@@ -148,12 +148,13 @@ row counts (scan-free `information_schema` estimates, so the source isn't
 full-scanned just to count). The engine-specific coordinate differs:
 
 - **MySQL** — the **binlog file + position**, plus the **GTID set**
-  (`@@GLOBAL.gtid_executed`) and `server_uuid`. These are read via
-  `SHOW BINARY LOG STATUS` (MySQL 8.2+/8.4, where `SHOW MASTER STATUS` was removed)
-  with a fallback to `SHOW MASTER STATUS` (≤ 8.0.x). The watermark also records a short
-  fingerprint of each migrated table's column definitions, read just before the
-  position, so Start CDC can tell whether a table changed since (see
-  [Chapter 6](06-limitations.md)).
+  (`@@GLOBAL.gtid_executed`), the source's **`gtid_mode`** and `server_uuid`. These are
+  read via `SHOW BINARY LOG STATUS` (MySQL 8.2+/8.4, where `SHOW MASTER STATUS` was
+  removed) with a fallback to `SHOW MASTER STATUS` (≤ 8.0.x). On a `gtid_mode=ON` source
+  CDC starts after the watermark's GTID set; otherwise at its file + position. The
+  watermark also records a short fingerprint of each migrated table's column
+  definitions, read just before the position, so Start CDC can tell whether a table
+  changed since (see [Chapter 6](06-limitations.md)).
 - **PostgreSQL** — a **WAL LSN** (`Watermark.wal_lsn`), not a binlog coordinate.
   At the consistency point the tool creates a **publication** (`FOR TABLE` the exact
   migrated tables, never `FOR ALL TABLES`) and a `pgoutput` **logical replication

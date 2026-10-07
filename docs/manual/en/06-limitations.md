@@ -219,6 +219,96 @@ fails **loudly** where it can't.
     next Start rebuilds it (`recovery`) after the same check. That check compares the
     tables with the original start point, so a change made even before the Stop refuses
     that Start.
+- **MySQL with `gtid_mode=ON`: CDC starts after the start point's GTID set.** Debezium
+  positions by GTID only when the source's `gtid_mode` is exactly `ON`: it then streams
+  every transaction that is not in the GTID set recorded with the start point and
+  ignores the start point's binlog `file:position` (with `OFF`, `OFF_PERMISSIVE` or
+  `ON_PERMISSIVE` it uses the `file:position`). On an `ON` source the GTID set therefore
+  *is* the start point, so Start CDC reads `gtid_mode` first — in the Start dialog and
+  again before it changes anything — and refuses a start point it cannot use:
+  - **No GTID set.** Debezium would make MySQL send its whole retained binary log again,
+    re-applying changes made before the start point. **Fetch current position** records
+    the position and the GTID set together; for a position you type, also enter the GTID
+    set the source had executed at exactly that position (for example the one your dump
+    recorded). A Manual start point saved by version 0.1.565 or earlier comes back
+    without its GTID set (those versions kept a fetched set beside any position typed
+    after it): fetch it again, or re-enter the set executed at exactly that position.
+  - **Recorded while `gtid_mode` was not `ON`** (also a restart after Stop CDC of a stack
+    started from such a point, or from a start point without a GTID set): see the next
+    bullet.
+  - **A GTID set the source has not executed** (it was read from another server, or
+    entered incorrectly), **or one the source has purged binary logs after**: give CDC a
+    new start point — **Re-run Full Load with "Drop & reload"**, or **Manual** → **Fetch
+    current position** → **Use this start point** (changes to the captured tables between
+    the two points are then not replicated: reload them with "Drop & reload" — CDC only:
+    correct them on Aurora DSQL — and validate with CHECKSUM) — raising the binlog
+    retention first if it ran out. If checking the GTID set against the source fails
+    instead (the connection dropped, a read timed out), nothing is known to be wrong with
+    the start point: check that the source is reachable from the tool, then Start CDC
+    again.
+  - **`gtid_mode` cannot be read** while the start point has no GTID set, or was recorded
+    while `gtid_mode` was not `ON` (this session has no source connection — the password
+    is kept in memory only, so an app restart clears it — or the read failed): re-test the
+    source connection on the Connect step, then Start CDC again.
+
+  On the Manual card, editing the position after **Fetch current position** drops the
+  fetched GTID set (it was read at the fetched position) — also when the position is
+  left empty or mistyped — and editing the GTID set drops the recorded table definitions,
+  so the start-point check above then only warns. A GTID set you enter must be a MySQL
+  GTID set (`<server UUID>:<interval>`, comma-separated, for example
+  `3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100`): Start CDC refuses any other text — quotes
+  or a `SET` statement copied with it, say — on every `gtid_mode`, because Debezium would
+  write it into every offset it commits and stop at its next restart.
+- **MySQL: decide `gtid_mode` before the Full Load and keep it until cut over.** A start
+  point recorded while `gtid_mode` was not `ON` cannot start CDC once the source is `ON`:
+  MySQL cannot send the changes written without a GTID by GTID, so it stops the
+  connector on them or skips them with no error. Start CDC refuses that start, and also
+  a restart after Stop CDC of a stack started from such a point, or from a start point
+  without a GTID set (it streamed by `file:position` and holds no GTID set to continue
+  from). Start CDC reads the start offset from the stack's own record of its last
+  Start, so this holds even when the session no longer holds the start point (an
+  attached stack, a reset session). Keep the start point by setting `gtid_mode` back to
+  `ON_PERMISSIVE` until cut over (CDC then streams by `file:position`), or give CDC a new
+  start point: **Re-run Full Load with "Drop & reload"**, or **Manual** → **Fetch current
+  position** → **Use this start point**, then reload the tables changed in between with
+  "Drop & reload" (CDC only: correct them on Aurora DSQL) and validate with CHECKSUM.
+  Changing `gtid_mode` while CDC streams takes effect at the connector's next automatic
+  restart, can stop it or skip changes with no error, and the tool cannot intercept it:
+  Stop CDC first. Start CDC judges only what is recorded — the mode recorded with the
+  start point, and the start offset (with its GTID set) the stack was last started from —
+  not how the stack streamed since. So a Start after `gtid_mode` is back to `ON` is not
+  refused for a stack started from a point recorded while it was `ON` that then streamed
+  while it was not `ON` (for example `ON_PERMISSIVE` after a *changes written without a
+  GTID* failure), for one started from a GTID set typed while it was not `ON`, or for
+  one whose last Start had no start point to offer (a restart from a session that held
+  none, which leaves the stack no record): it continues after the GTID set it holds and
+  re-sends changes already applied, or stops on the ones written without a GTID, or skips
+  them with no error. Keep such a source not `ON` until cut over, or give CDC a new start
+  point as above. Start points recorded by version 0.1.565 or earlier do not record the
+  mode: if `gtid_mode` was turned `ON` since, set a new one.
+- **MySQL with `gtid_mode=ON`: pipelines started by version 0.1.565 or earlier.** Those
+  versions emptied the GTID set Debezium starts from, so on a `gtid_mode=ON` source MySQL
+  re-sent its whole retained binary log at every Start, every Start after Stop and every
+  automatic connector restart. Writes converged (the sink is idempotent), but older
+  values were re-applied, unique-key conflicts could be dead-lettered, and an unparseable
+  DDL anywhere in the retained log — even before the start point — stopped every Start. A
+  running pipeline keeps that behaviour until one **Stop CDC** → **Start CDC**, which then
+  resumes exactly where it stopped. A pipeline started from a Manual point (including CDC
+  only) can fail that Start with *the source has purged binary logs CDC's GTID set does
+  not cover*: those versions recorded a GTID set without the transactions the source had
+  purged at its start, although the source may still hold every change since CDC
+  stopped. Stop CDC, set the source's `gtid_mode` to `ON_PERMISSIVE` until cut over (a
+  parameter-group change on RDS and Aurora), then Start CDC: Debezium resumes from where
+  it stopped by `file:position`, with no gap (if the binlog retention also ran out, that
+  Start fails instead). Or give CDC a new start point as the message says. Such a Start
+  is refused before anything changes when its Manual point has no GTID set; follow the
+  message. If such a Start failed part-way, the topics may hold re-sent older changes
+  and the sink may have applied some: **Delete CDC infrastructure**, deploy again,
+  **Re-run Full Load with "Drop & reload"** for all tables (CDC only: **Manual** →
+  **Fetch current position** → **Use this start point**, then correct the tables on
+  Aurora DSQL — rows the sink re-applied keep their older values until rewritten), Start
+  CDC, then validate with CHECKSUM. Validate any pipeline that ran on a `gtid_mode=ON`
+  source with an earlier version with CHECKSUM before cut over.
 - **MySQL: a DDL statement Debezium cannot parse, anywhere on the source server, stops
   CDC.** Debezium parses every DDL statement in the binary log with its MySQL grammar
   (Debezium 2.7) — for every database and table on the server, not only the captured
@@ -229,7 +319,10 @@ fails **loudly** where it can't.
   names the cause — in the Start CDC error, or on the connector's Pipeline health row
   with an error notice once it has started
   ([§4.6](04-cdc-and-dsql-constraints.md#pipeline-health-and-change-flow)) — and shows
-  the beginning of the statement with quoted values hidden.
+  the beginning of the statement with quoted values hidden. Only a statement from the
+  start point on stops CDC (version 0.1.565 and earlier also re-read the retained binary
+  log from its beginning on a `gtid_mode=ON` source, so an older statement could stop it
+  too — see above).
   - **Way forward.** Stop CDC, then give CDC a start point after the statement:
     **Re-run Full Load with "Drop & reload"** for all tables (Full load + CDC; re-run
     Step 1 Evaluation and Schema Conversion first if the statement changed a captured

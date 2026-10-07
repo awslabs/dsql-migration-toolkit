@@ -116,6 +116,8 @@ class _FakeDeployer:
         self._seeder_eni_counts = list(seeder_eni_counts or [])
         self.calls: list[str] = []
         self.updates: list[list[tuple[str, str]]] = []
+        # The template_body each update received (None: UsePreviousTemplate).
+        self.template_bodies: list = []
         self.created: list[tuple[str, list[tuple[str, str]]]] = []
 
     # The in-process External seed reads the deployer's region.
@@ -163,6 +165,7 @@ class _FakeDeployer:
     def submit_update(self, stack_name, overrides, *, template_body=None):
         self.calls.append("submit_update")
         self.updates.append(list(overrides))
+        self.template_bodies.append(template_body)
         if self._update_error:
             raise self._update_error
         return self._update_changed
@@ -203,7 +206,7 @@ class _FakeDeployer:
             return "RUNNING"
         return seq.pop(0) if len(seq) > 1 else seq[0]
 
-    def connector_log_tail(self, stack_name, connector_name, *, limit=400):
+    def connector_log_tail(self, stack_name, connector_name, *, limit=400, since=None):
         return self._connector_logs.get(connector_name, "")
 
 
@@ -752,12 +755,16 @@ def test_start_passes_watermark_params_on_single_pass() -> None:
     run_cdc_start(
         handle, stack_name=STACK, params=_start_params(), deployer=deployer,
         on_log=lambda ts, msg: captured.append(msg), sleep=lambda _s: None,
-        watermark=_watermark(),
+        watermark=_watermark(), template_body="BUNDLED-TEMPLATE",
         connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
     )
     # The single pass carries the watermark coordinates + DeploySink=true, so the
     # in-VPC CdcStartPrepResource seeds the offset and both connectors are created.
     assert len(deployer.updates) == 1
+    # ...and the BUNDLED template, never UsePreviousTemplate: that is how a stack deployed
+    # by an earlier version gets this version's connector configuration (G19: no
+    # gtid.source.excludes ".*") at its next Start, without an infrastructure redeploy.
+    assert deployer.template_bodies == ["BUNDLED-TEMPLATE"]
     only = dict(deployer.updates[0])
     assert only["WatermarkBinlogFile"] == "mysql-bin.000042"
     assert only["WatermarkBinlogPos"] == "15324"
@@ -765,7 +772,11 @@ def test_start_passes_watermark_params_on_single_pass() -> None:
     assert only["DeploySink"] == "true"
     # Neutral: the seeder may legitimately skip it (no-clobber), so no "gapless" claim.
     offered = [m for m in captured if "Offering CDC start offset" in m]
-    assert offered and "mysql-bin.000042:15324 (Full Load watermark)" in offered[0]
+    # G19: the GTID set offered with the position is named (on a gtid_mode=ON source
+    # Debezium starts after it).
+    assert offered and (
+        "mysql-bin.000042:15324 with GTID set UUID:1-9 (Full Load watermark)" in offered[0]
+    )
     assert "not applied if the committed offset is already at/past it" in offered[0]
     assert not any("Seeding gapless" in m for m in captured)
 
@@ -1578,7 +1589,7 @@ def test_connector_failed_surfaces_worker_log_guidance() -> None:
 
 def test_connector_failed_without_known_log_falls_back_to_generic() -> None:
     # No recognizable worker-log signature -> the generic FAILED message (still
-    # names the connector), never a crash -- and now the last log line with it, because
+    # names the connector), never a crash -- and now the log's error line with it, because
     # the tail was already fetched and used to be thrown away.
     handle = _FakeHandle()
     deployer = _FakeDeployer(
@@ -1598,8 +1609,8 @@ def test_unmatched_worker_log_is_repeated_instead_of_discarded() -> None:
     This was the worst outcome in the CDC flow: the tail WAS fetched, no needle matched,
     and `_connector_failure_message` returned the bare "<connector> entered FAILED state."
     -- so an operator who had just waited out a billable connector create had to go read
-    CloudWatch to learn anything at all. Repeating the last line is strictly more general
-    than adding needles: it cannot assert a wrong cause.
+    CloudWatch to learn anything at all. Repeating the error line is strictly more general
+    than adding needles.
     """
     from dsql_migrator.core.cdc_deployer import (
         _connector_failure_message,
@@ -1621,7 +1632,7 @@ def test_unmatched_worker_log_is_repeated_instead_of_discarded() -> None:
     failed = _connector_failure_message(_Tail(unknown), "stack", SRC)
     assert "nobody wrote a needle for this" in failed
     assert failed.startswith(f"{SRC} entered FAILED state.")
-    # The LAST line, not the framework frame above it.
+    # The error line, not the INFO line above it.
     assert "framework frame" not in failed
 
     # The excerpt matters MOST on the timeout path (a task that dies at startup leaves the
@@ -3203,3 +3214,680 @@ def test_start_refuses_an_oversized_rekey_parameter_before_any_update() -> None:
     assert "No connectors were changed" in str(exc.value)
     assert deployer.updates == []
     assert "submit_update" not in deployer.calls
+
+
+# ---------------------------------------------------------------------------
+# G19: a failed Start names its cause -- the app's own log reader, the unmatched excerpt,
+# the empty-log message, the offered GTID set, and the GTID-positioning needles
+# ---------------------------------------------------------------------------
+
+# The live Seoul failure (2026-10-07): with the GTID set emptied by the old template's
+# gtid.source.excludes ".*", MySQL streamed the retained binary log from its beginning and
+# Debezium died on an unparseable DDL BEFORE the start point. The rollback showed only the
+# CloudFormation status, because the deployer (CdcDeployRole) cannot read the log group.
+_SEOUL_TAIL = (
+    "INFO Connected to binlog at db:3306, starting at BinlogOffsetContext{restartGtidSet=\n"
+    "ERROR Error during binlog processing. Last offset stored = {ts_sec=1791067989, "
+    "file=mysql-bin-changelog.000008, pos=5149734, gtids=1dff02db-0000:1-808, event=1}, "
+    "binlog reader near position = mysql-bin-changelog.000008/5149734\n"
+    "io.debezium.text.ParsingException: DDL statement couldn't be parsed. Please open a "
+    "Jira issue with the statement 'CREATE TABLE `migration_schema`.g7live_kw (id INT "
+    "PRIMARY KEY, retain INT)'\n"
+    "no viable alternative at input 'retain'"
+)
+
+
+class _AppReader:
+    """The app's own log reader (MskConnectController.connector_log_tail stand-in).
+
+    ``calls`` records ``(stack, connector)``; ``since`` records the ``since`` each read
+    was limited to (None: unlimited)."""
+
+    def __init__(self, logs=None, *, raises=None):
+        self.logs = dict(logs or {})
+        self.raises = raises
+        self.calls: list = []
+        self.since: list = []
+
+    def __call__(self, stack_name, connector_name, *, since=None):
+        self.calls.append((stack_name, connector_name))
+        self.since.append(since)
+        if self.raises is not None:
+            raise self.raises
+        return self.logs.get(connector_name, "")
+
+
+def _run_start_with_reader(deployer, reader):
+    handle = _FakeHandle()
+    captured: list[str] = []
+    with pytest.raises(CdcDeployError) as exc:
+        run_cdc_start(
+            handle, stack_name=STACK, params=_start_params(), deployer=deployer,
+            on_log=lambda ts, msg: captured.append(msg), sleep=lambda _s: None,
+            connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+            log_tail=reader,
+        )
+    return str(exc.value), captured
+
+
+def test_a_rollback_is_diagnosed_through_the_app_reader_when_the_deploy_role_cannot_read():
+    deployer = _FakeDeployer(stack_statuses=("UPDATE_ROLLBACK_COMPLETE",))  # deployer tail ""
+    reader = _AppReader({SRC: _SEOUL_TAIL})
+    msg, _logs = _run_start_with_reader(deployer, reader)
+    assert "Stack operation ended in" not in msg
+    assert "could not parse a DDL statement in the source's binary log" in msg
+    assert (
+        'It begins "CREATE TABLE `migration_schema`.g7live_kw (id INT PRIMARY KEY, retain '
+        'INT)" (quoted values are hidden).'
+    ) in msg
+    assert (STACK, SRC) in reader.calls
+
+
+def test_a_rollback_repeats_the_failed_connectors_masked_last_line():
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[
+            ("DebeziumSourceConnector", "CREATE_FAILED",
+             "Resource handler returned message: \"Invalid request\""),
+            ("DsqlSinkConnector", "CREATE_FAILED", "Resource creation cancelled"),
+        ],
+    )
+    reader = _AppReader({
+        SRC: (
+            "INFO starting\n"
+            "ERROR org.apache.kafka.connect.errors.ConnectException: odd value "
+            "'alice@example.com' rejected, password=hunter2\n"
+        ),
+        SINK: "INFO [dsql-sink] consumer group joined\n",
+    })
+    msg, _logs = _run_start_with_reader(deployer, reader)
+    assert msg.startswith(f"Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE': {SRC} failed. ")
+    assert "(quoted values hidden)" in msg
+    assert "ConnectException: odd value '?' rejected, password=***" in msg
+    assert "alice@example.com" not in msg and "hunter2" not in msg
+    # The cancelled sink did not fail on its own: its benign line is never "the cause".
+    assert "consumer group joined" not in msg
+    # The failed connector is read first.
+    assert reader.calls[0] == (STACK, SRC)
+
+
+def test_a_rollback_with_no_readable_log_line_says_so():
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[("DebeziumSourceConnector", "CREATE_FAILED", "Resource handler returned")],
+    )
+    msg, _logs = _run_start_with_reader(deployer, _AppReader())
+    assert msg.startswith("Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'. ")
+    assert f"No worker-log line was found for {SRC} in the CloudWatch log group " in msg
+    assert f"/msk-connect/{STACK}-cdc" in msg
+    assert "this app cannot read that log group" in msg
+    # A reader that raises counts as empty and falls back to the deployer's (also empty).
+    msg2, _ = _run_start_with_reader(
+        _FakeDeployer(
+            stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+            events=[("DebeziumSourceConnector", "CREATE_FAILED", "")],
+        ),
+        _AppReader(raises=RuntimeError("AccessDenied")),
+    )
+    assert "No worker-log line was found for" in msg2
+
+
+def test_a_rollback_without_the_app_reader_keeps_todays_message():
+    handle = _FakeHandle()
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[("DebeziumSourceConnector", "CREATE_FAILED", "Resource handler returned")],
+    )
+    with pytest.raises(CdcDeployError) as exc:
+        _run_start(handle, deployer)
+    assert str(exc.value) == "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'."
+    # A rollback with no failed connector event and the reader: the unchanged wording.
+    msg, _ = _run_start_with_reader(
+        _FakeDeployer(stack_statuses=("UPDATE_ROLLBACK_COMPLETE",)), _AppReader()
+    )
+    assert msg == "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'."
+
+
+def test_the_app_reader_is_read_before_the_deployer_and_falls_back_to_it():
+    from dsql_migrator.core.cdc_deployer import _read_connector_log
+
+    deployer = _FakeDeployer(connector_logs={SRC: "deployer view"})
+    assert _read_connector_log(deployer, _AppReader({SRC: "app view"}), STACK, SRC) == "app view"
+    assert _read_connector_log(deployer, _AppReader(), STACK, SRC) == "deployer view"
+    assert _read_connector_log(
+        deployer, _AppReader(raises=RuntimeError("x")), STACK, SRC
+    ) == "deployer view"
+    assert _read_connector_log(deployer, None, STACK, SRC) == "deployer view"
+
+
+def test_the_connector_waits_read_through_the_app_reader():
+    from dsql_migrator.core.cdc_deployer import (
+        _StageDriver,
+        _connector_timeout_message,
+    )
+
+    handle = _FakeHandle()
+    driver = _StageDriver(handle, stages=CDC_START_STAGES, on_log=lambda *_a: None,
+                          sleep=lambda _s: None)
+    deployer = _FakeDeployer(connector_states={SRC: ["FAILED"]})  # deployer tail ""
+    reader = _AppReader({SRC: "ERROR Communications link failure"})
+    with pytest.raises(CdcDeployError) as exc:
+        _wait_connector_running(
+            deployer, SRC, "connectors_running", driver, 5.0, 0.0,
+            stack_name=STACK, log_tail=reader,
+        )
+    assert "could not reach the source MySQL" in str(exc.value)
+    timed = _connector_timeout_message(
+        _FakeDeployer(), STACK, SRC, log_tail=_AppReader({SRC: "ERROR odd thing 'v'"})
+    )
+    assert timed.startswith(f"{SRC} did not reach RUNNING in time.")
+    assert "ERROR odd thing '?'" in timed
+
+
+def test_the_offer_line_names_the_gtid_set_only_when_the_seed_carries_one():
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import Watermark
+
+    def _offer(wm):
+        captured: list[str] = []
+        run_cdc_start(
+            _FakeHandle(), stack_name=STACK, params=_start_params(),
+            deployer=_FakeDeployer(
+                connector_states={SRC: ["RUNNING"], SINK: ["CREATING", "RUNNING"]}
+            ),
+            on_log=lambda ts, msg: captured.append(msg), sleep=lambda _s: None,
+            watermark=wm, connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        )
+        return next(m for m in captured if "Offering CDC start offset" in m)
+
+    ts = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
+    with_set = _offer(Watermark(binlog_file="F", binlog_position=7, gtid_executed="U:1-5",
+                                snapshot_timestamp=ts))
+    assert with_set.startswith(
+        "Offering CDC start offset F:7 with GTID set U:1-5 (Full Load watermark)"
+    )
+    without = _offer(Watermark(binlog_file="F", binlog_position=7, snapshot_timestamp=ts))
+    assert without == (
+        "Offering CDC start offset F:7 (Full Load watermark) to the seeder; not applied if "
+        "the committed offset is already at/past it."
+    )
+    long_set = ",".join(f"{i:08d}-0000-0000-0000-000000000000:1-9" for i in range(10))
+    capped = _offer(Watermark(binlog_file="F", binlog_position=7, gtid_executed=long_set,
+                              snapshot_timestamp=ts))
+    assert " …" in capped and long_set not in capped
+
+
+def test_the_unmatched_excerpt_masks_quoted_values():
+    from dsql_migrator.core.cdc_deployer import _connector_log_excerpt
+
+    assert _connector_log_excerpt(
+        "ERROR Duplicate entry 'alice@x' for key 'users.email'"
+    ) == "ERROR Duplicate entry '?' for key '?'"
+    assert _connector_log_excerpt('ERROR value "secret-ish" refused') == (
+        'ERROR value "?" refused'
+    )
+
+
+# The server errors GTID positioning can end in (MySQL 8.0 / 5.7 / anonymous transaction).
+_PURGED_80_TAIL = (
+    "ERROR Error during binlog processing. Last offset stored = {...}\n"
+    "com.github.shyiko.mysql.binlog.network.ServerException: Cannot replicate because the "
+    "source purged required binary logs. Replicate the missing transactions from "
+    "elsewhere, or provision a new replica from backup."
+)
+_PURGED_57_TAIL = (
+    "ERROR Error during binlog processing. Last offset stored = {...}\n"
+    "com.github.shyiko.mysql.binlog.network.ServerException: The replica is connecting "
+    "using AUTO_POSITION = 1, but the source has purged binary logs containing GTIDs that "
+    "the replica requires."
+)
+_ANONYMOUS_TAIL = (
+    "ERROR Error during binlog processing. Last offset stored = {...}\n"
+    "com.github.shyiko.mysql.binlog.network.ServerException: Cannot replicate anonymous "
+    "transaction when AUTO_POSITION = 1, at file ./mysql-bin-changelog.000009, position 4."
+)
+
+
+def test_the_gtid_positioning_failures_are_diagnosed():
+    from dsql_migrator.core.cdc_deployer import (
+        DEFINITION_SNAPSHOT_MARK,
+        SCHEMA_HISTORY_MARK,
+        diagnose_connector_log,
+        history_missing_after_failure,
+    )
+    from dsql_migrator.ui.cdc_start_point_gate import RELOAD_RESETS_MANUAL
+
+    purged_headline = "the source has purged binary logs CDC's GTID set does not cover"
+    anon_headline = "the source wrote changes without a GTID after CDC's start point"
+    for tail, headline, phrase in (
+        (_PURGED_80_TAIL, purged_headline, "already purged binary logs"),
+        (_PURGED_57_TAIL, purged_headline, "already purged binary logs"),
+        (_ANONYMOUS_TAIL, anon_headline, "changes written without a GTID"),
+    ):
+        for episode_only in (False, True):
+            found = diagnose_connector_log(SRC, tail, episode_only=episode_only)
+            assert found is not None and found.headline == headline, tail
+        guidance = found.guidance
+        assert guidance.startswith(f"{SRC} failed: the source runs gtid_mode=ON")
+        assert phrase in guidance
+        assert guidance.index("Stop CDC") < guidance.index("Start CDC")
+        assert "Start CDC again" not in guidance
+        assert SCHEMA_HISTORY_MARK not in guidance
+        assert DEFINITION_SNAPSHOT_MARK not in guidance
+        assert RELOAD_RESETS_MANUAL in guidance
+        for mode in ("schema_only", "recovery"):
+            assert history_missing_after_failure(mode, guidance) is False
+    assert "ON_PERMISSIVE" in diagnose_connector_log(SRC, _ANONYMOUS_TAIL).guidance
+    assert "binlog retention hours" in diagnose_connector_log(SRC, _PURGED_80_TAIL).guidance
+    # Debezium's own WARN that an offset is no longer available is not a server refusal.
+    assert diagnose_connector_log(
+        SRC, "WARN Last recorded offset is no longer available on the server."
+    ) is None
+
+
+def test_the_gtid_needles_sit_below_the_ddl_entry_and_above_the_link_needles():
+    from dsql_migrator.core.cdc_deployer import (
+        _CONNECTOR_LOG_DIAGNOSES,
+        _UNPARSEABLE_DDL_NEEDLE,
+    )
+
+    needles = [n for n, _g in _CONNECTOR_LOG_DIAGNOSES]
+    ddl = needles.index(_UNPARSEABLE_DDL_NEEDLE)
+    for needle in (
+        "cannot replicate anonymous transaction",
+        "purged required binary logs",
+        "has purged binary logs containing gtids",
+    ):
+        assert ddl < needles.index(needle) < needles.index("communications link failure")
+    assert needles[-1] == "failed testing connection"
+
+
+# ---------------------------------------------------------------------------
+# G19 review: the purged-GTID guidance splits its two causes
+# ---------------------------------------------------------------------------
+
+
+def test_the_purged_guidance_offers_the_gapless_resume_for_an_earlier_versions_manual_start():
+    # A pipeline 0.1.565 or earlier started from a Manual point recorded a GTID set without
+    # the purged range: the source still holds every change since CDC stopped, and
+    # ON_PERMISSIVE resumes by file:position with no gap. Only the retention cause loses
+    # the changes.
+    from dsql_migrator.core.cdc_deployer import diagnose_connector_log
+
+    for tail in (_PURGED_80_TAIL, _PURGED_57_TAIL):
+        guidance = diagnose_connector_log(SRC, tail).guidance
+        assert (
+            "If the binlog retention ran out while CDC was stopped or behind, those changes "
+            "can no longer be streamed."
+        ) in guidance
+        assert guidance.count("can no longer be streamed") == 1  # tied to retention only
+        assert (
+            "If an earlier version of the tool started this pipeline from a Manual start "
+            "point (CDC only included), the source may still hold every change since CDC "
+            "stopped"
+        ) in guidance
+        assert (
+            "set the source's gtid_mode to ON_PERMISSIVE until cut over (a parameter-group "
+            "change on RDS and Aurora), then Start CDC: Debezium resumes from where it "
+            "stopped by binlog file:position, with no gap"
+        ) in guidance
+        assert "back to ON_PERMISSIVE" not in guidance  # the source was ON all along
+        assert "While gtid_mode stays ON, Retry CDC fails the same way" in guidance
+        # The ON_PERMISSIVE way comes before the new start points, which lose changes.
+        assert guidance.index("ON_PERMISSIVE") < guidance.index("Re-run Full Load")
+
+
+# ---------------------------------------------------------------------------
+# G19 review: the rollback diagnosis is limited to this Start and its failed resources
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+_T0 = _dt(2026, 10, 7, 12, 0, tzinfo=_tz.utc)
+_MS = lambda t: int(t.timestamp() * 1000)  # noqa: E731
+
+
+class _TimedLogs:
+    """CloudWatch Logs double: streams in DescribeLogStreams order, events with timestamps;
+    GetLogEvents honours startTime as the service does (events at or after it)."""
+
+    def __init__(self, streams):
+        self.streams = streams  # [(name, [(datetime, message), ...]), ...]
+        self.calls: list = []
+
+    def describe_log_streams(self, **kw):
+        self.calls.append(("describe_log_streams", kw))
+        return {"logStreams": [{"logStreamName": n} for n, _e in self.streams][:10]}
+
+    def get_log_events(self, **kw):
+        self.calls.append(("get_log_events", kw))
+        events = dict(self.streams).get(kw["logStreamName"], [])
+        start = kw.get("startTime")
+        return {"events": [
+            {"timestamp": _MS(t), "message": m} for t, m in events
+            if start is None or _MS(t) >= start
+        ]}
+
+
+def _real_reader(logs):
+    """The reader MySQL Start CDC passes: MskConnectController.connector_log_tail."""
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    class _Session:
+        def client(self, _service, **_k):
+            return logs
+
+    return MskConnectController("us-east-1", session=_Session()).connector_log_tail
+
+
+_YESTERDAY = _T0 - _td(days=1)
+_STALE_SRC = (f"{SRC}/worker-0", [(_YESTERDAY, line) for line in _SEOUL_TAIL.splitlines()])
+
+
+def _rollback_now(monkeypatch, events, streams):
+    import dsql_migrator.core.cdc_deployer as _dep
+
+    monkeypatch.setattr(_dep, "_now", lambda: _T0)  # this Start's submit time
+    deployer = _FakeDeployer(stack_statuses=("UPDATE_ROLLBACK_COMPLETE",), events=events)
+    logs = _TimedLogs(streams)
+    msg, _captured = _run_start_with_reader(deployer, _real_reader(logs))
+    return msg, logs
+
+
+def test_a_seeder_failure_is_named_and_never_diagnosed_from_an_earlier_starts_log(monkeypatch):
+    msg, logs = _rollback_now(
+        monkeypatch,
+        [("CdcStartPrepResource", "CREATE_FAILED",
+          "Received response status [FAILED] from custom resource. Message returned: "
+          "KafkaTimeoutError: brokers not ready, password=hunter2")],
+        [_STALE_SRC],
+    )
+    assert msg == (
+        "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE': CdcStartPrepResource failed — "
+        "Received response status [FAILED] from custom resource. Message returned: "
+        "KafkaTimeoutError: brokers not ready, password=***. No connector reported a "
+        "failure, so no connector worker log is shown."
+    )
+    assert not [c for c in logs.calls if c[0] == "get_log_events"]  # no connector read
+    # A reason ending in a period reads as one sentence.
+    msg2, _ = _rollback_now(
+        monkeypatch,
+        [("CdcStartPrepResource", "CREATE_FAILED", "Seeder timed out after 60.0 secs.")],
+        [_STALE_SRC],
+    )
+    assert msg2.endswith(
+        "CdcStartPrepResource failed — Seeder timed out after 60.0 secs. No connector "
+        "reported a failure, so no connector worker log is shown."
+    )
+
+
+def test_a_connector_rejected_before_it_logged_is_not_given_an_earlier_starts_cause(
+    monkeypatch,
+):
+    msg, logs = _rollback_now(
+        monkeypatch,
+        [("DebeziumSourceConnector", "CREATE_FAILED",
+          'Resource handler returned message: "Invalid request"')],
+        [_STALE_SRC],
+    )
+    assert "could not parse a DDL statement" not in msg and "g7live_kw" not in msg
+    assert msg.startswith(
+        f"Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'. No worker-log line was found "
+        f"for {SRC} in the CloudWatch log group /msk-connect/{STACK}-cdc since this Start"
+    )
+    gets = [kw for c, kw in logs.calls if c == "get_log_events"]
+    assert gets and all(kw["startTime"] == _MS(_T0) - 120_000 for kw in gets)
+
+
+def test_a_failed_sinks_own_line_outranks_a_stale_source_signature(monkeypatch):
+    fresh_sink = (f"{SINK}/worker-0", [(_T0 + _td(minutes=3),
+                                        "ERROR something nobody wrote a needle for 'v'")])
+    msg, _logs = _rollback_now(
+        monkeypatch,
+        [("DsqlSinkConnector", "CREATE_FAILED", "Resource handler returned message"),
+         ("DebeziumSourceConnector", "CREATE_FAILED", "Resource creation cancelled")],
+        [_STALE_SRC, fresh_sink],
+    )
+    assert msg.startswith(f"Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE': {SINK} failed. ")
+    assert "ERROR something nobody wrote a needle for '?'" in msg
+    assert "g7live_kw" not in msg and "could not parse a DDL statement" not in msg
+
+
+def test_this_starts_own_failure_is_still_diagnosed(monkeypatch):
+    # The Seoul failure itself, written after this Start's submit: the G7 diagnosis.
+    fresh = (f"{SRC}/worker-1", [(_T0 + _td(minutes=14), line) for line in _SEOUL_TAIL.splitlines()])
+    msg, _logs = _rollback_now(
+        monkeypatch,
+        [("DebeziumSourceConnector", "CREATE_FAILED", "Resource handler returned message")],
+        [_STALE_SRC, fresh],  # the stale stream is described FIRST (eventually consistent)
+    )
+    assert "could not parse a DDL statement in the source's binary log" in msg
+
+
+def test_the_log_reader_limits_by_time_only_when_asked():
+    from dsql_migrator.core.cdc_stack_deployer import read_connector_log_tail
+
+    logs = _TimedLogs([_STALE_SRC])
+    assert read_connector_log_tail(logs, STACK, SRC) == _SEOUL_TAIL  # unchanged without since
+    assert "startTime" not in logs.calls[-1][1]
+    logs = _TimedLogs([_STALE_SRC])
+    assert read_connector_log_tail(logs, STACK, SRC, since=_T0) == ""
+    assert logs.calls[-1][1]["startTime"] == _MS(_T0) - 120_000
+
+
+def test_rollback_never_blames_the_cancelled_sink_with_its_benign_line():
+    # Real stack events carry IN_PROGRESS lines too; only a resource that failed on its
+    # own counts -- not one CloudFormation cancelled, and not a status that is not *_FAILED.
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[
+            ("DebeziumSourceConnector", "CREATE_IN_PROGRESS", ""),
+            ("DsqlSinkConnector", "CREATE_IN_PROGRESS", ""),
+            ("DebeziumSourceConnector", "CREATE_IN_PROGRESS", "Resource creation Initiated"),
+            ("DsqlSinkConnector", "CREATE_IN_PROGRESS", "Resource creation Initiated"),
+            ("DebeziumSourceConnector", "CREATE_FAILED",
+             'Resource handler returned message: "Invalid request"'),
+            ("DsqlSinkConnector", "CREATE_FAILED", "Resource creation cancelled"),
+        ],
+    )
+    reader = _AppReader({SINK: "INFO [dsql-sink] consumer group joined\n"})
+    msg, _logs = _run_start_with_reader(deployer, reader)
+    assert msg.startswith(
+        "Stack operation ended in 'UPDATE_ROLLBACK_COMPLETE'. No worker-log line was found "
+        f"for {SRC} in the CloudWatch log group "
+    )
+    assert SINK not in msg and "consumer group joined" not in msg
+    assert reader.calls == [(STACK, SRC)]  # only the connector that failed is read
+    assert reader.since and all(s is not None for s in reader.since)  # limited to this Start
+
+
+def test_rollback_diagnoses_the_failed_connector_not_a_cancelled_one():
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[
+            ("DsqlSinkConnector", "CREATE_FAILED",
+             'Resource handler returned message: "Invalid request"'),
+            ("DebeziumSourceConnector", "CREATE_FAILED", "Resource creation cancelled"),
+        ],
+    )
+    reader = _AppReader({
+        SRC: "ERROR Communications link failure\n",
+        SINK: "ERROR java.lang.NoSuchFieldError: AUTH_SCHEME_PROVIDER\n",
+    })
+    msg, _logs = _run_start_with_reader(deployer, reader)
+    assert reader.calls[0] == (STACK, SINK)
+    assert msg.startswith(f"{SINK} failed with an AWS SDK conflict")
+    assert "could not reach the source MySQL" not in msg
+    # Both failed on their own: read in the order the stack events reported them, so the
+    # connector that failed FIRST names the cause.
+    both = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[
+            ("DsqlSinkConnector", "CREATE_FAILED", "Resource handler returned message"),
+            ("DebeziumSourceConnector", "CREATE_FAILED", "Resource handler returned message"),
+        ],
+    )
+    reader2 = _AppReader({
+        SRC: "ERROR Communications link failure\n",
+        SINK: "ERROR java.lang.NoSuchFieldError: AUTH_SCHEME_PROVIDER\n",
+    })
+    msg2, _ = _run_start_with_reader(both, reader2)
+    assert reader2.calls[0] == (STACK, SINK)
+    assert msg2.startswith(f"{SINK} failed with an AWS SDK conflict")
+
+
+# ---------------------------------------------------------------------------
+# G19 review: the excerpt names the error, not the shutdown line after it
+# ---------------------------------------------------------------------------
+
+_TASK_DIED_TAIL = (
+    "[Worker-0a1] INFO Starting MySqlConnectorTask with configuration:\n"
+    "[Worker-0a1] ERROR [src|task-0] WorkerSourceTask{id=src-0} Task threw an uncaught and "
+    "unrecoverable exception. Task is being killed and will not recover until manually "
+    "restarted (org.apache.kafka.connect.runtime.WorkerTask:212)\n"
+    "[Worker-0a1] org.apache.kafka.connect.errors.ConnectException: An exception occurred "
+    "in the change event producer. This connector will be stopped.\n"
+    "[Worker-0a1] \tat io.debezium.pipeline.ErrorHandler.setProducerThrowable(ErrorHandler.java:67)\n"
+    "[Worker-0a1] Caused by: io.debezium.DebeziumException: the binlog file "
+    "'mysql-bin.000003' is no longer available on the server\n"
+    "[Worker-0a1] \tat io.debezium.connector.binlog.BinlogStreamingChangeEventSource.x(B.java:1)\n"
+    "[Worker-0a1] \t... 9 more\n"
+    "[Worker-0a1] INFO [src|task-0] Stopping down connector (io.debezium.connector.common.BaseSourceTask:420)\n"
+    "[Worker-0a1] INFO [Producer clientId=connector-producer-src-0] Closing the Kafka producer\n"
+    "[Worker-0a1] INFO App info kafka.producer for connector-producer-src-0 unregistered\n"
+    "[Worker-0a1] INFO Kafka Connect stopped\n"
+)
+
+
+def test_the_excerpt_repeats_the_root_cause_not_the_shutdown_lines():
+    from dsql_migrator.core.cdc_deployer import (
+        _connector_failure_message,
+        _connector_log_excerpt,
+    )
+
+    excerpt = _connector_log_excerpt(_TASK_DIED_TAIL)
+    assert excerpt == (
+        "[Worker-0a1] Caused by: io.debezium.DebeziumException: the binlog file '?' is no "
+        "longer available on the server"
+    )
+    # Through the rollback message and the FAILED-state path alike.
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_ROLLBACK_COMPLETE",),
+        events=[("DebeziumSourceConnector", "CREATE_FAILED", "Resource handler returned")],
+    )
+    msg, _ = _run_start_with_reader(deployer, _AppReader({SRC: _TASK_DIED_TAIL}))
+    failed = _connector_failure_message(
+        _FakeDeployer(connector_logs={SRC: _TASK_DIED_TAIL}), STACK, SRC
+    )
+    for text in (msg, failed):
+        assert "is no longer available on the server" in text
+        assert "its last error line is repeated" in text
+        for absent in ("unregistered", "Kafka Connect stopped", "Stopping down connector"):
+            assert absent not in text
+    # No INFO lines: never a stack frame either.
+    no_info = "\n".join(
+        ln for ln in _TASK_DIED_TAIL.splitlines() if " INFO " not in ln
+    )
+    assert "... 9 more" not in _connector_log_excerpt(no_info)
+    # One exception and no cause: its message, not the generic ERROR line before it.
+    single = (
+        "[Worker-0a1] ERROR Task threw an uncaught and unrecoverable exception\n"
+        "[Worker-0a1] org.apache.kafka.connect.errors.ConnectException: nobody wrote a "
+        "needle for this\n[Worker-0a1] \tat x.Y.z(Y.java:1)\n[Worker-0a1] INFO stopped\n"
+    )
+    assert _connector_log_excerpt(single).endswith("ConnectException: nobody wrote a needle for this")
+
+
+@pytest.mark.parametrize(
+    "line, hidden",
+    [
+        ("ERROR couldn't insert value 'secret-1' into col", "secret-1"),
+        ("ERROR the connector's write of 'secret-1' failed", "secret-1"),
+        ("ERROR couldn't connect: password='hunter2' rejected", "hunter2"),
+        ("ERROR the user's token='abc123' expired", "abc123"),
+        ("ERROR users' password='hunter2' rejected", "hunter2"),
+        ("ERROR Duplicate entry 'O'Brien-5' for key 'users.name_idx'", "Brien"),
+        ("WARN statement DEFAULT N'secret' skipped", "secret"),
+        ("WARN statement DEFAULT x'beef' skipped", "beef"),
+        ("WARN statement DEFAULT _binary'secret' skipped", "secret"),
+        ("WARN statement DEFAULT b'secret' skipped", "secret"),
+    ],
+)
+def test_the_excerpt_masks_values_after_a_contraction_or_a_possessive(line, hidden):
+    # An apostrophe inside a word is prose: it must not pair with the value's opening quote
+    # (which showed the value in clear) nor hide a password= keyword from the scrub.
+    from dsql_migrator.core.cdc_deployer import _connector_log_excerpt
+
+    assert hidden not in _connector_log_excerpt(line)
+
+
+def test_the_excerpt_keeps_prose_readable():
+    from dsql_migrator.core.cdc_deployer import _connector_log_excerpt, _ddl_statement_head
+
+    assert _connector_log_excerpt(
+        "WARN Coordinator didn't stop in the expected time, shutting down executor now"
+    ) == "WARN Coordinator didn't stop in the expected time, shutting down executor now"
+    assert _connector_log_excerpt(
+        "ERROR couldn't insert value 'secret-1' into col"
+    ) == "ERROR couldn't insert value '?' into col"
+    # A DDL statement head keeps the strict SQL scan.
+    head = _ddl_statement_head(
+        "ERROR ... with the statement 'ALTER TABLE t ADD c varchar(9) DEFAULT N'x''"
+    )
+    assert head == "ALTER TABLE t ADD c varchar(9) DEFAULT N'?'"
+
+
+# ---------------------------------------------------------------------------
+# G19 review: run_cdc_start's RUNNING-waits read through the app's own reader
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("failing", [SRC, SINK])
+def test_run_cdc_start_reads_a_connector_failed_after_the_stack_settled_through_the_app_reader(
+    failing,
+):
+    # The stack update completed, then a connector went FAILED: on Fargate/EC2 the
+    # deployer (CdcDeployRole) reads "", so the cause must come through the app's reader.
+    deployer = _FakeDeployer(
+        stack_statuses=("UPDATE_COMPLETE",),
+        connector_states={SRC: ["FAILED"] if failing == SRC else ["RUNNING"],
+                          SINK: ["FAILED"] if failing == SINK else ["RUNNING"]},
+    )
+    reader = _AppReader({
+        SRC: "ERROR Communications link failure",
+        SINK: "ERROR something odd 'v'",
+    })
+    msg, _ = _run_start_with_reader(deployer, reader)
+    assert (STACK, failing) in reader.calls
+    if failing == SRC:
+        assert "could not reach the source MySQL" in msg
+    else:
+        assert msg.startswith(f"{SINK} entered FAILED state. ")
+        assert "something odd '?'" in msg
+
+
+class _RaisingStateDeployer(_FakeDeployer):
+    def connector_state(self, connector_name):
+        raise RuntimeError("ThrottlingException: Rate exceeded")
+
+
+@pytest.mark.parametrize("which", ["state", "read-failure"])
+def test_the_running_wait_timeouts_read_through_the_app_reader(which):
+    from dsql_migrator.core.cdc_deployer import _StageDriver
+
+    deployer = (
+        _FakeDeployer(connector_states={SRC: ["CREATING"]})
+        if which == "state"
+        else _RaisingStateDeployer()
+    )
+    driver = _StageDriver(_FakeHandle(), stages=CDC_START_STAGES, on_log=lambda *_a: None,
+                          sleep=lambda _s: None)
+    with pytest.raises(CdcDeployError) as exc:
+        _wait_connector_running(
+            deployer, SRC, "connectors_running", driver, 0.0, 0.0, stack_name=STACK,
+            log_tail=_AppReader({SRC: "ERROR Communications link failure"}),
+        )
+    msg = str(exc.value)
+    assert msg.startswith(f"{SRC} did not reach RUNNING in time.")
+    assert "could not reach the source MySQL" in msg

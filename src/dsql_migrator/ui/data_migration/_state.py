@@ -28,6 +28,7 @@ from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
     CdcResumePoint,
 )
+from dsql_migrator.core.cdc_coords import normalize_gtid_set
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.models import (
     LoadStatusView,
@@ -465,6 +466,11 @@ class DataMigrationState:
         # The binlog (file, pos) the stack's LAST Start offered the offset seeder, from the
         # same phase probe (Stop carries Watermark* forward). None: no stack / no seed.
         self.cdc_deployed_watermark: Optional[tuple[str, str]] = None
+        # ...and the GTID set offered with it (WatermarkGtids, normalized; "" when it carried
+        # none), from the same describe. The MySQL GTID start check judges a resume by it: a
+        # stack offered a position with no GTID set streamed by file:position. None: no
+        # recorded position, or not read (unknown).
+        self.cdc_deployed_watermark_gtids: Optional[str] = None
         # The LATEST binlog (file, pos) a Start offered the seeder on this stack. A Start
         # that fails after seeding leaves it in the offsets topic, and the seeder never
         # rewinds -- so a later, earlier start point would silently not apply.
@@ -1139,9 +1145,12 @@ class DataMigrationState:
     ) -> None:
         """Record the manual CDC start-position override (GTID and/or binlog).
 
-        Blank/``None`` values clear that field. Stored verbatim; the UI validates
-        the strings before calling this (advisory) and :meth:`cdc_start_override`
-        assembles a :class:`CdcResumePoint` from whatever is set.
+        Blank/``None`` values clear that field. The GTID set is stored normalized
+        (:func:`~dsql_migrator.core.cdc_coords.normalize_gtid_set`: no whitespace or
+        comments), the rest verbatim; the UI validates the strings before calling this
+        (advisory) and :meth:`cdc_start_override` assembles a :class:`CdcResumePoint` from
+        whatever is set. Start CDC offers the GTID set with the binlog file:position, and
+        on a ``gtid_mode=ON`` source it is what Debezium starts after.
 
         ``fingerprints`` are the captured tables' start-point fingerprints recorded for
         exactly this binlog file:position (Fetch current position). They are REPLACED on
@@ -1150,7 +1159,7 @@ class DataMigrationState:
         """
         file_value = (binlog_file or "").strip() or None
         with self._lock:
-            self._cdc_start_gtid = (gtid or "").strip() or None
+            self._cdc_start_gtid = normalize_gtid_set(gtid) or None
             self._cdc_start_binlog_file = file_value
             self._cdc_start_binlog_pos = binlog_pos
             self._cdc_start_fingerprints = (
@@ -1437,6 +1446,7 @@ class DataMigrationState:
             self.cdc_deployed_message_key_columns = None
             self.cdc_deployed_column_exclude_list = None
             self.cdc_deployed_watermark = None
+            self.cdc_deployed_watermark_gtids = None
             self.cdc_offered_seed = None
             self.cdc_deployed_snapshot_mode = None
             self.cdc_history_missing = False
@@ -1714,10 +1724,16 @@ class DataMigrationState:
             ):
                 self.cdc_offered_seed = (str(f), int(pos))
 
-    def set_cdc_deployed_watermark(self, value: Optional[tuple[str, str]]) -> None:
-        """Record the binlog (file, pos) the deployed stack was last started from."""
+    def set_cdc_deployed_watermark(
+        self, value: Optional[tuple[str, str]], *, gtids: Optional[str] = None
+    ) -> None:
+        """Record the binlog (file, pos) the deployed stack was last started from, and the
+        GTID set offered with it (``gtids``: ``""`` for none; ``None``: not known)."""
         with self._lock:
             self.cdc_deployed_watermark = tuple(value) if value else None  # type: ignore[assignment]
+            self.cdc_deployed_watermark_gtids = (
+                str(gtids) if value and gtids is not None else None
+            )
 
     def set_cdc_deployed_snapshot_mode(self, value: Optional[str]) -> None:
         """Record the SnapshotMode of a stack whose connectors exist (``None``: none)."""

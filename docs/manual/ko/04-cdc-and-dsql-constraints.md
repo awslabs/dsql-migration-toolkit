@@ -243,11 +243,18 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
 
 벌크 적재와 스트림 사이에 **누락된 변경도 중복도 없도록** 설계된 부분입니다.
 
-1. Full Load가 스냅샷 지점에서 **워터마크**를 캡처했습니다 — MySQL은 binlog file:position(가능하면 GTID
-   포함), PostgreSQL은 논리 복제 슬롯을 생성할 때 반환되는 WAL LSN이며, 슬롯 이름·publication 이름과 함께
-   기록됩니다 ([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
+1. Full Load가 스냅샷 지점에서 **워터마크**를 캡처했습니다 — MySQL은 binlog file:position, GTID 셋과
+   소스의 `gtid_mode`, PostgreSQL은 논리 복제 슬롯을 생성할 때 반환되는 WAL LSN이며, 슬롯 이름·
+   publication 이름과 함께 기록됩니다 ([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
 2. CDC를 시작하면 도구가 바로 그 워터마크에 재개 지점을 확립합니다. **MySQL 소스**에서는 커넥터의
    **시작 오프셋을 시드**합니다(소스 커넥터가 시작하기 전에 in-VPC Lambda가 오프셋 레코드를 기록).
+   시드된 오프셋에는 file:position과 GTID 셋이 담깁니다: `gtid_mode=ON`이면 Debezium은 정확히 그 GTID
+   셋(Full Load가 이미 복사한 트랜잭션) 다음부터 시작하고, `OFF`, `OFF_PERMISSIVE`, `ON_PERMISSIVE`이면
+   file:position부터 시작합니다. Start CDC는 먼저 `gtid_mode`를 읽고, 쓸 수 없는 시작 지점은
+   거부합니다([6장](06-limitations.md)). Manual 시작 지점은 binlog file:position과 함께 저장된 GTID 셋을
+   시드합니다. 버전 0.1.565 이하가 저장한 Manual 시작 지점은 GTID 셋 없이 복원되므로(그 버전들은 가져온
+   셋을 그 뒤에 입력한 어떤 위치 옆에도 남겨 두었습니다), `gtid_mode=ON`인 소스에서는 Start CDC 전에
+   **Fetch current position**을 다시 하거나 정확히 그 위치에서 실행을 마친 GTID 셋을 다시 입력하세요.
    **PostgreSQL 소스**에서는 오프셋 시더 Lambda가 없습니다. 대신 Full Load 정합성 지점에서 도구가 논리 복제
    슬롯(과 Full Load가 로드한 테이블에 대한 publication)을 생성하며, 슬롯이 반환한 정합 WAL LSN이 곧
    워터마크가 됩니다 — CDC는 그 미리 생성된 슬롯에서 바로 재개하므로 Kafka의 connect-offsets에는 아무것도
@@ -270,7 +277,9 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
    재구성한 뒤(binlog 이벤트를 디코딩하기 위해) **행 데이터는 다시 읽지 않고** 시드된 오프셋부터 재개합니다.
    Start CDC는 먼저 캡처 대상 테이블이 그 시작 지점 이후 바뀌지 않았는지 검사합니다([6장](06-limitations.md)).
    **Stop CDC 후의 재시작**은 대신 **`snapshot.mode=schema_only`**로 실행되어, 기록된 스키마 히스토리를
-   재생하고 DDL을 binlog 순서대로 적용합니다. **PostgreSQL 소스**에서는
+   재생하고 DDL을 binlog 순서대로 적용합니다. 이런 재시작은 커넥터의 자동 재시작과 마찬가지로
+   Debezium이 기록한 위치부터 이어집니다 — `gtid_mode=ON`이면 마지막으로 커밋한 GTID 셋 다음부터입니다.
+   **PostgreSQL 소스**에서는
    Debezium pgoutput 커넥터에 스키마 히스토리 토픽이 없습니다. 무손실 경로에서는 **`snapshot.mode=never`**로
    실행되며(논리 슬롯이 이미 시작 LSN을 보유하고 행도 적재됨), 단독/수동 시작에서는 **`initial`**(스냅샷 후
    스트리밍)을 사용합니다. Debezium PostgreSQL은 슬롯 자체의 위치에서만 재개할 수 있으며, 임의의 WAL LSN으로

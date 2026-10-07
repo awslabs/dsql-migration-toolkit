@@ -8,7 +8,9 @@ Why this exists
 ---------------
 The gapless Full Load -> CDC handoff (Property 11) requires the Debezium MySQL
 source connector to begin streaming from *exactly* the binlog/GTID position the
-bulk snapshot ended at. A first start from a seeded offset runs
+bulk snapshot ended at: by the binlog file:position, or -- on a source whose
+``gtid_mode`` is ON, where Debezium positions by GTID set and ignores the
+file:position -- after the offset's GTID set. A first start from a seeded offset runs
 ``snapshot.mode=recovery``, which rebuilds only the schema history (from the source
 tables as they are now), never the rows; a restart of a stopped stack runs
 ``schema_only`` and replays that history. Debezium reads its start position from the compacted
@@ -36,8 +38,11 @@ insulates against any version drift by mirroring the live connector's record.)
   ``["<connector_name>", {"server": "<topic.prefix>"}]``.
 - **Source offset** (the *value*): a streaming (non-snapshot) MySQL offset:
   ``{"ts_sec": <unix>, "file": "<binlog file>", "pos": <int>, "gtids":
-  "<gtid set>", "row": 0, "server_id": 0, "event": 0}``. ``gtids`` is omitted
-  when the source has no GTID set (file:pos resume only).
+  "<gtid set>", "row": 0, "server_id": 0, "event": 0}``. ``gtids`` is what Debezium
+  starts after on a ``gtid_mode=ON`` source; it is omitted when the start point
+  carries no GTID set (Debezium then positions by file:pos, which on a
+  ``gtid_mode=ON`` source means the whole retained binary log -- Start CDC refuses
+  such a start point there).
 
 Because the precise value schema is connector-version sensitive, the builder
 supports a **read-modify-write** mode: pass the connector's *existing* offset
@@ -77,7 +82,8 @@ def build_source_offset(
 
     Requires binlog ``file``+``pos`` (GTID alone is not sufficient for the MySQL
     connector's offset value, which is binlog-coordinate based; ``gtids`` is
-    added when present so GTID-aware resume is used). When ``base_offset`` is
+    added when present: on a ``gtid_mode=ON`` source Debezium starts after it and
+    ignores ``file``/``pos``). When ``base_offset`` is
     given (the live connector's current offset value read from ``connect-offsets``)
     its shape is preserved and only ``ts_sec``/``file``/``pos``/``gtids`` (plus the
     position-relative ``row``/``event`` counters) are overridden -- the safest seed
@@ -113,8 +119,10 @@ def build_source_offset(
     if watermark.gtid_executed:
         offset["gtids"] = watermark.gtid_executed
     else:
-        # No GTID on the source -> resume purely by file:pos; never leave a stale
-        # gtids from a copied base_offset, which would mis-seed the connector.
+        # No GTID set with this point -> Debezium positions by file:pos (unless the
+        # source runs gtid_mode=ON, which Start CDC refuses for such a point); never
+        # leave a stale gtids from a copied base_offset, which would mis-seed the
+        # connector.
         offset.pop("gtids", None)
     # A seeded *streaming* start must not look like an in-progress snapshot.
     offset.pop("snapshot", None)

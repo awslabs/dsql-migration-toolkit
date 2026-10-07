@@ -132,6 +132,13 @@ class SessionSnapshot(BaseModel):
         default_factory=dict, exclude_if=lambda v: not v
     )
     cdc_history_missing: bool = Field(default=False, exclude_if=lambda v: not v)
+    # True when ``cdc_start_gtid`` was saved by a build that keeps a Manual GTID set only
+    # with the binlog position it was read at (or typed with). 0.1.565 and earlier kept a
+    # fetched set beside ANY position typed after the fetch and never seeded it; a later
+    # build seeds it, and on a gtid_mode=ON source Debezium starts after it -- so an
+    # unstamped set is dropped on restore (position and fingerprints kept). Left OUT of the
+    # payload while False, like the fields above.
+    cdc_start_gtid_bound: bool = Field(default=False, exclude_if=lambda v: not v)
     # LOB exclusions flattened to "table:column" strings (stable, sorted).
     cdc_lob_exclusions: list[str] = Field(default_factory=list)
     cdc_connector_names: list[str] = Field(default_factory=list)

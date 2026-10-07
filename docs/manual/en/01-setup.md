@@ -149,11 +149,16 @@ what's missing, but setting them up is a source-side task you do once.
   pinning WAL and can fill the source's disk**, so monitor WAL/slot health — the
   tool surfaces `wal_status`, and `wal_status='lost'` means the slot was invalidated
   → gapless resume is broken → re-run Full Load.
-- **MySQL source — GTID is recommended, but not required.** With `gtid_mode=ON`, CDC
-  resume survives a source failover or replica promotion; without it, the tool falls
-  back to the binlog `file:position` watermark — which works, but is less robust
-  across failover. The gate reports a missing GTID as informational, never as a
-  blocker. (PostgreSQL has no GTID / `file:position` concept.)
+- **MySQL source — GTID is recommended, but not required; decide before the Full Load.**
+  With `gtid_mode=ON`, Debezium positions by GTID: CDC starts after the GTID set
+  recorded with its start point (the Full Load watermark, or **Fetch current position**
+  for a Manual point) and resumes after the GTID set it last committed, which also
+  survives a failover to a replica whose binary log files differ. With `OFF`,
+  `OFF_PERMISSIVE` or `ON_PERMISSIVE` it uses the binlog `file:position`, which works the
+  same on one source. Keep the mode unchanged from the Full Load to cut over: a start
+  point recorded while `gtid_mode` was not `ON` cannot start CDC once it is `ON`
+  ([Chapter 6](06-limitations.md)). The gate reports a missing GTID as informational,
+  never as a blocker. (PostgreSQL has no GTID / `file:position` concept.)
 - **PostgreSQL source — CDC must run against the cluster writer.** The source must
   be the **writer, not a standby** (`pg_is_in_recovery()` must be false) — a standby
   can't host a replication slot, so point CDC at the writer endpoint.

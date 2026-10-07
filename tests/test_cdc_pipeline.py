@@ -181,9 +181,23 @@ def test_build_source_config_binlog_override_selects_recovery() -> None:
     )
     assert config.start_binlog_file == "mysql-bin.000999"
     assert config.start_binlog_pos == 12345
-    # Only file:pos is seeded, so the override's GTID is not reported either.
-    assert config.start_gtid is None
+    # G19: the override's GTID set is seeded with its file:pos (on a gtid_mode=ON source
+    # Debezium starts after it), so the preview reports it -- normalized, as seeded.
+    assert config.start_gtid == "99999999-1111-2222-3333-444444444444:1-9"
     assert config.snapshot_mode == "recovery"
+    spaced = CdcPipelineOrchestrator().build_source_config(
+        "src", _tables(), _watermark(),
+        resume_override=override.model_copy(
+            update={"gtid_executed": "u:1-3,\n v:1-2 "}
+        ),
+    )
+    assert spaced.start_gtid == "u:1-3,v:1-2"
+    # Without a GTID set there is none to report.
+    bare_point = CdcPipelineOrchestrator().build_source_config(
+        "src", _tables(), _watermark(),
+        resume_override=override.model_copy(update={"gtid_executed": None}),
+    )
+    assert bare_point.start_gtid is None
     # Also with the sentinel (no Full Load) watermark a CDC-only Manual start uses.
     bare = CdcPipelineOrchestrator().build_source_config(
         "src", _tables(),
@@ -201,16 +215,40 @@ def test_cdc_seed_watermark_precedence() -> None:
     # Automatic (no Manual point): the Full Load job watermark, unchanged -- even None.
     assert cdc_seed_watermark(job, None, now=now) == (job, "full_load")
     assert cdc_seed_watermark(None, None, now=now) == (None, "full_load")
-    # A usable Manual point beats the job watermark; file:pos only, stamped `now`.
+    # A usable Manual point beats the job watermark, stamped `now`. G19: it carries its
+    # GTID set (normalized: MySQL prints ",\n" between UUIDs and the binlog client does
+    # not trim), because on a gtid_mode=ON source Debezium positions by that set.
     manual = CdcResumePoint(
-        binlog_file="mysql-bin.000042", binlog_position=4, gtid_executed="u:1-3"
+        binlog_file="mysql-bin.000042", binlog_position=4, gtid_executed="u:1-3,\n v:1-2 "
     )
     for job_wm in (job, None):
         seed, origin = cdc_seed_watermark(job_wm, manual, now=now)
         assert origin == "manual"
         assert (seed.binlog_file, seed.binlog_position) == ("mysql-bin.000042", 4)
-        assert seed.gtid_executed is None
+        assert seed.gtid_executed == "u:1-3,v:1-2"
         assert seed.snapshot_timestamp == now
+    # A Manual point without a GTID set still carries none (file:pos only).
+    seed, origin = cdc_seed_watermark(
+        job, CdcResumePoint(binlog_file="mysql-bin.000042", binlog_position=4), now=now
+    )
+    assert origin == "manual" and seed.gtid_executed is None
+    # The Full Load route returns the SAME object when its set needs no normalization...
+    assert cdc_seed_watermark(job, None, now=now)[0] is job
+    # ...and a copy with the normalized set otherwise, keeping everything else.
+    raw = job.model_copy(
+        update={
+            "gtid_executed": "u:1-5,\nv:1-3",
+            "table_fingerprints": {"app.orders": "2:1:x:y"},
+            "gtid_mode": "ON",
+        }
+    )
+    copied, origin = cdc_seed_watermark(raw, None, now=now)
+    assert origin == "full_load" and copied is not raw
+    assert copied.gtid_executed == "u:1-5,v:1-3"
+    assert copied.table_fingerprints == {"app.orders": "2:1:x:y"}
+    assert copied.gtid_mode == "ON"
+    assert (copied.binlog_file, copied.binlog_position) == (job.binlog_file, job.binlog_position)
+    assert raw.gtid_executed == "u:1-5,\nv:1-3"  # the stored job watermark is unchanged
     # A GTID set alone cannot seed: no fallback to the job watermark or to "now".
     gtid_only = CdcResumePoint(gtid_executed="u:1-3")
     assert cdc_seed_watermark(job, gtid_only, now=now) == (None, "manual_unseedable")

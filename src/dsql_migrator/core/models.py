@@ -892,6 +892,18 @@ class Watermark(BaseModel):
     server_uuid: Optional[str] = Field(
         default=None, description="The source server's '@@GLOBAL.server_uuid'."
     )
+    # Left OUT of the payload while empty, like table_fingerprints below: this model is
+    # extra="forbid", so a watermark that never recorded it still loads on an older build.
+    gtid_mode: Optional[str] = Field(
+        default=None,
+        exclude_if=lambda v: not v,
+        description=(
+            "The source's @@GLOBAL.gtid_mode when this point was captured (MySQL). Start "
+            "CDC refuses a start point captured while it was not ON once the source is ON. "
+            "None when unread, for PostgreSQL, or for a watermark recorded by an earlier "
+            "version."
+        ),
+    )
     wal_lsn: Optional[str] = Field(
         default=None,
         description=(

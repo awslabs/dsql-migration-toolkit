@@ -427,6 +427,16 @@ def test_watermark_params_filled_from_coordinates() -> None:
     assert all(isinstance(v, str) for v in by_key.values())
 
 
+def test_watermark_params_normalize_the_gtid_set() -> None:
+    # G19: MySQL prints ",\n" between server UUIDs, and the binlog client splits the set on
+    # "," without trimming, so a space or newline would fail the connector at start. The
+    # seeder gets the set exactly as Debezium will parse it.
+    by_key = dict(build_watermark_params(_wm(gtid_executed="u:1-5,\nv:1-3")))
+    assert by_key["WatermarkGtids"] == "u:1-5,v:1-3"
+    by_key = dict(build_watermark_params(_wm(gtid_executed=" u:1-5 ,\r\n v:1-3 /*x*/")))
+    assert by_key["WatermarkGtids"] == "u:1-5,v:1-3"
+
+
 def test_watermark_params_gtidless_source_empty_gtids() -> None:
     by_key = dict(build_watermark_params(_wm(gtid_executed=None)))
     assert by_key["WatermarkGtids"] == ""

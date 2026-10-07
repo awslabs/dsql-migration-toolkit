@@ -136,11 +136,13 @@ Schema Conversion ステップにあります。
 `information_schema` の推定値。単に数えるだけのためにソースをフルスキャンしません)を保持します。エンジン
 固有の座標は次のように異なります。
 
-- **MySQL** — **binlog ファイル + 位置**、および **GTID セット**(`@@GLOBAL.gtid_executed`)と
-  `server_uuid`。これらは `SHOW BINARY LOG STATUS`(MySQL 8.2+/8.4、`SHOW MASTER STATUS` が削除された
-  バージョン)で読み取り、それ以下(≤ 8.0.x)では `SHOW MASTER STATUS` にフォールバックします。ウォーター
-  マークは位置を読む直前に、移行対象テーブルごとの列定義の短いフィンガープリントも記録するため、Start CDC は
-  それ以降にテーブルが変更されたかを判断できます([第 6 章](06-limitations.md) を参照)。
+- **MySQL** — **binlog ファイル + 位置**、および **GTID セット**(`@@GLOBAL.gtid_executed`)、
+  ソースの **`gtid_mode`**、`server_uuid`。これらは `SHOW BINARY LOG STATUS`(MySQL 8.2+/8.4、
+  `SHOW MASTER STATUS` が削除されたバージョン)で読み取り、それ以下(≤ 8.0.x)では `SHOW MASTER STATUS`
+  にフォールバックします。`gtid_mode=ON` のソースでは CDC はウォーターマークの GTID セットの次から開始し、
+  それ以外ではそのファイル + 位置から開始します。ウォーターマークは位置を読む直前に、移行対象テーブル
+  ごとの列定義の短いフィンガープリントも記録するため、Start CDC はそれ以降にテーブルが変更されたかを
+  判断できます([第 6 章](06-limitations.md) を参照)。
 - **PostgreSQL** — binlog 座標ではなく **WAL LSN**(`Watermark.wal_lsn`)。一貫性の地点で、ツールは
   **publication**(移行対象テーブルに厳密に対する `FOR TABLE`。`FOR ALL TABLES` は決して使いません)と
   `pgoutput` の**論理レプリケーションスロット**を作成し、スロットが返した一貫 LSN を、スロット名・

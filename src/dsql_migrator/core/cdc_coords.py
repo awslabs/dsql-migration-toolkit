@@ -10,11 +10,13 @@ validated, structured form for :class:`~dsql_migrator.core.cdc.CdcResumePoint`.
 
 Design choice -- **advisory, not blocking** (Property: user-convenience-first):
 ``validate_gtid``/``validate_binlog_file`` return an *optional message* describing
-why a value looks wrong rather than raising, so the UI can show an orange hint
-while still letting the user proceed. MySQL GTID sets have many legal shapes
-(multi-source, multi-interval, whitespace, ``gtid_purged``-style comments), so a
-strict regex would wrongly reject valid input; we validate structure liberally
-and let MSK Connect be the final authority at connector-start time.
+why a value looks wrong rather than raising, so the UI can show a hint while still
+storing what the user entered. MySQL GTID sets have many legal shapes
+(multi-source, multi-interval, whitespace, ``gtid_purged``-style comments), so the
+structure is validated liberally. The one hard stop is at Start CDC: a Manual GTID
+set that fails :func:`validate_gtid` is refused there on every ``gtid_mode``, because
+Debezium writes the start point's set into every offset it commits and cannot read a
+malformed one back at its next task start.
 
 No dependency on the rest of the package -- these are standalone string helpers,
 trivially unit-testable without any database or AWS access.
@@ -55,6 +57,46 @@ def _strip_noise(value: str) -> str:
     no_comments = re.sub(r"/\*.*?\*/", "", value, flags=re.DOTALL)
     # Remove all whitespace (GTID sets never contain meaningful spaces).
     return "".join(no_comments.split())
+
+
+def normalize_gtid_set(value: Optional[str]) -> str:
+    """A GTID set with every ``/* ... */`` comment and all whitespace removed. Pure.
+
+    ``""`` for ``None`` or a blank value. MySQL prints ``Executed_Gtid_Set`` and
+    ``@@GLOBAL.gtid_executed`` with ``",\\n"`` between server UUIDs, and a pasted set can
+    carry spaces or a comment. Debezium strips only ``\\n`` and ``\\r``, and the binlog
+    client it hands the set to splits it on ``,`` and parses each server UUID without
+    trimming, so a space left in the set fails the source connector at start. A GTID set
+    never contains meaningful whitespace, so removing it changes nothing else.
+    """
+    if not value:
+        return ""
+    return _strip_noise(str(value))
+
+
+# How many characters of a GTID set a log line or a notice shows before " …".
+GTID_SUMMARY_LIMIT = 160
+
+
+def gtid_set_summary(value: Optional[str], limit: int = GTID_SUMMARY_LIMIT) -> str:
+    """A GTID set for a log line or a notice: normalized, capped at ``limit`` + ``" …"``.
+
+    A set holds one interval list per server UUID that ever wrote to the source, so it can
+    run to kilobytes; a line names its beginning only. Pure.
+    """
+    text = normalize_gtid_set(value)
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
+def gtid_mode_is_on(value: Optional[str]) -> bool:
+    """True when a MySQL ``gtid_mode`` value is exactly ``ON`` (case-insensitive). Pure.
+
+    Debezium's own test (2.7.4 ``MySqlConnection.isGtidModeEnabled``): only ``ON`` makes it
+    position by GTID set. ``ON_PERMISSIVE``, ``OFF_PERMISSIVE`` and ``OFF`` stream by
+    binlog file:position, and MySQL refuses GTID auto-positioning unless ``gtid_mode`` is
+    ``ON``.
+    """
+    return (value or "").strip().upper() == "ON"
 
 
 def validate_gtid(value: str) -> Optional[str]:
@@ -129,6 +171,10 @@ def validate_wal_lsn(value: str) -> Optional[str]:
 
 
 __all__ = [
+    "GTID_SUMMARY_LIMIT",
+    "gtid_mode_is_on",
+    "gtid_set_summary",
+    "normalize_gtid_set",
     "validate_gtid",
     "validate_binlog_file",
     "parse_binlog_coordinate",

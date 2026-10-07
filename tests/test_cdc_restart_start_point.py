@@ -87,12 +87,23 @@ def test_probe_records_the_watermark_the_stack_last_started_from():
                     "WatermarkBinlogFile": "mysql-bin-changelog.000007",
                     "WatermarkBinlogPos": "108063011"})
     assert seeded.cdc_deployed_watermark == ("mysql-bin-changelog.000007", "108063011")
+    # G19: with the GTID set it was offered ("" -- none), from the same describe.
+    assert seeded.cdc_deployed_watermark_gtids == ""
+    with_set = probe({"MskBootstrapServers": "", "DeploySink": "true",
+                      "WatermarkBinlogFile": "mysql-bin-changelog.000007",
+                      "WatermarkBinlogPos": "108063011",
+                      "WatermarkGtids": "u:1-5,\n v:1-3"})
+    assert with_set.cdc_deployed_watermark_gtids == "u:1-5,v:1-3"
     cdc_only = probe({"MskBootstrapServers": "", "DeploySink": "true",
-                      "WatermarkBinlogFile": "", "WatermarkBinlogPos": ""})
+                      "WatermarkBinlogFile": "", "WatermarkBinlogPos": "",
+                      "WatermarkGtids": "u:1-5"})
     assert cdc_only.cdc_deployed_watermark is None
+    assert cdc_only.cdc_deployed_watermark_gtids is None  # no recorded position: no record
     # Adopting another stack drops it (it belongs to the previous stack).
     seeded.adopt_cdc_stack("dsql-cdc-other")
     assert seeded.cdc_deployed_watermark is None
+    with_set.adopt_cdc_stack("dsql-cdc-other")
+    assert with_set.cdc_deployed_watermark_gtids is None
 
 
 def test_cdc_start_resumes_truth_table():
@@ -194,8 +205,8 @@ def test_a_gtid_only_manual_entry_is_not_a_start_point():
     assert "Start point set" not in blob
     assert "Action needed" in blob
     assert (
-        "A GTID set alone cannot set where this pipeline starts; it streams by binlog "
-        "file:position (Fetch current position fills it)."
+        "A GTID set alone cannot set where this pipeline starts: the start offset is keyed "
+        "on the binlog file:position, so enter it too (Fetch current position fills both)."
     ) in blob
     assert "(preferred)" not in blob
 
@@ -301,6 +312,25 @@ def test_start_detail_names_a_manual_start_point():
     ) in line
     assert "gapless from the Full Load watermark" not in line
     assert "CURRENT position" not in line
+    # G19 review: a Manual point seeded WITH a GTID set is still named by its binlog
+    # file:position -- the card's, the deploy log's and the positioning line's coordinate --
+    # plus the set (capped like every other line naming one), never by the set alone.
+    with_set = manual.model_copy(update={
+        "gtid_executed": "1DFF02DB-0000-0000-0000-000000000001:1-900,\n"
+                         "1DFF02DB-0000-0000-0000-000000000002:1-77"
+    })
+    line = d("dsql-cdc-x", with_set, mode="manual", source_type=SourceType.MYSQL,
+             seed_origin="manual")
+    assert (
+        "start point binlog mysql-bin.000042:1234 with GTID set "
+        "1DFF02DB-0000-0000-0000-000000000001:1-900,1DFF02DB-0000-0000-0000-000000000002:1-77 "
+        "(Manual start point; changes from this position on are replicated)"
+    ) in line
+    assert "start point GTID" not in line
+    long_set = ",".join(f"{i:08d}-0000-0000-0000-000000000000:1-9" for i in range(10))
+    capped = d("dsql-cdc-x", manual.model_copy(update={"gtid_executed": long_set}),
+               mode="manual", source_type=SourceType.MYSQL, seed_origin="manual")
+    assert " … (Manual start point" in capped and long_set not in capped
     # A GTID-only Manual entry seeds nothing: say so, not "there is no Full Load watermark".
     none = d("dsql-cdc-x", None, mode="manual", source_type=SourceType.MYSQL,
              seed_origin="manual_unseedable")
@@ -568,7 +598,7 @@ class _FetchConn:
         self.log, self.status_error, self.catalog_error = log, status_error, catalog_error
 
 
-def _patch_fetch(monkeypatch, *, status_error=None, catalog_error=None):
+def _patch_fetch(monkeypatch, *, status_error=None, catalog_error=None, gtid_mode="ON"):
     import dsql_migrator.core.cdc_catalog_drift as drift
     import dsql_migrator.core.watermark as wm
     import dsql_migrator.ui.connect as connect
@@ -613,8 +643,13 @@ def _patch_fetch(monkeypatch, *, status_error=None, catalog_error=None):
             raise conn.status_error
         return {"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}
 
+    def _gtid_mode(conn):
+        log.append(("gtid_mode", id(conn)))
+        return gtid_mode
+
     monkeypatch.setattr(drift, "read_live_catalog", _catalog)
     monkeypatch.setattr(wm, "read_binlog_status_row", _status_row)
+    monkeypatch.setattr(wm, "read_gtid_mode", _gtid_mode)
     return log
 
 
@@ -622,20 +657,22 @@ _SESSION = SimpleNamespace(source_config=SimpleNamespace(), source_password="pw"
 
 
 def test_fetch_reads_the_catalog_before_the_position_on_one_connection(monkeypatch):
-    log = _patch_fetch(monkeypatch)
-    row, fps = _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
+    log = _patch_fetch(monkeypatch, gtid_mode="ON")
+    row, fps, mode = _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
     assert row["File"] == "mysql-bin.000200"
     assert set(fps) == {"app.orders"} and fps["app.orders"].startswith("2:1:")
+    # G19: the source's gtid_mode is read on the same connection, after the position.
+    assert mode == "ON"
     kinds = [e[0] for e in log]
-    assert kinds == ["connect", "catalog", "status", "dispose"]
-    assert log[1][1] == log[2][1] == log[0][1]  # ONE connection
+    assert kinds == ["connect", "catalog", "status", "gtid_mode", "dispose"]
+    assert log[1][1] == log[2][1] == log[3][1] == log[0][1]  # ONE connection
 
 
 def test_fetch_disposes_the_engine_and_keeps_the_position_when_the_catalog_fails(monkeypatch):
     import pytest
 
     log = _patch_fetch(monkeypatch, catalog_error=RuntimeError("timeout"))
-    row, fps = _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
+    row, fps, _mode = _cdc_ui._fetch_start_position(_SESSION, ["app.orders"])
     assert row["Position"] == 77 and fps is None
     log = _patch_fetch(monkeypatch, status_error=RuntimeError("denied"))
     with pytest.raises(RuntimeError):
@@ -668,7 +705,7 @@ class _InputsUi(_RecordingUi):
         self.notified.append((str(message), _k.get("type")))
 
 
-def _manual_inputs(monkeypatch, fetch_result):
+def _manual_inputs(monkeypatch, fetch_result, *, state=None):
     import asyncio
 
     import nicegui
@@ -683,11 +720,13 @@ def _manual_inputs(monkeypatch, fetch_result):
 
     def _fetch(session, names):
         calls.append(list(names))
-        return fetch_result
+        # (row, fingerprints, gtid_mode); a 2-tuple fixture fetched while gtid_mode was OFF.
+        return tuple(fetch_result) if len(fetch_result) == 3 else (*fetch_result, "OFF")
 
     monkeypatch.setattr(_cdc_ui, "_fetch_start_position", _fetch)
-    state = DataMigrationState()
-    state.set_cdc_start_mode("manual")
+    if state is None:
+        state = DataMigrationState()
+        state.set_cdc_start_mode("manual")
     ui = _InputsUi()
     _cdc_ui._render_cdc_manual_inputs(
         ui, state, lambda: None, session=_SESSION, captured_names=lambda: ["app.orders"],
@@ -773,6 +812,118 @@ def test_fetch_never_swallows_a_read_only_guard_violation(monkeypatch):
     assert log[-1] == ("dispose",)
 
 
+# ---------------------------------------------------------------------------
+# G19: Fetch current position records the GTID set with the position (gtid_mode=ON only)
+# ---------------------------------------------------------------------------
+
+_U = "1DFF02DB-0000-0000-0000-000000000001"
+_V = "1DFF02DB-0000-0000-0000-000000000002"
+# MySQL prints ",\n" between server UUIDs.
+_ROW_GTID = {"File": "mysql-bin.000200", "Position": 77,
+             "Executed_Gtid_Set": f"{_U}:1-812,\n{_V}:1-3"}
+_GTID_NORM = f"{_U}:1-812,{_V}:1-3"
+
+
+def test_fetch_on_a_gtid_on_source_fills_the_normalized_set_and_says_so(monkeypatch):
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    assert ui.inputs["GTID set"].value == _GTID_NORM
+    assert ui.inputs["Binlog file:position"].value == "mysql-bin.000200:77"
+    positive = [m for m, t in ui.notified if t == "positive"]
+    assert positive and "gtid_mode=ON: CDC starts after this GTID set" in positive[0]
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid == _GTID_NORM
+    assert state.cdc_start_fingerprints() == _FPS  # the fetched (position, set) pair
+    seed, origin = _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)
+    assert origin == "manual" and seed.gtid_executed == _GTID_NORM
+    saved = [m for m, t in ui.notified if t == "positive"][-1]
+    assert saved == "Start point saved (not streaming yet) — mysql-bin.000200:77 with its GTID set"
+
+
+def test_fetch_on_a_source_that_is_not_gtid_on_leaves_the_set_empty(monkeypatch):
+    # A set read while gtid_mode is not ON is never offered: if the mode is switched to ON
+    # later, it could make MySQL skip the changes written without a GTID.
+    ui, state, by, _calls = _manual_inputs(
+        monkeypatch, (dict(_ROW_GTID), _FPS, "OFF_PERMISSIVE")
+    )
+    assert ui.inputs["GTID set"].value == ""
+    positive = [m for m, t in ui.notified if t == "positive"]
+    assert positive and "its gtid_mode is OFF_PERMISSIVE" in positive[0]
+    assert "starts from this binlog file:position" in positive[0]
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid is None
+    assert state.cdc_start_fingerprints() == _FPS
+    # An unread mode keeps the old wording and fills nothing either.
+    ui2, _state2, _by2, _c = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, None))
+    assert ui2.inputs["GTID set"].value == ""
+    assert [m for m, t in ui2.notified if t == "positive"][0].startswith(
+        "Fetched current position from source"
+    )
+
+
+def test_editing_only_the_position_after_a_fetch_drops_the_fetched_set(monkeypatch):
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    ui.inputs["Binlog file:position"].set_value("mysql-bin.000200:99")
+    by["Use this start point"].on_click()
+    # The set was read at :77, not :99 -- storing it would skip or re-read changes.
+    assert state._cdc_start_gtid is None
+    assert (state._cdc_start_binlog_file, state._cdc_start_binlog_pos) == (
+        "mysql-bin.000200", 99
+    )
+    assert state.cdc_start_fingerprints() == {}
+    assert ui.inputs["GTID set"].value == ""
+    warned = [m for m, t in ui.notified if t == "warning"]
+    assert warned and warned[-1].startswith("Start point saved without a GTID set:")
+    assert "read at mysql-bin.000200:77, not at mysql-bin.000200:99" in warned[-1]
+
+
+def test_a_stored_set_beside_an_edited_position_is_dropped_after_a_re_render(monkeypatch):
+    _ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    by["Use this start point"].on_click()
+    # Re-confirming the stored (position, set) pair after a re-render keeps both.
+    ui2, by2 = _rerender(state)
+    assert ui2.inputs["GTID set"].value == _GTID_NORM
+    by2["Use this start point"].on_click()
+    assert state._cdc_start_gtid == _GTID_NORM and state.cdc_start_fingerprints() == _FPS
+    # Editing only the position: the stored set was read at :77.
+    ui3, by3 = _rerender(state)
+    ui3.inputs["Binlog file:position"].set_value("mysql-bin.000201:4")
+    by3["Use this start point"].on_click()
+    assert state._cdc_start_gtid is None and state.cdc_start_fingerprints() == {}
+    assert any(
+        m.startswith("Start point saved without a GTID set:") for m, _t in ui3.notified
+    )
+    # A set the operator types with a position is theirs to assert: stored (normalized).
+    ui4, by4 = _rerender(state)
+    ui4.inputs["GTID set"].set_value(f" {_U}:1-900 ")
+    by4["Use this start point"].on_click()
+    assert state._cdc_start_gtid == f"{_U}:1-900"
+
+
+def test_the_start_point_line_names_the_gtid_set_seeded_with_the_position():
+    state = _state(committed=False)
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(
+        gtid=f"{_U}:1-812,\n {_V}:1-3", binlog_file="mysql-bin.000200", binlog_pos=77
+    )
+    assert state._cdc_start_gtid == _GTID_NORM  # stored normalized
+    blob = _card_text(state)
+    assert f"Start point set — binlog mysql-bin.000200:77 · GTID set {_GTID_NORM}" in blob
+    # The connector-config preview names the set too, and when Debezium uses it.
+    from dsql_migrator.core.models import TableSelection
+    from tests.test_ui_data_migration import _inventory
+
+    state.set_selection(TableSelection(selected_tables=["orders"]))
+    preview = " ".join(_card(state, inventory=_inventory()).texts)
+    assert f"gtid (start, used when gtid_mode=ON) = {_GTID_NORM}" in preview
+    assert "binlog (start) = mysql-bin.000200:77" in preview
+    without = _state(committed=False)
+    without.set_cdc_start_mode("manual")
+    without.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77)
+    line = _card_text(without)
+    assert "Start point set — binlog mysql-bin.000200:77" in line
+    assert "· GTID set" not in line
+
+
 _FPS = {"app.orders": "2:1:00000000:0000000000000000"}
 _ROW = {"File": "mysql-bin.000200", "Position": 77, "Executed_Gtid_Set": ""}
 
@@ -796,10 +947,12 @@ def test_reconfirming_the_stored_point_after_a_re_render_keeps_its_fingerprints(
     by2["Use this start point"].on_click()
     assert state.cdc_start_fingerprints() == _FPS
     assert _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)[0].table_fingerprints == _FPS
-    # Editing only the GTID keeps them too: the seed is the binlog file:position.
+    # G19: editing only the GTID set drops them -- on a gtid_mode=ON source the set IS the
+    # start point, so definitions recorded with another set do not describe it.
     ui2.inputs["GTID set"].set_value("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5")
     by2["Use this start point"].on_click()
-    assert state.cdc_start_fingerprints() == _FPS
+    assert state.cdc_start_fingerprints() == {}
+    assert state._cdc_start_gtid == "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
     # Another position never carries them.
     ui2.inputs["Binlog file:position"].set_value("mysql-bin.000200:78")
     by2["Use this start point"].on_click()
@@ -853,7 +1006,7 @@ def _live_card(monkeypatch, state, *, migration_type, job=None):
 
     def _fetch(_session, names):
         calls.append(list(names))
-        return dict(_ROW), dict(_FPS)
+        return dict(_ROW), dict(_FPS), "OFF"
 
     monkeypatch.setattr(_cdc_ui, "_fetch_start_position", _fetch)
     ui = _CardInputsUi()
@@ -979,3 +1132,164 @@ def test_after_a_reload_reset_choosing_manual_again_brings_the_fetched_point_bac
     state.set_cdc_start_mode("manual")
     seed, origin = _cdc_ui._cdc_start_seed(state, _WM, SourceType.MYSQL)
     assert origin == "manual" and seed.table_fingerprints == _FPS
+
+
+# ---------------------------------------------------------------------------
+# G19 review: a fetched GTID set is never stored without the position it was read at
+# ---------------------------------------------------------------------------
+
+
+def _manual_seed(state):
+    return _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)[0]
+
+
+def test_a_fetched_set_saved_without_its_position_is_not_kept(monkeypatch):
+    # Fetch (set read at :77), clear the position, Use: the set was read at :77, so it is
+    # not saved alone -- a position typed on the next render would silently carry it.
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    ui.inputs["Binlog file:position"].set_value("")
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid is None
+    assert ui.inputs["GTID set"].value == ""
+    warned = [m for m, t in ui.notified if t == "warning"]
+    assert warned[-1] == (
+        "The GTID set shown was read at mysql-bin.000200:77, so it is not saved without "
+        "that position. Enter a binlog file:position (on a source with gtid_mode=ON, with "
+        "the GTID set executed at it), or Fetch current position again."
+    )
+    # The next render: an earlier position typed is saved WITHOUT a set (Start CDC then
+    # asks for the set on a gtid_mode=ON source instead of skipping :5 to :77).
+    ui2, by2 = _rerender(state)
+    assert ui2.inputs["GTID set"].value == ""
+    ui2.inputs["Binlog file:position"].set_value("mysql-bin.000200:5")
+    by2["Use this start point"].on_click()
+    seed = _manual_seed(state)
+    assert (seed.binlog_position, seed.gtid_executed) == (5, None)
+    assert not any("with its GTID set" in m for m, _t in ui2.notified)
+
+
+def test_a_stored_pair_whose_position_is_cleared_drops_its_set(monkeypatch):
+    _ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid == _GTID_NORM
+    ui2, by2 = _rerender(state)
+    ui2.inputs["Binlog file:position"].set_value("")
+    by2["Use this start point"].on_click()
+    assert state._cdc_start_gtid is None
+    assert any("read at mysql-bin.000200:77, so it is not saved" in m
+               for m, _t in ui2.notified)
+    ui3, by3 = _rerender(state)
+    ui3.inputs["Binlog file:position"].set_value("mysql-bin.000200:5")
+    by3["Use this start point"].on_click()
+    assert _manual_seed(state).gtid_executed is None
+
+
+def test_a_mistyped_position_after_a_fetch_does_not_keep_the_set(monkeypatch):
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    ui.inputs["Binlog file:position"].set_value("mysql-bin.000200:5x")
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid is None
+    negative = [m for m, t in ui.notified if t == "negative"]
+    assert negative[-1] == (
+        "Binlog must be 'file:position' (e.g. mysql-bin.000123:45678). The GTID set shown "
+        "was cleared: it was read at mysql-bin.000200:77 and is kept only with that "
+        "position."
+    )
+    ui2, by2 = _rerender(state)
+    ui2.inputs["Binlog file:position"].set_value("mysql-bin.000200:5")
+    by2["Use this start point"].on_click()
+    assert _manual_seed(state).gtid_executed is None
+
+
+def test_a_set_the_operator_typed_alone_is_kept_with_a_later_position(monkeypatch):
+    # Theirs to assert (Start CDC checks it on a gtid_mode=ON source): not a fetched set.
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW), _FPS, "OFF"))
+    ui.inputs["Binlog file:position"].set_value("")
+    ui.inputs["GTID set"].set_value(f"{_U}:1-50")
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid == f"{_U}:1-50"
+    ui2, by2 = _rerender(state)
+    ui2.inputs["Binlog file:position"].set_value("mysql-bin.000200:5")
+    by2["Use this start point"].on_click()
+    assert _manual_seed(state).gtid_executed == f"{_U}:1-50"
+
+
+def test_editing_only_the_set_right_after_a_fetch_drops_the_fetched_fingerprints(monkeypatch):
+    # Same render as the Fetch: its cell still holds (:77, set, fingerprints). On a
+    # gtid_mode=ON source the set IS the start point, so definitions read with another set
+    # do not describe it -- the start-point check then warns instead of passing.
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW_GTID), _FPS, "ON"))
+    ui.inputs["GTID set"].set_value(f" {_U}:1-700,\n{_V}:1-3 ")
+    by["Use this start point"].on_click()
+    assert state._cdc_start_gtid == f"{_U}:1-700,{_V}:1-3"  # typed set stored, normalized
+    assert (state._cdc_start_binlog_file, state._cdc_start_binlog_pos) == (
+        "mysql-bin.000200", 77
+    )
+    assert state.cdc_start_fingerprints() == {}
+    assert not _manual_seed(state).table_fingerprints
+
+
+def test_a_malformed_set_is_saved_with_a_warning_that_start_refuses_it(monkeypatch):
+    ui, state, by, _calls = _manual_inputs(monkeypatch, (dict(_ROW), _FPS, "OFF"))
+    ui.inputs["GTID set"].set_value(f"'{_U}:1-5'")
+    by["Use this start point"].on_click()
+    warned = [m for m, t in ui.notified if t == "warning"]
+    assert warned[-1] == (
+        "Start point saved, but its GTID set is not a valid GTID set (<server "
+        "UUID>:<interval>, comma-separated), so Start CDC refuses it — correct it, or "
+        "clear it if the source's gtid_mode is not ON."
+    )
+
+
+def test_an_attached_stack_offered_no_gtid_set_is_refused_by_the_start_dialog_check(
+    monkeypatch,
+):
+    # The dialog's own chain on a reset session: Attach -> the phase probe caches the
+    # stack's Watermark* -> _mysql_start_context (no start point: a resume) -> the GTID
+    # check. The stack's last Start offered a binlog position and NO GTID set, so on a
+    # gtid_mode=ON source it is refused although the session holds no start point.
+    import dsql_migrator.core.cdc_deployer as dmod
+    from dsql_migrator.ui.cdc_gtid_gate import GtidSourceState
+
+    params = {"MskBootstrapServers": "", "DeploySink": "true", "SnapshotMode": "recovery",
+              "WatermarkBinlogFile": "mysql-bin-changelog.000010", "WatermarkBinlogPos": "4",
+              "WatermarkGtids": ""}
+
+    class _D:
+        stack_status = "UPDATE_COMPLETE"
+        is_stable = True
+        current_parameters = params
+
+    class _Dep:
+        def describe_stack_or_none(self, _n):
+            return _D()
+
+        def list_cdc_stacks(self):
+            return []
+
+    monkeypatch.setattr(dmod, "build_cdc_stack_deployer", lambda *_a, **_k: _Dep())
+    reads: list = []
+    monkeypatch.setattr(
+        _status, "read_source_gtid_state_once",
+        lambda _s, gtid_set: reads.append(gtid_set) or GtidSourceState(mode="ON"),
+    )
+    session = SimpleNamespace(
+        target_config=SimpleNamespace(region="us-east-1"), aws_profile=None,
+        source_config=SimpleNamespace(source_type=SourceType.MYSQL), source_password="pw",
+    )
+    state = DataMigrationState()
+    assert state.adopt_cdc_stack("dsql-cdc-stack")
+    _status._probe_cdc_stack_phase(state, session)
+    seed, origin, facts = _cdc_ui._mysql_start_context(state, _JM(None), None, session)[:3]
+    assert seed is None and facts.resumes is True
+    verdict = _cdc_ui._probe_cdc_gtid_start(state, session, seed=seed, facts=facts,
+                                            origin=origin)
+    assert verdict.kind == "no-gtid" and verdict.blocks
+    assert verdict.stack_point == "binlog mysql-bin-changelog.000010:4"
+    assert reads == [None]
+    # The same stack offered a GTID set: continues after the set Debezium committed.
+    params["WatermarkGtids"] = "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
+    _status._probe_cdc_stack_phase(state, session)
+    verdict = _cdc_ui._probe_cdc_gtid_start(state, session, seed=seed, facts=facts,
+                                            origin=origin)
+    assert verdict.kind == "proceed" and verdict.positioning == "gtid-resume"

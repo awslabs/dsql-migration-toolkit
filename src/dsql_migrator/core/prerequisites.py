@@ -808,15 +808,18 @@ def check_binlog_row_format(variables: dict[str, str]) -> PrerequisiteResult:
 def check_gtid_mode(variables: dict[str, str]) -> PrerequisiteResult:
     """PASS when GTID mode is on; otherwise a non-blocking ``INFO`` recommendation.
 
-    GTID is **not required** for CDC. Debezium and the watermark-based resume
-    (:class:`~dsql_migrator.core.cdc.CdcResumePoint`) fall back to the binlog
-    ``file:position`` coordinate when GTID is unavailable, so the gapless Full
-    Load -> CDC handoff still works. GTID is only *recommended* because it
-    survives source failover/replica promotion (where ``file:position`` can
-    break). Its absence is therefore reported as ``INFO`` (an optional
-    recommendation, ``required=False``) -- NOT a ``WARN`` (which implies something
-    is wrong) and NOT a gating ``FAIL`` (Property 14). Customers without GTID
-    enabled are not forced to turn it on and are not shown an alarming warning.
+    GTID is **not required** for CDC. With ``gtid_mode=ON`` Debezium positions by GTID
+    set: CDC starts after the GTID set recorded with its start point (the Full Load
+    watermark, or Fetch current position for a Manual point) and resumes after the set it
+    last committed, which also survives a failover to a replica whose binary log files
+    differ. With any other mode (``OFF`` / ``OFF_PERMISSIVE`` / ``ON_PERMISSIVE``) it
+    starts from the binlog ``file:position`` of its start point, so the gapless Full Load
+    -> CDC handoff works there too. The mode must stay as it was from the start point to
+    cut over: Start CDC refuses a start point recorded while ``gtid_mode`` was not ON once
+    the source is ON. GTID's absence is therefore reported as ``INFO`` (an optional
+    recommendation, ``required=False``) -- NOT a ``WARN`` (which implies something is
+    wrong) and NOT a gating ``FAIL`` (Property 14). Customers without GTID enabled are not
+    forced to turn it on and are not shown an alarming warning.
     """
     ok = (variables.get("gtid_mode") or "").strip().upper() == "ON"
     return PrerequisiteResult(
@@ -824,15 +827,20 @@ def check_gtid_mode(variables: dict[str, str]) -> PrerequisiteResult:
         title="GTID mode is enabled (recommended)",
         status=PrerequisiteStatus.PASS if ok else PrerequisiteStatus.INFO,
         required=False,
-        detail="gtid_mode=ON."
+        detail="gtid_mode=ON: CDC starts after the GTID set recorded with its start point."
         if ok
-        else "gtid_mode is not ON; CDC will resume from the binlog file:position watermark.",
+        else (
+            "gtid_mode is not ON; CDC starts from the binlog file:position of its start "
+            "point."
+        ),
         remediation=""
         if ok
         else (
-            "Optional: enable GTID mode for more robust CDC resume across source "
-            "failover/replica promotion. Not required -- CDC otherwise resumes "
-            "from the binlog file:position watermark."
+            "Optional: GTID is not required. With gtid_mode=ON, CDC positions by GTID set, "
+            "which also survives a failover to a replica whose binary log files differ. If "
+            "you change gtid_mode, do it before the Full Load (or Fetch current position) "
+            "and keep it until cut over: Start CDC refuses a start point recorded while "
+            "gtid_mode was not ON once the source is ON."
         ),
     )
 

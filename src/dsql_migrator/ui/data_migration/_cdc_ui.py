@@ -55,6 +55,9 @@ from dsql_migrator.core.cdc import (
     cdc_stack_params_to_json,
 )
 from dsql_migrator.core.cdc_coords import (
+    gtid_mode_is_on,
+    gtid_set_summary,
+    normalize_gtid_set,
     parse_binlog_coordinate,
     validate_gtid,
 )
@@ -277,7 +280,8 @@ def _cdc_resume_signal(migration_state, session):
     Returns ``(resume_override, force_initial_snapshot)`` so every ``dispatch_source_config``
     call site stays consistent:
 
-    - **MySQL** -- a Manual binlog ``file:position`` is what Start seeds into
+    - **MySQL** -- a Manual binlog ``file:position`` (with the GTID set executed there,
+      which Debezium positions by on a ``gtid_mode=ON`` source) is what Start seeds into
       ``connect-offsets`` (:func:`cdc_seed_watermark`); pass it as ``resume_override``
       only when it can seed that offset (``can_seed_offset``). A GTID set alone cannot --
       both seeders key the offset on file+pos -- so it is not an override (and the card
@@ -783,7 +787,8 @@ def _render_cdc_source_config_card(
     # PostgresSourceConfig raised AttributeError and crashed the CDC step render).
     start_gtid = getattr(config, "start_gtid", None)
     if start_gtid:
-        source_lines.append(f"gtid (start) = {start_gtid}")
+        # Debezium positions by this set only on a gtid_mode=ON source (file:pos otherwise).
+        source_lines.append(f"gtid (start, used when gtid_mode=ON) = {start_gtid}")
     start_binlog_file = getattr(config, "start_binlog_file", None)
     if start_binlog_file:
         source_lines.append(
@@ -1124,8 +1129,10 @@ def _render_cdc_start_point_card(
     GTID/binlog inputs are shown.
     """
     is_pg = source_type is SourceType.POSTGRES
-    # The operator's Manual entry (MySQL): what the notices below judge. Start seeds only
-    # its binlog file:position (cdc_seed_watermark); a GTID set alone seeds nothing.
+    # The operator's Manual entry (MySQL): what the notices below judge. Start seeds its
+    # binlog file:position with its GTID set (cdc_seed_watermark), and on a gtid_mode=ON
+    # source Debezium positions by that set; a GTID set alone seeds nothing (the offset is
+    # keyed on the position).
     manual_point = (
         migration_state.cdc_start_override()
         if (not is_pg and mode == "manual")
@@ -1139,8 +1146,9 @@ def _render_cdc_start_point_card(
             tone="warning",
             header="Enter a binlog file:position",
             body=(
-                "A GTID set alone cannot set where this pipeline starts; it streams by "
-                "binlog file:position (Fetch current position fills it)."
+                "A GTID set alone cannot set where this pipeline starts: the start offset "
+                "is keyed on the binlog file:position, so enter it too (Fetch current "
+                "position fills both)."
             ),
         )
 
@@ -1446,11 +1454,14 @@ def _render_cdc_start_point_card(
         elif effective_resume is not None:
             with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                 ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
-                # The binlog coordinate is what Start seeds (the offset is keyed on it),
-                # so the confirmation names IT -- not a GTID set that seeds nothing.
+                # The binlog coordinate is what the offset is keyed on, so the confirmation
+                # names IT, plus the GTID set seeded with it (what Debezium starts after on
+                # a gtid_mode=ON source). A GTID set alone seeds nothing.
+                _gtids = normalize_gtid_set(effective_resume.gtid_executed)
                 coord = (
                     f"binlog {effective_resume.binlog_file}:"
                     f"{effective_resume.binlog_position}"
+                    + (f" · GTID set {gtid_set_summary(_gtids)}" if _gtids else "")
                     if effective_resume.can_seed_offset()
                     else f"GTID {effective_resume.gtid_executed}"
                 )
@@ -1479,15 +1490,21 @@ def _render_cdc_start_summary(ui, gtid, binlog_file, binlog_pos) -> None:
                 ui.label(f"{label_text}:").classes("text-xs text-gray-500")  # type: ignore[attr-defined]
                 ui.label(str(value)).classes("text-xs font-mono")  # type: ignore[attr-defined]
 
-def _fetch_start_position(session, names) -> "tuple[Optional[Mapping], Optional[dict]]":
-    """Read the source's current binlog position and the captured tables' start-point
-    fingerprints (BLOCKING; callers run it via ``run.io_bound``; MySQL).
+def _fetch_start_position(
+    session, names
+) -> "tuple[Optional[Mapping], Optional[dict], Optional[str]]":
+    """Read the source's current binlog position, the captured tables' start-point
+    fingerprints and the source's ``gtid_mode`` (BLOCKING; callers run it via
+    ``run.io_bound``; MySQL).
 
     ONE read-only engine and ONE connection: the catalog statement (``read_live_catalog``,
     bounded like the CDC catalog-drift read) first, THEN ``SHOW BINARY LOG STATUS`` -- so a
     schema change racing the fetch can only make Start CDC refuse this point, never pass a
-    position the recorded definitions do not describe. Returns ``(row, fingerprints)``;
-    ``fingerprints`` is ``None`` when the catalog read failed (the position is still
+    position the recorded definitions do not describe -- then ``@@GLOBAL.gtid_mode``.
+    The status row carries the GTID set executed at that position (``Executed_Gtid_Set``,
+    read with it), which is what Debezium starts after on a ``gtid_mode=ON`` source.
+    Returns ``(row, fingerprints, gtid_mode)``; ``fingerprints`` is ``None`` when the
+    catalog read failed and ``gtid_mode`` when it could not be read (the position is still
     returned). A failure of the position read itself raises, as before. The engine is
     disposed in every case.
     """
@@ -1496,7 +1513,7 @@ def _fetch_start_position(session, names) -> "tuple[Optional[Mapping], Optional[
         start_point_fingerprints,
     )
     from dsql_migrator.core.introspector import ReadOnlySourceError
-    from dsql_migrator.core.watermark import read_binlog_status_row
+    from dsql_migrator.core.watermark import read_binlog_status_row, read_gtid_mode
     from dsql_migrator.ui.connect import make_source_engine_factory
     from dsql_migrator.ui.data_migration._cdc_status import (
         _CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
@@ -1519,9 +1536,10 @@ def _fetch_start_position(session, names) -> "tuple[Optional[Mapping], Optional[
             except Exception:  # noqa: BLE001 - optional record; the position still counts
                 fingerprints = None
             row = read_binlog_status_row(conn)
+            gtid_mode = read_gtid_mode(conn) if row else None
     finally:
         engine.dispose()
-    return row, fingerprints
+    return row, fingerprints, gtid_mode
 
 
 def _render_cdc_manual_inputs(
@@ -1533,27 +1551,32 @@ def _render_cdc_manual_inputs(
 
     Shown when the Manual radio is selected, and (``select_manual``) inside the resume
     card's "Manual" disclosure, where "Use this start point" also selects Manual so a
-    later point is what Start offers. Advisory validation: an
-    unrecognized-but-valid GTID must not be rejected, so a bad-looking value shows
-    an orange hint but is still stored; MSK Connect validates at connector start.
-    ``locked`` (CDC already started) renders the inputs + button read-only.
+    later point is what Start offers. Advisory validation here: a bad-looking GTID set
+    shows a warning but is still stored, and Start CDC refuses it (on every gtid_mode:
+    Debezium writes the set into every offset it commits and cannot read a malformed one
+    back). ``locked`` (CDC already started) renders the inputs + button read-only.
 
     When a ``session`` with a live source connection is available, a "Fetch from
     source" button queries ``SHOW MASTER STATUS`` and populates the fields
     automatically — no manual copy-paste needed. It also records the captured tables'
-    (``captured_names()``) start-point fingerprints with that position; "Use this start
-    point" keeps them only for exactly the fetched file:position (or, re-confirming the
-    stored point unchanged after a re-render or a session restore, the ones already
-    recorded for it), so a typed or edited position never carries definitions read for
-    another one.
+    (``captured_names()``) start-point fingerprints with that position, and -- only while
+    the source's ``gtid_mode`` is ON -- the GTID set executed at it (the same status row),
+    which is what Debezium starts after on such a source; a set read while the mode is not
+    ON is never filled in. "Use this start point" keeps a fetched (or already stored) GTID
+    set only with the position it was read at, and the fingerprints only for exactly that
+    (position, GTID set) pair -- the fetched pair, or, re-confirming the stored point
+    unchanged after a re-render or a session restore, the stored one -- so a typed or
+    edited point never carries a set or definitions read for another one.
     """
     gtid_error = {"msg": None}  # mutable cell so the handler can show a hint
-    # The last fetch: the (file, pos) it returned and the fingerprints read with it.
-    fetched: dict = {"coord": None, "fps": None}
+    # The last fetch: the (file, pos) it returned, the fingerprints read with it, and the
+    # GTID set read with it (normalized; None when the source's gtid_mode was not ON).
+    fetched: dict = {"coord": None, "fps": None, "gtid": None}
 
     def _apply() -> None:
         gtid_raw = (gtid_input.value or "").strip()
         binlog_raw = (binlog_input.value or "").strip()
+        gtid_norm = normalize_gtid_set(gtid_raw) or None
         gtid_error["msg"] = validate_gtid(gtid_raw) if gtid_raw else None
         binlog_file = None
         binlog_pos = None
@@ -1564,24 +1587,55 @@ def _render_cdc_manual_inputs(
                 binlog_file, binlog_pos = parsed
             else:
                 binlog_unparsed = True
-        # Fingerprints only for the very position they were read with: this card's fetch,
-        # or -- re-confirming the STORED point unchanged -- the ones already recorded for
-        # it. The card is rebuilt on every refresh ("Use this start point" itself
-        # refreshes) and after a session restore, so the fetch cell is empty then; without
-        # the fallback a second click on the same point wiped them and the start-point
-        # check dropped to a warning. Any other position carries none.
         _coord = (binlog_file, binlog_pos) if binlog_file is not None else None
-        if _coord is not None and fetched["coord"] == _coord and fetched["fps"] is not None:
-            _bound = fetched["fps"]
-        elif _coord is not None and _coord == (
+        _stored_coord = (
             getattr(migration_state, "_cdc_start_binlog_file", None),
             getattr(migration_state, "_cdc_start_binlog_pos", None),
+        )
+        _stored_gtid = getattr(migration_state, "_cdc_start_gtid", None)
+        # A GTID set read at one position is not the set at another: a fetched (or stored)
+        # set left unchanged beside an EDITED position is dropped, not stored -- on a
+        # gtid_mode=ON source Debezium would start after it, so a set read later than the
+        # new position skips changes and one read earlier re-reads them. That includes no
+        # position at all (left empty, or mistyped): a set saved alone is bound to nothing,
+        # so a position typed on a later render would silently carry it. A set the operator
+        # typed is theirs to assert (Start CDC refuses one that is not a GTID set, and on a
+        # gtid_mode=ON source checks it against what the source executed and purged).
+        stale_at = None
+        if gtid_norm is not None:
+            if fetched["gtid"] == gtid_norm and fetched["coord"] not in (None, _coord):
+                stale_at = fetched["coord"]
+            elif (
+                _stored_gtid == gtid_norm
+                and _stored_coord[0] is not None
+                and _stored_coord[1] is not None
+                and _stored_coord != _coord
+            ):
+                stale_at = _stored_coord
+        if stale_at is not None:
+            gtid_norm = None
+            gtid_input.set_value("")
+        # Fingerprints only for the very (position, GTID set) they were read with: this
+        # card's fetch, or -- re-confirming the STORED point unchanged -- the ones already
+        # recorded for it. The card is rebuilt on every refresh ("Use this start point"
+        # itself refreshes) and after a session restore, so the fetch cell is empty then;
+        # without the fallback a second click on the same point wiped them and the
+        # start-point check dropped to a warning. Any other point carries none: on a
+        # gtid_mode=ON source the GTID set IS the start point, so editing only the set
+        # drops them too.
+        if (
+            _coord is not None
+            and fetched["coord"] == _coord
+            and fetched["gtid"] == gtid_norm
+            and fetched["fps"] is not None
         ):
+            _bound = fetched["fps"]
+        elif _coord is not None and _coord == _stored_coord and gtid_norm == _stored_gtid:
             _bound = migration_state.cdc_start_fingerprints()
         else:
             _bound = None
         migration_state.set_cdc_start_position(
-            gtid=gtid_raw or None,
+            gtid=gtid_norm,
             binlog_file=binlog_file,
             binlog_pos=binlog_pos,
             fingerprints=_bound,
@@ -1597,26 +1651,53 @@ def _render_cdc_manual_inputs(
             )
         elif binlog_unparsed:
             ui.notify(  # type: ignore[attr-defined]
-                "Binlog must be 'file:position' (e.g. mysql-bin.000123:45678).",
+                "Binlog must be 'file:position' (e.g. mysql-bin.000123:45678)."
+                + (
+                    f" The GTID set shown was cleared: it was read at {stale_at[0]}:"
+                    f"{stale_at[1]} and is kept only with that position."
+                    if stale_at is not None
+                    else ""
+                ),
                 type="negative", position="top",
+            )
+        elif binlog_file is None and stale_at is not None:
+            ui.notify(  # type: ignore[attr-defined]
+                f"The GTID set shown was read at {stale_at[0]}:{stale_at[1]}, so it is not "
+                "saved without that position. Enter a binlog file:position (on a source with "
+                "gtid_mode=ON, with the GTID set executed at it), or Fetch current position "
+                "again.",
+                type="warning", position="top",
             )
         elif binlog_file is None:
             # GTID only: stored, but it cannot set the start point (see the card notice).
             ui.notify(  # type: ignore[attr-defined]
-                "A GTID set alone cannot set the start point — enter a binlog "
-                "file:position.",
+                "A GTID set alone cannot set the start point — enter its binlog "
+                "file:position too (Fetch current position fills both).",
+                type="warning", position="top",
+            )
+        elif stale_at is not None:
+            ui.notify(  # type: ignore[attr-defined]
+                "Start point saved without a GTID set: the GTID set shown was read at "
+                f"{stale_at[0]}:{stale_at[1]}, not at {binlog_file}:{binlog_pos}. On a "
+                "source with gtid_mode=ON, enter the GTID set executed at "
+                f"{binlog_file}:{binlog_pos}, or Fetch current position again.",
                 type="warning", position="top",
             )
         elif gtid_error["msg"]:
+            # Start CDC refuses it on every gtid_mode (Debezium would write it into every
+            # offset it commits and fail on it at the next task start), so say so now.
             ui.notify(  # type: ignore[attr-defined]
-                "Start point saved, but the GTID format looks unusual — "
-                "double-check it.",
+                "Start point saved, but its GTID set is not a valid GTID set (<server "
+                "UUID>:<interval>, comma-separated), so Start CDC refuses it — correct it, "
+                "or clear it if the source's gtid_mode is not ON.",
                 type="warning", position="top",
             )
         else:
-            # The binlog coordinate is what Start seeds, so it is what is confirmed.
+            # The binlog coordinate is what the offset is keyed on, so it is what is
+            # confirmed -- with the GTID set seeded beside it, when there is one.
             ui.notify(  # type: ignore[attr-defined]
-                f"Start point saved (not streaming yet) — {binlog_file}:{binlog_pos}",
+                f"Start point saved (not streaming yet) — {binlog_file}:{binlog_pos}"
+                + (" with its GTID set" if gtid_norm else ""),
                 type="positive", position="top",
             )
         refresh()
@@ -1642,7 +1723,7 @@ def _render_cdc_manual_inputs(
             _names = []
 
         try:
-            row, fps = await run.io_bound(_fetch_start_position, session, _names)
+            row, fps, gtid_mode = await run.io_bound(_fetch_start_position, session, _names)
         except Exception as exc:  # noqa: BLE001
             ui.notify(  # type: ignore[attr-defined]
                 f"Failed to fetch: {exc}",
@@ -1663,7 +1744,12 @@ def _render_cdc_manual_inputs(
             )
             return
 
-        gtid_val = row.get("Executed_Gtid_Set") or ""
+        # The GTID set executed at this position (same status row) -- only while the source
+        # runs gtid_mode=ON, where Debezium starts after it. A set read under any other
+        # mode is never offered: if the mode is switched to ON later, such a set could make
+        # MySQL skip the changes written without a GTID, and Start CDC refuses the point.
+        gtid_on = gtid_mode_is_on(gtid_mode)
+        gtid_val = normalize_gtid_set(row.get("Executed_Gtid_Set")) if gtid_on else ""
         binlog_file_val = row.get("File") or ""
         binlog_pos_val = row.get("Position")
         binlog_coord = (
@@ -1682,6 +1768,7 @@ def _render_cdc_manual_inputs(
             _coord = None
         fetched["coord"] = _coord
         fetched["fps"] = fps
+        fetched["gtid"] = gtid_val or None
         if fps is None:
             # The point is NOT applied yet: say what to do next, as the success path does.
             ui.notify(  # type: ignore[attr-defined]
@@ -1692,17 +1779,35 @@ def _render_cdc_manual_inputs(
                 type="warning", position="top",
             )
             return
+        if gtid_on:
+            _fetched_msg = (
+                "Fetched the current position and GTID set from the source (gtid_mode=ON: "
+                "CDC starts after this GTID set) — click 'Use this start point' to confirm."
+            )
+        elif gtid_mode:
+            _fetched_msg = (
+                "Fetched the current position from the source — its gtid_mode is "
+                f"{str(gtid_mode).strip().upper()}, so CDC starts from this binlog "
+                "file:position. Click 'Use this start point' to confirm."
+            )
+        else:
+            _fetched_msg = (
+                "Fetched current position from source — click 'Use this start point' "
+                "to confirm."
+            )
         ui.notify(  # type: ignore[attr-defined]
-            "Fetched current position from source — click 'Use this start point' "
-            "to confirm.",
+            _fetched_msg,
             type="positive", position="top",
         )
 
     # Not "GTID (preferred)": the start offset is keyed on the binlog file:position, so a
-    # GTID set alone cannot set where streaming begins (cdc_seed_watermark).
+    # GTID set alone cannot set where streaming begins (cdc_seed_watermark) -- but on a
+    # gtid_mode=ON source Debezium starts after the GTID set seeded with it.
     ui.label(  # type: ignore[attr-defined]
-        "Enter the binlog file:position streaming starts from (Fetch current position "
-        "fills it). A GTID set alone cannot set the start point."
+        "Enter the binlog file:position streaming starts from. On a source with "
+        "gtid_mode=ON, CDC starts after the GTID set executed at that position instead, "
+        "so enter that too — Fetch current position fills both. A GTID set alone cannot "
+        "set the start point."
     ).classes("text-xs text-gray-500 mt-1")
     gtid_input = ui.input(  # type: ignore[attr-defined]
         "GTID set",
@@ -1866,10 +1971,13 @@ def _cdc_start_detail(
 
     ``watermark`` is what the Start offers the seeder and ``seed_origin`` where it came
     from (:func:`_cdc_start_seed`): a ``"manual"`` one is named as the operator's Manual
-    start point, not as a Full Load handoff.
+    start point, not as a Full Load handoff -- by its binlog file:position plus the GTID set
+    seeded with it (capped like every other line naming a set), since a Manual point records
+    no ``gtid_mode`` for ``watermark_coordinate`` to judge.
 
-    States the resume coordinate through the same precedence the Full Load watermark line
-    uses (:func:`~dsql_migrator.ui.data_migration._full_load_engine.watermark_coordinate`),
+    States a Full Load watermark's coordinate through the same precedence the Full Load
+    watermark line uses
+    (:func:`~dsql_migrator.ui.data_migration._full_load_engine.watermark_coordinate`),
     so the two lines in one log agree rather than spelling it two ways. With no watermark
     the stream starts from the source's CURRENT position, which means anything written
     between an earlier snapshot and now is NOT replicated -- the one case a reader must be
@@ -1887,9 +1995,16 @@ def _cdc_start_detail(
             "before; it continues where streaming stopped)"
         )
     elif watermark is not None and seed_origin == "manual":
+        # Named as the card, the deploy log and the "CDC start position" line name it: the
+        # binlog file:position the offset is keyed on, plus the GTID set seeded with it --
+        # Debezium starts after that set only on a gtid_mode=ON source (at the position on
+        # any other mode), and a Manual point records no mode for watermark_coordinate.
+        _gtids = normalize_gtid_set(getattr(watermark, "gtid_executed", None))
         parts.append(
-            f"start point {watermark_coordinate(watermark, source_type)} (Manual start "
-            "point; changes from this position on are replicated)"
+            f"start point binlog {getattr(watermark, 'binlog_file', None)}:"
+            f"{getattr(watermark, 'binlog_position', None)}"
+            + (f" with GTID set {gtid_set_summary(_gtids)}" if _gtids else "")
+            + " (Manual start point; changes from this position on are replicated)"
         )
     elif watermark is None and seed_origin == "manual_unseedable":
         parts.append(
@@ -2779,8 +2894,9 @@ def _render_cdc_start_button(
         watermark, source_type=_cdc_source_type(session), start_mode=mode
     )
     # A MySQL Manual start is ready only on a SEEDABLE point (binlog file:position) -- the
-    # thing Start seeds (cdc_seed_watermark). A GTID set alone seeds nothing, and in Manual
-    # the job watermark is NOT a fallback, so neither may enable Start there.
+    # offset Start seeds is keyed on it (cdc_seed_watermark). A GTID set alone cannot seed
+    # it, and in Manual the job watermark is NOT a fallback, so neither may enable Start
+    # there. (Whether a gtid_mode=ON source can start from the point is Start's GTID check.)
     manual_mysql = not is_pg and mode == "manual"
     ready = (
         resumes_from_offset
@@ -4846,6 +4962,114 @@ def _probe_cdc_start_point(migration_state, session, *, seed, mode, facts, table
     return read_cdc_start_point_once(session, names, recorded)
 
 
+def _stack_start_record(migration_state, stack_params):
+    """``((file, pos) or None, gtids or None)``: the start offset the stack's last Start
+    offered (its Watermark* parameters, carried forward by Stop), from ``stack_params`` (a
+    fresh describe on the worker) or else the phase probe's cache. ``gtids`` is ``""`` for
+    an offer with no GTID set and ``None`` when nothing is recorded or known. Pure."""
+    if stack_params is not None:
+        from dsql_migrator.ui.data_migration._cdc_status import (
+            cdc_deployed_watermark,
+            cdc_deployed_watermark_gtids,
+        )
+
+        return (
+            cdc_deployed_watermark(stack_params),
+            cdc_deployed_watermark_gtids(stack_params),
+        )
+    deployed = getattr(migration_state, "cdc_deployed_watermark", None)
+    gtids = getattr(migration_state, "cdc_deployed_watermark_gtids", None)
+    return (tuple(deployed) if deployed else None), (gtids if deployed else None)
+
+
+def _seed_is_point(seed, point) -> bool:
+    """Is ``seed``'s binlog file:position exactly ``point`` (a deployed ``(file, pos)``)?"""
+    if not point or not _seed_can_seed(seed):
+        return False
+    try:
+        return (
+            str(getattr(seed, "binlog_file", "")) == str(point[0]).strip()
+            and int(getattr(seed, "binlog_position")) == int(str(point[1]).strip())
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _probe_cdc_gtid_start(
+    migration_state, session, *, seed, facts, origin=None, stack_params=None
+):
+    """The MySQL GTID start check for one Start (BLOCKING; run it via ``run.io_bound``).
+
+    ``None`` when no check is due: PostgreSQL, a stack whose connectors exist, or a start
+    that neither seeds a binlog position nor resumes (:func:`gtid_start_check_due`).
+    Otherwise ONE bounded read of the source's ``gtid_mode`` -- plus, for a seeded start
+    whose GTID set Debezium will position by, whether the source can stream from that set
+    (:func:`~dsql_migrator.ui.data_migration._cdc_status.read_source_gtid_state_once`,
+    which never raises) -- judged by
+    :func:`~dsql_migrator.ui.cdc_gtid_gate.mysql_gtid_start_verdict`, with the stack's own
+    record of its last start offset (``stack_params``: the worker's fresh describe; else
+    the phase probe's cache) for a resume. ``origin`` is the seed's
+    (:func:`_cdc_start_seed`): a ``"manual"`` GTID set that is not a GTID set is refused
+    without reading anything.
+    """
+    if _cdc_source_type(session) is SourceType.POSTGRES:
+        return None
+    from dsql_migrator.ui.cdc_gtid_gate import (
+        gtid_start_check_due,
+        mysql_gtid_start_verdict,
+    )
+
+    if not gtid_start_check_due(seed, facts):
+        return None
+    from dsql_migrator.ui.data_migration._cdc_status import read_source_gtid_state_once
+
+    seedable = _seed_can_seed(seed)
+    resumes = bool(getattr(facts, "resumes", False))
+    seed_gtids = normalize_gtid_set(getattr(seed, "gtid_executed", None))
+    # The mode recorded with the start point (a Full Load watermark of this version).
+    captured = getattr(seed, "gtid_mode", None) or None
+    if (
+        origin == "manual"
+        and seedable
+        and not resumes
+        and seed_gtids
+        and validate_gtid(seed_gtids) is not None
+    ):
+        # A typed set that is not a GTID set: refused on every mode, nothing to read. (A
+        # Full Load watermark's set is MySQL's own output.)
+        return mysql_gtid_start_verdict(
+            None, seed_gtids=seed_gtids, seed_gtid_mode=captured, seedable=seedable,
+            resumes=resumes, seed_set_malformed=True,
+        )
+    stack_point, stack_gtids = _stack_start_record(migration_state, stack_params)
+    # The set is checked against the source only for a seeded start that will position by
+    # it: a resume continues from what Debezium committed, and a point recorded while the
+    # mode was not ON is refused whatever the set says.
+    subset_set = (
+        seed_gtids
+        if (
+            not resumes
+            and seedable
+            and (captured is None or gtid_mode_is_on(captured))
+            and (seed_gtids or gtid_mode_is_on(captured))
+        )
+        else None
+    )
+    state = read_source_gtid_state_once(session, subset_set)
+    return mysql_gtid_start_verdict(
+        state,
+        seed_gtids=seed_gtids,
+        seed_gtid_mode=captured,
+        seedable=seedable,
+        resumes=resumes,
+        stack_gtids=stack_gtids,
+        stack_point=(
+            f"binlog {stack_point[0]}:{stack_point[1]}" if stack_point else None
+        ),
+        seed_is_stack_point=_seed_is_point(seed, stack_point),
+    )
+
+
 def pg_start_resnapshots(watermark, *, source_type, start_mode: str) -> bool:
     """Will this PostgreSQL start RE-READ every captured table? Pure.
 
@@ -5173,6 +5397,9 @@ async def _open_cdc_start_dialog(
     # The MySQL start-point check (cdc_start_point_gate): its verdict and notice.
     sp_verdict = None
     sp_notice: Optional[tuple] = None
+    # The MySQL GTID start check (cdc_gtid_gate): its verdict and notice.
+    gtid_verdict = None
+    gtid_notice: Optional[tuple] = None
     inventory_tables = list(getattr(inventory, "tables", None) or [])
     # G17: a selected table not loaded under the Full Load's start point yet holds Start
     # (re-read here: another tab may have ticked one since the card rendered). No I/O; the
@@ -5223,6 +5450,43 @@ async def _open_cdc_start_dialog(
             # a resume (schema_only) or a stack with connectors is not checked. Blocking
             # source I/O -> run.io_bound; the job re-checks on its worker thread.
             if _cdc_source_type(session) is not SourceType.POSTGRES:
+                # G19: on a gtid_mode=ON source Debezium starts after the GTID set seeded
+                # with the start point, so a start point it cannot start exactly at is
+                # refused here too (one bounded read; the job re-checks on its worker).
+                try:
+                    _g_seed, _g_origin, _g_facts = _mysql_start_context(
+                        migration_state, job_manager, inventory, session
+                    )[:3]
+                    gtid_verdict = await run.io_bound(
+                        _probe_cdc_gtid_start, migration_state, session,
+                        seed=_g_seed, facts=_g_facts, origin=_g_origin,
+                    )
+                except Exception:  # noqa: BLE001 - unknown here; the job re-checks
+                    gtid_verdict = None
+                    _log_cdc_event(
+                        "CDC GTID start-point check unknown",
+                        status=ActivityStatus.INFO,
+                        detail=(
+                            "could not read the source's gtid_mode before Start CDC; the "
+                            "job re-checks before creating any connector"
+                        ),
+                    )
+                if gtid_verdict is not None and gtid_verdict.blocks:
+                    from dsql_migrator.ui.cdc_gtid_gate import (
+                        gtid_notice_point,
+                        gtid_start_notice,
+                    )
+
+                    _g_label, _g_coord = gtid_notice_point(
+                        gtid_verdict, seed=_g_seed, origin=_g_origin
+                    )
+                    gtid_notice = gtid_start_notice(
+                        gtid_verdict,
+                        point_label=_g_label,
+                        coord=_g_coord,
+                        origin=_g_origin,
+                        migration_type=getattr(migration_state, "migration_type", None),
+                    )
                 try:
                     _sp_seed, _sp_origin, _sp_facts, _sp_mode, _sp_tables = (
                         _mysql_start_context(migration_state, job_manager, inventory, session)
@@ -5316,6 +5580,12 @@ async def _open_cdc_start_dialog(
                 # "start point", not "snapshot": the probed log may be a Manual one.
                 header="The start point's binary log has been purged",
                 body=binlog_gap,
+            )
+        _gtid_blocks = bool(getattr(gtid_verdict, "blocks", False))
+        if gtid_notice is not None:
+            _render_notice(
+                ui, tone=gtid_notice[0], icon=gtid_notice[1], header=gtid_notice[2],
+                body=gtid_notice[3],
             )
         _sp_blocks = bool(getattr(sp_verdict, "blocks", False))
         if sp_notice is not None:
@@ -5454,9 +5724,10 @@ async def _open_cdc_start_dialog(
                         # straight on instead of re-opening the dialog and re-running the
                         # pre-flight checks.
                         _fk_state["cleared"] = True
-                        # A start-point refusal still stands after the FKs are gone, so the
-                        # notice claims "ready" only when Start is really unlocked.
-                        _unlocks = not conn_blocker and not _sp_blocks
+                        # A start-point refusal (G5 or the GTID check) still stands after the
+                        # FKs are gone, so the notice claims "ready" only when Start is
+                        # really unlocked.
+                        _unlocks = not conn_blocker and not _sp_blocks and not _gtid_blocks
                         fk_slot.clear()
                         with fk_slot:
                             _render_notice(
@@ -5475,7 +5746,7 @@ async def _open_cdc_start_dialog(
                                     '"Apply foreign keys" once the stream has drained.'
                                     + (
                                         ""
-                                        if _unlocks or not _sp_blocks
+                                        if _unlocks or not (_sp_blocks or _gtid_blocks)
                                         else " Start CDC stays blocked by the start-point "
                                         "notice above."
                                     )
@@ -5537,6 +5808,13 @@ async def _open_cdc_start_dialog(
                     "blocked while this is unknown — re-test the target connection "
                     "and retry."
                 )
+            elif _gtid_blocks:
+                # Hard block: on a gtid_mode=ON source this start point would make Debezium
+                # re-read the retained binary log, or skip changes, or fail on every Start.
+                from dsql_migrator.ui.cdc_gtid_gate import gtid_start_tooltip
+
+                start_btn.props("disable")
+                start_btn.tooltip(gtid_start_tooltip(gtid_verdict) or "")
             elif _sp_blocks:
                 # Hard block: a recovery-mode start against a changed table replays the
                 # same failure on every Start, or writes wrong values silently.
@@ -6510,9 +6788,16 @@ def _start_cdc_deploy(
 
     def _check_mysql_start_on_worker(pre, pre_params) -> None:
         """MySQL, on the worker thread before anything changes: the snapshot mode decided
-        on the loop must still be right for the stack as it is NOW, and a recovery start
-        must pass the start-point check (Retry CDC skips the dialog; a dialog verdict can
-        be stale). Raises RuntimeError to refuse; nothing has been changed yet."""
+        on the loop must still be right for the stack as it is NOW, the start point must
+        be one a gtid_mode=ON source can start from (the GTID start check), and a
+        recovery start must pass the start-point check (Retry CDC skips the dialog; a
+        dialog verdict can be stale). Raises RuntimeError to refuse; nothing has been
+        changed yet."""
+        from dsql_migrator.ui.cdc_gtid_gate import (
+            gtid_notice_point,
+            gtid_start_activity,
+            gtid_start_notice,
+        )
         from dsql_migrator.ui.cdc_start_point_gate import (
             point_coord,
             point_label,
@@ -6521,6 +6806,7 @@ def _start_cdc_deploy(
         )
         from dsql_migrator.ui.data_migration._cdc_status import (
             cdc_deployed_watermark,
+            cdc_deployed_watermark_gtids,
             cdc_has_committed_offset,
             cdc_live_snapshot_mode,
             mysql_start_facts_from_params,
@@ -6538,7 +6824,10 @@ def _start_cdc_deploy(
                 # stopping or redeploying it. Refresh the cached facts from THIS describe
                 # so the next click decides from the stack as it is, then refuse.
                 migration_state.set_cdc_has_committed_offset(cdc_has_committed_offset(pre_params))
-                migration_state.set_cdc_deployed_watermark(cdc_deployed_watermark(pre_params))
+                migration_state.set_cdc_deployed_watermark(
+                    cdc_deployed_watermark(pre_params),
+                    gtids=cdc_deployed_watermark_gtids(pre_params),
+                )
                 _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
                 if callable(_set_mode):
                     _set_mode(cdc_live_snapshot_mode(pre_params))
@@ -6554,6 +6843,49 @@ def _start_cdc_deploy(
                 )
                 raise RuntimeError(_r1)
             facts = fresh
+        # G19: on a gtid_mode=ON source Debezium starts after the GTID set seeded with the
+        # start point (not at its file:position), so refuse a start point it cannot start
+        # exactly at -- before the start-point check (which would otherwise also read). A
+        # resume is judged by the stack's own record of its last start offset, from THIS
+        # describe when there is one.
+        _gtid_verdict = _probe_cdc_gtid_start(
+            migration_state, session, seed=seed, facts=facts, origin=seed_origin,
+            stack_params=pre_params if pre is not None else None,
+        )
+        if _gtid_verdict is not None:
+            _gtid_label, _coord = gtid_notice_point(
+                _gtid_verdict, seed=seed, origin=seed_origin
+            )
+            _gtid_seed_set = normalize_gtid_set(getattr(seed, "gtid_executed", None))
+            _gtid_activity = gtid_start_activity(
+                _gtid_verdict, coord=_coord, seed_gtids=_gtid_seed_set
+            )
+            if _gtid_verdict.blocks:
+                _gtid_notice = gtid_start_notice(
+                    _gtid_verdict, point_label=_gtid_label, coord=_coord,
+                    origin=seed_origin,
+                    migration_type=getattr(migration_state, "migration_type", None),
+                )
+                if _gtid_activity is not None:
+                    _log_cdc_event(
+                        _gtid_activity[0], status=_gtid_activity[1], detail=_gtid_activity[2]
+                    )
+                raise RuntimeError(
+                    "Start CDC blocked: "
+                    + (
+                        f"{_gtid_notice[2]}. {_gtid_notice[3]}"
+                        if _gtid_notice is not None
+                        else ""
+                    )
+                )
+            if _gtid_activity is not None:
+                # The durable record of how CDC positioned (the deploy log is per-action).
+                migration_state.append_cdc_deploy_log(
+                    datetime.now(timezone.utc), _gtid_activity[2]
+                )
+                _log_cdc_event(
+                    _gtid_activity[0], status=_gtid_activity[1], detail=_gtid_activity[2]
+                )
         verdict = _probe_cdc_start_point(
             migration_state, session, seed=seed, mode=_sent_snapshot_mode, facts=facts,
             tables=tables_for_config,
@@ -6685,6 +7017,20 @@ def _start_cdc_deploy(
             history_missing_after_failure,
         )
 
+        # MySQL: a failed connector create is diagnosed from its worker log, read with the
+        # APP's identity (TaskRole / instance role, which may read the connector log
+        # group) before the deployer's -- on Fargate and EC2 the deployer acts as
+        # CdcDeployRole, which cannot, and the Start then showed only the CloudFormation
+        # status. PostgreSQL keeps today's exact call.
+        _log_kwargs: dict = {}
+        if not _is_pg_start:
+            from dsql_migrator.core.msk_connect_controller import (
+                build_msk_connect_controller,
+            )
+
+            _log_kwargs["log_tail"] = build_msk_connect_controller(
+                region, aws_profile=aws_profile
+            ).connector_log_tail
         try:
             run_cdc_start(
                 handle,
@@ -6712,6 +7058,7 @@ def _start_cdc_deploy(
                     else None
                 ),
                 pg_source_password=getattr(session, "source_password", None),
+                **_log_kwargs,
             )
         except CdcDeployError as exc:
             # A schema_only RESUME that found this stack's schema history missing or

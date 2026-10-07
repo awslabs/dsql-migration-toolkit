@@ -2322,3 +2322,94 @@ def test_session_signature_changes_on_the_fingerprints_and_the_history_flag() ->
     assert sig2 != sig1
     migration_state.note_cdc_history_missing(True)
     assert session_signature(session, eval_state, conv_state, migration_state) != sig2
+
+
+# ---------------------------------------------------------------------------
+# G19 review: a Manual GTID set saved by 0.1.565 or earlier is not restored
+# ---------------------------------------------------------------------------
+
+_G19_SET = "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-900"
+
+
+def _legacy_manual_snapshot() -> SessionSnapshot:
+    """What 0.1.565 saved after Fetch (set read at 000012:777) then an edited position: the
+    fetched set beside the TYPED 000010:4, never tied together (and never seeded then)."""
+    session, eval_state, conv_state, migration_state = _populated_states()
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+    payload = snapshot.model_dump()
+    payload.update(
+        cdc_start_mode="manual", cdc_start_gtid=_G19_SET,
+        cdc_start_binlog_file="mysql-bin-changelog.000010", cdc_start_binlog_pos=4,
+        cdc_start_fingerprints=dict(_FPS),
+    )
+    payload.pop("cdc_start_gtid_bound", None)  # 0.1.565 had no such field
+    return SessionSnapshot.model_validate(payload)
+
+
+def _restored(snapshot: SessionSnapshot) -> DataMigrationState:
+    m2 = DataMigrationState()
+    apply_session_snapshot(
+        SessionSnapshot.model_validate_json(snapshot.model_dump_json()),
+        SessionConnectionState(), EvaluationState(), SchemaConversionState(), m2,
+    )
+    return m2
+
+
+def test_a_manual_gtid_set_saved_by_an_earlier_version_is_dropped_on_restore() -> None:
+    m2 = _restored(_legacy_manual_snapshot())
+    # The position and its fingerprints come back; the unbound set does not.
+    assert m2._cdc_start_gtid is None
+    assert (m2._cdc_start_binlog_file, m2._cdc_start_binlog_pos) == (
+        "mysql-bin-changelog.000010", 4
+    )
+    assert m2.cdc_start_fingerprints() == _FPS
+    assert m2.cdc_start_mode() == "manual"
+
+
+def test_a_restored_earlier_version_point_is_refused_on_on_and_unchanged_elsewhere() -> None:
+    # On gtid_mode=ON the restored point has no GTID set: refused (G1) instead of starting
+    # after a set read at another position. On any other mode: by file:position as before.
+    from dsql_migrator.ui.cdc_gtid_gate import GtidSourceState, mysql_gtid_start_verdict
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    m2 = _restored(_legacy_manual_snapshot())
+    seed, origin = _cdc_ui._cdc_start_seed(m2, None, SourceType.MYSQL)
+    assert origin == "manual" and seed.gtid_executed is None
+    for mode, kind in (("ON", "no-gtid"), ("OFF", "proceed"), ("OFF_PERMISSIVE", "proceed"),
+                       ("ON_PERMISSIVE", "proceed")):
+        verdict = mysql_gtid_start_verdict(
+            GtidSourceState(mode=mode, within_executed=True, covers_purged=True),
+            seed_gtids="", seed_gtid_mode=None, seedable=True, resumes=False,
+        )
+        assert verdict.kind == kind, mode
+
+
+def test_a_manual_gtid_set_saved_by_this_version_round_trips() -> None:
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.set_cdc_start_mode("manual")
+    migration_state.set_cdc_start_position(
+        gtid=_G19_SET, binlog_file="mysql-bin-changelog.000012", binlog_pos=777,
+        fingerprints=_FPS,
+    )
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+    assert snapshot.cdc_start_gtid_bound is True
+    m2 = _restored(snapshot)
+    assert m2._cdc_start_gtid == _G19_SET and m2.cdc_start_fingerprints() == _FPS
+    assert (m2._cdc_start_binlog_file, m2._cdc_start_binlog_pos) == (
+        "mysql-bin-changelog.000012", 777
+    )
+
+
+def test_the_gtid_bound_stamp_is_written_only_with_a_set() -> None:
+    # Left out of the payload while False, so a snapshot without a Manual GTID set still
+    # loads on an older build (extra="forbid"), and one without the key loads here.
+    session, eval_state, conv_state, migration_state = _populated_states()
+    migration_state.set_cdc_start_mode("manual")
+    migration_state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77)
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+    dumped = snapshot.model_dump()
+    assert "cdc_start_gtid_bound" not in dumped
+    m2 = DataMigrationState()
+    apply_session_snapshot(SessionSnapshot.model_validate(dumped), SessionConnectionState(),
+                           EvaluationState(), SchemaConversionState(), m2)
+    assert m2.cdc_start_override().binlog_position == 77 and m2._cdc_start_gtid is None

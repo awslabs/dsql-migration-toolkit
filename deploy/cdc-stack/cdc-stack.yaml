@@ -653,11 +653,13 @@ Parameters:
       the stack region when left empty.
 
   # --- CDC start offset (drives the offset seeder) ----------------------------
-  # The binlog coordinates Start CDC offers the offset seeder: the Full Load
-  # watermark (the source connector resumes from exactly the snapshot end point --
-  # gapless, Property 11) or the operator's Manual binlog file:position. Empty when
-  # neither is available -> CdcStartPrepResource only pre-creates the topics and
-  # seeds no offset. A committed offset already at/past it is never rewound.
+  # The coordinates Start CDC offers the offset seeder: the binlog file:position plus
+  # the GTID set executed there (Debezium starts after that set on a gtid_mode=ON
+  # source), of the Full Load watermark (the source connector resumes from exactly the
+  # snapshot end point -- gapless, Property 11) or of the operator's Manual start
+  # point. Empty when neither is available -> CdcStartPrepResource only pre-creates
+  # the topics and seeds no offset. A committed offset already at/past it is never
+  # rewound.
   WatermarkBinlogFile:
     Type: String
     Default: ""
@@ -671,7 +673,10 @@ Parameters:
   WatermarkGtids:
     Type: String
     Default: ""
-    Description: Full Load watermark GTID set (empty when the source has no GTIDs).
+    Description: >
+      GTID set executed at the start point (Full Load watermark or Manual start
+      point). On a gtid_mode=ON source Debezium starts after it; empty when the
+      source reported none.
 
   WatermarkTsSec:
     Type: String
@@ -1758,11 +1763,11 @@ Resources:
   # table.include.list = selected tables, snapshot.mode = Ref: SnapshotMode
   # (recovery when Start seeds a new start offset; schema_only for a resume of a
   # stopped stack or when nothing is seeded — see below). The start offset (the
-  # binlog file:position of the Full Load
-  # watermark, or of the operator's Manual start point) is seeded by the control
-  # plane into the connect-offsets topic (gapless from a Full Load, Property 11) —
-  # it is not a static connector config key, so it is documented here rather than
-  # set inline.
+  # binlog file:position of the Full Load watermark or of the operator's Manual start
+  # point, plus its GTID set — what Debezium positions by on a gtid_mode=ON source) is
+  # seeded by the control plane into the connect-offsets topic (gapless from a Full
+  # Load, Property 11) — it is not a static connector config key, so it is documented
+  # here rather than set inline.
   DebeziumSourceConnector:
     Type: AWS::KafkaConnect::Connector
     Condition: DeployMysqlSource
@@ -1942,21 +1947,19 @@ Resources:
         # the history, so a rename on ANY table is replayed too.
         snapshot.mode:
           Ref: SnapshotMode
-        # When the source has gtid_mode=OFF or OFF_PERMISSIVE, new transactions
-        # do NOT receive GTIDs. Without this flag, Debezium records the GTID set
-        # at snapshot time and then skips all non-GTID events in streaming
-        # (treating them as "already processed"), producing zero records. Setting
-        # this to false disables GTID-based DML filtering so file:pos tracking
-        # drives event delivery regardless of the source's GTID mode.
-        # GTID handling: when the source has gtid_mode=OFF or OFF_PERMISSIVE,
-        # new transactions do not receive GTIDs. Without these settings Debezium
-        # records the (stale) GTID set at snapshot time, then the binlog client
-        # applies a GTID filter that skips all non-GTID events → zero produce.
-        # gtid.source.filter.dml.events=false disables the DML skip logic, and
-        # gtid.source.excludes with a catch-all UUID pattern prevents Debezium
-        # from including any GTID set in the offset, forcing pure file:pos mode.
-        gtid.source.filter.dml.events: "false"
-        gtid.source.excludes: ".*"
+        # GTID positioning: no gtid.source.* key, on purpose. Debezium 2.7.4 positions
+        # by GTID only when the source's gtid_mode is exactly ON
+        # (MySqlConnection.isGtidModeEnabled). It then asks MySQL for every transaction
+        # NOT in the GTID set of its offset and ignores the offset's binlog
+        # file:position. That set is the start point's: Start CDC seeds it through
+        # WatermarkGtids and refuses a start point without one on a gtid_mode=ON
+        # source. On a restart it is the set Debezium committed. A
+        # gtid.source.includes/excludes filter is applied to that set first; the
+        # catch-all excludes ".*" this template carried until G19 emptied it, so MySQL
+        # streamed its whole retained binary log on every Start and connector restart.
+        # With gtid_mode OFF, OFF_PERMISSIVE or ON_PERMISSIVE Debezium positions by the
+        # offset's binlog file:position, so no GTID key is needed there either
+        # (gtid.source.filter.dml.events does nothing without a filter).
         schema.history.internal.store.only.captured.tables.ddl: "false"
         include.schema.changes: "false"
         # Emit TRUNCATE events. Debezium's `skipped.operations` defaults to "t", and the

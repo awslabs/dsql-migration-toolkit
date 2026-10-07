@@ -59,6 +59,7 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from dsql_migrator.core.cdc_coords import normalize_gtid_set
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.models import (
     DataErrorRecord,
@@ -97,9 +98,11 @@ class CdcResumePoint(BaseModel):
     """The exact binlog/GTID coordinates a CDC run resumes from (Property 11).
 
     Built from the :class:`~dsql_migrator.core.models.Watermark` captured at
-    export start so catch-up begins precisely where the snapshot ended. A real
-    backend prefers the GTID set when present (more robust than file:position)
-    and otherwise uses the binlog ``file:position`` coordinate.
+    export start so catch-up begins precisely where the snapshot ended, or from the
+    operator's Manual start point. The start offset is keyed on the binlog
+    ``file:position``; on a ``gtid_mode=ON`` source Debezium positions by the GTID set
+    instead (it streams every transaction NOT in that set), so a point used there needs
+    the GTID set executed at that position too.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -179,9 +182,11 @@ class CdcResumePoint(BaseModel):
         and ``build_watermark_params`` returns all-empty parameters, which makes the
         template skip the seeder entirely so the connector starts from the CURRENT binlog.
 
-        A GTID set alone therefore does NOT give a gapless start: it is optional
-        reinforcement the seeder adds to the offset when present, not a substitute for the
-        coordinate it is keyed on. Keeping this distinct from
+        A GTID set alone therefore does NOT give a gapless start: the offset is keyed on
+        the coordinate, so a GTID set cannot replace it. On a ``gtid_mode=ON`` source the
+        GTID set the seeder adds to the offset is what Debezium positions by, so a
+        seedable point there also needs it (Start CDC checks that before it seeds).
+        Keeping this distinct from
         :meth:`has_coordinates` is what stops the UI promising "gapless from Full Load"
         for a watermark that would silently resume from the live binlog and lose every
         change made during the load.
@@ -1392,10 +1397,12 @@ class CdcPipelineOrchestrator:
         ``resume_override`` (optional) is the Manual start position the operator
         entered in the UI. When given it takes precedence over the watermark, so CDC
         can be seeded when no Full Load watermark exists in this session or when the
-        operator needs a custom offset. Only its binlog ``file:position`` is seeded
-        (:func:`cdc_seed_watermark`), so ``start_gtid`` is not reported for an
-        override: the config states exactly what is seeded. When ``None`` the
-        gapless watermark path is used.
+        operator needs a custom offset. Its binlog ``file:position`` is seeded together
+        with its GTID set (:func:`cdc_seed_watermark`), which is what Debezium positions
+        by on a ``gtid_mode=ON`` source, so ``start_gtid`` reports that set (normalized)
+        for a seedable override and ``None`` for a GTID-only one, which seeds nothing:
+        the config states exactly what is seeded. When ``None`` the gapless watermark
+        path is used.
 
         ``message_key_columns`` (optional) maps ``{db.table: [target key cols]}``
         for tables whose DSQL target has a composite primary key; Debezium then
@@ -1436,10 +1443,15 @@ class CdcPipelineOrchestrator:
             name=name,
             table_include_list=[table.name for table in tables],
             snapshot_mode=mode,
-            # A Manual override seeds its file:position only (the connector runs
-            # gtid.source.excludes '.*'), so report no GTID for it: the preview must
-            # print exactly what is seeded.
-            start_gtid=resume.gtid_executed if resume_override is None else None,
+            # The GTID set the seed carries with its file:position (cdc_seed_watermark),
+            # normalized as it is seeded: on a gtid_mode=ON source Debezium starts after
+            # it. A GTID-only override seeds nothing, so it reports none -- the preview
+            # must print exactly what is seeded.
+            start_gtid=(
+                normalize_gtid_set(resume.gtid_executed) or None
+                if resume_override is None or resume.can_seed_offset()
+                else None
+            ),
             start_binlog_file=resume.binlog_file,
             start_binlog_pos=resume.binlog_position,
             column_exclude_list=list(column_exclude_list or []),
@@ -2440,7 +2452,9 @@ def build_watermark_params(
     return [
         ("WatermarkBinlogFile", watermark.binlog_file),
         ("WatermarkBinlogPos", str(int(watermark.binlog_position))),
-        ("WatermarkGtids", watermark.gtid_executed or ""),
+        # Normalized (MySQL prints ",\n" between server UUIDs; the binlog client does not
+        # trim): on a gtid_mode=ON source Debezium starts after exactly this set.
+        ("WatermarkGtids", normalize_gtid_set(watermark.gtid_executed)),
         ("WatermarkTsSec", str(ts_sec)),
     ]
 
@@ -2459,23 +2473,38 @@ def cdc_seed_watermark(
       start-point fingerprints (``table_fingerprints``).
     - A Manual point with a binlog ``file:position`` -> that position, origin
       ``"manual"``. It beats the job watermark: it is what the start-point card and
-      the connector-config preview already show. Only ``file:position`` is carried
-      (``gtid_executed=None``): both seeders key the offset on file+pos and the
-      connector runs ``gtid.source.excludes '.*'``. ``now`` stamps the offset's
-      ``ts_sec``; ``override_fingerprints`` (recorded by Fetch current position for
-      exactly this point) become its ``table_fingerprints``.
+      the connector-config preview already show. Both seeders key the offset on
+      file+pos and add the point's GTID set (normalized; ``None`` when it has none):
+      on a ``gtid_mode=ON`` source Debezium positions by that set, not by file:pos, so
+      a point without one would make it read the whole retained binary log (Start CDC
+      refuses that start). ``now`` stamps the offset's ``ts_sec``;
+      ``override_fingerprints`` (recorded by Fetch current position for exactly this
+      point) become its ``table_fingerprints``.
     - A Manual point without a ``file:position`` (a GTID set alone) -> ``None``,
       origin ``"manual_unseedable"``. Never falls back to the job watermark or to
       "now": the operator chose Manual, so neither is what they asked for.
+
+    The Full Load route keeps the job watermark object itself when its GTID set needs no
+    normalization, else a copy with the normalized set (fingerprints, added tables and
+    the recorded ``gtid_mode`` kept), so the Lambda and the in-process seeders offer the
+    identical set. The stored job watermark is never changed: Validation compares its
+    set with the live ``@@GLOBAL.gtid_executed`` as a string.
     """
     if override is None:
+        if job_watermark is not None and job_watermark.gtid_executed:
+            normalized = normalize_gtid_set(job_watermark.gtid_executed)
+            if normalized != job_watermark.gtid_executed:
+                return (
+                    job_watermark.model_copy(update={"gtid_executed": normalized or None}),
+                    "full_load",
+                )
         return job_watermark, "full_load"
     if override.can_seed_offset():
         return (
             Watermark(
                 binlog_file=override.binlog_file,
                 binlog_position=override.binlog_position,
-                gtid_executed=None,
+                gtid_executed=normalize_gtid_set(override.gtid_executed) or None,
                 snapshot_timestamp=now,
                 table_fingerprints=dict(override_fingerprints or {}),
             ),

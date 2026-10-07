@@ -683,6 +683,9 @@ def test_capture_watermark_skips_binlog_for_postgres_source(monkeypatch) -> None
     assert fake_engine.disposed is True  # source engine disposed (no leak)
     assert watermark.slot_name is None  # Full-Load-only: no slot (would pin WAL)
     assert watermark.publication_name is None
+    # G19: no MySQL gtid_mode on a PostgreSQL watermark, and none in its payload.
+    assert watermark.gtid_mode is None
+    assert "gtid_mode" not in watermark.model_dump()
 
 
 def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) -> None:
@@ -3779,6 +3782,7 @@ def _run_start_cdc_capture(
     inventory=None,
     selected=None,
     migration_type=None,
+    gtid_state="OFF",
 ):
     """Drive _start_cdc_deploy end to end (running the submitted job body) and capture it.
 
@@ -3794,6 +3798,12 @@ def _run_start_cdc_capture(
     capturing; ``state`` reuses a DataMigrationState across runs; ``catch`` returns the
     job's exception as ``"error"`` instead of raising. ``"events"`` holds every
     ``_log_cdc_event`` call as ``(action, kwargs)``.
+
+    G19 knob: ``gtid_state`` stubs ``_cdc_status.read_source_gtid_state_once`` (nothing
+    connects). A string is the source's gtid_mode (default ``"OFF"``: every earlier caller
+    keeps today's file:position start); a ``GtidSourceState`` is returned as is; ``None``
+    leaves the real reader (no source password -> no-source-connection). The calls are in
+    ``"gtid_reads"`` as ``(session, gtid_set)``.
     """
     from types import SimpleNamespace
 
@@ -3836,6 +3846,20 @@ def _run_start_cdc_capture(
         import dsql_migrator.ui.data_migration._cdc_status as _status
 
         monkeypatch.setattr(_status, "read_cdc_start_point_once", start_point_read)
+    gtid_reads: list = []
+    if gtid_state is not None:
+        import dsql_migrator.ui.data_migration._cdc_status as _status
+        from dsql_migrator.ui.cdc_gtid_gate import GtidSourceState
+
+        _gtid_result = (
+            GtidSourceState(mode=gtid_state) if isinstance(gtid_state, str) else gtid_state
+        )
+
+        def _gtid_read(session, gtid_set):
+            gtid_reads.append((session, gtid_set))
+            return _gtid_result
+
+        monkeypatch.setattr(_status, "read_source_gtid_state_once", _gtid_read)
     # The FK precondition is fail-closed and this fake session has no readable target
     # catalog, so stub it "clean" -- these tests are about seed mode / job deferral, and
     # the gate itself is covered by test_cdc_start_*_foreign_key* below.
@@ -3942,6 +3966,7 @@ def _run_start_cdc_capture(
         "events": events,
         "error": error,
         "state": state,
+        "gtid_reads": gtid_reads,
     }
 
 
@@ -4065,7 +4090,7 @@ def test_start_cdc_seeds_a_manual_binlog_start_point(monkeypatch, host_seed_mode
     kw = run["kwargs"]
     seed = kw["watermark"]
     assert (seed.binlog_file, seed.binlog_position) == _MANUAL
-    assert seed.gtid_executed is None  # file:pos only (gtid.source.excludes '.*')
+    assert seed.gtid_executed is None  # no GTID set entered (a gtid_mode=OFF source)
     assert kw["seed_origin"] == "manual"
     params = dict(build_watermark_params(seed))
     assert params["WatermarkBinlogFile"] == "mysql-bin.000042"
@@ -23345,6 +23370,8 @@ def _drive_start_dialog(monkeypatch, *, drop_result):
     import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
 
     ui = _DialogUi()
+    # The G19 GTID start check reads the source: stubbed (no verdict).
+    monkeypatch.setattr(cdc_ui, "_probe_cdc_gtid_start", lambda *_a, **_k: None)
     blocked = SimpleNamespace(
         ours=[("ecommerce.products", "fk_products_category")], foreign=[], unknown=False
     )
@@ -23426,9 +23453,14 @@ def test_a_partial_removal_leaves_start_locked(monkeypatch) -> None:
 
 
 def _drive_start_dialog_start_point(
-    monkeypatch, *, verdict=None, probe_raises=None, fk_block=False, drop_result=(1, 0)
+    monkeypatch, *, verdict=None, probe_raises=None, fk_block=False, drop_result=(1, 0),
+    gtid_verdict=None, gtid_raises=None,
 ):
-    """Open the real Start CDC dialog with a stubbed MySQL start-point verdict (G5)."""
+    """Open the real Start CDC dialog with a stubbed MySQL start-point verdict (G5).
+
+    ``gtid_verdict`` / ``gtid_raises`` stub the G19 GTID start check (``None``: no
+    verdict, the check is not due or found nothing to refuse).
+    """
     import asyncio
     from types import SimpleNamespace
 
@@ -23436,15 +23468,23 @@ def _drive_start_dialog_start_point(
 
     ui = _DialogUi()
     events: list = []
+
+    def _gtid_probe(*_a, **_k):
+        if gtid_raises is not None:
+            raise gtid_raises
+        return gtid_verdict
+
+    monkeypatch.setattr(cdc_ui, "_probe_cdc_gtid_start", _gtid_probe)
     monkeypatch.setattr(cdc_ui, "cdc_deploy_connection_blocker", lambda *_a, **_k: None)
     monkeypatch.setattr(cdc_ui, "_cdc_fk_block_reason", lambda *_a: ("x", "Foreign keys block CDC"))
     monkeypatch.setattr(cdc_ui, "_cdc_fk_block_body", lambda *_a: "body")
-    monkeypatch.setattr(
-        cdc_ui, "_render_notice",
-        lambda _ui, *, tone="info", icon=None, header="", body="": ui.notices.append(
-            (tone, header)
-        ),
-    )
+    ui.bodies = {}  # header -> the latest body rendered under it
+
+    def _notice(_ui, *, tone="info", icon=None, header="", body=""):
+        ui.notices.append((tone, header))
+        ui.bodies[header] = body
+
+    monkeypatch.setattr(cdc_ui, "_render_notice", _notice)
     blocked = SimpleNamespace(
         ours=[("ecommerce.products", "fk_products_category")], foreign=[], unknown=False,
         blocking=True,
@@ -33946,3 +33986,519 @@ def test_start_card_and_stop_dialog_carry_the_last_stop_cause() -> None:
     assert [t for t in plain.texts if "cdc-stack" not in t] == [
         t for t in bare.texts if "cdc-stack" not in t
     ]
+
+
+# ---------------------------------------------------------------------------
+# G19: on a gtid_mode=ON source CDC starts exactly at its start point (the GTID start
+# check on the job's worker thread and in the Start dialog)
+# ---------------------------------------------------------------------------
+
+_G19_SET = "1DFF02DB-0000-0000-0000-000000000001:1-812"
+
+
+def _g19_state(**kw):
+    from dsql_migrator.ui.cdc_gtid_gate import GtidSourceState
+
+    return GtidSourceState(**kw)
+
+
+def _g19_events(run, action):
+    return [k for a, k in run["events"] if a == action]
+
+
+def test_g19_a_gtid_on_source_refuses_a_manual_point_without_a_gtid_set(monkeypatch) -> None:
+    # Debezium positions by GTID on ON; an offset with no GTID set makes it register an
+    # empty set, and MySQL then re-sends its whole retained binary log.
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_BLOCKED, G1_HEADER
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, gtid_state="ON", catch=True,
+    )
+    err = run["error"]
+    assert isinstance(err, RuntimeError)
+    msg = str(err)
+    assert msg.startswith(f"Start CDC blocked: {G1_HEADER}. ")
+    assert "whole retained binary log again from its beginning" in msg
+    assert "Fetch current position and Use this start point" in msg
+    assert "ON_PERMISSIVE" in msg
+    assert msg.endswith("No connectors were changed.")
+    assert run["kwargs"] == {}  # run_cdc_start never ran
+    blocked = _g19_events(run, ACTION_BLOCKED)
+    assert blocked and blocked[0]["status"].name == "FAILURE"
+    assert blocked[0]["detail"] == f"{G1_HEADER}: binlog mysql-bin.000042:1234"
+    # Only the mode was read: there is no set to check.
+    assert [g for _s, g in run["gtid_reads"]] == [None]
+
+
+def test_g19_a_manual_point_with_its_gtid_set_starts_after_that_set(monkeypatch) -> None:
+    from dsql_migrator.core.cdc import build_watermark_params
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, manual_gtid=f"{_G19_SET},\n 2AAA0000-0000-0000-0000-000000000002:1-3",
+        gtid_state=_g19_state(mode="ON", within_executed=True, covers_purged=True),
+    )
+    assert run["submitted"] and run["kwargs"]
+    want = f"{_G19_SET},2AAA0000-0000-0000-0000-000000000002:1-3"
+    seed = run["kwargs"]["watermark"]
+    assert seed.gtid_executed == want
+    assert dict(build_watermark_params(seed))["WatermarkGtids"] == want
+    # The set was checked against the source (within gtid_executed, covers gtid_purged).
+    assert [g for _s, g in run["gtid_reads"]] == [want]
+    line = (
+        f"Source gtid_mode=ON: Debezium starts after the start point's GTID set {want} "
+        "(binlog mysql-bin.000042:1234)."
+    )
+    positions = _g19_events(run, ACTION_POSITION)
+    assert positions and positions[0]["detail"] == line
+    assert positions[0]["status"].name == "INFO"
+    # The durable record of how CDC positioned is in the deploy log too.
+    assert line in [m for _ts, m in run["state"].get_cdc_deploy_log()]
+    # The "start CDC connectors" line names the same binlog position, with the set.
+    assert (
+        f"start point binlog mysql-bin.000042:1234 with GTID set {want} (Manual start "
+        "point; changes from this position on are replicated)"
+    ) in run["details"][0]
+
+
+@pytest.mark.parametrize("mode", ["OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE"])
+@pytest.mark.parametrize("manual_gtid", [None, "2AAA0000-0000-0000-0000-000000000002:1-3"])
+def test_g19_a_source_that_is_not_gtid_on_starts_by_file_position_as_before(
+    monkeypatch, mode, manual_gtid
+) -> None:
+    # Debezium's own predicate (gtid_mode == ON) is false on all three: file:pos, the
+    # behaviour 7da20f2's sources rely on, with the Watermark* parameters of today.
+    from dsql_migrator.core.cdc import build_watermark_params
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, manual_gtid=manual_gtid, gtid_state=mode,
+    )
+    assert run["submitted"] and run["kwargs"]
+    params = dict(build_watermark_params(run["kwargs"]["watermark"]))
+    assert params["WatermarkBinlogFile"] == "mysql-bin.000042"
+    assert params["WatermarkBinlogPos"] == "1234"
+    assert params["WatermarkGtids"] == (manual_gtid or "")
+    assert _g19_events(run, ACTION_POSITION)[0]["detail"] == (
+        f"Source gtid_mode={mode}: Debezium starts at binlog mysql-bin.000042:1234 by "
+        "binlog file:position."
+    )
+    # The "start CDC connectors" line agrees: the binlog position (never "start point
+    # GTID ..." -- a set Debezium does not position by on this mode).
+    assert "start point binlog mysql-bin.000042:1234" in run["details"][0]
+    assert "start point GTID" not in run["details"][0]
+    # The bundled template is what Start sends (an older stack gets G19's connector config).
+    assert run["kwargs"]["template_body"] == "TEMPLATE-BODY"
+
+
+def test_g19_a_start_point_recorded_while_not_on_is_refused_once_the_source_is_on(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import G2_HEADER
+
+    recorded_off = _job_wm().model_copy(update={"gtid_mode": "OFF"})
+    seeded = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=recorded_off, gtid_state="ON", catch=True,
+    )
+    msg = str(seeded["error"])
+    assert msg.startswith(f"Start CDC blocked: {G2_HEADER}. ")
+    assert "was recorded while the source's gtid_mode was OFF, and it is ON now" in msg
+    assert "MySQL stops the connector on them, or skips them with no error" in msg
+    assert seeded["kwargs"] == {}
+    # The resume of a stack that streamed from it by file:position: the resume copy.
+    resumed = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=recorded_off, committed=True, deployed=("mysql-bin.000050", "999"),
+        gtid_state="ON", catch=True,
+    )
+    msg = str(resumed["error"])
+    assert msg.startswith(f"Start CDC blocked: {G2_HEADER}. ")
+    assert "streamed from that point by binlog file:position" in msg
+    assert "streams from where this stack stopped by binlog file:position" in msg
+    assert resumed["kwargs"] == {}
+
+
+@pytest.mark.parametrize(
+    "state_kw, cause",
+    [
+        ({"mode": "ON", "within_executed": True, "covers_purged": False},
+         "already purged binary logs"),
+        ({"mode": "ON", "within_executed": False, "covers_purged": True},
+         "names transactions this source has not executed"),
+    ],
+)
+def test_g19_a_gtid_set_the_source_cannot_stream_from_is_refused(
+    monkeypatch, state_kw, cause
+) -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import G4_HEADER
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=_job_wm(), gtid_state=_g19_state(**state_kw), catch=True,
+    )
+    msg = str(run["error"])
+    assert msg.startswith(f"Start CDC blocked: {G4_HEADER}. ")
+    assert cause in msg
+    assert 'Re-run Full Load for all tables with "Drop & reload"' in msg
+    assert run["kwargs"] == {}
+    assert [g for _s, g in run["gtid_reads"]] == ["3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"]
+
+
+def test_g19_a_failed_gtid_set_check_asks_to_start_again_not_for_a_new_start_point(
+    monkeypatch,
+) -> None:
+    # The GTID_SUBSET read failed after the mode read (a dropped connection, a timeout):
+    # still refused -- the set could not be confirmed -- but as "could not check", with the
+    # retry as the way forward. A Full Load watermark's set is MySQL's own: no "syntax".
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_BLOCKED, G4_CHECK_HEADER
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=_job_wm(),
+        gtid_state=_g19_state(mode="ON", problem="check-failed",
+                              error_class="OperationalError"),
+        catch=True,
+    )
+    msg = str(run["error"])
+    assert msg.startswith(f"Start CDC blocked: {G4_CHECK_HEADER}. ")
+    assert "failed (OperationalError), so Start CDC cannot confirm" in msg
+    assert "Check that the source database is reachable from the tool, then Start CDC again." in msg
+    for absent in ("syntax", "Re-run Full Load", "not replicated"):
+        assert absent not in msg
+    assert run["kwargs"] == {}
+    assert _g19_events(run, ACTION_BLOCKED)[0]["detail"].startswith(f"{G4_CHECK_HEADER}: ")
+
+
+def test_g19_an_unreadable_mode_refuses_only_a_start_point_without_a_gtid_set(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION, G3_HEADER
+
+    # The real reader: this session has no source password, so nothing connects.
+    refused = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, gtid_state=None, catch=True,
+    )
+    msg = str(refused["error"])
+    assert msg.startswith(f"Start CDC blocked: {G3_HEADER}. ")
+    assert "this session has no source connection" in msg
+    assert "Test the source connection on the Connect step" in msg
+    # A start point WITH a GTID set proceeds: Debezium uses whichever the mode requires.
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=_job_wm(), gtid_state=None,
+    )
+    assert run["submitted"] and run["kwargs"]
+    detail = _g19_events(run, ACTION_POSITION)[0]["detail"]
+    assert detail.startswith(
+        "The source's gtid_mode could not be read (this session has no source connection)"
+    )
+    assert "binlog mysql-bin.000050:999" in detail
+    assert "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5" in detail
+
+
+def test_g19_a_stack_whose_connectors_exist_is_not_checked(monkeypatch) -> None:
+    from dsql_migrator.core.models import SourceType
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, live_mode="recovery", gtid_state="ON",
+    )
+    assert run["submitted"] and run["kwargs"]
+    assert run["gtid_reads"] == []
+
+
+def test_g19_a_postgres_start_is_unchanged(monkeypatch) -> None:
+    from dsql_migrator.core.models import SourceType
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.POSTGRES, gtid_state="ON",
+    )
+    assert run["submitted"]
+    assert run["gtid_reads"] == []
+    assert "log_tail" not in run["kwargs"]
+    assert sorted(run["kwargs"]) == sorted([
+        "stack_name", "params", "deployer", "on_log", "watermark", "seed_origin",
+        "template_body", "seed_mode", "pg_source_config", "pg_source_password",
+    ])
+
+
+def test_g19_a_mysql_start_reads_a_failed_connector_log_with_the_app_identity(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.msk_connect_controller as _mcc
+    from dsql_migrator.core.models import SourceType
+
+    built: list = []
+
+    def _build(region, *, aws_profile=None):
+        built.append((region, aws_profile))
+        return SimpleNamespace(connector_log_tail=lambda stack, name: f"tail {stack} {name}")
+
+    monkeypatch.setattr(_mcc, "build_msk_connect_controller", _build)
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL,
+    )
+    reader = run["kwargs"]["log_tail"]
+    assert callable(reader) and reader("s", "c") == "tail s c"
+    assert built == [("us-east-1", None)]
+
+
+def test_g19_the_gtid_refusal_comes_before_the_start_point_check(monkeypatch) -> None:
+    # Both would refuse (a GTID-less watermark on ON; fingerprints the start-point check
+    # would read): the GTID refusal is raised and the start-point check is never read.
+    from dsql_migrator.ui.cdc_gtid_gate import G1_HEADER
+
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), start_point_read=_g5_never,
+        gtid_state="ON", source_password="pw",
+    )
+    assert isinstance(run["error"], RuntimeError), run["error"]
+    assert str(run["error"]).startswith(f"Start CDC blocked: {G1_HEADER}. ")
+    assert "The Full Load watermark (binlog mysql-bin.000100:4" in str(run["error"])
+
+
+def test_g19_a_resume_of_a_gtid_less_start_point_on_a_gtid_on_source_is_refused(
+    monkeypatch,
+) -> None:
+    from dsql_migrator.ui.cdc_gtid_gate import G1_HEADER
+
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000100", "4"), start_point_read=_g5_never, gtid_state="ON",
+    )
+    msg = str(run["error"])
+    assert msg.startswith(f"Start CDC blocked: {G1_HEADER}. ")
+    assert "has no GTID set, and the source's gtid_mode is ON now" in msg
+    assert "streams from where this stack stopped by binlog file:position" in msg
+    assert run["kwargs"] == {}
+    # The same resume with a recorded GTID set continues after the set Debezium committed.
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    with_set = _g5_wm().model_copy(update={"gtid_executed": _G19_SET, "gtid_mode": "ON"})
+    ok = _g5_run(
+        monkeypatch, job_watermark=with_set, committed=True,
+        deployed=("mysql-bin.000100", "4"), start_point_read=_g5_never, gtid_state="ON",
+    )
+    assert ok["error"] is None and ok["kwargs"]
+    assert _g19_events(ok, ACTION_POSITION)[0]["detail"] == (
+        "Source gtid_mode=ON: Debezium continues after the GTID set it last committed."
+    )
+    # A resume is never asked to prove a set against the source.
+    assert [g for _s, g in ok["gtid_reads"]] == [None]
+
+
+def test_g19_the_start_dialog_refuses_a_gtid_less_point_on_a_gtid_on_source(
+    monkeypatch,
+) -> None:
+    import asyncio
+
+    from dsql_migrator.ui.cdc_gtid_gate import (
+        BLOCK_TOOLTIP,
+        G1_HEADER,
+        GtidSourceState,
+        mysql_gtid_start_verdict,
+    )
+
+    verdict = mysql_gtid_start_verdict(
+        GtidSourceState(mode="ON"), seed_gtids="", seed_gtid_mode=None, seedable=True,
+        resumes=False,
+    )
+    ui, _events = _drive_start_dialog_start_point(
+        monkeypatch, gtid_verdict=verdict, fk_block=True
+    )
+    # (The FK slot's re-render clears this double's notice list, so the GTID notice is
+    # asserted on the dialog without an FK block below.)
+    assert ui.bodies[G1_HEADER].endswith("No connectors were changed.")
+    start = ui.buttons["Start CDC"]
+    assert start.enabled is False
+    # Removing the foreign keys does not unlock a GTID refusal.
+    asyncio.run(ui.buttons["Remove foreign keys"].on_click())
+    assert start.enabled is False
+    removed = "1 foreign key(s) removed"
+    assert ("success", removed) in ui.notices
+    assert ui.bodies[removed].endswith(
+        "Start CDC stays blocked by the start-point notice above."
+    )
+    # Without the FK block: the error notice, and the tooltip is the GTID refusal's.
+    ui2, _events = _drive_start_dialog_start_point(monkeypatch, gtid_verdict=verdict)
+    assert ("error", G1_HEADER) in ui2.notices
+    assert ui2.buttons["Start CDC"].enabled is False
+    assert ui2.buttons["Start CDC"].tooltip_text == BLOCK_TOOLTIP
+    # The GTID notice comes before the start-point notice.
+    from dsql_migrator.ui.cdc_start_point_gate import W1_HEADER, StartPointVerdict
+
+    ui3, _events = _drive_start_dialog_start_point(
+        monkeypatch, gtid_verdict=verdict,
+        verdict=StartPointVerdict(kind="unverified", unverified=("app.orders",),
+                                  problem="no-baseline"),
+    )
+    headers = [h for _t, h in ui3.notices]
+    assert headers.index(G1_HEADER) < headers.index(W1_HEADER)
+
+
+def test_g19_a_failing_gtid_probe_in_the_dialog_logs_it_and_does_not_block(
+    monkeypatch,
+) -> None:
+    ui, events = _drive_start_dialog_start_point(
+        monkeypatch, gtid_raises=RuntimeError("boom")
+    )
+    assert ui.buttons["Start CDC"].enabled is True
+    unknown = [k for a, k in events if a == "CDC GTID start-point check unknown"]
+    assert unknown and unknown[0]["status"].name == "INFO"
+    assert "the job re-checks before creating any connector" in unknown[0]["detail"]
+    assert not [n for n in ui.notices if n[0] == "error"]
+
+
+def test_g19_watermark_coordinate_names_the_position_for_a_watermark_recorded_off_on() -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._full_load_engine import watermark_coordinate
+
+    off = _job_wm().model_copy(update={"gtid_mode": "OFF"})
+    assert watermark_coordinate(off) == "binlog mysql-bin.000050:999"
+    on = _job_wm().model_copy(update={"gtid_mode": "ON"})
+    assert watermark_coordinate(on) == "GTID 3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
+    # Unrecorded (an earlier version's watermark, a Manual seed): unchanged precedence.
+    assert watermark_coordinate(_job_wm()) == "GTID 3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
+    pg = Watermark(snapshot_timestamp=_job_wm().snapshot_timestamp, wal_lsn="3/AF012B8")
+    assert watermark_coordinate(pg, SourceType.POSTGRES) == "WAL LSN 3/AF012B8"
+
+
+# ---------------------------------------------------------------------------
+# G19 review: a resume is judged by the stack's own record of its last start offset, and
+# a malformed Manual GTID set is refused on every mode
+# ---------------------------------------------------------------------------
+
+# A stopped stack whose last Start offered a binlog position and NO GTID set (it streamed
+# by file:position while gtid_mode was not ON): Stop carried Watermark* forward.
+_G19_STOPPED_NO_SET = {
+    "DeploySink": "true", "MskBootstrapServers": "",
+    "WatermarkBinlogFile": "mysql-bin.000100", "WatermarkBinlogPos": "4",
+    "WatermarkGtids": "",
+}
+
+
+@pytest.mark.parametrize(
+    "session_point",
+    [
+        {},  # nothing in the session: an attached stack, a reset session
+        {"start_mode": "manual", "manual_gtid": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"},
+    ],
+)
+def test_g19_a_seedless_resume_of_a_stack_offered_no_gtid_set_is_refused_on_on(
+    monkeypatch, session_point
+) -> None:
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_BLOCKED, G1_HEADER
+
+    run = _g5_run(
+        monkeypatch, committed=True, deployed=("mysql-bin.000100", "4"),
+        describe_params=dict(_G19_STOPPED_NO_SET), start_point_read=_g5_never,
+        gtid_state="ON", **session_point,
+    )
+    msg = str(run["error"])
+    assert msg.startswith(f"Start CDC blocked: {G1_HEADER}. ")
+    assert (
+        "The start offset this stack was last started from (binlog mysql-bin.000100:4) "
+        "has no GTID set, and the source's gtid_mode is ON now."
+    ) in msg
+    assert "ON_PERMISSIVE" in msg and msg.endswith("No connectors were changed.")
+    assert run["kwargs"] == {}  # run_cdc_start never ran
+    assert _g19_events(run, ACTION_BLOCKED)[0]["detail"] == (
+        f"{G1_HEADER}: binlog mysql-bin.000100:4"
+    )
+    assert [g for _s, g in run["gtid_reads"]] == [None]  # the mode only
+
+
+@pytest.mark.parametrize("mode", ["OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE"])
+def test_g19_a_seedless_resume_of_a_file_position_stack_is_unchanged_off_on(
+    monkeypatch, mode
+) -> None:
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    run = _g5_run(
+        monkeypatch, committed=True, deployed=("mysql-bin.000100", "4"),
+        describe_params=dict(_G19_STOPPED_NO_SET), start_point_read=_g5_never,
+        gtid_state=mode,
+    )
+    assert run["error"] is None and run["kwargs"]
+    assert _g19_events(run, ACTION_POSITION)[0]["detail"] == (
+        f"Source gtid_mode={mode}: Debezium continues from the binlog file:position it "
+        "last committed."
+    )
+
+
+def test_g19_a_resume_of_a_stack_offered_a_gtid_set_continues_although_the_point_was_edited(
+    monkeypatch,
+) -> None:
+    # The stack was started (on ON) from a point WITH a GTID set; the session's Manual
+    # point was edited since to a GTID-less earlier position: a resume (the seeder skips
+    # it), continuing after the set Debezium committed -- not refused.
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    params = dict(_G19_STOPPED_NO_SET, WatermarkBinlogPos="900", WatermarkGtids=_G19_SET)
+    run = _g5_run(
+        monkeypatch, committed=True, deployed=("mysql-bin.000100", "900"),
+        describe_params=params, start_point_read=_g5_never, gtid_state="ON",
+        start_mode="manual", manual_binlog=("mysql-bin.000100", 4),
+    )
+    assert run["error"] is None, run["error"]
+    assert run["kwargs"]
+    assert _g19_events(run, ACTION_POSITION)[0]["detail"] == (
+        "Source gtid_mode=ON: Debezium continues after the GTID set it last committed."
+    )
+
+
+def test_g19_a_seedless_cdc_only_resume_with_no_stack_record_continues_by_gtid(
+    monkeypatch,
+) -> None:
+    # Stop -> Start of a CDC-only stack whose session holds a GTID set alone (it seeds
+    # nothing) and whose stack records no start offset: the committed offset decides.
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    run = _g5_run(
+        monkeypatch, migration_type=MigrationType.CDC_ONLY, committed=True,
+        deployed=("mysql-bin.000100", "4"), start_point_read=_g5_never, gtid_state="ON",
+        start_mode="manual", manual_gtid=_G19_SET,
+    )
+    assert run["error"] is None, run["error"]
+    assert run["kwargs"] and run["kwargs"]["watermark"] is None
+    assert _g19_events(run, ACTION_POSITION)[0]["detail"] == (
+        "Source gtid_mode=ON: Debezium continues after the GTID set it last committed."
+    )
+    assert [g for _s, g in run["gtid_reads"]] == [None]
+
+
+@pytest.mark.parametrize("mode", ["ON", "OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE", None])
+def test_g19_a_malformed_manual_gtid_set_is_refused_before_anything_is_read(
+    monkeypatch, mode
+) -> None:
+    # A set pasted with its quotes would be seeded and written into every offset Debezium
+    # commits -- which it cannot read back at its next task start, on any gtid_mode.
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_BLOCKED, MALFORMED_HEADER
+
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, manual_gtid=f"'{_G19_SET}'", gtid_state=mode, catch=True,
+    )
+    msg = str(run["error"])
+    assert msg.startswith(f"Start CDC blocked: {MALFORMED_HEADER}. ")
+    assert "stop at the connector's next restart" in msg
+    assert _G19_SET not in msg  # the entered value is never repeated
+    assert run["kwargs"] == {} and run["gtid_reads"] == []
+    assert _g19_events(run, ACTION_BLOCKED)[0]["detail"] == (
+        f"{MALFORMED_HEADER}: binlog mysql-bin.000042:1234"
+    )

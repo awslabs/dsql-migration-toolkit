@@ -84,9 +84,11 @@ class _FakeConnection:
         server_uuid: Union[str, Exception, None] = None,
         counts: Optional[dict[str, int]] = None,
         current_db: str = "app",
+        gtid_mode: Union[str, Exception, None] = None,
     ) -> None:
         self._master_status = master_status
         self._gtid = gtid
+        self._gtid_mode = gtid_mode
         self._server_uuid = server_uuid
         self._counts = counts or {}
         self._current_db = current_db
@@ -110,6 +112,10 @@ class _FakeConnection:
             if isinstance(self._gtid, Exception):
                 raise self._gtid
             return _FakeResult(scalar=self._gtid)
+        if "@@GLOBAL.GTID_MODE" in upper:
+            if isinstance(self._gtid_mode, Exception):
+                raise self._gtid_mode
+            return _FakeResult(scalar=self._gtid_mode)
         if "@@GLOBAL.SERVER_UUID" in upper:
             if isinstance(self._server_uuid, Exception):
                 raise self._server_uuid
@@ -628,3 +634,66 @@ def test_the_fingerprint_field_is_left_out_while_empty_and_round_trips() -> None
     job = MigrationJob(job_id="j", watermark=full)
     again = MigrationJob.model_validate_json(job.model_dump_json())
     assert again.watermark.table_fingerprints == {"app.t": "1:1:x:y"}
+
+
+# ---------------------------------------------------------------------------
+# G19: the watermark records the gtid_mode its GTID set was captured under
+# ---------------------------------------------------------------------------
+
+
+def test_capture_records_the_gtid_mode_inside_the_snapshot() -> None:
+    connection = _FakeConnection(
+        master_status={"File": "mysql-bin.000008", "Position": 5150730,
+                       "Executed_Gtid_Set": "uuid:1-812"},
+        gtid="uuid:1-812",
+        gtid_mode="ON",
+        counts={"orders": 1},
+    )
+    watermark = capture_watermark(connection, ["orders"], now=lambda: FIXED_NOW)
+    assert watermark.gtid_mode == "ON"
+    executed = connection.executed
+    mode_at = next(i for i, s in enumerate(executed) if "GTID_MODE" in s.upper())
+    status_at = next(i for i, s in enumerate(executed) if SHOW_BINARY_LOG_STATUS in s)
+    # Right after the status row, inside the consistent-snapshot transaction.
+    assert executed.index(START_CONSISTENT_SNAPSHOT) < status_at < mode_at
+    assert mode_at < executed.index(COMMIT)
+    assert all(not is_write_or_ddl(s) for s in executed)
+
+
+def test_a_failed_gtid_mode_read_leaves_it_unrecorded() -> None:
+    connection = _FakeConnection(
+        master_status={"File": "f.000001", "Position": 4, "Executed_Gtid_Set": ""},
+        gtid_mode=RuntimeError("Unknown system variable"),
+        counts={"orders": 1},
+    )
+    watermark = capture_watermark(connection, ["orders"], now=lambda: FIXED_NOW)
+    assert watermark.gtid_mode is None
+    assert (watermark.binlog_file, watermark.binlog_position) == ("f.000001", 4)
+
+
+def test_the_gtid_executed_precedence_is_unchanged() -> None:
+    # @@GLOBAL.gtid_executed wins over the status row's set when both are read (G19 does
+    # not change the capture's precedence; the watermark is read before any table is).
+    connection = _FakeConnection(
+        master_status={"File": "f.000001", "Position": 4, "Executed_Gtid_Set": "uuid:1-5"},
+        gtid="uuid:1-6",
+        gtid_mode="ON",
+        counts={"orders": 1},
+    )
+    watermark = capture_watermark(connection, ["orders"], now=lambda: FIXED_NOW)
+    assert watermark.gtid_executed == "uuid:1-6"
+
+
+def test_the_gtid_mode_field_is_left_out_while_empty_and_round_trips() -> None:
+    bare = Watermark(snapshot_timestamp=FIXED_NOW)
+    assert "gtid_mode" not in bare.model_dump()
+    assert "gtid_mode" not in bare.model_dump_json()
+    # A job written by an earlier version (no key) still loads.
+    old_job = MigrationJob(job_id="j", watermark=bare).model_dump_json()
+    assert "gtid_mode" not in old_job
+    assert MigrationJob.model_validate_json(old_job).watermark.gtid_mode is None
+    full = Watermark(snapshot_timestamp=FIXED_NOW, gtid_mode="OFF_PERMISSIVE")
+    again = MigrationJob.model_validate_json(
+        MigrationJob(job_id="j", watermark=full).model_dump_json()
+    )
+    assert again.watermark.gtid_mode == "OFF_PERMISSIVE"

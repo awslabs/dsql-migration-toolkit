@@ -13,7 +13,9 @@ value is as-of one point):
 
 - MySQL binlog coordinates (file + position) via ``SHOW BINARY LOG STATUS``
   (MySQL 8.2+/8.4), falling back to ``SHOW MASTER STATUS`` (<= 8.0.x),
-- the GTID set (``@@GLOBAL.gtid_executed``),
+- the GTID set (``@@GLOBAL.gtid_executed``) and the ``@@GLOBAL.gtid_mode`` it was
+  recorded under (on a ``gtid_mode=ON`` source Debezium starts CDC after that GTID set,
+  so Start CDC refuses a point recorded while the mode was not ON once it is ON),
 - the source ``@@GLOBAL.server_uuid``,
 - a UTC snapshot timestamp,
 - per-table row counts, and
@@ -170,6 +172,18 @@ def _read_global_variable(connection: _Connection, name: str) -> Optional[str]:
     return text_value or None
 
 
+def read_gtid_mode(connection: _Connection) -> Optional[str]:
+    """The source's ``@@GLOBAL.gtid_mode`` (``ON`` / ``ON_PERMISSIVE`` / ``OFF_PERMISSIVE`` /
+    ``OFF``), or ``None`` when it cannot be read. Read-only.
+
+    Debezium positions by GTID set only when it is ``ON``
+    (:func:`~dsql_migrator.core.cdc_coords.gtid_mode_is_on`), so the watermark records it
+    with its GTID set and Fetch current position reads it with the position. A
+    :class:`ReadOnlySourceError` is never suppressed.
+    """
+    return _read_global_variable(connection, "gtid_mode")
+
+
 def _approximate_row_counts(
     connection: _Connection,
     tables: list[str],
@@ -322,6 +336,14 @@ def capture_watermark(
     schema change racing the capture can only make Start CDC refuse a start point it
     could have used -- never pass one whose older rows the tables no longer describe.
 
+    ``gtid_mode`` is read right after the binlog position: on a ``gtid_mode=ON`` source
+    Debezium starts CDC after the GTID set recorded here, so Start CDC refuses this point
+    once the source is ON if it was captured while the mode was not ON. The GTID set is
+    ``@@GLOBAL.gtid_executed`` (the status row's set when that read fails). It is read
+    after the position, which is gap-free because the watermark is captured before any
+    table is read and MySQL adds a transaction's GTID to ``gtid_executed`` only after the
+    transaction commits.
+
     ``baseline_tables`` (G17, MySQL: the migratable tables this run does NOT load) get the
     same fingerprint in a SECOND, separate bounded statement, also before the binlog
     position: a failure there leaves those baselines out and never drops a run table's
@@ -350,6 +372,7 @@ def capture_watermark(
         binlog_file, binlog_position, gtid_from_master = _read_master_status(
             connection
         )
+        gtid_mode = read_gtid_mode(connection)
         gtid_executed = (
             _read_global_variable(connection, "gtid_executed") or gtid_from_master
         )
@@ -366,6 +389,7 @@ def capture_watermark(
         binlog_position=binlog_position,
         gtid_executed=gtid_executed,
         server_uuid=server_uuid,
+        gtid_mode=gtid_mode,
         snapshot_timestamp=snapshot_timestamp,
         table_row_counts=table_row_counts,
         row_counts_approximate=True,
@@ -494,6 +518,7 @@ def binlog_resume_gap_reason(
 __all__ = [
     "WatermarkCapturer",
     "capture_watermark",
+    "read_gtid_mode",
     "read_start_point_fingerprints",
     "count_source_rows",
     "estimate_source_rows",

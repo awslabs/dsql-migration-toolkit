@@ -68,6 +68,7 @@ from dsql_migrator.core.converter import (
     pg_preserved_generated_columns,
     parse_target_primary_key,
 )
+from dsql_migrator.core.cdc_coords import gtid_mode_is_on
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
 from dsql_migrator.core.column_exclusion import names_in as _names_in  # noqa: F401
 from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
@@ -3853,6 +3854,10 @@ def watermark_coordinate(
     :func:`_log_captured_watermark` so the CDC start logs the SAME coordinate it resumes
     from, rather than a second spelling of the precedence. Only a log position -- never a
     row value (Property 7).
+
+    A MySQL watermark that recorded a ``gtid_mode`` other than ON names its binlog
+    file:position first: Debezium positions by GTID set only on a ``gtid_mode=ON``
+    source, so a GTID set recorded under another mode is not where CDC starts.
     """
     if watermark is None:
         return "no watermark"
@@ -3863,6 +3868,9 @@ def watermark_coordinate(
     gtid = getattr(watermark, "gtid_executed", None)
     binlog_file = getattr(watermark, "binlog_file", None)
     wal_lsn = getattr(watermark, "wal_lsn", None)
+    recorded_mode = getattr(watermark, "gtid_mode", None)
+    if binlog_file and recorded_mode and not gtid_mode_is_on(recorded_mode):
+        return f"binlog {binlog_file}:{getattr(watermark, 'binlog_position', None)}"
     if gtid:
         return f"GTID {gtid}"
     if binlog_file:

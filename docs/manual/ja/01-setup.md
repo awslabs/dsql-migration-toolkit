@@ -136,11 +136,15 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
   未消費のスロットが WAL を固定し続け、ソースのディスクを満杯にする恐れがある** ため、WAL/スロットの
   健全性を監視してください — ツールは `wal_status` を提示し、`wal_status='lost'` はスロットが無効化
   されたことを意味します → gapless な再開が壊れる → Full Load を再実行してください。
-- **MySQL ソース — GTID は推奨ですが必須ではありません。** `gtid_mode=ON` にすると、ソースの
-  フェイルオーバー(failover)やレプリカ昇格の後でも CDC の再開が堅牢になります。設定していない場合、
-  ツールは binlog の `file:position` ウォーターマークにフォールバックします — 動作はしますが、
-  フェイルオーバーをまたぐ堅牢性は劣ります。ゲートは GTID の欠如をブロッカーとしてではなく、情報と
-  して報告します。(PostgreSQL には GTID / `file:position` の概念はありません。)
+- **MySQL ソース — GTID は推奨ですが必須ではありません。Full Load の前に決めてください。**
+  `gtid_mode=ON` では Debezium が GTID で位置を決めます: CDC は開始位置とともに記録された GTID セット
+  (Full Load のウォーターマーク、または Manual の位置なら **Fetch current position**)の次から開始し、
+  最後にコミットした GTID セットの次から再開するため、バイナリログファイルの異なるレプリカへの
+  フェイルオーバー(failover)の後でも続けられます。`OFF`、`OFF_PERMISSIVE`、`ON_PERMISSIVE` では
+  binlog の `file:position` を使い、1 つのソース上では同じように動作します。Full Load からカットオーバー
+  まではモードを変えないでください: `gtid_mode` が `ON` でないときに記録された開始位置では、`ON` に
+  なった後に CDC を開始できません([第 6 章](06-limitations.md))。ゲートは GTID の欠如をブロッカーと
+  してではなく、情報として報告します。(PostgreSQL には GTID / `file:position` の概念はありません。)
 - **PostgreSQL ソース — CDC はクラスターのライターに対して実行する必要があります。** ソースは
   **スタンバイではなくライター** でなければなりません(`pg_is_in_recovery()` が false であること)—
   スタンバイはレプリケーションスロットをホストできないため、CDC はライターのエンドポイントに向けて

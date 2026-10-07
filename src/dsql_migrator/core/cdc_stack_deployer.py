@@ -97,19 +97,37 @@ def _parse_unsupported_azs(reason: str) -> set[str]:
     return {az.strip() for az in match.group(1).split(",") if az.strip()}
 
 
+# How far before ``since`` a time-limited worker-log read starts: the app's clock and
+# CloudWatch's event timestamps can differ by a little.
+_LOG_SINCE_SKEW_SECONDS = 120
+
+
 def read_connector_log_tail(
-    logs, stack_name: str, connector_name: str, *, limit: int = 400
+    logs,
+    stack_name: str,
+    connector_name: str,
+    *,
+    limit: int = 400,
+    since: Optional[datetime] = None,
 ) -> str:
     """Recent worker-log lines of ``connector_name`` from a CloudWatch Logs client. Bounded.
 
-    Two calls, both capped: ``DescribeLogStreams`` on ``/msk-connect/<stack>-cdc`` (newest
-    first, at most 10 streams), then ``GetLogEvents`` on the first stream whose name
-    contains ``connector_name`` (the newest ``limit`` events). Returns the messages joined
-    with newlines, or ``""`` when no stream matches or on ANY error -- the log may not
-    exist yet or permissions may be missing, so callers must treat it as advisory. Shared
-    by the Start CDC failure path (:meth:`CdcStackDeployer.connector_log_tail`) and the
+    ``DescribeLogStreams`` on ``/msk-connect/<stack>-cdc`` (newest first, at most 10
+    streams), then ``GetLogEvents`` on the first stream whose name contains
+    ``connector_name`` (the newest ``limit`` events). Returns the messages joined with
+    newlines, or ``""`` when no stream matches or on ANY error -- the log may not exist yet
+    or permissions may be missing, so callers must treat it as advisory. Shared by the
+    Start CDC failure path (:meth:`CdcStackDeployer.connector_log_tail`) and the
     Pipeline-health read of a stopped connector
     (``MskConnectController.connector_log_tail``).
+
+    ``since`` (a Start's submit time) limits the read to events written from then on (less
+    ``_LOG_SINCE_SKEW_SECONDS``): a connector name repeats across Starts and the log group
+    keeps 30 days, so the newest stream can be an earlier Start's. ``GetLogEvents`` then
+    filters by event time on the server, over every matching stream in turn (still at most
+    10 described), and the first one with such events is returned. The stream ordering
+    alone is not trusted for this: ``lastEventTimestamp`` is eventually consistent.
+    Without ``since`` the read is unchanged.
     """
     log_group = f"/msk-connect/{stack_name}-cdc"
     try:
@@ -119,23 +137,33 @@ def read_connector_log_tail(
             descending=True,
             limit=10,
         ).get("logStreams", [])
-        stream = next(
-            (
-                s.get("logStreamName")
-                for s in streams
-                if connector_name in str(s.get("logStreamName", ""))
-            ),
-            None,
-        )
-        if stream is None:
-            return ""
-        events = logs.get_log_events(
-            logGroupName=log_group,
-            logStreamName=stream,
-            limit=limit,
-            startFromHead=False,
-        ).get("events", [])
-        return "\n".join(str(e.get("message", "")) for e in events)
+        names = [
+            s.get("logStreamName")
+            for s in streams
+            if connector_name in str(s.get("logStreamName", ""))
+        ]
+        if since is None:
+            if not names:
+                return ""
+            events = logs.get_log_events(
+                logGroupName=log_group,
+                logStreamName=names[0],
+                limit=limit,
+                startFromHead=False,
+            ).get("events", [])
+            return "\n".join(str(e.get("message", "")) for e in events)
+        start_ms = int(since.timestamp() * 1000) - _LOG_SINCE_SKEW_SECONDS * 1000
+        for name in names:
+            events = logs.get_log_events(
+                logGroupName=log_group,
+                logStreamName=name,
+                limit=limit,
+                startFromHead=False,
+                startTime=start_ms,
+            ).get("events", [])
+            if events:
+                return "\n".join(str(e.get("message", "")) for e in events)
+        return ""
     except Exception:  # noqa: BLE001 - advisory only
         return ""
 
@@ -625,7 +653,12 @@ class CdcStackDeployer:
         return None
 
     def connector_log_tail(
-        self, stack_name: str, connector_name: str, *, limit: int = 400
+        self,
+        stack_name: str,
+        connector_name: str,
+        *,
+        limit: int = 400,
+        since: Optional[datetime] = None,
     ) -> str:
         """Return recent worker-log lines for ``connector_name`` (best-effort).
 
@@ -638,13 +671,15 @@ class CdcStackDeployer:
         classify the cause. Returns ``""`` on any error (the log may not exist yet,
         or permissions may be missing) -- callers must treat it as advisory. The
         read itself is :func:`read_connector_log_tail`, shared with the poll-time
-        controller.
+        controller (``since``: only events written from then on).
         """
         try:
             logs = self._client("logs")
         except Exception:  # noqa: BLE001 - advisory only
             return ""
-        return read_connector_log_tail(logs, stack_name, connector_name, limit=limit)
+        return read_connector_log_tail(
+            logs, stack_name, connector_name, limit=limit, since=since
+        )
 
     # -- First-deploy / teardown (create_stack / delete_stack) ---------------
 

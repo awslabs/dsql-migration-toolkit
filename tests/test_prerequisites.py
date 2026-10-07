@@ -325,6 +325,29 @@ def test_binlog_and_gtid_checks() -> None:
     assert gtid_off.required is False
 
 
+def test_the_gtid_check_says_how_cdc_positions_on_each_mode() -> None:
+    # G19: on ON Debezium positions by the start point's GTID set; on any other mode
+    # (ON_PERMISSIVE included: Debezium's own predicate is gtid_mode == ON) by binlog
+    # file:position. Statuses are unchanged.
+    on = check_gtid_mode({"gtid_mode": "ON"})
+    assert on.status == PrerequisiteStatus.PASS and on.required is False
+    assert on.detail == "gtid_mode=ON: CDC starts after the GTID set recorded with its start point."
+    assert on.remediation == ""
+    for mode in ("OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE", ""):
+        res = check_gtid_mode({"gtid_mode": mode})
+        assert res.status == PrerequisiteStatus.INFO and res.required is False
+        assert res.detail == (
+            "gtid_mode is not ON; CDC starts from the binlog file:position of its start point."
+        )
+        assert res.remediation == (
+            "Optional: GTID is not required. With gtid_mode=ON, CDC positions by GTID set, "
+            "which also survives a failover to a replica whose binary log files differ. If "
+            "you change gtid_mode, do it before the Full Load (or Fetch current position) "
+            "and keep it until cut over: Start CDC refuses a start point recorded while "
+            "gtid_mode was not ON once the source is ON."
+        )
+
+
 def test_binlog_retention_rds_value() -> None:
     # RDS retention hours: >= 24h passes, a short/unset ("0") value WARNs.
     ok = check_binlog_retention({"rds_binlog_retention_hours": "168"})

@@ -624,15 +624,21 @@ class MskConnectController:
         return found
 
     def connector_log_tail(
-        self, stack_name: str, connector_name: str, *, limit: int = 400
+        self,
+        stack_name: str,
+        connector_name: str,
+        *,
+        limit: int = 400,
+        since: Optional[datetime] = None,
     ) -> str:
         """Recent worker-log lines of ``connector_name`` (``""`` on any error). Bounded.
 
-        The same two capped CloudWatch Logs reads the Start CDC failure path makes
+        The same capped CloudWatch Logs reads the Start CDC failure path makes
         (:func:`~dsql_migrator.core.cdc_stack_deployer.read_connector_log_tail`), for the
         Pipeline-health diagnosis of a connector that stopped AFTER it started. Read it
         only for a stopped connector, throttled by the caller: it is two API calls, and a
-        healthy connector's log names no failure.
+        healthy connector's log names no failure. MySQL Start CDC also reads a failed
+        connector create with it, limited to events written ``since`` that Start.
         """
         from dsql_migrator.core.cdc_stack_deployer import read_connector_log_tail
 
@@ -640,7 +646,11 @@ class MskConnectController:
             logs = self._client("logs")
         except Exception:  # noqa: BLE001 - advisory monitoring read, never crash
             return ""
-        return read_connector_log_tail(logs, stack_name, connector_name, limit=limit)
+        if since is None:
+            return read_connector_log_tail(logs, stack_name, connector_name, limit=limit)
+        return read_connector_log_tail(
+            logs, stack_name, connector_name, limit=limit, since=since
+        )
 
     # -- read-only ----------------------------------------------------------
 

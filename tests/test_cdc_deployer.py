@@ -237,6 +237,30 @@ def test_submit_update_overrides_and_carries_forward() -> None:
     assert update_call[1]["UsePreviousTemplate"] is True
 
 
+def test_submit_update_sends_the_given_template_instead_of_the_previous_one() -> None:
+    # G19: Start CDC sends the BUNDLED template, which is how a stack deployed by an
+    # earlier version gets this version's connector configuration (no gtid.source.excludes
+    # ".*") at its next Start -- the update must carry it, never UsePreviousTemplate.
+    client = _FakeClient({"describe_stacks": _stack(params={"VpcId": "vpc-1"})})
+    _dep(client).submit_update(
+        "mysql-dsql-cdc-stack", [("TableIncludeList", "x")], template_body="TEMPLATE_BODY"
+    )
+    update_call = next(c for c in client.calls if c[0] == "update_stack")
+    assert update_call[1]["TemplateBody"] == "TEMPLATE_BODY"
+    assert "UsePreviousTemplate" not in update_call[1]
+    # Over CloudFormation's 51,200-byte inline limit it is staged in S3 and passed by URL.
+    big = "x" * 60000
+    client2 = _FakeClient({"describe_stacks": _stack(params={"VpcId": "vpc-1"})})
+    dep = _dep(client2)
+    dep.template_s3_bucket = "plugin-bucket"
+    dep.submit_update("mysql-dsql-cdc-stack", [("TableIncludeList", "x")], template_body=big)
+    put = next(c for c in client2.calls if c[0] == "put_object")
+    update2 = next(c for c in client2.calls if c[0] == "update_stack")
+    assert put[1]["Body"] in (big, big.encode("utf-8"))
+    assert "TemplateURL" in update2[1] and "TemplateBody" not in update2[1]
+    assert "UsePreviousTemplate" not in update2[1]
+
+
 def test_submit_update_no_changes_returns_false() -> None:
     client = _FakeClient(
         {"describe_stacks": _stack(params={"TableIncludeList": "x"})},

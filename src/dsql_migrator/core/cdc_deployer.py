@@ -74,6 +74,7 @@ from dsql_migrator.core.cdc import (
     rekey_parameter_size_refusal,
     rekey_routing_log_lines,
 )
+from dsql_migrator.core.cdc_coords import gtid_set_summary, normalize_gtid_set
 from dsql_migrator.core.models import (
     ChunkState,
     MigrationJob,
@@ -405,6 +406,51 @@ _UNPARSEABLE_DEFINITION_GUIDANCE = (
 )
 _UNPARSEABLE_DEFINITION_HEADLINE = "Debezium could not parse a source table's definition"
 
+# G19: GTID positioning on a gtid_mode=ON source (see the table entries below). The sentence
+# after the CHECKSUM step is ui.cdc_start_point_gate.RELOAD_RESETS_MANUAL verbatim (pinned).
+_ANONYMOUS_GTID_NEEDLE = "cannot replicate anonymous transaction"
+_PURGED_GTIDS_NEEDLE = "purged required binary logs"
+_PURGED_GTIDS_NEEDLE_57 = "has purged binary logs containing gtids"
+_ANONYMOUS_GTID_GUIDANCE = (
+    "{connector} failed: the source runs gtid_mode=ON, so Debezium reads the binary log by "
+    "GTID, and the binary log after the position this connector started from holds changes "
+    "written without a GTID (while gtid_mode was not ON); MySQL cannot send those by GTID. "
+    "Retry CDC fails the same way, and so does Stop CDC followed by Start CDC. Stop CDC, "
+    "then either set the source's gtid_mode back to ON_PERMISSIVE until cut over — Debezium "
+    "then reads by binlog file:position from where it stopped — or give CDC a start point "
+    "recorded while gtid_mode is ON: Re-run Full Load for all tables with \"Drop & reload\" "
+    "(Full load + CDC), or choose Manual, Fetch current position and Use this start point — "
+    "changes made between where CDC stopped and that point are then not replicated, so "
+    "reload those tables with \"Drop & reload\" (CDC only: correct them on Aurora DSQL) and "
+    "validate with CHECKSUM. "
+    "A reload switches the CDC start point back to Automatic, so choose Manual again and "
+    "Use this start point before Start CDC (the fetched point is kept)."
+)
+_PURGED_GTIDS_GUIDANCE = (
+    "{connector} failed: the source runs gtid_mode=ON, so Debezium reads the binary log by "
+    "GTID, and the source refused the GTID set this connector started from: it has already "
+    "purged binary logs holding transactions that set does not contain. That has two "
+    "causes. If the binlog retention ran out while CDC was stopped or behind, those changes "
+    "can no longer be streamed. If an earlier version of the tool started this pipeline "
+    "from a Manual start point (CDC only included), the source may still hold every change "
+    "since CDC stopped: only the GTID set that version recorded lacks the transactions the "
+    "source had purged at that start. While gtid_mode stays ON, Retry CDC fails the same "
+    "way, and so does Stop CDC followed by Start CDC. For a pipeline an earlier version "
+    "started from a Manual start point, Stop CDC, set the source's gtid_mode to "
+    "ON_PERMISSIVE until cut over (a parameter-group change on RDS and Aurora), then Start "
+    "CDC: Debezium resumes from where it stopped by binlog file:position, with no gap (if "
+    "the binlog retention also ran out, that Start fails rather than skip changes). "
+    "Otherwise, Stop CDC, then give CDC a start point the source still holds: Re-run Full "
+    "Load for all tables with \"Drop & reload\" (Full load + CDC; raise the source's binlog "
+    "retention first, for example CALL mysql.rds_set_configuration('binlog retention "
+    "hours', 168)), or choose Manual, Fetch current position and Use this start point — "
+    "changes made between where CDC stopped and that point are then not replicated, so "
+    "reload those tables with \"Drop & reload\" (CDC only: correct them on Aurora DSQL) and "
+    "validate with CHECKSUM. "
+    "A reload switches the CDC start point back to Automatic, so choose Manual again and "
+    "Use this start point before Start CDC (the fetched point is kept)."
+)
+
 
 _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
     (
@@ -540,6 +586,35 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         _UNPARSEABLE_DDL_NEEDLE,
         _UNPARSEABLE_DDL_GUIDANCE,
     ),
+    # --- MySQL gtid_mode=ON: GTID positioning (G19) ------------------------------------
+    # Debezium 2.7.4 asks MySQL for every transaction NOT in its offset's GTID set when the
+    # source's gtid_mode is ON (MySqlConnection.isGtidModeEnabled), and the server refuses
+    # in two ways the start-time GTID check cannot always prevent: the binary log after
+    # that point holds transactions written without a GTID (a gtid_mode change while CDC
+    # was stopped or streaming), or the server purged binary logs the set does not cover
+    # (retention ran out, or a set recorded by an earlier version lacks the purged range).
+    # Server text, as the binlog client's ServerException repeats it: "Cannot replicate
+    # anonymous transaction when AUTO_POSITION = 1, at file ..., position ..."; MySQL 8.0
+    # "Cannot replicate because the source purged required binary logs. ..." and MySQL
+    # 5.7 "... has purged binary logs containing GTIDs that the replica requires" (older
+    # releases name the two servers with other words; both needles avoid them). Below the
+    # DDL entry (a quoted statement could contain these words) and above the link, auth
+    # and connection-test needles. Neither text carries SCHEMA_HISTORY_MARK or
+    # DEFINITION_SNAPSHOT_MARK (a resume must not flip to recovery) nor "Start CDC again"
+    # (Starting again fails the same way). Debezium's own WARN "Last recorded offset is no
+    # longer available on the server." matches neither.
+    (
+        _ANONYMOUS_GTID_NEEDLE,
+        _ANONYMOUS_GTID_GUIDANCE,
+    ),
+    (
+        _PURGED_GTIDS_NEEDLE,
+        _PURGED_GTIDS_GUIDANCE,
+    ),
+    (
+        _PURGED_GTIDS_NEEDLE_57,
+        _PURGED_GTIDS_GUIDANCE,
+    ),
     (
         "communications link failure",
         "{connector} failed: the Debezium worker could not reach the source MySQL "
@@ -653,6 +728,9 @@ _CONNECTOR_LOG_HEADLINES: dict[str, str] = {
         "a change arrived for a table Debezium's schema history does not hold"
     ),
     _UNPARSEABLE_DDL_NEEDLE: "Debezium could not parse a DDL statement in the binary log",
+    _ANONYMOUS_GTID_NEEDLE: "the source wrote changes without a GTID after CDC's start point",
+    _PURGED_GTIDS_NEEDLE: "the source has purged binary logs CDC's GTID set does not cover",
+    _PURGED_GTIDS_NEEDLE_57: "the source has purged binary logs CDC's GTID set does not cover",
     "communications link failure": "the source MySQL could not be reached",
     "access denied for user": "the source MySQL rejected the CDC user's credentials",
     "publication autocreation is disabled": "the PostgreSQL CDC publication does not exist",
@@ -667,12 +745,12 @@ _CONNECTOR_LOG_HEADLINES: dict[str, str] = {
 # fetched and then DISCARDED, leaving the bare "<connector> entered FAILED state." -- the
 # single worst outcome in the CDC flow, because the operator had waited out a billable
 # connector create (up to ``connector_timeout_seconds``) and still had to go read CloudWatch
-# to learn anything at all. Repeating the last log line verbatim is strictly more general
-# than any needle: it cannot assert a wrong cause, and it covers every failure mode nobody
-# has written a needle for yet.
+# to learn anything at all. Repeating the log's last error line (masked) is strictly more
+# general than any needle: it covers every failure mode nobody has written a needle for yet.
 _UNMATCHED_LOG_HINT = (
-    "No known failure signature matched its worker log, so its last log line is repeated "
-    "verbatim: {excerpt} — the MSK Connect log group has the full stack trace."
+    "No known failure signature matched its worker log, so its last error line is repeated "
+    "(quoted values hidden): {excerpt} — the MSK Connect log group has the full stack "
+    "trace."
 )
 
 # Defensive only: the connector's password is a separate `database.password` config (Kafka
@@ -682,28 +760,79 @@ _UNMATCHED_LOG_HINT = (
 _SECRET_IN_LOG_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|secret|token)\b\s*[=:]\s*\S+"
 )
+# The same pairs with a quoted value, scrubbed in a log excerpt BEFORE its literals are
+# masked: a quote mis-paired by the prose around it can otherwise hide the keyword inside a
+# masked region, where the scrub above never sees it.
+_SECRET_QUOTED_IN_LOG_RE = re.compile(
+    r"""(?i)\b(password|passwd|pwd|secret|token)\b\s*[=:]\s*(?:'[^']*'|"[^"]*"|\S+)"""
+)
 _LOG_EXCERPT_MAX = 400
+
+# Which worker-log line an excerpt repeats. A task that dies logs Kafka Connect's ERROR
+# "Task threw an uncaught and unrecoverable exception", the exception and its frames
+# ("\tat ...", "Caused by: ...", "... 9 more"), and then INFO shutdown lines (Debezium's
+# "Stopping down connector", the producer close, "Kafka Connect stopped" once the connector
+# is deleted) -- so the LAST line is almost never the error. All after any "[Worker-...]" /
+# "[timestamp]" prefixes.
+_STACK_FRAME_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*(?:at\s+\S|\.\.\.\s*\d+\s+more\b)")
+_CAUSED_BY_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*Caused by:")
+_EXCEPTION_LINE_RE = re.compile(r"\w(?:Exception|Error):")
+_ERROR_LEVEL_RE = re.compile(r"\b(?:ERROR|FATAL)\b")
+
+
+def _excerpt_line(log_tail: str) -> Optional[str]:
+    """The worker-log line that best names the error, or ``None`` for an empty tail. Pure.
+
+    Within the latest task run without INFO/DEBUG/TRACE lines (:func:`_episode_lines`) and
+    without stack frames: the LAST ``Caused by:`` line (the root cause of the latest
+    trace), else the last exception line (``...Exception:`` / ``...Error:``), else the last
+    ERROR/FATAL line, else the last line left; the last non-empty line of the whole tail
+    only when nothing is left.
+    """
+    lines = [ln.strip() for ln in (log_tail or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    telling = [
+        ln.strip()
+        for ln in _episode_lines(log_tail).splitlines()
+        if ln.strip() and not _STACK_FRAME_RE.match(ln)
+    ]
+    for pattern in (_CAUSED_BY_RE, _EXCEPTION_LINE_RE, _ERROR_LEVEL_RE):
+        pick = next((ln for ln in reversed(telling) if pattern.search(ln)), None)
+        if pick is not None:
+            return pick
+    return telling[-1] if telling else lines[-1]
 
 
 def _connector_log_excerpt(log_tail: str) -> Optional[str]:
-    """The last non-empty line of a worker-log tail, scrubbed and length-bounded. Pure.
+    """The worker-log line that names the error, masked, scrubbed and length-bounded. Pure.
 
     Bounded on purpose: a Java stack trace is unbounded and this string flows into a notice
-    and the activity log, so it takes the LAST line (which is where Kafka Connect puts the
-    message that killed the task, not the framework frames above it) and truncates.
+    and the activity log, so it takes ONE line, picked by content (:func:`_excerpt_line`):
+    Kafka Connect logs the task's ERROR with its trace and then INFO shutdown lines, so the
+    last line is rarely the cause. Credentials are scrubbed, and every quoted literal is
+    masked (:func:`_mask_sql_literals`, reading an apostrophe inside a word as prose): a
+    server error can quote a row value ("Duplicate entry '<value>' for key ..."), and
+    Property 7 keeps row values out of the UI and the activity log.
     """
-    for line in reversed((log_tail or "").splitlines()):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        scrubbed = _SECRET_IN_LOG_RE.sub(r"\1=***", stripped)
-        if len(scrubbed) > _LOG_EXCERPT_MAX:
-            scrubbed = scrubbed[:_LOG_EXCERPT_MAX].rstrip() + " …"
-        return scrubbed
-    return None
+    line = _excerpt_line(log_tail)
+    return _sanitized_log_line(line) if line is not None else None
 
 
-def _connector_timeout_message(deployer, stack_name: str, connector: str) -> str:
+def _sanitized_log_line(line: str) -> str:
+    """One log or stack-event line as the UI may repeat it: credentials scrubbed, quoted
+    values masked (prose apostrophes kept), length-bounded. Pure."""
+    pre = _SECRET_QUOTED_IN_LOG_RE.sub(r"\1=***", line.strip())
+    scrubbed = _SECRET_IN_LOG_RE.sub(r"\1=***", _mask_sql_literals(pre, prose=True))
+    if len(scrubbed) > _LOG_EXCERPT_MAX:
+        scrubbed = scrubbed[:_LOG_EXCERPT_MAX].rstrip() + " …"
+    return scrubbed
+
+
+def _connector_timeout_message(
+    deployer, stack_name: str, connector: str,
+    log_tail: Optional[ConnectorLogReader] = None,
+) -> str:
     """Timeout text, with the worker log's diagnosis when it explains the stall.
 
     Diagnose on TIMEOUT too, not only on connectorState=FAILED. MSK Connect exposes no
@@ -714,7 +843,7 @@ def _connector_timeout_message(deployer, stack_name: str, connector: str) -> str
     to make. Falls back to the bare timeout wording when nothing matches.
     """
     timed_out = f"{connector} did not reach RUNNING in time."
-    message = _connector_failure_message(deployer, stack_name, connector)
+    message = _connector_failure_message(deployer, stack_name, connector, log_tail=log_tail)
     bare = f"{connector} entered FAILED state."
     if message == bare:
         return timed_out
@@ -822,7 +951,23 @@ def _episode_lines(log_tail: str) -> str:
     return "\n".join(line for line in lines if not _QUIET_LEVEL_RE.match(line))
 
 
-def _mask_sql_literals(text: str) -> str:
+# In a log line (``prose``), the word right before an apostrophe that makes it a SQL literal
+# anyway: a lone N / X / B (``N'v'``, ``x'ab'``, ``b'1'``) or a ``_charset`` introducer.
+_SQL_LITERAL_PREFIX_RE = re.compile(r"(?:^|[^\w])(?:[nNxXbB]|_[A-Za-z0-9]+)$")
+
+
+def _prose_apostrophe(text: str, k: int) -> bool:
+    """Is ``text[k]`` (a ``'``) prose -- a contraction, a possessive, a name like O'Brien --
+    rather than a quote? A letter on both sides, and no SQL literal prefix before it."""
+    return (
+        0 < k < len(text) - 1
+        and text[k - 1].isalpha()
+        and text[k + 1].isalpha()
+        and not _SQL_LITERAL_PREFIX_RE.search(text, max(0, k - 64), k)
+    )
+
+
+def _mask_sql_literals(text: str, *, prose: bool = False) -> str:
     """Replace every quoted SQL literal with ``'?'`` / ``"?"``; keep identifiers. Pure.
 
     A character scanner, not a regex: backtick identifiers are copied verbatim (a doubled
@@ -834,6 +979,12 @@ def _mask_sql_literals(text: str) -> str:
     end of a complete value such as ``'C:\\'`` -- and guessing wrong would show the NEXT
     literal in clear, so it is treated like an unterminated literal (fail closed). Other
     backslash escapes read the same in both modes. Numbers and keywords stay.
+
+    ``prose`` (a log line, not a statement): an apostrophe with a letter on both sides is
+    text -- "couldn't", "the user's", "O'Brien" -- so it neither opens a literal (which
+    would pair with the NEXT quote and show the value after it in clear) nor closes one;
+    unless the word before it is a SQL literal prefix (``N'..'``, ``x'..'``, ``_binary'..'``),
+    which keeps it masked. A DDL statement head keeps the strict scan.
     """
     out: list[str] = []
     i, n = 0, len(text or "")
@@ -854,6 +1005,10 @@ def _mask_sql_literals(text: str) -> str:
             out.append(text[i:j + 1])
             i = j + 1
             continue
+        if ch == "'" and prose and _prose_apostrophe(text, i):
+            out.append(ch)
+            i += 1
+            continue
         if ch in ("'", '"'):
             j = i + 1
             closed = False
@@ -867,6 +1022,9 @@ def _mask_sql_literals(text: str) -> str:
                 if c == ch:
                     if j + 1 < n and text[j + 1] == ch:
                         j += 2
+                        continue
+                    if ch == "'" and prose and _prose_apostrophe(text, j):
+                        j += 1  # an apostrophe inside the value ('O'Brien-5'), not its end
                         continue
                     closed = True
                     break
@@ -975,6 +1133,147 @@ def _diagnose_connector_log(connector: str, log_tail: str) -> Optional[str]:
     return diagnosis.guidance if diagnosis is not None else None
 
 
+# A worker-log reader: ``(stack_name, connector_name, *, since=None) -> tail`` (``""`` when
+# unreadable). With ``since``, only events written from then on (see
+# ``cdc_stack_deployer.read_connector_log_tail``).
+ConnectorLogReader = Callable[..., str]
+
+
+def _read_connector_log(
+    deployer,
+    log_tail: Optional[ConnectorLogReader],
+    stack_name: str,
+    connector: str,
+    *,
+    since: Optional[datetime] = None,
+) -> str:
+    """A connector's worker-log tail, read with ``log_tail`` first, then the deployer's.
+
+    ``log_tail`` is the app's own reader (MySQL Start CDC passes the MSK Connect
+    controller's): on Fargate and EC2 the deployer acts as CdcDeployRole, which cannot read
+    the connector log group, while the app's own identity can. A reader that raises, or
+    returns nothing, falls back to the deployer's (``""`` when neither reads anything).
+    ``since`` (this Start's submit time) keeps both reads to events written from then on:
+    connector names repeat across Starts and the log group keeps 30 days, so the newest
+    stream can be an EARLIER Start's. Without ``log_tail`` this is exactly the deployer's
+    read.
+    """
+    extra = {"since": since} if since is not None else {}
+    if log_tail is None:
+        return deployer.connector_log_tail(stack_name, connector, **extra)
+    try:
+        tail = log_tail(stack_name, connector, **extra)
+    except Exception:  # noqa: BLE001 - advisory read; fall back to the deployer's
+        tail = ""
+    if isinstance(tail, str) and tail:
+        return tail
+    try:
+        tail = deployer.connector_log_tail(stack_name, connector, **extra)
+    except Exception:  # noqa: BLE001 - advisory read
+        return ""
+    return tail if isinstance(tail, str) else ""
+
+
+# CloudFormation logical IDs of the connector resources -> their index in
+# ``connector_names_for_log`` (``[source, sink]``).
+_CONNECTOR_RESOURCE_INDEX = {
+    "DebeziumSourceConnector": 0,
+    "PostgresSourceConnector": 0,
+    "DsqlSinkConnector": 1,
+}
+
+
+def _failed_resource_in_event(message: str) -> Optional[tuple[str, str]]:
+    """``(LogicalId, reason)`` of a resource a stack-event line reports FAILED, or ``None``.
+
+    ``message`` is a :meth:`CdcStackDeployer.poll_events` line, ``"<LogicalId> <STATUS>[ —
+    <reason>]"``. A status ending in ``_FAILED`` counts, except a resource CloudFormation
+    cancelled because ANOTHER resource failed ("Resource creation cancelled"): that one did
+    not fail on its own. Pure.
+    """
+    parts = (message or "").split(None, 2)
+    if len(parts) < 2 or not parts[1].endswith("_FAILED"):
+        return None
+    if "cancel" in message.lower():
+        return None
+    reason = parts[2] if len(parts) > 2 else ""
+    if reason.startswith("—"):
+        reason = reason[1:]
+    return parts[0], reason.strip()
+
+
+def _failed_connector_in_event(
+    message: str, connector_names: Sequence[str]
+) -> Optional[str]:
+    """The connector a stack-event line reports FAILED (:func:`_failed_resource_in_event`),
+    or ``None``. Pure."""
+    failed = _failed_resource_in_event(message)
+    if failed is None:
+        return None
+    index = _CONNECTOR_RESOURCE_INDEX.get(failed[0])
+    if index is None or index >= len(connector_names):
+        return None
+    return connector_names[index]
+
+
+def _rollback_failure_message(
+    deployer,
+    stack_name: str,
+    status: str,
+    *,
+    connector_names: Sequence[str],
+    failed: Sequence[str],
+    log_tail: ConnectorLogReader,
+    failed_resource: Optional[tuple[str, str]] = None,
+    since: Optional[datetime] = None,
+) -> str:
+    """The Start CDC error for a connector stack operation that ended in ``status``.
+
+    Every worker-log read is limited to this Start (``since``, :func:`_read_connector_log`):
+    a connector name repeats across Starts and the log group keeps 30 days, so an earlier
+    Start's failure must not be reported as this one's. When the stack events reported
+    connectors FAILED, only their logs are read -- a connector cancelled because another
+    resource failed is not the cause: the first known failure signature wins; otherwise the
+    last error line of a failed connector is repeated (masked); otherwise the message says
+    no log line was found for it. When only another resource failed (``failed_resource``:
+    the offset seeder / topic prep, say), it is named with its CloudFormation reason
+    (masked), and no connector log is read. With neither, the connectors' logs since the
+    Start are scanned for a known signature before the bare status.
+    """
+    if not failed and failed_resource is not None:
+        resource, reason = failed_resource
+        shown = _sanitized_log_line(reason).rstrip(".") if reason else ""
+        return (
+            f"Stack operation ended in '{status}': {resource} failed"
+            + (f" — {shown}" if shown else "")
+            + ". No connector reported a failure, so no connector worker log is shown."
+        )
+    names = [n for n in failed if n in connector_names] if failed else list(connector_names)
+    tails: dict[str, str] = {}
+    for name in names:
+        tails[name] = _read_connector_log(deployer, log_tail, stack_name, name, since=since)
+        guidance = _diagnose_connector_log(name, tails[name])
+        if guidance:
+            return guidance
+    for name in failed:
+        excerpt = _connector_log_excerpt(tails.get(name, ""))
+        if excerpt:
+            return (
+                f"Stack operation ended in '{status}': {name} failed. "
+                + _UNMATCHED_LOG_HINT.format(excerpt=excerpt)
+            )
+    if failed:
+        return (
+            f"Stack operation ended in '{status}'. No worker-log line was found for "
+            f"{' and '.join(failed)} in the CloudWatch log group "
+            f"/msk-connect/{stack_name}-cdc since this Start — the connector may have "
+            "failed before writing one, or this app cannot read that log group — so the "
+            "cause is not shown here; the stack events above are all that CloudFormation "
+            "reported."
+        )
+    return f"Stack operation ended in '{status}'."
+
+
 def _wait_stack_settles(
     deployer: CdcStackDeployer,
     stack_name: str,
@@ -986,6 +1285,7 @@ def _wait_stack_settles(
     vanish_ok: bool = False,
     connector_names_for_log: Optional[Sequence[str]] = None,
     watch_seeder_enis: bool = False,
+    log_tail: Optional[ConnectorLogReader] = None,
 ) -> Optional[str]:
     """Stream stack events to the log and block until the stack settles.
 
@@ -1006,12 +1306,23 @@ def _wait_stack_settles(
     exactly this -- the primary -- connector-failure path); the stack rolls back and
     re-raises here before the per-connector RUNNING-waits (which diagnose on real
     names) are ever reached.
+
+    ``log_tail`` (MySQL Start CDC: the app's own log reader, see
+    :func:`_read_connector_log`) also records which resources the stack events report
+    FAILED, and the rollback message then reads only the failed connectors' logs written
+    since ``since`` (this Start), repeats a failed connector's last error line when no
+    signature matches or says that none was found, and names a failed non-connector
+    resource with its reason (:func:`_rollback_failure_message`). Without it the rollback
+    message is exactly as before.
     """
     import time as _time
 
     deadline = _monotonic_deadline(timeout)
     seen_until = since
     saw_partition_quota = False
+    failed_connectors: list[str] = []
+    # The first non-connector resource the events report FAILED (the seeder, say).
+    failed_resource: Optional[tuple[str, str]] = None
     status_read_failures = 0
     # Seeder-ENI reporting state. ``-2`` is an unused sentinel so the first real
     # reading (including 0) always prints. ``eni_wait_started`` / ``eni_last_logged``
@@ -1034,6 +1345,18 @@ def _wait_stack_settles(
             seen_until = ts
             if _is_partition_quota_message(msg):
                 saw_partition_quota = True
+            if log_tail is not None:
+                _failed = _failed_connector_in_event(msg, connector_names_for_log or ())
+                if _failed and _failed not in failed_connectors:
+                    failed_connectors.append(_failed)
+                elif _failed is None and failed_resource is None:
+                    _resource = _failed_resource_in_event(msg)
+                    if (
+                        _resource is not None
+                        and _resource[0] != stack_name
+                        and _resource[0] not in _CONNECTOR_RESOURCE_INDEX
+                    ):
+                        failed_resource = _resource
         # Delete only: report the seeder-ENI reclamation that CloudFormation is silent
         # about, so the long tail of the teardown does not look frozen. Reported on
         # CHANGE *and* periodically while the count is unchanged -- the wait routinely
@@ -1114,6 +1437,15 @@ def _wait_stack_settles(
             if "ROLLBACK" in status or "FAILED" in status:
                 if saw_partition_quota:
                     raise CdcDeployError(_PARTITION_QUOTA_GUIDANCE.format(status=status))
+                if log_tail is not None:
+                    raise CdcDeployError(_rollback_failure_message(
+                        deployer, stack_name, status,
+                        connector_names=list(connector_names_for_log or ()),
+                        failed=failed_connectors,
+                        log_tail=log_tail,
+                        failed_resource=failed_resource,
+                        since=since,
+                    ))
                 for name in connector_names_for_log or ():
                     # Scan each REAL connector's worker log (a synthetic combined name
                     # matched no log stream, so the diagnosis was always dead here) and
@@ -1697,6 +2029,9 @@ def run_cdc_start(
     # restored session legitimately has none.
     pg_source_config: Optional[SourceConnectionConfig] = None,
     pg_source_password: Optional[object] = None,
+    # The app's own connector-log reader (MySQL Start CDC passes the MSK Connect
+    # controller's), read before the deployer's: see _read_connector_log.
+    log_tail: Optional[ConnectorLogReader] = None,
 ) -> None:
     """Start CDC with a SINGLE-pass update that creates both connectors at once.
 
@@ -1741,6 +2076,11 @@ def run_cdc_start(
     no-clobber guard prevents anyway). When ``watermark`` is None or lacks binlog
     coordinates the Watermark* params are blanked and the template's SeedOffset
     condition stays false (legacy: start from the current binlog).
+
+    ``log_tail`` (optional) is the app's own reader of a connector's worker log. A failed
+    connector create is diagnosed from it first, so the cause is named even when the
+    deployer's identity (CdcDeployRole) cannot read the log group. ``None`` keeps every
+    failure message exactly as before.
     """
     driver = _StageDriver(
         handle, stages=CDC_START_STAGES, on_log=on_log, sleep=sleep
@@ -1850,9 +2190,14 @@ def run_cdc_start(
                 "full_load": "Full Load watermark",
                 "manual": "Manual start point",
             }.get(seed_origin, seed_origin)
+            # The GTID set offered with it: what Debezium starts after on a gtid_mode=ON
+            # source (the same normalized value build_watermark_params sends).
+            _gtids = normalize_gtid_set(watermark.gtid_executed)
             driver.log(
                 f"Offering CDC start offset {watermark.binlog_file}:"
-                f"{watermark.binlog_position} ({_origin}) to the seeder; not applied if "
+                f"{watermark.binlog_position}"
+                + (f" with GTID set {gtid_set_summary(_gtids)}" if _gtids else "")
+                + f" ({_origin}) to the seeder; not applied if "
                 "the committed offset is already at/past it."
             )
         # MySQL only (the PostgreSQL params carry no SnapshotMode): say which schema path
@@ -1955,6 +2300,7 @@ def run_cdc_start(
                         deployer, stack_name, driver=driver, since=since,
                         timeout=connector_timeout_seconds, interval=poll_interval_seconds,
                         connector_names_for_log=[src_name, sink_name],
+                        log_tail=log_tail,
                     )
                 except CdcDeployError:
                     driver.stage("stack_connectors", "FAILED")
@@ -1969,17 +2315,21 @@ def run_cdc_start(
             # Both connectors were created by the single stack update and deploy in
             # parallel; wait for each to reach RUNNING under the one connectors_running
             # stage. Sequential polling, so the total wait is ~max(source, sink) --
-            # not their sum -- because both are already deploying concurrently.
+            # not their sum -- because both are already deploying concurrently. Their
+            # worker logs are read without the rollback path's "since this Start" limit:
+            # an update that did not change a connector (Retry CDC with the same
+            # configuration) leaves a connector FAILED by an earlier run, whose cause was
+            # logged before this Start.
             driver.stage("connectors_running", "IN_PROGRESS")
             _wait_connector_running(
                 deployer, src_name, "connectors_running", driver,
                 connector_timeout_seconds, poll_interval_seconds,
-                stack_name=stack_name,
+                stack_name=stack_name, log_tail=log_tail,
             )
             _wait_connector_running(
                 deployer, sink_name, "connectors_running", driver,
                 connector_timeout_seconds, poll_interval_seconds,
-                stack_name=stack_name,
+                stack_name=stack_name, log_tail=log_tail,
             )
             driver.stage("connectors_running", "DONE")
 
@@ -2479,7 +2829,7 @@ def run_cdc_delete(
 
 def _wait_connector_running(
     deployer, connector, stage_name, driver: _StageDriver, timeout, interval,
-    *, stack_name: Optional[str] = None
+    *, stack_name: Optional[str] = None, log_tail: Optional[ConnectorLogReader] = None,
 ) -> None:
     """Poll one connector until RUNNING; raise on FAILED or timeout.
 
@@ -2488,7 +2838,7 @@ def _wait_connector_running(
     ``stack_name`` is given we read the connector's worker log and, if it matches a
     known failure signature (partition-quota exhaustion, source-DB unreachable, a
     plugin/SDK defect, …), raise with the actionable guidance instead of the opaque
-    "entered FAILED state".
+    "entered FAILED state". ``log_tail`` is read first (:func:`_read_connector_log`).
     """
     deadline = _monotonic_deadline(timeout)
     read_failures = 0
@@ -2522,7 +2872,7 @@ def _wait_connector_running(
                 )
             if _deadline_passed(deadline):
                 raise CdcDeployError(_connector_timeout_message(
-                    deployer, stack_name, connector
+                    deployer, stack_name, connector, log_tail=log_tail
                 ))
             driver.sleep(interval)
             continue
@@ -2531,26 +2881,30 @@ def _wait_connector_running(
             driver.log(f"{connector}: RUNNING")
             return
         if state == _CONNECTOR_FAILED:
-            raise CdcDeployError(_connector_failure_message(deployer, stack_name, connector))
+            raise CdcDeployError(_connector_failure_message(
+                deployer, stack_name, connector, log_tail=log_tail
+            ))
         driver.log(f"{connector}: {state or 'creating'}…")
         if _deadline_passed(deadline):
             raise CdcDeployError(_connector_timeout_message(
-                    deployer, stack_name, connector
+                    deployer, stack_name, connector, log_tail=log_tail
                 ))
         driver.sleep(interval)
 
 
 def _connector_failure_message(
-    deployer, stack_name: Optional[str], connector: str
+    deployer, stack_name: Optional[str], connector: str,
+    log_tail: Optional[ConnectorLogReader] = None,
 ) -> str:
     """Best-effort actionable message for a FAILED connector (worker-log driven).
 
     Falls back to a plain "entered FAILED state" when no stack name is available
-    or the worker log matches no known signature.
+    or the worker log matches no known signature. ``log_tail`` is read first
+    (:func:`_read_connector_log`).
     """
     bare = f"{connector} entered FAILED state."
     if stack_name:
-        tail = deployer.connector_log_tail(stack_name, connector)
+        tail = _read_connector_log(deployer, log_tail, stack_name, connector)
         guidance = _diagnose_connector_log(connector, tail)
         if guidance:
             return guidance

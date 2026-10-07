@@ -307,13 +307,22 @@ This is the bit designed to ensure **no missed changes and no duplicates** betwe
 the bulk load and the stream.
 
 1. Full Load captured a **watermark** at the snapshot point — for MySQL the binlog
-   file:position (plus GTID when available); for PostgreSQL the WAL LSN returned
-   when the logical replication slot is created, recorded together with the slot
-   and publication names
+   file:position, the GTID set and the source's `gtid_mode`; for PostgreSQL the WAL LSN
+   returned when the logical replication slot is created, recorded together with the
+   slot and publication names
    ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
 2. When you start CDC, the tool establishes the resume point at exactly that
    watermark. **For a MySQL source** it **seeds the connector's start offset** (an
-   in-VPC Lambda writes the offset record before the source connector starts).
+   in-VPC Lambda writes the offset record before the source connector starts). The
+   seeded offset carries the file:position and the GTID set: with `gtid_mode=ON`
+   Debezium starts after exactly that GTID set (the transactions the Full Load already
+   copied); with `OFF`, `OFF_PERMISSIVE` or `ON_PERMISSIVE`, at the file:position. Start
+   CDC reads `gtid_mode` first and refuses a start point it cannot use
+   ([Chapter 6](06-limitations.md)). A Manual start point seeds its binlog file:position
+   and the GTID set saved with it; one saved by version 0.1.565 or earlier comes back
+   without its GTID set (those versions kept a fetched set beside any position typed
+   after it), so on a `gtid_mode=ON` source use **Fetch current position** again, or
+   re-enter the GTID set executed at exactly that position, before Start CDC.
    **For a PostgreSQL source** there is no offset-seeder Lambda; instead, at the
    Full Load consistency point the tool creates the logical replication slot (and a
    publication for the tables the Full Load loaded), and the slot's returned
@@ -343,7 +352,9 @@ the bulk load and the stream.
    CDC first checks that the captured tables have not changed since that start point
    ([Chapter 6](06-limitations.md)). A **restart after Stop CDC** runs
    **`snapshot.mode=schema_only`** instead: it replays the recorded schema history
-   and applies any DDL in binlog order. **For a PostgreSQL source**, the Debezium
+   and applies any DDL in binlog order. Such a restart, like any automatic connector
+   restart, continues from the position Debezium recorded — on `gtid_mode=ON`, after
+   the GTID set it last committed. **For a PostgreSQL source**, the Debezium
    pgoutput connector has no schema-history topic: on the gapless path it runs with
    **`snapshot.mode=never`** (the logical slot already holds the start LSN and the
    rows are loaded), while a stand-alone / manual start uses **`initial`** (snapshot

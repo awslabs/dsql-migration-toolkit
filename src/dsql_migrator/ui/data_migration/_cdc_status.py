@@ -1016,6 +1016,25 @@ def cdc_deployed_watermark(
     return (f, p) if f and p else None
 
 
+def cdc_deployed_watermark_gtids(
+    parameters: "Optional[Mapping[str, str]]",
+) -> Optional[str]:
+    """The GTID set the stack's LAST Start offered with :func:`cdc_deployed_watermark`. Pure.
+
+    ``WatermarkGtids`` normalized (``""`` when that offer carried no GTID set), or ``None``
+    when the stack records no offered binlog position. On a stopped stack (Stop carries
+    Watermark* forward) it tells the MySQL GTID start check whether the stack was started
+    from a point WITH a GTID set: one offered a binlog position and no set streamed by
+    file:position (or was started by an earlier version), so on a ``gtid_mode=ON`` source
+    its committed offset holds no GTID set to continue from.
+    """
+    from dsql_migrator.core.cdc_coords import normalize_gtid_set
+
+    if cdc_deployed_watermark(parameters) is None:
+        return None
+    return normalize_gtid_set(str((parameters or {}).get("WatermarkGtids", "") or ""))
+
+
 def cdc_live_snapshot_mode(parameters: "Optional[Mapping[str, str]]") -> Optional[str]:
     """The SnapshotMode of a stack whose connectors EXIST, else None. Pure.
 
@@ -1149,7 +1168,8 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         cdc_has_committed_offset(getattr(discovery, "current_parameters", None))
     )
     migration_state.set_cdc_deployed_watermark(
-        cdc_deployed_watermark(getattr(discovery, "current_parameters", None))
+        cdc_deployed_watermark(getattr(discovery, "current_parameters", None)),
+        gtids=cdc_deployed_watermark_gtids(getattr(discovery, "current_parameters", None)),
     )
     # The live SnapshotMode while connectors exist (MySQL), from the SAME describe: a
     # Start on such a stack keeps it (core.cdc.mysql_snapshot_mode).
@@ -3127,6 +3147,93 @@ def read_cdc_start_point_once(session, names, recorded) -> object:
             error_class=type(exc).__name__[:64],
         )
     return verdict_from_check(check_start_point(recorded, live, wanted))
+
+
+# The GTID start check's statements (G19): reads only, so the read-only guard passes them.
+_GTID_MODE_SQL = "SELECT @@GLOBAL.gtid_mode"
+_GTID_SUBSET_SQL = (
+    "SELECT GTID_SUBSET(:g, @@GLOBAL.gtid_executed) AS within_executed, "
+    "GTID_SUBSET(@@GLOBAL.gtid_purged, :g) AS covers_purged"
+)
+
+
+def _subset_flag(value: object) -> Optional[bool]:
+    """``GTID_SUBSET``'s 0/1 as a bool, ``None`` when it is NULL or not a number."""
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def read_source_gtid_state_once(session, gtid_set: Optional[str]) -> object:
+    """ONE bounded read of the source's ``gtid_mode`` and, when it is ON and ``gtid_set`` is
+    given, of whether that set can be streamed from (BLOCKING; never raises; MySQL).
+
+    Returns a :class:`~dsql_migrator.ui.cdc_gtid_gate.GtidSourceState`. Without a source
+    connection (no config, or no password: it is kept in memory only) it reports
+    ``no-source-connection`` without connecting. Otherwise one read-only engine with the
+    10 s read bound, disposed after it: ``SELECT @@GLOBAL.gtid_mode`` (a failure or an empty
+    value is ``read-failed``), then -- only on ``ON`` with a set -- ``GTID_SUBSET(set,
+    @@GLOBAL.gtid_executed)`` and ``GTID_SUBSET(@@GLOBAL.gtid_purged, set)`` with the set
+    bound as a parameter (a failure there is ``check-failed``). Keeps only the mode, two
+    booleans and an exception's CLASS name (Property 7).
+    """
+    from sqlalchemy import text
+
+    from dsql_migrator.core.cdc_coords import gtid_mode_is_on
+    from dsql_migrator.ui.cdc_gtid_gate import (
+        PROBLEM_CHECK_FAILED,
+        PROBLEM_NO_SOURCE,
+        PROBLEM_READ_FAILED,
+        GtidSourceState,
+    )
+
+    source_config = getattr(session, "source_config", None)
+    password = getattr(session, "source_password", None)
+    if source_config is None or password is None:
+        return GtidSourceState(problem=PROBLEM_NO_SOURCE)
+
+    def _class(exc: BaseException) -> str:
+        return type(exc).__name__[:64]
+
+    try:
+        engine = make_source_engine_factory(
+            password, read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS
+        )(source_config)
+    except Exception as exc:  # noqa: BLE001 - unreadable is a state, not a crash
+        return GtidSourceState(problem=PROBLEM_READ_FAILED, error_class=_class(exc))
+    try:
+        with engine.connect() as connection:
+            try:
+                raw = connection.execute(text(_GTID_MODE_SQL)).scalar()
+            except Exception as exc:  # noqa: BLE001 - unreadable is a state
+                return GtidSourceState(problem=PROBLEM_READ_FAILED, error_class=_class(exc))
+            mode = str(raw).strip() if raw is not None else ""
+            if not mode:
+                return GtidSourceState(problem=PROBLEM_READ_FAILED)
+            if gtid_set is None or not gtid_mode_is_on(mode):
+                return GtidSourceState(mode=mode)
+            try:
+                row = connection.execute(
+                    text(_GTID_SUBSET_SQL), {"g": gtid_set}
+                ).mappings().first()
+            except Exception as exc:  # noqa: BLE001 - e.g. a malformed GTID set
+                return GtidSourceState(
+                    mode=mode, problem=PROBLEM_CHECK_FAILED, error_class=_class(exc)
+                )
+            if not row:
+                return GtidSourceState(mode=mode, problem=PROBLEM_CHECK_FAILED)
+            return GtidSourceState(
+                mode=mode,
+                within_executed=_subset_flag(row.get("within_executed")),
+                covers_purged=_subset_flag(row.get("covers_purged")),
+            )
+    except Exception as exc:  # noqa: BLE001 - e.g. the connection itself failed
+        return GtidSourceState(problem=PROBLEM_READ_FAILED, error_class=_class(exc))
+    finally:
+        engine.dispose()
 
 
 # Tailwind tone -> (border, background, icon-color, icon) for the health cards.

@@ -124,10 +124,14 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
   가득 채울 수 있으므로** WAL/슬롯 상태를 모니터링하세요 — 도구가 `wal_status`를 노출하며,
   `wal_status='lost'`는 슬롯이 무효화됐다는 뜻으로 → gapless 재개가 깨졌으니 → Full Load를 다시
   실행해야 합니다.
-- **MySQL 소스 — GTID는 권장이지만 필수는 아닙니다.** `gtid_mode=ON`이면 소스 장애 조치(failover)나
-  복제본 승격 후에도 CDC 재개가 견고합니다. 없으면 도구가 binlog `file:position` 워터마크로 폴백하는데
-  — 동작은 하지만 장애 조치 상황에서는 덜 견고합니다. 게이트는 GTID 부재를 차단이 아니라 정보성으로
-  보고합니다. (PostgreSQL에는 GTID / `file:position` 개념이 없습니다.)
+- **MySQL 소스 — GTID는 권장이지만 필수는 아니며, Full Load 전에 정하세요.** `gtid_mode=ON`이면
+  Debezium이 GTID로 위치를 잡습니다: CDC는 시작 지점과 함께 기록된 GTID 셋(Full Load 워터마크, 또는
+  Manual 지점이면 **Fetch current position**) 다음부터 시작하고, 마지막으로 커밋한 GTID 셋 다음부터
+  재개하므로 바이너리 로그 파일이 다른 복제본으로 장애 조치(failover)한 뒤에도 이어집니다. `OFF`,
+  `OFF_PERMISSIVE`, `ON_PERMISSIVE`이면 binlog `file:position`을 쓰며, 한 소스에서는 똑같이 동작합니다.
+  Full Load부터 cut over까지 모드를 바꾸지 마세요: `gtid_mode`가 `ON`이 아닐 때 기록된 시작 지점으로는
+  `ON`이 된 뒤 CDC를 시작할 수 없습니다([6장](06-limitations.md)). 게이트는 GTID 부재를 차단이 아니라
+  정보성으로 보고합니다. (PostgreSQL에는 GTID / `file:position` 개념이 없습니다.)
 - **PostgreSQL 소스 — CDC는 클러스터 라이터에서 실행해야 합니다.** 소스는 **스탠바이가 아니라
   라이터**여야 합니다(`pg_is_in_recovery()`가 false여야 함) — 스탠바이는 복제 슬롯을 호스팅할 수
   없으므로 CDC를 라이터 엔드포인트로 향하게 하세요.

@@ -933,6 +933,62 @@ def test_manual_start_point_chain_seeds_the_manual_offset(seeder_env) -> None:
     assert (key, value) == (exp_key, exp_value)
 
 
+def test_manual_start_point_with_gtid_set_seeds_its_gtids(seeder_env) -> None:
+    """G19: on a gtid_mode=ON source Debezium positions by the offset's GTID set, so a
+    Manual point carries its set (normalized) through the same chain: cdc_seed_watermark
+    -> run_cdc_start -> WatermarkGtids -> seeder._seed -> the connect-offsets record, which
+    equals the canonical builder's."""
+    from dsql_migrator.core.cdc import (
+        CDC_WATERMARK_PARAM_KEYS,
+        CdcResumePoint,
+        cdc_seed_watermark,
+    )
+    from dsql_migrator.core.cdc_deployer import run_cdc_start
+    from tests.test_cdc_deploy_stages import (
+        SINK,
+        SRC,
+        STACK,
+        _FakeDeployer,
+        _FakeHandle,
+        _start_params,
+    )
+
+    module, recorder = seeder_env
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    seed, origin = cdc_seed_watermark(
+        None,
+        CdcResumePoint(
+            binlog_file="mysql-bin.000042", binlog_position=1234,
+            gtid_executed="U:1-9,\nV:1-3",
+        ),
+        now=now,
+    )
+    assert origin == "manual" and seed.gtid_executed == "U:1-9,V:1-3"
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    run_cdc_start(
+        _FakeHandle(), stack_name=STACK, params=_start_params(), deployer=deployer,
+        on_log=lambda _ts, _msg: None, sleep=lambda _s: None,
+        watermark=seed, seed_origin=origin,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    passed = dict(deployer.updates[0])
+    props = {key: passed[key] for key in CDC_WATERMARK_PARAM_KEYS}
+    assert props["WatermarkGtids"] == "U:1-9,V:1-3"
+
+    recorder.topic_partitions = set()  # a fresh offsets topic: nothing committed yet
+    assert module._seed(props) == {"Seeded": "true"}
+    _topic, key, value = recorder.produced[0]
+    produced = json.loads(value)
+    assert (produced["file"], produced["pos"]) == ("mysql-bin.000042", 1234)
+    assert produced["gtids"] == "U:1-9,V:1-3"
+    exp_key, exp_value = build_connect_offset_record(
+        "mysql-dsql-cdc-stack-debezium-source", "dsqlcdc", seed
+    )
+    assert (key, value) == (exp_key, exp_value)
+
+
 # --------------------------------------------------------------------------- #
 # Packaging guard: the COMMITTED offset-seeder zip must embed the CURRENT
 # on-disk seeder.py / cfnresponse.py. The drift guards above load seeder.py from

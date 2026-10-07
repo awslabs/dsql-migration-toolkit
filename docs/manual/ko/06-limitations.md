@@ -175,6 +175,77 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     스냅샷 모드를 유지하므로 같은 방식으로 실패합니다. 그러면 다음 Start가 같은 검사를 거친 뒤 히스토리를
     다시 만듭니다(`recovery`). 이 검사는 테이블을 원래 시작 지점과 비교하므로, Stop 전에 한 변경이라도 그
     Start를 거부합니다.
+- **MySQL에서 `gtid_mode=ON`이면: CDC는 시작 지점의 GTID 셋 다음부터 시작.** Debezium은 소스의
+  `gtid_mode`가 정확히 `ON`일 때만 GTID로 위치를 잡습니다: 그때는 시작 지점과 함께 기록된 GTID 셋에 없는
+  모든 트랜잭션을 스트리밍하고, 시작 지점의 binlog `file:position`은 무시합니다(`OFF`, `OFF_PERMISSIVE`,
+  `ON_PERMISSIVE`이면 `file:position`을 씁니다). 그래서 `ON`인 소스에서는 GTID 셋이 곧 시작 지점이며,
+  Start CDC는 먼저 `gtid_mode`를 읽고 — Start 대화 상자에서, 그리고 무엇이든 바꾸기 전에 다시 — 쓸 수
+  없는 시작 지점은 거부합니다:
+  - **GTID 셋이 없음.** Debezium이 MySQL에 보관 중인 바이너리 로그 전체를 다시 보내게 해, 시작 지점 이전의
+    변경을 다시 적용합니다. **Fetch current position**은 위치와 GTID 셋을 함께 기록합니다. 직접 입력한
+    위치라면 소스가 정확히 그 위치에서 실행을 마친 GTID 셋(예: 덤프가 기록한 것)도 함께 입력하세요. 버전
+    0.1.565 이하가 저장한 Manual 시작 지점은 GTID 셋 없이 복원됩니다(그 버전들은 가져온 셋을 그 뒤에 입력한
+    어떤 위치 옆에도 남겨 두었습니다): 다시 가져오거나, 정확히 그 위치에서 실행을 마친 셋을 다시 입력하세요.
+  - **`gtid_mode`가 `ON`이 아닐 때 기록된 시작 지점**(그런 지점이나 GTID 셋이 없는 시작 지점에서 시작한
+    스택의 Stop CDC 후 재시작 포함): 다음 항목을 참조하세요.
+  - **소스가 실행한 적 없는 GTID 셋**(다른 서버에서 읽었거나 잘못 입력함), **또는 소스가 그 이후의
+    바이너리 로그를 이미 삭제한 셋**: CDC에 새 시작 지점을 주세요 — **"Drop & reload"로 Re-run Full
+    Load**, 또는 **Manual** → **Fetch current position** → **Use this start point**(그러면 두 지점 사이의
+    캡처 대상 테이블 변경은 복제되지 않으므로 "Drop & reload"로 다시 로드하고 — CDC only: Aurora DSQL에서
+    바로잡고 — CHECKSUM으로 검증하세요) — 보존 기간이 끝나서였다면 먼저 binlog 보존을 늘리세요. 대신
+    GTID 셋을 소스와 대조하는 검사 자체가 실패했다면(연결이 끊김, 읽기 시간 초과) 시작 지점에 문제가 있다고
+    알려진 것은 없습니다: 도구에서 소스에 연결할 수 있는지 확인한 뒤 Start CDC를 다시 실행하세요.
+  - 시작 지점에 GTID 셋이 없거나 `gtid_mode`가 `ON`이 아닐 때 기록됐는데 **`gtid_mode`를 읽을 수
+    없음**(이 세션에 소스 연결이 없음 — 비밀번호는 메모리에만 보관되므로 앱을 재시작하면 지워집니다 —
+    또는 읽기 실패): Connect 단계에서 소스 연결을 다시 테스트한 뒤 Start CDC를 다시 실행하세요.
+
+  Manual 카드에서 **Fetch current position** 후 위치를 고치면 — 위치를 비워 두거나 잘못 입력해도 —
+  가져온 GTID 셋은 버려지고(가져온 위치에서 읽은 것이므로), GTID 셋을 고치면 기록된 테이블 정의가
+  버려지므로 위의 시작 지점 검사는 경고만 합니다. 입력하는 GTID 셋은 MySQL GTID 셋이어야 합니다
+  (`<server UUID>:<interval>`을 쉼표로 구분, 예: `3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100`):
+  Start CDC는 그 밖의 텍스트 — 함께 복사된 따옴표나 `SET` 문 등 — 를 모든 `gtid_mode`에서 거부합니다.
+  Debezium이 그 값을 커밋하는 모든 오프셋에 써 넣고 다음 재시작 때 멈추기 때문입니다.
+- **MySQL: `gtid_mode`는 Full Load 전에 정하고 cut over까지 유지.** `gtid_mode`가 `ON`이 아닐 때 기록된
+  시작 지점으로는 소스가 `ON`이 된 뒤 CDC를 시작할 수 없습니다: MySQL은 GTID 없이 쓰인 변경을 GTID로
+  보낼 수 없으므로 그 변경에서 커넥터를 멈추거나, 오류 없이 건너뜁니다. Start CDC는 그런 시작을 거부하며,
+  그런 지점이나 GTID 셋이 없는 시작 지점에서 시작한 스택의 Stop CDC 후 재시작도 거부합니다
+  (`file:position`으로 스트리밍했으므로 이어 갈 GTID 셋이 없음). Start CDC는 시작 오프셋을 스택이 마지막
+  Start 때 남긴 자체 기록에서 읽으므로, 세션에 더 이상 시작 지점이 없어도(연결한 스택, 초기화한 세션)
+  마찬가지입니다. 그 시작 지점을 유지하려면 cut over까지 `gtid_mode`를 `ON_PERMISSIVE`로
+  되돌리거나(그러면 CDC는 `file:position`으로 스트리밍), CDC에 새 시작 지점을 주세요: **"Drop &
+  reload"로 Re-run Full Load**, 또는 **Manual** → **Fetch current position** → **Use this start point**
+  후 그 사이에 바뀐 테이블을 "Drop & reload"로 다시 로드하고(CDC only: Aurora DSQL에서 바로잡기)
+  CHECKSUM으로 검증하세요. CDC가 스트리밍하는 동안 `gtid_mode`를 바꾸면 커넥터의 다음 자동 재시작 때
+  적용되어 커넥터를 멈추거나 오류 없이 변경을 건너뛸 수 있고, 도구는 이를 막을 수 없습니다: 먼저 Stop
+  CDC 하세요. Start CDC는 기록된 것 — 시작 지점과 함께 기록된 모드, 그리고 스택이 마지막으로 시작한 시작
+  오프셋(과 그 GTID 셋) — 만으로 판단할 뿐, 그 뒤 스택이 어떻게 스트리밍했는지는 알 수 없습니다. 그래서
+  `gtid_mode`를 다시 `ON`으로 바꾼 뒤의 Start는 다음 스택에 대해 거부되지 않습니다: `ON`일 때 기록된
+  지점에서 시작했지만 `ON`이 아닌 동안(예: GTID 없이 쓰인 변경으로 실패한 뒤의 `ON_PERMISSIVE`)
+  스트리밍한 스택, `ON`이 아닐 때 입력한 GTID 셋에서 시작한 스택, 마지막 Start에 줄 시작 지점이
+  없었던 스택(시작 지점이 없는 세션에서 재시작해 스택에 기록이 남지 않음). 이런 스택은 가지고 있는 GTID
+  셋 다음부터 이어 가며 이미 적용한 변경을 다시 보내거나, GTID 없이 쓰인 변경에서 멈추거나, 오류 없이
+  건너뜁니다. 그런 소스는 cut over까지 `ON`이 아닌 상태로 두거나, 위와 같이 CDC에 새 시작 지점을
+  주세요. 버전 0.1.565 이하가 기록한 시작 지점에는 모드가 기록되지 않습니다: 그 뒤 `gtid_mode`를 `ON`으로
+  바꿨다면 새 시작 지점을 정하세요.
+- **MySQL에서 `gtid_mode=ON`이면: 버전 0.1.565 이하가 시작한 파이프라인.** 그 버전들은 Debezium이 시작
+  기준으로 삼는 GTID 셋을 비웠기 때문에, `gtid_mode=ON`인 소스에서 MySQL이 모든 Start, Stop 후의 모든
+  Start, 커넥터의 모든 자동 재시작 때마다 보관 중인 바이너리 로그 전체를 다시 보냈습니다. 쓰기는
+  수렴했지만(싱크는 멱등) 예전 값이 다시 적용됐고, 고유 키 충돌은 데드레터가 될 수 있었으며, 보관된 로그
+  어디에든 — 시작 지점 이전이라도 — 파싱할 수 없는 DDL이 있으면 모든 Start가 멈췄습니다. 실행 중인
+  파이프라인은 **Stop CDC** → **Start CDC**를 한 번 할 때까지 그 동작을 유지하며, 그 뒤에는 멈춘 곳에서
+  정확히 재개합니다. Manual 지점(CDC only 포함)에서 시작한 파이프라인은 그 Start가 *the source has purged
+  binary logs CDC's GTID set does not cover*로 실패할 수 있습니다: 그 버전들은 시작 시점에 소스가 이미
+  삭제한 트랜잭션을 빼고 GTID 셋을 기록했지만, 소스에는 CDC가 멈춘 이후의 변경이 모두 남아 있을 수
+  있습니다. Stop CDC 후 cut over까지 소스의 `gtid_mode`를 `ON_PERMISSIVE`로 바꾸고(RDS와 Aurora에서는
+  파라미터 그룹 변경) Start CDC를 하세요: Debezium이 멈춘 곳부터 `file:position`으로 빈틈 없이
+  재개합니다(binlog 보존 기간도 끝났다면 그 Start는 대신 실패합니다). 또는 메시지대로 CDC에 새 시작 지점을
+  주세요. Manual 지점에 GTID 셋이 없으면 그런 Start는 무엇이든 바꾸기 전에 거부됩니다: 메시지를 따르세요.
+  그런 Start가 중간에 실패했다면 토픽에 다시 보내진 예전 변경이 남아 있고 싱크가 그 일부를 적용했을 수
+  있습니다: **Delete CDC infrastructure** 후 다시 배포하고, 모든 테이블에 대해 **"Drop & reload"로
+  Re-run Full Load**를 한 뒤(CDC only: **Manual** → **Fetch current position** → **Use this start
+  point** 후 Aurora DSQL에서 테이블을 바로잡기 — 싱크가 다시 적용한 행은 다시 쓰일 때까지 예전 값을
+  유지합니다) Start CDC를 하고 CHECKSUM으로 검증하세요. 이전 버전으로 `gtid_mode=ON` 소스에서 실행한
+  파이프라인은 cut over 전에 CHECKSUM으로 검증하세요.
 - **MySQL: Debezium이 파싱하지 못하는 DDL 문은, 소스 서버의 어디에서 실행되든 CDC를 멈춤.** Debezium은
   binary log의 모든 DDL 문을 자신의 MySQL 문법(Debezium 2.7)으로 파싱합니다 — 캡처 대상만이 아니라 서버의
   모든 데이터베이스와 테이블에 대해, 저장 루틴·트리거·뷰·계정 문까지 포함해 — 무엇이든 필터링하기 전에
@@ -183,7 +254,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   문에서 멈춥니다. CDC 단계가 원인을 알려 줍니다 — Start CDC 오류에서, 또는 시작된 뒤라면 그 커넥터의
   Pipeline health 행과 오류 알림에서
   ([§4.6](04-cdc-and-dsql-constraints.md#파이프라인-헬스와-change-flow)) — 그리고 따옴표로 묶인 값을 가린
-  채 그 문의 앞부분을 보여 줍니다.
+  채 그 문의 앞부분을 보여 줍니다. 시작 지점 이후의 문만 CDC를 멈춥니다(버전 0.1.565 이하는
+  `gtid_mode=ON`인 소스에서 보관된 바이너리 로그를 처음부터 다시 읽었으므로 그 이전의 문도 CDC를 멈출 수
+  있었습니다 — 위 참조).
   - **해결 방법.** CDC를 Stop한 다음, 그 문 이후의 시작 지점을 CDC에 주세요: 모든 테이블에 대해
     **"Drop & reload"로 Re-run Full Load**를 실행하거나(Full load + CDC; 그 문이 캡처 대상 테이블을
     바꿨다면 먼저 1단계 Evaluation과 Schema Conversion을 다시 실행), **Manual** → **Fetch current

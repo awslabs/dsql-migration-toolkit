@@ -1341,6 +1341,26 @@ def test_cdc_stack_source_creates_data_topics_sized_for_oversized_records(
     assert json.dumps(value).find("MaxMessageBytes") != -1, value
 
 
+def test_mysql_source_connector_sets_no_gtid_source_filter(cdc_template: dict) -> None:
+    # G19 (live, Seoul, 2026-10-07): gtid.source.excludes ".*" did NOT force file:position
+    # mode on a gtid_mode=ON source. Debezium 2.7.4 applies the filter to the offset's GTID
+    # set, so the set it registered with MySQL was EMPTY and MySQL streamed its whole
+    # retained binary log on every Start and connector restart -- re-applying history and
+    # dying on an unparseable DDL from before the start point. With no filter Debezium
+    # starts after the offset's own GTID set on ON, and by file:position on any other
+    # mode, so no gtid.source.* key belongs in the connector config.
+    cfg = cdc_template["Resources"]["DebeziumSourceConnector"]["Properties"][
+        "ConnectorConfiguration"
+    ]
+    assert not [k for k in cfg if str(k).startswith("gtid.source.")]
+    raw = CDC_STACK_TEMPLATE.read_text(encoding="utf-8")
+    assert "forcing pure file:pos mode" not in raw
+    assert "gtid_mode is exactly ON" in raw
+    # Backward compatible: the parameter Start CDC seeds the GTID set through is kept,
+    # with its empty default (an older stack's Start re-sends it as UsePreviousValue).
+    assert cdc_template["Parameters"]["WatermarkGtids"]["Default"] == ""
+
+
 def test_cdc_stack_schema_history_has_complete_iam_jaas(cdc_template: dict) -> None:
     # Regression: the Debezium schema-history is a SEPARATE Kafka client (MSK
     # Connect only auto-injects IAM auth for the connector's own producer). Declaring
@@ -2094,6 +2114,14 @@ def test_cdc_start_prep_passes_partition_map_and_max_bytes(cdc_template: dict) -
     # The seeder also pre-creates the sink DLQ topic at MaxMessageBytes so a >1 MiB
     # dead-lettered record isn't RecordTooLarge'd against a 1 MiB auto-created DLQ.
     assert props["DlqTopicName"] == {"Ref": "DlqTopicName"}
+    # G19: the offset seeder reads its start point ONLY from these resource properties.
+    # Without WatermarkGtids a gtid_mode=ON source re-reads its whole retained binary log
+    # (the seeded offset carries no GTID set); without WatermarkBinlogFile/Pos nothing is
+    # seeded. Every key the app emits must be forwarded.
+    from dsql_migrator.core.cdc import CDC_WATERMARK_PARAM_KEYS
+
+    for key in CDC_WATERMARK_PARAM_KEYS:
+        assert props[key] == {"Ref": key}, key
 
 
 def test_cdc_stack_seeder_iam_covers_per_table_topics(cdc_template: dict) -> None:
@@ -3037,3 +3065,123 @@ def test_manual_13_gives_a_target_key_reason_true_for_both_cdc_routings() -> Non
         )
         assert stale[lang] not in row, lang
         assert new[lang] in row, lang
+
+
+def test_manual_says_how_a_gtid_on_source_starts_cdc() -> None:
+    # G19: on gtid_mode=ON Debezium starts after the start point's GTID set; the manual must
+    # say so in every language, name the refusals and their remedies, keep gtid_mode until
+    # cut over, and tell pipelines run by 0.1.565 or earlier what to do. The old claim that
+    # GTID made the resume robust while the template emptied the set is gone.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    heads = {
+        "en": ("**MySQL with `gtid_mode=ON`: CDC starts after the start point's GTID set.**",
+               "**MySQL: decide `gtid_mode` before the Full Load and keep it until cut over.**",
+               "**MySQL with `gtid_mode=ON`: pipelines started by version 0.1.565 or earlier.**"),
+        "ko": ("**MySQL에서 `gtid_mode=ON`이면: CDC는 시작 지점의 GTID 셋 다음부터 시작.**",
+               "**MySQL: `gtid_mode`는 Full Load 전에 정하고 cut over까지 유지.**",
+               "**MySQL에서 `gtid_mode=ON`이면: 버전 0.1.565 이하가 시작한 파이프라인.**"),
+        "ja": ("**MySQL で `gtid_mode=ON` の場合: CDC は開始位置の GTID セットの次から開始します。**",
+               "**MySQL: `gtid_mode` は Full Load の前に決め、カットオーバーまで維持してください。**",
+               "**MySQL で `gtid_mode=ON` の場合: バージョン 0.1.565 以前が開始したパイプライン。**"),
+    }
+    must = ("**Fetch current position**", "`ON_PERMISSIVE`", "CHECKSUM", "Stop CDC",
+            "Start CDC", "**Delete CDC", "0.1.565")
+    for lang, three in heads.items():
+        bullets = "".join(
+            _flat_manual_slice(lang, "06-limitations.md", head, "\n- ") for head in three
+        )
+        for phrase in must:
+            assert phrase in bullets, (lang, phrase)
+        for page in ("01-setup.md", "03-full-load.md", "04-cdc-and-dsql-constraints.md"):
+            assert "gtid_mode" in (manual / lang / page).read_text(encoding="utf-8"), (
+                lang, page
+            )
+    stale = {
+        "en": "CDC\n  resume survives a source failover or replica promotion",
+        "ko": "복제본 승격 후에도 CDC 재개가 견고합니다",
+        "ja": "レプリカ昇格の後でも CDC の再開が堅牢になります",
+    }
+    for lang, phrase in stale.items():
+        assert phrase not in (manual / lang / "01-setup.md").read_text(encoding="utf-8"), lang
+
+
+def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> None:
+    # G19 review: the manual must not promise a refusal the check cannot make (it judges the
+    # recorded mode and the stack's recorded start offset, not how the stack streamed since),
+    # must give the gapless ON_PERMISSIVE resume for an earlier version's Manual-route
+    # pipeline, must pair every Manual remedy with the correction it needs, and must say
+    # that a Manual point saved by 0.1.565 or earlier comes back without its GTID set.
+    heads = {
+        "en": ("**MySQL with `gtid_mode=ON`: CDC starts after the start point's GTID set.**",
+               "**MySQL: decide `gtid_mode` before the Full Load and keep it until cut over.**",
+               "**MySQL with `gtid_mode=ON`: pipelines started by version 0.1.565 or earlier.**"),
+        "ko": ("**MySQL에서 `gtid_mode=ON`이면: CDC는 시작 지점의 GTID 셋 다음부터 시작.**",
+               "**MySQL: `gtid_mode`는 Full Load 전에 정하고 cut over까지 유지.**",
+               "**MySQL에서 `gtid_mode=ON`이면: 버전 0.1.565 이하가 시작한 파이프라인.**"),
+        "ja": ("**MySQL で `gtid_mode=ON` の場合: CDC は開始位置の GTID セットの次から開始します。**",
+               "**MySQL: `gtid_mode` は Full Load の前に決め、カットオーバーまで維持してください。**",
+               "**MySQL で `gtid_mode=ON` の場合: バージョン 0.1.565 以前が開始したパイプライン。**"),
+    }
+    gone = {
+        "en": ("refuses a restart after Stop CDC of a stack that streamed by `file:position`",
+               "or a stack that streamed by `file:position`: see the next bullet",
+               "(or set a new Manual point)",
+               "GTID position still needs*, or have it refused"),
+        "ko": ("`file:position`으로 스트리밍한 스택의 Stop CDC 후 재시작도 거부합니다",
+               "또는 `file:position`으로 스트리밍한 스택: 다음", "(또는 새 Manual 지점)"),
+        "ja": ("`file:position`でストリーミングしたスタックのStop CDC後の再起動も拒否",
+               "または`file:position`でストリーミングしたスタック: 次の項目",
+               "(または新しいManualの位置を設定)"),
+    }
+    present = {
+        "en": ("not how the stack streamed since",
+               "even when the session no longer holds the start point",
+               "set the source's `gtid_mode` to `ON_PERMISSIVE` until cut over",
+               "with no gap",
+               "rows the sink re-applied keep their older values until rewritten",
+               "changes to the captured tables between the two points are then not replicated",
+               "then Start CDC again",
+               "comes back without its GTID set",
+               "`<server UUID>:<interval>`"),
+        "ko": ("그 뒤 스택이 어떻게 스트리밍했는지는 알 수 없습니다",
+               "세션에 더 이상 시작 지점이 없어도",
+               "`gtid_mode`를 `ON_PERMISSIVE`로 바꾸고",
+               "빈틈 없이",
+               "싱크가 다시 적용한 행은 다시 쓰일 때까지 예전 값을 유지합니다",
+               "두 지점 사이의 캡처 대상 테이블 변경은 복제되지 않으므로",
+               "Start CDC를 다시 실행하세요",
+               "GTID 셋 없이 복원됩니다",
+               "`<server UUID>:<interval>`"),
+        "ja": ("その後スタックがどうストリーミングしたかはわかりません",
+               "セッションにもう開始位置がなくても",
+               "`gtid_mode`を`ON_PERMISSIVE`に変更し",
+               "欠落なく再開します",
+               "sinkが再適用した行は書き直されるまで古い値のままです",
+               "2つの位置の間のキャプチャ対象テーブルの変更はレプリケートされない",
+               "もう一度Start CDCを実行してください",
+               "GTIDセットなしで復元されます",
+               "`<server UUID>:<interval>`"),
+    }
+    for lang, three in heads.items():
+        bullets = "".join(
+            _flat_manual_slice(lang, "06-limitations.md", head, "\n- ") for head in three
+        )
+        if lang == "ja":
+            bullets = bullets.replace(" ", "")
+        for phrase in gone[lang]:
+            probe = phrase.replace(" ", "") if lang == "ja" else phrase
+            assert probe not in bullets, (lang, phrase)
+        for phrase in present[lang]:
+            probe = phrase.replace(" ", "") if lang == "ja" else phrase
+            assert probe in bullets, (lang, phrase)
+    # Chapter 4's handoff step names the restored-without-a-set Manual point too.
+    import pathlib
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    for lang, phrase in {"en": "0.1.565 or earlier comes back", "ko": "0.1.565 이하가 저장한 Manual",
+                         "ja": "0.1.565 以前が保存した Manual"}.items():
+        text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+        flat = " ".join(text.split())
+        assert phrase in flat, lang

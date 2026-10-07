@@ -432,6 +432,74 @@ def test_manual_start_point_chain_through_the_external_seed(rec) -> None:
     assert rec.produced == []
 
 
+def test_manual_start_point_with_gtid_set_through_the_external_seed(rec) -> None:
+    """G19: a Manual point's GTID set (normalized) reaches the External seeder's produced
+    record -- Debezium positions by it on a gtid_mode=ON source -- and the file:pos
+    no-clobber guard still refuses to rewind a committed offset past the point."""
+    import functools
+
+    from dsql_migrator.core.cdc import CdcResumePoint, cdc_seed_watermark
+    from dsql_migrator.core.cdc_deployer import run_cdc_start
+    from tests.test_cdc_deploy_stages import (
+        SINK,
+        SRC,
+        STACK,
+        _FakeDeployer,
+        _FakeHandle,
+        _start_params,
+    )
+
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    seed, origin = cdc_seed_watermark(
+        None,
+        CdcResumePoint(
+            binlog_file="mysql-bin.000040", binlog_position=4,
+            gtid_executed="U:1-9,\nV:1-3",
+        ),
+        now=now,
+    )
+    seed_fn = functools.partial(
+        seed_kafka_prep,
+        admin_factory=rec.admin, consumer_factory=rec.consumer,
+        producer_factory=rec.producer,
+    )
+
+    def _start():
+        run_cdc_start(
+            _FakeHandle(), stack_name=STACK, params=_start_params(),
+            deployer=_FakeDeployer(
+                connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+            ),
+            on_log=lambda _ts, _msg: None, sleep=lambda _s: None,
+            watermark=seed, seed_origin=origin,
+            connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+            seed_mode="external", seed_fn=seed_fn,
+        )
+
+    rec.topic_partitions = set()  # a fresh offsets topic: nothing committed yet
+    _start()
+    assert len(rec.produced) == 1
+    _topic, key, value = rec.produced[0]
+    produced = json.loads(value)
+    assert (produced["file"], produced["pos"]) == ("mysql-bin.000040", 4)
+    assert produced["gtids"] == "U:1-9,V:1-3"
+    assert (key, value) == build_connect_offset_record(SRC, "dsqlcdc", seed)
+
+    # A committed offset already PAST the Manual point: skipped, never rewound -- the
+    # no-clobber guard compares file:pos, whatever the GTID sets say.
+    rec.produced.clear()
+    rec.topic_partitions = {0}
+    rec.existing_records = [
+        _FakeMsg(
+            key,
+            json.dumps({"file": "mysql-bin.000041", "pos": 9, "row": 0,
+                        "server_id": 0, "event": 0, "gtids": "U:1-5"}),
+        )
+    ]
+    _start()
+    assert rec.produced == []
+
+
 def test_seed_partition_plan_matches_plan_topics(rec) -> None:
     # The topics ensure_topics creates must equal plan_topics() for the same inputs.
     rec.topic_partitions = set()

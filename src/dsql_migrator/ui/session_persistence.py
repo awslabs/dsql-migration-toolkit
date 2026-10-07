@@ -246,6 +246,8 @@ def capture_session_snapshot(
         cdc_start_fingerprints=dict(
             getattr(migration_state, "cdc_start_fingerprints", dict)()
         ),
+        # This build's card keeps a GTID set only with the position it belongs to.
+        cdc_start_gtid_bound=bool(migration_state._cdc_start_gtid),  # type: ignore[attr-defined]
         cdc_history_missing=bool(getattr(migration_state, "cdc_history_missing", False)),
         cdc_lob_exclusions=_flatten_lob_exclusions(
             migration_state.lob_exclusions()  # type: ignore[attr-defined]
@@ -683,7 +685,12 @@ def apply_session_snapshot(
     # exclusions, tracked connector names). All optional -- older snapshots leave
     # them unset and default to Automatic.
     migration_state.set_cdc_start_position(  # type: ignore[attr-defined]
-        gtid=snapshot.cdc_start_gtid,
+        # A Manual GTID set saved by 0.1.565 or earlier (unstamped) is dropped: that card
+        # kept a fetched set beside any position typed after the fetch, and never seeded it,
+        # while this build seeds it -- on a gtid_mode=ON source Debezium would start after a
+        # set read somewhere else and skip changes with no error. Without it Start CDC asks
+        # for the set on such a source (and nothing changes on any other mode).
+        gtid=snapshot.cdc_start_gtid if snapshot.cdc_start_gtid_bound else None,
         binlog_file=snapshot.cdc_start_binlog_file,
         binlog_pos=snapshot.cdc_start_binlog_pos,
         # Bound to the coordinates restored with them (set_cdc_start_position drops them
