@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.567
+
+### Fixed
+
+- **A CDC Start on a GTID-enabled MySQL source never continues from a GTID set that stopped advancing.** Debezium advances the GTID set in its offset only while `gtid_mode` is exactly `ON`. Each Start now records on the CDC stack the `gtid_mode` it started under (a new stack parameter, `StartGtidMode`, kept by Stop). On a `gtid_mode=ON` source, Start CDC refuses, with the remedies, a resume or a new start point on a stack last started while `gtid_mode` was not `ON`. A stack last started under `ON` resumes by GTID (0.1.566 refused some of these). If `gtid_mode` cannot be read, the first Start of a stack, and every Start of a stack that has this record, is refused until you test the source connection on Connect.
+- **The CDC sink no longer dead-letters healthy rows after a schema change elsewhere on the cluster** (sink plugin v52). Aurora DSQL can report a schema conflict (OC001, `SQLSTATE 40001`) while a statement runs, for example when an asynchronous index build finishes. The sink retried on the aborted transaction, failed with `25P02` and dead-lettered the row. Each retry now starts on a clean transaction.
+- **Aurora DSQL's temporary "server unavailable" (`SQLSTATE XX000`) is retried.** The CDC sink dead-lettered, and the Full Load quarantined, healthy rows on it. Both now retry it within their existing budgets. When the condition outlasts the budget, the sink waits and resumes on its own, and the Full Load fails the batch, which Retry unfinished tables reloads. An index whose creation answered `XX000` is shown as not confirmed (check the table) instead of missing. The sink-stall notice now tells this case from an ejected sink consumer.
+- **PostgreSQL: the Full Load never publishes a table whose UPDATE or DELETE would then fail on the source.** Before its first write to the source, it checks every table it would add to CDC's publication with the same rule as a table added after the Full Load, and nothing is changed on the source when one fails. The CDC prerequisite REPLICA_IDENTITY checks the source's live catalog the same way. Every REPLICA IDENTITY refusal now names the fix for its cause.
+- **Deploy CDC infrastructure uploads a changed plugin file even when its size did not change.** Uploads are now compared by SHA-256.
+- **AI Assist:** a reply that arrives after you switch the model no longer changes the new model's status, and Verify AI access stays off while AI Assist is switched off.
+- **Logs:** a transient sink error no longer carries row values into the connector log.
+
+### Upgrade notes
+
+- **Sink plugin v52.** A CDC stack deployed by an earlier version keeps the earlier sink until you **Delete CDC infrastructure** and deploy it again (Start CDC does not replace the plugin). Deleting the CDC infrastructure discards its offsets, so CDC then needs a new start point. The first deploy after upgrading uploads the plugin files once more.
+- **`StartGtidMode`** applies at the next Start CDC, with no redeploy (Start sends the bundled template). A stack started by 0.1.566 or earlier is judged as before until its first Start on this version. After a Start on this version, do not start that stack from an older version: its stack update would fail.
+- After an app restart, test the source connection on Connect before Start CDC on a MySQL source.
+
 ## v0.1.566
 
 ### Fixed

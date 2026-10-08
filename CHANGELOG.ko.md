@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.567
+
+### 수정
+
+- **GTID가 켜진 MySQL 소스에서 CDC Start가 진행이 멈춘 GTID 집합에서 이어가지 않습니다.** Debezium은 `gtid_mode`가 정확히 `ON`일 때만 오프셋의 GTID 집합을 갱신합니다. 이제 Start마다 시작할 때의 `gtid_mode`를 CDC 스택에 기록합니다(새 스택 파라미터 `StartGtidMode`, Stop 후에도 유지). `gtid_mode=ON` 소스에서, 마지막 Start가 `gtid_mode`가 `ON`이 아닐 때 이뤄진 스택이면 재개도 새 시작점도 Start CDC가 해결 방법과 함께 거부합니다. 마지막 Start가 `ON`이었던 스택은 GTID로 재개합니다(0.1.566은 이 중 일부를 거부했습니다). `gtid_mode`를 읽을 수 없으면, 스택의 첫 Start와 이 기록이 있는 스택의 모든 Start는 Connect에서 소스 연결을 테스트할 때까지 거부됩니다.
+- **클러스터의 다른 곳에서 스키마가 바뀐 뒤에도 CDC sink가 정상 행을 dead-letter하지 않습니다**(sink 플러그인 v52). Aurora DSQL은 구문 실행 중에도 스키마 충돌(OC001, `SQLSTATE 40001`)을 보고할 수 있습니다(예: 비동기 인덱스 빌드가 끝날 때). sink는 중단된 트랜잭션에서 재시도하다 `25P02`로 실패해 그 행을 dead-letter했습니다. 이제 재시도마다 깨끗한 트랜잭션에서 시작합니다.
+- **Aurora DSQL의 일시적인 "server unavailable"(`SQLSTATE XX000`)을 재시도합니다.** CDC sink는 이 오류에서 정상 행을 dead-letter했고, Full Load는 정상 행을 격리했습니다. 이제 둘 다 기존 재시도 예산 안에서 재시도합니다. 상태가 예산보다 오래가면 sink는 기다렸다가 스스로 재개하고, Full Load는 배치를 실패로 남기며 Retry unfinished tables가 다시 로드합니다. 생성 요청에 `XX000`이 돌아온 인덱스는 "없음" 대신 "확인되지 않음"(테이블을 확인)으로 표시합니다. sink 정체 알림은 이 경우를 그룹에서 빠진 sink 컨슈머와 구분해 안내합니다.
+- **PostgreSQL: Full Load가 UPDATE나 DELETE가 소스에서 실패하게 될 테이블을 publication에 넣지 않습니다.** 소스에 처음 쓰기 전에, CDC의 publication에 넣을 모든 테이블을 Full Load 후 추가하는 테이블과 같은 규칙으로 검사하고, 하나라도 걸리면 소스에 아무것도 바꾸지 않습니다. CDC 사전 점검 REPLICA_IDENTITY도 소스의 실제 카탈로그를 같은 방식으로 검사합니다. 모든 REPLICA IDENTITY 거부는 이제 원인에 맞는 해결 방법을 알려 줍니다.
+- **Deploy CDC infrastructure가 크기가 같아도 바뀐 플러그인 파일을 업로드합니다.** 이제 업로드 여부를 SHA-256으로 비교합니다.
+- **AI Assist:** 모델을 바꾼 뒤 도착한 응답이 새 모델의 상태를 바꾸지 않고, AI Assist가 꺼져 있는 동안 Verify AI access도 꺼진 상태를 유지합니다.
+- **로그:** 일시적인 sink 오류가 더 이상 커넥터 로그에 행 값을 남기지 않습니다.
+
+### 업그레이드 참고
+
+- **Sink 플러그인 v52.** 이전 버전으로 배포한 CDC 스택은 **Delete CDC infrastructure** 후 다시 배포할 때까지 이전 sink를 씁니다(Start CDC는 플러그인을 바꾸지 않습니다). CDC 인프라를 삭제하면 오프셋이 사라지므로, 그 뒤 CDC에 새 시작점이 필요합니다. 업그레이드 후 첫 배포는 플러그인 파일을 한 번 더 업로드합니다.
+- **`StartGtidMode`**는 다음 Start CDC부터 적용되며 재배포가 필요 없습니다(Start가 번들 템플릿을 보냅니다). 0.1.566 이하로 시작한 스택은 이 버전에서 처음 Start할 때까지 예전 방식으로 판단합니다. 이 버전으로 Start한 스택은 이전 버전에서 Start하지 마세요: 스택 업데이트가 실패합니다.
+- 앱을 재시작한 뒤에는, MySQL 소스에서 Start CDC 전에 Connect에서 소스 연결을 테스트하세요.
+
 ## v0.1.566
 
 ### 수정
