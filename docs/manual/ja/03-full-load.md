@@ -40,8 +40,12 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 削除します。また、再キー化したテーブルに `REPLICA IDENTITY FULL` を設定し、publication の
 `publish_via_partition_root` を修正し、Full Load の後に選択したテーブル(Full load + CDC、CDC を開始する前)
 については、そのテーブルをコピーする直前に publication に追加してから、その時点で開いていたトランザクションを
-待つためにトランザクション ID を 1 つ取得します。いずれも autocommit で、小さな allowlist に制限され、監査
-されます。これらが、ツールがいずれのソースに対して行う唯一の書き込みです。
+待つためにトランザクション ID を 1 つ取得します。いずれも autocommit で、小さな allowlist に制限され、監査さ
+れます。これらが、ツールがいずれのソースに対して行う唯一の書き込みです。ウォーターマークの地点で publication
+を作成する(またはテーブルを追加する)前に、追加するすべてのテーブルに使用可能な `REPLICA IDENTITY` があること
+を確認し、ない場合はソースで何も変更する前に実行を止めて、そのテーブルを示します。Full Load の後に選択したテー
+ブルも、追加する前に同じ確認を受けます。ない場合はそのテーブルはロードされず、その行に理由が表示されます
+([13.7](13-excluding-tables-and-columns.md))。
 
 ---
 

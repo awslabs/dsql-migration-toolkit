@@ -45,11 +45,12 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
 
 **Why a *custom* sink and not a stock JDBC sink?**
 
-A standard JDBC sink retries optimistic-concurrency conflicts (`SQLSTATE 40001`)
-**per batch**, which collapses throughput under high-contention large-scale CDC.
-The custom sink retries a conflicting **transaction** itself (one chunk of ≤3000
-rows, or one row), with backoff and jitter, and handles DSQL's short-lived IAM tokens
-and reconnects (details in §4.4).
+A stock JDBC sink cannot authenticate with DSQL's short-lived IAM tokens and has no
+DSQL-specific handling of optimistic-concurrency conflicts (`SQLSTATE 40001`) or of
+a row DSQL rejects. The custom sink re-runs a conflicting **transaction** itself
+(one chunk of ≤3000 rows, or one row) with exponential backoff and full jitter,
+sends a rejected row to the DLQ while the rest of its chunk still lands, and handles
+DSQL's short-lived IAM tokens and reconnects (details in §4.4).
 
 ---
 

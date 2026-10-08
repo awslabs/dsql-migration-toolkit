@@ -142,19 +142,23 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
   最後にコミットした GTID セットの次から再開するため、バイナリログファイルの異なるレプリカへの
   フェイルオーバー(failover)の後でも続けられます。`OFF`、`OFF_PERMISSIVE`、`ON_PERMISSIVE` では
   binlog の `file:position` を使い、1 つのソース上では同じように動作します。Full Load からカットオーバー
-  まではモードを変えないでください: `gtid_mode` が `ON` でないときに記録された開始位置では、`ON` に
-  なった後に CDC を開始できません([第 6 章](06-limitations.md))。ゲートは GTID の欠如をブロッカーと
-  してではなく、情報として報告します。(PostgreSQL には GTID / `file:position` の概念はありません。)
+  まではモードを変えないでください: `gtid_mode` が `ON` でないときに記録された開始位置では — また
+  `gtid_mode` が `ON` でないときに最後に開始した CDC スタックでも — `ON` になった後に CDC を開始できませ
+  ん([第 6 章](06-limitations.md))。ゲートは GTID の欠如をブロッカーとしてではなく、情報として報告します。
+  (PostgreSQL には GTID / `file:position` の概念はありません。)
 - **PostgreSQL ソース — CDC はクラスターのライターに対して実行する必要があります。** ソースは
   **スタンバイではなくライター** でなければなりません(`pg_is_in_recovery()` が false であること)—
   スタンバイはレプリケーションスロットをホストできないため、CDC はライターのエンドポイントに向けて
   ください。
-- **PostgreSQL ソース — レプリケーション対象の各テーブルには使用可能な REPLICA IDENTITY が必要
-  です。** 主キーがあれば既定で十分で、なければ `ALTER TABLE … REPLICA IDENTITY FULL` を設定します
-  (FULL またはインデックスアイデンティティでも動作)。`REPLICA IDENTITY NOTHING` のままのテーブルは
-  publisher 側で UPDATE/DELETE がエラーになるため、拒否されます。レプリケーションスロット /
-  `max_wal_senders`(walsender)の **余裕** は非ブロッキングの **警告(WARN)** として検査されます
-  (スロットのエントリに空きがあっても、walsender プールが満杯だと新しいスロットはブロックされます)。
+- **PostgreSQL ソース — レプリケーション対象の各テーブルには使用可能な REPLICA IDENTITY が必要です。**
+  `DEFAULT` には `DEFERRABLE` でない有効な主キーが必要で(PostgreSQL はキーが削除された後も `DEFAULT` の
+  ままにするため、チェックはソースのカタログを読みます)、`USING INDEX` には有効な一意インデックスが必要
+  で、`FULL` は常に動作します(`ALTER TABLE … REPLICA IDENTITY FULL`)。パーティション化されたテーブルでは、
+  すべてのパーティションに必要です。ない場合、テーブルが publication に含まれた後はそのテーブルのすべて
+  の UPDATE/DELETE がソースで失敗するため、CDC の前提条件チェックが失敗と判定し、Full Load はソースで何
+  も変更する前に停止します(publication もスロットも作成しません)。レプリケーションスロット /
+  `max_wal_senders`(walsender)の **余裕** は非ブロッキングの **警告(WARN)** として検査されます(スロット
+  のエントリに空きがあっても、walsender プールが満杯だと新しいスロットはブロックされます)。
 
 ---
 

@@ -2154,6 +2154,24 @@ def test_cdc_stack_declares_watermark_and_seeder_params(cdc_template: dict) -> N
         assert params[p].get("Default", None) == "", p
 
 
+def test_cdc_stack_declares_the_start_gtid_mode_record(cdc_template: dict) -> None:
+    # G20: Start CDC records the source gtid_mode each start positions under. Default "" so
+    # a stack deployed by an earlier version takes it at its next Start (Start sends the
+    # bundled template); no AllowedValues, so no recorded value can fail UpdateStack
+    # mid-Start; and it is no seeder input (the seeder ZIP is unchanged) -- nothing refers
+    # to it at all.
+    param = cdc_template["Parameters"]["StartGtidMode"]
+    assert param["Type"] == "String" and param["Default"] == ""
+    assert "AllowedValues" not in param and "AllowedPattern" not in param
+    prep = cdc_template["Resources"]["CdcStartPrepResource"]["Properties"]
+    assert "StartGtidMode" not in prep
+    assert "StartGtidMode" not in _collect_refs(cdc_template["Resources"])
+    assert "StartGtidMode" not in _collect_refs(cdc_template.get("Conditions", {}))
+    text = CDC_STACK_TEMPLATE.read_text(encoding="utf-8")
+    assert "Ref: StartGtidMode" not in text and "!Ref StartGtidMode" not in text
+    assert "${StartGtidMode}" not in text
+
+
 def test_public_image_default_is_not_left_behind_the_app_version(template: dict) -> None:
     """The ECR Public default tag must track the shipped version.
 
@@ -3128,12 +3146,21 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
         "en": ("refuses a restart after Stop CDC of a stack that streamed by `file:position`",
                "or a stack that streamed by `file:position`: see the next bullet",
                "(or set a new Manual point)",
-               "GTID position still needs*, or have it refused"),
+               "GTID position still needs*, or have it refused",
+               # G20 (DELIBERATE UPDATE): a seedless restart no longer leaves the stack
+               # without a record -- the gtid_mode record survives it.
+               "which leaves the stack no record",
+               # G20 review: after the redeploy, the held point may do (see present).
+               "deploy it again and give CDC a new start point as above"),
         "ko": ("`file:position`으로 스트리밍한 스택의 Stop CDC 후 재시작도 거부합니다",
-               "또는 `file:position`으로 스트리밍한 스택: 다음", "(또는 새 Manual 지점)"),
+               "또는 `file:position`으로 스트리밍한 스택: 다음", "(또는 새 Manual 지점)",
+               "스택에 기록이 남지 않음",
+               "후 다시 배포하고 위와 같이 CDC에 새 시작 지점을 주세요"),
         "ja": ("`file:position`でストリーミングしたスタックのStop CDC後の再起動も拒否",
                "または`file:position`でストリーミングしたスタック: 次の項目",
-               "(または新しいManualの位置を設定)"),
+               "(または新しいManualの位置を設定)",
+               "スタックに記録が残らない",
+               "を実行して再デプロイし、上記のとおりCDCに新しい開始位置を与えてください"),
     }
     present = {
         "en": ("not how the stack streamed since",
@@ -3144,7 +3171,13 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
                "changes to the captured tables between the two points are then not replicated",
                "then Start CDC again",
                "comes back without its GTID set",
-               "`<server UUID>:<interval>`"),
+               "`<server UUID>:<interval>`",
+               # G20: the gtid_mode record, and which stacks still lack it.
+               "records on the CDC stack the source's `gtid_mode`",
+               "version 0.1.566 or earlier holds no record",
+               # G20 review: a new stack starts exactly at the held point when it can.
+               "the one you hold if `gtid_mode` was already `ON` when it was recorded and "
+               "has stayed `ON` since"),
         "ko": ("그 뒤 스택이 어떻게 스트리밍했는지는 알 수 없습니다",
                "세션에 더 이상 시작 지점이 없어도",
                "`gtid_mode`를 `ON_PERMISSIVE`로 바꾸고",
@@ -3153,7 +3186,11 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
                "두 지점 사이의 캡처 대상 테이블 변경은 복제되지 않으므로",
                "Start CDC를 다시 실행하세요",
                "GTID 셋 없이 복원됩니다",
-               "`<server UUID>:<interval>`"),
+               "`<server UUID>:<interval>`",
+               "소스의 `gtid_mode`를 CDC 스택에 기록",
+               "버전 0.1.566 이하가 마지막으로 시작한 스택에는 기록이 없",
+               "가지고 있는 시작 지점이 기록될 때 이미 `gtid_mode`가 `ON`이었고 그 뒤로 계속 "
+               "`ON`이었다면 그 지점에서"),
         "ja": ("その後スタックがどうストリーミングしたかはわかりません",
                "セッションにもう開始位置がなくても",
                "`gtid_mode`を`ON_PERMISSIVE`に変更し",
@@ -3162,7 +3199,11 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
                "2つの位置の間のキャプチャ対象テーブルの変更はレプリケートされない",
                "もう一度Start CDCを実行してください",
                "GTIDセットなしで復元されます",
-               "`<server UUID>:<interval>`"),
+               "`<server UUID>:<interval>`",
+               "ソースの `gtid_mode` を CDC スタックに記録",
+               "バージョン 0.1.566 以前が最後に開始したスタックには記録がな",
+               "保持している開始位置が記録されたときすでに `gtid_mode` が `ON` で、その後も "
+               "`ON` のままなら、その位置から"),
     }
     for lang, three in heads.items():
         bullets = "".join(
@@ -3185,3 +3226,102 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
         text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
         flat = " ".join(text.split())
         assert phrase in flat, lang
+
+
+def test_occ_retry_is_described_as_a_transaction_not_a_statement() -> None:
+    # G20: the Full Load re-runs the whole batch (one multi-row INSERT in its own
+    # transaction) and the sink re-runs its whole chunk's transaction (or one row's in the
+    # record-by-record fallback) -- nothing retries a single statement. The docs and the
+    # comments said "statement-level" in many places; the one deliberate exception is the
+    # plugin's ConfigDef string literal, which changes only with a plugin rebuild.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    manual = root / "docs" / "manual"
+    sink_src = root / "connectors" / "dsql-sink" / "src" / "main" / "java" / "dev" / (
+        "dsqlmigrator") / "connect"
+
+    def flat(path: pathlib.Path) -> str:
+        return re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+
+    english = [
+        root / "README.md", root / "connectors" / "dsql-sink" / "README.md",
+        manual / "en" / "07-performance-and-tuning.md",
+        manual / "en" / "08-testing-and-verification.md",
+        root / "src" / "dsql_migrator" / "core" / "cdc.py", CDC_STACK_TEMPLATE,
+        sink_src / "DsqlSinkTask.java", sink_src / "OccRetry.java",
+    ]
+    for path in english:
+        text = flat(path)
+        for stale in ("statement-level", "Statement-level", "statement level",
+                      "statement -level"):
+            assert stale not in text, (path.name, stale)
+    assert "conflicted statement" not in flat(sink_src / "OccRetry.java")
+    assert "구문 단위 OCC" not in flat(root / "README.ko.md")
+    assert "문장 단위" not in flat(manual / "ko" / "07-performance-and-tuning.md")
+    for path in (root / "README.ja.md", manual / "ja" / "07-performance-and-tuning.md",
+                 manual / "ja" / "08-testing-and-verification.md"):
+        text = flat(path)
+        assert "ステートメントレベル" not in text and "ステートメント単位" not in text, path.name
+    assert "the tool re-runs the **whole transaction**" in flat(
+        manual / "en" / "07-performance-and-tuning.md"
+    )
+    # G20 review: each path's own attempt budget -- the Full Load's per-batch default
+    # (shared with dropped connections) and the sink's occ.max.retries default (the
+    # template does not set it) -- not one shared "up to 10".
+    from dsql_migrator.config import load_config
+
+    full_load = load_config(env={}).full_load_occ_max_attempts
+    sink = int(re.search(
+        r"MAX_RETRIES,\s*Type\.INT,\s*(\d+),",
+        (sink_src / "DsqlSinkConnectorConfig.java").read_text(encoding="utf-8"),
+    ).group(1))
+    assert "occ.max.retries" not in CDC_STACK_TEMPLATE.read_text(encoding="utf-8")
+    budgets = {
+        "en": (f"up to {full_load} attempts per Full Load batch",
+               f"up to {sink} per sink transaction", "for up to 10 attempts"),
+        "ko": (f"Full Load 배치당 최대 {full_load}회", f"싱크 트랜잭션당 최대 {sink}회",
+               "`40001`은 최대 10회까지"),
+        "ja": (f"Full Load のバッチごとに最大 {full_load} 回",
+               f"シンクのトランザクションごとに最大 {sink} 回", "`40001` は最大 10 回まで"),
+    }
+    for lang, (fl_phrase, sink_phrase, stale) in budgets.items():
+        text = (manual / lang / "07-performance-and-tuning.md").read_text(encoding="utf-8")
+        text = re.sub(r"[ \t]*\n[ \t]*", "" if lang == "ja" else " ", text)
+        assert fl_phrase in text and sink_phrase in text, lang
+        assert stale not in text, lang
+    # The deliberate exception: a ConfigDef string literal ships in the plugin jar.
+    assert "Max statement-level OCC (40001) retries." in (
+        sink_src / "DsqlSinkConnectorConfig.java"
+    ).read_text(encoding="utf-8")
+
+
+def test_manual_3_1_stops_the_run_only_for_the_watermarks_publication_write() -> None:
+    # G20 review: §3.1 said an unusable REPLICA IDENTITY stops the run before any of its
+    # source writes -- adding a table selected after the Full Load included. That table is
+    # refused on its own (not loaded, its row says why) while the other additions still join
+    # the publication and load; only the watermark's provisioning stops the run.
+    stale = {
+        "en": "Before the first of these writes it checks",
+        "ko": "이 쓰기 가운데 첫 번째보다 먼저",
+        "ja": "これらの最初の書き込みの前に",
+    }
+    new = {
+        "en": ("Before it creates the publication (or adds tables to it) at the watermark",
+               "A table selected after the Full Load gets the same check before it is added: "
+               "without one it is not loaded, and its row says why"),
+        "ko": ("워터마크 시점에 publication을 만들거나 거기에 테이블을 추가하기 전에",
+               "Full Load 이후 선택한 테이블도 추가하기 전에 같은 확인을 거치며, 없으면 그 "
+               "테이블은 로드되지 않고 그 행에 이유가 표시됩니다"),
+        "ja": ("ウォーターマークの地点でpublicationを作成する(またはテーブルを追加する)前に",
+               "FullLoadの後に選択したテーブルも、追加する前に同じ確認を受けます。ない場合は"
+               "そのテーブルはロードされず、その行に理由が表示されます"),
+    }
+    for lang in ("en", "ko", "ja"):
+        section = _flat_manual_slice(lang, "03-full-load.md", "## 3.1 ", "\n---")
+        if lang == "ja":
+            section = section.replace(" ", "")
+        assert stale[lang] not in section, lang
+        for phrase in new[lang]:
+            assert phrase in section, (lang, phrase)

@@ -127,6 +127,14 @@ class _El:
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
 
+    # G20: modelled (not chainable no-ops) so a test can see what a button shows after
+    # ``run_busy`` restored it.
+    def enable(self) -> None:
+        self.enabled = True
+
+    def disable(self) -> None:
+        self.enabled = False
+
     def set_value(self, value: Any) -> "_El":
         previous = self.value
         if value == previous:
@@ -814,3 +822,71 @@ def test_a_follow_up_in_an_open_connect_chat_uses_the_current_settings(
     assert state.ai_verified is True
     assert ai_is_usable(state)
     assert ui.shown()[0] == "Verified"
+
+
+# ---------------------------------------------------------------------------
+# G20: the Verify button follows the AI Assist switch after a check
+# ---------------------------------------------------------------------------
+
+
+def test_g20_switching_ai_off_during_the_check_leaves_verify_disabled() -> None:
+    # run_busy's restore re-enabled the button although AI Assist was off by then.
+    holder: dict[str, _Ui] = {}
+
+    def runner(config: Any, _profile: Any) -> AiAccessCheckResult:
+        holder["ui"].ai_switch().set_value(False)
+        return AiAccessCheckResult(
+            ok=True, reason="OK", detail="OK-COPY", model_id=config.model_id
+        )
+
+    ui, _state = _render(_ai_on, runner)
+    holder["ui"] = ui
+    ui.verify()
+    assert ui.find_button("Verify AI access").enabled is False
+    assert ui.model_select().enabled is False
+
+
+def test_g20_verify_stays_disabled_while_the_check_runs_and_follows_the_switch_after() -> None:
+    holder: dict[str, _Ui] = {}
+    seen: list[bool] = []
+
+    def runner(config: Any, _profile: Any) -> AiAccessCheckResult:
+        ui = holder["ui"]
+        ui.ai_switch().set_value(False)
+        ui.ai_switch().set_value(True)
+        # Still running: a second click must not be possible.
+        seen.append(ui.find_button("Verify AI access").enabled)
+        return AiAccessCheckResult(
+            ok=True, reason="OK", detail="OK-COPY", model_id=config.model_id
+        )
+
+    ui, _state = _render(_ai_on, runner)
+    holder["ui"] = ui
+    ui.verify()
+    assert seen == [False]
+    assert ui.find_button("Verify AI access").enabled is True
+
+
+def test_g20_verify_is_enabled_again_after_a_check_with_ai_on() -> None:
+    ui, _state = _render(_ai_on, _ok_runner())
+    ui.verify()
+    button = ui.find_button("Verify AI access")
+    assert button.enabled is True
+    # The check is over, so the switch alone drives the button again (the running flag
+    # must be cleared, or AI Assist off and on leaves Verify disabled until a page rebuild).
+    ui.ai_switch().set_value(False)
+    assert button.enabled is False
+    ui.ai_switch().set_value(True)
+    assert button.enabled is True
+
+
+def test_g20_the_connection_test_buttons_are_restored_as_before() -> None:
+    def _no_io(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("no connection test may run against an empty form")
+
+    ui, _state = _render(_ai_on, source_tester=_no_io, target_tester=_no_io)
+    for label in ("Test source connection", "Test target connection"):
+        button = ui.find_button(label)
+        button.enabled = False
+        asyncio.run(button.click())  # the empty form fails validation: no I/O
+        assert button.enabled is True, label

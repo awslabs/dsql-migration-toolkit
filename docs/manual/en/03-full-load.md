@@ -44,7 +44,12 @@ and, for a table selected after the Full Load (Full load + CDC, before CDC start
 adds that table to the publication just before copying it, then takes one
 transaction ID to wait for the transactions open at that moment. All of these are
 autocommit, restricted to a small allowlist, and audited. They are the only writes
-the tool ever makes to any source.
+the tool ever makes to any source. Before it creates the publication (or adds
+tables to it) at the watermark, it checks that every table it would add keeps a
+usable `REPLICA IDENTITY`; otherwise the run stops before it changes anything on
+the source and names the table. A table selected after the Full Load gets the same
+check before it is added: without one it is not loaded, and its row says why
+([13.7](13-excluding-tables-and-columns.md)).
 
 ---
 

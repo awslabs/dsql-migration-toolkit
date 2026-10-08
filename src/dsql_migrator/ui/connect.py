@@ -75,6 +75,7 @@ from dsql_migrator.ui.ai_assist import (
     SUPPORTED_BEDROCK_MODELS,
     ai_availability,
     ai_is_usable,
+    ai_settings_key,
     ai_unavailable_hint,
     build_ai_assist_config,
     map_access_check_display,
@@ -662,12 +663,20 @@ def build_connect_page(
     # Track readiness so on_connection_change fires only on an actual change.
     last_ready = {"value": state.connection_ready()}
 
-    async def run_busy(button: object, action: Callable[[], object]) -> None:
+    async def run_busy(
+        button: object,
+        action: Callable[[], object],
+        *,
+        enabled_after: Optional[Callable[[], bool]] = None,
+    ) -> None:
         """Run an async ``action`` while ``button`` shows a busy/disabled state.
 
         Prevents a double-submit of a connection/AI test and gives a visible
         in-progress cue. The button is restored in ``finally`` unless the page
-        was rebuilt while awaiting (the element is then deleted -- NiceGUI #3028).
+        was rebuilt while awaiting (the element is then deleted -- NiceGUI #3028):
+        re-enabled, or -- with ``enabled_after`` -- set to whatever that predicate
+        says NOW (the Verify AI access button follows the AI Assist switch, which
+        may have been turned off while the check ran).
 
         Busy cue is the disabled state, NOT Quasar's button ``loading`` prop: the
         loading spinner overlays the button's border and reads as a "spinning
@@ -681,7 +690,10 @@ def build_connect_page(
                 await result
         finally:
             if not getattr(button, "is_deleted", False):
-                button.enable()  # type: ignore[attr-defined]
+                if enabled_after is None:
+                    button.enable()  # type: ignore[attr-defined]
+                else:
+                    button.set_enabled(bool(enabled_after()))  # type: ignore[attr-defined]
 
     def update_next_state() -> None:
         """Enable Next only when both connections are verified; else lock it."""
@@ -1631,8 +1643,10 @@ def build_connect_page(
 
                 show_ai_status("Verifying AI access...", "neutral")
                 # The credentials the check runs with, captured beside ``config`` so the
-                # result can be matched to both once it arrives (see below).
+                # result can be matched to both once it arrives (see below) -- by value,
+                # with the same key the AI panel matches a reply's outcome to (G20).
                 profile = state.aws_profile
+                sent_with = ai_settings_key(state)
                 # verify_access is non-blocking (never raises); run it off the
                 # event loop like the connection tests.
                 result = await run.io_bound(verify_runner, config, profile)
@@ -1653,7 +1667,7 @@ def build_connect_page(
                 # was never checked -- so it is dropped: no toast, no fallback adoption, no
                 # verdict. A change that was undone (A -> B -> A) compares equal and keeps
                 # the result.
-                if state.ai_assist != config or state.aws_profile != profile:
+                if ai_settings_key(state) != sent_with:
                     if ai_availability(state) == AI_UNVERIFIED:
                         show_ai_status(
                             "AI settings changed during the check. Click Verify AI "
@@ -1724,9 +1738,24 @@ def build_connect_page(
                 inline_hint(
                     ui, "Settings are saved automatically.", tone="neutral"
                 )
-            ai_verify_button.on_click(
-                lambda: run_busy(ai_verify_button, on_verify_ai_access)
-            )
+            # Whether a Verify AI access check is running: the switch can flip while it
+            # does, and the button must then stay disabled until the check ends and
+            # follow the switch after it (G20) -- run_busy's restore alone re-enabled it
+            # with AI Assist switched off.
+            verify_running = {"on": False}
+
+            async def on_verify_click() -> None:
+                verify_running["on"] = True
+                try:
+                    await run_busy(
+                        ai_verify_button,
+                        on_verify_ai_access,
+                        enabled_after=lambda: bool(ai_enabled.value),
+                    )
+                finally:
+                    verify_running["on"] = False
+
+            ai_verify_button.on_click(on_verify_click)
 
             # AI Assist is the single gate: with it OFF the app never calls Bedrock,
             # so the model/region settings and the access preflight are meaningless.
@@ -1737,7 +1766,7 @@ def build_connect_page(
                 on = bool(ai_enabled.value)
                 ai_model.set_enabled(on)
                 ai_region.set_enabled(on)
-                ai_verify_button.set_enabled(on)
+                ai_verify_button.set_enabled(on and not verify_running["on"])
 
             sync_ai_controls()
             ai_enabled.on_value_change(sync_ai_controls)

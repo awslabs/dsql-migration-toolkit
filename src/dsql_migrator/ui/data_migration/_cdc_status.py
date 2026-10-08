@@ -1026,13 +1026,31 @@ def cdc_deployed_watermark_gtids(
     Watermark* forward) it tells the MySQL GTID start check whether the stack was started
     from a point WITH a GTID set: one offered a binlog position and no set streamed by
     file:position (or was started by an earlier version), so on a ``gtid_mode=ON`` source
-    its committed offset holds no GTID set to continue from.
+    its committed offset holds no GTID set to continue from. It decides a resume only for a
+    stack without a ``gtid_mode`` record (:func:`cdc_deployed_gtid_mode`, G20): a stack
+    started by version 0.1.566 or earlier, or whose starts could not read the mode.
     """
     from dsql_migrator.core.cdc_coords import normalize_gtid_set
 
     if cdc_deployed_watermark(parameters) is None:
         return None
     return normalize_gtid_set(str((parameters or {}).get("WatermarkGtids", "") or ""))
+
+
+def cdc_deployed_gtid_mode(parameters: "Optional[Mapping[str, str]]") -> Optional[str]:
+    """The source ``gtid_mode`` the stack's last MySQL Start positioned under, or None. Pure.
+
+    ``StartGtidMode`` (G20): written by Start CDC from the mode its GTID start check read,
+    carried forward by Stop (UsePreviousValue), independent of Watermark* (which a Start
+    with no start point blanks). Stripped, upper-cased and capped at 32 characters; ``None``
+    when absent or blank -- a stack created by version 0.1.566 or earlier, one never
+    started, or one whose starts could not read the mode. The GTID start check treats any
+    value other than exactly ``ON`` as "not ON" (fail closed), never as ON.
+    """
+    from dsql_migrator.core.cdc import CDC_START_GTID_MODE_PARAM
+
+    value = str((parameters or {}).get(CDC_START_GTID_MODE_PARAM, "") or "")
+    return value.strip().upper()[:32] or None
 
 
 def cdc_live_snapshot_mode(parameters: "Optional[Mapping[str, str]]") -> Optional[str]:
@@ -1171,6 +1189,11 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         cdc_deployed_watermark(getattr(discovery, "current_parameters", None)),
         gtids=cdc_deployed_watermark_gtids(getattr(discovery, "current_parameters", None)),
     )
+    # ...and the gtid_mode its last MySQL Start positioned under (StartGtidMode, G20), from
+    # the SAME describe -- kept apart from Watermark*, which a seedless Start blanks.
+    _set_gtid_mode = getattr(migration_state, "set_cdc_deployed_gtid_mode", None)
+    if callable(_set_gtid_mode):
+        _set_gtid_mode(cdc_deployed_gtid_mode(getattr(discovery, "current_parameters", None)))
     # The live SnapshotMode while connectors exist (MySQL), from the SAME describe: a
     # Start on such a stack keeps it (core.cdc.mysql_snapshot_mode).
     _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)

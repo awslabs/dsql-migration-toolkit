@@ -683,6 +683,19 @@ Parameters:
     Default: ""
     Description: Full Load watermark snapshot timestamp (unix seconds, as a string).
 
+  # The source's gtid_mode when Start CDC last created the MySQL source connector (G20).
+  # Written by Start CDC (the @@GLOBAL.gtid_mode its GTID check read just before), kept
+  # by Stop CDC (UsePreviousValue), and read by the next Start's GTID check: Debezium
+  # advances the GTID set in its offset only while gtid_mode is exactly ON, so a stack
+  # last started under another mode cannot continue by GTID. Not a seeder input; no
+  # resource references it. Empty: not recorded.
+  StartGtidMode:
+    Type: String
+    Default: ""
+    Description: >
+      MySQL source gtid_mode (ON / OFF / OFF_PERMISSIVE / ON_PERMISSIVE) when Start CDC
+      last created the source connector. Written by Start CDC; empty when not recorded.
+
 Conditions:
   UseSourceDbSecurityGroup:
     Fn::Not:
@@ -1953,10 +1966,13 @@ Resources:
         # NOT in the GTID set of its offset and ignores the offset's binlog
         # file:position. That set is the start point's: Start CDC seeds it through
         # WatermarkGtids and refuses a start point without one on a gtid_mode=ON
-        # source. On a restart it is the set Debezium committed. A
-        # gtid.source.includes/excludes filter is applied to that set first; the
-        # catch-all excludes ".*" this template carried until G19 emptied it, so MySQL
-        # streamed its whole retained binary log on every Start and connector restart.
+        # source. On a restart it is the set Debezium committed. Start CDC records the
+        # gtid_mode each start positions under (StartGtidMode) and refuses a gtid_mode=ON
+        # start of a stack last started under another mode: its GTID set stopped
+        # advancing then. A gtid.source.includes/excludes filter is applied to that set
+        # first; the catch-all excludes ".*" this template carried until G19 emptied it,
+        # so MySQL streamed its whole retained binary log on every Start and connector
+        # restart.
         # With gtid_mode OFF, OFF_PERMISSIVE or ON_PERMISSIVE Debezium positions by the
         # offset's binlog file:position, so no GTID key is needed there either
         # (gtid.source.filter.dml.events does nothing without a filter).
@@ -2265,9 +2281,10 @@ Resources:
   # --- Custom DSQL sink connector ---------------------------------------------
   # Configuration mirrors CdcPipelineOrchestrator.build_sink_config: one topic
   # per selected table, PK keying (record_key), idempotent upsert + delete, and
-  # a DLQ for poison messages (Req 12.3-12.6). Statement-level OCC (40001) retry,
-  # IAM token refresh, and the <=3,000-row batch live in the connector plugin
-  # itself (Task 23.2), not in this config.
+  # a DLQ for poison messages (Req 12.3-12.6). OCC (40001) retry of a whole chunk
+  # transaction (or of one row's in the record-by-record fallback), IAM token
+  # refresh, and the <=3,000-row batch live in the connector plugin itself
+  # (Task 23.2), not in this config.
   # Gated on DeploySinkConnector: deploy the source first (DeploySink=false) so it
   # creates the per-table data topic, then deploy the sink (DeploySink=true) so it
   # subscribes to an existing topic. Starting the sink before the topic exists

@@ -10,16 +10,18 @@
 
 ## Why a custom connector (and why Java)
 
-The standard managed JDBC sink retries OCC (`SQLSTATE 40001`) at **batch**
-granularity, which collapses throughput under high-contention large-scale CDC:
-a single `40001` replays the whole batch, so a wide key range keeps colliding and
-throughput degrades toward a livelock. This connector applies Debezium change
-events to Aurora DSQL while handling DSQL's constraints directly:
+A stock managed JDBC sink cannot authenticate with DSQL's short-lived IAM tokens
+and has no DSQL-specific handling of OCC conflicts (`SQLSTATE 40001`) or of a row
+DSQL rejects (this connector sends it to the DLQ while the rest of its chunk still
+lands). This connector applies Debezium change events to Aurora DSQL while
+handling DSQL's constraints directly:
 
 - **IAM short-lived tokens (~15 min)** — auto-refresh + reconnect before the
   1-hour connection timeout (`DsqlIamTokenProvider`).
-- **OCC `40001`** — **statement-level** retry with backoff + jitter
-  (`OccRetry`), mirroring the Python `core/occ.py` policy.
+- **OCC `40001`** — the conflicting **transaction** (one chunk of ≤3,000
+  changes, or one row in the record-by-record fallback) is re-run with
+  exponential backoff + full jitter (`OccRetry`), mirroring the Python
+  `core/occ.py` policy.
 - **≤ 3,000 rows / transaction** — small idempotent batches (`Batches` +
   `DsqlSinkTask`).
 - **PK-keyed idempotent upsert/delete** — `INSERT ... ON CONFLICT (pk) DO
@@ -55,7 +57,7 @@ errors — it does **not** run this connector in-process. This connector is the
 | `DsqlDialect.java` | Pure DSQL SQL builders: identifier quoting, `INSERT ... ON CONFLICT` upsert, `DELETE` |
 | `Batches.java` | Partitions events into ≤`batch.size` chunks (rows weighted: a move counts 2) |
 | `SourceKeyIndex.java` | Per-task cache of whether a re-keyed table's unique index on its source key is valid (one `pg_index` read per table; 10 min when valid, 60 s otherwise), so a delete is keyed on the source key only when that is a single-row lookup |
-| `OccRetry.java` | Statement-level `40001` retry with backoff + jitter (mirrors `core/occ.py`); injectable sleeper/jitter for tests |
+| `OccRetry.java` | Re-runs a `40001`-conflicted transaction (a chunk, or one row) with backoff + jitter (mirrors `core/occ.py`); injectable sleeper/jitter for tests |
 | `DsqlIamTokenProvider.java` | DSQL IAM token cache + refresh policy (mirrors `core/target_connection.py`); injectable token source + clock for tests |
 | `AwsDsqlTokenSource.java` | The only class touching the AWS SDK: `DsqlUtilities` admin/non-admin token generation |
 | `src/test/java/...` | JUnit 5 tests: dialect SQL, OCC retry, batch partition, Debezium parse, token refresh |

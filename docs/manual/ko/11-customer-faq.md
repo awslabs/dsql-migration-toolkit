@@ -179,12 +179,15 @@ MySQL은 기본적으로 약 24시간만 보관). RDS/Aurora에서는 이 설정
 재시작)이 **필수**이고, **복제 권한을 가진 사용자**(superuser, `REPLICATION` 역할 속성, 또는 RDS/Aurora의
 `rds_replication` 멤버십, 그리고 마이그레이션 대상 테이블에 대한 `SELECT`)가 **필수**이며, 소스는
 standby/reader가 아니라 클러스터의 **writer**여야(`pg_is_in_recovery()=false`) 하고 이 역시 **필수**이며,
-복제되는 모든 테이블에는 쓸 수 있는 **`REPLICA IDENTITY`**(PK가 있으면 기본값 제공, 없으면 `ALTER TABLE …
-REPLICA IDENTITY FULL` — `REPLICA IDENTITY NOTHING`이면 publisher에서 UPDATE/DELETE가 오류)가
-**필수**입니다. 복제 슬롯 / `max_wal_senders`(walsender) 여유는 **경고**(비차단)입니다. PostgreSQL에는
-**binlog 보존 개념이 없습니다** — 도구가 publication(정확히 마이그레이션 대상 테이블 대상)과 `pgoutput`
-논리 슬롯을 자동 생성하고, WAL은 슬롯에 의해 고정됩니다(비활성·미소비 슬롯이 소스 디스크를 채울 수
-있으니 `wal_status`를 지켜보세요).
+복제되는 모든 테이블에는 쓸 수 있는 **`REPLICA IDENTITY`**(`DEFAULT`에는 `DEFERRABLE`이 아닌 유효한 기본
+키가 필요 — PostgreSQL은 키가 삭제된 뒤에도 `DEFAULT`를 유지하므로 검사는 소스의 카탈로그를 읽음 — `USING
+INDEX`에는 유효한 고유 인덱스, `FULL`은 항상 동작; 파티션된 테이블은 모든 파티션에 필요. 없으면
+publication에 들어간 뒤 그 테이블의 모든 UPDATE/DELETE가 소스에서 실패하므로 CDC 사전 요구사항 검사가
+실패로 판정하고, Full Load는 소스에서 아무것도 바꾸기 전에 멈춤)가 **필수**입니다. 복제 슬롯 /
+`max_wal_senders`(walsender) 여유는 **경고**(비차단)입니다. PostgreSQL에는 **binlog 보존 개념이
+없습니다** — 도구가 publication(정확히 마이그레이션 대상 테이블 대상)과 `pgoutput` 논리 슬롯을 자동
+생성하고, WAL은 슬롯에 의해 고정됩니다(비활성·미소비 슬롯이 소스 디스크를 채울 수 있으니 `wal_status`를
+지켜보세요).
 
 [§1.1](01-setup.md#11-사전-요구사항)과 [6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)를
 참조하세요.

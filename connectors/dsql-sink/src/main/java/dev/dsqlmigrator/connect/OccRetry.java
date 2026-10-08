@@ -13,15 +13,20 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.LongUnaryOperator;
 
 /**
- * Statement-level OCC retry for DSQL serialization failures (SQLSTATE 40001).
+ * OCC retry of a whole transaction on DSQL serialization failures (SQLSTATE 40001).
  *
  * <p>Mirrors the Python {@code core/occ.py} policy: a unit of work that raises
  * {@code 40001} is retried up to {@code maxAttempts} with exponential backoff +
  * full jitter (capped); any other SQL error propagates immediately, and once
  * the attempt budget is exhausted the last {@code 40001} is re-raised. Because
- * the connector applies idempotent PK-keyed upsert/delete, retrying a
- * conflicted statement is safe (Property 5 analog). Spike H2 measures
- * throughput under contention.
+ * the connector applies idempotent PK-keyed upsert/delete, re-running a
+ * conflicted transaction (the sink's whole chunk, or one row's) is safe
+ * (Property 5 analog). Spike H2 measures throughput under contention.
+ *
+ * <p>No rollback runs between attempts: this relies on DSQL reporting the
+ * conflict at COMMIT, which has already ended the transaction. A 40001 raised
+ * before COMMIT would leave the transaction aborted, so the next attempt fails
+ * with 25P02, which is not retried.
  *
  * <p>The sleeper and jitter source are injectable (package-private overload) so
  * the retry policy is unit-tested instantly and deterministically without real

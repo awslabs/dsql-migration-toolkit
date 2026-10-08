@@ -156,16 +156,21 @@ what's missing, but setting them up is a source-side task you do once.
   survives a failover to a replica whose binary log files differ. With `OFF`,
   `OFF_PERMISSIVE` or `ON_PERMISSIVE` it uses the binlog `file:position`, which works the
   same on one source. Keep the mode unchanged from the Full Load to cut over: a start
-  point recorded while `gtid_mode` was not `ON` cannot start CDC once it is `ON`
-  ([Chapter 6](06-limitations.md)). The gate reports a missing GTID as informational,
-  never as a blocker. (PostgreSQL has no GTID / `file:position` concept.)
+  point recorded while `gtid_mode` was not `ON` — or a CDC stack that last started while
+  it was not `ON` — cannot start CDC once it is `ON` ([Chapter 6](06-limitations.md)).
+  The gate reports a missing GTID as informational, never as a blocker. (PostgreSQL has
+  no GTID / `file:position` concept.)
 - **PostgreSQL source — CDC must run against the cluster writer.** The source must
   be the **writer, not a standby** (`pg_is_in_recovery()` must be false) — a standby
   can't host a replication slot, so point CDC at the writer endpoint.
-- **PostgreSQL source — every replicated table needs a usable REPLICA IDENTITY.** A
-  primary key gives the default; otherwise set `ALTER TABLE … REPLICA IDENTITY FULL`
-  (FULL or an index identity also work). A table left at `REPLICA IDENTITY NOTHING`
-  makes UPDATE/DELETE error on the publisher, so it is refused. Replication-slot /
+- **PostgreSQL source — every replicated table needs a usable REPLICA IDENTITY.**
+  `DEFAULT` needs a valid primary key that is not `DEFERRABLE` (PostgreSQL keeps
+  `DEFAULT` after the key is dropped, so the check reads the source's catalog),
+  `USING INDEX` a valid unique index, and `FULL` always works
+  (`ALTER TABLE … REPLICA IDENTITY FULL`); on a partitioned table every partition needs
+  one. Without one, every UPDATE/DELETE on the table would fail on the source once it is
+  published, so the CDC prerequisite check fails it, and the Full Load stops before it
+  changes anything on the source (no publication, no slot). Replication-slot /
   `max_wal_senders` (walsender) **headroom** is checked as a non-blocking **WARN** (a
   full walsender pool blocks a new slot even when slot entries are free).
 

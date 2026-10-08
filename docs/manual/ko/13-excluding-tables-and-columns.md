@@ -577,7 +577,7 @@ Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작�
 - **체크를 해제한 테이블에서만 생긴 실패는 더 이상 단계를 붙잡지 않습니다.** 단계는 Done으로 표시되고, Continue to CDC가 열리며, PostgreSQL에서는 CDC가 여전히 로드 때 만든 슬롯에서 재개합니다. Retry unfinished tables는 체크를 해제한 테이블을 다시 로드하지 않습니다.
 - **기다려야 할 때는 기다림으로 안내하며, Start over를 요구하지 않습니다:** Full Load, 외래 키 적용, 컷오버 DEFAULT 복원이 실행되는 동안, CDC 인프라를 생성하거나 삭제하는 동안, 실패한 생성이 계정에 남아 있는 동안(CDC 단계에서 삭제하세요), 그리고 페이지를 연 뒤 CDC 상태를 읽는 몇 초 동안입니다. CDC 상태를 읽을 수 없으면 CDC 단계가 그 이유를 보여 줍니다: AWS 접근을 고친 뒤 **Re-check CDC state**를 사용하세요.
 - **Unselect all은 허용됩니다**. 다만 Deploy CDC infrastructure와 Start CDC에는 선택된 테이블이 하나 이상 필요합니다.
-- **현재 집합으로 Re-run Full Load를 실행하면** 선택된 모든 테이블에 대한 새 워터마크를 잡습니다. PostgreSQL에서는 기존 publication을 재사용하고, 거기에 없는 선택된 테이블을 추가합니다(위와 같이 사용할 수 있는 `REPLICA IDENTITY`가 있을 때만: 그렇지 않으면 실행은 어떤 테이블도 로드하기 전에 멈추고 어느 테이블인지 알려 줍니다).
+- **현재 집합으로 Re-run Full Load를 실행하면** 선택된 모든 테이블에 대한 새 워터마크를 잡습니다. PostgreSQL에서는 기존 publication을 재사용하고, 거기에 없는 선택된 테이블을 추가합니다(위와 같이 사용할 수 있는 `REPLICA IDENTITY`가 있을 때만: 그렇지 않으면 실행은 소스에서 아무것도 바꾸기 전에 멈추고 어느 테이블인지 알려 줍니다).
 - **PostgreSQL에서 CDC가 Full Load의 슬롯에서 재개하면, publication에 체크를 해제한 테이블이 계속 남아 있습니다**(도구는 소스에서 그 테이블을 빼지 않습니다). 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start(캡처 대상 테이블의 로드가 끝나지 않았거나, **Re-snapshot every table instead**를 고르거나, CDC 인프라를 삭제한 뒤의 Start)에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다.
 - **외래 키.** 선택된 테이블은 체크를 해제한 테이블을 가리키는 외래 키를 유지합니다: Cut over에서 orphan 점검이, 부모 행이 복제되지 않은 키를 보고합니다.
 - **CDC를 한 번 시작하면, 그 뒤 멈췄더라도 집합은 다시 고정됩니다.**

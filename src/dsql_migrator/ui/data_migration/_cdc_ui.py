@@ -31,6 +31,7 @@ from datetime import (
 from typing import (
     Callable,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
 )
@@ -4962,24 +4963,50 @@ def _probe_cdc_start_point(migration_state, session, *, seed, mode, facts, table
     return read_cdc_start_point_once(session, names, recorded)
 
 
-def _stack_start_record(migration_state, stack_params):
-    """``((file, pos) or None, gtids or None)``: the start offset the stack's last Start
-    offered (its Watermark* parameters, carried forward by Stop), from ``stack_params`` (a
-    fresh describe on the worker) or else the phase probe's cache. ``gtids`` is ``""`` for
-    an offer with no GTID set and ``None`` when nothing is recorded or known. Pure."""
+class StackStartRecord(NamedTuple):
+    """What a stack records about its last Start (see :func:`_stack_start_record`)."""
+
+    point: Optional[tuple]
+    gtids: Optional[str]
+    gtid_mode: Optional[str]
+    committed: Optional[bool]
+
+
+def _stack_start_record(migration_state, stack_params) -> StackStartRecord:
+    """What the stack records about its last Start, from ``stack_params`` (a fresh describe
+    on the worker) or else the phase probe's cache. Pure.
+
+    ``point`` / ``gtids``: the start offset that Start offered (its Watermark* parameters,
+    carried forward by Stop) -- ``(file, pos)`` or ``None``; ``gtids`` is ``""`` for an offer
+    with no GTID set and ``None`` when nothing is recorded or known. ``gtid_mode``: the
+    source gtid_mode its last MySQL Start positioned under (StartGtidMode, G20), ``None``
+    for no record. ``committed``: the stack has streamed before (a committed offset), or
+    ``None`` when there is neither a state nor a describe to say.
+    """
     if stack_params is not None:
         from dsql_migrator.ui.data_migration._cdc_status import (
+            cdc_deployed_gtid_mode,
             cdc_deployed_watermark,
             cdc_deployed_watermark_gtids,
+            cdc_has_committed_offset,
         )
 
-        return (
+        return StackStartRecord(
             cdc_deployed_watermark(stack_params),
             cdc_deployed_watermark_gtids(stack_params),
+            cdc_deployed_gtid_mode(stack_params),
+            cdc_has_committed_offset(stack_params),
         )
+    if migration_state is None:
+        return StackStartRecord(None, None, None, None)
     deployed = getattr(migration_state, "cdc_deployed_watermark", None)
     gtids = getattr(migration_state, "cdc_deployed_watermark_gtids", None)
-    return (tuple(deployed) if deployed else None), (gtids if deployed else None)
+    return StackStartRecord(
+        tuple(deployed) if deployed else None,
+        gtids if deployed else None,
+        getattr(migration_state, "cdc_deployed_gtid_mode", None) or None,
+        bool(getattr(migration_state, "cdc_has_committed_offset", False)),
+    )
 
 
 def _seed_is_point(seed, point) -> bool:
@@ -5006,11 +5033,13 @@ def _probe_cdc_gtid_start(
     whose GTID set Debezium will position by, whether the source can stream from that set
     (:func:`~dsql_migrator.ui.data_migration._cdc_status.read_source_gtid_state_once`,
     which never raises) -- judged by
-    :func:`~dsql_migrator.ui.cdc_gtid_gate.mysql_gtid_start_verdict`, with the stack's own
-    record of its last start offset (``stack_params``: the worker's fresh describe; else
-    the phase probe's cache) for a resume. ``origin`` is the seed's
-    (:func:`_cdc_start_seed`): a ``"manual"`` GTID set that is not a GTID set is refused
-    without reading anything.
+    :func:`~dsql_migrator.ui.cdc_gtid_gate.mysql_gtid_start_verdict`, with what the stack
+    records about its last Start (:func:`_stack_start_record`; ``stack_params``: the
+    worker's fresh describe, else the phase probe's cache): the gtid_mode it positioned
+    under (G20), the start offset it was offered, and whether it ever streamed -- a stack
+    that never did is on its first start, which must read the mode to record it.
+    ``origin`` is the seed's (:func:`_cdc_start_seed`): a ``"manual"`` GTID set that is not
+    a GTID set is refused without reading anything.
     """
     if _cdc_source_type(session) is SourceType.POSTGRES:
         return None
@@ -5041,7 +5070,11 @@ def _probe_cdc_gtid_start(
             None, seed_gtids=seed_gtids, seed_gtid_mode=captured, seedable=seedable,
             resumes=resumes, seed_set_malformed=True,
         )
-    stack_point, stack_gtids = _stack_start_record(migration_state, stack_params)
+    record = _stack_start_record(migration_state, stack_params)
+    stack_point = record.point
+    # G20: a stack that never streamed is on its first start (its gtid_mode record must be
+    # written by a start that read the mode); unknown (no state, no describe) is not.
+    first_start = record.committed is False and not resumes
     # The set is checked against the source only for a seeded start that will position by
     # it: a resume continues from what Debezium committed, and a point recorded while the
     # mode was not ON is refused whatever the set says.
@@ -5062,11 +5095,13 @@ def _probe_cdc_gtid_start(
         seed_gtid_mode=captured,
         seedable=seedable,
         resumes=resumes,
-        stack_gtids=stack_gtids,
+        stack_gtids=record.gtids,
         stack_point=(
             f"binlog {stack_point[0]}:{stack_point[1]}" if stack_point else None
         ),
         seed_is_stack_point=_seed_is_point(seed, stack_point),
+        stack_gtid_mode=record.gtid_mode,
+        first_start=first_start,
     )
 
 
@@ -6786,14 +6821,17 @@ def _start_cdc_deploy(
     )
     _is_pg_start = _cdc_source_type(session) is SourceType.POSTGRES
 
-    def _check_mysql_start_on_worker(pre, pre_params) -> None:
+    def _check_mysql_start_on_worker(pre, pre_params) -> Optional[str]:
         """MySQL, on the worker thread before anything changes: the snapshot mode decided
         on the loop must still be right for the stack as it is NOW, the start point must
         be one a gtid_mode=ON source can start from (the GTID start check), and a
         recovery start must pass the start-point check (Retry CDC skips the dialog; a
         dialog verdict can be stale). Raises RuntimeError to refuse; nothing has been
-        changed yet."""
+        changed yet. Returns the gtid_mode this Start records on the stack (G20:
+        :func:`~dsql_migrator.ui.cdc_gtid_gate.gtid_mode_to_record`), or None when the
+        check did not run or could not read the mode."""
         from dsql_migrator.ui.cdc_gtid_gate import (
+            gtid_mode_to_record,
             gtid_notice_point,
             gtid_start_activity,
             gtid_start_notice,
@@ -6805,6 +6843,7 @@ def _start_cdc_deploy(
             start_point_notice,
         )
         from dsql_migrator.ui.data_migration._cdc_status import (
+            cdc_deployed_gtid_mode,
             cdc_deployed_watermark,
             cdc_deployed_watermark_gtids,
             cdc_has_committed_offset,
@@ -6828,6 +6867,9 @@ def _start_cdc_deploy(
                     cdc_deployed_watermark(pre_params),
                     gtids=cdc_deployed_watermark_gtids(pre_params),
                 )
+                _set_gtid_mode = getattr(migration_state, "set_cdc_deployed_gtid_mode", None)
+                if callable(_set_gtid_mode):
+                    _set_gtid_mode(cdc_deployed_gtid_mode(pre_params))
                 _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
                 if callable(_set_mode):
                     _set_mode(cdc_live_snapshot_mode(pre_params))
@@ -6852,6 +6894,8 @@ def _start_cdc_deploy(
             migration_state, session, seed=seed, facts=facts, origin=seed_origin,
             stack_params=pre_params if pre is not None else None,
         )
+        # G20: the mode a passing check read is what this Start records on the stack.
+        _gtid_record = gtid_mode_to_record(_gtid_verdict)
         if _gtid_verdict is not None:
             _gtid_label, _coord = gtid_notice_point(
                 _gtid_verdict, seed=seed, origin=seed_origin
@@ -6891,7 +6935,7 @@ def _start_cdc_deploy(
             tables=tables_for_config,
         )
         if verdict is None:
-            return
+            return _gtid_record
         _label = point_label(seed, seed_origin)
         _activity = start_point_activity(verdict, point_label=_label)
         if verdict.blocks:
@@ -6908,6 +6952,7 @@ def _start_cdc_deploy(
             )
         if _activity is not None:
             _log_cdc_event(_activity[0], status=_activity[1], detail=_activity[2])
+        return _gtid_record
 
     def work(handle) -> None:
         try:
@@ -6986,8 +7031,12 @@ def _start_cdc_deploy(
                 detail=_seen_refusal,
             )
             raise RuntimeError(f"Start CDC blocked: {_seen_refusal}")
+        # MySQL: the gtid_mode the GTID start check read (G20), recorded on the stack by the
+        # pass that creates the connectors; None when the check did not run or could not
+        # read it (the stack then keeps its record).
+        _start_gtid_mode: Optional[str] = None
         if not _is_pg_start:
-            _check_mysql_start_on_worker(_pre, _pre_params)
+            _start_gtid_mode = _check_mysql_start_on_worker(_pre, _pre_params)
         # The column-exclusion overlay: every captured excluded column nullable with no
         # DEFAULT (recorded first) BEFORE any connector is created or changed, so every row
         # CDC writes holds NULL there. Covers Retry CDC and a re-Start after Stop; a no-op
@@ -7031,6 +7080,8 @@ def _start_cdc_deploy(
             _log_kwargs["log_tail"] = build_msk_connect_controller(
                 region, aws_profile=aws_profile
             ).connector_log_tail
+            # G20: MySQL only, like log_tail -- a PostgreSQL Start's call is unchanged.
+            _log_kwargs["start_gtid_mode"] = _start_gtid_mode
         try:
             run_cdc_start(
                 handle,
@@ -7084,6 +7135,11 @@ def _start_cdc_deploy(
             _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
             if callable(_set_mode):
                 _set_mode(_sent_snapshot_mode)
+            # ...and the gtid_mode this Start recorded on the stack (G20).
+            if _start_gtid_mode:
+                _set_gtid_mode = getattr(migration_state, "set_cdc_deployed_gtid_mode", None)
+                if callable(_set_gtid_mode):
+                    _set_gtid_mode(_start_gtid_mode)
             _note = getattr(migration_state, "note_cdc_history_missing", None)
             if callable(_note):
                 _note(False)

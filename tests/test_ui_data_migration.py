@@ -714,8 +714,9 @@ def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) ->
     class _WriteConn:
         """Records slot/publication writes; returns a canned consistent-point LSN."""
 
-        def __init__(self):
+        def __init__(self, usable=True):
             self.statements = []
+            self.usable = usable
 
         def __enter__(self):  # noqa: ANN204
             return self
@@ -727,6 +728,14 @@ def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) ->
             sql = str(statement)
             self.statements.append(sql)
             up = " ".join(sql.upper().split())
+            # G20 (DELIBERATE fake update): provisioning grades every table it publishes
+            # with the strict, fail-closed identity read BEFORE any write -- a plain table,
+            # REPLICA IDENTITY DEFAULT with a valid primary key, unless told otherwise.
+            if "AS IDENTITY_USABLE" in up:
+                return _Result([
+                    (n, "r", "d", self.usable, 0, [])
+                    for n in (params or {}).get("names", [])
+                ])
             if "FROM PG_CLASS" in up:  # replica-identity guard: usable ('d')
                 return _Result([(n, "d") for n in (params or {}).get("names", [])])
             if "FROM PG_PUBLICATION" in up or "FROM PG_REPLICATION_SLOTS" in up:
@@ -798,6 +807,33 @@ def test_capture_watermark_creates_slot_for_postgres_cdc_handoff(monkeypatch) ->
     assert "CREATE PUBLICATION" in writes and "FOR ALL TABLES" not in writes
     assert "PG_CREATE_LOGICAL_REPLICATION_SLOT" in writes
     assert write_engine.disposed is True  # write engine disposed (no leak)
+
+    # G20: a table whose UPDATE/DELETE publishing would break on the source (DEFAULT with
+    # no valid primary key) refuses the capture BEFORE any write -- no ALTER TABLE, no
+    # publication, no slot left on the customer's source.
+    refused_conn = _WriteConn(usable=False)
+
+    class _RefusedEngine:
+        def connect(self):  # noqa: ANN201
+            return refused_conn
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    refused_engine = _RefusedEngine()
+    monkeypatch.setattr(
+        cdc_pg_slot, "build_pg_source_write_engine", lambda src, pw: refused_engine
+    )
+    with pytest.raises(cdc_pg_slot.PgReplicaIdentityError) as refused:
+        migrator.capture_watermark([TableDef(name="orders", primary_key=["id"])])
+    assert str(refused.value).startswith(
+        "orders: REPLICA IDENTITY DEFAULT, but no valid primary key. Published for CDC"
+    )
+    ups = [" ".join(sql.upper().split()) for sql in refused_conn.statements]
+    assert not any(u.startswith(("CREATE PUBLICATION", "ALTER TABLE", "ALTER PUBLICATION"))
+                   for u in ups)
+    assert not any("PG_CREATE_LOGICAL_REPLICATION_SLOT" in u for u in ups)
+    assert refused_engine.disposed is True
 
 
 def test_batched_table_migrator_streams_then_loads() -> None:
@@ -34194,10 +34230,24 @@ def test_g19_an_unreadable_mode_refuses_only_a_start_point_without_a_gtid_set(
     assert msg.startswith(f"Start CDC blocked: {G3_HEADER}. ")
     assert "this session has no source connection" in msg
     assert "Test the source connection on the Connect step" in msg
-    # A start point WITH a GTID set proceeds: Debezium uses whichever the mode requires.
+    # DELIBERATE G20 UPDATE: a stack's FIRST start (it never streamed) with a GTID-set
+    # start point and an unread mode is now refused too -- the start must record the mode
+    # it positions under on the stack, or a later start could not tell (G19 let it through:
+    # "Debezium uses whichever the mode requires").
+    first = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=_job_wm(), gtid_state=None, catch=True,
+    )
+    msg = str(first["error"])
+    assert msg.startswith(f"Start CDC blocked: {G3_HEADER}. ")
+    assert "records it on the stack" in msg and "this session has no source connection" in msg
+    assert first["kwargs"] == {}
+    # A stack that streamed before and holds no gtid_mode record (an older version started
+    # it): proceeds as before, Debezium using whichever the mode requires, recording nothing.
     run = _run_start_cdc_capture(
         monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
-        job_watermark=_job_wm(), gtid_state=None,
+        job_watermark=_job_wm(), gtid_state=None, committed=True,
+        describe_params={"DeploySink": "true", "MskBootstrapServers": ""},
     )
     assert run["submitted"] and run["kwargs"]
     detail = _g19_events(run, ACTION_POSITION)[0]["detail"]
@@ -34206,6 +34256,7 @@ def test_g19_an_unreadable_mode_refuses_only_a_start_point_without_a_gtid_set(
     )
     assert "binlog mysql-bin.000050:999" in detail
     assert "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5" in detail
+    assert run["kwargs"]["start_gtid_mode"] is None
 
 
 def test_g19_a_stack_whose_connectors_exist_is_not_checked(monkeypatch) -> None:
@@ -34502,3 +34553,130 @@ def test_g19_a_malformed_manual_gtid_set_is_refused_before_anything_is_read(
     assert _g19_events(run, ACTION_BLOCKED)[0]["detail"] == (
         f"{MALFORMED_HEADER}: binlog mysql-bin.000042:1234"
     )
+
+
+# ---------------------------------------------------------------------------
+# G20: every MySQL Start records the gtid_mode it positions under on the stack
+# (StartGtidMode), and the GTID start check reads that record on every later Start
+# ---------------------------------------------------------------------------
+
+_G20_STOPPED_SEEDLESS = {
+    "DeploySink": "true", "MskBootstrapServers": "",
+    "WatermarkBinlogFile": "", "WatermarkBinlogPos": "", "WatermarkGtids": "",
+    "WatermarkTsSec": "",
+}
+
+
+def test_g20_a_mysql_start_sends_the_gtid_mode_its_check_read(monkeypatch) -> None:
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual", manual_binlog=_MANUAL,
+    )
+    assert run["submitted"] and run["kwargs"]["start_gtid_mode"] == "OFF"
+    # ...and cached after the Start, as the next phase probe reads it from the stack.
+    assert run["state"].cdc_deployed_gtid_mode == "OFF"
+    on = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, manual_gtid=_G19_SET,
+        gtid_state=_g19_state(mode="ON", within_executed=True, covers_purged=True),
+    )
+    assert on["kwargs"]["start_gtid_mode"] == "ON"
+    assert on["state"].cdc_deployed_gtid_mode == "ON"
+
+
+def test_g20_a_start_that_did_not_check_the_mode_records_nothing(monkeypatch) -> None:
+    # Connectors exist (Retry CDC, a live re-Start): the check is not due, nothing is sent,
+    # and the stack keeps its record.
+    live = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="manual",
+        manual_binlog=_MANUAL, live_mode="recovery", gtid_state="ON",
+    )
+    assert live["submitted"] and live["kwargs"]["start_gtid_mode"] is None
+    assert live["state"].cdc_deployed_gtid_mode is None
+    # A resume of a stack that streamed before with no record, and the mode unread: as
+    # before (G19), and nothing is recorded.
+    params = {
+        "DeploySink": "true", "MskBootstrapServers": "",
+        "WatermarkBinlogFile": "mysql-bin.000050", "WatermarkBinlogPos": "999",
+        "WatermarkGtids": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5",
+    }
+    resumed = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        job_watermark=_job_wm(), committed=True, deployed=("mysql-bin.000050", "999"),
+        describe_params=params, gtid_state=_g19_state(problem="no-source-connection"),
+        start_point_read=_g5_never,
+    )
+    assert resumed["submitted"] and resumed["kwargs"]["start_gtid_mode"] is None
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    assert _g19_events(resumed, ACTION_POSITION)[0]["detail"].startswith(
+        "The source's gtid_mode could not be read (this session has no source connection): "
+        "Debezium continues from the position it last committed."
+    )
+
+
+def test_g20_a_seedless_resume_of_a_stack_last_started_while_not_on_is_refused(
+    monkeypatch,
+) -> None:
+    # Residual (1): the stack's last Start had no start point to offer, so Watermark* are
+    # blank -- G19 saw no record and continued by GTID after a set that stopped advancing.
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_BLOCKED, G2_STACK_HEADER
+
+    run = _g5_run(
+        monkeypatch, committed=True,
+        describe_params=dict(_G20_STOPPED_SEEDLESS, StartGtidMode="ON_PERMISSIVE"),
+        start_point_read=_g5_never, gtid_state="ON",
+    )
+    msg = str(run["error"])
+    assert msg.startswith(f"Start CDC blocked: {G2_STACK_HEADER}. ")
+    assert "This CDC stack last started while the source's gtid_mode was ON_PERMISSIVE" in msg
+    assert "Delete CDC infrastructure on the CDC step, deploy it again" in msg
+    assert msg.endswith("No connectors were changed.")
+    assert run["kwargs"] == {}
+    blocked = _g19_events(run, ACTION_BLOCKED)
+    assert blocked and "(last started under gtid_mode=ON_PERMISSIVE)" in blocked[0]["detail"]
+    # The same stack on a source that is not ON: by file:position, as before.
+    ok = _g5_run(
+        monkeypatch, committed=True,
+        describe_params=dict(_G20_STOPPED_SEEDLESS, StartGtidMode="ON_PERMISSIVE"),
+        start_point_read=_g5_never, gtid_state="ON_PERMISSIVE",
+    )
+    assert ok["error"] is None and ok["kwargs"]["start_gtid_mode"] == "ON_PERMISSIVE"
+
+
+def test_g20_a_resume_of_a_stack_last_started_under_on_continues_from_any_session(
+    monkeypatch,
+) -> None:
+    # G19's false refusal: started under ON from an EMPTY GTID set; this session no longer
+    # holds that point. The record says it positioned by GTID: continue.
+    from dsql_migrator.ui.cdc_gtid_gate import ACTION_POSITION
+
+    run = _g5_run(
+        monkeypatch, committed=True, deployed=("mysql-bin.000100", "4"),
+        describe_params=dict(_G19_STOPPED_NO_SET, StartGtidMode="ON"),
+        start_point_read=_g5_never, gtid_state="ON",
+    )
+    assert run["error"] is None, run["error"]
+    assert _g19_events(run, ACTION_POSITION)[0]["detail"] == (
+        "Source gtid_mode=ON: Debezium continues after the GTID set it last committed."
+    )
+    assert run["kwargs"]["start_gtid_mode"] == "ON"
+
+
+def test_g20_the_worker_refresh_caches_the_gtid_mode_record(monkeypatch) -> None:
+    # The snapshot-mode mismatch refusal refreshes the cached facts from THIS describe --
+    # the gtid_mode record included.
+    state = DataMigrationState()
+    state.set_selection(TableSelection(selected_tables=["app.orders"]))
+    state.set_cdc_has_committed_offset(True)
+    state.set_cdc_deployed_watermark(("mysql-bin.000100", "4"))
+    state.set_cdc_deployed_gtid_mode("ON")
+    run = _g5_run(
+        monkeypatch, job_watermark=_g5_wm(), state=state,
+        describe_params={"DeploySink": "false", "MskBootstrapServers": "",
+                         "StartGtidMode": "off"},
+        start_point_read=_g5_never,
+    )
+    assert str(run["error"]).startswith(
+        "Start CDC blocked: the CDC stack changed after this page last read it"
+    )
+    assert run["state"].cdc_deployed_gtid_mode == "OFF"

@@ -203,8 +203,9 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
 - **CDC is a separate stack** (`cdc-stack`) — Amazon MSK + Debezium → a
   **custom Aurora DSQL sink connector**
   ([`connectors/dsql-sink/`](connectors/dsql-sink)) on managed MSK Connect. A stock
-  JDBC sink can't handle DSQL's short-lived IAM tokens, statement-level OCC retry,
-  and ≤3,000-row batches, so we built our own. The tool stays the control plane and
+  JDBC sink can't handle DSQL's short-lived IAM tokens, OCC conflicts (`40001`,
+  answered by re-running the conflicting transaction with jittered backoff) and
+  ≤3,000-row transactions, so we built our own. The tool stays the control plane and
   runs no sink compute of its own.
 
 > More: [CDC & DSQL constraints](docs/manual/en/04-cdc-and-dsql-constraints.md) ·

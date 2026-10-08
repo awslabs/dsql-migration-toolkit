@@ -46,6 +46,7 @@ from dsql_migrator.ui.ai_assist import (
     AI_LATCHING_REASONS,
     AI_UNAVAILABLE,
     ai_availability,
+    ai_settings_key,
     ai_unavailable_hint,
 )
 from dsql_migrator.ui.ai_chat_drawer import (
@@ -989,6 +990,10 @@ def build_ai_panel(
             _apply_composer_state()
             return
         conv["stop_requested"] = False  # clear any stale flag from a prior turn
+        # The settings this reply is sent with, BY VALUE (G20): the switch, model, region
+        # and AWS profile stay editable while it streams, so its outcome may latch -- or
+        # clear -- the session's AI verdict only if they still hold when it arrives.
+        sent_with = ai_settings_key(state)
         _set_busy(True)
         conversation.messages.append({"role": "user", "text": text})
         # Ground the streamer on the CURRENT scope only: send the turns since this
@@ -1136,7 +1141,12 @@ def build_ai_panel(
                 # missing, so every call fails the same way until it is accepted): a
                 # throttle or network blip is transient and must not disable AI for the
                 # rest of the session.
-                if getattr(outcome, "reason", None) in AI_LATCHING_REASONS:
+                # Only for the settings it was sent with (G20): a denial of a model switched
+                # away from mid-reply says nothing about the one selected now.
+                if (
+                    getattr(outcome, "reason", None) in AI_LATCHING_REASONS
+                    and ai_settings_key(state) == sent_with
+                ):
                     setter = getattr(state, "set_ai_verified", None)
                     if callable(setter):
                         setter(False, outcome.detail)
@@ -1157,8 +1167,13 @@ def build_ai_panel(
                 # denied bucket also covers ExpiredToken, which is recoverable -- or the
                 # model's agreement was accepted). Without this the "unavailable" state
                 # would be absorbing.
-                # Only CLEAR to unverified; green stays something a preflight earns.
-                if getattr(state, "ai_verified", None) is False:
+                # Only CLEAR to unverified; green stays something a preflight earns. And
+                # only for the settings it was sent with (G20): a success of the previous
+                # model must not clear a denial latched for the one selected now.
+                if (
+                    getattr(state, "ai_verified", None) is False
+                    and ai_settings_key(state) == sent_with
+                ):
                     setter = getattr(state, "set_ai_verified", None)
                     if callable(setter):
                         setter(None)

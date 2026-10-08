@@ -174,12 +174,15 @@ binlog フォーマットとレプリケーション権限が満たされるま�
 再起動）が **必須** で、**レプリケーション権限を持つユーザー**（superuser、`REPLICATION` ロール属性、または
 RDS/Aurora の `rds_replication` メンバーシップ、加えて移行対象テーブルへの `SELECT`）が **必須**、ソースは
 standby/reader ではなくクラスタの **writer** でなければならず（`pg_is_in_recovery()=false`）これも **必須**、
-そしてレプリケートされる各テーブルには使用可能な **`REPLICA IDENTITY`**（PK があればデフォルトが得られ、
-なければ `ALTER TABLE … REPLICA IDENTITY FULL`。`REPLICA IDENTITY NOTHING` は publisher で UPDATE/DELETE が
-エラーになる）が **必須** です。レプリケーションスロット / `max_wal_senders`（walsender）の余裕は **警告**
-（非ブロッキング）です。PostgreSQL には **binlog 保持期間の概念がありません** — ツールが publication（移行
-対象テーブルちょうどを対象）と `pgoutput` 論理スロットを自動作成し、WAL はスロットによってピン留めされます
-（非アクティブで未消費のスロットはソースのディスクを埋めうるので `wal_status` を監視してください）。
+そしてレプリケートされる各テーブルには使用可能な **`REPLICA IDENTITY`**（`DEFAULT` には `DEFERRABLE` でない有
+効な主キーが必要 — PostgreSQL はキーが削除された後も `DEFAULT` のままにするため、チェックはソースのカタログを
+読みます — `USING INDEX` には有効な一意インデックス、`FULL` は常に動作。パーティション化されたテーブルではすべ
+てのパーティションに必要。ない場合、publication に含まれた後はそのテーブルのすべての UPDATE/DELETE がソースで
+失敗するため、CDC の前提条件チェックが失敗と判定し、Full Load はソースで何も変更する前に停止します）が
+**必須** です。レプリケーションスロット / `max_wal_senders`（walsender）の余裕は **警告** （非ブロッキング）で
+す。PostgreSQL には **binlog 保持期間の概念がありません** — ツールが publication（移行対象テーブルちょうどを対
+象）と `pgoutput` 論理スロットを自動作成し、WAL はスロットによってピン留めされます（非アクティブで未消費のスロ
+ットはソースのディスクを埋めうるので `wal_status` を監視してください）。
 
 [§1.1](01-setup.md#11-前提条件) と [第6章 §6.2](06-limitations.md#62-移行プロセスの制限) をご覧ください。
 

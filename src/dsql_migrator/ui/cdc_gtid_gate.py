@@ -17,23 +17,38 @@ set seeded with the start point IS the start point:
 - a set this source never executed, or one the source purged binary logs after, cannot be
   streamed either (G4).
 
-A resume continues the stack's committed offset, so it is judged by the stack's OWN record
-of the start offset its last Start offered (its ``Watermark*`` parameters, which Stop
-carries forward), not by whatever start point the session holds now: a stack that was
-offered a binlog position with no GTID set streamed by file:position (or was started by an
-earlier version) and holds no GTID set to continue from (G1, resume variant).
+A resume continues the stack's committed offset, so it is judged by the stack's OWN
+records, not by whatever start point the session holds now. First by the ``gtid_mode`` its
+last Start positioned under (its ``StartGtidMode`` parameter, G20: every Start this check
+lets through writes the mode it read -- a resume with no start point included -- and Stop
+carries it forward; it is kept apart from ``Watermark*``, so the Start with no start point
+that blanks those does not erase it; a Start that could not read the mode writes nothing).
+Debezium advances the GTID set in its offset only while ``gtid_mode`` is exactly ON, so a
+stack last started under another mode holds a set that stopped advancing at that start: on
+an ON source every start of it is refused -- a resume, and a seeded start too, because the
+offset seeder keeps the committed offset whenever the new point is not later than it and
+Start CDC cannot see where that offset is. A stack last started under ON continues by GTID.
+A stack with no such record (started by version 0.1.566 or earlier, or whose starts could
+not read the mode) is judged by the start offset its last Start offered (its ``Watermark*``
+parameters, which Stop carries forward): a stack that was offered a binlog position with no
+GTID set streamed by file:position (or was started by an earlier version) and holds no GTID
+set to continue from (G1, resume variant).
 
 With ``gtid_mode`` OFF, OFF_PERMISSIVE or ON_PERMISSIVE Debezium positions by binlog
-file:position, exactly as before this check existed, so nothing is refused there. When the
-mode cannot be read (no source connection, a failed read), only a start point WITHOUT a GTID
-set, or one recorded while the mode was not ON, is refused (G3): otherwise Debezium uses
-whichever coordinate the mode requires, and a resume continues from what Debezium committed.
-On every mode, a Manual GTID set that is not a GTID set at all is refused before anything is
-read: Debezium would write it into every offset it commits and fail on it at the next task
-start.
+file:position, exactly as before this check existed, so nothing is refused there (that mode
+becomes the stack's record). When the mode cannot be read (no source connection, a failed
+read), a start point WITHOUT a GTID set, or one recorded while the mode was not ON, is
+refused (G3), and so is every start of a stack that holds a ``gtid_mode`` record and a
+stack's first start: the record is only true if every start reads the mode. Otherwise (a
+stack with no record that streamed before) Debezium uses whichever coordinate the mode
+requires, and a resume continues from what Debezium committed. On every mode, a Manual GTID
+set that is not a GTID set at all is refused before anything is read: Debezium would write it
+into every offset it commits and fail on it at the next task start.
 
 Start CDC runs the check in the Start dialog and again on the job's worker thread before
-anything changes (Retry CDC skips the dialog), never for a stack whose connectors exist.
+anything changes (Retry CDC skips the dialog), never for a stack whose connectors exist. A
+Start the worker's check lets through records the mode it read on the stack
+(:func:`gtid_mode_to_record`); one that could not read it records nothing.
 Value-free (Property 7): positions, GTID sets, modes and exception class names only.
 """
 
@@ -49,6 +64,7 @@ from dsql_migrator.core.cdc_coords import (
     normalize_gtid_set,
 )
 from dsql_migrator.ui.cdc_start_point_gate import (
+    NO_SEED_LABEL,
     PROBLEM_NO_SOURCE,
     PROBLEM_READ_FAILED,
     RELOAD_RESETS_MANUAL,
@@ -80,6 +96,8 @@ POSITION_UNKNOWN_RESUME = "unknown-resume"
 
 G1_HEADER = "The CDC start point has no GTID set"
 G2_HEADER = "The source's gtid_mode changed since the CDC start point"
+# G2 judged by the stack's own gtid_mode record (G20): it last started while not ON.
+G2_STACK_HEADER = "The source's gtid_mode changed since this CDC stack last started"
 G3_HEADER = "Cannot read the source's gtid_mode"
 G4_HEADER = "The source cannot stream from the start point's GTID set"
 # G4 when the check itself failed: it could not be checked, not "cannot be used".
@@ -151,6 +169,14 @@ class GtidStartVerdict:
     committed offset. ``stack_point``: ``binlog F:P`` of the start offset the stack's last
     Start offered, set when a resume was refused on that record rather than on the
     session's start point (the copy names it, see :func:`gtid_notice_point`).
+    ``stack_mode``: the stack's ``gtid_mode`` record (G20, upper-cased), set only on a
+    refusal the record decided -- ``mode-changed`` (the stack last started while it was
+    not ON) or ``unreadable`` with ``mode_required`` (the mode must be read to keep the
+    record true: the stack holds one, or this is its first start; ``stack_mode`` is then
+    ``None`` for a first start). ``seed_fits_new_stack``: set only on a seeded start that
+    record refused (``mode-changed`` with ``stack_mode``, not a resume) when the same rules
+    would let a NEW stack -- no records, no committed offset -- start exactly at the seed
+    (the copy then offers that way out instead of always asking for a new start point).
     """
 
     kind: str
@@ -161,6 +187,9 @@ class GtidStartVerdict:
     resumes: bool = False
     error_class: Optional[str] = None
     stack_point: Optional[str] = None
+    stack_mode: Optional[str] = None
+    mode_required: bool = False
+    seed_fits_new_stack: bool = False
 
     @property
     def blocks(self) -> bool:
@@ -204,6 +233,8 @@ def mysql_gtid_start_verdict(
     stack_point: Optional[str] = None,
     seed_is_stack_point: bool = False,
     seed_set_malformed: bool = False,
+    stack_gtid_mode: Optional[str] = None,
+    first_start: bool = False,
 ) -> GtidStartVerdict:
     """The GTID start verdict for one MySQL Start (rules R0-R6, in order). Pure.
 
@@ -216,14 +247,31 @@ def mysql_gtid_start_verdict(
     it offered a binlog position with none), or ``None`` when the stack records no start
     offset; ``stack_point`` names that offer (``binlog F:P``) and ``seed_is_stack_point``
     says the session's start point is that very position. ``seed_set_malformed``: the
-    start point's GTID set is a Manual entry that is not a GTID set.
+    start point's GTID set is a Manual entry that is not a GTID set. ``stack_gtid_mode``:
+    the stack's ``gtid_mode`` record (its ``StartGtidMode``, G20: the mode its last
+    positioning Start ran under; ``None`` or blank when it has none -- any value other than
+    ``ON`` counts as not ON). ``first_start``: the stack has never started (no committed
+    offset, not a resume). Both default to the judgement of a stack without a record.
 
     0. A seeded start whose Manual GTID set is not a GTID set: refused on every mode.
-    1. Mode unread: a resume proceeds, and so does a seed with a GTID set (Debezium uses
-       whichever the mode requires); a seed without one is refused (G3), and so is one
+    1. Mode unread: a start point without a GTID set is refused (G3), and so is one
        recorded while the mode was not ON (if the source is ON now, its set does not
-       describe the point: a silent skip is possible).
-    2. Mode not ON (OFF, OFF_PERMISSIVE, ON_PERMISSIVE): proceed by binlog file:position.
+       describe the point: a silent skip is possible). Any other start that positions (a
+       resume or a seedable point) is refused too when the stack holds a ``gtid_mode``
+       record or this is its first start (G3, ``mode_required``): the record is only true
+       if every start reads the mode. Otherwise a resume proceeds, and so does a seed with
+       a GTID set (Debezium uses whichever the mode requires).
+    2. Mode not ON (OFF, OFF_PERMISSIVE, ON_PERMISSIVE): proceed by binlog file:position
+       (that mode becomes the stack's record).
+    2s. ON, and the stack holds a ``gtid_mode`` record (G20): one other than ``ON`` refuses
+       every start that positions (G2, ``stack_mode``) -- the GTID set in the committed
+       offset stopped advancing at that start, and a seeded start cannot replace it with
+       certainty (the offset seeder keeps the committed offset whenever the new point is
+       not later than it); a seeded start refused here also says whether a new stack would
+       start exactly at the seed (``seed_fits_new_stack``: rules 3, 5 and 6 without the
+       stack's records). Record ``ON``: a resume continues after the GTID set Debezium
+       committed (whatever the Watermark* record says); a seeded start falls through to
+       rules 3, 5 and 6, which judge the seed.
     3. ON, and the start point recorded while the mode was not ON: refused (G2) -- for a
        resume only when that point is what the stack was last started from (or the stack
        records nothing); otherwise rule 4 judges the stack's own record.
@@ -232,7 +280,8 @@ def mysql_gtid_start_verdict(
        recorded while ON at that very point; an offer with a binlog position and no GTID
        set is refused (G1, resume variant) -- that stack streamed by file:position or was
        started by an earlier version, so it holds no GTID set to continue from. With no
-       record, the session's start point is judged the same way.
+       record, the session's start point is judged the same way. (Reached only by a stack
+       without a ``gtid_mode`` record: rule 2s decides every other resume.)
     5. ON and a seed with no GTID set (and no ON recorded with it): refused (G1).
     6. ON and a seed with a GTID set (or an empty one recorded while ON): it must be within
        the source's ``gtid_executed`` and cover its ``gtid_purged`` (G4 otherwise, also
@@ -245,6 +294,10 @@ def mysql_gtid_start_verdict(
     has_set = bool(normalize_gtid_set(seed_gtids))
     # The stack's own record (None: it records no start offset).
     record = normalize_gtid_set(stack_gtids) if stack_gtids is not None else None
+    # The stack's gtid_mode record (None: none). Anything but exactly ON is "not ON".
+    stack_mode = _upper(stack_gtid_mode)
+    # Does this start position the source connector at all (a resume or a seeded point)?
+    positions = resumes or seedable
 
     def _verdict(kind: str, **extra) -> GtidStartVerdict:
         return GtidStartVerdict(
@@ -257,18 +310,25 @@ def mysql_gtid_start_verdict(
         return _verdict(KIND_MALFORMED)
     # R1: the mode is unknown.
     if mode is None or problem in (PROBLEM_NO_SOURCE, PROBLEM_READ_FAILED):
+        unread = problem or PROBLEM_READ_FAILED
+        if not resumes and seedable and not (has_set and cap in (None, "ON")):
+            # A seed without a GTID set, or one recorded while not ON (as before).
+            return _verdict(KIND_UNREADABLE, reason=unread, error_class=error_class)
+        if positions and (stack_mode is not None or first_start):
+            # G20: the stack's gtid_mode record is only true if every start reads the mode
+            # -- the record it holds may say "not ON", and a first start must write one.
+            return _verdict(
+                KIND_UNREADABLE, reason=unread, error_class=error_class,
+                stack_mode=stack_mode, mode_required=True,
+            )
         if resumes:
             return _verdict(
                 KIND_PROCEED, positioning=POSITION_UNKNOWN_RESUME,
-                reason=problem or PROBLEM_READ_FAILED, error_class=error_class,
-            )
-        if not seedable or (has_set and cap in (None, "ON")):
-            return _verdict(
-                KIND_PROCEED, positioning=POSITION_UNKNOWN if seedable else None,
-                reason=problem or PROBLEM_READ_FAILED, error_class=error_class,
+                reason=unread, error_class=error_class,
             )
         return _verdict(
-            KIND_UNREADABLE, reason=problem or PROBLEM_READ_FAILED, error_class=error_class
+            KIND_PROCEED, positioning=POSITION_UNKNOWN if seedable else None,
+            reason=unread, error_class=error_class,
         )
     # R2: not ON -> binlog file:position, as before.
     if not gtid_mode_is_on(mode):
@@ -276,6 +336,25 @@ def mysql_gtid_start_verdict(
             KIND_PROCEED,
             positioning=POSITION_BINLOG_RESUME if resumes else POSITION_BINLOG,
         )
+    # R2s (G20): ON now, and the stack records the gtid_mode its last Start positioned
+    # under. Debezium advances the GTID set in its offset only while gtid_mode is exactly
+    # ON, so a stack last started under another mode holds a set that stopped advancing
+    # then -- refused for a resume AND a seeded start (the seeder keeps the committed
+    # offset whenever the new point is not later than it, unseen from here). A stack last
+    # started under ON continues by GTID; its seeded start is judged on the seed below.
+    if stack_mode is not None and positions:
+        if stack_mode != "ON":
+            # For the copy only: a NEW stack has no committed offset for the seeder to keep,
+            # so would it start exactly at this seed? The same rules, without the records.
+            fits = not resumes and mysql_gtid_start_verdict(
+                state, seed_gtids=seed_gtids, seed_gtid_mode=seed_gtid_mode,
+                seedable=seedable, resumes=False, first_start=True,
+            ).kind == KIND_PROCEED
+            return _verdict(
+                KIND_MODE_CHANGED, stack_mode=stack_mode, seed_fits_new_stack=fits
+            )
+        if resumes:
+            return _verdict(KIND_PROCEED, positioning=POSITION_GTID_RESUME)
     # R3: ON now, recorded while not ON. A resume continues the stack's committed offset,
     # so the recorded mode speaks for it only when the stack was last started from this
     # very point (or records no start offset at all).
@@ -331,15 +410,37 @@ def _keep(start: str) -> str:
     )
 
 
-def _new_point(since: str, migration_type: object) -> str:
+def _new_point(
+    since: str, migration_type: object, *, redeploy: bool = False, keep_held: bool = False
+) -> str:
+    # ``redeploy``: the stack's committed offset would outrank any new start point (the
+    # stack's gtid_mode record refused it, G20), so the new point needs a new stack.
+    # ``keep_held``: a new stack could also start from the point the session holds
+    # (``seed_fits_new_stack``) -- exactly, only if gtid_mode stayed ON since that point
+    # (no change after it lacks a GTID), which Start CDC cannot see: the copy names it.
+    if keep_held:
+        lead = (
+            "Or Delete CDC infrastructure on the CDC step and deploy it again (a new stack "
+            "has no committed offset, so CDC then starts exactly at its start point), then "
+            "Start CDC again — from this start point if the source's gtid_mode was already "
+            "ON when it was recorded and has stayed ON since, or else from a new one"
+        )
+    elif redeploy:
+        lead = (
+            "Or Delete CDC infrastructure on the CDC step, deploy it again (a new stack has "
+            "no committed offset, so CDC then starts exactly at its start point) and give "
+            "CDC a new start point"
+        )
+    else:
+        lead = "Or give CDC a new start point"
     if _cdc_only(migration_type):
         return (
-            "Or give CDC a new start point: choose Manual, then Fetch current position and "
+            f"{lead}: choose Manual, then Fetch current position and "
             f"Use this start point. Changes made between {since} and the new point are then "
             "not replicated: correct them on Aurora DSQL and validate with CHECKSUM."
         )
     return (
-        "Or give CDC a new start point: Re-run Full Load for all tables with \"Drop & "
+        f"{lead}: Re-run Full Load for all tables with \"Drop & "
         "reload\" — its new watermark records the GTID set with the position (Reload "
         "specific tables and Retry keep this one) — or choose Manual, then Fetch current "
         "position and Use this start point: changes to the captured tables between "
@@ -422,18 +523,67 @@ def _mode_changed_body(
     )
 
 
-def _unreadable_body(verdict: GtidStartVerdict, point: str) -> str:
-    if verdict.reason == PROBLEM_NO_SOURCE:
-        reason = (
-            "this session has no source connection (the source password is kept in memory "
-            "only, so an app restart clears it)."
+def _stack_mode_body(
+    verdict: GtidStartVerdict, coord: str, migration_type: object
+) -> str:
+    """G2 decided by the stack's own gtid_mode record (G20): it last started while not ON."""
+    lead = (
+        f"This CDC stack last started while the source's gtid_mode was {verdict.stack_mode}, "
+        "so its source connector streamed by binlog file:position and the GTID set in its "
+        "committed offset stopped advancing at that start. The source's gtid_mode is ON "
+        "now, so Debezium would continue after that GTID set: it would re-send changes "
+        "already applied, stop on the changes written without a GTID, or skip them with no "
+        "error."
+    )
+    if verdict.resumes:
+        return (
+            f"{lead} {_keep(_STOPPED_AT)} "
+            f"{_new_point(_STOPPED_AT, migration_type, redeploy=True)}"
         )
-        exit_ = "Test the source connection on the Connect step, then Start CDC again."
-    else:
-        reason = f"reading it failed ({verdict.error_class or 'no value returned'})."
-        exit_ = (
-            "Check that the source database is reachable from the tool, then Start CDC "
-            "again."
+    return (
+        f"{lead} A new start point cannot replace that offset: the offset seeder keeps the "
+        "committed offset whenever the new point is not later than it, and Start CDC "
+        "cannot see where that offset is. "
+        f"{_keep(f'{coord} (or from where this stack stopped, if that is later)')} "
+        + _new_point(
+            _STOPPED_AT, migration_type, redeploy=True,
+            keep_held=verdict.seed_fits_new_stack,
+        )
+    )
+
+
+def _unread_reason_exit(verdict: GtidStartVerdict) -> tuple[str, str]:
+    """``(reason, exit)`` sentences for a gtid_mode that could not be read."""
+    if verdict.reason == PROBLEM_NO_SOURCE:
+        return (
+            "this session has no source connection (the source password is kept in memory "
+            "only, so an app restart clears it).",
+            "Test the source connection on the Connect step, then Start CDC again.",
+        )
+    return (
+        f"reading it failed ({verdict.error_class or 'no value returned'}).",
+        "Check that the source database is reachable from the tool, then Start CDC again.",
+    )
+
+
+def _unreadable_body(verdict: GtidStartVerdict, point: str) -> str:
+    reason, exit_ = _unread_reason_exit(verdict)
+    if verdict.mode_required:
+        # G20: the stack's gtid_mode record must stay true, so every start reads the mode.
+        if verdict.stack_mode is not None and verdict.stack_mode != "ON":
+            return (
+                "This CDC stack last started while the source's gtid_mode was "
+                f"{verdict.stack_mode}, so the GTID set in its committed offset stopped "
+                "advancing then: Start CDC first checks that the source's gtid_mode is "
+                "still not ON — with gtid_mode=ON, Debezium would continue after that GTID "
+                "set and re-send changes, or skip some with no error — and "
+                f"{reason} {exit_}"
+            )
+        return (
+            "Start CDC reads the source's gtid_mode before every start of this CDC stack "
+            "and records it on the stack: Debezium positions by GTID only when it is ON, "
+            "and a later start can continue by GTID only after a start under ON. It cannot "
+            f"be read now: {reason} {exit_}"
         )
     if verdict.captured_mode is not None and verdict.captured_mode != "ON":
         return (
@@ -551,6 +701,8 @@ def gtid_start_notice(
     header, icon = _header_icon(verdict)
     if verdict.kind == KIND_NO_GTID:
         body = _no_gtid_body(verdict, point_label, coord, origin, migration_type)
+    elif verdict.kind == KIND_MODE_CHANGED and verdict.stack_mode is not None:
+        body = _stack_mode_body(verdict, coord, migration_type)
     elif verdict.kind == KIND_MODE_CHANGED:
         body = _mode_changed_body(verdict, point_label, coord, migration_type)
     elif verdict.kind == KIND_UNREADABLE:
@@ -565,6 +717,8 @@ def gtid_start_notice(
 def _header_icon(verdict: GtidStartVerdict) -> tuple[str, str]:
     if verdict.kind == KIND_NOT_USABLE and verdict.reason == REASON_CHECK_FAILED:
         return G4_CHECK_HEADER, "link_off"
+    if verdict.kind == KIND_MODE_CHANGED and verdict.stack_mode is not None:
+        return G2_STACK_HEADER, "sync_problem"
     return _HEADERS[verdict.kind]
 
 
@@ -575,11 +729,15 @@ def gtid_notice_point(
 
     The session's start point (:func:`point_label` / :func:`point_coord`), except for a
     resume refused on the stack's own record of its last start offset
-    (``verdict.stack_point``): that offer is named, since the session may hold no point.
+    (``verdict.stack_point``): that offer is named, since the session may hold no point;
+    and for a resume refused on the stack's ``gtid_mode`` record (G20), which would continue
+    from where the stack stopped: named by the no-seed label (its Watermark* may be blank).
     """
     stack_point = getattr(verdict, "stack_point", None) if verdict is not None else None
     if stack_point:
         return f"{STACK_POINT_LABEL} ({stack_point})", stack_point
+    if verdict is not None and verdict.stack_mode is not None and verdict.resumes:
+        return NO_SEED_LABEL, NO_SEED_LABEL
     return point_label(seed, origin), point_coord(seed)
 
 
@@ -648,11 +806,32 @@ def gtid_start_activity(
         return None
     if verdict.blocks:
         header, _icon = _header_icon(verdict)
-        return ACTION_BLOCKED, ActivityStatus.FAILURE, f"{header}: {coord}"
+        suffix = (
+            f" (last started under gtid_mode={verdict.stack_mode})"
+            if verdict.stack_mode is not None and verdict.stack_mode != "ON"
+            else ""
+        )
+        return ACTION_BLOCKED, ActivityStatus.FAILURE, f"{header}: {coord}{suffix}"
     line = gtid_positioning_line(verdict, coord=coord, seed_gtids=seed_gtids)
     if line is None:
         return None
     return ACTION_POSITION, ActivityStatus.INFO, line
+
+
+def gtid_mode_to_record(verdict: Optional[GtidStartVerdict]) -> Optional[str]:
+    """The ``gtid_mode`` a Start that passed the check records on the stack (G20), or None.
+
+    The mode the check READ (upper-cased) for a start that proceeds; ``None`` for no check,
+    a refusal, or a mode that could not be read -- nothing is then recorded, and the stack
+    keeps the record it has. Pure.
+    """
+    if verdict is None or verdict.blocks:
+        return None
+    if verdict.positioning in (POSITION_UNKNOWN, POSITION_UNKNOWN_RESUME):
+        return None
+    if verdict.reason in (PROBLEM_NO_SOURCE, PROBLEM_READ_FAILED):
+        return None
+    return verdict.mode or None
 
 
 __all__ = [
@@ -661,6 +840,7 @@ __all__ = [
     "BLOCK_TOOLTIP",
     "G1_HEADER",
     "G2_HEADER",
+    "G2_STACK_HEADER",
     "G3_HEADER",
     "G3_TOOLTIP",
     "G4_CHECK_HEADER",
@@ -689,6 +869,7 @@ __all__ = [
     "REASON_NOT_EXECUTED",
     "REASON_PURGED",
     "STACK_POINT_LABEL",
+    "gtid_mode_to_record",
     "gtid_notice_point",
     "gtid_positioning_line",
     "gtid_set_summary",

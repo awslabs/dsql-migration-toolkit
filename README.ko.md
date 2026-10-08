@@ -183,9 +183,10 @@ EC2 호스트에서 소스로**(systemd + SSM 포트포워드, ALB/ECR 없음) �
   주지만, Full Load / CDC 행 데이터는 보지도 건드리지도 않고 스키마/DDL/플랜 메타데이터만
   사용합니다. 기본 off, 서드파티 API 키 없음(범위 제한된 `bedrock:InvokeModel`).
 - **CDC는 별도 스택**(`cdc-stack`) — Amazon MSK + Debezium → 관리형 MSK Connect 위의
-  **커스텀 Aurora DSQL 싱크 커넥터**([`connectors/dsql-sink/`](connectors/dsql-sink)). 표준
-  JDBC 싱크로는 DSQL의 단기 IAM 토큰·구문 단위 OCC 재시도·≤3,000행 배치를 감당할 수 없어 직접
-  만들었습니다. 이 도구는 컨트롤 플레인만 맡고 싱크 실행 자원은 직접 운영하지 않습니다.
+  **커스텀 Aurora DSQL 싱크 커넥터**([`connectors/dsql-sink/`](connectors/dsql-sink)). 표준 JDBC
+  싱크로는 DSQL의 단기 IAM 토큰, OCC 충돌(`40001` — 충돌한 트랜잭션 전체를 지터 백오프로 다시
+  실행), ≤3,000행 트랜잭션을 감당할 수 없어 직접 만들었습니다. 이 도구는 컨트롤 플레인만 맡고
+  싱크 실행 자원은 직접 운영하지 않습니다.
 
 > 더 보기: [CDC와 DSQL 제약](docs/manual/ko/04-cdc-and-dsql-constraints.md) ·
 > [성능과 튜닝](docs/manual/ko/07-performance-and-tuning.md).

@@ -83,10 +83,14 @@ PostgreSQL)을 그대로 대체하는 드롭인 대체재가 **아니라** 고�
       writer를 재부팅; 자체 관리형은 `wal_level=logical` 설정 후 재시작). **복제 권한**을 가진
       사용자(superuser, **REPLICATION** 역할 속성, 또는 RDS/Aurora의 **`rds_replication`** 멤버십)가
       필요하며, 소스는 standby가 아니라 클러스터 **writer** 엔드포인트여야 합니다(`pg_is_in_recovery()`
-      = false). 또한 **복제 대상 모든 테이블에 사용 가능한 `REPLICA IDENTITY`가 필요합니다** — 기본 키가
-      있으면 기본값으로 충족되고, 없으면 `ALTER TABLE … REPLICA IDENTITY FULL`을 설정하세요
-      (`REPLICA IDENTITY NOTHING`은 거부됩니다). 복제 슬롯 / walsender **여유량**은 차단하지 않는
-      **경고**로 확인합니다. **퍼블리케이션**과 **논리 복제 슬롯**은 도구가 자동으로 생성합니다.
+      = false). 또한 **복제 대상 모든 테이블에 사용 가능한 `REPLICA IDENTITY`가 필요합니다**:
+      `DEFAULT`에는 `DEFERRABLE`이 아닌 유효한 기본 키가 필요하고(PostgreSQL은 키가 삭제된 뒤에도
+      `DEFAULT`를 유지하므로 검사는 소스의 카탈로그를 읽습니다), `USING INDEX`에는 유효한 고유 인덱스가
+      필요하며, `FULL`은 항상 동작합니다. 파티션된 테이블은 모든 파티션에 하나씩 있어야 합니다. 없으면
+      테이블이 퍼블리케이션에 들어간 뒤 그 테이블의 모든 UPDATE/DELETE가 소스에서 실패하므로, CDC 사전
+      요구사항 검사가 실패로 판정하고 Full Load는 소스에서 아무것도 바꾸기 전에 멈춥니다(퍼블리케이션도
+      슬롯도 만들지 않음). 복제 슬롯 / walsender **여유량**은 차단하지 않는 **경고**로 확인합니다.
+      **퍼블리케이션**과 **논리 복제 슬롯**은 도구가 자동으로 생성합니다.
 
 - [ ] **CDC는 스키마가 아니라 데이터를 복제합니다.** CDC 중 소스 **DDL** 변경은 DSQL로 **전파되지
       않습니다** — Aurora DSQL에 대응하는 변경을 직접 합니다(추가되거나 이름이 바뀐 컬럼은

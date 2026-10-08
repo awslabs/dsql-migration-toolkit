@@ -3639,3 +3639,183 @@ def test_a_rekeyed_postgres_table_lists_its_before_image_check_as_not_checked() 
             if r.check_id is PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY]
     assert len(rows) == 1 and rows[0].not_checked is True
     assert rows[0].status is PrerequisiteStatus.SKIP and rows[0].target == "app.orders"
+
+
+# --- G20: the REPLICA IDENTITY prerequisite grades with the write layer's own rule ----------
+
+
+def test_g20_a_default_identity_without_a_live_primary_key_fails_the_prerequisite() -> None:
+    # The Step 1 inventory said "primary key"; the source's catalog says the key is gone
+    # (PostgreSQL keeps relreplident='d'). The Full Load's provisioning would refuse it before
+    # any write, so the prerequisite must say so before the load.
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    result = check_replica_identity(
+        _table("app.orders"),
+        _pg_facts_healthy(
+            replica_identity={"app.orders": "d"},
+            replica_identity_problems={
+                "app.orders": "REPLICA IDENTITY DEFAULT, but no valid primary key"
+            },
+        ),
+    )
+    assert result.status is PrerequisiteStatus.FAIL and result.required is True
+    assert "REPLICA IDENTITY DEFAULT, but no valid primary key" in result.detail
+    assert "app.orders" in result.detail
+    for phrase in ("not DEFERRABLE", "REPLICA IDENTITY FULL", "each partition"):
+        assert phrase in result.remediation, phrase
+
+
+def test_g20_a_partition_without_a_usable_identity_fails_the_prerequisite() -> None:
+    # Leaf codes alone look fine ('d'); the leaf has no valid primary key.
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    result = check_replica_identity(
+        _table("app.p"),
+        _pg_facts_healthy(
+            replica_identity={"app.p": "d"},
+            leaf_replica_identity={"app.p": {"app.p_1": "d"}},
+            replica_identity_problems={"app.p": "1 of its partitions has none: app.p_1"},
+        ),
+    )
+    assert result.status is PrerequisiteStatus.FAIL and result.required is True
+    assert "app.p_1" in result.detail
+
+
+def test_g20_the_live_grading_fail_comes_before_the_non_pk_identity_index_warn() -> None:
+    # A partitioned parent whose identity is a valid unique index that is not the primary
+    # key, while a partition stays DEFAULT with no usable key (its code alone looks fine):
+    # the live grading's FAIL must win over the non-blocking non-PK WARN, or Deploy / Start
+    # CDC stays open on a table whose UPDATE/DELETE would fail on the source once published.
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    result = check_replica_identity(
+        _table("app.p"),
+        _pg_facts_healthy(
+            replica_identity={"app.p": "i"},
+            identity_index_valid={"app.p": True},
+            identity_index_is_primary={"app.p": False},
+            leaf_replica_identity={"app.p": {"app.p_1": "d"}},
+            replica_identity_problems={"app.p": "1 of its partitions has none: app.p_1"},
+        ),
+    )
+    assert result.status is PrerequisiteStatus.FAIL and result.required is True
+    assert "app.p_1" in result.detail
+
+
+def test_g20_the_prerequisite_is_unchanged_without_the_grading_and_for_safe_tables() -> None:
+    from dsql_migrator.core.prerequisites_postgres import check_replica_identity
+
+    t = _table("app.orders")
+    # Not read (None): the code alone decides, as before.
+    for code, status in (("d", PrerequisiteStatus.PASS), ("f", PrerequisiteStatus.PASS),
+                         ("i", PrerequisiteStatus.PASS), ("n", PrerequisiteStatus.FAIL)):
+        assert check_replica_identity(
+            t, _pg_facts_healthy(replica_identity={"app.orders": code})
+        ).status is status, code
+    # Read, and fine: PASS.
+    assert check_replica_identity(
+        t, _pg_facts_healthy(replica_identity={"app.orders": "d"},
+                             replica_identity_problems={"app.orders": None})
+    ).status is PrerequisiteStatus.PASS
+    # A valid identity index that is not the primary key: still the WARN.
+    warn = check_replica_identity(
+        t,
+        _pg_facts_healthy(
+            replica_identity={"app.orders": "i"},
+            identity_index_valid={"app.orders": True},
+            identity_index_is_primary={"app.orders": False},
+            replica_identity_problems={"app.orders": None},
+        ),
+    )
+    assert warn.status is PrerequisiteStatus.WARN
+    # The parent's own NOTHING keeps its own copy; an unknown code stays INFO.
+    nothing = check_replica_identity(
+        t,
+        _pg_facts_healthy(replica_identity={"app.orders": "n"},
+                          replica_identity_problems={"app.orders": "REPLICA IDENTITY NOTHING"}),
+    )
+    assert nothing.status is PrerequisiteStatus.FAIL
+    assert nothing.detail.startswith("REPLICA IDENTITY is 'nothing'")
+    unknown = check_replica_identity(
+        t, _pg_facts_healthy(replica_identity={}, replica_identity_problems={})
+    )
+    assert unknown.status is PrerequisiteStatus.INFO
+
+
+class _G20ProbeConnection:
+    """Answers the probe's statements; the G20 usability read answers ``usable`` rows, or
+    raises (and poisons the transaction until rollback, as PostgreSQL does)."""
+
+    def __init__(self, *, usable=None, fail=False) -> None:
+        self._usable = dict(usable or {})
+        self._fail = fail
+        self._aborted = False
+        self.rollbacks = 0
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+        self._aborted = False
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        if self._aborted:
+            raise RuntimeError("current transaction is aborted")
+        if "AS identity_usable" in sql:
+            if self._fail:
+                self._aborted = True
+                raise RuntimeError("permission denied for pg_index")
+            rows = [(n, *self._usable[n]) for n in (params or {}).get("names", [])
+                    if n in self._usable]
+            return _G20Result(sql, rows)
+        return _G20Result(sql, [])
+
+
+class _G20Result:
+    def __init__(self, sql, rows) -> None:
+        self._sql, self._rows = sql, rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def scalar(self):
+        low = self._sql.lower()
+        if "wal_level" in low:
+            return "logical"
+        if "max_replication_slots" in low or "max_wal_senders" in low:
+            return "10"
+        if "max_slot_wal_keep_size" in low:
+            return "-1"
+        if "pg_is_in_recovery" in low:
+            return False
+        if "has_database_privilege" in low:
+            return True
+        return None
+
+
+def test_g20_the_probe_reads_the_identity_grading_in_one_isolated_read() -> None:
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    connection = _G20ProbeConnection(usable={
+        "app.orders": ("r", "d", False, 0, []),
+        "app.ok": ("r", "d", True, 0, []),
+        "app.p": ("p", "d", True, 1, ["app.p_1"]),
+    })
+    facts = PostgresSourceDialect().probe_cdc_prerequisites(
+        connection, ["app.orders", "app.ok", "app.p", "app.gone"]
+    )
+    assert facts.replica_identity_problems == {
+        "app.orders": "REPLICA IDENTITY DEFAULT, but no valid primary key",
+        "app.ok": None,
+        "app.p": "1 of its partitions has none: app.p_1",
+    }
+    # A failed read leaves it unknown (None) -- rolled back, so the later facts still read.
+    failing = _G20ProbeConnection(fail=True)
+    facts = PostgresSourceDialect().probe_cdc_prerequisites(failing, ["app.orders"])
+    assert facts.replica_identity_problems is None
+    # The read right after it is the one a missing rollback would poison: the fake
+    # answers it [], so only an aborted transaction turns it None.
+    assert facts.cdc_uncarryable_columns == {}
+    assert failing.rollbacks >= 1
+    for name in ("max_replication_slots", "is_in_recovery", "has_database_create"):
+        assert getattr(facts, name) is not None, name

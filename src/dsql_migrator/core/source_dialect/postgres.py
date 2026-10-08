@@ -1304,6 +1304,8 @@ class PostgresSourceDialect(SourceDialect):
         unlogged: dict[str, bool] = {}
         # None until the read SUCCEEDS -- an empty dict means "read, nothing offending".
         uncarryable: Optional[dict[str, tuple]] = None
+        # None until the read SUCCEEDS (G20): unknown, never "usable".
+        identity_problems: Optional[dict[str, Optional[str]]] = None
         not_owned: list[str] = []
         names = list(table_names)
         if names:
@@ -1354,6 +1356,28 @@ class PostgresSourceDialect(SourceDialect):
             )
             for r in leaves or ():
                 leaf_identity.setdefault(str(r[0]), {})[str(r[1])] = str(r[2])
+            # G20: whether publishing each table would make its UPDATE/DELETE fail on the
+            # source, graded server-side by the SAME catalog read and rule the Full Load's
+            # provisioning refuses on (a valid immediate primary key behind DEFAULT, a valid
+            # identity index behind USING INDEX, every leaf of a partitioned table) -- so
+            # the prerequisite and the write layer cannot disagree. One isolated read like
+            # the others: a failure rolls back and leaves the fact unknown (None), never
+            # "usable". Imported lazily (cdc_pg_slot imports this package).
+            try:
+                from dsql_migrator.core.cdc_pg_slot import (
+                    read_replica_identity_usability,
+                    replica_identity_problem,
+                )
+
+                identity_problems = {
+                    qname: replica_identity_problem(read)
+                    for qname, read in read_replica_identity_usability(
+                        connection, names
+                    ).items()
+                }
+            except Exception:  # noqa: BLE001 - best-effort probe
+                _rollback()
+                identity_problems = None
             # The columns CDC cannot carry: ONE catalog round trip for ALL selected
             # tables (see _PG_CDC_UNCARRYABLE_COLUMNS_SQL). The type policy is the
             # classifier's, so this only shapes rows into the fact. A failed read leaves
@@ -1421,6 +1445,7 @@ class PostgresSourceDialect(SourceDialect):
             identity_index_is_primary=identity_index_is_primary,
             unlogged=unlogged,
             cdc_uncarryable_columns=uncarryable,
+            replica_identity_problems=identity_problems,
             has_database_create=_bool(
                 _scalar(
                     "SELECT pg_catalog.has_database_privilege("

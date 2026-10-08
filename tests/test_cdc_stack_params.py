@@ -27,6 +27,7 @@ from dsql_migrator.core.cdc import (
     CDC_STACK_NAME_LEGACY_PREFIX,
     CDC_STACK_NAME_MAX_LEN,
     CDC_STACK_NAME_PREFIX,
+    CDC_START_GTID_MODE_PARAM,
     CDC_WATERMARK_PARAM_KEYS,
     CdcCostEstimate,
     DebeziumSourceConfig,
@@ -186,6 +187,8 @@ def test_every_emitted_param_is_declared_in_the_template() -> None:
         | {k for k, _ in stack.placeholders}
         | {k for k, _ in infra.filled}
         | set(CDC_WATERMARK_PARAM_KEYS)
+        # G20: Start CDC's gtid_mode record (cdc_deployer.run_cdc_start).
+        | {CDC_START_GTID_MODE_PARAM}
     )
     undeclared = emitted - declared
     assert not undeclared, (
@@ -448,6 +451,15 @@ def test_watermark_params_none_watermark_all_empty() -> None:
     by_key = dict(build_watermark_params(None))
     assert set(by_key) == set(CDC_WATERMARK_PARAM_KEYS)
     assert all(v == "" for v in by_key.values())
+
+
+def test_g20_the_gtid_mode_record_is_not_a_watermark_parameter() -> None:
+    # A Start with no start point blanks every Watermark* key; the StartGtidMode record
+    # must survive that Start, so it is never built or blanked with them.
+    assert CDC_START_GTID_MODE_PARAM == "StartGtidMode"
+    assert CDC_START_GTID_MODE_PARAM not in CDC_WATERMARK_PARAM_KEYS
+    assert CDC_START_GTID_MODE_PARAM not in dict(build_watermark_params(None))
+    assert CDC_START_GTID_MODE_PARAM not in dict(build_watermark_params(_wm()))
 
 
 def test_watermark_params_no_binlog_coords_all_empty() -> None:

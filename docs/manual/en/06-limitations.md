@@ -58,16 +58,20 @@ fails **loudly** where it can't.
   - **PostgreSQL source:** `wal_level=logical` (RDS/Aurora: set the static
     `rds.logical_replication=1` in a custom DB/cluster parameter group, then reboot;
     self-managed: set `wal_level=logical` and restart); a **replication-privileged
-    user** (superuser, the `REPLICATION` role attribute, or `rds_replication`
-    membership on RDS/Aurora); the source must be the cluster **WRITER**, not a
-    standby/reader (`pg_is_in_recovery()=false`); and every replicated table must
-    have a usable **`REPLICA IDENTITY`** (a PK gives the default, else
-    `ALTER TABLE … REPLICA IDENTITY FULL` or an index identity — `NOTHING` is
-    refused and errors `UPDATE`/`DELETE` on the publisher). There is no
-    binlog-retention analog: the tool creates a **logical replication slot** and a
-    **publication scoped to exactly the migrated tables** at the Full Load
-    consistency point, so WAL is pinned by the slot instead of by a retention window
-    (watch `wal_status` — an inactive slot can fill the source disk).
+    user** (superuser, the `REPLICATION` role attribute, or `rds_replication` membership
+    on RDS/Aurora); the source must be the cluster **WRITER**, not a standby/reader
+    (`pg_is_in_recovery()=false`); and every replicated table must have a usable
+    **`REPLICA IDENTITY`**: `DEFAULT` needs a valid primary key that is not `DEFERRABLE`
+    (PostgreSQL keeps `DEFAULT` after the key is dropped, so the check reads the
+    source's catalog), `USING INDEX` a valid unique index, and `FULL` always works; on a
+    partitioned table every partition needs one. Without one, every `UPDATE`/`DELETE` on
+    the table would fail on the publisher once it is published, so the CDC prerequisite
+    check fails it and the Full Load stops before it changes anything on the source (no
+    publication, no slot). There is no binlog-retention analog: the tool creates a
+    **logical replication slot** and a **publication scoped to exactly the migrated
+    tables** at the Full Load consistency point, so WAL is pinned by the slot instead of
+    by a retention window (watch `wal_status` — an inactive slot can fill the source
+    disk).
     Replication-slot / `max_wal_senders` headroom is checked (non-blocking).
   - **PostgreSQL source, re-keyed tables:** a table CDC re-keys — Schema
     Conversion's **Composite key**, or an edited target key that adds a column outside
@@ -234,8 +238,8 @@ fails **loudly** where it can't.
     without its GTID set (those versions kept a fetched set beside any position typed
     after it): fetch it again, or re-enter the set executed at exactly that position.
   - **Recorded while `gtid_mode` was not `ON`** (also a restart after Stop CDC of a stack
-    started from such a point, or from a start point without a GTID set): see the next
-    bullet.
+    started from such a point, or from a start point without a GTID set, and any start of
+    a stack whose last start ran while `gtid_mode` was not `ON`): see the next bullet.
   - **A GTID set the source has not executed** (it was read from another server, or
     entered incorrectly), **or one the source has purged binary logs after**: give CDC a
     new start point — **Re-run Full Load with "Drop & reload"**, or **Manual** → **Fetch
@@ -247,9 +251,11 @@ fails **loudly** where it can't.
     the start point: check that the source is reachable from the tool, then Start CDC
     again.
   - **`gtid_mode` cannot be read** while the start point has no GTID set, or was recorded
-    while `gtid_mode` was not `ON` (this session has no source connection — the password
-    is kept in memory only, so an app restart clears it — or the read failed): re-test the
-    source connection on the Connect step, then Start CDC again.
+    while `gtid_mode` was not `ON`, or while Start CDC has to record it — before every
+    start of a stack that holds a `gtid_mode` record, and before a stack's first start
+    (this session has no source connection — the password is kept in memory only, so an
+    app restart clears it — or the read failed): re-test the source connection on the
+    Connect step, then Start CDC again.
 
   On the Manual card, editing the position after **Fetch current position** drops the
   fetched GTID set (it was read at the fetched position) — also when the position is
@@ -274,18 +280,34 @@ fails **loudly** where it can't.
   "Drop & reload" (CDC only: correct them on Aurora DSQL) and validate with CHECKSUM.
   Changing `gtid_mode` while CDC streams takes effect at the connector's next automatic
   restart, can stop it or skip changes with no error, and the tool cannot intercept it:
-  Stop CDC first. Start CDC judges only what is recorded — the mode recorded with the
-  start point, and the start offset (with its GTID set) the stack was last started from —
-  not how the stack streamed since. So a Start after `gtid_mode` is back to `ON` is not
-  refused for a stack started from a point recorded while it was `ON` that then streamed
-  while it was not `ON` (for example `ON_PERMISSIVE` after a *changes written without a
-  GTID* failure), for one started from a GTID set typed while it was not `ON`, or for
-  one whose last Start had no start point to offer (a restart from a session that held
-  none, which leaves the stack no record): it continues after the GTID set it holds and
-  re-sends changes already applied, or stops on the ones written without a GTID, or skips
-  them with no error. Keep such a source not `ON` until cut over, or give CDC a new start
-  point as above. Start points recorded by version 0.1.565 or earlier do not record the
-  mode: if `gtid_mode` was turned `ON` since, set a new one.
+  Stop CDC first. Start CDC also records on the CDC stack the source's `gtid_mode` each
+  time it starts the source connector (Stop CDC keeps the record). On an `ON` source it
+  refuses any start of a stack whose last start ran while `gtid_mode` was not `ON` — a
+  restart after Stop CDC, and also a new start point, because the offset seeder keeps
+  the committed offset whenever the new point is not later than it and Start CDC cannot
+  see that offset. That stack streamed by `file:position` from that start, so the GTID
+  set in its committed offset stopped advancing there. Keep `gtid_mode` `ON_PERMISSIVE`
+  until cut over, or **Delete CDC infrastructure**, deploy it again and Start CDC: a new
+  stack has no committed offset, so CDC then starts exactly at its start point — the one
+  you hold if `gtid_mode` was already `ON` when it was recorded and has stayed `ON`
+  since, else a new start point as above. A stack whose last start ran while `gtid_mode`
+  was `ON` continues by GTID, even when the session no longer holds its start point. The
+  record cannot see a `gtid_mode` change while CDC streams (Stop CDC first, as above),
+  nor a Start that failed and was rolled back (the stack then keeps the record of the
+  start before it, so start again before you change `gtid_mode`). A stack last started by
+  version 0.1.566 or earlier holds no record until a start reads the mode, and until
+  then — that start included — Start CDC judges it only by what is recorded: the mode
+  recorded with the start point, and the start offset (with its GTID set) the stack was
+  last started from, not how the stack streamed since. So for such a stack a Start after
+  `gtid_mode` is back to `ON` is not refused if the stack was started from a point
+  recorded while it was `ON` and then streamed while it was not `ON` (for example
+  `ON_PERMISSIVE` after a *changes written without a GTID* failure), was started from a
+  GTID set typed while it was not `ON`, or was last started with no start point to offer
+  (a restart from a session that held none): it continues after the GTID set it holds
+  and re-sends changes already applied, or stops on the ones written without a GTID, or
+  skips them with no error. Keep such a source not `ON` until cut over, or give CDC a
+  new start point as above. Start points recorded by version 0.1.565 or earlier do not
+  record the mode: if `gtid_mode` was turned `ON` since, set a new one.
 - **MySQL with `gtid_mode=ON`: pipelines started by version 0.1.565 or earlier.** Those
   versions emptied the GTID set Debezium starts from, so on a `gtid_mode=ON` source MySQL
   re-sent its whole retained binary log at every Start, every Start after Stop and every

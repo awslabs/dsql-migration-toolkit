@@ -451,7 +451,8 @@ class SinkConnectorConfig(BaseModel):
     The Python control plane only *builds* this config; the connector plugin (our
     Java artifact on MSK Connect) consumes it. Keying/idempotency knobs make the
     connector apply PK-keyed upsert/delete with DLQ quarantine (Req 12.3-12.6);
-    statement-level OCC retry and <=3,000-row batching live in the plugin.
+    OCC (40001) retry of each whole transaction (a <=3,000-row chunk, or one row in the
+    record-by-record fallback) and the batching live in the plugin.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -2431,6 +2432,14 @@ CDC_WATERMARK_PARAM_KEYS: tuple[str, ...] = (
     "WatermarkGtids",
     "WatermarkTsSec",
 )
+
+# The cdc-stack parameter recording the MySQL source's gtid_mode when Start CDC last created
+# the source connector (G20): Debezium advances the GTID set in its offset only while
+# gtid_mode is exactly ON, so the next Start's GTID check reads it. Deliberately NOT one of
+# CDC_WATERMARK_PARAM_KEYS: a Start without a start point blanks every Watermark* key
+# (build_watermark_params), and this record must survive that Start. Start CDC sends it only
+# when its GTID check read the mode; every other update keeps it (UsePreviousValue).
+CDC_START_GTID_MODE_PARAM = "StartGtidMode"
 
 
 def build_watermark_params(

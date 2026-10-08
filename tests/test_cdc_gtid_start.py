@@ -27,6 +27,7 @@ from dsql_migrator.ui.cdc_gtid_gate import (
     BLOCK_TOOLTIP,
     G1_HEADER,
     G2_HEADER,
+    G2_STACK_HEADER,
     G3_HEADER,
     G3_TOOLTIP,
     G4_CHECK_HEADER,
@@ -80,11 +81,19 @@ def test_gtid_set_summary_caps_a_long_set() -> None:
 # (b) the verdict truth table (rules R1-R6)
 # --------------------------------------------------------------------------- #
 def _v(state, *, gtids="", cap=None, seedable=True, resumes=False, stack=None,
-       stack_point=None, same=False, malformed=False):
+       stack_point=None, same=False, malformed=False, stack_mode=None, first_start=False):
+    # ``stack_mode`` / ``first_start`` (G20) are passed only when a row sets them: their
+    # defaults are a stack without a gtid_mode record that streamed before, so every
+    # earlier row is the very call it was.
+    g20 = {}
+    if stack_mode is not None:
+        g20["stack_gtid_mode"] = stack_mode
+    if first_start:
+        g20["first_start"] = True
     return mysql_gtid_start_verdict(
         state, seed_gtids=gtids, seed_gtid_mode=cap, seedable=seedable, resumes=resumes,
         stack_gtids=stack, stack_point=stack_point, seed_is_stack_point=same,
-        seed_set_malformed=malformed,
+        seed_set_malformed=malformed, **g20,
     )
 
 
@@ -268,13 +277,39 @@ def _all_refusals():
     }
 
 
+def _g20_refusals():
+    """G20: the refusals the stack's own gtid_mode record decides."""
+    on = GtidSourceState(mode="ON")
+    return {
+        "G2S-resume": (
+            _v(on, gtids="", seedable=False, resumes=True, stack_mode="ON_PERMISSIVE"),
+            "full_load",
+        ),
+        "G2S-seeded": (
+            _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET, stack_mode="OFF"),
+            "full_load",
+        ),
+        "G3R-stack": (
+            _v(GtidSourceState(problem="no-source-connection"), seedable=False, resumes=True,
+               stack_mode="OFF"),
+            "full_load",
+        ),
+        "G3R-first": (
+            _v(GtidSourceState(problem="read-failed", error_class="OperationalError"),
+               gtids=_SET, first_start=True),
+            "full_load",
+        ),
+    }
+
+
 @pytest.mark.parametrize("migration_type", [_CDC_ONLY, _FL_CDC])
 def test_every_refusal_is_an_error_that_changes_nothing(migration_type) -> None:
     from dsql_migrator.core.cdc_deployer import DEFINITION_SNAPSHOT_MARK, SCHEMA_HISTORY_MARK
 
     headers = {"G1": G1_HEADER, "G2": G2_HEADER, "G3": G3_HEADER, "G4": G4_HEADER,
-               "G4-check": G4_CHECK_HEADER, "MF": MALFORMED_HEADER}
-    for name, (verdict, origin) in _all_refusals().items():
+               "G4-check": G4_CHECK_HEADER, "MF": MALFORMED_HEADER,
+               "G2S": G2_STACK_HEADER, "G3R": G3_HEADER}
+    for name, (verdict, origin) in {**_all_refusals(), **_g20_refusals()}.items():
         tone, icon, header, body = _notice(verdict, origin=origin, migration_type=migration_type)
         assert tone == "error" and icon, name
         prefix = "G4-check" if name.startswith("G4-check") else name.split("-")[0]
@@ -297,8 +332,10 @@ def test_every_refusal_is_an_error_that_changes_nothing(migration_type) -> None:
 
 
 def test_the_keep_remedy_names_on_permissive() -> None:
-    for name in ("G1-FL", "G1-manual", "G1-resume", "G2-seeded", "G2-resume"):
-        verdict, origin = _all_refusals()[name]
+    refusals = {**_all_refusals(), **_g20_refusals()}
+    for name in ("G1-FL", "G1-manual", "G1-resume", "G2-seeded", "G2-resume", "G2S-resume",
+                 "G2S-seeded"):
+        verdict, origin = refusals[name]
         body = _notice(verdict, origin=origin)[3]
         assert "set the source's gtid_mode back to ON_PERMISSIVE until cut over" in body, name
     resume = _notice(*_all_refusals()["G1-resume"][:1])[3]
@@ -791,3 +828,345 @@ def test_the_probe_refuses_a_malformed_manual_set_without_reading(monkeypatch, m
     for origin, facts in (("full_load", None), ("manual", _RESUME)):
         other, _ = _probe(monkeypatch, mode=mode, seed=seed, origin=origin, facts=facts)
         assert other.kind != "malformed"
+
+
+# --------------------------------------------------------------------------- #
+# G20: the stack's gtid_mode record (StartGtidMode) -- Debezium advances the GTID set in
+# its offset only while gtid_mode is exactly ON, so the mode a stack last positioned under
+# decides whether a later gtid_mode=ON start can continue by GTID.
+# --------------------------------------------------------------------------- #
+_NOT_ON = ["OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE"]
+
+
+def test_g20_a_stack_last_started_under_on_resumes_by_gtid_whatever_its_offer_was() -> None:
+    # The false refusal G19 left: a stack started under ON from an EMPTY GTID set (a source
+    # with no GTID transaction yet), resumed from a session that no longer holds that
+    # point. Its committed set advanced under ON, so it continues after it.
+    on = GtidSourceState(mode="ON")
+    for stack in ("", None, _SET):
+        verdict = _v(on, gtids="", cap="ON", resumes=True, stack=stack,
+                     stack_point=_STACK_POINT, stack_mode="ON")
+        assert (verdict.kind, verdict.positioning) == ("proceed", "gtid-resume"), stack
+        assert verdict.stack_mode is None
+    # ...also with no session point at all.
+    seedless = _v(on, seedable=False, resumes=True, stack="", stack_point=_STACK_POINT,
+                  stack_mode="ON")
+    assert seedless.positioning == "gtid-resume"
+    # ...and when the session's point (recorded under OFF) IS the stack's point: the record
+    # says the stack positioned under ON since, so its committed set is current.
+    same = _v(on, gtids=_SET, cap="OFF", resumes=True, stack=_SET, stack_point=_STACK_POINT,
+              same=True, stack_mode="ON")
+    assert same.positioning == "gtid-resume"
+    # Without the record these are exactly G19's verdicts.
+    assert _v(on, gtids="", cap="ON", resumes=True, stack="",
+              stack_point=_STACK_POINT).kind == "no-gtid"
+
+
+@pytest.mark.parametrize("record", _NOT_ON)
+@pytest.mark.parametrize("stack", [None, "", _SET])
+@pytest.mark.parametrize("seedable", [False, True])
+def test_g20_a_resume_of_a_stack_last_started_while_not_on_is_refused_on_on(
+    record, stack, seedable
+) -> None:
+    # Case 1 (Watermark* blanked by a seedless Start: stack None), case 2a (a set typed
+    # under OFF became WatermarkGtids: stack _SET) and 2b (an ON start that later streamed
+    # under ON_PERMISSIVE): the set in the committed offset stopped advancing then.
+    verdict = _v(GtidSourceState(mode="ON"), gtids=_SET, cap="ON", seedable=seedable,
+                 resumes=True, stack=stack, stack_point=_STACK_POINT, stack_mode=record)
+    assert verdict.kind == "mode-changed" and verdict.blocks
+    assert verdict.stack_mode == record and verdict.resumes is True
+
+
+@pytest.mark.parametrize("record", _NOT_ON)
+def test_g20_a_seeded_start_of_a_stack_last_started_while_not_on_is_refused_on_on(
+    record,
+) -> None:
+    # The seeder keeps the committed offset whenever the new point is not later than it,
+    # and Start CDC cannot see where it is: even a usable seed is refused.
+    verdict = _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET, cap="ON",
+                 stack_mode=record)
+    assert verdict.kind == "mode-changed" and verdict.stack_mode == record
+    assert verdict.resumes is False
+
+
+def test_g20_a_seeded_start_of_a_stack_last_started_under_on_is_judged_on_its_seed() -> None:
+    for state, kw in (
+        (GtidSourceState(mode="ON", **_OK_SUBSET), {"gtids": _SET}),
+        (GtidSourceState(mode="ON"), {"gtids": ""}),
+        (GtidSourceState(mode="ON", **_OK_SUBSET), {"gtids": _SET, "cap": "OFF"}),
+        (GtidSourceState(mode="ON", within_executed=True, covers_purged=False),
+         {"gtids": _SET}),
+        (GtidSourceState(mode="ON", problem="check-failed"), {"gtids": _SET}),
+    ):
+        with_record = _v(state, stack_mode="ON", **kw)
+        without = _v(state, **kw)
+        assert with_record == without, kw
+    assert _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET,
+              stack_mode="ON").positioning == "gtid"
+    # A seed recorded under OFF is still G2 of the seed (not of the stack).
+    assert _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET, cap="OFF",
+              stack_mode="ON").stack_mode is None
+
+
+@pytest.mark.parametrize("mode", _NOT_ON)
+@pytest.mark.parametrize("record", ["ON", "OFF", "ON_PERMISSIVE"])
+@pytest.mark.parametrize("resumes", [False, True])
+def test_g20_any_record_on_a_source_that_is_not_on_proceeds_by_file_position(
+    mode, record, resumes
+) -> None:
+    verdict = _v(GtidSourceState(mode=mode), gtids=_SET, resumes=resumes, stack_mode=record,
+                 first_start=not resumes)
+    assert verdict.kind == "proceed"
+    assert verdict.positioning == ("binlog-resume" if resumes else "binlog")
+
+
+def test_g20_the_record_is_normalized_and_anything_but_on_fails_closed() -> None:
+    on = GtidSourceState(mode="ON")
+    assert _v(on, seedable=False, resumes=True, stack_mode=" on ").positioning == "gtid-resume"
+    garbage = _v(on, seedable=False, resumes=True, stack_mode="garbage")
+    assert garbage.kind == "mode-changed" and garbage.stack_mode == "GARBAGE"
+    body = _notice(garbage)[3]
+    assert "while the source's gtid_mode was GARBAGE" in body
+    # Blank is no record: judged as before.
+    assert _v(on, seedable=False, resumes=True, stack_mode="  ").positioning == "gtid-resume"
+
+
+@pytest.mark.parametrize("record", ["ON", "OFF", "ON_PERMISSIVE"])
+@pytest.mark.parametrize(
+    "state",
+    [GtidSourceState(problem="no-source-connection"),
+     GtidSourceState(problem="read-failed", error_class="OperationalError"), None],
+)
+def test_g20_a_stack_with_a_record_must_have_its_mode_read(record, state) -> None:
+    # The record is only true if every start reads the mode: unread -> refused, for a resume
+    # and for a seed with a GTID set (both proceeded before G20).
+    for kw in ({"seedable": False, "resumes": True}, {"gtids": _SET},
+               {"gtids": _SET, "resumes": True}):
+        verdict = _v(state, stack_mode=record, **kw)
+        assert verdict.kind == "unreadable" and verdict.mode_required, kw
+        assert verdict.stack_mode == record
+
+
+def test_g20_a_first_start_must_have_its_mode_read() -> None:
+    unread = GtidSourceState(problem="no-source-connection")
+    first = _v(unread, gtids=_SET, first_start=True)
+    assert first.kind == "unreadable" and first.mode_required and first.stack_mode is None
+    # A stack that streamed before and holds no record: exactly as before.
+    assert _v(unread, gtids=_SET).positioning == "unknown"
+    assert _v(unread, seedable=False, resumes=True).positioning == "unknown-resume"
+    # G19's own unread refusals keep their copy, record or not.
+    for kw in ({"gtids": ""}, {"gtids": _SET, "cap": "OFF_PERMISSIVE"}):
+        for extra in ({}, {"stack_mode": "ON"}, {"first_start": True}):
+            verdict = _v(unread, **kw, **extra)
+            assert verdict.kind == "unreadable" and not verdict.mode_required, (kw, extra)
+            assert verdict.stack_mode is None
+
+
+def test_g20_gtid_mode_to_record() -> None:
+    from dsql_migrator.ui.cdc_gtid_gate import gtid_mode_to_record
+
+    assert gtid_mode_to_record(None) is None
+    assert gtid_mode_to_record(_v(GtidSourceState(mode="ON"), gtids="")) is None  # refused
+    assert gtid_mode_to_record(
+        _v(GtidSourceState(problem="no-source-connection"), gtids=_SET)
+    ) is None  # unread: proceeds, records nothing
+    assert gtid_mode_to_record(
+        _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET)
+    ) == "ON"
+    assert gtid_mode_to_record(_v(GtidSourceState(mode="off_permissive"))) == "OFF_PERMISSIVE"
+    assert gtid_mode_to_record(
+        _v(GtidSourceState(mode="ON"), seedable=False, resumes=True, stack_mode="ON")
+    ) == "ON"
+
+
+def test_g20_the_gate_docstring_says_a_seedless_resume_rewrites_the_record() -> None:
+    # Review: the module docstring said a Start without a start point "leaves it alone". It
+    # writes the mode its check read (a seedless resume is due for the check) -- the very
+    # overwrite that closes residual (1) -- and only the Watermark* blanking leaves it be.
+    import dsql_migrator.ui.cdc_gtid_gate as gate
+
+    doc = " ".join((gate.__doc__ or "").split())
+    assert "a Start without a start point leaves it alone" not in doc
+    assert "writes the mode it read -- a resume with no start point included --" in doc
+    assert "a Start that could not read the mode writes nothing" in doc
+
+
+def test_g20_the_stack_record_refusal_copy() -> None:
+    from dsql_migrator.ui.cdc_start_point_gate import NO_SEED_LABEL
+
+    r = {**_all_refusals(), **_g20_refusals()}
+    resume = _notice(r["G2S-resume"][0])
+    assert resume[1] == "sync_problem" and resume[2] == G2_STACK_HEADER
+    body = resume[3]
+    assert body.startswith(
+        "This CDC stack last started while the source's gtid_mode was ON_PERMISSIVE, so its "
+        "source connector streamed by binlog file:position"
+    )
+    assert "set the source's gtid_mode back to ON_PERMISSIVE until cut over" in body
+    assert "streams from where this stack stopped by binlog file:position" in body
+    assert (
+        "Or Delete CDC infrastructure on the CDC step, deploy it again (a new stack has no "
+        "committed offset"
+    ) in body
+    assert RELOAD_RESETS_MANUAL in body
+    cdc_only = _notice(r["G2S-resume"][0], migration_type=_CDC_ONLY)[3]
+    assert "correct them on Aurora DSQL" in cdc_only and "Re-run Full Load" not in cdc_only
+    seeded = _notice(r["G2S-seeded"][0])[3]
+    assert "the offset seeder keeps the committed offset whenever the new point is not later " \
+           "than it" in seeded
+    assert (
+        "CDC then streams from binlog mysql-bin.000008:5150730 (or from where this stack "
+        "stopped, if that is later) by binlog file:position."
+    ) in seeded
+    # Unread with a record / on a first start.
+    stack = _notice(r["G3R-stack"][0])[3]
+    assert stack.startswith("This CDC stack last started while the source's gtid_mode was OFF")
+    assert stack.endswith("Start CDC again. No connectors were changed.")
+    first = _notice(r["G3R-first"][0])[3]
+    assert "records it on the stack" in first and "reading it failed (OperationalError)." in first
+    assert first.endswith("Start CDC again. No connectors were changed.")
+    on_record = _notice(
+        _v(GtidSourceState(problem="no-source-connection"), seedable=False, resumes=True,
+           stack_mode="ON")
+    )[3]
+    assert on_record.startswith("Start CDC reads the source's gtid_mode before every start")
+    # Tooltips, the point the copy names, and the activity line.
+    assert gtid_start_tooltip(r["G2S-resume"][0]) == BLOCK_TOOLTIP
+    assert gtid_start_tooltip(r["G2S-seeded"][0]) == BLOCK_TOOLTIP
+    assert gtid_start_tooltip(r["G3R-stack"][0]) == G3_TOOLTIP
+    assert gtid_start_tooltip(r["G3R-first"][0]) == G3_TOOLTIP
+    label, coord = gtid_notice_point(r["G2S-resume"][0], seed=_seed(), origin="full_load")
+    assert (label, coord) == (NO_SEED_LABEL, NO_SEED_LABEL)
+    assert gtid_notice_point(r["G2S-seeded"][0], seed=_seed(), origin="full_load")[1] == (
+        "binlog mysql-bin.000008:5150730"
+    )
+    detail = gtid_start_activity(r["G2S-resume"][0], coord=coord)[2]
+    assert detail == (
+        f"{G2_STACK_HEADER}: {NO_SEED_LABEL} (last started under gtid_mode=ON_PERMISSIVE)"
+    )
+    # G19's own copy is byte-identical (no "Delete CDC infrastructure" remedy there).
+    assert "Delete CDC infrastructure" not in _notice(r["G2-resume"][0])[3]
+    assert _notice(r["G2-seeded"][0])[2] == G2_HEADER
+
+
+# The G2S seeded refusal's way out after a redeploy: the held point (review), or a new one.
+_HELD_POINT_LEAD = (
+    "deploy it again (a new stack has no committed offset, so CDC then starts exactly at its "
+    "start point), then Start CDC again — from this start point if the source's gtid_mode was "
+    "already ON when it was recorded and has stayed ON since, or else from a new one: "
+)
+_NEW_POINT_LEAD = (
+    "deploy it again (a new stack has no committed offset, so CDC then starts exactly at its "
+    "start point) and give CDC a new start point: "
+)
+
+
+@pytest.mark.parametrize("migration_type", [_CDC_ONLY, _FL_CDC])
+@pytest.mark.parametrize("origin", ["full_load", "manual"])
+def test_g20_a_seed_a_new_stack_would_start_from_is_offered_after_the_redeploy(
+    migration_type, origin
+) -> None:
+    # Review: the operator turned gtid_mode ON, re-ran the Full Load (or fetched a point) as
+    # told, and started the old stack -- and the refusal asked for yet another new start
+    # point after the redeploy. A new stack has no committed offset, so the rules of a first
+    # start decide: a seed they accept is offered, with the one condition Start CDC cannot
+    # see (no change after the point lacks a GTID).
+    ok = GtidSourceState(mode="ON", **_OK_SUBSET)
+    for kw in ({"gtids": _SET, "cap": "ON"}, {"gtids": _SET}, {"gtids": "", "cap": "ON"}):
+        verdict = _v(ok, stack_mode="OFF", **kw)
+        assert verdict.kind == "mode-changed" and verdict.stack_mode == "OFF", kw
+        assert verdict.seed_fits_new_stack is True, kw
+        assert _v(ok, first_start=True, **kw).kind == "proceed", kw  # what a new stack says
+        body = _notice(verdict, origin=origin, migration_type=migration_type)[3]
+        assert _HELD_POINT_LEAD in body and _NEW_POINT_LEAD not in body, kw
+        assert "the offset seeder keeps the committed offset whenever the new point" in body
+        assert "set the source's gtid_mode back to ON_PERMISSIVE until cut over" in body
+
+
+def test_g20_a_seed_a_new_stack_would_refuse_keeps_the_new_start_point_remedy() -> None:
+    for state, kw in (
+        (GtidSourceState(mode="ON", **_OK_SUBSET), {"gtids": _SET, "cap": "OFF"}),
+        (GtidSourceState(mode="ON", **_OK_SUBSET), {"gtids": ""}),
+        (GtidSourceState(mode="ON", within_executed=True, covers_purged=False), {"gtids": _SET}),
+        (GtidSourceState(mode="ON", within_executed=False, covers_purged=True), {"gtids": _SET}),
+        (GtidSourceState(mode="ON", problem="check-failed", error_class="DataError"),
+         {"gtids": _SET}),
+    ):
+        verdict = _v(state, stack_mode="ON_PERMISSIVE", **kw)
+        assert verdict.kind == "mode-changed" and verdict.seed_fits_new_stack is False, kw
+        body = _notice(verdict)[3]
+        assert _NEW_POINT_LEAD in body and _HELD_POINT_LEAD not in body, kw
+    # Only a seeded start the stack's record refused carries it: never a resume (it holds no
+    # point later than the one the stack last started from, under a mode that was not ON).
+    resume = _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET, cap="ON", resumes=True,
+                stack_mode="OFF")
+    assert resume.kind == "mode-changed" and resume.seed_fits_new_stack is False
+    assert _NEW_POINT_LEAD in _notice(resume)[3]
+    for name, (verdict, _origin) in {**_all_refusals(), **_g20_refusals()}.items():
+        assert verdict.seed_fits_new_stack is (name == "G2S-seeded"), name
+    for record in ("ON", None):
+        assert _v(GtidSourceState(mode="ON", **_OK_SUBSET), gtids=_SET,
+                  stack_mode=record).seed_fits_new_stack is False
+
+
+_STOPPED_SEEDLESS = {
+    "MskBootstrapServers": "", "DeploySink": "true",
+    "WatermarkBinlogFile": "", "WatermarkBinlogPos": "", "WatermarkGtids": "",
+    "WatermarkTsSec": "",
+}
+
+
+def test_g20_the_probe_reads_the_stack_record_from_the_workers_describe(monkeypatch) -> None:
+    # Case 1: the stack's last Start had no start point to offer (Watermark* blank), so
+    # G19 saw no record and let a seedless resume continue by GTID.
+    params = dict(_STOPPED_SEEDLESS, StartGtidMode="ON_PERMISSIVE")
+    verdict, asked = _probe(monkeypatch, facts=_RESUME, stack_params=params)
+    assert verdict.kind == "mode-changed" and verdict.stack_mode == "ON_PERMISSIVE"
+    assert asked == [None]
+    # Case 2a: a set typed under OFF became WatermarkGtids.
+    params = dict(_STOPPED, WatermarkGtids=_SET, StartGtidMode="OFF")
+    assert _probe(monkeypatch, facts=_RESUME, stack_params=params)[0].kind == "mode-changed"
+    # The false refusal: started under ON from an empty set, resumed from a session without
+    # that point.
+    params = dict(_STOPPED, StartGtidMode="ON")
+    verdict, _ = _probe(monkeypatch, facts=_RESUME, stack_params=params)
+    assert (verdict.kind, verdict.positioning) == ("proceed", "gtid-resume")
+    # No record (an older stack): exactly G19's verdict.
+    assert _probe(monkeypatch, facts=_RESUME, stack_params=dict(_STOPPED))[0].kind == "no-gtid"
+
+
+def test_g20_the_probe_reads_the_stack_record_from_the_phase_probe_cache(monkeypatch) -> None:
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    state = DataMigrationState()
+    state.set_cdc_has_committed_offset(True)
+    state.set_cdc_deployed_gtid_mode("off")
+    verdict, _ = _probe(monkeypatch, facts=_RESUME, state=state)
+    assert verdict.kind == "mode-changed" and verdict.stack_mode == "OFF"
+    state.set_cdc_deployed_gtid_mode("ON")
+    assert _probe(monkeypatch, facts=_RESUME, state=state)[0].positioning == "gtid-resume"
+
+
+def test_g20_the_probe_requires_the_mode_on_a_first_start(monkeypatch) -> None:
+    from dsql_migrator.ui.data_migration._state import DataMigrationState
+
+    fresh = DataMigrationState()  # never streamed: no committed offset
+    verdict, _ = _probe(monkeypatch, mode=None, seed=_seed(gtids=_SET), state=fresh)
+    assert verdict.kind == "unreadable" and verdict.mode_required
+    # From the worker's describe of a never-started stack too.
+    verdict, _ = _probe(monkeypatch, mode=None, seed=_seed(gtids=_SET),
+                        stack_params={"MskBootstrapServers": "", "DeploySink": "false"})
+    assert verdict.kind == "unreadable" and verdict.mode_required
+    # A stack that streamed before, with no record: proceeds as before.
+    streamed = DataMigrationState()
+    streamed.set_cdc_has_committed_offset(True)
+    verdict, _ = _probe(monkeypatch, mode=None, facts=_RESUME, state=streamed)
+    assert verdict.positioning == "unknown-resume"
+    # ...and so does its seeded start (a newer start point): the phase probe's cached
+    # committed offset says it is not a first start (a resume alone could not tell).
+    verdict, _ = _probe(monkeypatch, mode=None, seed=_seed(gtids=_SET), state=streamed,
+                        facts=SimpleNamespace(resumes=False, live_mode=None))
+    assert (verdict.kind, verdict.positioning) == ("proceed", "unknown")
+    # Neither a state nor a describe (pure callers): not a first start.
+    verdict, _ = _probe(monkeypatch, mode=None, seed=_seed(gtids=_SET))
+    assert verdict.positioning == "unknown"

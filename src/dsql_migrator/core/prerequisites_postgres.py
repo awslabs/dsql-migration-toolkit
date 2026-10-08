@@ -285,6 +285,16 @@ class PostgresCdcFacts:
     # the row silently describe a different object than the connector will use.
     checked_publication_name: str = ""
     checked_slot_name: str = ""
+    # G20: per selected table, why publishing it would make its UPDATE/DELETE fail on the
+    # source -- the value-free phrase of ``cdc_pg_slot.replica_identity_problem``, graded
+    # from the live catalog by the SAME rule the Full Load's provisioning and the one-table
+    # ADD refuse on (a valid immediate primary key behind DEFAULT, a valid unique identity
+    # index behind USING INDEX, every partition of a partitioned table) -- or ``None`` for
+    # a table that is fine. ``None`` for the whole map means not read (a failed read, or
+    # facts built without it): grading then falls back to the relreplident code alone, as
+    # before. A table absent from a provided map was not found as a plain or partitioned
+    # table, and is graded by its code too.
+    replica_identity_problems: Optional[Mapping[str, Optional[str]]] = None
 
 
 def check_wal_level_logical(facts: PostgresCdcFacts) -> PrerequisiteResult:
@@ -487,10 +497,17 @@ def check_replica_identity(
 ) -> PrerequisiteResult:
     """PASS when ``table`` has a REPLICA IDENTITY usable for UPDATE/DELETE replication.
 
-    'd' (default, keyed on the primary key -- which ``check_table_primary_key`` already
-    requires), 'f' (full) and 'i' (index) are usable; 'n' (nothing) makes an UPDATE or
-    DELETE on the table ERROR on the publisher. An unknown/unreadable identity is a
-    non-blocking INFO (the connector remains the final authority).
+    'n' (nothing) -- on the table or on one of its partitions -- makes an UPDATE or DELETE
+    on it ERROR on the publisher, and so does an 'i' whose index is gone. Beyond the code,
+    the table is graded from the source's live catalog by the rule the Full Load's
+    provisioning refuses on before any write (``facts.replica_identity_problems``, G20):
+    'd' needs a valid primary key that is not DEFERRABLE -- PostgreSQL keeps 'd' when the
+    key is dropped, and the Step 1 inventory ``check_table_primary_key`` reads can predate
+    that -- 'i' a valid unique identity index, and a partitioned table a usable identity on
+    every partition. Any of those is a required FAIL. When that grading was not read, the
+    code alone decides, as before ('d'/'f'/'i' PASS). An identity index that is not the
+    primary key is a WARN; an unknown/unreadable identity is a non-blocking INFO (the
+    connector, and the Full Load's own fail-closed check, remain the final authority).
     """
     identity = facts.replica_identity.get(table.name)
     if identity is None:
@@ -564,6 +581,26 @@ def check_replica_identity(
                 "run ALTER TABLE ... REPLICA IDENTITY USING INDEX <index>, or use "
                 "REPLICA IDENTITY DEFAULT (primary key) / FULL.",
             )
+
+    # G20: the live-catalog grading the Full Load's provisioning refuses on before any
+    # write -- the same rule, so the operator learns it here, before the load. It stays
+    # AHEAD of the non-PK index WARN below (do not merge the two 'i' blocks): a partitioned
+    # parent can have a valid non-PK identity index while a partition has no usable key.
+    problems = facts.replica_identity_problems
+    problem = problems.get(table.name) if problems is not None else None
+    if problem:
+        return _fail(
+            f"{table.name} has no usable REPLICA IDENTITY on the source ({problem}), so "
+            "once it is in CDC's publication every UPDATE and DELETE on it would fail "
+            "there. PostgreSQL keeps the REPLICA IDENTITY setting when the key or index "
+            "behind it is dropped.",
+            f"Give {table.name} a valid primary key that is not DEFERRABLE, or run ALTER "
+            f"TABLE {table.name} REPLICA IDENTITY FULL (on a partitioned table, on each "
+            "partition: ALTER TABLE on the parent does not reach existing partitions), "
+            "then re-run the prerequisite checks.",
+        )
+
+    if identity == "i":
         # A non-PK identity index publishes only ITS columns in the before-image, so a
         # primary-key column outside that index is not carried for UPDATE/DELETE (Debezium
         # fills an absent NOT NULL key column with a placeholder -- 0, '' or its DEFAULT --

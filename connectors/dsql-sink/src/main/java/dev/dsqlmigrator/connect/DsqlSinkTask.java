@@ -58,7 +58,7 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
 
 /**
  * Applies Debezium change events to Aurora DSQL with idempotent PK upsert/delete,
- * statement-level OCC retry, &lt;=3,000-row batches, and IAM-token reconnect.
+ * OCC retry of each whole transaction, &lt;=3,000-row batches, and IAM-token reconnect.
  *
  * <p><b>Error handling (heterogeneous-engine policy).</b>
  * A change event that DSQL permanently rejects (type mismatch, constraint
@@ -68,8 +68,8 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * only transient failures are retried:
  *
  * <ul>
- *   <li><b>OCC 40001</b> — serialization failure: statement-level retry
- *       ({@link OccRetry}). Safe because apply is idempotent.</li>
+ *   <li><b>OCC 40001</b> — serialization failure: the whole transaction is re-run
+ *       ({@link OccRetry}: the chunk, or one row). Safe because apply is idempotent.</li>
  *   <li><b>Connectivity</b> — closed/expired connection (1h DSQL timeout, token
  *       expiry): reconnect and retry.</li>
  *   <li><b>Permanent</b> — any other SQLSTATE: do NOT retry; report the offending

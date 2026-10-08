@@ -200,10 +200,10 @@ VPC 内のプライベートなデータ経路（ソース → EC2 → DSQL）�
   サードパーティ API キー不要（スコープ限定の `bedrock:InvokeModel`）。
 - **CDC は別スタック**（`cdc-stack`）— Amazon MSK + Debezium → マネージド
   MSK Connect 上の**カスタム Aurora DSQL シンクコネクタ**
-  ([`connectors/dsql-sink/`](connectors/dsql-sink))。既製の JDBC シンクでは DSQL の
-  短命な IAM トークン、ステートメントレベルの OCC リトライ、≤3,000 行バッチに対応
-  できないため独自に構築しました。ツールはコントロールプレーンに留まり、シンクの
-  コンピューティングは持ちません。
+  ([`connectors/dsql-sink/`](connectors/dsql-sink))。既製の JDBC シンクでは DSQL の短
+  命な IAM トークン、OCC 競合 (`40001`: 競合したトランザクション全体をジッター付きバッ
+  クオフで再実行)、≤3,000 行のトランザクションに対応できないため独自に構築しました。ツ
+  ールはコントロールプレーンに留まり、シンクのコンピューティングは持ちません。
 
 > 詳しくは: [CDC と DSQL 制約](docs/manual/ja/04-cdc-and-dsql-constraints.md) ·
 > [パフォーマンスとチューニング](docs/manual/ja/07-performance-and-tuning.md)。

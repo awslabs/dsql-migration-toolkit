@@ -190,12 +190,16 @@ then reboot the writer; self-managed: `wal_level=logical` + restart) — require
 `rds_replication` membership on RDS/Aurora, plus `SELECT` on the migrated tables) —
 required; the source must be the cluster **writer, not a standby/reader**
 (`pg_is_in_recovery()=false`) — required; and every replicated table needs a usable
-**`REPLICA IDENTITY`** (a PK gives the default; otherwise `ALTER TABLE … REPLICA
-IDENTITY FULL`, since `REPLICA IDENTITY NOTHING` makes UPDATE/DELETE error on the
-publisher) — required. Replication-slot / `max_wal_senders` (walsender) headroom is a
-**warning** (non-blocking). There is **no binlog-retention concept** for PostgreSQL:
-the tool auto-creates the publication (for the exact migrated tables) and a `pgoutput`
-logical slot, and WAL is pinned by the slot instead (watch `wal_status` — an inactive,
+**`REPLICA IDENTITY`** (`DEFAULT` needs a valid primary key that is not `DEFERRABLE` —
+PostgreSQL keeps `DEFAULT` after the key is dropped, so the check reads the source's
+catalog — `USING INDEX` a valid unique index, and `FULL` always works; on a
+partitioned table every partition needs one. Without one, every UPDATE/DELETE on the
+table would fail on the source once it is published, so the CDC prerequisite check
+fails it, and the Full Load stops before it changes anything on the source) —
+required. Replication-slot / `max_wal_senders` (walsender) headroom is a **warning**
+(non-blocking). There is **no binlog-retention concept** for PostgreSQL: the tool
+auto-creates the publication (for the exact migrated tables) and a `pgoutput` logical
+slot, and WAL is pinned by the slot instead (watch `wal_status` — an inactive,
 unconsumed slot can fill the source disk).
 
 See [§1.1](01-setup.md#11-prerequisites) and

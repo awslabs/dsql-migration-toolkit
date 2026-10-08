@@ -861,6 +861,86 @@ def test_start_watermark_only_change_does_not_bounce_running_source() -> None:
     assert any("already RUNNING with the requested configuration" in m for m in captured)
 
 
+def _start_with_mode(deployer, *, start_gtid_mode, watermark="default",
+                     template_body="BUNDLED-TEMPLATE"):
+    captured: list[str] = []
+    run_cdc_start(
+        _FakeHandle(), stack_name=STACK, params=_start_params(), deployer=deployer,
+        on_log=lambda ts, msg: captured.append(msg), sleep=lambda _s: None,
+        watermark=_watermark() if watermark == "default" else watermark,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        start_gtid_mode=start_gtid_mode, template_body=template_body,
+    )
+    return captured
+
+
+def test_g20_start_records_the_gtid_mode_it_positions_under() -> None:
+    # The GTID check's mode is recorded on the stack (StartGtidMode) by the pass that
+    # creates the connectors, so the next Start knows whether this one ran under ON.
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    captured = _start_with_mode(deployer, start_gtid_mode=" on ")
+    assert len(deployer.updates) == 1
+    only = dict(deployer.updates[0])
+    assert only["StartGtidMode"] == "ON"
+    assert any(
+        "Recording source gtid_mode=ON on the stack (StartGtidMode)" in m for m in captured
+    )
+    # None (PostgreSQL, live connectors, an unread mode, scripts): nothing is sent, so the
+    # stack keeps its record (UsePreviousValue).
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    captured = _start_with_mode(deployer, start_gtid_mode=None)
+    assert "StartGtidMode" not in dict(deployer.updates[0])
+    assert not any("StartGtidMode" in m for m in captured)
+
+
+def test_g20_a_start_with_no_start_point_blanks_watermark_but_records_the_mode() -> None:
+    # Residual (1): a Start with nothing to offer blanks every Watermark* key -- the record
+    # must not live there.
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    _start_with_mode(deployer, start_gtid_mode="OFF", watermark=None)
+    only = dict(deployer.updates[0])
+    for key in ("WatermarkBinlogFile", "WatermarkBinlogPos", "WatermarkGtids",
+                "WatermarkTsSec"):
+        assert only[key] == "", key
+    assert only["StartGtidMode"] == "OFF"
+
+
+def test_g20_the_record_is_sent_only_with_a_template_that_declares_it() -> None:
+    # UsePreviousTemplate (no bundled template) on a stack deployed before G20: its template
+    # has no StartGtidMode, so sending one would fail the update -- skipped, judged as before.
+    older = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
+    )
+    _start_with_mode(older, start_gtid_mode="ON", template_body=None)
+    assert "StartGtidMode" not in dict(older.updates[0])
+    # The same with a stack that already declares it: recorded.
+    newer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"StartGtidMode": "OFF"},
+    )
+    _start_with_mode(newer, start_gtid_mode="ON", template_body=None)
+    assert dict(newer.updates[0])["StartGtidMode"] == "ON"
+
+
+def test_g20_the_record_never_bounces_running_connectors() -> None:
+    # Both RUNNING with the requested configuration: nothing is submitted, even with a mode
+    # to record -- and a stack whose recorded mode differs is not "changed".
+    params = dict(_connector_overrides(), StartGtidMode="OFF")
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["RUNNING"], SINK: ["RUNNING"]}, discovery_params=params,
+    )
+    captured = _start_with_mode(deployer, start_gtid_mode="ON")
+    assert deployer.updates == []
+    assert any("already RUNNING with the requested configuration" in m for m in captured)
+    assert not any("StartGtidMode" in m for m in captured)
+
+
 def test_start_bootstrap_fetch_failure_raises() -> None:
     handle = _FakeHandle()
     deployer = _FakeDeployer(bootstrap_error=CdcDeployError("not active"))

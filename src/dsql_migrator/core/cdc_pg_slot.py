@@ -34,6 +34,10 @@ writes the tool ever issues to a source, so they are confined to this module, wh
   (Property 7 -- no new credential surface; revealed only at connect), and
 - reports each write through an ``on_log`` callback so the caller can audit it.
 
+Before its first write, provisioning refuses to publish any table whose UPDATE/DELETE would
+then fail on the source -- no usable REPLICA IDENTITY, or one that cannot be read (G20) --
+with the same strict, fail-closed rule as the one-table ADD (G17).
+
 Slot/publication CREATION is wired at the Full Load consistency point
 (``_capture_postgres_watermark``); DROP is wired into CDC teardown BEFORE the source
 secret is deleted (a slot left behind pins WAL and can fill the source disk); the one-table
@@ -111,10 +115,12 @@ class PgPublicationMissingError(PgReplicationError):
 
 
 class PgReplicaIdentityError(PgReplicationError):
-    """A one-table add was refused BEFORE any write (G17): the table has no replica identity
-    PostgreSQL accepts for UPDATE/DELETE once it is published (``cause``, the value-free
-    phrase of :func:`replica_identity_problem`), or whether it has one could not be read
-    (``unreadable``, ``cause`` None) -- fail closed, never "usable"."""
+    """A one-table add (G17) -- or the Full Load's provisioning of its publication (G20) --
+    was refused BEFORE any write: a table has no replica identity PostgreSQL accepts for
+    UPDATE/DELETE once it is published (``cause``, the value-free phrase of
+    :func:`replica_identity_problem`; for provisioning, the first refused table's), or
+    whether it has one could not be read (``unreadable``, ``cause`` None) -- fail closed,
+    never "usable"."""
 
     def __init__(
         self, message: str, *, cause: Optional[str] = None, unreadable: bool = False
@@ -909,12 +915,15 @@ def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None
     relies on the primary key, which the prerequisite gate separately requires). Best-effort
     read: if relreplident is unreadable the table is not blocked here (the prereq owns that).
 
-    Only the Full Load's own ``CREATE PUBLICATION`` (:func:`provision_pg_replication`) uses
-    this lenient check, whose prerequisite run precedes the load. A one-table ADD after a Full
-    Load (:func:`add_table_to_publication`, G17 -- including the ADDs a reused publication
-    gets in :func:`create_publication`) cannot lean on that: the primary key the prerequisite
-    reads is the Step 1 inventory's, which can predate a dropped key. It runs the strict,
-    fail-closed :func:`_verify_table_publishable` instead.
+    Only :func:`provision_pg_replication` uses this lenient check, and since G20 only
+    second: the strict, fail-closed :func:`_verify_tables_publishable` runs first and grades
+    every table that provisioning would ADD to the publication (a valid immediate primary
+    key behind DEFAULT, a valid identity index behind USING INDEX, every partition) from
+    the source's live catalog -- the Step 1 inventory can predate a dropped key. This check
+    still refuses NOTHING for EVERY requested table, members of a reused publication
+    included, so nothing it refused before passes now. A one-table ADD after a Full Load
+    (:func:`add_table_to_publication`, G17) runs the strict per-table
+    :func:`_verify_table_publishable`.
     """
     names = list(tables)
     if not names:
@@ -976,6 +985,150 @@ def _verify_table_publishable(connection: object, table: str, *, publication: st
             "(on each partition of a partitioned table), then retry.",
             cause=problem,
         )
+
+
+# The provisioning refusal's one-line messages (G20). The JobManager keeps the first line of
+# the error, capped at 300 characters, so the leading table's name is clipped and partition
+# names are left to the per-table audit lines.
+_PUBLISH_NAME_LIMIT = 32
+_PUBLISH_READ_FAILED = (
+    "Whether each table to publish for CDC (and each partition) has a usable REPLICA "
+    "IDENTITY could not be read ({cls}). Nothing was changed on the source: check that it "
+    "is reachable from the tool, then run the Full Load again."
+)
+
+
+def _clip_table_name(name: str) -> str:
+    if len(name) <= _PUBLISH_NAME_LIMIT:
+        return name
+    return name[: _PUBLISH_NAME_LIMIT - 3] + "..."
+
+
+def _publish_remedy(read: ReplicaIdentityUsability) -> str:
+    """The fix for one refused table, by its cause. Pure.
+
+    A new primary key does not repair NOTHING or a USING INDEX whose index is gone
+    (PostgreSQL keeps ``relreplident``; only ALTER TABLE ... REPLICA IDENTITY changes it),
+    and a DEFERRABLE key is no replica identity -- so "give it a primary key" fits DEFAULT
+    alone. A partitioned table's leaves carry the identity (ALTER TABLE on the parent does
+    not reach existing partitions); its own NOTHING is the parent's to fix.
+    """
+    if read.kind == "p":
+        if read.identity == "n":
+            return (
+                "set REPLICA IDENTITY FULL on it and on each partition"
+                if read.unusable_partitions > 0
+                else "set REPLICA IDENTITY FULL on it, or DEFAULT with a primary key"
+            )
+        return "set REPLICA IDENTITY FULL on each partition"
+    if read.identity == "d":
+        return "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"
+    return "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"
+
+
+def _publish_refusal_message(
+    unusable: "Sequence[tuple[str, str, ReplicaIdentityUsability]]",
+    missing: Sequence[str],
+) -> str:
+    """The one-line refusal for :func:`_verify_tables_publishable`: the leading table (the
+    first unusable one, else the first not found), its cause (partition names dropped:
+    they are in the audit lines), how many more were refused, and the remedy for that
+    cause (:func:`_publish_remedy`). Pure."""
+    others = len(unusable) + len(missing) - 1
+    more = f" (+{others} more table{'s' if others != 1 else ''})" if others > 0 else ""
+    if unusable:
+        name, problem, read = unusable[0]
+        cause = problem.split(": ", 1)[0]
+        return (
+            f"{_clip_table_name(name)}: {cause}{more}. Published for CDC, its UPDATE/DELETE "
+            f"would fail on the source. Nothing was changed there: {_publish_remedy(read)}, "
+            "then re-run the Full Load."
+        )
+    return (
+        f"{_clip_table_name(missing[0])}: not found on the source as a table{more}, so its "
+        "REPLICA IDENTITY could not be checked. Nothing was changed there: re-run Step 1 "
+        "(Evaluation) if it was dropped or renamed, then run the Full Load again."
+    )
+
+
+def _verify_tables_publishable(
+    connection: object,
+    tables: Sequence[str],
+    *,
+    publication: str,
+    widened: Sequence[str] = (),
+    on_log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Refuse -- BEFORE any write -- to publish a table whose UPDATE/DELETE would then fail
+    on the source (G20): :class:`PgReplicaIdentityError`, fail closed.
+
+    The Full Load's provisioning check (:func:`provision_pg_replication`), with the strict
+    rule of :func:`_verify_table_publishable` (G17) for every table this provisioning would
+    add to ``publication``: all of ``tables`` when it does not exist yet, those it lacks
+    (membership rolled up to the partition root, as :func:`add_table_to_publication`
+    decides) when it does, none for a ``FOR ALL TABLES`` one. Members are not graded here
+    (the lenient NOTHING check still covers every requested table). One membership read and
+    ONE catalog read (:func:`read_replica_identity_usability`). A table in ``widened`` --
+    one provisioning sets REPLICA IDENTITY FULL on just before the publication -- is graded
+    as FULL: a plain table then passes, while a partitioned one is still graded by its
+    leaves (only the parent is widened). A failed read, or a table not found as a plain or
+    partitioned table, refuses too: unreadable is not usable. Every refused table gets one
+    audit line through ``on_log`` (sorted, so the result is deterministic); the error
+    message is one bounded line (:func:`_publish_refusal_message`).
+    """
+    requested = sorted({str(t) for t in tables or () if t})
+    try:
+        membership = _publication_membership(connection, publication)
+        if membership is None:
+            candidates = requested
+        elif membership[0]:
+            candidates = []  # FOR ALL TABLES: nothing is added
+        else:
+            candidates = sorted(set(requested) - set(membership[1]))
+        reads = read_replica_identity_usability(connection, candidates) if candidates else {}
+    except Exception as exc:  # noqa: BLE001 - unreadable is not usable
+        cls = type(exc).__name__[:64]
+        if on_log is not None:
+            on_log(
+                f"refused before any write: the REPLICA IDENTITY read failed ({cls}), so "
+                "nothing is published"
+            )
+        raise PgReplicaIdentityError(
+            _PUBLISH_READ_FAILED.format(cls=cls), unreadable=True
+        ) from exc
+    widened_set = {str(t) for t in widened or ()}
+    unusable: list[tuple[str, str, ReplicaIdentityUsability]] = []
+    missing: list[str] = []
+    for name in candidates:
+        read = reads.get(name)
+        if read is None:
+            missing.append(name)
+            continue
+        if name in widened_set:
+            # Provisioning sets it FULL before the publication; a partitioned table's
+            # leaves are not widened, so they are still graded.
+            read = read._replace(identity="f", usable=True)
+        problem = replica_identity_problem(read)
+        if problem:
+            unusable.append((name, problem, read))
+    if not unusable and not missing:
+        return
+    if on_log is not None:
+        for name, problem, _read in unusable:
+            on_log(
+                f"refused before any write: {name} has no usable REPLICA IDENTITY "
+                f"({problem}), so it is not published"
+            )
+        for name in missing:
+            on_log(
+                f"refused before any write: {name} was not found on the source as a table, "
+                "so it is not published"
+            )
+    raise PgReplicaIdentityError(
+        _publish_refusal_message(unusable, missing),
+        cause=unusable[0][1] if unusable else None,
+        unreadable=not unusable,
+    )
 
 
 def pg_sqlstate(exc: BaseException) -> Optional[str]:
@@ -1161,7 +1314,10 @@ def create_publication(
     G17) is ADDED, one audited ``ADD TABLE`` each (:func:`add_table_to_publication`, which
     first refuses -- raises -- a table whose UPDATE/DELETE publishing would break) --
     never left unreplicated (pgoutput only streams a publication's members), and never by
-    dropping the publication. :func:`provision_pg_replication` then creates the new slot,
+    dropping the publication. The fresh ``CREATE`` has no identity check of its own: its
+    one caller, :func:`provision_pg_replication`, grades every table it would publish
+    before any write (G20), which also refuses before the first of those ADDs.
+    :func:`provision_pg_replication` then creates the new slot,
     whose creation waits out the transactions open at that moment, so its consistent point
     decodes every change after it. One that COVERS every requested table and lists more (a
     Full load + CDC re-run over a set narrowed after its first load, G16) is reused as is,
@@ -1342,15 +1498,31 @@ def provision_pg_replication(
     IDENTITY FULL. A FULL-identity ALTER that fails RAISES (before the slot is created), so
     the handoff never silently starts without the wider before-image.
 
-    Refuses upfront if any table lacks a usable REPLICA IDENTITY (a source-write outage
-    guard). On AUTOCOMMIT the publication commits immediately, so if slot creation then
-    fails, a publication CREATED by this call is dropped (compensating) rather than left
-    orphaned on the source. (A REPLICA IDENTITY FULL set here is left in place on a later
-    failure -- it is a benign, reversible widening of the before-image, not an orphaned
-    object arming a write outage.)
+    Refuses upfront -- BEFORE any write: no ALTER TABLE, no publication, no slot -- if a
+    table it would publish has no usable REPLICA IDENTITY, or whether it has one cannot be
+    read (:func:`_verify_tables_publishable`, G20: the strict, fail-closed rule the one-table
+    ADD applies; a re-keyed plain table about to be set FULL passes, a partitioned one is
+    graded by its partitions), and if any requested table is REPLICA IDENTITY NOTHING
+    (:func:`_verify_tables_replicable`) -- a source-write outage guard. On a reused
+    publication the up-front check covers every table it would add, so a refusal never
+    leaves some of them added. On AUTOCOMMIT the publication commits immediately, so if
+    slot creation then fails, a publication CREATED by this call is dropped (compensating)
+    rather than left orphaned on the source. (A REPLICA IDENTITY FULL set here is left in
+    place on a later failure -- it is a benign, reversible widening of the before-image,
+    not an orphaned object arming a write outage.)
     """
-    # Source-safety guard (independent of the advisory prereq): never publish a table
-    # whose UPDATE/DELETE would then ERROR on the source publisher.
+    # Source-safety guards (independent of the advisory prerequisite), both BEFORE the
+    # first write: never publish a table whose UPDATE/DELETE would then ERROR on the source
+    # publisher. The strict, fail-closed check grades every table this call would add to
+    # the publication (G20); the lenient one keeps refusing NOTHING for every requested
+    # table, members of a reused publication included.
+    _verify_tables_publishable(
+        connection,
+        tables,
+        publication=publication_name,
+        widened=full_identity_tables,
+        on_log=on_log,
+    )
     _verify_tables_replicable(connection, tables)
     # Re-keyed tables need the full before-image (leading key column) BEFORE the slot's LSN.
     set_replica_identity_full(connection, full_identity_tables, on_log=on_log)

@@ -104,11 +104,16 @@ plus a pointer to the chapter that covers it in depth.
       (a superuser, the **REPLICATION** role attribute, or **`rds_replication`**
       membership on RDS/Aurora); the source must be the cluster **writer**
       endpoint, not a standby (`pg_is_in_recovery()` = false); and **every
-      replicated table needs a usable `REPLICA IDENTITY`** — a primary key gives
-      the default, otherwise set `ALTER TABLE … REPLICA IDENTITY FULL`
-      (`REPLICA IDENTITY NOTHING` is refused). Replication-slot / walsender
-      **headroom** is checked as a non-blocking **warn**. The tool auto-creates the
-      **publication** and **logical replication slot** for you.
+      replicated table needs a usable `REPLICA IDENTITY`**: `DEFAULT` needs a valid
+      primary key that is not `DEFERRABLE` (PostgreSQL keeps `DEFAULT` after the key
+      is dropped, so the check reads the source's catalog), `USING INDEX` a valid
+      unique index, and `FULL` always works; on a partitioned table every partition
+      needs one. Without one, every UPDATE/DELETE on the table would fail on the
+      source once it is published, so the CDC prerequisite check fails it, and the
+      Full Load stops before it changes anything on the source (no publication, no
+      slot). Replication-slot / walsender **headroom** is checked as a non-blocking
+      **warn**. The tool auto-creates the **publication** and **logical replication
+      slot** for you.
 
 - [ ] **CDC replicates data, not schema.** During CDC, source **DDL** changes are
       **not** propagated to DSQL — you make the matching change on Aurora DSQL

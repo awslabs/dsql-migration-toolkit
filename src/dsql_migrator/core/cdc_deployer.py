@@ -62,6 +62,7 @@ from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import (
     CDC_PLACEHOLDER_PREFIX,
     CDC_STACK_NAME_PREFIX,
+    CDC_START_GTID_MODE_PARAM,
     CDC_WATERMARK_PARAM_KEYS,
     CdcInfraParams,
     CdcStackParams,
@@ -2032,6 +2033,9 @@ def run_cdc_start(
     # The app's own connector-log reader (MySQL Start CDC passes the MSK Connect
     # controller's), read before the deployer's: see _read_connector_log.
     log_tail: Optional[ConnectorLogReader] = None,
+    # MySQL only: the source gtid_mode this Start's GTID check read (G20), recorded on the
+    # stack as StartGtidMode. None sends nothing and the stack keeps its record.
+    start_gtid_mode: Optional[str] = None,
 ) -> None:
     """Start CDC with a SINGLE-pass update that creates both connectors at once.
 
@@ -2081,6 +2085,16 @@ def run_cdc_start(
     connector create is diagnosed from it first, so the cause is named even when the
     deployer's identity (CdcDeployRole) cannot read the log group. ``None`` keeps every
     failure message exactly as before.
+
+    ``start_gtid_mode`` (MySQL, optional) is the source's ``gtid_mode`` the Start's GTID
+    check read just before (G20). The pass that creates the connectors records it on the
+    stack as ``StartGtidMode`` (normalized: stripped, upper-cased, at most 32 characters),
+    and Stop carries it forward, so the next Start's GTID check knows whether this one
+    positioned under ``ON`` -- the only mode under which Debezium advances the GTID set in
+    its offset. Like Watermark*, it is kept OUT of the connector overrides and the
+    config-changed comparison, so a mode-only change never bounces a running connector, and
+    the both-RUNNING fast path sends nothing. ``None`` (PostgreSQL, a stack whose
+    connectors exist, an unread mode, scripts) sends nothing: the stack keeps its record.
     """
     driver = _StageDriver(
         handle, stages=CDC_START_STAGES, on_log=on_log, sleep=sleep
@@ -2172,8 +2186,9 @@ def run_cdc_start(
         # connector-control overrides shared by both passes. Watermark* keys are
         # never part of params.filled (they come from the separate watermark arg),
         # so they cannot leak into config_changed; we also defensively exclude them
-        # here so a watermark-only change can never bounce a RUNNING source.
-        _seed_keys = set(CDC_WATERMARK_PARAM_KEYS)
+        # here so a watermark-only change can never bounce a RUNNING source. The
+        # StartGtidMode record (G20) is excluded the same way.
+        _seed_keys = set(CDC_WATERMARK_PARAM_KEYS) | {CDC_START_GTID_MODE_PARAM}
         connector_overrides = [
             kv
             for kv in params.filled
@@ -2258,6 +2273,22 @@ def run_cdc_start(
                 *watermark_overrides,
                 *connector_overrides,
             ]
+            # G20: the gtid_mode this Start positions under, recorded on the stack (its own
+            # parameter: Watermark* are blanked by a Start with no start point). Never part
+            # of connector_overrides / config_changed, so it never bounces a connector.
+            # Only with a template that declares it: the bundled one (always sent by the
+            # UI's Start), or the stack's own when it already has the parameter -- sent with
+            # UsePreviousTemplate to an older stack it would fail the update.
+            _recorded_mode = str(start_gtid_mode or "").strip().upper()[:32]
+            if _recorded_mode and (
+                template_body is not None
+                or CDC_START_GTID_MODE_PARAM in (discovery.current_parameters or {})
+            ):
+                start_pass.append((CDC_START_GTID_MODE_PARAM, _recorded_mode))
+                driver.log(
+                    f"Recording source gtid_mode={_recorded_mode} on the stack "
+                    "(StartGtidMode): the next Start checks it before it continues by GTID."
+                )
             # SeedMode=External (Lambda-free): the app does the CDC Kafka prep
             # IN-PROCESS here — pre-create the compacted offset topic + per-table
             # data topics + DLQ topic, and seed the connect-offsets record from the

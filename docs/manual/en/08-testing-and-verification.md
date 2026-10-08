@@ -48,7 +48,7 @@ transaction must **re-run**, and under contention this happens often.
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| 40001 conflict on a write | A batch hits a serialization conflict, then succeeds on retry | Statement-level retry with backoff/jitter recovers (`test_occ_conflict_on_batch_is_retried_then_succeeds`); the same logic in the CDC sink (`OccRetryTest.java`) |
+| 40001 conflict on a write | A batch hits a serialization conflict, then succeeds on retry | The whole batch — one transaction — is re-run with backoff/jitter and succeeds (`test_occ_conflict_on_batch_is_retried_then_succeeds`); the CDC sink re-runs its chunk's transaction the same way (`OccRetryTest.java`) |
 | Retry budget exhausted | Conflicts never clear | Recorded as a **failure**, never silently dropped (`test_exhausted_occ_conflict_is_recorded_as_failure`) |
 | High concurrency vs. connection quota (10,000/cluster, 100/s) | Many tables × many batches at once | Total in-flight connections stay bounded (`test_parallel_connection_use_is_bounded`); default 4 tables × 8 batches = 32 ≪ quota |
 

@@ -1256,3 +1256,118 @@ def test_general_chat_follows_a_source_connected_after_the_streamer_was_built() 
     assert "migrating a PostgreSQL database" in system
     assert "THIS PostgreSQL -> Aurora DSQL migration" in system
     assert "migrating a MySQL database" not in system
+
+
+# ---------------------------------------------------------------------------
+# G20: a reply latches (or clears) only the verdict of the settings it was sent with
+# ---------------------------------------------------------------------------
+
+
+def _g20_in_flight(state, outcome, mutate):  # noqa: ANN001, ANN202
+    """Open a turn whose reply is held until ``mutate(state)`` ran, then deliver
+    ``outcome`` and pump the turn to its end. Returns the panel's ui double."""
+    import threading
+
+    release = threading.Event()
+
+    def blocking_streamer(messages, on_delta):  # noqa: ANN001
+        release.wait(timeout=5)
+        return outcome
+
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.open_scope(
+        scope_id="general", title="general",
+        streamer=blocking_streamer, seed_question="What should I do next?",
+    )
+    mutate(state)
+    release.set()
+    _pump(ui)
+    return ui
+
+
+def _g20_denied(detail: str = "DENIED-COPY") -> ObjectGuidanceOutcome:
+    return ObjectGuidanceOutcome(
+        available=False, reason="ACCESS_DENIED", detail=detail, markdown="", model_id=None,
+    )
+
+
+def _g20_ok() -> ObjectGuidanceOutcome:
+    return ObjectGuidanceOutcome(
+        available=True, reason="OK", detail="", markdown="fine", model_id="fake-model",
+    )
+
+
+def _g20_other_model(state) -> None:  # noqa: ANN001
+    state.set_ai_assist(state.ai_assist.model_copy(update={"model_id": "other-model"}))
+
+
+def test_g20_a_denial_for_a_model_switched_away_from_does_not_latch_the_new_one() -> None:
+    state = _enabled_state()
+    ui = _g20_in_flight(state, _g20_denied(), _g20_other_model)
+    assert state.ai_verified is None and state.ai_unavailable_detail is None
+    # The reply's own bubble still says what happened to it.
+    assert any(el.text == "AI reply unavailable" for el in ui.labels)
+
+
+def test_g20_an_in_place_model_change_counts_too() -> None:
+    state = _enabled_state()
+
+    def mutate(st) -> None:  # noqa: ANN001
+        st.ai_assist.model_id = "other-model"  # mutated in place: no verdict reset
+
+    _g20_in_flight(state, _g20_denied(), mutate)
+    assert state.ai_verified is None and state.ai_unavailable_detail is None
+
+
+def test_g20_a_late_success_does_not_clear_the_new_models_latch() -> None:
+    state = _enabled_state()
+
+    def mutate(st) -> None:  # noqa: ANN001
+        _g20_other_model(st)
+        st.set_ai_verified(False, "X")  # the new model was denied meanwhile
+
+    _g20_in_flight(state, _g20_ok(), mutate)
+    assert state.ai_verified is False and state.ai_unavailable_detail == "X"
+
+
+def test_g20_a_profile_change_mid_reply_does_not_latch() -> None:
+    state = _enabled_state()
+    _g20_in_flight(state, _g20_denied(), lambda st: st.set_aws_profile("dev"))
+    assert state.ai_verified is None
+
+
+def test_g20_a_change_undone_mid_reply_still_latches() -> None:
+    state = _enabled_state()
+    original = state.ai_assist.model_id
+
+    def mutate(st) -> None:  # noqa: ANN001
+        _g20_other_model(st)
+        st.set_ai_assist(st.ai_assist.model_copy(update={"model_id": original}))
+
+    _g20_in_flight(state, _g20_denied("DENIED-COPY"), mutate)
+    assert state.ai_verified is False and state.ai_unavailable_detail == "DENIED-COPY"
+
+
+def test_g20_switching_ai_off_mid_reply_neither_latches_nor_clears() -> None:
+    def off(st) -> None:  # noqa: ANN001
+        st.ai_assist.enabled = False
+
+    denied = _enabled_state()
+    _g20_in_flight(denied, _g20_denied(), off)
+    assert denied.ai_verified is None
+    latched = _enabled_state()
+    latched.set_ai_verified(False, "X")
+    _g20_in_flight(latched, _g20_ok(), off)
+    assert latched.ai_verified is False and latched.ai_unavailable_detail == "X"
+
+
+def test_g20_ai_settings_key_is_by_value() -> None:
+    from dsql_migrator.ui.ai_assist import ai_settings_key
+
+    state = _enabled_state()
+    before = ai_settings_key(state)
+    assert before == (True, state.ai_assist.model_id, state.ai_assist.region, None)
+    state.ai_assist.region = "us-west-2"  # in place
+    assert ai_settings_key(state) != before
+    assert ai_settings_key(None) == (False, None, None, None)

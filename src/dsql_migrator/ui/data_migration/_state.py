@@ -471,6 +471,13 @@ class DataMigrationState:
         # stack offered a position with no GTID set streamed by file:position. None: no
         # recorded position, or not read (unknown).
         self.cdc_deployed_watermark_gtids: Optional[str] = None
+        # MySQL: the source gtid_mode the stack's last Start positioned under (its
+        # StartGtidMode, G20, upper-cased), from the same describe -- or the mode this
+        # session's last Start sent. Kept apart from Watermark* (a Start with no start
+        # point blanks those). The GTID start check reads it before any later Start: a
+        # stack last started while gtid_mode was not ON cannot continue by GTID. None: no
+        # record (an older stack, one never started) or not read. Transient.
+        self.cdc_deployed_gtid_mode: Optional[str] = None
         # The LATEST binlog (file, pos) a Start offered the seeder on this stack. A Start
         # that fails after seeding leaves it in the offsets topic, and the seeder never
         # rewinds -- so a later, earlier start point would silently not apply.
@@ -1355,8 +1362,10 @@ class DataMigrationState:
                 # discovery reads this one's. REPLICA IDENTITY findings are kept: they are
                 # about target tables, whichever stack produced the loss.
                 self.cdc_deployed_message_key_columns = None
-                # The snapshot-mode facts describe the previously-targeted stack too.
+                # The snapshot-mode facts describe the previously-targeted stack too, and
+                # so does its gtid_mode record (G20).
                 self.cdc_deployed_snapshot_mode = None
+                self.cdc_deployed_gtid_mode = None
                 self.cdc_history_missing = False
                 # ...and so does why its connectors stopped (names embed the stack name).
                 self._clear_cdc_connector_diagnoses_locked(None)
@@ -1374,8 +1383,10 @@ class DataMigrationState:
             self.cdc_probe_error = None  # a successful probe clears any prior failure
             if phase == "absent":
                 self.cdc_offered_seed = None  # a new stack gets a new offsets topic
-                # ...and a new schema history, and no connectors (nor why they stopped).
+                # ...and a new schema history, and no connectors (nor why they stopped),
+                # and no gtid_mode record (G20).
                 self.cdc_deployed_snapshot_mode = None
+                self.cdc_deployed_gtid_mode = None
                 self.cdc_history_missing = False
                 self._clear_cdc_connector_diagnoses_locked(None)
 
@@ -1447,6 +1458,7 @@ class DataMigrationState:
             self.cdc_deployed_column_exclude_list = None
             self.cdc_deployed_watermark = None
             self.cdc_deployed_watermark_gtids = None
+            self.cdc_deployed_gtid_mode = None
             self.cdc_offered_seed = None
             self.cdc_deployed_snapshot_mode = None
             self.cdc_history_missing = False
@@ -1734,6 +1746,14 @@ class DataMigrationState:
             self.cdc_deployed_watermark_gtids = (
                 str(gtids) if value and gtids is not None else None
             )
+
+    def set_cdc_deployed_gtid_mode(self, value: Optional[str]) -> None:
+        """Record the source gtid_mode the stack's last MySQL Start positioned under (its
+        StartGtidMode, G20; upper-cased, at most 32 characters). Blank or ``None``: no
+        record."""
+        text = str(value or "").strip().upper()[:32]
+        with self._lock:
+            self.cdc_deployed_gtid_mode = text or None
 
     def set_cdc_deployed_snapshot_mode(self, value: Optional[str]) -> None:
         """Record the SnapshotMode of a stack whose connectors exist (``None``: none)."""

@@ -20,7 +20,7 @@ large-scale migration, this is the technical case.
 
 ## 7.1 Why this design (the technical case)
 
-### Statement-level OCC retry, not batch-level
+### OCC retry of small, idempotent transactions
 
 Aurora DSQL is **lock-free**: it never takes row locks, and detects write
 conflicts **at commit time**, returning `SQLSTATE 40001` (a serialization
@@ -28,14 +28,25 @@ failure — `OC000` data conflict or `OC001` schema conflict). The losing
 transaction must **re-run**, and AWS explicitly notes that with OCC, "applications
 [must] exercise this logic **more frequently**" than with lock-based databases.
 
-A stock JDBC sink retries the **whole batch** on `40001`. At large scale with
-bounded parallelism that is the wrong unit: re-submitting all ~3000 rows
-re-pays the read/write work for the 99%+ that never conflicted, and the larger
-key range a transaction spans, the more likely *another* worker touches it before
-the retry commits — pushing a busy load toward livelock. This tool retries at the
-**statement level**: only the conflicting `INSERT … ON CONFLICT` re-runs, so each
-conflict is local and bounded. This is exactly why a custom DSQL sink connector
-exists instead of a stock JDBC sink (see [Chapter 4 §4.1](04-cdc-and-dsql-constraints.md#41-the-pipeline)).
+The unit that loses a conflict is a transaction, so the tool re-runs the
+**whole transaction** — and keeps every transaction small and idempotent, so a
+re-run is cheap and safe. A Full Load batch is one multi-row `INSERT` of at most
+3,000 rows in its own transaction; the CDC sink applies a chunk of at most 3,000
+rows in one transaction (one row per transaction while it isolates a rejected
+row). Every write is keyed by primary key, so applying one twice changes nothing.
+A `40001` is retried with exponential backoff (50 ms base, 5 s cap) and full
+jitter, up to 20 attempts per Full Load batch (a budget it shares with dropped
+connections and expired IAM tokens) and up to 10 per sink transaction, so workers
+that collided do not retry in lockstep and collide again — the pattern that pushes
+a busy load toward livelock — and bounded parallelism caps how many writers
+contend at once. A dropped connection or an expired IAM token is reconnected and
+retried too. Any other error is not retried:
+the Full Load splits the batch down to the rejected row and quarantines it, and
+the sink sends it to the DLQ, while every healthy row still lands. A stock JDBC
+sink cannot authenticate with DSQL's short-lived IAM tokens and has no
+DSQL-specific handling of these conflicts, which is why a custom DSQL sink
+connector exists (see
+[Chapter 4 §4.1](04-cdc-and-dsql-constraints.md#41-the-pipeline)).
 
 ### Primary-key strategy — avoid hot partitions
 
@@ -134,11 +145,11 @@ Deferring pays that cost once, over the stable dataset.
 DSQL is shared-nothing and serverless — there is no PostgreSQL logical-replication
 slot to target, and a generic tool's "full load" is JDBC `INSERT` under the hood
 with **no** DSQL-specific OCC handling. The tool's purpose-built loader is keyset
-streaming (resumable, bounded memory), DSQL-envelope-aware batching, statement
--level OCC retry, and PK remapping in one path. For the cut-over, **Debezium → MSK
-→ custom sink** decouples the source binlog from the apply: Kafka durably buffers
-changes so the sink can fall behind during an OCC retry burst **without** losing
-events or stalling the source's binlog rotation.
+streaming (resumable, bounded memory), DSQL-envelope-aware batching, OCC retry of
+each batch's transaction, and PK remapping in one path. For the cut-over,
+**Debezium → MSK → custom sink** decouples the source binlog from the apply: Kafka
+durably buffers changes so the sink can fall behind during an OCC retry burst
+**without** losing events or stalling the source's binlog rotation.
 
 ### Reading ahead of the write pool (bounded prefetch queue)
 

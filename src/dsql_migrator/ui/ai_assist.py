@@ -173,6 +173,26 @@ AI_LATCHING_REASONS: frozenset[str] = frozenset(
 )
 
 
+def ai_settings_key(state: object) -> tuple:
+    """The AI settings a verdict is about, BY VALUE: ``(enabled, model_id, region,
+    aws_profile)``. Pure; a missing state or config reads as off.
+
+    A reply or a Verify AI access result arrives after the request was sent, while the
+    switch, the model, the region and the AWS profile stay editable. Capture this key when
+    the request is SENT and compare it when the result ARRIVES: only a result whose key is
+    unchanged may latch (or clear) the session's AI verdict -- otherwise it would be
+    recorded against settings it never checked (G20). Values, not the config object, which
+    can be mutated in place.
+    """
+    config = getattr(state, "ai_assist", None)
+    return (
+        bool(getattr(config, "enabled", False)),
+        getattr(config, "model_id", None),
+        getattr(config, "region", None),
+        getattr(state, "aws_profile", None),
+    )
+
+
 def ai_is_usable(state: object) -> bool:
     """Return ``True`` when an AI affordance should be live and clickable.
 
@@ -456,6 +476,7 @@ __all__ = [
     "AI_UNAVAILABLE",
     "ai_availability",
     "AI_LATCHING_REASONS",
+    "ai_settings_key",
     "ai_is_usable",
     "ai_unavailable_hint",
     "AiConversionAssistant",

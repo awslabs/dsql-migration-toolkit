@@ -40,7 +40,11 @@ publication을 생성하고 teardown 시 삭제합니다. 또한 재키잉된 �
 publication의 `publish_via_partition_root`를 바로잡으며, Full Load 이후 선택한 테이블(Full load + CDC,
 CDC를 시작하기 전)을 복사하기 직전에 그 publication에 추가한 뒤, 그 시점에 열려 있던 트랜잭션을 기다리기
 위해 트랜잭션 ID를 하나 받습니다. 모두 autocommit이고, 소규모 allowlist로 제한되며, 감사됩니다. 이것이
-도구가 어떤 소스에든 수행하는 유일한 쓰기입니다.
+도구가 어떤 소스에든 수행하는 유일한 쓰기입니다. 워터마크 시점에 publication을 만들거나 거기에 테이블을
+추가하기 전에, 추가할 모든 테이블에 사용 가능한 `REPLICA IDENTITY`가 있는지 확인하며, 없으면 실행은
+소스에서 아무것도 바꾸기 전에 멈추고 그 테이블을 알려 줍니다. Full Load 이후 선택한 테이블도 추가하기
+전에 같은 확인을 거치며, 없으면 그 테이블은 로드되지 않고 그 행에 이유가 표시됩니다
+([13.7](13-excluding-tables-and-columns.md)).
 
 ---
 

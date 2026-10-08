@@ -55,13 +55,15 @@ class _FakeConn:
     The one-table ADD's identity read (:func:`read_replica_identity_usability`) answers
     ``usability[table]`` -- ``(relkind, relreplident, usable, unusable partitions, sample)``
     -- else a plain table usable unless its ``replident`` is 'n'; ``usability_error`` makes
-    that read raise.
+    that read raise, and ``usability_absent`` leaves the named tables out of its answer (not
+    found on the source as a table, G20).
     """
 
     def __init__(
         self, *, pubs=None, slots=(), lsn="3/AF012B8", replident=None,
         fail_slot_create=False, all_tables=(), add_errors=None, xid="7001",
         xmin_ready=(True,), poll_error=None, usability=None, usability_error=None,
+        usability_absent=(),
     ):
         self.statements: list[tuple[str, dict]] = []
         self._pubs = {k: list(v) for k, v in dict(pubs or {}).items()}
@@ -76,6 +78,7 @@ class _FakeConn:
         self._poll_error = poll_error
         self._usability = dict(usability or {})
         self._usability_error = usability_error
+        self._usability_absent = set(usability_absent)
         self.polls = 0
 
     def execute(self, statement, params=None):
@@ -90,6 +93,8 @@ class _FakeConn:
                 raise self._usability_error
             rows = []
             for name in params.get("names") or []:
+                if name in self._usability_absent:
+                    continue
                 if name in self._usability:
                     rows.append((name, *self._usability[name]))
                 else:
@@ -1235,3 +1240,267 @@ def test_runtime_grade_matches_start_prerequisite(identity, weak_partitions, key
     assert grade_rekeyed_replica_identity("app.t", key, read) == expected
     # A missing row is always unknown -- never "not re-keyed", never FULL.
     assert grade_rekeyed_replica_identity("app.t", key, None) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# G20: the Full Load's fresh publication refuses -- BEFORE any write -- a table whose
+# UPDATE/DELETE publishing would break on the source, with G17's strict rule
+# ---------------------------------------------------------------------------
+
+
+def _provision(conn, tables, *, full=(), logs=None):
+    return provision_pg_replication(
+        conn, slot_name="dsqlmig_s", publication_name="dsqlmig_pub_s", tables=tables,
+        full_identity_tables=list(full), on_log=(logs.append if logs is not None else None),
+    )
+
+
+def _normalized(conn):
+    return [" ".join(sql.upper().split()) for sql, _ in conn.statements]
+
+
+def _assert_nothing_written(conn):
+    # No publication, no slot, no ADD -- and no ALTER TABLE (writes() does not list it).
+    assert conn.writes() == []
+    assert not any(s.startswith("ALTER TABLE") for s in _normalized(conn))
+
+
+def test_g20_a_default_identity_without_a_primary_key_is_refused_before_any_write() -> None:
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    conn = _FakeConn(usability={"app.orders": ("r", "d", False, 0, [])})
+    logs: list[str] = []
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, ["app.orders", "app.items"], logs=logs)
+    err = ei.value
+    assert err.cause == "REPLICA IDENTITY DEFAULT, but no valid primary key"
+    assert err.unreadable is False
+    msg = str(err)
+    assert msg.startswith(
+        "app.orders: REPLICA IDENTITY DEFAULT, but no valid primary key. Published for CDC"
+    )
+    assert "Nothing was changed there" in msg and len(msg) <= 300 and "\n" not in msg
+    assert (
+        "refused before any write: app.orders has no usable REPLICA IDENTITY (REPLICA "
+        "IDENTITY DEFAULT, but no valid primary key), so it is not published"
+    ) in logs
+    _assert_nothing_written(conn)
+    # The strict read was the very first statement after the membership read.
+    ups = _normalized(conn)
+    assert "AS IDENTITY_USABLE" in ups[1] and "PUBALLTABLES" in ups[0]
+
+
+def test_g20_an_unreadable_identity_is_refused_before_any_write() -> None:
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    class OperationalError(Exception):
+        pass
+
+    conn = _FakeConn(usability_error=OperationalError("permission denied for pg_class"))
+    logs: list[str] = []
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, ["app.orders"], logs=logs)
+    assert ei.value.unreadable is True and ei.value.cause is None
+    msg = str(ei.value)
+    assert msg.startswith("Whether each table to publish for CDC")
+    assert "(OperationalError)" in msg and "permission denied" not in msg
+    assert logs == [
+        "refused before any write: the REPLICA IDENTITY read failed (OperationalError), so "
+        "nothing is published"
+    ]
+    _assert_nothing_written(conn)
+
+
+def test_g20_a_table_not_found_is_refused_before_any_write() -> None:
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    conn = _FakeConn(usability_absent={"app.gone"})
+    logs: list[str] = []
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, ["app.orders", "app.gone"], logs=logs)
+    assert ei.value.unreadable is True
+    assert str(ei.value).startswith("app.gone: not found on the source as a table, so its")
+    assert logs == [
+        "refused before any write: app.gone was not found on the source as a table, so it is "
+        "not published"
+    ]
+    _assert_nothing_written(conn)
+
+
+def test_g20_a_partitioned_table_is_graded_by_its_partitions() -> None:
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    usability = {"app.p": ("p", "d", True, 2, ["app.p_1", "app.p_2"])}
+    for full in ((), ("app.p",)):  # widening the parent does not reach its partitions
+        conn = _FakeConn(usability=usability)
+        logs: list[str] = []
+        with pytest.raises(PgReplicaIdentityError) as ei:
+            _provision(conn, ["app.p"], full=full, logs=logs)
+        msg = str(ei.value)
+        assert msg.startswith("app.p: 2 of its partitions have none. Published for CDC")
+        assert "REPLICA IDENTITY FULL on each partition" in msg
+        assert "app.p_1" not in msg  # partition names go to the audit line
+        assert any("app.p_1, app.p_2" in m for m in logs)
+        _assert_nothing_written(conn)
+
+
+def test_g20_a_rekeyed_plain_table_is_graded_as_the_full_it_gets_first() -> None:
+    # Provisioning sets REPLICA IDENTITY FULL on a re-keyed table before the publication,
+    # so a plain one without a primary key passes -- and the order is unchanged.
+    conn = _FakeConn(usability={"app.orders": ("r", "d", False, 0, [])}, lsn="7/1")
+    handles = _provision(conn, ["app.orders"], full=["app.orders"])
+    assert handles.consistent_lsn == "7/1"
+    ups = _normalized(conn)
+    alter = next(i for i, s in enumerate(ups) if s.startswith("ALTER TABLE"))
+    create = next(i for i, s in enumerate(ups) if s.startswith("CREATE PUBLICATION"))
+    slot = next(i for i, s in enumerate(ups) if "PG_CREATE_LOGICAL_REPLICATION_SLOT" in s)
+    strict = next(i for i, s in enumerate(ups) if "AS IDENTITY_USABLE" in s)
+    assert strict < alter < create < slot
+
+
+def test_g20_a_rekeyed_plain_table_with_nothing_is_still_refused() -> None:
+    # No weakening: graded as FULL by the strict check, it is still REPLICA IDENTITY
+    # NOTHING to the lenient one -- refused before any write, as before G20.
+    conn = _FakeConn(replident={"app.orders": "n"})
+    with pytest.raises(PgReplicationError) as ei:
+        _provision(conn, ["app.orders"], full=["app.orders"])
+    assert "REPLICA IDENTITY NOTHING" in str(ei.value)
+    _assert_nothing_written(conn)
+
+
+def test_g20_a_reused_publication_refuses_before_its_first_add() -> None:
+    # Before G20 the ADDs ran table by table, so app.b was added and only then app.c was
+    # refused. Now every table the reuse would add is graded first.
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    conn = _FakeConn(
+        pubs={"dsqlmig_pub_s": ["app.a"]},
+        usability={"app.c": ("r", "i", False, 0, [])},
+    )
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, ["app.a", "app.b", "app.c"])
+    assert str(ei.value).startswith(
+        "app.c: REPLICA IDENTITY USING INDEX, but that index is gone or not valid."
+    )
+    assert conn.writes() == []  # no ALTER PUBLICATION ... ADD TABLE app.b
+    # Only the tables it would add were read (app.a is already a member).
+    strict = [p for sql, p in conn.statements if "AS IDENTITY_USABLE" in sql.upper()]
+    assert strict == [{"names": ["app.b", "app.c"]}]
+
+
+def test_g20_members_of_a_reused_publication_are_not_graded_strictly() -> None:
+    # Already published: a Re-run that passed before still passes (its identity is not this
+    # run's change)...
+    conn = _FakeConn(
+        pubs={"dsqlmig_pub_s": ["app.a"]},
+        usability={"app.a": ("r", "d", False, 0, [])}, lsn="9/9",
+    )
+    assert _provision(conn, ["app.a"]).consistent_lsn == "9/9"
+    assert not any("AS IDENTITY_USABLE" in s for s in _normalized(conn))
+    # ...while a member with REPLICA IDENTITY NOTHING is still refused, as before.
+    nothing = _FakeConn(pubs={"dsqlmig_pub_s": ["app.a"]}, replident={"app.a": "n"})
+    with pytest.raises(PgReplicationError):
+        _provision(nothing, ["app.a"])
+    assert nothing.writes() == []
+
+
+def test_g20_a_for_all_tables_publication_adds_nothing_so_grades_nothing() -> None:
+    conn = _FakeConn(pubs={"dsqlmig_pub_s": []}, all_tables={"dsqlmig_pub_s"}, lsn="4/4")
+    assert _provision(conn, ["app.orders"]).consistent_lsn == "4/4"
+    assert not any("AS IDENTITY_USABLE" in s for s in _normalized(conn))
+
+
+def test_g20_safe_tables_still_publish() -> None:
+    usability = {
+        "app.pk": ("r", "d", True, 0, []),
+        "app.full": ("r", "f", True, 0, []),
+        "app.idx": ("r", "i", True, 0, []),
+        "app.part": ("p", "d", True, 0, []),
+    }
+    conn = _FakeConn(usability=usability, lsn="5/5")
+    assert _provision(conn, sorted(usability)).consistent_lsn == "5/5"
+    assert any(s.startswith("CREATE PUBLICATION") for s in _normalized(conn))
+
+
+def test_g20_many_refused_tables_make_one_bounded_deterministic_line() -> None:
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    names = [f"{chr(97 + i) * 63}.{'t' * 63}" for i in range(12)]
+    usability = {n: ("r", "d", False, 0, []) for n in names}
+    usability[names[0]] = ("r", "i", False, 0, [])  # the longest cause leads (sorted first)
+    messages = set()
+    for order in (names, list(reversed(names)), names[5:] + names[:5]):
+        conn = _FakeConn(usability=usability)
+        logs: list[str] = []
+        with pytest.raises(PgReplicaIdentityError) as ei:
+            _provision(conn, order, logs=logs)
+        msg = str(ei.value)
+        messages.add(msg)
+        assert len(msg) <= 300 and "\n" not in msg
+        assert "(+11 more tables)" in msg
+        # The leading name is clipped at 32 characters (the review's per-cause remedies
+        # need the room; every name is in full in its audit line).
+        assert msg.startswith("a" * 29 + "...: REPLICA IDENTITY USING INDEX")
+        assert len(logs) == 12 and logs == sorted(logs)
+        _assert_nothing_written(conn)
+    assert len(messages) == 1
+
+
+@pytest.mark.parametrize(
+    "usability, cause, remedy",
+    [
+        # A new primary key repairs DEFAULT only: PostgreSQL keeps NOTHING and USING INDEX
+        # (relreplident) when a key is added, and a DEFERRABLE key is no replica identity.
+        (("r", "d", False, 0, []), "REPLICA IDENTITY DEFAULT, but no valid primary key",
+         "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"),
+        (("r", "n", False, 0, []), "REPLICA IDENTITY NOTHING",
+         "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"),
+        (("r", "i", False, 0, []),
+         "REPLICA IDENTITY USING INDEX, but that index is gone or not valid",
+         "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"),
+        # A partitioned table: the leaves carry the identity; its own NOTHING is its own.
+        (("p", "d", True, 2, ["app.t_1", "app.t_2"]), "2 of its partitions have none",
+         "set REPLICA IDENTITY FULL on each partition"),
+        (("p", "n", False, 1, ["app.t_1"]), "REPLICA IDENTITY NOTHING",
+         "set REPLICA IDENTITY FULL on it and on each partition"),
+        (("p", "n", False, 0, []), "REPLICA IDENTITY NOTHING",
+         "set REPLICA IDENTITY FULL on it, or DEFAULT with a primary key"),
+    ],
+)
+def test_g20_review_each_refusal_names_the_remedy_that_fixes_its_cause(
+    usability, cause, remedy
+) -> None:
+    # Review: every cause got "give it a primary key or REPLICA IDENTITY FULL", and the
+    # first half cannot clear NOTHING, a gone identity index, or a DEFERRABLE key -- the
+    # operator followed it and got the same refusal back.
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    conn = _FakeConn(usability={"app.t": usability})
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, ["app.t"])
+    msg = str(ei.value)
+    assert msg == (
+        f"app.t: {cause}. Published for CDC, its UPDATE/DELETE would fail on the source. "
+        f"Nothing was changed there: {remedy}, then re-run the Full Load."
+    )
+    assert "give it a primary key or" not in msg
+    _assert_nothing_written(conn)
+
+
+def test_g20_review_the_longest_refusal_still_fits_one_bounded_line() -> None:
+    # The longest cause and remedy, a 127-character name and a six-digit count of other
+    # refused tables: still one line the JobManager keeps whole (300 characters).
+    from dsql_migrator.core.cdc_pg_slot import (
+        ReplicaIdentityUsability,
+        _publish_refusal_message,
+        replica_identity_problem,
+    )
+
+    name = "s" * 63 + "." + "t" * 63
+    for kind, code in (("r", "i"), ("r", "d"), ("r", "x"), ("p", "n")):
+        read = ReplicaIdentityUsability(kind, code, False, 3, ("a", "b", "c"))
+        problem = replica_identity_problem(read)
+        msg = _publish_refusal_message([(name, problem, read)] * 100_000, ["app.gone"])
+        assert "(+100000 more tables)" in msg and "\n" not in msg
+        assert len(msg) <= 300, (kind, code, len(msg))
+        assert msg.endswith(", then re-run the Full Load."), (kind, code)

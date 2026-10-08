@@ -1293,3 +1293,71 @@ def test_an_attached_stack_offered_no_gtid_set_is_refused_by_the_start_dialog_ch
     verdict = _cdc_ui._probe_cdc_gtid_start(state, session, seed=seed, facts=facts,
                                             origin=origin)
     assert verdict.kind == "proceed" and verdict.positioning == "gtid-resume"
+
+
+def test_g20_cdc_deployed_gtid_mode_parses_the_stack_record():
+    f = _status.cdc_deployed_gtid_mode
+    assert f(None) is None and f({}) is None
+    assert f({"StartGtidMode": ""}) is None and f({"StartGtidMode": "   "}) is None
+    assert f({"StartGtidMode": " on "}) == "ON"
+    assert f({"StartGtidMode": "off_permissive"}) == "OFF_PERMISSIVE"
+    assert f({"StartGtidMode": "x" * 100}) == "X" * 32
+    # Independent of Watermark*: a seedless Start blanks those, never this.
+    assert f({"WatermarkBinlogFile": "", "StartGtidMode": "ON"}) == "ON"
+
+
+def test_g20_the_phase_probe_caches_the_gtid_mode_record_and_adopt_clears_it():
+    import dsql_migrator.core.cdc_deployer as dmod
+
+    class _D:
+        stack_status = "UPDATE_COMPLETE"
+        is_stable = True
+
+        def __init__(self, p):
+            self.current_parameters = p
+
+    class _Dep:
+        def __init__(self, p):
+            self._p = p
+
+        def describe_stack_or_none(self, _n):
+            return _D(self._p)
+
+        def list_cdc_stacks(self):
+            return []
+
+    def probe(p, st=None):
+        st = st or DataMigrationState()
+        orig = dmod.build_cdc_stack_deployer
+        dmod.build_cdc_stack_deployer = lambda *_a, **_k: _Dep(p)
+        try:
+            _status._probe_cdc_stack_phase(
+                st, SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"),
+                                    aws_profile=None)
+            )
+        finally:
+            dmod.build_cdc_stack_deployer = orig
+        return st
+
+    seedless = probe({"MskBootstrapServers": "", "DeploySink": "true",
+                      "WatermarkBinlogFile": "", "WatermarkBinlogPos": "",
+                      "StartGtidMode": "on"})
+    assert seedless.cdc_deployed_watermark is None  # Watermark* blank...
+    assert seedless.cdc_deployed_gtid_mode == "ON"  # ...the record survives
+    assert probe({"MskBootstrapServers": "", "DeploySink": "true",
+                  "StartGtidMode": ""}).cdc_deployed_gtid_mode is None
+    # An older stack (no such parameter) re-probed over a cached record: cleared.
+    assert probe({"MskBootstrapServers": "", "DeploySink": "true"},
+                 st=seedless).cdc_deployed_gtid_mode is None
+    seedless.set_cdc_deployed_gtid_mode("OFF")
+    assert seedless.adopt_cdc_stack("dsql-cdc-other")
+    assert seedless.cdc_deployed_gtid_mode is None
+    # A different stack name, and a stack found absent, drop it too.
+    other = DataMigrationState()
+    other.set_cdc_deployed_gtid_mode("OFF")
+    assert other.set_cdc_stack_name("dsql-cdc-renamed")
+    assert other.cdc_deployed_gtid_mode is None
+    gone = DataMigrationState()
+    gone.set_cdc_deployed_gtid_mode("OFF")
+    gone.set_cdc_stack_phase("absent")
+    assert gone.cdc_deployed_gtid_mode is None
