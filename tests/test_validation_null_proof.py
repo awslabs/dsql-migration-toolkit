@@ -436,6 +436,34 @@ def test_a_lost_connection_during_the_proof_is_retried_with_the_proof_never_with
     assert lost.proof_reason == "table_error"  # never "query_error" with a released table
 
 
+class _Unavailable(Exception):
+    sqlstate = "XX000"
+
+
+def test_g22_server_unavailable_during_the_proof_is_retried_with_the_proof_never_without_it(
+    monkeypatch,
+):
+    # Aurora DSQL's temporary XX000 is not the proof's fault either. FAILS WITHOUT G22: the
+    # pass was re-run WITHOUT the proof, so the table read matched=True with the proof "not
+    # determined" (query_error) although its excluded column holds values.
+    monkeypatch.setattr(v.time, "sleep", lambda _s: None)
+    attempts = v._TARGET_RECONNECT_MAX_ATTEMPTS
+
+    def run(times):
+        source = _FakeSourceConnection(counts={"orders": 5})
+        target = _ProofTarget(counts={"orders": 5}, values={"orders": {"c": {1, 2}}},
+                              fail=_Unavailable("server unavailable"), fail_times=times)
+        return _validator(source, target, overlay={"orders": ["c"]}).validate(
+            _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")]).items[0]
+
+    recovered = run(attempts)  # one pass's statement budget, then it works
+    assert recovered.proof_state == "complete" and recovered.excluded_values_block is True
+    assert recovered.matched is False
+    lost = run(99)
+    assert lost.error is not None and lost.matched is False
+    assert lost.proof_reason == "table_error"  # fails closed, never a released table
+
+
 def test_a_lost_source_connection_keeps_the_validation_report():
     # The snapshot COMMIT on the invalidated connection used to raise PendingRollbackError
     # out of validate(), discarding every table's result.

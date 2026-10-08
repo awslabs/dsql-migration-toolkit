@@ -110,6 +110,7 @@ from dsql_migrator.core.models import (
 )
 from dsql_migrator.core.target_connection import (
     DsqlConnector,
+    is_server_unavailable,
     is_transient_connection_error,
 )
 from dsql_migrator.core.source_dialect import SourceDialect, dialect_for
@@ -509,10 +510,11 @@ class _ReconnectingTargetConnection:
     Transparent: it quacks like a psycopg connection (``cursor()`` / ``close()``), so
     every ``_target_*`` read helper is unchanged. Only a connection-level transient
     error (SQLSTATE class ``08`` / no-SQLSTATE, via
-    :func:`is_transient_connection_error`) triggers a reconnect; any real query /
-    constraint error propagates unchanged. The underlying connection is opened EAGERLY
-    so the open cost / an immediate connect failure surfaces at the same point as
-    before this wrapper existed.
+    :func:`is_transient_connection_error`) triggers a reconnect; Aurora DSQL's XX000
+    (server unavailable) re-runs the statement on the same connection, which Aurora DSQL
+    keeps; any real query / constraint error propagates unchanged. The underlying
+    connection is opened EAGERLY so the open cost / an immediate connect failure surfaces
+    at the same point as before this wrapper existed.
     """
 
     def __init__(
@@ -553,7 +555,8 @@ class _ReconnectingCursor:
     ``execute`` runs on the owner's live connection; on a transient connection drop it
     discards the dead connection, reconnects (short bounded backoff), and re-runs the
     SAME statement on a fresh underlying cursor -- safe because every target read here
-    is idempotent and the keyset pages carry their own ``WHERE pk > :last`` bound.
+    is idempotent and the keyset pages carry their own ``WHERE pk > :last`` bound. On an
+    XX000 it re-runs it on the same connection, within the same budget.
     ``fetchone`` / ``fetchall`` delegate to the live underlying cursor.
     """
 
@@ -583,13 +586,15 @@ class _ReconnectingCursor:
             except Exception as exc:  # noqa: BLE001 - reconnect on a transient drop
                 _safe_close(cursor)
                 attempt += 1
+                transient = is_transient_connection_error(exc)
                 if (
-                    is_transient_connection_error(exc)
-                    and attempt < self._owner._max_attempts
-                ):
-                    # Discard the dead connection so the next _live() re-mints a fresh
-                    # one (new IAM token), then replay the SAME statement.
-                    self._owner._discard()
+                    transient or is_server_unavailable(exc)
+                ) and attempt < self._owner._max_attempts:
+                    if transient:
+                        # Discard the dead connection so the next _live() re-mints a
+                        # fresh one (new IAM token). An XX000 keeps it: Aurora DSQL keeps
+                        # the session open. Either way, replay the SAME statement.
+                        self._owner._discard()
                     delay = self._owner._base_delay * attempt
                     if delay:
                         (self._owner._sleep or time.sleep)(delay)
@@ -1813,9 +1818,9 @@ class Validator:
         pass with the proof; any other failure re-runs it once WITHOUT the proof, which
         supplies the count, and the proof is "not determined". A failure the proof did
         not cause propagates unchanged: the source side, a cancel, and a lost target
-        connection (the proof is not its cause, so dropping the proof would only lose
-        it) -- which gets the same one retry WITH the proof, then errors the table as it
-        does without exclusions.
+        connection or Aurora DSQL's XX000 (the proof is not its cause, so dropping the
+        proof would only lose it) -- which gets the same one retry WITH the proof, then
+        errors the table as it does without exclusions.
         """
         if proof is None:
             return run(None)
@@ -1827,7 +1832,7 @@ class Validator:
             except Exception as exc:  # noqa: BLE001 - classified below
                 if proof.failed is None:
                     raise
-                transient = is_transient_connection_error(exc)
+                transient = is_transient_connection_error(exc) or is_server_unavailable(exc)
                 if (is_occ_conflict(exc) or transient) and not proof.retried:
                     proof.retried = True
                     proof.reset()

@@ -690,6 +690,88 @@ def test_reconnecting_target_gives_up_after_max_attempts() -> None:
     assert len(made) == 3
 
 
+class _ServerUnavailable(Exception):
+    """Aurora DSQL's temporary XX000 "server unavailable" (psycopg's InternalError_)."""
+
+    sqlstate = "XX000"
+
+
+class _UnavailableTargetConn:
+    """A target connection whose first ``failures`` executes raise XX000, then serve "ok"."""
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.executes: list = []
+        self.closed = False
+
+    def cursor(self) -> "_UnavailableTargetConn._Cursor":
+        return _UnavailableTargetConn._Cursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+    class _Cursor:
+        def __init__(self, conn: "_UnavailableTargetConn") -> None:
+            self._conn = conn
+
+        def execute(self, statement: Any, parameters: Any = None) -> None:
+            self._conn.executes.append((statement, parameters))
+            if self._conn.failures > 0:
+                self._conn.failures -= 1
+                raise _ServerUnavailable("server unavailable")
+
+        def fetchone(self) -> tuple:
+            return ("ok",)
+
+        def close(self) -> None:
+            pass
+
+
+def test_g22_reconnecting_target_reruns_a_statement_on_server_unavailable_on_the_same_connection(
+) -> None:
+    # Aurora DSQL keeps the session open across an XX000, so the read re-runs on the SAME
+    # connection, within the existing budget. FAILS WITHOUT G22: the XX000 errored the table,
+    # which shuts the cut-over gate for a temporary service condition.
+    from dsql_migrator.core.validator import _ReconnectingTargetConnection
+
+    conn = _UnavailableTargetConn(failures=1)
+    made: list = []
+
+    def factory() -> _UnavailableTargetConn:
+        made.append(conn)
+        return conn
+
+    proxy = _ReconnectingTargetConnection(factory, sleep=lambda _s: None)
+    cursor = proxy.cursor()
+    cursor.execute("SELECT 1", {"last": 42})
+
+    assert cursor.fetchone() == ("ok",)
+    assert len(made) == 1  # no reconnect
+    assert conn.closed is False
+    assert conn.executes == [("SELECT 1", {"last": 42})] * 2
+
+
+def test_g22_reconnecting_target_gives_up_on_a_sustained_server_unavailable() -> None:
+    from dsql_migrator.core.validator import _ReconnectingTargetConnection
+
+    conn = _UnavailableTargetConn(failures=99)
+    made: list = []
+
+    def factory() -> _UnavailableTargetConn:
+        made.append(conn)
+        return conn
+
+    proxy = _ReconnectingTargetConnection(
+        factory, max_attempts=4, base_delay=0.0, sleep=lambda _s: None
+    )
+    with pytest.raises(Exception) as excinfo:
+        proxy.cursor().execute("SELECT 1")
+
+    assert getattr(excinfo.value, "sqlstate", None) == "XX000"
+    assert len(conn.executes) == 4  # the existing budget
+    assert len(made) == 1  # all on the one connection
+
+
 def test_validation_recovers_when_the_target_connection_drops_mid_run(monkeypatch) -> None:
     # The aged-connection fix end-to-end: the target connection is force-closed
     # partway through validating a table; the read path reconnects and resumes, so

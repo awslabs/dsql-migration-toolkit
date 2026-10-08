@@ -13,6 +13,7 @@
  */
 package dev.dsqlmigrator.connect;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -20,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.InvocationHandler;
@@ -59,6 +61,18 @@ class DsqlSinkTaskTest {
   @Test
   void occSerializationFailureIsTransient() {
     assertTrue(task.isTransient(new SQLException("conflict", "40001")));
+  }
+
+  @Test
+  void serverUnavailableIsTransientButTheCorruptionCodesAreNot() {
+    // G22: Aurora DSQL's XX000 "server unavailable" is a temporary service condition. Once its
+    // in-process budget runs out it is redelivered, never dead-lettered. FAILS WITHOUT G22:
+    // XX000 was permanent, so a healthy row went to the DLQ during a short service blip.
+    assertTrue(task.isTransient(new SQLException("server unavailable", "XX000")));
+    // XX001 (data corrupted) and XX002 (index corrupted) share the class but are not
+    // transient: redelivering them would stall the stream forever.
+    assertFalse(task.isTransient(new SQLException("data corrupted", "XX001")));
+    assertFalse(task.isTransient(new SQLException("index corrupted", "XX002")));
   }
 
   @Test
@@ -176,11 +190,85 @@ class DsqlSinkTaskTest {
   }
 
   @Test
-  void transientRetryExceptionCarriesSqlStateAndCause() {
+  void transientRetryExceptionCarriesSqlStateAndAValueFreeCause() {
+    // G22: Connect logs a RetriableException with its cause chain at ERROR on every
+    // redelivery, so the cause keeps the SQLSTATE, the exception class and the stack trace --
+    // never the driver message.
     SQLException adminShutdown = new SQLException("admin shutdown", "57P01");
     RetriableException wrapped = DsqlSinkTask.transientRetryException(adminShutdown);
-    assertTrue(wrapped.getMessage().contains("57P01"));
-    assertSame(adminShutdown, wrapped.getCause());
+    assertEquals(
+        "DSQL apply failed (transient sqlstate=57P01); Connect will retry",
+        wrapped.getMessage());
+    SQLException cause = assertInstanceOf(SQLException.class, wrapped.getCause());
+    assertEquals("57P01", cause.getSQLState());
+    assertEquals("java.sql.SQLException", cause.getMessage());
+    assertNull(cause.getCause());
+    assertArrayEquals(adminShutdown.getStackTrace(), cause.getStackTrace());
+  }
+
+  @Test
+  void theRedeliveredCauseCarriesNoRowValue() {
+    // pgjdbc renders a failed batch entry WITH its bound values into the BatchUpdateException
+    // message (logServerErrorDetail defaults to true; reWriteBatchedInserts makes it the whole
+    // multi-row INSERT), and Connect prints the RetriableException's cause chain on every
+    // redelivery. FAILS WITHOUT G22: the raw exception was the cause, row values included.
+    java.sql.BatchUpdateException batch =
+        new java.sql.BatchUpdateException(
+            "Batch entry 0 INSERT INTO \"shop\".\"customers\" (\"id\", \"email\") VALUES "
+                + "('42', 'alice@example.com') was aborted: ERROR: server unavailable",
+            "XX000",
+            0,
+            new int[] {-3},
+            new SQLException("ERROR: server unavailable", "XX000"));
+    RetriableException wrapped = DsqlSinkTask.transientRetryException(batch);
+    java.io.StringWriter printed = new java.io.StringWriter();
+    wrapped.printStackTrace(new java.io.PrintWriter(printed));
+    assertFalse(printed.toString().contains("alice@example.com"), printed.toString());
+    assertFalse(printed.toString().contains("INSERT INTO"), printed.toString());
+    SQLException cause = (SQLException) wrapped.getCause();
+    assertEquals("XX000", cause.getSQLState());
+    assertEquals(
+        "java.sql.BatchUpdateException caused by java.sql.SQLException", cause.getMessage());
+  }
+
+  @Test
+  void aValueFreeCopyNamesTheRootCauseKeepsTheVendorCodeAndEndsOnACycle() {
+    // pgjdbc's mid-batch I/O drop is three levels deep: BatchUpdateException -> PSQLException
+    // (08006) -> the socket error. The redelivery ERROR names the ROOT class, the actionable
+    // part, and the copy keeps the vendor code (pgjdbc itself always sets 0, so this pins the
+    // copy's contract). FAILS if the walk stops at the direct cause or the code is dropped.
+    SQLException io =
+        new SQLException(
+            "An I/O error occurred while sending to the backend.",
+            "08006",
+            new java.net.SocketException("Connection reset"));
+    java.sql.BatchUpdateException batch =
+        new java.sql.BatchUpdateException(
+            "Batch entry 0 INSERT INTO \"shop\".\"customers\" (\"id\", \"email\") VALUES "
+                + "('42', 'alice@example.com') was aborted",
+            "08006",
+            7,
+            new int[] {-3},
+            io);
+    SQLException copy = DsqlSinkTask.valueFreeCopy(batch);
+    assertEquals("java.sql.BatchUpdateException caused by java.net.SocketException",
+        copy.getMessage());
+    assertEquals("08006", copy.getSQLState());
+    assertEquals(7, copy.getErrorCode());
+    java.io.StringWriter printed = new java.io.StringWriter();
+    DsqlSinkTask.transientRetryException(batch).printStackTrace(new java.io.PrintWriter(printed));
+    assertFalse(printed.toString().contains("alice@example.com"), printed.toString());
+
+    // A cyclic cause chain must not spin the task thread inside put(): the walk is bounded.
+    // (Run on another thread: a plain @Timeout only interrupts a loop that never checks.)
+    SQLException a = new SQLException("a", "XX000");
+    SQLException b = new SQLException("b", "XX000");
+    a.initCause(b);
+    b.initCause(a);
+    SQLException cyclic =
+        assertTimeoutPreemptively(
+            java.time.Duration.ofSeconds(5), () -> DsqlSinkTask.valueFreeCopy(a));
+    assertEquals("XX000", cyclic.getSQLState());
   }
 
   // --- DLQ log PK enrichment (surrogate value shown, natural key withheld) -----
@@ -455,6 +543,29 @@ class DsqlSinkTaskTest {
     unqualified.startMetrics(sinkProps());
     assertNull(unqualified.readTargetTypes("orders"));
     assertEquals(0, unqualified.loads);
+  }
+
+  @Test
+  void aServerUnavailableCatalogReadIsRetriedThenRedeliveredNeverFailedOpen() {
+    // G22: an XX000 on the column-type read is retried like a 40001, and one that never
+    // clears is redelivered. FAILS WITHOUT G22: it FAILED OPEN -- the table's values were
+    // written unchecked for 60 s (extra decimal places or a fraction for an integer column
+    // rounded silently) because of a temporary service condition.
+    Map<String, ValueFit.TargetType> types =
+        Map.of("flag", ValueFit.TargetType.fromCatalog("boolean", null, null));
+    ScriptedCatalogTask once =
+        new ScriptedCatalogTask().answer(new SQLException("server unavailable", "XX000"), types);
+    once.startMetrics(sinkProps());
+    assertEquals(types, once.readTargetTypes("shop.orders"));
+    assertEquals(2, once.loads);
+
+    ScriptedCatalogTask sustained =
+        new ScriptedCatalogTask().answer(new SQLException("server unavailable", "XX000"));
+    sustained.startMetrics(sinkProps());
+    RetriableException e =
+        assertThrows(RetriableException.class, () -> sustained.readTargetTypes("shop.orders"));
+    assertEquals("XX000", ((SQLException) e.getCause()).getSQLState());
+    assertEquals(10, sustained.loads); // the occ.max.retries budget, then redelivered
   }
 
   @Test
@@ -761,13 +872,29 @@ class DsqlSinkTaskTest {
 
   @Test
   void aDescribeFailureThatIsNotAnOccConflictFallsBackToPlainBinding() throws Exception {
-    // G21 rethrows only a 40001 from the parameter describe (OccRetry re-runs it); any other
-    // describe failure -- a driver or server that cannot describe parameters before execute --
-    // must still fall back to plain setObject binding and apply the row. FAILS if
-    // paramMetaOrNull rethrows it: the healthy row is then treated as poison (no DLQ reporter
-    // here, so the put throws; with one it would be dead-lettered).
+    // G21/G22 rethrow only a 40001 or an XX000 from the parameter describe (OccRetry re-runs
+    // it); any other describe failure -- a driver or server that cannot describe parameters
+    // before execute -- must still fall back to plain setObject binding and apply the row.
+    // FAILS if paramMetaOrNull rethrows it: the healthy row is then treated as poison (no DLQ
+    // reporter here, so the put throws; with one it would be dead-lettered).
+    assertADescribeFailureFallsBackToPlainBinding(
+        new SQLException("parameter metadata not available", "0A000"));
+  }
+
+  @Test
+  void aDescribeFailureWithNoSqlStateFallsBackToPlainBinding() throws Exception {
+    // A describe failure with no SQLSTATE (a driver limitation) falls back to plain binding
+    // like any other that is not a 40001 or an XX000. FAILS if paramMetaOrNull rethrows it:
+    // isTransient(null) is true, so put() throws a RetriableException and Connect redelivers
+    // the same healthy batch forever, never applying it.
+    assertADescribeFailureFallsBackToPlainBinding(
+        new SQLException("parameter metadata not available"));
+  }
+
+  private static void assertADescribeFailureFallsBackToPlainBinding(SQLException failure)
+      throws Exception {
     FakeJdbc jdbc = new FakeJdbc();
-    jdbc.describeFailure = new SQLException("parameter metadata not available", "0A000");
+    jdbc.describeFailure = failure;
     DsqlSinkTask task = new DsqlSinkTask();
     task.startMetrics(sinkProps()); // no start(): no DLQ reporter, so a quarantine throws
     inject(task, jdbc.connection());

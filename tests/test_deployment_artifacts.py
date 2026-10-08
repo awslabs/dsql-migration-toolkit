@@ -2801,12 +2801,18 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v52 (G22, rebuilt in place): Aurora DSQL's XX000 "server unavailable" is retried
+        # like a 40001 and, once the budget is spent, redelivered -- never dead-lettered. The
+        # marker is OccRetry.SERVER_UNAVAILABLE_SQLSTATE; no class of the pre-G22 jar (shaded
+        # dependencies included) holds it.
+        "server unavailable retry": b"XX000",
         # v52 (G21): every OCC retry starts on a clean transaction -- the failed attempt is
         # rolled back before the re-run, because Aurora DSQL can report a 40001 (OC001, a
         # stale catalog) while a statement runs, which leaves the transaction aborted; the
         # retry then failed with 25P02 and a healthy row was dead-lettered. The marker is the
-        # WARN literal of DsqlSinkTask.rollbackBeforeRetry.
-        "OCC retry rollback": b"OCC-conflicted attempt",
+        # WARN literal of DsqlSinkTask.rollbackBeforeRetry, reworded in G22 because the
+        # failed attempt can now be an XX000.
+        "OCC retry rollback": b"failed attempt before its retry",
         # v51 (G15): a re-keyed table's records are keyed on the SOURCE primary key and the
         # sink writes them by the composite target key read from target.key.columns, so a
         # leading-column change is one ordered move and a DELETE never misses its row.
@@ -3328,10 +3334,18 @@ def test_occ_retry_is_described_as_a_transaction_not_a_statement() -> None:
         assert fl_phrase in text and sink_phrase in text, lang
         assert stale not in text, lang
     # The ConfigDef string literal ships in the plugin jar (v52, G21): the value is the
-    # number of attempts, and the retry re-runs a whole sink transaction.
-    assert "Max OCC (40001) attempts per sink transaction (a chunk, or one row)." in (
-        sink_src / "DsqlSinkConnectorConfig.java"
-    ).read_text(encoding="utf-8")
+    # number of attempts, and the retry re-runs a whole sink transaction. G22 (v52 rebuilt in
+    # place) names the second SQLSTATE it covers; the literal is split across two Java string
+    # literals, so their join is flattened first.
+    config_src = re.sub(
+        r'"\s*\+\s*"',
+        "",
+        (sink_src / "DsqlSinkConnectorConfig.java").read_text(encoding="utf-8"),
+    )
+    assert (
+        "Max attempts per sink transaction (a chunk, or one row) on an OCC conflict (40001) or "
+        "Aurora DSQL's server unavailable (XX000)." in config_src
+    )
 
 
 def test_manual_says_each_sink_occ_retry_starts_on_a_clean_transaction() -> None:
@@ -3423,6 +3437,105 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             if page.startswith("13-"):
                 stale = unscoped[lang].replace(" ", "") if lang == "ja" else unscoped[lang]
                 assert stale not in text, (lang, page)
+
+
+def test_plugin_v52_history_records_the_g22_rebuild() -> None:
+    # G22 rebuilt the never-deployed v52 ZIP in place instead of bumping the version: the
+    # PLUGIN_VERSION history must say so, and name what changed.
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
+    text = (source / "s3_provision.py").read_text(encoding="utf-8")
+    history = " ".join(text.replace("#", " ").split())
+    assert 'PLUGIN_VERSION = "v52"' in text
+    assert "rebuilt in place (G22" in history
+    assert "XX000" in history
+    # G22 also changed paths other than XX000 (a failed error-path rollback drops the
+    # session; every transient RetriableException's cause is value-free), so the G21
+    # paragraph must not claim they behave as in v51 with only XX000 carved out.
+    assert "any other error except XX000 (G22, below)" not in history
+    assert "behave as in v51, except as G22 changes them (below)" in history
+    # A landed COMMIT's re-run is exact per primary key, not in every case: a secondary
+    # UNIQUE index can reject an image the landed chunk already replaced.
+    assert "re-runs to the same rows" not in history
+    assert "secondary UNIQUE index can reject (23505)" in history
+
+
+def test_manual_says_server_unavailable_is_retried_never_dead_lettered() -> None:
+    # G22: Aurora DSQL documents XX000 "server unavailable" as a temporary condition to be
+    # answered by re-running the whole transaction, COMMIT included. The Full Load retries the
+    # batch and never quarantines a row for it; the sink (plugin v52) retries the transaction
+    # and never dead-letters a row for it. Chapters 3, 4 and 7 say so in every language.
+    import pathlib
+    import re
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    wanted = {
+        "en": {
+            "04-cdc-and-dsql-constraints.md": (
+                "such a row is **never dead-lettered**",
+                "If `XX000` keeps recurring, contact AWS Support.",
+            ),
+            "07-performance-and-tuning.md": (
+                "So is Aurora DSQL's `XX000`",
+                "no row is quarantined for it",
+            ),
+            "03-full-load.md": ("no row is quarantined for it",),
+        },
+        "ko": {
+            "04-cdc-and-dsql-constraints.md": ("그런 행은 **dead-letter 처리되지 않음**",),
+            "07-performance-and-tuning.md": (
+                'Aurora DSQL의 `XX000`("server unavailable")도 재시도합니다',
+            ),
+            "03-full-load.md": ("그 때문에 quarantine되는 행은 없습니다",),
+        },
+        "ja": {
+            "04-cdc-and-dsql-constraints.md": ("そのような行は **デッドレター化されません**",),
+            "07-performance-and-tuning.md": (
+                'Aurora DSQL の `XX000` ("server unavailable") もリトライします',
+            ),
+            "03-full-load.md": ("そのために隔離される行はありません",),
+        },
+    }
+    for lang, pages in wanted.items():
+        for page, phrases in pages.items():
+            text = (manual / lang / page).read_text(encoding="utf-8")
+            text = re.sub(r"\s+", "", text) if lang == "ja" else re.sub(r"\s+", " ", text)
+            for phrase in phrases:
+                probe = re.sub(r"\s+", "", phrase) if lang == "ja" else phrase
+                assert probe in text, (lang, page, phrase)
+
+
+def test_manual_says_a_landed_commits_rerun_can_meet_a_secondary_unique_index() -> None:
+    # G22 review: an XX000 at COMMIT may have landed, and the sink re-runs the whole chunk on
+    # the rows it already wrote. That is idempotent per primary key, but a secondary UNIQUE
+    # index can reject (23505) an image the landed chunk already replaced, which is then
+    # dead-lettered -- on a re-keyed table or a plain one, as on any redelivery of a committed
+    # batch. The manual (ch.4 in every language) and the sink README said "the re-run leaves
+    # the same rows", unqualified.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    manual = root / "docs" / "manual"
+    wanted = {
+        "en": ("on a table with a secondary `UNIQUE` index", "Cut over holds the table until it matches by CHECKSUM"),
+        "ko": ("보조 `UNIQUE` 인덱스가 있는 테이블에서는", "Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됨"),
+        "ja": ("二次 `UNIQUE` インデックスがあるテーブルでは", "そのテーブルが CHECKSUM で一致するまで Cut over は保留されます"),
+    }
+    stale = {
+        "en": "so the re-run leaves the same rows",
+        "ko": "PK 기준 upsert·delete이므로 다시 실행해도 같은 행이 남음",
+        "ja": "なので、再実行しても同じ行が残ります",
+    }
+    for lang, phrases in wanted.items():
+        text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
+        row = next(line for line in text.splitlines() if "XX000" in line and line.startswith("| **"))
+        for phrase in phrases:
+            assert phrase in row, (lang, phrase)
+        assert stale[lang] not in re.sub(r"\s+", " ", text), lang
+    readme = re.sub(r"\s+", " ", (root / "connectors" / "dsql-sink" / "README.md").read_text(encoding="utf-8"))
+    assert "the PK-keyed upsert/delete re-run is idempotent per key, though a secondary `UNIQUE` index" in readme
 
 
 def test_manual_3_1_stops_the_run_only_for_the_watermarks_publication_write() -> None:

@@ -524,6 +524,56 @@ def test_target_error_hint_none_for_unrecognized() -> None:
 
 
 # ---------------------------------------------------------------------------
+# G22: Aurora DSQL's XX000 "server unavailable" -- one named target classifier
+# ---------------------------------------------------------------------------
+
+
+def test_g22_is_server_unavailable_matches_only_xx000() -> None:
+    import psycopg
+
+    from dsql_migrator.core.target_connection import (
+        SERVER_UNAVAILABLE_SQLSTATE,
+        is_server_unavailable,
+        is_transient_connection_error,
+    )
+
+    assert SERVER_UNAVAILABLE_SQLSTATE == "XX000"
+    # psycopg raises InternalError_ for XX000 (its own sqlstate is what is read).
+    driver = psycopg.errors.lookup("XX000")("server unavailable")
+    assert driver.sqlstate == "XX000"
+    assert is_server_unavailable(driver) is True
+    assert is_server_unavailable(_TargetError("server unavailable", "XX000")) is True
+    # Exactly XX000: XX001 (data corrupted) and XX002 (index corrupted) share its class.
+    for state in ("XX001", "XX002", "40001", "08006", None):
+        assert is_server_unavailable(_TargetError("x", state)) is False, state
+    # Never by text, and never through a wrapper: a deliberately terminal wrapper whose
+    # cause was an XX000 is not retried.
+    assert is_server_unavailable(RuntimeError("server unavailable")) is False
+    wrapper = RuntimeError("dropped but not recreated")
+    wrapper.__cause__ = driver
+    assert is_server_unavailable(wrapper) is False
+    # "A fresh connection fixes it" stays a different contract.
+    assert is_transient_connection_error(driver) is False
+
+
+def test_g22_target_error_hint_explains_server_unavailable() -> None:
+    import psycopg
+
+    driver = psycopg.errors.lookup("XX000")("server unavailable")
+    wrapped = RuntimeError("1 batch(es) failed loading 't': InternalError_: server unavailable")
+    for exc in (driver, wrapped):
+        hint = target_error_hint(exc)
+        assert hint is not None and "XX000" in hint and "Retry unfinished tables" in hint
+        assert "AWS Support" in hint
+    # The 40001 hint is unchanged.
+    assert target_error_hint(_TargetError("x", "40001")) == (
+        "Aurora DSQL optimistic-concurrency retries were exhausted for this table. "
+        "Lower full_load_table_parallelism / batch size and re-run — the load is "
+        "idempotent (INSERT ... ON CONFLICT), so a re-run is safe"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The DSQL IAM hint must name the actionable fix, not a role nobody can edit
 # ---------------------------------------------------------------------------
 

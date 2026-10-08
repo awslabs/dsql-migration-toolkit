@@ -77,13 +77,14 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
               Type.INT,
               10,
               Importance.MEDIUM,
-              "Max OCC (40001) attempts per sink transaction (a chunk, or one row).")
+              "Max attempts per sink transaction (a chunk, or one row) on an OCC conflict "
+                  + "(40001) or Aurora DSQL's server unavailable (XX000).")
           .define(
               RETRY_BACKOFF_MS,
               Type.LONG,
               50L,
               Importance.LOW,
-              "Base backoff for OCC retry (ms).")
+              "Base backoff for the OCC / server-unavailable retry (ms).")
           .define(
               METRICS_ENABLED,
               Type.BOOLEAN,

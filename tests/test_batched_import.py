@@ -91,6 +91,9 @@ class _FakeStore:
     executed_inserts: list[_ExecutedInsert] = field(default_factory=list)
     executed_ddls: list[str] = field(default_factory=list)
     insert_failures: list[str] = field(default_factory=list)
+    # SQLSTATEs an INSERT raises AFTER its rows were stored: the statement committed but
+    # the client got an error (Aurora DSQL's uncertain XX000 outcome at commit, G22).
+    landed_failures: list[str] = field(default_factory=list)
     # Index names whose CREATE INDEX must fail (simulates DSQL's 24-index limit).
     failing_index_names: set = field(default_factory=set)
     # Number of NEWLY-created connections that should die on their first DDL
@@ -231,6 +234,8 @@ class _FakeConnection:
             self._store.executed_inserts.append(
                 _ExecutedInsert(sql_text=text, num_rows=len(rows), params=list(params))
             )
+            if self._store.landed_failures:
+                raise _FakeSerializationFailure(sqlstate=self._store.landed_failures.pop(0))
         cursor.rowcount = affected
 
     def close(self) -> None:
@@ -1615,6 +1620,232 @@ def test_none_mode_recovers_from_post_commit_retry_conflict_without_quarantine()
     assert result.failures == 0
     assert result.rows_loaded == 0  # every row already present
     assert len(store.rows) == 10  # no duplicates, no loss
+
+
+# ---------------------------------------------------------------------------
+# G22: Aurora DSQL's XX000 "server unavailable" -- retried, never quarantined
+# ---------------------------------------------------------------------------
+
+_ALL_MODES = pytest.mark.parametrize(
+    "mode",
+    [
+        OnConflictMode.NONE,
+        OnConflictMode.SKIP_EXISTING,
+        OnConflictMode.DO_NOTHING,
+        OnConflictMode.DO_UPDATE,
+    ],
+)
+
+
+@_ALL_MODES
+def test_g22_server_unavailable_is_retried_and_never_quarantines(mode) -> None:
+    # A temporary Aurora DSQL condition is not a rejected row. FAILS WITHOUT G22: XX000 was
+    # not retryable, so the batch was binary-split and all 4 healthy rows QUARANTINED, with
+    # the batch counted as done.
+    store = _FakeStore()
+    store.insert_failures = ["XX000"] * 7
+    importer = _importer(
+        store, ["id", "name"], ["id"],
+        options=BatchedImportOptions(on_conflict=mode), occ_max_attempts=20,
+    )
+    result = importer.import_rows(_rows(4), _table())
+    assert result.failures == 0
+    assert result.quarantined == 0
+    assert result.rows_loaded == 4
+    assert sorted(store.rows) == [(0,), (1,), (2,), (3,)]
+
+
+@_ALL_MODES
+def test_g22_exhausted_server_unavailable_fails_the_batch_unsplit(mode) -> None:
+    # Once the budget runs out the BATCH fails (retryable: Retry unfinished tables), exactly
+    # like an exhausted 40001 -- never split down to rows, never quarantined.
+    store = _FakeStore()
+    store.insert_failures = ["XX000"] * 50
+    importer = _importer(
+        store, ["id", "name"], ["id"],
+        options=BatchedImportOptions(on_conflict=mode), occ_max_attempts=3,
+    )
+    result = importer.import_rows(_rows(4), _table())
+    assert result.failures == 1
+    assert result.quarantined == 0
+    assert len(store.insert_failures) == 47  # exactly the budget: no binary split
+    assert store.rows == {}
+
+
+@pytest.mark.parametrize(
+    ("mode", "loaded", "skipped"),
+    [
+        (OnConflictMode.NONE, 0, 4),  # 23505 -> select-filter: every key already there
+        (OnConflictMode.SKIP_EXISTING, 0, 4),  # the optimistic INSERT's 23505, same filter
+        (OnConflictMode.DO_NOTHING, 0, 4),  # every row a conflict
+        (OnConflictMode.DO_UPDATE, 4, 0),  # the same values written again
+    ],
+)
+def test_g22_a_commit_that_landed_but_answered_xx000_is_re_run_exactly(
+    mode, loaded, skipped
+) -> None:
+    # Aurora DSQL's uncertain outcome: the batch committed but its client got XX000, so the
+    # retry re-runs a batch that is already on the target. Every mode ends with exactly the
+    # rows, no duplicate and none missing; only the counts move from loaded to skipped.
+    store = _FakeStore()
+    store.landed_failures = ["XX000"]
+    importer = _importer(
+        store, ["id", "name"], ["id"],
+        options=BatchedImportOptions(on_conflict=mode), occ_max_attempts=20,
+    )
+    result = importer.import_rows(_rows(4), _table())
+    assert result.failures == 0
+    assert result.quarantined == 0
+    assert store.rows == {(i,): {"id": i, "name": f"name-{i}"} for i in range(4)}
+    assert (result.rows_loaded, result.conflicts) == (loaded, skipped)
+    assert result.rows_loaded + result.conflicts == 4
+
+
+class _DdlError(Exception):
+    """A driver-like DDL error exposing ``sqlstate`` (like psycopg)."""
+
+    def __init__(self, message: str, sqlstate: str) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class _IndexCatalog:
+    """The target's index names, shared by every connection. ``failures`` scripts the next
+    DDL executes as ``(sqlstate, lands)``: ``lands`` creates the index before the error, as
+    an XX000 whose commit landed does."""
+
+    def __init__(self, failures=(), existing=()) -> None:
+        self.names = set(existing)
+        self.failures = list(failures)
+        self.executes = 0
+
+
+class _IndexDdlCursor:
+    def __init__(self, catalog: _IndexCatalog) -> None:
+        self._catalog = catalog
+
+    def execute(self, ddl: Any, params: Any = None) -> None:
+        from dsql_migrator.core.batched_import import _index_name_of
+
+        catalog = self._catalog
+        catalog.executes += 1
+        name = _index_name_of(ddl)
+        if catalog.failures:
+            state, lands = catalog.failures.pop(0)
+            if lands:
+                catalog.names.add(name)
+            raise _DdlError("server unavailable" if state == "XX000" else "failed", state)
+        if name in catalog.names:
+            raise _DdlError(f'relation "{name}" already exists', "42P07")
+        catalog.names.add(name)
+
+    def close(self) -> None:
+        pass
+
+
+class _IndexDdlConnection:
+    """A connection whose only statements are index DDLs against an :class:`_IndexCatalog`."""
+
+    def __init__(self, catalog: _IndexCatalog) -> None:
+        self._catalog = catalog
+
+    def cursor(self) -> _IndexDdlCursor:
+        return _IndexDdlCursor(self._catalog)
+
+    def close(self) -> None:
+        pass
+
+
+def _index_importer(catalog: _IndexCatalog, occ_max_attempts: int = 5) -> BatchedImporter:
+    return BatchedImporter(
+        BatchedImportOptions(parallelism=1),
+        connection_factory=lambda: _IndexDdlConnection(catalog),
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=0.0,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+
+
+_UNIQUE_DDL = "CREATE UNIQUE INDEX ASYNC ux_a ON t (a)"
+
+
+def test_g22_index_ddl_server_unavailable_is_retried_and_created() -> None:
+    # FAILS WITHOUT G22: the XX000 was not retried, so the index was reported "not created".
+    catalog = _IndexCatalog(failures=[("XX000", False)])
+    assert _index_importer(catalog).create_indexes([_UNIQUE_DDL]) == (1, [])
+    assert catalog.executes == 2
+    assert catalog.names == {"ux_a"}
+
+
+def test_g22_index_already_there_after_server_unavailable_is_reported_never_counted() -> None:
+    # The XX000 attempt's CREATE landed, so the retry finds the name taken. Index names are
+    # per schema on Aurora DSQL and come from the source, where they are per table, so the
+    # index found could be another table's: reported with a note, never counted as created.
+    catalog = _IndexCatalog(failures=[("XX000", True)])
+    created, failures = _index_importer(catalog).create_indexes([_UNIQUE_DDL])
+    assert created == 0
+    assert len(failures) == 1
+    assert failures[0].startswith("UNIQUE ux_a: ")
+    assert "already exists" in failures[0]
+    assert "may have been created anyway" in failures[0]
+
+
+def test_g22_sustained_server_unavailable_on_index_ddl_is_reported_with_the_note() -> None:
+    catalog = _IndexCatalog(failures=[("XX000", False)] * 5)
+    created, failures = _index_importer(catalog, occ_max_attempts=3).create_indexes(
+        [_UNIQUE_DDL]
+    )
+    assert (created, catalog.executes) == (0, 3)  # the budget, then reported
+    assert len(failures) == 1
+    assert "server unavailable" in failures[0]
+    assert "may have been created anyway" in failures[0]
+
+
+def test_g22_a_duplicate_index_without_server_unavailable_is_reported_unchanged() -> None:
+    # A first-attempt 42P07 means what it always meant; no XX000 note.
+    catalog = _IndexCatalog(existing={"ux_a"})
+    created, failures = _index_importer(catalog).create_indexes([_UNIQUE_DDL])
+    assert created == 0
+    assert failures == ['UNIQUE ux_a: _DdlError: relation "ux_a" already exists']
+    assert catalog.executes == 1
+
+
+def test_g22_an_xx000_while_connecting_does_not_mark_the_index_unconfirmed() -> None:
+    # Only a CREATE that answered XX000 may have landed; an XX000 from opening the pooled
+    # connection ran no DDL, so the later 42P07 keeps its plain meaning.
+    catalog = _IndexCatalog(existing={"ux_a"})
+    opened: list = []
+
+    def factory() -> _IndexDdlConnection:
+        opened.append(1)
+        if len(opened) == 1:
+            raise _DdlError("server unavailable", "XX000")
+        return _IndexDdlConnection(catalog)
+
+    importer = BatchedImporter(
+        BatchedImportOptions(parallelism=1),
+        connection_factory=factory,
+        occ_max_attempts=5,
+        occ_base_delay=0.0,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    created, failures = importer.create_indexes([_UNIQUE_DDL])
+    assert created == 0
+    assert failures == ['UNIQUE ux_a: _DdlError: relation "ux_a" already exists']
+    assert len(opened) == 2  # the connect was retried, then the DDL ran once
+
+
+def test_g22_retry_predicates() -> None:
+    import psycopg
+
+    from dsql_migrator.core.batched_import import _is_retryable_load_error
+
+    assert _is_retryable_load_error(psycopg.errors.lookup("XX000")("server unavailable"))
+    # XX001 (data corrupted) and XX002 (index corrupted) are genuine errors.
+    assert not _is_retryable_load_error(psycopg.errors.lookup("XX001")("data corrupted"))
+    assert not _is_retryable_load_error(psycopg.errors.lookup("XX002")("index corrupted"))
 
 
 def test_quarantine_is_capped_and_a_systematic_error_fails_fast(monkeypatch) -> None:

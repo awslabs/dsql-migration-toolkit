@@ -404,7 +404,7 @@ def test_classify_schema_drift_maps_a_missing_target_table() -> None:
 
     DSQL raises 42P01 when the table the sink writes to is gone (a Schema Conversion
     REPLACE, or an out-of-band DROP, under a live stream). The sink's isTransient covers
-    only 40001 / 08* / 57* / a null state, so 42P01 is PERMANENT: every event for that
+    only 40001 / XX000 / 08* / 57* / a null state, so 42P01 is PERMANENT: every event for that
     table is dead-lettered with its offset committed and no retry. Unmapped, that -- the
     most destructive failure of the three -- rendered as an ordinary poison row with no
     banner at all, and under 50 records not even an amber DLQ badge.

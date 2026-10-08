@@ -95,8 +95,12 @@ class DsqlSinkOccRollbackTest {
     private int executes;
     private int describes;
     Predicate<Integer> conflictOnExecute = n -> false; // execute #n raises 40001 (OC001)
+    Predicate<Integer> unavailableOnExecute = n -> false; // execute #n raises XX000
     Predicate<Integer> conflictOnDescribe = n -> false; // describe #n raises 40001 (OC001)
+    Predicate<Integer> unavailableOnDescribe = n -> false; // describe #n raises XX000
     int commitConflicts; // the next N commits raise 40001 (OC000)
+    int commitsUnavailable; // the next N commits raise XX000 ...
+    boolean unavailableCommitLands; // ... after committing (Aurora DSQL's uncertain outcome)
     Predicate<Long> rejected = id -> false; // rows Aurora DSQL rejects for good (23505)
     SQLException rollbackFailure; // thrown once, by the first rollback past the skipped ones
     int rollbacksBeforeFailure; // rollbacks that still succeed before rollbackFailure
@@ -113,6 +117,11 @@ class DsqlSinkOccRollbackTest {
           "25P02");
     }
 
+    /** Aurora DSQL's temporary service condition; the session stays open (G22). */
+    static SQLException serverUnavailable() {
+      return new SQLException("server unavailable", "XX000");
+    }
+
     /** A failed statement inside a transaction aborts it (PostgreSQL). */
     private SQLException fail(String call, SQLException e) {
       calls.add(call + "!" + e.getSQLState());
@@ -126,9 +135,13 @@ class DsqlSinkOccRollbackTest {
         throw fail(op, aborted());
       }
       tx = Tx.OPEN; // pgjdbc sends BEGIN before the first statement (autocommit off)
-      if (conflictOnExecute.test(++executes)) {
+      int n = ++executes;
+      if (conflictOnExecute.test(n)) {
         throw fail(op, new SQLException("schema has been updated by another transaction "
             + "(OC001)", "40001"));
+      }
+      if (unavailableOnExecute.test(n)) {
+        throw fail(op, serverUnavailable());
       }
       for (List<Object> row : rows) {
         // A Number bound to the boolean column is what PostgreSQL rejects (42804) -- the
@@ -153,13 +166,18 @@ class DsqlSinkOccRollbackTest {
       if (tx == Tx.ABORTED) {
         throw fail("describe", aborted());
       }
-      if (conflictOnDescribe.test(++describes)) {
-        SQLException e = new SQLException("schema has been updated by another transaction "
-            + "(OC001)", "40001");
+      int n = ++describes;
+      SQLException e =
+          conflictOnDescribe.test(n)
+              ? new SQLException("schema has been updated by another transaction (OC001)",
+                  "40001")
+              : unavailableOnDescribe.test(n) ? serverUnavailable() : null;
+      if (e != null) {
         if (tx == Tx.OPEN) {
           throw fail("describe", e); // inside the transaction: it is now aborted
         }
-        calls.add("describe!40001"); // pgjdbc sends it with no BEGIN: nothing is aborted
+        // pgjdbc sends it with no BEGIN: nothing is aborted
+        calls.add("describe!" + e.getSQLState());
         throw e;
       }
       return proxy(
@@ -230,6 +248,16 @@ class DsqlSinkOccRollbackTest {
                     tx = Tx.IDLE; // a failed COMMIT ends the transaction
                     throw new SQLException("change conflicts with another transaction (OC000)",
                         "40001");
+                  }
+                  if (commitsUnavailable > 0) {
+                    commitsUnavailable--;
+                    calls.add("commit!XX000");
+                    if (unavailableCommitLands) {
+                      committed.addAll(pending); // it committed; the client got an error
+                    }
+                    pending.clear();
+                    tx = Tx.IDLE; // a failed COMMIT ends the transaction
+                    throw serverUnavailable();
                   }
                   calls.add("commit");
                   committed.addAll(pending);
@@ -503,6 +531,195 @@ class DsqlSinkOccRollbackTest {
             "prepare", "update!40001", "rollback!XX000", "close"),
         dsql.calls);
     assertEquals(1, reconnects.get());
+    assertEquals(List.of(), dlq.states());
+  }
+
+  // --- G22: Aurora DSQL's XX000 "server unavailable" is retried, never dead-lettered ----------
+  //
+  // Aurora DSQL documents XX000 as a temporary service condition: the connection stays
+  // usable, and the whole transaction, COMMIT included, is to be retried with backoff and
+  // jitter. Before G22 it was permanent, so a one-row chunk (or each row of the one-row
+  // fallback that met it) was dead-lettered although healthy.
+
+  @Test
+  void aOneRowChunkWhoseStatementRaisesXX000IsAppliedNotDeadLettered() throws Exception {
+    // FAILS WITHOUT G22: the XX000 was not retried and the healthy row went to the DLQ.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.unavailableOnExecute = n -> n == 1;
+    Dlq dlq = new Dlq();
+    task(dsql, dlq).put(List.of(insert("orders", 1)));
+    assertEquals(List.of(1L), dsql.committed);
+    assertEquals(List.of(), dlq.states());
+    assertEquals(
+        List.of("prepare", "update!XX000", "rollback", "prepare", "update", "commit"),
+        dsql.calls);
+  }
+
+  @Test
+  void aMultiRowChunkCommitsOnTheBatchedPathAfterAStatementXX000() throws Exception {
+    // FAILS WITHOUT G22: the chunk fell back to one row per transaction (three commits).
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.unavailableOnExecute = n -> n == 1;
+    Dlq dlq = new Dlq();
+    task(dsql, dlq).put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3)));
+    assertEquals(List.of(1L, 2L, 3L), dsql.committed);
+    assertEquals(List.of(), dlq.states());
+    assertEquals(
+        List.of("prepare", "batch!XX000", "rollback", "prepare", "batch", "commit"), dsql.calls);
+  }
+
+  @Test
+  void aCommitTimeXX000ReRunsTheWholeTransaction() throws Exception {
+    // The COMMIT failed and did not land: the whole transaction, COMMIT included, re-runs.
+    // FAILS WITHOUT G22: the row was dead-lettered.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.commitsUnavailable = 1;
+    Dlq dlq = new Dlq();
+    task(dsql, dlq).put(List.of(insert("orders", 1)));
+    assertEquals(List.of(1L), dsql.committed);
+    assertEquals(List.of(), dlq.states());
+    assertEquals(
+        List.of("prepare", "update", "commit!XX000", "rollback(no-op)", "prepare", "update",
+            "commit"),
+        dsql.calls);
+  }
+
+  @Test
+  void aCommitTimeXX000ThatLandedIsReRunHarmlessly() throws Exception {
+    // Aurora DSQL's uncertain outcome: the COMMIT landed but answered XX000. The re-run writes
+    // the same row again -- an idempotent upsert -- and nothing is dead-lettered.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.commitsUnavailable = 1;
+    dsql.unavailableCommitLands = true;
+    Dlq dlq = new Dlq();
+    task(dsql, dlq).put(List.of(insert("orders", 1)));
+    assertEquals(List.of(1L, 1L), dsql.committed); // applied twice: the same upsert
+    assertEquals(List.of(), dlq.states());
+    assertEquals(
+        List.of("prepare", "update", "commit!XX000", "rollback(no-op)", "prepare", "update",
+            "commit"),
+        dsql.calls);
+  }
+
+  @Test
+  void aServerUnavailableThatNeverClearsIsRedeliveredNeverDeadLettered() throws Exception {
+    // FAILS WITHOUT G22: the healthy row was dead-lettered at the first XX000.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.unavailableOnExecute = n -> true;
+    Dlq dlq = new Dlq();
+    Task task = task(dsql, dlq);
+    RetriableException e =
+        assertThrows(RetriableException.class, () -> task.put(List.of(insert("orders", 1))));
+    assertEquals("XX000", ((SQLException) e.getCause()).getSQLState());
+    assertEquals(List.of(), dlq.states());
+    assertEquals(10, dsql.calls.stream().filter("update!XX000"::equals).count()); // the budget
+    assertEquals(10, dsql.calls.stream().filter("rollback"::equals).count()); // 9 + the caller's
+    assertEquals("close", dsql.calls.get(dsql.calls.size() - 1)); // reconnect on redelivery
+    assertNull(get(task, "connection"));
+  }
+
+  @Test
+  void aSustainedXX000OnTheOneRowPathIsRedeliveredNotDeadLettered() throws Exception {
+    // Row 2 is rejected for good (23505), so the chunk falls back to one row per transaction;
+    // there, every statement meets XX000. FAILS WITHOUT G22: healthy row 1 (and row 3) were
+    // dead-lettered with XX000 next to row 2.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.rejected = id -> id == 2L;
+    dsql.unavailableOnExecute = n -> n >= 2;
+    Dlq dlq = new Dlq();
+    Task task = task(dsql, dlq);
+    assertThrows(
+        RetriableException.class,
+        () -> task.put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3))));
+    assertEquals(List.of(), dlq.states());
+    assertEquals(List.of(), dsql.committed);
+  }
+
+  @Test
+  void xx000And40001ShareOneBudget() throws Exception {
+    // One occ.max.retries budget for both (the ~21 s per-unit bound the poll interval relies
+    // on), then the transient path.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.conflictOnExecute = n -> n % 2 == 1;
+    dsql.unavailableOnExecute = n -> n % 2 == 0;
+    Dlq dlq = new Dlq();
+    Task task = task(dsql, dlq);
+    assertThrows(RetriableException.class, () -> task.put(List.of(insert("orders", 1))));
+    assertEquals(10, dsql.calls.stream().filter(c -> c.startsWith("update!")).count());
+    assertEquals(List.of(), dlq.states());
+  }
+
+  @Test
+  void aDescribeXX000IsRetriedSoTheBooleanStillBindsAsBoolean() throws Exception {
+    // FAILS WITHOUT G22: the describe's XX000 was swallowed, the 0/1 bound as a number, Aurora
+    // DSQL rejected it (42804) and the healthy row was dead-lettered -- and its table put on
+    // the drift cool-down for a type change that never happened.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.unavailableOnDescribe = n -> n == 1;
+    Dlq dlq = new Dlq();
+    Task task = task(dsql, dlq);
+    task.put(List.of(insert("orders", 1)));
+    assertEquals(List.of(1L), dsql.committed);
+    assertEquals(List.of(), dlq.states());
+    assertTrue(task.driftCooledTables().isEmpty());
+    assertEquals(
+        List.of("prepare", "describe!XX000", "rollback(no-op)", "prepare", "update", "commit"),
+        dsql.calls);
+  }
+
+  @Test
+  void aDescribeXX000InsideTheTransactionIsRolledBackAndTheChunkRetriedBatched()
+      throws Exception {
+    // The second statement group's describe runs inside the open transaction and aborts it.
+    // FAILS WITHOUT G22: swallowed, the next execute got 25P02 and the chunk fell back to one
+    // row per transaction.
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.unavailableOnDescribe = n -> n == 2;
+    Dlq dlq = new Dlq();
+    task(dsql, dlq).put(List.of(insert("orders", 1), insert("items", 2)));
+    assertEquals(List.of(1L, 2L), dsql.committed);
+    assertEquals(List.of(), dlq.states());
+    assertEquals(
+        List.of("prepare", "update", "prepare", "describe!XX000", "rollback", "prepare",
+            "update", "prepare", "update", "commit"),
+        dsql.calls);
+  }
+
+  @Test
+  void aFailedErrorPathRollbackDropsTheSessionSoAHealthyRowIsNotDeadLettered()
+      throws Exception {
+    // Row 2 is rejected for good (23505) and the chunk's rollback fails while Aurora DSQL
+    // keeps the session open (XX000), so that session still holds the aborted transaction.
+    // The one-row-per-transaction fallback must start on a new session. FAILS WITHOUT G22:
+    // rollbackQuietly kept the session, so healthy row 1 was dead-lettered with 25P02.
+    assertAFailedErrorPathRollbackDropsTheSession(AbortingDsql.serverUnavailable());
+  }
+
+  @Test
+  void anyFailedErrorPathRollbackDropsTheSessionWhateverItsSqlState() throws Exception {
+    // Not only XX000: a rollback that fails with any other server error, or with no SQLSTATE,
+    // may leave the session holding the aborted transaction too -- and pgjdbc's isValid()
+    // still answers true in one, so connection() would reuse it. FAILS if the drop is
+    // narrowed to XX000: healthy row 1 is dead-lettered with 25P02.
+    assertAFailedErrorPathRollbackDropsTheSession(new SQLException("io error", "58030"));
+    assertAFailedErrorPathRollbackDropsTheSession(new SQLException("rollback failed"));
+  }
+
+  private static void assertAFailedErrorPathRollbackDropsTheSession(SQLException failure)
+      throws Exception {
+    AbortingDsql dsql = new AbortingDsql();
+    dsql.rejected = id -> id == 2L;
+    dsql.rollbackFailure = failure;
+    Dlq dlq = new Dlq();
+    Task task = task(dsql, dlq);
+    AtomicInteger reconnects = offline(task);
+    assertThrows(
+        IllegalStateException.class,
+        () -> task.put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3))));
+    assertEquals(
+        List.of("prepare", "batch!23505", "rollback!" + failure.getSQLState(), "close"),
+        dsql.calls);
+    assertEquals(1, reconnects.get()); // the fallback's first row opened a new session
     assertEquals(List.of(), dlq.states());
   }
 

@@ -451,8 +451,8 @@ class SinkConnectorConfig(BaseModel):
     The Python control plane only *builds* this config; the connector plugin (our
     Java artifact on MSK Connect) consumes it. Keying/idempotency knobs make the
     connector apply PK-keyed upsert/delete with DLQ quarantine (Req 12.3-12.6);
-    OCC (40001) retry of each whole transaction (a <=3,000-row chunk, or one row in the
-    record-by-record fallback) and the batching live in the plugin.
+    OCC (40001) / server-unavailable (XX000) retry of each whole transaction (a <=3,000-row
+    chunk, or one row in the record-by-record fallback) and the batching live in the plugin.
     """
 
     model_config = ConfigDict(extra="forbid")

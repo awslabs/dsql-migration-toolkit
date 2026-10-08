@@ -51,6 +51,7 @@ from dsql_migrator.core.batched_import import (
     BatchedImporter,
     BatchedImportOptions,
     OnConflictMode,
+    is_unconfirmed_index_failure,
     safe_error_message,
 )
 from dsql_migrator.core.target_connection import (
@@ -1987,6 +1988,11 @@ def _record_index_failures(
     is present, so only an access path is absent -- failing here used to mark a
     fully-loaded table FAILED and block the Validation gate on data with nothing
     missing. Logged as INFO (not FAILURE) for the same reason.
+
+    An index Aurora DSQL answered XX000 for (its failure carries
+    :data:`~dsql_migrator.core.batched_import.UNCONFIRMED_INDEX_NOTE`) may exist after all,
+    so it is recorded as "index not confirmed", without the remedy for a missing index: the
+    note says what to check.
     """
     entries = tuple(failures or ())
     if not entries:
@@ -1999,7 +2005,10 @@ def _record_index_failures(
                 chunk_id=table_name,
                 error_code=None,
                 message=(
-                    f"index not created: {failure} — the table's DATA loaded "
+                    f"index not confirmed: {failure} — the table's DATA loaded "
+                    "completely"
+                    if is_unconfirmed_index_failure(failure)
+                    else f"index not created: {failure} — the table's DATA loaded "
                     "completely; add the index later or reduce the table's index "
                     "count (Aurora DSQL allows 24 per table, including the "
                     "primary key)"
@@ -4952,8 +4961,8 @@ def _default_importer_factory(inputs: "DataMigrationInputs") -> BatchedImporter:
         parallelism=cfg.full_load_batch_parallelism,
         batch_size=cfg.full_load_batch_rows,
     )
-    # occ_max_attempts is the per-batch retry budget for BOTH OCC conflicts and
-    # transient connection failures; a large-scale load needs it patient enough to
+    # occ_max_attempts is the per-batch retry budget shared by OCC conflicts, Aurora DSQL's
+    # XX000 and transient connection failures; a large-scale load needs it patient enough to
     # ride out a connection storm at a high-parallelism transition (config key
     # DSQL_MIGRATOR_FULL_LOAD_OCC_MAX_ATTEMPTS).
     return BatchedImporter(
@@ -7646,9 +7655,11 @@ def _count_orphans(
     serialization failure (OC001/40001) when the target is being written concurrently
     (e.g. a live CDC sink at cut over), and a transient conflict must not be mistaken
     for "orphan pre-check failed" and skip an otherwise-applicable foreign key. On a
-    conflict the whole (idempotent, read-only) count re-runs from the first page.
+    conflict, or Aurora DSQL's temporary XX000, the whole (idempotent, read-only) count
+    re-runs from the first page.
     """
-    from dsql_migrator.core.occ import with_occ_retry
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.target_connection import is_server_unavailable
 
     def _run() -> int:
         # A prior OC001 leaves the connection's transaction aborted; clear it before the
@@ -7672,7 +7683,9 @@ def _count_orphans(
                 pass
         return int(row[0]) if row and row[0] is not None else 0
 
-    return with_occ_retry()(_run)()
+    return with_occ_retry(
+        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc)
+    )(_run)()
 
 
 def _count_orphans_keyset(

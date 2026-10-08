@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
+from dsql_migrator.core.batched_import import is_unconfirmed_index_failure
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.job_manager import JobNotFoundError
 from dsql_migrator.core.models import (
@@ -2570,8 +2571,9 @@ def _render_full_load_progress(
     # error-log entry, but it is NOT a load failure: every row is present and only an
     # access path is missing. Split it out so it is reported as its own warning instead
     # of appearing among the failed tables (which would contradict the table's DONE
-    # state and imply data was lost).
-    index_prefix = "index not created: "
+    # state and imply data was lost). "index not confirmed" is an index Aurora DSQL answered
+    # XX000 for while it was being created: it may exist after all.
+    index_prefix = ("index not created: ", "index not confirmed: ")
     index_only = [
         r for r in failures if str(r.error_message).startswith(index_prefix)
     ]
@@ -2761,42 +2763,80 @@ def _render_full_load_progress(
         # from failures and quarantine: nothing is missing from the target, so the
         # migration can proceed -- but the operator has to know an index they asked
         # for does not exist, since queries relying on it will be slow.
+        #
+        # A UNIQUE index that failed to create is NOT merely a missing access path: it is a
+        # missing CONSTRAINT, so the target now accepts duplicates the source forbids. "No
+        # data was lost and you do not need to re-run" was true of the data and false of the
+        # constraint, and a COMPOSITE_KEY table's post-load pass can contain ONLY such an
+        # index. Split the notice, and raise the tone when one is unique -- cutting over onto
+        # a table that no longer enforces uniqueness is not an FYI.
+        #
+        # An index Aurora DSQL answered XX000 for while it was being created may exist after
+        # all (most likely its CREATE landed), so it is "not confirmed", not "missing": when
+        # every entry is such an index the notice says so instead of claiming a missing
+        # constraint, and asks for a check rather than a create (the tone stays: it may truly
+        # be missing). A mix keeps the "NOT created" notice, which is true of the others; each
+        # row's badge tells them apart.
+        unique = _has_unique_index_failure(index_only)
+        unconfirmed = all(is_unconfirmed_index_failure(r.error_message) for r in index_only)
+        count = len(index_only)
+        if unique and unconfirmed:
+            header = (
+                f"Unique index not confirmed ({count}) — the data loaded; check that it "
+                "exists before cutting over"
+            )
+            body = (
+                "Every row is on the target, so no data was lost. Aurora DSQL answered "
+                "server unavailable (SQLSTATE XX000) while these indexes were being "
+                "created, so they may exist after all. At least one is a UNIQUE index, "
+                "which the source enforced as a constraint: if it is missing, duplicates "
+                "can be written until it exists. Check the table's indexes on the target "
+                "and create any that are missing BEFORE cutting over."
+            )
+        elif unique:
+            header = (
+                f"Unique index NOT created ({count}) — the data loaded, "
+                "but a constraint is missing"
+            )
+            body = (
+                "Every row is on the target, so no data was lost. But at least one of "
+                "these is a UNIQUE index, which the source enforced as a constraint "
+                "and the target now does not — duplicates can be written until it "
+                "exists, so create it BEFORE cutting over. Aurora DSQL allows 24 "
+                "indexes per table, including the primary key."
+            )
+        elif unconfirmed:
+            header = f"Indexes not confirmed ({count}) — the data loaded completely"
+            body = (
+                "Every row is on the target, so no data was lost and you do not need to "
+                "re-run the load. Aurora DSQL answered server unavailable (SQLSTATE "
+                "XX000) while these indexes were being created, so they may exist after "
+                "all: check the table's indexes on the target and create only the ones "
+                "that are missing. Queries that depend on a missing index will be slower "
+                "until it exists."
+            )
+        else:
+            header = f"Indexes not created ({count}) — the data loaded completely"
+            body = (
+                "Every row is on the target; only these secondary indexes are "
+                "missing, so no data was lost and you do not need to re-run the "
+                "load. Add them later, or reduce the table's index count — Aurora "
+                "DSQL allows 24 indexes per table, including the primary key. "
+                "Queries that depend on a missing index will be slower until it "
+                "exists."
+            )
         with ui.column().classes("w-full gap-2"):
             render_notice(
-                ui,
-                # A UNIQUE index that failed to create is NOT merely a missing access
-                # path: it is a missing CONSTRAINT, so the target now accepts duplicates
-                # the source forbids. "No data was lost and you do not need to re-run"
-                # was true of the data and false of the constraint, and a COMPOSITE_KEY
-                # table's post-load pass can contain ONLY such an index. Split the notice,
-                # and raise the tone when one is unique -- cutting over onto a table that
-                # no longer enforces uniqueness is not an FYI.
-                tone="warning" if _has_unique_index_failure(index_only) else "info",
-                header=(
-                    f"Unique index NOT created ({len(index_only)}) — the data loaded, "
-                    "but a constraint is missing"
-                    if _has_unique_index_failure(index_only)
-                    else f"Indexes not created ({len(index_only)}) — the data loaded "
-                    "completely"
-                ),
-                body=(
-                    "Every row is on the target, so no data was lost. But at least one of "
-                    "these is a UNIQUE index, which the source enforced as a constraint "
-                    "and the target now does not — duplicates can be written until it "
-                    "exists, so create it BEFORE cutting over. Aurora DSQL allows 24 "
-                    "indexes per table, including the primary key."
-                    if _has_unique_index_failure(index_only)
-                    else "Every row is on the target; only these secondary indexes are "
-                    "missing, so no data was lost and you do not need to re-run the "
-                    "load. Add them later, or reduce the table's index count — Aurora "
-                    "DSQL allows 24 indexes per table, including the primary key. "
-                    "Queries that depend on a missing index will be slower until it "
-                    "exists."
-                ),
+                ui, tone="warning" if unique else "info", header=header, body=body
             )
             for row in index_only:
+                state = (
+                    "not confirmed"
+                    if is_unconfirmed_index_failure(row.error_message)
+                    else "missing"
+                )
                 _failure_row(
-                    table_name=f"{row.table} · Done — index missing",
+                    table_name=f"{row.table} · Done — index {state}",
                     message=row.error_message,
                     tone="info",
                 )

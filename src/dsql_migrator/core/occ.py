@@ -98,7 +98,9 @@ def with_occ_retry(
     ``retryable`` decides which errors are retried; it defaults to
     :func:`is_occ_conflict` (OCC ``40001`` only). Callers whose operation can also
     recover from a transient connection drop / expired token (e.g. the batched
-    loader, which leases a fresh connection per attempt) pass a wider predicate.
+    loader, which leases a fresh connection per attempt) or Aurora DSQL's XX000
+    (:func:`~dsql_migrator.core.target_connection.is_server_unavailable`) pass a wider
+    predicate.
 
     It does not roll back between attempts: every Aurora DSQL connection this tool
     opens is autocommit (DsqlConnector), so a failed statement leaves no transaction

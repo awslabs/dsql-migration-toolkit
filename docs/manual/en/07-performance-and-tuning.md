@@ -40,12 +40,22 @@ Each re-run starts on a clean transaction: the sink (plugin v52 or later) rolls
 back what the failed attempt left before it runs the transaction again (a Full
 Load batch runs in autocommit, so a failed one leaves nothing open).
 A `40001` is retried with exponential backoff (50 ms base, 5 s cap) and full
-jitter, up to 20 attempts per Full Load batch (a budget it shares with dropped
-connections and expired IAM tokens) and up to 10 per sink transaction, so workers
+jitter, up to 20 attempts per Full Load batch (a budget it shares with `XX000`,
+dropped connections and expired IAM tokens) and up to 10 per sink transaction
+(shared with `XX000`), so workers
 that collided do not retry in lockstep and collide again — the pattern that pushes
 a busy load toward livelock — and bounded parallelism caps how many writers
 contend at once. A dropped connection or an expired IAM token is reconnected and
-retried too. Any other error is not retried:
+retried too. So is Aurora DSQL's `XX000` ("server unavailable"), a temporary
+service condition that Aurora DSQL says to answer by running the whole transaction
+again, `COMMIT` included: an `XX000` at commit can mean the transaction did commit,
+which is safe here because every re-run is idempotent per primary key (the sink's one
+caveat, a table with a secondary `UNIQUE` index, is in
+[§4.4](04-cdc-and-dsql-constraints.md#44-how-the-sink-handles-dsqls-constraints-in-the-data-path)).
+If it outlasts the budget, the Full Load batch fails (use **Retry unfinished tables**;
+no row is quarantined for it) and the sink has Kafka Connect redeliver its batch (no
+row is dead-lettered for it); if it keeps recurring, contact AWS Support. Any other
+error is not retried:
 the Full Load splits the batch down to the rejected row and quarantines it, and
 the sink sends it to the DLQ, while every healthy row still lands. A stock JDBC
 sink cannot authenticate with DSQL's short-lived IAM tokens and has no

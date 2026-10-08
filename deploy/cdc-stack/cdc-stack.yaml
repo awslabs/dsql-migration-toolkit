@@ -2413,9 +2413,11 @@ Resources:
         # (converter/transform errors), for up to 10 min before dead-lettering; it
         # never wraps put(). Transient DSQL errors (dropped connection, token
         # expiry) are rethrown from put() as RetriableException and retried
-        # indefinitely by Connect, and OCC 40001 is retried per transaction inside
-        # the plugin (OccRetry: the whole chunk, or one row in the record-by-record
-        # fallback) -- see DsqlSinkTask.put(). (History: the original
+        # indefinitely by Connect, and OCC 40001 and Aurora DSQL's temporary XX000
+        # "server unavailable" are retried per transaction inside the plugin
+        # (OccRetry: the whole chunk, or one row in the record-by-record fallback;
+        # sink plugin v52+), then redelivered like a dropped connection -- see
+        # DsqlSinkTask.put(). (History: the original
         # errors.retry.timeout=0 default was part of the 2026-06 contiguous-band
         # data-loss analysis.)
         errors.retry.timeout: "600000"
@@ -2554,9 +2556,11 @@ Resources:
         # (converter/transform errors), for up to 10 min before dead-lettering; it
         # never wraps put(). Transient DSQL errors (dropped connection, token
         # expiry) are rethrown from put() as RetriableException and retried
-        # indefinitely by Connect, and OCC 40001 is retried per transaction inside
-        # the plugin (OccRetry: the whole chunk, or one row in the record-by-record
-        # fallback) -- see DsqlSinkTask.put(). (History: the original
+        # indefinitely by Connect, and OCC 40001 and Aurora DSQL's temporary XX000
+        # "server unavailable" are retried per transaction inside the plugin
+        # (OccRetry: the whole chunk, or one row in the record-by-record fallback;
+        # sink plugin v52+), then redelivered like a dropped connection -- see
+        # DsqlSinkTask.put(). (History: the original
         # errors.retry.timeout=0 default was part of the 2026-06 contiguous-band
         # data-loss analysis.)
         errors.retry.timeout: "600000"

@@ -661,15 +661,36 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   -- swallowed, it left an open transaction aborted, or bound a TINYINT(1) 0/1 as a number
 #   (42804: dead-lettered, and a false TYPE_CHANGE cool-down). A COMMIT-time 40001 (pgjdbc
 #   sends nothing to roll back), any other error, budget exhaustion and the transient
-#   reconnect path behave as in v51. The occ.max.retries description now says what it counts
-#   (OCC attempts per sink transaction). G20's comment-only Java changes ride along (they
-#   moved OccRetry.class line numbers only). Worker configuration and connector properties
-#   are unchanged; the Debezium ZIPs and the offset-seeder Lambda are byte-identical (the bump
-#   renames only the CustomPlugins and the worker configurations; the seeder Lambda keeps its
-#   name). Bumped because the ZIP changed; a live cdc-stack needs Delete + Deploy CDC
-#   infrastructure to pick up v52 (Start CDC does not re-register the plugin). That deploy
-#   replaces the S3 object even at the same size: upload_plugin now proves the content by
-#   SHA-256 (G21).
+#   reconnect path behave as in v51, except as G22 changes them (below). The occ.max.retries
+#   description now says what it counts (OCC attempts per sink transaction). G20's
+#   comment-only Java changes ride along (they moved OccRetry.class line numbers only).
+#   Worker configuration and connector properties are unchanged; the Debezium ZIPs and the
+#   offset-seeder Lambda are byte-identical (the bump renames only the CustomPlugins and the
+#   worker configurations; the seeder Lambda keeps its name). Bumped because the ZIP changed;
+#   a live cdc-stack needs Delete + Deploy CDC infrastructure to pick up v52 (Start CDC does
+#   not re-register the plugin). That deploy replaces the S3 object even at the same size:
+#   upload_plugin now proves the content by SHA-256 (G21).
+# v52, rebuilt in place (G22; v52 was never deployed, so the version stays): Aurora DSQL's
+#   "server unavailable" (SQLSTATE XX000 -- a temporary service condition after which the
+#   session stays open) is retried exactly like a 40001: OccRetry.retriesInProcess, the whole
+#   transaction re-run after the rollback, within the same occ.max.retries budget; once that
+#   budget is spent it is transient (reconnect + RetriableException, so Connect redelivers).
+#   Before, it was permanent: a one-row chunk, or each row of the one-row-per-transaction
+#   fallback that hit it, was DEAD-LETTERED although healthy; an XX000 from the parameter
+#   describe bound a TINYINT(1) 0/1 as a number (42804 dead letter + a false TYPE_CHANGE
+#   cool-down) or left the transaction aborted (25P02); and the two catalog reads failed open
+#   for 60 s (values written unchecked; source-key deletes off). An XX000 at COMMIT may have
+#   committed; every write shape (upsert, delete, move, the spared delete, tombstone skip)
+#   re-runs to the same image per primary key, though a secondary UNIQUE index can reject
+#   (23505) an image the landed chunk already replaced, which is then dead-lettered as on any
+#   redelivery of a committed batch. Also: a rollback that fails on an error path now drops the
+#   connection (kept, its aborted transaction dead-lettered the next healthy row with 25P02),
+#   and the RetriableException's cause is value-free -- SQLSTATE and exception classes only,
+#   because pgjdbc renders a failed batch entry WITH its bound values and Connect logs the
+#   cause on every redelivery. XX001/XX002 stay permanent. The rollback WARN now says "failed
+#   attempt", and the occ.max.retries / retry.backoff.ms descriptions name XX000. Worker
+#   configuration, connector properties, the Debezium ZIPs and the seeder Lambda are
+#   unchanged; a live cdc-stack still needs Delete + Deploy CDC infrastructure to pick up v52.
 PLUGIN_VERSION = "v52"
 
 

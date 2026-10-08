@@ -172,6 +172,11 @@ class DsqlSinkRekeyTest {
     BiFunction<String, List<Object>, SQLException> failure = (sql, binds) -> null;
     // Off: no unique index on the source key (not built yet, or an edited DDL without one).
     boolean uniqueSourceKey = true;
+    // G22: the next N commits answer Aurora DSQL's XX000 "server unavailable" -- after
+    // committing when unavailableCommitLands (the documented uncertain outcome), else after
+    // ending the transaction with nothing applied.
+    int commitsUnavailable;
+    boolean unavailableCommitLands;
 
     private static final Pattern WHERE_COLUMN = Pattern.compile("\"([^\"]+)\" = \\?");
     private static final Pattern INSERT_COLUMNS =
@@ -354,6 +359,16 @@ class DsqlSinkRekeyTest {
                   yield statement((String) a[0]);
                 }
                 case "commit" -> {
+                  if (commitsUnavailable > 0) {
+                    commitsUnavailable--;
+                    calls.add("commit!XX000");
+                    if (unavailableCommitLands) {
+                      committed = copy(working); // it committed; the client got an error
+                    } else {
+                      working = copy(committed); // the failed COMMIT ended the transaction
+                    }
+                    throw new SQLException("server unavailable", "XX000");
+                  }
                   calls.add("commit");
                   committed = copy(working);
                   yield null;
@@ -1243,6 +1258,35 @@ class DsqlSinkRekeyTest {
   }
 
   @Test
+  void aServerUnavailableIndexReadIsRetriedAndASustainedOneRedelivers() throws Exception {
+    // G22: an XX000 on the unique-index read is retried like a 40001, and one that never
+    // clears is redelivered. FAILS WITHOUT G22: it counted as NOT VALID for 60 s, so this
+    // REPLICA IDENTITY DEFAULT delete (the before-image's lead is the column DEFAULT, 7) was
+    // keyed on the exact composite key and silently matched nothing.
+    SQLException unavailable = new SQLException("server unavailable", "XX000");
+    SinkRecord delete = record(ORDERS, sourceKey(2), "d", row(7, 2, null), null);
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(5, 2, "a");
+    RekeyTask task =
+        task(dsql, new RecordingReporter(), TARGET_KEYS).index(unavailable, true);
+    task.put(List.of(delete));
+    assertEquals(List.of(new Executed(DELETE_BY_SOURCE_KEY, List.of(2))), dsql.executed);
+    assertTrue(dsql.rows().isEmpty());
+    assertEquals(2, task.indexLoads);
+    assertTrue(task.sourceKeyWarnedTables().isEmpty());
+
+    FakeDsql next = new FakeDsql();
+    next.seed(5, 2, "a");
+    RekeyTask sustained = task(next, new RecordingReporter(), TARGET_KEYS).index(unavailable);
+    RetriableException e =
+        assertThrows(RetriableException.class, () -> sustained.put(List.of(delete)));
+    assertEquals("XX000", ((SQLException) e.getCause()).getSQLState());
+    assertTrue(next.executed.isEmpty()); // nothing written: Connect redelivers the batch
+    assertEquals(10, sustained.indexLoads); // the occ.max.retries budget
+    assertTrue(sustained.sourceKeyWarnedTables().isEmpty()); // never "deletes are off"
+  }
+
+  @Test
   void theWarningNamesTheTableAndSqlstateOnly() {
     String line = DsqlSinkTask.SOURCE_KEY_INDEX_WARN;
     assertEquals(
@@ -1500,5 +1544,190 @@ class DsqlSinkRekeyTest {
     assertEquals(1, dlq.records.size());
     assertEquals("23505", ((SQLException) dlq.causes.get(0)).getSQLState());
     assertEquals(List.of(List.of(5, 4, "a")), legacy.rows());
+  }
+
+  // --- G22: an XX000 at COMMIT (Aurora DSQL's uncertain outcome) ------------------------------
+  //
+  // Aurora DSQL documents that a transaction whose COMMIT answered XX000 "server unavailable"
+  // MIGHT have committed. The sink re-runs the whole transaction either way, so every write
+  // shape must end in the same rows whether that first COMMIT landed or not.
+
+  /**
+   * Runs {@code put} with its first COMMIT answering XX000, once after it landed and once after
+   * it did not, and checks both end at {@code expected}, nothing dead-lettered, one re-run.
+   */
+  private static void assertConvergesThroughAnUncertainCommit(
+      boolean indexValid,
+      java.util.function.Consumer<FakeDsql> seed,
+      List<SinkRecord> put,
+      List<List<Object>> expected)
+      throws Exception {
+    for (boolean landed : new boolean[] {true, false}) {
+      FakeDsql dsql = new FakeDsql();
+      seed.accept(dsql);
+      dsql.commitsUnavailable = 1;
+      dsql.unavailableCommitLands = landed;
+      RecordingReporter dlq = new RecordingReporter();
+      task(dsql, dlq, TARGET_KEYS).index(indexValid).put(put);
+      String context = "landed=" + landed + " indexValid=" + indexValid;
+      assertEquals(expected, dsql.rows(), context);
+      assertTrue(dlq.records.isEmpty(), () -> context + " " + dlq.causes);
+      assertEquals(1, dsql.count("commit!XX000"), context);
+      assertEquals(1, dsql.count("commit"), context);
+    }
+  }
+
+  @Test
+  void g22anUpsertConvergesThroughAnUncertainCommit() throws Exception {
+    assertConvergesThroughAnUncertainCommit(
+        false,
+        dsql -> dsql.seed(5, 2, "a"),
+        List.of(
+            record(ORDERS, sourceKey(4), "c", null, row(5, 4, "n")),
+            record(ORDERS, sourceKey(2), "u", row(5, 2, "a"), row(5, 2, "b"))),
+        List.of(List.of(5, 2, "b"), List.of(5, 4, "n")));
+  }
+
+  @Test
+  void g22deletesConvergeThroughAnUncertainCommit() throws Exception {
+    for (boolean indexValid : new boolean[] {false, true}) {
+      assertConvergesThroughAnUncertainCommit(
+          indexValid,
+          dsql -> {
+            dsql.seed(5, 2, "a");
+            dsql.seed(5, 3, "b");
+          },
+          List.of(
+              record(ORDERS, sourceKey(2), "d", row(5, 2, "a"), null),
+              tombstone(ORDERS, sourceKey(2))),
+          List.of(List.of(5, 3, "b")));
+    }
+  }
+
+  @Test
+  void g22aMoveConvergesThroughAnUncertainCommit() throws Exception {
+    for (boolean indexValid : new boolean[] {false, true}) {
+      assertConvergesThroughAnUncertainCommit(
+          indexValid,
+          dsql -> dsql.seed(5, 2, "a"),
+          List.of(leadUpdate()),
+          List.of(List.of(9, 2, "b")));
+    }
+  }
+
+  @Test
+  void g22aReplaceWithAnUnknownOldKeyConvergesThroughAnUncertainCommit() throws Exception {
+    // The spared delete (DELETE ... AND NOT (lead = ?)) spares the row the landed attempt
+    // already moved, and the one an UPDATE kept in place.
+    assertConvergesThroughAnUncertainCommit(
+        true,
+        dsql -> {
+          dsql.seed(9, 3, "r3");
+          dsql.seed(9, 4, "r4");
+        },
+        List.of(blindUpdate(11, 3, "r3"), blindUpdate(9, 4, "r4b")),
+        List.of(List.of(9, 4, "r4b"), List.of(11, 3, "r3")));
+  }
+
+  /** What one run of a put left: the rows, the dead-lettered offsets, the COMMIT counts. */
+  private record Outcome(
+      Set<List<Object>> rows, List<Long> deadLettered, int commits, int uncertain) {}
+
+  private static Outcome runOnce(List<SinkRecord> put, boolean indexValid, boolean landed)
+      throws Exception {
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(5, 2, "a");
+    dsql.seed(5, 4, "d");
+    if (landed) {
+      dsql.commitsUnavailable = 1;
+      dsql.unavailableCommitLands = true;
+    }
+    RecordingReporter dlq = new RecordingReporter();
+    task(dsql, dlq, TARGET_KEYS).index(indexValid).put(put);
+    List<Long> offsets = new ArrayList<>();
+    for (SinkRecord r : dlq.records) {
+      offsets.add(r.kafkaOffset());
+    }
+    return new Outcome(
+        Set.copyOf(dsql.rows()), offsets, dsql.count("commit"), dsql.count("commit!XX000"));
+  }
+
+  @Test
+  void everyWriteShapeReRunAfterALandedCommitEndsInTheSameState() throws Exception {
+    // Every shape, with and without a valid unique index on id (Aurora DSQL enforces that
+    // index even while it builds), run twice: cleanly, and with its COMMIT landing but
+    // answering XX000 so the whole transaction re-runs on the state it already wrote. Both end
+    // in the same rows. The one difference allowed is pre-existing (any Connect redelivery of
+    // a committed chunk does the same) and comes from a secondary UNIQUE index -- here the one
+    // on id -- not from re-keying: the re-run replays earlier images on rows that already hold
+    // their final ones, an earlier image whose unique value the committed state gives to
+    // another row is rejected (23505), the chunk falls back to one row per transaction, and
+    // that record is dead-lettered. A table that is not re-keyed does the same (an insert, a
+    // delete, then a re-insert of one unique value in one chunk). For the shapes below the
+    // record is a superseded image and the row still ends correct; that is no general
+    // guarantee -- rows that pass a unique value along within one chunk can lose a row's last
+    // image, which is why Cut over waits for a CHECKSUM of every dead-lettered table.
+    Map<String, List<SinkRecord>> shapes = new LinkedHashMap<>();
+    shapes.put("insert", List.of(record(ORDERS, sourceKey(7), "c", null, row(1, 7, "n"))));
+    shapes.put(
+        "update in place",
+        List.of(record(ORDERS, sourceKey(2), "u", row(5, 2, "a"), row(5, 2, "c"))));
+    shapes.put("move", List.of(leadUpdate()));
+    shapes.put("delete", List.of(record(ORDERS, sourceKey(2), "d", row(5, 2, "a"), null)));
+    shapes.put(
+        "delete + tombstone",
+        List.of(
+            record(ORDERS, sourceKey(2), "d", row(5, 2, "a"), null),
+            tombstone(ORDERS, sourceKey(2))));
+    shapes.put("unknown old key (spared delete)", List.of(blindUpdate(9, 2, "b")));
+    shapes.put("unknown old key, unmoved", List.of(blindUpdate(5, 2, "c")));
+    shapes.put(
+        "two moves of different rows",
+        List.of(leadUpdate(), record(ORDERS, sourceKey(4), "u", row(5, 4, "d"), row(9, 4, "e"))));
+    shapes.put(
+        "the same row moved twice",
+        List.of(leadUpdate(), record(ORDERS, sourceKey(2), "u", row(9, 2, "b"), row(4, 2, "x"))));
+    shapes.put(
+        "update then move",
+        List.of(
+            record(ORDERS, sourceKey(2), "u", row(5, 2, "a"), row(5, 2, "c")),
+            record(ORDERS, sourceKey(2), "u", row(5, 2, "c"), row(9, 2, "b"))));
+    shapes.put(
+        "insert then delete",
+        List.of(
+            record(ORDERS, sourceKey(7), "c", null, row(1, 7, "n")),
+            record(ORDERS, sourceKey(7), "d", row(1, 7, "n"), null),
+            tombstone(ORDERS, sourceKey(7))));
+    for (Map.Entry<String, List<SinkRecord>> shape : shapes.entrySet()) {
+      List<SinkRecord> put = shape.getValue();
+      for (boolean indexValid : new boolean[] {false, true}) {
+        String context = shape.getKey() + " indexValid=" + indexValid;
+        Outcome clean = runOnce(put, indexValid, false);
+        Outcome landed = runOnce(put, indexValid, true);
+        assertEquals(clean.rows(), landed.rows(), context);
+        if (clean.commits() > 0) {
+          assertEquals(1, landed.uncertain(), context); // the re-run really happened
+        }
+        for (long offset : landed.deadLettered()) {
+          if (clean.deadLettered().contains(offset)) {
+            continue; // dead-lettered either way: not the re-run's doing
+          }
+          int at = -1;
+          for (int i = 0; i < put.size(); i++) {
+            if (put.get(i).kafkaOffset() == offset) {
+              at = i;
+            }
+          }
+          assertTrue(at >= 0, context);
+          Object key = put.get(at).key();
+          boolean superseded = false;
+          for (int i = at + 1; i < put.size(); i++) {
+            // A later change of the same row (a tombstone is not one: it follows its delete).
+            superseded |= put.get(i).value() != null && key.equals(put.get(i).key());
+          }
+          assertTrue(superseded, context + ": the re-run dead-lettered a row's last image");
+        }
+      }
+    }
   }
 }

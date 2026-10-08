@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Se
 
 from psycopg import sql
 
+from dsql_migrator.core.batched_import import UNCONFIRMED_INDEX_NOTE
 from dsql_migrator.core.models import (
     ApplyMode,
     ApplyResult,
@@ -65,7 +66,10 @@ from dsql_migrator.core.occ import (
     is_occ_conflict,
     with_occ_retry,
 )
-from dsql_migrator.core.target_connection import is_transient_connection_error
+from dsql_migrator.core.target_connection import (
+    is_server_unavailable,
+    is_transient_connection_error,
+)
 
 if TYPE_CHECKING:
     from dsql_migrator.core.target_introspector import ColumnNullFacts
@@ -97,16 +101,21 @@ def _is_permanent_connect_error(exc: BaseException) -> bool:
 
 
 def _is_retryable_connect_error(exc: BaseException) -> bool:
-    """Retryable while OPENING a DSQL connection for DDL: an OCC ``40001`` or a
-    transient connection failure (dropped socket / TLS teardown / connect timeout /
-    the new-connection rate limit rejecting a connect under a burst). Lets a
-    per-table DROP+recreate connect ride out a connection storm instead of failing
-    the table -- the same resilience the batched loader's pool leases already have.
-    A permanently-unresolvable host is excluded so a misconfigured endpoint fails fast.
+    """Retryable while OPENING a DSQL connection for DDL: an OCC ``40001``, Aurora DSQL's
+    temporary server unavailable (``XX000``), or a transient connection failure (dropped
+    socket / TLS teardown / connect timeout / the new-connection rate limit rejecting a
+    connect under a burst). Lets a per-table DROP+recreate connect ride out a connection
+    storm instead of failing the table -- the same resilience the batched loader's pool
+    leases already have. A connect is idempotent. A permanently-unresolvable host is
+    excluded so a misconfigured endpoint fails fast.
     """
     if _is_permanent_connect_error(exc):
         return False
-    return is_occ_conflict(exc) or is_transient_connection_error(exc)
+    return (
+        is_occ_conflict(exc)
+        or is_server_unavailable(exc)
+        or is_transient_connection_error(exc)
+    )
 
 
 def _open_connection_with_retry(
@@ -194,6 +203,26 @@ class SchemaApplyError(ValueError):
     anything else (a malformed or non-CREATE statement) is rejected up front
     rather than being sent to the target.
     """
+
+
+class _UnconfirmedIndexError(Exception):
+    """A bare ``CREATE INDEX`` failed after an attempt to create it answered Aurora DSQL's
+    ``XX000``, so that attempt may have created the index -- but the failure cannot show it
+    did: index names are per schema on Aurora DSQL and come from the source, where MySQL's
+    are per table, so a later "already exists" (``42P07``) can be another table's index.
+
+    Keeps the failure's ``sqlstate`` (a ``42P07`` still takes the SKIP_IF_EXISTS self-heal of
+    :meth:`SchemaApplier.apply`) and reads as its first line followed by
+    :data:`~dsql_migrator.core.batched_import.UNCONFIRMED_INDEX_NOTE`, the post-load index
+    pass's wording.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        lines = str(cause).strip().splitlines()
+        super().__init__(
+            (lines[0].strip() if lines else type(cause).__name__) + UNCONFIRMED_INDEX_NOTE
+        )
+        self.sqlstate = getattr(cause, "sqlstate", None)
 
 
 class _ExistenceOracle(Protocol):
@@ -477,7 +506,8 @@ class SchemaApplier:
         "dropped but not recreated" error instead of silent data loss. A brand-new object
         (no drop) runs the bare ``CREATE`` on a storm-retried connect but is NOT replayed on
         a mid-execute transient -- a bare CREATE is not idempotent, so a replay could
-        spuriously hit "relation already exists".
+        spuriously hit "relation already exists". An ``XX000`` on the bare CREATE is
+        retried on the same connection (see :meth:`_run_ddl`).
         """
         if drop_first:
             _run_ddls_reconnecting(
@@ -498,19 +528,50 @@ class SchemaApplier:
             jitter=self._jitter,
         )
         try:
-            self._run_ddl(connection, target_ddl)
+            self._run_ddl(connection, target_ddl, kind=parsed.kind)
         finally:
             _safe_close(connection)
 
-    def _run_ddl(self, connection: Any, statement: object) -> None:
-        """Execute one DDL statement with OC001 idempotent retry (Property 5)."""
+    def _run_ddl(self, connection: Any, statement: object, *, kind: str) -> None:
+        """Execute one DDL statement with OC001 idempotent retry (Property 5).
+
+        Aurora DSQL's XX000 (server unavailable) is retried too, on the same connection,
+        which Aurora DSQL keeps; only the bare CREATE path runs here, never inside a
+        reconnecting unit, so nothing nests. A bare CREATE is not idempotent: an attempt
+        that answered XX000 may still have created the object. For a table, view,
+        materialized view or schema (``kind``), a later "already exists" (42P07) means the
+        earlier attempt did -- the name is that object's in its schema, so it is there and
+        the apply succeeds. Not for an index: index names are per schema on Aurora DSQL but
+        come from the source, where MySQL's are per table, so the index found may be another
+        table's. Its failure keeps its meaning and is raised as
+        :class:`_UnconfirmedIndexError` (it may have been created anyway), as the post-load
+        index pass reports it. A 42P07 with no earlier XX000 keeps its meaning.
+        """
+        unconfirmed = [False]  # an earlier attempt answered XX000: its CREATE may have landed
+
+        def _attempt(conn: Any, stmt: object) -> None:
+            try:
+                _execute_single_ddl(conn, stmt)
+            except Exception as exc:  # noqa: BLE001 - classified, then re-raised
+                if unconfirmed[0] and _is_duplicate_object(exc) and kind != _INDEX:
+                    return  # the earlier attempt's CREATE landed
+                if is_server_unavailable(exc):
+                    unconfirmed[0] = True
+                raise
+
         retried = with_occ_retry(
             max_attempts=self._occ_max_attempts,
             base_delay=self._occ_base_delay,
             sleep=self._sleep,
             jitter=self._jitter,
-        )(_execute_single_ddl)
-        retried(connection, statement)
+            retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc),
+        )(_attempt)
+        try:
+            retried(connection, statement)
+        except Exception as exc:  # noqa: BLE001 - an unconfirmed index is noted, then raised
+            if kind == _INDEX and unconfirmed[0]:
+                raise _UnconfirmedIndexError(exc) from exc
+            raise
 
 
 def _build_drop_statement(parsed: _ParsedObject) -> sql.Composed:
@@ -577,15 +638,17 @@ def _run_ddls_reconnecting(
     from the start. Callers pass ONLY replay-safe statements: ``CREATE SCHEMA IF NOT EXISTS``,
     ``DROP ... IF EXISTS``, or a ``CREATE`` that a preceding ``DROP IF EXISTS`` in the same
     sequence makes safe to re-run. Each statement still carries its own OC001 (40001) retry;
-    only a connection-level transient (SQLSTATE class ``08`` / no-SQLSTATE) triggers the
-    whole-unit reconnect -- a 40001 is absorbed per-statement, exactly as before, so there is
-    no double retry.
+    only a connection-level transient (SQLSTATE class ``08`` / no-SQLSTATE) or Aurora DSQL's
+    XX000 (its statement may have committed; the sequence is replay-safe either way) triggers
+    the whole-unit reconnect -- a 40001 is absorbed per-statement, exactly as before, so there
+    is no double retry.
 
     When ``recreated`` is given, the LAST statement is the CREATE that follows a committed
-    DROP. DSQL commits each DDL immediately, so a NON-transient failure of that CREATE leaves
-    the object dropped and gone. It is re-raised as an explicit "dropped but not recreated"
-    error rather than a generic apply failure, so the operator knows to restore it (a generic
-    message reads as a harmless retryable hiccup and the loss goes unnoticed).
+    DROP. DSQL commits each DDL immediately, so a NON-transient failure of that CREATE (not
+    class 08, no SQLSTATE or XX000) leaves the object dropped and gone. It is re-raised as an
+    explicit "dropped but not recreated" error rather than a generic apply failure, so the
+    operator knows to restore it (a generic message reads as a harmless retryable hiccup and
+    the loss goes unnoticed).
     """
     statements = list(statements)
 
@@ -599,6 +662,7 @@ def _run_ddls_reconnecting(
                     is_recreate
                     and not isinstance(exc, SchemaApplyError)
                     and not is_transient_connection_error(exc)
+                    and not is_server_unavailable(exc)
                 ):
                     raise SchemaApplyError(
                         f"{recreated.kind} {recreated.name} was DROPPED but could not be "
@@ -632,9 +696,11 @@ def _run_unit_reconnecting(
     statement)`` executes one DDL with its own 40001 (OC000/OC001) retry; ``retry_read(fn)``
     runs ``fn(connection)`` under the same 40001 retry (for the catalog reads the overlay
     and the restore do inside the unit). Only a transient CONNECTION failure (SQLSTATE class
-    ``08`` / no SQLSTATE, not a permanent connect error) replays the whole unit on a new
+    ``08`` / no SQLSTATE, not a permanent connect error) or Aurora DSQL's XX000 (server
+    unavailable; its statement may have committed) replays the whole unit on a new
     connection -- so the body must be replay-safe; a :class:`SchemaApplyError` is terminal
-    and never replayed. The same nested budgets :func:`_run_ddls_reconnecting` always used.
+    and never replayed. The same nested budgets :func:`_run_ddls_reconnecting` always used;
+    an XX000 is retried at this unit level only, never per statement as well.
     """
     run_one = with_occ_retry(
         max_attempts=occ_max_attempts,
@@ -658,8 +724,9 @@ def _run_unit_reconnecting(
         finally:
             _safe_close(connection)
 
-    # Only a transient CONNECTION failure replays the unit; a SchemaApplyError (parse/schema
-    # limit/dependency/dropped-not-recreated) is terminal and must never be retried.
+    # Only a transient CONNECTION failure or Aurora DSQL's XX000 replays the unit; a
+    # SchemaApplyError (parse/schema limit/dependency/dropped-not-recreated) is terminal and
+    # must never be retried.
     return with_occ_retry(
         max_attempts=occ_max_attempts,
         base_delay=occ_base_delay,
@@ -667,7 +734,7 @@ def _run_unit_reconnecting(
         jitter=jitter,
         retryable=lambda exc: not isinstance(exc, SchemaApplyError)
         and not _is_permanent_connect_error(exc)
-        and is_transient_connection_error(exc),
+        and (is_transient_connection_error(exc) or is_server_unavailable(exc)),
     )(_unit)()
 
 
@@ -789,9 +856,9 @@ def apply_foreign_key(
     so each FK is added AFTER the load, as its own single autocommit DDL (DSQL
     allows one DDL per transaction) with OC001 (40001) retry and a connection-level
     transient reconnect. ``ADD CONSTRAINT`` is not natively idempotent, so a
-    reconnect that replays an already-committed ADD raises ``duplicate_object``
-    (SQLSTATE 42710); that is treated as success, because the constraint being
-    present is the goal.
+    replay (after a dropped connection or an XX000) of an already-committed ADD raises
+    ``duplicate_object`` (SQLSTATE 42710); that is treated as success, because the
+    constraint being present is the goal.
     """
     try:
         _run_ddls_reconnecting(

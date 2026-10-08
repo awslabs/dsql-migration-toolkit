@@ -1537,6 +1537,25 @@ def _render_cdc_pipeline_health(
                 )
             _render_change_flow_status(ui, activity)
 
+# The confirmed-stall notice. Two causes look the same on the rate gauges, and only the sink
+# connector log tells them apart: an ejected sink consumer never recovers by itself (Stop +
+# Start rejoins the group), while a target that cannot take writes right now -- e.g. Aurora
+# DSQL's temporary XX000 "server unavailable", retried by the sink and redelivered by
+# Connect since plugin v52 (G22) -- resumes on its own. Quotes the sink's own log prefix.
+SINK_STALL_NOTICE_BODY = (
+    "The source is producing changes but the sink has applied none, so the target is "
+    "falling behind. The connector can still report RUNNING and no errored task while this "
+    "is happening, so RUNNING is not evidence that replication works — compare target row "
+    "counts. Then check the sink connector log. A repeating \"Commit of offsets timed out\" "
+    "means the sink consumer was ejected from its group (it keeps its thread alive) and the "
+    "gap will not close on its own: Stop CDC and Start CDC to rejoin the group. A repeating "
+    "\"DSQL apply failed (transient sqlstate=\" means Aurora DSQL cannot take the writes "
+    "right now (for example XX000 \"server unavailable\"): the sink keeps retrying and "
+    "resumes on its own once Aurora DSQL answers; if it lasts, contact AWS Support. Either "
+    "way, do NOT cut over until the sink send rate recovers."
+)
+
+
 def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
     """The change-flow state line + CloudWatch throughput (inner block, no card).
 
@@ -1590,17 +1609,7 @@ def _render_change_flow_status(ui, activity: "CdcActivitySummary") -> None:
             ui,
             tone="error",
             header="The sink is not applying changes",
-            body=(
-                "The source is producing changes but the sink has applied none, so the "
-                "target is falling behind and the gap will not close on its own. The "
-                "connector can still report RUNNING and no errored task while this is "
-                "happening (a sink consumer ejected from its group keeps its thread "
-                "alive), so RUNNING is not evidence that replication works — compare "
-                "target row counts. Check the sink connector log for repeating "
-                '"Commit of offsets timed out"; if you see it, Stop CDC and Start CDC '
-                "to rejoin the group, and do NOT cut over until the sink send rate "
-                "recovers."
-            ),
+            body=SINK_STALL_NOTICE_BODY,
         )
     # Visual rate gauges: source poll vs sink send on the SAME scale, so at a glance
     # you can see whether the sink is keeping up with the source (matched bars) or

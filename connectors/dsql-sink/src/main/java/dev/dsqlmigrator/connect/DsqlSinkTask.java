@@ -72,6 +72,13 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  *       ({@link OccRetry}: the chunk, or one row), each time on a clean transaction (the
  *       failed attempt is rolled back first: a schema conflict can come when a statement runs,
  *       not only at COMMIT). Safe because apply is idempotent.</li>
+ *   <li><b>Server unavailable (XX000)</b> — Aurora DSQL's temporary service condition: the
+ *       same in-process retry as 40001 ({@link OccRetry}: one shared budget, the failed
+ *       attempt rolled back first, the same session). Never dead-lettered: once the budget is
+ *       spent it is transient (below). A COMMIT that fails with it may have committed; the
+ *       re-run sets the same image per primary key, but a secondary UNIQUE index can reject
+ *       (23505) an image the landed chunk already replaced, which is then dead-lettered as on
+ *       any redelivery of a committed batch.</li>
  *   <li><b>Connectivity</b> — closed/expired connection (1h DSQL timeout, token
  *       expiry): reconnect and retry.</li>
  *   <li><b>Permanent</b> — any other SQLSTATE: do NOT retry; report the offending
@@ -117,9 +124,6 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
 public class DsqlSinkTask extends SinkTask {
 
   private static final Logger log = LoggerFactory.getLogger(DsqlSinkTask.class);
-
-  /** PostgreSQL/DSQL serialization-failure SQLSTATE (the only retryable class). */
-  private static final String OCC_SQLSTATE = "40001";
 
   /**
    * DSQL rejects a single TEXT/bytea value larger than 1 MiB ("datatype limit
@@ -550,8 +554,8 @@ public class DsqlSinkTask extends SinkTask {
    * it would fail the same way (the drift kinds of core/cdc.py {@code _DRIFT_BY_SQLSTATE}).
    * Per-value codes (class 22, 23505, 23514, 23503, 07006, 54000, 25P02) do not count -- one
    * bad value says nothing about the next row. Transient codes (40001 incl. DSQL OC000/OC001,
-   * 08xxx, 57xxx, no SQLSTATE) never get here: they are retried, never quarantined. Only the
-   * PATH depends on this set, never a row's fate. Package-private for tests.
+   * XX000, 08xxx, 57xxx, no SQLSTATE) never get here: they are retried, never quarantined.
+   * Only the PATH depends on this set, never a row's fate. Package-private for tests.
    */
   static boolean isStructuralDrift(String sqlState) {
     if (sqlState == null) {
@@ -632,11 +636,11 @@ public class DsqlSinkTask extends SinkTask {
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
-        // OCC budget exhausted or connectivity issue: discard the (possibly
-        // half-open) connection so the next attempt truly reconnects -- isValid()
-        // can pass on a stale socket -- then re-raise as a RetriableException so
-        // Connect redelivers the whole batch (not a poison row). Apply is
-        // idempotent, so a replay of the same offsets is safe.
+        // OCC / server-unavailable (40001 / XX000) budget exhausted or connectivity
+        // issue: discard the (possibly half-open) connection so the next attempt truly
+        // reconnects -- isValid() can pass on a stale socket -- then re-raise as a
+        // RetriableException so Connect redelivers the whole batch (not a poison row).
+        // Apply is idempotent, so a replay of the same offsets is safe.
         //
         // RetriableException (NOT ConnectException): WorkerSinkTask.deliverMessages()
         // catches RetriableException and pauses+redelivers the SAME batch on the next
@@ -760,12 +764,14 @@ public class DsqlSinkTask extends SinkTask {
 
   /**
    * The cache loader: the guarded column types of a {@code schema.table} target, or
-   * {@code null} when they are unknown. Mirrors the apply path's failure semantics: a 40001 is
-   * retried ({@link OccRetry}); a transient failure discards the connection and throws a
-   * {@link RetriableException} so Connect redelivers the batch; any other failure FAILS OPEN
-   * -- the table's values are written unchecked, as before this guard existed, with one WARN
-   * per table per task, and the read is retried after {@link ValueFit#UNKNOWN_RETRY_NANOS}.
-   * It never fails the task and never dead-letters a row for this.
+   * {@code null} when they are unknown. Mirrors the apply path's failure semantics: a 40001 or
+   * an XX000 is retried ({@link OccRetry}); a transient failure -- including a 40001 or XX000
+   * whose budget ran out -- discards the connection and throws a {@link RetriableException} so
+   * Connect redelivers the batch (a transient failure never fails open); any other failure
+   * FAILS OPEN -- the table's values are written unchecked, as before this guard existed, with
+   * one WARN per table per task, and the read is retried after
+   * {@link ValueFit#UNKNOWN_RETRY_NANOS}. It never fails the task and never dead-letters a row
+   * for this.
    */
   Map<String, ValueFit.TargetType> readTargetTypes(String table) {
     String[] key = ValueFit.catalogKey(table);
@@ -843,10 +849,12 @@ public class DsqlSinkTask extends SinkTask {
   /**
    * The {@link SourceKeyIndex} loader: whether a {@code schema.table} target has a VALID unique
    * index on exactly {@code columns} ({@code null} when unknown). Same failure semantics as
-   * {@link #readTargetTypes}: a 40001 is retried; a transient failure discards the connection
-   * and throws a {@link RetriableException} so Connect redelivers the batch; any other failure
-   * counts as not valid -- the table's deletes keep the exact composite key -- with one WARN per
-   * table per task, and the read is retried after {@link SourceKeyIndex#NOT_VALID_TTL_NANOS}.
+   * {@link #readTargetTypes}: a 40001 or an XX000 is retried; a transient failure -- including
+   * a 40001 or XX000 whose budget ran out -- discards the connection and throws a
+   * {@link RetriableException} so Connect redelivers the batch (a transient failure never
+   * switches source-key deletes off); any other failure counts as not valid -- the table's
+   * deletes keep the exact composite key -- with one WARN per table per task, and the read is
+   * retried after {@link SourceKeyIndex#NOT_VALID_TTL_NANOS}.
    */
   Boolean readSourceKeyIndex(String table, List<String> columns) {
     String[] key = ValueFit.catalogKey(table);
@@ -1498,14 +1506,45 @@ public class DsqlSinkTask extends SinkTask {
    * general-purpose wrapper (wrapping a permanent error would make Connect retry a
    * poison row forever). Pure + package-private so a unit test can assert the surfaced
    * exception TYPE without a live JDBC connection.
+   *
+   * <p>The cause is {@link #valueFreeCopy}: Connect logs a RetriableException with its cause
+   * chain at ERROR on every redelivery, and pgjdbc renders a failed batch entry WITH its bound
+   * values into the BatchUpdateException message (logServerErrorDetail defaults to true), so
+   * the driver text must not ride along (Property 7).
    */
   static RetriableException transientRetryException(SQLException e) {
     return new RetriableException(
-        "DSQL apply failed (transient sqlstate=" + e.getSQLState() + "); Connect will retry", e);
+        "DSQL apply failed (transient sqlstate=" + e.getSQLState() + "); Connect will retry",
+        valueFreeCopy(e));
   }
 
   /**
-   * Transient = retryable: OCC serialization failure or a connectivity drop.
+   * {@code e} reduced to its SQLSTATE, vendor code and the names of its own and its root
+   * cause's exception classes, with its stack trace -- never a driver message. Package-private
+   * for tests.
+   */
+  static SQLException valueFreeCopy(SQLException e) {
+    Throwable root = e;
+    for (int depth = 0; depth < 16; depth++) { // bounded: a cause chain can be cyclic
+      Throwable next = root.getCause();
+      if (next == null || next == root) {
+        break;
+      }
+      root = next;
+    }
+    String classes =
+        root == e
+            ? e.getClass().getName()
+            : e.getClass().getName() + " caused by " + root.getClass().getName();
+    SQLException copy = new SQLException(classes, e.getSQLState(), e.getErrorCode());
+    copy.setStackTrace(e.getStackTrace());
+    return copy;
+  }
+
+  /**
+   * Transient = redelivered, never dead-lettered: a 40001 or an XX000 whose in-process budget
+   * ran out ({@link OccRetry} re-ran the transaction up to occ.max.retries times), or a
+   * connectivity drop.
    *
    * <p><b>Why this is broader than SQLSTATE 08.</b> A connection torn down out
    * from under an in-flight statement -- DSQL's 1h idle close, IAM-token expiry,
@@ -1522,8 +1561,8 @@ public class DsqlSinkTask extends SinkTask {
    */
   // Package-private for unit testing (DsqlSinkTaskTest); semantically internal.
   boolean isTransient(SQLException e) {
-    if (OCC_SQLSTATE.equals(e.getSQLState())) {
-      return true;
+    if (OccRetry.retriesInProcess(e)) {
+      return true; // 40001 or XX000 whose in-process budget ran out
     }
     // A closed/aborted connection often arrives with no SQLSTATE, or as a
     // dedicated connection-exception subclass -- treat both as transient.
@@ -1611,22 +1650,26 @@ public class DsqlSinkTask extends SinkTask {
    * The parameter types are identical for every row of a given SQL, so one fetch
    * per statement is all that is needed.
    *
-   * <p>A {@code 40001} is rethrown, not swallowed: it is the transaction's OCC conflict
-   * (OC001), not a driver limitation. Swallowed inside an open transaction it left the
-   * transaction aborted (25P02 on the next execute, never retried); at a transaction's start it
-   * bound a TINYINT(1) 0/1 without the boolean conversion (42804: dead-lettered, and a false
+   * <p>A {@code 40001} or {@code XX000} ({@link OccRetry#retriesInProcess}) is rethrown, not
+   * swallowed: it belongs to the transaction, not to the driver, and OccRetry rolls back and
+   * re-runs the transaction. Swallowed inside an open transaction it left the transaction
+   * aborted (25P02 on the next execute, never retried); at a transaction's start it bound a
+   * TINYINT(1) 0/1 without the boolean conversion (42804: dead-lettered, and a false
    * TYPE_CHANGE cool-down). Any other failure still falls back to plain {@code setObject}
-   * binding.
+   * binding -- 0A000, 42703 and a null SQLSTATE (a driver limitation, which would otherwise be
+   * redelivered forever) included -- and a connection-level one (08, 57) fails again at
+   * execute, where it is transient.
    */
   private static java.sql.ParameterMetaData paramMetaOrNull(PreparedStatement ps)
       throws SQLException {
     try {
       return ps.getParameterMetaData();
     } catch (SQLException e) {
-      if (OCC_SQLSTATE.equals(e.getSQLState())) {
-        // An OCC conflict (OC001: a stale catalog) is the transaction's, not the driver's:
-        // swallowed, it left an open transaction aborted, or bound a 0/1 without the boolean
-        // conversion. OccRetry rolls back and re-runs the transaction.
+      if (OccRetry.retriesInProcess(e)) {
+        // An OCC conflict (OC001: a stale catalog) or Aurora DSQL's server unavailable
+        // (XX000) is the transaction's, not the driver's: swallowed, it left an open
+        // transaction aborted, or bound a 0/1 without the boolean conversion. OccRetry
+        // rolls back and re-runs the transaction.
         throw e;
       }
       return null; // fall back to plain setObject binding
@@ -1665,17 +1708,21 @@ public class DsqlSinkTask extends SinkTask {
       if (connection != null && !connection.isClosed()) {
         connection.rollback();
       }
-    } catch (SQLException ignored) {
-      // best-effort
+    } catch (SQLException e) {
+      // A failed rollback, whatever its SQLSTATE, may leave the session holding the aborted
+      // transaction (pgjdbc's isValid() still answers true in one, and Aurora DSQL keeps a
+      // connection open across an XX000): drop it, so the next transaction opens a new session
+      // instead of failing with 25P02 -- which dead-lettered the next healthy row.
+      discardConnection();
     }
   }
 
   /**
    * {@link OccRetry}'s step between attempts: roll back what the failed attempt left, so the
-   * next attempt starts on a clean transaction (after a COMMIT-time 40001 there is nothing to
-   * roll back and pgjdbc sends nothing). If the rollback itself fails, the connection is
-   * dropped, so the next attempt opens a new session instead of running on a transaction in
-   * an unknown state. Package-private for tests.
+   * next attempt starts on a clean transaction (after a COMMIT-time 40001 or XX000 there is
+   * nothing to roll back and pgjdbc sends nothing). If the rollback itself fails, the
+   * connection is dropped, so the next attempt opens a new session instead of running on a
+   * transaction in an unknown state. Package-private for tests.
    */
   void rollbackBeforeRetry() {
     try {
@@ -1685,8 +1732,8 @@ public class DsqlSinkTask extends SinkTask {
     } catch (SQLException e) {
       // SQLSTATE only: the driver message is not logged (Property 7).
       log.warn(
-          "Could not roll back an OCC-conflicted attempt (sqlstate={}); the retry opens a new "
-              + "connection",
+          "Could not roll back the failed attempt before its retry (sqlstate={}); the retry "
+              + "opens a new connection",
           e.getSQLState());
       discardConnection();
     }

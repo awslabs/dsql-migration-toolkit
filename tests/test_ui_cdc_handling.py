@@ -2413,3 +2413,34 @@ def test_pipeline_health_renders_the_runbook_notice_for_a_diagnosed_failure() ->
     _render_cdc_pipeline_health(sink_only, view, None, diagnoses={_G7_SINK: diagnosis})
     assert sink_only.icons.count(error_icon) == 1
     assert not any("stopped:" in t for t in sink_only.texts)
+
+
+def test_g22_the_sink_stall_notice_tells_a_transient_target_from_an_ejected_consumer() -> None:
+    # G22: since plugin v52 a sustained Aurora DSQL XX000 "server unavailable" stalls the sink
+    # (retried, then redelivered by Connect -- never dead-lettered), which the rate gauges show
+    # exactly like an ejected sink consumer. Only the connector log tells them apart, and only
+    # the ejected consumer needs Stop + Start: the notice must name both log lines, quote the
+    # sink's own transient-failure prefix, and not claim the gap never closes on its own.
+    import inspect
+    from pathlib import Path
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    body = cm.SINK_STALL_NOTICE_BODY
+    assert '"Commit of offsets timed out"' in body
+    assert "Stop CDC and Start CDC to rejoin the group" in body
+    assert "XX000" in body and "resumes on its own once Aurora DSQL answers" in body
+    assert "contact AWS Support" in body
+    assert "do NOT cut over until the sink send rate recovers" in body
+    # The prefix is the sink's own log text (DsqlSinkTask.transientRetryException).
+    assert '"DSQL apply failed (transient sqlstate="' in body
+    root = Path(__file__).resolve().parents[1]
+    sink = (
+        root / "connectors/dsql-sink/src/main/java/dev/dsqlmigrator/connect/DsqlSinkTask.java"
+    ).read_text(encoding="utf-8")
+    assert '"DSQL apply failed (transient sqlstate=" + e.getSQLState()' in sink
+    # "will not close on its own" is said of the ejected consumer only.
+    ejected, transient = body.split("A repeating \"DSQL apply failed", 1)
+    assert "will not close on its own" in ejected and "will not close" not in transient
+    # The confirmed-stall branch renders this constant.
+    assert "body=SINK_STALL_NOTICE_BODY" in inspect.getsource(cm._render_change_flow_status)

@@ -2935,6 +2935,47 @@ def test_count_orphans_retries_on_occ_conflict() -> None:
     assert conn.rollbacks >= 1  # cleared the aborted transaction before the retry
 
 
+def test_g22_count_orphans_retries_on_server_unavailable() -> None:
+    # Aurora DSQL's temporary XX000 "server unavailable" on the read-only orphan count is
+    # retried like a 40001 (the count re-runs from the first page). FAILS WITHOUT G22: the
+    # pre-gate reported "orphan pre-check failed; apply this foreign key manually".
+    from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration._full_load_engine import _count_orphans
+
+    class _Unavailable(Exception):
+        sqlstate = "XX000"
+
+    class _Cur:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *_a):
+            self._conn.attempts += 1
+            if self._conn.attempts == 1:
+                raise _Unavailable("server unavailable")
+
+        def fetchone(self):
+            return (0,)
+
+        def close(self):
+            pass
+
+    class _Conn:
+        def __init__(self):
+            self.attempts = 0
+
+        def cursor(self):
+            return _Cur(self)
+
+        def rollback(self):
+            pass
+
+    conn = _Conn()
+    fk = ForeignKeyDef(name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"])
+    assert _count_orphans(conn, "child", fk) == 0
+    assert conn.attempts == 2
+
+
 def test_constraint_name_from_ddl_parses_quoted_and_bare() -> None:
     from dsql_migrator.ui.data_migration._full_load_engine import _constraint_name_from_ddl
 
@@ -25844,6 +25885,121 @@ def test_a_failed_unique_index_is_reported_as_a_missing_constraint() -> None:
     )
     assert "BEFORE cutting over" in notice, (
         "a missing uniqueness constraint must say when it has to be fixed"
+    )
+
+
+def _index_failures_panel(monkeypatch, failures_by_table):
+    """Record each table's post-load index failures as the Full Load does, then render the
+    Full Load panel for those DONE tables: ``(stored messages, notices, badges)``."""
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+    from dsql_migrator.ui.data_migration import build_full_load_table_rows
+    from dsql_migrator.ui.data_migration._full_load_engine import _record_index_failures
+
+    log = ErrorLogStore()
+    for table, failures in failures_by_table.items():
+        _record_index_failures(log, "j1", table, failures)
+    messages = log.latest_messages("j1")
+    job = MigrationJob(job_id="j1")
+    job.status = "DONE"
+    job.progress_pct = 100.0
+    job.chunks = [
+        ChunkState(chunk_id=table, status="DONE", rows_loaded=3, attempts=1)
+        for table in failures_by_table
+    ]
+    notices: list = []
+    monkeypatch.setattr(flu, "render_notice", lambda _ui, **kw: notices.append(kw))
+    ui = _DetailRowUi()
+    flu._render_full_load_progress(
+        ui, job, build_full_load_table_rows(job, None, messages), reload_table=lambda _n: None
+    )
+    index_notices = [n for n in notices if "ndex" in str(n.get("header", ""))]
+    return messages, index_notices, ui.badges
+
+
+def test_g22_an_unconfirmed_unique_index_is_reported_not_confirmed_never_missing(
+    monkeypatch,
+) -> None:
+    """Aurora DSQL answered XX000 to the CREATE UNIQUE INDEX, whose commit landed.
+
+    The index exists and already enforces uniqueness; the retry's 42P07 only cannot prove it
+    is this table's. FAILS WITHOUT THE FIX: "Unique index NOT created ... a constraint is
+    missing", "create it BEFORE cutting over" (which would fail with "already exists") and
+    "Done — index missing" for an index that is there.
+    """
+    from tests.test_batched_import import _IndexCatalog, _UNIQUE_DDL, _index_importer
+
+    created, failures = _index_importer(
+        _IndexCatalog(failures=[("XX000", True)])
+    ).create_indexes([_UNIQUE_DDL])
+    assert created == 0
+    messages, notices, badges = _index_failures_panel(monkeypatch, {"shop.orders": failures})
+    stored = messages["shop.orders"]
+    assert stored.startswith("index not confirmed: UNIQUE ux_a: ")
+    assert "may have been created anyway" in stored
+    assert "reduce the table's index count" not in stored
+    (notice,) = notices
+    assert notice["tone"] == "warning"  # it may still be missing: check before cutting over
+    assert "not confirmed" in notice["header"]
+    assert "NOT created" not in notice["header"]
+    assert "constraint is missing" not in notice["header"]
+    assert "BEFORE cutting over" in notice["body"]
+    assert "shop.orders · Done — index not confirmed" in badges
+    assert not any(badge.endswith("index missing") for badge in badges)
+
+
+def test_g22_an_unconfirmed_secondary_index_is_an_info_to_check(monkeypatch) -> None:
+    # A sustained XX000 on a plain index: it may have been created, so the notice asks for a
+    # check, not a create, and says nothing of the 24-index limit (which is not the cause).
+    from tests.test_batched_import import _IndexCatalog, _index_importer
+
+    _created, failures = _index_importer(
+        _IndexCatalog(failures=[("XX000", False)] * 5), occ_max_attempts=3
+    ).create_indexes(["CREATE INDEX ASYNC ix_b ON t (b)"])
+    messages, notices, badges = _index_failures_panel(monkeypatch, {"shop.orders": failures})
+    assert messages["shop.orders"].startswith("index not confirmed: ix_b: ")
+    (notice,) = notices
+    assert notice["tone"] == "info"
+    assert notice["header"] == "Indexes not confirmed (1) — the data loaded completely"
+    assert "check the table's indexes on the target" in notice["body"]
+    assert "24 indexes" not in notice["body"]
+    assert "shop.orders · Done — index not confirmed" in badges
+
+
+def test_g22_a_mix_keeps_the_not_created_notice_and_tells_the_rows_apart(monkeypatch) -> None:
+    # One table's index is unconfirmed, another's hit the 24-index limit: the notice stays the
+    # "NOT created" one (true of the second); each row's badge says which is which.
+    from tests.test_batched_import import _IndexCatalog, _UNIQUE_DDL, _index_importer
+
+    _created, unsure = _index_importer(
+        _IndexCatalog(failures=[("XX000", True)])
+    ).create_indexes([_UNIQUE_DDL])
+    _messages, notices, badges = _index_failures_panel(
+        monkeypatch,
+        {
+            "shop.orders": unsure,
+            "shop.items": ["ix_total: more than 24 indexes per table are not allowed"],
+        },
+    )
+    (notice,) = notices
+    assert notice["header"].startswith("Unique index NOT created (2)")
+    assert "shop.orders · Done — index not confirmed" in badges
+    assert "shop.items · Done — index missing" in badges
+
+
+def test_g22_an_index_failure_without_xx000_is_recorded_byte_identically() -> None:
+    from dsql_migrator.core.error_log import ErrorLogStore
+    from dsql_migrator.ui.data_migration._full_load_engine import _record_index_failures
+
+    log = ErrorLogStore()
+    _record_index_failures(
+        log, "j1", "orders", ['UNIQUE ux_a: _DdlError: relation "ux_a" already exists']
+    )
+    assert log.latest_messages("j1")["orders"] == (
+        'index not created: UNIQUE ux_a: _DdlError: relation "ux_a" already exists — the '
+        "table's DATA loaded completely; add the index later or reduce the table's index "
+        "count (Aurora DSQL allows 24 per table, including the primary key)"
     )
 
 

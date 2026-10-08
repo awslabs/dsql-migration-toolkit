@@ -276,7 +276,11 @@ DSQL-compatible DDL and applies it to the target. It's the SCT-like step:
   asks **Replace / Skip / Cancel** right then, so the choice is explicit — this is
   how you *re-apply* a table after changing its DDL, e.g. reverting a composite key
   back to the integer key (SKIP would leave the old table in place; REPLACE
-  recreates it with the new key).
+  recreates it with the new key). A `CREATE` that Aurora DSQL answers with its
+  temporary `XX000` ("server unavailable") is retried: a table, view or schema the
+  retry then finds already there was created by the earlier attempt, but an index
+  found that way is not reported as created, because its name could belong to
+  another table's index.
 
 ### What the conversion does for you
 

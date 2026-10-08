@@ -119,6 +119,8 @@ class DsqlSinkDriftCooldownTest {
     final List<List<Object>> committed = new ArrayList<>(); // [table, id, v?] per row
     private final List<List<Object>> pending = new ArrayList<>();
     Function<String, SQLException> failure = sql -> null;
+    // G22: the next N commits land, then answer XX000 (Aurora DSQL's uncertain outcome).
+    int landedCommitsUnavailable;
 
     static String table(String sql) {
       return sql.contains("\"" + DRIFTED + "\"") ? DRIFTED : HEALTHY;
@@ -196,9 +198,14 @@ class DsqlSinkDriftCooldownTest {
                   yield statement((String) a[0]);
                 }
                 case "commit" -> {
-                  calls.add("commit");
                   committed.addAll(pending);
                   pending.clear();
+                  if (landedCommitsUnavailable > 0) {
+                    landedCommitsUnavailable--;
+                    calls.add("commit!XX000");
+                    throw new SQLException("server unavailable", "XX000");
+                  }
+                  calls.add("commit");
                   yield null;
                 }
                 case "rollback" -> {
@@ -490,6 +497,7 @@ class DsqlSinkDriftCooldownTest {
     List<SQLException> transients =
         List.of(
             new SQLException("serialization failure", "40001"),
+            new SQLException("server unavailable", "XX000"), // G22: Aurora DSQL's temporary
             new SQLException("This connection has been closed."),
             new SQLException("connection failure", "08006"),
             new SQLException("admin shutdown", "57P01"),
@@ -751,9 +759,57 @@ class DsqlSinkDriftCooldownTest {
     for (String s :
         List.of(
             "23505", "23514", "22001", "22003", "22P02", "07006", "23503", "54000", "40001",
-            "25P02", "08006")) {
+            "25P02", "08006", "XX000", "XX001", "XX002")) {
       assertFalse(DsqlSinkTask.isStructuralDrift(s), s);
     }
     assertFalse(DsqlSinkTask.isStructuralDrift(null));
+  }
+
+  // --- (n) G22: an XX000 on the cooled path is retried, and the row ends the cool-down --------
+
+  @Test
+  void aCooledTablesRowThatHitsServerUnavailableIsRetriedAndEndsTheCoolDown() throws Exception {
+    // The table was repaired after a 42703 cool-down; its next row meets one XX000 on the
+    // one-row-per-transaction path. FAILS WITHOUT G22: the healthy row was dead-lettered with
+    // XX000 and the table stayed cooled.
+    FakeDsql dsql = new FakeDsql();
+    dsql.failure = driftedUpserts("42703");
+    RecordingReporter dlq = new RecordingReporter();
+    ClockedTask task = task(dsql, dlq, 100);
+    task.put(List.of(insert(DRIFTED, 1))); // arm
+    assertEquals(Set.of("shop." + DRIFTED), task.driftCooledTables());
+    assertEquals(1, dlq.records.size());
+
+    int[] left = {1};
+    dsql.failure =
+        sql ->
+            FakeDsql.table(sql).equals(DRIFTED) && left[0]-- > 0
+                ? new SQLException("server unavailable", "XX000")
+                : null;
+    task.put(List.of(insert(DRIFTED, 2)));
+    assertEquals(1, dsql.committedRows(DRIFTED));
+    assertEquals(1, dlq.records.size()); // nothing new dead-lettered
+    assertTrue(task.driftCooledTables().isEmpty());
+  }
+
+  @Test
+  void aCooledTablesRowWhoseCommitLandedButAnsweredXX000IsReRunHarmlessly() throws Exception {
+    // The uncertain outcome on the one-row-per-transaction path: the COMMIT landed but
+    // answered XX000, so the row's transaction re-runs on what it already wrote -- the same
+    // upsert again. Nothing is dead-lettered and the applied row still ends the cool-down.
+    FakeDsql dsql = new FakeDsql();
+    dsql.failure = driftedUpserts("42703");
+    RecordingReporter dlq = new RecordingReporter();
+    ClockedTask task = task(dsql, dlq, 100);
+    task.put(List.of(insert(DRIFTED, 1))); // arm
+    dsql.failure = sql -> null; // repaired
+    dsql.landedCommitsUnavailable = 1;
+    dsql.calls.clear();
+    task.put(List.of(insert(DRIFTED, 2)));
+    assertEquals(2, dsql.committedRows(DRIFTED)); // applied twice: the same upsert
+    assertEquals(1, dsql.count("commit!XX000"));
+    assertEquals(1, dsql.count("commit"));
+    assertEquals(1, dlq.records.size()); // only the arming rejection
+    assertTrue(task.driftCooledTables().isEmpty());
   }
 }

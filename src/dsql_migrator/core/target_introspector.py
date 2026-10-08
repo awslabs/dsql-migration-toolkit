@@ -793,7 +793,8 @@ def read_overlay_column_facts(
 
 # One OC001 on a connection used before a DDL (P0 F6) or a dropped socket must not make a
 # table "unknown" (its load would then fail closed for nothing): each table's reads retry a
-# 40001 on the same connection, and a lost connection is replaced a bounded number of times.
+# 40001 or an XX000 (Aurora DSQL's temporary server unavailable) on the same connection, and
+# a lost connection is replaced a bounded number of times.
 _FACTS_OCC_ATTEMPTS = 3
 _FACTS_RECONNECTS = 2
 
@@ -809,10 +810,10 @@ def target_overlay_facts(
 ) -> "dict[str, Optional[TableOverlayFacts]]":
     """Each table's overlay facts over ONE connection; ``None`` = unknown.
 
-    Every read is idempotent: a 40001 is retried on the same connection, and a transient
-    connection loss reconnects (at most twice per call) and re-reads that table. A table
-    whose reads still fail -- or any non-transient error, e.g. 42501 -- is unknown (best-
-    effort rollback, then the next table); a connection that cannot be restored makes that
+    Every read is idempotent: a 40001 or an XX000 is retried on the same connection, and a
+    transient connection loss reconnects (at most twice per call) and re-reads that table. A
+    table whose reads still fail -- or any non-transient error, e.g. 42501 -- is unknown
+    (best-effort rollback, then the next table); a connection that cannot be restored makes that
     table and every later one unknown, as a connect failure makes every table unknown. An
     absent table is ``exists=False`` with every column ``None``. ``probe_rows`` adds one
     ``SELECT 1 ... LIMIT 1`` per existing table; ``primary_key_tables`` adds one key read
@@ -820,8 +821,11 @@ def target_overlay_facts(
     """
     from psycopg import sql
 
-    from dsql_migrator.core.occ import with_occ_retry
-    from dsql_migrator.core.target_connection import is_transient_connection_error
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.target_connection import (
+        is_server_unavailable,
+        is_transient_connection_error,
+    )
 
     try:
         connection = connection_factory()
@@ -885,7 +889,10 @@ def target_overlay_facts(
             raise
 
     retrying = with_occ_retry(
-        max_attempts=_FACTS_OCC_ATTEMPTS, base_delay=0.05, sleep=sleep
+        max_attempts=_FACTS_OCC_ATTEMPTS,
+        base_delay=0.05,
+        sleep=sleep,
+        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc),
     )(_attempt)
     result: dict[str, Optional[TableOverlayFacts]] = {}
     reconnects = 0

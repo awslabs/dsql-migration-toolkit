@@ -348,7 +348,8 @@ class AppConfig(BaseModel):
         le=100,
         description=(
             "Full Load per-batch retry budget, shared by OCC (SQLSTATE 40001) "
-            "conflicts AND transient connection failures (dropped socket, TLS eof, "
+            "conflicts, Aurora DSQL's temporary 'server unavailable' (SQLSTATE XX000) "
+            "AND transient connection failures (dropped socket, TLS eof, "
             "connect timeout). Each retry leases a FRESH connection and replays the "
             "idempotent batch, so a batch rides out a transient DSQL blip / "
             "connection storm instead of failing the whole table. Raised from the "

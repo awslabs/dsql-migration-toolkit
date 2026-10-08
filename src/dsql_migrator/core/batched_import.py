@@ -37,6 +37,11 @@ What it does, and the properties it satisfies:
    serialization failure is retried with backoff. The batch operation is
    idempotent, so a retry is safe; an unresolved conflict surfaces the original
    error and leaves no partial state (each batch is a single atomic statement).
+   Aurora DSQL's temporary "server unavailable" (``SQLSTATE XX000``) shares that
+   budget: it can mean the batch DID commit (the documented uncertain outcome), and
+   a re-run is exact even then (every mode re-runs to the same rows; only the counts
+   move from loaded to skipped), so it is retried like a ``40001`` and, once the
+   budget runs out, fails the batch -- never a row (no quarantine).
 
 5. **Bounded parallel connections (Property 2 -- parallelism).** Batches are
    loaded concurrently across a small, bounded pool of DSQL connections (default
@@ -66,7 +71,10 @@ What it does, and the properties it satisfies:
    input -- they are not regenerated. Each DDL is wrapped in
    :func:`~dsql_migrator.core.occ.with_occ_retry` for ``OC001`` (schema
    conflict) idempotency. ``CREATE INDEX ASYNC`` is non-blocking on DSQL: the
-   statement returns quickly and the index is built in the background.
+   statement returns quickly and the index is built in the background. An
+   ``XX000`` is retried the same way; because that attempt's CREATE may have
+   committed, a later "already exists" is reported with a note to check the
+   target, never counted as created.
 
 The row input is decoupled from any specific file reader: :meth:`import_rows`
 accepts an iterable of already-converted rows (dict-like, keyed by column name --
@@ -109,6 +117,7 @@ from dsql_migrator.core.occ import (
 from dsql_migrator.core.target_connection import (
     DsqlConnector,
     TRANSIENT_CONN_SIGNATURES,
+    is_server_unavailable,
     is_transient_connection_error,
 )
 
@@ -197,11 +206,37 @@ _TRANSIENT_CONN_SIGNATURES = TRANSIENT_CONN_SIGNATURES
 
 
 def _is_retryable_load_error(exc: BaseException) -> bool:
-    """Retryable during a batch load: an OCC ``40001`` conflict OR a transient
-    class-08 connection drop / expired token. A permanent data error (e.g. a
-    type/constraint violation) is NOT retryable and surfaces as a batch failure.
+    """Retryable during a batch load: an OCC ``40001`` conflict, Aurora DSQL's temporary
+    "server unavailable" (``XX000``), OR a transient class-08 connection drop / expired
+    token. A permanent data error (e.g. a type/constraint violation) is NOT retryable and
+    is isolated to its row. A retryable error that outlasts the budget fails the BATCH,
+    never a row: it is raised, so the batch is FAILED (retryable), not split or quarantined.
     """
-    return is_occ_conflict(exc) or _is_transient_connection_error(exc)
+    return (
+        is_occ_conflict(exc)
+        or is_server_unavailable(exc)
+        or _is_transient_connection_error(exc)
+    )
+
+
+# Appended to an index failure when an attempt to create the index answered Aurora DSQL's
+# XX000: that attempt's CREATE may have committed. A later "already exists" (42P07) is NOT
+# counted as created -- index names are per schema on Aurora DSQL and come from the source,
+# where they are per table, so the index found could be another table's. Shared by the
+# post-load index pass and Schema Conversion's bare CREATE INDEX (core/schema_applier).
+UNCONFIRMED_INDEX_NOTE = (
+    " (Aurora DSQL answered server unavailable (SQLSTATE XX000) to an attempt to create "
+    "it, so it may have been created anyway: check whether it exists on this table "
+    "before you add it)"
+)
+
+
+def is_unconfirmed_index_failure(message: object) -> bool:
+    """True when an index failure carries :data:`UNCONFIRMED_INDEX_NOTE`: Aurora DSQL
+    answered an attempt to create the index with XX000, so the index may exist after all.
+    The Full Load reports such an index as "not confirmed" rather than missing, keyed on
+    this one marker instead of a copy of its text."""
+    return UNCONFIRMED_INDEX_NOTE in str(message or "")
 
 
 class OnConflictMode(str, Enum):
@@ -1307,15 +1342,16 @@ class BatchedImporter:
     ) -> tuple[int, int]:
         """Load one batch, isolating poison rows on a permanent error.
 
-        Tries the batch via :meth:`_execute_for_mode` (which retries OCC ``40001``
-        and transient connection drops). If it still fails with a NON-retryable
-        error (a permanent data/constraint error that a re-run cannot fix), the
-        batch is binary-split and each half retried recursively, down to a single
-        row: that row is the poison row -- it is quarantined (its PK + reason
-        recorded, never its non-key values) and skipped, while every other row in
-        the batch still loads. This is the Full Load analogue of the CDC sink's
-        DLQ quarantine: one bad row never blocks ~thousands of good rows, and the
-        loss is surfaced (in the error log) rather than silent.
+        Tries the batch via :meth:`_execute_for_mode` (which retries OCC ``40001``,
+        Aurora DSQL's temporary ``XX000`` and transient connection drops; one that
+        outlasts the budget is raised, so the BATCH fails -- retryable, never split). If
+        it fails with a NON-retryable error (a permanent data/constraint error that a
+        re-run cannot fix), the batch is binary-split and each half retried recursively,
+        down to a single row: that row is the poison row -- it is quarantined (its PK +
+        reason recorded, never its non-key values) and skipped, while every other row in
+        the batch still loads. This is the Full Load analogue of the CDC sink's DLQ
+        quarantine: one bad row never blocks ~thousands of good rows, and the loss is
+        surfaced (in the error log) rather than silent.
 
         Returns ``(rows_inserted, conflicts)`` for the loaded rows; quarantined
         rows are accumulated on the importer's quarantine sink (read via
@@ -1403,6 +1439,15 @@ class BatchedImporter:
         :func:`~dsql_migrator.core.occ.with_occ_retry`; because the statement is a
         single idempotent ``INSERT ... ON CONFLICT``, retrying a ``40001`` is safe
         and never duplicates rows (Properties 3/5).
+
+        Aurora DSQL's ``XX000`` is retried the same way, and its attempt MAY have
+        committed (every connection is autocommit, and a multi-row ``INSERT`` is
+        atomic), so each mode re-runs a batch that already landed exactly: ``DO_NOTHING``
+        inserts nothing and counts every row as a conflict; ``DO_UPDATE`` writes the same
+        values again; ``NONE`` gets ``23505`` and recovers through
+        :meth:`_select_filter_insert`, which finds every key present; ``SKIP_EXISTING``'s
+        optimistic ``INSERT`` gets ``23505`` and takes the same select-filter. The rows
+        are exact; only the counts move from loaded to skipped.
         """
         attempted = len(work.rows)
         # Count OCC attempts so the trace can report retries. The wrapper runs once
@@ -1461,11 +1506,12 @@ class BatchedImporter:
             except Exception as exc:  # noqa: BLE001 - inspect sqlstate
                 # A NONE-mode plain INSERT (clean load into an empty target) can only hit a
                 # unique violation (23505) on a RETRY after the batch already committed but the
-                # commit ack was lost to a transient connection drop. Recover idempotently via
-                # SELECT-existing + insert-missing instead of letting the 23505 reach
-                # _load_batch, which would binary-split and FALSELY quarantine rows that are
-                # actually present (phantom data-loss report). DO_NOTHING / DO_UPDATE carry an
-                # ON CONFLICT clause, so a 23505 is not expected there and is left to surface.
+                # commit ack was lost to a transient connection drop or to Aurora DSQL's XX000
+                # at commit. Recover idempotently via SELECT-existing + insert-missing instead
+                # of letting the 23505 reach _load_batch, which would binary-split and FALSELY
+                # quarantine rows that are actually present (phantom data-loss report).
+                # DO_NOTHING / DO_UPDATE carry an ON CONFLICT clause, so a 23505 is not
+                # expected there and is left to surface.
                 if (
                     work.on_conflict is OnConflictMode.NONE
                     and work.key_columns
@@ -1706,6 +1752,13 @@ class BatchedImporter:
         Since an index is an access path, not data, each DDL is attempted
         independently (one bad index no longer stops the remaining ones) and the
         failures are returned for the caller to surface as a warning.
+
+        Aurora DSQL's ``XX000`` is retried within the same budget. Its attempt may have
+        created the index, and an index DDL is not idempotent, so a failure after one --
+        a later "already exists" (``42P07``) or an ``XX000`` that never cleared -- carries
+        :data:`UNCONFIRMED_INDEX_NOTE` and is never counted as created (the name could be
+        another table's index). Never ``IF NOT EXISTS``: that would silently skip a genuine
+        name collision.
         """
         # Lease a FRESH connection INSIDE each retried unit -- mirroring the data
         # path (``_execute_insert``, which leases per attempt) -- and pass the wider
@@ -1722,9 +1775,17 @@ class BatchedImporter:
         # refills the slot, so the next lease / retry mints a fresh one) plus
         # ``retryable=_is_retryable_load_error`` fixes both: a transient drop is
         # retried on a fresh connection, and no dead connection is reused across DDLs.
-        def _run_ddl(ddl: str) -> None:
+        # ``unconfirmed`` records an attempt whose CREATE answered XX000 (it may have
+        # committed), so the failure it may cause is reported with that note. Only the
+        # statement's XX000 counts: one from opening the connection ran no CREATE.
+        def _run_ddl(ddl: str, unconfirmed: list) -> None:
             with pool.lease() as connection:
-                _execute_ddl(connection, ddl)
+                try:
+                    _execute_ddl(connection, ddl)
+                except Exception as exc:  # noqa: BLE001 - noted, then re-raised to the retry
+                    if is_server_unavailable(exc):
+                        unconfirmed[0] = True
+                    raise
 
         retried = with_occ_retry(
             max_attempts=self._occ_max_attempts,
@@ -1736,8 +1797,9 @@ class BatchedImporter:
         created = 0
         failures: list[str] = []
         for ddl in index_ddls:
+            unconfirmed = [False]
             try:
-                retried(ddl)
+                retried(ddl, unconfirmed)
             except Exception as exc:  # noqa: BLE001 - isolate per-index failure
                 # Log-safe: the DDL is tool-generated (no row values, no
                 # credentials) and the driver message is a schema-level error.
@@ -1749,6 +1811,7 @@ class BatchedImporter:
                 failures.append(
                     f"{'UNIQUE ' if _unique else ''}{_index_name_of(ddl)}: "
                     f"{_safe_error(exc)}"
+                    + (UNCONFIRMED_INDEX_NOTE if unconfirmed[0] else "")
                 )
                 _LOGGER.warning(
                     "Post-load index creation failed (data is unaffected): %s",
@@ -2074,8 +2137,10 @@ __all__ = [
     "BatchedImportOptions",
     "BatchedImportResult",
     "BatchedImporter",
+    "UNCONFIRMED_INDEX_NOTE",
     "batch_chunk_id",
     "build_insert_statement",
+    "is_unconfirmed_index_failure",
     "safe_error_message",
 ]
 

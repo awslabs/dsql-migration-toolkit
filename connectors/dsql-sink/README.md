@@ -25,6 +25,18 @@ handling DSQL's constraints directly:
   failed attempt wrote is rolled back first, because Aurora DSQL can report
   `40001` while a statement runs (`OC001`: a schema change elsewhere on the
   cluster, such as an asynchronous index build finishing), not only at commit.
+- **Server unavailable `XX000`** — Aurora DSQL's temporary service condition is
+  retried exactly like a `40001` (`OccRetry.retriesInProcess`: the same
+  `occ.max.retries` budget, the failed attempt rolled back first, backoff +
+  jitter, the same session). If it outlasts the budget, the task drops its
+  connection and throws a `RetriableException`, so Kafka Connect redelivers the
+  batch: it is never dead-lettered. A COMMIT that fails with `XX000` may have
+  committed; the PK-keyed upsert/delete re-run is idempotent per key, though a
+  secondary `UNIQUE` index can reject (`23505`) an image the landed chunk already
+  replaced, which is then dead-lettered as on any redelivery of a committed
+  batch. The exception Connect logs on a redelivery carries the SQLSTATE and
+  exception classes only (pgjdbc renders a failed batch entry with its bound
+  values).
 - **≤ 3,000 rows / transaction** — small idempotent batches (`Batches` +
   `DsqlSinkTask`).
 - **PK-keyed idempotent upsert/delete** — `INSERT ... ON CONFLICT (pk) DO
@@ -54,16 +66,16 @@ errors — it does **not** run this connector in-process. This connector is the
 | `pom.xml` | Maven build; Kafka Connect (provided) + PostgreSQL JDBC + AWS SDK v2 `dsql` + JUnit 5; shaded uber-jar for the MSK Connect custom plugin |
 | `DsqlSinkConnector.java` | `SinkConnector` entrypoint; distributes config to tasks |
 | `DsqlSinkConnectorConfig.java` | Connector config: `dsql.cluster.endpoint`/`dsql.region`/`dsql.database`/`dsql.username`/`delete.enabled`/`batch.size`/`occ.*`/`metrics.*`/`target.key.columns` (re-keyed tables keyed on the source primary key, with the composite key the sink writes each by — the cdc-stack `SinkKeyColumns` parameter; absent = none) |
-| `DsqlSinkTask.java` | `SinkTask`: parse → batch (≤3,000) → OCC-retried upsert/delete → commit; IAM-token reconnect; failures re-thrown for the Connect DLQ |
+| `DsqlSinkTask.java` | `SinkTask`: parse → batch (≤3,000) → OCC/`XX000`-retried upsert/delete → commit; IAM-token reconnect; failures re-thrown for the Connect DLQ |
 | `DebeziumEvents.java` | Maps a Debezium envelope `SinkRecord` to a `ChangeEvent` (record key = PK; `c/r/u`→upsert, `d`/tombstone→delete). A table listed in `target.key.columns` whose record is keyed on the SOURCE primary key is written by its composite key instead: an `UPDATE` of a composite-key column becomes delete-old + insert-new in one transaction, a delete uses the exact composite key of its before-image (or the source key once its unique index is valid), and its tombstone is skipped |
 | `ChangeEvent.java` | Parsed change event (table, delete flag, columns/values, pk columns/values) |
 | `DsqlDialect.java` | Pure DSQL SQL builders: identifier quoting, `INSERT ... ON CONFLICT` upsert, `DELETE` |
 | `Batches.java` | Partitions events into ≤`batch.size` chunks (rows weighted: a move counts 2) |
 | `SourceKeyIndex.java` | Per-task cache of whether a re-keyed table's unique index on its source key is valid (one `pg_index` read per table; 10 min when valid, 60 s otherwise), so a delete is keyed on the source key only when that is a single-row lookup |
-| `OccRetry.java` | Re-runs a `40001`-conflicted transaction (a chunk, or one row) with backoff + jitter (mirrors `core/occ.py`), rolling back the failed attempt first; injectable sleeper/jitter for tests |
+| `OccRetry.java` | Re-runs a transaction (a chunk, or one row) that failed with a `40001` conflict or Aurora DSQL's `XX000` server unavailable, with backoff + jitter (mirrors `core/occ.py`), rolling back the failed attempt first; injectable sleeper/jitter for tests |
 | `DsqlIamTokenProvider.java` | DSQL IAM token cache + refresh policy (mirrors `core/target_connection.py`); injectable token source + clock for tests |
 | `AwsDsqlTokenSource.java` | The only class touching the AWS SDK: `DsqlUtilities` admin/non-admin token generation |
-| `src/test/java/...` | JUnit 5 tests: dialect SQL, OCC retry (incl. a `40001` raised while a statement runs, against a double with PostgreSQL's aborted-transaction semantics), batch partition, Debezium parse, token refresh |
+| `src/test/java/...` | JUnit 5 tests: dialect SQL, OCC retry (incl. a `40001` or `XX000` raised while a statement runs or at COMMIT, against a double with PostgreSQL's aborted-transaction semantics; a COMMIT that landed re-runs to the same rows for every write shape), batch partition, Debezium parse, token refresh |
 
 ## Build and test
 
@@ -79,7 +91,7 @@ The shaded jar is the MSK Connect custom plugin artifact (uploaded to S3 by
 ## What the offline tests cover (and what they don't)
 
 Covered without AWS/DSQL: DSQL dialect SQL generation (upsert/delete), OCC
-`40001` transaction-retry policy (each attempt rolled back before the next),
+`40001` / `XX000` transaction-retry policy (each attempt rolled back before the next),
 ≤3,000-row batch partitioning, Debezium envelope → upsert/delete parsing, and
 the IAM-token refresh trigger.
 

@@ -120,7 +120,7 @@ constraint, handled for you:
 | ≤ 3000 rows per transaction | Caps batch row count | `DEFAULT_BATCH_ROWS = 2000`, hard cap `3000` |
 | Bind-parameter limit | Clamps batch to fit | `MAX_STATEMENT_PARAMETERS = 65535` (`65535 // columns`) |
 | Per-write-txn size | Splits wide rows | `MAX_BATCH_BYTES = 8 MiB` |
-| Optimistic concurrency (`40001`) | Retries the batch with backoff + jitter — also on a transient connection drop | up to 20 attempts |
+| Optimistic concurrency (`40001`) | Retries the batch with backoff + jitter — also on a transient connection drop and on Aurora DSQL's temporary `XX000` (server unavailable) | up to 20 attempts |
 | Bounded resource use | Limited concurrent batches | `DEFAULT_PARALLELISM = 8` per table, `4` tables at once |
 
 **Idempotent by construction.** A clean load inserts into a freshly-recreated
@@ -140,7 +140,13 @@ plain-integer keys have no sequence and are untouched.
 
 **Indexes come last.** Secondary indexes are created **after** all data batches
 succeed, each as `CREATE INDEX ASYNC` in its own single-DDL transaction (DSQL
-allows one DDL per transaction and builds indexes asynchronously).
+allows one DDL per transaction and builds indexes asynchronously). An index
+statement Aurora DSQL answers with `XX000` ("server unavailable") is retried the
+same way. If a retry then finds an index of that name already there, the tool does
+not count it as created, because index names are per schema in Aurora DSQL and it
+could be another table's: the Full Load panel and the error log show it as **not
+confirmed** (not as missing), with a note that the earlier attempt may have created
+it, so check the target before you add it.
 
 ---
 
@@ -196,6 +202,11 @@ loader does **not** fail the table. It binary-splits the batch down to the singl
 offending row, **quarantines** that row (recording its **primary key and the
 reason — never its values**), and loads the rest. Quarantined rows show up in a
 downloadable error log.
+
+A temporary Aurora DSQL condition is not a rejection: a `40001`, a dropped
+connection and `XX000` ("server unavailable") retry the whole batch (§3.4), and a
+batch whose retries run out fails — the table can be retried with **Retry
+unfinished tables**, and no row is quarantined for it.
 
 ### Table-fatal (the whole table stops)
 

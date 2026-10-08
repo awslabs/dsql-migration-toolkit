@@ -1229,3 +1229,306 @@ def test_dependent_objects_hint_does_not_claim_the_tool_did_not_create_the_fk() 
     assert "did not create" not in message, message
     # It offers the action that actually resolves an owned constraint.
     assert "re-run" in message.lower(), message
+
+
+# ---------------------------------------------------------------------------
+# G22: Aurora DSQL's XX000 "server unavailable" -- replayed as a unit, a landed CREATE
+# recognised, never a misleading "Fix the CREATE DDL"
+# ---------------------------------------------------------------------------
+
+
+class _Catalog:
+    """A target catalog shared by every connection: the relations and the constraints that
+    exist. ``faults`` scripts failures as ``(sqlstate, lands, matches)``: the first entry
+    whose ``matches(statement text)`` is true fires once -- ``lands`` applies the statement
+    first, as an XX000 whose commit landed does (Aurora DSQL's uncertain outcome)."""
+
+    def __init__(self, relations=(), faults=()) -> None:
+        self.relations = set(relations)
+        self.constraints: set[str] = set()
+        self.faults = list(faults)
+        self.connections: list["_CatalogConnection"] = []
+
+    def connect(self) -> "_CatalogConnection":
+        connection = _CatalogConnection(self)
+        self.connections.append(connection)
+        return connection
+
+    def run(self, text: str) -> None:
+        for index, (state, lands, matches) in enumerate(self.faults):
+            if matches(text):
+                del self.faults[index]
+                if lands:
+                    self._apply(text)
+                raise _FakeSerializationFailure(sqlstate=state)
+        self._apply(text)
+
+    def _apply(self, text: str) -> None:
+        import re
+
+        upper = text.upper()
+        if upper.startswith("DROP"):
+            self.relations.discard(".".join(re.findall(r'"([^"]+)"', text)))
+        elif upper.startswith("CREATE"):
+            name, _kind = parse_create_object(text)
+            if name in self.relations:
+                raise _FakeSerializationFailure(sqlstate="42P07")
+            self.relations.add(name)
+        elif "ADD CONSTRAINT" in upper:
+            name = re.search(r'ADD CONSTRAINT "([^"]+)"', text).group(1)
+            if name in self.constraints:
+                raise _FakeSerializationFailure(sqlstate="42710")
+            self.constraints.add(name)
+
+
+class _CatalogConnection:
+    """An autocommit connection on a :class:`_Catalog`; ``attempted`` records every
+    statement it was asked to run, failed ones included."""
+
+    def __init__(self, catalog: _Catalog) -> None:
+        self._catalog = catalog
+        self.attempted: list[str] = []
+
+    def cursor(self) -> "_CatalogCursor":
+        return _CatalogCursor(self)
+
+    def close(self) -> None:
+        pass
+
+
+class _CatalogCursor:
+    def __init__(self, connection: _CatalogConnection) -> None:
+        self._connection = connection
+
+    def execute(self, statement: Any, _params: Optional[list[object]] = None) -> None:
+        text = statement if isinstance(statement, str) else statement.as_string(None)
+        self._connection.attempted.append(text)
+        self._connection._catalog.run(text)
+
+    def close(self) -> None:
+        pass
+
+
+_CREATE_T = 'CREATE TABLE "t" ("id" integer PRIMARY KEY)'
+
+
+def _is_create(text: str) -> bool:
+    return text.upper().startswith("CREATE")
+
+
+@pytest.mark.parametrize("lands", [True, False])
+def test_g22_recreate_table_replays_the_unit_on_server_unavailable(lands) -> None:
+    # An XX000 on the CREATE after a committed DROP replays the replay-safe DROP IF EXISTS +
+    # CREATE unit on a new connection, whether or not that CREATE landed. FAILS WITHOUT G22:
+    # it was a terminal "DROPPED but could not be recreated ... Fix the CREATE DDL".
+    catalog = _Catalog(relations={"t"}, faults=[("XX000", lands, _is_create)])
+    recreate_table(
+        [], _CREATE_T, connection_factory=catalog.connect, sleep=_no_sleep, jitter=_zero_jitter
+    )
+    assert "t" in catalog.relations
+    assert len(catalog.connections) == 2
+    assert catalog.connections[1].attempted == ['DROP TABLE IF EXISTS "t"', _CREATE_T]
+
+
+def test_g22_a_recreate_that_never_recovers_raises_the_xx000_not_a_create_ddl_error() -> None:
+    # Exhausted, the raw XX000 surfaces (as an exhausted class-08 does): the Full Load shows
+    # the "temporary service condition" hint, not advice to fix a DDL that is not wrong.
+    from dsql_migrator.core.target_connection import target_error_hint
+
+    catalog = _Catalog(relations={"t"}, faults=[("XX000", False, _is_create)] * 5)
+    with pytest.raises(Exception) as excinfo:
+        recreate_table(
+            [], _CREATE_T, connection_factory=catalog.connect, occ_max_attempts=3,
+            sleep=_no_sleep, jitter=_zero_jitter,
+        )
+    exc = excinfo.value
+    assert not isinstance(exc, SchemaApplyError)
+    assert getattr(exc, "sqlstate", None) == "XX000"
+    assert "Retry unfinished tables" in (target_error_hint(exc) or "")
+    assert len(catalog.connections) == 3  # the unit's budget, once per attempt
+
+
+@pytest.mark.parametrize("lands", [True, False])
+@pytest.mark.parametrize("mode", [ApplyMode.SKIP_IF_EXISTS, ApplyMode.REPLACE])
+def test_g22_a_bare_create_retries_server_unavailable_and_a_landed_one_is_created(
+    mode, lands
+) -> None:
+    # A brand-new object's bare CREATE (not idempotent) is retried on the same connection;
+    # when the retry finds "already exists" after an XX000, that attempt's CREATE landed.
+    # FAILS WITHOUT G22: FAILED for a temporary service condition.
+    catalog = _Catalog(faults=[("XX000", lands, _is_create)])
+    applier = SchemaApplier(
+        _StubOracle(set()),
+        connection_factory=catalog.connect,
+        occ_max_attempts=5,
+        occ_base_delay=0.0,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    result = applier.apply(_CREATE_ORDERS, mode, confirmed=True)
+    assert result.status is ApplyStatus.CREATED, result.detail
+    assert len(catalog.connections) == 1
+    assert catalog.connections[0].attempted == [_CREATE_ORDERS, _CREATE_ORDERS]
+    assert "orders" in catalog.relations
+
+
+def test_g22_apply_foreign_key_replays_and_a_landed_add_counts_as_applied() -> None:
+    # The ADD's commit landed but answered XX000: the unit replays, the replay's 42710 means
+    # the constraint is there -- applied, not reported as failed.
+    from dsql_migrator.core.schema_applier import apply_foreign_key
+
+    catalog = _Catalog(faults=[("XX000", True, lambda s: "ADD CONSTRAINT" in s)])
+    apply_foreign_key(
+        _FK_ADD, connection_factory=catalog.connect, sleep=_no_sleep, jitter=_zero_jitter
+    )
+    assert catalog.constraints == {"fk_user"}
+    assert len(catalog.connections) == 2
+
+
+def test_g22_connect_retry_covers_server_unavailable() -> None:
+    from dsql_migrator.core.schema_applier import _is_retryable_connect_error
+
+    assert _is_retryable_connect_error(_FakeSerializationFailure(sqlstate="XX000")) is True
+    assert _is_retryable_connect_error(_FakeSerializationFailure(sqlstate="XX001")) is False
+
+
+def test_g22_server_unavailable_replays_the_unit_never_retries_it_per_statement() -> None:
+    # The per-statement retry stays 40001-only, so an XX000 is retried once, at the unit
+    # level (a new connection), never also per statement inside it: no nested budgets.
+    from dsql_migrator.core.schema_applier import drop_object
+
+    catalog = _Catalog(
+        relations={"v"}, faults=[("XX000", False, lambda s: s.startswith("DROP"))]
+    )
+    drop_object(
+        "CREATE VIEW v AS SELECT 1",
+        connection_factory=catalog.connect,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    assert len(catalog.connections) == 2
+    assert catalog.connections[0].attempted == ['DROP VIEW IF EXISTS "v"']
+    assert "v" not in catalog.relations
+
+
+def _bare_create_applier(catalog: _Catalog, occ_max_attempts: int = 5) -> SchemaApplier:
+    # The object is absent at browse time, so apply() runs the bare CREATE path.
+    return SchemaApplier(
+        _StubOracle(set()),
+        connection_factory=catalog.connect,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=0.0,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+
+
+_BOTH_MODES = pytest.mark.parametrize("mode", [ApplyMode.SKIP_IF_EXISTS, ApplyMode.REPLACE])
+
+
+@_BOTH_MODES
+def test_g22_a_bare_create_whose_xx000_never_clears_fails_within_its_budget(mode) -> None:
+    # Only a 42P07 after an XX000 means the earlier CREATE landed: a sustained XX000 is a
+    # failure, after exactly the budget's attempts. FAILS if any failure after an XX000 counted
+    # as "landed" (CREATED for a table that does not exist).
+    catalog = _Catalog(faults=[("XX000", False, _is_create)] * 10)
+    result = _bare_create_applier(catalog, occ_max_attempts=3).apply(
+        _CREATE_ORDERS, mode, confirmed=True
+    )
+    assert result.status is ApplyStatus.FAILED, result.detail
+    assert "orders" not in catalog.relations
+    assert catalog.connections[0].attempted == [_CREATE_ORDERS] * 3
+
+
+@_BOTH_MODES
+def test_g22_a_permanent_error_after_an_xx000_is_still_a_failure(mode) -> None:
+    # The retry after an XX000 fails for good (42601): FAILED, never taken for a landed CREATE.
+    catalog = _Catalog(faults=[("XX000", False, _is_create), ("42601", False, _is_create)])
+    result = _bare_create_applier(catalog).apply(_CREATE_ORDERS, mode, confirmed=True)
+    assert result.status is ApplyStatus.FAILED, result.detail
+    assert "orders" not in catalog.relations
+    assert catalog.connections[0].attempted == [_CREATE_ORDERS] * 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [(ApplyMode.REPLACE, ApplyStatus.FAILED), (ApplyMode.SKIP_IF_EXISTS, ApplyStatus.SKIPPED)],
+)
+def test_g22_a_42p07_after_a_40001_keeps_its_meaning(mode, expected) -> None:
+    # A 40001 (OC001: another session changed the catalog -- here it created the table) is
+    # no uncertain commit: our CREATE never landed, so the retry's 42P07 is that session's
+    # table and keeps its meaning (REPLACE surfaces the conflict, SKIP_IF_EXISTS self-heals).
+    # FAILS if a 40001 marked the attempt unconfirmed: CREATED for another session's table.
+    catalog = _Catalog()
+
+    def matches(text: str) -> bool:
+        if not _is_create(text):
+            return False
+        catalog.relations.add("orders")  # another session creates it first
+        return True
+
+    catalog.faults = [("40001", False, matches)]
+    result = _bare_create_applier(catalog).apply(_CREATE_ORDERS, mode, confirmed=True)
+    assert result.status is expected, result.detail
+    assert catalog.connections[0].attempted == [_CREATE_ORDERS] * 2
+
+
+_CREATE_PAYMENTS_INDEX = 'CREATE INDEX ASYNC "user_id" ON "payments" ("user_id")'
+_CREATE_PAYMENTS_UNIQUE_INDEX = 'CREATE UNIQUE INDEX ASYNC "user_id" ON "payments" ("user_id")'
+_INDEX_MODES = pytest.mark.parametrize(
+    ("mode", "expected"),
+    [(ApplyMode.SKIP_IF_EXISTS, ApplyStatus.SKIPPED), (ApplyMode.REPLACE, ApplyStatus.FAILED)],
+)
+
+
+@pytest.mark.parametrize("ddl", [_CREATE_PAYMENTS_INDEX, _CREATE_PAYMENTS_UNIQUE_INDEX])
+@_INDEX_MODES
+def test_g22_an_index_name_another_table_holds_is_never_reported_created(
+    ddl, mode, expected
+) -> None:
+    # MySQL index names are per table, Aurora DSQL's per schema: orders' index "user_id",
+    # created earlier in the same Apply all (the one browse still says absent), holds the name
+    # payments' index wants. The first attempt answers XX000 and does not land, so the retry's
+    # 42P07 is orders' index. It keeps the meaning it has without the XX000 (SKIPPED / FAILED,
+    # never CREATED), as the post-load index pass reports it. FAILS WITHOUT THE FIX: CREATED,
+    # with no index on payments (for a UNIQUE one, a source constraint silently gone).
+    catalog = _Catalog(relations={"user_id"}, faults=[("XX000", False, _is_create)])
+    result = _bare_create_applier(catalog).apply(ddl, mode, confirmed=True)
+    assert result.status is expected, result.detail
+    assert catalog.connections[0].attempted == [ddl, ddl]
+    if expected is ApplyStatus.FAILED:
+        assert "may have been created anyway" in result.detail
+
+
+@_INDEX_MODES
+def test_g22_a_landed_index_create_is_noted_never_assumed(mode, expected) -> None:
+    # Our own CREATE INDEX landed but answered XX000. The retry's 42P07 cannot tell our index
+    # from another table's, so it is not counted as created: SKIPPED by the existing self-heal,
+    # or FAILED with the note that it may have been created anyway.
+    catalog = _Catalog(faults=[("XX000", True, _is_create)])
+    result = _bare_create_applier(catalog).apply(_CREATE_PAYMENTS_INDEX, mode, confirmed=True)
+    assert result.status is expected, result.detail
+    assert "user_id" in catalog.relations  # it did land
+    if expected is ApplyStatus.FAILED:
+        assert "may have been created anyway" in result.detail
+
+
+def test_g22_a_bare_create_index_whose_xx000_never_clears_is_failed_with_the_note() -> None:
+    catalog = _Catalog(faults=[("XX000", False, _is_create)] * 10)
+    result = _bare_create_applier(catalog, occ_max_attempts=3).apply(
+        _CREATE_PAYMENTS_INDEX, ApplyMode.SKIP_IF_EXISTS, confirmed=True
+    )
+    assert result.status is ApplyStatus.FAILED, result.detail
+    assert "may have been created anyway" in result.detail
+    assert catalog.connections[0].attempted == [_CREATE_PAYMENTS_INDEX] * 3
+
+
+def test_g22_an_index_name_taken_with_no_xx000_is_reported_unchanged() -> None:
+    # A first-attempt 42P07 means what it always meant: no note.
+    catalog = _Catalog(relations={"user_id"})
+    result = _bare_create_applier(catalog).apply(
+        _CREATE_PAYMENTS_INDEX, ApplyMode.REPLACE, confirmed=True
+    )
+    assert result.status is ApplyStatus.FAILED
+    assert "may have been created anyway" not in result.detail
+    assert catalog.connections[0].attempted == [_CREATE_PAYMENTS_INDEX]

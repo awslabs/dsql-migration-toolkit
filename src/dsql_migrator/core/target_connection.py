@@ -138,6 +138,31 @@ def is_transient_connection_error(exc: BaseException) -> bool:
         return any(sig in message for sig in TRANSIENT_CONN_SIGNATURES)
     return False
 
+
+# Aurora DSQL's "server unavailable" (troubleshooting guide): a temporary service condition
+# after which the connection stays open. Exactly XX000: XX001 (data corrupted) and XX002
+# (index corrupted) share its class but are not transient.
+SERVER_UNAVAILABLE_SQLSTATE = "XX000"
+
+
+def is_server_unavailable(exc: BaseException) -> bool:
+    """True for Aurora DSQL's temporary "server unavailable" (``SQLSTATE XX000``) on a TARGET call.
+
+    Aurora DSQL documents it as a temporary service condition: the connection stays usable,
+    and the whole transaction -- COMMIT included -- is retried with exponential backoff and
+    jitter. If it came while committing, the transaction MAY have committed, so compose this
+    predicate only into retries whose re-run is exact even then -- never into
+    :func:`~dsql_migrator.core.occ.with_occ_retry`'s default. A non-idempotent DDL handles the
+    uncertain outcome itself.
+
+    Keyed on the exception's own ``sqlstate`` (psycopg raises ``InternalError_``), like
+    :func:`~dsql_migrator.core.occ.is_occ_conflict`, so a deliberately terminal wrapper is
+    never retried. Target only: a PostgreSQL SOURCE raising ``XX000`` is a genuine internal
+    error.
+    """
+    return getattr(exc, "sqlstate", None) == SERVER_UNAVAILABLE_SQLSTATE
+
+
 # A token generator takes (hostname, region, expires_in_seconds) and returns the
 # token string. It is injectable so tests can supply a fake (no real AWS calls).
 TokenGenerator = Callable[[str, str, int], str]
@@ -601,6 +626,14 @@ def target_error_hint(exc: BaseException) -> Optional[str]:
             "Lower full_load_table_parallelism / batch size and re-run — the load is "
             "idempotent (INSERT ... ON CONFLICT), so a re-run is safe"
         )
+    # XX000 -- Aurora DSQL's temporary "server unavailable" outlasted the retries.
+    if code == SERVER_UNAVAILABLE_SQLSTATE or "server unavailable" in low:
+        return (
+            "Aurora DSQL reported a temporary service condition (server unavailable, "
+            "SQLSTATE XX000) that lasted longer than the automatic retries. Use Retry "
+            "unfinished tables: the load is idempotent, so a re-run is safe. If it keeps "
+            "happening, contact AWS Support"
+        )
     # 54000 -- a per-table structural limit (too many indexes/columns, or a batch that
     # exceeded the row/parameter/time cap).
     if code == "54000" or "54000" in low:
@@ -631,6 +664,8 @@ __all__ = [
     "TokenGenerator",
     "ConnectFactory",
     "target_error_hint",
+    "SERVER_UNAVAILABLE_SQLSTATE",
+    "is_server_unavailable",
     "ADMIN_USERNAME",
     "DEFAULT_TOKEN_EXPIRY_SECONDS",
     "DEFAULT_REFRESH_MARGIN_SECONDS",

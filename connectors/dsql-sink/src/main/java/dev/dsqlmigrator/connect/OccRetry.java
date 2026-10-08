@@ -13,26 +13,37 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.LongUnaryOperator;
 
 /**
- * OCC retry of a whole transaction on DSQL serialization failures (SQLSTATE 40001).
+ * In-process retry of a whole transaction on an Aurora DSQL serialization failure (SQLSTATE
+ * 40001) or "server unavailable" (SQLSTATE XX000).
  *
- * <p>Mirrors the Python {@code core/occ.py} policy: a unit of work that raises
- * {@code 40001} is retried up to {@code maxAttempts} with exponential backoff +
- * full jitter (capped); any other SQL error propagates immediately, and once
- * the attempt budget is exhausted the last {@code 40001} is re-raised. Because
- * the connector applies idempotent PK-keyed upsert/delete, re-running a
- * conflicted transaction (the sink's whole chunk, or one row's) is safe
- * (Property 5 analog). Spike H2 measures throughput under contention.
+ * <p>Mirrors the Python {@code core/occ.py} backoff policy: a unit of work that raises a
+ * {@code 40001} or an {@code XX000} ({@link #retriesInProcess}) is retried up to
+ * {@code maxAttempts} with exponential backoff + full jitter (capped), one budget shared by
+ * both; any other SQL error propagates immediately, and once the attempt budget is exhausted
+ * the last error is re-raised. Because the connector applies idempotent PK-keyed
+ * upsert/delete, re-running a conflicted transaction (the sink's whole chunk, or one row's) is
+ * safe (Property 5 analog). Spike H2 measures throughput under contention.
  *
- * <p><b>Every attempt starts on a clean transaction.</b> After a {@code 40001}, and only when
- * another attempt follows, the caller's {@code rollback} runs before the backoff. Aurora DSQL
- * reports a write conflict (OC000) at COMMIT, which already ended the transaction (the rollback
- * then sends nothing), but a schema conflict (OC001: the session's cached catalog is behind
- * after a DDL, GRANT or REVOKE elsewhere on the cluster, such as an asynchronous index build
- * finishing) can come when a statement runs -- and that failed statement leaves the transaction
- * aborted, so without the rollback every statement of the next attempt failed with 25P02,
- * which is not retried. The retry stays on the same session, whose catalog Aurora DSQL
- * refreshes. After the last attempt, and for any other error, nothing runs here: the caller's
- * error path rolls back.
+ * <p><b>XX000.</b> Aurora DSQL documents "server unavailable" as a temporary service condition
+ * after which the connection stays usable: the entire transaction, COMMIT included, is retried
+ * from the beginning with exponential backoff and jitter. When the COMMIT is what failed, the
+ * transaction may have committed; a re-run of a unit that did commit sets the same image per
+ * primary key again (every statement sets an absolute image per key), so it is retried exactly
+ * like a 40001. A secondary UNIQUE index can still reject (23505) an image the landed unit
+ * already replaced; the caller then applies the chunk one row per transaction and dead-letters
+ * that record, as on any Connect redelivery of a committed batch. Only {@code XX000} itself:
+ * {@code XX001} (data corrupted) and {@code XX002} (index corrupted) are not transient.
+ *
+ * <p><b>Every attempt starts on a clean transaction.</b> After a {@code 40001} or an
+ * {@code XX000}, and only when another attempt follows, the caller's {@code rollback} runs
+ * before the backoff. Aurora DSQL reports a write conflict (OC000) at COMMIT, which already
+ * ended the transaction (the rollback then sends nothing), but a schema conflict (OC001: the
+ * session's cached catalog is behind after a DDL, GRANT or REVOKE elsewhere on the cluster,
+ * such as an asynchronous index build finishing) or an XX000 can come when a statement runs --
+ * and that failed statement leaves the transaction aborted, so without the rollback every
+ * statement of the next attempt failed with 25P02, which is not retried. The retry stays on
+ * the same session, whose catalog Aurora DSQL refreshes. After the last attempt, and for any
+ * other error, nothing runs here: the caller's error path rolls back.
  *
  * <p>The sleeper and jitter source are injectable (package-private overload) so
  * the retry policy is unit-tested instantly and deterministically without real
@@ -43,10 +54,26 @@ public final class OccRetry {
   /** PostgreSQL/DSQL serialization-failure SQLSTATE. */
   public static final String OCC_SQLSTATE = "40001";
 
+  /**
+   * Aurora DSQL "server unavailable": a temporary service condition after which the session
+   * stays open. Exactly {@code XX000} -- {@code XX001}/{@code XX002} are corruption errors.
+   */
+  public static final String SERVER_UNAVAILABLE_SQLSTATE = "XX000";
+
   /** Cap on a single backoff sleep (ms), mirroring core/occ.py's 5s cap. */
   static final long MAX_BACKOFF_MS = 5_000L;
 
   private OccRetry() {}
+
+  /**
+   * True for an error this class re-runs the whole transaction for: an OCC conflict
+   * ({@code 40001}) or Aurora DSQL's server unavailable ({@code XX000}). The one predicate of
+   * {@link #withRetry}, {@code DsqlSinkTask.isTransient} and the parameter describe.
+   */
+  public static boolean retriesInProcess(SQLException e) {
+    String s = e.getSQLState();
+    return OCC_SQLSTATE.equals(s) || SERVER_UNAVAILABLE_SQLSTATE.equals(s);
+  }
 
   @FunctionalInterface
   public interface SqlWork<T> {
@@ -91,7 +118,7 @@ public final class OccRetry {
         return work.run();
       } catch (SQLException e) {
         attempt++;
-        if (!OCC_SQLSTATE.equals(e.getSQLState()) || attempt >= maxAttempts) {
+        if (!retriesInProcess(e) || attempt >= maxAttempts) {
           throw e;
         }
         rollback.run(); // the next attempt starts on a clean transaction
