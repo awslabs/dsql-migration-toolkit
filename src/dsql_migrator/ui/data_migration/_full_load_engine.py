@@ -4399,11 +4399,12 @@ PG_IDENTITY_UNKNOWN = (
     "Not loaded: whether this re-keyed table is REPLICA IDENTITY FULL on the source could "
     "not be read. Retry it."
 )
+# {remedy}: cdc_pg_slot.replica_identity_remedy -- the fix for THIS cause (a new primary key
+# repairs only DEFAULT).
 PG_IDENTITY_UNUSABLE = (
     "Not loaded: the table has no usable REPLICA IDENTITY on the source ({cause}), so once "
     "in CDC's publication every UPDATE and DELETE on it would fail there; it was not added. "
-    "Give it a primary key, or set REPLICA IDENTITY FULL (on each partition of a "
-    "partitioned table), re-run the prerequisite checks, then retry it."
+    "To fix it, {remedy}, then re-run the prerequisite checks and retry it."
 )
 PG_IDENTITY_UNREADABLE = (
     "Not loaded: whether the table (and each of its partitions) has a usable REPLICA "
@@ -5970,7 +5971,9 @@ class BatchedTableMigrator:
                 continue
             problem = cdc_pg_slot.replica_identity_problem(read)
             if problem:
-                out[table] = PG_IDENTITY_UNUSABLE.format(cause=problem)
+                out[table] = PG_IDENTITY_UNUSABLE.format(
+                    cause=problem, remedy=cdc_pg_slot.replica_identity_remedy(read)
+                )
         for table, columns in rekey.items():
             if table in out:
                 continue
@@ -6104,7 +6107,7 @@ class BatchedTableMigrator:
                 out[table] = (
                     PG_IDENTITY_UNREADABLE
                     if exc.unreadable
-                    else PG_IDENTITY_UNUSABLE.format(cause=exc.cause)
+                    else PG_IDENTITY_UNUSABLE.format(cause=exc.cause, remedy=exc.remedy)
                 )
             except cdc_pg_slot.PgReplicationError as exc:
                 # Any other refusal of the write path, before its write.

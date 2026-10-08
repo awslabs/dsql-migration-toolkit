@@ -1484,6 +1484,7 @@ def test_g20_review_each_refusal_names_the_remedy_that_fixes_its_cause(
         f"Nothing was changed there: {remedy}, then re-run the Full Load."
     )
     assert "give it a primary key or" not in msg
+    assert ei.value.remedy == remedy  # G21: the remedy travels on the error too
     _assert_nothing_written(conn)
 
 
@@ -1504,3 +1505,112 @@ def test_g20_review_the_longest_refusal_still_fits_one_bounded_line() -> None:
         assert "(+100000 more tables)" in msg and "\n" not in msg
         assert len(msg) <= 300, (kind, code, len(msg))
         assert msg.endswith(", then re-run the Full Load."), (kind, code)
+
+
+# ---------------------------------------------------------------------------
+# G21: every REPLICA IDENTITY refusal names the fix for its cause, in one bounded line
+# ---------------------------------------------------------------------------
+
+_NOTHING_REMEDY = "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"
+
+
+def test_g21_the_lenient_nothing_refusal_names_its_fix() -> None:
+    # FAILS WITHOUT THE FIX: "Set a primary key or ALTER TABLE ... REPLICA IDENTITY FULL"
+    # -- a new primary key does not clear NOTHING (PostgreSQL keeps relreplident) -- after a
+    # list of every refused name, which the JobManager's 300-character cap could cut off.
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    # A member of a reused publication: the strict check grades only what it would add.
+    conn = _FakeConn(pubs={"dsqlmig_pub_s": ["app.a"]}, replident={"app.a": "n"})
+    logs: list[str] = []
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, ["app.a"], logs=logs)
+    err = ei.value
+    assert str(err) == (
+        "app.a: REPLICA IDENTITY NOTHING. Published for CDC, its UPDATE/DELETE would fail on "
+        "the source. Nothing was changed there: set REPLICA IDENTITY FULL, or DEFAULT with a "
+        "primary key, then re-run the Full Load."
+    )
+    assert (err.cause, err.remedy, err.unreadable) == (
+        "REPLICA IDENTITY NOTHING", _NOTHING_REMEDY, False
+    )
+    assert logs == ["refused before any write: app.a has REPLICA IDENTITY NOTHING"]
+    _assert_nothing_written(conn)
+
+
+def test_g21_many_nothing_tables_make_one_bounded_line_and_one_audit_line_each() -> None:
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError
+
+    names = [f"{chr(97 + i) * 63}.{'t' * 63}" for i in range(12)]
+    conn = _FakeConn(
+        pubs={"dsqlmig_pub_s": list(names)}, replident={n: "n" for n in names}
+    )
+    logs: list[str] = []
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        _provision(conn, list(reversed(names)), logs=logs)
+    msg = str(ei.value)
+    assert len(msg) <= 300 and "\n" not in msg
+    assert "(+11 more tables)" in msg
+    assert msg.startswith("a" * 29 + "...: REPLICA IDENTITY NOTHING")
+    assert msg.endswith(f"{_NOTHING_REMEDY}, then re-run the Full Load.")
+    assert logs == [
+        f"refused before any write: {n} has REPLICA IDENTITY NOTHING" for n in sorted(names)
+    ]
+    _assert_nothing_written(conn)
+
+
+@pytest.mark.parametrize(
+    "usability, head, remedy",
+    [
+        (("r", "d", False, 0, []), "REPLICA IDENTITY DEFAULT, but no valid primary key",
+         "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"),
+        (("r", "n", False, 0, []), "REPLICA IDENTITY NOTHING", _NOTHING_REMEDY),
+        (("r", "i", False, 0, []),
+         "REPLICA IDENTITY USING INDEX, but that index is gone or not valid", _NOTHING_REMEDY),
+        (("p", "d", True, 2, ["app.t_1", "app.t_2"]), "2 of its partitions have none",
+         "set REPLICA IDENTITY FULL on each partition"),
+        (("p", "n", False, 1, ["app.t_1"]), "REPLICA IDENTITY NOTHING",
+         "set REPLICA IDENTITY FULL on it and on each partition"),
+    ],
+    ids=["no-pk", "nothing", "dropped-identity-index", "partitions", "nothing-and-a-leaf"],
+)
+def test_g21_a_one_table_add_names_the_fix_for_its_cause(usability, head, remedy) -> None:
+    # FAILS WITHOUT THE FIX: every cause got "Give it a primary key, or set REPLICA IDENTITY
+    # FULL (on each partition of a partitioned table)", which cannot clear NOTHING, a gone
+    # identity index or a DEFERRABLE key.
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError, add_table_to_publication
+
+    conn = _FakeConn(pubs={"p": ["app.a"]}, usability={"app.t": usability})
+    with pytest.raises(PgReplicaIdentityError) as ei:
+        add_table_to_publication(conn, name="p", table="app.t")
+    assert str(ei.value) == (
+        f"app.t: {head}. Once published, every UPDATE and DELETE on it would fail on the "
+        f"source, so it was not added: {remedy}, then re-run the Full Load."
+    )
+    assert ei.value.remedy == remedy
+    assert ei.value.cause.startswith(head) and not ei.value.unreadable
+    assert conn.writes() == []
+
+
+def test_g21_the_longest_one_table_refusal_still_fits_one_bounded_line() -> None:
+    # Its only displayed channel is the Full Load's error (JobManager: the first line, 300
+    # characters): a 127-character name, a 63-character publication and the longest causes
+    # and remedies still fit, and partition names stay out of the line.
+    from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError, add_table_to_publication
+
+    table = "s" * 63 + "." + "t" * 63
+    publication = "p" * 63
+    leaf = "l" * 63 + "." + "m" * 63
+    for usability in (
+        ("r", "i", False, 0, []),
+        ("r", "d", False, 0, []),
+        ("p", "d", True, 999_999, [leaf] * 5),
+    ):
+        conn = _FakeConn(pubs={publication: ["app.a"]}, usability={table: usability})
+        with pytest.raises(PgReplicaIdentityError) as ei:
+            add_table_to_publication(conn, name=publication, table=table)
+        msg = str(ei.value)
+        assert len(msg) <= 300 and "\n" not in msg, (usability[:2], len(msg))
+        assert msg.endswith(", then re-run the Full Load."), usability[:2]
+        assert leaf not in msg
+        assert conn.writes() == []

@@ -77,7 +77,7 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
               Type.INT,
               10,
               Importance.MEDIUM,
-              "Max statement-level OCC (40001) retries.")
+              "Max OCC (40001) attempts per sink transaction (a chunk, or one row).")
           .define(
               RETRY_BACKOFF_MS,
               Type.LONG,

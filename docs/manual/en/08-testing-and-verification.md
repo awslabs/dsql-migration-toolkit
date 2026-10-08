@@ -41,14 +41,16 @@ silently truncates.
 | ≤ 10 MiB / txn (8 MiB safety budget) | Wide rows whose **bytes** exceed the limit before the row count does; a single row larger than the budget | Byte-aware split before row-count split; an oversized single row is yielded alone (`test_iter_batches_splits_on_byte_budget_before_row_count`, `…_single_oversized_row_yields_alone`) |
 | One DDL / txn | Creating a table's secondary indexes | Each index DDL runs in its own transaction (`test_indexes_created_after_all_data_each_its_own_statement`) |
 
-### Optimistic concurrency — DSQL has no locks; conflicts surface at commit (40001)
+### Optimistic concurrency — DSQL has no locks; conflicts surface as 40001 (at commit, or while a statement runs)
 
-DSQL detects write conflicts at commit and returns `SQLSTATE 40001`. The losing
-transaction must **re-run**, and under contention this happens often.
+DSQL detects write conflicts at commit, and a schema conflict (`OC001`) can also come
+while a statement runs; both return `SQLSTATE 40001`. The losing transaction must
+**re-run**, and under contention this happens often.
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
 | 40001 conflict on a write | A batch hits a serialization conflict, then succeeds on retry | The whole batch — one transaction — is re-run with backoff/jitter and succeeds (`test_occ_conflict_on_batch_is_retried_then_succeeds`); the CDC sink re-runs its chunk's transaction the same way (`OccRetryTest.java`) |
+| 40001 while a statement runs (`OC001`) | The sink's chunk, or one row, gets a 40001 before COMMIT, which leaves its transaction aborted | The failed attempt is rolled back and the whole transaction re-runs: a one-row chunk is applied, not dead-lettered, and a multi-row chunk commits on the batched path (`DsqlSinkOccRollbackTest.java`, against a double with PostgreSQL's aborted-transaction semantics) |
 | Retry budget exhausted | Conflicts never clear | Recorded as a **failure**, never silently dropped (`test_exhausted_occ_conflict_is_recorded_as_failure`) |
 | High concurrency vs. connection quota (10,000/cluster, 100/s) | Many tables × many batches at once | Total in-flight connections stay bounded (`test_parallel_connection_use_is_bounded`); default 4 tables × 8 batches = 32 ≪ quota |
 

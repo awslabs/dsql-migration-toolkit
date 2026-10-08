@@ -2,7 +2,7 @@
 
 > **STATUS: implemented + offline unit-tested + plugin jar builds.**
 > The connector logic is complete and verified at the unit/build level
-> (`mvn test` → 20 tests pass; `mvn package` → shaded MSK Connect plugin jar).
+> (`mvn test` → the offline unit tests pass; `mvn package` → shaded MSK Connect plugin jar).
 > Before a production deploy, validate the runtime characteristics on a live
 > MSK Connect + Aurora DSQL environment: IAM token rotation, OCC `40001`
 > throughput under contention, ≤3,000-row batching / 1-hour reconnect, and
@@ -21,7 +21,10 @@ handling DSQL's constraints directly:
 - **OCC `40001`** — the conflicting **transaction** (one chunk of ≤3,000
   changes, or one row in the record-by-record fallback) is re-run with
   exponential backoff + full jitter (`OccRetry`), mirroring the Python
-  `core/occ.py` policy.
+  `core/occ.py` policy. Each re-run starts on a clean transaction: what the
+  failed attempt wrote is rolled back first, because Aurora DSQL can report
+  `40001` while a statement runs (`OC001`: a schema change elsewhere on the
+  cluster, such as an asynchronous index build finishing), not only at commit.
 - **≤ 3,000 rows / transaction** — small idempotent batches (`Batches` +
   `DsqlSinkTask`).
 - **PK-keyed idempotent upsert/delete** — `INSERT ... ON CONFLICT (pk) DO
@@ -57,10 +60,10 @@ errors — it does **not** run this connector in-process. This connector is the
 | `DsqlDialect.java` | Pure DSQL SQL builders: identifier quoting, `INSERT ... ON CONFLICT` upsert, `DELETE` |
 | `Batches.java` | Partitions events into ≤`batch.size` chunks (rows weighted: a move counts 2) |
 | `SourceKeyIndex.java` | Per-task cache of whether a re-keyed table's unique index on its source key is valid (one `pg_index` read per table; 10 min when valid, 60 s otherwise), so a delete is keyed on the source key only when that is a single-row lookup |
-| `OccRetry.java` | Re-runs a `40001`-conflicted transaction (a chunk, or one row) with backoff + jitter (mirrors `core/occ.py`); injectable sleeper/jitter for tests |
+| `OccRetry.java` | Re-runs a `40001`-conflicted transaction (a chunk, or one row) with backoff + jitter (mirrors `core/occ.py`), rolling back the failed attempt first; injectable sleeper/jitter for tests |
 | `DsqlIamTokenProvider.java` | DSQL IAM token cache + refresh policy (mirrors `core/target_connection.py`); injectable token source + clock for tests |
 | `AwsDsqlTokenSource.java` | The only class touching the AWS SDK: `DsqlUtilities` admin/non-admin token generation |
-| `src/test/java/...` | JUnit 5 tests: dialect SQL, OCC retry, batch partition, Debezium parse, token refresh |
+| `src/test/java/...` | JUnit 5 tests: dialect SQL, OCC retry (incl. a `40001` raised while a statement runs, against a double with PostgreSQL's aborted-transaction semantics), batch partition, Debezium parse, token refresh |
 
 ## Build and test
 
@@ -76,8 +79,9 @@ The shaded jar is the MSK Connect custom plugin artifact (uploaded to S3 by
 ## What the offline tests cover (and what they don't)
 
 Covered without AWS/DSQL: DSQL dialect SQL generation (upsert/delete), OCC
-`40001` statement-retry policy, ≤3,000-row batch partitioning, Debezium
-envelope → upsert/delete parsing, and the IAM-token refresh trigger.
+`40001` transaction-retry policy (each attempt rolled back before the next),
+≤3,000-row batch partitioning, Debezium envelope → upsert/delete parsing, and
+the IAM-token refresh trigger.
 
 **Not** covered here (requires live MSK Connect + Aurora DSQL validation):
 real IAM token rotation across >15 min / >1 h inside an MSK Connect

@@ -96,6 +96,14 @@ class DsqlSinkTaskTest {
     // DSQL per-value limit rejection is permanent (handled by the oversized guard
     // pre-write, but if it reaches here it must not loop).
     assertFalse(task.isTransient(new SQLException("datatype limit exceeded", "54000")));
+    // 25P02 is the symptom of an earlier failure in the same transaction (e.g. a later
+    // statement group's describe failing with 42703 under drift, which paramMetaOrNull
+    // swallows). Permanent, the chunk falls back to one row per transaction, where the real
+    // error surfaces; transient, the same deterministic failure would be redelivered forever.
+    // G21 removed the OCC cause (rollback before a retry); it did not make 25P02 retryable.
+    assertFalse(task.isTransient(new SQLException(
+        "current transaction is aborted, commands ignored until end of transaction block",
+        "25P02")));
   }
 
   @Test
@@ -529,7 +537,8 @@ class DsqlSinkTaskTest {
   /**
    * A JDBC double (java.lang.reflect.Proxy): the catalog statement answers {@link #catalogRows}
    * (or throws {@link #catalogFailure}); any other statement is a write that succeeds (or
-   * throws {@link #writeFailure}). Records the Connection calls that matter.
+   * throws {@link #writeFailure}), and its parameter describe answers no metadata (or throws
+   * {@link #describeFailure}). Records the Connection calls that matter.
    */
   private static final class FakeJdbc {
     final List<String> calls = new ArrayList<>(); // prepare/commit/rollback/close, in order
@@ -537,6 +546,7 @@ class DsqlSinkTaskTest {
     List<Object[]> catalogRows = List.of();
     SQLException catalogFailure;
     SQLException writeFailure;
+    SQLException describeFailure; // thrown by a write statement's getParameterMetaData
     int catalogReads;
 
     @SuppressWarnings("unchecked")
@@ -603,7 +613,13 @@ class DsqlSinkTaskTest {
           PreparedStatement.class,
           (self, m, a) ->
               switch (m.getName()) {
-                case "getParameterMetaData", "setObject", "addBatch", "close" -> null;
+                case "getParameterMetaData" -> {
+                  if (describeFailure != null) {
+                    throw describeFailure;
+                  }
+                  yield null;
+                }
+                case "setObject", "addBatch", "close" -> null;
                 case "executeUpdate" -> {
                   if (writeFailure != null) {
                     throw writeFailure;
@@ -741,5 +757,32 @@ class DsqlSinkTaskTest {
     assertTrue(jdbc.calls.contains("prepareWrite"), jdbc.calls.toString()); // it was written
     assertThrows(ConnectException.class, () -> task.put(List.of(record)));
     assertEquals(2, jdbc.catalogReads);
+  }
+
+  @Test
+  void aDescribeFailureThatIsNotAnOccConflictFallsBackToPlainBinding() throws Exception {
+    // G21 rethrows only a 40001 from the parameter describe (OccRetry re-runs it); any other
+    // describe failure -- a driver or server that cannot describe parameters before execute --
+    // must still fall back to plain setObject binding and apply the row. FAILS if
+    // paramMetaOrNull rethrows it: the healthy row is then treated as poison (no DLQ reporter
+    // here, so the put throws; with one it would be dead-lettered).
+    FakeJdbc jdbc = new FakeJdbc();
+    jdbc.describeFailure = new SQLException("parameter metadata not available", "0A000");
+    DsqlSinkTask task = new DsqlSinkTask();
+    task.startMetrics(sinkProps()); // no start(): no DLQ reporter, so a quarantine throws
+    inject(task, jdbc.connection());
+    Struct envelope =
+        new Struct(ORDER_ENVELOPE)
+            .put("op", "u")
+            .put("after", new Struct(ORDER_ROW).put("id", 1L).put("flag", (short) 1))
+            .put("source", new Struct(ORDER_SOURCE).put("db", "shop").put("table", "orders"));
+    SinkRecord record =
+        new SinkRecord(
+            "dsqlcdc.shop.orders", 0, ORDER_KEY, new Struct(ORDER_KEY).put("id", 1L),
+            ORDER_ENVELOPE, envelope, 0L);
+
+    task.put(List.of(record));
+    // The catalog read (no rows: unchecked), then the row written and committed.
+    assertEquals(List.of("prepareCatalog", "commit", "prepareWrite", "commit"), jdbc.calls);
   }
 }

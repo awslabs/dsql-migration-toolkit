@@ -100,6 +100,12 @@ def with_occ_retry(
     recover from a transient connection drop / expired token (e.g. the batched
     loader, which leases a fresh connection per attempt) pass a wider predicate.
 
+    It does not roll back between attempts: every Aurora DSQL connection this tool
+    opens is autocommit (DsqlConnector), so a failed statement leaves no transaction
+    open. An operation that runs several statements in one transaction must roll
+    back inside its attempt (as target_introspector's does), or the retry fails with
+    25P02.
+
     ``sleep`` and ``jitter`` are injectable so tests are deterministic and never
     sleep for real.
     """

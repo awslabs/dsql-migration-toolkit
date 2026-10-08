@@ -16,7 +16,8 @@ binlog offset (``DeploySeederFunction`` ANDs ``IsMySqlSource``). The sink is sha
 
 Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<account>-<region>``
 (globally unique because the account id is in the name). Uploads are idempotent
-(skipped when the object already matches), so re-deploys are cheap.
+(skipped only when the object's size and content match the local file: a stored
+SHA-256, or a single-part ETag's MD5), so re-deploys are cheap.
 
 Read/writes share the single profile-aware boto3 session (mirroring
 :mod:`dsql_migrator.core.dsql_metadata`). Clients are injectable for tests. The
@@ -644,7 +645,32 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   `target.key.columns` on both sink bodies, omitted while SinkKeyColumns is empty).
 #   Bumped because the ZIP changed; a live cdc-stack needs Delete + Deploy infra to pick
 #   up v51 (Start CDC alone does not re-register the plugin).
-PLUGIN_VERSION = "v51"
+# v52 (G21): the sink ZIP's CONTENT changed -- every OCC retry now starts on a clean
+#   transaction. Aurora DSQL reports a write conflict (OC000) at COMMIT, which ends the
+#   transaction, but a schema conflict (OC001: the session's cached catalog is behind after a
+#   DDL, GRANT or REVOKE elsewhere on the cluster -- an asynchronous index build finishing, a
+#   CREATE TABLE for a table added after the Full Load, an ALTER) can come when a statement
+#   RUNS, and the failed statement leaves the transaction aborted. OccRetry re-ran the work on
+#   that aborted transaction, so every statement of the retry failed with 25P02, which is not
+#   retried: a multi-row chunk fell back to one row per transaction (slow, but applied), while
+#   a one-row chunk -- most put() calls at low traffic -- or a row of that fallback was
+#   DEAD-LETTERED although healthy. Now OccRetry runs the caller's rollback before each re-run
+#   (DsqlSinkTask.rollbackBeforeRetry at all four call sites; a rollback that itself fails
+#   drops the connection, so the retry opens a new session), and a 40001 from a statement's
+#   parameter describe (getParameterMetaData) is rethrown to that retry instead of swallowed
+#   -- swallowed, it left an open transaction aborted, or bound a TINYINT(1) 0/1 as a number
+#   (42804: dead-lettered, and a false TYPE_CHANGE cool-down). A COMMIT-time 40001 (pgjdbc
+#   sends nothing to roll back), any other error, budget exhaustion and the transient
+#   reconnect path behave as in v51. The occ.max.retries description now says what it counts
+#   (OCC attempts per sink transaction). G20's comment-only Java changes ride along (they
+#   moved OccRetry.class line numbers only). Worker configuration and connector properties
+#   are unchanged; the Debezium ZIPs and the offset-seeder Lambda are byte-identical (the bump
+#   renames only the CustomPlugins and the worker configurations; the seeder Lambda keeps its
+#   name). Bumped because the ZIP changed; a live cdc-stack needs Delete + Deploy CDC
+#   infrastructure to pick up v52 (Start CDC does not re-register the plugin). That deploy
+#   replaces the S3 object even at the same size: upload_plugin now proves the content by
+#   SHA-256 (G21).
+PLUGIN_VERSION = "v52"
 
 
 class S3ProvisionError(RuntimeError):
@@ -774,6 +800,20 @@ def _local_md5(path: Path) -> str:
     return h.hexdigest()
 
 
+# The S3 user-metadata key (x-amz-meta-sha256) every upload stamps with the local file's
+# SHA-256 (hex), so a later deploy can PROVE the object holds the same bytes: the keys are
+# version-independent and a multipart ETag is not a digest of the content.
+_SHA256_METADATA_KEY = "sha256"
+
+
+def _local_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def upload_plugin(
     s3_client: BotoSessionLike,
     bucket: str,
@@ -782,14 +822,20 @@ def upload_plugin(
     *,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Upload ``local_path`` to ``s3://bucket/key``, skipping when already current.
+    """Upload ``local_path`` to ``s3://bucket/key``, skipping only when the object is
+    PROVEN to hold the same bytes.
 
-    Idempotency: ``head_object`` for the existing size + ETag. If the size matches
-    and the ETag equals the local file's MD5 (non-multipart upload), skip. A
-    multipart/composite ETag (contains ``-``) can't be compared to a plain MD5, so
-    a size match alone is accepted as "unchanged" for our stable artifacts.
-    Uploads via ``upload_file`` when available (boto3 managed multipart), else
-    ``put_object`` (the injectable-fake path). Raises :class:`S3ProvisionError`.
+    The keys are version-independent and a cdc-stack CustomPlugin names no object
+    version, so whatever the object holds is what a deploy registers. ``head_object``
+    gives the size, the ETag and the user metadata; the upload is skipped when the size
+    matches AND either the object's ``sha256`` metadata (stamped by every upload since
+    G21) equals the local file's SHA-256, or its ETag is a plain MD5 (a single-part
+    upload) equal to the local file's. A multipart ETag (``<hash>-<parts>``) is not a
+    digest of the bytes, so a same-size object without the metadata -- uploaded by an
+    earlier version -- is uploaded once more, with it. A failed ``head_object`` uploads
+    too. Uploads via ``upload_file`` when available (boto3 managed multipart), else
+    ``put_object`` (the injectable-fake path), each with the metadata. Raises
+    :class:`S3ProvisionError`.
     """
     if not local_path.is_file():
         raise S3ProvisionError(f"Plugin artifact not found on disk: {local_path}")
@@ -800,24 +846,36 @@ def upload_plugin(
 
     local_size = local_path.stat().st_size
     try:
+        local_sha256 = _local_sha256(local_path)
+    except OSError as exc:
+        raise S3ProvisionError(
+            f"Could not read plugin artifact {local_path}: {str(exc).splitlines()[0]}"
+        ) from exc
+    try:
         head = s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore[attr-defined]
         remote_size = int(head.get("ContentLength", -1))
-        etag = str(head.get("ETag", "")).strip('"')
         if remote_size == local_size:
-            if "-" in etag or etag == _local_md5(local_path):
+            stored = str((head.get("Metadata") or {}).get(_SHA256_METADATA_KEY, ""))
+            etag = str(head.get("ETag", "")).strip('"')
+            if stored == local_sha256 or (
+                "-" not in etag and etag == _local_md5(local_path)
+            ):
                 _log(f"{key}: already up to date — skipping upload.")
                 return
     except Exception:  # noqa: BLE001 - object absent or head not supported; upload
         pass
 
+    metadata = {_SHA256_METADATA_KEY: local_sha256}
     _log(f"Uploading {key} ({local_size // (1024 * 1024)} MiB)…")
     try:
         upload_file = getattr(s3_client, "upload_file", None)
         if callable(upload_file):
-            upload_file(str(local_path), bucket, key)
+            upload_file(str(local_path), bucket, key, ExtraArgs={"Metadata": metadata})
         else:
             with local_path.open("rb") as fh:
-                s3_client.put_object(Bucket=bucket, Key=key, Body=fh.read())  # type: ignore[attr-defined]
+                s3_client.put_object(  # type: ignore[attr-defined]
+                    Bucket=bucket, Key=key, Body=fh.read(), Metadata=metadata
+                )
     except Exception as exc:  # noqa: BLE001
         raise S3ProvisionError(
             f"Failed to upload {key}: {str(exc).splitlines()[0]}"

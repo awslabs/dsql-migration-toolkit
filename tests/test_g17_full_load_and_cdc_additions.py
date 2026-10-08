@@ -1823,19 +1823,27 @@ def test_an_unexpected_failure_after_a_write_refuses_what_is_not_graded(monkeypa
 
 
 _NO_PK = ("r", "d", False, 0, [])
+# The fix for each cause (cdc_pg_slot.replica_identity_remedy, G21): a new primary key
+# repairs DEFAULT only; NOTHING and a gone identity index change only with ALTER TABLE ...
+# REPLICA IDENTITY; a partitioned table's partitions carry the identity.
+_PK_REMEDY = "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"
+_IDENTITY_REMEDY = "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"
+_PARTITION_REMEDY = "set REPLICA IDENTITY FULL on each partition"
 
 
-@pytest.mark.parametrize("usability, cause", [
-    (_NO_PK, "REPLICA IDENTITY DEFAULT, but no valid primary key"),
+@pytest.mark.parametrize("usability, cause, remedy", [
+    (_NO_PK, "REPLICA IDENTITY DEFAULT, but no valid primary key", _PK_REMEDY),
     (("r", "i", False, 0, []),
-     "REPLICA IDENTITY USING INDEX, but that index is gone or not valid"),
-    (("r", "n", False, 0, []), "REPLICA IDENTITY NOTHING"),
-    (("p", "f", True, 1, ["app.c_2026q1"]), "1 of its partitions has none: app.c_2026q1"),
+     "REPLICA IDENTITY USING INDEX, but that index is gone or not valid", _IDENTITY_REMEDY),
+    (("r", "n", False, 0, []), "REPLICA IDENTITY NOTHING", _IDENTITY_REMEDY),
+    (("p", "f", True, 1, ["app.c_2026q1"]), "1 of its partitions has none: app.c_2026q1",
+     _PARTITION_REMEDY),
     (("p", "d", False, 7, ["app.c_1", "app.c_2", "app.c_3", "app.c_4", "app.c_5"]),
-     "7 of its partitions have none: app.c_1, app.c_2, app.c_3, app.c_4, app.c_5 and 2 more"),
+     "7 of its partitions have none: app.c_1, app.c_2, app.c_3, app.c_4, app.c_5 and 2 more",
+     _PARTITION_REMEDY),
 ], ids=["no-pk", "dropped-identity-index", "nothing", "a-nothing-leaf", "many-leaves"])
 def test_an_addition_whose_updates_publishing_would_break_is_never_added(
-        monkeypatch, usability, cause) -> None:
+        monkeypatch, usability, cause, remedy) -> None:
     # FAILS WITHOUT THE FIX: only the parent's own NOTHING was refused (and an unreadable
     # identity let the ADD through), so a table whose primary key was dropped after Step 1
     # -- or a partition set to NOTHING, or a dropped identity index -- joined CDC's
@@ -1844,7 +1852,16 @@ def test_an_addition_whose_updates_publishing_would_break_is_never_added(
 
     source = _PgSource(usability={"app.c": usability})
     out, _b = _guard(_pg_migrator(monkeypatch, source), ["app.c", "app.d"], _pg_watermark())
-    assert out == {"app.c": PG_IDENTITY_UNUSABLE.format(cause=cause), "app.d": None}
+    assert out == {
+        "app.c": PG_IDENTITY_UNUSABLE.format(cause=cause, remedy=remedy), "app.d": None
+    }
+    # G21: the row names the fix for THIS cause (str.format ignores an unused keyword, so the
+    # equality above alone would not prove the remedy is in the text).
+    assert out["app.c"].endswith(
+        f"it was not added. To fix it, {remedy}, then re-run the prerequisite checks and "
+        "retry it."
+    )
+    assert "Give it a primary key, or set" not in out["app.c"]
     assert source.writes() == [  # app.c never joins; app.d (usable) still does
         'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."D"',
         "SELECT PG_CURRENT_XACT_ID()::TEXT",
@@ -1916,9 +1933,11 @@ def test_the_add_itself_rechecks_the_identity_fail_closed(monkeypatch) -> None:
     out, _b = _guard(_pg_migrator(monkeypatch, source), ["app.c", "app.d"], _pg_watermark())
     assert out == {
         "app.c": PG_IDENTITY_UNUSABLE.format(
-            cause="REPLICA IDENTITY DEFAULT, but no valid primary key"),
+            cause="REPLICA IDENTITY DEFAULT, but no valid primary key", remedy=_PK_REMEDY),
         "app.d": PG_IDENTITY_UNREADABLE,
     }
+    # G21: the write layer's refusal carries its remedy to the row (PgReplicaIdentityError).
+    assert "To fix it, give it a primary key that is not DEFERRABLE" in out["app.c"]
     assert source.writes() == []  # neither joined the publication
 
 
@@ -2313,15 +2332,16 @@ def test_add_table_to_publication_is_idempotent_and_refuses_before_any_write() -
                     'stream from now on)']
 
 
-@pytest.mark.parametrize("usability, cause", [
-    (("r", "d", False, 0, []), "REPLICA IDENTITY DEFAULT, but no valid primary key"),
+@pytest.mark.parametrize("usability, cause, remedy", [
+    (("r", "d", False, 0, []), "REPLICA IDENTITY DEFAULT, but no valid primary key",
+     _PK_REMEDY),
     (("r", "i", False, 0, []),
-     "REPLICA IDENTITY USING INDEX, but that index is gone or not valid"),
+     "REPLICA IDENTITY USING INDEX, but that index is gone or not valid", _IDENTITY_REMEDY),
     (("p", "f", True, 2, ["app.c_a", "app.c_b"]), "2 of its partitions have none: "
-                                                   "app.c_a, app.c_b"),
+                                                   "app.c_a, app.c_b", _PARTITION_REMEDY),
 ], ids=["no-pk", "dropped-identity-index", "nothing-leaves"])
 def test_add_table_to_publication_refuses_a_table_whose_updates_would_break(
-        usability, cause) -> None:
+        usability, cause, remedy) -> None:
     # FAILS WITHOUT THE FIX: only relreplident 'n' on the table itself was refused.
     from dsql_migrator.core.cdc_pg_slot import PgReplicaIdentityError, add_table_to_publication
 
@@ -2332,6 +2352,9 @@ def test_add_table_to_publication_refuses_a_table_whose_updates_would_break(
         add_table_to_publication(conn, name="p", table="app.c")
     assert refused.value.cause == cause and not refused.value.unreadable
     assert "UPDATE and DELETE on it would fail on the source" in str(refused.value)
+    # G21: the fix for this cause, on the error and at the end of its one line.
+    assert refused.value.remedy == remedy
+    assert str(refused.value).endswith(f"{remedy}, then re-run the Full Load.")
     assert conn.writes() == []
 
 

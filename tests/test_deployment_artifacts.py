@@ -1155,6 +1155,33 @@ def test_cdc_stack_worker_config_names_carry_plugin_version(cdc_template: dict) 
         assert "${PluginVersion}" in json.dumps(name), cfg_name
 
 
+def test_a_plugin_version_bump_renames_only_the_plugins_and_worker_configs(
+    cdc_template: dict,
+) -> None:
+    # What a PLUGIN_VERSION bump replaces: the three CustomPlugins and the two worker
+    # configurations carry ${PluginVersion}; nothing else does -- the offset-seeder Lambda keeps
+    # ${AWS::StackName}-offset-seeder and a fixed S3 key, so a bump does not reload its code.
+    # The PLUGIN_VERSION history in core/s3_provision.py says so (G21 review: the v52 note
+    # said the bump renamed the seeder Lambda's resources too).
+    versioned = {
+        name for name, resource in cdc_template["Resources"].items()
+        if "PluginVersion" in json.dumps(resource)
+    }
+    assert versioned == {
+        "DebeziumSourcePlugin", "PostgresSourcePlugin", "DsqlSinkPlugin",
+        "WorkerConfiguration", "SinkWorkerConfiguration",
+    }
+    source = Path(__file__).resolve().parent.parent / "src" / "dsql_migrator" / "core"
+    history = " ".join(
+        (source / "s3_provision.py").read_text(encoding="utf-8").replace("#", " ").split()
+    )
+    assert "the bump only renames their resources" not in history
+    assert (
+        "the bump renames only the CustomPlugins and the worker configurations; the seeder "
+        "Lambda keeps its name" in history
+    )
+
+
 def test_cdc_source_connector_has_heartbeat_without_source_write(cdc_template: dict) -> None:
     # A heartbeat keeps Debezium's committed binlog offset advancing while the
     # CAPTURED tables are idle (other tables churn the binlog), so source binlog
@@ -2774,6 +2801,12 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v52 (G21): every OCC retry starts on a clean transaction -- the failed attempt is
+        # rolled back before the re-run, because Aurora DSQL can report a 40001 (OC001, a
+        # stale catalog) while a statement runs, which leaves the transaction aborted; the
+        # retry then failed with 25P02 and a healthy row was dead-lettered. The marker is the
+        # WARN literal of DsqlSinkTask.rollbackBeforeRetry.
+        "OCC retry rollback": b"OCC-conflicted attempt",
         # v51 (G15): a re-keyed table's records are keyed on the SOURCE primary key and the
         # sink writes them by the composite target key read from target.key.columns, so a
         # leading-column change is one ordered move and a DELETE never misses its row.
@@ -3232,8 +3265,10 @@ def test_occ_retry_is_described_as_a_transaction_not_a_statement() -> None:
     # G20: the Full Load re-runs the whole batch (one multi-row INSERT in its own
     # transaction) and the sink re-runs its whole chunk's transaction (or one row's in the
     # record-by-record fallback) -- nothing retries a single statement. The docs and the
-    # comments said "statement-level" in many places; the one deliberate exception is the
-    # plugin's ConfigDef string literal, which changes only with a plugin rebuild.
+    # comments said "statement-level" in many places. G20 kept one deliberate exception, the
+    # plugin's ConfigDef string literal, because it changes only with a plugin rebuild; G21's
+    # v52 rebuild changed it too, so it now says what occ.max.retries counts (OCC attempts
+    # per sink transaction) and no file is exempt.
     import pathlib
     import re
 
@@ -3251,6 +3286,7 @@ def test_occ_retry_is_described_as_a_transaction_not_a_statement() -> None:
         manual / "en" / "08-testing-and-verification.md",
         root / "src" / "dsql_migrator" / "core" / "cdc.py", CDC_STACK_TEMPLATE,
         sink_src / "DsqlSinkTask.java", sink_src / "OccRetry.java",
+        sink_src / "DsqlSinkConnectorConfig.java",
     ]
     for path in english:
         text = flat(path)
@@ -3291,10 +3327,102 @@ def test_occ_retry_is_described_as_a_transaction_not_a_statement() -> None:
         text = re.sub(r"[ \t]*\n[ \t]*", "" if lang == "ja" else " ", text)
         assert fl_phrase in text and sink_phrase in text, lang
         assert stale not in text, lang
-    # The deliberate exception: a ConfigDef string literal ships in the plugin jar.
-    assert "Max statement-level OCC (40001) retries." in (
+    # The ConfigDef string literal ships in the plugin jar (v52, G21): the value is the
+    # number of attempts, and the retry re-runs a whole sink transaction.
+    assert "Max OCC (40001) attempts per sink transaction (a chunk, or one row)." in (
         sink_src / "DsqlSinkConnectorConfig.java"
     ).read_text(encoding="utf-8")
+
+
+def test_manual_says_each_sink_occ_retry_starts_on_a_clean_transaction() -> None:
+    # G21 (plugin v52): Aurora DSQL can report a 40001 while a statement runs (OC001, a
+    # stale catalog after a schema change elsewhere on the cluster), not only at COMMIT, and
+    # the sink now rolls the failed attempt back before each re-run. Chapters 4 and 7 say
+    # both, in every language.
+    import pathlib
+    import re
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    phrases = {
+        "en": ("Each re-run starts on a clean transaction", "while a statement runs"),
+        "ko": ("깨끗한 트랜잭션에서 시작", "구문을 실행하는 도중에도"),
+        "ja": ("クリーンなトランザクションから始まります", "ステートメントの実行中にも"),
+    }
+    for lang, wanted in phrases.items():
+        for page in ("04-cdc-and-dsql-constraints.md", "07-performance-and-tuning.md"):
+            text = (manual / lang / page).read_text(encoding="utf-8")
+            text = re.sub(r"\s+", "", text) if lang == "ja" else re.sub(r"\s+", " ", text)
+            for phrase in wanted:
+                probe = phrase.replace(" ", "") if lang == "ja" else phrase
+                assert probe in text, (lang, page, phrase)
+
+
+def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy() -> None:
+    # G21 review: a live cdc-stack keeps its plugin until Delete + Deploy CDC infrastructure
+    # (Start CDC carries PluginVersion forward), so the v52 rollback-before-retry is not what
+    # an earlier stack does. Chapter 4 says what such a stack still does and how to get v52,
+    # chapter 7 names the plugin version, and section 13.10 no longer says, unscoped, that no
+    # Delete + Deploy is needed.
+    import pathlib
+    import re
+
+    manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
+    wanted = {
+        "en": {
+            "04-cdc-and-dsql-constraints.md": (
+                "CDC infrastructure deployed by an earlier version of the tool re-runs without "
+                "that rollback: until you **Delete CDC infrastructure** and deploy it again, "
+                "such a `40001` can dead-letter a healthy row (`25P02`).",
+            ),
+            "07-performance-and-tuning.md": ("the sink (plugin v52 or later) rolls back",),
+            "13-excluding-tables-and-columns.md": (
+                "**No Delete + Deploy is needed for the changes in this section.**",
+                "Later releases changed the sink plugin (v51, v52), so a stack deployed before "
+                "them needs **Delete CDC infrastructure** and a new deploy",
+            ),
+        },
+        "ko": {
+            "04-cdc-and-dsql-constraints.md": (
+                "이전 버전의 도구로 배포한 CDC 인프라는 이 롤백 없이 다시 실행함: "
+                "**Delete CDC infrastructure** 후 다시 배포하기 전까지는 그런 `40001` 때문에 "
+                "정상 행이 dead-letter 처리될 수 있음(`25P02`).",
+            ),
+            "07-performance-and-tuning.md": ("싱크(플러그인 v52 이상)는 트랜잭션을",),
+            "13-excluding-tables-and-columns.md": (
+                "**이 절의 변경에는 Delete + Deploy가 필요 없습니다.**",
+                "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52), 그 전에 배포한 스택은 "
+                "**Delete CDC infrastructure** 후 다시 배포해야",
+            ),
+        },
+        "ja": {
+            "04-cdc-and-dsql-constraints.md": (
+                "以前のバージョンのツールでデプロイした CDC インフラはこのロールバックなしで再実行します: "
+                "**Delete CDC infrastructure** して再デプロイするまでは、そのような `40001` によって"
+                "正常な行がデッドレターになることがあります (`25P02`)。",
+            ),
+            "07-performance-and-tuning.md": ("シンク (プラグイン v52 以降) はトランザクションを",),
+            "13-excluding-tables-and-columns.md": (
+                "**この節の変更には Delete + Deploy は不要です。**",
+                "その後のリリースでシンクプラグインが変わったため(v51、v52)、それ以前にデプロイした"
+                "スタックは **Delete CDC infrastructure** して再デプロイするまで",
+            ),
+        },
+    }
+    unscoped = {
+        "en": "**No Delete + Deploy is needed.**",
+        "ko": "**Delete + Deploy는 필요 없습니다.**",
+        "ja": "**Delete + Deploy は不要です。**",
+    }
+    for lang, pages in wanted.items():
+        for page, phrases in pages.items():
+            text = (manual / lang / page).read_text(encoding="utf-8")
+            text = re.sub(r"\s+", "", text) if lang == "ja" else re.sub(r"\s+", " ", text)
+            for phrase in phrases:
+                probe = phrase.replace(" ", "") if lang == "ja" else phrase
+                assert probe in text, (lang, page, phrase)
+            if page.startswith("13-"):
+                stale = unscoped[lang].replace(" ", "") if lang == "ja" else unscoped[lang]
+                assert stale not in text, (lang, page)
 
 
 def test_manual_3_1_stops_the_run_only_for_the_watermarks_publication_write() -> None:

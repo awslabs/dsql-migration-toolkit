@@ -59,7 +59,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     카탈로그를 읽음), `USING INDEX`에는 유효한 고유 인덱스가 필요하며, `FULL`은 항상 동작하고, 파티션된
     테이블은 모든 파티션에 하나씩 필요함. 없으면 publication에 들어간 뒤 그 테이블의 모든
     `UPDATE`/`DELETE`가 publisher에서 실패하므로 CDC 사전 요구사항 검사가 실패로 판정하고 Full Load는
-    소스에서 아무것도 바꾸기 전에 멈춤(publication도 슬롯도 만들지 않음). binlog 보존에 해당하는 개념은
+    소스에서 아무것도 바꾸기 전에 멈춤(publication도 슬롯도 만들지 않음). 이 거부는 모두 그 원인을
+    해결하는 방법을 알려 줌: 새 기본 키는 `DEFAULT`만 고치며, `NOTHING`이나 인덱스가 사라진 `USING INDEX`는
+    `ALTER TABLE … REPLICA IDENTITY`(`FULL`, 또는 기본 키가 있으면 `DEFAULT`)로만 바뀜. binlog 보존에 해당하는 개념은
     없습니다: 도구가 Full Load 정합성 지점에서 **논리 복제 슬롯**과 **정확히 마이그레이션 대상 테이블만을
     범위로 하는 publication**을 생성하므로, WAL은 보존 기간이 아니라 슬롯에 의해 고정됩니다(`wal_status`를
     관찰하세요 — 비활성 슬롯은 소스 디스크를 가득 채울 수 있음). 복제 슬롯 / `max_wal_senders` 여유는

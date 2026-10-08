@@ -238,6 +238,10 @@ def _logs():
     return captured, (lambda ts, msg: captured.append(msg))
 
 
+# The SHA-256 of b"" -- the content of the size-0 artifact temp files (see _run_infra).
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
 class _FakeS3:
     """Fake S3 for the infra-deploy bucket+upload stages (always 'exists', skip)."""
 
@@ -267,8 +271,10 @@ class _FakeS3:
             # the size-0 temp files always "match" and put_object is never called, so a
             # put-based key-set assertion would be vacuously empty for both engines.
             raise RuntimeError("absent")
-        # Report a matching object so upload is skipped (no real file needed).
-        return {"ContentLength": 0, "ETag": '"x-1"'}
+        # Report a matching object so upload is skipped (no real file needed): the size-0
+        # temp files and the SHA-256 of b"" that upload_plugin stamps on every object (G21:
+        # a size match with a composite ETag alone no longer proves the content).
+        return {"ContentLength": 0, "ETag": '"x-1"', "Metadata": {"sha256": _EMPTY_SHA256}}
 
     def put_object(self, **kw):
         self.calls.append("put_object")
@@ -285,8 +291,8 @@ def _run_infra(handle, deployer, on_log, *, s3_client=None, **kw):
     """Drive run_cdc_infra_deploy with injected fake S3/STS clients.
 
     Patches s3_provision._artifact_paths to three real temp files (upload_plugin
-    requires the local file to exist); the fake S3 reports a size-0/composite
-    match so the actual upload is skipped.
+    requires the local file to exist); the fake S3 reports a size-0 object carrying
+    their SHA-256 so the actual upload is skipped.
     """
     import tempfile
 

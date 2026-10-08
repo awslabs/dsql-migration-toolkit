@@ -567,7 +567,7 @@ Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작�
   - **Retry unfinished tables**가 원래 워터마크 아래에서 그 테이블을 로드하며, 로드된 테이블은 모두 유지합니다. 그 로드는 먼저 CDC가 Full Load 이후 그 테이블을 공백 없이 캡처할 수 있는지 점검합니다. 점검이 실패하면 테이블은 로드되지 않으며, 그 행에 이유와 해야 할 일이 표시됩니다.
   - **비어 있는** Aurora DSQL 테이블에만 로드합니다. 테이블에 이미 행이 있으면 다이얼로그가 그 테이블을 drop 후 재적재합니다: 그 행들이 CDC가 그 테이블에 대해 캡처하는 변경(MySQL에서는 Full Load의 시작 지점 이후의 변경, PostgreSQL에서는 그 테이블이 CDC의 publication에 들어간 이후의 변경)보다 오래된 것인지 도구가 알 수 없고, append는 이미 있는 행을 모두 그대로 두기 때문입니다.
   - **MySQL:** Full Load는 자신이 로드하지 않는 이관 가능한 테이블의 시작 지점 정의를 기록하고, 로드는 그 정의를 테이블의 현재 정의와 비교합니다. 이전 버전의 Full Load나, 로드 후에 변환된 테이블에는 그런 기록이 없습니다: **Re-run all tables**를 사용하거나 체크를 해제하세요. 시작 지점 이후 정의가 바뀐 경우에도 Re-run all tables가 필요합니다.
-  - **PostgreSQL:** 도구는 소스에서 그 테이블을 CDC의 publication에 추가하고, 테이블을 복사하기 전에 이미 열려 있던 트랜잭션이 끝나기를 (최대 10분) 기다립니다. 그 시점에 테이블과 그 모든 파티션에는 소스에서 사용할 수 있는 `REPLICA IDENTITY`가 있어야 합니다: 기본 키, 유효한 identity 인덱스, 또는 `FULL`(재키잉된 테이블은 이미 `REPLICA IDENTITY FULL`이어야 합니다). 그렇지 않으면 publication에 들어간 뒤 그 테이블의 모든 UPDATE와 DELETE가 소스에서 실패하므로, 그 로드는 테이블을 추가하기 전에 거부합니다(identity를 읽을 수 없을 때도 거부합니다). 소스 사용자는 그 테이블과 publication의 소유자여야 합니다. 로드를 위해 추가했는데 그 로드가 실패한 테이블은 **Delete CDC infrastructure** 전까지 publication에 남으므로(CDC의 테이블 목록이 걸러 냅니다), 그때까지 그 테이블의 UPDATE와 DELETE에는 계속 그 replica identity가 필요합니다. **Delete CDC infrastructure**(슬롯과 publication을 drop함) 후에는 테이블을 추가하려면 Re-run all tables가 필요합니다.
+  - **PostgreSQL:** 도구는 소스에서 그 테이블을 CDC의 publication에 추가하고, 테이블을 복사하기 전에 이미 열려 있던 트랜잭션이 끝나기를 (최대 10분) 기다립니다. 그 시점에 테이블과 그 모든 파티션에는 소스에서 사용할 수 있는 `REPLICA IDENTITY`가 있어야 합니다: `DEFERRABLE`이 아닌 유효한 기본 키가 있는 `DEFAULT`, 유효한 고유 인덱스가 있는 `USING INDEX`, 또는 `FULL`(재키잉된 테이블은 이미 `REPLICA IDENTITY FULL`이어야 합니다). 그렇지 않으면 publication에 들어간 뒤 그 테이블의 모든 UPDATE와 DELETE가 소스에서 실패하므로, 그 로드는 테이블을 추가하기 전에 거부하며(identity를 읽을 수 없을 때도 거부합니다), 그 행은 찾은 원인에 맞는 해결 방법을 알려 줍니다. 소스 사용자는 그 테이블과 publication의 소유자여야 합니다. 로드를 위해 추가했는데 그 로드가 실패한 테이블은 **Delete CDC infrastructure** 전까지 publication에 남으므로(CDC의 테이블 목록이 걸러 냅니다), 그때까지 그 테이블의 UPDATE와 DELETE에는 계속 그 replica identity가 필요합니다. **Delete CDC infrastructure**(슬롯과 publication을 drop함) 후에는 테이블을 추가하려면 Re-run all tables가 필요합니다.
   - CDC는 **격리된 행이 없는** 로드 후에만 그 테이블을 캡처합니다.
   - **Change & reload는 CDC가 아직 캡처하지 않는 테이블을 drop 후 재적재하지 않습니다**(Full Load 후에 선택했거나, 격리된 행과 함께 로드된 테이블): Save가 그 테이블의 컬럼 규칙을 저장하고, Full Load 단계에서의 그 테이블의 로드가 규칙을 적용합니다.
   - **대가:** MySQL에서는 CDC가 Full Load의 시작 지점 이후 그 테이블에 일어난 모든 변경을 더 새로운 복사본 위에 재생하고, PostgreSQL에서는 그 테이블이 CDC의 publication에 들어간 이후(복사 직전)의 모든 변경을 그 복사본 위에 스트리밍합니다. 어느 쪽이든 결과는 수렴합니다. 이미 복사된 행과 고유 인덱스에서 잠깐 충돌하는 변경은 데드레터가 될 수 있으며, 그러면 Cut over는 CHECKSUM 검증을 기다립니다. MySQL에서는 Full Load 이후의 모든 변경을 binary log가 아직 보유하고 있어야 합니다. 그 테이블을 로드하기 전에 CDC 인프라를 배포했다면, 그 테이블의 Kafka 토픽은 인프라의 기본 파티션 수를 받습니다.
@@ -577,7 +577,7 @@ Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작�
 - **체크를 해제한 테이블에서만 생긴 실패는 더 이상 단계를 붙잡지 않습니다.** 단계는 Done으로 표시되고, Continue to CDC가 열리며, PostgreSQL에서는 CDC가 여전히 로드 때 만든 슬롯에서 재개합니다. Retry unfinished tables는 체크를 해제한 테이블을 다시 로드하지 않습니다.
 - **기다려야 할 때는 기다림으로 안내하며, Start over를 요구하지 않습니다:** Full Load, 외래 키 적용, 컷오버 DEFAULT 복원이 실행되는 동안, CDC 인프라를 생성하거나 삭제하는 동안, 실패한 생성이 계정에 남아 있는 동안(CDC 단계에서 삭제하세요), 그리고 페이지를 연 뒤 CDC 상태를 읽는 몇 초 동안입니다. CDC 상태를 읽을 수 없으면 CDC 단계가 그 이유를 보여 줍니다: AWS 접근을 고친 뒤 **Re-check CDC state**를 사용하세요.
 - **Unselect all은 허용됩니다**. 다만 Deploy CDC infrastructure와 Start CDC에는 선택된 테이블이 하나 이상 필요합니다.
-- **현재 집합으로 Re-run Full Load를 실행하면** 선택된 모든 테이블에 대한 새 워터마크를 잡습니다. PostgreSQL에서는 기존 publication을 재사용하고, 거기에 없는 선택된 테이블을 추가합니다(위와 같이 사용할 수 있는 `REPLICA IDENTITY`가 있을 때만: 그렇지 않으면 실행은 소스에서 아무것도 바꾸기 전에 멈추고 어느 테이블인지 알려 줍니다).
+- **현재 집합으로 Re-run Full Load를 실행하면** 선택된 모든 테이블에 대한 새 워터마크를 잡습니다. PostgreSQL에서는 기존 publication을 재사용하고, 거기에 없는 선택된 테이블을 추가합니다(위와 같이 사용할 수 있는 `REPLICA IDENTITY`가 있을 때만: 그렇지 않으면 실행은 소스에서 아무것도 바꾸기 전에 멈추고 어느 테이블인지와 그 원인에 맞는 해결 방법을 알려 줍니다).
 - **PostgreSQL에서 CDC가 Full Load의 슬롯에서 재개하면, publication에 체크를 해제한 테이블이 계속 남아 있습니다**(도구는 소스에서 그 테이블을 빼지 않습니다). 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start(캡처 대상 테이블의 로드가 끝나지 않았거나, **Re-snapshot every table instead**를 고르거나, CDC 인프라를 삭제한 뒤의 Start)에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다.
 - **외래 키.** 선택된 테이블은 체크를 해제한 테이블을 가리키는 외래 키를 유지합니다: Cut over에서 orphan 점검이, 부모 행이 복제되지 않은 키를 보고합니다.
 - **CDC를 한 번 시작하면, 그 뒤 멈췄더라도 집합은 다시 고정됩니다.**
@@ -801,7 +801,9 @@ Validation에서 그런 컬럼마다 표시되는 줄이 현재 세션에 적용
 
 ### 배포된 CDC 스택
 
-- **Delete + Deploy는 필요 없습니다.** 싱크 플러그인, 워커 설정, 스택 파라미터는 바뀌지 않았습니다.
+- **이 절의 변경에는 Delete + Deploy가 필요 없습니다.** 싱크 플러그인, 워커 설정, 스택 파라미터를
+  바꾸지 않습니다. 이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52), 그 전에 배포한 스택은
+  **Delete CDC infrastructure** 후 다시 배포해야 그 변경을 받습니다.
 - **0.1.561이 배포한 스택은 캡처 목록을 유지합니다.** 스택이 그 세션에 대한 0.1.561의
   `ColumnExcludeList`를 정확히 갖고 있으면, Start CDC는 이를 바이트 단위로 그대로 유지하고, 다른 커넥터
   파라미터(`MessageKeyColumns` 포함)도 0.1.561처럼 구성합니다. 따라서 실행 중인 파이프라인은 커넥터

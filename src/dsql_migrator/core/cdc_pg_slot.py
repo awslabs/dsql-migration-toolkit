@@ -118,15 +118,23 @@ class PgReplicaIdentityError(PgReplicationError):
     """A one-table add (G17) -- or the Full Load's provisioning of its publication (G20) --
     was refused BEFORE any write: a table has no replica identity PostgreSQL accepts for
     UPDATE/DELETE once it is published (``cause``, the value-free phrase of
-    :func:`replica_identity_problem`; for provisioning, the first refused table's), or
-    whether it has one could not be read (``unreadable``, ``cause`` None) -- fail closed,
-    never "usable"."""
+    :func:`replica_identity_problem`; for provisioning, the first refused table's -- and
+    ``remedy``, the fix for that cause, :func:`replica_identity_remedy`, set whenever
+    ``cause`` is), or whether it has one could not be read (``unreadable``, ``cause`` and
+    ``remedy`` None) -- fail closed, never "usable". Provisioning's lenient REPLICA IDENTITY
+    NOTHING refusal (:func:`_verify_tables_replicable`) raises it too (G21)."""
 
     def __init__(
-        self, message: str, *, cause: Optional[str] = None, unreadable: bool = False
+        self,
+        message: str,
+        *,
+        cause: Optional[str] = None,
+        remedy: Optional[str] = None,
+        unreadable: bool = False,
     ) -> None:
         super().__init__(message)
         self.cause = cause
+        self.remedy = remedy
         self.unreadable = unreadable
 
 
@@ -427,6 +435,29 @@ def replica_identity_problem(read: ReplicaIdentityUsability) -> Optional[str]:
     if read.identity == "i":
         return "REPLICA IDENTITY USING INDEX, but that index is gone or not valid"
     return "a REPLICA IDENTITY that PostgreSQL cannot use"
+
+
+def replica_identity_remedy(read: ReplicaIdentityUsability) -> str:
+    """The fix for one refused table, by its cause -- a lowercase phrase for mid-sentence use
+    (every refusal of an unusable replica identity names it, G21). Pure.
+
+    A new primary key does not repair NOTHING or a USING INDEX whose index is gone
+    (PostgreSQL keeps ``relreplident``; only ALTER TABLE ... REPLICA IDENTITY changes it),
+    and a DEFERRABLE key is no replica identity -- so "give it a primary key" fits DEFAULT
+    alone. A partitioned table's leaves carry the identity (ALTER TABLE on the parent does
+    not reach existing partitions); its own NOTHING is the parent's to fix.
+    """
+    if read.kind == "p":
+        if read.identity == "n":
+            return (
+                "set REPLICA IDENTITY FULL on it and on each partition"
+                if read.unusable_partitions > 0
+                else "set REPLICA IDENTITY FULL on it, or DEFAULT with a primary key"
+            )
+        return "set REPLICA IDENTITY FULL on each partition"
+    if read.identity == "d":
+        return "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"
+    return "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"
 
 
 REPLICA_IDENTITY_WEAK = "weak"
@@ -905,7 +936,12 @@ def pg_replication_objects_blocker(
     return None
 
 
-def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None:
+def _verify_tables_replicable(
+    connection: object,
+    tables: Sequence[str],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> None:
     """Raise if any table lacks a REPLICA IDENTITY usable for UPDATE/DELETE replication.
 
     A last-line source-safety guard at the write layer (independent of the advisory
@@ -924,6 +960,11 @@ def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None
     included, so nothing it refused before passes now. A one-table ADD after a Full Load
     (:func:`add_table_to_publication`, G17) runs the strict per-table
     :func:`_verify_table_publishable`.
+
+    A refusal is :class:`PgReplicaIdentityError` in the strict check's one-line format
+    (:func:`_publish_refusal_message`: the first table, how many more, and the fix -- a new
+    primary key does not clear NOTHING, only ALTER TABLE ... REPLICA IDENTITY does), with
+    one audit line per refused table through ``on_log`` (G21).
     """
     names = list(tables)
     if not names:
@@ -940,12 +981,23 @@ def _verify_tables_replicable(connection: object, tables: Sequence[str]) -> None
     except Exception:  # noqa: BLE001 - if unreadable, let the prereq gate own it
         return
     nothing = sorted(str(r[0]) for r in rows if str(r[1]) == "n")
-    if nothing:
-        raise PgReplicationError(
-            "cannot publish tables with REPLICA IDENTITY NOTHING (UPDATE/DELETE would "
-            f"fail on the source): {', '.join(nothing)}. Set a primary key or "
-            "ALTER TABLE ... REPLICA IDENTITY FULL before starting CDC."
-        )
+    if not nothing:
+        return
+    if on_log is not None:
+        for name in nothing:
+            on_log(f"refused before any write: {name} has REPLICA IDENTITY NOTHING")
+    # relkind is not read here: NOTHING's fix is the same for a plain table and for a
+    # partitioned table's own NOTHING, and this read claims no partition facts.
+    read = ReplicaIdentityUsability(
+        kind="r", identity="n", usable=False, unusable_partitions=0,
+        unusable_partition_names=(),
+    )
+    problem = "REPLICA IDENTITY NOTHING"  # replica_identity_problem's phrase for it
+    raise PgReplicaIdentityError(
+        _publish_refusal_message([(name, problem, read) for name in nothing], []),
+        cause=problem,
+        remedy=replica_identity_remedy(read),
+    )
 
 
 def _verify_table_publishable(connection: object, table: str, *, publication: str) -> None:
@@ -978,12 +1030,17 @@ def _verify_table_publishable(connection: object, table: str, *, publication: st
         )
     problem = replica_identity_problem(read)
     if problem:
+        remedy = replica_identity_remedy(read)
+        # One bounded line: its only displayed channel is the Full Load's error (a reused
+        # publication's ADD refused after the up-front check), whose first 300 characters the
+        # JobManager keeps -- the name clipped, partition names left to ``cause`` (the
+        # per-table row shows them).
         raise PgReplicaIdentityError(
-            f'cannot add {table} to publication "{publication}": it has no usable REPLICA '
-            f"IDENTITY ({problem}), so every UPDATE and DELETE on it would fail on the "
-            "source once published. Give it a primary key, or set REPLICA IDENTITY FULL "
-            "(on each partition of a partitioned table), then retry.",
+            f"{_clip_table_name(table)}: {problem.split(': ', 1)[0]}. Once published, every "
+            "UPDATE and DELETE on it would fail on the source, so it was not added: "
+            f"{remedy}, then re-run the Full Load.",
             cause=problem,
+            remedy=remedy,
         )
 
 
@@ -1004,28 +1061,6 @@ def _clip_table_name(name: str) -> str:
     return name[: _PUBLISH_NAME_LIMIT - 3] + "..."
 
 
-def _publish_remedy(read: ReplicaIdentityUsability) -> str:
-    """The fix for one refused table, by its cause. Pure.
-
-    A new primary key does not repair NOTHING or a USING INDEX whose index is gone
-    (PostgreSQL keeps ``relreplident``; only ALTER TABLE ... REPLICA IDENTITY changes it),
-    and a DEFERRABLE key is no replica identity -- so "give it a primary key" fits DEFAULT
-    alone. A partitioned table's leaves carry the identity (ALTER TABLE on the parent does
-    not reach existing partitions); its own NOTHING is the parent's to fix.
-    """
-    if read.kind == "p":
-        if read.identity == "n":
-            return (
-                "set REPLICA IDENTITY FULL on it and on each partition"
-                if read.unusable_partitions > 0
-                else "set REPLICA IDENTITY FULL on it, or DEFAULT with a primary key"
-            )
-        return "set REPLICA IDENTITY FULL on each partition"
-    if read.identity == "d":
-        return "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"
-    return "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"
-
-
 def _publish_refusal_message(
     unusable: "Sequence[tuple[str, str, ReplicaIdentityUsability]]",
     missing: Sequence[str],
@@ -1033,15 +1068,16 @@ def _publish_refusal_message(
     """The one-line refusal for :func:`_verify_tables_publishable`: the leading table (the
     first unusable one, else the first not found), its cause (partition names dropped:
     they are in the audit lines), how many more were refused, and the remedy for that
-    cause (:func:`_publish_remedy`). Pure."""
+    cause (:func:`replica_identity_remedy`). Pure."""
     others = len(unusable) + len(missing) - 1
     more = f" (+{others} more table{'s' if others != 1 else ''})" if others > 0 else ""
     if unusable:
         name, problem, read = unusable[0]
         cause = problem.split(": ", 1)[0]
+        remedy = replica_identity_remedy(read)
         return (
             f"{_clip_table_name(name)}: {cause}{more}. Published for CDC, its UPDATE/DELETE "
-            f"would fail on the source. Nothing was changed there: {_publish_remedy(read)}, "
+            f"would fail on the source. Nothing was changed there: {remedy}, "
             "then re-run the Full Load."
         )
     return (
@@ -1127,6 +1163,7 @@ def _verify_tables_publishable(
     raise PgReplicaIdentityError(
         _publish_refusal_message(unusable, missing),
         cause=unusable[0][1] if unusable else None,
+        remedy=replica_identity_remedy(unusable[0][2]) if unusable else None,
         unreadable=not unusable,
     )
 
@@ -1523,7 +1560,7 @@ def provision_pg_replication(
         widened=full_identity_tables,
         on_log=on_log,
     )
-    _verify_tables_replicable(connection, tables)
+    _verify_tables_replicable(connection, tables, on_log=on_log)
     # Re-keyed tables need the full before-image (leading key column) BEFORE the slot's LSN.
     set_replica_identity_full(connection, full_identity_tables, on_log=on_log)
     created_publication = create_publication(
@@ -1590,6 +1627,7 @@ __all__ = [
     "ReplicaIdentityUsability",
     "read_replica_identity_usability",
     "replica_identity_problem",
+    "replica_identity_remedy",
     "REPLICA_IDENTITY_WEAK",
     "REPLICA_IDENTITY_FULL",
     "REPLICA_IDENTITY_UNKNOWN",

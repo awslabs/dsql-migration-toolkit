@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from dsql_migrator.core import s3_provision
 from dsql_migrator.core.s3_provision import (
     S3ProvisionError,
     ensure_and_upload_plugins,
@@ -132,12 +133,174 @@ def test_upload_skips_when_size_and_etag_match(tmp_path: Path) -> None:
     assert not any(c[0] == "put_object" for c in s3.calls)
 
 
-def test_upload_skips_when_multipart_etag_and_size_match(tmp_path: Path) -> None:
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _puts(s3: _FakeS3) -> list[dict]:
+    return [c[1] for c in s3.calls if c[0] == "put_object"]
+
+
+_SKIP_LOG = "k: already up to date — skipping upload."
+
+
+def test_a_same_size_multipart_object_with_other_content_is_uploaded(tmp_path: Path) -> None:
+    # G21: size + a multipart ETag was taken as "unchanged", and the keys are
+    # version-independent, so a rebuilt plugin of the same byte size was never uploaded --
+    # Deploy registered the OLD bytes under the new PluginVersion, with no error.
     data = b"x" * 100
     p = _write(tmp_path, data)
-    s3 = _FakeS3(head_object={"ContentLength": 100, "ETag": '"abc-3"'})  # composite
+    s3 = _FakeS3(
+        head_object={
+            "ContentLength": 100,
+            "ETag": '"abc-3"',  # composite: not a digest of the bytes
+            "Metadata": {"sha256": _sha256(b"y" * 100)},
+        }
+    )
+    logs: list[str] = []
+    upload_plugin(s3, "b", "k", p, on_progress=logs.append)
+    puts = _puts(s3)
+    assert len(puts) == 1
+    assert puts[0]["Metadata"] == {"sha256": _sha256(data)}
+    assert _SKIP_LOG not in logs
+
+
+def test_a_same_size_object_without_the_hash_is_uploaded_once(tmp_path: Path) -> None:
+    # An object an earlier version uploaded carries no hash, and its multipart ETag proves
+    # nothing: it is uploaded once more, with the hash -- and from then on it is skipped.
+    data = b"x" * 100
+    p = _write(tmp_path, data)
+    legacy = _FakeS3(head_object={"ContentLength": 100, "ETag": '"abc-3"'})
+    upload_plugin(legacy, "b", "k", p)
+    puts = _puts(legacy)
+    assert len(puts) == 1
+    assert puts[0]["Metadata"] == {"sha256": _sha256(data)}
+
+    stamped = _FakeS3(
+        head_object={
+            "ContentLength": 100,
+            "ETag": '"abc-3"',
+            "Metadata": puts[0]["Metadata"],
+        }
+    )
+    logs: list[str] = []
+    upload_plugin(stamped, "b", "k", p, on_progress=logs.append)
+    assert _puts(stamped) == []
+    assert logs == [_SKIP_LOG]
+
+
+def test_the_hash_covers_every_byte_of_a_multi_chunk_artifact(tmp_path: Path) -> None:
+    # The real artifacts are up to ~31 MiB and are hashed 1 MiB at a time. A hash of only the
+    # first chunk would stay self-consistent (it is both what an upload stamps and what a
+    # deploy compares), so a same-size rebuild that differs only after the first MiB would be
+    # "proven" identical and the OLD bytes kept registered. Round trip: the old build's stamp,
+    # on a same-size multipart object, must not skip the new build.
+    mib = 1024 * 1024
+    old = b"x" * mib + b"old tail"
+    first = _FakeS3(head_object=None)
+    upload_plugin(first, "b", "k", _write(tmp_path, old))
+    (stamp,) = [put["Metadata"] for put in _puts(first)]
+    assert stamp == {"sha256": _sha256(old)}
+
+    new = b"x" * mib + b"new tail"  # the rebuild: same size, same first MiB
+    s3 = _FakeS3(head_object={"ContentLength": len(new), "ETag": '"abc-2"', "Metadata": stamp})
+    logs: list[str] = []
+    upload_plugin(s3, "b", "k", _write(tmp_path, new), on_progress=logs.append)
+    puts = _puts(s3)
+    assert len(puts) == 1
+    assert puts[0]["Metadata"] == {"sha256": _sha256(new)}
+    assert _SKIP_LOG not in logs
+
+
+def test_upload_skips_when_size_and_stored_sha256_match(tmp_path: Path) -> None:
+    data = b"x" * 100
+    p = _write(tmp_path, data)
+    s3 = _FakeS3(
+        head_object={
+            "ContentLength": 100,
+            "ETag": '"abc-3"',
+            "Metadata": {"sha256": _sha256(data)},
+        }
+    )
+    logs: list[str] = []
+    upload_plugin(s3, "b", "k", p, on_progress=logs.append)
+    assert _puts(s3) == []
+    assert logs == [_SKIP_LOG]
+
+
+def test_a_matching_hash_does_not_skip_a_different_size(tmp_path: Path) -> None:
+    data = b"x" * 100
+    p = _write(tmp_path, data)
+    s3 = _FakeS3(
+        head_object={
+            "ContentLength": 99,
+            "ETag": '"abc-3"',
+            "Metadata": {"sha256": _sha256(data)},
+        }
+    )
     upload_plugin(s3, "b", "k", p)
-    assert not any(c[0] == "put_object" for c in s3.calls)
+    assert len(_puts(s3)) == 1
+
+
+def test_a_same_size_single_part_object_with_another_md5_is_uploaded(tmp_path: Path) -> None:
+    data = b"hello world"
+    p = _write(tmp_path, data)
+    # A plain (single-part) ETag IS the MD5 of the object: another digest, other bytes.
+    other = hashlib.md5(b"HELLO WORLD", usedforsecurity=False).hexdigest()  # noqa: S324
+    s3 = _FakeS3(head_object={"ContentLength": len(data), "ETag": f'"{other}"'})
+    logs: list[str] = []
+    upload_plugin(s3, "b", "k", p, on_progress=logs.append)
+    assert len(_puts(s3)) == 1
+    assert _SKIP_LOG not in logs
+
+
+def test_upload_file_receives_the_hash_as_user_metadata(tmp_path: Path) -> None:
+    data = b"z" * 10
+    p = _write(tmp_path, data)
+
+    class _ManagedS3(_FakeS3):
+        def upload_file(self, filename, bucket, key, ExtraArgs=None):  # noqa: N803
+            self.calls.append(
+                (
+                    "upload_file",
+                    {
+                        "Filename": filename,
+                        "Bucket": bucket,
+                        "Key": key,
+                        "ExtraArgs": ExtraArgs,
+                    },
+                )
+            )
+
+    s3 = _ManagedS3(head_object=None)
+    upload_plugin(s3, "b", "k", p)
+    (call,) = [c[1] for c in s3.calls if c[0] == "upload_file"]
+    assert call["Filename"] == str(p)
+    assert (call["Bucket"], call["Key"]) == ("b", "k")
+    assert call["ExtraArgs"] == {"Metadata": {"sha256": _sha256(data)}}
+    assert _puts(s3) == []
+
+
+def test_boto3_accepts_metadata_on_a_managed_upload() -> None:
+    # upload_file rejects an ExtraArgs key outside ALLOWED_UPLOAD_ARGS ("Invalid extra_args
+    # key"), which would fail EVERY deploy's upload: pin it against the installed s3transfer.
+    from s3transfer.manager import TransferManager
+
+    assert "Metadata" in TransferManager.ALLOWED_UPLOAD_ARGS
+
+
+def test_a_local_read_failure_is_an_s3_provision_error(tmp_path: Path, monkeypatch) -> None:
+    p = _write(tmp_path, b"data")
+
+    def _unreadable(path: Path) -> str:
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr(s3_provision, "_local_sha256", _unreadable)
+    s3 = _FakeS3(head_object=None)
+    with pytest.raises(S3ProvisionError) as exc:
+        upload_plugin(s3, "b", "k", p)
+    assert "Input/output error" in str(exc.value)
+    assert _puts(s3) == []
 
 
 def test_upload_when_size_differs(tmp_path: Path) -> None:
@@ -151,7 +314,9 @@ def test_upload_when_object_absent(tmp_path: Path) -> None:
     p = _write(tmp_path, b"data")
     s3 = _FakeS3(head_object=None)
     upload_plugin(s3, "b", "k", p)
-    assert any(c[0] == "put_object" for c in s3.calls)
+    puts = _puts(s3)
+    assert len(puts) == 1
+    assert puts[0]["Metadata"] == {"sha256": _sha256(b"data")}
 
 
 def test_upload_missing_local_file_raises(tmp_path: Path) -> None:

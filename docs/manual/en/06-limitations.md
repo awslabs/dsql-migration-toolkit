@@ -67,7 +67,10 @@ fails **loudly** where it can't.
     partitioned table every partition needs one. Without one, every `UPDATE`/`DELETE` on
     the table would fail on the publisher once it is published, so the CDC prerequisite
     check fails it and the Full Load stops before it changes anything on the source (no
-    publication, no slot). There is no binlog-retention analog: the tool creates a
+    publication, no slot). Each refusal names the fix for its cause: a new primary key
+    repairs only `DEFAULT`; `NOTHING`, or a `USING INDEX` whose index is gone, changes
+    only with `ALTER TABLE … REPLICA IDENTITY` (`FULL`, or `DEFAULT` with a primary key).
+    There is no binlog-retention analog: the tool creates a
     **logical replication slot** and a **publication scoped to exactly the migrated
     tables** at the Full Load consistency point, so WAL is pinned by the slot instead of
     by a retention window (watch `wal_status` — an inactive slot can fill the source

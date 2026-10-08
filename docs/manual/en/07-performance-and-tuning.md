@@ -23,8 +23,10 @@ large-scale migration, this is the technical case.
 ### OCC retry of small, idempotent transactions
 
 Aurora DSQL is **lock-free**: it never takes row locks, and detects write
-conflicts **at commit time**, returning `SQLSTATE 40001` (a serialization
-failure — `OC000` data conflict or `OC001` schema conflict). The losing
+conflicts **at commit time** (`OC000`). A schema conflict (`OC001`: the session's
+cached schema is behind after a DDL, `GRANT` or `REVOKE` elsewhere on the cluster,
+such as an asynchronous index build finishing) can also come while a statement
+runs. Both return `SQLSTATE 40001` (a serialization failure). The losing
 transaction must **re-run**, and AWS explicitly notes that with OCC, "applications
 [must] exercise this logic **more frequently**" than with lock-based databases.
 
@@ -34,6 +36,9 @@ re-run is cheap and safe. A Full Load batch is one multi-row `INSERT` of at most
 3,000 rows in its own transaction; the CDC sink applies a chunk of at most 3,000
 rows in one transaction (one row per transaction while it isolates a rejected
 row). Every write is keyed by primary key, so applying one twice changes nothing.
+Each re-run starts on a clean transaction: the sink (plugin v52 or later) rolls
+back what the failed attempt left before it runs the transaction again (a Full
+Load batch runs in autocommit, so a failed one leaves nothing open).
 A `40001` is retried with exponential backoff (50 ms base, 5 s cap) and full
 jitter, up to 20 attempts per Full Load batch (a budget it shares with dropped
 connections and expired IAM tokens) and up to 10 per sink transaction, so workers

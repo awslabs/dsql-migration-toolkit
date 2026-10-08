@@ -69,7 +69,9 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  *
  * <ul>
  *   <li><b>OCC 40001</b> — serialization failure: the whole transaction is re-run
- *       ({@link OccRetry}: the chunk, or one row). Safe because apply is idempotent.</li>
+ *       ({@link OccRetry}: the chunk, or one row), each time on a clean transaction (the
+ *       failed attempt is rolled back first: a schema conflict can come when a statement runs,
+ *       not only at COMMIT). Safe because apply is idempotent.</li>
  *   <li><b>Connectivity</b> — closed/expired connection (1h DSQL timeout, token
  *       expiry): reconnect and retry.</li>
  *   <li><b>Permanent</b> — any other SQLSTATE: do NOT retry; report the offending
@@ -623,6 +625,7 @@ public class DsqlSinkTask extends SinkTask {
             conn.commit();
             return null;
           },
+          this::rollbackBeforeRetry,
           config.maxRetries(),
           config.retryBackoffMs());
       recordOps(chunk); // committed: count the chunk's per-table applied ops
@@ -675,6 +678,7 @@ public class DsqlSinkTask extends SinkTask {
               conn.commit();
               return null;
             },
+            this::rollbackBeforeRetry,
             config.maxRetries(),
             config.retryBackoffMs());
         recordOps(a.event()); // committed this row: count its applied op
@@ -770,7 +774,10 @@ public class DsqlSinkTask extends SinkTask {
     }
     try {
       return OccRetry.withRetry(
-          () -> loadTargetTypes(key[0], key[1]), config.maxRetries(), config.retryBackoffMs());
+          () -> loadTargetTypes(key[0], key[1]),
+          this::rollbackBeforeRetry,
+          config.maxRetries(),
+          config.retryBackoffMs());
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
@@ -849,6 +856,7 @@ public class DsqlSinkTask extends SinkTask {
     try {
       return OccRetry.withRetry(
           () -> loadSourceKeyIndex(key[0], key[1], columns),
+          this::rollbackBeforeRetry,
           config.maxRetries(),
           config.retryBackoffMs());
     } catch (SQLException e) {
@@ -1602,11 +1610,25 @@ public class DsqlSinkTask extends SinkTask {
    * ~1 read-only transaction per applied row in DSQL's TotalTransactions metric).
    * The parameter types are identical for every row of a given SQL, so one fetch
    * per statement is all that is needed.
+   *
+   * <p>A {@code 40001} is rethrown, not swallowed: it is the transaction's OCC conflict
+   * (OC001), not a driver limitation. Swallowed inside an open transaction it left the
+   * transaction aborted (25P02 on the next execute, never retried); at a transaction's start it
+   * bound a TINYINT(1) 0/1 without the boolean conversion (42804: dead-lettered, and a false
+   * TYPE_CHANGE cool-down). Any other failure still falls back to plain {@code setObject}
+   * binding.
    */
-  private static java.sql.ParameterMetaData paramMetaOrNull(PreparedStatement ps) {
+  private static java.sql.ParameterMetaData paramMetaOrNull(PreparedStatement ps)
+      throws SQLException {
     try {
       return ps.getParameterMetaData();
-    } catch (SQLException ignored) {
+    } catch (SQLException e) {
+      if (OCC_SQLSTATE.equals(e.getSQLState())) {
+        // An OCC conflict (OC001: a stale catalog) is the transaction's, not the driver's:
+        // swallowed, it left an open transaction aborted, or bound a 0/1 without the boolean
+        // conversion. OccRetry rolls back and re-runs the transaction.
+        throw e;
+      }
       return null; // fall back to plain setObject binding
     }
   }
@@ -1645,6 +1667,28 @@ public class DsqlSinkTask extends SinkTask {
       }
     } catch (SQLException ignored) {
       // best-effort
+    }
+  }
+
+  /**
+   * {@link OccRetry}'s step between attempts: roll back what the failed attempt left, so the
+   * next attempt starts on a clean transaction (after a COMMIT-time 40001 there is nothing to
+   * roll back and pgjdbc sends nothing). If the rollback itself fails, the connection is
+   * dropped, so the next attempt opens a new session instead of running on a transaction in
+   * an unknown state. Package-private for tests.
+   */
+  void rollbackBeforeRetry() {
+    try {
+      if (connection != null && !connection.isClosed()) {
+        connection.rollback();
+      }
+    } catch (SQLException e) {
+      // SQLSTATE only: the driver message is not logged (Property 7).
+      log.warn(
+          "Could not roll back an OCC-conflicted attempt (sqlstate={}); the retry opens a new "
+              + "connection",
+          e.getSQLState());
+      discardConnection();
     }
   }
 

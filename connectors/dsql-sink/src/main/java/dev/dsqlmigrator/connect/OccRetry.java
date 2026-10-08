@@ -23,10 +23,16 @@ import java.util.function.LongUnaryOperator;
  * conflicted transaction (the sink's whole chunk, or one row's) is safe
  * (Property 5 analog). Spike H2 measures throughput under contention.
  *
- * <p>No rollback runs between attempts: this relies on DSQL reporting the
- * conflict at COMMIT, which has already ended the transaction. A 40001 raised
- * before COMMIT would leave the transaction aborted, so the next attempt fails
- * with 25P02, which is not retried.
+ * <p><b>Every attempt starts on a clean transaction.</b> After a {@code 40001}, and only when
+ * another attempt follows, the caller's {@code rollback} runs before the backoff. Aurora DSQL
+ * reports a write conflict (OC000) at COMMIT, which already ended the transaction (the rollback
+ * then sends nothing), but a schema conflict (OC001: the session's cached catalog is behind
+ * after a DDL, GRANT or REVOKE elsewhere on the cluster, such as an asynchronous index build
+ * finishing) can come when a statement runs -- and that failed statement leaves the transaction
+ * aborted, so without the rollback every statement of the next attempt failed with 25P02,
+ * which is not retried. The retry stays on the same session, whose catalog Aurora DSQL
+ * refreshes. After the last attempt, and for any other error, nothing runs here: the caller's
+ * error path rolls back.
  *
  * <p>The sleeper and jitter source are injectable (package-private overload) so
  * the retry policy is unit-tested instantly and deterministically without real
@@ -53,10 +59,15 @@ public final class OccRetry {
     void sleep(long millis) throws InterruptedException;
   }
 
-  /** Production entry point: real sleep, real jitter. */
-  public static <T> T withRetry(SqlWork<T> work, int maxAttempts, long baseBackoffMs)
+  /**
+   * Production entry point: real sleep, real jitter. {@code rollback} must leave the
+   * connection with no open transaction; it runs between attempts only.
+   */
+  public static <T> T withRetry(
+      SqlWork<T> work, Runnable rollback, int maxAttempts, long baseBackoffMs)
       throws SQLException {
-    return withRetry(work, maxAttempts, baseBackoffMs, Thread::sleep, OccRetry::fullJitter);
+    return withRetry(
+        work, rollback, maxAttempts, baseBackoffMs, Thread::sleep, OccRetry::fullJitter);
   }
 
   /**
@@ -65,6 +76,7 @@ public final class OccRetry {
    */
   static <T> T withRetry(
       SqlWork<T> work,
+      Runnable rollback,
       int maxAttempts,
       long baseBackoffMs,
       Sleeper sleeper,
@@ -82,6 +94,7 @@ public final class OccRetry {
         if (!OCC_SQLSTATE.equals(e.getSQLState()) || attempt >= maxAttempts) {
           throw e;
         }
+        rollback.run(); // the next attempt starts on a clean transaction
         long capped = backoffCapMs(attempt, baseBackoffMs);
         long delay = jitter.applyAsLong(capped + 1);
         try {
