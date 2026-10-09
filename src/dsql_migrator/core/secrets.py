@@ -136,7 +136,7 @@ def _access_denied_message(secret_id: str) -> str:
             "task role to the key's policy."
         )
     return (
-        f"Access denied reading the secret. This deployment is granted exactly one "
+        f"Access denied reading the secret. This deployment is granted one source "
         f"secret -- '{granted}' -- and '{secret_id}' is a different one. Update the app "
         "stack's SourceSecretArn parameter to this secret, or connect with a username "
         "and password instead."

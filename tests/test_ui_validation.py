@@ -8425,3 +8425,42 @@ def test_a_checksum_after_a_step_1_refresh_renders_the_new_type_4b_4c() -> None:
     scale = _mysql_checksum_expr(ColumnDef(name="amt", mysql_type="decimal(12,4)",
                                            target_type="numeric(12,4)"))
     assert scale == "CAST(`amt` AS DECIMAL(65, 4))"
+
+
+def test_postgres_drift_explains_why_it_is_not_compared() -> None:
+    """Live PG E2E (2026-10-09): a PostgreSQL run said the source "did not report ... a
+    PostgreSQL WAL LSN", which reads as a malfunction. Drift by LSN is deliberately not
+    computed (an idle PostgreSQL source advances its LSN), so the screen says that."""
+    import inspect
+
+    from dsql_migrator.core.models import ValidationReport
+    from dsql_migrator.core.validator import _build_drift
+    from dsql_migrator.ui import validation as v
+
+    class _Wm:
+        gtid_executed = None
+        binlog_file = None
+        binlog_position = None
+
+    report = ValidationReport.model_construct(drift=_build_drift(_Wm(), None, source_is_postgres=True))
+    display = v.format_drift(report, postgres_source=True)
+    assert display.postgres_source is True and display.determinable is False
+    assert "PostgreSQL" in display.summary and "did not report" not in display.summary
+    tone, _header, body = v.drift_verdict(display, cdc_in_use=True)
+    assert tone == "info"
+    assert "advances its WAL LSN on its own" in body
+    assert "did not report" not in body
+    # Both screens hand the session's engine in (the persisted report has no engine field).
+    src = inspect.getsource(v)
+    assert 'postgres_source=_source_engine_word(session) == "PostgreSQL"' in src
+    assert 'format_drift(report, postgres_source=engine == "PostgreSQL")' in src
+
+
+def test_mysql_undeterminable_drift_no_longer_mentions_a_wal_lsn() -> None:
+    from dsql_migrator.ui.validation import drift_verdict
+
+    _tone, _header, body = drift_verdict(
+        _drifted_display(determinable=False), cdc_in_use=False
+    )
+    assert "WAL LSN" not in body
+    assert "GTID or binlog position" in body

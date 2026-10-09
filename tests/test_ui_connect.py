@@ -1001,3 +1001,19 @@ def test_a_prefilled_credential_field_says_where_the_value_came_from() -> None:
         if node.args and isinstance(node.args[0], ast.Constant)
     }
     assert keys == {"secret", "endpoint"}, keys
+
+
+def test_the_target_region_is_parsed_from_the_prefilled_granted_endpoint() -> None:
+    """Live PG E2E (2026-10-09): the granted endpoint was prefilled but the region was
+    parsed only from a configured default endpoint, so the region field started blank and
+    Test target connection failed until it was typed."""
+    import ast
+
+    from dsql_migrator.ui.connect import parse_region_from_endpoint
+
+    src = ast.unparse(_connect_page_tree()).replace('"', "'")
+    assert "parse_region_from_endpoint(str(tgt_endpoint or ''))" in src, src
+    assert src.index("tgt_endpoint = _eff(") < src.index("tgt_region = _eff(")
+    assert parse_region_from_endpoint("abcdefghijklmnopqrstuvwxyz.dsql.ap-northeast-2.on.aws") == (
+        "ap-northeast-2"
+    )

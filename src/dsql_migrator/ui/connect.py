@@ -401,9 +401,9 @@ def check_target_connection(
 # assertion still passing on the source text.
 _PREFILL_PROVENANCE = {
     "secret": (
-        "Prefilled from this deployment: its app stack's SourceSecretArn parameter. Only "
-        "this secret is readable by the task role, so another ARN will fail the connection "
-        "test with AccessDenied."
+        "Prefilled from this deployment: its app stack's SourceSecretArn parameter, the "
+        "source secret its task role is granted. Another ARN fails the connection test with "
+        "AccessDenied unless the task role is granted that secret too."
     ),
     "endpoint": (
         "Prefilled from this deployment: its app stack's DsqlClusterArn parameter. Aurora "
@@ -624,9 +624,12 @@ def build_connect_page(
         getattr(_tc, "cluster_endpoint", None),
         d.target_endpoint or _granted_endpoint or "",
     )
+    # Parsed from the endpoint the field actually starts with: the configured default OR the
+    # granted one. Parsing only the configured default left the region blank beside a
+    # prefilled granted endpoint, and Test target connection failed until it was typed.
     tgt_region = _eff(
         getattr(_tc, "region", None),
-        d.target_region or parse_region_from_endpoint(d.target_endpoint or "") or "",
+        d.target_region or parse_region_from_endpoint(str(tgt_endpoint or "")) or "",
     )
     # No tgt_database default: Aurora DSQL's single database ("postgres") is fixed
     # by build_target_config, so the form has no database field.

@@ -23927,7 +23927,9 @@ def test_start_over_reset_preserves_the_multi_stack_teardown_queue() -> None:
     assert after.cdc_teardown_queue == [
         ("j1", "dsql-cdc-a"), ("j2", "dsql-cdc-b"), ("j3", "dsql-cdc-c")
     ]
-    assert after.cdc_teardown_done.get("stacks") == ["dsql-cdc-z"]
+    # A FINISHED teardown is history from before this fresh journey (live PG E2E,
+    # 2026-10-09): Start over clears it; the live job and queue above survive.
+    assert after.cdc_teardown_done == {}
 
 
 def test_a_preserved_queue_makes_the_multi_stack_banner_work() -> None:
@@ -34836,3 +34838,119 @@ def test_g20_the_worker_refresh_caches_the_gtid_mode_record(monkeypatch) -> None
         "Start CDC blocked: the CDC stack changed after this page last read it"
     )
     assert run["state"].cdc_deployed_gtid_mode == "OFF"
+
+
+def _young_group_controller(streams, *, pages_token=None, boom=False):
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.msk_connect_controller import MskConnectController
+
+    controller = MskConnectController(region="us-east-1")
+    now = datetime(2026, 10, 9, 3, 0, tzinfo=timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    calls = []
+
+    class _Logs:
+        def filter_log_events(self, **_kwargs):
+            return {"events": []}
+
+        def describe_log_streams(self, **kwargs):
+            calls.append(kwargs)
+            if boom:
+                raise RuntimeError("AccessDenied")
+            out = {"logStreams": [
+                {"logStreamName": n, "creationTime": now_ms - age_s * 1000}
+                for n, age_s in streams
+            ]}
+            if pages_token:
+                out["nextToken"] = pages_token
+            return out
+
+    controller._client = lambda _svc: _Logs()  # type: ignore[assignment]
+    controller.dlq_errors("/msk-connect/x", now=now)
+    return controller, calls
+
+
+def test_a_young_log_group_is_not_called_a_lower_bound() -> None:
+    """Live PG E2E (2026-10-09): a cdc-stack created under an hour earlier was told its
+    dead-letter count was a floor "read from the last 6h only". Every log stream starting
+    inside the look-back window proves the read saw the whole history."""
+    controller, calls = _young_group_controller([("w1", 3000), ("w2", 1200)])
+    assert controller.dlq_coverage_bound("/msk-connect/x") is None
+    assert len(calls) == 1
+    controller.dlq_errors("/msk-connect/x")  # checked once per group
+    assert len(calls) == 1
+
+
+def test_a_stream_older_than_the_window_keeps_the_bound() -> None:
+    controller, _ = _young_group_controller([("w1", 3000), ("old", 7 * 3600)])
+    assert "6h" in (controller.dlq_coverage_bound("/msk-connect/x") or "")
+
+
+def test_an_unreadable_or_endless_stream_list_keeps_the_bound() -> None:
+    controller, _ = _young_group_controller([("w1", 60)], boom=True)
+    assert controller.dlq_coverage_bound("/msk-connect/x") is not None
+    controller, calls = _young_group_controller([("w1", 60)], pages_token="more")
+    assert controller.dlq_coverage_bound("/msk-connect/x") is not None
+    assert len(calls) == 5
+
+
+def test_the_reload_dialog_summary_follows_the_ticks(monkeypatch) -> None:
+    """Live PG E2E (2026-10-09): with ONE table ticked the reload dialog still read "4 tables
+    selected for Full Load" (and "4 selected table(s) already contain data") above a Drop &
+    reload that dropped only the ticked one."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import ChunkState, MigrationJob
+
+    monkeypatch.setattr(
+        _ConfirmDialogUi._El, "set_text",
+        lambda self, text: self._ui.texts.append(f"SET:{text}"), raising=False,
+    )
+    job = MigrationJob(job_id="j1")
+    job.status = "DONE"
+    job.progress_pct = 100.0
+    job.chunks = [
+        ChunkState(chunk_id=n, status="DONE", rows_loaded=5, attempts=1)
+        for n in ("shop.a", "shop.b", "shop.c")
+    ]
+    ui = _open_full_load_confirm_dialog(
+        monkeypatch, recreate_candidates=[], selected_names=["shop.a", "shop.b", "shop.c"],
+        job=job, status=StepStatus.DONE, retry_tables=lambda names: None,
+        click="Reload specific tables",
+    )
+    dialog = " ".join(ui.texts[ui.texts.index("Reload selected tables?"):])
+    assert "3 tables selected for Full Load" not in dialog
+    assert "No tables ticked yet" in dialog
+    tick = [h for h in ui.checkbox_handlers if callable(h)]
+    tick[0](SimpleNamespace(value=True))
+    assert ui.texts[-1].startswith("SET:1 table selected for Full Load."), ui.texts[-3:]
+
+
+def test_the_confirm_summary_names_the_pg_cdc_source_writes() -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._full_load_ui import (
+        full_load_confirm_summary,
+        with_data_choice_text,
+    )
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    pg = full_load_confirm_summary(["t"], SourceType.POSTGRES, MigrationType.FULL_LOAD_AND_CDC)
+    assert "publication and replication slot" in pg and "read only" not in pg
+    for engine, mtype in (
+        (SourceType.POSTGRES, MigrationType.FULL_LOAD_ONLY),
+        (SourceType.MYSQL, MigrationType.FULL_LOAD_AND_CDC),
+    ):
+        assert full_load_confirm_summary(["t"], engine, mtype).endswith(
+            "the source is accessed read only."
+        )
+    assert with_data_choice_text(1, ticked_scope=True).startswith("1 ticked table already contains")
+    assert with_data_choice_text(4, ticked_scope=False).startswith("4 selected table(s)")
+    assert with_data_choice_text(0, ticked_scope=True).startswith("No ticked table holds data")
+
+
+def test_a_stream_created_at_the_window_edge_keeps_the_bound() -> None:
+    # A line can carry a timestamp a little before its stream's creation (delivery lag), so
+    # a stream created within the ingest grace of the window start does not prove coverage.
+    controller, _ = _young_group_controller([("edge", 6 * 3600 - 60)])
+    assert controller.dlq_coverage_bound("/msk-connect/x") is not None

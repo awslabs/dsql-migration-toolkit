@@ -310,6 +310,47 @@ def format_selected_workloads(names: Sequence[str]) -> str:
     return f"{count} {noun} selected for Full Load"
 
 
+def full_load_confirm_summary(names: Sequence[str], engine, migration_type) -> str:
+    """The Full Load confirm dialog's summary line for the tables this run loads. Pure.
+
+    "The source is accessed read only" is false for a PostgreSQL Full load + CDC: the load
+    creates (or reuses) the CDC publication and replication slot on the source, and sets
+    REPLICA IDENTITY FULL on a table whose CDC key was changed (provision_pg_replication).
+    """
+    if not names:
+        # A tick-to-choose dialog before the first tick (its confirm stays disabled).
+        return "No tables ticked yet: tick the tables to load below."
+    if engine is SourceType.POSTGRES and migration_type is MigrationType.FULL_LOAD_AND_CDC:
+        source = (
+            "the source's tables are only read, but the tool also creates or reuses the CDC "
+            "publication and replication slot on the source (and sets REPLICA IDENTITY FULL "
+            "on a table whose CDC key was changed)"
+        )
+    else:
+        source = "the source is accessed read only"
+    return (
+        f"{format_selected_workloads(names)}. The target tables will receive the snapshot "
+        f"rows; {source}."
+    )
+
+
+def with_data_choice_text(count: int, *, ticked_scope: bool) -> str:
+    """The Append / Drop & reload card's lead for ``count`` tables holding data. Pure.
+
+    In a tick-to-choose dialog (Reload specific tables, Retry) the count follows the ticks:
+    it counted every loaded table, so one ticked table read as "4 selected table(s) already
+    contain data" above a Drop & reload choice that drops only the ticked one."""
+    noun = "table" if count == 1 else "tables"
+    if ticked_scope and count == 0:
+        return "No ticked table holds data on the target yet; this choice applies to any that does:"
+    if ticked_scope:
+        return (
+            f"{count} ticked {noun} already contain{'s' if count == 1 else ''} data on the "
+            "target. Choose how to load them:"
+        )
+    return f"{count} selected table(s) already contain data on the target. Choose how to load them:"
+
+
 def _overlay_statement_facts(view, facts, name, *, from_ddl):
     """The facts one table's overlay statements are built from: the applied DDL for a
     table this run recreates (or when the target could not be read), else the live
@@ -712,10 +753,13 @@ def _render_full_load_step(
 
                 confirm_dialog.on_value_change(_on_close)
                 ui.label(title).classes("text-lg font-semibold")
-                ui.label(
-                    f"{format_selected_workloads(action_tables)}. The target "
-                    "tables will receive the snapshot rows; the source is accessed "
-                    "read only."
+                _migration_type = getattr(migration_state, "migration_type", None)
+
+                def _ticked(names) -> list:
+                    return [n for n in names if n in checked] if selectable else list(names)
+
+                summary_label = ui.label(
+                    full_load_confirm_summary(_ticked(action_tables), _engine, _migration_type)
                 ).classes("text-sm")
                 # Missing target tables an append can't create -> warn BEFORE the load
                 # (rather than letting it fail per table, then risk a standing CDC gap).
@@ -859,13 +903,17 @@ def _render_full_load_step(
                     with ui.card().classes(
                         "w-full bg-amber-50 border border-amber-200 gap-2"
                     ):
-                        ui.label(
-                            f"{len(radio_tables)} selected table(s) already "
-                            "contain data on the target. Choose how to load them:"
+                        with_data_label = ui.label(
+                            with_data_choice_text(
+                                len(_ticked(radio_tables)), ticked_scope=selectable
+                            )
                         ).classes("text-sm text-gray-800")
-                        with ui.row().classes("items-center gap-1 flex-wrap"):
-                            for name in radio_tables:
-                                ui.badge(name).props("color=amber-8 outline")
+                        # A tick-to-choose dialog names its tables in the checklist above;
+                        # badges of every loaded table here would contradict the ticks.
+                        if not selectable:
+                            with ui.row().classes("items-center gap-1 flex-wrap"):
+                                for name in radio_tables:
+                                    ui.badge(name).props("color=amber-8 outline")
                         reload_choice = ui.radio(
                             {
                                 "append": "Append — keep existing rows, load only "
@@ -957,6 +1005,19 @@ def _render_full_load_step(
                         text, color = _label_and_color(mode)
                         start_btn.set_text(text)
                         start_btn.props(f"color={color}")
+                        if selectable:
+                            # The summary and the with-data count follow the ticks.
+                            summary_label.set_text(
+                                full_load_confirm_summary(
+                                    _ticked(action_tables), _engine, _migration_type
+                                )
+                            )
+                            if radio_tables and not cdc_live_now:
+                                with_data_label.set_text(
+                                    with_data_choice_text(
+                                        len(_ticked(radio_tables)), ticked_scope=True
+                                    )
+                                )
                         # Disabled when the retry checklist has nothing ticked, or the
                         # record of excluded-column changes could not be read.
                         if (selectable and not checked) or ledger_error:

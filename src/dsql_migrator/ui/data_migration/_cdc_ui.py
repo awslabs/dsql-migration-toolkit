@@ -1995,6 +1995,26 @@ def _cdc_start_detail(
             "start point: the committed stream position on MSK (this stack streamed "
             "before; it continues where streaming stopped)"
         )
+    elif (
+        resumes
+        and source_type is SourceType.POSTGRES
+        and watermark is not None
+        and getattr(watermark, "slot_name", None)
+        and not force_snapshot
+    ):
+        # A PostgreSQL restart streams from the slot's confirmed position, not from the Full
+        # Load LSN: naming the watermark as the start put a position the stream had long
+        # passed into the permanent record (live PG E2E, 2026-10-09). The slot stands where
+        # streaming stopped -- or, when a Full Load re-run since then recreated it
+        # (provision_pg_replication), at that run's watermark; nothing on the stack records
+        # which, so the line states both.
+        parts.append(
+            f"start point: replication slot {watermark.slot_name} (this stack streamed "
+            "before; it continues from the slot's confirmed position -- where streaming "
+            "stopped, or the Full Load watermark "
+            f"{watermark_coordinate(watermark, source_type)} if a Full Load run since then "
+            "recreated the slot)"
+        )
     elif watermark is not None and seed_origin == "manual":
         # Named as the card, the deploy log and the "CDC start position" line name it: the
         # binlog file:position the offset is keyed on, plus the GTID set seeded with it --

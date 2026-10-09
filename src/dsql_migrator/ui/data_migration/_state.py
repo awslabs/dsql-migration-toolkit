@@ -1293,8 +1293,8 @@ class DataMigrationState:
 
         The completion signal was a ``ui.notify`` toast, which dies with the page: after a
         refresh there was nothing distinguishing "the 45-minute teardown finished" from
-        "it never ran". This survives a refresh and is cleared only by
-        :meth:`dismiss_cdc_teardown_done` (the banner's close button).
+        "it never ran". This survives a refresh and is cleared by
+        :meth:`dismiss_cdc_teardown_done` (the banner's close button) or by Start over.
         """
         with self._lock:
             self.cdc_teardown_done = {
@@ -2611,8 +2611,8 @@ class DataMigrationStore:
                 getattr(state, "cdc_teardown_stack", None),
                 getattr(state, "cdc_teardown_ctx", None),
             )
-            # The multi-stack QUEUE and the finished-teardown record must survive too --
-            # their own docstrings claimed they did, and they did not. The queue's only
+            # The multi-stack QUEUE must survive too --
+            # its own docstring claimed it did, and it did not. The queue's only
             # writer runs in the SAME synchronous Start-over handler as this reset (the
             # dialog calls on_reset_cdc(mode) and then on_reset()), so it was written and
             # wiped in one event, EVERY time: the banner never showed "1 of 3", the
@@ -2622,7 +2622,12 @@ class DataMigrationStore:
             # teardown_queue_progress / next_unfinished_teardown / advance_cdc_teardown
             # dead code in production, reachable only from tests that seed the queue.
             teardown_queue = list(getattr(state, "cdc_teardown_queue", []) or [])
-            teardown_done = dict(getattr(state, "cdc_teardown_done", {}) or {})
+            # The FINISHED-teardown notice is not carried over: it reports a stack that is
+            # already gone, from before this fresh journey, and Start over promises to clear
+            # saved session state (live PG E2E, 2026-10-09: a previous journey's "CDC
+            # infrastructure deleted (dsql-cdc-stack)" stayed on every screen of the next
+            # one). A teardown this Start over submits finishes after the reset and records
+            # its own notice then.
             # Builder-time handles (the ledger store and three callables), set once when
             # the screen is built -- the builder does not re-run after Start over.
             handles = {
@@ -2647,5 +2652,3 @@ class DataMigrationStore:
                 )
             if teardown_queue:
                 state.set_cdc_teardown_queue(teardown_queue)
-            if teardown_done:
-                state.cdc_teardown_done = teardown_done

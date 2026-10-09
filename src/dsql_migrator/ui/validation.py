@@ -1846,15 +1846,19 @@ class DriftDisplay:
     basis: str = ""
     watermark_binlog: str = _UNAVAILABLE
     current_binlog: str = _UNAVAILABLE
+    # Drift deliberately not computed for a PostgreSQL source (see DriftReport).
+    postgres_source: bool = False
 
 
-def format_drift(report: ValidationReport) -> DriftDisplay:
+def format_drift(report: ValidationReport, *, postgres_source: bool = False) -> DriftDisplay:
     """Format ``report``'s source-change section for display (Requirement 6.5).
 
     Surfaces whether the source changed after the snapshot (Property 11), judged by
     GTID when both sides have one and otherwise by binlog ``file:position``. When no
     watermark was used, or neither coordinate is comparable, the panel says so rather
-    than implying a clean or dirty result.
+    than implying a clean or dirty result. ``postgres_source`` (the session's source engine)
+    words an undeterminable verdict: drift by WAL LSN is deliberately not computed (see
+    ``core.validator._build_drift``), which is not the source failing to report one.
     """
     drift: Optional[DriftReport] = report.drift
     if drift is None:
@@ -1879,11 +1883,15 @@ def format_drift(report: ValidationReport) -> DriftDisplay:
     determinable = bool(basis) if basis else (
         drift.watermark_gtid is not None and drift.current_gtid is not None
     )
-    if not determinable:
+    if not determinable and postgres_source:
+        summary = (
+            "Source changes since the snapshot are not determined on a PostgreSQL "
+            "source (its WAL LSN advances even when nobody writes)."
+        )
+    elif not determinable:
         summary = (
             "Source changes since the snapshot could not be determined "
-            "(no comparable source replication coordinate — a MySQL GTID/binlog "
-            "position or a PostgreSQL WAL LSN)."
+            "(no comparable MySQL GTID or binlog position)."
         )
     elif drift.drifted:
         evidence = "binlog position moved" if basis == "binlog" else "GTID changed"
@@ -1902,6 +1910,7 @@ def format_drift(report: ValidationReport) -> DriftDisplay:
         basis=basis,
         watermark_binlog=getattr(drift, "watermark_binlog", None) or _UNAVAILABLE,
         current_binlog=getattr(drift, "current_binlog", None) or _UNAVAILABLE,
+        postgres_source=postgres_source,
     )
 
 
@@ -4052,6 +4061,7 @@ def build_validation_screen(
                     rechecked_tables=validation_state.rechecked_tables,
                     rechecked_at=validation_state.rechecked_at,
                     cdc_in_use=_cdc_in_use(session),
+                    postgres_source=_source_engine_word(session) == "PostgreSQL",
                     identity_sync=validation_state.identity_sync,
                     identity_sync_failed=validation_state.identity_sync_failed,
                     excluded_values_remedy=(
@@ -5187,7 +5197,11 @@ def build_cutover_screen(
 
         report = validation_state.result
         summary = summarize_validation(report) if report is not None else None
-        drift = format_drift(report) if report is not None else None
+        drift = (
+            format_drift(report, postgres_source=engine == "PostgreSQL")
+            if report is not None
+            else None
+        )
 
         # The runbook's "Sync identity sequences" button calls this: advance identity
         # keys past the current target MAX(pk), in the background, then refresh to show
@@ -6661,6 +6675,7 @@ def _render_result(
     scope_extra: "Sequence[str]" = (),
     replica_identity_gate: "Optional[object]" = None,
     catalog_drift_gate: "Optional[object]" = None,
+    postgres_source: bool = False,
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
 
@@ -6722,7 +6737,7 @@ def _render_result(
             ),
         )
     summary = summarize_validation(report)
-    drift = format_drift(report)
+    drift = format_drift(report, postgres_source=postgres_source)
     _hold_shown = _render_verdict(
         ui, summary, drift, cdc_gate=cdc_gate, scope_missing=scope_missing,
         replica_identity_gate=replica_identity_gate,
@@ -8847,11 +8862,15 @@ def _validation_run_facts(summary: ValidationSummary, drift: DriftDisplay) -> st
     if summary.migration_excluded_columns:
         lines.append(f"Excluded columns: {_proof_clause(summary)}")
     if drift.available:
-        if not drift.determinable:
+        if not drift.determinable and drift.postgres_source:
             lines.append(
-                "Source changes since snapshot: undeterminable (no comparable "
-                "replication coordinate — a MySQL GTID/binlog position or a "
-                "PostgreSQL WAL LSN — to compare)."
+                "Source changes since snapshot: not determined (a PostgreSQL source's WAL "
+                "LSN advances even when idle, so it is not compared)."
+            )
+        elif not drift.determinable:
+            lines.append(
+                "Source changes since snapshot: undeterminable (no comparable MySQL "
+                "GTID or binlog position to compare)."
             )
         else:
             lines.append(
@@ -9278,14 +9297,22 @@ def drift_verdict(
             "it was during the run rather than as-of a consistency point. For a "
             "definitive pre-cut-over check, freeze source writes and re-validate.",
         )
+    if not drift.determinable and drift.postgres_source:
+        return (
+            "info",
+            "Could not tell whether the source changed",
+            "On a PostgreSQL source this run does not compare WAL positions: an idle "
+            "PostgreSQL source advances its WAL LSN on its own (autovacuum, checkpoints), "
+            "so the comparison would report changes nobody made. Freeze source writes and "
+            "re-validate for a definitive pre-cut-over check.",
+        )
     if not drift.determinable:
         return (
             "info",
             "Could not tell whether the source changed",
-            "The source did not report a comparable replication coordinate (a MySQL "
-            "GTID/binlog position or a PostgreSQL WAL LSN), so this run cannot tell "
-            "whether the source changed after the snapshot. Freeze source writes and "
-            "re-validate for a definitive pre-cut-over check.",
+            "The source did not report a comparable MySQL GTID or binlog position, so this "
+            "run cannot tell whether the source changed after the snapshot. Freeze source "
+            "writes and re-validate for a definitive pre-cut-over check.",
         )
     if not drift.drifted:
         return (

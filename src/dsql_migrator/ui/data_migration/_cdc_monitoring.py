@@ -2172,12 +2172,18 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
     for group in drift:
         by_kind.setdefault(getattr(group, "kind", ""), set()).add(str(group.table))
     cdc_only = _fix_is_cdc_only(migration_type)
-    ddl = set(by_kind) - _NON_DDL_SOURCE_KINDS
+    # A target-side kind (a 23505, a dropped target table, an unbindable value) is no source
+    # DDL: its repair is the stop-and-reload notice the banner renders below, so on its own
+    # it gets no DDL lead -- "apply the matching change (e.g. ALTER TABLE)" would send the
+    # operator after a schema change that never happened.
+    ddl = set(by_kind) - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS
 
     def names(kind: str) -> str:
         return _fix_names(sorted(by_kind[kind]))
 
-    if ddl <= {"type-change", "key-change"}:
+    if not ddl:
+        parts = []
+    elif ddl <= {"type-change", "key-change"}:
         # Neither can be "applied" with an ALTER on Aurora DSQL: their own sentences recreate.
         parts = ["CDC does not replicate DDL."]
     elif cdc_only:
@@ -3064,6 +3070,23 @@ _CDC_VALUE_FIT_SEED = (
     "that holds these values — Aurora DSQL has no ALTER COLUMN ... TYPE — and how to backfill "
     "the set-aside rows, and whether I must stop CDC first."
 )
+# The target-side-only banner's seed: Aurora DSQL refused the rows (a unique index, a missing
+# target table, a value the sink cannot bind) -- no source DDL to "apply".
+_CDC_TARGET_SIDE_SEED = (
+    "CDC dead-lettered rows that Aurora DSQL or the sink refused on the target (not a source "
+    "schema change). For each affected table, tell me why the rows were refused and how to "
+    "restore them on the target, and whether I must stop CDC first."
+)
+
+
+def _drift_names_no_source_ddl(drift) -> bool:
+    """True when every group is target-side (and any others are non-DDL source kinds).
+
+    Such a banner, its AI seed and its AI facts must not claim a source schema change."""
+    kinds = {getattr(g, "kind", "") for g in drift}
+    return bool(kinds & _TARGET_SIDE_DRIFT_KINDS) and not (
+        kinds - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS
+    )
 
 
 def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
@@ -3142,12 +3165,19 @@ def _cdc_drift_facts(status_view: LoadStatusView) -> str:
     value_fit_only = bool(drift) and all(
         getattr(g, "kind", "") == "value-does-not-fit" for g in drift
     )
-    lines = [
-        "CDC set rows aside: a value does not fit its Aurora DSQL column (not necessarily a "
-        "source schema change; CDC does not replicate DDL):"
-        if value_fit_only
-        else "Source schema drift detected (CDC does not replicate DDL):"
-    ]
+    if value_fit_only:
+        lead = (
+            "CDC set rows aside: a value does not fit its Aurora DSQL column (not necessarily a "
+            "source schema change; CDC does not replicate DDL):"
+        )
+    elif _drift_names_no_source_ddl(drift):
+        lead = (
+            "CDC dead-lettered rows the target refused (not a source schema change; the "
+            "dead-lettered rows are never replayed):"
+        )
+    else:
+        lead = "Source schema drift detected (CDC does not replicate DDL):"
+    lines = [lead]
     for group in drift:
         noun = "record" if group.count == 1 else "records"
         columns = list(getattr(group, "columns", None) or ())
@@ -3320,16 +3350,23 @@ def _render_cdc_schema_drift_banner(
                 ui.space()  # type: ignore[attr-defined]
                 # A value-fit-only banner claims no schema change, so its chat must not either
                 # (the seed becomes the operator's first message).
+                _target_only = _drift_names_no_source_ddl(drift)
                 _render_cdc_ai_button(
                     ui,
                     lambda: cdc_ai_opener(
                         "drift",
                         _cdc_drift_facts(status_view),
-                        _CDC_VALUE_FIT_SEED if _value_fit_only else _CDC_DRIFT_SEED,
+                        _CDC_VALUE_FIT_SEED
+                        if _value_fit_only
+                        else _CDC_TARGET_SIDE_SEED
+                        if _target_only
+                        else _CDC_DRIFT_SEED,
                     ),
                     "Ask AI DBA how to give the column a type that holds these values and "
                     "backfill the set-aside rows."
                     if _value_fit_only
+                    else "Ask AI DBA why the target refused these rows and how to restore them."
+                    if _target_only
                     else "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
                 )
         for group in drift:
@@ -3442,7 +3479,8 @@ def _render_cdc_schema_drift_banner(
                     migration_type, _value_fit_tables, is_pg=_is_pg,
                     remap=_value_fit_remap(drift),
                 )
-        ui.label(_runbook).classes("text-xs italic text-gray-600")  # type: ignore[attr-defined]
+        if _runbook:
+            ui.label(_runbook).classes("text-xs italic text-gray-600")  # type: ignore[attr-defined]
         if _target_side:
             # The recovery is different in kind: dead-lettered rows are NOT replayed and
             # their Kafka offsets are already committed, so nothing will re-deliver them

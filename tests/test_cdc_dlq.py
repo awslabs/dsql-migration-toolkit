@@ -1247,8 +1247,12 @@ def test_a_truncate_beside_any_other_kind_keeps_its_own_repair(kind, mtype_name)
          {"table": "shop.b", "kind": "source-truncate", "count": 1}],
         mtype, ui=ui,
     )
-    (runbook,) = [t for t in ui.texts if t.startswith("CDC does not replicate DDL.")]
-    assert "Aurora DSQL has no TRUNCATE statement" in runbook
+    (runbook,) = [
+        t for t in ui.texts
+        if t.startswith(("CDC does not replicate DDL.", "CDC cannot replicate a TRUNCATE"))
+    ]
+    # A target-side kind is no source DDL, so only a real DDL kind gets the DDL lead.
+    assert runbook.startswith("CDC does not replicate DDL.") is (kind != "unique-conflict")
     if mtype is MigrationType.CDC_ONLY:
         assert "delete the rows the source no longer has from shop.b on Aurora DSQL" in runbook
         assert "'Drop & reload'" not in runbook
@@ -1264,6 +1268,34 @@ def test_a_truncate_beside_any_other_kind_keeps_its_own_repair(kind, mtype_name)
         else "Stop CDC, reload the table on the Full Load step with 'Drop & reload'"
     )
     assert any(expected in t for t in alone.texts)
+
+
+@pytest.mark.parametrize("kind", ["unique-conflict", "missing-table", "unbindable-value"])
+@pytest.mark.parametrize("mtype_name", ["FULL_LOAD_AND_CDC", "CDC_ONLY"])
+def test_a_target_side_only_banner_gets_no_ddl_runbook(kind, mtype_name) -> None:
+    """Live PG E2E (2026-10-09): a primary-key change racing a secondary UNIQUE dead-lettered
+    23505 and the banner told the operator "CDC does not replicate DDL. Apply the matching
+    change to the target schema (e.g. ALTER TABLE)" -- there was no schema change. A
+    target-side kind's repair is the stop-and-reload notice, so it gets no DDL lead."""
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    blob, _ = _render_drift(
+        [{"table": "shop.customers", "kind": kind, "count": 3}], MigrationType[mtype_name]
+    )
+    assert "does not replicate DDL" not in blob
+    assert "e.g. ALTER TABLE" not in blob
+    assert "Stop CDC" in blob
+
+
+def test_a_target_side_kind_beside_a_ddl_kind_keeps_the_ddl_lead() -> None:
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    blob, _ = _render_drift(
+        [{"table": "shop.a", "kind": "add-column", "count": 1},
+         {"table": "shop.b", "kind": "unique-conflict", "count": 1}],
+        MigrationType.FULL_LOAD_AND_CDC,
+    )
+    assert "CDC does not replicate DDL. Apply the matching change" in blob
 
 
 class _AiBannerUi(_BannerUi):
@@ -1333,6 +1365,26 @@ def test_the_value_fit_banner_asks_the_ai_dba_without_claiming_a_schema_change()
         assert seed == cm._CDC_DRIFT_SEED
         assert facts.startswith("Source schema drift detected")
         assert any("what DDL to apply" in t for t in tooltips), tooltips
+
+
+def test_a_target_side_banner_asks_the_ai_dba_without_claiming_a_schema_change() -> None:
+    """Live PG E2E (2026-10-09): a 23505 from a primary-key change racing a secondary UNIQUE
+    is no source DDL, so neither the seed, the facts nor the tooltip may say so."""
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    group = {"table": "shop.customers", "kind": "unique-conflict", "count": 3}
+    truncate = {"table": "shop.b", "kind": "source-truncate", "count": 1}
+    for groups in ([group], [group, truncate]):
+        _scope, facts, seed, tooltips = _ask_ai_dba(groups, MigrationType.FULL_LOAD_AND_CDC)
+        assert seed == cm._CDC_TARGET_SIDE_SEED
+        assert "what DDL to apply" not in seed
+        assert not facts.startswith("Source schema drift detected"), facts
+        assert tooltips and not any("what DDL" in t for t in tooltips), tooltips
+    add = {"table": "shop.orders", "kind": "add-column", "count": 1}
+    _scope, facts, seed, _tooltips = _ask_ai_dba([add, group], MigrationType.FULL_LOAD_AND_CDC)
+    assert seed == cm._CDC_DRIFT_SEED
+    assert facts.startswith("Source schema drift detected")
 
 
 def test_the_ai_drift_facts_name_a_constraint_as_a_constraint_and_list_the_codes() -> None:

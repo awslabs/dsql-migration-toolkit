@@ -2444,3 +2444,35 @@ def test_g22_the_sink_stall_notice_tells_a_transient_target_from_an_ejected_cons
     assert "will not close on its own" in ejected and "will not close" not in transient
     # The confirmed-stall branch renders this constant.
     assert "body=SINK_STALL_NOTICE_BODY" in inspect.getsource(cm._render_change_flow_status)
+
+
+def test_a_postgres_restart_names_the_slot_not_the_full_load_lsn() -> None:
+    """Live PG E2E (2026-10-09): the resumed Start's audit line said "start point WAL LSN
+    0/41204A0 (gapless from the Full Load watermark)" while Debezium resumed from the slot at
+    0/42F8428 -- the permanent record named a position the stream had long passed."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_ui import _cdc_start_detail
+
+    wm = SimpleNamespace(
+        gtid_executed=None, binlog_file=None, binlog_position=None,
+        wal_lsn="0/41204A0", slot_name="dsqlmig_x",
+    )
+    resumed = _cdc_start_detail(
+        "dsql-cdc-x", wm, mode="auto", source_type=SourceType.POSTGRES, resumes=True
+    )
+    assert "replication slot dsqlmig_x" in resumed
+    assert "continues from the slot's confirmed position" in resumed
+    assert "where streaming stopped" in resumed
+    # A Full Load re-run recreates the slot at its own watermark, so that case is named too.
+    assert "WAL LSN 0/41204A0 if a Full Load run since then recreated the slot" in resumed
+    assert "gapless from the Full Load watermark" not in resumed
+    # The first start keeps its line; a forced snapshot still says it re-snapshots.
+    first = _cdc_start_detail("dsql-cdc-x", wm, mode="auto", source_type=SourceType.POSTGRES)
+    assert "gapless from the Full Load watermark" in first
+    forced = _cdc_start_detail(
+        "dsql-cdc-x", wm, mode="auto", source_type=SourceType.POSTGRES,
+        resumes=True, force_snapshot=True,
+    )
+    assert "re-snapshot" in forced
