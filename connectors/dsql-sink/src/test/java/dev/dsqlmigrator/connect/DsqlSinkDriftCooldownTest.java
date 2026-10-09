@@ -526,7 +526,9 @@ class DsqlSinkDriftCooldownTest {
 
   @Test
   void perValueCodesDoNotArm() throws Exception {
-    for (String state : List.of("23505", "22P02", "23514", "23503", "07006")) {
+    // 23505 is a per-value code too, but since plugin v53 it is first held on its partition
+    // (a different path); DsqlSinkUniqueHoldTest pins that it never arms the cool-down either.
+    for (String state : List.of("22P02", "23514", "23503", "07006")) {
       FakeDsql dsql = new FakeDsql();
       dsql.failure = driftedUpserts(state);
       RecordingReporter dlq = new RecordingReporter();

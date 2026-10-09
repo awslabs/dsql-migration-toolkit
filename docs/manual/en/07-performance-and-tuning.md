@@ -114,7 +114,8 @@ single rightmost partition. Key points:
 - **Full Load and CDC both handle it.** Full Load's idempotent
   `INSERT ... ON CONFLICT` keys on the target composite key. CDC keys each change
   record on the **source** primary key, so every change to a row — including one that
-  moves it to another leading value — stays in order on one Kafka partition; the sink
+  moves it to another leading value — stays in order on one Kafka partition (a change of
+  the source primary key itself does not: see the partition note in §7.2); the sink
   writes it by the composite key, and an `UPDATE` of the leading column becomes a
   delete of the old row and an insert of the new one in one transaction. This needs
   CDC infrastructure deployed by this version (sink plugin v51 or later); older
@@ -279,8 +280,18 @@ single table's gain flattens past ~4 partitions as concurrent DSQL upserts to it
 contend). This is **automatic**: it activates only for a genuinely skewed,
 many-table capture, is a **no-op under even load**, and falls back to the uniform
 default when there is no size signal (or you set
-`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`). Ordering is unaffected — Debezium keys each
-record by primary key, so all changes for a row still land on one partition.
+`DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS`). Per-row ordering holds for every change that
+keeps the primary key: Debezium keys each record by primary key, so all changes to one
+row land on one partition. Two kinds of change span partitions: an `UPDATE` that changes
+the primary key, which Debezium replicates as a delete of the old key and an insert of the
+new key that can land on different partitions and apply in either order; and a unique
+value (for example an email address) passed from one row to another. On a table with a
+unique index besides its primary key, CDC infrastructure deployed by this version (sink
+plugin v53 or later) holds such a change, and every later change on its partition, for up
+to 5 minutes, until the other row's change has applied. Other partitions keep flowing, and
+the wait shows as lag on that partition. CDC infrastructure deployed by an earlier version
+of this tool dead-letters the change at once; Delete and Deploy CDC infrastructure to pick
+up the wait (see [Chapter 6](06-limitations.md)).
 Because a topic's partition count is fixed at creation, this is decided at CDC
 infra deploy; changing it needs a fresh CDC deploy.
 

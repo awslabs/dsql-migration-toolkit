@@ -30,8 +30,10 @@ import java.util.function.LongUnaryOperator;
  * transaction may have committed; a re-run of a unit that did commit sets the same image per
  * primary key again (every statement sets an absolute image per key), so it is retried exactly
  * like a 40001. A secondary UNIQUE index can still reject (23505) an image the landed unit
- * already replaced; the caller then applies the chunk one row per transaction and dead-letters
- * that record, as on any Connect redelivery of a committed batch. Only {@code XX000} itself:
+ * already replaced; the caller then applies the chunk one row per transaction, where that
+ * record is skipped when a later change of the same row in the batch replaces it, and
+ * otherwise held on its partition like any unique conflict ({@code DsqlSinkTask.holdOrReport})
+ * and dead-lettered only if the conflict outlasts the hold. Only {@code XX000} itself:
  * {@code XX001} (data corrupted) and {@code XX002} (index corrupted) are not transient.
  *
  * <p><b>Every attempt starts on a clean transaction.</b> After a {@code 40001} or an

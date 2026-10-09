@@ -2356,7 +2356,8 @@ def cdc_schema_drift_summary(migration_state, log_key: str) -> list:
     Each group also carries its distinct normalized ``codes`` and the value-free names its
     reasons give (at most :data:`_VALUE_FIT_COLUMN_LIMIT`, first-seen order): a value-fit
     refusal's ``"<column> <type>"``, the column a NULL-sent 23502 named, the column a 23502
-    proves was not sent, a 23514's constraint. Other kinds carry none.
+    proves was not sent, a 23514's constraint, the unique index a 23505 names. Other kinds
+    carry none.
 
     INCREMENTAL: the CDC poll and the AI tool call this every few seconds over an uncapped,
     append-only log, so the fold is memoized on ``migration_state._cdc_drift_summary_cache``
@@ -2422,7 +2423,9 @@ def cdc_schema_drift_summary(migration_state, log_key: str) -> list:
             # sent; an evidence-free one names none rather than guessing.
             if kind is SchemaDriftKind.NULLABILITY_CHANGE or sent is False:
                 name = column
-        elif kind is SchemaDriftKind.CHECK_VIOLATION:
+        elif kind in (SchemaDriftKind.CHECK_VIOLATION, SchemaDriftKind.UNIQUE_CONFLICT):
+            # The sink's " [constraint: <name>]" suffix names a unique index (23505) the same
+            # way it names a CHECK (23514): an identifier, never a value.
             name = check_constraint_from_reason(message)
         if name and name not in seen:
             seen.append(name)

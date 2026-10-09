@@ -92,6 +92,34 @@ fails **loudly** where it can't.
     app restart the re-check needs the source password again (reconnect on the Connect
     step). A drop and its reversal between two re-checks are not seen, so keep FULL in
     place.
+- **Primary-key changes and unique values moving between rows.** Debezium replicates an
+  `UPDATE` of a primary key as a delete of the old key plus an insert of the new key; the
+  two are keyed differently, so they can land on different partitions (any topic with more
+  than one: fewer than 8 captured tables, or a large table given 2 or 4) and apply in
+  either order. A unique value passed from one row to another (an email address moved to
+  another account) can do the same. On a table with a unique index besides its primary
+  key, the insert can then meet the old row, which Aurora DSQL rejects at once (`23505`).
+  CDC infrastructure deployed by this version (sink plugin v53 or later) holds that change,
+  and every later change on its partition, until the other row's change has applied, for
+  up to 5 minutes, while other partitions keep flowing; when the partition's next batch
+  carries a later change of the same row that replaces it entirely, the change is skipped
+  instead. The change is still dead-lettered (*a unique constraint rejected the row*, with
+  the index name) when the change that frees the value is more than 5 minutes behind (very
+  uneven partition lag during a long catch-up), when an older change of a row replayed
+  after a restart or a re-read of the stream (such as the one after Delete and Deploy CDC
+  infrastructure) meets values its own later change already wrote and that later change is
+  more than one batch further on its partition, when the target already holds the value
+  from outside the stream, when a
+  PostgreSQL transaction swaps unique values between rows under a `DEFERRABLE` unique
+  constraint (each change waits on the other, so both are dead-lettered after 5 minutes),
+  and for the composite-key cause of a re-keyed table (below and §4.6). On CDC
+  infrastructure deployed by an earlier version the insert is dead-lettered at once and the
+  old row's delete then removes the row, so it is missing until the table is reloaded.
+  Either way Cut over holds the table until it matches by CHECKSUM, and once it does the
+  CDC step shows it as *Reloaded and verified*. Remedy: Stop CDC, reload the table on the
+  Full Load step with **Drop & reload**, Start CDC, then validate it. To pick up the wait,
+  Delete CDC infrastructure and deploy it again, which also deletes the stream position
+  (see the next entry). Both engines.
 - **Re-keyed tables on CDC infrastructure deployed by an earlier version** keep their
   change records keyed on the composite key (the Start CDC log says so). An `UPDATE` of
   the leading key column — or a delete and re-insert of a row with another leading
@@ -108,7 +136,8 @@ fails **loudly** where it can't.
   every table again (Full load + CDC: choose **"Re-snapshot every table instead"**) and a
   row the source deleted meanwhile stays on Aurora DSQL. See "Starting CDC again after a
   delete" and "The cost of deleting a CDC-only stack" in
-  [Chapter 13](13-excluding-tables-and-columns.md#why-the-set-locks). Both engines.
+  [Chapter 13](13-excluding-tables-and-columns.md#why-the-set-locks). Both engines. (A
+  primary-key change on any table with another unique index: the entry above.)
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
   **not** propagated to DSQL — you make the matching change on Aurora DSQL yourself:
   **Fix target schema…** for an added or renamed column, an `ALTER … DROP NOT NULL`

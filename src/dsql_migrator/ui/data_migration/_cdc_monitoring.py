@@ -1709,17 +1709,31 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "rejected every row (SQLSTATE 42P01)",
     ),
     # Deliberately does NOT assert a cause: 23505 is raised by any unique index, so an
-    # out-of-band duplicate raises it too. It names the realistic causes and, above all,
-    # that a row may be MISSING -- the one thing an unclassified poison row cannot say.
+    # out-of-band duplicate raises it too. It names the realistic causes -- a primary-key
+    # change (or a unique value passed between rows) on any table with a secondary unique
+    # index, held up to 5 minutes since sink plugin v53 (G23), and the composite-key cause --
+    # and, above all, that a row may be MISSING -- the one thing an unclassified poison row
+    # cannot say. The index name, when the record carries one, is shown beside the label.
     "unique-conflict": (
         "a unique constraint rejected the row",
         "Aurora DSQL refused the row because a unique index already holds its values "
-        "(SQLSTATE 23505). On a table with a composite key (Schema Conversion's Composite "
-        "key), an UPDATE to the leading key column produces it when the change does not "
-        "carry the old value (REPLICA IDENTITY below FULL on a PostgreSQL source) or when "
-        "the CDC infrastructure was deployed by an earlier version of this tool — so that "
-        "row can end up missing or stale on the target. Validate the table and reload it if "
-        "it differs; the leading key column must be one the application never updates",
+        "(SQLSTATE 23505), so the row can be missing or stale on the target. On any table "
+        "with a unique index besides the primary key, a change can reach Aurora DSQL before "
+        "the earlier change that frees the value: most often an UPDATE of the primary key, "
+        "which is replicated as a delete of the old key and an insert of the new key that "
+        "can travel on different stream partitions, or a unique value passed from one row to "
+        "another. CDC infrastructure deployed by this version holds such a change for up to "
+        "5 minutes and dead-letters it only if the conflict outlasts the wait (the change "
+        "that frees the value is further behind, an older change of the row replayed after a "
+        "restart or a re-read of the stream has its later change further behind on its own "
+        "partition, or the target already holds the value from outside the stream); "
+        "infrastructure deployed by an earlier version dead-letters it "
+        "at once (Delete and Deploy CDC infrastructure to pick up the wait). On a table with "
+        "a composite key (Schema Conversion's Composite key), an UPDATE to the leading key "
+        "column produces it when the change does not carry the old value (REPLICA IDENTITY "
+        "below FULL on a PostgreSQL source) or when the CDC infrastructure was deployed by "
+        "an earlier version of this tool; the leading key column must be one the "
+        "application never updates. Either way, reload the table as below and validate it",
     ),
     # Neither a schema change nor a key-model conflict: the sink cannot BIND the value, so
     # EVERY insert and update for the table dead-letters. Names the array cause because it is
@@ -3137,8 +3151,13 @@ def _cdc_drift_facts(status_view: LoadStatusView) -> str:
     for group in drift:
         noun = "record" if group.count == 1 else "records"
         columns = list(getattr(group, "columns", None) or ())
-        # A check-violation group names its CHECK constraint, every other kind columns.
-        what = "constraint" if getattr(group, "kind", "") == "check-violation" else "columns"
+        # A check-violation group names its CHECK constraint and a unique-conflict group its
+        # unique index (a constraint name, not a column); every other kind names columns.
+        what = (
+            "constraint"
+            if getattr(group, "kind", "") in ("check-violation", "unique-conflict")
+            else "columns"
+        )
         detail = f" ({what}: {', '.join(columns)})" if columns else ""
         codes = list(getattr(group, "codes", None) or ())
         coded = f" [codes: {', '.join(codes)}]" if codes else ""
@@ -3153,6 +3172,36 @@ def _render_cdc_ai_button(ui, on_click, tooltip: str) -> None:
     ui.button("Ask AI DBA", on_click=on_click).props(  # type: ignore[attr-defined]
         "flat dense no-caps size=sm color=indigo-6 icon=auto_awesome"
     ).tooltip(tooltip)
+
+
+def _cdc_dlq_proven(migration_state) -> "dict[str, object]":
+    """The dead-lettered tables the cut-over gate no longer holds (``{}`` when unknown)."""
+    if migration_state is None or not getattr(migration_state, "cdc_dlq_ledger", None):
+        return {}
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_proven_tables
+
+    provider = getattr(migration_state, "validation_state_provider", None)
+    try:
+        validation_state = provider() if callable(provider) else None
+    except Exception:  # noqa: BLE001 - without it every table simply stays open
+        validation_state = None
+    try:
+        return cdc_dlq_proven_tables(migration_state, validation_state)
+    except Exception:  # noqa: BLE001 - a resolved line is a convenience, never a gate
+        return {}
+
+
+def _render_cdc_dlq_resolved(ui, groups, proven) -> None:
+    """One success notice for the target-side tables already reloaded and verified."""
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_resolved_body
+
+    tables = sorted({g.table for g in groups})
+    render_notice(
+        ui,
+        tone="success",
+        header="Reloaded and verified",
+        body=cdc_dlq_resolved_body({t: proven[t] for t in tables}),
+    )
 
 
 def _render_cdc_schema_drift_banner(
@@ -3186,6 +3235,21 @@ def _render_cdc_schema_drift_banner(
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
         return
+    # A target-side table the operator already repaired (Drop & reload, then a CHECKSUM match
+    # in a comparison started after its last dead letter -- the cut-over gate's own rule, so
+    # Cut over no longer holds it) is shown as resolved, not as an open "Stop CDC and reload"
+    # error; its dead-lettered records stay listed in the breakdown below the banner. A newer
+    # dead letter moves the ledger's last time past that comparison and reopens it.
+    _proven = _cdc_dlq_proven(migration_state)
+    _resolved = [
+        g for g in drift
+        if getattr(g, "kind", "") in _TARGET_SIDE_DRIFT_KINDS and g.table in _proven
+    ]
+    if _resolved:
+        drift = [g for g in drift if not any(g is r for r in _resolved)]
+        if not drift:
+            _render_cdc_dlq_resolved(ui, _resolved, _proven)
+            return
     # THREE cases, not two. The old two-way split put every target-side kind under the
     # "Target table missing — rows are being lost" header, which is false for 23505 (there a
     # row only CAN end up missing) and was about to be false for 07006 as well. Mixed drift
@@ -3402,6 +3466,8 @@ def _render_cdc_schema_drift_banner(
                     "(step 4) is what proves the gap is closed; this panel cannot."
                 ),
             )
+    if _resolved:
+        _render_cdc_dlq_resolved(ui, _resolved, _proven)
 
 
 def cdc_oversized_quarantine_groups(records) -> "list[tuple[str, list[str], list[str]]]":

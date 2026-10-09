@@ -754,9 +754,12 @@ def build_ai_tool_executor(
                      "schema_drift": [
                          {"table": d.table, "kind": d.kind, "count": d.count,
                           # The value-free names the group's reasons give (never a value):
-                          # a check-violation's CHECK constraint, otherwise columns (a
-                          # value-fit "<column> <type>", a 23502's column).
-                          **({("constraints" if d.kind == "check-violation" else "columns"):
+                          # a check-violation's CHECK constraint or a unique-conflict's unique
+                          # index (constraints), otherwise columns (a value-fit
+                          # "<column> <type>", a 23502's column).
+                          **({("constraints"
+                               if d.kind in ("check-violation", "unique-conflict")
+                               else "columns"):
                               list(d.columns)}
                              if getattr(d, "columns", None) else {}),
                           **({"codes": list(d.codes)} if getattr(d, "codes", None) else {})}

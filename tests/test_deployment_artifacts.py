@@ -2801,6 +2801,12 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v53 (G23): a unique-index conflict (23505) is held on its partition -- rewound,
+        # paused, its commit capped -- until the earlier change that frees the value (a
+        # primary-key change's old-row delete, on another partition) applies, for up to 5 min,
+        # instead of being dead-lettered at once (the row was missing). The marker is the hold
+        # INFO literal of DsqlSinkTask.UNIQUE_HOLD_START.
+        "unique conflict hold": b"until the earlier change that frees the value",
         # v52 (G22, rebuilt in place): Aurora DSQL's XX000 "server unavailable" is retried
         # like a 40001 and, once the budget is spent, redelivered -- never dead-lettered. The
         # marker is OccRetry.SERVER_UNAVAILABLE_SQLSTATE; no class of the pre-G22 jar (shaded
@@ -3447,7 +3453,7 @@ def test_plugin_v52_history_records_the_g22_rebuild() -> None:
     source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
     text = (source / "s3_provision.py").read_text(encoding="utf-8")
     history = " ".join(text.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v52"' in text
+    assert 'PLUGIN_VERSION = "v53"' in text  # G23 bumped it past the released v52
     assert "rebuilt in place (G22" in history
     assert "XX000" in history
     # G22 also changed paths other than XX000 (a failed error-path rollback drops the

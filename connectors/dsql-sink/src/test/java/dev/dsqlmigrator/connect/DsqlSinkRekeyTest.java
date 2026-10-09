@@ -446,6 +446,15 @@ class DsqlSinkRekeyTest {
     void emitMetrics() {
       // never CloudWatch in a unit test
     }
+
+    /**
+     * Since plugin v53 a unique conflict (23505) is first held on its partition: let the hold
+     * run out (the clock past its budget) and try it once more, so it is dead-lettered.
+     */
+    void expireHolds() {
+      now += DsqlSinkTask.UNIQUE_HOLD_BUDGET_NANOS + SECOND;
+      put(List.of());
+    }
   }
 
   private static Map<String, String> props(String targetKeys, int batchSize) {
@@ -483,6 +492,7 @@ class DsqlSinkRekeyTest {
   private static RekeyTask task(
       FakeDsql dsql, RecordingReporter dlq, String targetKeys, int batchSize) throws Exception {
     RekeyTask task = new RekeyTask();
+    task.initialize(new RecordingSinkTaskContext());
     task.startMetrics(props(targetKeys, batchSize));
     setField(task, "connection", dsql.connection());
     if (dlq != null) {
@@ -547,6 +557,7 @@ class DsqlSinkRekeyTest {
     RekeyTask task = new RekeyTask().index(false);
     Map<String, String> props = props(TARGET_KEYS, 1000);
     props.put(DsqlSinkConnectorConfig.DELETE_ENABLED, "false");
+    task.initialize(new RecordingSinkTaskContext());
     task.startMetrics(props);
     setField(task, "connection", dsql.connection());
 
@@ -575,6 +586,8 @@ class DsqlSinkRekeyTest {
     RecordingReporter dlq = new RecordingReporter();
     RekeyTask task = task(single, dlq, TARGET_KEYS).index(false);
     task.put(List.of(leadUpdate()));
+    assertTrue(dlq.records.isEmpty()); // v53: held first (a unique conflict)
+    task.expireHolds();
     assertEquals(List.of(List.of(5, 2, "a")), single.rows());
     assertEquals(0, single.count("commit"));
     assertEquals(1, dlq.records.size());
@@ -589,6 +602,7 @@ class DsqlSinkRekeyTest {
     RekeyTask task2 = task(mixed, dlq2, TARGET_KEYS).index(false);
     SinkRecord insert = record(ORDERS, sourceKey(7), "c", null, row(1, 7, "n"));
     task2.put(List.of(insert, leadUpdate()));
+    task2.expireHolds();
     assertEquals(List.of(List.of(5, 2, "a"), List.of(1, 7, "n")), mixed.rows());
     assertEquals(1, dlq2.records.size());
     // The replayed move: delete then insert on one connection, then ONE rollback, no commit.
@@ -600,12 +614,42 @@ class DsqlSinkRekeyTest {
     loud.seed(5, 2, "a");
     loud.failure = failNewRow;
     RekeyTask noDlq = task(loud, null, TARGET_KEYS).index(false);
-    ConnectException e =
-        assertThrows(ConnectException.class, () -> noDlq.put(List.of(leadUpdate())));
+    noDlq.put(List.of(leadUpdate()));
+    ConnectException e = assertThrows(ConnectException.class, noDlq::expireHolds);
     assertTrue(e.getMessage().contains("sqlstate=23505"), e.getMessage());
     assertTrue(e.getMessage().contains("op: u"), e.getMessage());
     assertTrue(e.getMessage().contains(" | sql: INSERT INTO \"app\".\"orders\""), e.getMessage());
     assertTrue(e.getMessage().contains("pk: lead=9, id=2"), e.getMessage());
+  }
+
+  @Test
+  void aMoveRejectedByAUniqueIndexIsHeldAsAWholeThenApplied() throws Exception {
+    // v53: a move whose insert meets a value another row still holds (a secondary UNIQUE, here
+    // injected) waits on its partition, delete and insert together, until the value is freed.
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(5, 2, "a");
+    boolean[] blocked = {true};
+    dsql.failure =
+        (sql, binds) ->
+            blocked[0] && sql.startsWith("INSERT") && binds.get(0).equals(9)
+                ? new SQLException("duplicate key value violates unique constraint", "23505")
+                : null;
+    RecordingReporter dlq = new RecordingReporter();
+    RekeyTask task = task(dsql, dlq, TARGET_KEYS).index(false);
+    task.put(List.of(leadUpdate()));
+    assertTrue(dlq.records.isEmpty());
+    assertEquals(List.of(List.of(5, 2, "a")), dsql.rows()); // the delete rolled back with it
+    blocked[0] = false;
+    dsql.executed.clear();
+    task.now += SECOND;
+    task.put(List.of());
+    assertEquals(
+        List.of(
+            new Executed(DELETE_EXACT, List.of(5, 2)),
+            new Executed(UPSERT_COMPOSITE, List.of(9, 2, "b"))),
+        dsql.executed);
+    assertEquals(List.of(List.of(9, 2, "b")), dsql.rows());
+    assertTrue(dlq.records.isEmpty());
   }
 
   @Test
@@ -1539,8 +1583,11 @@ class DsqlSinkRekeyTest {
     FakeDsql legacy = new FakeDsql();
     legacy.seed(5, 4, "a");
     RecordingReporter dlq = new RecordingReporter();
-    task(legacy, dlq, null)
-        .put(List.of(record(ORDERS, compositeKey(9, 4), "u", null, row(9, 4, "b"))));
+    RekeyTask legacyTask = task(legacy, dlq, null);
+    legacyTask.put(List.of(record(ORDERS, compositeKey(9, 4), "u", null, row(9, 4, "b"))));
+    // Not re-keyed in this record, so to the sink a plain unique conflict: held first (v53).
+    assertTrue(dlq.records.isEmpty());
+    legacyTask.expireHolds();
     assertEquals(1, dlq.records.size());
     assertEquals("23505", ((SQLException) dlq.causes.get(0)).getSQLState());
     assertEquals(List.of(List.of(5, 4, "a")), legacy.rows());
@@ -1662,7 +1709,9 @@ class DsqlSinkRekeyTest {
     // on id -- not from re-keying: the re-run replays earlier images on rows that already hold
     // their final ones, an earlier image whose unique value the committed state gives to
     // another row is rejected (23505), the chunk falls back to one row per transaction, and
-    // that record is dead-lettered. A table that is not re-keyed does the same (an insert, a
+    // that record is dead-lettered (since plugin v53 it is first held on its partition, and on
+    // a table that is not re-keyed skipped when a later image of the row replaces it:
+    // DsqlSinkUniqueHoldTest). A table that is not re-keyed does the same (an insert, a
     // delete, then a re-insert of one unique value in one chunk). For the shapes below the
     // record is a superseded image and the row still ends correct; that is no general
     // guarantee -- rows that pass a unique value along within one chunk can lose a row's last

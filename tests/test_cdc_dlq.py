@@ -1354,6 +1354,21 @@ def test_the_ai_drift_facts_name_a_constraint_as_a_constraint_and_list_the_codes
     assert "nullability-change (columns: note) [codes: 23502]" in facts
 
 
+def test_the_ai_drift_facts_name_a_unique_conflicts_index_as_a_constraint() -> None:
+    """A 23505 group carries the unique index Aurora DSQL named: never labelled a column."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.models import SchemaDriftSummary
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    facts = cm._cdc_drift_facts(SimpleNamespace(schema_drift=[
+        SchemaDriftSummary(table="shop.customers", kind="unique-conflict", count=1,
+                           columns=["uk_email"], codes=["23505"]),
+    ]))
+    assert "unique-conflict (constraint: uk_email) [codes: 23505]" in facts
+    assert "columns:" not in facts
+
+
 def test_cdc_schema_drift_summary_lists_value_fit_columns(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _cdc_status
 

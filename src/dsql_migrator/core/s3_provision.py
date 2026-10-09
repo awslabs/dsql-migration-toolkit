@@ -691,7 +691,32 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   attempt", and the occ.max.retries / retry.backoff.ms descriptions name XX000. Worker
 #   configuration, connector properties, the Debezium ZIPs and the seeder Lambda are
 #   unchanged; a live cdc-stack still needs Delete + Deploy CDC infrastructure to pick up v52.
-PLUGIN_VERSION = "v52"
+# v53 (G23): the sink ZIP's CONTENT changed -- a unique-index conflict (SQLSTATE 23505) of an
+#   insert or update is HELD on its partition, for up to 5 min from its first rejection, until
+#   the change that frees the value applies, instead of being dead-lettered at once. Debezium
+#   replicates an UPDATE of the primary key as a delete of the old key and an insert of the new
+#   key; the two are keyed differently, so they can land on different partitions and apply in
+#   either order, and Aurora DSQL checks unique indexes at once (only foreign keys defer). On
+#   v52 the new key's insert met the old row on a secondary UNIQUE index, was dead-lettered,
+#   and the old row's delete then applied: the row was missing until Drop & reload (live,
+#   Seoul GTID E2E of v0.1.567). Now the task rewinds and pauses that partition
+#   (SinkTaskContext.offset/pause), writes nothing at or after the held change on it, caps its
+#   committed offset there (preCommit), and tries the change alone at the end of each put
+#   (500 ms doubling to 10 s, context.timeout bounding an idle poll) while other partitions keep
+#   applying; once applied the partition is rewound past it and resumed, and a conflict that
+#   outlasts the 5 min is dead-lettered with the unchanged reason. A later image of the same row
+#   in the batch (same partition, a plain delete or an upsert of the same column set; tables
+#   that are not re-keyed) replaces a conflicting intermediate image -- the G22 re-run of a
+#   landed XX000 commit -- which is then skipped, not dead-lettered. Not held: deletes,
+#   delete.enabled=false, and a re-keyed table's composite-key cause (an UPDATE of the leading
+#   key column with an unknown old key); 23505 still never arms the drift cool-down. No config
+#   key, template or Start CDC change. Worker configuration, connector properties, the Debezium
+#   ZIPs and the seeder Lambda are unchanged (the bump renames only the CustomPlugins and the
+#   worker configurations). Bumped because the ZIP changed; a live cdc-stack needs Delete +
+#   Deploy CDC infrastructure to pick up v53 (Start CDC does not re-register the plugin), which
+#   also drops the stream position (MySQL re-reads from the watermark; the PostgreSQL slot is
+#   recreated).
+PLUGIN_VERSION = "v53"
 
 
 class S3ProvisionError(RuntimeError):

@@ -1384,7 +1384,8 @@ class SchemaDriftSummary(BaseModel):
     # Value-free identifiers the group's reasons name (bounded, first-seen order), per kind:
     # ``value-does-not-fit`` the ``"<column> <type>"`` the sink's refusal named;
     # ``nullability-change`` the column sent as NULL; ``drop-column`` the column ONLY when the
-    # record proves it was not sent; ``check-violation`` the constraint name. Other kinds: none.
+    # record proves it was not sent; ``check-violation`` the constraint name;
+    # ``unique-conflict`` the unique index the 23505 named. Other kinds: none.
     # Never a value.
     columns: list[str] = Field(default_factory=list)
     # The distinct normalized codes in the group, sorted (e.g. ``["22003",

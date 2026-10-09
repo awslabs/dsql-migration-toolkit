@@ -513,6 +513,13 @@ class SchemaDriftKind(str, Enum):
     # UPDATE is one ordered record applied as delete-old + insert-new in one transaction, so it
     # arises only when the change does not carry the old value (PostgreSQL REPLICA IDENTITY
     # below FULL): the insert is dead-lettered and the old row stays.
+    # The same split hits ANY table with a unique index besides its primary key (live, G23):
+    # an UPDATE of the primary key is delete(old key) + create(new key) on different
+    # partitions, and the create meets the old row on that index. Sink plugin v53+ holds such
+    # a change on its partition for up to 5 minutes until the freeing change applies, so it
+    # reaches the DLQ only when the conflict outlasts that (a value the target holds from
+    # outside the stream, or a freeing change further behind); v52 and earlier dead-letter it
+    # at once and the row goes missing once the old row's delete lands.
     UNIQUE_CONFLICT = "unique-conflict"  # 23505 unique_violation
     # 07006 invalid_parameter_type. Also not a schema change: the sink CANNOT BIND the value
     # at all, so EVERY insert and update for the table dead-letters -- certain, ongoing,

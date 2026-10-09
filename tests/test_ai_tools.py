@@ -367,6 +367,8 @@ def test_get_cdc_status_names_a_check_groups_constraint_not_a_column(monkeypatch
                            columns=["o_status_check"], codes=["23514"]),
         SchemaDriftSummary(table="app.o", kind="nullability-change", count=1,
                            columns=["note"], codes=["23502"]),
+        SchemaDriftSummary(table="app.c", kind="unique-conflict", count=1,
+                           columns=["uk_email"], codes=["23505"]),
     ]
     monkeypatch.setattr(_cdc_status, "cdc_schema_drift_summary", lambda *_a: groups)
     execute = build_ai_tool_executor(
@@ -383,3 +385,6 @@ def test_get_cdc_status_names_a_check_groups_constraint_not_a_column(monkeypatch
     assert drift[0] == {"table": "app.o", "kind": "check-violation", "count": 2,
                         "constraints": ["o_status_check"], "codes": ["23514"]}
     assert drift[1]["columns"] == ["note"] and "constraints" not in drift[1]
+    # A unique-conflict's index is a constraint name, never a column.
+    assert drift[2] == {"table": "app.c", "kind": "unique-conflict", "count": 1,
+                        "constraints": ["uk_email"], "codes": ["23505"]}

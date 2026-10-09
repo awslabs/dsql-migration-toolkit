@@ -101,7 +101,8 @@ class DsqlSinkOccRollbackTest {
     int commitConflicts; // the next N commits raise 40001 (OC000)
     int commitsUnavailable; // the next N commits raise XX000 ...
     boolean unavailableCommitLands; // ... after committing (Aurora DSQL's uncertain outcome)
-    Predicate<Long> rejected = id -> false; // rows Aurora DSQL rejects for good (23505)
+    Predicate<Long> rejected = id -> false; // rows Aurora DSQL rejects for good (23514; a unique
+    // violation is held first since plugin v53: DsqlSinkUniqueHoldTest)
     SQLException rollbackFailure; // thrown once, by the first rollback past the skipped ones
     int rollbacksBeforeFailure; // rollbacks that still succeed before rollbackFailure
     boolean closed;
@@ -151,8 +152,7 @@ class DsqlSinkOccRollbackTest {
               + "is of type smallint", "42804"));
         }
         if (rejected.test((Long) row.get(0))) {
-          throw fail(op, new SQLException("duplicate key value violates unique constraint",
-              "23505"));
+          throw fail(op, new SQLException("new row violates check constraint", "23514"));
         }
       }
       calls.add(op);
@@ -377,7 +377,7 @@ class DsqlSinkOccRollbackTest {
 
   @Test
   void aRowOfTheOneRowPerTransactionPathWhoseStatementRaises40001IsApplied() throws Exception {
-    // Row 2 is rejected for good (23505), so the chunk falls back to one row per transaction;
+    // Row 2 is rejected for good (23514), so the chunk falls back to one row per transaction;
     // there, row 1's statement (execute #2) raises 40001 once. FAILS WITHOUT THE FIX: healthy
     // row 1 was dead-lettered with 25P02 next to row 2.
     AbortingDsql dsql = new AbortingDsql();
@@ -386,11 +386,11 @@ class DsqlSinkOccRollbackTest {
     Dlq dlq = new Dlq();
     task(dsql, dlq).put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3)));
     assertEquals(List.of(1L, 3L), dsql.committed);
-    assertEquals(List.of("23505"), dlq.states());
+    assertEquals(List.of("23514"), dlq.states());
     assertEquals(
-        List.of("prepare", "batch!23505", "rollback",
+        List.of("prepare", "batch!23514", "rollback",
             "prepare", "update!40001", "rollback", "prepare", "update", "commit",
-            "prepare", "update!23505", "rollback",
+            "prepare", "update!23514", "rollback",
             "prepare", "update", "commit"),
         dsql.calls);
   }
@@ -436,8 +436,8 @@ class DsqlSinkOccRollbackTest {
     dsql.rejected = id -> true;
     Dlq dlq = new Dlq();
     task(dsql, dlq).put(List.of(insert("orders", 1)));
-    assertEquals(List.of("prepare", "update!23505", "rollback"), dsql.calls);
-    assertEquals(List.of("23505"), dlq.states());
+    assertEquals(List.of("prepare", "update!23514", "rollback"), dsql.calls);
+    assertEquals(List.of("23514"), dlq.states());
   }
 
   // --- A 40001 from the parameter describe is retried too ------------------------------------
@@ -511,7 +511,7 @@ class DsqlSinkOccRollbackTest {
 
   @Test
   void aRollbackThatFailsOnTheOneRowPerTransactionRetryPathReconnectsToo() throws Exception {
-    // The same on the record-by-record path: row 2 is rejected for good (23505), so the chunk
+    // The same on the record-by-record path: row 2 is rejected for good (23514), so the chunk
     // falls back to one row per transaction (the chunk's own rollback still succeeds); there,
     // row 1's statement (execute #2) raises 40001 and the rollback before its retry fails.
     // FAILS if that call site passes rollbackQuietly (healthy row 1 dead-lettered, 25P02).
@@ -519,7 +519,7 @@ class DsqlSinkOccRollbackTest {
     dsql.rejected = id -> id == 2L;
     dsql.conflictOnExecute = n -> n == 2;
     dsql.rollbackFailure = new SQLException("server unavailable", "XX000");
-    dsql.rollbacksBeforeFailure = 1; // the chunk's rollback after its 23505
+    dsql.rollbacksBeforeFailure = 1; // the chunk's rollback after its 23514
     Dlq dlq = new Dlq();
     Task task = task(dsql, dlq);
     AtomicInteger reconnects = offline(task);
@@ -527,7 +527,7 @@ class DsqlSinkOccRollbackTest {
         IllegalStateException.class,
         () -> task.put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3))));
     assertEquals(
-        List.of("prepare", "batch!23505", "rollback",
+        List.of("prepare", "batch!23514", "rollback",
             "prepare", "update!40001", "rollback!XX000", "close"),
         dsql.calls);
     assertEquals(1, reconnects.get());
@@ -620,7 +620,7 @@ class DsqlSinkOccRollbackTest {
 
   @Test
   void aSustainedXX000OnTheOneRowPathIsRedeliveredNotDeadLettered() throws Exception {
-    // Row 2 is rejected for good (23505), so the chunk falls back to one row per transaction;
+    // Row 2 is rejected for good (23514), so the chunk falls back to one row per transaction;
     // there, every statement meets XX000. FAILS WITHOUT G22: healthy row 1 (and row 3) were
     // dead-lettered with XX000 next to row 2.
     AbortingDsql dsql = new AbortingDsql();
@@ -688,7 +688,7 @@ class DsqlSinkOccRollbackTest {
   @Test
   void aFailedErrorPathRollbackDropsTheSessionSoAHealthyRowIsNotDeadLettered()
       throws Exception {
-    // Row 2 is rejected for good (23505) and the chunk's rollback fails while Aurora DSQL
+    // Row 2 is rejected for good (23514) and the chunk's rollback fails while Aurora DSQL
     // keeps the session open (XX000), so that session still holds the aborted transaction.
     // The one-row-per-transaction fallback must start on a new session. FAILS WITHOUT G22:
     // rollbackQuietly kept the session, so healthy row 1 was dead-lettered with 25P02.
@@ -717,7 +717,7 @@ class DsqlSinkOccRollbackTest {
         IllegalStateException.class,
         () -> task.put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3))));
     assertEquals(
-        List.of("prepare", "batch!23505", "rollback!" + failure.getSQLState(), "close"),
+        List.of("prepare", "batch!23514", "rollback!" + failure.getSQLState(), "close"),
         dsql.calls);
     assertEquals(1, reconnects.get()); // the fallback's first row opened a new session
     assertEquals(List.of(), dlq.states());

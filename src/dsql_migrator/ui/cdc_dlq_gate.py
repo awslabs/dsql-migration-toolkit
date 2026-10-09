@@ -225,6 +225,44 @@ def table_proof_reason(
     return None
 
 
+def cdc_dlq_proven_tables(
+    migration_state: object, validation_state: object
+) -> "dict[str, datetime]":
+    """The dead-lettered tables the cut-over gate no longer holds, each with the start of the
+    comparison that proved it. Pure.
+
+    The gate's own per-table rule (:func:`table_proof_reason` on the ledger's ``last_at``,
+    the comparison start from ``compared_overrides`` or ``compared_run_start``), applied the
+    way :func:`~dsql_migrator.ui.cdc_replica_identity_gate.replica_identity_proven_tables`
+    applies it: a value-verified CHECKSUM match whose comparison started more than
+    :data:`CDC_DLQ_EVIDENCE_MARGIN_SECONDS` after the table's last dead letter. A newer dead
+    letter, a row-count-only match, skipped deep checks or an unknown compare time leave the
+    table out, exactly as the gate keeps holding it. ``{}`` without a validation state.
+    """
+    if migration_state is None or validation_state is None:
+        return {}
+    ledger = dict(getattr(migration_state, "cdc_dlq_ledger", None) or {})
+    if not ledger:
+        return {}
+    report = getattr(validation_state, "result", None)
+    items = {i.table: i for i in (getattr(report, "items", None) or ())}
+    run_start = _aware(getattr(validation_state, "compared_run_start", None))
+    overrides = getattr(validation_state, "compared_overrides", None) or {}
+    proven: dict[str, datetime] = {}
+    for table, entry in ledger.items():
+        started = _aware(overrides.get(table)) or run_start
+        reason = table_proof_reason(
+            items.get(table),
+            release="released",
+            explained=False,
+            started=started,
+            last_at=_aware(getattr(entry, "last_at", None)),
+        )
+        if reason is None and started is not None:  # None implies a known start
+            proven[table] = started
+    return proven
+
+
 def cdc_dlq_waiver_covers(
     waiver: object,
     *,
@@ -1147,6 +1185,21 @@ def verdict_resolved_suffix(gate: Optional[CdcDlqGate]) -> str:
     return (
         f" CDC dead-lettered changes for {names}; each has since matched in a CHECKSUM "
         "comparison started after its last dead-lettered record."
+    )
+
+
+def cdc_dlq_resolved_body(proven: "Mapping[str, datetime]") -> str:
+    """The CDC step's "Reloaded and verified" notice body (:func:`cdc_dlq_proven_tables`).
+    Table names and times only."""
+    lines = "; ".join(
+        f"{table} matched by CHECKSUM in a Validation comparison started "
+        f"{_fmt_minute(_aware(started).astimezone(timezone.utc))}, after its last "
+        "dead-lettered record"
+        for table, started in sorted(proven.items())
+    )
+    return (
+        f"{lines}. Cut over no longer holds these tables; their dead-lettered records stay "
+        "listed below, and a new dead letter reopens this."
     )
 
 
