@@ -181,24 +181,82 @@ def new_topics_route(migration_type: object) -> str:
     )
 
 
+# G26: with CDC only, the refusals' route starts the new stack from the Full Load's watermark,
+# and CDC from a watermark carries only the changes after it. A Full Load that appended to rows
+# already on the target (Append is the Re-run dialog's default) kept them as they were, so an
+# update made before that point stays stale and a delete stays an extra row, silently (ROW_COUNT
+# can still match). The job record keeps no load mode: only the run's activity line names it, and
+# a chunk's rows "already there" also count a source-drop re-read's or a Retry's own rows. So the
+# route states the condition (rule E). RELOAD_FIRST follows its "then Start CDC on the new
+# stack."; _RELOAD_FIRST_ROUTE is the one-line form of the route.
+RELOAD_FIRST = (
+    "That Start begins at the Full Load's watermark, so if that Full Load appended to rows already "
+    "on the target, run it again choosing 'Drop & reload' before that Start (CDC only has no Full "
+    "Load step: switch the migration type to Full load only for that run, then back to CDC only). "
+    "An append keeps those rows as they were, and CDC from a watermark carries only the changes "
+    "after it."
+)
+_RELOAD_FIRST_ROUTE = (
+    "Delete CDC infrastructure and deploy it again, then Start CDC (if the Full Load appended to "
+    "rows already on the target, re-run it choosing 'Drop & reload' first)"
+)
+
+
+def reloads_first(migration_type: object, origin: str = "full_load") -> bool:
+    """Does a CDC only refusal's route start the new stack from the Full Load's watermark, so
+    that it names :data:`RELOAD_FIRST` (G26)? Not for a Manual start point (``origin``
+    ``"manual"``): the new stack starts from that point. Pure."""
+    return _cdc_only(migration_type) and origin == "full_load"
+
+
+def _route_line(migration_type: object, origin: str) -> str:
+    """The refusals' route in their one-line form. Pure."""
+    if reloads_first(migration_type, origin):
+        return _RELOAD_FIRST_ROUTE
+    if _cdc_only(migration_type):
+        return "Delete CDC infrastructure and deploy it again, then Start CDC on the new stack"
+    return (
+        "Delete CDC infrastructure and deploy it again, then Re-run Full Load choosing "
+        "'Drop & reload', then Start CDC"
+    )
+
+
 # A2: Start CDC refuses a start point newer than the one a streamed stack last started from.
 NEWER_POINT_HEADER = "This CDC stack cannot start from a newer start point"
+# ...and every start point on a stack whose first Start CloudFormation rolled back, while the
+# start offset that Start offered is unknown (``_cdc_ui._offer_unknown_refusal``): the refused
+# point may be that same one, so this header does not call it newer (G26).
+OFFER_UNKNOWN_HEADER = "This CDC stack's last start point is not known"
 
 
-def newer_point_line(migration_type: object) -> str:
+def newer_point_line(migration_type: object, origin: str = "full_load") -> str:
     """A2's one-line form: the disabled Start button's tooltip, a click-time refusal, and the
     Start CDC job's error after "Start CDC blocked: " -- under 300 characters with it, since a
-    job error keeps only its first line, so it carries the reason and the route. Pure."""
-    route = (
-        "Delete CDC infrastructure and deploy it again, then Start CDC on the new stack"
-        if _cdc_only(migration_type)
-        else "Delete CDC infrastructure and deploy it again, then Re-run Full Load choosing "
-        "'Drop & reload', then Start CDC"
+    job error keeps only its first line, so it carries the reason and the route. ``origin`` is
+    the refused start point's (:func:`reloads_first`); the route's Drop & reload condition
+    takes the place of the parenthesised why. Pure."""
+    why = (
+        "" if reloads_first(migration_type, origin)
+        else " (its sink would apply older changes over newer rows)"
     )
     return (
         "This CDC stack has streamed, so Start CDC does not move it forward to a newer start "
-        f"point (its sink would apply older changes over newer rows): {route}. Nothing was "
-        "changed."
+        f"point{why}: {_route_line(migration_type, origin)}. Nothing was changed."
+    )
+
+
+def offer_unknown_line(migration_type: object, origin: str = "full_load") -> str:
+    """The one-line form of the refusal on a stack whose first Start CloudFormation rolled
+    back, when the start offset that Start offered is no longer known -- neither this session
+    nor the stack's events, as read, give it (``_cdc_ui._offer_unknown_refusal``) -- like
+    :func:`newer_point_line`. Pure."""
+    why = (
+        "" if reloads_first(migration_type, origin)
+        else ", so no start point can be checked against it"
+    )
+    return (
+        "This CDC stack's last Start rolled back and the start offset it offered is no longer "
+        f"known{why}: {_route_line(migration_type, origin)}. Nothing was changed."
     )
 
 
@@ -209,12 +267,14 @@ def newer_point_notice(
     rolled_back: bool,
     migration_type: object,
     automatic_resumes: bool = False,
+    origin: str = "full_load",
 ) -> tuple[str, str, str, str]:
     """``(tone, icon, header, body)`` refusing a MySQL Start from ``point`` (a
     :func:`point_label`), later than ``last`` (``binlog F:P``, or ``None``: not recorded) --
     the start offset this streamed stack's last Start offered, or (``rolled_back``) the one
     the Start CloudFormation rolled back offered (G25, A2). ``automatic_resumes``: the start
-    point is a Manual one, and Automatic would continue this stream instead. Pure."""
+    point is a Manual one, and Automatic would continue this stream instead. ``origin``: the
+    start point's, for :func:`reloads_first`. Pure."""
     if rolled_back:
         lead = (
             f"CloudFormation rolled back this stack's last Start, which offered {last}; that "
@@ -240,6 +300,8 @@ def newer_point_notice(
         "silently. To start from a new "
         f"start point, use {new_topics_route(migration_type)}."
     )
+    if reloads_first(migration_type, origin):
+        body += f" {RELOAD_FIRST}"
     if automatic_resumes:
         body += " To continue this stream instead, set the CDC start point back to Automatic."
     return "error", "fast_forward", NEWER_POINT_HEADER, body + " No connectors were changed."
@@ -460,6 +522,7 @@ __all__ = [
     "E2_HEADER",
     "NEWER_POINT_HEADER",
     "NEW_TOPICS",
+    "OFFER_UNKNOWN_HEADER",
     "W1_HEADER",
     "KIND_CHANGED",
     "KIND_OK",
@@ -468,14 +531,17 @@ __all__ = [
     "PROBLEM_NO_BASELINE",
     "PROBLEM_NO_SOURCE",
     "PROBLEM_READ_FAILED",
+    "RELOAD_FIRST",
     "RELOAD_RESETS_MANUAL",
     "StartPointVerdict",
     "changed_rows",
     "new_topics_route",
     "newer_point_line",
     "newer_point_notice",
+    "offer_unknown_line",
     "point_coord",
     "point_label",
+    "reloads_first",
     "start_point_activity",
     "start_point_notice",
     "start_point_tooltip",

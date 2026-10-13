@@ -385,7 +385,9 @@ the bulk load and the stream.
    skip every change between where it stopped and the new point
    ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). After a first
    Start that CloudFormation rolled back, it refuses a later point than that Start offered,
-   and every start point once the app has restarted: the stack does not record that offer.
+   after an app restart too (the rollback restores the stack's parameters, but the app reads
+   that point from the stack's CloudFormation events), and every start point when those
+   events do not give it either.
    A **restart after Stop CDC** runs
    **`snapshot.mode=schema_only`** instead: it replays the recorded schema history
    and applies any DDL in binlog order. Such a restart, like any automatic connector

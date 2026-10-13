@@ -1367,6 +1367,11 @@ class DataMigrationState:
                 self.cdc_deployed_snapshot_mode = None
                 self.cdc_deployed_gtid_mode = None
                 self.cdc_history_missing = False
+                # ...and so does the start offset a Start offered its seeder (G26 repair): that
+                # stack's offset must not refuse a seed on this one (Start's earlier-offer
+                # check). The stack-phase probe reads a rolled-back stack's offer back from
+                # its events.
+                self.cdc_offered_seed = None
                 # ...and so does why its connectors stopped (names embed the stack name).
                 self._clear_cdc_connector_diagnoses_locked(None)
             self.cdc_stack_name = candidate

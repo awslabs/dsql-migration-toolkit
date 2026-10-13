@@ -15,10 +15,11 @@ module never imports the orchestration).
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.aws_session import (
     BotoSessionLike,
@@ -30,6 +31,7 @@ from dsql_migrator.core.cdc import (
     CDC_STACK_NAME_LEGACY_PREFIX,
     CDC_STACK_NAME_PREFIX,
 )
+from dsql_migrator.core.cdc_coords import validate_binlog_file
 
 # Stack statuses from which an UpdateStack can safely start. Anything in an
 # *_IN_PROGRESS / ROLLBACK / FAILED state means a deploy is unsafe right now.
@@ -75,6 +77,79 @@ class CdcStackDiscovery:
     stack_status: str
     current_parameters: dict[str, str]
     is_stable: bool
+
+
+# The offset seeder's custom resource (deploy/cdc-stack/cdc-stack.yaml). A MySQL Start in
+# SeedMode=Lambda creates it with the start offset it offers the seeder as resource properties
+# (WatermarkBinlogFile / WatermarkBinlogPos); SeedMode=External creates none -- the app seeds
+# in process.
+SEEDER_RESOURCE_ID = "CdcStartPrepResource"
+_STACK_RESOURCE_TYPE = "AWS::CloudFormation::Stack"
+# At most this many DescribeStackEvents pages (newest first) are read for a rolled-back
+# Start's offer; that Start's update and its rollback normally fit in the first.
+_OFFER_EVENT_PAGES = 5
+
+
+def _offer_from_properties(blob: object) -> Optional[tuple[str, int]]:
+    """``(file, pos)`` from a seeder event's ``ResourceProperties`` (a JSON object), or
+    ``None`` when it is missing or malformed, or names no start offset. Pure."""
+    if not isinstance(blob, str):
+        return None
+    try:
+        props = json.loads(blob)
+    except ValueError:
+        return None
+    if not isinstance(props, dict):
+        return None
+    file = str(props.get("WatermarkBinlogFile") or "").strip()
+    pos = str(props.get("WatermarkBinlogPos") or "").strip()
+    if validate_binlog_file(file) is not None or not (pos.isascii() and pos.isdigit()):
+        return None
+    return file, int(pos)
+
+
+def rolled_back_start_offer_from_events(
+    events: "Iterable[Mapping]", stack_name: str
+) -> Optional[tuple[str, int]]:
+    """The binlog ``(file, pos)`` the stack's latest update -- a Start CloudFormation rolled
+    back -- offered the offset seeder, from the stack's events NEWEST FIRST (as
+    ``DescribeStackEvents`` returns them); ``None`` when unknown. Pure (G26).
+
+    The rollback restored the stack's parameters, but each event of the seeder resource
+    carries its ``ResourceProperties``. The newest seeder event with properties in that
+    update's FORWARD phase counts: after the stack-level ``UPDATE_IN_PROGRESS`` that began it,
+    before its stack-level ``UPDATE_ROLLBACK_IN_PROGRESS``. The rollback phase carries the
+    restored properties, and a continued rollback starts another rollback phase. The scan
+    stops at that ``UPDATE_IN_PROGRESS``, so the caller's pagination stops there too.
+
+    Only a stack-level event WITHOUT a ``DetailedStatus`` begins a phase. One that carries it
+    reports a detail of a phase already begun (``CONFIGURATION_COMPLETE``: every resource
+    reached that point, and one can still fail after it; ``VALIDATION_FAILED``: the template's
+    properties failed validation), so it is skipped. An ``UPDATE_IN_PROGRESS`` with
+    ``CONFIGURATION_COMPLETE`` between the seeder's events and a connector's ``CREATE_FAILED``
+    therefore does not end the scan before the seeder's events (G26 repair).
+
+    ``None`` (the caller fails closed) when that event is not reached, the update did not roll
+    back, its forward phase has no seeder event with properties (SeedMode=External, or an
+    update that failed before the seeder), or the properties are malformed or name no start
+    offset.
+    """
+    forward = False
+    blob = None
+    for event in events:
+        logical = event.get("LogicalResourceId")
+        if event.get("ResourceType") == _STACK_RESOURCE_TYPE and logical == stack_name:
+            if event.get("DetailedStatus"):
+                continue  # a point within a phase, not its start
+            status = str(event.get("ResourceStatus") or "")
+            if status == "UPDATE_IN_PROGRESS":
+                return _offer_from_properties(blob) if forward else None
+            if status == "UPDATE_ROLLBACK_IN_PROGRESS":
+                forward, blob = True, None
+            continue
+        if forward and blob is None and logical == SEEDER_RESOURCE_ID:
+            blob = event.get("ResourceProperties") or None
+    return None
 
 
 # MSK Serverless supports only a subset of a region's AZs and offers no API to
@@ -538,6 +613,34 @@ class CdcStackDeployer:
             out.append((ts, msg))
         out.sort(key=lambda x: x[0])
         return out
+
+    def rolled_back_start_offer(self, stack_name: str) -> Optional[tuple[str, int]]:
+        """The binlog ``(file, pos)`` the stack's latest update -- a Start CloudFormation
+        rolled back -- offered the offset seeder (:func:`rolled_back_start_offer_from_events`),
+        or ``None``. Read-only ``DescribeStackEvents``: at most :data:`_OFFER_EVENT_PAGES`
+        pages, and none after the one holding the stack-level ``UPDATE_IN_PROGRESS`` (with no
+        ``DetailedStatus``) that began that update. ``None`` on ANY read error: unknown, which
+        the caller fails closed on (G26). The stack-phase probe reads it, and so does the
+        Start CDC worker for its own describe (G26 repair)."""
+        try:
+            client = self._client("cloudformation")
+
+            def _events():
+                token = None
+                for _ in range(_OFFER_EVENT_PAGES):
+                    page = (
+                        client.describe_stack_events(StackName=stack_name, NextToken=token)
+                        if token
+                        else client.describe_stack_events(StackName=stack_name)
+                    )
+                    yield from page.get("StackEvents", []) or []
+                    token = page.get("NextToken")
+                    if not token:
+                        return
+
+            return rolled_back_start_offer_from_events(_events(), stack_name)
+        except Exception:  # noqa: BLE001 - unreadable: the offer is unknown
+            return None
 
     def seeder_eni_count(self, stack_name: str) -> Optional[int]:
         """Count the in-VPC seeder Lambda's still-present ENIs, or ``None`` if unknown.

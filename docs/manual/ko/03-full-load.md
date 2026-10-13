@@ -216,15 +216,26 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
   streamed, so Start CDC does not move it forward to a newer start point …*)도 거부합니다. 거부된 Manual
   지점은 시작 지점을 **Automatic**으로 되돌리면 스트림이 이어지는 경우 그렇다고도 알려 줍니다. 그 지점과
   같거나 이전인 시작 지점, 또는 시작 지점이 없는 Start는 스트림을 이어 가며 거부되지 않습니다.
-  CloudFormation이 롤백한 첫 Start 뒤에는 스택에 Start를 롤백했다는 사실만 남습니다: 롤백이 스택의
-  파라미터를 되돌리므로, 그 Start가 준 시작 지점은 앱의 메모리에만 남습니다. 앱이 그 지점을 알고 있는
-  동안에는 그보다 뒤의 시작 지점은 거부되고, 같은 시작 지점에서 다시 시작하는 것은 거부되지 않습니다. 앱을
-  재시작한 뒤에는(또는 다른 세션에서 한 Start라면) 어떤 시작 지점도 그 지점과 비교할 수 없으므로, 그
-  스택에서는 같은 시작 지점을 포함해 모든 시작 지점이 같은 경로와 함께 거부됩니다(*CloudFormation rolled
-  back this stack's last Start, and the start offset that Start offered is no longer known …*).
-  CDC only 경로는 새 스택을 Full Load의 워터마크에서 시작하므로, Full load only 재실행이 타깃에 이미 있던
-  행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요(append는 그 행을 그대로 두고,
-  워터마크에서 시작한 CDC는 그 뒤의 변경만 가져옵니다).
+  CloudFormation이 롤백한 첫 Start 뒤에는 롤백이 스택의 파라미터를 되돌리므로 파라미터에는 그 Start가 준
+  시작 지점이 더 이상 없지만, 스택의 CloudFormation 이벤트에는 아직 남아 있습니다(오프셋 시더의 속성):
+  앱은 다음 Start를 자신이 기록한 그 지점과 비교하고, 앱을 재시작한 뒤에는(또는 다른 세션에서 한
+  Start라면) 그 이벤트에서 읽은 그 지점과 비교합니다. 그보다 뒤의 시작 지점은 거부되고, 같은 시작
+  지점에서 다시 시작하는 것은 거부되지 않으며, 그보다 이전의 시작 지점은 Start CDC를 클릭할 때, 또는
+  이 세션이 그 지점을 아직 읽지 않았을 때는 Start CDC 작업에서 거부됩니다(*This start point cannot be
+  applied*: 그 오프셋은 시드된 채로 남고, 시더는 되감지 않습니다). 이벤트에서도 그 지점을 얻지 못하면
+  — 예를 들어 이벤트를 읽을 수 없거나, 그 Start가 오프셋 시더 Lambda 대신 앱 안에서 Kafka를
+  시드했다면(단일 EC2 호스트가 그렇게 합니다,
+  [§1.4](01-setup.md#14-단일-ec2-호스트에서-실행-소스에서)) — 어떤 시작 지점도 그 지점과 비교할 수
+  없으므로, 그 스택에서는 같은 시작 지점을 포함해 모든 시작 지점이 같은 경로와 함께 거부됩니다(*This CDC
+  stack's last start point is not known*: *CloudFormation rolled back this stack's last Start, and
+  the start offset that Start offered is no longer known …*). CDC only 경로는 새 스택을 Full Load의
+  워터마크에서 시작하므로, 거부된 지점이 그 워터마크(Automatic)이면 거부가 그 경로의 조건을 덧붙입니다:
+  그 Full Load가 타깃에 이미 있던 행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요.
+  CDC only에는 Full Load 단계가 없으므로 그 실행 동안 마이그레이션 유형을 Full load only로 바꾼 뒤 다시
+  CDC only로 돌아옵니다(append는 그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 변경만
+  가져옵니다). 비활성화된 Start의 툴팁과 작업의 오류에서는 그 경로가 *Delete CDC infrastructure and deploy it
+  again, then Start CDC (if the Full Load appended to rows already on the target, re-run it choosing
+  'Drop & reload' first)*로 표시됩니다.
   PostgreSQL에는 이런 거부가 없습니다: Start CDC는 Full Load의 워터마크와 상관없이 스택 자체의
   복제 슬롯에서 이어 가고, Full load only 실행은 그 슬롯을 건드리지 않으므로, 스택의 소스 커넥터가
   스트리밍했다면 CDC는 Stop CDC 후의 모든 재시작처럼(위) 멈춘 곳에서 이어 갑니다(그렇지 않으면 Debezium이
@@ -288,8 +299,8 @@ Aurora DSQL의 일시적 상태는 거부가 아닙니다: `40001`, 끊긴 연�
 - 중단/재시도는 미완료 범위만 다시 실행;
 - `INSERT ... ON CONFLICT` 덕분에 배치를 다시 실행해도 중복이 생기지 않음.
 
-"실패 테이블 재시도" 경로는 실패 테이블만 대기 상태로 리셋하고, **원래 워터마크를 재사용**하며, 완료된
-테이블은 유지합니다 — 작업을 다시 하거나 CDC 핸드오프 지점을 잃지 않습니다.
+**Retry unfinished tables** 경로는 미완료 테이블만 대기 상태로 리셋하고, **원래 워터마크를 재사용**하며,
+완료된 테이블은 유지합니다 — 작업을 다시 하거나 CDC 핸드오프 지점을 잃지 않습니다.
 
 로드 후에 선택한 테이블(Full load only는 테이블 집합을 바꿀 수 있습니다.
 [13.7](13-excluding-tables-and-columns.md) 참고)도 같은 재시도가 로드하지만, 원래 워터마크는 그 테이블을

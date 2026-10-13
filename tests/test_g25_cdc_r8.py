@@ -14,6 +14,12 @@ earlier-offer refusal's way on.
   rolled-back Start recorded". Now no seed can be shown to be at or before an offer the app no
   longer knows, so every seed is refused there, on the cards, the click, the dialog and the
   worker, with the route (new CDC topics first).
+  DELIBERATE G26 UPDATE: since G26 the stack-phase probe reads that offer back from the stack's
+  events (the offset seeder's resource properties), so after a restart a retry from it is taken
+  again and a later or earlier point refused, as before the restart (tests/test_g26_cdc.py).
+  The refusals pinned here hold while the offer stays unknown: ``_restarted``'s deployer reads
+  no events unless given ``offer``, as when they cannot be read. Their header no longer calls
+  the refused point newer: it may be that same one.
 * The earlier-offer refusal ("Start from that offset or later") named a later point that A2
   refuses on a stack that has streamed (a rolled-back Start, or its connectors in place).
 
@@ -28,7 +34,11 @@ from types import SimpleNamespace
 import pytest
 
 from dsql_migrator.core.models import MigrationMode, SourceType
-from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER, new_topics_route
+from dsql_migrator.ui.cdc_start_point_gate import (
+    NEWER_POINT_HEADER,
+    OFFER_UNKNOWN_HEADER,
+    new_topics_route,
+)
 from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType, _cdc_ui
 from dsql_migrator.ui.data_migration import _cdc_status as st
 from tests.test_g25_cdc_r7 import (
@@ -54,10 +64,18 @@ _RESTORED = {
     "WatermarkBinlogPos": "",
     "TableIncludeList": "app.orders",
 }
+# The start offset the rolled-back Start offered (W1), as read from the stack's events (G26).
+_OFFER = ("mysql-bin.000090", 4)
+# DELIBERATE G26 UPDATE: "the app kept that offset only in memory" is no longer true -- the
+# stack-phase probe also reads it from the stack's events. DELIBERATE G26 REPAIR UPDATE: the
+# lead names an app restart and a Start made outside this session only as possible reasons
+# (the worker reads the events too: tests/test_g26_repair_cdc.py).
 _UNKNOWN_LEAD = (
     "CloudFormation rolled back this stack's last Start, and the start offset that Start "
-    "offered is no longer known: the rollback restored the stack's parameters, and the app "
-    "kept that offset only in memory, which an app restart clears."
+    "offered is no longer known: the rollback restored the stack's parameters, this session "
+    "holds no record of that offset (the app may have restarted since that Start, or that "
+    "Start may have been made outside this session), and it could not be read from the "
+    "stack's events."
 )
 _LINE = {
     MigrationType.FULL_LOAD_AND_CDC: (
@@ -66,10 +84,13 @@ _LINE = {
         "deploy it again, then Re-run Full Load choosing 'Drop & reload', then Start CDC. "
         "Nothing was changed."
     ),
+    # DELIBERATE G26 UPDATE: the new stack starts from the Full Load's watermark, so the CDC
+    # only route carries the Drop & reload condition (tests/test_g26_cdc.py).
     MigrationType.CDC_ONLY: (
         "This CDC stack's last Start rolled back and the start offset it offered is no longer "
-        "known, so no start point can be checked against it: Delete CDC infrastructure and "
-        "deploy it again, then Start CDC on the new stack. Nothing was changed."
+        "known: Delete CDC infrastructure and deploy it again, then Start CDC (if the Full Load "
+        "appended to rows already on the target, re-run it choosing 'Drop & reload' first). "
+        "Nothing was changed."
     ),
 }
 _NEW_WAY = (
@@ -83,9 +104,11 @@ _OLD_WAY = (
 
 
 def _restarted(monkeypatch, migration_type=MigrationType.FULL_LOAD_AND_CDC, *,
-               status="UPDATE_ROLLBACK_COMPLETE"):
+               status="UPDATE_ROLLBACK_COMPLETE", offer=None):
     """The session after an app restart: a new state (no offered seed in memory), then the
-    stack-phase probe reads the rolled-back stack again."""
+    stack-phase probe reads the rolled-back stack again. ``offer`` (G26): the ``(file, pos)``
+    its deployer reads from the stack's events; ``None`` -- it reads none, as when they cannot
+    be read (the real read: tests/test_g26_cdc.py)."""
     import dsql_migrator.core.cdc_deployer as dep
     from dsql_migrator.core.cdc_stack_deployer import CdcStackDiscovery
 
@@ -96,6 +119,8 @@ def _restarted(monkeypatch, migration_type=MigrationType.FULL_LOAD_AND_CDC, *,
         def list_cdc_stacks(self):
             return []
 
+    if offer is not None:
+        _Deployer.rolled_back_start_offer = lambda self, _name: offer
     monkeypatch.setattr(dep, "build_cdc_stack_deployer", lambda *_a, **_k: _Deployer())
     state = DataMigrationState()
     state.migration_type = migration_type
@@ -116,7 +141,8 @@ def test_the_rolled_back_start_is_judged_from_the_stack_after_an_app_restart(mon
     before = _rolled_back()
     assert _cdc_ui.newer_start_point_refusal(before, _W1, MYSQL) is None
     assert _cdc_ui.newer_start_point_refusal(before, _W2, MYSQL) is not None
-    # After it the probe reads the rollback again, and the offer is gone with the memory.
+    # After it the probe reads the rollback again, and the offer is gone with the memory (and,
+    # here, the stack's events do not give it either -- G26).
     after = _restarted(monkeypatch)
     assert after.cdc_stack_phase == "infra" and st.cdc_start_rolled_back(after)
     assert after.cdc_offered_seed is None and after.cdc_deployed_watermark is None
@@ -127,7 +153,8 @@ def test_the_rolled_back_start_is_judged_from_the_stack_after_an_app_restart(mon
         refusal = _cdc_ui.newer_start_point_refusal(after, seed, MYSQL)
         assert refusal is not None, seed
         (tone, _icon, header, body), line = refusal
-        assert (tone, header) == ("error", NEWER_POINT_HEADER)
+        # DELIBERATE G26 UPDATE: the header no longer calls W1 -- that same point -- newer.
+        assert (tone, header) == ("error", OFFER_UNKNOWN_HEADER)
         assert body.startswith(_UNKNOWN_LEAD)
         assert "None" not in body and "is later than" not in body
         assert body.endswith(
@@ -156,7 +183,7 @@ def test_after_a_restart_the_cards_refuse_and_claim_no_continuity(monkeypatch, m
     state = _restarted(monkeypatch, mtype)
     start = _start_card(state, _W2)
     blob = " ".join(start.texts)
-    assert NEWER_POINT_HEADER in blob and _UNKNOWN_LEAD in blob
+    assert OFFER_UNKNOWN_HEADER in blob and _UNKNOWN_LEAD in blob
     assert f"To start CDC, use {new_topics_route(mtype)}." in blob
     # FAILS WITHOUT THE FIX: "Ready to start CDC again ... continues from the position the
     # rolled-back Start recorded, if it recorded one" over an enabled Start.
@@ -165,7 +192,7 @@ def test_after_a_restart_the_cards_refuse_and_claim_no_continuity(monkeypatch, m
     assert start.start_disabled is True
     assert start.start_tooltip == _LINE[mtype]
     card = " ".join(_point_card(state, _W2).texts)
-    assert NEWER_POINT_HEADER in card and _UNKNOWN_LEAD in card and "Action needed" in card
+    assert OFFER_UNKNOWN_HEADER in card and _UNKNOWN_LEAD in card and "Action needed" in card
     assert "Automatic — from the Full Load watermark" in card
     assert "Automatic — from the Full Load watermark (recommended)" not in card
     assert "Starting again after a rolled-back Start" not in card
@@ -173,19 +200,36 @@ def test_after_a_restart_the_cards_refuse_and_claim_no_continuity(monkeypatch, m
 
 
 @pytest.mark.parametrize(
-    "mtype,seed",
+    "mtype,seed,offer",
     [
-        (MigrationType.FULL_LOAD_AND_CDC, _W1),  # the retry, from the start point it offered
-        (MigrationType.CDC_ONLY, _W2),  # the detour's watermark, on to CDC only
+        # DELIBERATE G26 UPDATE: the retry from the start point the rolled-back Start offered
+        # (W1) is refused only while that offer stays unknown -- here the stack's events give
+        # none. Read from them, the same retry is taken (tests/test_g26_cdc.py).
+        (MigrationType.FULL_LOAD_AND_CDC, _W1, None),
+        (MigrationType.CDC_ONLY, _W2, None),  # the detour's watermark, on to CDC only
+        # G26: with the offer read from the stack's events (W1), the detour's later W2 is
+        # refused against it (A2), no longer as unknown.
+        (MigrationType.CDC_ONLY, _W2, _OFFER),
     ],
+    ids=["retry, offer unknown", "detour, offer unknown", "detour, offer read"],
 )
-def test_after_a_restart_the_click_refuses_before_any_job(monkeypatch, mtype, seed) -> None:
-    state = _restarted(monkeypatch, mtype)
+def test_after_a_restart_the_click_refuses_before_any_job(
+    monkeypatch, mtype, seed, offer
+) -> None:
+    state = _restarted(monkeypatch, mtype, offer=offer)
     run = _capture(monkeypatch, state, seed)
     assert not run["submitted"] and run["kwargs"] == {}
-    assert [n["header"] for n in run["notices"]] == [NEWER_POINT_HEADER]
-    assert run["notices"][0]["body"].startswith(_UNKNOWN_LEAD)
-    assert new_topics_route(mtype) in run["notices"][0]["body"]
+    (notice,) = run["notices"]
+    if offer is None:
+        assert notice["header"] == OFFER_UNKNOWN_HEADER
+        assert notice["body"].startswith(_UNKNOWN_LEAD)
+    else:
+        assert notice["header"] == NEWER_POINT_HEADER
+        assert notice["body"].startswith(
+            "CloudFormation rolled back this stack's last Start, which offered binlog "
+            "mysql-bin.000090:4; "
+        )
+    assert new_topics_route(mtype) in notice["body"]
 
 
 def test_the_worker_refuses_on_a_fresh_describe_that_shows_the_rollback() -> None:
@@ -255,8 +299,8 @@ def test_after_a_restart_the_dialog_refuses_and_runs_no_start_position_read(monk
             ui, state, lambda: None, session=None, job_manager=_JM(_W1), inventory=None,
         )
     )
-    assert ("error", NEWER_POINT_HEADER) in ui.notices
-    assert bodies[NEWER_POINT_HEADER].startswith(_UNKNOWN_LEAD)
+    assert ("error", OFFER_UNKNOWN_HEADER) in ui.notices
+    assert bodies[OFFER_UNKNOWN_HEADER].startswith(_UNKNOWN_LEAD)
     assert reads == []
     assert ui.buttons["Start CDC"].enabled is False
 

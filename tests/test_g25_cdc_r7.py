@@ -233,13 +233,18 @@ def test_a_newer_watermark_after_a_detour_is_refused_on_the_cards(detour) -> Non
 
 def test_the_one_line_refusal_fits_a_job_error() -> None:
     for mtype in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
-        line = f"Start CDC blocked: {newer_point_line(mtype)}"
-        assert len(line) <= 300, len(line)
-        assert "Delete CDC infrastructure and deploy it again" in line
+        for origin in ("full_load", "manual"):
+            line = f"Start CDC blocked: {newer_point_line(mtype, origin)}"
+            assert len(line) <= 300, len(line)
+            assert "Delete CDC infrastructure and deploy it again" in line
     assert "Re-run Full Load choosing 'Drop & reload'" in newer_point_line(
         MigrationType.FULL_LOAD_AND_CDC
     )
-    assert "Start CDC on the new stack" in newer_point_line(MigrationType.CDC_ONLY)
+    # DELIBERATE G26 UPDATE: with CDC only, the new stack starts from the Full Load's watermark,
+    # so the route carries the Drop & reload condition (tests/test_g26_cdc.py); a Manual start
+    # point's route is unchanged.
+    assert "re-run it choosing 'Drop & reload' first" in newer_point_line(MigrationType.CDC_ONLY)
+    assert "Start CDC on the new stack" in newer_point_line(MigrationType.CDC_ONLY, "manual")
 
 
 def _capture(monkeypatch, state, wm, **kw):

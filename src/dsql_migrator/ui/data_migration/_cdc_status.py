@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Mapping, Optional, Sequence
 
 _logger = logging.getLogger(__name__)
@@ -1157,8 +1158,8 @@ class NewerStartPoint:
 
     ``last``: the ``(file, pos)`` start offset this stack's last Start offered -- its
     ``Watermark*`` parameters, or (``rolled_back``) the seed the Start CloudFormation rolled
-    back offered, as this process recorded it -- or ``None`` when the stack records none (and,
-    with ``rolled_back``, when this process holds none either: an app restart).
+    back offered, as this process recorded it or read it from the stack's events (G26) -- or
+    ``None`` when the stack records none (and, with ``rolled_back``, when neither gives it).
     """
 
     last: Optional[tuple]
@@ -1194,14 +1195,17 @@ def newer_start_point(
     * Connectors in place (``connectors_exist``: Retry CDC on an incomplete pipeline):
       refused only when it is provably past ``deployed_watermark``.
     * A first Start CloudFormation rolled back (``rolled_back``, no committed offset): its
-      parameters are restored, so the stack records only THAT it rolled back a Start (its
-      ``UPDATE_ROLLBACK_*`` status, which the stack-phase probe reads again after an app
-      restart), not the seed that Start offered. Judged against this process's record of that
-      seed (``offered_seed``): a later seed is refused, the same or an earlier one is not
-      here (Start's earlier-offer check, ``_cdc_ui.seed_refused_by_an_earlier_offer``, refuses
-      an earlier one). With no record -- an app restart, or a Start this process did not make
-      -- no seed can be shown to be at or before it, so any seed is refused (``last`` None),
-      like a stopped stack judged against none.
+      parameters are restored, so they no longer say which seed that Start offered. Judged
+      against the record of that seed (``offered_seed``) -- this process's own, or the one
+      read from the stack's events (the offset seeder's properties, G26: by the stack-phase
+      probe, and by the Start CDC worker for its own describe), which an app restart or a
+      Start made outside this session does not lose: a later seed is refused, the same one
+      (a gapless retry: the seeder keeps any offset at or past it) or an earlier one is not
+      here (Start's earlier-offer check, ``_cdc_ui.seed_refused_by_an_earlier_offer``,
+      refuses an earlier one). With no record -- the events unreadable, a Start that seeded in
+      the app (SeedMode=External) or malformed seeder properties -- no seed can be shown to be
+      at or before it, so any seed is refused (``last`` None), like a stopped stack judged
+      against none.
 
     PostgreSQL is never refused here: its Start continues from the stack's stored offset and
     slot whatever the job watermark says (no offset is seeded), so a Full load only detour --
@@ -1274,6 +1278,23 @@ def mysql_start_facts_from_params(seed, parameters, *, history_missing: bool):
     )
 
 
+def _rolled_back_offer(deployer, stack_name: str, status: Optional[str]):
+    """The ``(file, pos)`` start offset the stack's last Start offered, read from the stack's
+    events (``CdcStackDeployer.rolled_back_start_offer``) when ``status`` is a rollback one
+    (G26); ``None`` for any other status, or when it is unknown. Never raises. The stack-phase
+    probe reads it for its describe, the Start CDC worker for its own (G26 repair)."""
+    if not str(status or "").strip().upper().startswith("UPDATE_ROLLBACK"):
+        return None
+    read = getattr(deployer, "rolled_back_start_offer", None)
+    if not callable(read):
+        return None
+    try:
+        return read(stack_name)
+    except Exception:  # noqa: BLE001 - unknown: Start stays refused there (fail closed)
+        _logger.warning("Reading the rolled-back CDC Start's start offset failed", exc_info=True)
+        return None
+
+
 def _probe_cdc_stack_phase(migration_state, session) -> None:
     """Probe the cdc-stack's lifecycle phase once and cache it on the state.
 
@@ -1316,7 +1337,19 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         migration_state.set_cdc_probe_error(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
         return
     phase, status = _classify_cdc_stack_phase(discovery)
+    # G26: the rollback of a Start restored the stack's parameters, which then no longer hold
+    # the start offset that Start offered -- what a later MySQL Start is judged against
+    # (newer_start_point, the earlier-offer check). The stack's events still hold it (the
+    # offset seeder's resource properties): read them (before the facts below are set, so the
+    # read does not leave them half-updated), only for a rollback status, and record the offer
+    # as this process records one it makes (in memory, cleared with the stack), so an app
+    # restart keeps the gapless retry. Unknown: nothing is recorded (fail closed).
+    offer = _rolled_back_offer(deployer, mine, status)
     migration_state.set_cdc_stack_phase(phase, status=status)
+    if offer:
+        migration_state.note_cdc_offered_seed(
+            SimpleNamespace(binlog_file=offer[0], binlog_position=offer[1])
+        )
     migration_state.set_cdc_other_stacks(others)
     # Has this stack streamed before? If so its resume offset is already committed to
     # the (fixed-name, Stop-surviving) offsets topic, so Start CDC needs no watermark --
@@ -3448,7 +3481,8 @@ def cdc_discovery_fingerprint(migration_state) -> tuple:
 
     Covers every field ``_ensure_cdc_controller`` / ``_probe_cdc_stack_phase`` write:
     controller presence, connector names, running-connector names, stack phase, the
-    other-stacks list, and whether the phase probe has reported. Presence (not identity)
+    other-stacks list, whether the phase probe has reported, and the offered start offset it
+    may read from a rolled-back Start's events. Presence (not identity)
     for the controller: it is rebuilt on each probe, so comparing the object would
     always look changed.
     """
@@ -3466,4 +3500,7 @@ def cdc_discovery_fingerprint(migration_state) -> tuple:
         # determined" notice updates to name the real cause instead of staying on the
         # generic restored-session message.
         getattr(migration_state, "cdc_probe_error", None),
+        # A rolled-back Start's offer, read from the stack's events (G26): once known, a
+        # retry from it is no longer refused, so the cards must re-render.
+        getattr(migration_state, "cdc_offered_seed", None),
     )

@@ -3087,7 +3087,8 @@ def build_data_migration_screen(
                                 # to the already-loaded target from the Full Load
                                 # watermark. Point them at the migration-type selector
                                 # above, and note the infra may need deploying first
-                                # (a Full-load-only plan typically has no CDC stack).
+                                # (a Full-load-only plan typically has no CDC stack) --
+                                # said only once the CDC state is read (G26, below).
                                 infra_ready = getattr(
                                     migration_state, "cdc_stack_phase", None
                                 ) in ("infra", "running", "unstable")
@@ -3137,6 +3138,15 @@ def build_data_migration_screen(
                                 )
 
                                 _streamed = cdc_stack_has_streamed(migration_state)
+                                # G26: Full load only never arms the stack-phase probe, so
+                                # after an app restart (or a failed probe) the CDC state is
+                                # unread, and an unread state reads as never started -- on
+                                # a stack that streamed or rolled back a Start too. Unread,
+                                # the notice states nothing about that stack: its CDC step
+                                # reads it once the type is switched.
+                                _read = bool(
+                                    getattr(migration_state, "cdc_stack_phase_checked", False)
+                                )
                                 if _coverage_gap is not None:
                                     _started = _cdc_started_for_migration(
                                         migration_state, job_manager
@@ -3153,6 +3163,12 @@ def build_data_migration_screen(
                                         )
                                         if _is_pg
                                         else ""
+                                    )
+                                elif not _read:
+                                    body = (
+                                        _CDC_NEXT_UNREAD_PG
+                                        if _is_pg
+                                        else _CDC_NEXT_UNREAD_MYSQL
                                     )
                                 elif _is_pg and _streamed:
                                     from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
@@ -3259,7 +3275,7 @@ def build_data_migration_screen(
                                         "watermark carries only the changes after it. Use "
                                         "the link below to jump to that setting."
                                     )
-                                if not infra_ready:
+                                if _read and not infra_ready:
                                     body += (
                                         " CDC streaming infrastructure isn't deployed "
                                         "yet, so you'll deploy it first (usually ~5 min) "
@@ -4067,6 +4083,37 @@ def migratable_table_names(
 from dsql_migrator.ui.data_migration._models import (  # noqa: E402
     MIGRATION_TYPE_ANCHOR,
     SCROLL_TO_MIGRATION_TYPE_JS,
+)
+
+# G26: the Full load only "want CDC next?" notice while this migration's CDC state is UNREAD
+# (``cdc_stack_phase_checked`` False). Full load only never arms the stack-phase probe, so after
+# an app restart -- or a probe that failed -- nothing says whether the cdc-stack streamed or
+# rolled back a Start, and the never-started wording ("streams from this Full Load's watermark",
+# "infrastructure isn't deployed yet") was false on such a stack. These state only what holds
+# for any stack: the CDC step reads the infrastructure once the type is switched (the plan-level
+# discovery arms for every CDC type) and says what Start CDC will do there; what a stack never
+# started does comes only under that condition; and rule E's Drop & reload advice, which holds
+# either way (CDC from this watermark -- a never-started stack's, or a new stack's after a
+# refused newer start point -- carries only the changes after it).
+_CDC_NEXT_UNREAD = (
+    "To keep the target in sync with ongoing source changes, set the migration type to "
+    "\"CDC only\": its CDC step reads this migration's CDC infrastructure and says what Start "
+    "CDC will do there (deploy the infrastructure first if there is none)."
+)
+_CDC_NEXT_UNREAD_MYSQL = (
+    _CDC_NEXT_UNREAD
+    + " Unless this migration's CDC stack was started before, CDC streams from this Full "
+    "Load's watermark onto the already-loaded target (no re-snapshot). If this run appended "
+    "to rows an earlier load left on the target, first Re-run Full Load choosing 'Drop & "
+    "reload': an append keeps those rows as they were, and CDC from a watermark carries only "
+    "the changes after it. Use the link below to jump to that setting."
+)
+_CDC_NEXT_UNREAD_PG = (
+    "This run created no replication slot (a Full load only run never does). "
+    + _CDC_NEXT_UNREAD
+    + " Unless this migration's CDC stack was started before, Start CDC re-snapshots every "
+    "selected table first (nothing is lost, but the source is read again). Use the link "
+    "below to jump to that setting."
 )
 
 

@@ -258,18 +258,30 @@ replication slot again at its own snapshot point), then **Start CDC**.
   streamed, so Start CDC does not move it forward to a newer start point …*), refuse it too.
   A refused Manual point also says when setting the start point back to **Automatic** would
   continue the stream. A start point at or before that one, or none, continues the stream
-  and is not refused. After a first Start that CloudFormation rolled back, the stack records
-  only that it rolled back a Start: the rollback restores its parameters, so the start point
-  that Start offered is kept only in the app's memory. While the app holds it, a start point
-  later than that one is refused and a retry from the same one is not. After an app restart
-  (or for a Start made in another session) no start point can be checked against it, so
-  every start point is refused on that stack, that same one included (*CloudFormation rolled
-  back this stack's last Start, and the start offset that Start offered is no longer known
-  …*), with the same route. The CDC only route starts the new stack from the Full Load's
-  watermark, so after a Full load only re-run that appended to rows already on the target,
-  run it again choosing **Drop & reload** before that Start (an append keeps those rows as
-  they were, and CDC from a watermark carries only the changes after it). On PostgreSQL
-  there is no such
+  and is not refused. After a first Start that CloudFormation rolled back, the rollback
+  restores the stack's parameters, so they no longer hold the start point that Start
+  offered, but the stack's CloudFormation events still do (the offset seeder's properties):
+  the app judges the next Start against that point as it recorded it, or, after an app
+  restart (or for a Start made in another session), as it reads it from those events. A
+  start point later than that one is refused, a retry from the same one is not, and an
+  earlier one is refused at the click on Start CDC, or by the Start CDC job when this
+  session had not read that point yet (*This start point cannot be applied*: that offset
+  stays seeded, and the seeder never rewinds). When the events do not give that
+  point either — they cannot be read, for example, or that Start seeded Kafka in the app
+  instead of through the offset-seeder Lambda, as the single EC2 host does
+  ([§1.4](01-setup.md#14-run-on-a-single-ec2-host-from-source)) — no start point can be
+  checked against it, so every start point is refused on that stack, that same one
+  included (*This CDC stack's last start point is not known*: *CloudFormation rolled back
+  this stack's last Start, and the start offset that Start offered is no longer known …*),
+  with the same route. The CDC only route starts the new stack from the Full Load's
+  watermark, so when the refused point is that watermark (Automatic), the refusal adds that
+  route's condition: if that Full Load appended to rows already on the target, run it again
+  choosing **Drop & reload** before that Start — CDC only has no Full Load step, so switch
+  the migration type to Full load only for that run, then back to CDC only (an append keeps
+  those rows as they were, and CDC from a watermark carries only the changes after it). In
+  the disabled Start's tooltip and the job's error, the route reads *Delete CDC infrastructure and
+  deploy it again, then Start CDC (if the Full Load appended to rows already on the target,
+  re-run it choosing 'Drop & reload' first)*. On PostgreSQL there is no such
   refusal: Start CDC continues from the stack's own replication slot whatever the Full Load's
   watermark says, and a Full load only run leaves that slot alone, so CDC continues from
   where it stopped if the stack's source connector streamed (otherwise Debezium snapshots
@@ -347,9 +359,9 @@ units**:
 - a stop / retry re-runs only the unfinished ranges;
 - `INSERT ... ON CONFLICT` makes re-running a batch idempotent (no duplicates).
 
-The "retry failed tables" path resets only the failed tables to pending, **reuses
-the original watermark**, and keeps the completed tables — so you never redo work
-or lose the CDC handoff point.
+The **Retry unfinished tables** path resets only the unfinished tables to pending,
+**reuses the original watermark**, and keeps the completed tables — so you never redo
+work or lose the CDC handoff point.
 
 A table selected after the load (Full load only lets the table set change; see
 [13.7](13-excluding-tables-and-columns.md)) is loaded by the same retry, but the

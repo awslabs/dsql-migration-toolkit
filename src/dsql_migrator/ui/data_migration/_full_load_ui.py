@@ -1927,7 +1927,7 @@ def _render_full_load_step(
                     else:
                         rerun_btn.tooltip(
                             "Re-runs ALL selected tables from a fresh snapshot (new "
-                            "watermark). Use 'Retry failed tables' to resume only "
+                            "watermark). Use 'Retry unfinished tables' to resume only "
                             "the unfinished ones instead."
                         )
                     # Spacer pushes the recommended action to the right edge.

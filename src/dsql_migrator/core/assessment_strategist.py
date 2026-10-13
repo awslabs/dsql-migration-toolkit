@@ -724,15 +724,21 @@ def _cdc_capture_phrase(source_engine: str) -> str:
 # How a migrated source->DSQL pipeline can diverge, and what fixes it. Grounds the
 # validation chat so the model reasons about THIS tool's Full Load + CDC model
 # (not generic replication) and recommends the right recovery.
+# G26: the backfill steps are those of Validation's "How to recover" card
+# (ui/validation.py _render_recovery_section), one nested bullet per migration type and CDC
+# stack state -- the facts carry neither, so every case is named. Before CDC from a new start
+# point the re-run is a Drop & reload (rule E): an Append keeps the rows already on the target
+# without the updates and deletes made before that point. The idempotent append is named only
+# for missing rows under the ORIGINAL start point, and for Full load only (no CDC step, rule F).
 def _validation_recovery_context(source_engine: str = "MySQL") -> str:
-    watermark = "LSN" if source_engine == "PostgreSQL" else "binlog"
+    watermark = "an LSN" if source_engine == "PostgreSQL" else "a binlog"
     return (
     "How this migration works (use it to reason about WHY a table diverges and "
     "WHAT fixes it):\n"
     "- Full Load is a one-shot bulk copy (the tool's own loader). CDC then streams "
-    f"ongoing changes ({_cdc_capture_phrase(source_engine)}) from a {watermark} "
+    f"ongoing changes ({_cdc_capture_phrase(source_engine)}) from {watermark} "
     "watermark captured at the snapshot, for a gapless hand-off.\n"
-    "- CDC only carries changes GOING FORWARD from the connector's offset. A row "
+    "- CDC carries only the changes GOING FORWARD from the connector's offset. A row "
     "that was lost earlier (e.g. a past sink incident, or a Full Load<->CDC "
     "hand-off gap) is NOT re-delivered by CDC, so the difference does not shrink "
     "over time — it is a standing gap, not lag.\n"
@@ -740,19 +746,51 @@ def _validation_recovery_context(source_engine: str = "MySQL") -> str:
     "over time, point to a standing gap (missing middle rows), not replication lag. "
     "Counts that ARE shrinking, or a target whose max PK trails the source, point "
     "to lag (CDC still catching up).\n"
-    "- The idempotent loader makes a re-run safe: re-running Full Load (then CDC) "
-    "backfills missing rows without creating duplicates (INSERT ... ON CONFLICT). "
-    "This is the recommended fix for a standing gap. On a migration whose CDC stack "
-    "has streamed (or rolled back a Start), that re-run takes a new start point, so the "
-    "order is Stop CDC, Delete CDC infrastructure and deploy it again, Re-run Full Load "
-    "with Drop & reload, then Start CDC (the Full Load step refuses it otherwise); for a "
-    "few tables, Reload specific tables with Drop & reload (CDC stopped) keeps the "
-    "original start point and needs no redeploy.\n"
+    "- A standing gap is backfilled by re-running the migration. The steps depend on the "
+    "migration type and on the state of this migration's CDC stack, which these facts do "
+    "not state (Validation's 'How to recover' card shows the ones for this migration), so "
+    "give the case that applies, or ask:\n"
+    "  - Full load only: Re-run Full Load (Start/Re-run on the Full Load sub-step) fills "
+    "missing rows and never creates duplicates (the loader is idempotent: INSERT ... ON "
+    "CONFLICT); if the source took writes since the snapshot, choose 'Drop & reload' "
+    "instead, since the default Append only adds missing rows and applies no update or "
+    "delete made since. Then Re-run validation. Full load only has no CDC step: for any "
+    "CDC action, switch the migration type first.\n"
+    "  - Full load + CDC or CDC only, on a CDC stack that has streamed (or rolled back a "
+    "Start), and also while this migration's CDC state is not read yet (after an app "
+    "restart, until the Data Migration step reads it): Stop CDC if it is running, Delete "
+    "CDC infrastructure and deploy it again (the new stack starts with empty CDC topics; "
+    "until then the Full Load step refuses a new start point, because the old stack's "
+    "sink would re-apply older changes over the reloaded tables), with CDC only set the "
+    "migration type to Full load + CDC, Re-run Full Load with Drop & reload, then Start "
+    "CDC (it starts from the new Full Load's start point), then Re-run validation.\n"
+    "  - Full load + CDC or CDC only, on a CDC stack that never streamed (also the new "
+    "stack right after that redeploy): with CDC only, set the migration type to Full load "
+    "+ CDC first, then Re-run Full Load choosing 'Drop & reload', then Start CDC (it "
+    "starts from the new Full Load's start point), then Re-run validation.\n"
+    "- Before CDC from a new start point (any CDC type, its stack streamed or never "
+    "streamed), the Full Load re-run is 'Drop & reload', NEVER a plain re-run with the "
+    "dialog's default Append: CDC carries only the changes after that start point, so an "
+    "append keeps the rows already on the target without the updates and deletes the "
+    "source made before it (an updated row stays stale, which a ROW_COUNT validation does "
+    "not catch; a deleted one stays as an extra row). So never recommend a plain re-run "
+    "there. The idempotent append (INSERT ... ON CONFLICT, no duplicates) is the fix only "
+    "for missing rows under the ORIGINAL start point: Retry unfinished tables (for what a "
+    "Full Load left unfinished) or, for a few tables, Reload specific tables (with CDC "
+    "stopped, its 'Drop & reload' also rebuilds stale rows); either keeps the original start "
+    "point and needs no redeploy (with CDC only, switch the migration type to Full load + "
+    "CDC first: both are on the Full Load step).\n"
     "- For a DEFINITIVE zero-loss cut-over check, source writes should be quiesced "
     "(or CDC confirmed caught up) first, because a live stream makes the target a "
     "moving target. Stopping CDC is done from the previous (Data Migration) step.\n"
     "- A 'target has MORE rows than source' (extra rows) usually means a source "
-    "delete CDC has not applied, or rows that predate the migration."
+    "delete CDC has not applied, or rows that predate the migration. An append re-run "
+    "does not clear them: it only fills rows and never removes one. To clear them, "
+    "Reload specific tables on the Full Load step (with CDC stopped) choosing 'Drop & "
+    "reload': it rebuilds that table from the source and keeps the original start point "
+    "(with CDC only, switch the migration type to Full load + CDC first; with no Full Load "
+    "in this session there is no table to reload one at a time, so follow the backfill "
+    "steps above)."
 )
 
 
@@ -858,6 +896,9 @@ def build_validation_chat_system(
     )
 
 
+# The buttons it names are the Full Load step's own (G26): a failed table's row draws only AI
+# Assist, so it is re-run through Retry unfinished tables (a checklist), and the per-table
+# Reload is on a quarantined table's card.
 _FULL_LOAD_RECOVERY_CONTEXT = (
     "How this tool's Full Load works and how to recover a failed table:\n"
     "- Full Load is the tool's OWN Python bulk loader (not a Debezium snapshot): it "
@@ -865,8 +906,9 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
     "target with idempotent, batched INSERT ... ON CONFLICT (<= 3000 rows/txn), "
     "each batch wrapped in optimistic-concurrency (SQLSTATE 40001) retry.\n"
     "- Because the load is idempotent and resumable, RE-RUNNING a failed table is "
-    "safe: use the per-table 'Reload' button (re-runs Full Load for just that "
-    "table) or 'Retry failed tables' -- no duplicates are created.\n"
+    "safe: use 'Retry unfinished tables' (its checklist starts with every unfinished "
+    "table ticked; untick the others to re-run Full Load for just this one) -- no "
+    "duplicates are created.\n"
     "- A table may also fail during the SCHEMA step (creating/replacing the target "
     "table's DDL) rather than the row copy. A 'DependentObjectsStillExist ... "
     "cannot drop table ... because ... view ... depends on it ... Use DROP ... "
@@ -877,16 +919,18 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
     "transaction, so a view that depends on several tables must be handled around "
     "those tables.\n"
     "- A transient error like 'InternalError_: server unavailable', a timeout, or a "
-    "connection reset is usually not a data problem: just Reload that table (or "
-    "Retry failed tables). If it persists, check target reachability / IAM token "
+    "connection reset is usually not a data problem: just retry that table with "
+    "'Retry unfinished tables'. If it persists, check target reachability / IAM token "
     "expiry and source read headroom.\n"
     "- 'quarantined row' entries are NOT failures: the table loaded and specific "
-    "rows were skipped (e.g. a value over DSQL's ~1 MiB per-value limit).\n"
-    "- STANDING-GAP TRAP (critical before CDC): CDC only carries changes forward from "
-    "the Full Load watermark -- it does NOT backfill history. So a table that FAILED "
-    "in Full Load, or that has quarantined/dropped rows, is a STANDING gap CDC will "
-    "never fill in. Resolve it BEFORE starting CDC: reload the table (fix the cause "
-    "first), or explicitly accept the gap. Starting CDC over an unresolved failure "
+    "rows were skipped (e.g. a value over DSQL's ~1 MiB per-value limit); that "
+    "table's card has its own 'Reload' button, which re-runs Full Load for just that "
+    "table.\n"
+    "- STANDING-GAP TRAP (critical before CDC): CDC carries only the changes going "
+    "forward from the Full Load watermark -- it does NOT backfill history. So a table "
+    "that FAILED in Full Load, or that has quarantined/dropped rows, is a STANDING gap "
+    "CDC will never fill in. Resolve it BEFORE starting CDC: reload the table (fix the "
+    "cause first), or explicitly accept the gap. Starting CDC over an unresolved failure "
     "silently leaves that table permanently short on the target.\n"
     "- Distinguish a SCHEMA/DDL cause (fix dependency or DDL, then reload) from a "
     "DATA cause (fix the source value, then reload) from a TRANSIENT cause (just "
@@ -909,10 +953,10 @@ def build_full_load_error_chat_system(
     this table was a DROP+recreate of an existing target, whether CDC is already
     streaming, how many tables were selected) so the reply is specific to THIS
     migration, not generic. The model is told these facts are authoritative and is
-    pointed at this tool's Full Load recovery model (per-table Reload / Retry
-    failed tables, schema-vs-data-vs-transient triage, DSQL constraints) so its
-    advice matches what the tool can actually do. It must stay on the topic of
-    explaining and fixing THIS table's failure.
+    pointed at this tool's Full Load recovery model (Retry unfinished tables, a
+    quarantined table's per-table Reload, schema-vs-data-vs-transient triage, DSQL
+    constraints) so its advice matches what the tool can actually do. It must stay
+    on the topic of explaining and fixing THIS table's failure.
     """
     facts = f"Failed table: {table_name}\nError message:\n{error_message.strip()}"
     if migration_context.strip():

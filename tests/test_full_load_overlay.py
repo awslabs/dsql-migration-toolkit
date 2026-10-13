@@ -47,6 +47,23 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
 
 from tests.test_job_store import _FakeS3
 from tests.test_ui_data_migration import _RetryHandle, _inputs, _tables
+from tests.test_ui_validation import _no_identity_columns, _record_real_boto3_sessions
+
+
+@pytest.fixture(autouse=True)
+def no_real_identity_sync(monkeypatch):
+    """Yield the real boto3 sessions this test built: none, or it fails at teardown.
+
+    Every completed run here ends with the identity-sequence sync, which ``run_full_load``
+    has no seam for: its default opens a real ``DsqlConnector`` per table (a boto3 session
+    and a DSQL IAM token, then a DNS lookup and a psycopg connect). G26 [5] stubbed it in
+    one test; this stubs it for the whole file.
+    """
+    monkeypatch.setattr("dsql_migrator.core.target_introspector.sync_identity_sequences",
+                        _no_identity_columns)
+    built = _record_real_boto3_sessions(monkeypatch)
+    yield built
+    assert built == [], f"{len(built)} real boto3 session(s) built"
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +428,14 @@ def events(monkeypatch):
 class _RaisingStore:
     def __getattr__(self, name):
         raise AssertionError(f"the ledger must not be touched ({name})")
+
+
+def test_a_completed_rig_run_builds_no_real_boto3_session(events, no_real_identity_sync):
+    # G26 repair: [5] stubbed the identity-sequence sync in one test, so 20 rig tests here
+    # still built a real boto3 session per table at the end of every completed run.
+    rig = _Rig(rows={"docs": False})
+    assert rig.run([DOCS]) == {"docs": "DONE"}
+    assert no_real_identity_sync == []
 
 
 def test_a_run_without_exclusions_reads_the_ledger_once_and_is_otherwise_unchanged(events):
@@ -911,7 +936,12 @@ def test_an_unreadable_ledger_on_the_process_path_never_recreates_the_overlay_ta
     assert len(_failures_for(events, "docs")) == 1
 
 
-def test_the_prepass_budget_is_constant_in_connections(monkeypatch, events):
+def test_the_prepass_budget_is_constant_in_connections(monkeypatch, events, no_real_identity_sync):
+    # G26 [5]: the completed run ends with the identity-sequence sync, which run_full_load
+    # offers no seam for; its default opened a real DsqlConnector per table -- 50 boto3
+    # sessions resolving the shell's AWS credentials, which blocked past the 60 s wait.
+    # no_real_identity_sync stubs it (for the whole file) and records any real session.
+    built = no_real_identity_sync
     tables = [TableDef(name=f"t{i}", primary_key=["id"], columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
                                                                   ColumnDef(name="c", mysql_type="text")])
               for i in range(50)]
@@ -928,6 +958,7 @@ def test_the_prepass_budget_is_constant_in_connections(monkeypatch, events):
         assert set(rig.run().values()) == {"DONE"}
         assert at_submit["connects"] == 1  # the one step-1 read for 50 tables
         assert merges == [50] and rig.applied == []
+        assert built == []  # G26 [5]: no real boto3 session, so no AWS credentials
     finally:
         for t in tables:
             FRESH.pop(t.name, None)

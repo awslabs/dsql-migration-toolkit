@@ -255,7 +255,8 @@ def test_admin_username_selects_admin_token_api() -> None:
     try:
         connect = _ConnectRecorder()
         admin = DsqlConnector(
-            _target_config(), connect_factory=connect, clock=_ManualClock()
+            _target_config(), connect_factory=connect, clock=_ManualClock(),
+            ipv4_resolver=lambda _host: None,  # no real DNS lookup
         )
         admin.connect()
         assert captured["api"] == "admin"
@@ -266,7 +267,8 @@ def test_admin_username_selects_admin_token_api() -> None:
             username="app_user",
         )
         standard = DsqlConnector(
-            standard_config, connect_factory=_ConnectRecorder(), clock=_ManualClock()
+            standard_config, connect_factory=_ConnectRecorder(), clock=_ManualClock(),
+            ipv4_resolver=lambda _host: None,  # no real DNS lookup
         )
         standard.connect()
         assert captured["api"] == "standard"
@@ -355,6 +357,7 @@ def test_connection_autocommit_is_enforced_when_driver_ignores_kwarg() -> None:
         token_generator=_RecordingTokenGenerator(),
         connect_factory=connect,
         clock=_ManualClock(),
+        ipv4_resolver=lambda _host: None,  # no real DNS lookup
     )
     connection = connector.connect()
     assert connection.autocommit is True
@@ -387,6 +390,7 @@ def test_failure_message_redacts_the_token() -> None:
         token_generator=generator,
         connect_factory=connect,
         clock=_ManualClock(),
+        ipv4_resolver=lambda _host: None,  # no real DNS lookup
     )
     result = connector.test_connection()
 
@@ -424,6 +428,7 @@ def test_test_connection_failure_returns_reason() -> None:
         token_generator=_RecordingTokenGenerator(),
         connect_factory=connect,
         clock=_ManualClock(),
+        ipv4_resolver=lambda _host: None,  # no real DNS lookup
     )
     result = connector.test_connection()
 
@@ -441,6 +446,7 @@ def _fail_with(message: str) -> "ConnectionResult":
         token_generator=_RecordingTokenGenerator(),
         connect_factory=connect,
         clock=_ManualClock(),
+        ipv4_resolver=lambda _host: None,  # no real DNS lookup
     )
     return connector.test_connection()
 

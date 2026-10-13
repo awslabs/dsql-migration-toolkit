@@ -5395,7 +5395,9 @@ def _cdc_watermark(job, migration_state=None):
     return wm
 
 
-def seed_refused_by_an_earlier_offer(migration_state, seed, source_type) -> Optional[str]:
+def seed_refused_by_an_earlier_offer(
+    migration_state, seed, source_type, *, streamed: Optional[bool] = None
+) -> Optional[str]:
     """Why a MySQL Start must refuse ``seed``: it is EARLIER than a seed an earlier Start
     already offered on this stack, which never streamed (a Start that failed after seeding).
     The seeder never rewinds, so that seed stays and this one would silently not apply.
@@ -5404,7 +5406,9 @@ def seed_refused_by_an_earlier_offer(migration_state, seed, source_type) -> Opti
     The way on it names is one Start CDC takes (G25): "or later" only on a stack that has not
     streamed -- after a Start CloudFormation rolled back, or with that Start's connectors in
     place, a later point is refused too (:func:`newer_start_point_refusal`), so only that
-    offset, or new CDC topics, are named."""
+    offset, or new CDC topics, are named. ``streamed``: whether it has, as the Start CDC
+    worker's own describe shows it (G26 repair); ``None`` -- the stack-phase probe's cache
+    (:func:`cdc_stack_has_streamed`)."""
     if source_type is SourceType.POSTGRES:
         return None
     if getattr(migration_state, "cdc_has_committed_offset", False):
@@ -5416,10 +5420,12 @@ def seed_refused_by_an_earlier_offer(migration_state, seed, source_type) -> Opti
         return None
     if offset_already_at_or_past({"file": f, "pos": int(pos)}, {"file": offered[0], "pos": int(offered[1])}):
         return None
+    if streamed is None:
+        streamed = cdc_stack_has_streamed(migration_state)
     way_on = (
         "Start from that offset, or delete the CDC infrastructure and deploy it again to "
         "start from another point."
-        if cdc_stack_has_streamed(migration_state)
+        if streamed
         else "Start from that offset or later, or delete the CDC infrastructure and deploy "
         "again to start earlier."
     )
@@ -5504,10 +5510,13 @@ def newer_start_point_refusal(
     # A Manual point refused where Automatic would continue this stream.
     automatic_resumes = origin == "manual" and _judge(job_watermark) is None
     if newer.rolled_back and newer.last is None:
-        # A first Start CloudFormation rolled back, whose offered start offset this process no
-        # longer holds (an app restart): no start point can be checked against it (G25).
+        # A first Start CloudFormation rolled back, whose offered start offset this session
+        # does not hold and the stack's events did not give -- read for a rollback status by
+        # the stack-phase probe, and by the Start CDC worker for its own describe (G26): no
+        # start point can be checked against it (G25).
         return _offer_unknown_refusal(
-            point_label(seed, origin), migration_type, automatic_resumes=automatic_resumes
+            point_label(seed, origin), migration_type, automatic_resumes=automatic_resumes,
+            origin=origin,
         )
     last = f"binlog {newer.last[0]}:{newer.last[1]}" if newer.last else None
     notice = newer_point_notice(
@@ -5516,25 +5525,42 @@ def newer_start_point_refusal(
         rolled_back=newer.rolled_back,
         migration_type=migration_type,
         automatic_resumes=automatic_resumes,
+        origin=origin,
     )
-    return notice, newer_point_line(migration_type)
+    return notice, newer_point_line(migration_type, origin)
 
 
 def _offer_unknown_refusal(
-    point: str, migration_type, *, automatic_resumes: bool = False
+    point: str, migration_type, *, automatic_resumes: bool = False, origin: str = "full_load"
 ) -> "tuple[tuple[str, str, str, str], str]":
     """A2's ``(notice, line)`` (:func:`newer_start_point_refusal`) on a MySQL stack whose first
     Start CloudFormation rolled back, when the start offset that Start offered is not known
-    (G25). The rollback restored the stack's parameters, so the stack records only that it
-    rolled back a Start, and the app kept the offer in memory, which an app restart clears.
-    Every start point is refused then: none can be shown to be at or before that offer, while
-    that Start's source connector may have streamed past it into the CDC topics. Pure."""
-    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER, new_topics_route
+    (G25). The rollback restored the stack's parameters. This session records the offer of a
+    Start it makes (in memory: none after an app restart, nor for a Start made outside this
+    session) and an offer read back from the stack's events (G26), which the stack-phase
+    probe reads for a rollback status and the Start CDC worker for its own describe -- so
+    this is shown only after such a read did not give it: the events cannot be read, the
+    Start seeded in the app (SeedMode=External), or the seeder's properties are malformed.
+    The body names the possible reasons this session holds no record, and asserts none (G26
+    repair). Every start point is refused then, that same one included (so the header does
+    not call it newer): none can be shown to be at or before that offer, while that Start's
+    source connector may have streamed past it into the CDC topics. ``origin``: the refused
+    start point's -- with CDC only, a route from the Full Load's watermark names the Drop &
+    reload condition (G26, ``cdc_start_point_gate.reloads_first``). Pure."""
+    from dsql_migrator.ui.cdc_start_point_gate import (
+        OFFER_UNKNOWN_HEADER,
+        RELOAD_FIRST,
+        new_topics_route,
+        offer_unknown_line,
+        reloads_first,
+    )
 
     body = (
         "CloudFormation rolled back this stack's last Start, and the start offset that Start "
-        "offered is no longer known: the rollback restored the stack's parameters, and the "
-        f"app kept that offset only in memory, which an app restart clears. So {point} cannot "
+        "offered is no longer known: the rollback restored the stack's parameters, this "
+        "session holds no record of that offset (the app may have restarted since that "
+        "Start, or that Start may have been made outside this session), and it could not be "
+        f"read from the stack's events. So {point} cannot "
         "be shown to be at or before it, while that Start's source connector may have "
         "streamed past it into this stack's CDC topics before the rollback removed it. Start "
         "CDC does not move such a stack's position forward: its sink resumes from its last "
@@ -5543,21 +5569,13 @@ def _offer_unknown_refusal(
         "stopped and the new point — silently. To start CDC, use "
         f"{new_topics_route(migration_type)}."
     )
+    if reloads_first(migration_type, origin):
+        body += f" {RELOAD_FIRST}"
     if automatic_resumes:
         body += " To continue this stream instead, set the CDC start point back to Automatic."
-    route = (
-        "Delete CDC infrastructure and deploy it again, then Start CDC on the new stack"
-        if str(getattr(migration_type, "value", migration_type) or "") == "cdc_only"
-        else "Delete CDC infrastructure and deploy it again, then Re-run Full Load choosing "
-        "'Drop & reload', then Start CDC"
-    )
-    line = (
-        "This CDC stack's last Start rolled back and the start offset it offered is no longer "
-        f"known, so no start point can be checked against it: {route}. Nothing was changed."
-    )
     return (
-        ("error", "fast_forward", NEWER_POINT_HEADER, body + " No connectors were changed."),
-        line,
+        ("error", "fast_forward", OFFER_UNKNOWN_HEADER, body + " No connectors were changed."),
+        offer_unknown_line(migration_type, origin),
     )
 
 
@@ -8047,7 +8065,7 @@ def _start_cdc_deploy(
     )
     _is_pg_start = _cdc_source_type(session) is SourceType.POSTGRES
 
-    def _check_mysql_start_on_worker(pre, pre_params, job_id=None) -> Optional[str]:
+    def _check_mysql_start_on_worker(pre, pre_params, job_id=None, deployer=None) -> Optional[str]:
         """MySQL, on the worker thread before anything changes: the snapshot mode decided
         on the loop must still be right for the stack as it is NOW, the start point must
         be one a gtid_mode=ON source can start from (the GTID start check), and a
@@ -8057,7 +8075,9 @@ def _start_cdc_deploy(
         notice for job ``job_id``'s CDC card (:func:`_start_refusal`). Returns the
         gtid_mode this Start records on the stack (G20:
         :func:`~dsql_migrator.ui.cdc_gtid_gate.gtid_mode_to_record`), or None when the
-        check did not run or could not read the mode."""
+        check did not run or could not read the mode. ``deployer``: reads a rolled-back
+        Start's offer from the stack's events when THIS describe shows the rollback and this
+        session holds no offer (G26 repair)."""
         from dsql_migrator.ui.cdc_gtid_gate import (
             gtid_mode_to_record,
             gtid_notice_point,
@@ -8071,6 +8091,7 @@ def _start_cdc_deploy(
             start_point_notice,
         )
         from dsql_migrator.ui.data_migration._cdc_status import (
+            _rolled_back_offer,
             cdc_deployed_gtid_mode,
             cdc_deployed_watermark,
             cdc_deployed_watermark_gtids,
@@ -8117,6 +8138,19 @@ def _start_cdc_deploy(
         # judged on THIS describe when there is one (another session or the console may have
         # started or stopped the stack since the dialog read it), before anything reads.
         _pre_status = getattr(pre, "stack_status", None) if pre is not None else None
+        # G26 repair: THIS describe can show a rollback the page's cache never saw (another
+        # session's first Start rolled back after this page's last probe), so this session
+        # holds no offer for it. Read that Start's offer from the stack's events here, as the
+        # probe does (read-only, only for a rollback status; unknown -> nothing recorded,
+        # fail closed), so the checks below judge the retry instead of refusing it unread.
+        if getattr(migration_state, "cdc_offered_seed", None) is None:
+            _offer = _rolled_back_offer(deployer, stack_name, _pre_status)
+            if _offer:
+                from types import SimpleNamespace
+
+                migration_state.note_cdc_offered_seed(
+                    SimpleNamespace(binlog_file=_offer[0], binlog_position=_offer[1])
+                )
         _newer = newer_start_point_refusal(
             migration_state, seed, SourceType.MYSQL, origin=seed_origin,
             job_watermark=watermark,
@@ -8132,6 +8166,20 @@ def _start_cdc_deploy(
             if _pre_status is not None
             else _pg_start_rolled_back(migration_state)
         )
+        # ...and the click's earlier-offer check, again on the offer as known NOW (just read
+        # above, or recorded since the click): A2 does not refuse an earlier seed, and the
+        # seeder never rewinds, so it would silently not apply (G26 repair). Its way on is
+        # judged on THIS describe too: after a rolled-back Start a later point is refused.
+        _earlier = seed_refused_by_an_earlier_offer(
+            migration_state, seed, SourceType.MYSQL,
+            streamed=_rolled_back or cdc_stack_has_streamed(migration_state),
+        )
+        if _earlier:
+            raise _start_refusal(
+                migration_state,
+                ("error", "", "This start point cannot be applied", _earlier),
+                job_id,
+            )
         # G19: on a gtid_mode=ON source Debezium starts after the GTID set seeded with the
         # start point (not at its file:position), so refuse a start point it cannot start
         # exactly at -- before the start-point check (which would otherwise also read). A
@@ -8306,7 +8354,7 @@ def _start_cdc_deploy(
         _start_gtid_mode: Optional[str] = None
         if not _is_pg_start:
             _start_gtid_mode = _check_mysql_start_on_worker(
-                _pre, _pre_params, job_id=getattr(handle, "job_id", None)
+                _pre, _pre_params, job_id=getattr(handle, "job_id", None), deployer=deployer
             )
         # The column-exclusion overlay: every captured excluded column nullable with no
         # DEFAULT (recorded first) BEFORE any connector is created or changed, so every row

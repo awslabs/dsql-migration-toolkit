@@ -254,7 +254,7 @@ def test_full_load_partial_failure_reports_incomplete_with_guidance() -> None:
     message = manager.get_error(job_id)
     assert message is not None
     assert "incomplete" in message.lower()
-    assert "Retry failed tables" in message
+    assert "Retry unfinished tables" in message
     # The succeeded table is still DONE (carried forward for retry); the failed
     # one is recorded in the downloadable error log.
     by_name = {chunk.chunk_id: chunk for chunk in job.chunks}
@@ -1006,6 +1006,9 @@ def test_replace_path_is_never_sharded_even_when_ranges_available() -> None:
         watermark_capturer=_FakeWatermarkCapturer(_watermark()),  # type: ignore[arg-type]
         importer_factory=lambda _inputs: importer,  # type: ignore[arg-type,return-value]
         table_recreator=lambda t: [],
+        # Skip the replace's post-load count verification: its default opens a real
+        # DsqlConnector (a DSQL IAM token, then a connection to the cluster).
+        target_counter=lambda _t: None,
     )
 
     migrator.migrate_table(_tables()[0])  # orders (replace)
@@ -18119,6 +18122,15 @@ def test_cdc_step_drops_back_on_a_freshly_built_controller_too() -> None:
         def list_connectors(self):
             return []  # nothing of mine on AWS (post Stop/Delete)
 
+    class _NoStack:
+        # The stack-phase probe the same render runs first (a describe_stacks): no
+        # cdc-stack either, after the Delete.
+        def describe_stack_or_none(self, _name):
+            return None
+
+        def list_cdc_stacks(self):
+            return []
+
     class _Target:
         region = "ap-northeast-2"
 
@@ -18127,14 +18139,18 @@ def test_cdc_step_drops_back_on_a_freshly_built_controller_too() -> None:
     sess = _WorkflowSess(StepStatus.IN_PROGRESS)
     sess.target_config = _Target()
 
+    import dsql_migrator.core.cdc_deployer as _dep
     import dsql_migrator.core.msk_connect_controller as _mcc
 
     original = _mcc.build_msk_connect_controller
+    original_deployer = _dep.build_cdc_stack_deployer
     _mcc.build_msk_connect_controller = lambda *_a, **_k: _Ctl()
+    _dep.build_cdc_stack_deployer = lambda *_a, **_k: _NoStack()
     try:
         _status._ensure_cdc_controller(state, sess)
     finally:
         _mcc.build_msk_connect_controller = original
+        _dep.build_cdc_stack_deployer = original_deployer
 
     assert state.cdc_controller is not None, "the controller must still be cached"
     assert get_status(sess.workflow, WorkflowStep.CDC) is StepStatus.NOT_STARTED
@@ -26505,6 +26521,7 @@ def _drive_infra_deploy_submit(monkeypatch, *, admission, source_type=None):
 
     import nicegui.run as nrun
 
+    import dsql_migrator.core.ec2_metadata as _em
     import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
     from dsql_migrator.core.models import SourceType
 
@@ -26515,6 +26532,9 @@ def _drive_infra_deploy_submit(monkeypatch, *, admission, source_type=None):
         return fn(*a, **k)
 
     monkeypatch.setattr(nrun, "io_bound", _io_bound)
+    # The prefilled connector subnets' NAT-egress pre-flight (EC2 describes): they have it.
+    monkeypatch.setattr(_em, "build_ec2_client", lambda *_a, **_k: object())
+    monkeypatch.setattr(_em, "verify_subnet_egress", lambda *_a, **_k: (True, ""))
     monkeypatch.setattr(
         cdc_ui,
         "_cdc_target_region",
@@ -30325,7 +30345,7 @@ def test_a_shard_source_reread_names_the_shard_and_the_snapshot_it_reopens(monke
     assert "fresh snapshot" not in shared
     assert "closes the run's shared-snapshot anchor" in shared
     assert "the load stops (tables still loading are marked failed)" in shared
-    assert "Retry failed tables" in shared
+    assert "Retry unfinished tables" in shared
     assert "anchor" not in own
     assert "re-reading shard 2 of this table from a fresh snapshot in 15s" in own
     assert "idempotent" in shared and "idempotent" in own
@@ -30363,7 +30383,7 @@ def test_a_lost_snapshot_anchor_fails_the_tables_it_stopped_not_a_user_stop() ->
     assert "_anchor_stop = _anchor_lost[0] and not handle.cancelled" in whole
     assert "_TableLoadOutcome.FAILED if _anchor_stop else _TableLoadOutcome.STOPPED" in whole
     assert "_ANCHOR_LOST_DETAIL if _anchor_stop" in whole
-    assert "Retry failed tables" in engine._ANCHOR_LOST_DETAIL
+    assert "Retry unfinished tables" in engine._ANCHOR_LOST_DETAIL
     # both record the cause in the error log, like every other FAILED tally
     assert "_record_anchor_lost(error_log, job_id, name)" in sharded
     assert "_record_anchor_lost(error_log, job_id, name)" in whole

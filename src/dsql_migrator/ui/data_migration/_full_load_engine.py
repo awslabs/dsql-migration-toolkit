@@ -659,7 +659,7 @@ class FullLoadIncompleteError(RuntimeError):
     attempted -- marks the job/step ``FAILED`` (never ``DONE``), so an incomplete
     load can never be mistaken for success and the prerequisite gate keeps
     Validation/cut-over from proceeding on partial data. The user is pointed to
-    the downloadable error log and "Retry failed tables". This is distinct from a
+    the downloadable error log and "Retry unfinished tables". This is distinct from a
     cooperative stop (:class:`_FullLoadStopped`), which the manager records as
     ``CANCELLED``.
     """
@@ -714,7 +714,7 @@ def _fail_unfinished_chunks(job: MigrationJob) -> None:
 
     On a cooperative cancel, tables that never started (``PENDING``) or were
     interrupted are left unfinished. Converting them to ``FAILED`` lets the
-    existing "Retry failed tables" path pick up exactly the remaining work while
+    existing "Retry unfinished tables" path pick up exactly the remaining work while
     already-``DONE`` tables are carried forward (idempotent re-load).
     """
     for chunk in job.chunks:
@@ -767,7 +767,7 @@ _ANCHOR_KEEPALIVE_SECONDS = 60.0
 # The activity line for a table the anchor's loss stopped (see the keepalive loop).
 _ANCHOR_LOST_DETAIL = (
     "stopped: the shared-snapshot anchor connection was lost (a source failover closes "
-    "it), so this table did not finish -- Retry failed tables reloads it from a new "
+    "it), so this table did not finish -- Retry unfinished tables reloads it from a new "
     "snapshot"
 )
 
@@ -1756,7 +1756,7 @@ def _log_source_reread(
     if shared_snapshot:
         detail += (
             " A failover also closes the run's shared-snapshot anchor; if it did, the "
-            "load stops (tables still loading are marked failed) and Retry failed "
+            "load stops (tables still loading are marked failed) and Retry unfinished "
             "tables reloads them from a new snapshot."
         )
     log_activity(
@@ -2706,7 +2706,7 @@ def _migrate_tables_in_parallel(
     own per-table errors, so one table's failure never aborts the others. If the
     job is cancelled, in-flight tables stop mid-load and not-yet-started ones are
     skipped; any remaining non-``DONE`` chunk is then marked ``FAILED`` so the
-    "Retry failed tables" path resumes exactly the unfinished work.
+    "Retry unfinished tables" path resumes exactly the unfinished work.
 
     Returns fresh per-run :class:`_RunCounts` (``real_failed`` tables that errored
     vs ``quarantined`` tables that dropped rows), so the caller can block on a
@@ -3978,12 +3978,12 @@ def incomplete_load_message(
         guidance = (
             "some tables failed to load and "
             f"{quarantined_rows} row(s) were quarantined; review the error log for each "
-            "row's reason, then 'Retry failed tables', or 'Exclude column & reload' to "
+            "row's reason, then 'Retry unfinished tables', or 'Exclude column & reload' to "
             "load a table without that column."
         )
     else:
         guidance = (
-            "review the downloadable error log, then use 'Retry failed tables' to "
+            "review the downloadable error log, then use 'Retry unfinished tables' to "
             "load the remaining tables before validating."
         )
     return (

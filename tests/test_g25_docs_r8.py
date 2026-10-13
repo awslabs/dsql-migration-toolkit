@@ -29,6 +29,14 @@ what round 8 shipped, and what it said before is pinned as stale so it cannot co
 Each check reads the CODE first (its own constants and the real derivations, the real screens
 where a notice is rendered) and only then the manual text, with the hard wrap undone (in ja,
 with no whitespace at all).
+
+G26 changed what three of these said, so their pins moved to test_g26_docs.py: after an app
+restart the app reads a rolled-back first Start's start point back from the stack's
+CloudFormation events, so every start point is refused only when they do not give it (chapters
+3, 4 and 6); with CDC only, the refusal names the Drop & reload condition of its new-stack route
+itself (chapter 3); and the chapter 6 lead's reloaded tables converge only where the stack's
+source connector streamed (in the snapshot case a row deleted on the source in between stays on
+the target).
 """
 
 from __future__ import annotations
@@ -119,62 +127,11 @@ def _steps(ui: _CopyUi) -> str:
 
 # -- the rolled-back first Start, after an app restart (finding [14]) ------------------------
 
+# G26 moved the "judged" pins of chapters 3, 4 and 6 to test_g26_docs.py: after an app restart
+# the app reads the start point a rolled-back first Start offered back from the stack's
+# CloudFormation events, so every start point is refused there only when they do not give it.
 _ROLLED_BACK = {
-    _P03: {
-        "judged": {
-            "en": "After a first Start that CloudFormation rolled back, the stack records only "
-            "that it rolled back a Start: the rollback restores its parameters, so the start "
-            "point that Start offered is kept only in the app's memory. While the app holds it, "
-            "a start point later than that one is refused and a retry from the same one is "
-            "not. After an app restart (or for a Start made in another session) no start point "
-            "can be checked against it, so every start point is refused on that stack, that "
-            "same one included (*CloudFormation rolled back this stack's last Start, and the "
-            "start offset that Start offered is no longer known …*), with the same route.",
-            "ko": "CloudFormation이 롤백한 첫 Start 뒤에는 스택에 Start를 롤백했다는 사실만 남습니다: "
-            "롤백이 스택의 파라미터를 되돌리므로, 그 Start가 준 시작 지점은 앱의 메모리에만 남습니다. 앱이 "
-            "그 지점을 알고 있는 동안에는 그보다 뒤의 시작 지점은 거부되고, 같은 시작 지점에서 다시 시작하는 "
-            "것은 거부되지 않습니다. 앱을 재시작한 뒤에는(또는 다른 세션에서 한 Start라면) 어떤 시작 지점도 "
-            "그 지점과 비교할 수 없으므로, 그 스택에서는 같은 시작 지점을 포함해 모든 시작 지점이 같은 경로와 "
-            "함께 거부됩니다(*CloudFormation rolled back this stack's last Start, and the start offset "
-            "that Start offered is no longer known …*).",
-            "ja": "CloudFormation がロールバックした初回の Start の後は、スタックには Start をロールバック"
-            "したことしか残りません: ロールバックがスタックのパラメータを元に戻すため、その Start が渡した"
-            "開始位置はアプリのメモリにしか残らないからです。アプリがそれを保持している間は、それより後の"
-            "開始位置は拒否され、同じ開始位置からの再試行は拒否されません。アプリの再起動後 (または別の"
-            "セッションで行った Start の場合) は、どの開始位置もその位置と比較できないため、そのスタック"
-            "では同じ開始位置も含めてすべての開始位置が同じ方法とともに拒否されます (*CloudFormation "
-            "rolled back this stack's last Start, and the start offset that Start offered is no "
-            "longer known …*)。",
-        },
-    },
-    _P04: {
-        "judged": {
-            "en": "After a first Start that CloudFormation rolled back, it refuses a later point "
-            "than that Start offered, and every start point once the app has restarted: the "
-            "stack does not record that offer.",
-            "ko": "CloudFormation이 롤백한 첫 Start 뒤에는 그 Start가 준 지점보다 뒤의 시작 지점을, 앱을 "
-            "재시작한 뒤에는 모든 시작 지점을 거부합니다: 스택은 그 지점을 기록하지 않기 때문입니다.",
-            "ja": "CloudFormation がロールバックした初回の Start の後は、その Start が渡した位置より後の"
-            "開始位置を、アプリの再起動後はすべての開始位置を拒否します: スタックはその位置を記録しない"
-            "ためです。",
-        },
-    },
     _P06: {
-        "judged": {
-            "en": "On MySQL, after a first Start that CloudFormation rolled back, the stack "
-            "records only that rollback, not the start point that Start offered, which the app "
-            "holds in memory: until the app restarts, Start CDC refuses a later point than that "
-            "one (a retry from it is not refused); after a restart, it refuses every start point "
-            "on that stack.",
-            "ko": "MySQL에서 CloudFormation이 롤백한 첫 Start 뒤에는 스택에 그 롤백만 기록되고 그 Start가 "
-            "준 시작 지점은 기록되지 않으며, 앱이 그 지점을 메모리에 들고 있습니다: 앱을 재시작하기 전까지 "
-            "Start CDC는 그 지점보다 뒤의 시작 지점을 거부하고(그 지점에서 다시 시작하는 것은 거부하지 않음), "
-            "재시작한 뒤에는 그 스택에서 모든 시작 지점을 거부합니다.",
-            "ja": "MySQL では、CloudFormation がロールバックした初回の Start の後、スタックにはその"
-            "ロールバックだけが記録され、その Start が渡した開始位置は記録されず、アプリがそれをメモリに"
-            "保持します: アプリが再起動するまで、Start CDC はその位置より後の開始位置を拒否し (その位置"
-            "からの再試行は拒否しません)、再起動の後は、そのスタックですべての開始位置を拒否します。",
-        },
         # The claim finding [14] doubted, true as written now.
         "no-detour": {
             "en": "so a detour through **Full load only** does not get around it",
@@ -184,7 +141,8 @@ _ROLLED_BACK = {
     },
 }
 # Round 7's "until the app restarts" refusal, and the caveat finding [14] proposed for chapters
-# 4 and 6, both false since round 8: after a restart every start point is refused.
+# 4 and 6, both false since round 8: a later point is refused after a restart too (since G26
+# judged from the stack's events, and every start point when they do not give it).
 _ROLLED_BACK_STALE = {
     "en": (
         "a start point later than the one that Start offered is refused only until the app "
@@ -201,7 +159,7 @@ def test_a_rolled_back_first_start_is_refused_from_the_stack_record_after_a_rest
     monkeypatch, lang: str
 ) -> None:
     from dsql_migrator.core.models import SourceType
-    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER, new_topics_route
+    from dsql_migrator.ui.cdc_start_point_gate import OFFER_UNKNOWN_HEADER, new_topics_route
     from dsql_migrator.ui.data_migration._cdc_status import newer_start_point
     from dsql_migrator.ui.data_migration._cdc_ui import newer_start_point_refusal
     from dsql_migrator.ui.data_migration._models import MigrationType
@@ -221,20 +179,24 @@ def test_a_rolled_back_first_start_is_refused_from_the_stack_record_after_a_rest
     # the same one is not.
     assert judge(later, offered) is not None and judge(later, offered).rolled_back
     assert judge(same, offered) is None
-    # After an app restart (no offer): every start point is refused, the same one included; a
-    # Start that offers none is not judged, nor is PostgreSQL.
+    # With no record of the offer (G26: after an app restart, only when the stack's events do
+    # not give it): every start point is refused, the same one included; a Start that offers
+    # none is not judged, nor is PostgreSQL.
     for seed in (earlier, same, later):
         refused = judge(seed, None)
         assert refused is not None and refused.rolled_back and refused.last is None, seed
     assert judge(None, None) is None
     assert judge(later, None, SourceType.POSTGRES) is None
     # The real stack-phase probe over a rolled-back stack, with the offer gone (as after an app
-    # restart): the refusal the cards, the click and the job show, with the route by type.
+    # restart whose stack events do not give it): the refusal the cards, the click and the job
+    # show, with the route by type.
     for mtype in (MigrationType.FULL_LOAD_AND_CDC, MigrationType.CDC_ONLY):
         state = _state(monkeypatch, ROLLED_BACK, mtype=mtype)
         assert state.cdc_offered_seed is None
         notice, line = newer_start_point_refusal(state, same, SourceType.MYSQL)
-        assert notice[2] == NEWER_POINT_HEADER
+        # DELIBERATE G26 UPDATE: this header does not call that same point newer (G26 CDC-2:
+        # the offer is unknown here because this probe's deployer reads no stack events).
+        assert notice[2] == OFFER_UNKNOWN_HEADER
         assert notice[3].startswith(
             "CloudFormation rolled back this stack's last Start, and the start offset that "
             "Start offered is no longer known"
@@ -384,19 +346,8 @@ _DROP_AND_RELOAD = {
             "ください: すべてのテーブルに新しい開始点を取りますが、append はロード済みの行をそのまま"
             "残すためです。",
         },
-        "cdc-only-route": {
-            "en": "The CDC only route starts the new stack from the Full Load's watermark, so "
-            "after a Full load only re-run that appended to rows already on the target, run it "
-            "again choosing **Drop & reload** before that Start (an append keeps those rows as "
-            "they were, and CDC from a watermark carries only the changes after it).",
-            "ko": "CDC only 경로는 새 스택을 Full Load의 워터마크에서 시작하므로, Full load only 재실행이 "
-            "타깃에 이미 있던 행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요(append는 "
-            "그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 변경만 가져옵니다).",
-            "ja": "CDC only の方法は新しいスタックを Full Load のウォーターマークから開始するため、Full "
-            "load only の再実行がターゲットに既にあった行に append した場合は、その Start の前に "
-            "**Drop & reload** でもう一度実行してください (append はそれらの行をそのまま残し、ウォーター"
-            "マークからの CDC はその後の変更しか運びません)。",
-        },
+        # G26 moved the "cdc-only-route" pin to test_g26_docs.py: the refusal itself now names
+        # that route's Drop & reload condition, with the type switch CDC only needs.
     },
     _P04: {
         "after-full-load-only": {
@@ -574,18 +525,8 @@ _PG_SLOT = {
         "Debezium が先に選択したすべてのテーブルをスナップショットします: sink が適用していなかった変更を "
         "CDC トピックがまだ保持している間だけギャップがありません",
     },
-    _P06: {
-        "en": "so CDC continues from where it stopped if the stack's source connector streamed "
-        "(otherwise Debezium snapshots every selected table first), gapless only while the CDC "
-        "topics still retain what the sink had not applied, and the reloaded tables converge.",
-        "ko": "스택의 소스 커넥터가 스트리밍했다면 CDC는 멈춘 곳에서 이어 가고(그렇지 않으면 Debezium이 "
-        "먼저 선택한 모든 테이블을 스냅샷합니다. 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 "
-        "동안만 빈틈이 없음) 다시 적재한 테이블은 수렴합니다.",
-        "ja": "スタックの source connector がストリーミングしていれば CDC は停止した位置から続き (そう"
-        "でなければ Debezium が先に選択したすべてのテーブルをスナップショットします。sink が適用して"
-        "いなかった変更を CDC トピックがまだ保持している間だけギャップがありません)、再ロードしたテーブル"
-        "は収束します。",
-    },
+    # G26 moved the chapter 6 pin to test_g26_docs.py: the reloaded tables converge only where
+    # the stack's source connector streamed, not in the snapshot case.
 }
 _PG_SLOT[_P10] = _PG_SLOT[_P04]
 # The promise round 8 withdrew: a Start after a Full load only run records no slot, so it sends

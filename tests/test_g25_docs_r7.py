@@ -11,7 +11,8 @@ shipped, and what it said before is pinned as stale so it cannot come back.
   at or before that one continues the stream; after a first Start CloudFormation rolled back, a
   later one is refused while the app still holds the start point that Start offered, and every
   one after an app restart (G25 round 8; the pins of what round 8 changed are in
-  test_g25_docs_r8.py). On PostgreSQL nothing is refused: Start CDC
+  test_g25_docs_r8.py) -- since G26 only when the stack's CloudFormation events do not give that
+  point either (test_g26_docs.py). On PostgreSQL nothing is refused: Start CDC
   continues from the stack's own slot, which a Full load only run leaves alone. Chapter 3 said
   a Full load only or CDC only migration was "not gated at all", chapters 4 and 10 promised a
   later MySQL CDC start "from the watermark" on any stack, chapter 6 listed a Start after a
@@ -160,9 +161,9 @@ def test_chapter_3_states_start_cdcs_newer_start_point_refusal_as_the_code_appli
     # stopped" for the no-start-point case.
     assert judge(newer, connectors_exist=True, deployed_watermark=last) is not None
     assert judge(newer, connectors_exist=True) is None
-    # A rolled-back first Start: judged against the seed it offered while the app still knows
-    # it; the retry from the same point is allowed. Once it does not (an app restart), the
-    # stack records only the rollback, so every seed is refused (G25 round 8).
+    # A rolled-back first Start: judged against the seed it offered while the app knows it; the
+    # retry from the same point is allowed. With no record of it, every seed is refused (G25
+    # round 8) -- since G26 after an app restart only when the stack's events do not give it.
     assert judge(newer, rolled_back=True, offered_seed=last).rolled_back is True
     assert judge(same, rolled_back=True, offered_seed=last) is None
     unknown = judge(newer, rolled_back=True)

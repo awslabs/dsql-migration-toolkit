@@ -676,8 +676,8 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
             "It raises SOURCE read concurrency: total source readers = Tables in parallel × "
             "this, so keep it modest on a source still serving production traffic. The tool "
             "clamps the product under the source's connection ceiling. Takes effect at the next "
-            "Full Load run or 'Retry failed tables' (re-read from config), so you can adjust it "
-            "without a redeploy."
+            "Full Load run or 'Retry unfinished tables' (re-read from config), so you can "
+            "adjust it without a redeploy."
         ),
     ),
     TunableKnob(
@@ -701,7 +701,7 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
             "headroom you want the migration to use. Too low (below your app's own "
             "load) will pause the read indefinitely — a Stop still works, and the "
             "pause is logged and shown in the progress caption. Takes effect at the "
-            "next Full Load run or 'Retry failed tables' (re-read from config), so "
+            "next Full Load run or 'Retry unfinished tables' (re-read from config), so "
             "you can turn it on/adjust it without a redeploy."
         ),
     ),

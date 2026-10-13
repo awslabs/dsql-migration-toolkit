@@ -2240,7 +2240,7 @@ def test_the_teardown_slot_drop_uses_the_session_credentials_first(monkeypatch) 
     assert "s3cret" not in f"{password}" and "s3cret" not in repr(password)
 
 
-def test_the_teardown_reports_whether_the_slot_survived() -> None:
+def test_the_teardown_reports_whether_the_slot_survived(monkeypatch) -> None:
     """A failed drop must be visible to the caller, not just printed.
 
     The teardown kept the source-credentials secret's deletion unconditional, so the only
@@ -2248,12 +2248,22 @@ def test_the_teardown_reports_whether_the_slot_survived() -> None:
     operator was told to go and use them.
     """
     from dsql_migrator.core import cdc_deployer
+    from dsql_migrator.core import secrets as _secrets
+    from dsql_migrator.core.secrets import SecretResolutionError, cdc_source_secret_name
 
     logs: list = []
+    reads: list = []
 
     class _Driver:
         def log(self, msg):
             logs.append(msg)
+
+    def _unreachable(name, _profile, region=None):
+        reads.append(name)
+        raise SecretResolutionError("Could not reach Secrets Manager.")
+
+    # Imported locally by the teardown, so patch the source module.
+    monkeypatch.setattr(_secrets, "resolve_source_secret", _unreachable)
 
     # No credentials and an unreachable secret -> the drop fails and says so.
     ok = cdc_deployer._drop_pg_source_replication(
@@ -2264,6 +2274,7 @@ def test_the_teardown_reports_whether_the_slot_survived() -> None:
         aws_profile=None,
     )
     assert ok is False
+    assert reads == [cdc_source_secret_name("dsql-cdc-stack")]
     joined = " ".join(logs)
     assert "could not drop the PostgreSQL replication slot" in joined
     # The manual remedy must carry BOTH statements the operator needs.

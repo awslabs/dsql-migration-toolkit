@@ -56,19 +56,22 @@ fails **loudly** where it can't.
   tables, while the source skips the changes between where CDC stopped and the new point.
   Full load only has no CDC step: on a detour through it, switch the migration type first,
   then delete and deploy on the CDC step. On MySQL, after a first Start that
-  CloudFormation rolled back, the stack records only that rollback, not the start point
-  that Start offered, which the app holds in memory: until the app restarts, Start CDC
-  refuses a later point than that one (a retry from it is not refused); after a restart, it
-  refuses every start point on that stack.
+  CloudFormation rolled back, the rollback restores the stack's parameters, so Start CDC
+  judges the next Start against the start point that Start offered as the app recorded it
+  or, after an app restart, as the stack's CloudFormation events still record it: it
+  refuses a later point than that one (a retry from it is not refused), and every start
+  point on that stack when neither gives it (for example after a restart on the single EC2
+  host, which seeds Kafka in the app).
   On a PostgreSQL source Start CDC has no such refusal: it continues from the stack's own
   replication slot, which a Full load only run leaves as it is, so CDC continues from where
-  it stopped if the stack's source connector streamed (otherwise Debezium snapshots every
-  selected table first), gapless only while the CDC topics still retain what the sink had
-  not applied, and the reloaded tables converge. **Reload specific tables** and
-  **Retry unfinished tables** keep the original start point and are not affected. A Manual
-  point is a new start point: the changes between where CDC stopped and it are not
-  replicated, on the new stack too, so reload or correct those tables and validate with
-  CHECKSUM, as each remedy below says.
+  it stopped if the stack's source connector streamed, gapless only while the CDC topics
+  still retain what the sink had not applied, and the reloaded tables converge. Otherwise
+  Debezium snapshots every selected table first, and a row deleted on the source between
+  the reload and that snapshot stays on the target: Validation reports it as an EXTRA row.
+  **Reload specific tables** and **Retry unfinished tables** keep the original start point
+  and are not affected. A Manual point is a new start point: the changes between where CDC
+  stopped and it are not replicated, on the new stack too, so reload or correct those
+  tables and validate with CHECKSUM, as each remedy below says.
 - **Single region — no cross-region migration.** The tool works in any region
   where DSQL is available, but **source and target must be in the same region**,
   and the optional CDC pipeline runs in a single region/VPC. Cross-region is not

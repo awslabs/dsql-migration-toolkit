@@ -136,6 +136,9 @@ def test_mysql_streamed_notice_switches_the_type_before_the_cdc_steps_delete(
 def test_mysql_never_streamed_notice_names_drop_and_reload_after_an_append(monkeypatch):
     # Rule E on the same seed (CDC only from this Full Load's watermark): a run that appended
     # to an earlier load's rows needs a Drop & reload re-run first. A first load is unchanged.
+    # G26: a state never read (None, as after an app restart) is no longer taken for a stack
+    # never started -- there the watermark claim holds only under that condition
+    # (test_g26_fl_notice) -- while the Drop & reload advice holds either way.
     for stack in (None, NEVER_STARTED):
         body = _notice(monkeypatch, job=_wm_job("mysql-bin.000009", 4), stack=stack)
         assert "streams from this Full Load's watermark onto the already-loaded target" in body
@@ -144,6 +147,11 @@ def test_mysql_never_streamed_notice_names_drop_and_reload_after_an_append(monke
                 f"{_DROP_RELOAD}") in body
         assert _in_order(body, _DROP_RELOAD, "Use the link below")
         assert "Delete CDC infrastructure" not in body
+        never_started = "\"CDC only\" — it streams from this Full Load's watermark" in body
+        assert never_started is (stack is NEVER_STARTED)
+        conditioned = ("Unless this migration's CDC stack was started before, CDC streams from "
+                       "this Full Load's watermark") in body
+        assert conditioned is (stack is None)
 
 
 def test_mysql_a_start_point_not_newer_keeps_the_continuing_notice(monkeypatch) -> None:

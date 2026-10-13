@@ -1501,6 +1501,16 @@ def test_background_run_cancel_maps_to_cancelled_and_no_result() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _no_identity_columns(table_names, *, connection_factory):
+    """The identity-sequence sync of a target without identity columns. Never connects.
+
+    A completed run ends with this sync, and the production one calls
+    ``connection_factory`` -- a real ``DsqlConnector`` -- per table: a boto3 session that
+    resolves the shell's AWS credentials, then a DNS lookup and a psycopg connect.
+    """
+    return dict.fromkeys(table_names)
+
+
 def _build_runner_with_session(
     *, source_verified: bool, target_verified: bool, sync_sequences=None, report=None
 ):
@@ -1510,7 +1520,8 @@ def _build_runner_with_session(
     and assert whether a job was submitted. A fake validator is injected so a run,
     if it were (wrongly) started, would not touch a real database. ``sync_sequences``
     (when given) injects a fake identity-sequence sync so the post-run re-sync path is
-    exercised without a DSQL connection. ``report`` overrides the comparison result the
+    exercised without a DSQL connection; without one, ``_no_identity_columns`` stands in,
+    so no run reaches real AWS credentials. ``report`` overrides the comparison result the
     fake validator returns, so a test can drive the run with a target that is BEHIND
     the source (the identity-sync deferral path).
     """
@@ -1558,7 +1569,9 @@ def _build_runner_with_session(
         validator_factory=lambda _i: _FakeValidator(
             _report() if report is None else report
         ),
-        sync_sequences=sync_sequences,
+        sync_sequences=(
+            sync_sequences if sync_sequences is not None else _no_identity_columns
+        ),
     )
     return runner, validation_store.get_or_create(session_id), manager
 
@@ -1592,6 +1605,50 @@ def test_runner_submits_when_both_verified() -> None:
     # Both connections verified -> a job is submitted (no gating error).
     assert state.job_id is not None
     assert manager.wait(state.job_id, timeout=5.0) is True
+
+
+def _record_real_boto3_sessions(monkeypatch) -> list:
+    """Record every build of a REAL boto3 session, and build none.
+
+    The tool builds every boto3 session that uses the shell's credential chain -- the
+    DSQL IAM token's included -- through ``build_session``, which takes the real
+    ``boto3.Session`` constructor from ``aws_session._default_session_factory``. This
+    replaces that factory with a recorder that raises before a session exists, so the
+    shell's AWS credentials (``AWS_CONFIG_FILE`` / ``AWS_SHARED_CREDENTIALS_FILE`` /
+    ``AWS_PROFILE``) are never resolved. Product code may catch the raise (the identity
+    sync records it per table), so the caller asserts the record is empty. Stricter than
+    the suite guard in tests/conftest.py, whose factory builds dummy-credential sessions
+    that refuse any real call: here no session is built at all.
+    """
+    from dsql_migrator.core import aws_session
+
+    built: list = []
+
+    def _no_real_session():
+        built.append("boto3.Session")
+        raise AssertionError("a unit test must not build a real boto3 session")
+
+    monkeypatch.setattr(aws_session, "_default_session_factory", _no_real_session)
+    return built
+
+
+def test_a_verified_runner_run_builds_no_real_boto3_session(monkeypatch) -> None:
+    """G26 [5]: a run started through the helper never reaches real AWS credentials.
+
+    The run ends with the identity-sequence re-sync. When the helper passed no
+    ``sync_sequences``, the production sync opened a real DsqlConnector per table: a fresh
+    boto3 session that resolves the shell's AWS credentials, then a DNS lookup and a
+    psycopg connect. With a sandbox's AWS variables set, test_runner_submits_when_both_verified
+    and test_validation_run_logs_started_and_verdict blocked for about 60 s and failed the
+    5 s wait.
+    """
+    built = _record_real_boto3_sessions(monkeypatch)
+    runner, state, manager = _build_runner_with_session(
+        source_verified=True, target_verified=True
+    )
+    runner()
+    assert manager.wait(state.job_id, timeout=5.0) is True
+    assert built == []
 
 
 # ---------------------------------------------------------------------------
