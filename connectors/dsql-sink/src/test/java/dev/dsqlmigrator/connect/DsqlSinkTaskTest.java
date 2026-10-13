@@ -111,9 +111,9 @@ class DsqlSinkTaskTest {
     // pre-write, but if it reaches here it must not loop).
     assertFalse(task.isTransient(new SQLException("datatype limit exceeded", "54000")));
     // 25P02 is the symptom of an earlier failure in the same transaction (e.g. a later
-    // statement group's describe failing with 42703 under drift, which paramMetaOrNull
-    // swallows). Permanent, the chunk falls back to one row per transaction, where the real
-    // error surfaces; transient, the same deterministic failure would be redelivered forever.
+    // statement group's describe failing with 42703 under drift; G25 reports that describe
+    // failure in its place). Permanent, the row is dead-lettered with its real cause;
+    // transient, the same deterministic failure would be redelivered forever.
     // G21 removed the OCC cause (rollback before a retry); it did not make 25P02 retryable.
     assertFalse(task.isTransient(new SQLException(
         "current transaction is aborted, commands ignored until end of transaction block",

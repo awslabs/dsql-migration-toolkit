@@ -111,7 +111,9 @@ class _FakeConn:
             return _Result([(self._xid,)])
         if up.startswith("ALTER PUBLICATION") and " ADD TABLE " in up:
             name = re.search(r'ALTER PUBLICATION "([^"]+)"', sql).group(1)
-            schema, table = re.search(r'ADD TABLE "([^"]+)"\."([^"]+)"', sql).groups()
+            schema, table = re.search(
+                r'ADD TABLE (?:ONLY )?"([^"]+)"\."([^"]+)"', sql  # G25: ADD TABLE ONLY
+            ).groups()
             qualified = f"{schema}.{table}"
             if qualified in self._add_errors:
                 raise self._add_errors[qualified]
@@ -231,25 +233,28 @@ def test_allowlist_permits_only_two_exact_alter_publication_shapes() -> None:
     # Case-insensitive and run-of-whitespace tolerant (the check normalizes both), which is
     # all the latitude the module needs since it composes the statement itself...
     _assert_allowed('alter publication "p"   SET (publish_via_partition_root = TRUE)')
-    _assert_allowed('ALTER PUBLICATION "dsqlmig_pub_x" ADD TABLE "app"."orders"')
+    # G25 (DELIBERATELY changed): ONLY is required -- without it PostgreSQL also adds every
+    # inheritance child, whose REPLICA IDENTITY nothing checked.
+    _assert_allowed('ALTER PUBLICATION "dsqlmig_pub_x" ADD TABLE ONLY "app"."orders"')
     # A quoted name may carry a comma or a doubled quote: it is still ONE identifier.
-    _assert_allowed('ALTER PUBLICATION "p" ADD TABLE "app"."a,b"')
-    _assert_allowed('ALTER PUBLICATION "p" ADD TABLE "app"."a""b"')
+    _assert_allowed('ALTER PUBLICATION "p" ADD TABLE ONLY "app"."a,b"')
+    _assert_allowed('ALTER PUBLICATION "p" ADD TABLE ONLY "app"."a""b"')
     # ...and both shapes are otherwise EXACT, deliberately: a looser match is what would let
     # this prefix drift into an arbitrary-DDL surface. Anything else is refused.
     for refused in (
         'ALTER PUBLICATION "p" SET TABLE app.orders',
         'ALTER PUBLICATION "p" DROP TABLE app.orders',
         'ALTER PUBLICATION "p" DROP TABLE "app"."orders"',
-        'ALTER PUBLICATION "p" ADD TABLE app.orders',
-        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders"',
-        'ALTER PUBLICATION "p" ADD TABLE "app"."orders" *',
-        'ALTER PUBLICATION "p" ADD TABLE "app"."orders", "app"."items"',
-        'ALTER PUBLICATION "p" ADD TABLE "app"."orders" (id)',
-        'ALTER PUBLICATION "p" ADD TABLE "app"."orders" WHERE (id > 1)',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY app.orders',
+        'ALTER PUBLICATION "p" ADD TABLE "app"."orders"',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders" *',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders", "app"."items"',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders", ONLY "app"."items"',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders" (id)',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders" WHERE (id > 1)',
         'ALTER PUBLICATION "p" ADD TABLES IN SCHEMA "app"',
-        'ALTER PUBLICATION "p" ADD TABLE "app"."orders"; DROP TABLE "app"."x"',
-        'ALTER PUBLICATION "p-1" ADD TABLE "app"."orders"',
+        'ALTER PUBLICATION "p" ADD TABLE ONLY "app"."orders"; DROP TABLE "app"."x"',
+        'ALTER PUBLICATION "p-1" ADD TABLE ONLY "app"."orders"',
         'ALTER PUBLICATION "p" OWNER TO bob',
         'ALTER PUBLICATION "p" RENAME TO q',
         'ALTER PUBLICATION "p" SET (publish = \'insert\')',
@@ -395,7 +400,8 @@ def test_create_publication_adds_a_requested_table_the_reused_one_lacks() -> Non
         conn, name="dsqlmig_pub_s", tables=["app.orders", "app.customers"], on_log=logs.append
     )
     assert created is False
-    assert conn.writes() == ['ALTER PUBLICATION "dsqlmig_pub_s" ADD TABLE "app"."customers"']
+    assert conn.writes() == [
+        'ALTER PUBLICATION "dsqlmig_pub_s" ADD TABLE ONLY "app"."customers"']  # G25: ONLY
     assert any('added app.customers to publication "dsqlmig_pub_s"' in m for m in logs)
     # ...and provisioning over it adds the table, then creates the fresh slot.
     prov = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]}, lsn="8/2")
@@ -441,7 +447,7 @@ def test_create_publication_reuses_a_publication_that_covers_the_set() -> None:
     missing = _FakeConn(pubs={"dsqlmig_pub_s": ["app.orders"]})
     assert create_publication(missing, name="dsqlmig_pub_s", tables=["app.customers"]) is False
     assert missing.writes() == [
-        'ALTER PUBLICATION "dsqlmig_pub_s" ADD TABLE "app"."customers"']
+        'ALTER PUBLICATION "dsqlmig_pub_s" ADD TABLE ONLY "app"."customers"']  # G25: ONLY
 
 
 def test_create_publication_rejects_zero_tables() -> None:

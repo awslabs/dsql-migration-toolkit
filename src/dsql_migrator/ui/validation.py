@@ -1100,10 +1100,14 @@ def excluded_values_remedy(migration_state, job_manager) -> str:
     job_id = getattr(migration_state, "job_id", None)
     cdc_only = getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY
     if cdc_only and job_id is None:
+        # G25 (decision A): CDC wrote these rows, so this CDC stack has streamed, and a Full
+        # load + CDC Full Load there is a new start point -- refused until new CDC topics.
         return (
             "Rows that were on Aurora DSQL before CDC started keep their values: CDC "
-            "never writes an excluded column. To hold NULL there, migrate the table "
-            "with a Full load + CDC migration and choose Drop & reload for it."
+            "never writes an excluded column. To hold NULL there, Delete CDC "
+            "infrastructure and deploy it again (a new Full Load start point needs new CDC "
+            "topics), then switch the migration type to Full load + CDC, run its Full Load "
+            "choosing Drop & reload for it, and Start CDC."
         )
     if job_id is not None:
         from dsql_migrator.core.job_manager import JobNotFoundError
@@ -1801,6 +1805,49 @@ def _cdc_in_use(session: object) -> bool:
         )
     except Exception:  # noqa: BLE001 - decorative; never break the page
         return False
+
+
+def _cdc_stack_streamed(migration_state: object) -> bool:
+    """Whether this migration's CDC stack has streamed, or rolled back a Start (G25), whatever
+    the migration type -- a CDC only migration's too: a backfill on it (a Full Load with a new
+    start point, after a switch to Full load + CDC with CDC only) then needs new CDC topics
+    first, so the recovery runbook names Delete CDC infrastructure and deploy it again before
+    the re-run (:func:`_render_recovery_section`). Read from the stack-phase probe's cache
+    (:func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_stack_has_streamed`); ``False``
+    when it cannot be read. Whether that cache was read at all is :func:`_cdc_state_unread`."""
+    try:
+        from dsql_migrator.ui.data_migration._cdc_status import cdc_stack_has_streamed
+
+        return bool(cdc_stack_has_streamed(migration_state))
+    except Exception:  # noqa: BLE001 - decorative; never break the page
+        return False
+
+
+def _cdc_state_unread(migration_state: object) -> bool:
+    """Whether this migration's CDC state is not read yet, or could not be (G25:
+    ``cdc_stack_phase_checked`` False -- e.g. a session restored after an app restart, until
+    the Data Migration step's probe reads it). The recovery runbook then gives a CDC type the
+    order of a stack that has streamed, never the shorter one: the Full Load step holds a new
+    start point until the state is read
+    (:func:`~dsql_migrator.ui.data_migration._full_load_engine.new_start_point_block`)."""
+    return not bool(getattr(migration_state, "cdc_stack_phase_checked", False))
+
+
+def _has_full_load_record(migration_state: object, job_manager: object) -> bool:
+    """Whether this session holds a Full Load job record (G25): the Full Load step offers
+    Reload specific tables only for a record's loaded tables, so a CDC only migration without
+    one (the target loaded outside the tool) has no table to reload on its own
+    (:func:`_render_recovery_section`). One job read; an unexpected read error keeps the usual
+    remedy, as :func:`excluded_values_remedy` does."""
+    from dsql_migrator.ui.data_migration._cdc_status import _current_job
+
+    job_id = getattr(migration_state, "job_id", None)
+    if job_id is None:
+        return False
+    try:
+        return _current_job(job_manager, job_id) is not None
+    except Exception:  # noqa: BLE001 - decorative; never break the page
+        return True
 
 
 def _source_engine_word(session: object) -> str:
@@ -3370,8 +3417,10 @@ def build_validation_screen(
                         f"source, so advancing a sequence to the target's MAX(pk)+1 "
                         f"would claim an id the source has already used and CDC has yet "
                         f"to apply — the duplicate key this step prevents. Let CDC "
-                        f"drain (or re-run Full Load for a standing gap), re-validate, "
-                        f"and the sync runs; Cut over re-runs it either way. "
+                        f"drain (or, for a standing gap, follow How to recover: on a "
+                        f"CDC stack that has streamed it starts with Delete CDC "
+                        f"infrastructure and deploy it again), re-validate, and the "
+                        f"sync runs; Cut over re-runs it either way. "
                         f"Behind: {_behind_detail}"
                     ),
                 )
@@ -4062,6 +4111,10 @@ def build_validation_screen(
                     rechecked_at=validation_state.rechecked_at,
                     cdc_in_use=_cdc_in_use(session),
                     postgres_source=_source_engine_word(session) == "PostgreSQL",
+                    cdc_stack_streamed=_cdc_stack_streamed(migration_state),
+                    cdc_state_unread=_cdc_state_unread(migration_state),
+                    migration_type=getattr(session, "migration_type", None),
+                    full_load_record=_has_full_load_record(migration_state, job_manager),
                     identity_sync=validation_state.identity_sync,
                     identity_sync_failed=validation_state.identity_sync_failed,
                     excluded_values_remedy=(
@@ -6676,8 +6729,18 @@ def _render_result(
     replica_identity_gate: "Optional[object]" = None,
     catalog_drift_gate: "Optional[object]" = None,
     postgres_source: bool = False,
+    cdc_stack_streamed: bool = False,
+    cdc_state_unread: bool = False,
+    migration_type: "Optional[object]" = None,
+    full_load_record: bool = True,
 ) -> None:
     """Render the cut-over readiness report: verdict, checks, then the details.
+
+    ``cdc_stack_streamed`` / ``cdc_state_unread`` (G25, :func:`_cdc_stack_streamed`,
+    :func:`_cdc_state_unread`) and ``migration_type`` pick the recovery runbook: on a CDC
+    type, one that deletes and deploys the CDC infrastructure again before the Full Load
+    re-run (:func:`_render_recovery_section`); ``full_load_record``
+    (:func:`_has_full_load_record`) its CDC only extra-row remedy.
 
     ``scope_missing`` / ``scope_extra`` (:func:`validation_scope_gap`, after a table-set
     change): tables the migration now includes that this report has no row for (the
@@ -6892,6 +6955,10 @@ def _render_result(
         _render_recovery_section(
             ui, summary, drift, diagnose_provider=diagnose_provider,
             excluded_values_remedy=excluded_values_remedy,
+            cdc_stack_streamed=cdc_stack_streamed,
+            cdc_state_unread=cdc_state_unread,
+            migration_type=migration_type,
+            full_load_record=full_load_record,
         )
     _render_failing_tables(
         ui, report, summary, drift,
@@ -7211,14 +7278,34 @@ def _render_recovery_section(
     ui: object, summary: ValidationSummary, drift: DriftDisplay, *,
     diagnose_provider=None,
     excluded_values_remedy: str = "",
+    cdc_stack_streamed: bool = False,
+    cdc_state_unread: bool = False,
+    migration_type: "Optional[object]" = None,
+    full_load_record: bool = True,
 ) -> None:
     """Render the mismatch-recovery guidance as its OWN titled section card.
 
     Grouping it in a Cloudscape "Container" (the same `_section` every other block
     uses) makes the recovery path a first-class, scannable unit rather than loose
-    notices under the verdict: a one-line why, the ordered click-path (Stop CDC
-    FIRST → re-run Full Load → resume CDC → re-validate), the quiesce-source
-    caveat, and an optional "Diagnose with AI" action.
+    notices under the verdict: a one-line why, the ordered click-path (re-run Full Load
+    → Start CDC → re-validate), the quiesce-source caveat, and an optional "Diagnose
+    with AI" action.
+
+    ``cdc_stack_streamed`` (G25): this migration's CDC stack has streamed, or rolled back a
+    Start (:func:`_cdc_stack_streamed`); ``cdc_state_unread``: its CDC state is not read yet
+    (:func:`_cdc_state_unread`), which the Full Load step's gate holds on alike. On a CDC
+    type either one means the backfill -- a Full Load with a new start point -- needs new
+    CDC topics first, so the click-path is Stop CDC (if it runs) → Delete CDC infrastructure
+    and deploy it again → (CDC only: switch to Full load + CDC) → Re-run Full Load (Drop &
+    reload) → Start CDC → re-validate, the order that gate names. A stack that never
+    streamed cannot be running, so its path has no Stop CDC step; its re-run is a Drop &
+    reload too (rule E): CDC then starts from the new start point, and an append would keep
+    rows older than it. ``migration_type`` (``None``: read as Full load + CDC): Full load
+    only has no CDC phase, so its path is the re-run and the re-validate alone (its re-run
+    is not gated); CDC only has no Full Load step, so its path switches the type first.
+    ``full_load_record``: the session holds a Full Load job record (:func:`_has_full_load_record`)
+    -- without one, CDC only has no table to reload on its own (no Reload specific tables),
+    so its extra-row remedy is a new Full Load start point, behind new CDC topics.
     """
     # Two genuinely different recoveries share this "no-go" gate, and conflating them
     # is the defect. When the WHOLE shortfall is rows the migration already reported
@@ -7256,6 +7343,20 @@ def _render_recovery_section(
         and rest <= set(summary.quarantine_explained_tables)
         and not summary.errored_tables
     )
+    # The ordered click-path, for the backfill branches only (G25: set by both), numbered
+    # as rendered.
+    steps: "tuple[str, ...]" = ()
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    full_load_only = migration_type is MigrationType.FULL_LOAD_ONLY
+    cdc_only = migration_type is MigrationType.CDC_ONLY
+    # G25: a CDC type's backfill comes after new CDC topics when its stack has streamed, or
+    # when that is not read yet -- as the Full Load step's gate holds a new start point.
+    new_topics_first = not full_load_only and (cdc_stack_streamed or cdc_state_unread)
+    switch_type = (
+        "Set the migration type to Full load + CDC at the top of the Data Migration step: "
+        "CDC only has no Full Load step."
+    )
     with _section(ui, icon=_icon, title=_title):  # type: ignore[misc]
         if summary.excluded_values:
             _render_excluded_values_recovery(ui, summary, excluded_values_remedy)
@@ -7286,6 +7387,34 @@ def _render_recovery_section(
             # nothing. It also names the likely cause, because an extra row is otherwise
             # undiagnosable: the count is printed, the PK is enumerated, and nothing
             # connects either to a lost delete.
+            # Not "re-run the Full Load" (G25): that takes a new start point, which the Full
+            # Load step refuses on a CDC stack that has streamed. Reloading the one table
+            # keeps the original start point, so it converges -- but Reload specific tables
+            # exists only for a Full Load record's loaded tables: CDC only with none (the
+            # target loaded outside the tool) rebuilds the table through a Full Load from a
+            # new start point, behind new CDC topics on such a stack, as its excluded-values
+            # remedy does (excluded_values_remedy).
+            clear = (
+                (
+                    "To clear the extra rows either way: CDC only has no Full Load step, and "
+                    "this session holds no Full Load whose tables could be reloaded one at a "
+                    "time, so "
+                    + (
+                        "Stop CDC if it is running, Delete CDC infrastructure and deploy it "
+                        "again (a new Full Load start point needs new CDC topics), then "
+                        if new_topics_first
+                        else ""
+                    )
+                    + "switch the migration type to Full load + CDC, run its Full Load "
+                    "choosing Drop & reload, and Start CDC."
+                )
+                if cdc_only and not full_load_record
+                else "To clear the extra rows either way, reload that table on the Full "
+                "Load step ('Reload specific tables…', with CDC stopped) choosing Drop "
+                "& reload: it DROPs the table and rebuilds it from the source instead "
+                "of adding to it, and keeps the original start point. With CDC only, "
+                "switch the migration type to Full load + CDC first."
+            )
             render_notice(
                 ui,
                 tone="warning",
@@ -7316,12 +7445,24 @@ def _render_recovery_section(
                     "on the source between the Full Load and the CDC start were never "
                     "streamed as deletes. The CDC start point said so at the time; check "
                     "the activity log if you are unsure which applies. "
-                    "To clear the extra rows either way, "
-                    "re-run the Full Load and choose to DROP that table when it asks — "
-                    "that rebuilds it from the source instead of adding to it."
+                    + clear
                 ),
             )
-        else:
+        elif new_topics_first:
+            # G25 (decision A): the backfill is a Full Load with a new start point, and this
+            # CDC stack has streamed -- or its state is not read yet, which the Full Load
+            # step's gate holds on alike -- so new CDC topics come first, the order that gate
+            # names. A resume after the re-run would have the sink re-apply its older
+            # changes over the reloaded tables.
+            why = (
+                "This migration's CDC stack has streamed, so that run needs new CDC topics "
+                "first"
+                if cdc_stack_streamed
+                else "This migration's CDC state has not been read yet (after an app "
+                "restart, until the Data Migration step reads it; this card then shows the "
+                "steps for the stack as it is), so these steps put new CDC topics first, "
+                "which a CDC stack that has streamed needs"
+            )
             render_notice(
                 ui,
                 tone="info",
@@ -7329,34 +7470,88 @@ def _render_recovery_section(
                 body=(
                     "These differences do not shrink over time, so they are a standing "
                     "gap (rows CDC won't re-deliver), not lag. Backfill them by "
-                    "re-running the migration. The Full Load is idempotent "
-                    "(INSERT ... ON CONFLICT) — it only fills missing rows and never "
-                    "creates duplicates."
+                    f"re-running the migration from a new start point. {why}: Stop CDC "
+                    "removes the sink without a drain, so its consumer group would re-apply "
+                    "changes older than the new snapshot over the reloaded tables, while the "
+                    "source skips the changes between the old stop point and the new "
+                    "snapshot."
                 ),
             )
-            # The exact, ordered click-path. STOP CDC FIRST is the critical step (a
-            # live CDC sink + a fresh Full Load collide; CDC resumes from the old
-            # watermark). Only shown for an unexplained gap -- the reload is what fixes
-            # THAT case; for permanently-quarantined rows it would not help.
             steps = (
-                ("1", "Go to the Data Migration step (left nav)."),
-                ("2", "Open the CDC sub-step and click Stop CDC — do this FIRST. "
-                 "Re-running Full Load while CDC is live collides with the stream and "
-                 "leaves a gap/overlap (CDC would resume from the old snapshot point)."),
-                ("3", "In the Full Load sub-step, click Start/Re-run to backfill the "
-                 "missing rows (safe and duplicate-free)."),
-                ("4", "When it finishes, click Continue to CDC and start CDC again — it "
-                 "resumes gaplessly from the new snapshot."),
-                ("5", "Come back here and click Re-run validation to confirm a clean "
-                 "match."),
+                "Go to the Data Migration step (left nav).",
+                "Open the CDC sub-step. If CDC is running, click Stop CDC first. Then "
+                "click Delete CDC infrastructure, and deploy it again: the new stack "
+                "starts with empty CDC topics.",
+                *((switch_type,) if cdc_only else ()),
+                "In the Full Load sub-step, click Re-run Full Load (Re-run all tables "
+                "when some failed; Start Full Load if none ran) and choose "
+                "'Drop & reload': every selected table is reloaded from a new start "
+                "point (an append would keep rows older than it).",
+                "When it finishes, click Continue to CDC and Start CDC: it starts from the "
+                "new Full Load's start point.",
+                "Come back here and click Re-run validation to confirm a clean match.",
             )
+        else:
+            render_notice(
+                ui,
+                tone="info",
+                header=(
+                    "Re-run Full Load to backfill the gap"
+                    if full_load_only
+                    else "Re-run Full Load + CDC to backfill the gap"
+                ),
+                body=(
+                    "These differences do not shrink over time, so they are a standing "
+                    "gap (rows CDC won't re-deliver), not lag. Backfill them by "
+                    "re-running the migration. "
+                    + (
+                        "The Full Load is idempotent (INSERT ... ON CONFLICT) — it only "
+                        "fills missing rows and never creates duplicates."
+                        if full_load_only
+                        # G25 (rule E): CDC continues from the re-run's new start point.
+                        else "CDC then starts from the new Full Load's start point, so "
+                        "that re-run is a Drop & reload: an append would keep the rows "
+                        "already on the target as they were, without the changes the "
+                        "source made to them before that point."
+                    )
+                ),
+            )
+            # The exact, ordered click-path. Only shown for an unexplained gap -- the reload
+            # is what fixes THAT case; for permanently-quarantined rows it would not help.
+            # A CDC type's stack that has streamed, or is not read yet, takes the branch
+            # above (G25); one that never streamed cannot be running, so there is no Stop
+            # CDC step, and its re-run and Start are the branch above's own (rule E: a Drop &
+            # reload, since CDC continues from its new start point) -- the card shown too
+            # right after that branch's Delete-and-redeploy step. Full load only has no CDC
+            # phase to start afterwards.
+            steps = (
+                "Go to the Data Migration step (left nav).",
+                *((switch_type,) if cdc_only else ()),
+                *(
+                    (
+                        "In the Full Load sub-step, click Start/Re-run to backfill the "
+                        "missing rows (safe and duplicate-free).",
+                    )
+                    if full_load_only
+                    else (
+                        "In the Full Load sub-step, click Re-run Full Load (Re-run all tables "
+                        "when some failed; Start Full Load if none ran) and choose "
+                        "'Drop & reload': every selected table is reloaded from a new start "
+                        "point (an append would keep rows older than it).",
+                        "When it finishes, click Continue to CDC and Start CDC: it starts "
+                        "from the new Full Load's start point.",
+                    )
+                ),
+                "Come back here and click Re-run validation to confirm a clean match.",
+            )
+        if steps:
             ui.label("Steps to recover").classes(  # type: ignore[attr-defined]
                 "text-sm font-semibold text-gray-900 mt-1"
             )
             with ui.column().classes("w-full gap-1.5"):  # type: ignore[attr-defined]
-                for num, text in steps:
+                for num, text in enumerate(steps, start=1):
                     with ui.row().classes("items-start gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-                        ui.label(num).classes(  # type: ignore[attr-defined]
+                        ui.label(str(num)).classes(  # type: ignore[attr-defined]
                             "shrink-0 w-5 h-5 rounded-full bg-blue-100 text-blue-700 "
                             "text-[11px] font-semibold flex items-center justify-center"
                         )
@@ -7664,8 +7859,11 @@ def _render_cutover_section(
                  f"read-only / maintenance mode so {source_engine} stops taking new "
                  "writes."),
                 ("3", "Wait for the final drain: let CDC apply the last in-flight "
-                 f"change events until lag is zero again. {source_engine} and DSQL now "
-                 "hold the same rows."),
+                 "change events until lag is zero again, and at least 5 minutes after "
+                 "the last source write — a change waiting on a unique index is held "
+                 "that long before it is applied or dead-lettered, and its lag can "
+                 f"take a minute or two to show. {source_engine} and DSQL now hold the "
+                 "same rows."),
                 ("4", "Re-run validation here for the final go/no-go — do this AFTER "
                  "the drain (step 3). Cut over only on a clean MATCH (or differences "
                  "you can fully explain). This final run also advances any "
@@ -7692,9 +7890,13 @@ def _render_cutover_section(
                 ("1", "Freeze writes on the source: put your application in "
                  "read-only / maintenance mode so no new rows are written to "
                  f"{source_engine} while you switch."),
-                ("2", "If the source took writes since the snapshot, re-run Full "
-                 "Load once more (it's idempotent — only fills the unfinished "
-                 "work, never duplicates), then re-run validation here."),
+                # G25 (rule E): a fresh copy is a Drop & reload re-run. The default Append
+                # applies no update or delete, and a row-count MATCH cannot see a stale
+                # value; Retry unfinished tables only fills unfinished work.
+                ("2", "If the source took writes since the snapshot, Re-run Full Load "
+                 "choosing 'Drop & reload' (the default Append only adds missing rows "
+                 "and applies no update or delete made since), then re-run validation "
+                 "here in CHECKSUM mode."),
                 ("3", "Confirm a clean MATCH on this screen — that's the go/no-go "
                  "gate."),
                 ("4", "Repoint your application to the Aurora DSQL endpoint "

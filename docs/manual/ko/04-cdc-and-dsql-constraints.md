@@ -29,9 +29,9 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
   행의 모든 변경이 한 파티션에 순서대로 유지), 그리고 DLQ 토픽, Debezium **스키마 히스토리** 토픽
   (새 시작 지점에서 `recovery`가 만들고 재시작 때 재생되는 대상 — **MySQL 소스 전용**이며,
   PostgreSQL/pgoutput 커넥터에는 스키마 히스토리 토픽이 없음), 그리고 유휴 구간에도 커밋된 소스 위치를
-  전진시켜 재시작 시 무손실 재개를 가능케 하는
+  전진시켜 재시작 지점이 유휴 구간 때문에 뒤처지지 않게 하는
   **하트비트** 토픽 — MySQL은 binlog offset, PostgreSQL은 슬롯의 확정 LSN(이는 WAL 누적도 막아 줌) — 으로
-  구성됩니다.
+  구성됩니다(재시작에 빈틈이 없는 것은 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안뿐: §4.3).
 - **커스텀 DSQL 싱크 커넥터**(이 프로젝트가 소유한 Java Kafka Connect 플러그인)가 변경을 DSQL에
   적용합니다. 두 커넥터 모두 **관리형 MSK Connect**에서 실행되며, 도구는 **자체 싱크 컴퓨트를 돌리지
   않고** 컨트롤 플레인 역할만 합니다(구성 작성, 재개 지점 확립 — MySQL은 Kafka 시작 오프셋을 시드하고,
@@ -109,8 +109,9 @@ SQLSTATE와 레코드 형태로 드리프트를 **분류**(아래 표)하고 CDC
   `CHECK`를 추가하는 `ADD CONSTRAINT … CHECK (…) NOT VALID` 문이 나옵니다.
 
 아래 표의 모든 거부와, 더 이상 존재하지 않는 타깃 테이블(`42P01`), 고유 키 충돌(`23505`; 그 행은 고유 인덱스 이름과
-생길 수 있는 두 원인 — 기본 키 변경이나 행 사이를 옮겨 가는 고유 값(§4.4), 복합 키 테이블의 선행 컬럼
-업데이트(§4.6) — 을 알려 줌), 싱크가 바인딩할 수 없는 값(`07006`)은 같은 방식으로 배너 행이 생기며, 직접 해결하도록 표시만 합니다(도구는 타깃 데이터를 자동으로
+생길 수 있는 원인 — 기본 키 변경이나 행 사이를 옮겨 가는 고유 값(§4.4), 복합 키 테이블의 선행 컬럼
+업데이트(§4.6), 그리고 소스가 그 `UNIQUE` 인덱스를 삭제하거나 완화한 경우(CDC는 이를 복제하지 않으므로
+Aurora DSQL에서도 삭제) — 을 알려 줌), 싱크가 바인딩할 수 없는 값(`07006`)은 같은 방식으로 배너 행이 생기며, 직접 해결하도록 표시만 합니다(도구는 타깃 데이터를 자동으로
 삭제하거나 다시 쓰지 않습니다). 소스 `TRUNCATE`는 별도의 배너가 생깁니다(아래 참고). 그 밖의 데드레터는 자체
 배너 행이 생기지 않고 데드레터 큐 카드에만 나타납니다:
 
@@ -141,9 +142,17 @@ Aurora DSQL에는 `ALTER COLUMN … TYPE`과 `SET NOT NULL`이 없고 기본 키
 이미 밀쳐둔 행을 백필하려면: **Full Load + CDC**에서는 Step 1(Evaluation) 재실행 → Stop CDC → **Drop &
 reload**로 테이블 리로드(Schema Conversion에서 그 DDL을 편집하지 않았다면 새 키·타입·NULL 규칙·ENUM 값으로 다시
 만듦) → Start CDC → Validation에서 재확인(그 테이블은 CHECKSUM이 자동). **CDC only**에서는 Aurora DSQL에서 직접
-고치거나(데드레터 큐 카드에 각 기본 키가 나옴) **Start over**를 사용하세요. 그 밖의 데이터 오류(`22P02`,
+고치거나 **Start over**를 사용하세요: 데드레터 큐 카드는 각 레코드의 기본 키를 알려 주지만 키 값은 정수나
+UUID일 때만 보여 주므로(그 밖의 값은 숨김), 키 값이 숨겨지는 테이블에는 Start over를 사용하세요. 그 밖의
+데이터 오류(`22P02`,
 `22007`/`22008`, `22021`, …)는 데드레터 큐 카드에 SQLSTATE만 표시됩니다. 데드레터가 생긴 모든 테이블과
 마찬가지로, Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됩니다.
+더 이상 존재하지 않는 타깃 테이블, 고유 키 충돌, 싱크가 바인딩할 수 없는 값에 대해서는 배너의 알림이
+*Stop CDC and reload these tables*로 표시되고, **CDC only**에서는 *Stop CDC and repair these tables*로
+표시됩니다: Stop CDC 후 타깃에 테이블이 있는지 확인하고(없으면 Schema Conversion에서 다시 적용), 데드레터가 된
+행을 Aurora DSQL에서 직접 고친 다음(트랜잭션당 최대 3,000행) Start CDC 하고 Validation을 실행하거나,
+카드가 키 값을 숨기는 테이블처럼 **Start over**를 사용하세요. 타깃에서 삭제된 테이블은 삭제 전에 적용된 모든 행도 잃었고 어떤 데드레터도 그
+행을 나열하지 않으므로, 그 테이블에는 Start over를 사용하세요.
 
 **컬럼이 정확히 담을 수 없는 값**(MySQL·PostgreSQL 소스)은 쓰지 않고 거부합니다. 싱크는 쓰기 전에 각 숫자를
 Aurora DSQL 컬럼과 대조하며, 컬럼 타입은 테이블당 한 번(이후 10분마다 다시) 읽습니다. 이 검사가 없으면 다음
@@ -265,27 +274,66 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
 
    > **이 설명은 `Full load + CDC` 실행에 해당합니다.** 재읽기 없는 핸드오프를 만들어 주는 것은 그 적재
    > *도중에* 생성된 슬롯이며, PostgreSQL 슬롯은 과거 위치에 만들 수 없습니다. **`Full Load만`** 실행한 뒤
-   > 나중에 CDC로 돌아오면 스트리밍은 여전히 무손실이지만, 소스 커넥터가 자체 publication과 슬롯을 만들고
-   > **선택된 모든 테이블을 먼저 재스냅샷**합니다 — 데이터를 한 번 더 읽습니다. 선택 기준은
-   > [10장 §10.1](10-conclusion.md)을 참고하세요. MySQL은 소비자가 없어도 바이너리 로그가 히스토리를
-   > 보관하므로, 나중에 CDC를 시작해도 재읽기 없이 워터마크부터 재개합니다.
+   > 나중에 CDC로 돌아오면 스트리밍은 여전히 무손실이지만, 소스 커넥터가 자체 슬롯을 만들고 publication을
+   > 선택된 테이블로 맞춘 뒤 **선택된 모든 테이블을 먼저 재스냅샷**합니다 — 데이터를 한 번 더 읽습니다
+   > (커넥터를 전에 시작한 CDC 스택에서는 대신 Start CDC가 그 스택 자체의 슬롯에서 이어 가되, 그 스택의
+   > 소스 커넥터가 스트리밍하지 않았다면 Debezium이 먼저 선택한 모든 테이블을 스냅샷합니다: 싱크가 적용하지
+   > 않은 변경을 CDC 토픽이 아직 보존하는 동안만 빈틈이 없음). 선택 기준은 [10장 §10.1](10-conclusion.md)을 참고하세요. MySQL은 소비자가 없어도 바이너리
+   > 로그가 히스토리를 보관하므로, 스트리밍한 적 없는 CDC 스택에서는 나중에 CDC를 시작해도 재읽기 없이
+   > 워터마크부터 시작합니다. 스트리밍한 적 있는 스택에서는 Start CDC가 그 더 새 시작 지점을 거부하므로,
+   > 마이그레이션 유형을 CDC only로 바꾼 뒤 그 CDC 단계에서 Delete CDC infrastructure 후 다시 배포하고
+   > Start CDC 하세요(Full load only에는 CDC 단계가 없습니다.
+   > [3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)). 어느 쪽이든 CDC는 워터마크에서 시작해 그 뒤의
+   > 변경만 가져오므로, 그 Full load only 실행이 앞선 적재가 타깃에 남긴 행에 append했다면 먼저
+   > **Drop & reload**로 Re-run Full Load 하세요.
 
    Full Load 후 테이블의 체크를 해제하면(Full load + CDC, CDC를 시작하기 전; [§13.7](13-excluding-tables-and-columns.md)), CDC는 아직 선택된 테이블만 캡처하고 같은 워터마크 또는 슬롯에서 재개하므로, 그 테이블들의 핸드오프는 계속 gapless입니다. PostgreSQL에서 CDC가 그 슬롯에서 재개하면 publication에 체크를 해제한 테이블이 계속 남아 있고(도구는 소스에서 그 테이블을 빼지 않습니다) 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다. 줄어든 집합으로 Re-run Full Load를 실행하면 기존 publication을 재사용합니다.
 
-   Full Load 후 체크한 테이블(Full load + CDC, CDC를 시작하기 전)은 먼저 [§13.7](13-excluding-tables-and-columns.md)의 점검을 거쳐 Retry unfinished tables가 로드하고, 그 뒤 CDC가 같은 워터마크 또는 슬롯에서 그 테이블을 캡처합니다(MySQL에서 Full Load가 시작 지점 정의를 기록하지 않은 테이블은 대신 Re-run all tables가 필요합니다). 그 테이블이 로드될 때까지 Start CDC는 기다립니다. MySQL에서는 CDC가 워터마크 이후 그 테이블에 일어난 모든 변경을 더 새로운 복사본 위에 재생합니다. PostgreSQL에서는 그 테이블이 복사를 시작하기 직전에 CDC의 publication에 들어가고, CDC는 그때부터 그 테이블에 일어난 모든 변경을 그 복사본 위에 스트리밍합니다. 어느 쪽이든 결과는 수렴합니다. 고유 인덱스에서 잠깐 충돌하는 변경은 데드레터가 될 수 있으며, 그러면 Cut over는 CHECKSUM 검증을 기다립니다.
-3. **MySQL 소스**에서는 **새 시작 지점**에서의 Start — 첫 Start, 더 새 Full Load나 Manual 지점 이후의
-   Start, Delete CDC infrastructure 후의 첫 Start — 가 소스 커넥터를 **`snapshot.mode=recovery`**로
+   Full Load 후 체크한 테이블(Full load + CDC, CDC를 시작하기 전)은 먼저 [§13.7](13-excluding-tables-and-columns.md)의 점검을 거쳐 Retry unfinished tables가 로드하고, 그 뒤 CDC가 같은 워터마크 또는 슬롯에서 그 테이블을 캡처합니다(MySQL에서 Full Load가 시작 지점 정의를 기록하지 않은 테이블은 대신 **Drop & reload**로 Re-run all tables가 필요합니다). 그 테이블이 로드될 때까지 Start CDC는 기다립니다. MySQL에서는 CDC가 워터마크 이후 그 테이블에 일어난 모든 변경을 더 새로운 복사본 위에 재생합니다. PostgreSQL에서는 그 테이블이 복사를 시작하기 직전에 CDC의 publication에 들어가고, CDC는 그때부터 그 테이블에 일어난 모든 변경을 그 복사본 위에 스트리밍합니다. 어느 쪽이든 결과는 수렴합니다. 고유 인덱스에서 잠깐 충돌하는 변경은 데드레터가 될 수 있으며, 그러면 Cut over는 CHECKSUM 검증을 기다립니다.
+3. **MySQL 소스**에서는 **새 시작 지점**에서의 Start — 첫 Start(Full Load 워터마크 또는 Manual 지점에서),
+   Delete CDC infrastructure 후의 첫 Start — 가 소스 커넥터를 **`snapshot.mode=recovery`**로
    실행합니다: 오프셋이 이미 시드돼 있으므로 Debezium은 내부 **스키마 히스토리**를 **현재 소스 테이블**로부터
    재구성한 뒤(binlog 이벤트를 디코딩하기 위해) **행 데이터는 다시 읽지 않고** 시드된 오프셋부터 재개합니다.
    Start CDC는 먼저 캡처 대상 테이블이 그 시작 지점 이후 바뀌지 않았는지 검사합니다([6장](06-limitations.md)).
+   스트리밍한 적 있는 스택에서는 더 새 Full Load나 Manual 지점에서의 Start를 인프라를 다시 배포할 때까지
+   Start CDC가 거부합니다(*This CDC stack cannot start from a newer start point*): 그 스택의 토픽에는 어떤
+   싱크도 적용하지 않은 변경이 남아 있을 수 있고, 그 싱크는 그 변경을 그 뒤에 적재한 것 위에 쓰는 한편
+   소스는 멈춘 곳과 새 지점 사이의 모든 변경을 건너뛰기 때문입니다([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
+   CloudFormation이 롤백한 첫 Start 뒤에는 그 Start가 준 지점보다 뒤의 시작 지점을, 앱을 재시작한 뒤에는
+   모든 시작 지점을 거부합니다: 스택은 그 지점을 기록하지 않기 때문입니다.
    **Stop CDC 후의 재시작**은 대신 **`snapshot.mode=schema_only`**로 실행되어, 기록된 스키마 히스토리를
    재생하고 DDL을 binlog 순서대로 적용합니다. 이런 재시작은 커넥터의 자동 재시작과 마찬가지로
    Debezium이 기록한 위치부터 이어집니다 — `gtid_mode=ON`이면 마지막으로 커밋한 GTID 셋 다음부터입니다.
+   Stop CDC는 두 커넥터를 싱크를 드레인하지 않고 제거하므로, CDC가 멈출 때 싱크가 적용하지 않은 변경은 그
+   재시작에서 CDC 토픽에서만 Aurora DSQL에 도달하며(싱크의 마지막 커밋부터 다시 적용되므로 중복은 생기지
+   않습니다): 그 재시작에 빈틈이 없는 것은 토픽이 그 변경을 아직 보존하는 동안 — MSK에서의 보존 기간 —
+   뿐입니다. *Ready to resume CDC* 카드와 *Resuming from the last streamed position* 시작 지점 카드가 그
+   조건을 말하며, 둘 중 어느 것도 *빈틈 없음*이나 다시 적용되는 것이 없다고 약속하지 않습니다.
    **PostgreSQL 소스**에서는
    Debezium pgoutput 커넥터에 스키마 히스토리 토픽이 없습니다. 무손실 경로에서는 **`snapshot.mode=never`**로
    실행되며(논리 슬롯이 이미 시작 LSN을 보유하고 행도 적재됨), 단독/수동 시작에서는 **`initial`**(스냅샷 후
    스트리밍)을 사용합니다. Debezium PostgreSQL은 슬롯 자체의 위치에서만 재개할 수 있으며, 임의의 WAL LSN으로
-   탐색할 수 없습니다.
+   탐색할 수 없습니다. Stop CDC 후의 Start는 슬롯의 위치(스트리밍이 멈춘 곳, 그 스택의 소스 커넥터가 한 번도
+   스트리밍하지 않았으면 Full Load의 시작 지점)에서 이어 가지만, `initial`에서 초기 스냅샷을 끝내지 못한 소스 커넥터(그 전에
+   태스크가 실패했거나 CDC를 멈춘 경우)는 선택한 모든 테이블을 다시 스냅샷합니다 — 소스 전체를 다시 읽습니다.
+   Stop CDC는 커넥터를 드레인하지 않고 제거하므로, 그때까지 싱크가 적용하지 않은 변경은 CDC 토픽에서만 Aurora
+   DSQL에 도달합니다: 그런 Start에 빈틈이 없는 것은 토픽이 그 변경을 아직 보존하는 동안뿐이며, Start CDC는 이를
+   확인하지 않습니다. MSK에서 토픽의 보존 기간이 지나면 그 Start는 그 변경을 건너뛰므로, Start CDC 카드(*Ready
+   to resume CDC*)와 시작 지점 카드(*Resuming from this stack's replication slot*)는 대신 택할 경로로 커넥터를
+   전에 시작한 스택의 경로(새 토픽 먼저. 아래 PostgreSQL 설명 참고)를 알려 줍니다. **Stop CDC** 대화 상자도
+   멈추기 전에 같은 조건을 두 소스 모두에 말해 주고, PostgreSQL에서는 그 보존 기간이 지난 뒤의 경로까지 알려
+   줍니다. 스냅샷하는 Start는
+   상속(`INHERITS`) 자식 테이블이 있는 캡처 대상 테이블이 있으면 거부됩니다(*CDC cannot snapshot a table that
+   has inheritance child tables*). Debezium의 스냅샷은 그 테이블을 자식 테이블의 행과 함께 읽기
+   때문입니다([6장](06-limitations.md)). 도구가 소스는 읽었지만 어떤 캡처 대상 테이블에 자식 테이블이 있는지
+   읽지 못하면 그런 Start도 거부됩니다(*Whether a captured table has inheritance child tables could not be
+   read*): 도구가 소스에 닿을 수 있는지 확인한 뒤 Start CDC를 다시 실행하세요. 소스를 아예 읽지 못하면 — 예컨대
+   앱을 재시작한 뒤 연결을 다시 테스트하기 전의 Secrets Manager 소스 — Start CDC는 막히지 않지만 시작 전
+   PostgreSQL 검사(publication, 복제 슬롯과 그 위치, 상속 읽기)가 실행되지 않습니다: Start CDC 대화 상자가
+   이유와 함께 *CDC's publication and replication slot could not be checked* 경고를 보여 주고, 활동 로그가
+   *PostgreSQL publication and slot checks not run*(WARNING)을 대화 상자에서 한 번, 그리고 Start CDC 작업이 그
+   검사 없이 진행하면 그 작업에서 다시 기록합니다. Connect 단계에서 소스 연결을 테스트한 뒤 Start CDC를 다시
+   열어 검사가 실행되게 하세요.
 
 그 결과, 스냅샷과 "지금" 사이의 모든 변경이 정확히 한 번 적용됩니다. 싱크는 PK를 기준으로 적용하므로 같은
 변경이 겹치거나 재시도돼도 **중복이 생기지 않습니다**.
@@ -294,13 +342,131 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
 > 위치의 바이너리 로그를 아직 삭제하지 않았을 때만 동작합니다. RDS/Aurora는 기본적으로 binlog를
 > 공격적으로 삭제하고(Aurora MySQL은 24시간 보존), CDC 스택 배포에만 ~15~20분이 걸리므로 **시작 전에
 > binlog 보존을 늘리세요** — [§1.1](01-setup.md#11-사전-요구사항) 참조. 해당 구간이 이미 사라졌다면 CDC가
-> 무손실로 재개할 수 없고, 새 워터마크를 얻기 위해 Full Load를 다시 실행해야 합니다.
+> 무손실로 재개할 수 없고, 새 워터마크를 얻기 위해 **Drop & reload**로 Full Load를 다시 실행해야
+> 합니다(append는 이미 로드된 행을 그대로 둡니다) — 스트리밍한 적 있는
+> 스택에서는 Delete CDC infrastructure 후 다시 배포한 뒤에 실행합니다. 그때까지 Full Load 단계가 새 시작
+> 지점을 거부하기 때문입니다([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
 >
-> **PostgreSQL: 논리 복제 슬롯이 대신 WAL을 고정합니다.** 슬롯이 생성되는 순간부터 필요한 WAL을 붙잡아
-> 두므로 밑에서 무언가가 삭제되어 사라지지 않습니다 — 전제 조건은 binlog 보존이 아니라
-> `wal_level=logical`(RDS/Aurora는 `rds.logical_replication`)입니다. 다만 슬롯은 건강해야 합니다: 너무
-> 뒤처져 Postgres가 `wal_status='lost'`(슬롯 무효화)를 보고하면 무손실 재개가 깨지므로, 새 워터마크를 얻기
-> 위해 Full Load를 다시 실행해야 합니다.
+> **PostgreSQL: 논리 복제 슬롯이 대신 WAL을 고정합니다.** 슬롯이 생성되는 순간부터 필요한 WAL을 붙잡아 두므로
+> 밑에서 무언가가 삭제되어 사라지지 않습니다 — 전제 조건은 binlog 보존이 아니라
+> `wal_level=logical`(RDS/Aurora는 `rds.logical_replication`)입니다. 다만 슬롯은 건강해야 합니다: 너무 뒤처져
+> Postgres가 `wal_status='lost'`(슬롯 무효화)를 보고하면 그 슬롯에서의 무손실 재개가 깨지고, Start CDC가
+> 차단하며 해결 경로를 알려 줍니다(아래): Full load + CDC에서는 새 워터마크를 얻기 위해 **Drop & reload**로
+> Full Load를 다시 실행하되, 스택의 커넥터를 전에 시작했다면 먼저 Delete CDC infrastructure 후 다시
+> 배포합니다. CDC 모니터의
+> 슬롯 패널도 같은 슬롯을 *Replication slot invalidated*로 보고하며 그 경로를 모두 알려 줍니다: Delete CDC
+> infrastructure 후 다시 배포, 그다음 Re-run Full Load를 **Drop & reload**로, 그다음 Start CDC. CDC only에서는
+> Delete CDC infrastructure 후 다시 배포한 뒤 새 스택에서 Start CDC 하며, 그 Start가 선택한 모든 테이블을
+> 스냅샷합니다(그 유형에는 다시 실행할 Full Load 단계가 없습니다). 슬롯 이름은 CDC 스택 이름에서 나오므로,
+> 한 소스를 같은 스택 이름으로 마이그레이션하는 두 작업은 슬롯을 공유합니다. Full
+> Load는 그 이름의 슬롯이 사용 중이거나 다른 데이터베이스에 속하면 절대 삭제하지 않습니다(쓰기 전에 멈춤).
+> 그래서 그 이름의 슬롯이 있지만 CDC가 쓸 수 없을 때 — 다른 데이터베이스의 것이거나 논리 `pgoutput` 슬롯이
+> 아닐 때 — 모든 차단은 그 슬롯의 자체 해결책(그 슬롯을 삭제하거나 이 마이그레이션에 고유한 CDC 스택 이름을
+> 사용)을 Full Load 재실행보다 먼저 알려 줍니다. 그런 슬롯은 Full Load 재실행도 쓰기 전에 거부하기
+> 때문입니다. 슬롯이 없다는 차단도 같은 말을 하며, 그런 슬롯은 캡처 대상 테이블의 상속 자식 테이블보다 먼저
+> 보고됩니다. 상속 차단의 자체 해결책이 바로 그 재실행이기 때문입니다. CDC
+> 스택의 첫 Start(스택에 커넥터를 시작한 기록이 아직 없는 스택. CloudFormation 업데이트가 롤백된 Start의
+> 기록도 없고, MSK Connect에 그 스택의 커넥터도 없어야 함)에서는 슬롯이 더 이상 Full Load의 시작 지점에 있지
+> 않으면 Start CDC가 그 슬롯에서의 재개를 거부합니다(*CDC's replication slot is not at this Full Load's start
+> point*: 같은 CDC 스택 이름을 쓰는 다른 실행이 슬롯을 다시 만들었거나 읽었으므로, 재개하면 그 사이의 변경을
+> 건너뜀): 모든 테이블을 다시 스냅샷하거나 **Drop & reload**로 Full Load를 다시 실행하세요(다른
+> 마이그레이션이 이 스택 이름을 함께 쓰면 고유한 CDC 스택 이름으로) — CDC only에서는 마이그레이션 유형을 Full load + CDC로 바꾼 뒤입니다.
+> 커넥터를 시작한 적 없는 스택의 경로는 아래에 있습니다. 커넥터를 전에 시작한 스택 — 그 뒤 멈췄거나, Retry
+> CDC처럼 커넥터가 그대로 있거나(MSK Connect에 그 스택의 커넥터가 있으면 스택 상태와 상관없이 해당), 마지막
+> Start의 CloudFormation 업데이트가 롤백된(완료, 진행 중, 실패, 정리 진행 중 등 모든 `UPDATE_ROLLBACK_*` 상태)
+> 스택 — 은 슬롯 위치로 판단하지 않습니다: 그 스택의 소스 커넥터가 슬롯을 옮겼을 수 있기 때문입니다. 그런
+> 스택에서 새 시작 지점을 가져가는 Full Load는 CDC 인프라를 삭제하고 다시 배포하기 전까지
+> 거부되므로([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)), 이 스택이 스트리밍한 뒤 Full Load가 다시
+> 만든 슬롯에서의 재개는 어디에서도 설명하지 않습니다. 이 검사는 스택이 기록한 것과 MSK Connect에
+> 있는 그 스택의 커넥터만 읽으므로, 거부된 Start, 스택을 업데이트하기 전에 실패한 Start, 앱 재시작, Start over
+> 뒤에도 다음 Start는 같은 방식으로 판단됩니다. 이 스택이 스트리밍한 뒤, 또는 이 스택의 첫 Start가 롤백된 뒤
+> 같은 CDC 스택 이름을 쓰는 다른 마이그레이션이 슬롯을 다시 만드는 경우는 알아차리지 못하므로,
+> 마이그레이션마다 고유한 CDC 스택 이름을 쓰세요.
+>
+> **커넥터를 전에 시작한 스택에서는** CDC 토픽에 아직 어떤 싱크도 적용하지 않은 변경이 남아 있을 수 있습니다:
+> Stop CDC와 롤백된 Start는 커넥터를 드레인하지 않고 제거하고 이 스택의 싱크는 마지막 커밋에서 재개하므로,
+> 이전 토픽을 둔 채로 Full Load를 다시 실행하면 그 변경이 다시 적재한 테이블 위에 적용됩니다. 그곳에서는 다시
+> 스냅샷도 믿을 수 없습니다: 소스 커넥터가 한 번 스트리밍하면 Debezium이 이후의 모든 Start에서 스냅샷을
+> 건너뜁니다. 그래서 그런 스택에서 publication이 없거나, publication에 선택한 테이블이 빠졌거나, 슬롯이 없거나
+> 무효화됐거나 쓸 수 없다는 차단은 그렇게 알리고 경로를 하나만, 새 토픽 먼저 알려 줍니다: Delete CDC
+> infrastructure 후 다시 배포(새 스택은 빈 토픽으로 시작), 그다음 Re-run Full Load를
+> **Drop & reload**로(슬롯을 자신의 스냅샷 지점에 다시 만듦), 그다음 Start CDC. CDC only에서는 Delete CDC
+> infrastructure 후 다시 배포한 뒤 새 스택에서 Start CDC 하며, 그 Start가 선택한 모든 테이블을 스냅샷합니다(그
+> 사이에 소스에서 삭제된 행은 Aurora DSQL에 남고, Validation이 EXTRA 행으로 보고합니다). 같은 이유로 자체
+> 해결책이 Full load + CDC 실행인 상속 차단(*CDC cannot snapshot a table that has inheritance child tables*)은
+> 그런 스택에서 그 Full Load 전에 Delete CDC infrastructure 후 다시 배포하라는 말로 끝납니다. 그 이름의 슬롯을
+> 쓸 수 없다는 차단은 그 경로를 자체 해결책(그 슬롯을 삭제하거나 다른 CDC 스택 이름을 사용) 다음 단계로 알려
+> 줍니다. 그런 스택에는 **Re-snapshot every table instead**를 제시하지 않습니다. 소스 커넥터가 Debezium의
+> *Publication autocreation is disabled*로 실패했을 때의 진단(커넥터를 시작한 스택에서만 나옴)도, CDC 단계에
+> 커넥터가 아직 보이면 Stop CDC 한 뒤, 두 마이그레이션 유형 모두에 같은 경로를 알려 줍니다.
+>
+> **CloudFormation이 Start를 롤백한 뒤**에는 그 Start가 위치를 기록했다면 다음 Start가 그 위치에서 이어
+> 갑니다: 그 소스 커넥터가 롤백으로 삭제되기 전에 스트리밍하고 위치를 커밋했을 수 있으며, 그래서 그런 Start도
+> 시작한 것으로 칩니다. 기록하지 않았다면 `snapshot.mode=never`에서는 슬롯의 확정된 위치에서 스냅샷 없이 이어
+> 가고, `initial`(Manual 포함)에서는 이전 실행이 스트리밍을 멈춘 곳에서 이어 갑니다. 다만 `initial`에서
+> Debezium이 스냅샷 없이 이어 가는 것은 초기 스냅샷을 끝낸, 기록된 위치에서뿐입니다: 그 Start(또는 이전
+> 실행)가 초기 스냅샷을 끝내지 못했거나 기록된 것이 없으면, 먼저 선택한 모든 테이블을 스냅샷한 뒤 슬롯에서
+> 스트리밍합니다. 그래서 Start CDC 카드(*Ready to start CDC again*), 그 위의 시작 지점 카드(*Starting again
+> after a rolled-back Start*. 그곳에서는 시작 지점도 다시 스냅샷도 제시하지 않음), 그 Start의 활동 로그 줄은
+> 바로 그렇게 말하며, `initial`에서는 스냅샷도, 스냅샷이 없다는 것도 약속하지 않습니다. 그 Start가 스트리밍한
+> 변경은 롤백 뒤에도 남는 CDC 토픽에만 있고 다음 싱크가 거기서 적용하므로, CDC를 다시 시작해도 빈틈이 없는
+> 것은 토픽이 그 변경을 아직 보존하는 동안뿐이며, Start CDC는 이를 확인하지 않습니다. 그 Start 뒤로 MSK에서
+> 토픽의 보존 기간이 지났다면 Delete CDC infrastructure 후 다시 배포하고, Re-run Full Load를
+> **Drop & reload**로 실행한 뒤 Start CDC 하세요(CDC only에서는 Delete CDC infrastructure 후 다시 배포: 그 첫
+> Start CDC가 선택한 모든 테이블을 스냅샷합니다). 롤백된 그 Start 전에 CDC를 **멈췄**다면 카드가 그 사실을
+> 말하고 그 기간을 그 Start가 아니라 **Stop** 시점부터 셉니다(*since CDC was stopped*): CDC가 멈출 때 싱크가
+> 적용하지 않은 변경이 토픽에서 가장 오래된 것이므로 먼저 만료됩니다. 검사하지 않는 경우가 하나 있습니다: 첫 Start가 롤백된
+> 스택에서 `snapshot.mode=initial`을 보내는 Start는 슬롯이 있는지 확인하지 않습니다. 그때 슬롯이 없다면 보통
+> 실패한 커넥터가 만들지 못한 것이고 그 Start는 빈틈 없이 스냅샷하지만, 그 커넥터가 스트리밍한 뒤 슬롯이
+> 삭제되었다면 그 Start는 그 사이의 모든 변경을 건너뜁니다.
+>
+> 차단이 **Re-snapshot every table instead**를 제시하기 전에, Start CDC 대화 상자는 열릴 때 그 방법이 풀어 줄
+> Start(`snapshot.mode=initial`)의 검사를 실행하고, 검사를 통과할 때만 그 방법을 제시합니다. 그 방법은
+> 커넥터를 시작한 적 없는 스택에만, publication이 없거나 슬롯이 없거나 슬롯이 Full Load의 시작 지점에 있지
+> 않을 때만 제시됩니다. 그 Start가 차단과 같은 이유로 거부되면 두 번째 알림 없이 차단을 보여 주며 그 차단이
+> 그곳에서 통하는 경로로 끝나고, 다른 이유로 거부되면 — 예컨대 캡처 대상 테이블에 상속 자식 테이블이 있거나,
+> 그 이름의 슬롯이 있지만 쓸 수 없는 경우(무효화된 슬롯 등) — 그 거부도 *Re-snapshot every table is not
+> offered here: a Start that re-snapshots is refused too.*로 시작해 보여 줍니다. 그 뒤에는 그곳에서 통하는
+> 경로를 알려 줍니다. 상속 때문에(또는 그 읽기에 실패해) 거부되었다면 대신 Re-run Full Load를
+> **Drop & reload**로 실행하세요. 슬롯을 자신의 스냅샷 지점에 다시 만들므로 그 뒤의 Start CDC는 스냅샷하지
+> 않습니다(Full Load 단계가 없는 CDC only에서는 먼저 마이그레이션 유형을 Full load + CDC로 바꿈). 그 이름의
+> 슬롯을 쓸 수 없어 거부되었다면, 그 거부의 자체 해결책(그 슬롯을 삭제하거나 다른 CDC 스택 이름을 사용) 다음
+> 단계로 Re-run Full Load를 **Drop & reload**로 실행한 뒤 Start CDC 하세요(CDC only에서는 Start CDC를 다시
+> 실행). publication에 선택한 테이블이 빠졌다면 다시 스냅샷하는 Start도 같은 이유로 거부되므로(그 검사도
+> publication의 포함 범위를 판정함), 그 차단은 자신의 경로로 끝납니다: Re-run Full Load를 **Drop & reload**로
+> 실행하면 빠진 선택 테이블을 publication에 추가하고 슬롯을 자신의 스냅샷 지점에 다시 만들며, 그 뒤 Start
+> CDC(CDC only에서는 Delete CDC infrastructure 후 다시 배포: publication을 삭제하므로 새 스택의 Start CDC가
+> 선택한 테이블로 publication을 만들 수 있습니다). Start CDC 작업은 커넥터를 만들기 전에 publication과 슬롯
+> 검사를 다시 실행합니다(Retry CDC는 대화 상자를 열지 않음). 커넥터를 시작한 적 없는 스택에서 publication에
+> 선택한 테이블이 빠졌다거나 그 이름의 슬롯을 쓸 수 없다는 그 작업의 거부는 같은 경로로 끝나고, publication이
+> 없거나 슬롯이 없거나 슬롯이 Full Load의 시작 지점에 있지 않다는 거부는 두 가지 길을 알려 줍니다: Re-snapshot
+> every table instead(다시 스냅샷하는 Start가 자체 검사를 통과하면 Start CDC 대화 상자가 제시), 또는 Re-run
+> Full Load를 **Drop & reload**로 실행한 뒤 Start CDC(CDC only에서는 마이그레이션 유형을 Full load + CDC로
+> 바꾼 뒤). 그 검사가 소스를 읽지 못하면 그 방법은 그대로 남고, 대화 상자가 *The re-snapshot route could not
+> be checked* 경고를 보여 줍니다. 활동 로그는 *PostgreSQL re-snapshot route check not run*(WARNING)을
+> 기록합니다. 이때 publication과 슬롯 검사는 실행되었고, Start CDC 작업이 커넥터를 만들기 전에 다시 스냅샷하는
+> Start의 검사를 실행합니다(그 작업도 소스를 읽지 못하면 그 검사 없이 진행). *CDC's publication and
+> replication slot could not be checked*는 publication과 슬롯 검사 자체가 소스를 읽지 못할 때만 보입니다(위).
+>
+> **publication이 INSERT/UPDATE/DELETE의 일부만 publish하도록 제한된 경우**에도 Start CDC가 차단되며
+> (*CDC's publication does not publish every change type*), 그 차단은 자체 해결책을 먼저 알려 줍니다:
+> publication 소유자로 소스에서 `ALTER PUBLICATION … SET (publish = 'insert, update, delete')`를 실행하세요.
+> 다만 그것만으로는 충분하지 않고, 차단도 그렇게 말합니다: pgoutput은 각 변경이 커밋된 시점의 publication을
+> 보고 무엇을 publish할지 결정하므로, 목록을 되돌려도 좁혀져 있던 동안 커밋된 변경은 돌아오지 않고, 슬롯에서
+> 이어 가는 Start는 그 변경을 여전히 건너뜁니다. 그 해결책 다음에 경로가 옵니다 — 커넥터를 시작한 적 없는
+> 스택에서는 Re-run Full Load를 **Drop & reload**로 실행한 뒤 Start CDC(CDC only에서는 먼저 마이그레이션
+> 유형을 Full load + CDC로 바꿈), 커넥터를 전에 시작한 스택에서는 위와 같이 새 토픽 먼저. 다시 스냅샷해도
+> (Full Load 재실행과 마찬가지로) publication을 그대로 재사용하므로, 이 차단에는 **Re-snapshot every table
+> instead**를 제시하지 않습니다.
+>
+> **상속 차단의 두 번째 해결책은 UI가 실제로 수행할 수 있을 때만 알려 줍니다.** *…or untick `<부모 테이블>`:
+> each child table migrates as a table of its own*은 테이블 선택기가 아직 집합을 바꿀 수 있는 동안에만
+> 나옵니다. Start를 한 번 보내면 집합이 잠기므로 Start CDC 작업 자체의 거부는 그 방법을 알려 주지 않고, Full
+> Load의 스냅샷 지점에서 시작하는 방법만 남습니다. 그리고 그런 Start가 스냅샷하는 이유가 Full Load가 기록한
+> 슬롯을 두고 **Re-snapshot every table instead**를 택한 것뿐일 때, 그 차단은 돌아가는 길도 알려 줍니다:
+> 시작 지점을 다시 Automatic으로 돌리는 CDC 시작 지점 카드의 **Resume from the Full Load's slot instead**
+> 컨트롤입니다 — 그래서 기록된 재스냅샷이 같은 차단을 되풀이하지 않습니다. 그 컨트롤은 정확히 그 상태에서만
+> 나오며, 재스냅샷 알림(*Manual re-snapshots instead of resuming from this load's slot*)도 그것을 알려 줍니다.
 
 > **왜 새 시작 지점에서는 `recovery`이고 재시작에서는 `schema_only`인가? (MySQL 소스)** 시드된 오프셋이
 > 있으면 Debezium은 "재개" 경로를 타며 기존 스키마 히스토리 토픽을 기대하는데, 새 시작 지점에는 아직 그
@@ -322,8 +488,8 @@ DSQL은 분산형이면서 PostgreSQL 호환이라, 싱크는 기존 MySQL/JDBC 
 |---|---|
 | **IAM 토큰 인증(비밀번호 없음)** | 단기 IAM 토큰(admin 또는 standard)을 생성해 TLS 위 JDBC 비밀번호로 사용하고, 만료 전 **갱신**(15분 토큰, 2분 갱신 여유)해 장기 CDC가 만료 토큰에 멈추지 않게 함. |
 | **낙관적 동시성(락 없음)** | `SQLSTATE 40001`이면 충돌한 **트랜잭션**을 지수 백오프+지터로 다시 실행(최대 10회): ≤3000행 청크 하나(적용이 멱등이므로 안전), 또는 거부된 행을 격리하려고 행 단위로 적용하는 동안에는 행 하나. 다시 실행할 때마다 실패한 시도를 먼저 롤백해 깨끗한 트랜잭션에서 시작(Aurora DSQL은 커밋 시점뿐 아니라 구문을 실행하는 도중에도 `40001`을 보고할 수 있음 — `OC001`, 클러스터의 다른 곳에서 스키마가 바뀐 뒤). 이전 버전의 도구로 배포한 CDC 인프라는 이 롤백 없이 다시 실행함: **Delete CDC infrastructure** 후 다시 배포하기 전까지는 그런 `40001` 때문에 정상 행이 dead-letter 처리될 수 있음(`25P02`). |
-| **일시적 서비스 상태(`XX000` "server unavailable")** | Aurora DSQL은 `XX000`을 일시적인 상태로 문서화함: 연결은 계속 쓸 수 있고, `COMMIT`까지 포함한 트랜잭션 전체를 다시 실행하면 됨. 싱크는 이를 `40001`과 똑같이 처리: 실패한 시도를 롤백한 뒤 **트랜잭션**(청크 하나, 또는 행 하나)을 같은 지수 백오프+지터로 다시 실행하며, 두 오류는 최대 10회 예산을 함께 씀. 그 예산을 넘겨도 계속되면 싱크가 다시 연결하고, Aurora DSQL이 다시 응답할 때까지 Kafka Connect가 배치를 다시 전달하므로 그런 행은 **dead-letter 처리되지 않음**. 이전 버전의 도구로 배포한 CDC 인프라는 **Delete CDC infrastructure** 후 다시 배포하기 전까지 그런 행을 dead-letter 처리함(`XX000`). 커밋 중에 난 `XX000`은 커밋이 실제로 반영됐다는 뜻일 수 있음. 모든 쓰기가 PK 기준 upsert·delete라 다시 실행해도 기본 키 기준으로는 멱등이지만, 보조 `UNIQUE` 인덱스가 있는 테이블에서는 반영된 청크가 이미 대체한 중간 이미지가 거부(`23505`)될 수 있음. 커밋이 반영됐다면 재실행의 그 중간 이미지는 같은 배치에 있는 그 행의 이후 변경으로 대체되어 건너뜀. 남은 충돌은 보류된 다른 변경과 똑같이 기다리며(아래 행) 5분 대기를 넘길 때만 dead-letter 처리되고, 그때는 dead-letter가 난 모든 테이블과 마찬가지로 Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됨([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)). 이전 인프라는 이를 즉시 dead-letter 처리함. 그동안 CDC 단계는 싱크가 멈췄다고 표시하고("The sink is not applying changes"), 싱크 커넥터 로그에는 `DSQL apply failed (transient sqlstate=XX000); Connect will retry`가 반복됨. Aurora DSQL이 다시 응답하면 스트림은 저절로 재개됨. `XX000`이 계속 반복되면 AWS Support에 문의. |
-| **기본 키 외의 고유 인덱스(`23505`)** | Aurora DSQL은 고유 인덱스를 즉시 검사하므로(지연할 수 있는 것은 외래 키뿐) 다른 행이 아직 그 값을 가진 동안에는 변경이 거부될 수 있음. 기본 키의 `UPDATE`가 바로 그런 경우: Debezium은 이를 이전 키의 delete와 새 키의 insert로 복제하는데 둘의 키가 달라 서로 다른 파티션으로 갈 수 있고 insert가 먼저 도착할 수 있음. 한 행에서 다른 행으로 넘어가는 고유 값도 마찬가지. 싱크(플러그인 v53 이상)는 그런 변경과 그 파티션의 이후 변경을 모두, 값을 비우는 변경이 적용될 때까지 보류함: 첫 거부부터 최대 5분 동안 점점 늘어나는 간격(500 ms에서 10 s까지)으로 다시 시도하고, 그동안 다른 파티션은 모두 계속 적용됨(대기는 그 파티션의 지연으로 보임). 같은 행의 이후 변경이 그것을 완전히 대체하면 — 같은 배치에 있거나, 싱크가 파티션을 일시 정지하기 전에 (적용하지 않고) 읽는 그 파티션의 다음 배치에 있으면 — 충돌한 변경은 대신 건너뜀. 5분을 넘기면 SQLSTATE `23505`와 인덱스 이름으로 dead-letter 처리됨(*a unique constraint rejected the row*). 이전 버전의 도구로 배포한 CDC 인프라는 **Delete CDC infrastructure** 후 다시 배포하기 전까지 이를 즉시 dead-letter 처리하고, 그 뒤 이전 행의 delete가 행을 지움([6장](06-limitations.md)). |
+| **일시적 서비스 상태(`XX000` "server unavailable")** | Aurora DSQL은 `XX000`을 일시적인 상태로 문서화함: 연결은 계속 쓸 수 있고, `COMMIT`까지 포함한 트랜잭션 전체를 다시 실행하면 됨. 싱크는 이를 `40001`과 똑같이 처리: 실패한 시도를 롤백한 뒤 **트랜잭션**(청크 하나, 또는 행 하나)을 같은 지수 백오프+지터로 다시 실행하며, 두 오류는 최대 10회 예산을 함께 씀. 그 예산을 넘겨도 계속되면 싱크가 다시 연결하고, Aurora DSQL이 다시 응답할 때까지 Kafka Connect가 배치를 다시 전달하므로 그런 행은 **dead-letter 처리되지 않음**. 이전 버전의 도구로 배포한 CDC 인프라는 **Delete CDC infrastructure** 후 다시 배포하기 전까지 그런 행을 dead-letter 처리함(`XX000`). 커밋 중에 난 `XX000`은 커밋이 실제로 반영됐다는 뜻일 수 있음. 모든 쓰기가 PK 기준 upsert·delete라 다시 실행해도 기본 키 기준으로는 멱등이지만, 보조 `UNIQUE` 인덱스가 있는 테이블에서는 반영된 청크가 이미 대체한 중간 이미지가 거부(`23505`)될 수 있음. 커밋이 반영됐다면 재실행의 그 중간 이미지는 같은 배치에 있는 그 행의 이후 변경으로 대체되어 건너뜀(재키잉되지 않은 테이블일 때). 남은 충돌은 보류된 다른 변경과 똑같이 기다리며(아래 행) 5분 대기를 넘길 때만 dead-letter 처리되고, 그때는 dead-letter가 난 모든 테이블과 마찬가지로 Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됨([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버)). 이전 인프라는 이를 즉시 dead-letter 처리함. 그동안 CDC 단계는 싱크가 멈췄다고 표시하고("The sink is not applying changes"), 싱크 커넥터 로그에는 `DSQL apply failed (transient sqlstate=XX000); Connect will retry`가 반복됨. Aurora DSQL이 다시 응답하면 스트림은 저절로 재개됨. `XX000`이 계속 반복되면 AWS Support에 문의. |
+| **기본 키 외의 고유 인덱스(`23505`)** | Aurora DSQL은 고유 인덱스를 즉시 검사하므로(지연할 수 있는 것은 외래 키뿐) 다른 행이 아직 그 값을 가진 동안에는 변경이 거부될 수 있음. 기본 키의 `UPDATE`가 바로 그런 경우: Debezium은 이를 이전 키의 delete와 새 키의 insert로 복제하는데 둘의 키가 달라 서로 다른 파티션으로 갈 수 있고 insert가 먼저 도착할 수 있음. 한 행에서 다른 행으로 넘어가는 고유 값도 마찬가지. 싱크(플러그인 v53 이상)는 그런 변경과 그 파티션의 이후 변경을 모두, 값을 비우는 변경이 적용될 때까지 보류함: 다른 파티션은 모두 계속 적용되는 동안 점점 늘어나는 간격(500 ms에서 10 s까지)으로 다시 시도하며, 첫 거부부터 — 또는 그보다 나중이면 그 변경을 보류한 싱크 태스크의 마지막 일시적 실패(끊긴 연결, 또는 재시도를 넘긴 `XX000`이나 `40001`)부터 — 최대 5분이므로, 그 태스크가 겪는 Aurora DSQL 장애는 대기를 다 써 버리지 않음. 다른 싱크 태스크에서 값을 비우는 변경만 늦추는 장애는 다 써 버릴 수 있음. 대기는 그 테이블의 Stream lag으로 보임(§4.6). 5분은 보류된 변경마다 적용됨: 한 파티션의 충돌은 하나씩 차례로 기다리며, 따라잡기 중에도 마찬가지. 재키잉되지 않은 테이블에서 같은 행의 이후 변경이 그것을 완전히 대체하면(일반 delete, 또는 같은 컬럼의 이미지) — 같은 배치에 있거나, 싱크가 파티션을 일시 정지하기 전에 (적용하지 않고) 읽는 그 파티션의 다음 배치에 있으면 — 충돌한 변경은 대신 건너뜀(dead-letter 처리하지 않음). 재키잉(Composite key) 테이블에서는 아무것도 건너뛰지 않음. 5분을 넘기면 SQLSTATE `23505`와 인덱스 이름으로 dead-letter 처리됨(*a unique constraint rejected the row*). 이전 버전의 도구로 배포한 CDC 인프라는 **Delete CDC infrastructure** 후 다시 배포하기 전까지 충돌한 변경을 즉시 dead-letter 처리하고, 그 뒤 이전 행의 delete가 행을 지움([6장](06-limitations.md)). 건너뛴 변경의 행은 그 대체 변경이 적용될 때까지 타깃에서 값이 그대로임. 그래서 건너뛴 변경이 비웠을 값이 필요한 다른 행의 변경(여러 행을 거쳐 넘어가는 고유 값)은 그 대체 변경을 기다리며, 그 대체 변경이 그 파티션에서 그 뒤에 줄 서 있거나, 그 변경의 행이 아직 가진 값을 대체 변경 자신이 기다리면(이때는 둘 다 dead-letter 처리됨) 5분 뒤 dead-letter 처리됨. 그러면 dead-letter가 난 모든 테이블과 마찬가지로 Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됨. |
 | **트랜잭션당 ≤ 3000행** | ≤ 3000행 청크로 적용(기본 배치 3000), 청크당 한 번 `commit()`. |
 | **문장 단위 UPDATE/재생 없음** | 모든 변경을 **PK 기준 upsert/delete**로 적용: insert/update는 `INSERT ... ON CONFLICT (pk) DO UPDATE`, delete는 `DELETE ... WHERE pk = ?`(Kafka tombstone 포함). 같은 이벤트를 다시 적용해도 안전(중복 없음). |
 | **커넥션 끊김(idle close / 토큰 만료 / 워커 교체)** | 죽은 커넥션이나 half-open(끊겼지만 살아있는 듯 보이는) 커넥션을 감지해 새 토큰으로 재연결하고 **같은 오프셋부터 다시 적용**합니다. 같은 변경을 다시 적용해도 중복이 안 생기므로 안전하며, 레코드를 버리지 않습니다. 연결 오류는 일시적(transient) 오류로 보고 재시도하며, 손상된 행(poison row)으로 오인하지 않습니다. |
@@ -413,12 +579,17 @@ CDC 실행 중에는 Data Migration 화면이 테이블별 실시간 모니터�
   `2m 10s behind`, `1h 4m behind`.
 - 실제 **시간** 지연이므로 **모든** 기본 키 타입에서 정확하고, 최신 insert뿐 아니라 update/delete 지연도
   반영합니다.
+- 싱크가 **고유 인덱스 때문에 보류한 변경**(§4.4)은 기다리는 동안 그 테이블의 지연으로 집계됩니다 — 보류될
+  때, 다시 시도할 때마다, 오프셋 커밋 때마다(약 1분에 한 번) — 적용되기 전까지는 insert·update·delete로
+  세지 않으며, 적용되거나 dead-letter 처리되면 지연이 줄어듭니다. 파티션별 지연은 없습니다: 그 파티션에서
+  그 뒤에 쌓인 변경은 그 변경을 통해서만 드러납니다.
 - **폴백:** 시간 메트릭이 아직 없으면(구버전 싱크 플러그인이거나 메트릭 데이터포인트가 아직 없을 때) 모니터는
   `MAX(pk)` **선행 엣지** 검사로 폴백해 `N behind (PK)`(타깃 최신 키가 소스보다 몇 PK 단위 뒤처졌는지) 또는
   `caught up`을 표시합니다. 이 폴백은 단일 컬럼 정수 PK에서만 동작하며, 위의 시간 기반 값이 일반적이고 권장되는
   척도입니다.
 
-지연 측정은 철저히 **best-effort**이며 복제에 영향을 주지 않습니다. "Stream lag → caught up"을
+지연 측정은 철저히 **best-effort**이며 복제에 영향을 주지 않습니다. 소스의 마지막 쓰기 후 최소 5분이 지난
+뒤의 "Stream lag → caught up"을(보류된 변경의 지연은 나타나기까지 1~2분 걸릴 수 있음)
 [cut over](10-conclusion.md)로 넘어가도 안전하다는 신호로 사용하세요.
 
 ### 파이프라인 헬스와 change flow
@@ -427,6 +598,15 @@ per-table 표 위에 **파이프라인 헬스 카드**가 각 커넥터 상태�
 *Streaming*, *No changes flowing — idle*, 또는 **"Sink stalled — changes are NOT reaching DSQL"** — 소스 poll과
 싱크 send의 rec/s 게이지 두 개와 함께라 유휴 스트림과 멈춘 스트림을 한눈에 구분합니다. **라이브 stream-lag
 차트**는 최악의 종단 지연을 시간축으로 그려 "caught up"과 확정된 싱크 stall을 구분합니다.
+
+확정된 stall의 알림은 싱크 커넥터 로그를 가리킵니다. `Commit of offsets timed out`이 반복되면 싱크 컨슈머가
+그룹에서 빠진 것이므로 Stop CDC 후 Start CDC 해 다시 합류시키세요. `DSQL apply failed (transient sqlstate=…)`가
+반복되면 싱크가 실패하는 쓰기를 계속 재시도하는 중이며, 그 SQLSTATE가 이유를 알려 줍니다: `XX000`은 일시적인
+Aurora DSQL 상태입니다(싱크는 저절로 재개됨, 오래가면 AWS Support에 문의). `08xxx`, `57xxx` 또는 `null`은
+싱크가 클러스터에 닿지 못한다는 뜻입니다(클러스터가 아직 있는지, 커넥터 서브넷이 포트 5432로 그 엔드포인트에
+닿는지 — 보안 그룹, NAT 게이트웨이 또는 Aurora DSQL VPC 엔드포인트와 그 DNS — 그리고 커넥터의 IAM 역할이 아직
+연결할 수 있는지 확인). `40001`은 다른 무언가가 Aurora DSQL에서 같은 행에 쓰고 있다는 뜻입니다(cut over까지
+멈추세요). 싱크 send 속도가 회복될 때까지 cut over하지 마세요.
 
 커넥터의 태스크가 멈추면 그 행이 빨간색으로 바뀝니다. 커넥터의 CloudWatch 워커 로그에 도구가 아는 실패 —
 Debezium이 파싱하지 못하는 MySQL DDL 문, 스키마 히스토리 문제, 만들 수 없는 PostgreSQL publication, 연결할
@@ -464,7 +644,10 @@ letter로 격리되고(*a unique constraint rejected the row*) 이전 행이 남
 
 - **빨간색 — "Deletes on re-keyed tables can be lost":** 테이블(또는 그 파티션 중 하나)이 FULL
   미만입니다. 소스에서 `ALTER TABLE <table> REPLICA IDENTITY FULL`을 실행하세요 — 부모는 전파되지 않고
-  새 파티션은 `DEFAULT`로 시작하므로 각 파티션에도 — 그런 다음 **Check again**을 누르세요. Cut over가
+  새 파티션은 `DEFAULT`로 시작하므로 각 파티션에도 — 그런 다음 **Check again**을 누르세요(PostgreSQL 18에서
+  생성 컬럼이 있는 테이블에는 FULL 대신 **Keep source PK**를 알려 주며, 다시 읽기가 실패해도 그대로임. 앱을
+  재시작한 뒤 도구가 소스를 다시 읽기 전까지는 FULL을 알려 주면서 그런 테이블에는 대신 **Keep source PK**가
+  필요하다고 덧붙임, [6장](06-limitations.md) 참고). Cut over가
   보류됩니다. 수정 전에 일어난 delete는 다시 재생되지 않습니다. 다시 읽기 자체가 실패하면 알림이 그렇게
   알려 줍니다: 소스 자격 증명이나 네트워크 접근이 바뀌었다면 Connect 단계에서 소스를 다시 연결하세요.
 - **노란색 — "REPLICA IDENTITY is FULL again":** 수정은 반영되었지만 FULL 미만이던 동안의 delete가 빠져

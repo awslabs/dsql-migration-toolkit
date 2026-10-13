@@ -104,7 +104,10 @@ def test_readiness_prompt_grounds_deterministic_facts() -> None:
     prompt = build_cdc_readiness_prompt(
         _signals(), tables=["app.orders", "app.audit_log"]
     )
-    assert "GTID enabled (gapless resume): no" in prompt
+    # G25: no unconditional gaplessness claim for the AI to repeat (a resume is gapless
+    # only while the CDC topics retain the sink's unapplied changes, GTID or not).
+    assert "GTID enabled (Debezium positions by GTID set): no" in prompt
+    assert "gapless resume" not in prompt
     assert "binlog ROW format + full row image: yes" in prompt
     assert "app.audit_log" in prompt  # tables without PK
     assert "app.orders" in prompt  # hot PK

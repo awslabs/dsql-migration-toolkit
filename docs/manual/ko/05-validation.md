@@ -121,6 +121,33 @@ Validation은 **테이블 단위**로, 선택할 수 있는 점증적 엄밀도�
 > 마이그레이션은 건전합니다. 행 수가 일치하고 따라잡은 테이블에서 **설명되지 않는** 누락/잉여 PK가
 > 바로 Validation이 드러내려는 대상입니다.
 
+> **보고서 자체의 복구 카드.** 불일치가 **설명되지 않으면** 보고서는 순서가 있는 클릭 경로와 함께
+> **How to recover**를 보여 줍니다. CDC 스택이 **스트리밍한 적 있는** — Start 뒤에 멈췄거나, 커넥터가
+> 그대로 있거나, CloudFormation이 Start를 롤백한 스택 — 또는 CDC 상태를 아직 읽지 못한(앱 재시작 후 Data
+> Migration 단계가 읽기 전. 카드가 그렇다고 말하며, 읽은 뒤에는 그 스택 상태에 맞는 단계를 보여 줍니다)
+> **Full load + CDC**나 **CDC only** 마이그레이션에서는
+> 그 백필이 **새 시작 지점**을 가져가므로, 단계가 새 CDC 토픽을 먼저 둡니다: CDC가 실행 중이면 Stop CDC →
+> **Delete CDC infrastructure** 후 다시 배포 → **Re-run Full Load**(일부가 실패했다면 **Re-run all
+> tables**)를 **Drop & reload**로 → **Start CDC**(새 Full Load의 시작 지점에서 시작) → **Re-run
+> validation**. CDC only에서는 다시 배포한 다음 단계에서 마이그레이션 유형을 Full Load 단계가 있는 Full
+> load + CDC로 바꿉니다. 그런 스택에서는 인프라를 다시 배포하기 전까지 Full Load 단계가 새 시작 지점을
+> 거부합니다([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)): 새 시작 지점을 가져간 Full Load 뒤의
+> 재개는 **빈틈 없지 않으며**, 그래서 새 토픽이 먼저 옵니다. 스트리밍한 적 없는 스택에서는 순서가 더
+> 짧습니다(CDC only에서는 먼저 마이그레이션 유형을 Full load + CDC로 바꿈 → **Re-run Full Load**(일부가
+> 실패했다면 **Re-run all tables**)를 **Drop & reload**로 → **Start CDC**(새 Full Load의 시작 지점에서
+> 시작) → **Re-run validation**). 위 단계에서 Stop CDC와 재배포를 뺀 것이며, 그 재배포를 마친 뒤에도 카드가
+> 이 단계를 보여 줍니다: CDC가 새 시작 지점에서 시작하고 append는 그보다 오래된 행을 그대로 두므로, 여기서도
+> 재실행은 **Drop & reload**입니다. **Full load only**에서는 카드가 *Re-run Full Load to
+> backfill the gap*이며, 재실행 다음 **Re-run validation**이고 CDC 단계는 없습니다. **한 테이블**만 다시 적재하는 것은 다릅니다: 특정 테이블의
+> **Drop & reload**는 **원래** 시작 지점을 유지하므로, 5.5~5.7의 테이블별 해결 경로는 전혀 막히지 않습니다.
+> 타깃에 소스에 없는 행이 있으면 카드는 *The target holds rows the source does not — a delete never
+> landed*라고 말합니다: 재실행은 행을 채우기만 하므로, 카드는 그 테이블별 다시 적재(CDC를 멈춘 채 **Reload
+> specific tables**, **Drop & reload** 선택. CDC only에서는 마이그레이션 유형을 Full load + CDC로 바꾼 뒤)를
+> 알려 줍니다. CDC only이고 이 세션에 Full Load 기록이 없으면 다시 적재할 테이블이 없으므로, 대신 새 Full Load
+> 시작 지점을 알려 줍니다: CDC가 실행 중이면 Stop CDC 후 **Delete CDC infrastructure** 하고 다시
+> 배포한 다음(스트리밍한 적 있거나 CDC 상태를 아직 읽지 못한 스택이면), 마이그레이션 유형을 Full load +
+> CDC로 바꿔 그 Full Load를 **Drop & reload**로 실행하고 **Start CDC** 합니다.
+
 Validation이 깨끗한 **MATCH**(또는 모든 차이가 설명됨)를 보고하고 — CDC 마이그레이션이면 5.5의
 dead-letter 확인까지 해소되면 — 마지막 워크플로 단계인 **Cut over**가 UI에 나타나며 애플리케이션을 소스 데이터베이스(RDS/Aurora MySQL 또는 PostgreSQL)에서
 DSQL로 전환하는 런북을 제공합니다. Full load only에서는 Cut over에 보고서가 Full Load 이후 선택한 모든
@@ -164,6 +191,11 @@ Full load + CDC에서 Full Load 후(CDC를 시작하기 전) 체크를 해제한
   2. 도구가 **최신 Validation이 끝난 뒤 시작한**, CloudWatch Logs의 CDC dead-letter 로그에 대한
      **성공적이고 완전한 읽기**를 수행했다;
   3. 그 읽기의 이력이 **Full Load 워터마크**(CDC only이면 CDC 시작)까지 거슬러 올라간다.
+- **보류된 변경은 아직 dead letter가 아닙니다.** 싱크가 고유 인덱스 때문에 보류한 변경
+  ([§4.4](04-cdc-and-dsql-constraints.md#44-싱크가-데이터-경로에서-dsql-제약을-처리하는-방식))은 대기가 끝날
+  때에야 dead-letter 처리되므로, 그 사이의 읽기는 그것을 셀 수 없습니다: 최종 검증 전에 소스의 마지막 쓰기 후
+  최소 5분을 기다리세요([§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환) 3단계). 그 테이블의
+  Stream lag이 대기를 보여 줍니다.
 - **재시작.** 테이블별 건수, 최신 시각, 드리프트 종류는 앱 재시작 후에도 남지만, Data Migration 단계의
   레코드 목록은 남지 않습니다. 재시작 후 Cut over는 로그를 자동으로 다시 읽습니다 — Validation 또는
   Cut over 단계가 그려질 때마다 범위가 제한된 읽기 한 번, 최대 1분에 한 번입니다.
@@ -196,7 +228,8 @@ CHECKSUM은 값 비교할 수 없는 컬럼을 명시합니다(5.1). dead-letter
 - **Full Load + CDC:** 소스 스키마가 바뀌었으면 Step 1(Evaluation) 재실행 → Stop CDC → **Drop &
   reload**로 테이블 리로드 → Start CDC → 재확인.
 - **CDC only:** Aurora DSQL에서 행을 직접 수정(dead-letter queue 카드에 각 레코드의 기본 키와 Kafka
-  오프셋이 나옴) → 재확인. 소스 `TRUNCATE`의 dead letter는 어떤 행도 가리키지 않습니다: Stop CDC → 소스에
+  오프셋이 나오며, 키 값은 정수나 UUID일 때만 나옴) → 재확인. 카드가 키 값을 숨기는 테이블에는
+  **Start over**를 사용하세요. 소스 `TRUNCATE`의 dead letter는 어떤 행도 가리키지 않습니다: Stop CDC → 소스에
   더 이상 없는 행을 트랜잭션당 최대 3,000행씩 삭제 → Start CDC → 재확인
   ([§4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요)).
 

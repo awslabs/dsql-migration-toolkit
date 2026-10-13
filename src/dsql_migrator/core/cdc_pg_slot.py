@@ -8,7 +8,8 @@ enforced by :func:`~dsql_migrator.core.introspector.install_read_only_guard` on 
 source engine. PostgreSQL CDC is the sole, deliberate exception: to hand off from Full
 Load to CDC gaplessly the tool must, ON THE SOURCE,
 
-  1. create a **publication** scoped to exactly the migrated tables, and
+  1. create a **publication** scoped to exactly the migrated tables (``FOR TABLE ONLY``:
+     an inheritance child is never pulled in with its parent), and
   2. create a **logical replication slot** (``pgoutput``) at the Full Load consistency
      point -- the slot pins the source WAL from its returned LSN until CDC consumes it,
 
@@ -36,7 +37,8 @@ writes the tool ever issues to a source, so they are confined to this module, wh
 
 Before its first write, provisioning refuses to publish any table whose UPDATE/DELETE would
 then fail on the source -- no usable REPLICA IDENTITY, or one that cannot be read (G20) --
-with the same strict, fail-closed rule as the one-table ADD (G17).
+with the same strict, fail-closed rule as the one-table ADD (G17), and refuses to drop a
+same-named replication slot that is in use or belongs to another database (G25).
 
 Slot/publication CREATION is wired at the Full Load consistency point
 (``_capture_postgres_watermark``); DROP is wired into CDC teardown BEFORE the source
@@ -50,7 +52,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Mapping, NamedTuple, Optional, Sequence
 
 from sqlalchemy import text
@@ -96,11 +98,14 @@ _ALLOWED_WRITE_PREFIXES: tuple[str, ...] = (
 # The ONLY ALTER PUBLICATION ... SET this module may run.
 _PUBLICATION_VIA_ROOT_TAIL = " SET (PUBLISH_VIA_PARTITION_ROOT = TRUE)"
 # The ONLY ALTER PUBLICATION ... ADD TABLE: one sanitized publication name and ONE
-# double-quoted schema.table (a doubled quote is the escape), matched on the normalized
-# text. ONLY / * / a column list / WHERE / TABLES IN SCHEMA / a second table / a trailing
-# statement all fail the anchored match.
+# double-quoted schema.table (a doubled quote is the escape) after ``ONLY``, matched on the
+# normalized text. ONLY is REQUIRED (G25): without it PostgreSQL also adds every
+# inheritance descendant, whose REPLICA IDENTITY nothing here checked -- a child with none
+# then fails every UPDATE/DELETE through the parent too. (A partitioned table's partitions
+# stay published either way.) A missing ONLY / * / a column list / WHERE / TABLES IN SCHEMA
+# / a second table / a trailing statement all fail the anchored match.
 _PUBLICATION_ADD_TABLE_RE = re.compile(
-    r'^ALTER PUBLICATION "[A-Z0-9_]+" ADD TABLE "(?:[^"]|"")+"\."(?:[^"]|"")+"$'
+    r'^ALTER PUBLICATION "[A-Z0-9_]+" ADD TABLE ONLY "(?:[^"]|"")+"\."(?:[^"]|"")+"$'
 )
 # The ONLY transaction-ID statement (normalized form).
 _XID_STATEMENT = "SELECT PG_CURRENT_XACT_ID()::TEXT"
@@ -235,13 +240,16 @@ class RekeyedIdentityRead(NamedTuple):
     ``identity`` is ``pg_class.relreplident`` of the table itself ('d'/'f'/'i'/'n');
     ``primary_key`` its LIVE primary-key columns (column order); ``weak_partitions`` how many
     of its LEAF partitions are not FULL (0 for a plain table), and ``weak_partition_names``
-    at most five of them, sorted. Value-free: names and codes only.
+    at most five of them, sorted. ``full_refused`` (G25): PostgreSQL 18+ and the table has a
+    generated column (its partitions inherit it), so a published REPLICA IDENTITY FULL fails
+    its every UPDATE/DELETE -- FULL is no fix for it. Value-free: names, codes and a flag.
     """
 
     identity: str
     primary_key: tuple
     weak_partitions: int
     weak_partition_names: tuple
+    full_refused: bool = False
 
 
 # ONE catalog round trip for every scoped table. Leaves are aggregated SERVER-side (a count
@@ -249,7 +257,8 @@ class RekeyedIdentityRead(NamedTuple):
 # same result size as a plain one. Catalog only: no table scan, no lock. pg_partition_tree is
 # PostgreSQL 12+ (the tool targets 13-18); ``a.attnum = ANY(i.indkey)`` reads the int2vector
 # directly. The approved live check runs this on PG 13-17 (see the G2 notes).
-_REKEYED_REPLICA_IDENTITY_SQL = (
+# Completed below, once its PostgreSQL 18 generated-column test is defined.
+_REKEYED_IDENTITY_TEMPLATE = (
     "SELECT n.nspname || '.' || c.relname AS qname, "
     "       c.relreplident::text AS identity, "
     "       ARRAY(SELECT a.attname::text "
@@ -271,7 +280,8 @@ _REKEYED_REPLICA_IDENTITY_SQL = (
     "               JOIN pg_catalog.pg_namespace ln ON ln.oid = l.relnamespace "
     "               WHERE t.isleaf AND l.relreplident <> 'f' "
     "               ORDER BY 1 LIMIT 5) "
-    "       ELSE ARRAY[]::text[] END AS weak_sample "
+    "       ELSE ARRAY[]::text[] END AS weak_sample, "
+    "       {full_refused} AS full_refused "
     "FROM pg_catalog.pg_class c "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
     "WHERE c.relkind IN ('r','p') "
@@ -300,11 +310,14 @@ def read_rekeyed_replica_identity(
     out: dict[str, RekeyedIdentityRead] = {}
     for row in rows:
         sample = tuple(str(v) for v in (row[4] or ()) if v is not None)[:5]
+        values = tuple(row)
         out[str(row[0])] = RekeyedIdentityRead(
             identity=str(row[1]) if row[1] is not None else "",
             primary_key=tuple(str(v) for v in (row[2] or ()) if v is not None),
             weak_partitions=max(int(row[3] or 0), 0),
             weak_partition_names=sample,
+            # G25, after the G2 columns; a row without it reads as False.
+            full_refused=bool(values[5]) if len(values) > 5 else False,
         )
     return out
 
@@ -314,10 +327,17 @@ class ReplicaIdentityUsability(NamedTuple):
 
     ``kind`` is ``pg_class.relkind`` ('r' a plain table, 'p' a partitioned one); ``identity``
     its own ``relreplident``; ``usable`` whether PostgreSQL has a replica identity for its
-    UPDATE/DELETE once published (graded server-side by :func:`_identity_usable_sql`); and,
-    for a partitioned table, ``unusable_partitions`` how many LEAF partitions have none, at
-    most five of them named (sorted) in ``unusable_partition_names``. Value-free: names and
-    codes only.
+    UPDATE/DELETE once published (graded server-side by :func:`_identity_usable_sql`); and
+    ``unusable_partitions`` how many of its LEAF partitions have none (0 for a plain table),
+    at most five of them named (sorted) in ``unusable_partition_names``. A plain table's
+    inheritance children (``INHERITS``) are not graded: nothing this tool runs publishes them
+    -- its publication lists each table ``ONLY`` -- and Start CDC refuses the snapshot that
+    would let Debezium's own publication add them (:func:`pg_replication_objects_blocker`).
+    G25 also reads why a key is unusable: ``pk_deferrable`` (its valid primary key is
+    DEFERRABLE), ``full_refused`` (PostgreSQL 18+: it has a generated column, so a published
+    REPLICA IDENTITY FULL refuses every UPDATE/DELETE -- FULL is no fix for it) and
+    ``key_generated`` (PostgreSQL 18+: the key DEFAULT or USING INDEX would use has a
+    generated column). Value-free: names, codes and flags only.
     """
 
     kind: str
@@ -325,6 +345,43 @@ class ReplicaIdentityUsability(NamedTuple):
     usable: bool
     unusable_partitions: int
     unusable_partition_names: tuple
+    pk_deferrable: bool = False
+    full_refused: bool = False
+    key_generated: bool = False
+
+
+# PostgreSQL 18 refuses UPDATE/DELETE on a published table whose replica identity contains
+# a generated column that the publication does not publish ("Replica identity must not
+# contain unpublished generated columns", CheckCmdReplicaIdentity): under FULL every column
+# is in the identity; under DEFAULT / USING INDEX the key's columns are. A VIRTUAL one can
+# never be published, a STORED one only with publish_generated_columns = stored -- which
+# CDC's publication never sets (the tool creates it without, and so does Debezium), so both
+# count. PostgreSQL 13-17 do not check this, and their grading is unchanged.
+_PG18 = "pg_catalog.current_setting('server_version_num')::int >= 180000"
+
+
+def _has_generated_column_sql(alias: str) -> str:
+    """PostgreSQL 18+ and relation ``alias`` has a generated column: FULL is refused."""
+    return (
+        f"({_PG18} AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a "
+        f"WHERE a.attrelid = {alias}.oid AND a.attnum > 0 AND NOT a.attisdropped "
+        "AND a.attgenerated <> ''))"
+    )
+
+
+_REKEYED_REPLICA_IDENTITY_SQL = _REKEYED_IDENTITY_TEMPLATE.format(
+    full_refused=_has_generated_column_sql("c")
+)
+
+
+def _generated_key_sql(index: str) -> str:
+    """PostgreSQL 18+ and a KEY column of index ``index`` is generated (INCLUDE columns are
+    not part of a replica identity: ``indnkeyatts`` key columns lead ``indkey``)."""
+    return (
+        f"({_PG18} AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a "
+        f"WHERE a.attrelid = {index}.indrelid AND a.attgenerated <> '' "
+        f"AND a.attnum = ANY(({index}.indkey::int2[])[0:{index}.indnkeyatts - 1])))"
+    )
 
 
 def _identity_usable_sql(alias: str) -> str:
@@ -332,16 +389,18 @@ def _identity_usable_sql(alias: str) -> str:
     once published? The relcache's own rule (``RelationGetIndexList`` /
     ``CheckCmdReplicaIdentity``): FULL; DEFAULT backed by a valid, immediate (not deferrable)
     primary key; or USING INDEX backed by a valid, unique, immediate, non-partial identity
-    index. PostgreSQL does NOT reset ``relreplident`` when that key or index is dropped, so
-    the code alone proves nothing. Catalog only."""
+    index -- on PostgreSQL 18, none of them with a generated column in the identity
+    (:data:`_PG18`). PostgreSQL does NOT reset ``relreplident`` when that key or index is
+    dropped, so the code alone proves nothing. Catalog only."""
     return (
-        f"({alias}.relreplident = 'f' "
+        f"({alias}.relreplident = 'f' AND NOT {_has_generated_column_sql(alias)} "
         f"OR ({alias}.relreplident = 'd' AND EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
         f"WHERE i.indrelid = {alias}.oid AND i.indisprimary AND i.indisvalid "
-        f"AND i.indimmediate)) "
+        f"AND i.indimmediate AND NOT {_generated_key_sql('i')})) "
         f"OR ({alias}.relreplident = 'i' AND EXISTS (SELECT 1 FROM pg_catalog.pg_index i "
         f"WHERE i.indrelid = {alias}.oid AND i.indisreplident AND i.indisvalid "
-        f"AND i.indisunique AND i.indimmediate AND i.indpred IS NULL)))"
+        f"AND i.indisunique AND i.indimmediate AND i.indpred IS NULL "
+        f"AND NOT {_generated_key_sql('i')})))"
     )
 
 
@@ -349,7 +408,8 @@ def _identity_usable_sql(alias: str) -> str:
 # partitioned table are graded and aggregated SERVER-side (a count plus at most five names).
 # PostgreSQL skips the check for a partitioned parent itself (the UPDATE/DELETE runs on the
 # leaf), so a parent is graded by its leaves -- plus its own NOTHING, which the prerequisite
-# also refuses. Catalog only: no table scan, no lock.
+# also refuses. A plain table's inheritance children are not graded (see
+# :class:`ReplicaIdentityUsability`). Catalog only: no table scan, no lock.
 _REPLICA_IDENTITY_USABLE_SQL = (
     "SELECT n.nspname || '.' || c.relname AS qname, "
     "       c.relkind::text AS kind, "
@@ -368,7 +428,17 @@ _REPLICA_IDENTITY_USABLE_SQL = (
     "               JOIN pg_catalog.pg_namespace ln ON ln.oid = l.relnamespace "
     f"              WHERE t.isleaf AND NOT {_identity_usable_sql('l')} "
     "               ORDER BY 1 LIMIT 5) "
-    "       ELSE ARRAY[]::text[] END AS unusable_sample "
+    "       ELSE ARRAY[]::text[] END AS unusable_sample, "
+    "       EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid = c.oid "
+    "               AND i.indisprimary AND i.indisvalid AND NOT i.indimmediate) "
+    "         AS pk_deferrable, "
+    f"      {_has_generated_column_sql('c')} AS full_refused, "
+    "       EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid = c.oid "
+    "               AND i.indisvalid AND i.indimmediate "
+    "               AND ((c.relreplident = 'd' AND i.indisprimary) "
+    "                 OR (c.relreplident = 'i' AND i.indisreplident AND i.indisunique "
+    "                     AND i.indpred IS NULL)) "
+    f"              AND {_generated_key_sql('i')}) AS key_generated "
     "FROM pg_catalog.pg_class c "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
     "WHERE c.relkind IN ('r','p') "
@@ -394,16 +464,32 @@ def read_replica_identity_usability(
     ).fetchall()
     out: dict[str, ReplicaIdentityUsability] = {}
     for row in rows:
+        # The G25 flags follow the G17 columns; a row without them reads as False.
+        flags = [bool(v) for v in tuple(row)[6:9]]
+        flags += [False] * (3 - len(flags))
         out[str(row[0])] = ReplicaIdentityUsability(
-            kind=str(row[1]) if row[1] is not None else "",
-            identity=str(row[2]) if row[2] is not None else "",
-            usable=bool(row[3]),
-            unusable_partitions=max(int(row[4] or 0), 0),
-            unusable_partition_names=tuple(
-                str(v) for v in (row[5] or ()) if v is not None
-            )[:5],
+            str(row[1]) if row[1] is not None else "",
+            str(row[2]) if row[2] is not None else "",
+            bool(row[3]),
+            max(int(row[4] or 0), 0),
+            tuple(str(v) for v in (row[5] or ()) if v is not None)[:5],
+            *flags,
         )
     return out
+
+
+# replica_identity_problem's phrases for a key or index that is GONE: PostgreSQL keeps
+# ``relreplident`` when it is dropped, which the prerequisite explains for these causes only.
+NO_PRIMARY_KEY_PROBLEM = "REPLICA IDENTITY DEFAULT, but no valid primary key"
+INDEX_GONE_PROBLEM = "REPLICA IDENTITY USING INDEX, but that index is gone or not valid"
+
+
+def _partitions(read: ReplicaIdentityUsability) -> str:
+    count = read.unusable_partitions
+    shown = ", ".join(read.unusable_partition_names)
+    names = len(read.unusable_partition_names)
+    more = f" and {count - names} more" if count > names else ""
+    return f"{count} of its partitions {'has' if count == 1 else 'have'} none: {shown}{more}"
 
 
 def replica_identity_problem(read: ReplicaIdentityUsability) -> Optional[str]:
@@ -411,33 +497,39 @@ def replica_identity_problem(read: ReplicaIdentityUsability) -> Optional[str]:
     value-free phrase -- or ``None`` when it would not (G17). Pure.
 
     A partitioned table is graded by its leaves (PostgreSQL enforces the LEAF's identity:
-    ``ALTER TABLE <parent>`` does not reach existing partitions) and by its own NOTHING.
+    ``ALTER TABLE <parent>`` does not reach existing partitions) and by its own NOTHING; a
+    plain one by its own identity alone -- its inheritance children are never published
+    with it (:class:`ReplicaIdentityUsability`). Each cause says what is wrong with the key:
+    none, DEFERRABLE, or (PostgreSQL 18) generated.
     """
     if read.kind == "p":
         if read.identity == "n":
             return "REPLICA IDENTITY NOTHING"
-        count = read.unusable_partitions
-        if count <= 0:
-            return None
-        shown = ", ".join(read.unusable_partition_names)
-        more = (
-            f" and {count - len(read.unusable_partition_names)} more"
-            if count > len(read.unusable_partition_names)
-            else ""
-        )
-        return f"{count} of its partitions {'has' if count == 1 else 'have'} none: {shown}{more}"
+        return _partitions(read) if read.unusable_partitions > 0 else None
     if read.usable:
         return None
     if read.identity == "n":
         return "REPLICA IDENTITY NOTHING"
+    if read.identity == "f" and read.full_refused:
+        return "REPLICA IDENTITY FULL, but it has generated columns (PostgreSQL 18)"
+    if read.key_generated:
+        return (
+            "REPLICA IDENTITY DEFAULT, but its primary key has a generated column"
+            if read.identity == "d"
+            else "REPLICA IDENTITY USING INDEX, but that index has a generated column"
+        )
     if read.identity == "d":
-        return "REPLICA IDENTITY DEFAULT, but no valid primary key"
+        if read.pk_deferrable:
+            return "REPLICA IDENTITY DEFAULT, but its primary key is DEFERRABLE"
+        return NO_PRIMARY_KEY_PROBLEM
     if read.identity == "i":
-        return "REPLICA IDENTITY USING INDEX, but that index is gone or not valid"
+        return INDEX_GONE_PROBLEM
     return "a REPLICA IDENTITY that PostgreSQL cannot use"
 
 
-def replica_identity_remedy(read: ReplicaIdentityUsability) -> str:
+def replica_identity_remedy(
+    read: ReplicaIdentityUsability, *, table: Optional[str] = None
+) -> str:
     """The fix for one refused table, by its cause -- a lowercase phrase for mid-sentence use
     (every refusal of an unusable replica identity names it, G21). Pure.
 
@@ -445,19 +537,47 @@ def replica_identity_remedy(read: ReplicaIdentityUsability) -> str:
     (PostgreSQL keeps ``relreplident``; only ALTER TABLE ... REPLICA IDENTITY changes it),
     and a DEFERRABLE key is no replica identity -- so "give it a primary key" fits DEFAULT
     alone. A partitioned table's leaves carry the identity (ALTER TABLE on the parent does
-    not reach existing partitions); its own NOTHING is the parent's to fix.
+    not reach existing partitions); its own NOTHING is the parent's to fix. On PostgreSQL 18
+    a table with a generated column (``full_refused``) gets no FULL advice: published, FULL
+    refuses its UPDATE/DELETE (a partitioned parent's own FULL is never checked, only its
+    leaves'). ``table`` -- the qualified name, for a prerequisite that has room for it --
+    adds the exact, quoted statement wherever FULL on the table itself is the fix (G25).
     """
+    sql = (
+        f" (ALTER TABLE {dialect_for(SourceType.POSTGRES).quote_table(table)} "
+        "REPLICA IDENTITY FULL)"
+        if table
+        else ""
+    )
+    refused = read.full_refused
     if read.kind == "p":
         if read.identity == "n":
+            if read.unusable_partitions <= 0:
+                return f"set REPLICA IDENTITY FULL on it{sql}, or DEFAULT with a primary key"
+            if refused:
+                return (
+                    f"set REPLICA IDENTITY FULL on it{sql} and DEFAULT with a primary key "
+                    "on each partition"
+                )
+            return f"set REPLICA IDENTITY FULL on it{sql} and on each partition"
+        if refused:
             return (
-                "set REPLICA IDENTITY FULL on it and on each partition"
-                if read.unusable_partitions > 0
-                else "set REPLICA IDENTITY FULL on it, or DEFAULT with a primary key"
+                "give each partition a primary key (not DEFERRABLE) and REPLICA IDENTITY "
+                "DEFAULT"
             )
         return "set REPLICA IDENTITY FULL on each partition"
+    if read.key_generated:
+        return "use a key with no generated column as its identity"
+    or_full = "" if refused else f", or REPLICA IDENTITY FULL{sql}"
     if read.identity == "d":
-        return "give it a primary key that is not DEFERRABLE, or REPLICA IDENTITY FULL"
-    return "set REPLICA IDENTITY FULL, or DEFAULT with a primary key"
+        if read.pk_deferrable:  # PostgreSQL cannot ALTER a key to NOT DEFERRABLE in place
+            return "re-add the key NOT DEFERRABLE" + (
+                "" if refused else f", or set REPLICA IDENTITY FULL{sql}"
+            )
+        return f"give it a primary key that is not DEFERRABLE{or_full}"
+    if refused:
+        return "give it a primary key and REPLICA IDENTITY DEFAULT"
+    return f"set REPLICA IDENTITY FULL{sql}, or DEFAULT with a primary key"
 
 
 REPLICA_IDENTITY_WEAK = "weak"
@@ -567,7 +687,7 @@ def _assert_allowed(statement: str) -> None:
     ):
         raise PgReplicationError(
             "refused non-allowlisted ALTER PUBLICATION (only SET "
-            "(publish_via_partition_root = true), or ADD TABLE of one quoted table): "
+            "(publish_via_partition_root = true), or ADD TABLE ONLY of one quoted table): "
             f"{normalized[:60]!r}"
         )
     if normalized.startswith("SELECT PG_CURRENT_XACT_ID") and normalized != _XID_STATEMENT:
@@ -627,14 +747,14 @@ def slot_exists(connection: object, name: str) -> bool:
 def publication_tables(connection: object, name: str) -> set:
     """Return the set of qualified ``schema.table`` names a publication covers.
 
-    ``pg_publication_tables`` is the EFFECTIVE membership, which is what the reconcile has
-    to compare against: for a partitioned table it reports the PARENT only because
-    :func:`create_publication` sets ``publish_via_partition_root = true``. Without that
-    option it expands to the LEAVES, so this set could never equal the requested parent
-    name and the reconcile refused every re-run over a partitioned source. Do not "fix"
-    that by reading ``pg_publication_rel`` (which always reports the registered parent) --
-    that would hide the real defect, which is that leaf-named changes are what pgoutput
-    would then stream.
+    ``pg_publication_tables`` is the EFFECTIVE membership: for a partitioned table it
+    reports the PARENT only because :func:`create_publication` sets
+    ``publish_via_partition_root = true``. Without that option it expands to the LEAVES --
+    which is what pgoutput then streams -- so the reconcile reads it rolled up to each
+    partition root (:func:`_publication_membership`) and provisioning repairs the setting
+    before its slot exists. Do not "fix" that by reading ``pg_publication_rel`` (which
+    always reports the registered parent) -- that would hide the real defect, which is that
+    leaf-named changes are what pgoutput would then stream.
     """
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
@@ -644,10 +764,6 @@ def publication_tables(connection: object, name: str) -> set:
         {"name": name},
     ).fetchall()
     return {str(r[0]) for r in rows}
-
-
-# Kept as the private name the existing provisioning call site uses.
-_publication_tables = publication_tables
 
 
 def publication_publishes_via_partition_root(
@@ -671,8 +787,13 @@ def ensure_publication_via_partition_root(
     *,
     name: str,
     on_log: "Optional[Callable[[str], None]]" = None,
+    before_slot: bool = False,
 ) -> str:
     """Make ``name`` publish under the partition ROOT. Returns what happened.
+
+    ``before_slot``: the Full Load's provisioning repairs a REUSED publication before it
+    creates the replication slot (G25), so nothing decoded from that slot is lost and the
+    audit line says so.
 
     WHY this exists as a repair and not only as a create option: the tool's own
     :func:`create_publication` already sets the property, but it only runs on the GAPLESS
@@ -732,8 +853,12 @@ def ensure_publication_via_partition_root(
         connection,
         f'ALTER PUBLICATION "{name}" SET (publish_via_partition_root = true)',
         action=(
-            f'repaired publication "{name}": publish_via_partition_root false -> true, so '
-            "changes to a partitioned table stream under the parent the target has (in "
+            f'repaired publication "{name}": publish_via_partition_root false -> true, '
+            "before this Full Load's replication slot is created, so every change it "
+            "streams for a partitioned table carries the parent the target has"
+            if before_slot
+            else f'repaired publication "{name}": publish_via_partition_root false -> true, '
+            "so changes to a partitioned table stream under the parent the target has (in "
             "place -- the replication slot and its position are untouched). Changes "
             "committed BEFORE this repair are not recovered by it."
         ),
@@ -768,6 +893,51 @@ class PgReplicationObjects:
     # ``pg_publication_tables`` reports under that setting. Without the roll-up the coverage
     # check reported a captured partitioned parent as MISSING and made a retry a dead end.
     publication_via_partition_root: Optional[bool] = None
+    # The usable slot's ``confirmed_flush_lsn`` (text), ``None`` when there is no usable slot
+    # or it was not read. A slot nothing has streamed from is still exactly at the consistent
+    # point it was created at, which the Full Load records as ``Watermark.wal_lsn`` (G25).
+    slot_confirmed_flush_lsn: Optional[str] = None
+    # The asked tables that are plain tables with inheritance (INHERITS) child tables, as
+    # ``(table, child count, first child names)`` -- read only for a Start that snapshots
+    # (:func:`with_inheritance_children`), so empty means "none, or not asked" (G25), and
+    # ``None`` that the read failed, which refuses such a Start: unreadable is not "none".
+    inheritance_children: Optional[tuple] = ()
+
+
+# A plain table's inheritance children (G25): a bare ``SELECT ... FROM`` of the table -- the
+# query Debezium's snapshot runs -- returns their rows too. Catalog only: no scan, no lock.
+# Direct children are enough to tell (a grandchild has a child as its parent); another
+# session's temporary table is left out, as PostgreSQL's own expansion leaves it out.
+_INHERITANCE_CHILDREN_SQL = (
+    "SELECT n.nspname || '.' || c.relname AS parent, count(*) AS children, "
+    "(array_agg(kn.nspname || '.' || k.relname ORDER BY kn.nspname, k.relname))[1:3] "
+    "AS sample "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_inherits i ON i.inhparent = c.oid "
+    "JOIN pg_catalog.pg_class k ON k.oid = i.inhrelid "
+    "JOIN pg_catalog.pg_namespace kn ON kn.oid = k.relnamespace "
+    "WHERE c.relkind = 'r' AND k.relpersistence <> 't' "
+    "AND n.nspname || '.' || c.relname = ANY(:names) "
+    "GROUP BY n.nspname, c.relname ORDER BY 1"
+)
+
+
+def read_inheritance_children(connection: object, tables: Sequence[str]) -> tuple:
+    """Which of ``tables`` are plain tables with inheritance child tables? Read-only (G25).
+
+    ``((table, child count, first child names), ...)`` in name order; a partitioned table is
+    never one (its partitions are CDC's own: they publish under it). One catalog statement,
+    none for no table. Raises on failure, like :func:`read_pg_replication_objects`."""
+    names = sorted({str(t) for t in tables or () if t})
+    if not names:
+        return ()
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(_INHERITANCE_CHILDREN_SQL), {"names": names}
+    ).fetchall()
+    return tuple(
+        (str(r[0]), int(r[1] or 0), tuple(str(n) for n in (r[2] or ()))) for r in rows
+    )
 
 
 def read_pg_replication_objects(
@@ -779,6 +949,8 @@ def read_pg_replication_objects(
     ``pg_publication_tables`` are readable by an ordinary role (live-verified with
     ``rolsuper=f rolreplication=f`` and no grants, inside ``BEGIN TRANSACTION READ ONLY``),
     so this is strictly cheaper than the publication-privilege check that already runs.
+    Which tables have inheritance child tables is a separate read
+    (:func:`with_inheritance_children`), for a Start that snapshots only.
 
     RAISES on failure rather than returning "absent": unreadable is NOT evidence of
     absence, and the caller must be able to tell the two apart before it blocks anything.
@@ -817,9 +989,21 @@ def read_pg_replication_objects(
         # (collapsed) parent name found it "missing" and blocked the start, even though the
         # parent is registered and the CDC start repairs the property before the connector
         # exists. Compare against what the publication will EFFECTIVELY cover after that
-        # repair. The raw :func:`publication_tables` reader is left alone: the
-        # membership reconcile in :func:`create_publication` needs the unrolled view.
+        # repair. The raw :func:`publication_tables` reader is left alone: what it reports
+        # is what pgoutput would stream under the current setting.
         covered = {_partition_roots(connection).get(name, name) for name in covered}
+    usable = int(row[3] or 0) > 0
+    confirmed: Optional[str] = None
+    if usable:
+        position = connection.execute(  # type: ignore[attr-defined]
+            text(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots "
+                "WHERE slot_name = :slot AND database = current_database()"
+            ),
+            {"slot": slot_name},
+        ).first()
+        if position is not None and position[0] is not None:
+            confirmed = str(position[0])
     return PgReplicationObjects(
         publication_name=publication_name,
         slot_name=slot_name,
@@ -827,9 +1011,29 @@ def read_pg_replication_objects(
         publication_publishes_all_dml=(None if all_dml is None else bool(all_dml)),
         publication_tables=frozenset(covered),
         slot_present_any_database=int(row[2] or 0) > 0,
-        slot_usable=int(row[3] or 0) > 0,
+        slot_usable=usable,
         publication_via_partition_root=via_root,
+        slot_confirmed_flush_lsn=confirmed,
     )
+
+
+def with_inheritance_children(
+    connection: object, objects: PgReplicationObjects, tables: Sequence[str]
+) -> PgReplicationObjects:
+    """``objects`` with :attr:`~PgReplicationObjects.inheritance_children` read for
+    ``tables`` -- for a Start that snapshots, which reads each captured table without ONLY
+    (G25). Unreadable: ``None`` there, which refuses that Start
+    (:func:`pg_replication_objects_blocker`), unlike a source the pre-flight could not
+    connect to at all (``_cdc_ui._probe_pg_replication_objects`` does not block on that; it
+    says the checks did not run): nothing else stops that snapshot from copying a child
+    table's rows into its parent, or Debezium's own publication -- it names each table
+    without ``ONLY`` -- from adding the child tables, whose REPLICA IDENTITY nothing
+    grades."""
+    try:
+        children = read_inheritance_children(connection, tables)
+    except Exception:  # noqa: BLE001 - unreadable is not "none": refuse the snapshot
+        return replace(objects, inheritance_children=None)
+    return replace(objects, inheritance_children=children)
 
 
 def _partition_roots(connection: object) -> dict:
@@ -852,12 +1056,319 @@ def _partition_roots(connection: object) -> dict:
     return {str(r[0]): str(r[1]) for r in rows}
 
 
+# The slot-position block (G25). It judges only a stack whose connectors were never started --
+# none stopped, in place or detected, or created by a Start whose update CloudFormation rolled
+# back, whatever the rollback status (``_cdc_ui._pg_stack_started``); its way out is the route
+# rule's (:func:`pg_cdc_route`), like every block's.
+SLOT_POSITION_HEADER = "CDC's replication slot is not at this Full Load's start point"
+# The other blocks whose stream cannot continue as is (G25), each routed by pg_cdc_route.
+SLOT_MISSING_HEADER = "CDC's replication slot does not exist on the source"
+SLOT_UNUSABLE_HEADER = "A replication slot of that name is not usable for CDC"
+PUBLICATION_MISSING_HEADER = "CDC's publication does not exist on the source"
+PUBLICATION_COVERAGE_HEADER = "CDC's publication does not cover every selected table"
+# Blocks that name their own fix (G25), so the Start CDC dialog does not judge a re-snapshot
+# for them (``_cdc_ui._pg_objects_gate_block``): a re-snapshot fixes none of them -- Debezium
+# reuses an existing publication as it is, and its snapshot is what reads a parent's child
+# tables. A read again works on any stack; the inheritance block's own fix is a Full Load run,
+# which pg_cdc_route puts after new topics on a stack started before. The publish list's fix
+# comes first but does not bring back the changes committed while the list was narrowed
+# (pgoutput publishes from the publication as it stood at each change's commit), so
+# pg_cdc_route names the route after it, as for every block whose stream cannot continue.
+PUBLISH_LIST_HEADER = "CDC's publication does not publish every change type"
+INHERITANCE_SNAPSHOT_HEADER = "CDC cannot snapshot a table that has inheritance child tables"
+# The read behind that block failed: fail closed, and its fix is to read again (G25).
+INHERITANCE_UNREADABLE_HEADER = (
+    "Whether a captured table has inheritance child tables could not be read"
+)
+BLOCKS_WITH_THEIR_OWN_FIX = frozenset(
+    {PUBLISH_LIST_HEADER, INHERITANCE_SNAPSHOT_HEADER, INHERITANCE_UNREADABLE_HEADER}
+)
+
+# The re-snapshot remedy's standing on a stack never started (``pg_cdc_route``'s
+# ``resnapshot``): the Start CDC dialog judges the Start it would unlock before it offers it.
+RESNAPSHOT_OFFERED = "offered"  # that Start's own checks passed: the dialog offers the remedy
+RESNAPSHOT_REFUSED = "refused"  # they refused it, for the reason ``block`` names
+
+_RERUN_FULL_LOAD = "Re-run Full Load on the Full Load step choosing 'Drop & reload'"
+_SLOT_AGAIN = "it creates the slot again at its own snapshot point"
+_NEW_TOPICS = (
+    "use Delete CDC infrastructure and deploy it again (the new stack starts with empty topics)"
+)
+# Why a stack started before needs new topics before a Full Load re-run (G25): Stop CDC deletes
+# the source and the sink in parallel, with no drain, and a rolled-back Start deletes them
+# mid-stream, so the topics may hold changes no sink applied; this stack's sink group resumes
+# from its last commit and applies them over the reloaded tables -- silently.
+_UNAPPLIED_IN_TOPICS = (
+    "its CDC topics may still hold changes that no sink applied (Stop CDC and a rolled-back "
+    "Start remove the connectors without draining them), which this stack's sink would apply "
+    "over a reload"
+)
+_SNAPSHOT_FIRST = "it snapshots every selected table"
+# The blocks a stack started before gets the new-topics route for (G25): every one but a
+# failed inheritance read, whose own fix (a read again) works on any stack.
+_STARTED_ROUTED_BLOCKS = frozenset(
+    {
+        SLOT_POSITION_HEADER,
+        SLOT_MISSING_HEADER,
+        SLOT_UNUSABLE_HEADER,
+        PUBLICATION_MISSING_HEADER,
+        PUBLICATION_COVERAGE_HEADER,
+        PUBLISH_LIST_HEADER,
+        INHERITANCE_SNAPSHOT_HEADER,
+    }
+)
+# The blocks whose own fix comes first, before the route (G25): a slot of that name it cannot
+# use (drop it, or another CDC stack name -- a Full Load re-run refuses such a slot before any
+# write), and a narrowed publish list (set it back -- which does not bring back the changes
+# committed while it was narrowed).
+_FIX_FIRST_BLOCKS = frozenset({SLOT_UNUSABLE_HEADER, PUBLISH_LIST_HEADER})
+
+
+def _sentence(clause: str) -> str:
+    """``clause`` as a sentence: its first letter capitalised, a period added. Pure."""
+    return f"{clause[:1].upper()}{clause[1:]}."
+
+
+def _new_topics_route(cdc_only: Optional[bool]) -> str:
+    """The route of a stack started before, as a clause: new topics first (G25). Pure."""
+    full_load = f"{_RERUN_FULL_LOAD} ({_SLOT_AGAIN})"
+    if cdc_only is None:
+        return (
+            f"{_NEW_TOPICS}; then, for Full load + CDC, {full_load} and Start CDC, and for CDC "
+            f"only, Start CDC on the new stack ({_SNAPSHOT_FIRST})"
+        )
+    if cdc_only:
+        return (
+            f"{_NEW_TOPICS}, then Start CDC on the new stack, which snapshots every selected "
+            "table (a row deleted on the source in between stays on the target; Validation "
+            "reports it as an EXTRA row)"
+        )
+    return f"{_NEW_TOPICS}, then {full_load}, then Start CDC"
+
+
+def _no_snapshot_route(cdc_only: Optional[bool], *, note: str = "") -> str:
+    """The route of a stack never started once a re-snapshot is ruled out, as a clause: a Full
+    Load run, which creates the slot again, so the Start CDC after it takes no snapshot -- after
+    a switch to Full load + CDC with CDC only, which has no Full Load step (G25). Pure."""
+    full_load = f"{_RERUN_FULL_LOAD} ({_SLOT_AGAIN}{note}), then Start CDC"
+    if cdc_only is None:
+        return f"{full_load} (with CDC only, switch the migration type to Full load + CDC first)"
+    if cdc_only:
+        return f"switch the migration type to Full load + CDC, then {full_load}"
+    return full_load
+
+
+def pg_cdc_route(
+    block: Optional[str],
+    *,
+    started: bool,
+    cdc_only: Optional[bool],
+    resnapshot: Optional[str] = None,
+) -> str:
+    """The way out of a PostgreSQL CDC block whose stream cannot continue as is -- THE route
+    rule (G25). Every surface that names a route takes it from here: the Start CDC dialog's
+    block, its withheld re-snapshot notice, the Start CDC job's refusal, the "Publication
+    autocreation is disabled" diagnosis and the Start CDC / start-point cards. Pure.
+
+    ``block``: the block's header; ``None`` for a card naming the route of a stack started
+    before mid-sentence (the bare clause, no capital, no period). ``started``: the stack's
+    connectors were started before (``_cdc_ui._pg_stack_started``: stopped since, in place, or
+    created by a Start CloudFormation rolled back). ``cdc_only``: the migration type is CDC
+    only (``None``: not known here, so both types are named).
+
+    A stack started before: its CDC topics may hold changes no sink applied, and its sink would
+    resume from its last commit, so its ONLY route is new topics first -- Delete CDC
+    infrastructure and deploy it again, then (Full load + CDC) Re-run Full Load with Drop &
+    reload, then Start CDC; (CDC only) Start CDC on the new stack, which snapshots. A Full Load
+    re-run on its topics would have those changes applied over the reloaded tables, and a
+    re-snapshot cannot be relied on there: Debezium continues from a stored offset whose
+    snapshot completed.
+
+    A stack never started: the re-snapshot remedy when its own checks pass (``resnapshot`` is
+    :data:`RESNAPSHOT_OFFERED`: nothing to add, the dialog offers it), else a Start that takes
+    no snapshot after a Full Load re-run -- a step after the block's own fix when the block
+    names one -- or, with CDC only, the Start once its checks pass, Delete CDC infrastructure
+    for a publication that misses a table, and a switch to Full load + CDC where only a Start
+    with no snapshot can run (never a Full Load step it does not have). ``resnapshot`` is
+    :data:`RESNAPSHOT_REFUSED` when ``block`` is the refusal of that remedy (or of the Start for
+    the same reason), ``None`` when it was not judged (the Start CDC job): both are named.
+
+    A narrowed publish list's own fix comes first, and the route follows it: setting the list
+    back does not bring back the changes committed while it was narrowed (pgoutput publishes
+    from the publication as it stood when each change committed), so a Start that continues
+    from the slot would skip them -- a Full Load re-run after the fix (with CDC only, behind a
+    switch to Full load + CDC), or new topics first on a stack started before. A failed
+    inheritance read names its own fix, which works on any stack: no route. So does the
+    inheritance block of a never-started stack's own Start."""
+    if not started:
+        return _never_started_route(block, cdc_only=cdc_only, resnapshot=resnapshot)
+    if block is None:
+        return _new_topics_route(cdc_only)
+    if block not in _STARTED_ROUTED_BLOCKS:
+        return ""
+    if block == INHERITANCE_SNAPSHOT_HEADER:
+        # Its own fix is a Full load + CDC run: new topics first (either type).
+        return (
+            f"This stack's connectors were started before, and {_UNAPPLIED_IN_TOPICS}. So "
+            f"before that Full Load, {_NEW_TOPICS}."
+        )
+    # A block that names its own fix (a slot of that name it cannot use, a narrowed publish
+    # list): the route comes after it.
+    head = "The gapless route"
+    if block in _FIX_FIRST_BLOCKS:
+        head = "After that fix, the gapless route"
+    return (
+        "This stack's connectors were started before: if its source connector streamed, "
+        "Debezium skips the snapshot on every later Start, so a re-snapshot cannot be relied on "
+        f"here, and {_UNAPPLIED_IN_TOPICS}. {head}: {_new_topics_route(cdc_only)}."
+    )
+
+
+def _never_started_route(
+    block: Optional[str], *, cdc_only: Optional[bool], resnapshot: Optional[str]
+) -> str:
+    """:func:`pg_cdc_route` for a stack whose connectors were never started. Pure."""
+    if block == PUBLICATION_COVERAGE_HEADER:
+        # A re-snapshot grades coverage too, so it never helps: a Full Load re-run adds each
+        # missing table to the reused publication (G17); Delete CDC infrastructure drops it.
+        full_load = (
+            f"{_RERUN_FULL_LOAD}, which adds each missing selected table to the publication and "
+            "creates the slot again at its own snapshot point, then Start CDC"
+        )
+        delete = (
+            "use Delete CDC infrastructure and deploy it again: it drops the publication, so the "
+            "new stack's Start CDC can create one over the selected tables"
+        )
+        if cdc_only is None:
+            return f"{full_load} (with CDC only, {delete})."
+        return _sentence(delete if cdc_only else full_load)
+    if block == SLOT_UNUSABLE_HEADER:
+        # After its own fix (drop that slot, or another CDC stack name): a Full Load re-run
+        # would refuse such a slot before any write. CDC only: the Start, its checks then pass.
+        full_load = f"{_RERUN_FULL_LOAD} ({_SLOT_AGAIN}), then Start CDC"
+        if cdc_only is None:
+            return f"Then {full_load} (with CDC only, Start CDC again)."
+        return "Then Start CDC again." if cdc_only else f"Then {full_load}."
+    if block == PUBLISH_LIST_HEADER:
+        # After its own fix (the list set back): a Start that continues from the slot would
+        # still skip the changes committed while it was narrowed, and a re-snapshot is not
+        # offered (it reuses the publication as it is), so a Full Load re-run takes a new start
+        # point -- with CDC only, after a switch to Full load + CDC.
+        return f"Then {_no_snapshot_route(cdc_only)}."
+    if block in (INHERITANCE_SNAPSHOT_HEADER, INHERITANCE_UNREADABLE_HEADER):
+        # The refusal of the re-snapshot remedy: a Start with no snapshot works. As the block of
+        # the Start itself, its own fix stands alone.
+        if resnapshot != RESNAPSHOT_REFUSED:
+            return ""
+        no_snapshot = f"{_SLOT_AGAIN}, and the Start CDC after it takes no snapshot"
+        if cdc_only:
+            return (
+                f"Or switch the migration type to Full load + CDC, then {_RERUN_FULL_LOAD}: "
+                f"{no_snapshot}."
+            )
+        if cdc_only is None:
+            return (
+                f"{_RERUN_FULL_LOAD} instead (with CDC only, switch the migration type to Full "
+                f"load + CDC first): {no_snapshot}."
+            )
+        return f"{_RERUN_FULL_LOAD} instead: {no_snapshot}."
+    if block in (SLOT_POSITION_HEADER, SLOT_MISSING_HEADER, PUBLICATION_MISSING_HEADER):
+        # A Start that resumes from the Full Load's slot: a re-snapshot fixes it when its own
+        # checks pass, else a Full Load run creates the slot again.
+        if resnapshot == RESNAPSHOT_OFFERED:
+            return ""
+        note = (
+            "; give this migration its own CDC stack name if another migration shares this one"
+            if block == SLOT_POSITION_HEADER
+            else ""
+        )
+        route = _no_snapshot_route(cdc_only, note=note)
+        if resnapshot == RESNAPSHOT_REFUSED:
+            return _sentence(route)
+        return (
+            "Re-snapshot every table instead (the Start CDC dialog offers it when the Start that "
+            f"re-snapshots passes its own checks), or {route}."
+        )
+    return ""
+
+
+def publish_list_fix(publication_name: str) -> str:
+    """The fix for a publication restricted to a subset of INSERT/UPDATE/DELETE: its publish
+    list set in place, by its owner. A re-snapshot and a Full Load re-run both reuse an
+    existing publication as it is; only this -- or Delete CDC infrastructure, which drops
+    it -- changes the list (G25). Pure."""
+    quoted = dialect_for(SourceType.POSTGRES).quote_identifier(str(publication_name))
+    return (
+        f"As its owner, run ALTER PUBLICATION {quoted} SET (publish = 'insert, update, "
+        "delete') on the source"
+    )
+
+
+def _inheritance_snapshot_block(parents: Sequence[tuple], *, untick: bool = True) -> tuple:
+    """The block for a Start that snapshots a plain table with inheritance child tables
+    (``parents``: :func:`read_inheritance_children` rows, at least one). Pure (G25).
+
+    ``untick``: the table set can still change, so unticking the parent is a fix the UI can
+    carry out. Once a Start was submitted (or with CDC only, while its infrastructure exists)
+    the table picker is locked, and the block names only the Start from a Full Load's snapshot
+    point."""
+    table, count, sample = parents[0]
+    shown = ", ".join(sample) + (" …" if count > len(sample) else "")
+    others = len(parents) - 1
+    more = (
+        f" (and {others} more captured table{'s' if others != 1 else ''} like it)"
+        if others
+        else ""
+    )
+    alternative = (
+        f" -- or untick {table}: each child table migrates as a table of its own."
+        if untick
+        else "."
+    )
+    return (
+        INHERITANCE_SNAPSHOT_HEADER,
+        f"{table} has {count} inheritance (INHERITS) child table{'s' if count != 1 else ''}: "
+        f"{shown}{more}. This Start sends snapshot.mode=initial, and Debezium's snapshot "
+        f"reads {table} with its child tables' rows: they would be copied into {table} on "
+        f"Aurora DSQL, where CDC never updates or deletes them (it captures only {table}'s "
+        "own changes). Start CDC from a Full Load's snapshot point instead -- a \"Full load "
+        f"+ CDC\" run whose Full Load has finished reads only {table}'s own rows, and its "
+        f"CDC starts without a snapshot{alternative}",
+    )
+
+
+# Fail closed (G25): a snapshot of a parent copies its child tables' rows into it, and
+# Debezium's own publication then names it without ONLY, adding child tables whose REPLICA
+# IDENTITY nothing grades -- so a Start that snapshots never goes ahead without that read.
+_INHERITANCE_UNREADABLE_BLOCK = (
+    INHERITANCE_UNREADABLE_HEADER,
+    "This Start sends snapshot.mode=initial. Debezium's snapshot reads a table with "
+    "inheritance (INHERITS) child tables together with their rows, which CDC never updates "
+    "or deletes on Aurora DSQL, so Start CDC first reads which captured tables have any, and "
+    "that read failed. Check that the source is reachable from the tool, then Start CDC "
+    "again.",
+)
+
+
+def _lsn_value(lsn: Optional[str]) -> Optional[int]:
+    """A PostgreSQL ``X/Y`` LSN as one integer, or ``None`` when it is not one. Pure."""
+    high, separator, low = str(lsn or "").strip().partition("/")
+    try:
+        return (int(high, 16) << 32) | int(low, 16) if separator else None
+    except ValueError:
+        return None
+
+
 def pg_replication_objects_blocker(
     objects: PgReplicationObjects,
     selected_tables: Sequence[str],
     *,
     resumes_from_slot: bool,
     connector_autocreates_publication: bool = False,
+    start_lsn: Optional[str] = None,
+    stack_started: bool = False,
+    snapshots: bool = False,
+    untick: bool = True,
 ) -> Optional[tuple]:
     """Why CDC must not start against these objects, as ``(header, body)``, or None. Pure.
 
@@ -880,11 +1391,45 @@ def pg_replication_objects_blocker(
     Debezium reach RUNNING while replicating NOTHING for it -- strictly worse than a task
     that dies loudly. Deliberately NOT graded here: ``puballtables`` and whether the slot is
     currently ``active`` (neither is a failure of THIS migration).
+
+    The slot's POSITION too (G25), on a stack's FIRST Start only: ``start_lsn`` is the Full
+    Load watermark's LSN -- the consistent point of the slot it created. While the stack
+    records no Start of its connectors (``stack_started`` False), none of them has streamed
+    from the slot, so it must still be exactly there; anywhere else, another run using the
+    same CDC stack name re-created it (or read it), and resuming would silently skip the
+    changes in between. Its way out, like every block's, is the route rule's
+    (:func:`pg_cdc_route`), which knows the migration type and the re-snapshot remedy's
+    standing: the block itself names none. A stack whose connectors were started before is
+    never judged on it: its connector moved the slot legitimately, and Debezium
+    continues from the later of its stored offset and the slot's confirmed point (a Full Load
+    that takes a new start point waits for new topics there: the Full Load step refuses it on
+    a stack that has streamed, ``_cdc_status.cdc_stack_has_streamed``). A Start whose
+    CloudFormation update rolled back counts as one, whatever the rollback status (complete,
+    in progress or failed), and so do connectors of the stack still in place
+    (``_cdc_ui._pg_stack_started``): its source connector may have streamed before the
+    rollback deleted it. Stateless -- what the
+    stack records decides, nothing the UI keeps -- so a refused Start, one that failed before
+    it updated the stack, an app restart and Start over all leave the next Start judged the
+    same way. Residual, like a re-created slot after this stack streamed (each migration
+    needs its own CDC stack name): another migration re-creates the slot after this stack's
+    first Start rolled back.
+
+    ``snapshots`` <-> ``snapshot.mode=initial`` (G25): a captured plain table with inheritance
+    child tables (``objects.inheritance_children``) blocks, because Debezium's snapshot reads
+    it without ``ONLY``, so its children's rows would land in its target, and CDC never
+    changes them there -- and so does a failed read of them (``None``): fail closed, as this
+    block is all that keeps Debezium's own publication from adding child tables nothing
+    grades. ``untick`` (:func:`_inheritance_snapshot_block`): the table set can still change,
+    so that block also names unticking the parent. A slot of that name it cannot use is
+    reported before it: every route needs that slot's own fix first. A narrowed publish list
+    names its own fix (:func:`publish_list_fix`), which no re-snapshot or Full Load re-run
+    makes, and which does not bring back the changes committed while the list was narrowed:
+    the route rule's route follows it (:func:`pg_cdc_route`).
     """
     pub = objects.publication_name
     if not objects.publication_present and not connector_autocreates_publication:
         return (
-            "CDC's publication does not exist on the source",
+            PUBLICATION_MISSING_HEADER,
             f"The connector is configured with publication.autocreate.mode=disabled and "
             f"expects a publication named '{pub}', which is not on the source. Only a "
             "'Full load + CDC' run creates it; a 'Full load only' run does not. Starting "
@@ -903,35 +1448,80 @@ def pg_replication_objects_blocker(
     if missing:
         shown = ", ".join(missing[:5]) + (" …" if len(missing) > 5 else "")
         return (
-            "CDC's publication does not cover every selected table",
+            PUBLICATION_COVERAGE_HEADER,
             f"Publication '{pub}' exists but does not include {len(missing)} of the "
             f"selected tables: {shown}. Those tables would replicate NOTHING while the "
             "connector reported RUNNING, which is worse than a visible failure.",
         )
     if objects.publication_present and objects.publication_publishes_all_dml is False:
+        # Its own fix first, then the route rule's (decision C, G25): pgoutput decides what to
+        # publish from the publication as it stood when each change committed, so setting the
+        # list back does not bring back what was left out while it was narrowed.
         return (
-            "CDC's publication does not publish every change type",
+            PUBLISH_LIST_HEADER,
             f"Publication '{pub}' is restricted to a subset of INSERT/UPDATE/DELETE, so "
             "the change types it omits would never reach the target and the connector "
-            "would still report RUNNING. Recreate it with all three, or let this run "
-            "re-snapshot and create its own.",
+            "would still report RUNNING. A re-snapshot and a Full Load re-run both reuse "
+            f"it as it is. {publish_list_fix(pub)} first. Setting the list back does not "
+            "bring back the changes committed while it was narrowed: pgoutput decides what to "
+            "publish from the publication as it stood when each change committed, so a Start "
+            "that continues from the slot would still skip them.",
         )
     if resumes_from_slot and not objects.slot_usable:
+        # A same-named slot it cannot use (G25): its own fix comes before any route -- a Full
+        # Load re-run drops only an inactive slot of this database, and refuses another
+        # database's (or another type's) before any write.
+        elsewhere = (
+            " A slot of that name does exist in this cluster (invalidated, in another database, "
+            "or not a logical pgoutput slot): if it is another database's or of another type, "
+            "drop it or give this migration its own CDC stack name first -- a Full Load re-run "
+            "refuses such a slot before any write."
+            if objects.slot_present_any_database
+            else ""
+        )
         return (
-            "CDC's replication slot does not exist on the source",
+            SLOT_MISSING_HEADER,
             f"This start is configured to resume from replication slot "
             f"'{objects.slot_name}' (snapshot.mode=never), and the source has no usable "
             "logical pgoutput slot of that name in this database. A slot cannot be created "
             "at a past position, so one created now would start from the CURRENT WAL and "
-            "silently skip every change committed since the Full Load.",
+            f"silently skip every change committed since the Full Load.{elsewhere}",
         )
+    # Before the inheritance check (G25): every route needs this fix first -- a Start that
+    # snapshots cannot create its own slot under that name, and a Full Load re-run refuses
+    # such a slot before any write -- so the refusal of a re-snapshot names it, not a Full
+    # Load re-run that would be refused too.
     if objects.slot_present_any_database and not objects.slot_usable:
         return (
-            "A replication slot of that name is not usable for CDC",
+            SLOT_UNUSABLE_HEADER,
             f"A slot named '{objects.slot_name}' exists in this cluster but is not a "
             "logical pgoutput slot in this database, so the connector cannot use it and "
             "cannot create its own under that name. Drop it, or use a different CDC stack "
             "name so the derived slot name differs.",
+        )
+    if snapshots:
+        if objects.inheritance_children is None:
+            return _INHERITANCE_UNREADABLE_BLOCK
+        captured = set(selected_tables)
+        parents = [p for p in objects.inheritance_children if p[0] in captured]
+        if parents:
+            return _inheritance_snapshot_block(parents, untick=untick)
+    at = _lsn_value(objects.slot_confirmed_flush_lsn)
+    wanted = _lsn_value(start_lsn)
+    if (
+        resumes_from_slot
+        and not stack_started
+        and at is not None
+        and wanted is not None
+        and at != wanted
+    ):
+        return (
+            SLOT_POSITION_HEADER,
+            f"Slot '{objects.slot_name}' is at {objects.slot_confirmed_flush_lsn}, not at "
+            f"{start_lsn} where this Full Load's CDC starts, and this CDC stack records no "
+            "Start of its connectors (not even one that rolled back), so none of them has "
+            "streamed from it: another run with the same CDC stack name re-created or read "
+            "it, so starting now would silently skip the changes in between.",
         )
     return None
 
@@ -1000,7 +1590,7 @@ def _verify_tables_replicable(
     )
 
 
-def _verify_table_publishable(connection: object, table: str, *, publication: str) -> None:
+def _verify_table_publishable(connection: object, table: str) -> None:
     """Raise :class:`PgReplicaIdentityError` unless ``table`` keeps a replica identity
     PostgreSQL accepts for UPDATE/DELETE once published (G17) -- FAIL CLOSED.
 
@@ -1010,22 +1600,24 @@ def _verify_table_publishable(connection: object, table: str, *, publication: st
     (:func:`read_replica_identity_usability`, the relcache's rule: a valid primary key behind
     DEFAULT, a valid identity index behind USING INDEX, FULL, and every leaf of a partitioned
     table). An unreadable answer, or a table not found, refuses too: unreadable is not
-    usable.
+    usable. Every refusal is one bounded line (the name clipped, the next step last), like
+    the provisioning refusal's.
     """
     try:
         reads = read_replica_identity_usability(connection, [table])
     except Exception as exc:  # noqa: BLE001 - unreadable is not usable
         raise PgReplicaIdentityError(
-            f'cannot add {table} to publication "{publication}": whether it has a usable '
-            f"REPLICA IDENTITY could not be read ({type(exc).__name__}); it was not added",
+            f"{_clip_table_name(table)}: whether it has a usable REPLICA IDENTITY could not "
+            f"be read ({type(exc).__name__[:64]}), so it was not added: check that the "
+            "source is reachable from the tool, then re-run the Full Load.",
             unreadable=True,
         ) from exc
     read = reads.get(table)
     if read is None:
         raise PgReplicaIdentityError(
-            f'cannot add {table} to publication "{publication}": it was not found on the '
-            "source as a table, so its REPLICA IDENTITY could not be checked; it was not "
-            "added",
+            f"{_clip_table_name(table)}: not found on the source as a table, so it was not "
+            "added: re-run Step 1 (Evaluation) if it was dropped or renamed, then re-run "
+            "the Full Load.",
             unreadable=True,
         )
     problem = replica_identity_problem(read)
@@ -1056,9 +1648,32 @@ _PUBLISH_READ_FAILED = (
 
 
 def _clip_table_name(name: str) -> str:
+    """``name`` for a one-line message: at most 32 characters, and a character that is not
+    printable -- a quoted identifier may hold a line separator, after which the JobManager
+    keeps nothing -- shown as ``?``."""
+    name = "".join(ch if ch.isprintable() else "?" for ch in name)
     if len(name) <= _PUBLISH_NAME_LIMIT:
         return name
     return name[: _PUBLISH_NAME_LIMIT - 3] + "..."
+
+
+# A re-keyed table provisioning would set REPLICA IDENTITY FULL on (its composite key needs
+# the full before-image) where PostgreSQL 18 refuses UPDATE/DELETE under a published FULL:
+# it has a generated column (``full_refused``). Its own cause and remedy -- DEFAULT would
+# lose its deletes, so the fix is to drop the re-key (G25).
+_REKEYED_FULL_REFUSED = (
+    "needs REPLICA IDENTITY FULL, but has generated columns (PostgreSQL 18)"
+)
+_REKEYED_FULL_REFUSED_REMEDY = 'set it back to "Keep source PK" in Schema Conversion'
+# Public, for the other surfaces of that cause (the Full load + CDC Retry guard, G25).
+REKEYED_FULL_REFUSED_PROBLEM = _REKEYED_FULL_REFUSED
+REKEYED_FULL_REFUSED_REMEDY = _REKEYED_FULL_REFUSED_REMEDY
+
+
+def _refusal_remedy(problem: str, read: ReplicaIdentityUsability) -> str:
+    if problem == _REKEYED_FULL_REFUSED:
+        return _REKEYED_FULL_REFUSED_REMEDY
+    return replica_identity_remedy(read)
 
 
 def _publish_refusal_message(
@@ -1074,11 +1689,11 @@ def _publish_refusal_message(
     if unusable:
         name, problem, read = unusable[0]
         cause = problem.split(": ", 1)[0]
-        remedy = replica_identity_remedy(read)
+        remedy = _refusal_remedy(problem, read)
         return (
             f"{_clip_table_name(name)}: {cause}{more}. Published for CDC, its UPDATE/DELETE "
-            f"would fail on the source. Nothing was changed there: {remedy}, "
-            "then re-run the Full Load."
+            f"would fail on the source. Nothing was changed there: {remedy}, then re-run the "
+            "Full Load."
         )
     return (
         f"{_clip_table_name(missing[0])}: not found on the source as a table{more}, so its "
@@ -1107,12 +1722,16 @@ def _verify_tables_publishable(
     ONE catalog read (:func:`read_replica_identity_usability`). A table in ``widened`` --
     one provisioning sets REPLICA IDENTITY FULL on just before the publication -- is graded
     as FULL: a plain table then passes, while a partitioned one is still graded by its
-    leaves (only the parent is widened). A failed read, or a table not found as a plain or
-    partitioned table, refuses too: unreadable is not usable. Every refused table gets one
-    audit line through ``on_log`` (sorted, so the result is deterministic); the error
-    message is one bounded line (:func:`_publish_refusal_message`).
+    leaves (only the parent is widened) -- except a plain one with a generated column on
+    PostgreSQL 18 (``full_refused``), member or not: published, the FULL it needs would
+    refuse its every UPDATE/DELETE, so it is refused with its own cause and remedy (G25). A
+    failed read, or a table not found as a plain or partitioned table, refuses too:
+    unreadable is not usable. Every refused table gets one audit line through ``on_log``
+    (sorted, so the result is deterministic); the error message is one bounded line
+    (:func:`_publish_refusal_message`).
     """
     requested = sorted({str(t) for t in tables or () if t})
+    widened_set = {str(t) for t in widened or ()}
     try:
         membership = _publication_membership(connection, publication)
         if membership is None:
@@ -1121,7 +1740,8 @@ def _verify_tables_publishable(
             candidates = []  # FOR ALL TABLES: nothing is added
         else:
             candidates = sorted(set(requested) - set(membership[1]))
-        reads = read_replica_identity_usability(connection, candidates) if candidates else {}
+        to_read = sorted(set(candidates) | widened_set)
+        reads = read_replica_identity_usability(connection, to_read) if to_read else {}
     except Exception as exc:  # noqa: BLE001 - unreadable is not usable
         cls = type(exc).__name__[:64]
         if on_log is not None:
@@ -1132,18 +1752,23 @@ def _verify_tables_publishable(
         raise PgReplicaIdentityError(
             _PUBLISH_READ_FAILED.format(cls=cls), unreadable=True
         ) from exc
-    widened_set = {str(t) for t in widened or ()}
     unusable: list[tuple[str, str, ReplicaIdentityUsability]] = []
     missing: list[str] = []
-    for name in candidates:
+    candidate_set = set(candidates)
+    for name in to_read:
         read = reads.get(name)
-        if read is None:
-            missing.append(name)
-            continue
-        if name in widened_set:
+        if name in widened_set and read is not None:
+            if read.kind != "p" and read.full_refused:
+                unusable.append((name, _REKEYED_FULL_REFUSED, read))
+                continue
             # Provisioning sets it FULL before the publication; a partitioned table's
             # leaves are not widened, so they are still graded.
             read = read._replace(identity="f", usable=True)
+        if name not in candidate_set:
+            continue  # a member: only the widening is this run's change
+        if read is None:
+            missing.append(name)
+            continue
         problem = replica_identity_problem(read)
         if problem:
             unusable.append((name, problem, read))
@@ -1151,9 +1776,23 @@ def _verify_tables_publishable(
         return
     if on_log is not None:
         for name, problem, _read in unusable:
+            if problem != _REKEYED_FULL_REFUSED:
+                on_log(
+                    f"refused before any write: {name} has no usable REPLICA IDENTITY "
+                    f"({problem}), so it is not published"
+                )
+                continue
+            # A member of the reused publication is published already, and it stays.
+            outcome = (
+                "and it is not published"
+                if name in candidate_set
+                else "(it stays in the publication)"
+            )
             on_log(
-                f"refused before any write: {name} has no usable REPLICA IDENTITY "
-                f"({problem}), so it is not published"
+                f"refused before any write: {name} is re-keyed, so it needs REPLICA "
+                "IDENTITY FULL, and on PostgreSQL 18 a published FULL table with generated "
+                "columns refuses every UPDATE and DELETE; its REPLICA IDENTITY was not "
+                f"changed {outcome}"
             )
         for name in missing:
             on_log(
@@ -1163,7 +1802,7 @@ def _verify_tables_publishable(
     raise PgReplicaIdentityError(
         _publish_refusal_message(unusable, missing),
         cause=unusable[0][1] if unusable else None,
-        remedy=replica_identity_remedy(unusable[0][2]) if unusable else None,
+        remedy=_refusal_remedy(unusable[0][1], unusable[0][2]) if unusable else None,
         unreadable=not unusable,
     )
 
@@ -1209,17 +1848,19 @@ def add_table_to_publication(
 ) -> bool:
     """Add ONE table to publication ``name``; return whether this call added it (G17).
 
-    ``ALTER PUBLICATION "<name>" ADD TABLE <one quoted table>`` -- the one shape the
-    allowlist accepts. Idempotent: a member (read first, rolled up to the partition root),
-    a ``FOR ALL TABLES`` publication, or a concurrent add that lost the race (SQLSTATE
-    42710, already a member) issues no further write and returns False. A table with no
-    replica identity PostgreSQL accepts for UPDATE/DELETE -- NOTHING, DEFAULT with no valid
-    primary key, USING INDEX whose index is gone, or such a leaf partition -- is refused
-    BEFORE any write with :class:`PgReplicaIdentityError` (:func:`_verify_table_publishable`:
-    publishing it would make its UPDATE/DELETE fail on the source), and so is one whose
-    identity cannot be read (fail closed). An absent publication raises
-    :class:`PgPublicationMissingError`; any other failure propagates (the caller grades it by
-    SQLSTATE). The audit line is written after the ADD commits (AUTOCOMMIT).
+    ``ALTER PUBLICATION "<name>" ADD TABLE ONLY <one quoted table>`` -- the one shape the
+    allowlist accepts (``ONLY``: never its inheritance children, G25). Idempotent: a member
+    (read first, rolled up to the partition root), a ``FOR ALL TABLES`` publication, or a
+    concurrent add that lost the race (SQLSTATE 42710, already a member) issues no further
+    write and returns False. A table with no replica identity PostgreSQL accepts for
+    UPDATE/DELETE -- NOTHING, DEFAULT with no valid primary key, USING INDEX whose index is
+    gone, or such a leaf partition -- is refused BEFORE any write with
+    :class:`PgReplicaIdentityError` (:func:`_verify_table_publishable`: publishing it would
+    make its UPDATE/DELETE fail on the source), and so is one whose identity cannot be read
+    (fail closed). An absent publication -- also one dropped after that read (SQLSTATE
+    42704) -- raises :class:`PgPublicationMissingError`; any other failure propagates (the
+    caller grades it by SQLSTATE). The audit line is written after the ADD commits
+    (AUTOCOMMIT).
 
     pgoutput decodes a table's changes only from when it is a publication member, so a
     table added for a load must be added BEFORE its copy starts, and its copy may start only
@@ -1234,13 +1875,13 @@ def add_table_to_publication(
         if on_log is not None:
             on_log(f'{table} is already in publication "{name}"; not added again')
         return False
-    _verify_table_publishable(connection, table, publication=name)
+    _verify_table_publishable(connection, table)
     dialect = dialect_for(SourceType.POSTGRES)
     ident = _sanitize(name)
     try:
         _run_write(
             connection,
-            f'ALTER PUBLICATION "{ident}" ADD TABLE {dialect.quote_table(table)}',
+            f'ALTER PUBLICATION "{ident}" ADD TABLE ONLY {dialect.quote_table(table)}',
             action=(
                 f'added {table} to publication "{ident}" (selected after the Full Load; '
                 "its changes stream from now on)"
@@ -1248,10 +1889,15 @@ def add_table_to_publication(
             on_log=on_log,
         )
     except Exception as exc:
-        if pg_sqlstate(exc) == "42710":  # duplicate_object: already a member
+        code = pg_sqlstate(exc)
+        if code == "42710":  # duplicate_object: already a member
             if on_log is not None:
                 on_log(f'{table} is already in publication "{name}"; not added again')
             return False
+        if code == "42704":  # undefined_object: the publication was dropped meanwhile
+            raise PgPublicationMissingError(
+                f"publication {name} does not exist on the source"
+            ) from exc
         raise
     return True
 
@@ -1342,11 +1988,16 @@ def create_publication(
 ) -> bool:
     """Create a publication for exactly ``tables``; return whether it was CREATED (vs reused).
 
-    ``FOR TABLE <exact migrated tables>`` -- NEVER ``FOR ALL TABLES`` (that would make an
-    UPDATE/DELETE on any of the source's no-PK tables ERROR on the publisher, a customer
-    write outage). ``tables`` are qualified ``schema.table`` names, quoted via the PG
-    dialect. PostgreSQL has no ``CREATE PUBLICATION IF NOT EXISTS``, so existence is checked
-    first. On reuse the existing publication's table set is RECONCILED against ``tables``:
+    ``FOR TABLE ONLY <t>, ONLY <t2>, ...`` -- exactly the migrated tables: NEVER ``FOR ALL
+    TABLES`` (that would make an UPDATE/DELETE on any of the source's no-PK tables ERROR on
+    the publisher, a customer write outage), and never a table's inheritance children,
+    which a bare ``FOR TABLE <t>`` adds too (G25; a partitioned table's partitions are
+    published either way). ``tables`` are qualified ``schema.table`` names, quoted via the
+    PG dialect. PostgreSQL has no ``CREATE PUBLICATION IF NOT EXISTS``, so existence is
+    checked first, and a ``CREATE`` that loses a race to another run with the same CDC stack
+    name (SQLSTATE 42710, or 23505 when simultaneous) reuses what that run created. On
+    reuse the existing publication's table set -- rolled up to each partition root, as
+    :func:`add_table_to_publication` reads it -- is RECONCILED against ``tables``:
     a requested table it does not list (e.g. a table added before a Re-run over a grown set,
     G17) is ADDED, one audited ``ADD TABLE`` each (:func:`add_table_to_publication`, which
     first refuses -- raises -- a table whose UPDATE/DELETE publishing would break) --
@@ -1377,34 +2028,42 @@ def create_publication(
     """
     if not tables:
         raise PgReplicationError("cannot create a publication for zero tables")
-    if publication_exists(connection, name):
-        existing = _publication_tables(connection, name)
-        requested = {str(t) for t in tables}
-        for table in sorted(requested - existing):
-            # A requested table the publication does not list yet: added, never skipped
-            # (pgoutput would stream nothing for it) and never by dropping the publication.
-            add_table_to_publication(connection, name=name, table=table, on_log=on_log)
-        if on_log is not None:
-            extra = sorted(existing - requested)
-            on_log(
-                f"publication {name} already exists and covers every requested table; "
-                f"reusing it (it also lists {', '.join(extra)}, which this run does not "
-                "load: CDC's table.include.list filters them out)"
-                if extra
-                else f"publication {name} already exists with the same tables; reusing"
+    membership = _publication_membership(connection, name)
+    if membership is None:
+        dialect = dialect_for(SourceType.POSTGRES)
+        quoted = ", ".join(f"ONLY {dialect.quote_table(t)}" for t in tables)
+        ident = _sanitize(name)  # allowlisted charset; also the literal in the DDL
+        try:
+            _run_write(
+                connection,
+                f'CREATE PUBLICATION "{ident}" FOR TABLE {quoted} '
+                "WITH (publish_via_partition_root = true)",
+                action=f"creating publication {ident}",
+                on_log=on_log,
             )
-        return False
-    dialect = dialect_for(SourceType.POSTGRES)
-    quoted = ", ".join(dialect.quote_table(t) for t in tables)
-    ident = _sanitize(name)  # allowlisted charset; also the literal in the DDL
-    _run_write(
-        connection,
-        f'CREATE PUBLICATION "{ident}" FOR TABLE {quoted} '
-        "WITH (publish_via_partition_root = true)",
-        action=f"creating publication {ident}",
-        on_log=on_log,
-    )
-    return True
+            return True
+        except Exception as exc:
+            if pg_sqlstate(exc) not in ("42710", "23505"):  # not "it exists now"
+                raise
+            membership = _publication_membership(connection, name)
+            if membership is None:
+                raise
+    existing = membership[1]
+    requested = {str(t) for t in tables}
+    for table in sorted(requested - existing):
+        # A requested table the publication does not list yet: added, never skipped
+        # (pgoutput would stream nothing for it) and never by dropping the publication.
+        add_table_to_publication(connection, name=name, table=table, on_log=on_log)
+    if on_log is not None:
+        extra = sorted(existing - requested)
+        on_log(
+            f"publication {name} already exists and covers every requested table; "
+            f"reusing it (it also lists {', '.join(extra)}, which this run does not "
+            "load: CDC's table.include.list filters them out)"
+            if extra
+            else f"publication {name} already exists with the same tables; reusing"
+        )
+    return False
 
 
 def create_replication_slot(
@@ -1507,6 +2166,106 @@ def set_replica_identity_full(
         )
 
 
+_SLOT_STATE_SQL = (
+    "SELECT NOT active AND slot_type = 'logical' "
+    "       AND plugin IS NOT DISTINCT FROM 'pgoutput' "
+    "       AND database IS NOT DISTINCT FROM current_database() AS reusable, "
+    "       active, database IS NOT DISTINCT FROM current_database() AS same_database, "
+    "       coalesce(database, '') AS database "
+    "FROM pg_replication_slots WHERE slot_name = :name"
+)
+
+
+def _stale_slot_or_refuse(
+    connection: object, slot_name: str, *, on_log: Optional[Callable[[str], None]]
+) -> bool:
+    """Does a same-named slot exist that provisioning may drop as a prior run's (G25)?
+
+    Read-only, before any write. ``True`` for an inactive logical pgoutput slot in this
+    database (the slot this stack's last Full Load left), ``False`` for none. Anything else
+    is refused with :class:`PgReplicationError` rather than dropped: a slot something
+    streams from, or one bound to another database or plugin, is not this run's -- the
+    slot name derives from the CDC stack name alone, and two migrations of one source
+    cluster can share it (the default name) -- and dropping it loses that pipeline's
+    changes."""
+    row = connection.execute(  # type: ignore[attr-defined]
+        text(_SLOT_STATE_SQL), {"name": slot_name}
+    ).first()
+    if row is None:
+        return False
+    if row[0]:
+        return True
+    if row[1]:
+        reason = "is in use (another CDC pipeline streams from it)"
+        fix = "stop that pipeline, or give this migration its own CDC stack name"
+    else:
+        reason = (
+            f"belongs to database {str(row[3])[:63]}"
+            if not row[2] and row[3]
+            else "is not a logical pgoutput slot"
+        )
+        fix = "give this migration its own CDC stack name"
+    if on_log is not None:
+        on_log(f"refused before any write: replication slot {slot_name} {reason}")
+    raise PgReplicationError(
+        f"Replication slot {slot_name} {reason}; it was not dropped. Nothing was changed "
+        f"on the source: {fix}, then run the Full Load again."
+    )
+
+
+def _repair_reused_publication(
+    connection: object,
+    *,
+    name: str,
+    tables: Sequence[str],
+    on_log: Optional[Callable[[str], None]],
+) -> None:
+    """Make a REUSED publication publish under the partition root BEFORE the slot (G25).
+
+    A publication Debezium created (``publication.autocreate.mode=filtered``) or an older
+    version made is at ``publish_via_partition_root = false``, and the setting is not
+    retroactive: a change committed before the flip decodes under its LEAF partition's name,
+    which ``table.include.list`` (the parent) discards. Flipped before the slot's consistent
+    point, nothing the slot decodes is affected. If the flip fails, a partitioned requested
+    table is refused with the statement to run by hand; otherwise the publication is reused
+    as is (nothing partitioned is captured through it)."""
+    try:
+        ensure_publication_via_partition_root(
+            connection, name=name, on_log=on_log, before_slot=True
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - graded below
+        cls = type(exc).__name__[:32]
+        failure = exc
+    try:
+        partitioned = (
+            connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT 1 FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE c.relkind = 'p' AND n.nspname || '.' || c.relname = ANY(:names) "
+                    "LIMIT 1"
+                ),
+                {"names": sorted({str(t) for t in tables})},
+            ).first()
+            is not None
+        )
+    except Exception:  # noqa: BLE001 - unreadable: fail closed
+        partitioned = True
+    if partitioned:
+        # The statement leads: the line must fit the JobManager's 300 characters.
+        raise PgReplicationError(
+            f'Run ALTER PUBLICATION "{name}" SET (publish_via_partition_root = true) as its '
+            f"owner, then run the Full Load again: setting it failed ({cls}), and without it "
+            "CDC discards the changes of a partitioned table."
+        ) from failure
+    if on_log is not None:
+        on_log(
+            f"publication {name} keeps publish_via_partition_root = false (setting it "
+            f"failed: {cls}); no table of this run is partitioned, so it is reused as is"
+        )
+
+
 def provision_pg_replication(
     connection: object,
     *,
@@ -1522,11 +2281,13 @@ def provision_pg_replication(
     from the slot's LSN onward carries the full before-image the re-keyed DELETE needs),
     then the publication (what pgoutput may decode -- the connector's table.include.list
     defines the capture within it, so a reused publication that lists more is fine, G16,
-    and a reused one missing a requested table gets it added, one ``ADD TABLE`` each, G17),
-    then the slot (whose returned consistent-point LSN pins WAL from here). A stale slot
-    from a prior run is dropped first so the new slot's LSN matches THIS Full Load's
-    snapshot -- safe because slot creation runs at Full Load time, before any CDC connector
-    exists to hold it active.
+    and a reused one missing a requested table gets it added, one ``ADD TABLE`` each, G17;
+    a reused one also gets ``publish_via_partition_root = true``, G25), then the slot (whose
+    returned consistent-point LSN pins WAL from here). A stale slot from a prior run is
+    dropped first so the new slot's LSN matches THIS Full Load's snapshot -- safe because
+    slot creation runs at Full Load time, before any CDC connector of this run exists to
+    hold it active. A same-named slot that is in use, or bound to another database or
+    plugin, is someone else's and is refused before any write instead (G25).
     Returns the handles (incl. the resume LSN) to record on the watermark. Callers pass a
     connection from :func:`build_pg_source_write_engine` (the un-guarded AUTOCOMMIT path).
 
@@ -1539,8 +2300,9 @@ def provision_pg_replication(
     table it would publish has no usable REPLICA IDENTITY, or whether it has one cannot be
     read (:func:`_verify_tables_publishable`, G20: the strict, fail-closed rule the one-table
     ADD applies; a re-keyed plain table about to be set FULL passes, a partitioned one is
-    graded by its partitions), and if any requested table is REPLICA IDENTITY NOTHING
-    (:func:`_verify_tables_replicable`) -- a source-write outage guard. On a reused
+    graded by its partitions), if any requested table is REPLICA IDENTITY NOTHING
+    (:func:`_verify_tables_replicable`) -- a source-write outage guard -- and if a slot of
+    that name is not this stack's stale one (:func:`_stale_slot_or_refuse`). On a reused
     publication the up-front check covers every table it would add, so a refusal never
     leaves some of them added. On AUTOCOMMIT the publication commits immediately, so if
     slot creation then fails, a publication CREATED by this call is dropped (compensating)
@@ -1548,11 +2310,11 @@ def provision_pg_replication(
     place on a later failure -- it is a benign, reversible widening of the before-image,
     not an orphaned object arming a write outage.)
     """
-    # Source-safety guards (independent of the advisory prerequisite), both BEFORE the
+    # Source-safety guards (independent of the advisory prerequisite), all BEFORE the
     # first write: never publish a table whose UPDATE/DELETE would then ERROR on the source
     # publisher. The strict, fail-closed check grades every table this call would add to
     # the publication (G20); the lenient one keeps refusing NOTHING for every requested
-    # table, members of a reused publication included.
+    # table, members of a reused publication included. Never drop another pipeline's slot.
     _verify_tables_publishable(
         connection,
         tables,
@@ -1561,13 +2323,18 @@ def provision_pg_replication(
         on_log=on_log,
     )
     _verify_tables_replicable(connection, tables, on_log=on_log)
+    stale_slot = _stale_slot_or_refuse(connection, slot_name, on_log=on_log)
     # Re-keyed tables need the full before-image (leading key column) BEFORE the slot's LSN.
     set_replica_identity_full(connection, full_identity_tables, on_log=on_log)
     created_publication = create_publication(
         connection, name=publication_name, tables=tables, on_log=on_log
     )
     try:
-        if slot_exists(connection, slot_name):
+        if not created_publication:
+            _repair_reused_publication(
+                connection, name=publication_name, tables=tables, on_log=on_log
+            )
+        if stale_slot:
             if on_log is not None:
                 on_log(f"dropping stale replication slot {slot_name} from a prior run")
             drop_replication_slot(connection, name=slot_name, on_log=on_log)
@@ -1641,6 +2408,25 @@ __all__ = [
     "PgReplicationObjects",
     "read_pg_replication_objects",
     "pg_replication_objects_blocker",
+    "NO_PRIMARY_KEY_PROBLEM",
+    "INDEX_GONE_PROBLEM",
+    "REKEYED_FULL_REFUSED_PROBLEM",
+    "REKEYED_FULL_REFUSED_REMEDY",
+    "SLOT_POSITION_HEADER",
+    "SLOT_MISSING_HEADER",
+    "SLOT_UNUSABLE_HEADER",
+    "PUBLICATION_MISSING_HEADER",
+    "PUBLICATION_COVERAGE_HEADER",
+    "RESNAPSHOT_OFFERED",
+    "RESNAPSHOT_REFUSED",
+    "pg_cdc_route",
+    "PUBLISH_LIST_HEADER",
+    "INHERITANCE_SNAPSHOT_HEADER",
+    "INHERITANCE_UNREADABLE_HEADER",
+    "BLOCKS_WITH_THEIR_OWN_FIX",
+    "publish_list_fix",
+    "read_inheritance_children",
+    "with_inheritance_children",
     "create_publication",
     "pg_sqlstate",
     "add_table_to_publication",

@@ -47,7 +47,7 @@ Full load only without a finding: nothing is read, drawn or logged.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -86,7 +86,12 @@ class CdcReplicaIdentityProbe:
     ``scope`` is what was asked ({table: composite key columns}); ``reads`` what the source
     returned ({table: cdc_pg_slot.RekeyedIdentityRead}) -- a scoped table absent from it was
     not found. A failed read has ``ok`` False, a ``problem`` and only the exception's CLASS
-    name (never its message, which can carry a host or a value).
+    name (never its message, which can carry a host or a value). ``migration_type`` is the
+    migration the read was landed for (:func:`_probe_and_land`): a fix that reloads a table
+    depends on it, as CDC only has no Full Load to reload from (G25).
+    ``full_refused_by_table`` (G25): per table, whether PostgreSQL 18 refuses FULL on it (a
+    generated column) as the last SUCCESSFUL read before this one found -- carried at landing
+    (:func:`_carry_full_refused`), so a failed read does not turn its fix back into FULL.
     """
 
     started_at: datetime
@@ -96,15 +101,47 @@ class CdcReplicaIdentityProbe:
     error_class: Optional[str] = None
     scope: Mapping[str, tuple] = field(default_factory=dict)
     reads: Mapping[str, Any] = field(default_factory=dict)
+    migration_type: Optional[object] = None
+    full_refused_by_table: Mapping[str, bool] = field(default_factory=dict)
+
+
+def full_refused_facts(probe: Optional[object]) -> "dict[str, bool]":
+    """Per table, whether PostgreSQL 18 refuses REPLICA IDENTITY FULL on it (a generated
+    column), as the last SUCCESSFUL read found: ``probe``'s own reads when it succeeded, over
+    what it carried from the reads before it (G25). A table missing from the result is
+    unknown -- no read since the app started has found it. Pure."""
+    facts = dict(getattr(probe, "full_refused_by_table", None) or {})
+    if getattr(probe, "ok", False):
+        for table, read in (getattr(probe, "reads", None) or {}).items():
+            facts[str(table)] = bool(getattr(read, "full_refused", False))
+    return facts
+
+
+def _carry_full_refused(previous: Optional[object], probe: object) -> object:
+    """``probe`` carrying the PostgreSQL 18 facts of the reads before it (``previous``, the
+    last landed probe): a failed read keeps them all, a successful one replaces those of the
+    tables it found. Pure."""
+    if not isinstance(probe, CdcReplicaIdentityProbe):
+        return probe
+    return replace(
+        probe,
+        full_refused_by_table={**full_refused_facts(previous), **full_refused_facts(probe)},
+    )
 
 
 @dataclass(frozen=True)
 class ReplicaIdentityTransition:
-    """A finding changed state: ``opened`` / ``reopened`` / ``restored`` / ``not-rekeyed``."""
+    """A finding changed state: ``opened`` / ``reopened`` / ``restored`` / ``not-rekeyed``.
+
+    ``full_refused`` (G25): the read that opened it found PostgreSQL 18 and a generated column
+    (``cdc_pg_slot.RekeyedIdentityRead.full_refused``), so FULL is no fix for it; the fix then
+    depends on ``migration_type`` (the read's)."""
 
     kind: str
     table: str
     finding: object
+    full_refused: bool = False
+    migration_type: Optional[object] = None
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +367,8 @@ def fold_replica_identity_probe(
                         kind="opened" if existing is None else "reopened",
                         table=table,
                         finding=finding,
+                        full_refused=bool(getattr(read, "full_refused", False)),
+                        migration_type=getattr(probe, "migration_type", None),
                     )
                 )
             else:
@@ -368,6 +407,13 @@ async def _probe_and_land(session: object, migration_state: object, scope: Mappi
         )
 
         probe = await run.io_bound(read_cdc_replica_identity_once, session, dict(scope))
+        if isinstance(probe, CdcReplicaIdentityProbe):
+            # The migration it is landed for: its fixes depend on it (G25) -- and PostgreSQL
+            # 18's FULL refusal as the reads before it found it, which a failed read keeps.
+            probe = _carry_full_refused(
+                getattr(migration_state, "cdc_replica_identity_last_probe", None),
+                replace(probe, migration_type=getattr(migration_state, "migration_type", None)),
+            )
         if probe is not None:  # None only when the app is stopping
             transitions = migration_state.apply_cdc_replica_identity_probe(probe)  # type: ignore[attr-defined]
             log_replica_identity_transitions(transitions)
@@ -441,6 +487,8 @@ def _view_signature(migration_state: object, evidence_at: Optional[datetime]) ->
             getattr(last, "error_class", None),
             tuple(sorted(getattr(last, "scope", None) or {})),
             tuple(sorted(getattr(last, "reads", None) or {})),
+            # Which fix the notices name for each table (G25): FULL, or "Keep source PK".
+            tuple(sorted(full_refused_facts(last).items())),
             evidence is None or (_aware(last.started_at) or evidence) > evidence,
         )
     )
@@ -894,6 +942,19 @@ def repair_line(migration_type: object) -> str:
     )
 
 
+def keep_source_pk_fix(migration_type: object, them: str = "it") -> str:
+    """The fix for a re-keyed table PostgreSQL 18 refuses FULL on (a generated column): drop
+    the re-key, then load the table again with its source key -- by migration type, since
+    CDC only has no Full Load step to reload it from, and a resumed Start does not
+    re-snapshot (G25). ``them``: "it" or "them"."""
+    if _is_type(migration_type, "CDC_ONLY"):
+        return (
+            f'use Start over to migrate {them} again with "Keep source PK" chosen in Schema '
+            "Conversion"
+        )
+    return f'set {them} back to "Keep source PK" in Schema Conversion and reload {them}'
+
+
 def wrong_row_sentence(issues: "Sequence[ReplicaIdentityIssue]") -> str:
     """Only when a key omits part of the source primary key: a lost DELETE can also hit a
     different row (one whose key really holds the placeholder value)."""
@@ -940,6 +1001,40 @@ def _weak_issues(findings: "Mapping[str, Any]") -> list[ReplicaIdentityIssue]:
     ]
 
 
+def _full_refused(
+    issues: "Sequence[ReplicaIdentityIssue]", last_probe: Optional[object], migration_type: object
+) -> "tuple[list[str], str, str, str]":
+    """The open tables PostgreSQL 18 refuses FULL on, as the last SUCCESSFUL read found (a
+    generated column, G25 -- :func:`full_refused_facts`, so a failed re-read changes nothing),
+    with that cause and its fix for ``migration_type`` -- the prerequisite's own remedy, never
+    FULL. With every open table refused, a notice names only that fix. The last element
+    qualifies the FULL advice for the open tables no read since the app started has found
+    (after a restart): whether FULL is a fix there is not known yet."""
+    facts = full_refused_facts(last_probe)
+    refused = [i.table for i in issues if facts.get(i.table)]
+    whose, them = ("its", "it") if len(refused) == 1 else ("their", "them")
+    pg18 = (
+        f"on PostgreSQL 18 {whose} generated columns make a published REPLICA IDENTITY FULL "
+        "fail every UPDATE and DELETE on the source"
+    )
+    unknown = [i.table for i in issues if i.table not in facts]
+    unread = ""
+    if unknown:
+        which = "here" if len(unknown) == len(issues) else f"for {_bounded(unknown)}"
+        # A restored session has no migration type on its (absent) read: neutral then.
+        fix = (
+            keep_source_pk_fix(migration_type, "it")
+            if migration_type is not None
+            else 'set it back to "Keep source PK" in Schema Conversion and migrate it again'
+        )
+        unread = (
+            f" Until the tool reads the source again it cannot tell whether FULL is a fix "
+            f"{which}: on PostgreSQL 18 a published FULL table with generated columns fails "
+            f"every UPDATE and DELETE on the source, so for such a table, {fix} instead."
+        )
+    return refused, pg18, keep_source_pk_fix(migration_type, them), unread
+
+
 def monitor_weak_notice(
     findings: "Mapping[str, Any]",
     *,
@@ -955,19 +1050,33 @@ def monitor_weak_notice(
         (_aware(getattr(i.finding, "first_weak_at", None)) for i in weak),
         key=lambda d: d or _now(),
     )
+    refused, pg18, fix, unread = _full_refused(
+        weak, last_probe, getattr(last_probe, "migration_type", None))
     body = (
         f"{_labelled(weak)}, found at {_fmt_hm(found)}. These tables have the composite "
         "primary key chosen in Schema Conversion, and a DELETE carries that key's added "
         "column only under REPLICA IDENTITY FULL. While it is below FULL, a DELETE can leave "
         "its row on Aurora DSQL with no error and no dead letter, and an UPDATE that changes "
-        "a key column can be lost too. Run ALTER TABLE <table> REPLICA IDENTITY FULL "
-        "on the source now; for a partitioned table, run it on each partition too (the "
-        "parent does not propagate, and a new partition starts at DEFAULT). Then choose "
-        "Check again. Deletes made before the fix are not replayed, so Cut over is held "
-        "until REPLICA IDENTITY is FULL again and each table matches in a CHECKSUM "
-        "comparison started after the fix."
+        "a key column can be lost too. "
     )
+    if refused and len(refused) == len(weak):
+        body += (
+            f"FULL is no fix here: {pg18}, so {fix}. Deletes made before the fix are not "
+            "replayed, so Cut over is held until each table matches in a CHECKSUM comparison "
+            "started after the fix."
+        )
+    else:
+        body += (
+            "Run ALTER TABLE <table> REPLICA IDENTITY FULL "
+            "on the source now; for a partitioned table, run it on each partition too (the "
+            "parent does not propagate, and a new partition starts at DEFAULT). Then choose "
+            "Check again. Deletes made before the fix are not replayed, so Cut over is held "
+            "until REPLICA IDENTITY is FULL again and each table matches in a CHECKSUM "
+            "comparison started after the fix." + unread
+        )
     body += wrong_row_sentence(weak)
+    if refused and len(refused) < len(weak):
+        body += f" Not for {_bounded(refused)}: {pg18}, so {fix} instead."
     if not has_password:
         body += _NO_PASSWORD_SENTENCE
     else:
@@ -1131,15 +1240,30 @@ def cutover_weak_notice(gate: ReplicaIdentityGate) -> Optional[tuple[str, str]]:
     """``(header, body)`` of Cut over's ERROR while a finding is open."""
     if not gate.weak:
         return None
+    refused, pg18, fix, unread = _full_refused(
+        gate.weak, gate.last_probe, gate.migration_type)
     body = (
         f"REPLICA IDENTITY on {_labelled(gate.weak)} is below FULL on the source, so their "
         "DELETEs (and UPDATEs that change the source primary key) can miss their rows on Aurora "
         "DSQL with no error and no dead letter, and an UPDATE of the added key column alone can "
-        "be dead-lettered and leave the old row. Run ALTER TABLE <table> REPLICA IDENTITY FULL on "
-        "the source (on each partition of a partitioned table), then choose Check again. Once "
-        "the tool reads FULL, each table must match in a CHECKSUM comparison started more "
-        "than a minute later; Validation compares them by CHECKSUM automatically."
+        "be dead-lettered and leave the old row. "
     )
+    if refused and len(refused) == len(gate.weak):
+        body += (
+            f"FULL is no fix here: {pg18}, so {fix}. Each table must then match in a CHECKSUM "
+            "comparison started more than a minute after the fix; Validation compares them "
+            "by CHECKSUM automatically."
+        )
+    else:
+        body += (
+            "Run ALTER TABLE <table> REPLICA IDENTITY FULL on "
+            "the source (on each partition of a partitioned table), then choose Check again. "
+            "Once the tool reads FULL, each table must match in a CHECKSUM comparison started "
+            "more than a minute later; Validation compares them by CHECKSUM automatically."
+            + unread
+        )
+        if refused:
+            body += f" Not for {_bounded(refused)}: {pg18}, so {fix} instead."
     if not gate.has_source_connection:
         body += _NO_PASSWORD_SENTENCE
     elif gate.probe_state == PROBE_STATE_FAILED:
@@ -1312,13 +1436,27 @@ def replica_identity_verdict_hold(
         else ""
     )
     if gate.weak:
+        refused, pg18, fix, unread = _full_refused(
+            gate.weak, gate.last_probe, gate.migration_type)
         body = (
             f"All {total} table(s) match as-of {as_of}, but REPLICA IDENTITY on "
             f"{_bounded([i.table for i in gate.weak])} is below FULL on the source, so their "
-            "DELETEs can miss Aurora DSQL and this match may not last. Run ALTER TABLE … "
-            "REPLICA IDENTITY FULL on the source (on each partition too); the tool re-reads "
-            "it, and Cut over then needs a CHECKSUM match started after the fix."
+            "DELETEs can miss Aurora DSQL and this match may not last. "
         )
+        if refused and len(refused) == len(gate.weak):
+            # PostgreSQL 18 refuses FULL on every one of them (G25): its fix alone.
+            body += (
+                f"FULL is no fix here: {pg18}, so {fix}; Cut over then needs a CHECKSUM "
+                "match started after the fix."
+            )
+        else:
+            body += (
+                "Run ALTER TABLE … REPLICA IDENTITY FULL on the source (on each partition "
+                "too); the tool re-reads it, and Cut over then needs a CHECKSUM match started "
+                "after the fix." + unread
+            )
+            if refused:
+                body += f" Not for {_bounded(refused)}: {pg18}, so {fix} instead."
         if not gate.has_source_connection:
             body += _NO_PASSWORD_SENTENCE
         else:
@@ -1455,16 +1593,32 @@ def _transition_line(transition: ReplicaIdentityTransition) -> tuple[str, str, s
     finding = transition.finding
     table = transition.table
     if transition.kind in ("opened", "reopened"):
+        from dsql_migrator.core.models import SourceType
+        from dsql_migrator.core.source_dialect import dialect_for
+
         key = ", ".join(getattr(finding, "key_columns", None) or [])
         missing = ", ".join(getattr(finding, "missing", None) or []) or "a column"
+        # Quoted, like the prerequisite's remedy (G25): unquoted, PostgreSQL folds
+        # MixS.Orders to mixs.orders.
+        quoted = dialect_for(SourceType.POSTGRES).quote_table(table)
+        # PostgreSQL 18 and a generated column: a published FULL fails every UPDATE and
+        # DELETE on the source, so the fix is the prerequisite's -- remove the re-key, then
+        # load the table again as the migration type can (G25).
+        fix = (
+            f"Fix: {keep_source_pk_fix(transition.migration_type)} -- not FULL: on PostgreSQL "
+            "18 its generated columns make a published REPLICA IDENTITY FULL fail every "
+            "UPDATE and DELETE on the source."
+            if transition.full_refused
+            else f"Fix: ALTER TABLE {quoted} REPLICA IDENTITY FULL on the source (each "
+            "partition too)."
+        )
         return (
             "FAILURE",
             "re-keyed table's REPLICA IDENTITY is below FULL: its deletes can be lost",
             f"{identity_label(finding)}; the composite key ({key}) adds {missing}, which a "
             "DELETE carries only under REPLICA IDENTITY FULL, so deletes on "
-            f"{table} can miss Aurora DSQL with no error and no dead letter. Fix: ALTER TABLE "
-            f"{table} REPLICA IDENTITY FULL on the source (each partition too). Cut over is "
-            "held.",
+            f"{table} can miss Aurora DSQL with no error and no dead letter. {fix} Cut over "
+            "is held.",
         )
     restored = _aware(getattr(finding, "restored_at", None))
     after = _fmt_hms(restored + timedelta(seconds=60)) if restored is not None else "the fix"
@@ -1523,6 +1677,8 @@ __all__ = [
     "cdc_checksum_forced_tables",
     "cdc_replica_identity_cutover_gate",
     "fold_replica_identity_probe",
+    "full_refused_facts",
+    "keep_source_pk_fix",
     "log_replica_identity_transitions",
     "probe_replica_identity_now",
     "replica_identity_gate_for",

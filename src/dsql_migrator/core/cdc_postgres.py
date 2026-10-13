@@ -526,7 +526,10 @@ def classify_slot_health(health: Optional[SlotHealth]) -> tuple[str, str, str]:
     Tones are the design-system notice tones (info / success / warning / error):
 
     * ``error``   -- ``wal_status='lost'``: the slot is invalidated, required WAL was
-      removed, so CDC cannot resume gaplessly (a Full Load re-run is needed).
+      removed, so CDC cannot resume gaplessly. The detail names no way out: the CDC
+      monitor appends the route rule's (``cdc_pg_slot.pg_cdc_route``, G25), which knows the
+      stack was started and the migration type -- new CDC topics before any Full Load re-run,
+      and no Full Load step with CDC only.
     * ``warning`` -- WAL pressure: ``unreserved``/``extended``, a non-positive
       ``safe_wal_size``, or an inactive slot (no consumer, so WAL is accumulating).
     * ``success`` -- ``reserved`` and active (a healthy, consumed slot).
@@ -545,8 +548,7 @@ def classify_slot_health(health: Optional[SlotHealth]) -> tuple[str, str, str]:
         return (
             "error",
             "Replication slot invalidated",
-            "The source removed WAL this slot needed, so CDC cannot resume gaplessly. "
-            "Re-run Full Load to re-establish a consistency point.",
+            "The source removed WAL this slot needed, so CDC cannot resume gaplessly.",
         )
     low_headroom = health.safe_wal_size is not None and health.safe_wal_size <= 0
     if status in ("unreserved", "extended") or low_headroom:

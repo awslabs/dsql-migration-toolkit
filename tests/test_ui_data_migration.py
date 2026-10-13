@@ -4423,25 +4423,20 @@ def test_start_cdc_without_a_fingerprint_proceeds_and_logs_that_it_was_not_check
     assert "no recorded definitions" in infos[0]["detail"]
 
 
-def test_start_cdc_newer_seed_after_stop_runs_recovery_and_the_check(monkeypatch) -> None:
-    # Re-run Full Load after the Stop: its watermark (000100:4) is past the one the stack
-    # was seeded from (000090:4), so the seeder MOVES the offset forward -- recovery, gated
-    # on the NEW watermark.
-    calls: list = []
+def test_start_cdc_newer_seed_after_stop_is_refused(monkeypatch) -> None:
+    # A Full Load re-run after the Stop (a detour around the Full Load step's gate): its
+    # watermark (000100:4) is past the one the stack was seeded from (000090:4). The seeder
+    # would MOVE the offset forward while the sink resumes from its last commit and applies
+    # its unapplied tail over the reload -- so Start CDC refuses it (G25, A2), before any read.
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER
 
-    def _read(session, names, recorded):
-        from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
-
-        calls.append((tuple(names), dict(recorded)))
-        return StartPointVerdict(kind="ok")
-
-    wm = _g5_wm()
     run = _g5_run(
-        monkeypatch, job_watermark=wm, committed=True,
-        deployed=("mysql-bin.000090", "4"), start_point_read=_read,
+        monkeypatch, job_watermark=_g5_wm(), committed=True,
+        deployed=("mysql-bin.000090", "4"), start_point_read=_g5_never,
     )
-    assert run["error"] is None and _g5_mode(run) == "recovery"
-    assert calls == [(("app.orders",), wm.table_fingerprints)]
+    assert not run["submitted"] and run["kwargs"] == {}
+    assert [n["header"] for n in run["notices"]] == [NEWER_POINT_HEADER]
+    assert "Delete CDC infrastructure and deploy it again" in run["notices"][0]["body"]
 
 
 def test_start_cdc_keeps_a_live_schema_only_mode_and_skips_the_check(monkeypatch) -> None:
@@ -4638,8 +4633,10 @@ def test_start_cdc_worker_checks_when_the_fresh_describe_shows_the_connectors_go
     monkeypatch,
 ) -> None:
     # The page cached running recovery connectors (no check due); the fresh describe shows
-    # them gone and an older seed, so this Start creates connectors in recovery from the
-    # watermark: the check must run on the FRESH facts (Retry CDC skips the dialog).
+    # them gone -- the stack deployed again, never started -- so this Start creates
+    # connectors in recovery from the watermark: the check must run on the FRESH facts
+    # (Retry CDC skips the dialog). (A fresh describe of a STOPPED stack seeded from an
+    # earlier point would refuse this newer seed first: G25, A2 -- test_g25_cdc_r7.)
     from dsql_migrator.ui.cdc_start_point_gate import StartPointVerdict
 
     calls: list = []
@@ -4651,8 +4648,7 @@ def test_start_cdc_worker_checks_when_the_fresh_describe_shows_the_connectors_go
     run = _g5_run(
         monkeypatch, job_watermark=_g5_wm(), live_mode="recovery",
         describe_params={
-            "DeploySink": "true", "MskBootstrapServers": "", "SnapshotMode": "recovery",
-            "WatermarkBinlogFile": "mysql-bin.000090", "WatermarkBinlogPos": "4",
+            "DeploySink": "false", "MskBootstrapServers": "", "SnapshotMode": "recovery",
         },
         start_point_read=_read,
     )
@@ -17358,8 +17354,11 @@ def test_start_cdc_enabled_on_restart_without_any_watermark() -> None:
     assert "Set the CDC start point above first." not in blob
     assert "Ready to resume CDC" in blob
     assert "continues from exactly where streaming stopped" in blob
-    # It must state the two things the operator needs: no gap and no re-load.
-    assert "no gap" in blob
+    # It must state the two things the operator needs: when it is gapless and no re-load.
+    # (G25 round 6: gapless only while the CDC topics retain what the sink had not applied
+    # at the Stop -- never an unconditional "no gap".)
+    assert "gapless only while the topics still retain them" in blob
+    assert "no gap" not in blob
     assert "no re-load" in blob
 
     # Without a committed offset (a genuinely fresh stack) it stays the FIRST-start copy.
@@ -17489,11 +17488,11 @@ def test_start_point_card_reports_the_resume_instead_of_demanding_a_watermark() 
     assert "Resuming from the last streamed position" in blob
     assert "Ready" in ui.texts
     assert "Action needed" not in ui.texts
-    # The now-irrelevant Automatic/Manual choice is not offered; only a LATER Manual point,
-    # behind a collapsed disclosure (the route the start-point refusals name).
+    # The now-irrelevant Automatic/Manual choice is not offered -- nor a LATER Manual point
+    # (G25, A2): on a stack that has streamed one needs new CDC topics first.
     assert "needs a Full Load watermark" not in blob
     assert "Manual — enter a GTID or binlog position" not in blob
-    assert "Manual — start from a later binlog position instead" in blob
+    assert "Manual — start from a later binlog position instead" not in blob
 
 
 def test_stop_dialog_promises_the_position_survives() -> None:
@@ -25882,7 +25881,8 @@ def test_a_failed_unique_index_is_reported_as_a_missing_constraint() -> None:
     assert flu._has_unique_index_failure([]) is False
 
     notice = inspect.getsource(flu._render_full_load_progress)
-    assert "_has_unique_index_failure(index_only)" in notice, (
+    # G25: over the indexes KNOWN missing (a not-confirmed one most likely exists).
+    assert "_has_unique_index_failure(missing)" in notice, (
         "the notice no longer distinguishes a missing constraint from a missing index"
     )
     assert "BEFORE cutting over" in notice, (
@@ -25969,9 +25969,10 @@ def test_g22_an_unconfirmed_secondary_index_is_an_info_to_check(monkeypatch) -> 
     assert "shop.orders · Done — index not confirmed" in badges
 
 
-def test_g22_a_mix_keeps_the_not_created_notice_and_tells_the_rows_apart(monkeypatch) -> None:
-    # One table's index is unconfirmed, another's hit the 24-index limit: the notice stays the
-    # "NOT created" one (true of the second); each row's badge says which is which.
+def test_g22_a_mix_names_both_groups_and_tells_the_rows_apart(monkeypatch) -> None:
+    # One table's index is unconfirmed, another's hit the 24-index limit: the notice names
+    # both groups (G25: the only UNIQUE one is the unconfirmed one, which most likely exists,
+    # so no "NOT created ... constraint is missing"); each row's badge says which is which.
     from tests.test_batched_import import _IndexCatalog, _UNIQUE_DDL, _index_importer
 
     _created, unsure = _index_importer(
@@ -25985,7 +25986,9 @@ def test_g22_a_mix_keeps_the_not_created_notice_and_tells_the_rows_apart(monkeyp
         },
     )
     (notice,) = notices
-    assert notice["header"].startswith("Unique index NOT created (2)")
+    assert notice["header"].startswith("Indexes not created (1), not confirmed (1)")
+    assert "constraint is missing" not in notice["header"]
+    assert notice["tone"] == "warning"  # the unique one may still be missing
     assert "shop.orders · Done — index not confirmed" in badges
     assert "shop.items · Done — index missing" in badges
 
@@ -26827,7 +26830,10 @@ def test_pg_connector_failures_are_diagnosed_instead_of_left_to_cloudwatch() -> 
     )
     guidance = _diagnose_connector_log("dsql-cdc-stack-debezium-source", real_log)
     assert guidance is not None
-    assert "Re-snapshot every table instead" in guidance
+    # The gapless routes of a stack whose connectors were started (G25: such a stack is never
+    # offered "Re-snapshot every table instead", and this failure is only read on one).
+    assert "choosing 'Drop & reload'" in guidance
+    assert "Delete CDC infrastructure and deploy it again" in guidance
     # ...and it must warn OFF the remedy that silently loses data.
     assert "cannot start at a past position" in guidance
     # An unrelated log still yields nothing rather than a wrong diagnosis.
@@ -28277,6 +28283,12 @@ def _pg_gate_fixture(monkeypatch, *, publication_present, covered):
 
         def __exit__(self, *exc):
             return False
+
+        def execute(self, statement, _params=None):
+            # A Start that snapshots also reads which captured tables have inheritance
+            # child tables (G25), and refuses when that read fails: none has any here.
+            assert "pg_catalog.pg_inherits" in str(statement)
+            return SimpleNamespace(fetchall=lambda: [])
 
     class _Eng:
         def connect(self):
@@ -34400,11 +34412,23 @@ def test_g19_an_unreadable_mode_refuses_only_a_start_point_without_a_gtid_set(
     assert msg.startswith(f"Start CDC blocked: {G3_HEADER}. ")
     assert "records it on the stack" in msg and "this session has no source connection" in msg
     assert first["kwargs"] == {}
-    # A stack that streamed before and holds no gtid_mode record (an older version started
-    # it): proceeds as before, Debezium using whichever the mode requires, recording nothing.
+    # DELIBERATE G25 UPDATE (A2): a stack that streamed before, whose last Start recorded no
+    # start offset, is refused a seeded start before anything is read -- the seed cannot be
+    # shown to be at or before the position it committed, so the seeder could move it
+    # forward under the sink's unapplied tail. (It used to proceed, unread.)
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER
+
     run = _run_start_cdc_capture(
         monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
         job_watermark=_job_wm(), gtid_state=None, committed=True,
+        describe_params={"DeploySink": "true", "MskBootstrapServers": ""},
+    )
+    assert not run["submitted"] and run["gtid_reads"] == []
+    assert [n["header"] for n in run["notices"]] == [NEWER_POINT_HEADER]
+    # ...while the same stack's resume (no seed) proceeds unread, recording nothing.
+    run = _run_start_cdc_capture(
+        monkeypatch, source_type=SourceType.MYSQL, start_mode="auto",
+        gtid_state=None, committed=True,
         describe_params={"DeploySink": "true", "MskBootstrapServers": ""},
     )
     assert run["submitted"] and run["kwargs"]
@@ -34412,8 +34436,7 @@ def test_g19_an_unreadable_mode_refuses_only_a_start_point_without_a_gtid_set(
     assert detail.startswith(
         "The source's gtid_mode could not be read (this session has no source connection)"
     )
-    assert "binlog mysql-bin.000050:999" in detail
-    assert "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5" in detail
+    assert "continues from the position it last committed" in detail
     assert run["kwargs"]["start_gtid_mode"] is None
 
 
@@ -34935,15 +34958,19 @@ def test_the_confirm_summary_names_the_pg_cdc_source_writes() -> None:
     )
     from dsql_migrator.ui.data_migration._models import MigrationType
 
-    pg = full_load_confirm_summary(["t"], SourceType.POSTGRES, MigrationType.FULL_LOAD_AND_CDC)
-    assert "publication and replication slot" in pg and "read only" not in pg
+    # A Start (new snapshot); the per-action kinds are covered by tests/test_g25_fl.py.
+    pg = full_load_confirm_summary(
+        ["t"], SourceType.POSTGRES, MigrationType.FULL_LOAD_AND_CDC, keeps_watermark=False
+    )
+    assert "CDC publication" in pg and "replaces the replication slot" in pg
+    assert "read only" not in pg
     for engine, mtype in (
         (SourceType.POSTGRES, MigrationType.FULL_LOAD_ONLY),
         (SourceType.MYSQL, MigrationType.FULL_LOAD_AND_CDC),
     ):
-        assert full_load_confirm_summary(["t"], engine, mtype).endswith(
-            "the source is accessed read only."
-        )
+        assert full_load_confirm_summary(
+            ["t"], engine, mtype, keeps_watermark=False
+        ).endswith("the source is accessed read only.")
     assert with_data_choice_text(1, ticked_scope=True).startswith("1 ticked table already contains")
     assert with_data_choice_text(4, ticked_scope=False).startswith("4 selected table(s)")
     assert with_data_choice_text(0, ticked_scope=True).startswith("No ticked table holds data")

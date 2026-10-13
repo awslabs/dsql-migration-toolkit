@@ -333,11 +333,15 @@ def test_every_refusal_is_an_error_that_changes_nothing(migration_type) -> None:
 
 def test_the_keep_remedy_names_on_permissive() -> None:
     refusals = {**_all_refusals(), **_g20_refusals()}
-    for name in ("G1-FL", "G1-manual", "G1-resume", "G2-seeded", "G2-resume", "G2S-resume",
-                 "G2S-seeded"):
+    for name in ("G1-FL", "G1-manual", "G1-resume", "G2-seeded", "G2-resume", "G2S-resume"):
         verdict, origin = refusals[name]
         body = _notice(verdict, origin=origin)[3]
         assert "set the source's gtid_mode back to ON_PERMISSIVE until cut over" in body, name
+    # DELIBERATE G25 UPDATE (A2): a seeded start refused on the stack's record cannot keep
+    # its start point on this stack -- Start CDC refuses a start point newer than where a
+    # streamed stack last started -- so it names only the redeploy route.
+    seeded = _notice(refusals["G2S-seeded"][0], origin=refusals["G2S-seeded"][1])[3]
+    assert "ON_PERMISSIVE until cut over" not in seeded
     resume = _notice(*_all_refusals()["G1-resume"][:1])[3]
     assert "streams from where this stack stopped by binlog file:position" in resume
 
@@ -1014,10 +1018,11 @@ def test_g20_the_stack_record_refusal_copy() -> None:
     seeded = _notice(r["G2S-seeded"][0])[3]
     assert "the offset seeder keeps the committed offset whenever the new point is not later " \
            "than it" in seeded
+    # G25 (A2): no way to keep this point on this stack -- only the redeploy.
     assert (
-        "CDC then streams from binlog mysql-bin.000008:5150730 (or from where this stack "
-        "stopped, if that is later) by binlog file:position."
+        "Start CDC does not take a start point newer than where this stack last started"
     ) in seeded
+    assert "CDC then streams from binlog mysql-bin.000008:5150730" not in seeded
     # Unread with a record / on a first start.
     stack = _notice(r["G3R-stack"][0])[3]
     assert stack.startswith("This CDC stack last started while the source's gtid_mode was OFF")
@@ -1044,8 +1049,14 @@ def test_g20_the_stack_record_refusal_copy() -> None:
     assert detail == (
         f"{G2_STACK_HEADER}: {NO_SEED_LABEL} (last started under gtid_mode=ON_PERMISSIVE)"
     )
-    # G19's own copy is byte-identical (no "Delete CDC infrastructure" remedy there).
-    assert "Delete CDC infrastructure" not in _notice(r["G2-resume"][0])[3]
+    # G19's own copy: a never-started stack's seeded start names no Delete CDC
+    # infrastructure remedy. DELIBERATE G25 UPDATE: a resume does -- the stack streamed, so
+    # a new start point needs new CDC topics first (decision B; A2 refuses a newer one).
+    assert "Delete CDC infrastructure" not in _notice(r["G2-seeded"][0])[3]
+    assert (
+        "Or Delete CDC infrastructure on the CDC step, deploy it again (a new stack has no "
+        "committed offset"
+    ) in _notice(r["G2-resume"][0])[3]
     assert _notice(r["G2-seeded"][0])[2] == G2_HEADER
 
 
@@ -1080,7 +1091,8 @@ def test_g20_a_seed_a_new_stack_would_start_from_is_offered_after_the_redeploy(
         body = _notice(verdict, origin=origin, migration_type=migration_type)[3]
         assert _HELD_POINT_LEAD in body and _NEW_POINT_LEAD not in body, kw
         assert "the offset seeder keeps the committed offset whenever the new point" in body
-        assert "set the source's gtid_mode back to ON_PERMISSIVE until cut over" in body
+        # G25 (A2): keeping the point on THIS stack would be refused -- only the redeploy.
+        assert "set the source's gtid_mode back to ON_PERMISSIVE until cut over" not in body
 
 
 def test_g20_a_seed_a_new_stack_would_refuse_keeps_the_new_start_point_remedy() -> None:

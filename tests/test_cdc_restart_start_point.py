@@ -183,14 +183,19 @@ def test_a_manual_point_before_where_the_stack_streamed_is_disclosed_as_not_appl
     assert "Ready to resume CDC" in " ".join(ui.texts)
 
 
-def test_a_manual_point_on_a_stack_whose_start_is_unknown_is_applied_only_if_past():
+def test_a_manual_point_on_a_stack_whose_start_is_unknown_is_refused():
     # Committed offset but no recorded deployed watermark (a CDC-only history): the point
-    # is offered, and applied only if it is past where streaming already reached.
+    # cannot be shown to be at or before where streaming reached. DELIBERATE G25 UPDATE (A2):
+    # it used to be offered ("applied only if it is past"), which moves the stream forward
+    # under the sink's unapplied tail; Start CDC now refuses it, naming the route.
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER
+
     state = _manual_state(("mysql-bin-changelog.000009", 4))
     blob = " ".join(_card(state).texts)
     assert "Resuming from the last streamed position" not in blob
-    assert "is applied only if it is past the position this stack already streamed" in blob
-    assert "Start point set — binlog mysql-bin-changelog.000009:4" in blob
+    assert NEWER_POINT_HEADER in blob and "its last Start offered no start offset" in blob
+    assert "is applied only if it is past" not in blob
+    assert "Start point set" not in blob and "Action needed" in blob
 
 
 def test_a_gtid_only_manual_entry_is_not_a_start_point():
@@ -243,22 +248,35 @@ def test_the_locked_badge_does_not_promise_a_stop_can_rewind_the_start_point():
     )
     tips = " ".join(ui.tooltips)
     assert "To change it, stop CDC first." not in tips
-    assert "never rewinds" in tips
-    assert "delete the CDC infrastructure and deploy again" in tips
+    # G25 (A2): after a Stop Start CDC continues; ANY other start point needs a new stack.
+    assert "is applied only if it is past" not in tips
+    assert (
+        "After a Stop, Start CDC continues from the committed position; a different start "
+        "point (earlier or later) needs Delete CDC infrastructure and deploy it again first."
+    ) in tips
 
 
-def test_start_button_after_a_new_full_load_is_a_watermark_start_not_a_resume():
-    ui = _RecordingUi()
+def test_start_button_after_a_new_full_load_on_a_streamed_stack_is_refused():
+    # DELIBERATE G25 UPDATE (A2): a Full Load watermark the stack's start cannot be compared
+    # with (it recorded none) is not a resume -- it used to be a "Ready to start CDC" seeded
+    # start, which moves the stream forward under the sink's unapplied tail.
+    from tests.test_ui_data_migration import _StartButtonUi
+
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER
+
+    ui = _StartButtonUi()
     _cdc_ui._render_cdc_start_button(ui, _state(), _JM(_job()), lambda: None,
                                      inventory=None, session=None)
     blob = " ".join(ui.texts)
     assert "Ready to resume CDC" not in blob
     assert "continues from exactly where streaming stopped" not in blob
-    assert "Ready to start CDC" in blob
-    assert "Set the CDC start point above first." not in blob
+    assert "Ready to start CDC" not in blob and NEWER_POINT_HEADER in blob
+    assert ui.start_disabled is True
 
 
-def test_start_point_card_after_a_new_full_load_shows_the_watermark_start():
+def test_start_point_card_after_a_new_full_load_on_a_streamed_stack_refuses_it():
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER
+
     ui = _CardUi()
     _cdc_ui._render_cdc_source_config_card(
         ui, _state(), _JM(_job()), lambda: None, inventory=None,
@@ -266,7 +284,15 @@ def test_start_point_card_after_a_new_full_load_shows_the_watermark_start():
     )
     blob = " ".join(ui.texts)
     assert "Resuming from the last streamed position" not in blob
-    assert "Automatic — gapless from Full Load (recommended)" in blob
+    assert "Automatic — gapless from Full Load (recommended)" not in blob
+    assert "Automatic — from the Full Load watermark" in blob and NEWER_POINT_HEADER in blob
+    # Never started: the gapless Automatic handoff, as before.
+    first = _CardUi()
+    _cdc_ui._render_cdc_source_config_card(
+        first, _state(committed=False), _JM(_job()), lambda: None, inventory=None,
+        migration_type=MigrationType.FULL_LOAD_AND_CDC, session=None,
+    )
+    assert "Automatic — gapless from Full Load (recommended)" in " ".join(first.texts)
 
 
 def test_plain_restart_from_the_same_watermark_keeps_the_resume_copy():
@@ -383,13 +409,18 @@ def test_the_mysql_manual_option_asks_for_a_binlog_position_not_a_gtid():
     assert "Manual — enter a GTID or binlog position" not in blob
 
 
-def test_a_manual_point_on_a_streamed_stack_names_the_skipped_window():
+def test_a_manual_point_on_a_streamed_stack_is_refused_with_the_route():
+    # DELIBERATE G25 UPDATE (A2): it used to be "applied only if it is past ... not
+    # replicated" -- the forward seed under the sink's unapplied tail Start CDC now refuses.
     state = _state(committed=True)  # streamed; its start watermark unknown
     state.set_cdc_start_mode("manual")
     state.set_cdc_start_position(binlog_file="mysql-bin-changelog.000009", binlog_pos=4)
     blob = _card_text(state, job=SimpleNamespace(watermark=None, status="DONE"))
-    assert "past the position this stack already streamed to" in blob
-    assert "not replicated" in blob.lower()
+    assert "past the position this stack already streamed to" not in blob
+    assert (
+        "To start from a new start point, use Delete CDC infrastructure and deploy it again "
+        "(the new stack starts with empty topics), then Re-run Full Load"
+    ) in blob
 
 
 def test_a_new_full_load_resets_a_stale_manual_start_point():
@@ -1027,44 +1058,49 @@ def _selected(state):
 _MANUAL_DISCLOSURE = "Manual — start from a later binlog position instead"
 
 
-def test_a_stopped_cdc_only_stack_offers_the_manual_route_its_refusals_name(monkeypatch):
-    # CDC only, streamed then stopped (e.g. after a replay crash): a plain Start resumes
-    # with schema_only. The diagnosis and the E1 copy name "choose Manual, Fetch current
-    # position and Use this start point" as the way forward, so the resume card must have
-    # it -- it used to return before any Manual control was rendered.
-    import asyncio
-
+def test_a_stopped_cdc_only_stack_names_new_topics_for_a_later_start_point(monkeypatch):
+    # CDC only, streamed then stopped (e.g. after a replay crash): a plain Start resumes with
+    # schema_only. DELIBERATE G25 UPDATE (A2): a start point past where this stack streamed
+    # needs new CDC topics -- the sink would apply its unapplied tail over the rows corrected
+    # since, while the source skipped the changes before the point -- so the diagnosis names
+    # Delete CDC infrastructure first and the Manual alternative on the NEW stack, the resume
+    # card offers no Manual control, and a Manual point set anyway is refused with the route.
     from dsql_migrator.core.cdc_deployer import _diagnose_connector_log
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER
 
     d1 = _diagnose_connector_log("src", "internal schema size 4, but UPDATE size 3")
-    assert "choose Manual, Fetch current position and Use this start point" in d1
+    assert d1.index("Delete CDC infrastructure and deploy it again") < d1.index(
+        "On the new stack you can instead choose Manual, Fetch current position and Use this "
+        "start point"
+    )
     state = _selected(_state())  # committed offset; CDC only: no watermark was seeded
-    ui, by, calls = _live_card(monkeypatch, state, migration_type=MigrationType.CDC_ONLY)
+    state.migration_type = MigrationType.CDC_ONLY
+    ui, by, _calls = _live_card(monkeypatch, state, migration_type=MigrationType.CDC_ONLY)
     blob = " ".join(ui.texts)
     assert "Resuming from the last streamed position" in blob
-    assert _MANUAL_DISCLOSURE in blob
+    assert _MANUAL_DISCLOSURE not in blob
     assert "Manual — enter a binlog file:position" not in blob  # no radio on a resume
-    assert "Fetch current position" in by and "Use this start point" in by
-    # Following it moves the start point FORWARD on this same stack.
-    asyncio.run(by["Fetch current position"].on_click())
-    assert calls == [["app.orders"]]  # the card hands Fetch the captured tables
-    by["Use this start point"].on_click()
-    assert state.cdc_start_mode() == "manual"
+    assert "Fetch current position" not in by and "Use this start point" not in by
+    # A Manual point set before (a restored session): refused, with the CDC only route.
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(binlog_file="mysql-bin.000200", binlog_pos=77)
     seed, origin = _cdc_ui._cdc_start_seed(state, None, SourceType.MYSQL)
-    assert origin == "manual"
-    assert (seed.binlog_file, seed.binlog_position) == ("mysql-bin.000200", 77)
-    assert seed.table_fingerprints == _FPS
-    assert _cdc_ui.cdc_start_resumes(state, seed, SourceType.MYSQL) is False
+    assert origin == "manual" and _cdc_ui.cdc_start_resumes(state, seed, SourceType.MYSQL) is False
     after = " ".join(
         _live_card(monkeypatch, state, migration_type=MigrationType.CDC_ONLY)[0].texts
     )
     assert "Resuming from the last streamed position" not in after
-    assert "Start point set — binlog mysql-bin.000200:77" in after
+    assert NEWER_POINT_HEADER in after and "Start point set" not in after
+    assert "then Start CDC on the new stack" in after
+    # Automatic (no Full Load watermark here) would continue the stream: said.
+    assert "set the CDC start point back to Automatic" in after
 
 
-def test_a_history_missing_resume_says_it_rebuilds_and_offers_the_manual_route(monkeypatch):
-    # The flagged next Start runs recovery after the start-point check, which can refuse
-    # with "choose Manual ..."; the card must not claim "nothing re-applied, no choice".
+def test_a_history_missing_resume_says_it_rebuilds_and_names_new_topics(monkeypatch):
+    # The flagged next Start runs recovery after the start-point check; the card must not
+    # claim "nothing re-applied, no choice". DELIBERATE G25 UPDATE: if that check names a
+    # changed table, a start point after the change needs new CDC topics (A2), so the card
+    # names that route and the topics' condition, and offers no Manual control.
     from dsql_migrator.core.cdc import mysql_snapshot_mode, start_point_check_due
 
     state = _selected(_state(deployed=("mysql-bin-changelog.000007", "108063011")))
@@ -1078,15 +1114,23 @@ def test_a_history_missing_resume_says_it_rebuilds_and_offers_the_manual_route(m
         blob = " ".join(ui.texts)
         assert "Resuming from the last streamed position" in blob
         assert "(snapshot.mode=recovery)" in blob and "nothing re-applied" not in blob
-        assert _MANUAL_DISCLOSURE in blob
-        assert "Fetch current position" in by and "Use this start point" in by
-    # A plain resume keeps its copy, with the same collapsed route.
+        assert (
+            "a start point after the change needs new CDC topics: Delete CDC infrastructure "
+            "and deploy it again"
+        ) in blob
+        assert "gapless only while the topics still retain them" in blob
+        assert "choose Manual below" not in blob
+        assert _MANUAL_DISCLOSURE not in blob and "Fetch current position" not in by
+    # A plain resume keeps its copy. (G25 round 6: it states the CDC topics' condition
+    # instead of "nothing re-applied" -- the sink re-applies from its last commit, and what
+    # it had not applied at the Stop comes only from the topics.)
     state.note_cdc_history_missing(False)
     ui, by, _calls = _live_card(
         monkeypatch, state, migration_type=MigrationType.FULL_LOAD_AND_CDC, job=_job()
     )
     blob = " ".join(ui.texts)
-    assert "nothing re-applied" in blob and _MANUAL_DISCLOSURE in blob
+    assert "gapless only while the topics still retain them" in blob
+    assert "nothing re-applied" not in blob and _MANUAL_DISCLOSURE not in blob
 
 
 def test_a_postgres_resume_offers_no_binlog_route():

@@ -10,6 +10,7 @@ package dev.dsqlmigrator.connect;
 
 import java.sql.SQLException;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Consumer;
 import java.util.function.LongUnaryOperator;
 
 /**
@@ -95,8 +96,20 @@ public final class OccRetry {
   public static <T> T withRetry(
       SqlWork<T> work, Runnable rollback, int maxAttempts, long baseBackoffMs)
       throws SQLException {
+    return withRetry(work, retried -> rollback.run(), maxAttempts, baseBackoffMs);
+  }
+
+  /**
+   * Production entry point that hands the step between attempts the error being retried (a
+   * {@code 40001} or an {@code XX000}), so a caller can count retries by SQLSTATE.
+   * {@code beforeRetry} must leave the connection with no open transaction; it runs between
+   * attempts only, never after the last one.
+   */
+  public static <T> T withRetry(
+      SqlWork<T> work, Consumer<SQLException> beforeRetry, int maxAttempts, long baseBackoffMs)
+      throws SQLException {
     return withRetry(
-        work, rollback, maxAttempts, baseBackoffMs, Thread::sleep, OccRetry::fullJitter);
+        work, beforeRetry, maxAttempts, baseBackoffMs, Thread::sleep, OccRetry::fullJitter);
   }
 
   /**
@@ -106,6 +119,19 @@ public final class OccRetry {
   static <T> T withRetry(
       SqlWork<T> work,
       Runnable rollback,
+      int maxAttempts,
+      long baseBackoffMs,
+      Sleeper sleeper,
+      LongUnaryOperator jitter)
+      throws SQLException {
+    return withRetry(
+        work, retried -> rollback.run(), maxAttempts, baseBackoffMs, sleeper, jitter);
+  }
+
+  /** Test/seam overload with the retried error (see the production one above). */
+  static <T> T withRetry(
+      SqlWork<T> work,
+      Consumer<SQLException> beforeRetry,
       int maxAttempts,
       long baseBackoffMs,
       Sleeper sleeper,
@@ -123,7 +149,7 @@ public final class OccRetry {
         if (!retriesInProcess(e) || attempt >= maxAttempts) {
           throw e;
         }
-        rollback.run(); // the next attempt starts on a clean transaction
+        beforeRetry.accept(e); // the next attempt starts on a clean transaction
         long capped = backoffCapMs(attempt, baseBackoffMs);
         long delay = jitter.applyAsLong(capped + 1);
         try {

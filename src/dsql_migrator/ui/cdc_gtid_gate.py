@@ -64,6 +64,7 @@ from dsql_migrator.core.cdc_coords import (
     normalize_gtid_set,
 )
 from dsql_migrator.ui.cdc_start_point_gate import (
+    NEW_TOPICS,
     NO_SEED_LABEL,
     PROBLEM_NO_SOURCE,
     PROBLEM_READ_FAILED,
@@ -465,43 +466,67 @@ def _reload_suffix(migration_type: object) -> str:
     return "" if _cdc_only(migration_type) else f" {RELOAD_RESETS_MANUAL}"
 
 
+# G25: a Start CloudFormation rolled back may have streamed into this stack's CDC topics, so a
+# NEW start point there needs new topics first (the Full Load step refuses a new one, and Start
+# CDC a newer one): said before a remedy that would offer one.
+ROLLED_BACK_NEW_POINT = (
+    "This stack's last Start rolled back, so a new start point needs new CDC topics: use "
+    f"{NEW_TOPICS} first."
+)
+
+
 def _no_gtid_body(
-    verdict: GtidStartVerdict, point: str, coord: str, origin: str, migration_type: object
+    verdict: GtidStartVerdict,
+    point: str,
+    coord: str,
+    origin: str,
+    migration_type: object,
+    rolled_back: bool = False,
 ) -> str:
     if verdict.resumes:
+        # A resume: the stack streamed, so a new start point needs a new stack (G25).
         return (
             f"{_capitalized(point)} has no GTID set, and the source's gtid_mode is ON now. A "
             "stack started from such a point streamed by binlog file:position — while "
             "gtid_mode was not ON — or was started by an earlier version of the tool, so "
             "the position it recorded may hold no GTID set to continue from, and continuing "
             "by GTID could re-read changes or skip some with no error. "
-            f"{_keep(_STOPPED_AT)} {_new_point(_STOPPED_AT, migration_type)}"
+            f"{_keep(_STOPPED_AT)} {_new_point(_STOPPED_AT, migration_type, redeploy=True)}"
         )
     if origin == "manual":
+        fetch = (
+            f"{ROLLED_BACK_NEW_POINT} Then choose Fetch current position on the new stack and "
+            "Use this start point"
+            if rolled_back
+            else "Choose Fetch current position and Use this start point"
+        )
         return (
             f"{_LEAD} {_capitalized(point)} has no GTID set — it was entered without one, "
             "fetched while the source's gtid_mode was not ON, or restored from a session "
             "an earlier version of the tool saved (which did not keep a GTID set with its "
             "position) — so Debezium would read "
             "the source's whole retained binary log again from its beginning and re-apply "
-            "changes made before it. Choose Fetch current position and Use this start "
-            "point: it records the binlog file:position and the GTID set together "
-            f"({_since_clause(coord, migration_type)}). If the source's gtid_mode was ON at "
-            f"{coord}, you can instead enter the GTID set it had executed at exactly that "
-            "position (for example the one your dump recorded) and Use this start point. "
-            f"{_keep(coord)}{_reload_suffix(migration_type)}"
+            f"changes made before it. {fetch}: it records the binlog file:position and the "
+            f"GTID set together ({_since_clause(coord, migration_type)}). If the source's "
+            f"gtid_mode was ON at {coord}, you can instead enter the GTID set it had executed "
+            "at exactly that position (for example the one your dump recorded) and Use this "
+            f"start point. {_keep(coord)}{_reload_suffix(migration_type)}"
         )
     return (
         f"{_LEAD} {_capitalized(point)} has no GTID set: the source reported none when it "
         "was captured, because its gtid_mode was not ON then (or no transaction had a GTID "
         "yet). Debezium would therefore read the source's whole retained binary log again "
         "from its beginning and re-apply changes the Full Load already copied. "
-        f"{_keep(coord)} {_new_point(coord, migration_type)}"
+        f"{_keep(coord)} {_new_point(coord, migration_type, redeploy=rolled_back)}"
     )
 
 
 def _mode_changed_body(
-    verdict: GtidStartVerdict, point: str, coord: str, migration_type: object
+    verdict: GtidStartVerdict,
+    point: str,
+    coord: str,
+    migration_type: object,
+    rolled_back: bool = False,
 ) -> str:
     captured = verdict.captured_mode or "not ON"
     lead = (
@@ -509,17 +534,18 @@ def _mode_changed_body(
         "and it is ON now."
     )
     if verdict.resumes:
+        # A resume: the stack streamed, so a new start point needs a new stack (G25).
         return (
             f"{lead} This stack streamed from that point by binlog file:position, so the "
             "position it recorded holds no GTID set to continue from, and continuing by "
             "GTID would re-read changes or skip some with no error. "
-            f"{_keep(_STOPPED_AT)} {_new_point(_STOPPED_AT, migration_type)}"
+            f"{_keep(_STOPPED_AT)} {_new_point(_STOPPED_AT, migration_type, redeploy=True)}"
         )
     return (
         f"{lead} With gtid_mode=ON Debezium starts from a GTID set, and the changes the "
         "source wrote without a GTID after that point cannot be streamed that way: MySQL "
         "stops the connector on them, or skips them with no error. "
-        f"{_keep(coord)} {_new_point(coord, migration_type)}"
+        f"{_keep(coord)} {_new_point(coord, migration_type, redeploy=rolled_back)}"
     )
 
 
@@ -540,15 +566,18 @@ def _stack_mode_body(
             f"{lead} {_keep(_STOPPED_AT)} "
             f"{_new_point(_STOPPED_AT, migration_type, redeploy=True)}"
         )
+    # A seeded start on this stack (G25, A2): Start CDC does not take a start point newer
+    # than where a streamed stack last started (its sink would apply older changes over
+    # newer rows), and one at or before it is a resume -- so only a new stack starts there.
+    route = _new_point(
+        _STOPPED_AT, migration_type, redeploy=True, keep_held=verdict.seed_fits_new_stack
+    )
     return (
-        f"{lead} A new start point cannot replace that offset: the offset seeder keeps the "
-        "committed offset whenever the new point is not later than it, and Start CDC "
-        "cannot see where that offset is. "
-        f"{_keep(f'{coord} (or from where this stack stopped, if that is later)')} "
-        + _new_point(
-            _STOPPED_AT, migration_type, redeploy=True,
-            keep_held=verdict.seed_fits_new_stack,
-        )
+        f"{lead} A new start point cannot replace that offset on this stack: Start CDC does "
+        "not take a start point newer than where this stack last started, and the offset "
+        "seeder keeps the committed offset whenever the new point is not later than it. "
+        # The redeploy is the only way here, not an alternative to keeping the point.
+        + _capitalized(route[len("Or "):] if route.startswith("Or ") else route)
     )
 
 
@@ -632,7 +661,12 @@ def _malformed_body(point: str, coord: str, migration_type: object) -> str:
 
 
 def _not_usable_body(
-    verdict: GtidStartVerdict, point: str, coord: str, origin: str, migration_type: object
+    verdict: GtidStartVerdict,
+    point: str,
+    coord: str,
+    origin: str,
+    migration_type: object,
+    rolled_back: bool = False,
 ) -> str:
     if verdict.reason == REASON_CHECK_FAILED:
         return _check_failed_body(verdict, origin)
@@ -651,32 +685,47 @@ def _not_usable_body(
             "GTID set, so those changes can no longer be streamed."
         )
     purged = verdict.reason == REASON_PURGED
+    # G25: after a Start CloudFormation rolled back, a remedy that takes a new start point runs
+    # on a new stack (a corrected GTID set for the same position does not): said first.
+    first = f" {ROLLED_BACK_NEW_POINT} Then" if rolled_back else ""
+    on_new = " on the new stack" if rolled_back else ""
     if origin == "manual":
-        remedy = (
-            " " + ("Choose" if purged else "Correct the GTID set you entered, or choose")
-            + " Fetch current position and Use this start point: it records the GTID set "
-            f"together with the position ({_since_clause(coord, migration_type)})."
-            + _reload_suffix(migration_type)
-        )
+        if rolled_back:
+            remedy = (
+                ("" if purged else " Correct the GTID set you entered, or give CDC a new start "
+                 "point.")
+                + f"{first} choose Fetch current position{on_new} and Use this start point: it "
+                "records the GTID set together with the position "
+                f"({_since_clause(coord, migration_type)}).{_reload_suffix(migration_type)}"
+            )
+        else:
+            remedy = (
+                " " + ("Choose" if purged else "Correct the GTID set you entered, or choose")
+                + " Fetch current position and Use this start point: it records the GTID set "
+                f"together with the position ({_since_clause(coord, migration_type)})."
+                + _reload_suffix(migration_type)
+            )
     elif _cdc_only(migration_type):
         remedy = (
-            " Give CDC a new start point: choose Manual, then Fetch current position and "
-            f"Use this start point. Changes made between {coord} and the new point are then "
-            "not replicated: correct them on Aurora DSQL and validate with CHECKSUM."
+            f"{first or ' Give CDC a new start point:'} choose Manual{on_new}, then Fetch "
+            f"current position and Use this start point. Changes made between {coord} and "
+            "the new point are then not replicated: correct them on Aurora DSQL and validate "
+            "with CHECKSUM."
         )
     else:
         remedy = (
-            " Re-run Full Load for all tables with \"Drop & reload\" for a new start point"
+            f"{first} Re-run Full Load for all tables with \"Drop & reload\" for a new start "
+            "point"
             + (
                 " (raise the source's binlog retention first, for example CALL "
                 "mysql.rds_set_configuration('binlog retention hours', 168))"
                 if purged
                 else ""
             )
-            + ", or choose Manual, then Fetch current position and Use this start point: "
-            f"changes to the captured tables between {coord} and that point are then not "
-            "replicated, so reload them with \"Drop & reload\" and validate with CHECKSUM. "
-            + RELOAD_RESETS_MANUAL
+            + f", or choose Manual{on_new}, then Fetch current position and Use this start "
+            f"point: changes to the captured tables between {coord} and that point are then "
+            "not replicated, so reload them with \"Drop & reload\" and validate with "
+            "CHECKSUM. " + RELOAD_RESETS_MANUAL
         )
     return f"{_LEAD} {cause}{remedy}"
 
@@ -688,29 +737,34 @@ def gtid_start_notice(
     coord: str,
     origin: str,
     migration_type: object,
+    rolled_back: bool = False,
 ) -> Optional[tuple[str, str, str, str]]:
     """``(tone, icon, header, body)`` for a refusal (the Start dialog, the job), or None.
 
     ``point_label`` / ``coord`` name the start point as the start-point check does
     (:func:`~dsql_migrator.ui.cdc_start_point_gate.point_label` /
     :func:`~dsql_migrator.ui.cdc_start_point_gate.point_coord`); ``origin`` is the seed's
-    (``"full_load"`` / ``"manual"``). Pure.
+    (``"full_load"`` / ``"manual"``). ``rolled_back``: CloudFormation rolled back this stack's
+    last Start (G25), so a remedy that takes a new start point runs on a new stack -- as on
+    every resume, the stack's connectors were started before. Pure.
     """
     if verdict is None or not verdict.blocks:
         return None
     header, icon = _header_icon(verdict)
     if verdict.kind == KIND_NO_GTID:
-        body = _no_gtid_body(verdict, point_label, coord, origin, migration_type)
+        body = _no_gtid_body(verdict, point_label, coord, origin, migration_type, rolled_back)
     elif verdict.kind == KIND_MODE_CHANGED and verdict.stack_mode is not None:
         body = _stack_mode_body(verdict, coord, migration_type)
     elif verdict.kind == KIND_MODE_CHANGED:
-        body = _mode_changed_body(verdict, point_label, coord, migration_type)
+        body = _mode_changed_body(verdict, point_label, coord, migration_type, rolled_back)
     elif verdict.kind == KIND_UNREADABLE:
         body = _unreadable_body(verdict, point_label)
     elif verdict.kind == KIND_MALFORMED:
         body = _malformed_body(point_label, coord, migration_type)
     else:
-        body = _not_usable_body(verdict, point_label, coord, origin, migration_type)
+        body = _not_usable_body(
+            verdict, point_label, coord, origin, migration_type, rolled_back
+        )
     return "error", icon, header, body + _NO_CHANGE
 
 
@@ -866,6 +920,7 @@ __all__ = [
     "PROBLEM_NO_SOURCE",
     "PROBLEM_READ_FAILED",
     "REASON_CHECK_FAILED",
+    "ROLLED_BACK_NEW_POINT",
     "REASON_NOT_EXECUTED",
     "REASON_PURGED",
     "STACK_POINT_LABEL",

@@ -259,7 +259,8 @@ def test_upload_file_receives_the_hash_as_user_metadata(tmp_path: Path) -> None:
     p = _write(tmp_path, data)
 
     class _ManagedS3(_FakeS3):
-        def upload_file(self, filename, bucket, key, ExtraArgs=None):  # noqa: N803
+        # Config: the single-PUT TransferConfig (G25; pinned in tests/test_g25_s3_deploy.py).
+        def upload_file(self, filename, bucket, key, ExtraArgs=None, Config=None):  # noqa: N803
             self.calls.append(
                 (
                     "upload_file",
@@ -479,7 +480,21 @@ def test_only_the_engines_own_artifacts_are_uploaded_and_named(
 ) -> None:
     from dsql_migrator.core.models import SourceType
 
-    _paths(tmp_path, monkeypatch)
+    paths = _paths(tmp_path, monkeypatch)
+    # G25: each artifact goes to its content-addressed key, cdc-plugins/<sha256[:16]>/<name>.
+    by_base = dict(zip(
+        (
+            s3_provision.DEBEZIUM_PLUGIN_KEY,
+            s3_provision.DEBEZIUM_PG_PLUGIN_KEY,
+            s3_provision.DSQL_SINK_PLUGIN_KEY,
+            s3_provision.LAMBDA_SEEDER_KEY,
+        ),
+        paths,
+    ))
+    expected_keys = {
+        s3_provision._content_key(base, _sha256(by_base[base].read_bytes()))
+        for base in expected_keys
+    }
     s3 = _FakeS3(head_object=None)  # always upload
     result = ensure_and_upload_plugins(
         s3, _FakeSts(), "us-east-1", source_engine=getattr(SourceType, engine)

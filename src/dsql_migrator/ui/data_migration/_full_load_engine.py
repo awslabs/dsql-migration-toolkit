@@ -665,6 +665,11 @@ class FullLoadIncompleteError(RuntimeError):
     """
 
 
+class FullLoadRefusedError(RuntimeError):
+    """Raised by :func:`run_full_load` when its new-start-point gate refuses the run, before
+    anything is written or read (G25): its message's first line is the refusal."""
+
+
 class OverlayRunError(FullLoadIncompleteError):
     """A table's column-exclusion overlay could not be made safe, so the table fails
     closed BEFORE its first write (the other tables continue).
@@ -4050,6 +4055,110 @@ def _lob_excluded_note(migrator: "DataMigrator", table_name: str) -> str:
     return f" ({len(excluded)} column(s) excluded: {', '.join(excluded)}{null_note})"
 
 
+# ---------------------------------------------------------------------------
+# G25 (decision A): the new-start-point gate of a Full load + CDC migration
+# ---------------------------------------------------------------------------
+
+# A Full Load that takes a NEW start point (Start Full Load, Re-run all tables: a new
+# watermark) on a cdc-stack that has streamed, or rolled back a Start, comes after new CDC
+# topics. Stop CDC (and a rolled-back Start) removes the connectors without draining the sink,
+# whose consumer group resumes from its last commit: on the old topics it would re-apply
+# changes older than the new snapshot over the reloaded tables, while the source continues
+# from the new snapshot and skips the changes in between -- silently. Retry unfinished
+# tables, Reload specific tables and a G17 addition keep the original start point and
+# converge, so they are not gated.
+NEW_START_POINT_HEADER = "Delete CDC infrastructure and deploy it again before a new Full Load"
+# The CDC state is not read yet (or could not be): whether the stack has streamed is unknown,
+# so the gate holds, as the G17 addition guard does (_cdc_monitoring.cdc_addition_block_reason).
+NEW_START_POINT_UNREAD_HEADER = "A new Full Load start point waits until the CDC state is read"
+_NEW_START_POINT_WHY = (
+    "Stop CDC removes the sink without a drain (a rolled-back Start removes it mid-stream), so "
+    "its consumer group would re-apply changes older than the new snapshot over the reloaded "
+    "tables, while the source skips the changes between the old stop point and the new "
+    "snapshot."
+)
+# The MySQL form of the route pg_cdc_route names a PostgreSQL stack started before.
+_MYSQL_NEW_TOPICS_ROUTE = (
+    "use Delete CDC infrastructure and deploy it again (the new stack starts with empty "
+    "topics), then Re-run Full Load on the Full Load step choosing 'Drop & reload', then "
+    "Start CDC"
+)
+# The one-line form (a disabled button's tooltip, a click-time refusal, the engine's): a job
+# error keeps only its first line, capped at 300 characters, so it carries the reason and
+# the route on its own.
+_NEW_START_POINT_LINE = (
+    "This CDC stack has streamed, and its sink would re-apply changes older than a new "
+    "snapshot over the reloaded tables: Delete CDC infrastructure and deploy it again, then "
+    "Re-run Full Load choosing 'Drop & reload', then Start CDC."
+)
+_NEW_START_POINT_UNREAD_LINE = (
+    "The CDC state has not been read yet, so the tool cannot confirm that this CDC stack never "
+    "streamed (a new Full Load start point on one that has needs new CDC topics first). This "
+    "usually clears within seconds; if it does not, use Re-check CDC state on the CDC step."
+)
+_NEW_START_POINT_PROBE_ERROR_LINE = (
+    "The CDC state could not be read, so the tool cannot confirm that this CDC stack never "
+    "streamed (a new Full Load start point on one that has needs new CDC topics first). The "
+    "CDC step shows the error: fix the AWS access and use Re-check CDC state there."
+)
+
+
+def new_start_point_block(migration_state, engine) -> "Optional[tuple[str, str, str]]":
+    """``(header, body, line)`` when a Full Load that takes a NEW start point must not run on
+    this migration, else ``None`` (G25, decision A). Pure (state reads only).
+
+    Only a Full load + CDC migration is gated. Its cdc-stack has streamed or rolled back a
+    Start (:func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_stack_has_streamed`, one
+    answer for both engines): the run waits for new CDC topics -- Delete CDC infrastructure
+    and deploy it again, then the Full Load with Drop & reload, then Start CDC (on PostgreSQL
+    the route rule's own words, :func:`~dsql_migrator.core.cdc_pg_slot.pg_cdc_route`). Not read
+    yet, or unreadable (``cdc_stack_phase_checked`` False): it waits for the read, since an
+    unread stack may have streamed. ``line`` is the one-line form, under 300 characters: the
+    tooltip of the disabled action, the refusal at its click and the engine's
+    (:func:`new_start_point_refusal`). The gate does not depend on CDC streaming now: while
+    it does, the Full Load step's own "Stop CDC first" gate comes first."""
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_stack_has_streamed
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_AND_CDC:
+        return None
+    if cdc_stack_has_streamed(migration_state):
+        if engine is SourceType.POSTGRES:
+            from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
+
+            route = pg_cdc_route(None, started=True, cdc_only=False)
+        else:
+            route = _MYSQL_NEW_TOPICS_ROUTE
+        body = (
+            "Start Full Load and Re-run all tables take a new start point, and this "
+            "migration's CDC stack has streamed, or rolled back a Start. "
+            f"{_NEW_START_POINT_WHY} {route[:1].upper()}{route[1:]}. Retry unfinished tables "
+            "and Reload specific tables keep the original start point, so they are not "
+            "affected."
+        )
+        return NEW_START_POINT_HEADER, body, _NEW_START_POINT_LINE
+    if not getattr(migration_state, "cdc_stack_phase_checked", False):
+        line = (
+            _NEW_START_POINT_PROBE_ERROR_LINE
+            if getattr(migration_state, "cdc_probe_error", None)
+            else _NEW_START_POINT_UNREAD_LINE
+        )
+        return NEW_START_POINT_UNREAD_HEADER, line, line
+    return None
+
+
+def new_start_point_refusal(migration_state, engine) -> Optional[str]:
+    """The refusal of a Full Load that takes a new start point, or ``None`` (G25): the one-line
+    form of :func:`new_start_point_block` first (a job error keeps only its first line), then
+    the notice's body. What a caller of :func:`run_full_load` evaluates for its
+    ``start_point_refusal``. Pure."""
+    block = new_start_point_block(migration_state, engine)
+    if block is None:
+        return None
+    _header, body, line = block
+    return line if body == line else f"{line}\n{body}"
+
+
 def run_full_load(
     handle: JobHandle,
     tables: Sequence[TableDef],
@@ -4063,8 +4172,17 @@ def run_full_load(
     # do not exercise that path keep working -- but the UI DOES pass it, because an
     # unsynced identity sequence is a post-cut-over duplicate-key failure.
     inputs: "Optional[DataMigrationInputs]" = None,
+    # G25 (decision A): the new-start-point gate, re-checked on this thread before the run
+    # writes or reads anything -- the refusal (new_start_point_refusal over the session's
+    # state), or None. Defaulted: a caller that passes none is never refused.
+    start_point_refusal: "Optional[Callable[[], Optional[str]]]" = None,
 ) -> None:
     """Drive the Full Load export/import pipeline for the selected ``tables``.
+
+    ``start_point_refusal`` (G25) runs first: a refusal ends the run before its chunks
+    are seeded, its watermark captured (a PostgreSQL Full load + CDC capture replaces the
+    replication slot) or anything else read or written -- one ``run refused`` activity line,
+    then :class:`FullLoadRefusedError`, whose first line (the job error) is the refusal's.
 
     Seeds one chunk per selected table, captures the export watermark once and
     persists it on the job (Requirement 5.7 / Property 11), then migrates each
@@ -4087,6 +4205,17 @@ def run_full_load(
     """
     job_id = handle.job_id
     table_names = [table.name for table in tables]
+    refusal = start_point_refusal() if start_point_refusal is not None else None
+    if refusal:
+        # No chunk is seeded: a refused record with PENDING tables would offer "Retry
+        # unfinished tables", a load with no start point at all.
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "run refused",
+            status=ActivityStatus.FAILURE,
+            detail=f"nothing was read or written: {refusal}",
+        )
+        raise FullLoadRefusedError(refusal)
     handle.update(lambda job: _seed_chunks(job, table_names))
     log_activity(
         ActivityCategory.FULL_LOAD,
@@ -4395,9 +4524,16 @@ PG_OBJECTS_UNREADABLE = (
     "Not loaded: CDC's publication and replication slot could not be read on the source "
     "({cls}). Nothing was written; use Retry unfinished tables again."
 )
+# {fix}: cdc_pg_slot.publish_list_fix. Re-run all tables alone reuses the publication as it is
+# (provisioning repairs only publish_via_partition_root), and setting the list back does not
+# bring back the changes committed while it was narrowed -- pgoutput judges each change
+# against the publication as it stood at its commit -- so the fix comes first, then the run
+# that takes a new start point (G25, decision C). Unticking the table does not restore the
+# list for the other captured tables: Start CDC refuses the narrowed publication either way.
 PG_DML = (
     "Not loaded: publication \"{pub}\" does not publish every change type (INSERT, UPDATE "
-    "and DELETE). Re-run all tables, or untick it."
+    "and DELETE). {fix} first, then Re-run all tables (a new start point: the changes "
+    "committed while the list was narrowed are not in CDC's stream)."
 )
 PG_IDENTITY_NOT_FULL = (
     "Not loaded: this re-keyed table (or one of its partitions) is not REPLICA IDENTITY "
@@ -4414,6 +4550,15 @@ PG_IDENTITY_UNUSABLE = (
     "Not loaded: the table has no usable REPLICA IDENTITY on the source ({cause}), so once "
     "in CDC's publication every UPDATE and DELETE on it would fail there; it was not added. "
     "To fix it, {remedy}, then re-run the prerequisite checks and retry it."
+)
+# PostgreSQL 18: the re-key needs FULL, which a generated column makes fail every UPDATE and
+# DELETE once published, and DEFAULT does not carry the composite key -- so neither identity
+# is the fix: removing the re-key is (cdc_pg_slot.REKEYED_FULL_REFUSED_REMEDY, G25).
+PG_REKEYED_FULL_REFUSED = (
+    "Not loaded: this re-keyed table needs REPLICA IDENTITY FULL, and on PostgreSQL 18 a "
+    "published FULL table with generated columns fails every UPDATE and DELETE on the "
+    "source; DEFAULT does not carry its composite key. To fix it, {remedy}, then re-run "
+    "the prerequisite checks and retry it."
 )
 PG_IDENTITY_UNREADABLE = (
     "Not loaded: whether the table (and each of its partitions) has a usable REPLICA "
@@ -5978,6 +6123,15 @@ class BatchedTableMigrator:
             if read is None:
                 out[table] = PG_IDENTITY_UNREADABLE
                 continue
+            if table in rekey and read.full_refused:
+                # PostgreSQL 18, a generated column: FULL (the re-key) and DEFAULT (not the
+                # re-key) both fail it, so neither is advised -- the rows below alternated
+                # between them and never named the fix (G25). Its partitions inherit the
+                # generated columns, so a partitioned table is no exception.
+                out[table] = PG_REKEYED_FULL_REFUSED.format(
+                    remedy=cdc_pg_slot.REKEYED_FULL_REFUSED_REMEDY
+                )
+                continue
             problem = cdc_pg_slot.replica_identity_problem(read)
             if problem:
                 out[table] = PG_IDENTITY_UNUSABLE.format(
@@ -6082,7 +6236,8 @@ class BatchedTableMigrator:
             out.update({n: PG_OBJECTS_GONE.format(slot=slot, pub=pub) for n in remaining})
             return
         if objects.publication_publishes_all_dml is False:
-            out.update({n: PG_DML.format(pub=pub) for n in remaining})
+            refusal = PG_DML.format(pub=pub, fix=cdc_pg_slot.publish_list_fix(pub))
+            out.update({n: refusal for n in remaining})
             return
         if objects.publication_via_partition_root is False:
             try:

@@ -73,6 +73,8 @@ Aurora DSQL は外部キーを **強制** し、ツールはロード後（CDC �
 
 > **経験則:** 差異がドリフト、意図的な隔離（サイズ超過の値）、またはまだ収束していない CDC のいずれかで説明できるだけであれば、その移行は健全です。行数が一致し追いついたテーブルにおける、**説明のつかない** 欠落 / 余分な PK こそが、Validation が浮き彫りにするために存在するものです。
 
+> **レポート自身の復旧カード。** 不一致が **説明のつかない** ものである場合、レポートは順序のあるクリック手順とともに **How to recover** を表示します。CDC スタックが **ストリーミングしたことのある** — Start の後に停止した、コネクタがそのまま残っている、または CloudFormation が Start をロールバックしたスタック — または CDC の状態をまだ読み取っていない (アプリの再起動後、Data Migration ステップが読み取るまで。カードはそう述べ、読み取った後はそのスタックの状態に合った手順を示します) **Full load + CDC** または **CDC only** のマイグレーションでは、そのバックフィルが **新しい開始位置** を取るため、手順は新しい CDC トピックを先に置きます: CDC が動いていれば Stop CDC → **Delete CDC infrastructure** して再デプロイ → **Drop & reload** で **Re-run Full Load** (一部が失敗していれば **Re-run all tables**) → **Start CDC** (新しい Full Load の開始位置から始まります) → **Re-run validation**。CDC only では、再デプロイの後の手順でマイグレーションの種類を、Full Load ステップのある Full load + CDC に切り替えます。そのようなスタックでは、インフラを再デプロイするまで Full Load ステップが新しい開始位置を拒否します ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し)): 新しい開始位置を取った Full Load の後の再開には **ギャップがない保証がなく**、だからこそ新しいトピックが先に来ます。ストリーミングしたことのないスタックでは手順はもっと短くなります (CDC only では、先にマイグレーションの種類を Full load + CDC に切り替えます → **Drop & reload** で **Re-run Full Load** (一部が失敗していれば **Re-run all tables**) → **Start CDC** (新しい Full Load の開始位置から始まります) → **Re-run validation**)。上記の手順から Stop CDC と再デプロイを除いたもので、その再デプロイを終えた後もカードはこの手順を示します: CDC は新しい開始位置から始まり、append はそれより古い行をそのまま残すため、ここでも再実行は **Drop & reload** です。**Full load only** ではカードは *Re-run Full Load to backfill the gap* で、再実行の次に **Re-run validation** となり、CDC の手順はありません。**1 つのテーブル** だけを再ロードするのは別です: 特定のテーブルの **Drop & reload** は **元の** 開始位置を維持するため、5.5〜5.7 のテーブルごとの対処手順はまったく制限されません。ターゲットにソースにない行がある場合、カードは *The target holds rows the source does not — a delete never landed* と述べます: 再実行は行を埋めるだけなので、カードはそのテーブルごとの再ロード (CDC を停止して **Reload specific tables**、**Drop & reload** を選択。CDC only では、マイグレーションの種類を Full load + CDC に切り替えてから) を示します。CDC only でこのセッションに Full Load の記録がない場合は再ロードするテーブルがないため、代わりに新しい Full Load の開始位置を示します: CDC が動いていれば Stop CDC し、**Delete CDC infrastructure** して再デプロイしてから (ストリーミングしたことのある、または CDC の状態をまだ読み取っていないスタックの場合)、マイグレーションの種類を Full load + CDC に切り替え、その Full Load を **Drop & reload** で実行して **Start CDC** します。
+
 Validation がクリーンな **MATCH**（またはすべての差異が説明済み）を報告し — CDC 移行では 5.5 のデッドレター確認も解消すると — 最後のワークフロー手順である **Cut over** が UI に表示され、アプリケーションをソースデータベース（RDS/Aurora MySQL または PostgreSQL）から DSQL へ切り替えるためのランブックが提供されます。Full load only では、Cut over にはレポートが Full Load 以降に選択したすべてのテーブルを対象にしていることも必要です: そのようなテーブルのうちレポートに行がないものがあると、それをロードして Validation を再実行するまで（または **Objects to validate** でそのチップをオフにするまで）Cut over は保留されます。Full load + CDC（および CDC only）でも、Full Load の後に選択してその開始点の下でロードしたテーブルについて同じです: レポートにそのテーブルの行がなければ、Validation を再実行するまで Cut over は保留されます。Full load + CDC で Full Load の後（CDC を開始する前）にチェックを外したテーブルは検証されません。Validation はまだ選択されているテーブルを比較します。最後のレポートがその変更より前のものなら、Validation を再実行してください。カットオーバーのシーケンス（CDC ドレイン対 Full Load フリーズ）とロールバックのアンカーについては、[結論](10-conclusion.md) の推奨されるエンドツーエンドのフローを参照してください。
 
 > **コマンドラインで検証（任意）。** この組み込みの Validation に加えて、2 つの読み取り専用 CLI
@@ -96,6 +98,7 @@ Validation がクリーンな **MATCH**（またはすべての差異が説明�
   1. 各デッドレター対象テーブルが、最新のデッドレターレコードより **1 分以上後に開始した** CHECKSUM 比較で一致した;
   2. ツールが、**最新の Validation が終わった後に開始した**、CloudWatch Logs の CDC デッドレターログの **成功した完全な読み取り** を行った;
   3. その読み取りの履歴が **Full Load のウォーターマーク**（CDC only では CDC の開始）まで遡る。
+- **保留された変更はまだデッドレターではありません。** シンクが一意インデックスのために保留した変更（[§4.4](04-cdc-and-dsql-constraints.md#44-sink-がデータパスで-dsql-の制約を処理する方法)）は、待機が終わったときにはじめてデッドレターになるため、その間の読み取りはそれを数えられません: 最終検証の前に、ソースの最後の書き込みから少なくとも 5 分待ってください（[§10.3](10-conclusion.md#103-カットオーバー-アプリケーションを-dsql-へ切り替える) の手順 3）。そのテーブルの Stream lag が待機を示します。
 - **再起動。** テーブルごとの件数、最新時刻、ドリフトの種類はアプリの再起動後も残りますが、Data Migration ステップのレコード一覧は残りません。再起動後、Cut over はログを自動的に読み直します — Validation または Cut over ステップが描画されるたびに範囲の限られた読み取りを 1 回、最大 1 分に 1 回です。
 
 **フェイルクローズ** で動作します。次の場合、Cut over はランブックの代わりに赤い通知を表示します:
@@ -113,7 +116,7 @@ CHECKSUM は値を比較できない列を明示します（5.1）。デッド�
 一致しないテーブルの **対処手順**:
 
 - **Full Load + CDC:** ソースのスキーマが変わった場合は Step 1（Evaluation）を再実行 → Stop CDC → **Drop & reload** でテーブルをリロード → Start CDC → 再確認。
-- **CDC only:** Aurora DSQL 上の行を手作業で修正（dead-letter queue カードに各レコードの主キーと Kafka オフセットが表示されます）→ 再確認。ソースの `TRUNCATE` のデッドレターはどの行も示しません: Stop CDC → ソースにもう存在しない行をトランザクションあたり最大 3,000 行ずつ削除 → Start CDC → 再確認（[§4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要)）。
+- **CDC only:** Aurora DSQL 上の行を手作業で修正（dead-letter queue カードに各レコードの主キーと Kafka オフセットが表示され、キーの値は整数か UUID のときだけ表示されます）→ 再確認。カードがキーの値を伏せるテーブルには **Start over** を使ってください。ソースの `TRUNCATE` のデッドレターはどの行も示しません: Stop CDC → ソースにもう存在しない行をトランザクションあたり最大 3,000 行ずつ削除 → Start CDC → 再確認（[§4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要)）。
 
 **Full Load only** は影響を受けません。ただし同じセッションで先に CDC を実行していた場合、そのとき記録されたデッドレターには引き続き CHECKSUM での一致が必要です。
 

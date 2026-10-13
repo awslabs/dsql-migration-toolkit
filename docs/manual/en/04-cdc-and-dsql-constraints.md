@@ -35,7 +35,9 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
   PostgreSQL/pgoutput connector has no schema-history topic), and a **heartbeat**
   topic that keeps the committed source position advancing during idle windows — the
   binlog offset for MySQL, and for PostgreSQL the slot's confirmed LSN (which also
-  stops WAL accumulating) — so a restart can still resume gaplessly.
+  stops WAL accumulating) — so a restart's source position is not left behind by an idle
+  window (the restart is gapless only while the CDC topics still retain the changes the
+  sink had not applied: §4.3).
 - **The custom DSQL sink connector** — a Java Kafka Connect plugin this project
   owns — applies the changes to DSQL. Both connectors run on **managed MSK
   Connect**; the tool runs **no sink compute of its own**, it is the control
@@ -134,14 +136,15 @@ CDC then resumes for that table.
   takes no constraint); the warning gives the `ADD CONSTRAINT … CHECK (…) NOT VALID`
   statement that adds it.
 
-Every rejection in the table below, and a target table that no longer exists
-(`42P01`), a unique-key conflict (`23505`; its row names the unique index and both causes
-it can have — a primary-key change or a unique value moved between rows, see §4.4, and a
-composite-key table's leading-column update, see §4.6) or a value the sink cannot bind
-(`07006`), gets a banner row the same way, for you to resolve by hand (the tool never drops or
-rewrites target data automatically); a source `TRUNCATE` gets its own (below). Any
-other dead letter gets no banner row of its own and shows up only in the dead-letter
-queue card:
+Every rejection in the table below, and a target table that no longer exists (`42P01`),
+a unique-key conflict (`23505`; its row names the unique index and the causes it can
+have — a primary-key change or a unique value moved between rows, see §4.4, a
+composite-key table's leading-column update, see §4.6, and a source that dropped or
+relaxed that `UNIQUE` index, which CDC does not replicate: drop it on Aurora DSQL too)
+or a value the sink cannot bind (`07006`), gets a banner row the same way, for you to
+resolve by hand (the tool never drops or rewrites target data automatically); a source
+`TRUNCATE` gets its own (below). Any other dead letter gets no banner row of its own and
+shows up only in the dead-letter queue card:
 
 - a rejection with any other SQLSTATE (for example `22P02`, `22007`/`22008`, `22021`,
   `23503` or `54000`), listed with that SQLSTATE;
@@ -174,10 +177,21 @@ To backfill the rows already set aside: with **Full Load + CDC**, re-run Step 1
 (Evaluation), Stop CDC, reload the table with **Drop & reload** (it recreates the new
 key, type, NULL rule and ENUM values unless you edited its DDL in Schema Conversion),
 Start CDC, then re-check it in Validation (CHECKSUM is automatic for it); with **CDC
-only**, correct them on Aurora DSQL by hand (the dead-letter queue card lists each
-primary key) or use **Start over**. Other data errors (`22P02`, `22007`/`22008`,
+only**, correct them on Aurora DSQL by hand or use **Start over**: the dead-letter queue
+card names each record's primary key but shows a key value only when it is an integer or a
+UUID (any other is withheld), so use Start over for a table whose key values it withholds.
+Other data errors (`22P02`, `22007`/`22008`,
 `22021`, …) are listed in the dead-letter queue card with their SQLSTATE only; like
 every dead-lettered table, Cut over holds the table until it matches by CHECKSUM.
+For a target table that no longer exists, a unique-key conflict or a value the sink
+cannot bind, the banner's notice reads *Stop CDC and reload these tables*; with **CDC
+only** it reads *Stop CDC and repair these tables*: Stop CDC, confirm the table exists
+on the target (re-apply it in Schema Conversion if it does not), correct the
+dead-lettered rows on Aurora DSQL by hand (at most 3,000 rows per transaction), then
+Start CDC and run Validation, or use **Start over**, as for a table whose key values the
+card withholds. A table dropped on the target also
+lost every row applied before the drop, which no dead letter lists: use Start over for
+it.
 
 **A value its column cannot hold exactly** (MySQL or PostgreSQL source) is refused, not
 written. Before writing, the sink checks each number against its Aurora DSQL column,
@@ -337,32 +351,83 @@ the bulk load and the stream.
    > **This describes a `Full load + CDC` run.** It is the slot created *during* that
    > load that makes the handoff free of a re-read, and a PostgreSQL slot cannot be
    > created at a past position. If you ran **`Full load only`** and come back to CDC
-   > later, streaming is still lossless but the source connector creates its own
-   > publication and slot and **re-snapshots every selected table first** — the data is
-   > read a second time. See [Chapter 10 §10.1](10-conclusion.md) for choosing between
-   > them. On MySQL the binary log retains history with no consumer, so a later CDC
-   > start resumes from the watermark with no re-read.
+   > later, streaming is still lossless but the source connector creates its own slot,
+   > sets the publication to the selected tables and **re-snapshots every selected
+   > table first** — the data is read a second time (on a CDC stack whose connectors were
+   > started before, Start CDC instead continues from that stack's own slot if its source
+   > connector streamed (otherwise Debezium snapshots every selected table first): gapless
+   > only while the CDC topics still retain what the sink had not applied). See
+   > [Chapter 10 §10.1](10-conclusion.md)
+   > for choosing between them. On MySQL the binary log retains history with no
+   > consumer, so a later CDC start on a CDC stack that has never streamed starts from
+   > the watermark with no re-read. On one that has streamed, Start CDC refuses that newer
+   > start point: set the migration type to CDC only, then on its CDC step Delete CDC
+   > infrastructure and deploy it again before Start CDC (Full load only has no CDC step;
+   > [Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Either way
+   > CDC starts from the watermark and carries only the changes after it, so if that Full
+   > load only run appended to rows an earlier load left on the target, first Re-run Full
+   > Load choosing **Drop & reload**.
 
    If you untick tables after the Full Load (Full load + CDC, before CDC starts; [§13.7](13-excluding-tables-and-columns.md)), CDC captures only the tables still selected and resumes from the same watermark or slot, so the handoff stays gapless for them. On PostgreSQL, when CDC resumes from that slot, the publication still lists the unticked tables (the tool does not remove them on the source) and the connector discards their changes; a Start that re-snapshots instead lets the connector set the publication to the captured tables. A Re-run Full Load over the smaller set reuses the existing publication.
 
-   A table you tick after the Full Load (Full load + CDC, before CDC starts) is loaded first, by Retry unfinished tables after the checks in [§13.7](13-excluding-tables-and-columns.md), and CDC then captures it from the same watermark or slot (a MySQL table the Full Load recorded no start-point definition for needs Re-run all tables instead); Start CDC waits until it is loaded. On MySQL, CDC replays every change made to it since the watermark over the newer copy. On PostgreSQL the table joins CDC's publication just before its copy starts, and CDC streams every change made to it from then on over that copy. Either way it converges; a change that briefly conflicts on a unique index can be dead-lettered, and Cut over then waits for a CHECKSUM validation.
-3. **For a MySQL source**, a Start at a **new start point** — the first Start, a
-   Start after a newer Full Load or Manual point, or the first Start after Delete CDC
+   A table you tick after the Full Load (Full load + CDC, before CDC starts) is loaded first, by Retry unfinished tables after the checks in [§13.7](13-excluding-tables-and-columns.md), and CDC then captures it from the same watermark or slot (a MySQL table the Full Load recorded no start-point definition for needs Re-run all tables, with **Drop & reload**, instead); Start CDC waits until it is loaded. On MySQL, CDC replays every change made to it since the watermark over the newer copy. On PostgreSQL the table joins CDC's publication just before its copy starts, and CDC streams every change made to it from then on over that copy. Either way it converges; a change that briefly conflicts on a unique index can be dead-lettered, and Cut over then waits for a CHECKSUM validation.
+3. **For a MySQL source**, a Start at a **new start point** — the first Start (from the
+   Full Load watermark or a Manual point), or the first Start after Delete CDC
    infrastructure — runs the source connector with **`snapshot.mode=recovery`**:
    because an offset is already seeded, Debezium rebuilds its internal **schema
    history** from the **current source tables** (so it can decode binlog events)
    **without re-reading any row data**, then resumes from the seeded offset. Start
    CDC first checks that the captured tables have not changed since that start point
-   ([Chapter 6](06-limitations.md)). A **restart after Stop CDC** runs
+   ([Chapter 6](06-limitations.md)). On a stack that has streamed, Start CDC refuses a
+   newer Full Load or Manual point (*This CDC stack cannot start from a newer start
+   point*) until the infrastructure is deployed again: its topics may hold changes no sink
+   applied, which its sink would write over anything loaded since, while the source would
+   skip every change between where it stopped and the new point
+   ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). After a first
+   Start that CloudFormation rolled back, it refuses a later point than that Start offered,
+   and every start point once the app has restarted: the stack does not record that offer.
+   A **restart after Stop CDC** runs
    **`snapshot.mode=schema_only`** instead: it replays the recorded schema history
    and applies any DDL in binlog order. Such a restart, like any automatic connector
    restart, continues from the position Debezium recorded — on `gtid_mode=ON`, after
-   the GTID set it last committed. **For a PostgreSQL source**, the Debezium
+   the GTID set it last committed. Stop CDC removes both connectors without draining the
+   sink, so the changes the sink had not applied when CDC stopped reach Aurora DSQL on that
+   restart only from the CDC topics, re-applied from the sink's last commit (idempotent, so
+   nothing is duplicated): the restart is gapless only while the topics still retain them —
+   their retention period on MSK. The *Ready to resume CDC* card and the *Resuming from the
+   last streamed position* start-point card state that condition; neither promises *no gap*
+   or that nothing is re-applied. **For a PostgreSQL source**, the Debezium
    pgoutput connector has no schema-history topic: on the gapless path it runs with
    **`snapshot.mode=never`** (the logical slot already holds the start LSN and the
    rows are loaded), while a stand-alone / manual start uses **`initial`** (snapshot
    then stream). Debezium PostgreSQL can only resume from the slot's own
-   position — it cannot seek an arbitrary WAL LSN.
+   position — it cannot seek an arbitrary WAL LSN. A Start after Stop CDC continues from
+   the slot's position (where streaming stopped, or the Full Load's start point if its
+   source connector never streamed); with `initial`, though, a source connector that never completed
+   its snapshot (its task failed, or CDC was stopped, first) snapshots every selected
+   table again — a full re-read of the source. Stop CDC removes the connectors without
+   draining them, so the changes the sink had not applied by then reach Aurora DSQL only
+   from the CDC topics: such a Start is gapless only while the topics still retain them,
+   which Start CDC does not check. Once their retention period on MSK has passed, it would
+   skip them, so the Start CDC card (*Ready to resume CDC*) and the start-point card
+   (*Resuming from this stack's replication slot*) name the route to take instead: that of
+   a stack whose connectors were started before (new topics first; see the PostgreSQL note
+   below). The **Stop CDC** dialog states the same condition before you stop — for either
+   source — and on PostgreSQL it names that route for after the retention period. A Start that snapshots is refused for a captured table that has inheritance
+   (`INHERITS`) child tables (*CDC cannot snapshot a table that has inheritance child
+   tables*), because Debezium's snapshot reads it with its children's rows
+   ([Chapter 6](06-limitations.md)). If the tool can read the source but not which
+   captured tables have any, it refuses such a Start too (*Whether a captured table has
+   inheritance child tables could not be read*): check that the tool can reach the source,
+   then Start CDC again. If it cannot read the source at all — for example a Secrets
+   Manager source after an app restart, before you test the connection again — Start CDC
+   is not blocked, but its PostgreSQL pre-start checks do not run (the publication, the
+   replication slot and its position, and the inheritance read): the Start CDC dialog
+   warns *CDC's publication and replication slot could not be checked*, with the reason,
+   and the activity log records *PostgreSQL publication and slot checks not run*
+   (WARNING), from the dialog and again from the Start CDC job when it goes ahead without
+   them. Test the source connection on the Connect step, then open Start CDC again so they
+   run.
 
 The result: every change between the snapshot and "now" is applied exactly once.
 Because the sink's applies are **idempotent** (keyed by PK), even an overlap or a
@@ -373,16 +438,167 @@ retry can't create duplicates.
 > position yet. RDS/Aurora purge binlogs aggressively by default (Aurora MySQL
 > keeps them 24 h), and deploying the CDC stack takes ~15–20 min, so **raise binlog
 > retention before you start** — see [§1.1](01-setup.md#11-prerequisites). If the
-> segment is already gone, CDC can't resume gaplessly and you'd re-run Full Load to
-> capture a fresh watermark.
+> segment is already gone, CDC can't resume gaplessly and you'd re-run Full Load with
+> **Drop & reload** to capture a fresh watermark (an append would keep the rows already
+> loaded as they were) — on a stack that has streamed, after Delete CDC infrastructure
+> and a new deploy, because the Full Load step refuses a new start point until then
+> ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
 >
-> **PostgreSQL: the logical replication slot pins the WAL for you.** From the
-> moment the slot is created it holds the required WAL, so nothing is purged out
-> from under you — the prerequisite is `wal_level=logical` (RDS/Aurora
-> `rds.logical_replication`), not binlog retention. But the slot must stay healthy:
-> if it falls too far behind and Postgres reports `wal_status='lost'` (slot
-> invalidated), gapless resume is broken and you must re-run Full Load to capture a
-> fresh watermark.
+> **PostgreSQL: the logical replication slot pins the WAL for you.** From the moment the
+> slot is created it holds the required WAL, so nothing is purged out from under you — the
+> prerequisite is `wal_level=logical` (RDS/Aurora `rds.logical_replication`), not binlog
+> retention. But the slot must stay healthy: if it falls too far behind and Postgres
+> reports `wal_status='lost'` (slot invalidated), gapless resume from it is broken, and
+> Start CDC blocks and names the way out (below): with Full load + CDC, re-run Full Load
+> with **Drop & reload** to capture a fresh watermark, after Delete CDC infrastructure and
+> a new deploy if the stack's connectors were started before. The CDC monitor's slot panel reports the same slot
+> as *Replication slot invalidated* and names that route in full: Delete CDC infrastructure
+> and deploy it again, then Re-run Full Load with **Drop & reload**, then Start CDC; with CDC
+> only, Delete CDC infrastructure and deploy it again, then Start CDC on the new stack, which
+> snapshots every selected table (that type has no Full Load step to re-run). The slot's name
+> derives from the CDC stack name, so two migrations of one source that use the same stack name
+> share it. The Full Load
+> never drops a slot of that name that is in use or belongs to another database (it stops
+> before any write instead). So where a slot of that name exists but CDC cannot use it —
+> another database's, or not a logical `pgoutput` slot — every block names that slot's own fix
+> first (drop it, or give this migration its own CDC stack name), ahead of any Full Load
+> re-run, which would refuse such a slot before any write; the block for a missing slot says
+> the same, and such a slot is reported before a captured table's inheritance children, whose
+> own fix is that very re-run. On a CDC stack's first Start — while the stack records no
+> Start of its connectors, not even one whose CloudFormation update rolled back, and MSK
+> Connect lists none of its connectors — Start CDC refuses to resume from a slot that is
+> no longer at the Full Load's start point (*CDC's replication slot is not at this Full
+> Load's start point*: another run with the same CDC stack name re-created or read it, and
+> resuming would skip the changes in between): re-snapshot every table, or Re-run Full
+> Load with **Drop & reload** (under its own CDC stack name if another migration shares
+> this one) — with CDC only, after switching the migration type to Full load + CDC. The routes for a stack
+> whose connectors were never started are below. A stack whose connectors were started
+> before — stopped since, with its connectors still in place (as for Retry CDC; connectors
+> of the stack that MSK Connect lists count whatever the stack's status), or with a last
+> Start whose CloudFormation update rolled back (any `UPDATE_ROLLBACK_*` status: complete,
+> in progress, failed or cleanup in progress) — is never judged on the slot's position:
+> its own source connector may have moved the slot. A Full Load that would take a new start
+> point is refused on such a stack until the CDC infrastructure is deleted and deployed again
+> ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)), so nothing here
+> describes a resume from a slot a Full Load re-created after this stack had streamed. The check
+> reads only what the stack records
+> and which of its connectors MSK Connect lists, so a refused Start, a Start that failed
+> before it updated the stack, an app restart and Start over all leave the next Start
+> judged the same way. It cannot see another migration that uses the same CDC stack name
+> and re-creates the slot after this stack has streamed, or after this stack's first Start
+> rolled back, so give each migration its own CDC stack name.
+>
+> **On a stack whose connectors were started before**, the CDC topics may still hold
+> changes that no sink applied: Stop CDC and a rolled-back Start remove the connectors
+> without draining them, and this stack's sink resumes from its last commit, so a Full
+> Load re-run on the old topics would have those changes applied over the reloaded tables.
+> A re-snapshot cannot be relied on there either: once the source connector has streamed,
+> Debezium skips the snapshot on every later Start. So on such a stack a block for a
+> missing publication, a publication that misses a selected table, or a missing,
+> invalidated or unusable slot says so and names one route, new topics first: Delete CDC
+> infrastructure and deploy it again (the new stack starts with empty topics), then Re-run
+> Full Load with **Drop & reload** (it creates the slot again at its own snapshot point),
+> then Start CDC; with CDC only, Delete CDC infrastructure and deploy it again, then Start
+> CDC on the new stack, which snapshots every selected table (a row deleted on the source
+> in between stays on Aurora DSQL; Validation reports it as an EXTRA row). For the same
+> reason the inheritance block (*CDC cannot snapshot a table that has inheritance child
+> tables*), whose own fix is a Full load + CDC run, ends there by asking you to Delete CDC
+> infrastructure and deploy it again before that Full Load. The block for a slot of that
+> name it cannot use names the route as a step after its own fix (drop that slot, or use a
+> different CDC stack name). No **Re-snapshot every table instead** is offered on such a
+> stack. The diagnosis of a source connector that fails with Debezium's *Publication
+> autocreation is disabled* (read only on a stack whose connectors were started) names the
+> same route for both migration types, after Stop CDC if the CDC step still shows the
+> connectors.
+>
+> **After a Start that CloudFormation rolled back**, the next Start continues from the
+> position that Start recorded, if it recorded one: its source connector may have
+> streamed, and committed its position, before the rollback deleted it, which is why such
+> a Start counts. Otherwise, with `snapshot.mode=never`, it continues from the slot's
+> confirmed position, with no snapshot; with `initial` (Manual included), from where an
+> earlier run stopped streaming. With `initial`, though, Debezium continues without a
+> snapshot only from a recorded position whose initial snapshot had completed: if that
+> Start (or the earlier run) had not completed its initial snapshot, or nothing was
+> recorded, it snapshots every selected table first, then streams from the slot. So the
+> Start CDC card (*Ready to start CDC again*), the start-point card above it (*Starting
+> again after a rolled-back Start*, which offers no start point or re-snapshot there) and
+> the Start's activity-log line say just that: with `initial`, they promise neither a
+> snapshot nor its absence. The changes that Start streamed exist only in the CDC topics,
+> which outlive the rollback, and the next sink applies them from there: starting CDC
+> again is gapless only while the topics still retain them, which Start CDC does not
+> check. Once their retention period on MSK has passed since that Start, use Delete CDC
+> infrastructure and deploy it again, then Re-run Full Load with **Drop & reload**, then
+> Start CDC (with CDC only, Delete CDC infrastructure and deploy it again: its first Start
+> CDC snapshots every selected table). If CDC had been **stopped** before that rolled-back
+> Start, the cards say so and count that period from the **Stop** instead (*since CDC was
+> stopped*): the changes the sink had not applied when CDC stopped are the oldest in the
+> topics, so they expire first. One case goes unchecked: on a stack whose first
+> Start rolled back, a Start that sends `snapshot.mode=initial` does not check that the
+> slot exists. An absent slot there is normally one the failed connector never created,
+> and that Start snapshots with no gap; but if that connector streamed and the slot was
+> dropped since, that Start skips every change made in between.
+>
+> Before a block offers **Re-snapshot every table instead**, the Start CDC dialog, as it
+> opens, runs the checks of the Start that remedy would unlock (`snapshot.mode=initial`)
+> and offers it only if they pass. It is offered only on a stack whose connectors were
+> never started, for a missing publication, a missing slot or a slot that is not at the
+> Full Load's start point. If that Start would be refused for the block's own reason, the
+> block is shown with no second notice and ends with the route that works there; if for
+> another — for example a captured table has inheritance child tables, or a slot of that
+> name exists but cannot be used (an invalidated one, say) — the dialog shows that refusal
+> too, introduced by *Re-snapshot every table is not offered here: a Start that
+> re-snapshots is refused too.* It then names the route that works there. After an
+> inheritance refusal (or a failed read of them), that is Re-run Full Load with
+> **Drop & reload** instead, which creates the slot again at its own snapshot point, so
+> the Start CDC after it takes no snapshot; with CDC only, which has no Full Load step,
+> switch the migration type to Full load + CDC first. After the refusal of a slot of that
+> name it cannot use, it is a step after that refusal's own fix (drop that slot, or use a
+> different CDC stack name): then Re-run Full Load with **Drop & reload**, then Start CDC
+> (with CDC only, Start CDC again). A publication that misses a selected table is refused
+> for its own reason (the Start that re-snapshots grades the publication's coverage too),
+> so its block ends with its route: Re-run Full Load with **Drop & reload**, which adds
+> each missing selected table to the publication and creates the slot again at its own
+> snapshot point, then Start CDC (with CDC only, Delete CDC infrastructure and deploy it
+> again: it drops the publication, so the new stack's Start CDC can create one over the
+> selected tables). The Start CDC job runs the publication and slot checks again before it
+> creates any connector (Retry CDC opens no dialog). On a stack never started, its refusal
+> for a publication that misses a selected table, or for a slot of that name it cannot
+> use, ends with the same route; for a missing publication, a missing slot or a slot that
+> is not at the Full Load's start point it names both ways out: Re-snapshot every table
+> instead (the Start CDC dialog offers it when the Start that re-snapshots passes its own
+> checks), or Re-run Full Load with **Drop & reload**, then Start CDC (with CDC only,
+> after switching the migration type to Full load + CDC). If those checks cannot read the
+> source, the remedy stays, and the dialog warns *The re-snapshot route could not be
+> checked*; the activity log records *PostgreSQL re-snapshot route check not run*
+> (WARNING). The publication and slot checks did run then, and the Start CDC job runs the
+> re-snapshot's own checks before it creates any connector (it goes ahead without them if
+> it cannot read the source either). *CDC's publication and replication slot could not be
+> checked* is shown only when the publication and slot checks themselves cannot read the
+> source (above).
+>
+> **A publication restricted to a subset of INSERT/UPDATE/DELETE** blocks Start CDC too
+> (*CDC's publication does not publish every change type*), and that block names its own fix
+> first: as the publication's owner, run `ALTER PUBLICATION … SET (publish = 'insert,
+> update, delete')` on the source. That alone is not enough, and the block says so: pgoutput
+> decides what to publish from the publication as it stood when each change committed, so
+> setting the list back does not bring back the changes committed while it was narrowed, and
+> a Start that continues from the slot would still skip them. The route follows that fix —
+> on a stack whose connectors were never started, Re-run Full Load with **Drop & reload**,
+> then Start CDC (with CDC only, switch the migration type to Full load + CDC first); on one
+> whose connectors were started before, new topics first, as above. **Re-snapshot every
+> table instead** is never offered for it, because a re-snapshot — like a Full Load
+> re-run — reuses the publication exactly as it is.
+>
+> **The inheritance block's second fix is named only where the UI can carry it out.** *…or
+> untick `<the parent>`: each child table migrates as a table of its own* appears only while
+> the table picker can still change the set. Once a Start has been submitted the set is
+> locked, so the Start CDC job's own refusal never names it and only the Start from a Full
+> Load's snapshot point is left. And when such a Start snapshots only because **Re-snapshot
+> every table instead** was taken over a slot the Full Load recorded, the block names the way
+> back: **Resume from the Full Load's slot instead**, a control on the CDC start point card
+> that sets the start point back to Automatic — so a recorded re-snapshot never loops on the
+> same block. The control appears in exactly that state, and the re-snapshot notice (*Manual
+> re-snapshots instead of resuming from this load's slot*) names it too.
 
 > **Why `recovery` at a new start point and `schema_only` on a restart? (MySQL
 > source)** With a seeded offset present, Debezium takes its "resume" path and
@@ -408,8 +624,8 @@ classic MySQL/JDBC writer. Here is what it does for each constraint:
 |---|---|
 | **IAM-token auth (no password)** | Generates a short-lived IAM token (admin or standard) and uses it as the JDBC password over TLS; **refreshes before expiry** (15-min token, 2-min refresh margin) so long-running CDC never stalls on an expired token. |
 | **Optimistic concurrency (no locks)** | On `SQLSTATE 40001` it re-runs the conflicting **transaction** with exponential backoff + jitter (up to 10 attempts): one chunk of ≤3000 rows (safe because apply is idempotent), or one row while it applies row by row to isolate a rejected row. Each re-run starts on a clean transaction: the failed attempt is rolled back first, because Aurora DSQL can also report `40001` while a statement runs (`OC001`, after a schema change elsewhere on the cluster), not only at commit. CDC infrastructure deployed by an earlier version of the tool re-runs without that rollback: until you **Delete CDC infrastructure** and deploy it again, such a `40001` can dead-letter a healthy row (`25P02`). |
-| **Temporary service condition (`XX000` "server unavailable")** | Aurora DSQL documents `XX000` as temporary: the connection stays usable, and the whole transaction, `COMMIT` included, is to be run again. The sink handles it exactly like a `40001`: it rolls the failed attempt back and re-runs the **transaction** (one chunk, or one row) with the same exponential backoff + jitter, and the two share the 10-attempt budget. If it outlasts that budget, the sink reconnects and Kafka Connect redelivers the batch until Aurora DSQL answers again, so such a row is **never dead-lettered**. CDC infrastructure deployed by an earlier version of the tool dead-letters such a row instead (`XX000`) until you **Delete CDC infrastructure** and deploy it again. An `XX000` at commit can mean the commit landed. Every write is a PK-keyed upsert or delete, so the re-run is idempotent per primary key; on a table with a secondary `UNIQUE` index, though, it can be rejected (`23505`) for an intermediate image the landed chunk already replaced. If the commit had landed, the re-run's intermediate image is replaced by the row's later change in the same batch and skipped; any remaining conflict waits like any held change (the row below) and is dead-lettered only if it outlasts the 5-minute wait, and then, like every dead-lettered table, Cut over holds the table until it matches by CHECKSUM ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). Earlier infrastructure dead-letters it at once. While it lasts, the CDC step reports the sink as stalled ("The sink is not applying changes") and the sink connector log repeats `DSQL apply failed (transient sqlstate=XX000); Connect will retry`; the stream resumes on its own once Aurora DSQL answers. If `XX000` keeps recurring, contact AWS Support. |
-| **Unique indexes besides the primary key (`23505`)** | Aurora DSQL checks a unique index at once (only foreign keys can be deferred), so a change can be rejected while another row still holds its value. That is what an `UPDATE` of the primary key meets: Debezium replicates it as a delete of the old key and an insert of the new key, keyed differently, so the two can travel on different partitions and the insert can arrive first; a unique value passed from one row to another can do the same. The sink (plugin v53 or later) holds such a change, and every later change on its partition, until the change that frees the value has applied: it is tried again with a growing wait (500 ms up to 10 s) for at most 5 minutes from its first rejection, while every other partition keeps applying (the wait shows as lag on that partition). If a later change of the same row replaces it entirely — in the same batch, or in its partition's next batch, which the sink reads (without applying it) before it pauses the partition — the conflicting change is skipped instead. Past the 5 minutes it is dead-lettered with SQLSTATE `23505` and the index name (*a unique constraint rejected the row*). CDC infrastructure deployed by an earlier version of the tool dead-letters it at once, and the old row's delete then removes the row, until you **Delete CDC infrastructure** and deploy it again ([Chapter 6](06-limitations.md)). |
+| **Temporary service condition (`XX000` "server unavailable")** | Aurora DSQL documents `XX000` as temporary: the connection stays usable, and the whole transaction, `COMMIT` included, is to be run again. The sink handles it exactly like a `40001`: it rolls the failed attempt back and re-runs the **transaction** (one chunk, or one row) with the same exponential backoff + jitter, and the two share the 10-attempt budget. If it outlasts that budget, the sink reconnects and Kafka Connect redelivers the batch until Aurora DSQL answers again, so such a row is **never dead-lettered**. CDC infrastructure deployed by an earlier version of the tool dead-letters such a row instead (`XX000`) until you **Delete CDC infrastructure** and deploy it again. An `XX000` at commit can mean the commit landed. Every write is a PK-keyed upsert or delete, so the re-run is idempotent per primary key; on a table with a secondary `UNIQUE` index, though, it can be rejected (`23505`) for an intermediate image the landed chunk already replaced. If the commit had landed, the re-run's intermediate image is replaced by the row's later change in the same batch and skipped, on a table that is not re-keyed; any remaining conflict waits like any held change (the row below) and is dead-lettered only if it outlasts the 5-minute wait, and then, like every dead-lettered table, Cut over holds the table until it matches by CHECKSUM ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). Earlier infrastructure dead-letters it at once. While it lasts, the CDC step reports the sink as stalled ("The sink is not applying changes") and the sink connector log repeats `DSQL apply failed (transient sqlstate=XX000); Connect will retry`; the stream resumes on its own once Aurora DSQL answers. If `XX000` keeps recurring, contact AWS Support. |
+| **Unique indexes besides the primary key (`23505`)** | Aurora DSQL checks a unique index at once (only foreign keys can be deferred), so a change can be rejected while another row still holds its value. That is what an `UPDATE` of the primary key meets: Debezium replicates it as a delete of the old key and an insert of the new key, keyed differently, so the two can travel on different partitions and the insert can arrive first; a unique value passed from one row to another can do the same. The sink (plugin v53 or later) holds such a change, and every later change on its partition, until the change that frees the value has applied: it is tried again with a growing wait (500 ms up to 10 s) while every other partition keeps applying, for at most 5 minutes from its first rejection — or from the last transient failure (a dropped connection, or an `XX000` or `40001` that outlasted its retries) of the sink task that holds it, if that is later, so an Aurora DSQL outage that task sees does not use up the wait; one that only delays the freeing change on another sink task can. The wait shows as Stream lag on its table (§4.6). The 5 minutes apply to each held change: conflicts on one partition are waited out one after another, during a catch-up too. On a table that is not re-keyed, if a later change of the same row replaces it entirely (a plain delete, or an image of the same columns) — in the same batch, or in its partition's next batch, which the sink reads (without applying it) before it pauses the partition — the conflicting change is skipped instead (never dead-lettered). On a re-keyed (Composite key) table nothing is skipped. Past the 5 minutes it is dead-lettered with SQLSTATE `23505` and the index name (*a unique constraint rejected the row*). CDC infrastructure deployed by an earlier version of the tool dead-letters the conflicting change at once, and the old row's delete then removes the row, until you **Delete CDC infrastructure** and deploy it again ([Chapter 6](06-limitations.md)). A skipped change leaves its row's values on the target as they were until its replacement applies. So a change of another row that needs a value the skipped change would have freed (a unique value passed along several rows) waits for that replacement, and is dead-lettered after its 5 minutes when the replacement is queued behind it on its partition, or itself waits for a value that change's row still holds (then both are dead-lettered); like every dead-lettered table, Cut over then holds the table until it matches by CHECKSUM. |
 | **≤ 3000 rows per transaction** | Applies in chunks of ≤ 3000 rows (default batch 3000), one `commit()` per chunk. |
 | **No UPDATE-by-statement / replays** | Every change is an **idempotent upsert or delete keyed by PK**: `INSERT ... ON CONFLICT (pk) DO UPDATE` for inserts/updates, `DELETE ... WHERE pk = ?` for deletes (and Kafka tombstones). Re-applying the same event is safe. |
 | **Connections drop (idle close / token expiry / worker recycle)** | Detects a dead/half-open connection, reconnects with a fresh token, and **replays the same offsets** (safe because applies are idempotent) rather than dropping records. Connectivity errors are treated as transient and retried, not mistaken for poison rows. |
@@ -514,6 +730,11 @@ value.
   `8.5s behind`, `2m 10s behind`, `1h 4m behind`.
 - It is a true **time** lag, so it is accurate for **any** primary-key type and
   reflects update/delete lag too — not just the newest insert.
+- A change the sink **holds on a unique index** (§4.4) counts as lag on its table
+  while it waits — when it is held, on each retry and at each offset commit (about
+  once a minute) — with no insert, update or delete counted for it until it applies;
+  the lag drops once it applies or is dead-lettered. There is no per-partition lag:
+  the changes queued behind it on its partition show only through it.
 - **Fallback:** when the time metric isn't available yet (an older sink plugin, or
   the metric hasn't emitted a datapoint), the monitor falls back to a `MAX(pk)`
   **leading-edge** check and shows `N behind (PK)` (how many PK units the target's
@@ -522,7 +743,8 @@ value.
   measure.
 
 Lag is emitted strictly **best-effort** and never affects replication. Use "Stream
-lag → caught up" as the signal that it's safe to proceed to
+lag → caught up", at least 5 minutes after the source's last write (a held change's
+lag can take a minute or two to show), as the signal that it's safe to proceed to
 [cut-over](10-conclusion.md).
 
 ### Pipeline health and change flow
@@ -533,6 +755,18 @@ and a **"change flow"** status line — *Streaming*, *No changes flowing — idl
 poll vs sink send), so you can tell an idle stream from a stuck one at a glance. A
 **live stream-lag chart** plots the worst end-to-end lag over time, distinguishing
 "caught up" from a confirmed sink stall.
+
+A confirmed stall's notice points to the sink connector log. A repeating
+`Commit of offsets timed out` means the sink consumer was ejected from its group: Stop
+CDC and Start CDC to rejoin it. A repeating `DSQL apply failed (transient sqlstate=…)`
+means the sink keeps retrying writes that fail, and the SQLSTATE says why: `XX000` is a
+temporary Aurora DSQL condition (the sink resumes on its own; contact AWS Support if it
+lasts); `08xxx`, `57xxx` or `null` means the sink cannot reach the cluster (check that
+the cluster still exists, that the connector subnets reach its endpoint on port 5432 —
+security group, NAT gateway or Aurora DSQL VPC endpoint and its DNS — and that the
+connector's IAM role may still connect); `40001` means something else is writing the
+same rows on Aurora DSQL (stop it until cut over). Do not cut over until the sink send
+rate recovers.
 
 When a connector's task stops, its row turns red. If the connector's CloudWatch worker
 log shows a failure the tool recognizes — a MySQL DDL statement Debezium cannot parse, a
@@ -582,8 +816,12 @@ notices:
 - **Red — "Deletes on re-keyed tables can be lost":** a table (or one of its
   partitions) is below FULL. Run `ALTER TABLE <table> REPLICA IDENTITY FULL` on the
   source — on each partition too, since the parent does not propagate and a new
-  partition starts at `DEFAULT` — then choose **Check again**. Cut over is held.
-  Deletes made before the fix are not replayed. If the re-read itself fails, the notice
+  partition starts at `DEFAULT` — then choose **Check again** (on PostgreSQL 18, for a
+  table with a generated column, it names **Keep source PK** instead of FULL, and a failed
+  re-read keeps that; after an app restart, until the tool reads the source again, it
+  names FULL and adds that such a table needs **Keep source PK** instead; see
+  [Chapter 6](06-limitations.md)). Cut over is held. Deletes made before the fix are not
+  replayed. If the re-read itself fails, the notice
   says so: if the source credentials or network access changed, reconnect the source on
   the Connect step.
 - **Amber — "REPLICA IDENTITY is FULL again":** the fix is in, but deletes made while

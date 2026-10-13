@@ -159,6 +159,8 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     _fail_unfinished_chunks,
     _migrate_one_table,
     _migrate_tables_in_parallel,
+    new_start_point_block,
+    new_start_point_refusal,
     run_full_load,
     sync_identity_sequences_for_tables,
     _seed_retry_chunks,
@@ -239,6 +241,7 @@ from dsql_migrator.ui.data_migration._models import (
     COVERAGE_GAP_NOTICE_BODY,
     COVERAGE_GAP_NOTICE_BODY_STARTED,
     COVERAGE_GAP_NOTICE_PG_SUFFIX,
+    COVERAGE_GAP_NOTICE_PG_SUFFIX_STARTED,
     added_since_run_reason,
     retry_scope_block_reason,
     format_duration,
@@ -762,6 +765,20 @@ def build_data_migration_screen(
         if _restore_block:
             migration_state.set_error(_restore_block)
             return
+        # G25 (decision A): every run started here takes a NEW start point (Start Full Load,
+        # Re-run Full Load, Re-run all tables, the page header's Run); Retry unfinished
+        # tables, Reload specific tables and a G17 addition keep the original one and go
+        # through _run_retry_for instead. On a Full load + CDC migration whose CDC stack has
+        # streamed, or rolled back a Start, it waits for new CDC topics (and, while that
+        # state is not read yet, for the read): refused here, before anything changes, with
+        # the toast a click on the step's disabled action gets -- the page header's direct
+        # Run reaches this without that button or the Start dialog. The engine re-reads the
+        # gate on the job thread (start_point_refusal below).
+        _engine = session_source_type(session)
+        _start_point_block = new_start_point_block(migration_state, _engine)
+        if _start_point_block is not None:
+            ui.notify(_start_point_block[2], type="warning", position="top", multi_line=True)
+            return
         if not session.has_source():
             migration_state.set_error(
                 "Configure and test the source connection first, then start the "
@@ -943,6 +960,10 @@ def build_data_migration_screen(
                 accept_quarantined_rows=migration_state.accept_quarantined_rows,
                 accepted_quarantine_rows=migration_state.accepted_quarantine_rows,
                 inputs=inputs,
+                # G25: the same gate, re-read on the job thread before the run seeds a chunk
+                # or captures its watermark -- the CDC state can change after the check
+                # above (its probe runs off the event loop).
+                start_point_refusal=lambda: new_start_point_refusal(migration_state, _engine),
             )
 
         reset_stale_manual_start_point(
@@ -1311,6 +1332,12 @@ def build_data_migration_screen(
                     for name in _prereq_lob_columns
                     if getattr(_applied_now.get(name), "target_ddl", None)
                 }
+                # G25 (route rule B): on a PostgreSQL CDC stack whose connectors were started
+                # before, the publication/slot row defers to the Start CDC dialog, which judges
+                # them against the stack's own record -- read here, on the event loop.
+                from dsql_migrator.ui.data_migration._cdc_status import cdc_stack_has_streamed
+
+                _stack_started = bool(cdc_stack_has_streamed(migration_state))
                 report = await run.io_bound(
                     lambda: checker.check(
                         request,
@@ -1319,6 +1346,7 @@ def build_data_migration_screen(
                         lob_columns=_prereq_lob_columns,
                         overlay_columns=_prereq_overlay,
                         lob_limit_types=_prereq_limit_types,
+                        cdc_stack_started=_stack_started,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - surface as inline feedback
@@ -3091,14 +3119,117 @@ def build_data_migration_screen(
                                 # it here handed the operator a one-click route into a
                                 # dead start. (The app already says as much 1100 lines
                                 # away in _cdc_ui's start-point card.)
+                                # G25 (decision A2): a CDC stack that has streamed, or
+                                # rolled back a Start, continues only from where it stopped.
+                                # MySQL: Start CDC refuses on it a start point newer than
+                                # the one it streamed from (its sink would apply the changes
+                                # it had not applied over the reload). PostgreSQL: this run
+                                # did not touch the stack's slot, so CDC only continues
+                                # from it -- gapless only while the CDC topics retain what
+                                # the sink had not applied, and with a snapshot first when
+                                # its source connector never completed one. Full load only
+                                # has no CDC step, so the type switch always comes before a
+                                # Delete CDC infrastructure (rule F); and CDC from a Full
+                                # Load's watermark needs a copy Drop & reload made when
+                                # the run appended to rows already there (rule E).
+                                from dsql_migrator.ui.data_migration._cdc_status import (
+                                    cdc_stack_has_streamed,
+                                )
+
+                                _streamed = cdc_stack_has_streamed(migration_state)
                                 if _coverage_gap is not None:
+                                    _started = _cdc_started_for_migration(
+                                        migration_state, job_manager
+                                    )
                                     body = (
                                         COVERAGE_GAP_NOTICE_BODY_STARTED
-                                        if _cdc_started_for_migration(
-                                            migration_state, job_manager
-                                        )
+                                        if _started
                                         else COVERAGE_GAP_NOTICE_BODY
-                                    ) + (COVERAGE_GAP_NOTICE_PG_SUFFIX if _is_pg else "")
+                                    ) + (
+                                        (
+                                            COVERAGE_GAP_NOTICE_PG_SUFFIX_STARTED
+                                            if _started
+                                            else COVERAGE_GAP_NOTICE_PG_SUFFIX
+                                        )
+                                        if _is_pg
+                                        else ""
+                                    )
+                                elif _is_pg and _streamed:
+                                    from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
+
+                                    # No unconditional "no re-snapshot": this run recorded no
+                                    # slot, so the Start sends snapshot.mode=initial, which
+                                    # snapshots every selected table first when the stack's
+                                    # source connector never completed its initial snapshot
+                                    # (_cdc_ui._pg_resume_continues).
+                                    body = (
+                                        "To keep the target in sync with ongoing source "
+                                        "changes, set the migration type to \"CDC only\". "
+                                        "This migration's CDC stack was started before, so "
+                                        "Start CDC on its CDC step continues from that "
+                                        "stack's replication slot if its source connector "
+                                        "streamed (otherwise Debezium snapshots every "
+                                        "selected table first): gapless only while the CDC "
+                                        "topics still retain what the sink had not "
+                                        "applied; past that, "
+                                        + pg_cdc_route(None, started=True, cdc_only=True)
+                                        + ". Use the link below to jump to that setting."
+                                    )
+                                elif _streamed:
+                                    from dsql_migrator.ui.data_migration._cdc_ui import (
+                                        cdc_start_resumes,
+                                    )
+
+                                    _job_wm = getattr(
+                                        _current_job(
+                                            job_manager,
+                                            getattr(migration_state, "job_id", None),
+                                        ),
+                                        "watermark",
+                                        None,
+                                    )
+                                    if cdc_start_resumes(
+                                        migration_state, _job_wm, SourceType.MYSQL
+                                    ):
+                                        body = (
+                                            "To keep the target in sync with ongoing "
+                                            "source changes, set the migration type to "
+                                            "\"CDC only\": this Full Load's start point is "
+                                            "not newer than the one this migration's CDC "
+                                            "stack streamed from, so CDC continues from "
+                                            "where streaming stopped (gapless only while "
+                                            "the CDC topics still retain what the sink had "
+                                            "not applied). Use the link below to jump to "
+                                            "that setting."
+                                        )
+                                    else:
+                                        # A newer watermark, or a stack whose last Start
+                                        # rolled back (no position to compare): the safe
+                                        # route is a new stack either way, seeded from a
+                                        # copy Drop & reload made (rule E: this target held
+                                        # the old stream's rows, which an append keeps as
+                                        # they were). A Full load only re-run is not gated,
+                                        # so that re-run comes here, before the type switch;
+                                        # then the CDC step's Delete and deploy (rule F).
+                                        body = (
+                                            "This migration's CDC stack has streamed, or "
+                                            "rolled back a Start, so CDC from this Full "
+                                            "Load's watermark needs a new stack (that "
+                                            "stack's sink would apply the changes it had "
+                                            "not applied over the reload, and Start CDC "
+                                            "refuses a start point newer than the one it "
+                                            "streamed from) and a copy made with Drop & "
+                                            "reload: if this run appended, first Re-run "
+                                            "Full Load choosing 'Drop & reload' (an append "
+                                            "keeps the rows already on the target as they "
+                                            "were, and CDC from a watermark carries only the "
+                                            "changes after it). Then set the migration type "
+                                            "to \"CDC only\" (use the link below to jump to "
+                                            "that setting), and on its CDC step Delete CDC "
+                                            "infrastructure and deploy it again, then Start "
+                                            "CDC: the new stack streams from the Full Load's "
+                                            "watermark onto the loaded target."
+                                        )
                                 elif _is_pg:
                                     body = (
                                         "This run created no replication slot, so there "
@@ -3113,13 +3244,20 @@ def build_data_migration_screen(
                                         "setting."
                                     )
                                 else:
+                                    # Rule E: CDC from this watermark replays only the
+                                    # changes after it, so a run that appended to an
+                                    # earlier load's rows needs a Drop & reload re-run first.
                                     body = (
                                         "To keep the target in sync with ongoing source "
                                         "changes, set the migration type to "
                                         "\"CDC only\" — it streams from this Full Load's "
                                         "watermark onto the already-loaded target (no "
-                                        "re-snapshot). Use the link below to jump to that "
-                                        "setting."
+                                        "re-snapshot). If this run appended to rows an "
+                                        "earlier load left on the target, first Re-run "
+                                        "Full Load choosing 'Drop & reload': an append "
+                                        "keeps those rows as they were, and CDC from a "
+                                        "watermark carries only the changes after it. Use "
+                                        "the link below to jump to that setting."
                                     )
                                 if not infra_ready:
                                     body += (
@@ -3474,7 +3612,8 @@ def reset_stale_manual_start_point(
     migration_state, migration_type, source_type, *, log=None
 ) -> bool:
     """At a Full load + CDC run's Full Load (Start or Retry): drop a MySQL Manual CDC start
-    point entered before it, so the watermark this load captures is the gapless handoff.
+    point entered before it, so the job watermark -- the one this load captures, or the
+    original one a Retry or a Reload keeps -- is what Start CDC offers.
 
     A Manual binlog point is seeded instead of the job watermark (it is what the card
     shows), so one left over from an earlier CDC-only attempt or a restored session would
@@ -3493,10 +3632,13 @@ def reset_stale_manual_start_point(
         if point is not None and point.binlog_file and point.binlog_position is not None
         else "(no binlog position)"
     )
+    # G25: a Retry or a Reload resets it too, and captures no watermark; and on a stack that
+    # has streamed the next Start continues from its committed position (decision A2).
     detail = (
-        f"the Manual CDC start point {coord} was set before this Full Load; the "
-        "watermark this load captures is the gapless start point, so CDC start is back "
-        "to Automatic (choose Manual again after the load for a different point)"
+        f"the Manual CDC start point {coord} was set before this Full Load, so CDC start is "
+        "back to Automatic (this load's start point; a Retry or Reload keeps the original "
+        "one); on a stack that has streamed, Start CDC continues from its committed position "
+        "and refuses a newer start point"
     )
     if log is None:
         log_activity(

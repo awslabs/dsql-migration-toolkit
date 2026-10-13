@@ -1486,7 +1486,7 @@ class _PgSource:
         if "RELREPLIDENT" in up:
             return _Res([(n, "d") for n in params.get("names", [])])
         if up.startswith("ALTER PUBLICATION") and " ADD TABLE " in up:
-            schema, table = re.search(r'ADD TABLE "([^"]+)"\."([^"]+)"', sql).groups()
+            schema, table = re.search(r'ADD TABLE ONLY "([^"]+)"\."([^"]+)"', sql).groups()
             name = f"{schema}.{table}"
             if name in self.add_errors:
                 raise self.add_errors[name]
@@ -1609,8 +1609,8 @@ def test_the_postgresql_guard_adds_then_waits_before_any_copy(monkeypatch) -> No
     assert len(polls) == 3 and len(beats) >= 3  # a heartbeat every poll
     assert source.writes() == [
         'ALTER PUBLICATION "DSQLMIG_PUB_S" SET (PUBLISH_VIA_PARTITION_ROOT = TRUE)',
-        'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."C"',
-        'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."D"',
+        'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE ONLY "APP"."C"',
+        'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE ONLY "APP"."D"',
         "SELECT PG_CURRENT_XACT_ID()::TEXT",
     ]
     assert not any(s.startswith("ALTER TABLE") for s in sql)  # never sets REPLICA IDENTITY
@@ -1646,7 +1646,7 @@ def test_postgresql_refusals_are_isolated_and_fail_closed(monkeypatch) -> None:
     owner = _PgSource(add_errors={"app.c": _Denied("must be owner")})
     out, _b = _guard(_pg_migrator(monkeypatch, owner), ["app.c", "app.d"], _pg_watermark())
     assert out == {"app.c": PG_ADD_OWNER.format(pub="dsqlmig_pub_s"), "app.d": None}
-    assert 'ADD TABLE "APP"."D"' in " ".join(owner.writes())  # app.d still added
+    assert 'ADD TABLE ONLY "APP"."D"' in " ".join(owner.writes())  # app.d still added
     lock = _PgSource(add_errors={"app.c": _Lock("lock timeout")})
     assert _guard(_pg_migrator(monkeypatch, lock), ["app.c"], _pg_watermark())[0] == {
         "app.c": PG_ADD_LOCK.format(pub="dsqlmig_pub_s")}
@@ -1658,8 +1658,10 @@ def test_postgresql_refusals_are_isolated_and_fail_closed(monkeypatch) -> None:
     assert _guard(_pg_migrator(monkeypatch, unreadable), ["app.c"], _pg_watermark())[0] == {
         "app.c": PG_OBJECTS_UNREADABLE.format(cls="RuntimeError")}
     insert_only = _PgSource(all_dml=False)
+    from dsql_migrator.core.cdc_pg_slot import publish_list_fix
+
     assert _guard(_pg_migrator(monkeypatch, insert_only), ["app.c"], _pg_watermark())[0] == {
-        "app.c": PG_DML.format(pub="dsqlmig_pub_s")}
+        "app.c": PG_DML.format(pub="dsqlmig_pub_s", fix=publish_list_fix("dsqlmig_pub_s"))}
     # A re-keyed table that is not REPLICA IDENTITY FULL (or whose identity is unknown) is
     # refused -- the guard never ALTERs the table to fix it.
     weak = _PgSource(rekey_reads=[("app.c", "d", ["id"], 0, [])])
@@ -1800,8 +1802,8 @@ def test_an_unknown_add_failure_and_a_lost_connection_are_refused(monkeypatch) -
                      _pg_watermark())
     refused = PG_CONNECT.format(pub="dsqlmig_pub_s", cls="_Lost")
     assert out == {"app.c": None, "app.d": refused, "app.e": refused}
-    assert _adds(lost) == ['ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."C"',
-                           'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."D"']  # the lost one
+    assert _adds(lost) == ['ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE ONLY "APP"."C"',
+                           'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE ONLY "APP"."D"']  # the lost one
 
 
 def test_an_unexpected_failure_after_a_write_refuses_what_is_not_graded(monkeypatch) -> None:
@@ -1863,7 +1865,7 @@ def test_an_addition_whose_updates_publishing_would_break_is_never_added(
     )
     assert "Give it a primary key, or set" not in out["app.c"]
     assert source.writes() == [  # app.c never joins; app.d (usable) still does
-        'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."D"',
+        'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE ONLY "APP"."D"',
         "SELECT PG_CURRENT_XACT_ID()::TEXT",
     ]
     # Read through the READ-ONLY engine, before any write.
@@ -1908,7 +1910,7 @@ def test_an_addition_with_a_usable_replica_identity_is_still_added(monkeypatch,
     source = _PgSource(usability={"app.c": usability})
     out, _b = _guard(_pg_migrator(monkeypatch, source), ["app.c"], _pg_watermark())
     assert out == {"app.c": None}
-    assert 'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE "APP"."C"' in source.writes()
+    assert 'ALTER PUBLICATION "DSQLMIG_PUB_S" ADD TABLE ONLY "APP"."C"' in source.writes()
 
 
 def test_the_add_itself_rechecks_the_identity_fail_closed(monkeypatch) -> None:
@@ -2243,6 +2245,7 @@ def test_the_runner_records_baselines_for_the_migratable_tables_it_does_not_load
     _content, runner = dm.build_data_migration_screen(
         sessions, "s1", job_manager=jobs, eval_store=evals, migration_store=migrations,
         conv_store=convs, migrator_factory=_factory)
+    state.set_cdc_stack_phase("absent", status=None)  # the CDC state is read (G25 gate)
     runner()
     assert seen == [() if pg else ("app.b", "app.c")]
     assert len(jobs.submitted) == 1
@@ -2326,7 +2329,7 @@ def test_add_table_to_publication_is_idempotent_and_refuses_before_any_write() -
     logs.clear()
     added = _FakeConn(pubs={"p": ["app.a"]})
     assert add_table_to_publication(added, name="p", table="app.c", on_log=logs.append) is True
-    assert added.writes() == ['ALTER PUBLICATION "p" ADD TABLE "app"."c"']
+    assert added.writes() == ['ALTER PUBLICATION "p" ADD TABLE ONLY "app"."c"']
     # The audit line names the write AFTER it committed.
     assert logs == ['added app.c to publication "p" (selected after the Full Load; its changes '
                     'stream from now on)']

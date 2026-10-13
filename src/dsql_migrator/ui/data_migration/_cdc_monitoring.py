@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import NamedTuple, Optional
 
 from dsql_migrator.core.activity_log import ActivityStatus
@@ -52,6 +52,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     _fetch_migration_row_counts,
     _migration_status_tables,
     cdc_dlq_records,
+    cdc_dlq_shown_message,
     cdc_dlq_summary,
     cdc_error_log_key,
     is_cdc_error_record,
@@ -766,9 +767,26 @@ def _render_cdc_slot_health(ui, migration_state) -> None:
     health = getattr(migration_state, "cdc_slot_health", None)
     if health is None or not getattr(health, "exists", False):
         return
+    from dsql_migrator.core.cdc_pg_slot import SLOT_MISSING_HEADER, pg_cdc_route
     from dsql_migrator.core.cdc_postgres import classify_slot_health
+    from dsql_migrator.ui.data_migration._models import MigrationType
 
     tone, headline, detail = classify_slot_health(health)
+    if tone == "error":
+        # An invalidated slot (G25): its way out is the route rule's, like the Start CDC block
+        # for the same slot. This panel renders only once a Start was submitted, so the stack
+        # counts as started: new CDC topics before any Full Load re-run -- its topics may hold
+        # changes no sink applied, which its sink would apply over the reload -- and, with
+        # CDC only, Start CDC on the new stack (no Full Load step).
+        detail = (
+            f"{detail} "
+            + pg_cdc_route(
+                SLOT_MISSING_HEADER,
+                started=True,
+                cdc_only=getattr(migration_state, "migration_type", None)
+                is MigrationType.CDC_ONLY,
+            )
+        )
     # Say WHEN it was read. The slot is read only on the source/target counts refresh, yet
     # this renders every 5 s tick -- so without the time a snapshot read as live state (a
     # stopped-time "no consumer" kept showing after Start CDC while the real slot was
@@ -1539,9 +1557,14 @@ def _render_cdc_pipeline_health(
 
 # The confirmed-stall notice. Two causes look the same on the rate gauges, and only the sink
 # connector log tells them apart: an ejected sink consumer never recovers by itself (Stop +
-# Start rejoins the group), while a target that cannot take writes right now -- e.g. Aurora
-# DSQL's temporary XX000 "server unavailable", retried by the sink and redelivered by
-# Connect since plugin v52 (G22) -- resumes on its own. Quotes the sink's own log prefix.
+# Start rejoins the group), while a sink whose writes keep failing transiently -- retried by
+# the sink and redelivered by Connect, never dead-lettered -- resumes once the cause clears.
+# Quotes the sink's own log prefix (DsqlSinkTask.transientRetryException) and splits the
+# guidance by the SQLSTATE it carries: only XX000 is Aurora DSQL's own temporary condition
+# (G22); 08xxx / 57xxx / null is the sink's path to the cluster (a security group, NAT or
+# VPC endpoint change, or a deleted cluster: pgjdbc reports a failed connect as 08001), and
+# a lasting 40001 is another writer on the same rows -- never the sink's own tasks, which
+# never write the same row (each row's changes travel on one partition).
 SINK_STALL_NOTICE_BODY = (
     "The source is producing changes but the sink has applied none, so the target is "
     "falling behind. The connector can still report RUNNING and no errored task while this "
@@ -1549,10 +1572,17 @@ SINK_STALL_NOTICE_BODY = (
     "counts. Then check the sink connector log. A repeating \"Commit of offsets timed out\" "
     "means the sink consumer was ejected from its group (it keeps its thread alive) and the "
     "gap will not close on its own: Stop CDC and Start CDC to rejoin the group. A repeating "
-    "\"DSQL apply failed (transient sqlstate=\" means Aurora DSQL cannot take the writes "
-    "right now (for example XX000 \"server unavailable\"): the sink keeps retrying and "
-    "resumes on its own once Aurora DSQL answers; if it lasts, contact AWS Support. Either "
-    "way, do NOT cut over until the sink send rate recovers."
+    "\"DSQL apply failed (transient sqlstate=\" means the sink keeps retrying writes that "
+    "fail, and the SQLSTATE after it names why. XX000 (\"server unavailable\") is a "
+    "temporary Aurora DSQL condition: the sink resumes on its own once Aurora DSQL answers; "
+    "if it lasts, contact AWS Support. 08xxx, 57xxx or null means the sink cannot reach the "
+    "cluster or keeps losing its connection: check that the cluster still exists, that the "
+    "connector subnets still reach its endpoint on port 5432 (security group, NAT gateway "
+    "or Aurora DSQL VPC endpoint and its DNS), and that the connector's IAM role is still "
+    "allowed to connect; the sink resumes once it can connect. 40001 means write conflicts "
+    "outlast the sink's retries: something else is writing the same rows on Aurora DSQL — "
+    "stop it until cut over, and the sink resumes. In every case, do NOT cut over until the "
+    "sink send rate recovers."
 )
 
 
@@ -1675,6 +1705,74 @@ def _dlq_panel_tone(health, *, sink_stalled: bool = False) -> str:
         return "success" if health.depth == 0 and not sink_stalled else "info"
     return _DLQ_LEVEL_TONE.get(health.level, "info")
 
+# The 23505 "why", up to its remedy tail. Deliberately does NOT assert a cause: 23505 is
+# raised by any unique index, so an out-of-band duplicate raises it too. It names the
+# realistic causes -- a primary-key change (or a unique value passed between rows) on any
+# table with a secondary unique index, held up to 5 minutes since sink plugin v53 (G23), the
+# composite-key cause, and a source that dropped or relaxed the index (CDC replicates no DDL,
+# and the source schema re-check compares no index) -- and, above all, that a row may be
+# MISSING -- the one thing an unclassified poison row cannot say. The index name, when the
+# record carries one, is shown beside the label. The tail follows the migration type
+# (:func:`_drift_why`): CDC only has no reload, and there its Delete-and-Deploy aside also
+# names what the delete costs (:func:`_fix_engine_sentence`: on MySQL the stream position of
+# EVERY captured table goes with it).
+_UNIQUE_CONFLICT_WHY_HELD = (
+    "Aurora DSQL refused the row because a unique index already holds its values "
+    "(SQLSTATE 23505), so the row can be missing or stale on the target. On any table "
+    "with a unique index besides the primary key, a change can reach Aurora DSQL before "
+    "the earlier change that frees the value: most often an UPDATE of the primary key, "
+    "which is replicated as a delete of the old key and an insert of the new key that "
+    "can travel on different stream partitions, or a unique value passed from one row to "
+    "another. CDC infrastructure deployed by this version holds such a change for up to "
+    "5 minutes and dead-letters it only if the conflict outlasts the wait (the change "
+    "that frees the value is further behind, an older change of the row replayed after a "
+    "restart or a re-read of the stream has its later change further behind on its own "
+    "partition, or the target already holds the value from outside the stream); "
+    "infrastructure deployed by an earlier version dead-letters it "
+    "at once (Delete and Deploy CDC infrastructure to pick up the wait)."
+)
+_UNIQUE_CONFLICT_WHY_REST = (
+    " On a table with "
+    "a composite key (Schema Conversion's Composite key), an UPDATE to the leading key "
+    "column produces it when the change does not carry the old value (REPLICA IDENTITY "
+    "below FULL on a PostgreSQL source) or when the CDC infrastructure was deployed by "
+    "an earlier version of this tool; the leading key column must be one the "
+    "application never updates. A source that dropped or relaxed this UNIQUE index gives "
+    "the same refusal (no source DDL change is replicated): drop it on Aurora DSQL too"
+)
+_UNIQUE_CONFLICT_WHY = _UNIQUE_CONFLICT_WHY_HELD + _UNIQUE_CONFLICT_WHY_REST
+_UNIQUE_CONFLICT_TAIL = (
+    ", and re-run Step 1 (Evaluation) before the reload so the reload does not rebuild it. "
+    "In each case, reload the table as below and validate it"
+)
+_UNIQUE_CONFLICT_TAIL_CDC_ONLY = ". In each case, repair the table as below and validate it"
+
+# The 07006 "why", up to its recovery. Neither a schema change nor a key-model conflict: the
+# sink cannot BIND the value, so EVERY insert and update for the table dead-letters. Names the
+# array cause because it is the one the tool itself creates (Schema Conversion substitutes an
+# array to jsonb), and says plainly that the count-based signals cannot see it -- that is the
+# whole reason this needed classifying. The recovery follows the migration type.
+_UNBINDABLE_WHY = (
+    "Aurora DSQL never received the row: the sink could not bind one of its values "
+    "(SQLSTATE 07006), so EVERY insert and update for this table is being "
+    "dead-lettered for as long as the stream runs. The known cause is a source ARRAY "
+    "column: Schema Conversion stores it as jsonb (DSQL has no array type) and the Full "
+    "Load converts it correctly, but the change stream delivers it as a list the sink "
+    "cannot bind. Row COUNTS cannot see this — an update that never lands changes no "
+    "count — so run Validation (step 4), whose checksum does. Recovery: "
+)
+_UNBINDABLE_RECOVERY = (
+    "stop CDC and reload this table with 'Drop & reload' to bring its values current (an "
+    "append reload cannot — it never rewrites a primary key the target already has); the "
+    "stream cannot catch up on its own until the sink connector is upgraded"
+)
+# CDC only: the upgrade, then (in _drift_why) what deleting the infrastructure costs, then this.
+_UNBINDABLE_RECOVERY_CDC_ONLY = (
+    "the stream cannot catch up on its own until the sink connector is upgraded (Delete and "
+    "Deploy CDC infrastructure)."
+)
+_UNBINDABLE_REPAIR_CDC_ONLY = " Repair the rows set aside as below"
+
 # Source-schema-drift kinds (core.cdc.SchemaDriftKind values) -> a human label and
 # the reason DSQL rejected the row. Detection-only: CDC never propagates DDL, so a
 # source ALTER leaves the target behind and its rows dead-letter. The recovery is
@@ -1708,50 +1806,13 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "recreated (a Schema Conversion REPLACE) or dropped out of band — so DSQL "
         "rejected every row (SQLSTATE 42P01)",
     ),
-    # Deliberately does NOT assert a cause: 23505 is raised by any unique index, so an
-    # out-of-band duplicate raises it too. It names the realistic causes -- a primary-key
-    # change (or a unique value passed between rows) on any table with a secondary unique
-    # index, held up to 5 minutes since sink plugin v53 (G23), and the composite-key cause --
-    # and, above all, that a row may be MISSING -- the one thing an unclassified poison row
-    # cannot say. The index name, when the record carries one, is shown beside the label.
     "unique-conflict": (
         "a unique constraint rejected the row",
-        "Aurora DSQL refused the row because a unique index already holds its values "
-        "(SQLSTATE 23505), so the row can be missing or stale on the target. On any table "
-        "with a unique index besides the primary key, a change can reach Aurora DSQL before "
-        "the earlier change that frees the value: most often an UPDATE of the primary key, "
-        "which is replicated as a delete of the old key and an insert of the new key that "
-        "can travel on different stream partitions, or a unique value passed from one row to "
-        "another. CDC infrastructure deployed by this version holds such a change for up to "
-        "5 minutes and dead-letters it only if the conflict outlasts the wait (the change "
-        "that frees the value is further behind, an older change of the row replayed after a "
-        "restart or a re-read of the stream has its later change further behind on its own "
-        "partition, or the target already holds the value from outside the stream); "
-        "infrastructure deployed by an earlier version dead-letters it "
-        "at once (Delete and Deploy CDC infrastructure to pick up the wait). On a table with "
-        "a composite key (Schema Conversion's Composite key), an UPDATE to the leading key "
-        "column produces it when the change does not carry the old value (REPLICA IDENTITY "
-        "below FULL on a PostgreSQL source) or when the CDC infrastructure was deployed by "
-        "an earlier version of this tool; the leading key column must be one the "
-        "application never updates. Either way, reload the table as below and validate it",
+        _UNIQUE_CONFLICT_WHY + _UNIQUE_CONFLICT_TAIL,
     ),
-    # Neither a schema change nor a key-model conflict: the sink cannot BIND the value, so
-    # EVERY insert and update for the table dead-letters. Names the array cause because it is
-    # the one the tool itself creates (Schema Conversion substitutes an array to jsonb), and
-    # says plainly that the count-based signals cannot see it -- that is the whole reason this
-    # needed classifying.
     "unbindable-value": (
         "the sink cannot write one of this table's columns",
-        "Aurora DSQL never received the row: the sink could not bind one of its values "
-        "(SQLSTATE 07006), so EVERY insert and update for this table is being "
-        "dead-lettered for as long as the stream runs. The known cause is a source ARRAY "
-        "column: Schema Conversion stores it as jsonb (DSQL has no array type) and the Full "
-        "Load converts it correctly, but the change stream delivers it as a list the sink "
-        "cannot bind. Row COUNTS cannot see this — an update that never lands changes no "
-        "count — so run Validation (step 4), whose checksum does. Recovery: stop CDC and "
-        "reload this table with 'Drop & reload' to bring its values current (an append "
-        "reload cannot — it never rewrites a primary key the target already has); the "
-        "stream cannot catch up on its own until the sink connector is upgraded",
+        _UNBINDABLE_WHY + _UNBINDABLE_RECOVERY,
     ),
     # The only kind where the target ends up with EXTRA rows rather than missing ones, so it
     # needs its own header and its own runbook line (an ALTER backfills nothing here). Says
@@ -1859,9 +1920,26 @@ _CHECK_WHY_PG = (
 )
 
 
-def _drift_why(group, *, is_pg: bool) -> str:
-    """The banner's "why" for one group: by kind, engine and the group's own evidence."""
+def _drift_why(group, *, is_pg: bool, cdc_only: bool = False) -> str:
+    """The banner's "why" for one group: by kind, engine, migration type (CDC only has no
+    reload: its target-side remedy is a repair by hand, see the notice below the rows, and its
+    Delete-and-Deploy advice names what the delete costs on the engine) and the group's own
+    evidence."""
     kind = getattr(group, "kind", "")
+    if cdc_only and kind == "unique-conflict":
+        return (
+            _UNIQUE_CONFLICT_WHY_HELD
+            + _fix_engine_sentence(is_pg=is_pg, cdc_only=True)
+            + _UNIQUE_CONFLICT_WHY_REST
+            + _UNIQUE_CONFLICT_TAIL_CDC_ONLY
+        )
+    if cdc_only and kind == "unbindable-value":
+        return (
+            _UNBINDABLE_WHY
+            + _UNBINDABLE_RECOVERY_CDC_ONLY
+            + _fix_engine_sentence(is_pg=is_pg, cdc_only=True)
+            + _UNBINDABLE_REPAIR_CDC_ONLY
+        )
     why = _DRIFT_LABELS.get(kind, (kind, "the source schema changed"))[1]
     if kind == "value-does-not-fit":
         codes = set(getattr(group, "codes", None) or ())
@@ -1948,6 +2026,14 @@ _CERTAIN_LOSS_DRIFT_KINDS = frozenset({"missing-table", "unbindable-value"})
 # (e.g. ALTER TABLE)" one.
 _NON_DDL_SOURCE_KINDS = frozenset({"source-truncate", "value-does-not-fit"})
 
+# The kinds whose WHOLE repair is putting the table's rows right, which a CHECKSUM match after
+# the table's last dead letter proves done: the target-side kinds (refused rows, restored by a
+# reload or a later full-row change) and a source TRUNCATE (rows the source dropped, removed
+# by a Drop & reload or a delete -- a match proves the target holds none of them). A
+# value-fit or DDL group keeps its banner group once verified: its cause (a column type, a
+# schema change) is still there, and no CHECKSUM proves that fixed.
+_CHECKSUM_REPAIRED_DRIFT_KINDS = _TARGET_SIDE_DRIFT_KINDS | {"source-truncate"}
+
 
 # How many names one Fix target schema… sentence lists before it tails off with "+N more".
 _FIX_NAME_LIMIT = 6
@@ -1963,6 +2049,21 @@ def _fix_names(names, joiner: str = ", ") -> str:
 
 def _fix_is_cdc_only(migration_type) -> bool:
     return getattr(migration_type, "name", None) == "CDC_ONLY"
+
+
+# What the dead-letter record list can tell a CDC-only hand repair. The sink renders a key
+# value only when it is an integer or a UUID (DsqlSinkTask.isSurrogate); any other, a natural
+# key such as an email, is "<withheld>" (Property 7), so such a table's rows cannot be found
+# from the list and the banner and the card send that table to Start over.
+_DLQ_KEY_VALUES = (
+    "names each record's primary key, but shows a key value only when it is an integer or a "
+    "UUID (any other is withheld)"
+)
+# The same, inside a runbook's parenthesis (the card itself then names Start over).
+_DLQ_KEY_LISTED = (
+    "the dead-letter queue card lists each record's primary key, with its value when that is "
+    "an integer or a UUID"
+)
 
 
 def _value_fit_runbook(
@@ -1992,7 +2093,7 @@ def _value_fit_runbook(
             "by hand: add a column of that type, copy the values across (at most 3,000 rows "
             "per transaction), drop the old column and rename the new one (a primary-key "
             "column cannot be dropped: use Start over instead). Then correct the set-aside "
-            "rows on Aurora DSQL (the dead-letter queue card lists each record's primary key), "
+            f"rows on Aurora DSQL ({_DLQ_KEY_LISTED}), "
             f"Start CDC and run Validation (step 4); or use Start over to migrate {shown} "
             "again with that type."
         )
@@ -2080,7 +2181,7 @@ def _key_change_remedy(migration_type, shown: str, *, is_pg: bool, rekeyed) -> s
             "and CDC only has no Full Load step to reload from: restore the original key on "
             "the source, or use Start over to migrate the table with its new key. If you "
             "restore the key, the rows set aside meanwhile are not replayed: correct them on "
-            "Aurora DSQL by hand (the dead-letter queue card lists each record's primary key)."
+            f"Aurora DSQL by hand ({_DLQ_KEY_LISTED})."
         )
     remedy = (
         " Aurora DSQL cannot change a primary key in place or drop a primary-key column, "
@@ -2191,7 +2292,7 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
             "CDC does not replicate DDL. Apply the matching change to the target schema (e.g. "
             "ALTER TABLE) to stop new rows being set aside. The rows already set aside are not "
             "replayed, and CDC only has no Full Load step to reload them from: correct them on "
-            "Aurora DSQL by hand (the dead-letter queue card lists each record's primary key), "
+            f"Aurora DSQL by hand ({_DLQ_KEY_LISTED}), "
             "re-run Step 1 (Evaluation) so Validation compares the new definition, then run "
             "Validation (step 4)."
         ]
@@ -3070,23 +3171,92 @@ _CDC_VALUE_FIT_SEED = (
     "that holds these values — Aurora DSQL has no ALTER COLUMN ... TYPE — and how to backfill "
     "the set-aside rows, and whether I must stop CDC first."
 )
-# The target-side-only banner's seed: Aurora DSQL refused the rows (a unique index, a missing
-# target table, a value the sink cannot bind) -- no source DDL to "apply".
+# The target-side banner's seed: Aurora DSQL refused the rows (a unique index, a missing
+# target table, a value the sink cannot bind) -- no source DDL to "apply", though a 23505 can
+# also come from a source that dropped or relaxed a UNIQUE index, hence "not necessarily".
 _CDC_TARGET_SIDE_SEED = (
-    "CDC dead-lettered rows that Aurora DSQL or the sink refused on the target (not a source "
-    "schema change). For each affected table, tell me why the rows were refused and how to "
-    "restore them on the target, and whether I must stop CDC first."
+    "CDC dead-lettered rows that Aurora DSQL or the sink refused on the target (not "
+    "necessarily a source schema change). For each affected table, tell me why the rows were "
+    "refused and how to restore them on the target, and whether I must stop CDC first."
+)
+# A source TRUNCATE (extra rows on the target) is no schema change, and nothing is backfilled.
+_CDC_TRUNCATE_SEED = (
+    "CDC could not replicate a source TRUNCATE (not a schema change; Aurora DSQL has no "
+    "TRUNCATE statement), so the target still holds rows the source no longer has. For each "
+    "affected table, tell me how to remove those rows from the target, and whether I must "
+    "stop CDC first."
+)
+_CDC_TRUNCATE_VALUE_FIT_SEED = (
+    "CDC could not replicate a source TRUNCATE (not a schema change), and it set rows aside "
+    "because a value does not fit its Aurora DSQL column (not necessarily a source schema "
+    "change either). For each affected table, tell me how to remove the rows the source no "
+    "longer has, how to give the column a type that holds these values — Aurora DSQL has no "
+    "ALTER COLUMN ... TYPE — and backfill the set-aside rows, and whether I must stop CDC "
+    "first."
 )
 
 
-def _drift_names_no_source_ddl(drift) -> bool:
-    """True when every group is target-side (and any others are non-DDL source kinds).
+def _drift_ai_case(drift) -> str:
+    """Which AI seed, tooltip and facts lead a banner over ``drift`` gets. Pure.
 
-    Such a banner, its AI seed and its AI facts must not claim a source schema change."""
+    ``"ddl"`` while any group is a source DDL kind (or there is none); else the banner claims
+    no schema change: ``"target-side"`` with any target-side kind, otherwise
+    ``"value-fit"``, ``"truncate"`` or ``"truncate-value-fit"``. The banner computes it once
+    from the SAME (open) groups it shows and passes those groups to :func:`_cdc_drift_facts`,
+    so the seed, the tooltip and the facts can never disagree."""
     kinds = {getattr(g, "kind", "") for g in drift}
-    return bool(kinds & _TARGET_SIDE_DRIFT_KINDS) and not (
-        kinds - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS
-    )
+    if not kinds or kinds - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS:
+        return "ddl"
+    if kinds & _TARGET_SIDE_DRIFT_KINDS:
+        return "target-side"
+    if kinds == {"value-does-not-fit"}:
+        return "value-fit"
+    if kinds == {"source-truncate"}:
+        return "truncate"
+    return "truncate-value-fit"
+
+
+_DRIFT_AI_SEED = {
+    "ddl": _CDC_DRIFT_SEED,
+    "value-fit": _CDC_VALUE_FIT_SEED,
+    "target-side": _CDC_TARGET_SIDE_SEED,
+    "truncate": _CDC_TRUNCATE_SEED,
+    "truncate-value-fit": _CDC_TRUNCATE_VALUE_FIT_SEED,
+}
+_DRIFT_AI_TOOLTIP = {
+    "ddl": "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
+    "value-fit": (
+        "Ask AI DBA how to give the column a type that holds these values and backfill the "
+        "set-aside rows."
+    ),
+    "target-side": "Ask AI DBA why the target refused these rows and how to restore them.",
+    "truncate": "Ask AI DBA how to remove the rows the source no longer has.",
+    "truncate-value-fit": (
+        "Ask AI DBA how to remove the rows the source no longer has and give the column a "
+        "type that holds these values."
+    ),
+}
+# The facts are "authoritative" to the model: each lead claims only what its banner claims.
+_DRIFT_AI_LEAD = {
+    "ddl": "Source schema drift detected (CDC does not replicate DDL):",
+    "value-fit": (
+        "CDC set rows aside: a value does not fit its Aurora DSQL column (not necessarily a "
+        "source schema change; CDC does not replicate DDL):"
+    ),
+    "target-side": (
+        "CDC dead-lettered rows the target refused (not necessarily a source schema change; "
+        "the dead-lettered rows are never replayed):"
+    ),
+    "truncate": (
+        "A source TRUNCATE was not replicated (not a schema change; Aurora DSQL has no "
+        "TRUNCATE statement, so the target keeps the rows the source removed):"
+    ),
+    "truncate-value-fit": (
+        "A source TRUNCATE was not replicated (not a schema change), and CDC set rows aside "
+        "because a value does not fit its Aurora DSQL column (not necessarily a source schema "
+        "change):"
+    ),
+}
 
 
 def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
@@ -3121,6 +3291,18 @@ def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
             "Top SQLSTATEs: "
             + ", ".join(f"{c} ({n})" for c, n in by_code.most_common(5))
         )
+    # The tables the CDC step calls verified (every one a CHECKSUM proves after its last dead
+    # letter, whatever else holds it), with the open finding still holding any of them at Cut
+    # over, so the chat never advises reloading them.
+    try:
+        from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_open_finding_holds
+
+        verified = _cdc_dlq_proven(migration_state)
+        held = cdc_dlq_open_finding_holds(migration_state, verified)
+    except Exception:  # noqa: BLE001 - advisory facts only
+        verified, held = {}, {}
+    if verified:
+        lines.append(_verified_facts_line(verified, held))
     activity = getattr(migration_state, "cdc_activity", None)
     if bool(getattr(activity, "sink_stall_confirmed", False)):
         lines.append(
@@ -3128,7 +3310,18 @@ def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
         )
     lines.extend(_exclusion_state_facts(migration_state, job_manager))
     lines.append("Sample dead-lettered events:")
-    lines.append(_summarize_errors(records))
+    # Each reason as the record list shows it (cdc_dlq_shown_message): the facts are
+    # authoritative to the chat, so a source TRUNCATE's sink clause "reload this table on the
+    # Full Load step" must not reach it -- on CDC only there is no such step.
+    from types import SimpleNamespace
+
+    lines.append(_summarize_errors([
+        SimpleNamespace(
+            table=r.table, error_code=getattr(r, "error_code", None),
+            message=cdc_dlq_shown_message(r),
+        )
+        for r in records
+    ]))
     return "\n".join(lines)
 
 
@@ -3156,28 +3349,27 @@ def _exclusion_state_facts(migration_state, job_manager) -> "list[str]":
     return out
 
 
-def _cdc_drift_facts(status_view: LoadStatusView) -> str:
+def _cdc_drift_facts(
+    status_view: LoadStatusView,
+    *,
+    drift=None,
+    verified: "Optional[Mapping[str, datetime]]" = None,
+    held: "Optional[Mapping[str, Sequence[str]]]" = None,
+) -> str:
     """Assemble a credential-free schema-drift facts block for the AI DBA chat.
 
-    The model is told these facts are authoritative, so a value-fit-only block must not open
-    by claiming a source schema change the banner itself does not claim."""
-    drift = getattr(status_view, "schema_drift", None) or []
-    value_fit_only = bool(drift) and all(
-        getattr(g, "kind", "") == "value-does-not-fit" for g in drift
-    )
-    if value_fit_only:
-        lead = (
-            "CDC set rows aside: a value does not fit its Aurora DSQL column (not necessarily a "
-            "source schema change; CDC does not replicate DDL):"
-        )
-    elif _drift_names_no_source_ddl(drift):
-        lead = (
-            "CDC dead-lettered rows the target refused (not a source schema change; the "
-            "dead-lettered rows are never replayed):"
-        )
-    else:
-        lead = "Source schema drift detected (CDC does not replicate DDL):"
-    lines = [lead]
+    The model is told these facts are authoritative, so the lead claims only what the banner
+    claims (:func:`_drift_ai_case`). ``drift`` (default: the view's) is the banner's OPEN
+    groups -- the ones its seed was chosen from; a verified table's target-side and truncate
+    groups are not among them -- and ``verified`` the tables verified by CHECKSUM
+    (:func:`_cdc_dlq_proven`), named on one line so the model never advises reloading them
+    again (or deleting a truncate's rows) for those, while any open group of theirs keeps its
+    fix, and ``held`` the open finding still holding any of them at Cut over
+    (:func:`~dsql_migrator.ui.cdc_dlq_gate.cdc_dlq_open_finding_holds`), as the banner's
+    Verified notice names it."""
+    if drift is None:
+        drift = getattr(status_view, "schema_drift", None) or []
+    lines = [_DRIFT_AI_LEAD[_drift_ai_case(drift)]]
     for group in drift:
         noun = "record" if group.count == 1 else "records"
         columns = list(getattr(group, "columns", None) or ())
@@ -3194,7 +3386,50 @@ def _cdc_drift_facts(status_view: LoadStatusView) -> str:
         lines.append(
             f"- {group.table}: {group.kind}{detail}{coded} — {group.count} {noun} dead-lettered"
         )
+    if any(getattr(g, "kind", "") == "unique-conflict" for g in drift):
+        # The one source-side cause of a 23505 that nothing else tells the model: no DDL is
+        # replicated, and the source schema re-check compares no index.
+        lines.append(_UNIQUE_SOURCE_CAUSE_FACT)
+    if verified:
+        lines.append(_verified_facts_line(verified, held))
     return "\n".join(lines)
+
+
+_UNIQUE_SOURCE_CAUSE_FACT = (
+    "A unique-conflict (23505) can also mean the source dropped or relaxed a UNIQUE index that "
+    "Aurora DSQL still has (CDC replicates no DDL, and the source schema re-check compares no "
+    "index): then drop it on Aurora DSQL too."
+)
+
+
+# What a verified table's CHECKSUM proves, for the AI facts: its rows match the source, so a
+# dead letter whose whole repair is putting the rows right (_CHECKSUM_REPAIRED_DRIFT_KINDS: a
+# target-side one, or a source TRUNCATE's extra rows) needs no other; any other kind still
+# listed for it keeps the fix its banner group shows (a CHECKSUM proves no schema fix),
+# exactly as the banner's per-group rule shows it.
+_VERIFIED_FACTS_LEAD = (
+    "Verified by CHECKSUM, so Cut over's dead-letter check no longer holds them, and their "
+    "unique-conflict, missing-table, unbindable-value or source-truncate dead letters need no "
+    "repair (do not advise a reload or a delete for them; any other kind listed for them "
+    "keeps its own fix): "
+)
+
+
+def _verified_facts_line(
+    verified: "Mapping[str, datetime]",
+    held: "Optional[Mapping[str, Sequence[str]]]" = None,
+) -> str:
+    """The AI facts' line naming the tables verified by CHECKSUM, then -- as the banner's
+    Verified notice does -- the open finding that still holds any of them at Cut over
+    (``held``; names and times only)."""
+    from dsql_migrator.ui.cdc_dlq_gate import (
+        cdc_dlq_still_held_sentence,
+        cdc_dlq_verified_clauses,
+    )
+
+    line = _VERIFIED_FACTS_LEAD + cdc_dlq_verified_clauses(verified, limit=_FIX_NAME_LIMIT)
+    still = cdc_dlq_still_held_sentence(held or {}, limit=_FIX_NAME_LIMIT, pointer=False)
+    return f"{line}. {still}" if still else line
 
 
 def _render_cdc_ai_button(ui, on_click, tooltip: str) -> None:
@@ -3205,7 +3440,8 @@ def _render_cdc_ai_button(ui, on_click, tooltip: str) -> None:
 
 
 def _cdc_dlq_proven(migration_state) -> "dict[str, object]":
-    """The dead-lettered tables the cut-over gate no longer holds (``{}`` when unknown)."""
+    """The dead-lettered tables the cut-over dead-letter check no longer holds -- the ones the
+    CDC step calls verified by CHECKSUM, whatever else holds them (``{}`` when unknown)."""
     if migration_state is None or not getattr(migration_state, "cdc_dlq_ledger", None):
         return {}
     from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_proven_tables
@@ -3221,16 +3457,23 @@ def _cdc_dlq_proven(migration_state) -> "dict[str, object]":
         return {}
 
 
-def _render_cdc_dlq_resolved(ui, groups, proven) -> None:
-    """One success notice for the target-side tables already reloaded and verified."""
+def _render_cdc_dlq_resolved(ui, groups, verified, held=None) -> None:
+    """One success notice naming the tables of ``groups`` -- the target-side and truncate
+    groups a CHECKSUM verified after their table's last dead letter (a reload, a later
+    full-row change of each row, or a delete of the rows the source dropped repaired them) --
+    with one sentence naming the open finding (``held``) that still holds any of them at Cut
+    over."""
     from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_resolved_body
 
     tables = sorted({g.table for g in groups})
     render_notice(
         ui,
         tone="success",
-        header="Reloaded and verified",
-        body=cdc_dlq_resolved_body({t: proven[t] for t in tables}),
+        header="Verified by CHECKSUM",
+        body=cdc_dlq_resolved_body(
+            {t: verified[t] for t in tables},
+            {t: checks for t, checks in (held or {}).items() if t in tables},
+        ),
     )
 
 
@@ -3265,20 +3508,30 @@ def _render_cdc_schema_drift_banner(
     drift = getattr(status_view, "schema_drift", None) or []
     if not drift:
         return
-    # A target-side table the operator already repaired (Drop & reload, then a CHECKSUM match
-    # in a comparison started after its last dead letter -- the cut-over gate's own rule, so
-    # Cut over no longer holds it) is shown as resolved, not as an open "Stop CDC and reload"
-    # error; its dead-lettered records stay listed in the breakdown below the banner. A newer
-    # dead letter moves the ledger's last time past that comparison and reopens it.
-    _proven = _cdc_dlq_proven(migration_state)
+    # A table a CHECKSUM match in a comparison started after its last dead letter proves (the
+    # cut-over dead-letter check's own rule; a reload or a later full-row change repaired it)
+    # has its TARGET-SIDE and TRUNCATE groups shown as verified, not as an open "Stop CDC and
+    # reload" error or a "the target still holds the rows" warning: their whole repair is
+    # putting the rows right, which the CHECKSUM proves done (_CHECKSUM_REPAIRED_DRIFT_KINDS).
+    # Whatever else holds the table (G25): an OPEN REPLICA IDENTITY or source schema finding
+    # holds Cut over on its own and has its own fix (a reload fixes neither), so the Verified
+    # notice names it in one sentence (cdc_dlq_open_finding_holds) rather than sending the
+    # table back to a reload. Its value-fit and DDL groups keep their own headers and runbooks
+    # (a CHECKSUM proves no schema fix). Its dead-lettered records stay listed in the breakdown
+    # below the banner. A newer dead letter moves the ledger's last time past that comparison
+    # and reopens it.
+    from dsql_migrator.ui.cdc_dlq_gate import cdc_dlq_open_finding_holds
+
+    _verified = _cdc_dlq_proven(migration_state)
+    _held = cdc_dlq_open_finding_holds(migration_state, _verified)
     _resolved = [
         g for g in drift
-        if getattr(g, "kind", "") in _TARGET_SIDE_DRIFT_KINDS and g.table in _proven
+        if getattr(g, "kind", "") in _CHECKSUM_REPAIRED_DRIFT_KINDS and g.table in _verified
     ]
     if _resolved:
         drift = [g for g in drift if not any(g is r for r in _resolved)]
         if not drift:
-            _render_cdc_dlq_resolved(ui, _resolved, _proven)
+            _render_cdc_dlq_resolved(ui, _resolved, _verified, _held)
             return
     # THREE cases, not two. The old two-way split put every target-side kind under the
     # "Target table missing — rows are being lost" header, which is false for 23505 (there a
@@ -3348,33 +3601,28 @@ def _render_cdc_schema_drift_banner(
             ui.label(_header).classes("text-sm font-semibold text-gray-900")  # type: ignore[attr-defined]
             if cdc_ai_opener is not None:
                 ui.space()  # type: ignore[attr-defined]
-                # A value-fit-only banner claims no schema change, so its chat must not either
-                # (the seed becomes the operator's first message).
-                _target_only = _drift_names_no_source_ddl(drift)
+                # A banner that claims no schema change gets a chat that does not either (the
+                # seed becomes the operator's first message): the seed, the tooltip and the
+                # facts all come from the open groups shown here, so they cannot disagree,
+                # and the facts name the tables already verified (never "reload them again").
+                _ai_case = _drift_ai_case(drift)
                 _render_cdc_ai_button(
                     ui,
                     lambda: cdc_ai_opener(
                         "drift",
-                        _cdc_drift_facts(status_view),
-                        _CDC_VALUE_FIT_SEED
-                        if _value_fit_only
-                        else _CDC_TARGET_SIDE_SEED
-                        if _target_only
-                        else _CDC_DRIFT_SEED,
+                        _cdc_drift_facts(
+                            status_view, drift=drift, verified=_verified, held=_held
+                        ),
+                        _DRIFT_AI_SEED[_ai_case],
                     ),
-                    "Ask AI DBA how to give the column a type that holds these values and "
-                    "backfill the set-aside rows."
-                    if _value_fit_only
-                    else "Ask AI DBA why the target refused these rows and how to restore them."
-                    if _target_only
-                    else "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
+                    _DRIFT_AI_TOOLTIP[_ai_case],
                 )
         for group in drift:
             label = _DRIFT_LABELS.get(group.kind, (group.kind, ""))[0]
             # The source schema re-check's own label when an open finding confirms this
             # group ("column dropped at the source", ...); the why stays record-level.
             label = _catalog_label(group, migration_state) or label
-            why = _drift_why(group, is_pg=_is_pg)
+            why = _drift_why(group, is_pg=_is_pg, cdc_only=_fix_is_cdc_only(migration_type))
             noun = "record" if group.count == 1 else "records"
             # The value-free names the group's reasons give: a value-fit "<column> <type>",
             # the 23502 column, the 23514 constraint (never a value).
@@ -3485,13 +3733,33 @@ def _render_cdc_schema_drift_banner(
             # The recovery is different in kind: dead-lettered rows are NOT replayed and
             # their Kafka offsets are already committed, so nothing will re-deliver them
             # -- and rows applied BEFORE the table was dropped went with the table. Only
-            # a re-read of the source restores them.
+            # a re-read of the source restores them. CDC only has no Full Load step (and
+            # no Drop & reload): its repair is by hand, or Start over.
             _names = ", ".join(sorted({g.table for g in _target_side}))
-            render_notice(
-                ui,
-                tone="error",
-                header="Stop CDC and reload these tables",
-                body=(
+            if _fix_is_cdc_only(migration_type):
+                _stop_header = "Stop CDC and repair these tables"
+                _stop_body = (
+                    f"Dead-lettered rows are never replayed and their stream position is "
+                    f"already committed, so {_names} will not catch up on its own, and CDC "
+                    "only has no Full Load step to reload from. Stop CDC, confirm the table "
+                    "exists on the target (re-apply Schema Conversion if it does not), "
+                    "correct the dead-lettered rows on Aurora DSQL by hand (at most 3,000 "
+                    "rows per transaction), then Start CDC and run Validation (step 4): it "
+                    "is what proves the gap is closed; this panel cannot. The dead-letter "
+                    f"queue card {_DLQ_KEY_VALUES}: for a table whose key values it "
+                    "withholds, or instead of the repair by hand, use Start over to migrate "
+                    "the table again with a Full Load."
+                    + (
+                        " A table that was dropped on the target also lost every row "
+                        "applied before the drop, which no dead letter lists: use Start "
+                        "over for it."
+                        if "missing-table" in _kinds
+                        else ""
+                    )
+                )
+            else:
+                _stop_header = "Stop CDC and reload these tables"
+                _stop_body = (
                     f"Dead-lettered rows are never replayed and their stream position is "
                     f"already committed, so {_names} will not catch up on its own — and "
                     "any rows applied before the table was dropped went with it. Stop "
@@ -3502,10 +3770,10 @@ def _render_cdc_schema_drift_banner(
                     "target is missing, so a row that IS on the target but holds a stale "
                     "value (the 07006 and 23505 cases) is never rewritten. Validation "
                     "(step 4) is what proves the gap is closed; this panel cannot."
-                ),
-            )
+                )
+            render_notice(ui, tone="error", header=_stop_header, body=_stop_body)
     if _resolved:
-        _render_cdc_dlq_resolved(ui, _resolved, _proven)
+        _render_cdc_dlq_resolved(ui, _resolved, _verified, _held)
 
 
 def cdc_oversized_quarantine_groups(records) -> "list[tuple[str, list[str], list[str]]]":
@@ -3770,7 +4038,9 @@ def _render_cdc_dlq_panel(
             on_applied=getattr(migration_state, "record_cdc_target_added_columns", None),
             migration_state=migration_state,
         )
-        _render_cdc_dlq_breakdown(ui, status_view)
+        _render_cdc_dlq_breakdown(
+            ui, status_view, migration_type=getattr(migration_state, "migration_type", None)
+        )
         # CDC commonly has no Full Load job_id this session, so key the record list /
         # download off the same stable CDC key the fold used (cdc_error_log_key) --
         # not _current_job, which would be None and hide everything.
@@ -3839,7 +4109,9 @@ def _render_full_load_quarantine_pointer(
     ).classes("text-xs text-gray-500")
 
 
-def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
+def _render_cdc_dlq_breakdown(
+    ui, status_view: LoadStatusView, *, migration_type=None
+) -> None:
     """Show which tables produced DLQ/error records, so a poison source is found.
 
     Reads the per-table counts already on the view's
@@ -3848,7 +4120,8 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
     Chips (not a collapsible sub-table) keep the at-a-glance "where is the poison
     coming from" answer visible without a click and survive the ~5s re-render
     without snapping shut. Nothing shown when there are no per-table counts (a
-    clean stream or errors not yet attributed to a table).
+    clean stream or errors not yet attributed to a table). ``migration_type`` picks
+    the repair: CDC only has no Full Load step to reload from.
     """
     summary = status_view.error_summary
     by_table = summary.errors_by_table if summary is not None else {}
@@ -3884,6 +4157,27 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
     # Stating the precondition here is the fix; "a reload fixes them" is also softened to
     # "reload that table to backfill it" because even the append-mode reload has to be
     # confirmed past that collision warning.
+    #
+    # CDC only has no Full Load step at all (G25), so there the repair is the drift banner's
+    # own: by hand on Aurora DSQL with CDC stopped, or Start over -- never a reload.
+    if _fix_is_cdc_only(migration_type):
+        repair = (
+            "Rows MISSING on the target, or holding a stale value, are a dropped insert or "
+            "update: with CDC stopped, correct them on Aurora DSQL by hand (at most 3,000 rows "
+            "per transaction), or migrate the table again with Start over. Rows EXTRA on the "
+            "target are a dropped delete: delete them by hand, with CDC stopped too. The "
+            f"record list below {_DLQ_KEY_VALUES}: for a table whose key values it withholds, "
+            "use Start over."
+        )
+    else:
+        repair = (
+            "Rows MISSING "
+            "on the target are a dropped insert (reload that table to backfill it); rows "
+            "EXTRA on the target are a dropped delete (a reload cannot remove it — the table "
+            "must be dropped and reloaded, or the row deleted by hand). Both repairs need "
+            "Stop CDC first: while the sink is streaming, Full Load collides with it and the "
+            "drop-and-recreate option is not offered at all."
+        )
     render_notice(
         ui,
         tone="info",
@@ -3891,12 +4185,9 @@ def _render_cdc_dlq_breakdown(ui, status_view: LoadStatusView) -> None:
         header="Confirm the effect of these drops in Validation",
         body=(
             "A dead-lettered record is a row the stream did NOT apply, and it is never "
-            "retried; Validation is what shows the consequence on the target. Rows MISSING "
-            "on the target are a dropped insert (reload that table to backfill it); rows "
-            "EXTRA on the target are a dropped delete (a reload cannot remove it — the table "
-            "must be dropped and reloaded, or the row deleted by hand). Both repairs need "
-            "Stop CDC first: while the sink is streaming, Full Load collides with it and the "
-            "drop-and-recreate option is not offered at all. A dropped UPDATE changes no row "
+            "retried; Validation is what shows the consequence on the target. "
+            + repair
+            + " A dropped UPDATE changes no row "
             "count, so the default row-count mode cannot see it: Validation therefore also "
             "compares these tables by CHECKSUM, and Cut over stays locked until each has "
             "matched in a CHECKSUM comparison that started after its last dead-lettered "
@@ -3938,22 +4229,14 @@ def _render_cdc_dlq_records(ui, migration_state, log_key: str, page_state=None) 
         reverse=True,
     )
     shown = ordered[:_DLQ_RECORD_LIST_LIMIT]
-    from dsql_migrator.core.cdc_dlq import SOURCE_TRUNCATE_CODE
-
     rows = [
         {
             "table": r.table,
             "code": r.error_code or "—",
-            # A source TRUNCATE's reason ends in the sink's own "Recovery: reload ... on the
-            # Full Load step with 'Drop & reload'" clause, which leaves out Stop CDC and is
-            # impossible in CDC only (no Full Load step). The drift banner on this same panel
-            # (fed by the same records) gives the runbook for the run's migration type, so the
-            # list shows the reason without that clause rather than contradicting the banner.
-            # Display only: the stored message and the download keep the full text, and
-            # deployed sink plugins keep emitting the clause, so this stays when it is reworded.
-            "message": r.message.split(" Recovery:", 1)[0]
-            if r.error_code == SOURCE_TRUNCATE_CODE and r.message
-            else r.message,
+            # Without a source TRUNCATE's sink "Recovery: reload ... on the Full Load step"
+            # clause (cdc_dlq_shown_message): the drift banner on this same panel, fed by the
+            # same records, gives the runbook for the run's migration type.
+            "message": cdc_dlq_shown_message(r),
             "when": r.occurred_at.strftime("%Y-%m-%d %H:%M:%S")
             if r.occurred_at
             else "—",
@@ -4373,7 +4656,9 @@ def exclusion_lock_state(migration_state, job_manager) -> ExclusionLockState:
                     "the captured tables after the last one Aurora DSQL applied are NOT "
                     "replicated. If they were written in that window, re-copy them: after "
                     "the delete, switch the migration type to Full load + CDC and run its "
-                    "Full Load, choosing to drop and recreate the tables that hold rows."
+                    "Full Load (choosing to drop and recreate the tables that hold rows) "
+                    "before the new stack's first Start CDC: once that stack has streamed, a "
+                    "new Full Load start point needs another Delete and redeploy."
                 )
             else:
                 cost = (

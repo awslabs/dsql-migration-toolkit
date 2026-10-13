@@ -15,6 +15,7 @@ shared ``core`` + ``ui`` modules -- never back from the package ``__init__``.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
@@ -42,6 +43,7 @@ from dsql_migrator.ui.workflow import WorkflowStep, with_status
 from dsql_migrator.ui.data_migration._full_load_engine import (
     full_load_progress_caption,
     job_status_to_step_status,
+    new_start_point_block,
     sync_identity_sequences_for_tables,
 )
 from dsql_migrator.ui.data_migration._models import (
@@ -97,6 +99,39 @@ _ADDITION_FORCED_REASON = (
     "selected after the Full Load, and Aurora DSQL already holds rows in it that may predate "
     "the changes CDC captures for it (an append keeps every row already there), so it is "
     "dropped and reloaded"
+)
+
+# G25 (decision A): while CDC is live the step keeps its "Stop CDC first" gate. A Full Load
+# that takes a new start point then still needs new CDC topics (new_start_point_block), so the
+# copy names the whole route and never a resume "from the new snapshot": Stop CDC removes the
+# sink without a drain, and its consumer group would re-apply older changes over the reload.
+_CDC_LIVE_START_TOOLTIP = (
+    "CDC is streaming -- starting Full Load would collide with the live pipeline. Stop CDC "
+    "first (CDC step → Stop CDC), then Delete CDC infrastructure and deploy it again before a "
+    "new Full Load."
+)
+_CDC_LIVE_START_HINT = (
+    "CDC is live, so Full Load is disabled. Stop CDC first (CDC step → Stop CDC), then Delete "
+    "CDC infrastructure and deploy it again before a new Full Load."
+)
+# The confirm dialog's "CDC is currently streaming" notice: the collision, then the way on --
+# by the action, since a Retry or a Reload keeps the original start point and converges.
+_CDC_LIVE_COLLISION = (
+    "Re-running Full Load now will collide with the live pipeline -- the snapshot (and any "
+    "DROP+recreate) writes to tables the CDC sink is actively applying changes to, which can "
+    "drop streamed rows or create a gap/overlap."
+)
+_CDC_LIVE_NEW_START_POINT = (
+    "Stop CDC first (CDC step → Stop CDC). A new start point then needs new CDC topics: Delete "
+    "CDC infrastructure and deploy it again, then Re-run Full Load choosing 'Drop & reload', "
+    "then Start CDC."
+)
+# Rule D: Stop CDC removes the sink without a drain, so what it had not applied reaches the
+# target on the restart only from the CDC topics.
+_CDC_LIVE_KEEPS_START_POINT = (
+    "Stop CDC first (CDC step → Stop CDC), run this, then Start CDC again: this run keeps the "
+    "original start point, so CDC continues from where it stopped, gapless only while the CDC "
+    "topics still retain what the sink had not applied (their retention period on MSK)."
 )
 
 
@@ -310,21 +345,60 @@ def format_selected_workloads(names: Sequence[str]) -> str:
     return f"{count} {noun} selected for Full Load"
 
 
-def full_load_confirm_summary(names: Sequence[str], engine, migration_type) -> str:
+def full_load_confirm_summary(
+    names: Sequence[str],
+    engine,
+    migration_type,
+    *,
+    keeps_watermark: bool,
+    cdc_live: bool = False,
+    publication_additions: "Sequence[str] | frozenset[str]" = (),
+) -> str:
     """The Full Load confirm dialog's summary line for the tables this run loads. Pure.
 
-    "The source is accessed read only" is false for a PostgreSQL Full load + CDC: the load
-    creates (or reuses) the CDC publication and replication slot on the source, and sets
-    REPLICA IDENTITY FULL on a table whose CDC key was changed (provision_pg_replication).
+    What the run writes on the source depends on the action (G25). On a PostgreSQL Full
+    load + CDC, a run that takes a new snapshot (Start, Re-run all tables) provisions CDC's
+    replication objects at it (provision_pg_replication) -- unless CDC is streaming
+    (``cdc_live``), when it provisions nothing. It creates the publication or reuses one,
+    adding any missing table and setting a reused one's publish_via_partition_root to true
+    if it is false (_repair_reused_publication, before the slot); it REPLACES the
+    replication slot (one left by an earlier run is dropped and a new one created -- such a
+    run waits for new CDC topics on a stack that has streamed, new_start_point_block); and
+    it sets REPLICA IDENTITY FULL on a table whose CDC key was
+    changed. A Retry or Reload (``keeps_watermark``) runs under the original watermark and
+    only reads the source, except that a table selected after the Full Load (G17,
+    ``publication_additions``) joins CDC's publication before its copy, the guard first
+    setting the publication's publish_via_partition_root to true if it is false -- the
+    ticked ones are named, as a possibility: an earlier guarded attempt that joined it can
+    leave it pending (the wait after the join timed out, or the copy failed or
+    quarantined), and the guard writes nothing for a member. Each catalog write an action
+    can make on the source is named, as the dialog is where the operator learns of them.
+    Every other engine and type only reads the source.
     """
     if not names:
         # A tick-to-choose dialog before the first tick (its confirm stays disabled).
         return "No tables ticked yet: tick the tables to load below."
-    if engine is SourceType.POSTGRES and migration_type is MigrationType.FULL_LOAD_AND_CDC:
+    pg_cdc = engine is SourceType.POSTGRES and migration_type is MigrationType.FULL_LOAD_AND_CDC
+    additions = set(publication_additions or ())
+    joining = [n for n in names if n in additions]
+    if pg_cdc and not keeps_watermark and not cdc_live:
         source = (
-            "the source's tables are only read, but the tool also creates or reuses the CDC "
-            "publication and replication slot on the source (and sets REPLICA IDENTITY FULL "
-            "on a table whose CDC key was changed)"
+            "the source's tables are only read, but the tool also creates the CDC "
+            "publication on the source (or reuses one, adding any missing table and setting "
+            "its publish_via_partition_root to true if it is false), replaces the "
+            "replication slot (a slot left by an earlier run is dropped and a new one is "
+            "created at this snapshot) and sets REPLICA IDENTITY FULL on a table whose CDC "
+            "key was changed"
+        )
+    elif pg_cdc and keeps_watermark and joining:
+        from dsql_migrator.ui.cdc_dlq_gate import bounded_table_names
+
+        one = len(joining) == 1
+        source = (
+            f"the source is accessed read only, except that {bounded_table_names(joining)} "
+            f"{'joins' if one else 'join'} CDC's publication on the source if "
+            f"{'it is not a member' if one else 'they are not members'} yet, and the "
+            "publication's publish_via_partition_root is set to true if it is false"
         )
     else:
         source = "the source is accessed read only"
@@ -627,10 +701,27 @@ def _render_full_load_step(
     # warning. Both are computed fresh inside the dialog builder below (so the
     # periodic poll re-render can't tear a stale value into the dialog).
 
+    # G25 (decision A): a Full Load that takes a new start point on a cdc-stack that has
+    # streamed (or that is not read yet) waits for new CDC topics. Judged once per render for
+    # the buttons below, and again at the click and at the confirm -- the CDC state can change
+    # under a rendered button or an open dialog (the stack-phase probe runs off the loop).
+    _start_point_block = new_start_point_block(migration_state, _engine)
+
+    def _refuse_new_start_point(keeps_watermark: bool) -> bool:
+        """At a click: refuse (with a toast of the refusal's one-line form) a run that takes a
+        new start point while the gate holds. A Retry or a Reload is never refused here."""
+        if keeps_watermark:
+            return False
+        block = new_start_point_block(migration_state, _engine)
+        if block is None:
+            return False
+        ui.notify(block[2], type="warning", position="top", multi_line=True)
+        return True
+
     def _open_confirm_dialog_now(
-        *, action_tables, on_confirm, title, table_reasons=None,
+        *, action_tables, on_confirm, title, keeps_watermark, table_reasons=None,
         preselect=True, checklist_hint=None, overlay=None, on_retry=None,
-        addition_forced=None,
+        addition_forced=None, cdc_additions=frozenset(),
     ) -> None:
         """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
@@ -661,6 +752,14 @@ def _render_full_load_step(
         reloaded whatever the Append / Drop choice says (the rows may predate the changes
         CDC captures for the table, and an append keeps them), exactly like the overlay's
         forced tables.
+
+        ``keeps_watermark`` (G25) is the action kind the summary's source-write sentence
+        follows: False for Start / Re-run all tables (a new snapshot, which on PostgreSQL
+        Full load + CDC provisions the publication and replaces the slot), True for a Retry
+        or Reload (the original watermark: the source is only read, except that each ticked
+        ``cdc_additions`` table joins CDC's publication when the watermark has the load's
+        slot, its guard setting the publication's publish_via_partition_root to true first
+        if it is false).
         """
         from nicegui import context as _ctx
 
@@ -758,9 +857,16 @@ def _render_full_load_step(
                 def _ticked(names) -> list:
                     return [n for n in names if n in checked] if selectable else list(names)
 
-                summary_label = ui.label(
-                    full_load_confirm_summary(_ticked(action_tables), _engine, _migration_type)
-                ).classes("text-sm")
+                def _summary() -> str:
+                    # A G17 addition joins the publication only when the watermark has the
+                    # load's slot (_pg_publication); without one Start CDC re-snapshots it.
+                    return full_load_confirm_summary(
+                        _ticked(action_tables), _engine, _migration_type,
+                        keeps_watermark=keeps_watermark, cdc_live=cdc_live_now,
+                        publication_additions=cdc_additions if _pg_publication else (),
+                    )
+
+                summary_label = ui.label(_summary()).classes("text-sm")
                 # Missing target tables an append can't create -> warn BEFORE the load
                 # (rather than letting it fail per table, then risk a standing CDC gap).
                 if missing_uncreated:
@@ -797,15 +903,9 @@ def _render_full_load_step(
                         ui,
                         tone="error",
                         header="CDC is currently streaming",
-                        body=(
-                            "Re-running Full Load now will collide with the live "
-                            "pipeline -- the snapshot (and any DROP+recreate) writes "
-                            "to tables the CDC sink is actively applying changes to, "
-                            "which can drop streamed rows or create a gap/overlap "
-                            "(CDC resumes from the ORIGINAL watermark, not this new "
-                            "one). Stop CDC first (CDC step → Stop CDC), re-run the "
-                            "Full Load, then start CDC again so it resumes from the "
-                            "new snapshot."
+                        body=f"{_CDC_LIVE_COLLISION} " + (
+                            _CDC_LIVE_KEEPS_START_POINT if keeps_watermark
+                            else _CDC_LIVE_NEW_START_POINT
                         ),
                     )
                 from dsql_migrator.ui.data_migration._models import (
@@ -942,6 +1042,11 @@ def _render_full_load_step(
                         return  # guard: nothing selected (button is also disabled)
                     if ledger_error:
                         return  # guard: the record could not be read (button disabled)
+                    if _refuse_new_start_point(keeps_watermark):
+                        # G25: the CDC state changed while the dialog was open (a probe read
+                        # a stack that has streamed): closed as a Cancel, nothing runs.
+                        confirm_dialog.close()
+                        return
                     confirmed["v"] = True
                     # Hand the forced set and the disclosed overlay to the run being built.
                     migration_state.confirm_exclusion_forced_replace()
@@ -1007,11 +1112,7 @@ def _render_full_load_step(
                         start_btn.props(f"color={color}")
                         if selectable:
                             # The summary and the with-data count follow the ticks.
-                            summary_label.set_text(
-                                full_load_confirm_summary(
-                                    _ticked(action_tables), _engine, _migration_type
-                                )
-                            )
+                            summary_label.set_text(_summary())
                             if radio_tables and not cdc_live_now:
                                 with_data_label.set_text(
                                     with_data_choice_text(
@@ -1067,6 +1168,7 @@ def _render_full_load_step(
         preselect=True,
         checklist_hint=None,
         cdc_additions=frozenset(),
+        keeps_watermark=False,
     ) -> None:
         """Probe which target tables hold data, then open the confirm dialog.
 
@@ -1083,9 +1185,18 @@ def _render_full_load_step(
         ``cdc_additions`` (G17: the Full load + CDC tables the watermark does not cover yet,
         as the step rendered them) -- each the probe finds holding rows is forced to Drop &
         reload (an empty one appends).
+        ``keeps_watermark`` (G25) is the action kind the dialog states the source writes
+        for: False -- the default action, ``start_full_load``, takes a new snapshot (Start,
+        Re-run all tables) -- and True for an ``on_confirm`` that runs the retry engine
+        under the original watermark (Retry unfinished tables, a per-table Reload, Reload
+        specific tables). A new snapshot is refused here, before any probe, while the
+        new-start-point gate holds (G25) -- the page header's Run reaches this dialog too.
         """
         if _confirm_busy["value"]:
             return  # a probe is already in flight -> ignore the extra click
+        if _refuse_new_start_point(keeps_watermark):
+            refresh()  # the step then shows the disabled action and why
+            return
         _confirm_busy["value"] = True
         action_tables = (
             list(probe_tables) if probe_tables is not None else list(selected_names)
@@ -1271,18 +1382,21 @@ def _render_full_load_step(
                     None, probe_tables=action_tables, on_confirm=confirm_action,
                     title=title, table_reasons=table_reasons, preselect=preselect,
                     checklist_hint=checklist_hint, cdc_additions=cdc_additions,
+                    keeps_watermark=keeps_watermark,
                 )
 
             _open_confirm_dialog_now(
                 action_tables=action_tables,
                 on_confirm=confirm_action,
                 title=title,
+                keeps_watermark=keeps_watermark,
                 table_reasons=table_reasons,
                 preselect=preselect,
                 checklist_hint=checklist_hint,
                 overlay=overlay_info,
                 on_retry=_retry,
                 addition_forced=addition_forced,
+                cdc_additions=cdc_additions,
             )
         finally:
             _confirm_busy["value"] = False
@@ -1320,6 +1434,7 @@ def _render_full_load_step(
             on_confirm=lambda n=table_name: reload_table(n),
             title=f"Reload {table_name}?",
             cdc_additions=frozenset(_pending),
+            keeps_watermark=True,  # reload_table runs the retry engine
         )
 
     # The watermark, object browser, prerequisites, and buttons are STATIC: they
@@ -1510,10 +1625,15 @@ def _render_full_load_step(
             if bool(_call_or(foreign_keys_running, False)):
                 _live_detail.refresh()
                 return
+            # G25 (decision A): with the record gone there is no Retry or Reload, so running
+            # the load again takes a new start point -- refused on a Full load + CDC
+            # migration whose CDC stack has streamed until it is deployed again.
             migration_state.set_error(
                 "The Full Load job record was lost (the app restarted, or the job was "
-                "reaped). Re-run the load, or check Validation — the rows already "
-                "written are still on the target."
+                "reaped). Run the Full Load again (on a Full load + CDC migration whose CDC "
+                "stack has streamed, Delete CDC infrastructure and deploy it again first: a "
+                "new start point needs new CDC topics), or check Validation — the rows "
+                "already written are still on the target."
             )
             session.set_workflow(  # type: ignore[attr-defined]
                 with_status(
@@ -1661,18 +1781,18 @@ def _render_full_load_step(
             elif cdc_streaming_started(migration_state, job_manager):
                 # CDC is live: starting/re-running Full Load would collide with the
                 # running stream, so DISABLE (grey out) the button rather than let it
-                # look clickable. The tooltip + hint say how to re-enable it (Stop CDC),
-                # so it is a clear "not now", not a dead end.
+                # look clickable. The tooltip + hint name the way on (Stop CDC, then new
+                # CDC topics -- G25), so it is a clear "not now", not a dead end.
                 start_btn.disable()
-                start_btn.tooltip(
-                    "CDC is streaming -- starting Full Load would collide with the "
-                    "live pipeline. Stop CDC first (CDC step → Stop CDC) to run it."
-                )
-                inline_hint(
-                    ui,
-                    "CDC is live, so Full Load is disabled. Stop CDC first "
-                    "(CDC step → Stop CDC) to run it.",
-                    tone="warning",
+                start_btn.tooltip(_CDC_LIVE_START_TOOLTIP)
+                inline_hint(ui, _CDC_LIVE_START_HINT, tone="warning")
+            elif _start_point_block is not None:
+                # G25: a new start point on a cdc-stack that has streamed (or not read yet).
+                # An info notice: the stack's state is normal, the route is the operator's.
+                start_btn.disable()
+                start_btn.tooltip(_start_point_block[2])
+                render_notice(
+                    ui, tone="info", header=_start_point_block[0], body=_start_point_block[1]
                 )
 
     if job is not None:
@@ -1775,6 +1895,7 @@ def _render_full_load_step(
                     f"Reconnect the {' and '.join(missing)} connection first "
                     "(Connect step), then retry."
                 )
+                _rerun_gated = False  # G25: disabled by the new-start-point gate
                 with ui.row().classes("items-center gap-2 w-full"):
                     rerun_btn = ui.button(
                         "Re-run all tables",
@@ -1792,6 +1913,17 @@ def _render_full_load_step(
                     elif guard_reason:
                         rerun_btn.disable()
                         rerun_btn.tooltip(guard_reason)
+                    elif _start_point_block is not None:
+                        # G25: a fresh snapshot is a new start point (the notice below the
+                        # row says why); Retry beside it keeps the original one. While CDC
+                        # is live, Stop CDC comes first, as on the Start button.
+                        rerun_btn.disable()
+                        rerun_btn.tooltip(
+                            _CDC_LIVE_START_TOOLTIP
+                            if cdc_streaming_started(migration_state, job_manager)
+                            else _start_point_block[2]
+                        )
+                        _rerun_gated = True
                     else:
                         rerun_btn.tooltip(
                             "Re-runs ALL selected tables from a fresh snapshot (new "
@@ -1860,6 +1992,7 @@ def _render_full_load_step(
                             title=f"Retry {len(failed)} unfinished table(s)?",
                             table_reasons={n: _reason_for(n) for n in failed},
                             cdc_additions=frozenset(_pending),
+                            keeps_watermark=True,  # the retry engine, original watermark
                         )
 
                     retry_btn = ui.button(
@@ -1900,6 +2033,11 @@ def _render_full_load_step(
                             "succeeded table(s) are kept as-is (no re-load, no new "
                             "snapshot)."
                         )
+                if _rerun_gated:
+                    render_notice(
+                        ui, tone="info", header=_start_point_block[0],
+                        body=_start_point_block[1],
+                    )
             else:
                 # Every table finished. Until now this state offered NO scoped action at
                 # all: the per-table "Reload" button lives only on the quarantine card,
@@ -1916,8 +2054,8 @@ def _render_full_load_step(
                 # no longer selected is left as is on Aurora DSQL.
                 #
                 # The engine already supports the scoped run (the same retry path the
-                # quarantine Reload uses, which keeps the ORIGINAL watermark so a later
-                # CDC start stays gapless), so this only adds the missing entry point:
+                # quarantine Reload uses, which keeps the ORIGINAL watermark so CDC still
+                # converges over it), so this only adds the missing entry point:
                 # the identical confirm checklist, starting EMPTY so nothing is reloaded
                 # by accident.
                 _loaded = sorted(
@@ -1945,12 +2083,19 @@ def _render_full_load_step(
                             # hint line below carries the meaning instead.
                             table_reasons={n: "" for n in _loaded},
                             preselect=False,
+                            # G25 (rule D): on a stack that has streamed the next Start
+                            # continues from where streaming stopped, and its sink's
+                            # unapplied tail comes from the CDC topics.
                             checklist_hint=(
                                 "Tick the tables to reload. Reloading re-reads those "
                                 "tables from the source and leaves every other table "
-                                "untouched; the run keeps its original watermark, so a "
-                                "later CDC start is still gapless."
+                                "untouched; the run keeps its original watermark, so CDC "
+                                "still converges over the reloaded tables (on a stack "
+                                "that has streamed, the next Start continues from where "
+                                "streaming stopped, gapless only while the CDC topics "
+                                "still retain what the sink had not applied)."
                             ),
+                            keeps_watermark=True,  # retry_tables, original watermark
                         )
 
                     with ui.row().classes("items-center gap-2 w-full"):
@@ -2433,7 +2578,8 @@ def _render_full_load_progress(
     # built from ``latest_messages()``, which keeps one message per TABLE (last write
     # wins) -- so a table that dropped 3 rows listed exactly 1, and the count above it
     # disagreed with the list below. The primary key is the actionable part of each
-    # entry, so every row has to appear.
+    # entry, so every row has to appear. The caller passes every Full Load record, so the
+    # index notice reads its failed indexes from here too, one per index (G25).
     quarantine_records: "Sequence[tuple[str, str]]" = (),
     ai_error_opener=None,
     page_state=None,
@@ -2633,11 +2779,9 @@ def _render_full_load_progress(
     # access path is missing. Split it out so it is reported as its own warning instead
     # of appearing among the failed tables (which would contradict the table's DONE
     # state and imply data was lost). "index not confirmed" is an index Aurora DSQL answered
-    # XX000 for while it was being created: it may exist after all.
+    # XX000 for, or whose connection dropped, while it was being created: it may exist after
+    # all.
     index_prefix = ("index not created: ", "index not confirmed: ")
-    index_only = [
-        r for r in failures if str(r.error_message).startswith(index_prefix)
-    ]
     real_failures = [
         r
         for r in failures
@@ -2646,6 +2790,24 @@ def _render_full_load_progress(
     ]
     quarantined = [
         r for r in failures if str(r.error_message).startswith(quar_prefix)
+    ]
+    # One entry per failed INDEX (G25), not per table: a table records one failure per
+    # CREATE that failed, in DDL order, and judged by its latest one an earlier UNIQUE index
+    # vanished -- a missing (or unconfirmed) constraint followed by any other failed index
+    # read "the data loaded completely". ``quarantine_records`` carries every record; a table
+    # with none there (a caller that passes none) keeps its latest message. A table listed
+    # among the failures is not "Done", so it gets no entry here.
+    _failed_tables = {r.table for r in real_failures}
+    _index_records: dict[str, list[str]] = {}
+    for _record_table, _record_message in quarantine_records or ():
+        if str(_record_message).startswith(index_prefix):
+            _index_records.setdefault(str(_record_table), []).append(str(_record_message))
+    index_only = [
+        dataclasses.replace(row, error_message=message)
+        for row in rows
+        if row.table not in _failed_tables
+        for message in _index_records.get(row.table)
+        or ([row.error_message] if str(row.error_message).startswith(index_prefix) else [])
     ]
     terminal = job.status in ("DONE", "FAILED", "CANCELLED")
 
@@ -2832,49 +2994,111 @@ def _render_full_load_progress(
         # index. Split the notice, and raise the tone when one is unique -- cutting over onto
         # a table that no longer enforces uniqueness is not an FYI.
         #
-        # An index Aurora DSQL answered XX000 for while it was being created may exist after
-        # all (most likely its CREATE landed), so it is "not confirmed", not "missing": when
-        # every entry is such an index the notice says so instead of claiming a missing
-        # constraint, and asks for a check rather than a create (the tone stays: it may truly
-        # be missing). A mix keeps the "NOT created" notice, which is true of the others; each
-        # row's badge tells them apart.
-        unique = _has_unique_index_failure(index_only)
-        unconfirmed = all(is_unconfirmed_index_failure(r.error_message) for r in index_only)
+        # An index whose CREATE ended with no confirmed outcome -- Aurora DSQL answered
+        # XX000, or (G25) the connection dropped while it ran -- may exist after all (most
+        # likely its CREATE landed), so it is "not confirmed", not "missing": when every entry
+        # is such an index the notice says so instead of claiming a missing constraint, and
+        # asks for a check rather than a create (the tone stays: it may truly be missing).
+        # The "NOT created / a constraint is missing" wording is picked from the indexes KNOWN
+        # missing only (G25): picked from every entry, a not-confirmed UNIQUE index (which
+        # most likely exists) made a mix with a missing plain index claim a missing
+        # constraint. A mix names both groups -- also on one table, as every entry is one
+        # index -- and each entry's badge says which of the two it is.
+        unsure = [r for r in index_only if is_unconfirmed_index_failure(r.error_message)]
+        missing = [r for r in index_only if not is_unconfirmed_index_failure(r.error_message)]
+        unique_missing = _has_unique_index_failure(missing)
+        unique_unsure = _has_unique_index_failure(unsure)
         count = len(index_only)
-        if unique and unconfirmed:
+        # "(N)" counts the entries below, one per index. It follows "Unique index" only when
+        # every one is unique; otherwise the unique ones are counted apart (G25): counted
+        # together, one unique and three plain indexes read "Unique index NOT created (4)".
+        n_unique = sum(1 for r in index_only if _has_unique_index_failure([r]))
+        cause = (
+            "Aurora DSQL answered server unavailable (SQLSTATE XX000), or the connection "
+            "dropped,"
+        )
+        if not missing and unique_unsure:
             header = (
-                f"Unique index not confirmed ({count}) — the data loaded; check that it "
-                "exists before cutting over"
+                f"Unique index not confirmed ({count}) — the data loaded; check that "
+                f"{'it exists' if count == 1 else 'they exist'} before cutting over"
+                if n_unique == count
+                else f"Indexes not confirmed ({count}, {n_unique} unique) — the data loaded; "
+                f"check that the unique {'index exists' if n_unique == 1 else 'indexes exist'} "
+                "before cutting over"
             )
             body = (
-                "Every row is on the target, so no data was lost. Aurora DSQL answered "
-                "server unavailable (SQLSTATE XX000) while these indexes were being "
-                "created, so they may exist after all. At least one is a UNIQUE index, "
-                "which the source enforced as a constraint: if it is missing, duplicates "
-                "can be written until it exists. Check the table's indexes on the target "
-                "and create any that are missing BEFORE cutting over."
+                f"Every row is on the target, so no data was lost. {cause} while these "
+                "indexes were being created, so they may exist after all. At least one is "
+                "a UNIQUE index, which the source enforced as a constraint: if it is "
+                "missing, duplicates can be written until it exists. Check the table's "
+                "indexes on the target and create any that are missing BEFORE cutting over."
             )
-        elif unique:
+        elif not missing:
+            header = f"Indexes not confirmed ({count}) — the data loaded completely"
+            body = (
+                "Every row is on the target, so no data was lost and you do not need to "
+                f"re-run the load. {cause} while these indexes were being created, so they "
+                "may exist after all: check the table's indexes on the target and create "
+                "only the ones that are missing. Queries that depend on a missing index "
+                "will be slower until it exists."
+            )
+        elif unsure:
+            groups = f"({len(missing)}), not confirmed ({len(unsure)})"
+            # The unique ones among the not-confirmed are counted (G25): "the unique index" and
+            # "one of them is a UNIQUE index" for two of them sent the operator to check one
+            # constraint, so the other could be cut over missing.
+            n_unique_unsure = sum(1 for r in unsure if _has_unique_index_failure([r]))
+            if unique_missing:
+                header = (
+                    f"Indexes NOT created {groups} — the data loaded, but a constraint is "
+                    "missing"
+                )
+            elif unique_unsure:
+                header = (
+                    f"Indexes not created {groups} — the data loaded; check that the unique "
+                    f"{'index exists' if n_unique_unsure == 1 else 'indexes exist'} before "
+                    "cutting over"
+                )
+            else:
+                header = f"Indexes not created {groups} — the data loaded completely"
+            unique_unsure_note = (
+                "one of them is a UNIQUE index"
+                if n_unique_unsure == 1
+                else f"{n_unique_unsure} of them are UNIQUE indexes"
+            )
+            body = (
+                "Every row is on the target, so no data was lost. "
+                + (
+                    "But at least one index that was not created is a UNIQUE index, which "
+                    "the source enforced as a constraint and the target now does not — "
+                    "duplicates can be written until it exists, so create it BEFORE "
+                    "cutting over. "
+                    if unique_missing
+                    else "Add the indexes that were not created later, or reduce the "
+                    "table's index count. "
+                )
+                + "Aurora DSQL allows 24 indexes per table, including the primary key. "
+                f"The ones not confirmed may exist after all: {cause} while they were "
+                "being created. Check the table's indexes on the target and create only "
+                "the ones that are missing"
+                + (
+                    f" — {unique_unsure_note}, so check BEFORE cutting over."
+                    if unique_unsure
+                    else "."
+                )
+            )
+        elif unique_missing:
             header = (
-                f"Unique index NOT created ({count}) — the data loaded, "
-                "but a constraint is missing"
-            )
+                f"Unique index NOT created ({count})"
+                if n_unique == count
+                else f"Indexes NOT created ({count}, {n_unique} unique)"
+            ) + " — the data loaded, but a constraint is missing"
             body = (
                 "Every row is on the target, so no data was lost. But at least one of "
                 "these is a UNIQUE index, which the source enforced as a constraint "
                 "and the target now does not — duplicates can be written until it "
                 "exists, so create it BEFORE cutting over. Aurora DSQL allows 24 "
                 "indexes per table, including the primary key."
-            )
-        elif unconfirmed:
-            header = f"Indexes not confirmed ({count}) — the data loaded completely"
-            body = (
-                "Every row is on the target, so no data was lost and you do not need to "
-                "re-run the load. Aurora DSQL answered server unavailable (SQLSTATE "
-                "XX000) while these indexes were being created, so they may exist after "
-                "all: check the table's indexes on the target and create only the ones "
-                "that are missing. Queries that depend on a missing index will be slower "
-                "until it exists."
             )
         else:
             header = f"Indexes not created ({count}) — the data loaded completely"
@@ -2888,7 +3112,10 @@ def _render_full_load_progress(
             )
         with ui.column().classes("w-full gap-2"):
             render_notice(
-                ui, tone="warning" if unique else "info", header=header, body=body
+                ui,
+                tone="warning" if unique_missing or unique_unsure else "info",
+                header=header,
+                body=body,
             )
             for row in index_only:
                 state = (

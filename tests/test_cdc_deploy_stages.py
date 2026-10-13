@@ -2066,14 +2066,16 @@ def test_external_seed_honours_an_explicitly_configured_host_cidr(monkeypatch) -
 # Condition IsMySqlSource; DeploySeederFunction ANDs IsMySqlSource), so uploading them
 # is work whose result nothing can read -- and it put a MySQL plugin line at the top of
 # every PostgreSQL deploy log. A LIVE deploy cannot catch a wrong-engine regression: the
-# four object keys are fixed constants and uploads skip on match, so in any account that
-# ever ran a MySQL deploy all four objects already exist and a wrong set still works.
-# This test is the only detector.
+# four object keys depend only on the artifacts' content and uploads skip on match, so in
+# any account that ever ran a MySQL deploy of this build all four objects already exist
+# and a wrong set still works. This test is the only detector.
 
-_MYSQL_PLUGIN = "cdc-plugins/debezium-mysql-plugin.zip"
-_PG_PLUGIN = "cdc-plugins/debezium-postgres-plugin.zip"
-_SINK_PLUGIN = "cdc-plugins/dsql-sink-connector.zip"
-_SEEDER = "cdc-plugins/offset-seeder-lambda.zip"
+# The content-addressed keys (G25) of _run_infra's size-0 artifacts.
+_CONTENT_DIR = f"cdc-plugins/{_EMPTY_SHA256[:16]}/"
+_MYSQL_PLUGIN = _CONTENT_DIR + "debezium-mysql-plugin.zip"
+_PG_PLUGIN = _CONTENT_DIR + "debezium-postgres-plugin.zip"
+_SINK_PLUGIN = _CONTENT_DIR + "dsql-sink-connector.zip"
+_SEEDER = _CONTENT_DIR + "offset-seeder-lambda.zip"
 
 
 def _pg_infra_params():
@@ -2135,12 +2137,17 @@ def test_the_infra_deploy_uploads_exactly_the_artifacts_its_stack_references(
         joined = "\n".join(logs)
         if engine == "postgres":
             assert "Not uploading" in joined
-            assert _MYSQL_PLUGIN in joined and _SEEDER in joined
+            # Named by file name: a skipped artifact is never hashed, so it has no key.
+            assert "debezium-mysql-plugin.zip" in joined
+            assert "offset-seeder-lambda.zip" in joined
             assert "a PostgreSQL source does not use them" in joined
             # ...and never claims the MySQL plugin was handled.
             assert f"{_MYSQL_PLUGIN}: already up to date" not in joined
+            assert _MYSQL_PLUGIN not in joined and _SEEDER not in joined
         else:
-            assert _PG_PLUGIN in joined and "a MySQL source does not use it" in joined
+            assert "debezium-postgres-plugin.zip" in joined
+            assert "a MySQL source does not use it" in joined
+            assert _PG_PLUGIN not in joined
 
 
 def _pg_teardown_params(**over):

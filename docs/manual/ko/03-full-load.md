@@ -36,13 +36,26 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 소스는 일관된 스냅샷 안에서 **읽기 전용**으로 읽히며, 로더는 절대 수정하지 않습니다. MySQL 소스는 —
 그리고 PostgreSQL의 Full Load 전용 마이그레이션도 — 절대 쓰이지 않습니다. 유일한 예외는 **PostgreSQL
 CDC**입니다: 워터마크 시점(§3.5)에 도구가 논리 복제 슬롯과, 정확히 마이그레이션 대상 테이블로만 한정된
-publication을 생성하고 teardown 시 삭제합니다. 또한 재키잉된 테이블에 `REPLICA IDENTITY FULL`을 설정하고,
-publication의 `publish_via_partition_root`를 바로잡으며, Full Load 이후 선택한 테이블(Full load + CDC,
-CDC를 시작하기 전)을 복사하기 직전에 그 publication에 추가한 뒤, 그 시점에 열려 있던 트랜잭션을 기다리기
-위해 트랜잭션 ID를 하나 받습니다. 모두 autocommit이고, 소규모 allowlist로 제한되며, 감사됩니다. 이것이
-도구가 어떤 소스에든 수행하는 유일한 쓰기입니다. 워터마크 시점에 publication을 만들거나 거기에 테이블을
-추가하기 전에, 추가할 모든 테이블에 사용 가능한 `REPLICA IDENTITY`가 있는지 확인하며, 없으면 실행은
-소스에서 아무것도 바꾸기 전에 멈추고 그 테이블과 원인에 맞는 해결 방법을 알려 줍니다. Full Load 이후
+publication(`FOR TABLE ONLY`: 테이블의 상속 자식 테이블은 함께 추가되지 않고 — Full Load도 그 테이블 자신의
+행만 읽음(`FROM ONLY`, [§6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함) 참고) —
+파티션된 테이블의 파티션은 추가됨)을 생성하고 teardown 시 삭제합니다. 또한 재키잉된 테이블에
+`REPLICA IDENTITY FULL`을 설정하고,
+publication의 `publish_via_partition_root`를 바로잡습니다: Full Load에서는 재사용하는 publication을(슬롯을
+만들기 전에), Start CDC 때마다(publication이 아직 없으면 — 처음 하는 CDC only Start나 Full Load 전용 실행
+이후의 Start처럼 — 그 설정으로 빈 publication을 만들고, 커넥터가 테이블을 추가합니다), 그리고 Full Load
+이후 선택한 테이블을 추가하기 전에 바로잡습니다. 그런 테이블(Full load + CDC, CDC를 시작하기 전)은 복사
+직전에 publication에 추가되고, 도구는 그 시점에 열려 있던 트랜잭션을 기다리기 위해 트랜잭션 ID를 하나
+받습니다. 모두 autocommit이고, 소규모 allowlist로 제한되며, 감사됩니다. 이것이 도구가 어떤 소스에든
+수행하는 유일한 쓰기입니다. 워터마크 시점에 publication을 만들거나 거기에 테이블을
+추가하기 전에, 추가할 모든 테이블에 사용 가능한 `REPLICA IDENTITY`가 있는지(그리고
+PostgreSQL 18에서는 재키잉된 테이블에 생성 컬럼이 없는지 — 그 테이블에 필요한 `FULL`이 깨지므로) 확인하며,
+없으면 실행은 소스에서 아무것도 바꾸기 전에 멈추고 그 테이블과 원인에 맞는 해결 방법을 알려 줍니다. 같은
+이름의 복제 슬롯이 사용 중이거나, 다른 데이터베이스에 속하거나, 논리 `pgoutput` 슬롯이 아니면(예: 같은 CDC
+스택 이름을 쓰는 다른 마이그레이션의 슬롯) 쓰기 전에 멈추며, 이 데이터베이스의 비활성 슬롯은 이 스택의
+이전 슬롯으로 보고 교체합니다. 선택한 테이블 중 파티션된 테이블이 있는데 Full Load의
+`publish_via_partition_root` 바로잡기가 실패하면, 실행은 슬롯을 만들기 전에 멈추고 publication 소유자로
+실행할 `ALTER PUBLICATION` 구문을 알려 줍니다. Start CDC에서는 바로잡기가 실패하거나 세션에 소스
+비밀번호가 없어 실행되지 못해도 Start가 멈추지 않으며, 그 로그가 같은 구문을 알려 줍니다. Full Load 이후
 선택한 테이블도 추가하기 전에 같은 확인을 거치며, 없으면 그 테이블은 로드되지 않고 그 행에 이유가 표시됩니다
 ([13.7](13-excluding-tables-and-columns.md)).
 
@@ -122,11 +135,12 @@ PostgreSQL-16 wire(양쪽 모두 psycopg)이므로 DSQL이 지원하는 값은 �
 
 **인덱스는 마지막.** 보조 인덱스는 모든 데이터 배치 성공 **후** `CREATE INDEX ASYNC`로, 각자 자체
 단일 DDL 트랜잭션에서 생성됩니다(DSQL은 트랜잭션당 한 개 DDL, 인덱스를 비동기 빌드). Aurora DSQL이
-`XX000`("server unavailable")으로 응답한 인덱스 구문도 같은 방식으로 재시도합니다. 재시도에서 같은
+`XX000`("server unavailable")으로 응답했거나 실행 중에 연결이 끊긴 인덱스 구문도 같은 방식으로 재시도합니다. 재시도에서 같은
 이름의 인덱스가 이미 있으면 생성된 것으로 세지 않습니다: Aurora DSQL에서 인덱스 이름은 스키마
 단위라 다른 테이블의 인덱스일 수도 있기 때문입니다. Full Load 화면과 에러 로그에는 없는 인덱스가
 아니라 **not confirmed**(확인되지 않음)로, 앞선 시도가 만들었을 수 있다는 안내와 함께 표시되므로,
-인덱스를 추가하기 전에 타깃을 확인하세요.
+인덱스를 추가하기 전에 타깃을 확인하세요. 화면의 알림은 `UNIQUE` 인덱스가 생성되지 않은 것이 확실할 때만
+제약이 빠졌다고 말하며, 없는 인덱스와 확인되지 않은 인덱스가 섞여 있으면 둘을 모두 밝힙니다.
 
 ---
 
@@ -158,6 +172,65 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
 
 > 워터마크의 행 수는 **의도적으로 근사**입니다(소스 부담 최소화). 정확한 `COUNT(*)`와 체크섬은
 > **Validation**([5장](05-validation.md))의 역할이지 Full Load가 아닙니다.
+
+### 새 시작 지점에는 새 CDC 토픽이 필요합니다
+
+**새** 워터마크를 캡처하는 것은 CDC에 대한 결정이기도 하므로, CDC 스택이 **스트리밍한 적 있는**
+**Full load + CDC** 마이그레이션 — Start 뒤에 멈췄거나, 커넥터가 그대로 있거나, CloudFormation이 Start를
+롤백한 스택 — 에서는 새 워터마크를 가져가는 모든 작업이 **거부됩니다**: **Start Full Load**,
+**Re-run Full Load**, **Re-run all tables**는 비활성화되고, 페이지 헤더의 **Run**은 아무것도 시작하지
+않습니다. Stop CDC(그리고 롤백된 Start)는 싱크를 드레인하지 않고 제거하므로, 그 싱크의 컨슈머 그룹은 새
+스냅샷보다 오래된 변경을 다시 적재한 테이블 위에 다시 적용하고, 그동안 소스는 이전 정지 지점과 새 스냅샷
+사이의 변경을 건너뜁니다 — 조용히, CHECKSUM 검증만이 그것을 드러냅니다. 그래서 알림은 대신 경로를 알려 줍니다: **Delete CDC infrastructure** 후 다시
+배포(새 스택은 빈 토픽으로 시작), 그다음 **Re-run Full Load**를 **Drop & reload**로(PostgreSQL에서는 복제
+슬롯을 자신의 스냅샷 지점에 다시 만듦), 그다음 **Start CDC**.
+
+- **페이지 헤더의 Run도 같은 방식으로 막힙니다.** Start / Re-run Full Load와 똑같이 새 시작 지점을
+  가져가기 때문입니다. 스트리밍한 적 있는 스택에서는 아무것도 시작하지 않습니다: 경고 토스트가 같은 경로를
+  알려 주고, 작업은 만들어지지 않고, 워터마크도 캡처되지 않으며(PostgreSQL에서는 복제 슬롯이 교체되지
+  않음), 단계 상태와 이전 Full Load 기록도 그대로 남습니다. 아직 **스트리밍 중인** 스택도 여기에
+  포함됩니다.
+- **CDC가 살아 있는 동안**에는 Full Load 작업에 자체 게이트가 먼저 걸립니다: *Stop CDC first (CDC step →
+  Stop CDC), then Delete CDC infrastructure and deploy it again before a new Full Load.* 원래 시작 지점을
+  유지하는 **Retry unfinished tables**, **Reload specific tables**, 테이블별 **Reload**의 확인 대화
+  상자는 대신 먼저 Stop CDC를 하고 그 작업을 실행한 뒤 Start CDC를 다시 하라고 알려 줍니다: 그러면 CDC는
+  멈춘 곳에서 이어 가며, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안(MSK에서의 보존 기간)만
+  빈틈이 없습니다.
+- **이 세션에서 CDC 상태를 아직 읽지 못했으면**(화면을 막 열었거나 앱을 재시작한 직후), 또는 읽을 수
+  없었으면 새 시작 지점은 추측하지 않고 **기다립니다**: 알림이 그렇게 말하고 CDC 단계의
+  **Re-check CDC state**를 알려 줍니다(읽기에 실패했다면 먼저 AWS 접근 권한을 고치세요).
+- **막히지 않는 것:** **Retry unfinished tables**, **Reload specific tables**, 테이블별 **Reload**,
+  **Change & reload**는 모두 **원래** 시작 지점을 유지하므로 CDC가 멈춘 곳에서 이어 가고 — Stop CDC 후의
+  모든 재시작처럼, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안만 빈틈이 없음
+  ([§4.3](04-cdc-and-dsql-constraints.md#43-무손실-full-load--cdc-핸드오프)) — 다시 적재한 테이블은
+  수렴합니다. Full Load 단계는 **Full load only**와 **CDC only** 마이그레이션을 막지 않지만, 그 유형으로
+  바꿔도 이 게이트를 우회할 수는 없습니다(다음 항목).
+- **Start CDC도 더 새 시작 지점을 거부합니다(MySQL).** MySQL 소스에서 Start CDC는 스트리밍한 적 있는 CDC
+  스택을 마이그레이션 유형과 상관없이, 스택이 마지막으로 시작한 지점보다 새 시작 지점으로(또는 멈춘 스택의
+  마지막 Start가 시작 지점을 주지 않았다면 어떤 시작 지점으로도) 앞당기는 것을 거부합니다: 예를 들어 Full load +
+  CDC에서 **Full load only**로 바꾼 뒤 Re-run Full Load가 잡은 워터마크나, 더 뒤의 **Manual** 지점입니다.
+  시작 지점 카드와 Start CDC 카드가 *This CDC stack cannot start from a newer start point*와 함께 경로 —
+  위의 경로, CDC only에서는 **Delete CDC infrastructure** 후 다시 배포한 뒤 새 스택에서 **Start CDC** — 를
+  보여 주고 Start CDC는 비활성화됩니다. Start CDC 대화 상자, Start나 Retry CDC 클릭, 그리고 무엇이든
+  바꾸기 전에 그때 읽은 스택으로 판단하는 Start CDC 작업(*Start CDC blocked: This CDC stack has
+  streamed, so Start CDC does not move it forward to a newer start point …*)도 거부합니다. 거부된 Manual
+  지점은 시작 지점을 **Automatic**으로 되돌리면 스트림이 이어지는 경우 그렇다고도 알려 줍니다. 그 지점과
+  같거나 이전인 시작 지점, 또는 시작 지점이 없는 Start는 스트림을 이어 가며 거부되지 않습니다.
+  CloudFormation이 롤백한 첫 Start 뒤에는 스택에 Start를 롤백했다는 사실만 남습니다: 롤백이 스택의
+  파라미터를 되돌리므로, 그 Start가 준 시작 지점은 앱의 메모리에만 남습니다. 앱이 그 지점을 알고 있는
+  동안에는 그보다 뒤의 시작 지점은 거부되고, 같은 시작 지점에서 다시 시작하는 것은 거부되지 않습니다. 앱을
+  재시작한 뒤에는(또는 다른 세션에서 한 Start라면) 어떤 시작 지점도 그 지점과 비교할 수 없으므로, 그
+  스택에서는 같은 시작 지점을 포함해 모든 시작 지점이 같은 경로와 함께 거부됩니다(*CloudFormation rolled
+  back this stack's last Start, and the start offset that Start offered is no longer known …*).
+  CDC only 경로는 새 스택을 Full Load의 워터마크에서 시작하므로, Full load only 재실행이 타깃에 이미 있던
+  행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요(append는 그 행을 그대로 두고,
+  워터마크에서 시작한 CDC는 그 뒤의 변경만 가져옵니다).
+  PostgreSQL에는 이런 거부가 없습니다: Start CDC는 Full Load의 워터마크와 상관없이 스택 자체의
+  복제 슬롯에서 이어 가고, Full load only 실행은 그 슬롯을 건드리지 않으므로, 스택의 소스 커넥터가
+  스트리밍했다면 CDC는 Stop CDC 후의 모든 재시작처럼(위) 멈춘 곳에서 이어 갑니다(그렇지 않으면 Debezium이
+  먼저 선택한 모든 테이블을 스냅샷합니다).
+- 클릭과 작업 시작 사이에 스택이 스트리밍을 시작하면, 엔진이 작업 스레드에서 아무것도 읽거나 쓰기 전에
+  거부합니다: 그 실행은 *FullLoadRefusedError*와 같은 한 줄 이유로 실패로 기록됩니다.
 
 ---
 
@@ -213,7 +286,7 @@ Aurora DSQL의 일시적 상태는 거부가 아닙니다: `40001`, 끊긴 연�
 
 - 완료된 배치는 `DONE`으로 기록;
 - 중단/재시도는 미완료 범위만 다시 실행;
-- `INSERT ... ON CONFLICT` 덕분에 몇 번을 다시 실행해도 중복이 생기지 않음.
+- `INSERT ... ON CONFLICT` 덕분에 배치를 다시 실행해도 중복이 생기지 않음.
 
 "실패 테이블 재시도" 경로는 실패 테이블만 대기 상태로 리셋하고, **원래 워터마크를 재사용**하며, 완료된
 테이블은 유지합니다 — 작업을 다시 하거나 CDC 핸드오프 지점을 잃지 않습니다.
@@ -222,10 +295,12 @@ Aurora DSQL의 일시적 상태는 거부가 아닙니다: `40001`, 끊긴 연�
 [13.7](13-excluding-tables-and-columns.md) 참고)도 같은 재시도가 로드하지만, 원래 워터마크는 그 테이블을
 포함하지 않으므로 CDC 핸드오프는 원래 집합에만 유효합니다: Re-run Full Load가 현재 집합에 대한 새
 워터마크를 잡을 때까지(또는 그 이후 선택한 테이블의 체크를 해제할 때까지) 마이그레이션 유형은 Full load only에 머뭅니다.
+그 재실행은 **Drop & reload**로 하세요: 그러면 CDC가 그 워터마크에서 시작하는데, *Append*는 앞선 적재가
+쓴 행을 그 뒤 소스의 UPDATE와 DELETE 없이 그대로 둡니다.
 
 이 마이그레이션에서 CDC를 이미 시작한 경우가 아니라면, 테이블의 체크를 해제하는 것만으로는 유형이 잠기지 않습니다: CDC는 로드된 테이블 중 아직 선택된 테이블을 캡처합니다. Full load + CDC에서는 로드 후 CDC를 시작하기 전까지 테이블의 체크를 해제할 수 있습니다. 그 테이블은 Aurora DSQL에 그대로 남고, CDC가 캡처하지 않으며, 워터마크는 캡처되는 모든 테이블을 여전히 포함하고(핸드오프는 계속 gapless), 체크를 해제한 테이블에서만 생긴 실패는 더 이상 단계를 붙잡지 않습니다.
 
-Full load + CDC에서는 CDC를 시작하기 전까지 로드 후에 테이블을 체크할 수도 있습니다. Retry unfinished tables가 [13.7](13-excluding-tables-and-columns.md)의 점검(CDC를 시작한 적이 없음, Aurora DSQL 테이블이 비어 있거나 drop 후 재적재됨, CDC가 그 테이블을 공백 없이 캡처할 수 있음: MySQL에서는 워터마크 이후 그 테이블의 정의가 바뀌지 않았고, PostgreSQL에서는 사용할 수 있는 replica identity가 있으며 복사 전에 CDC의 publication에 들어감)을 거친 뒤 원래 워터마크 아래에서 그 테이블을 로드합니다. 그러면 워터마크가 그 테이블을 포함하게 되고, CDC는 다른 테이블과 함께 그 워터마크에서 그 테이블을 캡처하므로, 그 테이블의 핸드오프도 gapless입니다. MySQL에서 Full Load가 시작 지점 정의를 기록하지 않은 테이블(이전 버전의 Full Load, 또는 로드 후에 변환된 테이블)은 대신 Re-run all tables가 로드합니다. Full load only는 바뀌지 않습니다: 거기서의 로드는 워터마크를 절대 확장하지 않습니다.
+Full load + CDC에서는 CDC를 시작하기 전까지 로드 후에 테이블을 체크할 수도 있습니다. Retry unfinished tables가 [13.7](13-excluding-tables-and-columns.md)의 점검(CDC를 시작한 적이 없음, Aurora DSQL 테이블이 비어 있거나 drop 후 재적재됨, CDC가 그 테이블을 공백 없이 캡처할 수 있음: MySQL에서는 워터마크 이후 그 테이블의 정의가 바뀌지 않았고, PostgreSQL에서는 사용할 수 있는 replica identity가 있으며 복사 전에 CDC의 publication에 들어감)을 거친 뒤 원래 워터마크 아래에서 그 테이블을 로드합니다. 그러면 워터마크가 그 테이블을 포함하게 되고, CDC는 다른 테이블과 함께 그 워터마크에서 그 테이블을 캡처하므로, 그 테이블의 핸드오프도 gapless입니다. MySQL에서 Full Load가 시작 지점 정의를 기록하지 않은 테이블(이전 버전의 Full Load, 또는 로드 후에 변환된 테이블)은 대신 Re-run all tables가 로드하며, 이때 **Drop & reload**를 선택하세요: 모든 테이블에 대해 새 시작 지점을 잡는데, append는 이미 로드된 행을 그대로 두기 때문입니다. Full load only는 바뀌지 않습니다: 거기서의 로드는 워터마크를 절대 확장하지 않습니다.
 
 > **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
 > `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,

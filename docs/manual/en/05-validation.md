@@ -145,6 +145,41 @@ The report is **exportable** so you can attach it to a cut-over decision.
 > Any **unexplained** missing/extra PK on a count-matched, caught-up table is what
 > Validation exists to surface.
 
+> **The report's own recovery card.** When a mismatch is **unexplained**, the report shows
+> **How to recover** with the ordered click-path. On a **Full load + CDC** or **CDC only**
+> migration whose CDC stack has **streamed** — stopped after a Start, its connectors in
+> place, or a Start CloudFormation rolled back — or whose CDC state has not been read yet
+> (after an app restart, until the Data Migration step reads it; the card says so, and
+> shows the steps for the stack as it is once it has been read), that backfill takes a
+> **new start point**, so the steps put new CDC topics first: Stop CDC if it is running →
+> **Delete CDC infrastructure** and deploy it again → **Re-run Full Load** (**Re-run all
+> tables** when some failed) choosing **Drop & reload** → **Start CDC**, which starts from
+> the new Full Load's start point → **Re-run validation**. With CDC only, a step after the
+> redeploy sets the migration type to Full load + CDC, which has the Full Load step. The
+> Full Load step refuses a new start point on such a stack until the infrastructure is
+> deployed again
+> ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)): a resume after a
+> Full Load that took a new start point is **not** gapless, which is why the new topics come
+> first. On a stack that never streamed the order is shorter (with CDC only, switch the
+> migration type to Full load + CDC first → **Re-run Full Load** (**Re-run all tables** when
+> some failed) choosing **Drop & reload** → **Start CDC**, which starts from the new Full
+> Load's start point → **Re-run validation**). These are the steps above without Stop CDC
+> and the redeploy, and the card shows them once that redeploy is done: the re-run is a
+> **Drop & reload** there too, because CDC starts from its new start point and an append
+> would keep rows older than it. In **Full load only** the card is *Re-run Full
+> Load to backfill the gap*: the re-run, then **Re-run validation**, with no CDC step.
+> Reloading **one table** is different: **Drop & reload** of specific tables keeps the
+> **original** start point, so the per-table way forward in 5.5–5.7 is never gated. When
+> the target holds rows the source does not, the card says *The target holds rows the
+> source does not — a delete never landed*: a re-run only adds rows, so it names that
+> per-table reload (**Reload specific tables**, with CDC stopped, choosing **Drop &
+> reload**; with CDC only, after switching the migration type to Full load + CDC). With CDC
+> only and no Full Load record in this session there is no table to reload, so it names a new
+> Full Load start point instead: Stop CDC if it is running and **Delete CDC
+> infrastructure** and deploy it again (on a stack that has streamed, or whose CDC state is
+> not read yet), then switch the migration type to Full load + CDC, run its Full Load
+> choosing **Drop & reload**, and **Start CDC**.
+
 Once Validation reports a clean **MATCH** (or every difference is explained) — and,
 for a CDC migration, the dead-letter check in 5.5 clears — the
 final workflow step — **Cut over** — appears in the UI with the runbook for
@@ -198,6 +233,12 @@ Validation and Cut over use it:
      CloudWatch Logs that **started after the latest validation finished**;
   3. the history of that read reaches back to the **Full Load watermark** (or, for CDC
      only, the CDC start).
+- **A held change is not a dead letter yet.** A change the sink holds on a unique index
+  ([§4.4](04-cdc-and-dsql-constraints.md#44-how-the-sink-handles-dsqls-constraints-in-the-data-path))
+  is dead-lettered only when its wait ends, so a read made meanwhile cannot count it:
+  wait at least 5 minutes after the source's last write before the final validation
+  ([§10.3](10-conclusion.md#103-the-cut-over-switching-your-application-to-dsql), step
+  3). Its table's Stream lag shows the wait.
 - **Restarts.** The per-table count, its latest time and the drift kinds survive an
   app restart; the record list on the Data Migration step does not. After a restart,
   Cut over re-reads the log automatically — one bounded read each time the Validation or
@@ -234,9 +275,11 @@ Cut over repeats them as a non-blocking warning.
 - **Full Load + CDC:** re-run Step 1 (Evaluation) if the source schema changed →
   Stop CDC → reload the table with **Drop & reload** → Start CDC → re-check it.
 - **CDC only:** correct the rows on Aurora DSQL by hand (the dead-letter queue card
-  lists each record's primary key and Kafka offset) → re-check. A source `TRUNCATE`'s
-  dead letter names no row: Stop CDC → delete the rows the source no longer has (at most
-  3,000 rows per transaction) → Start CDC → re-check
+  lists each record's primary key and Kafka offset, with the key's value when that is an
+  integer or a UUID) → re-check; for a table whose key values the card withholds, use
+  **Start over**. A source `TRUNCATE`'s dead letter names no row: Stop CDC → delete the
+  rows the source no longer has (at most 3,000 rows per transaction) → Start CDC →
+  re-check
   ([§4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
 
 **Full Load only** is unaffected, unless CDC ran earlier in the same session: dead

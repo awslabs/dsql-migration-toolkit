@@ -87,7 +87,9 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  *       that replaces the held one, the partition is rewound and paused) while other
  *       partitions keep applying, and it is tried again at the end of each put; it is
  *       dead-lettered with its real reason only if the conflict outlasts
- *       {@link #UNIQUE_HOLD_BUDGET_NANOS} (see {@link #holdOrReport}).</li>
+ *       {@link #UNIQUE_HOLD_BUDGET_NANOS}, time Aurora DSQL could not answer not counted (see
+ *       {@link #holdOrReport}). A hold is released only when the put returns normally, so
+ *       Connect's redelivery of a failed put's batch never writes a partition past its tail.</li>
  *   <li><b>Connectivity</b> — closed/expired connection (1h DSQL timeout, token
  *       expiry): reconnect and retry.</li>
  *   <li><b>Permanent</b> — any other SQLSTATE: do NOT retry; report the offending
@@ -234,7 +236,8 @@ public class DsqlSinkTask extends SinkTask {
 
   /**
    * How long a change Aurora DSQL rejects on a unique index (23505) is held on its partition,
-   * from its first rejection, for the change that frees the value to apply (see
+   * from its first rejection or from this task's last transient failure, whichever is later
+   * ({@link #lastTransientNanos}), for the change that frees the value to apply (see
    * {@link #holdOrReport}); past it the change is dead-lettered with its real reason.
    * Package-private for tests; deliberately not a config option.
    */
@@ -250,11 +253,24 @@ public class DsqlSinkTask extends SinkTask {
   static final String UNIQUE_VIOLATION_SQLSTATE = "23505";
 
   /**
+   * How a hold ended: its head applied, was dead-lettered, or a later change of its row read one
+   * poll further replaces it (REPLACED).
+   */
+  enum HoldEnd {
+    APPLIED,
+    DEAD_LETTERED,
+    REPLACED
+  }
+
+  /**
    * One held partition: its head (the change a unique index rejected, at {@code offset}) and
    * when it is tried next. Nothing at or after {@code offset} on that partition is written until
    * the head applies or is dead-lettered. While {@code lookahead} is set the partition is not
    * paused yet: the next poll that brings its records past {@code frontier} is read (never
-   * written) for a later change of the same row that replaces the head.
+   * written) for a later change of the same row that replaces the head. Once {@code ended} is
+   * set the hold is never tried again and is released when a put returns normally
+   * ({@link #releaseEndedHolds}); a put that throws first keeps it, so Connect's redelivery of
+   * that put's batch still skips the tail.
    */
   static final class UniqueHold {
     final Applicable head;
@@ -265,6 +281,8 @@ public class DsqlSinkTask extends SinkTask {
     int attempts;
     boolean lookahead;
     long frontier; // the last offset of this partition the put that made the hold carried
+    HoldEnd ended; // null while the hold waits
+    long endedNanos;
 
     UniqueHold(Applicable head, long offset, long firstNanos, String constraint) {
       this.head = head;
@@ -272,6 +290,11 @@ public class DsqlSinkTask extends SinkTask {
       this.firstNanos = firstNanos;
       this.nextNanos = firstNanos; // due at once: the freeing change may be later in this put
       this.constraint = constraint;
+    }
+
+    void end(HoldEnd how, long nowNanos) {
+      this.ended = how;
+      this.endedNanos = nowNanos;
     }
   }
 
@@ -284,6 +307,21 @@ public class DsqlSinkTask extends SinkTask {
   // partition's current offset to the end of the put before the next poll rewinds it, and a
   // commit in between must not pass the diverted records.
   private final Map<TopicPartition, Long> releasedCaps = new HashMap<>();
+  // Set while a put has not returned normally: the next put is then Connect's redelivery of
+  // that put's batch (WorkerSinkTask keeps it on a RetriableException), whose records were
+  // fetched BEFORE any rewind issued since, so releasedCaps are kept through it.
+  private boolean redelivering;
+  // The clock value of this task's last transient failure (Aurora DSQL unreachable, a dropped
+  // connection, a 40001 or XX000 whose retry budget ran out), Long.MIN_VALUE before any: while
+  // Aurora DSQL cannot answer, neither a held change nor the change that frees its value can
+  // apply, so a hold's budget restarts after it (see UNIQUE_HOLD_BUDGET_NANOS).
+  private long lastTransientNanos = Long.MIN_VALUE;
+  // Held changes' tries in a row that failed transiently, reset by a try Aurora DSQL answers:
+  // the next try waits holdWaitNanos(this) -- 500 ms doubling to 10 s -- so an outage is not
+  // met with a reconnect every 500 ms. And when such a failure was last logged
+  // (logUnansweredTry).
+  private int unansweredTries;
+  private long unansweredLoggedNanos;
   // Offsets after a hold that were dead-lettered before any write in the put that created it:
   // they are fetched again after the rewind and must not be dead-lettered twice. Dropped once
   // the committed offset passes them.
@@ -293,6 +331,9 @@ public class DsqlSinkTask extends SinkTask {
   private List<Applicable> putBatch = List.of();
   private List<SinkRecord> putRefused = List.of();
   private Collection<SinkRecord> putRecords = List.of();
+  // The current put's records in a held partition's tail (skipped unparsed), parsed the first
+  // time the superseded check needs them (heldTailInPut); null until then and outside put().
+  private List<Applicable> putHeldTail;
 
   // --- Per-table applied-ops monitor metrics (best-effort CloudWatch) --------
   // The UI reads these instead of COUNT(*)-ing the source: the sink knows exactly
@@ -335,6 +376,22 @@ public class DsqlSinkTask extends SinkTask {
   // must not build a backlog of windows). The skipped counts are not lost -- they stay
   // in the counters and roll into the next window.
   private final AtomicBoolean emitInFlight = new AtomicBoolean(false);
+
+  // Transactions this task ran again because Aurora DSQL answered 40001 or XX000 (OccRetry's
+  // step between attempts) since the last offset commit, which logs them once (flush). Task
+  // thread only, like put() and the commit.
+  private long occRetries;
+  private long unavailableRetries;
+
+  /**
+   * The INFO line, at most one per offset commit, when transactions were run again since the
+   * last one. Counts and SQLSTATE codes only (Property 7); deliberately none of the phrases the
+   * tool reads from this log. Package-private for tests.
+   */
+  static final String RETRY_SUMMARY =
+      "Since the last offset commit, Aurora DSQL asked this task to retry a transaction {} "
+          + "times (SQLSTATE 40001: {}, XX000: {}); each failed attempt was rolled back and "
+          + "run again.";
 
   @Override
   public String version() {
@@ -419,12 +476,37 @@ public class DsqlSinkTask extends SinkTask {
     return conn;
   }
 
+  /**
+   * Apply one batch. A hold that ends in it (its head applied, was dead-lettered, or is replaced
+   * by a later change of its row) is released only when it returns normally
+   * ({@link #releaseEndedHolds}): a put that throws a {@link RetriableException} is redelivered
+   * by Connect with the SAME batch -- fetched before any rewind issued since -- so a release
+   * issued before the throw would let that redelivery write the partition's later records
+   * ahead of its never-written tail, and the next commit pass that tail.
+   */
   @Override
   public void put(Collection<SinkRecord> records) {
-    // Any put() runs after the poll that applied the rewinds of the holds released before it.
+    boolean redelivery = redelivering;
+    redelivering = true; // until this put returns normally
     if (!releasedCaps.isEmpty()) {
-      releasedCaps.clear();
+      if (redelivery) {
+        // A redelivered batch predates these caps' rewinds: its records of a released partition
+        // at or after the cap are skipped unparsed (they are fetched again, in order), and the
+        // rewind is issued again for the poll after it (Connect sets the partition's current
+        // offset to the end of the batch first).
+        releasedCaps.forEach(context::offset);
+      } else {
+        // Any other put() runs after the poll that applied the rewinds of these releases.
+        releasedCaps.clear();
+      }
     }
+    applyPut(records);
+    releaseEndedHolds();
+    redelivering = false;
+  }
+
+  /** The body of {@link #put}: parse, refuse pre-write, apply, then try the due holds. */
+  private void applyPut(Collection<SinkRecord> records) {
     if (records.isEmpty()) {
       if (!holds.isEmpty()) {
         putNanos = nanoTime();
@@ -437,7 +519,8 @@ public class DsqlSinkTask extends SinkTask {
     List<Applicable> batch = new ArrayList<>(records.size());
     long now = nanoTime(); // one clock read per put(): the value-fit cache + drift cool-down
     putNanos = now;
-    boolean skipping = !holds.isEmpty() || !refusedAhead.isEmpty();
+    // releasedCaps is non-empty here only in a redelivery (any other put clears it first).
+    boolean skipping = !holds.isEmpty() || !refusedAhead.isEmpty() || !releasedCaps.isEmpty();
     List<SinkRecord> refused = new ArrayList<>(0);
     Map<TopicPartition, List<SinkRecord>> lookedAhead = null;
     for (SinkRecord record : records) {
@@ -533,6 +616,7 @@ public class DsqlSinkTask extends SinkTask {
       putBatch = List.of();
       putRefused = List.of();
       putRecords = List.of();
+      putHeldTail = null;
     }
     // After every chunk, so a freeing change elsewhere in this put has committed first.
     if (!holds.isEmpty()) {
@@ -757,7 +841,7 @@ public class DsqlSinkTask extends SinkTask {
             conn.commit();
             return null;
           },
-          this::rollbackBeforeRetry,
+          this::beforeRetry,
           config.maxRetries(),
           config.retryBackoffMs());
       recordOps(chunk); // committed: count the chunk's per-table applied ops
@@ -779,8 +863,7 @@ public class DsqlSinkTask extends SinkTask {
         // Do not "fix" this into a bounded/fail-fast retry: that would dead-letter
         // healthy rows during a routine reconnect (idle close / token expiry / worker
         // recycle) -- the exact data-loss mode this path exists to prevent.
-        discardConnection();
-        throw transientRetryException(e);
+        throw transientFailure(e);
       }
       // Permanent failure somewhere in the batch — find and isolate the poison
       // row(s); apply the rest. Single-row chunk → that row is the poison.
@@ -812,7 +895,7 @@ public class DsqlSinkTask extends SinkTask {
               conn.commit();
               return null;
             },
-            this::rollbackBeforeRetry,
+            this::beforeRetry,
             config.maxRetries(),
             config.retryBackoffMs());
         recordOps(a.event()); // committed this row: count its applied op
@@ -824,8 +907,7 @@ public class DsqlSinkTask extends SinkTask {
         if (isTransient(e)) {
           // Transient: reconnect + re-raise as RetriableException so Connect
           // redelivers (see applyChunk for the full rationale). Not fatal.
-          discardConnection();
-          throw transientRetryException(e);
+          throw transientFailure(e);
         }
         holdOrReport(a, e);
       }
@@ -859,6 +941,39 @@ public class DsqlSinkTask extends SinkTask {
       "Table {}: the change at partition {} offset {} conflicted on unique index {} and a later "
           + "change of the same row in this batch replaces it; skipped.";
 
+  /**
+   * The INFO line when a held change is replaced by a later change of its row read one poll
+   * further (the look-ahead), which ends its hold. Package-private for tests.
+   */
+  static final String UNIQUE_HOLD_REPLACED =
+      "Table {}: a later change of the same row replaces the held change at partition {} offset "
+          + "{}, so the hold on unique index {} ended and that partition continues.";
+
+  /** The INFO line when a held partition is revoked (rebalance, stop). Package-private. */
+  static final String UNIQUE_HOLD_DROPPED =
+      "Table {}: partition {} was revoked while the change at offset {} was held; its commit "
+          + "stayed at that change, so the partition's next owner reads it again.";
+
+  /**
+   * The WARN when a held change's try fails transiently (Aurora DSQL unreachable, a dropped
+   * connection, a 40001 or XX000 past its retries). The put does not throw for it, so Connect
+   * logs nothing; the line starts like the RetriableException Connect logs for any other
+   * transient failure, the text the stall notice and the manual point to. SQLSTATE, table,
+   * partition, offset and the next wait only, never a driver message (Property 7).
+   * Package-private for tests.
+   */
+  static final String UNIQUE_HOLD_TRY_FAILED =
+      "DSQL apply failed (transient sqlstate={}); the sink tries the change held on table {} at "
+          + "partition {} offset {} again in {} ms, less often (up to every 10 s) while this "
+          + "lasts, and this time does not count against its 5 min.";
+
+  /**
+   * How often, at most, {@link #UNIQUE_HOLD_TRY_FAILED} repeats while the tries keep failing
+   * (Connect's default offset-commit interval, about how often it logged the RetriableException
+   * a failed try threw before G25). Package-private for tests.
+   */
+  static final long UNIQUE_HOLD_TRY_FAILED_LOG_NANOS = TimeUnit.SECONDS.toNanos(60);
+
   private static TopicPartition partitionOf(SinkRecord record) {
     return new TopicPartition(record.topic(), record.kafkaPartition());
   }
@@ -885,10 +1000,19 @@ public class DsqlSinkTask extends SinkTask {
     return out == null ? chunk : out;
   }
 
-  /** The pre-parse skip of {@link #put}: a held tail, or an offset already refused ahead. */
+  /**
+   * The pre-parse skip of {@link #put}: a held tail, an offset already refused ahead, or -- in
+   * a redelivery -- a released partition's record at or after its cap.
+   */
   private boolean skipHeldOrRefused(SinkRecord record) {
     if (!holds.isEmpty() && isHeldTail(record)) {
       return true;
+    }
+    if (!releasedCaps.isEmpty()) {
+      Long cap = releasedCaps.get(partitionOf(record));
+      if (cap != null && record.kafkaOffset() >= cap) {
+        return true;
+      }
     }
     if (refusedAhead.isEmpty()) {
       return false;
@@ -928,18 +1052,25 @@ public class DsqlSinkTask extends SinkTask {
    *   <li>on a table that is not re-keyed, a LATER change of the same row on the same
    *       partition in this put that replaces it entirely (a plain delete, or an upsert of the
    *       same column set) makes it moot: it is skipped, not dead-lettered (the image a re-run
-   *       of a landed XX000 commit repeats, G22);</li>
+   *       of a landed XX000 commit repeats, G22, or an older image replayed onto a target that
+   *       already holds a later one). A known limit: the row keeps its current values until
+   *       that later change applies, so a change of ANOTHER row between the two on the
+   *       partition that needs a value the skipped change would have freed is held with the
+   *       later change in its tail, and dead-lettered once its budget runs out (as on v52,
+   *       which dead-lettered both): never lost silently. The same goes for a head the
+   *       look-ahead below finds replaced;</li>
    *   <li>otherwise its partition is held: nothing at or after it on that partition is
    *       written (its tail is fetched again), the committed offset stays at or below it
    *       ({@link #preCommit}), and it is tried alone at the end of each put
    *       ({@link #resolveDueHolds}) until it applies or, {@link #UNIQUE_HOLD_BUDGET_NANOS}
-   *       after its first rejection, is dead-lettered with its real reason. Other partitions
-   *       keep applying. On a table that is not re-keyed the partition is first read one poll
-   *       further ({@link #endLookaheads}): the change that frees the value can be a later
-   *       change of the held row itself on the same partition (a primary-key change and its
-   *       reversal, or an older image replayed after a restart or a re-read of the stream), and
-   *       a pause would keep it from ever arriving. Only then -- and at once for a move or a
-   *       re-keyed table -- is Connect asked to rewind the partition to it and pause it.</li>
+   *       after its first rejection (or after this task's last transient failure, whichever is
+   *       later), is dead-lettered with its real reason. Other partitions keep applying. On a
+   *       table that is not re-keyed the partition is first read one poll further
+   *       ({@link #endLookaheads}): the change that frees the value can be a later change of
+   *       the held row itself on the same partition (a primary-key change and its reversal, or
+   *       an older image replayed after a restart or a re-read of the stream), and a pause would
+   *       keep it from ever arriving. Only then -- and at once for a move or a re-keyed table --
+   *       is Connect asked to rewind the partition to it and pause it.</li>
    * </ul>
    */
   private void holdOrReport(Applicable a, SQLException e) {
@@ -984,6 +1115,7 @@ public class DsqlSinkTask extends SinkTask {
     } else {
       pauseHeld(tp, hold);
     }
+    recordLag(event); // the wait shows as replication lag on its table (see flush)
     log.info(UNIQUE_HOLD_START, event.table(), constraint, tp.partition(), offset);
   }
 
@@ -999,15 +1131,17 @@ public class DsqlSinkTask extends SinkTask {
    * End the one-poll look-ahead of each hold whose partition brought records past what the put
    * that made it carried ({@code seen}, in offset order, none of them written). A later change
    * of the held row among them that replaces it entirely ({@link #replaces}) makes the head moot:
-   * the hold is dropped and the partition rewound past the head, so those records are fetched
-   * again and applied in order. Otherwise the partition is rewound to the hold and paused. A
-   * record that does not parse here is only skipped (it is fetched again and handled as ever).
+   * the hold ends, and once the put returns normally the partition is rewound past the head
+   * ({@link #releaseEndedHolds}), so those records are fetched again and applied in order --
+   * after the rest of this put, whose chunks can still fail transiently, has been written.
+   * Otherwise the partition is rewound to the hold and paused. A record that does not parse
+   * here is only skipped (it is fetched again and handled as ever).
    */
   private void endLookaheads(Map<TopicPartition, List<SinkRecord>> seen) {
     for (Map.Entry<TopicPartition, List<SinkRecord>> entry : seen.entrySet()) {
       TopicPartition tp = entry.getKey();
       UniqueHold hold = holds.get(tp);
-      if (hold == null || !hold.lookahead) {
+      if (hold == null || !hold.lookahead || hold.ended != null) {
         continue;
       }
       boolean superseded = false;
@@ -1024,11 +1158,7 @@ public class DsqlSinkTask extends SinkTask {
         }
       }
       if (superseded) {
-        holds.remove(tp);
-        log.debug(
-            UNIQUE_SUPERSEDED, hold.head.event().table(), tp.partition(), hold.offset,
-            hold.constraint);
-        release(tp, hold);
+        hold.end(HoldEnd.REPLACED, putNanos);
       } else {
         pauseHeld(tp, hold);
       }
@@ -1039,7 +1169,11 @@ public class DsqlSinkTask extends SinkTask {
    * True when this put holds a LATER change of {@code failing}'s row on its partition that
    * replaces it entirely: a plain delete (not a delete that spares a row), or a plain upsert
    * rendering the same SQL (the same column set, so a partial image never replaces a full one).
-   * Tables that are not re-keyed only (the caller checks). Linear; the error path only.
+   * A change below its partition's hold gets here only in Connect's redelivery of the put that
+   * made the hold, whose later changes of that partition are then the hold's tail, skipped
+   * unparsed: they are looked at too ({@link #heldTailInPut}), so the redelivery skips the
+   * change again, as the put did the first time, instead of dead-lettering it. Tables that are
+   * not re-keyed only (the caller checks). Linear; the error path only.
    */
   private boolean supersededInPut(Applicable failing) {
     for (Applicable later : putBatch) {
@@ -1047,13 +1181,43 @@ public class DsqlSinkTask extends SinkTask {
         return true;
       }
     }
+    if (holds.containsKey(partitionOf(failing.record()))) {
+      for (Applicable later : heldTailInPut()) {
+        if (replaces(failing, later.record(), later.event())) {
+          return true;
+        }
+      }
+    }
     return false;
   }
 
   /**
+   * This put's records at or after their partition's hold, parsed once per put and only when
+   * {@link #supersededInPut} needs them. One that does not parse is left out: it is fetched
+   * again with its partition and handled as ever.
+   */
+  private List<Applicable> heldTailInPut() {
+    if (putHeldTail == null) {
+      List<Applicable> tail = new ArrayList<>();
+      for (SinkRecord r : putRecords) {
+        if (isHeldTail(r)) {
+          try {
+            tail.add(new Applicable(r, DebeziumEvents.parse(r, targetKeys)));
+          } catch (RuntimeException e) {
+            // not a replacement: fetched again with its partition
+          }
+        }
+      }
+      putHeldTail = tail;
+    }
+    return putHeldTail;
+  }
+
+  /**
    * True when {@code le} (record {@code lr}) is a LATER change of {@code failing}'s row on its
-   * partition -- never an earlier one -- that replaces it entirely: a plain delete, or a plain
-   * upsert rendering the same SQL. The rule of {@link #supersededInPut} and
+   * partition -- never an earlier one -- that replaces it entirely: a plain delete (not a delete
+   * that spares a row), or a plain upsert rendering the same SQL (the same column set, so a
+   * partial image never replaces a full one). The rule of {@link #supersededInPut} and
    * {@link #endLookaheads}.
    */
   private static boolean replaces(Applicable failing, SinkRecord lr, ChangeEvent le) {
@@ -1078,21 +1242,23 @@ public class DsqlSinkTask extends SinkTask {
 
   /**
    * Try every due hold alone, one row in one transaction (the same retry as a row of
-   * {@link #applyRecordByRecord}), in the order the holds were made. Applied: the partition is
-   * rewound past it and resumed. Rejected again by a unique index within the budget: tried
-   * again after a doubling wait (500 ms up to 10 s). Past the budget, or rejected for another
-   * reason: dead-lettered exactly as before, then rewound past it and resumed. A transient
-   * failure is redelivered as anywhere else (the hold stays). While holds remain, the next poll
-   * is bounded so an idle task comes back to try them, and each paused partition's rewind is
-   * re-issued. Never sleeps.
+   * {@link #applyRecordByRecord}), in the order the holds were made. Applied: the hold ends and
+   * its partition is rewound past it and resumed when the put returns. Rejected again by a
+   * unique index within the budget: tried again after a doubling wait (500 ms up to 10 s). Past
+   * the budget, or rejected for another reason: dead-lettered exactly as before, and released
+   * the same way. A transient failure does not fail the put -- every write of it has already
+   * committed, and redelivering the batch would only repeat them: the hold stays, the
+   * connection is dropped, every hold is tried again after a wait that doubles from 500 ms up
+   * to 10 s while the tries keep failing ({@link #unansweredTries}), the failure is logged
+   * ({@link #logUnansweredTry}), and the time does not count against the budget
+   * ({@link #lastTransientNanos}). While holds remain, the next poll is bounded so an idle task
+   * comes back to try them, and each paused partition's rewind is re-issued. Never sleeps.
    */
   private void resolveDueHolds() {
     long now = nanoTime();
-    java.util.Iterator<Map.Entry<TopicPartition, UniqueHold>> it = holds.entrySet().iterator();
-    while (it.hasNext()) {
-      Map.Entry<TopicPartition, UniqueHold> entry = it.next();
+    for (Map.Entry<TopicPartition, UniqueHold> entry : holds.entrySet()) {
       UniqueHold hold = entry.getValue();
-      if (now < hold.nextNanos) {
+      if (hold.ended != null || now < hold.nextNanos) {
         continue;
       }
       TopicPartition tp = entry.getKey();
@@ -1105,19 +1271,30 @@ public class DsqlSinkTask extends SinkTask {
               conn.commit();
               return null;
             },
-            this::rollbackBeforeRetry,
+            this::beforeRetry,
             config.maxRetries(),
             config.retryBackoffMs());
       } catch (SQLException e) {
         rollbackQuietly();
         if (isTransient(e)) {
           discardConnection();
-          throw transientRetryException(e);
+          lastTransientNanos = nanoTime();
+          unansweredTries++;
+          long retryIn = holdWaitNanos(unansweredTries);
+          for (UniqueHold other : holds.values()) {
+            other.nextNanos = Math.max(other.nextNanos, now + retryIn); // the others meet it too
+          }
+          logUnansweredTry(tp, hold, e, retryIn, now);
+          recordLag(event);
+          break;
         }
+        unansweredTries = 0; // Aurora DSQL answered
         boolean unique = UNIQUE_VIOLATION_SQLSTATE.equals(e.getSQLState());
-        if (unique && now - hold.firstNanos < UNIQUE_HOLD_BUDGET_NANOS) {
+        if (unique
+            && now - Math.max(hold.firstNanos, lastTransientNanos) < UNIQUE_HOLD_BUDGET_NANOS) {
           hold.attempts++;
           hold.nextNanos = now + holdWaitNanos(hold.attempts);
+          recordLag(event);
           log.debug(
               "Table {}: the held change at partition {} offset {} still conflicts on unique "
                   + "index {} (attempt {}).",
@@ -1128,42 +1305,91 @@ public class DsqlSinkTask extends SinkTask {
           log.warn(UNIQUE_HOLD_EXPIRED, event.table(), hold.constraint, tp.partition(), hold.offset);
         }
         reportOrThrow(hold.head.record(), event, e); // the unchanged dead letter and reason
-        it.remove();
-        release(tp, hold);
+        hold.end(HoldEnd.DEAD_LETTERED, now);
         continue;
       }
+      unansweredTries = 0;
       recordOps(event); // committed the held row: count its applied op
       if (!driftCooldown.isEmpty()) {
         clearDriftCooldownOnSuccess(event);
       }
-      it.remove();
-      release(tp, hold);
-      log.info(
-          UNIQUE_HOLD_RESOLVED,
-          event.table(),
-          TimeUnit.NANOSECONDS.toSeconds(Math.max(0L, now - hold.firstNanos)),
-          hold.attempts + 1,
-          tp.partition());
-    }
-    if (holds.isEmpty()) {
-      return;
+      hold.end(HoldEnd.APPLIED, now);
     }
     long wait = Long.MAX_VALUE;
     for (Map.Entry<TopicPartition, UniqueHold> entry : holds.entrySet()) {
-      if (!entry.getValue().lookahead) {
-        context.offset(entry.getKey(), entry.getValue().offset); // idempotent
+      UniqueHold hold = entry.getValue();
+      if (hold.ended != null) {
+        continue;
       }
-      wait = Math.min(wait, entry.getValue().nextNanos - now);
+      if (!hold.lookahead) {
+        context.offset(entry.getKey(), hold.offset); // idempotent
+      }
+      wait = Math.min(wait, hold.nextNanos - now);
+    }
+    if (wait == Long.MAX_VALUE) {
+      return; // no hold waits any more
     }
     long waitMs = TimeUnit.NANOSECONDS.toMillis(Math.max(0L, wait));
     context.timeout(
         Math.max(1L, Math.min(waitMs, TimeUnit.NANOSECONDS.toMillis(UNIQUE_HOLD_MAX_WAIT_NANOS))));
   }
 
+  /**
+   * Release every hold that ended -- in this put, or in a put that threw before it -- now that
+   * this put returns normally: rewind its partition past the head and resume it, capping the
+   * commit until that rewind has run. Nothing can fail after this, so Connect never redelivers
+   * a released partition's later records ahead of its never-written tail.
+   */
+  private void releaseEndedHolds() {
+    if (holds.isEmpty()) {
+      return;
+    }
+    java.util.Iterator<Map.Entry<TopicPartition, UniqueHold>> it = holds.entrySet().iterator();
+    while (it.hasNext()) {
+      Map.Entry<TopicPartition, UniqueHold> entry = it.next();
+      UniqueHold hold = entry.getValue();
+      if (hold.ended == null) {
+        continue;
+      }
+      TopicPartition tp = entry.getKey();
+      it.remove();
+      release(tp, hold);
+      ChangeEvent event = hold.head.event();
+      if (hold.ended == HoldEnd.APPLIED) {
+        log.info(
+            UNIQUE_HOLD_RESOLVED,
+            event.table(),
+            TimeUnit.NANOSECONDS.toSeconds(Math.max(0L, hold.endedNanos - hold.firstNanos)),
+            hold.attempts + 1,
+            tp.partition());
+      } else if (hold.ended == HoldEnd.REPLACED) {
+        log.info(UNIQUE_HOLD_REPLACED, event.table(), tp.partition(), hold.offset, hold.constraint);
+      } // DEAD_LETTERED: its WARN and the quarantine line were logged when it was decided
+    }
+  }
+
   /** The wait after the {@code attempts}-th failed try: 500 ms, doubling, capped at 10 s. */
   static long holdWaitNanos(int attempts) {
     int doublings = Math.max(0, Math.min(attempts - 1, 20));
     return Math.min(UNIQUE_HOLD_FIRST_WAIT_NANOS << doublings, UNIQUE_HOLD_MAX_WAIT_NANOS);
+  }
+
+  /**
+   * Log {@link #UNIQUE_HOLD_TRY_FAILED} for a held change's try that failed transiently with
+   * {@code e}, the next try {@code retryInNanos} away: on the first such try since one Aurora
+   * DSQL answered, then at most once per {@link #UNIQUE_HOLD_TRY_FAILED_LOG_NANOS} while they
+   * keep failing. Package-private for tests; true when it logged.
+   */
+  boolean logUnansweredTry(
+      TopicPartition tp, UniqueHold hold, SQLException e, long retryInNanos, long now) {
+    if (unansweredTries > 1 && now - unansweredLoggedNanos < UNIQUE_HOLD_TRY_FAILED_LOG_NANOS) {
+      return false;
+    }
+    unansweredLoggedNanos = now;
+    log.warn(
+        UNIQUE_HOLD_TRY_FAILED, e.getSQLState(), hold.head.event().table(), tp.partition(),
+        hold.offset, TimeUnit.NANOSECONDS.toMillis(retryInNanos));
+    return true;
   }
 
   /** Rewind {@code tp} past its released hold and resume it; cap its commit until then. */
@@ -1247,7 +1473,10 @@ public class DsqlSinkTask extends SinkTask {
   @Override
   public void close(Collection<TopicPartition> partitions) {
     for (TopicPartition tp : partitions) {
-      holds.remove(tp);
+      UniqueHold hold = holds.remove(tp);
+      if (hold != null) {
+        log.info(UNIQUE_HOLD_DROPPED, hold.head.event().table(), tp.partition(), hold.offset);
+      }
       refusedAhead.remove(tp);
       releasedCaps.remove(tp);
     }
@@ -1360,14 +1589,13 @@ public class DsqlSinkTask extends SinkTask {
     try {
       return OccRetry.withRetry(
           () -> loadTargetTypes(key[0], key[1]),
-          this::rollbackBeforeRetry,
+          this::beforeRetry,
           config.maxRetries(),
           config.retryBackoffMs());
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
-        discardConnection();
-        throw transientRetryException(e);
+        throw transientFailure(e);
       }
       if (catalogWarned.add(table)) {
         // Table name and SQLSTATE only: the driver message is not logged (Property 7).
@@ -1443,14 +1671,13 @@ public class DsqlSinkTask extends SinkTask {
     try {
       return OccRetry.withRetry(
           () -> loadSourceKeyIndex(key[0], key[1], columns),
-          this::rollbackBeforeRetry,
+          this::beforeRetry,
           config.maxRetries(),
           config.retryBackoffMs());
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
-        discardConnection();
-        throw transientRetryException(e);
+        throw transientFailure(e);
       }
       if (sourceKeyWarned.add(table)) {
         // Table name and SQLSTATE only: the driver message is not logged (Property 7).
@@ -1565,15 +1792,19 @@ public class DsqlSinkTask extends SinkTask {
       // can never carry a duplicate conflict key.
       List<Applicable> run = dedupeRunByPk(statements, i, end);
       try (PreparedStatement ps = conn.prepareStatement(sql)) {
-        java.sql.ParameterMetaData meta = paramMetaOrNull(ps); // once per statement
+        Described described = describe(ps); // once per statement
         for (Applicable a : run) {
-          bind(ps, a.event(), meta);
+          bind(ps, a.event(), described.meta());
           ps.addBatch();
         }
-        if (run.size() == 1) {
-          ps.executeUpdate();
-        } else {
-          ps.executeBatch();
+        try {
+          if (run.size() == 1) {
+            ps.executeUpdate();
+          } else {
+            ps.executeBatch();
+          }
+        } catch (SQLException e) {
+          throw described.cause(e);
         }
       }
       i = end;
@@ -1771,8 +2002,13 @@ public class DsqlSinkTask extends SinkTask {
 
   private void executeStatement(Connection conn, ChangeEvent event) throws SQLException {
     try (PreparedStatement ps = conn.prepareStatement(renderSql(event))) {
-      bind(ps, event, paramMetaOrNull(ps));
-      ps.executeUpdate();
+      Described described = describe(ps);
+      bind(ps, event, described.meta());
+      try {
+        ps.executeUpdate();
+      } catch (SQLException e) {
+        throw described.cause(e);
+      }
     }
   }
 
@@ -2098,6 +2334,18 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
+   * The exception to throw for a transient {@code e} (Connect redelivers the batch): drop the
+   * possibly half-open connection so the next attempt truly reconnects ({@code isValid()} can
+   * pass on a stale socket), and note the time, so a hold's budget does not run while Aurora
+   * DSQL cannot answer ({@link #lastTransientNanos}).
+   */
+  private RetriableException transientFailure(SQLException e) {
+    discardConnection();
+    lastTransientNanos = nanoTime();
+    return transientRetryException(e);
+  }
+
+  /**
    * {@code e} reduced to its SQLSTATE, vendor code and the names of its own and its root
    * cause's exception classes, with its stack trace -- never a driver message. Package-private
    * for tests.
@@ -2237,12 +2485,15 @@ public class DsqlSinkTask extends SinkTask {
    * TYPE_CHANGE cool-down). Any other failure still falls back to plain {@code setObject}
    * binding -- 0A000, 42703 and a null SQLSTATE (a driver limitation, which would otherwise be
    * redelivered forever) included -- and a connection-level one (08, 57) fails again at
-   * execute, where it is transient.
+   * execute, where it is transient. The failure is kept ({@link Described#cause}): inside an
+   * open transaction -- a move's upsert after its delete, or any statement group after a
+   * chunk's first -- it aborted the transaction, and the execute then fails only with the
+   * 25P02 that names no cause, so the describe's own error (such as 42703, a column the target
+   * lacks) is reported in its place.
    */
-  private static java.sql.ParameterMetaData paramMetaOrNull(PreparedStatement ps)
-      throws SQLException {
+  private static Described describe(PreparedStatement ps) throws SQLException {
     try {
-      return ps.getParameterMetaData();
+      return new Described(ps.getParameterMetaData(), null);
     } catch (SQLException e) {
       if (OccRetry.retriesInProcess(e)) {
         // An OCC conflict (OC001: a stale catalog) or Aurora DSQL's server unavailable
@@ -2251,7 +2502,27 @@ public class DsqlSinkTask extends SinkTask {
         // rolls back and re-runs the transaction.
         throw e;
       }
-      return null; // fall back to plain setObject binding
+      return new Described(null, e); // fall back to plain setObject binding; keep the cause
+    }
+  }
+
+  /** "current transaction is aborted, commands ignored until end of transaction block". */
+  static final String IN_FAILED_TRANSACTION_SQLSTATE = "25P02";
+
+  /**
+   * A statement's parameter describe: its metadata, or {@code null} with the describe's own
+   * failure kept. pgjdbc sends the describe with no BEGIN, so at a transaction's start a failed
+   * describe aborts nothing and the execute reports its own error; inside an open transaction
+   * (a move's upsert after its delete, any statement group after a chunk's first) it aborts the
+   * transaction, and the execute then fails with 25P02, which names no cause.
+   */
+  record Described(java.sql.ParameterMetaData meta, SQLException failure) {
+    /** The describe's failure when {@code executeFailure} is only the 25P02 it caused. */
+    SQLException cause(SQLException executeFailure) {
+      return failure != null
+              && IN_FAILED_TRANSACTION_SQLSTATE.equals(executeFailure.getSQLState())
+          ? failure
+          : executeFailure;
     }
   }
 
@@ -2294,6 +2565,44 @@ public class DsqlSinkTask extends SinkTask {
       // instead of failing with 25P02 -- which dead-lettered the next healthy row.
       discardConnection();
     }
+  }
+
+  /**
+   * {@link OccRetry}'s step between attempts at every call site: count the retry by its
+   * SQLSTATE (logged once per offset commit, {@link #logRetrySummary}), then
+   * {@link #rollbackBeforeRetry}. Package-private for tests.
+   */
+  void beforeRetry(SQLException retried) {
+    if (OccRetry.SERVER_UNAVAILABLE_SQLSTATE.equals(retried.getSQLState())) {
+      unavailableRetries++;
+    } else {
+      occRetries++; // OccRetry retries only a 40001 or an XX000
+    }
+    rollbackBeforeRetry();
+  }
+
+  /**
+   * Log, once, how many transactions Aurora DSQL asked this task to retry since the last call,
+   * by SQLSTATE, and reset the counts; nothing when there were none (the steady state). One
+   * INFO line per offset commit at most: a retry is an expected condition, but one that
+   * succeeded left no trace at all, so a slowdown from Aurora DSQL asking for retries could not
+   * be told from an undersized sink. Package-private for tests; true when it logged.
+   */
+  boolean logRetrySummary() {
+    long occ = occRetries;
+    long unavailable = unavailableRetries;
+    if (occ == 0L && unavailable == 0L) {
+      return false;
+    }
+    occRetries = 0L;
+    unavailableRetries = 0L;
+    log.info(RETRY_SUMMARY, occ + unavailable, occ, unavailable);
+    return true;
+  }
+
+  /** Package-private view for tests: the retries since the last summary, by SQLSTATE. */
+  long retriesSinceSummary(String sqlState) {
+    return OccRetry.SERVER_UNAVAILABLE_SQLSTATE.equals(sqlState) ? unavailableRetries : occRetries;
   }
 
   /**
@@ -2345,9 +2654,21 @@ public class DsqlSinkTask extends SinkTask {
    * PutMetricData here could exhaust that budget and produce a repeating "Commit of
    * offsets timed out" — i.e. a best-effort monitor degrading replication. So the
    * network call is queued, never awaited (see {@link #scheduleEmit}).
+   *
+   * <p>Before that, each change still held on a unique index counts as replication lag (now
+   * minus its source commit time) without an op, so its table's {@code ReplicationLagMs} grows
+   * while it waits -- no write applies it, so nothing else would report it -- and drops once it
+   * applies or is dead-lettered. Then the retries since the last commit are logged (one INFO
+   * line at most). Both are in-memory work on the task thread.
    */
   @Override
   public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
+    for (UniqueHold hold : holds.values()) {
+      if (hold.ended == null) {
+        recordLag(hold.head.event());
+      }
+    }
+    logRetrySummary();
     scheduleEmit();
   }
 
@@ -2398,7 +2719,7 @@ public class DsqlSinkTask extends SinkTask {
     // APPLIED", since the tombstone applies nothing new: same key, idempotent) and breaking
     // comparison with Inserts/Updates, which are 1:1. Returning here is safe for ordering:
     // recordOps runs AFTER the apply. Lag is unaffected -- a tombstone carries no
-    // source.ts_ms, so the `src > 0` gate below already skipped it.
+    // source.ts_ms, so the `src > 0` gate of recordLag already skipped it.
     if (event.isTombstone()) {
       return;
     }
@@ -2410,10 +2731,19 @@ public class DsqlSinkTask extends SinkTask {
             ? deletesByTable
             : event.isInsert() ? insertsByTable : updatesByTable;
     counter.computeIfAbsent(event.table(), t -> new LongAdder()).increment();
-    // End-to-end replication lag for this just-applied event: how long from the
-    // source commit (source.ts_ms) to now (apply/commit time). Keep the WORST lag
-    // per table since the last emit. Clamp to >= 0 (source/target clock skew can
-    // make a fresh event read slightly negative). Only when source.ts_ms was present.
+    recordLag(event);
+  }
+
+  /**
+   * End-to-end replication lag of {@code event} -- applied just now, or still held on a unique
+   * index: how long from the source commit (source.ts_ms) to now. Keeps the WORST lag per table
+   * since the last emit; counts no op. Clamped to >= 0 (source/target clock skew can make a
+   * fresh event read slightly negative). Only when source.ts_ms was present.
+   */
+  private void recordLag(ChangeEvent event) {
+    if (!metricsEnabled) {
+      return;
+    }
     long src = event.sourceTsMs();
     if (src > 0L) {
       long lag = Math.max(0L, System.currentTimeMillis() - src);

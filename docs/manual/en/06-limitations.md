@@ -20,7 +20,7 @@ fails **loudly** where it can't.
 | **Source `CHECK` constraints** | A source `CHECK` constraint is not translated to the target (e.g. a MySQL `CHECK`, 8.0.16+). | Dropped from the DDL and flagged **MANUAL** — re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool generates for a MySQL `ENUM` or a PostgreSQL enum, both converted to `text`, is unaffected. A value added to the source type later is dead-lettered with `23514` until you replace that `CHECK`; see [§4.2](04-cdc-and-dsql-constraints.md#detecting-and-handling-source-schema-drift).) |
 | **Primary key required** | A PK-less table can't be migrated. | Flagged **UNSUPPORTED**; also blocks Full Load (keyset export needs a PK). |
 | **No triggers / stored procedures / functions / scheduled events** | Server-side logic doesn't move. | Flagged **UNSUPPORTED** — reimplement in the application (events → EventBridge/Lambda). |
-| **No native partitioning** | DSQL auto-distributes data itself. | Partitioned tables flagged **MANUAL** (drop the partitioning). |
+| **No native partitioning** | DSQL auto-distributes data itself. | Partitioned tables flagged **MANUAL** (drop the partitioning). Nor is there table inheritance: a PostgreSQL inheritance (`INHERITS`) parent and each of its child tables migrate as separate tables, each only if selected. The Full Load, Validation and the CDC monitor's `MAX(pk)` check read a parent's own rows only (`FROM ONLY`), as CDC captures them, so a parent whose rows all live in its children (inheritance used as partitioning) loads none, and on Aurora DSQL its table holds only its own rows; a child needs a primary key of its own (PostgreSQL does not inherit one). In every migration type the prerequisite check warns about each such parent (*Inheritance child tables are migrated as tables of their own*: only the parent's own rows, and each child migrates as a table of its own if it is selected), and it fails the parent when this migration's Start CDC would snapshot it (for example every CDC only Start, a re-snapshot or a Manual start point; [§4.3](04-cdc-and-dsql-constraints.md)), and Start CDC refuses that snapshot, as does Deploy CDC infrastructure with CDC only (*CDC cannot snapshot a table that has inheritance child tables*): Debezium's snapshot would copy the children's rows into the parent's table, where CDC never changes them. If the tool cannot read the source at all, Start CDC does not refuse the snapshot but warns that its PostgreSQL checks did not run ([§4.3](04-cdc-and-dsql-constraints.md)). With CDC only, untick the parent (each child still migrates as a table of its own); with Full load + CDC, CDC starts from the Full Load's snapshot point, with no snapshot. |
 | **1 MiB per-column limit** | A single column value over **1 MiB** can't be stored — ANY type (MySQL `TEXT`/`BLOB`/`JSON`, PostgreSQL `text`/`bytea`/`json`): `54000 ERROR: maximum column size exceeded`. A whole **row** is capped at **2 MiB** (`maximum row size exceeded`), and one write transaction at 10 MiB. ([Aurora DSQL quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)) | Oversized values are **quarantined** per row to the error log (Full Load) / **DLQ** (CDC); columns that can exceed the Kafka message cap must be **excluded at capture**. Columns that can hold an oversized value are flagged `OVERSIZED_LOB`: a binary/document column (MySQL `MEDIUMBLOB`/`LONGBLOB`/`MEDIUMTEXT`/`LONGTEXT`/`JSON`, PostgreSQL `bytea`/`json`/`jsonb`) as a LOSS, since choosing that type is the intent to store something large; an unbounded PostgreSQL `text`/`varchar` as a RECOMMENDATION, since that is also the idiomatic spelling for an ordinary short string. A column a CHECK limits to a finite set of literals is not flagged at all. |
 | **`DECIMAL` precision > 1000** | Higher precision unsupported (DSQL documents maximum precision 1000, scale -1000..1000). | Evaluation flags it **UNSUPPORTED** (`NUMERIC_PRECISION`); if the converted DDL is applied anyway, Schema Conversion **clamps to the maximum** (lossy) with a warning. MySQL caps `DECIMAL` at 65,30, so this is a PostgreSQL-source edge only. |
 | **Spatial / geometry types** | For a MySQL source, substituted to `bytea` (raw WKB preserved end-to-end through Full Load and CDC); a PostgreSQL source is **not** auto-substituted. | MySQL source: the converter auto-substitutes each column to `bytea` and the assessor flags the table **MANUAL** for review. PostgreSQL source: geometric types (point/line/lseg/box/path/polygon/circle) are flagged **UNSUPPORTED** at both Evaluation (`PG_UNSUPPORTED_TYPE`) and Schema Conversion, with a suggested remodel to `text` — you must remodel before the DDL applies. (Other PG-only types that need manual remodeling rather than auto-substitution: arrays, network `inet`/`cidr`/`macaddr`, `xml`, `money`, `bit`/`varbit`, `tsvector`/`tsquery`, range/multirange, composite, pgvector.) |
@@ -42,6 +42,33 @@ fails **loudly** where it can't.
 
 ## 6.2 Migration-process limits
 
+- **A new CDC start point needs new CDC topics first.** Wherever this chapter sends you to
+  **Re-run Full Load with "Drop & reload"** (or **Re-run all tables**), or to a newer
+  **Manual** start point, to give CDC a newer start point, that start point is **refused**
+  while this migration's CDC stack has streamed — stopped after a Start, its connectors in
+  place, or a Start CloudFormation rolled back. The Full Load step refuses the re-run (Full
+  load + CDC), and on a MySQL source Start CDC refuses a start point newer than the one the
+  stack last started from, whatever the migration type, so a detour through **Full load
+  only** does not get around it. **Delete CDC infrastructure** and deploy it again first,
+  then the re-run (or the Manual point), then **Start CDC**
+  ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Otherwise that
+  stack's sink would re-apply changes older than the new start point over the reloaded
+  tables, while the source skips the changes between where CDC stopped and the new point.
+  Full load only has no CDC step: on a detour through it, switch the migration type first,
+  then delete and deploy on the CDC step. On MySQL, after a first Start that
+  CloudFormation rolled back, the stack records only that rollback, not the start point
+  that Start offered, which the app holds in memory: until the app restarts, Start CDC
+  refuses a later point than that one (a retry from it is not refused); after a restart, it
+  refuses every start point on that stack.
+  On a PostgreSQL source Start CDC has no such refusal: it continues from the stack's own
+  replication slot, which a Full load only run leaves as it is, so CDC continues from where
+  it stopped if the stack's source connector streamed (otherwise Debezium snapshots every
+  selected table first), gapless only while the CDC topics still retain what the sink had
+  not applied, and the reloaded tables converge. **Reload specific tables** and
+  **Retry unfinished tables** keep the original start point and are not affected. A Manual
+  point is a new start point: the changes between where CDC stopped and it are not
+  replicated, on the new stack too, so reload or correct those tables and validate with
+  CHECKSUM, as each remedy below says.
 - **Single region — no cross-region migration.** The tool works in any region
   where DSQL is available, but **source and target must be in the same region**,
   and the optional CDC pipeline runs in a single region/VPC. Cross-region is not
@@ -57,25 +84,31 @@ fails **loudly** where it can't.
     [§1.1](01-setup.md#11-prerequisites).
   - **PostgreSQL source:** `wal_level=logical` (RDS/Aurora: set the static
     `rds.logical_replication=1` in a custom DB/cluster parameter group, then reboot;
-    self-managed: set `wal_level=logical` and restart); a **replication-privileged
-    user** (superuser, the `REPLICATION` role attribute, or `rds_replication` membership
-    on RDS/Aurora); the source must be the cluster **WRITER**, not a standby/reader
+    self-managed: set `wal_level=logical` and restart); a **replication-privileged user**
+    (superuser, the `REPLICATION` role attribute, or `rds_replication` membership on
+    RDS/Aurora); the source must be the cluster **WRITER**, not a standby/reader
     (`pg_is_in_recovery()=false`); and every replicated table must have a usable
     **`REPLICA IDENTITY`**: `DEFAULT` needs a valid primary key that is not `DEFERRABLE`
-    (PostgreSQL keeps `DEFAULT` after the key is dropped, so the check reads the
-    source's catalog), `USING INDEX` a valid unique index, and `FULL` always works; on a
-    partitioned table every partition needs one. Without one, every `UPDATE`/`DELETE` on
-    the table would fail on the publisher once it is published, so the CDC prerequisite
-    check fails it and the Full Load stops before it changes anything on the source (no
-    publication, no slot). Each refusal names the fix for its cause: a new primary key
-    repairs only `DEFAULT`; `NOTHING`, or a `USING INDEX` whose index is gone, changes
-    only with `ALTER TABLE … REPLICA IDENTITY` (`FULL`, or `DEFAULT` with a primary key).
-    There is no binlog-retention analog: the tool creates a
-    **logical replication slot** and a **publication scoped to exactly the migrated
-    tables** at the Full Load consistency point, so WAL is pinned by the slot instead of
-    by a retention window (watch `wal_status` — an inactive slot can fill the source
-    disk).
-    Replication-slot / `max_wal_senders` headroom is checked (non-blocking).
+    (PostgreSQL keeps `DEFAULT` after the key is dropped, so the check reads the source's
+    catalog), `USING INDEX` a valid unique index, and `FULL` works for any table except,
+    on PostgreSQL 18, one with a generated column: PostgreSQL 18 refuses `UPDATE`/`DELETE`
+    on a published table whose identity includes a generated column the publication does
+    not publish (CDC's publishes none), so there neither `FULL` nor a key with a generated
+    column will do. On a partitioned table every partition needs one. Without one, every
+    `UPDATE`/`DELETE` on the table would fail on the publisher once it is published, so
+    the CDC prerequisite check fails it and the Full Load stops before it changes anything
+    on the source (no publication, no slot). Each
+    refusal names the fix for its cause (the prerequisite check also gives the statement,
+    with the table's name quoted): a new primary key repairs only `DEFAULT`; a
+    `DEFERRABLE` key is fixed by adding it again `NOT DEFERRABLE` (PostgreSQL cannot
+    change it in place) or by `FULL`; `NOTHING`, or a `USING INDEX` whose index is gone,
+    changes only with `ALTER TABLE … REPLICA IDENTITY` (`FULL`, or `DEFAULT` with a
+    primary key); and no fix offers `FULL` for a table PostgreSQL 18 would refuse it on.
+    There is no binlog-retention analog: the tool creates a **logical replication slot**
+    and a **publication scoped to exactly the migrated tables** at the Full Load
+    consistency point, so WAL is pinned by the slot instead of by a retention window
+    (watch `wal_status` — an inactive slot can fill the source disk). Replication-slot /
+    `max_wal_senders` headroom is checked (non-blocking).
   - **PostgreSQL source, re-keyed tables:** a table CDC re-keys — Schema
     Conversion's **Composite key**, or an edited target key that adds a column outside
     the source primary key — needs **`REPLICA IDENTITY FULL` on the table and on every
@@ -85,7 +118,13 @@ fails **loudly** where it can't.
     table's unique index on the source primary key, and always on CDC infrastructure
     deployed by an earlier version — and in the same cases an `UPDATE` that changes the
     added key column is dead-lettered and leaves the old row. The prerequisites block
-    Start. While the Data Migration, Validation or Cut over step is open, the tool
+    Start. On PostgreSQL 18 a re-keyed table with a generated column cannot keep FULL
+    (its `UPDATE`/`DELETE` would fail on the source, see above), so the prerequisites, the
+    Full Load and the load of a table selected after the Full Load refuse it before any
+    write: set it back to **Keep source PK** in Schema Conversion (for such a table the CDC
+    monitor's notice, below, names that fix instead of FULL: then reload the table, or, with
+    CDC only, migrate it again with **Start over**). While the Data
+    Migration, Validation or Cut over step is open, the tool
     re-reads it at most every 2 minutes: a red notice appears in the CDC monitor, and Cut
     over is held until it is FULL again and the table matches by CHECKSUM
     (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). After an
@@ -99,27 +138,50 @@ fails **loudly** where it can't.
   either order. A unique value passed from one row to another (an email address moved to
   another account) can do the same. On a table with a unique index besides its primary
   key, the insert can then meet the old row, which Aurora DSQL rejects at once (`23505`).
-  CDC infrastructure deployed by this version (sink plugin v53 or later) holds that change,
-  and every later change on its partition, until the other row's change has applied, for
-  up to 5 minutes, while other partitions keep flowing; when the partition's next batch
-  carries a later change of the same row that replaces it entirely, the change is skipped
-  instead. The change is still dead-lettered (*a unique constraint rejected the row*, with
-  the index name) when the change that frees the value is more than 5 minutes behind (very
-  uneven partition lag during a long catch-up), when an older change of a row replayed
-  after a restart or a re-read of the stream (such as the one after Delete and Deploy CDC
-  infrastructure) meets values its own later change already wrote and that later change is
-  more than one batch further on its partition, when the target already holds the value
-  from outside the stream, when a
-  PostgreSQL transaction swaps unique values between rows under a `DEFERRABLE` unique
-  constraint (each change waits on the other, so both are dead-lettered after 5 minutes),
-  and for the composite-key cause of a re-keyed table (below and §4.6). On CDC
-  infrastructure deployed by an earlier version the insert is dead-lettered at once and the
-  old row's delete then removes the row, so it is missing until the table is reloaded.
-  Either way Cut over holds the table until it matches by CHECKSUM, and once it does the
-  CDC step shows it as *Reloaded and verified*. Remedy: Stop CDC, reload the table on the
-  Full Load step with **Drop & reload**, Start CDC, then validate it. To pick up the wait,
-  Delete CDC infrastructure and deploy it again, which also deletes the stream position
-  (see the next entry). Both engines.
+  CDC infrastructure deployed by this version (sink plugin v53 or later) holds that
+  change, and every later change on its partition, until the other row's change has
+  applied, for up to 5 minutes (counted again from a later transient failure of the sink
+  task that holds it, so an Aurora DSQL outage that task sees does not use them up; one
+  that only delays the other row's change on another sink task can), while other
+  partitions keep flowing and its table's Stream lag shows the wait. The 5 minutes apply
+  to each held change, so conflicts on one partition are waited out one after another:
+  several of them during a catch-up delay that partition by about 5 minutes each. On a
+  table that is not re-keyed, when the same batch or the partition's next batch carries
+  a later change of the same row that replaces it entirely, the change is skipped
+  instead. The change is still
+  dead-lettered (*a unique constraint rejected the row*, with the index name) when the
+  change that frees the value is more than 5 minutes behind (very uneven partition lag
+  during a long catch-up), when an older change of a row replayed after a restart or a
+  re-read of the stream (such as the one after Delete and Deploy CDC infrastructure) meets
+  values its own later change already wrote and that later change is more than one batch
+  further on its partition, when the target already holds the value from outside the
+  stream, when the change needs a value that a skipped change of another row would have
+  freed and that row's replacing change is queued behind it on its partition, or itself
+  waits for a value the change's own row holds (then both are dead-lettered; a unique
+  value passed along several rows, such as X changing a to b while b is still taken, Z
+  then changing z to a and X changing again: X's first change is skipped, and X keeps a
+  on the target until its last change applies), when a PostgreSQL transaction swaps
+  unique values between rows under a `DEFERRABLE` unique constraint (each change waits on
+  the other, so both are dead-lettered, after 5 minutes, or about 10 when the two share a
+  partition), on a
+  re-keyed (Composite key) table when the row's own later change already made the conflict
+  moot (a primary-key change and its reversal, a replayed older image, the re-run of an
+  `XX000` commit that landed: nothing is skipped there, so it waits the 5 minutes and is
+  dead-lettered, though the target ends up right), and for the composite-key cause of a
+  re-keyed table (below and §4.6). On CDC infrastructure deployed by an earlier version
+  the insert is dead-lettered at once and the old row's delete then removes the row, so it
+  is missing until the table is reloaded. Either way Cut over holds the table until it
+  matches by CHECKSUM, and once it does the CDC step shows it as *Verified by CHECKSUM*;
+  if an open source-schema or REPLICA IDENTITY finding still holds it at Cut over, that
+  notice names the finding, which keeps its own fix (no reload is needed for the dead
+  letters). Remedy: Stop
+  CDC, reload the table on the Full Load step with **Drop & reload** (CDC only: correct
+  the rows on Aurora DSQL by hand), Start CDC, then validate it. A source that dropped or
+  relaxed the `UNIQUE` index gives the same dead letter (CDC replicates no DDL): drop the
+  index on Aurora DSQL too, and with Full load + CDC re-run Step 1 (Evaluation) first, so
+  the reload does not rebuild it. To pick up the wait, Delete CDC infrastructure and
+  deploy it again, which also deletes the stream position (see the next entry). Both
+  engines.
 - **Re-keyed tables on CDC infrastructure deployed by an earlier version** keep their
   change records keyed on the composite key (the Start CDC log says so). An `UPDATE` of
   the leading key column — or a delete and re-insert of a row with another leading
@@ -133,9 +195,10 @@ fails **loudly** where it can't.
   then re-reads the binlog from the Full Load watermark (CDC only: it begins at the
   source's current position, so changes made after the last one Aurora DSQL applied are
   not replicated); on PostgreSQL it drops the replication slot, so the next Start reads
-  every table again (Full load + CDC: choose **"Re-snapshot every table instead"**) and a
-  row the source deleted meanwhile stays on Aurora DSQL. See "Starting CDC again after a
-  delete" and "The cost of deleting a CDC-only stack" in
+  every table again (Full load + CDC: choose **"Re-snapshot every table instead"** when
+  the Start CDC dialog offers it) and a row the source deleted meanwhile stays on Aurora
+  DSQL. See "Starting CDC again after a delete" and "The cost of deleting a CDC-only
+  stack" in
   [Chapter 13](13-excluding-tables-and-columns.md#why-the-set-locks). Both engines. (A
   primary-key change on any table with another unique index: the entry above.)
 - **CDC replicates data, not DDL.** Schema changes on the source during CDC are
@@ -181,10 +244,12 @@ fails **loudly** where it can't.
 - **MySQL: a schema change between a CDC start point and the Start that uses it.** A
   MySQL Start that seeds a new start position runs Debezium in `snapshot.mode=recovery`:
   the first Start from the Full Load watermark or a Manual binlog start point (a MySQL
-  CDC-only first start needs one unless the session holds a Full Load watermark), a Start
-  after **Re-run Full Load** or a newer Manual point, and the first Start after **Delete
-  CDC infrastructure** and a new deploy — which reads again from the **original**
-  watermark. Under `recovery` Debezium rebuilds its schema history from the tables'
+  CDC-only first start needs one unless the session holds a Full Load watermark), and the
+  first Start after **Delete CDC infrastructure** and a new deploy — which reads again from
+  the **original** watermark. On a stack that has streamed, the new start point of a
+  **Re-run Full Load**, or a newer Manual point, is refused until the infrastructure is
+  deployed again (§6.2, first entry). Under `recovery` Debezium rebuilds its schema
+  history from the tables'
   **current** definitions, then reads the binlog from that earlier position, matching
   each row's values to columns by position. A schema change (`ALTER TABLE`, …) to a
   captured table committed in between therefore breaks the stream: an added or dropped
@@ -225,21 +290,23 @@ fails **loudly** where it can't.
     reorder or a character-set conversion, so validate the table with CHECKSUM after such
     a change.
   - **Starting again, Retry CDC and Debezium's "recovery mode" never help** — they replay
-    the same rows. Move the start point past the change: Stop CDC; refresh the source
-    inventory (re-run Step 1 Evaluation) and update the changed tables in Schema
-    Conversion, so the reload both recreates and reads the new definition — a table
-    whose DDL you edited, or whose key strategy you chose, keeps that edit (redo or reset
-    it), and a dropped or renamed column must be dropped on Aurora DSQL first or the
+    the same rows. Move the start point past the change. Stop CDC. On a stack that has
+    streamed (a restart after Stop CDC, or a connector that stopped mid-run), **Delete CDC
+    infrastructure** and deploy it again first: you get new, empty topics, and until then
+    the Full Load step refuses a new start point and Start CDC refuses a newer one.
+    Refresh the source inventory (re-run Step 1 Evaluation) and update the changed tables
+    in Schema Conversion, so the reload both recreates and reads the new definition — a
+    table whose DDL you edited, or whose key strategy you chose, keeps that edit (redo or
+    reset it), and a dropped or renamed column must be dropped on Aurora DSQL first or the
     table re-applied with Replace (Drop & reload refuses to destroy a target column the
     new definition no longer has); then **Re-run Full Load with "Drop & reload"** (the
     default *Append* keeps existing rows, so updates and deletes made in between would
     be lost; *Reload specific tables* and *Retry* keep the original watermark). The new
-    run's watermark is past the change, so Start CDC moves the offset forward to it. A
-    CDC-only run has no Full Load to re-run: update the changed tables on Aurora DSQL,
-    then choose **Manual**, **Fetch current position** and **Use this start point** on
-    the same stack (Start never rewinds a stopped stack's offset, but it does advance
-    it; on a stopped stack the start-point card offers this under **Manual — start from
-    a later binlog position instead**). Changes to the captured tables made before that
+    run's watermark is past the change, and Start CDC on the new stack (or the stack's
+    first Start) starts from it. A CDC-only run has no Full Load to re-run: update the
+    changed tables on Aurora DSQL, then — after Delete CDC infrastructure and a new deploy
+    if the stack has streamed — choose **Manual**, **Fetch current position** and **Use
+    this start point**, then Start CDC. Changes to the captured tables made before that
     point are then not replicated: reload them with "Drop & reload" (Full load + CDC) or
     correct them on Aurora DSQL (CDC only), and validate with CHECKSUM. A reload
     switches the CDC start point back to Automatic, so choose Manual again (the fetched
@@ -261,7 +328,10 @@ fails **loudly** where it can't.
   ignores the start point's binlog `file:position` (with `OFF`, `OFF_PERMISSIVE` or
   `ON_PERMISSIVE` it uses the `file:position`). On an `ON` source the GTID set therefore
   *is* the start point, so Start CDC reads `gtid_mode` first — in the Start dialog and
-  again before it changes anything — and refuses a start point it cannot use:
+  again before it changes anything (a refusal there fails the Start with *Start CDC
+  blocked: …*, and the CDC step shows the whole notice, with its fix, under the failed
+  Start; the activity log records it whole too, one longer than a log line as
+  consecutive `(1/2) …`, `(2/2) …` lines) — and refuses a start point it cannot use:
   - **No GTID set.** Debezium would make MySQL send its whole retained binary log again,
     re-applying changes made before the start point. **Fetch current position** records
     the position and the GTID set together; for a position you type, also enter the GTID
@@ -307,19 +377,22 @@ fails **loudly** where it can't.
   Start, so this holds even when the session no longer holds the start point (an
   attached stack, a reset session). Keep the start point by setting `gtid_mode` back to
   `ON_PERMISSIVE` until cut over (CDC then streams by `file:position`), or give CDC a new
-  start point: **Re-run Full Load with "Drop & reload"**, or **Manual** → **Fetch current
-  position** → **Use this start point**, then reload the tables changed in between with
-  "Drop & reload" (CDC only: correct them on Aurora DSQL) and validate with CHECKSUM.
+  start point — for a restart after Stop CDC (a stack that has streamed), after **Delete
+  CDC infrastructure** and a new deploy first: **Re-run Full Load with "Drop & reload"**,
+  or **Manual** → **Fetch current position** → **Use this start point**, then reload the
+  tables changed in between with "Drop & reload" (CDC only: correct them on Aurora DSQL),
+  Start CDC and validate with CHECKSUM.
   Changing `gtid_mode` while CDC streams takes effect at the connector's next automatic
   restart, can stop it or skip changes with no error, and the tool cannot intercept it:
   Stop CDC first. Start CDC also records on the CDC stack the source's `gtid_mode` each
   time it starts the source connector (Stop CDC keeps the record). On an `ON` source it
   refuses any start of a stack whose last start ran while `gtid_mode` was not `ON` — a
-  restart after Stop CDC, and also a new start point, because the offset seeder keeps
-  the committed offset whenever the new point is not later than it and Start CDC cannot
-  see that offset. That stack streamed by `file:position` from that start, so the GTID
-  set in its committed offset stopped advancing there. Keep `gtid_mode` `ON_PERMISSIVE`
-  until cut over, or **Delete CDC infrastructure**, deploy it again and Start CDC: a new
+  restart after Stop CDC, and also a new start point, because Start CDC does not take a
+  start point newer than where the stack last started (§6.2, first entry) and the offset
+  seeder keeps the committed offset whenever the new point is not later than it. That
+  stack streamed by `file:position` from that start, so the GTID set in its committed
+  offset stopped advancing there. For a restart, keep `gtid_mode` `ON_PERMISSIVE` until
+  cut over; or **Delete CDC infrastructure**, deploy it again and Start CDC: a new
   stack has no committed offset, so CDC then starts exactly at its start point — the one
   you hold if `gtid_mode` was already `ON` when it was recorded and has stayed `ON`
   since, else a new start point as above. A stack whose last start ran while `gtid_mode`
@@ -338,8 +411,10 @@ fails **loudly** where it can't.
   (a restart from a session that held none): it continues after the GTID set it holds
   and re-sends changes already applied, or stops on the ones written without a GTID, or
   skips them with no error. Keep such a source not `ON` until cut over, or give CDC a
-  new start point as above. Start points recorded by version 0.1.565 or earlier do not
-  record the mode: if `gtid_mode` was turned `ON` since, set a new one.
+  new start point on a new stack (Delete CDC infrastructure and deploy it again first),
+  as above. Start points recorded by version 0.1.565 or earlier do not record the mode:
+  if `gtid_mode` was turned `ON` since, set a new one (on a stack that has streamed,
+  after Delete CDC infrastructure and a new deploy).
 - **MySQL with `gtid_mode=ON`: pipelines started by version 0.1.565 or earlier.** Those
   versions emptied the GTID set Debezium starts from, so on a `gtid_mode=ON` source MySQL
   re-sent its whole retained binary log at every Start, every Start after Stop and every
@@ -347,14 +422,23 @@ fails **loudly** where it can't.
   values were re-applied, unique-key conflicts could be dead-lettered, and an unparseable
   DDL anywhere in the retained log — even before the start point — stopped every Start. A
   running pipeline keeps that behaviour until one **Stop CDC** → **Start CDC**, which then
-  resumes exactly where it stopped. A pipeline started from a Manual point (including CDC
+  continues from where it stopped: the changes the sink had not applied at the Stop come
+  from the CDC topics, so this is gapless only while the topics still retain them
+  ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)). A
+  pipeline started from a Manual point (including CDC
   only) can fail that Start with *the source has purged binary logs CDC's GTID set does
   not cover*: those versions recorded a GTID set without the transactions the source had
   purged at its start, although the source may still hold every change since CDC
   stopped. Stop CDC, set the source's `gtid_mode` to `ON_PERMISSIVE` until cut over (a
   parameter-group change on RDS and Aurora), then Start CDC: Debezium resumes from where
-  it stopped by `file:position`, with no gap (if the binlog retention also ran out, that
-  Start fails instead). Or give CDC a new start point as the message says. Such a Start
+  it stopped by `file:position`, with no gap while the CDC topics still retain the
+  changes the sink had not applied when CDC stopped (their retention period on MSK); if
+  the binlog retention also ran out, that Start fails instead. Or give CDC a new start
+  point, as the message says: this stack has streamed, so first **Delete CDC
+  infrastructure** and deploy it again, then **Re-run Full Load with "Drop & reload"** for
+  all tables (CDC only: **Manual** → **Fetch current position** → **Use this start
+  point**, then correct the tables changed in between on Aurora DSQL), then Start CDC and
+  validate with CHECKSUM. Such a Start
   is refused before anything changes when its Manual point has no GTID set; follow the
   message. If such a Start failed part-way, the topics may hold re-sent older changes
   and the sink may have applied some: **Delete CDC infrastructure**, deploy again,
@@ -377,15 +461,18 @@ fails **loudly** where it can't.
   start point on stops CDC (version 0.1.565 and earlier also re-read the retained binary
   log from its beginning on a `gtid_mode=ON` source, so an older statement could stop it
   too — see above).
-  - **Way forward.** Stop CDC, then give CDC a start point after the statement:
-    **Re-run Full Load with "Drop & reload"** for all tables (Full load + CDC; re-run
-    Step 1 Evaluation and Schema Conversion first if the statement changed a captured
-    table), or **Manual** → **Fetch current position** → **Use this start point**;
-    changes made between where CDC stopped and that point are then not replicated, so
-    reload those tables with "Drop & reload" (CDC only: correct them on Aurora DSQL) and
-    validate with CHECKSUM. A reload switches the start point back to Automatic, so
-    choose Manual again before Start CDC. Do not use the *binlog reader near position*
-    from the connector log as a start point: it is where the failing statement begins.
+  - **Way forward.** Stop CDC, then **Delete CDC infrastructure** and deploy it again: the
+    stack has streamed, so a new start point needs new, empty topics (until then the Full
+    Load step refuses a new start point, and Start CDC a newer one). Then give CDC a start
+    point after the statement: **Re-run Full Load with "Drop & reload"** for all tables
+    (Full load + CDC; re-run Step 1 Evaluation and Schema Conversion first if the
+    statement changed a captured table), or **Manual** → **Fetch current position** →
+    **Use this start point**; changes made between where CDC stopped and that point are
+    then not replicated, so reload those tables with "Drop & reload" (CDC only: correct
+    them on Aurora DSQL) and validate with CHECKSUM. A reload switches the start point back
+    to Automatic, so choose Manual again before you **Start CDC** on the new stack. Do not
+    use the *binlog reader near position* from the connector log as a start point: it is
+    where the failing statement begins.
   - **When moving the start point does not help.** A Start that builds Debezium's
     schema from the source — the first Start, a Start from a new start point, a Start
     that rebuilds a missing schema history — reads the current definition of every

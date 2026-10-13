@@ -148,7 +148,10 @@ what's missing, but setting them up is a source-side task you do once.
   position. The trade-off is the opposite risk: an **inactive/unconsumed slot keeps
   pinning WAL and can fill the source's disk**, so monitor WAL/slot health — the
   tool surfaces `wal_status`, and `wal_status='lost'` means the slot was invalidated
-  → gapless resume is broken → re-run Full Load.
+  → gapless resume is broken → Start CDC blocks and names the way out
+  ([§4.3](04-cdc-and-dsql-constraints.md)): with Full load + CDC, re-run Full Load with
+  **Drop & reload**, after Delete CDC infrastructure and a new deploy if the stack's
+  connectors were started before.
 - **MySQL source — GTID is recommended, but not required; decide before the Full Load.**
   With `gtid_mode=ON`, Debezium positions by GTID: CDC starts after the GTID set
   recorded with its start point (the Full Load watermark, or **Fetch current position**
@@ -166,9 +169,10 @@ what's missing, but setting them up is a source-side task you do once.
 - **PostgreSQL source — every replicated table needs a usable REPLICA IDENTITY.**
   `DEFAULT` needs a valid primary key that is not `DEFERRABLE` (PostgreSQL keeps
   `DEFAULT` after the key is dropped, so the check reads the source's catalog),
-  `USING INDEX` a valid unique index, and `FULL` always works
-  (`ALTER TABLE … REPLICA IDENTITY FULL`); on a partitioned table every partition needs
-  one. Without one, every UPDATE/DELETE on the table would fail on the source once it is
+  `USING INDEX` a valid unique index, and `FULL` (`ALTER TABLE … REPLICA IDENTITY FULL`)
+  works for any table except, on PostgreSQL 18, one with a generated column (the identity
+  must include none there, so neither may the key); on a partitioned table every partition
+  needs one. Without one, every UPDATE/DELETE on the table would fail on the source once it is
   published, so the CDC prerequisite check fails it, and the Full Load stops before it
   changes anything on the source (no publication, no slot). Replication-slot /
   `max_wal_senders` (walsender) **headroom** is checked as a non-blocking **WARN** (a

@@ -333,7 +333,7 @@ class MskConnectController:
             )
         return None
 
-    def _clear_window_bound_if_history_fits(self, logs, log_group: str) -> None:
+    def _clear_window_bound_if_history_fits(self, logs, log_group: str, *, since_ms: int) -> None:
         """Drop the look-back "lower bound" when the group's whole history is in the window.
 
         A read with no cursor looks back only ``window_seconds``, so its count is a lower
@@ -341,6 +341,8 @@ class MskConnectController:
         an hour ago has no 6-hour-old dead letter, yet every first read called its count a
         floor (live PG E2E, 2026-10-09). Every log stream starting inside the window proves
         it (``logs:DescribeLogStreams``, already granted for the connector log groups).
+        ``since_ms`` is the startTime of the no-cursor read that just SUCCEEDED -- never an
+        earlier failed attempt's, whose window started hours before the read that counted.
         Checked once per group; any error, or more streams than a few pages, keeps the
         bound (fail closed).
         """
@@ -350,9 +352,6 @@ class MskConnectController:
         if checked.get(log_group):
             return
         checked[log_group] = True
-        since_ms = self._dlq_state_dict("_dlq_first_read_start_ms").get(log_group)
-        if since_ms is None:
-            return
         try:
             token = None
             for _page in range(5):
@@ -492,9 +491,6 @@ class MskConnectController:
             # number that looks complete.
             if cursor is None:
                 self._dlq_first_read_window_seconds[log_group] = int(window_seconds)
-                self._dlq_state_dict("_dlq_first_read_start_ms").setdefault(
-                    log_group, now_ms - window_seconds * 1000
-                )
             return cursor if cursor is not None else now_ms - window_seconds * 1000
 
         if resume is not None:
@@ -555,7 +551,11 @@ class MskConnectController:
         self._dlq_read_truncated[log_group] = truncated
         self._dlq_state_dict("_dlq_read_ok")[log_group] = True
         self._dlq_state_dict("_dlq_read_error")[log_group] = None
-        self._clear_window_bound_if_history_fits(logs, log_group)
+        if cursor is None:
+            # Judged against THIS read's own look-back start: a first attempt that failed
+            # (an IAM or KMS fix in place keeps this controller) started its window hours
+            # earlier, and a stream created in between would have passed for "young".
+            self._clear_window_bound_if_history_fits(logs, log_group, since_ms=int(start_ms))
         errors: list[CdcConnectorError] = []
         max_ts = cursor or 0
         for event in events:

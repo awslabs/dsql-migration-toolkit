@@ -113,6 +113,15 @@ class SourceProbe(Protocol):
         simply yields "not determined".
         """
 
+    def inheritance_children(
+        self, table_names: Sequence[str]
+    ) -> "Optional[Mapping[str, tuple]]":
+        """PostgreSQL: ``{table: (child count, first child names)}`` for each of
+        ``table_names`` with inheritance (INHERITS) child tables, or ``None`` (MySQL, or the
+        read failed). Read-only. OPTIONAL, like :meth:`oversized_values`: Full load only
+        lists the inheritance WARN from it (G25), and a probe without it lists none.
+        """
+
 
 class TargetProbe(Protocol):
     """Read-only access to the target Aurora DSQL used by prerequisite checks."""
@@ -1116,6 +1125,30 @@ class PrerequisiteChecker:
             return None
         return {str(k): bool(v) for k, v in answer.items()}
 
+    def _inheritance_rows(self, tables: Sequence[TableDef]) -> list[PrerequisiteResult]:
+        """Full load only, PostgreSQL: the inheritance WARN of each selected inheritance
+        parent -- the CDC modes' row (``check_inheritance_children``, never a snapshot here)
+        over ONE catalog read (G25). ``inheritance_children`` is OPTIONAL on
+        :class:`SourceProbe`, like ``oversized_values``; a probe without it, or a read that
+        fails, adds no row (the row is advisory, and the Full Load reads FROM ONLY anyway)."""
+        from dsql_migrator.core import prerequisites_postgres
+
+        probe = getattr(self._source, "inheritance_children", None)
+        if not callable(probe) or not tables:
+            return []
+        try:
+            read = probe([table.name for table in tables])
+        except Exception:  # noqa: BLE001 - advisory read; never break the gate
+            return []
+        if not isinstance(read, Mapping):
+            return []
+        facts = prerequisites_postgres.PostgresCdcFacts(inheritance_children=dict(read))
+        rows = [
+            prerequisites_postgres.check_inheritance_children(table, facts, snapshots=False)
+            for table in tables
+        ]
+        return [row for row in rows if row is not None]
+
     def check(
         self,
         request: PrerequisiteCheckRequest,
@@ -1125,8 +1158,14 @@ class PrerequisiteChecker:
         lob_columns: Optional[Mapping[str, Sequence[str]]] = None,
         overlay_columns: Optional[Mapping[str, Iterable[str]]] = None,
         lob_limit_types: Optional[Mapping[str, Mapping[str, str]]] = None,
+        cdc_stack_started: bool = False,
     ) -> PrerequisiteReport:
         """Run all checks for ``request.mode`` over the resolved ``tables``.
+
+        ``cdc_stack_started`` (G25, PostgreSQL CDC only): the CDC stack's connectors were
+        started before, as the caller's stack-phase cache reads it. Its publication/slot row
+        then defers to the Start CDC dialog, which judges both against the stack's own
+        record (:func:`~dsql_migrator.core.prerequisites_postgres.check_cdc_replication_objects`).
 
         Produces one :class:`PrerequisiteResult` per check (and per selected
         table for ``TABLE_PRIMARY_KEY`` / ``TARGET_SCHEMA_READY``). CDC mode adds
@@ -1363,6 +1402,7 @@ class PrerequisiteChecker:
                             message_key_columns=request.message_key_columns,
                             pending_tables=request.cdc_pending_tables,
                             excluded_columns=exclusions,
+                            cdc_stack_started=cdc_stack_started,
                         )
                     )
             # MySQL's binlog/GTID rows are NOT listed for a PostgreSQL source, in either
@@ -1427,6 +1467,14 @@ class PrerequisiteChecker:
                 results.extend(
                     prerequisites_postgres.postgres_cdc_prerequisites_skipped()
                 )
+                # Not a CDC check: the Full Load reads an inheritance parent FROM ONLY in
+                # every migration type, so Full load only gets the same WARN as the CDC
+                # modes -- the parent's own rows only, each child table migrated as a table
+                # of its own if it is selected (G25).
+                if source_ok:
+                    results.extend(
+                        self._inheritance_rows([effective[t.name] for t in tables])
+                    )
             # The MySQL rows stay present for a PostgreSQL source too, but as an ENGINE
             # skip rather than a mode skip: D-1 established that a check id present in
             # one mode and absent in another reads as an oversight, so PG CDC keeps them

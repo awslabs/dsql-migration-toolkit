@@ -181,7 +181,9 @@ MySQL은 기본적으로 약 24시간만 보관). RDS/Aurora에서는 이 설정
 standby/reader가 아니라 클러스터의 **writer**여야(`pg_is_in_recovery()=false`) 하고 이 역시 **필수**이며,
 복제되는 모든 테이블에는 쓸 수 있는 **`REPLICA IDENTITY`**(`DEFAULT`에는 `DEFERRABLE`이 아닌 유효한 기본
 키가 필요 — PostgreSQL은 키가 삭제된 뒤에도 `DEFAULT`를 유지하므로 검사는 소스의 카탈로그를 읽음 — `USING
-INDEX`에는 유효한 고유 인덱스, `FULL`은 항상 동작; 파티션된 테이블은 모든 파티션에 필요. 없으면
+INDEX`에는 유효한 고유 인덱스, `FULL`은 어떤 테이블에도 동작하되 PostgreSQL 18에서 생성 컬럼이 있는
+테이블은 예외(거기서는 identity에 생성 컬럼이 들어가면 안 되므로 키에도 안 됨); 파티션된 테이블은 모든
+파티션에 필요. 없으면
 publication에 들어간 뒤 그 테이블의 모든 UPDATE/DELETE가 소스에서 실패하므로 CDC 사전 요구사항 검사가
 실패로 판정하고, Full Load는 소스에서 아무것도 바꾸기 전에 멈춤)가 **필수**입니다. 복제 슬롯 /
 `max_wal_senders`(walsender) 여유는 **경고**(비차단)입니다. PostgreSQL에는 **binlog 보존 개념이
@@ -281,8 +283,11 @@ bootstrap에 접근하기 위해 **반드시 VPC 안에 있어야** 하므로 �
 > 재시작**하는 편이 이 20분 지연을 피할 수 있어 유리합니다. **Stop CDC**는 MSK 클러스터·플러그인·
 > VPC·IAM을 보존하고 커넥터 2개만 제거하므로, 이후 **Start CDC**는 인프라 대기를 완전히 건너뛰고
 > 멈춘 지점에서 재개합니다 — MySQL 소스는 클러스터의 `connect-offsets` 토픽에 남아 있는 오프셋에서,
-> PostgreSQL 소스는 논리 슬롯의 LSN 위치에서요. 컷오버가 끝나 더 이상 CDC가 필요 없을 때 최종적으로
-> 철거하세요.
+> PostgreSQL 소스는 논리 슬롯의 LSN 위치에서요. 다만 Stop CDC는 싱크를 드레인하지 않으므로, 그때까지
+> 싱크가 적용하지 않은 변경은 CDC 토픽에서 적용됩니다: 그 재개에 빈틈이 없는 것은 토픽이 그 변경을
+> 아직 보존하는 동안(MSK에서의 보존 기간)뿐입니다. PostgreSQL 소스에서 그 기간이 지난 뒤의 경로는
+> [§4.3](04-cdc-and-dsql-constraints.md)에 있습니다. 컷오버가 끝나 더 이상 CDC가 필요 없을 때
+> 최종적으로 철거하세요.
 
 이 작업들은 각각 **결과**(성공/실패와 소요 시간)를 활동 로그에 기록하므로, 예컨대 컷오버 전에 실행한
 Stop이 실제로 완료되었는지를 나중에 확인할 수 있습니다.
@@ -559,17 +564,27 @@ AWS에 배포하는 형태는 **ECS Fargate 태스크 하나로 동작**하며, 
 1. **CDC 인프라 먼저**(CDC를 배포한 적이 있을 때만 — MSK / MSK Connect / NAT로 비용의 핵심입니다).
    **앱이 떠 있는 동안** UI에서 하세요: **Start over(우측 상단) → "Delete all CDC infrastructure"** (앱이
    `cdc-stack` 삭제를 구동, ~15–25분; 도구가 만든 소스 자격증명 시크릿도 함께 제거됩니다). 앱이 이미
-   없으면 수동 삭제: `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack`.
+   없으면 수동 삭제: `aws cloudformation delete-stack --stack-name dsql-cdc-stack`(실제 cdc-stack 이름을
+   쓰세요 — 기본값은 `dsql-cdc-stack`이고, 레거시 스택은 `mysql-dsql-cdc-stack`일 수 있습니다).
 2. **app-stack** — `deploy/teardown.sh <스택이름>` 실행(ECS/ALB/IAM 스택 삭제; `DELETE_ECR=true`를 주면
    컨테이너 이미지 저장소까지 제거).
 3. **build-stack** — 선택적 CodeBuild 빌드 경로를 썼을 때만.
 4. **스택이 소유하지 않는 잔여 리소스 확인:** 도구는 계정/리전별 **플러그인 버킷**
    `mysql-dsql-migrator-plugins-<계정>-<리전>`을 자동 생성하는데, 이건 어떤 스택에도 속하지 않아
-   `delete-stack`으로 지워지지 않습니다 — 완전히 깨끗이 하려면 직접 삭제하세요. 직접 만든 **Route 53**
-   레코드도 함께 제거하고, 마지막으로 `mysql-dsql-*` CloudFormation 스택이 남아 있지 않은지 확인하세요.
+   `delete-stack`으로 지워지지 않습니다 — 완전히 깨끗이 하려면 직접 삭제하세요(`aws s3 rb`에 `--force`;
+   되돌릴 수 없고, 그 계정·리전의 모든 도구 배포가 이 버킷을 함께 쓰므로 그중 어느 것도 쓰지 않을 때만).
+   이 버킷은 배포가 업로드한 CDC 플러그인 파일의 모든 버전을 한 부씩 보관하며(`cdc-plugins/<hash>/<file>`,
+   각각 최대 약 31 MiB), 아무것도 이를 정리하지 않습니다. ECS Fargate에서는 저장된 세션·작업 상태도 이
+   버킷에 있습니다. 직접 만든 **Route 53** 레코드도 함께 제거하고, 마지막으로 `mysql-dsql-*` 또는
+   `dsql-cdc-*` CloudFormation 스택이 남아 있지 않은지 확인하세요.
 
 teardown이 끝나면 최초 설치와 똑같이 처음부터 재배포할 수 있습니다(배포 가이드 참고). 인프라는 그대로 두고
-**마이그레이션만 다시 시작**하고 싶다면 **Start over**를 쓰세요 — 즉시, 비용 없이 됩니다.
+**마이그레이션만 다시 시작**하고 싶다면 **Start over**를 쓰세요 — 즉시, 비용 없이 됩니다. 남겨 둔 CDC
+스택에서 CDC가 스트리밍한 적 있다면, 그 스택에서 새로 Full load + CDC를 실행하려면 먼저 **Delete CDC
+infrastructure** 후 다시 배포해야 합니다: 그때까지 Full Load 단계가 새 시작 지점을 거부합니다
+([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)). 타깃 테이블에 이전 실행의 행이 아직 있으면, 새
+실행의 Start Full Load 대화 상자에서 **Drop & reload**를 선택하세요: 기본값 *Append*는 그 행을 그대로
+둡니다.
 
 ---
 

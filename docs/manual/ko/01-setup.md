@@ -122,8 +122,10 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
   것이 없습니다. 슬롯이 시작 위치를 잡아두므로 약 15~20분의 CDC 스택 프로비저닝도 문제가 되지
   않습니다. 대신 반대 방향의 위험이 있습니다: **비활성/미소비 슬롯이 계속 WAL을 고정해 소스 디스크를
   가득 채울 수 있으므로** WAL/슬롯 상태를 모니터링하세요 — 도구가 `wal_status`를 노출하며,
-  `wal_status='lost'`는 슬롯이 무효화됐다는 뜻으로 → gapless 재개가 깨졌으니 → Full Load를 다시
-  실행해야 합니다.
+  `wal_status='lost'`는 슬롯이 무효화됐다는 뜻으로 → gapless 재개가 깨졌으니 → Start CDC가 차단하며 해결
+  경로를 알려 줍니다([§4.3](04-cdc-and-dsql-constraints.md)): Full load + CDC에서는 **Drop & reload**로
+  Full Load를 다시 실행하되, 스택의 커넥터를 전에 시작했다면 먼저 Delete CDC infrastructure 후 다시
+  배포합니다.
 - **MySQL 소스 — GTID는 권장이지만 필수는 아니며, Full Load 전에 정하세요.** `gtid_mode=ON`이면
   Debezium이 GTID로 위치를 잡습니다: CDC는 시작 지점과 함께 기록된 GTID 셋(Full Load 워터마크, 또는
   Manual 지점이면 **Fetch current position**) 다음부터 시작하고, 마지막으로 커밋한 GTID 셋 다음부터
@@ -139,8 +141,10 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 - **PostgreSQL 소스 — 복제되는 모든 테이블에 사용 가능한 REPLICA IDENTITY가 필요합니다.**
   `DEFAULT`에는 `DEFERRABLE`이 아닌 유효한 기본 키가 필요하고(PostgreSQL은 키가 삭제된 뒤에도
   `DEFAULT`를 유지하므로 검사는 소스의 카탈로그를 읽습니다), `USING INDEX`에는 유효한 고유 인덱스가
-  필요하며, `FULL`은 항상 동작합니다(`ALTER TABLE … REPLICA IDENTITY FULL`). 파티션된 테이블은 모든
-  파티션에 하나씩 있어야 합니다. 없으면 테이블이 publication에 들어간 뒤 그 테이블의 모든
+  필요하며, `FULL`(`ALTER TABLE … REPLICA IDENTITY FULL`)은 어떤 테이블에도 동작하지만 PostgreSQL
+  18에서 생성 컬럼이 있는 테이블은 예외입니다(거기서는 identity에 생성 컬럼이 들어가면 안 되므로 키에도
+  들어가면 안 됨). 파티션된 테이블은 모든 파티션에 하나씩 있어야 합니다. 없으면 테이블이 publication에 들어간
+  뒤 그 테이블의 모든
   UPDATE/DELETE가 소스에서 실패하므로, CDC 사전 요구사항 검사가 실패로 판정하고 Full Load는 소스에서
   아무것도 바꾸기 전에 멈춥니다(publication도 슬롯도 만들지 않음). 복제 슬롯 /
   `max_wal_senders`(walsender) **여유**는 비차단 **경고(WARN)**로 검사됩니다(슬롯 항목이 남아 있어도

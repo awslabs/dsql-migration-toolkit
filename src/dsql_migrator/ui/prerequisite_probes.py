@@ -163,6 +163,11 @@ class SessionSourceProbe:
         serialization), because ``::`` does not parse on MySQL and the failure would be
         swallowed into "not determined" for every JSON column.
 
+        A PostgreSQL inheritance parent is measured ``FROM ONLY`` (G25), decided by the same
+        live catalog read the Full Load makes
+        (:func:`~dsql_migrator.core.source_dialect.postgres.pg_reads_own_rows_only`): only its
+        own rows are migrated into its table, and each child table's are the child's.
+
         Measures the UNCOMPRESSED byte length, which is an upper bound: DSQL's limit
         applies to the compressed size for the character and json types (outside a key), so
         a highly compressible value may still fit. Over-reporting in that direction is the
@@ -200,6 +205,17 @@ class SessionSourceProbe:
         try:
             with engine.connect() as connection:
                 self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
+                if is_postgres:
+                    # An inheritance parent is measured FROM ONLY: the Full Load and CDC
+                    # move only its own rows, so a child table's value is the child's to
+                    # report. The same live catalog read as the Full Load's (G25); if it
+                    # fails, nothing is measured (not determined, never a guess).
+                    from dsql_migrator.core.source_dialect.postgres import (
+                        pg_reads_own_rows_only,
+                    )
+
+                    if pg_reads_own_rows_only(connection, table_name):
+                        qualified = f"ONLY {qualified}"
                 for index, name in enumerate(columns):
                     if should_cancel is not None and should_cancel():
                         break
@@ -379,6 +395,29 @@ class SessionSourceProbe:
                 )
         except Exception:  # noqa: BLE001 - treated as "facts unknown"
             return None
+
+    def inheritance_children(
+        self, table_names: Sequence[str]
+    ) -> "Optional[dict[str, tuple]]":
+        """PostgreSQL: ``{table: (child count, first child names)}`` for each of
+        ``table_names`` that is a plain table with inheritance (INHERITS) child tables -- the
+        catalog read the CDC prerequisite makes (``cdc_pg_slot.read_inheritance_children``),
+        for Full load only, which reads such a parent ``FROM ONLY`` too (G25). Read-only, one
+        catalog statement. ``None`` for a MySQL source, or when the read fails."""
+        if self._config.source_type is not SourceType.POSTGRES:
+            return None
+        from dsql_migrator.core.cdc_pg_slot import read_inheritance_children
+
+        try:
+            engine = self._engine_factory(self._config)
+            try:
+                with engine.connect() as connection:
+                    rows = read_inheritance_children(connection, list(table_names))
+            finally:
+                engine.dispose()
+        except Exception:  # noqa: BLE001 - advisory read: no row, never a crash
+            return None
+        return {table: (count, sample) for table, count, sample in rows}
 
 
 class SessionTargetProbe:

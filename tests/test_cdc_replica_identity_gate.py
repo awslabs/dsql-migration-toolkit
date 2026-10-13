@@ -133,7 +133,7 @@ def test_a_weak_read_opens_one_finding_and_a_repeat_is_silent(logged):
     log_replica_identity_transitions(transitions)
     (line,) = logged
     assert line["status"] is ActivityStatus.FAILURE and line["target"] == "app.t"
-    assert "ALTER TABLE app.t REPLICA IDENTITY FULL" in line["detail"]
+    assert 'ALTER TABLE "app"."t" REPLICA IDENTITY FULL' in line["detail"]
     assert "REPLICA IDENTITY DEFAULT" in line["detail"]
     # The same weak state read again: nothing changes, nothing is logged.
     again, quiet = fold_replica_identity_probe(
@@ -651,7 +651,7 @@ def test_g15_copy_says_a_change_can_be_lost_on_any_infrastructure():
     assert detail == (
         "REPLICA IDENTITY DEFAULT; the composite key (tenant_id, id) adds tenant_id, which a "
         "DELETE carries only under REPLICA IDENTITY FULL, so deletes on app.t can miss Aurora "
-        "DSQL with no error and no dead letter. Fix: ALTER TABLE app.t REPLICA IDENTITY FULL "
+        'DSQL with no error and no dead letter. Fix: ALTER TABLE "app"."t" REPLICA IDENTITY FULL '
         "on the source (each partition too). Cut over is held."
     )
     _tone, _h, info = monitor_unchecked_notice({"app.t": KEY}, None, has_password=False)

@@ -162,8 +162,111 @@ RELOAD_RESETS_MANUAL = (
     "Use this start point before Start CDC (the fetched point is kept)."
 )
 
+# G25 (decisions A/B): a new start point on a stack that has streamed -- stopped since, in
+# place, or a Start CloudFormation rolled back -- needs new CDC topics first: its topics may
+# hold changes no sink applied, and its sink resumes from its last commit. The Full Load step
+# refuses a new start point there, and Start CDC refuses a newer one (A2).
+NEW_TOPICS = (
+    "Delete CDC infrastructure and deploy it again (the new stack starts with empty topics)"
+)
 
-def _ways_after_change(coord: str, migration_type: object) -> str:
+
+def new_topics_route(migration_type: object) -> str:
+    """The route to a new start point on a stack that has streamed, as a clause. Pure."""
+    if _cdc_only(migration_type):
+        return f"{NEW_TOPICS}, then Start CDC on the new stack"
+    return (
+        f"{NEW_TOPICS}, then Re-run Full Load on the Full Load step choosing 'Drop & reload', "
+        "then Start CDC"
+    )
+
+
+# A2: Start CDC refuses a start point newer than the one a streamed stack last started from.
+NEWER_POINT_HEADER = "This CDC stack cannot start from a newer start point"
+
+
+def newer_point_line(migration_type: object) -> str:
+    """A2's one-line form: the disabled Start button's tooltip, a click-time refusal, and the
+    Start CDC job's error after "Start CDC blocked: " -- under 300 characters with it, since a
+    job error keeps only its first line, so it carries the reason and the route. Pure."""
+    route = (
+        "Delete CDC infrastructure and deploy it again, then Start CDC on the new stack"
+        if _cdc_only(migration_type)
+        else "Delete CDC infrastructure and deploy it again, then Re-run Full Load choosing "
+        "'Drop & reload', then Start CDC"
+    )
+    return (
+        "This CDC stack has streamed, so Start CDC does not move it forward to a newer start "
+        f"point (its sink would apply older changes over newer rows): {route}. Nothing was "
+        "changed."
+    )
+
+
+def newer_point_notice(
+    *,
+    point: str,
+    last: Optional[str],
+    rolled_back: bool,
+    migration_type: object,
+    automatic_resumes: bool = False,
+) -> tuple[str, str, str, str]:
+    """``(tone, icon, header, body)`` refusing a MySQL Start from ``point`` (a
+    :func:`point_label`), later than ``last`` (``binlog F:P``, or ``None``: not recorded) --
+    the start offset this streamed stack's last Start offered, or (``rolled_back``) the one
+    the Start CloudFormation rolled back offered (G25, A2). ``automatic_resumes``: the start
+    point is a Manual one, and Automatic would continue this stream instead. Pure."""
+    if rolled_back:
+        lead = (
+            f"CloudFormation rolled back this stack's last Start, which offered {last}; that "
+            "Start's source connector may have streamed past it before the rollback removed "
+            f"it, and {point} is later than {last}."
+        )
+    elif last:
+        lead = (
+            f"This CDC stack has streamed: the position it committed is at or past {last}, "
+            f"the start offset its last Start offered, and {point} is later than that."
+        )
+    else:
+        lead = (
+            "This CDC stack has streamed, and its last Start offered no start offset, so "
+            f"{point} cannot be shown to be at or before the position it committed."
+        )
+    body = (
+        f"{lead} Start CDC does not move a streamed stack's position forward: its CDC topics "
+        "may hold changes no sink applied (Stop CDC and a rolled-back Start remove the "
+        "connectors without draining them), and its sink resumes from its last commit, so it "
+        "would write those older changes over anything loaded or corrected since, while the "
+        "source would skip every change between where it stopped and the new point — "
+        "silently. To start from a new "
+        f"start point, use {new_topics_route(migration_type)}."
+    )
+    if automatic_resumes:
+        body += " To continue this stream instead, set the CDC start point back to Automatic."
+    return "error", "fast_forward", NEWER_POINT_HEADER, body + " No connectors were changed."
+
+
+def _ways_after_change(coord: str, migration_type: object, *, streamed: bool = False) -> str:
+    if streamed:
+        # G25: the stack has streamed (a resume, or a retry after a rolled-back Start), so a
+        # start point after the change needs new CDC topics first (decisions A/B, A2).
+        if _cdc_only(migration_type):
+            return (
+                "To continue, give CDC a start point after the change. This stack's "
+                "connectors were started before, so that needs new CDC topics: "
+                f"{NEW_TOPICS}, update these tables "
+                "on Aurora DSQL to their new definitions (re-run Step 1 and Schema "
+                "Conversion), then choose Manual on the new stack (Fetch current position, "
+                "Use this start point) and Start CDC. Changes made between where CDC stopped "
+                "and the new point are not replicated: correct them on Aurora DSQL and "
+                "validate with CHECKSUM."
+            )
+        return (
+            "To continue, give CDC a start point after the change. This stack's connectors "
+            f"were started before, so that needs new CDC topics: {NEW_TOPICS}, re-run Step 1 "
+            "(Evaluation) and "
+            "update these tables in Schema Conversion, then Re-run Full Load for all tables "
+            "with \"Drop & reload\", then Start CDC."
+        )
     if _cdc_only(migration_type):
         return (
             "To continue, give CDC a start point after the change: update these tables on "
@@ -239,16 +342,21 @@ def start_point_notice(
     coord: str,
     migration_type: object,
     resumes: bool = False,
+    streamed: bool = False,
 ) -> Optional[tuple[str, str, str, str]]:
     """``(tone, icon, header, body)`` for the Start dialog / the job's refusal, or None. Pure.
 
     ``resumes``: the start resumes the stack's committed offset (a history-missing resume,
     the only checked one), so the copy says it reads from the recorded stream position --
     not from ``point_label``, which is only what the tables can be compared with.
+    ``streamed``: the stack has streamed (a resume, or a retry after a Start CloudFormation
+    rolled back), so a start point after the change needs new CDC topics first (G25): the
+    Full Load step refuses a new start point there, and Start CDC refuses a newer one.
     """
     if verdict is None or verdict.kind == KIND_OK:
         return None
     point = point_label
+    streamed = streamed or resumes
     if verdict.kind == KIND_CHANGED:
         if resumes:
             lead = (
@@ -270,7 +378,8 @@ def start_point_notice(
             )
         body = (
             f"{lead} Changed since {coord}: {changed_rows(verdict)}. "
-            f"{_ways_after_change(coord, migration_type)} No connectors were changed."
+            f"{_ways_after_change(coord, migration_type, streamed=streamed)} No connectors "
+            "were changed."
         )
         return "error", "schema", E1_HEADER, body
     if verdict.kind == KIND_UNREADABLE:
@@ -284,12 +393,24 @@ def start_point_notice(
         )
         body = f"{lead}, and {reason} {exit_} No connectors were changed."
         return "error", "link_off", E2_HEADER, body
-    way = (
-        "choose Manual, then Fetch current position and Use this start point for a start "
-        "point the tool can check (changes made before it are then not replicated)."
-        if _cdc_only(migration_type)
-        else 're-run the Full Load with "Drop & reload" for a start point the tool can check.'
-    )
+    if streamed:
+        # G25: a new start point on a stack that has streamed needs new CDC topics first.
+        way = (
+            f"use {NEW_TOPICS}, then choose Manual on the new stack, Fetch current position "
+            "and Use this start point for a start point the tool can check (changes made "
+            "before it are then not replicated), then Start CDC."
+            if _cdc_only(migration_type)
+            else f"use {NEW_TOPICS}, then Re-run Full Load with \"Drop & reload\" for a "
+            "start point the tool can check, then Start CDC."
+        )
+    else:
+        way = (
+            "choose Manual, then Fetch current position and Use this start point for a start "
+            "point the tool can check (changes made before it are then not replicated)."
+            if _cdc_only(migration_type)
+            else 're-run the Full Load with "Drop & reload" for a start point the tool can '
+            "check."
+        )
     reads = (
         f"{_RESUME_LEAD}, so if one of them was altered while CDC was stopped ({_ALTERED})"
         if resumes
@@ -337,6 +458,8 @@ __all__ = [
     "ACTION_UNVERIFIED",
     "E1_HEADER",
     "E2_HEADER",
+    "NEWER_POINT_HEADER",
+    "NEW_TOPICS",
     "W1_HEADER",
     "KIND_CHANGED",
     "KIND_OK",
@@ -348,6 +471,9 @@ __all__ = [
     "RELOAD_RESETS_MANUAL",
     "StartPointVerdict",
     "changed_rows",
+    "new_topics_route",
+    "newer_point_line",
+    "newer_point_notice",
     "point_coord",
     "point_label",
     "start_point_activity",

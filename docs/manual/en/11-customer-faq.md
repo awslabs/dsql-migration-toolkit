@@ -192,10 +192,11 @@ required; the source must be the cluster **writer, not a standby/reader**
 (`pg_is_in_recovery()=false`) — required; and every replicated table needs a usable
 **`REPLICA IDENTITY`** (`DEFAULT` needs a valid primary key that is not `DEFERRABLE` —
 PostgreSQL keeps `DEFAULT` after the key is dropped, so the check reads the source's
-catalog — `USING INDEX` a valid unique index, and `FULL` always works; on a
-partitioned table every partition needs one. Without one, every UPDATE/DELETE on the
-table would fail on the source once it is published, so the CDC prerequisite check
-fails it, and the Full Load stops before it changes anything on the source) —
+catalog — `USING INDEX` a valid unique index, and `FULL` works for any table except,
+on PostgreSQL 18, one with a generated column (the identity must include none there, so
+neither may the key); on a partitioned table every partition needs one. Without one, every
+UPDATE/DELETE on the table would fail on the source once it is published, so the CDC
+prerequisite check fails it, and the Full Load stops before it changes anything on the source) —
 required. Replication-slot / `max_wal_senders` (walsender) headroom is a **warning**
 (non-blocking). There is **no binlog-retention concept** for PostgreSQL: the tool
 auto-creates the publication (for the exact migrated tables) and a `pgoutput` logical
@@ -295,8 +296,12 @@ such Lambda and does not incur the ENI-cleanup delay.
 > and IAM (it only removes the two connectors), so a later **Start CDC** skips the
 > infrastructure wait entirely and resumes where it left off — a MySQL source from the
 > offsets kept in the cluster's `connect-offsets` topic, a PostgreSQL source from its
-> logical slot's LSN position. Tear the stack down for good once cut-over is done and
-> you no longer need CDC.
+> logical slot's LSN position. Stop CDC does not drain the sink, though: the changes it
+> had not applied by then are applied from the CDC topics, so that resume is gapless
+> only while the topics still retain them (their retention period on MSK; for a
+> PostgreSQL source, [§4.3](04-cdc-and-dsql-constraints.md) names the route once it has
+> passed). Tear the stack down for good once cut-over is done and you no longer need
+> CDC.
 
 Each of these operations records its **outcome** (succeeded / failed, with the
 elapsed time) in the activity log, so you can confirm after the fact that — for
@@ -555,19 +560,31 @@ procedure with exact commands is [Deployment §9 — Teardown](../../../deploy/D
    UI: **Start over (top right) → "Delete all CDC infrastructure"** (the app drives
    the `cdc-stack` deletion, ~15–25 min, and also removes the managed source-
    credentials secret it created). If the app is already gone, delete the stack
-   manually: `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack`.
+   manually: `aws cloudformation delete-stack --stack-name dsql-cdc-stack` (use your
+   cdc-stack's name: the default is `dsql-cdc-stack`; a legacy one may be
+   `mysql-dsql-cdc-stack`).
 2. **app-stack** — run `deploy/teardown.sh <stack-name>` (deletes the ECS/ALB/IAM
    stack; pass `DELETE_ECR=true` to also remove the container image repo).
 3. **build-stack** — only if you used the optional CodeBuild build path.
 4. **Check for leftovers the stacks don't own:** the tool auto-creates a per-account/
    region **plugin bucket** `mysql-dsql-migrator-plugins-<account>-<region>` that is
    NOT part of any stack, so `delete-stack` won't remove it — delete it manually if
-   you want a truly clean slate. Also remove any **Route 53** records you added by
-   hand. Then confirm no `mysql-dsql-*` CloudFormation stacks remain.
+   you want a truly clean slate (`aws s3 rb` with `--force`; it cannot be undone, and
+   every deployment of the tool in that account and region shares the bucket, so only
+   once none of them is in use). It keeps a copy of every version of a CDC plugin file
+   that a deploy uploaded (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each), and
+   nothing prunes them; on ECS Fargate it also holds the saved session and job state.
+   Also remove any **Route 53** records you added by hand. Then confirm no
+   `mysql-dsql-*` or `dsql-cdc-*` CloudFormation stacks remain.
 
 After teardown you can redeploy from scratch exactly like a first-time install
 (Deployment guide). If you only want to *restart the migration itself* — same infra,
-fresh workflow — use **Start over** instead; it's instant and free.
+fresh workflow — use **Start over** instead; it's instant and free. If CDC has streamed on
+the CDC stack you keep, a fresh Full load + CDC run on it needs **Delete CDC
+infrastructure** and a new deploy first: the Full Load step refuses a new start point until
+then ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Where the
+target tables still hold the earlier run's rows, choose **Drop & reload** in the new run's
+Start Full Load dialog: the default *Append* keeps them as they were.
 
 ---
 

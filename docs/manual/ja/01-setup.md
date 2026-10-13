@@ -135,7 +135,10 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
   スタックのプロビジョニングも問題になりません。トレードオフは逆方向のリスクです:**非アクティブ/
   未消費のスロットが WAL を固定し続け、ソースのディスクを満杯にする恐れがある** ため、WAL/スロットの
   健全性を監視してください — ツールは `wal_status` を提示し、`wal_status='lost'` はスロットが無効化
-  されたことを意味します → gapless な再開が壊れる → Full Load を再実行してください。
+  されたことを意味します → gapless な再開が壊れる → Start CDC がブロックして解決方法を示します
+  ([§4.3](04-cdc-and-dsql-constraints.md)): Full load + CDC では **Drop & reload** で Full Load を
+  再実行します。スタックのコネクタを以前に開始していた場合は、その前に Delete CDC infrastructure して
+  再デプロイします。
 - **MySQL ソース — GTID は推奨ですが必須ではありません。Full Load の前に決めてください。**
   `gtid_mode=ON` では Debezium が GTID で位置を決めます: CDC は開始位置とともに記録された GTID セット
   (Full Load のウォーターマーク、または Manual の位置なら **Fetch current position**)の次から開始し、
@@ -153,8 +156,10 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 - **PostgreSQL ソース — レプリケーション対象の各テーブルには使用可能な REPLICA IDENTITY が必要です。**
   `DEFAULT` には `DEFERRABLE` でない有効な主キーが必要で(PostgreSQL はキーが削除された後も `DEFAULT` の
   ままにするため、チェックはソースのカタログを読みます)、`USING INDEX` には有効な一意インデックスが必要
-  で、`FULL` は常に動作します(`ALTER TABLE … REPLICA IDENTITY FULL`)。パーティション化されたテーブルでは、
-  すべてのパーティションに必要です。ない場合、テーブルが publication に含まれた後はそのテーブルのすべて
+  で、`FULL`(`ALTER TABLE … REPLICA IDENTITY FULL`)はどのテーブルでも動作しますが、PostgreSQL 18 で生成
+  列を持つテーブルは例外です(そこでは identity に生成列を含めてはならないため、キーにも含めてはなりませ
+  ん)。パーティション化されたテーブルでは、すべてのパーティションに必要です。ない場合、テーブルが publication
+  に含まれた後はそのテーブルのすべて
   の UPDATE/DELETE がソースで失敗するため、CDC の前提条件チェックが失敗と判定し、Full Load はソースで何
   も変更する前に停止します(publication もスロットも作成しません)。レプリケーションスロット /
   `max_wal_senders`(walsender)の **余裕** は非ブロッキングの **警告(WARN)** として検査されます(スロット

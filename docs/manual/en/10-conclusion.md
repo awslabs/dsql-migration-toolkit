@@ -24,8 +24,18 @@ replication slot that retains WAL cannot be created at a past position, so
 **Full Load + CDC** creates it at the snapshot point; after a **Full Load only**
 run that option is gone, and a later CDC start re-snapshots every captured table
 instead — still lossless, but it reads the source a second time and streams every
-row through MSK. On MySQL the binary log retains history with no consumer, so a
-later CDC start resumes from the watermark with no re-read.
+row through MSK (on a CDC stack whose connectors were started before, Start CDC instead
+continues from that stack's own slot if its source connector streamed (otherwise Debezium
+snapshots every selected table first): gapless only while the CDC topics still retain what
+the sink had not applied). On MySQL the binary log retains history with no
+consumer, so a later CDC start on a CDC stack that has never streamed starts from the
+watermark with no re-read. On one that has streamed, Start CDC refuses that newer start
+point: set the migration type to CDC only, then on its CDC step Delete CDC
+infrastructure and deploy it again before Start CDC (Full load only has no CDC step;
+[Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Either way CDC
+starts from the watermark and carries only the changes after it, so if that Full load
+only run appended to rows an earlier load left on the target, first Re-run Full Load
+choosing **Drop & reload**.
 
 CDC adds real moving parts (MSK, MSK Connect, the sink connector) and **ongoing
 cost while deployed**. Reach for it only when you genuinely need continuous
@@ -87,8 +97,9 @@ freeze lasts the length of the load + validation.
 1. **Freeze writes on the source** — put the application in maintenance / read-only
    mode so no new rows are written to MySQL. (The tool keeps the source read-only;
    *your application* is what must stop writing.)
-2. **Re-run Full Load** if the source took writes since the snapshot — it's
-   idempotent, so it only fills the unfinished work, never duplicates.
+2. **Re-run Full Load choosing "Drop & reload"** if the source took writes since the
+   snapshot (the default *Append* only adds missing rows and applies no update or delete
+   made since), then validate with CHECKSUM.
 3. **Validation** — confirm a clean **MATCH** (the go/no-go gate).
 4. **Repoint the application** to the DSQL endpoint (PostgreSQL wire, IAM-token
    auth — no password). Smoke-test the critical read/write paths.
@@ -102,7 +113,9 @@ freeze shrinks to just the final drain + smoke test.
 1. **Let CDC catch up** until replication lag is at/near zero.
 2. **Freeze writes on the source** (brief read-only / maintenance mode).
 3. **Wait for the final drain** — let CDC apply the last in-flight changes until
-   lag is zero again. MySQL and DSQL now hold the same rows.
+   lag is zero again, and at least 5 minutes after the last source write: a change
+   waiting on a unique index is held that long before it is applied or dead-lettered,
+   and its lag can take a minute or two to show. MySQL and DSQL now hold the same rows.
 4. **Re-run Validation** for the final go/no-go; cut over only on a clean MATCH.
    The final validation also **advances any identity / `AUTO_INCREMENT` sequence**
    past the rows CDC delivered (a *Sync identity sequences* action), so the
@@ -137,8 +150,10 @@ reconciling them yourself first.
 - **Loud over silent.** It refuses to corrupt data quietly — a value it can't
   represent stops the table visibly; an incomplete load is never reported as
   success.
-- **Idempotent and resumable.** Re-running Full Load or replaying CDC never
-  creates duplicates; an interrupted load resumes only the unfinished work.
+- **Idempotent and resumable.** Re-running a Full Load batch or replaying CDC never
+  creates duplicates, and an interrupted load resumes only the unfinished work
+  (**Retry unfinished tables**). A fresh copy is a **Drop & reload**: a re-run's default
+  *Append* only adds the missing rows.
 - **Sound validation.** A "match" is reported only when the evidence (counts,
   checksums, PK sets) supports it.
 - **Credentials stay in memory.** Never written to disk, logs, reports, or job

@@ -1,10 +1,13 @@
-"""G23: a 23505 names both causes; a reloaded-and-verified table reads as resolved on the CDC step.
+"""G23: a 23505 names both causes; a CHECKSUM-verified table reads as verified on the CDC step.
 
-The CDC drift banner showed the red "Stop CDC and reload these tables" notice for a table the
-operator had already reloaded (Drop & reload) and Validation had matched by CHECKSUM in a
-comparison started after its last dead letter -- the exact condition the cut-over gate uses to
-stop holding it. The banner now reuses that rule (``cdc_dlq_proven_tables``) and shows such a
-table in one success notice, keeping the error for every table not yet resolved.
+The CDC drift banner showed the red "Stop CDC and reload these tables" notice for a table
+Validation had matched by CHECKSUM in a comparison started after its last dead letter (after a
+reload, or a later full-row change of each row) -- the exact condition the cut-over gate's
+dead-letter check uses to stop holding it. The banner now reuses that rule
+(``cdc_dlq_proven_tables``) and shows such a table's target-side groups in one "Verified by
+CHECKSUM" notice, keeping the error for every table not yet resolved (G25: the notice speaks
+for the dead-letter check only, and names an open source-schema / REPLICA IDENTITY finding that
+still holds a table at Cut over).
 """
 
 from __future__ import annotations
@@ -189,12 +192,12 @@ def test_a_reloaded_and_verified_table_reads_as_resolved_not_as_an_error() -> No
     blob, ui = _render(
         [{"table": "app.customers", "kind": "unique-conflict", "count": 3}], state
     )
-    assert "Reloaded and verified" in blob
+    assert "Verified by CHECKSUM" in blob
     assert (
         "app.customers matched by CHECKSUM in a Validation comparison started "
         "2026-10-09 01:05 UTC, after its last dead-lettered record" in blob
     )
-    assert "Cut over no longer holds these tables" in blob
+    assert "Cut over's dead-letter check no longer holds these tables" in blob
     assert "Stop CDC and reload these tables" not in blob
     assert "Rows may be missing from the target" not in blob
     assert NOTICE_STYLE["success"][1] in " ".join(ui.classes_seen)
@@ -209,7 +212,7 @@ def test_without_the_fix_state_the_error_stays() -> None:
             [{"table": "app.customers", "kind": "unique-conflict", "count": 3}], state
         )
         assert "Stop CDC and reload these tables" in blob
-        assert "Reloaded and verified" not in blob
+        assert "Verified by CHECKSUM" not in blob
 
 
 def test_mixed_the_error_names_only_the_open_table() -> None:
@@ -231,7 +234,7 @@ def test_mixed_the_error_names_only_the_open_table() -> None:
     assert "app.customers will not catch up" not in blob
     assert "app.customers: a unique constraint rejected the row" not in blob
     assert "app.orders: a unique constraint rejected the row" in blob
-    assert "Reloaded and verified" in blob and "app.customers matched by CHECKSUM" in blob
+    assert "Verified by CHECKSUM" in blob and "app.customers matched by CHECKSUM" in blob
 
 
 def test_a_newer_dead_letter_brings_the_error_back() -> None:
@@ -239,7 +242,7 @@ def test_a_newer_dead_letter_brings_the_error_back() -> None:
     state = _state(_ledger("app.customers", last_at=_MATCHED + timedelta(minutes=1)), validation)
     blob, _ = _render([{"table": "app.customers", "kind": "unique-conflict", "count": 4}], state)
     assert "Stop CDC and reload these tables" in blob
-    assert "Reloaded and verified" not in blob
+    assert "Verified by CHECKSUM" not in blob
 
 
 def test_a_provider_that_raises_leaves_the_banner_unchanged() -> None:
@@ -249,7 +252,7 @@ def test_a_provider_that_raises_leaves_the_banner_unchanged() -> None:
     state = _state(_ledger("app.customers"), provider=broken)
     blob, _ = _render([{"table": "app.customers", "kind": "unique-conflict", "count": 3}], state)
     assert "Stop CDC and reload these tables" in blob
-    assert "Reloaded and verified" not in blob
+    assert "Verified by CHECKSUM" not in blob
 
 
 def test_a_source_side_group_of_a_resolved_table_stays_open() -> None:
@@ -267,7 +270,7 @@ def test_a_source_side_group_of_a_resolved_table_stays_open() -> None:
     )
     assert "Source schema change detected" in blob
     assert "Stop CDC and reload these tables" not in blob
-    assert "Reloaded and verified" in blob
+    assert "Verified by CHECKSUM" in blob
 
 
 # --- The 23505 copy (Part C) -------------------------------------------------------------------

@@ -975,9 +975,12 @@ def cdc_has_committed_offset(parameters: "Optional[Mapping[str, str]]") -> bool:
     ``MskBootstrapServers``, which deletes the two connectors and leaves MSK, the topics
     and the seeder Lambda in place. On the next Start the seeder reads that offset and
     SKIPS the seed when it is at/past the watermark (``seeder.py`` no-clobber guard), so
-    streaming resumes exactly where it stopped -- unless a NEWER watermark is offered (a
-    Full Load run after the Stop): the seeder then moves the offset forward to it, which
-    is why "committed" alone does not mean "resumes" (see ``cdc_start_resumes``). A
+    streaming resumes exactly where it stopped. A NEWER point (a Manual start point past
+    it, or a newer Full Load watermark) would make the seeder move the offset forward,
+    which is why "committed" alone does not mean "resumes" (see ``cdc_start_resumes``) --
+    and Start CDC refuses such a start (:func:`newer_start_point`, G25), as the Full Load
+    step refuses a Full Load that would take one (:func:`cdc_stack_has_streamed`): its sink
+    would apply its unapplied tail over the reload. A
     watermark is otherwise needed only for the FIRST start, when the offsets topic is
     empty and the connector would begin at the source's current binlog and silently lose
     everything since the Full Load. On MySQL such a resume runs ``snapshot.mode=
@@ -999,6 +1002,50 @@ def cdc_has_committed_offset(parameters: "Optional[Mapping[str, str]]") -> bool:
     bootstrap = str(params.get("MskBootstrapServers", "") or "").strip()
     deploy_sink = str(params.get("DeploySink", "") or "").strip().lower()
     return not bootstrap and deploy_sink == "true"
+
+
+def cdc_start_rolled_back(migration_state) -> bool:
+    """Did CloudFormation roll back this cdc-stack's last update -- a Start's? (G25) Its
+    status as the stack-phase probe last read it (the same describe as the phase): ANY
+    ``UPDATE_ROLLBACK_*`` -- complete, still in progress, or failed. Only a Start updates an
+    infra stack, and the rollback restores the parameters it had before, so ``DeploySink`` and
+    ``MskBootstrapServers`` no longer say a Start happened: that Start's source connector may
+    have streamed into the CDC topics before the rollback deleted it. Either engine. Pure
+    (state reads only)."""
+    status = str(getattr(migration_state, "cdc_stack_phase_status", None) or "")
+    return status.strip().upper().startswith("UPDATE_ROLLBACK")
+
+
+def cdc_stack_has_streamed(migration_state) -> bool:
+    """Has this cdc-stack ever streamed, or rolled back a Start? (G25) THE one answer, for a
+    MySQL and a PostgreSQL source alike, read from the stack-phase probe's cached describe
+    (:func:`_probe_cdc_stack_phase`) and the connectors discovery saw -- nothing this process
+    keeps beside it. True when any holds:
+
+    * started, then stopped (:func:`cdc_has_committed_offset`: ``DeploySink="true"`` with a
+      blank ``MskBootstrapServers``);
+    * connectors in place (the ``running`` phase, or this stack's connectors detected on MSK
+      Connect, whatever the stack status);
+    * a Start whose update CloudFormation rolled back (:func:`cdc_start_rolled_back`).
+
+    Why it matters: Stop CDC and a rolled-back Start remove the connectors without draining
+    them, so this stack's CDC topics may hold changes no sink applied, and its sink resumes
+    from its last commit. A Full Load that takes a NEW start point (Start Full Load, Re-run
+    all tables) would then have those older changes applied over the reloaded tables, while
+    the source continues from the new snapshot and skips the changes between the old stop
+    point and it -- silently. Such a Full Load needs new topics first: Delete CDC
+    infrastructure and deploy it again, then the Full Load, then Start CDC. A Full Load that
+    keeps the original start point (Retry unfinished, Reload specific tables, a table added
+    under it) converges, and needs nothing.
+
+    False until the probe has described the stack (``cdc_stack_phase_checked``): a gate that
+    must not open on an unread stack checks that too. Pure (state reads only)."""
+    return (
+        bool(getattr(migration_state, "cdc_has_committed_offset", False))
+        or getattr(migration_state, "cdc_stack_phase", None) == "running"
+        or bool(getattr(migration_state, "cdc_connector_names", None))
+        or cdc_start_rolled_back(migration_state)
+    )
 
 
 def cdc_deployed_watermark(
@@ -1102,6 +1149,99 @@ def start_resumes_committed_offset(
         )
     except (TypeError, ValueError):  # a malformed deployed parameter: not provably a resume
         return False
+
+
+@dataclass(frozen=True)
+class NewerStartPoint:
+    """A MySQL Start that would move a streamed stack's position FORWARD (G25, decision A2).
+
+    ``last``: the ``(file, pos)`` start offset this stack's last Start offered -- its
+    ``Watermark*`` parameters, or (``rolled_back``) the seed the Start CloudFormation rolled
+    back offered, as this process recorded it -- or ``None`` when the stack records none (and,
+    with ``rolled_back``, when this process holds none either: an app restart).
+    """
+
+    last: Optional[tuple]
+    rolled_back: bool = False
+
+
+def newer_start_point(
+    seed,
+    *,
+    has_committed_offset: bool,
+    connectors_exist: bool,
+    rolled_back: bool,
+    deployed_watermark,
+    offered_seed=None,
+    source_type,
+) -> Optional[NewerStartPoint]:
+    """Would a MySQL Start of ``seed`` move this streamed stack's position FORWARD? (G25, A2)
+    Pure; ``None`` when it would not (and always for PostgreSQL, or a Start that seeds
+    nothing).
+
+    The backstop of the Full Load step's new-start-point gate, which a detour gets around (the
+    migration type switched to Full load only for a Re-run, then back): a stack that has
+    streamed keeps its CDC topics, which may hold changes no sink applied, and its sink group
+    resumes from its last commit. A seed past the stack's committed position makes the seeder
+    move the source FORWARD to it, so the sink applies that older tail over anything loaded
+    since while the source skips every change before the seed -- silently. So Start CDC
+    refuses it; a seed at or before it is a resume (the seeder keeps the committed offset).
+
+    * Started, then stopped (``has_committed_offset``): refused unless it is a resume
+      (:func:`start_resumes_committed_offset`) -- a seed past the start offset the last Start
+      offered (``deployed_watermark``), or judged against none (that Start had no start
+      point, so the position it streamed to cannot be compared).
+    * Connectors in place (``connectors_exist``: Retry CDC on an incomplete pipeline):
+      refused only when it is provably past ``deployed_watermark``.
+    * A first Start CloudFormation rolled back (``rolled_back``, no committed offset): its
+      parameters are restored, so the stack records only THAT it rolled back a Start (its
+      ``UPDATE_ROLLBACK_*`` status, which the stack-phase probe reads again after an app
+      restart), not the seed that Start offered. Judged against this process's record of that
+      seed (``offered_seed``): a later seed is refused, the same or an earlier one is not
+      here (Start's earlier-offer check, ``_cdc_ui.seed_refused_by_an_earlier_offer``, refuses
+      an earlier one). With no record -- an app restart, or a Start this process did not make
+      -- no seed can be shown to be at or before it, so any seed is refused (``last`` None),
+      like a stopped stack judged against none.
+
+    PostgreSQL is never refused here: its Start continues from the stack's stored offset and
+    slot whatever the job watermark says (no offset is seeded), so a Full load only detour --
+    which leaves the slot alone -- replays the stream completely and converges. Only a Full
+    Load that re-creates the slot moves it, and the Full Load step's gate refuses that one.
+    """
+    from dsql_migrator.core.cdc_kafka_prep import offset_already_at_or_past
+    from dsql_migrator.core.models import SourceType
+
+    if source_type is SourceType.POSTGRES:
+        return None
+    f = getattr(seed, "binlog_file", None) if seed is not None else None
+    p = getattr(seed, "binlog_position", None) if seed is not None else None
+    if not f or p is None:
+        return None
+
+    def _past(last) -> bool:
+        try:
+            return not offset_already_at_or_past(
+                {"file": last[0], "pos": last[1]}, {"file": f, "pos": p}
+            )
+        except (TypeError, ValueError, IndexError):  # malformed: not provably at/before it
+            return True
+
+    deployed = tuple(deployed_watermark) if deployed_watermark else None
+    if has_committed_offset:
+        if start_resumes_committed_offset(
+            seed, has_committed_offset=True, deployed_watermark=deployed,
+            source_type=SourceType.MYSQL,
+        ):
+            return None
+        return NewerStartPoint(deployed)
+    if connectors_exist:
+        return NewerStartPoint(deployed) if deployed and _past(deployed) else None
+    if rolled_back:
+        if not offered_seed:
+            return NewerStartPoint(None, rolled_back=True)
+        if _past(offered_seed):
+            return NewerStartPoint(tuple(offered_seed), rolled_back=True)
+    return None
 
 
 def mysql_start_facts_from(
@@ -2198,6 +2338,25 @@ def cdc_dlq_records(migration_state, log_key: str) -> list:
     except Exception:  # noqa: BLE001 - caching is best-effort; correctness unaffected
         pass
     return filtered
+
+
+def cdc_dlq_shown_message(record) -> str:
+    """A dead-letter record's reason as the CDC step shows it. Pure.
+
+    A source TRUNCATE's reason ends in the sink's own "Recovery: reload this table on the
+    Full Load step with 'Drop & reload'" clause, which leaves out Stop CDC and is impossible
+    in CDC only (no Full Load step). The drift banner gives the runbook for the run's
+    migration type, so every surface built from these records -- the record list, and the AI
+    DBA's facts and dead-letter samples -- drops that clause rather than contradicting it.
+    Display only: the stored message and the download keep the full text, and deployed sink
+    plugins keep emitting the clause, so this stays when the sink rewords it.
+    """
+    from dsql_migrator.core.cdc_dlq import SOURCE_TRUNCATE_CODE
+
+    message = str(getattr(record, "message", None) or "")
+    if getattr(record, "error_code", None) == SOURCE_TRUNCATE_CODE:
+        return message.split(" Recovery:", 1)[0]
+    return message
 
 
 def full_load_error_records(error_log, job_id: str) -> list:

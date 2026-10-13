@@ -126,7 +126,7 @@ def build_cdc_readiness_prompt(
         "and concrete recommendations for a low-risk cutover.\n\n"
         "Deterministic CDC facts:\n"
         f"- binlog ROW format + full row image: {_yes_no(signals.binlog_row_format_ok)}\n"
-        f"- GTID enabled (gapless resume): {_yes_no(signals.gtid_enabled)}\n"
+        f"- GTID enabled (Debezium positions by GTID set): {_yes_no(signals.gtid_enabled)}\n"
         f"- tables without a primary key (block keying/idempotent upsert): "
         f"{_bullet_list(signals.tables_without_pk)}\n"
         f"- columns near the 2 MiB row limit: {_bullet_list(signals.large_row_columns)}\n"

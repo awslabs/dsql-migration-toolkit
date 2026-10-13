@@ -62,7 +62,7 @@ from sqlalchemy.engine import Engine
 
 from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
-from dsql_migrator.core.models import SourceConnectionConfig, TableDef
+from dsql_migrator.core.models import SourceConnectionConfig, SourceType, TableDef
 from dsql_migrator.core.source_dialect import (
     MySQLSourceDialect,
     SourceDialect,
@@ -736,11 +736,29 @@ def shardable_leading_int_pk(
     return None
 
 
+def _reads_own_rows_only(
+    connection: _Connection, table: TableDef, dialect: "SourceDialect"
+) -> bool:
+    """Read ``table`` with ``FROM ONLY``? A PostgreSQL inheritance parent only (G25).
+
+    One live catalog read (:func:`~dsql_migrator.core.source_dialect.postgres.
+    pg_reads_own_rows_only`), so the read takes exactly the rows CDC captures for the table:
+    its own -- each child is its own table in the inventory. A partitioned table and every
+    MySQL table read as before."""
+    if dialect.source_type is not SourceType.POSTGRES:
+        return False
+    from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
+
+    return pg_reads_own_rows_only(connection, table.name)
+
+
 def compute_pk_shard_ranges(
     connection: _Connection,
     table: TableDef,
     shards: int,
     dialect: "SourceDialect" = _MYSQL_DIALECT,
+    *,
+    from_only: bool = False,
 ) -> list[tuple[Optional[int], Optional[int]]]:
     """Return ``shards`` half-open ``[lo, hi)`` ranges over the LEADING PK column.
 
@@ -753,6 +771,8 @@ def compute_pk_shard_ranges(
     (the read snapshot fixes the set, but the open ends are belt-and-suspenders).
     Falls back to a single ``(None, None)`` range (one reader, whole table) when
     the PK isn't a shardable integer, the table is empty, or ``shards <= 1``.
+    ``from_only`` (a PostgreSQL inheritance parent, :func:`_reads_own_rows_only`) bands the
+    table's own rows only, as its readers read them.
 
     The split is **key-domain-uniform** (``[MIN,MAX]`` divided into equal PK-value
     bands), which balances the shards well for a dense/monotonic key (e.g. AUTO_
@@ -765,9 +785,10 @@ def compute_pk_shard_ranges(
         return [(None, None)]
     quoted_col = dialect.quote_identifier(pk_col)
     quoted_table = dialect.quote_table(table.name)
+    only = "ONLY " if from_only else ""
     row = connection.execute(
         text(f"SELECT MIN({quoted_col}) AS lo, MAX({quoted_col}) AS hi "
-             f"FROM {quoted_table}")
+             f"FROM {only}{quoted_table}")
     ).mappings().first()
     if not row or row["lo"] is None or row["hi"] is None:
         return [(None, None)]
@@ -967,8 +988,13 @@ def keyset_stream(
     dialect: "SourceDialect" = _MYSQL_DIALECT,
     target_types: Optional[Mapping[str, str]] = None,
     on_description: Optional[Callable[[object], None]] = None,
+    from_only: bool = False,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
+
+    ``from_only`` reads ``FROM ONLY <table>``: a PostgreSQL inheritance parent's own rows,
+    the rows CDC captures for it (:func:`_reads_own_rows_only`, which callers ask once per
+    read).
 
     Issues ``SELECT <cols> FROM <table> [WHERE pk > :last] ORDER BY pk LIMIT
     :batch_size`` repeatedly, advancing ``:last`` to the last row's primary key,
@@ -1082,13 +1108,15 @@ def keyset_stream(
     # bound (if any); later pages AND the cursor with the range bound.
     first_where = " AND ".join(range_clauses)
     next_where = " AND ".join([where_sql, *range_clauses])
+    # ONLY changes the rows read, not the FROM item's name: ORDER BY still qualifies by it.
+    from_sql = f"ONLY {table_sql}" if from_only else table_sql
     first_page_sql = (
-        f"SELECT {columns_sql} FROM {table_sql}"
+        f"SELECT {columns_sql} FROM {from_sql}"
         f"{(' WHERE ' + first_where) if first_where else ''} "
         f"ORDER BY {order_by_sql} LIMIT :batch_size"
     )
     next_page_sql = (
-        f"SELECT {columns_sql} FROM {table_sql} WHERE {next_where} "
+        f"SELECT {columns_sql} FROM {from_sql} WHERE {next_where} "
         f"ORDER BY {order_by_sql} LIMIT :batch_size"
     )
 
@@ -1253,7 +1281,10 @@ class TableExporter:
                     est = estimate_source_rows(ro, [table.name], dialect).get(table.name)
                     if est is not None and est < min_rows:
                         return [(None, None)]
-                return compute_pk_shard_ranges(ro, table, shards, dialect)
+                return compute_pk_shard_ranges(
+                    ro, table, shards, dialect,
+                    from_only=_reads_own_rows_only(ro, table, dialect),
+                )
         finally:
             engine.dispose()
 
@@ -1352,6 +1383,8 @@ class TableExporter:
                     else None
                 )
                 try:
+                    # Inside the snapshot: the read below takes exactly these rows.
+                    from_only = _reads_own_rows_only(snapshot, table, dialect)
                     for raw in keyset_stream(
                         snapshot,
                         table,
@@ -1363,6 +1396,7 @@ class TableExporter:
                         dialect=dialect,
                         target_types=target_types,
                         on_description=on_description,
+                        from_only=from_only,
                     ):
                         row = converter.convert_row(raw)
                         if guard is not None and guard.armed:
@@ -1405,7 +1439,8 @@ def export_rows(
     try:
         writer.write_header(column_names)
         for row in keyset_stream(
-            connection, table, batch_size=batch_size, dialect=dialect
+            connection, table, batch_size=batch_size, dialect=dialect,
+            from_only=_reads_own_rows_only(connection, table, dialect),
         ):
             writer.write_row(value_converter.convert_row(row))
             rows_exported += 1

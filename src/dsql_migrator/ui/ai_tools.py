@@ -742,6 +742,31 @@ def build_ai_tool_executor(
                     ),
                     key=lambda r: (not r["open"], r["table"]),
                 )
+                # The dead-lettered tables the CDC step calls verified by CHECKSUM (the
+                # cut-over dead-letter rule, whatever else holds them), so the assistant never
+                # advises reloading one again for a target-side dead letter (or deleting a
+                # TRUNCATE's rows); the note keeps any other kind's own fix, as the banner's
+                # per-group rule does, and still_held_by names an open REPLICA IDENTITY /
+                # source schema finding that still holds one at Cut over, as the banner's
+                # Verified notice does. Best effort: unknown -> none.
+                try:
+                    from dsql_migrator.ui.cdc_dlq_gate import (
+                        cdc_dlq_open_finding_holds,
+                        cdc_dlq_proven_tables,
+                    )
+
+                    _verified = cdc_dlq_proven_tables(
+                        _dm, VALIDATION_STORE.get_or_create(session_id)
+                    )
+                    _still_held = cdc_dlq_open_finding_holds(_dm, _verified)
+                    _resolved_rows = [
+                        {"table": t, "checksum_compared_from": s.isoformat(),
+                         **({"still_held_by": list(_still_held[t])}
+                            if t in _still_held else {})}
+                        for t, s in sorted(_verified.items())
+                    ]
+                except Exception:  # noqa: BLE001
+                    _resolved_rows = []
                 return _json.dumps(
                     {"status": "ok", "streaming": _streaming,
                      "dlq_depth": int(getattr(_dlq, "total_errors", 0) or 0),
@@ -768,8 +793,19 @@ def build_ai_tool_executor(
                      "max_replication_lag_ms": _max_lag,
                      "source_schema_changes": _schema_rows[:20],
                      "source_schema_changes_total": len(_schema_rows),
+                     "resolved_tables": _resolved_rows[:20],
+                     "resolved_tables_total": len(_resolved_rows),
                      "note": ("DLQ poison rows + detected schema drift are silent "
-                              "data-loss risks — resolve before cut over. SQLSTATEs: "
+                              "data-loss risks — resolve before cut over, except "
+                              "resolved_tables: each matched by CHECKSUM in a Validation "
+                              "comparison started after its last dead letter, so Cut "
+                              "over's dead-letter check no longer holds it, and its "
+                              "unique-conflict, missing-table, unbindable-value or "
+                              "source-truncate dead letters need no repair (do not advise a "
+                              "reload or a delete for them; any other kind listed for it "
+                              "keeps its own fix; one with still_held_by is still held at "
+                              "Cut over by its open REPLICA IDENTITY or source schema "
+                              "finding, which keeps its own fix). SQLSTATEs: "
                               "42703 = column added/renamed at the source; 23502 = a "
                               "NOT NULL column got no value (dropped or excluded "
                               "column) or got NULL (source now allows NULL: ALTER "
@@ -782,7 +818,10 @@ def build_ai_tool_executor(
                               "... CHECK (...) NOT VALID); 22001/22003 = too long / out "
                               "of range for the Aurora DSQL type (recreate with a type "
                               "that holds it); 22P02 = malformed value; 23505 = "
-                              "duplicate key. "
+                              "duplicate key (a change that reached Aurora DSQL before the "
+                              "one freeing the value, a replayed row, or the source dropped "
+                              "or relaxed a UNIQUE index Aurora DSQL still has: drop it there "
+                              "too). "
                               "source_schema_changes come from the tool's re-read of the "
                               "source catalog (no dead letter needed); an open one holds "
                               "Cut over.")}
@@ -792,6 +831,9 @@ def build_ai_tool_executor(
                 # connector states, sink-stall flag, CFN stack phase, the failed deploy
                 # stage + deploy-log tail, and the Full Load -> CDC watermark handoff.
                 from dsql_migrator.ui.data_migration import _current_job
+                from dsql_migrator.ui.data_migration._cdc_status import (
+                    cdc_stack_has_streamed,
+                )
 
                 _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
                 _streaming = bool(cdc_streaming_started(_dm, JOB_MANAGER))
@@ -862,13 +904,19 @@ def build_ai_tool_executor(
                      "failed_deploy_stage": _failed_stage,
                      "deploy_log_tail": _log_tail,
                      "watermark_handoff": _handoff,
+                     # G25: on a stack that has streamed (or rolled back a Start), Start
+                     # CDC continues from its committed position, not the watermark.
+                     "stack_has_streamed": bool(cdc_stack_has_streamed(_dm)),
                      "resume_mode": _resume_mode,
                      "note": ("If streaming is false: check stack_phase (deployed?), "
                               "connector_states (any FAILED?), failed_deploy_stage + "
                               "deploy_log_tail (why the deploy stopped). "
                               "sink_stall_confirmed = connector RUNNING but nothing "
-                              "applied (silent data loss). watermark_handoff is where "
-                              "CDC resumes from after Full Load. "
+                              "applied (silent data loss). watermark_handoff is the start "
+                              "point a first Start CDC seeds; on a stack that has streamed "
+                              "(stack_has_streamed) Start CDC continues from its committed "
+                              "position instead, and refuses a newer start point until the "
+                              "CDC infrastructure is deleted and deployed again. "
                               "connector_failure_causes names why a stopped connector "
                               "stopped; the CDC step shows the steps to take.")}
                 )
@@ -912,6 +960,7 @@ def build_ai_tool_executor(
             if name == "list_cdc_dlq_samples":
                 from dsql_migrator.ui.data_migration._cdc_status import (
                     cdc_dlq_records,
+                    cdc_dlq_shown_message,
                     cdc_error_log_key,
                 )
 
@@ -931,10 +980,11 @@ def build_ai_tool_executor(
                     _seen.add((_tbl, _code))
                     _occ = getattr(r, "occurred_at", None)
                     # NB: the failing row's primary-key VALUE (r.pk) is intentionally
-                    # NOT included -- error text + code only (Property 7).
+                    # NOT included -- error text + code only (Property 7). The text is the
+                    # record list's (no source TRUNCATE "reload ... on the Full Load step").
                     _samples.append(
                         {"table": _tbl, "sqlstate": _code,
-                         "message": str(getattr(r, "message", "") or "")[:400],
+                         "message": cdc_dlq_shown_message(r)[:400],
                          "occurred_at": _occ.isoformat() if _occ else None}
                     )
                     if len(_samples) >= 20:

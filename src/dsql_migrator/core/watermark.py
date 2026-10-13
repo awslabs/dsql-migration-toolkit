@@ -68,7 +68,7 @@ from dsql_migrator.core.introspector import (
     ReadOnlySourceError,
     _default_engine_factory,
 )
-from dsql_migrator.core.models import SourceConnectionConfig, Watermark
+from dsql_migrator.core.models import SourceConnectionConfig, SourceType, Watermark
 from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
 
 # Transaction-control and read statements issued during capture. None of these
@@ -269,9 +269,13 @@ def max_pk_source(
     column. Used by the CDC consistency view to compare the source high-water PK
     against the target's: an equal max means the stream's leading edge is caught
     up even when row COUNTs differ. Returns ``None`` for a table with no single
-    integer PK, or on any error.
+    integer PK, or on any error. A PostgreSQL inheritance parent is read ``FROM ONLY``
+    (one catalog read, the Full Load's and Validation's rule): its own rows, the ones the
+    Full Load copies and CDC captures -- a bare ``FROM`` also maxes over its child tables,
+    a high-water its Aurora DSQL table never reaches (G25).
     """
     out: dict[str, Optional[int]] = {}
+    postgres = getattr(dialect, "source_type", None) is SourceType.POSTGRES
     for table, pk in pk_by_table.items():
         if not pk:
             out[table] = None
@@ -279,7 +283,12 @@ def max_pk_source(
         try:
             quoted = dialect.quote_table(table)
             col = dialect.quote_identifier(pk)
-            result = connection.execute(text(f"SELECT MAX({col}) FROM {quoted}"))
+            only = ""
+            if postgres:
+                from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
+
+                only = "ONLY " if pg_reads_own_rows_only(connection, table) else ""
+            result = connection.execute(text(f"SELECT MAX({col}) FROM {only}{quoted}"))
             val = result.scalar()
             out[table] = int(val) if isinstance(val, int) else None
         except ReadOnlySourceError:

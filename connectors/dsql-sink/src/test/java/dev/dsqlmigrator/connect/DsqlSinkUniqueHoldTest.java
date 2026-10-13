@@ -49,7 +49,6 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
-import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.Test;
@@ -937,13 +936,17 @@ class DsqlSinkUniqueHoldTest {
 
     dsql.failure = (sql, binds) -> new SQLException("connection lost", "08006");
     task.advance(SECOND);
-    assertThrows(RetriableException.class, () -> task.put(List.of()));
+    // G25: the probe's transient failure no longer fails the put (every write of it already
+    // committed): the hold survives and is tried again after the first wait.
+    task.put(List.of());
     assertEquals(Map.of(P1, 10L), task.heldOffsets()); // the hold survives
+    assertEquals(500L, task.ctx.lastTimeout);
     dsql.failure = (sql, binds) -> null;
     setField(task, "connection", dsql.connection()); // the reconnect
 
-    // Connect redelivers the same batch: row 50 replays, the held tail is skipped unparsed.
+    // The same batch again: row 50 replays, the held tail is skipped unparsed.
     dsql.executed.clear();
+    task.advance(SECOND);
     task.put(batch);
     assertEquals(1, dsql.count("upsert:50"));
     assertEquals(1, dsql.count("upsert:100005")); // only the end-of-put probe, still 23505

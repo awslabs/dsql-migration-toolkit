@@ -26,6 +26,7 @@ from dsql_migrator.core.models import (
     PrerequisiteCheckId,
     PrerequisiteResult,
     PrerequisiteStatus,
+    SourceType,
     TableDef,
 )
 
@@ -33,6 +34,16 @@ from dsql_migrator.core.models import (
 # (uses the primary key -- which the migration already requires), 'f' full, 'i' a
 # unique index. 'n' (nothing) makes UPDATE/DELETE on the table ERROR on the publisher.
 _USABLE_REPLICA_IDENTITY = frozenset({"d", "f", "i"})
+
+
+def _quoted(name: str) -> str:
+    """``schema.table`` as the quoted identifier a printed statement needs -- unquoted,
+    PostgreSQL folds ``MixS.Orders`` to ``mixs.orders`` and the remedy fails (G25). The
+    tool's own source writes quote the same way."""
+    # Lazy: the dialect package imports this module.
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    return dialect_for(SourceType.POSTGRES).quote_table(name)
 
 
 # --- Columns PostgreSQL CDC cannot carry -----------------------------------------------
@@ -295,6 +306,20 @@ class PostgresCdcFacts:
     # before. A table absent from a provided map was not found as a plain or partitioned
     # table, and is graded by its code too.
     replica_identity_problems: Optional[Mapping[str, Optional[str]]] = None
+    # G25, from the same read: per table with a problem, the fix for THAT cause
+    # (``cdc_pg_slot.replica_identity_remedy``, with the exact quoted statement where FULL is
+    # it), so this check, the Full Load's refusal and its per-table row name the same fix.
+    # ``None`` when not read; a table missing from it gets the general advice.
+    replica_identity_remedies: Optional[Mapping[str, str]] = None
+    # G25: the tables on which PostgreSQL 18+ refuses UPDATE/DELETE under a published
+    # REPLICA IDENTITY FULL -- they have a generated column, which CDC's publication does not
+    # publish -- so no remedy here may offer FULL for them. Absent means not refused or not
+    # read (PostgreSQL 13-17 never refuse it).
+    full_identity_refused: Mapping[str, bool] = field(default_factory=dict)
+    # G25: per selected plain table with inheritance (INHERITS) child tables, ``(child count,
+    # first child names)`` (``cdc_pg_slot.read_inheritance_children``). ``None`` when not
+    # read; a table missing from a read map has none.
+    inheritance_children: Optional[Mapping[str, tuple]] = None
 
 
 def check_wal_level_logical(facts: PostgresCdcFacts) -> PrerequisiteResult:
@@ -504,12 +529,17 @@ def check_replica_identity(
     'd' needs a valid primary key that is not DEFERRABLE -- PostgreSQL keeps 'd' when the
     key is dropped, and the Step 1 inventory ``check_table_primary_key`` reads can predate
     that -- 'i' a valid unique identity index, and a partitioned table a usable identity on
-    every partition. Any of those is a required FAIL. When that grading was not read, the
+    every partition. Any of those is a required FAIL, whose remedy is the one for its cause
+    (``facts.replica_identity_remedies``, G25). When that grading was not read, the
     code alone decides, as before ('d'/'f'/'i' PASS). An identity index that is not the
     primary key is a WARN; an unknown/unreadable identity is a non-blocking INFO (the
     connector, and the Full Load's own fail-closed check, remain the final authority).
+    A printed statement quotes the table's name; no remedy offers FULL for a table
+    PostgreSQL 18 refuses it on (``facts.full_identity_refused``).
     """
     identity = facts.replica_identity.get(table.name)
+    quoted = _quoted(table.name)
+    full_refused = bool(facts.full_identity_refused.get(table.name))
     if identity is None:
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.REPLICA_IDENTITY,
@@ -554,16 +584,31 @@ def check_replica_identity(
             "so UPDATE/DELETE through the parent would fail on the publisher.",
             "Set the identity on each PARTITION, not the parent -- ALTER TABLE on the "
             "parent does not propagate to existing partitions. For each one run "
-            "ALTER TABLE <partition> REPLICA IDENTITY FULL (or DEFAULT if it has a "
-            "primary key), and set it on new partitions as they are created.",
+            + (
+                "ALTER TABLE <partition> REPLICA IDENTITY DEFAULT with a primary key that "
+                "is not DEFERRABLE (on PostgreSQL 18, FULL fails every UPDATE and DELETE "
+                "of a published table with generated columns)"
+                if full_refused
+                else "ALTER TABLE <partition> REPLICA IDENTITY FULL (or DEFAULT if it has "
+                "a primary key)"
+            )
+            + ", and set it on new partitions as they are created.",
         )
 
     if identity not in _USABLE_REPLICA_IDENTITY:
+        # PostgreSQL 18's generated-column rule is checked on the table an UPDATE/DELETE
+        # runs on: a partitioned parent's own identity never is (its partitions' are, and
+        # they are graded above), so FULL on the parent stays a fix (G25).
+        partitioned = table.partitioned or table.name in facts.leaf_replica_identity
         return _fail(
             "REPLICA IDENTITY is 'nothing' -- UPDATE/DELETE would fail on the publisher.",
-            f"Set a REPLICA IDENTITY on {table.name}: with a primary key the default is "
-            "enough; otherwise run ALTER TABLE ... REPLICA IDENTITY FULL so Debezium can "
-            "replicate UPDATE/DELETE.",
+            f"Give {table.name} a primary key that is not DEFERRABLE and run ALTER TABLE "
+            f"{quoted} REPLICA IDENTITY DEFAULT: on PostgreSQL 18, FULL fails every UPDATE "
+            "and DELETE of a published table with generated columns."
+            if full_refused and not partitioned
+            else f"Set a REPLICA IDENTITY on {table.name}: with a primary key the default is "
+            f"enough; otherwise run ALTER TABLE {quoted} REPLICA IDENTITY FULL so Debezium "
+            "can replicate UPDATE/DELETE.",
         )
 
     if identity == "i":
@@ -578,8 +623,9 @@ def check_replica_identity(
                 "index was dropped), so the table behaves as 'nothing' and UPDATE/DELETE "
                 "would fail on the publisher.",
                 f"Re-point the identity on {table.name}: recreate the unique index and "
-                "run ALTER TABLE ... REPLICA IDENTITY USING INDEX <index>, or use "
-                "REPLICA IDENTITY DEFAULT (primary key) / FULL.",
+                f"run ALTER TABLE {quoted} REPLICA IDENTITY USING INDEX <index>, or use "
+                "REPLICA IDENTITY DEFAULT (primary key)"
+                + ("." if full_refused else " / FULL."),
             )
 
     # G20: the live-catalog grading the Full Load's provisioning refuses on before any
@@ -589,13 +635,29 @@ def check_replica_identity(
     problems = facts.replica_identity_problems
     problem = problems.get(table.name) if problems is not None else None
     if problem:
+        # Lazy: cdc_pg_slot imports source_dialect, which imports this module.
+        from dsql_migrator.core.cdc_pg_slot import (
+            INDEX_GONE_PROBLEM,
+            NO_PRIMARY_KEY_PROBLEM,
+        )
+
+        remedy = (facts.replica_identity_remedies or {}).get(table.name)
+        # Only a key or index that is GONE leaves its setting behind; a DEFERRABLE key, a
+        # generated column or a partition is there to see (G25).
+        kept = (
+            " PostgreSQL keeps the REPLICA IDENTITY setting when the key or index behind "
+            "it is dropped."
+            if problem in (NO_PRIMARY_KEY_PROBLEM, INDEX_GONE_PROBLEM)
+            else ""
+        )
         return _fail(
             f"{table.name} has no usable REPLICA IDENTITY on the source ({problem}), so "
             "once it is in CDC's publication every UPDATE and DELETE on it would fail "
-            "there. PostgreSQL keeps the REPLICA IDENTITY setting when the key or index "
-            "behind it is dropped.",
-            f"Give {table.name} a valid primary key that is not DEFERRABLE, or run ALTER "
-            f"TABLE {table.name} REPLICA IDENTITY FULL (on a partitioned table, on each "
+            f"there.{kept}",
+            f"To fix {table.name}, {remedy}, then re-run the prerequisite checks."
+            if remedy
+            else f"Give {table.name} a valid primary key that is not DEFERRABLE, or run "
+            f"ALTER TABLE {quoted} REPLICA IDENTITY FULL (on a partitioned table, on each "
             "partition: ALTER TABLE on the parent does not reach existing partitions), "
             "then re-run the prerequisite checks.",
         )
@@ -621,9 +683,9 @@ def check_replica_identity(
                     "locate its row on the target."
                 ),
                 remediation=(
-                    f"Prefer ALTER TABLE {table.name} REPLICA IDENTITY DEFAULT (the "
-                    "primary key) or FULL, so every replicated change carries the key "
-                    "Aurora DSQL needs."
+                    f"Prefer ALTER TABLE {quoted} REPLICA IDENTITY DEFAULT (the primary "
+                    f"key){'' if full_refused else ' or FULL'}, so every replicated change "
+                    "carries the key Aurora DSQL needs."
                 ),
             )
 
@@ -699,6 +761,7 @@ def check_replica_identity_covers_key(
         identity=facts.replica_identity.get(table.name),
         weak_partition_names=weak_leaves,
         weak_partition_count=len(weak_leaves),
+        full_refused=bool(facts.full_identity_refused.get(table.name)),
     )
 
 
@@ -709,6 +772,7 @@ def replica_identity_covers_key_result(
     identity: Optional[str],
     weak_partition_names: Sequence[str],
     weak_partition_count: int,
+    full_refused: bool = False,
 ) -> Optional[PrerequisiteResult]:
     """The REPLICA_IDENTITY_COVERS_KEY rule on explicit catalog facts. Pure.
 
@@ -718,6 +782,8 @@ def replica_identity_covers_key_result(
     when the key adds nothing beyond ``table.primary_key``; INFO when ``identity`` is unknown;
     FAIL when any partition is not FULL (``weak_partition_count``; at most five of
     ``weak_partition_names`` are named); PASS on 'f'; FAIL on 'd', 'n' and 'i'.
+    ``full_refused`` (PostgreSQL 18, a generated column: a published FULL refuses every
+    UPDATE/DELETE) makes 'f' a FAIL too, and every FAIL's remedy removing the re-key (G25).
     """
     extra = [c for c in (key_columns or []) if c not in set(table.primary_key or ())]
     if not extra:
@@ -738,6 +804,15 @@ def replica_identity_covers_key_result(
             ),
         )
 
+    # FULL is no remedy when PostgreSQL 18 refuses it: published, it fails the table's every
+    # UPDATE/DELETE -- so every FAIL then says to remove the re-key instead (G25).
+    keep_source_pk = (
+        f"Set {table.name} back to \"Keep source PK\" in Schema Conversion, which removes "
+        "the re-key and the need for REPLICA IDENTITY FULL: on PostgreSQL 18, FULL fails "
+        "every UPDATE and DELETE of a published table with generated columns, and DEFAULT "
+        "does not carry the composite key."
+    )
+
     def _fail(detail: str, remediation: str) -> PrerequisiteResult:
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.REPLICA_IDENTITY_COVERS_KEY,
@@ -746,7 +821,7 @@ def replica_identity_covers_key_result(
             required=True,
             target=table.name,
             detail=detail,
-            remediation=remediation,
+            remediation=keep_source_pk if full_refused else remediation,
         )
 
     # PARTITIONS FIRST, and they are graded even when the parent itself is FULL: PostgreSQL
@@ -768,6 +843,17 @@ def replica_identity_covers_key_result(
             "parent does not propagate to existing partitions), and set it on new "
             "partitions as they are created. Keep them FULL for the whole run: while CDC "
             "runs the tool re-checks it and holds Cut over if it drops.",
+        )
+
+    if identity == "f" and full_refused:
+        # FULL carries the key, but on PostgreSQL 18 it is the very identity that fails
+        # the table's UPDATE/DELETE once published (the REPLICA_IDENTITY check refuses it
+        # too), and the identity it then needs, DEFAULT, does not carry the key (G25).
+        return _fail(
+            f"REPLICA IDENTITY FULL carries {missing}, but {table.name} has generated "
+            "columns: on PostgreSQL 18 a published FULL table with generated columns fails "
+            f"every UPDATE and DELETE on the source, and DEFAULT does not carry {missing}.",
+            keep_source_pk,
         )
 
     if identity == "f":
@@ -810,8 +896,8 @@ def replica_identity_covers_key_result(
         f"{missing} alone can be dead-lettered (a unique constraint rejected the row) and "
         "leave the old row. INSERTs and other UPDATEs are not affected (their after-image "
         "carries every column).",
-        f"Run ALTER TABLE {table.name} REPLICA IDENTITY FULL on the source, then re-run "
-        "these checks. DEFAULT is not enough for a re-keyed table. The alternative is to "
+        f"Run ALTER TABLE {_quoted(table.name)} REPLICA IDENTITY FULL on the source, then "
+        "re-run these checks. DEFAULT is not enough for a re-keyed table. The alternative is to "
         f"set {table.name} back to \"Keep source PK\" in Schema Conversion, which removes "
         "the re-key and the requirement with it. Keep it FULL for the whole run: while CDC "
         "runs the tool re-checks it and holds Cut over if it drops.",
@@ -858,9 +944,84 @@ def check_table_replicable(
             "from a publication and the whole CDC publication creation fails."
         ),
         remediation=(
-            f"Either convert it with ALTER TABLE {table.name} SET LOGGED, or deselect it "
-            "and migrate it with Full Load only (an UNLOGGED table can never be "
-            "change-replicated)."
+            f"Either convert it with ALTER TABLE {_quoted(table.name)} SET LOGGED, or "
+            "deselect it and migrate it with Full Load only (an UNLOGGED table can never "
+            "be change-replicated)."
+        ),
+    )
+
+
+_INHERITANCE_TITLE = "Inheritance child tables are migrated as tables of their own"
+
+
+def check_inheritance_children(
+    table: TableDef, facts: PostgresCdcFacts, *, snapshots: bool, started: bool = False
+) -> Optional[PrerequisiteResult]:
+    """The rows of ``table``'s inheritance (INHERITS) child tables are not migrated into it
+    (G25) -- or ``None`` when it has none, or that was not read (Start CDC reads it again
+    and refuses a snapshot it cannot check). Pure.
+
+    Aurora DSQL has no table inheritance, and CDC captures only the table's own changes (its
+    publication lists it ``ONLY``), so the Full Load and Validation read only its own rows
+    too (``FROM ONLY``), and each child table migrates as a table of its own, when it is
+    selected. A non-blocking WARN: a child table that is not selected is not migrated at
+    all, and a query of the table on Aurora DSQL no longer returns its child tables' rows. A
+    required FAIL when this run's Start CDC snapshots (``snapshots``: CDC only, or a recorded
+    re-snapshot): Debezium's snapshot reads the table WITH its child tables' rows, which CDC
+    then never changes on Aurora DSQL, so Start CDC refuses it
+    (``cdc_pg_slot.pg_replication_objects_blocker``) -- said here, before the billable CDC
+    infrastructure is deployed. Its fix is a Full load + CDC run, a new start point, so on a
+    stack whose connectors were started before (``started``) the route rule's route follows
+    it, new CDC topics first, as in the Start CDC dialog's block (G25, rule B).
+    """
+    count, sample = (facts.inheritance_children or {}).get(table.name) or (0, ())
+    count, sample = int(count or 0), tuple(sample or ())
+    if count <= 0:
+        return None
+    shown = ", ".join(sample) + (" …" if count > len(sample) else "")
+    children = f"{count} inheritance (INHERITS) child table{'s' if count != 1 else ''}: {shown}"
+    if snapshots:
+        route = ""
+        if started:
+            # Lazy: cdc_pg_slot imports source_dialect, which imports this module.
+            from dsql_migrator.core.cdc_pg_slot import INHERITANCE_SNAPSHOT_HEADER, pg_cdc_route
+
+            route = " " + pg_cdc_route(INHERITANCE_SNAPSHOT_HEADER, started=True, cdc_only=None)
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.TABLE_REPLICABLE,
+            title=_INHERITANCE_TITLE,
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            target=table.name,
+            detail=(
+                f"{table.name} has {children}. This migration's Start CDC takes a snapshot "
+                f"(snapshot.mode=initial), and Debezium's snapshot reads {table.name} with "
+                f"its child tables' rows: they would be copied into {table.name} on Aurora "
+                "DSQL, where CDC never updates or deletes them, so Start CDC refuses it."
+            ),
+            remediation=(
+                f"Untick {table.name} (each child table migrates as a table of its own), or "
+                'migrate it in a "Full load + CDC" run whose CDC starts from its Full Load\'s '
+                f"snapshot point: that Full Load reads only {table.name}'s own rows, and its "
+                f"CDC takes no snapshot.{route}"
+            ),
+        )
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.TABLE_REPLICABLE,
+        title=_INHERITANCE_TITLE,
+        status=PrerequisiteStatus.WARN,
+        required=False,
+        target=table.name,
+        detail=(
+            f"{table.name} has {children}. Aurora DSQL has no table inheritance, so the Full "
+            f"Load, CDC and Validation take only {table.name}'s own rows (FROM ONLY): the "
+            "rows of a child table migrate only as that table, and only if it is selected. A "
+            f"query of {table.name} that returns its child tables' rows on the source "
+            "returns only its own on Aurora DSQL."
+        ),
+        remediation=(
+            "Select each child table whose rows you need: it migrates as a table of its own "
+            "and needs a primary key of its own (PostgreSQL does not inherit one)."
         ),
     )
 
@@ -1180,6 +1341,7 @@ def check_cdc_replication_objects(
     provisions_replication: bool,
     cdc_start_resnapshots: bool = False,
     pending_tables: Sequence[str] = (),
+    cdc_stack_started: bool = False,
     _scope: str = "selected tables",
 ) -> PrerequisiteResult:
     """Do CDC's publication + replication slot EXIST? Distinct from the PRIVILEGE check.
@@ -1226,6 +1388,15 @@ def check_cdc_replication_objects(
     pending sentence is added only where their guarded load CAN add them -- a usable slot
     and a publication that publishes every change type; otherwise the row already blocks or
     warns, and their load would refuse them.
+
+    ``cdc_stack_started`` (G25, route rule B): the CDC stack's connectors were started before
+    (``_cdc_status.cdc_stack_has_streamed``: stopped since, in place, or a Start
+    CloudFormation rolled back). Its Start continues from the committed offset -- Debezium
+    skips the snapshot once its source connector has streamed -- and its CDC topics may hold
+    changes no sink applied, so none of the copy below holds there (a re-snapshot, "run as
+    Full load + CDC", "nothing is lost"). The row is then INFO: what the source shows, and
+    that the Start CDC dialog judges it against the stack's own record and names the route
+    (``cdc_pg_slot.pg_cdc_route``) when the stream cannot continue as is.
     """
     title = "CDC's publication and replication slot exist on the source"
     if provisions_replication:
@@ -1266,6 +1437,8 @@ def check_cdc_replication_objects(
                 "before Start CDC."
             ),
         )
+    if cdc_stack_started:
+        return _started_stack_objects_result(facts, tables, title=title, pub=pub, slot=slot)
     resnapshot_note = (
         "Otherwise choose the re-snapshot option on the CDC start card, which re-reads "
         "every selected table and loses nothing; a slot created now begins at the "
@@ -1379,6 +1552,13 @@ def check_cdc_replication_objects(
             ),
         )
     if facts.publication_publishes_all_dml is False:
+        # Lazy: cdc_pg_slot imports source_dialect, which imports this module.
+        from dsql_migrator.core.cdc_pg_slot import (
+            PUBLISH_LIST_HEADER,
+            pg_cdc_route,
+            publish_list_fix,
+        )
+
         return PrerequisiteResult(
             check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
             title=title,
@@ -1389,9 +1569,19 @@ def check_cdc_replication_objects(
                 "INSERT/UPDATE/DELETE, so the change types it omits would never reach "
                 "the target while the connector still reported RUNNING."
             ),
+            # Not a re-snapshot, nor a Full Load re-run: both reuse the publication as it is
+            # (G25), which is also why a re-snapshot does not re-grade this row. Nor is the fix
+            # alone enough (decision C): once the list is set back this row passes and the
+            # Start CDC dialog's block no longer fires, but pgoutput judged each change against
+            # the publication as it stood at its commit, so a Start that continues from the
+            # slot would skip the changes committed while it was narrowed -- the route rule's
+            # route follows the fix, as in that block. (A stack started before is INFO above.)
             remediation=(
-                "Recreate the publication with all three operations, or "
-                + resnapshot_note[0].lower() + resnapshot_note[1:]
+                f"{publish_list_fix(pub)} first (a re-snapshot and a Full Load re-run both "
+                "reuse the publication as it is), then re-run the prerequisite checks. "
+                "Setting it back does not bring back the changes committed while it was "
+                "narrowed, so a Start that continues from the slot would skip them. "
+                + pg_cdc_route(PUBLISH_LIST_HEADER, started=False, cdc_only=None)
             ),
         )
     if not facts.slot_usable:
@@ -1499,6 +1689,48 @@ def _pending_publication_sentence(pending: Sequence[str]) -> str:
     )
 
 
+def _started_stack_objects_result(
+    facts: PostgresCdcFacts, tables: Sequence[TableDef], *, title: str, pub: str, slot: str
+) -> PrerequisiteResult:
+    """CDC_REPLICATION_OBJECTS for a CDC stack whose connectors were started before (G25,
+    route rule B): INFO -- what the source shows, then that the Start CDC dialog judges it
+    against the stack's own record. That dialog is the one gate there: it names the route
+    rule's route (new CDC topics first) when the stream cannot continue as is, so this row
+    names no route of its own -- the never-started copy (a re-snapshot, "run as Full load +
+    CDC", "nothing is lost") would contradict it. Pure."""
+    selected = [t.name for t in tables]
+    missing = set(selected) - set(facts.publication_tables or ())
+    if not facts.publication_present:
+        found = f'Publication "{pub}" does not exist on the source'
+    elif missing:
+        found = (
+            f'Publication "{pub}" does not include {len(missing)} of the {len(selected)} '
+            "selected tables"
+        )
+    elif facts.publication_publishes_all_dml is False:
+        found = f'Publication "{pub}" does not publish every change type'
+    elif not facts.slot_usable:
+        found = (
+            f'Publication "{pub}" covers the selected tables, but replication slot "{slot}" '
+            "is not usable on this database"
+        )
+    else:
+        found = f'Publication "{pub}" and replication slot "{slot}" are present'
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.CDC_REPLICATION_OBJECTS,
+        title=title,
+        status=PrerequisiteStatus.INFO,
+        required=False,
+        detail=(
+            f"{found}. This CDC stack's connectors were started before, so Start CDC judges "
+            "its publication and slot against the stack's own record: it continues from the "
+            "slot when the stream can continue as is, and otherwise refuses the Start and "
+            "names the way on, new CDC topics first (Debezium skips the snapshot once its "
+            "source connector has streamed, so a re-snapshot cannot be relied on here)."
+        ),
+    )
+
+
 def check_postgres_cdc_prerequisites(
     facts: PostgresCdcFacts,
     tables: Sequence[TableDef],
@@ -1508,13 +1740,14 @@ def check_postgres_cdc_prerequisites(
     message_key_columns: Optional[Mapping[str, Sequence[str]]] = None,
     excluded_columns: "Optional[Mapping[str, Iterable[str]]]" = None,
     pending_tables: Sequence[str] = (),
+    cdc_stack_started: bool = False,
 ) -> list[PrerequisiteResult]:
     """Run all PostgreSQL CDC readiness checks (global + per-table REPLICA IDENTITY).
 
     ``provisions_replication`` defaults True -- "this run creates the objects itself" --
     so every existing caller and the whole Full-load-+-CDC path is unchanged and the
-    existence check can never block them. ``pending_tables`` -- see
-    :func:`check_cdc_replication_objects` (G17).
+    existence check can never block them. ``pending_tables`` (G17) and
+    ``cdc_stack_started`` (G25) -- see :func:`check_cdc_replication_objects`.
 
     ``message_key_columns`` is the connector's re-key map (qualified table -> the target
     primary key the change record is keyed on). Only tables in it can fail
@@ -1531,14 +1764,23 @@ def check_postgres_cdc_prerequisites(
             provisions_replication=provisions_replication,
             cdc_start_resnapshots=cdc_start_resnapshots,
             pending_tables=pending_tables,
+            cdc_stack_started=cdc_stack_started,
         ),
         check_replication_slot_headroom(facts),
         check_slot_wal_retention(facts),
         check_source_is_writer(facts),
     ]
     _keys = dict(message_key_columns or {})
+    # Will Start CDC snapshot? The same signals the publication/slot row reads: a run that
+    # still provisions its slot (Full load + CDC before its load) does not (G25).
+    _snapshots = cdc_start_resnapshots and not provisions_replication
     for table in tables:
         results.append(check_table_replicable(table, facts))
+        _inheritance = check_inheritance_children(
+            table, facts, snapshots=_snapshots, started=cdc_stack_started
+        )
+        if _inheritance is not None:
+            results.append(_inheritance)
         results.append(check_replica_identity(table, facts))
         _columns = check_columns_replicable(
             table, facts, excluded=(excluded_columns or {}).get(table.name, ()))
@@ -1661,6 +1903,7 @@ __all__ = [
     "check_source_is_writer",
     "check_replica_identity",
     "check_table_replicable",
+    "check_inheritance_children",
     "check_columns_replicable",
     "check_publication_privilege",
     "check_cdc_replication_objects",

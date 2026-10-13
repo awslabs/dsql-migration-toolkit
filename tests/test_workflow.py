@@ -1656,13 +1656,16 @@ def test_finished_teardown_reports_a_result_that_survives_a_refresh() -> None:
     assert "cdc-a" in body and "cdc-b" in body
     assert "billing has stopped" in body
 
-    # A stop reports what it kept, and that a restart resumes rather than re-loads.
+    # A stop reports what it kept, and that a restart continues the stream rather than
+    # re-loads -- with its condition, and what a new Full Load start point needs (G25).
     tone, header, body = _cdc_teardown_banner_copy(
         {"state": "done", "kind": "stop", "stacks": ["cdc-a"]}
     )
     assert tone == "success"
     assert "connectors" in header.lower()
-    assert "resumes from where streaming left off" in body
+    assert "Start CDC can continue this stream from where streaming left off" in body
+    assert "gapless only while the CDC topics still retain" in body
+    assert "needs Delete CDC infrastructure and deploy it again first" in body
 
 
 def test_completion_notice_is_dismissed_by_the_user_not_a_timer() -> None:

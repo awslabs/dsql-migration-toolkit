@@ -2465,14 +2465,23 @@ def test_a_postgres_restart_names_the_slot_not_the_full_load_lsn() -> None:
     assert "replication slot dsqlmig_x" in resumed
     assert "continues from the slot's confirmed position" in resumed
     assert "where streaming stopped" in resumed
-    # A Full Load re-run recreates the slot at its own watermark, so that case is named too.
-    assert "WAL LSN 0/41204A0 if a Full Load run since then recreated the slot" in resumed
+    # The watermark is named for a connector that never streamed from the slot. (G25 round 6:
+    # no slot a Full Load re-created since -- such a Full Load waits for new topics on a stack
+    # that has streamed.)
+    assert "WAL LSN 0/41204A0 if the connector never streamed from it" in resumed
+    assert "recreated the slot" not in resumed
     assert "gapless from the Full Load watermark" not in resumed
-    # The first start keeps its line; a forced snapshot still says it re-snapshots.
+    # The first start keeps its line; a forced snapshot says it re-snapshots only when no
+    # offset is committed (G25: snapshot.mode=initial skips a completed snapshot's offset, so a
+    # forced restart continues from the slot like any other).
     first = _cdc_start_detail("dsql-cdc-x", wm, mode="auto", source_type=SourceType.POSTGRES)
     assert "gapless from the Full Load watermark" in first
     forced = _cdc_start_detail(
-        "dsql-cdc-x", wm, mode="auto", source_type=SourceType.POSTGRES,
+        "dsql-cdc-x", wm, mode="manual", source_type=SourceType.POSTGRES,
         resumes=True, force_snapshot=True,
     )
-    assert "re-snapshot" in forced
+    assert "replication slot dsqlmig_x" in forced and "re-snapshot" not in forced
+    forced_first = _cdc_start_detail(
+        "dsql-cdc-x", wm, mode="manual", source_type=SourceType.POSTGRES, force_snapshot=True,
+    )
+    assert "re-snapshot" in forced_first

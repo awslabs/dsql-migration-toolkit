@@ -230,11 +230,15 @@ def _open_start_over_dialog(
             listed = ", ".join(targets)
             scope = f" ({listed})" if targets else ""
             cdc_tiles_def = {
+                # Not "Recommended" (G25): these connectors streamed, so a fresh Full load +
+                # CDC run on the kept stack -- the usual next step after Start over -- needs new
+                # CDC topics (the Full Load step refuses a new start point there).
                 "stop": (
                     "Remove connectors, keep infrastructure",
                     f"Deletes only the MSK connectors on {listed or 'the cdc-stack'}; "
-                    "MSK / VPC / IAM stay for a fast restart (idle billing continues). "
-                    "Recommended.",
+                    "MSK / VPC / IAM stay so Start CDC can continue this stream from where "
+                    "it stopped (idle billing continues). A fresh Full load + CDC run needs "
+                    "new CDC topics: choose Delete instead.",
                 ),
                 "delete": (
                     (
@@ -403,8 +407,10 @@ def _cdc_teardown_banner_copy(
             "success",
             "CDC connectors removed",
             f"The CDC connectors on {listed} are gone and streaming has stopped. MSK, "
-            "the VPC wiring and the plugins were kept, so Start CDC can restart quickly "
-            "— and it resumes from where streaming left off.",
+            "the VPC wiring and the plugins were kept, so Start CDC can continue this "
+            "stream from where streaming left off (gapless only while the CDC topics still "
+            "retain what the sink had not applied); a new Full Load start point on it needs "
+            "Delete CDC infrastructure and deploy it again first.",
         )
     if kind == "infra" and state != "failed":
         # An infrastructure create is the one CDC operation the user is meant to walk

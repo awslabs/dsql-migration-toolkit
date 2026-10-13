@@ -814,20 +814,30 @@ yet* で拒否された場合は、上記のとおり契約を承諾してから
 
 > [!WARNING]
 > **完全な teardown の順序 (すべてのリソースを削除 / すべてのコストを停止)。** 移行は
-> 最大 3 つのスタックを使用します。何も — そしてコストも — 残らないよう、この順序で
-> 削除してください:
+> 最大 3 つのスタックと、どのスタックも所有しない S3 バケット 1 つを使用します。何も —
+> そしてコストも — 残らないよう、この順序で削除してください:
 >
 > 1. **最初に cdc-stack（一度でも CDC をデプロイした場合）** — これはコストのかかるもの
 >    です（Amazon MSK / MSK Connect / NAT）。**アプリがまだ起動している間に** UI から
 >    削除します: **Start over（右上） → 「Delete all CDC infrastructure」**（アプリが
 >    `cdc-stack` の削除を実行、~15〜25 分）。アプリがすでにない場合は手動で削除します:
->    `aws cloudformation delete-stack --stack-name mysql-dsql-cdc-stack --region "$AWS_REGION"`。
+>    `aws cloudformation delete-stack --stack-name dsql-cdc-stack --region "$AWS_REGION"`
+>    （実際の cdc-stack 名を使用してください — デフォルトは `dsql-cdc-stack` で、レガシーの
+>    デプロイでは `mysql-dsql-cdc-stack` の場合があります）。
 >    （CDC は別の `cdc-stack` です。CDC のドキュメントを参照。）
 > 2. **app-stack** — `deploy/teardown.sh`（下記）。
 > 3. **build-stack** — Option B（CodeBuild）を使用した場合のみ（下記）。
-> 4. **何も残っていないことを確認** — `mysql-dsql-*` の CloudFormation スタックが残って
->    いないこと
->    （`aws cloudformation list-stacks --query "StackSummaries[?starts_with(StackName,\`mysql-dsql\`) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`）、
+> 4. **プラグインバケット（ある場合）** — アプリが
+>    `mysql-dsql-migrator-plugins-<account>-<region>` を自ら作成するため、どのスタックも所有
+>    しておらず、どの `delete-stack` でも削除されません。このバケットは、デプロイがアップロード
+>    したすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB。
+>    整理するものはありません）と、ECS Fargate では保存されたセッションとジョブの状態を保持します。
+>    このアカウントとリージョンにあるツールのすべてのデプロイが共有するため、どのデプロイももう
+>    使用していないときにだけ削除してください。削除は元に戻せません:
+>    `aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+> 5. **何も残っていないことを確認** — `mysql-dsql-*` または `dsql-cdc-*` の CloudFormation
+>    スタックが残っていないこと
+>    （`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`）、
 >    加えて、作成したすべての **Route 53** レコードと **CodeBuild ソース S3 バケット**。
 
 ヘルパースクリプトを使用します（スタックを削除して待機します。デフォルトでは ECR
@@ -1162,6 +1172,16 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 > [!WARNING]
 > 状態 EBS ボリュームは設計上 **`DeletionPolicy: Retain`** のため、**スタック削除後も残ります** —
 > 保持したくない場合は手動で削除してください（`aws:cloudformation:stack-name` タグで検索）。
+
+CDC をデプロイした場合、アプリはプラグインバケット `mysql-dsql-migrator-plugins-<account>-<region>`
+も作成しています。どのスタックも所有しないためこのバケットも残り、整理するものもありません: デプロイが
+アップロードしたすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB）を
+保持します。このアカウントとリージョンにあるツールのすべてのデプロイが共有するため、どのデプロイももう
+使用していない状態になったら、クリーンな状態にするために削除してください（元に戻せません）:
+
+```bash
+aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
+```
 
 ---
 

@@ -313,14 +313,27 @@ class _StageDriver:
 # enough to prove liveness without drowning the stack events (polls are ~30s).
 _ENI_REPORT_INTERVAL_SECONDS = 120.0
 
+# What a Delete and a redeploy then cost, per engine (G25): this text is read on either, and
+# nothing here says which. A MySQL Start on the new stack re-reads the binary log from a start
+# point -- with CDC only and none, from the source's current position. A PostgreSQL delete
+# drops the replication slot, so its way on is the route rule's (cdc_pg_slot.pg_cdc_route).
+_QUOTA_REDEPLOY_COST = (
+    "On a MySQL source, Start CDC on the new stack re-reads the binary log from the Full Load "
+    "watermark or your Manual start point; with CDC only and neither, it begins at the "
+    "source's current position, so changes since the last one Aurora DSQL applied are not "
+    "replicated. On a PostgreSQL source, deleting drops the replication slot: "
+    + cdc_pg_slot.pg_cdc_route(None, started=True, cdc_only=None)
+    + "."
+)
+
 _PARTITION_QUOTA_GUIDANCE = (
     "Stack operation ended in '{status}' because the MSK Serverless partition "
     "quota is exhausted. Each connector create/delete consumes partitions that "
     "are not reclaimed, so repeated Start/retry cycles can run the cluster out. "
     "This cannot be fixed in place: use Delete CDC infrastructure to tear down the "
-    "whole cdc-stack, then deploy again from scratch (CDC resumes from the source "
-    "position you set). To avoid recurrence, finalize table selection before "
-    "Start so you do not iterate connectors."
+    "whole cdc-stack, then deploy again from scratch. " + _QUOTA_REDEPLOY_COST + " To "
+    "avoid recurrence, finalize table selection before Start so you do not iterate "
+    "connectors."
 )
 
 
@@ -331,6 +344,25 @@ def _is_partition_quota_message(msg: str) -> bool:
         "quota" in lowered or "exceeded" in lowered or "limit" in lowered
     )
 
+
+# G25 (decisions A/B): every connector diagnosis below is read on a stack whose connectors
+# were started (running, stopped since, or a Start CloudFormation rolled back), so its CDC
+# topics may hold changes no sink applied and its sink resumes from its last commit: a NEW
+# start point there needs new topics first -- the Full Load step refuses one, and Start CDC
+# refuses a newer one -- and the Manual alternative is on the new stack. The last sentence is
+# ui.cdc_start_point_gate.RELOAD_RESETS_MANUAL verbatim (core may not import ui; pinned).
+_NEW_START_POINT_ROUTE = (
+    "This stack has streamed, so a new start point needs new CDC topics: Delete CDC "
+    "infrastructure and deploy it again (the new stack starts with empty topics), then "
+    "Re-run Full Load for all tables with \"Drop & reload\" (Full load + CDC; re-run Step 1 "
+    "(Evaluation) and Schema Conversion first if a captured table changed), then Start CDC. "
+    "On the new stack you can instead choose Manual, Fetch current position and Use this "
+    "start point: changes made between where CDC stopped and that point are then not "
+    "replicated, so reload those tables with \"Drop & reload\" (CDC only: correct them on "
+    "Aurora DSQL) and validate with CHECKSUM. "
+    "A reload switches the CDC start point back to Automatic, so choose Manual again and "
+    "Use this start point before Start CDC (the fetched point is kept)."
+)
 
 # One text for both "Debezium has no definition for this table" signatures below (a row
 # change, or a replayed CREATE UNIQUE INDEX). It carries SCHEMA_HISTORY_MARK on purpose:
@@ -345,12 +377,8 @@ _UNKNOWN_TABLE_GUIDANCE = (
     "Retry CDC on connectors that exist keeps their snapshot mode and fails the same way) "
     "— then Start CDC: it rebuilds the history from the source tables as they are now, "
     "after checking the captured tables against the start point. Otherwise, or if that "
-    "check names a changed or missing table, give CDC a start point after the change: "
-    "Re-run Full Load for all tables with \"Drop & reload\" (Full load + CDC), or choose "
-    "Manual, Fetch current position and Use this start point, then reconcile with "
-    "\"Drop & reload\" and CHECKSUM. "
-    "A reload switches the CDC start point back to Automatic, so choose Manual again "
-    "and Use this start point before Start CDC (the fetched point is kept)."
+    "check names a changed or missing table, give CDC a start point after the change. "
+    + _NEW_START_POINT_ROUTE
 )
 
 # G7: a DDL statement Debezium's MySQL grammar cannot parse (see the table entry below).
@@ -369,16 +397,8 @@ _UNPARSEABLE_DDL_GUIDANCE = (
     "stored routines, triggers, views and accounts — and stops at one its MySQL grammar "
     "does not support rather than skip it, because a skipped statement could leave its "
     "table definitions wrong. The connector resumes from a position before that "
-    "statement, so Retry CDC, and Start CDC after Stop CDC, read it and stop again. Stop "
-    "CDC, then give CDC a start point after the statement: Re-run Full Load for all "
-    "tables with \"Drop & reload\" (Full load + CDC; re-run Step 1 (Evaluation) and Schema "
-    "Conversion first if the statement changed a captured table) — its new watermark is "
-    "past the statement; or choose Manual, Fetch current position and Use this start "
-    "point — changes made between where CDC stopped and that point are then not "
-    "replicated, so reload those tables with \"Drop & reload\" (CDC only: correct them on "
-    "Aurora DSQL) and validate with CHECKSUM. "
-    "A reload switches the CDC start point back to Automatic, so choose Manual again "
-    "and Use this start point before Start CDC (the fetched point is kept). "
+    "statement, so Retry CDC, and Start CDC after Stop CDC, read it and stop again. To "
+    "continue, give CDC a start point after the statement. " + _NEW_START_POINT_ROUTE + " "
     "Do not use the \"binlog reader near position\" in the connector log as a start "
     "point: it is where the statement begins. A Start from a new start point reads the "
     "current definition of every table on the server, so if the statement created or "
@@ -419,13 +439,7 @@ _ANONYMOUS_GTID_GUIDANCE = (
     "Retry CDC fails the same way, and so does Stop CDC followed by Start CDC. Stop CDC, "
     "then either set the source's gtid_mode back to ON_PERMISSIVE until cut over — Debezium "
     "then reads by binlog file:position from where it stopped — or give CDC a start point "
-    "recorded while gtid_mode is ON: Re-run Full Load for all tables with \"Drop & reload\" "
-    "(Full load + CDC), or choose Manual, Fetch current position and Use this start point — "
-    "changes made between where CDC stopped and that point are then not replicated, so "
-    "reload those tables with \"Drop & reload\" (CDC only: correct them on Aurora DSQL) and "
-    "validate with CHECKSUM. "
-    "A reload switches the CDC start point back to Automatic, so choose Manual again and "
-    "Use this start point before Start CDC (the fetched point is kept)."
+    "recorded while gtid_mode is ON. " + _NEW_START_POINT_ROUTE
 )
 _PURGED_GTIDS_GUIDANCE = (
     "{connector} failed: the source runs gtid_mode=ON, so Debezium reads the binary log by "
@@ -439,17 +453,12 @@ _PURGED_GTIDS_GUIDANCE = (
     "way, and so does Stop CDC followed by Start CDC. For a pipeline an earlier version "
     "started from a Manual start point, Stop CDC, set the source's gtid_mode to "
     "ON_PERMISSIVE until cut over (a parameter-group change on RDS and Aurora), then Start "
-    "CDC: Debezium resumes from where it stopped by binlog file:position, with no gap (if "
-    "the binlog retention also ran out, that Start fails rather than skip changes). "
-    "Otherwise, Stop CDC, then give CDC a start point the source still holds: Re-run Full "
-    "Load for all tables with \"Drop & reload\" (Full load + CDC; raise the source's binlog "
-    "retention first, for example CALL mysql.rds_set_configuration('binlog retention "
-    "hours', 168)), or choose Manual, Fetch current position and Use this start point — "
-    "changes made between where CDC stopped and that point are then not replicated, so "
-    "reload those tables with \"Drop & reload\" (CDC only: correct them on Aurora DSQL) and "
-    "validate with CHECKSUM. "
-    "A reload switches the CDC start point back to Automatic, so choose Manual again and "
-    "Use this start point before Start CDC (the fetched point is kept)."
+    "CDC: Debezium resumes from where it stopped by binlog file:position, with no gap while "
+    "the CDC topics still retain the changes the sink had not applied when CDC stopped "
+    "(their retention period on MSK); if the binlog retention also ran out, that Start "
+    "fails rather than skip changes. Otherwise, give CDC a start point the source still "
+    "holds (raise the source's binlog retention first, for example CALL "
+    "mysql.rds_set_configuration('binlog retention hours', 168)). " + _NEW_START_POINT_ROUTE
 )
 
 
@@ -460,9 +469,8 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "connector create/delete consumes partitions that are not reclaimed, so "
         "repeated Start/retry cycles run the cluster out. This cannot be fixed in "
         "place: use Delete CDC infrastructure to tear down the whole cdc-stack, then "
-        "deploy again from scratch (CDC resumes from the source position you set). To "
-        "avoid recurrence, finalize your table selection before Start so you do not "
-        "iterate connectors.",
+        "deploy again from scratch. " + _QUOTA_REDEPLOY_COST + " To avoid recurrence, "
+        "finalize your table selection before Start so you do not iterate connectors.",
     ),
     (
         "could not find a 'kafkaclient' entry in the jaas",
@@ -496,15 +504,8 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "started reading from — before the first Start from that start point, before a "
         "Start after Delete CDC infrastructure, or shortly before an automatic connector "
         "restart. Starting again, Retry CDC and the \"schema recovery mode\" the log "
-        "suggests all replay the same rows and fail again. Stop CDC, then give CDC a "
-        "start point after the change: for Full load + CDC, re-run Step 1 (Evaluation), "
-        "update the changed table in Schema Conversion and Re-run Full Load for all "
-        "tables with \"Drop & reload\" (its new watermark is past the change); or choose "
-        "Manual, Fetch current position and Use this start point — changes made before "
-        "that point are then not replicated, so reload those tables with \"Drop & "
-        "reload\" (CDC only: correct them on Aurora DSQL) and validate with CHECKSUM. "
-        "A reload switches the CDC start point back to Automatic, so choose Manual again "
-        "and Use this start point before Start CDC (the fetched point is kept).",
+        "suggests all replay the same rows and fail again. To continue, give CDC a start "
+        "point after the change. " + _NEW_START_POINT_ROUTE,
     ),
     (
         # AlterTableParserListener: "Trying to change column <c> in <t> table, which does
@@ -518,14 +519,8 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
         "renamed after the position this connector started reading from, on ANY table of "
         "the source server, not only a captured one: Debezium tracks every table's "
         "definition (the connector's CloudWatch log names the table). Starting again, "
-        "Retry CDC and recovery mode repeat it. Stop CDC, then give CDC a start point "
-        "after the rename: Re-run Full Load for all tables with \"Drop & reload\" (Full "
-        "load + CDC; re-run Step 1 and Schema Conversion first if a captured table "
-        "changed); or "
-        "choose Manual, Fetch current position and Use this start point, then reload or "
-        "correct the changes made before it and validate with CHECKSUM. "
-        "A reload switches the CDC start point back to Automatic, so choose Manual again "
-        "and Use this start point before Start CDC (the fetched point is kept).",
+        "Retry CDC and recovery mode repeat it. To continue, give CDC a start point after "
+        "the rename. " + _NEW_START_POINT_ROUTE,
     ),
     (
         # BaseSourceTask: "The db history topic is missing. You may attempt to recover it
@@ -638,15 +633,26 @@ _CONNECTOR_LOG_DIAGNOSES: tuple[tuple[str, str], ...] = (
     # died got the content-free "<connector> entered FAILED state." and the operator had
     # to open the MSK Connect log group themselves.
     (
+        # Names no "Re-snapshot every table instead": the Start dialog never offers it on a
+        # stack whose connectors were started (G25, _cdc_ui._pg_stack_started), and every
+        # stack this failure is read on is one: its connectors still exist (the task died
+        # after the stack update; Stop CDC then keeps DeploySink=true), or the Start's update
+        # rolled back (any UPDATE_ROLLBACK_*), which removed them. Either way the CDC topics
+        # may hold changes no sink applied, which this stack's sink would apply over a Full
+        # Load re-run on it, so the one route is new topics first -- the route rule's own
+        # words (cdc_pg_slot.pg_cdc_route), as the Start dialog and the job name it (G25).
+        # The migration type is not known here, so both types' last steps are named.
         "publication autocreation is disabled",
         "{connector} failed: the PostgreSQL CDC publication does not exist on the "
         "source, and the connector is configured not to create one. Only a "
-        "'Full load + CDC' run creates it. Delete the connectors (Stop CDC), then Start "
-        "CDC again and choose \"Re-snapshot every table instead\" when the dialog offers "
-        "it -- that lets the connector create its own publication and snapshot the "
-        "tables, which has no replication gap. Do NOT create a replication slot by hand "
-        "to resume from: a slot cannot start at a past position, so it would silently "
-        "skip every change made since the Full Load.",
+        "'Full load + CDC' run creates it. If the CDC step still shows the connectors, Stop "
+        "CDC first (or Clean up leftover connector on an incomplete pipeline); a Start whose "
+        "CloudFormation update rolled back left none to remove. "
+        + cdc_pg_slot.pg_cdc_route(
+            cdc_pg_slot.PUBLICATION_MISSING_HEADER, started=True, cdc_only=None
+        )
+        + " Do NOT create a replication slot by hand to resume from: a slot cannot start at "
+        "a past position, so it would silently skip every change made since the Full Load.",
     ),
     (
         # PostgresReplicationConnection: "Unable to %s filtered publication %s for %s" and
@@ -1713,6 +1719,8 @@ def run_cdc_infra_deploy(
         # in an unsupported AZ makes MskCluster CREATE_FAILED. On that reason we
         # delete the rolled-back stack, re-select subnets with the AZ excluded,
         # and retry — bounded by max_az_retries so a genuinely stuck deploy stops.
+        # The retry re-creates the CustomPlugins from the SAME content-addressed
+        # keys (G25), whose objects hold the bytes this deploy hashed: no re-upload.
         excluded_azs: set[str] = set()
         attempt = 0
         while True:

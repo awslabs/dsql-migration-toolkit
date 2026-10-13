@@ -38,18 +38,36 @@ The source is read **read-only** inside a consistent snapshot; the loader never
 modifies it. A MySQL source — and a PostgreSQL Full-Load-only migration — is never
 written. The single exception is **PostgreSQL CDC**: at the watermark point (§3.5)
 the tool creates, and at teardown drops, a logical replication slot and a
-publication scoped to exactly the migrated tables. It also sets `REPLICA IDENTITY
-FULL` on a re-keyed table, repairs the publication's `publish_via_partition_root`,
-and, for a table selected after the Full Load (Full load + CDC, before CDC starts),
-adds that table to the publication just before copying it, then takes one
-transaction ID to wait for the transactions open at that moment. All of these are
-autocommit, restricted to a small allowlist, and audited. They are the only writes
-the tool ever makes to any source. Before it creates the publication (or adds
-tables to it) at the watermark, it checks that every table it would add keeps a
-usable `REPLICA IDENTITY`; otherwise the run stops before it changes anything on
-the source and names the table and the fix for its cause. A table selected after
-the Full Load gets the same check before it is added: without one it is not
-loaded, and its row says why ([13.7](13-excluding-tables-and-columns.md)).
+publication scoped to exactly the migrated tables (`FOR TABLE ONLY`: a table's
+inheritance children are not added with it, just as the Full Load reads only the table's
+own rows, `FROM ONLY`, see
+[§6.1](06-limitations.md#61-aurora-dsql-feature-limits-your-schema-must-fit-these); a
+partitioned table's partitions are).
+It also sets `REPLICA IDENTITY FULL` on a re-keyed table and repairs the publication's
+`publish_via_partition_root`: at the Full Load on a publication it reuses (before it
+creates the slot), at each Start CDC (if there is no publication yet, as on a first
+CDC only Start or one after a Full-load-only run, it creates an empty one with that
+setting and the connector adds its tables), and before it adds a table selected after
+the Full Load. Such a table (Full load + CDC, before CDC starts) joins the publication
+just before its copy, then the tool takes one transaction ID to wait for the
+transactions open at that moment. All of these are autocommit, restricted to a small
+allowlist, and audited. They are the only writes the tool ever makes to any source.
+Before it creates the publication (or adds tables to it) at the watermark, it checks
+that every table it would add keeps a usable `REPLICA IDENTITY` (and, on PostgreSQL 18,
+that no re-keyed table has a generated column, which the `FULL` it needs would break);
+otherwise the run stops before it changes anything on the source and names the table and
+the fix for its cause. It also
+stops before any write if a replication slot of the same name is in use, belongs to
+another database or is not a logical `pgoutput` slot (for example another
+migration's, under the same CDC stack name); an inactive one in this database is
+taken as this stack's earlier slot and replaced. If the Full Load's
+`publish_via_partition_root` repair fails while a selected table is partitioned, the
+run stops before it creates the slot and names the `ALTER PUBLICATION` statement to
+run as the publication's owner; at Start CDC a repair that fails, or cannot run because
+the session has no source password, does not stop the Start, and its log names the
+same statement. A table selected after the Full Load gets the same check before it is
+added: without one it is not loaded, and its row says why
+([13.7](13-excluding-tables-and-columns.md)).
 
 ---
 
@@ -139,14 +157,17 @@ runs **only on a complete** (or accepted-gap) load — never on a partial/failed
 plain-integer keys have no sequence and are untouched.
 
 **Indexes come last.** Secondary indexes are created **after** all data batches
-succeed, each as `CREATE INDEX ASYNC` in its own single-DDL transaction (DSQL
-allows one DDL per transaction and builds indexes asynchronously). An index
-statement Aurora DSQL answers with `XX000` ("server unavailable") is retried the
-same way. If a retry then finds an index of that name already there, the tool does
-not count it as created, because index names are per schema in Aurora DSQL and it
-could be another table's: the Full Load panel and the error log show it as **not
-confirmed** (not as missing), with a note that the earlier attempt may have created
-it, so check the target before you add it.
+succeed, each as `CREATE INDEX ASYNC` in its own single-DDL transaction (DSQL allows
+one DDL per transaction and builds indexes asynchronously). An index statement
+Aurora DSQL answers with `XX000` ("server unavailable"), or whose connection drops
+while it runs, is retried the same way. If a retry then finds an index of that name
+already there, the tool does not count it as created, because index names are per
+schema in Aurora DSQL and it could be another table's: the Full Load panel and the
+error log show it as **not confirmed** (not as missing), with a note that the
+earlier attempt may have created it, so check the target before you add it. The
+panel's notice says a constraint is missing only when a `UNIQUE` index is known not
+to have been created; when some indexes are missing and others not confirmed, it
+names both.
 
 ---
 
@@ -186,6 +207,76 @@ and you simply don't get the CDC handoff (Full Load still works).
 > The watermark's row counts are **approximate on purpose** (to spare the
 > source). Exact `COUNT(*)` and checksums are the job of **Validation**
 > ([Chapter 5](05-validation.md)), not Full Load.
+
+### A new start point needs new CDC topics
+
+Capturing a **new** watermark is a decision about CDC too, so on a **Full load + CDC**
+migration whose CDC stack has **streamed** — stopped after a Start, its connectors in place,
+or a Start that CloudFormation rolled back — every action that takes one is **refused**:
+**Start Full Load**, **Re-run Full Load** and **Re-run all tables** are disabled, and the page
+header's **Run** starts nothing. Stop CDC (and a rolled-back Start) removes the sink without draining it, so its
+consumer group would re-apply changes older than the new snapshot over the reloaded tables,
+while the source skips the changes between the old stop point and the new snapshot —
+silently: only a CHECKSUM validation would show it. The notice names the route instead:
+**Delete CDC infrastructure** and deploy it again (the new stack starts with empty topics),
+then **Re-run Full Load** choosing **Drop & reload** (on PostgreSQL that creates the
+replication slot again at its own snapshot point), then **Start CDC**.
+
+- **The page header's Run is gated the same way**, because it takes a new start point just
+  like Start / Re-run Full Load. On a stack that has streamed it starts nothing: a warning
+  toast names the same route, no job is created, no watermark is captured (on PostgreSQL the
+  replication slot is not replaced), and the step status and the previous Full Load record
+  stay as they were. That covers a stack that is still **streaming** too.
+- **While CDC is live**, the Full Load actions keep their own gate first: *Stop CDC first
+  (CDC step → Stop CDC), then Delete CDC infrastructure and deploy it again before a new
+  Full Load.* The confirm dialog of **Retry unfinished tables**, **Reload specific tables**
+  or a per-table **Reload**, which keep the original start point, says instead to Stop CDC
+  first, run it, then Start CDC again: CDC then continues from where it stopped, gapless
+  only while the CDC topics still retain what the sink had not applied (their retention
+  period on MSK).
+- **Until the CDC state has been read** in this session — just after the screen opens, or
+  after an app restart — or when it could not be read, a new start point **waits** rather
+  than guessing: the notice says so and points at **Re-check CDC state** on the CDC step
+  (fix the AWS access first if the read failed).
+- **Not gated:** **Retry unfinished tables**, **Reload specific tables**, a per-table
+  **Reload** and **Change & reload** all keep the **original** start point, so CDC continues
+  from where it stopped — like any restart after Stop CDC, gapless only while the CDC topics
+  still retain the changes the sink had not applied
+  ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)) — and the
+  reloaded tables converge. The Full Load step does not gate a **Full load only** or **CDC
+  only** migration, but switching to one is no way around this gate (next entry).
+- **Start CDC refuses a newer start point (MySQL).** On a MySQL source, Start CDC refuses to
+  move a CDC stack that has streamed forward to a start point newer than the one it last
+  started from (or, once it is stopped, to any start point when its last Start offered none),
+  whatever the migration type: for example the watermark of a Re-run Full Load made in
+  **Full load only** after switching away from Full load + CDC, or a later **Manual** point.
+  The start-point card and the Start CDC card show *This CDC stack cannot start from a newer
+  start point* with the route — the one above, or with CDC only, **Delete CDC
+  infrastructure** and deploy it again, then **Start CDC** on the new stack — and Start CDC
+  is disabled; the Start CDC dialog, a click on Start or Retry CDC, and the Start CDC job, on
+  the stack as it reads it before changing anything (*Start CDC blocked: This CDC stack has
+  streamed, so Start CDC does not move it forward to a newer start point …*), refuse it too.
+  A refused Manual point also says when setting the start point back to **Automatic** would
+  continue the stream. A start point at or before that one, or none, continues the stream
+  and is not refused. After a first Start that CloudFormation rolled back, the stack records
+  only that it rolled back a Start: the rollback restores its parameters, so the start point
+  that Start offered is kept only in the app's memory. While the app holds it, a start point
+  later than that one is refused and a retry from the same one is not. After an app restart
+  (or for a Start made in another session) no start point can be checked against it, so
+  every start point is refused on that stack, that same one included (*CloudFormation rolled
+  back this stack's last Start, and the start offset that Start offered is no longer known
+  …*), with the same route. The CDC only route starts the new stack from the Full Load's
+  watermark, so after a Full load only re-run that appended to rows already on the target,
+  run it again choosing **Drop & reload** before that Start (an append keeps those rows as
+  they were, and CDC from a watermark carries only the changes after it). On PostgreSQL
+  there is no such
+  refusal: Start CDC continues from the stack's own replication slot whatever the Full Load's
+  watermark says, and a Full load only run leaves that slot alone, so CDC continues from
+  where it stopped if the stack's source connector streamed (otherwise Debezium snapshots
+  every selected table first), as in any restart after Stop CDC (above).
+- If the stack starts streaming between the click and the job starting, the engine refuses on
+  the job thread before it reads or writes anything: the run is recorded as failed with
+  *FullLoadRefusedError* and the same one-line reason.
 
 ---
 
@@ -254,7 +345,7 @@ units**:
 
 - a completed batch is recorded as `DONE`;
 - a stop / retry re-runs only the unfinished ranges;
-- `INSERT ... ON CONFLICT` makes any re-run idempotent (no duplicates).
+- `INSERT ... ON CONFLICT` makes re-running a batch idempotent (no duplicates).
 
 The "retry failed tables" path resets only the failed tables to pending, **reuses
 the original watermark**, and keeps the completed tables — so you never redo work
@@ -264,11 +355,14 @@ A table selected after the load (Full load only lets the table set change; see
 [13.7](13-excluding-tables-and-columns.md)) is loaded by the same retry, but the
 original watermark does not cover it, so the CDC handoff holds only for the original
 set: the migration type stays on Full load only until Re-run Full Load takes a fresh
-watermark over the current set (or you untick the tables selected since).
+watermark over the current set (or you untick the tables selected since). Choose
+**Drop & reload** for that re-run: CDC then starts from its watermark, and an *Append*
+keeps the rows the earlier load wrote as they were, without the source's updates and
+deletes since.
 
 Unticking tables does not lock the type unless CDC has already started for this migration: CDC captures the loaded tables still selected. In Full load + CDC you can untick tables after the load until CDC starts. They are left as is on Aurora DSQL, CDC does not capture them, the watermark still covers every captured table (the handoff stays gapless), and a failure only in unticked tables no longer holds the step.
 
-In Full load + CDC you can also tick a table after the load, until CDC starts. Retry unfinished tables loads it under the original watermark, after the checks in [13.7](13-excluding-tables-and-columns.md) (CDC never started, the Aurora DSQL table is empty or dropped and reloaded, and CDC can capture the table with no gap: on MySQL its definition is unchanged since the watermark; on PostgreSQL it has a usable replica identity and joins CDC's publication before its copy). The watermark then covers it, CDC captures it from that watermark with the other tables, and the handoff stays gapless for it too. On MySQL, a table the Full Load recorded no start-point definition for (a Full Load from an earlier version, or a table converted after the load) is loaded by Re-run all tables instead. Full load only is unchanged: a load there never extends the watermark.
+In Full load + CDC you can also tick a table after the load, until CDC starts. Retry unfinished tables loads it under the original watermark, after the checks in [13.7](13-excluding-tables-and-columns.md) (CDC never started, the Aurora DSQL table is empty or dropped and reloaded, and CDC can capture the table with no gap: on MySQL its definition is unchanged since the watermark; on PostgreSQL it has a usable replica identity and joins CDC's publication before its copy). The watermark then covers it, CDC captures it from that watermark with the other tables, and the handoff stays gapless for it too. On MySQL, a table the Full Load recorded no start-point definition for (a Full Load from an earlier version, or a table converted after the load) is loaded by Re-run all tables instead, choosing **Drop & reload**: it takes a fresh start point for every table, and an append would keep the rows already loaded as they were. Full load only is unchanged: a load there never extends the watermark.
 
 > **Run Full Load from the command line (optional).** The same bulk loader is
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;

@@ -382,6 +382,10 @@ class _SizeProbeConn:
             )
         if "SET " in sql:
             return None
+        if "AS inheritance_parent" in sql:
+            # G25 round 4: a PostgreSQL table is first asked whether it is an inheritance
+            # parent (measured FROM ONLY then, tests/test_g25_pg_r4.py); none of these is.
+            return type("_Scalar", (), {"scalar": lambda self: False})()
         # The byte limit must arrive as a BOUND parameter. Checking only that ":limit"
         # appears in the text is not enough -- dropping the bindparams() call leaves the
         # placeholder in the SQL and the value nowhere, which a permissive fake would

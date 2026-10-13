@@ -1367,7 +1367,10 @@ def test_once_cdc_has_started_a_full_load_only_detour_cannot_narrow_it(monkeypat
         "Locked — the table set changed after this Full Load (unselected since: app.b), and "
         "CDC has already started for this migration: a CDC type cannot continue a set that "
         "differs from the one that run started with. To add CDC, re-run Full Load over the "
-        "current set (it takes a fresh watermark), or restore the original table set.")
+        "current set (it takes a fresh watermark), or restore the original table set. Before "
+        "that re-run, if this migration's CDC stack still exists, Delete CDC infrastructure and "
+        "deploy it again: a stack that has streamed only continues from where it stopped, never "
+        "from a newer start point.")  # G25 round 7 (decision A2)
     _rerender(s)  # the completion notice says the same, not "Tables were selected..."
     assert any(t.startswith(COVERAGE_GAP_NOTICE_BODY_STARTED) for t in s.ui.texts)
     held["on_tick"](SimpleNamespace(value=["table:app.a", "table:app.b"]))  # restored

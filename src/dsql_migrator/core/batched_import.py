@@ -229,14 +229,24 @@ UNCONFIRMED_INDEX_NOTE = (
     "it, so it may have been created anyway: check whether it exists on this table "
     "before you add it)"
 )
+# The post-load pass's note when instead the connection dropped while an attempt's CREATE
+# ran (G25): the statement may have committed before its reply was lost, the same
+# uncertain outcome as an XX000.
+UNCONFIRMED_INDEX_DROP_NOTE = (
+    " (the connection dropped while an attempt to create it was running, so it may have "
+    "been created anyway: check whether it exists on this table before you add it)"
+)
 
 
 def is_unconfirmed_index_failure(message: object) -> bool:
-    """True when an index failure carries :data:`UNCONFIRMED_INDEX_NOTE`: Aurora DSQL
-    answered an attempt to create the index with XX000, so the index may exist after all.
-    The Full Load reports such an index as "not confirmed" rather than missing, keyed on
-    this one marker instead of a copy of its text."""
-    return UNCONFIRMED_INDEX_NOTE in str(message or "")
+    """True when an index failure carries :data:`UNCONFIRMED_INDEX_NOTE` or
+    :data:`UNCONFIRMED_INDEX_DROP_NOTE`: an attempt to create the index ended with no
+    confirmed outcome (Aurora DSQL's XX000, or a connection dropped during the statement),
+    so the index may exist after all. The Full Load reports such an index as "not
+    confirmed" rather than missing, keyed on these markers instead of a copy of their
+    text."""
+    text = str(message or "")
+    return UNCONFIRMED_INDEX_NOTE in text or UNCONFIRMED_INDEX_DROP_NOTE in text
 
 
 class OnConflictMode(str, Enum):
@@ -1753,12 +1763,14 @@ class BatchedImporter:
         independently (one bad index no longer stops the remaining ones) and the
         failures are returned for the caller to surface as a warning.
 
-        Aurora DSQL's ``XX000`` is retried within the same budget. Its attempt may have
-        created the index, and an index DDL is not idempotent, so a failure after one --
-        a later "already exists" (``42P07``) or an ``XX000`` that never cleared -- carries
-        :data:`UNCONFIRMED_INDEX_NOTE` and is never counted as created (the name could be
-        another table's index). Never ``IF NOT EXISTS``: that would silently skip a genuine
-        name collision.
+        Aurora DSQL's ``XX000`` is retried within the same budget, as is a dropped
+        connection. Either attempt may have created the index (G25: a connection that
+        drops while the statement runs loses its reply, not necessarily its commit), and an
+        index DDL is not idempotent, so a failure after one -- a later "already exists"
+        (``42P07``), or an ``XX000`` / drop that never cleared -- carries
+        :data:`UNCONFIRMED_INDEX_NOTE` (or :data:`UNCONFIRMED_INDEX_DROP_NOTE`) and is never
+        counted as created (the name could be another table's index). Never ``IF NOT
+        EXISTS``: that would silently skip a genuine name collision.
         """
         # Lease a FRESH connection INSIDE each retried unit -- mirroring the data
         # path (``_execute_insert``, which leases per attempt) -- and pass the wider
@@ -1775,17 +1787,28 @@ class BatchedImporter:
         # refills the slot, so the next lease / retry mints a fresh one) plus
         # ``retryable=_is_retryable_load_error`` fixes both: a transient drop is
         # retried on a fresh connection, and no dead connection is reused across DDLs.
-        # ``unconfirmed`` records an attempt whose CREATE answered XX000 (it may have
-        # committed), so the failure it may cause is reported with that note. Only the
-        # statement's XX000 counts: one from opening the connection ran no CREATE.
+        # ``unconfirmed`` holds the note for an attempt whose CREATE ended with no confirmed
+        # outcome -- it answered XX000, or (G25) the connection dropped while it ran: either
+        # may have committed -- so the failure it may cause is reported with that note. Only
+        # the statement counts: opening the connection, or a cursor on one the client
+        # already knows is closed, ran no CREATE.
         def _run_ddl(ddl: str, unconfirmed: list) -> None:
             with pool.lease() as connection:
+                cursor = connection.cursor()
                 try:
-                    _execute_ddl(connection, ddl)
+                    cursor.execute(ddl)
                 except Exception as exc:  # noqa: BLE001 - noted, then re-raised to the retry
-                    if is_server_unavailable(exc):
-                        unconfirmed[0] = True
+                    if not unconfirmed[0]:
+                        unconfirmed[0] = (
+                            UNCONFIRMED_INDEX_NOTE
+                            if is_server_unavailable(exc)
+                            else UNCONFIRMED_INDEX_DROP_NOTE
+                            if _is_transient_connection_error(exc)
+                            else ""
+                        )
                     raise
+                finally:
+                    _safe_close(cursor)
 
         retried = with_occ_retry(
             max_attempts=self._occ_max_attempts,
@@ -1797,7 +1820,7 @@ class BatchedImporter:
         created = 0
         failures: list[str] = []
         for ddl in index_ddls:
-            unconfirmed = [False]
+            unconfirmed = [""]
             try:
                 retried(ddl, unconfirmed)
             except Exception as exc:  # noqa: BLE001 - isolate per-index failure
@@ -1810,8 +1833,7 @@ class BatchedImporter:
                 _unique = bool(re.match(r"\s*CREATE\s+UNIQUE\b", ddl, re.IGNORECASE))
                 failures.append(
                     f"{'UNIQUE ' if _unique else ''}{_index_name_of(ddl)}: "
-                    f"{_safe_error(exc)}"
-                    + (UNCONFIRMED_INDEX_NOTE if unconfirmed[0] else "")
+                    f"{_safe_error(exc)}{unconfirmed[0]}"
                 )
                 _LOGGER.warning(
                     "Post-load index creation failed (data is unaffected): %s",
@@ -1946,15 +1968,6 @@ def _safe_error(exc: BaseException) -> str:
         first_line = first_line[:297] + "..."
     name = type(exc).__name__
     return f"{name}: {first_line}" if first_line else name
-
-
-def _execute_ddl(connection: Any, ddl: str) -> None:
-    """Execute a single DDL statement on ``connection`` (one transaction)."""
-    cursor = connection.cursor()
-    try:
-        cursor.execute(ddl)
-    finally:
-        _safe_close(cursor)
 
 
 def _estimate_row_bytes(row: Mapping[str, object]) -> int:
@@ -2138,6 +2151,7 @@ __all__ = [
     "BatchedImportResult",
     "BatchedImporter",
     "UNCONFIRMED_INDEX_NOTE",
+    "UNCONFIRMED_INDEX_DROP_NOTE",
     "batch_chunk_id",
     "build_insert_statement",
     "is_unconfirmed_index_failure",

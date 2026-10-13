@@ -2801,6 +2801,34 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v53 (G25, rebuilt in place): a hold that ends -- applied, dead-lettered, or replaced
+        # by a later change of its row -- is released only when the put returns normally, and
+        # a probe's transient failure no longer fails the put: Connect's redelivery of a failed
+        # put's batch wrote the released partition's later records ahead of its never-written
+        # tail and committed past it (a row lost silently after a crash). The marker is the
+        # nested type that carries the decision.
+        "hold released after the put returns": b"DsqlSinkTask$HoldEnd",
+        # ...a change skipped because a later change of its row replaces it stays skipped in
+        # Connect's redelivery of its put, whose held tail now holds that later change (it was
+        # dead-lettered with 23505 once per redelivery). G23's skip itself is kept as is.
+        "skip kept through a redelivery": b"heldTailInPut",
+        # ...time Aurora DSQL could not answer does not count against the 5-minute budget.
+        "hold budget excludes outages": b"lastTransientNanos",
+        # ...a held change is reported as replication lag while it waits (no op counted).
+        "held change as lag": b"recordLag",
+        # ...every logged hold is closed by a line: the look-ahead replacement and a revoke.
+        "hold replaced line": b"so the hold on unique index {} ended",
+        "hold dropped line": b"next owner reads it again",
+        # ...the retries Aurora DSQL asked for are logged once per offset commit.
+        "retry summary": b"asked this task to retry a transaction",
+        # ...a describe failure inside a move's transaction is reported with its own cause
+        # (such as 42703), not as the 25P02 it leads to.
+        "describe failure kept": b"DsqlSinkTask$Described",
+        # ...a held change's try that Aurora DSQL does not answer is logged (WARN, about once a
+        # minute while it lasts) and backed off from 500 ms to 10 s: it no longer fails the put,
+        # so Connect logged nothing and the sink reconnected every 500 ms. The marker is the
+        # WARN literal of DsqlSinkTask.UNIQUE_HOLD_TRY_FAILED.
+        "held try failure logged and backed off": b"less often (up to every 10 s) while this",
         # v53 (G23): a unique-index conflict (23505) is held on its partition -- rewound,
         # paused, its commit capped -- until the earlier change that frees the value (a
         # primary-key change's old-row delete, on another partition) applies, for up to 5 min,
@@ -3397,7 +3425,7 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             "07-performance-and-tuning.md": ("the sink (plugin v52 or later) rolls back",),
             "13-excluding-tables-and-columns.md": (
                 "**No Delete + Deploy is needed for the changes in this section.**",
-                "Later releases changed the sink plugin (v51, v52), so a stack deployed before "
+                "Later releases changed the sink plugin (v51, v52, v53), so a stack deployed before "
                 "them needs **Delete CDC infrastructure** and a new deploy",
             ),
         },
@@ -3410,7 +3438,7 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             "07-performance-and-tuning.md": ("싱크(플러그인 v52 이상)는 트랜잭션을",),
             "13-excluding-tables-and-columns.md": (
                 "**이 절의 변경에는 Delete + Deploy가 필요 없습니다.**",
-                "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52), 그 전에 배포한 스택은 "
+                "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53), 그 전에 배포한 스택은 "
                 "**Delete CDC infrastructure** 후 다시 배포해야",
             ),
         },
@@ -3423,7 +3451,7 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             "07-performance-and-tuning.md": ("シンク (プラグイン v52 以降) はトランザクションを",),
             "13-excluding-tables-and-columns.md": (
                 "**この節の変更には Delete + Deploy は不要です。**",
-                "その後のリリースでシンクプラグインが変わったため(v51、v52)、それ以前にデプロイした"
+                "その後のリリースでシンクプラグインが変わったため(v51、v52、v53)、それ以前にデプロイした"
                 "スタックは **Delete CDC infrastructure** して再デプロイするまで",
             ),
         },

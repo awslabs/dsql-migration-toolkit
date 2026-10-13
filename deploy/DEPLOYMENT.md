@@ -817,8 +817,8 @@ account yet*, accept the agreement as above and verify again.
 
 > [!WARNING]
 > **Complete teardown order (remove ALL resources / stop ALL cost).** The
-> migration uses up to three stacks; remove them in this order so nothing — and no
-> cost — is left behind:
+> migration uses up to three stacks and one S3 bucket that no stack owns; remove them
+> in this order so nothing — and no cost — is left behind:
 >
 > 1. **cdc-stack first (if you ever deployed CDC)** — this is the costly one
 >    (Amazon MSK / MSK Connect / NAT). Remove it **while the app is still up**, from
@@ -830,7 +830,15 @@ account yet*, accept the agreement as above and verify again.
 >    (CDC is the separate `cdc-stack`; see the CDC docs.)
 > 2. **app-stack** — `deploy/teardown.sh` (below).
 > 3. **build-stack** — only if you used Option B (CodeBuild) (below).
-> 4. **Verify nothing is left** — no `mysql-dsql-*` or `dsql-cdc-*` CloudFormation stacks remain
+> 4. **Plugin bucket (if present)** — the app creates
+>    `mysql-dsql-migrator-plugins-<account>-<region>` itself, so no stack owns it and no
+>    `delete-stack` removes it. It keeps every CDC plugin file a deploy uploaded
+>    (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each; nothing prunes them) and, on
+>    ECS Fargate, the saved session and job state. Every deployment of the tool in this
+>    account and region shares it, so delete it only when none of them is still in use.
+>    Deleting it cannot be undone:
+>    `aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+> 5. **Verify nothing is left** — no `mysql-dsql-*` or `dsql-cdc-*` CloudFormation stacks remain
 >    (`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
 >    plus any **Route 53** records and the **CodeBuild source S3 bucket** you created.
 
@@ -1177,6 +1185,17 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 > The state EBS volume has **`DeletionPolicy: Retain`** by design, so it **survives
 > stack deletion** — delete it manually if you don't want to keep it (find it by the
 > `aws:cloudformation:stack-name` tag).
+
+If you deployed CDC, the app also created the plugin bucket
+`mysql-dsql-migrator-plugins-<account>-<region>`. No stack owns it, so it survives too, and
+nothing prunes it: it keeps every CDC plugin file a deploy uploaded
+(`cdc-plugins/<hash>/<file>`, up to about 31 MiB each). Every deployment of the tool in this
+account and region shares it; once none of them is still in use, delete it for a clean
+slate (this cannot be undone):
+
+```bash
+aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
+```
 
 ---
 

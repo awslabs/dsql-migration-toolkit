@@ -19,7 +19,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 | **소스 `CHECK` 제약** | 소스의 `CHECK` 제약은 타깃으로 변환되지 않음(예: MySQL `CHECK`, 8.0.16+). | DDL에서 드롭되고 **MANUAL** 플래그 — DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제. (도구가 MySQL `ENUM`이나 PostgreSQL enum(둘 다 `text`로 변환됨)용으로 생성하는 `CHECK … IN (...)`은 영향 없음. 나중에 소스 타입에 추가된 값은 그 `CHECK`를 바꿀 때까지 `23514`로 데드레터됨; [§4.2](04-cdc-and-dsql-constraints.md#cdc-중-소스-스키마-드리프트-감지처리) 참고.) |
 | **기본 키 필수** | PK 없는 테이블은 마이그레이션 불가. | **UNSUPPORTED** 플래그; Full Load도 차단(keyset export에 PK 필요). |
 | **트리거/저장 프로시저/함수/스케줄 이벤트 없음** | 서버 측 로직은 옮겨지지 않음. | **UNSUPPORTED** — 애플리케이션으로 재구현(이벤트 → EventBridge/Lambda). |
-| **네이티브 파티셔닝 없음** | DSQL이 직접 자동 분산. | 파티션 테이블 **MANUAL**(파티셔닝 제거). |
+| **네이티브 파티셔닝 없음** | DSQL이 직접 자동 분산. | 파티션 테이블 **MANUAL**(파티셔닝 제거). 테이블 상속도 없음: PostgreSQL 상속(`INHERITS`) 부모와 각 자식 테이블은 별개의 테이블로, 선택한 것만 마이그레이션됨. Full Load와 Validation, CDC 모니터의 `MAX(pk)` 확인은 부모 자신의 행만 읽으므로(`FROM ONLY`, CDC가 캡처하는 것과 같음) 모든 행이 자식에 있는 부모(파티셔닝 용도의 상속)는 행을 하나도 로드하지 않고, Aurora DSQL에서 그 테이블은 자신의 행만 가짐. 자식 테이블에는 자체 기본 키가 필요함(PostgreSQL은 기본 키를 상속하지 않음). 사전 요구사항 검사는 모든 마이그레이션 유형에서 그런 부모마다 경고하고(*Inheritance child tables are migrated as tables of their own*: 부모 자신의 행만 옮기며, 각 자식은 선택한 경우 별개의 테이블로 마이그레이션됨), 이 마이그레이션의 Start CDC가 그 부모를 스냅샷하게 되면(예: 모든 CDC only Start, 다시 스냅샷, Manual 시작 지점; [§4.3](04-cdc-and-dsql-constraints.md)) 실패로 판정하며, Start CDC는 그 스냅샷을 거부하고 CDC only에서는 Deploy CDC infrastructure도 거부함(*CDC cannot snapshot a table that has inheritance child tables*): Debezium의 스냅샷이 자식 테이블의 행을 부모 테이블에 복사하고, CDC는 그 행을 결코 바꾸지 않기 때문. 도구가 소스를 아예 읽지 못하면 Start CDC는 거부하지 않고 PostgreSQL 검사가 실행되지 않았다고 경고함([§4.3](04-cdc-and-dsql-constraints.md)). CDC only에서는 부모의 선택을 해제하고(각 자식은 여전히 별개의 테이블로 마이그레이션됨), Full load + CDC에서는 CDC가 스냅샷 없이 Full Load의 스냅샷 지점에서 시작함. |
 | **열당 1 MiB 한도** | 열 하나의 값이 **1 MiB**를 넘으면 저장할 수 없습니다 — 타입과 무관합니다(MySQL `TEXT`/`BLOB`/`JSON`, PostgreSQL `text`/`bytea`/`json`): `54000 ERROR: maximum column size exceeded`. **행** 전체는 **2 MiB**가 한도이고(`maximum row size exceeded`), 쓰기 트랜잭션 하나는 10 MiB입니다. ([Aurora DSQL 쿼터](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)) | 한도를 넘는 값은 행 단위로 에러 로그(Full Load) / **DLQ**(CDC)로 **격리(quarantine)**됩니다. Kafka 메시지 상한을 넘길 수 있는 컬럼은 **캡처 단계에서 제외**해야 합니다. 초과 값을 담을 수 있는 컬럼은 `OVERSIZED_LOB`로 표시됩니다: 바이너리/문서 컬럼(MySQL `MEDIUMBLOB`/`LONGBLOB`/`MEDIUMTEXT`/`LONGTEXT`/`JSON`, PostgreSQL `bytea`/`json`/`jsonb`)은 LOSS — 그 타입을 고른 것이 큰 값을 담겠다는 의도이기 때문입니다. 길이 제한 없는 PostgreSQL `text`/`varchar`는 RECOMMENDATION — 그것이 평범한 짧은 문자열의 관용적 표기이기도 하기 때문입니다. CHECK로 리터럴 집합에 제한된 컬럼은 아예 표시되지 않습니다. |
 | **`DECIMAL` 정밀도 > 38** | 더 높은 정밀도 미지원. | Evaluation은 **UNSUPPORTED**(`NUMERIC_PRECISION`)로 표시하지만, 변환된 DDL을 적용하면 Schema Conversion이 **`numeric(38,37)`로 clamp**(손실)하며 경고 — 스케일도 37로 제한. |
 | **공간/geometry 타입** | MySQL 소스에서는 `bytea`로 대체(원본 WKB가 Full Load·CDC 전 구간에서 그대로 보존됨); PostgreSQL 소스는 자동 대체 **안 함**. | MySQL 소스: 변환기가 각 컬럼을 `bytea`로 자동 대체하고, 평가기가 해당 테이블을 검토 대상 **MANUAL**로 표시. PostgreSQL 소스: geometric 타입(point/line/lseg/box/path/polygon/circle)은 Evaluation(`PG_UNSUPPORTED_TYPE`)과 Schema Conversion 양쪽에서 **UNSUPPORTED**로 표시되고 `text`로의 재모델링이 제안됨 — DDL 적용 전에 직접 재모델링해야 함. (자동 대체가 아니라 수동 재모델링이 필요한 그 밖의 PG 전용 타입: 배열, network `inet`/`cidr`/`macaddr`, `xml`, `money`, `bit`/`varbit`, `tsvector`/`tsquery`, range/multirange, composite, pgvector.) |
@@ -40,6 +40,29 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 
 ## 6.2 마이그레이션 프로세스 한계
 
+- **새 CDC 시작 지점에는 새 CDC 토픽이 먼저 필요합니다.** 이 장에서 CDC에 더 새로운 시작 지점을 주기
+  위해 **Re-run Full Load를 "Drop & reload"로**(또는 **Re-run all tables**) 실행하거나 더 새 **Manual**
+  시작 지점을 쓰라고 안내하는 곳은 모두, 이 마이그레이션의 CDC 스택이 스트리밍한 적 있는 동안 — Start
+  뒤에 멈췄거나, 커넥터가 그대로 있거나, CloudFormation이 Start를 롤백한 동안 — 그 시작 지점이
+  **거부됩니다**. Full Load 단계가 재실행을 거부하고(Full load + CDC), MySQL 소스에서는 Start CDC가
+  마이그레이션 유형과 상관없이 스택이 마지막으로 시작한 지점보다 새 시작 지점을 거부하므로, **Full load
+  only**를 거쳐 돌아와도 우회되지 않습니다. 먼저 **Delete CDC infrastructure** 후 다시 배포하고, 그다음
+  재실행(또는 Manual 지점), 그다음 **Start CDC**
+  ([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)). 그러지 않으면 그 스택의 싱크가 새 시작
+  지점보다 오래된 변경을 다시 적재한 테이블 위에 다시 적용하고, 그동안 소스는 CDC가 멈춘 곳과 새 지점
+  사이의 변경을 건너뜁니다. Full load only에는 CDC 단계가 없으므로, 그 유형을 거쳐 가는 중이라면 먼저
+  마이그레이션 유형을 바꾼 뒤 CDC 단계에서 삭제하고 다시 배포하세요. MySQL에서 CloudFormation이 롤백한
+  첫 Start 뒤에는 스택에 그 롤백만 기록되고 그 Start가 준 시작 지점은 기록되지 않으며, 앱이 그 지점을
+  메모리에 들고 있습니다: 앱을 재시작하기 전까지 Start CDC는 그 지점보다 뒤의 시작 지점을 거부하고(그
+  지점에서 다시 시작하는 것은 거부하지 않음), 재시작한 뒤에는 그 스택에서 모든 시작 지점을 거부합니다.
+  PostgreSQL 소스의 Start CDC에는 이런 거부가 없습니다:
+  스택 자체의 복제 슬롯에서 이어 가고 Full load only 실행은 그 슬롯을 그대로 두므로, 스택의 소스 커넥터가
+  스트리밍했다면 CDC는 멈춘 곳에서 이어 가고(그렇지 않으면 Debezium이 먼저 선택한 모든 테이블을
+  스냅샷합니다. 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안만 빈틈이 없음) 다시 적재한
+  테이블은 수렴합니다. **Reload specific tables**와 **Retry unfinished tables**는 원래 시작 지점을 유지하므로
+  영향을 받지 않습니다. Manual 지점은 새 시작 지점입니다: CDC가 멈춘 곳과 그 지점 사이의 변경은 새
+  스택에서도 복제되지 않으므로, 아래 각 해결 방법이 말하는 대로 그 테이블을 다시 적재하거나 바로잡고
+  CHECKSUM으로 검증하세요.
 - **단일 리전 — 크로스 리전 마이그레이션 없음.** 도구는 DSQL을 지원하는 어느 리전에서나 동작하지만,
   **소스와 타깃은 동일 리전에 있어야 하며** 선택적 CDC 파이프라인은 단일 리전/VPC에서 실행됩니다. 크로스
   리전은 지원되지 않습니다.
@@ -56,12 +79,19 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     멤버십); 소스는 standby/reader가 아니라 클러스터의 **WRITER**여야 함(`pg_is_in_recovery()=false`);
     모든 복제 대상 테이블은 사용 가능한 **`REPLICA IDENTITY`**를 가져야 함: `DEFAULT`에는 `DEFERRABLE`이
     아닌 유효한 기본 키가 필요하고(PostgreSQL은 키가 삭제된 뒤에도 `DEFAULT`를 유지하므로 검사는 소스의
-    카탈로그를 읽음), `USING INDEX`에는 유효한 고유 인덱스가 필요하며, `FULL`은 항상 동작하고, 파티션된
-    테이블은 모든 파티션에 하나씩 필요함. 없으면 publication에 들어간 뒤 그 테이블의 모든
+    카탈로그를 읽음), `USING INDEX`에는 유효한 고유 인덱스가 필요하며, `FULL`은 어떤 테이블에도 동작하지만
+    PostgreSQL 18에서 생성 컬럼이 있는 테이블은 예외임: PostgreSQL 18은 publication이 게시하지 않는 생성
+    컬럼이 identity에 들어간 게시 테이블의 `UPDATE`/`DELETE`를 거부하고(CDC의 publication은 생성 컬럼을
+    게시하지 않음), 그래서 거기서는 `FULL`도, 생성 컬럼이 있는 키도 쓸 수 없음. 파티션된 테이블은 모든 파티션에
+    하나씩 필요함.
+    없으면 publication에 들어간 뒤 그 테이블의 모든
     `UPDATE`/`DELETE`가 publisher에서 실패하므로 CDC 사전 요구사항 검사가 실패로 판정하고 Full Load는
     소스에서 아무것도 바꾸기 전에 멈춤(publication도 슬롯도 만들지 않음). 이 거부는 모두 그 원인을
-    해결하는 방법을 알려 줌: 새 기본 키는 `DEFAULT`만 고치며, `NOTHING`이나 인덱스가 사라진 `USING INDEX`는
-    `ALTER TABLE … REPLICA IDENTITY`(`FULL`, 또는 기본 키가 있으면 `DEFAULT`)로만 바뀜. binlog 보존에 해당하는 개념은
+    해결하는 방법을 알려 줌(사전 점검은 테이블 이름을 따옴표로 감싼 구문도 함께 보여 줌): 새 기본 키는
+    `DEFAULT`만 고치며, `DEFERRABLE` 키는 `NOT DEFERRABLE`로 다시 추가하거나 `FULL`로 고치고(PostgreSQL은 이를 그 자리에서
+    바꿀 수 없음), `NOTHING`이나 인덱스가 사라진 `USING INDEX`는
+    `ALTER TABLE … REPLICA IDENTITY`(`FULL`, 또는 기본 키가 있으면 `DEFAULT`)로만 바뀌며, PostgreSQL 18이 거부할
+    테이블에는 어떤 해결 방법도 `FULL`을 권하지 않음. binlog 보존에 해당하는 개념은
     없습니다: 도구가 Full Load 정합성 지점에서 **논리 복제 슬롯**과 **정확히 마이그레이션 대상 테이블만을
     범위로 하는 publication**을 생성하므로, WAL은 보존 기간이 아니라 슬롯에 의해 고정됩니다(`wal_status`를
     관찰하세요 — 비활성 슬롯은 소스 디스크를 가득 채울 수 있음). 복제 슬롯 / `max_wal_senders` 여유는
@@ -73,7 +103,11 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     남길 수 있습니다 — Aurora DSQL이 소스 기본 키에 대한 테이블의 고유 인덱스를 다 만들기 전까지, 그리고 이전
     버전이 배포한 CDC 인프라에서는 언제나 — 그리고 같은 경우에 추가된 키 컬럼을 바꾸는 `UPDATE`는 dead letter로
     격리되고 이전 행이 남습니다. 사전 점검이 Start를
-    차단합니다. Data Migration, Validation 또는 Cut over 단계가 열려 있는 동안 도구는 최대 2분마다 이를
+    차단합니다. PostgreSQL 18에서 생성 컬럼이 있는 재키잉 테이블은 FULL을 유지할 수 없으므로(그 `UPDATE`/`DELETE`가
+    소스에서 실패함, 위 참고) 사전 점검, Full Load, 그리고 Full Load 후 선택한 테이블의 로드가 쓰기 전에
+    거부합니다: Schema Conversion에서 그 테이블을 **Keep source PK**로 되돌리세요(그런 테이블에는 아래 CDC 모니터
+    알림도 FULL 대신 그 해결 방법을 알려 줌: 그다음 테이블을 리로드하거나, CDC only에서는 **Start over**로 다시
+    마이그레이션). Data Migration, Validation 또는 Cut over 단계가 열려 있는 동안 도구는 최대 2분마다 이를
     다시 읽습니다: CDC 모니터에 빨간 알림이 나타나고, 다시 FULL이 되고 테이블이 CHECKSUM으로 일치할 때까지
     Cut over가 보류됩니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고). 앱 재시작
     후에는 재확인에 소스 비밀번호가 다시 필요합니다(Connect 단계에서 다시 연결). 두 번의 재확인 사이에
@@ -84,18 +118,36 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   행으로 넘어가는 고유 값(다른 계정으로 옮긴 이메일 주소)도 마찬가지입니다. 기본 키 외에 고유 인덱스가 있는
   테이블에서는 그러면 insert가 이전 행과 부딪히고, Aurora DSQL은 이를 즉시 거부합니다(`23505`). 이 버전이 배포한
   CDC 인프라(싱크 플러그인 v53 이상)는 그 변경과 그 파티션의 이후 변경을 모두, 다른 행의 변경이 적용될 때까지
-  최대 5분 동안 보류하며, 그동안 다른 파티션은 계속 흐릅니다. 그 파티션의 다음 배치에 그 변경을 완전히
-  대체하는 같은 행의 이후 변경이 있으면 그 변경은 대신 건너뜁니다. 다음 경우에는 그래도 dead-letter 처리됩니다(*a
+  최대 5분(그 변경을 보류한 싱크 태스크의 일시적 실패가 더 나중이면 그때부터 다시 세므로 그 태스크가 겪는
+  Aurora DSQL 장애는 그 시간을 다 써 버리지 않음. 다른 싱크 태스크에서 다른 행의 변경만 늦추는 장애는 다 써
+  버릴 수 있음) 동안 보류하며,
+  그동안 다른 파티션은 계속 흐르고 그 테이블의 Stream lag이 대기를 보여 줍니다. 5분은 보류된 변경마다
+  적용되므로 한 파티션의 충돌은 하나씩 차례로 기다립니다: 따라잡기 중에 그런 충돌이 여럿이면 그 파티션은
+  하나에 약 5분씩 늦어집니다. 재키잉되지 않은 테이블에서는 같은 배치나 그 파티션의 다음 배치에 그 변경을 완전히
+  대체하는 같은 행의 이후 변경이 있으면 그 변경은 대신 건너뜁니다.
+  다음 경우에는 그래도 dead-letter 처리됩니다(*a
   unique constraint rejected the row*, 인덱스 이름 포함): 값을 비우는 변경이 5분 넘게 뒤처진 경우(긴 따라잡기
   중 파티션 간 지연이 크게 벌어질 때), 재시작이나 스트림 재읽기(CDC 인프라 삭제 후 재배포 뒤의 재읽기 등) 후
   재생된 행의 이전 변경이 그 행의 이후 변경이 이미 쓴 값과 부딪히고 그 이후 변경이 같은 파티션에서 배치 하나보다
-  더 뒤에 있는 경우, 타깃이 스트림 밖에서 이미 그 값을 가진 경우, PostgreSQL 트랜잭션이
-  `DEFERRABLE` 고유 제약 아래에서 행끼리 고유 값을 맞바꾼 경우(두 변경이 서로를 기다리므로 5분 뒤 둘 다
+  더 뒤에 있는 경우, 타깃이 스트림 밖에서 이미 그 값을 가진 경우, 다른 행의 건너뛴 변경이 비웠을 값이 그 변경에
+  필요한데 그 행의 대체 변경이 그 파티션에서 그 뒤에 줄 서 있거나, 그 대체 변경 자신이 이 변경의 행이 가진 값을
+  기다리는 경우(이때는 둘 다 dead-letter 처리됨. 여러 행을 거쳐 넘어가는 고유 값: 예컨대 b가 아직 다른 행에 있을
+  때 X가 a를 b로 바꾸고, 이어서 Z가 z를 a로 바꾸고, X가 다시 바뀌면 X의 첫 변경은 건너뛰므로 X는 마지막 변경이
+  적용될 때까지 타깃에서 a를 가짐), PostgreSQL 트랜잭션이
+  `DEFERRABLE` 고유 제약 아래에서 행끼리 고유 값을 맞바꾼 경우(두 변경이 서로를 기다리므로 둘 다
+  dead-letter 처리됨: 5분 뒤, 두 변경이 같은 파티션에 있으면 약 10분 뒤), 재키잉(Composite key) 테이블에서 그
+  행 자신의 이후 변경이 이미 충돌을 무의미하게 만든 경우(기본 키 변경과 그 되돌림, 재생된 이전 이미지,
+  반영된 `XX000` 커밋의 재실행: 거기서는 아무것도 건너뛰지 않으므로 5분을 기다린 뒤, 타깃은 결국 맞게 되는데도
   dead-letter 처리됨), 그리고 재키잉 테이블의 복합 키 원인(아래와 §4.6). 이전 버전이 배포한 CDC 인프라에서는
   insert가 즉시 dead-letter 처리되고 그 뒤 이전 행의 delete가 행을 지우므로, 테이블을 리로드할 때까지 그 행이
   빠집니다. 어느 쪽이든 Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류하며, 일치하면 CDC 단계가 그
-  테이블을 *Reloaded and verified*로 표시합니다. 복구: Stop CDC, Full Load 단계에서 그 테이블을
-  **Drop & reload**로 리로드, Start CDC, 그다음 검증. 대기 동작을 받으려면 CDC 인프라를 삭제(Delete CDC
+  테이블을 *Verified by CHECKSUM*으로 표시합니다. 열린 소스 스키마나 REPLICA IDENTITY 발견 사항이 아직
+  Cut over에서 그 테이블을 붙잡고 있으면 그 알림이 그 발견 사항을 알려 주며, 그 발견 사항은 자체의 해결
+  방법을 따릅니다(dead letter 때문에 리로드할 필요는 없음). 복구: Stop CDC, Full Load 단계에서 그 테이블을
+  **Drop & reload**로 리로드(CDC only: Aurora DSQL에서 행을 직접 고침), Start CDC, 그다음 검증. 소스가 그
+  `UNIQUE` 인덱스를 삭제하거나 완화해도 같은 dead letter가 생깁니다(CDC는 DDL을 복제하지 않음): Aurora
+  DSQL에서도 그 인덱스를 삭제하고, Full load + CDC에서는 리로드가 인덱스를 다시 만들지 않도록 먼저 Step
+  1(Evaluation)을 다시 실행하세요. 대기 동작을 받으려면 CDC 인프라를 삭제(Delete CDC
   infrastructure)하고 다시 배포하세요. 이 작업은 스트림 위치도 삭제합니다(다음 항목 참고). 두 엔진 모두
   해당합니다.
 - **이전 버전이 배포한 CDC 인프라의 재키잉 테이블**은 변경 레코드를 계속 복합 키로 키잉합니다(Start CDC
@@ -107,8 +159,8 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   기본 키로 키잉하려면 CDC 인프라를 삭제(Delete CDC infrastructure)하고 다시 배포하세요. 이 작업은 스트림
   위치도 삭제합니다: MySQL에서는 Start CDC가 Full Load 워터마크부터 binlog를 다시 읽고(CDC only: 소스의 현재
   위치에서 시작하므로 Aurora DSQL이 마지막으로 적용한 변경 이후의 변경은 복제되지 않음), PostgreSQL에서는 복제
-  슬롯이 drop되므로 다음 Start가 모든 테이블을 다시 읽으며(Full load + CDC:
-  **"Re-snapshot every table instead"**를 선택) 그 사이 소스에서 삭제된 행은 Aurora DSQL에 남습니다.
+  슬롯이 drop되므로 다음 Start가 모든 테이블을 다시 읽으며(Full load + CDC: Start CDC 대화 상자가
+  제시하면 **"Re-snapshot every table instead"**를 선택) 그 사이 소스에서 삭제된 행은 Aurora DSQL에 남습니다.
   [13장](13-excluding-tables-and-columns.md#집합이-잠기는-이유)의 "삭제 후 다시 CDC 시작"과 "CDC only 스택을
   삭제하는 대가"를 참고하세요. 두 엔진 모두 해당합니다. (다른 고유 인덱스가 있는 모든 테이블의 기본 키
   변경: 위 항목.)
@@ -147,8 +199,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **MySQL: CDC 시작 지점과 그 지점을 쓰는 Start 사이의 스키마 변경.** 새 시작 위치를 시드하는 MySQL
   Start는 Debezium을 `snapshot.mode=recovery`로 실행합니다: Full Load 워터마크나 Manual binlog 시작
   지점에서의 첫 Start(세션에 Full Load 워터마크가 없는 MySQL CDC only의 첫 시작은 Manual 지점이 필요),
-  **Re-run Full Load**나 더 새 Manual 지점 이후의 Start, 그리고 **Delete CDC infrastructure** 후 다시
-  배포한 뒤의 첫 Start — 이때는 **원래** 워터마크부터 다시 읽습니다. `recovery`에서 Debezium은 테이블의
+  그리고 **Delete CDC infrastructure** 후 다시 배포한 뒤의 첫 Start — 이때는 **원래** 워터마크부터 다시
+  읽습니다. 스트리밍한 적 있는 스택에서는 **Re-run Full Load**의 새 시작 지점이나 더 새 Manual 지점이
+  인프라를 다시 배포할 때까지 거부됩니다(§6.2 첫 항목). `recovery`에서 Debezium은 테이블의
   **현재** 정의로 스키마 히스토리를 다시 만든 뒤 그 이전 위치부터 binlog를 읽고, 각 행의 값을 위치 순서로
   컬럼에 대응시킵니다. 따라서 그 사이에 캡처 대상 테이블에 커밋된 스키마 변경(`ALTER TABLE` 등)은
   스트림을 깨뜨립니다: 컬럼 추가·삭제는 Start할 때마다 커넥터를 멈추고, 컬럼 이름 변경도 커넥터를
@@ -178,18 +231,20 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     다른 컬럼으로 대체된 컬럼을 알리고 Cut over를 보류합니다. 순서 변경과 문자 집합 변환은 어느 검사도 보지
     못하므로, 그런 변경 뒤에는 CHECKSUM으로 검증하세요.
   - **다시 Start, Retry CDC, Debezium의 "recovery mode"는 결코 도움이 되지 않습니다** — 같은 행을 다시
-    재생할 뿐입니다. 시작 지점을 변경 이후로 옮기세요: CDC를 Stop하고, 소스 인벤토리를 새로 읽은 뒤(1단계
+    재생할 뿐입니다. 시작 지점을 변경 이후로 옮기세요. CDC를 Stop하세요. 스트리밍한 적 있는 스택(Stop CDC
+    후의 재시작, 또는 실행 도중 멈춘 커넥터)이면 먼저 **Delete CDC infrastructure** 후 다시 배포하세요:
+    새 빈 토픽을 얻으며, 그때까지 Full Load 단계는 새 시작 지점을, Start CDC는 더 새 시작 지점을
+    거부합니다. 소스 인벤토리를 새로 읽은 뒤(1단계
     Evaluation 재실행) Schema Conversion에서 바뀐 테이블을 갱신해 다시 로드가 새 정의로 테이블을 만들고
     읽게 한 다음 — DDL을 직접 편집했거나 키 전략을 고른 테이블은 그 편집이 유지되므로 다시 하거나
     초기화하고, 삭제·이름 변경된 컬럼은 먼저 Aurora DSQL에서 삭제하거나 그 테이블을 Replace로 다시
     적용해야 합니다(Drop & reload는 새 정의에 없는 대상 컬럼을 지우지 않으려고 해당 테이블을 거부합니다) —
     **"Drop & reload"로 Re-run Full Load**를 실행하세요(기본값 *Append*는 기존 행을 유지하므로 그 사이의
     UPDATE/DELETE가 사라지고, *Reload specific tables*와 *Retry*는 원래 워터마크를 유지합니다). 새 실행의
-    워터마크는 변경 이후이므로 Start CDC가 오프셋을 그 위치로 앞당깁니다. CDC only 실행에는 다시 돌릴 Full
-    Load가 없으므로, 바뀐 테이블을 Aurora DSQL에서 갱신한 다음 같은 스택에서 **Manual**, **Fetch current
-    position**, **Use this start point**를 선택하세요(Start는 멈춘 스택의 오프셋을 되감지는 않지만 앞으로는
-    이동합니다. 멈춘 스택에서는 시작 지점 카드의 **Manual — start from a later binlog position instead**
-    아래에 있습니다). 그러면 그 지점 이전에 캡처 대상 테이블에 생긴 변경은 복제되지 않습니다: "Drop &
+    워터마크는 변경 이후이며, 새 스택에서의(또는 스택의 첫) Start CDC가 그 지점에서 시작합니다. CDC only
+    실행에는 다시 돌릴 Full Load가 없으므로, 바뀐 테이블을 Aurora DSQL에서 갱신한 다음 — 스트리밍한
+    스택이면 Delete CDC infrastructure 후 다시 배포한 뒤 — **Manual**, **Fetch current position**, **Use
+    this start point**를 선택하고 Start CDC 하세요. 그러면 그 지점 이전에 캡처 대상 테이블에 생긴 변경은 복제되지 않습니다: "Drop &
     reload"로 다시 로드하거나(Full load + CDC) Aurora DSQL에서 바로잡고(CDC only), CHECKSUM으로 검증하세요.
     다시 로드하면 CDC 시작 지점이 Automatic으로 돌아가므로, Start CDC 전에 Manual을 다시 선택하세요(가져온
     지점은 유지됩니다).
@@ -206,8 +261,10 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   `gtid_mode`가 정확히 `ON`일 때만 GTID로 위치를 잡습니다: 그때는 시작 지점과 함께 기록된 GTID 셋에 없는
   모든 트랜잭션을 스트리밍하고, 시작 지점의 binlog `file:position`은 무시합니다(`OFF`, `OFF_PERMISSIVE`,
   `ON_PERMISSIVE`이면 `file:position`을 씁니다). 그래서 `ON`인 소스에서는 GTID 셋이 곧 시작 지점이며,
-  Start CDC는 먼저 `gtid_mode`를 읽고 — Start 대화 상자에서, 그리고 무엇이든 바꾸기 전에 다시 — 쓸 수
-  없는 시작 지점은 거부합니다:
+  Start CDC는 먼저 `gtid_mode`를 읽고 — Start 대화 상자에서, 그리고 무엇이든 바꾸기 전에 다시(여기서 거부하면
+  Start가 *Start CDC blocked: …*로 실패하고, CDC 단계가 실패한 Start 아래에 해결 방법을 포함한 알림 전체를
+  보여 줌. 활동 로그도 알림 전체를 기록하며, 로그 한 줄보다 긴 알림은 `(1/2) …`, `(2/2) …`처럼 이어지는 줄로
+  기록함) — 쓸 수 없는 시작 지점은 거부합니다:
   - **GTID 셋이 없음.** Debezium이 MySQL에 보관 중인 바이너리 로그 전체를 다시 보내게 해, 시작 지점 이전의
     변경을 다시 적용합니다. **Fetch current position**은 위치와 GTID 셋을 함께 기록합니다. 직접 입력한
     위치라면 소스가 정확히 그 위치에서 실행을 마친 GTID 셋(예: 덤프가 기록한 것)도 함께 입력하세요. 버전
@@ -242,18 +299,20 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   (`file:position`으로 스트리밍했으므로 이어 갈 GTID 셋이 없음). Start CDC는 시작 오프셋을 스택이 마지막
   Start 때 남긴 자체 기록에서 읽으므로, 세션에 더 이상 시작 지점이 없어도(연결한 스택, 초기화한 세션)
   마찬가지입니다. 그 시작 지점을 유지하려면 cut over까지 `gtid_mode`를 `ON_PERMISSIVE`로
-  되돌리거나(그러면 CDC는 `file:position`으로 스트리밍), CDC에 새 시작 지점을 주세요: **"Drop &
+  되돌리거나(그러면 CDC는 `file:position`으로 스트리밍), CDC에 새 시작 지점을 주세요 — Stop CDC 후의
+  재시작(스트리밍한 적 있는 스택)이라면 먼저 **Delete CDC infrastructure** 후 다시 배포한 뒤: **"Drop &
   reload"로 Re-run Full Load**, 또는 **Manual** → **Fetch current position** → **Use this start point**
-  후 그 사이에 바뀐 테이블을 "Drop & reload"로 다시 로드하고(CDC only: Aurora DSQL에서 바로잡기)
-  CHECKSUM으로 검증하세요. CDC가 스트리밍하는 동안 `gtid_mode`를 바꾸면 커넥터의 다음 자동 재시작 때
+  후 그 사이에 바뀐 테이블을 "Drop & reload"로 다시 로드하고(CDC only: Aurora DSQL에서 바로잡기) Start
+  CDC 한 다음 CHECKSUM으로 검증하세요. CDC가 스트리밍하는 동안 `gtid_mode`를 바꾸면 커넥터의 다음 자동 재시작 때
   적용되어 커넥터를 멈추거나 오류 없이 변경을 건너뛸 수 있고, 도구는 이를 막을 수 없습니다: 먼저 Stop
   CDC 하세요. Start CDC는 또 소스 커넥터를 시작할 때마다 소스의 `gtid_mode`를 CDC 스택에 기록합니다(Stop
   CDC는 그 기록을 유지합니다). `ON`인 소스에서는 마지막 시작이 `gtid_mode`가 `ON`이 아닐 때였던 스택의
-  시작을 모두 거부합니다 — Stop CDC 후 재시작은 물론 새 시작 지점도 거부하는데, 오프셋 시더는 새 지점이
-  커밋된 오프셋보다 뒤가 아니면 커밋된 오프셋을 그대로 두고, Start CDC는 그 오프셋을 볼 수 없기
-  때문입니다. 그런 스택은 그 시작부터 `file:position`으로 스트리밍했으므로 커밋된 오프셋의 GTID 셋은
-  거기서 더 나아가지 않았습니다. cut over까지 `gtid_mode`를 `ON_PERMISSIVE`로 유지하거나, **Delete CDC
-  infrastructure** 후 다시 배포하고 Start CDC 하세요: 새 스택에는 커밋된 오프셋이 없으므로 CDC는 시작
+  시작을 모두 거부합니다 — Stop CDC 후 재시작은 물론 새 시작 지점도 거부하는데, Start CDC는 스택이
+  마지막으로 시작한 지점보다 새 시작 지점을 받지 않고(§6.2 첫 항목), 오프셋 시더는 새 지점이 커밋된
+  오프셋보다 뒤가 아니면 커밋된 오프셋을 그대로 두기 때문입니다. 그런 스택은 그 시작부터
+  `file:position`으로 스트리밍했으므로 커밋된 오프셋의 GTID 셋은 거기서 더 나아가지 않았습니다. 재시작이라면
+  cut over까지 `gtid_mode`를 `ON_PERMISSIVE`로 유지하고, 아니면 **Delete CDC infrastructure** 후 다시
+  배포하고 Start CDC 하세요: 새 스택에는 커밋된 오프셋이 없으므로 CDC는 시작
   지점에서 정확히 시작합니다 — 가지고 있는 시작 지점이 기록될 때 이미 `gtid_mode`가 `ON`이었고 그 뒤로
   계속 `ON`이었다면 그 지점에서, 아니면 위와 같이 새 시작 지점에서. 마지막 시작이 `gtid_mode`가
   `ON`일 때였던 스택은 세션에 더 이상 그 시작 지점이 없어도 GTID로 이어 갑니다. 이 기록은 CDC가
@@ -267,22 +326,28 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   `ON_PERMISSIVE`) 스트리밍한 경우, `ON`이 아닐 때 입력한 GTID 셋에서 시작한 경우, 마지막 시작에 줄 시작
   지점이 없었던 경우(시작 지점이 없는 세션에서의 재시작). 이런 스택은 가지고 있는 GTID 셋 다음부터 이어
   가며 이미 적용한 변경을 다시 보내거나, GTID 없이 쓰인 변경에서 멈추거나, 오류 없이 건너뜁니다. 그런
-  소스는 cut over까지 `ON`이 아닌 상태로 두거나, 위와 같이 CDC에 새 시작 지점을 주세요. 버전 0.1.565
-  이하가 기록한 시작 지점에는 모드가 기록되지 않습니다: 그 뒤 `gtid_mode`를 `ON`으로 바꿨다면 새 시작
-  지점을 정하세요.
+  소스는 cut over까지 `ON`이 아닌 상태로 두거나, 새 스택에서(먼저 Delete CDC infrastructure 후 다시
+  배포) 위와 같이 CDC에 새 시작 지점을 주세요. 버전 0.1.565 이하가 기록한 시작 지점에는 모드가 기록되지
+  않습니다: 그 뒤 `gtid_mode`를 `ON`으로 바꿨다면 새 시작 지점을 정하세요(스트리밍한 스택이면 먼저 Delete
+  CDC infrastructure 후 다시 배포).
 - **MySQL에서 `gtid_mode=ON`이면: 버전 0.1.565 이하가 시작한 파이프라인.** 그 버전들은 Debezium이 시작
   기준으로 삼는 GTID 셋을 비웠기 때문에, `gtid_mode=ON`인 소스에서 MySQL이 모든 Start, Stop 후의 모든
   Start, 커넥터의 모든 자동 재시작 때마다 보관 중인 바이너리 로그 전체를 다시 보냈습니다. 쓰기는
   수렴했지만(싱크는 멱등) 예전 값이 다시 적용됐고, 고유 키 충돌은 데드레터가 될 수 있었으며, 보관된 로그
   어디에든 — 시작 지점 이전이라도 — 파싱할 수 없는 DDL이 있으면 모든 Start가 멈췄습니다. 실행 중인
   파이프라인은 **Stop CDC** → **Start CDC**를 한 번 할 때까지 그 동작을 유지하며, 그 뒤에는 멈춘 곳에서
-  정확히 재개합니다. Manual 지점(CDC only 포함)에서 시작한 파이프라인은 그 Start가 *the source has purged
+  이어 갑니다(Stop 때 싱크가 적용하지 않은 변경은 CDC 토픽에서 오므로 토픽이 그 변경을 아직 보존하는
+  동안만 빈틈이 없습니다 — [§4.3](04-cdc-and-dsql-constraints.md#43-무손실-full-load--cdc-핸드오프)). Manual 지점(CDC only 포함)에서 시작한 파이프라인은 그 Start가 *the source has purged
   binary logs CDC's GTID set does not cover*로 실패할 수 있습니다: 그 버전들은 시작 시점에 소스가 이미
   삭제한 트랜잭션을 빼고 GTID 셋을 기록했지만, 소스에는 CDC가 멈춘 이후의 변경이 모두 남아 있을 수
   있습니다. Stop CDC 후 cut over까지 소스의 `gtid_mode`를 `ON_PERMISSIVE`로 바꾸고(RDS와 Aurora에서는
-  파라미터 그룹 변경) Start CDC를 하세요: Debezium이 멈춘 곳부터 `file:position`으로 빈틈 없이
-  재개합니다(binlog 보존 기간도 끝났다면 그 Start는 대신 실패합니다). 또는 메시지대로 CDC에 새 시작 지점을
-  주세요. Manual 지점에 GTID 셋이 없으면 그런 Start는 무엇이든 바꾸기 전에 거부됩니다: 메시지를 따르세요.
+  파라미터 그룹 변경) Start CDC를 하세요: Debezium이 멈춘 곳부터 `file:position`으로 재개하며, CDC가
+  멈출 때 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안(MSK 보존 기간)은 빈틈 없이 이어
+  갑니다(binlog 보존 기간도 끝났다면 그 Start는 대신 실패합니다). 또는 메시지대로 CDC에 새 시작 지점을
+  주세요: 이 스택은 스트리밍했으므로 먼저 **Delete CDC infrastructure** 후 다시 배포한 뒤, 모든 테이블에
+  대해 **"Drop & reload"로 Re-run Full Load**(CDC only: **Manual** → **Fetch current position** → **Use
+  this start point** 후 그 사이에 바뀐 테이블을 Aurora DSQL에서 바로잡기), 그다음 Start CDC 하고
+  CHECKSUM으로 검증하세요. Manual 지점에 GTID 셋이 없으면 그런 Start는 무엇이든 바꾸기 전에 거부됩니다: 메시지를 따르세요.
   그런 Start가 중간에 실패했다면 토픽에 다시 보내진 예전 변경이 남아 있고 싱크가 그 일부를 적용했을 수
   있습니다: **Delete CDC infrastructure** 후 다시 배포하고, 모든 테이블에 대해 **"Drop & reload"로
   Re-run Full Load**를 한 뒤(CDC only: **Manual** → **Fetch current position** → **Use this start
@@ -300,13 +365,15 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   채 그 문의 앞부분을 보여 줍니다. 시작 지점 이후의 문만 CDC를 멈춥니다(버전 0.1.565 이하는
   `gtid_mode=ON`인 소스에서 보관된 바이너리 로그를 처음부터 다시 읽었으므로 그 이전의 문도 CDC를 멈출 수
   있었습니다 — 위 참조).
-  - **해결 방법.** CDC를 Stop한 다음, 그 문 이후의 시작 지점을 CDC에 주세요: 모든 테이블에 대해
-    **"Drop & reload"로 Re-run Full Load**를 실행하거나(Full load + CDC; 그 문이 캡처 대상 테이블을
-    바꿨다면 먼저 1단계 Evaluation과 Schema Conversion을 다시 실행), **Manual** → **Fetch current
-    position** → **Use this start point**를 선택하세요. 그러면 CDC가 멈춘 지점과 그 지점 사이의 변경은
-    복제되지 않으므로, 그 테이블들을 "Drop & reload"로 다시 로드하고(CDC only: Aurora DSQL에서 바로잡기)
-    CHECKSUM으로 검증하세요. 다시 로드하면 시작 지점이 Automatic으로 돌아가므로, Start CDC 전에 Manual을
-    다시 선택하세요. 커넥터 로그의 *binlog reader near position*을 시작 지점으로 쓰지 마세요: 그것은
+  - **해결 방법.** CDC를 Stop한 다음 **Delete CDC infrastructure** 후 다시 배포하세요: 스택이
+    스트리밍했으므로 새 시작 지점에는 새 빈 토픽이 필요합니다(그때까지 Full Load 단계는 새 시작 지점을,
+    Start CDC는 더 새 시작 지점을 거부합니다). 그다음 그 문 이후의 시작 지점을 CDC에 주세요: 모든
+    테이블에 대해 **"Drop & reload"로 Re-run Full Load**를 실행하거나(Full load + CDC; 그 문이 캡처 대상
+    테이블을 바꿨다면 먼저 1단계 Evaluation과 Schema Conversion을 다시 실행), **Manual** → **Fetch
+    current position** → **Use this start point**를 선택하세요. 그러면 CDC가 멈춘 지점과 그 지점 사이의
+    변경은 복제되지 않으므로, 그 테이블들을 "Drop & reload"로 다시 로드하고(CDC only: Aurora DSQL에서
+    바로잡기) CHECKSUM으로 검증하세요. 다시 로드하면 시작 지점이 Automatic으로 돌아가므로, 새 스택에서
+    **Start CDC** 하기 전에 Manual을 다시 선택하세요. 커넥터 로그의 *binlog reader near position*을 시작 지점으로 쓰지 마세요: 그것은
     실패한 문이 시작되는 위치입니다.
   - **시작 지점을 옮겨도 도움이 되지 않는 경우.** 소스로부터 Debezium의 스키마를 만드는 Start — 첫
     Start, 새 시작 지점에서의 Start, 없어진 스키마 히스토리를 다시 만드는 Start — 는 서버의 모든 테이블의

@@ -54,7 +54,10 @@ caveat, a table with a secondary `UNIQUE` index, is in
 [§4.4](04-cdc-and-dsql-constraints.md#44-how-the-sink-handles-dsqls-constraints-in-the-data-path)).
 If it outlasts the budget, the Full Load batch fails (use **Retry unfinished tables**;
 no row is quarantined for it) and the sink has Kafka Connect redeliver its batch (no
-row is dead-lettered for it); if it keeps recurring, contact AWS Support. Any other
+row is dead-lettered for it); if it keeps recurring, contact AWS Support. At most once
+per offset commit, and only when there were any, the sink logs how many transactions
+Aurora DSQL asked it to retry, by SQLSTATE (`40001`, `XX000`; counts only), so a slowdown
+from retries can be told from an undersized sink. Any other
 error is not retried:
 the Full Load splits the batch down to the rejected row and quarantines it, and
 the sink sends it to the DLQ, while every healthy row still lands. A stock JDBC
@@ -287,9 +290,10 @@ the primary key, which Debezium replicates as a delete of the old key and an ins
 new key that can land on different partitions and apply in either order; and a unique
 value (for example an email address) passed from one row to another. On a table with a
 unique index besides its primary key, CDC infrastructure deployed by this version (sink
-plugin v53 or later) holds such a change, and every later change on its partition, for up
-to 5 minutes, until the other row's change has applied. Other partitions keep flowing, and
-the wait shows as lag on that partition. CDC infrastructure deployed by an earlier version
+plugin v53 or later) holds such a change, and every later change on its partition, until
+the other row's change has applied: up to 5 minutes for each held change, so conflicts on
+one partition are waited out one after another. Other partitions keep flowing, and the
+wait shows as Stream lag on its table. CDC infrastructure deployed by an earlier version
 of this tool dead-letters the change at once; Delete and Deploy CDC infrastructure to pick
 up the wait (see [Chapter 6](06-limitations.md)).
 Because a topic's partition count is fixed at creation, this is decided at CDC
@@ -390,12 +394,14 @@ Start CDC creates or updates the sink connector:
 |---|---|
 | No CDC deployed yet | Used by the next infrastructure deploy and Start CDC. |
 | Infra deployed, not started | Used by the next Start CDC. |
-| **Already streaming** | **Nothing changes until you run Start CDC again.** |
+| **Already streaming** | **Nothing changes until the next Start CDC: Stop CDC, then Start CDC.** |
 
-Re-running Start CDC on a streaming pipeline is safe for this purpose: connector
-`Capacity` is an in-place update (no replacement), so the sink is resized rather
-than recreated — it does **not** consume MSK partition quota the way a table-set
-change does, and there is no gap in replication.
+While CDC streams, the CDC step offers only **Stop CDC**, so a new sink capacity takes
+effect when you Stop CDC and Start CDC again. The connectors are then re-created with it
+(each connector create/delete uses MSK Serverless partitions), and the changes the sink had
+not applied at the Stop are applied from the CDC topics, so that restart is gapless only
+while the topics still retain them
+([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)).
 
 > **Source reboots are handled automatically.** The source connector sets
 > `errors.retry.timeout=600000` (10 min), so a source RDS/Aurora reboot

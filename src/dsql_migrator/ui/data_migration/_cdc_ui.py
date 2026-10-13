@@ -140,6 +140,8 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     _format_eta_hint,
     _is_inflight_stack_status,
     cdc_attach_scope_mismatch,
+    cdc_stack_has_streamed,
+    cdc_start_rolled_back,
     split_attachable_stacks,
     split_cleanup_by_progress,
     _migration_status_tables,
@@ -352,6 +354,76 @@ def mysql_start_facts(migration_state, seed, source_type=SourceType.MYSQL):
         live_mode=getattr(migration_state, "cdc_deployed_snapshot_mode", None),
         history_missing=bool(getattr(migration_state, "cdc_history_missing", False)),
     )
+
+
+# The Start CDC worker's refusals (the GTID start check, G19/G20, and the start-point check)
+# carry a notice of up to ~1,800 characters, and the JobManager keeps the first 300 of a job
+# error, so every remedy was cut away. The job error is a short pointer; the full notice is
+# kept on the migration state, tied to its job (it never outlives it, nor survives Start
+# over, which clears the job id), and the CDC card renders it under the failed Start. The
+# activity log gets the full notice too: on its own line, or on consecutive lines when it
+# is longer than the log's 2,000-character line cap (the fix comes last, and a cut line
+# would lose it -- G25). A restart loses the notice (process memory) and, on the default
+# Fargate task, the activity log too (the task's own /tmp file; its CloudWatch mirror is off
+# by default), while the job store and the session snapshot bring the failed Start and its
+# pointer back. So the pointer names neither: every Start CDC and Retry CDC runs the same
+# checks again, and the CDC step shows the cause and the fix then (G25).
+_START_REFUSAL_NOTICE_ATTR = "cdc_start_refusal_notice"
+START_REFUSAL_ACTION = "start blocked: cause and fix"
+
+
+def _activity_lines(text: str) -> "list[str]":
+    """``text`` as activity-log details that each fit the log's one-line cap: one line when
+    it fits, else consecutive ``(i/N)`` parts split between words. Pure."""
+    from dsql_migrator.core.activity_log import _MAX_DETAIL_CHARS
+
+    words = text.split()
+    if len(" ".join(words)) <= _MAX_DETAIL_CHARS:
+        return [" ".join(words)]
+    cap = _MAX_DETAIL_CHARS - len("(99/99) ")
+    lines: list[str] = []
+    for word in words:
+        if lines and len(lines[-1]) + 1 + len(word) <= cap:
+            lines[-1] += f" {word}"
+        else:
+            lines.append(word)
+    return [f"({i}/{len(lines)}) {line}" for i, line in enumerate(lines, 1)]
+
+
+def _start_refusal(
+    migration_state, notice, job_id, *, first_line: Optional[str] = None
+) -> RuntimeError:
+    """The job error for a worker refusal, after recording its full ``notice``
+    (``(tone, icon, header, body)``) for job ``job_id``'s CDC card and the activity log.
+    Nothing was changed.
+
+    Its FIRST line is the short pointer the job keeps: the JobManager and the activity log
+    keep only a first line (300 / 2,000 characters). The full refusal follows on the next
+    line for a caller that runs the worker in-process; no surface shows that part.
+    ``first_line``: a refusal whose one-line form carries its route on its own (G25, A2),
+    kept as that first line instead of the pointer -- under 300 characters with "Start CDC
+    blocked: "."""
+    if notice is None:
+        return RuntimeError("Start CDC blocked. Nothing was changed.")
+    tone, icon, header, body = notice
+    setattr(migration_state, _START_REFUSAL_NOTICE_ATTR, (job_id, tone, icon, header, body))
+    for line in _activity_lines(f"{header}. {body}"):
+        _log_cdc_event(START_REFUSAL_ACTION, status=ActivityStatus.FAILURE, detail=line)
+    first = (
+        f"Start CDC blocked: {first_line}"
+        if first_line
+        else f"Start CDC blocked: {header}. Nothing was changed; the CDC step shows the cause "
+        "and the fix whenever Start CDC (or Retry CDC) runs its checks."
+    )
+    return RuntimeError(f"{first}\n{header}. {body}")
+
+
+def _start_refusal_notice(migration_state, job_id) -> "Optional[tuple]":
+    """The refusal notice recorded for ``job_id`` (``(tone, icon, header, body)``), or None."""
+    recorded = getattr(migration_state, _START_REFUSAL_NOTICE_ATTR, None)
+    if not recorded or job_id is None or recorded[0] != job_id:
+        return None
+    return tuple(recorded[1:])
 
 
 def _logged_cdc_lifecycle(action: str, *, detail: str, work, residue=None):
@@ -652,6 +724,13 @@ def _render_cdc_source_config_card(
         source_type=source_type,
         wm_gtid_only=wm_gtid_only,
         resumes_from_offset=resumes_from_offset,
+        # G25 (A2): the start point Start CDC would refuse on a stack that has streamed --
+        # this one, and the Automatic one (the Full Load watermark).
+        newer=newer_start_point_refusal(
+            migration_state, seed, source_type, origin=_seed_origin, job_watermark=watermark
+        ),
+        auto_refused=newer_start_point_refusal(migration_state, watermark, source_type)
+        is not None,
         # The CAUSE of a re-snapshot, derived from the RAW job (the card only sees the
         # watermark, whose slot has already been suppressed for an unfinished load, so it
         # cannot tell "never provisioned" from "not honoured yet" on its own).
@@ -663,6 +742,7 @@ def _render_cdc_source_config_card(
         captured_names=lambda: [
             t.name for t in _cdc_tables_for_config(migration_state, inventory, watermark)
         ],
+        pg_slot=_pg_start_slot(migration_state, watermark) if is_pg else None,
     )
 
     # On a restart the connector config below is not what decides the start position (the
@@ -1046,15 +1126,36 @@ def _estimate_cdc_table_rows(session, table_names):
         return None
 
 
-def _render_manual_vs_watermark_notice(ui, manual_point, wm_resume) -> None:
+def _mysql_rolled_back_continues(fallback: str) -> str:
+    """How a MySQL Start continues after a Start CloudFormation rolled back (G25), as a clause:
+    the offset seeder keeps a position that Start's source connector recorded at or past the
+    start point, and what it streamed is only in the CDC topics -- the PostgreSQL wording
+    (:func:`_pg_resume_continues`). ``fallback``: where it starts when nothing was recorded."""
+    return (
+        "continues from the position the rolled-back Start recorded, if it recorded one, else "
+        f"from {fallback}; any changes that Start streamed are applied from the CDC topics, so "
+        "this is gapless only while the topics still retain them"
+    )
+
+
+def _render_manual_vs_watermark_notice(
+    ui, manual_point, wm_resume, *, rolled_back: bool = False
+) -> None:
     """A Manual binlog point REPLACES the gapless Full Load watermark as the start offset:
-    say which changes that loses (after it) or re-applies (before it). Nothing when equal."""
+    say which changes that loses (after it) or re-applies (before it). Nothing when equal.
+    ``rolled_back``: this stack's last Start CloudFormation rolled back, so Automatic is
+    gapless only while the CDC topics retain what that Start streamed (G25)."""
     m = {"file": manual_point.binlog_file, "pos": int(manual_point.binlog_position)}
     w = {"file": wm_resume.binlog_file, "pos": int(wm_resume.binlog_position)}
     if m == w:
         return
     m_txt = f"{m['file']}:{m['pos']}"
     w_txt = f"{w['file']}:{w['pos']}"
+    automatic = (
+        f"Automatic {_mysql_rolled_back_continues(f'the snapshot end ({w_txt})')}."
+        if rolled_back
+        else None
+    )
     if offset_already_at_or_past(m, w):
         render_notice(
             ui,
@@ -1062,8 +1163,12 @@ def _render_manual_vs_watermark_notice(ui, manual_point, wm_resume) -> None:
             header="Your manual point skips part of the stream",
             body=(
                 f"The Full Load snapshot ends at {w_txt}; streaming from your manual point "
-                f"{m_txt} means the changes between them are NOT replicated. Choose "
-                "Automatic for the gapless handoff."
+                f"{m_txt} means the changes between them are NOT replicated. "
+                + (
+                    f"Choose Automatic instead: it {automatic[len('Automatic '):]}"
+                    if automatic
+                    else "Choose Automatic for the gapless handoff."
+                )
             ),
         )
     else:
@@ -1074,10 +1179,129 @@ def _render_manual_vs_watermark_notice(ui, manual_point, wm_resume) -> None:
             body=(
                 f"Streaming from {m_txt} re-reads the changes up to the snapshot's end "
                 f"({w_txt}): they are re-applied on top of the loaded rows (idempotent "
-                "writes, so the result converges). Automatic starts exactly at the "
-                "snapshot's end."
+                "writes, so the result converges). "
+                + (automatic or "Automatic starts exactly at the snapshot's end.")
             ),
         )
+
+
+def _pg_start_slot(migration_state, watermark) -> str:
+    """The replication slot a PostgreSQL Start gives its connector: the one the Full Load
+    recorded, else the stack's own -- the same fallback ``dispatch_source_config`` uses."""
+    from dsql_migrator.core.cdc_pg_slot import pg_slot_name
+
+    return getattr(watermark, "slot_name", None) or pg_slot_name(
+        getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    )
+
+
+# The CDC topics' condition on a resume (G25), both engines: Stop CDC removes the source and
+# the sink in parallel with no drain, so the changes the sink had not applied reach the target
+# on the next Start only from the CDC topics -- re-applied from the sink's last commit, which is
+# idempotent -- and only while the topics still retain them. PostgreSQL also names the route
+# past that period (pg_cdc_route, in _pg_resume_continues and the Stop dialog).
+_MYSQL_TOPICS_CONDITION = (
+    "Changes the sink had not applied when CDC stopped are applied from the CDC topics, so "
+    "this is gapless only while the topics still retain them (their retention period on MSK)."
+)
+# The same condition said before the Stop, in the Stop CDC dialog.
+_STOP_TOPICS_CONDITION = (
+    "Changes the sink has not applied when CDC stops are applied from the CDC topics on the "
+    "next Start, so a restart is gapless only while the topics still retain them"
+)
+
+
+def _pg_resume_continues(
+    slot: str,
+    *,
+    snapshot_never: bool,
+    rolled_back: bool = False,
+    cdc_only: bool = False,
+    stopped: bool = False,
+) -> str:
+    """How a PostgreSQL Start continues on a stack whose connectors were started before
+    (:func:`cdc_start_resumes`), for the Start CDC and start-point cards. Pure.
+
+    Worded like the start line (:func:`_cdc_start_detail`, G25): the stack records that its
+    connectors were started, not that its source connector streamed. ``snapshot_never``
+    (``snapshot.mode=never``) never snapshots; ``initial`` continues without a snapshot from a
+    stored position whose initial snapshot completed, and snapshots again when none was
+    stored or its snapshot had not completed (Debezium 2.7.4). The slot is the one this
+    stack's connectors used: a Full Load that takes a new start point waits for new topics on
+    a stack that has streamed (the Full Load step's gate,
+    :func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_stack_has_streamed`), so no
+    resume after one is described here.
+
+    ``rolled_back`` (:func:`_pg_start_rolled_back`): its last Start's update rolled back; the
+    Start continues from the position that Start recorded, if it recorded one. ``stopped``
+    (with ``rolled_back``): CDC had been stopped before that Start -- the rollback restored the
+    stopped parameters (``cdc_has_committed_offset``) -- so the changes the sink had not applied
+    at the Stop are in the topics too, and the retention bound counts from the Stop, not from
+    that Start. Either way the changes no sink applied -- those that Start streamed, or those
+    the sink had not applied when Stop CDC removed it, with no drain -- reach the target only
+    from the CDC topics: gapless only while the topics still retain them. Past that, the route
+    is new topics (:func:`~dsql_migrator.core.cdc_pg_slot.pg_cdc_route`; ``cdc_only`` picks its
+    last step: no Full Load to re-run)."""
+    from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
+
+    fresh = pg_cdc_route(None, started=True, cdc_only=cdc_only)
+    if rolled_back:
+        if snapshot_never:
+            how = (
+                "Start CDC creates them again and continues from the position the "
+                "rolled-back Start recorded, if it recorded one, else from replication slot "
+                f"{slot}'s confirmed position, with no snapshot (snapshot.mode=never)."
+            )
+        else:
+            how = (
+                "Start CDC creates them again and continues from the position the "
+                "rolled-back Start recorded, if it recorded one (or from where an earlier "
+                "run stopped streaming). If that Start (or the earlier run) had not completed "
+                "its initial snapshot, or nothing was recorded, Debezium snapshots every "
+                f"selected table first, then streams from replication slot {slot}."
+            )
+        if stopped:
+            # Stopped, then a Start rolled back (G25): the sink's tail from before the Stop is
+            # the oldest in the topics, so it is what expires first.
+            return (
+                "CloudFormation rolled back this stack's last Start, which removed its "
+                "connectors; CDC had been stopped before that Start, and stopping removed the "
+                f"connectors without draining them. {how} The changes the sink had not applied "
+                "when CDC stopped, and any that Start streamed, are applied from the CDC "
+                "topics, so this is gapless only while the topics still retain them: once "
+                "their retention period on MSK has passed since CDC was stopped, a Start here "
+                f"would skip them, so instead {fresh}."
+            )
+        return (
+            "CloudFormation rolled back this stack's last Start, which removed its "
+            f"connectors. {how} Any changes that Start streamed are applied from the CDC "
+            "topics, so this is gapless only while the topics still retain them: once their "
+            "retention period on MSK has passed since that Start, a Start here would skip "
+            f"them, so instead {fresh}."
+        )
+    lead = (
+        "This stack's connectors were started before, and stopping CDC removed only the "
+        f"connectors (without draining them), not replication slot {slot}."
+    )
+    if snapshot_never:
+        how = (
+            "Start CDC re-creates them and continues from that slot with no snapshot "
+            "(snapshot.mode=never): from where streaming stopped, or from the Full Load's "
+            "start point if its source connector never streamed."
+        )
+    else:
+        how = (
+            "Start CDC re-creates them and continues from that slot. If its source connector "
+            "streamed, it picks up where streaming stopped. If it never "
+            "completed its initial snapshot (its task failed, or CDC was stopped, before then), "
+            "Debezium snapshots every selected table first, then streams: a full re-read of the "
+            "source, which takes a while on a large one."
+        )
+    return (
+        f"{lead} {how} Changes the sink had not applied when CDC stopped are applied from the "
+        "CDC topics, so this is gapless only while the topics still retain them: once their "
+        f"retention period on MSK has passed, a Start here would skip them, so instead {fresh}."
+    )
 
 
 def _render_cdc_start_point_card(
@@ -1098,15 +1322,23 @@ def _render_cdc_start_point_card(
     # Full Load never ran.
     wm_gtid_only: bool = False,
     # This stack streamed before, so its resume offset is already committed and no start
-    # point needs choosing -- the card reports the resume (offering only a LATER Manual
-    # point, MySQL) instead of demanding a coordinate it does not need.
+    # point needs choosing -- the card reports the resume instead of demanding a coordinate
+    # it does not need.
     resumes_from_offset: bool = False,
+    # MySQL (G25, A2): ``(notice, line)`` when Start CDC refuses the start point this card
+    # resolves -- it would move a stack that has streamed forward (newer_start_point_refusal)
+    # -- and whether it refuses the Automatic one (the Full Load watermark) too.
+    newer: Optional[tuple] = None,
+    auto_refused: bool = False,
     # Why a PostgreSQL start re-snapshots (see :func:`pg_resnapshot_reason`), or None when
     # it does not. Passed in because the cause is only visible on the RAW job.
     resnapshot_reason: Optional[str] = None,
     # MySQL Manual: the names of the tables a Start would capture, called when Fetch
     # current position is clicked so their definitions are recorded with the position.
     captured_names: Optional[Callable[[], Sequence[str]]] = None,
+    # PostgreSQL: the replication slot a Start gives the connector (:func:`_pg_start_slot`);
+    # None names the stack's own.
+    pg_slot: Optional[str] = None,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -1114,8 +1346,8 @@ def _render_cdc_start_point_card(
     it is a top-level card (not buried in the raw connector config). An AWS
     console-style radio chooses between Automatic (gapless from the Full Load
     watermark) and Manual (an explicit GTID / binlog position); the manual inputs
-    appear only when Manual is selected -- or, on a MySQL resume (no radio), inside a
-    collapsed "Manual" disclosure for a later start point. A status line confirms the
+    appear only when Manual is selected (a MySQL resume offers none: a later start point on
+    a stack that has streamed needs new CDC topics, G25). A status line confirms the
     resolved start point. Validation is advisory (orange hint, never blocks): MSK
     Connect is the final authority at connector start.
 
@@ -1159,11 +1391,19 @@ def _render_cdc_start_point_card(
     # "Start CDC" (the button's own readiness test passes on the LSN), telling the operator
     # something was broken when the only thing missing was a slot they can no longer get.
     # What Automatic does here is disclosed by the notice below, not by a false alarm.
-    ready = (
+    ready = newer is None and (
         resumes_from_offset
         or effective_resume is not None
         or (is_pg and (mode == "manual" or not wm_usable))
     )
+    # MySQL: the stack's last Start CloudFormation rolled back (G25) -- its source connector
+    # may have recorded a position the seeder keeps, and streamed into the CDC topics.
+    mysql_rolled_back = (
+        not is_pg and not resumes_from_offset and cdc_start_rolled_back(migration_state)
+    )
+    # The stack's connectors were started before (G25): Start CDC continues from what it
+    # recorded, so the card's "where it begins" is not the Full Load snapshot's end.
+    streamed = resumes_from_offset or cdc_stack_has_streamed(migration_state)
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon(  # type: ignore[attr-defined]
@@ -1180,7 +1420,11 @@ def _render_cdc_start_point_card(
             ui.icon("info").classes(  # type: ignore[attr-defined]
                 "text-gray-400 text-sm cursor-help"
             ).tooltip(
-                "Where change streaming begins. Automatic resumes exactly where the "
+                "Where change streaming begins. This stack has streamed, so Start CDC "
+                "continues from its recorded stream position"
+                + ("." if locked else " (see the notice below).")
+                if streamed
+                else "Where change streaming begins. Automatic resumes exactly where the "
                 "Full Load snapshot ended (no gap, no overlap)."
                 if wm_usable or not is_pg
                 else "Where change streaming begins. This load left no replication slot "
@@ -1194,10 +1438,10 @@ def _render_cdc_start_point_card(
                 # A Stop keeps the committed position and Start never rewinds it, so
                 # "stop CDC first" alone promised an edit that cannot move it back.
                 ui.badge("Locked", color="grey").props("outline").tooltip(  # type: ignore[attr-defined]
-                    "CDC has started — the start point is locked. After a Stop, a new "
-                    "start point is applied only if it is past the committed position "
-                    "(Start never rewinds it); to replay from an earlier point, delete "
-                    "the CDC infrastructure and deploy again."
+                    "CDC has started — the start point is locked. After a Stop, Start CDC "
+                    "continues from the committed position; a different start point "
+                    "(earlier or later) needs Delete CDC infrastructure and deploy it again "
+                    "first."
                 )
             elif ready:
                 ui.badge("Ready", color="positive").props("outline")  # type: ignore[attr-defined]
@@ -1208,17 +1452,54 @@ def _render_cdc_start_point_card(
         # offsets topic, not in anything this card can set, so the Automatic/Manual radio
         # would imply the operator must pick one -- and "Automatic — needs a Full Load
         # watermark (unavailable)" would be actively wrong, since no watermark is needed.
-        # State the fact, plus (MySQL) one collapsed way to move it FORWARD: a start point
-        # after a schema change is the remedy the start-point refusal and the replay
-        # diagnoses name, and the seeder does advance a stopped stack's offset to it.
-        if resumes_from_offset and not locked:
+        # State the fact. No Manual point is offered: a start point past the committed one
+        # needs new CDC topics on a stack that has streamed (G25, A2 -- Start CDC refuses it).
+        # PostgreSQL: a stack whose last Start CloudFormation rolled back continues the same
+        # way (G25) -- from the position that Start recorded, if it recorded one -- so it
+        # takes this branch too: neither a promised snapshot nor an unconditional gapless
+        # start below applies to it.
+        pg_rolled_back = is_pg and _pg_start_rolled_back(migration_state)
+        if (resumes_from_offset or pg_rolled_back) and not locked:
             # MySQL: the last start found the schema history missing, so this one rebuilds
             # it (recovery) after the start-point check -- "nothing re-applied, no choice"
             # would describe a start that is not the one about to run.
             history_missing = not is_pg and bool(
                 getattr(migration_state, "cdc_history_missing", False)
             )
-            if history_missing:
+            if is_pg:
+                # PostgreSQL: the stack records that its connectors were started, not that
+                # its source connector streamed, so the card states both outcomes as the
+                # start line does (G25). On PostgreSQL an effective resume point exists
+                # exactly when the Start sends snapshot.mode=never (pg_snapshot_mode).
+                _never = effective_resume is not None
+                render_notice(
+                    ui,
+                    tone="success" if (_never and not pg_rolled_back) else "info",
+                    icon="restart_alt",
+                    header=(
+                        "Starting again after a rolled-back Start"
+                        if pg_rolled_back
+                        else "Resuming from this stack's replication slot"
+                    ),
+                    body=(
+                        _pg_resume_continues(
+                            pg_slot or _pg_start_slot(migration_state, None),
+                            snapshot_never=_never,
+                            rolled_back=pg_rolled_back,
+                            cdc_only=getattr(migration_state, "migration_type", None)
+                            is MigrationType.CDC_ONLY,
+                            # Stopped before a Start that rolled back: the retention bound
+                            # counts from the Stop (G25).
+                            stopped=bool(
+                                getattr(migration_state, "cdc_has_committed_offset", False)
+                            ),
+                        )
+                        + " No start point or Full Load watermark is needed."
+                    ),
+                )
+            elif history_missing:
+                from dsql_migrator.ui.cdc_start_point_gate import new_topics_route
+
                 render_notice(
                     ui,
                     tone="info",
@@ -1229,8 +1510,10 @@ def _render_cdc_start_point_card(
                         "its committed position on MSK. Its last start found Debezium's "
                         "schema history missing, so this Start rebuilds it from the source "
                         "tables as they are now (snapshot.mode=recovery), after the "
-                        "start-point check. If that check names a changed table, choose "
-                        "Manual below and give CDC a start point after the change."
+                        "start-point check. If that check names a changed table, a start "
+                        "point after the change needs new CDC topics: "
+                        + new_topics_route(getattr(migration_state, "migration_type", None))
+                        + f". {_MYSQL_TOPICS_CONDITION}"
                     ),
                 )
             else:
@@ -1240,11 +1523,13 @@ def _render_cdc_start_point_card(
                     icon="restart_alt",
                     header="Resuming from the last streamed position",
                     body=(
+                        # G25: the sink re-applies from its last commit, and what it had not
+                        # applied at the Stop comes only from the CDC topics.
                         "This pipeline has streamed before, so its resume position is "
                         "already committed on MSK (stopping CDC deleted the connectors, "
                         "not the position). Streaming continues from there — no start "
-                        "point needed, no Full Load watermark required, and nothing "
-                        "re-applied."
+                        "point needed and no Full Load watermark required. "
+                        f"{_MYSQL_TOPICS_CONDITION}"
                     ),
                 )
             # A Manual point is still OFFERED to the seeder, which never rewinds the
@@ -1265,24 +1550,8 @@ def _render_cdc_start_point_card(
                 )
             elif manual_point is not None:
                 _render_gtid_only_notice()
-            if not is_pg:
-                # Collapsed (open while the history is missing, when the check may refuse
-                # and name this route): a point applied here selects Manual, and one past
-                # the committed offset turns this card into the regular Manual card.
-                with ui.expansion(  # type: ignore[attr-defined]
-                    "Manual — start from a later binlog position instead",
-                    icon="edit_location_alt",
-                    value=history_missing,
-                ).classes(f"w-full {EXPANSION_PANEL_CLASSES}").props("expand-separator"):
-                    ui.label(  # type: ignore[attr-defined]
-                        "Only a position past where this stack already streamed moves it "
-                        "(Start never rewinds); changes between that position and the new "
-                        "one are not replicated."
-                    ).classes("text-xs text-gray-500")
-                    _render_cdc_manual_inputs(
-                        ui, migration_state, refresh, session=session,
-                        captured_names=captured_names, select_manual=True,
-                    )
+            # No Manual start point is offered here (G25, A2): one past where this stack
+            # streamed needs new CDC topics, and Start CDC refuses it on this stack.
             return
 
         if is_pg:
@@ -1308,7 +1577,15 @@ def _render_cdc_start_point_card(
             # escape buttons still record it); it is just not a start point to pick.
             pass
         else:
-            if wm_usable:
+            if wm_usable and auto_refused:
+                # G25 (A2): this stack has streamed, and the watermark is past where it last
+                # started -- Start CDC refuses it (the notice below says why and the route).
+                auto_label = "Automatic — from the Full Load watermark"
+            elif wm_usable and mysql_rolled_back:
+                # G25: gapless only while the CDC topics retain what the rolled-back Start
+                # streamed (the notice below).
+                auto_label = "Automatic — from the Full Load watermark (recommended)"
+            elif wm_usable:
                 auto_label = "Automatic — gapless from Full Load (recommended)"
             elif wm_gtid_only:
                 # Do NOT say "needs a Full Load watermark": there IS one. It simply lacks the
@@ -1348,6 +1625,33 @@ def _render_cdc_start_point_card(
                 radio.props("disable").classes(
                     "opacity-50 pointer-events-none cursor-not-allowed"
                 )
+            if newer is not None and not locked:
+                # G25 (A2): Start CDC refuses this start point -- the stack has streamed,
+                # and the point is past where it last started.
+                render_notice(
+                    ui, tone=newer[0][0], icon=newer[0][1], header=newer[0][2],
+                    body=newer[0][3],
+                )
+            elif mysql_rolled_back and mode == "auto" and wm_usable and not locked:
+                # G25: a retry after a Start CloudFormation rolled back -- gapless only while
+                # the CDC topics retain what that Start streamed.
+                from dsql_migrator.ui.cdc_start_point_gate import new_topics_route
+
+                render_notice(
+                    ui,
+                    tone="info",
+                    icon="restart_alt",
+                    header="Starting again after a rolled-back Start",
+                    body=(
+                        "CloudFormation rolled back this stack's last Start, which removed "
+                        "its connectors. Start CDC creates them again and "
+                        f"{_mysql_rolled_back_continues('the Full Load watermark')} (their "
+                        "retention period on MSK). Past that, a new start point needs new "
+                        "CDC topics: "
+                        + new_topics_route(getattr(migration_state, "migration_type", None))
+                        + "."
+                    ),
+                )
         # PostgreSQL: keyed on the EFFECTIVE snapshot mode, not on a radio value. With the
         # radio gone `mode` no longer describes what will happen, and `not wm_usable` never
         # did -- it missed the state where a slot IS recorded and an escape button set
@@ -1359,6 +1663,17 @@ def _render_cdc_start_point_card(
             _notice = pg_resnapshot_notice(resnapshot_reason)
             if _notice is not None:
                 render_notice(ui, tone="warning", header=_notice[0], body=_notice[1])
+            if resnapshot_reason == "manual":
+                # The way back the notice names (G25): PostgreSQL has no start-point radio, so
+                # a re-snapshot the "Re-snapshot every table instead" remedy recorded is set
+                # back to Automatic HERE -- the Start then resumes from this Full Load's slot
+                # with no snapshot, and the Start CDC dialog runs that Start's own checks.
+                with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
+                    ui.button(  # type: ignore[attr-defined]
+                        PG_RESUME_FROM_SLOT_ACTION,
+                        icon="restart_alt",
+                        on_click=lambda: _on_mode("auto"),
+                    ).props("color=primary outline no-caps")
         if not is_pg and not wm_usable and mode == "auto" and not locked:
             if wm_gtid_only:
                 # Name the cause AND the fix. This is the one case where the operator can
@@ -1379,6 +1694,15 @@ def _render_cdc_start_point_card(
                         "re-run the Full Load for a gapless handoff, or enter a binlog "
                         "position manually if you know the coordinate the load started "
                         "from."
+                        + (
+                            # G25: a new start point on this stack needs new CDC topics.
+                            " This stack's last Start rolled back, so either way needs new "
+                            "CDC topics first: Delete CDC infrastructure and deploy it "
+                            "again, then re-run the Full Load or enter the position, then "
+                            "Start CDC."
+                            if mysql_rolled_back
+                            else ""
+                        )
                     ),
                 )
             else:
@@ -1396,33 +1720,16 @@ def _render_cdc_start_point_card(
             elif (
                 manual_seedable
                 and not locked
-                and getattr(migration_state, "cdc_has_committed_offset", False)
-            ):
-                # This stack streamed before (and this point is not at/before where it
-                # started, or that is unknown): the seeder applies the point only if it is
-                # past the committed position, which the tool cannot read.
-                render_notice(
-                    ui,
-                    tone="info",
-                    header="This stack has streamed before",
-                    body=(
-                        f"Your manual point {manual_point.binlog_file}:"
-                        f"{manual_point.binlog_position} is applied only if it is past "
-                        "the position this stack already streamed to — Start never "
-                        "rewinds a committed position. If it is past it, the changes "
-                        "between that position and your point are not replicated. To "
-                        "replay from an earlier point, delete the CDC infrastructure and "
-                        "deploy again."
-                    ),
-                )
-            elif (
-                manual_seedable
-                and not locked
+                # A point past where a streamed stack last started is refused above (G25,
+                # A2); one at or before it is a resume (the card's resume branch).
+                and newer is None
                 and wm_usable
                 and wm_resume is not None
                 and wm_resume.can_seed_offset()
             ):
-                _render_manual_vs_watermark_notice(ui, manual_point, wm_resume)
+                _render_manual_vs_watermark_notice(
+                    ui, manual_point, wm_resume, rolled_back=mysql_rolled_back
+                )
             _render_cdc_manual_inputs(
                 ui, migration_state, refresh, locked=locked, session=session,
                 captured_names=captured_names,
@@ -1452,7 +1759,7 @@ def _render_cdc_start_point_card(
                 with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                     ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
                     ui.label(pg_confirm).classes("text-xs text-gray-700 font-mono")  # type: ignore[attr-defined]
-        elif effective_resume is not None:
+        elif effective_resume is not None and newer is None:
             with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                 ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
                 # The binlog coordinate is what the offset is keyed on, so the confirmation
@@ -1963,6 +2270,7 @@ def _cdc_start_detail(
     resumes: bool = False,
     seed_origin: str = "full_load",
     snapshot_mode: Optional[str] = None,
+    rolled_back: bool = False,
 ) -> str:
     """The audit detail for a CDC start: where the stream resumes FROM, and how.
 
@@ -1979,15 +2287,51 @@ def _cdc_start_detail(
     States a Full Load watermark's coordinate through the same precedence the Full Load
     watermark line uses
     (:func:`~dsql_migrator.ui.data_migration._full_load_engine.watermark_coordinate`),
-    so the two lines in one log agree rather than spelling it two ways. With no watermark
-    the stream starts from the source's CURRENT position, which means anything written
+    so the two lines in one log agree rather than spelling it two ways. With no watermark a
+    MySQL stream starts from the source's CURRENT position, which means anything written
     between an earlier snapshot and now is NOT replicated -- the one case a reader must be
-    able to spot, so it is said explicitly rather than implied by an absent coordinate.
+    able to spot, so it is said explicitly rather than implied by an absent coordinate. A
+    PostgreSQL one has no such gap: on a stack whose connectors were started before
+    (``resumes``) it continues from the stack's slot -- checked first by the Start's
+    publication/slot gate -- or, with ``snapshot.mode=initial`` and a source connector that
+    never streamed, snapshots first; without ``resumes`` it snapshots first.
+
+    ``rolled_back`` (PostgreSQL, :func:`_pg_start_rolled_back`, G25): the stack's last Start
+    was rolled back by CloudFormation. Its source connector may have recorded a position, so
+    the line promises no snapshot either way: it continues from the position the rolled-back
+    Start recorded, if it recorded one, and with ``initial`` snapshots first when that Start
+    (or the earlier run) had not completed its initial snapshot, or nothing was recorded
+    (Debezium 2.7.4); that Start's changes come from the CDC topics -- gapless only while the
+    topics retain them. On MySQL (G25) a Full Load watermark's start after such a Start is
+    worded the same way: the offset seeder keeps a position that Start recorded at or past the
+    watermark, and what it streamed is only in the CDC topics -- so no unconditional "gapless".
 
     Log positions, a mode, and column COUNTS only -- never a row value (Property 7).
     """
+    from dsql_migrator.core.cdc_pg_slot import pg_slot_name
     from dsql_migrator.ui.data_migration._full_load_engine import watermark_coordinate
 
+    # ``resumes`` on PostgreSQL means only that this stack's connectors were started and then
+    # stopped: whether its source connector ever STREAMED (recorded a position) the stack does
+    # not record. snapshot.mode=never streams from the slot either way. initial (a forced --
+    # Manual -- or a slotless start) skips the snapshot once its source connector has streamed
+    # (live-checked on the shipped Debezium, 2026-10-09), and takes it when that connector
+    # never did -- its task failed, or was stopped, before its snapshot completed (live:
+    # "Previous snapshot was cancelled before completion; a new snapshot will be taken"). So
+    # the line names the slot and states both outcomes, never one the tool cannot know. The
+    # Start's gate (_pg_objects_gate_block) checks that slot for every such start.
+    pg_resumes = resumes and source_type is SourceType.POSTGRES
+    # A Start whose update CloudFormation rolled back (G25): whether that Start's source
+    # connector recorded a position the stack does not record, and the changes it streamed
+    # are only in the CDC topics -- so the line promises no snapshot and states the bound.
+    pg_rolled_back = rolled_back and source_type is SourceType.POSTGRES
+    # The snapshot.mode this Start sends (the config's own, else its mirror: never needs the
+    # slot the Full Load recorded and no forced snapshot).
+    pg_never = (
+        snapshot_mode == "never"
+        if snapshot_mode
+        else bool(getattr(watermark, "slot_name", None)) and not force_snapshot
+    )
     parts = [f"stack {stack_name}"]
     if resumes and source_type is not SourceType.POSTGRES:
         # See cdc_start_resumes: nothing new is seeded, so the committed offset decides.
@@ -1995,25 +2339,53 @@ def _cdc_start_detail(
             "start point: the committed stream position on MSK (this stack streamed "
             "before; it continues where streaming stopped)"
         )
-    elif (
-        resumes
-        and source_type is SourceType.POSTGRES
-        and watermark is not None
-        and getattr(watermark, "slot_name", None)
-        and not force_snapshot
-    ):
+    elif pg_rolled_back:
+        _slot = getattr(watermark, "slot_name", None) or pg_slot_name(stack_name)
+        parts.append(
+            f"start point: replication slot {_slot} (this stack's last Start was rolled back "
+            "by CloudFormation; "
+            + (
+                "snapshot.mode=never, so no snapshot runs and the connector continues from the "
+                "position the rolled-back Start recorded, if it recorded one, else from the "
+                "slot's confirmed position"
+                if pg_never and getattr(watermark, "slot_name", None)
+                # initial: Debezium continues without a snapshot only from a stored position
+                # whose initial snapshot completed (2.7.4), so nothing more is promised.
+                else "the connector continues from the position the rolled-back Start "
+                "recorded, if it recorded one, or from where an earlier run stopped "
+                "streaming; if that Start (or the earlier run) had not completed its initial "
+                "snapshot, or nothing was recorded, Debezium snapshots every selected table "
+                "first, then streams from the slot"
+            )
+            + "; any changes that Start streamed are applied from the CDC topics, gapless "
+            "only while the topics still retain them)"
+        )
+    elif pg_resumes and pg_never and getattr(watermark, "slot_name", None):
         # A PostgreSQL restart streams from the slot's confirmed position, not from the Full
         # Load LSN: naming the watermark as the start put a position the stream had long
         # passed into the permanent record (live PG E2E, 2026-10-09). The slot stands where
-        # streaming stopped -- or, when a Full Load re-run since then recreated it
-        # (provision_pg_replication), at that run's watermark; nothing on the stack records
-        # which, so the line states both.
+        # streaming stopped -- or at this watermark when the connector never streamed from
+        # it. Nothing on the stack records which, so the line states both. (A Full Load that
+        # takes a new start point waits for new topics on a stack that has streamed -- the
+        # Full Load step's gate, cdc_stack_has_streamed -- so no slot it re-created is named.)
         parts.append(
-            f"start point: replication slot {watermark.slot_name} (this stack streamed "
-            "before; it continues from the slot's confirmed position -- where streaming "
-            "stopped, or the Full Load watermark "
-            f"{watermark_coordinate(watermark, source_type)} if a Full Load run since then "
-            "recreated the slot)"
+            f"start point: replication slot {watermark.slot_name} (this stack's connectors "
+            "were started before; snapshot.mode=never, so no snapshot runs and the connector "
+            "continues from the slot's confirmed position -- where streaming stopped, or the "
+            f"Full Load watermark {watermark_coordinate(watermark, source_type)} if the "
+            "connector never streamed from it)"
+        )
+    elif pg_resumes:
+        # snapshot.mode=initial: the slot the Full Load recorded, else the stack's own
+        # (pg_slot_name) -- the same name dispatch_source_config gives the connector.
+        parts.append(
+            "start point: replication slot "
+            f"{getattr(watermark, 'slot_name', None) or pg_slot_name(stack_name)} (this "
+            "stack's connectors were started before: if its source connector streamed, no "
+            "snapshot runs and the connector continues from the slot's confirmed position, "
+            "where streaming stopped; if it never streamed -- its task failed, or was "
+            "stopped, before its snapshot completed -- Debezium snapshots every selected "
+            "table first, then streams from the slot)"
         )
     elif watermark is not None and seed_origin == "manual":
         # Named as the card, the deploy log and the "CDC start position" line name it: the
@@ -2033,6 +2405,16 @@ def _cdc_start_detail(
             "binlog file:position to seed, so any change written before this moment is "
             "NOT replicated"
         )
+    elif watermark is None and source_type is SourceType.POSTGRES:
+        # No Full Load watermark and no committed offset (CDC only's first start, or a stack
+        # deployed again since): snapshot.mode=initial snapshots every selected table, then
+        # streams from the stack's own slot (pg_slot_name). No gap either, so the
+        # CURRENT-position sentence is MySQL's only.
+        parts.append(
+            "start point: a snapshot — there is no Full Load watermark, so the "
+            "connector snapshots every selected table, then streams from its own "
+            f"replication slot {pg_slot_name(stack_name)}"
+        )
     elif watermark is not None:
         # "gapless" is a claim about the SLOT, not about merely HAVING a watermark. A
         # PostgreSQL Full-load-only watermark carries a WAL LSN and no slot, so nothing can
@@ -2040,7 +2422,8 @@ def _cdc_start_detail(
         # gapless in the PERMANENT record was worse than saying nothing, because Step 4 will
         # show rows the source no longer has and this line is the only durable artifact a
         # reader has to explain them. Mirrors ``pg_snapshot_mode``: PostgreSQL re-snapshots
-        # when no slot was recorded OR a full snapshot is forced.
+        # when no slot was recorded OR a full snapshot is forced -- with no committed offset
+        # (one with an offset continues from it: named above).
         pg_resnapshots = source_type is SourceType.POSTGRES and (
             not getattr(watermark, "slot_name", None) or force_snapshot
         )
@@ -2050,6 +2433,10 @@ def _cdc_start_detail(
                 "(re-snapshot: every selected table is read again before streaming, so "
                 "rows DELETED on the source since the Full Load remain on the target)"
                 if pg_resnapshots
+                # MySQL after a Start CloudFormation rolled back (G25).
+                else "(this stack's last Start was rolled back by CloudFormation: the "
+                f"connector {_mysql_rolled_back_continues('this start point')})"
+                if rolled_back and source_type is not SourceType.POSTGRES
                 else "(gapless from the Full Load watermark)"
             )
         )
@@ -2062,7 +2449,16 @@ def _cdc_start_detail(
     if snapshot_mode and source_type is not SourceType.POSTGRES:
         parts.append(f"snapshot.mode {snapshot_mode}")
     if force_snapshot:
-        parts.append("a FULL initial snapshot is forced for this start")
+        parts.append(
+            # Worded like the start point above: the stack does not record whether its
+            # source connector streamed, which is what decides it.
+            "Manual's full snapshot runs only if nothing was recorded on this stack, or the "
+            "run that recorded its position had not completed its initial snapshot"
+            if pg_rolled_back
+            else "Manual's full snapshot runs only if this stack's source connector never streamed"
+            if pg_resumes
+            else "a FULL initial snapshot is forced for this start"
+        )
     excluded = sum(len(cols or ()) for cols in (exclusions or {}).values())
     if excluded:
         parts.append(f"{excluded} column(s) excluded from replication (Exclude tables & columns)")
@@ -2526,8 +2922,11 @@ def _render_cdc_start_action(
                     "deploy again, Start CDC reads the source again, so the connector "
                     "stops the same way until its cause is dealt with. Follow the steps "
                     "above, and on Pipeline health when it names the cause, instead. "
-                    "Delete only for a full teardown, or when the MSK partition quota is "
-                    "exhausted (a redeploy reclaims it)."
+                    "Delete only for a full teardown, when the MSK partition quota is "
+                    "exhausted (a redeploy reclaims it), or when the steps above call for a "
+                    "new start point: on a stack that has streamed, that needs new CDC "
+                    "topics (Delete, deploy again, Re-run Full Load with Drop & reload, then "
+                    "Start CDC)."
                 )
             else:  # partial: a connector is missing
                 danger_header = "Delete only if Stop + Start can't recover"
@@ -2567,8 +2966,9 @@ def _render_cdc_partial_actions(
       idempotent, so a source that is already RUNNING is kept (no binlog re-read,
       no wasted MSK churn) and only the MISSING connector is (re)created. The
       events the source already streamed sit buffered in the Kafka topics, so the
-      new sink consumes them and catches DSQL up -- no gap. This is the fast,
-      non-destructive path for a sink that failed to create.
+      new sink consumes them and catches DSQL up -- gapless only while the topics still
+      retain them (G25). This is the fast, non-destructive path for a sink that failed
+      to create.
     - **Clean up leftover connector** (secondary): remove the surviving connector
       (same backend path as Stop CDC) to return to a clean infra-only state --
       useful when Retry keeps failing (e.g. MSK partition quota) and a from-scratch
@@ -2613,8 +3013,17 @@ def _render_cdc_partial_actions(
                     + ("their worker logs" if many else "its worker log")
                     + " yet; the "
                     f"CloudWatch log group /msk-connect/{stack_name}-cdc has the error. "
-                    "Once the cause is fixed, Stop CDC, then Start CDC: it continues "
-                    "from the recorded stream position."
+                    + (
+                        # PostgreSQL (G25, like the resume card): the stack does not record
+                        # whether its source connector streamed -- a task that stopped in its
+                        # initial snapshot never did -- so the card shown once CDC is stopped
+                        # says where the Start continues from, not this one.
+                        "Once the cause is fixed, Stop CDC; the CDC step then says where "
+                        "Start CDC continues from."
+                        if _cdc_source_type(session) is SourceType.POSTGRES
+                        else "Once the cause is fixed, Stop CDC, then Start CDC: it continues "
+                        "from the recorded stream position."
+                    )
                 )
             ),
         )
@@ -2650,7 +3059,7 @@ def _render_cdc_partial_actions(
     def _retry() -> None:
         # Re-run Start CDC: idempotent, so the RUNNING connector is left alone and
         # the missing one is re-created (the source's buffered events let the new
-        # sink catch DSQL up with no gap).
+        # sink catch DSQL up, while the topics retain them).
         _start_cdc_deploy(
             ui, migration_state, job_manager, refresh,
             inventory=inventory, session=session,
@@ -2667,7 +3076,9 @@ def _render_cdc_partial_actions(
         ).props("color=primary")
         retry_btn.tooltip(
             f"Re-create the missing connector ({missing_label}); the running "
-            "connector is kept. Buffered changes let the new sink catch up — no gap."
+            "connector is kept. The new sink catches up from the changes buffered in the "
+            "CDC topics: gapless only while the topics still retain them (their retention "
+            "period on MSK)."
         )
 
 # G16/G17 (Full load + CDC after its Full Load, before CDC first starts): the CDC step's
@@ -2862,8 +3273,9 @@ def _render_cdc_start_button(
     # offset is already committed to the source connector's offsets topic -- which is
     # pinned to a fixed name and survives a Stop (a Stop only deletes the connectors) --
     # and the seeder skips re-seeding an offset that is at/past the watermark. So
-    # streaming resumes exactly where it stopped -- unless a newer watermark (a Full Load
-    # run after the Stop) moves it forward; cdc_start_resumes tells the two apart.
+    # streaming resumes exactly where it stopped -- unless a newer point (a later Manual
+    # one) moves it forward; cdc_start_resumes tells the two apart. (A Full Load that takes
+    # a new start point waits for new topics on such a stack: cdc_stack_has_streamed, G25.)
     #
     # Gating `ready` on a watermark alone was wrong here, and wrong in the case that
     # matters most: the watermark is read off the Full Load JOB record, so after an app
@@ -2877,6 +3289,12 @@ def _render_cdc_start_button(
     )
     resumes_from_offset = cdc_start_resumes(
         migration_state, _seed, _cdc_source_type(session)
+    )
+    # G25 (A2): a MySQL Start that would move a stack that has streamed forward, past where it
+    # last started (a detour through Full load only, a later Manual point) -- refused.
+    _newer = newer_start_point_refusal(
+        migration_state, _seed, _cdc_source_type(session), origin=_seed_origin,
+        job_watermark=watermark,
     )
     # Why the last run's connector stopped, kept across Stop CDC (the runbook's first step)
     # until the next Start: "Ready to resume" alone would invite the Start that stops the
@@ -2966,6 +3384,40 @@ def _render_cdc_start_button(
             header=START_UNCOVERED_HEADER,
             body=start_uncovered_body(_uncovered, _migration_type),
         )
+    elif _newer is not None:
+        # G25 (A2): no "Ready to start CDC ... begins streaming" for a start Start CDC refuses.
+        render_notice(
+            ui, tone=_newer[0][0], icon=_newer[0][1], header=_newer[0][2], body=_newer[0][3]
+        )
+    elif is_pg and (resumes_from_offset or _pg_start_rolled_back(migration_state)):
+        # PostgreSQL: worded like the start line (G25) -- the stack records that its
+        # connectors were started, not that its source connector streamed. A Start whose
+        # update CloudFormation rolled back is one too: its source connector may have
+        # recorded a position Debezium continues from, so no snapshot is promised there.
+        _rolled_back = _pg_start_rolled_back(migration_state)
+        _continues = _pg_resume_continues(
+            _pg_start_slot(migration_state, watermark),
+            snapshot_never=not _resnapshots,
+            rolled_back=_rolled_back,
+            cdc_only=_migration_type is MigrationType.CDC_ONLY,
+            # Stopped before a Start that rolled back: the retention bound counts from the
+            # Stop (G25).
+            stopped=bool(getattr(migration_state, "cdc_has_committed_offset", False)),
+        )
+        render_notice(
+            ui,
+            tone="info",
+            icon="restart_alt",
+            header="Ready to start CDC again" if _rolled_back else "Ready to resume CDC",
+            body=(
+                f"{_continues} No start point needs re-entering. The connectors take a few "
+                "minutes; progress appears below."
+                if not _last_causes
+                else f"{_continues} The last run stopped for the cause above: follow its "
+                "steps before Start CDC — for some causes a Start from the recorded position "
+                "stops the same way."
+            ),
+        )
     elif resumes_from_offset:
         render_notice(
             ui,
@@ -2973,11 +3425,13 @@ def _render_cdc_start_button(
             icon="restart_alt",
             header="Ready to resume CDC",
             body=(
+                # G25: no unconditional "no gap" -- Stop CDC removed the sink without a
+                # drain, so what it had not applied comes only from the CDC topics.
                 "This pipeline streamed before and its resume position is still recorded "
                 "on MSK — stopping CDC removed only the connectors, not that position. "
                 "Start CDC re-creates them and continues from exactly where streaming "
-                "stopped: no gap, no re-load, and no need to re-enter a start point. It "
-                "takes a few minutes; progress appears below."
+                "stopped, with no re-load and no need to re-enter a start point. "
+                f"{_MYSQL_TOPICS_CONDITION} It takes a few minutes; progress appears below."
                 if not _last_causes
                 # A held stop cause qualifies the promise: for the replay causes (an
                 # unparseable DDL, a schema-history replay) a Start from the recorded
@@ -2986,7 +3440,33 @@ def _render_cdc_start_button(
                 else "This pipeline's resume position is still recorded on MSK — stopping "
                 "CDC removed only the connectors, not that position. The last run stopped "
                 "for the cause above: follow its steps before Start CDC — for some causes "
-                "a Start from the recorded position stops the same way."
+                "a Start from the recorded position stops the same way. "
+                f"{_MYSQL_TOPICS_CONDITION}"
+            ),
+        )
+    elif not is_pg and cdc_start_rolled_back(migration_state) and not _resnapshots:
+        # MySQL (G25): a retry after a Start CloudFormation rolled back -- worded like
+        # PostgreSQL's: gapless only while the CDC topics retain what that Start streamed.
+        from dsql_migrator.ui.cdc_start_point_gate import new_topics_route
+
+        render_notice(
+            ui,
+            tone="info",
+            icon="restart_alt",
+            header="Ready to start CDC again",
+            body=(
+                "CloudFormation rolled back this stack's last Start, which removed its "
+                "connectors. Start CDC creates them again and "
+                f"{_mysql_rolled_back_continues('the start point above')} (their retention "
+                "period on MSK). Past that, a new start point needs new CDC topics: "
+                + new_topics_route(_migration_type)
+                + (
+                    ". The connectors take a few minutes; progress appears below."
+                    if not _last_causes
+                    else ". The last run stopped for the cause above: follow its steps "
+                    "before Start CDC — for some causes a Start from the recorded position "
+                    "stops the same way."
+                )
             ),
         )
     else:
@@ -3263,6 +3743,10 @@ def _render_cdc_start_button(
         # probes, in a notice the closing dialog takes with it.
         start_btn.props("disable")
         start_btn.tooltip(will_stream_none(migration_state, job_manager))
+    elif _newer is not None:
+        # G25 (A2): the notice above says why, and the route.
+        start_btn.props("disable")
+        start_btn.tooltip(_newer[1])
     elif not ready:
         start_btn.props("disable")
         ui.label(  # type: ignore[attr-defined]
@@ -3889,6 +4373,16 @@ def _table_lock(migration_state, job_manager, session):
     from dsql_migrator.ui.data_migration import table_set_lock_reason
 
     return table_set_lock_reason(migration_state, job_manager, session)
+
+
+def _table_set_open(migration_state, job_manager, session) -> bool:
+    """Can the table picker change the set right now (no lock reason)? (G25) So a block names
+    unticking a table only when the UI can carry it out. A lock that cannot be read counts as
+    locked. Pure apart from job reads."""
+    try:
+        return _table_lock(migration_state, job_manager, session) is None
+    except Exception:  # noqa: BLE001 - unknown: do not offer an untick that may be locked
+        return False
 
 
 def _stored_exclusion_deploy_block(migration_state, job_manager, inventory, session, **kwargs):
@@ -4804,9 +5298,16 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
             engine.dispose()
     except Exception:  # noqa: BLE001 - advisory pre-flight; unknown never blocks
         return None
-    return binlog_resume_gap_reason(
+    reason = binlog_resume_gap_reason(
         watermark_file, retained, manual=(origin == "manual")
     )
+    if reason and cdc_start_rolled_back(migration_state):
+        # G25: either remedy takes a new start point, which this stack needs new CDC topics
+        # for -- that Start may have streamed into them.
+        from dsql_migrator.ui.cdc_gtid_gate import ROLLED_BACK_NEW_POINT
+
+        reason = f"{reason} {ROLLED_BACK_NEW_POINT}"
+    return reason
 
 
 def pg_objects_required_before_deploy(migration_state, job) -> bool:
@@ -4898,7 +5399,12 @@ def seed_refused_by_an_earlier_offer(migration_state, seed, source_type) -> Opti
     """Why a MySQL Start must refuse ``seed``: it is EARLIER than a seed an earlier Start
     already offered on this stack, which never streamed (a Start that failed after seeding).
     The seeder never rewinds, so that seed stays and this one would silently not apply.
-    ``None`` otherwise (and always once the stack streamed: cdc_start_resumes decides)."""
+    ``None`` otherwise (and always once the stack streamed: cdc_start_resumes decides).
+
+    The way on it names is one Start CDC takes (G25): "or later" only on a stack that has not
+    streamed -- after a Start CloudFormation rolled back, or with that Start's connectors in
+    place, a later point is refused too (:func:`newer_start_point_refusal`), so only that
+    offset, or new CDC topics, are named."""
     if source_type is SourceType.POSTGRES:
         return None
     if getattr(migration_state, "cdc_has_committed_offset", False):
@@ -4910,13 +5416,148 @@ def seed_refused_by_an_earlier_offer(migration_state, seed, source_type) -> Opti
         return None
     if offset_already_at_or_past({"file": f, "pos": int(pos)}, {"file": offered[0], "pos": int(offered[1])}):
         return None
+    way_on = (
+        "Start from that offset, or delete the CDC infrastructure and deploy it again to "
+        "start from another point."
+        if cdc_stack_has_streamed(migration_state)
+        else "Start from that offset or later, or delete the CDC infrastructure and deploy "
+        "again to start earlier."
+    )
     return (
         f"An earlier Start already offered the start offset {offered[0]}:{offered[1]} to "
         "this stack's seeder and did not complete; that offset stays seeded and the seeder "
         f"never rewinds, so starting from {f}:{int(pos)} would silently not apply -- the "
-        "changes in between would be skipped. Start from that offset or later, or delete "
-        "the CDC infrastructure and deploy again to start earlier. No connectors were "
-        "changed."
+        f"changes in between would be skipped. {way_on} No connectors were changed."
+    )
+
+
+def newer_start_point_refusal(
+    migration_state,
+    seed,
+    source_type,
+    *,
+    origin: str = "full_load",
+    job_watermark=None,
+    stack_params=None,
+    stack_status: Optional[str] = None,
+) -> "Optional[tuple[tuple[str, str, str, str], str]]":
+    """``(notice, line)`` when Start CDC must refuse this MySQL Start of ``seed``: it would move
+    a stack that has streamed FORWARD, past the start point it last started from (G25, decision
+    A2) -- else ``None`` (always for PostgreSQL: see
+    :func:`~dsql_migrator.ui.data_migration._cdc_status.newer_start_point`). ``notice`` is
+    ``(tone, icon, header, body)``; ``line`` its one-line form (the disabled Start's tooltip,
+    and the Start CDC job's error after "Start CDC blocked: ").
+
+    The backstop of the Full Load step's new-start-point gate, which a detour gets around (the
+    migration type switched to Full load only for a Re-run, then back, or to CDC only). Judged
+    on ``stack_params`` / ``stack_status`` -- the worker's fresh describe -- when given, else
+    on the stack-phase probe's cache. ``job_watermark`` is what Automatic would seed: a Manual
+    ``seed`` refused while Automatic would continue the stream says so. Pure."""
+    from dsql_migrator.ui.cdc_start_point_gate import (
+        newer_point_line,
+        newer_point_notice,
+        point_label,
+    )
+    from dsql_migrator.ui.data_migration._cdc_status import (
+        cdc_deployed_watermark,
+        cdc_has_committed_offset,
+        cdc_start_rolled_back,
+        newer_start_point,
+    )
+
+    if source_type is SourceType.POSTGRES:
+        return None
+    named = bool(getattr(migration_state, "cdc_connector_names", None))
+    if stack_params is not None:
+        facts = {
+            "has_committed_offset": cdc_has_committed_offset(stack_params),
+            "connectors_exist": named
+            or bool(str(stack_params.get("MskBootstrapServers", "") or "").strip()),
+            "rolled_back": (
+                str(stack_status).strip().upper().startswith("UPDATE_ROLLBACK")
+                if stack_status is not None
+                else cdc_start_rolled_back(migration_state)
+            ),
+            "deployed_watermark": cdc_deployed_watermark(stack_params),
+        }
+    else:
+        facts = {
+            "has_committed_offset": bool(
+                getattr(migration_state, "cdc_has_committed_offset", False)
+            ),
+            "connectors_exist": named
+            or getattr(migration_state, "cdc_stack_phase", None) == "running",
+            "rolled_back": cdc_start_rolled_back(migration_state),
+            "deployed_watermark": getattr(migration_state, "cdc_deployed_watermark", None),
+        }
+    offered = getattr(migration_state, "cdc_offered_seed", None)
+
+    def _judge(candidate):
+        return newer_start_point(
+            candidate, offered_seed=offered, source_type=source_type, **facts
+        )
+
+    newer = _judge(seed)
+    if newer is None:
+        return None
+    migration_type = getattr(migration_state, "migration_type", None)
+    # A Manual point refused where Automatic would continue this stream.
+    automatic_resumes = origin == "manual" and _judge(job_watermark) is None
+    if newer.rolled_back and newer.last is None:
+        # A first Start CloudFormation rolled back, whose offered start offset this process no
+        # longer holds (an app restart): no start point can be checked against it (G25).
+        return _offer_unknown_refusal(
+            point_label(seed, origin), migration_type, automatic_resumes=automatic_resumes
+        )
+    last = f"binlog {newer.last[0]}:{newer.last[1]}" if newer.last else None
+    notice = newer_point_notice(
+        point=point_label(seed, origin),
+        last=last,
+        rolled_back=newer.rolled_back,
+        migration_type=migration_type,
+        automatic_resumes=automatic_resumes,
+    )
+    return notice, newer_point_line(migration_type)
+
+
+def _offer_unknown_refusal(
+    point: str, migration_type, *, automatic_resumes: bool = False
+) -> "tuple[tuple[str, str, str, str], str]":
+    """A2's ``(notice, line)`` (:func:`newer_start_point_refusal`) on a MySQL stack whose first
+    Start CloudFormation rolled back, when the start offset that Start offered is not known
+    (G25). The rollback restored the stack's parameters, so the stack records only that it
+    rolled back a Start, and the app kept the offer in memory, which an app restart clears.
+    Every start point is refused then: none can be shown to be at or before that offer, while
+    that Start's source connector may have streamed past it into the CDC topics. Pure."""
+    from dsql_migrator.ui.cdc_start_point_gate import NEWER_POINT_HEADER, new_topics_route
+
+    body = (
+        "CloudFormation rolled back this stack's last Start, and the start offset that Start "
+        "offered is no longer known: the rollback restored the stack's parameters, and the "
+        f"app kept that offset only in memory, which an app restart clears. So {point} cannot "
+        "be shown to be at or before it, while that Start's source connector may have "
+        "streamed past it into this stack's CDC topics before the rollback removed it. Start "
+        "CDC does not move such a stack's position forward: its sink resumes from its last "
+        "commit, so a later start point would have it write those older changes over anything "
+        "loaded or corrected since, while the source would skip every change between where it "
+        "stopped and the new point — silently. To start CDC, use "
+        f"{new_topics_route(migration_type)}."
+    )
+    if automatic_resumes:
+        body += " To continue this stream instead, set the CDC start point back to Automatic."
+    route = (
+        "Delete CDC infrastructure and deploy it again, then Start CDC on the new stack"
+        if str(getattr(migration_type, "value", migration_type) or "") == "cdc_only"
+        else "Delete CDC infrastructure and deploy it again, then Re-run Full Load choosing "
+        "'Drop & reload', then Start CDC"
+    )
+    line = (
+        "This CDC stack's last Start rolled back and the start offset it offered is no longer "
+        f"known, so no start point can be checked against it: {route}. Nothing was changed."
+    )
+    return (
+        ("error", "fast_forward", NEWER_POINT_HEADER, body + " No connectors were changed."),
+        line,
     )
 
 
@@ -5217,7 +5858,10 @@ _PG_RESNAPSHOT_CAUSE: dict[str, tuple[str, str, str]] = {
         "A gapless resume IS available here -- this Full Load created the replication "
         "slot. Manual takes a fresh copy instead, which is a legitimate choice but reads "
         "the source again.",
-        "Switch the start point back to Automatic to resume from the slot with no re-read.",
+        # The control is on the CDC start point card (PG_RESUME_FROM_SLOT_ACTION, G25):
+        # PostgreSQL has no start-point radio.
+        "Switch the start point back to Automatic to resume from the slot with no re-read: "
+        "use \"Resume from the Full Load's slot instead\" on the CDC start point card.",
     ),
     "no_watermark": (
         "This CDC start will snapshot every selected table first",
@@ -5256,7 +5900,8 @@ _PG_RESNAPSHOT_BRIEF: dict[str, str] = {
     "manual": (
         "This start re-snapshots instead of resuming from the slot this load created, so "
         "every selected table is read again. Switch the start point back to Automatic to "
-        "resume with no re-read."
+        "resume with no re-read (\"Resume from the Full Load's slot instead\" on the CDC start "
+        "point card)."
     ),
     "no_watermark": (
         "There is no Full Load watermark to resume from, so every selected table is "
@@ -5308,8 +5953,214 @@ def pg_resnapshot_notice(
     return header, " ".join((cause, lossless, cost, remedy))
 
 
+def _pg_start_rolled_back(migration_state) -> bool:
+    """Did CloudFormation roll back this cdc-stack's last update -- a Start's? (G25) Its
+    status as the stack-phase probe last read it (the same describe as the phase): ANY
+    ``UPDATE_ROLLBACK_*`` -- complete, still in progress, or failed (an unstable status keeps
+    the tool's unstable-stack handling; only the started rule reads it here). Only a Start
+    updates an infra stack (Stop changes nothing on one; on a stack with connectors the
+    update was a Stop's or a Retry's, started either way), and the rollback restores the
+    parameters it had before, so ``DeploySink`` and ``MskBootstrapServers`` no longer say so.
+    That Start's source connector may have streamed, and committed an offset, before the
+    rollback deleted it: Debezium continues from that offset, so a re-snapshot would be
+    skipped. The CDC topics outlive the rollback and may hold changes it streamed that no
+    sink applied: the next sink applies them first, so a retry is gapless only while the
+    topics still retain them, and a Full Load re-run on this stack would have them applied
+    over the reloaded tables (the route rule, :func:`~dsql_migrator.core.cdc_pg_slot.pg_cdc_route`,
+    names new topics instead). The engine-neutral reading lives in
+    :func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_start_rolled_back`. Pure."""
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_start_rolled_back
+
+    return cdc_start_rolled_back(migration_state)
+
+
+def _pg_stack_started(migration_state) -> bool:
+    """Were this cdc-stack's connectors started before? (G25) Read from its CloudFormation
+    parameters and status as the stack-phase probe last described them (one describe):
+    started, then stopped
+    (:func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_has_committed_offset`:
+    ``DeploySink="true"`` with a blank ``MskBootstrapServers``), connectors in place
+    (``MskBootstrapServers`` set, the ``running`` phase, where Retry CDC re-creates a missing
+    one; or this stack's connectors detected on MSK Connect, whatever the stack status -- a
+    rollback that failed or is still running leaves them), or a Start whose update
+    CloudFormation rolled back (:func:`_pg_start_rolled_back`: any rollback status). The
+    PostgreSQL slot-position check judges only a stack for which none of these holds: its
+    FIRST Start; and the route rule (:func:`~dsql_migrator.core.cdc_pg_slot.pg_cdc_route`)
+    gives a stack for which any holds new topics first -- its topics may hold changes no sink
+    applied -- and never the re-snapshot remedy. Nothing is kept beside what the stack
+    records, so a Start a check refused, one that failed before it updated the stack, an app
+    restart and Start over all leave the next Start judged the same way. Residual, like a slot
+    re-created after this stack streamed (each migration needs its own CDC stack name): another
+    migration re-creates the slot after this stack's first Start rolled back. The same answer,
+    for either engine, is :func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_stack_has_streamed`
+    -- what the Full Load step gates a new start point on. Pure (state reads only)."""
+    from dsql_migrator.ui.data_migration._cdc_status import cdc_stack_has_streamed
+
+    return cdc_stack_has_streamed(migration_state)
+
+
+# The Start CDC dialog's notice, and the activity line of the dialog and of the worker, when
+# the publication/slot pre-flight could not read the source at all (G25): that does not
+# block, but it is never silent either.
+PG_CHECKS_NOT_RUN_HEADER = "CDC's publication and replication slot could not be checked"
+PG_CHECKS_NOT_RUN_ACTION = "PostgreSQL publication and slot checks not run"
+# The Start CDC dialog's lead for the refusal of the Start its re-snapshot remedy would
+# unlock, shown instead of that remedy (G25); the refusal's own body follows.
+PG_RESNAPSHOT_REFUSED_LEAD = (
+    "Re-snapshot every table is not offered here: a Start that re-snapshots is refused too."
+)
+# The Start CDC dialog's notice, and its activity line, when only the second read -- the
+# checks of the Start the re-snapshot remedy would unlock -- could not read the source (G25):
+# the publication and slot checks before it ran, and the block they produced stands.
+PG_RESNAPSHOT_NOT_CHECKED_HEADER = "The re-snapshot route could not be checked"
+PG_RESNAPSHOT_NOT_CHECKED_ACTION = "PostgreSQL re-snapshot route check not run"
+
+
+def _pg_checks_not_run_reason(session, exc: BaseException) -> str:
+    """Why the PostgreSQL publication/slot pre-flight could not read the source: a short,
+    value-free phrase (an exception class name at most, never its message: it can carry a
+    host or a user name -- Property 7). Pure."""
+    if getattr(session, "source_password", None) is None:
+        if getattr(session, "source_secret_id", None):
+            return (
+                "this session holds no source credentials: the Secrets Manager secret is "
+                "read when the source connection is tested, and an app restart clears it"
+            )
+        return "this session holds no source password: an app restart clears it"
+    return f"the connection failed: {type(exc).__name__[:64]}"
+
+
+def pg_checks_not_run_body(reason: str) -> str:
+    """The Start CDC dialog's notice body for a pre-flight that could not read the source
+    (:data:`PG_CHECKS_NOT_RUN_HEADER`). Pure."""
+    return (
+        f"Start CDC could not read the PostgreSQL source ({reason}), so it did not check "
+        "CDC's publication and replication slot, nor which captured tables have inheritance "
+        "child tables. Start CDC is not blocked on that, but what those checks catch would go "
+        "unnoticed: a replication slot another run with the same CDC stack name re-created "
+        "(the changes in between would be skipped), or a snapshot that copies inheritance "
+        "child tables' rows into their parent. Test the source connection on the Connect "
+        "step, then open Start CDC again so they run."
+    )
+
+
+def pg_resnapshot_not_checked_body(reason: str) -> str:
+    """The Start CDC dialog's notice body when only the re-snapshot route's own read could not
+    reach the source (:data:`PG_RESNAPSHOT_NOT_CHECKED_HEADER`, G25). Pure."""
+    return (
+        "Start CDC checked CDC's publication and replication slot, but could not read the "
+        f"PostgreSQL source again ({reason}) to check the Start that \"Re-snapshot every table "
+        "instead\" unlocks (snapshot.mode=initial): above all which captured tables have "
+        "inheritance child tables, whose rows that snapshot would copy into their parent. The "
+        "remedy is still offered; the Start CDC job runs those checks before it creates any "
+        "connector, and goes ahead without them if it cannot read the source either."
+    )
+
+
+def _pg_block_route(
+    migration_state, block: Optional[str], *, resnapshot: Optional[str] = None
+) -> str:
+    """The way out of PostgreSQL block ``block`` for this migration's CDC stack: the route
+    rule's (:func:`~dsql_migrator.core.cdc_pg_slot.pg_cdc_route`, G25), fed from what the stack
+    records (:func:`_pg_stack_started`) and the migration type -- the one derivation the Start
+    CDC dialog, its withheld re-snapshot notice and the Start CDC job all use, so no surface
+    names a route of its own. ``resnapshot``: the re-snapshot remedy's standing on a stack never
+    started (``None``: not judged here). Pure (state reads only)."""
+    from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
+
+    return pg_cdc_route(
+        block,
+        started=_pg_stack_started(migration_state),
+        cdc_only=getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY,
+        resnapshot=resnapshot,
+    )
+
+
+def _with_route(body: str, route: str) -> str:
+    """``body`` followed by ``route``, when there is one. Pure."""
+    return f"{body} {route}" if route else body
+
+
+def _probe_pg_resume_slot(
+    migration_state, session, watermark, *, on_unread: Optional[Callable[[str], None]] = None
+) -> Optional[tuple]:
+    """Read-only: is the slot a resumed PostgreSQL Start continues from usable? (blocking)
+
+    For a Start the publication/slot probe does not check the slot for -- ``snapshot.mode=
+    initial`` on a stack whose connectors were started before (:func:`_pg_objects_gate_block`).
+    The slot is the one the connector is given (the SAME fallback ``dispatch_source_config``
+    uses). Returns the block's ``(header, body)`` when the source has no usable slot of that
+    name, else None -- None too when the catalog cannot be read, the probe's own rule
+    (:func:`_probe_pg_replication_objects`: no block, and ``on_unread`` is told why). A
+    same-named slot that exists but is unusable is that probe's block, which fires whatever
+    the mode.
+
+    Blocking I/O: callers MUST run it via ``run.io_bound``.
+    """
+    source_config = getattr(session, "source_config", None)
+    if source_config is None:
+        return None
+    stack = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    try:
+        from dsql_migrator.core import cdc_pg_slot as _pg
+        from dsql_migrator.ui.connect import make_source_engine_factory
+
+        slot = getattr(watermark, "slot_name", None) or _pg.pg_slot_name(stack)
+        pub = getattr(watermark, "publication_name", None) or _pg.pg_publication_name(stack)
+        engine = make_source_engine_factory(getattr(session, "source_password", None))(
+            source_config
+        )
+        try:
+            with engine.connect() as connection:
+                objects = _pg.read_pg_replication_objects(
+                    connection, publication_name=pub, slot_name=slot
+                )
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - unreadable is NOT absent: no block, but say so
+        if on_unread is not None:
+            on_unread(_pg_checks_not_run_reason(session, exc))
+        return None
+    if objects.slot_usable:
+        return None
+    # Worded like the start line and the CDC card (G25): the stack records that its
+    # connectors were started, not that its source connector streamed -- and a slot dropped
+    # since it streamed looks exactly like one a task that failed first never created. So
+    # the block states both outcomes and stays closed for both.
+    return (
+        _pg.SLOT_MISSING_HEADER,
+        f"The source has no usable logical pgoutput slot named '{slot}' in this database. If "
+        "this stack's source connector streamed, Start CDC continues the position it "
+        "recorded in that slot, and a slot cannot be created at a past position: the "
+        "connector would create one at the CURRENT WAL and silently skip every change "
+        "committed since streaming stopped. If it never streamed (its task failed, or CDC "
+        "was stopped, before its snapshot completed, for example before it created the "
+        "slot), the Start would snapshot every selected table first, with no gap. The stack "
+        "does not record which, so Start CDC is blocked either way.",
+    )
+
+
+# The inheritance block's way back to the Full Load's slot (G25), when this Start snapshots only
+# because "Re-snapshot every table instead" was taken (a PostgreSQL Manual start mode) and the
+# Full Load recorded a slot: the CDC start point card's control sets the mode back to Automatic.
+PG_RESUME_FROM_SLOT_ACTION = "Resume from the Full Load's slot instead"
+PG_RESUME_FROM_SLOT_HINT = (
+    "This Start snapshots only because \"Re-snapshot every table instead\" was chosen, and "
+    "this migration's Full Load recorded a slot to resume from: use \""
+    + PG_RESUME_FROM_SLOT_ACTION
+    + "\" on the CDC start point card, then Start CDC again."
+)
+
+
 def _pg_objects_gate_block(
-    migration_state, session, inventory, watermark
+    migration_state,
+    session,
+    inventory,
+    watermark,
+    *,
+    on_unread: Optional[Callable[[str], None]] = None,
+    force_initial: Optional[bool] = None,
+    untick: bool = True,
 ) -> Optional[tuple]:
     """The publication/slot gate, run with the SAME inputs the connector config will get.
 
@@ -5337,33 +6188,127 @@ def _pg_objects_gate_block(
     that the start-position radio and session restore never set. The gate then waved through
     the one combination it exists to stop.
 
+    The slot-position check judges only the stack's FIRST Start (G25): a stack whose
+    CloudFormation record shows no Start of its connectors (:func:`_pg_stack_started`: none
+    stopped, in place or rolled back). Stateless, so nothing a refused Start did, nor a
+    restart, changes the verdict.
+
+    ``force_initial`` judges the Start the dialog's "Re-snapshot every table instead" would
+    unlock (``True``: Manual, ``snapshot.mode=initial``) instead of the one the start mode
+    sends now, so that remedy is offered only when its own route's checks pass (G25).
+
+    ``untick`` (G25): the table set can still change, so the inheritance block also names
+    unticking the parent -- the Start CDC dialog passes the table picker's own lock, the Start
+    CDC job ``False`` (a submitted Start fixes the set). When this Start snapshots only because
+    the re-snapshot remedy was taken over a slot the Full Load recorded, that block names the
+    way back to it (:data:`PG_RESUME_FROM_SLOT_HINT`), so a recorded Manual mode never loops it.
+
+    When the source cannot be read at all, nothing blocks -- a missing publication makes the
+    connector die loudly -- but the checks that catch a SILENT loss did not run either, so
+    ``on_unread`` is told why (G25): the Start dialog shows a warning and the worker writes an
+    activity line. Never silent.
+
+    A Start on a stack that was started and then stopped (:func:`cdc_start_resumes`: its
+    offset is committed) continues from its slot WHATEVER ``snapshot.mode`` it sends: once
+    the source connector has streamed, Debezium skips ``initial``'s snapshot too
+    (live-checked on the shipped Debezium 2.7.4, 2026-10-09), so a missing slot is re-created
+    at the CURRENT WAL and every change since streaming stopped is skipped. The probe checks
+    the slot only for ``never``, so :func:`_probe_pg_resume_slot` checks it for the other
+    modes there. Every block on a stack whose connectors were started before
+    (:func:`_pg_stack_started`: stopped since, in place, or created by a Start CloudFormation
+    rolled back, any rollback status) names the route rule's one route, new CDC topics first
+    (:func:`_pg_block_route`, G25): its topics may hold changes no sink applied -- Stop CDC and
+    a rollback remove the connectors without draining them -- which its sink would apply over a
+    Full Load re-run on them, and "Re-snapshot every table instead" would not snapshot there.
+    The inheritance block, whose own fix runs a Full Load, is told to get new topics first, and
+    so is the publish list's block after its own fix; a failed inheritance read keeps its own
+    fix alone. A stack never
+    started gets its route where the re-snapshot remedy's standing is known: the Start CDC
+    dialog and the Start CDC job add it. A rolled-back stack's slot is not read for the other
+    modes: that Start's source connector may have died before it created the slot, and an
+    absent slot is then no gap (the Start snapshots). Residual,
+    documented beside the same-stack-name one: that connector streamed and committed an
+    offset, and the slot was dropped since -- the Start would continue from the offset on a
+    slot created at the current WAL.
+
     Blocking source I/O: callers MUST run it via ``run.io_bound``.
     """
     tables = _cdc_tables_for_config(migration_state, inventory, watermark)
-    resume_override, force_initial = _cdc_resume_signal(migration_state, session)
+    resume_override, mode_forces_initial = _cdc_resume_signal(migration_state, session)
     snapshot_mode = pg_snapshot_mode(
         watermark,
         resume_override=resume_override,
-        force_initial_snapshot=force_initial,
+        force_initial_snapshot=(
+            mode_forces_initial if force_initial is None else force_initial
+        ),
     )
-    return _probe_pg_replication_objects(
+    # Why the source could not be read, at most once: a second read of a source the first
+    # could not reach is not tried.
+    unread: list[str] = []
+    verdict = _probe_pg_replication_objects(
         migration_state,
         session,
         tables,
         watermark,
         snapshot_mode=snapshot_mode,
+        on_unread=unread.append,
+        # Passed only for a locked table set: the probe's default is the editable one.
+        **({} if untick else {"untick": False}),
     )
+    resumes = _cdc_source_type(session) is SourceType.POSTGRES and cdc_start_resumes(
+        migration_state, watermark, SourceType.POSTGRES
+    )
+    if resumes and verdict is None and snapshot_mode != "never" and not unread:
+        verdict = _probe_pg_resume_slot(
+            migration_state, session, watermark, on_unread=unread.append
+        )
+    if unread and on_unread is not None:
+        on_unread(unread[0])
+    if (
+        verdict is not None
+        and _cdc_source_type(session) is SourceType.POSTGRES
+        and _pg_stack_started(migration_state)
+    ):
+        # A stack started before: the route rule's one route, new topics first (G25).
+        route = _pg_block_route(migration_state, verdict[0])
+        verdict = (verdict[0], _with_route(verdict[1], route))
+    elif (
+        verdict is not None
+        and force_initial is None
+        and mode_forces_initial
+        and getattr(watermark, "slot_name", None)
+    ):
+        from dsql_migrator.core.cdc_pg_slot import INHERITANCE_SNAPSHOT_HEADER
+
+        if verdict[0] == INHERITANCE_SNAPSHOT_HEADER:
+            # A stack never started whose Start snapshots only because the re-snapshot remedy
+            # was taken, over a slot its Full Load recorded (G25): its way back is the Full
+            # Load's slot -- the Start the block itself names -- through the card's control.
+            verdict = (verdict[0], f"{verdict[1]} {PG_RESUME_FROM_SLOT_HINT}")
+    return verdict
 
 
 def _probe_pg_replication_objects(
-    migration_state, session, tables, watermark, *, snapshot_mode: str = "never"
+    migration_state,
+    session,
+    tables,
+    watermark,
+    *,
+    snapshot_mode: str = "never",
+    on_unread: Optional[Callable[[str], None]] = None,
+    untick: bool = True,
 ) -> Optional[tuple]:
     """Read-only: do CDC's publication + slot exist on the PostgreSQL source? (blocking)
 
+    ``untick``: the table set can still change (the blocker's inheritance block names
+    unticking the parent only then, G25).
+
     Returns the blocker's ``(header, body)`` or None. Fails CLOSED on "the catalog says
     absent/incomplete" and OPEN on "I could not ask" -- unreadable is not evidence of
-    absence, and a missing publication makes the connector die LOUDLY anyway. Same
-    degrade-to-silence discipline as :func:`_probe_binlog_resume_gap`.
+    absence, and a missing publication makes the connector die LOUDLY anyway. But the slot
+    position and the inheritance read guard against SILENT losses, so an open failure is
+    never silent: ``on_unread`` is told why the source could not be read
+    (:func:`_pg_checks_not_run_reason`, G25).
 
     The object names come from the SAME fallback ``dispatch_source_config`` uses (recorded
     on the watermark, else derived from the stack name), so the probe can never check a
@@ -5380,6 +6325,10 @@ def _probe_pg_replication_objects(
     if source_config is None:
         return None
     stack = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    names = [getattr(t, "name", str(t)) for t in (tables or [])]
+    # A Start that snapshots reads each captured table without ONLY, so the read also asks
+    # which of them have inheritance child tables (G25).
+    snapshots = snapshot_mode == "initial"
     try:
         from dsql_migrator.core import cdc_pg_slot as _pg
         from dsql_migrator.ui.connect import make_source_engine_factory
@@ -5397,9 +6346,13 @@ def _probe_pg_replication_objects(
                 objects = _pg.read_pg_replication_objects(
                     connection, publication_name=pub, slot_name=slot
                 )
+                if snapshots:
+                    objects = _pg.with_inheritance_children(connection, objects, names)
         finally:
             engine.dispose()
-    except Exception:  # noqa: BLE001 - unreadable is NOT absent; degrade to silence
+    except Exception as exc:  # noqa: BLE001 - unreadable is NOT absent: no block, but say so
+        if on_unread is not None:
+            on_unread(_pg_checks_not_run_reason(session, exc))
         return None
     # MIRROR build_pg_source_config's two decisions exactly, or this refuses a
     # configuration that would have worked -- or, worse, passes one that cannot. Both are
@@ -5412,11 +6365,18 @@ def _probe_pg_replication_objects(
     )
     return _pg.pg_replication_objects_blocker(
         objects,
-        [getattr(t, "name", str(t)) for t in (tables or [])],
+        names,
         resumes_from_slot=(
             bool(getattr(watermark, "slot_name", None)) and snapshot_mode == "never"
         ),
         connector_autocreates_publication=autocreates,
+        # G25: on the stack's FIRST Start the slot must still be at the watermark's LSN
+        # (another run with the same stack name may have re-created it). Judged by what the
+        # stack records (_pg_stack_started), never by anything this process kept.
+        start_lsn=getattr(watermark, "wal_lsn", None),
+        stack_started=_pg_stack_started(migration_state),
+        snapshots=snapshots,
+        untick=untick,
     )
 
 
@@ -5449,6 +6409,20 @@ async def _open_cdc_start_dialog(
     binlog_gap: Optional[str] = None
     fk_block = None
     pg_objects_block: Optional[tuple] = None
+    # The same gate for the Start the block's re-snapshot remedy would unlock (G25).
+    pg_resnapshot_block: Optional[tuple] = None
+    # Why the PostgreSQL publication/slot gate could not read the source, if it could not.
+    pg_unread: list[str] = []
+    # ...and why the re-snapshot route's own read could not (G25): the gate's checks ran then.
+    pg_resnapshot_unread: list[str] = []
+    # A PostgreSQL stack whose connectors were started before (stopped since, in place, or a
+    # Start that CloudFormation rolled back, G25) continues from its slot whatever the Start
+    # sends, so the re-snapshot remedy would NOT snapshot there: Start would go ahead and skip
+    # every change since streaming stopped. Its block names the route rule's one route itself
+    # (the gate's same test, _pg_stack_started), and no remedy is offered here.
+    _pg_resumes = _cdc_source_type(session) is SourceType.POSTGRES and _pg_stack_started(
+        migration_state
+    )
     # The MySQL start-point check (cdc_start_point_gate): its verdict and notice.
     sp_verdict = None
     sp_notice: Optional[tuple] = None
@@ -5466,12 +6440,37 @@ async def _open_cdc_start_dialog(
         if job_manager is not None
         else []
     )
+    # G25 (A2): a MySQL Start that would move a stack that has streamed FORWARD, past where it
+    # last started -- refused (no I/O; the job judges it again against a fresh describe). The
+    # start-position probes below are then skipped: no start from this point can run here.
+    newer: Optional[tuple] = None
+    # The stack's last Start CloudFormation rolled back (G25): a refusal's remedy that takes a
+    # new start point runs on a new stack.
+    _rolled_back = cdc_start_rolled_back(migration_state)
+    if job_manager is not None and _cdc_source_type(session) is not SourceType.POSTGRES:
+        try:
+            _a2_wm = _cdc_watermark(
+                _current_job(job_manager, migration_state.job_id), migration_state
+            )
+            _a2_seed, _a2_origin = _cdc_start_seed(
+                migration_state, _a2_wm, _cdc_source_type(session)
+            )
+            newer = newer_start_point_refusal(
+                migration_state, _a2_seed, _cdc_source_type(session), origin=_a2_origin,
+                job_watermark=_a2_wm,
+            )
+        except Exception:  # noqa: BLE001 - unknown here, like the probes; the job re-checks
+            newer = None
     if job_manager is not None and not _uncovered:
         from nicegui import run
 
         try:
-            binlog_gap = await run.io_bound(
-                _probe_binlog_resume_gap, migration_state, job_manager, session
+            binlog_gap = (
+                None
+                if newer is not None
+                else await run.io_bound(
+                    _probe_binlog_resume_gap, migration_state, job_manager, session
+                )
             )
         except Exception:  # noqa: BLE001 - advisory only; never block the dialog
             binlog_gap = None
@@ -5504,7 +6503,7 @@ async def _open_cdc_start_dialog(
             # Checked against the start point's fingerprint with one bounded catalog read;
             # a resume (schema_only) or a stack with connectors is not checked. Blocking
             # source I/O -> run.io_bound; the job re-checks on its worker thread.
-            if _cdc_source_type(session) is not SourceType.POSTGRES:
+            if _cdc_source_type(session) is not SourceType.POSTGRES and newer is None:
                 # G19: on a gtid_mode=ON source Debezium starts after the GTID set seeded
                 # with the start point, so a start point it cannot start exactly at is
                 # refused here too (one bounded read; the job re-checks on its worker).
@@ -5541,6 +6540,7 @@ async def _open_cdc_start_dialog(
                         coord=_g_coord,
                         origin=_g_origin,
                         migration_type=getattr(migration_state, "migration_type", None),
+                        rolled_back=_rolled_back,
                     )
                 try:
                     _sp_seed, _sp_origin, _sp_facts, _sp_mode, _sp_tables = (
@@ -5576,6 +6576,9 @@ async def _open_cdc_start_dialog(
                         # A checked resume (history missing) reads from the stack's own
                         # position, not from the start point it is compared with.
                         resumes=bool(getattr(_sp_facts, "resumes", False)),
+                        # G25: a start point after the change needs new CDC topics on a
+                        # stack whose connectors were started.
+                        streamed=_rolled_back or cdc_stack_has_streamed(migration_state),
                     )
             # CDC only: list the overlay ALTERs Start CDC runs before any connector (one
             # live read). Full load + CDC reads nothing here: after the load they are
@@ -5590,18 +6593,69 @@ async def _open_cdc_start_dialog(
                         )
                     except Exception:  # noqa: BLE001 - unknown: the job re-reads and blocks
                         overlay_changes = _OVERLAY_UNREAD
+        # Whether the inheritance block may name unticking the parent: only while the table
+        # picker can still change the set (G25).
+        _pg_untick = _cdc_source_type(session) is SourceType.POSTGRES and _table_set_open(
+            migration_state, job_manager, session
+        )
         # The PostgreSQL publication/slot precondition. Checked HERE, before the operator
         # pays: starting without it deploys both connectors and the Debezium task dies on
         # "Publication autocreation is disabled" -- after the cdc-stack update. Blocking
-        # source I/O -> run.io_bound, never on the loop.
+        # source I/O -> run.io_bound, never on the loop. A source it cannot read does not
+        # block, and is never silent either (G25): ``pg_unread`` gets why, shown below.
         try:
             _job2 = _current_job(job_manager, migration_state.job_id)
+            _pg_wm = _cdc_watermark(_job2, migration_state)
             pg_objects_block = await run.io_bound(
                 _pg_objects_gate_block,
-                migration_state, session, inventory, _cdc_watermark(_job2, migration_state),
+                migration_state, session, inventory, _pg_wm,
+                on_unread=pg_unread.append, untick=_pg_untick,
             )
         except Exception:  # noqa: BLE001 - unreadable is not absent; never block on it
             pg_objects_block = None
+        # The block's "Re-snapshot every table instead" unlocks a Start that sends
+        # snapshot.mode=initial, whose route has checks of its own -- the inheritance read
+        # first, which a never-mode gate skips (G25). So that Start is judged too, before the
+        # remedy is offered: its refusal is shown instead (the job is still the backstop).
+        # Its read keeps its own reason: the block above came from checks that DID run.
+        if pg_objects_block is not None and not _pg_resumes:
+            from dsql_migrator.core.cdc_pg_slot import BLOCKS_WITH_THEIR_OWN_FIX
+
+            if pg_objects_block[0] not in BLOCKS_WITH_THEIR_OWN_FIX:
+                try:
+                    pg_resnapshot_block = await run.io_bound(
+                        _pg_objects_gate_block,
+                        migration_state, session, inventory, _pg_wm,
+                        on_unread=pg_resnapshot_unread.append, force_initial=True,
+                        untick=_pg_untick,
+                    )
+                except Exception:  # noqa: BLE001 - unknown, like the gate; the job re-checks
+                    pg_resnapshot_block = None
+        if pg_unread and not conn_blocker:
+            _log_cdc_event(
+                PG_CHECKS_NOT_RUN_ACTION,
+                status=ActivityStatus.WARNING,
+                detail=(
+                    f"could not read the PostgreSQL source before Start CDC ({pg_unread[0]}), "
+                    "so its publication, replication slot and inheritance checks did not "
+                    "run; the Start CDC job tries them again before it creates any "
+                    "connector, and goes ahead without them if it cannot read the source "
+                    "either"
+                ),
+            )
+        elif pg_resnapshot_unread and not conn_blocker:
+            _log_cdc_event(
+                PG_RESNAPSHOT_NOT_CHECKED_ACTION,
+                status=ActivityStatus.WARNING,
+                detail=(
+                    "could not read the PostgreSQL source a second time before Start CDC "
+                    f"({pg_resnapshot_unread[0]}), so the checks of the Start that "
+                    "'Re-snapshot every table instead' unlocks (its inheritance read) did not "
+                    "run; the publication and replication slot checks ran. The Start CDC job "
+                    "runs them before it creates any connector, and goes ahead without them if "
+                    "it cannot read the source either"
+                ),
+            )
     with ui.dialog() as dialog, ui.card().classes("gap-2").style("min-width: 460px"):  # type: ignore[attr-defined]
         ui.label("Start CDC — create connectors").classes("text-lg font-semibold")  # type: ignore[attr-defined]
         ui.label(  # type: ignore[attr-defined]
@@ -5636,6 +6690,10 @@ async def _open_cdc_start_dialog(
                 header="The start point's binary log has been purged",
                 body=binlog_gap,
             )
+        if newer is not None:
+            _render_notice(
+                ui, tone=newer[0][0], icon=newer[0][1], header=newer[0][2], body=newer[0][3]
+            )
         _gtid_blocks = bool(getattr(gtid_verdict, "blocks", False))
         if gtid_notice is not None:
             _render_notice(
@@ -5649,6 +6707,27 @@ async def _open_cdc_start_dialog(
                 body=sp_notice[3],
             )
         _render_cdc_overlay_changes(ui, overlay_changes)
+        if pg_unread and not conn_blocker:
+            # The publication/slot gate could not read the source (G25): Start stays enabled
+            # -- a missing publication or slot stops the connector loudly -- but the checks
+            # against a silent loss did not run, and the operator sees which, and why.
+            _render_notice(
+                ui,
+                tone="warning",
+                icon="sync_problem",
+                header=PG_CHECKS_NOT_RUN_HEADER,
+                body=pg_checks_not_run_body(pg_unread[0]),
+            )
+        elif pg_resnapshot_unread and not conn_blocker:
+            # Only the re-snapshot route's own read failed (G25): the block below came from
+            # checks that ran, and its remedy stays offered, unchecked -- said as exactly that.
+            _render_notice(
+                ui,
+                tone="warning",
+                icon="sync_problem",
+                header=PG_RESNAPSHOT_NOT_CHECKED_HEADER,
+                body=pg_resnapshot_not_checked_body(pg_resnapshot_unread[0]),
+            )
         # The PostgreSQL publication/slot block, with its remedy in the SAME dialog (same
         # shape as the FK slot below): a block whose only advice is "re-run the whole Full
         # Load" is a dead end, and the pre-flight results just computed would be thrown
@@ -5660,6 +6739,51 @@ async def _open_cdc_start_dialog(
         _pg_state = {"resolved": False}
         if pg_objects_block is not None:
             pg_slot_area = ui.column().classes("w-full gap-2")  # type: ignore[attr-defined]
+            from dsql_migrator.core.cdc_pg_slot import (
+                BLOCKS_WITH_THEIR_OWN_FIX,
+                RESNAPSHOT_REFUSED,
+            )
+
+            # No remedy on a stack started before (_pg_resumes: the gate named its route), nor
+            # for a block that names its own fix: a re-snapshot repairs neither
+            # (cdc_pg_slot.BLOCKS_WITH_THEIR_OWN_FIX, G25).
+            _pg_judged = (
+                not _pg_resumes and pg_objects_block[0] not in BLOCKS_WITH_THEIR_OWN_FIX
+            )
+            _pg_block_body = pg_objects_block[1]
+            if not _pg_resumes and not _pg_judged:
+                # A block that names its own fix, on a stack never started (G25): the route
+                # rule's way out after it -- a Full Load re-run after a narrowed publish list
+                # is set back; nothing for a failed inheritance read, nor for the inheritance
+                # block of this Start, whose own fix stands alone.
+                _pg_block_body = _with_route(
+                    _pg_block_body, _pg_block_route(migration_state, pg_objects_block[0])
+                )
+            _pg_refusal: Optional[tuple] = None
+            if _pg_judged and pg_resnapshot_block is not None:
+                # The re-snapshot's own Start is refused too (G25), so it is not offered, and
+                # the route rule's way out follows: after the block itself when refused for the
+                # same reason (a publication that misses a table, say), else after the refusal,
+                # shown in a notice of its own.
+                if pg_resnapshot_block[0] == pg_objects_block[0]:
+                    _pg_block_body = _with_route(
+                        _pg_block_body,
+                        _pg_block_route(
+                            migration_state, pg_objects_block[0], resnapshot=RESNAPSHOT_REFUSED
+                        ),
+                    )
+                else:
+                    _pg_refusal = (
+                        pg_resnapshot_block[0],
+                        _with_route(
+                            f"{PG_RESNAPSHOT_REFUSED_LEAD} {pg_resnapshot_block[1]}",
+                            _pg_block_route(
+                                migration_state,
+                                pg_resnapshot_block[0],
+                                resnapshot=RESNAPSHOT_REFUSED,
+                            ),
+                        ),
+                    )
 
             def _render_pg_block() -> None:
                 pg_slot_area.clear()
@@ -5669,8 +6793,20 @@ async def _open_cdc_start_dialog(
                         tone="error",
                         icon="sync_problem",
                         header=pg_objects_block[0],
-                        body=pg_objects_block[1],
+                        body=_pg_block_body,
                     )
+                    if not _pg_judged:
+                        return
+                    if pg_resnapshot_block is not None:
+                        if _pg_refusal is not None:
+                            _render_notice(
+                                ui,
+                                tone="error",
+                                icon="restart_alt",
+                                header=_pg_refusal[0],
+                                body=_pg_refusal[1],
+                            )
+                        return
                     _render_notice(
                         ui,
                         tone="info",
@@ -5692,7 +6828,9 @@ async def _open_cdc_start_dialog(
                         # "manual" is the WHOLE decision now: it forces
                         # snapshot.mode=initial, from which publication.autocreate.mode
                         # =filtered is derived, so the connector's own DB user creates the
-                        # publication. There is no second flag to forget.
+                        # publication. There is no second flag to forget. That Start's own
+                        # checks passed when the dialog opened (pg_resnapshot_block), so the
+                        # notice below may say it is unlocked; the job checks it again.
                         migration_state.set_cdc_start_mode("manual")
                         _pg_state["resolved"] = True
                         pg_slot_area.clear()
@@ -5782,7 +6920,12 @@ async def _open_cdc_start_dialog(
                         # A start-point refusal (G5 or the GTID check) still stands after the
                         # FKs are gone, so the notice claims "ready" only when Start is
                         # really unlocked.
-                        _unlocks = not conn_blocker and not _sp_blocks and not _gtid_blocks
+                        _unlocks = (
+                            not conn_blocker
+                            and not _sp_blocks
+                            and not _gtid_blocks
+                            and newer is None
+                        )
                         fk_slot.clear()
                         with fk_slot:
                             _render_notice(
@@ -5801,7 +6944,8 @@ async def _open_cdc_start_dialog(
                                     '"Apply foreign keys" once the stream has drained.'
                                     + (
                                         ""
-                                        if _unlocks or not (_sp_blocks or _gtid_blocks)
+                                        if _unlocks
+                                        or not (_sp_blocks or _gtid_blocks or newer)
                                         else " Start CDC stays blocked by the start-point "
                                         "notice above."
                                     )
@@ -5851,6 +6995,10 @@ async def _open_cdc_start_dialog(
                 start_btn.props("disable")
                 start_btn.tooltip(start_uncovered_body(
                     _uncovered, getattr(migration_state, "migration_type", None)))
+            elif newer is not None:
+                # Hard block (G25, A2): the sink would apply older changes over newer rows.
+                start_btn.props("disable")
+                start_btn.tooltip(newer[1])
             elif fk_block is not None:
                 # Hard block: an enforced FK makes the stream discard child rows
                 # silently, so Start stays unavailable until the FKs are gone.
@@ -5914,16 +7062,49 @@ def _open_cdc_stop_dialog(
         # connectors are deleted) is wrong. That guess is expensive: it invites re-entering
         # coordinates by hand, or re-running the Full Load, to recover something the
         # connector never lost.
+        _is_pg = _cdc_source_type(session) is SourceType.POSTGRES
+        # The resume is gapless only while the CDC topics retain what the sink had not
+        # applied (G25): Stop deletes the source and the sink in parallel, with no drain, and
+        # the sink resumes from its last commit -- both engines. PostgreSQL also names the
+        # route rule's way out past that period, as the resume cards do.
+        if _is_pg:
+            from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
+
+            _topics = (
+                f"{_STOP_TOPICS_CONDITION}: once their retention period on MSK has passed, a "
+                "Start would skip them, so instead "
+                + pg_cdc_route(
+                    None,
+                    started=True,
+                    cdc_only=getattr(migration_state, "migration_type", None)
+                    is MigrationType.CDC_ONLY,
+                )
+                + "."
+            )
+        else:
+            _topics = f"{_STOP_TOPICS_CONDITION} (their retention period on MSK)."
         body = (
             f"This updates the cdc-stack '{stack_name}' to delete the two CDC "
             "connectors and stop streaming. MSK Connect has no pause, so stopping means "
             "deleting the connectors — but MSK, the VPC wiring and the plugins are kept, "
             "and so is the recorded stream position. Start CDC re-creates the connectors "
-            "and continues from exactly where streaming stopped: no gap, nothing "
-            "re-applied, and no Full Load or start point needed again. Restart as often "
-            "as you like — but do not LEAVE it stopped."
+            + (
+                # PostgreSQL (G25, like the start line): a source connector stopped before
+                # its initial snapshot completed has not streamed, and the next Start
+                # (snapshot.mode=initial) takes that snapshot again.
+                "and a source connector that has streamed continues from where streaming "
+                "stopped, with no Full Load or start point needed again. One still "
+                "taking its initial snapshot has not streamed yet: stopping it now cancels "
+                "that snapshot, and the next Start snapshots every selected table again "
+                "first."
+                if _is_pg
+                else "and continues from exactly where streaming stopped, with no Full Load "
+                "or start point needed again."
+            )
+            + f" {_topics}"
+            + " Restart as often as you like — but do not LEAVE it stopped."
         )
-        if _cdc_source_type(session) is SourceType.POSTGRES:
+        if _is_pg:
             # WHY the position survives is also why the source keeps paying for it: the
             # connector config sets slot.drop.on.stop=false, so the replication slot stays
             # behind with no consumer attached -- and an inactive slot still pins every WAL
@@ -6457,7 +7638,12 @@ def _cdc_fk_deploy_body(blocking) -> str:
 
 
 def _cdc_fk_block_body(
-    blocking, *, can_remove_here: bool = True, why: bool = True, before_start: bool = False
+    blocking,
+    *,
+    can_remove_here: bool = True,
+    why: bool = True,
+    before_start: bool = False,
+    bounded: bool = False,
 ) -> str:
     """Compose the CDC-start FK precondition message. Pure.
 
@@ -6472,7 +7658,16 @@ def _cdc_fk_block_body(
     REFUSED, but in the Deploy dialog it is 40 words of rationale competing with three other
     boxes for an operator who has not been refused anything yet -- there the instruction and
     its cost are the whole message.
+
+    ``bounded`` names at most six keys / tables per list, then ``(+N more)``: the worker's
+    refusal, whose notice is also the durable activity record -- an unbounded list pushed
+    each fix past the log's line cap (G25). The Start CDC dialog keeps every name.
     """
+    from dsql_migrator.ui.cdc_dlq_gate import bounded_table_names
+
+    def _names(items) -> str:
+        return bounded_table_names(items) if bounded else ", ".join(items)
+
     parts: list[str] = []
     if blocking.ours:
         if can_remove_here:
@@ -6487,20 +7682,20 @@ def _cdc_fk_block_body(
         parts.append(
             "These foreign keys are enforced on the target and were created by this "
             "migration: "
-            + ", ".join(f"{t}.{c}" for t, c in blocking.ours)
+            + _names([f"{t}.{c}" for t, c in blocking.ours])
             + f". {removal} — cut over re-creates them once the stream has drained."
         )
     if blocking.foreign:
         parts.append(
             "These enforced foreign keys are NOT accounted for by this migration, so "
             "the tool will not remove them (it could not put them back): "
-            + ", ".join(f"{t}.{c}" for t, c in blocking.foreign)
+            + _names([f"{t}.{c}" for t, c in blocking.foreign])
             + ". Drop them yourself before starting CDC."
         )
     if blocking.unknown_tables:
         parts.append(
             "The target's constraints could not be read for: "
-            + ", ".join(blocking.unknown_tables)
+            + _names(list(blocking.unknown_tables))
             + ". Re-test the target connection and retry — CDC is blocked while this "
             "is unknown, because an undetected foreign key silently discards rows."
         )
@@ -6567,6 +7762,17 @@ def _start_cdc_deploy(
     if _seed_refusal:
         render_notice(
             ui, tone="error", header="This start point cannot be applied", body=_seed_refusal
+        )
+        return
+    # G25 (A2): a stack that has streamed never moves forward to a newer start point (Retry
+    # CDC comes here directly; the worker judges it again against a fresh describe).
+    _newer = newer_start_point_refusal(
+        migration_state, seed, _cdc_source_type(session), origin=seed_origin,
+        job_watermark=watermark,
+    )
+    if _newer is not None:
+        render_notice(
+            ui, tone="error", icon=_newer[0][1], header=_newer[0][2], body=_newer[0][3]
         )
         return
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
@@ -6841,13 +8047,15 @@ def _start_cdc_deploy(
     )
     _is_pg_start = _cdc_source_type(session) is SourceType.POSTGRES
 
-    def _check_mysql_start_on_worker(pre, pre_params) -> Optional[str]:
+    def _check_mysql_start_on_worker(pre, pre_params, job_id=None) -> Optional[str]:
         """MySQL, on the worker thread before anything changes: the snapshot mode decided
         on the loop must still be right for the stack as it is NOW, the start point must
         be one a gtid_mode=ON source can start from (the GTID start check), and a
         recovery start must pass the start-point check (Retry CDC skips the dialog; a
         dialog verdict can be stale). Raises RuntimeError to refuse; nothing has been
-        changed yet. Returns the gtid_mode this Start records on the stack (G20:
+        changed yet. A check's refusal raises a short job error and records its full
+        notice for job ``job_id``'s CDC card (:func:`_start_refusal`). Returns the
+        gtid_mode this Start records on the stack (G20:
         :func:`~dsql_migrator.ui.cdc_gtid_gate.gtid_mode_to_record`), or None when the
         check did not run or could not read the mode."""
         from dsql_migrator.ui.cdc_gtid_gate import (
@@ -6905,6 +8113,25 @@ def _start_cdc_deploy(
                 )
                 raise RuntimeError(_r1)
             facts = fresh
+        # G25 (A2): a stack that has streamed never moves forward to a newer start point --
+        # judged on THIS describe when there is one (another session or the console may have
+        # started or stopped the stack since the dialog read it), before anything reads.
+        _pre_status = getattr(pre, "stack_status", None) if pre is not None else None
+        _newer = newer_start_point_refusal(
+            migration_state, seed, SourceType.MYSQL, origin=seed_origin,
+            job_watermark=watermark,
+            stack_params=pre_params if pre is not None else None,
+            stack_status=_pre_status,
+        )
+        if _newer is not None:
+            raise _start_refusal(migration_state, _newer[0], job_id, first_line=_newer[1])
+        # A stack whose last Start CloudFormation rolled back (G25): the checks' remedies that
+        # take a new start point run on a new stack.
+        _rolled_back = (
+            str(_pre_status).strip().upper().startswith("UPDATE_ROLLBACK")
+            if _pre_status is not None
+            else _pg_start_rolled_back(migration_state)
+        )
         # G19: on a gtid_mode=ON source Debezium starts after the GTID set seeded with the
         # start point (not at its file:position), so refuse a start point it cannot start
         # exactly at -- before the start-point check (which would otherwise also read). A
@@ -6929,19 +8156,13 @@ def _start_cdc_deploy(
                     _gtid_verdict, point_label=_gtid_label, coord=_coord,
                     origin=seed_origin,
                     migration_type=getattr(migration_state, "migration_type", None),
+                    rolled_back=_rolled_back,
                 )
                 if _gtid_activity is not None:
                     _log_cdc_event(
                         _gtid_activity[0], status=_gtid_activity[1], detail=_gtid_activity[2]
                     )
-                raise RuntimeError(
-                    "Start CDC blocked: "
-                    + (
-                        f"{_gtid_notice[2]}. {_gtid_notice[3]}"
-                        if _gtid_notice is not None
-                        else ""
-                    )
-                )
+                raise _start_refusal(migration_state, _gtid_notice, job_id)
             if _gtid_activity is not None:
                 # The durable record of how CDC positioned (the deploy log is per-action).
                 migration_state.append_cdc_deploy_log(
@@ -6963,13 +8184,13 @@ def _start_cdc_deploy(
                 verdict, point_label=_label, coord=point_coord(seed),
                 migration_type=getattr(migration_state, "migration_type", None),
                 resumes=bool(getattr(facts, "resumes", False)),
+                # G25: a start point after the change needs new CDC topics on a stack whose
+                # connectors were started (a resume, or a retry after a rolled-back Start).
+                streamed=_rolled_back or cdc_stack_has_streamed(migration_state),
             )
             if _activity is not None:
                 _log_cdc_event(_activity[0], status=_activity[1], detail=_activity[2])
-            raise RuntimeError(
-                "Start CDC blocked: "
-                + (f"{_notice[2]}. {_notice[3]}" if _notice is not None else "")
-            )
+            raise _start_refusal(migration_state, _notice, job_id)
         if _activity is not None:
             _log_cdc_event(_activity[0], status=_activity[1], detail=_activity[2])
         return _gtid_record
@@ -7006,14 +8227,21 @@ def _start_cdc_deploy(
             migration_state, session, inventory, watermark
         )
         if fk_state is not None and fk_state.blocking:
-            _detail = _cdc_fk_block_body(fk_state, can_remove_here=False)
-            _log_cdc_event(
-                "start blocked by target foreign keys",
-                status=ActivityStatus.FAILURE,
-                detail=_detail,
-            )
-            raise RuntimeError(
-                f"Start CDC blocked: {_cdc_fk_block_reason(fk_state)[0]}. " + _detail
+            # Through _start_refusal like the other worker refusals (G25): the job keeps
+            # 300 characters, and the remedy follows the foreign-key list, so three or more
+            # keys cut it off. The CDC card shows the full notice; its activity line
+            # replaces the one this refusal wrote before. Its lists are bounded, so each
+            # fix fits the activity log's line too (the Start CDC dialog lists every key).
+            _clause = _cdc_fk_block_reason(fk_state)[0]
+            raise _start_refusal(
+                migration_state,
+                (
+                    "error",
+                    "link",
+                    _clause[:1].upper() + _clause[1:],
+                    _cdc_fk_block_body(fk_state, can_remove_here=False, bounded=True),
+                ),
+                getattr(handle, "job_id", None),
             )
         # BACKSTOP for the PostgreSQL publication/slot precondition, on the worker thread
         # right before anything is created. The Start dialog already blocks on this, but
@@ -7022,17 +8250,38 @@ def _start_cdc_deploy(
         # _start_cdc_deploy's body: that runs ON the NiceGUI event loop and this probe is
         # blocking source I/O. Fails OPEN on an unreadable source (the probe returns
         # None) -- unlike the FK gate, because a missing publication kills the connector
-        # LOUDLY whereas an enforced FK loses rows silently.
+        # LOUDLY whereas an enforced FK loses rows silently -- but never silently: the
+        # activity log records that the checks did not run, and why (G25).
+        def _pg_checks_not_run(reason: str) -> None:
+            _log_cdc_event(
+                PG_CHECKS_NOT_RUN_ACTION,
+                status=ActivityStatus.WARNING,
+                detail=(
+                    f"could not read the PostgreSQL source ({reason}), so the publication, "
+                    "replication slot and inheritance checks did not run; this Start CDC "
+                    "went ahead without them"
+                ),
+            )
+
         _pg_block = _pg_objects_gate_block(
-            migration_state, session, inventory, watermark
+            migration_state, session, inventory, watermark, on_unread=_pg_checks_not_run,
+            # A submitted Start fixes the table set (G25): no untick to name.
+            untick=False,
         )
         if _pg_block is not None:
-            _log_cdc_event(
-                "start blocked by missing PostgreSQL replication objects",
-                status=ActivityStatus.FAILURE,
-                detail=_pg_block[1],
+            _pg_body = _pg_block[1]
+            if not _pg_stack_started(migration_state):
+                # A stack never started: the route rule's way out, the re-snapshot remedy's
+                # standing unknown here -- the Start CDC dialog judges it (G25). A stack started
+                # before already has its route from the gate.
+                _pg_body = _with_route(_pg_body, _pg_block_route(migration_state, _pg_block[0]))
+            # Through _start_refusal like the other worker refusals: the job keeps 300
+            # characters, which cut the fix off (G25), so the CDC card shows the notice.
+            raise _start_refusal(
+                migration_state,
+                ("error", "sync_problem", _pg_block[0], _pg_body),
+                getattr(handle, "job_id", None),
             )
-            raise RuntimeError(f"Start CDC blocked: {_pg_block[0]}. {_pg_block[1]}")
         deployer = build_cdc_stack_deployer(
             region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
         )
@@ -7056,7 +8305,9 @@ def _start_cdc_deploy(
         # read it (the stack then keeps its record).
         _start_gtid_mode: Optional[str] = None
         if not _is_pg_start:
-            _start_gtid_mode = _check_mysql_start_on_worker(_pre, _pre_params)
+            _start_gtid_mode = _check_mysql_start_on_worker(
+                _pre, _pre_params, job_id=getattr(handle, "job_id", None)
+            )
         # The column-exclusion overlay: every captured excluded column nullable with no
         # DEFAULT (recorded first) BEFORE any connector is created or changed, so every row
         # CDC writes holds NULL there. Covers Retry CDC and a re-Start after Stop; a no-op
@@ -7177,6 +8428,8 @@ def _start_cdc_deploy(
         source_type=_cdc_source_type(session),
         force_snapshot=_force_initial_snapshot,
         resumes=cdc_start_resumes(migration_state, seed, _cdc_source_type(session)),
+        # PostgreSQL: a last Start CloudFormation rolled back promises no snapshot (G25).
+        rolled_back=_pg_start_rolled_back(migration_state),
         seed_origin=seed_origin,
         # The operator's (effective) exclusions only -- "oversized LOB" in the detail; the
         # generated columns the capture also drops are not the operator's choice.
@@ -7892,6 +9145,14 @@ def _render_cdc_deploy_live(ui, migration_state, job_manager, refresh) -> None:
                         else fail_msg
                     ),
                 )
+                # A Start the worker's own checks refused: the job error is only a pointer
+                # (it is capped), so the refusal's full cause and fix are shown here.
+                _refusal = _start_refusal_notice(
+                    migration_state, migration_state.cdc_deploy_job_id
+                )
+                if _refusal is not None:
+                    _tone, _icon, _header, _body = _refusal
+                    render_notice(ui, tone=_tone, icon=_icon, header=_header, body=_body)
 
     def _poll_deploy() -> None:
         job = _current_job(job_manager, migration_state.cdc_deploy_job_id)

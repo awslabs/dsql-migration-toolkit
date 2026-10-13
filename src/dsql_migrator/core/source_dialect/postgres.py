@@ -231,6 +231,40 @@ def _pg_apply_partitioning(connection: object, nsp: str, tables: list) -> None:
     tables[:] = kept
 
 
+# Is the table a PLAIN table with inheritance children (``INHERITS``)? Catalog only: no
+# scan, no lock. ``relhassubclass`` can stay true after its last child is dropped, which only
+# adds a harmless ONLY; a partitioned table (relkind 'p') is never one.
+_PG_INHERITANCE_PARENT_SQL = (
+    "SELECT (c.relkind = 'r' AND c.relhassubclass) AS inheritance_parent "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = :schema AND c.relname = :name"
+)
+
+
+def pg_reads_own_rows_only(connection: object, table_name: str) -> bool:
+    """Must a read of ``table_name`` say ``FROM ONLY``? One catalog read (G25).
+
+    True for a plain table with inheritance children: a bare ``FROM`` also returns every
+    child's rows, while CDC captures only the table's own (its publication is ``FOR TABLE
+    ONLY``, and pgoutput names each change after the table that holds the row). The
+    introspection keeps each child as its own table, so the Full Load and Validation read
+    each table's own rows -- a child's rows are migrated, and compared, as the child's.
+    False for a partitioned table (``ONLY`` would return none of its rows: they live in its
+    partitions, which CDC publishes under the parent), any other table, a name not found,
+    and an unqualified name (no schema to look it up in, as
+    ``validator._source_declared_column_types``). Read LIVE, not from the Step 1 inventory:
+    a table partitioned since then must never read as empty. A failed read raises.
+    """
+    schema, separator, name = str(table_name or "").partition(".")
+    if not (separator and schema and name):
+        return False
+    value = connection.execute(  # type: ignore[attr-defined]
+        text(_PG_INHERITANCE_PARENT_SQL), {"schema": schema, "name": name}
+    ).scalar()
+    return bool(value)
+
+
 def _pg_drop_extension_relations(connection: object, nsp: str, tables: list) -> set:
     """DROP extension-owned tables from ``tables`` in place; return their names.
 
@@ -1306,6 +1340,9 @@ class PostgresSourceDialect(SourceDialect):
         uncarryable: Optional[dict[str, tuple]] = None
         # None until the read SUCCEEDS (G20): unknown, never "usable".
         identity_problems: Optional[dict[str, Optional[str]]] = None
+        identity_remedies: Optional[dict[str, str]] = None
+        full_refused: dict[str, bool] = {}
+        inheritance: Optional[dict[str, tuple]] = None
         not_owned: list[str] = []
         names = list(table_names)
         if names:
@@ -1359,25 +1396,48 @@ class PostgresSourceDialect(SourceDialect):
             # G20: whether publishing each table would make its UPDATE/DELETE fail on the
             # source, graded server-side by the SAME catalog read and rule the Full Load's
             # provisioning refuses on (a valid immediate primary key behind DEFAULT, a valid
-            # identity index behind USING INDEX, every leaf of a partitioned table) -- so
-            # the prerequisite and the write layer cannot disagree. One isolated read like
-            # the others: a failure rolls back and leaves the fact unknown (None), never
-            # "usable". Imported lazily (cdc_pg_slot imports this package).
+            # identity index behind USING INDEX, every leaf of a partitioned table,
+            # PostgreSQL 18's generated-column rule) -- so the prerequisite and the write
+            # layer cannot disagree, and (G25) each problem carries the same per-cause fix.
+            # One isolated read like the others: a failure rolls back and leaves the facts
+            # unknown (None), never "usable". Imported lazily (cdc_pg_slot imports this
+            # package).
             try:
                 from dsql_migrator.core.cdc_pg_slot import (
+                    read_inheritance_children,
                     read_replica_identity_usability,
                     replica_identity_problem,
+                    replica_identity_remedy,
                 )
 
+                usability = read_replica_identity_usability(connection, names)
                 identity_problems = {
-                    qname: replica_identity_problem(read)
-                    for qname, read in read_replica_identity_usability(
-                        connection, names
-                    ).items()
+                    qname: replica_identity_problem(read) for qname, read in usability.items()
+                }
+                identity_remedies = {
+                    qname: replica_identity_remedy(usability[qname], table=qname)
+                    for qname, problem in identity_problems.items()
+                    if problem
+                }
+                full_refused = {
+                    qname: True for qname, read in usability.items() if read.full_refused
                 }
             except Exception:  # noqa: BLE001 - best-effort probe
                 _rollback()
                 identity_problems = None
+                identity_remedies = None
+                full_refused = {}
+            # G25: the selected plain tables with inheritance (INHERITS) child tables, whose
+            # rows the run migrates only as those tables (one catalog read, isolated: None
+            # when it fails -- Start CDC reads it again, and refuses a snapshot it cannot).
+            try:
+                inheritance = {
+                    table: (count, sample)
+                    for table, count, sample in read_inheritance_children(connection, names)
+                }
+            except Exception:  # noqa: BLE001 - best-effort probe
+                _rollback()
+                inheritance = None
             # The columns CDC cannot carry: ONE catalog round trip for ALL selected
             # tables (see _PG_CDC_UNCARRYABLE_COLUMNS_SQL). The type policy is the
             # classifier's, so this only shapes rows into the fact. A failed read leaves
@@ -1446,6 +1506,9 @@ class PostgresSourceDialect(SourceDialect):
             unlogged=unlogged,
             cdc_uncarryable_columns=uncarryable,
             replica_identity_problems=identity_problems,
+            replica_identity_remedies=identity_remedies,
+            full_identity_refused=full_refused,
+            inheritance_children=inheritance,
             has_database_create=_bool(
                 _scalar(
                     "SELECT pg_catalog.has_database_privilege("
@@ -1570,4 +1633,4 @@ class PostgresSourceDialect(SourceDialect):
         )
 
 
-__all__ = ["PostgresSourceDialect"]
+__all__ = ["PostgresSourceDialect", "pg_reads_own_rows_only"]

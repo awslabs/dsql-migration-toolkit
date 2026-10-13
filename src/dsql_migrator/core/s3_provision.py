@@ -15,9 +15,13 @@ only reference one set: the MySQL and PostgreSQL source plugins are mutually exc
 binlog offset (``DeploySeederFunction`` ANDs ``IsMySqlSource``). The sink is shared.
 
 Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<account>-<region>``
-(globally unique because the account id is in the name). Uploads are idempotent
-(skipped only when the object's size and content match the local file: a stored
-SHA-256, or a single-part ETag's MD5), so re-deploys are cheap.
+(globally unique because the account id is in the name), so every tool build that deploys
+in an account and region shares it. Each artifact is therefore uploaded to a
+CONTENT-ADDRESSED key, ``cdc-plugins/<first 16 hex digits of its SHA-256>/<name>``: the
+key a deploy hands to its cdc-stack names the bytes that deploy hashed, and no other build
+writes different bytes there. Uploads are idempotent (skipped only when the object's size
+and content match the local file: a stored SHA-256, or a single-part ETag's MD5), so
+re-deploys are cheap.
 
 Read/writes share the single profile-aware boto3 session (mirroring
 :mod:`dsql_migrator.core.dsql_metadata`). Clients are injectable for tests. The
@@ -36,9 +40,15 @@ from typing import Callable, Optional
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.models import SourceType
 
-# Canonical, version-independent object keys. The MSK Connect plugin RESOURCE
-# names carry a version suffix (cdc-stack PluginVersion) for immutability; the S3
-# keys themselves are stable so re-uploads overwrite in place.
+# The artifacts' BASE keys. An upload goes to the content-addressed key derived from one
+# (_content_key: cdc-plugins/<sha256[:16]>/<name>), which is what PluginUploadResult and the
+# cdc-stack parameters carry. These fixed keys were the upload keys themselves until G25:
+# shared by every build, so a deploy by another build could replace the bytes between this
+# deploy's upload and its CustomPlugin's creation (the AZ retry re-creates it minutes later).
+# A stack deployed before G25 still names them and keeps them (Start and Stop send the
+# plugin keys as UsePreviousValue); this code no longer writes them, though an older build
+# sharing the bucket still may. The MSK Connect plugin RESOURCE names carry the cdc-stack
+# PluginVersion for immutability.
 DEBEZIUM_PLUGIN_KEY = "cdc-plugins/debezium-mysql-plugin.zip"
 # The Debezium PostgreSQL source-connector plugin (pgoutput). Same packaging as the
 # MySQL one: the stock Debezium 2.7.4.Final PostgreSQL plugin with the
@@ -52,9 +62,9 @@ DEBEZIUM_PG_PLUGIN_KEY = "cdc-plugins/debezium-postgres-plugin.zip"
 # jar) -- not a bare jar -- because both connectors' worker configs declare the
 # AWSKafkaAvroConverter, which must be on each plugin's classpath.
 DSQL_SINK_PLUGIN_KEY = "cdc-plugins/dsql-sink-connector.zip"
-# The offset-seeder Lambda deployment zip (CFN custom resource). Stable key; the
-# cdc-stack reads it via the LambdaSeederS3Key parameter so the in-VPC Lambda code
-# is fetched from the same managed bucket as the connector plugins.
+# The offset-seeder Lambda deployment zip (CFN custom resource). The cdc-stack reads its
+# key via the LambdaSeederS3Key parameter so the in-VPC Lambda code is fetched from the
+# same managed bucket as the connector plugins.
 LAMBDA_SEEDER_KEY = "cdc-plugins/offset-seeder-lambda.zip"
 
 # Local artifact paths relative to the repo root (this file is at
@@ -716,6 +726,56 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   Deploy CDC infrastructure to pick up v53 (Start CDC does not re-register the plugin), which
 #   also drops the stream position (MySQL re-reads from the watermark; the PostgreSQL slot is
 #   recreated).
+# v53, rebuilt in place (G25; v53 was never deployed, so the version stays): the sink ZIP's
+#   CONTENT changed again, after a review of the G23 hold.
+#   * A hold that ends -- its change applied, dead-lettered, or replaced by a later change of its
+#     row read one poll further -- is released (rewound past it, resumed) only when the put
+#     returns normally. Before, a put that released a hold and then threw RetriableException was
+#     redelivered with its stale batch: the partition's later records were written ahead of its
+#     never-written tail and the next commit passed it (the change lost, no dead letter). A
+#     redelivery also keeps the release caps and skips a released partition's records at or past
+#     its cap. A transient failure while trying a held change (a dropped connection; XX000 or
+#     40001 past its retries) no longer fails the put: its writes stand, the hold stays, every
+#     hold's next try waits 500 ms, doubling to 10 s while the tries keep failing, and the task
+#     logs a WARN that starts like Connect's retry line ("DSQL apply failed (transient
+#     sqlstate=...)"), at most once a minute while they do.
+#   * The 5 min run from the change's first rejection or from the task's last transient failure,
+#     whichever is later (lastTransientNanos, per task), so an Aurora DSQL outage the holding task
+#     sees does not use up its hold; one only another task sees (say, the one carrying the
+#     freeing change) does not restart it. They are per held change: conflicts on one partition
+#     are waited out one after another.
+#   * A held change counts as ReplicationLagMs on its table, with no op counted (recordLag): when
+#     it is held, on each failed try and at each offset commit, until it applies or is
+#     dead-lettered -- before, a table with a held change read "caught up".
+#   * The skip of a replaced change stays G23's (tables that are not re-keyed, never a move): a
+#     conflicting change that a later change of its row in the put replaces is skipped -- not
+#     held or dead-lettered, and not remembered: Connect's redelivery of the put runs it again,
+#     skipped again while it still conflicts or written and then replaced -- and so is a held
+#     change its one-poll look-ahead finds replaced. In Connect's redelivery of the put that made
+#     a hold, the replacement can sit in that hold's tail (skipped unparsed): it is looked for
+#     there too (heldTailInPut), so the redelivery skips the change again instead of
+#     dead-lettering it with 23505 (G23 did, once per redelivery, though the row ended right).
+#     Known limit, documented rather than fixed (G25 tried three redesigns and reverted each, as
+#     each brought new regressions): the skipped row keeps its target values until the
+#     replacement applies, so a change of ANOTHER row that needs a value the skipped change
+#     would have freed is held with the replacement in its tail (or, on another partition, waits
+#     for a replacement that in turn waits for it) and is dead-lettered with 23505 after its
+#     5 min, as v52 dead-lettered both changes at once. Never silent: the DLQ cut-over gate sees
+#     it, and a reload of the table repairs it.
+#   * A parameter describe that fails inside an open transaction (a re-keyed move's upsert, any
+#     statement group after a chunk's first) is reported with its own SQLSTATE (in practice
+#     42703) instead of the 25P02 the execute then gets, so the row is classified as drift and
+#     arms the table's cool-down. 40001/XX000 from the describe are still retried.
+#   * New value-free INFO lines (table, index, partition, offset, counts): a look-ahead
+#     replacement ends a hold (was DEBUG); a revoked partition drops its hold; RESOLVED is logged
+#     at the release; and at most one per offset commit counts the transactions Aurora DSQL asked
+#     the task to retry, by SQLSTATE (40001 / XX000). Plus the WARN above (SQLSTATE, table,
+#     partition, offset, the next wait). None carries a phrase the tool parses.
+#   No config key, template or Start CDC change; the worker configuration, connector properties,
+#   Debezium ZIPs and seeder Lambda are unchanged. G25 also uploads each artifact to a
+#   content-addressed key (cdc-plugins/<sha256[:16]>/<name>) as one PutObject, so the next Deploy
+#   CDC infrastructure registers exactly these bytes; a stack that registered the earlier v53
+#   bytes (none did) would need Delete + Deploy CDC infrastructure.
 PLUGIN_VERSION = "v53"
 
 
@@ -725,7 +785,11 @@ class S3ProvisionError(RuntimeError):
 
 @dataclass(frozen=True)
 class PluginUploadResult:
-    """Where the plugin artifacts ended up, for the cdc-stack parameters."""
+    """Where the plugin artifacts ended up, for the cdc-stack parameters.
+
+    Each key is the content-addressed key the artifact was uploaded to (or found at),
+    ``cdc-plugins/<sha256[:16]>/<name>``; ``""`` for an artifact this engine does not use.
+    """
 
     bucket_name: str
     bucket_arn: str
@@ -847,9 +911,20 @@ def _local_md5(path: Path) -> str:
 
 
 # The S3 user-metadata key (x-amz-meta-sha256) every upload stamps with the local file's
-# SHA-256 (hex), so a later deploy can PROVE the object holds the same bytes: the keys are
-# version-independent and a multipart ETag is not a digest of the content.
+# SHA-256 (hex), so a later deploy can PROVE the object holds the same bytes before it skips
+# the upload: a content-addressed key names the bytes it should hold, but only the stamp
+# shows that an upload of exactly those bytes put them there, and a multipart ETag (an
+# object uploaded before G25) is not a digest of the content.
 _SHA256_METADATA_KEY = "sha256"
+
+# Every artifact goes up as ONE PutObject, never a multipart upload: a single PUT is atomic,
+# so an upload that fails or is killed (task replacement, OOM, restart) leaves nothing in the
+# bucket, while an interrupted multipart upload leaves its parts there, billed and invisible
+# in the object listing -- and the app's roles hold no s3:AbortMultipartUpload to clean them
+# up. boto3's default multipart_threshold is 8 MiB and the bundled artifacts are up to
+# ~31 MiB; 1 GiB is far above them and below S3's 5 GiB single-PUT limit, and a test fails
+# if a bundled artifact ever reaches it.
+_SINGLE_PUT_THRESHOLD = 1024 * 1024 * 1024
 
 
 def _local_sha256(path: Path) -> str:
@@ -860,6 +935,25 @@ def _local_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _artifact_sha256(path: Path) -> str:
+    """The SHA-256 (hex) of a local artifact; :class:`S3ProvisionError` if it is unreadable."""
+    if not path.is_file():
+        raise S3ProvisionError(f"Plugin artifact not found on disk: {path}")
+    try:
+        return _local_sha256(path)
+    except OSError as exc:
+        raise S3ProvisionError(
+            f"Could not read plugin artifact {path}: {str(exc).splitlines()[0]}"
+        ) from exc
+
+
+def _content_key(base_key: str, sha256: str) -> str:
+    """``cdc-plugins/<name>`` -> ``cdc-plugins/<sha256[:16]>/<name>``: the key that names
+    these bytes. The name stays in the key, so two artifacts never share one."""
+    prefix, _, name = base_key.rpartition("/")
+    return f"{prefix}/{sha256[:16]}/{name}"
+
+
 def upload_plugin(
     s3_client: BotoSessionLike,
     bucket: str,
@@ -867,21 +961,24 @@ def upload_plugin(
     local_path: Path,
     *,
     on_progress: Optional[Callable[[str], None]] = None,
+    local_sha256: Optional[str] = None,
 ) -> None:
     """Upload ``local_path`` to ``s3://bucket/key``, skipping only when the object is
     PROVEN to hold the same bytes.
 
-    The keys are version-independent and a cdc-stack CustomPlugin names no object
-    version, so whatever the object holds is what a deploy registers. ``head_object``
-    gives the size, the ETag and the user metadata; the upload is skipped when the size
-    matches AND either the object's ``sha256`` metadata (stamped by every upload since
-    G21) equals the local file's SHA-256, or its ETag is a plain MD5 (a single-part
-    upload) equal to the local file's. A multipart ETag (``<hash>-<parts>``) is not a
-    digest of the bytes, so a same-size object without the metadata -- uploaded by an
-    earlier version -- is uploaded once more, with it. A failed ``head_object`` uploads
-    too. Uploads via ``upload_file`` when available (boto3 managed multipart), else
-    ``put_object`` (the injectable-fake path), each with the metadata. Raises
-    :class:`S3ProvisionError`.
+    A cdc-stack CustomPlugin names no object version, so whatever the object holds is
+    what a deploy registers; :func:`ensure_and_upload_plugins` passes the artifact's
+    content-addressed key. ``head_object`` gives the size, the ETag and the user metadata;
+    the upload is skipped when the size matches AND either the object's ``sha256`` metadata
+    (stamped by every upload since G21) equals the local file's SHA-256, or its ETag is a
+    plain MD5 (a single-part upload) equal to the local file's. A multipart ETag
+    (``<hash>-<parts>``) is not a digest of the bytes, so a same-size object without the
+    metadata is uploaded once more, with it. A failed ``head_object`` uploads too.
+    ``local_sha256`` is the file's SHA-256 when the caller already computed it (the key was
+    derived from it, so the stamp must be that same digest); otherwise it is computed here.
+    Uploads via ``upload_file`` when available, as one PutObject
+    (:data:`_SINGLE_PUT_THRESHOLD`), else ``put_object`` (the injectable-fake path), each
+    with the metadata. Raises :class:`S3ProvisionError`.
     """
     if not local_path.is_file():
         raise S3ProvisionError(f"Plugin artifact not found on disk: {local_path}")
@@ -891,12 +988,8 @@ def upload_plugin(
             on_progress(msg)
 
     local_size = local_path.stat().st_size
-    try:
-        local_sha256 = _local_sha256(local_path)
-    except OSError as exc:
-        raise S3ProvisionError(
-            f"Could not read plugin artifact {local_path}: {str(exc).splitlines()[0]}"
-        ) from exc
+    if local_sha256 is None:
+        local_sha256 = _artifact_sha256(local_path)
     try:
         head = s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore[attr-defined]
         remote_size = int(head.get("ContentLength", -1))
@@ -916,7 +1009,15 @@ def upload_plugin(
     try:
         upload_file = getattr(s3_client, "upload_file", None)
         if callable(upload_file):
-            upload_file(str(local_path), bucket, key, ExtraArgs={"Metadata": metadata})
+            from boto3.s3.transfer import TransferConfig  # local import, like aws_session
+
+            upload_file(
+                str(local_path),
+                bucket,
+                key,
+                ExtraArgs={"Metadata": metadata},
+                Config=TransferConfig(multipart_threshold=_SINGLE_PUT_THRESHOLD),
+            )
         else:
             with local_path.open("rb") as fh:
                 s3_client.put_object(  # type: ignore[attr-defined]
@@ -940,7 +1041,11 @@ def ensure_and_upload_plugins(
     """Ensure the managed bucket exists and upload the artifacts this engine uses.
 
     Single entry point for the deploy job's bucket/upload stages. Returns the bucket ARN
-    + object keys + plugin version for the cdc-stack parameters.
+    + object keys + plugin version for the cdc-stack parameters. Each artifact is hashed
+    once and uploaded to the key named by that hash (:func:`_content_key`), so the key a
+    cdc-stack is created with holds the bytes this call hashed, whatever another tool build
+    sharing the bucket uploads before or after it -- including the minutes before the AZ
+    retry re-creates the stack (and its CustomPlugins) from the same parameters.
 
     ``source_engine`` selects the artifact set, because the cdc-stack can only reference
     one: the two source plugins are mutually exclusive (``IsMySqlSource`` /
@@ -971,19 +1076,20 @@ def ensure_and_upload_plugins(
     wanted.append((DSQL_SINK_PLUGIN_KEY, sink_path))
     if not is_postgres:
         wanted.append((LAMBDA_SEEDER_KEY, seeder_path))
-    uploaded = {key for key, _ in wanted}
+    named = {base_key for base_key, _ in wanted}
 
     # Say what is NOT being uploaded and why, rather than silently omitting it: an
-    # operator reading this log needs to know which key is absent. "Not uploading" is
+    # operator reading this log needs to know which artifact is absent. "Not uploading" is
     # deliberate and must not be "simplified" to "Skipping" -- upload_plugin's own
     # "already up to date -- skipping upload." means UNCHANGED, and on a first deploy an
     # engine-skipped object is ABSENT, not current. One verb must not mean both. Likewise
     # "does not use" and never "is not required": a MySQL SeedMode=External deploy does
-    # not read the seeder either, so "required" would overclaim.
+    # not read the seeder either, so "required" would overclaim. It is named by its file
+    # name: its key would come from the hash of content this deploy never reads.
     skipped = [
-        key
-        for key in (DEBEZIUM_PLUGIN_KEY, DEBEZIUM_PG_PLUGIN_KEY, LAMBDA_SEEDER_KEY)
-        if key not in uploaded
+        base_key.rpartition("/")[2]
+        for base_key in (DEBEZIUM_PLUGIN_KEY, DEBEZIUM_PG_PLUGIN_KEY, LAMBDA_SEEDER_KEY)
+        if base_key not in named
     ]
     if skipped and on_progress is not None:
         engine_name = "PostgreSQL" if is_postgres else "MySQL"
@@ -992,18 +1098,22 @@ def ensure_and_upload_plugins(
             f"does not use {'them' if len(skipped) > 1 else 'it'}."
         )
 
-    for key, path in wanted:
-        upload_plugin(s3_client, bucket, key, path, on_progress=on_progress)
+    keys: dict[str, str] = {}
+    for base_key, path in wanted:
+        sha256 = _artifact_sha256(path)
+        keys[base_key] = _content_key(base_key, sha256)
+        upload_plugin(
+            s3_client, bucket, keys[base_key], path,
+            on_progress=on_progress, local_sha256=sha256,
+        )
 
     return PluginUploadResult(
         bucket_name=bucket,
         bucket_arn=f"arn:aws:s3:::{bucket}",
-        debezium_key=DEBEZIUM_PLUGIN_KEY if DEBEZIUM_PLUGIN_KEY in uploaded else "",
-        debezium_pg_key=(
-            DEBEZIUM_PG_PLUGIN_KEY if DEBEZIUM_PG_PLUGIN_KEY in uploaded else ""
-        ),
-        dsql_sink_key=DSQL_SINK_PLUGIN_KEY,
-        lambda_seeder_key=LAMBDA_SEEDER_KEY if LAMBDA_SEEDER_KEY in uploaded else "",
+        debezium_key=keys.get(DEBEZIUM_PLUGIN_KEY, ""),
+        debezium_pg_key=keys.get(DEBEZIUM_PG_PLUGIN_KEY, ""),
+        dsql_sink_key=keys[DSQL_SINK_PLUGIN_KEY],
+        lambda_seeder_key=keys.get(LAMBDA_SEEDER_KEY, ""),
         plugin_version=PLUGIN_VERSION,
     )
 

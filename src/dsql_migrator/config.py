@@ -733,10 +733,12 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
             "bill for as long as the connector runs.\n\n"
             "Takes effect at the next Start CDC, because it is a cdc-stack "
             "CloudFormation parameter rather than something the app re-reads. A pipeline "
-            "already streaming keeps its current capacity until you run Start CDC again; "
-            "doing so purely to resize is safe — connector capacity updates in place, so "
-            "the sink is resized rather than recreated, with no gap in replication and no "
-            "MSK partition-quota cost."
+            "already streaming keeps its current capacity until then: while CDC streams "
+            "the CDC step offers only Stop CDC, so Stop CDC and Start CDC again. That "
+            "re-creates the connectors (each connector create/delete uses MSK Serverless "
+            "partitions), and the changes the sink had not applied at the Stop are applied "
+            "from the CDC topics, so that restart is gapless only while the topics still "
+            "retain them (their retention period on MSK)."
         ),
     ),
     TunableKnob(

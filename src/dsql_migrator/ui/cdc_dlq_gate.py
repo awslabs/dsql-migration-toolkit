@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 # A dead letter's time is the MSK Connect worker / CloudWatch clock, a compare start is this
 # app's clock: a table resolves only when its compare started this long AFTER its last dead
@@ -261,6 +261,43 @@ def cdc_dlq_proven_tables(
         if reason is None and started is not None:  # None implies a known start
             proven[table] = started
     return proven
+
+
+# Cut over's other per-table checks, which hold a table on their own whatever its CHECKSUM: an
+# OPEN finding (the closing time unset) holds it outright. (Finding map on the migration
+# state, the field that closes a finding, the check's name in the CDC step's copy.)
+_OPEN_FINDING_CHECKS = (
+    ("cdc_replica_identity_findings", "restored_at", "REPLICA IDENTITY"),
+    ("cdc_catalog_drift_findings", "resolved_at", "source schema"),
+)
+
+
+def cdc_dlq_open_finding_holds(
+    migration_state: object, tables: "Iterable[str]"
+) -> "dict[str, tuple[str, ...]]":
+    """Of ``tables``, each one an OPEN REPLICA IDENTITY or source schema finding still holds at
+    Cut over, with those checks' names (``"REPLICA IDENTITY"`` before ``"source schema"``).
+    Pure.
+
+    A table :func:`cdc_dlq_proven_tables` proves is verified for its dead letters whatever
+    else holds it (G25: the CHECKSUM shows its rows caught up, so it is never sent to a
+    reload that fixes neither finding); this is what its Verified notice adds -- the other
+    check that still holds Cut over (:func:`cdc_dlq_still_held_sentence`). ``{}`` when a
+    finding map cannot be read: the notice then names no other check, and it speaks for the
+    dead-letter check only either way.
+    """
+    wanted = set(tables or ())
+    if migration_state is None or not wanted:
+        return {}
+    held: "dict[str, list[str]]" = {}
+    try:
+        for attr, closed, check in _OPEN_FINDING_CHECKS:
+            for table, finding in dict(getattr(migration_state, attr, None) or {}).items():
+                if table in wanted and getattr(finding, closed, None) is None:
+                    held.setdefault(table, []).append(check)
+    except Exception:  # noqa: BLE001 - unknown: name no other check
+        return {}
+    return {table: tuple(checks) for table, checks in held.items()}
 
 
 def cdc_dlq_waiver_covers(
@@ -890,11 +927,15 @@ def way_forward_lines(gate: CdcDlqGate) -> list[str]:
         )
         truncate_repair: list[str] = []
         if _is_type(gate.migration_type, "CDC_ONLY"):
+            # The card shows a key's value only for an integer or a UUID key (the sink
+            # withholds any other, Property 7), so a natural-key table's rows cannot be found
+            # from it: Start over, as the CDC step's own card says (G25).
             repair = (
                 "CDC only has no Full Load step to reload from: correct these rows on "
                 "Aurora DSQL by hand (the dead-letter queue card lists each record's "
-                "primary key and Kafka offset), and delete any row a lost DELETE left "
-                "behind."
+                "primary key and Kafka offset, with the key's value when that is an integer "
+                "or a UUID), and delete any row a lost DELETE left behind. For a table whose "
+                "key values the card withholds, use Start over."
             )
             # A source TRUNCATE dead letter names no row (no key, no image), so the line
             # above gives no way to find what to remove. Stop CDC first: it freezes the
@@ -1188,19 +1229,65 @@ def verdict_resolved_suffix(gate: Optional[CdcDlqGate]) -> str:
     )
 
 
-def cdc_dlq_resolved_body(proven: "Mapping[str, datetime]") -> str:
-    """The CDC step's "Reloaded and verified" notice body (:func:`cdc_dlq_proven_tables`).
-    Table names and times only."""
-    lines = "; ".join(
+def cdc_dlq_verified_clauses(
+    proven: "Mapping[str, datetime]", limit: Optional[int] = None
+) -> str:
+    """``t matched by CHECKSUM in a Validation comparison started <minute>, after its last
+    dead-lettered record; ...`` for each table (:func:`cdc_dlq_proven_tables`), at most
+    ``limit`` of them then ``(+N more)``. Table names and times only."""
+    items = sorted(proven.items())
+    shown = items if limit is None else items[:limit]
+    text = "; ".join(
         f"{table} matched by CHECKSUM in a Validation comparison started "
         f"{_fmt_minute(_aware(started).astimezone(timezone.utc))}, after its last "
         "dead-lettered record"
-        for table, started in sorted(proven.items())
+        for table, started in shown
     )
-    return (
-        f"{lines}. Cut over no longer holds these tables; their dead-lettered records stay "
-        "listed below, and a new dead letter reopens this."
+    return text + (f" (+{len(items) - len(shown)} more)" if len(items) > len(shown) else "")
+
+
+def cdc_dlq_still_held_sentence(
+    held: "Mapping[str, Sequence[str]]", *, limit: Optional[int] = None, pointer: bool = True
+) -> str:
+    """``Cut over still holds t for its open REPLICA IDENTITY finding (see that notice
+    above).`` for the tables of ``held`` (:func:`cdc_dlq_open_finding_holds`), at most
+    ``limit`` of them then ``(+N more)``; ``""`` when none. ``pointer`` names the findings'
+    own notices, which the CDC step draws above its dead-letter card (the AI facts, which
+    have none, leave it out). Table and check names only."""
+    items = sorted((t, tuple(c)) for t, c in (held or {}).items() if c)
+    if not items:
+        return ""
+    shown = items if limit is None else items[:limit]
+    parts = [
+        f"{table} for its open {' and '.join(checks)} "
+        + ("finding" if len(checks) == 1 else "findings")
+        for table, checks in shown
+    ]
+    text = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    if len(items) > len(shown):
+        text += f" (+{len(items) - len(shown)} more)"
+    if pointer:
+        one = len(items) == 1 and len(items[0][1]) == 1
+        text += " (see that notice above)" if one else " (see those notices above)"
+    return f"Cut over still holds {text}."
+
+
+def cdc_dlq_resolved_body(
+    proven: "Mapping[str, datetime]", held: "Optional[Mapping[str, Sequence[str]]]" = None
+) -> str:
+    """The CDC step's "Verified by CHECKSUM" notice body. Says what was proven -- a CHECKSUM
+    match after each table's last dead letter, by a reload, a later full-row change or a
+    delete of a TRUNCATE's rows, which the rule does not tell apart -- and speaks for Cut
+    over's dead-letter check only: the REPLICA IDENTITY and source schema checks hold a table
+    on their own, and ``held`` (:func:`cdc_dlq_open_finding_holds`) adds one sentence naming
+    the open finding that still holds each such table."""
+    body = (
+        f"{cdc_dlq_verified_clauses(proven)}. Cut over's dead-letter check no longer holds "
+        "these tables; their dead-lettered records stay listed below, and a new dead letter "
+        "reopens this."
     )
+    still = cdc_dlq_still_held_sentence(held or {})
+    return f"{body} {still}" if still else body
 
 
 def held_log_clause(gate: Optional[CdcDlqGate]) -> Optional[str]:

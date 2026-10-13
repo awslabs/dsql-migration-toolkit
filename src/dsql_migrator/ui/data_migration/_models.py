@@ -722,7 +722,9 @@ def coverage_lock_reason(
     removal alone never locks (CDC captures the loaded tables still selected, G16). Once CDC
     has started (``started``) -- even if stopped and deleted since -- any change locks, both
     halves are named: a detour through Full load only must not change the set a started CDC
-    captured."""
+    captured. The re-run that takes a fresh watermark is then a new start point, which a CDC
+    stack that has streamed never continues from (G25, decision A2): the text names Delete
+    CDC infrastructure and deploy it again before it, for a stack that still exists."""
     if started:
         added, removed = gap
         parts = []
@@ -735,7 +737,7 @@ def coverage_lock_reason(
             "CDC has already started for this migration: a CDC type cannot continue a set "
             "that differs from the one that run started with. To add CDC, re-run Full Load "
             "over the current set (it takes a fresh watermark), or restore the original "
-            "table set."
+            f"table set.{_STARTED_STACK_NEW_START_POINT}"
         )
     added = list(gap[0])
     one = len(added) == 1
@@ -749,6 +751,14 @@ def coverage_lock_reason(
     )
 
 
+# G25 (decision A2): a CDC stack that has streamed continues only from where it stopped --
+# MySQL's Start CDC refuses a newer start point on it, and PostgreSQL's continues from its own
+# slot -- so a re-run's fresh watermark needs a new stack first.
+_STARTED_STACK_NEW_START_POINT = (
+    " Before that re-run, if this migration's CDC stack still exists, Delete CDC "
+    "infrastructure and deploy it again: a stack that has streamed only continues from where "
+    "it stopped, never from a newer start point."
+)
 COVERAGE_GAP_NOTICE_BODY = (
     "Tables were selected after this Full Load, so its watermark does not cover them and "
     "CDC cannot continue them from it. To add CDC, re-run Full Load over the current set "
@@ -761,10 +771,17 @@ COVERAGE_GAP_NOTICE_BODY_STARTED = (
     "migration: CDC cannot continue a set that differs from the one this run started with. "
     "To add CDC, re-run Full Load over the current set first (it takes a fresh watermark), "
     "or restore the original table set; the migration type unlocks then."
+    + _STARTED_STACK_NEW_START_POINT
 )
 COVERAGE_GAP_NOTICE_PG_SUFFIX = (
     " On PostgreSQL, CDC then re-reads the tables either way (a Full load only run "
     "creates no replication slot)."
+)
+# Once CDC has started: the stack's own slot remains (a Full load only run does not touch it),
+# so CDC re-reads the tables only on a stack deployed again (G25).
+COVERAGE_GAP_NOTICE_PG_SUFFIX_STARTED = (
+    " On PostgreSQL, after the CDC infrastructure is deleted and deployed again, CDC re-reads "
+    "the tables (a Full load only run creates no replication slot)."
 )
 
 
@@ -4166,12 +4183,19 @@ def stale_error_notice(
         return None
     if error_migration_type is None or error_migration_type is migration_type:
         return ("error", "Migration failed", error)
+    # G25 (route rule B): the way to close it keeps the original start point. A Re-run Full
+    # Load takes a new one, which a CDC stack that has streamed refuses until it is deployed
+    # again (the Full Load step's new-start-point gate).
     return (
         "warning",
         "Carried over from the previous Full Load",
         "This did not happen in the migration type now selected, but the target still "
         "reflects it -- CDC streams ongoing changes and will not backfill a Full Load "
-        f"gap. Re-run Full Load to close it before relying on the target. {error}",
+        "gap. Close it before relying on the target: switch back to the type that ran the "
+        "load and use Retry unfinished tables (or Reload specific tables with Drop & "
+        "reload), which keeps the original start point; a Re-run Full Load takes a new one, "
+        "which on a CDC stack that has streamed needs Delete CDC infrastructure and deploy "
+        f"it again first. {error}",
     )
 
 

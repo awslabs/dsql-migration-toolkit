@@ -114,6 +114,7 @@ from dsql_migrator.core.target_connection import (
     is_transient_connection_error,
 )
 from dsql_migrator.core.source_dialect import SourceDialect, dialect_for
+from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
 from dsql_migrator.core.validator_postgres import PgSourceConnection
 from dsql_migrator.core.watermark import COMMIT, read_binlog_status_row
 
@@ -867,6 +868,8 @@ def _diff_pks(
     table: TableDef,
     sample_size: int,
     source_dialect: SourceDialect,
+    *,
+    from_only: bool = False,
 ) -> Optional[RowDiffSample]:
     """Sample which primary keys diverge between source and target for ``table``.
 
@@ -884,7 +887,8 @@ def _diff_pks(
     pk_column = table.primary_key[0]
 
     source_tokens = _source_pk_tokens_for(
-        source_dialect, source_connection, table, pk_column, sample_size
+        source_dialect, source_connection, table, pk_column, sample_size,
+        from_only=from_only,
     )
     target_tokens = _target_pk_tokens(
         target_connection, table, pk_column, sample_size,
@@ -1027,19 +1031,98 @@ def _source_is_postgres(dialect: SourceDialect) -> bool:
     return dialect.source_type is SourceType.POSTGRES
 
 
+def _from_only(statement: Any, table: "sql.Identifier") -> Any:
+    """``statement`` with each ``FROM <table>`` read as ``FROM ONLY <table>`` (G25).
+
+    Rewrites the psycopg ``Composed`` the PG readers build (``... FROM {table} ...``, the
+    table always right after a ``FROM`` chunk) -- never text -- and REFUSES a statement in
+    which it finds none: a reader whose SQL changed must fail the table, never compare an
+    inheritance parent's children unnoticed."""
+    hits = 0
+
+    def _walk(node: Any) -> Any:
+        nonlocal hits
+        if not isinstance(node, sql.Composed):
+            return node
+        parts: list = []
+        previous: Any = None
+        for part in node:
+            if (
+                part == table
+                and isinstance(previous, sql.SQL)
+                and previous.as_string(None).rstrip().upper().endswith(" FROM")
+            ):
+                parts.append(sql.SQL("ONLY "))
+                hits += 1
+            else:
+                part = _walk(part)
+            parts.append(part)
+            previous = part
+        return sql.Composed(parts)
+
+    rewritten = _walk(statement)
+    if not hits:
+        raise RuntimeError(
+            "the source read could not be limited to the table's own rows (FROM ONLY), "
+            "so its inheritance child tables' rows would be compared with it"
+        )
+    return rewritten
+
+
+class _OwnRowsCursor:
+    """A PG source cursor whose statements read ONE table's own rows (:func:`_from_only`)."""
+
+    def __init__(self, inner: Any, table: "sql.Identifier") -> None:
+        self._inner = inner
+        self._table = table
+
+    def execute(self, statement: Any, params: Any = None) -> None:
+        self._inner.execute(_from_only(statement, self._table), params)
+
+    def fetchone(self) -> Any:
+        return self._inner.fetchone()
+
+    def fetchall(self) -> Any:
+        return self._inner.fetchall()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+class _OwnRowsSource:
+    """The PG source shim for an inheritance parent: ``FROM ONLY`` on every read (G25)."""
+
+    def __init__(self, inner: Any, table_name: str) -> None:
+        self._inner = inner
+        self._table = _pg_table_identifier(table_name)
+
+    def cursor(self) -> _OwnRowsCursor:
+        return _OwnRowsCursor(self._inner.cursor(), self._table)
+
+
+def _pg_source(connection: _SourceConnection, table: TableDef, from_only: bool) -> Any:
+    """The PG readers' connection for ``table``: the shim, reading only the table's own rows
+    when ``from_only`` (an inheritance parent, see :meth:`Validator._compare_table`)."""
+    shim = PgSourceConnection(connection)
+    return _OwnRowsSource(shim, table.name) if from_only else shim
+
+
 def _source_row_count_live(
     dialect: SourceDialect,
     connection: _SourceConnection,
     table: TableDef,
     page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    from_only: bool = False,
 ) -> int:
     """Exact live source count: PG keyset-bounds it (single PK) like the target; MySQL
-    (no per-txn limit) uses a plain ``COUNT(*)`` as before."""
+    (no per-txn limit) uses a plain ``COUNT(*)`` as before. ``from_only``: a PostgreSQL
+    inheritance parent's own rows (:func:`_pg_source`), as on every PG source read here."""
     if _source_is_postgres(dialect):
         # Never a NULL proof here: the proof columns are TARGET ONLY.
         return _bounded_target_count(
-            PgSourceConnection(connection), table, page_size, on_page=on_page
+            _pg_source(connection, table, from_only), table, page_size, on_page=on_page
         )
     return _source_count(connection, table.name)
 
@@ -1050,6 +1133,8 @@ def _source_checksum_for(
     table: TableDef,
     page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    from_only: bool = False,
 ) -> str:
     """Source checksum for either engine, beating ``on_page`` once per keyset page.
 
@@ -1060,7 +1145,7 @@ def _source_checksum_for(
     """
     if _source_is_postgres(dialect):
         return _target_checksum(
-            PgSourceConnection(connection), table, page_size,
+            _pg_source(connection, table, from_only), table, page_size,
             source_is_postgres=True, on_page=on_page,
         )
     return _source_checksum(connection, table, page_size, on_page=on_page)
@@ -1073,11 +1158,13 @@ def _iter_source_pks_for(
     pk_column: str,
     page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    from_only: bool = False,
 ) -> "Iterator[int]":
     if _source_is_postgres(dialect):
         # Never a NULL proof here: the proof columns are TARGET ONLY.
         return _iter_target_pks(
-            PgSourceConnection(connection), table, pk_column, page_size,
+            _pg_source(connection, table, from_only), table, pk_column, page_size,
             on_page=on_page,
         )
     return _iter_source_pks(connection, table, pk_column, page_size, on_page=on_page)
@@ -1089,10 +1176,12 @@ def _source_pk_tokens_for(
     table: TableDef,
     pk_column: str,
     sample_size: int,
+    *,
+    from_only: bool = False,
 ) -> dict[str, str]:
     if _source_is_postgres(dialect):
         return _target_pk_tokens(
-            PgSourceConnection(connection), table, pk_column, sample_size,
+            _pg_source(connection, table, from_only), table, pk_column, sample_size,
             source_is_postgres=True,
         )
     return _source_pk_tokens(connection, table, pk_column, sample_size)
@@ -1918,11 +2007,19 @@ class Validator:
                 error=stale_inventory_error,
                 **self._proof_not_determined(table, "table_error"),
             )
+        # G25: a PostgreSQL inheritance parent is compared by its OWN rows -- the rows the
+        # Full Load copied and CDC captures (each child table is compared as itself). Read
+        # live, in the validation snapshot like the catalog read above, never from the Step 1
+        # inventory: a table partitioned since then must not compare as empty.
+        from_only = _source_is_postgres(source_dialect) and pg_reads_own_rows_only(
+            source_connection, table.name
+        )
 
         source_row_count = self._source_row_count(
             source_connection, table, watermark, source_dialect,
             self._reconcile_page_size,
             on_page=self._page,
+            from_only=from_only,
         )
         # The TARGET count must be BOUNDED on Aurora DSQL: a single COUNT(*) scans the
         # whole table in one transaction and, at scale, exceeds DSQL's hard 300s limit,
@@ -1963,7 +2060,7 @@ class Validator:
         if mode is ValidationMode.CHECKSUM and run_deep:
             source_checksum = _source_checksum_for(
                 source_dialect, source_connection, table, self._reconcile_page_size,
-                on_page=self._page,
+                on_page=self._page, from_only=from_only,
             )
             target_checksum = _target_checksum(
                 target_connection, table, self._reconcile_page_size,
@@ -2004,6 +2101,7 @@ class Validator:
                         _iter_source_pks_for(
                             source_dialect, source_connection, table, pk_column,
                             self._reconcile_page_size, on_page=self._page,
+                            from_only=from_only,
                         ),
                         _iter_target_pks(
                             target_connection, table, pk_column,
@@ -2047,7 +2145,7 @@ class Validator:
         if not matched and self._row_diff_sample_size > 0:
             row_diff_sample = _diff_pks(
                 source_connection, target_connection, table,
-                self._row_diff_sample_size, source_dialect,
+                self._row_diff_sample_size, source_dialect, from_only=from_only,
             )
 
         return TableValidationResult(
@@ -2079,6 +2177,7 @@ class Validator:
         source_dialect: SourceDialect,
         page_size: int,
         on_page: Optional[Callable[[], None]] = None,
+        from_only: bool = False,
     ) -> int:
         """Return the as-of source row count for ``table``.
 
@@ -2101,6 +2200,7 @@ class Validator:
             return watermark.table_row_counts[table.name]
         return _source_row_count_live(
             source_dialect, source_connection, table, page_size, on_page=on_page,
+            from_only=from_only,
         )
 
     def _check_orphans(
