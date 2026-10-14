@@ -502,7 +502,8 @@ AWS ホスト形態は **単一の ECS Fargate タスク** であり、そのジ
 1. **最初に CDC インフラ**（CDC をデプロイしたことがある場合のみ — これはコストのかかる MSK / MSK Connect /
    NAT の部分です）。**アプリがまだ実行されている間** に、UI から行います：**Start over（右上）→
    「Delete all CDC infrastructure」**（アプリが `cdc-stack` の削除を駆動、~15〜25分、そしてそれが作成した
-   マネージドのソース認証情報シークレットも削除します）。アプリがすでに消えている場合は、スタックを手動で削除します：
+   マネージドのソース認証情報シークレットも削除します。ただし PostgreSQL でレプリケーションスロットを
+   削除できなかった場合は、スロットの削除に必要な認証情報であるため、そのシークレットを残します）。アプリがすでに消えている場合は、スタックを手動で削除します：
    `aws cloudformation delete-stack --stack-name dsql-cdc-stack`（実際の cdc-stack 名を使用してください —
    デフォルトは `dsql-cdc-stack` で、レガシーのスタックは `mysql-dsql-cdc-stack` の場合があります）。
 2. **app-stack** — `deploy/teardown.sh <stack-name>` を実行（ECS/ALB/IAM スタックを削除。`DELETE_ECR=true`

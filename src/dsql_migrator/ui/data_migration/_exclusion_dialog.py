@@ -1814,7 +1814,10 @@ def _render_drop_card(ui, ctx: ExclusionDialogContext, resolution, tables, *,
             if table in resolution.retained_legacy and not parts:
                 parts.append("omit-only -> NULL")
             rows = _row_estimate(ctx, table)
-            estimate = f"   {rows:,} rows re-read" if rows is not None else ""
+            # The watermark's scan-free information_schema estimate, not a count (it read
+            # 2,000 for a 2,890-row table, G27): worded as one, and no source scan here --
+            # exact counts are Validation's.
+            estimate = f"   ~{rows:,} rows re-read (estimate)" if rows is not None else ""
             ui.label(f"{table}   {'; '.join(parts)}{estimate}").classes("text-xs font-mono")
         if len(tables) > 20:
             ui.label(f"and {len(tables) - 20} more").classes("text-xs")

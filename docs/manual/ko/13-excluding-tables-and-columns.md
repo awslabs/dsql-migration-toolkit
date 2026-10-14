@@ -494,7 +494,14 @@ drop하거나 쓰기 전에 모든 테이블을 실패시키고, Start CDC는 �
   추가된 컬럼) Start CDC가 거부하기도 합니다: 그때는 더 새 워터마크를 위해 "Drop & reload"로 모든 테이블에
   Re-run Full Load를 실행하거나, Manual을 선택하고 Fetch current position을 사용하세요
   ([6장](06-limitations.md) 참고).
-  PostgreSQL에서는 스택을 삭제하면 복제 슬롯과 publication이 drop되므로, Start CDC 다이얼로그에서
+  PostgreSQL에서는 스택을 삭제하면 복제 슬롯과 publication이 drop됩니다. Delete CDC infrastructure
+  다이얼로그가 슬롯 이름(그리고 이 세션이 publication 이름을 알면 그 이름도)과 함께 그렇게 알려 줍니다:
+  스택이 삭제되면 teardown이 소스에서 그 둘을 각각 존재할 때만 drop하여 슬롯이 보관하던 WAL을 해제하며,
+  drop하지 못해도 teardown은 그대로 끝나고 그 로그가 소스에서 실행할 문을 알려 줍니다. 그때 teardown은
+  도구가 CDC용으로 만든 소스 자격증명 시크릿(비밀번호 인증일 때)을 삭제 예약하지 않고 남겨 둡니다: 그
+  시크릿에 슬롯을 drop하는 데 필요한 자격증명이 있기 때문이며, 다이얼로그도 알려 주듯 슬롯이 없어진 뒤
+  직접 삭제하세요. drop하는 슬롯이 Full Load의 슬롯이면 Start CDC는 더 이상 그 슬롯에서 재개할 수
+  없으므로, Start CDC 다이얼로그에서
   **"Re-snapshot every table instead"**를 선택하세요. 이 방법은 그것이 풀어 줄 Start가 자체 검사를 통과할
   때만 제시되며, 그렇지 않으면 다이얼로그가 그 Start의 거부를 보여 줍니다(예컨대 상속 자식 테이블이 있는
   캡처 대상 테이블. [§4.3](04-cdc-and-dsql-constraints.md) 참고). 그 뒤에는 그곳에서 통하는 경로를 알려
@@ -520,7 +527,7 @@ Full Load가 포함된 마이그레이션 유형에서 그 실행이 기록되�
   로드합니다. 직전 Full Load가 이미 로드한 테이블은 그대로 유지되지만, 컬럼 규칙이 그 테이블의 컬럼을 새로
   제외하면 제외 컬럼이 바뀌는 다른 테이블과 마찬가지로 **Drop & reload** 대상으로 표시됩니다. Full load + CDC에서는 CDC를 시작하기 전까지 테이블 줄로 테이블의 선택을 해제하거나(Aurora DSQL에 그대로 남으며 CDC가 캡처하지 않음) 이관 가능한 어느 테이블이든 선택할 수 있습니다: 직전 Full Load가 로드하지 않은 테이블은 Full Load 단계의 Retry unfinished tables 아래에 표시되고, 로드되면 CDC가 캡처합니다. CDC가 아직 캡처하지 않는 테이블의 컬럼 규칙은 여기서 아무것도 drop하지 않습니다: Full Load 단계에서의 그 테이블의 로드가 그 규칙을 적용합니다. CDC를 시작한 뒤에는 선택을 바꾸게 되는 모든 줄이 오류입니다. CDC 스택이 있으면 팝업은 읽기 전용이므로, 대신 테이블 목록을 사용하세요.
 - **무엇이든 drop하기 전에 무슨 일이 일어날지 정확히 보여 줍니다:** drop 후 재적재할 각 테이블과 그
-  컬럼 diff(`+ c (NULL)`, `- c`)와 행 추정치("N rows re-read"), 그리고 그 테이블들이 받을 경고와
+  컬럼 diff(`+ c (NULL)`, `- c`)와 행 추정치("~N rows re-read (estimate)"), 그리고 그 테이블들이 받을 경고와
   ALTER. "Their rows on Aurora DSQL are permanently deleted; each table is recreated from your
   Schema Conversion DDL, made nullable where needed, and reloaded. Other tables are not touched."
 - **확인 버튼이 동작을 이름으로 밝힙니다:** 파괴적 동작 색의 **Drop & reload** *table* 또는 **Drop &

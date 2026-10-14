@@ -209,6 +209,76 @@ def reloads_first(migration_type: object, origin: str = "full_load") -> bool:
     return _cdc_only(migration_type) and origin == "full_load"
 
 
+# G27: the same condition before a Start that is not refused and begins at the Full Load's
+# watermark, when the session shows that Full Load was not this migration's first copy
+# (``_cdc_status.drop_reload_condition_due``: Start CDC was submitted from an earlier start point
+# before it ran and it found rows already on the target, or -- G27 repair, with or without a
+# Start -- it found them on a table's first attempt). The start-point card, the Start CDC
+# dialog and the Start's activity line say it; a first copy (a first Full Load, or a Drop &
+# reload, which recreates each table it loads) keeps its text.
+RELOAD_CONDITION_HEADER = "Gapless only if this Full Load did not append"
+# The Start's activity line, in place of "(gapless from the Full Load watermark)".
+RELOAD_CONDITION_LINE = (
+    "(from the Full Load watermark; gapless only if that Full Load did not append to rows already "
+    "on the target)"
+)
+# The start-point card's hover text for Automatic.
+RELOAD_CONDITION_TOOLTIP = (
+    "Where change streaming begins. Automatic starts where the Full Load snapshot ended, which "
+    "is gapless only if that Full Load did not append to rows already on the target."
+)
+
+
+# G27 repair (rule E): the MySQL GTID-only start-point notice's re-run -- the Full Load again, for
+# a watermark with a binlog position, is a NEW copy -- named here, with the other routes.
+RERUN_FULL_LOAD_DROP_AND_RELOAD = "re-run the Full Load choosing 'Drop & reload'"
+
+
+def drop_and_reload_rerun(migration_type: object, *, postgres: bool = False) -> "tuple[str, str]":
+    """``(rerun, note)``: the re-run that takes a NEW copy of the Full Load, which names 'Drop &
+    reload' (rule E), and what CDC only needs for it -- said after the clause ``rerun`` leads
+    (empty otherwise). With CDC only the re-run needs a type switch: to Full load only on MySQL
+    (as in :data:`RELOAD_FIRST`), to Full load + CDC on PostgreSQL (``postgres``), whose Full
+    Load there creates the replication slot again. Pure."""
+    if _cdc_only(migration_type) and postgres:
+        return (
+            "switch the migration type to Full load + CDC and Re-run Full Load there choosing "
+            "'Drop & reload'",
+            " (it creates the slot again at its own snapshot point)",
+        )
+    if _cdc_only(migration_type):
+        return (
+            "run it again choosing 'Drop & reload'",
+            " (CDC only has no Full Load step: switch the migration type to Full load only for "
+            "that run, then back to CDC only)",
+        )
+    return "Re-run Full Load on the Full Load step choosing 'Drop & reload'", ""
+
+
+def reload_condition(
+    migration_type: object, *, postgres: bool = False, started: bool = False
+) -> str:
+    """The body of the :data:`RELOAD_CONDITION_HEADER` notice: why it is shown, then
+    :data:`RELOAD_FIRST`'s condition said before Start CDC, with the re-run
+    :func:`drop_and_reload_rerun` names. ``started`` (``_cdc_status.cdc_started_before_load``):
+    Start CDC was submitted in this migration from an earlier start point before this Full Load
+    ran, which the body then says first; without it (G27 repair: an Append re-run before any
+    Start, or a Start from this watermark that did not stream) it says only what the Full Load
+    found, which holds whichever sign showed the condition. Pure."""
+    rerun, note = drop_and_reload_rerun(migration_type, postgres=postgres)
+    why = (
+        "This migration started CDC from an earlier start point before this Full Load ran, and "
+        "the Full Load found rows already on the target."
+        if started
+        else "This Full Load found rows already on the target."
+    )
+    return (
+        f"{why} Start CDC begins at its watermark, so if the Full Load appended to them, "
+        f"{rerun} before Start CDC{note}. An append keeps those rows as they were, and CDC from "
+        "a watermark carries only the changes after it."
+    )
+
+
 def _route_line(migration_type: object, origin: str) -> str:
     """The refusals' route in their one-line form. Pure."""
     if reloads_first(migration_type, origin):
@@ -531,16 +601,22 @@ __all__ = [
     "PROBLEM_NO_BASELINE",
     "PROBLEM_NO_SOURCE",
     "PROBLEM_READ_FAILED",
+    "RELOAD_CONDITION_HEADER",
+    "RELOAD_CONDITION_LINE",
+    "RELOAD_CONDITION_TOOLTIP",
     "RELOAD_FIRST",
     "RELOAD_RESETS_MANUAL",
+    "RERUN_FULL_LOAD_DROP_AND_RELOAD",
     "StartPointVerdict",
     "changed_rows",
+    "drop_and_reload_rerun",
     "new_topics_route",
     "newer_point_line",
     "newer_point_notice",
     "offer_unknown_line",
     "point_coord",
     "point_label",
+    "reload_condition",
     "reloads_first",
     "start_point_activity",
     "start_point_notice",

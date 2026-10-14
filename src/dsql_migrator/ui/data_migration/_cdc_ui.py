@@ -142,6 +142,8 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     cdc_attach_scope_mismatch,
     cdc_stack_has_streamed,
     cdc_start_rolled_back,
+    cdc_started_before_load,
+    drop_reload_condition_due,
     split_attachable_stacks,
     split_cleanup_by_progress,
     _migration_status_tables,
@@ -743,6 +745,11 @@ def _render_cdc_source_config_card(
             t.name for t in _cdc_tables_for_config(migration_state, inventory, watermark)
         ],
         pg_slot=_pg_start_slot(migration_state, watermark) if is_pg else None,
+        # G27: this Full Load is not the migration's first copy, so Automatic is gapless only
+        # if it did not append to rows already on the target -- and whether a Start CDC from
+        # an earlier start point preceded it, which its notice then says first.
+        recopied=drop_reload_condition_due(migration_state, job),
+        recopied_after_start=cdc_started_before_load(migration_state, job),
     )
 
     # On a restart the connector config below is not what decides the start position (the
@@ -1139,12 +1146,14 @@ def _mysql_rolled_back_continues(fallback: str) -> str:
 
 
 def _render_manual_vs_watermark_notice(
-    ui, manual_point, wm_resume, *, rolled_back: bool = False
+    ui, manual_point, wm_resume, *, rolled_back: bool = False, recopied: bool = False
 ) -> None:
     """A Manual binlog point REPLACES the gapless Full Load watermark as the start offset:
     say which changes that loses (after it) or re-applies (before it). Nothing when equal.
     ``rolled_back``: this stack's last Start CloudFormation rolled back, so Automatic is
-    gapless only while the CDC topics retain what that Start streamed (G25)."""
+    gapless only while the CDC topics retain what that Start streamed (G25). ``recopied``:
+    the Full Load is not this migration's first copy, so Automatic is gapless only if it did
+    not append to rows already on the target (G27)."""
     m = {"file": manual_point.binlog_file, "pos": int(manual_point.binlog_position)}
     w = {"file": wm_resume.binlog_file, "pos": int(wm_resume.binlog_position)}
     if m == w:
@@ -1154,6 +1163,9 @@ def _render_manual_vs_watermark_notice(
     automatic = (
         f"Automatic {_mysql_rolled_back_continues(f'the snapshot end ({w_txt})')}."
         if rolled_back
+        else "Automatic starts at the snapshot's end, which is gapless only if that Full Load "
+        "did not append to rows already on the target."
+        if recopied
         else None
     )
     if offset_already_at_or_past(m, w):
@@ -1339,6 +1351,14 @@ def _render_cdc_start_point_card(
     # PostgreSQL: the replication slot a Start gives the connector (:func:`_pg_start_slot`);
     # None names the stack's own.
     pg_slot: Optional[str] = None,
+    # G27 (:func:`~dsql_migrator.ui.data_migration._cdc_status.drop_reload_condition_due`):
+    # the Full Load is not this migration's first copy, so the Automatic start from its
+    # watermark is gapless only if it did not append to rows already on the target.
+    recopied: bool = False,
+    # ...and Start CDC was submitted from an earlier start point before it ran
+    # (:func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_started_before_load`), which
+    # the notice then says first (``reload_condition``'s ``started``).
+    recopied_after_start: bool = False,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -1404,6 +1424,22 @@ def _render_cdc_start_point_card(
     # The stack's connectors were started before (G25): Start CDC continues from what it
     # recorded, so the card's "where it begins" is not the Full Load snapshot's end.
     streamed = resumes_from_offset or cdc_stack_has_streamed(migration_state)
+    from dsql_migrator.ui.cdc_start_point_gate import (
+        RELOAD_CONDITION_HEADER,
+        RELOAD_CONDITION_TOOLTIP,
+        reload_condition,
+    )
+
+    # G27: this Full Load is not the migration's first copy -- the condition its watermark's
+    # Automatic start carries (MySQL: the radio below; PostgreSQL: the slot start).
+    reload_notice = (
+        (RELOAD_CONDITION_HEADER, reload_condition(
+            getattr(migration_state, "migration_type", None), postgres=is_pg,
+            started=recopied_after_start,
+        ))
+        if recopied and wm_usable
+        else None
+    )
     with ui.card().classes("w-full"):  # type: ignore[attr-defined]
         with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon(  # type: ignore[attr-defined]
@@ -1424,6 +1460,8 @@ def _render_cdc_start_point_card(
                 "continues from its recorded stream position"
                 + ("." if locked else " (see the notice below).")
                 if streamed
+                else RELOAD_CONDITION_TOOLTIP
+                if reload_notice is not None
                 else "Where change streaming begins. Automatic resumes exactly where the "
                 "Full Load snapshot ended (no gap, no overlap)."
                 if wm_usable or not is_pg
@@ -1581,9 +1619,10 @@ def _render_cdc_start_point_card(
                 # G25 (A2): this stack has streamed, and the watermark is past where it last
                 # started -- Start CDC refuses it (the notice below says why and the route).
                 auto_label = "Automatic — from the Full Load watermark"
-            elif wm_usable and mysql_rolled_back:
+            elif wm_usable and (mysql_rolled_back or reload_notice is not None):
                 # G25: gapless only while the CDC topics retain what the rolled-back Start
-                # streamed (the notice below).
+                # streamed (the notice below). G27: or only if a Full Load that is not this
+                # migration's first copy did not append (the notice below).
                 auto_label = "Automatic — from the Full Load watermark (recommended)"
             elif wm_usable:
                 auto_label = "Automatic — gapless from Full Load (recommended)"
@@ -1652,6 +1691,11 @@ def _render_cdc_start_point_card(
                         + "."
                     ),
                 )
+            elif reload_notice is not None and mode == "auto" and not locked:
+                # G27: the watermark's Full Load is not this migration's first copy.
+                render_notice(
+                    ui, tone="warning", header=reload_notice[0], body=reload_notice[1]
+                )
         # PostgreSQL: keyed on the EFFECTIVE snapshot mode, not on a radio value. With the
         # radio gone `mode` no longer describes what will happen, and `not wm_usable` never
         # did -- it missed the state where a slot IS recorded and an escape button set
@@ -1660,7 +1704,14 @@ def _render_cdc_start_point_card(
         # the RAW job and is None exactly when the start is gapless, so it is the predicate.
         _pg_resnap = is_pg and resnapshot_reason is not None
         if _pg_resnap and not locked:
-            _notice = pg_resnapshot_notice(resnapshot_reason)
+            # G27 repair: a resume from this load's slot -- the way back the notice names --
+            # is gapless only if a Full Load that is not this migration's first copy did not
+            # append (``recopied``, not ``reload_notice``: an unfinished load's watermark has
+            # its slot suppressed, so it is not ``wm_usable``).
+            _notice = pg_resnapshot_notice(
+                resnapshot_reason, recopied=recopied,
+                migration_type=getattr(migration_state, "migration_type", None),
+            )
             if _notice is not None:
                 render_notice(ui, tone="warning", header=_notice[0], body=_notice[1])
             if resnapshot_reason == "manual":
@@ -1674,12 +1725,31 @@ def _render_cdc_start_point_card(
                         icon="restart_alt",
                         on_click=lambda: _on_mode("auto"),
                     ).props("color=primary outline no-caps")
+        # G27: the gapless start from this Full Load's slot, when that Full Load is not this
+        # migration's first copy.
+        _pg_reload_condition = (
+            is_pg and reload_notice is not None and not _pg_resnap
+            and effective_resume is not None
+        )
+        if _pg_reload_condition and not locked:
+            render_notice(ui, tone="warning", header=reload_notice[0], body=reload_notice[1])
         if not is_pg and not wm_usable and mode == "auto" and not locked:
             if wm_gtid_only:
                 # Name the cause AND the fix. This is the one case where the operator can
                 # get a real gapless handoff by changing something on the source, so a
                 # generic "no watermark" message would send them to Manual with a GTID
-                # that cannot seed the offset either -- still not gapless.
+                # that cannot seed the offset either -- still not gapless. The re-run takes a
+                # NEW copy, so it names the destructive choice (rule E, G27 repair): an Append
+                # keeps the first load's rows as they were, and CDC from the new watermark
+                # never replays the changes made before it. CDC only has no Full Load step.
+                from dsql_migrator.ui.cdc_start_point_gate import (
+                    RERUN_FULL_LOAD_DROP_AND_RELOAD,
+                    drop_and_reload_rerun,
+                )
+
+                _cdc_only_note = drop_and_reload_rerun(
+                    getattr(migration_state, "migration_type", None)
+                )[1]
                 render_notice(
                     ui,
                     tone="warning",
@@ -1691,15 +1761,15 @@ def _render_cdc_start_point_card(
                         "binlog and skip every change made during the Full Load. "
                         "SHOW MASTER STATUS is what supplies it; on RDS/Aurora it needs "
                         "the REPLICATION CLIENT grant. Grant it to the source user and "
-                        "re-run the Full Load for a gapless handoff, or enter a binlog "
-                        "position manually if you know the coordinate the load started "
-                        "from."
+                        f"{RERUN_FULL_LOAD_DROP_AND_RELOAD} for a gapless "
+                        f"handoff{_cdc_only_note}, or enter a binlog position manually if "
+                        "you know the coordinate the load started from."
                         + (
                             # G25: a new start point on this stack needs new CDC topics.
                             " This stack's last Start rolled back, so either way needs new "
                             "CDC topics first: Delete CDC infrastructure and deploy it "
-                            "again, then re-run the Full Load or enter the position, then "
-                            "Start CDC."
+                            f"again, then {RERUN_FULL_LOAD_DROP_AND_RELOAD} or enter the "
+                            "position, then Start CDC."
                             if mysql_rolled_back
                             else ""
                         )
@@ -1728,7 +1798,8 @@ def _render_cdc_start_point_card(
                 and wm_resume.can_seed_offset()
             ):
                 _render_manual_vs_watermark_notice(
-                    ui, manual_point, wm_resume, rolled_back=mysql_rolled_back
+                    ui, manual_point, wm_resume, rolled_back=mysql_rolled_back,
+                    recopied=reload_notice is not None,
                 )
             _render_cdc_manual_inputs(
                 ui, migration_state, refresh, locked=locked, session=session,
@@ -1754,7 +1825,12 @@ def _render_cdc_start_point_card(
                 pg_confirm = "Start point set — re-snapshot every table (snapshot.mode=initial)"
             elif effective_resume is not None:
                 lsn = effective_resume.wal_lsn or "(recorded)"
-                pg_confirm = f"Start point set — gapless from the replication slot (WAL LSN {lsn})"
+                # G27: no "gapless" while the notice above states the reload condition.
+                pg_confirm = (
+                    f"Start point set — from the replication slot (WAL LSN {lsn})"
+                    if _pg_reload_condition
+                    else f"Start point set — gapless from the replication slot (WAL LSN {lsn})"
+                )
             if pg_confirm is not None:
                 with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                     ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
@@ -2271,6 +2347,7 @@ def _cdc_start_detail(
     seed_origin: str = "full_load",
     snapshot_mode: Optional[str] = None,
     rolled_back: bool = False,
+    recopied: bool = False,
 ) -> str:
     """The audit detail for a CDC start: where the stream resumes FROM, and how.
 
@@ -2306,9 +2383,14 @@ def _cdc_start_detail(
     worded the same way: the offset seeder keeps a position that Start recorded at or past the
     watermark, and what it streamed is only in the CDC topics -- so no unconditional "gapless".
 
+    ``recopied`` (G27, :func:`~dsql_migrator.ui.data_migration._cdc_status.
+    drop_reload_condition_due`): the Full Load is not this migration's first copy, so a start
+    from its watermark is gapless only if it did not append to rows already on the target.
+
     Log positions, a mode, and column COUNTS only -- never a row value (Property 7).
     """
     from dsql_migrator.core.cdc_pg_slot import pg_slot_name
+    from dsql_migrator.ui.cdc_start_point_gate import RELOAD_CONDITION_LINE
     from dsql_migrator.ui.data_migration._full_load_engine import watermark_coordinate
 
     # ``resumes`` on PostgreSQL means only that this stack's connectors were started and then
@@ -2437,6 +2519,9 @@ def _cdc_start_detail(
                 else "(this stack's last Start was rolled back by CloudFormation: the "
                 f"connector {_mysql_rolled_back_continues('this start point')})"
                 if rolled_back and source_type is not SourceType.POSTGRES
+                # G27: a Full Load that is not this migration's first copy.
+                else RELOAD_CONDITION_LINE
+                if recopied
                 else "(gapless from the Full Load watermark)"
             )
         )
@@ -2606,7 +2691,9 @@ def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
     Leads with the outcome the operator was waiting for (the infrastructure is gone and
     is no longer billing), and makes rebuilding an explicit opt-in that states the real
     cost of saying yes (~5 min, billable). Answering yes latches
-    ``cdc_redeploy_confirmed`` so the form stays open across refreshes.
+    ``cdc_redeploy_confirmed`` so the form stays open across refreshes, and makes the CDC
+    sub-step -- where this prompt and the deploy form are -- the active one (G27): a section
+    opened in the browser is not the active sub-step, so the refresh used to open Full Load.
     """
     render_notice(
         ui,
@@ -2622,6 +2709,7 @@ def _render_cdc_redeploy_prompt(ui, migration_state, refresh) -> None:
 
     def _confirm() -> None:
         migration_state.set_cdc_redeploy_confirmed(True)
+        migration_state.set_active_substep("cdc")
         if callable(refresh):
             refresh()
 
@@ -3601,8 +3689,12 @@ def _render_cdc_start_button(
                 (
                     START_TOOLTIP_NARROWING
                     + (
+                        # The gapless tail only where the handoff IS gapless: not on a
+                        # re-snapshot, and not (G27) after a Full Load that may not be this
+                        # migration's first copy -- the card states the condition there.
                         START_TOOLTIP_NARROWING_TAIL
                         if not _resnapshots
+                        and not drop_reload_condition_due(migration_state, job)
                         else START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT
                     )
                 )
@@ -3613,11 +3705,14 @@ def _render_cdc_start_button(
                 + (
                     # Only assert gaplessness when this start actually IS gapless. Gated on
                     # full_load_ran alone, this told the operator in the tool's own voice
-                    # that the handoff was gapless on the one route that re-snapshots.
+                    # that the handoff was gapless on the one route that re-snapshots -- and
+                    # (G27) after a Full Load that is not this migration's first copy.
                     "It is drawn from the Full Load snapshot, which is what makes the "
                     "handoff gapless — streaming a different set means a fresh migration, "
                     "via 'Start over' (top right)."
-                    if full_load_ran and not _resnapshots
+                    if full_load_ran
+                    and not _resnapshots
+                    and not drop_reload_condition_due(migration_state, job)
                     else "It is drawn from the Full Load snapshot — streaming a different "
                     "set means a fresh migration, via 'Start over' (top right)."
                     if full_load_ran
@@ -4183,11 +4278,16 @@ def _render_cdc_infra_deploy_action(
             "Enter your VPC ID above to enable the deploy." if missing else ""
         )
 
-    _render_cdc_infra_form(
+    _flush_form = _render_cdc_infra_form(
         ui, migration_state, session=session, on_vpc_change=_sync_gate
     )
 
     async def _confirm() -> None:
+        # G27: the dialog names the stack and diagnoses the subnets from the saved inputs,
+        # and a click does not always blur the field typed in last -- so save the fields
+        # first. A rejected suffix opens no dialog: its notice says why, the field reverted.
+        if not _flush_form():
+            return
         _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
         _needs_objects = pg_objects_required_before_deploy(migration_state, _job)
         await _open_cdc_infra_dialog(
@@ -4478,6 +4578,7 @@ def _render_cdc_delete_action(
                 ui, migration_state,
                 lambda: _start_cdc_delete(ui, migration_state, job_manager, refresh, session=session),
                 session=session,
+                job=_current_job(job_manager, getattr(migration_state, "job_id", None)),
             )
 
         ui.button(  # type: ignore[attr-defined]
@@ -4551,13 +4652,21 @@ def _cdc_infra_prefill(
 
 def _render_cdc_infra_form(
     ui, migration_state, *, session=None, on_vpc_change=None
-) -> None:
+) -> Callable[[], bool]:
     """Render the minimal infra inputs (just VpcId + an advanced subnet override).
 
     Everything else is resolved at deploy time: subnets/NAT from the VPC, the
     plugin bucket/keys (uploaded), the DSQL cluster ARN + source host (prefilled),
     and the source-credentials secret (reused from the Connect Secrets-Manager
     reference, or created by the tool from the username/password used on Connect).
+
+    Returns ``flush`` (G27): it saves each field whose value changed since this form last
+    saved it, as its blur would, and returns False when the stack-name suffix was rejected
+    (the field reverts and the charset notice shows). The Deploy click calls it before the
+    confirm dialog is built: a click does not always blur the field typed in last, and the
+    dialog then named the stack the field had before (live: "dsql-cdc-stack" after "e2e26"
+    was typed). Only changed fields: Prerequisites and the CDC step can both show this form,
+    and one copy's Deploy must not write its unedited values over what the other saved.
     """
     # Render must not block the event loop on a control-plane round-trip (one
     # asyncio loop serves every browser session on Fargate), so skip the DSQL
@@ -4567,6 +4676,10 @@ def _render_cdc_infra_form(
     # Persist the prefill so a deploy submitted without edits still has the host.
     migration_state.set_cdc_infra_inputs(values)
 
+    # For the flush the Deploy click runs (see the docstring): each field's save, and the value
+    # this form last saved in each field (or rendered it with).
+    saves: list = []
+    applied: dict = {}
     with ui.expansion("Infrastructure inputs", icon="lan", value=True).classes(  # type: ignore[attr-defined]
         f"w-full {EXPANSION_PANEL_CLASSES}"
     ):
@@ -4617,13 +4730,15 @@ def _render_cdc_infra_form(
 
             def _save(_e, k=key, f=field) -> None:
                 current = migration_state.cdc_infra_inputs()
-                current[k] = (f.value or "").strip()
+                current[k] = applied[k] = (f.value or "").strip()
                 migration_state.set_cdc_infra_inputs(current)
                 # VpcId gates the Deploy button, so re-check it as the value changes.
                 if k == "vpc_id" and on_vpc_change is not None:
                     on_vpc_change()
 
             field.on("blur", _save)
+            applied[key] = (values.get(key, "") or "").strip()
+            saves.append((key, field, _save))
             # Also gate as the value changes, not only on blur: the user's next move
             # after entering the VPC ID is to click Deploy, and a click on a still-
             # disabled button is swallowed. on_value_change (as the Connect step uses)
@@ -4657,26 +4772,41 @@ def _render_cdc_infra_form(
                 getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
             )
 
-        def _save_stack_name(_e, f=name_field) -> None:
+        applied["stack_name"] = _current_suffix()
+
+        def _save_stack_name(_e, f=name_field) -> bool:
+            """Apply the typed suffix; False when it was rejected (reverted + notice)."""
             suffix = (f.value or "").strip()
             if not suffix:
                 # Empty -> keep the current name; reflect its suffix back in the field.
-                f.value = _current_suffix()
-                return
+                f.value = applied["stack_name"] = _current_suffix()
+                return True
             full = build_cdc_stack_name(suffix)
             if full is not None and migration_state.set_cdc_stack_name(full):
-                f.value = cdc_stack_name_suffix(full)  # normalize what's shown
-                return
+                # normalize what's shown
+                f.value = applied["stack_name"] = cdc_stack_name_suffix(full)
+                return True
             # Reject: revert to the current suffix and explain the (charset) rule --
             # the prefix is already guaranteed, so only the suffix charset can fail.
-            f.value = _current_suffix()
+            f.value = applied["stack_name"] = _current_suffix()
             ui.notify(  # type: ignore[attr-defined]
                 "CDC stack name suffix may use only letters, digits and hyphens "
                 "(e.g. 'orders' -> dsql-cdc-orders).",
                 type="warning", position="top",
             )
+            return False
 
         name_field.on("blur", _save_stack_name)
+
+    def _flush() -> bool:
+        for key, field, save in saves:
+            if (field.value or "").strip() != applied[key]:
+                save(None)
+        if (name_field.value or "").strip() == applied["stack_name"]:
+            return True
+        return _save_stack_name(None)
+
+    return _flush
 
 def _render_cdc_cost_estimate(ui, *, includes_nat: bool, extra: str = "") -> None:
     """Show a ballpark hourly cost line in the deploy dialog (not a quote).
@@ -4904,7 +5034,12 @@ async def _open_cdc_infra_dialog(
             migration_state=migration_state,
         )
         _rs_notice = (
-            pg_resnapshot_notice(_rs_reason, brief=True)
+            # G27 repair: the resume it names is conditional after a Full Load that is not
+            # this migration's first copy.
+            pg_resnapshot_notice(
+                _rs_reason, brief=True,
+                recopied=drop_reload_condition_due(migration_state, job),
+            )
             if _rs_reason in _PG_RESNAPSHOT_AFTER_LOAD
             else None
         )
@@ -5301,6 +5436,14 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
     reason = binlog_resume_gap_reason(
         watermark_file, retained, manual=(origin == "manual")
     )
+    if reason and origin != "manual":
+        # CDC only has no Full Load step: the remedy's re-run needs the type switch the other
+        # Drop & reload routes name (G27; empty for Full load + CDC).
+        from dsql_migrator.ui.cdc_start_point_gate import drop_and_reload_rerun
+
+        _note = drop_and_reload_rerun(getattr(migration_state, "migration_type", None))[1]
+        if _note:
+            reason = f"{reason}{_note.rstrip()}."
     if reason and cdc_start_rolled_back(migration_state):
         # G25: either remedy takes a new start point, which this stack needs new CDC topics
         # for -- that Start may have streamed into them.
@@ -5600,6 +5743,43 @@ def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
         has_committed_offset=bool(getattr(migration_state, "cdc_has_committed_offset", False)),
         deployed_watermark=getattr(migration_state, "cdc_deployed_watermark", None),
         source_type=source_type,
+    )
+
+
+def _reload_condition_notice(migration_state, job, session) -> Optional[tuple]:
+    """``(header, body)`` of the reload condition (G27,
+    :func:`~dsql_migrator.ui.cdc_start_point_gate.reload_condition`) for a Start CDC that begins at
+    the Full Load's watermark -- MySQL: it seeds that watermark and resumes no committed offset;
+    PostgreSQL: it streams from that Full Load's slot on a stack never started -- when that Full
+    Load is not this migration's first copy (:func:`drop_reload_condition_due`); else None. The
+    start-point card states it from its own state; the Start CDC dialog uses this. Pure."""
+    if not drop_reload_condition_due(migration_state, job):
+        return None
+    source_type = _cdc_source_type(session)
+    watermark = _cdc_watermark(job, migration_state)
+    if watermark is None:
+        return None
+    if source_type is SourceType.POSTGRES:
+        if (
+            not getattr(watermark, "slot_name", None)
+            or migration_state.cdc_start_mode() == "manual"
+            or _pg_stack_started(migration_state)
+        ):
+            return None
+    else:
+        seed, origin = _cdc_start_seed(migration_state, watermark, source_type)
+        if (
+            origin != "full_load"
+            or not _seed_can_seed(seed)
+            or cdc_start_resumes(migration_state, seed, source_type)
+        ):
+            return None
+    from dsql_migrator.ui.cdc_start_point_gate import RELOAD_CONDITION_HEADER, reload_condition
+
+    return RELOAD_CONDITION_HEADER, reload_condition(
+        getattr(migration_state, "migration_type", None),
+        postgres=source_type is SourceType.POSTGRES,
+        started=cdc_started_before_load(migration_state, job),
     )
 
 
@@ -5928,9 +6108,40 @@ _PG_RESNAPSHOT_BRIEF: dict[str, str] = {
     ),
 }
 
+# G27 repair: the two causes whose way back is a resume from this load's slot, when that Full
+# Load is not this migration's first copy (``_cdc_status.drop_reload_condition_due``): the
+# resume is gapless only if it did not append to rows already on the target, as the card's
+# info tooltip says. ``(cause, remedy, brief)``, None keeping the default: the remedy names the
+# Drop & reload re-run (rule E; ``{rerun}``/``{note}``:
+# ``cdc_start_point_gate.drop_and_reload_rerun``), the brief only the condition. The default
+# "manual" brief claims no gapless resume.
+_PG_RESNAPSHOT_RECOPIED: dict[str, tuple[Optional[str], str, Optional[str]]] = {
+    "unfinished_load": (
+        None,
+        "Retry the failed tables first: once the load reaches DONE the slot is honoured "
+        "again and the resume from it comes back on its own, with no re-read -- gapless only "
+        "if this Full Load did not append to rows already on the target. If it did, {rerun} "
+        "instead{note}.",
+        "This Full Load did not finish, so its replication slot is not used: every selected "
+        "table is re-snapshotted before any change flows. Retry the failed tables first — "
+        "the resume from the slot comes back on its own once the load reaches DONE, gapless "
+        "only if this Full Load did not append to rows already on the target.",
+    ),
+    "manual": (
+        "A resume from this load's slot is available here -- this Full Load created the "
+        "replication slot -- but it is gapless only if that Full Load did not append to "
+        "rows already on the target. Manual takes a fresh copy instead, which is a "
+        "legitimate choice but reads the source again.",
+        _PG_RESNAPSHOT_CAUSE["manual"][2]
+        + " If that Full Load appended, {rerun} before Start CDC{note}.",
+        None,
+    ),
+}
+
 
 def pg_resnapshot_notice(
-    reason: Optional[str], *, brief: bool = False
+    reason: Optional[str], *, brief: bool = False, recopied: bool = False,
+    migration_type: object = None,
 ) -> Optional[tuple[str, str]]:
     """``(header, body)`` disclosing a re-snapshotting PostgreSQL start, or ``None``. Pure.
 
@@ -5942,13 +6153,32 @@ def pg_resnapshot_notice(
     pipeline (Debezium -> MSK -> the sink), not the bulk loader, and the repo's own
     measurements put those an order of magnitude apart, so "about as long as the Full Load"
     would be a number the tool cannot support. State the direction, not a figure.
+
+    ``recopied`` (G27 repair, ``_cdc_status.drop_reload_condition_due``): the Full Load is not
+    this migration's first copy, so the resume from its slot that the ``manual`` and
+    ``unfinished_load`` causes offer as the way back is worded as gapless only if it did not
+    append (:data:`_PG_RESNAPSHOT_RECOPIED`), the re-run named for ``migration_type``.
     """
     entry = _PG_RESNAPSHOT_CAUSE.get(reason or "")
     if entry is None:
         return None
     header, cause, remedy = entry
+    recopied_entry = _PG_RESNAPSHOT_RECOPIED.get(reason or "") if recopied else None
     if brief:
-        return header, _PG_RESNAPSHOT_BRIEF[reason or ""]
+        return header, (
+            (recopied_entry[2] if recopied_entry is not None else None)
+            or _PG_RESNAPSHOT_BRIEF[reason or ""]
+        )
+    if recopied_entry is not None:
+        from dsql_migrator.ui.cdc_start_point_gate import drop_and_reload_rerun
+
+        rerun, note = drop_and_reload_rerun(migration_type, postgres=True)
+        if reason == "unfinished_load":
+            # An unfinished load's Full Load step offers 'Retry unfinished tables' and 'Re-run
+            # all tables', not 'Re-run Full Load': name the button the operator can see there.
+            rerun = rerun.replace("Re-run Full Load", "Re-run all tables")
+        cause = recopied_entry[0] or cause
+        remedy = recopied_entry[1].format(rerun=rerun, note=note)
     after_load = reason in _PG_RESNAPSHOT_AFTER_LOAD
     lossless = (
         "Nothing is lost: there is no window between the snapshot and the stream, and the "
@@ -6479,6 +6709,16 @@ async def _open_cdc_start_dialog(
             )
         except Exception:  # noqa: BLE001 - unknown here, like the probes; the job re-checks
             newer = None
+    # G27: this Start begins at the watermark of a Full Load that is not this migration's first
+    # copy -- the start-point card's condition, said again where Start is pressed (no I/O).
+    reload_notice: Optional[tuple] = None
+    if job_manager is not None and not _uncovered and newer is None:
+        try:
+            reload_notice = _reload_condition_notice(
+                migration_state, _current_job(job_manager, migration_state.job_id), session
+            )
+        except Exception:  # noqa: BLE001 - advisory copy; never block the dialog
+            reload_notice = None
     if job_manager is not None and not _uncovered:
         from nicegui import run
 
@@ -6712,6 +6952,9 @@ async def _open_cdc_start_dialog(
             _render_notice(
                 ui, tone=newer[0][0], icon=newer[0][1], header=newer[0][2], body=newer[0][3]
             )
+        elif reload_notice is not None:
+            # G27: not a block -- the tool cannot tell whether that Full Load appended.
+            _render_notice(ui, tone="warning", header=reload_notice[0], body=reload_notice[1])
         _gtid_blocks = bool(getattr(gtid_verdict, "blocks", False))
         if gtid_notice is not None:
             _render_notice(
@@ -7189,8 +7432,71 @@ def _open_cdc_stop_dialog(
             ui.button(confirm_label, on_click=_go).props("color=amber-8")  # type: ignore[attr-defined]
     dialog.open()
 
-def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) -> None:
-    """Type-to-confirm dialog before deleting the whole cdc-stack."""
+def _pg_delete_disclosure(migration_state, job) -> str:
+    """What Delete CDC infrastructure does to a PostgreSQL source, for its confirm dialog (G27),
+    as ``cdc_deployer.run_cdc_delete`` does it: once the stack is deleted (its connectors with
+    it, so the slot is inactive), ``_drop_pg_source_replication`` drops the stack's replication
+    slot -- its deployed ``PgSlotName``, which the stack-phase probe reads, else the name derived
+    from the stack name -- then its publication, each only if it exists; a drop that fails
+    leaves the teardown complete and logs the statements to run by hand. The publication is
+    named when its name is known: the derived one beside the derived slot, or the one the Full
+    Load (``job``) recorded beside its slot -- the two are always created together.
+
+    What a later Start then needs, on a new stack (never started): when that slot is the one
+    the Full Load recorded, the route of a missing slot (``pg_cdc_route``); when the stack
+    streamed and no Full Load recorded a slot, a snapshot of every selected table, which its
+    Start takes on its own. Otherwise nothing is said: no slot of this migration's start point
+    is dropped, or the Full Load's is another one, which the teardown leaves. Pure."""
+    from dsql_migrator.core.cdc_pg_slot import (
+        SLOT_MISSING_HEADER,
+        pg_cdc_route,
+        pg_publication_name,
+        pg_slot_name,
+    )
+
+    stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    derived = pg_slot_name(stack_name)
+    slot = (getattr(migration_state, "cdc_deployed_slot_name", None) or "").strip() or derived
+    recorded = getattr(job, "watermark", None) if job is not None else None
+    load_slot = getattr(recorded, "slot_name", None)
+    loads_slot = load_slot == slot
+    if slot == derived:
+        publication = pg_publication_name(stack_name)
+    else:
+        publication = getattr(recorded, "publication_name", None) if loads_slot else None
+    named = f" '{publication}'" if publication else ""
+    text = (
+        "On PostgreSQL, once the stack is deleted, the teardown also drops this stack's "
+        f"replication slot '{slot}' and its publication{named} on the source (each only if it "
+        "exists), which releases the WAL the slot retains. If it cannot drop them, the teardown "
+        "still completes and its log gives the statements to run on the source."
+    )
+    if loads_slot:
+        return (
+            f"{text} A slot cannot be created again at a past position, so after you deploy "
+            "again, Start CDC cannot resume from the Full Load's slot. "
+            + pg_cdc_route(
+                SLOT_MISSING_HEADER,
+                started=False,
+                cdc_only=getattr(migration_state, "migration_type", None)
+                is MigrationType.CDC_ONLY,
+            )
+        )
+    if not load_slot and _pg_stack_started(migration_state):
+        return (
+            f"{text} A slot cannot be created again at a past position, so after you deploy "
+            "again, Start CDC on the new stack snapshots every selected table before it streams "
+            "(a row deleted on the source in between stays on the target; Validation reports it "
+            "as an EXTRA row)."
+        )
+    return text
+
+
+def _open_cdc_delete_dialog(
+    ui, migration_state, on_confirm, *, session=None, job=None
+) -> None:
+    """Type-to-confirm dialog before deleting the whole cdc-stack. ``job``: the Full Load
+    record, whose slot a PostgreSQL teardown may drop (:func:`_pg_delete_disclosure`)."""
     stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
     # Was a tool-managed source secret created (password auth), or is the source
     # secret the customer's own Secrets Manager reference (SM auth)?
@@ -7214,6 +7520,12 @@ def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) ->
                 "if that start point has no recorded table definitions (one recorded by an "
                 "earlier version of the tool or typed by hand)."
             ).classes("text-xs text-gray-500")
+        else:
+            # G27: the teardown drops the slot and publication on the source, which this
+            # dialog never said (live: both were gone after the delete).
+            ui.label(  # type: ignore[attr-defined]
+                _pg_delete_disclosure(migration_state, job)
+            ).classes("text-xs text-gray-500")
         # Show the exact stack name in a copyable mono box so the operator can see
         # (and copy) precisely what to type -- relying on the input placeholder
         # alone is a trap (it looks pre-filled but is empty).
@@ -7235,6 +7547,15 @@ def _open_cdc_delete_dialog(ui, migration_state, on_confirm, *, session=None) ->
                 f"('{secret_name}') will also be scheduled for deletion with a "
                 "7-day recovery window, so your database credentials do not linger "
                 "in Secrets Manager."
+                + (
+                    # G27 repair: as cdc_deployer.run_cdc_delete does it -- a slot it could
+                    # not drop keeps the secret, the stored credentials that can drop it.
+                    " If the replication slot cannot be dropped, the teardown keeps the "
+                    "secret instead: it holds the credentials needed to drop the slot, so "
+                    "delete it yourself once the slot is gone."
+                    if _cdc_source_type(session) is SourceType.POSTGRES
+                    else ""
+                )
             ).classes("text-xs text-amber-700")
         # Create the widgets first, then wire the live check -- so the handler can
         # safely reference all three even if on_change fires immediately.
@@ -8483,6 +8804,8 @@ def _start_cdc_deploy(
         # generated columns the capture also drops are not the operator's choice.
         exclusions=effective_lob_exclusions(migration_state, inventory),
         snapshot_mode=_sent_snapshot_mode,
+        # G27: judged BEFORE this Start moves the ops window to this watermark (below).
+        recopied=drop_reload_condition_due(migration_state, job),
     )
     if _overlay_plan["overlay_by_table"]:
         _mark = getattr(migration_state, "mark_overlay_ledger_in_use", None)

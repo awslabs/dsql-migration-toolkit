@@ -235,7 +235,9 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
   CDC only로 돌아옵니다(append는 그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 변경만
   가져옵니다). 비활성화된 Start의 툴팁과 작업의 오류에서는 그 경로가 *Delete CDC infrastructure and deploy it
   again, then Start CDC (if the Full Load appended to rows already on the target, re-run it choosing
-  'Drop & reload' first)*로 표시됩니다.
+  'Drop & reload' first)*로 표시됩니다. 새 스택에서는 그 Start가 거부되지 않으며, 이 세션이 그
+  Full Load가 앞선 복사본 위에 append했을 수 있음을 보여 주면 CDC 단계가 그 Start
+  전에 그 조건을 알려 줍니다([§4.3](04-cdc-and-dsql-constraints.md#43-무손실-full-load--cdc-핸드오프)).
   PostgreSQL에는 이런 거부가 없습니다: Start CDC는 Full Load의 워터마크와 상관없이 스택 자체의
   복제 슬롯에서 이어 가고, Full load only 실행은 그 슬롯을 건드리지 않으므로, 스택의 소스 커넥터가
   스트리밍했다면 CDC는 Stop CDC 후의 모든 재시작처럼(위) 멈춘 곳에서 이어 갑니다(그렇지 않으면 Debezium이

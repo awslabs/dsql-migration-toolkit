@@ -281,9 +281,13 @@ replication slot again at its own snapshot point), then **Start CDC**.
   those rows as they were, and CDC from a watermark carries only the changes after it). In
   the disabled Start's tooltip and the job's error, the route reads *Delete CDC infrastructure and
   deploy it again, then Start CDC (if the Full Load appended to rows already on the target,
-  re-run it choosing 'Drop & reload' first)*. On PostgreSQL there is no such
-  refusal: Start CDC continues from the stack's own replication slot whatever the Full Load's
-  watermark says, and a Full load only run leaves that slot alone, so CDC continues from
+  re-run it choosing 'Drop & reload' first)*. On the new stack that Start is not refused,
+  and the CDC step states the condition before it when this session shows that the Full
+  Load may have appended to an earlier copy
+  ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)). On
+  PostgreSQL there is no such refusal: Start CDC continues from the stack's own replication
+  slot whatever the Full Load's watermark says, and a Full load only run leaves that slot
+  alone, so CDC continues from
   where it stopped if the stack's source connector streamed (otherwise Debezium snapshots
   every selected table first), as in any restart after Stop CDC (above).
 - If the stack starts streaming between the click and the job starting, the engine refuses on

@@ -63,6 +63,7 @@ from dsql_migrator.ui.data_migration._models import (
     scope_notice,
     FullLoadCompleteness,
     FullLoadTableRow,
+    _CDC_MIGRATION_TYPES,
     _LOAD_STATE_ORDER,
     _UNAVAILABLE,
     build_full_load_table_rows,
@@ -132,6 +133,16 @@ _CDC_LIVE_KEEPS_START_POINT = (
     "Stop CDC first (CDC step → Stop CDC), run this, then Start CDC again: this run keeps the "
     "original start point, so CDC continues from where it stopped, gapless only while the CDC "
     "topics still retain what the sink had not applied (their retention period on MSK)."
+)
+# G27 (rule E): in a CDC migration type, a run that takes a new start point (Start, Re-run Full
+# Load, Re-run all tables) gives CDC its new watermark. Under the Append / Drop & reload choice,
+# Append is then not called "recommended" and this line names Drop & reload. Append stays the
+# default (never preselect the destructive option); Full load only and a Retry / Reload (the
+# original watermark) keep the choice as it was.
+_APPEND_NEW_CDC_START_POINT = (
+    "CDC from this run's new start point needs 'Drop & reload': an Append keeps the rows "
+    "already on the target as they were, and CDC from the new watermark never replays the "
+    "changes made before it."
 )
 
 
@@ -759,7 +770,9 @@ def _render_full_load_step(
         or Reload (the original watermark: the source is only read, except that each ticked
         ``cdc_additions`` table joins CDC's publication when the watermark has the load's
         slot, its guard setting the publication's publish_via_partition_root to true first
-        if it is false).
+        if it is false). In a CDC migration type it also words the Append / Drop & reload
+        choice (G27): a new start point does not call Append recommended and names Drop &
+        reload (:data:`_APPEND_NEW_CDC_START_POINT`); Append stays the default either way.
         """
         from nicegui import context as _ctx
 
@@ -1000,6 +1013,12 @@ def _render_full_load_step(
                 # rows, load only the missing ones -- the non-destructive default)
                 # or drop & reload (DROP+recreate each first, for a clean load).
                 if radio_tables and not cdc_live_now:
+                    # G27 (rule E): a new start point in a CDC migration type is CDC's new
+                    # watermark, so Append is not "recommended" there and a line names Drop &
+                    # reload (_APPEND_NEW_CDC_START_POINT). The default stays Append.
+                    _new_cdc_start_point = (
+                        _migration_type in _CDC_MIGRATION_TYPES and not keeps_watermark
+                    )
                     with ui.card().classes(
                         "w-full bg-amber-50 border border-amber-200 gap-2"
                     ):
@@ -1017,7 +1036,8 @@ def _render_full_load_step(
                         reload_choice = ui.radio(
                             {
                                 "append": "Append — keep existing rows, load only "
-                                "the missing ones (idempotent; recommended)",
+                                "the missing ones (idempotent"
+                                + (")" if _new_cdc_start_point else "; recommended)"),
                                 "drop": "Drop & reload — DROP and recreate these "
                                 "tables first for a clean load (existing rows are "
                                 "permanently lost; DSQL has no TRUNCATE)",
@@ -1028,6 +1048,8 @@ def _render_full_load_step(
                             ),
                         ).props("dense").classes("text-sm")
                         reload_choice.classes("w-full")
+                        if _new_cdc_start_point:
+                            inline_hint(ui, _APPEND_NEW_CDC_START_POINT, tone="warning")
                         # Reassure the user that a Drop & reload recreates the target
                         # from the APPLIED schema conversion -- including any edits
                         # they made in Schema Conversion -- not a stale/original DDL.

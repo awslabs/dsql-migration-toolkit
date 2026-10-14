@@ -533,7 +533,16 @@ More details:
   added): then Re-run Full Load for all tables with "Drop & reload" for a newer
   watermark, or choose Manual and Fetch current position (see
   [Chapter 6](06-limitations.md)). On PostgreSQL, deleting the stack drops the
-  replication slot and the publication, so choose **"Re-snapshot every table instead"**
+  replication slot and the publication. The Delete CDC infrastructure dialog says so,
+  naming the slot (and the publication when this session knows its name): once the stack
+  is deleted, the teardown drops each of them that exists on the source, which releases
+  the WAL the slot retains, and if it cannot drop them, the teardown still completes and
+  its log gives the statements to run on the source. It then keeps the source-credentials
+  secret the tool created for CDC (with password authentication) instead of scheduling it
+  for deletion, because that secret holds the credentials needed to drop the slot: delete
+  it yourself once the slot is gone, as the dialog also says. When the slot it drops is the
+  Full Load's, Start CDC can no longer resume from it, so choose
+  **"Re-snapshot every table instead"**
   in the Start CDC dialog. It is offered only when the Start it unlocks passes its own
   checks; otherwise the dialog shows that Start's refusal (for example for a captured
   table with inheritance child tables; see [§4.3](04-cdc-and-dsql-constraints.md)) and
@@ -563,8 +572,8 @@ read-only popup offers **Change & reload**. It opens **Change exclusions & reloa
   columns in it, in which case it is listed for **Drop & reload** like any other table
   whose excluded columns change. In Full load + CDC, until CDC starts, a table line can unselect tables (left as is on Aurora DSQL, not captured by CDC) and select any migratable table: one the last Full Load did not load is listed under Retry unfinished tables on the Full Load step, and CDC captures it once it is loaded. A column rule on a table CDC does not capture yet drops nothing here: its load on the Full Load step applies it. Once CDC has started, any line that would change the selection is an error. With a CDC stack the popup is read-only: use the table list instead.
 - **Before anything is dropped, it shows exactly what will happen:** each table it will
-  drop and reload, with the column diff (`+ c (NULL)`, `- c`) and a row estimate ("N
-  rows re-read"), plus the warnings and the ALTERs those tables will get. "Their rows on
+  drop and reload, with the column diff (`+ c (NULL)`, `- c`) and a row estimate ("~N
+  rows re-read (estimate)"), plus the warnings and the ALTERs those tables will get. "Their rows on
   Aurora DSQL are permanently deleted; each table is recreated from your Schema
   Conversion DDL, made nullable where needed, and reloaded. Other tables are not
   touched."

@@ -4174,7 +4174,9 @@ def migration_type_lock_reason(
       selector stayed live while Start CDC was already running. The user could switch
       to Full load + CDC and watch it lock immediately afterwards, once the connectors
       appeared. The start point and table set are committed the moment Start is
-      pressed, so the choice must freeze then, not when the connectors finish.
+      pressed, so the choice must freeze then, not when the connectors finish. The
+      text names the CDC state the lock rests on (G27, :func:`_cdc_started_type_lock`):
+      "starting" only while that Start job runs -- it said so while CDC streamed too.
 
     * **Provisioning** — a cdc-stack CREATE is IN FLIGHT (``kind="infra"``). This one
       used to be deliberately excluded, on the grounds that the create makes no
@@ -4211,10 +4213,7 @@ def migration_type_lock_reason(
             "change the type."
         )
     if job_manager is not None and cdc_streaming_started(migration_state, job_manager):
-        return (
-            "Locked because CDC is starting — the start point and table set are "
-            "already committed. Stop CDC on the CDC step to change the type."
-        )
+        return _cdc_started_type_lock(migration_state, job_manager)
     if getattr(migration_state, "cdc_stack_phase", None) == "running" or getattr(
         migration_state, "cdc_connector_names", None
     ):
@@ -4246,6 +4245,40 @@ def migration_type_lock_reason(
             gap, started=_cdc_started_for_migration(migration_state, job_manager)
         )
     return None
+
+
+def _cdc_started_type_lock(migration_state, job_manager) -> str:
+    """The type lock once :func:`cdc_streaming_started` holds, worded for the CDC state it
+    rests on (G27). That predicate covers a live pipeline AND a Start / Stop / Delete job in
+    flight, and its one sentence said "CDC is starting" for all of them -- also while the
+    connectors streamed. "Starting" only while the Start job runs, "started" once the
+    pipeline is live (both: Stop CDC is the remedy), and a running Stop or Delete is a wait,
+    as in the table-set lock. Pure apart from the job reads."""
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        estimate, _why = cdc_delete_eta(migration_state)
+        return (
+            "Locked while the CDC infrastructure is being deleted (a cdc-stack delete "
+            f"takes {estimate}). Wait for the deletion to finish to change the type."
+        )
+    if cdc_stop_in_flight(migration_state, job_manager):
+        return (
+            "Locked while CDC is being stopped. Wait for the Stop CDC that is running to "
+            "finish to change the type."
+        )
+    start_job = (
+        _current_job(job_manager, getattr(migration_state, "cdc_deploy_job_id", None))
+        if getattr(migration_state, "cdc_action_kind", None) == "start"
+        else None
+    )
+    state = (
+        "is starting"
+        if start_job is not None and start_job.status in ("PENDING", "RUNNING")
+        else "has started"
+    )
+    return (
+        f"Locked because CDC {state} — the start point and table set are already "
+        "committed. Stop CDC on the CDC step to change the type."
+    )
 
 
 def _type_switch_coverage_gap(migration_state, job_manager):
@@ -6267,10 +6300,12 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     cdc_unstable_message,
     classify_cdc_card_phase,
 )
-# G16's CDC-evidence reads, shared with the type-switch lock and CDC only's lock text.
+# G16's CDC-evidence reads, shared with the type-switch lock and CDC only's lock text
+# (cdc_stop_in_flight: the type lock's Stop wait, G27).
 from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
     _cdc_started_for_migration,
     _fl_cdc_narrowing_open,
+    cdc_stop_in_flight,
 )
 
 

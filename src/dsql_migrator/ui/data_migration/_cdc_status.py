@@ -1049,6 +1049,80 @@ def cdc_stack_has_streamed(migration_state) -> bool:
     )
 
 
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def cdc_started_before_load(migration_state, job) -> bool:
+    """Was Start CDC submitted in this migration from an EARLIER start point before ``job`` (the
+    latest Full Load) took its watermark? ``cdc_ops_window_start`` -- set at every Start CDC
+    submission to the job watermark's snapshot time (the time of the Start, without one),
+    persisted with the session, cleared only by Start over and an Attach, never by Stop,
+    Delete, a redeploy or a type switch -- is earlier than the watermark's
+    ``snapshot_timestamp``. Retry and Reload keep the watermark, so the window of a Start from
+    it is not earlier; a first Full Load has no Start before it. The first sign of
+    :func:`drop_reload_condition_due`, and the fact its notice then leads with
+    (``cdc_start_point_gate.reload_condition``, ``started``). Pure."""
+    started = getattr(migration_state, "cdc_ops_window_start", None)
+    taken = getattr(getattr(job, "watermark", None), "snapshot_timestamp", None)
+    if not isinstance(started, datetime) or not isinstance(taken, datetime):
+        return False
+    return _as_utc(started) < _as_utc(taken)
+
+
+def drop_reload_condition_due(migration_state, job) -> bool:
+    """Is the latest Full Load (``job``) not this migration's first copy, so that a Start from its
+    watermark owes the Drop & reload condition (G27, ``cdc_start_point_gate.reload_condition``)?
+    Pure (state and job-record reads only). True when either sign shows:
+
+    * Start CDC was submitted from an EARLIER start point before that Full Load ran
+      (:func:`cdc_started_before_load`), and that Full Load found rows already on the target:
+      a chunk with ``rows_skipped`` (its "already there"). An append counts every key the
+      target already holds; a Drop & reload recreates each table it loads, so it finds none
+      and keeps the first copy's text. Rows it re-read itself (after a dropped source
+      connection) or that a Retry had loaded count too, which can only add the condition where
+      it does not apply.
+    * (G27 repair) a chunk found rows already on the target on its FIRST attempt:
+      ``attempts == 1`` with ``rows_skipped``. A run that takes a new start point seeds each
+      chunk at 0 attempts, and each start of a table counts one. Retry unfinished tables, Reload
+      specific tables and a G17 addition keep the original watermark: a table they re-run
+      starts from its earlier count (``_seed_retry_chunks``), so the rows its re-read finds --
+      loaded by an earlier attempt of the same copy -- leave it at 2 or more; a table they
+      carry forward keeps the count and the rows of the attempt that recorded them; and a G17
+      addition loads only a table its guard found empty, or recreates. So rows found on a
+      first attempt were on the target before this copy began (an earlier copy's, which an
+      append keeps). This sign needs no Start: it covers an Append re-run made before
+      CDC ever started, and a retry after a Start from this watermark that did not stream (that
+      Start moved the window, which ends the sign above). A first copy into empty tables finds
+      no rows. Three cases can show the condition on a first copy, which its conditional wording
+      allows: a first attempt's re-read after a dropped source connection counts its own rows;
+      a batch that committed but drew a retryable answer (Aurora DSQL's temporary XX000, or a
+      connection dropped after the commit) is retried and finds its own rows; and a re-run
+      table whose start the multiprocess progress drain applied only after the table
+      finished, or never, keeps its earlier count. A first attempt missed that way stays at 0
+      and gives no sign. The sign lives on the chunk, so a Retry unfinished tables or Reload
+      specific tables that loads AGAIN every table showing it ends it (their re-read rows
+      count toward a later attempt), even when that Full Load appended; chapter 4 says so.
+
+    The same for MySQL and PostgreSQL: one Start stamps the window and one loader counts the
+    rows and the attempts, for both. The job record keeps no load mode (G26), so neither sign
+    proves an append: the notice states the condition, never the fact. The first sign ends
+    with a Start from this watermark (the window moves to it) and with an Attach (it clears the
+    window); the second lasts while this record is the latest Full Load."""
+    if job is None:
+        return False
+    chunks = getattr(job, "chunks", None) or ()
+
+    def _skipped(chunk) -> int:
+        return int(getattr(chunk, "rows_skipped", 0) or 0)
+
+    if cdc_started_before_load(migration_state, job) and any(_skipped(c) > 0 for c in chunks):
+        return True
+    return any(
+        int(getattr(chunk, "attempts", 0) or 0) == 1 and _skipped(chunk) > 0 for chunk in chunks
+    )
+
+
 def cdc_deployed_watermark(
     parameters: "Optional[Mapping[str, str]]",
 ) -> "Optional[tuple[str, str]]":

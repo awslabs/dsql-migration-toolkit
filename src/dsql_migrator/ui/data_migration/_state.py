@@ -605,10 +605,15 @@ class DataMigrationState:
         # Completion used to be signalled only by a ui.notify toast, which hangs off a
         # ui.timer and so is gone after a refresh -- leaving no way to tell "finished"
         # from "never ran", for an operation that takes 15-45 min and is expected to be
-        # left unattended. Held durably so the banner can report the result until it is
-        # explicitly closed. Preserved across a Start-over reset, like the marker (see
-        # ``DataMigrationStore.reset_in_place``; it was not, until v0.1.482).
+        # left unattended. Held so the banner can report the result until it is closed,
+        # a Start over clears it (``DataMigrationStore.reset_in_place``: it reports the
+        # previous journey), or a deploy or Start of a stack it names begins: that stack
+        # leaves it (``_drop_redeployed_teardown_done_locked``, G27).
         self.cdc_teardown_done: dict = {}
+        # The stacks this session deployed or started since their latest teardown was
+        # submitted (G27). The notice above leaves them out, also when it is recorded
+        # later: the banner records it only on its next read of the settled job. Transient.
+        self._cdc_redeployed_stacks: set[str] = set()
         # Everything a one-click "Retry cleanup" needs to re-launch this teardown
         # AFTER a Start-over session reset has wiped the session config (region /
         # deploy-role / profile / whether to also delete the tool-managed secret).
@@ -1221,11 +1226,37 @@ class DataMigrationState:
         """Record (or clear) the running CDC lifecycle job's id + which operation.
 
         ``kind`` is one of ``"infra"``/``"start"``/``"stop"``/``"delete"`` so the
-        progress UI can label the right stage set; cleared with the job id.
+        progress UI can label the right stage set; cleared with the job id. A deploy
+        (``"infra"``) or Start (``"start"``) job targets ``cdc_stack_name`` and takes that
+        stack out of the finished-teardown notice (see
+        :meth:`_drop_redeployed_teardown_done_locked`).
         """
         with self._lock:
             self.cdc_deploy_job_id = job_id
             self.cdc_action_kind = kind if job_id is not None else None
+            if job_id is not None and kind in ("infra", "start") and self.cdc_stack_name:
+                self._cdc_redeployed_stacks.add(self.cdc_stack_name)
+                self._drop_redeployed_teardown_done_locked()
+
+    def _drop_redeployed_teardown_done_locked(self) -> None:
+        """Leave the stacks deployed or started since their teardown out of the
+        finished-teardown notice (lock held).
+
+        The notice ("CDC infrastructure deleted ... MSK / NAT billing has stopped", or
+        "CDC connectors removed ... streaming has stopped") stayed on every screen after
+        the SAME stack was deployed again and was streaming (live Seoul E2E, 2026-10-14).
+        A stack leaves ``_cdc_redeployed_stacks`` when a new teardown of it is submitted
+        (:meth:`set_cdc_teardown`, :meth:`set_cdc_teardown_queue`: the notice names only
+        stacks from those two), so its next result is reported. Another stack's result
+        stays. The in-flight teardown marker and queue are not touched.
+        """
+        done = self.cdc_teardown_done or {}
+        stacks = list(done.get("stacks") or [])
+        remaining = [s for s in stacks if s not in self._cdc_redeployed_stacks]
+        if len(remaining) == len(stacks):
+            return
+        # Nothing left to report: clear it, or the copy falls back to "the cdc-stack".
+        self.cdc_teardown_done = {**done, "stacks": remaining} if remaining else {}
 
     def set_cdc_redeploy_confirmed(self, confirmed: bool) -> None:
         """Record that the operator asked to (re)deploy CDC infrastructure.
@@ -1262,6 +1293,9 @@ class DataMigrationState:
             self.cdc_teardown_kind = kind if job_id is not None else None
             self.cdc_teardown_stack = stack if job_id is not None else None
             self.cdc_teardown_ctx = dict(ctx) if (job_id is not None and ctx) else {}
+            if job_id is not None and stack:
+                # A deploy or Start before this teardown is older: its result is reported.
+                self._cdc_redeployed_stacks.discard(stack)
 
     def set_cdc_teardown_queue(self, entries: "list[tuple[str, str]]") -> None:
         """Record every ``(job_id, stack)`` this teardown launched, in teardown order.
@@ -1275,6 +1309,10 @@ class DataMigrationState:
             self.cdc_teardown_queue = [
                 (str(job_id), str(stack)) for job_id, stack in entries if job_id
             ]
+            # As in set_cdc_teardown: every stack this teardown launched is reported.
+            self._cdc_redeployed_stacks.difference_update(
+                stack for _job_id, stack in self.cdc_teardown_queue
+            )
 
     def advance_cdc_teardown(self, job_id: str, stack: str) -> None:
         """Re-point the durable marker at another still-running teardown in the queue.
@@ -1295,12 +1333,18 @@ class DataMigrationState:
         refresh there was nothing distinguishing "the 45-minute teardown finished" from
         "it never ran". This survives a refresh and is cleared by
         :meth:`dismiss_cdc_teardown_done` (the banner's close button) or by Start over.
+
+        The banner records this the next time it reads the settled job, so a deploy or
+        Start of one of these stacks may already be under way: for example the first
+        stack of a multi-stack teardown, deployed again while the next one is still
+        deleting. That stack is left out (:meth:`_drop_redeployed_teardown_done_locked`).
         """
         with self._lock:
             self.cdc_teardown_done = {
                 "kind": kind,
                 "stacks": [str(s) for s in stacks if s],
             }
+            self._drop_redeployed_teardown_done_locked()
 
     def dismiss_cdc_teardown_done(self) -> None:
         """Clear the finished-teardown notice (the operator closed the banner)."""

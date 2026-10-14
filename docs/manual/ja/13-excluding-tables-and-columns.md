@@ -501,8 +501,16 @@ CDC only の Start ダイアログはそれらのテーブル名を示し、各�
   定義が変わっていれば(たとえばソースで追加された列)、Start CDC は拒否もします: その場合は、より新しい
   ウォーターマークのために「Drop & reload」ですべてのテーブルを Re-run Full Load するか、Manual を選んで
   Fetch current position を使ってください([第 6 章](06-limitations.md)を参照)。PostgreSQL では、
-  スタックを削除するとレプリケーションスロットと publication が削除されるため、Start CDC ダイアログで
-  **「Re-snapshot every table instead」** を選んでください。この方法は、それが解除する Start が自身の
+  スタックを削除するとレプリケーションスロットと publication が削除されます。Delete CDC infrastructure の
+  ダイアログは、スロットの名前 (このセッションが publication の名前を知っていればその名前も) を挙げて
+  そう示します: スタックが削除されると、teardown はソースにあるそれぞれを存在する場合にだけ削除し、
+  スロットが保持していた WAL を解放します。削除できなかった場合も teardown はそのまま完了し、そのログが
+  ソースで実行する文を示します。その場合 teardown は、ツールが CDC 用に作成したソース認証情報シークレット
+  (パスワード認証の場合) を削除予定にせず残します: そのシークレットにスロットの削除に必要な認証情報が
+  あるためで、ダイアログも示すとおり、スロットがなくなった後に自分で削除してください。削除されるスロットが
+  Full Load のスロットであれば、Start CDC はもう
+  そのスロットから再開できないため、Start CDC ダイアログで **「Re-snapshot every table instead」** を
+  選んでください。この方法は、それが解除する Start が自身の
   チェックを通過する場合にだけ提示され、そうでなければダイアログがその Start の拒否を表示します (たとえば
   継承の子テーブルを持つキャプチャ対象テーブル。[§4.3](04-cdc-and-dsql-constraints.md) を参照)。その後に、
   そこで使える方法を示します: 継承のための拒否なら、代わりに「Drop & reload」で Re-run Full Load すると、
@@ -529,7 +537,7 @@ Full Load を含む移行タイプで、実行が記録されており、CDC ス
   ルールがそのテーブルの列を新たに除外する場合は、除外列が変わる他のテーブルと同様に **Drop & reload** の
   対象として表示されます。Full load + CDC では、CDC を開始するまで、テーブル行でテーブルの選択を外せ(Aurora DSQL 上にそのまま残され、CDC はキャプチャしません)、移行できる任意のテーブルを選択できます。前回の Full Load がロードしなかったテーブルは Full Load ステップの Retry unfinished tables の対象として表示され、ロードされると CDC がキャプチャします。CDC がまだキャプチャしていないテーブルの列ルールは、ここでは何も drop しません。Full Load ステップでのそのテーブルのロードがルールを適用します。CDC を開始した後は、選択を変えることになる行はすべてエラーになります。CDC スタックがある場合、ポップアップは読み取り専用なので、代わりにテーブル一覧を使ってください。
 - **何かを削除する前に、何が起きるかを正確に示します:** drop して reload する各テーブルを、列の差分
-  (`+ c (NULL)`、`- c`)と行数の見積もり(「N rows re-read」)とともに示し、さらにそれらのテーブルに対する
+  (`+ c (NULL)`、`- c`)と行数の見積もり(「~N rows re-read (estimate)」)とともに示し、さらにそれらのテーブルに対する
   警告と ALTER も示します。「Their rows on Aurora DSQL are permanently deleted; each table is recreated
   from your Schema Conversion DDL, made nullable where needed, and reloaded. Other tables are not
   touched.」

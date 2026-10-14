@@ -563,8 +563,9 @@ AWS에 배포하는 형태는 **ECS Fargate 태스크 하나로 동작**하며, 
 
 1. **CDC 인프라 먼저**(CDC를 배포한 적이 있을 때만 — MSK / MSK Connect / NAT로 비용의 핵심입니다).
    **앱이 떠 있는 동안** UI에서 하세요: **Start over(우측 상단) → "Delete all CDC infrastructure"** (앱이
-   `cdc-stack` 삭제를 구동, ~15–25분; 도구가 만든 소스 자격증명 시크릿도 함께 제거됩니다). 앱이 이미
-   없으면 수동 삭제: `aws cloudformation delete-stack --stack-name dsql-cdc-stack`(실제 cdc-stack 이름을
+   `cdc-stack` 삭제를 구동, ~15–25분; 도구가 만든 소스 자격증명 시크릿도 함께 제거됩니다. 단, PostgreSQL에서 복제
+   슬롯을 drop하지 못하면 그 시크릿은 남겨 둡니다: 슬롯을 drop하는 데 필요한 자격증명이기 때문입니다).
+   앱이 이미 없으면 수동 삭제: `aws cloudformation delete-stack --stack-name dsql-cdc-stack`(실제 cdc-stack 이름을
    쓰세요 — 기본값은 `dsql-cdc-stack`이고, 레거시 스택은 `mysql-dsql-cdc-stack`일 수 있습니다).
 2. **app-stack** — `deploy/teardown.sh <스택이름>` 실행(ECS/ALB/IAM 스택 삭제; `DELETE_ECR=true`를 주면
    컨테이너 이미지 저장소까지 제거).

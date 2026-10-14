@@ -490,7 +490,10 @@ def binlog_resume_gap_reason(
     min infrastructure create plus the connector create all elapse before Debezium
     reads it. If the source purged that file in the meantime the gapless hand-off
     (Property 11) is impossible: rows changed between the snapshot point and the new
-    log start are lost, and the only correct recovery is a re-snapshot.
+    log start are lost, and the only correct recovery is a re-snapshot -- a Full Load
+    re-run choosing Drop & reload, which the remedy names (an Append keeps the rows
+    already on the target as they were, and CDC from the new watermark never replays the
+    changes made before it).
 
     Today that surfaces only as an undiagnosed connector ``CREATE_FAILED`` roughly
     26 minutes into a billable create (MySQL error 1236, "could not find first log
@@ -517,10 +520,12 @@ def binlog_resume_gap_reason(
         f"The Full Load watermark points at binary log '{watermark_file}', which the "
         f"source no longer retains (oldest kept: '{retained[0]}'). A gapless resume "
         "from the snapshot is no longer possible — changes made since then are not "
-        "in the remaining logs. Re-run the Full Load to take a fresh snapshot (and "
-        "raise the source's binlog retention first, e.g. "
-        "CALL mysql.rds_set_configuration('binlog retention hours', 168)), or start "
-        "CDC from a manual position and accept the gap."
+        "in the remaining logs. Re-run the Full Load choosing 'Drop & reload' to take a "
+        "fresh snapshot (and raise the source's binlog retention first, e.g. "
+        "CALL mysql.rds_set_configuration('binlog retention hours', 168)): an Append "
+        "keeps the rows already on the target as they were, and CDC from the new "
+        "watermark never replays the changes made before it. Or start CDC from a manual "
+        "position and accept the gap."
     )
 
 

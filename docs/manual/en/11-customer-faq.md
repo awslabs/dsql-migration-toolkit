@@ -559,8 +559,10 @@ procedure with exact commands is [Deployment §9 — Teardown](../../../deploy/D
    MSK / MSK Connect / NAT part). Do it **while the app is still running**, from the
    UI: **Start over (top right) → "Delete all CDC infrastructure"** (the app drives
    the `cdc-stack` deletion, ~15–25 min, and also removes the managed source-
-   credentials secret it created). If the app is already gone, delete the stack
-   manually: `aws cloudformation delete-stack --stack-name dsql-cdc-stack` (use your
+   credentials secret it created; on PostgreSQL it keeps that secret if it cannot drop
+   the replication slot, since it holds the credentials needed to drop the slot). If the
+   app is already gone, delete the stack manually:
+   `aws cloudformation delete-stack --stack-name dsql-cdc-stack` (use your
    cdc-stack's name: the default is `dsql-cdc-stack`; a legacy one may be
    `mysql-dsql-cdc-stack`).
 2. **app-stack** — run `deploy/teardown.sh <stack-name>` (deletes the ECS/ALB/IAM
