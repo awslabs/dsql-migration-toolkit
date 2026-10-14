@@ -5,6 +5,27 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.569
+
+### Security
+
+- **Upgraded the transitive `urllib3` dependency to 2.8.0**, closing two advisories Dependabot
+  raised against the shipped lockfile:
+  - `GHSA-vxq7-64xx-v4gw` — **high**. `HTTPResponse.stream()` and `read_chunked()` buffered a
+    chunk-size line of unbounded length into memory, so a server sending a crafted chunked
+    response could exhaust the client's memory.
+  - `GHSA-gh4c-6fx4-qh6g` — medium. Streaming a chunked response with Deflate content encoding
+    could enter an infinite loop.
+- **Practical exposure here was low, and the patch is applied anyway.** `urllib3` reaches this
+  project through botocore, so the tool's own outbound HTTP goes to AWS endpoints only, and both
+  advisories need a server that sends a malicious chunked response. The CDC offset-seeder Lambda
+  ships no `urllib3` code (its ZIP carries only the package metadata; the function imports the
+  Lambda runtime's copy). A high advisory against a library inside the published image is worth
+  shipping a patch for regardless of reachability.
+- Lockfile only — no first-party code changed. The sink plugin is unchanged (v53), so no CDC
+  infrastructure redeploy is needed. The full suite passes, and the UI was booted on 2.8.0 to
+  confirm the web stack is unaffected.
+
 ## v0.1.568
 
 ### Fixed

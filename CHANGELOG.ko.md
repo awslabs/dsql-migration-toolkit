@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.569
+
+### 보안
+
+- **transitive 의존성 `urllib3`를 2.8.0으로 올려**, Dependabot이 배포 lockfile에 대해 제기한 권고 2건을
+  닫았습니다:
+  - `GHSA-vxq7-64xx-v4gw` — **high**. `HTTPResponse.stream()`과 `read_chunked()`가 길이 제한이 없는
+    chunk-size 줄을 메모리에 쌓아 두었기 때문에, 조작된 chunked 응답을 보내는 서버가 클라이언트의
+    메모리를 고갈시킬 수 있었습니다.
+  - `GHSA-gh4c-6fx4-qh6g` — medium. Deflate 콘텐츠 인코딩을 쓴 chunked 응답을 스트리밍하면 무한 루프에
+    빠질 수 있었습니다.
+- **이 프로젝트의 실질적 노출은 낮았고, 그래도 패치했습니다.** `urllib3`는 botocore를 통해 들어오므로
+  도구 자신의 아웃바운드 HTTP는 AWS 엔드포인트로만 가며, 두 권고 모두 악의적인 chunked 응답을 보내는
+  서버가 있어야 합니다. CDC offset-seeder Lambda는 `urllib3` 코드를 포함하지 않습니다(ZIP에는 패키지
+  메타데이터만 있고, 함수는 Lambda 런타임의 사본을 import합니다). 다만 **배포되는 이미지 안의**
+  라이브러리에 대한 high 권고는 도달 가능성과 무관하게 패치를 내보낼 값이 있습니다.
+- lockfile만 변경 — 1st-party 코드 변경 없음. 싱크 플러그인은 그대로(v53)이므로 CDC 인프라 재배포가
+  필요 없습니다. 전체 테스트 통과, 2.8.0에서 UI를 부팅해 웹 스택에 영향이 없음을 확인했습니다.
+
 ## v0.1.568
 
 ### 수정
