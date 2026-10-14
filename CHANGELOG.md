@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.570
+
+### Security
+
+- **Upgraded the transitive `multidict` dependency to 6.9.1**, closing an advisory Dependabot
+  raised against the shipped lockfile after v0.1.569: `GHSA-54p9-h82j-f925` — medium. The
+  items-view union and subtraction of `CIMultiDict` / `MultiDict` leaked a reference, so
+  repeating those operations grew memory.
+- **v0.1.569's `urllib3` 2.8.0 also closes `GHSA-8988-9cw3-xx77`** — high, published after that
+  release: an HTTPS proxy's TLS configuration could be ignored or overridden. This version keeps
+  2.8.0.
+- **Practical exposure here was low, and the patch is applied anyway.** `multidict` reaches this
+  project only through `aiohttp`, and the tool's own code does not combine multidict item views.
+  The tool configures no HTTPS proxy for its AWS calls (a proxy set in the environment is honoured
+  by botocore).
+- Lockfile only — no first-party code changed. The sink plugin is unchanged (v53), so no CDC
+  infrastructure redeploy is needed. The full suite passes, and the UI was booted on 6.9.1 to
+  confirm the web stack is unaffected.
+
 ## v0.1.569
 
 ### Security

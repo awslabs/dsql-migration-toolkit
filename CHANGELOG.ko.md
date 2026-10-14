@@ -5,6 +5,21 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.570
+
+### 보안
+
+- **transitive 의존성 `multidict`를 6.9.1로 올려**, v0.1.569 이후 Dependabot이 배포 lockfile에 대해
+  제기한 권고를 닫았습니다: `GHSA-54p9-h82j-f925` — medium. `CIMultiDict` / `MultiDict`의 items-view
+  합집합과 차집합이 참조를 누수해서, 이 연산을 반복하면 메모리가 늘었습니다.
+- **v0.1.569의 `urllib3` 2.8.0은 `GHSA-8988-9cw3-xx77`도 닫습니다** — high, 그 릴리스 뒤에 공개된
+  권고입니다: HTTPS 프록시의 TLS 설정이 무시되거나 덮어써질 수 있었습니다. 이 버전도 2.8.0을 유지합니다.
+- **이 프로젝트의 실질적 노출은 낮았고, 그래도 패치했습니다.** `multidict`는 `aiohttp`를 통해서만
+  들어오고, 도구 자신의 코드는 multidict의 items view를 조합하지 않습니다. 도구는 AWS 호출에 HTTPS
+  프록시를 설정하지 않습니다(환경에 설정된 프록시는 botocore가 따릅니다).
+- lockfile만 변경 — 1st-party 코드 변경 없음. 싱크 플러그인은 그대로(v53)이므로 CDC 인프라 재배포가
+  필요 없습니다. 전체 테스트 통과, 6.9.1에서 UI를 부팅해 웹 스택에 영향이 없음을 확인했습니다.
+
 ## v0.1.569
 
 ### 보안
