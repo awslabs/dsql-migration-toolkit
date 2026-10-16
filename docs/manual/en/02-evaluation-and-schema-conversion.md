@@ -126,6 +126,12 @@ For every assessed object you get:
 The report also rolls these up into **summaries**: counts per classification and
 per effort level — your at-a-glance picture of how migratable the schema is.
 
+On screen, the list shows the objects by kind, most critical first. A kind with work to
+do opens on its own; each kind shows 50 objects at a time with a page control, and an
+object's risks and recommendations appear when you expand its row. The
+**Classification** and **Estimated manual effort** filters and the **Filter objects by
+name** box narrow the list. The HTML, JSON and Text exports always list every object.
+
 ### The migration readiness score
 
 The card at the top of the report rates the per-object work from 0 to 100. An AUTO object

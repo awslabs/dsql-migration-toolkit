@@ -471,6 +471,14 @@ class _Ui:
         self.texts.append(str(text))
         return self._El()
 
+    def refreshable(self, fn):
+        # NiceGUI's decorator: the result renders when called and has ``.refresh()``.
+        def _call(*a, **k):
+            return fn(*a, **k)
+
+        _call.refresh = lambda *a, **k: fn(*a, **k)
+        return _call
+
     def __getattr__(self, _name):
         return lambda *_a, **_k: self._El()
 

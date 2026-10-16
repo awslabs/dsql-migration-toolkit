@@ -721,6 +721,28 @@ def filter_select(ui, *, label, options, value, on_change, classes: str = ""):
     return select
 
 
+# The free-text box of the same filter bar (Cloudscape "TextFilter"). Outlined, dense and
+# clearable like Schema Conversion's "Filter objects by name" box, white like the
+# selects beside it, and debounced: a list filtered on the server is redrawn once per
+# pause in typing instead of on every keystroke.
+FILTER_INPUT_PROPS = "outlined dense clearable"
+FILTER_INPUT_CLASSES = "bg-white text-sm min-w-[16rem]"
+FILTER_INPUT_DEBOUNCE_MS = 300
+
+
+def filter_input(ui, *, placeholder, value="", on_change, classes: str = ""):
+    """Render the text filter of a :func:`filter_bar` (Cloudscape filtering "TextFilter").
+
+    ``on_change`` receives the (debounced) value change, as ``ui.input`` delivers it; a
+    cleared box reports ``None``. Returns the created input so the caller can set or read
+    its value.
+    """
+    box = ui.input(placeholder=placeholder, value=value, on_change=on_change)
+    box.props(f"{FILTER_INPUT_PROPS} debounce={FILTER_INPUT_DEBOUNCE_MS}")
+    box.classes(f"{FILTER_INPUT_CLASSES} {classes}".strip())
+    return box
+
+
 # ---------------------------------------------------------------------------
 # Container header (Cloudscape "Container"/"Header")
 # ---------------------------------------------------------------------------

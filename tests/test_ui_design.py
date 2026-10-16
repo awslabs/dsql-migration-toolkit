@@ -139,6 +139,13 @@ class _RecordingUi:
             self.texts.extend(str(v) for v in options)
         return _El(self, "select")
 
+    def input(self, *_a, placeholder=None, value=None, on_change=None, **_k):
+        # The placeholder is what an empty box shows, so it is recorded as visible text.
+        if placeholder:
+            self.texts.append(str(placeholder))
+        self.input_on_change = on_change
+        return _El(self, "input")
+
 
 # ---------------------------------------------------------------------------
 # Palette invariants
@@ -569,6 +576,31 @@ def test_filter_bar_is_a_wrapping_row() -> None:
     assert bar is not None
     classes_blob = " ".join(ui.classes)
     assert "flex-wrap" in classes_blob and "items-center" in classes_blob
+
+
+def test_filter_input_matches_the_bar_and_is_debounced() -> None:
+    from dsql_migrator.ui.design import FILTER_INPUT_DEBOUNCE_MS, filter_input
+
+    ui = _RecordingUi()
+    changes: list[object] = []
+    box = filter_input(
+        ui,
+        placeholder="Filter objects by name",
+        value="",
+        on_change=lambda e: changes.append(e),
+    )
+    assert box is not None
+    assert "Filter objects by name" in ui.texts
+    ui.input_on_change("x")
+    assert changes == ["x"], "the caller's handler is the one wired"
+    props_blob = " ".join(ui.props)
+    # Outlined, dense and clearable like Schema Conversion's name filter; debounced, since
+    # what it filters is redrawn on the server.
+    for prop in ("outlined", "dense", "clearable", f"debounce={FILTER_INPUT_DEBOUNCE_MS}"):
+        assert prop in props_blob, prop
+    assert FILTER_INPUT_DEBOUNCE_MS > 0
+    # White, like the selects beside it in the bar.
+    assert "bg-white" in " ".join(ui.classes)
 
 
 # ---------------------------------------------------------------------------

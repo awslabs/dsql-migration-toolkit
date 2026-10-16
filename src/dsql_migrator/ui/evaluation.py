@@ -79,7 +79,9 @@ from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.ai_chat_drawer import chat_turns_remaining
 from dsql_migrator.ui.design import (
     filter_bar,
+    filter_input,
     filter_select,
+    inline_hint,
     render_notice,
     section_header,
 )
@@ -723,9 +725,9 @@ def sort_assessment_items(items: list) -> list:
 
 
 def filter_assessment_items(
-    items: list, *, classification: str = "ALL", effort: str = "ALL"
+    items: list, *, classification: str = "ALL", effort: str = "ALL", name: str = ""
 ) -> list:
-    """Return the assessment items kept under the two "Objects by importance" filters.
+    """Return the assessment items kept under the "Objects by importance" filters.
 
     Filters along the two color-coded categories independently and combines them
     (AND): ``classification`` is ``ALL`` or a classification enum value
@@ -733,7 +735,9 @@ def filter_assessment_items(
     :class:`EffortLevel` value (``SIMPLE`` / ``MEDIUM`` / ``SIGNIFICANT``). An
     unknown value for either axis is treated as ``ALL`` (nothing hidden). Because
     ``AUTO`` objects carry no effort, selecting a specific effort naturally
-    excludes them. Order is preserved, so callers can sort first and filter after.
+    excludes them. ``name`` keeps the objects whose name contains it, ignoring case and
+    surrounding spaces -- the rule Schema Conversion's "Filter objects by name" box
+    applies to its tree. Order is preserved, so callers can sort first and filter after.
     """
     from dsql_migrator.core.models import Classification, EffortLevel
 
@@ -747,15 +751,39 @@ def filter_assessment_items(
         "MEDIUM": EffortLevel.MEDIUM,
         "SIGNIFICANT": EffortLevel.SIGNIFICANT,
     }.get(effort)
+    needle = (name or "").strip().lower()
 
     def _keep(item) -> bool:
         if class_target is not None and item.classification != class_target:
             return False
         if effort_target is not None and item.effort != effort_target:
             return False
+        if needle and needle not in item.object_name.lower():
+            return False
         return True
 
     return [item for item in items if _keep(item)]
+
+
+# Rows per object-kind group in the "Objects by importance" list. Each group shows one page
+# of its objects, most critical first, so the screen builds a bounded number of elements
+# however large the source is (the exports still list every object).
+OBJECTS_PER_PAGE = 50
+
+
+def assessment_page(
+    items: list, page: int, *, size: int = OBJECTS_PER_PAGE
+) -> tuple[list, int, int]:
+    """Return ``(the items on page, the page clamped to 1..pages, pages)``. Pure.
+
+    ``page`` is 1-based; one out of range (a group that shrank under a filter, a stale
+    page from an earlier render) is clamped rather than showing an empty page. An empty
+    list is one empty page.
+    """
+    pages = max(1, -(-len(items) // size))
+    current = min(max(1, int(page or 1)), pages)
+    start = (current - 1) * size
+    return items[start : start + size], current, pages
 
 
 # Display order for grouping assessed objects by kind. Tables come first (the
@@ -1223,6 +1251,10 @@ class EvaluationState:
         # combine (AND). Lets the user focus on actionable objects at scale.
         self.classification_filter: str = "ALL"
         self.effort_filter: str = "ALL"
+        # The list's name search and, per object kind, the page each group shows (both
+        # UI-thread only and never persisted, like the filters above).
+        self.name_filter: str = ""
+        self.list_pages: dict[str, int] = {}
         self._result: Optional[EvaluationResult] = None
         self._error: Optional[str] = None
         # Coarse progress for the in-progress UI, updated by the background
@@ -1802,7 +1834,6 @@ def build_evaluation_screen(
                     ui,
                     result,
                     eval_state=eval_state,
-                    refresh=refresh,
                     guidance_provider=guidance_provider,
                     open_ai_scope=open_ai_scope,
                     # So the target subsection can tell the operator when the assessed
@@ -1896,7 +1927,6 @@ def _render_result(
     result: EvaluationResult,
     *,
     eval_state: Optional["EvaluationState"] = None,
-    refresh: Optional[Callable[[], None]] = None,
     guidance_provider: Optional[
         Callable[
             ["AssessmentItem", "list[dict[str, str]]", Callable[[str], None]],
@@ -1915,8 +1945,9 @@ def _render_result(
     batch AI section: when AI assist is enabled, ``guidance_provider`` is a
     graceful per-object guidance call wired to a right slide-in AI drawer opened
     on demand from each actionable object; when it is ``None`` the affordance
-    renders disabled with a hint instead. ``eval_state``/``refresh`` drive the
-    assessment list filter (and are omitted only by non-UI callers).
+    renders disabled with a hint instead. ``eval_state`` holds the object list's
+    filters, search and pages (it is omitted only by non-UI callers, which get the
+    list without its filter bar).
     """
     inventory = result.inventory
     ai_enabled = guidance_provider is not None
@@ -1975,7 +2006,6 @@ def _render_result(
             result.assessment,
             render_title=False,
             eval_state=eval_state,
-            refresh=refresh,
             on_ai=on_ai,
             ai_enabled=ai_enabled,
         )
@@ -2216,7 +2246,6 @@ def _render_assessment(
     *,
     render_title: bool = True,
     eval_state: Optional["EvaluationState"] = None,
-    refresh: Optional[Callable[[], None]] = None,
     on_ai: Optional[Callable[["AssessmentItem"], object]] = None,
     ai_enabled: bool = False,
 ) -> None:
@@ -2224,10 +2253,11 @@ def _render_assessment(
 
     Per-object detail is shown as an expandable accordion (not a table) so long
     Risk/Recommendation text is never truncated, ordered most-critical-first and
-    showing each object's kind and classification. A filter (All / Needs
-    attention / per classification) lets the user focus on actionable objects in
-    a large schema; it is driven by ``eval_state``/``refresh`` and omitted when
-    those are not provided. ``render_title`` is False when the caller already
+    showing each object's kind and classification. Two filters (Classification /
+    Estimated manual effort) and a name search let the user focus on actionable
+    objects in a large schema; they are driven by ``eval_state`` and omitted
+    without one. The list is bounded and lazily built (see
+    :func:`_render_object_list`). ``render_title`` is False when the caller already
     shows the section title in a header (e.g. alongside the export buttons).
     ``on_ai``/``ai_enabled`` wire each actionable object's on-demand AI guidance
     (opening the fixed right drawer); when AI is off the affordance renders
@@ -2273,8 +2303,8 @@ def _render_assessment(
     # Per-object detail as an expandable list (accordion), ordered by importance
     # so the most critical objects are at the top. Two AWS-style dropdown filters
     # (Classification / Estimated manual effort — the same color-coded categories
-    # the summary badges show) let the user focus on actionable objects in a large
-    # schema instead of scrolling past every AUTO object.
+    # the summary badges show) and a name search let the user focus on actionable
+    # objects in a large schema instead of scrolling past every AUTO object.
     if not report.items:
         ui.label("Objects by importance (most critical first)").classes(  # type: ignore[attr-defined]
             "text-md font-semibold"
@@ -2282,16 +2312,9 @@ def _render_assessment(
         ui.label("No objects were assessed.").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
         return
 
-    class_mode = eval_state.classification_filter if eval_state is not None else "ALL"
-    effort_mode = eval_state.effort_filter if eval_state is not None else "ALL"
-    ordered = sort_assessment_items(report.items)
-    visible = filter_assessment_items(
-        ordered, classification=class_mode, effort=effort_mode
+    ui.label("Objects by importance (most critical first)").classes(  # type: ignore[attr-defined]
+        "text-md font-semibold"
     )
-
-    ui.label(  # type: ignore[attr-defined]
-        f"Objects by importance — showing {len(visible)} of {len(report.items)}"
-    ).classes("text-md font-semibold")
     # Effort distribution, beside the list and the effort filter it describes. The count
     # is spelled out as "objects needing work" because it is NOT the object total: an
     # object with no required work (all-AUTO, or only a recommendation) carries no effort
@@ -2307,25 +2330,62 @@ def _render_assessment(
                 ).classes("text-sm q-px-sm q-py-xs")
             needing = sum(report.effort_summary.values())
             ui.label(  # type: ignore[attr-defined]
-                f"({needing} of {len(report.items)} objects need work)"
+                f"({needing:,} of {len(report.items):,} objects need work)"
             ).classes("text-xs text-gray-500")
-    if eval_state is not None and refresh is not None:
+
+    # The list's filters, search and pages. A non-UI caller (no eval_state) gets the list
+    # with its defaults and no filter bar.
+    view = eval_state if eval_state is not None else EvaluationState()
+    # Sorted once per render; a filter, the search or Clear filters only re-filters it.
+    ordered = sort_assessment_items(report.items)
+    controls: dict[str, object] = {}
+    # Set while Clear filters puts the controls back: their change handlers then fire
+    # with values already applied, and the one redraw is Clear's own.
+    clearing = False
+
+    def _list_changed() -> None:
+        if clearing:
+            return
+        # A different set of objects, so every group starts again at its first page.
+        view.list_pages.clear()
+        object_list.refresh()  # type: ignore[attr-defined]
+
+    def on_clear() -> None:
+        nonlocal clearing
+        view.classification_filter = "ALL"
+        view.effort_filter = "ALL"
+        view.name_filter = ""
+        clearing = True
+        try:
+            for key, value in (("classification", "ALL"), ("effort", "ALL"), ("name", "")):
+                control = controls.get(key)
+                if control is not None:
+                    control.set_value(value)  # type: ignore[attr-defined]
+        finally:
+            clearing = False
+        _list_changed()
+
+    if eval_state is not None:
+        # A handler fires only when THIS control's value changed, so it always redraws:
+        # the state is the session's, shared by its browser tabs, and may already hold the
+        # value another tab chose while this tab's list still shows the old one.
 
         def on_class(event: object) -> None:
-            eval_state.classification_filter = getattr(event, "value", "ALL") or "ALL"
-            refresh()
+            view.classification_filter = getattr(event, "value", None) or "ALL"
+            _list_changed()
 
         def on_effort(event: object) -> None:
-            eval_state.effort_filter = getattr(event, "value", "ALL") or "ALL"
-            refresh()
+            view.effort_filter = getattr(event, "value", None) or "ALL"
+            _list_changed()
 
-        def on_clear() -> None:
-            eval_state.classification_filter = "ALL"
-            eval_state.effort_filter = "ALL"
-            refresh()
+        def on_name(event: object) -> None:
+            view.name_filter = (getattr(event, "value", None) or "").strip()
+            _list_changed()
 
+        # The bar sits OUTSIDE the list's refreshable, so a redraw never re-creates the
+        # search box under the operator's cursor.
         with filter_bar(ui):  # type: ignore[attr-defined]
-            filter_select(  # type: ignore[attr-defined]
+            controls["classification"] = filter_select(  # type: ignore[attr-defined]
                 ui,
                 label="Classification",
                 options={
@@ -2334,10 +2394,10 @@ def _render_assessment(
                     "MANUAL": classification_label("MANUAL"),
                     "UNSUPPORTED": classification_label("UNSUPPORTED"),
                 },
-                value=class_mode,
+                value=view.classification_filter,
                 on_change=on_class,
             )
-            filter_select(  # type: ignore[attr-defined]
+            controls["effort"] = filter_select(  # type: ignore[attr-defined]
                 ui,
                 label="Estimated manual effort",
                 options={
@@ -2346,47 +2406,231 @@ def _render_assessment(
                     "MEDIUM": "Medium (2–6h)",
                     "SIGNIFICANT": "Significant (> 6h)",
                 },
-                value=effort_mode,
+                value=view.effort_filter,
                 on_change=on_effort,
             )
-            if class_mode != "ALL" or effort_mode != "ALL":
-                ui.button("Clear filters", on_click=on_clear).props(  # type: ignore[attr-defined]
-                    "flat dense no-caps color=primary"
-                )
+            controls["name"] = filter_input(
+                ui,
+                placeholder="Filter objects by name",
+                value=view.name_filter,
+                on_change=on_name,
+            )
 
+    # Its own refreshable: a filter, the search or Clear filters redraws this list and
+    # nothing else. They used to call the workflow shell's refresh, which rebuilt the whole
+    # page -- sidebar, diagram, score, chart and every row -- on each click.
+    @ui.refreshable  # type: ignore[attr-defined]
+    def object_list() -> None:
+        _render_object_list(
+            ui,
+            ordered,
+            view=view,
+            total=len(report.items),
+            on_clear=on_clear,
+            on_ai=on_ai,
+            ai_enabled=ai_enabled,
+        )
+
+    object_list()
+
+
+def _render_object_list(
+    ui: object,
+    ordered: list,
+    *,
+    view: "EvaluationState",
+    total: int,
+    on_clear: Callable[[], None],
+    on_ai: Optional[Callable[..., object]],
+    ai_enabled: bool,
+) -> None:
+    """The filtered list: a count line, then one section per object kind.
+
+    What it builds is bounded whatever the source's size. A section's rows are built only
+    while it is open and one page (:data:`OBJECTS_PER_PAGE`) at a time, and an object's
+    finding cards only when its row is first expanded. Building every row and card up front
+    -- collapsed ones included, which Quasar keeps in the DOM -- cost about 100 elements
+    per object: some 98,000 for 1,000 tables, five seconds of the event loop that every
+    session shares on each render. The browser's find does not see a collapsed row's
+    findings either way, so the name search is the way to look an object up; the exports
+    list every object.
+    """
+    visible = filter_assessment_items(
+        ordered,
+        classification=view.classification_filter,
+        effort=view.effort_filter,
+        name=view.name_filter,
+    )
+    narrowed = (
+        view.classification_filter != "ALL"
+        or view.effort_filter != "ALL"
+        or bool(view.name_filter)
+    )
     if not visible:
-        ui.label(  # type: ignore[attr-defined]
-            "No objects match these filters."
-        ).classes("text-sm text-gray-500")
+        with ui.row().classes("items-center gap-2"):  # type: ignore[attr-defined]
+            ui.label("No objects match these filters.").classes(  # type: ignore[attr-defined]
+                "text-sm text-gray-500"
+            )
+            ui.button("Clear filters", on_click=on_clear).props(  # type: ignore[attr-defined]
+                "flat dense no-caps color=primary"
+            )
         return
 
-    # Render the full list inline (the page scrolls) -- no inner scroll area, so
-    # there is no nested-scroll trap and the browser's find works across every
-    # item. Objects are grouped by kind; a group is expanded by default only when
-    # it has actionable (UNSUPPORTED/MANUAL) items, so a large all-AUTO group
-    # (common at scale) stays collapsed with its counts visible in the header.
+    with ui.row().classes("items-center gap-2"):  # type: ignore[attr-defined]
+        inline_hint(
+            ui,
+            (
+                f"{len(visible):,} of {total:,} objects match"
+                if narrowed
+                else f"{total:,} object{'' if total == 1 else 's'}"
+            ),
+            classes="text-sm",
+        )
+        if narrowed:
+            ui.button("Clear filters", on_click=on_clear).props(  # type: ignore[attr-defined]
+                "flat dense no-caps color=primary"
+            )
     with ui.column().classes("w-full gap-1"):  # type: ignore[attr-defined]
         for kind, kind_items in group_assessment_items_by_kind(visible):
-            actionable = any(
-                item.classification.value != "AUTO" for item in kind_items
+            _render_kind_group(
+                ui,
+                kind,
+                kind_items,
+                view=view,
+                # Narrowed by a filter or the search: the operator asked to see these.
+                open_=narrowed
+                or any(item.classification.value != "AUTO" for item in kind_items),
+                on_ai=on_ai,
+                ai_enabled=ai_enabled,
             )
-            with ui.expansion(value=actionable).classes("w-full").props(  # type: ignore[attr-defined]
-                "expand-separator"
-            ) as kind_exp:
-                with kind_exp.add_slot("header"):
-                    with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
-                        ui.label(kind_section_label(kind)).classes(  # type: ignore[attr-defined]
-                            "text-sm font-semibold"
-                        )
-                        ui.badge(str(len(kind_items))).props("color=primary")  # type: ignore[attr-defined]
-                        ui.label(assessment_kind_summary(kind_items)).classes(  # type: ignore[attr-defined]
-                            "text-xs text-gray-500"
-                        )
-                with ui.column().classes("gap-1 w-full pl-2"):  # type: ignore[attr-defined]
-                    for item in kind_items:
-                        _render_assessment_item(
-                            ui, item, on_ai=on_ai, ai_enabled=ai_enabled
-                        )
+
+
+def _lazy_expansion(
+    ui: object,
+    *,
+    header: Callable[[], None],
+    body: Callable[[], None],
+    value: bool = False,
+) -> object:
+    """A ``ui.expansion`` whose content is built the first time it opens.
+
+    ``header`` fills the header slot. ``body`` runs inside the expansion once: right away
+    when it starts open, otherwise on its first open (its value-change event). Collapsing
+    keeps what was built, so a re-open costs nothing. Returns the expansion.
+    """
+    built = False
+
+    def build() -> None:
+        nonlocal built
+        if built:
+            return
+        built = True
+        with expansion:  # type: ignore[attr-defined]
+            body()
+
+    def on_change(event: object) -> None:
+        if getattr(event, "value", False):
+            build()
+
+    expansion = (
+        ui.expansion(value=value, on_value_change=on_change)  # type: ignore[attr-defined]
+        .classes("w-full")
+        .props("expand-separator")
+    )
+    with expansion.add_slot("header"):
+        header()
+    if value:
+        build()
+    return expansion
+
+
+def _render_kind_group(
+    ui: object,
+    kind: str,
+    kind_items: list,
+    *,
+    view: "EvaluationState",
+    open_: bool,
+    on_ai: Optional[Callable[..., object]],
+    ai_enabled: bool,
+) -> None:
+    """One object kind's section: a header with its counts, and its rows built lazily.
+
+    It starts open when ``open_`` (the kind has work to do, or the list is narrowed), and
+    otherwise closed and empty, so a large all-AUTO group stays one header line until the
+    operator opens it.
+    """
+
+    def header() -> None:
+        with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
+            ui.label(kind_section_label(kind)).classes(  # type: ignore[attr-defined]
+                "text-sm font-semibold"
+            )
+            ui.badge(f"{len(kind_items):,}").props("color=primary")  # type: ignore[attr-defined]
+            ui.label(assessment_kind_summary(kind_items)).classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-500"
+            )
+
+    _lazy_expansion(
+        ui,
+        header=header,
+        body=lambda: _render_kind_rows(
+            ui, kind, kind_items, view=view, on_ai=on_ai, ai_enabled=ai_enabled
+        ),
+        value=open_,
+    )
+
+
+def _render_kind_rows(
+    ui: object,
+    kind: str,
+    kind_items: list,
+    *,
+    view: "EvaluationState",
+    on_ai: Optional[Callable[..., object]],
+    ai_enabled: bool,
+) -> None:
+    """One page of a section's rows, most critical first, under a page control when the
+    section has more than one page.
+
+    The page is kept per kind in ``view.list_pages``, so a redraw of the list keeps it, and
+    turning it redraws this section's rows only. The control sits above the rows, where it
+    stays in view after the page turns (Cloudscape puts a collection's pagination there).
+    """
+    rows_box = ui.column().classes("gap-1 w-full pl-2")  # type: ignore[attr-defined]
+    # The page THIS section shows: the stored one is the session's, which another browser
+    # tab may already have turned to the page this one is asked for.
+    shown: dict[str, int] = {}
+
+    def turn(event: object) -> None:
+        page = int(getattr(event, "value", None) or 1)
+        if page == shown.get("page"):
+            return
+        view.list_pages[kind] = page
+        rows_box.clear()  # type: ignore[attr-defined]
+        with rows_box:  # type: ignore[attr-defined]
+            draw()
+
+    def draw() -> None:
+        rows, page, pages = assessment_page(kind_items, view.list_pages.get(kind, 1))
+        shown["page"] = view.list_pages[kind] = page
+        if pages > 1:
+            first = (page - 1) * OBJECTS_PER_PAGE + 1
+            with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
+                inline_hint(
+                    ui,
+                    f"Showing {first:,} to {first + len(rows) - 1:,} of "
+                    f"{len(kind_items):,}. The exports list every object.",
+                )
+                ui.space()  # type: ignore[attr-defined]
+                ui.pagination(  # type: ignore[attr-defined]
+                    1, pages, direction_links=True, value=page, on_change=turn
+                ).props("max-pages=7 boundary-numbers")
+        for item in rows:
+            _render_assessment_item(ui, item, on_ai=on_ai, ai_enabled=ai_enabled)
+
+    with rows_box:  # type: ignore[attr-defined]
+        draw()
 
 
 def _render_concern_line(
@@ -2426,193 +2670,215 @@ def _render_assessment_item(
     on_ai: Optional[Callable[["AssessmentItem"], object]] = None,
     ai_enabled: bool = False,
 ) -> None:
-    """Render one assessed object as an expandable row (header + detail body).
+    """Render one assessed object as an expandable row: its findings summary in the
+    header, and its finding cards (:func:`_render_assessment_item_body`) built when the
+    row is first expanded.
 
-    For an object that needs attention (not AUTO), the header row carries a compact
-    on-demand AI-guidance ICON that opens the side panel for this object (``on_ai``),
-    so guidance is one click away without expanding the row; ``click.stop`` keeps that
-    click from toggling the expansion. When AI assist is off the icon is shown disabled
-    with a hint, so the affordance is discoverable rather than silently missing.
+    A collapsed row is about 6 elements, and its cards add about 18 per finding once
+    built. They used to be built for every row, collapsed or not, so a 1,000-table source
+    with five findings per table paid for 5,000 cards nobody had opened.
     """
-    is_auto = item.classification.value == "AUTO"
     color = _CLASS_BADGE_COLOR.get(item.classification.value, "grey")
-    with ui.expansion().classes("w-full").props("expand-separator") as exp:  # type: ignore[attr-defined]
-        with exp.add_slot("header"):
-            with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
-                ui.label(item.object_name).classes("font-medium")  # type: ignore[attr-defined]
-                ui.badge(item.kind).props("color=grey-6 outline")  # type: ignore[attr-defined]
-                # ONE BADGE PER FINDINGS CATEGORY, not a single governing badge. That badge
-                # named only the most severe classification and was silent about the rest:
-                # measured on a real source, 16 of 18 tables carried a mix -- typically a
-                # real gap plus the AUTO_INCREMENT recommendation -- behind one badge, and a
-                # row reading "Unsupported" could hide six findings of which four were
-                # merely review-needed and one was optional advice. The object looked wholly
-                # blocked when most of it was not.
-                #
-                # Each badge keeps its label rather than showing a bare count, so severity
-                # never rests on color alone (a colorblind reader, or a monochrome
-                # screenshot, would otherwise need the chart legend to decode it). The
-                # leading badge is the classification the old single badge showed, so the
-                # row still reads worst-first at a glance.
-                #
-                # The per-object effort badge is deliberately NOT here. It described the
-                # object as a whole while this row now summarises its findings, and each
-                # finding carries its own effort inside -- which is the number to act on,
-                # since one SIMPLE fix and one SIGNIFICANT one do not average. The effort
-                # distribution for the whole schema stays in the summary above the list.
-                counts = assessment_concern_counts(item)
-                if counts:
-                    for label, count, badge_color in counts:
-                        ui.badge(f"{count} {label}").props(  # type: ignore[attr-defined]
-                            f"color={badge_color}"
-                        )
-                else:
-                    # No findings at all (a clean AUTO object): still say so, rather than
-                    # leaving the row with nothing but a name.
-                    ui.badge(  # type: ignore[attr-defined]
-                        classification_label(item.classification.value)
-                    ).props(f"color={color}")
-        with ui.column().classes("gap-3 p-3 w-full"):  # type: ignore[attr-defined]
-            # One block per matched rule, each pairing a risk with ITS OWN
-            # recommendation. Previously every rule's text was semicolon-joined into a
-            # single Risk paragraph and a single Recommendation paragraph, so a table
-            # matching five rules (FK + AUTO_INCREMENT + CI collation + ENUM + ON UPDATE)
-            # produced two run-on sentences and left the reader to guess which fix went
-            # with which problem. `concerns` is empty only for a report persisted before
-            # it existed, which falls back to the joined text below.
-            concerns = list(getattr(item, "concerns", None) or [])
-            if concerns:
-                # Each concern is a bordered card indented behind ONE vertical spine, so
-                # the expanded body reads as children of the row above it. Flat
-                # separators (the previous treatment) gave no such cue: at two expanded
-                # tables the findings ran together and it was not obvious which object a
-                # given block belonged to. The spine + card is the same containment
-                # idiom as the object tree on the Schema Conversion screen.
-                with ui.column().classes(  # type: ignore[attr-defined]
-                    "gap-2 w-full pl-4 ml-1 border-l-2 border-gray-200"
-                ):
-                    for concern in concerns:
-                        # An ADVISORY finding is not a defect: the conversion is complete
-                        # and correct and ignoring it costs throughput, not correctness.
-                        # It therefore gets the calm info-blue treatment instead of the
-                        # amber warning one, so a reader can tell at a glance which of an
-                        # object's five findings they MUST act on. Same distinction
-                        # Schema Conversion has drawn since v0.1.151.
-                        advisory = getattr(concern, "is_advisory", False)
-                        with ui.column().classes(  # type: ignore[attr-defined]
-                            "gap-2 w-full rounded-md border p-3 "
-                            + (
-                                "border-sky-200 bg-sky-50"
-                                if advisory
-                                else "border-gray-200 bg-gray-50"
-                            )
-                        ):
-                            with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
-                                # Per-concern class: the item's badge shows only the
-                                # governing (most severe) one, which says nothing about
-                                # the others. An advisory finding says "RECOMMENDED"
-                                # rather than repeating the object's severity, because
-                                # its classification is about how much work the CHANGE
-                                # would be, not about anything being wrong.
-                                if advisory:
-                                    ui.badge("RECOMMENDED").props(  # type: ignore[attr-defined]
-                                        "color=info outline"
-                                    )
-                                else:
-                                    ui.badge(  # type: ignore[attr-defined]
-                                        classification_label(
-                                            concern.classification.value
-                                        )
-                                    ).props(
-                                        "color="
-                                        + _CLASS_BADGE_COLOR.get(
-                                            concern.classification.value, "grey"
-                                        )
-                                        + " outline"
-                                    )
-                                ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
-                                    "text-xs text-gray-500 font-mono"
-                                )
-                                # Push the effort badge + per-finding AI icon to the
-                                # right of the concern's header line.
-                                ui.space()  # type: ignore[attr-defined]
-                                if concern.effort is not None:
-                                    # "if you take it" makes clear the estimate is the
-                                    # cost of OPTING IN, not required migration work --
-                                    # it is excluded from the object's effort for exactly
-                                    # that reason.
-                                    ui.badge(  # type: ignore[attr-defined]
-                                        (
-                                            f"effort if you take it: "
-                                            f"{concern.effort.value}"
-                                        )
-                                        if advisory
-                                        else f"effort: {concern.effort.value}"
-                                    ).props(f"color={_EFFORT_BADGE_COLOR} outline")
-                                # Per-FINDING AI guidance icon: ask AI about THIS
-                                # specific finding on this object (one click).
-                                _render_item_ai_action(
-                                    ui, item, on_ai=on_ai, ai_enabled=ai_enabled,
-                                    concern=concern,
-                                )
-                            # Problem and fix are LABELED and visually separated. A bare
-                            # sentence followed by a fainter arrowed sentence read as one
-                            # wrapped paragraph -- the arrow was the only cue that the
-                            # second line was the remedy, and it was easy to skim past.
-                            # Each now carries its own leading chip (amber "Risk" /
-                            # green "Recommendation"), matching the amber=be-aware,
-                            # green=resolution tones the notice palette uses, with the
-                            # fix on a tinted panel so problem and solution are two
-                            # distinct blocks rather than two lines of prose.
-                            if concern.risk:
-                                _render_concern_line(
-                                    ui,
-                                    # Advisory: the text describes the situation, not a
-                                    # hazard, so neither the word "Risk" nor the amber
-                                    # warning palette applies to it.
-                                    icon="info" if advisory else "warning",
-                                    label="Note" if advisory else "Risk",
-                                    text=concern.risk,
-                                    icon_class=(
-                                        "text-sky-600" if advisory else "text-amber-600"
-                                    ),
-                                    label_class=(
-                                        "text-sky-700" if advisory else "text-amber-700"
-                                    ),
-                                    panel_class=(
-                                        "rounded border px-2 py-1.5 "
-                                        + (
-                                            "border-sky-200 bg-white"
-                                            if advisory
-                                            else "border-amber-200 bg-amber-50"
-                                        )
-                                    ),
-                                )
-                            if concern.recommendation:
-                                _render_concern_line(
-                                    ui,
-                                    icon="lightbulb",
-                                    label="Recommendation",
-                                    text=concern.recommendation,
-                                    icon_class="text-green-600",
-                                    label_class="text-green-700",
-                                    panel_class=(
-                                        "rounded border border-green-200 bg-green-50 "
-                                        "px-2 py-1.5"
-                                    ),
-                                )
-            else:
-                ui.label(f"Rule: {item.rule_id}").classes(  # type: ignore[attr-defined]
-                    "text-xs text-gray-500"
-                )
-                if item.risk:
-                    ui.label("Risk").classes("text-sm font-semibold")  # type: ignore[attr-defined]
-                    ui.label(item.risk).classes("text-sm")  # type: ignore[attr-defined]
-                if item.recommendation:
-                    ui.label("Recommendation").classes(  # type: ignore[attr-defined]
-                        "text-sm font-semibold"
+
+    def header() -> None:
+        with ui.row().classes("items-center gap-2 w-full no-wrap"):  # type: ignore[attr-defined]
+            ui.label(item.object_name).classes("font-medium")  # type: ignore[attr-defined]
+            ui.badge(item.kind).props("color=grey-6 outline")  # type: ignore[attr-defined]
+            # ONE BADGE PER FINDINGS CATEGORY, not a single governing badge. That badge
+            # named only the most severe classification and was silent about the rest:
+            # measured on a real source, 16 of 18 tables carried a mix -- typically a
+            # real gap plus the AUTO_INCREMENT recommendation -- behind one badge, and a
+            # row reading "Unsupported" could hide six findings of which four were
+            # merely review-needed and one was optional advice. The object looked wholly
+            # blocked when most of it was not.
+            #
+            # Each badge keeps its label rather than showing a bare count, so severity
+            # never rests on color alone (a colorblind reader, or a monochrome
+            # screenshot, would otherwise need the chart legend to decode it). The
+            # leading badge is the classification the old single badge showed, so the
+            # row still reads worst-first at a glance.
+            #
+            # The per-object effort badge is deliberately NOT here. It described the
+            # object as a whole while this row now summarises its findings, and each
+            # finding carries its own effort inside -- which is the number to act on,
+            # since one SIMPLE fix and one SIGNIFICANT one do not average. The effort
+            # distribution for the whole schema stays in the summary above the list.
+            counts = assessment_concern_counts(item)
+            if counts:
+                for label, count, badge_color in counts:
+                    ui.badge(f"{count} {label}").props(  # type: ignore[attr-defined]
+                        f"color={badge_color}"
                     )
-                    ui.label(item.recommendation).classes("text-sm")  # type: ignore[attr-defined]
+            else:
+                # No findings at all (a clean AUTO object): still say so, rather than
+                # leaving the row with nothing but a name.
+                ui.badge(  # type: ignore[attr-defined]
+                    classification_label(item.classification.value)
+                ).props(f"color={color}")
+
+    _lazy_expansion(
+        ui,
+        header=header,
+        body=lambda: _render_assessment_item_body(
+            ui, item, on_ai=on_ai, ai_enabled=ai_enabled
+        ),
+    )
+
+
+def _render_assessment_item_body(
+    ui: object,
+    item: "AssessmentItem",
+    *,
+    on_ai: Optional[Callable[["AssessmentItem"], object]] = None,
+    ai_enabled: bool = False,
+) -> None:
+    """One object's finding cards: a risk and its own recommendation per matched rule.
+
+    Each card carries a compact on-demand AI-guidance icon for that finding
+    (``on_ai``); when AI assist is off the icon is shown disabled with a hint, so the
+    affordance is discoverable rather than silently missing.
+    """
+    with ui.column().classes("gap-3 p-3 w-full"):  # type: ignore[attr-defined]
+        # One block per matched rule, each pairing a risk with ITS OWN
+        # recommendation. Previously every rule's text was semicolon-joined into a
+        # single Risk paragraph and a single Recommendation paragraph, so a table
+        # matching five rules (FK + AUTO_INCREMENT + CI collation + ENUM + ON UPDATE)
+        # produced two run-on sentences and left the reader to guess which fix went
+        # with which problem. `concerns` is empty only for a report persisted before
+        # it existed, which falls back to the joined text below.
+        concerns = list(getattr(item, "concerns", None) or [])
+        if concerns:
+            # Each concern is a bordered card indented behind ONE vertical spine, so
+            # the expanded body reads as children of the row above it. Flat
+            # separators (the previous treatment) gave no such cue: at two expanded
+            # tables the findings ran together and it was not obvious which object a
+            # given block belonged to. The spine + card is the same containment
+            # idiom as the object tree on the Schema Conversion screen.
+            with ui.column().classes(  # type: ignore[attr-defined]
+                "gap-2 w-full pl-4 ml-1 border-l-2 border-gray-200"
+            ):
+                for concern in concerns:
+                    # An ADVISORY finding is not a defect: the conversion is complete
+                    # and correct and ignoring it costs throughput, not correctness.
+                    # It therefore gets the calm info-blue treatment instead of the
+                    # amber warning one, so a reader can tell at a glance which of an
+                    # object's five findings they MUST act on. Same distinction
+                    # Schema Conversion has drawn since v0.1.151.
+                    advisory = getattr(concern, "is_advisory", False)
+                    with ui.column().classes(  # type: ignore[attr-defined]
+                        "gap-2 w-full rounded-md border p-3 "
+                        + (
+                            "border-sky-200 bg-sky-50"
+                            if advisory
+                            else "border-gray-200 bg-gray-50"
+                        )
+                    ):
+                        with ui.row().classes("items-center gap-2 no-wrap w-full"):  # type: ignore[attr-defined]
+                            # Per-concern class: the item's badge shows only the
+                            # governing (most severe) one, which says nothing about
+                            # the others. An advisory finding says "RECOMMENDED"
+                            # rather than repeating the object's severity, because
+                            # its classification is about how much work the CHANGE
+                            # would be, not about anything being wrong.
+                            if advisory:
+                                ui.badge("RECOMMENDED").props(  # type: ignore[attr-defined]
+                                    "color=info outline"
+                                )
+                            else:
+                                ui.badge(  # type: ignore[attr-defined]
+                                    classification_label(
+                                        concern.classification.value
+                                    )
+                                ).props(
+                                    "color="
+                                    + _CLASS_BADGE_COLOR.get(
+                                        concern.classification.value, "grey"
+                                    )
+                                    + " outline"
+                                )
+                            ui.label(concern.rule_id).classes(  # type: ignore[attr-defined]
+                                "text-xs text-gray-500 font-mono"
+                            )
+                            # Push the effort badge + per-finding AI icon to the
+                            # right of the concern's header line.
+                            ui.space()  # type: ignore[attr-defined]
+                            if concern.effort is not None:
+                                # "if you take it" makes clear the estimate is the
+                                # cost of OPTING IN, not required migration work --
+                                # it is excluded from the object's effort for exactly
+                                # that reason.
+                                ui.badge(  # type: ignore[attr-defined]
+                                    (
+                                        f"effort if you take it: "
+                                        f"{concern.effort.value}"
+                                    )
+                                    if advisory
+                                    else f"effort: {concern.effort.value}"
+                                ).props(f"color={_EFFORT_BADGE_COLOR} outline")
+                            # Per-FINDING AI guidance icon: ask AI about THIS
+                            # specific finding on this object (one click).
+                            _render_item_ai_action(
+                                ui, item, on_ai=on_ai, ai_enabled=ai_enabled,
+                                concern=concern,
+                            )
+                        # Problem and fix are LABELED and visually separated. A bare
+                        # sentence followed by a fainter arrowed sentence read as one
+                        # wrapped paragraph -- the arrow was the only cue that the
+                        # second line was the remedy, and it was easy to skim past.
+                        # Each now carries its own leading chip (amber "Risk" /
+                        # green "Recommendation"), matching the amber=be-aware,
+                        # green=resolution tones the notice palette uses, with the
+                        # fix on a tinted panel so problem and solution are two
+                        # distinct blocks rather than two lines of prose.
+                        if concern.risk:
+                            _render_concern_line(
+                                ui,
+                                # Advisory: the text describes the situation, not a
+                                # hazard, so neither the word "Risk" nor the amber
+                                # warning palette applies to it.
+                                icon="info" if advisory else "warning",
+                                label="Note" if advisory else "Risk",
+                                text=concern.risk,
+                                icon_class=(
+                                    "text-sky-600" if advisory else "text-amber-600"
+                                ),
+                                label_class=(
+                                    "text-sky-700" if advisory else "text-amber-700"
+                                ),
+                                panel_class=(
+                                    "rounded border px-2 py-1.5 "
+                                    + (
+                                        "border-sky-200 bg-white"
+                                        if advisory
+                                        else "border-amber-200 bg-amber-50"
+                                    )
+                                ),
+                            )
+                        if concern.recommendation:
+                            _render_concern_line(
+                                ui,
+                                icon="lightbulb",
+                                label="Recommendation",
+                                text=concern.recommendation,
+                                icon_class="text-green-600",
+                                label_class="text-green-700",
+                                panel_class=(
+                                    "rounded border border-green-200 bg-green-50 "
+                                    "px-2 py-1.5"
+                                ),
+                            )
+        else:
+            ui.label(f"Rule: {item.rule_id}").classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-500"
+            )
+            if item.risk:
+                ui.label("Risk").classes("text-sm font-semibold")  # type: ignore[attr-defined]
+                ui.label(item.risk).classes("text-sm")  # type: ignore[attr-defined]
+            if item.recommendation:
+                ui.label("Recommendation").classes(  # type: ignore[attr-defined]
+                    "text-sm font-semibold"
+                )
+                ui.label(item.recommendation).classes("text-sm")  # type: ignore[attr-defined]
 
 
 def _render_item_ai_action(
@@ -2779,6 +3045,8 @@ __all__ = [
     "with_refreshed_catalogs",
     "chat_turns_remaining",
     "filter_assessment_items",
+    "assessment_page",
+    "OBJECTS_PER_PAGE",
     "sort_assessment_items",
     "source_inventory_tallies",
     "group_assessment_items_by_kind",

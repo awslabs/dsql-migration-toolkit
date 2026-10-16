@@ -3435,7 +3435,8 @@ def test_conversion_note_surfaces_come_from_the_same_tokens_evaluation_uses() ->
     from dsql_migrator.ui import evaluation, schema_conversion
 
     notes = inspect.getsource(schema_conversion._render_conversion_warnings)
-    concern = inspect.getsource(evaluation._render_assessment_item)
+    # The finding cards an expanded Evaluation row builds (on its first expand).
+    concern = inspect.getsource(evaluation._render_assessment_item_body)
     for surface in ("border-gray-200 bg-gray-50", "border-sky-200 bg-sky-50"):
         assert surface in notes, surface
         assert surface in concern, surface

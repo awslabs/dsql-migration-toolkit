@@ -1081,8 +1081,20 @@ def test_kind_section_label_friendly_names() -> None:
 # ---------------------------------------------------------------------------
 
 
+class _Changed:
+    """The event a value change hands its handler (``event.value``)."""
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+
 class _ItemUi:
-    """A NiceGUI stand-in that records emitted text, badges, and separators."""
+    """A NiceGUI stand-in that records emitted text, badges, and separators.
+
+    It also counts every element it creates (``created``) and keeps the handlers the
+    browser would trigger -- an expansion opening, a page turning, a filter changing, a
+    button click -- so a test can drive the screen the way the operator does.
+    """
 
     def __init__(self) -> None:
         self.texts: list[str] = []
@@ -1090,6 +1102,15 @@ class _ItemUi:
         self.separators = 0
         self.icons: list[str] = []
         self.classes: list[str] = []
+        self.created = 0
+        # (element, on_value_change, index into texts where its header starts)
+        self.expansions: list[tuple] = []
+        self._opened: set[int] = set()
+        self.paginations: list[tuple] = []  # (element, on_change, (min, max), value)
+        self.inputs: list[tuple] = []  # (element, on_change, placeholder)
+        self.selects: dict[str, object] = {}  # label -> on_change
+        self.buttons: dict[str, list] = {}  # text -> [on_click, ...]
+        self.refreshes = 0
 
     class _El:
         def __init__(self, owner) -> None:
@@ -1124,6 +1145,7 @@ class _ItemUi:
             return lambda *_a, **_k: self
 
     def _el(self):
+        self.created += 1
         return self._El(self)
 
     def label(self, text="", *_a, **_k):
@@ -1145,6 +1167,64 @@ class _ItemUi:
         if name:
             self.icons.append(str(name))
         return self._el()
+
+    def expansion(self, *_a, on_value_change=None, **_k):
+        element = self._el()
+        self.expansions.append((element, on_value_change, len(self.texts)))
+        return element
+
+    def pagination(self, *bounds, on_change=None, value=None, **_k):
+        element = self._el()
+        self.paginations.append((element, on_change, bounds, value))
+        return element
+
+    def input(self, *_a, on_change=None, placeholder=None, **_k):
+        element = self._el()
+        self.inputs.append((element, on_change, placeholder))
+        return element
+
+    def select(self, *_a, label=None, on_change=None, **_k):
+        self.selects[str(label)] = on_change
+        return self._el()
+
+    def button(self, text="", *_a, on_click=None, **_k):
+        self.buttons.setdefault(str(text), []).append(on_click)
+        return self._el()
+
+    def refreshable(self, fn):
+        # NiceGUI's decorator: calling the result renders; ``.refresh()`` renders again.
+        ui = self
+
+        def _call(*a, **k):
+            return fn(*a, **k)
+
+        def _refresh(*a, **k):
+            ui.refreshes += 1
+            return fn(*a, **k)
+
+        _call.refresh = _refresh
+        return _call
+
+    def open(self, header: str) -> None:
+        """Open the first not-yet-opened expansion whose header starts with ``header``."""
+        for index, (_element, handler, start) in enumerate(self.expansions):
+            if index in self._opened or start >= len(self.texts):
+                continue
+            if self.texts[start] == header and handler is not None:
+                self._opened.add(index)
+                handler(_Changed(True))
+                return
+        raise AssertionError(f"no unopened expansion headed {header!r}")
+
+    def open_expansions(self) -> None:
+        """Open every expansion not opened yet, including those built while opening."""
+        index = 0
+        while index < len(self.expansions):
+            _element, handler, _start = self.expansions[index]
+            if index not in self._opened and handler is not None:
+                self._opened.add(index)
+                handler(_Changed(True))
+            index += 1
 
     def __getattr__(self, _name):
         return lambda *_a, **_k: self._el()
@@ -1192,6 +1272,7 @@ def test_assessment_row_renders_one_block_per_concern() -> None:
     item = _five_rule_item()
     ui = _ItemUi()
     _render_assessment_item(ui, item)
+    ui.open(item.object_name)
 
     body = "\n".join(ui.texts)
     # Every rule id is shown, so the reader can see WHICH rules fired.
@@ -1218,6 +1299,7 @@ def test_each_rendered_concern_shows_its_own_class_and_fix() -> None:
     item = _five_rule_item()
     ui = _ItemUi()
     _render_assessment_item(ui, item)
+    ui.open(item.object_name)
 
     body = "\n".join(ui.texts)
     for concern in item.concerns:
@@ -1265,6 +1347,7 @@ def test_row_falls_back_to_joined_text_for_a_pre_concerns_report() -> None:
     )
     ui = _ItemUi()
     _render_assessment_item(ui, legacy)
+    ui.open(legacy.object_name)
     body = "\n".join(ui.texts)
     assert "a; b" in body
     assert "fix a; fix b" in body
@@ -1538,6 +1621,9 @@ def test_collapsed_row_shows_no_object_level_effort_badge() -> None:
 
     ui = _ItemUi()
     _render_assessment_item(ui, item)
+    # Collapsed, the row carries no effort badge at all.
+    assert not [b for b in ui.badges if b.startswith("effort")], ui.badges
+    ui.open(item.object_name)
     # Exactly one effort badge per finding that has an estimate -- no extra one for the
     # object itself. Counting is what catches a re-added row badge: the object's governing
     # effort equals some finding's, so checking for the text alone would still pass.
@@ -1691,6 +1777,7 @@ def test_a_cluster_level_row_renders_like_every_table_row() -> None:
 
     ui = _ItemUi()
     _render_assessment_item(ui, cluster)
+    ui.open(cluster.object_name)
     # The category badge treatment, same as a table row.
     assert "1 Unsupported" in ui.badges, ui.badges
     # The card treatment: labeled Risk / Recommendation panels behind a spine. (The caps
@@ -2317,3 +2404,309 @@ def test_a_cancel_retires_the_run_so_a_late_result_is_not_recorded() -> None:
     assert state.set_result(object(), token=token) is False
 
 
+# ---------------------------------------------------------------------------
+# A large report: a bounded, lazily built object list (review scale-1 / ui-ux-6 / tests-9).
+# Every row and finding card used to be built up front, collapsed ones included (Quasar
+# keeps them in the DOM), and each filter click rebuilt the whole page: about 98,000
+# elements and five seconds of the shared event loop for 1,000 tables.
+# ---------------------------------------------------------------------------
+
+
+def _bulk_items(
+    count: int,
+    *,
+    kind: str = "TABLE",
+    prefix: str = "app.t",
+    classification: Classification = Classification.MANUAL,
+    findings: int = 5,
+) -> list:
+    """``count`` assessed objects of one kind, each with ``findings`` findings (none for
+    AUTO), named ``<prefix>00000`` upwards so name order is creation order."""
+    from dsql_migrator.core.models import AssessmentConcern, AssessmentItem
+
+    auto = classification is Classification.AUTO
+    items = []
+    for i in range(count):
+        name = f"{prefix}{i:05d}"
+        concerns = [] if auto else [
+            AssessmentConcern(
+                rule_id=f"RULE_{k}",
+                classification=classification,
+                risk=f"risk {k} of {name}",
+                recommendation=f"fix {k} of {name}",
+                effort=EffortLevel.MEDIUM,
+            )
+            for k in range(findings)
+        ]
+        items.append(
+            AssessmentItem(
+                object_name=name,
+                rule_id="RULE_0" if concerns else "COMPATIBLE",
+                classification=classification,
+                kind=kind,
+                effort=None if auto else EffortLevel.MEDIUM,
+                concerns=concerns,
+            )
+        )
+    return items
+
+
+def _bulk_result(items: list) -> EvaluationResult:
+    from dsql_migrator.core.models import AssessmentReport
+
+    return EvaluationResult(
+        inventory=SourceInventory(
+            tables=[
+                TableDef(
+                    name="app.t",
+                    columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                    primary_key=["id"],
+                )
+            ]
+        ),
+        assessment=AssessmentReport.from_items(items),
+        target_inventory=TargetInventory(),
+        target_conflicts=[],
+    )
+
+
+def _rows(texts: list) -> list:
+    """The object rows a render emitted (their names), in order."""
+    return [t for t in texts if t.startswith("app.")]
+
+
+def _mixed(tables: int) -> list:
+    """``tables`` MANUAL tables, 60 MANUAL views and 40 UNSUPPORTED triggers, each object
+    with five findings: three open sections, two of them longer than a page."""
+    return (
+        _bulk_items(tables)
+        + _bulk_items(60, kind="VIEW", prefix="app.v")
+        + _bulk_items(
+            40, kind="TRIGGER", prefix="app.trg", classification=Classification.UNSUPPORTED
+        )
+    )
+
+
+def test_the_result_screen_builds_a_bounded_number_of_elements_at_5000_objects() -> None:
+    """What the screen builds must not grow with the source: 5,000 objects cost exactly
+    what 1,000 do, no finding card is built before its row is opened, and each open
+    section shows one page."""
+    from dsql_migrator.ui.evaluation import OBJECTS_PER_PAGE, _render_result
+
+    def render(tables: int) -> _ItemUi:
+        ui = _ItemUi()
+        _render_result(ui, _bulk_result(_mixed(tables)), eval_state=EvaluationState())
+        return ui
+
+    small, large = render(900), render(4_900)
+    assert large.created == small.created, (small.created, large.created)
+    # The eager list built ~460,000 elements here. One page per open section (140 header-
+    # only rows), plus the score card, chart, filters and target analysis, is ~800; cards
+    # built up front for those rows alone would add ~10,000, unpaged rows ~30,000.
+    assert large.created < 2_000, large.created
+    rows = _rows(large.texts)
+    assert len([r for r in rows if r.startswith("app.t0")]) == OBJECTS_PER_PAGE
+    assert len([r for r in rows if r.startswith("app.v")]) == OBJECTS_PER_PAGE
+    assert len([r for r in rows if r.startswith("app.trg")]) == 40
+    assert not [t for t in large.texts if t.startswith("risk ")], "cards built up front"
+    # A section with more than one page says where the rest is.
+    assert "Showing 1 to 50 of 4,900. The exports list every object." in large.texts
+    assert len(large.paginations) == 2  # Tables and Views; 40 triggers fit one page
+
+
+def test_the_exports_list_every_object_while_the_screen_shows_one_page() -> None:
+    from dsql_migrator.ui.evaluation import OBJECTS_PER_PAGE, _render_result
+
+    result = _bulk_result(_bulk_items(120))
+    ui = _ItemUi()
+    _render_result(ui, result, eval_state=EvaluationState())
+    assert len(_rows(ui.texts)) == OBJECTS_PER_PAGE
+    for fmt in ("json", "text", "html"):
+        content = assessment_download(result, fmt).content
+        missing = [
+            i.object_name for i in result.assessment.items if i.object_name not in content
+        ]
+        assert not missing, (fmt, missing[:3])
+
+
+def test_a_row_builds_its_finding_cards_once_on_its_first_expand() -> None:
+    from dsql_migrator.ui.evaluation import _render_assessment_item
+
+    item = _five_rule_item()
+    ui = _ItemUi()
+    _render_assessment_item(ui, item)
+    assert not [c.rule_id for c in item.concerns if c.rule_id in ui.texts], ui.texts
+    collapsed = ui.created
+    ui.open(item.object_name)
+    assert all(c.rule_id in ui.texts for c in item.concerns)
+    opened = ui.created
+    assert opened > collapsed
+    # The value change fires on every open; what was built is kept, not built again.
+    _element, on_change, _start = ui.expansions[0]
+    on_change(_Changed(False))
+    on_change(_Changed(True))
+    assert ui.created == opened
+
+
+def test_a_closed_section_builds_no_rows_until_it_is_opened() -> None:
+    """An all-AUTO section starts closed -- and empty, since Quasar would ship hidden rows."""
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui.evaluation import OBJECTS_PER_PAGE, _render_assessment
+
+    report = AssessmentReport.from_items(
+        _bulk_items(500, classification=Classification.AUTO)
+    )
+    ui = _ItemUi()
+    _render_assessment(ui, report, eval_state=EvaluationState())
+    assert _rows(ui.texts) == []
+    ui.open("Tables")
+    assert len(_rows(ui.texts)) == OBJECTS_PER_PAGE
+
+
+def test_a_long_section_shows_one_page_at_a_time_most_critical_first() -> None:
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = AssessmentReport.from_items(
+        _bulk_items(110)
+        + _bulk_items(10, prefix="app.u", classification=Classification.UNSUPPORTED)
+    )
+    state = EvaluationState()
+    ui = _ItemUi()
+    _render_assessment(ui, report, eval_state=state)
+    first_page = _rows(ui.texts)
+    assert first_page == (
+        [f"app.u{i:05d}" for i in range(10)] + [f"app.t{i:05d}" for i in range(40)]
+    )
+    ((_element, turn, bounds, value),) = ui.paginations
+    assert (bounds, value) == ((1, 3), 1)
+    assert "Showing 1 to 50 of 120. The exports list every object." in ui.texts
+
+    mark = len(ui.texts)
+    turn(_Changed(2))
+    assert _rows(ui.texts[mark:]) == [f"app.t{i:05d}" for i in range(40, 90)]
+    assert "Showing 51 to 100 of 120. The exports list every object." in ui.texts[mark:]
+    assert state.list_pages["TABLE"] == 2
+    # Turning a page redraws that section only, not the list (nor the page).
+    assert ui.refreshes == 0
+    mark = len(ui.texts)
+    turn(_Changed(2))  # the page it already shows
+    assert ui.texts[mark:] == []
+
+    # A redraw of the screen keeps the page (it lives on the state).
+    again = _ItemUi()
+    _render_assessment(again, report, eval_state=state)
+    assert _rows(again.texts) == [f"app.t{i:05d}" for i in range(40, 90)]
+
+
+def test_filters_and_the_name_search_redraw_only_the_object_list() -> None:
+    """They used to call the workflow shell's refresh, which rebuilt the whole page --
+    sidebar, diagram, score, chart and every row -- on each click."""
+    import inspect
+
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui.evaluation import _render_assessment, _render_result
+
+    assert "refresh" not in inspect.signature(_render_assessment).parameters
+    assert "refresh" not in inspect.signature(_render_result).parameters
+    report = AssessmentReport.from_items(
+        _bulk_items(300, classification=Classification.AUTO)
+        + _bulk_items(
+            20, kind="TRIGGER", prefix="app.trg", classification=Classification.UNSUPPORTED
+        )
+    )
+    state = EvaluationState()
+    state.list_pages["TABLE"] = 3
+    ui = _ItemUi()
+    _render_assessment(ui, report, eval_state=state)
+    assert "320 objects" in ui.texts
+    ((_box, on_name, placeholder),) = ui.inputs
+    assert placeholder == "Filter objects by name"  # Schema Conversion's wording
+
+    rendered = ui.created
+    ui.selects["Classification"](_Changed("UNSUPPORTED"))
+    assert (state.classification_filter, ui.refreshes) == ("UNSUPPORTED", 1)
+    assert "20 of 320 objects match" in ui.texts
+    assert ui.created - rendered < 300, ui.created - rendered  # the list, not the page
+    assert "TABLE" not in state.list_pages  # a different set: pages start again
+
+    # The search ignores case and surrounding spaces, and opens the section it matches in
+    # (the all-AUTO Tables section starts closed).
+    ui.selects["Classification"](_Changed("ALL"))
+    mark = len(ui.texts)
+    on_name(_Changed("  APP.T00042 "))
+    assert state.name_filter == "APP.T00042"
+    assert _rows(ui.texts[mark:]) == ["app.t00042"]
+    assert "1 of 320 objects match" in ui.texts[mark:]
+    # The filter bar is outside the redrawn region: the box under the cursor survives.
+    assert len(ui.inputs) == 1
+
+    on_name(_Changed("no such object"))
+    assert ui.texts[-1] == "No objects match these filters."
+    refreshes, mark = ui.refreshes, len(ui.texts)
+    ui.buttons["Clear filters"][-1]()
+    assert (state.classification_filter, state.effort_filter, state.name_filter) == (
+        "ALL",
+        "ALL",
+        "",
+    )
+    assert ui.refreshes == refreshes + 1
+    redrawn = ui.texts[mark:]
+    assert redrawn[0] == "320 objects" and "No objects match these filters." not in redrawn
+
+
+def test_a_second_browser_tab_redraws_for_a_filter_or_page_the_first_already_set() -> None:
+    """The filters and pages live on the session's state, which all its browser tabs share,
+    so a tab must redraw for its own control's change even when another tab already put
+    the state at that value -- or its control shows the new value over the old list."""
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = AssessmentReport.from_items(
+        _bulk_items(120)
+        + _bulk_items(
+            20, kind="TRIGGER", prefix="app.trg", classification=Classification.UNSUPPORTED
+        )
+    )
+    state = EvaluationState()
+    tab_a, tab_b = _ItemUi(), _ItemUi()
+    _render_assessment(tab_a, report, eval_state=state)
+    _render_assessment(tab_b, report, eval_state=state)
+
+    ((_a, turn_a, _bounds, _value),) = tab_a.paginations
+    ((_b, turn_b, _bounds, _value),) = tab_b.paginations
+    turn_a(_Changed(2))
+    mark = len(tab_b.texts)
+    turn_b(_Changed(2))
+    assert _rows(tab_b.texts[mark:])[:1] == ["app.t00050"]
+
+    tab_a.selects["Classification"](_Changed("UNSUPPORTED"))
+    mark = len(tab_b.texts)
+    tab_b.selects["Classification"](_Changed("UNSUPPORTED"))
+    assert tab_b.refreshes == 1
+    assert "20 of 140 objects match" in tab_b.texts[mark:]
+
+
+def test_assessment_page_slices_and_clamps() -> None:
+    from dsql_migrator.ui.evaluation import assessment_page
+
+    items = list(range(120))
+    assert assessment_page(items, 1, size=50) == (list(range(50)), 1, 3)
+    assert assessment_page(items, 3, size=50) == (list(range(100, 120)), 3, 3)
+    # Out of range (a section that shrank, a stale page) is clamped, never empty.
+    assert assessment_page(items, 9, size=50)[1:] == (3, 3)
+    assert assessment_page(items, 0, size=50)[1:] == (1, 3)
+    assert assessment_page([], 2, size=50) == ([], 1, 1)
+
+
+def test_filter_assessment_items_by_name_ignores_case_and_spaces() -> None:
+    from dsql_migrator.ui.evaluation import filter_assessment_items
+
+    items = _bulk_items(3) + _bulk_items(
+        2, prefix="shop.orders_", classification=Classification.UNSUPPORTED
+    )
+    kept = filter_assessment_items(items, name=" ORDERS ")
+    assert [i.object_name for i in kept] == ["shop.orders_00000", "shop.orders_00001"]
+    assert filter_assessment_items(items, name="") == items
+    # Combined with the other filters (AND).
+    assert filter_assessment_items(items, name="app.", classification="UNSUPPORTED") == []

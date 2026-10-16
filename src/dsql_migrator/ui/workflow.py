@@ -2043,9 +2043,14 @@ def build_workflow_sidebar(
                             if disable_reason:
                                 run_button.disable()
                                 run_button.tooltip(disable_reason)
-                        # "Next" lives only at the bottom (after the step content), so
-                        # the top keeps just the status and the Run/Re-run action; the
-                        # natural "review then proceed" flow ends with Next below.
+                        # "Next" also sits here once the step is DONE. The "review then
+                        # proceed" flow still ends with the Next below the content, which
+                        # is the one that explains, disabled, what is left to do; but a
+                        # DONE step is one the operator has reviewed or is coming back to,
+                        # and its content can be long (the assessment of a large source),
+                        # so they should not have to scroll past it to move on.
+                        if status is StepStatus.DONE:
+                            make_next_button()
 
             step_header()
 

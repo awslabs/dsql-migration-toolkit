@@ -1968,6 +1968,24 @@ def test_next_button_is_rendered_after_the_step_builder():
     assert body.index("builder(refresh_all)") < body.rindex("make_next_button()")
 
 
+def test_the_step_header_also_offers_next_once_the_step_is_done():
+    """Evaluation review (ui-ux-6): the only Next sat below the content, so moving on from
+    the assessment of a large source meant scrolling past the whole report. The header
+    now shows it beside Re-run once the step is DONE -- from the status the header reads
+    LIVE, since a builder can finish its own step mid-render -- and only then: the Next
+    below the content is the one that explains, disabled, what is left to do."""
+    import ast
+
+    (header,) = [n for n in ast.walk(_render_main_fn()) if isinstance(n, ast.FunctionDef)
+                 and n.name == "step_header"]
+    header_src = ast.unparse(header)
+    assert "status = get_status(state.workflow, step)" in header_src
+    guarded = [n for n in ast.walk(header) if isinstance(n, ast.If)
+               and ast.unparse(n.test) == "status is StepStatus.DONE"]
+    assert [ast.unparse(s) for g in guarded for s in g.body] == ["make_next_button()"]
+    assert header_src.count("make_next_button()") == 1
+
+
 def test_a_builder_that_changes_its_own_step_redraws_only_the_header_and_sidebar():
     """Review of a61cbbc: the header badge, the stepper and the sidebar were drawn from the
     status read BEFORE the builder, so a builder that changes its own step (a streaming
