@@ -95,6 +95,44 @@ class DebeziumEventsTest {
   }
 
   @Test
+  void aValueTheConverterCannotReadIsDeadLetteredNotATaskKiller() {
+    // put() dead-letters a DataException; anything else escaped it and killed the task.
+    Schema rowSchema =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("id", Schema.INT64_SCHEMA)
+            .field(
+                "valid_to",
+                SchemaBuilder.string().name(DebeziumTypeConverter.ZONED_TIMESTAMP).optional().build())
+            .optional()
+            .build();
+    Schema envSchema =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("after", rowSchema)
+            .field("source", SOURCE)
+            .build();
+    Struct current =
+        new Struct(envSchema)
+            .put("op", "c")
+            .put("after", new Struct(rowSchema).put("id", 1L).put("valid_to", "infinity"))
+            .put("source", source("periods"));
+    ChangeEvent event = DebeziumEvents.parse(record(key(1L), current, "dsqlcdc.app.periods"));
+    assertEquals("infinity", assertInstanceOf(PGobject.class, event.values().get(1)).getValue());
+    Struct garbled =
+        new Struct(envSchema)
+            .put("op", "c")
+            .put("after", new Struct(rowSchema).put("id", 2L).put("valid_to", "not a time"))
+            .put("source", source("periods"));
+    DataException e =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(key(2L), garbled, "dsqlcdc.app.periods")));
+    assertTrue(e.getMessage().contains("valid_to"), e.getMessage());
+  }
+
+  @Test
   void sourceTsMsParsedForReplicationLag() {
     // source.ts_ms (source commit time) is carried onto the ChangeEvent so the sink
     // can compute end-to-end replication lag = now - source.ts_ms at apply time.

@@ -517,6 +517,24 @@ final class DebeziumEvents {
    * rather than the MySQL-BIT integer mapping. MySQL Bits keeps the integer mapping.
    */
   private static Object convertField(Field field, Object raw, boolean pgSource) {
+    try {
+      return convertFieldValue(field, raw, pgSource);
+    } catch (DataException e) {
+      throw e;
+    } catch (RuntimeException e) {
+      // A value encoded in a way the converter does not expect (a parse, cast or arithmetic
+      // failure) must cost only its own record: put() dead-letters a DataException, but any
+      // other exception escapes it and KILLS the task -- every table the task serves stops,
+      // and a restart replays the same record.
+      throw new DataException(
+          "Cannot convert the value of column '" + field.name() + "' ("
+              + (field.schema().name() != null ? field.schema().name() : field.schema().type())
+              + "): " + e,
+          e);
+    }
+  }
+
+  private static Object convertFieldValue(Field field, Object raw, boolean pgSource) {
     Schema fieldSchema = field.schema();
     if (pgSource && DebeziumTypeConverter.BITS_TYPE.equals(fieldSchema.name())) {
       return DebeziumTypeConverter.pgBitString(raw, fieldSchema);

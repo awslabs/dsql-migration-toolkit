@@ -68,6 +68,37 @@ class DebeziumTypeConverterTest {
   }
 
   @Test
+  void postgresInfinityReachesDsqlAsInfinity() {
+    // The Debezium PostgreSQL connector's own encodings (2.7.4, PostgresValueConverter): the
+    // timestamptz string, the timestamp epoch micros / millis, the date day count.
+    assertInfinity("timestamptz", "infinity",
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIMESTAMP, "infinity"));
+    assertInfinity("timestamptz", "-infinity",
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIMESTAMP, "-infinity"));
+    assertInfinity("timestamp", "infinity", DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.MICRO_TIMESTAMP, 9_223_372_036_825_200_000L));
+    assertInfinity("timestamp", "-infinity", DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.MICRO_TIMESTAMP, -9_223_372_036_832_400_000L));
+    assertInfinity("timestamp", "infinity", DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.TIMESTAMP_MS, 9_223_372_036_825_200L));
+    assertInfinity("timestamp", "-infinity", DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.TIMESTAMP_MS, -9_223_372_036_832_400L));
+    assertInfinity("date", "infinity",
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, -2_147_472_692));
+    assertInfinity("date", "-infinity",
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, -2_147_472_691));
+    // A neighbour of a sentinel is an ordinary value.
+    assertInstanceOf(Timestamp.class, DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.MICRO_TIMESTAMP, 9_223_372_036_825_199_999L));
+  }
+
+  private static void assertInfinity(String type, String text, Object converted) {
+    PGobject pg = assertInstanceOf(PGobject.class, converted);
+    assertEquals(type, pg.getType());
+    assertEquals(text, pg.getValue());
+  }
+
+  @Test
   void jsonStringWrappedInPgObject() throws Exception {
     Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.JSON_TYPE, "{\"k\": 1}");
     assertInstanceOf(PGobject.class, r);

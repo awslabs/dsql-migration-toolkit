@@ -106,6 +106,29 @@ final class DebeziumTypeConverter {
   // through the default case unchanged.)
   static final String VARIABLE_SCALE_DECIMAL = "io.debezium.data.VariableScaleDecimal";
 
+  // PostgreSQL +/-infinity, as the Debezium PostgreSQL connector (2.7.4, its
+  // PostgresValueConverter) encodes it. Without these a timestamptz 'infinity' -- the usual
+  // valid_to DEFAULT of a temporal table -- reached OffsetDateTime.parse, whose
+  // DateTimeParseException is not a DataException, so it KILLED the task (and a restart
+  // replayed the same record); a timestamp +infinity was stored as the year 294247, and
+  // -infinity and a date infinity were dead-lettered as out of range. Aurora DSQL stores
+  // +/-infinity for date, timestamp and timestamptz, and Full Load writes them as such.
+  //  - timestamptz (ZonedTimestamp): the strings "infinity" / "-infinity".
+  //  - timestamp: the epoch value of pgjdbc's DATE_POSITIVE/NEGATIVE_INFINITY read as micros
+  //    (MicroTimestamp), or those micros / 1000 for a column of precision 0-3 (Timestamp).
+  //    Aurora DSQL's own CDC uses the same two numbers. The positive one is also the instant
+  //    294247-01-10 04:00:25.2 UTC, so a row holding exactly that would read as infinity;
+  //    the negative one is before PostgreSQL's earliest timestamp (4713 BC).
+  //  - date: PostgreSQL's INT_MAX / INT_MIN day sentinel moved from its 2000 epoch to 1970,
+  //    which wraps; both fall before PostgreSQL's earliest date. Nothing MySQL emits comes
+  //    near any of them (its range is years 1000-9999), so they need no source gate.
+  static final long PG_INFINITY_MICROS = 9_223_372_036_825_200_000L;
+  static final long PG_NEGATIVE_INFINITY_MICROS = -9_223_372_036_832_400_000L;
+  static final long PG_INFINITY_MILLIS = PG_INFINITY_MICROS / 1_000L;
+  static final long PG_NEGATIVE_INFINITY_MILLIS = PG_NEGATIVE_INFINITY_MICROS / 1_000L;
+  static final int PG_INFINITY_DAYS = -2_147_472_692;
+  static final int PG_NEGATIVE_INFINITY_DAYS = -2_147_472_691;
+
   private static final long MICROS_PER_MILLI = 1_000L;
   private static final int NANOS_PER_MICRO = 1_000;
   private static final long MICROS_PER_SECOND = 1_000_000L;
@@ -129,14 +152,28 @@ final class DebeziumTypeConverter {
       return value; // null, or a plain primitive (no logical type) — bind as-is
     }
     switch (schemaName) {
-      case MICRO_TIMESTAMP:
-        return microsToTimestamp(((Number) value).longValue());
-      case TIMESTAMP_MS:
-        return Timestamp.from(Instant.ofEpochMilli(((Number) value).longValue()));
-      case ZONED_TIMESTAMP:
-        return Timestamp.from(OffsetDateTime.parse(value.toString()).toInstant());
-      case DATE:
-        return java.sql.Date.valueOf(LocalDate.ofEpochDay(((Number) value).longValue()));
+      case MICRO_TIMESTAMP: {
+        long micros = ((Number) value).longValue();
+        Object infinity = infinity("timestamp", micros, PG_INFINITY_MICROS, PG_NEGATIVE_INFINITY_MICROS);
+        return infinity != null ? infinity : microsToTimestamp(micros);
+      }
+      case TIMESTAMP_MS: {
+        long millis = ((Number) value).longValue();
+        Object infinity = infinity("timestamp", millis, PG_INFINITY_MILLIS, PG_NEGATIVE_INFINITY_MILLIS);
+        return infinity != null ? infinity : Timestamp.from(Instant.ofEpochMilli(millis));
+      }
+      case ZONED_TIMESTAMP: {
+        String text = value.toString();
+        if ("infinity".equals(text) || "-infinity".equals(text)) {
+          return pgObject("timestamptz", text);
+        }
+        return Timestamp.from(OffsetDateTime.parse(text).toInstant());
+      }
+      case DATE: {
+        long days = ((Number) value).longValue();
+        Object infinity = infinity("date", days, PG_INFINITY_DAYS, PG_NEGATIVE_INFINITY_DAYS);
+        return infinity != null ? infinity : java.sql.Date.valueOf(LocalDate.ofEpochDay(days));
+      }
       case JSON_TYPE:
         return jsonObject(value.toString());
       case BITS_TYPE:
@@ -713,6 +750,20 @@ final class DebeziumTypeConverter {
       }
     }
     out.append('"');
+  }
+
+  /**
+   * {@code 'infinity'} / {@code '-infinity'} as a {@code type} value when {@code encoded} is
+   * that type's Debezium sentinel ({@code positive} / {@code negative}), else {@code null}.
+   */
+  private static Object infinity(String type, long encoded, long positive, long negative) {
+    if (encoded == positive) {
+      return pgObject(type, "infinity");
+    }
+    if (encoded == negative) {
+      return pgObject(type, "-infinity");
+    }
+    return null;
   }
 
   /**

@@ -3425,7 +3425,7 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             "07-performance-and-tuning.md": ("the sink (plugin v52 or later) rolls back",),
             "13-excluding-tables-and-columns.md": (
                 "**No Delete + Deploy is needed for the changes in this section.**",
-                "Later releases changed the sink plugin (v51, v52, v53), so a stack deployed before "
+                "Later releases changed the sink plugin (v51, v52, v53, v54), so a stack deployed before "
                 "them needs **Delete CDC infrastructure** and a new deploy",
             ),
         },
@@ -3438,7 +3438,7 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             "07-performance-and-tuning.md": ("싱크(플러그인 v52 이상)는 트랜잭션을",),
             "13-excluding-tables-and-columns.md": (
                 "**이 절의 변경에는 Delete + Deploy가 필요 없습니다.**",
-                "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53), 그 전에 배포한 스택은 "
+                "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53, v54), 그 전에 배포한 스택은 "
                 "**Delete CDC infrastructure** 후 다시 배포해야",
             ),
         },
@@ -3451,7 +3451,7 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
             "07-performance-and-tuning.md": ("シンク (プラグイン v52 以降) はトランザクションを",),
             "13-excluding-tables-and-columns.md": (
                 "**この節の変更には Delete + Deploy は不要です。**",
-                "その後のリリースでシンクプラグインが変わったため(v51、v52、v53)、それ以前にデプロイした"
+                "その後のリリースでシンクプラグインが変わったため(v51、v52、v53、v54)、それ以前にデプロイした"
                 "スタックは **Delete CDC infrastructure** して再デプロイするまで",
             ),
         },
@@ -3481,7 +3481,7 @@ def test_plugin_v52_history_records_the_g22_rebuild() -> None:
     source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
     text = (source / "s3_provision.py").read_text(encoding="utf-8")
     history = " ".join(text.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v53"' in text  # G23 bumped it past the released v52
+    assert 'PLUGIN_VERSION = "v54"' in text  # G23 bumped past the released v52, B6 past v53
     assert "rebuilt in place (G22" in history
     assert "XX000" in history
     # G22 also changed paths other than XX000 (a failed error-path rollback drops the

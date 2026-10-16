@@ -909,7 +909,7 @@ Validation's line for each such column names the steps that apply in your sessio
 
 - **No Delete + Deploy is needed for the changes in this section.** They leave the sink
   plugin, the worker configuration and the stack parameters unchanged. Later releases
-  changed the sink plugin (v51, v52, v53), so a stack deployed before them needs **Delete CDC
+  changed the sink plugin (v51, v52, v53, v54), so a stack deployed before them needs **Delete CDC
   infrastructure** and a new deploy to pick those changes up.
 - **A stack deployed by 0.1.561 keeps its capture list.** When the stack carries
   exactly the 0.1.561 `ColumnExcludeList` for the session, Start CDC keeps it

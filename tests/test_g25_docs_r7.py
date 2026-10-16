@@ -714,16 +714,16 @@ _CH13 = {
         "(そのスタックがストリーミングした後では、新しい Full Load の開始位置にはもう一度 Delete と"
         "再デプロイが必要です)",
     },
-    "v53": {
-        "en": "Later releases changed the sink plugin (v51, v52, v53)",
-        "ko": "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53)",
-        "ja": "その後のリリースでシンクプラグインが変わったため(v51、v52、v53)",
+    "v54": {
+        "en": "Later releases changed the sink plugin (v51, v52, v53, v54)",
+        "ko": "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53, v54)",
+        "ja": "その後のリリースでシンクプラグインが変わったため(v51、v52、v53、v54)",
     },
 }
 _CH13_STALE = {
-    "en": ("changed the sink plugin (v51, v52),",),
-    "ko": ("싱크 플러그인이 바뀌었으므로(v51, v52),",),
-    "ja": ("シンクプラグインが変わったため(v51、v52)、",),
+    "en": ("changed the sink plugin (v51, v52),", "changed the sink plugin (v51, v52, v53),"),
+    "ko": ("싱크 플러그인이 바뀌었으므로(v51, v52),", "싱크 플러그인이 바뀌었으므로(v51, v52, v53),"),
+    "ja": ("シンクプラグインが変わったため(v51、v52)、", "シンクプラグインが変わったため(v51、v52、v53)、"),
 }
 
 
@@ -746,7 +746,7 @@ def test_chapter_13_names_new_topics_for_the_type_switch_and_the_re_copy(lang: s
         "before the new stack's first Start CDC: once that stack has streamed, a new Full Load "
         "start point needs another Delete and redeploy." in monitoring
     )
-    assert PLUGIN_VERSION == "v53"
+    assert PLUGIN_VERSION == "v54"
 
     _all(lang, _P13, _CH13)
     assert not _stale(lang, _CH13_STALE[lang]), lang

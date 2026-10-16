@@ -448,9 +448,12 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で
     あり、その `interval` 入力パーサはこれらの値を拒否します。そのため *無限* の `interval` を持つ行は
     Full Load 中に **隔離（quarantine）** され（隔離カウントに表示）、Validation で count/checksum の
-    不一致として表面化します — 暗黙のうちに変更されることはありません。有限の interval と
-    `timestamp`/`timestamptz` の `infinity` は影響を受けません。その列を移行する前に、該当行を
-    リモデリング（例: 有限のセンチネル値）してください。
+    不一致として表面化します — 暗黙のうちに変更されることはありません。有限の interval は影響を
+    受けず、`date`/`timestamp`/`timestamptz` の `infinity`/`-infinity` も同様です: Full Load と CDC
+    （シンクプラグイン v54 以降）のどちらも `infinity` として保存します。それ以前のプラグインで
+    デプロイした CDC スタックは、そのような `timestamptz` 値に最初に出会った時点でシンクタスクが停止
+    するため、**Delete CDC infrastructure** して再デプロイしてください。無限の `interval` の行は、
+    その列を移行する前にリモデリング（例: 有限のセンチネル値）してください。
   - **VIRTUAL 生成列（PG18 の既定の種類）。** Aurora DSQL は
     `GENERATED ALWAYS AS (expr) **STORED**` をサポートし値を自ら維持するため、STORED 列は
     **保持**されます — 再計算もドリフトもありません（書き込みでその列を省けばよく、Full Load と CDC

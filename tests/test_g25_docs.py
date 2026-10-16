@@ -128,7 +128,7 @@ def _v53_history() -> str:
         encoding="utf-8"
     )
     start = source.index("# v53 (G23)")
-    note = source[start : source.index('PLUGIN_VERSION = "v53"', start)]
+    note = source[start : source.index("# v54:", start)]
     return " ".join(note.replace("#", " ").split())
 
 
@@ -387,7 +387,8 @@ def test_the_sink_readme_and_the_plugin_history_describe_the_g25_hold() -> None:
         encoding="utf-8"
     )
     history = " ".join(source.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v53"' in source  # rebuilt in place: v53 reached no stack
+    # Rebuilt in place (v53 reached no stack then); v54 later moved past the released v53.
+    assert 'PLUGIN_VERSION = "v54"' in source
     assert "v53, rebuilt in place (G25" in history
     assert "lastTransientNanos" in history and "recordLag" in history
 

@@ -776,7 +776,22 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   content-addressed key (cdc-plugins/<sha256[:16]>/<name>) as one PutObject, so the next Deploy
 #   CDC infrastructure registers exactly these bytes; a stack that registered the earlier v53
 #   bytes (none did) would need Delete + Deploy CDC infrastructure.
-PLUGIN_VERSION = "v53"
+# v54: a PostgreSQL `infinity` / `-infinity` date or timestamp. A timestamptz `infinity` -- the
+#   usual `valid_to` DEFAULT of a temporal (SCD-2) table -- KILLED the sink task: Debezium sends it
+#   as the string "infinity", OffsetDateTime.parse threw a DateTimeParseException, which is not a
+#   DataException, so it escaped put()'s dead-letter path; every table the task served stopped,
+#   and a restart replayed the same record. A timestamp `+infinity` was stored as the year 294247,
+#   and `-infinity` and a date infinity were dead-lettered as out of range. The sink now maps the
+#   Debezium PostgreSQL connector's own encodings (2.7.4, read from its PostgresValueConverter;
+#   Aurora DSQL's CDC uses the same timestamp numbers) to Aurora DSQL `infinity` / `-infinity`:
+#   the timestamptz strings, the timestamp epoch micros 9223372036825200000 /
+#   -9223372036832400000 (or those / 1000 for a precision 0-3 column) and the date day counts
+#   -2147472692 / -2147472691. Full Load already wrote them so (it reads date/time as text). And
+#   any RuntimeException a value's conversion throws is now a DataException naming the column, so
+#   one value costs its own record (dead-lettered), never the task. MySQL is untouched: nothing it
+#   emits comes near those values (its range is years 1000-9999). No config key, template or Start
+#   CDC change; a stack that registered v53 needs Delete + Deploy CDC infrastructure to get it.
+PLUGIN_VERSION = "v54"
 
 
 class S3ProvisionError(RuntimeError):

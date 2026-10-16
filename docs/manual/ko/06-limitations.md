@@ -415,8 +415,11 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그
     `interval` 입력 파서가 이 값을 거부합니다. 따라서 *무한* `interval`을 담은 행은 Full Load 중
     **격리(quarantine)**되어(격리 카운트에 표시됨) Validation에서 count/checksum 불일치로 드러납니다 —
-    조용히 변형되는 일은 없습니다. 유한 interval과 `timestamp`/`timestamptz`의 `infinity`는 영향받지
-    않습니다. 해당 컬럼을 마이그레이션하기 전에 그런 행을 재모델링(예: 유한 sentinel 값)하세요.
+    조용히 변형되는 일은 없습니다. 유한 interval은 영향받지 않고, `date`/`timestamp`/`timestamptz`의
+    `infinity`/`-infinity`도 마찬가지입니다: Full Load와 CDC(싱크 플러그인 v54 이상) 모두 `infinity`로
+    저장합니다. 이전 플러그인으로 배포한 CDC 스택은 그런 `timestamptz` 값을 처음 만나면 싱크 태스크가
+    멈추므로 **Delete CDC infrastructure** 후 다시 배포하세요. 무한 `interval` 행은 해당 컬럼을
+    마이그레이션하기 전에 재모델링(예: 유한 sentinel 값)하세요.
   - **VIRTUAL 생성 컬럼(PG18의 기본 종류).** Aurora DSQL은 `GENERATED ALWAYS AS (expr) **STORED**`를
     지원하고 값을 스스로 유지하므로 STORED 컬럼은 **보존**됩니다 — 다시 계산할 것도, 드리프트도
     없습니다(쓰기에서 그 컬럼을 빼면 되고, Full Load와 CDC 싱크가 그렇게 합니다. DSQL은 값을 명시하면

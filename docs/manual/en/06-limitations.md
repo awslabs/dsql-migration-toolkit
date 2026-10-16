@@ -528,9 +528,12 @@ fails **loudly** where it can't.
     PostgreSQL-16-compatible and its `interval` input parser rejects these values, so
     a row carrying an *infinite* `interval` is **quarantined** during Full Load
     (visible in the quarantine count) and surfaced by Validation as a count/checksum
-    mismatch — never silently altered. Finite intervals and `timestamp`/`timestamptz`
-    `infinity` are unaffected. Remodel such rows (e.g. to a finite sentinel) before
-    migrating the column.
+    mismatch — never silently altered. Finite intervals are unaffected, and so is
+    `date`/`timestamp`/`timestamptz` `infinity`/`-infinity`: Full Load and CDC (sink
+    plugin v54 and later) both store it as `infinity`. A CDC stack deployed with an
+    earlier plugin stops its sink task at the first such `timestamptz` value; **Delete CDC
+    infrastructure** and deploy it again. Remodel infinite-`interval` rows (e.g. to a
+    finite sentinel) before migrating the column.
   - **VIRTUAL generated columns (the DEFAULT kind on PG18).** Aurora DSQL supports
     `GENERATED ALWAYS AS (expr) **STORED**` and maintains the value itself, so a STORED
     column is **preserved** — nothing to recompute and no drift (a write must simply omit
