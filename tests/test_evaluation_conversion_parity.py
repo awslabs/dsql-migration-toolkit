@@ -153,14 +153,6 @@ _PG_CORPUS = [
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
 # conversion reports that Evaluation does not). Close one => delete its line.
 _KNOWN_GAPS = {
-    # A functional index the introspector reflects only partially is skipped.
-    ("mysql", "app.expr_idx", "LOSS"),
-    # A partial UNIQUE index loses its predicate on Aurora DSQL.
-    ("postgres", "app.partial_idx", "LOSS"),
-    # A GIN/GiST index is emitted as btree on Aurora DSQL.
-    ("postgres", "app.gin_idx", "LOSS"),
-    # A per-column collation Aurora DSQL does not have is dropped.
-    ("postgres", "app.coll_col", "LOSS"),
 }
 
 

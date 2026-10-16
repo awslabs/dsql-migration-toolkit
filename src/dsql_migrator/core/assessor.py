@@ -1711,6 +1711,78 @@ class YearTypeRule(Rule):
         return findings
 
 
+class ConversionWarningRule(Rule):
+    """A Step 1 finding that IS a Schema Conversion warning: the converter's own helper
+    decides and words it, so the two steps cannot grade or describe the table differently
+    (the reverse direction the Evaluation/conversion parity test checks). ``warning`` names
+    the converter helper; it is resolved lazily because the converter imports this module."""
+
+    def __init__(
+        self, rule_id: str, warning: str, recommendation: str, effort: EffortLevel
+    ) -> None:
+        self.rule_id = rule_id
+        self._warning = warning
+        self._recommendation = recommendation
+        self._effort = effort
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core import converter
+
+        helper = getattr(converter, self._warning)
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            warning = helper(table)
+            if warning is None:
+                continue
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=warning.classification,
+                    risk=warning.message,
+                    recommendation=self._recommendation,
+                    effort=self._effort,
+                )
+            )
+        return findings
+
+
+def expression_index_rule() -> ConversionWarningRule:
+    """MySQL functional indexes, which the conversion cannot carry (EXPRESSION_INDEX)."""
+    return ConversionWarningRule(
+        "EXPRESSION_INDEX",
+        "_expression_index_warning",
+        "Recreate the index on Aurora DSQL after the load as an expression index "
+        "(CREATE INDEX ASYNC ... ((expression))), which Aurora DSQL supports.",
+        EffortLevel.SIMPLE,
+    )
+
+
+def pg_index_not_preserved_rule() -> ConversionWarningRule:
+    """PostgreSQL partial and non-btree indexes (PG_INDEX_NOT_PRESERVED)."""
+    return ConversionWarningRule(
+        "PG_INDEX_NOT_PRESERVED",
+        "_pg_partial_or_nonbtree_index_warning",
+        "Before loading, check that the rows a partial UNIQUE index left out hold no "
+        "duplicates; for a non-btree index, move that search outside the database or "
+        "redesign the query.",
+        EffortLevel.MEDIUM,
+    )
+
+
+def pg_collation_rule() -> ConversionWarningRule:
+    """PostgreSQL non-default column collations, which the target does not keep
+    (PG_COLLATION_DROPPED)."""
+    return ConversionWarningRule(
+        "PG_COLLATION_DROPPED",
+        "_pg_collation_warning",
+        "Check the comparisons, sorting and unique keys on these columns under Aurora "
+        "DSQL's default collation before cut over; where they must ignore case or accents, "
+        "have the application store a normalised key column and match on that.",
+        EffortLevel.MEDIUM,
+    )
+
+
 class TimeTypeRule(Rule):
     """Flag MySQL TIME columns: a duration type, where Aurora DSQL's time is a time of day.
 
@@ -2646,6 +2718,7 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         BitTypeRule(),
         YearTypeRule(),
         TimeTypeRule(),
+        expression_index_rule(),
         GeneratedColumnRule(),
         AutoUpdateTimestampRule(),
         UnsupportedIndexTypeRule(),

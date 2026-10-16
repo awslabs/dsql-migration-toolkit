@@ -31,6 +31,9 @@ _EXPECTED_PG_RULE_IDS = {
     "VIEW_DEFINITION_UNREADABLE",
     # PG-specific: a column type a CDC change event cannot carry (Step 3's classifier).
     "CDC_UNCARRYABLE_COLUMN",
+    # PG-specific conversion warnings, decided by the converter's own helpers.
+    "PG_INDEX_NOT_PRESERVED",
+    "PG_COLLATION_DROPPED",
     "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
     "TRIGGER_UNSUPPORTED",

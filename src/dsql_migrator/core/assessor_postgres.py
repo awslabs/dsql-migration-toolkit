@@ -1283,6 +1283,8 @@ def default_rules() -> "list[Rule]":
         TooManyKeyColumnsRule,
         TriggerRule,
         ViewDefinitionUnreadableRule,
+        pg_collation_rule,
+        pg_index_not_preserved_rule,
     )
 
     return [
@@ -1325,6 +1327,9 @@ def default_rules() -> "list[Rule]":
         ViewDefinitionUnreadableRule(is_postgres=True),
         # What CDC cannot carry, said at Step 1 as the Step 3 check says it.
         PgCdcUncarryableColumnRule(),
+        # Conversion warnings Evaluation had no finding for (the parity test's known gaps).
+        pg_index_not_preserved_rule(),
+        pg_collation_rule(),
     ]
 
 

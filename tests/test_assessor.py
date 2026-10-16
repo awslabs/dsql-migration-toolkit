@@ -609,6 +609,9 @@ def test_default_rules_source_type_seam() -> None:
         "PG_UNCONSTRAINED_NUMERIC",
         # A PostgreSQL type a pgoutput change event cannot carry (array/geometric types).
         "CDC_UNCARRYABLE_COLUMN",
+        # PostgreSQL partial / non-btree indexes and column collations.
+        "PG_INDEX_NOT_PRESERVED",
+        "PG_COLLATION_DROPPED",
     }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
@@ -644,6 +647,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "BIT_TYPE",
         "YEAR_TYPE",
         "TIME_TYPE",
+        "EXPRESSION_INDEX",
         "VIEW_UNSUPPORTED_SQL",
         "VIEW_DEFINITION_UNREADABLE",
         "GENERATED_COLUMN",
