@@ -1223,6 +1223,45 @@ def with_pg_catalog_facts(
     return report
 
 
+class PgViewRemodelledColumnRule(Rule):
+    """A PostgreSQL view over columns Schema Conversion re-types (enum, array, range, ...).
+
+    The view was graded AUTO and emitted verbatim, so an expression relying on the old
+    type reached apply: a cast to the enum type failed CREATE VIEW (that cast is now
+    rewritten to text), and an array subscript or a range operator fails or changes. The
+    conversion note's own text, decided by the same detection."""
+
+    rule_id = "VIEW_REMODELLED_COLUMN"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.converter import (
+            pg_view_remodelled_references,
+            remodelled_reference_note,
+        )
+
+        findings: list[Finding] = []
+        for view in inventory.views:
+            if getattr(view, "unsupported_kind", None):
+                continue
+            references = pg_view_remodelled_references(view, inventory.tables)
+            if references:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_VIEW, view.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=remodelled_reference_note(references),
+                        recommendation=(
+                            "Open the view in Schema Conversion and adapt the expressions "
+                            "on those columns to their new type (the target DDL is "
+                            "editable) before applying it."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
 class PgCdcUncarryableColumnRule(Rule):
     """Columns whose PostgreSQL type a CDC change event cannot carry to Aurora DSQL.
 
@@ -1327,6 +1366,7 @@ def default_rules() -> "list[Rule]":
         ViewDefinitionUnreadableRule(is_postgres=True),
         # What CDC cannot carry, said at Step 1 as the Step 3 check says it.
         PgCdcUncarryableColumnRule(),
+        PgViewRemodelledColumnRule(),
         # Conversion warnings Evaluation had no finding for (the parity test's known gaps).
         pg_index_not_preserved_rule(),
         pg_collation_rule(),

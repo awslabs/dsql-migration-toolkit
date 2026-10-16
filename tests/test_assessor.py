@@ -612,6 +612,8 @@ def test_default_rules_source_type_seam() -> None:
         # PostgreSQL partial / non-btree indexes and column collations.
         "PG_INDEX_NOT_PRESERVED",
         "PG_COLLATION_DROPPED",
+        # A PostgreSQL view over enum / array / range columns the conversion re-types.
+        "VIEW_REMODELLED_COLUMN",
     }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}

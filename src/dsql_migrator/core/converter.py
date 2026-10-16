@@ -5779,7 +5779,9 @@ class SchemaConverter:
             self.convert_table(table, options, index_names=renames.get(table.name))
             for table in inventory.tables
         ]
-        view_conversions = [self.convert_view(view) for view in inventory.views]
+        view_conversions = [
+            self.convert_view(view, tables=inventory.tables) for view in inventory.views
+        ]
         collisions = name_collisions(
             inventory, is_postgres=is_postgres, namespaces=namespaces
         )
@@ -5814,7 +5816,9 @@ class SchemaConverter:
             conversions, object_warnings, views=view_conversions, index_renames=renames
         )
 
-    def convert_view(self, view: ViewDef) -> ViewConversion:
+    def convert_view(
+        self, view: ViewDef, *, tables: "Sequence[TableDef]" = ()
+    ) -> ViewConversion:
         """Convert a single source view to a DSQL-compatible ``CREATE VIEW``.
 
         Aurora DSQL is PostgreSQL-compatible and supports views. A MySQL view's
@@ -5889,8 +5893,9 @@ class SchemaConverter:
         if self._source_type is SourceType.POSTGRES:
             # Verbatim, and sqlglot is no gate either: a body it cannot parse (it raises on
             # the jsonb `@?` operator, for one) is still the text PostgreSQL deparsed
-            # itself, and Evaluation grades the view AUTO.
-            verbatim = pg_view_ddl(view.name, definition)
+            # itself, and Evaluation grades the view AUTO. The one rewrite is a cast to an
+            # enum the conversion turns into text (that type does not exist on DSQL).
+            verbatim = pg_view_ddl(view.name, _rewrite_enum_casts(definition, tables))
             if verbatim is None:
                 return _manual_view_conversion(view.name, schema_ddls)
             return ViewConversion(
@@ -5898,7 +5903,7 @@ class SchemaConverter:
                 target_ddl=verbatim,
                 schema_ddls=schema_ddls,
                 auto_converted=True,
-                warnings=[],
+                warnings=_remodelled_reference_warnings(view, tables),
             )
         try:
             parsed = sqlglot.parse_one(definition, read=_MYSQL)
@@ -5932,6 +5937,106 @@ class SchemaConverter:
             auto_converted=True,
             warnings=[],
         )
+
+
+def pg_remodelled_columns(table: TableDef) -> "dict[str, tuple[str, str]]":
+    """``{column: (source type, target type)}`` for the columns Schema Conversion re-types
+    on a PostgreSQL source: an enum becomes text (with a CHECK), an array jsonb, a range
+    text, and the other substituted types their stand-in. Pure."""
+    from dsql_migrator.core.converter_postgres import substitute_pg_unsupported_type
+
+    out: dict[str, tuple[str, str]] = {}
+    for column in table.columns:
+        if column.type_kind == "enum" and column.enum_labels:
+            out[column.name] = (column.mysql_type, "text")
+            continue
+        target, _note = substitute_pg_unsupported_type(
+            column.mysql_type, type_kind=column.type_kind
+        )
+        if target:
+            out[column.name] = (column.mysql_type, target)
+    return out
+
+
+def _mentions_identifier(text: str, name: str) -> bool:
+    """Whether ``name`` appears in ``text`` as a whole identifier, bare or quoted."""
+    return re.search(rf'(?<![\w"$]){re.escape(name)}(?![\w"$])|"{re.escape(name)}"', text) is not None
+
+
+def pg_view_remodelled_references(
+    view: ViewDef, tables: "Sequence[TableDef]"
+) -> "list[tuple[str, str, str, str]]":
+    """``(table, column, source type, target type)`` for each re-typed column of a table
+    ``view`` reads whose name its definition mentions. A text match, so it errs toward
+    naming a column: the view is then flagged for a review rather than reaching apply with
+    an expression that relies on the old type (an array subscript, a range operator) and
+    failing there, or quietly changing what it returns. Pure."""
+    definition = view.definition or ""
+    if not definition:
+        return []
+    found: list[tuple[str, str, str, str]] = []
+    for table in tables:
+        remodelled = pg_remodelled_columns(table)
+        if not remodelled:
+            continue
+        _schema, bare = _split_qualified(table.name)
+        if not _mentions_identifier(definition, bare):
+            continue
+        for column, (old, new) in remodelled.items():
+            if _mentions_identifier(definition, column):
+                found.append((table.name, column, old, new))
+    return found
+
+
+def _rewrite_enum_casts(definition: str, tables: "Sequence[TableDef]") -> str:
+    """``definition`` with every cast to a converted enum type (``'x'::mood``,
+    ``CAST(c AS app.mood)``) made a cast to text: the type does not exist on Aurora DSQL
+    (no CREATE TYPE), and its columns become text, so the cast is what made CREATE VIEW
+    fail. Only these casts change; the rest of the body stays verbatim."""
+    names = {
+        column.mysql_type.strip()
+        for table in tables
+        for column in table.columns
+        if column.type_kind == "enum" and column.enum_labels and column.mysql_type
+    }
+    for name in sorted(names, key=len, reverse=True):
+        parts = [re.escape(part.strip('"')) for part in name.split(".")]
+        pattern = r'\.'.join(rf'"?{part}"?' for part in parts)
+        definition = re.sub(
+            rf"(::\s*|\bAS\s+)(?:[\w\"]+\.)?{pattern}(?![\w\"$])",
+            lambda match: match.group(1) + "text",
+            definition,
+            flags=re.IGNORECASE,
+        )
+    return definition
+
+
+def remodelled_reference_note(references: "Sequence[tuple[str, str, str, str]]") -> str:
+    """The note for a view that reads re-typed columns (Schema Conversion and Evaluation)."""
+    listed = ", ".join(f"{t}.{c} ({old} -> {new})" for t, c, old, new in references)
+    return (
+        f"This view reads columns Schema Conversion re-types: {listed}. A cast to a "
+        "converted enum is rewritten to text, but an expression that relies on the old "
+        "type -- an array subscript or ANY(), a range operator, an enum ordering -- fails "
+        "at apply or returns something else on Aurora DSQL. Review the view's target DDL "
+        "before applying."
+    )
+
+
+def _remodelled_reference_warnings(
+    view: ViewDef, tables: "Sequence[TableDef]"
+) -> "list[ConversionWarning]":
+    references = pg_view_remodelled_references(view, tables)
+    if not references:
+        return []
+    return [
+        ConversionWarning(
+            object_name=view.name,
+            classification=Classification.MANUAL,
+            kind=ConversionNoteKind.LOSS,
+            message=remodelled_reference_note(references),
+        )
+    ]
 
 
 def _manual_view_conversion(name: str, schema_ddls: "list[str]") -> ViewConversion:

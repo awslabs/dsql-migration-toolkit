@@ -470,3 +470,45 @@ def test_every_view_header_the_converter_emits_is_one_the_applier_accepts() -> N
         ddl = pg_view_ddl("public.Nums", definition)
         assert ddl is not None, definition
         assert parse_create_object(ddl) == ("public.Nums", "VIEW"), (definition, ddl)
+
+
+def test_a_view_over_re_typed_columns_is_flagged_and_its_enum_casts_become_text() -> None:
+    """Emitted verbatim and graded AUTO, such a view failed at apply: the enum type does not
+    exist on Aurora DSQL, and array/range expressions break on jsonb/text columns."""
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, SourceType, TableDef, ViewDef
+
+    orders = TableDef(
+        name="app.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="status", mysql_type="app.order_status", type_kind="enum",
+                      enum_labels=["new", "paid"]),
+            ColumnDef(name="tags", mysql_type="text[]"),
+        ],
+        primary_key=["id"],
+    )
+    view = ViewDef(
+        name="app.v_paid",
+        definition=" SELECT o.id, o.tags[1] AS first_tag FROM app.orders o "
+        "WHERE o.status = 'paid'::app.order_status;",
+    )
+    inventory = SourceInventory(tables=[orders], views=[view])
+    conversion = SchemaConverter(source_type=SourceType.POSTGRES).convert(inventory)
+    (converted,) = conversion.views
+    assert "'paid'::text" in converted.target_ddl and "order_status" not in converted.target_ddl
+    assert "o.tags[1]" in converted.target_ddl  # the rest stays verbatim
+    (note,) = converted.warnings
+    assert "app.orders.status (app.order_status -> text)" in note.message
+    assert "app.orders.tags (text[] -> jsonb)" in note.message
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(inventory)
+    (item,) = [i for i in report.items if i.object_name == "app.v_paid"]
+    (concern,) = [c for c in item.concerns if c.rule_id == "VIEW_REMODELLED_COLUMN"]
+    assert concern.risk == note.message and item.classification.value == "MANUAL"
+    # A view over untouched columns stays AUTO and byte-identical.
+    plain = ViewDef(name="app.v_ids", definition=" SELECT o.id FROM app.orders o;")
+    (clean,) = SchemaConverter(source_type=SourceType.POSTGRES).convert(
+        SourceInventory(tables=[orders], views=[plain])
+    ).views
+    assert clean.warnings == [] and clean.target_ddl.endswith("SELECT o.id FROM app.orders o")

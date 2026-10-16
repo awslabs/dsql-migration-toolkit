@@ -324,7 +324,11 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   수동 작업 플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다. **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
   같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
-  `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다.
+  `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum
+  타입으로의 캐스트입니다(`'paid'::order_status`가 `'paid'::text`가 됨). 그 타입은 Aurora DSQL에 없기
+  때문입니다. 변환이 타입을 바꾸는 컬럼(enum, jsonb가 되는 배열, text가 되는 범위)을 읽는 뷰는 두 단계 모두에서
+  **MANUAL**(`VIEW_REMODELLED_COLUMN`)로 표시되며 각 컬럼의 이전·새 타입을 알려 줍니다: 그 안의 배열 첨자나
+  범위 연산자는 적용 시 실패하거나 다른 결과를 돌려줍니다.
 
 ### 외래 키 — DSQL에서 강제되지만, 데이터 적재 *이후*에 적용
 

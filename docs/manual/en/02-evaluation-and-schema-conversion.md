@@ -420,7 +420,12 @@ MySQL→PostgreSQL transpile:
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column
-  into text.
+  into text. The one rewrite is a cast to an enum type the conversion turns into text
+  (`'paid'::order_status` becomes `'paid'::text`), since that type does not exist on Aurora
+  DSQL. A view that reads columns the conversion re-types (an enum, an array that becomes
+  jsonb, a range that becomes text) is flagged **MANUAL** in both steps
+  (`VIEW_REMODELLED_COLUMN`), naming each column with its old and new type: an array
+  subscript or a range operator in it fails at apply or returns something else.
 
 ### Foreign keys — enforced on DSQL, but applied *after* the data loads
 
