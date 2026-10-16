@@ -2645,6 +2645,81 @@ def check_postgres_database_collation(
     return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
+MIXED_CASE_RULE_ID = "MIXED_CASE_IDENTIFIERS"
+
+
+def check_mixed_case_identifiers(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """Note the MySQL names with upper-case letters, which unquoted SQL cannot reach on DSQL.
+
+    Schema Conversion keeps every name exactly as the source spells it by quoting it, and
+    Aurora DSQL, like PostgreSQL, folds an UNQUOTED name to lower case. MySQL matches column
+    names case-insensitively (and table names too where lower_case_table_names is set), so
+    application SQL that writes ``CustomerId`` or ``Orders`` unquoted worked there and finds
+    nothing after cut over -- with no finding anywhere until then. Tables whose names differ
+    only by case (possible where MySQL's table names are case-sensitive) cannot both be
+    reached unquoted at all."""
+    def upper(name: str) -> bool:
+        return name != name.lower()
+
+    schemas: set[str] = set()
+    relations: list[str] = []
+    columns: list[str] = []
+    by_folded: dict[tuple[str, str], list[str]] = {}
+    for relation in (*inventory.tables, *inventory.views):
+        schema, _, bare = relation.name.partition(".")
+        if not bare:
+            schema, bare = "", schema
+        if schema and upper(schema):
+            schemas.add(schema)
+        if upper(bare):
+            relations.append(relation.name)
+        by_folded.setdefault((schema.lower(), bare.lower()), []).append(relation.name)
+    for table in inventory.tables:
+        columns.extend(f"{table.name}.{c.name}" for c in table.columns if upper(c.name))
+    if not (schemas or relations or columns):
+        return []
+    counts = ", ".join(
+        part
+        for part in (
+            f"{len(schemas)} database name(s)" if schemas else "",
+            f"{len(relations)} table/view name(s)" if relations else "",
+            f"{len(columns)} column name(s)" if columns else "",
+        )
+        if part
+    )
+    examples = ", ".join([*sorted(schemas), *relations, *columns][:5])
+    pairs = [names for names in by_folded.values() if len(names) > 1]
+    risk = (
+        f"{counts} contain upper-case letters (for example {examples}). Schema Conversion "
+        "keeps every name exactly as spelled by quoting it, and Aurora DSQL folds an "
+        "UNQUOTED name to lower case -- so application SQL that writes these names "
+        "unquoted, which MySQL accepted (it matches column names case-insensitively), "
+        "finds nothing after cut over."
+    )
+    if pairs:
+        risk += (
+            " These names differ only by case, so they cannot both be reached unquoted: "
+            + "; ".join(" / ".join(names) for names in pairs[:5])
+            + "."
+        )
+    item = AssessmentItem(
+        object_name="identifier case",
+        rule_id=MIXED_CASE_RULE_ID,
+        classification=Classification.MANUAL,
+        risk=risk,
+        recommendation=(
+            "Before cut over, quote these names in the application's SQL exactly as they "
+            "are spelled (\"CustomerId\"), or rename them to lower case on the target "
+            "(ALTER TABLE ... RENAME ...) and use lower case throughout."
+        ),
+        effort=EffortLevel.MEDIUM,
+        kind=KIND_DATABASE.upper(),
+    )
+    return [item.model_copy(update={"concerns": _single_concern(item)})]
+
+
 def default_inventory_rules(
     source_type: SourceType = SourceType.MYSQL,
 ) -> list[InventoryRule]:
@@ -2670,6 +2745,7 @@ def default_inventory_rules(
         check_table_count,
         check_schema_count,
         check_view_count,
+        check_mixed_case_identifiers,
     ]
 
 
@@ -3505,6 +3581,7 @@ __all__ = [
     "check_view_count",
     "DSQL_DATABASE_LIMITS",
     "default_inventory_rules",
+    "check_mixed_case_identifiers",
     "default_rules",
     "CompatibilityAssessor",
     "render_text_report",

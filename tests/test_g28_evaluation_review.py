@@ -2258,3 +2258,23 @@ def test_a_not_null_generated_column_cdc_never_carries_says_what_cdc_does() -> N
     (item,) = [i for i in report.items if i.object_name == "shop.orders"]
     (concern,) = [c for c in item.concerns if c.rule_id == "GENERATED_COLUMN"]
     assert "label is NOT NULL, so such a row is refused instead (SQLSTATE 23502" in concern.risk
+
+
+def test_mixed_case_mysql_names_are_named_before_unquoted_sql_breaks() -> None:
+    """Quoted on Aurora DSQL, a name with upper case is unreachable by the unquoted SQL
+    MySQL accepted (column names match case-insensitively there) -- with no finding."""
+    tables = [
+        _table("shop.Orders", columns=[ColumnDef(name="id", mysql_type="int"),
+                                       ColumnDef(name="CustomerId", mysql_type="int")]),
+        _table("shop.orders"),
+        _table("shop.items"),
+    ]
+    report = CompatibilityAssessor().assess(SourceInventory(tables=tables))
+    (item,) = [i for i in report.items if i.rule_id == "MIXED_CASE_IDENTIFIERS"]
+    assert item.classification is Classification.MANUAL and item.kind == "DATABASE"
+    assert "1 table/view name(s), 1 column name(s)" in item.risk
+    assert "shop.Orders.CustomerId" in item.risk
+    assert "shop.Orders / shop.orders" in item.risk  # differ only by case
+    lower = [_table("shop.items"), _table("shop.orders")]
+    report = CompatibilityAssessor().assess(SourceInventory(tables=lower))
+    assert not [i for i in report.items if i.rule_id == "MIXED_CASE_IDENTIFIERS"]

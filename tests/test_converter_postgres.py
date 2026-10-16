@@ -1328,6 +1328,28 @@ def test_a_default_cast_to_a_dsql_unsupported_type_is_reported_not_emitted() -> 
     assert _pg_default_unsupported_type("nextval('ecommerce.s'::regclass)") is None
 
 
+def test_a_default_cast_is_judged_by_its_whole_type_name() -> None:
+    """Only the first word was read: 'double precision' looked like an unsupported 'double'
+    (a valid default dropped with a false warning) and 'character varying[]' like a
+    supported 'character' (an array default kept, which the jsonb column then rejects)."""
+    from dsql_migrator.core.converter_postgres import _pg_default_unsupported_type
+
+    for kept in (
+        "0::double precision",
+        "CAST(1 AS double precision)",
+        "'x'::character varying",
+        "now()::timestamp(6) with time zone",
+        "'12:00'::time without time zone",
+    ):
+        assert _pg_default_unsupported_type(kept) is None, kept
+    for dropped, name in (
+        ("'{}'::character varying[]", "character varying[]"),
+        ("'{}'::timestamp with time zone[]", "timestamp with time zone[]"),
+        ("'{a}'::text[]", "text[]"),
+    ):
+        assert _pg_default_unsupported_type(dropped) == name, dropped
+
+
 def test_an_over_long_character_length_is_clamped_instead_of_failing_at_apply() -> None:
     """A PG varchar/char above DSQL's declared-length ceiling broke the whole CREATE TABLE.
 

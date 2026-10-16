@@ -306,7 +306,15 @@ def dsql_create_sequence_sql(sequence: "StandaloneSequence") -> str:
 # the `CAST(... AS type)` form the converter's own re-render produces. The name may be
 # schema-qualified and quoted.
 _PG_DEFAULT_CAST_RE = re.compile(
-    r"(?:::|\bCAST\s*\([^()]*?\bAS\s+)\s*([\w.\"]+(?:\s*\[\s*\])?)",
+    r"(?:::|\bCAST\s*\([^()]*?\bAS\s+)\s*"
+    # The type name, with the second words of PostgreSQL's multi-word types (a modifier
+    # may sit between: timestamp(6) with time zone), then any array brackets. Reading only
+    # the first word took "double precision" for an unsupported "double" (dropping a valid
+    # default) and "character varying[]" for a supported "character" (keeping an array
+    # default the jsonb column then rejects).
+    r"(?P<name>[\w.\"]+)(?:\s*\([^()]*\))?"
+    r"(?P<rest>\s+(?:precision|varying|with(?:out)?\s+time\s+zone))?(?:\s*\([^()]*\))?"
+    r"(?P<array>(?:\s*\[\s*\])*)",
     re.IGNORECASE,
 )
 
@@ -361,9 +369,12 @@ def _pg_default_unsupported_type(raw: str) -> "Optional[str]":
     re-render emits those) and must not be dropped.
     """
     for match in _PG_DEFAULT_CAST_RE.finditer(raw or ""):
-        name = match.group(1).strip().strip('"')
-        if not name or name.lower() in _PG_EXPRESSION_ONLY_CAST_TYPES:
+        base = match.group("name").strip().strip('"')
+        if not base or base.lower() in _PG_EXPRESSION_ONLY_CAST_TYPES:
             continue
+        name = base + " ".join([""] + (match.group("rest") or "").split())
+        if match.group("array"):
+            name += "[]"
         if unsupported_dsql_reason(name) is not None:
             return name
     return None
