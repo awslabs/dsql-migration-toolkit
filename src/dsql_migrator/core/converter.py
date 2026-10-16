@@ -101,6 +101,25 @@ from dsql_migrator.core.models import (
 # concurrent inserts, and CACHE 1 is the non-cached behavior it exists to avoid.
 _IDENTITY_CACHE_SIZE = 65536
 
+# What every "add an identity to the column on the target" fallback has to say, so the
+# advice can be followed. Aurora DSQL allows an identity only on a bigint column (its
+# CREATE TABLE and ALTER TABLE ... ADD GENERATED ... AS IDENTITY documentation alike), and
+# its ALTER TABLE has no SET DATA TYPE -- so on an integer column the bare advice could not
+# be followed after apply at all. And an identity added to a table the Full Load filled
+# starts below the loaded values (an explicitly written value never advances it), so it has
+# to be restarted past them. Shared by Evaluation and Schema Conversion so the two steps
+# give the same instruction.
+IDENTITY_RESTART_ADVICE = (
+    "RESTART it past the largest loaded value before cutting over (ALTER TABLE ... ALTER "
+    "COLUMN ... RESTART WITH <largest value + 1>), because the loaded rows do not "
+    "advance it"
+)
+IDENTITY_FALLBACK_CAVEAT = (
+    "which Aurora DSQL allows only on a bigint column -- and it cannot change a column's "
+    "type after apply, so a smaller integer column has to be declared bigint in the "
+    "target DDL before applying -- then " + IDENTITY_RESTART_ADVICE
+)
+
 # Aurora DSQL numeric limits, from the SERVICE DOCUMENTATION ("Supported data types":
 # "The maximum precision is 1000 and scale can be between -1000 and 1000", default
 # numeric(18,6), max storage 510 bytes) and re-confirmed live 2026-09-25 against a real
@@ -3114,7 +3133,9 @@ def _apply_pk_strategy(
                 "table because its primary key is composite "
                 f"({', '.join(table.primary_key)}) and DSQL's identity applies to a single "
                 "column, so the value has to come from the application (or add an identity "
-                "to the column on the target after apply). "
+                "to the column on the target after apply, "
+                + IDENTITY_FALLBACK_CAVEAT
+                + "). "
             )
             + "For higher insert "
             "throughput, consider a UUID/random key or a cached identity: DSQL stores "

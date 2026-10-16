@@ -120,7 +120,9 @@ freeze shrinks to just the final drain + smoke test.
    The final validation also **advances any identity / `AUTO_INCREMENT` sequence**
    past the rows CDC delivered (a *Sync identity sequences* action), so the
    application's first insert after cut-over can't collide with a migrated id
-   (`23505`). Tables with dead-lettered CDC changes are compared by CHECKSUM
+   (`23505`). A PostgreSQL sequence no column owns is not among them: Evaluation lists each
+   one (`PG_STANDALONE_SEQUENCE`), and you move it past the source's final value yourself
+   (`SELECT setval(...)` on Aurora DSQL) before repointing. Tables with dead-lettered CDC changes are compared by CHECKSUM
    automatically, and Cut over re-reads the dead-letter queue before it opens (see
    [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). On a PostgreSQL source
    with re-keyed tables, Cut over also re-reads their REPLICA IDENTITY before it opens

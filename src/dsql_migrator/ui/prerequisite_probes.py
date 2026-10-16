@@ -32,7 +32,7 @@ not a failure.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from sqlalchemy import text
 
@@ -51,6 +51,9 @@ from dsql_migrator.core.target_introspector import (
     target_required_columns_without_default,
 )
 from dsql_migrator.ui.connect import make_source_engine_factory
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.catalog_postgres import RowSecurityFacts
 
 # MSK Serverless/provisioned cluster states that mean the broker is usable.
 _MSK_CLUSTER_READY_STATES = frozenset({"ACTIVE"})
@@ -418,6 +421,38 @@ class SessionSourceProbe:
         except Exception:  # noqa: BLE001 - advisory read: no row, never a crash
             return None
         return {table: (count, sample) for table, count, sample in rows}
+
+    def row_security(
+        self, table_names: Sequence[str]
+    ) -> "Optional[RowSecurityFacts]":
+        """PostgreSQL: which of ``table_names`` have row-level security enabled, with their
+        policies and whether the source login is exempt from them
+        (:class:`~dsql_migrator.core.catalog_postgres.RowSecurityFacts`) -- the catalog read
+        Evaluation makes, live and for this run's login. Read-only. ``None`` for a MySQL
+        source, or when the read fails."""
+        if self._config.source_type is not SourceType.POSTGRES:
+            return None
+        from dsql_migrator.core.catalog_postgres import RowSecurityFacts
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        try:
+            engine = self._engine_factory(self._config)
+            try:
+                with engine.connect() as connection:
+                    facts = dialect_for(self._config.source_type).read_row_security(
+                        connection
+                    )
+            finally:
+                engine.dispose()
+        except Exception:  # noqa: BLE001 - advisory read: no row, never a crash
+            return None
+        if facts is None:
+            return None
+        wanted = set(table_names)
+        return RowSecurityFacts(
+            login=facts.login,
+            tables=tuple(table for table in facts.tables if table.table in wanted),
+        )
 
 
 class SessionTargetProbe:

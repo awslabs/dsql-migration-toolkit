@@ -38,13 +38,35 @@ migration user needs `SHOW VIEW` to read view definitions, and `TRIGGER`, `EVENT
 `SHOW_ROUTINE` (or `SELECT` on `*.*`) to list triggers, events and routines; without them
 the report says what it could not list (`SOURCE_VISIBILITY`) instead of omitting it.
 
+For a PostgreSQL source, Evaluation also reads two things the inventory does not hold:
+
+- **Row-level security.** Aurora DSQL has none, so a table with row-level security enabled
+  is graded **UNSUPPORTED** (`PG_ROW_LEVEL_SECURITY`), with each policy's `USING` /
+  `WITH CHECK` text to rebuild the rule in the application from. The finding also says
+  whether the source user reads every row: a superuser, a role with `BYPASSRLS`, or the
+  table's owner when the table is not `FORCE ROW LEVEL SECURITY`. Every PostgreSQL source
+  session runs with `row_security = off`, as `pg_dump` does, so for any other user the Full
+  Load and Validation stop on that table with an error instead of copying and comparing
+  only the rows its policies show; the Data Migration prerequisite checks flag it
+  (`ROW_SECURITY`) before the load.
+- **Standalone sequences** (a sequence no column owns). Schema Conversion does not create
+  them, so each one is a **MANUAL** item (`PG_STANDALONE_SEQUENCE`) carrying the Aurora DSQL
+  `CREATE SEQUENCE` that continues after the source's current value: `CACHE 1`, or
+  `CACHE 65536` when the source already caches (Aurora DSQL accepts only those), and the
+  source's own bounds when they are not bigint's. Create it before cut over, and once source
+  writes stop move it past the source's final value with `setval`: the tool neither creates
+  nor syncs it.
+
+If either read fails, the report says so (`PG_CATALOG_UNREAD`) rather than reading as if
+there were none.
+
 ### Every object gets one classification
 
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below); a multi-database MySQL source (each database becomes its own schema, flagged `RECOMMENDED`); an index name another table, view or index of the schema also uses (the index is renamed automatically, flagged `RECOMMENDED`). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns (a UNIQUE one stops enforcing uniqueness), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`). |
-| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`), names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), FULLTEXT/SPATIAL indexes. |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns (a UNIQUE one stops enforcing uniqueness), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
+| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`), names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), FULLTEXT/SPATIAL indexes, row-level security on a PostgreSQL table (`PG_ROW_LEVEL_SECURITY`). |
 
 The examples above are mostly drawn from a MySQL source. For a **PostgreSQL source** the same
 scale applies: unsupported PG column types — arrays (`[]`), geometric
@@ -348,7 +370,12 @@ MySQL→PostgreSQL transpile:
   `serial`/`IDENTITY` `nextval` is governed by the chosen primary-key strategy instead, and a
   non-key `nextval`, a default that does not parse, or one that casts to a type DSQL lacks is
   dropped with a note (an enum default is kept as its plain text literal, since the column
-  becomes `text`). A `STORED` generated column IS preserved, too: its expression is re-emitted
+  becomes `text`). For a non-key `nextval` the note says how to keep the database generating
+  the value: an identity, which Aurora DSQL allows only on a `bigint` column — and it cannot
+  change a column's type after apply — so a `serial` (`integer`) column has to be
+  declared `bigint GENERATED BY DEFAULT AS IDENTITY (CACHE 65536)` in the target DDL before
+  applying, and the identity restarted past the loaded values before cut over (Evaluation's
+  `NON_KEY_SEQUENCE` finding gives the same instruction). A `STORED` generated column IS preserved, too: its expression is re-emitted
   verbatim as `GENERATED ALWAYS AS (expr) STORED` and Aurora DSQL maintains the value on every
   write, so nothing has to be re-implemented (a write must simply OMIT the column, which
   Full Load and the CDC sink do). A `VIRTUAL` generated column — PG18's default kind — has

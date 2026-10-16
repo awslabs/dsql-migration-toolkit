@@ -19,6 +19,14 @@ from typing import Optional
 
 from sqlalchemy import text
 
+from dsql_migrator.core.catalog_postgres import (
+    PgCatalogFacts,
+    RowSecurityFacts,
+    RowSecurityPolicy,
+    RowSecurityTable,
+    SourceLogin,
+    StandaloneSequence,
+)
 from dsql_migrator.core.introspector import SOURCE_CONNECT_TIMEOUT_SECONDS
 from dsql_migrator.core.models import ObjectRef, ObjectType, SourceType, ViewDef
 from dsql_migrator.core.source_dialect.base import (
@@ -646,6 +654,158 @@ def _pg_collect_routines(connection: object, nsp: str) -> list:
     return out
 
 
+# Sent on every new source connection (see ``PostgresSourceDialect.session_setup_sql``), as
+# pg_dump does by default and for the same reason: with ``row_security = off`` a read that
+# a row-level security policy would FILTER fails instead -- SQLSTATE 42501, "query would be
+# affected by row-level security policy for table ..." -- so a migration role the policies
+# apply to cannot copy, count or checksum a filtered subset of a table and report it
+# complete. A role exempt from them (a superuser, BYPASSRLS, or the owner of a table that is
+# not FORCE ROW LEVEL SECURITY) is unaffected: PostgreSQL applies no policy to its reads, so
+# there is nothing to refuse.
+#
+# A SET after connect, NOT a libpq ``options`` startup parameter: RDS Proxy rejects the
+# ``options`` parameter, while it accepts a SET.
+_PG_ROW_SECURITY_OFF = "SET row_security = off"
+# How that refusal is told apart from an ordinary permission error with the same SQLSTATE.
+_PG_ROW_SECURITY_REFUSAL = "row-level security"
+
+
+def pg_read_row_security(connection: object, schemas: "list[str]") -> RowSecurityFacts:
+    """Read the tables of ``schemas`` that have row-level security ENABLED, their policies,
+    and whether the login is exempt from them. Read-only catalog statements; raises on a
+    failed read (the caller decides what an unread answer means).
+
+    One statement in the common case (no table has row-level security), three otherwise.
+    A declarative partition is left out: Full Load reads its parent, whose own policies are
+    the ones PostgreSQL applies to that read, and the partition is not a table of the
+    inventory. An extension's own table is left out like every other extension object.
+    """
+    if not schemas:
+        return RowSecurityFacts(login=None)
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT n.nspname AS nsp, c.relname AS rel, c.relforcerowsecurity AS forced, "
+            "pg_get_userbyid(c.relowner) AS owner, "
+            # 'USAGE': the login has the owner's privileges WITHOUT a SET ROLE -- the owner
+            # itself or an inheriting member -- which is how PostgreSQL decides the owner
+            # exemption (object_ownercheck -> has_privs_of_role).
+            "pg_has_role(c.relowner, 'USAGE') AS owned "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relrowsecurity AND c.relkind IN ('r', 'p') AND NOT c.relispartition "
+            "AND n.nspname = ANY(:schemas) "
+            + _not_extension_owned("pg_class", "c.oid")
+            + "ORDER BY n.nspname, c.relname"
+        ),
+        {"schemas": list(schemas)},
+    ).mappings()
+    found = [(f"{row['nsp']}.{row['rel']}", row) for row in rows]
+    if not found:
+        return RowSecurityFacts(login=None)
+    login_row = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT current_user AS login, r.rolsuper AS superuser, "
+            "r.rolbypassrls AS bypassrls FROM pg_roles r WHERE r.rolname = current_user"
+        )
+    ).mappings().first()
+    login = (
+        SourceLogin(
+            name=str(login_row["login"]),
+            superuser=bool(login_row["superuser"]),
+            bypass_rls=bool(login_row["bypassrls"]),
+        )
+        if login_row is not None
+        else None
+    )
+    policies: dict[str, list[RowSecurityPolicy]] = {}
+    for row in connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT schemaname AS nsp, tablename AS rel, policyname AS name, permissive, "
+            "roles, cmd, qual, with_check FROM pg_policies "
+            "WHERE schemaname = ANY(:schemas) ORDER BY schemaname, tablename, policyname"
+        ),
+        {"schemas": list(schemas)},
+    ).mappings():
+        policies.setdefault(f"{row['nsp']}.{row['rel']}", []).append(
+            RowSecurityPolicy(
+                name=str(row["name"]),
+                command=str(row["cmd"] or "ALL"),
+                permissive=str(row["permissive"] or "PERMISSIVE").upper() != "RESTRICTIVE",
+                roles=tuple(str(role) for role in (row["roles"] or ())),
+                using=str(row["qual"]) if row["qual"] is not None else None,
+                with_check=(
+                    str(row["with_check"]) if row["with_check"] is not None else None
+                ),
+            )
+        )
+    return RowSecurityFacts(
+        login=login,
+        tables=tuple(
+            RowSecurityTable(
+                table=name,
+                owner=str(row["owner"]),
+                login_owns=bool(row["owned"]),
+                forced=bool(row["forced"]),
+                policies=tuple(policies.get(name, ())),
+            )
+            for name, row in found
+        ),
+    )
+
+
+def pg_read_standalone_sequences(
+    connection: object, schemas: "list[str]"
+) -> "tuple[StandaloneSequence, ...]":
+    """Read the sequences of ``schemas`` that no column owns, with their definitions and
+    last values. Read-only (``pg_sequences``); raises on a failed read.
+
+    "No column owns it" is the ``pg_depend`` test: a ``serial`` column's sequence (and one
+    attached with ``OWNED BY``) has an ``'a'`` (auto) dependency on its column and an
+    identity column's an ``'i'`` (internal) one -- both are governed by their column's
+    conversion. Everything else is created by hand and used by the application or by a
+    column DEFAULT, and Schema Conversion creates none of it. An extension's own sequence is
+    left out like every other extension object.
+
+    ``last_value`` comes from ``pg_sequences``, which hides it (NULL) both when the sequence
+    was never used and when the user may not read it; ``readable`` tells the two apart.
+    """
+    if not schemas:
+        return ()
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(
+            "SELECT s.schemaname AS nsp, s.sequencename AS name, "
+            "s.data_type::text AS data_type, s.start_value, s.min_value, s.max_value, "
+            "s.increment_by, s.cycle, s.cache_size, s.last_value, "
+            "has_sequence_privilege(c.oid, 'SELECT,USAGE') AS readable "
+            "FROM pg_sequences s "
+            "JOIN pg_namespace n ON n.nspname = s.schemaname "
+            "JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = s.sequencename "
+            "AND c.relkind = 'S' "
+            "WHERE s.schemaname = ANY(:schemas) "
+            "AND NOT EXISTS (SELECT 1 FROM pg_depend o "
+            "WHERE o.classid = 'pg_class'::regclass AND o.objid = c.oid "
+            "AND o.refclassid = 'pg_class'::regclass AND o.deptype IN ('a', 'i')) "
+            + _not_extension_owned("pg_class", "c.oid")
+            + "ORDER BY s.schemaname, s.sequencename"
+        ),
+        {"schemas": list(schemas)},
+    ).mappings()
+    return tuple(
+        StandaloneSequence(
+            name=f"{row['nsp']}.{row['name']}",
+            data_type=str(row["data_type"]),
+            start_value=int(row["start_value"]),
+            min_value=int(row["min_value"]),
+            max_value=int(row["max_value"]),
+            increment=int(row["increment_by"]),
+            cycle=bool(row["cycle"]),
+            cache_size=int(row["cache_size"]),
+            last_value=int(row["last_value"]) if row["last_value"] is not None else None,
+            readable=bool(row["readable"]),
+        )
+        for row in rows
+    )
+
+
 class PostgresSourceDialect(SourceDialect):
     """RDS/Aurora PostgreSQL source dialect (read-only)."""
 
@@ -743,6 +903,15 @@ class PostgresSourceDialect(SourceDialect):
             # (e.g. macOS) and on Unix-domain sockets, effective on the Linux deploy target.
             connect_args["tcp_user_timeout"] = timeout * 1000
         return {"pool_pre_ping": True, "connect_args": connect_args}
+
+    @property
+    def session_setup_sql(self) -> tuple[str, ...]:
+        # Every source session, not only the Full Load export and Validation that read rows
+        # in bulk: the prerequisite size probe, the exclusion dialog's size check and the
+        # CDC monitor's MAX(pk) read rows too, and a filtered answer from any of them is
+        # wrong in the same way. A catalog-only session is unaffected (no system catalog
+        # has row-level security). See _PG_ROW_SECURITY_OFF.
+        return (_PG_ROW_SECURITY_OFF,)
 
     def enrich(
         self,
@@ -913,6 +1082,61 @@ class PostgresSourceDialect(SourceDialect):
             return [f"{row['name']} ({row['nsp']})" for row in rows]
         except Exception:  # noqa: BLE001 - best-effort; never break introspection
             return []
+
+    def _reflected_schemas(self, connection: object) -> "list[str]":
+        """The schemas introspection reflects: :meth:`list_schemas` minus the system ones
+        -- the same two definitions ``_assemble_inventory`` applies, so a catalog read
+        scoped by this covers exactly the inventory's schemas (including one that holds
+        only sequences)."""
+        return [
+            name
+            for name in (self.list_schemas(connection) or [])
+            if name not in self.system_schemas
+        ]
+
+    def read_source_catalog(self, connection: object) -> PgCatalogFacts:
+        # Row-level security and standalone sequences across the reflected schemas, each
+        # part read on its own so one failed read does not hide the other (the caller's
+        # connection is in autocommit, so a failed statement does not poison the next).
+        # Value-free failure reasons: the exception class only.
+        try:
+            schemas = self._reflected_schemas(connection)
+        except Exception as exc:  # noqa: BLE001 - reported as unread, never as clean
+            reason = type(exc).__name__
+            return PgCatalogFacts(
+                read_errors=(f"row-level security: {reason}", f"sequences: {reason}")
+            )
+        errors: list[str] = []
+        try:
+            row_security: Optional[RowSecurityFacts] = pg_read_row_security(
+                connection, schemas
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as unread
+            row_security = None
+            errors.append(f"row-level security: {type(exc).__name__}")
+        try:
+            sequences: "Optional[tuple[StandaloneSequence, ...]]" = (
+                pg_read_standalone_sequences(connection, schemas)
+            )
+        except Exception as exc:  # noqa: BLE001 - reported as unread
+            sequences = None
+            errors.append(f"sequences: {type(exc).__name__}")
+        return PgCatalogFacts(
+            row_security=row_security, sequences=sequences, read_errors=tuple(errors)
+        )
+
+    def read_row_security(self, connection: object) -> RowSecurityFacts:
+        # Raises on a failed read; the prerequisite probe turns that into "not read".
+        return pg_read_row_security(connection, self._reflected_schemas(connection))
+
+    def is_row_security_refusal(self, exc: BaseException) -> bool:
+        for candidate in _pg_error_candidates(exc):
+            if (
+                getattr(candidate, "sqlstate", None) == "42501"
+                and _PG_ROW_SECURITY_REFUSAL in str(candidate)
+            ):
+                return True
+        return False
 
     def quote_identifier(self, name: str) -> str:
         # PostgreSQL: double quotes, embedded double-quotes doubled.

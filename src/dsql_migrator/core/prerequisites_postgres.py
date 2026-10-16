@@ -20,7 +20,7 @@ import this lazily without a cycle. All strings are English, credential-free (Pr
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.models import (
     PrerequisiteCheckId,
@@ -29,6 +29,9 @@ from dsql_migrator.core.models import (
     SourceType,
     TableDef,
 )
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.catalog_postgres import RowSecurityFacts
 
 # pg_class.relreplident values that let Debezium key an UPDATE/DELETE: 'd' default
 # (uses the primary key -- which the migration already requires), 'f' full, 'i' a
@@ -947,6 +950,97 @@ def check_table_replicable(
             f"Either convert it with ALTER TABLE {_quoted(table.name)} SET LOGGED, or "
             "deselect it and migrate it with Full Load only (an UNLOGGED table can never "
             "be change-replicated)."
+        ),
+    )
+
+
+_ROW_SECURITY_TITLE = "Source user reads every row (row-level security)"
+
+
+def check_row_security(
+    table: TableDef, facts: "RowSecurityFacts"
+) -> Optional[PrerequisiteResult]:
+    """Whether the source user reads EVERY row of ``table`` despite its row-level security,
+    or ``None`` when row-level security is not enabled on it. Pure. Every mode.
+
+    The tool reads the source with ``row_security = off``, as pg_dump does, so a user the
+    policies apply to has the Full Load and Validation stop on this table with "query would
+    be affected by row-level security policy" instead of copying -- and then validating --
+    only the rows the policies show it. That is the loud failure the setting exists for;
+    this row says so before the run, as a required FAIL, rather than mid-load. A user that
+    is exempt (a superuser, BYPASSRLS, or the owner of a table that is not FORCE ROW LEVEL
+    SECURITY) PASSes; an unreadable login is a non-blocking INFO, since the setting still
+    turns a subset into a refusal. That the policies themselves do not exist on Aurora DSQL
+    is Evaluation's finding (``PG_ROW_LEVEL_SECURITY``), not a precondition of the load.
+    """
+    from dsql_migrator.core.catalog_postgres import row_security_exemption
+
+    entry = next((t for t in facts.tables if t.table == table.name), None)
+    if entry is None:
+        return None
+    exemption = row_security_exemption(entry, facts.login)
+    if exemption is None:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.ROW_SECURITY,
+            title=_ROW_SECURITY_TITLE,
+            status=PrerequisiteStatus.INFO,
+            required=False,
+            target=table.name,
+            detail=(
+                f"Row-level security is enabled on {table.name}, and whether it applies to "
+                "the source user could not be read."
+            ),
+            remediation=(
+                "If it applies to the source user, the Full Load and Validation stop on "
+                f"{table.name} with an error (the tool reads with row_security = off): run "
+                "the migration as a superuser, a role with BYPASSRLS, or the table's owner."
+            ),
+        )
+    login = facts.login.name if facts.login is not None else "the source user"
+    if exemption:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.ROW_SECURITY,
+            title=_ROW_SECURITY_TITLE,
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            target=table.name,
+            detail=(
+                f"Row-level security is enabled on {table.name}; the source user {login} "
+                f"reads every row as {exemption}."
+            ),
+        )
+    ownership = (
+        "it owns the table, but FORCE ROW LEVEL SECURITY applies it to the owner too"
+        if entry.login_owns
+        else f"it is not the table's owner, {entry.owner}"
+    )
+    # With no policy, what this user would have read is nothing at all (default deny).
+    instead = (
+        "copy and compare only the rows its policies show this user"
+        if entry.policies
+        else "copy an empty table (it has no policy, so it shows this user no rows)"
+    )
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.ROW_SECURITY,
+        title=_ROW_SECURITY_TITLE,
+        status=PrerequisiteStatus.FAIL,
+        required=True,
+        target=table.name,
+        detail=(
+            f"Row-level security is enabled on {table.name} and applies to the source user "
+            f"{login} (not a superuser, no BYPASSRLS, and {ownership}). The tool reads "
+            "with row_security = off, as pg_dump does, so the Full Load and Validation "
+            f"would stop on {table.name} rather than {instead}."
+        ),
+        remediation=(
+            f"Run the migration as a role that reads every row of {table.name}: a superuser "
+            "or a role with BYPASSRLS"
+            + (
+                " (not the owner: FORCE ROW LEVEL SECURITY subjects it to the policies)"
+                if entry.forced
+                else f", or its owner {entry.owner}"
+            )
+            + f". Or untick {table.name}."
         ),
     )
 
@@ -1904,6 +1998,7 @@ __all__ = [
     "check_replica_identity",
     "check_table_replicable",
     "check_inheritance_children",
+    "check_row_security",
     "check_columns_replicable",
     "check_publication_privilege",
     "check_cdc_replication_objects",

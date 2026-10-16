@@ -53,8 +53,8 @@ from dsql_migrator.core.assessor import (
     DSQL_DATABASE_LIMITS,
     KIND_DATABASE,
     KIND_LABELS,
-    SOURCE_VISIBILITY_RULE_ID,
     CompatibilityAssessor,
+    carry_probe_results,
     source_visibility_items,
 )
 from dsql_migrator.core.assessor import export_report as export_assessment_report
@@ -319,16 +319,12 @@ def with_refreshed_catalogs(
     assessment = CompatibilityAssessor(source_type=engine).assess(
         inventory, target_inventory=target_inventory
     )
-    # The source-privilege finding comes from the run's own probe of the source, not from
-    # the inventory, so a re-assessment keeps it (re-run Step 1 to probe again) -- unless
-    # the re-read is of another engine, which that probe never looked at.
-    kept = [
-        item
-        for item in result.assessment.items
-        if item.rule_id == SOURCE_VISIBILITY_RULE_ID and engine == result.source_type
-    ]
-    if kept:
-        assessment = AssessmentReport.from_items([*assessment.items, *kept])
+    # What the run's own probes of the source found -- the privilege gap, and for
+    # PostgreSQL row-level security and standalone sequences -- is not in the inventory, so
+    # a re-assessment carries it over (re-run Step 1 to probe again). Not across an engine
+    # switch: those findings describe the other engine's source.
+    if engine is result.source_type:
+        assessment = carry_probe_results(result.assessment, assessment)
     return replace(
         result,
         inventory=inventory,
@@ -790,7 +786,8 @@ def assessment_page(
 # migration's primary objects), then Views, Triggers, Routines; any other kind
 # follows in first-seen order.
 _KIND_DISPLAY_ORDER = (
-    "DATABASE", "TABLE", "VIEW", "TRIGGER", "PROCEDURE", "FUNCTION", "ROUTINE", "EVENT"
+    "DATABASE", "TABLE", "VIEW", "SEQUENCE", "TRIGGER", "PROCEDURE", "FUNCTION", "ROUTINE",
+    "EVENT",
 )
 
 # Friendly, pluralized section labels for the known object kinds.
@@ -997,6 +994,15 @@ def run_evaluation(
         if callable(_probe)
         else []
     )
+    # PostgreSQL catalog facts the inventory does not carry: row-level security (Aurora
+    # DSQL has none, and a migration user the policies apply to would read a subset) and
+    # sequences no column owns (Schema Conversion creates none). Same optional seam; a read
+    # that fails is reported as not checked, never as nothing found.
+    _catalog_probe = getattr(introspector, "source_catalog", None)
+    catalog_probed = (
+        inputs.source_config.source_type is SourceType.POSTGRES and callable(_catalog_probe)
+    )
+    catalog = _catalog_probe(inputs.source_config) if catalog_probed else None
 
     # The target is read BEFORE the assessment because Aurora DSQL's database-level limits
     # (tables, schemas, views per database) are about what the target will hold after the
@@ -1016,6 +1022,10 @@ def run_evaluation(
         assessment = AssessmentReport.from_items(
             [*assessment.items, *source_visibility_items(listing_gaps)]
         )
+    if catalog_probed:
+        from dsql_migrator.core.assessor_postgres import with_pg_catalog_facts
+
+        assessment = with_pg_catalog_facts(assessment, catalog)
 
     report(85, "Detecting objects that already exist on the target...")
     target_conflicts = _find_target_conflicts(inventory, target_inventory)

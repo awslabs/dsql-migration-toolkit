@@ -31,6 +31,13 @@ PostgreSQL)을 그대로 대체하는 드롭인 대체재가 **아니라** 고�
       이것이 도구가 어떤 소스에든 수행하는 유일한 쓰기입니다.
       → [§1.1](01-setup.md#11-사전-요구사항)
 
+- [ ] **PostgreSQL 행 수준 보안에는 모든 행을 읽는 마이그레이션 사용자가 필요합니다.** Aurora DSQL에는
+      행 수준 보안이 없으므로 Evaluation은 정책이 있는 테이블을 `UNSUPPORTED`로 분류합니다(규칙은
+      애플리케이션으로 옮겨야 함). 또한 도구는 `pg_dump`처럼 `row_security = off`로 소스를 읽으므로,
+      마이그레이션 사용자는 그런 테이블의 모든 행을 읽을 수 있어야 합니다 — 슈퍼유저, `BYPASSRLS` 역할,
+      또는 `FORCE ROW LEVEL SECURITY`가 아닌 테이블의 소유자. 그렇지 않으면 Full Load와 Validation이 일부
+      행만 복사하는 대신 그 테이블에서 멈춥니다. → [2장](02-evaluation-and-schema-conversion.md), [6장](06-limitations.md)
+
 - [ ] **두 가지 소스 엔진을 지원합니다.** **RDS for MySQL**과 **Aurora MySQL**(**5.7 / 8.0 / 8.4**
       버전), 그리고 **RDS for PostgreSQL**과 **Aurora PostgreSQL**(PG **13–18**; 13–16은 종단 간
       검증, 17/18은 호환성 감사로 검증 — 버전별 엣지 2가지 + CDC 커넥터 캐비엇은

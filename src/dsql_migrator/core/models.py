@@ -1126,6 +1126,13 @@ class PrerequisiteCheckId(str, Enum):
     # learned when Full Load quarantined the row. NON-blocking: an oversized value is a
     # deliberate decision (accept the quarantine, or exclude the column), not a stop.
     SOURCE_VALUE_SIZE = "SOURCE_VALUE_SIZE"
+    # PostgreSQL, per table with row-level security enabled: does the source user read
+    # EVERY row (superuser, BYPASSRLS, or the owner of a table that is not FORCE ROW LEVEL
+    # SECURITY)? The tool reads with row_security = off, so one its policies apply to has
+    # the Full Load and Validation stop on the table rather than copy a subset -- this says
+    # so before the run instead of mid-load. Prerequisite reports are not persisted, so a
+    # new member reaches no session snapshot.
+    ROW_SECURITY = "ROW_SECURITY"
     # CDC-only
     BINLOG_ROW_FORMAT = "BINLOG_ROW_FORMAT"
     BINLOG_RETENTION = "BINLOG_RETENTION"

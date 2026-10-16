@@ -99,6 +99,9 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 4. **Validation 재실행**으로 최종 go/no-go 판단을 하고, 깨끗한 MATCH일 때만 전환합니다. 최종 검증은
    CDC가 전달한 행들 이후로 **identity / `AUTO_INCREMENT` 시퀀스를 전진**시키기도 하므로(*Sync identity
    sequences* 동작), 전환 후 앱의 첫 insert가 마이그레이션된 id와 충돌(`23505`)하지 않습니다.
+   어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스는 여기에 포함되지 않습니다: Evaluation이 각각을
+   나열하므로(`PG_STANDALONE_SEQUENCE`), 애플리케이션을 전환하기 전에 직접 소스의 최종 값 다음으로
+   옮기세요(Aurora DSQL에서 `SELECT setval(...)`).
    dead-letter 처리된 CDC 변경이 있는 테이블은 자동으로 CHECKSUM으로 비교되며, Cut over는 열리기 전에
    dead-letter queue를 다시 읽습니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버) 참고). 재키잉된
    테이블이 있는 PostgreSQL 소스에서는 Cut over가 열리기 전에 그 테이블들의 REPLICA IDENTITY도 다시

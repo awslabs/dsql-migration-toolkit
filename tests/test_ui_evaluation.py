@@ -1070,8 +1070,10 @@ def test_kind_section_label_friendly_names() -> None:
     assert kind_section_label("VIEW") == "Views"
     assert kind_section_label("TRIGGER") == "Triggers"
     assert kind_section_label("ROUTINE") == "Routines"
+    # A PostgreSQL sequence no column owns is reported as an object of its own.
+    assert kind_section_label("SEQUENCE") == "Sequences"
     # Unknown kinds fall back to a title-cased label.
-    assert kind_section_label("SEQUENCE") == "Sequence"
+    assert kind_section_label("WIDGET") == "Widget"
 
 
 # ---------------------------------------------------------------------------

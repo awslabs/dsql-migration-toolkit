@@ -41,6 +41,7 @@ import inspect
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Protocol, Sequence
 
 if TYPE_CHECKING:
+    from dsql_migrator.core.catalog_postgres import RowSecurityFacts
     from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
 from dsql_migrator.core.models import (
@@ -120,6 +121,16 @@ class SourceProbe(Protocol):
         ``table_names`` with inheritance (INHERITS) child tables, or ``None`` (MySQL, or the
         read failed). Read-only. OPTIONAL, like :meth:`oversized_values`: Full load only
         lists the inheritance WARN from it (G25), and a probe without it lists none.
+        """
+
+    def row_security(
+        self, table_names: Sequence[str]
+    ) -> "Optional[RowSecurityFacts]":
+        """PostgreSQL: which of ``table_names`` have row-level security enabled, and whether
+        the source login is exempt from their policies, or ``None`` (MySQL, or the read
+        failed). Read-only. OPTIONAL, like :meth:`oversized_values`: a probe without it
+        lists no ``ROW_SECURITY`` row -- the load itself still refuses a filtered read, as
+        the source session runs with ``row_security = off``.
         """
 
 
@@ -1149,6 +1160,25 @@ class PrerequisiteChecker:
         ]
         return [row for row in rows if row is not None]
 
+    def _row_security_rows(self, tables: Sequence[TableDef]) -> list[PrerequisiteResult]:
+        """PostgreSQL, every mode: one ``ROW_SECURITY`` row per selected table with
+        row-level security enabled (``check_row_security``), over one catalog read.
+        ``row_security`` is OPTIONAL on :class:`SourceProbe`; a probe without it, or a read
+        that fails, adds no row -- the read itself still fails loudly on such a table."""
+        from dsql_migrator.core import prerequisites_postgres
+
+        probe = getattr(self._source, "row_security", None)
+        if not callable(probe) or not tables:
+            return []
+        try:
+            facts = probe([table.name for table in tables])
+        except Exception:  # noqa: BLE001 - advisory read; never break the gate
+            return []
+        if facts is None:
+            return []
+        rows = [prerequisites_postgres.check_row_security(table, facts) for table in tables]
+        return [row for row in rows if row is not None]
+
     def check(
         self,
         request: PrerequisiteCheckRequest,
@@ -1290,6 +1320,11 @@ class PrerequisiteChecker:
                             )
                         )
                     )
+
+        # A PostgreSQL table whose row-level security policies apply to the source user is
+        # refused by the load (the session runs with row_security = off): say so up front.
+        if source_ok and request.source_type is SourceType.POSTGRES:
+            results.extend(self._row_security_rows([effective[t.name] for t in tables]))
 
         # Target-side checks
         results.append(check_target_dsql_reachable(self._target.reachable()))

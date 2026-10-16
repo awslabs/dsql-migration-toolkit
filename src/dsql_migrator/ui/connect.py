@@ -35,6 +35,7 @@ from dsql_migrator.config import ConnectDefaults, SecretValue
 from dsql_migrator.core.introspector import (
     SourceIntrospector,
     install_read_only_guard,
+    install_session_setup,
 )
 from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.activity_log import (
@@ -347,6 +348,10 @@ def make_source_engine_factory(
             url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
         )
         install_read_only_guard(engine)
+        # The dialect's per-session settings, as a statement after connect (PostgreSQL:
+        # row_security = off, so a role its policies apply to fails loudly instead of
+        # reading a filtered subset). Every source engine, like the guard above.
+        install_session_setup(engine, dialect.session_setup_sql)
         return engine
 
     return factory

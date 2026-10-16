@@ -34,6 +34,14 @@ _言語: [English](../en/00-before-you-begin.md) | [한국어](../ko/00-before-y
       コミット、小さな allowlist に限定、監査記録あり）。これがツールがどのソースに対しても行う唯一の
       書き込みです。 → [§1.1](01-setup.md#11-前提条件)
 
+- [ ] **PostgreSQL の行レベルセキュリティには、すべての行を読める移行ユーザーが必要です。** Aurora DSQL
+      には行レベルセキュリティがないため、Evaluation はポリシーのあるテーブルを `UNSUPPORTED` と判定します
+      （ルールはアプリケーションに移す必要があります）。また、ツールは `pg_dump` と同様に `row_security = off`
+      でソースを読むため、移行ユーザーはそのようなテーブルのすべての行を読める必要があります —
+      スーパーユーザー、`BYPASSRLS` を持つロール、または `FORCE ROW LEVEL SECURITY` でないテーブルの所有者。
+      そうでなければ、Full Load と Validation は一部の行だけをコピーするのではなく、そのテーブルで停止します。
+      → [第 2 章](02-evaluation-and-schema-conversion.md), [第 6 章](06-limitations.md)
+
 - [ ] **2 つのソースエンジンをサポートします。** **RDS for MySQL** と **Aurora MySQL**（**5.7 / 8.0 /
       8.4** バージョン）、および **RDS for PostgreSQL** と **Aurora PostgreSQL**（PG **13–18**。
       13–16 はエンドツーエンドで検証済み、17/18 は互換性監査で検証済み — バージョン固有のエッジ 2 点

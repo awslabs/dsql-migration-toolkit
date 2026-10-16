@@ -48,10 +48,38 @@ on PostgreSQL-catalog enrichment) are still later refinements.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Sequence
 
-from dsql_migrator.core.assessor import KIND_TABLE, KIND_VIEW, Finding, ObjectKey, Rule
-from dsql_migrator.core.models import Classification, ConversionNoteKind, EffortLevel
+from dsql_migrator.core.assessor import (
+    KIND_DATABASE,
+    KIND_SEQUENCE,
+    KIND_TABLE,
+    KIND_VIEW,
+    PG_CATALOG_UNREAD_RULE_ID,
+    PG_ROW_LEVEL_SECURITY_RULE_ID,
+    PG_STANDALONE_SEQUENCE_RULE_ID,
+    Finding,
+    ObjectKey,
+    Rule,
+    _single_concern,
+    with_object_findings,
+)
+from dsql_migrator.core.catalog_postgres import (
+    PgCatalogFacts,
+    RowSecurityFacts,
+    RowSecurityPolicy,
+    RowSecurityTable,
+    SourceLogin,
+    StandaloneSequence,
+    row_security_exemption,
+)
+from dsql_migrator.core.models import (
+    AssessmentItem,
+    AssessmentReport,
+    Classification,
+    ConversionNoteKind,
+    EffortLevel,
+)
 
 if TYPE_CHECKING:
     from dsql_migrator.core.models import SourceInventory
@@ -499,12 +527,16 @@ class PgNonKeySequenceRule(Rule):
     rule_id = "NON_KEY_SEQUENCE"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        # The identity fallback is the converter's own clause, so Step 1 and Step 2 give the
+        # same (bigint-aware) instruction for the same column.
+        from dsql_migrator.core.converter_postgres import pg_identity_fallback
+
         findings: list[Finding] = []
         for table in inventory.tables:
             key_columns = set(table.primary_key or ())
             if table.auto_increment_column:
                 key_columns.add(table.auto_increment_column)
-            not_null, nullable = [], []
+            not_null, nullable, sequenced = [], [], []
             for column in table.columns:
                 if column.name in key_columns:
                     continue
@@ -516,6 +548,7 @@ class PgNonKeySequenceRule(Rule):
                 mechanism = "GENERATED AS IDENTITY" if column.identity else "serial"
                 label = f"{column.name} ({mechanism})"
                 (nullable if column.nullable else not_null).append(label)
+                sequenced.append(column)
             if not (not_null or nullable):
                 continue
             # The outcome depends on the column's NULLABILITY, and the two are not
@@ -541,7 +574,7 @@ class PgNonKeySequenceRule(Rule):
                 remedies.append(
                     "For the NOT NULL column(s) this must be handled BEFORE cut over or "
                     "writes fail outright: set the value explicitly in the application, "
-                    "or add an identity to the column on the target."
+                    "or have Aurora DSQL generate it with an identity."
                 )
             if nullable:
                 clauses.append(
@@ -549,9 +582,15 @@ class PgNonKeySequenceRule(Rule):
                     "column writes NULL instead of the next number"
                 )
                 remedies.append(
-                    "For the nullable column(s), supply the value from the application "
-                    "(or add an identity on the target) to stop NULLs accumulating."
+                    "For the nullable column(s), supply the value from the application, "
+                    "or have Aurora DSQL generate it with an identity, to stop NULLs "
+                    "accumulating."
                 )
+            # Which identity route applies depends on the column's type: Aurora DSQL allows
+            # an identity only on bigint and cannot change a column's type after apply, so
+            # the bare "add an identity on the target" could not be followed on an integer
+            # column -- which is what a plain serial is.
+            remedies.append("For an identity: " + pg_identity_fallback(sequenced) + ".")
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
@@ -559,8 +598,8 @@ class PgNonKeySequenceRule(Rule):
                     classification=Classification.MANUAL,
                     risk=(
                         f"{len(not_null) + len(nullable)} column(s) take their value from a "
-                        "sequence but are NOT the primary key. Aurora DSQL has no source "
-                        "sequence to point at, and the primary-key strategy generates "
+                        "sequence but are NOT the primary key. Their sequences are not "
+                        "created on Aurora DSQL, and the primary-key strategy generates "
                         "values only for the key column, so each lands on the target with "
                         f"neither identity nor default: {'; '.join(clauses)}."
                     ),
@@ -654,6 +693,8 @@ class PgIdentityKeyRule(Rule):
     rule_id = "AUTO_INCREMENT"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.converter import IDENTITY_FALLBACK_CAVEAT
+
         findings: list[Finding] = []
         for table in inventory.tables:
             column = table.auto_increment_column
@@ -691,7 +732,9 @@ class PgIdentityKeyRule(Rule):
                             "a DSQL identity applies to a single column, so the key is "
                             "converted as a plain integer: the application must supply the "
                             "value on every insert, or add an identity to the column on the "
-                            "target after apply."
+                            "target after apply, "
+                            + IDENTITY_FALLBACK_CAVEAT
+                            + "."
                         )
                         + " Optional, for throughput only: a UUID/random key spreads the "
                         "writes further."
@@ -747,6 +790,323 @@ class PgUnconstrainedNumericRule(Rule):
                 )
             )
         return findings
+
+
+# ---------------------------------------------------------------------------
+# Source catalog facts the inventory does not carry (core.catalog_postgres): row-level
+# security and standalone sequences. Read by the Evaluation probe beside the inventory,
+# graded here, and carried over a re-assessment by ``assessor.carry_probe_results``.
+# ---------------------------------------------------------------------------
+
+# A policy's expressions are unbounded, and the finding lands in a UI card, the text report
+# and the HTML report: show enough to act on, then say where the rest is.
+_MAX_POLICIES_SHOWN = 6
+_MAX_POLICY_EXPRESSION_CHARS = 300
+
+# Commands whose policies also decide which rows may be WRITTEN (WITH CHECK, or USING where
+# the policy has no WITH CHECK).
+_WRITE_COMMANDS = frozenset({"ALL", "INSERT", "UPDATE"})
+
+
+def _policy_expression(text: str) -> str:
+    """One line, bounded, saying where the full expression is when it was cut."""
+    line = _one_line(text)
+    if len(line) <= _MAX_POLICY_EXPRESSION_CHARS:
+        return line
+    return (
+        line[:_MAX_POLICY_EXPRESSION_CHARS].rstrip()
+        + " ... [truncated; the full expression is in pg_policies on the source]"
+    )
+
+
+def _render_policy(policy: RowSecurityPolicy) -> str:
+    """``name (FOR cmd TO roles) USING (...) WITH CHECK (...)``, the way CREATE POLICY reads."""
+    roles = ", ".join(policy.roles) if policy.roles else "public"
+    restrictive = "" if policy.permissive else "AS RESTRICTIVE, "
+    parts = [f"{policy.name} ({restrictive}FOR {policy.command} TO {roles})"]
+    if policy.using:
+        parts.append(f"USING ({_policy_expression(policy.using)})")
+    if policy.with_check:
+        parts.append(f"WITH CHECK ({_policy_expression(policy.with_check)})")
+    return " ".join(parts)
+
+
+def _row_security_finding(
+    table: RowSecurityTable, login: "Optional[SourceLogin]"
+) -> Finding:
+    """The UNSUPPORTED finding for one table with row-level security enabled.
+
+    UNSUPPORTED because Aurora DSQL has no row-level security at all (its ALTER TABLE has no
+    ENABLE ROW LEVEL SECURITY, and pg_policy / pg_policies are not part of it), so the
+    access rule has no target and has to be redesigned in the application -- the same
+    grade a trigger gets, and for the same reason. The table's DATA still migrates, which is
+    why the finding sits on the table's own item rather than replacing it.
+    """
+    enabled = "Row-level security is enabled on this table" + (
+        " and FORCED (it applies to the table's owner too)" if table.forced else ""
+    )
+    if table.policies:
+        count = len(table.policies)
+        shown = "; ".join(
+            _render_policy(p) for p in table.policies[:_MAX_POLICIES_SHOWN]
+        )
+        rest = count - _MAX_POLICIES_SHOWN
+        more = (
+            f"; and {rest} more {'policy' if rest == 1 else 'policies'} (pg_policies on "
+            "the source)"
+            if rest > 0
+            else ""
+        )
+        what = (
+            f"{enabled}, with {count} {'policy' if count == 1 else 'policies'}: "
+            f"{shown}{more}."
+        )
+    else:
+        what = (
+            f"{enabled}, with no policy: on the source, every role it applies to reads "
+            "and writes no rows at all (default deny)."
+        )
+    risk = what + (
+        " Aurora DSQL has no row-level security, so none of this exists on the target: "
+        "after cut over, every role that can read or write the table reaches every row."
+    )
+    exemption = row_security_exemption(table, login)
+    if exemption is None:
+        risk += (
+            " Whether row-level security applies to the source user could not be read. The "
+            "tool reads with row_security = off, as pg_dump does, so if it does, the Full "
+            "Load and Validation stop on this table with an error rather than copy and "
+            "compare only the rows it shows that user."
+        )
+    elif exemption:
+        risk += (
+            f" The source user {login.name} reads every row as {exemption}, so the Full "  # type: ignore[union-attr]
+            "Load and Validation still copy and compare the whole table."
+        )
+    else:
+        ownership = (
+            "it owns the table, but FORCE ROW LEVEL SECURITY applies it to the owner too"
+            if table.login_owns
+            else f"it is not the table's owner, {table.owner}"
+        )
+        # With no policy, what the user would have read is nothing at all (default deny).
+        instead = (
+            "copy and compare only the rows the policies show it"
+            if table.policies
+            else "copy an empty table"
+        )
+        risk += (
+            f" Row-level security applies to the source user {login.name} (not a "  # type: ignore[union-attr]
+            f"superuser, no BYPASSRLS, and {ownership}), so the Full Load and Validation "
+            f"stop on this table with an error rather than {instead}: the tool reads with "
+            "row_security = off, as pg_dump does."
+        )
+    if table.policies:
+        recommendation = (
+            "Before cut over, enforce this in the application: every query on the table "
+            "has to carry the policies' conditions itself (for example a tenant predicate "
+            "bound from the application's own session), because Aurora DSQL will not add "
+            "them."
+        )
+        if any(p.command.upper() in _WRITE_COMMANDS for p in table.policies):
+            recommendation += (
+                " The write side -- which rows a role may insert or update (WITH CHECK, or "
+                "USING where a policy has none) -- has to be checked by the application too."
+            )
+    else:
+        recommendation = (
+            "Before cut over, decide who may read this table on Aurora DSQL: on the source "
+            "only roles exempt from row-level security can read it, while on the target "
+            "every role granted SELECT reads every row -- restrict the grants, or filter in "
+            "the application."
+        )
+    if exemption == "":
+        recommendation += (
+            " To migrate its rows, run the migration as a role that reads every row: a "
+            "superuser or a role with BYPASSRLS"
+            + (
+                " -- not its owner, whom FORCE ROW LEVEL SECURITY subjects to the "
+                "policies."
+                if table.forced
+                else f", or the table's owner ({table.owner})."
+            )
+        )
+    if not exemption:  # unknown, or the policies apply to the source user
+        recommendation += (
+            " The Data Migration prerequisite checks re-check this before the load."
+        )
+    return Finding(
+        object=ObjectKey(KIND_TABLE, table.table),
+        rule_id=PG_ROW_LEVEL_SECURITY_RULE_ID,
+        classification=Classification.UNSUPPORTED,
+        risk=risk,
+        recommendation=recommendation,
+        effort=EffortLevel.MEDIUM,
+        note_kind=ConversionNoteKind.LOSS,
+    )
+
+
+def row_security_findings(facts: RowSecurityFacts) -> "list[Finding]":
+    """One UNSUPPORTED finding per table with row-level security enabled. Pure."""
+    return [_row_security_finding(table, facts.login) for table in facts.tables]
+
+
+def _sql_literal(text: str) -> str:
+    """``text`` as a SQL string literal (single quotes doubled)."""
+    return "'" + text.replace("'", "''") + "'"
+
+
+def standalone_sequence_items(
+    sequences: "Sequence[StandaloneSequence]",
+) -> "list[AssessmentItem]":
+    """One MANUAL item per sequence no column owns, carrying the Aurora DSQL statement that
+    re-creates it after its source value. Pure.
+
+    Schema Conversion creates no such sequence (only a column's own serial/identity is
+    converted, by its column), so the application's -- or a column DEFAULT's -- nextval()
+    on it fails after cut over until it exists on the target. Creating it, and moving it
+    past the source's final value at cut over, is left to the operator: this tool neither
+    emits nor syncs it.
+    """
+    from dsql_migrator.core.converter_postgres import (
+        dsql_create_sequence_sql,
+        pg_sequence_next_value,
+    )
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    pg = dialect_for(SourceType.POSTGRES)
+    items: list[AssessmentItem] = []
+    for sequence in sequences:
+        quoted = pg.quote_table(sequence.name)
+        statement = dsql_create_sequence_sql(sequence)
+        following = pg_sequence_next_value(sequence)
+        if not sequence.readable:
+            state = (
+                "Its current value could not be read (the source user has neither SELECT "
+                "nor USAGE on it), so the statement below has a placeholder for where it "
+                "starts."
+            )
+        elif sequence.last_value is None:
+            state = f"It has not been used yet, so it starts at {sequence.start_value}."
+        elif following is None:
+            bound = "MAXVALUE" if sequence.increment > 0 else "MINVALUE"
+            state = (
+                f"It is exhausted: its last value {sequence.last_value} is at its {bound} "
+                "and it does not CYCLE, so nextval() already fails on the source -- choose "
+                "a new range before creating it."
+            )
+        else:
+            state = (
+                f"Its last value on the source is {sequence.last_value}, read now: it keeps "
+                "advancing while the source is in use."
+            )
+        if sequence.data_type.lower() not in ("bigint", "int8"):
+            state += (
+                f" Aurora DSQL sequences are always bigint; the statement keeps the source's "
+                f"{sequence.data_type} range as MINVALUE/MAXVALUE."
+            )
+        if sequence.cache_size <= 1:
+            cache_note = (
+                "CACHE 1 keeps the source's one-value-at-a-time allocation; Aurora DSQL also "
+                "accepts CACHE 65536 or more, which serves concurrent sessions faster but "
+                "leaves gaps and out-of-order values."
+            )
+        else:
+            cache_note = (
+                f"The source caches {sequence.cache_size} values per session, so the "
+                "application already tolerates gaps; Aurora DSQL accepts only CACHE 1 or at "
+                "least 65536, so the statement uses 65536."
+            )
+        item = AssessmentItem(
+            object_name=sequence.name,
+            rule_id=PG_STANDALONE_SEQUENCE_RULE_ID,
+            classification=Classification.MANUAL,
+            risk=(
+                "A standalone sequence: no column owns it, so Schema Conversion does not "
+                "create it and it does not exist on Aurora DSQL -- an application (or a "
+                "column DEFAULT) that calls nextval() on it fails after cut over. "
+                + state
+            ),
+            recommendation=(
+                f"Create it on Aurora DSQL before cut over: {statement} Once source writes "
+                f"stop, read its final value (SELECT last_value FROM {quoted}) and move the "
+                f"target past it with SELECT setval({_sql_literal(quoted)}, <that value>) -- "
+                "this tool neither creates nor syncs it. " + cache_note
+            ),
+            effort=EffortLevel.SIMPLE,
+            kind=KIND_SEQUENCE.upper(),
+        )
+        items.append(item.model_copy(update={"concerns": _single_concern(item)}))
+    return items
+
+
+def catalog_unread_items(facts: "Optional[PgCatalogFacts]") -> "list[AssessmentItem]":
+    """The database-level item for a probe part that could not be read (``facts`` ``None``:
+    none could). Without it a failed read would look exactly like a source with no
+    row-level security and no standalone sequence -- a "Ready" over what was never checked.
+    """
+    if facts is None:
+        unread = ["row-level security", "sequences"]
+        reason = "the catalog read failed"
+    else:
+        unread = [
+            part
+            for part, value in (
+                ("row-level security", facts.row_security),
+                ("sequences", facts.sequences),
+            )
+            if value is None
+        ]
+        reason = "; ".join(facts.read_errors) or "the read failed"
+    if not unread:
+        return []
+    unknowns = {
+        "row-level security": (
+            "whether a table has row-level security policies (which Aurora DSQL does not "
+            "keep)"
+        ),
+        "sequences": (
+            "whether the application uses a standalone sequence (which Schema Conversion "
+            "does not create)"
+        ),
+    }
+    item = AssessmentItem(
+        object_name="source catalog",
+        rule_id=PG_CATALOG_UNREAD_RULE_ID,
+        classification=Classification.MANUAL,
+        risk=(
+            f"The source's {' and '.join(unread)} could not be read ({reason}), so this "
+            "report cannot say "
+            + " or ".join(unknowns[part] for part in unread)
+            + "."
+        ),
+        recommendation=(
+            "Re-run Step 1 (Evaluation). If the read keeps failing, list them on the "
+            "source as a user who can: SELECT relname FROM pg_class WHERE relrowsecurity; "
+            "and SELECT * FROM pg_sequences;"
+        ),
+        effort=EffortLevel.SIMPLE,
+        kind=KIND_DATABASE.upper(),
+    )
+    return [item.model_copy(update={"concerns": _single_concern(item)})]
+
+
+def with_pg_catalog_facts(
+    report: AssessmentReport, facts: "Optional[PgCatalogFacts]"
+) -> AssessmentReport:
+    """``report`` with the PostgreSQL catalog probe's findings: row-level security graded on
+    each table's own item, an item per standalone sequence, and an item for any part that
+    could not be read (``facts`` ``None``: the probe could not read the source). Pure."""
+    if facts is not None and facts.row_security is not None:
+        report = with_object_findings(report, row_security_findings(facts.row_security))
+    extra = [
+        *standalone_sequence_items((facts.sequences if facts is not None else None) or ()),
+        *catalog_unread_items(facts),
+    ]
+    if extra:
+        report = AssessmentReport.from_items([*report.items, *extra])
+    return report
 
 
 def default_rules() -> "list[Rule]":

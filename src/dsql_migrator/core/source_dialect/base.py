@@ -18,6 +18,7 @@ from dsql_migrator.core.models import SourceType
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from dsql_migrator.core.catalog_postgres import PgCatalogFacts, RowSecurityFacts
     from dsql_migrator.core.cdc_postgres import SlotHealth
     from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
@@ -391,6 +392,38 @@ class SourceDialect(ABC):
         """What the source user's privileges keep out of the inventory, one line per object
         kind (``[]`` when nothing is or when it cannot be told). Read only; best effort."""
         return []
+
+    @property
+    def session_setup_sql(self) -> "tuple[str, ...]":
+        """Statements every new source connection runs (committed) before it is used.
+
+        Sent as statements after connect, never as startup parameters, so a proxy that
+        rejects those (RDS Proxy refuses the libpq ``options`` parameter) still connects.
+        Installed on every source engine by
+        :func:`~dsql_migrator.core.introspector.install_session_setup`. Default: none
+        (MySQL pins its session time zone through the driver's ``init_command``).
+        """
+        return ()
+
+    def read_source_catalog(self, connection: object) -> "Optional[PgCatalogFacts]":
+        """Source catalog facts the inventory does not carry, for Evaluation to grade.
+
+        PostgreSQL returns its row-level security and standalone sequences
+        (:class:`~dsql_migrator.core.catalog_postgres.PgCatalogFacts`); an engine with
+        neither returns ``None`` (the default -- MySQL). Read only.
+        """
+        return None
+
+    def read_row_security(self, connection: object) -> "Optional[RowSecurityFacts]":
+        """The tables with row-level security enabled and whether the login is exempt from
+        their policies, or ``None`` for an engine without row-level security (MySQL).
+        Read only; a failed read raises."""
+        return None
+
+    def is_row_security_refusal(self, exc: BaseException) -> bool:
+        """True when ``exc`` is the source refusing a read that a row-level security policy
+        would have filtered (PostgreSQL with ``row_security = off``). False by default."""
+        return False
 
     @abstractmethod
     def probe_grants(self, connection: object) -> list[str]:

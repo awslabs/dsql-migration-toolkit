@@ -38,6 +38,15 @@ plus a pointer to the chapter that covers it in depth.
       are the only writes the tool ever makes to any source.
       → [§1.1](01-setup.md#11-prerequisites)
 
+- [ ] **PostgreSQL row-level security needs a migration user that reads every row.**
+      Aurora DSQL has no row-level security, so Evaluation grades a table with policies
+      `UNSUPPORTED` (the rule moves into the application). And because the tool reads the
+      source with `row_security = off`, as `pg_dump` does, the migration user must read
+      every row of such a table — a superuser, a role with `BYPASSRLS`, or the table's
+      owner when it is not `FORCE ROW LEVEL SECURITY` — or the Full Load and Validation
+      stop on it instead of copying a subset. → [Chapter 2](02-evaluation-and-schema-conversion.md),
+      [Chapter 6](06-limitations.md)
+
 - [ ] **Two source engines are supported.** **RDS for MySQL** and **Aurora
       MySQL** (versions **5.7 / 8.0 / 8.4**), and **RDS for PostgreSQL** and
       **Aurora PostgreSQL** (PG **13–18**; 13–16 tested end to end, 17/18 verified

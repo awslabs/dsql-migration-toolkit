@@ -34,7 +34,7 @@ import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, ClassVar, Optional
+from typing import Callable, ClassVar, Optional, Sequence
 
 from dsql_migrator.core.models import (
     AiAssessmentReport,
@@ -75,6 +75,9 @@ KIND_ROUTINE = "routine"
 KIND_PROCEDURE = "procedure"
 KIND_FUNCTION = "function"
 KIND_EVENT = "event"
+# A PostgreSQL sequence no column owns. Not an inventory object: it is read by the
+# Evaluation probe (see core.catalog_postgres) and reported on its own.
+KIND_SEQUENCE = "sequence"
 
 # User-facing label per object kind. Lives here, beside the KIND_* constants, because all
 # three surfaces need it: the Evaluation list headings, the UI chart axis and the HTML
@@ -89,6 +92,7 @@ KIND_LABELS: dict[str, str] = {
     "PROCEDURE": "Stored procedures",
     "FUNCTION": "Functions",
     "EVENT": "Events",
+    "SEQUENCE": "Sequences",
     "DATABASE": "Database / cluster-level",
 }
 
@@ -778,6 +782,9 @@ class AutoIncrementRule(Rule):
     rule_id = "AUTO_INCREMENT"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        # Lazy: converter imports this module at load time.
+        from dsql_migrator.core.converter import IDENTITY_FALLBACK_CAVEAT
+
         findings: list[Finding] = []
         for table in inventory.tables:
             column = table.auto_increment_column
@@ -817,7 +824,9 @@ class AutoIncrementRule(Rule):
                                 f"primary key is composite ({', '.join(table.primary_key)}) "
                                 "and a DSQL identity applies to a single column, so the "
                                 "value must come from the application — or add an identity "
-                                "to the column on the target after apply."
+                                "to the column on the target after apply, "
+                                + IDENTITY_FALLBACK_CAVEAT
+                                + "."
                             )
                             + " Optional, for throughput only: a UUID/random key or a "
                             "cached identity spreads the writes."
@@ -2030,6 +2039,105 @@ def source_visibility_items(gaps: "Sequence[str]") -> list[AssessmentItem]:
         kind=KIND_DATABASE.upper(),
     )
     return [item.model_copy(update={"concerns": _single_concern(item, ConversionNoteKind.LOSS)})]
+
+
+# Findings from the PostgreSQL catalog probe (core.catalog_postgres; graded in
+# core.assessor_postgres): row-level security on a table, a sequence no column owns, and the
+# probe itself failing.
+PG_ROW_LEVEL_SECURITY_RULE_ID = "PG_ROW_LEVEL_SECURITY"
+PG_STANDALONE_SEQUENCE_RULE_ID = "PG_STANDALONE_SEQUENCE"
+PG_CATALOG_UNREAD_RULE_ID = "PG_CATALOG_UNREAD"
+
+# Findings that come from probing the SOURCE at Evaluation time rather than from the
+# inventory, so a re-assessment from the inventory alone (a catalog refresh, a restored
+# session) cannot recompute them and has to carry them over (:func:`carry_probe_results`).
+# Two shapes: an item of its own (the privilege gap, a sequence, an unread probe), and a
+# concern on an inventory object's item (row-level security on a table).
+_PROBE_ITEM_RULE_IDS = frozenset(
+    {SOURCE_VISIBILITY_RULE_ID, PG_STANDALONE_SEQUENCE_RULE_ID, PG_CATALOG_UNREAD_RULE_ID}
+)
+_PROBE_CONCERN_RULE_IDS = frozenset({PG_ROW_LEVEL_SECURITY_RULE_ID})
+
+
+def _findings_of(item: AssessmentItem) -> list[Finding]:
+    """The findings ``item`` was aggregated from, so it can be graded again with more. An
+    item built without concerns (a caller-supplied assessor) keeps its own headline."""
+    key = ObjectKey(item.kind.lower(), item.object_name)
+    if item.concerns:
+        return [
+            Finding(
+                object=key,
+                rule_id=concern.rule_id,
+                classification=concern.classification,
+                risk=concern.risk,
+                recommendation=concern.recommendation,
+                effort=concern.effort,
+                note_kind=concern.note_kind,
+            )
+            for concern in item.concerns
+        ]
+    if item.rule_id == "COMPATIBLE":
+        return []
+    return [
+        Finding(
+            object=key,
+            rule_id=item.rule_id,
+            classification=item.classification,
+            risk=item.risk,
+            recommendation=item.recommendation,
+            effort=item.effort,
+        )
+    ]
+
+
+def with_object_findings(
+    report: AssessmentReport, findings: "Sequence[Finding]"
+) -> AssessmentReport:
+    """``report`` with ``findings`` added to the items of the objects they are about.
+
+    Each affected item is re-aggregated exactly as :class:`CompatibilityAssessor` grades an
+    object -- its own findings plus the new ones, the most severe gap governing -- so a
+    finding read outside the inventory (row-level security on a table) grades the TABLE,
+    instead of becoming a second, unrelated row for it. A finding replaces an existing
+    concern of the same rule (re-applying is idempotent); one about an object the report
+    does not hold is dropped, since there is no object to grade. Pure.
+    """
+    added: dict[tuple[str, str], list[Finding]] = defaultdict(list)
+    for finding in findings:
+        added[(finding.object.kind.upper(), finding.object.name)].append(finding)
+    if not added:
+        return report
+    items: list[AssessmentItem] = []
+    for item in report.items:
+        extra = added.get((item.kind, item.object_name))
+        if not extra:
+            items.append(item)
+            continue
+        replaced = {finding.rule_id for finding in extra}
+        own = [f for f in _findings_of(item) if f.rule_id not in replaced]
+        items.append(_aggregate(ObjectKey(item.kind.lower(), item.object_name), own + extra))
+    return AssessmentReport.from_items(items)
+
+
+def carry_probe_results(
+    previous: AssessmentReport, recomputed: AssessmentReport
+) -> AssessmentReport:
+    """``recomputed`` (assessed from the inventory alone) plus what ``previous`` held from
+    probing the source: the probe's own items, and its concerns re-attached to the objects
+    ``recomputed`` still holds (a table no longer in the inventory loses its concern with
+    it). Re-run Step 1 to probe again. Pure."""
+    whole = [item for item in previous.items if item.rule_id in _PROBE_ITEM_RULE_IDS]
+    attached = [
+        finding
+        for item in previous.items
+        if item.rule_id not in _PROBE_ITEM_RULE_IDS
+        for finding in _findings_of(item)
+        if finding.rule_id in _PROBE_CONCERN_RULE_IDS
+    ]
+    report = with_object_findings(recomputed, attached)
+    if whole:
+        report = AssessmentReport.from_items([*report.items, *whole])
+    return report
 
 
 def check_multiple_source_databases(
@@ -3258,4 +3366,10 @@ __all__ = [
     "KIND_FUNCTION",
     "KIND_DATABASE",
     "KIND_EVENT",
+    "KIND_SEQUENCE",
+    "PG_CATALOG_UNREAD_RULE_ID",
+    "PG_ROW_LEVEL_SECURITY_RULE_ID",
+    "PG_STANDALONE_SEQUENCE_RULE_ID",
+    "carry_probe_results",
+    "with_object_findings",
 ]

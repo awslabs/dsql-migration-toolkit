@@ -88,7 +88,10 @@ from psycopg import sql
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from dsql_migrator.core.introspector import _default_engine_factory
+from dsql_migrator.core.introspector import (
+    SOURCE_ROW_SECURITY_HINT,
+    _default_engine_factory,
+)
 from dsql_migrator.core.occ import is_occ_conflict
 from dsql_migrator.core.models import (
     ColumnDef,
@@ -1869,13 +1872,20 @@ class Validator:
         except ValidationCancelled:
             raise  # cooperative stop: abort the run, not a per-table error
         except Exception as exc:  # noqa: BLE001 - isolate per-table failure
+            error = _safe_error_message(exc)
+            # The source refused a read its row-level security would have filtered (the
+            # session runs with row_security = off): the driver text does not say what to do.
+            # Looked up defensively -- this handler isolates one table, so it must not raise.
+            refusal = getattr(source_dialect, "is_row_security_refusal", None)
+            if callable(refusal) and refusal(exc):
+                error = f"{error} — {SOURCE_ROW_SECURITY_HINT}"
             return TableValidationResult(
                 table=table.name,
                 source_row_count=0,
                 target_row_count=0,
                 row_count_match=False,
                 matched=False,
-                error=_safe_error_message(exc),
+                error=error,
                 **self._proof_not_determined(table, "table_error"),
             )
 

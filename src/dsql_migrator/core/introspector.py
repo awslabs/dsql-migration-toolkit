@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Callable, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, Sequence
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.exc import NoSuchTableError
@@ -49,6 +49,7 @@ from dsql_migrator.core.models import (
 )
 
 if TYPE_CHECKING:
+    from dsql_migrator.core.catalog_postgres import PgCatalogFacts
     from dsql_migrator.core.source_dialect import SourceDialect
 
 MYSQL_DRIVER = "mysql+pymysql"
@@ -182,6 +183,30 @@ SOURCE_CONNECTION_LOST_HINT_TEMPLATE = (
 # MySQL-rendered constant kept for backward compatibility (and existing callers/tests).
 SOURCE_CONNECTION_LOST_HINT = SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine="MySQL")
 
+# Operator-facing explanation for a PostgreSQL read refused under ``row_security = off``
+# (see ``source_dialect.postgres._PG_ROW_SECURITY_OFF``). The driver text names the table
+# and the policy mechanism but not what to do, and the refusal is deliberate: without it
+# the same read would have returned only the rows the policies show this user.
+SOURCE_ROW_SECURITY_HINT = (
+    "Row-level security is enabled on this source table and the source user is subject to "
+    "its policies, so the read was refused rather than copying or comparing only the rows "
+    "they show this user (the tool reads with row_security = off, as pg_dump does). Run "
+    "the migration as a role that reads every row -- a superuser, a role with BYPASSRLS, "
+    "or the table's owner when the table is not FORCE ROW LEVEL SECURITY -- or untick the "
+    "table. Nothing on the source was changed."
+)
+
+
+def row_security_hint(
+    exc: BaseException, source_type: SourceType = SourceType.MYSQL
+) -> Optional[str]:
+    """:data:`SOURCE_ROW_SECURITY_HINT` when ``exc`` is that refusal, else ``None``."""
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    if dialect_for(source_type).is_row_security_refusal(exc):
+        return SOURCE_ROW_SECURITY_HINT
+    return None
+
 
 # Codes that specifically mean the SOURCE ran out of connection slots, which needs
 # different advice from a failover: fewer concurrent readers, not "wait and re-run".
@@ -257,6 +282,8 @@ def source_error_hint(
 
     dialect = dialect_for(source_type)
     engine = dialect.engine_display_name
+    if dialect.is_row_security_refusal(exc):
+        return SOURCE_ROW_SECURITY_HINT
     if dialect.is_too_many_connections(exc):
         return SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE.format(engine=engine)
     if dialect.is_transient_error(exc):
@@ -402,6 +429,38 @@ def install_read_only_guard(engine: Engine) -> None:
             )
 
 
+def install_session_setup(engine: Engine, statements: "Sequence[str]") -> None:
+    """Run ``statements`` on every new DBAPI connection of ``engine``, before it is used.
+
+    The source dialect's :attr:`~dsql_migrator.core.source_dialect.base.SourceDialect.
+    session_setup_sql` (PostgreSQL: ``SET row_security = off``). A ``connect`` listener, so
+    it covers every connection the pool ever opens -- each shard reader, and the fresh one
+    ``pool_pre_ping`` makes after a dropped connection -- not just the first. The
+    statements are COMMITTED: the driver opens a transaction around them, and a SET made
+    inside a transaction that is later rolled back (the pool rolls back every connection it
+    takes back) is undone with it. A failure propagates: a session that could not be set
+    up must not be used as if it had been. No-op for an empty list.
+    """
+    pending = tuple(statements)
+    if not pending:
+        return
+
+    def _set_up(dbapi_connection, _connection_record) -> None:  # noqa: ANN001 - SQLAlchemy
+        cursor = dbapi_connection.cursor()
+        try:
+            for statement in pending:
+                cursor.execute(statement)
+        finally:
+            cursor.close()
+        dbapi_connection.commit()
+
+    # Recorded on the listener so a test can see what a built engine will send.
+    _set_up.session_setup_sql = pending  # type: ignore[attr-defined]
+    # insert=True: before SQLAlchemy's own first-connect initialisation, as the SQLAlchemy
+    # recipe for per-connection session settings does.
+    event.listen(engine, "connect", _set_up, insert=True)
+
+
 def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
     """Build a read-only-guarded source engine from a connection config.
 
@@ -425,6 +484,7 @@ def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
     )
     engine = create_engine(url, **dialect.engine_kwargs())
     install_read_only_guard(engine)
+    install_session_setup(engine, dialect.session_setup_sql)
     return engine
 
 
@@ -1254,6 +1314,34 @@ class SourceIntrospector:
                 return list(dialect.listing_gaps(connection, wanted))
         except Exception:  # noqa: BLE001 - best effort
             return []
+        finally:
+            engine.dispose()
+
+    def source_catalog(self, conn: SourceConnectionConfig) -> "Optional[PgCatalogFacts]":
+        """Catalog facts the inventory does not carry, from the source dialect: for
+        PostgreSQL, row-level security and standalone sequences
+        (:class:`~dsql_migrator.core.catalog_postgres.PgCatalogFacts`).
+
+        Read only, in autocommit, waiting at most
+        :data:`INTROSPECTION_LOCK_TIMEOUT_SECONDS` for a lock (reading a sequence's value
+        locks the sequence briefly). ``None`` when the engine has no such facts -- or when
+        the source could not be read at all, which a PostgreSQL caller must report as
+        "not checked", never as "nothing found".
+        """
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        dialect = dialect_for(conn.source_type)
+        try:
+            engine = self._engine_factory(conn)
+        except Exception:  # noqa: BLE001 - unread; the caller says so
+            return None
+        try:
+            with engine.connect() as connection:
+                connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+                _limit_lock_waits(connection)
+                return dialect.read_source_catalog(connection)
+        except Exception:  # noqa: BLE001 - unread; the caller says so
+            return None
         finally:
             engine.dispose()
 
