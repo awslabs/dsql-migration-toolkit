@@ -31,12 +31,19 @@ sequences, `REPLICA IDENTITY`, etc., with the system schemas
 `pg_catalog`/`information_schema`/`pg_toast` excluded) **and** the **target**, then produces
 a **compatibility assessment report**.
 
+The read is read-only and in autocommit, waits at most 5 seconds for a lock another session
+holds (a running `ALTER TABLE`), reports progress per table, and can be cancelled
+(**Cancel evaluation**). A re-run keeps the previous report until it succeeds. A MySQL
+migration user needs `SHOW VIEW` to read view definitions, and `TRIGGER`, `EVENT` and
+`SHOW_ROUTINE` (or `SELECT` on `*.*`) to list triggers, events and routines; without them
+the report says what it could not list (`SOURCE_VISIBILITY`) instead of omitting it.
+
 ### Every object gets one classification
 
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below); a multi-database MySQL source (each database becomes its own schema, flagged `RECOMMENDED`); an index name another table, view or index of the schema also uses (the index is renamed automatically, flagged `RECOMMENDED`). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns (a UNIQUE one stops enforcing uniqueness), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns (a UNIQUE one stops enforcing uniqueness), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`). |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`), names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), FULLTEXT/SPATIAL indexes. |
 
 The examples above are mostly drawn from a MySQL source. For a **PostgreSQL source** the same
@@ -473,6 +480,12 @@ shared "write contract" keeps them identical).
 > governs identity). A `STORED` generated column's expression **is** re-emitted
 > (`GENERATED ALWAYS AS (expr) STORED`), because Aurora DSQL supports and maintains those;
 > a `VIRTUAL` one becomes an ordinary column.
+>
+> A **MySQL** generated column is created as an ordinary column (the tool does not read its
+> expression): Full Load copies the computed value, and CDC carries a `STORED` one's value. You
+> can re-add the expression (`GENERATED ALWAYS AS (...) STORED`) in Schema Conversion for a
+> **Full load only** migration — never with CDC, which sends every column's value and so would
+> have every insert and update rejected (SQLSTATE `428C9`).
 
 ### Type mapping (complete reference)
 

@@ -3158,6 +3158,59 @@ from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate liter
 )
 
 
+def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
+    """What becomes of a MySQL table's generated columns, by kind (``None``: it has none).
+
+    Shared by Evaluation's ``GENERATED_COLUMN`` and the conversion note, so both steps say
+    the same thing. The expression is not in the inventory (only the kind), so the column is
+    created ORDINARY even though Aurora DSQL supports STORED generated columns."""
+    columns = [column for column in table.columns if column.generated]
+    if not columns:
+        return None
+    stored = [c.name for c in columns if c.generated_kind == "STORED"]
+    virtual = [c.name for c in columns if c.generated_kind == "VIRTUAL"]
+    unknown = [c.name for c in columns if c.generated_kind not in ("STORED", "VIRTUAL")]
+    parts = [
+        f"Columns ({', '.join(c.name for c in columns)}) are MySQL generated columns. The "
+        "tool does not read MySQL's generating expression, so they are created as ORDINARY "
+        "columns (Aurora DSQL itself supports STORED generated columns)."
+    ]
+    if stored:
+        parts.append(
+            f"STORED ({', '.join(stored)}): MySQL stores the value, so Full Load copies it "
+            "and CDC carries each change's value."
+        )
+    if virtual:
+        parts.append(
+            f"VIRTUAL ({', '.join(virtual)}): MySQL computes the value when the row is read "
+            "and does not store it. Full Load copies the computed value, but a change event "
+            "may not carry it, so a row CDC writes can be left without it (NULL)."
+        )
+    if unknown:
+        parts.append(
+            f"({', '.join(unknown)}): Full Load copies the value MySQL computed."
+        )
+    parts.append(
+        "After cut over nothing computes them, so a value drifts with the first insert or "
+        "update that does not supply it."
+    )
+    return " ".join(parts)
+
+
+# What to do about a MySQL generated column (Evaluation's recommendation; the conversion
+# note carries it too).
+MYSQL_GENERATED_COLUMN_ADVICE = (
+    "Compute the value in the application after cut over. For a Full load only migration "
+    "you can instead re-add the expression before applying: read it with SHOW CREATE TABLE, "
+    "translate it to PostgreSQL and edit the target DDL in Schema Conversion to GENERATED "
+    "ALWAYS AS (<expression>) STORED; Full Load then lets Aurora DSQL compute it. Not with "
+    "CDC: a GENERATED column rejects the value every CDC insert and update carries, so each "
+    "of them would be set aside (SQLSTATE 428C9). Decide before applying: Aurora DSQL can "
+    "turn a generated column into an ordinary one (ALTER COLUMN ... DROP EXPRESSION) but "
+    "cannot add an expression to an existing column."
+)
+
+
 def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Warn that a MySQL generated column becomes an ordinary column on the target.
 
@@ -3171,23 +3224,14 @@ def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
     The expression itself is not in the inventory (only the boolean), which is why this
     names the columns and points at the source rather than quoting the formula.
     """
-    columns = [column.name for column in table.columns if column.generated]
-    if not columns:
+    detail = mysql_generated_column_detail(table)
+    if detail is None:
         return None
-    names = ", ".join(columns)
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
-        message=(
-            f"Columns ({names}) are MySQL GENERATED (computed) columns; Aurora DSQL has "
-            "no equivalent, so they are created as ORDINARY columns. Full Load copies the "
-            "values the source already computed, so the target starts correct — but "
-            "nothing maintains them afterwards, so any insert/update that does not supply "
-            "the value will drift. Compute it in the application (or in the query) before "
-            "cut over. The generating expression is not captured here; read it from the "
-            "source with SHOW CREATE TABLE."
-        ),
+        message=f"{detail} {MYSQL_GENERATED_COLUMN_ADVICE}",
     )
 
 

@@ -29,12 +29,14 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 `pg_catalog`/`information_schema`/`pg_toast` は除外)**と** **ターゲット** の両方を
 イントロスペクトし、**互換性評価レポート** を生成します。
 
+読み取りは読み取り専用・autocommit で行われ、他のセッションが保持するロック (実行中の `ALTER TABLE`) は最大 5 秒しか待たず、テーブルごとに進捗を報告し、**Cancel evaluation** で取り消せます。再実行すると、成功するまで前回のレポートが残ります。MySQL の移行ユーザーは、ビュー定義を読むには `SHOW VIEW`、トリガー・イベント・ルーチンを一覧するには `TRIGGER`、`EVENT`、`SHOW_ROUTINE` (または `*.*` に対する `SELECT`) が必要です。権限がない場合、レポートはそれらを省略せず、一覧できなかったものを示します (`SOURCE_VISIBILITY`)。
+
 ### すべてのオブジェクトが 1 つの分類を受け取る
 
 | 分類 | 意味 | 例 |
 |---|---|---|
 | **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。**外部キー**(自動変換され、`RECOMMENDED` としてフラグ付け — 下記参照)。複数データベースの MySQL ソース(各データベースが独自のスキーマになり、`RECOMMENDED` としてフラグ付け)。同じスキーマの別のテーブル・ビュー・インデックスも使うインデックス名(インデックスは自動的に名前が変更され、`RECOMMENDED` としてフラグ付け)。 |
-| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム上のセカンダリインデックス(UNIQUE インデックスは一意性を失います)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)。 |
+| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム上のセカンダリインデックス(UNIQUE インデックスは一意性を失います)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)、ソースが定義を返さなかったビュー、ソースユーザーが一覧できないオブジェクト(`SOURCE_VISIBILITY`)。 |
 | **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`bytea` カラムの主キー(`BINARY`/`VARBINARY`/`BLOB`、PostgreSQL の `bytea`)、63 バイトに切り詰めると衝突する名前(1 つのテーブルの 2 つのカラム、または 1 つのスキーマの 2 つのテーブル/ビュー)、`DECIMAL` 精度 > 1000、テーブルあたりカラム > 255、ターゲットデータベースのテーブル 1,000 個・スキーマ 10 個・ビュー 5,000 個超(クラスターに既にあるものを含む)、FULLTEXT/SPATIAL インデックス。 |
 
 上記の例は主に MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
@@ -404,6 +406,8 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 > 列 DEFAULT は **出力され**、`serial`/`IDENTITY` `nextval` だけが除去されます(identity は PK 戦略が決定)。
 > `STORED` 生成カラムの式は再出力され(Aurora DSQL がサポート・維持するため)、`VIRTUAL` 生成カラムは通常の
 > カラムになります。
+>
+> **MySQL** の生成カラムは通常のカラムとして作成されます (ツールは式を読みません)。Full Load は計算済みの値をコピーし、CDC は `STORED` カラムの値を運びます。式 (`GENERATED ALWAYS AS (...) STORED`) を Schema Conversion で再追加できるのは **Full load only** の移行だけです。CDC はすべてのカラムの値を送るため、そうするとすべての insert と update が拒否されます (SQLSTATE `428C9`)。
 
 ### 型マッピング (完全なリファレンス)
 

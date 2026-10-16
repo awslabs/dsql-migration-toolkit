@@ -630,6 +630,14 @@ def apply_session_snapshot(
                 target_endpoint=snapshot.target_inventory_endpoint,
             )
         )
+        # As for Validation below: the job id is not persisted, so an IN_PROGRESS step has
+        # no live job after a restart, and a restored report means a run finished (or a
+        # re-run was interrupted with the previous report kept). Reconcile to DONE HERE,
+        # before the workflow shell renders, or the header shows "In progress" over it.
+        if get_status(session.workflow, WorkflowStep.EVALUATION) is StepStatus.IN_PROGRESS:
+            session.set_workflow(
+                with_status(session.workflow, WorkflowStep.EVALUATION, StepStatus.DONE)
+            )
 
     if snapshot.generated_node_ids is not None:
         conv_state.generated_node_ids = list(snapshot.generated_node_ids)  # type: ignore[attr-defined]

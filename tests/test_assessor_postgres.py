@@ -27,6 +27,8 @@ _EXPECTED_PG_RULE_IDS = {
     # PG-specific: a declared char/varchar length above DSQL's 4096/65535-byte
     # ceiling, which would make the CREATE TABLE fail at apply.
     "PG_CHARACTER_LENGTH",
+    # A view whose definition the source did not return (shared, PG wording).
+    "VIEW_DEFINITION_UNREADABLE",
     "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
     "TRIGGER_UNSUPPORTED",

@@ -484,6 +484,9 @@ def test_enrich_columns_marks_generated_and_on_update_columns() -> None:
 
     by_name = {c.name: c for c in tables[0].columns}
     assert by_name["total"].generated is True
+    # The kind is kept: what CDC carries depends on it (a STORED value is in the row).
+    assert by_name["total"].generated_kind == "STORED"
+    assert by_name["created_at"].generated_kind is None
     assert by_name["updated_at"].auto_update_timestamp is True
     assert by_name["created_at"].generated is False
     assert by_name["created_at"].auto_update_timestamp is False
@@ -1594,3 +1597,57 @@ def test_binary_default_restore_handles_odd_names_quoting_modes_and_line_separat
     t5 = table("0x01")
     _restore_cut_binary_defaults(denied, "app", [t5])
     assert t5.columns[0].default == "0x01"
+
+
+def test_introspection_reports_each_table_and_reads_in_autocommit() -> None:
+    """One implicit transaction held a PostgreSQL source's view share locks (and a MySQL
+    source's metadata locks) until the whole read ended; a long read was also one silent
+    span the 900 s watchdog reaped."""
+    levels: list[str] = []
+    calls: list[tuple[int, int]] = []
+    factory = _sqlite_factory()
+    engine = factory(SourceConnectionConfig(host="x", database=None))
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _isolation(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        levels.append(conn.get_execution_options().get("isolation_level"))
+
+    introspector = SourceIntrospector(engine_factory=lambda _c: engine)
+    inventory = introspector.introspect(
+        SourceConnectionConfig(host="x", database=None),
+        progress=lambda read, total: calls.append((read, total)),
+    )
+    assert {t.name.split(".")[-1] for t in inventory.tables} == {"customers", "orders"}
+    assert (1, 2) in calls and (2, 2) in calls
+    assert levels and set(levels) == {"AUTOCOMMIT"}
+
+
+def test_a_lock_another_session_holds_fails_fast_with_what_to_do() -> None:
+    import pytest
+
+    from dsql_migrator.core.introspector import SourceLockTimeoutError, _is_lock_timeout
+
+    class _PgLock(Exception):
+        sqlstate = "55P03"
+
+    class _Wrapped(Exception):
+        def __init__(self, orig):
+            super().__init__("wrapped")
+            self.orig = orig
+
+    assert _is_lock_timeout(_Wrapped(_PgLock()))
+    assert _is_lock_timeout(_Wrapped(Exception(1205, "Lock wait timeout exceeded")))
+    assert not _is_lock_timeout(_Wrapped(Exception(1146, "no such table")))
+
+    factory = _sqlite_factory()
+    engine = factory(SourceConnectionConfig(host="x", database=None))
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _locked(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        if "orders" in statement:
+            raise _Wrapped(_PgLock())
+
+    with pytest.raises(SourceLockTimeoutError, match="another session holds a lock"):
+        SourceIntrospector(engine_factory=lambda _c: engine).introspect(
+            SourceConnectionConfig(host="x", database=None)
+        )

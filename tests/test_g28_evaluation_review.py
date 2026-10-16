@@ -1697,3 +1697,120 @@ def test_two_databases_whose_names_agree_in_63_bytes_share_one_target_schema() -
     assert relation_clash_names(inventory) == {f"{one}.orders", f"{two}.orders"}
     conversion = SchemaConverter().convert(inventory)
     assert all(is_name_collision_placeholder(t.target_ddl) for t in conversion.tables)
+
+
+def test_generated_column_advice_never_sends_a_cdc_migration_to_a_generated_target() -> None:
+    """The advice was to re-add GENERATED ... STORED on the target; with CDC every insert
+    and update to the table then dead-letters (428C9). It also claimed CDC never carries
+    the value, which is false for a STORED column."""
+    from dsql_migrator.core.converter import MYSQL_GENERATED_COLUMN_ADVICE
+
+    table = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="int"),
+            ColumnDef(name="total", mysql_type="int", generated=True, generated_kind="STORED"),
+            ColumnDef(name="label", mysql_type="text", generated=True, generated_kind="VIRTUAL"),
+        ],
+        primary_key=["id"],
+    )
+    report = CompatibilityAssessor().assess(SourceInventory(tables=[table]))
+    (item,) = [i for i in report.items if i.object_name == "shop.orders"]
+    (concern,) = [c for c in item.concerns if c.rule_id == "GENERATED_COLUMN"]
+    assert "STORED (total): MySQL stores the value, so Full Load copies it and CDC carries" in concern.risk
+    assert "VIRTUAL (label)" in concern.risk
+    assert "Not with CDC" in concern.recommendation and "428C9" in concern.recommendation
+    assert concern.recommendation == MYSQL_GENERATED_COLUMN_ADVICE
+    # Step 2 says the same thing.
+    notes = SchemaConverter().convert_table(table, None).warnings  # type: ignore[arg-type]
+    assert any(MYSQL_GENERATED_COLUMN_ADVICE in w.message for w in notes)
+
+
+def test_a_generated_target_column_sent_a_value_is_named_and_its_repair_given() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.cdc import SchemaDriftKind, classify_schema_drift
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _DRIFT_LABELS, _ddl_runbook
+
+    assert classify_schema_drift("428C9") is SchemaDriftKind.GENERATED_COLUMN
+    assert "428C9" in _DRIFT_LABELS["generated-column"][1]
+    group = SimpleNamespace(table="shop.orders", kind="generated-column", columns=[], codes=["428C9"])
+    from dsql_migrator.ui.data_migration._models import MigrationType
+
+    runbook = _ddl_runbook([group], MigrationType.FULL_LOAD_AND_CDC, is_pg=False)
+    assert "DROP EXPRESSION" in runbook
+    assert "CDC does not replicate DDL" not in runbook  # not a source change
+
+
+def test_a_view_whose_definition_could_not_be_read_is_not_ready() -> None:
+    """A least-privilege MySQL user (no SHOW VIEW) gets empty view bodies; the view was
+    graded AUTO while Schema Conversion could only flag it for manual work."""
+    for engine in (SourceType.MYSQL, SourceType.POSTGRES):
+        inventory = SourceInventory(
+            views=[ViewDef(name="shop.v_hidden", definition=""), ViewDef(name="shop.v_ok", definition="SELECT 1")]
+        )
+        report = CompatibilityAssessor(source_type=engine).assess(inventory)
+        by_name = {item.object_name: item for item in report.items}
+        assert by_name["shop.v_hidden"].classification is Classification.MANUAL
+        assert by_name["shop.v_hidden"].rule_id == "VIEW_DEFINITION_UNREADABLE"
+        assert by_name["shop.v_ok"].classification is not Classification.MANUAL or (
+            by_name["shop.v_ok"].rule_id != "VIEW_DEFINITION_UNREADABLE"
+        )
+        wording = by_name["shop.v_hidden"].concerns[0].risk
+        assert ("SHOW VIEW" in wording) is (engine is SourceType.MYSQL)
+
+
+def test_objects_the_source_user_cannot_list_are_reported_not_assumed_absent() -> None:
+    """A least-privilege MySQL user sees no triggers, events or routines at all, and the
+    report read "Ready" over objects it never saw."""
+    from dsql_migrator.core.models import SourceConnectionConfig, TargetConnectionConfig
+    from dsql_migrator.core.source_dialect.mysql import mysql_listing_gaps
+    from dsql_migrator.ui.evaluation import EvaluationInputs, run_evaluation
+
+    gaps = mysql_listing_gaps(
+        ["GRANT USAGE ON *.* TO `u`@`%`", "GRANT SELECT, SHOW VIEW ON `shop`.* TO `u`@`%`"], ["shop"]
+    )
+    assert gaps == [
+        "triggers in shop (needs TRIGGER)",
+        "scheduled events in shop (needs EVENT)",
+        "stored procedures and functions in shop (needs SHOW_ROUTINE (or SELECT on *.*))",
+    ]
+    # The Aurora master user (global privileges; a role membership line is ignored).
+    assert mysql_listing_gaps(
+        [
+            "GRANT SELECT, SHOW VIEW, EXECUTE, EVENT, TRIGGER ON *.* TO `admin`@`%`",
+            "GRANT `rds_superuser_role`@`%` TO `admin`@`%`",
+        ],
+        ["shop"],
+    ) == []
+    assert mysql_listing_gaps([], ["shop"]) == []  # unknown: no claim
+
+    class _Introspector:
+        def introspect(self, conn, *, progress=None):
+            return SourceInventory(tables=[_table("shop.orders")])
+
+        def listing_gaps(self, conn, databases):
+            assert databases == ["shop"]
+            return gaps
+
+    class _Browser:
+        def browse(self, _conn):
+            return TargetInventory()
+
+    result = run_evaluation(
+        EvaluationInputs(
+            source_config=SourceConnectionConfig(host="db", database="shop"),
+            source_password=None,
+            target_config=TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"),
+        ),
+        introspector_factory=lambda _p: _Introspector(),
+        target_browser_factory=lambda _p: _Browser(),
+    )
+    (item,) = [i for i in result.assessment.items if i.rule_id == "SOURCE_VISIBILITY"]
+    assert item.classification is Classification.MANUAL
+    assert "triggers in shop (needs TRIGGER)" in item.risk
+    # A refresh re-assesses from the inventory alone and keeps the probe's finding.
+    refreshed = with_refreshed_catalogs(
+        result, inventory=result.inventory, target_inventory=TargetInventory(), target_endpoint=None
+    )
+    assert any(i.rule_id == "SOURCE_VISIBILITY" for i in refreshed.assessment.items)

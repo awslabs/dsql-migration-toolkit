@@ -575,6 +575,10 @@ class SchemaDriftKind(str, Enum):
     # 23514 check_violation: a CHECK rejected a value -- usually the CHECK Schema Conversion
     # gives a MySQL ENUM / PostgreSQL enum column, after the source type gained a value.
     CHECK_VIOLATION = "check-violation"
+    # 428C9 generated_always: the target column is GENERATED (made so in Schema Conversion
+    # for a MySQL generated column), and the change records carry a value for it, so EVERY
+    # insert and update for the table is rejected. Not a source change.
+    GENERATED_COLUMN = "generated-column"
 
 
 # SQLSTATE -> drift kind. Only rejections a source schema change explains map to drift;
@@ -615,6 +619,7 @@ _DRIFT_BY_SQLSTATE: dict[str, SchemaDriftKind] = {
     "07006": SchemaDriftKind.UNBINDABLE_VALUE,
     "42P10": SchemaDriftKind.KEY_CHANGE,
     "23514": SchemaDriftKind.CHECK_VIOLATION,
+    "428C9": SchemaDriftKind.GENERATED_COLUMN,
     "22001": SchemaDriftKind.VALUE_DOES_NOT_FIT,
     "22003": SchemaDriftKind.VALUE_DOES_NOT_FIT,
     "SOURCE_TRUNCATE": SchemaDriftKind.SOURCE_TRUNCATE,

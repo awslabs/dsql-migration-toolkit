@@ -1674,37 +1674,25 @@ class GeneratedColumnRule(Rule):
     rule_id = "GENERATED_COLUMN"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import (
+            MYSQL_GENERATED_COLUMN_ADVICE,
+            mysql_generated_column_detail,
+        )
+
         findings: list[Finding] = []
         for table in inventory.tables:
-            columns = [c.name for c in table.columns if c.generated]
-            if columns:
-                names = ", ".join(columns)
+            # The conversion note's own text, so Step 1 and Step 2 agree (it used to claim
+            # CDC never carries the value, and advised a GENERATED target column that makes
+            # every CDC insert and update to the table dead-letter).
+            detail = mysql_generated_column_detail(table)
+            if detail is not None:
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
-                        risk=(
-                            f"Columns ({names}) are MySQL generated/computed columns "
-                            "(VIRTUAL or STORED). Aurora DSQL DOES support STORED "
-                            "generated columns and maintains them, but the tool cannot "
-                            "carry THIS one over: MySQL introspection does not read "
-                            "information_schema.COLUMNS.GENERATION_EXPRESSION, so there is "
-                            "no expression to re-emit and the column is created ORDINARY. "
-                            "Full Load copies the value the source already computed, so the "
-                            "target starts correct -- but nothing maintains it afterwards, "
-                            "and the CDC stream does not carry it either, so any write that "
-                            "does not supply the value drifts."
-                        ),
-                        recommendation=(
-                            "Either re-add the expression yourself before applying -- read "
-                            "it with SHOW CREATE TABLE and edit the target DDL in Schema "
-                            "Conversion to GENERATED ALWAYS AS (<expression>) STORED, "
-                            "translating it to PostgreSQL syntax -- or compute the value in "
-                            "the application. Decide BEFORE applying: Aurora DSQL can DROP "
-                            "an expression from a column but cannot ADD one, so retrofitting "
-                            "it later means recreating the table."
-                        ),
+                        risk=detail,
+                        recommendation=MYSQL_GENERATED_COLUMN_ADVICE,
                         effort=EffortLevel.MEDIUM,
                     )
                 )
@@ -1776,6 +1764,56 @@ class UnsupportedIndexTypeRule(Rule):
                         effort=EffortLevel.SIGNIFICANT,
                     )
                 )
+        return findings
+
+
+class ViewDefinitionUnreadableRule(Rule):
+    """A view whose definition the source did not return, so it cannot be converted.
+
+    Introspection reads a view's definition best-effort and keeps an EMPTY one when the read
+    fails -- on MySQL the usual cause is a migration user without SHOW VIEW -- so one bad
+    view does not abort the inventory. Graded AUTO, it read as "Ready" while Schema
+    Conversion (which needs the definition) could only flag it for manual work."""
+
+    rule_id = "VIEW_DEFINITION_UNREADABLE"
+
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        self._is_postgres = is_postgres
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        causes = (
+            "the view may be invalid (a relation it reads was dropped), or the read was "
+            "blocked by a lock another session holds"
+            if self._is_postgres
+            else "the migration user may lack the SHOW VIEW privilege on it, the view may "
+            "be invalid (a table it reads was dropped), or the read was blocked by a lock"
+        )
+        fix = (
+            "Repair the view on the source"
+            if self._is_postgres
+            else "Grant SHOW VIEW on its database to the migration user (a read-only "
+            "privilege), or repair the view on the source"
+        )
+        findings: list[Finding] = []
+        for view in inventory.views:
+            if view.unsupported_kind or (view.definition or "").strip():
+                continue
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_VIEW, view.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=(
+                        "The source returned no definition for this view, so it cannot be "
+                        f"converted: {causes}."
+                    ),
+                    recommendation=(
+                        f"{fix}, then re-run Step 1 (Evaluation); otherwise recreate the "
+                        "view on Aurora DSQL by hand."
+                    ),
+                    effort=EffortLevel.MEDIUM,
+                )
+            )
         return findings
 
 
@@ -1954,6 +1992,37 @@ def _relations_after_migration(
 
 def _ceil_div(value: int, limit: int) -> int:
     return -(-value // limit)
+
+
+SOURCE_VISIBILITY_RULE_ID = "SOURCE_VISIBILITY"
+
+
+def source_visibility_items(gaps: "Sequence[str]") -> list[AssessmentItem]:
+    """The database-level item for objects the source user cannot list (``gaps``, from the
+    source dialect's listing probe): what is not listed is not assessed, converted or
+    migrated, so a report built without it read "Ready" over objects it never saw."""
+    if not gaps:
+        return []
+    item = AssessmentItem(
+        object_name="source privileges",
+        rule_id=SOURCE_VISIBILITY_RULE_ID,
+        classification=Classification.MANUAL,
+        risk=(
+            "The source user cannot list every object, so this report may be missing some: "
+            + "; ".join(gaps)
+            + ". Objects that are not listed are not assessed, converted or migrated."
+        ),
+        recommendation=(
+            "Grant the missing privileges to the migration user and re-run Step 1 "
+            "(Evaluation), or list those objects as an administrator (SHOW TRIGGERS, SHOW "
+            "EVENTS, SHOW PROCEDURE STATUS / SHOW FUNCTION STATUS) and review them by hand. "
+            "SHOW_ROUTINE only reads; TRIGGER and EVENT also allow changing triggers and "
+            "events, which is why listing them by hand may be preferable."
+        ),
+        effort=EffortLevel.SIMPLE,
+        kind=KIND_DATABASE.upper(),
+    )
+    return [item.model_copy(update={"concerns": _single_concern(item, ConversionNoteKind.LOSS)})]
 
 
 def check_multiple_source_databases(
@@ -2379,6 +2448,7 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         GeneratedColumnRule(),
         AutoUpdateTimestampRule(),
         UnsupportedIndexTypeRule(),
+        ViewDefinitionUnreadableRule(),
         ViewCompatibilityRule(),
     ]
 

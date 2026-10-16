@@ -28,12 +28,14 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 등이며, 시스템 스키마 `pg_catalog`/`information_schema`/`pg_toast`는 제외)와 **타깃**을
 살펴본(introspect) 뒤 **호환성 평가 리포트**를 만듭니다.
 
+읽기는 읽기 전용·autocommit으로 수행되며, 다른 세션이 잡은 잠금(실행 중인 `ALTER TABLE`)은 최대 5초만 기다리고, 테이블마다 진행 상황을 보고하며, **Cancel evaluation**으로 취소할 수 있습니다. 다시 실행하면 성공할 때까지 이전 리포트가 유지됩니다. MySQL 마이그레이션 사용자는 뷰 정의를 읽으려면 `SHOW VIEW`, 트리거·이벤트·루틴을 나열하려면 `TRIGGER`, `EVENT`, `SHOW_ROUTINE`(또는 `*.*`에 대한 `SELECT`)이 필요합니다. 권한이 없으면 리포트는 해당 객체를 빠뜨리지 않고 나열하지 못한 항목을 알려 줍니다(`SOURCE_VISIBILITY`).
+
 ### 모든 객체가 하나의 분류를 받음
 
 | 분류 | 의미 | 예시 |
 |---|---|---|
 | **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고); 다중 데이터베이스 MySQL 소스(각 데이터베이스가 자체 스키마가 되며 `RECOMMENDED`로 표시); 같은 스키마의 다른 테이블·뷰·인덱스도 쓰는 인덱스 이름(인덱스가 자동으로 이름이 바뀌며 `RECOMMENDED`로 표시). |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼의 보조 인덱스(UNIQUE 인덱스는 유일성 보장을 잃음), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장). |
+| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼의 보조 인덱스(UNIQUE 인덱스는 유일성 보장을 잃음), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장), 소스가 정의를 돌려주지 않은 뷰, 소스 사용자가 나열할 수 없는 객체(`SOURCE_VISIBILITY`). |
 | **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `bytea` 컬럼의 기본 키(`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`), 63바이트로 잘리면 충돌하는 이름(한 테이블의 두 컬럼, 또는 한 스키마의 두 테이블/뷰), `DECIMAL` 정밀도 > 1000, 테이블당 컬럼 > 255, 타깃 데이터베이스의 테이블 1,000개·스키마 10개·뷰 5,000개 초과(클러스터에 이미 있는 것 포함), FULLTEXT/SPATIAL 인덱스. |
 
 위 예시는 대부분 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
@@ -386,6 +388,8 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 > 컬럼 DEFAULT는 **내보내며** `serial`/`IDENTITY` `nextval`만 제거되고(identity는 PK 전략이 좌우),
 > `STORED` 생성 컬럼의 식은 다시 출력됩니다(Aurora DSQL이 지원·유지하므로). `VIRTUAL` 생성 컬럼은 일반 컬럼이
 > 됩니다.
+>
+> **MySQL** 생성 컬럼은 일반 컬럼으로 만들어집니다(도구가 식을 읽지 않음). Full Load는 계산된 값을 복사하고, CDC는 `STORED` 컬럼의 값을 전달합니다. 식(`GENERATED ALWAYS AS (...) STORED`)은 **Full load only** 마이그레이션에서만 Schema Conversion에서 다시 추가할 수 있습니다. CDC는 모든 컬럼의 값을 보내므로, 그렇게 하면 모든 insert와 update가 거부됩니다(SQLSTATE `428C9`).
 
 ### 타입 매핑 (전체 참조)
 

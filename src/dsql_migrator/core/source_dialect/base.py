@@ -387,6 +387,11 @@ class SourceDialect(ABC):
         PostgreSQL reads ``version()`` / ``server_version`` / ``aurora_version()``.
         """
 
+    def listing_gaps(self, connection: object, databases: "Sequence[str]") -> list[str]:
+        """What the source user's privileges keep out of the inventory, one line per object
+        kind (``[]`` when nothing is or when it cannot be told). Read only; best effort."""
+        return []
+
     @abstractmethod
     def probe_grants(self, connection: object) -> list[str]:
         """Read the source user's privilege grants read-only, as raw text lines.

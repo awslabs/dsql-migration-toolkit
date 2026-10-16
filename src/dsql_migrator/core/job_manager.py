@@ -131,6 +131,9 @@ class _JobRecord:
     error: Optional[str] = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     last_progress_at: Optional[float] = None
+    # What the stall watchdog reports for THIS job ("{seconds}" is filled in); None keeps
+    # the Full Load wording, which a read-only Evaluation must not get.
+    stall_message: Optional[str] = None
 
 
 class JobHandle:
@@ -323,7 +326,13 @@ class JobManager:
                 self._records.pop(job_id, None)
             return len(to_delete)
 
-    def submit(self, work: WorkFn, *, job_id: Optional[str] = None) -> str:
+    def submit(
+        self,
+        work: WorkFn,
+        *,
+        job_id: Optional[str] = None,
+        stall_message: Optional[str] = None,
+    ) -> str:
         """Start ``work`` on a background thread and return its ``job_id`` now.
 
         Creates the job in ``PENDING`` state and launches a daemon thread that
@@ -333,7 +342,8 @@ class JobManager:
 
         ``job_id`` may be supplied to correlate the job with an external id;
         otherwise a random hex id is generated. Raises :class:`ValueError` if the
-        id is already in use.
+        id is already in use. ``stall_message`` is what the stall watchdog records if it
+        reaps this job (``{seconds}`` is replaced by the timeout).
         """
         new_id = job_id or uuid.uuid4().hex
         thread = threading.Thread(
@@ -349,6 +359,7 @@ class JobManager:
                 job=MigrationJob(job_id=new_id),
                 thread=thread,
                 last_progress_at=self._clock(),
+                stall_message=stall_message,
             )
             self._records[new_id] = record
             self._persist_locked(record)
@@ -493,11 +504,17 @@ class JobManager:
                 )
                 if not record.error:
                     record.error = (
-                        "No progress for "
-                        f"{int(self._stall_timeout)}s — the load appears to have "
-                        "stalled (an unresponsive source/target connection) and "
-                        "was stopped. Retry the failed tables to resume; the "
-                        "already-loaded tables are kept."
+                        record.stall_message.replace(
+                            "{seconds}", str(int(self._stall_timeout))
+                        )
+                        if record.stall_message
+                        else (
+                            "No progress for "
+                            f"{int(self._stall_timeout)}s — the load appears to have "
+                            "stalled (an unresponsive source/target connection) and "
+                            "was stopped. Retry the failed tables to resume; the "
+                            "already-loaded tables are kept."
+                        )
                     )
                 record.last_progress_at = now
                 self._persist_locked(record)

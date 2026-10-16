@@ -63,8 +63,11 @@ class _FakeIntrospector:
         self.inventory = inventory
         self.calls: list[SourceConnectionConfig] = []
 
-    def introspect(self, conn: SourceConnectionConfig) -> SourceInventory:
+    def introspect(self, conn: SourceConnectionConfig, *, progress=None) -> SourceInventory:
         self.calls.append(conn)
+        if progress is not None:
+            for read in range(1, len(self.inventory.tables) + 1):
+                progress(read, len(self.inventory.tables))
         return self.inventory
 
 
@@ -355,7 +358,7 @@ def test_find_target_conflicts_ignores_same_table_in_other_schema() -> None:
 
 def test_run_evaluation_propagates_introspection_failure() -> None:
     class _Boom:
-        def introspect(self, conn: SourceConnectionConfig) -> SourceInventory:
+        def introspect(self, conn: SourceConnectionConfig, *, progress=None) -> SourceInventory:
             raise RuntimeError("connection refused")
 
     def make(_password: object) -> _Boom:
@@ -809,12 +812,14 @@ def test_reconcile_evaluation_step_recovers_an_interrupted_run() -> None:
         )
         is None
     )
-    # A finished run (result present) is never reset, even if the job is gone.
+    # A finished run (result present) whose completion only the screen's poll would have
+    # recorded -- the operator was on another step, then a restart -- is DONE, not a
+    # permanent spinner.
     assert (
         reconcile_evaluation_step(
             StepStatus.IN_PROGRESS, job_alive=False, has_result=True
         )
-        is None
+        is StepStatus.DONE
     )
     # Terminal steps are never reconciled.
     assert (
@@ -2120,3 +2125,148 @@ def test_a_current_target_still_renders_the_normal_subsection() -> None:
     joined = " ".join(ui.text)
     assert "Target catalog:" in joined
     assert "out of date" not in joined
+
+
+def _screen_runner(introspector_factory, target_browser_factory, *, manager=None):
+    """The REAL Evaluation runner (not a re-implementation), over fakes."""
+    from dsql_migrator.ui.evaluation import EvaluationStore, build_evaluation_screen
+    from dsql_migrator.ui.session import SessionStore
+
+    store = SessionStore()
+    session = store.get_or_create("s1")
+    session.set_source(SourceConnectionConfig(host="db", database="shop"), None)
+    session.set_target(TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"))
+    eval_store = EvaluationStore()
+    manager = manager or JobManager()
+    _content, runner = build_evaluation_screen(
+        store,
+        "s1",
+        job_manager=manager,
+        eval_store=eval_store,
+        introspector_factory=introspector_factory,
+        target_browser_factory=target_browser_factory,
+    )
+    return runner, manager, eval_store.get_or_create("s1"), session
+
+
+def test_the_real_runner_reports_each_source_table_and_records_done() -> None:
+    from dsql_migrator.ui.workflow import WorkflowStep, get_status
+
+    src_factory, _ = _source_factory(_inventory_with_fk())
+    tgt_factory, _ = _target_factory(_empty_target())
+    runner, manager, state, session = _screen_runner(src_factory, tgt_factory)
+    seen: list[str] = []
+    original = state.set_progress
+
+    def _record(pct, message, *, token=None):
+        seen.append(message)
+        original(pct, message, token=token)
+
+    state.set_progress = _record  # type: ignore[method-assign]
+    runner()
+    assert manager.wait(state.job_id, timeout=5.0)
+    assert "Reading the source catalog: 2 of 2 tables" in seen
+    # Recorded by the worker itself: the screen's poll is not needed for DONE.
+    assert get_status(session.workflow, WorkflowStep.EVALUATION) is StepStatus.DONE
+
+
+def test_a_cancelled_evaluation_ends_cancelled_and_keeps_the_previous_report() -> None:
+    import threading
+
+    from dsql_migrator.ui.evaluation import _settle_unfinished_run
+
+    gate = threading.Event()
+    release = threading.Event()
+
+    class _Slow:
+        def introspect(self, conn, *, progress=None):
+            gate.set()
+            release.wait(5)
+            progress(1, 2)  # the next table boundary: the cancel lands here
+            raise AssertionError("not reached")
+
+    tgt_factory, _ = _target_factory(_empty_target())
+    runner, manager, state, _session = _screen_runner(lambda _p: _Slow(), tgt_factory)
+    previous = object()
+    state._result = previous  # a report from an earlier run
+    runner()
+    assert gate.wait(5)
+    manager.request_cancel(state.job_id)
+    release.set()
+    assert manager.wait(state.job_id, timeout=5.0)
+    assert manager.get_status(state.job_id).status == "CANCELLED"
+    assert state.result is previous  # begin_run kept it; nothing replaced it
+    assert _settle_unfinished_run(state, cancelled=True, error="") is StepStatus.DONE
+    assert state.run_notice[1] == "Evaluation cancelled"
+
+
+def test_a_second_run_is_refused_while_one_is_running() -> None:
+    import threading
+
+    release = threading.Event()
+
+    class _Blocking:
+        def introspect(self, conn, *, progress=None):
+            release.wait(5)
+            return SourceInventory()
+
+    tgt_factory, _ = _target_factory(_empty_target())
+    runner, manager, state, _session = _screen_runner(lambda _p: _Blocking(), tgt_factory)
+    runner()
+    first = state.job_id
+    runner()  # a second click / another tab
+    assert state.job_id == first
+    release.set()
+    assert manager.wait(first, timeout=5.0)
+
+
+def test_a_superseded_or_retired_run_cannot_write_its_result() -> None:
+    state = EvaluationState()
+    old = state.begin_run()
+    new = state.begin_run()
+    assert state.set_result(object(), token=old) is False
+    assert state.result is None
+    kept = object()
+    assert state.set_result(kept, token=new) is True
+    state.retire_run()  # cancelled or reaped: a late return must not land
+    assert state.set_result(object(), token=new) is False
+    assert state.result is kept
+    # Start over re-initialises the state in place: an old token never matches again.
+    state.__init__()
+    assert state.set_result(object(), token=new) is False
+
+
+def test_a_failed_rerun_keeps_the_previous_report_and_the_step_done() -> None:
+    from dsql_migrator.ui.evaluation import _settle_unfinished_run
+
+    first_run = EvaluationState()
+    assert _settle_unfinished_run(first_run, cancelled=False, error="boom") is StepStatus.FAILED
+    assert first_run.error == "boom"
+    rerun = EvaluationState()
+    rerun._result = object()
+    assert _settle_unfinished_run(rerun, cancelled=False, error="boom") is StepStatus.DONE
+    assert rerun.run_notice == ("warning", "The re-run failed; the previous assessment is kept", "boom")
+    assert rerun.error is None
+
+
+def test_the_watchdog_reaps_an_evaluation_with_its_own_message() -> None:
+    from dsql_migrator.ui.evaluation import EVALUATION_STALL_MESSAGE
+
+    now = [0.0]
+    manager = JobManager(stall_timeout_seconds=10, clock=lambda: now[0])
+    manager.shutdown()  # this test drives the reap itself
+    import threading
+
+    release = threading.Event()
+    job_id = manager.submit(lambda _h: release.wait(5), stall_message=EVALUATION_STALL_MESSAGE)
+    import time
+
+    deadline = time.monotonic() + 5
+    while manager.get_status(job_id).status != "RUNNING" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    now[0] = 60.0
+    assert manager.reap_stalled_jobs() == [job_id]
+    error = manager.get_error(job_id) or ""
+    assert error.startswith("No progress for 10s while reading the source or target catalog")
+    assert "Retry the failed tables" not in error
+    release.set()

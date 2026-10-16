@@ -771,6 +771,7 @@ def default_rules() -> "list[Rule]":
         TooManyIndexesRule,
         TooManyKeyColumnsRule,
         TriggerRule,
+        ViewDefinitionUnreadableRule,
     )
 
     return [
@@ -810,6 +811,7 @@ def default_rules() -> "list[Rule]":
         DecimalPrecisionRule(),
         # The far more common lossy numeric: no declared precision at all.
         PgUnconstrainedNumericRule(),
+        ViewDefinitionUnreadableRule(is_postgres=True),
     ]
 
 

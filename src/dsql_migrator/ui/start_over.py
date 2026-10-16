@@ -151,8 +151,8 @@ def _open_start_over_dialog(
         ui.label(  # type: ignore[attr-defined]
             "This clears your connections, migration plan, workflow progress, table "
             "selections and saved session state, returning you to a fresh Connect "
-            "screen. It does NOT change or delete any AWS resource (your DSQL "
-            "cluster and migrated data are untouched)."
+            "screen, and cancels a running evaluation. It does NOT change or delete any "
+            "AWS resource (your DSQL cluster and migrated data are untouched)."
         ).classes("text-sm text-gray-700")
         # A non-teardown CDC job (Deploy infra / Start CDC) is still running. Unlike a
         # stop/delete (hard-blocked above), a deploy/start is re-discoverable and must

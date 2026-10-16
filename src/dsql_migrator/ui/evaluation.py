@@ -33,6 +33,7 @@ independent of NiceGUI so they can be unit tested directly; only
 
 from __future__ import annotations
 
+import itertools
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
@@ -52,7 +53,9 @@ from dsql_migrator.core.assessor import (
     DSQL_DATABASE_LIMITS,
     KIND_DATABASE,
     KIND_LABELS,
+    SOURCE_VISIBILITY_RULE_ID,
     CompatibilityAssessor,
+    source_visibility_items,
 )
 from dsql_migrator.core.assessor import export_report as export_assessment_report
 from dsql_migrator.core.assessor import render_html_report
@@ -90,9 +93,32 @@ from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
 
 class _Introspector(Protocol):
-    """Minimal contract used by :func:`run_evaluation` (read-only source)."""
+    """Minimal contract used by :func:`run_evaluation` (read-only source).
 
-    def introspect(self, conn: SourceConnectionConfig) -> SourceInventory: ...
+    ``progress(tables_read, tables_total)`` is called while the source is read."""
+
+    def introspect(
+        self,
+        conn: SourceConnectionConfig,
+        *,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> SourceInventory: ...
+
+
+class EvaluationStopped(Exception):
+    """Raised from a progress report when the operator cancelled the run: it unwinds the
+    read (closing its connection) at the next table, and the worker returns normally so
+    the job ends CANCELLED rather than FAILED."""
+
+
+# What the stall watchdog says when it reaps an evaluation ({seconds} is filled in): the
+# Full Load wording ("the load appears to have stalled ... retry the failed tables") is
+# wrong for a read-only step.
+EVALUATION_STALL_MESSAGE = (
+    "No progress for {seconds}s while reading the source or target catalog, so the "
+    "evaluation was stopped (an unresponsive connection, or a lock held on the source). "
+    "Nothing was changed. Run it again."
+)
 
 
 class _TargetBrowser(Protocol):
@@ -288,12 +314,20 @@ def with_refreshed_catalogs(
     from dataclasses import replace
 
     engine = source_type if source_type is not None else result.source_type
+    assessment = CompatibilityAssessor(source_type=engine).assess(
+        inventory, target_inventory=target_inventory
+    )
+    # The source-privilege finding comes from the run's own probe of the source, not from
+    # the inventory, so a re-assessment keeps it (re-run Step 1 to probe again).
+    kept = [
+        item for item in result.assessment.items if item.rule_id == SOURCE_VISIBILITY_RULE_ID
+    ]
+    if kept:
+        assessment = AssessmentReport.from_items([*assessment.items, *kept])
     return replace(
         result,
         inventory=inventory,
-        assessment=CompatibilityAssessor(source_type=engine).assess(
-            inventory, target_inventory=target_inventory
-        ),
+        assessment=assessment,
         source_type=engine,
         target_inventory=target_inventory,
         target_conflicts=_find_target_conflicts(inventory, target_inventory),
@@ -886,7 +920,23 @@ def run_evaluation(
 
     report(5, "Introspecting source schema...")
     introspector = introspector_factory(inputs.source_password)
-    inventory = introspector.introspect(inputs.source_config)
+
+    def _source_read(read: int, total: int) -> None:
+        # 5% -> 35% across the source read: one report per table is a heartbeat (a large
+        # schema used to be one silent span the 900 s watchdog reaped) and a stop point.
+        pct = 5 + (30 * read // total if total else 0)
+        report(pct, f"Reading the source catalog: {read:,} of {total:,} tables")
+
+    inventory = introspector.introspect(inputs.source_config, progress=_source_read)
+    # What the source user's privileges keep out of that inventory (a least-privilege MySQL
+    # user sees no triggers, events or routines at all), so the report says so instead of
+    # reading "Ready" over objects it never saw. Optional seam: a test double may not probe.
+    _probe = getattr(introspector, "listing_gaps", None)
+    listing_gaps = (
+        _probe(inputs.source_config, _listing_databases(inventory, inputs.source_config))
+        if callable(_probe)
+        else []
+    )
 
     # The target is read BEFORE the assessment because Aurora DSQL's database-level limits
     # (tables, schemas, views per database) are about what the target will hold after the
@@ -902,6 +952,10 @@ def run_evaluation(
         assessor
         or CompatibilityAssessor(source_type=inputs.source_config.source_type)
     ).assess(inventory, target_inventory=target_inventory)
+    if listing_gaps:
+        assessment = AssessmentReport.from_items(
+            [*assessment.items, *source_visibility_items(listing_gaps)]
+        )
 
     report(85, "Detecting objects that already exist on the target...")
     target_conflicts = _find_target_conflicts(inventory, target_inventory)
@@ -917,6 +971,24 @@ def run_evaluation(
     )
 
 
+def _listing_databases(
+    inventory: SourceInventory, config: SourceConnectionConfig
+) -> list[str]:
+    """The source databases whose listing the privilege probe checks: those the inventory
+    holds objects of, plus the configured one (it may hold only what the user cannot see)."""
+    names: list[str] = []
+    for name in (
+        *(t.name for t in inventory.tables),
+        *(v.name for v in inventory.views),
+    ):
+        database = name.partition(".")[0] if "." in name else ""
+        if database and database not in names:
+            names.append(database)
+    if config.database and config.database not in names:
+        names.append(config.database)
+    return names
+
+
 def job_status_to_step_status(job_status: str) -> Optional[StepStatus]:
     """Map a :class:`JobManager` job status to the Evaluation step status.
 
@@ -927,6 +999,8 @@ def job_status_to_step_status(job_status: str) -> Optional[StepStatus]:
         return StepStatus.DONE
     if job_status == "FAILED":
         return StepStatus.FAILED
+    if job_status == "CANCELLED":
+        return StepStatus.NOT_STARTED
     return None
 
 
@@ -942,13 +1016,68 @@ def reconcile_evaluation_step(
 
     Returns ``NOT_STARTED`` when the step is ``IN_PROGRESS`` but there is neither a
     live job nor a result (the interrupted case) so the spinner stops and the "Run
-    evaluation" affordance returns; otherwise ``None`` (leave the status unchanged --
+    evaluation" affordance returns, and ``DONE`` when the result IS there (the run
+    finished while the screen was not open to record it -- only its poll did -- and
+    the snapshot kept the result); otherwise ``None`` (leave the status unchanged --
     a genuinely running job keeps spinning, a finished one keeps its DONE/FAILED).
     Pure + deterministic so the reconciliation is unit-testable.
     """
-    if status is StepStatus.IN_PROGRESS and not job_alive and not has_result:
-        return StepStatus.NOT_STARTED
+    if status is StepStatus.IN_PROGRESS and not job_alive:
+        return StepStatus.DONE if has_result else StepStatus.NOT_STARTED
     return None
+
+
+def _settle_unfinished_run(
+    eval_state: "EvaluationState", *, cancelled: bool, error: str
+) -> StepStatus:
+    """The step status after a run that did not finish, and what to tell the operator.
+
+    The previous report was kept through the run (see :meth:`EvaluationState.begin_run`):
+    when there is one, it stands -- the step stays DONE, so the later steps are not
+    blocked by a re-run that failed or was cancelled -- and a notice says so. Without
+    one, a failure is FAILED with its error and a cancel returns to NOT_STARTED."""
+    has_previous = eval_state.result is not None
+    if cancelled:
+        eval_state.run_notice = (
+            "info",
+            "Evaluation cancelled",
+            (
+                "The run was cancelled; nothing was changed (this step only reads). "
+                + (
+                    "The previous assessment below is kept."
+                    if has_previous
+                    else "Run it again when you are ready."
+                )
+            ),
+        )
+        return StepStatus.DONE if has_previous else StepStatus.NOT_STARTED
+    if has_previous:
+        eval_state.run_notice = (
+            "warning",
+            "The re-run failed; the previous assessment is kept",
+            error,
+        )
+        return StepStatus.DONE
+    eval_state.set_error(error)
+    return StepStatus.FAILED
+
+
+def _eval_job_running(job_manager: JobManager, job_id: Optional[str]) -> bool:
+    """True while the evaluation job is PENDING or RUNNING in this process."""
+    if job_id is None:
+        return False
+    try:
+        return job_manager.get_status(job_id).status in ("PENDING", "RUNNING")
+    except JobNotFoundError:
+        return False
+
+
+def _notify_quietly(ui: object, message: str) -> None:
+    """``ui.notify`` an info message when a client context exists (a no-op otherwise)."""
+    try:
+        ui.notify(message, type="info")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - no client context (a test, a background call)
+        pass
 
 
 def _eval_job_alive(job_manager: JobManager, job_id: Optional[str]) -> bool:
@@ -1033,6 +1162,15 @@ class EvaluationState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.job_id: Optional[str] = None
+        # The current run's token (0: none). A worker writes only while its token is
+        # current: Start over re-inits this object, and a stopped or reaped run is
+        # retired, so a superseded worker can no longer overwrite the result.
+        self._run_token = 0
+        # Set by the Cancel button (UI thread only).
+        self.cancel_requested = False
+        # (tone, header, body) about how the last run ended when a previous report was
+        # kept (a failed or cancelled re-run), shown above it; or a cancelled first run.
+        self.run_notice: Optional[tuple[str, str, str]] = None
         # Filters for the "Objects by importance" list (UI-thread only), split
         # along the two color-coded categories the summary already shows so the
         # controls read as "narrow by Classification and/or Estimated manual
@@ -1048,9 +1186,36 @@ class EvaluationState:
         self._progress_pct: int = 0
         self._progress_message: str = ""
 
-    def set_progress(self, percent: int, message: str) -> None:
+    def begin_run(self) -> int:
+        """Start a run: a new token, cleared progress/error/notice. The previous result is
+        KEPT until the new run succeeds -- later steps read it, and a failed or cancelled
+        re-run must not leave them with nothing."""
+        with self._lock:
+            self._run_token = next(_RUN_TOKENS)
+            self._error = None
+            self._progress_pct = 0
+            self._progress_message = ""
+            self.run_notice = None
+            self.cancel_requested = False
+            return self._run_token
+
+    def is_current(self, token: Optional[int]) -> bool:
+        """Whether ``token`` is the current run's (``None``: an untokened caller)."""
+        with self._lock:
+            return token is None or token == self._run_token
+
+    def retire_run(self, token: Optional[int] = None) -> None:
+        """Make the current run's (or ``token``'s) late writes no-ops: it was cancelled or
+        reaped, and a worker that comes back later must not land a result under it."""
+        with self._lock:
+            if token is None or token == self._run_token:
+                self._run_token = -next(_RUN_TOKENS)
+
+    def set_progress(self, percent: int, message: str, *, token: Optional[int] = None) -> None:
         """Record coarse run progress (percent 0-100 and a phase message)."""
         with self._lock:
+            if token is not None and token != self._run_token:
+                return
             self._progress_pct = max(0, min(100, int(percent)))
             self._progress_message = message
 
@@ -1066,15 +1231,21 @@ class EvaluationState:
         with self._lock:
             return self._progress_message
 
-    def set_result(self, result: EvaluationResult) -> None:
-        """Record a successful run's result (clears any prior error)."""
+    def set_result(self, result: EvaluationResult, *, token: Optional[int] = None) -> bool:
+        """Record a successful run's result (clears any prior error). ``False`` (nothing
+        recorded) for a superseded run's ``token``."""
         with self._lock:
+            if token is not None and token != self._run_token:
+                return False
             self._result = result
             self._error = None
+            return True
 
-    def set_error(self, message: str) -> None:
+    def set_error(self, message: str, *, token: Optional[int] = None) -> None:
         """Record a failure message for display."""
         with self._lock:
+            if token is not None and token != self._run_token:
+                return
             self._error = message
 
     @property
@@ -1148,6 +1319,10 @@ class EvaluationStore:
 # How often the screen polls the background job (seconds).
 _POLL_INTERVAL_SECONDS = 0.5
 
+# Run tokens, unique in the process (never 0, the "no run" token), so a re-initialised
+# EvaluationState can never match a superseded worker's token.
+_RUN_TOKENS = itertools.count(1)
+
 
 def build_evaluation_screen(
     store: SessionStore,
@@ -1180,6 +1355,14 @@ def build_evaluation_screen(
     eval_state = eval_store.get_or_create(session_id)
 
     def runner() -> None:
+        if _eval_job_running(job_manager, eval_state.job_id):
+            # A second Run (another tab, a double click) would start a second read of the
+            # production source and race the first for the result.
+            _notify_quietly(
+                ui,
+                "An evaluation is already running. Wait for it to finish, or cancel it.",
+            )
+            return
         if not session.has_source():
             eval_state.set_error(
                 "Configure and test the source connection first, then run the "
@@ -1203,7 +1386,7 @@ def build_evaluation_screen(
             target_config=target_config,
             aws_profile=session.aws_profile,
         )
-        eval_state.clear_outputs()
+        token = eval_state.begin_run()
         session.set_workflow(
             with_status(session.workflow, WorkflowStep.EVALUATION, StepStatus.IN_PROGRESS)
         )
@@ -1214,11 +1397,14 @@ def build_evaluation_screen(
                 # so a very large schema's evaluation was reaped by the job watchdog and
                 # rendered a red "Evaluation failed" carrying a Full-Load-worded stall
                 # message -- for a read-only step -- which then blocks the journey's
-                # step-order gate. A reported phase is a real unit boundary.
+                # step-order gate. A reported phase (and each source table) is a real
+                # unit boundary, and where a cancel takes effect.
+                if getattr(_handle, "cancelled", False):
+                    raise EvaluationStopped()
                 beat = getattr(_handle, "heartbeat", None)
                 if callable(beat):
                     beat()
-                eval_state.set_progress(pct, message)
+                eval_state.set_progress(pct, message, token=token)
 
             log_activity(
                 ActivityCategory.ASSESSMENT,
@@ -1239,6 +1425,14 @@ def build_evaluation_screen(
                     target_browser_factory=target_browser_factory,
                     progress_cb=_progress,
                 )
+            except EvaluationStopped:
+                log_activity(
+                    ActivityCategory.ASSESSMENT,
+                    "run assessment",
+                    status=ActivityStatus.INFO,
+                    detail="cancelled by the operator; read only, so nothing was changed",
+                )
+                return  # the job ends CANCELLED (its cancel was requested)
             except Exception as exc:  # noqa: BLE001 - re-raised; job marks FAILED
                 log_activity(
                     ActivityCategory.ASSESSMENT,
@@ -1247,7 +1441,7 @@ def build_evaluation_screen(
                     detail=f"{type(exc).__name__}: {exc}",
                     exc=exc,
                 )
-                if ai_post_event is not None:
+                if ai_post_event is not None and eval_state.is_current(token):
                     # Keep the event lean: the type is the useful signal; the full
                     # exception message can be long/verbose (and is already in the
                     # activity log), so it is not sent into the AI feed/grounding.
@@ -1256,7 +1450,15 @@ def build_evaluation_screen(
                         status="error",
                     )
                 raise
-            eval_state.set_result(result)
+            if not eval_state.set_result(result, token=token):
+                # Superseded (Start over, or a cancelled/reaped run that came back late):
+                # its result must not replace the session's.
+                return
+            # Recorded here, not only by the screen's poll: a run that finished while the
+            # operator was on another step stayed "In progress" until they came back.
+            session.set_workflow(
+                with_status(session.workflow, WorkflowStep.EVALUATION, StepStatus.DONE)
+            )
             report = result.assessment
             counts = ", ".join(f"{k.value}={v}" for k, v in report.summary.items())
             conflicts = len(result.target_conflicts or [])
@@ -1293,7 +1495,9 @@ def build_evaluation_screen(
                     },
                 )
 
-        eval_state.job_id = job_manager.submit(work)
+        eval_state.job_id = job_manager.submit(
+            work, stall_message=EVALUATION_STALL_MESSAGE
+        )
 
     def content(refresh: Callable[[], None]) -> None:
         status = get_status(session.workflow, WorkflowStep.EVALUATION)
@@ -1319,6 +1523,20 @@ def build_evaluation_screen(
             # (not only via the workflow shell's Run button); shares the runner
             # and refreshes so the progress panel/poll-timer appear inline.
             runner()
+            refresh()
+
+        def _cancel_evaluation() -> None:
+            job_id = eval_state.job_id
+            if job_id is None or eval_state.cancel_requested:
+                return
+            log_activity(
+                ActivityCategory.ASSESSMENT,
+                "cancel requested",
+                status=ActivityStatus.INFO,
+                detail="operator cancelled the evaluation; it stops after the table being read",
+            )
+            job_manager.request_cancel(job_id)
+            eval_state.cancel_requested = True
             refresh()
 
         with ui.column().classes("w-full gap-3"):
@@ -1352,7 +1570,7 @@ def build_evaluation_screen(
             # Empty-state call-to-action: before the first run, give an on-screen
             # Run button (the workflow shell's Run is easy to miss) and reassure
             # that this step is read-only.
-            if status is StepStatus.NOT_STARTED and eval_state.result is None:
+            if status is StepStatus.NOT_STARTED:
                 with ui.card().classes("w-full bg-gray-50"):
                     ui.label("Ready to evaluate").classes("text-md font-semibold")
                     ui.label(
@@ -1394,6 +1612,19 @@ def build_evaluation_screen(
                         percent_label = ui.label(
                             f"{eval_state.progress_pct}%"
                         ).classes("text-sm text-blue-800 font-semibold")
+                        # Cancelling a read-only run is a normal (secondary) action, as
+                        # Validation's "Cancel validation": nothing is half-changed.
+                        cancel_button = ui.button(
+                            "Cancel evaluation",
+                            icon="stop_circle",
+                            on_click=lambda: _cancel_evaluation(),
+                        ).props("outline color=grey-8 no-caps")
+                        if eval_state.cancel_requested:
+                            cancel_button.disable()
+                            cancel_button.tooltip(
+                                "Cancel requested -- it takes effect after the table "
+                                "being read. Read-only, so nothing is left half-changed."
+                            )
                     progress_bar = (
                         ui.linear_progress(
                             value=eval_state.progress_pct / 100, show_value=False
@@ -1411,6 +1642,19 @@ def build_evaluation_screen(
                     percent_label=percent_label,
                     progress_bar=progress_bar,
                 )
+                if eval_state.result is not None:
+                    render_notice(
+                        ui,
+                        tone="info",
+                        header="Showing the previous assessment",
+                        body=(
+                            "It stays in place, and the later steps keep using it, until "
+                            "this run finishes."
+                        ),
+                    )
+            elif eval_state.run_notice is not None:
+                _tone, _header, _body = eval_state.run_notice
+                render_notice(ui, tone=_tone, header=_header, body=_body)
 
             result = eval_state.result
             if result is not None:
@@ -1534,9 +1778,14 @@ def _install_poll_timer(
         mapped = job_status_to_step_status(job.status)
         if mapped is None:
             return
-        if mapped is StepStatus.FAILED:
-            eval_state.set_error(
-                job_manager.get_error(job_id) or "Evaluation failed."
+        if job.status in ("FAILED", "CANCELLED"):
+            # The worker has failed, been cancelled or been reaped by the watchdog (it may
+            # still return later): retire its token so nothing it writes lands now.
+            eval_state.retire_run()
+            mapped = _settle_unfinished_run(
+                eval_state,
+                cancelled=job.status == "CANCELLED",
+                error=job_manager.get_error(job_id) or "Evaluation failed.",
             )
         session.set_workflow(  # type: ignore[attr-defined]
             with_status(session.workflow, WorkflowStep.EVALUATION, mapped)  # type: ignore[attr-defined]

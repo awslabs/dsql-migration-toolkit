@@ -641,6 +641,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "BIT_TYPE",
         "YEAR_TYPE",
         "VIEW_UNSUPPORTED_SQL",
+        "VIEW_DEFINITION_UNREADABLE",
         "GENERATED_COLUMN",
         "ON_UPDATE_TIMESTAMP",
         "UNSUPPORTED_INDEX_TYPE",

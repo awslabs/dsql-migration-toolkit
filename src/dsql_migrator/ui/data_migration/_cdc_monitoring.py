@@ -1857,6 +1857,14 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
     ),
     # 23514. The tool's own ENUM port is the usual CHECK (text + CHECK IN (...)), so a value
     # the source type gained is the realistic cause; a hand-added CHECK is named too.
+    # 428C9: target-side, and every insert and update is lost, like key-change.
+    "generated-column": (
+        "a GENERATED column was sent a value",
+        "the Aurora DSQL column is GENERATED (it computes its own value), and the change "
+        "records carry one, so DSQL rejected every insert and update for this table "
+        "(SQLSTATE 428C9). This is not a source change: the column was made GENERATED on "
+        "the target, which CDC cannot write",
+    ),
     "check-violation": (
         "a CHECK constraint rejected the row",
         "a value fails a CHECK constraint on the Aurora DSQL table, so DSQL rejected the rows "
@@ -2282,9 +2290,11 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
     def names(kind: str) -> str:
         return _fix_names(sorted(by_kind[kind]))
 
-    if not ddl:
+    # A GENERATED target column is no source change: its own sentence below is the repair.
+    lead = ddl - {"generated-column"}
+    if not lead:
         parts = []
-    elif ddl <= {"type-change", "key-change"}:
+    elif lead <= {"type-change", "key-change"}:
         # Neither can be "applied" with an ALTER on Aurora DSQL: their own sentences recreate.
         parts = ["CDC does not replicate DDL."]
     elif cdc_only:
@@ -2351,6 +2361,19 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
                 "new values."
             )
         parts.append(check)
+    if "generated-column" in by_kind:
+        generated = (
+            f"For {names('generated-column')} (a GENERATED column was sent a value): make it "
+            "an ordinary column on Aurora DSQL with ALTER TABLE ... ALTER COLUMN ... DROP "
+            "EXPRESSION (it keeps the stored values), so new changes apply again."
+        )
+        if not cdc_only:
+            generated += (
+                " Then backfill the rows already set aside: stop CDC and reload the table with "
+                "'Drop & reload' after removing GENERATED from its target DDL in Schema "
+                "Conversion."
+            )
+        parts.append(generated)
     if "key-change" in by_kind:
         rekeyed = _banner_rekeyed(sorted(by_kind["key-change"]), migration_state)
         parts.append(
@@ -3562,10 +3585,13 @@ def _render_cdc_schema_drift_banner(
     # and update for the table -- certain, ongoing loss, so `error` like 07006 -- but its table
     # exists, so it is not target-side and never gets the dropped-table notice below.
     _key_loss = "key-change" in _kinds
+    # EIGHT: a 428C9 (a GENERATED target column was sent a value) loses every insert and
+    # update for the table too, and is no source change at all.
+    _generated_loss = "generated-column" in _kinds
     # `error` for certain ongoing loss AND for the target-side kinds generally: a row that
     # may have vanished is not "be aware" either. `warning` is left to a source DDL change,
     # which is recoverable by applying the DDL.
-    _tone = "error" if _target_side or _key_loss else "warning"
+    _tone = "error" if _target_side or _key_loss or _generated_loss else "warning"
     if _certain_loss:
         _header = (
             "Rows are being lost — the sink cannot write this table"
@@ -3574,6 +3600,8 @@ def _render_cdc_schema_drift_banner(
         )
     elif _key_loss:
         _header = "Rows are being lost — the key no longer matches the Aurora DSQL primary key"
+    elif _generated_loss:
+        _header = "Rows are being lost — a GENERATED Aurora DSQL column was sent a value"
     elif _target_side:
         _header = "Rows may be missing from the target"
     elif _truncate_only:

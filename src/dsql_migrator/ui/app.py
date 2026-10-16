@@ -739,6 +739,14 @@ def build_page(
         # still reads the old (locked) one, so steps never unlock. Resetting the
         # SAME objects in place keeps every closure pointing at the live, wiped
         # state.
+        # A running evaluation is cancelled (it would keep reading the source for nothing);
+        # its token dies with the reset below, so nothing it returns lands in the session.
+        _eval = EVALUATION_STORE.get(session_id)
+        if _eval is not None and _eval.job_id is not None:
+            try:
+                JOB_MANAGER.request_cancel(_eval.job_id)
+            except Exception:  # noqa: BLE001 - reset is best-effort
+                pass
         SESSION_STORE.reset_in_place(session_id)
         EVALUATION_STORE.reset_in_place(session_id)
         SCHEMA_CONVERSION_STORE.reset_in_place(session_id)

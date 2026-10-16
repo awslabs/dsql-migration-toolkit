@@ -452,13 +452,18 @@ def _default_to_str(default: object) -> Optional[str]:
     return str(default)
 
 
-def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[TableDef]:
+def _reflect_tables(
+    inspector: object,
+    schema: Optional[str] = None,
+    on_table: Optional[Callable[[], None]] = None,
+) -> list[TableDef]:
     """Collect table/column/PK/index/FK structure via SQLAlchemy reflection.
 
     ``schema`` selects the database/schema to reflect; ``None`` uses the
     connection's default schema (single-database mode). Names are returned
     unqualified either way -- the caller (``_assemble_inventory`` via ``_qualify``)
-    qualifies them, in BOTH modes.
+    qualifies them, in BOTH modes. ``on_table`` is called after each table (several
+    catalog round trips): progress and liveness for a long read, and where a stop lands.
     """
     tables: list[TableDef] = []
     for table_name in inspector.get_table_names(schema=schema):  # type: ignore[attr-defined]
@@ -611,6 +616,8 @@ def _reflect_tables(inspector: object, schema: Optional[str] = None) -> list[Tab
                 comment=table_comment,
             )
         )
+        if on_table is not None:
+            on_table()
     return tables
 
 
@@ -778,6 +785,11 @@ def enrich_columns(
             # "DEFAULT_GENERATED" (expression default) is intentionally excluded.
             if "virtual generated" in extra_text or "stored generated" in extra_text:
                 column.generated = True
+                # The kind decides what CDC carries (a STORED value is in the row; a
+                # VIRTUAL one is computed on read), so it is kept, as for PostgreSQL.
+                column.generated_kind = (
+                    "STORED" if "stored generated" in extra_text else "VIRTUAL"
+                )
             if "on update" in extra_text:
                 column.auto_update_timestamp = True
             # MySQL flags an EXPRESSION default (as opposed to a literal) with
@@ -948,6 +960,7 @@ def _assemble_inventory(
     database: Optional[str],
     *,
     dialect: "SourceDialect",
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> SourceInventory:
     """Assemble a :class:`SourceInventory` from one or all schemas.
 
@@ -961,6 +974,10 @@ def _assemble_inventory(
     non-system schema of the connected database is reflected + qualified regardless (so a
     non-``public`` schema is never silently dropped). Structural reflection is
     dialect-agnostic; the ``dialect`` supplies the system schemas + engine enrichment.
+
+    ``progress(tables_read, tables_total)`` is called after each table and after each
+    schema's enrichment: the read is long on a large or remote source (several round trips
+    per table), and the caller turns it into liveness, a visible count and stop points.
     """
     if database and dialect.database_is_schema:
         # Single-database mode (MySQL): reflect the connection's default schema, then
@@ -990,14 +1007,31 @@ def _assemble_inventory(
     all_routines: list[ObjectRef] = []
     all_events: list[ObjectRef] = []
 
+    read = [0]
+    total = (
+        sum(
+            len(inspector.get_table_names(schema=reflect_schema))  # type: ignore[attr-defined]
+            for reflect_schema, _, _ in plans
+        )
+        if progress is not None
+        else 0
+    )
+
+    def _one_table() -> None:
+        read[0] += 1
+        progress(read[0], total)  # type: ignore[misc]  # only installed with progress
+
     for reflect_schema, enrich_db, qualify in plans:
-        tables = _reflect_tables(inspector, schema=reflect_schema)
+        on_table = _one_table if progress is not None else None
+        tables = _reflect_tables(inspector, schema=reflect_schema, on_table=on_table)
         views = _reflect_views(inspector, schema=reflect_schema)
         # Engine-specific enrichment (columns/indexes/partitions in place + stored
         # triggers/routines/events). No-ops for a dialect/connection without it.
         triggers, routines, events = dialect.enrich(
             connection, enrich_db, tables, views
         )
+        if progress is not None:
+            progress(read[0], total)
         # Relations with no plain-table/plain-view migration target that structural
         # reflection misses entirely (PostgreSQL materialized views + foreign tables,
         # relkinds 'm'/'f'). Carried as flagged views so Evaluation surfaces them
@@ -1025,6 +1059,46 @@ def _assemble_inventory(
         database_collation=dialect.database_collation(connection),
         sibling_databases=dialect.sibling_databases(connection),
     )
+
+
+# How long one catalog read waits for a lock another session holds (an ALTER TABLE).
+INTROSPECTION_LOCK_TIMEOUT_SECONDS = 5
+
+
+class SourceLockTimeoutError(RuntimeError):
+    """The source catalog read waited too long for a lock another session holds."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Could not read the source catalog: another session holds a lock on a table "
+            "or view it reads (for example a running ALTER TABLE). Nothing was changed; "
+            "run the evaluation again once that session finishes."
+        )
+
+
+def _limit_lock_waits(connection: object) -> None:
+    """Bound this session's lock waits (a SET: no write, and accepted by RDS Proxy)."""
+    name = getattr(getattr(connection, "dialect", None), "name", None)
+    if name == "postgresql":
+        statement = f"SET lock_timeout = '{INTROSPECTION_LOCK_TIMEOUT_SECONDS}s'"
+    elif name == "mysql":
+        statement = f"SET SESSION lock_wait_timeout = {INTROSPECTION_LOCK_TIMEOUT_SECONDS}"
+    else:
+        return
+    connection.execute(text(statement))  # type: ignore[attr-defined]
+
+
+def _is_lock_timeout(exc: BaseException) -> bool:
+    """A PostgreSQL ``lock_not_available`` (55P03) or MySQL lock-wait timeout (1205)."""
+    for candidate in (exc, getattr(exc, "orig", None)):
+        if candidate is None:
+            continue
+        if getattr(candidate, "sqlstate", None) == "55P03":
+            return True
+        args = getattr(candidate, "args", ())
+        if args and args[0] == 1205:
+            return True
+    return False
 
 
 class SourceIntrospector:
@@ -1079,7 +1153,12 @@ class SourceIntrospector:
             if engine is not None:
                 engine.dispose()
 
-    def introspect(self, conn: SourceConnectionConfig) -> SourceInventory:
+    def introspect(
+        self,
+        conn: SourceConnectionConfig,
+        *,
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> SourceInventory:
         """Extract the source inventory (Requirements 1.2, 1.3).
 
         When ``conn.database`` is set, only that database/schema is reflected; when it
@@ -1090,6 +1169,16 @@ class SourceIntrospector:
         reflection; on MySQL, ``information_schema`` is queried per schema to
         enrich triggers, routines, AUTO_INCREMENT, and collation. All access is
         read-only (Property 1).
+
+        The connection is AUTOCOMMIT: in one implicit transaction a PostgreSQL source held
+        the share locks of every table a view reads (``pg_get_viewdef``), and a MySQL
+        source its metadata locks, until the whole read ended -- minutes on a large
+        schema, blocking the application's DDL -- and one failed statement poisoned the
+        rest (25P02). A catalog read gains no consistency from one transaction anyway.
+        It also waits at most :data:`INTROSPECTION_LOCK_TIMEOUT_SECONDS` for a lock: a
+        catalog read of a table under a running ``ALTER TABLE`` otherwise waits for it
+        (MySQL's default ``lock_wait_timeout`` is a year), silently, until the watchdog.
+        ``progress`` is :func:`_assemble_inventory`'s.
         """
         from dsql_migrator.core.source_dialect import dialect_for
 
@@ -1097,10 +1186,41 @@ class SourceIntrospector:
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
+                connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+                _limit_lock_waits(connection)
                 inspector = inspect(connection)
-                return _assemble_inventory(
-                    inspector, connection, conn.database, dialect=dialect
-                )
+                try:
+                    return _assemble_inventory(
+                        inspector, connection, conn.database, dialect=dialect, progress=progress
+                    )
+                except Exception as exc:
+                    if _is_lock_timeout(exc):
+                        raise SourceLockTimeoutError() from exc
+                    raise
+        finally:
+            engine.dispose()
+
+    def listing_gaps(
+        self, conn: SourceConnectionConfig, databases: "list[str]"
+    ) -> list[str]:
+        """What the source user's privileges keep out of the inventory (one line per object
+        kind), from the source dialect; ``[]`` when nothing is, or when it cannot be told.
+        Read only (a ``SHOW GRANTS``); a failure is never an evaluation failure."""
+        from dsql_migrator.core.source_dialect import dialect_for
+
+        if not databases:
+            return []
+        dialect = dialect_for(conn.source_type)
+        try:
+            engine = self._engine_factory(conn)
+        except Exception:  # noqa: BLE001 - best effort
+            return []
+        try:
+            with engine.connect() as connection:
+                connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+                return list(dialect.listing_gaps(connection, databases))
+        except Exception:  # noqa: BLE001 - best effort
+            return []
         finally:
             engine.dispose()
 

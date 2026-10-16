@@ -10,6 +10,8 @@ MySQL path is byte-identical to before the dialect seam was introduced.
 
 from __future__ import annotations
 
+import re
+
 from typing import Optional
 
 from dsql_migrator.core.introspector import (
@@ -190,6 +192,27 @@ class MySQLSourceDialect(SourceDialect):
             return []
         return [str(row[0]) for row in rows if row]
 
+    def listing_gaps(self, connection: object, databases) -> list[str]:
+        # information_schema lists a trigger only with TRIGGER, an event only with EVENT
+        # and a routine only with SHOW_ROUTINE (or global SELECT, or a routine privilege),
+        # and a view's body needs SHOW VIEW (that one is graded per view, from the empty
+        # definition). The privileges of the session's ACTIVE roles count, so they are
+        # expanded with USING; when they cannot be, nothing is claimed.
+        from sqlalchemy import text
+
+        try:
+            roles = connection.execute(text("SELECT CURRENT_ROLE()")).scalar()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - MySQL 5.7 has no roles
+            roles = None
+        statement = "SHOW GRANTS"
+        if roles and str(roles).strip().upper() != "NONE":
+            statement = f"SHOW GRANTS FOR CURRENT_USER() USING {roles}"
+        try:
+            rows = connection.execute(text(statement)).fetchall()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - unknown: claim nothing
+            return []
+        return mysql_listing_gaps([str(row[0]) for row in rows if row], databases)
+
     @property
     def engine_display_name(self) -> str:
         return "MySQL"
@@ -229,3 +252,103 @@ class MySQLSourceDialect(SourceDialect):
 
 
 __all__ = ["MySQLSourceDialect"]
+
+
+_GRANT_LINE = re.compile(
+    r"^GRANT\s+(?P<privs>.+?)\s+ON\s+(?:(?:TABLE|FUNCTION|PROCEDURE)\s+)?(?P<scope>\S+)\s+TO\s",
+    re.IGNORECASE,
+)
+
+
+def _split_privileges(text: str) -> list[str]:
+    """``SELECT (a, b), INSERT`` -> ``["SELECT", "INSERT"]`` (column lists dropped)."""
+    privileges, depth, current = [], 0, []
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            privileges.append("".join(current))
+            current = []
+            continue
+        if depth == 0 and char not in "()":
+            current.append(char)
+    privileges.append("".join(current))
+    return [" ".join(p.split()).upper() for p in privileges if p.strip()]
+
+
+def _like(pattern: str, name: str) -> bool:
+    """MySQL's grant-scope match: ``%`` and ``_`` wildcards, ``\\`` escapes."""
+    out, escaped = [], False
+    for char in pattern:
+        if escaped:
+            out.append(re.escape(char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "%":
+            out.append(".*")
+        elif char == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(char))
+    return re.fullmatch("".join(out), name) is not None
+
+
+def mysql_listing_gaps(grant_lines: "list[str]", databases) -> list[str]:
+    """The object kinds a MySQL user with ``grant_lines`` cannot list completely, in
+    ``databases``: one human line per kind naming the databases and the privilege. Pure.
+
+    ``grant_lines`` are the SESSION's: direct grants plus those of its active roles
+    (``SHOW GRANTS ... USING``); a role that is granted but not active gives the session
+    nothing, so its membership line (``GRANT `r`@`%` TO ...``, no ``ON``) is ignored. ``[]``
+    when the grants are unknown (none read)."""
+    if not grant_lines:
+        return []
+    global_privs: set[str] = set()
+    schema_privs: dict[str, set[str]] = {}
+    for line in grant_lines:
+        match = _GRANT_LINE.match(line.strip())
+        if match is None:
+            continue
+        privileges = set(_split_privileges(match.group("privs")))
+        if "ALL" in privileges:
+            privileges.add("ALL PRIVILEGES")
+        scope = match.group("scope")
+        if scope in ("*.*", "`*`.*"):
+            global_privs |= privileges
+            continue
+        db, _, obj = scope.partition(".")
+        if obj != "*":
+            continue  # table, column or routine level: not a whole database
+        schema_privs.setdefault(db.strip("`'\""), set()).update(privileges)
+
+    def held(database: str, wanted: "set[str]") -> bool:
+        if global_privs & (wanted | {"ALL PRIVILEGES"}):
+            return True
+        return any(
+            _like(pattern, database) and privileges & (wanted | {"ALL PRIVILEGES"})
+            for pattern, privileges in schema_privs.items()
+        )
+
+    routine_global = {"SHOW_ROUTINE", "SELECT", "CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE"}
+    checks = (
+        ("triggers", "TRIGGER", {"TRIGGER"}, set()),
+        ("scheduled events", "EVENT", {"EVENT"}, set()),
+        (
+            "stored procedures and functions",
+            "SHOW_ROUTINE (or SELECT on *.*)",
+            {"CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE"},
+            routine_global,
+        ),
+    )
+    gaps: list[str] = []
+    for label, needs, schema_level, global_level in checks:
+        if global_level and global_privs & (global_level | {"ALL PRIVILEGES"}):
+            continue
+        missing = [db for db in databases if not held(db, schema_level)]
+        if missing:
+            shown = ", ".join(missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
+            gaps.append(f"{label} in {shown} (needs {needs})")
+    return gaps
