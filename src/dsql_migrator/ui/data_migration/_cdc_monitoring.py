@@ -1791,7 +1791,7 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "a NOT NULL column got no value",
         "Aurora DSQL rejected rows that carry no value for a column it requires, NOT NULL "
         "with no DEFAULT (SQLSTATE 23502): usually the source dropped that column, or now "
-        "allows NULL in it",
+        "allows NULL in it, or it is a generated column CDC does not carry",
     ),
     "type-change": (
         "column type changed at the source",
@@ -2336,8 +2336,9 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
             )
         parts.append(
             f"For {names('drop-column')} (a NOT NULL column got no value): if the source "
-            f"dropped that column, {drop} Otherwise (the source column now allows NULL, or "
-            f"your exclusions keep it out{toast}), {drop_not_null}"
+            f"dropped that column, {drop} Otherwise (the source column now allows NULL, "
+            f"your exclusions keep it out{toast}, or it is a generated column CDC does not "
+            f"carry -- Step 1 names those), {drop_not_null}"
         )
     if "nullability-change" in by_kind:
         parts.append(

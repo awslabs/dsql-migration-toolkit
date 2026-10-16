@@ -19,6 +19,7 @@ import java.util.function.BiPredicate;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import org.postgresql.util.PGobject;
 
 /**
  * Refuse, never silently change, a number its Aurora DSQL column cannot hold exactly.
@@ -92,7 +93,9 @@ final class ValueFit {
   enum Kind {
     BOOLEAN,
     INTEGRAL,
-    NUMERIC
+    NUMERIC,
+    // A time-of-day column, guarded only against a MySQL TIME duration (bound as interval).
+    TIME
   }
 
   /**
@@ -123,6 +126,10 @@ final class ValueFit {
           return new TargetType(Kind.INTEGRAL, 0, false, "integer");
         case "bigint":
           return new TargetType(Kind.INTEGRAL, 0, false, "bigint");
+        case "time without time zone":
+          return new TargetType(Kind.TIME, 0, false, "time");
+        case "time with time zone":
+          return new TargetType(Kind.TIME, 0, false, "time with time zone");
         case "numeric":
           if (precision == null || scale == null) {
             return new TargetType(
@@ -143,7 +150,11 @@ final class ValueFit {
   enum Rule {
     NOT_ZERO_OR_ONE("a number other than 0 or 1 would be stored as true or false"),
     FRACTION("a number with a fractional part would be rounded to a whole number"),
-    SCALE("a number with more than %d decimal places would be rounded");
+    SCALE("a number with more than %d decimal places would be rounded"),
+    DURATION(
+        "a MySQL TIME outside 00:00:00..24:00:00 is a duration, which a time-of-day column"
+            + " cannot hold (remap the column to interval at Schema Conversion, as for Full"
+            + " Load)");
 
     private final String phrase;
 
@@ -272,6 +283,13 @@ final class ValueFit {
     int n = Math.min(columns.size(), values.size());
     for (int i = 0; i < n; i++) {
       Object v = values.get(i);
+      if (v instanceof PGobject pg && "interval".equals(pg.getType())) {
+        TargetType target = cols.get(columns.get(i));
+        if (target != null && target.kind() == Kind.TIME) {
+          return reason(columns.get(i), target, Rule.DURATION);
+        }
+        continue;
+      }
       if (!(v instanceof Number)) {
         continue; // before the map lookup: most cells are not numbers
       }

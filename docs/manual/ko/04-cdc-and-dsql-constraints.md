@@ -118,7 +118,7 @@ Aurora DSQL에서도 삭제) — 을 알려 줌), 싱크가 바인딩할 수 없
 - 그 밖의 SQLSTATE로 인한 거부(예: `22P02`, `22007`/`22008`, `22021`, `23503`, `54000`). 그 SQLSTATE와 함께
   표시됨;
 - Aurora DSQL에 비해 너무 큰 값([§4.5](#45-1-mib-값당-한도-그리고-dlq));
-- 싱크가 변환할 수 없는 값. 예: PostgreSQL의 `timetz[]`, `bytea[]` 또는 제약 없는 `numeric[]` 컬럼;
+- 싱크가 변환할 수 없는 값. 예: PostgreSQL의 `timetz[]`, `bytea[]` 또는 제약 없는 `numeric[]` 컬럼(Evaluation이 이런 컬럼을 미리 알려 줍니다, `CDC_UNCARRYABLE_COLUMN`. 대신 NULL로 도착하는 컬럼도 함께: `interval[]`, `money[]`, `tsvector`, `tsquery`, 기하 타입 `box`, `circle`, `line`, `lseg`, `path`, `polygon`). 스칼라 `point`는 싱크 플러그인 v54부터 자신의 텍스트 `(x,y)`로 기록됩니다;
 - 소스 기본 키가 삭제된 뒤의 키 없는 변경 레코드(MySQL 또는 PostgreSQL). 레코드 자체는 분류되지 않지만, 소스
   스키마 재확인이 삭제된 키를 "primary key changed at the source"로 보고함.
 
@@ -203,9 +203,10 @@ replicated"** 배너가 표시되고, 그 테이블의 이후 변경은 계속 �
 TRUNCATE가 Full Load 시작 후 그 테이블을 복사하기 전에 실행됐다면 타깃이 이미 일치할 수 있으며, 이때는
 CHECKSUM 재확인으로 리로드 없이 보류가 풀립니다. 워크로드가 주기적으로 TRUNCATE하는 테이블(스테이징·큐
 테이블 등)은 TRUNCATE할 때마다 이 상황이 생기므로, Aurora DSQL에 그 데이터가 필요 없다면 마이그레이션에서
-제외하세요. 다루지 않는 경우: MySQL의 `ALTER TABLE … TRUNCATE PARTITION`과 `ALTER TABLE … DROP PARTITION`은
-변경 이벤트 없이 행을 지우므로 CDC는 아무것도 보고하지 않고 extra 행은 Validation에서만 보입니다. 이런
-테이블도 같은 방법으로 복구하세요. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL
+제외하세요. 다루지 않는 경우: MySQL의 `ALTER TABLE … TRUNCATE PARTITION`과 `ALTER TABLE … DROP PARTITION`
+— 그리고 PostgreSQL에서 파티션을 drop하거나 detach하는 것 — 은 변경 이벤트 없이 행을 지우므로 CDC는 아무것도
+보고하지 않고 extra 행은 Validation에서만 보입니다. 이런 테이블도 같은 방법으로 복구하거나, 컷오버까지 파티션
+관리를 멈추세요. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL
 파이프라인은 Stop CDC → Start CDC를 한 번 거친 뒤부터 TRUNCATE를 보고합니다.
 
 **드리프트 중의 지연.** 타깃에 컬럼·테이블·스키마가 없거나, 키가 바뀌었거나, 컬럼 타입이 바뀌었거나,

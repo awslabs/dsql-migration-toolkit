@@ -2165,3 +2165,96 @@ def test_the_preview_names_the_old_view_copy_even_when_the_view_exists(monkeypat
     sc._render_preview(_Ui(), preview, sc.SchemaConversionState(), lambda: None)
     assert "Object already exists on target" in headers
     assert "An earlier version's copy of this view is on the target" in headers
+
+
+def test_partitioned_table_advice_warns_about_partition_rotation_under_cdc() -> None:
+    """'No action is required ... no data is lost' -- but a partition dropped or truncated
+    during CDC leaves its rows on Aurora DSQL (no row-level delete reaches the stream)."""
+    for engine, wording in ((SourceType.MYSQL, "DROP or TRUNCATE PARTITION"),
+                            (SourceType.POSTGRES, "dropping or detaching a partition")):
+        table = _table("shop.events").model_copy(update={"partitioned": True})
+        report = CompatibilityAssessor(source_type=engine).assess(SourceInventory(tables=[table]))
+        (item,) = [i for i in report.items if i.object_name == "shop.events"]
+        (concern,) = [c for c in item.concerns if c.rule_id == "PARTITIONED_TABLE"]
+        assert "If you replicate with CDC, pause partition maintenance" in concern.recommendation
+        assert wording in concern.recommendation, engine
+
+
+def test_columns_cdc_cannot_carry_are_named_at_evaluation_as_at_step_3() -> None:
+    """text[] graded exactly like timetz[] (every change dead-letters) or interval[] (arrives
+    NULL): Step 3 found them only after the plan was made on Step 1's verdict."""
+    table = TableDef(
+        name="app.events",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="tags", mysql_type="text[]"),
+            ColumnDef(name="slots", mysql_type="time with time zone[]"),
+            ColumnDef(name="spans", mysql_type="interval[]"),
+            ColumnDef(name="area", mysql_type="box"),
+            ColumnDef(name="where_at", mysql_type="point"),
+            ColumnDef(name="amounts", mysql_type="numeric(10,2)[]"),
+        ],
+        primary_key=["id"],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=[table])
+    )
+    (item,) = [i for i in report.items if i.object_name == "app.events"]
+    (concern,) = [c for c in item.concerns if c.rule_id == "CDC_UNCARRYABLE_COLUMN"]
+    assert concern.risk.startswith("If you replicate with CDC: ")
+    assert "`slots` (time with time zone[])" in concern.risk  # dead-letters
+    assert "`spans` (interval[])" in concern.risk and "`area` (box)" in concern.risk  # NULL
+    for carried in ("`tags`", "`where_at`", "`amounts`"):
+        assert carried not in concern.risk, carried
+    assert "Full Load itself carries all of these correctly" in concern.risk
+    # The same words as Step 3's row.
+    from dsql_migrator.core.prerequisites_postgres import uncarryable_column_texts, uncarryable_columns_of
+
+    detail, remediation = uncarryable_column_texts(uncarryable_columns_of(table))
+    assert concern.risk == "If you replicate with CDC: " + detail
+    assert concern.recommendation == remediation
+
+
+def test_a_mysql_time_column_is_graded_as_schema_conversion_grades_it() -> None:
+    """Schema Conversion said MANUAL (a duration type); Evaluation said nothing."""
+    from dsql_migrator.core.converter import MYSQL_TIME_NOTE
+
+    table = _table("shop.shifts", columns=[ColumnDef(name="id", mysql_type="int"),
+                                           ColumnDef(name="worked", mysql_type="time(6)")])
+    report = CompatibilityAssessor().assess(SourceInventory(tables=[table]))
+    (item,) = [i for i in report.items if i.object_name == "shop.shifts"]
+    (concern,) = [c for c in item.concerns if c.rule_id == "TIME_TYPE"]
+    assert item.classification is Classification.MANUAL
+    assert MYSQL_TIME_NOTE in concern.risk and "(worked)" in concern.risk
+    assert "If you replicate with CDC" in concern.risk and "interval" in concern.recommendation
+    notes = SchemaConverter().convert_table(table, None).warnings  # type: ignore[arg-type]
+    assert any(MYSQL_TIME_NOTE in w.message for w in notes)
+
+
+def test_a_not_null_generated_column_cdc_never_carries_says_what_cdc_does() -> None:
+    """Every CDC insert leaves such a column out, so the target refuses it (23502), and the
+    CDC step called it a column the source dropped."""
+    pg_table = TableDef(
+        name="app.items",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="label", mysql_type="text", nullable=False, generated=True,
+                      generated_kind="VIRTUAL", generated_expression="upper(name)"),
+        ],
+        primary_key=["id"],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=[pg_table])
+    )
+    (item,) = [i for i in report.items if i.object_name == "app.items"]
+    risk = " ".join(c.risk for c in item.concerns if c.rule_id == "GENERATED_COLUMN")
+    assert "label is NOT NULL: if you replicate with CDC" in risk and "23502" in risk
+    my_table = _table("shop.orders", columns=[
+        ColumnDef(name="id", mysql_type="int"),
+        ColumnDef(name="label", mysql_type="text", nullable=False, generated=True,
+                  generated_kind="VIRTUAL"),
+    ])
+    report = CompatibilityAssessor().assess(SourceInventory(tables=[my_table]))
+    (item,) = [i for i in report.items if i.object_name == "shop.orders"]
+    (concern,) = [c for c in item.concerns if c.rule_id == "GENERATED_COLUMN"]
+    assert "label is NOT NULL, so such a row is refused instead (SQLSTATE 23502" in concern.risk

@@ -431,6 +431,17 @@ _MYSQL_IDENTITY_INTEGERS = frozenset(
 )
 
 
+# What becomes of a MySQL TIME column (the conversion note; Evaluation's TIME_TYPE finding
+# repeats it, adding what CDC does).
+MYSQL_TIME_NOTE = (
+    "MySQL TIME is a duration (-838:59:59..838:59:59); Aurora DSQL 'time' is "
+    "a time-of-day (00:00:00..24:00:00). In-range values convert cleanly, but "
+    "any value outside that range has no 'time' representation and fails per "
+    "row during Full Load. If this column stores durations, remap it to "
+    "interval or text (the converted DDL is editable) before loading."
+)
+
+
 def mysql_identity_is_lossless(table: TableDef) -> bool:
     """Whether a MySQL ``AUTO_INCREMENT`` key can become a ``bigint`` identity without
     losing a value: an integer column, other than ``bigint unsigned`` (whose range
@@ -891,13 +902,7 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
         # YEAR pattern) instead of surfacing only mid-load on the offending row.
         return _Mapping(
             target=data_type,
-            message=(
-                "MySQL TIME is a duration (-838:59:59..838:59:59); Aurora DSQL 'time' is "
-                "a time-of-day (00:00:00..24:00:00). In-range values convert cleanly, but "
-                "any value outside that range has no 'time' representation and fails per "
-                "row during Full Load. If this column stores durations, remap it to "
-                "interval or text (the converted DDL is editable) before loading."
-            ),
+            message=MYSQL_TIME_NOTE,
             classification=Classification.MANUAL,
         )
 
@@ -3395,6 +3400,15 @@ def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
             "and does not store it. Full Load copies the computed value, but a change event "
             "may not carry it, so a row CDC writes can be left without it (NULL)."
         )
+        required = [c.name for c in columns if c.generated_kind == "VIRTUAL" and not c.nullable]
+        if required:
+            parts.append(
+                f"{', '.join(required)} {'is' if len(required) == 1 else 'are'} NOT NULL, "
+                "so such a row is refused instead (SQLSTATE 23502, shown on the CDC step "
+                "as a column the source dropped): choose Full load only for this table, or "
+                "drop the NOT NULL from the target DDL before applying (Aurora DSQL cannot "
+                "add it back afterwards)."
+            )
     if unknown:
         parts.append(
             f"({', '.join(unknown)}): Full Load copies the value MySQL computed."

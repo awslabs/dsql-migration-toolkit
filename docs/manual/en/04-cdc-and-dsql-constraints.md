@@ -151,7 +151,11 @@ shows up only in the dead-letter queue card:
 - a value too large for Aurora DSQL
   ([§4.5](#45-the-1-mib-per-value-limit-and-the-dlq));
 - a value the sink cannot convert, for example a PostgreSQL `timetz[]`, `bytea[]` or
-  unconstrained `numeric[]` column;
+  unconstrained `numeric[]` column (Evaluation names such columns in advance,
+  `CDC_UNCARRYABLE_COLUMN`, with the columns that arrive NULL instead: `interval[]`,
+  `money[]`, `tsvector`, `tsquery`, and the geometric types `box`, `circle`, `line`, `lseg`,
+  `path`, `polygon`); a scalar `point` is written as its own text `(x,y)` since sink plugin
+  v54;
 - a change record with no key after the source primary key was dropped (MySQL or
   PostgreSQL). The record itself is not classified, but the source schema re-check
   reports the dropped key as "primary key changed at the source".
@@ -258,8 +262,9 @@ target may already match; the CHECKSUM re-check then clears the hold with no rel
 table your workload truncates routinely (a staging or queue table) raises this on every
 `TRUNCATE`; leave it out of the migration if you don't need its data on Aurora DSQL. Not
 covered: on MySQL, `ALTER TABLE … TRUNCATE PARTITION` and `ALTER TABLE … DROP PARTITION`
-remove rows without any change event, so CDC reports nothing and only Validation shows
-the extra rows; repair such a table the same way. A MySQL pipeline that was already
+— and on PostgreSQL, dropping or detaching a partition — remove rows without any change
+event, so CDC reports nothing and only Validation shows the extra rows; repair such a
+table the same way, or pause partition maintenance until cut over. A MySQL pipeline that was already
 streaming when you upgraded from an earlier version of the tool starts reporting
 `TRUNCATE` after one Stop CDC → Start CDC.
 

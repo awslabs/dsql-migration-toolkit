@@ -539,6 +539,11 @@ final class DebeziumEvents {
     if (pgSource && DebeziumTypeConverter.BITS_TYPE.equals(fieldSchema.name())) {
       return DebeziumTypeConverter.pgBitString(raw, fieldSchema);
     }
+    // A PostgreSQL point lands in a text column as its own text, as Full Load writes it; a
+    // MySQL POINT keeps the WKB bytes its bytea column holds.
+    if (pgSource && DebeziumTypeConverter.POINT_TYPE.equals(fieldSchema.name())) {
+      return DebeziumTypeConverter.pgPointText(raw);
+    }
     // A PostgreSQL ARRAY column. Schema Conversion stores it as jsonb (DSQL has no array
     // type) and the Full Load wrote PostgreSQL's own to_jsonb text, so render the same --
     // see DebeziumTypeConverter.pgArrayAsJsonb. Gated on ARRAY rather than on a schema NAME

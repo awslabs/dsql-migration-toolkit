@@ -29,6 +29,8 @@ _EXPECTED_PG_RULE_IDS = {
     "PG_CHARACTER_LENGTH",
     # A view whose definition the source did not return (shared, PG wording).
     "VIEW_DEFINITION_UNREADABLE",
+    # PG-specific: a column type a CDC change event cannot carry (Step 3's classifier).
+    "CDC_UNCARRYABLE_COLUMN",
     "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
     "TRIGGER_UNSUPPORTED",

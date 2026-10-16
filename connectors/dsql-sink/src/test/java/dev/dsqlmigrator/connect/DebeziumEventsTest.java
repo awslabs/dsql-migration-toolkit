@@ -279,6 +279,35 @@ class DebeziumEventsTest {
   }
 
   @Test
+  void aPostgresPointLandsAsTextWhileAMysqlPointKeepsItsWkb() {
+    Schema point = SchemaBuilder.struct()
+        .name(DebeziumTypeConverter.POINT_TYPE)
+        .field("x", Schema.FLOAT64_SCHEMA)
+        .field("y", Schema.FLOAT64_SCHEMA)
+        .field("wkb", Schema.OPTIONAL_BYTES_SCHEMA)
+        .field("srid", Schema.OPTIONAL_INT32_SCHEMA)
+        .optional()
+        .build();
+    Schema row = SchemaBuilder.struct().name("Row")
+        .field("id", Schema.INT64_SCHEMA).field("at", point).optional().build();
+    Schema env = SchemaBuilder.struct().name("Envelope")
+        .field("op", Schema.STRING_SCHEMA).field("after", row).field("source", ENGINE_SOURCE).build();
+    byte[] wkb = {1, 2, 3};
+    Struct at = new Struct(point).put("x", 1.5).put("y", 2.0).put("wkb", wkb);
+    for (String connector : List.of("postgresql", "mysql")) {
+      Struct value = new Struct(env).put("op", "c")
+          .put("after", new Struct(row).put("id", 1L).put("at", at))
+          .put("source", engineSource(connector, "places"));
+      Object landed = DebeziumEvents.parse(record(key(1L), value, "dsqlcdc.app.places")).values().get(1);
+      if (connector.equals("postgresql")) {
+        assertEquals("(1.5,2)", landed); // point_out's text, as Full Load writes it
+      } else {
+        assertEquals(wkb, landed); // the bytea column's WKB
+      }
+    }
+  }
+
+  @Test
   void unchangedToastTextColumnOmittedFromUpsert() {
     // On a PostgreSQL UPDATE, an unchanged TOASTed text column arrives as the sentinel.
     // The sink must OMIT it (so ON CONFLICT DO UPDATE keeps the existing value), not bind

@@ -970,7 +970,15 @@ class PartitionedTableRule(Rule):
                             "the partitioning automatically and no data is lost (do NOT "
                             "change the source -- this tool only reads it). What needs a "
                             "decision is whatever depended on the partitions, as described "
-                            "above."
+                            "above. If you replicate with CDC, pause partition maintenance "
+                            "until cut over, or plan to delete those rows on the target: "
+                            + (
+                                "dropping or detaching a partition"
+                                if self._is_postgres
+                                else "DROP or TRUNCATE PARTITION"
+                            )
+                            + " removes rows without a row-level delete CDC can carry, so "
+                            "they stay on Aurora DSQL."
                         ),
                         effort=EffortLevel.MEDIUM,
                         # Advisory, matching the converter's own grading of the same fact:
@@ -1696,6 +1704,45 @@ class YearTypeRule(Rule):
                         recommendation=(
                             "Treat the column as an integer year in the "
                             "application."
+                        ),
+                        effort=EffortLevel.SIMPLE,
+                    )
+                )
+        return findings
+
+
+class TimeTypeRule(Rule):
+    """Flag MySQL TIME columns: a duration type, where Aurora DSQL's time is a time of day.
+
+    Schema Conversion graded TIME MANUAL while Evaluation said nothing, so a table of TIME
+    durations read Ready at Step 1 and then failed row by row. The text is the conversion
+    note's, plus what CDC does with an out-of-range value since sink plugin v54."""
+
+    rule_id = "TIME_TYPE"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import MYSQL_TIME_NOTE
+
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column.name for column in table.columns if _base_type(column.mysql_type) == "time"
+            ]
+            if columns:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"Columns ({', '.join(columns)}): {MYSQL_TIME_NOTE} If you "
+                            "replicate with CDC, a change carrying such a value is "
+                            "dead-lettered with that reason for a time column; with the "
+                            "column remapped to interval, CDC writes it as an interval."
+                        ),
+                        recommendation=(
+                            "Only time-of-day values: no action. Durations: remap the "
+                            "column to interval in Schema Conversion before loading."
                         ),
                         effort=EffortLevel.SIMPLE,
                     )
@@ -2598,6 +2645,7 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         TinyIntBooleanRule(),
         BitTypeRule(),
         YearTypeRule(),
+        TimeTypeRule(),
         GeneratedColumnRule(),
         AutoUpdateTimestampRule(),
         UnsupportedIndexTypeRule(),

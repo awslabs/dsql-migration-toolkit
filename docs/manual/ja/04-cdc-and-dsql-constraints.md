@@ -84,7 +84,7 @@ DSQL のターゲットスキーマは **Schema Conversion** ステップの実�
 - そのほかの SQLSTATE による拒否 (たとえば `22P02`、`22007`/`22008`、`22021`、`23503`、`54000`)。その SQLSTATE
   とともに表示されます。
 - Aurora DSQL には大きすぎる値 ([§4.5](#45-値ごとの-1-mib-上限および-dlq))。
-- sink が変換できない値。たとえば PostgreSQL の `timetz[]`、`bytea[]`、または制約のない `numeric[]` 列。
+- sink が変換できない値。たとえば PostgreSQL の `timetz[]`、`bytea[]`、または制約のない `numeric[]` 列 (Evaluation はこのような列を事前に示します、`CDC_UNCARRYABLE_COLUMN`。代わりに NULL で届く列も併せて: `interval[]`、`money[]`、`tsvector`、`tsquery`、幾何型 `box`、`circle`、`line`、`lseg`、`path`、`polygon`)。スカラーの `point` はシンクプラグイン v54 以降、自身のテキスト `(x,y)` として書き込まれます。
 - ソースの主キーが削除された後のキーのない変更レコード (MySQL または PostgreSQL)。レコード自体は分類されませんが、
   ソーススキーマの再確認が削除されたキーを "primary key changed at the source" として報告します。
 
@@ -172,8 +172,9 @@ TRUNCATE が Full Load の開始後、そのテーブルのコピー前に実行
 あり、その場合は CHECKSUM の再確認でリロードなしに保留が解除されます。ワークロードが定期的に TRUNCATE する
 テーブル（ステージングやキューのテーブルなど）は TRUNCATE のたびにこの状態になるため、Aurora DSQL でその
 データが不要なら移行対象から外してください。対象外: MySQL の `ALTER TABLE … TRUNCATE PARTITION` と
-`ALTER TABLE … DROP PARTITION` は変更イベントを生成せずに行を削除するため、CDC は何も報告せず、余分な行は
-Validation でしか確認できません。そのようなテーブルも同じ方法で修復してください。以前のバージョンのツールから
+`ALTER TABLE … DROP PARTITION` — および PostgreSQL でのパーティションの drop・detach — は変更イベントを生成せずに
+行を削除するため、CDC は何も報告せず、余分な行は Validation でしか確認できません。そのようなテーブルも同じ方法で
+修復するか、カットオーバーまでパーティションの保守を止めてください。以前のバージョンのツールから
 アップグレードした時点ですでにストリーミング中だった MySQL パイプラインは、Stop CDC → Start CDC を 1 回
 行った後から TRUNCATE を報告します。
 

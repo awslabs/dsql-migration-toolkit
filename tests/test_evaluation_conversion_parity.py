@@ -153,8 +153,6 @@ _PG_CORPUS = [
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
 # conversion reports that Evaluation does not). Close one => delete its line.
 _KNOWN_GAPS = {
-    # MySQL TIME holds durations beyond 24h that PostgreSQL time rejects.
-    ("mysql", "app.time_col", "LOSS"),
     # A functional index the introspector reflects only partially is skipped.
     ("mysql", "app.expr_idx", "LOSS"),
     # A partial UNIQUE index loses its predicate on Aurora DSQL.

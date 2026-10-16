@@ -317,6 +317,14 @@ def test_binlog_and_gtid_checks() -> None:
     assert check_binlog_row_format(good).status == PrerequisiteStatus.PASS
     bad = {"log_bin": "ON", "binlog_format": "STATEMENT", "binlog_row_image": "FULL"}
     assert check_binlog_row_format(bad).status == PrerequisiteStatus.FAIL
+    # PARTIAL_JSON logs a JSON UPDATE as a diff CDC cannot apply: a FAIL that says so.
+    partial = {**good, "binlog_row_value_options": "PARTIAL_JSON"}
+    result = check_binlog_row_format(partial)
+    assert result.status == PrerequisiteStatus.FAIL and "PARTIAL_JSON" in result.detail
+    assert "binlog_row_value_options" in result.remediation
+    assert check_binlog_row_format({**good, "binlog_row_value_options": ""}).status == (
+        PrerequisiteStatus.PASS
+    )
     assert check_gtid_mode({"gtid_mode": "ON"}).status == PrerequisiteStatus.PASS
     # GTID is recommended, not required: off -> non-blocking INFO (an optional
     # recommendation, NOT a WARN that implies something is wrong; Property 14).

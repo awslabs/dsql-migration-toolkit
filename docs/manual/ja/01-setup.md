@@ -83,7 +83,9 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 > 必要です。** 以下の手順は、このツールが対象とするマネージド(RDS/Aurora)方式です。
 
 - **MySQL ソース — バイナリログが ROW 形式・完全な行イメージで有効になっている必要があります** —
-  `log_bin=ON`、`binlog_format=ROW`、`binlog_row_image=FULL`。これは CDC の **必須要件** です
+  `log_bin=ON`、`binlog_format=ROW`、`binlog_row_image=FULL`、そして MySQL 8.0 以降では
+  `binlog_row_value_options` を空のままにします (`PARTIAL_JSON` は JSON の更新を CDC が適用できない差分として
+  記録します)。これは CDC の **必須要件** です
   (満たされていないとゲートが CDC を失敗扱いにします)。マネージド MySQL での設定方法:
   - **RDS for MySQL:** `log_bin` を **直接オンにすることはできず**、`my.cnf` も **編集できません**。
     代わりに **自動バックアップ** を有効にすると(バックアップ保持期間を > 0 に設定)バイナリ

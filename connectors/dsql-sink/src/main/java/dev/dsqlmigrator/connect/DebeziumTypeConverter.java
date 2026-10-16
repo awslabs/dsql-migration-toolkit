@@ -204,8 +204,10 @@ final class DebeziumTypeConverter {
   /**
    * Convert microseconds-since-midnight to a {@link java.time.LocalTime}. MySQL TIME
    * can exceed 24h or be negative (range -838:59:59..838:59:59); such a value has no
-   * {@code time} representation, so it is left to bind as-is (failing loudly to the
-   * DLQ) rather than being silently wrapped. In-range values bind cleanly.
+   * {@code time} representation and is bound as an {@code interval} instead -- never
+   * silently wrapped -- which a column remapped to interval stores and ValueFit refuses,
+   * by name, for a time column. Exactly 24:00:00 is PostgreSQL time's own upper bound.
+   * In-range values bind cleanly.
    *
    * <p><b>Returns {@code LocalTime}, NOT {@code java.sql.Time}.</b>
    * {@code java.sql.Time} holds only hour/minute/second -- {@code Time.valueOf(LocalTime)}
@@ -218,10 +220,81 @@ final class DebeziumTypeConverter {
    * interpret the millis in the JVM's local zone).
    */
   private static Object microsToTime(long micros) {
-    if (micros < 0 || micros >= 86_400L * MICROS_PER_SECOND) {
-      return micros; // out of [0,24h): cannot represent as time — fail loudly
+    if (micros == 86_400L * MICROS_PER_SECOND) {
+      // PostgreSQL's time holds 24:00:00 exactly; LocalTime cannot.
+      return pgObject("time", "24:00:00");
+    }
+    if (micros < 0 || micros > 86_400L * MICROS_PER_SECOND) {
+      // A MySQL TIME outside a day is a DURATION. Bound as an interval it lands in a column
+      // remapped to interval (Schema Conversion's advice, and what Full Load writes there);
+      // for a time column ValueFit refuses it by name (Rule.DURATION) instead of the bind
+      // error that used to read as "the column's type changed at the source".
+      return pgObject("interval", intervalText(micros));
     }
     return java.time.LocalTime.ofNanoOfDay(micros * NANOS_PER_MICRO);
+  }
+
+  /** {@code [-]HH:MM:SS[.ffffff]} of a duration in microseconds (hours not capped at 24). */
+  static String intervalText(long micros) {
+    long abs = Math.abs(micros);
+    long hours = abs / 3_600_000_000L;
+    long rest = abs % 3_600_000_000L;
+    long minutes = rest / 60_000_000L;
+    rest %= 60_000_000L;
+    long seconds = rest / MICROS_PER_SECOND;
+    long fraction = rest % MICROS_PER_SECOND;
+    String text = String.format(
+        java.util.Locale.ROOT, "%s%02d:%02d:%02d", micros < 0 ? "-" : "", hours, minutes, seconds);
+    return fraction == 0 ? text : text + String.format(java.util.Locale.ROOT, ".%06d", fraction);
+  }
+
+  /**
+   * A PostgreSQL {@code point} as its own text, {@code (x,y)} -- PostgreSQL SOURCE only (gated in
+   * {@link DebeziumEvents}). Its Aurora DSQL column is text (DSQL has no point), and Full Load
+   * writes the source's {@code point_out} text there; binding the Debezium Point's WKB bytes, as
+   * the MySQL spatial path does, wrote something else. The coordinates are rendered like
+   * {@code float8out} (shortest round-trip digits, exponent outside 1e-4..1e15).
+   */
+  static Object pgPointText(Object value) {
+    if (!(value instanceof Struct)) {
+      return value;
+    }
+    Object x = ((Struct) value).get("x");
+    Object y = ((Struct) value).get("y");
+    if (!(x instanceof Number) || !(y instanceof Number)) {
+      throw new DataException("A PostgreSQL point arrived without its x/y coordinates");
+    }
+    return "(" + pgFloat8Text(((Number) x).doubleValue()) + ","
+        + pgFloat8Text(((Number) y).doubleValue()) + ")";
+  }
+
+  /**
+   * {@code value} as PostgreSQL's {@code float8out} prints it (PostgreSQL 12+ with the default
+   * {@code extra_float_digits}): the shortest digits that round-trip, plain between 1e-4 and
+   * 1e15 and exponential ({@code 1.5e+20}, {@code 1e-05}) outside, {@code NaN},
+   * {@code Infinity}, and {@code -0}.
+   */
+  static String pgFloat8Text(double value) {
+    if (Double.isNaN(value)) {
+      return "NaN";
+    }
+    if (Double.isInfinite(value)) {
+      return value > 0 ? "Infinity" : "-Infinity";
+    }
+    if (value == 0.0) {
+      return 1.0 / value < 0 ? "-0" : "0";
+    }
+    BigDecimal shortest = shortestDecimal(Math.abs(value), false).stripTrailingZeros();
+    int exponent = shortest.precision() - shortest.scale() - 1;
+    String sign = value < 0 ? "-" : "";
+    if (exponent >= -4 && exponent < 15) {
+      return sign + shortest.toPlainString();
+    }
+    String digits = shortest.unscaledValue().toString();
+    String mantissa = digits.length() == 1 ? digits : digits.charAt(0) + "." + digits.substring(1);
+    int magnitude = Math.abs(exponent);
+    return sign + mantissa + "e" + (exponent < 0 ? "-" : "+") + (magnitude < 10 ? "0" : "")
+        + magnitude;
   }
 
   /**
@@ -687,7 +760,18 @@ final class DebeziumTypeConverter {
       out.append('0'); // both +0 and -0: measured to_jsonb(ARRAY[0::float8,'-0'::float8]) -> [0, 0]
       return;
     }
-    double magnitude = Math.abs(value);
+    BigDecimal shortest = shortestDecimal(Math.abs(value), singlePrecision);
+    if (value < 0) {
+      out.append('-');
+    }
+    out.append(shortest.stripTrailingZeros().toPlainString());
+  }
+
+  /**
+   * The decimal with the fewest significant digits that still rounds to {@code magnitude}
+   * (finite, positive) -- strictly inside the half-ulp interval around it.
+   */
+  private static BigDecimal shortestDecimal(double magnitude, boolean singlePrecision) {
     BigDecimal exact = new BigDecimal(magnitude);
     BigDecimal below =
         new BigDecimal(
@@ -699,19 +783,14 @@ final class DebeziumTypeConverter {
         Double.isInfinite(aboveValue) // the finite maximum: mirror the lower half-ulp
             ? exact.add(exact.subtract(low))
             : exact.add(new BigDecimal(aboveValue)).divide(TWO);
-    BigDecimal shortest = exact;
     int maxDigits = singlePrecision ? 9 : 17;
     for (int digits = 1; digits <= maxDigits; digits++) {
       BigDecimal candidate = exact.round(new MathContext(digits, RoundingMode.HALF_EVEN));
       if (candidate.compareTo(low) > 0 && candidate.compareTo(high) < 0) {
-        shortest = candidate;
-        break;
+        return candidate;
       }
     }
-    if (value < 0) {
-      out.append('-');
-    }
-    out.append(shortest.stripTrailingZeros().toPlainString());
+    return exact;
   }
 
   /** Escape a string the way PostgreSQL's JSON output does. */

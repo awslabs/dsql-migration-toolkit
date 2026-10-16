@@ -209,8 +209,9 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   イベントをデッドレターにし、CDC ステップにテーブル名を表示します。余分な行を削除し（Full Load + CDC は
   Drop & reload、CDC only は手動削除）、そのテーブルが CHECKSUM で一致するまで Cut over は保留されます
   （[第 4 章 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-は-スキーマ-ではなく-データ-を複製する--重要) を参照）。
-  MySQL の `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` は変更イベントを一切生成せず、余分な行は
-  Validation でしか確認できません。以前のバージョンのツールからアップグレードした時点ですでにストリーミング中
+  MySQL の `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` — および PostgreSQL でのパーティションの
+  drop・detach — は変更イベントを一切生成せず、余分な行は Validation でしか確認できません。カットオーバーまで
+  パーティションの保守を止めてください。以前のバージョンのツールからアップグレードした時点ですでにストリーミング中
   だった MySQL パイプラインは、Stop CDC → Start CDC を 1 回行った後から `TRUNCATE` を検出します。
 - **MySQL: CDC 開始位置と、その位置を使う Start との間のスキーマ変更。** 新しい開始位置をシードする
   MySQL の Start は Debezium を `snapshot.mode=recovery` で実行します: Full Load のウォーターマークまたは

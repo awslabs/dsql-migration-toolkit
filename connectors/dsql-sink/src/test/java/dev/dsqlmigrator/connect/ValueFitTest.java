@@ -196,6 +196,28 @@ class ValueFitTest {
   }
 
   @Test
+  void aMysqlTimeDurationIsRefusedByNameForATimeColumnOnly() throws Exception {
+    // Bound as an interval (the sink's conversion of a TIME outside a day): a time column
+    // used to reject it with a bind error that read as "the column type changed".
+    org.postgresql.util.PGobject duration = new org.postgresql.util.PGobject();
+    duration.setType("interval");
+    duration.setValue("838:59:59");
+    ChangeEvent shift =
+        ChangeEvent.upsert(
+            "shop.shifts", List.of("id", "worked"), List.of(1L, duration), List.of("id"),
+            List.of(1L), 0L);
+    ValueFit.TargetType time = ValueFit.TargetType.fromCatalog("time without time zone", null, null);
+    String reason = ValueFit.refusal(shift, Map.of("worked", time), c -> false);
+    assertNotNull(reason);
+    assertTrue(reason.startsWith(ValueFit.REASON_PREFIX), reason);
+    assertTrue(reason.contains("'worked' of type time: a MySQL TIME outside"), reason);
+    assertFalse(reason.contains("838"), reason); // value-free
+    // A column remapped to interval is not guarded: the value lands.
+    assertNull(ValueFit.TargetType.fromCatalog("interval", null, null));
+    assertNull(ValueFit.refusal(shift, Map.of(), c -> false));
+  }
+
+  @Test
   void refusalSkipsDeletesUnknownColumnsAndNamesTheFirstUnfitColumn() {
     ChangeEvent delete =
         ChangeEvent.delete("shop.orders", List.of("id"), List.of(new BigDecimal("5.5")), 0L);
@@ -339,6 +361,8 @@ class ValueFitTest {
                   case NOT_ZERO_OR_ONE -> "not-0-or-1";
                   case FRACTION -> "fraction";
                   case SCALE -> "scale";
+                  // Never from a number: only an interval bound for a time column.
+                  case DURATION -> "duration";
                 };
         assertEquals(f[7], verdict, line);
         rows++;

@@ -312,6 +312,51 @@ class DebeziumTypeConverterTest {
   }
 
   @Test
+  void aMysqlTimeOutsideADayIsBoundAsAnInterval() {
+    // A MySQL TIME is a duration (-838:59:59..838:59:59): bound as an interval it lands in
+    // a column remapped to interval, and ValueFit refuses it by name for a time column.
+    long over = (838L * 3600 + 59 * 60 + 59) * 1_000_000L;
+    PGobject interval = assertInstanceOf(
+        PGobject.class, DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, over));
+    assertEquals("interval", interval.getType());
+    assertEquals("838:59:59", interval.getValue());
+    PGobject negative = assertInstanceOf(PGobject.class,
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, -1_500_000L));
+    assertEquals("-00:00:01.500000", negative.getValue());
+    // Exactly 24:00:00 is PostgreSQL time's own upper bound.
+    PGobject midnight = assertInstanceOf(PGobject.class,
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, 86_400L * 1_000_000L));
+    assertEquals("time", midnight.getType());
+    assertEquals("24:00:00", midnight.getValue());
+  }
+
+  @Test
+  void aPostgresPointIsWrittenAsItsOwnText() {
+    // Its Aurora DSQL column is text, and Full Load writes point_out's text there.
+    // The Debezium Point struct's shape (io.debezium.data.geometry.Point).
+    Schema point = SchemaBuilder.struct()
+        .name(DebeziumTypeConverter.POINT_TYPE)
+        .field("x", Schema.FLOAT64_SCHEMA)
+        .field("y", Schema.FLOAT64_SCHEMA)
+        .field("wkb", Schema.OPTIONAL_BYTES_SCHEMA)
+        .field("srid", Schema.OPTIONAL_INT32_SCHEMA)
+        .build();
+    Struct value = new Struct(point).put("x", 1.5).put("y", -2.0);
+    assertEquals("(1.5,-2)", DebeziumTypeConverter.pgPointText(value));
+    // float8out: plain between 1e-4 and 1e15, exponential outside, -0 kept.
+    assertEquals("1e+20", DebeziumTypeConverter.pgFloat8Text(1e20));
+    assertEquals("1.5e-05", DebeziumTypeConverter.pgFloat8Text(1.5e-5));
+    assertEquals("0.0001", DebeziumTypeConverter.pgFloat8Text(1e-4));
+    assertEquals("100000000000000", DebeziumTypeConverter.pgFloat8Text(1e14));
+    assertEquals("1e+15", DebeziumTypeConverter.pgFloat8Text(1e15));
+    assertEquals("0.1", DebeziumTypeConverter.pgFloat8Text(0.1));
+    assertEquals("-0", DebeziumTypeConverter.pgFloat8Text(-0.0));
+    assertEquals("NaN", DebeziumTypeConverter.pgFloat8Text(Double.NaN));
+    assertEquals("-Infinity", DebeziumTypeConverter.pgFloat8Text(Double.NEGATIVE_INFINITY));
+    assertEquals("1.7976931348623157e+308", DebeziumTypeConverter.pgFloat8Text(Double.MAX_VALUE));
+  }
+
+  @Test
   void timeMillisToLocalTimeKeepsMilliseconds() {
     // io.debezium.time.Time (millis since midnight, MySQL TIME(1-3)) -> LocalTime with
     // the millis preserved (01:02:03.456), same as the micro-precision path.
@@ -322,11 +367,13 @@ class DebeziumTypeConverterTest {
   }
 
   @Test
-  void outOfRangeTimePassesThroughToFailLoudly() {
-    // >= 24h has no `time` representation -> left as the raw long (DLQ'd downstream).
+  void outOfRangeTimeIsNeverWrappedIntoADay() {
+    // > 24h has no `time` representation: bound as the interval it is (never 06:00:00),
+    // which a time column refuses by name (ValueFit.Rule.DURATION).
     long micros = 30L * 3600L * 1_000_000L; // 30h
-    Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, micros);
-    assertEquals(micros, r);
+    PGobject r = assertInstanceOf(
+        PGobject.class, DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIME, micros));
+    assertEquals("30:00:00", r.getValue());
   }
 
   // --- Integration: the converter is wired into DebeziumEvents.extractStruct ---

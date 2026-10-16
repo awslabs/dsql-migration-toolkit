@@ -19,6 +19,7 @@ import this lazily without a cycle. All strings are English, credential-free (Pr
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence
 
@@ -100,21 +101,37 @@ _CDC_UNCARRYABLE_ARRAY_ELEMENTS = {
     "xml": UNCARRYABLE_COLUMN_ARRIVES_NULL,
     "point": UNCARRYABLE_COLUMN_ARRIVES_NULL,
     "name": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    # The types the shipped Debezium 2.7.4 PostgresValueConverter has no converter for at
+    # all (scalar or array: it handles none of PGbox/PGcircle/PGline/PGlseg/PGpath/
+    # PGpolygon, nor tsquery), so the column is left out of every change event.
+    "box": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "circle": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "line": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "lseg": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "path": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "polygon": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "tsquery": UNCARRYABLE_COLUMN_ARRIVES_NULL,
+    "tsvector": UNCARRYABLE_COLUMN_ARRIVES_NULL,
     # (B) but WRONG rather than absent: to_jsonb writes ["42"] (a quoted string) while the
     # event carries an unnamed int64 array, so the target renders [42].
     "oid": UNCARRYABLE_COLUMN_ARRIVES_WRONG,
 }
 
 # SCALAR types with the same problem. Scalar timetz / interval / money / xml / point have
-# real Debezium converters and replicate fine -- it is only their ARRAY forms above that do
-# not -- so listing them here would warn about columns that work.
+# real Debezium converters and replicate fine (a point since sink plugin v54, which writes it
+# as its own text rather than WKB bytes) -- it is only their ARRAY forms above that do not --
+# so listing them here would warn about columns that work. The types with no converter at
+# all are listed in both maps.
 #
 # ``bit`` / ``varbit`` are the exception and are NOT in this map: their outcome depends on
 # the DECLARED WIDTH, so they are handled by the length-aware arm in
 # :func:`classify_uncarryable_cdc_column`. An earlier version of this comment asserted that
 # scalar bit/varbit "replicate fine"; live measurement on Aurora PostgreSQL 17.7 refuted it
 # for three of the four width bands (see that function).
-_CDC_UNCARRYABLE_SCALARS = {"tsvector": UNCARRYABLE_COLUMN_ARRIVES_NULL}
+_CDC_UNCARRYABLE_SCALARS = {
+    name: UNCARRYABLE_COLUMN_ARRIVES_NULL
+    for name in ("tsvector", "tsquery", "box", "circle", "line", "lseg", "path", "polygon")
+}
 
 # The widest bit string the remodeled target column can hold. MUST stay equal to the sink's
 # own ``DebeziumTypeConverter.MAX_STORABLE_BIT_LENGTH`` (Aurora DSQL's documented
@@ -167,6 +184,58 @@ def classify_uncarryable_cdc_column(
     if base_type_name == "numeric" and element_typmod != -1:
         return None
     return _CDC_UNCARRYABLE_ARRAY_ELEMENTS.get(base_type_name)
+
+
+# format_type spellings whose pg_catalog name differs (the classifier keys on the latter).
+_FORMAT_TYPE_CATALOG_NAMES = {"time with time zone": "timetz", "bit varying": "varbit"}
+
+
+def _catalog_discriminators(declared: str) -> "tuple[bool, str, int]":
+    """``(is_array, pg_catalog base name, atttypmod stand-in)`` from a ``format_type``
+    spelling such as ``numeric(10,2)[]``, ``bit varying(5)`` or ``time with time zone[]``.
+    The typmod stand-in is what the classifier reads: -1 for an unconstrained numeric or an
+    unbounded bit varying, the declared width for bit / bit varying, and 1 for any
+    constrained numeric (only "is it -1" matters there)."""
+    text = " ".join((declared or "").lower().split())
+    is_array = text.endswith("[]")
+    while text.endswith("[]"):
+        text = text[:-2].rstrip()
+    modifier = re.search(r"\(([^)]*)\)", text)
+    base = " ".join(re.sub(r"\([^)]*\)", "", text).split())
+    if base.startswith("interval"):
+        base = "interval"  # interval day to second, interval(3)
+    base = _FORMAT_TYPE_CATALOG_NAMES.get(base, base)
+    first = (modifier.group(1).split(",")[0].strip() if modifier else "")
+    if base in ("bit", "varbit"):
+        if first.isdigit():
+            typmod = int(first)
+        else:
+            typmod = 1 if base == "bit" else -1  # bare bit means bit(1)
+    elif base == "numeric":
+        typmod = 1 if modifier else -1
+    else:
+        typmod = -1
+    return is_array, base, typmod
+
+
+def uncarryable_columns_of(table: TableDef) -> "list[UncarryableCdcColumn]":
+    """The columns of ``table`` CDC cannot carry, judged from the inventory's own column
+    types -- the same verdict the Step 3 probe reaches from the catalog, for Evaluation,
+    which reads no catalog for it. A DOMAIN over such a type is not seen here (the inventory
+    names the domain); the probe still sees it. Pure."""
+    found: list[UncarryableCdcColumn] = []
+    for column in table.columns:
+        is_array, base, typmod = _catalog_discriminators(column.mysql_type)
+        reason = classify_uncarryable_cdc_column(
+            is_array=is_array, base_type_name=base, element_typmod=typmod
+        )
+        if reason is not None:
+            found.append(
+                UncarryableCdcColumn(
+                    column=column.name, declared_type=column.mysql_type, reason=reason
+                )
+            )
+    return found
 
 
 def _classify_scalar_bit_width(base_type_name: str, typmod: int) -> Optional[str]:
@@ -1205,6 +1274,24 @@ def check_columns_replicable(
     found = [c for c in (per_table.get(table.name) or ()) if c.column not in skip]
     if not found:
         return None
+    detail, remediation = uncarryable_column_texts(found)
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
+        title=_COLUMN_REPLICABLE_TITLE,
+        status=PrerequisiteStatus.WARN,
+        required=False,
+        target=table.name,
+        detail=detail,
+        remediation=remediation,
+    )
+
+
+def uncarryable_column_texts(
+    found: "Sequence[UncarryableCdcColumn]",
+) -> "tuple[str, str]":
+    """``(what happens, what to do)`` for ``found``: the Step 3 ``COLUMN_REPLICABLE`` row's
+    wording, which Evaluation's ``CDC_UNCARRYABLE_COLUMN`` finding repeats, so both steps
+    describe the same columns the same way. Pure."""
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
     nulled = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
     wrong = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
@@ -1254,28 +1341,21 @@ def check_columns_replicable(
         if any(c.declared_type.startswith("numeric[") for c in fatal)
         else ""
     )
-    return PrerequisiteResult(
-        check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
-        title=_COLUMN_REPLICABLE_TITLE,
-        status=PrerequisiteStatus.WARN,
-        required=False,
-        target=table.name,
-        detail=" ".join(sentences),
-        remediation=(
-            "Decide before the CDC infrastructure is created: "
-            + numeric_route
-            + "exclude the column in Exclude tables & columns (under the table list; it "
-            "then migrates as NULL and CDC never captures it), "
-            "remodel the column on the source to a type CDC does carry (text / text[] "
-            "carries every one of these), or leave this table out of the selection and "
-            "migrate it with Full Load only -- the capture set follows the table "
-            "selection, so there is no per-table \"load but do not stream\" switch. "
-            "Accepting it is also a valid choice: every other table streams normally, "
-            "Validation will report this one as a mismatch, and the table is made correct "
-            "again by stopping writes to it and using the Full Load step's per-table "
-            "Reload before you cut over."
-        ),
+    remediation = (
+        "Decide before the CDC infrastructure is created: "
+        + numeric_route
+        + "exclude the column in Exclude tables & columns (under the table list; it "
+        "then migrates as NULL and CDC never captures it), "
+        "remodel the column on the source to a type CDC does carry (text / text[] "
+        "carries every one of these), or leave this table out of the selection and "
+        "migrate it with Full Load only -- the capture set follows the table "
+        "selection, so there is no per-table \"load but do not stream\" switch. "
+        "Accepting it is also a valid choice: every other table streams normally, "
+        "Validation will report this one as a mismatch, and the table is made correct "
+        "again by stopping writes to it and using the Full Load step's per-table "
+        "Reload before you cut over."
     )
+    return " ".join(sentences), remediation
 
 
 def check_publication_privilege(facts: PostgresCdcFacts) -> PrerequisiteResult:

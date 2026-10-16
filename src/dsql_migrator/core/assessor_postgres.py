@@ -267,6 +267,22 @@ class UnsupportedRelationRule(Rule):
         return findings
 
 
+def _generated_not_null_cdc_note(columns) -> str:
+    """What CDC does to a NOT NULL generated column it never carries: every insert it
+    writes leaves the column out, so the target refuses it (23502, which the CDC step
+    reports as a dropped column)."""
+    if not columns:
+        return ""
+    names = ", ".join(c.name for c in columns)
+    return (
+        f" {names} {'is' if len(columns) == 1 else 'are'} NOT NULL: if you replicate with "
+        "CDC, every insert CDC writes leaves the column out, so Aurora DSQL refuses it "
+        "(SQLSTATE 23502, shown on the CDC step as a column the source dropped) -- choose "
+        "Full load only for this table, or drop the NOT NULL from the target DDL in Schema "
+        "Conversion before applying (Aurora DSQL cannot add it back afterwards)."
+    )
+
+
 class PgGeneratedColumnRule(Rule):
     """Flag PostgreSQL generated (computed) columns at Evaluation.
 
@@ -354,6 +370,9 @@ class PgGeneratedColumnRule(Rule):
                             "target starts correct -- but nothing maintains it afterwards, "
                             "and the CDC stream does not carry it either, so any write that "
                             "does not supply the value drifts."
+                            + _generated_not_null_cdc_note(
+                                [by_name[name] for name in lost if not by_name[name].nullable]
+                            )
                         ),
                         recommendation=(
                             "Compute the value in the application (or in the query) before "
@@ -1204,6 +1223,43 @@ def with_pg_catalog_facts(
     return report
 
 
+class PgCdcUncarryableColumnRule(Rule):
+    """Columns whose PostgreSQL type a CDC change event cannot carry to Aurora DSQL.
+
+    Step 3's ``COLUMN_REPLICABLE`` check found them only after the operator had planned on
+    Evaluation's verdict, where such a table read like any other: ``text[]`` graded the same
+    as ``timetz[]`` (every change dead-letters) or ``interval[]`` (arrives NULL). Judged from
+    the inventory's column types with the same classifier, and worded with the same
+    sentences, prefixed by the condition: none of it applies to a Full load only migration,
+    which carries every one of these columns."""
+
+    rule_id = "CDC_UNCARRYABLE_COLUMN"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.prerequisites_postgres import (
+            uncarryable_column_texts,
+            uncarryable_columns_of,
+        )
+
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            found = uncarryable_columns_of(table)
+            if not found:
+                continue
+            detail, remediation = uncarryable_column_texts(found)
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk="If you replicate with CDC: " + detail,
+                    recommendation=remediation,
+                    effort=EffortLevel.SIMPLE,
+                )
+            )
+        return findings
+
+
 def default_rules() -> "list[Rule]":
     """Ordered PostgreSQL-source compatibility rules (v1: structural, source-neutral).
 
@@ -1267,6 +1323,8 @@ def default_rules() -> "list[Rule]":
         # The far more common lossy numeric: no declared precision at all.
         PgUnconstrainedNumericRule(),
         ViewDefinitionUnreadableRule(is_postgres=True),
+        # What CDC cannot carry, said at Step 1 as the Step 3 check says it.
+        PgCdcUncarryableColumnRule(),
     ]
 
 

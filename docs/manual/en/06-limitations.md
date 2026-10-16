@@ -242,8 +242,9 @@ fails **loudly** where it can't.
   until you remove the extra rows (Drop & reload for Full Load + CDC, a manual delete for
   CDC only) and it matches by CHECKSUM (see
   [Chapter 4 §4.2](04-cdc-and-dsql-constraints.md#42-cdc-replicates-data-not-schema--important)).
-  On MySQL, `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` produce no change event
-  at all; only Validation shows the extra rows. A MySQL pipeline that was already
+  On MySQL, `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` — and on PostgreSQL,
+  dropping or detaching a partition — produce no change event at all; only Validation
+  shows the extra rows. Pause partition maintenance until cut over. A MySQL pipeline that was already
   streaming when you upgraded from an earlier version of the tool detects `TRUNCATE`
   only after one Stop CDC → Start CDC.
 - **MySQL: a schema change between a CDC start point and the Start that uses it.** A

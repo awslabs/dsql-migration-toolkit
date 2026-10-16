@@ -803,25 +803,50 @@ _MIN_BINLOG_RETENTION_HOURS = 24
 
 
 def check_binlog_row_format(variables: dict[str, str]) -> PrerequisiteResult:
-    """PASS when binary logging is on with ROW format and a FULL row image."""
+    """PASS when binary logging is on with ROW format and a FULL row image, and JSON
+    updates are logged whole.
+
+    ``binlog_row_value_options=PARTIAL_JSON`` (MySQL 8.0+) logs an UPDATE of a JSON column
+    as a diff, which Debezium cannot apply: such updates are lost on the target, and
+    Validation, which leaves JSON out of its CHECKSUM, would not notice. Absent (MySQL 5.7)
+    or empty is fine."""
     log_bin = _on(variables.get("log_bin"))
     row_format = (variables.get("binlog_format") or "").strip().upper() == "ROW"
     full_image = (variables.get("binlog_row_image") or "").strip().upper() == "FULL"
-    ok = log_bin and row_format and full_image
+    partial_json = "PARTIAL_JSON" in (variables.get("binlog_row_value_options") or "").upper()
+    ok = log_bin and row_format and full_image and not partial_json
+    if ok:
+        detail = "log_bin=ON, binlog_format=ROW, binlog_row_image=FULL."
+        remediation = ""
+    elif log_bin and row_format and full_image:
+        detail = (
+            "binlog_row_value_options=PARTIAL_JSON: an UPDATE of a JSON column is logged as "
+            "a partial diff, which CDC cannot apply, so those updates would be lost on the "
+            "target (Validation leaves JSON out of its checksum, so it would not notice)."
+        )
+        remediation = (
+            "Clear binlog_row_value_options (set it to an empty value) in the source's "
+            "parameter group."
+        )
+    else:
+        detail = "Binary logging is not ROW/FULL or is disabled."
+        remediation = (
+            "Set binlog_format=ROW and binlog_row_image=FULL on the source "
+            "(RDS parameter group)."
+            + (
+                " Also clear binlog_row_value_options (PARTIAL_JSON): CDC cannot apply "
+                "partial JSON updates."
+                if partial_json
+                else ""
+            )
+        )
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.BINLOG_ROW_FORMAT,
         title="Binary log uses ROW format with full row image",
         status=PrerequisiteStatus.PASS if ok else PrerequisiteStatus.FAIL,
         required=True,
-        detail="log_bin=ON, binlog_format=ROW, binlog_row_image=FULL."
-        if ok
-        else "Binary logging is not ROW/FULL or is disabled.",
-        remediation=""
-        if ok
-        else (
-            "Set binlog_format=ROW and binlog_row_image=FULL on the source "
-            "(RDS parameter group)."
-        ),
+        detail=detail,
+        remediation=remediation,
     )
 
 

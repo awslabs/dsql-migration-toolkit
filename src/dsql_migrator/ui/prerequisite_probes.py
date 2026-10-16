@@ -66,6 +66,7 @@ _CDC_VARIABLES = (
     "log_bin",
     "binlog_format",
     "binlog_row_image",
+    "binlog_row_value_options",
     "gtid_mode",
     "binlog_expire_logs_seconds",
     "expire_logs_days",

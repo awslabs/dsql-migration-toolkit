@@ -91,9 +91,10 @@ what's missing, but setting them up is a source-side task you do once.
 > is what this tool targets.
 
 - **MySQL source — binary logging must be on, in ROW format with a full row image**
-  — `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`. This is a **hard
-  requirement** for CDC (the gate fails CDC if it isn't met). How to set it on
-  managed MySQL:
+  — `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, and on MySQL 8.0+
+  `binlog_row_value_options` left empty (`PARTIAL_JSON` logs a JSON update as a diff CDC
+  cannot apply). This is a **hard requirement** for CDC (the gate fails CDC if it isn't
+  met). How to set it on managed MySQL:
   - **RDS for MySQL:** you **can't turn `log_bin` on directly** and you **can't edit
     `my.cnf`**. Instead, enable **automated backups** (set the backup retention
     period > 0) — that turns binary logging on — then set `binlog_format=ROW` and

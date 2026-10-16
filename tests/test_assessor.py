@@ -607,6 +607,8 @@ def test_default_rules_source_type_seam() -> None:
         "NON_KEY_SEQUENCE",
         # A bare numeric: MySQL's bare DECIMAL means DECIMAL(10,0), so it never rounds.
         "PG_UNCONSTRAINED_NUMERIC",
+        # A PostgreSQL type a pgoutput change event cannot carry (array/geometric types).
+        "CDC_UNCARRYABLE_COLUMN",
     }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
@@ -641,6 +643,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "TINYINT_BOOLEAN",
         "BIT_TYPE",
         "YEAR_TYPE",
+        "TIME_TYPE",
         "VIEW_UNSUPPORTED_SQL",
         "VIEW_DEFINITION_UNREADABLE",
         "GENERATED_COLUMN",

@@ -791,6 +791,15 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   one value costs its own record (dead-lettered), never the task. MySQL is untouched: nothing it
 #   emits comes near those values (its range is years 1000-9999). No config key, template or Start
 #   CDC change; a stack that registered v53 needs Delete + Deploy CDC infrastructure to get it.
+#   v54, rebuilt in place (still unreleased) with two more value paths:
+#   * a PostgreSQL point is written as its own text, (x,y) with float8out's spelling -- its
+#     Aurora DSQL column is text and Full Load writes point_out's text there, while the sink
+#     bound the Debezium Point's WKB bytes (the MySQL spatial path, kept for MySQL);
+#   * a MySQL TIME outside a day (a duration, -838:59:59..838:59:59) is bound as an interval
+#     instead of the raw microseconds: a column remapped to interval stores it, and a time
+#     column refuses it by name (ValueFit Rule.DURATION, a VALUE_DOES_NOT_FIT dead letter)
+#     where the bind error used to read as "the column's type changed at the source".
+#     Exactly 24:00:00 is bound as time's own upper bound.
 PLUGIN_VERSION = "v54"
 
 

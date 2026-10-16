@@ -1859,9 +1859,11 @@ def test_a_23502_banner_is_neutral_without_evidence_and_gives_both_repairs() -> 
     # Both PostgreSQL TOAST clauses, each pinned on its own: the row's why and the runbook.
     assert "which PostgreSQL does not resend" in blob
     assert (
-        "or your exclusions keep it out, or an update left its large (TOASTed) value unchanged"
+        "your exclusions keep it out, or an update left its large (TOASTed) value unchanged"
         in blob
     )
+    # ...and a generated column CDC does not carry (Step 1 names those).
+    assert "or it is a generated column CDC does not carry" in blob
     blob, _ = _render_drift([named], MigrationType.FULL_LOAD_AND_CDC)
     assert "TOAST" not in blob and "do not carry this column" in blob
 
