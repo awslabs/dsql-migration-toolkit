@@ -3266,3 +3266,73 @@ def test_a_text_default_holding_a_nul_is_dropped_with_a_warning() -> None:
         assert "\0" not in edged.target_ddl and any("NUL (0x00)" in w.message for w in edged.warnings)
     # a newline is storable: kept
     assert "DEFAULT 'a\nb'" in _convert_table(_single_column_table("t", "varchar(5)", default="a\nb")).target_ddl
+
+
+def test_an_index_name_reused_across_tables_of_one_schema_is_renamed() -> None:
+    """Aurora DSQL scopes index names per schema (MySQL: per table). The second CREATE
+    INDEX of a name used to be skipped as "already exists"; every index sharing the name is
+    emitted under ``<table>_<index>`` now (order-independent), with a RECOMMENDATION note,
+    and not across schemas."""
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import (
+        Classification,
+        ColumnDef,
+        ConversionNoteKind,
+        IndexDef,
+        SourceInventory,
+        TableDef,
+    )
+
+    def child(name: str, unique: bool = False) -> TableDef:
+        return TableDef(
+            name=name,
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                ColumnDef(name="user_id", mysql_type="bigint"),
+            ],
+            primary_key=["id"],
+            indexes=[IndexDef(name="user_id", columns=["user_id"], unique=unique)],
+        )
+
+    result = SchemaConverter().convert(
+        SourceInventory(
+            tables=[child("shop.orders"), child("shop.payments", unique=True), child("crm.notes")]
+        )
+    )
+    by_name = {table.table: table for table in result.tables}
+    assert by_name["shop.orders"].index_ddls == [
+        'CREATE INDEX ASYNC "orders_user_id" ON "shop"."orders" ("user_id")'
+    ]
+    assert by_name["shop.payments"].index_ddls == [
+        'CREATE UNIQUE INDEX ASYNC "payments_user_id" ON "shop"."payments" ("user_id")'
+    ]
+    assert by_name["crm.notes"].index_ddls == [
+        'CREATE INDEX ASYNC "user_id" ON "crm"."notes" ("user_id")'
+    ]
+    (note,) = [w for w in by_name["shop.payments"].warnings if "renamed within" in w.message]
+    assert note.classification is Classification.MANUAL
+    assert note.kind is ConversionNoteKind.RECOMMENDATION
+    assert not any("renamed within" in w.message for w in by_name["crm.notes"].warnings)
+    assert result.index_renames == {
+        "shop.orders": {"user_id": "orders_user_id"},
+        "shop.payments": {"user_id": "payments_user_id"},
+    }
+
+
+def test_a_skipped_unique_bytea_index_says_its_uniqueness_is_lost() -> None:
+    from dsql_migrator.core.converter import SchemaConverter, SchemaConvertOptions
+    from dsql_migrator.core.models import ColumnDef, IndexDef, TableDef
+
+    table = TableDef(
+        name="app.files",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="sha", mysql_type="varbinary(32)"),
+        ],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ux_sha", columns=["sha"], unique=True)],
+    )
+    result = SchemaConverter().convert_table(table, SchemaConvertOptions())
+    (note,) = [w for w in result.warnings if "bytea" in w.message.lower()]
+    assert "ux_sha is UNIQUE" in note.message
+    assert "duplicate values are accepted after cut over" in note.message

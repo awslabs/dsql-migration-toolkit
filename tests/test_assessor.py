@@ -604,6 +604,8 @@ def test_default_rules_source_type_seam() -> None:
         # A non-PK serial / GENERATED AS IDENTITY column. MySQL allows only ONE
         # AUTO_INCREMENT column and it must be a key, so the condition cannot arise there.
         "NON_KEY_SEQUENCE",
+        # A bare numeric: MySQL's bare DECIMAL means DECIMAL(10,0), so it never rounds.
+        "PG_UNCONSTRAINED_NUMERIC",
     }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
@@ -623,12 +625,15 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "EVENT_UNSUPPORTED",
         "AUTO_INCREMENT",
         "NO_PRIMARY_KEY",
+        "BYTEA_KEY",
         "CI_COLLATION",
         "PARTITIONED_TABLE",
         "SPATIAL_TYPE",
         "TOO_MANY_COLUMNS",
         "TOO_MANY_INDEXES",
         "TOO_MANY_KEY_COLUMNS",
+        "NAME_COLLISION",
+        "IDENTIFIER_LENGTH",
         "OVERSIZED_LOB",
         "NUMERIC_PRECISION",
         "ENUM_SET_TYPE",
@@ -844,14 +849,23 @@ def test_view_rule_leaves_clean_view_auto() -> None:
     assert item.classification is Classification.AUTO
 
 
-def test_inventory_rule_flags_multiple_source_databases() -> None:
+def test_inventory_rule_notes_multiple_source_databases_as_advice() -> None:
+    # Schema Conversion already lands each database as its own schema, so this is a
+    # RECOMMENDED note with no effort -- not a MANUAL "consolidate them" gap.
     inventory = SourceInventory(
         tables=[_table_with_pk("db1.orders"), _table_with_pk("db2.users")]
     )
     item = _item_for(_assess(inventory), "2 source databases")
     assert item.rule_id == "MULTIPLE_DATABASES"
-    assert item.classification is Classification.MANUAL
+    assert item.classification is Classification.AUTO
+    assert item.effort is None
     assert item.kind == "DATABASE"
+    (concern,) = item.concerns
+    assert concern.is_advisory
+    assert "Consolidate" not in item.recommendation
+    assert "Aurora DSQL allows 10 schemas per database; this migration needs 2" in (
+        item.recommendation
+    )
 
 
 def test_inventory_rule_single_database_emits_no_finding() -> None:
@@ -1786,8 +1800,8 @@ def test_inventory_level_items_carry_their_finding_as_a_concern() -> None:
         assert concern.risk == item.risk
         assert concern.recommendation == item.recommendation
         assert concern.effort is item.effort
-        # A cluster-level gap is never advisory.
-        assert not concern.is_advisory
+        # The multi-database note is advice (the conversion does the work)...
+        assert concern.is_advisory
 
     # The sibling check behaves the same way; both go through one helper.
     many = SourceInventory(
@@ -1802,6 +1816,8 @@ def test_inventory_level_items_carry_their_finding_as_a_concern() -> None:
     )
     over = check_table_count(many)
     assert over and len(over[0].concerns) == 1, over
+    # ...while a database-level limit is a real gap, never advisory.
+    assert not over[0].concerns[0].is_advisory
 
 
 def test_every_assessed_item_has_at_least_one_concern_unless_clean() -> None:
@@ -2072,3 +2088,248 @@ def test_the_numeric_precision_rule_uses_dsqls_documented_maximum() -> None:
         assert "NUMERIC_PRECISION" not in rules_for(spec), spec
     # Beyond it -> still flagged.
     assert "NUMERIC_PRECISION" in rules_for(f"numeric({_MAX_NUMERIC_PRECISION + 1},10)")
+
+
+# ---------------------------------------------------------------------------
+# Aurora DSQL database-level limits (tables / schemas / views per database)
+# ---------------------------------------------------------------------------
+
+
+def _target_with(schemas: dict[str, int], *, views: int = 0, table_prefix: str = "x"):
+    """A browsed target: ``{schema: number of tables}`` (named ``<table_prefix><i>``) plus
+    ``views`` views in schema ``v``."""
+    from dsql_migrator.core.models import (
+        TargetInventory,
+        TargetObjectKind,
+        TargetRelation,
+        TargetSchemaNode,
+    )
+
+    nodes = [
+        TargetSchemaNode(
+            name=schema,
+            tables=[
+                TargetRelation(
+                    schema_name=schema,
+                    name=f"{table_prefix}{i}",
+                    kind=TargetObjectKind.TABLE,
+                )
+                for i in range(count)
+            ],
+        )
+        for schema, count in schemas.items()
+    ]
+    if views:
+        nodes.append(
+            TargetSchemaNode(
+                name="v",
+                views=[
+                    TargetRelation(schema_name="v", name=f"w{i}", kind=TargetObjectKind.VIEW)
+                    for i in range(views)
+                ],
+            )
+        )
+    return TargetInventory(schemas=nodes)
+
+
+def test_more_than_ten_target_schemas_is_a_database_level_blocker() -> None:
+    """Every MySQL database becomes a target schema, and Aurora DSQL allows 10 per database.
+
+    The old report graded 12 databases one MANUAL "consolidate them into schemas" item --
+    the conversion's own work, and impossible past 10 -- and Schema Conversion then failed
+    part-way with "more than 10 schemas not allowed".
+    """
+    from dsql_migrator.core.assessor import check_schema_count
+
+    eleven = SourceInventory(tables=[_table_with_pk(f"db{i}.t") for i in range(11)])
+    (item,) = check_schema_count(eleven)
+    assert item.rule_id == "SCHEMA_COUNT_LIMIT"
+    assert item.classification is Classification.UNSUPPORTED
+    assert item.kind == "DATABASE"
+    assert item.object_name == "11 schemas"
+    assert "Database on the Connect step" in item.recommendation
+    assert "at least 2 Aurora DSQL clusters" in item.recommendation
+    # The multi-database note steps aside for the blocker (one item, not two).
+    database_items = {i.rule_id for i in _assess(eleven).items if i.kind == "DATABASE"}
+    assert database_items == {"SCHEMA_COUNT_LIMIT"}
+    # Exactly ten fits.
+    ten = SourceInventory(tables=[_table_with_pk(f"db{i}.t") for i in range(10)])
+    assert check_schema_count(ten) == []
+
+
+def test_schema_count_includes_the_schemas_already_on_the_target() -> None:
+    from dsql_migrator.core.assessor import check_schema_count
+
+    three = SourceInventory(tables=[_table_with_pk(f"db{i}.t") for i in range(3)])
+    others = {f"old{i}": 1 for i in range(8)}
+    (item,) = check_schema_count(three, _target_with(others))
+    assert item.object_name == "11 schemas"
+    assert "8 already on the cluster" in item.risk
+    assert "already on this cluster push it past the limit" in item.recommendation
+    # A source schema that is already on the target is not counted twice, and public --
+    # which Aurora DSQL provides in every database -- is not counted at all.
+    overlap = _target_with({"db0": 1, "public": 5, **{f"old{i}": 1 for i in range(7)}})
+    assert check_schema_count(three, overlap) == []
+
+
+def test_table_count_limit_counts_the_tables_already_on_the_target() -> None:
+    """700 new tables into a cluster that already holds 400 others is 1,100 > 1,000."""
+    source = SourceInventory(tables=[_table_with_pk(f"app.t{i}") for i in range(700)])
+    (item,) = check_table_count(source, _target_with({"other": 400}))
+    assert item.object_name == "1,100 tables"
+    assert "700 new from the source plus 400 already on the cluster" in item.risk
+    assert "already on this cluster push it past the limit" in item.recommendation
+    # Tables already on the target under the same names are replaced or skipped, never
+    # added twice: 700 source tables that are all there already stay at 700.
+    same = _target_with({"app": 700}, table_prefix="t")
+    assert check_table_count(source, same) == []
+    # Without a target catalog only the source is counted (the old behaviour).
+    assert check_table_count(source) == []
+
+
+def test_view_count_limit_flags_more_than_five_thousand_views() -> None:
+    from dsql_migrator.core.assessor import check_view_count
+    from dsql_migrator.core.models import ViewDef
+
+    def views(n: int) -> SourceInventory:
+        return SourceInventory(
+            views=[ViewDef(name=f"app.v{i}", definition="SELECT 1") for i in range(n)]
+        )
+
+    (item,) = check_view_count(views(5001))
+    assert item.rule_id == "VIEW_COUNT_LIMIT"
+    assert item.classification is Classification.UNSUPPORTED
+    assert check_view_count(views(5000)) == []
+    (with_target,) = check_view_count(views(4000), _target_with({}, views=1500))
+    assert with_target.object_name == "5,500 views"
+
+
+# ---------------------------------------------------------------------------
+# Verdicts Evaluation now takes from the converter (BYTEA_KEY, IDENTIFIER_LENGTH,
+# NAME_COLLISION)
+# ---------------------------------------------------------------------------
+
+
+def test_a_binary_primary_key_is_unsupported_at_evaluation_as_at_conversion() -> None:
+    """The MySQL UUID_TO_BIN pattern: a BINARY(16) key converts to bytea, which Aurora DSQL
+    cannot index, so the CREATE TABLE is rejected. Evaluation used to say AUTO."""
+    from dsql_migrator.core.converter import _bytea_key_warning
+
+    table = _table_with_pk(
+        "app.users", columns=[ColumnDef(name="id", mysql_type="BINARY(16)")]
+    )
+    item = _item_for(_assess(SourceInventory(tables=[table])), "app.users")
+    assert item.rule_id == "BYTEA_KEY"
+    assert item.classification is Classification.UNSUPPORTED
+    assert item.effort is EffortLevel.SIGNIFICANT
+    # The risk IS the conversion note, so the two steps describe it identically.
+    assert item.concerns[0].risk == _bytea_key_warning(table).message
+
+
+def test_a_unique_bytea_index_is_a_gap_that_names_the_lost_uniqueness() -> None:
+    def table(unique: bool):
+        return _table_with_pk(
+            "app.files",
+            columns=[
+                ColumnDef(name="id", mysql_type="INT"),
+                ColumnDef(name="sha", mysql_type="varbinary(32)"),
+            ],
+            indexes=[IndexDef(name="ux_sha", columns=["sha"], unique=unique)],
+        )
+
+    unique = _item_for(_assess(SourceInventory(tables=[table(True)])), "app.files")
+    assert (unique.rule_id, unique.classification) == ("BYTEA_KEY", Classification.MANUAL)
+    assert unique.effort is EffortLevel.MEDIUM
+    assert "uniqueness is NOT enforced" in unique.risk
+    assert "accepts duplicates" in unique.recommendation
+    plain = _item_for(_assess(SourceInventory(tables=[table(False)])), "app.files")
+    assert plain.effort is EffortLevel.SIMPLE
+    assert "uniqueness" not in plain.risk
+
+
+def test_a_spatial_index_is_not_reported_twice_as_a_bytea_key() -> None:
+    table = _table_with_pk(
+        "app.places",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name="g", mysql_type="point"),
+        ],
+        indexes=[IndexDef(name="sp_g", columns=["g"], index_type="SPATIAL")],
+    )
+    item = _item_for(_assess(SourceInventory(tables=[table])), "app.places")
+    assert "BYTEA_KEY" not in {c.rule_id for c in item.concerns}
+
+
+def test_identifier_collision_is_unsupported_and_an_overlong_name_is_advice() -> None:
+    a, b = "c" * 63 + "a", "c" * 63 + "b"
+    colliding = _table_with_pk(
+        "app.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="INT"),
+            ColumnDef(name=a, mysql_type="INT"),
+            ColumnDef(name=b, mysql_type="INT"),
+        ],
+    )
+    item = _item_for(_assess(SourceInventory(tables=[colliding])), "app.t")
+    assert (item.rule_id, item.classification) == (
+        "IDENTIFIER_LENGTH",
+        Classification.UNSUPPORTED,
+    )
+    long_only = _table_with_pk(
+        "app.u",
+        columns=[ColumnDef(name="id", mysql_type="INT"), ColumnDef(name=a, mysql_type="INT")],
+    )
+    advice = _item_for(_assess(SourceInventory(tables=[long_only])), "app.u")
+    assert advice.classification is Classification.AUTO
+    assert [c.rule_id for c in advice.concerns if c.is_advisory] == ["IDENTIFIER_LENGTH"]
+
+
+def test_an_index_name_reused_across_tables_of_one_schema_is_renamed_on_each() -> None:
+    """MySQL scopes index names per table, Aurora DSQL per schema: the second CREATE INDEX
+    of a name was skipped as "already exists" -- silently, a UNIQUE one included. Schema
+    Conversion renames every index that shares a name now (order-independent), so
+    Evaluation reports advice, not a gap."""
+
+    def child(name: str, unique: bool = False):
+        return _table_with_pk(
+            name,
+            columns=[
+                ColumnDef(name="id", mysql_type="INT"),
+                ColumnDef(name="user_id", mysql_type="INT"),
+            ],
+            indexes=[IndexDef(name="user_id", columns=["user_id"], unique=unique)],
+        )
+
+    report = _assess(
+        SourceInventory(
+            tables=[child("shop.orders"), child("shop.payments", unique=True), child("crm.notes")]
+        )
+    )
+    for name, new_name in (("shop.orders", "orders_user_id"), ("shop.payments", "payments_user_id")):
+        item = _item_for(report, name)
+        assert item.classification is Classification.AUTO
+        (rename,) = [c for c in item.concerns if c.rule_id == "NAME_COLLISION"]
+        assert rename.is_advisory
+        assert f"user_id is created as {new_name}" in rename.risk
+    assert "a UNIQUE one keeps enforcing uniqueness" in _item_for(report, "shop.payments").risk
+    # Another schema has its own namespace.
+    notes = _item_for(report, "crm.notes")
+    assert notes.classification is Classification.AUTO
+    assert "NAME_COLLISION" not in {c.rule_id for c in notes.concerns}
+
+
+def test_too_many_indexes_counts_only_the_indexes_the_conversion_can_create() -> None:
+    """24 source indexes, two of them over bytea columns: only 22 can be created, which
+    fits the 23-index budget -- the old count claimed an overflow that never happens."""
+    columns = [ColumnDef(name="id", mysql_type="INT")] + [
+        ColumnDef(name=f"c{i}", mysql_type="varbinary(16)" if i < 2 else "int")
+        for i in range(24)
+    ]
+    table = _table_with_pk(
+        "app.wide",
+        columns=columns,
+        indexes=[IndexDef(name=f"i{i}", columns=[f"c{i}"]) for i in range(24)],
+    )
+    item = _item_for(_assess(SourceInventory(tables=[table])), "app.wide")
+    assert "TOO_MANY_INDEXES" not in {c.rule_id for c in item.concerns}
+    assert "BYTEA_KEY" in {c.rule_id for c in item.concerns}

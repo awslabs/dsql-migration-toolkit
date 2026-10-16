@@ -63,6 +63,9 @@ from dsql_migrator.core.converter import (
     SchemaConverter,
     SchemaConvertOptions,
     TableConversion,
+    index_renames as derive_index_renames,
+    is_name_collision_placeholder,
+    relation_clash_names,
     parse_target_column_types,
     parse_target_value_specs,
     parse_target_generated_columns,
@@ -183,6 +186,17 @@ class DataMigrationInputs:
     # remapped to smallint loads as an integer, not a boolean). A table absent
     # here falls back to the deterministic conversion / source-derived types.
     table_conversions: Mapping[str, TableConversion] = field(default_factory=dict)
+    # Schema Conversion's index renames (table -> {source index name: emitted name}),
+    # read only for a table with NO applied conversion: its deterministic re-derivation
+    # (_derived_table_conversion) converts one table at a time, which cannot see an index
+    # name another relation of the schema also uses, and would re-emit the source name.
+    # Derived from ``inventory`` when left empty (see BatchedTableMigrator).
+    index_renames: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # Tables whose stored name another table or view of the schema shares (Aurora DSQL
+    # stores names cut to 63 bytes): Schema Conversion creates none of them, and a load
+    # would write into the other's relation, so they are never loaded. Derived from
+    # ``inventory`` (see BatchedTableMigrator); a worker keeps only its own table's entry.
+    name_clash_tables: frozenset = frozenset()
     # Converted target view DDLs (view name -> CREATE VIEW SQL), used ONLY on a
     # "drop & reload" (replace) run: a view that SELECTs from a replaced table
     # blocks that table's DROP ("other objects depend on it"). Before the replace
@@ -897,6 +911,8 @@ def _slim_worker_inputs(
         inputs,
         inventory=SourceInventory(),
         table_conversions=({table_name: conv} if conv is not None else {}),
+        index_renames=_one(inputs.index_renames),
+        name_clash_tables=inputs.name_clash_tables & {table_name},
         excluded_lob_columns=_one(inputs.excluded_lob_columns),
         overlay_columns=_one(inputs.overlay_columns),
         legacy_exclusions=_one(inputs.legacy_exclusions),
@@ -2738,6 +2754,13 @@ def _migrate_tables_in_parallel(
         _tally(_TableLoadOutcome.FAILED)
         withheld.add(name)
 
+    # A table whose stored name another table or view shares is never recreated, sharded
+    # or loaded, on either path: every write would land in the other's relation.
+    _clash = getattr(getattr(migrator, "_inputs", None), "name_clash_tables", frozenset())
+    for table in tables:
+        if table.name in _clash:
+            _fail_prepass_table(table.name, reason=name_clash_message(table.name))
+
     # Operator-tunable table-level parallelism (default FULL_LOAD_TABLE_PARALLELISM),
     # bounded by the table count.
     cfg = load_config()
@@ -2750,6 +2773,7 @@ def _migrate_tables_in_parallel(
 
     if not use_processes:
         # Thread fallback (test doubles, or table_parallelism<=1).
+        tables = [table for table in tables if table.name not in withheld]
         workers = min(table_parallelism, len(tables))
         if workers <= 1:
             for table in tables:
@@ -5122,6 +5146,16 @@ def _default_importer_factory(inputs: "DataMigrationInputs") -> BatchedImporter:
 TableRecreator = Callable[[TableDef], list[str]]
 
 
+def name_clash_message(table_name: str) -> str:
+    """Why a table whose stored name another table or view shares is not loaded."""
+    return (
+        f"Table '{table_name}' was not loaded: its name shares its first 63 bytes with "
+        "another table or view of its schema, and Aurora DSQL stores names cut to 63 bytes, "
+        "so their rows would go into one table. Schema Conversion did not create it. "
+        "Shorten the names on the source, then re-run Step 1 (Evaluation)."
+    )
+
+
 def _derived_table_conversion(
     inputs: "DataMigrationInputs", table: TableDef
 ) -> TableConversion:
@@ -5142,7 +5176,9 @@ def _derived_table_conversion(
     """
     return SchemaConverter(
         source_type=inputs.source_config.source_type
-    ).convert_table(table, SchemaConvertOptions())
+    ).convert_table(
+        table, SchemaConvertOptions(), index_names=inputs.index_renames.get(table.name)
+    )
 
 
 def _target_columns_the_conversion_would_drop(
@@ -5689,6 +5725,29 @@ class BatchedTableMigrator:
         overlay_applier: Optional[Callable[..., Any]] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
+        if inputs.inventory.tables:
+            # The parent (a worker's inventory is slimmed away): a library caller converts
+            # table by table, which cannot see a name another table shares.
+            clash = frozenset(
+                relation_clash_names(inputs.inventory)
+                & {table.name for table in inputs.inventory.tables}
+            )
+            if clash != inputs.name_clash_tables:
+                inputs = replace(inputs, name_clash_tables=clash)
+        if not inputs.index_renames and any(
+            table.name not in inputs.table_conversions for table in inputs.inventory.tables
+        ):
+            # Derived here, in the parent, before the per-table workers get inputs slimmed
+            # to one table: only the whole inventory shows a name another table also uses.
+            # Read only for a table with no applied conversion, so a run that carries one
+            # for every table (the UI) skips it.
+            inputs = replace(
+                inputs,
+                index_renames=derive_index_renames(
+                    inputs.inventory,
+                    is_postgres=inputs.source_config.source_type is SourceType.POSTGRES,
+                ),
+            )
         self._inputs = inputs
         # Column-exclusion overlay seams (injectable for tests). None resolves the module
         # defaults at CALL time, so a test can monkeypatch them for a worker that builds
@@ -6367,6 +6426,14 @@ class BatchedTableMigrator:
             table, self._inputs.excluded_lob_columns.get(table.name)
         )
         applied = self._inputs.table_conversions.get(table.name)
+        if table.name in self._inputs.name_clash_tables or (
+            applied is not None and is_name_collision_placeholder(applied.target_ddl)
+        ):
+            # Schema Conversion created nothing for it: its stored name is another table's
+            # or view's, so every write would land in that relation (the screen keeps such
+            # tables out of the selection, and a run withholds them; this guards any
+            # direct caller).
+            raise FullLoadIncompleteError(name_clash_message(table.name))
         # A column the TARGET computes must not be sent: Aurora DSQL rejects an INSERT
         # that supplies a value for a generated column (428C9), permanently, so every
         # batch would fail and every row would be quarantined. Filtered through the same
@@ -6530,8 +6597,12 @@ class BatchedTableMigrator:
                 # pre-pass (avoiding a concurrent-DDL catalog storm at startup). Don't
                 # re-run the DDL; derive the same secondary-index DDLs from the applied
                 # conversion so they are still (re)created after the load.
-                index_ddls = (
-                    list(applied.index_ddls) if applied is not None else []
+                # The parent ran _effective_conversion for it (the applied conversion,
+                # else the deterministic one with this table's index renames), so the
+                # same derivation gives the same DDLs -- a library caller with no applied
+                # conversion used to get none here, losing every index (UNIQUE ones too).
+                index_ddls = list(
+                    _effective_conversion(self._inputs, original_table).index_ddls
                 )
             else:
                 # Recreate from the UNFILTERED table so the target keeps the excluded
@@ -6889,12 +6960,18 @@ class BatchedTableMigrator:
         ddls = self._dependent_view_ddls_for_replace()
         if not ddls:
             return
-        from dsql_migrator.core.schema_applier import drop_object
+        from dsql_migrator.core.schema_applier import converted_names, drop_object
 
+        # Every source view, so a lower-case twin that is the source's own view is never
+        # taken for the copy an earlier version left (and dropped without a recreate).
+        own_views = converted_names(
+            [*(view.name for view in self._inputs.inventory.views), *self._inputs.dependent_view_ddls],
+            {},
+        ).views
         connect = self._view_connection_factory()
         for view_ddl in ddls:
             try:
-                drop_object(view_ddl, connection_factory=connect)
+                drop_object(view_ddl, connection_factory=connect, own_views=own_views)
             except Exception:  # noqa: BLE001 - best-effort; a real block surfaces on the table DROP
                 _LOGGER.warning("Could not pre-drop dependent view", exc_info=True)
 

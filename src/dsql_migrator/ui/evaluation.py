@@ -48,7 +48,12 @@ from dsql_migrator.core.activity_log import (
     ActivityStatus,
     log_activity,
 )
-from dsql_migrator.core.assessor import KIND_LABELS, CompatibilityAssessor
+from dsql_migrator.core.assessor import (
+    DSQL_DATABASE_LIMITS,
+    KIND_DATABASE,
+    KIND_LABELS,
+    CompatibilityAssessor,
+)
 from dsql_migrator.core.assessor import export_report as export_assessment_report
 from dsql_migrator.core.assessor import render_html_report
 from dsql_migrator.core.introspector import SourceIntrospector
@@ -259,44 +264,81 @@ def target_inventory_is_stale(
     return stamped != live
 
 
+def with_refreshed_catalogs(
+    result: EvaluationResult,
+    *,
+    inventory: SourceInventory,
+    target_inventory: TargetInventory,
+    target_endpoint: "Optional[str]",
+    source_type: "Optional[SourceType]" = None,
+) -> EvaluationResult:
+    """``result`` with a re-read source inventory and/or target catalog, and what they feed.
+
+    The assessment is recomputed together with the catalogs: Aurora DSQL's database-level
+    limits (tables, schemas, views per database) are counted against the TARGET as well as
+    the source, so a refresh that swapped the catalog and re-stamped the endpoint but kept
+    the old assessment showed the other cluster's verdict as current -- a green 'Ready' for
+    a cluster with no room left, or a stale 'Blocked' after the room was made. The name
+    conflicts are recomputed with it. ``source_type`` is the engine the inventory was just
+    read with (default: the result's own); a re-read after the operator switched engines on
+    Connect is graded by that engine's rules, and the result says so. Pure but not free --
+    it scales with the schema -- so UI callers run it off the event loop
+    (``run.io_bound``); :func:`dataclasses.replace` keeps every other field.
+    """
+    from dataclasses import replace
+
+    engine = source_type if source_type is not None else result.source_type
+    return replace(
+        result,
+        inventory=inventory,
+        assessment=CompatibilityAssessor(source_type=engine).assess(
+            inventory, target_inventory=target_inventory
+        ),
+        source_type=engine,
+        target_inventory=target_inventory,
+        target_conflicts=_find_target_conflicts(inventory, target_inventory),
+        target_endpoint=target_endpoint,
+    )
+
+
 def _find_target_conflicts(
     source: SourceInventory, target: TargetInventory
 ) -> list[str]:
     """Return source table/view names that already exist on the target.
 
-    Mirrors :meth:`TargetIntrospector.object_exists`: a source name is matched
-    against the target's QUALIFIED names (``schema.table``) when it is itself
-    qualified (the tool qualifies source objects as ``database.table``), and
-    against unqualified names otherwise. Matching is case-insensitive
-    (PostgreSQL identifier folding). This is what surfaces a conflict when the
-    target already has the same schema *and* table name as the source. Source
-    order is preserved.
+    Decides as Schema Apply does: a qualified source name (the tool qualifies source
+    objects as ``database.table``) is matched exactly against the target's stored names
+    (``shop.Orders`` is not ``shop.orders``), an unqualified one case-insensitively. This
+    is what surfaces a conflict when the target already has the same schema *and* table
+    name as the source. Source order is preserved (tables, then views). The matching rule
+    itself is
+    :func:`~dsql_migrator.core.target_introspector.relations_existing_on_target`,
+    shared with the per-database limit counts so the two cannot disagree.
     """
-    qualified_names = {
-        relation.qualified_name.lower()
-        for schema in target.schemas
-        for relation in (*schema.tables, *schema.views)
-    }
-    unqualified_names = {
-        relation.name.lower()
-        for schema in target.schemas
-        for relation in (*schema.tables, *schema.views)
-    }
+    from dsql_migrator.core.target_introspector import relations_existing_on_target
 
-    def _exists(name: str) -> bool:
-        normalized = name.strip().lower()
-        if "." in normalized:
-            return normalized in qualified_names
-        return normalized in unqualified_names
+    view_names = [view.name for view in source.views]
+    return relations_existing_on_target(
+        [table.name for table in source.tables] + view_names,
+        target,
+        views=view_names,
+    )
 
-    conflicts: list[str] = []
-    for table in source.tables:
-        if _exists(table.name):
-            conflicts.append(table.name)
-    for view in source.views:
-        if _exists(view.name):
-            conflicts.append(view.name)
-    return conflicts
+
+def _find_target_blockers(
+    source: SourceInventory, target: TargetInventory
+) -> "list[tuple[str, str]]":
+    """``(source table/view, what holds its name)`` where ANOTHER kind of object (a view
+    where a table goes, an index) holds the name on the target: Schema Apply refuses those
+    in both modes. Computed at render from the browsed catalog (nothing new persisted)."""
+    from dsql_migrator.core.target_introspector import relations_blocked_on_target
+
+    view_names = [view.name for view in source.views]
+    return relations_blocked_on_target(
+        [table.name for table in source.tables] + view_names,
+        target,
+        views=view_names,
+    )
 
 
 @dataclass(frozen=True)
@@ -366,6 +408,15 @@ _NO_EFFORT_PENALTY: dict[str, float] = {
 # Score band -> (label, notice tone, one-line meaning). Bands read on one axis of
 # "how ready is this migration", reusing the shared notice tones so the score
 # card matches the rest of the AWS-style UI.
+#
+# The ratio alone does not pick the band when something BLOCKS the migration, because an
+# average dilutes a blocker into nothing: one cluster-level quota item among 1,001
+# otherwise-clean tables is 1/1002 of the worst case, so the card read a green "Ready --
+# a straightforward migration" for a source whose 1,001st CREATE TABLE fails at apply, and
+# two tables without a primary key among ten read "Ready" too. So blockers decide first
+# (see :func:`compute_migration_score`): a database-level limit the source exceeds forces
+# :data:`_BLOCKED_BAND`, and any UNSUPPORTED object caps a success band at
+# :data:`_UNSUPPORTED_BAND`. The ratio still places everything else.
 _SCORE_BANDS: tuple[tuple[int, str, str, str], ...] = (
     (90, "Ready", "success",
      "Almost everything converts automatically — a straightforward migration."),
@@ -377,6 +428,20 @@ _SCORE_BANDS: tuple[tuple[int, str, str, str], ...] = (
      "Many objects need manual work or are unsupported — budget time and review."),
     (0, "High effort", "error",
      "Most objects need manual work or cannot move as-is — expect substantial rework."),
+)
+
+# A database-level Aurora DSQL limit the source exceeds (tables / schemas / views per
+# database): nothing about the per-object work matters until it is resolved, so it is an
+# error regardless of the ratio. The summary is built per report (it names the limit).
+_BLOCKED_BAND = ("Blocked", "error")
+# At least one UNSUPPORTED object, in a report whose ratio alone would read as a success:
+# the rest may be easy, but these objects cannot move as-is, so the card must not read as
+# an all-clear. Bands that are already warning/error keep their own label.
+_UNSUPPORTED_BAND = (
+    "Unsupported objects",
+    "warning",
+    "{count} object{plural} cannot move to Aurora DSQL as-is and {verb} a redesign (see "
+    "the Unsupported items below).",
 )
 
 # Score notice tone -> Quasar color for the circular gauge, so the gauge color
@@ -419,13 +484,34 @@ def compute_migration_score(report: AssessmentReport) -> Optional[MigrationScore
     (UNSUPPORTED -> hardest, MANUAL -> medium). The score is
     ``round(100 * (1 - total_penalty / worst_case_penalty))`` where the
     worst-case is every object at the heaviest single-object cost, so it is
-    bounded to 0-100 and is 100 exactly when nothing needs manual work. Returns
-    ``None`` for an empty report (nothing to score). Pure and deterministic so it
-    is unit-testable and matches the on-screen and exported values.
+    bounded to 0-100; it is capped at 99 while any object needs work, so it is 100
+    exactly when nothing does (rounding alone reached 100 with one SIGNIFICANT object
+    among 200).
+
+    The band is decided by blockers BEFORE the ratio: a database-level limit the migration
+    exceeds (an UNSUPPORTED limit item of kind ``DATABASE`` -- too many tables, schemas or
+    views for one Aurora DSQL database) forces "Blocked" (error), naming the limit;
+    otherwise any UNSUPPORTED object turns a success band into "Unsupported objects"
+    (warning). The ratio places everything else. A limit item is not per-object work, so it
+    sets the band without entering the ratio (the score then reads as the per-object
+    readiness it is captioned as). Returns ``None`` for an empty report (nothing to score).
+    Pure and deterministic so it is unit-testable and matches the on-screen and exported
+    values.
     """
     items = report.items
     if not items:
         return None
+
+    # Keyed on the limit checks themselves (not merely kind DATABASE), so the band's
+    # "exceeds an Aurora DSQL database limit" can only ever name a real limit.
+    blockers = [
+        item
+        for item in items
+        if item.classification is Classification.UNSUPPORTED
+        and item.kind == KIND_DATABASE.upper()
+        and item.rule_id in DSQL_DATABASE_LIMITS
+    ]
+    scored = [item for item in items if not any(item is b for b in blockers)]
 
     total_penalty = 0.0
     auto = manual = unsupported = 0
@@ -433,26 +519,42 @@ def compute_migration_score(report: AssessmentReport) -> Optional[MigrationScore
         classification = item.classification.value
         if classification == "AUTO":
             auto += 1
-            continue
-        if classification == "UNSUPPORTED":
+        elif classification == "UNSUPPORTED":
             unsupported += 1
         else:
             manual += 1
+    for item in scored:
+        classification = item.classification.value
+        if classification == "AUTO":
+            continue
         effort = item.effort.value if item.effort is not None else None
         if effort is not None:
             total_penalty += _EFFORT_PENALTY.get(effort, _EFFORT_PENALTY["MEDIUM"])
         else:
             total_penalty += _NO_EFFORT_PENALTY.get(classification, _MAX_OBJECT_PENALTY)
 
-    worst_case = _MAX_OBJECT_PENALTY * len(items)
+    worst_case = _MAX_OBJECT_PENALTY * len(scored)
     ratio = total_penalty / worst_case if worst_case else 0.0
     score = max(0, min(100, round(100 * (1 - ratio))))
+    if total_penalty > 0:
+        score = min(score, 99)
 
     label, tone, summary = _SCORE_BANDS[-1][1:]
     for threshold, band_label, band_tone, band_summary in _SCORE_BANDS:
         if score >= threshold:
             label, tone, summary = band_label, band_tone, band_summary
             break
+
+    if blockers:
+        label, tone = _BLOCKED_BAND
+        summary = _blocked_summary(blockers)
+    elif unsupported and tone == "success":
+        label, tone, template = _UNSUPPORTED_BAND
+        summary = template.format(
+            count=unsupported,
+            plural="" if unsupported == 1 else "s",
+            verb="needs" if unsupported == 1 else "need",
+        )
 
     return MigrationScore(
         score=score,
@@ -463,6 +565,22 @@ def compute_migration_score(report: AssessmentReport) -> Optional[MigrationScore
         auto=auto,
         manual=manual,
         unsupported=unsupported,
+    )
+
+
+def _blocked_summary(blockers: list) -> str:
+    """The "Blocked" band's sentence: which database-level limit(s) the migration exceeds."""
+    parts = []
+    for item in blockers:
+        noun, limit = DSQL_DATABASE_LIMITS[item.rule_id]
+        parts.append(f"{item.object_name} (Aurora DSQL allows {limit:,} {noun} per database)")
+    several = len(parts) > 1
+    subject = "Aurora DSQL database limits" if several else "an Aurora DSQL database limit"
+    return (
+        f"This migration exceeds {subject}: "
+        + "; ".join(parts)
+        + f". Resolve the database / cluster-level item{'s' if several else ''} below "
+        "before converting; the score rates the per-object work only."
     )
 
 
@@ -770,17 +888,20 @@ def run_evaluation(
     introspector = introspector_factory(inputs.source_password)
     inventory = introspector.introspect(inputs.source_config)
 
-    report(35, "Assessing source/target compatibility...")
+    # The target is read BEFORE the assessment because Aurora DSQL's database-level limits
+    # (tables, schemas, views per database) are about what the target will hold after the
+    # migration: 700 source tables are a blocker on a cluster that already has 400 others.
+    report(35, "Introspecting target Aurora DSQL catalog...")
+    browser = target_browser_factory(inputs.aws_profile)
+    target_inventory = browser.browse(inputs.target_config)
+
+    report(60, "Assessing source/target compatibility...")
     # The default rule set is source-engine-specific (MySQL vs PostgreSQL); pass the
     # source type so a PostgreSQL source is assessed with its own rules.
     assessment = (
         assessor
         or CompatibilityAssessor(source_type=inputs.source_config.source_type)
-    ).assess(inventory)
-
-    report(60, "Introspecting target Aurora DSQL catalog...")
-    browser = target_browser_factory(inputs.aws_profile)
-    target_inventory = browser.browse(inputs.target_config)
+    ).assess(inventory, target_inventory=target_inventory)
 
     report(85, "Detecting objects that already exist on the target...")
     target_conflicts = _find_target_conflicts(inventory, target_inventory)
@@ -1466,6 +1587,23 @@ def _render_result(
     # Migration-readiness score (its own leading card; skipped for an empty
     # report, which has nothing to score).
     _render_score_card(ui, result.assessment)
+    # The band counts the TARGET too (tables / schemas / views per database), so when the
+    # connected cluster is no longer the assessed one the card describes the other cluster.
+    # Said here, at the card, not only in the target subsection far below it.
+    if compute_migration_score(result.assessment) is not None and target_inventory_is_stale(
+        result, _EndpointOnly(live_target_endpoint) if live_target_endpoint else None
+    ):
+        render_notice(
+            ui,
+            tone="warning",
+            header="Readiness was assessed against another cluster",
+            body=(
+                "The database-level limits in this score were counted on "
+                f"{result.target_endpoint}; the connected target is now "
+                f"{live_target_endpoint}. Re-run Evaluation, or refresh the target catalog "
+                "in Schema Conversion, to count them for the current cluster."
+            ),
+        )
     # Directly under the score, because it is the score that needs qualifying: an
     # evaluation over ZERO tables still produces a confident band.
     _render_empty_inventory_notice(ui, result)
@@ -1525,7 +1663,15 @@ def _render_score_card(ui: object, report: AssessmentReport) -> None:
             with ui.column().classes("gap-1 flex-1 min-w-0"):  # type: ignore[attr-defined]
                 with ui.row().classes("items-center gap-2"):  # type: ignore[attr-defined]
                     ui.badge(score.band).props(f"color={color}")  # type: ignore[attr-defined]
-                    ui.label(f"{score.score} / 100 readiness").classes(  # type: ignore[attr-defined]
+                    # Blocked is decided by a database-level limit, not by the gauge, so the
+                    # caption says what the number does measure; a bare "99 / 100 readiness"
+                    # beside "Blocked" read as a contradiction.
+                    caption = (
+                        "per-object readiness"
+                        if score.band == _BLOCKED_BAND[0]
+                        else "readiness"
+                    )
+                    ui.label(f"{score.score} / 100 {caption}").classes(  # type: ignore[attr-defined]
                         "text-sm text-gray-500"
                     )
                 with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
@@ -2216,7 +2362,23 @@ def _render_target(
             "Resolve these in Schema Conversion: choose SKIP (keep the existing "
             "object) or REPLACE (recreate it) when you apply."
         ).classes("text-xs text-gray-500")
-    else:
+    blocked = _find_target_blockers(result.inventory, target)
+    if blocked:
+        render_notice(
+            ui,
+            tone="error",
+            header="Names held on the target by another object",
+            body=(
+                f"{len(blocked)} source object(s) cannot be created in either apply mode "
+                "until the object holding the name is dropped or renamed on the target "
+                "(Aurora DSQL keeps a schema's tables, views and indexes in one namespace; "
+                "an earlier apply may have left it):"
+            ),
+        )
+        with ui.row().classes("items-center gap-1 flex-wrap"):  # type: ignore[attr-defined]
+            for name, holder in blocked:
+                ui.badge(f"{name}: {holder}").props("color=red-7 outline")  # type: ignore[attr-defined]
+    if not result.target_conflicts and not blocked:
         render_notice(
             ui,
             tone="success",
@@ -2265,6 +2427,7 @@ __all__ = [
     "run_evaluation",
     "compute_migration_score",
     "MigrationScore",
+    "with_refreshed_catalogs",
     "chat_turns_remaining",
     "filter_assessment_items",
     "sort_assessment_items",

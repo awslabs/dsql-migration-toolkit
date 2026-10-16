@@ -35,11 +35,11 @@ a **compatibility assessment report**.
 
 | Class | Meaning | Examples |
 |---|---|---|
-| **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, multi-database sources, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate). |
-| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, `DECIMAL` precision > 1000, > 255 columns/table, > 1000 tables/database, FULLTEXT/SPATIAL indexes. |
+| **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below); a multi-database MySQL source (each database becomes its own schema, flagged `RECOMMENDED`); an index name another table, view or index of the schema also uses (the index is renamed automatically, flagged `RECOMMENDED`). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns (a UNIQUE one stops enforcing uniqueness), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`). |
+| **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`), names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), FULLTEXT/SPATIAL indexes. |
 
-The examples above are drawn from a MySQL source. For a **PostgreSQL source** the same
+The examples above are mostly drawn from a MySQL source. For a **PostgreSQL source** the same
 scale applies: unsupported PG column types — arrays (`[]`), geometric
 (`point`/`line`/`box`/…), network (`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`,
 `bit`/`bit varying`/`varbit`, `tsvector`/`tsquery`, range + multirange, `pgvector`,
@@ -118,6 +118,25 @@ For every assessed object you get:
 
 The report also rolls these up into **summaries**: counts per classification and
 per effort level — your at-a-glance picture of how migratable the schema is.
+
+### The migration readiness score
+
+The card at the top of the report rates the per-object work from 0 to 100. An AUTO object
+costs nothing; any other object costs its effort weight (simple 1, medium 3, significant 7;
+an UNSUPPORTED object with no estimate counts as significant), and recommendations cost
+nothing. The score is 100 minus that cost as a share of the worst case (every object
+significant), and it stays below 100 while any object needs work. A database-level limit
+item does not count toward the score: it sets the band instead.
+
+The band is decided by blockers first, so a large source cannot average them away:
+
+| Band | When |
+|---|---|
+| **Blocked** (red) | The migration exceeds an Aurora DSQL database limit: more than 1,000 tables, 10 schemas or 5,000 views in one database, counting what the target cluster already holds. Nothing else matters until it is resolved, so this band wins whatever the score. |
+| **Unsupported objects** (amber) | At least one object is UNSUPPORTED and the score alone would read Ready or Low effort. (With a lower score, the effort band below keeps its label.) |
+| **Ready** / **Low effort** (green) | Score ≥ 90 / ≥ 70, with nothing UNSUPPORTED. |
+| **Moderate effort** / **Significant effort** (amber) | Score ≥ 45 / ≥ 1. |
+| **High effort** (red) | Score 0. |
 
 ### Target name-conflict detection (before you apply anything)
 
@@ -309,10 +328,12 @@ MySQL→PostgreSQL transpile:
   expression referencing another column does not), it is dropped and **reported** rather
   than silently lost. `ON UPDATE CURRENT_TIMESTAMP` cannot be reproduced at all — DSQL
   has no `ON UPDATE` clause and no triggers — so it is flagged **MANUAL** for the
-  application to handle. **For a PostgreSQL source** the converter emits **no** column
-  DEFAULTs at all — including `serial`/`IDENTITY` `nextval` and generated-column
-  expressions — so the chosen primary-key strategy governs identity on the target
-  instead. A `STORED` generated column IS preserved, though: its expression is re-emitted
+  application to handle. **For a PostgreSQL source** a column DEFAULT **is** carried
+  across (normalized by a PostgreSQL re-parse); a primary-key `serial`/`IDENTITY`
+  `nextval` is governed by the chosen primary-key strategy instead, and a non-key
+  `nextval`, a default that does not parse, or one that casts to a type DSQL lacks is
+  dropped with a note (an enum default is kept as its plain text literal, since the column
+  becomes `text`). A `STORED` generated column IS preserved, too: its expression is re-emitted
   as `GENERATED ALWAYS AS (expr) STORED` and Aurora DSQL maintains the value on every
   write, so nothing has to be re-implemented (a write must simply OMIT the column, which
   Full Load and the CDC sink do). A `VIRTUAL` generated column — PG18's default kind — has
@@ -445,8 +466,10 @@ shared "write contract" keeps them identical).
 > (`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`, `bit`/`bit varying`/`varbit`,
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. The PG
 > numeric rules match the table below: `numeric(p,s)` with `p > 1000`/`s > 1000` is clamped
-> with a warning, and a bare `numeric`/`decimal` becomes `numeric(18,6)`. Column
-> DEFAULTs and `serial`/`IDENTITY` `nextval` are **not** emitted (the primary-key strategy
+> with a warning, and a bare `numeric`/`decimal` is stored as `numeric(18,6)`: a value with
+> more than 6 fractional digits is rounded on load and Validation compares that column at
+> scale 6, so Evaluation flags it (`PG_UNCONSTRAINED_NUMERIC`). Column DEFAULTs **are**
+> emitted; only a `serial`/`IDENTITY` `nextval` is stripped (the primary-key strategy
 > governs identity). A `STORED` generated column's expression **is** re-emitted
 > (`GENERATED ALWAYS AS (expr) STORED`), because Aurora DSQL supports and maintains those;
 > a `VIRTUAL` one becomes an ordinary column.
@@ -483,7 +506,7 @@ conversion (redesign).
 
 | MySQL type | Aurora DSQL type | Stored value form | Class | Note |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 1000** → Evaluation flags it **UNSUPPORTED** (DSQL documents a maximum precision of 1000, scale -1000..1000, default `numeric(18,6)`); Schema Conversion still emits DDL by **clamping to the maximum** with a data-loss warning. A MySQL `DECIMAL` (max 65,30) and almost every PostgreSQL `numeric` are well inside this, so the clamp normally never fires. A value with more decimal places than the target keeps (a source widened after Step 1, or a narrower type set here) is refused on Full Load and CDC, never rounded. |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Precision/scale preserved. **Precision > 1000** → Evaluation flags it **UNSUPPORTED** (DSQL documents a maximum precision of 1000, scale -1000..1000, default `numeric(18,6)`); Schema Conversion still emits DDL by **clamping to the maximum** with a data-loss warning. A MySQL `DECIMAL` (max 65,30) and every PostgreSQL `numeric` (whose own limit is the same 1000) are inside this, so the flag and the clamp are only a safety net. A value with more decimal places than the target keeps (a source widened after Step 1, or a narrower type set here) is refused on Full Load and CDC, never rounded. |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | Unsigned-ness is not representable and carries no storage meaning. |
 | `FLOAT` | `real` | `real` | AUTO | Single-precision float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | The `(M,D)` display spec is dropped (PostgreSQL `float` takes one precision, not a scale). |
@@ -531,17 +554,19 @@ conversion (redesign).
 | **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |
 | **`CREATE INDEX ASYNC`** | Secondary indexes are created asynchronously, after data. |
 | **Optimistic concurrency** | Every batch and DDL is wrapped in `40001` retry. |
-| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across (normalized by a PostgreSQL re-parse) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. Note a default that casts to a user-defined type (e.g. an `ENUM`) is carried verbatim, so it must be remodelled with its column. |
+| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across (normalized by a PostgreSQL re-parse) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. A converted enum column keeps its default as a plain text literal; a default that casts to another type DSQL lacks is dropped with a note. |
 | **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
 | **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
 | **No native partitioning** | DSQL auto-distributes; partitioned tables are flagged MANUAL. |
-| **One database per cluster** | A multi-database source is flagged MANUAL (consolidate into schemas or split clusters). |
+| **One database per cluster** | Each source database of a multi-database MySQL source becomes its own schema automatically (flagged `RECOMMENDED`); see the next row for how many fit. |
+| **≤ 10 schemas, ≤ 1,000 tables, ≤ 5,000 views per database** | Evaluation counts what the target database will hold after the migration (the source's objects plus those already on the cluster; the built-in `public` schema is not counted, and a schema that holds no table or view is not visible to the count) and flags any excess **UNSUPPORTED** (`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`), which makes the readiness score read **Blocked**. Otherwise the apply would create the first objects and then fail with `54000`. At the limit Aurora DSQL rejects every `CREATE SCHEMA`, even `IF NOT EXISTS` for a schema that already exists (live-verified), so the apply checks the catalog and treats ensuring an existing schema as done. |
 | **Source `CHECK` constraints are dropped** | A source `CHECK` constraint (a MySQL `CHECK` requires 8.0.16+) is **not** carried to the target — its functions/operators may differ on DSQL — and is flagged **MANUAL**: re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool *generates* for an `ENUM` is unaffected.) |
-| **`bytea` cannot be a key** | A `bytea` column (from `BINARY`/`VARBINARY`, `*BLOB`, or spatial) cannot be a **primary-key** column (table → **UNSUPPORTED**) or an **index** column (index dropped → **MANUAL**). Re-key as `text`/`uuid`/hash. |
+| **`bytea` cannot be a key** | A `bytea` column (from `BINARY`/`VARBINARY`, `*BLOB`, or spatial) cannot be a **primary-key** column (table → **UNSUPPORTED**) or an **index** column (index dropped → **MANUAL**; a dropped UNIQUE index no longer enforces uniqueness, and the note says so). Evaluation flags the same tables (`BYTEA_KEY`). Re-key as `text`/`uuid`/hash. |
 | **≤ 8 columns per key** | A primary key or index over more than 8 columns exceeds DSQL's limit: the PK case is **UNSUPPORTED**, an over-wide secondary index is **dropped (MANUAL)**. |
 | **≤ 24 indexes per table** | DSQL allows at most 24 indexes per table (the PK counts, so ≤ 23 secondary). Excess indexes are flagged and not all emitted. |
 | **≤ 1 KiB key value** | The combined key value must stay under ~1 KiB; a wide key is flagged as a **recommendation** (it can fail at insert time on real data). |
-| **63-byte identifiers** | DSQL/PostgreSQL truncate identifiers to 63 bytes; where truncation would collide two names, the object is flagged **UNSUPPORTED** (rename to keep the first 63 bytes unique). |
+| **63-byte identifiers** | DSQL/PostgreSQL truncate identifiers to 63 bytes (on a character boundary). Two column names of one table that truncate to the same name make the table **UNSUPPORTED** (`IDENTIFIER_LENGTH`). Two tables or views of one schema that truncate to the same name are **UNSUPPORTED** too (`NAME_COLLISION`), and Schema Conversion creates neither of them (Data Migration does not offer them either), because whichever came first would receive the other's rows; rename on the source so the first 63 bytes differ. Schema names are cut the same way, so two source databases whose names agree in their first 63 bytes share one target schema. A longer name that collides with nothing is a **recommendation**: DSQL stores the shortened name. |
+| **Index names are unique per schema** | Aurora DSQL keeps a schema's tables, views and indexes in one namespace, while MySQL scopes an index name to its table. Schema Conversion therefore **renames** every index whose name another relation of the schema also uses to `<table>_<index>` (cut to 63 bytes with a hash suffix if needed); tables and views keep their names, and view names are emitted quoted like table names, so their case is kept. Every index, a UNIQUE one included, is then created. Evaluation and Schema Conversion flag the renamed indexes `RECOMMENDED` (`NAME_COLLISION`), and a primary-key strategy change keeps the same names. If an earlier apply left a relation that holds a name now needed by a different object (an index named like a table), the apply reports that object **FAILED** with the holder named, instead of skipping it as "already exists", and Evaluation's target analysis lists it under *Names held on the target by another object*. On a target an earlier version built, the apply still creates the renamed index and the quoted view, and its result notes the old copy left under the previous name, which nothing maintains any more: drop it (a **Replace** drops it). |
 
 The **Class** column above uses the same AUTO / MANUAL / UNSUPPORTED scale Evaluation
 applies to every object — see [§2.1](#every-object-gets-one-classification) for what each

@@ -234,6 +234,37 @@ def test_run_evaluation_assessment_includes_effort_estimate() -> None:
     assert result.assessment.effort_summary[EffortLevel.SIGNIFICANT] == 0
 
 
+def test_run_evaluation_counts_the_target_against_the_database_limits() -> None:
+    """The target is read before the assessment, so 700 new tables into a cluster that
+    already holds 400 others are reported as over Aurora DSQL's 1,000-table limit."""
+    from dsql_migrator.core.models import (
+        TargetInventory,
+        TargetObjectKind,
+        TargetRelation,
+        TargetSchemaNode,
+    )
+
+    src_factory, _ = _source_factory(SourceInventory(tables=_clean_tables(700)))
+    occupied = TargetInventory(
+        schemas=[
+            TargetSchemaNode(
+                name="other",
+                tables=[
+                    TargetRelation(schema_name="other", name=f"x{i}", kind=TargetObjectKind.TABLE)
+                    for i in range(400)
+                ],
+            )
+        ]
+    )
+    tgt_factory, _ = _target_factory(occupied)
+
+    result = run_evaluation(
+        _inputs(), introspector_factory=src_factory, target_browser_factory=tgt_factory
+    )
+    (limit,) = [i for i in result.assessment.items if i.kind == "DATABASE"]
+    assert (limit.rule_id, limit.object_name) == ("TABLE_COUNT_LIMIT", "1,100 tables")
+
+
 def test_run_evaluation_reports_no_conflicts_for_empty_target() -> None:
     src_factory, _ = _source_factory(_inventory_with_fk())
     tgt_factory, _ = _target_factory(_empty_target())
@@ -632,6 +663,73 @@ def test_compute_migration_score_mixed_lands_in_a_middle_band() -> None:
     # 1 simple penalty (1.0) over worst case (7*4=28) -> ~96 -> "Ready" band.
     assert score.tone in {"success", "warning"}
     assert score.manual == 1
+
+
+def _clean_tables(n: int, *, schema: str = "app") -> list:
+    return [
+        TableDef(
+            name=f"{schema}.t{i}",
+            columns=[ColumnDef(name="id", mysql_type="int")],
+            primary_key=["id"],
+        )
+        for i in range(n)
+    ]
+
+
+def test_a_source_over_a_database_limit_reads_blocked_not_ready() -> None:
+    """1,001 otherwise-clean tables scored 100 'Ready -- a straightforward migration', a
+    green all-clear for a source whose 1,001st CREATE TABLE fails at apply. A database-
+    level limit decides the band before the ratio does."""
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.ui.evaluation import compute_migration_score
+
+    score = compute_migration_score(
+        CompatibilityAssessor().assess(SourceInventory(tables=_clean_tables(1001)))
+    )
+    assert (score.band, score.tone) == ("Blocked", "error")
+    # The limit item sets the band, not the per-object score (every table is AUTO here).
+    assert score.score == 100
+    assert "1,001 tables (Aurora DSQL allows 1,000 tables per database)" in score.summary
+
+
+def test_unsupported_objects_never_read_as_a_success_band() -> None:
+    """2 of 10 tables without a primary key scored 91 'Ready' (success)."""
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.ui.evaluation import compute_migration_score
+
+    no_pk = [
+        TableDef(name=f"app.nopk{i}", columns=[ColumnDef(name="v", mysql_type="int")])
+        for i in range(2)
+    ]
+    score = compute_migration_score(
+        CompatibilityAssessor().assess(SourceInventory(tables=_clean_tables(8) + no_pk))
+    )
+    assert (score.band, score.tone) == ("Unsupported objects", "warning")
+    assert score.summary.startswith("2 objects cannot move to Aurora DSQL as-is")
+    # A report whose ratio is already a warning/error band keeps its own label.
+    heavy = compute_migration_score(
+        _score_report(
+            (Classification.UNSUPPORTED, EffortLevel.SIGNIFICANT),
+            (Classification.UNSUPPORTED, EffortLevel.SIGNIFICANT),
+        )
+    )
+    assert (heavy.band, heavy.tone) == ("High effort", "error")
+
+
+def test_the_score_is_never_100_while_any_object_needs_work() -> None:
+    """One SIGNIFICANT object among 200 used to round 99.5 up to a perfect 100."""
+    from dsql_migrator.ui.evaluation import compute_migration_score
+
+    auto = [(Classification.AUTO, None)] * 199
+    manual = compute_migration_score(
+        _score_report(*auto, (Classification.MANUAL, EffortLevel.SIGNIFICANT))
+    )
+    assert (manual.score, manual.band, manual.tone) == (99, "Ready", "success")
+    unsupported = compute_migration_score(
+        _score_report(*auto, (Classification.UNSUPPORTED, EffortLevel.SIGNIFICANT))
+    )
+    assert unsupported.score == 99
+    assert (unsupported.band, unsupported.tone) == ("Unsupported objects", "warning")
 
 
 def test_a_mysql_json_table_grades_and_scores_like_a_postgres_json_table() -> None:
@@ -1569,24 +1667,27 @@ def test_a_cluster_level_row_renders_like_every_table_row() -> None:
     from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef
     from dsql_migrator.ui.evaluation import _render_assessment_item
 
+    # Eleven databases need eleven target schemas: the database-level SCHEMA_COUNT_LIMIT
+    # blocker (the multi-database note itself is advice now, and renders as such).
     report = CompatibilityAssessor().assess(
         SourceInventory(
             tables=[
                 TableDef(
-                    name=f"{schema}.t",
+                    name=f"db{n}.t",
                     columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
                     primary_key=["id"],
                 )
-                for schema in ("ecommerce", "ecommerce_demo")
+                for n in range(11)
             ]
         )
     )
     cluster = next(i for i in report.items if i.kind == "DATABASE")
+    assert cluster.rule_id == "SCHEMA_COUNT_LIMIT", cluster
 
     ui = _ItemUi()
     _render_assessment_item(ui, cluster)
     # The category badge treatment, same as a table row.
-    assert "1 Review needed" in ui.badges, ui.badges
+    assert "1 Unsupported" in ui.badges, ui.badges
     # The card treatment: labeled Risk / Recommendation panels behind a spine. (The caps
     # in the rendered UI come from a `uppercase` class, not from the label text.)
     assert "Risk" in ui.texts and "Recommendation" in ui.texts, ui.texts

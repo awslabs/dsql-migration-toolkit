@@ -42,11 +42,22 @@ conflicts without any live DSQL cluster or AWS call.
 
 from __future__ import annotations
 
+import logging
 import random
 import re
 import time
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 from psycopg import sql
 
@@ -190,8 +201,14 @@ _CREATE_PATTERN = re.compile(
     r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:UNIQUE\s+)?"
     r"(?P<kind>MATERIALIZED\s+VIEW|TABLE|VIEW|INDEX|SCHEMA)\s+"
     r"(?:ASYNC\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
-    r"(?P<name>(?:\"[^\"]+\"|[A-Za-z_][\w$]*)"
-    r"(?:\.(?:\"[^\"]+\"|[A-Za-z_][\w$]*))*)",
+    r"(?P<name>(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][\w$]*)"
+    r"(?:\.(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][\w$]*))*)",
+    re.IGNORECASE,
+)
+# The ``ON <table>`` of a CREATE INDEX, read right after the index name.
+_INDEX_ON_PATTERN = re.compile(
+    r"\s+ON\s+(?:ONLY\s+)?(?P<table>(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][\w$]*)"
+    r"(?:\.(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][\w$]*))*)",
     re.IGNORECASE,
 )
 
@@ -232,14 +249,78 @@ class _ExistenceOracle(Protocol):
 
 
 class _ParsedObject:
-    """The identity of the object a CREATE statement defines."""
+    """The identity of the object a CREATE statement defines.
 
-    __slots__ = ("name", "kind", "identifier")
+    For an INDEX, ``on_table`` holds the ``ON`` table's unquoted parts. An index lives in
+    that table's SCHEMA, so it is looked up and dropped schema-qualified: Aurora DSQL keeps
+    one relation namespace per schema, and a bare ``DROP INDEX "x"`` resolves through the
+    search_path -- so it could drop a same-named index of ANOTHER schema -- while a bare
+    existence check matched an index of the same name in any schema and skipped this one.
+    """
 
-    def __init__(self, name: str, kind: str, identifier: sql.Identifier) -> None:
-        self.name = name
+    __slots__ = ("name", "kind", "parts", "identifier", "on_table")
+
+    def __init__(
+        self,
+        kind: str,
+        parts: "list[str]",
+        on_table: "Optional[list[str]]" = None,
+    ) -> None:
+        self.name = ".".join(parts)
         self.kind = kind
-        self.identifier = identifier
+        self.parts = parts
+        self.identifier = sql.Identifier(*parts)
+        self.on_table = on_table
+
+    @property
+    def _index_schema(self) -> Optional[str]:
+        if self.kind == _INDEX and self.on_table and len(self.on_table) > 1:
+            return self.on_table[0]
+        return None
+
+    @property
+    def stored_parts(self) -> Optional[tuple[str, str]]:
+        """``(schema, name)`` as the catalog stores them, or ``None`` when unqualified.
+
+        Each part cut to 63 bytes like the server does (:func:`~dsql_migrator.core.
+        target_introspector.pg_stored_name`); an index's schema is its table's."""
+        from dsql_migrator.core.target_introspector import pg_stored_name
+
+        if self.kind == _INDEX:
+            schema = self._index_schema
+            if schema is None:
+                return None
+            return pg_stored_name(schema), pg_stored_name(self.name)
+        if len(self.parts) != 2:
+            return None
+        return pg_stored_name(self.parts[0]), pg_stored_name(self.parts[1])
+
+    @property
+    def lookup_name(self) -> str:
+        """The name to check existence by (an index: ``<its table's schema>.<index>``)."""
+        stored = self.stored_parts
+        if stored is not None:
+            return ".".join(stored)
+        schema = self._index_schema
+        return f"{schema}.{self.name}" if schema else self.name
+
+    @property
+    def drop_identifier(self) -> "sql.Identifier":
+        schema = self._index_schema
+        return sql.Identifier(schema, self.name) if schema else self.identifier
+
+    @property
+    def on_table_name(self) -> Optional[str]:
+        return ".".join(self.on_table) if self.on_table else None
+
+    @property
+    def stored_on_table_name(self) -> Optional[str]:
+        """The ``ON`` table as the catalog stores it (each part cut to 63 bytes)."""
+        from dsql_migrator.core.target_introspector import pg_stored_name
+
+        if not self.on_table:
+            return None
+        return ".".join(pg_stored_name(part) for part in self.on_table)
 
 
 def parse_create_object(target_ddl: str) -> tuple[str, str]:
@@ -264,11 +345,12 @@ def _parse(target_ddl: str) -> _ParsedObject:
             "target DDL must be a CREATE TABLE/VIEW/MATERIALIZED VIEW/INDEX statement"
         )
     kind = re.sub(r"\s+", " ", match.group("kind").strip().upper())
-    raw_parts = _split_identifier(match.group("name"))
-    object_name = ".".join(raw_parts)
-    return _ParsedObject(
-        name=object_name, kind=kind, identifier=sql.Identifier(*raw_parts)
-    )
+    on_table = None
+    if kind == _INDEX:
+        on_match = _INDEX_ON_PATTERN.search(target_ddl, match.end())
+        if on_match is not None:
+            on_table = _split_identifier(on_match.group("table"))
+    return _ParsedObject(kind, _split_identifier(match.group("name")), on_table)
 
 
 def _split_identifier(raw: str) -> list[str]:
@@ -286,13 +368,90 @@ def _split_identifier(raw: str) -> list[str]:
     statement, so the name can never break out into SQL (Requirement 9.4).
     """
     parts: list[str] = []
-    for part in re.findall(r'"[^"]+"|[^.]+', raw):
+    for part in re.findall(r'"(?:[^"]|"")+"|[^.]+', raw):
         token = part.strip()
         if token.startswith('"') and token.endswith('"'):
-            parts.append(token[1:-1])
+            parts.append(token[1:-1].replace('""', '"'))
         else:
             parts.append(token.lower())
     return parts
+
+
+_LOGGER = logging.getLogger(__name__)
+
+# The SKIPPED detail of an object that is simply already there.
+SKIPPED_EXISTING_DETAIL = "Object already exists on the target; skipped."
+
+
+@dataclass(frozen=True)
+class ConvertedNames:
+    """What the conversion emits, by stored ``(schema, name)``, so that what an EARLIER
+    version of the tool left on the target under another name is recognized -- to drop it
+    on a REPLACE, and to say what it is -- and never taken for the source's own object.
+    Nothing here makes an apply SKIP an object: a leftover is not the object.
+
+    ``views``: every source view as the converter emits it (quoted, each part cut to 63
+    bytes). Up to 0.1.570 views were emitted unquoted, so ``V_Orders`` is on such a target
+    as ``v_orders`` -- unless the source also has a view ``v_orders``, which is then that
+    view, not a leftover.
+
+    ``renamed_indexes``: ``(schema, emitted index name)`` -> the source index name the
+    converter renamed it from (:func:`~dsql_migrator.core.converter.index_renames`). Up to
+    0.1.570 the index kept that name, so a target built then holds it under the old one.
+    ``legacy_indexes`` is the reverse: ``(schema, stored source name)`` -> ``(its table,
+    emitted name)``, for telling a table or view whose name such an index holds what to do.
+    ``relations``: every source table and view -> ``"table"`` / ``"view"``.
+    """
+
+    views: frozenset = frozenset()
+    renamed_indexes: Mapping = field(default_factory=dict)
+    legacy_indexes: Mapping = field(default_factory=dict)
+    relations: Mapping = field(default_factory=dict)
+
+
+def converted_names(
+    view_names: "Iterable[str]",
+    index_renames: "Mapping[str, Mapping[str, str]]",
+    *,
+    table_names: "Iterable[str]" = (),
+) -> ConvertedNames:
+    """:class:`ConvertedNames` from the source's view and table names (``schema.name``,
+    split on the first dot like the converter) and the conversion's index renames (keyed
+    by table)."""
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    def _stored(qualified: str) -> "Optional[tuple[str, str]]":
+        schema, _, name = qualified.partition(".")
+        return (pg_stored_name(schema), pg_stored_name(name)) if schema and name else None
+
+    relations: dict = {}
+    for qualified in table_names:
+        stored = _stored(qualified)
+        if stored is not None:
+            relations.setdefault(stored, "table")
+    views = set()
+    for qualified in view_names:
+        stored = _stored(qualified)
+        if stored is not None:
+            views.add(stored)
+            relations.setdefault(stored, "view")
+    renamed: dict = {}
+    legacy: dict = {}
+    for table in sorted(index_renames):
+        schema, _, name = table.partition(".")
+        if not (schema and name):
+            continue
+        stored_schema = pg_stored_name(schema)
+        owner = f"{stored_schema}.{pg_stored_name(name)}"
+        for old, new in sorted(index_renames[table].items()):
+            renamed[(stored_schema, pg_stored_name(new))] = old
+            legacy.setdefault((stored_schema, pg_stored_name(old)), (owner, new))
+    return ConvertedNames(
+        views=frozenset(views),
+        renamed_indexes=renamed,
+        legacy_indexes=legacy,
+        relations=relations,
+    )
 
 
 class SchemaApplier:
@@ -340,6 +499,11 @@ class SchemaApplier:
         self._occ_base_delay = occ_base_delay
         self._sleep = sleep
         self._jitter = jitter
+        self._converted_names: Optional[ConvertedNames] = None
+
+    def set_converted_names(self, names: Optional[ConvertedNames]) -> None:
+        """What the conversion emits (see :class:`ConvertedNames`); ``None`` when unknown."""
+        self._converted_names = names
 
     def preview(self, source_ddl: str, target_ddl: str) -> DdlPreview:
         """Pair source vs. target DDL and report target existence (Req 10.2/10.3).
@@ -414,15 +578,47 @@ class SchemaApplier:
                 detail="Schema ensured on the target.",
             )
 
-        exists = self._introspector.object_exists(parsed.name)
+        # A name can be held by a DIFFERENT kind of relation, or by the index of another
+        # table (Aurora DSQL keeps one namespace per schema; e.g. an earlier version left
+        # the index ``currency`` of ``account`` under the name of the table ``currency``).
+        # Skipping as "already exists" then reported a table or index that is not there,
+        # so the holder is checked when the oracle can tell (a browsed TargetIntrospector).
+        # It is matched EXACTLY, as the server stores names: the case-insensitive
+        # object_exists made "Currency" and the index currency one name, refusing (or
+        # skipping) the object that was not there.
+        holder_of = _browsed_holder(self._introspector)
+        stored = parsed.stored_parts
+        exact = holder_of is not None and stored is not None
+        legacy: Optional[_ParsedObject] = None
+        if exact:
+            holder = holder_of(stored)  # type: ignore[misc,arg-type]  # guarded above
+            if holder is not None and not _holder_matches(parsed, holder):
+                live = self._live_holder(parsed)
+                holder = holder if live is _UNKNOWN else live
+            if holder is not None and not _holder_matches(parsed, holder):
+                return ApplyResult(
+                    object_name=parsed.name,
+                    status=ApplyStatus.FAILED,
+                    detail=_name_taken_detail(parsed, holder, self._converted_names),
+                )
+            # What an earlier version left for this object under another name. Never a
+            # reason to skip -- it is not this object (a view that dependents read by its
+            # quoted name; an index whose old name a table may need) -- but a REPLACE drops
+            # it, and a SKIP that creates the object says it is there.
+            legacy = _legacy_twin(parsed, holder_of, self._converted_names)  # type: ignore[arg-type]
+            exists = holder is not None
+        else:
+            exists = self._introspector.object_exists(parsed.lookup_name)
 
         if exists and on_conflict is ApplyMode.SKIP_IF_EXISTS:
             return ApplyResult(
                 object_name=parsed.name,
                 status=ApplyStatus.SKIPPED,
-                detail="Object already exists on the target; skipped.",
+                detail=SKIPPED_EXISTING_DETAIL,
             )
 
+        if on_conflict is ApplyMode.REPLACE and legacy is not None:
+            exists = True  # the leftover is dropped with it
         if exists and on_conflict is ApplyMode.REPLACE and not confirmed:
             return ApplyResult(
                 object_name=parsed.name,
@@ -435,7 +631,9 @@ class SchemaApplier:
 
         replace_existing = exists and on_conflict is ApplyMode.REPLACE
         try:
-            self._execute(parsed, target_ddl, drop_first=replace_existing)
+            self._execute(
+                parsed, target_ddl, drop_first=replace_existing, drop_target=legacy
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced as a FAILED result
             # Idempotent self-heal under SKIP_IF_EXISTS (Property 5 spirit): a
             # "relation already exists" (SQLSTATE 42P07) means the object is
@@ -445,10 +643,25 @@ class SchemaApplier:
             # instead of failing. REPLACE is not self-healed here: it did not drop
             # first (the object looked absent), so the conflict is surfaced.
             if on_conflict is ApplyMode.SKIP_IF_EXISTS and _is_duplicate_object(exc):
+                # ...unless the live catalog shows ANOTHER object holds the name (another
+                # table's index, a table where a view goes): this object is not there.
+                live = self._live_holder(parsed) if exact else _UNKNOWN
+                if (
+                    live is not _UNKNOWN
+                    and live is not None
+                    and not _holder_matches(parsed, live)  # type: ignore[arg-type]
+                ):
+                    return ApplyResult(
+                        object_name=parsed.name,
+                        status=ApplyStatus.FAILED,
+                        detail=_name_taken_detail(  # type: ignore[arg-type]
+                            parsed, live, self._converted_names
+                        ),
+                    )
                 return ApplyResult(
                     object_name=parsed.name,
                     status=ApplyStatus.SKIPPED,
-                    detail="Object already exists on the target; skipped.",
+                    detail=SKIPPED_EXISTING_DETAIL,
                 )
             return ApplyResult(
                 object_name=parsed.name,
@@ -461,6 +674,14 @@ class SchemaApplier:
             if replace_existing
             else "Created on the target."
         )
+        if legacy is not None and not replace_existing:
+            note = _legacy_copy_note(parsed, legacy, self._converted_names)
+            return ApplyResult(
+                object_name=parsed.name,
+                status=ApplyStatus.CREATED,
+                detail=note,
+                note=note,
+            )
         return ApplyResult(
             object_name=parsed.name, status=ApplyStatus.CREATED, detail=detail
         )
@@ -479,19 +700,68 @@ class SchemaApplier:
         recreated later by its own apply unit, so this only reorders the drop.
         """
         parsed = _parse(target_ddl)
+        statements = [_build_drop_statement(parsed)]
+        holder_of = _browsed_holder(self._introspector)
+        legacy = (
+            _legacy_folded_view(
+                parsed,
+                holder_of,
+                self._converted_names.views if self._converted_names is not None else None,
+            )
+            if holder_of is not None
+            else None
+        )
+        if legacy is not None:
+            statements.append(_build_drop_statement(legacy))
         # DROP ... IF EXISTS is idempotent, so the whole unit can reconnect and replay if a
         # transient connection failure hits mid-execute (not just at connect open).
         _run_ddls_reconnecting(
             self._connection_factory,
-            [_build_drop_statement(parsed)],
+            statements,
             occ_max_attempts=self._occ_max_attempts,
             occ_base_delay=self._occ_base_delay,
             sleep=self._sleep,
             jitter=self._jitter,
         )
 
+    def _live_holder(self, parsed: _ParsedObject) -> object:
+        """What holds ``parsed``'s stored name on the live target now (see
+        :func:`~dsql_migrator.core.target_introspector.live_relation_holder`), or
+        :data:`_UNKNOWN` when it cannot be read -- the caller then keeps what it knew."""
+        from dsql_migrator.core.target_introspector import live_relation_holder
+
+        stored = parsed.stored_parts
+        if stored is None:
+            return _UNKNOWN
+        try:
+            connection = _open_connection_with_retry(
+                self._connection_factory,
+                occ_max_attempts=self._occ_max_attempts,
+                occ_base_delay=self._occ_base_delay,
+                sleep=self._sleep,
+                jitter=self._jitter,
+            )
+        except Exception:  # noqa: BLE001 - unknown: the caller keeps the browse's answer
+            return _UNKNOWN
+        try:
+            holder = live_relation_holder(connection, *stored)
+        except Exception:  # noqa: BLE001 - unknown, as above
+            return _UNKNOWN
+        finally:
+            _safe_close(connection)
+        if holder is not None and not (
+            isinstance(holder, tuple) and len(holder) == 2 and isinstance(holder[0], str)
+        ):
+            return _UNKNOWN
+        return holder
+
     def _execute(
-        self, parsed: _ParsedObject, target_ddl: str, *, drop_first: bool
+        self,
+        parsed: _ParsedObject,
+        target_ddl: str,
+        *,
+        drop_first: bool,
+        drop_target: Optional[_ParsedObject] = None,
     ) -> None:
         """Run the DROP (when replacing) and the CREATE as single-DDL txns.
 
@@ -507,12 +777,18 @@ class SchemaApplier:
         (no drop) runs the bare ``CREATE`` on a storm-retried connect but is NOT replayed on
         a mid-execute transient -- a bare CREATE is not idempotent, so a replay could
         spuriously hit "relation already exists". An ``XX000`` on the bare CREATE is
-        retried on the same connection (see :meth:`_run_ddl`).
+        retried on the same connection (see :meth:`_run_ddl`). ``drop_target`` is what an
+        earlier version left under another name (:func:`_legacy_twin`): the unit drops it
+        AND the exact name, so a replay after the CREATE committed drops what it created
+        before re-creating it instead of failing "already exists".
         """
         if drop_first:
+            drops = [_build_drop_statement(parsed)]
+            if drop_target is not None:
+                drops.insert(0, _build_drop_statement(drop_target))
             _run_ddls_reconnecting(
                 self._connection_factory,
-                [_build_drop_statement(parsed), target_ddl],
+                [*drops, target_ddl],
                 occ_max_attempts=self._occ_max_attempts,
                 occ_base_delay=self._occ_base_delay,
                 sleep=self._sleep,
@@ -574,6 +850,165 @@ class SchemaApplier:
             raise
 
 
+# "The live catalog could not be read" (distinct from ``None``, "the name is free").
+_UNKNOWN = object()
+
+
+def _holder_matches(parsed: _ParsedObject, holder: "tuple[str, Optional[str]]") -> bool:
+    """Whether the relation that holds ``parsed``'s name on the target IS that object.
+
+    Exact, on stored names: the holder's names come from the catalog (cut to 63 bytes)."""
+    kind, owner = holder
+    if parsed.kind == _INDEX:
+        on_table = parsed.stored_on_table_name
+        return kind == "INDEX" and (not on_table or owner == on_table)
+    if parsed.kind in ("TABLE", "VIEW"):
+        return kind == parsed.kind
+    return True
+
+
+def _ascii_fold(name: str) -> str:
+    """``name`` as PostgreSQL folds an unquoted identifier (ASCII letters only)."""
+    from dsql_migrator.core.target_introspector import pg_fold_unquoted
+
+    return pg_fold_unquoted(name)
+
+
+_HolderLookup = Callable[[tuple[str, str]], Optional[tuple[str, Optional[str]]]]
+
+
+def _legacy_folded_view(
+    parsed: _ParsedObject,
+    holder_of: _HolderLookup,
+    own_views: "Optional[frozenset]" = None,
+) -> Optional[_ParsedObject]:
+    """The copy an earlier version created of view ``parsed`` under its FOLDED name, if any.
+
+    Up to 0.1.570 views were emitted unquoted (``CREATE VIEW shop.V_Orders``), which the
+    server stored as ``shop.v_orders``; they are quoted now. A view under the folded name
+    is that copy -- unless it is itself a source view (``own_views``: stored names of the
+    source's views, see :class:`ConvertedNames`; ``None`` when unknown). A REPLACE and a
+    pre-drop drop it with the view: it would still read, and block the DROP of, its
+    tables. ``holder_of`` answers for stored ``(schema, name)`` parts."""
+    stored = parsed.stored_parts
+    if parsed.kind != "VIEW" or stored is None:
+        return None
+    folded = (_ascii_fold(stored[0]), _ascii_fold(stored[1]))
+    if folded == stored or (own_views is not None and folded in own_views):
+        return None
+    if holder_of(folded) != ("VIEW", None):
+        return None
+    return _ParsedObject("VIEW", list(folded))
+
+
+def _legacy_renamed_index(
+    parsed: _ParsedObject, holder_of: _HolderLookup, renamed: "Mapping"
+) -> Optional[_ParsedObject]:
+    """The copy an earlier version created of index ``parsed`` under its SOURCE name.
+
+    The converter renames an index whose name another relation of the schema uses
+    (``renamed``: see :class:`ConvertedNames`); up to 0.1.570 the first table applied kept
+    the source name. An index of that name on the same table is that copy (or another
+    index the converter now also renames: names that agree in 63 bytes). A REPLACE drops
+    it with the index."""
+    stored = parsed.stored_parts
+    if parsed.kind != _INDEX or stored is None or not parsed.on_table:
+        return None
+    old = renamed.get(stored)
+    if old is None:
+        return None
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    old_stored = (stored[0], pg_stored_name(old))
+    if old_stored == stored:
+        return None
+    if holder_of(old_stored) != ("INDEX", parsed.stored_on_table_name):
+        return None
+    return _ParsedObject(_INDEX, [old], parsed.on_table)
+
+
+def _legacy_twin(
+    parsed: _ParsedObject, holder_of: _HolderLookup, names: Optional[ConvertedNames]
+) -> Optional[_ParsedObject]:
+    """What an earlier version left on the target for ``parsed`` under another name."""
+    return _legacy_folded_view(
+        parsed, holder_of, names.views if names is not None else None
+    ) or _legacy_renamed_index(
+        parsed, holder_of, names.renamed_indexes if names is not None else {}
+    )
+
+
+def _browsed_holder(introspector: object) -> Optional[_HolderLookup]:
+    """The introspector's exact holder lookup over stored parts, if it has one."""
+    holder_of = getattr(introspector, "relation_holder", None)
+    if holder_of is None:
+        return None
+    return lambda parts: holder_of(".".join(parts))
+
+
+def _legacy_copy_note(
+    parsed: _ParsedObject, legacy: _ParsedObject, names: Optional[ConvertedNames]
+) -> str:
+    """What a SKIP apply that created ``parsed`` says about the copy an earlier version
+    left under another name (it is not dropped: SKIP never drops)."""
+    schema = (parsed.stored_parts or ("", ""))[0]
+    if parsed.kind == _INDEX:
+        blocks = ""
+        needs = names.relations.get((schema, legacy.name)) if names is not None else None
+        if needs is not None:
+            blocks = (
+                f" It also holds the name of the {needs} {schema}.{legacy.name}, which "
+                "cannot be created until it is dropped."
+            )
+        return (
+            f"Created as {parsed.name}. The copy an earlier version created under the "
+            f"source name, {legacy.name}, is still on {parsed.on_table_name} and now "
+            f'duplicates it; drop it (DROP INDEX "{schema}"."{legacy.name}").' + blocks
+        )
+    return (
+        f"Created as {parsed.name}. The copy an earlier version created without quotes, "
+        f"{legacy.name}, is still on the target and no longer kept in step with the "
+        "source; drop it once nothing reads that name (a Replace of this view, or a Drop "
+        "& reload of a table it reads, drops it)."
+    )
+
+
+def _name_taken_detail(
+    parsed: _ParsedObject,
+    holder: "tuple[str, Optional[str]]",
+    names: Optional[ConvertedNames] = None,
+) -> str:
+    kind, owner = holder
+    subject = (
+        f"Index {parsed.name} on {parsed.on_table_name}"
+        if parsed.kind == _INDEX and parsed.on_table_name
+        else f"{parsed.kind.title()} {parsed.name}"
+    )
+    stored = parsed.stored_parts
+    copy_of = (
+        names.legacy_indexes.get(stored)
+        if names is not None and stored is not None and kind == "INDEX"
+        else None
+    )
+    if copy_of is not None and copy_of[0] == owner:
+        # Up to 0.1.570 the colliding index kept this name; the conversion now creates it
+        # as ``copy_of[1]``, so the old copy can go.
+        return (
+            f"{subject} was not created: its name is held on the target by the index "
+            f"{stored[1]} on {owner}, the copy an earlier version made of the index this "
+            f"migration creates as {copy_of[1]}. Drop that index "
+            f'(DROP INDEX "{stored[0]}"."{stored[1]}") once {copy_of[1]} exists (this apply '
+            "creates it), then apply again."
+        )
+    what = f"an index on {owner}" if kind == "INDEX" and owner else f"a {kind.lower()}"
+    return (
+        f"{subject} was not created: the name is already used on the target by {what} "
+        "(Aurora DSQL keeps a schema's tables, views and indexes in one namespace; an "
+        "earlier apply may have left it). Drop or rename that object on the target if it "
+        "is left over, then apply again."
+    )
+
+
 def _build_drop_statement(parsed: _ParsedObject) -> sql.Composed:
     """Build a safe ``DROP <kind> IF EXISTS <name>`` for a destructive replace.
 
@@ -583,7 +1018,7 @@ def _build_drop_statement(parsed: _ParsedObject) -> sql.Composed:
     idempotent under OCC retry.
     """
     return sql.SQL("DROP {kind} IF EXISTS {name}").format(
-        kind=sql.SQL(parsed.kind), name=parsed.identifier
+        kind=sql.SQL(parsed.kind), name=parsed.drop_identifier
     )
 
 
@@ -601,12 +1036,21 @@ def _execute_single_ddl(connection: Any, statement: object) -> None:
         cursor.execute(statement)
     except Exception as exc:  # noqa: BLE001 - translate specific, actionable failures
         if _is_schema_limit_exceeded(exc):
+            # Aurora DSQL checks the limit BEFORE the existence check (live-verified on a
+            # disposable cluster, 2026-10-16): once the database holds 10 user schemas,
+            # EVERY CREATE SCHEMA fails -- an IF NOT EXISTS for a schema that is already
+            # there, and even for ``public``. The converter emits that idempotent ensure with
+            # every table, so a migration that filled the 10th schema (or any migration into
+            # a cluster already at 10) failed on every later table. An ensure for a schema
+            # the catalog already has is therefore complete, not failed.
+            schema = _ensured_schema_name(statement)
+            if schema is not None and _schema_present(connection, schema):
+                return
+            named = f' "{schema}"' if schema else ""
             raise SchemaApplyError(
-                f"Aurora DSQL allows at most {_DSQL_MAX_SCHEMAS} schemas per "
-                "cluster, and this one is already at the limit, so the schema this "
-                "migration needs could not be created. Remove an unused schema from "
-                "the target cluster (DROP SCHEMA ... CASCADE) or use a different "
-                "cluster, then retry."
+                f"Schema{named} could not be created: the target already holds "
+                f"{_DSQL_MAX_SCHEMAS} schemas, the Aurora DSQL limit (public not counted). "
+                "Free schemas it no longer uses, or use another cluster."
             ) from exc
         if _is_dependent_objects_error(exc):
             # Replace the driver's "Use DROP ... CASCADE" hint with the safe fix
@@ -614,6 +1058,52 @@ def _execute_single_ddl(connection: Any, statement: object) -> None:
             # state, not a transient conflict.
             raise SchemaApplyError(dependent_objects_hint(str(exc))) from exc
         raise
+    finally:
+        _safe_close(cursor)
+
+
+# The idempotent schema ensure the converter emits: ``CREATE SCHEMA IF NOT EXISTS <name>``.
+_ENSURE_SCHEMA_PATTERN = re.compile(
+    r'^\s*CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(?P<name>"(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*;?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _ensured_schema_name(statement: object) -> Optional[str]:
+    """The schema a ``CREATE SCHEMA IF NOT EXISTS`` statement ensures, as the catalog stores
+    it (a quoted name exactly, an unquoted one folded to lower case), else ``None``."""
+    if not isinstance(statement, str):
+        return None
+    match = _ENSURE_SCHEMA_PATTERN.match(statement)
+    if match is None:
+        return None
+    raw = match.group("name")
+    if raw.startswith('"'):
+        return raw[1:-1].replace('""', '"')
+    return raw.lower()
+
+
+def _schema_present(connection: Any, schema: str) -> bool:
+    """Whether ``schema`` exists on the target (``False`` when the catalog read fails)."""
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s",
+            (pg_stored_name(schema),),
+        )
+        return cursor.fetchone() is not None
+    except Exception as exc:  # noqa: BLE001 - unknown means "not confirmed"...
+        # ...except a transient read failure, which the caller's retry should repeat
+        # instead of turning a schema that IS there into a terminal limit error.
+        if (
+            is_occ_conflict(exc)
+            or is_server_unavailable(exc)
+            or is_transient_connection_error(exc)
+        ):
+            raise
+        return False
     finally:
         _safe_close(cursor)
 
@@ -742,6 +1232,7 @@ def drop_object(
     target_ddl: str,
     *,
     connection_factory: ConnectionFactory,
+    own_views: "Optional[frozenset]" = None,
     occ_max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
     sleep: SleepFunc = time.sleep,
@@ -754,19 +1245,87 @@ def drop_object(
     dropping a dependent view before recreating a table it depends on). The
     kind/name are parsed from the CREATE DDL and composed injection-safely;
     ``IF EXISTS`` keeps it idempotent under OC001 retry. Runs as a single
-    autocommit DDL on a fresh connection, which is closed afterward.
+    autocommit DDL on a fresh connection, which is closed afterward. A view an earlier
+    version left under its folded name is dropped too (see :func:`_legacy_folded_view`,
+    read from the live catalog here; ``own_views`` as there).
     """
     parsed = _parse(target_ddl)
-    # DROP ... IF EXISTS is idempotent, so the unit reconnects and replays on a transient
-    # connection failure mid-execute, not merely at connect open.
-    _run_ddls_reconnecting(
+    statements = [_build_drop_statement(parsed)]
+    legacy = _live_legacy_folded_view(
+        parsed,
         connection_factory,
-        [_build_drop_statement(parsed)],
+        own_views,
         occ_max_attempts=occ_max_attempts,
         occ_base_delay=occ_base_delay,
         sleep=sleep,
         jitter=jitter,
     )
+    if legacy is not None:
+        statements.append(_build_drop_statement(legacy))
+    # DROP ... IF EXISTS is idempotent, so the unit reconnects and replays on a transient
+    # connection failure mid-execute, not merely at connect open.
+    _run_ddls_reconnecting(
+        connection_factory,
+        statements,
+        occ_max_attempts=occ_max_attempts,
+        occ_base_delay=occ_base_delay,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+
+def _live_legacy_folded_view(
+    parsed: _ParsedObject,
+    connection_factory: ConnectionFactory,
+    own_views: "Optional[frozenset]",
+    *,
+    occ_max_attempts: int,
+    occ_base_delay: float,
+    sleep: SleepFunc,
+    jitter: JitterFunc,
+) -> Optional[_ParsedObject]:
+    """:func:`_legacy_folded_view` on the live catalog, read as resiliently as the DROP that
+    follows it: a transient connect or read failure is replayed on a fresh connection, as
+    :func:`_run_ddls_reconnecting` does.
+
+    No query for a view whose name is already lower case (it has no folded twin). A catalog
+    that still cannot be read is logged and treated as "no twin": the exact DROP runs, and
+    a twin that is left blocks its table's DROP with the dependent-view hint."""
+    from dsql_migrator.core.target_introspector import live_relation_holder
+
+    stored = parsed.stored_parts
+    if parsed.kind != "VIEW" or stored is None:
+        return None
+    folded = (_ascii_fold(stored[0]), _ascii_fold(stored[1]))
+    if folded == stored or (own_views is not None and folded in own_views):
+        return None
+
+    def _read() -> Optional[_ParsedObject]:
+        connection = connection_factory()
+        try:
+            return _legacy_folded_view(
+                parsed, lambda parts: live_relation_holder(connection, *parts), own_views
+            )
+        finally:
+            _safe_close(connection)
+
+    try:
+        return with_occ_retry(
+            max_attempts=occ_max_attempts,
+            base_delay=occ_base_delay,
+            sleep=sleep,
+            jitter=jitter,
+            retryable=lambda exc: not _is_permanent_connect_error(exc)
+            and (is_transient_connection_error(exc) or is_server_unavailable(exc)),
+        )(_read)()
+    except Exception:  # noqa: BLE001 - logged; the exact DROP still runs
+        _LOGGER.warning(
+            "Could not read the target catalog for an earlier version's lower-case copy "
+            "of view %s; only the exact name is dropped",
+            parsed.name,
+            exc_info=True,
+        )
+        return None
 
 
 def recreate_table(

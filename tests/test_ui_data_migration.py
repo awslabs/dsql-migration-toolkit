@@ -2550,7 +2550,7 @@ def _patch_view_ddl_calls(monkeypatch, migrator):
     )
     monkeypatch.setattr(
         "dsql_migrator.core.schema_applier.drop_object",
-        lambda ddl, *, connection_factory: dropped.append(ddl),
+        lambda ddl, *, connection_factory, own_views=None: dropped.append(ddl),
     )
     monkeypatch.setattr(
         "dsql_migrator.core.schema_applier.recreate_table",

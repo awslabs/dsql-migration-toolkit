@@ -703,6 +703,52 @@ class PgIdentityKeyRule(Rule):
         return findings
 
 
+class PgUnconstrainedNumericRule(Rule):
+    """Flag bare ``numeric`` / ``decimal`` columns, which Aurora DSQL stores as numeric(18,6).
+
+    A PostgreSQL ``numeric`` with no declared precision is arbitrary-precision; Aurora
+    DSQL stores it at its default ``numeric(18,6)``, so a value with more than 6
+    fractional digits is ROUNDED on load and one needing more than 12 integer digits does
+    not fit. Nothing later catches the rounding -- Full Load and CDC deliberately accept it,
+    and Validation compares such a column at scale 6, so a rounded value still reads MATCH
+    -- which makes this the one place to decide before the data moves. The text is the
+    converter's own (``unconstrained_numeric_note``), which Schema Conversion shows on the
+    same columns.
+    """
+
+    rule_id = "PG_UNCONSTRAINED_NUMERIC"
+
+    def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.converter_postgres import unconstrained_numeric_note
+
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            columns = [
+                column
+                for column in table.columns
+                if unconstrained_numeric_note(column.mysql_type) is not None
+            ]
+            if not columns:
+                continue
+            note = unconstrained_numeric_note(columns[0].mysql_type)
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=f"Column(s) {', '.join(c.name for c in columns)}: {note}",
+                    recommendation=(
+                        "Check what these columns hold. If any value has more than 6 "
+                        "fractional digits or more than 12 integer digits, give the column "
+                        "an explicit numeric(p,s) in Schema Conversion's target DDL before "
+                        "applying; otherwise numeric(18,6) keeps every value as it is."
+                    ),
+                    effort=EffortLevel.SIMPLE,
+                )
+            )
+        return findings
+
+
 def default_rules() -> "list[Rule]":
     """Ordered PostgreSQL-source compatibility rules (v1: structural, source-neutral).
 
@@ -712,8 +758,10 @@ def default_rules() -> "list[Rule]":
     order in the MySQL list.
     """
     from dsql_migrator.core.assessor import (
+        ByteaKeyRule,
         CheckConstraintRule,
         DecimalPrecisionRule,
+        NameCollisionRule,
         EventRule,
         ForeignKeyRule,
         NoPrimaryKeyRule,
@@ -745,11 +793,14 @@ def default_rules() -> "list[Rule]":
         ProcedureRule(),
         EventRule(),
         NoPrimaryKeyRule(),
+        ByteaKeyRule(is_postgres=True),
         # PG wording: declarative partitioning, leaves are separate tables.
         PartitionedTableRule(is_postgres=True),
         TooManyColumnsRule(),
-        TooManyIndexesRule(),
+        TooManyIndexesRule(is_postgres=True),
         TooManyKeyColumnsRule(),
+        # Same check as Schema Conversion's, so the two steps agree on a PG source too.
+        NameCollisionRule(is_postgres=True),
         # Shared, and correct as-is for PostgreSQL: _DECIMAL_BASES already contains
         # "numeric" and the precision is parsed from the first parenthesised integer, so
         # numeric(40,10) is caught, and the message names only the DSQL limit -- no MySQL
@@ -757,6 +808,8 @@ def default_rules() -> "list[Rule]":
         # which left a numeric that Schema Conversion will CLAMP reading AUTO at
         # Evaluation, i.e. the go/no-go report understated a lossy conversion.
         DecimalPrecisionRule(),
+        # The far more common lossy numeric: no declared precision at all.
+        PgUnconstrainedNumericRule(),
     ]
 
 

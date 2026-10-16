@@ -114,8 +114,26 @@ def _routine_kind(routine: object) -> str:
 # Synthetic kind for cluster/inventory-level findings (not a single object).
 KIND_DATABASE = "database"
 
-# DSQL limit: at most 1,000 tables per database (cluster quotas).
+# Aurora DSQL database limits ("Cluster quotas and database limits", CHAP_quotas): none is
+# configurable, and each is enforced at CREATE time with SQLSTATE 54000 -- so a migration
+# that needs more is a planning-time blocker, not something an apply can work around.
 _MAX_TABLES_PER_DATABASE = 1000
+_MAX_SCHEMAS_PER_DATABASE = 10
+_MAX_VIEWS_PER_DATABASE = 5000
+
+# Rule id -> (plural noun, limit) of each database-level limit check. The Evaluation score
+# names the limit from this when an item blocks the migration, so the wording and the
+# number live in one place.
+DSQL_DATABASE_LIMITS: dict[str, tuple[str, int]] = {
+    "TABLE_COUNT_LIMIT": ("tables", _MAX_TABLES_PER_DATABASE),
+    "SCHEMA_COUNT_LIMIT": ("schemas", _MAX_SCHEMAS_PER_DATABASE),
+    "VIEW_COUNT_LIMIT": ("views", _MAX_VIEWS_PER_DATABASE),
+}
+
+# Aurora DSQL creates ``public`` in every database, so the migration never adds it. Whether
+# it counts toward the 10-schema limit is not documented; it is left out of the count so a
+# source that needs exactly 10 schemas of its own is not reported as blocked on a guess.
+_BUILTIN_TARGET_SCHEMA = "public"
 
 # MySQL spatial base types with no native DSQL (PostgreSQL 16) equivalent. The
 # converter does NOT block these: it auto-substitutes each column to ``bytea``
@@ -1027,10 +1045,23 @@ class TooManyIndexesRule(Rule):
 
     rule_id = "TOO_MANY_INDEXES"
 
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        """``is_postgres`` selects which indexes the conversion can emit (see evaluate)."""
+        self._is_postgres = is_postgres
+
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        # Count what Schema Conversion can actually create (``_emittable_secondary_indexes``,
+        # the filter its own budget note uses): an index over a bytea column, or over more
+        # than 8 columns, is skipped and reported for that reason, so counting it here
+        # claimed a budget overflow -- and a number of kept indexes -- that the generated
+        # DDL never had.
+        from dsql_migrator.core.converter import _emittable_secondary_indexes
+
         findings: list[Finding] = []
         for table in inventory.tables:
-            count = len(table.indexes)
+            count = len(
+                _emittable_secondary_indexes(table, is_postgres=self._is_postgres)
+            )
             if count <= _MAX_SECONDARY_INDEXES_PER_TABLE:
                 continue
             findings.append(
@@ -1047,8 +1078,9 @@ class TooManyIndexesRule(Rule):
                     # silently absent. Opposite outcomes from the two steps, and the
                     # quieter one is the one that actually happens.
                     risk=(
-                        f"The table has {count} secondary indexes; with its primary "
-                        f"key that is {count + 1} against Aurora DSQL's limit of "
+                        f"The table has {count} secondary indexes Aurora DSQL can create; "
+                        f"with its primary key that is {count + 1} against Aurora DSQL's "
+                        "limit of "
                         f"{_MAX_INDEXES_PER_TABLE} indexes per table. Schema Conversion "
                         "therefore OMITS the over-budget indexes from the applied script "
                         f"(it names them) and keeps {_MAX_SECONDARY_INDEXES_PER_TABLE}, "
@@ -1172,6 +1204,191 @@ class TooManyKeyColumnsRule(Rule):
                     ),
                 )
             )
+        return findings
+
+
+class ByteaKeyRule(Rule):
+    """Flag a primary key or secondary index over a column that converts to ``bytea``.
+
+    Aurora DSQL cannot index ``bytea`` ("datatype bytea is not supported in a key"), so a
+    primary key over a BINARY/VARBINARY/BLOB column (a PostgreSQL ``bytea`` one, for a PG
+    source) makes the generated CREATE TABLE REJECTED, and a secondary index over one is
+    not created -- a UNIQUE one then stops enforcing uniqueness. Evaluation used to read
+    these tables AUTO ("No DSQL compatibility issues") with a 100 'Ready' score while the
+    very next step graded the same table UNSUPPORTED; the common MySQL key of a
+    ``UUID_TO_BIN()`` value in ``BINARY(16)`` is exactly this case.
+
+    The detection and the risk text are the converter's own (``bytea_key_parts`` and
+    ``_bytea_key_warning`` / ``_pg_bytea_key_warning``), the :class:`PartitionedTableRule`
+    pattern, so the two steps cannot disagree about the same table.
+    """
+
+    rule_id = "BYTEA_KEY"
+
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        """``is_postgres`` selects the PostgreSQL detection (genuine ``bytea`` only)."""
+        self._is_postgres = is_postgres
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import (
+            _bytea_key_warning,
+            _pg_bytea_key_warning,
+            bytea_key_parts,
+        )
+
+        note_for = _pg_bytea_key_warning if self._is_postgres else _bytea_key_warning
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            note = note_for(table)
+            if note is None:
+                continue
+            pk_bytea, _indexes, unique_bytea = bytea_key_parts(
+                table, is_postgres=self._is_postgres
+            )
+            if pk_bytea:
+                recommendation = (
+                    "Plan a re-key before migrating: no conversion option changes a bytea "
+                    "key, so this table cannot be created on Aurora DSQL as it is. Give it "
+                    "a key DSQL can index on the source (for example the UUID as text, or "
+                    "the hash as its hex string), and update the foreign keys that "
+                    "reference it."
+                )
+                effort = EffortLevel.SIGNIFICANT
+            else:
+                recommendation = (
+                    "Decide whether the target needs these indexes: a non-unique one can "
+                    "simply be left out (those queries scan instead), or replaced after the "
+                    "load by an index on an indexable form of the value, such as its hex "
+                    "text."
+                )
+                if unique_bytea:
+                    recommendation += (
+                        " A UNIQUE one must be enforced another way (in the application, "
+                        "or by a UNIQUE index on such a derived value), or the target "
+                        "accepts duplicates."
+                    )
+                effort = EffortLevel.MEDIUM if unique_bytea else EffortLevel.SIMPLE
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=note.classification,
+                    risk=note.message,
+                    recommendation=recommendation,
+                    effort=effort,
+                )
+            )
+        return findings
+
+
+class IdentifierLengthRule(Rule):
+    """Flag identifiers PostgreSQL/Aurora DSQL truncate to 63 bytes.
+
+    MySQL allows 64 characters (more bytes in UTF-8); Aurora DSQL silently truncates to 63
+    BYTES. Two column names that share their first 63 bytes collide and the CREATE TABLE is
+    REJECTED (UNSUPPORTED); a longer name that does not collide just migrates shortened
+    (advice). Graded by the converter's own ``_identifier_length_warning``, which Schema
+    Conversion shows on the same table.
+    """
+
+    rule_id = "IDENTIFIER_LENGTH"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import (
+            IDENTIFIER_COLLISION_REMEDY,
+            _identifier_length_warning,
+            index_renames,
+        )
+
+        # The index names Schema Conversion emits (a colliding index is renamed).
+        renames = index_renames(inventory)
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            note = _identifier_length_warning(table, index_names=renames.get(table.name))
+            if note is None:
+                continue
+            collides = note.classification is Classification.UNSUPPORTED
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=note.classification,
+                    risk=note.message,
+                    recommendation=(
+                        IDENTIFIER_COLLISION_REMEDY
+                        if collides
+                        else "Optional: shorten the names on the source if they must match "
+                        "exactly on the target."
+                    ),
+                    effort=EffortLevel.MEDIUM if collides else EffortLevel.SIMPLE,
+                    note_kind=note.kind,
+                )
+            )
+        return findings
+
+
+class NameCollisionRule(Rule):
+    """Report names that tables, views and indexes would share in their target schema.
+
+    Aurora DSQL keeps a schema's tables, views and indexes in one namespace (names cut to 63
+    bytes), while MySQL scopes an index name to its table. Schema Conversion renames the
+    colliding indexes itself (:func:`~dsql_migrator.core.converter.index_renames`), so an
+    index collision -- the auto-named foreign-key index ``user_id`` on every child table, an
+    index named after another table -- is advice (RECOMMENDATION): every index and table is
+    still created. What no rename can fix is two tables or views whose names agree in their
+    first 63 bytes: only one can exist and the other's rows would land in it (UNSUPPORTED,
+    shorten the names on the source). Detection is the converter's own, which Schema
+    Conversion reports on the same objects.
+    """
+
+    rule_id = "NAME_COLLISION"
+
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        """``is_postgres`` selects which indexes the conversion emits (and so can collide)."""
+        self._is_postgres = is_postgres
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import (
+            INDEX_RENAME_ADVICE,
+            index_rename_detail,
+            index_renames,
+            name_collision_detail,
+            name_collision_remedy,
+            name_collisions,
+            relation_collisions,
+        )
+
+        collisions = name_collisions(inventory, is_postgres=self._is_postgres)
+        renames = index_renames(inventory, is_postgres=self._is_postgres)
+        findings: list[Finding] = []
+        objects = [(KIND_TABLE, table.name) for table in inventory.tables] + [
+            (KIND_VIEW, view.name) for view in inventory.views
+        ]
+        for kind, name in objects:
+            hits = collisions.get(name) or []
+            clashes = relation_collisions(hits)
+            if clashes:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(kind, name),
+                        rule_id=self.rule_id,
+                        classification=Classification.UNSUPPORTED,
+                        risk=name_collision_detail(name, clashes),
+                        recommendation=name_collision_remedy(clashes),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+            if kind == KIND_TABLE and name in renames:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(kind, name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=index_rename_detail(name, renames[name], hits),
+                        recommendation=INDEX_RENAME_ADVICE,
+                        note_kind=ConversionNoteKind.RECOMMENDATION,
+                    )
+                )
         return findings
 
 
@@ -1637,8 +1854,14 @@ class ViewCompatibilityRule(Rule):
 # ---------------------------------------------------------------------------
 
 # An inventory rule classifies the source as a whole (e.g. spanning multiple
-# databases) rather than a single object; it returns ready-made items.
-InventoryRule = Callable[[SourceInventory], list[AssessmentItem]]
+# databases) rather than a single object; it returns ready-made items. It also receives the
+# browsed TARGET catalog when the caller has one (Evaluation browses it before assessing),
+# because a database-level limit is about what the target database will hold AFTER the
+# migration -- the source's objects plus what the cluster already has -- and ``None``
+# otherwise (then only the source is counted).
+InventoryRule = Callable[
+    [SourceInventory, Optional[TargetInventory]], list[AssessmentItem]
+]
 
 
 def _source_databases(inventory: SourceInventory) -> list[str]:
@@ -1664,7 +1887,9 @@ def _source_databases(inventory: SourceInventory) -> list[str]:
 # "Recommendation" paragraphs while every table beside it used the labeled card treatment,
 # so one row in the list looked like a different application. One finding is still a
 # finding -- the list should not change shape because there is only one.
-def _single_concern(item: AssessmentItem) -> list[AssessmentConcern]:
+def _single_concern(
+    item: AssessmentItem, note_kind: ConversionNoteKind = ConversionNoteKind.LOSS
+) -> list[AssessmentConcern]:
     """Wrap an item's own risk/recommendation as its single concern."""
     return [
         AssessmentConcern(
@@ -1673,57 +1898,172 @@ def _single_concern(item: AssessmentItem) -> list[AssessmentConcern]:
             risk=item.risk,
             recommendation=item.recommendation,
             effort=item.effort,
+            note_kind=note_kind,
         )
     ]
 
 
+def _schemas_needed(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory]
+) -> tuple[list[str], list[str]]:
+    """``(source schemas, other schemas already on the target)``, in first-seen order.
+
+    Every source database (MySQL) or schema (PostgreSQL) becomes a target schema of the
+    same name -- the part before the first dot of the qualified object name -- and an
+    unqualified name lands in ``public``, which is never counted (see
+    :data:`_BUILTIN_TARGET_SCHEMA`). Only target schemas that hold a table or view are
+    visible: the browse reads the catalog's relations, so an EMPTY schema already on the
+    cluster is not seen, although it counts toward the limit.
+    """
+    source = [
+        name for name in _source_databases(inventory) if name != _BUILTIN_TARGET_SCHEMA
+    ]
+    existing = [
+        schema.name
+        for schema in (target_inventory.schemas if target_inventory is not None else [])
+        if schema.name != _BUILTIN_TARGET_SCHEMA and schema.name not in source
+    ]
+    return source, existing
+
+
+def _relations_after_migration(
+    names: list[str],
+    target_inventory: Optional[TargetInventory],
+    *,
+    views: bool,
+) -> tuple[int, int, int]:
+    """``(total, new from the source, already on the target)`` tables or views afterwards.
+
+    A source relation that is already on the target is skipped or replaced, never added
+    twice, so it adds nothing; matching is the Evaluation name-conflict rule
+    (:func:`~dsql_migrator.core.target_introspector.relations_existing_on_target`).
+    """
+    if target_inventory is None:
+        return len(names), len(names), 0
+    from dsql_migrator.core.target_introspector import relations_existing_on_target
+
+    on_target = sum(
+        len(schema.views if views else schema.tables)
+        for schema in target_inventory.schemas
+    )
+    new = len(names) - len(
+        relations_existing_on_target(names, target_inventory, views=names if views else ())
+    )
+    return on_target + new, new, on_target
+
+
+def _ceil_div(value: int, limit: int) -> int:
+    return -(-value // limit)
+
+
 def check_multiple_source_databases(
-    inventory: SourceInventory,
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
 ) -> list[AssessmentItem]:
-    """Flag a source that spans multiple databases (DSQL has one DB per cluster)."""
+    """Note that a multi-database MySQL source lands as one schema per database.
+
+    Advisory, not a gap. Aurora DSQL has one database per cluster, and Schema Conversion
+    already creates each source database as its own schema in it (``db.table`` becomes
+    ``"db"."table"``), so nothing has to be consolidated by hand. This used to be a
+    MANUAL/MEDIUM finding telling the operator to "consolidate the databases into one
+    cluster using separate schemas" -- the conversion's own work, and impossible past
+    Aurora DSQL's 10-schema limit. A migration over that limit gets
+    :func:`check_schema_count`'s blocker instead of this note.
+    """
     databases = _source_databases(inventory)
     if len(databases) <= 1:
+        return []
+    source, existing = _schemas_needed(inventory, target_inventory)
+    needed = len(source) + len(existing)
+    if needed > _MAX_SCHEMAS_PER_DATABASE:
         return []
     names = ", ".join(databases)
     items = [
         AssessmentItem(
             object_name=f"{len(databases)} source databases",
             rule_id="MULTIPLE_DATABASES",
-            classification=Classification.MANUAL,
+            classification=Classification.AUTO,
             risk=(
-                f"The source spans {len(databases)} databases ({names}); Aurora "
-                "DSQL provides a single database per cluster."
+                f"The source spans {len(databases)} databases ({names}). Aurora DSQL has "
+                "one database per cluster, so Schema Conversion creates each of them as "
+                "its own schema in it (db.table becomes schema.table): nothing has to be "
+                "consolidated by hand, and names cannot collide across databases."
             ),
             recommendation=(
-                "Consolidate the databases into one cluster using separate "
-                "schemas, or provision a separate Aurora DSQL cluster per "
-                "database. Resolve any cross-database name collisions."
+                "Point the application at the schema-qualified names, or set its "
+                "search_path to the schema, as for any database that moves into an "
+                f"Aurora DSQL schema. Aurora DSQL allows {_MAX_SCHEMAS_PER_DATABASE} "
+                f"schemas per database; this migration needs {needed}, counting the "
+                "cluster's existing schemas that hold tables or views."
             ),
-            effort=EffortLevel.MEDIUM,
+            effort=None,
             kind=KIND_DATABASE.upper(),
         )
     ]
-    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
+    return [
+        item.model_copy(
+            update={
+                "concerns": _single_concern(item, ConversionNoteKind.RECOMMENDATION)
+            }
+        )
+        for item in items
+    ]
 
 
-def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
-    """Flag a source whose table count exceeds the DSQL per-database limit."""
-    count = len(inventory.tables)
-    if count <= _MAX_TABLES_PER_DATABASE:
+def check_table_count(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """Flag a migration that would put more tables in one DSQL database than it allows.
+
+    The limit is on the DATABASE, so what counts is what the target will hold afterwards:
+    the source's tables plus the tables already on the cluster, less the source tables
+    that are already there. Without a target catalog only the source is counted.
+    """
+    names = [table.name for table in inventory.tables]
+    total, new, on_target = _relations_after_migration(
+        names, target_inventory, views=False
+    )
+    if total <= _MAX_TABLES_PER_DATABASE:
         return []
+    limit = _MAX_TABLES_PER_DATABASE
+    failure = (
+        f"Schema Conversion's apply would fail part-way (\"creating more than {limit} "
+        "tables not allowed\"), after the first tables were created"
+    )
+    if on_target:
+        risk = (
+            f"After this migration the target database would hold {total:,} tables "
+            f"({new:,} new from the source plus {on_target:,} already on the cluster), but "
+            f"Aurora DSQL allows at most {limit:,} tables per database (a hard limit). "
+            f"{failure}."
+        )
+    else:
+        risk = (
+            f"The source has {total:,} tables, but Aurora DSQL allows at most {limit:,} "
+            f"tables per database (a hard limit). {failure}."
+        )
+    # Advice follows the SOURCE's own size: a source that alone exceeds the limit needs
+    # several clusters whatever this one holds (counting only its tables NOT yet on the
+    # cluster understated that once some of them were already there).
+    if len(names) > limit:
+        recommendation = (
+            f"Split the tables across at least {_ceil_div(len(names), limit)} Aurora DSQL "
+            f"clusters (at most {limit:,} tables each) before migrating."
+        )
+        if on_target:
+            recommendation += " Tables already on this cluster count toward its limit too."
+    else:
+        recommendation = (
+            f"The source's {len(names):,} tables fit on their own, but the tables already "
+            "on this cluster push it past the limit: migrate into a cluster with room, or "
+            "remove the tables you no longer need from this one."
+        )
     items = [
         AssessmentItem(
-            object_name=f"{count} tables",
+            object_name=f"{total:,} tables",
             rule_id="TABLE_COUNT_LIMIT",
             classification=Classification.UNSUPPORTED,
-            risk=(
-                f"The source has {count} tables; Aurora DSQL allows at most "
-                f"{_MAX_TABLES_PER_DATABASE} tables per database."
-            ),
-            recommendation=(
-                "Reduce the table count or split the workload across multiple "
-                "Aurora DSQL clusters before migrating."
-            ),
+            risk=risk,
+            recommendation=recommendation,
             effort=EffortLevel.SIGNIFICANT,
             kind=KIND_DATABASE.upper(),
         )
@@ -1731,7 +2071,136 @@ def check_table_count(inventory: SourceInventory) -> list[AssessmentItem]:
     return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
-def check_postgres_extensions(inventory: SourceInventory) -> list[AssessmentItem]:
+def check_schema_count(
+    inventory: SourceInventory,
+    target_inventory: Optional[TargetInventory] = None,
+    *,
+    is_postgres: bool = False,
+) -> list[AssessmentItem]:
+    """Flag a migration that needs more schemas than one Aurora DSQL database allows.
+
+    Each source database (MySQL) or schema (PostgreSQL) becomes a target schema, and Aurora
+    DSQL allows at most 10 per database: a hard limit (54000 "more than 10 schemas not
+    allowed") that previously surfaced only part-way through Schema Conversion's apply,
+    after the first schemas' tables had been created. Schemas already on the cluster count
+    too; ``public`` does not (see :data:`_BUILTIN_TARGET_SCHEMA`). ``is_postgres`` selects
+    the engine's wording (and :func:`check_pg_schema_count` is the PostgreSQL entry).
+    """
+    source, existing = _schemas_needed(inventory, target_inventory)
+    total = len(source) + len(existing)
+    limit = _MAX_SCHEMAS_PER_DATABASE
+    if total <= limit:
+        return []
+    unit = "schema" if is_postgres else "database"
+    on_cluster = (
+        f" plus {len(existing)} already on the cluster ({', '.join(existing)})"
+        if existing
+        else ""
+    )
+    risk = (
+        f"This migration needs {total} schemas in the target database ({len(source)} "
+        f"from the source, one per source {unit}{on_cluster}), but Aurora DSQL allows at "
+        f"most {limit} schemas per database (a hard limit). Schema Conversion's apply "
+        "would create the first ones and then fail with \"more than 10 schemas not "
+        "allowed\", leaving a partially created target."
+    )
+    if len(source) > limit:
+        clusters = _ceil_div(len(source), limit)
+        if is_postgres:
+            recommendation = (
+                f"Consolidate the schemas on the source to at most {limit}, or plan for "
+                f"at least {clusters} Aurora DSQL clusters (at most {limit} schemas each). "
+                "This tool reads every schema of the connected database together, so a "
+                "split is done by selection: for each cluster, generate and apply only that "
+                "group's objects in Schema Conversion and select the same tables in Data "
+                "Migration (this verdict keeps counting the whole database)."
+            )
+        else:
+            recommendation = (
+                f"Plan for at least {clusters} Aurora DSQL clusters (at most {limit} "
+                "schemas each): set Database on the Connect step to migrate one database "
+                f"per run, and put at most {limit} databases into each cluster."
+            )
+        if existing:
+            recommendation += " Schemas already on this cluster count toward its limit too."
+    else:
+        recommendation = (
+            f"The source's {len(source)} schemas fit on their own, but the schemas "
+            "already on this cluster push it past the limit: migrate into a cluster with "
+            "room, or remove the schemas you no longer need from this one."
+        )
+    items = [
+        AssessmentItem(
+            object_name=f"{total} schemas",
+            rule_id="SCHEMA_COUNT_LIMIT",
+            classification=Classification.UNSUPPORTED,
+            risk=risk,
+            recommendation=recommendation,
+            effort=EffortLevel.SIGNIFICANT,
+            kind=KIND_DATABASE.upper(),
+        )
+    ]
+    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
+
+
+def check_pg_schema_count(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """PostgreSQL-worded :func:`check_schema_count` (source schemas, not databases)."""
+    return check_schema_count(inventory, target_inventory, is_postgres=True)
+
+
+def check_view_count(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """Flag a migration that would put more views in one DSQL database than it allows.
+
+    Counted like :func:`check_table_count`: the source's views plus the views already on
+    the cluster, less the source views that are already there.
+    """
+    names = [view.name for view in inventory.views]
+    total, new, on_target = _relations_after_migration(names, target_inventory, views=True)
+    limit = _MAX_VIEWS_PER_DATABASE
+    if total <= limit:
+        return []
+    where = (
+        f"({new:,} new from the source plus {on_target:,} already on the cluster)"
+        if on_target
+        else "from the source"
+    )
+    if len(names) > limit:
+        recommendation = (
+            f"Split the views across at least {_ceil_div(len(names), limit)} Aurora DSQL "
+            "clusters, or re-create only the views the application still uses."
+        )
+    else:
+        recommendation = (
+            f"The source's {len(names):,} views fit on their own, but the views already on "
+            "this cluster push it past the limit: migrate into a cluster with room, or "
+            "remove the views you no longer need from this one."
+        )
+    items = [
+        AssessmentItem(
+            object_name=f"{total:,} views",
+            rule_id="VIEW_COUNT_LIMIT",
+            classification=Classification.UNSUPPORTED,
+            risk=(
+                f"This migration needs {total:,} views in the target database {where}, but "
+                f"Aurora DSQL allows at most {limit:,} views per database (a hard limit), "
+                f"so Schema Conversion's apply would fail part-way (\"creating more than "
+                f"{limit} views not allowed\")."
+            ),
+            recommendation=recommendation,
+            effort=EffortLevel.SIGNIFICANT,
+            kind=KIND_DATABASE.upper(),
+        )
+    ]
+    return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
+
+
+def check_postgres_extensions(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
     """Report each installed PostgreSQL EXTENSION -- Aurora DSQL provides none.
 
     This is the pairing for filtering extension-owned objects out of the inventory. That
@@ -1773,7 +2242,9 @@ def check_postgres_extensions(inventory: SourceInventory) -> list[AssessmentItem
     return [item.model_copy(update={"concerns": _single_concern(item)}) for item in items]
 
 
-def check_postgres_database_collation(inventory: SourceInventory) -> list[AssessmentItem]:
+def check_postgres_database_collation(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
     """Report a source DATABASE collation that Aurora DSQL does not match.
 
     The per-COLUMN collation capture deliberately ignores the collation named ``default``,
@@ -1841,17 +2312,24 @@ def default_inventory_rules(
     ``check_multiple_source_databases`` is MySQL-only: a PostgreSQL source is
     introspected SCHEMA-qualified (``schema.table``), and its multiple schemas live
     within one database, which Aurora DSQL supports and this tool migrates
-    schema-qualified automatically -- so the "spans N databases / consolidate into
-    schemas" finding is both wrong (they already ARE schemas) and misleading for a PG
-    source. The table-count limit applies to every engine.
+    schema-qualified automatically -- so the "spans N databases" note is meaningless
+    for a PG source. The database-level limits (tables, schemas, views per database)
+    apply to every engine.
     """
     if source_type is SourceType.POSTGRES:
         return [
             check_table_count,
+            check_pg_schema_count,
+            check_view_count,
             check_postgres_extensions,
             check_postgres_database_collation,
         ]
-    return [check_multiple_source_databases, check_table_count]
+    return [
+        check_multiple_source_databases,
+        check_table_count,
+        check_schema_count,
+        check_view_count,
+    ]
 
 
 def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
@@ -1883,12 +2361,15 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         EventRule(),
         AutoIncrementRule(),
         NoPrimaryKeyRule(),
+        ByteaKeyRule(),
         CaseInsensitiveCollationRule(),
         PartitionedTableRule(),
         SpatialTypeRule(),
         TooManyColumnsRule(),
         TooManyIndexesRule(),
         TooManyKeyColumnsRule(),
+        NameCollisionRule(),
+        IdentifierLengthRule(),
         OversizedLobRule(),
         DecimalPrecisionRule(),
         EnumSetRule(),
@@ -2051,13 +2532,20 @@ class CompatibilityAssessor:
             else default_inventory_rules(source_type)
         )
 
-    def assess(self, inventory: SourceInventory) -> AssessmentReport:
+    def assess(
+        self,
+        inventory: SourceInventory,
+        target_inventory: Optional[TargetInventory] = None,
+    ) -> AssessmentReport:
         """Assess ``inventory`` and return a complete report.
 
         Guarantees Property 8: every inventory object appears in exactly one
         per-object :class:`AssessmentItem`, so no object is left unclassified.
         Inventory-level (cluster/database-wide) checks may append additional
         items (kind ``DATABASE``) that are not tied to a single object.
+        ``target_inventory`` is the browsed target catalog, when the caller has one:
+        the database-level limits then count what the target database will hold after
+        the migration, not only what the source brings.
         """
         findings_by_object: dict[ObjectKey, list[Finding]] = defaultdict(list)
         for rule in self._rules:
@@ -2069,7 +2557,7 @@ class CompatibilityAssessor:
             for key in _inventory_objects(inventory)
         ]
         for inventory_rule in self._inventory_rules:
-            items.extend(inventory_rule(inventory))
+            items.extend(inventory_rule(inventory, target_inventory))
         return AssessmentReport.from_items(items)
 
 
@@ -2622,10 +3110,13 @@ __all__ = [
     "EventRule",
     "AutoIncrementRule",
     "NoPrimaryKeyRule",
+    "ByteaKeyRule",
     "CaseInsensitiveCollationRule",
     "PartitionedTableRule",
     "SpatialTypeRule",
     "TooManyColumnsRule",
+    "NameCollisionRule",
+    "IdentifierLengthRule",
     "OversizedLobRule",
     "DecimalPrecisionRule",
     "EnumSetRule",
@@ -2638,7 +3129,11 @@ __all__ = [
     "ViewCompatibilityRule",
     "InventoryRule",
     "check_multiple_source_databases",
+    "check_pg_schema_count",
+    "check_schema_count",
     "check_table_count",
+    "check_view_count",
+    "DSQL_DATABASE_LIMITS",
     "default_inventory_rules",
     "default_rules",
     "CompatibilityAssessor",

@@ -4564,7 +4564,14 @@ def cdc_cascade_gap_tables(assessment: object, tables=None) -> list[str]:
     items = getattr(assessment, "items", None) or []
     names: list[str] = []
     for item in items:
-        if getattr(item, "rule_id", None) != _FK_CASCADE_CDC_RULE_ID:
+        # Any of the item's findings, not only the one governing it: a more severe finding
+        # on the same table (an UNSUPPORTED key, say) takes the item's headline rule_id,
+        # and matching that alone dropped the table from this CDC warning.
+        rule_ids = {getattr(item, "rule_id", None)} | {
+            getattr(concern, "rule_id", None)
+            for concern in (getattr(item, "concerns", None) or [])
+        }
+        if _FK_CASCADE_CDC_RULE_ID not in rule_ids:
             continue
         name = getattr(item, "object_name", None)
         if name and name not in names:

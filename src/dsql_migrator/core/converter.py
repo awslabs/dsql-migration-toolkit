@@ -65,8 +65,9 @@ data migrator, keeping the DDL/DML separation rule intact (Property 2).
 
 from __future__ import annotations
 
+import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from enum import Enum
@@ -508,6 +509,15 @@ class SchemaConversionResult(BaseModel):
         default_factory=list,
         description="All table and object warnings aggregated for convenience.",
     )
+    index_renames: dict[str, dict[str, str]] = Field(
+        default_factory=dict,
+        description=(
+            "Table name -> {source index name: emitted index name} for the indexes "
+            "renamed so that no two relations of a target schema share a name. A "
+            "per-table re-conversion (e.g. a primary-key strategy choice) passes the "
+            "table's entry to convert_table(index_names=...) so it emits the same names."
+        ),
+    )
 
     def execution_units(self) -> list[ExecutionUnit]:
         """Flatten the conversion into an ordered list of single-DDL units.
@@ -581,6 +591,7 @@ class SchemaConversionResult(BaseModel):
         tables: list[TableConversion],
         extra_warnings: Optional[list[ConversionWarning]] = None,
         views: Optional[list["ViewConversion"]] = None,
+        index_renames: "Optional[dict[str, dict[str, str]]]" = None,
     ) -> "SchemaConversionResult":
         """Build a result and aggregate every warning into one list.
 
@@ -593,7 +604,12 @@ class SchemaConversionResult(BaseModel):
         warnings = [warning for table in tables for warning in table.warnings]
         warnings.extend(warning for view in view_list for warning in view.warnings)
         warnings.extend(extra_warnings or [])
-        return cls(tables=list(tables), views=view_list, warnings=warnings)
+        return cls(
+            tables=list(tables),
+            views=view_list,
+            warnings=warnings,
+            index_renames=dict(index_renames or {}),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2511,7 +2527,11 @@ def _secondary_index_budget(reserved_secondary: int = 0) -> int:
 
 
 def _build_index_ddls(
-    table: TableDef, *, is_postgres: bool = False, reserved_secondary: int = 0
+    table: TableDef,
+    *,
+    is_postgres: bool = False,
+    reserved_secondary: int = 0,
+    index_names: "Optional[Mapping[str, str]]" = None,
 ) -> list[str]:
     """Render the table's secondary indexes as ``CREATE INDEX ASYNC`` statements.
 
@@ -2536,11 +2556,13 @@ def _build_index_ddls(
     emittable = _emittable_secondary_indexes(table, is_postgres=is_postgres)
     budget = _secondary_index_budget(reserved_secondary)
     statements: list[str] = []
+    renamed = index_names or {}
     for index in emittable[:budget]:
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_identifier(column) for column in index.columns)
+        name = renamed.get(index.name, index.name)
         statements.append(
-            f"CREATE {unique}INDEX ASYNC {_quote_pg_identifier(index.name)} "
+            f"CREATE {unique}INDEX ASYNC {_quote_pg_identifier(name)} "
             f"ON {table_identifier} ({columns})"
         )
     return statements
@@ -3937,42 +3959,475 @@ def _partitioned_table_warning(
 _PG_NAMEDATALEN = 63  # PostgreSQL/DSQL identifiers are truncated to 63 BYTES.
 
 
-def _bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """Warn when a BINARY/VARBINARY/BLOB/spatial (``bytea``) column is used in a key.
+# How many of the other relations sharing a name a collision note spells out. A schema
+# that reuses one index name on every table (a table-per-tenant schema near the 1,000-table
+# limit) would otherwise put every other table into every table's note -- O(n^2) text in
+# the report, the session snapshot, the HTML export and the AI prompt.
+_COLLISION_EXAMPLES = 3
 
-    Aurora DSQL rejects a ``bytea`` column in any key: "datatype bytea is not supported
-    in a key" (verified live). A PRIMARY KEY over such a column makes the generated
-    CREATE TABLE REJECTED (UNSUPPORTED -- neither the table nor its data migrates); a
-    plain SECONDARY index over one cannot be created either and is therefore NOT emitted
-    (LOSS). Spatial/FULLTEXT indexes are reported by :func:`_unsupported_index_type_warning`
-    instead, so they are excluded here to avoid a duplicate note.
+
+@dataclass(frozen=True)
+class NameCollision:
+    """One name an object shares with other relations of its target schema.
+
+    ``kind`` says what of THIS object holds the name (``"index"``, ``"table"`` or
+    ``"view"``); ``others`` spells out up to :data:`_COLLISION_EXAMPLES` of the
+    ``other_count`` relations that share it; ``clashes_with_relation`` is true when one of
+    them is a table or view, ``clashes_with_index`` when one of them is an index, and
+    ``unique`` when the colliding index is UNIQUE.
     """
-    bytea_columns = {column.name for column in table.columns if _maps_to_bytea(column)}
+
+    name: str
+    kind: str
+    unique: bool
+    others: "tuple[str, ...]"
+    other_count: int
+    clashes_with_relation: bool
+    clashes_with_index: bool
+
+
+@dataclass(frozen=True)
+class _NamespaceEntry:
+    description: str
+    owner: str
+    kind: str
+    name: str
+    unique: bool
+
+
+def name_collisions(
+    inventory: SourceInventory, *, is_postgres: bool = False
+) -> "dict[str, list[NameCollision]]":
+    """The names that more than one relation of the same target schema would use.
+
+    Aurora DSQL (like PostgreSQL) keeps a schema's tables, views and indexes in ONE
+    namespace and stores every name cut to 63 bytes, while MySQL scopes an index name to its
+    table -- so legacy MySQL schemas reuse index names freely (the auto-named foreign-key
+    index ``user_id`` on every child table), sometimes the name of another table (the index
+    ``currency`` for an FK to the table ``currency``). The converter emits each relation
+    under its source name, so under a shared name only the first relation applied is
+    created: the next CREATE fails with 42P07, which the default apply reports as "already
+    exists" and SKIPS. A skipped index silently never exists (a UNIQUE one included); a
+    skipped TABLE is not created at all.
+
+    Names are compared as Aurora DSQL stores them: exactly (every table, view and index
+    name is emitted quoted) and cut to 63 bytes on a character boundary
+    (:func:`~dsql_migrator.core.target_introspector.pg_stored_name`). Only indexes the conversion actually emits are considered (the filter
+    and per-table budget of :func:`_build_index_ddls`). A table whose name is shared only
+    with its OWN indexes is not reported as a table (it is created first, so those indexes
+    are what is lost). Returns object name (table or view) -> its collisions. Shared by
+    Schema Conversion's note and Evaluation's ``NAME_COLLISION`` rule.
+    """
+    namespaces = _relation_namespaces(inventory, is_postgres=is_postgres)
+    collisions: dict[str, list[NameCollision]] = {}
+    for names in namespaces.values():
+        for entries in names.values():
+            if len(entries) < 2:
+                continue
+            # Counted once per name, so a name shared by thousands of tables stays linear.
+            relations = sum(1 for entry in entries if entry.kind != "index")
+            indexes = len(entries) - relations
+            indexes_by_owner: dict[str, int] = {}
+            for entry in entries:
+                if entry.kind == "index":
+                    indexes_by_owner[entry.owner] = indexes_by_owner.get(entry.owner, 0) + 1
+            for position, entry in enumerate(entries):
+                other_count = len(entries) - 1
+                is_index = entry.kind == "index"
+                if not is_index and other_count == indexes_by_owner.get(entry.owner, 0):
+                    continue
+                examples: list[str] = []
+                for other_position, other in enumerate(entries):
+                    if other_position != position:
+                        examples.append(other.description)
+                        if len(examples) == _COLLISION_EXAMPLES:
+                            break
+                collisions.setdefault(entry.owner, []).append(
+                    NameCollision(
+                        name=entry.name,
+                        kind=entry.kind,
+                        unique=entry.unique,
+                        others=tuple(examples),
+                        other_count=other_count,
+                        clashes_with_relation=(relations - (0 if is_index else 1)) > 0,
+                        clashes_with_index=(indexes - (1 if is_index else 0)) > 0,
+                    )
+                )
+    return collisions
+
+
+def _relation_namespaces(
+    inventory: SourceInventory, *, is_postgres: bool
+) -> "dict[str, dict[str, list[_NamespaceEntry]]]":
+    """schema -> stored name -> the relations (tables, views, emitted indexes) using it."""
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    budget = _secondary_index_budget(0)
+    namespaces: dict[str, dict[str, list[_NamespaceEntry]]] = {}
+
+    def _register(owner: str, kind: str, name: str, unique: bool, description: str) -> None:
+        schema, _ = _split_qualified(owner)
+        # The schema name is stored cut to 63 bytes too: two databases whose names agree
+        # in their first 63 bytes are ONE target schema.
+        namespaces.setdefault(pg_stored_name(schema or ""), {}).setdefault(
+            pg_stored_name(name), []
+        ).append(_NamespaceEntry(description, owner, kind, name, unique))
+
+    for table in inventory.tables:
+        _, table_name = _split_qualified(table.name)
+        _register(table.name, "table", table_name, False, f"table {table_name}")
+        for index in _emittable_secondary_indexes(table, is_postgres=is_postgres)[:budget]:
+            _register(
+                table.name,
+                "index",
+                index.name,
+                index.unique,
+                f"{'UNIQUE ' if index.unique else ''}index {index.name} on {table_name}",
+            )
+    for view in inventory.views:
+        _, view_name = _split_qualified(view.name)
+        _register(view.name, "view", view_name, False, f"view {view_name}")
+    return namespaces
+
+
+def index_renames(
+    inventory: SourceInventory, *, is_postgres: bool = False
+) -> "dict[str, dict[str, str]]":
+    """table name -> {source index name: emitted name} so no two relations share a name.
+
+    The fix for :func:`name_collisions` that the tool can make by itself: index names are
+    not used by the data load, by CDC, or by any query, so a colliding index is created
+    under another name rather than skipped. EVERY index whose name another relation of the
+    schema also uses is renamed -- not "all but the first": the result must not depend on
+    inventory order, which an added or removed table changes. Tables and views keep their
+    names. The new name is ``<table>_<index>``, or that cut to fit 63 bytes with a hash
+    suffix when it would be longer or is itself taken. An index of a table that shares its
+    own name with another table or view (``relation_collisions``) is left alone: that
+    table is not created (see :meth:`SchemaConverter.convert`). Deterministic.
+    """
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    clashing = {
+        owner
+        for owner, hits in name_collisions(inventory, is_postgres=is_postgres).items()
+        if relation_collisions(hits)
+    }
+    renames: dict[str, dict[str, str]] = {}
+    for schema, names in sorted(_relation_namespaces(inventory, is_postgres=is_postgres).items()):
+        taken = set(names)
+        # Sorted, so two renames that would produce the same name are resolved the same
+        # way whatever the inventory order.
+        colliding = sorted(
+            (entry.owner, entry.name)
+            for entries in names.values()
+            if len(entries) >= 2
+            for entry in entries
+            if entry.kind == "index" and entry.owner not in clashing
+        )
+        for owner, index_name in colliding:
+            _, table_name = _split_qualified(owner)
+            new_name = _unused_index_name(schema, table_name, index_name, taken)
+            taken.add(pg_stored_name(new_name))
+            renames.setdefault(owner, {})[index_name] = new_name
+    return renames
+
+
+def rename_index_statements(
+    index_ddls: "Sequence[str]", renames: "Mapping[str, str]"
+) -> list[str]:
+    """``index_ddls`` with each ``CREATE [UNIQUE] INDEX ASYNC "<old>" ON`` renamed.
+
+    For DDL stored before the rename existed -- a primary-key strategy choice or an edit
+    baked into the session -- so applying it does not bring a colliding name back.
+    """
+    if not renames:
+        return list(index_ddls)
+    statements = list(index_ddls)
+    heads = [_INDEX_HEAD_RE.match(statement) for statement in statements]
+    pending = _pending_renames(heads, renames)
+    renamed: list[str] = []
+    for statement, head in zip(statements, heads):
+        new = pending.pop(_head_name(head), None) if head is not None else None
+        renamed.append(
+            statement if new is None else _splice(statement, [_rename_spot(head, new)])
+        )
+    return renamed
+
+
+# A ``CREATE [UNIQUE] INDEX ASYNC "<name>" ON`` at the start of a statement, as the tool
+# emits it (and as the apply paths see a stored edit: split on ``;``, then stripped).
+_INDEX_HEAD_RE = re.compile(
+    r'\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+"((?:[^"]|"")+)"\s+ON\s', re.IGNORECASE
+)
+
+
+def _head_name(head: "re.Match[str]") -> str:
+    return head.group(1).replace('""', '"')
+
+
+def _pending_renames(
+    heads: "Sequence[Optional[re.Match[str]]]", renames: "Mapping[str, str]"
+) -> "dict[str, str]":
+    """The renames to make: not one whose new name the script already uses (applied
+    before, or chosen by the user for another index) -- that would create it twice."""
+    present = {_head_name(head) for head in heads if head is not None}
+    return {old: new for old, new in renames.items() if new not in present}
+
+
+def _rename_spot(head: "re.Match[str]", new: str) -> "tuple[int, int, str]":
+    return head.start(1) - 1, head.end(1) + 1, new  # the quotes included
+
+
+def _splice(text: str, spots: "Sequence[tuple[int, int, str]]") -> str:
+    out, last = [], 0
+    for start, end, new in spots:
+        out.append(text[last:start])
+        out.append(_quote_pg_identifier(new))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def rename_index_script(script: str, renames: "Mapping[str, str]") -> str:
+    """``script`` (a stored target-DDL edit) renamed exactly as the apply paths rename it
+    (split on ``;``, then :func:`rename_index_statements`), with every other character
+    kept as written -- so the edit the screen shows and copies is the one they run. A
+    ``CREATE INDEX`` text inside a comment is not a statement head and is left alone."""
+    if not renames:
+        return script
+    spans, start = [], 0
+    for position, char in enumerate(script):
+        if char == ";":
+            spans.append((start, position))
+            start = position + 1
+    spans.append((start, len(script)))
+    heads = [
+        head for begin, end in spans if (head := _INDEX_HEAD_RE.match(script, begin, end))
+    ]
+    pending = _pending_renames(heads, renames)
+    spots = []
+    for head in heads:
+        new = pending.pop(_head_name(head), None)
+        if new is not None:
+            spots.append(_rename_spot(head, new))
+    return _splice(script, spots)
+
+# How :func:`name_collision_detail` begins, so every name-collision placeholder's target
+# DDL (``-- <detail>``, see ``_name_collision_placeholder``) can be recognized.
+_NAME_COLLISION_LEAD = "Names shared within"
+
+
+def is_name_collision_placeholder(target_ddl: str) -> bool:
+    """Whether ``target_ddl`` is the placeholder for tables/views sharing a stored name.
+
+    A user edit must not replace it: renaming in the target DDL does not separate them
+    (the load and CDC write to the source name)."""
+    return (target_ddl or "").lstrip().startswith(f"-- {_NAME_COLLISION_LEAD}")
+
+
+def _unused_index_name(schema: str, table_name: str, index_name: str, taken: "set[str]") -> str:
+    """``<table>_<index>``, else a 63-byte cut of it plus a hash, not already ``taken``."""
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    candidate = f"{table_name}_{index_name}"
+    if len(candidate.encode("utf-8")) <= _PG_NAMEDATALEN and candidate not in taken:
+        return candidate
+    digest = hashlib.sha1(
+        f"{schema}\x00{table_name}\x00{index_name}".encode("utf-8")
+    ).hexdigest()
+    for length in (8, 12, 16, 40):
+        suffix = "_" + digest[:length]
+        head = candidate.encode("utf-8")[: _PG_NAMEDATALEN - len(suffix)]
+        name = head.decode("utf-8", errors="ignore") + suffix
+        if pg_stored_name(name) not in taken:
+            return name
+    raise RuntimeError(f"no free index name for {schema}.{table_name}.{index_name}")
+
+
+def index_rename_detail(
+    table_name: str, renames: "Mapping[str, str]", hits: "Sequence[NameCollision]"
+) -> str:
+    """What renaming ``table_name``'s colliding indexes does, and why (bounded text)."""
+    schema, _ = _split_qualified(table_name)
+    where = f"schema {schema}" if schema else "its schema"
+    others = {hit.name: hit for hit in hits if hit.kind == "index"}
+    parts = []
+    for old, new in renames.items():
+        hit = others.get(old)
+        shared = ""
+        if hit is not None:
+            shown = ", ".join(hit.others)
+            if hit.other_count > len(hit.others):
+                shown += f" and {hit.other_count - len(hit.others)} more"
+            shared = f" (the name is also used by {shown})"
+        parts.append(f"{old} is created as {new}{shared}")
+    return (
+        f"Index name(s) renamed within {where}: {'; '.join(parts)}. Aurora DSQL keeps a "
+        "schema's tables, views and indexes in one namespace (index names are unique per "
+        "SCHEMA, not per table as in MySQL), so Schema Conversion renames these to create "
+        "every index (a UNIQUE one keeps enforcing uniqueness) and to leave table and view "
+        "names alone."
+    )
+
+
+INDEX_RENAME_ADVICE = (
+    "No action is needed to migrate: the data load and CDC do not use index names. Use the "
+    "new names in any DDL scripts or tooling that refer to these indexes."
+)
+
+
+def _index_rename_warning(
+    table_name: str, renames: "Mapping[str, str]", hits: "Sequence[NameCollision]"
+) -> ConversionWarning:
+    return ConversionWarning(
+        object_name=table_name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=index_rename_detail(table_name, renames, hits) + " " + INDEX_RENAME_ADVICE,
+    )
+
+
+def _name_collision_placeholder(
+    conversion: TableConversion, warning: ConversionWarning
+) -> TableConversion:
+    """``conversion`` replaced by a comment the apply skips (nothing is created)."""
+    return conversion.model_copy(
+        update={
+            "target_ddl": f"-- {warning.message}",
+            "schema_ddls": [],
+            "index_ddls": [],
+            "foreign_key_ddls": [],
+            "warnings": [*conversion.warnings, warning],
+        }
+    )
+
+
+def relation_collisions(hits: "Sequence[NameCollision]") -> "list[NameCollision]":
+    """The collisions no index rename resolves: a table or view sharing a name with another
+    table or view (their names agree in the first 63 bytes)."""
+    return [hit for hit in hits if hit.kind != "index" and hit.clashes_with_relation]
+
+
+def relation_clash_names(inventory: SourceInventory) -> "frozenset[str]":
+    """The tables and views that share their stored name with another table or view of the
+    same schema -- exactly those :meth:`SchemaConverter.convert` turns into the
+    name-collision placeholder (nothing is created for them). Cheap (tables and views
+    only, no index work), so the Data Migration screen can keep them out of the load on
+    every render: loading one would write into the other's relation."""
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    groups: dict[tuple[str, str], list[str]] = {}
+    for owner in (*(t.name for t in inventory.tables), *(v.name for v in inventory.views)):
+        schema, name = _split_qualified(owner)
+        groups.setdefault(
+            (pg_stored_name(schema or ""), pg_stored_name(name)), []
+        ).append(owner)
+    return frozenset(
+        owner for owners in groups.values() if len(owners) > 1 for owner in owners
+    )
+
+
+def name_collision_detail(object_name: str, hits: "Sequence[NameCollision]") -> str:
+    """What sharing a stored name with another table or view does to ``object_name``.
+
+    ``hits`` are :func:`relation_collisions` (index collisions are renamed instead)."""
+    schema, _ = _split_qualified(object_name)
+    where = f"schema {schema}" if schema else "its schema"
+    parts: list[str] = []
+    for hit in hits:
+        shown = ", ".join(hit.others)
+        if hit.other_count > len(hit.others):
+            shown += f" and {hit.other_count - len(hit.others)} more"
+        parts.append(f"the {hit.kind} name {hit.name} is also used by {shown}")
+    return (
+        f"{_NAME_COLLISION_LEAD} {where}: {'; '.join(parts)}. Aurora DSQL stores every name "
+        "cut to 63 bytes, so two tables or views whose names agree in their first 63 bytes "
+        "cannot both exist: every statement naming one (a CREATE, the load's INSERT, a "
+        "replace load's DROP) would reach the other, mixing their rows. Schema Conversion "
+        "therefore creates none of them until the names differ."
+    )
+
+
+def name_collision_remedy(hits: "Sequence[NameCollision]") -> str:
+    """The fix for tables/views that share a stored name: shorter names on the source.
+    (Index collisions need none: :func:`index_renames` renames those indexes.)"""
+    return (
+        "Shorten the names on the source so they differ within their first 63 bytes: "
+        "renaming a table only in the target DDL does not help, because the load and CDC "
+        "write to the source name."
+    )
+
+
+def _name_collision_warning(
+    object_name: str, hits: "Sequence[NameCollision]"
+) -> ConversionWarning:
+    return ConversionWarning(
+        object_name=object_name,
+        classification=Classification.UNSUPPORTED,
+        kind=ConversionNoteKind.LOSS,
+        message=name_collision_detail(object_name, hits) + " " + name_collision_remedy(hits),
+    )
+
+
+def bytea_key_parts(
+    table: TableDef, *, is_postgres: bool = False
+) -> "tuple[list[str], list[str], list[str]]":
+    """``(PK columns, secondary index names, of which UNIQUE)`` that sit on bytea columns.
+
+    The one detection shared by :func:`_bytea_key_warning` / :func:`_pg_bytea_key_warning`
+    (the Schema Conversion notes) and Evaluation's ``BYTEA_KEY`` rule, so the two steps
+    cannot grade the same table differently. A MySQL source uses :func:`_maps_to_bytea`
+    (BINARY/VARBINARY/BLOB and the spatial types), a PostgreSQL one only the genuine
+    ``bytea`` (:func:`_is_pg_bytea`). Spatial/FULLTEXT indexes are left out: they are
+    reported by :func:`_unsupported_index_type_warning` instead.
+    """
+    is_bytea = _is_pg_bytea if is_postgres else _maps_to_bytea
+    bytea_columns = {column.name for column in table.columns if is_bytea(column)}
     if not bytea_columns:
-        return None
+        return [], [], []
     pk_bytea = [c for c in table.primary_key if c in bytea_columns]
-    index_bytea = [
-        index.name
+    indexes = [
+        index
         for index in table.indexes
         if any(c in bytea_columns for c in index.columns)
         and (index.index_type or "").strip().lower() not in _UNSUPPORTED_INDEX_TYPES
     ]
+    return (
+        pk_bytea,
+        [index.name for index in indexes],
+        [index.name for index in indexes if index.unique],
+    )
+
+
+def _bytea_key_note(
+    table: TableDef, *, is_postgres: bool, key_type_phrase: str
+) -> Optional[ConversionWarning]:
+    pk_bytea, index_bytea, unique_bytea = bytea_key_parts(table, is_postgres=is_postgres)
     if not pk_bytea and not index_bytea:
         return None
     parts: list[str] = []
     if pk_bytea:
         parts.append(
-            f"the primary key includes {', '.join(pk_bytea)} "
-            "(BINARY/VARBINARY/BLOB or spatial, which convert to bytea), so the generated "
-            "CREATE TABLE will be REJECTED as-is and neither the table nor its data "
-            "migrates — change the key column to a keyable type (store it as text, a uuid, "
-            "or a hash) before applying"
+            f"the primary key includes {', '.join(pk_bytea)} {key_type_phrase}, so the "
+            "generated CREATE TABLE will be REJECTED as-is and neither the table nor its "
+            "data migrates — change the key column to a keyable type (store it as text, "
+            "a uuid, or a hash) before applying"
         )
     if index_bytea:
-        parts.append(
+        index_part = (
             f"secondary index(es) {', '.join(index_bytea)} are on bytea column(s) and were "
             "therefore NOT emitted (queries relying on them will fall back to a scan)"
         )
+        if unique_bytea:
+            # A skipped UNIQUE index is not just slower queries: the target accepts the
+            # duplicates the source refused, and nothing later (load, CDC, Validation)
+            # notices, because every row still matches its source row.
+            index_part += (
+                f"; {', '.join(unique_bytea)} {'is' if len(unique_bytea) == 1 else 'are'} "
+                "UNIQUE, so that uniqueness is NOT enforced on the target and duplicate "
+                "values are accepted after cut over"
+            )
+        parts.append(index_part)
     return ConversionWarning(
         object_name=table.name,
         classification=(
@@ -3982,6 +4437,26 @@ def _bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
         message=(
             "Aurora DSQL cannot use a bytea column in a key (\"datatype bytea is not "
             f"supported in a key\"): {'; also, '.join(parts)}."
+        ),
+    )
+
+
+def _bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Warn when a BINARY/VARBINARY/BLOB/spatial (``bytea``) column is used in a key.
+
+    Aurora DSQL rejects a ``bytea`` column in any key: "datatype bytea is not supported
+    in a key" (verified live). A PRIMARY KEY over such a column makes the generated
+    CREATE TABLE REJECTED (UNSUPPORTED -- neither the table nor its data migrates); a
+    plain SECONDARY index over one cannot be created either and is therefore NOT emitted
+    (LOSS), and a UNIQUE one loses its uniqueness guarantee. Spatial/FULLTEXT indexes are
+    reported by :func:`_unsupported_index_type_warning` instead, so they are excluded
+    here to avoid a duplicate note.
+    """
+    return _bytea_key_note(
+        table,
+        is_postgres=False,
+        key_type_phrase=(
+            "(BINARY/VARBINARY/BLOB or spatial, which convert to bytea)"
         ),
     )
 
@@ -4007,42 +4482,7 @@ def _pg_bytea_key_warning(table: TableDef) -> Optional[ConversionWarning]:
     bytea SECONDARY index -> it cannot be built and is NOT emitted (MANUAL/LOSS). Worded for
     a PG source (no MySQL binary/blob/spatial families) and scoped to genuine bytea columns.
     """
-    bytea_columns = {column.name for column in table.columns if _is_pg_bytea(column)}
-    if not bytea_columns:
-        return None
-    pk_bytea = [c for c in table.primary_key if c in bytea_columns]
-    index_bytea = [
-        index.name
-        for index in table.indexes
-        if any(c in bytea_columns for c in index.columns)
-        and (index.index_type or "").strip().lower() not in _UNSUPPORTED_INDEX_TYPES
-    ]
-    if not pk_bytea and not index_bytea:
-        return None
-    parts: list[str] = []
-    if pk_bytea:
-        parts.append(
-            f"the primary key includes {', '.join(pk_bytea)} (bytea), so the generated "
-            "CREATE TABLE will be REJECTED as-is and neither the table nor its data "
-            "migrates — change the key column to a keyable type (store it as text, a uuid, "
-            "or a hash) before applying"
-        )
-    if index_bytea:
-        parts.append(
-            f"secondary index(es) {', '.join(index_bytea)} are on bytea column(s) and were "
-            "therefore NOT emitted (queries relying on them will fall back to a scan)"
-        )
-    return ConversionWarning(
-        object_name=table.name,
-        classification=(
-            Classification.UNSUPPORTED if pk_bytea else Classification.MANUAL
-        ),
-        kind=ConversionNoteKind.LOSS,
-        message=(
-            "Aurora DSQL cannot use a bytea column in a key (\"datatype bytea is not "
-            f"supported in a key\"): {'; also, '.join(parts)}."
-        ),
-    )
+    return _bytea_key_note(table, is_postgres=True, key_type_phrase="(bytea)")
 
 
 def _pg_unsupported_index_column_warning(
@@ -4161,8 +4601,19 @@ def _check_constraint_warning(
     )
 
 
+# The one fix for column names that truncate to the same 63 bytes, shown by both steps.
+IDENTIFIER_COLLISION_REMEDY = (
+    "Shorten the colliding column names on the source so they differ within their first "
+    "63 bytes; renaming them in the target DDL does not help, because the load and CDC "
+    "write the source column names."
+)
+
+
 def _identifier_length_warning(
-    table: TableDef, *, generated_index_names: "Sequence[str]" = ()
+    table: TableDef,
+    *,
+    generated_index_names: "Sequence[str]" = (),
+    index_names: "Optional[Mapping[str, str]]" = None,
 ) -> Optional[ConversionWarning]:
     """Warn about identifiers over 63 bytes, and column names that collide after truncation.
 
@@ -4180,22 +4631,30 @@ def _identifier_length_warning(
     the source index names so an over-length GENERATED identifier -- which DSQL would
     silently truncate, risking a collision -- is surfaced rather than emitted blindly.
     """
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
     over_columns: list[str] = []
     collisions: list[str] = []
-    groups: dict[bytes, str] = {}
+    groups: dict[str, str] = {}
     for name in (column.name for column in table.columns):
-        encoded = name.encode("utf-8")
-        if len(encoded) > _PG_NAMEDATALEN:
+        if len(name.encode("utf-8")) > _PG_NAMEDATALEN:
             over_columns.append(name)
-        truncated = encoded[:_PG_NAMEDATALEN]
-        if truncated in groups and groups[truncated] != name:
-            collisions.append(f"{groups[truncated]} / {name}")
+        # Cut as the catalog stores it -- on a CHARACTER boundary (pg_mbcliplen) -- not at
+        # byte 63: a raw byte cut keeps half of a multibyte character, so a long name whose
+        # stored form equals a shorter column's name was not seen as a collision.
+        stored = pg_stored_name(name)
+        if stored in groups and groups[stored] != name:
+            collisions.append(f"{groups[stored]} / {name}")
         else:
-            groups.setdefault(truncated, name)
+            groups.setdefault(stored, name)
+    # The names the conversion EMITS: a colliding index renamed by index_renames is
+    # created under its new (at most 63-byte) name, not stored cut.
+    renamed = index_names or {}
     over_indexes = [
         name
         for name in (
-            [index.name for index in table.indexes] + list(generated_index_names)
+            [renamed.get(index.name, index.name) for index in table.indexes]
+            + list(generated_index_names)
         )
         if len(name.encode("utf-8")) > _PG_NAMEDATALEN
     ]
@@ -4253,7 +4712,14 @@ def _identifier_length_warning(
         message=(
             "PostgreSQL/Aurora DSQL limit identifiers to 63 bytes (MySQL allows 64 "
             f"characters, and UTF-8 uses more bytes). This table has {'; also '.join(parts)}. "
-            "Rename the affected identifier(s) before applying."
+            + (
+                IDENTIFIER_COLLISION_REMEDY
+                if collisions
+                else "No rename is needed to migrate: Aurora DSQL stores the shortened "
+                "name(s), and SQL that uses the full name is shortened the same way (a "
+                "shortened name that collides with another relation is reported "
+                "separately). Rename on the source if the names must match exactly."
+            )
         ),
     )
 
@@ -4407,7 +4873,11 @@ class SchemaConverter:
         self._source_type = source_type
 
     def convert_table(
-        self, table: TableDef, options: SchemaConvertOptions | None = None
+        self,
+        table: TableDef,
+        options: SchemaConvertOptions | None = None,
+        *,
+        index_names: "Optional[Mapping[str, str]]" = None,
     ) -> TableConversion:
         """Convert a single table definition to DSQL-compatible DDL.
 
@@ -4416,6 +4886,12 @@ class SchemaConverter:
         (Requirement 3.3), secondary indexes are emitted as ``CREATE INDEX ASYNC``
         (Requirement 3.4), and the primary-key strategy plus hot-partition /
         primary-key-required warnings are applied (Requirement 3.5).
+
+        ``index_names`` maps a source index name to the name to emit -- the renames
+        :func:`index_renames` computes over the whole inventory (a name collision is only
+        visible across tables). :meth:`convert` passes it; a per-table re-conversion must
+        pass the table's entry of :attr:`SchemaConversionResult.index_renames` too, or it
+        would emit the colliding source names again.
         """
         options = options or SchemaConvertOptions()
         is_postgres = self._source_type is SourceType.POSTGRES
@@ -4676,7 +5152,7 @@ class SchemaConverter:
                         )
                     )
                     continue
-                # A supported numeric whose precision/scale exceeds DSQL's 38/37 is clamped
+                # A supported numeric whose precision/scale exceeds DSQL's 1000 is clamped
                 # in the emitted DDL (converter_postgres._ddl_column_type); surface the
                 # lossy reduction here so it is not a silent range/scale change. Mirrors the
                 # MySQL DECIMAL clamp warning.
@@ -4810,7 +5286,9 @@ class SchemaConverter:
             _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
             _check_constraint_warning(table, is_postgres=is_postgres),
             _identifier_length_warning(
-                table, generated_index_names=generated_index_names
+                table,
+                generated_index_names=generated_index_names,
+                index_names=index_names,
             ),
             _expression_index_warning(table),
             _comment_warning(table),
@@ -4855,7 +5333,10 @@ class SchemaConverter:
             target_ddl=target_ddl,
             schema_ddls=schema_ddls,
             index_ddls=_build_index_ddls(
-                table, is_postgres=is_postgres, reserved_secondary=len(extra_index_ddls)
+                table,
+                is_postgres=is_postgres,
+                reserved_secondary=len(extra_index_ddls),
+                index_names=index_names,
             )
             + extra_index_ddls,
             foreign_key_ddls=_build_foreign_key_ddls(
@@ -4875,11 +5356,46 @@ class SchemaConverter:
         and objects are aggregated into the result (Property 6).
         """
         options = options or SchemaConvertOptions()
-        conversions = [self.convert_table(table, options) for table in inventory.tables]
+        is_postgres = self._source_type is SourceType.POSTGRES
+        # Names collide ACROSS objects (Aurora DSQL keeps a schema's tables, views and
+        # indexes in one namespace), which a per-object conversion cannot see: the colliding
+        # indexes are renamed here and the notes attached here.
+        renames = index_renames(inventory, is_postgres=is_postgres)
+        conversions = [
+            self.convert_table(table, options, index_names=renames.get(table.name))
+            for table in inventory.tables
+        ]
         view_conversions = [self.convert_view(view) for view in inventory.views]
+        collisions = name_collisions(inventory, is_postgres=is_postgres)
+        for position, conversion in enumerate(conversions):
+            hits = collisions.get(conversion.table) or []
+            clashes = relation_collisions(hits)
+            if clashes:
+                # Two tables or views stored under one name: whatever is created first
+                # would receive the other's rows. Emit neither (a placeholder the apply
+                # skips) until the source names differ.
+                conversions[position] = _name_collision_placeholder(
+                    conversion, _name_collision_warning(conversion.table, clashes)
+                )
+                continue
+            if conversion.table in renames:
+                conversion.warnings.append(
+                    _index_rename_warning(conversion.table, renames[conversion.table], hits)
+                )
+        for position, view_conversion in enumerate(view_conversions):
+            clashes = relation_collisions(collisions.get(view_conversion.view) or [])
+            if clashes:
+                warning = _name_collision_warning(view_conversion.view, clashes)
+                view_conversions[position] = view_conversion.model_copy(
+                    update={
+                        "target_ddl": f"-- {warning.message}",
+                        "auto_converted": False,
+                        "warnings": [*view_conversion.warnings, warning],
+                    }
+                )
         object_warnings = _object_reimplementation_warnings(inventory)
         return SchemaConversionResult.from_tables(
-            conversions, object_warnings, views=view_conversions
+            conversions, object_warnings, views=view_conversions, index_renames=renames
         )
 
     def convert_view(self, view: ViewDef) -> ViewConversion:
@@ -4960,8 +5476,22 @@ class SchemaConverter:
             select = parsed.expression if isinstance(parsed, exp.Create) else parsed
             if select is None:
                 raise ValueError("no SELECT body parsed from the view definition")
+            # The name is QUOTED, like every table and index name the converter emits:
+            # unquoted, Aurora DSQL folded it (``V_Orders`` became ``v_orders``, and a
+            # view in schema ``MyApp`` landed in a different schema, ``myapp``), so it
+            # could collide with a relation whose name differs only in case.
+            view_schema, view_name = _split_qualified(view.name)
             create = exp.Create(
-                this=exp.to_table(view.name), kind="VIEW", expression=select
+                this=exp.Table(
+                    this=exp.to_identifier(view_name, quoted=True),
+                    db=(
+                        exp.to_identifier(view_schema, quoted=True)
+                        if view_schema
+                        else None
+                    ),
+                ),
+                kind="VIEW",
+                expression=select,
             )
             target_ddl = create.sql(dialect=_POSTGRES, pretty=True)
         except Exception:  # noqa: BLE001 - any parse/generation failure -> manual

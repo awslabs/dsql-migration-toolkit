@@ -32,15 +32,15 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 
 | 분류 | 의미 | 예시 |
 |---|---|---|
-| **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고). |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, 다중 데이터베이스 소스, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키. |
-| **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `DECIMAL` 정밀도 > 38, 테이블당 컬럼 > 255, DB당 테이블 > 1000, FULLTEXT/SPATIAL 인덱스. |
+| **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고); 다중 데이터베이스 MySQL 소스(각 데이터베이스가 자체 스키마가 되며 `RECOMMENDED`로 표시); 같은 스키마의 다른 테이블·뷰·인덱스도 쓰는 인덱스 이름(인덱스가 자동으로 이름이 바뀌며 `RECOMMENDED`로 표시). |
+| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼의 보조 인덱스(UNIQUE 인덱스는 유일성 보장을 잃음), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장). |
+| **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `bytea` 컬럼의 기본 키(`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`), 63바이트로 잘리면 충돌하는 이름(한 테이블의 두 컬럼, 또는 한 스키마의 두 테이블/뷰), `DECIMAL` 정밀도 > 1000, 테이블당 컬럼 > 255, 타깃 데이터베이스의 테이블 1,000개·스키마 10개·뷰 5,000개 초과(클러스터에 이미 있는 것 포함), FULLTEXT/SPATIAL 인덱스. |
 
-위 예시는 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
+위 예시는 대부분 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
 컬럼 타입 — 배열(`[]`), geometric(`point`/`line`/`box`/…), network(`inet`/`cidr`/`macaddr`/`macaddr8`),
 `xml`, `money`, `bit`/`bit varying`/`varbit`, `tsvector`/`tsquery`, range + multirange, `pgvector`,
 `enum`, composite — 은 **MANUAL**/**UNSUPPORTED**로 표시되며 **절대 자동 대체되지 않고**, 구조적
-게이트(PK 없음, `numeric` 정밀도 > 38, 키 컬럼 > 8개 등)도 PostgreSQL 소스에 동일하게 적용됩니다.
+게이트(PK 없음, `numeric` 정밀도 > 1000, 키 컬럼 > 8개 등)도 PostgreSQL 소스에 동일하게 적용됩니다.
 
 분류되지 않는 객체는 없습니다 — 어떤 규칙에도 걸리지 않으면 기본 **AUTO**. 한 객체에 여러 규칙이
 걸리면 **가장 엄격한** 분류가 우선합니다(`UNSUPPORTED` > `MANUAL` > `AUTO`). 걸린 모든 규칙의
@@ -102,6 +102,24 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 
 리포트는 이를 **요약**으로 집계합니다: 분류별·작업량별 개수 — 스키마의 마이그레이션 용이성을 한눈에
 보여 줍니다.
+
+### 마이그레이션 준비도 점수
+
+리포트 맨 위 카드는 객체별 작업을 0~100으로 평가합니다. AUTO 객체는 비용이 0이고, 그 외 객체는 작업량
+가중치만큼 비용이 듭니다(simple 1, medium 3, significant 7; 추정치가 없는 UNSUPPORTED 객체는
+significant로 계산). 권장사항은 비용이 없습니다. 점수는 100에서 최악의 경우(모든 객체가 significant)
+대비 그 비용의 비율을 뺀 값이며, 작업이 필요한 객체가 하나라도 있으면 100이 되지 않습니다. 데이터베이스
+단위 한도 항목은 점수에 넣지 않고 등급을 정하는 데만 씁니다.
+
+등급은 blocker가 먼저 정하므로, 큰 소스라도 blocker가 평균에 묻히지 않습니다:
+
+| 등급 | 조건 |
+|---|---|
+| **Blocked** (빨강) | 마이그레이션이 Aurora DSQL 데이터베이스 한도를 넘음: 한 데이터베이스에 테이블 1,000개, 스키마 10개 또는 뷰 5,000개 초과(타깃 클러스터에 이미 있는 것 포함). 해결하기 전에는 다른 것이 의미가 없으므로 점수와 관계없이 이 등급이 됩니다. |
+| **Unsupported objects** (앰버) | UNSUPPORTED 객체가 하나 이상 있고, 점수만으로는 Ready 또는 Low effort인 경우. (점수가 더 낮으면 아래 작업량 등급이 그대로 유지됩니다.) |
+| **Ready** / **Low effort** (초록) | 점수 ≥ 90 / ≥ 70이고 UNSUPPORTED 객체가 없음. |
+| **Moderate effort** / **Significant effort** (앰버) | 점수 ≥ 45 / ≥ 1. |
+| **High effort** (빨강) | 점수 0. |
 
 ### 타깃 이름 충돌 감지 (적용 전에)
 
@@ -203,7 +221,7 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 
 1. **모든 UNSUPPORTED 항목 해결.** 이 항목들은 깨끗한 마이그레이션을 가로막습니다. PK가 없으면 추가,
    트리거/루틴/이벤트는 애플리케이션(또는 EventBridge/Lambda)으로 이전, 공간 타입은 대체, `DECIMAL`
-   정밀도는 ≤ 38로 축소.
+   정밀도는 ≤ 1000으로 축소.
 2. **모든 MANUAL 항목 결정.** 파티셔닝 제거, 기본 collation 수용, 대소문자 무시 collation 처리,
    `ENUM`/`SET` 처리 등. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전 점검(또는
    **Check sizes**, [§13.5](13-excluding-tables-and-columns.md#135-초대형-lob-후보와-check-sizes))을
@@ -253,8 +271,10 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   다른 컬럼을 참조하는 표현식은 불가) 조용히 사라지지 않고 드롭 + **보고**됩니다.
   `ON UPDATE CURRENT_TIMESTAMP`는 아예 재현할 수 없습니다 — DSQL에는 `ON UPDATE` 절도 트리거도
   없습니다 — 따라서 애플리케이션이 처리하도록 **MANUAL**로 표시됩니다. **PostgreSQL 소스**에서는
-  변환기가 컬럼 DEFAULT를 전혀 내보내지 않습니다 — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식
-  포함 — 따라서 타깃의 identity는 선택한 기본 키 전략이 좌우합니다. 단 `STORED` 생성 컬럼은
+  컬럼 DEFAULT를 **그대로 가져옵니다**(PostgreSQL 재파싱으로 정규화). 기본 키의 `serial`/`IDENTITY`
+  `nextval`은 선택한 기본 키 전략이 대신 좌우하고, 키가 아닌 컬럼의 `nextval`, 파싱되지 않는 기본값,
+  DSQL에 없는 타입으로 캐스팅하는 기본값은 노트와 함께 제외됩니다(enum 기본값은 컬럼이 `text`가 되므로
+  평문 텍스트 리터럴로 유지). `STORED` 생성 컬럼도
   **보존**됩니다: 식이 `GENERATED ALWAYS AS (expr) STORED`로 다시 출력되고 Aurora DSQL이 모든 쓰기에서
   값을 유지하므로 다시 구현할 것이 없습니다(쓰기는 그 컬럼을 빼야 하며, Full Load와 CDC 싱크가 그렇게
   합니다). `VIRTUAL` 생성 컬럼(PG18의 기본 종류)은 DSQL에 대응물이 없어 일반 컬럼으로
@@ -360,10 +380,11 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 > geometric(`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`),
 > network(`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`, `bit`/`bit varying`/`varbit`,
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. PG의 numeric
-> 규칙은 아래 표와 같습니다: `p > 38`/`s > 37`인 `numeric(p,s)`는 경고와 함께 clamp되고, 정밀도 없는
-> `numeric`/`decimal`은 `numeric(18,6)`이 됩니다. 컬럼 DEFAULT, `serial`/`IDENTITY` `nextval`,
-> `serial`/`IDENTITY` `nextval`은 **내보내지 않지만**(identity는 PK 전략이 좌우) `STORED` 생성 컬럼의
-> 식은 다시 출력됩니다(Aurora DSQL이 지원·유지하므로). `VIRTUAL` 생성 컬럼은 일반 컬럼이
+> 규칙은 아래 표와 같습니다: `p > 1000`/`s > 1000`인 `numeric(p,s)`는 경고와 함께 clamp되고, 정밀도 없는
+> `numeric`/`decimal`은 `numeric(18,6)`으로 저장됩니다: 소수 6자리를 넘는 값은 적재 시 반올림되고
+> Validation도 그 컬럼을 scale 6으로 비교하므로, Evaluation이 표시합니다(`PG_UNCONSTRAINED_NUMERIC`).
+> 컬럼 DEFAULT는 **내보내며** `serial`/`IDENTITY` `nextval`만 제거되고(identity는 PK 전략이 좌우),
+> `STORED` 생성 컬럼의 식은 다시 출력됩니다(Aurora DSQL이 지원·유지하므로). `VIRTUAL` 생성 컬럼은 일반 컬럼이
 > 됩니다.
 
 ### 타입 매핑 (전체 참조)
@@ -396,7 +417,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 
 | MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 38**은 Evaluation에서 **UNSUPPORTED**로 표시(DSQL은 NUMERIC을 38로 제한)되지만, Schema Conversion은 **`numeric(38,37)`으로 clamp**하며 데이터 손실 경고와 함께 DDL을 냅니다(스케일도 37로 제한). 타깃이 유지하는 것보다 소수 자릿수가 많은 값(Step 1 이후 넓어진 소스, 또는 여기서 지정한 더 좁은 타입)은 Full Load와 CDC 모두에서 반올림하지 않고 거부합니다. |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 1000**은 Evaluation에서 **UNSUPPORTED**로 표시(DSQL 문서상 최대 정밀도 1000, 스케일 -1000..1000, 기본값 `numeric(18,6)`)되지만, Schema Conversion은 **최대값으로 clamp**하며 데이터 손실 경고와 함께 DDL을 냅니다. MySQL `DECIMAL`(최대 65,30)과 모든 PostgreSQL `numeric`(자체 한도가 같은 1000)은 이 범위 안이므로, 이 표시와 clamp는 안전장치일 뿐입니다. 타깃이 유지하는 것보다 소수 자릿수가 많은 값(Step 1 이후 넓어진 소스, 또는 여기서 지정한 더 좁은 타입)은 Full Load와 CDC 모두에서 반올림하지 않고 거부합니다. |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 부호 없음은 표현 불가하며 저장상 의미 없음. |
 | `FLOAT` | `real` | `real` | AUTO | 단정밀도 float. |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 표시 스펙 드롭(PostgreSQL `float`은 스케일이 아닌 정밀도 하나만 받음). |
@@ -443,17 +464,19 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | **트랜잭션당 한 개 DDL** | 스키마 변환은 실행 단위당 정확히 한 개 DDL 문을 내보냄. |
 | **`CREATE INDEX ASYNC`** | 보조 인덱스를 데이터 적재 후 비동기로 생성. |
 | **낙관적 동시성** | 모든 배치·DDL을 `40001` 재시도로 감쌈. |
-| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 변환기가 컬럼 기본값을 전혀 내보내지 않고(`serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식은 제거됨), identity는 타깃에서 선택한 PK 전략이 좌우합니다. |
+| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 **그대로 가져옵니다**(PostgreSQL 재파싱으로 정규화) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고, DSQL에 없는 다른 타입으로 캐스팅하는 기본값은 노트와 함께 제외됩니다. |
 | **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
 | **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
 | **네이티브 파티셔닝 없음** | DSQL이 자동 분산; 파티션 테이블은 MANUAL. |
-| **클러스터당 하나의 DB** | 다중 DB 소스는 MANUAL(스키마로 통합하거나 클러스터 분리). |
+| **클러스터당 하나의 DB** | 다중 DB MySQL 소스의 각 데이터베이스는 자동으로 자체 스키마가 됩니다(`RECOMMENDED`로 표시). 몇 개까지 되는지는 다음 행을 참고하세요. |
+| **데이터베이스당 스키마 ≤ 10, 테이블 ≤ 1,000, 뷰 ≤ 5,000** | Evaluation은 마이그레이션 후 타깃 데이터베이스가 담게 될 개수(소스 객체 + 클러스터에 이미 있는 것; 기본 제공 `public` 스키마는 세지 않으며, 테이블이나 뷰가 없는 스키마는 개수에 보이지 않음)를 세어 초과하면 **UNSUPPORTED**(`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`)로 표시하고, 준비도 점수는 **Blocked**가 됩니다. 그렇지 않으면 적용이 처음 객체들을 만든 뒤 `54000`으로 실패합니다. 한도에 도달하면 Aurora DSQL은 이미 있는 스키마에 대한 `IF NOT EXISTS`까지 모든 `CREATE SCHEMA`를 거부하므로(라이브 확인), 적용은 카탈로그를 확인해 이미 있는 스키마는 생성된 것으로 처리합니다. |
 | **소스 `CHECK` 제약은 드롭됨** | 소스 `CHECK` 제약(MySQL `CHECK`는 8.0.16+ 필요)은 타깃으로 넘어가지 않고 — 함수/연산자가 DSQL과 다를 수 있음 — **MANUAL**로 표시됩니다: DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제하세요. (도구가 `ENUM`용으로 *생성*하는 `CHECK … IN (...)`은 영향 없음.) |
-| **`bytea`는 키가 될 수 없음** | `bytea` 컬럼(`BINARY`/`VARBINARY`, `*BLOB`, spatial 유래)은 **기본 키** 컬럼(테이블 → **UNSUPPORTED**)이나 **인덱스** 컬럼(인덱스 드롭 → **MANUAL**)이 될 수 없습니다. `text`/`uuid`/해시로 re-key하세요. |
+| **`bytea`는 키가 될 수 없음** | `bytea` 컬럼(`BINARY`/`VARBINARY`, `*BLOB`, spatial 유래)은 **기본 키** 컬럼(테이블 → **UNSUPPORTED**)이나 **인덱스** 컬럼(인덱스 드롭 → **MANUAL**; 드롭된 UNIQUE 인덱스는 더 이상 유일성을 보장하지 않으며 노트에 명시)이 될 수 없습니다. Evaluation도 같은 테이블을 표시합니다(`BYTEA_KEY`). `text`/`uuid`/해시로 re-key하세요. |
 | **키 컬럼 ≤ 8개** | PK 또는 인덱스가 8개 컬럼을 넘으면 DSQL 한도 초과: PK는 **UNSUPPORTED**, 과도한 세컨더리 인덱스는 **드롭(MANUAL)**. |
 | **테이블당 인덱스 ≤ 24개** | DSQL은 테이블당 최대 24개 인덱스 허용(PK 포함 → 세컨더리 ≤ 23). 초과 인덱스는 표시되고 일부는 생성되지 않습니다. |
 | **키 값 ≤ 1 KiB** | 결합된 키 값은 ~1 KiB 미만이어야 합니다; 큰 키는 **권장(recommendation)** 으로 표시(실데이터에서 삽입 시 실패 가능). |
-| **식별자 63바이트** | DSQL/PostgreSQL은 식별자를 63바이트로 자릅니다; 잘림으로 두 이름이 충돌하면 객체가 **UNSUPPORTED**로 표시됩니다(앞 63바이트가 유일하도록 개명). |
+| **식별자 63바이트** | DSQL/PostgreSQL은 식별자를 (문자 경계에서) 63바이트로 자릅니다. 한 테이블의 두 컬럼 이름이 같은 이름으로 잘리면 테이블이 **UNSUPPORTED**(`IDENTIFIER_LENGTH`)가 됩니다. 한 스키마의 두 테이블이나 뷰가 같은 이름으로 잘려도 **UNSUPPORTED**(`NAME_COLLISION`)이며, 먼저 만들어진 쪽이 다른 쪽의 행을 받게 되므로 Schema Conversion은 둘 다 생성하지 않습니다(Data Migration도 대상으로 제시하지 않습니다). 앞 63바이트가 다르도록 소스에서 이름을 바꾸세요. 스키마 이름도 같은 방식으로 잘리므로, 이름의 앞 63바이트가 같은 두 소스 데이터베이스는 하나의 타깃 스키마를 공유합니다. 아무것과도 충돌하지 않는 긴 이름은 **권장(recommendation)** 입니다: DSQL은 줄인 이름으로 저장합니다. |
+| **인덱스 이름은 스키마 단위로 유일** | Aurora DSQL은 한 스키마의 테이블·뷰·인덱스를 하나의 네임스페이스에 두지만, MySQL은 인덱스 이름을 테이블 단위로 구분합니다. 그래서 Schema Conversion은 같은 스키마의 다른 relation도 쓰는 이름의 인덱스를 **모두** `<table>_<index>`로 자동 변경합니다(필요하면 63바이트로 자르고 해시 접미사를 붙임). 테이블과 뷰는 이름을 유지하고, 뷰 이름도 테이블처럼 따옴표로 감싸 대소문자를 유지합니다. 그래서 UNIQUE를 포함한 모든 인덱스가 생성됩니다. Evaluation과 Schema Conversion은 이름이 바뀐 인덱스를 `RECOMMENDED`(`NAME_COLLISION`)로 표시하며, 기본 키 전략을 바꿔도 같은 이름이 유지됩니다. 이전 적용이 남긴 relation이 다른 객체에 필요한 이름을 차지하고 있으면(테이블 이름과 같은 인덱스 등), 적용은 "already exists"로 건너뛰지 않고 그 객체를 차지한 relation 이름과 함께 **FAILED**로 보고하며, Evaluation의 타깃 분석은 이를 *Names held on the target by another object*에 표시합니다. 이전 버전이 만든 타깃에서도 적용은 이름이 바뀐 인덱스와 따옴표로 감싼 뷰를 새로 만들고, 이전 이름으로 남은 옛 사본(더 이상 아무것도 관리하지 않음)을 결과에 알려 줍니다. 이 사본은 삭제하세요(**Replace**는 함께 삭제합니다). |
 
 위 표의 **분류** 열은 Evaluation이 모든 객체에 적용하는 것과 같은 AUTO / MANUAL / UNSUPPORTED
 척도입니다 — 각 분류의 의미와, 여러 규칙이 겹칠 때 가장 엄격한 분류가 이기는 방식은

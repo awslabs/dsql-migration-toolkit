@@ -72,7 +72,9 @@ from dsql_migrator.core.converter import (
     _mysql_source_base,
     default_primary_key_strategy,
     identity_strategy_applies,
+    is_name_collision_placeholder,
     parse_target_primary_key,
+    rename_index_script,
     validate_composite_leading_column,
 )
 from dsql_migrator.core.assessor import kind_label
@@ -913,7 +915,11 @@ def build_view_preview(
     Without a conversion (or one that could not be auto-converted) the target is
     the not-auto-converted note for manual reimplementation.
     """
-    if conversion is not None and conversion.auto_converted:
+    if conversion is not None and (
+        conversion.auto_converted or is_name_collision_placeholder(conversion.target_ddl)
+    ):
+        # A view sharing a stored name with a table or view keeps its placeholder: its
+        # remedy is a source rename, not the "reimplement manually" note.
         target_ddl = conversion.target_ddl
     else:
         target_ddl = _NOT_AUTO_CONVERTED
@@ -1532,6 +1538,20 @@ def build_schema_conversion_screen(
             factory = applier_factory or default_applier_factory(session.aws_profile)
             _applier_cache["config"] = target_config
             _applier_cache["applier"] = factory(target_config)
+        # What this conversion emits, for telling the source's own objects apart from what
+        # an earlier version left under another name (a lower-case view, a source-named
+        # index). Re-set every run: a source refresh changes it.
+        set_names = getattr(_applier_cache["applier"], "set_converted_names", None)
+        if callable(set_names):
+            from dsql_migrator.core.schema_applier import converted_names
+
+            set_names(
+                converted_names(
+                    (view.name for view in inventory.views),
+                    _conversion(inventory).index_renames,
+                    table_names=(table.name for table in inventory.tables),
+                )
+            )
         return (
             _applier_cache["applier"],  # type: ignore[return-value]
             conv_state.apply_mode,
@@ -1845,8 +1865,11 @@ def build_schema_conversion_screen(
         objects, mirroring the generated-DDL preview scope.
         """
         selected = _selected_apply_names()
+        conversion = _conversion(inventory)
         objects = override_apply_objects(
-            build_apply_objects(_conversion(inventory)), conv_state.edited_target_ddls
+            build_apply_objects(conversion),
+            conv_state.edited_target_ddls,
+            conversion=conversion,
         )
         # One apply unit per object (the deterministic conversion, overlaid with any
         # user edit from the "Use as target DDL" chat action) restricted to the current
@@ -2469,12 +2492,11 @@ def build_schema_conversion_screen(
             )
             async def refresh_source() -> None:
                 """Re-introspect the source DB and refresh the source tree."""
-                from dataclasses import replace as _replace
-
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
+                    with_refreshed_catalogs,
                 )
 
                 if not session.has_source():
@@ -2496,12 +2518,18 @@ def build_schema_conversion_screen(
                     return
                 old_result = eval_state.result
                 if old_result is not None:
-                    # ``replace`` rather than re-listing every field: this rebuild silently
-                    # dropped ``source_type`` (added later), which titled a PostgreSQL
-                    # migration's exported report "MySQL to Aurora DSQL...". Copying by
-                    # default means the NEXT field added cannot repeat that.
+                    # The assessment and the name conflicts are recomputed from the re-read
+                    # inventory -- graded by the engine it was just read with -- off the
+                    # event loop (it scales with the schema); every other field is copied.
                     eval_state.set_result(
-                        _replace(old_result, inventory=new_inventory)
+                        await _run.io_bound(
+                            with_refreshed_catalogs,
+                            old_result,
+                            inventory=new_inventory,
+                            target_inventory=old_result.target_inventory,
+                            target_endpoint=old_result.target_endpoint,
+                            source_type=source_conn.source_type,
+                        )
                     )
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]
                 refresh()
@@ -2515,13 +2543,11 @@ def build_schema_conversion_screen(
                 re-render are noise, because the caller renders once it has committed its
                 own state. The manual refresh button keeps both.
                 """
-                from dataclasses import replace as _replace
-
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
                     _default_target_browser_factory,
-                    _find_target_conflicts,
+                    with_refreshed_catalogs,
                 )
 
                 if not session.has_target():
@@ -2541,14 +2567,12 @@ def build_schema_conversion_screen(
                     return
                 old_result = eval_state.result
                 if old_result is not None:
-                    # ``replace`` for the same reason as refresh_source above.
                     eval_state.set_result(
-                        _replace(
+                        await _run.io_bound(
+                            with_refreshed_catalogs,
                             old_result,
+                            inventory=old_result.inventory,
                             target_inventory=new_target,
-                            target_conflicts=_find_target_conflicts(
-                                old_result.inventory, new_target
-                            ),
                             # Re-stamp: this catalog was just read from the CURRENT
                             # cluster, so without it the pair would stay flagged stale
                             # forever and the refresh would fix nothing.
@@ -2639,6 +2663,14 @@ def build_schema_conversion_screen(
 
                     sql = extract_sql_from_reply(md)
                     if not sql:
+                        return
+                    if is_name_collision_placeholder(deterministic):
+                        ui.notify(  # type: ignore[attr-defined]
+                            f"{object_name} cannot be fixed in its target DDL: its name "
+                            "shares its first 63 bytes with another table or view. "
+                            "Shorten the names on the source.",
+                            type="info",
+                        )
                         return
                     verdict = validate_suggested_sql(sql)
                     if not verdict.is_safe:
@@ -3516,10 +3548,11 @@ def _render_browser_and_preview(
         ).classes("text-sm text-gray-500")
         return
 
+    conversion_result = result_provider()
     previews = generate_previews(
         conv_state.generated_node_ids,
         inventory,
-        result_provider(),
+        conversion_result,
         existence_checker=existence_checker,
         source_type=source_type,
     )
@@ -3595,7 +3628,10 @@ def _render_browser_and_preview(
     def _render_preview_expansion(preview: DdlPreview) -> None:
         caption = _object_header_summary(
             preview,
-            edited=conv_state.get_edited_target_ddl(preview.object_name) is not None,
+            edited=(
+                conv_state.get_edited_target_ddl(preview.object_name) is not None
+                and not is_name_collision_placeholder(preview.target_ddl)
+            ),
             applied=conv_state.get_apply_result(preview.object_name),
         )
         expanded = (
@@ -3629,19 +3665,29 @@ def _render_browser_and_preview(
             source_table = _find_table(inventory, preview.object_name)
             if source_table is not None and not not_auto_converted:
                 _render_pk_strategy_picker(
-                    ui, source_table, conv_state, refresh, source_type=source_type
+                    ui,
+                    source_table,
+                    conv_state,
+                    refresh,
+                    source_type=source_type,
+                    # The re-conversion must emit the same (renamed) index names as the
+                    # whole-inventory conversion, or it would bring the collision back.
+                    index_names=conversion_result.index_renames.get(source_table.name),
                 )
             _render_preview(
                 ui,
                 preview,
                 conv_state,
                 refresh,
+                # Not for names that share a stored form: only a source rename helps.
                 is_ai_candidate=(
                     preview.object_name in candidates or not_auto_converted
-                ),
+                )
+                and not is_name_collision_placeholder(preview.target_ddl),
                 on_apply_object=on_apply_object,
                 on_ai_chat=on_ai_chat,
                 source_type=source_type,
+                index_renames=conversion_result.index_renames.get(preview.object_name),
             )
 
     # Group the generated objects by kind (Tables, then Views) with a small
@@ -3729,6 +3775,7 @@ def _render_pk_strategy_picker(
     refresh: Callable[[], None],
     *,
     source_type: SourceType = SourceType.MYSQL,
+    index_names: "Optional[Mapping[str, str]]" = None,
 ) -> None:
     """Per-table primary-key strategy picker (Keep / Server-generated / Composite).
 
@@ -3807,18 +3854,29 @@ def _render_pk_strategy_picker(
             if leading is None:
                 return  # no eligible column; the control stays on Keep (see below)
             conv_state.set_edited_target_ddl(
-                name, render_target_ddl(build_composite_conversion(converter, table, leading))
+                name,
+                render_target_ddl(
+                    build_composite_conversion(
+                        converter, table, leading, index_names=index_names
+                    )
+                ),
             )
         elif choice == _IDENTITY_PK:
             conv_state.set_edited_target_ddl(
-                name, render_target_ddl(build_identity_conversion(converter, table))
+                name,
+                render_target_ddl(
+                    build_identity_conversion(converter, table, index_names=index_names)
+                ),
             )
         elif identity_by_default:
             # Keep has to be STORED now: clearing the override would fall back to the
             # converter's default, which for this table IS the identity -- so "Keep"
             # would silently produce the very thing the operator just opted out of.
             conv_state.set_edited_target_ddl(
-                name, render_target_ddl(build_keep_conversion(converter, table))
+                name,
+                render_target_ddl(
+                    build_keep_conversion(converter, table, index_names=index_names)
+                ),
             )
         else:
             # No generated key, so the default conversion already keeps the source key:
@@ -3831,7 +3889,10 @@ def _render_pk_strategy_picker(
         if not leading:
             return
         conv_state.set_edited_target_ddl(
-            name, render_target_ddl(build_composite_conversion(converter, table, leading))
+            name,
+            render_target_ddl(
+                build_composite_conversion(converter, table, leading, index_names=index_names)
+            ),
         )
         refresh()
 
@@ -4012,6 +4073,7 @@ def _render_preview(
     on_apply_object: Optional[Callable[[str], None]] = None,
     on_ai_chat: Optional[Callable[..., None]] = None,
     source_type: SourceType = SourceType.MYSQL,
+    index_renames: "Optional[Mapping[str, str]]" = None,
 ) -> None:
     """Render one object's source-vs-target DDL diff (Req 10.2, 11.5).
 
@@ -4073,6 +4135,7 @@ def _render_preview(
                 conv_state,
                 on_apply_object,
                 source_type=source_type,
+                index_renames=index_renames,
             )
 
     if preview.warnings:
@@ -4080,6 +4143,9 @@ def _render_preview(
             ui,
             preview.warnings,
             on_ai_chat=on_ai_chat,
+            # Names that share a stored form: only a source rename helps, so no AI help
+            # (its "Use as target DDL" would store an edit every apply path ignores).
+            ai_withheld=is_name_collision_placeholder(preview.target_ddl),
             object_name=preview.object_name,
             source_ddl=preview.source_ddl,
             deterministic_ddl=preview.target_ddl,
@@ -4192,6 +4258,7 @@ def _render_conversion_warnings(
     object_name: str = "",
     source_ddl: str = "",
     deterministic_ddl: str = "",
+    ai_withheld: bool = False,
 ) -> None:
     """Render conversion notes as wrapping lists, split by kind.
 
@@ -4245,10 +4312,13 @@ def _render_conversion_warnings(
                     )
                     # Per-note AI-guidance icon on the right (mirrors Evaluation's
                     # per-finding icon) -- one click asks AI DBA about THIS note's issue.
-                    _render_conversion_note_ai_icon(
-                        ui, on_ai_chat, object_name, source_ddl, deterministic_ddl,
-                        note=note,
-                    )
+                    # None at all when AI help is withheld: a disabled one reads as "AI
+                    # is off" and sends the operator to Connect for nothing.
+                    if not ai_withheld:
+                        _render_conversion_note_ai_icon(
+                            ui, on_ai_chat, object_name, source_ddl, deterministic_ddl,
+                            note=note,
+                        )
 
     if losses:
         ui.label("Conversion warnings").classes("text-sm font-semibold")  # type: ignore[attr-defined]
@@ -4581,8 +4651,13 @@ def _render_editable_target(
     extra_actions: Optional[Callable[[], None]] = None,
     read_only_caption: Optional[str] = None,
     source_type: SourceType = SourceType.MYSQL,
+    index_renames: "Optional[Mapping[str, str]]" = None,
 ) -> None:
     """Render the source/target DDL diff with an inline Edit toggle.
+
+    ``index_renames`` (the conversion's renames for this object): a stored edit that still
+    names a colliding index by its source name is shown and copied renamed, exactly as
+    Schema Apply and Full Load apply it -- the stored text itself is left as typed.
 
     The read-only view is a side-by-side, change-highlighted diff of the source
     DDL against the effective target DDL (the generated DDL, or the user's edit
@@ -4595,6 +4670,11 @@ def _render_editable_target(
     inline.
     """
     editor_box = ui.column().classes("w-full gap-2")  # type: ignore[attr-defined]
+
+    def _as_applied(edited: Optional[str]) -> Optional[str]:
+        if edited is None or not index_renames:
+            return edited
+        return rename_index_script(edited, index_renames)
 
     async def apply_click(button: object = None) -> None:
         if on_apply_object is None:
@@ -4631,7 +4711,7 @@ def _render_editable_target(
 
     def render(*, editing: bool) -> None:
         editor_box.clear()  # type: ignore[attr-defined]
-        edited = conv_state.get_edited_target_ddl(preview.object_name)
+        edited = _as_applied(conv_state.get_edited_target_ddl(preview.object_name))
         current = edited if edited is not None else preview.target_ddl
         # Present the deferred foreign keys in their OWN read-only section (see
         # _render_fk_section) instead of intermixed in the editable box, so a user
@@ -4712,7 +4792,7 @@ def _render_editable_target(
                             # ``current`` (the string at build time) handed back the pre-edit
                             # DDL while Apply sent the edited one.
                             copy_ddl=lambda: (
-                                conv_state.get_edited_target_ddl(preview.object_name)
+                                _as_applied(conv_state.get_edited_target_ddl(preview.object_name))
                                 or preview.target_ddl
                             ),
                             copy_label="Target DDL",

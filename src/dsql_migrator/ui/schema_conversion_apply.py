@@ -27,7 +27,9 @@ from dsql_migrator.core.converter import (
     SchemaConvertOptions,
     SchemaConverter,
     TableConversion,
+    is_name_collision_placeholder,
     parse_target_primary_key,
+    rename_index_statements,
 )
 from dsql_migrator.core.models import (
     AiConversionSuggestion,
@@ -69,6 +71,16 @@ class ApplyOutcome(str, Enum):
 
     CREATED = "CREATED"
     SKIPPED = "SKIPPED"
+
+
+@dataclass(frozen=True)
+class NotedApplyOutcome:
+    """An :class:`ApplyOutcome` with something the user has to know about it, which an
+    applier returns instead of the bare outcome (e.g. a view kept under the lower-case
+    name an earlier version gave it). The note replaces the generic result detail."""
+
+    outcome: ApplyOutcome
+    note: str
 
 
 class ObjectApplyStatus(str, Enum):
@@ -250,7 +262,7 @@ class SchemaApplier(Protocol):
 
     def apply_object(
         self, object_name: str, ddls: Sequence[str], on_conflict: ApplyMode
-    ) -> ApplyOutcome:
+    ) -> "ApplyOutcome | NotedApplyOutcome":
         """Apply ``ddls`` for ``object_name`` honoring ``on_conflict``."""
 
 
@@ -492,6 +504,8 @@ def _is_foreign_key_ddl(statement: str) -> bool:
 def override_apply_objects(
     objects: Sequence[ApplyObject],
     edited_ddls: dict[str, str],
+    *,
+    conversion: Optional[SchemaConversionResult] = None,
 ) -> list[ApplyObject]:
     """Apply user edits to the deterministic apply units (Requirement 10.2/10.4).
 
@@ -509,16 +523,30 @@ def override_apply_objects(
     object with no edit, or whose edit contains no applicable CREATE statement,
     keeps its deterministic DDL (so an accidental blank -- or an edit reduced to
     only its FK line -- never silently applies nothing). Order is preserved.
+
+    ``conversion`` (the result ``objects`` came from) makes this agree with
+    :func:`applied_table_conversions`, which Full Load uses: an edit stored before the
+    converter renamed a table's colliding indexes is applied under the new names, and
+    a stored edit never replaces the placeholder of tables whose names share a stored
+    form (no target DDL can separate them).
     """
+    tables = {table.table: table for table in conversion.tables} if conversion else {}
+    renames_by_table = conversion.index_renames if conversion else {}
     overridden: list[ApplyObject] = []
     for obj in objects:
         edited = edited_ddls.get(obj.object_name)
+        table = tables.get(obj.object_name)
+        if table is not None and is_name_collision_placeholder(table.target_ddl):
+            edited = None
         if edited is not None:
             ddls = tuple(
                 stmt
                 for stmt in split_sql_statements(edited)
                 if not _is_foreign_key_ddl(stmt)
             )
+            renames = renames_by_table.get(obj.object_name)
+            if ddls and renames:
+                ddls = tuple(rename_index_statements(ddls, renames))
             if ddls:
                 overridden.append(ApplyObject(object_name=obj.object_name, ddls=ddls))
                 continue
@@ -574,7 +602,11 @@ def default_composite_leading(table: TableDef) -> Optional[str]:
 
 
 def build_composite_conversion(
-    converter: SchemaConverter, table: TableDef, leading: str
+    converter: SchemaConverter,
+    table: TableDef,
+    leading: str,
+    *,
+    index_names: "Optional[Mapping[str, str]]" = None,
 ) -> TableConversion:
     """Per-table conversion for ``table`` under a composite PK on ``leading``.
 
@@ -593,11 +625,15 @@ def build_composite_conversion(
             primary_key_strategy=PrimaryKeyStrategy.COMPOSITE_KEY,
             composite_leading_column=leading,
         ),
+        index_names=index_names,
     )
 
 
 def build_identity_conversion(
-    converter: SchemaConverter, table: TableDef
+    converter: SchemaConverter,
+    table: TableDef,
+    *,
+    index_names: "Optional[Mapping[str, str]]" = None,
 ) -> TableConversion:
     """Per-table conversion for ``table`` under a server-generated identity key.
 
@@ -618,11 +654,15 @@ def build_identity_conversion(
         SchemaConvertOptions(
             primary_key_strategy=PrimaryKeyStrategy.IDENTITY_WITH_CACHE,
         ),
+        index_names=index_names,
     )
 
 
 def build_keep_conversion(
-    converter: SchemaConverter, table: TableDef
+    converter: SchemaConverter,
+    table: TableDef,
+    *,
+    index_names: "Optional[Mapping[str, str]]" = None,
 ) -> TableConversion:
     """Per-table conversion for ``table`` with the source key kept as a plain integer.
 
@@ -638,6 +678,7 @@ def build_keep_conversion(
         SchemaConvertOptions(
             primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER,
         ),
+        index_names=index_names,
     )
 
 
@@ -794,11 +835,22 @@ def applied_table_conversions(
     conversions: dict[str, TableConversion] = {}
     for table in result.tables:
         edited = edited_target_ddls.get(table.table)
+        if edited is not None and is_name_collision_placeholder(table.target_ddl):
+            # No target DDL separates names that share a stored form (the load and CDC
+            # write to the source name), so the placeholder stands.
+            edited = None
         conv = (
             _classify_edited_table_conversion(table, edited)
             if edited is not None
             else table
         )
+        renames = result.index_renames.get(table.table)
+        if edited is not None and renames:
+            # A script stored before the rename (a primary-key choice, an edit) still
+            # names a colliding index by its source name; apply it under the new name.
+            conv = conv.model_copy(
+                update={"index_ddls": rename_index_statements(conv.index_ddls, renames)}
+            )
         if not preserve_foreign_keys and conv.foreign_key_ddls:
             conv = conv.model_copy(update={"foreign_key_ddls": []})
         conversions[table.table] = conv
@@ -1127,6 +1179,9 @@ def run_schema_apply(
                     detail=f"{type(exc).__name__}: {exc}",
                 )
             else:
+                note = None
+                if isinstance(outcome, NotedApplyOutcome):
+                    outcome, note = outcome.outcome, outcome.note
                 status = (
                     ObjectApplyStatus.CREATED
                     if outcome is ApplyOutcome.CREATED
@@ -1135,7 +1190,7 @@ def run_schema_apply(
                 result = ObjectApplyResult(
                     object_name=obj.object_name,
                     status=status,
-                    detail=_apply_success_detail(outcome, mode),
+                    detail=note or _apply_success_detail(outcome, mode),
                 )
         results.append(result)
         if on_object_result is not None:
@@ -1351,10 +1406,29 @@ class DsqlSchemaApplier:
         self._aws_profile = aws_profile
         self._core_factory = core_factory or _build_core_applier
         self._core: Optional[object] = None
+        self._converted_names: Optional[object] = None
+
+    def set_converted_names(self, names: Optional[object]) -> None:
+        """What the conversion emits (a core ``ConvertedNames``), passed to the core
+        applier so a name an earlier version left on the target is told apart from the
+        source's own object. Set before each apply run: a source refresh changes it."""
+        self._converted_names = names
+        self._sync_converted_names()
+
+    def _ensure_core(self) -> object:
+        if self._core is None:
+            self._core = self._core_factory(self._target, self._aws_profile)
+            self._sync_converted_names()
+        return self._core
+
+    def _sync_converted_names(self) -> None:
+        setter = getattr(self._core, "set_converted_names", None)
+        if callable(setter):
+            setter(self._converted_names)
 
     def apply_object(
         self, object_name: str, ddls: Sequence[str], on_conflict: ApplyMode
-    ) -> ApplyOutcome:
+    ) -> "ApplyOutcome | NotedApplyOutcome":
         """Apply each DDL of ``object_name`` via the core applier.
 
         Each statement is applied individually (single-DDL transactions) and its
@@ -1368,16 +1442,17 @@ class DsqlSchemaApplier:
         otherwise the object is reported CREATED when any statement
         created/replaced an object, else SKIPPED. Confirmation is enforced
         upstream (``run_schema_apply`` never reaches here for an unconfirmed
-        REPLACE), so the core applier is called with ``confirmed=True``.
+        REPLACE), so the core applier is called with ``confirmed=True``. A statement result
+        with a ``note`` (an earlier version's copy kept under another name) makes the
+        outcome a :class:`NotedApplyOutcome`.
         """
         from dsql_migrator.core.models import ApplyMode as _CoreMode, ApplyStatus
 
-        if self._core is None:
-            self._core = self._core_factory(self._target, self._aws_profile)
-        core = self._core
+        core = self._ensure_core()
         core_mode = _CoreMode(on_conflict.value)
 
         statements: list[StatementApplyResult] = []
+        notes: list[str] = []
         outcome = ApplyOutcome.SKIPPED
         prerequisite_failed = False
         for ddl in ddls:
@@ -1403,6 +1478,9 @@ class DsqlSchemaApplier:
                 if kind != _INDEX_KIND:
                     prerequisite_failed = True
                 continue
+            note = getattr(result, "note", "")
+            if note:
+                notes.append(_clean_detail(note))
             # A CREATE SCHEMA IF NOT EXISTS is always reported CREATED ("schema
             # ensured") even when the schema already existed, so it must not make
             # the object look CREATED. The verdict reflects the real object
@@ -1412,6 +1490,8 @@ class DsqlSchemaApplier:
 
         if any(s.status is ObjectApplyStatus.FAILED for s in statements):
             raise ObjectApplyError(object_name, statements)
+        if notes:
+            return NotedApplyOutcome(outcome, " ".join(notes))
         return outcome
 
     def drop(self, target_ddl: str) -> None:
@@ -1423,9 +1503,7 @@ class DsqlSchemaApplier:
         EXISTS`` with OC001 retry); the core applier is built lazily on first
         use, exactly as in :meth:`apply_object`.
         """
-        if self._core is None:
-            self._core = self._core_factory(self._target, self._aws_profile)
-        self._core.drop(target_ddl)  # type: ignore[attr-defined]
+        self._ensure_core().drop(target_ddl)  # type: ignore[attr-defined]
 
 
 def default_applier_factory(aws_profile: Optional[str]) -> ApplierFactory:

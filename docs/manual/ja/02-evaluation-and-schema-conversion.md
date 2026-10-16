@@ -33,15 +33,15 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 
 | 分類 | 意味 | 例 |
 |---|---|---|
-| **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。**外部キー**(自動変換され、`RECOMMENDED` としてフラグ付け — 下記参照)。 |
-| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、複数データベースのソース、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)。 |
-| **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`DECIMAL` 精度 > 38、テーブルあたりカラム > 255、データベースあたりテーブル > 1000、FULLTEXT/SPATIAL インデックス。 |
+| **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。**外部キー**(自動変換され、`RECOMMENDED` としてフラグ付け — 下記参照)。複数データベースの MySQL ソース(各データベースが独自のスキーマになり、`RECOMMENDED` としてフラグ付け)。同じスキーマの別のテーブル・ビュー・インデックスも使うインデックス名(インデックスは自動的に名前が変更され、`RECOMMENDED` としてフラグ付け)。 |
+| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム上のセカンダリインデックス(UNIQUE インデックスは一意性を失います)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)。 |
+| **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`bytea` カラムの主キー(`BINARY`/`VARBINARY`/`BLOB`、PostgreSQL の `bytea`)、63 バイトに切り詰めると衝突する名前(1 つのテーブルの 2 つのカラム、または 1 つのスキーマの 2 つのテーブル/ビュー)、`DECIMAL` 精度 > 1000、テーブルあたりカラム > 255、ターゲットデータベースのテーブル 1,000 個・スキーマ 10 個・ビュー 5,000 個超(クラスターに既にあるものを含む)、FULLTEXT/SPATIAL インデックス。 |
 
-上記の例は MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
+上記の例は主に MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
 ない PG カラム型 — 配列(`[]`)、geometric(`point`/`line`/`box`/…)、network(`inet`/`cidr`/`macaddr`/`macaddr8`)、
 `xml`、`money`、`bit`/`bit varying`/`varbit`、`tsvector`/`tsquery`、range + multirange、`pgvector`、`enum`、
 composite — は **MANUAL**/**UNSUPPORTED** としてフラグ付けされ、**決して自動置換されません**。構造上の
-ゲート(PK なし、`numeric` 精度 > 38、キー列 > 8 個 など)も PostgreSQL ソースに等しく適用されます。
+ゲート(PK なし、`numeric` 精度 > 1000、キー列 > 8 個 など)も PostgreSQL ソースに等しく適用されます。
 
 分類されないオブジェクトはありません — どのルールにも一致しないオブジェクトはデフォルトで **AUTO** に
 なります。1 つのオブジェクトに複数のルールが一致した場合は、**最も厳しい** 分類が優先され
@@ -109,6 +109,25 @@ DML は **追加の読み取り** を発生させます(AWS は追加前にベ�
 
 レポートはこれらを **サマリー** にも集計します。分類ごと・作業量レベルごとの件数 —
 スキーマがどれだけマイグレーションしやすいかを一目で把握できる図です。
+
+### マイグレーション準備度スコア
+
+レポート上部のカードは、オブジェクトごとの作業を 0〜100 で評価します。AUTO オブジェクトのコストは 0、
+それ以外のオブジェクトは作業量の重み(simple 1、medium 3、significant 7。見積もりのない UNSUPPORTED
+オブジェクトは significant として計算)がコストになり、推奨事項はコストになりません。スコアは、最悪の
+場合(すべてのオブジェクトが significant)に対するそのコストの割合を 100 から引いた値で、作業が必要な
+オブジェクトが 1 つでもある間は 100 になりません。データベース単位の制限項目はスコアに含めず、バンドの
+決定にだけ使います。
+
+バンドはまずブロッカーで決まるため、大きなソースでもブロッカーが平均に埋もれることはありません:
+
+| バンド | 条件 |
+|---|---|
+| **Blocked**(赤) | マイグレーションが Aurora DSQL のデータベース制限を超える: 1 つのデータベースにテーブル 1,000 個、スキーマ 10 個、またはビュー 5,000 個を超える(ターゲットクラスターに既にあるものを含む)。解決するまでは他のことに意味がないため、スコアに関係なくこのバンドになります。 |
+| **Unsupported objects**(アンバー) | UNSUPPORTED のオブジェクトが 1 つ以上あり、スコアだけなら Ready または Low effort になる場合。(スコアがそれより低い場合は、下の作業量バンドがそのまま使われます。) |
+| **Ready** / **Low effort**(緑) | スコア ≥ 90 / ≥ 70 で、UNSUPPORTED がない。 |
+| **Moderate effort** / **Significant effort**(アンバー) | スコア ≥ 45 / ≥ 1。 |
+| **High effort**(赤) | スコア 0。 |
 
 ### ターゲットの名前衝突検出(何かを適用する前に)
 
@@ -216,7 +235,7 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 
 1. **すべての UNSUPPORTED 項目を解決します。** これらはクリーンなマイグレーションを妨げます。PK が
    ない場合は追加し、トリガー/ルーチン/イベントはアプリケーション(または EventBridge/Lambda)へ移し、
-   空間型は置き換え、`DECIMAL` 精度は ≤ 38 に縮小します。
+   空間型は置き換え、`DECIMAL` 精度は ≤ 1000 に縮小します。
 2. **すべての MANUAL 項目を判断します。** パーティショニングの削除、デフォルト collation の受け入れ、
    `ENUM`/`SET` の扱い、`ON UPDATE` タイムスタンプの判断、CDC が複製できないカスケードアクションの置き換え
    などを決めます。過大な LOB/JSON カラム(`OVERSIZED_LOB`)は、まず Data Migration の前提条件チェック
@@ -268,9 +287,11 @@ MySQL→PostgreSQL トランスパイルではありません。
   ないデフォルト(MySQL の `UUID()` は変換されますが、他の列を参照する式は不可)は、黙って失われる
   のではなく破棄して **報告** されます。`ON UPDATE CURRENT_TIMESTAMP` はまったく再現できません —
   DSQL には `ON UPDATE` 句もトリガーもありません — そのため、アプリケーション側で処理するよう
-  **MANUAL** としてフラグ付けされます。**PostgreSQL ソース** では、コンバーターは列 DEFAULT を **一切**
-  出力しません — `serial`/`IDENTITY` `nextval` や生成カラムの式を含みます — そのため、ターゲットの
-  identity は選択した主キー戦略が決定し、`STORED` 生成カラムは通常のカラムとして作成されます。
+  **MANUAL** としてフラグ付けされます。**PostgreSQL ソース** では、列 DEFAULT を **引き継ぎます**
+  (PostgreSQL の再パースで正規化)。主キーの `serial`/`IDENTITY` `nextval` は選択した主キー戦略が代わりに
+  決定し、キーでない列の `nextval`、パースできないデフォルト、DSQL にない型へキャストするデフォルトは
+  注記付きで除外されます(enum のデフォルトは列が `text` になるため、プレーンなテキストリテラルとして
+  保持されます)。`STORED` 生成カラムの式は再出力され、`VIRTUAL` 生成カラムは通常のカラムになります。
 - **外部キーの保持** — Aurora DSQL は外部キーを **強制** するため、各ソースの FK は **`CREATE TABLE` の外**
   に保たれ、独立した post-load の `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 文としてレンダリングされます。
   Full Load はデータのロード **後** に実行単位レベルのパスとしてこれらを再作成します。**CDC** マイグレーション
@@ -377,9 +398,12 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 > geometric(`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`)、
 > network(`inet`/`cidr`/`macaddr`/`macaddr8`)、`xml`、`money`、`bit`/`bit varying`/`varbit`、
 > `tsvector`/`tsquery`、range + PG14 multirange、`pgvector`、`enum`、composite。PG の numeric ルールは
-> 下記のテーブルと同じです: `p > 38`/`s > 37` の `numeric(p,s)` は警告付きでクランプされ、精度指定のない
-> `numeric`/`decimal` は `numeric(18,6)` になります。列 DEFAULT、`serial`/`IDENTITY` `nextval`、
-> 生成カラムの式は **出力されず**(identity は PK 戦略が決定)、`STORED` 生成カラムは通常のカラムになります。
+> 下記のテーブルと同じです: `p > 1000`/`s > 1000` の `numeric(p,s)` は警告付きでクランプされ、精度指定のない
+> `numeric`/`decimal` は `numeric(18,6)` として格納されます: 小数 6 桁を超える値はロード時に丸められ、
+> Validation もその列をスケール 6 で比較するため、Evaluation がフラグ付けします(`PG_UNCONSTRAINED_NUMERIC`)。
+> 列 DEFAULT は **出力され**、`serial`/`IDENTITY` `nextval` だけが除去されます(identity は PK 戦略が決定)。
+> `STORED` 生成カラムの式は再出力され(Aurora DSQL がサポート・維持するため)、`VIRTUAL` 生成カラムは通常の
+> カラムになります。
 
 ### 型マッピング (完全なリファレンス)
 
@@ -407,7 +431,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 
 | MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
 |---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 38** は Evaluation で **UNSUPPORTED** と表示されます (DSQL は NUMERIC を 38 に制限) が、Schema Conversion は **`numeric(38,37)` にクランプ**し、データ損失の警告とともに DDL を出力します (スケールも 37 に制限)。ターゲットが保持するより小数桁の多い値 (Step 1 の後で広げられたソース、またはここで指定したより狭い型) は、Full Load と CDC のどちらでも丸めずに拒否します。 |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 精度/スケールを保持。**精度 > 1000** は Evaluation で **UNSUPPORTED** と表示されます (DSQL のドキュメント上、最大精度 1000、スケール -1000..1000、デフォルト `numeric(18,6)`) が、Schema Conversion は **最大値にクランプ**し、データ損失の警告とともに DDL を出力します。MySQL の `DECIMAL` (最大 65,30) とすべての PostgreSQL `numeric` (自身の上限も同じ 1000) はこの範囲内なので、このフラグとクランプは安全装置にすぎません。ターゲットが保持するより小数桁の多い値 (Step 1 の後で広げられたソース、またはここで指定したより狭い型) は、Full Load と CDC のどちらでも丸めずに拒否します。 |
 | `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 符号なしは表現できず、格納上の意味を持ちません。 |
 | `FLOAT` | `real` | `real` | AUTO | 単精度 float。 |
 | `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 表示仕様はドロップされます (PostgreSQL の `float` はスケールではなく 1 つの精度を取ります)。 |
@@ -454,17 +478,19 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | **トランザクションあたり 1 つの DDL** | Schema Conversion は実行単位ごとに正確に 1 つの DDL 文を出力します。 |
 | **`CREATE INDEX ASYNC`** | セカンダリインデックスはデータの後に非同期で作成されます。 |
 | **楽観的並行性制御** | すべてのバッチと DDL は `40001` リトライでラップされます。 |
-| **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** コンバーターは列のデフォルトを **一切** 出力せず(`serial`/`IDENTITY` `nextval` や生成カラムの式は除去されます)、identity はターゲット側で選択した PK 戦略が決定します。 |
+| **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** ソースの `DEFAULT` を **引き継ぎます**(PostgreSQL の再パースで正規化) — 除去されるのは `serial`/`IDENTITY` `nextval` と生成カラムの式だけで、identity はターゲット側で選択した PK 戦略が決定します。変換された enum 列はデフォルトをプレーンなテキストリテラルとして保持し、DSQL にない別の型へキャストするデフォルトは注記付きで除外されます。 |
 | **`ON UPDATE CURRENT_TIMESTAMP` なし** | 再現不可: DSQL には `ON UPDATE` 句も、(PostgreSQL で通常用いる回避策の)トリガーもありません。列は挿入時のデフォルトを保持し **MANUAL** としてフラグ付けされます — 更新時のタイムスタンプはアプリケーションで明示的に設定してください。 |
 | **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
 | **ネイティブパーティショニングなし** | DSQL が自動分散します。パーティション化されたテーブルは MANUAL としてフラグ付けされます。 |
-| **クラスターあたり 1 つのデータベース** | 複数データベースのソースは MANUAL としてフラグ付けされます (スキーマに統合するか、クラスターを分割します)。 |
+| **クラスターあたり 1 つのデータベース** | 複数データベースの MySQL ソースの各データベースは、自動的に独自のスキーマになります(`RECOMMENDED` としてフラグ付け)。いくつまで収まるかは次の行を参照してください。 |
+| **データベースあたりスキーマ ≤ 10、テーブル ≤ 1,000、ビュー ≤ 5,000** | Evaluation はマイグレーション後にターゲットデータベースが保持する数(ソースのオブジェクト + クラスターに既にあるもの。組み込みの `public` スキーマは数えず、テーブルもビューもないスキーマは数に現れない)を数え、超過分を **UNSUPPORTED**(`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`)としてフラグ付けし、準備度スコアは **Blocked** になります。そうしないと、適用は最初のオブジェクトを作成した後に `54000` で失敗します。制限に達すると Aurora DSQL は既存スキーマに対する `IF NOT EXISTS` も含めてすべての `CREATE SCHEMA` を拒否するため(ライブで確認)、適用はカタログを確認し、既存スキーマは作成済みとして扱います。 |
 | **ソースの `CHECK` 制約は破棄** | ソースの `CHECK` 制約(MySQL の `CHECK` は 8.0.16+ が必要)はターゲットに引き継がれず — 関数/演算子が DSQL と異なる場合がある — **MANUAL** としてフラグ付けされます: DSQL 互換の `CHECK` を手動で再追加するか、アプリで強制してください。(ツールが `ENUM` 用に *生成* する `CHECK … IN (...)` は影響を受けません。) |
-| **`bytea` はキーになれない** | `bytea` 列(`BINARY`/`VARBINARY`、`*BLOB`、空間型由来)は **主キー** 列(テーブル → **UNSUPPORTED**)や **インデックス** 列(インデックス破棄 → **MANUAL**)にできません。`text`/`uuid`/ハッシュに re-key してください。 |
+| **`bytea` はキーになれない** | `bytea` 列(`BINARY`/`VARBINARY`、`*BLOB`、空間型由来)は **主キー** 列(テーブル → **UNSUPPORTED**)や **インデックス** 列(インデックス破棄 → **MANUAL**。破棄された UNIQUE インデックスは一意性を保証しなくなり、注記にそう明示されます)にできません。Evaluation も同じテーブルをフラグ付けします(`BYTEA_KEY`)。`text`/`uuid`/ハッシュに re-key してください。 |
 | **キー列は 8 個以下** | 主キーまたはインデックスが 8 列を超えると DSQL の上限超過: PK は **UNSUPPORTED**、過剰なセカンダリインデックスは **破棄 (MANUAL)**。 |
 | **テーブルあたりインデックス 24 個以下** | DSQL はテーブルあたり最大 24 個のインデックスを許可(PK を含む → セカンダリは 23 個以下)。超過分は表示され、一部は生成されません。 |
 | **キー値は 1 KiB 以下** | 結合キー値は ~1 KiB 未満である必要があります。大きいキーは **推奨(recommendation)** として表示されます(実データで挿入時に失敗する可能性)。 |
-| **識別子 63 バイト** | DSQL/PostgreSQL は識別子を 63 バイトに切り詰めます。切り詰めで 2 つの名前が衝突する場合、そのオブジェクトは **UNSUPPORTED** としてフラグ付けされます(先頭 63 バイトが一意になるよう改名)。 |
+| **識別子 63 バイト** | DSQL/PostgreSQL は識別子を (文字境界で) 63 バイトに切り詰めます。1 つのテーブルの 2 つのカラム名が同じ名前に切り詰められるとテーブルは **UNSUPPORTED** (`IDENTIFIER_LENGTH`) になります。1 つのスキーマの 2 つのテーブルやビューが同じ名前に切り詰められる場合も **UNSUPPORTED** (`NAME_COLLISION`) で、先に作成された方がもう一方の行を受け取ってしまうため、Schema Conversion はどちらも作成しません (Data Migration も対象として提示しません)。先頭 63 バイトが異なるようソースで名前を変更してください。スキーマ名も同じように切り詰められるため、名前の先頭 63 バイトが同じ 2 つのソースデータベースは 1 つのターゲットスキーマを共有します。何とも衝突しない長い名前は **推奨事項** です: DSQL は短縮した名前で格納します。 |
+| **インデックス名はスキーマ単位で一意** | Aurora DSQL は 1 つのスキーマのテーブル・ビュー・インデックスを 1 つの名前空間に置きますが、MySQL はインデックス名をテーブル単位で区別します。そのため Schema Conversion は、同じスキーマの別の relation も使う名前のインデックスを **すべて** `<table>_<index>` に自動的に変更します(必要なら 63 バイトに切り詰めてハッシュ接尾辞を付けます)。テーブルとビューは名前を保持し、ビュー名もテーブル名と同様に引用符で囲んで大文字小文字を保持します。これにより UNIQUE を含むすべてのインデックスが作成されます。Evaluation と Schema Conversion は名前を変更したインデックスを `RECOMMENDED`(`NAME_COLLISION`)としてフラグ付けし、主キー戦略を変更しても同じ名前が保たれます。以前の適用が残した relation が別のオブジェクトに必要な名前を占めている場合(テーブル名と同じインデックスなど)、適用は "already exists" としてスキップせず、名前を占めている relation を示して **FAILED** と報告し、Evaluation のターゲット分析はそれを *Names held on the target by another object* に表示します。以前のバージョンが作成したターゲットでも、適用は名前を変えたインデックスと引用符付きのビューを新たに作成し、以前の名前で残った古いコピー (もう何も管理しません) を結果で知らせます。このコピーは削除してください (**Replace** は一緒に削除します)。 |
 
 上の表の **クラス** 列は、Evaluation がすべてのオブジェクトに適用するのと同じ
 AUTO / MANUAL / UNSUPPORTED の尺度です — 各クラスの意味と、複数のルールが一致した場合に

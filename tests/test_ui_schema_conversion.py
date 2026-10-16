@@ -5492,3 +5492,60 @@ def test_source_ddl_shows_a_restored_binary_default_bare() -> None:
     assert "`vb` varbinary(8) DEFAULT x'610062'," in ddl
     assert "`bn` binary(4) DEFAULT x'61006200'," in ddl
     assert "/*" not in ddl
+
+
+def test_a_stored_edit_is_shown_with_the_index_names_both_apply_paths_use() -> None:
+    """An edit stored before a colliding index was renamed is applied renamed; the screen
+    showed (and copied) the old name until something rewrote the stored text."""
+    from dsql_migrator.ui.schema_conversion import _render_editable_target
+
+    edited = (
+        'CREATE TABLE "orders" ("id" INT);\n\n'
+        'CREATE INDEX ASYNC "user_id" ON "shop"."orders" ("user_id");'
+    )
+    ui = _editable_target_ui()
+    _render_editable_target(
+        ui,
+        _StubPreview(),
+        _StubConvState(edited=edited),
+        index_renames={"user_id": "orders_user_id"},
+    )
+    targets = [e["value"] for e in ui.editors if e.get("language") == "PostgreSQL"]
+    assert targets == [edited.replace('"user_id" ON', '"orders_user_id" ON')], targets
+
+
+def test_name_collision_notes_carry_no_ai_icon_rather_than_a_disabled_one() -> None:
+    """A disabled icon reads as "AI is off: enable it on Connect" -- wrong while AI is on;
+    only a source rename resolves these, so no AI affordance is drawn at all."""
+    from dsql_migrator.ui.schema_conversion import _render_conversion_warnings
+
+    ui = _NotesUi()
+    _render_conversion_warnings(
+        ui,
+        [_loss_note(), _recommendation_note()],
+        on_ai_chat=lambda *_a: None,
+        object_name="t",
+        ai_withheld=True,
+    )
+    assert "auto_awesome" not in ui.button_icons
+    assert not any("Enable AI Assist" in t for t in ui.tooltips)
+
+
+def test_a_view_sharing_a_stored_name_keeps_its_placeholder_in_the_preview() -> None:
+    """The view showed "Reimplement this object manually" -- contradicting its own note
+    (shorten the source names) -- and every placeholder check missed it."""
+    from dsql_migrator.core.converter import SchemaConverter, is_name_collision_placeholder
+    from dsql_migrator.core.models import ColumnDef, SourceInventory, TableDef, ViewDef
+    from dsql_migrator.ui.schema_conversion import build_view_preview
+
+    long = "t" * 63
+    table = TableDef(
+        name=f"app.{long}_a",
+        columns=[ColumnDef(name="id", mysql_type="int")],
+        primary_key=["id"],
+    )
+    view = ViewDef(name=f"app.{long}_b", definition="select 1 AS `x`")
+    result = SchemaConverter().convert(SourceInventory(tables=[table], views=[view]))
+    (conversion,) = result.views
+    preview = build_view_preview(view, conversion)
+    assert is_name_collision_placeholder(preview.target_ddl)

@@ -659,6 +659,10 @@ class ApplyResult(BaseModel):
     object_name: str = Field(min_length=1)
     status: ApplyStatus
     detail: str = ""
+    # Something the user has to know beyond the status, shown instead of the generic
+    # result text (e.g. a view skipped because an earlier version created it under its
+    # lower-case name). Empty for an ordinary outcome.
+    note: str = ""
 
 
 # ---------------------------------------------------------------------------

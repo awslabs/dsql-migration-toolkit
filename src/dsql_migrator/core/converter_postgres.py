@@ -269,7 +269,7 @@ def unconstrained_numeric_note(pg_type: str) -> "Optional[str]":
     bare ``numeric`` is arbitrary-precision on PostgreSQL but the target caps it at 6
     fractional digits (and 12 integer digits), so a value beyond that is rounded (or, for
     the integer part, rejected) on load. :func:`clamp_pg_numeric` covers only a DECLARED
-    precision/scale that exceeds DSQL's 38/37 limits; this covers the common no-parens
+    precision/scale that exceeds DSQL's 1000/1000 limits; this covers the common no-parens
     form, which would otherwise migrate with NO signal that its precision is capped
     (Property 6: no silent precision loss). Values within 12 integer / 6 fractional digits
     are unaffected.
@@ -282,7 +282,8 @@ def unconstrained_numeric_note(pg_type: str) -> "Optional[str]":
         f"{_DSQL_DEFAULT_NUMERIC_SCALE} fractional digits are rounded, and values needing "
         f"more than {_DSQL_DEFAULT_NUMERIC_INT_DIGITS} integer digits will not fit (rounded "
         "or rejected on load). If this column needs a different precision/scale, set an "
-        "explicit numeric(p,s) (p<=38, s<=37) target in Schema Conversion; otherwise "
+        "explicit numeric(p,s) target in Schema Conversion (Aurora DSQL accepts precision "
+        "and scale up to 1000); otherwise "
         f"{_DSQL_DEFAULT_NUMERIC} is used and Validation compares at that scale."
     )
 
@@ -290,7 +291,7 @@ def unconstrained_numeric_note(pg_type: str) -> "Optional[str]":
 def clamp_pg_numeric(pg_type: str) -> "tuple[str, Optional[str]]":
     """Clamp a PostgreSQL ``numeric(p[,s])`` to what Aurora DSQL accepts.
 
-    Returns ``(type_string, warning)``. When the declared precision (>38) or scale (>37)
+    Returns ``(type_string, warning)``. When the declared precision or scale (>1000)
     exceeds DSQL's limits the spec is reduced and a warning describes the lost range/
     places; otherwise the type is returned verbatim with ``None``. The MySQL path clamps
     the same way (:func:`~dsql_migrator.core.converter._clamp_numeric_spec`); without this

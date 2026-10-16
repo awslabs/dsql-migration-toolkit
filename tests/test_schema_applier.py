@@ -705,9 +705,73 @@ def test_recreate_table_translates_schema_limit_to_actionable_error() -> None:
         )
     msg = str(exc_info.value)
     assert "10 schemas" in msg
-    assert "DROP SCHEMA" in msg
-    # The DROP/CREATE TABLE were never reached (failed on the schema ensure).
-    assert connection.executed == []
+    assert 'Schema "app"' in msg  # names the schema it could not create
+    assert len(msg) < 200  # Full Load keeps only the first couple of hundred characters
+    assert "DROP SCHEMA" not in msg  # no destructive advice for a shared cluster
+    # The DROP/CREATE TABLE were never reached (failed on the schema ensure); only the
+    # catalog read that checks whether the schema is already there ran.
+    assert not any(stmt.upper().startswith(("DROP", "CREATE")) for stmt in connection.executed)
+
+
+class _AtCapConnection(_SchemaLimitConnection):
+    """At Aurora DSQL's cap EVERY CREATE SCHEMA fails -- an IF NOT EXISTS for a schema that
+    is already there too (live-verified). ``present`` is what pg_namespace holds."""
+
+    def __init__(self, present: set[str]) -> None:
+        super().__init__()
+        self._present = present
+        self._last: Optional[tuple] = None
+
+    def cursor(self):
+        connection = self
+
+        class _Cursor(_FakeCursor):
+            def execute(self, statement, params=None):
+                text = statement if isinstance(statement, str) else statement.as_string(None)
+                if "pg_namespace" in text:
+                    connection._last = (1,) if params and params[0] in connection._present else None
+                    return
+                connection.handle_execute(statement, params)
+
+            def fetchone(self):
+                return connection._last
+
+        return _Cursor(self)
+
+
+def test_a_schema_ensure_at_the_cap_succeeds_when_the_schema_already_exists() -> None:
+    """Every table's CREATE SCHEMA IF NOT EXISTS failed once the target held 10 schemas, so
+    a migration that filled the 10th (or any into a full cluster) failed table by table."""
+    connection = _AtCapConnection(present={"app"})
+    recreate_table(
+        ['CREATE SCHEMA IF NOT EXISTS "app"'],
+        'CREATE TABLE "app"."orders" ("id" integer PRIMARY KEY)',
+        connection_factory=lambda: connection,
+        occ_max_attempts=5,
+        sleep=_no_sleep,
+        jitter=_zero_jitter,
+    )
+    assert any("CREATE TABLE" in stmt for stmt in connection.executed)
+    # A schema that is NOT there still reports the limit.
+    missing = _AtCapConnection(present=set())
+    with pytest.raises(SchemaApplyError):
+        recreate_table(
+            ['CREATE SCHEMA IF NOT EXISTS "new_one"'],
+            'CREATE TABLE "new_one"."t" ("id" integer PRIMARY KEY)',
+            connection_factory=lambda: missing,
+            occ_max_attempts=5,
+            sleep=_no_sleep,
+            jitter=_zero_jitter,
+        )
+
+
+def test_the_ensured_schema_name_is_read_as_the_catalog_stores_it() -> None:
+    from dsql_migrator.core.schema_applier import _ensured_schema_name
+
+    assert _ensured_schema_name('CREATE SCHEMA IF NOT EXISTS "MyApp"') == "MyApp"
+    assert _ensured_schema_name("create schema if not exists MyApp") == "myapp"
+    assert _ensured_schema_name('CREATE SCHEMA "app"') is None  # not an idempotent ensure
+    assert _ensured_schema_name('CREATE TABLE "app"."t" (id int)') is None
 
 
 def test_drop_object_emits_drop_if_exists() -> None:

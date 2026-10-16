@@ -79,7 +79,7 @@ from dsql_migrator.core.cdc import (
     CdcPipelineOrchestrator,
     composite_key_columns_for_cdc,
 )
-from dsql_migrator.core.converter import SchemaConverter
+from dsql_migrator.core.converter import SchemaConverter, relation_clash_names
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.job_manager import (
     JobHandle,
@@ -838,6 +838,7 @@ def build_data_migration_screen(
             is_cdc_migration=migration_state.migration_type
             is MigrationType.FULL_LOAD_AND_CDC,
             table_conversions=_applied_conversions,
+            index_renames=_conversion.index_renames,
             # Converted view DDLs so a "drop & reload" run can pre-drop / recreate
             # views that depend on a replaced table (else the DROP is blocked).
             dependent_view_ddls=applied_view_ddls(
@@ -1579,14 +1580,12 @@ def build_data_migration_screen(
                 now present on the target) reflects the latest schema -- e.g.
                 tables just created on the target in Step 2.
                 """
-                from dataclasses import replace as _dc_replace
-
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
                     _default_target_browser_factory,
-                    _find_target_conflicts,
+                    with_refreshed_catalogs,
                 )
 
                 current = eval_state.result
@@ -1621,19 +1620,21 @@ def build_data_migration_screen(
                 # ``replace`` copies every field this rebuild does not change -- including
                 # ``source_type``, which it used to drop, titling a PostgreSQL migration's
                 # exported Evaluation report "MySQL to Aurora DSQL...".
+                # The assessment is recomputed with both catalogs (the database-level
+                # limits count the target too), graded by the engine the inventory was
+                # just read with, off the event loop; every other field is copied.
                 eval_state.set_result(
-                    _dc_replace(
+                    await _run.io_bound(
+                        with_refreshed_catalogs,
                         current,
                         inventory=new_inventory,
                         target_inventory=new_target,
-                        target_conflicts=_find_target_conflicts(
-                            new_inventory, new_target
-                        ),
                         # Re-stamp with the cluster this catalog was just read from, or
                         # the pair stays flagged stale and the refresh fixes nothing.
                         target_endpoint=getattr(
                             session.target_config, "cluster_endpoint", None
                         ),
+                        source_type=session_source_type(session),
                     )
                 )
                 ui.notify("Object browser refreshed.", type="positive")
@@ -1699,6 +1700,28 @@ def build_data_migration_screen(
                             "detected until you refresh, so only tables whose DDL was "
                             'generated in this session are offered. Use "Refresh '
                             'objects" to re-read the target.'
+                        ),
+                    )
+                _clashing = sorted(
+                    relation_clash_names(inventory) & {t.name for t in inventory.tables}
+                )
+                if _clashing:
+                    _shown = ", ".join(_clashing[:5]) + (
+                        f" and {len(_clashing) - 5} more" if len(_clashing) > 5 else ""
+                    )
+                    render_notice(
+                        ui,
+                        tone="warning",
+                        header=(
+                            f"{len(_clashing)} table{'s' if len(_clashing) != 1 else ''} "
+                            "cannot be migrated"
+                        ),
+                        body=(
+                            f"{_shown}: each shares its first 63 bytes of name with another "
+                            "table or view of its schema, and Aurora DSQL stores names cut "
+                            "to 63 bytes, so their rows would go into one table. Schema "
+                            "Conversion did not create them. Shorten the names on the "
+                            "source, then re-run Step 1 (Evaluation)."
                         ),
                     )
                 _render_table_selection(
@@ -2121,6 +2144,7 @@ def build_data_migration_screen(
                     is_cdc_migration=migration_state.migration_type
                     is MigrationType.FULL_LOAD_AND_CDC,
                     table_conversions=_applied_retry_conversion,
+                    index_renames=_retry_conversion.index_renames,
                     dependent_view_ddls=applied_view_ddls(
                         _retry_conversion,
                         conv_state.edited_target_ddls,
@@ -2415,6 +2439,8 @@ def build_data_migration_screen(
                     # migration never loaded is not altered. The pinned selection, not the
                     # live picker: a stale target inventory must not hide pending keys.
                     table_conversions=_fk_scoped,
+                    # Already computed: saves re-deriving it on every 1.5 s poll.
+                    index_renames=_conv.index_renames,
                     fk_optional_tables=foreign_keys_pointing_in(_fk_scoped, _fk_tables),
                     # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
                     excluded_lob_columns=effective_lob_exclusions(
@@ -4063,9 +4089,15 @@ def migratable_table_names(
     -- e.g. Schema Conversion was applied in a prior session/out of band. Taking
     the union lets Data Migration proceed without re-running Schema Conversion in
     the current session when the target schema is already in place.
+
+    A table whose stored name another table or view of its schema shares
+    (:func:`~dsql_migrator.core.converter.relation_clash_names`) is never migratable:
+    Schema Conversion creates neither, and on a target an earlier version built, the one
+    relation that exists would receive both tables' rows.
     """
     migratable = set(generated_table_names(inventory, generated_node_ids))
     migratable |= set(target_existing_table_names(inventory, target))
+    migratable -= relation_clash_names(inventory)
     return [table.name for table in inventory.tables if table.name in migratable]
 
 

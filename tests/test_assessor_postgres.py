@@ -13,7 +13,9 @@ variants where the MySQL prose would have been wrong.
 from dsql_migrator.core.assessor import CompatibilityAssessor, default_rules
 from dsql_migrator.core.assessor_postgres import default_rules as pg_default_rules
 from dsql_migrator.core.models import (
+    Classification,
     ColumnDef,
+    EffortLevel,
     SourceInventory,
     SourceType,
     TableDef,
@@ -31,6 +33,8 @@ _EXPECTED_PG_RULE_IDS = {
     "PROC_PLPGSQL",
     "EVENT_UNSUPPORTED",
     "NO_PRIMARY_KEY",
+    # A bytea primary key / index: DSQL cannot index bytea (shared with MySQL, PG detection).
+    "BYTEA_KEY",
     "PARTITIONED_TABLE",
     "TOO_MANY_COLUMNS",
     "TOO_MANY_INDEXES",
@@ -49,6 +53,11 @@ _EXPECTED_PG_RULE_IDS = {
     # PG-only: a non-PK serial/identity column. Schema Conversion warned about it while
     # Evaluation said nothing, the same contradiction the identity-KEY rule closed.
     "NON_KEY_SEQUENCE",
+    # PG-only: a bare numeric, stored by DSQL at its default numeric(18,6).
+    "PG_UNCONSTRAINED_NUMERIC",
+    # The same name-collision check Schema Conversion runs (rarely fires on PG, whose
+    # names are already unique per schema and at most 63 bytes).
+    "NAME_COLLISION",
 }
 
 _EXCLUDED_MYSQL_RULE_IDS = {
@@ -62,6 +71,7 @@ _EXCLUDED_MYSQL_RULE_IDS = {
     "UNSUPPORTED_INDEX_TYPE",
     "FK_CASCADE_CDC_GAP",  # MySQL-binlog framed
     "VIEW_UNSUPPORTED_SQL",  # MySQL app-query linter
+    "IDENTIFIER_LENGTH",  # PostgreSQL identifiers are already at most 63 bytes
 }
 
 # The MySQL classes whose rule id a PG source now also reports, but NEVER via the MySQL
@@ -1089,3 +1099,70 @@ def test_the_unsupported_type_risk_line_says_a_user_defined_type_cannot_be_creat
     plain = UnsupportedPostgresTypeRule().evaluate(SourceInventory(tables=[built_in]))[0]
     assert "user-defined" not in plain.risk, plain.risk
     assert "no CREATE TYPE" not in plain.risk, plain.risk
+
+
+# --- Verdicts Evaluation takes from the converter / database-level limits --------------
+
+
+def _pg_assess(*tables: TableDef):
+    return CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=list(tables))
+    )
+
+
+def test_pg_bytea_primary_key_is_unsupported_not_just_an_oversized_lob() -> None:
+    # It used to read only OVERSIZED_LOB (MANUAL), while Schema Conversion graded the same
+    # table UNSUPPORTED: Aurora DSQL cannot index bytea, so the CREATE TABLE is rejected.
+    report = _pg_assess(
+        TableDef(
+            name="public.blobs",
+            columns=[ColumnDef(name="k", mysql_type="bytea", nullable=False)],
+            primary_key=["k"],
+        )
+    )
+    (item,) = report.items
+    assert item.rule_id == "BYTEA_KEY"
+    assert item.classification is Classification.UNSUPPORTED
+
+
+def test_pg_bare_numeric_is_flagged_because_dsql_rounds_it_to_six_digits() -> None:
+    """A bare numeric is stored as numeric(18,6): >6 fractional digits round on load, and
+    Validation compares at scale 6, so nothing later would notice."""
+    report = _pg_assess(
+        TableDef(
+            name="public.payments",
+            columns=[
+                ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                ColumnDef(name="amount", mysql_type="numeric"),
+                ColumnDef(name="fee", mysql_type="numeric(12,2)"),
+            ],
+            primary_key=["id"],
+        )
+    )
+    (item,) = report.items
+    assert item.rule_id == "PG_UNCONSTRAINED_NUMERIC"
+    assert item.classification is Classification.MANUAL
+    assert item.effort is EffortLevel.SIMPLE
+    assert item.risk.startswith("Column(s) amount:")  # the declared numeric(12,2) is fine
+    assert "numeric(18,6)" in item.risk
+    assert "up to 1000" in item.risk  # not the stale 38/37
+
+
+def test_pg_source_with_more_than_ten_schemas_is_blocked_with_schema_wording() -> None:
+    report = _pg_assess(
+        *(
+            TableDef(
+                name=f"tenant{i}.t",
+                columns=[ColumnDef(name="id", mysql_type="bigint")],
+                primary_key=["id"],
+            )
+            for i in range(12)
+        )
+    )
+    (item,) = [i for i in report.items if i.kind == "DATABASE"]
+    assert item.rule_id == "SCHEMA_COUNT_LIMIT"
+    assert item.classification is Classification.UNSUPPORTED
+    assert "one per source schema" in item.risk
+    assert "Consolidate the schemas on the source" in item.recommendation
+    assert "Schema Conversion" in item.recommendation  # names the tool's own steps
+    assert "Connect step" not in item.recommendation  # MySQL-only advice

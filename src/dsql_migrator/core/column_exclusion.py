@@ -508,14 +508,17 @@ def views_referencing(
     matching either the qualified ``schema.table`` or the bare table name as a
     word in the view's DDL -- so an unrelated view is never needlessly dropped.
     Case-insensitive, word-boundary match to avoid matching a substring of a
-    longer identifier. Deterministic order (by view name) for stable behavior.
+    longer identifier. Only the view's body is searched, never its own name: a quoted
+    ``CREATE VIEW "archive"."orders"`` would otherwise "reference" the table
+    ``shop.orders``. Deterministic order (by view name) for stable behavior.
     """
     if not view_ddls or not tables:
         return []
     wanted: list[str] = []
     for view_name in sorted(view_ddls):
         ddl = view_ddls[view_name]
-        low = ddl.lower()
+        head = _VIEW_HEAD_RE.match(ddl)
+        low = (ddl[head.end():] if head is not None else ddl).lower()
         for table in tables:
             bare = table.split(".")[-1].lower()
             qualified = table.lower()
@@ -523,6 +526,15 @@ def views_referencing(
                 wanted.append(ddl)
                 break
     return wanted
+
+
+# ``CREATE [OR REPLACE] [MATERIALIZED] VIEW <name>``: the part of a view DDL that names the
+# view itself, not what it reads.
+_VIEW_HEAD_RE = re.compile(
+    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+    r'(?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))*',
+    re.IGNORECASE,
+)
 
 
 def names_in(haystack_lower: str, candidates: "Sequence[str]") -> bool:

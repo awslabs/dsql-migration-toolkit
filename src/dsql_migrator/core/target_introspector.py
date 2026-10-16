@@ -257,6 +257,7 @@ class TargetIntrospector:
         self._connector_factory = connector_factory or _default_connector_factory
         self._qualified_names: Optional[set[str]] = None
         self._unqualified_names: Optional[set[str]] = None
+        self._holders: dict[str, tuple[str, Optional[str]]] = {}
 
     def browse(self, conn: TargetConnectionConfig) -> TargetInventory:
         """Read the target catalog and return the object tree (Requirement 10.1).
@@ -299,6 +300,20 @@ class TargetIntrospector:
             return normalized in self._qualified_names
         return normalized in self._unqualified_names
 
+    def relation_holder(self, name: str) -> "Optional[tuple[str, Optional[str]]]":
+        """What holds the schema-qualified ``name`` on the target, from the last browse.
+
+        ``("TABLE" | "VIEW", None)`` for a table or view, ``("INDEX", "<schema>.<table>")``
+        for an index (with the table it is on), or ``None`` when unknown -- an unqualified
+        name, or one the browse did not see. Lets the applier tell "this object is already
+        there" apart from "another relation holds this name": Aurora DSQL keeps a schema's
+        tables, views and indexes in one namespace. EXACT, unlike :meth:`object_exists`:
+        ``name`` is matched as the catalog stores it (case included, see
+        :func:`pg_stored_name`), so ``"Currency"`` and ``currency`` are two names, as they
+        are on the target. Issues no SQL.
+        """
+        return self._holders.get(name)
+
     def _index_inventory(self, inventory: TargetInventory) -> None:
         """Build the case-insensitive name index used by :meth:`object_exists`.
 
@@ -309,19 +324,160 @@ class TargetIntrospector:
         ``SKIP_IF_EXISTS`` for a ``CREATE INDEX`` statement and the apply fails
         with ``relation "..." already exists`` (Requirement 10.3). An index's
         qualified name is ``schema.index_name`` (indexes live in the schema, not
-        under the table); the unqualified form is the bare index name.
+        under the table); the unqualified form is the bare index name. The holder map
+        behind :meth:`relation_holder` is keyed by the exact stored names instead.
         """
         qualified: set[str] = set()
         unqualified: set[str] = set()
+        holders: dict[str, tuple[str, Optional[str]]] = {}
         for schema in inventory.schemas:
             for relation in (*schema.tables, *schema.views):
                 qualified.add(relation.qualified_name.lower())
                 unqualified.add(relation.name.lower())
+                holders.setdefault(relation.qualified_name, (relation.kind.value, None))
                 for index in relation.indexes:
                     qualified.add(f"{schema.name}.{index.name}".lower())
                     unqualified.add(index.name.lower())
+                    holders.setdefault(
+                        f"{schema.name}.{index.name}", ("INDEX", relation.qualified_name)
+                    )
         self._qualified_names = qualified
         self._unqualified_names = unqualified
+        self._holders = holders
+
+
+# What holds one stored name in one schema now: its kind and, for an index, the table it is
+# on. Bound parameters only (no identifier in the SQL text).
+_HOLDER_QUERY = (
+    "SELECT c.relkind, tn.nspname, t.relname "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "LEFT JOIN pg_catalog.pg_index ix ON ix.indexrelid = c.oid "
+    "LEFT JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid "
+    "LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace "
+    "WHERE n.nspname = %s AND c.relname = %s"
+)
+_HOLDER_KINDS = {
+    "r": "TABLE",
+    "p": "TABLE",
+    "v": "VIEW",
+    "m": "MATERIALIZED VIEW",
+    "i": "INDEX",
+    "I": "INDEX",
+    "S": "SEQUENCE",
+}
+
+
+def live_relation_holder(
+    connection: Any, schema: str, name: str
+) -> "Optional[tuple[str, Optional[str]]]":
+    """What holds ``schema.name`` on the target NOW, shaped like
+    :meth:`TargetIntrospector.relation_holder`; ``None`` when the name is free. RAISES.
+
+    Both names are matched as the catalog stores them (:func:`pg_stored_name`). The browse
+    behind ``relation_holder`` is a snapshot: an earlier REPLACE of the same run can have
+    dropped the holder, or the user removed a leftover since. A holder that is neither a
+    table, a view nor an index (a sequence, say) has the kind ``SEQUENCE`` or ``RELATION``.
+    """
+    cursor = connection.cursor()
+    try:
+        cursor.execute(_HOLDER_QUERY, (pg_stored_name(schema), pg_stored_name(name)))
+        rows = cursor.fetchall()
+    finally:
+        _safe_close(cursor)
+    if not rows:
+        return None
+    relkind, on_schema, on_table = rows[0][0], rows[0][1], rows[0][2]
+    kind = _HOLDER_KINDS.get(str(relkind), "RELATION")
+    if kind == "INDEX" and on_schema and on_table:
+        return kind, f"{on_schema}.{on_table}"
+    return kind, None
+
+
+def _target_holders(target: TargetInventory) -> "dict[tuple[str, str], tuple[str, Optional[str]]]":
+    """(schema, stored name) -> what holds it on the target, shaped like
+    :meth:`TargetIntrospector.relation_holder`: tables, views AND indexes (one namespace)."""
+    holders: dict[tuple[str, str], tuple[str, Optional[str]]] = {}
+    for schema in target.schemas:
+        for relation in (*schema.tables, *schema.views):
+            holders.setdefault((schema.name, relation.name), (relation.kind.value, None))
+            for index in relation.indexes:
+                holders.setdefault(
+                    (schema.name, index.name), ("INDEX", relation.qualified_name)
+                )
+    return holders
+
+
+def _stored_qualified(name: str) -> "Optional[tuple[str, str]]":
+    schema, _, rest = name.partition(".")
+    return (pg_stored_name(schema), pg_stored_name(rest)) if schema and rest else None
+
+
+def relations_existing_on_target(
+    names: "Sequence[str]",
+    target: TargetInventory,
+    *,
+    views: "Collection[str]" = (),
+) -> list[str]:
+    """Return the ``names`` (source tables/views) that already exist on the target. Pure.
+
+    The one matching rule for "this source relation is already there", shared by the
+    Evaluation name-conflict list and the per-database limit counts (a relation that is
+    already on the target adds nothing to them). It decides as Schema Apply does: a
+    qualified name (the tool qualifies source objects as ``database.table`` /
+    ``schema.table``, split on the first dot) is matched EXACTLY against the target's
+    stored names (the converter quotes every name, each cut to 63 bytes: see
+    :func:`pg_stored_name`), so ``shop.Orders`` is not ``shop.orders``, and only an object
+    of the SAME kind counts (``views``: the source's view names) -- a name another kind of
+    object holds is :func:`relations_blocked_on_target` instead. An unqualified name is
+    matched case-insensitively against bare names in any schema. Input order is preserved.
+    """
+    holders = _target_holders(target)
+    unqualified = {
+        relation.name.lower()
+        for schema in target.schemas
+        for relation in (*schema.tables, *schema.views)
+    }
+    view_names = set(views)
+    existing: list[str] = []
+    for name in names:
+        stored = _stored_qualified(name)
+        if stored is None:
+            if name.strip().lower() in unqualified:
+                existing.append(name)
+            continue
+        kind = "VIEW" if name in view_names else "TABLE"
+        if holders.get(stored) == (kind, None):
+            existing.append(name)
+    return existing
+
+
+def relations_blocked_on_target(
+    names: "Sequence[str]",
+    target: TargetInventory,
+    *,
+    views: "Collection[str]" = (),
+) -> "list[tuple[str, str]]":
+    """``(name, what holds it)`` for each source table/view whose stored name ANOTHER kind
+    of object holds on the target -- a view where a table goes, or an index (an earlier
+    apply may have left one under a table's name). Schema Apply cannot create those in
+    either mode until that object is dropped or renamed. Pure; input order is preserved."""
+    holders = _target_holders(target)
+    view_names = set(views)
+    blocked: list[tuple[str, str]] = []
+    for name in names:
+        stored = _stored_qualified(name)
+        holder = holders.get(stored) if stored is not None else None
+        if holder is None:
+            continue
+        kind = "VIEW" if name in view_names else "TABLE"
+        if holder == (kind, None):
+            continue
+        held_kind, owner = holder
+        blocked.append(
+            (name, f"an index on {owner}" if held_kind == "INDEX" else f"a {held_kind.lower()}")
+        )
+    return blocked
 
 
 def tables_with_rows(
@@ -723,6 +879,11 @@ def _relation_predicate(table_name: str) -> "tuple[str, dict[str, object]]":
 
 # PostgreSQL (and Aurora DSQL) stores an identifier cut to NAMEDATALEN-1 bytes.
 _PG_NAME_MAX_BYTES = 63
+
+
+def pg_fold_unquoted(name: str) -> str:
+    """``name`` as PostgreSQL folds an UNQUOTED identifier: ASCII letters to lower case."""
+    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in name)
 
 
 def pg_stored_name(name: str) -> str:
@@ -1453,6 +1614,8 @@ __all__ = [
     "max_pk_target",
     "sync_identity_sequences",
     "partition_identity_sync",
+    "relations_blocked_on_target",
+    "relations_existing_on_target",
     "tables_with_rows",
     "target_primary_key_columns",
     "target_primary_keys",
