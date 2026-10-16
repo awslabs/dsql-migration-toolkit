@@ -252,10 +252,11 @@ def test_precision_only_interval_emits_parseable_interval(interval_type: str) ->
 
 
 def test_pg_source_carries_column_defaults() -> None:
-    # FIX 6: PG column DEFAULTs are carried to the target (like the MySQL path); the
-    # read="postgres" re-parse normalizes each to DSQL-valid SQL. A serial (nextval)
-    # default is NOT emitted (governed by the PK strategy), and the carried columns get no
-    # default-loss warning.
+    # FIX 6: PG column DEFAULTs are carried to the target (like the MySQL path) VERBATIM --
+    # pg_get_expr text is PostgreSQL already, and the sqlglot re-render that used to
+    # "normalize" it broke common defaults (see the date_part / CURRENT_TIME tests below).
+    # A serial (nextval) default is NOT emitted (governed by the PK strategy), and the
+    # carried columns get no default-loss warning.
     table = TableDef(
         name="public.acct",
         columns=[
@@ -271,9 +272,10 @@ def test_pg_source_carries_column_defaults() -> None:
         primary_key=["id"],
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
-    up = conv.target_ddl.upper()
-    assert "DEFAULT CAST('ACTIVE' AS VARCHAR)" in up  # 'active'::character varying carried
-    assert "DEFAULT CURRENT_TIMESTAMP" in up          # now() carried + normalized
+    ddl = conv.target_ddl
+    up = ddl.upper()
+    assert "DEFAULT 'active'::character varying," in ddl  # carried byte for byte
+    assert "DEFAULT now()," in ddl
     assert "DEFAULT 0" in up
     assert "NEXTVAL" not in up                         # serial default NOT emitted
     assert sqlglot.parse_one(conv.target_ddl, read="postgres") is not None
@@ -336,8 +338,9 @@ def test_pg_identity_pk_strategy_applies_when_auto_increment_is_set() -> None:
 
 
 def test_convert_view_reads_pg_dialect_for_a_pg_source() -> None:
-    # A PostgreSQL view must be parsed as PG, not MySQL -- otherwise PG-only syntax
-    # (ANY(ARRAY[...]), ILIKE, `::` casts) is mangled into fabricated SQL.
+    # A PostgreSQL view must never go through the MySQL dialect -- PG-only syntax
+    # (ANY(ARRAY[...]), ILIKE, `::` casts) was mangled into fabricated SQL -- and it is not
+    # re-rendered at all now: the text is PostgreSQL already (test_pg_verbatim_text.py).
     from dsql_migrator.core.models import ViewDef
 
     view = ViewDef(
@@ -349,9 +352,10 @@ def test_convert_view_reads_pg_dialect_for_a_pg_source() -> None:
     )
     conv = SchemaConverter(source_type=SourceType.POSTGRES).convert_view(view)
     assert conv.auto_converted
-    # PG-only syntax survives (pretty-print may wrap whitespace, so check the tokens).
-    assert "ANY(" in conv.target_ddl and "ARRAY[1, 2]" in conv.target_ddl
-    assert "ILIKE" in conv.target_ddl.upper()
+    assert conv.target_ddl == (
+        'CREATE VIEW "public"."active" AS SELECT id FROM users '
+        "WHERE status = ANY(ARRAY[1, 2]) AND name ILIKE 'a%'"
+    )
 
 
 def test_clamp_pg_numeric_reduces_over_precision_and_scale() -> None:

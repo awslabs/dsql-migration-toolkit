@@ -336,12 +336,14 @@ MySQL→PostgreSQL transpile:
   than silently lost. `ON UPDATE CURRENT_TIMESTAMP` cannot be reproduced at all — DSQL
   has no `ON UPDATE` clause and no triggers — so it is flagged **MANUAL** for the
   application to handle. **For a PostgreSQL source** a column DEFAULT **is** carried
-  across (normalized by a PostgreSQL re-parse); a primary-key `serial`/`IDENTITY`
-  `nextval` is governed by the chosen primary-key strategy instead, and a non-key
-  `nextval`, a default that does not parse, or one that casts to a type DSQL lacks is
+  across **verbatim** — the exact text PostgreSQL stores (`pg_get_expr`), never re-rendered,
+  so `CURRENT_TIME`, `CURRENT_TIMESTAMP(0)`, a `date_part(...)` stored before PostgreSQL 14
+  and a 3-argument `date_trunc(..., 'Asia/Seoul')` reach Aurora DSQL unchanged; a primary-key
+  `serial`/`IDENTITY` `nextval` is governed by the chosen primary-key strategy instead, and a
+  non-key `nextval`, a default that does not parse, or one that casts to a type DSQL lacks is
   dropped with a note (an enum default is kept as its plain text literal, since the column
   becomes `text`). A `STORED` generated column IS preserved, too: its expression is re-emitted
-  as `GENERATED ALWAYS AS (expr) STORED` and Aurora DSQL maintains the value on every
+  verbatim as `GENERATED ALWAYS AS (expr) STORED` and Aurora DSQL maintains the value on every
   write, so nothing has to be re-implemented (a write must simply OMIT the column, which
   Full Load and the CDC sink do). A `VIRTUAL` generated column — PG18's default kind — has
   no DSQL equivalent and is created ordinary.
@@ -369,9 +371,13 @@ MySQL→PostgreSQL transpile:
 - **One DDL per transaction** — conversion emits each DDL statement as its own
   execution unit (DSQL allows one DDL per transaction), and the apply path retries
   optimistic-concurrency conflicts (`40001`) idempotently.
-- **Views** are transpiled to PostgreSQL `CREATE VIEW`; a definition that can't be
-  parsed becomes a clearly-marked placeholder flagged for manual work rather than
-  silently dropped.
+- **Views** — a MySQL view is transpiled to PostgreSQL `CREATE VIEW`; a definition that
+  can't be parsed becomes a clearly-marked placeholder flagged for manual work rather than
+  silently dropped. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  already, so it is carried **verbatim** under the quoted view name, and the source pane
+  shows that same text. Re-rendering it would change what the view returns — for example
+  a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column
+  into text.
 
 ### Foreign keys — enforced on DSQL, but applied *after* the data loads
 
@@ -569,7 +575,7 @@ conversion (redesign).
 | **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |
 | **`CREATE INDEX ASYNC`** | Secondary indexes are created asynchronously, after data. |
 | **Optimistic concurrency** | Every batch and DDL is wrapped in `40001` retry. |
-| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across (normalized by a PostgreSQL re-parse) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. A converted enum column keeps its default as a plain text literal; a default that casts to another type DSQL lacks is dropped with a note. |
+| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across verbatim (the exact text PostgreSQL stores, never re-rendered) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. A converted enum column keeps its default as a plain text literal; a default that casts to another type DSQL lacks is dropped with a note. |
 | **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
 | **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
 | **No native partitioning** | DSQL auto-distributes; partitioned tables are flagged MANUAL. |

@@ -57,7 +57,9 @@ def _pg_table(*extra):
 
 def test_a_default_or_check_mentioning_generated_is_not_a_generated_column():
     ddl = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(_pg_table()).target_ddl
-    assert "DEFAULT CAST('Auto-generated' AS TEXT)" in ddl
+    # Carried verbatim (pg_get_expr text) -- the reader must still see a DEFAULT, not the
+    # word "generated" inside it.
+    assert "DEFAULT 'Auto-generated'::text" in ddl
     assert parse_target_generated_columns(ddl) == {"doubled"}
     enum = ('CREATE TABLE t (id INT PRIMARY KEY, '
             "s TEXT CHECK (s IN ('generated', 'released')))")

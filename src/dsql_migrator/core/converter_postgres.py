@@ -12,14 +12,15 @@ strings captured by ``PostgresSourceDialect.enrich`` via ``format_type`` -- e.g.
 converter parses this with ``read="postgres"`` and re-enters the shared DSQL-constraint
 phase (FK removal, primary-key strategy, ``CREATE INDEX ASYNC``) unchanged.
 
-It emits columns (name + exact type + NOT NULL + carried-over DEFAULT) and the primary
-key. Column DEFAULTs ARE carried across (like the MySQL path): the source default is
-emitted verbatim and the ``read="postgres"`` re-parse normalizes it to DSQL-valid SQL
-(``'active'::character varying`` -> ``CAST('active' AS VARCHAR)``, ``now()`` ->
-``CURRENT_TIMESTAMP``). A generated column's computed value and a ``serial``/identity
-``nextval`` are the exclusions -- for the KEY column ``nextval`` is the identity mechanism
-the primary-key strategy governs, not a literal default; on any other column it is a
-reported loss (see :func:`pg_column_default_sql`).
+It emits columns (name + exact type + NOT NULL) and the primary key. Column DEFAULTs ARE
+carried across (like the MySQL path), but NOT through this text: the converter attaches
+each one after the parse, as the source's own ``pg_get_expr`` text, so it reaches the target
+byte for byte (``converter._apply_pg_column_defaults``). Re-rendering a default through
+sqlglot broke common ones (``CURRENT_TIME`` -> ``CURRENT_TIME()``, ``date_part(...)`` ->
+an invalid ``EXTRACT(CAST(...) FROM ...)``). A generated column's computed value and a
+``serial``/identity ``nextval`` are the exclusions -- for the KEY column ``nextval`` is the
+identity mechanism the primary-key strategy governs, not a literal default; on any other
+column it is a reported loss (see :func:`pg_column_default_sql`).
 """
 
 from __future__ import annotations
@@ -45,11 +46,13 @@ def pg_column_default_sql(
 ) -> "tuple[Optional[str], Optional[str]]":
     """Return ``(default_sql, drop_reason)`` for a PostgreSQL source column's DEFAULT.
 
-    ``default_sql`` is the text to place after ``DEFAULT`` in the rebuilt PostgreSQL
-    ``CREATE TABLE`` (the source default verbatim; the converter re-parses the DDL with
-    ``read="postgres"`` and re-renders it, which normalizes the default to DSQL-valid SQL
-    -- e.g. ``'active'::character varying`` -> ``CAST('active' AS VARCHAR)``, ``now()`` ->
-    ``CURRENT_TIMESTAMP``). ``None`` means emit no default. ``drop_reason`` is set ONLY
+    ``default_sql`` is the text to place after ``DEFAULT`` in the target ``CREATE TABLE``:
+    the source default VERBATIM (``pg_get_expr`` output is PostgreSQL already), which the
+    converter attaches after its parse so sqlglot never re-renders it -- a re-render turned
+    ``CURRENT_TIME`` into the invalid ``CURRENT_TIME()``, dropped the time zone of a
+    3-argument ``date_trunc`` and the precision of ``CURRENT_TIMESTAMP(0)``. The only
+    rewrite is an enum default, which becomes its plain label (the column becomes text).
+    ``None`` means emit no default. ``drop_reason`` is set ONLY
     when a PRESENT default could not be carried (so the caller warns, Property 6); it is
     ``None`` both when there is nothing to carry (no default / generated column) and when
     the default IS carried.
@@ -57,8 +60,10 @@ def pg_column_default_sql(
     PostgreSQL -> DSQL is near-identity, so a source default is carried by default (MySQL
     carries them too). The two exclusions -- a generated column's computed value and a
     serial/identity ``nextval`` -- match the MySQL path. A default that does not parse as a
-    PostgreSQL expression is dropped (with a reason) rather than emitted, so one odd default
-    cannot abort the whole-table parse.
+    PostgreSQL expression is dropped (with a reason) rather than emitted: the tool's own
+    readers of the applied DDL (column types, key, generated columns -- what Full Load
+    follows) parse the whole CREATE TABLE, so one default they cannot read would blind them
+    to the entire table.
 
     A ``nextval`` is never re-emitted, but whether that omission is SILENT now depends on
     ``is_key_column``. For a PRIMARY-KEY column the omission really is governed elsewhere --
@@ -92,7 +97,9 @@ def pg_column_default_sql(
     if not raw:
         return None, None
     # Validate the default parses as a PostgreSQL expression in isolation, so a malformed
-    # one is dropped with a warning instead of aborting the entire CREATE TABLE parse.
+    # one is dropped with a warning instead of leaving the emitted CREATE TABLE unreadable
+    # to the applied-DDL readers. (Over realistic pg_get_expr output this SELECT-context
+    # check agrees with the DEFAULT-clause context those readers parse.)
     try:
         sqlglot.parse_one(f"SELECT {raw}", read="postgres")
     except sqlglot.errors.SqlglotError:
@@ -698,6 +705,12 @@ def unsupported_dsql_reason(
 def build_pg_source_ddl(table: TableDef) -> str:
     """Build a PostgreSQL ``CREATE TABLE`` string for ``table`` (columns + PK).
 
+    This is the text the converter PARSES, so it carries only what sqlglot may re-render:
+    names, types, ``NOT NULL`` and the primary key. Column DEFAULTs and STORED generated
+    expressions are source text sqlglot changes when it re-renders it, so the converter
+    attaches them verbatim after the parse instead (``_apply_pg_column_defaults`` /
+    ``_apply_pg_generated_columns``).
+
     Identifiers are double-quoted via the PostgreSQL dialect (injection-safe, and a
     ``schema.table`` name renders as ``"schema"."table"``). Foreign keys and secondary
     indexes are intentionally not emitted (foreign keys are removed for DSQL and
@@ -726,15 +739,6 @@ def build_pg_source_ddl(table: TableDef) -> str:
         clause = f"{_PG.quote_identifier(column.name)} {column_type}"
         if not column.nullable:
             clause += " NOT NULL"
-        # Carry the source column DEFAULT across (MySQL does too). Skipped for a generated
-        # column, a serial/identity nextval, and the identity primary-key column (which the
-        # PK strategy turns into GENERATED ... AS IDENTITY -- a DEFAULT there is rejected).
-        if column.name != table.auto_increment_column:
-            default_sql, _drop_reason = pg_column_default_sql(
-                column, is_key_column=column.name in table.primary_key
-            )
-            if default_sql is not None:
-                clause += f" DEFAULT {default_sql}"
         column_clauses.append(clause)
 
     if table.primary_key:

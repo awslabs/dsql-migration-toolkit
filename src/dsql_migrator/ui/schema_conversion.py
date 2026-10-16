@@ -74,6 +74,7 @@ from dsql_migrator.core.converter import (
     identity_strategy_applies,
     is_name_collision_placeholder,
     parse_target_primary_key,
+    pg_view_ddl,
     rename_index_script,
     validate_composite_leading_column,
 )
@@ -839,10 +840,14 @@ def render_source_view_ddl(
     """Render a readable ``CREATE VIEW`` for the source side of the diff.
 
     Dispatches on the SOURCE engine so the pane's content matches its "Source —
-    PostgreSQL"/"MySQL" label and highlight: a PostgreSQL view is parsed and
-    pretty-printed in the PostgreSQL dialect (its definition is already PG and there is
-    no ``ALGORITHM``/``DEFINER`` prefix), so PG-only syntax (``ANY(ARRAY[...])``,
-    ``ILIKE``, ``::`` casts) is preserved rather than mangled through the MySQL dialect.
+    PostgreSQL"/"MySQL" label and highlight. A PostgreSQL view shows its TRUE source
+    text: ``pg_get_viewdef`` output is already PostgreSQL and already laid out, so it is
+    never re-rendered -- a sqlglot round trip changed it (a ``::text`` cast moved onto a
+    whole jsonb ``->``, ``POSITION`` arguments swapped), and since the target used to be
+    the same round trip, the diff showed identical mangled SQL on both sides. It is the
+    converter's own verbatim ``CREATE VIEW`` (:func:`pg_view_ddl`), so the two panes
+    agree: nothing is translated for a PostgreSQL view. A definition that already
+    carries a ``CREATE`` header is shown exactly as captured.
 
     MySQL's ``SHOW CREATE VIEW`` returns the whole definition on ONE line, prefixed
     with server metadata (``ALGORITHM=``, ``DEFINER=``, ``SQL SECURITY``). Shown raw it
@@ -861,25 +866,9 @@ def render_source_view_ddl(
     if not body:
         return f"-- View definition unavailable for {view.name}."
     if source_type is SourceType.POSTGRES:
-        # PostgreSQL: the definition is already PG (no ALGORITHM/DEFINER prefix). Parse +
-        # pretty-print in the PG dialect so PG-only syntax is preserved; fall back to the
-        # verbatim source when it will not parse.
-        try:
-            import sqlglot
-
-            stripped = body
-            if not stripped.upper().startswith("CREATE"):
-                stripped = f"CREATE VIEW {view.name} AS {stripped}"
-            parsed = sqlglot.parse_one(stripped, read="postgres")
-            if parsed is not None:
-                pretty = parsed.sql(dialect="postgres", pretty=True).strip()
-                if pretty:
-                    return pretty
-        except Exception:  # noqa: BLE001 - unparseable: show the source verbatim
-            logger.debug("View %s could not be pretty-printed; showing raw", view.name)
         if body.upper().startswith("CREATE"):
             return body
-        return f"CREATE VIEW {view.name} AS\n{body}"
+        return pg_view_ddl(view.name, body) or body
     try:
         import sqlglot
 

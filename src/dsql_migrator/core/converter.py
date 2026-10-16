@@ -288,8 +288,9 @@ class ViewConversion(BaseModel):
     """The converted target DDL for a single source view plus its warnings.
 
     Aurora DSQL is PostgreSQL-compatible and supports views, so a view's MySQL
-    definition is transpiled to a PostgreSQL ``CREATE VIEW`` (re-targeted to the
-    view's possibly schema-qualified name). ``schema_ddls`` create the view's
+    definition is transpiled to a PostgreSQL ``CREATE VIEW``, and a PostgreSQL view's
+    definition is carried verbatim (both re-targeted to the view's possibly
+    schema-qualified name). ``schema_ddls`` create the view's
     schema first (empty for an unqualified name). ``auto_converted`` is ``False``
     when the definition is missing or could not be parsed/transpiled -- the view
     is then surfaced for manual reimplementation (``target_ddl`` is a comment
@@ -2419,6 +2420,67 @@ def _quote_pg_qualified(name: str) -> str:
     return _quote_pg_identifier(obj)
 
 
+# A CREATE VIEW header up to and including the view's name (each part quoted or bare),
+# followed by what may come after a name: a column list, WITH (...), or AS.
+_PG_VIEW_HEADER_RE = re.compile(
+    r'^CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?(?P<recursive>RECURSIVE\s+)?'
+    r'VIEW\s+(?:"(?:[^"]|"")*"|[^\s"().;]+)(?:\s*\.\s*(?:"(?:[^"]|"")*"|[^\s"().;]+))*'
+    r"(?=\s*(?:\(|WITH\b|AS\b))",
+    re.IGNORECASE,
+)
+_PG_CREATE_PREFIX_RE = re.compile(r"CREATE\s", re.IGNORECASE)
+
+
+def pg_view_ddl(name: str, definition: str) -> Optional[str]:
+    """The ``CREATE VIEW`` of a PostgreSQL view, its definition VERBATIM. Pure.
+
+    ``definition`` is ``pg_get_viewdef`` output: PostgreSQL's own deparse of the view, so it
+    is PostgreSQL already, and Aurora DSQL reads it with PostgreSQL 16's own parser -- there
+    is nothing to translate. It used to be parsed and re-rendered by sqlglot, which changed
+    what views MEAN (measured on real pg_get_viewdef text, each graded auto-converted with
+    no warning):
+
+        (o.payload -> 'items'::text)        -> CAST(o.payload -> 'items' AS TEXT): jsonb
+                                               became text (PostgreSQL binds the cast to
+                                               the key, sqlglot to the whole ->)
+        (t.doc ? 'vip'::text)               -> text instead of boolean
+        date_part('epoch'::text, t.ts)      -> EXTRACT(CAST('epoch' AS TEXT) FROM t.ts), a
+                                               syntax error (every EXTRACT stored before
+                                               PG14 reads back as date_part)
+        CURRENT_TIME                        -> CURRENT_TIME(), a syntax error
+        unnest(..) WITH ORDINALITY u(tag, n)-> AS u(tag): u.n no longer exists
+        (ROW(t.a, t.b) IS NOT NULL)         -> NOT ROW(..) IS NULL, a different predicate
+        "position"(t.email, '@'::text)      -> POSITION(t.email IN '@'): arguments swapped
+        "overlaps"(a, b, c, d)              -> "OVERLAPS"(..), a function that does not exist
+        date_trunc('day'::text, ts, 'Asia/Seoul'::text) -> the time zone dropped
+
+    So the query is emitted byte for byte after ``CREATE VIEW <quoted name> AS``; only its
+    surrounding whitespace and the terminating semicolon pg_get_viewdef appends are removed.
+    The name is quoted like every table and index name (unquoted, Aurora DSQL folded
+    ``V_Orders`` to ``v_orders``).
+
+    pg_get_viewdef never returns a ``CREATE`` header; a definition that carries one (a
+    hand-built inventory) keeps everything after the name as written -- a column list,
+    ``WITH (...)``, ``WITH CHECK OPTION`` -- with the name re-targeted and ``OR REPLACE`` /
+    ``TEMPORARY`` dropped (the apply decides replacement; Aurora DSQL has no temporary
+    views). ``None`` for an empty definition or a header this cannot read (``CREATE
+    MATERIALIZED VIEW``, say), which the caller flags for manual work.
+    """
+    text = (definition or "").strip()
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    if not text:
+        return None
+    quoted = _quote_pg_qualified(name)
+    if _PG_CREATE_PREFIX_RE.match(text) is None:
+        return f"CREATE VIEW {quoted} AS\n{text}"
+    header = _PG_VIEW_HEADER_RE.match(text)
+    if header is None:
+        return None
+    recursive = "RECURSIVE " if header.group("recursive") else ""
+    return f"CREATE {recursive}VIEW {quoted}{text[header.end():]}"
+
+
 def _wide_indexes(table: TableDef) -> list[tuple[str, int]]:
     """Return ``(index name, column count)`` for indexes over the DSQL key-column cap.
 
@@ -3287,14 +3349,57 @@ def pg_preserved_generated_columns(table: TableDef) -> "list[ColumnDef]":
     ]
 
 
-def _apply_pg_generated_columns(create: exp.Expression, table: TableDef) -> None:
+# What a raw fragment holds in the tree until the CREATE is rendered (_render_create).
+_RAW_FRAGMENT_TOKEN = "__dsql_raw_fragment_{}__"
+_RAW_FRAGMENT_RE = re.compile(r"__dsql_raw_fragment_(\d+)__")
+
+
+def _raw_fragment(fragments: "list[str]", text: str) -> exp.Var:
+    """A placeholder node for ``text``, which :func:`_render_create` splices in VERBATIM.
+
+    Raw text cannot simply sit in the tree as an ``exp.var``: sqlglot emits it as written,
+    but its pretty printer then re-indents every line of the CREATE -- the continuation
+    lines of the raw text included -- so a newline INSIDE a string literal gained the
+    indentation (``'<LF>'::text`` became ``'<LF>  '::text``, a different value on every
+    row). sqlglot shields only the newlines of literals it parsed itself. Splicing the text
+    in after rendering keeps it byte for byte.
+    """
+    fragments.append(text)
+    return exp.var(_RAW_FRAGMENT_TOKEN.format(len(fragments) - 1))
+
+
+def _render_create(create: exp.Expression, fragments: "Sequence[str]") -> str:
+    """Render the converted CREATE (pretty), with each raw fragment spliced in verbatim.
+
+    With no fragment -- every MySQL table -- this is exactly the plain pretty render.
+    """
+    rendered = create.sql(dialect=_POSTGRES, pretty=True)
+    if not fragments:
+        return rendered
+    found = sorted(int(index) for index in _RAW_FRAGMENT_RE.findall(rendered))
+    if found == list(range(len(fragments))):
+        return _RAW_FRAGMENT_RE.sub(lambda match: fragments[int(match.group(1))], rendered)
+    # The table's own text spells a placeholder (a column named like one), so splicing could
+    # hit it: put each fragment into its node instead and render WITHOUT pretty-printing,
+    # which emits raw text as written -- on one line, but byte for byte.
+    for node in list(create.find_all(exp.Var)):
+        match = _RAW_FRAGMENT_RE.fullmatch(node.name)
+        if match is not None:
+            node.set("this", fragments[int(match.group(1))])
+    return create.sql(dialect=_POSTGRES)
+
+
+def _apply_pg_generated_columns(
+    create: exp.Expression, table: TableDef, fragments: "list[str]"
+) -> None:
     """Re-attach each preserved ``GENERATED ALWAYS AS (expr) STORED`` clause, in place.
 
-    Injected as RAW TEXT into the already-parsed tree -- the same technique
-    ``_apply_pk_strategy`` uses for the identity ``CACHE`` clause, but for a different and
-    sharper reason. sqlglot CAN parse and render this clause, so emitting it through
-    ``build_pg_source_ddl`` (which is re-parsed and re-RENDERED) looks fine and silently
-    corrupts real ``pg_get_expr`` output. Measured on what PostgreSQL actually stores:
+    Injected as RAW TEXT into the already-parsed tree (a :func:`_raw_fragment`) -- the
+    technique ``_apply_pk_strategy`` uses for the identity ``CACHE`` clause, but for a
+    different and sharper reason. sqlglot CAN parse and render this clause, so emitting it
+    through ``build_pg_source_ddl`` (which is re-parsed and re-RENDERED) looks fine and
+    silently corrupts real ``pg_get_expr`` output. Measured on what PostgreSQL actually
+    stores:
 
         (tags #>> '{a,b}'::text[])          -> CAST(tags #>> '{a,b}' AS TEXT[])
         ((tags -> 'a') ->> 'b'::text)       -> operator does not exist: text ->> unknown
@@ -3303,7 +3408,8 @@ def _apply_pg_generated_columns(create: exp.Expression, table: TableDef) -> None
 
     The last one is the worst: a ParseError here aborts the WHOLE table
     (``_unparsable_table_conversion``), taking every other column with it. Injecting the
-    source text verbatim preserves all four byte-for-byte.
+    source text verbatim preserves all four byte-for-byte -- and so does the render, since
+    the fragment is spliced in after pretty-printing (see :func:`_raw_fragment`).
     """
     for column in pg_preserved_generated_columns(table):
         column_def = _find_column_def(create, column.name)
@@ -3312,8 +3418,59 @@ def _apply_pg_generated_columns(create: exp.Expression, table: TableDef) -> None
         constraints = list(column_def.args.get("constraints") or [])
         constraints.append(
             exp.ColumnConstraint(
-                kind=exp.var(
-                    f"GENERATED ALWAYS AS ({column.generated_expression}) STORED"
+                kind=_raw_fragment(
+                    fragments,
+                    f"GENERATED ALWAYS AS ({column.generated_expression}) STORED",
+                )
+            )
+        )
+        column_def.set("constraints", constraints)
+
+
+def _apply_pg_column_defaults(
+    create: exp.Expression, table: TableDef, fragments: "list[str]"
+) -> None:
+    """Attach each carried PostgreSQL column DEFAULT, VERBATIM, in place.
+
+    The default text is ``pg_get_expr`` output -- PostgreSQL already -- so it is attached
+    after the parse as a :func:`_raw_fragment`, exactly like a generated expression, and
+    never re-rendered. It used to be part of the parsed ``build_pg_source_ddl`` text, and
+    sqlglot's re-render broke or changed common defaults:
+
+        CURRENT_TIME                                  -> CURRENT_TIME()  (syntax error)
+        (date_part('epoch'::text, now()))::bigint     -> CAST((EXTRACT(CAST('epoch' AS
+                                                         TEXT) FROM ...)) AS BIGINT)
+                                                         (syntax error)
+        date_trunc('day'::text, now(), 'Asia/Seoul'::text)
+                                                      -> the time zone dropped (Aurora DSQL
+                                                         runs in UTC: another day boundary)
+        CURRENT_TIMESTAMP(0)                          -> CURRENT_TIMESTAMP (precision lost)
+
+    The first two made the whole CREATE TABLE fail at apply, in SQL the user never wrote,
+    on tables Evaluation had graded AUTO. Which defaults are carried at all is still
+    :func:`~dsql_migrator.core.converter_postgres.pg_column_default_sql`'s decision (no
+    ``nextval``, no cast to a type DSQL lacks, an enum default as its plain label); the
+    identity primary key gets none, as before -- the primary-key strategy owns it.
+    """
+    from dsql_migrator.core.converter_postgres import pg_column_default_sql
+
+    primary_key = set(table.primary_key or [])
+    for column in table.columns:
+        if column.name == table.auto_increment_column:
+            continue
+        default_sql, _drop_reason = pg_column_default_sql(
+            column, is_key_column=column.name in primary_key
+        )
+        if default_sql is None:
+            continue
+        column_def = _find_column_def(create, column.name)
+        if column_def is None:
+            continue
+        constraints = list(column_def.args.get("constraints") or [])
+        constraints.append(
+            exp.ColumnConstraint(
+                kind=exp.DefaultColumnConstraint(
+                    this=_raw_fragment(fragments, default_sql)
                 )
             )
         )
@@ -4975,6 +5132,10 @@ class SchemaConverter:
         # Columns retyped to bytea for a DSQL-unsupported source type (MySQL spatial).
         # Empty for a PostgreSQL source (no such substitution in v1).
         bytea_fallback_columns: list[str] = []
+        # Source text that must reach the target byte for byte (PostgreSQL generated
+        # expressions and DEFAULTs), spliced in after rendering -- see _raw_fragment.
+        # Always empty for a MySQL source, whose render is therefore unchanged.
+        raw_fragments: list[str] = []
 
         # A single table whose reconstructed DDL cannot be parsed must NOT abort the
         # whole Schema Conversion step. Isolate the failure: surface this one table as
@@ -4991,10 +5152,12 @@ class SchemaConverter:
                 create = sqlglot.parse_one(build_pg_source_ddl(table), read=_POSTGRES)
             except sqlglot.errors.SqlglotError as exc:
                 return _unparsable_table_conversion(table, exc)
-            # Re-attach the STORED generated-column clauses AFTER the parse and BEFORE the
-            # primary-key strategy, so the expression text is never re-rendered by sqlglot
-            # (which mangles real pg_get_expr output -- see _apply_pg_generated_columns).
-            _apply_pg_generated_columns(create, table)
+            # Re-attach the STORED generated-column clauses and the column DEFAULTs AFTER
+            # the parse and BEFORE the primary-key strategy, so that source text is never
+            # re-rendered by sqlglot (which mangles real pg_get_expr output -- see
+            # _apply_pg_generated_columns and _apply_pg_column_defaults).
+            _apply_pg_generated_columns(create, table, raw_fragments)
+            _apply_pg_column_defaults(create, table, raw_fragments)
             # Re-add each converted ENUM's allowed values as a CHECK, so the value domain
             # survives the remodel to text (exactly what the MySQL ENUM path does).
             for column in table.columns:
@@ -5263,8 +5426,8 @@ class SchemaConverter:
                         )
                     )
 
-            # PostgreSQL column DEFAULTs ARE carried to the target (build_pg_source_ddl
-            # emits them; the read="postgres" re-parse normalizes each to DSQL-valid SQL).
+            # PostgreSQL column DEFAULTs ARE carried to the target, verbatim
+            # (_apply_pg_column_defaults attaches the source text; nothing re-renders it).
             # Warn for a default that genuinely could not be carried -- one that does not
             # parse as a PostgreSQL expression, or a sequence DEFAULT on a NON-key column
             # (the identity PK is skipped below, and the PK strategy governs only that
@@ -5396,7 +5559,7 @@ class SchemaConverter:
             if optional_warning is not None:
                 warnings.append(optional_warning)
 
-        target_ddl = create.sql(dialect=_POSTGRES, pretty=True)
+        target_ddl = _render_create(create, raw_fragments)
         schema_name, _ = _split_qualified(table.name)
         schema_ddls = (
             [f"CREATE SCHEMA IF NOT EXISTS {_quote_pg_identifier(schema_name)}"]
@@ -5478,17 +5641,20 @@ class SchemaConverter:
         )
 
     def convert_view(self, view: ViewDef) -> ViewConversion:
-        """Convert a single MySQL view to a DSQL-compatible ``CREATE VIEW``.
+        """Convert a single source view to a DSQL-compatible ``CREATE VIEW``.
 
-        Aurora DSQL is PostgreSQL-compatible and supports views, so the view's
-        captured MySQL definition is transpiled to PostgreSQL via sqlglot and
-        re-targeted to the view's (possibly schema-qualified) name, with a
-        ``CREATE SCHEMA IF NOT EXISTS`` for its schema. If the definition is
-        missing or cannot be parsed/transpiled, the view is surfaced for manual
-        reimplementation (``auto_converted=False``, a comment placeholder) with a
-        ``MANUAL`` warning -- never silently broken DDL. Table references inside
-        the view come from the source definition as-is (best effort); the user
-        can edit the converted DDL before applying.
+        Aurora DSQL is PostgreSQL-compatible and supports views. A MySQL view's
+        captured definition is transpiled to PostgreSQL via sqlglot; a PostgreSQL
+        view's definition (``pg_get_viewdef``) is emitted VERBATIM -- it is PostgreSQL
+        already, and re-rendering it changed what views return (see
+        :func:`pg_view_ddl`). Either way it is re-targeted to the view's (possibly
+        schema-qualified, always quoted) name, with a ``CREATE SCHEMA IF NOT EXISTS``
+        for its schema. If the definition is missing or cannot be
+        parsed/transpiled, the view is surfaced for manual reimplementation
+        (``auto_converted=False``, a comment placeholder) with a ``MANUAL`` warning --
+        never silently broken DDL. Table references inside the view come from the
+        source definition as-is (best effort); the user can edit the converted DDL
+        before applying.
         """
         schema_name, _ = _split_qualified(view.name)
         schema_ddls = (
@@ -5546,12 +5712,22 @@ class SchemaConverter:
                     )
                 ],
             )
-        # Read the view body in its SOURCE dialect: a PostgreSQL source's view is already
-        # PG (near-identity to the DSQL target), so reading it as MySQL would mangle
-        # PG-only syntax (ANY(ARRAY[...]), ILIKE, `::` casts) into fabricated SQL.
-        read_dialect = _POSTGRES if self._source_type is SourceType.POSTGRES else _MYSQL
+        if self._source_type is SourceType.POSTGRES:
+            # Verbatim, and sqlglot is no gate either: a body it cannot parse (it raises on
+            # the jsonb `@?` operator, for one) is still the text PostgreSQL deparsed
+            # itself, and Evaluation grades the view AUTO.
+            verbatim = pg_view_ddl(view.name, definition)
+            if verbatim is None:
+                return _manual_view_conversion(view.name, schema_ddls)
+            return ViewConversion(
+                view=view.name,
+                target_ddl=verbatim,
+                schema_ddls=schema_ddls,
+                auto_converted=True,
+                warnings=[],
+            )
         try:
-            parsed = sqlglot.parse_one(definition, read=read_dialect)
+            parsed = sqlglot.parse_one(definition, read=_MYSQL)
             select = parsed.expression if isinstance(parsed, exp.Create) else parsed
             if select is None:
                 raise ValueError("no SELECT body parsed from the view definition")
@@ -5574,25 +5750,7 @@ class SchemaConverter:
             )
             target_ddl = create.sql(dialect=_POSTGRES, pretty=True)
         except Exception:  # noqa: BLE001 - any parse/generation failure -> manual
-            return ViewConversion(
-                view=view.name,
-                target_ddl=(
-                    f"-- Could not auto-convert view {view.name} for Aurora DSQL; "
-                    "reimplement it manually after reviewing the source definition."
-                ),
-                schema_ddls=schema_ddls,
-                auto_converted=False,
-                warnings=[
-                    ConversionWarning(
-                        object_name=view.name,
-                        classification=Classification.MANUAL,
-                        message=(
-                            "The view's SQL could not be automatically converted; "
-                            "review and reimplement it manually on Aurora DSQL."
-                        ),
-                    )
-                ],
-            )
+            return _manual_view_conversion(view.name, schema_ddls)
         return ViewConversion(
             view=view.name,
             target_ddl=target_ddl,
@@ -5600,6 +5758,29 @@ class SchemaConverter:
             auto_converted=True,
             warnings=[],
         )
+
+
+def _manual_view_conversion(name: str, schema_ddls: "list[str]") -> ViewConversion:
+    """The placeholder of a view whose definition could not be converted (MANUAL)."""
+    return ViewConversion(
+        view=name,
+        target_ddl=(
+            f"-- Could not auto-convert view {name} for Aurora DSQL; "
+            "reimplement it manually after reviewing the source definition."
+        ),
+        schema_ddls=schema_ddls,
+        auto_converted=False,
+        warnings=[
+            ConversionWarning(
+                object_name=name,
+                classification=Classification.MANUAL,
+                message=(
+                    "The view's SQL could not be automatically converted; "
+                    "review and reimplement it manually on Aurora DSQL."
+                ),
+            )
+        ],
+    )
 
 
 __all__ = [

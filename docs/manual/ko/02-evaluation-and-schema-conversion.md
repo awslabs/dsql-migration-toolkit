@@ -273,11 +273,13 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   다른 컬럼을 참조하는 표현식은 불가) 조용히 사라지지 않고 드롭 + **보고**됩니다.
   `ON UPDATE CURRENT_TIMESTAMP`는 아예 재현할 수 없습니다 — DSQL에는 `ON UPDATE` 절도 트리거도
   없습니다 — 따라서 애플리케이션이 처리하도록 **MANUAL**로 표시됩니다. **PostgreSQL 소스**에서는
-  컬럼 DEFAULT를 **그대로 가져옵니다**(PostgreSQL 재파싱으로 정규화). 기본 키의 `serial`/`IDENTITY`
+  컬럼 DEFAULT를 PostgreSQL이 저장한 텍스트(`pg_get_expr`) **그대로** 가져옵니다. 다시 렌더링하지
+  않으므로 `CURRENT_TIME`, `CURRENT_TIMESTAMP(0)`, PostgreSQL 14 이전에 저장된 `date_part(...)`, 인자가
+  3개인 `date_trunc(..., 'Asia/Seoul')`도 바뀌지 않고 Aurora DSQL에 도달합니다. 기본 키의 `serial`/`IDENTITY`
   `nextval`은 선택한 기본 키 전략이 대신 좌우하고, 키가 아닌 컬럼의 `nextval`, 파싱되지 않는 기본값,
   DSQL에 없는 타입으로 캐스팅하는 기본값은 노트와 함께 제외됩니다(enum 기본값은 컬럼이 `text`가 되므로
   평문 텍스트 리터럴로 유지). `STORED` 생성 컬럼도
-  **보존**됩니다: 식이 `GENERATED ALWAYS AS (expr) STORED`로 다시 출력되고 Aurora DSQL이 모든 쓰기에서
+  **보존**됩니다: 식이 원문 그대로 `GENERATED ALWAYS AS (expr) STORED`로 다시 출력되고 Aurora DSQL이 모든 쓰기에서
   값을 유지하므로 다시 구현할 것이 없습니다(쓰기는 그 컬럼을 빼야 하며, Full Load와 CDC 싱크가 그렇게
   합니다). `VIRTUAL` 생성 컬럼(PG18의 기본 종류)은 DSQL에 대응물이 없어 일반 컬럼으로
   생성됩니다.
@@ -295,8 +297,11 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
 - **인덱스는 `CREATE INDEX ASYNC`** — DSQL은 보조 인덱스를 데이터 적재 후 비동기로 생성합니다.
 - **트랜잭션당 한 개 DDL** — 변환은 각 DDL을 자체 실행 단위로 내보내며(DSQL은 트랜잭션당 한 개 DDL),
   적용 경로는 낙관적 동시성 충돌(`40001`)을 재시도(다시 적용해도 중복이 안 생기므로 안전).
-- **뷰**는 PostgreSQL `CREATE VIEW`로 변환합니다. 파싱할 수 없는 정의는 조용히 버리지 않고, 수동 작업
-  플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다.
+- **뷰** — MySQL 뷰는 PostgreSQL `CREATE VIEW`로 변환합니다. 파싱할 수 없는 정의는 조용히 버리지 않고,
+  수동 작업 플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다. **PostgreSQL** 뷰의 정의
+  (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
+  같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
+  `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다.
 
 ### 외래 키 — DSQL에서 강제되지만, 데이터 적재 *이후*에 적용
 
@@ -468,7 +473,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | **트랜잭션당 한 개 DDL** | 스키마 변환은 실행 단위당 정확히 한 개 DDL 문을 내보냄. |
 | **`CREATE INDEX ASYNC`** | 보조 인덱스를 데이터 적재 후 비동기로 생성. |
 | **낙관적 동시성** | 모든 배치·DDL을 `40001` 재시도로 감쌈. |
-| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 **그대로 가져옵니다**(PostgreSQL 재파싱으로 정규화) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고, DSQL에 없는 다른 타입으로 캐스팅하는 기본값은 노트와 함께 제외됩니다. |
+| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 PostgreSQL이 저장한 텍스트 **그대로** 가져옵니다(다시 렌더링하지 않음) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고, DSQL에 없는 다른 타입으로 캐스팅하는 기본값은 노트와 함께 제외됩니다. |
 | **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
 | **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
 | **네이티브 파티셔닝 없음** | DSQL이 자동 분산; 파티션 테이블은 MANUAL. |

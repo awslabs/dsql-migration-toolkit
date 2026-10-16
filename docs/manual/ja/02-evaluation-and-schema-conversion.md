@@ -289,11 +289,13 @@ MySQL→PostgreSQL トランスパイルではありません。
   ないデフォルト(MySQL の `UUID()` は変換されますが、他の列を参照する式は不可)は、黙って失われる
   のではなく破棄して **報告** されます。`ON UPDATE CURRENT_TIMESTAMP` はまったく再現できません —
   DSQL には `ON UPDATE` 句もトリガーもありません — そのため、アプリケーション側で処理するよう
-  **MANUAL** としてフラグ付けされます。**PostgreSQL ソース** では、列 DEFAULT を **引き継ぎます**
-  (PostgreSQL の再パースで正規化)。主キーの `serial`/`IDENTITY` `nextval` は選択した主キー戦略が代わりに
+  **MANUAL** としてフラグ付けされます。**PostgreSQL ソース** では、列 DEFAULT を PostgreSQL が保存している
+  テキスト(`pg_get_expr`)の **まま** 引き継ぎます。再レンダリングしないため、`CURRENT_TIME`、
+  `CURRENT_TIMESTAMP(0)`、PostgreSQL 14 より前に保存された `date_part(...)`、3 引数の
+  `date_trunc(..., 'Asia/Seoul')` も変わらずに Aurora DSQL に届きます。主キーの `serial`/`IDENTITY` `nextval` は選択した主キー戦略が代わりに
   決定し、キーでない列の `nextval`、パースできないデフォルト、DSQL にない型へキャストするデフォルトは
   注記付きで除外されます(enum のデフォルトは列が `text` になるため、プレーンなテキストリテラルとして
-  保持されます)。`STORED` 生成カラムの式は再出力され、`VIRTUAL` 生成カラムは通常のカラムになります。
+  保持されます)。`STORED` 生成カラムの式はそのまま再出力され、`VIRTUAL` 生成カラムは通常のカラムになります。
 - **外部キーの保持** — Aurora DSQL は外部キーを **強制** するため、各ソースの FK は **`CREATE TABLE` の外**
   に保たれ、独立した post-load の `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 文としてレンダリングされます。
   Full Load はデータのロード **後** に実行単位レベルのパスとしてこれらを再作成します。**CDC** マイグレーション
@@ -309,8 +311,11 @@ MySQL→PostgreSQL トランスパイルではありません。
 - **トランザクションあたり 1 つの DDL** — 変換は各 DDL 文をそれ自身の実行単位として出力し(DSQL は
   トランザクションあたり 1 つの DDL を許可)、適用経路は楽観的並行性の衝突(`40001`)を冪等に
   リトライします。
-- **ビュー** は PostgreSQL の `CREATE VIEW` にトランスパイルされます。パースできない定義は、黙って
-  捨てられるのではなく、手作業のフラグが付いた明示的なプレースホルダーとして表示されます。
+- **ビュー** — MySQL のビューは PostgreSQL の `CREATE VIEW` にトランスパイルされます。パースできない定義は、
+  黙って捨てられるのではなく、手作業のフラグが付いた明示的なプレースホルダーとして表示されます。
+  **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
+  **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
+  変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。
 
 ### 外部キー — DSQL では強制されるが、データ適載の *後* に適用される
 
@@ -482,7 +487,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | **トランザクションあたり 1 つの DDL** | Schema Conversion は実行単位ごとに正確に 1 つの DDL 文を出力します。 |
 | **`CREATE INDEX ASYNC`** | セカンダリインデックスはデータの後に非同期で作成されます。 |
 | **楽観的並行性制御** | すべてのバッチと DDL は `40001` リトライでラップされます。 |
-| **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** ソースの `DEFAULT` を **引き継ぎます**(PostgreSQL の再パースで正規化) — 除去されるのは `serial`/`IDENTITY` `nextval` と生成カラムの式だけで、identity はターゲット側で選択した PK 戦略が決定します。変換された enum 列はデフォルトをプレーンなテキストリテラルとして保持し、DSQL にない別の型へキャストするデフォルトは注記付きで除外されます。 |
+| **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** ソースの `DEFAULT` を PostgreSQL が保存しているテキストの **まま** 引き継ぎます(再レンダリングしません) — 除去されるのは `serial`/`IDENTITY` `nextval` と生成カラムの式だけで、identity はターゲット側で選択した PK 戦略が決定します。変換された enum 列はデフォルトをプレーンなテキストリテラルとして保持し、DSQL にない別の型へキャストするデフォルトは注記付きで除外されます。 |
 | **`ON UPDATE CURRENT_TIMESTAMP` なし** | 再現不可: DSQL には `ON UPDATE` 句も、(PostgreSQL で通常用いる回避策の)トリガーもありません。列は挿入時のデフォルトを保持し **MANUAL** としてフラグ付けされます — 更新時のタイムスタンプはアプリケーションで明示的に設定してください。 |
 | **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
 | **ネイティブパーティショニングなし** | DSQL が自動分散します。パーティション化されたテーブルは MANUAL としてフラグ付けされます。 |

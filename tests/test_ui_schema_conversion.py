@@ -504,8 +504,8 @@ def test_render_source_view_ddl_postgres_preserves_pg_syntax() -> None:
         definition="CREATE VIEW public.active AS SELECT id FROM users WHERE name ILIKE 'a%'",
     )
     rendered = render_source_view_ddl(view, source_type=SourceType.POSTGRES)
-    assert "ILIKE" in rendered.upper()
-    assert "`" not in rendered
+    # The true source text, never re-rendered (no MySQL backticks, no sqlglot round trip).
+    assert rendered == view.definition
 
 
 def test_render_target_ddl_emits_async_index_and_post_load_foreign_key() -> None:
@@ -4698,7 +4698,8 @@ def test_a_render_before_connecting_does_not_poison_the_conversion_memo() -> Non
     the LABELS while Apply still writes the MySQL-dialect DDL -- correct-looking screen,
     corrupt target. Here a PostgreSQL expression default (``'x'::text``) is the tell:
     the MySQL reader re-quotes it into the literal 10-character string ``'x'::text``,
-    whereas the PostgreSQL reader renders a real ``CAST``.
+    whereas the PostgreSQL path carries it verbatim -- after the converter's own
+    upper-case ``TEXT`` type, which the PostgreSQL source pane (``text``) does not show.
     """
     import sys
     import types
@@ -4779,7 +4780,7 @@ def test_a_render_before_connecting_does_not_poison_the_conversion_memo() -> Non
 
     body = recorder.body()
     assert "Source (PostgreSQL)" in body, "the label did not even follow the engine"
-    assert "CAST('x' AS TEXT)" in body, (
+    assert "\"v\" TEXT NOT NULL DEFAULT 'x'::text" in body, (
         "the conversion memo still serves the MySQL-dialect target DDL after the engine "
         "changed -- correct labels over a corrupt target, the worst failure mode"
     )
