@@ -2270,3 +2270,50 @@ def test_the_watchdog_reaps_an_evaluation_with_its_own_message() -> None:
     assert error.startswith("No progress for 10s while reading the source or target catalog")
     assert "Retry the failed tables" not in error
     release.set()
+
+
+def test_a_leftover_poll_never_settles_or_retires_the_current_run() -> None:
+    """Two tabs share a session: Tab 2's poll on the old job A retired the CURRENT run B,
+    whose finished result was then dropped (step DONE with no report)."""
+    from dsql_migrator.ui.evaluation import _install_poll_timer
+
+    state = EvaluationState()
+    old_token = state.begin_run()
+    state.job_id, state.job_token = "job-a", old_token
+
+    timers = []
+
+    class _Ui:
+        def timer(self, _interval, callback):
+            timers.append(callback)
+
+    class _Manager:
+        def get_status(self, job_id):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(status="CANCELLED")
+
+        def get_error(self, _job_id):
+            return None
+
+    class _Session:
+        workflow = None
+
+        def set_workflow(self, workflow):
+            raise AssertionError("a leftover poll must not settle the step")
+
+    _install_poll_timer(_Ui(), _Manager(), _Session(), state, refresh=lambda: None)
+    new_token = state.begin_run()  # Start over + a new run B
+    state.job_id, state.job_token = "job-b", new_token
+    timers[0]()  # Tab 2's poll on A ticks
+    assert state.is_current(new_token)
+
+
+def test_a_cancel_retires_the_run_so_a_late_result_is_not_recorded() -> None:
+    state = EvaluationState()
+    token = state.begin_run()
+    state.job_token = token
+    state.retire_run(state.job_token)  # what the Cancel button does
+    assert state.set_result(object(), token=token) is False
+
+

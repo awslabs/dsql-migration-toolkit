@@ -653,6 +653,14 @@ def apply_session_snapshot(
             session.set_workflow(
                 with_status(session.workflow, WorkflowStep.EVALUATION, StepStatus.DONE)
             )
+            # A finished run records DONE itself, so this is a RE-run the restart stopped:
+            # say the report is the previous one, or it reads as the re-run's.
+            eval_state.run_notice = (  # type: ignore[attr-defined]
+                "warning",
+                "The re-run was interrupted by a restart",
+                "The app restarted while the evaluation was running again, so it stopped. "
+                "The assessment below is from the previous run; run it again to refresh it.",
+            )
 
     if snapshot.generated_node_ids is not None:
         conv_state.generated_node_ids = list(snapshot.generated_node_ids)  # type: ignore[attr-defined]

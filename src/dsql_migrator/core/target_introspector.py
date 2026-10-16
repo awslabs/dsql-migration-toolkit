@@ -430,6 +430,18 @@ def _stored_qualified(name: str) -> "Optional[tuple[str, str]]":
     return (pg_stored_name(schema), pg_stored_name(rest)) if schema and rest else None
 
 
+# What to do about the held names Evaluation lists (on screen and in the HTML export):
+# the summary of :meth:`TargetNames.held_advice`. The copy an earlier version made of an
+# index the conversion renames goes only after its table is applied -- dropping it first
+# leaves the table without that index.
+BLOCKED_NAMES_ADVICE = (
+    "Drop or rename that object on the target, then apply -- except the copy an earlier "
+    "version made of an index: apply that index's table first (it creates the index under "
+    "its new name; a Replace of it also drops the copy), then drop the copy if it is still "
+    "there."
+)
+
+
 class TargetNames:
     """The browsed target's names, matched the way Schema Apply matches them -- one rule
     for Evaluation (conflicts, limit counts, blocked names) and Schema Conversion (labels,
@@ -439,10 +451,18 @@ class TargetNames:
     is matched EXACTLY on stored names (the converter quotes every name, each part cut to
     63 bytes: :func:`pg_stored_name`), and only an object of the SAME kind counts
     (``views``: the source's view names); an unqualified one is matched case-insensitively
-    against bare names in any schema."""
+    against bare names in any schema. ``legacy_indexes`` (:class:`ConvertedNames`) names
+    the copies an earlier version made of the indexes the conversion renames."""
 
-    def __init__(self, target: TargetInventory, *, views: "Collection[str]" = ()) -> None:
+    def __init__(
+        self,
+        target: TargetInventory,
+        *,
+        views: "Collection[str]" = (),
+        legacy_indexes: "Optional[Mapping]" = None,
+    ) -> None:
         self._holders = _target_holders(target)
+        self._legacy_indexes = dict(legacy_indexes or {})
         self._unqualified = {
             relation.name.lower()
             for schema in target.schemas
@@ -461,15 +481,55 @@ class TargetNames:
             return name.strip().lower() in self._unqualified
         return self._holders.get(stored) == (self._kind(name), None)
 
-    def blocked_by(self, name: str) -> "Optional[str]":
-        """What ANOTHER kind of object holding ``name``'s stored name is (``"a view"``,
-        ``"an index on s.t"``): Schema Apply refuses it in both modes. ``None`` otherwise."""
+    def _blocker(self, name: str) -> "Optional[tuple[tuple[str, str], str, Optional[str]]]":
         stored = _stored_qualified(name)
         holder = self._holders.get(stored) if stored is not None else None
         if holder is None or holder == (self._kind(name), None):
             return None
-        kind, owner = holder
-        return f"an index on {owner}" if kind == "INDEX" else f"a {kind.lower()}"
+        return stored, holder[0], holder[1]  # type: ignore[return-value]
+
+    def _index_copy(self, stored: "tuple[str, str]", owner: "Optional[str]") -> "Optional[str]":
+        """The index the conversion now creates (on ``owner``) of which the index holding
+        ``stored`` is an earlier version's copy, else ``None``."""
+        copy_of = self._legacy_indexes.get(stored)
+        return copy_of[1] if copy_of is not None and copy_of[0] == owner else None
+
+    def blocked_by(self, name: str) -> "Optional[str]":
+        """What ANOTHER kind of object holding ``name``'s stored name is (``"a view"``,
+        ``"an index on s.t"``): Schema Apply refuses it in both modes. ``None`` otherwise."""
+        blocker = self._blocker(name)
+        if blocker is None:
+            return None
+        stored, kind, owner = blocker
+        if kind != "INDEX":
+            return f"a {kind.lower()}"
+        renamed = self._index_copy(stored, owner)
+        if renamed is not None:
+            return f"the copy an earlier version made of index {renamed} on {owner}"
+        return f"an index on {owner}"
+
+    def held_advice(self, name: str) -> "Optional[str]":
+        """What to do about the object :meth:`blocked_by` names (``None``: there is none).
+        Drop or rename it -- unless it is an earlier version's copy of an index the
+        conversion renames, which goes only once the renamed index is there: dropping it
+        first leaves the table without that index (a UNIQUE one unenforced) until the
+        table is applied again. The order Schema Apply itself gives."""
+        blocker = self._blocker(name)
+        if blocker is None:
+            return None
+        stored, kind, owner = blocker
+        renamed = self._index_copy(stored, owner) if kind == "INDEX" else None
+        if renamed is None:
+            return "Drop or rename that object on the target, then apply."
+        from dsql_migrator.core.schema_applier import _quoted_name
+
+        drop = f"DROP INDEX {_quoted_name(*stored)}"
+        if self._holders.get((stored[0], pg_stored_name(renamed))) == ("INDEX", owner):
+            return f"{renamed} is already there, so drop the copy ({drop}), then apply."
+        return (
+            f"Apply {owner} first (it creates {renamed}; a Replace of it also drops the "
+            f"copy), then drop the copy ({drop}) if it is still there, and apply."
+        )
 
     def old_view_copy(self, name: str) -> "Optional[str]":
         """For a source view: the lower-case copy an earlier version created (unquoted)

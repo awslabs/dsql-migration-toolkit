@@ -28,6 +28,7 @@ import re
 from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import URL
 
@@ -467,6 +468,15 @@ def _reflect_tables(
     """
     tables: list[TableDef] = []
     for table_name in inspector.get_table_names(schema=schema):  # type: ignore[attr-defined]
+        try:
+            reflected_columns = inspector.get_columns(table_name, schema=schema)  # type: ignore[attr-defined]
+        except NoSuchTableError:
+            # Dropped since the schema was listed (a pg_repack or gh-ost work table, an
+            # ETL staging table): no longer a migration object, and no reason to fail a
+            # read that may have run for minutes.
+            if on_table is not None:
+                on_table()
+            continue
         columns = [
             ColumnDef(
                 name=column["name"],
@@ -477,7 +487,7 @@ def _reflect_tables(
                 # MySQL column COMMENT (dropped on conversion; captured to warn).
                 comment=(column.get("comment") or None),
             )
-            for column in inspector.get_columns(table_name, schema=schema)  # type: ignore[attr-defined]
+            for column in reflected_columns
         ]
 
         pk_constraint = inspector.get_pk_constraint(table_name, schema=schema)  # type: ignore[attr-defined]
@@ -587,9 +597,13 @@ def _reflect_tables(
                         ),
                     )
                 )
-        except Exception:  # noqa: BLE001 - reflection of checks is best-effort
+        except Exception as exc:  # noqa: BLE001 - reflection of checks is best-effort
             # An older MySQL (< 8.0.16) or a dialect quirk: absence of CHECK reflection
-            # must never fail the whole introspection.
+            # must never fail the whole introspection -- but a lock wait that timed out
+            # (pg_get_constraintdef locks the table) is no quirk: losing the table's
+            # CHECKs silently is worse than the clear lock error.
+            if _is_lock_timeout(exc):
+                raise
             check_constraints = []
 
         # MySQL table COMMENT (dropped on conversion; captured to warn). Best-effort:
@@ -600,7 +614,9 @@ def _reflect_tables(
                 inspector.get_table_comment(table_name, schema=schema).get("text")  # type: ignore[attr-defined]
                 or None
             )
-        except Exception:  # noqa: BLE001 - table-comment reflection is best-effort
+        except Exception as exc:  # noqa: BLE001 - table-comment reflection is best-effort
+            if _is_lock_timeout(exc):
+                raise
             table_comment = None
 
         tables.append(
@@ -640,7 +656,11 @@ def _reflect_views(inspector: object, schema: Optional[str] = None) -> list[View
             # Never swallow the read-only guard sentinel -- it means a write/DDL was
             # attempted on the source, which must surface, not be silently skipped.
             raise
-        except Exception:  # noqa: BLE001 - one bad/broken view must not abort the inventory
+        except Exception as exc:  # noqa: BLE001 - one bad/broken view must not abort the inventory
+            # ...but a lock wait that timed out (pg_get_viewdef locks every relation the
+            # view reads) leaves a healthy view graded "unreadable": raise the lock error.
+            if _is_lock_timeout(exc):
+                raise
             definition = ""
         views.append(ViewDef(name=view_name, definition=definition))
     return views
@@ -1208,8 +1228,6 @@ class SourceIntrospector:
         Read only (a ``SHOW GRANTS``); a failure is never an evaluation failure."""
         from dsql_migrator.core.source_dialect import dialect_for
 
-        if not databases:
-            return []
         dialect = dialect_for(conn.source_type)
         try:
             engine = self._engine_factory(conn)
@@ -1218,7 +1236,22 @@ class SourceIntrospector:
         try:
             with engine.connect() as connection:
                 connection = connection.execution_options(isolation_level="AUTOCOMMIT")
-                return list(dialect.listing_gaps(connection, databases))
+                wanted = list(databases)
+                if not conn.database and dialect.database_is_schema:
+                    # Cluster-wide: every database the read reflected, not only those
+                    # holding a table or view -- one holding just routines or events the
+                    # user cannot list would otherwise never be named.
+                    for schema in _user_schemas(
+                        inspect(connection),
+                        dialect.system_schemas,
+                        connection=connection,
+                        dialect=dialect,
+                    ):
+                        if schema not in wanted:
+                            wanted.append(schema)
+                if not wanted:
+                    return []
+                return list(dialect.listing_gaps(connection, wanted))
         except Exception:  # noqa: BLE001 - best effort
             return []
         finally:

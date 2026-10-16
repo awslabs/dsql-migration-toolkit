@@ -2413,3 +2413,22 @@ def test_the_gtid_bound_stamp_is_written_only_with_a_set() -> None:
     apply_session_snapshot(SessionSnapshot.model_validate(dumped), SessionConnectionState(),
                            EvaluationState(), SchemaConversionState(), m2)
     assert m2.cdc_start_override().binlog_position == 77 and m2._cdc_start_gtid is None
+
+
+
+def test_a_restart_during_an_evaluation_rerun_restores_done_with_a_notice() -> None:
+    """The re-run kept the previous report; the restore made it a silent DONE that read as
+    the re-run's own result."""
+    from dsql_migrator.ui.workflow import get_status
+
+    session, eval_state, conv_state, migration_state = _populated_states()
+    assert eval_state.result is not None
+    session.set_workflow(
+        with_status(session.workflow, WorkflowStep.EVALUATION, StepStatus.IN_PROGRESS)
+    )
+    snapshot = capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+    s2, e2 = SessionConnectionState(), EvaluationState()
+    apply_session_snapshot(snapshot, s2, e2, SchemaConversionState(), DataMigrationState())
+    assert get_status(s2.workflow, WorkflowStep.EVALUATION) is StepStatus.DONE
+    assert e2.run_notice is not None
+    assert e2.run_notice[1] == "The re-run was interrupted by a restart"

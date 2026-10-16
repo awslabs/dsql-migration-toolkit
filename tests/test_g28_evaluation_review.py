@@ -1742,6 +1742,30 @@ def test_generated_column_advice_never_sends_a_cdc_migration_to_a_generated_targ
     assert any(MYSQL_GENERATED_COLUMN_ADVICE in w.message for w in notes)
 
 
+def test_a_generated_key_column_is_never_advised_to_become_generated_on_the_target() -> None:
+    """Re-adding GENERATED ... STORED to a primary-key column made every Full Load batch
+    fail (428C9): the loader writes every key column."""
+    from dsql_migrator.core.converter import MYSQL_GENERATED_COLUMN_ADVICE
+
+    def advice(columns, key):
+        table = TableDef(name="shop.ledger", columns=columns, primary_key=key)
+        report = CompatibilityAssessor().assess(SourceInventory(tables=[table]))
+        (item,) = [i for i in report.items if i.object_name == "shop.ledger"]
+        (concern,) = [c for c in item.concerns if c.rule_id == "GENERATED_COLUMN"]
+        notes = SchemaConverter().convert_table(table, None).warnings  # type: ignore[arg-type]
+        assert any(concern.recommendation in w.message for w in notes)  # Step 2 agrees
+        return concern.recommendation
+
+    day = ColumnDef(name="day", mysql_type="date", generated=True, generated_kind="STORED")
+    seq = ColumnDef(name="seq", mysql_type="int")
+    only_key = advice([day, seq], ["day", "seq"])
+    assert "re-add the expression" not in only_key
+    assert "Keep day ordinary" in only_key and "428C9" in only_key
+    total = ColumnDef(name="total", mysql_type="int", generated=True, generated_kind="STORED")
+    mixed = advice([day, seq, total], ["day", "seq"])
+    assert mixed.startswith(MYSQL_GENERATED_COLUMN_ADVICE) and "Keep day ordinary" in mixed
+
+
 def test_a_generated_target_column_sent_a_value_is_named_and_its_repair_given() -> None:
     from types import SimpleNamespace
 
@@ -1830,6 +1854,90 @@ def test_objects_the_source_user_cannot_list_are_reported_not_assumed_absent() -
         result, inventory=result.inventory, target_inventory=TargetInventory(), target_endpoint=None
     )
     assert any(i.rule_id == "SOURCE_VISIBILITY" for i in refreshed.assessment.items)
+    # ...but not across an engine switch: that probe read another server's grants.
+    switched = with_refreshed_catalogs(
+        result,
+        inventory=result.inventory,
+        target_inventory=TargetInventory(),
+        target_endpoint=None,
+        source_type=SourceType.POSTGRES,
+    )
+    assert not any(i.rule_id == "SOURCE_VISIBILITY" for i in switched.assessment.items)
+
+
+def test_listing_gaps_follow_how_mysql_itself_applies_the_grants() -> None:
+    """The first parser added up every matching grant and ignored partial revokes and
+    quoted names, so it could call a listing complete that MySQL would cut short."""
+    from dsql_migrator.core.source_dialect.mysql import mysql_listing_gaps
+
+    to = "TO `u`@`%`"
+    every = ["triggers", "scheduled events", "stored procedures and functions"]
+
+    def kinds(gaps):
+        return [g.split(" in ")[0] for g in gaps]
+
+    # A partial revoke takes a global privilege back in that database only.
+    revoke = [f"GRANT SELECT, TRIGGER, EVENT ON *.* {to}", "REVOKE TRIGGER ON `shop`.* FROM `u`@`%`"]
+    assert mysql_listing_gaps(revoke, ["shop", "crm"], partial_revokes=True) == [
+        "triggers in shop (needs TRIGGER)"
+    ]
+    assert kinds(
+        mysql_listing_gaps(
+            [f"GRANT ALL PRIVILEGES ON *.* {to}", "REVOKE EVENT ON `shop`.* FROM `u`@`%`"],
+            ["shop"],
+            partial_revokes=True,
+        )
+    ) == ["scheduled events"]
+    # Quoted names may hold spaces, dots and backticks.
+    assert mysql_listing_gaps([f"GRANT ALL ON `my db.x`.* {to}"], ["my db.x"]) == []
+    assert mysql_listing_gaps([f"GRANT ALL ON `we``ird`.* {to}"], ["we`ird"]) == []
+    # Only the most specific matching grant applies -- an exact name over any pattern, a
+    # later first wildcard over an earlier one; they are not added up.
+    assert kinds(mysql_listing_gaps([f"GRANT SELECT ON `shop`.* {to}", f"GRANT ALL ON `sh%`.* {to}"], ["shop"])) == every
+    assert mysql_listing_gaps([f"GRANT ALL ON `app\\_%`.* {to}", f"GRANT SELECT ON `%`.* {to}"], ["app_x"]) == []
+    # Tied patterns: MySQL's pick is not observable, so only what they all grant counts.
+    tied = [f"GRANT ALL ON `a%`.* {to}", f"GRANT TRIGGER ON `a_`.* {to}"]
+    assert kinds(mysql_listing_gaps(tied, ["ab"])) == ["scheduled events", "stored procedures and functions"]
+    # Case folds only where the server folds it (lower_case_table_names != 0).
+    assert mysql_listing_gaps([f"GRANT ALL ON `Shop`.* {to}"], ["shop"], case_insensitive=True) == []
+    assert kinds(mysql_listing_gaps([f"GRANT ALL ON `Shop`.* {to}"], ["shop"])) == every
+    # With partial_revokes on, % and _ in a grant's database name are plain characters.
+    assert kinds(mysql_listing_gaps([f"GRANT ALL ON `sh%`.* {to}"], ["shop"], partial_revokes=True)) == every
+
+
+def test_the_listing_probe_reads_the_servers_name_matching_settings() -> None:
+    from dsql_migrator.core.source_dialect.mysql import MySQLSourceDialect
+
+    answers = {
+        "SELECT CURRENT_ROLE()": [("NONE",)],
+        "SHOW GRANTS": [("GRANT ALL ON `Shop`.* TO `u`@`%`",)],
+        "SELECT @@lower_case_table_names": [("1",)],
+        "SELECT @@partial_revokes": [("0",)],
+    }
+    seen = []
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalar(self):
+            return self._rows[0][0] if self._rows else None
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def first(self):
+            return self._rows[0] if self._rows else None
+
+    class _Conn:
+        def execute(self, clause):
+            seen.append(str(clause))
+            return _Result(answers[str(clause)])
+
+    assert MySQLSourceDialect().listing_gaps(_Conn(), ["shop"]) == []
+    assert "SELECT @@lower_case_table_names" in seen
+    answers["SELECT @@lower_case_table_names"] = [("0",)]
+    assert MySQLSourceDialect().listing_gaps(_Conn(), ["shop"])  # case-sensitive: Shop != shop
 
 
 
@@ -1903,3 +2011,149 @@ def test_cdc_never_captures_tables_whose_stored_names_clash() -> None:
     finally:
         _cdc_ui.cdc_capture_names = original
     assert [t.name for t in tables] == ["app.ok"]
+
+
+def _held_target(*, tables=(), views=(), indexes=None) -> TargetInventory:
+    """One schema ``shop``: ``tables``/``views`` by name, ``indexes`` {table: [index]}."""
+    from dsql_migrator.core.models import TargetIndexDef
+
+    indexes = indexes or {}
+    return TargetInventory(
+        schemas=[
+            TargetSchemaNode(
+                name="shop",
+                tables=[
+                    TargetRelation(
+                        schema_name="shop",
+                        name=name,
+                        kind=TargetObjectKind.TABLE,
+                        indexes=[TargetIndexDef(name=i, unique=True) for i in indexes.get(name, [])],
+                    )
+                    for name in tables
+                ],
+                views=[
+                    TargetRelation(schema_name="shop", name=name, kind=TargetObjectKind.VIEW)
+                    for name in views
+                ],
+            )
+        ]
+    )
+
+
+def test_held_names_are_reported_only_for_objects_the_apply_creates() -> None:
+    """A materialized view's replacement table, a placeholder's name and an unread view
+    were listed as "drop or rename the object holding the name" -- for objects the tool
+    never creates, so the advice could drop the table the operator built."""
+    from dsql_migrator.ui.evaluation import _find_target_blockers
+
+    source = SourceInventory(
+        tables=[_table("shop.orders")],
+        views=[
+            ViewDef(name="shop.daily_sales", definition="SELECT 1", unsupported_kind="materialized view"),
+            ViewDef(name="shop.v_hidden", definition=""),
+            ViewDef(name="shop.v_ok", definition="SELECT 1"),
+        ],
+    )
+    target = _held_target(tables=["daily_sales", "v_hidden", "v_ok"])
+    assert _find_target_blockers(source, target) == [("shop.v_ok", "a table")]
+    # A name-collision placeholder (two tables, one stored name) is never created either.
+    long = "t" * 70
+    clash = SourceInventory(tables=[_table(f"shop.{long}a"), _table(f"shop.{long}b")])
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    assert _find_target_blockers(clash, _held_target(views=[pg_stored_name(long + "a")])) == []
+
+
+def test_an_old_index_copy_holding_a_table_name_gets_the_safe_order_everywhere() -> None:
+    """Evaluation and the preview said to drop the copy first; Schema Apply said apply
+    its table first. Dropping first leaves the table without the (UNIQUE) index."""
+    from dsql_migrator.core.converter import index_renames
+    from dsql_migrator.core.schema_applier import converted_names
+    from dsql_migrator.core.target_introspector import BLOCKED_NAMES_ADVICE, TargetNames
+    from dsql_migrator.ui.evaluation import _find_target_blockers
+
+    source = SourceInventory(
+        tables=[
+            _table("shop.account", indexes=[IndexDef(name="currency", columns=["currency"], unique=True)]),
+            _table("shop.currency"),
+        ]
+    )
+    renamed = index_renames(source)["shop.account"]["currency"]
+    legacy = converted_names((), index_renames(source)).legacy_indexes
+    before = _held_target(tables=["account"], indexes={"account": ["currency"]})
+    holder = f"the copy an earlier version made of index {renamed} on shop.account"
+    assert _find_target_blockers(source, before) == [("shop.currency", holder)]
+    advice = TargetNames(before, legacy_indexes=legacy).held_advice("shop.currency")
+    assert advice.startswith("Apply shop.account first") and 'DROP INDEX "shop"."currency"' in advice
+    # Once the renamed index is there, dropping the copy is the whole fix.
+    after = _held_target(tables=["account"], indexes={"account": ["currency", renamed]})
+    assert TargetNames(after, legacy_indexes=legacy).held_advice("shop.currency").startswith(
+        f"{renamed} is already there, so drop the copy"
+    )
+    # Any other holder: drop or rename it.
+    view = _held_target(views=["currency"])
+    assert TargetNames(view, legacy_indexes=legacy).held_advice("shop.currency") == (
+        "Drop or rename that object on the target, then apply."
+    )
+    assert "apply that index's table first" in BLOCKED_NAMES_ADVICE
+
+
+def test_the_preview_names_a_held_name_only_for_ddl_the_apply_runs() -> None:
+    from dsql_migrator.ui.schema_conversion import DdlPreview, _InventoryExistenceChecker, _with_held
+
+    checker = _InventoryExistenceChecker(_held_target(tables=["v_ok"]), view_names=["shop.v_ok"])
+    applied = _with_held(
+        DdlPreview(object_name="shop.v_ok", source_ddl="", target_ddl='CREATE VIEW "shop"."v_ok" AS SELECT 1'),
+        checker,
+    )
+    assert applied.held_on_target == "a table"
+    assert applied.held_advice == "Drop or rename that object on the target, then apply."
+    placeholder = _with_held(
+        DdlPreview(object_name="shop.v_ok", source_ddl="", target_ddl="-- reimplement this view manually"),
+        checker,
+    )
+    assert placeholder.held_on_target is None
+
+
+def test_the_replace_list_leaves_out_placeholders_the_apply_never_drops() -> None:
+    from dsql_migrator.core.target_introspector import pg_stored_name
+    from dsql_migrator.ui.schema_conversion import _InventoryExistenceChecker, _existing_object_names
+
+    long = "t" * 70
+    source = SourceInventory(tables=[_table(f"shop.{long}a"), _table(f"shop.{long}b"), _table("shop.ok")])
+    checker = _InventoryExistenceChecker(_held_target(tables=[pg_stored_name(long + "a"), "ok"]))
+    assert _existing_object_names(source, checker) == ["shop.ok"]
+
+
+def test_the_preview_names_the_old_view_copy_even_when_the_view_exists(monkeypatch) -> None:
+    """An upgraded target holds both the quoted view and its old lower-case copy; the
+    old-copy notice was an ``elif`` after "already exists", so it never showed there."""
+    from dsql_migrator.ui import schema_conversion as sc
+
+    headers: list[str] = []
+    monkeypatch.setattr(sc, "render_notice", lambda _ui, **kw: headers.append(kw["header"]))
+
+    class _El:
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Ui:
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: _El()
+
+    preview = sc.DdlPreview(
+        object_name="shop.V_Orders",
+        source_ddl="CREATE VIEW V_Orders AS SELECT 1",
+        target_ddl='CREATE VIEW "shop"."V_Orders" AS SELECT 1',
+        exists_on_target=True,
+        old_copy_on_target="shop.v_orders",
+    )
+    sc._render_preview(_Ui(), preview, sc.SchemaConversionState(), lambda: None)
+    assert "Object already exists on target" in headers
+    assert "An earlier version's copy of this view is on the target" in headers

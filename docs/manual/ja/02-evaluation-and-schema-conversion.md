@@ -407,7 +407,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 > `STORED` 生成カラムの式は再出力され(Aurora DSQL がサポート・維持するため)、`VIRTUAL` 生成カラムは通常の
 > カラムになります。
 >
-> **MySQL** の生成カラムは通常のカラムとして作成されます (ツールは式を読みません)。Full Load は計算済みの値をコピーし、CDC は `STORED` カラムの値を運びます。式 (`GENERATED ALWAYS AS (...) STORED`) を Schema Conversion で再追加できるのは **Full load only** の移行だけです。CDC はすべてのカラムの値を送るため、そうするとすべての insert と update が拒否されます (SQLSTATE `428C9`)。
+> **MySQL** の生成カラムは通常のカラムとして作成されます (ツールは式を読みません)。Full Load は計算済みの値をコピーし、CDC は `STORED` カラムの値を運びます。式 (`GENERATED ALWAYS AS (...) STORED`) を Schema Conversion で再追加できるのは **Full load only** の移行だけです。CDC はすべてのカラムの値を送るため、そうするとすべての insert と update が拒否されます (SQLSTATE `428C9`)。主キーに含まれる生成カラムはその場合も通常のカラムのままにします。Full Load はすべてのキーカラムを書き込むため、`GENERATED` のキーカラムではすべてのバッチが拒否されます。
 
 ### 型マッピング (完全なリファレンス)
 

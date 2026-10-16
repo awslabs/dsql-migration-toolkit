@@ -485,7 +485,9 @@ shared "write contract" keeps them identical).
 > expression): Full Load copies the computed value, and CDC carries a `STORED` one's value. You
 > can re-add the expression (`GENERATED ALWAYS AS (...) STORED`) in Schema Conversion for a
 > **Full load only** migration — never with CDC, which sends every column's value and so would
-> have every insert and update rejected (SQLSTATE `428C9`).
+> have every insert and update rejected (SQLSTATE `428C9`). A generated column that is part of
+> the primary key stays ordinary even then: Full Load writes every key column, so a `GENERATED`
+> key column would have every batch rejected.
 
 ### Type mapping (complete reference)
 

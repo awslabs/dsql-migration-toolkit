@@ -490,6 +490,9 @@ class DdlPreview:
     # What another kind of object holding this name on the target is ("a view", "an index
     # on s.t"): neither apply mode can create the object until it is dropped.
     held_on_target: Optional[str] = None
+    # What to do about it (the order Schema Apply gives; an earlier version's index copy
+    # goes only after its table is applied).
+    held_advice: Optional[str] = None
     # A view's lower-case copy an earlier version left on the target (SKIP creates the
     # quoted view beside it; REPLACE drops it).
     old_copy_on_target: Optional[str] = None
@@ -963,11 +966,11 @@ def preview_for_selection(
         if table is None or conversion is None:
             return None
         exists = _check_exists(existence_checker, name)
-        return replace(
+        return _with_held(
             build_table_preview(
                 table, conversion, exists_on_target=exists, source_type=source_type
             ),
-            held_on_target=_check_held(existence_checker, name),
+            existence_checker,
         )
 
     if node_id.startswith(VIEW_PREFIX):
@@ -978,10 +981,12 @@ def preview_for_selection(
         conversion = _find_view_conversion(result, name)
         exists = _check_exists(existence_checker, name)
         return replace(
-            build_view_preview(
-                view, conversion, exists_on_target=exists, source_type=source_type
+            _with_held(
+                build_view_preview(
+                    view, conversion, exists_on_target=exists, source_type=source_type
+                ),
+                existence_checker,
             ),
-            held_on_target=_check_held(existence_checker, name),
             old_copy_on_target=_check_old_copy(existence_checker, name),
         )
 
@@ -1003,6 +1008,26 @@ def _check_held(
     """What another kind of object holding ``name`` is, if the checker can tell."""
     blocked_by = getattr(existence_checker, "blocked_by", None)
     return blocked_by(name) if callable(blocked_by) else None
+
+
+def _with_held(
+    preview: DdlPreview, existence_checker: Optional[TargetExistenceChecker]
+) -> DdlPreview:
+    """``preview`` with what holds its name on the target and what to do about it -- only
+    when Schema Apply would create the object: a placeholder (a name-collision table, a
+    view that is not converted) is never created, so freeing its name achieves nothing,
+    or drops the table the operator built to replace a materialized view."""
+    if not _is_applicable_target_ddl(preview.target_ddl):
+        return preview
+    held = _check_held(existence_checker, preview.object_name)
+    if held is None:
+        return preview
+    advice = getattr(existence_checker, "held_advice", None)
+    return replace(
+        preview,
+        held_on_target=held,
+        held_advice=advice(preview.object_name) if callable(advice) else None,
+    )
 
 
 def _check_old_copy(
@@ -1956,6 +1981,8 @@ def build_schema_conversion_screen(
         object_name: str,
         on_replace: Callable[[], object],
         on_skip: Callable[[], object],
+        *,
+        old_copy: Optional[str] = None,
     ) -> None:
         """Open the action-time REPLACE/SKIP choice dialog for one existing object.
 
@@ -1980,8 +2007,14 @@ def build_schema_conversion_screen(
                 )
                 ui.label(
                     "Choose how to apply it. Replace drops and recreates the object "
-                    "(destructive — any data in it is lost); Skip leaves the existing "
-                    "object unchanged."
+                    "(destructive — any data in it is lost)"
+                    + (
+                        f" and also drops {old_copy}, the lower-case copy an earlier "
+                        "version left"
+                        if old_copy
+                        else ""
+                    )
+                    + "; Skip leaves the existing object unchanged."
                 ).classes("text-sm text-gray-600")
                 with ui.row().classes("justify-end gap-2 w-full"):
                     ui.button("Cancel", on_click=dialog.close).props("flat")
@@ -2310,9 +2343,12 @@ def build_schema_conversion_screen(
                 if _inv is not None
                 else []
             )
+            # A REPLACE of a view also drops the lower-case copy an earlier version left.
+            _copy = _check_old_copy(existence_checker, object_name)
             _open_replace_dialog(
                 replace_confirmation_message(
-                    [object_name] if exists else [],
+                    ([object_name] if exists else [])
+                    + ([f"{_copy} (the old copy of {object_name})"] if _copy else []),
                     _foreign_keys_to_predrop(_one) if _one else (),
                 ),
                 _confirmed,
@@ -2346,7 +2382,12 @@ def build_schema_conversion_screen(
 
                 return _run()
 
-            _open_conflict_dialog(object_name, _on_replace, _on_skip)
+            _open_conflict_dialog(
+                object_name,
+                _on_replace,
+                _on_skip,
+                old_copy=_check_old_copy(existence_checker, object_name),
+            )
             return
         # Object does not exist yet: a plain CREATE, no conflict to resolve.
         await apply_object_inline(object_name)
@@ -2511,8 +2552,14 @@ def build_schema_conversion_screen(
             ):
                 # Keyed on the source inventory too: which names are views decides the
                 # kind a target object must have to count.
+                from dsql_migrator.core.schema_applier import converted_names
+
                 existence_checker = _InventoryExistenceChecker(
-                    target_inventory, view_names=[view.name for view in inventory.views]
+                    target_inventory,
+                    view_names=[view.name for view in inventory.views],
+                    legacy_indexes=converted_names(
+                        (), get_conversion().index_renames
+                    ).legacy_indexes,
                 )
                 _derived_checker_state["snapshot"] = target_inventory
                 _derived_checker_state["inventory"] = inventory
@@ -4142,7 +4189,8 @@ def _render_preview(
                 f"'{preview.object_name}' cannot be created in either apply mode: its name "
                 f"is held on the target by {preview.held_on_target} (Aurora DSQL keeps a "
                 "schema's tables, views and indexes in one namespace; an earlier apply may "
-                "have left it). Drop or rename that object on the target, then apply."
+                "have left it). "
+                + (preview.held_advice or "Drop or rename that object on the target, then apply.")
             ),
         )
     elif preview.exists_on_target is True and not is_name_collision_placeholder(
@@ -4157,7 +4205,9 @@ def _render_preview(
                 "SKIP to keep it or REPLACE (destructive) to recreate it."
             ),
         )
-    elif preview.old_copy_on_target is not None:
+    if preview.old_copy_on_target is not None:
+        # Not an ``elif``: an upgraded target usually holds both the quoted view and the
+        # old copy, and a REPLACE drops the copy too.
         render_notice(
             ui,
             tone="info",
@@ -5154,10 +5204,20 @@ class _InventoryExistenceChecker:
     confirmed REPLACE then dropped.
     """
 
-    def __init__(self, target_inventory: object, *, view_names: "Sequence[str]" = ()) -> None:
+    def __init__(
+        self,
+        target_inventory: object,
+        *,
+        view_names: "Sequence[str]" = (),
+        legacy_indexes: "Optional[Mapping]" = None,
+    ) -> None:
         from dsql_migrator.core.target_introspector import TargetNames
 
-        self._names = TargetNames(target_inventory, views=view_names)  # type: ignore[arg-type]
+        self._names = TargetNames(
+            target_inventory,  # type: ignore[arg-type]
+            views=view_names,
+            legacy_indexes=legacy_indexes,
+        )
 
     def object_exists(self, object_name: str) -> bool:
         return self._names.exists(object_name)
@@ -5165,6 +5225,10 @@ class _InventoryExistenceChecker:
     def blocked_by(self, object_name: str) -> Optional[str]:
         """What another kind of object holding the name is (both apply modes refuse it)."""
         return self._names.blocked_by(object_name)
+
+    def held_advice(self, object_name: str) -> Optional[str]:
+        """What to do about that object, in the order Schema Apply gives."""
+        return self._names.held_advice(object_name)
 
     def old_view_copy(self, object_name: str) -> Optional[str]:
         """The lower-case copy of a view an earlier version left (a REPLACE drops it)."""
@@ -5182,12 +5246,17 @@ def _existing_object_names(
     """
     if existence_checker is None:
         return []
+    from dsql_migrator.core.converter import relation_clash_names
+
+    # A name-collision placeholder is never applied, so a REPLACE never drops what holds
+    # its name: listing it would name a table the confirmed REPLACE leaves alone.
+    clashing = relation_clash_names(inventory)
     names: list[str] = []
     for table in inventory.tables:
-        if existence_checker.object_exists(table.name):
+        if table.name not in clashing and existence_checker.object_exists(table.name):
             names.append(table.name)
     for view in inventory.views:
-        if existence_checker.object_exists(view.name):
+        if view.name not in clashing and existence_checker.object_exists(view.name):
             names.append(view.name)
     return names
 

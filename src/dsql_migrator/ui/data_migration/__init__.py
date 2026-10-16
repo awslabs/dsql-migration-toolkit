@@ -739,6 +739,10 @@ def build_data_migration_screen(
             0.8, lambda: _exclusion_ctx.refresh(), once=True
         )
 
+    # The FK card's total, kept across renders: computing it converts the whole inventory
+    # (seconds at a thousand tables), and the Full Load poll re-renders every 1.5 s.
+    _fk_count_memo: dict = {}
+
     def _assessment():
         """The Step 1 (Evaluation) compatibility report, or None if it hasn't run."""
         result = eval_state.result
@@ -2462,10 +2466,24 @@ def build_data_migration_screen(
                 clears the result, so that screen was terminal. The renderer decides what to
                 SHOW; this only reports the denominator.
                 """
+                # Recomputed only when what it is derived from changes (the inventory is
+                # compared by identity: a re-read is a new object).
+                _key = (
+                    session_source_type(session),
+                    conv_state.preserve_foreign_keys,
+                    tuple(sorted((conv_state.edited_target_ddls or {}).items())),
+                    tuple(getattr(migration_state.selection, "selected_tables", None) or ()),
+                    migration_state.migration_type,
+                )
+                _inv = _inventory()
+                if _fk_count_memo.get("inventory") is _inv and _fk_count_memo.get("key") == _key:
+                    return _fk_count_memo["count"]
                 try:
-                    return pending_foreign_key_count(migrator_factory(_fk_apply_inputs()))
+                    count = pending_foreign_key_count(migrator_factory(_fk_apply_inputs()))
                 except Exception:  # noqa: BLE001 - advisory count; never break the panel
                     return 0
+                _fk_count_memo.update(inventory=_inv, key=_key, count=count)
+                return count
 
             def cancel_foreign_keys() -> None:
                 """Stop the FK pass. Already-applied constraints stay; the rest remain

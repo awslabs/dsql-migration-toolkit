@@ -318,9 +318,12 @@ def with_refreshed_catalogs(
         inventory, target_inventory=target_inventory
     )
     # The source-privilege finding comes from the run's own probe of the source, not from
-    # the inventory, so a re-assessment keeps it (re-run Step 1 to probe again).
+    # the inventory, so a re-assessment keeps it (re-run Step 1 to probe again) -- unless
+    # the re-read is of another engine, which that probe never looked at.
     kept = [
-        item for item in result.assessment.items if item.rule_id == SOURCE_VISIBILITY_RULE_ID
+        item
+        for item in result.assessment.items
+        if item.rule_id == SOURCE_VISIBILITY_RULE_ID and engine == result.source_type
     ]
     if kept:
         assessment = AssessmentReport.from_items([*assessment.items, *kept])
@@ -368,19 +371,40 @@ def _find_target_conflicts(
 
 
 def _find_target_blockers(
-    source: SourceInventory, target: TargetInventory
+    source: SourceInventory, target: TargetInventory, *, is_postgres: bool = False
 ) -> "list[tuple[str, str]]":
     """``(source table/view, what holds its name)`` where ANOTHER kind of object (a view
     where a table goes, an index) holds the name on the target: Schema Apply refuses those
-    in both modes. Computed at render from the browsed catalog (nothing new persisted)."""
-    from dsql_migrator.core.target_introspector import relations_blocked_on_target
+    in both modes. Computed at render from the browsed catalog (nothing new persisted).
 
-    view_names = [view.name for view in source.views]
-    return relations_blocked_on_target(
-        [table.name for table in source.tables] + view_names,
+    Only for what Schema Apply creates: a name-collision placeholder table, a view whose
+    definition was not read, and a PostgreSQL materialized view or foreign table never
+    are, so freeing their name achieves nothing -- or drops the very table the operator
+    built to replace a materialized view."""
+    from dsql_migrator.core.converter import index_renames, relation_clash_names
+    from dsql_migrator.core.schema_applier import converted_names
+    from dsql_migrator.core.target_introspector import TargetNames
+
+    clashing = relation_clash_names(source)
+    created = [table.name for table in source.tables if table.name not in clashing] + [
+        view.name
+        for view in source.views
+        if view.name not in clashing and view.definition and not view.unsupported_kind
+    ]
+    names = TargetNames(
         target,
-        views=view_names,
+        views=[view.name for view in source.views],
+        legacy_indexes=converted_names(
+            (), index_renames(source, is_postgres=is_postgres)
+        ).legacy_indexes,
     )
+    blocked: list[tuple[str, str]] = []
+    for name in created:
+        holder = names.blocked_by(name)
+        if holder is not None:
+            blocked.append((name, holder))
+    return blocked
+
 
 
 @dataclass(frozen=True)
@@ -988,6 +1012,7 @@ def _listing_databases(
     for name in (
         *(t.name for t in inventory.tables),
         *(v.name for v in inventory.views),
+        *(o.name for o in (*inventory.routines, *inventory.events, *inventory.triggers)),
     ):
         database = name.partition(".")[0] if "." in name else ""
         if database and database not in names:
@@ -1150,7 +1175,11 @@ def assessment_download(result: EvaluationResult, fmt: str = "json") -> ReportDo
             source_type=result.source_type,
             # The screen's "Names held on the target by another object" list: without it
             # the export printed the all-clear over objects neither apply mode can create.
-            blocked=_find_target_blockers(result.inventory, result.target_inventory),
+            blocked=_find_target_blockers(
+                result.inventory,
+                result.target_inventory,
+                is_postgres=result.source_type is SourceType.POSTGRES,
+            ),
             target_endpoint=result.target_endpoint,
         )
     else:
@@ -1174,6 +1203,9 @@ class EvaluationState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.job_id: Optional[str] = None
+        # The run token of the job in ``job_id``: a poll or a cancel retires THAT run,
+        # never whichever run happens to be current.
+        self.job_token: Optional[int] = None
         # The current run's token (0: none). A worker writes only while its token is
         # current: Start over re-inits this object, and a stopped or reaped run is
         # retired, so a superseded worker can no longer overwrite the result.
@@ -1404,6 +1436,22 @@ def build_evaluation_screen(
         )
 
         def work(_handle: object) -> None:
+            def _settle_from_worker(*, cancelled: bool, error: str) -> None:
+                # A failed or stopped run is settled here too, not only by the screen's
+                # poll: with the operator on another step the step stayed IN_PROGRESS and
+                # Schema Conversion stayed locked. Only while this is still the session's
+                # job (Start over or a newer run has moved on); the poll's settle repeats it.
+                if eval_state.job_id != getattr(_handle, "job_id", None):
+                    return
+                eval_state.retire_run(token)
+                session.set_workflow(
+                    with_status(
+                        session.workflow,
+                        WorkflowStep.EVALUATION,
+                        _settle_unfinished_run(eval_state, cancelled=cancelled, error=error),
+                    )
+                )
+
             def _progress(pct: int, message: str) -> None:
                 # Source introspection + assessment + target browse were ONE silent span,
                 # so a very large schema's evaluation was reaped by the job watchdog and
@@ -1411,7 +1459,12 @@ def build_evaluation_screen(
                 # message -- for a read-only step -- which then blocks the journey's
                 # step-order gate. A reported phase (and each source table) is a real
                 # unit boundary, and where a cancel takes effect.
-                if getattr(_handle, "cancelled", False):
+                if getattr(_handle, "cancelled", False) or not eval_state.is_current(token):
+                    raise EvaluationStopped()
+                snapshot = getattr(_handle, "snapshot", None)
+                if callable(snapshot) and snapshot().status != "RUNNING":
+                    # Reaped by the stall watchdog (FAILED): it cannot be cancelled any
+                    # more, and its result would be thrown away -- stop reading.
                     raise EvaluationStopped()
                 beat = getattr(_handle, "heartbeat", None)
                 if callable(beat):
@@ -1442,7 +1495,19 @@ def build_evaluation_screen(
                     ActivityCategory.ASSESSMENT,
                     "run assessment",
                     status=ActivityStatus.INFO,
-                    detail="cancelled by the operator; read only, so nothing was changed",
+                    detail="stopped (cancelled, superseded or reaped); read only, so nothing was changed",
+                )
+                # Reaped by the watchdog (FAILED, with its stall message) is a failure,
+                # not a cancel.
+                _snapshot = getattr(_handle, "snapshot", None)
+                _reaped = callable(_snapshot) and _snapshot().status == "FAILED"
+                _settle_from_worker(
+                    cancelled=not _reaped,
+                    error=(
+                        (job_manager.get_error(_handle.job_id) or "Evaluation failed.")  # type: ignore[attr-defined]
+                        if _reaped
+                        else ""
+                    ),
                 )
                 return  # the job ends CANCELLED (its cancel was requested)
             except Exception as exc:  # noqa: BLE001 - re-raised; job marks FAILED
@@ -1461,6 +1526,15 @@ def build_evaluation_screen(
                         text=f"Compatibility assessment failed ({type(exc).__name__})",
                         status="error",
                     )
+                _first = str(exc).strip().splitlines()
+                _settle_from_worker(
+                    cancelled=False,
+                    error=(
+                        f"{type(exc).__name__}: {_first[0].strip()[:300]}"
+                        if _first
+                        else type(exc).__name__
+                    ),
+                )
                 raise
             if not eval_state.set_result(result, token=token):
                 # Superseded (Start over, or a cancelled/reaped run that came back late):
@@ -1507,6 +1581,7 @@ def build_evaluation_screen(
                     },
                 )
 
+        eval_state.job_token = token
         eval_state.job_id = job_manager.submit(
             work, stall_message=EVALUATION_STALL_MESSAGE
         )
@@ -1548,6 +1623,9 @@ def build_evaluation_screen(
                 detail="operator cancelled the evaluation; it stops after the table being read",
             )
             job_manager.request_cancel(job_id)
+            # Retired at once: a result the run produces after its last stop point is not
+            # recorded, so "cancelled; the previous assessment is kept" stays true.
+            eval_state.retire_run(eval_state.job_token)
             eval_state.cancel_requested = True
             refresh()
 
@@ -1761,6 +1839,7 @@ def _install_poll_timer(
     job_id = eval_state.job_id
     if job_id is None:
         return
+    job_token = eval_state.job_token
 
     def _update_progress() -> None:
         pct = eval_state.progress_pct
@@ -1782,6 +1861,11 @@ def _install_poll_timer(
             progress_bar.set_value(pct / 100)  # type: ignore[attr-defined]
 
     def poll() -> None:
+        if eval_state.job_id != job_id:
+            # A leftover poll (another tab, a reconnecting client) for a job the session
+            # has moved past: it must not settle -- or retire -- the current run.
+            refresh()
+            return
         _update_progress()
         try:
             job = job_manager.get_status(job_id)
@@ -1792,8 +1876,8 @@ def _install_poll_timer(
             return
         if job.status in ("FAILED", "CANCELLED"):
             # The worker has failed, been cancelled or been reaped by the watchdog (it may
-            # still return later): retire its token so nothing it writes lands now.
-            eval_state.retire_run()
+            # still return later): retire ITS token so nothing it writes lands now.
+            eval_state.retire_run(job_token)
             mapped = _settle_unfinished_run(
                 eval_state,
                 cancelled=job.status == "CANCELLED",
@@ -2623,17 +2707,21 @@ def _render_target(
             "Resolve these in Schema Conversion: choose SKIP (keep the existing "
             "object) or REPLACE (recreate it) when you apply."
         ).classes("text-xs text-gray-500")
-    blocked = _find_target_blockers(result.inventory, target)
+    blocked = _find_target_blockers(
+        result.inventory, target, is_postgres=result.source_type is SourceType.POSTGRES
+    )
     if blocked:
+        from dsql_migrator.core.target_introspector import BLOCKED_NAMES_ADVICE
+
         render_notice(
             ui,
             tone="error",
             header="Names held on the target by another object",
             body=(
                 f"{len(blocked)} source object(s) cannot be created in either apply mode "
-                "until the object holding the name is dropped or renamed on the target "
-                "(Aurora DSQL keeps a schema's tables, views and indexes in one namespace; "
-                "an earlier apply may have left it):"
+                "while another object holds the name on the target (Aurora DSQL keeps a "
+                "schema's tables, views and indexes in one namespace; an earlier apply may "
+                f"have left it). {BLOCKED_NAMES_ADVICE}"
             ),
         )
         with ui.row().classes("items-center gap-1 flex-wrap"):  # type: ignore[attr-defined]

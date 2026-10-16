@@ -350,9 +350,16 @@ def build_page(
                 _conf = len(_res.target_conflicts or [])
                 if _conf:
                     _line += f", {_conf} target conflict(s)"
+                from dsql_migrator.core.models import SourceType as _SourceType
                 from dsql_migrator.ui.evaluation import _find_target_blockers
 
-                _held = len(_find_target_blockers(_res.inventory, _res.target_inventory))
+                _held = len(
+                    _find_target_blockers(
+                        _res.inventory,
+                        _res.target_inventory,
+                        is_postgres=_res.source_type is _SourceType.POSTGRES,
+                    )
+                )
                 if _held:
                     _line += f", {_held} name(s) held on the target by another object"
                 facts.append(_line)

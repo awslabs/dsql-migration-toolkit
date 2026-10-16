@@ -197,7 +197,8 @@ class MySQLSourceDialect(SourceDialect):
         # and a routine only with SHOW_ROUTINE (or global SELECT, or a routine privilege),
         # and a view's body needs SHOW VIEW (that one is graded per view, from the empty
         # definition). The privileges of the session's ACTIVE roles count, so they are
-        # expanded with USING; when they cannot be, nothing is claimed.
+        # expanded with USING; when they cannot be, nothing is claimed. How the grants'
+        # database names match follows the server (case folding, partial revokes).
         from sqlalchemy import text
 
         try:
@@ -211,7 +212,12 @@ class MySQLSourceDialect(SourceDialect):
             rows = connection.execute(text(statement)).fetchall()  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - unknown: claim nothing
             return []
-        return mysql_listing_gaps([str(row[0]) for row in rows if row], databases)
+        return mysql_listing_gaps(
+            [str(row[0]) for row in rows if row],
+            databases,
+            case_insensitive=probe_scalar(connection, "SELECT @@lower_case_table_names") not in (None, "0"),
+            partial_revokes=probe_scalar(connection, "SELECT @@partial_revokes") in ("1", "ON"),
+        )
 
     @property
     def engine_display_name(self) -> str:
@@ -254,9 +260,13 @@ class MySQLSourceDialect(SourceDialect):
 __all__ = ["MySQLSourceDialect"]
 
 
+# One scope part: a backtick-quoted name (spaces, dots and doubled backticks allowed)
+# or a bare one.
+_SCOPE_PART = r"(?:`(?:[^`]|``)*`|[^.\s`]+)"
 _GRANT_LINE = re.compile(
-    r"^GRANT\s+(?P<privs>.+?)\s+ON\s+(?:(?:TABLE|FUNCTION|PROCEDURE)\s+)?(?P<scope>\S+)\s+TO\s",
-    re.IGNORECASE,
+    r"^(?P<verb>GRANT|REVOKE)\s+(?P<privs>.+?)\s+ON\s+(?:(?:TABLE|FUNCTION|PROCEDURE)\s+)?"
+    rf"(?P<db>{_SCOPE_PART})\.(?P<obj>{_SCOPE_PART})\s+(?:TO|FROM)\s",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -278,8 +288,13 @@ def _split_privileges(text: str) -> list[str]:
     return [" ".join(p.split()).upper() for p in privileges if p.strip()]
 
 
-def _like(pattern: str, name: str) -> bool:
-    """MySQL's grant-scope match: ``%`` and ``_`` wildcards, ``\\`` escapes."""
+def _unquote_scope(part: str) -> str:
+    return part[1:-1].replace("``", "`") if part.startswith("`") else part
+
+
+def _like(pattern: str, name: str, *, literal: bool = False) -> bool:
+    """MySQL's grant-scope match: ``%`` and ``_`` wildcards, ``\\`` escapes. With
+    ``literal`` (``partial_revokes`` on) both wildcards are plain characters."""
     out, escaped = [], False
     for char in pattern:
         if escaped:
@@ -287,26 +302,63 @@ def _like(pattern: str, name: str) -> bool:
             escaped = False
         elif char == "\\":
             escaped = True
-        elif char == "%":
+        elif char == "%" and not literal:
             out.append(".*")
-        elif char == "_":
+        elif char == "_" and not literal:
             out.append(".")
         else:
             out.append(re.escape(char))
-    return re.fullmatch("".join(out), name) is not None
+    return re.fullmatch("".join(out), name, re.DOTALL) is not None
 
 
-def mysql_listing_gaps(grant_lines: "list[str]", databases) -> list[str]:
+def _scope_rank(pattern: str, *, literal: bool = False) -> int:
+    """How specific a database-level grant is, as MySQL ranks them (``get_sort``): an
+    exact name (128) outranks every pattern, and a pattern whose first wildcard comes
+    later outranks one whose comes earlier (a lone ``%`` is the least specific)."""
+    if literal:
+        return 128
+    i = 0
+    while i < len(pattern):
+        if pattern[i] == "\\" and i + 1 < len(pattern):
+            i += 2
+            continue
+        if pattern[i] in "%_":
+            return 1 if pattern == "%" else min(i + 2, 127)
+        i += 1
+    return 128
+
+
+def mysql_listing_gaps(
+    grant_lines: "list[str]",
+    databases,
+    *,
+    case_insensitive: bool = False,
+    partial_revokes: bool = False,
+) -> list[str]:
     """The object kinds a MySQL user with ``grant_lines`` cannot list completely, in
     ``databases``: one human line per kind naming the databases and the privilege. Pure.
 
     ``grant_lines`` are the SESSION's: direct grants plus those of its active roles
     (``SHOW GRANTS ... USING``); a role that is granted but not active gives the session
     nothing, so its membership line (``GRANT `r`@`%` TO ...``, no ``ON``) is ignored. ``[]``
-    when the grants are unknown (none read)."""
+    when the grants are unknown (none read).
+
+    MySQL's own rules decide what is held in a database: a global privilege counts unless
+    a partial revoke (``REVOKE ... ON db.*``) takes it back there, and of the
+    database-level grants only the most specific matching one applies -- they are not
+    added up. When several patterns tie for most specific, which one MySQL picks is not
+    observable (and active roles add them up instead), so only what they all grant is
+    counted: an unsure answer names the gap rather than hiding it. ``case_insensitive``
+    is ``lower_case_table_names`` != 0; ``partial_revokes`` makes ``%`` and ``_`` in a
+    grant's database name plain characters, as MySQL then does."""
     if not grant_lines:
         return []
+
+    def fold(name: str) -> str:
+        return name.lower() if case_insensitive else name
+
     global_privs: set[str] = set()
+    revoked: dict[str, set[str]] = {}
     schema_privs: dict[str, set[str]] = {}
     for line in grant_lines:
         match = _GRANT_LINE.match(line.strip())
@@ -315,24 +367,42 @@ def mysql_listing_gaps(grant_lines: "list[str]", databases) -> list[str]:
         privileges = set(_split_privileges(match.group("privs")))
         if "ALL" in privileges:
             privileges.add("ALL PRIVILEGES")
-        scope = match.group("scope")
-        if scope in ("*.*", "`*`.*"):
-            global_privs |= privileges
-            continue
-        db, _, obj = scope.partition(".")
-        if obj != "*":
+        if match.group("obj") != "*":
             continue  # table, column or routine level: not a whole database
-        schema_privs.setdefault(db.strip("`'\""), set()).update(privileges)
+        is_global = match.group("db") == "*"
+        db = fold(_unquote_scope(match.group("db")))
+        if match.group("verb").upper() == "REVOKE":
+            if not is_global:  # a partial revoke of a global privilege
+                revoked.setdefault(db, set()).update(privileges)
+            continue
+        if is_global:
+            global_privs |= privileges
+        else:
+            schema_privs.setdefault(db, set()).update(privileges)
 
-    def held(database: str, wanted: "set[str]") -> bool:
-        if global_privs & (wanted | {"ALL PRIVILEGES"}):
-            return True
-        return any(
-            _like(pattern, database) and privileges & (wanted | {"ALL PRIVILEGES"})
+    def schema_grant(database: str) -> "set[str]":
+        name = fold(database)
+        ranked = [
+            (_scope_rank(pattern, literal=partial_revokes), privileges)
             for pattern, privileges in schema_privs.items()
-        )
+            if _like(pattern, name, literal=partial_revokes)
+        ]
+        if not ranked:
+            return set()
+        top = max(rank for rank, _ in ranked)
+        tied = [privileges for rank, privileges in ranked if rank == top]
+        narrower = [privileges for privileges in tied if "ALL PRIVILEGES" not in privileges]
+        return set.intersection(*narrower) if narrower else {"ALL PRIVILEGES"}
 
-    routine_global = {"SHOW_ROUTINE", "SELECT", "CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE"}
+    def held(database: str, wanted: "set[str]", global_only: "set[str]") -> bool:
+        taken_back = revoked.get(fold(database), set())
+        for privilege in wanted | global_only:
+            if (privilege in global_privs or "ALL PRIVILEGES" in global_privs) and not (
+                privilege in taken_back or "ALL PRIVILEGES" in taken_back
+            ):
+                return True
+        return bool(schema_grant(database) & (wanted | {"ALL PRIVILEGES"}))
+
     checks = (
         ("triggers", "TRIGGER", {"TRIGGER"}, set()),
         ("scheduled events", "EVENT", {"EVENT"}, set()),
@@ -340,14 +410,12 @@ def mysql_listing_gaps(grant_lines: "list[str]", databases) -> list[str]:
             "stored procedures and functions",
             "SHOW_ROUTINE (or SELECT on *.*)",
             {"CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE"},
-            routine_global,
+            {"SHOW_ROUTINE", "SELECT"},
         ),
     )
     gaps: list[str] = []
     for label, needs, schema_level, global_level in checks:
-        if global_level and global_privs & (global_level | {"ALL PRIVILEGES"}):
-            continue
-        missing = [db for db in databases if not held(db, schema_level)]
+        missing = [db for db in databases if not held(db, schema_level, global_level)]
         if missing:
             shown = ", ".join(missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
             gaps.append(f"{label} in {shown} (needs {needs})")

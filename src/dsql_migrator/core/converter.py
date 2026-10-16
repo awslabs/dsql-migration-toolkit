@@ -3211,6 +3211,28 @@ MYSQL_GENERATED_COLUMN_ADVICE = (
 )
 
 
+def mysql_generated_column_advice(table: TableDef) -> str:
+    """What to do about ``table``'s MySQL generated columns: Evaluation's recommendation,
+    which the conversion note carries too. A generated column in the primary key must stay
+    ordinary -- Full Load cannot leave a key column out of its INSERT, so re-adding the
+    expression there would fail every batch (``pg_preserved_generated_columns`` drops the
+    clause from a PostgreSQL key column for the same reason)."""
+    primary_key = set(table.primary_key or [])
+    generated = [c.name for c in table.columns if c.generated]
+    keyed = [name for name in generated if name in primary_key]
+    if not keyed:
+        return MYSQL_GENERATED_COLUMN_ADVICE
+    key_advice = (
+        f"Keep {', '.join(keyed)} ordinary, even for a Full load only migration: "
+        f"{'it is' if len(keyed) == 1 else 'they are'} part of the primary key, and Full "
+        "Load writes every key column, so a GENERATED one would have every batch rejected "
+        "(SQLSTATE 428C9)."
+    )
+    if len(keyed) == len(generated):
+        return f"Compute the value in the application after cut over. {key_advice}"
+    return f"{MYSQL_GENERATED_COLUMN_ADVICE} {key_advice}"
+
+
 def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
     """Warn that a MySQL generated column becomes an ordinary column on the target.
 
@@ -3231,7 +3253,7 @@ def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
         object_name=table.name,
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
-        message=f"{detail} {MYSQL_GENERATED_COLUMN_ADVICE}",
+        message=f"{detail} {mysql_generated_column_advice(table)}",
     )
 
 

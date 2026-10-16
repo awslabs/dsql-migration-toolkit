@@ -1675,7 +1675,7 @@ class GeneratedColumnRule(Rule):
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         from dsql_migrator.core.converter import (
-            MYSQL_GENERATED_COLUMN_ADVICE,
+            mysql_generated_column_advice,
             mysql_generated_column_detail,
         )
 
@@ -1692,7 +1692,7 @@ class GeneratedColumnRule(Rule):
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
                         risk=detail,
-                        recommendation=MYSQL_GENERATED_COLUMN_ADVICE,
+                        recommendation=mysql_generated_column_advice(table),
                         effort=EffortLevel.MEDIUM,
                     )
                 )
@@ -1782,11 +1782,10 @@ class ViewDefinitionUnreadableRule(Rule):
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         causes = (
-            "the view may be invalid (a relation it reads was dropped), or the read was "
-            "blocked by a lock another session holds"
+            "the view may be invalid (a relation it reads was dropped)"
             if self._is_postgres
-            else "the migration user may lack the SHOW VIEW privilege on it, the view may "
-            "be invalid (a table it reads was dropped), or the read was blocked by a lock"
+            else "the migration user may lack the SHOW VIEW privilege on it, or the view "
+            "may be invalid (a table it reads was dropped)"
         )
         fix = (
             "Repair the view on the source"
@@ -2961,16 +2960,18 @@ def _render_target_html_section(
             "apply.</p>"
         )
     if blocked:
+        from dsql_migrator.core.target_introspector import BLOCKED_NAMES_ADVICE
+
         parts.append(
             f'<p class="warn">{len(blocked)} source object(s) cannot be created in either '
-            "apply mode until the object holding the name is dropped or renamed on the "
-            "target:</p>"
+            "apply mode while another object holds the name on the target:</p>"
         )
         chips = " ".join(
             f'<span class="conflict">{esc(name)}: {esc(holder)}</span>'
             for name, holder in blocked
         )
         parts.append(f"<p>{chips}</p>")
+        parts.append(f'<p class="muted">{esc(BLOCKED_NAMES_ADVICE)}</p>')
     if not conflicts and not blocked:
         parts.append(
             '<p class="muted">No source objects conflict with existing target '

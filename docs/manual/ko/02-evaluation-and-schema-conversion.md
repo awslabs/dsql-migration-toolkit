@@ -389,7 +389,7 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 > `STORED` 생성 컬럼의 식은 다시 출력됩니다(Aurora DSQL이 지원·유지하므로). `VIRTUAL` 생성 컬럼은 일반 컬럼이
 > 됩니다.
 >
-> **MySQL** 생성 컬럼은 일반 컬럼으로 만들어집니다(도구가 식을 읽지 않음). Full Load는 계산된 값을 복사하고, CDC는 `STORED` 컬럼의 값을 전달합니다. 식(`GENERATED ALWAYS AS (...) STORED`)은 **Full load only** 마이그레이션에서만 Schema Conversion에서 다시 추가할 수 있습니다. CDC는 모든 컬럼의 값을 보내므로, 그렇게 하면 모든 insert와 update가 거부됩니다(SQLSTATE `428C9`).
+> **MySQL** 생성 컬럼은 일반 컬럼으로 만들어집니다(도구가 식을 읽지 않음). Full Load는 계산된 값을 복사하고, CDC는 `STORED` 컬럼의 값을 전달합니다. 식(`GENERATED ALWAYS AS (...) STORED`)은 **Full load only** 마이그레이션에서만 Schema Conversion에서 다시 추가할 수 있습니다. CDC는 모든 컬럼의 값을 보내므로, 그렇게 하면 모든 insert와 update가 거부됩니다(SQLSTATE `428C9`). 기본 키에 속한 생성 컬럼은 이 경우에도 일반 컬럼으로 둡니다. Full Load는 모든 키 컬럼을 쓰므로 `GENERATED` 키 컬럼이면 모든 배치가 거부됩니다.
 
 ### 타입 매핑 (전체 참조)
 

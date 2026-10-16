@@ -2373,6 +2373,11 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
                 "'Drop & reload' after removing GENERATED from its target DDL in Schema "
                 "Conversion."
             )
+        else:
+            generated += (
+                " The inserts and updates set aside meanwhile are not replayed: correct them on "
+                f"Aurora DSQL by hand ({_DLQ_KEY_LISTED}), then run Validation (step 4)."
+            )
         parts.append(generated)
     if "key-change" in by_kind:
         rekeyed = _banner_rekeyed(sorted(by_kind["key-change"]), migration_state)
@@ -3228,7 +3233,9 @@ def _drift_ai_case(drift) -> str:
     from the SAME (open) groups it shows and passes those groups to :func:`_cdc_drift_facts`,
     so the seed, the tooltip and the facts can never disagree."""
     kinds = {getattr(g, "kind", "") for g in drift}
-    if not kinds or kinds - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS:
+    if kinds == {"generated-column"}:
+        return "generated"  # a target-side refusal with its own repair, no source change
+    if not kinds or kinds - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS - {"generated-column"}:
         return "ddl"
     if kinds & _TARGET_SIDE_DRIFT_KINDS:
         return "target-side"
@@ -3239,7 +3246,15 @@ def _drift_ai_case(drift) -> str:
     return "truncate-value-fit"
 
 
+_CDC_GENERATED_SEED = (
+    "CDC dead-lettered every insert and update for a table because its Aurora DSQL column is "
+    "GENERATED and the change records carry a value for it (SQLSTATE 428C9; not a source "
+    "schema change). Tell me how to make the column ordinary (ALTER TABLE ... ALTER COLUMN "
+    "... DROP EXPRESSION), how to restore the rows set aside, and whether I must stop CDC first."
+)
+
 _DRIFT_AI_SEED = {
+    "generated": _CDC_GENERATED_SEED,
     "ddl": _CDC_DRIFT_SEED,
     "value-fit": _CDC_VALUE_FIT_SEED,
     "target-side": _CDC_TARGET_SIDE_SEED,
@@ -3247,6 +3262,9 @@ _DRIFT_AI_SEED = {
     "truncate-value-fit": _CDC_TRUNCATE_VALUE_FIT_SEED,
 }
 _DRIFT_AI_TOOLTIP = {
+    "generated": (
+        "Ask AI DBA how to make the GENERATED column ordinary and restore the set-aside rows."
+    ),
     "ddl": "Ask AI DBA what DDL to apply and how to backfill the drifted rows.",
     "value-fit": (
         "Ask AI DBA how to give the column a type that holds these values and backfill the "
@@ -3261,6 +3279,10 @@ _DRIFT_AI_TOOLTIP = {
 }
 # The facts are "authoritative" to the model: each lead claims only what its banner claims.
 _DRIFT_AI_LEAD = {
+    "generated": (
+        "CDC dead-lettered every insert and update: a GENERATED Aurora DSQL column was sent a "
+        "value (SQLSTATE 428C9; not a source schema change):"
+    ),
     "ddl": "Source schema drift detected (CDC does not replicate DDL):",
     "value-fit": (
         "CDC set rows aside: a value does not fit its Aurora DSQL column (not necessarily a "
