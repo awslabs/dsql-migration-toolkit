@@ -717,14 +717,22 @@ def pg_read_row_security(connection: object, schemas: "list[str]") -> RowSecurit
         else None
     )
     policies: dict[str, list[RowSecurityPolicy]] = {}
+    # Only the policies of the tables found above: deparsing a policy (pg_get_expr) locks
+    # its table, so a dormant policy on a table without row-level security could hold the
+    # read up behind an unrelated ALTER TABLE. (The name filter can still match a
+    # same-named table in another listed schema; those rows are dropped below.)
+    wanted = {name for name, _row in found}
     for row in connection.execute(  # type: ignore[attr-defined]
         text(
             "SELECT schemaname AS nsp, tablename AS rel, policyname AS name, permissive, "
             "roles, cmd, qual, with_check FROM pg_policies "
-            "WHERE schemaname = ANY(:schemas) ORDER BY schemaname, tablename, policyname"
+            "WHERE schemaname = ANY(:schemas) AND tablename = ANY(:tables) "
+            "ORDER BY schemaname, tablename, policyname"
         ),
-        {"schemas": list(schemas)},
+        {"schemas": list(schemas), "tables": sorted({str(row["rel"]) for _n, row in found})},
     ).mappings():
+        if f"{row['nsp']}.{row['rel']}" not in wanted:
+            continue
         policies.setdefault(f"{row['nsp']}.{row['rel']}", []).append(
             RowSecurityPolicy(
                 name=str(row["name"]),
@@ -765,8 +773,12 @@ def pg_read_standalone_sequences(
     column DEFAULT, and Schema Conversion creates none of it. An extension's own sequence is
     left out like every other extension object.
 
-    ``last_value`` comes from ``pg_sequences``, which hides it (NULL) both when the sequence
-    was never used and when the user may not read it; ``readable`` tells the two apart.
+    ``last_value`` comes from ``pg_sequences``, which hides it (NULL) both when the user may
+    not read it (``readable`` tells) and when nothing has been drawn from the sequence since
+    it was created, RESTARTed or ``setval(..., false)``-ed. For that second case the value is
+    read from the sequence's own row (``SELECT last_value, is_called``, as pg_dump does; it
+    needs SELECT on the sequence): after ``RESTART WITH 5000`` the next value is 5000, and
+    taking it for "never used, starts at 1" would re-issue values the application had used.
     """
     if not schemas:
         return ()
@@ -789,21 +801,45 @@ def pg_read_standalone_sequences(
         ),
         {"schemas": list(schemas)},
     ).mappings()
-    return tuple(
-        StandaloneSequence(
-            name=f"{row['nsp']}.{row['name']}",
-            data_type=str(row["data_type"]),
-            start_value=int(row["start_value"]),
-            min_value=int(row["min_value"]),
-            max_value=int(row["max_value"]),
-            increment=int(row["increment_by"]),
-            cycle=bool(row["cycle"]),
-            cache_size=int(row["cache_size"]),
-            last_value=int(row["last_value"]) if row["last_value"] is not None else None,
-            readable=bool(row["readable"]),
+    sequences = []
+    for row in rows:
+        last_value = int(row["last_value"]) if row["last_value"] is not None else None
+        is_called: Optional[bool] = True if last_value is not None else None
+        if last_value is None and bool(row["readable"]):
+            last_value, is_called = _sequence_row(connection, row["nsp"], row["name"])
+        sequences.append(
+            StandaloneSequence(
+                name=f"{row['nsp']}.{row['name']}",
+                data_type=str(row["data_type"]),
+                start_value=int(row["start_value"]),
+                min_value=int(row["min_value"]),
+                max_value=int(row["max_value"]),
+                increment=int(row["increment_by"]),
+                cycle=bool(row["cycle"]),
+                cache_size=int(row["cache_size"]),
+                last_value=last_value,
+                readable=bool(row["readable"]),
+                is_called=is_called,
+            )
         )
-        for row in rows
-    )
+    return tuple(sequences)
+
+
+def _sequence_row(
+    connection: object, schema: str, name: str
+) -> "tuple[Optional[int], Optional[bool]]":
+    """``(last_value, is_called)`` from the sequence's own row, ``(None, None)`` when it
+    cannot be read (a user with USAGE but not SELECT on it). Read-only."""
+    quoted = ".".join('"' + part.replace('"', '""') + '"' for part in (schema, name))
+    try:
+        row = connection.execute(  # type: ignore[attr-defined]
+            text(f"SELECT last_value, is_called FROM {quoted}")
+        ).first()
+    except Exception:  # noqa: BLE001 - unreadable: the statement keeps its placeholder
+        return None, None
+    if row is None or row[0] is None:
+        return None, None
+    return int(row[0]), bool(row[1])
 
 
 class PostgresSourceDialect(SourceDialect):

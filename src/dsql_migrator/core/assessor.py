@@ -2047,6 +2047,9 @@ def source_visibility_items(gaps: "Sequence[str]") -> list[AssessmentItem]:
 PG_ROW_LEVEL_SECURITY_RULE_ID = "PG_ROW_LEVEL_SECURITY"
 PG_STANDALONE_SEQUENCE_RULE_ID = "PG_STANDALONE_SEQUENCE"
 PG_CATALOG_UNREAD_RULE_ID = "PG_CATALOG_UNREAD"
+# The note that the run's probe read the catalog at all: without it a report from before the
+# probe (restored or refreshed) and a probe that found nothing looked the same.
+PG_CATALOG_CHECKED_RULE_ID = "PG_CATALOG_CHECKED"
 
 # Findings that come from probing the SOURCE at Evaluation time rather than from the
 # inventory, so a re-assessment from the inventory alone (a catalog refresh, a restored
@@ -2054,7 +2057,12 @@ PG_CATALOG_UNREAD_RULE_ID = "PG_CATALOG_UNREAD"
 # Two shapes: an item of its own (the privilege gap, a sequence, an unread probe), and a
 # concern on an inventory object's item (row-level security on a table).
 _PROBE_ITEM_RULE_IDS = frozenset(
-    {SOURCE_VISIBILITY_RULE_ID, PG_STANDALONE_SEQUENCE_RULE_ID, PG_CATALOG_UNREAD_RULE_ID}
+    {
+        SOURCE_VISIBILITY_RULE_ID,
+        PG_STANDALONE_SEQUENCE_RULE_ID,
+        PG_CATALOG_UNREAD_RULE_ID,
+        PG_CATALOG_CHECKED_RULE_ID,
+    }
 )
 _PROBE_CONCERN_RULE_IDS = frozenset({PG_ROW_LEVEL_SECURITY_RULE_ID})
 
@@ -3368,6 +3376,7 @@ __all__ = [
     "KIND_EVENT",
     "KIND_SEQUENCE",
     "PG_CATALOG_UNREAD_RULE_ID",
+    "PG_CATALOG_CHECKED_RULE_ID",
     "PG_ROW_LEVEL_SECURITY_RULE_ID",
     "PG_STANDALONE_SEQUENCE_RULE_ID",
     "carry_probe_results",

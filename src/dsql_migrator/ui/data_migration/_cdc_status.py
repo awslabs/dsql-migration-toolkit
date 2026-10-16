@@ -362,6 +362,15 @@ def _refresh_pg_slot_health(migration_state, source_config, connection) -> None:
         pass
 
 
+def _autocommit(connection):
+    """``connection`` in autocommit (each read its own transaction), or as it is when it
+    cannot be (a test double)."""
+    try:
+        return connection.execution_options(isolation_level="AUTOCOMMIT")
+    except Exception:  # noqa: BLE001 - keep the shared transaction
+        return connection
+
+
 def _fetch_migration_row_counts(migration_state, session, table_names, inventory=None):
     """Read the source row ESTIMATE, the exact target ``COUNT(*)``, and ``MAX(pk)`` per table.
 
@@ -417,6 +426,12 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
             engine_factory = make_source_engine_factory(session.source_password)
             engine = engine_factory(source_config)
             with engine.connect() as connection:
+                # Autocommit, so one refused read cannot fail the ones after it: a table
+                # whose row-level security refuses this user (row_security = off makes
+                # PostgreSQL raise rather than filter) failed its MAX(pk) inside one shared
+                # transaction, which every later table's MAX(pk) and the slot-health read
+                # then found ABORTED -- the WAL-retention panel disappeared with them.
+                connection = _autocommit(connection)
                 source_counts = estimate_source_rows(connection, list(table_names), dialect)
                 source_max_pk = max_pk_source(connection, pk_by_table, dialect)
                 # PostgreSQL CDC only: piggyback the source read-only connection to read
@@ -425,12 +440,10 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
                 # disk fills. Best-effort; MySQL's dialect returns None (no slot).
                 _refresh_pg_slot_health(migration_state, source_config, connection)
                 # How old each estimate is (PostgreSQL: last ANALYZE/VACUUM stamps via the
-                # per-OID statistics functions -- no scan). Deliberately the LAST read on
-                # this connection: the connection is not autocommit and a server-side error
-                # is swallowed without a rollback, which leaves the transaction ABORTED --
-                # run earlier, one failure here would silently have failed the slot-health
-                # read after it (InFailedSqlTransaction). Display-only, so it can never cost
-                # the counts either.
+                # per-OID statistics functions -- no scan). Kept the LAST read on this
+                # connection, for a connection that could not be made autocommit (a failed
+                # statement then leaves the transaction ABORTED for the reads after it).
+                # Display-only, so it can never cost the counts either.
                 try:
                     stats_at = dict(dialect.estimate_stats_at(connection, list(table_names)))
                 except Exception:  # noqa: BLE001 - display metadata only

@@ -451,3 +451,22 @@ def test_the_default_gates_still_decide_what_is_carried() -> None:
     assert "DEFAULT" not in conversion.target_ddl
     dropped = {w.column_name for w in conversion.warnings if "default" in w.message.lower()}
     assert dropped == {"seq", "kind", "odd"}
+
+
+def test_every_view_header_the_converter_emits_is_one_the_applier_accepts() -> None:
+    """A RECURSIVE header was graded auto-converted, then refused by the tool's own applier
+    as not a CREATE TABLE/VIEW/INDEX statement."""
+    from dsql_migrator.core.converter import pg_view_ddl
+    from dsql_migrator.core.schema_applier import parse_create_object
+
+    for definition in (
+        " SELECT 1 AS n;",
+        "CREATE VIEW nums AS SELECT 1",
+        "CREATE OR REPLACE TEMP VIEW nums (n) AS SELECT 1",
+        "CREATE RECURSIVE VIEW nums (n) AS VALUES (1) UNION ALL SELECT n + 1 FROM nums WHERE n < 9",
+        "CREATE OR REPLACE TEMPORARY RECURSIVE VIEW nums (n) AS VALUES (1)",
+        "CREATE VIEW nums WITH (security_barrier) AS SELECT 1",
+    ):
+        ddl = pg_view_ddl("public.Nums", definition)
+        assert ddl is not None, definition
+        assert parse_create_object(ddl) == ("public.Nums", "VIEW"), (definition, ddl)

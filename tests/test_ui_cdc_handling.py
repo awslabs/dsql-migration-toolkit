@@ -2485,3 +2485,44 @@ def test_a_postgres_restart_names_the_slot_not_the_full_load_lsn() -> None:
         "dsql-cdc-x", wm, mode="manual", source_type=SourceType.POSTGRES, force_snapshot=True,
     )
     assert "re-snapshot" in forced_first
+
+
+def test_the_monitor_reads_the_source_in_autocommit(monkeypatch) -> None:
+    """One refused MAX(pk) (row-level security, with row_security = off) aborted the shared
+    transaction, so every later table's MAX(pk) and the slot-health read failed with it."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.source_dialect as sd
+    import dsql_migrator.core.watermark as wm
+    from dsql_migrator.ui.data_migration import DataMigrationState, _cdc_status
+
+    seen: list = []
+
+    class _Connection:
+        def execution_options(self, **kwargs):
+            seen.append(kwargs)
+            return self
+
+    class _Engine:
+        @contextmanager
+        def connect(self):
+            yield _Connection()
+
+    class _Dialect:
+        def estimate_stats_at(self, connection, tables):
+            return {}
+
+    monkeypatch.setattr(_cdc_status, "make_source_engine_factory", lambda _pw: lambda _c: _Engine())
+    monkeypatch.setattr(sd, "dialect_for", lambda _t: _Dialect())
+    monkeypatch.setattr(wm, "estimate_source_rows", lambda c, t, d: {n: 5 for n in t})
+    monkeypatch.setattr(wm, "max_pk_source", lambda c, p, d: {})
+    session = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=None),
+        source_password=object(),
+        has_source=lambda: True,
+        has_target=lambda: False,
+        target_config=None,
+    )
+    _cdc_status._fetch_migration_row_counts(DataMigrationState(), session, ["t1"])
+    assert seen == [{"isolation_level": "AUTOCOMMIT"}]

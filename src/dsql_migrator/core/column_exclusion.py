@@ -282,6 +282,7 @@ def build_exclusion_context(
     """
     from dsql_migrator.core.converter import (
         parse_target_column_constraints,
+        parse_target_column_default_texts,
         pg_preserved_generated_columns,
     )
 
@@ -313,7 +314,13 @@ def build_exclusion_context(
         if not warnings:
             continue
         if ddl:
-            facts = parse_target_column_constraints(ddl)
+            # Shown in W2 and the omit-only note, never compared: each DEFAULT as the DDL
+            # writes it (the reader's sqlglot render changes common PostgreSQL defaults).
+            written = parse_target_column_default_texts(ddl)
+            facts = {
+                column: (not_null, written.get(column, default) if default is not None else None)
+                for column, (not_null, default) in parse_target_column_constraints(ddl).items()
+            }
             unique = _unique_members(
                 ddl, tuple(getattr(conversions.get(name), "index_ddls", None) or ())
             )

@@ -194,11 +194,12 @@ _DEPENDENT_OBJECTS_SQLSTATE = "2BP01"
 # Parses the leading ``CREATE <kind> [modifiers] <identifier>`` of a converted
 # DDL statement to recover the kind and the created object's name. Tolerant of
 # the DSQL-specific ``ASYNC`` index modifier and the usual ``IF NOT EXISTS`` /
-# ``OR REPLACE`` / ``UNIQUE`` qualifiers. ``CREATE SCHEMA`` is also recognized so
+# ``OR REPLACE`` / ``UNIQUE`` qualifiers, and PostgreSQL's ``RECURSIVE`` view header (a
+# view the converter emits verbatim). ``CREATE SCHEMA`` is also recognized so
 # a schema-qualified table can ensure its schema exists first. Identifiers may be
 # schema-qualified and may be double-quoted (each part captured verbatim).
 _CREATE_PATTERN = re.compile(
-    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:UNIQUE\s+)?"
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:UNIQUE\s+)?(?:RECURSIVE\s+(?=VIEW\b))?"
     r"(?P<kind>MATERIALIZED\s+VIEW|TABLE|VIEW|INDEX|SCHEMA)\s+"
     r"(?:ASYNC\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
     r"(?P<name>(?:\"(?:[^\"]|\"\")+\"|[A-Za-z_][\w$]*)"

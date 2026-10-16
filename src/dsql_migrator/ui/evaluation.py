@@ -53,6 +53,8 @@ from dsql_migrator.core.assessor import (
     DSQL_DATABASE_LIMITS,
     KIND_DATABASE,
     KIND_LABELS,
+    PG_CATALOG_CHECKED_RULE_ID,
+    PG_CATALOG_UNREAD_RULE_ID,
     CompatibilityAssessor,
     carry_probe_results,
     source_visibility_items,
@@ -325,6 +327,18 @@ def with_refreshed_catalogs(
     # switch: those findings describe the other engine's source.
     if engine is result.source_type:
         assessment = carry_probe_results(result.assessment, assessment)
+    if engine is SourceType.POSTGRES and not any(
+        item.rule_id in (PG_CATALOG_CHECKED_RULE_ID, PG_CATALOG_UNREAD_RULE_ID)
+        for item in assessment.items
+    ):
+        # A report made before the PostgreSQL catalog probe existed (or re-read across an
+        # engine switch) holds no trace of it, and a clean probe holds none either -- say
+        # so rather than let it read "Ready" over row-level security never checked.
+        from dsql_migrator.core.assessor_postgres import catalog_unread_items
+
+        assessment = AssessmentReport.from_items(
+            [*assessment.items, *catalog_unread_items(None, not_checked=True)]
+        )
     return replace(
         result,
         inventory=inventory,
@@ -575,7 +589,13 @@ def compute_migration_score(report: AssessmentReport) -> Optional[MigrationScore
         and item.kind == KIND_DATABASE.upper()
         and item.rule_id in DSQL_DATABASE_LIMITS
     ]
-    scored = [item for item in items if not any(item is b for b in blockers)]
+    # The note that the catalog probe ran is not an object to migrate: it must not dilute
+    # the penalties of the objects that are.
+    scored = [
+        item
+        for item in items
+        if not any(item is b for b in blockers) and item.rule_id != PG_CATALOG_CHECKED_RULE_ID
+    ]
 
     total_penalty = 0.0
     auto = manual = unsupported = 0
@@ -886,12 +906,12 @@ def assessment_kind_summary(items: list) -> str:
         counts[value] = counts.get(value, 0) + 1
     order = ["UNSUPPORTED", "MANUAL", "AUTO"]
     parts = [
-        f"{counts[value]} {classification_label(value)}"
+        f"{counts[value]:,} {classification_label(value)}"
         for value in order
         if counts.get(value)
     ]
     parts += [
-        f"{count} {classification_label(value)}"
+        f"{count:,} {classification_label(value)}"
         for value, count in counts.items()
         if value not in order
     ]
@@ -1025,7 +1045,7 @@ def run_evaluation(
     if catalog_probed:
         from dsql_migrator.core.assessor_postgres import with_pg_catalog_facts
 
-        assessment = with_pg_catalog_facts(assessment, catalog)
+        assessment = with_pg_catalog_facts(assessment, catalog, inventory)
 
     report(85, "Detecting objects that already exist on the target...")
     target_conflicts = _find_target_conflicts(inventory, target_inventory)
@@ -1325,6 +1345,8 @@ class EvaluationState:
                 return False
             self._result = result
             self._error = None
+            # A different set of objects: every group of the list starts at its first page.
+            self.list_pages.clear()
             return True
 
     def set_error(self, message: str, *, token: Optional[int] = None) -> None:
@@ -2009,7 +2031,7 @@ def _render_result(
                 with ui.row().classes(  # type: ignore[attr-defined]
                     "items-baseline gap-1 rounded bg-gray-100 px-3 py-1"
                 ):
-                    ui.label(str(count)).classes("text-base font-semibold")  # type: ignore[attr-defined]
+                    ui.label(f"{count:,}").classes("text-base font-semibold")  # type: ignore[attr-defined]
                     ui.label(label).classes("text-sm text-gray-600")  # type: ignore[attr-defined]
         _render_assessment(
             ui,
@@ -2296,7 +2318,7 @@ def _render_assessment(
         for classification, count in report.summary.items():
             color = _CLASS_BADGE_COLOR.get(classification.value, "grey")
             ui.badge(  # type: ignore[attr-defined]
-                f"{classification_label(classification.value)}: {count}"
+                f"{classification_label(classification.value)}: {count:,}"
             ).props(f"color={color}").classes("text-sm q-px-sm q-py-xs")
 
     # Wrap the chart in solid separators so "Compatibility by object kind" reads as
@@ -2335,7 +2357,7 @@ def _render_assessment(
                 "text-sm font-semibold text-gray-700"
             )
             for level, count in report.effort_summary.items():
-                ui.badge(f"{level.value}: {count}").props(  # type: ignore[attr-defined]
+                ui.badge(f"{level.value}: {count:,}").props(  # type: ignore[attr-defined]
                     f"color={_EFFORT_BADGE_COLOR} outline"
                 ).classes("text-sm q-px-sm q-py-xs")
             needing = sum(report.effort_summary.values())
@@ -2353,9 +2375,30 @@ def _render_assessment(
     # with values already applied, and the one redraw is Clear's own.
     clearing = False
 
+    def _sync_controls() -> None:
+        """Show what the list is filtered by. The state is the session's, shared by its
+        browser tabs, so another tab may have changed a filter whose old value this tab's
+        control still shows -- and picking that value again would fire no change."""
+        nonlocal clearing
+        clearing = True
+        try:
+            for key, value in (
+                ("classification", view.classification_filter),
+                ("effort", view.effort_filter),
+            ):
+                control = controls.get(key)
+                if control is not None and getattr(control, "value", value) != value:
+                    control.set_value(value)  # type: ignore[attr-defined]
+            box = controls.get("name")
+            if box is not None and (getattr(box, "value", "") or "").strip() != view.name_filter:
+                box.set_value(view.name_filter)  # type: ignore[attr-defined]
+        finally:
+            clearing = False
+
     def _list_changed() -> None:
         if clearing:
             return
+        _sync_controls()
         # A different set of objects, so every group starts again at its first page.
         view.list_pages.clear()
         object_list.refresh()  # type: ignore[attr-defined]

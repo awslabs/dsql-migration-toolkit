@@ -3613,3 +3613,40 @@ def test_migration_excluded_columns_keep_a_deliberate_omission_matching() -> Non
 
     assert _run({"app.orders": {"big"}}).items[0].matched is True
     assert _run(None).items[0].error is not None
+
+
+def test_a_refused_postgres_table_read_cannot_fail_the_tables_after_it(monkeypatch) -> None:
+    """PostgreSQL aborts the shared snapshot transaction on any failed statement, so one
+    table whose read row-level security refused failed every later table with 25P02.
+    Each table now reads inside a savepoint rolled back after it."""
+    import dsql_migrator.core.validator as v
+
+    class _Refused(Exception):
+        sqlstate = "42501"
+
+    def _count(_dialect, _connection, table, *_a, **_k):
+        if table.name == "orders":
+            raise _Refused('query would be affected by row-level security policy for table "orders"')
+        return 2
+
+    monkeypatch.setattr(v, "_source_row_count_live", _count)
+    monkeypatch.setattr(v, "_source_checksum_for", lambda d, c, t, ps, **k: "42")
+    source = _FakeSourceConnection()
+    target = _FakeTargetConnection(counts={"items": 2}, checksums={"items": "42"})
+    pg = SourceConnectionConfig(host="db.example.com", database="app", source_type=SourceType.POSTGRES)
+    report = _validator(source, target).validate(
+        pg, _TARGET_CONFIG, [_table("orders"), _table("items")], ValidationMode.ROW_COUNT
+    )
+    orders, items = report.items
+    assert orders.error and not items.error
+    saves = [s for s in source.executed if "SAVEPOINT dsql_migrator_validate_table" in s]
+    assert saves == [
+        "SAVEPOINT dsql_migrator_validate_table",
+        "ROLLBACK TO SAVEPOINT dsql_migrator_validate_table",
+    ] * 2
+    # MySQL keeps its transaction through an error: no savepoints there.
+    mysql = _FakeSourceConnection(counts={"items": 2})
+    _validator(mysql, _FakeTargetConnection(counts={"items": 2})).validate(
+        _SOURCE_CONFIG, _TARGET_CONFIG, [_table("items")], ValidationMode.ROW_COUNT
+    )
+    assert not any("SAVEPOINT" in s for s in mysql.executed)

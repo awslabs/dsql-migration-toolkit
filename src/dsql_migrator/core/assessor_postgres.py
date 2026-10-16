@@ -55,6 +55,7 @@ from dsql_migrator.core.assessor import (
     KIND_SEQUENCE,
     KIND_TABLE,
     KIND_VIEW,
+    PG_CATALOG_CHECKED_RULE_ID,
     PG_CATALOG_UNREAD_RULE_ID,
     PG_ROW_LEVEL_SECURITY_RULE_ID,
     PG_STANDALONE_SEQUENCE_RULE_ID,
@@ -590,7 +591,9 @@ class PgNonKeySequenceRule(Rule):
             # an identity only on bigint and cannot change a column's type after apply, so
             # the bare "add an identity on the target" could not be followed on an integer
             # column -- which is what a plain serial is.
-            remedies.append("For an identity: " + pg_identity_fallback(sequenced) + ".")
+            remedies.append(
+                "For an identity: " + pg_identity_fallback(sequenced, table.name) + "."
+            )
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
@@ -956,8 +959,25 @@ def _sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def _columns_calling(sequence_name: str, inventory) -> "list[tuple[str, str]]":
+    """``(table, column)`` of every source column whose DEFAULT calls ``sequence_name``
+    (``schema.name``); a bare name in the DEFAULT counts for a table of that schema."""
+    from dsql_migrator.core.converter_postgres import pg_nextval_sequence
+
+    schema, _, bare = sequence_name.partition(".")
+    calling: list[tuple[str, str]] = []
+    for table in getattr(inventory, "tables", None) or ():
+        table_schema = table.name.partition(".")[0]
+        for column in table.columns:
+            called = pg_nextval_sequence(column.default)
+            if called == sequence_name or (called == bare and table_schema == schema):
+                calling.append((table.name, column.name))
+    return calling
+
+
 def standalone_sequence_items(
     sequences: "Sequence[StandaloneSequence]",
+    inventory=None,
 ) -> "list[AssessmentItem]":
     """One MANUAL item per sequence no column owns, carrying the Aurora DSQL statement that
     re-creates it after its source value. Pure.
@@ -966,7 +986,9 @@ def standalone_sequence_items(
     converted, by its column), so the application's -- or a column DEFAULT's -- nextval()
     on it fails after cut over until it exists on the target. Creating it, and moving it
     past the source's final value at cut over, is left to the operator: this tool neither
-    emits nor syncs it.
+    emits nor syncs it. The columns of ``inventory`` whose DEFAULT calls it are named, with
+    the statement that re-attaches that DEFAULT (Schema Conversion drops it): an identity
+    per column instead would give each table its own counter.
     """
     from dsql_migrator.core.converter_postgres import (
         dsql_create_sequence_sql,
@@ -988,7 +1010,16 @@ def standalone_sequence_items(
                 "starts."
             )
         elif sequence.last_value is None:
-            state = f"It has not been used yet, so it starts at {sequence.start_value}."
+            state = (
+                "Nothing has been drawn from it since it was created or last reset, but its "
+                "next value could not be read (that needs SELECT on the sequence), so the "
+                "statement below has a placeholder for where it starts."
+            )
+        elif sequence.is_called is False:
+            state = (
+                "Nothing has been drawn from it since it was created or last reset (a "
+                f"RESTART or setval(..., false)): its next value is {sequence.last_value}."
+            )
         elif following is None:
             bound = "MAXVALUE" if sequence.increment > 0 else "MINVALUE"
             state = (
@@ -1018,6 +1049,25 @@ def standalone_sequence_items(
                 "application already tolerates gaps; Aurora DSQL accepts only CACHE 1 or at "
                 "least 65536, so the statement uses 65536."
             )
+        calling = _columns_calling(sequence.name, inventory)
+        defaults = ""
+        if calling:
+            shown = ", ".join(f"{table}.{column}" for table, column in calling)
+            state += (
+                f" A DEFAULT calls it on {shown}; Schema Conversion drops that DEFAULT, so an "
+                "INSERT that omits the column gets no value."
+            )
+            reattach = " ".join(
+                f"ALTER TABLE {pg.quote_table(table)} ALTER COLUMN "
+                f"{pg.quote_identifier(column)} SET DEFAULT nextval({_sql_literal(quoted)});"
+                for table, column in calling
+            )
+            defaults = (
+                f" Then re-attach {'that DEFAULT' if len(calling) == 1 else 'those DEFAULTs'}: "
+                f"{reattach} Do not give {'that column' if len(calling) == 1 else 'those columns'} "
+                "an identity instead: each table would get its own counter, and a sequence "
+                "they share would hand out the same numbers twice."
+            )
         item = AssessmentItem(
             object_name=sequence.name,
             rule_id=PG_STANDALONE_SEQUENCE_RULE_ID,
@@ -1029,10 +1079,10 @@ def standalone_sequence_items(
                 + state
             ),
             recommendation=(
-                f"Create it on Aurora DSQL before cut over: {statement} Once source writes "
-                f"stop, read its final value (SELECT last_value FROM {quoted}) and move the "
-                f"target past it with SELECT setval({_sql_literal(quoted)}, <that value>) -- "
-                "this tool neither creates nor syncs it. " + cache_note
+                f"Create it on Aurora DSQL before cut over: {statement}{defaults} Once source "
+                f"writes stop, read its final value (SELECT last_value FROM {quoted}) and move "
+                f"the target past it with SELECT setval({_sql_literal(quoted)}, <that value>) "
+                "-- this tool neither creates nor syncs it. " + cache_note
             ),
             effort=EffortLevel.SIMPLE,
             kind=KIND_SEQUENCE.upper(),
@@ -1041,12 +1091,18 @@ def standalone_sequence_items(
     return items
 
 
-def catalog_unread_items(facts: "Optional[PgCatalogFacts]") -> "list[AssessmentItem]":
+def catalog_unread_items(
+    facts: "Optional[PgCatalogFacts]", *, not_checked: bool = False
+) -> "list[AssessmentItem]":
     """The database-level item for a probe part that could not be read (``facts`` ``None``:
     none could). Without it a failed read would look exactly like a source with no
     row-level security and no standalone sequence -- a "Ready" over what was never checked.
+    ``not_checked``: the report never ran the probe (made before it, or re-read without it).
     """
-    if facts is None:
+    if not_checked:
+        unread = ["row-level security", "sequences"]
+        reason = "this report was made without that check; re-run Step 1"
+    elif facts is None:
         unread = ["row-level security", "sequences"]
         reason = "the catalog read failed"
     else:
@@ -1076,8 +1132,9 @@ def catalog_unread_items(facts: "Optional[PgCatalogFacts]") -> "list[AssessmentI
         rule_id=PG_CATALOG_UNREAD_RULE_ID,
         classification=Classification.MANUAL,
         risk=(
-            f"The source's {' and '.join(unread)} could not be read ({reason}), so this "
-            "report cannot say "
+            f"The source's {' and '.join(unread)} "
+            + ("were not checked" if not_checked else "could not be read")
+            + f" ({reason}), so this report cannot say "
             + " or ".join(unknowns[part] for part in unread)
             + "."
         ),
@@ -1092,8 +1149,43 @@ def catalog_unread_items(facts: "Optional[PgCatalogFacts]") -> "list[AssessmentI
     return [item.model_copy(update={"concerns": _single_concern(item)})]
 
 
+def catalog_checked_item(facts: "PgCatalogFacts") -> AssessmentItem:
+    """The database-level note that this run read the catalog probe (row-level security and
+    standalone sequences), saying what it found. Automatic and out of the score: it is what
+    tells a report from before the probe -- restored or refreshed, where a clean probe and
+    no probe would otherwise look the same -- from one whose probe found nothing."""
+    parts = []
+    if facts.row_security is not None:
+        count = len(facts.row_security.tables)
+        parts.append(
+            f"{count} table(s) with row-level security, graded on each table"
+            if count
+            else "no table with row-level security"
+        )
+    if facts.sequences is not None:
+        count = len(facts.sequences)
+        parts.append(
+            f"{count} standalone sequence(s), each its own item" if count
+            else "no standalone sequence"
+        )
+    found = "; ".join(parts) or "nothing it could read (see the source catalog item)"
+    item = AssessmentItem(
+        object_name="source catalog checks",
+        rule_id=PG_CATALOG_CHECKED_RULE_ID,
+        classification=Classification.AUTO,
+        risk=f"This run read the source catalog: {found}.",
+        recommendation=(
+            "Re-run Step 1 after enabling row-level security on a table or creating a "
+            "sequence on the source."
+        ),
+        effort=None,
+        kind=KIND_DATABASE.upper(),
+    )
+    return item.model_copy(update={"concerns": _single_concern(item)})
+
+
 def with_pg_catalog_facts(
-    report: AssessmentReport, facts: "Optional[PgCatalogFacts]"
+    report: AssessmentReport, facts: "Optional[PgCatalogFacts]", inventory=None
 ) -> AssessmentReport:
     """``report`` with the PostgreSQL catalog probe's findings: row-level security graded on
     each table's own item, an item per standalone sequence, and an item for any part that
@@ -1101,8 +1193,11 @@ def with_pg_catalog_facts(
     if facts is not None and facts.row_security is not None:
         report = with_object_findings(report, row_security_findings(facts.row_security))
     extra = [
-        *standalone_sequence_items((facts.sequences if facts is not None else None) or ()),
+        *standalone_sequence_items(
+            (facts.sequences if facts is not None else None) or (), inventory
+        ),
         *catalog_unread_items(facts),
+        *([catalog_checked_item(facts)] if facts is not None else []),
     ]
     if extra:
         report = AssessmentReport.from_items([*report.items, *extra])

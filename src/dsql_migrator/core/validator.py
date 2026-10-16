@@ -495,6 +495,19 @@ _TARGET_RECONNECT_BASE_DELAY_SECONDS = 0.5
 _EXECUTE_SENTINEL = object()
 
 
+_TABLE_SAVEPOINT = "SAVEPOINT dsql_migrator_validate_table"
+
+
+def _rollback_to_table_savepoint(connection) -> None:
+    """Undo a table's reads (all of them read-only) so a failed one leaves the snapshot
+    transaction usable. Best effort: a lost connection fails the next table's reads with
+    its own error, as before."""
+    try:
+        connection.execute(text("ROLLBACK TO SAVEPOINT dsql_migrator_validate_table"))
+    except Exception:  # noqa: BLE001 - the next table reports the connection's state
+        pass
+
+
 class _ReconnectingTargetConnection:
     """Target-connection proxy that transparently reconnects on a transient
     (aged-out / dropped) DSQL connection and re-runs the in-flight statement.
@@ -1590,6 +1603,13 @@ class Validator:
                     target_connection = _ReconnectingTargetConnection(
                         lambda: self._target_connection_factory(target)
                     )
+                    # PostgreSQL aborts the whole snapshot transaction on any failed
+                    # statement, so one table whose read is refused (its row-level
+                    # security, say) failed every table after it with 25P02. Each table
+                    # reads inside a savepoint that is rolled back after it: the snapshot
+                    # (taken at the transaction's first read) stays, and so does the next
+                    # table's read. MySQL keeps its transaction through an error.
+                    savepoints = _source_is_postgres(source_dialect)
                     try:
                         total = len(tables)
                         for index, table in enumerate(tables, start=1):
@@ -1602,6 +1622,8 @@ class Validator:
                                     "tables."
                                 )
                             _report_progress(table.name, index, total)
+                            if savepoints:
+                                source_connection.execute(text(_TABLE_SAVEPOINT))
                             items.append(
                                 self._validate_table(
                                     source_connection,
@@ -1617,6 +1639,8 @@ class Validator:
                                     ),
                                 )
                             )
+                            if savepoints:
+                                _rollback_to_table_savepoint(source_connection)
                             if check_orphans:
                                 orphan_findings.extend(
                                     self._check_orphans(target_connection, table)

@@ -1111,6 +1111,7 @@ class _ItemUi:
         self.paginations: list[tuple] = []  # (element, on_change, (min, max), value)
         self.inputs: list[tuple] = []  # (element, on_change, placeholder)
         self.selects: dict[str, object] = {}  # label -> on_change
+        self.select_elements: dict[str, object] = {}  # label -> element (has .value)
         self.buttons: dict[str, list] = {}  # text -> [on_click, ...]
         self.refreshes = 0
 
@@ -1180,14 +1181,31 @@ class _ItemUi:
         self.paginations.append((element, on_change, bounds, value))
         return element
 
-    def input(self, *_a, on_change=None, placeholder=None, **_k):
+    def _valued(self, value, on_change):
+        # A control holding a value; ``set_value`` fires its handler on a change, as
+        # NiceGUI's does.
         element = self._el()
+        element.value = value
+
+        def _set_value(new):
+            changed = element.value != new
+            element.value = new
+            if changed and on_change is not None:
+                on_change(_Changed(new))
+
+        element.set_value = _set_value
+        return element
+
+    def input(self, *_a, on_change=None, placeholder=None, value=None, **_k):
+        element = self._valued(value, on_change)
         self.inputs.append((element, on_change, placeholder))
         return element
 
-    def select(self, *_a, label=None, on_change=None, **_k):
+    def select(self, *_a, label=None, on_change=None, value=None, **_k):
         self.selects[str(label)] = on_change
-        return self._el()
+        element = self._valued(value, on_change)
+        self.select_elements[str(label)] = element
+        return element
 
     def button(self, text="", *_a, on_click=None, **_k):
         self.buttons.setdefault(str(text), []).append(on_click)
@@ -2687,6 +2705,44 @@ def test_a_second_browser_tab_redraws_for_a_filter_or_page_the_first_already_set
     tab_b.selects["Classification"](_Changed("UNSUPPORTED"))
     assert tab_b.refreshes == 1
     assert "20 of 140 objects match" in tab_b.texts[mark:]
+
+
+def test_a_tab_shows_the_filters_another_tab_set_once_it_redraws() -> None:
+    """Tab A narrowed to Unsupported; tab B's search then redrew its list filtered by that
+    too, while its own dropdown still read All -- and picking All fired no change."""
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui.evaluation import _render_assessment
+
+    report = AssessmentReport.from_items(
+        _bulk_items(30)
+        + _bulk_items(5, kind="TRIGGER", prefix="app.trg", classification=Classification.UNSUPPORTED)
+    )
+    state = EvaluationState()
+    tab_a, tab_b = _ItemUi(), _ItemUi()
+    _render_assessment(tab_a, report, eval_state=state)
+    _render_assessment(tab_b, report, eval_state=state)
+    tab_a.selects["Classification"](_Changed("UNSUPPORTED"))
+    ((_box, on_name, _placeholder),) = tab_b.inputs
+    on_name(_Changed("trg"))
+    assert tab_b.select_elements["Classification"].value == "UNSUPPORTED"
+    assert state.name_filter == "trg"
+
+
+def test_counts_beside_each_other_share_one_number_format() -> None:
+    from dsql_migrator.ui.evaluation import assessment_kind_summary
+
+    items = _bulk_items(5000) + _bulk_items(
+        1200, kind="TABLE", prefix="app.x", classification=Classification.UNSUPPORTED
+    )
+    assert assessment_kind_summary(items) == "1,200 Unsupported · 5,000 Review needed"
+
+
+def test_a_new_result_opens_every_group_on_its_first_page() -> None:
+    state = EvaluationState()
+    token = state.begin_run()
+    state.list_pages["TABLE"] = 3
+    assert state.set_result(object(), token=token)
+    assert state.list_pages == {}
 
 
 def test_assessment_page_slices_and_clamps() -> None:

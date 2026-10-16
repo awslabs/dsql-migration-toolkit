@@ -107,6 +107,9 @@ class _Result:
     def mappings(self) -> _Rows:
         return _Rows(self._rows)
 
+    def first(self):  # noqa: ANN201
+        return self._rows[0] if self._rows else None
+
 
 class _CatalogConnection:
     """A PostgreSQL-typed connection answering catalog reads by SQL substring.
@@ -154,11 +157,12 @@ def _login(name="migrator", *, superuser=False, bypass=False) -> SourceLogin:
 
 def _sequence(name="app.invoice_no_seq", *, data_type="bigint", start=1, minimum=1,
               maximum=_BIGINT_MAX, increment=1, cycle=False, cache=1, last=1042,
-              readable=True) -> StandaloneSequence:
+              readable=True, called=None) -> StandaloneSequence:
     return StandaloneSequence(
         name=name, data_type=data_type, start_value=start, min_value=minimum,
         max_value=maximum, increment=increment, cycle=cycle, cache_size=cache,
         last_value=last, readable=readable,
+        is_called=(last is not None) if called is None and last is not None else called,
     )
 
 
@@ -232,6 +236,11 @@ def test_the_row_security_read_collects_tables_policies_and_the_login() -> None:
         ],
     })
     facts = pg_read_row_security(conn, ["app"])
+    # The policy read asks only for the tables with row-level security (deparsing a policy
+    # locks its table, so a dormant one elsewhere could hold the read up).
+    ((policy_sql, policy_params),) = [(q, b) for q, b in conn.executed if "pg_policies" in q]
+    assert "tablename = ANY(:tables)" in policy_sql
+    assert policy_params == {"schemas": ["app"], "tables": ["audit", "orders"]}
     assert facts.login == SourceLogin(name="migrator", superuser=False, bypass_rls=True)
     orders, audit = facts.tables
     assert (orders.table, orders.owner, orders.login_owns, orders.forced) == (
@@ -252,8 +261,14 @@ def test_standalone_sequences_exclude_owned_identity_and_extension_sequences() -
         {"nsp": "app", "name": "hidden_seq", "data_type": "bigint", "start_value": 1,
          "min_value": 1, "max_value": _BIGINT_MAX, "increment_by": 1, "cycle": False,
          "cache_size": 1, "last_value": None, "readable": False},
-    ]})
+        {"nsp": "app", "name": "reset_seq", "data_type": "bigint", "start_value": 1,
+         "min_value": 1, "max_value": _BIGINT_MAX, "increment_by": 1, "cycle": False,
+         "cache_size": 1, "last_value": None, "readable": True},
+    ], 'FROM "app"."reset_seq"': [(5000, False)]})
     sequences = pg_read_standalone_sequences(conn, ["app"])
+    # pg_sequences hides a reset sequence's value; its own row has it (RESTART WITH 5000).
+    assert (sequences[2].last_value, sequences[2].is_called) == (5000, False)
+    assert not any('"hidden_seq"' in sql for sql, _ in conn.executed)  # not readable: not read
     sql, params = conn.executed[0]
     assert params == {"schemas": ["app"]}
     # 'a' = a serial column / OWNED BY, 'i' = an identity column: governed by their column.
@@ -416,9 +431,14 @@ def test_an_rls_table_is_graded_unsupported_on_its_own_item_with_its_policy() ->
         sequences=(),
     )
     graded = with_pg_catalog_facts(report, facts)
-    # Property 8: still exactly one item per table -- the finding grades the TABLE.
-    assert [i.object_name for i in graded.items] == ["app.orders", "app.items"]
-    orders, items = graded.items
+    # Property 8: still exactly one item per table -- the finding grades the TABLE -- plus
+    # the note that the probe ran.
+    assert [i.object_name for i in graded.items] == [
+        "app.orders", "app.items", "source catalog checks"
+    ]
+    orders, items, checked = graded.items
+    assert checked.rule_id == "PG_CATALOG_CHECKED" and checked.classification is Classification.AUTO
+    assert "1 table(s) with row-level security" in checked.concerns[0].risk
     assert orders.classification is Classification.UNSUPPORTED
     assert orders.rule_id == PG_ROW_LEVEL_SECURITY_RULE_ID
     assert orders.effort is EffortLevel.MEDIUM
@@ -447,7 +467,7 @@ def test_an_exempt_login_and_a_default_deny_table_are_worded_for_what_happens() 
         ),
         sequences=(),
     )
-    orders, vault = with_pg_catalog_facts(report, facts).items
+    orders, vault, _checked = with_pg_catalog_facts(report, facts).items
     assert "reads every row as a role with BYPASSRLS" in orders.concerns[0].risk
     assert "row_security = off" not in orders.concerns[0].risk
     assert "prerequisite" not in orders.concerns[0].recommendation
@@ -461,7 +481,7 @@ def test_a_login_that_could_not_be_read_is_said_so() -> None:
     facts = PgCatalogFacts(
         row_security=RowSecurityFacts(login=None, tables=(_rls_table(),)), sequences=()
     )
-    (orders,) = with_pg_catalog_facts(_pg_assess(_pg_table("app.orders")), facts).items
+    orders, _checked = with_pg_catalog_facts(_pg_assess(_pg_table("app.orders")), facts).items
     assert "could not be read" in orders.concerns[0].risk
     assert "prerequisite checks re-check" in orders.concerns[0].recommendation
 
@@ -473,7 +493,7 @@ def test_policy_text_is_bounded() -> None:
         row_security=RowSecurityFacts(login=_login(), tables=(_rls_table(policies=policies),)),
         sequences=(),
     )
-    (orders,) = with_pg_catalog_facts(_pg_assess(_pg_table("app.orders")), facts).items
+    orders, _checked = with_pg_catalog_facts(_pg_assess(_pg_table("app.orders")), facts).items
     risk = orders.concerns[0].risk
     assert "with 8 policies" in risk
     assert "p5 (" in risk and "p6 (" not in risk
@@ -506,8 +526,14 @@ def test_the_create_sequence_statement_follows_the_dsql_rules() -> None:
     assert dsql_create_sequence_sql(_sequence(cache=20)) == (
         'CREATE SEQUENCE "app"."invoice_no_seq" CACHE 65536 START WITH 1043;'
     )
-    # Never used: starts where the source would start.
-    assert pg_sequence_next_value(_sequence(start=100, last=None)) == 100
+    # Nothing drawn since it was created or reset: its row's last_value IS the next value
+    # -- after RESTART WITH 5000 that is 5000, never the start value.
+    assert pg_sequence_next_value(_sequence(start=100, last=100, called=False)) == 100
+    assert pg_sequence_next_value(_sequence(start=1, last=5000, called=False)) == 5000
+    (reset,) = standalone_sequence_items([_sequence(start=1, last=5000, called=False)])
+    assert "its next value is 5000" in reset.risk and "START WITH 5000;" in reset.recommendation
+    # Its row could not be read (USAGE without SELECT): a placeholder, not the start value.
+    assert pg_sequence_next_value(_sequence(start=100, last=None)) is None
     # Not readable: a placeholder that fails loudly rather than restarting at 1.
     unreadable = _sequence(last=None, readable=False)
     assert pg_sequence_next_value(unreadable) is None
@@ -925,9 +951,22 @@ def test_the_session_probe_filters_to_the_selected_tables(monkeypatch) -> None:
         def dispose(self) -> None:
             pass
 
+    executed: list[str] = []
+
+    class _Connection:
+        class dialect:  # noqa: N801 - mirrors SQLAlchemy's attribute
+            name = "postgresql"
+
+        def execution_options(self, **kwargs):  # noqa: ANN003, ANN201
+            executed.append(f"options {kwargs}")
+            return self
+
+        def execute(self, statement, *_a):  # noqa: ANN001, ANN201
+            executed.append(str(statement))
+
     class _Ctx:
         def __enter__(self):  # noqa: ANN204
-            return object()
+            return _Connection()
 
         def __exit__(self, *_exc):  # noqa: ANN002, ANN204
             return False
@@ -943,6 +982,9 @@ def test_the_session_probe_filters_to_the_selected_tables(monkeypatch) -> None:
     )
     read = probe.row_security(["app.orders"])
     assert [t.table for t in read.tables] == ["app.orders"] and read.login == _login()
+    # Bounded like Evaluation's read: a policy's table locked by another session cannot
+    # make "Run checks" wait for it.
+    assert executed == ["options {'isolation_level': 'AUTOCOMMIT'}", "SET lock_timeout = '5s'"]
     mysql = SessionSourceProbe(SourceConnectionConfig(host="h", database="d"), None)
     assert mysql.row_security(["app.orders"]) is None
 
@@ -962,15 +1004,10 @@ _REFUSAL = _InsufficientPrivilege(
 
 
 def test_a_refused_load_explains_itself() -> None:
-    from dsql_migrator.core.introspector import (
-        SOURCE_ROW_SECURITY_HINT,
-        row_security_hint,
-        source_error_hint,
-    )
+    from dsql_migrator.core.introspector import SOURCE_ROW_SECURITY_HINT, source_error_hint
 
     assert source_error_hint(_REFUSAL, SourceType.POSTGRES) == SOURCE_ROW_SECURITY_HINT
-    assert row_security_hint(_REFUSAL, SourceType.POSTGRES) == SOURCE_ROW_SECURITY_HINT
-    assert row_security_hint(_REFUSAL, SourceType.MYSQL) is None
+    assert source_error_hint(_REFUSAL, SourceType.MYSQL) != SOURCE_ROW_SECURITY_HINT
     assert "BYPASSRLS" in SOURCE_ROW_SECURITY_HINT
     assert "row_security = off" in SOURCE_ROW_SECURITY_HINT
 
@@ -991,3 +1028,118 @@ def test_a_refused_validation_table_explains_itself() -> None:
     )
     assert result.error.startswith("_InsufficientPrivilege: query would be affected")
     assert "BYPASSRLS" in result.error
+
+
+def test_the_default_multi_process_load_keeps_the_refusal_hint(monkeypatch) -> None:
+    """The process workers returned the bare driver text; only the thread fallback (one
+    table at a time) added the hint."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.introspector import SOURCE_ROW_SECURITY_HINT
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    def _refuse(*_a, **_k):
+        raise _REFUSAL
+
+    monkeypatch.setattr(engine, "BatchedTableMigrator", _refuse)
+    inputs = SimpleNamespace(
+        source_config=SimpleNamespace(source_type=SourceType.POSTGRES), excluded_lob_columns={}
+    )
+    table = _pg_table("app.orders")
+    result = engine._migrate_one_table_in_process(
+        engine._TableWorkerArgs(job_id="j", table=table, inputs=inputs)
+    )
+    assert result.status == "FAILED" and SOURCE_ROW_SECURITY_HINT in result.error_message
+    shard = engine._migrate_shard_in_process(
+        engine._ShardWorkerArgs(
+            job_id="j", table=table, inputs=inputs, pk_lower=None, pk_upper=None, shard_index=0
+        )
+    )
+    assert shard.status == "FAILED" and SOURCE_ROW_SECURITY_HINT in shard.error_message
+
+
+def test_a_refused_shard_plan_loads_the_table_with_one_reader() -> None:
+    """The planning MIN/MAX of a large RLS table raised inside the parent's planning loop
+    and ended the whole run before any table was loaded."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration._full_load_engine import _planned_shard_ranges
+
+    class _Exporter:
+        def plan_pk_shard_ranges(self, *_a, **_k):
+            raise _REFUSAL
+
+    migrator = SimpleNamespace(_exporter=_Exporter(), _inputs=SimpleNamespace(source_config=None))
+    assert _planned_shard_ranges(migrator, _pg_table("app.orders"), 4, 0) == []
+
+
+def test_a_sequence_shared_by_column_defaults_is_re_attached_not_replaced_by_identities() -> None:
+    """Two tables' order_no DEFAULT nextval('shop.order_no_seq'): the sequence item said
+    create the sequence (which restores no DEFAULT) and NON_KEY_SEQUENCE told each table to
+    add its own identity -- two counters handing out the same order numbers."""
+    from dsql_migrator.core.converter_postgres import pg_identity_fallback, pg_nextval_sequence
+
+    shared = "nextval('shop.order_no_seq'::regclass)"
+    tables = [
+        _pg_table(name, ColumnDef(name="order_no", mysql_type="bigint", nullable=False, default=shared))
+        for name in ("shop.web_orders", "shop.store_orders")
+    ]
+    (item,) = standalone_sequence_items(
+        [_sequence(name="shop.order_no_seq")], SourceInventory(tables=tables)
+    )
+    assert "shop.web_orders.order_no, shop.store_orders.order_no" in item.risk
+    assert (
+        'ALTER TABLE "shop"."web_orders" ALTER COLUMN "order_no" SET DEFAULT '
+        "nextval('\"shop\".\"order_no_seq\"');" in item.recommendation
+    )
+    assert "Do not give those columns an identity" in item.recommendation
+    # The identity advice says the same for a DEFAULT that is not the column's own serial.
+    advice = pg_identity_fallback([tables[0].columns[1]])
+    assert "'order_no' calls shop.order_no_seq" in advice and "do not add an identity" in advice
+    own = ColumnDef(name="n", mysql_type="integer", nullable=False,
+                    default="nextval('shop.t_n_seq'::regclass)")
+    assert "do not add an identity" not in pg_identity_fallback([own])
+    # Both CACHE choices are offered: 1 keeps the source's gap-free numbering.
+    assert "CACHE 1 keeps the source's one-value-at-a-time numbering" in advice
+    assert pg_nextval_sequence("""nextval('"Shop"."Seq"'::regclass)""") == "Shop.Seq"
+
+
+def test_a_report_without_the_probe_says_so_after_a_refresh_or_restore() -> None:
+    """A PostgreSQL report from before the probe kept reading 'Ready' over tables with
+    tenant-isolation policies: it held no trace of the probe, like one that found nothing."""
+    from dsql_migrator.core.models import TargetInventory
+    from dsql_migrator.ui.evaluation import (
+        EvaluationResult,
+        compute_migration_score,
+        with_refreshed_catalogs,
+    )
+
+    inventory = SourceInventory(tables=[_pg_table("app.orders")])
+    old = EvaluationResult(
+        inventory=inventory,
+        assessment=_pg_assess(_pg_table("app.orders")),
+        target_inventory=TargetInventory(),
+        target_conflicts=[],
+        source_type=SourceType.POSTGRES,
+    )
+    refreshed = with_refreshed_catalogs(
+        old, inventory=inventory, target_inventory=TargetInventory(), target_endpoint=None
+    )
+    (unread,) = [i for i in refreshed.assessment.items if i.rule_id == "PG_CATALOG_UNREAD"]
+    assert "were not checked" in unread.risk and "re-run Step 1" in unread.risk
+    # A report whose probe ran (and found nothing) carries its note instead.
+    probed = old.__class__(**{
+        **old.__dict__,
+        "assessment": with_pg_catalog_facts(
+            old.assessment, PgCatalogFacts(row_security=RowSecurityFacts(login=None), sequences=())
+        ),
+    })
+    again = with_refreshed_catalogs(
+        probed, inventory=inventory, target_inventory=TargetInventory(), target_endpoint=None
+    )
+    rule_ids = [i.rule_id for i in again.assessment.items]
+    assert "PG_CATALOG_CHECKED" in rule_ids and "PG_CATALOG_UNREAD" not in rule_ids
+    # The note is not an object to migrate: it does not dilute the score.
+    assert compute_migration_score(again.assessment).score == compute_migration_score(
+        old.assessment
+    ).score

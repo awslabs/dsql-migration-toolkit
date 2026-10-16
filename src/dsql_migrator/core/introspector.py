@@ -197,17 +197,6 @@ SOURCE_ROW_SECURITY_HINT = (
 )
 
 
-def row_security_hint(
-    exc: BaseException, source_type: SourceType = SourceType.MYSQL
-) -> Optional[str]:
-    """:data:`SOURCE_ROW_SECURITY_HINT` when ``exc`` is that refusal, else ``None``."""
-    from dsql_migrator.core.source_dialect import dialect_for
-
-    if dialect_for(source_type).is_row_security_refusal(exc):
-        return SOURCE_ROW_SECURITY_HINT
-    return None
-
-
 # Codes that specifically mean the SOURCE ran out of connection slots, which needs
 # different advice from a failover: fewer concurrent readers, not "wait and re-run".
 _MYSQL_TOO_MANY_CONNECTIONS_CODES = frozenset({1040, 1203})

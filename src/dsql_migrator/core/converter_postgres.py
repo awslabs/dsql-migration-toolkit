@@ -143,7 +143,34 @@ def pg_column_default_sql(
 _PG_BIGINT_TYPES = frozenset({"bigint", "int8"})
 
 
-def pg_identity_fallback(columns: "Sequence[ColumnDef]") -> str:
+# ``nextval('<sequence>'::regclass)`` as PostgreSQL renders a sequence DEFAULT: the literal
+# names the sequence, quoted parts as written (an unquoted part is already folded).
+_NEXTVAL_RE = re.compile(r"\bnextval\s*\(\s*'((?:[^']|'')+)'(?:\s*::\s*regclass)?\s*\)", re.IGNORECASE)
+
+
+def pg_nextval_sequence(default: Optional[str]) -> Optional[str]:
+    """The sequence a ``nextval(...)`` DEFAULT calls (``schema.name`` or a bare ``name``,
+    quotes removed), or ``None``. Pure."""
+    match = _NEXTVAL_RE.search(default or "")
+    if match is None:
+        return None
+    literal = match.group(1).replace("''", "'")
+    parts = re.findall(r'"((?:[^"]|"")*)"|([^."]+)', literal)
+    names = [quoted.replace('""', '"') if quoted else bare for quoted, bare in parts]
+    return ".".join(names) if names else None
+
+
+def _own_serial_sequence(sequence: str, column: str, table: Optional[str]) -> bool:
+    """Whether ``sequence`` looks like ``column``'s own serial sequence, which PostgreSQL
+    names ``<table>_<column>_seq`` (a number appended when that is taken). Without the
+    table, the ``_<column>_seq`` ending is what can be told."""
+    bare = sequence.rsplit(".", 1)[-1]
+    if table:
+        return bare.startswith(f"{table.rsplit('.', 1)[-1]}_{column}_seq")
+    return bare.endswith(f"_{column}_seq")
+
+
+def pg_identity_fallback(columns: "Sequence[ColumnDef]", table: Optional[str] = None) -> str:
     """How to have Aurora DSQL generate these sequence-fed columns' values with an identity:
     the clause both Schema Conversion's note on a non-key ``serial`` / identity column and
     Evaluation's ``NON_KEY_SEQUENCE`` finding give, so the two steps say the same thing.
@@ -185,7 +212,33 @@ def pg_identity_fallback(columns: "Sequence[ColumnDef]") -> str:
             f"apply, so declare {'it' if one else 'them'} bigint {identity} in the target "
             "DDL before applying (an identity column holds no NULL)"
         )
-    return "; ".join(parts) + "; then " + IDENTITY_RESTART_ADVICE
+    text = "; ".join(parts) + "; then " + IDENTITY_RESTART_ADVICE
+    # CACHE 1 is the source's own default: one value at a time, no gaps. Said, because the
+    # clause above silently traded that for throughput.
+    text += (
+        f" (CACHE {_IDENTITY_CACHE_SIZE} serves concurrent inserts faster but leaves gaps "
+        "and out-of-order values; CACHE 1 keeps the source's one-value-at-a-time numbering, "
+        "and Aurora DSQL accepts only those two kinds of size)"
+    )
+    # A DEFAULT that calls a sequence other than the column's own serial one may be a
+    # sequence several tables share: an identity per table would give each its own
+    # counter, and they would hand out the same numbers.
+    shared = [
+        (column.name, sequence)
+        for column in columns
+        if not column.identity
+        and (sequence := pg_nextval_sequence(column.default)) is not None
+        and not _own_serial_sequence(sequence, column.name, table)
+    ]
+    if shared:
+        named = ", ".join(f"'{name}' calls {sequence}" for name, sequence in shared)
+        text += (
+            f". {named}, which is not its own serial sequence: if other tables share it, "
+            "do not add an identity -- create the sequence on Aurora DSQL and re-attach the "
+            "DEFAULT (ALTER TABLE ... ALTER COLUMN ... SET DEFAULT nextval(...)), as Step 1's "
+            "item for that sequence says"
+        )
+    return text
 
 
 # Aurora DSQL's sequence rules, from its CREATE SEQUENCE documentation: CACHE must be stated
@@ -202,12 +255,14 @@ def pg_sequence_next_value(sequence: "StandaloneSequence") -> Optional[int]:
 
     ``last_value`` is the last value written to disk, which a cached sequence may have
     reserved ahead of what it handed out, so starting after it can skip values but never
-    repeats one.
+    repeats one. When nothing has been drawn since the sequence was created or reset
+    (``is_called`` False) ``last_value`` IS the next value; when it could not be read at
+    all, neither is the next one.
     """
-    if not sequence.readable:
+    if not sequence.readable or sequence.last_value is None:
         return None
-    if sequence.last_value is None:
-        return sequence.start_value
+    if sequence.is_called is False:
+        return sequence.last_value
     following = sequence.last_value + sequence.increment
     if sequence.min_value <= following <= sequence.max_value:
         return following

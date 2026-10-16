@@ -713,7 +713,7 @@ def _wcodes(found):
     return [f.code for f in found]
 
 
-def test_w1_and_w2_read_the_applied_ddl_and_render_the_default():
+def test_w1_and_w2_read_the_applied_ddl_and_quote_its_default():
     ctx = _w_ctx()
     code = column_exclusion_warnings("shop.orders", "code", ctx)
     assert _wcodes(code) == [W1, W2, W5]
@@ -722,9 +722,10 @@ def test_w1_and_w2_read_the_applied_ddl_and_render_the_default():
         "in place (a later Drop & reload of this table restores it).")
     assert code[1].message == (
         "DEFAULT '' is dropped for the migration and restored at Cut over (new rows only).")
+    # As the applied DDL writes it, not sqlglot's render (CAST(... AS BYTEA), '1 DAY').
     assert column_exclusion_warnings("shop.orders", "blob", ctx)[0].message.startswith(
-        "DEFAULT CAST('\\x00' AS BYTEA) is dropped")
-    assert "DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 DAY') is dropped" in (
+        "DEFAULT '\\x00'::bytea is dropped")
+    assert "DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 day') is dropped" in (
         column_exclusion_warnings("shop.orders", "due", ctx)[0].message)
     assert column_exclusion_warnings("shop.orders", "notes", ctx) == ()
 
@@ -930,3 +931,28 @@ def test_legacy_notes_replace_the_overlay_story():
     assert note.code == WL and "stores NULL" in note.message
     (must,) = legacy_exclusion_notes("shop.acct", "must", ctx)
     assert must.code == WL_REJECT and "23502" in must.message
+
+
+def test_w2_quotes_each_default_as_the_applied_ddl_writes_it():
+    """The note quoted sqlglot's render -- CURRENT_TIME(), a dropped time zone -- as the
+    DEFAULT 'restored at Cut over', where the DDL (and the restore) carry PostgreSQL's own."""
+    from types import SimpleNamespace
+
+    ddl = (
+        'CREATE TABLE "s"."t" ("id" bigint NOT NULL PRIMARY KEY, '
+        "\"day\" timestamptz DEFAULT date_trunc('day'::text, now(), 'Asia/Seoul'::text), "
+        '"clock" time DEFAULT CURRENT_TIME NOT NULL)'
+    )
+    t = TableDef(name="s.t", columns=[
+        ColumnDef(name="id", mysql_type="bigint", nullable=False),
+        ColumnDef(name="day", mysql_type="timestamptz"),
+        ColumnDef(name="clock", mysql_type="time", nullable=False)], primary_key=["id"])
+    ctx = build_exclusion_context(
+        SourceInventory(tables=[t]),
+        applied_conversions={"s.t": SimpleNamespace(target_ddl=ddl, index_ddls=[])},
+        warnings=True,
+    )
+    notes = {f.code: f.message for f in column_exclusion_warnings("s.t", "day", ctx)}
+    assert "DEFAULT date_trunc('day'::text, now(), 'Asia/Seoul'::text) is dropped" in notes[W2]
+    notes = {f.code: f.message for f in column_exclusion_warnings("s.t", "clock", ctx)}
+    assert "DEFAULT CURRENT_TIME is dropped" in notes[W2]

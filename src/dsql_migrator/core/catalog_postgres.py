@@ -88,9 +88,12 @@ class StandaloneSequence:
     ``serial`` column or ``OWNED BY`` -- nor an ``'i'`` link -- an identity column), with
     its ``pg_sequences`` definition.
 
-    ``last_value`` is the last value written to disk, ``None`` when the sequence has never
-    been used OR when the source user may not read it; ``readable`` tells the two apart
-    (``has_sequence_privilege(..., 'SELECT,USAGE')``).
+    ``last_value`` is the last value written to disk, ``None`` when the source user may not
+    read it (``readable``: ``has_sequence_privilege(..., 'SELECT,USAGE')``) or when it could
+    not be read from the sequence itself. ``is_called`` is ``False`` when nothing has been
+    drawn from the sequence since it was created, RESTARTed or ``setval(..., false)``-ed:
+    ``last_value`` is then the value its next ``nextval()`` returns (``pg_sequences`` shows
+    NULL for that state, so it is read from the sequence's own row).
     """
 
     name: str
@@ -103,6 +106,7 @@ class StandaloneSequence:
     cache_size: int
     last_value: Optional[int]
     readable: bool
+    is_called: Optional[bool] = None
 
 
 @dataclass(frozen=True)

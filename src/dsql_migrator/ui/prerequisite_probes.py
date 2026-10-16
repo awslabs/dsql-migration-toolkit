@@ -433,12 +433,19 @@ class SessionSourceProbe:
         if self._config.source_type is not SourceType.POSTGRES:
             return None
         from dsql_migrator.core.catalog_postgres import RowSecurityFacts
+        from dsql_migrator.core.introspector import _limit_lock_waits
         from dsql_migrator.core.source_dialect import dialect_for
 
         try:
             engine = self._engine_factory(self._config)
             try:
                 with engine.connect() as connection:
+                    # Bounded like Evaluation's read: deparsing a policy locks its table,
+                    # so behind an ALTER TABLE or VACUUM FULL this waited (and "Run
+                    # checks" spun) until the other session let go. A timeout is "not
+                    # read": the row says so instead of hanging.
+                    connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+                    _limit_lock_waits(connection)
                     facts = dialect_for(self._config.source_type).read_row_security(
                         connection
                     )

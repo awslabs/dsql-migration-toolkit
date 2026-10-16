@@ -42,6 +42,7 @@ from dsql_migrator.core.activity_log import (
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.exporter import ExportCancelled, TableExporter
 from dsql_migrator.core.introspector import (
+    ReadOnlySourceError,
     is_source_transient_error,
     source_error_hint,
 )
@@ -1352,9 +1353,22 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             # server DETAIL/"Failing row contains (...)" line, i.e. the offending
             # row's COLUMN VALUES. This message is surfaced to the AI DBA via
             # list_failed_full_load_tables, so it must be value-free (Property 7).
-            error_message=safe_error_message(exc),
+            error_message=_worker_error_message(exc, args.inputs),
             error_code=_error_code(exc),
         )
+
+
+def _worker_error_message(exc: BaseException, inputs: "DataMigrationInputs") -> str:
+    """A process worker's failure, worded as the thread path words it: the value-free
+    message plus the what-to-do hint (a source refusal or dropped connection, else the
+    target-side one). The parent records it as given, so without the hint here the default
+    multi-process load showed only the driver text."""
+    message = safe_error_message(exc)
+    if isinstance(exc, OverlayRunError):
+        return message
+    source_type = getattr(getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL)
+    hint = source_error_hint(exc, source_type) or target_error_hint(exc)
+    return f"{message} — {hint}" if hint else message
 
 
 def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
@@ -1584,7 +1598,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             # safe_error_message, not f"{exc}": drop the psycopg DETAIL/"Failing
             # row contains (...)" row-value line before it reaches the durable
             # result and, via list_failed_full_load_tables, the AI DBA (Property 7).
-            error_message=safe_error_message(exc),
+            error_message=_worker_error_message(exc, args.inputs),
             error_code=_error_code(exc),
         )
 
@@ -2709,6 +2723,26 @@ class _OverlayPrepass:
                 self._handle.heartbeat()
 
 
+def _planned_shard_ranges(
+    migrator: "DataMigrator", table: TableDef, shards: int, min_rows: int
+) -> list:
+    """The PK ranges to read ``table`` in, or ``[]`` (one reader) when the planning read
+    fails -- row-level security refusing its MIN/MAX, say. The table then fails, or loads,
+    on its own with its own error; raised, it ended the whole run before any table loaded."""
+    try:
+        return migrator._exporter.plan_pk_shard_ranges(  # type: ignore[attr-defined]
+            migrator._inputs.source_config,  # type: ignore[attr-defined]
+            table,
+            shards,
+            min_rows=min_rows,
+        )
+    except ReadOnlySourceError:
+        raise
+    except Exception:  # noqa: BLE001 - this table's problem, not the run's
+        _LOGGER.warning("Shard planning failed for %s; loading it with one reader", table.name)
+        return []
+
+
 def _migrate_tables_in_parallel(
     handle: JobHandle,
     job_id: str,
@@ -2848,11 +2882,8 @@ def _migrate_tables_in_parallel(
             if not shardable:
                 work_units.append(("table", table))
                 continue
-            shard_ranges = migrator._exporter.plan_pk_shard_ranges(
-                migrator._inputs.source_config,
-                table,
-                effective_reader_shards,
-                min_rows=cfg.full_load_shard_min_rows,
+            shard_ranges = _planned_shard_ranges(
+                migrator, table, effective_reader_shards, cfg.full_load_shard_min_rows
             )
             if len(shard_ranges) > 1:
                 for i, (lo, hi) in enumerate(shard_ranges):
