@@ -76,9 +76,9 @@ converge on one partition, spiking the OCC conflict rate and creating a write
 hot-spot **even when rows don't logically conflict**.
 
 The tool surfaces this at **Evaluation** (`AUTO_INCREMENT` → `MANUAL`) and offers
-PK strategies in **Schema Conversion** — keep the integer PK, convert to **UUID**,
-or use an **identity column with caching** — so you can spread writes across the
-key range. This is a DSQL-specific concern that a same-engine (MySQL→MySQL)
+PK strategies in **Schema Conversion** — an **identity column with caching** (the
+default for a single-column `AUTO_INCREMENT` key that `bigint` holds), keep the integer
+PK, or a composite key — so you can spread writes across the key range. This is a DSQL-specific concern that a same-engine (MySQL→MySQL)
 migration never has to think about.
 
 #### The composite-key option — the one lever that moves the server-side wall

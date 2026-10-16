@@ -1572,7 +1572,7 @@ def sync_identity_sequences(
             cursor = connection.cursor()
             try:
                 # Identity columns only: ``is_identity`` is the catalog's own answer, so a
-                # plain integer key (the KEEP_INTEGER default) is correctly skipped rather
+                # plain integer key (a Keep source PK table) is correctly skipped rather
                 # than having a sequence invented for it. Bound parameters throughout.
                 if schema_name is not None:
                     cursor.execute(

@@ -761,80 +761,106 @@ class EventRule(Rule):
         ]
 
 
+# Why a different key buys throughput (the optional half of every AUTO_INCREMENT finding).
+_MONOTONIC_KEY_NOTE = (
+    " Separately, for higher insert throughput: DSQL stores rows in primary-key order, so "
+    "a monotonically increasing key concentrates writes on one partition."
+)
+
+
 class AutoIncrementRule(Rule):
-    """Note tables whose AUTO_INCREMENT key is worth revisiting for throughput.
+    """What becomes of a MySQL AUTO_INCREMENT key's value generation, per table.
 
-    This is THROUGHPUT ADVICE, not a compatibility gap. An AUTO_INCREMENT integer key
-    converts cleanly and works correctly on DSQL -- nothing is dropped and no query
-    returns a different answer. Moving to a UUID/random or cached-identity key buys
-    insert throughput, because DSQL stores rows in primary-key order so a monotonic key
-    concentrates writes on one partition.
-
-    The wording therefore leads with what is true of the table ("converts cleanly")
-    rather than with a consequence ("causes hot partitions"), which described a tuning
-    opportunity as though it were a failure. Schema Conversion already made exactly this
-    correction in v0.1.151 -- see ``ConversionNoteKind.RECOMMENDATION`` in
-    ``core/converter.py``, which files the same condition as advice rather than a loss --
-    and this rule was missed at the time, so the two screens contradicted each other
-    about the same key.
+    Schema Conversion defaults a single-column integer AUTO_INCREMENT key that bigint holds
+    to a cached identity (``default_primary_key_strategy``), so the key keeps generating --
+    worded like the PostgreSQL rule, whose serial / identity key has the same default. It
+    used to keep a plain integer, which reached cut over with no generator: the
+    application's INSERTs that leave the key out failed. A ``bigint unsigned`` key (wider
+    than an identity's bigint) and a key column inside a composite primary key still lose
+    the generation, and say so.
     """
 
     rule_id = "AUTO_INCREMENT"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         # Lazy: converter imports this module at load time.
-        from dsql_migrator.core.converter import IDENTITY_FALLBACK_CAVEAT
+        from dsql_migrator.core.converter import (
+            IDENTITY_FALLBACK_CAVEAT,
+            mysql_identity_is_lossless,
+        )
 
         findings: list[Finding] = []
         for table in inventory.tables:
             column = table.auto_increment_column
-            if column:
-                findings.append(
-                    Finding(
-                        object=ObjectKey(KIND_TABLE, table.name),
-                        rule_id=self.rule_id,
-                        classification=Classification.MANUAL,
-                        risk=(
-                            f"The integer key from AUTO_INCREMENT column '{column}' "
-                            "converts cleanly, but Aurora DSQL will NOT generate it: the "
-                            "default conversion keeps a plain integer with no identity, so "
-                            "the APPLICATION must supply the value on every insert — code "
-                            "that relied on the database generating it fails or collides. "
-                            "Separately, for higher insert throughput consider a different "
-                            "key: DSQL stores rows in primary-key order, so a monotonically "
-                            "increasing key concentrates writes on one partition."
-                        ),
-                        # Only name a strategy the picker OFFERS. The IDENTITY tile is
-                        # rendered only for a SINGLE-column primary key that IS the
-                        # generated column, so on a composite-PK table this recommendation
-                        # sent the operator to a control Schema Conversion never shows.
-                        # (MySQL keeps the plain-integer default: AUTO_INCREMENT is not an
-                        # identity column, so converting it to one stays the operator's
-                        # decision -- unlike a PostgreSQL source, whose key already IS an
-                        # identity and is defaulted to one.)
-                        recommendation=(
-                            "Decide at Schema Conversion who generates the key: "
-                            + (
-                                "choose the 'Server-generated (IDENTITY)' strategy to have "
-                                "DSQL fill it (the column is widened to bigint), or keep "
-                                "the plain integer and supply the value from the "
-                                "application."
-                                if table.primary_key == [column]
-                                else "IDENTITY cannot be used for this table because its "
-                                f"primary key is composite ({', '.join(table.primary_key)}) "
-                                "and a DSQL identity applies to a single column, so the "
-                                "value must come from the application — or add an identity "
-                                "to the column on the target after apply, "
-                                + IDENTITY_FALLBACK_CAVEAT
-                                + "."
-                            )
-                            + " Optional, for throughput only: a UUID/random key or a "
-                            "cached identity spreads the writes."
-                        ),
-                        effort=EffortLevel.MEDIUM,
-                        note_kind=ConversionNoteKind.RECOMMENDATION,
-                    )
+            if not column:
+                continue
+            single = table.primary_key == [column]
+            if single and mysql_identity_is_lossless(table):
+                risk = (
+                    f"The key from AUTO_INCREMENT column '{column}' converts cleanly AND "
+                    "keeps generating values: the default conversion makes it a cached "
+                    "identity, so the application still does not supply the key. Two "
+                    "things change. The column is WIDENED to bigint (Aurora DSQL supports "
+                    "an identity only on bigint) — lossless for the values, but check "
+                    "anything that assumes a 4-byte id. And because each DSQL node draws "
+                    "its own block of values from the cache, the key is no longer "
+                    "gap-free or strictly increasing, which also spreads inserts instead of "
+                    "concentrating them on one partition (DSQL stores rows in primary-key "
+                    "order). Unlike AUTO_INCREMENT, an id the application supplies itself "
+                    "after cut over does not advance the sequence."
                 )
+                recommendation = (
+                    "No action needed to keep the behaviour: Schema Conversion defaults to "
+                    "'Server-generated (IDENTITY)' for this table, and Full Load loads the "
+                    "source's own ids before advancing the sequence past them (again at "
+                    "cut over). Switch to 'Keep source PK' only if the application "
+                    "supplies the key itself — that leaves the column a plain integer "
+                    "with no generator."
+                )
+            elif single:
+                risk = (
+                    f"The bigint unsigned key from AUTO_INCREMENT column '{column}' is "
+                    "kept as numeric(20,0) to hold its whole range, so Aurora DSQL will NOT "
+                    "generate it: an identity must be bigint. The APPLICATION must supply "
+                    "the value on every insert — code that relied on the database "
+                    "generating it fails or collides." + _MONOTONIC_KEY_NOTE
+                )
+                recommendation = (
+                    "Decide at Schema Conversion who generates the key: keep it and supply "
+                    "the value from the application, or choose 'Server-generated "
+                    "(IDENTITY)' if every value fits a signed bigint (up to "
+                    "9223372036854775807) — a larger one fails to load."
+                )
+            else:
+                risk = (
+                    f"The integer key from AUTO_INCREMENT column '{column}' converts "
+                    "cleanly, but Aurora DSQL will NOT generate it: the column stays a "
+                    "plain integer, so the APPLICATION must supply the value on every "
+                    "insert — code that relied on the database generating it fails or "
+                    "collides." + _MONOTONIC_KEY_NOTE
+                )
+                # Only name a strategy the picker OFFERS: its IDENTITY tile is rendered
+                # only for a single-column key that IS the generated column.
+                recommendation = (
+                    "IDENTITY cannot be used for this table because its primary key is "
+                    f"composite ({', '.join(table.primary_key)}) and a DSQL identity "
+                    "applies to a single column, so the value must come from the "
+                    "application — or add an identity to the column on the target after "
+                    "apply, " + IDENTITY_FALLBACK_CAVEAT + "."
+                )
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=risk,
+                    recommendation=recommendation
+                    + " Optional, for throughput only: a UUID/random key spreads the "
+                    "writes further.",
+                    effort=EffortLevel.MEDIUM,
+                    note_kind=ConversionNoteKind.RECOMMENDATION,
+                )
+            )
         return findings
 
 

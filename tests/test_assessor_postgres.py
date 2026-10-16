@@ -647,9 +647,10 @@ def test_identity_finding_states_who_generates_the_key_not_only_throughput() -> 
 
     * PostgreSQL: the source column already IS an identity / ``serial``, so the converter
       defaults to a DSQL identity and the generation is KEPT (nothing to change in the app).
-    * MySQL: ``AUTO_INCREMENT`` is a different mechanism, so converting it to an identity
-      stays the operator's explicit choice; the default keeps a plain integer and the
-      APPLICATION must supply the value.
+    * MySQL: the same default since the 2026-10 Evaluation review, wherever bigint holds
+      the key -- a plain integer default reached cut over with no generator. A
+      ``bigint unsigned`` key keeps the plain default, and there the APPLICATION supplies
+      the value.
     """
     from dsql_migrator.core.assessor import AutoIncrementRule
     from dsql_migrator.core.assessor_postgres import PgIdentityKeyRule
@@ -671,11 +672,21 @@ def test_identity_finding_states_who_generates_the_key_not_only_throughput() -> 
     assert "Switch to 'Keep source PK' only if" in pg.recommendation
 
     mysql = AutoIncrementRule().evaluate(SourceInventory(tables=[table]))[0]
-    assert "will NOT generate it" in mysql.risk, mysql.risk
-    assert "APPLICATION must supply" in mysql.risk, mysql.risk
-    assert "Server-generated (IDENTITY)" in mysql.recommendation
+    assert "keeps generating values" in mysql.risk, mysql.risk
+    assert "WIDENED to bigint" in mysql.risk and "no longer gap-free" in mysql.risk
+    assert "APPLICATION must supply" not in mysql.risk, mysql.risk
+    # The one AUTO_INCREMENT semantic an identity does not reproduce.
+    assert "does not advance the sequence" in mysql.risk, mysql.risk
+    assert "defaults to 'Server-generated (IDENTITY)'" in mysql.recommendation
 
-    for finding in (pg, mysql):
+    unsigned = table.model_copy(
+        update={"columns": [ColumnDef(name="id", mysql_type="bigint unsigned")]}
+    )
+    kept = AutoIncrementRule().evaluate(SourceInventory(tables=[unsigned]))[0]
+    assert "will NOT generate it" in kept.risk and "APPLICATION must supply" in kept.risk
+    assert "Server-generated (IDENTITY)" in kept.recommendation
+
+    for finding in (pg, mysql, kept):
         text = finding.risk + " " + finding.recommendation
         # Still calibrated as advice, not a failure (the v0.1.151 correction): the
         # THROUGHPUT half stays explicitly optional, and the throughput mechanism is kept.

@@ -405,21 +405,46 @@ def default_primary_key_strategy(
     ``bigint``. A PG serial / identity key is always int2/int4/int8, so that widening is
     always lossless.
 
-    MySQL: ``KEEP_INTEGER``, unchanged. ``AUTO_INCREMENT`` is not an identity column --
-    it is a different mechanism with different semantics -- so converting it to one is a
-    deliberate choice the operator makes in Schema Conversion, not something the tool
-    does on their behalf. (It is also the engine where the widening can COST something:
-    ``bigint unsigned`` maps to ``numeric(20, 0)`` to preserve its range, and an identity
-    must be ``bigint``, so a value above 2^63-1 would fail to load.)
+    MySQL: ``IDENTITY_WITH_CACHE`` too, wherever the widening to ``bigint`` is lossless
+    (:func:`mysql_identity_is_lossless`). ``KEEP_INTEGER`` used to be the MySQL default,
+    and it dropped what ``AUTO_INCREMENT`` is for: after cut over an application INSERT that
+    leaves the key out -- the usual one -- found no generator and failed. The column keeps
+    working as the database's own key generator; Full Load and CDC still write the source's
+    ids (``BY DEFAULT``), and the sequence is restarted past them after the load and at cut
+    over. One difference from MySQL remains: an id the application supplies itself after
+    cut over does not advance the sequence. ``bigint unsigned`` keeps ``KEEP_INTEGER``: it
+    maps to ``numeric(20, 0)`` to keep its range, and an identity must be ``bigint``.
 
     Resolved PER TABLE, so one global option cannot force an identity onto a composite
     key.
     """
-    if not is_postgres:
-        return PrimaryKeyStrategy.KEEP_INTEGER
     if not identity_strategy_applies(table):
         return PrimaryKeyStrategy.KEEP_INTEGER
+    if not is_postgres and not mysql_identity_is_lossless(table):
+        return PrimaryKeyStrategy.KEEP_INTEGER
     return PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+
+
+# MySQL integer types an identity (always bigint on Aurora DSQL) holds every value of.
+_MYSQL_IDENTITY_INTEGERS = frozenset(
+    {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
+)
+
+
+def mysql_identity_is_lossless(table: TableDef) -> bool:
+    """Whether a MySQL ``AUTO_INCREMENT`` key can become a ``bigint`` identity without
+    losing a value: an integer column, other than ``bigint unsigned`` (whose range
+    exceeds bigint's). A float/double AUTO_INCREMENT (allowed by older MySQL) is not."""
+    column = next(
+        (c for c in table.columns if c.name == table.auto_increment_column), None
+    )
+    if column is None:
+        return False
+    declared = (column.mysql_type or "").lower()
+    base = re.split(r"[\s(]", declared.strip(), maxsplit=1)[0]
+    if base not in _MYSQL_IDENTITY_INTEGERS:
+        return False
+    return not (base == "bigint" and "unsigned" in declared)
 
 
 class SchemaConvertOptions(BaseModel):
@@ -3207,6 +3232,12 @@ def _apply_pk_strategy(
             "the source's own ids and the sequence is advanced past them afterwards, so "
             "later application inserts do not collide."
         )
+        if key_word == "AUTO_INCREMENT":
+            message += (
+                " One difference from AUTO_INCREMENT remains: an id the application "
+                "supplies itself after cut over does not advance the sequence, so a value "
+                "generated later can collide with it."
+            )
     else:  # PrimaryKeyStrategy.KEEP_INTEGER
         message = (
             f"The integer key from {key_word} column '{column_name}' was kept as a "

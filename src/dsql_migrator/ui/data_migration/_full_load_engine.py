@@ -368,7 +368,7 @@ def _sync_identity_sequences_after_load(
 
     Returns ``{table: restart_value_or_None}``. Never raises: a load that finished
     correctly must not be reported FAILED because of this follow-up, and a table with no
-    identity column (the KEEP_INTEGER default) legitimately yields ``None``. The caller
+    identity column (a Keep source PK table) legitimately yields ``None``. The caller
     logs the outcome so an unrepaired sequence is never silent.
 
     ``sync`` is an injectable seam (tests pass a fake; production uses the real
@@ -3317,7 +3317,7 @@ def _log_identity_sequence_sync(
     The log entry is the point: an unrepaired identity sequence only fails after
     cut-over, so "we tried and here is what happened" has to be in the durable audit
     trail rather than inferred. Tables with no identity column are omitted (the
-    KEEP_INTEGER default), so a schema without any produces no noise.
+    Keep source PK strategy), so a schema without any produces no noise.
     """
     if inputs is None:
         return {}

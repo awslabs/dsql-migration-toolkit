@@ -206,9 +206,10 @@ def test_auto_increment_rule_reads_as_throughput_advice_not_a_failure() -> None:
     concern = next(c for c in item.concerns if c.rule_id == "AUTO_INCREMENT")
     assert concern.is_advisory
     text = item.risk.lower()
-    # Leads with what is TRUE of the table, not with a consequence.
-    assert "converts cleanly" in text
-    assert "throughput" in text
+    # Leads with what is TRUE of the table, not with a consequence: the default keeps the
+    # key generating (a cached identity), and the throughput half is optional advice.
+    assert "converts cleanly" in text and "keeps generating values" in text
+    assert "throughput" in item.recommendation.lower()
     # The partitioning mechanism is still explained -- that is the actionable part.
     assert "primary-key order" in text
     # But it is no longer asserted as a failure the operator has to fix.
@@ -1675,7 +1676,7 @@ def test_text_export_labels_an_advisory_finding_as_recommended() -> None:
     assert "[RECOMMENDED] AUTO_INCREMENT" in text
     assert "effort if you take it: MEDIUM" in text
     # It is captioned Note, not Risk; the preserved-FK finding is likewise advisory.
-    assert "Note: The integer key" in text
+    assert "Note: The key from AUTO_INCREMENT" in text
     assert "Note: Foreign key" in text
     # A genuine gap keeps its Risk caption.
     assert "Risk: Columns" in text

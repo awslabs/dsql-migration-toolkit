@@ -5319,7 +5319,8 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
         )
     )
 
-    # Default strategy (KEEP_INTEGER): no table is a server-generated identity -> 0.
+    # Default strategy: a MySQL AUTO_INCREMENT key becomes a server-generated identity
+    # (wherever bigint holds it) -> counted as 1.
     default_store = SimpleNamespace(
         get=lambda sid: SimpleNamespace(
             preserve_foreign_keys=True, edited_target_ddls={}
@@ -5327,7 +5328,21 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
     )
     assert _cutover_pending_identity_tables(
         session, eval_store, default_store, "s"
-    ) == 0
+    ) == 1
+    # An explicit Keep (the picker bakes it into an edited DDL) -> no identity -> 0.
+    keep_conv = SchemaConverter(source_type=SourceType.MYSQL).convert(
+        inv,
+        options=SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER),
+    )
+    keep_store = SimpleNamespace(
+        get=lambda sid: SimpleNamespace(
+            preserve_foreign_keys=True,
+            edited_target_ddls={
+                "orders": next(c.target_ddl for c in keep_conv.tables if c.table == "orders")
+            },
+        )
+    )
+    assert _cutover_pending_identity_tables(session, eval_store, keep_store, "s") == 0
 
     # Bake the IDENTITY_WITH_CACHE conversion for "orders" into an edited DDL (exactly
     # what the Schema-Conversion PK-strategy picker stores) -> counted as 1.
