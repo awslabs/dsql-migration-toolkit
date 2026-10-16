@@ -2334,31 +2334,40 @@ def test_apply_button_clears_busy_state_even_when_apply_raises() -> None:
 
 
 def test_inventory_existence_checker_detects_existing_tables() -> None:
+    from dsql_migrator.core.models import (
+        TargetInventory,
+        TargetObjectKind,
+        TargetRelation,
+        TargetSchemaNode,
+    )
     from dsql_migrator.ui.schema_conversion import _InventoryExistenceChecker
 
-    class _Schema:
-        def __init__(self, name, tables, views=()):
-            self.name = name
-            self.tables = tables
-            self.views = views
+    def rel(name, kind=TargetObjectKind.TABLE):
+        return TargetRelation(schema_name="public", name=name, kind=kind)
 
-    class _Rel:
-        def __init__(self, name):
-            self.name = name
-
-    class _Inv:
-        def __init__(self, schemas):
-            self.schemas = schemas
-
-    inv = _Inv([
-        _Schema("public", [_Rel("orders"), _Rel("customers")], [_Rel("v_summary")]),
-    ])
-    checker = _InventoryExistenceChecker(inv)
+    inv = TargetInventory(
+        schemas=[
+            TargetSchemaNode(
+                name="public",
+                tables=[rel("orders"), rel("customers"), rel("t" * 63)],
+                views=[rel("v_summary", TargetObjectKind.VIEW)],
+            )
+        ]
+    )
+    checker = _InventoryExistenceChecker(inv, view_names=["public.v_summary"])
     assert checker.object_exists("orders") is True
-    assert checker.object_exists("ORDERS") is True  # case-insensitive
+    assert checker.object_exists("ORDERS") is True  # an unqualified name: case-insensitive
     assert checker.object_exists("public.orders") is True
+    # Qualified names decide as Schema Apply does: exact, cut to 63 bytes, by kind.
+    assert checker.object_exists("public.Orders") is False
+    assert checker.object_exists("public." + "t" * 64) is True
+    assert checker.object_exists("public.v_summary") is True
     assert checker.object_exists("v_summary") is True
     assert checker.object_exists("nonexistent") is False
+    # A source TABLE whose name a target view holds is no conflict but a blocker.
+    blocked = _InventoryExistenceChecker(inv, view_names=[])
+    assert blocked.object_exists("public.v_summary") is False
+    assert blocked.blocked_by("public.v_summary") == "a view"
 
 
 def test_inventory_existence_checker_handles_empty_inventory() -> None:

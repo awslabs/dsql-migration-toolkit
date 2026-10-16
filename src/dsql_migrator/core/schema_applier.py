@@ -599,7 +599,9 @@ class SchemaApplier:
                 return ApplyResult(
                     object_name=parsed.name,
                     status=ApplyStatus.FAILED,
-                    detail=_name_taken_detail(parsed, holder, self._converted_names),
+                    detail=_name_taken_detail(
+                        parsed, holder, self._converted_names, self._index_present
+                    ),
                 )
             # What an earlier version left for this object under another name. Never a
             # reason to skip -- it is not this object (a view that dependents read by its
@@ -611,10 +613,18 @@ class SchemaApplier:
             exists = self._introspector.object_exists(parsed.lookup_name)
 
         if exists and on_conflict is ApplyMode.SKIP_IF_EXISTS:
+            # The copy an earlier version left is still there (SKIP never drops it): say
+            # so on every run, not only the one that created the object.
+            note = (
+                _legacy_copy_note(parsed, legacy, self._converted_names, created=False)
+                if legacy is not None
+                else ""
+            )
             return ApplyResult(
                 object_name=parsed.name,
                 status=ApplyStatus.SKIPPED,
-                detail=SKIPPED_EXISTING_DETAIL,
+                detail=note or SKIPPED_EXISTING_DETAIL,
+                note=note,
             )
 
         if on_conflict is ApplyMode.REPLACE and legacy is not None:
@@ -655,18 +665,32 @@ class SchemaApplier:
                         object_name=parsed.name,
                         status=ApplyStatus.FAILED,
                         detail=_name_taken_detail(  # type: ignore[arg-type]
-                            parsed, live, self._converted_names
+                            parsed, live, self._converted_names, self._index_present
                         ),
                     )
+                note = (
+                    _legacy_copy_note(parsed, legacy, self._converted_names, created=False)
+                    if legacy is not None
+                    else ""
+                )
                 return ApplyResult(
                     object_name=parsed.name,
                     status=ApplyStatus.SKIPPED,
-                    detail=SKIPPED_EXISTING_DETAIL,
+                    detail=note or SKIPPED_EXISTING_DETAIL,
+                    note=note,
+                )
+            note = ""
+            if legacy is not None and parsed.kind == _INDEX and _is_index_limit(exc):
+                note = (
+                    f"The copy an earlier version left under the source name, {legacy.name}, "
+                    "takes one of this table's index slots: drop it "
+                    f"({_drop_index_sql(legacy)}) and apply again."
                 )
             return ApplyResult(
                 object_name=parsed.name,
                 status=ApplyStatus.FAILED,
-                detail=f"Apply failed: {exc}",
+                detail=f"Apply failed: {exc}" + (f" {note}" if note else ""),
+                note=note,
             )
 
         detail = (
@@ -675,7 +699,7 @@ class SchemaApplier:
             else "Created on the target."
         )
         if legacy is not None and not replace_existing:
-            note = _legacy_copy_note(parsed, legacy, self._converted_names)
+            note = _legacy_copy_note(parsed, legacy, self._converted_names, created=True)
             return ApplyResult(
                 object_name=parsed.name,
                 status=ApplyStatus.CREATED,
@@ -723,6 +747,17 @@ class SchemaApplier:
             sleep=self._sleep,
             jitter=self._jitter,
         )
+
+    def _index_present(self, schema: str, name: str, owner: str) -> bool:
+        """Whether index ``name`` is on table ``owner`` (``schema.table``, stored names)
+        now: the live catalog, else the browse."""
+        owner_schema, _, owner_table = owner.partition(".")
+        probe = _ParsedObject(_INDEX, [name], [owner_schema, owner_table])
+        live = self._live_holder(probe)
+        if live is _UNKNOWN:
+            holder_of = _browsed_holder(self._introspector)
+            live = holder_of(probe.stored_parts) if holder_of is not None else None  # type: ignore[arg-type]
+        return live == ("INDEX", owner)
 
     def _live_holder(self, parsed: _ParsedObject) -> object:
         """What holds ``parsed``'s stored name on the live target now (see
@@ -946,12 +981,33 @@ def _browsed_holder(introspector: object) -> Optional[_HolderLookup]:
     return lambda parts: holder_of(".".join(parts))
 
 
+def _quoted_name(*parts: str) -> str:
+    """``"a"."b"`` with embedded double quotes doubled: advice text the operator may paste,
+    so a name holding a quote cannot turn it into another statement."""
+    return ".".join('"' + part.replace('"', '""') + '"' for part in parts)
+
+
+def _drop_index_sql(index: _ParsedObject) -> str:
+    stored = index.stored_parts
+    return "DROP INDEX " + (_quoted_name(*stored) if stored else _quoted_name(index.name))
+
+
+def _is_index_limit(exc: BaseException) -> bool:
+    """Aurora DSQL's per-table index limit (54000 program_limit_exceeded)."""
+    return getattr(exc, "sqlstate", None) == "54000"
+
+
 def _legacy_copy_note(
-    parsed: _ParsedObject, legacy: _ParsedObject, names: Optional[ConvertedNames]
+    parsed: _ParsedObject,
+    legacy: _ParsedObject,
+    names: Optional[ConvertedNames],
+    *,
+    created: bool,
 ) -> str:
-    """What a SKIP apply that created ``parsed`` says about the copy an earlier version
-    left under another name (it is not dropped: SKIP never drops)."""
+    """What a SKIP apply says about the copy an earlier version left of ``parsed`` under
+    another name (SKIP never drops it): ``created`` -- this run created ``parsed``."""
     schema = (parsed.stored_parts or ("", ""))[0]
+    lead = f"Created as {parsed.name}. " if created else ""
     if parsed.kind == _INDEX:
         blocks = ""
         needs = names.relations.get((schema, legacy.name)) if names is not None else None
@@ -961,12 +1017,13 @@ def _legacy_copy_note(
                 "cannot be created until it is dropped."
             )
         return (
-            f"Created as {parsed.name}. The copy an earlier version created under the "
-            f"source name, {legacy.name}, is still on {parsed.on_table_name} and now "
-            f'duplicates it; drop it (DROP INDEX "{schema}"."{legacy.name}").' + blocks
+            f"{lead}The copy an earlier version created of index {parsed.name} under the "
+            f"source name, {legacy.name}, is still on {parsed.on_table_name}: a duplicate "
+            "Aurora DSQL maintains on every write (a UNIQUE one keeps enforcing "
+            f"uniqueness). Drop it ({_drop_index_sql(legacy)})." + blocks
         )
     return (
-        f"Created as {parsed.name}. The copy an earlier version created without quotes, "
+        f"{lead}The copy an earlier version created of view {parsed.name} without quotes, "
         f"{legacy.name}, is still on the target and no longer kept in step with the "
         "source; drop it once nothing reads that name (a Replace of this view, or a Drop "
         "& reload of a table it reads, drops it)."
@@ -977,6 +1034,7 @@ def _name_taken_detail(
     parsed: _ParsedObject,
     holder: "tuple[str, Optional[str]]",
     names: Optional[ConvertedNames] = None,
+    index_present: "Optional[Callable[[str, str, str], bool]]" = None,
 ) -> str:
     kind, owner = holder
     subject = (
@@ -992,13 +1050,27 @@ def _name_taken_detail(
     )
     if copy_of is not None and copy_of[0] == owner:
         # Up to 0.1.570 the colliding index kept this name; the conversion now creates it
-        # as ``copy_of[1]``, so the old copy can go.
+        # as ``copy_of[1]``. Whether THAT index exists yet decides the safe order: dropping
+        # the copy first would leave the table without it (a UNIQUE one unenforced).
+        from dsql_migrator.core.target_introspector import pg_stored_name
+
+        drop = f"DROP INDEX {_quoted_name(stored[0], stored[1])}"
+        renamed_there = index_present is not None and index_present(
+            stored[0], pg_stored_name(copy_of[1]), owner
+        )
+        if renamed_there:
+            return (
+                f"{subject} was not created: its name is held on the target by the index "
+                f"{stored[1]} on {owner}, the copy an earlier version made of index "
+                f"{copy_of[1]}, which is already there. Drop the copy ({drop}), then "
+                "apply again."
+            )
         return (
             f"{subject} was not created: its name is held on the target by the index "
             f"{stored[1]} on {owner}, the copy an earlier version made of the index this "
-            f"migration creates as {copy_of[1]}. Drop that index "
-            f'(DROP INDEX "{stored[0]}"."{stored[1]}") once {copy_of[1]} exists (this apply '
-            "creates it), then apply again."
+            f"migration creates as {copy_of[1]}. Apply {owner} first (it creates "
+            f"{copy_of[1]}; a Replace of it also drops the copy), then drop the copy "
+            f"({drop}) if it is still there, and apply again."
         )
     what = f"an index on {owner}" if kind == "INDEX" and owner else f"a {kind.lower()}"
     return (

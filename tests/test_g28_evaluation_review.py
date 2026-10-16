@@ -1307,7 +1307,13 @@ def test_an_index_an_earlier_version_kept_under_its_source_name_is_created_and_n
     applier.set_converted_names(names)
     created = applier.apply(ddl, ApplyMode.SKIP_IF_EXISTS)
     assert created.status is ApplyStatus.CREATED
-    assert 'now duplicates it; drop it (DROP INDEX "shop"."user_id")' in created.note
+    assert 'a duplicate Aurora DSQL maintains on every write' in created.note
+    assert 'Drop it (DROP INDEX "shop"."user_id")' in created.note
+    # Every later SKIP run says it again while the copy is there.
+    later, _ = _applier(_HolderOracle({**oracle.holders, "shop.orders_user_id": ("INDEX", "shop.orders")}))
+    later.set_converted_names(names)
+    again = later.apply(ddl, ApplyMode.SKIP_IF_EXISTS)
+    assert again.status is ApplyStatus.SKIPPED and "is still on shop.orders" in again.note
     assert connection.ddl == [ddl]
 
     replacer, connection = _applier(oracle)
@@ -1660,9 +1666,19 @@ def test_index_renames_are_derived_only_for_tables_without_an_applied_conversion
         )
 
     every = build({t.table: t for t in conversion.tables})
-    assert every._inputs.index_renames == {}  # the UI's case: nothing to derive
+    assert every._inputs.index_renames is None  # the UI's case: nothing to derive
     partial = build({conversion.tables[0].table: conversion.tables[0]})
     assert partial._inputs.index_renames == conversion.index_renames
+    # An empty mapping the caller passes means "no renames": not derived again (the FK
+    # card builds its inputs on every 1.5 s poll).
+    from dataclasses import replace as _replace
+
+    given = BatchedTableMigrator(
+        _replace(partial._inputs, index_renames={}, table_conversions={}),
+        exporter=object(),
+        watermark_capturer=object(),
+    )
+    assert given._inputs.index_renames == {}
 
 
 def test_a_stored_edit_is_renamed_as_written_and_exactly_as_the_apply_paths_rename_it() -> None:
@@ -1814,3 +1830,76 @@ def test_objects_the_source_user_cannot_list_are_reported_not_assumed_absent() -
         result, inventory=result.inventory, target_inventory=TargetInventory(), target_endpoint=None
     )
     assert any(i.rule_id == "SOURCE_VISIBILITY" for i in refreshed.assessment.items)
+
+
+
+def test_the_advice_for_a_name_held_by_an_old_index_copy_follows_what_is_on_the_target() -> None:
+    """A per-object apply of the blocked table was told "this apply creates" the renamed
+    index -- it did not -- so dropping the copy as advised left the table without it."""
+    from dsql_migrator.core.models import ApplyMode, ApplyStatus
+    from dsql_migrator.core.schema_applier import converted_names
+
+    names = converted_names(
+        [], {"shop.account": {"currency": "account_currency"}}, table_names=["shop.account", "shop.currency"]
+    )
+    ddl = 'CREATE TABLE "shop"."currency" ("id" int PRIMARY KEY)'
+    before = _HolderOracle({"shop.account": ("TABLE", None), "shop.currency": ("INDEX", "shop.account")})
+    applier, _ = _applier(before)
+    applier.set_converted_names(names)
+    first = applier.apply(ddl, ApplyMode.SKIP_IF_EXISTS)
+    assert first.status is ApplyStatus.FAILED
+    assert "Apply shop.account first (it creates account_currency" in first.detail
+    after = _HolderOracle({**before.holders, "shop.account_currency": ("INDEX", "shop.account")})
+    applier, _ = _applier(after)
+    applier.set_converted_names(names)
+    second = applier.apply(ddl, ApplyMode.SKIP_IF_EXISTS)
+    assert "which is already there. Drop the copy (DROP INDEX \"shop\".\"currency\")" in second.detail
+
+
+def test_advised_drop_statements_quote_names_safely() -> None:
+    from dsql_migrator.core.schema_applier import _quoted_name
+
+    assert _quoted_name("shop", 'ix"; DROP TABLE "shop"."payments"; --') == (
+        '"shop"."ix""; DROP TABLE ""shop"".""payments""; --"'
+    )
+
+
+def test_the_html_export_names_blocked_objects_and_the_assessed_cluster() -> None:
+    from dsql_migrator.core.assessor import render_html_report
+
+    target = TargetInventory(
+        schemas=[
+            TargetSchemaNode(
+                name="shop",
+                views=[TargetRelation(schema_name="shop", name="orders", kind=TargetObjectKind.VIEW)],
+            )
+        ]
+    )
+    html = render_html_report(
+        CompatibilityAssessor().assess(SourceInventory(tables=[_table("shop.orders")])),
+        target=target,
+        conflicts=[],
+        blocked=[("shop.orders", "a view")],
+        target_endpoint="abc.dsql.ap-northeast-2.on.aws",
+    )
+    assert "shop.orders: a view" in html
+    assert "No source objects conflict" not in html
+    assert "Assessed against <strong>abc.dsql.ap-northeast-2.on.aws</strong>" in html
+
+
+def test_cdc_never_captures_tables_whose_stored_names_clash() -> None:
+    """A session whose Full Load ran on 0.1.570 can still cover a clash pair in its
+    watermark and pinned selection; CDC would stream both into one relation."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    a, b = "app." + "t" * 63 + "_a", "app." + "t" * 63 + "_b"
+    inventory = SourceInventory(tables=[_table(a), _table(b), _table("app.ok")])
+    original = _cdc_ui.cdc_capture_names
+    _cdc_ui.cdc_capture_names = lambda _state, _wm: {a, b, "app.ok"}
+    try:
+        tables = _cdc_ui._cdc_tables_for_config(SimpleNamespace(), inventory, object())
+    finally:
+        _cdc_ui.cdc_capture_names = original
+    assert [t.name for t in tables] == ["app.ok"]

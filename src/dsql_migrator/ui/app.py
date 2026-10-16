@@ -350,6 +350,11 @@ def build_page(
                 _conf = len(_res.target_conflicts or [])
                 if _conf:
                     _line += f", {_conf} target conflict(s)"
+                from dsql_migrator.ui.evaluation import _find_target_blockers
+
+                _held = len(_find_target_blockers(_res.inventory, _res.target_inventory))
+                if _held:
+                    _line += f", {_held} name(s) held on the target by another object"
                 facts.append(_line)
         except Exception:  # noqa: BLE001 - context is best-effort; never break the panel
             pass

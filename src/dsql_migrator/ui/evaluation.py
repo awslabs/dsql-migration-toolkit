@@ -349,14 +349,22 @@ def _find_target_conflicts(
     :func:`~dsql_migrator.core.target_introspector.relations_existing_on_target`,
     shared with the per-database limit counts so the two cannot disagree.
     """
+    from dsql_migrator.core.converter import relation_clash_names
     from dsql_migrator.core.target_introspector import relations_existing_on_target
 
     view_names = [view.name for view in source.views]
-    return relations_existing_on_target(
-        [table.name for table in source.tables] + view_names,
-        target,
-        views=view_names,
-    )
+    # Names that share a stored form are never created (NAME_COLLISION): their copy on the
+    # target is no SKIP/REPLACE choice.
+    clash = relation_clash_names(source)
+    return [
+        name
+        for name in relations_existing_on_target(
+            [table.name for table in source.tables] + view_names,
+            target,
+            views=view_names,
+        )
+        if name not in clash
+    ]
 
 
 def _find_target_blockers(
@@ -1140,6 +1148,10 @@ def assessment_download(result: EvaluationResult, fmt: str = "json") -> ReportDo
             target=result.target_inventory,
             conflicts=result.target_conflicts,
             source_type=result.source_type,
+            # The screen's "Names held on the target by another object" list: without it
+            # the export printed the all-clear over objects neither apply mode can create.
+            blocked=_find_target_blockers(result.inventory, result.target_inventory),
+            target_endpoint=result.target_endpoint,
         )
     else:
         content = export_assessment_report(result.assessment, fmt)

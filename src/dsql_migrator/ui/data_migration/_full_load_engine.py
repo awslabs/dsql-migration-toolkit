@@ -190,8 +190,9 @@ class DataMigrationInputs:
     # read only for a table with NO applied conversion: its deterministic re-derivation
     # (_derived_table_conversion) converts one table at a time, which cannot see an index
     # name another relation of the schema also uses, and would re-emit the source name.
-    # Derived from ``inventory`` when left empty (see BatchedTableMigrator).
-    index_renames: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # Derived from ``inventory`` when not given (None; see BatchedTableMigrator) -- an empty
+    # mapping a caller passes means "no renames", so it is not derived again.
+    index_renames: Optional[Mapping[str, Mapping[str, str]]] = None
     # Tables whose stored name another table or view of the schema shares (Aurora DSQL
     # stores names cut to 63 bytes): Schema Conversion creates none of them, and a load
     # would write into the other's relation, so they are never loaded. Derived from
@@ -911,7 +912,7 @@ def _slim_worker_inputs(
         inputs,
         inventory=SourceInventory(),
         table_conversions=({table_name: conv} if conv is not None else {}),
-        index_renames=_one(inputs.index_renames),
+        index_renames=_one(inputs.index_renames or {}),
         name_clash_tables=inputs.name_clash_tables & {table_name},
         excluded_lob_columns=_one(inputs.excluded_lob_columns),
         overlay_columns=_one(inputs.overlay_columns),
@@ -5177,7 +5178,7 @@ def _derived_table_conversion(
     return SchemaConverter(
         source_type=inputs.source_config.source_type
     ).convert_table(
-        table, SchemaConvertOptions(), index_names=inputs.index_renames.get(table.name)
+        table, SchemaConvertOptions(), index_names=(inputs.index_renames or {}).get(table.name)
     )
 
 
@@ -5734,7 +5735,7 @@ class BatchedTableMigrator:
             )
             if clash != inputs.name_clash_tables:
                 inputs = replace(inputs, name_clash_tables=clash)
-        if not inputs.index_renames and any(
+        if inputs.index_renames is None and any(
             table.name not in inputs.table_conversions for table in inputs.inventory.tables
         ):
             # Derived here, in the parent, before the per-table workers get inputs slimmed

@@ -620,16 +620,31 @@ def apply_session_snapshot(
             )
         except ValueError:
             restored_source_type = SourceType.MYSQL
-        eval_state.set_result(  # type: ignore[attr-defined]
-            EvaluationResult(
-                inventory=snapshot.inventory,
-                assessment=snapshot.assessment,
-                target_inventory=snapshot.target_inventory,
-                target_conflicts=list(snapshot.target_conflicts),
-                source_type=restored_source_type,
-                target_endpoint=snapshot.target_inventory_endpoint,
-            )
+        restored = EvaluationResult(
+            inventory=snapshot.inventory,
+            assessment=snapshot.assessment,
+            target_inventory=snapshot.target_inventory,
+            target_conflicts=list(snapshot.target_conflicts),
+            source_type=restored_source_type,
+            target_endpoint=snapshot.target_inventory_endpoint,
         )
+        # Re-graded with this version's rules, as every refresh is: a snapshot saved by an
+        # earlier version carries that version's verdict (no BYTEA_KEY, no schema-limit
+        # item) and conflict rule, next to blocked-name notices computed with the new one.
+        # Pure and cheap (~0.04 s per 1,000 tables); a failure keeps the snapshot's own.
+        try:
+            from dsql_migrator.ui.evaluation import with_refreshed_catalogs
+
+            restored = with_refreshed_catalogs(
+                restored,
+                inventory=snapshot.inventory,
+                target_inventory=snapshot.target_inventory,
+                target_endpoint=snapshot.target_inventory_endpoint,
+                source_type=restored_source_type,
+            )
+        except Exception:  # noqa: BLE001 - the saved assessment is still a valid one
+            pass
+        eval_state.set_result(restored)  # type: ignore[attr-defined]
         # As for Validation below: the job id is not persisted, so an IN_PROGRESS step has
         # no live job after a restart, and a restored report means a run finished (or a
         # re-run was interrupted with the previous report kept). Reconcile to DONE HERE,

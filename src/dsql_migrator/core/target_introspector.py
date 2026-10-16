@@ -57,6 +57,14 @@ from dsql_migrator.core.models import (
 # excludes its own ``sys`` (``MYSQL_SYSTEM_SCHEMAS``), so this is the symmetric rule.
 SYSTEM_SCHEMAS = ("pg_catalog", "information_schema", "pg_toast", "sys")
 
+# Every user schema, so an EMPTY one is seen: Aurora DSQL counts it toward its 10-schema
+# limit, and a schema holding no table or view never appears in RELATIONS_QUERY.
+SCHEMAS_QUERY = (
+    "SELECT nspname FROM pg_catalog.pg_namespace "
+    "WHERE nspname <> ALL(%(excluded_schemas)s) AND nspname NOT LIKE 'pg\\_%%' "
+    "ORDER BY nspname"
+)
+
 # Tables and views, with their type so views can be separated from tables.
 RELATIONS_QUERY = (
     "SELECT table_schema, table_name, table_type "
@@ -177,14 +185,16 @@ def build_inventory(
     relation_rows: list[tuple],
     column_rows: list[tuple],
     index_rows: list[tuple],
+    schema_rows: "Sequence[tuple]" = (),
 ) -> TargetInventory:
     """Assemble a :class:`TargetInventory` tree from raw catalog rows.
 
     ``relation_rows`` are ``(schema, name, table_type)``; ``column_rows`` are
     ``(schema, table, column, data_type, is_nullable)``; ``index_rows`` are
-    ``(schema, table, index_name, is_unique)``. Columns/indexes that reference an
-    unknown relation are ignored so a partial catalog read still yields a valid
-    tree.
+    ``(schema, table, index_name, is_unique)``; ``schema_rows`` are ``(schema,)`` for
+    every user schema, so one holding no relation is still in the tree (after the others).
+    Columns/indexes that reference an unknown relation are ignored so a partial catalog
+    read still yields a valid tree.
     """
     relations: dict[tuple[str, str], TargetRelation] = {}
     schema_order: list[str] = []
@@ -223,6 +233,9 @@ def build_inventory(
             TargetIndexDef(name=index_name, unique=bool(is_unique))
         )
 
+    for row in schema_rows:
+        if row and row[0] not in schema_order:
+            schema_order.append(row[0])
     schema_nodes: dict[str, TargetSchemaNode] = {
         name: TargetSchemaNode(name=name) for name in schema_order
     }
@@ -272,10 +285,14 @@ class TargetIntrospector:
             relation_rows = _query(connection, RELATIONS_QUERY)
             column_rows = _query(connection, COLUMNS_QUERY)
             index_rows = _query(connection, INDEXES_QUERY)
+            try:
+                schema_rows = _query(connection, SCHEMAS_QUERY)
+            except Exception:  # noqa: BLE001 - extra, best effort: the tree stands without it
+                schema_rows = []
         finally:
             _safe_close(connection)
 
-        inventory = build_inventory(relation_rows, column_rows, index_rows)
+        inventory = build_inventory(relation_rows, column_rows, index_rows, schema_rows)
         self._index_inventory(inventory)
         return inventory
 
@@ -413,6 +430,63 @@ def _stored_qualified(name: str) -> "Optional[tuple[str, str]]":
     return (pg_stored_name(schema), pg_stored_name(rest)) if schema and rest else None
 
 
+class TargetNames:
+    """The browsed target's names, matched the way Schema Apply matches them -- one rule
+    for Evaluation (conflicts, limit counts, blocked names) and Schema Conversion (labels,
+    the Replace/Skip prompt, the REPLACE confirmation), so the two steps cannot disagree.
+
+    A qualified source name (``database.table`` / ``schema.table``, split on the first dot)
+    is matched EXACTLY on stored names (the converter quotes every name, each part cut to
+    63 bytes: :func:`pg_stored_name`), and only an object of the SAME kind counts
+    (``views``: the source's view names); an unqualified one is matched case-insensitively
+    against bare names in any schema."""
+
+    def __init__(self, target: TargetInventory, *, views: "Collection[str]" = ()) -> None:
+        self._holders = _target_holders(target)
+        self._unqualified = {
+            relation.name.lower()
+            for schema in target.schemas
+            for relation in (*schema.tables, *schema.views)
+        }
+        self._views = set(views)
+        self._own_views = {_stored_qualified(name) for name in self._views} - {None}
+
+    def _kind(self, name: str) -> str:
+        return "VIEW" if name in self._views else "TABLE"
+
+    def exists(self, name: str) -> bool:
+        """Whether the source relation ``name`` is already on the target."""
+        stored = _stored_qualified(name)
+        if stored is None:
+            return name.strip().lower() in self._unqualified
+        return self._holders.get(stored) == (self._kind(name), None)
+
+    def blocked_by(self, name: str) -> "Optional[str]":
+        """What ANOTHER kind of object holding ``name``'s stored name is (``"a view"``,
+        ``"an index on s.t"``): Schema Apply refuses it in both modes. ``None`` otherwise."""
+        stored = _stored_qualified(name)
+        holder = self._holders.get(stored) if stored is not None else None
+        if holder is None or holder == (self._kind(name), None):
+            return None
+        kind, owner = holder
+        return f"an index on {owner}" if kind == "INDEX" else f"a {kind.lower()}"
+
+    def old_view_copy(self, name: str) -> "Optional[str]":
+        """For a source view: the lower-case copy an earlier version created (unquoted)
+        that a REPLACE drops with it (``schema.name``), else ``None``."""
+        if name not in self._views:
+            return None
+        stored = _stored_qualified(name)
+        if stored is None:
+            return None
+        folded = (pg_fold_unquoted(stored[0]), pg_fold_unquoted(stored[1]))
+        if folded == stored or folded in self._own_views:
+            return None
+        if self._holders.get(folded) != ("VIEW", None):
+            return None
+        return f"{folded[0]}.{folded[1]}"
+
+
 def relations_existing_on_target(
     names: "Sequence[str]",
     target: TargetInventory,
@@ -421,35 +495,14 @@ def relations_existing_on_target(
 ) -> list[str]:
     """Return the ``names`` (source tables/views) that already exist on the target. Pure.
 
-    The one matching rule for "this source relation is already there", shared by the
-    Evaluation name-conflict list and the per-database limit counts (a relation that is
-    already on the target adds nothing to them). It decides as Schema Apply does: a
-    qualified name (the tool qualifies source objects as ``database.table`` /
-    ``schema.table``, split on the first dot) is matched EXACTLY against the target's
-    stored names (the converter quotes every name, each cut to 63 bytes: see
-    :func:`pg_stored_name`), so ``shop.Orders`` is not ``shop.orders``, and only an object
-    of the SAME kind counts (``views``: the source's view names) -- a name another kind of
-    object holds is :func:`relations_blocked_on_target` instead. An unqualified name is
-    matched case-insensitively against bare names in any schema. Input order is preserved.
+    The one matching rule for "this source relation is already there" (:class:`TargetNames`),
+    shared by the Evaluation name-conflict list, the per-database limit counts (a relation
+    that is already on the target adds nothing to them) and Schema Conversion. A name
+    another kind of object holds is :func:`relations_blocked_on_target` instead. Input
+    order is preserved.
     """
-    holders = _target_holders(target)
-    unqualified = {
-        relation.name.lower()
-        for schema in target.schemas
-        for relation in (*schema.tables, *schema.views)
-    }
-    view_names = set(views)
-    existing: list[str] = []
-    for name in names:
-        stored = _stored_qualified(name)
-        if stored is None:
-            if name.strip().lower() in unqualified:
-                existing.append(name)
-            continue
-        kind = "VIEW" if name in view_names else "TABLE"
-        if holders.get(stored) == (kind, None):
-            existing.append(name)
-    return existing
+    matcher = TargetNames(target, views=views)
+    return [name for name in names if matcher.exists(name)]
 
 
 def relations_blocked_on_target(
@@ -462,21 +515,12 @@ def relations_blocked_on_target(
     of object holds on the target -- a view where a table goes, or an index (an earlier
     apply may have left one under a table's name). Schema Apply cannot create those in
     either mode until that object is dropped or renamed. Pure; input order is preserved."""
-    holders = _target_holders(target)
-    view_names = set(views)
+    matcher = TargetNames(target, views=views)
     blocked: list[tuple[str, str]] = []
     for name in names:
-        stored = _stored_qualified(name)
-        holder = holders.get(stored) if stored is not None else None
-        if holder is None:
-            continue
-        kind = "VIEW" if name in view_names else "TABLE"
-        if holder == (kind, None):
-            continue
-        held_kind, owner = holder
-        blocked.append(
-            (name, f"an index on {owner}" if held_kind == "INDEX" else f"a {held_kind.lower()}")
-        )
+        holder = matcher.blocked_by(name)
+        if holder is not None:
+            blocked.append((name, holder))
     return blocked
 
 
@@ -1614,6 +1658,7 @@ __all__ = [
     "max_pk_target",
     "sync_identity_sequences",
     "partition_identity_sync",
+    "TargetNames",
     "relations_blocked_on_target",
     "relations_existing_on_target",
     "tables_with_rows",

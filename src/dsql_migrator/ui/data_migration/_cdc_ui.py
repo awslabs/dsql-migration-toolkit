@@ -1061,12 +1061,20 @@ def _cdc_tables_for_config(
     """
     if inventory is None:
         return []
+    # Never a table whose stored name another table or view shares: CDC would write both
+    # into one relation (a session whose Full Load ran on an earlier version may still
+    # have such a pair covered by its watermark and pinned in its selection).
+    from dsql_migrator.core.converter import relation_clash_names
+
+    clash = relation_clash_names(inventory)
     names = cdc_capture_names(migration_state, watermark)
     if names is not None:
-        return [t for t in inventory.tables if t.name in names]
+        return [t for t in inventory.tables if t.name in names and t.name not in clash]
     selection = migration_state.selection
     if selection is not None and selection.selected_tables:
-        return TableSelector().resolve(inventory, selection)
+        return [
+            t for t in TableSelector().resolve(inventory, selection) if t.name not in clash
+        ]
     # Adopted / out-of-band pipeline: the session has no watermark or selection,
     # but the live stack's TableIncludeList tells us which tables are replicating.
     # Each include entry is a table's ``.name`` (build_source_config uses
@@ -1074,7 +1082,7 @@ def _cdc_tables_for_config(
     # the watermark path above.
     reconciled = set(getattr(migration_state, "cdc_reconciled_table_names", []) or [])
     if reconciled:
-        return [t for t in inventory.tables if t.name in reconciled]
+        return [t for t in inventory.tables if t.name in reconciled and t.name not in clash]
     return []
 
 

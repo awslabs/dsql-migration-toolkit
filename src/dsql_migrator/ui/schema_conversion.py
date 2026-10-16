@@ -47,7 +47,7 @@ import inspect
 import logging
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
@@ -487,6 +487,12 @@ class DdlPreview:
     target_ddl: str
     warnings: tuple[ConversionWarning, ...] = ()
     exists_on_target: Optional[bool] = None
+    # What another kind of object holding this name on the target is ("a view", "an index
+    # on s.t"): neither apply mode can create the object until it is dropped.
+    held_on_target: Optional[str] = None
+    # A view's lower-case copy an earlier version left on the target (SKIP creates the
+    # quoted view beside it; REPLACE drops it).
+    old_copy_on_target: Optional[str] = None
 
 
 def _quote_mysql(name: str) -> str:
@@ -957,8 +963,11 @@ def preview_for_selection(
         if table is None or conversion is None:
             return None
         exists = _check_exists(existence_checker, name)
-        return build_table_preview(
-            table, conversion, exists_on_target=exists, source_type=source_type
+        return replace(
+            build_table_preview(
+                table, conversion, exists_on_target=exists, source_type=source_type
+            ),
+            held_on_target=_check_held(existence_checker, name),
         )
 
     if node_id.startswith(VIEW_PREFIX):
@@ -968,8 +977,12 @@ def preview_for_selection(
             return None
         conversion = _find_view_conversion(result, name)
         exists = _check_exists(existence_checker, name)
-        return build_view_preview(
-            view, conversion, exists_on_target=exists, source_type=source_type
+        return replace(
+            build_view_preview(
+                view, conversion, exists_on_target=exists, source_type=source_type
+            ),
+            held_on_target=_check_held(existence_checker, name),
+            old_copy_on_target=_check_old_copy(existence_checker, name),
         )
 
     return None
@@ -982,6 +995,22 @@ def _check_exists(
     if existence_checker is None:
         return None
     return existence_checker.object_exists(name)
+
+
+def _check_held(
+    existence_checker: Optional[TargetExistenceChecker], name: str
+) -> Optional[str]:
+    """What another kind of object holding ``name`` is, if the checker can tell."""
+    blocked_by = getattr(existence_checker, "blocked_by", None)
+    return blocked_by(name) if callable(blocked_by) else None
+
+
+def _check_old_copy(
+    existence_checker: Optional[TargetExistenceChecker], name: str
+) -> Optional[str]:
+    """A view's lower-case copy an earlier version left, if the checker can tell."""
+    old_view_copy = getattr(existence_checker, "old_view_copy", None)
+    return old_view_copy(name) if callable(old_view_copy) else None
 
 
 def _find_table(inventory: SourceInventory, name: str) -> Optional[TableDef]:
@@ -2055,6 +2084,16 @@ def build_schema_conversion_screen(
             existing = [name for name in existing if name in selected]
             if only_names is not None:
                 existing = [name for name in existing if name in only_names]
+            # A REPLACE also drops the lower-case copy an earlier version left of a view
+            # in scope: name it, or the dialog understates what is dropped.
+            if inventory is not None:
+                for view in inventory.views:
+                    in_scope = view.name in selected and (
+                        only_names is None or view.name in only_names
+                    )
+                    copy = _check_old_copy(existence_checker, view.name) if in_scope else None
+                    if copy is not None:
+                        existing.append(f"{copy} (the old copy of {view.name})")
 
             def _confirmed() -> None:
                 conv_state.replace_confirmed = True
@@ -2465,10 +2504,18 @@ def build_schema_conversion_screen(
             if (
                 not existence_checker_injected
                 and target_inventory is not None
-                and _derived_checker_state.get("snapshot") is not target_inventory
+                and (
+                    _derived_checker_state.get("snapshot") is not target_inventory
+                    or _derived_checker_state.get("inventory") is not inventory
+                )
             ):
-                existence_checker = _InventoryExistenceChecker(target_inventory)
+                # Keyed on the source inventory too: which names are views decides the
+                # kind a target object must have to count.
+                existence_checker = _InventoryExistenceChecker(
+                    target_inventory, view_names=[view.name for view in inventory.views]
+                )
                 _derived_checker_state["snapshot"] = target_inventory
+                _derived_checker_state["inventory"] = inventory
             elif not existence_checker_injected and target_inventory is None:
                 # Explicitly DROP the derived checker. The branch above only ever
                 # replaced it, so a stale/absent inventory left the nonlocal serving the
@@ -4086,7 +4133,21 @@ def _render_preview(
     per-object AI-chat icon so the user can convert it with AI DBA -- whose
     "Use as target DDL" reply footer flows a fix into the editor -> Apply.
     """
-    if preview.exists_on_target is True:
+    if preview.held_on_target is not None:
+        render_notice(
+            ui,
+            tone="error",
+            header="Name held on the target by another object",
+            body=(
+                f"'{preview.object_name}' cannot be created in either apply mode: its name "
+                f"is held on the target by {preview.held_on_target} (Aurora DSQL keeps a "
+                "schema's tables, views and indexes in one namespace; an earlier apply may "
+                "have left it). Drop or rename that object on the target, then apply."
+            ),
+        )
+    elif preview.exists_on_target is True and not is_name_collision_placeholder(
+        preview.target_ddl
+    ):
         render_notice(
             ui,
             tone="warning",
@@ -4094,6 +4155,17 @@ def _render_preview(
             body=(
                 f"'{preview.object_name}' already exists on the target. Choose "
                 "SKIP to keep it or REPLACE (destructive) to recreate it."
+            ),
+        )
+    elif preview.old_copy_on_target is not None:
+        render_notice(
+            ui,
+            tone="info",
+            header="An earlier version's copy of this view is on the target",
+            body=(
+                f"It is {preview.old_copy_on_target} (created without quotes, so stored in "
+                f"lower case). SKIP creates '{preview.object_name}' beside it; REPLACE also "
+                "drops the old copy."
             ),
         )
 
@@ -5075,24 +5147,28 @@ class _InventoryExistenceChecker:
 
     A lightweight adapter that answers ``object_exists`` from the in-memory
     target inventory (stored in the Evaluation result after Step 1 or a
-    "Refresh target" action) without issuing any SQL. Case-insensitive
-    matching mirrors PostgreSQL identifier folding.
+    "Refresh target" action) without issuing any SQL. It decides as Schema Apply and
+    Evaluation do (:class:`~dsql_migrator.core.target_introspector.TargetNames`): exact on
+    stored names and by kind (``view_names``: the source's views). Case-insensitive and
+    uncut, it named objects the apply never drops and left out a long-named table a
+    confirmed REPLACE then dropped.
     """
 
-    def __init__(self, target_inventory: object) -> None:
-        names: set[str] = set()
-        for schema in getattr(target_inventory, "schemas", ()):
-            for table in getattr(schema, "tables", ()):
-                names.add(table.name.lower())
-                names.add(f"{schema.name}.{table.name}".lower())
-            for view in getattr(schema, "views", ()):
-                names.add(view.name.lower())
-                names.add(f"{schema.name}.{view.name}".lower())
-        self._names = names
+    def __init__(self, target_inventory: object, *, view_names: "Sequence[str]" = ()) -> None:
+        from dsql_migrator.core.target_introspector import TargetNames
+
+        self._names = TargetNames(target_inventory, views=view_names)  # type: ignore[arg-type]
 
     def object_exists(self, object_name: str) -> bool:
-        normalized = object_name.strip().lower()
-        return normalized in self._names
+        return self._names.exists(object_name)
+
+    def blocked_by(self, object_name: str) -> Optional[str]:
+        """What another kind of object holding the name is (both apply modes refuse it)."""
+        return self._names.blocked_by(object_name)
+
+    def old_view_copy(self, object_name: str) -> Optional[str]:
+        """The lower-case copy of a view an earlier version left (a REPLACE drops it)."""
+        return self._names.old_view_copy(object_name)
 
 
 def _existing_object_names(

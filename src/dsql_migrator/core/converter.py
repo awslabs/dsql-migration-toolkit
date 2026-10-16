@@ -4040,7 +4040,10 @@ class _NamespaceEntry:
 
 
 def name_collisions(
-    inventory: SourceInventory, *, is_postgres: bool = False
+    inventory: SourceInventory,
+    *,
+    is_postgres: bool = False,
+    namespaces: "Optional[dict[str, dict[str, list[_NamespaceEntry]]]]" = None,
 ) -> "dict[str, list[NameCollision]]":
     """The names that more than one relation of the same target schema would use.
 
@@ -4062,7 +4065,8 @@ def name_collisions(
     are what is lost). Returns object name (table or view) -> its collisions. Shared by
     Schema Conversion's note and Evaluation's ``NAME_COLLISION`` rule.
     """
-    namespaces = _relation_namespaces(inventory, is_postgres=is_postgres)
+    if namespaces is None:
+        namespaces = _relation_namespaces(inventory, is_postgres=is_postgres)
     collisions: dict[str, list[NameCollision]] = {}
     for names in namespaces.values():
         for entries in names.values():
@@ -4135,7 +4139,10 @@ def _relation_namespaces(
 
 
 def index_renames(
-    inventory: SourceInventory, *, is_postgres: bool = False
+    inventory: SourceInventory,
+    *,
+    is_postgres: bool = False,
+    namespaces: "Optional[dict[str, dict[str, list[_NamespaceEntry]]]]" = None,
 ) -> "dict[str, dict[str, str]]":
     """table name -> {source index name: emitted name} so no two relations share a name.
 
@@ -4151,13 +4158,11 @@ def index_renames(
     """
     from dsql_migrator.core.target_introspector import pg_stored_name
 
-    clashing = {
-        owner
-        for owner, hits in name_collisions(inventory, is_postgres=is_postgres).items()
-        if relation_collisions(hits)
-    }
+    clashing = relation_clash_names(inventory)
+    if namespaces is None:
+        namespaces = _relation_namespaces(inventory, is_postgres=is_postgres)
     renames: dict[str, dict[str, str]] = {}
-    for schema, names in sorted(_relation_namespaces(inventory, is_postgres=is_postgres).items()):
+    for schema, names in sorted(namespaces.items()):
         taken = set(names)
         # Sorted, so two renames that would produce the same name are resolved the same
         # way whatever the inventory order.
@@ -4361,7 +4366,9 @@ def relation_clash_names(inventory: SourceInventory) -> "frozenset[str]":
     from dsql_migrator.core.target_introspector import pg_stored_name
 
     groups: dict[tuple[str, str], list[str]] = {}
-    for owner in (*(t.name for t in inventory.tables), *(v.name for v in inventory.views)):
+    tables = getattr(inventory, "tables", ()) or ()
+    views = getattr(inventory, "views", ()) or ()
+    for owner in (*(t.name for t in tables), *(v.name for v in views)):
         schema, name = _split_qualified(owner)
         groups.setdefault(
             (pg_stored_name(schema or ""), pg_stored_name(name)), []
@@ -4761,8 +4768,10 @@ def _identifier_length_warning(
                 if collisions
                 else "No rename is needed to migrate: Aurora DSQL stores the shortened "
                 "name(s), and SQL that uses the full name is shortened the same way (a "
-                "shortened name that collides with another relation is reported "
-                "separately). Rename on the source if the names must match exactly."
+                "shortened table, view or source index name that collides with another "
+                "relation is reported separately; an index name a primary-key strategy "
+                "generates is not checked). Rename on the source if the names must match "
+                "exactly."
             )
         ),
     )
@@ -5404,13 +5413,17 @@ class SchemaConverter:
         # Names collide ACROSS objects (Aurora DSQL keeps a schema's tables, views and
         # indexes in one namespace), which a per-object conversion cannot see: the colliding
         # indexes are renamed here and the notes attached here.
-        renames = index_renames(inventory, is_postgres=is_postgres)
+        # One namespace build for both (it is the costly part at thousands of tables).
+        namespaces = _relation_namespaces(inventory, is_postgres=is_postgres)
+        renames = index_renames(inventory, is_postgres=is_postgres, namespaces=namespaces)
         conversions = [
             self.convert_table(table, options, index_names=renames.get(table.name))
             for table in inventory.tables
         ]
         view_conversions = [self.convert_view(view) for view in inventory.views]
-        collisions = name_collisions(inventory, is_postgres=is_postgres)
+        collisions = name_collisions(
+            inventory, is_postgres=is_postgres, namespaces=namespaces
+        )
         for position, conversion in enumerate(conversions):
             hits = collisions.get(conversion.table) or []
             clashes = relation_collisions(hits)

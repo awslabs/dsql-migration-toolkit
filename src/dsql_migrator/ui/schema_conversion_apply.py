@@ -160,11 +160,17 @@ class ObjectApplyError(RuntimeError):
     """
 
     def __init__(
-        self, object_name: str, statements: Sequence[StatementApplyResult]
+        self,
+        object_name: str,
+        statements: Sequence[StatementApplyResult],
+        notes: Sequence[str] = (),
     ) -> None:
         self.object_name = object_name
         self.statements: tuple[StatementApplyResult, ...] = tuple(statements)
-        super().__init__(format_statement_summary(statements))
+        # Notes of the statements that did not fail (an earlier version's copy) still have
+        # to reach the operator: the summary shows only failures' details.
+        summary = format_statement_summary(statements)
+        super().__init__(summary + "".join(f" {note}" for note in notes if note not in summary))
 
 
 # The parsed CREATE kind for an index (matches the core applier's parser). An
@@ -435,6 +441,10 @@ def _table_manual_reason(table: TableConversion) -> Optional[str]:
     """
     if _is_applicable_target_ddl(table.target_ddl):
         return None
+    if is_name_collision_placeholder(table.target_ddl):
+        # Its own reason, not the first UNSUPPORTED warning: a table with, say, a bytea key
+        # too was told to change the key -- after which it was still skipped, for the name.
+        return table.target_ddl.lstrip("-").strip()
     for warning in table.warnings:
         if (
             warning.classification is Classification.UNSUPPORTED
@@ -1489,7 +1499,7 @@ class DsqlSchemaApplier:
                 outcome = ApplyOutcome.CREATED
 
         if any(s.status is ObjectApplyStatus.FAILED for s in statements):
-            raise ObjectApplyError(object_name, statements)
+            raise ObjectApplyError(object_name, statements, notes)
         if notes:
             return NotedApplyOutcome(outcome, " ".join(notes))
         return outcome

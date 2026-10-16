@@ -207,8 +207,8 @@ def test_browse_closes_connection_and_cursors() -> None:
     introspector.browse(_target_config())
 
     assert connection.closed is True
-    # One cursor opened and closed per catalog query (relations/columns/indexes).
-    assert connection.closed_cursors == 3
+    # One cursor opened and closed per catalog query (relations/columns/indexes/schemas).
+    assert connection.closed_cursors == 4
 
 
 def test_build_inventory_ignores_orphan_columns_and_indexes() -> None:
@@ -313,7 +313,8 @@ def test_catalog_queries_are_parameterized_and_read_only() -> None:
     introspector, _ = _introspector(connection)
     introspector.browse(_target_config())
 
-    assert len(connection.executed) == 3
+    # Relations, columns, indexes and (so an empty schema is seen) the schema list.
+    assert len(connection.executed) == 4
     for statement, parameters in connection.executed:
         # Read-only: every catalog query is a SELECT.
         assert statement.lstrip().upper().startswith("SELECT")
@@ -1427,3 +1428,16 @@ def test_a_sys_relation_is_not_browsed_as_a_user_object() -> None:
     # that a real user schema still comes through.
     names = {s.name for s in inventory.schemas}
     assert "ecommerce" in names
+
+
+
+def test_an_empty_schema_on_the_target_is_part_of_the_tree() -> None:
+    """Aurora DSQL counts an empty schema toward its 10-schema limit; the browse read only
+    relations, so Evaluation said Ready at the cap."""
+    from dsql_migrator.core.target_introspector import build_inventory
+
+    inventory = build_inventory(
+        [("shop", "orders", "BASE TABLE")], [], [], [("analytics",), ("shop",)]
+    )
+    assert [schema.name for schema in inventory.schemas] == ["shop", "analytics"]
+    assert inventory.schemas[1].tables == [] and inventory.schemas[1].views == []

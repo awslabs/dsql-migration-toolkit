@@ -1949,17 +1949,25 @@ def _schemas_needed(
     Every source database (MySQL) or schema (PostgreSQL) becomes a target schema of the
     same name -- the part before the first dot of the qualified object name -- and an
     unqualified name lands in ``public``, which is never counted (see
-    :data:`_BUILTIN_TARGET_SCHEMA`). Only target schemas that hold a table or view are
-    visible: the browse reads the catalog's relations, so an EMPTY schema already on the
-    cluster is not seen, although it counts toward the limit.
+    :data:`_BUILTIN_TARGET_SCHEMA`). Names are compared as Aurora DSQL stores them, cut to
+    63 bytes: a long database name is not counted again once its schema exists, and two
+    databases whose names agree in their first 63 bytes are one target schema. The browse
+    lists empty schemas too (they count toward the limit).
     """
-    source = [
-        name for name in _source_databases(inventory) if name != _BUILTIN_TARGET_SCHEMA
-    ]
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    source = list(
+        dict.fromkeys(
+            pg_stored_name(name)
+            for name in _source_databases(inventory)
+            if name != _BUILTIN_TARGET_SCHEMA
+        )
+    )
+    wanted = set(source)
     existing = [
         schema.name
         for schema in (target_inventory.schemas if target_inventory is not None else [])
-        if schema.name != _BUILTIN_TARGET_SCHEMA and schema.name not in source
+        if schema.name != _BUILTIN_TARGET_SCHEMA and schema.name not in wanted
     ]
     return source, existing
 
@@ -2046,6 +2054,9 @@ def check_multiple_source_databases(
     if needed > _MAX_SCHEMAS_PER_DATABASE:
         return []
     names = ", ".join(databases)
+    # Unless two database names agree in their first 63 bytes: those are ONE schema (and
+    # their tables' clashes are reported as NAME_COLLISION).
+    apart = len(source) == len(databases)
     items = [
         AssessmentItem(
             object_name=f"{len(databases)} source databases",
@@ -2055,14 +2066,15 @@ def check_multiple_source_databases(
                 f"The source spans {len(databases)} databases ({names}). Aurora DSQL has "
                 "one database per cluster, so Schema Conversion creates each of them as "
                 "its own schema in it (db.table becomes schema.table): nothing has to be "
-                "consolidated by hand, and names cannot collide across databases."
+                "consolidated by hand"
+                + (", and names cannot collide across databases." if apart else ".")
             ),
             recommendation=(
                 "Point the application at the schema-qualified names, or set its "
                 "search_path to the schema, as for any database that moves into an "
                 f"Aurora DSQL schema. Aurora DSQL allows {_MAX_SCHEMAS_PER_DATABASE} "
                 f"schemas per database; this migration needs {needed}, counting the "
-                "cluster's existing schemas that hold tables or views."
+                "cluster's existing schemas."
             ),
             effort=None,
             kind=KIND_DATABASE.upper(),
@@ -2905,13 +2917,18 @@ def _render_ai_html_section(ai_report: AiAssessmentReport) -> str:
 
 
 def _render_target_html_section(
-    target: TargetInventory, conflicts: "list[str]"
+    target: TargetInventory,
+    conflicts: "list[str]",
+    blocked: "Sequence[tuple[str, str]]" = (),
+    endpoint: "Optional[str]" = None,
 ) -> str:
     """Render the Target analysis (Aurora DSQL) section for the HTML export.
 
-    Mirrors the on-screen Target analysis: the target catalog summary (schemas /
-    tables / views) and any source objects that already exist on the target and
-    may conflict when applying converted DDL.
+    Mirrors the on-screen Target analysis: the cluster it was read from (the limit items
+    count what that cluster holds), the target catalog summary (schemas / tables / views),
+    the source objects that already exist on the target, and those whose name another kind
+    of object holds there (``blocked``: neither apply mode can create them). The all-clear
+    is printed only when both lists are empty.
     """
     def esc(value: object) -> str:
         return html.escape(str(value)) if value is not None else ""
@@ -2921,10 +2938,14 @@ def _render_target_html_section(
     parts = [
         '<section class="target-section">',
         "<h2>Target analysis (Aurora DSQL)</h2>",
+    ]
+    if endpoint:
+        parts.append(f"<p>Assessed against <strong>{esc(endpoint)}</strong>.</p>")
+    parts.append(
         f"<p>Target catalog: <strong>{len(target.schemas)}</strong> schemas, "
         f"<strong>{table_count}</strong> tables, <strong>{view_count}</strong> "
-        "views.</p>",
-    ]
+        "views.</p>"
+    )
     if conflicts:
         parts.append(
             f'<p class="warn">{len(conflicts)} source object(s) already exist on '
@@ -2939,7 +2960,18 @@ def _render_target_html_section(
             "(keep the existing object) or REPLACE (recreate it) when you "
             "apply.</p>"
         )
-    else:
+    if blocked:
+        parts.append(
+            f'<p class="warn">{len(blocked)} source object(s) cannot be created in either '
+            "apply mode until the object holding the name is dropped or renamed on the "
+            "target:</p>"
+        )
+        chips = " ".join(
+            f'<span class="conflict">{esc(name)}: {esc(holder)}</span>'
+            for name, holder in blocked
+        )
+        parts.append(f"<p>{chips}</p>")
+    if not conflicts and not blocked:
         parts.append(
             '<p class="muted">No source objects conflict with existing target '
             "objects.</p>"
@@ -2955,6 +2987,8 @@ def render_html_report(
     target: Optional[TargetInventory] = None,
     conflicts: Optional[list[str]] = None,
     source_type: SourceType = SourceType.MYSQL,
+    blocked: "Optional[Sequence[tuple[str, str]]]" = None,
+    target_endpoint: Optional[str] = None,
 ) -> str:
     """Render a styled, standalone HTML assessment report (English).
 
@@ -3100,7 +3134,9 @@ def render_html_report(
 
     ai_section = _render_ai_html_section(ai_report) if ai_report is not None else ""
     target_section = (
-        _render_target_html_section(target, conflicts or [])
+        _render_target_html_section(
+            target, conflicts or [], blocked or (), target_endpoint
+        )
         if target is not None
         else ""
     )
