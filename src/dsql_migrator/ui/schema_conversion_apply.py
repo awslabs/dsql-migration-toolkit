@@ -535,8 +535,10 @@ def edited_statements(script: str) -> list[str]:
 # a one- or two-part name of them. Never a shorter reading of a longer name: a bare part ends
 # at its last name character, a quoted one at its real closing quote, and no further '.' may
 # follow -- ``"shop" . "orders"`` and ``db.shop.orders``, which the applier reads as another
-# name than PostgreSQL creates, name nothing here.
-_IDENT_PART = r'(?:"(?:[^"]|"")+"(?!")|[A-Za-z_][\w$]*(?![\w$]))'
+# name than PostgreSQL creates, name nothing here. A bare part is ASCII only: PostgreSQL folds
+# only A-Z and the applier lower()s every letter, so ``shop.ordersÉ`` (PostgreSQL's
+# "ordersÉ", the applier's "ordersé", which a REPLACE then dropped) names nothing either.
+_IDENT_PART = r'(?:"(?:[^"]|"")+"(?!")|[A-Za-z_][A-Za-z0-9_$]*(?![\w$]))'
 _RELATION_NAME = rf"{_IDENT_PART}(?:\.{_IDENT_PART})?(?!\s*\.)"
 _OWN_CREATE_RE = re.compile(
     r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+(?=VIEW\b))?(TABLE|VIEW)\s+"
@@ -630,8 +632,9 @@ def object_create_kind(script: str, object_name: str) -> Optional[str]:
 
 def is_object_scaffolding(statement: str, object_name: str) -> bool:
     """Whether ``statement`` only prepares ``object_name``'s CREATE: the ``CREATE SCHEMA [IF
-    NOT EXISTS]`` of its schema (which the tool writes itself) or a ``DROP`` of the object
-    itself (an edit is applied in REPLACE mode, which drops it)."""
+    NOT EXISTS]`` of its schema (a table's generated script has it, and Schema Apply puts the
+    generated one first for an edit that has none -- :func:`override_apply_objects`) or a
+    ``DROP`` of the object itself (an edit is applied in REPLACE mode, which drops it)."""
     clean = sql_without_comments(statement).strip()
     match = _OWN_SCHEMA_RE.match(clean)
     if match is not None:
@@ -644,16 +647,46 @@ _ALTER_OR_DROP_RE = re.compile(
     rf"(ALTER|DROP)\s+(TABLE|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?({_RELATION_NAME})",
     re.IGNORECASE,
 )
+# What may stand between CREATE and the kind it creates: ``CREATE OR REPLACE FUNCTION``,
+# ``CREATE UNIQUE INDEX``, ``CREATE TEMP TABLE``, ``CREATE CONSTRAINT TRIGGER``.
+_CREATE_MODIFIERS = (
+    r"(?:OR\s+REPLACE\s+)?"
+    r"(?:(?:UNIQUE|GLOBAL|LOCAL|TEMP|TEMPORARY|UNLOGGED|MATERIALIZED|RECURSIVE|CONSTRAINT)\s+)*"
+)
+# Any written name, as a notice shows it (not only one the applier reads as PostgreSQL does).
+_ANY_NAME_PART = r'(?:"(?:[^"]|"")+"|[^\W\d][\w$]*)'
+_ANY_NAME = rf"{_ANY_NAME_PART}(?:\s*\.\s*{_ANY_NAME_PART})*"
+_INDEX_LABEL_RE = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:ASYNC\s+|CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"(?:(?!ON\b)({_ANY_NAME})\s+)?ON\s+(?:ONLY\s+)?({_ANY_NAME})",
+    re.IGNORECASE,
+)
+_CREATE_LABEL_RE = re.compile(
+    rf"CREATE\s+{_CREATE_MODIFIERS}([A-Za-z]+)(?:\s+IF\s+NOT\s+EXISTS)?(?:\s+({_ANY_NAME}))?",
+    re.IGNORECASE,
+)
 
 
 def statement_label(statement: str) -> str:
-    """A statement named for a notice: ``CREATE TABLE shop.order_status`` for a CREATE,
-    ``ALTER TABLE shop.orders`` for an ALTER or DROP, else its leading keyword (``SELECT``),
-    with the next one for ``COMMENT ON`` and its kin."""
+    """A statement named for a notice: ``CREATE TABLE shop.order_status`` for a CREATE (its
+    modifiers left out: ``CREATE FUNCTION shop.touch`` for a CREATE OR REPLACE FUNCTION;
+    ``CREATE INDEX ON shop.customers`` for an unnamed index), ``ALTER TABLE shop.orders`` for
+    an ALTER or DROP, else its leading keyword (``SELECT``), with the next one for ``COMMENT
+    ON`` and its kin. The first two words read 'CREATE OR' for any CREATE OR REPLACE, and
+    the core parser takes an unnamed index's ON for its name."""
     clean = sql_without_comments(statement).strip()
+    match = _INDEX_LABEL_RE.match(clean)
+    if match is not None:
+        if match.group(1):
+            return f"CREATE INDEX {'.'.join(_stored_parts(match.group(1)))}"
+        return f"CREATE INDEX ON {'.'.join(_stored_parts(match.group(2)))}"
     label, kind = _describe_ddl(clean)
     if kind is not None:
         return f"CREATE {label}"
+    match = _CREATE_LABEL_RE.match(clean)
+    if match is not None:
+        name = ".".join(_stored_parts(match.group(2))) if match.group(2) else ""
+        return f"CREATE {match.group(1).upper()} {name}".rstrip()
     match = _ALTER_OR_DROP_RE.match(clean)
     if match is not None:
         name = ".".join(_stored_parts(match.group(3)))
@@ -666,56 +699,123 @@ def statement_label(statement: str) -> str:
     return words[0].upper()
 
 
+# One token as PostgreSQL reads it: a quoted name, a string literal, a word, a number, a sign.
+_SQL_TOKEN_RE = re.compile(
+    r'"(?P<quoted>(?:[^"]|"")*)"|\'(?:[^\']|\'\')*\'|(?P<word>[^\W\d][\w$]*)|\d[\w.]*|\S'
+)
+
+
+def _key_definition(statement: str) -> "tuple[str, ...]":
+    """What an index or foreign-key ALTER of an object creates, its name left out, token by
+    token as PostgreSQL reads it (a quoted name as written, an unquoted word folded, comments
+    and spacing dropped): UNIQUE or not and what follows ``ON <table>`` -- the key list, a
+    predicate -- or what follows ``FOREIGN KEY`` -- the columns, REFERENCES, its actions."""
+    from dsql_migrator.core.converter import fold_identifier
+
+    clean = sql_without_comments(statement).strip()
+    match = _OWN_INDEX_RE.match(clean)
+    if match is not None:
+        unique = re.match(r"CREATE\s+UNIQUE\b", clean, re.IGNORECASE) is not None
+        head = ("UNIQUE" if unique else "INDEX",)
+    else:
+        match = _OWN_FOREIGN_KEY_RE.match(clean)
+        if match is None:
+            return ()
+        head = ()
+    return head + tuple(
+        token.group("quoted").replace('""', '"') if token.group("quoted") is not None
+        else fold_identifier(token.group(0)) if token.group("word") is not None
+        else token.group(0)
+        for token in _SQL_TOKEN_RE.finditer(clean, match.end())
+    )
+
+
 def merge_object_ddl(
     current: str, statements: Sequence[str], object_name: str
 ) -> "tuple[str, list[str]]":
     """``current`` -- an object's target-DDL script, edited or generated -- with
-    ``statements``, the object's own from an AI reply, put in: each replaces the statement of
-    the same kind and name (its CREATE, the index or foreign key of that name), one without a
-    counterpart is added, and everything else of ``current`` is kept as written.
+    ``statements``, the object's own from an AI reply, put in: each replaces its counterpart
+    (its CREATE, the index or foreign key of the same name as PostgreSQL resolves it), one
+    that creates what a statement of ``current`` already creates -- the same definition, name
+    aside -- is that statement, one without a counterpart is added, and everything else of
+    ``current`` is kept as written. So adopting a reply twice changes nothing: an unnamed
+    index or foreign key matched nothing, and each click added another copy (two indexes, two
+    constraints on one column), as did an unquoted restatement of a mixed-case name.
+
+    Of two statements that create the same, the named one stands, and the current one when
+    both are: a foreign key is paired with its metadata by its constraint name (the orphan
+    check, a reload's pre-drop), which an unnamed or refolded restatement would lose.
 
     Returns the script and what was kept that the reply did not give (an index, a foreign
-    key, another statement of the script; never its schema ensure). A reply usually shows
-    only the corrected CREATE TABLE: taken as the whole script, it dropped every secondary
-    index and preserved foreign key of the table, which no apply path then created."""
-    incoming: dict = {}
-    for position, statement in enumerate(statements):
-        role = object_statement_role(statement, object_name)
-        if role is None:
-            continue
-        kind, name = role
-        # An unnamed index or foreign key matches none of the script's: it is added.
-        key = ("CREATE", "") if kind in (_TABLE_KIND, _VIEW_KIND) else (kind, name or position)
-        incoming.pop(key, None)  # the block's last one wins
-        incoming[key] = statement.strip()
+    key, another statement of the script; never its schema ensure) or gave under another
+    name. A reply usually shows only the corrected CREATE TABLE: taken as the whole script,
+    it dropped every secondary index and preserved foreign key of the table, which no apply
+    path then created."""
 
-    def key_of(statement: str) -> "Optional[tuple]":
+    def identity(statement: str) -> "Optional[tuple]":
+        # (kind, name, definition) of one of the object's statements, None for any other.
         role = object_statement_role(statement, object_name)
         if role is None:
             return None
-        return ("CREATE", "") if role[0] in (_TABLE_KIND, _VIEW_KIND) else role
+        if role[0] in (_TABLE_KIND, _VIEW_KIND):
+            return ("CREATE", "", ())
+        return (*role, _key_definition(statement))
+
+    pieces = split_sql_statements(current)
+    identities = [identity(piece) for piece in pieces]
+    names = {(i[0], i[1]) for i in identities if i is not None and i[1]}
+    incoming: dict = {}
+    for statement in statements:
+        ident = identity(statement)
+        if ident is None:
+            continue
+        kind, name, definition = ident
+        # By name when the current DDL has its namesake, else by what it creates.
+        key = (kind, name) if kind == "CREATE" or (kind, name) in names else (kind, definition)
+        incoming.pop(key, None)  # the block's last one wins
+        incoming[key] = (name, statement.strip())
+
+    def kept_label(piece: str, ident: "Optional[tuple]") -> Optional[str]:
+        if ident is not None and ident[0] in (_INDEX_KIND, _FOREIGN_KEY_ROLE):
+            what = "index" if ident[0] == _INDEX_KIND else "foreign key"
+            return f"{what} {ident[1]}" if ident[1] else f"an unnamed {what}"
+        clean = sql_without_comments(piece).strip()
+        if clean and not is_object_scaffolding(clean, object_name):
+            return statement_label(clean)
+        return None
 
     merged: list[str] = []
     kept: list[str] = []
     placed: set = set()
-    for statement in split_sql_statements(current):
-        key = key_of(statement)
-        if key in incoming:
-            if key not in placed:
-                merged.append(incoming[key])
-                placed.add(key)
+    for piece, ident in zip(pieces, identities):
+        key, stands = None, False
+        if ident is not None:
+            kind, name, definition = ident
+            if (kind, name) in incoming:
+                key = (kind, name)
+            elif (kind, definition) in incoming:
+                key = (kind, definition)
+                stands = bool(name) or not incoming[key][0]
+        if key is None:
+            merged.append(piece)
+            said = True
+        elif key in placed:
             continue  # a second copy of a replaced statement would create it twice
-        merged.append(statement)
-        clean = sql_without_comments(statement).strip()
-        if key is not None and key[0] in (_INDEX_KIND, _FOREIGN_KEY_ROLE):
-            what = "index" if key[0] == _INDEX_KIND else "foreign key"
-            kept.append(f"{what} {key[1]}" if key[1] else f"an unnamed {what}")
-        elif clean and not is_object_scaffolding(clean, object_name):
-            kept.append(statement_label(clean))
-    for key, statement in incoming.items():
-        if key in placed:
-            continue
-        keys = [key_of(existing) for existing in merged]
+        else:
+            merged.append(piece if stands else incoming[key][1])
+            placed.add(key)
+            # Kept under its own name where the reply names it otherwise: that is said.
+            said = stands and bool(ident[1]) and bool(incoming[key][0])
+        label = kept_label(piece, ident) if said else None
+        if label:
+            kept.append(label)
+    created = {(i[0], i[2]) for i in map(identity, merged) if i is not None and i[0] != "CREATE"}
+    for key, (_, statement) in incoming.items():
+        kind, _, definition = identity(statement)
+        if key in placed or (kind, definition) in created:
+            continue  # placed, or what it creates is there already
+        created.add((kind, definition))
+        kinds = [ident[0] if ident else None for ident in map(identity, merged)]
         if key == ("CREATE", ""):
             # After the schema it is created in.
             at = next(
@@ -725,10 +825,10 @@ def merge_object_ddl(
                 ),
                 len(merged),
             )
-        elif key[0] == _INDEX_KIND:
+        elif kind == _INDEX_KIND:
             # After the object's last index (or its CREATE); foreign keys come last.
             at = 1 + max(
-                (i for i, k in enumerate(keys) if k is not None and k[0] != _FOREIGN_KEY_ROLE),
+                (i for i, k in enumerate(kinds) if k is not None and k != _FOREIGN_KEY_ROLE),
                 default=len(merged) - 1,
             )
         else:
@@ -773,6 +873,11 @@ def override_apply_objects(
     converter renamed a table's colliding indexes is applied under the new names, and
     a stored edit never replaces the placeholder of tables whose names share a stored
     form (no target DDL can separate them).
+
+    An edit with no ``CREATE SCHEMA`` of its own is applied after the object's generated
+    schema ensure, as Full Load recreates an edited table: a view edit holds only its CREATE
+    VIEW (an AI reply's schema ensure is not taken, a hand-typed one rarely has it), so a
+    view in a schema with no tables failed with "schema does not exist".
     """
     tables = {table.table: table for table in conversion.tables} if conversion else {}
     renames_by_table = conversion.index_renames if conversion else {}
@@ -792,6 +897,11 @@ def override_apply_objects(
             if ddls and renames:
                 ddls = tuple(rename_index_statements(ddls, renames))
             if ddls:
+                if not any(_describe_ddl(ddl)[1] == _SCHEMA_KIND for ddl in ddls):
+                    ddls = (
+                        *(ddl for ddl in obj.ddls if _describe_ddl(ddl)[1] == _SCHEMA_KIND),
+                        *ddls,
+                    )
                 overridden.append(ApplyObject(object_name=obj.object_name, ddls=ddls))
                 continue
         overridden.append(obj)
@@ -1195,31 +1305,50 @@ def applied_view_ddls(
     manual reimplementation has a comment-placeholder ``target_ddl`` (not runnable
     DDL), so recreating it would fail; those are skipped. A user-edited view uses
     its edited DDL, mirroring :func:`applied_table_conversions`.
+
+    Every other CREATE VIEW of an edit -- a helper view it creates -- is here too, under
+    the name it creates (a source view's own DDL keeps its name): Schema Apply created it,
+    so it blocks a table's DROP like any view. A view over a helper over the reloaded table
+    was otherwise not selected (it reads no reloaded table itself), nothing was pre-dropped,
+    and the reload's DROP TABLE was refused (2BP01).
     """
+    from dsql_migrator.core.schema_applier import SchemaApplyError, parse_create_object
+
+    def created_view(statement: str) -> Optional[str]:
+        # The view a statement creates, as the reload's pre-drop reads it (one part: public's).
+        try:
+            name, kind = parse_create_object(statement)
+        except SchemaApplyError:
+            return None
+        if kind != _VIEW_KIND:
+            return None
+        return name if "." in name else f"public.{name}"
+
     ddls: dict[str, str] = {}
+    helpers: dict[str, str] = {}
     for view in result.views:
         if not view.auto_converted:
             continue
         edited = edited_target_ddls.get(view.view)
-        if edited is not None:
-            # As Schema Apply runs it: the edit's CREATE VIEW, without its comments (a note
-            # above it made the reload's pre-drop and re-create refuse the view) -- the one
-            # that creates THIS view, never a helper view the edit creates first.
-            statements = edited_statements(edited)
-            own = [
-                stmt for stmt in statements
-                if object_statement_role(stmt, view.view) == (_VIEW_KIND, "")
-            ]
-            views = [
-                stmt for stmt in statements
-                if re.match(
-                    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+)?VIEW\b", stmt, re.IGNORECASE
-                )
-            ]
-            created = (own or views or [None])[-1]
-            ddls[view.view] = created if created is not None else view.target_ddl
-        else:
+        if edited is None:
             ddls[view.view] = view.target_ddl
+            continue
+        # As Schema Apply runs them: the edit's CREATE VIEWs, without their comments (a note
+        # above one made the reload's pre-drop and re-create refuse the view). The one that
+        # creates THIS view is its DDL, never a helper view the edit creates first.
+        views = [
+            (stmt, name) for stmt in edited_statements(edited) if (name := created_view(stmt))
+        ]
+        own = [
+            stmt for stmt, _ in views
+            if object_statement_role(stmt, view.view) == (_VIEW_KIND, "")
+        ]
+        ddls[view.view] = (own or [stmt for stmt, _ in views] or [view.target_ddl])[-1]
+        for stmt, name in views:
+            if stmt != ddls[view.view]:
+                helpers[name] = stmt
+    for name, stmt in helpers.items():
+        ddls.setdefault(name, stmt)
     return ddls
 
 
@@ -1656,6 +1785,121 @@ def split_sql_statements(text: str) -> list[str]:
         for start, end in sql_statement_spans(text)
         if text[start:end].strip()
     ]
+
+
+# A line that starts a statement of its own. A WITH only as a CTE list (``WITH x AS (``),
+# never ``WITH (fillfactor = 70)`` or ``WITH CHECK OPTION``; an ALTER / DROP / CREATE only of
+# an object kind, never the ``ALTER COLUMN`` / ``DROP CONSTRAINT`` action of an ALTER TABLE.
+_KIND_WORDS = (
+    r"(?:TABLE|VIEW|INDEX|SCHEMA|SEQUENCE|FUNCTION|PROCEDURE|TRIGGER|TYPE|DOMAIN|EXTENSION"
+    r"|ROLE|USER|POLICY|RULE|DATABASE)"
+)
+_CTE_HEAD = (
+    rf"WITH\s+(?:RECURSIVE\s+)?{_ANY_NAME_PART}\s*(?:\(\s*\)\s*)?"
+    r"AS\s*(?:(?:NOT\s+)?MATERIALIZED\s*)?\("
+)
+_STATEMENT_START_RE = re.compile(
+    r"(?:SELECT|UPDATE|GRANT|EXPLAIN|INSERT\s+INTO|DELETE\s+FROM|COMMENT\s+ON"
+    rf"|(?:CREATE\s+{_CREATE_MODIFIERS}|ALTER\s+|DROP\s+){_KIND_WORDS})(?![\w$])|{_CTE_HEAD}",
+    re.IGNORECASE,
+)
+# The last word or sign of a statement that goes on with the next line's SELECT, INSERT, ...:
+# a view's AS, a set operator, a rule's DO [INSTEAD], a MERGE's THEN, a trigger's BEFORE /
+# OR events, FOR UPDATE, ON UPDATE of a foreign key, a list's comma.
+_GOES_ON_RE = re.compile(
+    r"(?:(?<![\w$])(?:AS|UNION|INTERSECT|EXCEPT|ALL|DISTINCT|DO|INSTEAD|ALSO|THEN|ELSE|BEFORE"
+    r"|AFTER|OF|OR|AND|NOT|FOR|ON|IN|IS|BY|BEGIN|ATOMIC|EXPLAIN|ANALYZE|VERBOSE|GRANT)"
+    r"|[,(=<>+\-*/|:])$",
+    re.IGNORECASE,
+)
+# A head still waiting for what the next line starts: an ALTER's action (``ALTER TABLE t`` /
+# ``ALTER type SET NOT NULL``, COLUMN left out), an INSERT's query, what an EXPLAIN explains.
+_OPEN_HEAD_RE = re.compile(
+    rf"ALTER\s+(?:MATERIALIZED\s+|FOREIGN\s+)?\w+\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{_ANY_NAME}"
+    rf"|INSERT\s+INTO\s+{_ANY_NAME}(?:\s+AS\s+{_ANY_NAME_PART})?(?:\s*\(\s*\))?"
+    r"(?:\s+OVERRIDING\s+\w+\s+VALUE)?"
+    r"|EXPLAIN(?:\s+(?:ANALYZE|VERBOSE))*(?:\s*\(\s*\))?",
+    re.IGNORECASE,
+)
+_CTE_HEAD_RE = re.compile(rf"(?<![\w$]){_CTE_HEAD}", re.IGNORECASE)
+_INDENT_RE = re.compile(r"[ \t]*")
+# What a CTE list goes on to: once one follows it at its level, the list has its statement.
+_CTE_STATEMENT_RE = re.compile(
+    r"(?<![\w$])(?:SELECT|INSERT|UPDATE|DELETE|VALUES|TABLE|MERGE)(?![\w$])", re.IGNORECASE
+)
+
+
+def _statement_level(statement: str) -> "tuple[str, list[int]]":
+    """``statement`` as read at its own level, every offset kept: a string or dollar literal
+    one value (``0``), a comment blank, what is inside brackets blank; and where each line at
+    that level starts."""
+    from dsql_migrator.core.converter import _SQL_SPECIAL_RE, _sql_skip
+
+    out: list[str] = []
+    starts: list[int] = []
+    depth = 0
+    at = 0
+    while at < len(statement):
+        char = statement[at]
+        skipped = _sql_skip(statement, at) if _SQL_SPECIAL_RE.match(statement, at) else None
+        if skipped is not None:
+            kind, end = skipped
+            if depth or kind == "comment":
+                out.append(" " * (end - at))
+            elif kind == "quoted":
+                out.append(statement[at:end].replace("\n", " "))
+            else:
+                out.append("0".ljust(end - at))
+            at = end
+            continue
+        if char == "(":
+            depth += 1
+        out.append(char if depth == 0 or (depth == 1 and char in "()") or char == "\n" else " ")
+        if char == ")":
+            depth = max(depth - 1, 0)
+        elif char == "\n" and depth == 0:
+            starts.append(at + 1)
+        at += 1
+    return "".join(out), starts
+
+
+def split_glued_statements(statement: str) -> list[str]:
+    """``statement`` -- one ``;``-split statement of an AI reply -- cut where a line starts a
+    statement of its own. A statement that lost its ``;`` ran into the next one, and the
+    whole of it was taken as the object's CREATE: Schema Apply failed it (42601), and Full
+    Load's applied DDL carried the verification SELECT or the side table's CREATE after it.
+
+    A line is a cut only at the statement's own level (outside brackets, literals and
+    comments), and only when what comes before it is whole: not a view's ``AS``, a set
+    operator, the CTE list of the query that follows, an ALTER still without its action, and
+    the like. A comment just above the line goes with it."""
+    level, starts = _statement_level(statement)
+    cuts: list[int] = []
+    begin = 0
+    for start in starts:
+        head = _INDENT_RE.match(level, start).end()
+        if not _STATEMENT_START_RE.match(level, head):
+            continue
+        before = level[begin:head].rstrip()
+        if (
+            not before.strip()
+            or _GOES_ON_RE.search(before[-16:])
+            or _OPEN_HEAD_RE.fullmatch(before.strip())
+        ):
+            continue
+        ctes = list(_CTE_HEAD_RE.finditer(before))
+        if ctes and not _CTE_STATEMENT_RE.search(before, ctes[-1].end()):
+            continue  # the query of a CTE list
+        cut = start
+        while cut > begin:
+            above = max(level.rfind("\n", begin, cut - 1) + 1, begin)
+            if level[above:cut].strip():
+                break
+            cut = above
+        cuts.append(cut)
+        begin = cut
+    bounds = [0, *cuts, len(statement)]
+    return [statement[a:b].strip() for a, b in zip(bounds, bounds[1:]) if statement[a:b].strip()]
 
 
 def _join_sql_statements(statements: Sequence[str]) -> str:

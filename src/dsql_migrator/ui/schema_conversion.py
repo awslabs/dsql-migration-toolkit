@@ -203,6 +203,7 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     replace_confirmation_message,
     run_schema_apply,
     schema_apply_is_complete,
+    split_glued_statements,
     split_sql_statements,
     split_target_ddl_fk_sections,
     statement_label,
@@ -4560,9 +4561,11 @@ def _reply_object_ddl(
     is the one the user sees; one tagged other than SQL is never read (a ```mysql 'before'
     block, a ```text error message). Only the object's own statements are taken -- its
     CREATE, and for a table its indexes and foreign keys -- never a verification SELECT or
-    another object's CREATE beside them. Its schema ensure and its own DROP are no reason to
-    refuse and go unmentioned: the tool writes the one itself, and an edit applies in
-    REPLACE mode, which drops the object."""
+    another object's CREATE beside them, a statement that lost its ``;`` included
+    (:func:`split_glued_statements`). Its schema ensure and its own DROP are no reason to
+    refuse and go unmentioned: Schema Apply runs the generated schema ensure for an edit
+    without one (:func:`override_apply_objects`; a table's current DDL keeps its own), and
+    an edit applies in REPLACE mode, which drops the object."""
     import textwrap
 
     from dsql_migrator.ui.ai_chat_drawer import split_markdown_segments
@@ -4576,9 +4579,10 @@ def _reply_object_ddl(
     ]
     for block in reversed(blocks):
         statements = [
-            statement.strip()
+            piece
             for statement in split_sql_statements(block)
-            if sql_without_comments(statement).strip()
+            for piece in split_glued_statements(statement)
+            if sql_without_comments(piece).strip()
         ]
         roles = [object_statement_role(statement, object_name) for statement in statements]
         created = [
