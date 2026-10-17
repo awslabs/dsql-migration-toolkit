@@ -341,19 +341,22 @@ def _rewrite_json_unquote(tree: exp.Expression) -> list[QueryWarning]:
     leaves ``JSON_UNQUOTE`` as an unknown function -- which the target rejects with
     ``function json_unquote(json) does not exist``. This rewrites the
     ``JSON_UNQUOTE(JSON_EXTRACT(...))`` pair in place to a single
-    :class:`sqlglot.exp.JSONExtractScalar`, so it renders as
-    ``JSON_EXTRACT_PATH_TEXT(col, 'k', ...)`` and runs on DSQL -- the converter's own
-    rewrite (:func:`unquote_json_extracts`), which a view's ``->>`` gets too.
+    :class:`sqlglot.exp.JSONExtractScalar`, which the expression rewrite writes as MySQL
+    reads it (``JSON_EXTRACT_PATH_TEXT(col, 'k', ...)``, a JSON null as ``'null'``) and runs
+    on DSQL -- the converter's own rewrite (:func:`unquote_json_extracts`), which a view's
+    ``->>`` gets too.
 
     A ``JSON_UNQUOTE`` wrapping anything else has no automatic equivalent, so it is
     left unchanged and flagged ``MANUAL`` rather than silently emitting SQL the
-    target will reject (Property 6). Returns the warnings produced (empty when
-    there was no ``JSON_UNQUOTE`` or every occurrence was rewritten cleanly).
+    target will reject (Property 6) -- one over a JSON_EXTRACT whose path Aurora DSQL
+    cannot follow is reported by the expression rewrite, which names the path. Returns
+    the warnings produced (empty when there was no ``JSON_UNQUOTE`` or every occurrence
+    was rewritten cleanly).
     """
     unquote_json_extracts(tree)
     warnings: list[QueryWarning] = []
     for node in list(tree.find_all(exp.Anonymous)):
-        if _is_json_unquote(node):
+        if _is_json_unquote(node) and not isinstance(node.expressions[0], exp.JSONExtract):
             warnings.append(
                 QueryWarning(
                     code=CODE_JSON_UNQUOTE_UNSUPPORTED,

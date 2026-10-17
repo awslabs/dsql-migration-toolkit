@@ -344,33 +344,45 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   UTC 벽시계로(MySQL처럼 정밀도에 맞춰 반올림이 아니라 잘라서), `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로,
   `VAR_SAMP`/`STDDEV_SAMP`는 표본 형태로, `CAST(x AS CHAR [CHARSET ...])`는 text로 — 길이가 있으면 자르기만 하고 채우지
   않는 `varchar(n)`으로 — 바이너리 컬럼은 그 바이트를 디코딩해서(`CONVERT_FROM`), `BINARY x`는 그 바이트로(비교나
-  `ORDER BY`, `GROUP BY`에서는 Aurora DSQL이 이미 바이트 단위로 비교하므로 생략), `CAST(x AS UNSIGNED)`는 MySQL처럼 먼저
+  `ORDER BY`, `GROUP BY`에서 텍스트의 것은 Aurora DSQL이 이미 바이트 단위로 비교하므로 생략하고 — `SELECT DISTINCT`에서는
+  선택 목록과 같은 형태로 — 타입을 알 수 없는 값은 그 텍스트의 바이트 순으로 정렬), `CAST(x AS UNSIGNED)`는 MySQL처럼 먼저
   반올림한 뒤(문자열은 앞쪽 정수로 읽어) 음수를 순환시켜, 정수와 decimal의 `/`는 MySQL의 정확한 나눗셈으로(MySQL이
   유지하는 소수 자릿수로 잘라서 계산하고 — 정수는 9자리라 `2 / 3 * 1000000`은 `666666.6660` — 피제수의 scale에 4를 더한
   decimal로 보여 주며 — `10 / 3`은 `3.3333` — 0으로 나누면 NULL) `AVG`도 마찬가지로, `FLOAT`의 `SUM`은 MySQL처럼
   배정밀도로 더해서, `FLOAT`/`DOUBLE`의 `ROUND`/`TRUNCATE(x, d)`는 MySQL처럼 배정밀도로 계산해서(실행 시점에 읽는
   자릿수도, 정수는 그 정수로), 숫자로 쓰인 `TINYINT(1)`(Aurora DSQL에서는 boolean)은 그 정수로, `GROUP_CONCAT`은 text
   위의 집계로, `CONCAT_WS`는 NULL을 건너뛰고
-  `GREATEST`/`LEAST`는 MySQL처럼 NULL을 반환하게, `LENGTH`는 텍스트의 바이트 수로(`CHAR(n)` 컬럼은 채움 공백 없이, JSON
-  값은 그 텍스트로), `DATE`에 일/월을 더해도 `DATE`로(컬럼이나 식에서 읽는 양, 또는 소수는 MySQL처럼 정수 단위로 세고 —
-  문자열은 앞쪽 정수로 — `'1 2' DAY_HOUR` 같은 복합 단위는 그 부분들로, 두 자리 연도나 `yyyymmdd`의 날짜 문자열은 MySQL처럼
-  해석), `+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든), NULL을 유지하고
-  `DATETIME`과 `TINYINT(1)`을 MySQL처럼 쓰는 `JSON_ARRAY`/`JSON_ARRAYAGG`, MySQL의 `->>`(MySQL은 뷰에
-  `json_unquote(json_extract(...))`로 저장합니다)는 `JSON_EXTRACT_PATH_TEXT`로, MySQL처럼 형식에 따라 `TIME`/`DATE`/`DATETIME`을
-  돌려주는 `STR_TO_DATE`(빈 문자열은 NULL, 두 자리 연도는 MySQL처럼 해석, 형식을 다 읽고 남은 입력은 무시), MySQL이 저장한
-  조인 안의 `ON` 없는 조인(`CROSS JOIN`, `LATERAL`)은 `CROSS JOIN`으로, `STRAIGHT_JOIN`은 `JOIN`으로, 그리고 모든
+  `GREATEST`/`LEAST`는 MySQL처럼 NULL을 반환하게, `LENGTH`는 텍스트의 바이트 수로, `CHAR_LENGTH`는 그 문자 수로
+  (`CHAR(n)` 컬럼은 채움 공백 없이, JSON 값은 그 텍스트로), MySQL이 문자열을 원하는 곳(`CONCAT`/`CONCAT_WS`,
+  `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`, `REPLACE`, `UPPER`/`LOWER`, `LIKE`, 숫자와 텍스트나 날짜의 `COALESCE`/`CASE`/`IF`)의
+  숫자·날짜·`TINYINT(1)`은 MySQL의 텍스트로(`DATETIME(6)`은 소수 6자리 모두), 날짜가 아닌 문자열(`IFNULL(d, '')`,
+  `'N/A'`)과 나란한 날짜는 MySQL의 문자열로(날짜 문자열 — `'2024-06-01'`, `'20240601'` — 과 나란하면 날짜 그대로, 시각이
+  있는 문자열과 나란한 `DATE`는 타임스탬프로), `DATE`에 일/월을 더해도 `DATE`로(컬럼이나 식에서 읽는 양, 또는 소수는
+  MySQL처럼 정수 단위로 세고 — 문자열은 앞쪽 정수로 — `'1 2' DAY_HOUR` 같은 복합 단위는 그 부분들로, 두 자리 연도나
+  `yyyymmdd`의 날짜 문자열은 MySQL처럼 해석), `+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든), NULL을 유지하고
+  `DATETIME`과 `TINYINT(1)`을 MySQL처럼 쓰는 `JSON_ARRAY`/`JSON_ARRAYAGG`, 멤버 이름과 배열 첨자로 된 경로의
+  `JSON_EXTRACT`/`->`와 MySQL의 `->>`(MySQL은 뷰에 `json_unquote(json_extract(...))`로 저장합니다)는 MySQL처럼 경로를
+  따라가고(배열이 아닌 값의 `[0]`은 그 값 자체) — `->>`의 JSON null은 텍스트 `'null'`로, 숫자와의 비교·산술·`SUM`/`AVG`·
+  `ROUND`에 쓰이는 그 텍스트는 MySQL처럼 배정밀도로(표시됨: 숫자가 아닌 텍스트는 거기서 실패합니다) — MySQL처럼 형식에 따라 `TIME`/`DATE`/`DATETIME`을
+  돌려주는 `STR_TO_DATE`(빈 문자열은 NULL, 두 자리 연도는 MySQL처럼 해석, 형식을 다 읽고 남은 입력은 무시), `ON` 없는
+  조인(`CROSS JOIN`, `LATERAL`, `INNER JOIN`, Query Converter 문 최상위의 `JOIN` — 쉼표는 쉼표 그대로)은 `CROSS JOIN`으로,
+  `CROSS JOIN ... ON`과 `STRAIGHT_JOIN`은 `JOIN`으로, 재귀 CTE의 `CAST(x AS CHAR(n))`(컬럼을 넓히는 MySQL의 방법)은 n으로
+  자른 text로, 그리고 모든
   `DATE_FORMAT`/`STR_TO_DATE`/`FROM_UNIXTIME` 형식은 `%%`와 알 수 없는 지정자까지 MySQL 자체의 지정자로부터 씁니다).
   나머지(ISO 이외 모드의 `WEEK`, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET` 등)는 같은 방식으로 표시되고, PostgreSQL에 같은 이름의
-  함수가 있어도 저장 함수(`date_trunc`)는 표시되며, Aurora DSQL 패턴이 없는 형식 토큰(MySQL의 `%U`/`%u`/`%V`/`%X` 주 번호,
+  함수가 있어도 저장 함수(`date_trunc`), Aurora DSQL이 따라갈 수 없는 JSON 경로(`'$'`, 와일드카드, `last`, 범위, 실행 시
+  계산하는 경로, 여러 경로), 비교되는 JSON 값(Aurora DSQL에는 json 값의 비교가 없습니다)은 표시되며, Aurora DSQL 패턴이 없는 형식 토큰(MySQL의 `%U`/`%u`/`%V`/`%X` 주 번호,
   `%w`)도 표시됩니다: 뷰는 만들어지지만 다른 텍스트를 반환합니다. 컬럼에 대한 `STR_TO_DATE`(형식으로 읽을 수 없는 값에 MySQL은
   NULL을 돌려주지만, Aurora DSQL은 그런 값에는 오류를 내고 구분자만 다른 값은 날짜로 읽습니다. 또 일광 절약 시간이 있는 세션
   시간대에서는 시계가 건너뛰는 한 시간 안의 시각이 한 시간 뒤로 읽힙니다), 바이트 디코딩(잘못된 바이트는 MySQL에서 NULL,
   Aurora DSQL에서 오류), 컬럼에서 읽는 형식, `GROUP_CONCAT(DISTINCT x ORDER BY y)`도 표시됩니다. 각 값은 그 내용에 맞게
   씁니다 — 컬럼은 그 타입으로(MySQL이 저장한 조인을 거쳐서도, MySQL이 바인딩하는 대로 — `db`.`table`.`col`은 그 데이터베이스의
-  테이블로), 식은 그 계산 결과로 — 그리고 Query Converter도 같은 MySQL 식을 같은 방식으로 쓰며(`UPDATE`, `DELETE`,
+  테이블로, 그 컬럼이 없는 테이블의 별칭은 건너서), 파생 테이블이나 CTE의 컬럼은 그 본문이 고르는 것으로(읽는 테이블과
+  같은 이름의 CTE도), 식은 그 계산 결과로 — 그리고 Query Converter도 같은 MySQL 식을 같은 방식으로 쓰며(`UPDATE`, `DELETE`,
   `ON DUPLICATE KEY UPDATE`에서도), 1단계를 실행했다면 Evaluation 인벤토리의 타입을 씁니다. 타입을 알 수 없는 컬럼 — 다른
-  뷰나 파생 테이블, CTE를 거쳐 읽거나, 1단계 전 Query Converter에서 — 의 `LENGTH`와 `BINARY`는 그 컬럼 자체의 바이트를
-  읽습니다. 텍스트나 바이너리 컬럼에는 맞지만, 숫자나 날짜에는 Aurora DSQL이 거부합니다. 몫은 MySQL이 보여 주는 곳에서
+  뷰의 컬럼, 파생 테이블이나 CTE가 계산하는 컬럼, 1단계 전 Query Converter의 컬럼 — 의 `LENGTH`와 `BINARY`는 표시됩니다:
+  `LENGTH`는 `x || ''`의 텍스트를 세어 텍스트·바이트·숫자·날짜에는 MySQL과 같은 수가 되고(`TINYINT(1)`, `TIMESTAMP`, 소수부가
+  있는 `DATETIME`은 다름), `BINARY`는 `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 몫은 MySQL이 보여 주는 곳에서
   그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE — 집계, 윈도우,
   `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나 테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는
   것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의 값도). MySQL이 읽는 쿼리에 병합(merge)하는 뷰는 거기서 몫이
@@ -383,7 +395,9 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   (`1 / 3`과 `3333 / 10000`은 같은 키), 임시 테이블로 그룹화할 때(그룹화 컬럼에 인덱스가 없을 때)는 몫을 그 scale로
   더하기도 합니다. 변환은 유지한 자릿수로 키를 만들고 더하므로, 그것이 중요하면 `ROUND(q, 4)`로 그룹화하세요. `IFNULL`,
   `IF`, `CASE` 또는 다른 함수 뒤로 세 단계보다 깊게 중첩된 `GREATEST`/`LEAST`와, 컬럼에서 읽는 복합 단위 interval은
-  MANUAL로 표시됩니다. **PostgreSQL** 뷰의 정의
+  MANUAL로 표시됩니다. 아직 다른 것: `FLOAT`의
+  텍스트(MySQL은 유효 숫자 6자리로 `1234.57`)와 JSON 안의 `FLOAT`, 날짜만 있는 문자열과 나란한 `DATETIME`은 그 문자열의
+  행을 `2024-06-01 00:00:00`으로 보여 줍니다(MySQL은 쓰인 그대로). **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
   같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
   `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum

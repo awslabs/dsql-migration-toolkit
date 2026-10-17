@@ -132,7 +132,8 @@ def test_a_name_in_another_case_finds_the_one_table_it_can_mean() -> None:
     from dsql_migrator.core.converter import table_type_index, view_column_types
 
     index = table_type_index([_ORDERS])
-    assert view_column_types("select 1 from `shop`.`ORDERS`", index) == (index["shop.orders"],)
+    # G107 (ES-23): a stored view keeps MySQL's case -- `ORDERS` is another table.
+    assert view_column_types("select 1 from `shop`.`ORDERS`", index) == ()
     sql, _ = _query("SELECT CONVERT(body USING utf8mb4) FROM Orders")
     assert "CONVERT_FROM(body, 'UTF8')" in sql
 
@@ -197,14 +198,16 @@ def test_length_and_binary_of_a_json_or_computed_value_read_its_text(call: str, 
 
 def test_an_unknown_expression_is_made_text_and_a_bare_column_keeps_its_own_bytes() -> None:
     sql, _ = _query("SELECT LENGTH(i), LENGTH(i + 1), CAST(i AS BINARY), CAST(i + 1 AS BINARY) FROM x", typed=False)
-    assert "OCTET_LENGTH(i), OCTET_LENGTH(CAST(i + 1 AS TEXT))" in sql
+    # G107: the text of any type (noted), where OCTET_LENGTH(integer) does not exist.
+    assert "OCTET_LENGTH(i || ''), OCTET_LENGTH(CAST(i + 1 AS TEXT))" in sql
     assert "CAST(i AS BYTEA), CONVERT_TO(CAST(i + 1 AS TEXT), 'UTF8')" in sql
 
 
 def test_binary_ordering_and_grouping_keys_are_the_value_itself() -> None:
     """F3: ORDER BY CAST(name AS BYTEA) failed on a backslash in the text."""
     sql, _ = _query("SELECT s FROM x ORDER BY BINARY s", typed=False)
-    assert "ORDER BY s" in sql and "BYTEA" not in sql
+    # G107 (R4): of unknown type, by the bytes of its text -- a number's digits too.
+    assert "ORDER BY CONVERT_TO(CAST(s AS TEXT), 'UTF8')" in sql and "BYTEA" not in sql
     ddl, _ = _view("select count(0) AS `n` from `shop`.`t` `t` group by cast(`t`.`s` as char charset binary)")
     assert 'GROUP BY "t"."s"' in ddl
     # A number keeps the bytes of its text, as MySQL orders them.
@@ -246,7 +249,8 @@ def test_a_date_beside_a_date_string_is_a_date() -> None:
 
 def test_json_of_a_datetime_beside_a_string_is_mysqls_string() -> None:
     ddl, _ = _select("json_array(coalesce(`t`.`dt`,'2024-06-01 00:00:00')) AS `x`")
-    assert "'YYYY-MM-DD HH24:MI:SS')" in ddl and ".US" not in ddl
+    # G107 (P12): each value's own text -- the DATETIME's, the string as written.
+    assert "COALESCE(CAST(\"t\".\"dt\" AS TEXT), '2024-06-01 00:00:00')" in ddl and ".US" not in ddl
 
 
 # --- Numbers ----------------------------------------------------------------------------
@@ -272,7 +276,7 @@ def test_mysqls_exact_division_is_numeric_at_its_scale() -> None:
     assert 'ROUND(((DIV(CAST("t"."i" AS DECIMAL) * 1000000000, NULLIF("t"."n", 0)) * 0.000000001) * 100), 4) AS "c"' in ddl
     assert f'TRUNC({_QUOTIENT}, 4) AS "e"' in ddl
     assert f'OCTET_LENGTH(CAST(ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) AS TEXT)) AS "g"' in ddl
-    assert f"ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) || '%'" in ddl
+    assert f"CAST(ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) AS TEXT) || '%'" in ddl  # G107: as text
     assert 'ROUND(TRUNC(AVG("t"."i"), 9), 4) AS "k"' in ddl  # G106: AVG keeps 9 digits too
     assert '(CAST("t"."db" AS DOUBLE PRECISION) / NULLIF(2, 0)) AS "m"' in ddl  # a double's is a double
 
@@ -405,7 +409,10 @@ def test_a_join_with_no_on_in_mysqls_join_container_is_a_cross_join(joins: str, 
 
 
 def test_a_top_level_comma_join_is_left() -> None:
+    # G107 (ES-14): a JOIN without ON is MySQL's CROSS JOIN, which binds as JOIN does.
     ddl, _ = _view("select `t`.`id` AS `id` from `shop`.`t` `t` join `shop`.`orders` `o`")
+    assert '"shop"."t" AS "t" CROSS JOIN "shop"."orders" AS "o"' in ddl
+    ddl, _ = _view("select `t`.`id` AS `id` from `shop`.`t` `t`, `shop`.`orders` `o`")
     assert '"shop"."t" AS "t", "shop"."orders" AS "o"' in ddl
 
 
@@ -428,11 +435,12 @@ def test_mysqls_json_unquote_of_json_extract_is_written_in_a_view_too() -> None:
     as json_unquote() (MANUAL, failing) where the Query Converter wrote ->>."""
     ddl, view = _select("json_unquote(json_extract(`t`.`j`,'$.b')) AS `b`")
     assert "JSON_EXTRACT_PATH_TEXT(\"t\".\"j\", 'b')" in ddl and view.warnings == []
-    # Over several paths JSON_EXTRACT returns an array: left, and reported.
+    # Over several paths JSON_EXTRACT returns an array: left, and reported (G107: by what it
+    # is, a path Aurora DSQL cannot follow).
     _ddl, view = _select("json_unquote(json_extract(`t`.`j`,'$.a','$.b')) AS `b`")
-    assert any("json_unquote()" in w.message for w in view.warnings)
+    assert any("several paths" in w.message for w in view.warnings)
     _sql, result = _query("SELECT JSON_UNQUOTE(JSON_EXTRACT(j, '$.a', '$.b')) FROM t")
-    assert [w.code for w in result.warnings] == ["JSON_UNQUOTE_UNSUPPORTED"]
+    assert [w.code for w in result.warnings] == ["MYSQL_SEMANTICS"]
 
 
 @pytest.mark.parametrize("sql", ["SELECT CAST(c AS BINARY(16)) FROM t", "SELECT CONVERT(bl USING ucs2) FROM t"])

@@ -441,28 +441,41 @@ MySQL→PostgreSQL transpile:
   `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` as the UTC one, truncated to their precision as MySQL does,
   `STDDEV`/`VARIANCE` as the population forms MySQL computes and `VAR_SAMP`/`STDDEV_SAMP` as the sample ones,
   `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
-  a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (dropped in a comparison, an
-  `ORDER BY` or a `GROUP BY`, which Aurora DSQL makes byte-wise already), `CAST(x AS UNSIGNED)` rounding first
-  (a string read by its leading integer) and wrapping a negative number as MySQL does, `/` of integers and
-  decimals as MySQL's exact division (computed with the fraction digits MySQL keeps, truncated — 9 for integers,
-  so `2 / 3 * 1000000` is `666666.6660` — shown at the dividend's scale plus 4 — `10 / 3` is `3.3333` — and NULL
-  for a zero divisor) and `AVG` likewise, `SUM` of a `FLOAT` in double precision as MySQL adds it,
+  a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (a text's dropped in a comparison,
+  an `ORDER BY` or a `GROUP BY`, which Aurora DSQL makes byte-wise already — in a `SELECT DISTINCT` written as its
+  select list has it; a value whose type cannot be told ordered by the bytes of its text), `CAST(x AS UNSIGNED)`
+  rounding first (a string read by its leading integer) and wrapping a negative number as MySQL does, `/` of
+  integers and decimals as MySQL's exact division (computed with the fraction digits MySQL keeps, truncated — 9 for
+  integers, so `2 / 3 * 1000000` is `666666.6660` — shown at the dividend's scale plus 4 — `10 / 3` is `3.3333` —
+  and NULL for a zero divisor) and `AVG` likewise, `SUM` of a `FLOAT` in double precision as MySQL adds it,
   `ROUND`/`TRUNCATE(x, d)` of a `FLOAT`/`DOUBLE` in double precision as MySQL computes them (to places read at
   run time too; of an integer, the integer), a `TINYINT(1)` (a boolean on Aurora DSQL) used as a number as its
   integer, `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL
-  does, `LENGTH` as the bytes of its text (a `CHAR(n)` column without its padding, a JSON value as its text), a
+  does, `LENGTH` as the bytes of its text and `CHAR_LENGTH` as its characters (a `CHAR(n)` column without its
+  padding, a JSON value as its text), a number, a date or a `TINYINT(1)` as MySQL's text of it where MySQL wants a
+  string (`CONCAT`/`CONCAT_WS`, `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`, `REPLACE`, `UPPER`/`LOWER`, `LIKE`, and a
+  `COALESCE`/`CASE`/`IF` of a number and text or a date; a `DATETIME(6)` with all six fractional digits), a date beside a
+  string that is no date (`IFNULL(d, '')`, `'N/A'`) as MySQL's string of them (beside a date string — `'2024-06-01'`,
+  `'20240601'` — it stays a date, a `DATE` beside one with a time a timestamp), a
   `DATE` plus days/months staying a `DATE` (an amount read from a column or an expression, or a fraction,
   counted in whole units as MySQL counts it — a string by its leading integer — and a composite unit such as
   `'1 2' DAY_HOUR` by its parts; a date string with a two-digit year, or as `yyyymmdd`, read as MySQL reads it),
   `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column), `JSON_ARRAY`/`JSON_ARRAYAGG`
-  keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL does, MySQL's `->>` (which MySQL stores in a
-  view as `json_unquote(json_extract(...))`) as `JSON_EXTRACT_PATH_TEXT`, `STR_TO_DATE` typed as MySQL types it
+  keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL does, `JSON_EXTRACT`/`->` and MySQL's `->>`
+  (which MySQL stores in a view as `json_unquote(json_extract(...))`) over a path of member names and array indexes
+  following it as MySQL does (`[0]` of a value that is no array is the value itself) — `->>` of a JSON null is the
+  text `'null'`, and its text compared with a number, in arithmetic, `SUM`/`AVG` or `ROUND` is read as the double
+  MySQL reads (flagged: a text that is not a number fails there) — `STR_TO_DATE` typed as MySQL types it
   (a `TIME`, `DATE` or `DATETIME` by its format, an empty string NULL, a two-digit year read as MySQL reads it,
-  input left over after the format ignored), a join without `ON` inside MySQL's stored joins (`CROSS JOIN`,
-  `LATERAL`) as a `CROSS JOIN` and `STRAIGHT_JOIN` as a `JOIN`, and every `DATE_FORMAT` / `STR_TO_DATE` /
+  input left over after the format ignored), a join without `ON` (`CROSS JOIN`, `LATERAL`, `INNER JOIN`, a `JOIN`
+  at the top of a Query Converter statement — a comma stays one) as a `CROSS JOIN`, `CROSS JOIN ... ON` and
+  `STRAIGHT_JOIN` as a `JOIN`, a recursive CTE's `CAST(x AS CHAR(n))` (MySQL's way to widen its column) as text
+  cut to n, and every `DATE_FORMAT` / `STR_TO_DATE` /
   `FROM_UNIXTIME` format written from MySQL's own specifiers, `%%` and unknown ones included); others (`WEEK` in a
   mode other than ISO's, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET`, ...) are flagged the same way, as is a stored
-  function even when PostgreSQL has one of its name (`date_trunc`), and a format token with no
+  function even when PostgreSQL has one of its name (`date_trunc`), a JSON path Aurora DSQL cannot follow (`'$'`,
+  a wildcard, `last`, a range, a path computed at run time, several paths) and a compared JSON value (Aurora DSQL
+  has no comparison of json values), and a format token with no
   Aurora DSQL pattern (MySQL's `%U`/`%u`/`%V`/`%X` week numbers, `%w`) is flagged too: the view would be
   created but return different text. So are `STR_TO_DATE` over a column (MySQL returns NULL for a value it cannot
   read with its format; Aurora DSQL raises an error for one and reads one whose separators differ as a date — and
@@ -470,11 +483,13 @@ MySQL→PostgreSQL transpile:
   decoding bytes (invalid bytes are NULL in MySQL, an error on Aurora DSQL), a format read from
   a column, and `GROUP_CONCAT(DISTINCT x ORDER BY y)`. Each value is written by what it holds — a column by its
   type, read through MySQL's stored joins and bound as MySQL binds it (`db`.`table`.`col` to that database's
-  table), an expression by what it computes — and the Query Converter writes the same MySQL expressions the same
+  table — past an alias whose table lacks the column), a derived table's or CTE's column by what its body selects
+  (a CTE named like the table it reads too), an expression by what it computes — and the Query Converter writes the same MySQL expressions the same
   way (in an `UPDATE`, a `DELETE` and an `ON DUPLICATE KEY UPDATE` too), typed by the Evaluation inventory once
-  Step 1 has run. `LENGTH` and `BINARY` of a column whose type cannot be told — read through another view, a
-  derived table or a CTE, or in the Query Converter before Step 1 — read the column's own bytes, which is right for
-  a text or a binary column; over a number or a date, Aurora DSQL refuses it. A quotient is shown at its scale
+  Step 1 has run. `LENGTH` and `BINARY` of a column whose type cannot be told — another view's, a derived table's or
+  CTE's that it computes, or one in the Query Converter before Step 1 — are flagged: `LENGTH` counts
+  the text of `x || ''`, MySQL's count for text, bytes, numbers and dates (not a `TINYINT(1)`, a `TIMESTAMP` or a
+  fractional `DATETIME`), and `BINARY` is `CAST(x AS BYTEA)`, right for a binary column only. A quotient is shown at its scale
   where MySQL shows it: a statement's output and a text, and the rows of a view, derived table or CTE that MySQL
   materializes — one with an aggregate, a window, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, a `UNION`, no table,
   or an output holding a subquery that reads its row — each stored at its column's scale (a window's values too).
@@ -488,7 +503,9 @@ MySQL→PostgreSQL transpile:
   (`1 / 3` and `3333 / 10000` are one key), and grouping through a temporary table (no index on the grouping
   columns) it also sums a quotient at that scale; the conversion keys and sums on the digits kept — group by
   `ROUND(q, 4)` where that matters. A `GREATEST`/`LEAST` nested more than three levels deep behind `IFNULL`, `IF`,
-  `CASE` or another function, and a composite-unit interval read from a column, are flagged MANUAL. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  `CASE` or another function, and a composite-unit interval read from a column, are flagged MANUAL. Still different: a
+  `FLOAT`'s text (MySQL writes 6 significant digits, `1234.57`) and a `FLOAT` in JSON, and a `DATETIME` beside a
+  date-only string shows the date string's rows as `2024-06-01 00:00:00` where MySQL writes it as given. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column

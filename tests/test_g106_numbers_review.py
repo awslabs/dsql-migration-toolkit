@@ -137,20 +137,17 @@ def test_a_derived_table_or_cte_mysql_materializes_stores_its_outputs() -> None:
 
 
 def test_a_quotient_read_out_of_a_derived_table_is_shown_by_its_type() -> None:
-    """P5: a derived table's or a CTE's column typed with its scale (decimal(65,4)) is a
-    quotient MySQL merges into the outer query, which shows it -- and what it computes from
-    it -- at that scale."""
-    from dsql_migrator.core.converter import MYSQL_EXPRESSION_DIALECT, _rewrite_mysql_calls
+    """P5: a derived table's or a CTE's column computed by a quotient is one MySQL merges
+    into the outer query, which shows it -- and what it computes from it -- at its scale; a
+    column passed through holds its own digits (G107 types both)."""
+    from dsql_migrator.core.converter import table_type_index
+    from dsql_migrator.core.query_converter import QueryConverter
 
-    tree = sqlglot.parse_one(
-        "SELECT x.q, x.q * 7 AS q7, o.c FROM (SELECT i / 7 AS q FROM t) x JOIN o ON o.id = 1",
-        read=MYSQL_EXPRESSION_DIALECT,
-    )
-    types = {"q": "decimal(65,4)", "i": "int", "c": "decimal(10,4)"}
-    _rewrite_mysql_calls(tree, lambda node: types.get(node.name) if isinstance(node, exp.Column) else None)
-    sql = tree.sql(dialect="postgres")
-    assert "ROUND(x.q, 4)" in sql and "ROUND(x.q * 7, 4) AS q7" in sql
-    assert "o.c FROM" in sql  # a table's decimal column holds its own digits
+    converted = QueryConverter(column_types=tuple(table_type_index(_TABLES).values())).convert(
+        "SELECT x.q, x.q * 7 AS q7, x.dec4 FROM (SELECT t.i / 7 AS q, t.dec4 FROM shop.t t) x"
+    ).converted_sql
+    assert "ROUND(x.q, 4)" in converted and "ROUND(x.q * 7, 4) AS q7" in converted
+    assert ", x.dec4 FROM" in converted  # a table's decimal column holds its own digits
 
 
 def test_a_scalar_subquery_window_and_nullif_carry_the_scale() -> None:

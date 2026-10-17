@@ -48,8 +48,9 @@ def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
         ("concat_ws(' ', a, b)", "CONCAT_WS(' ', a, b)"),
         ("convert_tz(d, '+00:00', '+09:00')", "AT TIME ZONE INTERVAL '+00:00' AT TIME ZONE INTERVAL '+09:00'"),
         ("greatest(a, b)", "CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE GREATEST(a, b) END"),
-        # G97: an operand of unknown type counts its own bytes (text or bytea alike).
-        ("length(s)", "OCTET_LENGTH(s)"),
+        # G97: an operand of unknown type counts its own bytes (text or bytea alike); G107:
+        # the bytes of its text, whatever it holds.
+        ("length(s)", "OCTET_LENGTH(s || '')"),
         ("cast(a as char charset utf8mb4)", "CAST(a AS TEXT)"),
         ("cast(a as char(10) charset utf8mb4)", "CAST(a AS VARCHAR(10))"),
         ("convert(a using utf8mb4)", "CAST(a AS TEXT)"),

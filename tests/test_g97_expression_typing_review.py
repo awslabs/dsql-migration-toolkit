@@ -72,9 +72,11 @@ def test_a_joined_view_as_mysql_stores_it_is_typed() -> None:
 
 
 def test_a_value_of_unknown_type_gets_the_form_right_for_text_and_bytes() -> None:
-    """Untyped, LENGTH(x) counted the hex text of a bytea, and BINARY x made bytes of it."""
+    """Untyped, LENGTH(x) counted the hex text of a bytea, and BINARY x made bytes of it.
+    G107: LENGTH counts the text of any type, and both are noted -- the type is unknown."""
     sql, codes = _query("SELECT LENGTH(body), CAST(body AS BINARY) FROM attachments")
-    assert sql == "SELECT OCTET_LENGTH(body), CAST(body AS BYTEA) FROM attachments" and codes == []
+    assert sql == "SELECT OCTET_LENGTH(body || ''), CAST(body AS BYTEA) FROM attachments"
+    assert codes == ["MYSQL_SEMANTICS", "MYSQL_SEMANTICS"]
 
 
 def test_the_query_converter_is_typed_by_the_evaluation_inventory() -> None:
@@ -116,7 +118,7 @@ def test_a_column_read_through_an_aliased_view_is_written_alias_dot_column() -> 
         "from `shop`.`v_base` `items`"
     )
     assert '"items"."id"' in ddl and '"shop"."items"."code"' not in ddl
-    assert 'OCTET_LENGTH("items"."code")' in ddl  # untyped: no CONVERT_FROM of a char
+    assert "OCTET_LENGTH(\"items\".\"code\" || '')" in ddl  # untyped: no CONVERT_FROM of a char
 
 
 @pytest.mark.parametrize(

@@ -79,6 +79,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.mysql import MySQL as _SqlglotMySQL
 from sqlglot.helper import seq_get
+from sqlglot.tokens import TokenType
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dsql_migrator.core.models import (
@@ -7510,6 +7511,8 @@ _QUOTIENT_SCALE = "mysql_scale"
 # The meta key holding how many GREATEST / LEAST nests a NULL test of the rewrite holds,
 # each inside the one before.
 _NEST_COPIES = "mysql_nest_copies"
+# The meta key marking a join written with a comma (which binds looser than JOIN).
+_COMMA_JOIN = "mysql_comma_join"
 # The meta key marking an interval amount MySQL read as a number ('decimal' / 'double'):
 # sqlglot makes INTERVAL 1.5 DAY's amount the string INTERVAL '1.5' DAY has, and MySQL
 # counts the two differently.
@@ -7568,6 +7571,8 @@ class _MySqlViewDialect(_SqlglotMySQL):
     * ``CAST(x AS CHAR(n) CHARSET cs)`` keeps its length, which sqlglot drops.
     * An interval's number amount (INTERVAL 1.5 DAY) is marked as one: sqlglot reads it as
       the string of INTERVAL '1.5' DAY, which MySQL counts otherwise.
+    * A comma join is marked as one: sqlglot builds the same node for a JOIN without ON,
+      which binds as JOIN does.
     Written back as MySQL (the Schema Conversion source pane), each reads as it did."""
 
     class Parser(_SqlglotMySQL.Parser):
@@ -7605,6 +7610,15 @@ class _MySqlViewDialect(_SqlglotMySQL):
             if number is not None and isinstance(interval.this, exp.Literal):
                 interval.this.meta[_MYSQL_NUMBER] = number
             return interval
+
+        def _parse_join(self, *args: Any, **kwargs: Any) -> Any:
+            # A comma join, which binds looser than JOIN: sqlglot builds the same node for
+            # it as for a JOIN without ON, which MySQL reads as JOIN.
+            comma = self._curr is not None and self._curr.token_type == TokenType.COMMA
+            join = super()._parse_join(*args, **kwargs)
+            if comma and join is not None:
+                join.meta[_COMMA_JOIN] = True
+            return join
 
         def _parse_convert(self, strict: bool, safe: Any = None) -> Any:
             # CONVERT(x USING cs) reads no type of its own: a CHAR(n) read earlier (a
@@ -7814,6 +7828,9 @@ _DATE_UNITS = frozenset({"DAY", "WEEK", "MONTH", "QUARTER", "YEAR"})
 _NUMERIC_KINDS = frozenset({"integer", "decimal", "float4", "float8"})
 _EXACT_KINDS = frozenset({"integer", "decimal"})
 _FLOAT_KINDS = frozenset({"float4", "float8"})
+_TEMPORAL_KINDS = frozenset({"date", "datetime", "timestamp", "time"})
+# The kinds MySQL writes as text where a string is wanted (as_text): all but text and bytes.
+_TEXTED_KINDS = _NUMERIC_KINDS | _TEMPORAL_KINDS | {"boolean", "char", "json"}
 # The nodes that are NULL exactly when an operand is, in MySQL and as written for Aurora
 # DSQL alike -- a division and a modulo also when the divisor is 0 (:func:`_null_strict`).
 _NULL_STRICT = (
@@ -7928,9 +7945,11 @@ def _mysql_materializes(query: exp.Expression) -> bool:
     return False
 
 
-# A MySQL DECIMAL type that names its scale (decimal(65,4)), as a derived table's or a CTE's
-# quotient column is typed.
-_SCALED_DECIMAL_RE = re.compile(r"^\s*(?:decimal|numeric|dec|fixed)\s*\(\s*\d+\s*,\s*\d+\s*\)", re.IGNORECASE)
+class _QuotientType(str):
+    """The MySQL type (decimal(65,4)) the rewrite gives a derived table's or a CTE's column
+    computed by a quotient (an AVG): MySQL merges such a body into the query that reads it,
+    which shows the quotient at this scale. A column passed through keeps its table's type,
+    whose digits are its own."""
 
 
 def _aggregated(node: exp.Expression) -> Optional[exp.Expression]:
@@ -7959,7 +7978,7 @@ def _reads_derived(column: exp.Column) -> bool:
     while scope is not None:
         bound = next((item for item in _scope_sources(scope) if _binds(item, column)), None)
         if bound is not None:
-            return isinstance(bound, exp.Subquery) or (isinstance(bound, exp.Table) and _names_a_cte(bound))
+            return isinstance(bound, exp.Subquery) or (isinstance(bound, exp.Table) and _cte_named(bound) is not None)
         scope = _type_scope(scope)
     return False
 
@@ -8069,32 +8088,15 @@ def _pg_type_kind(to: object) -> Optional[str]:
     return kinds.get(to.this)
 
 
-class _TableTypeIndex(dict):
-    """:func:`table_type_index`'s mapping, which also finds a name written in another case
-    when only one table has it."""
-
-    _folded: "Optional[dict[str, list[str]]]" = None
-
-    def entry(self, name: str) -> Optional[tuple]:
-        found = self.get(name)
-        if found is None:
-            if self._folded is None:
-                folded: dict[str, list[str]] = {}
-                for key in self:
-                    folded.setdefault(key.lower(), []).append(key)
-                self._folded = folded
-            names = self._folded.get(name.lower()) or []
-            found = self[names[0]] if len(names) == 1 else None
-        return found
-
-
 def table_type_index(tables: "Iterable[TableDef]") -> "dict[str, tuple]":
     """``{name: (name, ((lower-cased column, type), ...))}`` -- one shared entry per table,
     which every view's cache key over it references (a copy per view held one table's whole
     column list once per view, for the life of the server). By the table's exact name: MySQL
-    on Linux keeps `Docs` and `docs` apart, and so does Aurora DSQL (the names are quoted);
-    a name in another case finds the one table it can only mean."""
-    return _TableTypeIndex(
+    on Linux keeps `Docs` and `docs` apart, and so does Aurora DSQL (the names are quoted),
+    and a stored view names each table in the case MySQL keeps it -- `docs` is never `Docs`
+    left out of the inventory. Only a Query Converter statement is read in another case
+    (:func:`_column_type_resolver`)."""
+    return dict(
         (
             table.name,
             (
@@ -8169,143 +8171,324 @@ def _scope_sources(scope: exp.Expression) -> "list[exp.Expression]":
     return [item for entry in entries if isinstance(entry, exp.Expression) for item in _type_source_items(entry)]
 
 
-def _binds(item: exp.Expression, column: exp.Column) -> bool:
+def _binds(
+    item: exp.Expression,
+    column: exp.Column,
+    columns: "Optional[Callable[[exp.Expression], Optional[Mapping[str, object]]]]" = None,
+) -> bool:
     """Whether MySQL reads ``column``'s qualifier as ``item`` (find_field_in_table_ref): it
     names the item -- its alias, or an unaliased table's name -- and a database the column
-    is written with is the item's own (a derived table has none)."""
+    is written with is the item's own (a derived table has none). MySQL reads
+    `db`.`alias`.`col` as an aliased table only when the table has the column (and stores
+    it `alias`.`col` then): one the inventory (``columns``) says lacks it is a source further
+    out."""
     if item.alias_or_name != column.table:
         return False
     db = column.args.get("db")
     own = item.args.get("db") if isinstance(item, exp.Table) else None
-    return db is None or own is None or own.name == db.name
-
-
-def _names_a_cte(table: exp.Table) -> bool:
-    """Whether a table written without its schema reads a CTE of an enclosing WITH: from
-    the end of its own body, for a CTE that is not recursive -- inside that body, and in an
-    earlier sibling's, the name is the real table."""
-    if table.args.get("db") is not None:
+    if not (db is None or own is None or own.name == db.name):
         return False
+    if db is not None and columns is not None and isinstance(item, exp.Table) and item.args.get("alias") is not None:
+        held = columns(item)
+        return held is None or column.name.lower() in held
+    return True
+
+
+def _cte_named(table: exp.Table) -> Optional[exp.CTE]:
+    """The CTE of an enclosing WITH a table written without its schema reads: from the end
+    of its own body, for a CTE that is not recursive -- inside that body, and in an earlier
+    sibling's, the name is the real table."""
+    if table.args.get("db") is not None:
+        return None
     name = table.name.lower()
     node = table
     while node.parent is not None:
         parent = node.parent
+        visible: list = []
         if isinstance(parent, exp.With) and isinstance(node, exp.CTE):
-            ctes = parent.expressions
+            visible = parent.expressions
             if not parent.args.get("recursive"):
-                ctes = ctes[: next(i for i, cte in enumerate(ctes) if cte is node)]
-            if any(cte.alias.lower() == name for cte in ctes):
-                return True
+                visible = visible[: next(i for i, cte in enumerate(visible) if cte is node)]
         else:
             with_ = parent.args.get("with") or parent.args.get("with_")
-            if isinstance(with_, exp.With) and node is not with_ and any(
-                cte.alias.lower() == name for cte in with_.expressions
-            ):
-                return True
+            if isinstance(with_, exp.With) and node is not with_:
+                visible = with_.expressions
+        found = next((cte for cte in visible if cte.alias.lower() == name), None)
+        if found is not None:
+            return found
         node = parent
-    return False
+    return None
 
 
-def _column_type_resolver(
-    column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]",
-    *,
-    bare_names: bool = False,
-) -> "Callable[[exp.Expression], Optional[str]]":
-    """``node -> MySQL type`` of a column reference, read from ``column_types`` (``(table,
-    ((column, type), ...))``, column names lower-cased): through its qualifier -- matched
-    exactly, as MySQL (on Linux) and the quoted output both do -- to the source of its own
-    or an enclosing query (a SELECT's FROM / JOIN, a parenthesised join included, the table
-    an UPDATE / DELETE / ON DUPLICATE KEY UPDATE writes) that MySQL binds it to, and for an
-    unqualified column the one table of its query that has it. A column written
-    `db`.`table`.`col` is the unaliased table of that database (one read through an alias
-    has lost its database by now: :func:`_drop_alias_db`). A table is found by its exact
-    name, else by the one table its name can mean in another case; ``bare_names``: one
-    written without its schema (a Query Converter statement) by its name alone, when only
-    one schema has it. ``None`` when it cannot be told (a derived table, a CTE, another
-    view)."""
-    types: dict[str, dict[str, str]] = {table: dict(columns) for table, columns in column_types}
-    folded: dict[str, list[str]] = {}
-    bare: dict[str, list[str]] = {}
-    bare_folded: dict[str, list[str]] = {}
-    for table in types:
-        folded.setdefault(table.lower(), []).append(table)
+# The MySQL type a computed column of each kind (see :func:`_mysql_kind`) is typed as.
+_KIND_TYPES: "dict[str, str]" = {
+    "binary": "blob", "boolean": "tinyint(1)", "integer": "bigint", "float4": "float",
+    "float8": "double", "char": "char", "date": "date", "json": "json", "text": "text",
+}
+
+
+class _ColumnTypes:
+    """The resolver :func:`_column_type_resolver` returns: ``node -> MySQL type``.
+
+    A derived table's or CTE's column is read off the body that defines it -- a computed
+    one by :attr:`typed_by`, which the rewrite sets (by what the expression computes: a
+    quotient a decimal of its scale)."""
+
+    def __init__(
+        self, column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]", *, bare_names: bool
+    ) -> None:
+        self._types: dict[str, dict[str, str]] = {table: dict(columns) for table, columns in column_types}
+        self._bare_names = bare_names
+        self._folded: dict[str, list[str]] = {}
+        self._bare: dict[str, list[str]] = {}
+        self._bare_folded: dict[str, list[str]] = {}
         if bare_names:
-            short = table.rsplit(".", 1)[-1]
-            bare.setdefault(short, []).append(table)
-            bare_folded.setdefault(short.lower(), []).append(table)
-    # Per table reference: a WITH above it is walked once, however many columns ask.
-    looked_up: dict[int, tuple] = {}
+            for table in self._types:
+                self._folded.setdefault(table.lower(), []).append(table)
+                short = table.rsplit(".", 1)[-1]
+                self._bare.setdefault(short, []).append(table)
+                self._bare_folded.setdefault(short.lower(), []).append(table)
+        # Per table reference and per derived table / CTE: a WITH above it, or a body's
+        # select list, is read once however many columns ask.
+        self._looked_up: dict[int, tuple] = {}
+        self._projections: dict[int, tuple] = {}
+        self._typing: set = set()
+        self.typed_by: "Optional[Callable[[exp.Expression], Optional[str]]]" = None
+        self._scopes: dict[int, tuple] = {}
 
-    def named(key: str, exact: "dict[str, list[str]]", by_case: "dict[str, list[str]]") -> "Optional[dict[str, str]]":
-        owners = exact.get(key) or by_case.get(key.lower()) or ()
-        return types[owners[0]] if len(owners) == 1 else None
+    def __call__(self, node: exp.Expression) -> Optional[str]:
+        return self._typed(self._value(node))
 
-    def table_types(source: Optional[exp.Expression]) -> "Optional[dict[str, str]]":
-        if not isinstance(source, exp.Table):
-            return None
-        cached = looked_up.get(id(source))
-        if cached is not None and cached[0] is source:
-            return cached[1]
-        found = None
-        if not _names_a_cte(source):  # a CTE named like a table is no table
-            db = source.args.get("db")
-            key = f"{db.name}.{source.name}" if db is not None else source.name
-            found = types[key] if key in types else named(key, {}, folded)
-            if found is None and db is None and bare_names:
-                found = named(key, bare, bare_folded)
-        looked_up[id(source)] = (source, found)
+    def _one(self, owners: "Optional[list[str]]") -> "Optional[dict[str, str]]":
+        return self._types[owners[0]] if owners and len(owners) == 1 else None
+
+    def _table(self, key: str, *, bare: bool) -> "Optional[dict[str, str]]":
+        """The inventory's columns of the table ``key`` names, by its exact name -- in a Query
+        Converter statement also in another case, and one written without its schema
+        (``bare``) by its name alone, each when only one table can be meant."""
+        found = self._types.get(key)
+        if found is None and self._bare_names:
+            found = self._one(self._folded.get(key.lower()))
+            if found is None and bare:
+                found = self._one(self._bare.get(key) or self._bare_folded.get(key.lower()))
         return found
 
-    def resolve(node: exp.Expression) -> Optional[str]:
-        if not types or not isinstance(node, exp.Column):
+    def base_columns(self, source: exp.Expression) -> "Optional[Mapping[str, str]]":
+        """The inventory's columns of the base table a FROM source names (None for a CTE, a
+        derived table, or a table it lacks)."""
+        if not isinstance(source, exp.Table) or _cte_named(source) is not None:
+            return None
+        db = source.args.get("db")
+        return self._table(f"{db.name}.{source.name}" if db is not None else source.name, bare=db is None)
+
+    def table_types(self, source: Optional[exp.Expression]) -> "Optional[Mapping[str, object]]":
+        """The columns a FROM source brings, by lower-cased name: a table's types, a derived
+        table's or CTE's as :meth:`projected` reads them; None when they cannot be told
+        (another view, a table the inventory lacks)."""
+        if isinstance(source, (exp.Subquery, exp.Lateral)):
+            return self.projected(source)
+        if not isinstance(source, exp.Table):
+            return None
+        cached = self._looked_up.get(id(source))
+        if cached is not None and cached[0] is source:
+            return cached[1]
+        cte = _cte_named(source)
+        if cte is not None:
+            found: "Optional[Mapping[str, object]]" = self.projected(cte)
+        else:
+            found = self.base_columns(source)
+        self._looked_up[id(source)] = (source, found)
+        return found
+
+    def projected(self, holder: exp.Expression) -> "Optional[Mapping[str, object]]":
+        """A derived table's or CTE's columns, by the select list of the body that defines
+        them: a bare column of a typed source its type, read in the body's own scope;
+        ``SELECT *`` its sources' columns; a computed one the (select, position)
+        :attr:`typed_by` types when asked. A UNION's where every branch agrees, a recursive
+        CTE's by its non-recursive SELECTs (MySQL types it by them). None when its columns
+        cannot be told."""
+        cached = self._projections.get(id(holder))
+        if cached is not None and cached[0] is holder:
+            return cached[1]
+        self._projections[id(holder)] = (holder, None)  # a body that reads itself tells nothing
+        branches: list = []
+        pending = [holder.this]
+        while pending:
+            node = pending.pop()
+            while isinstance(node, (exp.Subquery, exp.Paren)):
+                node = node.this
+            if isinstance(node, exp.SetOperation):
+                pending += [node.expression, node.this]
+            elif isinstance(node, exp.Select):
+                branches.append(node)
+            else:
+                return None
+        if isinstance(holder, exp.CTE) and isinstance(holder.parent, exp.With) and holder.parent.args.get("recursive"):
+            leading = []
+            for branch in branches:
+                if any(_cte_named(table) is holder for table in branch.find_all(exp.Table)):
+                    break
+                leading.append(branch)
+            branches = leading
+        outputs: list = []
+        for branch in branches:
+            output = self._select_columns(branch)
+            if output is None:
+                return None
+            outputs.append(output)
+        if not outputs:
+            return None
+        alias = holder.args.get("alias")
+        names = (
+            [column.name.lower() for column in alias.columns]
+            if isinstance(alias, exp.TableAlias) and alias.columns
+            else [name for name, _ in outputs[0]]
+        )
+        columns: dict[str, object] = {}
+        for position, name in enumerate(names):
+            values = [output[position][1] if position < len(output) else None for output in outputs]
+            agreed = len(values) == 1 or all(isinstance(v, str) and v == values[0] for v in values)
+            columns.setdefault(name, values[0] if agreed else None)
+        self._projections[id(holder)] = (holder, columns)
+        return columns
+
+    def _select_columns(self, select: exp.Select) -> "Optional[list[tuple[str, object]]]":
+        out: list = []
+        for position, projection in enumerate(select.expressions):
+            expression = projection.unalias()
+            if isinstance(expression, exp.Star) or (
+                isinstance(expression, exp.Column) and isinstance(expression.this, exp.Star)
+            ):
+                qualifier = expression.table if isinstance(expression, exp.Column) else ""
+                for source in _select_sources(select):
+                    if qualifier and source.alias_or_name != qualifier:
+                        continue
+                    columns = self.table_types(source)
+                    if columns is None:
+                        return None
+                    out.extend(columns.items())
+                continue
+            value = self._value(expression) if isinstance(expression, exp.Column) else (select, position)
+            out.append((projection.alias_or_name.lower(), value))
+        return out
+
+    def _typed(self, value: object) -> Optional[str]:
+        if not isinstance(value, tuple):
+            return value if isinstance(value, str) else None
+        select, position = value
+        key = (id(select), position)
+        if self.typed_by is None or key in self._typing or position >= len(select.expressions):
+            return None
+        self._typing.add(key)
+        try:
+            return self.typed_by(select.expressions[position].unalias())
+        finally:
+            self._typing.discard(key)
+
+    def _scope(self, node: exp.Expression) -> Optional[exp.Expression]:
+        """:func:`_type_scope`, remembered for every node on the way up: a column deep in a
+        long predicate (thousands of ORs) climbs only to the first node another column has
+        climbed, so typing a statement stays linear in its size."""
+        path: list = []
+        child, parent = node, node.parent
+        scope = None
+        while parent is not None:
+            hit = self._scopes.get(id(child))
+            if hit is not None and hit[0] is child:
+                scope = hit[1]
+                break
+            path.append(child)
+            if isinstance(parent, (exp.Select, exp.Update, exp.Delete)) or (
+                isinstance(parent, exp.Insert) and child is parent.args.get("conflict")
+            ):
+                scope = parent
+                break
+            child, parent = parent, parent.parent
+        for climbed in path:
+            self._scopes[id(climbed)] = (climbed, scope)
+        return scope
+
+    def _value(self, node: exp.Expression) -> object:
+        if not isinstance(node, exp.Column):
             return None
         name = node.name.lower()
         qualifier = node.table
         db = node.args.get("db")
-        scope = _type_scope(node)
+        scope = self._scope(node)
         while scope is not None:
             listed = _scope_sources(scope)
             if qualifier:
                 # EXCLUDED (an upsert's VALUES(col), rewritten) is the row it inserts.
                 excluded = isinstance(scope, exp.Insert) and qualifier.upper() == "EXCLUDED"
                 for item in listed:
-                    if not excluded and (
+                    if excluded or (db is None and item.alias_or_name == qualifier):
+                        found = self.table_types(item)
+                    elif (
                         item.alias_or_name != qualifier
-                        or db is not None and not (
-                            isinstance(item, exp.Table)
-                            and item.args.get("alias") is None
-                            and item.args.get("db") is not None
-                            and item.args["db"].name == db.name
-                        )
+                        or not isinstance(item, exp.Table)
+                        or item.args.get("alias") is not None
+                        or _cte_named(item) is not None
                     ):
                         continue
-                    found = table_types(item)
+                    elif item.args.get("db") is None:
+                        # `db`.`table`.`col` FROM table, in a Query Converter statement: the
+                        # session's database, which MySQL takes `db` to be.
+                        found = self._table(f"{db.name}.{item.name}", bare=False)
+                    elif item.args["db"].name == db.name:
+                        found = self.table_types(item)
+                    else:
+                        continue
                     return found.get(name) if found is not None else None
             elif listed:
-                holders = [t for t in (table_types(item) for item in listed) if t and name in t]
+                tables = [self.table_types(item) for item in listed]
+                holders = [t for t in tables if t is not None and name in t]
                 if len(holders) == 1:
                     return holders[0][name]
-                if holders or any(table_types(item) is None for item in listed):
+                if holders or any(t is None for t in tables):
                     return None
-            scope = _type_scope(scope)
+            scope = self._scope(scope)
         return None
 
-    return resolve
+
+def _column_type_resolver(
+    column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]",
+    *,
+    bare_names: bool = False,
+) -> _ColumnTypes:
+    """``node -> MySQL type`` of a column reference, read from ``column_types`` (``(table,
+    ((column, type), ...))``, column names lower-cased): through its qualifier -- matched
+    exactly, as MySQL (on Linux) and the quoted output both do -- to the source of its own
+    or an enclosing query (a SELECT's FROM / JOIN, a parenthesised join included, the table
+    an UPDATE / DELETE / ON DUPLICATE KEY UPDATE writes) that MySQL binds it to, and for an
+    unqualified column the one source of its query that has it. A column written
+    `db`.`table`.`col` is the unaliased table of that database -- in a Query Converter
+    statement also one written without it (the session's) -- and one read through an alias
+    has lost its database by now (:func:`_drop_alias_db`). A derived table's or a CTE's
+    column takes the type of what its body selects (:meth:`_ColumnTypes.projected`). A table
+    is found by its exact name -- a stored view keeps MySQL's case; ``bare_names`` (a Query
+    Converter statement): also in another case, and one written without its schema by its
+    name alone, when only one table can be meant. ``None`` when it cannot be told (another
+    view's column, a table the inventory lacks)."""
+    return _ColumnTypes(column_types, bare_names=bare_names)
 
 
-def _drop_alias_db(select: exp.Expression) -> None:
+def _drop_alias_db(
+    select: exp.Expression,
+    columns: "Optional[Callable[[exp.Expression], Optional[Mapping[str, object]]]]" = None,
+) -> None:
     """MySQL stores a column read through an ALIASED table (a merged view's) as
     `db`.`alias`.`col`; PostgreSQL refuses that (the alias is no relation of the schema):
-    written ``alias.col``. The column is bound as MySQL binds it (:func:`_binds`), to the
-    nearest source of that name and database, so an inner query's alias of another
-    database's table leaves an outer `db`.`table`.`col` -- and PostgreSQL binds that one
-    where MySQL does."""
+    written ``alias.col``. The column is bound as MySQL binds it (:func:`_binds`, with the
+    inventory's ``columns``), to the nearest source of that name and database that can hold
+    it, so an inner query's alias of another database's table -- or of a table without the
+    column -- leaves an outer `db`.`table`.`col`, and PostgreSQL binds that one where MySQL
+    does."""
     for column in list(select.find_all(exp.Column)):
         if column.args.get("db") is None or not column.table:
             continue
         scope = _type_scope(column)
         while scope is not None:
-            bound = next((item for item in _scope_sources(scope) if _binds(item, column)), None)
+            bound = next((item for item in _scope_sources(scope) if _binds(item, column, columns)), None)
             if bound is not None:
                 if bound.args.get("alias") is not None:
                     column.set("db", None)
@@ -8477,10 +8660,12 @@ def _rewrite_mysql_calls(
     (:func:`_mysql_kind`): a column's type where ``column_type`` knows it (a view over the
     inventory's tables, a Query Converter statement over the Evaluation inventory), else
     what the expression computes (a cast, a date function, date arithmetic, an aggregate,
-    a JSON call, a CASE / COALESCE of them). Unknown, a column is written in the form right
-    for text AND bytes (``OCTET_LENGTH(x)``, ``CAST(x AS BYTEA)``), any other value as text
-    (a number's digits, a json's text). Rewritten, faithfully (each checked against MySQL
-    8.4 and PostgreSQL 17):
+    a JSON call, a CASE / COALESCE of them) -- a derived table's or CTE's column by what its
+    body selects. Unknown, a column's LENGTH counts the text of ``x || ''`` (right for any
+    type but a few, noted), its BINARY is ``CAST(x AS BYTEA)`` (noted: right for bytes
+    only), ordered or grouped by the bytes of its text; any other value is made text (a
+    number's digits, a json's text). Rewritten, faithfully (each checked against MySQL 8.4
+    and PostgreSQL 17):
 
     * YEAR/MONTH/DAY/DAYOFMONTH/DAYOFYEAR/QUARTER/HOUR/MINUTE/WEEKOFYEAR / WEEK(x, 3)(x) ->
       EXTRACT as an integer, SECOND(x) its whole seconds, DAYOFWEEK(x) EXTRACT(DOW) + 1,
@@ -8492,9 +8677,11 @@ def _rewrite_mysql_calls(
     * CAST / CONVERT to CHAR (MySQL stores it with its CHARSET) -> text, or varchar(n)
       with a length (MySQL's CHAR(n) cast truncates and never pads) -- a binary operand's
       bytes decoded (CONVERT_FROM, in the charset's encoding); to BINARY / CHARSET binary
-      -> its bytes, or nothing compared with a text, ordered or grouped by (Aurora DSQL
-      compares bytes already); to UNSIGNED -> numeric(20), rounded then a negative number
-      wrapped as MySQL does (a string by its leading integer);
+      -> its bytes, or a text itself compared, ordered or grouped by (Aurora DSQL compares
+      bytes already) -- in a SELECT DISTINCT's ORDER BY as its select list has it; to
+      UNSIGNED -> numeric(20), rounded then a negative number wrapped as MySQL does (a
+      string by its leading integer); a recursive CTE's CAST(x AS CHAR(n)) in its first
+      SELECT -> text cut to n, as PostgreSQL types the column by both terms;
     * MySQL's exact division (integers and decimals) -> numeric with the digits MySQL
       keeps, truncated, shown at its scale (the dividend's plus 4) where MySQL shows it --
       a statement's output, a text, a view or derived table MySQL materializes -- AVG of
@@ -8505,22 +8692,30 @@ def _rewrite_mysql_calls(
       ARRAY_TO_STRING(ARRAY_AGG(DISTINCT x ORDER BY x) FILTER (WHERE x IS NOT NULL));
     * CONCAT_WS skipping NULLs as MySQL does, GREATEST/LEAST returning NULL for a NULL
       argument as MySQL does (once per nest, through every NULL-strict node in it), LENGTH
-      as bytes, a CHAR(n) column's padding left out where MySQL leaves it out, a DATE plus
-      days/months a DATE (an amount in whole units, as MySQL counts it -- a string by its
-      leading integer, a composite unit by its parts; a date string or a two-digit year as
-      MySQL reads it), CONVERT_TZ with a UTC offset as an ISO offset -- a literal one, or
-      one read at run time;
+      as bytes and CHAR_LENGTH as characters of the value's text, a number, a date or a
+      boolean made MySQL's text of it where MySQL wants a string (CONCAT / CONCAT_WS,
+      LPAD / RPAD, LEFT / RIGHT, SUBSTRING, REPLACE, UPPER / LOWER, LIKE; a COALESCE / CASE
+      / IF of text and a number, or of a date and a string that is no date), a CHAR(n)
+      column's padding left out where MySQL leaves it out, a DATE plus days/months a DATE
+      (an amount in whole units, as MySQL counts it -- a string by its leading integer, a
+      composite unit by its parts; a date string or a two-digit year as MySQL reads it),
+      CONVERT_TZ with a UTC offset as an ISO offset -- a literal one, or one read at run
+      time;
     * JSON_ARRAY / JSON_ARRAYAGG -> JSON_BUILD_ARRAY / JSON_AGG, which keep NULLs, and
       every JSON value written as MySQL writes it (a DATETIME 'YYYY-MM-DD HH:MM:SS.ffffff',
-      a TIME with microseconds, a TINYINT(1) as its number, a CHAR(n) without padding);
-      JSON_UNQUOTE(JSON_EXTRACT(...)) -- MySQL's ->> -- -> JSON_EXTRACT_PATH_TEXT;
+      a TIME with microseconds, a TINYINT(1) as its number, a CHAR(n) without padding, a
+      date beside a date string MySQL's string of them); JSON_EXTRACT / -> and
+      JSON_UNQUOTE(JSON_EXTRACT(...)) -- MySQL's ->> -- over a path of member names and
+      indexes -> the value MySQL's path finds (a member in an object, an index in an array,
+      [0] of a value that is no array the value itself), ->> a JSON null as 'null', its text
+      meeting a number as the double MySQL reads (noted); another path is reported;
     * DATE_FORMAT / FROM_UNIXTIME(x, fmt) -> TO_CHAR, STR_TO_DATE -> TO_DATE / a TIME / a
       TIMESTAMP as MySQL's own rule types it (an empty string NULL, as in MySQL; a
       DATETIME read in the session's time zone), every format written by
       :func:`_mysql_format_to_pg`; a TIME operand of a date format on the current date and
       an integer yyyymmdd one as that date, as MySQL reads them;
-    * a join with no ON inside MySQL's stored join container -> a CROSS JOIN, STRAIGHT_JOIN
-      -> JOIN.
+    * a JOIN (or INNER JOIN) with no ON -> a CROSS JOIN, which binds as JOIN does (a comma
+      stays one), CROSS JOIN ... ON and STRAIGHT_JOIN -> JOIN.
     The statistics are read right by :class:`_MySqlViewDialect` (VAR_SAMP, STDDEV ...)."""
     untranslated: list[str] = []
     issues: list[str] = []
@@ -8567,6 +8762,9 @@ def _rewrite_mysql_calls(
         unit = interval.args.get("unit") if interval is not None else None
         return (unit.name if isinstance(unit, exp.Expression) else str(unit or "")).upper()
 
+    # The resolver itself (before the cache below wraps it): the rewrite types a derived
+    # table's computed columns for it, and _drop_alias_db reads its base tables.
+    resolver = column_type if isinstance(column_type, _ColumnTypes) else None
     if column_type is not None:
         # Each column resolved once, however many passes ask: by the node, which the cache
         # keeps alive (so its id is never another node's). Resolution starts after
@@ -8598,11 +8796,18 @@ def _rewrite_mysql_calls(
 
         return guarded
 
+    # The kinds of the choices a pass has written (each its own once, however deep they
+    # nest), while that pass runs.
+    known_kinds: dict = {}
+
     @bounded
     def kind_of(node: Optional[exp.Expression]) -> Optional[str]:
         """The static kind of a value (see :func:`_mysql_kind`), or None."""
         if node is None or isinstance(node, exp.Null):
             return None
+        known = known_kinds.get(id(node))
+        if known is not None and known[0] is node:
+            return known[1]
         if _QUOTIENT_SCALE in node.meta:
             return "decimal"  # MySQL's exact division, or an AVG, as written below
         if isinstance(node, exp.Paren):
@@ -8644,7 +8849,7 @@ def _rewrite_mysql_calls(
             }.get(name)
         if isinstance(node, (exp.JSONExtract, exp.JSONObject)):
             return "json"
-        if isinstance(node, exp.JSONExtractScalar):
+        if isinstance(node, (exp.JSONExtractScalar, exp.JSONBExtractScalar)):
             return "text"
         if isinstance(node, (exp.Add, exp.Sub, exp.DateAdd, exp.DateSub)):
             if interval_of(node) is not None:
@@ -8659,10 +8864,12 @@ def _rewrite_mysql_calls(
         if isinstance(node, (exp.Mul, exp.Mod)):
             return combine(kind_of(node.this), kind_of(node.expression))
         if isinstance(node, exp.Div):
-            # Not MySQL's exact division (that one is marked): the double sqlglot writes is
-            # a DOUBLE when an operand is one -- of operands not typed, it may well be exact
-            # in MySQL (rounded, truncated or made UNSIGNED in numeric, as one).
-            return "float8" if {kind_of(node.this), kind_of(node.expression)} & _FLOAT_KINDS else None
+            # A DOUBLE when an operand is one; of exact operands MySQL's exact division (a
+            # pass below writes it, and marks it -- a derived table's column may be typed
+            # before); of operands not typed it may well be exact in MySQL (rounded,
+            # truncated or made UNSIGNED in numeric, as one).
+            kinds = {kind_of(node.this), kind_of(node.expression)}
+            return "float8" if kinds & _FLOAT_KINDS else "decimal" if kinds <= _EXACT_KINDS else None
         if isinstance(node, exp.Neg):
             return kind_of(node.this)
         if isinstance(node, (exp.Count, exp.Length, exp.DateDiff, exp.Extract, exp.IntDiv, *_INTEGER_NODES)):
@@ -8726,20 +8933,41 @@ def _rewrite_mysql_calls(
             return next(k for k in ("float8", "float4", "decimal") if k in kinds)
         return kinds.pop() if len(kinds) == 1 else None
 
-    def string_typed(node: exp.Expression) -> bool:
-        """A COALESCE / CASE / IF mixing a date or datetime with a string literal: a STRING
-        in MySQL (written as its text), a date or a timestamp here."""
+    def null_checked(node: exp.Expression) -> exp.Expression:
+        """The GREATEST / LEAST inside the NULL check written for it (CASE WHEN a IS NULL OR
+        ... THEN NULL ELSE GREATEST(a, ...) END), else ``node`` itself."""
         while isinstance(node, exp.Paren):
             node = node.this
+        ifs = node.args.get("ifs") if isinstance(node, exp.Case) else None
+        if ifs and len(ifs) == 1 and isinstance(ifs[0].args.get("true"), exp.Null) and isinstance(
+            node.args.get("default"), (exp.Greatest, exp.Least)
+        ):
+            return node.args["default"]
+        return node
+
+    def string_typed(node: exp.Expression) -> bool:
+        """A COALESCE / CASE / IF, GREATEST or LEAST mixing a date or a time with a string
+        literal -- seen through the NULL check written for GREATEST / LEAST: a STRING in
+        MySQL, a date or a timestamp here."""
+        values = [v for v in choices(null_checked(node)) if v is not None and not isinstance(v, exp.Null)]
+        return any(isinstance(v, exp.Literal) and v.is_string for v in values) and any(
+            kind_of(v) in _TEMPORAL_KINDS for v in values if not isinstance(v, exp.Literal)
+        )
+
+    def each_choice(node: exp.Expression, write: "Callable[[exp.Expression], exp.Expression]") -> None:
+        """Each value a COALESCE / CASE / IF / GREATEST / LEAST chooses, as ``write`` gives
+        it (each typed while still in the tree)."""
         if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
-            values = [node.this, *node.expressions]
-        elif isinstance(node, exp.If):
-            values = [node.args.get("true"), node.args.get("false")]
-        elif isinstance(node, exp.Case):
-            values = [b.args.get("true") for b in node.args.get("ifs") or ()] + [node.args.get("default")]
-        else:
-            return False
-        return any(isinstance(v, exp.Literal) and v.is_string for v in values)
+            node.set("this", write(node.this))
+            node.set("expressions", [write(e) for e in node.expressions])
+            return
+        branches = (node.args.get("ifs") or ()) if isinstance(node, exp.Case) else [node]
+        for branch in branches:
+            if branch.args.get("true") is not None:
+                branch.set("true", write(branch.args["true"]))
+        key = "default" if isinstance(node, exp.Case) else "false"
+        if node.args.get(key) is not None:
+            node.set(key, write(node.args[key]))
 
     @bounded
     def scales(node: exp.Expression) -> "Optional[tuple[int, int]]":
@@ -8817,8 +9045,8 @@ def _rewrite_mysql_calls(
     @bounded
     def carries_quotient(node: Optional[exp.Expression]) -> bool:
         """Whether an exact value holds more digits than MySQL shows: a quotient or an AVG
-        not rounded since -- also one read out of a derived table or a CTE, typed with its
-        scale (decimal(65,4)), which MySQL merges into the query that reads it."""
+        not rounded since -- also one read out of a derived table or a CTE, typed as such
+        (:class:`_QuotientType`), which MySQL merges into the query that reads it."""
         while isinstance(node, exp.Paren):
             node = node.this
         if node is None:
@@ -8827,7 +9055,7 @@ def _rewrite_mysql_calls(
             return True
         if isinstance(node, exp.Column):
             mysql_type = column_type(node) if column_type is not None else None
-            return bool(mysql_type and _SCALED_DECIMAL_RE.match(mysql_type)) and _reads_derived(node)
+            return isinstance(mysql_type, _QuotientType) and _reads_derived(node)
         if isinstance(node, (exp.Neg, exp.Sum, exp.Min, exp.Max, exp.AnyValue, exp.Abs, exp.Nullif, exp.Window)):
             return carries_quotient(_aggregated(node))
         if isinstance(node, exp.Subquery):
@@ -8876,7 +9104,8 @@ def _rewrite_mysql_calls(
     def as_text(node: exp.Expression) -> exp.Expression:
         """A value as MySQL makes it text: a CHAR(n) column without its padding, a
         TINYINT(1) (boolean here) as its digit, a number or a date as its digits -- a
-        quotient as many as MySQL shows."""
+        quotient as many as MySQL shows, a DATETIME / TIME every fractional digit of its
+        precision (PostgreSQL's text drops trailing zeros), a TIMESTAMP without a zone."""
         kind = kind_of(node)
         if kind == "text":
             return node
@@ -8884,6 +9113,16 @@ def _rewrite_mysql_calls(
             node = exp.Cast(this=node, to=exp.DataType.build("INT"))
         elif kind in _EXACT_KINDS:
             node = shown(node)
+        elif kind in ("datetime", "timestamp", "time"):
+            digits = fraction_digits(node)
+            if digits or kind == "timestamp":
+                pattern = "HH24:MI:SS" if kind == "time" else "YYYY-MM-DD HH24:MI:SS"
+                if kind == "time":  # TO_CHAR reads a timestamp: on a day of its own
+                    node = exp.Paren(this=exp.Add(
+                        this=exp.Cast(this=exp.Literal.string("2000-01-01"), to=exp.DataType.build("DATE")),
+                        expression=node,
+                    ))
+                return pg_call("TO_CHAR", node, exp.Literal.string(pattern + (f".FF{digits}" if digits else "")))
         return exp.Cast(this=node, to=exp.DataType.build("TEXT"))
 
     def unpadded(node: exp.Expression) -> exp.Expression:
@@ -8942,6 +9181,129 @@ def _rewrite_mysql_calls(
             expression=exp.Mul(this=kept, expression=exp.Interval(this=exp.Literal.string("1 microsecond"))),
         )
 
+    def fraction_digits(node: Optional[exp.Expression]) -> int:
+        """The fractional digits MySQL writes a temporal value with: a column's or a cast's
+        precision, date arithmetic's its date's, a choice's widest -- else 0."""
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if isinstance(node, exp.Column):
+            declared = (column_type(node) if column_type is not None else None) or ""
+            match = re.match(r"^\w+\s*\(\s*(\d+)\s*\)", declared)
+            return int(match.group(1)) if match else 0
+        if isinstance(node, (exp.Cast, exp.TryCast)):
+            to = node.args.get("to")
+            params = to.expressions if isinstance(to, exp.DataType) else []
+            return int(params[0].name) if params and params[0].name.isdigit() else 0
+        if isinstance(node, (exp.Add, exp.Sub, exp.DateAdd, exp.DateSub)) and interval_of(node) is not None:
+            return fraction_digits(node.this)
+        if isinstance(node, (exp.Min, exp.Max, exp.AnyValue)):
+            return fraction_digits(node.this)
+        branches = choices(node)
+        return max((fraction_digits(b) for b in branches if b is not None), default=0)
+
+    def choices(node: Optional[exp.Expression]) -> "list[Optional[exp.Expression]]":
+        """The values a COALESCE / IFNULL, GREATEST / LEAST, IF or CASE chooses between."""
+        if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
+            return [node.this, *node.expressions]
+        if isinstance(node, exp.If):
+            return [node.args.get("true"), node.args.get("false")]
+        if isinstance(node, exp.Case):
+            return [b.args.get("true") for b in node.args.get("ifs") or ()] + [node.args.get("default")]
+        return []
+
+    def mysql_type(node: exp.Expression) -> Optional[str]:
+        """The MySQL type a derived table's or CTE's computed column has, by what its
+        expression computes (:attr:`_ColumnTypes.typed_by`): a quotient a decimal of its
+        scale, a DATETIME(6) its precision."""
+        kind = kind_of(node)
+        if kind == "decimal":
+            scale = decimal_scale(node)
+            if scale is None:
+                return None
+            return (_QuotientType if carries_quotient(node) else str)(f"decimal(65,{scale})")
+        if kind in ("datetime", "timestamp", "time"):
+            precision = fraction_digits(node)
+            return f"{kind}({precision})" if precision else kind
+        return _KIND_TYPES.get(kind or "")
+
+    def json_at(document: exp.Expression, steps: "list") -> exp.Expression:
+        """The JSON value at ``steps`` (:func:`_json_path_steps`) of ``document``, as MySQL's
+        path finds it: a member name only in an object, an index only in an array -- and [0]
+        of a value that is no array the value itself (MySQL reads it as an array of one)."""
+        if all(isinstance(step, str) and not re.fullmatch(r"\s*[+-]?\d+\s*", step) for step in steps):
+            return exp.JSONExtract(this=document, expression=_json_path(steps))
+        # The operators: JSON_EXTRACT_PATH reads a name that is a number as an index too.
+        value = document
+        run: list = []
+        for step in [*steps, None]:
+            if step is not None and not (type(step) is int and step == 0):
+                run.append(step)
+                continue
+            if run:
+                value = exp.Paren(this=exp.JSONExtract(this=value, expression=_json_path(run), only_json_types=True))
+                run = []
+            if step is not None:
+                bare = value.this if isinstance(value, exp.Paren) else value
+                value = exp.Case(
+                    ifs=[exp.If(
+                        this=exp.EQ(this=pg_call("JSON_TYPEOF", bare.copy()), expression=exp.Literal.string("array")),
+                        true=exp.JSONExtract(this=value.copy(), expression=_json_path([0]), only_json_types=True),
+                    )],
+                    default=bare,
+                )
+        return value
+
+    def json_text_at(document: exp.Expression, steps: "list") -> exp.Expression:
+        """The text of the JSON value at ``steps`` -- a string unquoted -- NULL for a JSON
+        null."""
+        found = json_at(document, steps)
+        if isinstance(found, exp.JSONExtract):
+            return exp.JSONExtractScalar(this=found.this, expression=found.expression)
+        bare = found.this if isinstance(found, exp.Paren) else found
+        return exp.Paren(this=exp.JSONBExtractScalar(this=bare, expression=exp.Literal.string("{}")))
+
+    def json_compared(node: exp.Expression) -> bool:
+        """Whether a JSON value is compared (=, <, IN, BETWEEN, LIKE ...)."""
+        parent = node.parent
+        while isinstance(parent, exp.Paren):
+            parent = parent.parent
+        return isinstance(parent, (*_COMPARISONS, exp.Between, exp.NullSafeEQ, exp.NullSafeNEQ))
+
+    def text_context(node: exp.Expression) -> Optional[str]:
+        """How MySQL reads the text of a JSON value (->>) where it stands: 'number' --
+        compared, IN or BETWEEN with numbers, in arithmetic, SUM / AVG, ROUND / TRUNCATE;
+        'cast' -- cast to a number; 'plain' -- cast to another type (which reads a JSON
+        null as NULL); 'other' -- compared with a value that is not text or of a type that
+        cannot be told, or an INTERVAL amount or the date of date arithmetic; else None."""
+        held, parent = node, node.parent
+        while isinstance(parent, exp.Paren):
+            held, parent = parent, parent.parent
+        if isinstance(parent, exp.Interval) or (
+            isinstance(parent, (exp.Add, exp.Sub)) and interval_of(parent) is not None
+        ):
+            return "other"
+        if isinstance(parent, (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv, exp.Neg)):
+            return "number"
+        if isinstance(parent, (exp.Sum, exp.Avg, exp.Round, exp.Trunc)) and parent.this is held:
+            return "number"
+        if isinstance(parent, (exp.Cast, exp.TryCast)):
+            kind = _pg_type_kind(parent.args.get("to"))
+            return "cast" if kind in _NUMERIC_KINDS else None if kind in (None, "text", "json") else "plain"
+        if isinstance(parent, exp.Between):
+            others = [parent.args.get("low"), parent.args.get("high")] if parent.this is held else [parent.this]
+        elif isinstance(parent, exp.In):
+            if parent.args.get("query") is not None:
+                return "other"
+            others = list(parent.expressions) if parent.this is held else [parent.this]
+        elif isinstance(parent, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ, exp.NullSafeNEQ)):
+            others = [parent.expression if parent.this is held else parent.this]
+        else:
+            return None
+        kinds = {kind_of(o) for o in others if o is not None and not isinstance(o, exp.Null)}
+        if kinds and kinds <= _NUMERIC_KINDS:
+            return "number"
+        return None if kinds <= {"text", "char"} else "other"
+
     # The node classes the statement holds, read in one walk: a pass over a construct it
     # does not hold is skipped -- each pass walks the whole tree, and Evaluation converts
     # thousands of views. No pass needs a class that only an earlier pass writes.
@@ -8953,14 +9315,20 @@ def _rewrite_mysql_calls(
             return []
         return _innermost_first(select, *types) if innermost else list(select.find_all(*types))
 
-    _drop_alias_db(select)
+    if resolver is not None:
+        resolver.typed_by = mysql_type
+    _drop_alias_db(select, resolver.base_columns if resolver is not None else None)
     unquote_json_extracts(select)
     for join in nodes(exp.Join):
-        # MySQL stores JOIN ... CROSS JOIN c as ((a join b on(...)) join c), and a LATERAL
-        # join with no ON: sqlglot writes such a join as a comma, which PostgreSQL refuses
-        # inside parentheses -- a CROSS JOIN says the same. STRAIGHT_JOIN is MySQL's.
-        straight = (join.args.get("kind") or "").upper() == "STRAIGHT_JOIN"
-        if straight:
+        # A JOIN without ON is MySQL's CROSS JOIN -- MySQL stores JOIN ... CROSS JOIN c as
+        # ((a join b on(...)) join c), and a LATERAL join with no ON -- which sqlglot writes
+        # as a comma: that binds looser than JOIN (a JOIN b JOIN c ON <a's column> is a, (b
+        # JOIN c ...) to PostgreSQL, which cannot see a there), and PostgreSQL refuses it
+        # inside parentheses. A comma stays one outside them. MySQL's INNER JOIN without ON
+        # is a CROSS JOIN too, and its CROSS JOIN ... ON an inner JOIN. STRAIGHT_JOIN is
+        # MySQL's.
+        kind = (join.args.get("kind") or "").upper()
+        if kind == "STRAIGHT_JOIN" or (kind == "CROSS" and join.args.get("on") is not None):
             join.set("kind", None)
         holder = join.parent
         container = holder.parent if holder is not None else None
@@ -8970,10 +9338,10 @@ def _rewrite_mysql_calls(
             and container.args.get("alias") is None
         )
         if (
-            (nested or straight)
+            (nested or not join.meta.get(_COMMA_JOIN))
             and join.args.get("on") is None
             and not join.args.get("using")
-            and not join.args.get("kind")
+            and (join.args.get("kind") or "").upper() in ("", "INNER")
             and not join.args.get("side")
             and not join.args.get("method")
         ):
@@ -9242,6 +9610,131 @@ def _rewrite_mysql_calls(
         else:
             node.replace(truncated)
 
+    # MySQL's JSON paths -- JSON_EXTRACT / -> and ->> (JSON_UNQUOTE(JSON_EXTRACT(...))) --
+    # as Aurora DSQL follows them; one it cannot follow is reported.
+    unfollowed: list = []
+    for node in nodes(exp.JSONExtract, exp.JSONExtractScalar, innermost=True):
+        steps = _json_path_steps(node.expression)
+        if steps is None or node.expressions:
+            # Left as MySQL's own call, which Aurora DSQL refuses -- JSON_EXTRACT_PATH would
+            # read such a path as a key, NULL on every row (and sqlglot writes no wildcard) --
+            # and reported below, not as a call left untranslated.
+            holder = node.parent
+            call = written(exp.Anonymous(this="JSON_EXTRACT", expressions=[
+                node.this, *(_json_path_text(p) for p in [node.expression, *node.expressions])
+            ]))
+            node.replace(call)
+            if isinstance(holder, exp.Anonymous) and (holder.name or "").upper() == "JSON_UNQUOTE":
+                written(holder)
+            unfollowed.append(call.sql(dialect=_MySqlViewDialect))
+            continue
+        document = node.this
+        if kind_of(document) in ("text", "char"):
+            # MySQL reads a JSON document from a string too.
+            document = exp.Cast(this=document, to=exp.DataType.build("JSON"))
+        if isinstance(node, exp.JSONExtract):
+            if json_compared(node):
+                issue(
+                    "A JSON value (JSON_EXTRACT / ->) is compared: MySQL compares JSON values "
+                    "by their JSON type and value (the JSON number 5 equals 5, the string "
+                    "\"5\" does not), and Aurora DSQL has no comparison of json values -- the "
+                    "statement fails there. Compare its text instead: x ->> 'k' = 'v', or "
+                    "CAST(x ->> 'k' AS NUMERIC) = 5 for a number."
+                )
+            node.replace(json_at(document, steps))
+            continue
+        context = text_context(node)
+        if context in ("number", "cast"):
+            issue(
+                "MySQL reads the text of a JSON value (->>, JSON_UNQUOTE(JSON_EXTRACT(...))) as "
+                "a number where it meets one -- compared with a number, in arithmetic, SUM / "
+                "AVG, ROUND / TRUNCATE, a cast -- and it is written so here (CAST(... AS DOUBLE "
+                "PRECISION)). A text that is not a number reads as its leading digits in MySQL "
+                "(0 when it has none) and fails the cast on Aurora DSQL; a JSON null, 0 in "
+                "MySQL, is NULL here. If the values can be other than numbers, guard the cast."
+            )
+            text = json_text_at(document, steps)
+            node.replace(text if context == "cast" else exp.Cast(this=text, to=exp.DataType.build("DOUBLE PRECISION")))
+            continue
+        if context == "plain":
+            node.replace(json_text_at(document, steps))
+            continue
+        if context == "other":
+            issue(
+                "The text of a JSON value (->>, JSON_UNQUOTE(JSON_EXTRACT(...))) is compared "
+                "with a value that is not text (or whose type the conversion cannot tell here), "
+                "or is the date of date arithmetic or an INTERVAL amount: MySQL converts the "
+                "text to the type it needs there (a number, a date; an amount by its leading "
+                "integer), Aurora DSQL does not and the statement fails. Cast it to that type."
+            )
+        # MySQL's ->> of a JSON null is the text 'null'; Aurora DSQL's is NULL.
+        node.replace(exp.Coalesce(
+            this=json_text_at(document, steps),
+            expressions=[exp.Case(ifs=[exp.If(
+                this=exp.Not(this=exp.Is(this=json_at(document.copy(), steps), expression=exp.Null())),
+                true=exp.Literal.string("null"),
+            )])],
+        ))
+
+    if unfollowed:
+        issue(
+            f"MySQL's {', '.join(dict.fromkeys(unfollowed))} (JSON_EXTRACT, -> or ->>) reads "
+            "the whole document ('$'), a wildcard (* / **), last, a range (m to n), a negative "
+            "index or a path computed at run time -- or several paths, whose values MySQL "
+            "returns as an array: Aurora DSQL's JSON functions follow one fixed path of member "
+            "names and array indexes, and the call is left as MySQL's (which Aurora DSQL "
+            "refuses). Rewrite it."
+        )
+
+    # A choice MySQL makes a STRING, which PostgreSQL types by its other values: a date or a
+    # time beside a string literal that is no date (IFNULL(d, ''), 'N/A' -- PostgreSQL
+    # reads the literal as a date and fails), and a COALESCE / CASE / IF of a number and
+    # text or a date (IFNULL(d, 0)). Written as text: each value as MySQL's text of it, a
+    # literal as written.
+    # Beside date literals a date stays one (MySQL's date arithmetic reads it so too) -- a
+    # DATE beside a literal with a time a timestamp, which keeps the time. GREATEST / LEAST
+    # compare a date and a string as dates in MySQL.
+    def chosen_as_mysql(node: exp.Expression) -> None:
+        values = [v for v in choices(node) if v is not None and not isinstance(v, exp.Null)]
+        strings = [v for v in values if isinstance(v, exp.Literal) and v.is_string]
+        kinds = {kind_of(v) for v in values if not (isinstance(v, exp.Literal) and v.is_string)}
+        dated, numbers = kinds & _TEMPORAL_KINDS, kinds & (_NUMERIC_KINDS | {"boolean"})
+        if strings and dated and not numbers and all(_is_datetime_literal(s) for s in strings):
+            if dated == {"date"} and not all(_is_date_literal(s) for s in strings):
+                each_choice(node, lambda value: exp.Cast(
+                    this=value, to=exp.DataType.build("TIMESTAMP")
+                ) if kind_of(value) == "date" else value)
+            return
+        if isinstance(node, (exp.Greatest, exp.Least)) or not (
+            (strings and dated) or (numbers and (strings or dated or kinds & {"text", "char"}))
+        ):
+            return
+        each_choice(node, lambda value: as_text(value) if kind_of(value) in _TEXTED_KINDS else value)
+
+    for node in nodes(exp.Coalesce, exp.Case, exp.If, exp.Greatest, exp.Least, innermost=True):
+        chosen_as_mysql(node)
+        known_kinds[id(node)] = (node, kind_of(node))  # read again by the choice it nests in
+    known_kinds.clear()
+
+    # A SELECT DISTINCT's ORDER BY must be an expression of its select list (PostgreSQL
+    # refuses it otherwise): a BINARY key is written as the select list writes it -- as the
+    # list's BINARY x, or as the x the list holds.
+    listed_binary: set = set()
+    listed_operand: set = set()
+    for query in nodes(exp.Select) if exp.Distinct in present else ():
+        order = query.args.get("order")
+        if not query.args.get("distinct") or order is None:
+            continue
+        listed = [projection.unalias() for projection in query.expressions]
+        for ordered in order.expressions:
+            key = ordered.this
+            while isinstance(key, exp.Paren):
+                key = key.this
+            if isinstance(key, exp.Cast) and key in listed:
+                listed_binary.add(id(key))
+            elif isinstance(key, exp.Cast) and key.this in listed:
+                listed_operand.add(id(key))
+
     # Casts to text, with a length, from bytes; casts to bytes.
     for node in nodes(exp.Cast, innermost=True):
         to = node.args.get("to")
@@ -9270,22 +9763,39 @@ def _rewrite_mysql_calls(
             elif isinstance(parent, _COMPARISONS):
                 other = parent.expression if parent.this is held else parent.this
             kind = kind_of(operand)
-            keyed = isinstance(parent, (exp.Ordered, exp.Group)) or (
-                isinstance(parent, exp.Window) and any(key is held for key in parent.args.get("partition_by") or ())
-            ) or (isinstance(parent, exp.Distinct) and isinstance(parent.parent, exp.AggFunc))
-            if (isinstance(parent, _COMPARISONS) and kind_of(other) != "binary") or (
-                keyed and kind in (None, "text", "char", "binary")
+            keyed = id(node) not in listed_binary and (
+                isinstance(parent, (exp.Ordered, exp.Group)) or (
+                    isinstance(parent, exp.Window) and any(key is held for key in parent.args.get("partition_by") or ())
+                ) or (isinstance(parent, exp.Distinct) and isinstance(parent.parent, exp.AggFunc))
+            )
+            if (isinstance(parent, _COMPARISONS) and kind_of(other) != "binary") or id(node) in listed_operand or (
+                keyed and kind in ("text", "char", "binary")
             ):
                 # MySQL's BINARY x compared, ordered or grouped by: byte-wise -- which every
-                # comparison on Aurora DSQL already is (C collation), so there it is the
+                # comparison on Aurora DSQL already is (C collation), so there a text's is the
                 # value itself (a BINARY(n)'s length, noted, is lost either way).
                 node.replace(operand)
+                continue
+            if keyed and kind is None:
+                # Ordered by the bytes of its text, whatever it holds: a text's own, a
+                # number's digits (12 before 3, as MySQL orders them), a bytea's hex -- which
+                # sorts as its bytes do.
+                node.replace(pg_call(
+                    "CONVERT_TO", exp.Cast(this=operand, to=exp.DataType.build("TEXT")), exp.Literal.string("UTF8")
+                ))
                 continue
             if kind == "binary":
                 node.replace(operand)
             elif kind is None and isinstance(operand, exp.Column):
-                # A column of unknown type: bytea's own bytes, a text's UTF-8 (a backslash in
-                # it aside); any other value made text first (a number's digits, a json's).
+                # A column of unknown type: no form gives MySQL's bytes for every type.
+                issue(
+                    "BINARY x / CAST(x AS BINARY) reads a column whose type cannot be told here "
+                    "-- one of another view, of a derived table or CTE that computes it, or (in "
+                    "the Query Converter) of a table Step 1 has not read: it is written "
+                    "CAST(x AS BYTEA), right for a binary column. For a text column write "
+                    "CONVERT_TO(x, 'UTF8'), for a number or a date CONVERT_TO(CAST(x AS TEXT), "
+                    "'UTF8')."
+                )
                 node.replace(exp.Cast(this=operand, to=exp.DataType.build("BYTEA")))
             else:
                 node.replace(pg_call("CONVERT_TO", as_text(operand), exp.Literal.string("UTF8")))
@@ -9351,6 +9861,31 @@ def _rewrite_mysql_calls(
                     )],
                     default=rounded,
                 ))
+    # MySQL types a recursive CTE's columns by its non-recursive SELECTs -- CAST(x AS
+    # CHAR(n)) there is its way to make a column wide enough -- PostgreSQL by both terms,
+    # and it refuses a VARCHAR(n) beside the recursive term's text: there the cast is text,
+    # cut to n characters as MySQL cuts it.
+    for with_ in nodes(exp.With):
+        if not with_.args.get("recursive"):
+            continue
+        for cte in with_.expressions:
+            if not isinstance(cte.this, exp.SetOperation):
+                continue
+            branches, pending = [], [cte.this]
+            while pending:
+                current = pending.pop()
+                if isinstance(current, exp.SetOperation):
+                    pending += [current.expression, current.this]
+                elif isinstance(current, exp.Select):
+                    branches.append(current)
+            for branch in branches:
+                if any(_cte_named(table) is cte for table in branch.find_all(exp.Table)):
+                    break
+                for projection in branch.expressions:
+                    value = projection.unalias()
+                    to = value.args.get("to") if isinstance(value, exp.Cast) else None
+                    if isinstance(to, exp.DataType) and to.this == exp.DataType.Type.VARCHAR and to.expressions:
+                        value.replace(exp.Cast(this=value.copy(), to=exp.DataType.build("TEXT")))
     for node in nodes(exp.GroupConcat):
         separator = node.args.get("separator") or exp.Literal.string(",")
         holder, key, value = node, "this", node.this
@@ -9387,11 +9922,24 @@ def _rewrite_mysql_calls(
             value.set("expressions", [_texted(shown(e)) for e in value.expressions])
         elif value is not None:
             holder.set(key, _texted(shown(value)))
+    # MySQL makes a number, a date ... text where it wants a string (as_text): PostgreSQL
+    # has no integer || integer, lpad(integer, ...) or integer LIKE, and writes a boolean,
+    # a DATETIME(6) or a TIMESTAMP as text of its own. Text, bytes and a value of a type
+    # that cannot be told stay as they are.
+    def textual(node: exp.Expression) -> exp.Expression:
+        return as_text(node) if kind_of(node) in _TEXTED_KINDS else node
+
     for node in nodes(exp.ConcatWs):
         node.set("coalesce", True)  # MySQL's CONCAT_WS skips a NULL argument, as PG's does
-        node.set("expressions", [shown(unpadded(e)) for e in node.expressions])
+        node.set("expressions", [textual(e) for e in node.expressions])
     for node in nodes(exp.Concat):
-        node.set("expressions", [shown(e) for e in node.expressions])
+        node.set("expressions", [textual(e) for e in node.expressions])
+    for node in nodes(exp.Pad, exp.Left, exp.Right, exp.Substring, exp.Replace, exp.Upper, exp.Lower, exp.Like):
+        keys = {exp.Pad: ("this", "fill_pattern"), exp.Replace: ("this", "expression", "replacement"),
+                exp.Like: ("this", "expression")}.get(type(node), ("this",))
+        for key in keys:
+            if node.args.get(key) is not None:
+                node.set(key, textual(node.args[key]))
     # GREATEST / LEAST are NULL when an argument is NULL in MySQL; Aurora DSQL's skip a NULL
     # argument. One NULL test per nest, at its outermost call, over the nest's leaves --
     # through every node NULL exactly when an operand is (_null_strict: arithmetic, ABS,
@@ -9646,14 +10194,28 @@ def _rewrite_mysql_calls(
         ):
             node.replace(exp.Cast(this=node.copy(), to=exp.DataType.build("DATE")))
     for node in nodes(exp.Length):
-        if node.args.get("binary"):
-            operand = node.this
-            kind = kind_of(operand)
-            # MySQL counts the bytes of the value's text: a CHAR(n) column's without its
-            # padding, a number's digits, a json's text; a binary value its own bytes -- and
-            # so a column of unknown type (its own bytes are right for text and bytes alike).
-            bare = kind in ("binary", "text") or (kind is None and isinstance(operand, exp.Column))
-            node.replace(pg_call("OCTET_LENGTH", operand if bare else as_text(operand)))
+        # MySQL counts the value's text -- LENGTH its bytes, CHAR_LENGTH its characters: a
+        # CHAR(n) column's without its padding, a number's digits, a json's text; a binary
+        # value its own bytes.
+        operand = node.this
+        kind = kind_of(operand)
+        characters = not node.args.get("binary")
+        if kind in ("binary", "text") or (kind == "char" and characters):  # LENGTH(char) skips the padding
+            counted = operand
+        elif kind is None and isinstance(operand, exp.Column):
+            # A column of unknown type: x || '' is the text of any type, bytes kept bytes.
+            issue(
+                "LENGTH / CHAR_LENGTH(x) reads a column whose type cannot be told here -- one "
+                "of another view, of a derived table or CTE that computes it, or (in the Query "
+                "Converter) of a table Step 1 has not read: it counts the text of x || '', "
+                "MySQL's count for text, bytes, numbers and dates, but not for a TINYINT(1) (a "
+                "boolean on Aurora DSQL: 'true' / 'false'), a TIMESTAMP (its text there carries "
+                "the zone) or a DATETIME / TIME with fractional digits (trailing zeros dropped)."
+            )
+            counted = exp.DPipe(this=operand, expression=exp.Literal.string(""))
+        else:
+            counted = as_text(operand)
+        node.replace(pg_call("LENGTH" if characters else "OCTET_LENGTH", counted))
     for node in nodes(exp.ConvertTimezone):
         for part in ("source_tz", "target_tz"):
             zone = node.args.get(part)
@@ -9699,14 +10261,21 @@ def _rewrite_mysql_calls(
         misformat("MONTHNAME" if isinstance(node, exp.TimeToStr) else "STR_TO_DATE", unmapped)
 
     def json_value(node: exp.Expression) -> exp.Expression:
-        """A value as MySQL writes it in JSON: a DATETIME as 'YYYY-MM-DD HH:MM:SS.ffffff' (a
-        COALESCE of one with a date string is a string in MySQL: as its text), a TIME with
-        its microseconds, a TINYINT(1) (a boolean on Aurora DSQL) as its number, a CHAR(n)
-        without its padding."""
+        """A value as MySQL writes it in JSON: a DATETIME as 'YYYY-MM-DD HH:MM:SS.ffffff', a
+        TIME with its microseconds, a TINYINT(1) (a boolean on Aurora DSQL) as its number, a
+        CHAR(n) without its padding. A choice between a date and a date string is a STRING
+        in MySQL: a COALESCE / CASE / IF of the date's text (as many fractional digits as its
+        precision) or the string as written, a GREATEST / LEAST the text of the date it
+        compares as."""
         kind = kind_of(node)
+        chosen = null_checked(node)
+        if kind in _TEMPORAL_KINDS and string_typed(chosen):
+            if isinstance(chosen, (exp.Greatest, exp.Least)):
+                return as_text(node)
+            each_choice(chosen, lambda value: as_text(value) if kind_of(value) in _TEMPORAL_KINDS else value)
+            return node
         if kind in ("datetime", "timestamp"):
-            pattern = "YYYY-MM-DD HH24:MI:SS" if string_typed(node) else "YYYY-MM-DD HH24:MI:SS.US"
-            return pg_call("TO_CHAR", node, exp.Literal.string(pattern))
+            return pg_call("TO_CHAR", node, exp.Literal.string("YYYY-MM-DD HH24:MI:SS.US"))
         if kind == "time":
             return pg_call(
                 "TO_CHAR",
@@ -9826,16 +10395,63 @@ def _output_queries(tree: exp.Expression) -> "list[exp.Select]":
 
 def unquote_json_extracts(tree: exp.Expression) -> None:
     """MySQL's ``->>`` -- which MySQL stores in a view as json_unquote(json_extract(...)) --
-    as PostgreSQL's scalar extraction: JSON_UNQUOTE(JSON_EXTRACT(col, '$.k')) means the
-    value as unquoted text, which is JSON_EXTRACT_PATH_TEXT (the ``->>`` operator). Only
-    over a single path: with more, JSON_EXTRACT returns an array of them, and the
-    JSON_UNQUOTE is left (and reported)."""
-    for node in list(tree.find_all(exp.Anonymous)):
+    as PostgreSQL's scalar extraction (:class:`exp.JSONExtractScalar`, written out by
+    :func:`_rewrite_mysql_calls`): JSON_UNQUOTE(JSON_EXTRACT(col, '$.k')) means the value as
+    unquoted text. Only over one path Aurora DSQL can follow as MySQL does
+    (:func:`_json_path_steps`): with more, JSON_EXTRACT returns an array of them, and the
+    JSON_UNQUOTE is left (and reported) -- as is a ``->>`` a statement writes over any other
+    path, written back as JSON_UNQUOTE(JSON_EXTRACT(...))."""
+    for node in list(tree.find_all(exp.Anonymous, exp.JSONExtractScalar)):
+        if isinstance(node, exp.JSONExtractScalar):
+            if not _json_path_steps(node.expression):
+                node.replace(exp.Anonymous(
+                    this="JSON_UNQUOTE",
+                    expressions=[exp.JSONExtract(this=node.this, expression=_json_path_text(node.expression))],
+                ))
+            continue
         if (node.name or "").upper() != "JSON_UNQUOTE" or len(node.expressions) != 1:
             continue
         inner = node.expressions[0]
-        if isinstance(inner, exp.JSONExtract) and not inner.expressions:
+        if isinstance(inner, exp.JSONExtract) and not inner.expressions and _json_path_steps(inner.expression):
             node.replace(exp.JSONExtractScalar(this=inner.this, expression=inner.expression))
+
+
+def _json_path_steps(path: Optional[exp.Expression]) -> "Optional[list]":
+    """The steps of a literal MySQL JSON path of member names and array indexes -- '$.a',
+    '$.a[0]', '$."k y"' -- as names (str) and indexes (int), else None: the whole document
+    ('$'), a wildcard, last, a range, a negative index, a path read at run time, or a
+    second [0] (each written with a test of the value's type, which doubles it)."""
+    if not isinstance(path, exp.JSONPath):
+        return None
+    parts = path.expressions
+    if len(parts) < 2 or not isinstance(parts[0], exp.JSONPathRoot):
+        return None
+    steps: list = []
+    for part in parts[1:]:
+        step = part.this
+        if isinstance(part, exp.JSONPathKey) and isinstance(step, str):
+            steps.append(step)
+        elif isinstance(part, exp.JSONPathSubscript) and type(step) is int and step >= 0:
+            steps.append(step)
+        else:
+            return None
+    return steps if sum(1 for step in steps if step == 0 and type(step) is int) <= 1 else None
+
+
+def _json_path_text(path: exp.Expression) -> exp.Expression:
+    """A JSON path as MySQL's own text (a literal, which any engine can render), when sqlglot
+    parsed it; any other path as it is."""
+    if isinstance(path, exp.JSONPath):
+        return exp.Literal.string(path.sql(dialect=_MySqlViewDialect)[1:-1].replace("''", "'"))
+    return path
+
+
+def _json_path(steps: "Sequence[Any]") -> exp.JSONPath:
+    """The :class:`exp.JSONPath` of member names and array indexes."""
+    return exp.JSONPath(expressions=[exp.JSONPathRoot()] + [
+        exp.JSONPathKey(this=step) if isinstance(step, str) else exp.JSONPathSubscript(this=step)
+        for step in steps
+    ])
 
 
 def _utc_clock_kind(node: exp.Expression) -> Optional[str]:
@@ -9856,16 +10472,19 @@ def _utc_clock_kind(node: exp.Expression) -> Optional[str]:
 
 
 def _is_date_literal(node: exp.Expression) -> bool:
-    """A string literal MySQL reads as a DATE (no time part): '2024-01-31', '24/1/31',
-    '20240131'."""
+    """A string literal MySQL reads as a DATE (no time part): with separators
+    ('2024-01-31', '24/1/31'), or MySQL's compact 'YYYYMMDD' (which PostgreSQL reads as
+    that date too)."""
     return isinstance(node, exp.Literal) and node.is_string and bool(
-        re.fullmatch(r"\s*(?:\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{8})\s*", node.name)
+        re.fullmatch(
+            r"\s*(?:\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))\s*", node.name
+        )
     )
 
 
 def _is_datetime_literal(node: exp.Expression) -> bool:
     """A string literal MySQL reads as a DATE or a DATETIME."""
-    return isinstance(node, exp.Literal) and node.is_string and bool(
+    return _is_date_literal(node) or isinstance(node, exp.Literal) and node.is_string and bool(
         re.fullmatch(
             r"\s*\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{1,2}(?::\d{1,2}(?:\.\d{1,6})?)?)?\s*",
             node.name,
@@ -9903,9 +10522,8 @@ def view_column_types(definition: str, type_index: "Mapping[str, tuple]") -> "tu
     that reads the table -- the key a conversion of the view is cached by, beside its
     body."""
     found: dict[str, tuple] = {}
-    lookup = getattr(type_index, "entry", type_index.get)
     for db, name in re.findall(r"`((?:[^`]|``)+)`\s*\.\s*`((?:[^`]|``)+)`", definition or ""):
-        entry = lookup(f"{db.replace('``', '`')}.{name.replace('``', '`')}")
+        entry = type_index.get(f"{db.replace('``', '`')}.{name.replace('``', '`')}")
         if entry is not None:
             found[entry[0]] = entry
     return tuple(found[key] for key in sorted(found))
