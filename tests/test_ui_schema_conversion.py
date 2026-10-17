@@ -2763,7 +2763,8 @@ def test_conversion_chat_wires_use_as_target_ddl_footer() -> None:
 
     src = inspect.getsource(sc.build_schema_conversion_screen)
     assert 'footer_label="Use as target DDL"' in src
-    assert "extract_sql_from_reply" in src  # gate on a single runnable sql block
+    # G100: gated on a block that CREATEs this object (never a verification SELECT).
+    assert "extract_ddl_from_reply" in src
     assert "validate_suggested_sql" in src  # untrusted model SQL is denylist-checked
     assert "set_edited_target_ddl" in src   # adopts into the editor, not the target
 

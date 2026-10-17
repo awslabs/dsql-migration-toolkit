@@ -16,6 +16,7 @@ module imports only stdlib + ``core.*`` + ``ui.ai_assist`` (never back from
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Mapping, Optional, Protocol, Sequence
@@ -986,7 +987,19 @@ def applied_view_ddls(
         if not view.auto_converted:
             continue
         edited = edited_target_ddls.get(view.view)
-        ddls[view.view] = edited if edited is not None else view.target_ddl
+        if edited is not None:
+            # As Schema Apply runs it: the edit's CREATE VIEW, without its comments (a note
+            # above it made the reload's pre-drop and re-create refuse the view).
+            created = next(
+                (
+                    stmt for stmt in edited_statements(edited)
+                    if re.match(r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+)?VIEW\b", stmt, re.IGNORECASE)
+                ),
+                None,
+            )
+            ddls[view.view] = created if created is not None else view.target_ddl
+        else:
+            ddls[view.view] = view.target_ddl
     return ddls
 
 

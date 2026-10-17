@@ -637,6 +637,7 @@ def _scan_sql_names(text: str) -> _SqlNames:
     # statement's own only within the bracket level that defines it (and the levels inside
     # it): a nested WITH named like an outer read leaves that read a real relation.
     ctes: dict[str, list[tuple[int, int]]] = {}
+    body_ends = {start: end for start, end in spans}
     for m in _CTE_DEFINITION_RE.finditer(masked):
         parts = _chain_parts(m.group(1))[0]
         if not parts:
@@ -647,7 +648,11 @@ def _scan_sql_names(text: str) -> _SqlNames:
             key=lambda span: span[1] - span[0],
             default=(0, len(masked)),
         )
-        ctes.setdefault(parts[-1], []).append(level)
+        # Without RECURSIVE a CTE joins the namespace after its own body: its body and the
+        # CTEs before it read the real relation of that name.
+        recursive = re.search(r"\bWITH\s+RECURSIVE\b", masked[level[0]:at], re.IGNORECASE)
+        body_end = body_ends.get(m.end() - 1, at)
+        ctes.setdefault(parts[-1], []).append(level if recursive else (body_end, level[1]))
     if ctes:
         relations = [
             (schema, bare)
@@ -5919,7 +5924,8 @@ def sql_statement_spans(text: str) -> "list[tuple[int, int]]":
 
 def sql_without_comments(text: str) -> str:
     """``text`` with its comments removed (``--`` and ``/* */``, outside literals and
-    quoted identifiers), everything else kept as written."""
+    quoted identifiers), everything else kept as written -- a ``/* */`` comment as one
+    space, as PostgreSQL reads it (``bigint/* was int */NOT NULL`` is two words)."""
     out, last, pos = [], 0, 0
     while True:
         match = _STATEMENT_SCAN_RE.search(text, pos)
@@ -5935,6 +5941,8 @@ def sql_without_comments(text: str) -> str:
             continue
         if skipped[0] == "comment":
             out.append(text[last:at])
+            if text.startswith("/*", at):
+                out.append(" ")
             last = skipped[1]
         pos = skipped[1]
     out.append(text[last:])

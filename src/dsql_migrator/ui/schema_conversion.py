@@ -2919,14 +2919,10 @@ def build_schema_conversion_screen(
                 # of hand-copying. The footer button IS the explicit human approval
                 # (Property 13); nothing is written to the target here -- Apply still does.
                 def _footer_visible(md: str) -> bool:
-                    from dsql_migrator.ui.query_playground import extract_sql_from_reply
-
-                    return extract_sql_from_reply(md) is not None
+                    return extract_ddl_from_reply(md, object_name) is not None
 
                 def _use_as_target_ddl(md: str) -> None:
-                    from dsql_migrator.ui.query_playground import extract_sql_from_reply
-
-                    sql = extract_sql_from_reply(md)
+                    sql = extract_ddl_from_reply(md, object_name)
                     if not sql:
                         return
                     if is_name_collision_placeholder(deterministic):
@@ -4539,6 +4535,29 @@ _WARNING_BADGE_COLOR: dict[str, str] = {
 }
 
 
+_FENCED_SQL_RE = re.compile(r"```[ \t]*(?:sql|postgresql|postgres|pgsql)?[ \t]*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+_CREATED_NAME_RE = re.compile(
+    r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+    r'((?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))?)',
+    re.IGNORECASE,
+)
+
+
+def extract_ddl_from_reply(markdown: str, object_name: str) -> Optional[str]:
+    """The target DDL an AI reply proposes for ``object_name``, or ``None``: the LAST fenced
+    sql block that creates this very table or view (with its indexes and foreign keys) --
+    never a verification SELECT beside it, and never a block about another object. Pure."""
+    from dsql_migrator.ui.schema_conversion_apply import edited_statements
+
+    wanted = object_name.replace('"', "").lower()
+    for block in reversed(_FENCED_SQL_RE.findall(markdown or "")):
+        for stmt in edited_statements(block):
+            match = _CREATED_NAME_RE.match(stmt)
+            if match and re.sub(r'\s|"', "", match.group(1)).lower() in (wanted, wanted.split(".", 1)[-1]):
+                return block.strip()
+    return None
+
+
 def _note_scope_key(note: ConversionWarning) -> str:
     """A stable, short scope suffix identifying ONE conversion note on an object.
 
@@ -4548,7 +4567,14 @@ def _note_scope_key(note: ConversionWarning) -> str:
     """
     kind = getattr(getattr(note, "kind", None), "value", "") or "note"
     column = (getattr(note, "column_name", "") or "").strip()
-    return f"{kind}:{column}" if column else kind
+    if column:
+        return f"{kind}:{column}"
+    # A view's notes carry no column: told apart by their text, so each note's AI icon
+    # opens its own chat instead of re-focusing the first one's.
+    import hashlib
+
+    digest = hashlib.sha256((getattr(note, "message", "") or "").encode("utf-8")).hexdigest()
+    return f"{kind}:{digest[:10]}"
 
 
 def _note_subtitle(object_name: str, note: ConversionWarning) -> str:
