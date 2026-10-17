@@ -387,12 +387,27 @@ def _inline_having_aliases(tree: exp.Expression, *, case_insensitive: bool = Tru
         }
         if not aliases:
             continue
+        # A HAVING name that is also a bare GROUP BY column means that column (MySQL's
+        # documented preference), never the alias.
+        group = select.args.get("group")
+        grouped = {
+            key(c.args.get("this"))
+            for c in (group.expressions if group is not None else [])
+            if isinstance(c, exp.Column) and not c.table
+        }
         for column in list(having.find_all(exp.Column)):
             # A qualified column (table.col) is a real column reference, never an
-            # output alias; only bare names can shadow a SELECT-list alias.
+            # output alias; only bare names can shadow a SELECT-list alias -- and not
+            # inside an aggregate's argument (MySQL reads that name from FROM) or a
+            # nested query.
             if column.table:
                 continue
-            replacement = aliases.get(key(column.args.get("this")))
+            if column.find_ancestor(exp.AggFunc, exp.Select) is not select:
+                continue
+            name = key(column.args.get("this"))
+            if name in grouped:
+                continue
+            replacement = aliases.get(name)
             if replacement is not None:
                 column.replace(replacement.copy())
 
@@ -523,6 +538,17 @@ def _is_dual_keyword(table: exp.Table) -> bool:
     )
 
 
+def _key(identifier: object) -> str:
+    """How PostgreSQL names ``identifier``: as written when quoted, folded when not -- so a
+    backquoted `O` and an unquoted O are two names on Aurora DSQL."""
+    if isinstance(identifier, exp.TableAlias):
+        identifier = identifier.this
+    if not isinstance(identifier, exp.Identifier):
+        return ""
+    name = identifier.name or ""
+    return name if identifier.quoted else name.translate(_ASCII_FOLD)
+
+
 def _output_identifiers(
     query: Optional[exp.Expression], alias: Optional[exp.Expression]
 ) -> "list[exp.Identifier]":
@@ -548,98 +574,189 @@ def _output_identifiers(
     return found
 
 
-def _output_names(query: Optional[exp.Expression], alias: Optional[exp.Expression]) -> set:
-    """The column names a derived table or CTE puts out, folded."""
-    return {i.name.translate(_ASCII_FOLD) for i in _output_identifiers(query, alias) if i.name}
-
-
 def _with_of(query: exp.Expression) -> Optional[exp.With]:
     found = query.args.get("with_") or query.args.get("with")
     return found if isinstance(found, exp.With) else None
 
 
-def _visible_ctes(node: exp.Expression) -> "dict[str, exp.CTE]":
-    """The CTEs a name at ``node`` can refer to, by folded name, innermost first: every CTE
-    of an enclosing WITH whose query ``node`` is in, and inside a CTE's own body only the
-    CTEs before it (all of them in a WITH RECURSIVE)."""
-    visible: dict[str, exp.CTE] = {}
-    child, parent = node, node.parent
-    while parent is not None:
-        if isinstance(parent, exp.With):
-            ctes = [c for c in parent.expressions if isinstance(c, exp.CTE)]
-            position = next((i for i, c in enumerate(ctes) if c is child), None)
-            allowed = (
-                ctes
-                if position is None or parent.args.get("recursive")
-                else ctes[:position]
-            )
-            for cte in allowed:
-                visible.setdefault((cte.alias or "").translate(_ASCII_FOLD), cte)
-        else:
-            with_ = _with_of(parent)
-            if with_ is not None and child is not with_:
-                for cte in with_.expressions:
-                    if isinstance(cte, exp.CTE):
-                        visible.setdefault((cte.alias or "").translate(_ASCII_FOLD), cte)
-        child, parent = parent, parent.parent
-    return visible
+# The nodes a name's scope is decided at: a query level or a DML statement.
+_SCOPE_NODES = (exp.Select, exp.SetOperation, exp.Update, exp.Delete, exp.Insert)
 
 
-def _from_items(select: exp.Select) -> "list[exp.Expression]":
-    source = select.args.get("from_") or select.args.get("from")
-    return [getattr(source, "this", None)] + [j.this for j in (select.args.get("joins") or [])]
-
-
-def _source_outputs(item: Optional[exp.Expression]) -> "Optional[set]":
-    """The folded output names of a FROM item that the statement defines itself (a derived
-    table, or a table naming a visible CTE), or ``None`` for a real table."""
-    if isinstance(item, exp.Subquery):
-        return _output_names(item.this, item.args.get("alias"))
-    if isinstance(item, exp.Table) and not item.args.get("db") and item.name:
-        cte = _visible_ctes(item).get(item.name.translate(_ASCII_FOLD))
-        if cte is not None:
-            return _output_names(cte.this, cte.args.get("alias"))
-    return None
-
-
-def _item_name(item: Optional[exp.Expression]) -> str:
-    """The folded name a FROM item is referenced by: its alias, else a table's name."""
-    alias = getattr(item, "alias", "") if item is not None else ""
-    if alias:
-        return alias.translate(_ASCII_FOLD)
-    if isinstance(item, exp.Table):
-        return item.name.translate(_ASCII_FOLD)
-    return ""
-
-
-def _qualified_source(column: exp.Column, qualifier: str) -> "tuple[bool, Optional[set]]":
-    """``(found, outputs)`` for the FROM item ``qualifier`` names in the column's scope (its
-    own SELECT, then the enclosing ones a correlated reference reaches): ``outputs`` is the
-    item's folded output names when the statement defines it, ``None`` for a real table."""
-    select = column.find_ancestor(exp.Select)
-    while select is not None:
-        for item in _from_items(select):
-            if item is not None and _item_name(item) == qualifier:
-                return True, _source_outputs(item)
-        select = select.find_ancestor(exp.Select)
-    return False, None
-
-
-def _query_aliases(column: exp.Column) -> "set[str]":
-    """The folded select-list aliases a bare ORDER BY / GROUP BY / HAVING name of
-    ``column``'s query can mean (a UNION's are its first branch's)."""
-    node = column.parent
-    while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
+def _scope_of(node: exp.Expression) -> Optional[exp.Expression]:
+    node = node.parent
+    while node is not None and not isinstance(node, _SCOPE_NODES):
         node = node.parent
-    while isinstance(node, (exp.SetOperation, exp.Subquery)):
-        node = node.this
-    if not isinstance(node, exp.Select):
-        return set()
-    return {
-        projection.alias.translate(_ASCII_FOLD)
-        for projection in node.expressions
-        if isinstance(projection, exp.Alias) and projection.alias
-    }
+    return node
+
+
+def _from_items(select: exp.Expression) -> "list[exp.Expression]":
+    """The FROM items a query level or DML statement names (a Select's FROM and JOINs, an
+    UPDATE / DELETE target and its joins, DELETE's USING), a parenthesised join's own
+    items included."""
+    items: list = []
+    if isinstance(select, (exp.Update, exp.Delete)):
+        items.append(select.this)
+        for part in ("from_", "from"):
+            source = select.args.get(part)
+            if source is not None:
+                items.append(getattr(source, "this", None))
+        using = select.args.get("using")
+        if isinstance(using, list):
+            items.extend(using)
+    elif isinstance(select, exp.Select):
+        source = select.args.get("from_") or select.args.get("from")
+        items.append(getattr(source, "this", None))
+        items.extend(j.this for j in (select.args.get("joins") or []))
+    out: list = []
+    pending = [item for item in items if item is not None]
+    while pending:
+        item = pending.pop(0)
+        out.append(item)
+        # A parenthesised join (b JOIN c AS C2) reads as Subquery(Table(b, joins=[...])).
+        inner = item.this if isinstance(item, exp.Subquery) and isinstance(item.this, exp.Table) else item
+        if isinstance(inner, exp.Table):
+            pending.extend(j.this for j in (inner.args.get("joins") or []) if j.this is not None)
+            if inner is not item:
+                pending.append(inner)
+    return out
+
+
+class _Scopes:
+    """The statement's own names, resolved per scope and memoized for one scan (a wide
+    statement asked for them once per column made the scan quadratic)."""
+
+    def __init__(self, tree: exp.Expression) -> None:
+        self.aliases = {_key(n) for n in tree.find_all(exp.TableAlias) if n.name}
+        self._ctes: dict = {}
+        self._outputs: dict[int, set] = {}
+        self._labels: dict[int, set] = {}
+        self._items: dict[int, list] = {}
+
+    def visible_ctes(self, node: exp.Expression) -> "dict[str, exp.CTE]":
+        """The CTEs a name at ``node`` can refer to, by key, innermost first: every CTE of
+        an enclosing WITH whose query ``node`` is in, and inside a CTE's own body only the
+        CTEs before it (all of them in a WITH RECURSIVE). Memoized per scope, each scope's
+        from its enclosing one's, so a deep UNION chain costs one walk."""
+        anchor = node if isinstance(node, _SCOPE_NODES) else _scope_of(node)
+        if anchor is None:
+            return {}
+        if id(anchor) in self._ctes:
+            return self._ctes[id(anchor)]
+        visible: dict[str, exp.CTE] = {}
+        own = _with_of(anchor)
+        if own is not None:
+            for cte in own.expressions:
+                if isinstance(cte, exp.CTE):
+                    visible.setdefault(_key(cte.args.get("alias")), cte)
+        for key, cte in self._above(anchor).items():
+            visible.setdefault(key, cte)
+        self._ctes[id(anchor)] = visible
+        return visible
+
+    def _above(self, scope: exp.Expression) -> "dict[str, exp.CTE]":
+        """What the scopes enclosing ``scope`` make visible to it (iterative: a UNION of
+        thousands of branches nests that deep)."""
+        chain: list = []
+        node = scope
+        while node is not None and ("above", id(node)) not in self._ctes:
+            chain.append(node)
+            node = _scope_of(node)
+        inherited = self._ctes[("above", id(node))] if node is not None else {}
+        for current in reversed(chain):
+            visible: dict[str, exp.CTE] = {}
+            child, parent = current, current.parent
+            through_with = False
+            while parent is not None and not isinstance(parent, _SCOPE_NODES):
+                if isinstance(parent, exp.With):
+                    through_with = True
+                    ctes = [c for c in parent.expressions if isinstance(c, exp.CTE)]
+                    position = next((i for i, c in enumerate(ctes) if c is child), None)
+                    allowed = (
+                        ctes if position is None or parent.args.get("recursive") else ctes[:position]
+                    )
+                    for cte in allowed:
+                        visible.setdefault(_key(cte.args.get("alias")), cte)
+                child, parent = parent, parent.parent
+            if parent is not None:
+                own = _with_of(parent)
+                if own is not None and not (through_with and child is own):
+                    for cte in own.expressions:
+                        if isinstance(cte, exp.CTE):
+                            visible.setdefault(_key(cte.args.get("alias")), cte)
+                for key, cte in inherited.items():
+                    visible.setdefault(key, cte)
+            self._ctes[("above", id(current))] = visible
+            inherited = visible
+        return self._ctes[("above", id(scope))]
+
+    def outputs(self, query, alias) -> set:
+        memo = id(alias) if alias is not None else id(query)
+        if memo not in self._outputs:
+            self._outputs[memo] = {_key(i) for i in _output_identifiers(query, alias) if i.name}
+        return self._outputs[memo]
+
+    def source_outputs(self, item: Optional[exp.Expression]) -> "Optional[set]":
+        """The output keys of a FROM item the statement defines itself (a derived table,
+        or a table naming a visible CTE), or ``None`` for a real table."""
+        if isinstance(item, exp.Subquery) and not isinstance(item.this, exp.Table):
+            return self.outputs(item.this, item.args.get("alias"))
+        if isinstance(item, exp.Table) and not item.args.get("db") and item.name:
+            cte = self.visible_ctes(item).get(_key(item.args.get("this")))
+            if cte is not None:
+                return self.outputs(cte.this, cte.args.get("alias"))
+        return None
+
+    def items(self, scope: exp.Expression) -> list:
+        if id(scope) not in self._items:
+            self._items[id(scope)] = _from_items(scope)
+        return self._items[id(scope)]
+
+    def labels(self, column: exp.Column) -> set:
+        """The keys a bare ORDER BY / GROUP BY / HAVING name of ``column``'s query can mean:
+        its select-list aliases, and for a set operation its first branch's labels."""
+        node = column.parent
+        while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
+            node = node.parent
+        if node is None:
+            return set()
+        if id(node) in self._labels:
+            return self._labels[id(node)]
+        if isinstance(node, exp.SetOperation):
+            found = {_key(i) for i in _output_identifiers(node, None)}
+        else:
+            found = {
+                _key(projection.args.get("alias"))
+                for projection in node.expressions
+                if isinstance(projection, exp.Alias) and projection.alias
+            }
+        self._labels[id(node)] = found
+        return found
+
+    def qualified_source(self, column: exp.Column, qualifier: str) -> "tuple[bool, Optional[set]]":
+        """``(found, outputs)`` for the FROM item ``qualifier`` names in the column's scope
+        (its own query level or statement, then the enclosing ones a correlated reference
+        reaches): ``outputs`` is the item's output keys when the statement defines it,
+        ``None`` for a real table."""
+        scope = _scope_of(column)
+        while scope is not None:
+            for item in self.items(scope):
+                if _item_key(item) == qualifier:
+                    return True, self.source_outputs(item)
+            scope = _scope_of(scope)
+        return False, None
+
+
+def _item_key(item: Optional[exp.Expression]) -> str:
+    """The key a FROM item is referenced by: its alias, else a table's name."""
+    if item is None:
+        return ""
+    alias = item.args.get("alias")
+    if isinstance(alias, exp.TableAlias) and alias.name:
+        return _key(alias)
+    if isinstance(item, exp.Table):
+        return _key(item.args.get("this"))
+    return ""
 
 
 def _in_alias_clause(column: exp.Column) -> bool:
@@ -658,15 +775,15 @@ def _in_alias_clause(column: exp.Column) -> bool:
 def _mixed_case_names(tree: exp.Expression) -> "list[str]":
     """The table and column names the statement writes unquoted with upper-case ASCII
     letters, in order: see :func:`_mixed_case_name_warning`."""
-    # Only REFERENCES to a name the statement defines are skipped, resolved in their own
-    # scope, because they fold the same where defined and where used: a qualifier naming
+    # Only REFERENCES to a name the statement defines are skipped -- resolved in their own
+    # scope, and matched as PostgreSQL names them (a backquoted `O` is not an unquoted O)
+    # -- because they name the same thing where defined and where used: a qualifier naming
     # a FROM item's alias or a visible CTE, a table naming a visible CTE, a bare ORDER BY /
     # GROUP BY / HAVING name equal to its query's select alias, a derived table's or CTE's
-    # own output column, and DUAL. The table that carries an alias, the column inside an
-    # aliased expression, an INSERT's column list and a JOIN's USING names are real names.
-    table_aliases = {
-        n.name.translate(_ASCII_FOLD) for n in tree.find_all(exp.TableAlias) if n.name
-    }
+    # own output column, a USING name only the statement's own sources hold, and DUAL. The
+    # table that carries an alias, the column inside an aliased expression and an INSERT's
+    # column list are real names.
+    scopes = _Scopes(tree)
     names: list[str] = []
 
     def _flag(part) -> None:
@@ -685,7 +802,7 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
         if (
             not table.args.get("db")
             and isinstance(this, exp.Identifier)
-            and this.name.translate(_ASCII_FOLD) in _visible_ctes(table)
+            and _key(this) in scopes.visible_ctes(table)
         ):
             continue
         for part in (this, table.args.get("db"), table.args.get("catalog")):
@@ -696,43 +813,50 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
             for part in schema.expressions:
                 _flag(part)
     for join in tree.find_all(exp.Join):
+        scope = _scope_of(join)
+        sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
+        own = bool(sources) and all(o is not None for o in sources)
         for part in join.args.get("using") or []:
+            if own and any(_key(part) in o for o in sources):
+                continue  # only the statement's own outputs on both sides
             _flag(part)
     for column in tree.find_all(exp.Column):
         qualifier = column.args.get("table")
         this = column.args.get("this")
-        folded_qualifier = (
-            qualifier.name.translate(_ASCII_FOLD)
+        qualifier_key = (
+            _key(qualifier)
             if isinstance(qualifier, exp.Identifier) and not column.args.get("db")
             else None
         )
         found, outputs = (
-            _qualified_source(column, folded_qualifier)
-            if folded_qualifier is not None
+            scopes.qualified_source(column, qualifier_key)
+            if qualifier_key is not None
             else (False, None)
         )
-        # A qualifier naming a FROM item's alias, or a CTE, is the statement's own name.
+        # A qualifier naming a FROM item's alias, or a CTE, is the statement's own name --
+        # and so is one naming an alias defined anywhere else in it (an INSERT row alias).
         if not (
-            folded_qualifier is not None
+            qualifier_key is not None
             and (
-                (found and folded_qualifier in table_aliases)
+                (found and qualifier_key in scopes.aliases)
                 or outputs is not None
-                or folded_qualifier in _visible_ctes(column)
+                or qualifier_key in scopes.visible_ctes(column)
+                or (not found and qualifier_key in scopes.aliases)
             )
         ):
             _flag(qualifier)
         _flag(column.args.get("db"))
         if isinstance(this, exp.Identifier):
-            folded = this.name.translate(_ASCII_FOLD)
-            if outputs is not None and folded in outputs:
+            key = _key(this)
+            if outputs is not None and key in outputs:
                 continue  # a derived table's / CTE's own output column
             if qualifier is None:
-                if folded in _query_aliases(column) and _in_alias_clause(column):
+                if key in scopes.labels(column) and _in_alias_clause(column):
                     continue
-                select = column.find_ancestor(exp.Select)
-                sources = [_source_outputs(i) for i in _from_items(select)] if select else []
+                scope = _scope_of(column)
+                sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
                 if sources and all(o is not None for o in sources) and any(
-                    folded in o for o in sources
+                    key in o for o in sources
                 ):
                     continue  # only the statement's own outputs are in scope
         _flag(this)
@@ -762,13 +886,13 @@ def _mixed_case_name_warning(names: "Sequence[str]") -> "Optional[QueryWarning]"
     )
 
 
-def _star_labels(item: Optional[exp.Expression]) -> "list[exp.Identifier]":
+def _star_labels(item: Optional[exp.Expression], scopes: "_Scopes") -> "list[exp.Identifier]":
     """The labels a ``*`` over FROM item ``item`` returns, when the statement defines it (a
     derived table or a CTE); a real table's columns are its schema's, already quoted."""
-    if isinstance(item, exp.Subquery):
+    if isinstance(item, exp.Subquery) and not isinstance(item.this, exp.Table):
         return _output_identifiers(item.this, item.args.get("alias"))
     if isinstance(item, exp.Table) and not item.args.get("db") and item.name:
-        cte = _visible_ctes(item).get(item.name.translate(_ASCII_FOLD))
+        cte = scopes.visible_ctes(item).get(_key(item.args.get("this")))
         if cte is not None:
             return _output_identifiers(cte.this, cte.args.get("alias"))
     return []
@@ -787,6 +911,7 @@ def _mixed_case_label_warning(
         query = query.this  # a UNION's labels are its first branch's
     if not isinstance(query, exp.Select):
         return None
+    scopes = _Scopes(tree)
     labels = []
     candidates: list = []
     for projection in query.expressions:
@@ -794,15 +919,15 @@ def _mixed_case_label_warning(
             candidates.append(projection.args.get("alias"))
         elif isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
             # t.*: the labels of the derived table or CTE ``t`` names
-            qualifier = (projection.table or "").translate(_ASCII_FOLD)
+            qualifier = _key(projection.args.get("table"))
             for item in _from_items(query):
-                if item is not None and _item_name(item) == qualifier:
-                    candidates.extend(_star_labels(item))
+                if _item_key(item) == qualifier:
+                    candidates.extend(_star_labels(item, scopes))
         elif isinstance(projection, exp.Column):
             candidates.append(projection.args.get("this"))  # the column's own name labels it
         elif isinstance(projection, exp.Star):
             for item in _from_items(query):
-                candidates.extend(_star_labels(item))
+                candidates.extend(_star_labels(item, scopes))
     for label in candidates:
         if (
             isinstance(label, exp.Identifier)
@@ -908,7 +1033,10 @@ class QueryConverter:
                 warnings.append(mixed_case)
             if mixed_label is not None:
                 warnings.append(mixed_label)
-        _inline_having_aliases(tree, case_insensitive=not self._is_postgres)
+        if not self._is_postgres:
+            # MySQL-only: PostgreSQL's HAVING never names an output alias, so on a
+            # PostgreSQL source a HAVING name matching one is a real column.
+            _inline_having_aliases(tree)
         warnings.extend(_for_update_warnings(tree))
 
         try:

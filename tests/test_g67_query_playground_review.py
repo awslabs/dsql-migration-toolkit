@@ -149,3 +149,90 @@ def test_a_having_alias_is_inlined_whatever_its_case() -> None:
 def test_a_label_that_reaches_the_client_through_a_star_is_named(sql: str) -> None:
     result = QueryConverter().convert(sql)
     assert [w.code for w in result.warnings] == ["MIXED_CASE_LABEL"]
+
+
+# --- G89: the review of G80 -----------------------------------------------------------
+
+
+def test_a_postgresql_having_is_never_inlined() -> None:
+    """PostgreSQL's HAVING never names an output alias: the folded key turned
+    `sum(total) AS Total ... HAVING sum(total) > 100` into SUM(SUM(total))."""
+    from dsql_migrator.core.models import SourceType
+
+    converter = QueryConverter(source_type=SourceType.POSTGRES)
+    for sql, tail in (
+        ("SELECT customer_id, sum(total) AS Total FROM orders GROUP BY customer_id HAVING sum(total) > 100",
+         "HAVING SUM(total) > 100"),
+        ("SELECT coalesce(region, 'n/a') AS Region, sum(amount) AS total FROM sales GROUP BY region "
+         "HAVING region IS NOT NULL", "HAVING NOT region IS NULL"),
+    ):
+        assert converter.convert(sql).converted_sql.endswith(tail), sql
+
+
+@pytest.mark.parametrize(
+    ("sql", "tail"),
+    [
+        # MySQL reads a name inside an aggregate in HAVING from FROM, not the alias.
+        ("SELECT customer_id, SUM(total) AS Total FROM orders GROUP BY customer_id HAVING SUM(total) > 100",
+         "HAVING SUM(total) > 100"),
+        # A HAVING name that is also a GROUP BY column means the column.
+        ("SELECT COALESCE(region, 'n/a') AS Region, SUM(amount) AS total FROM sales GROUP BY region "
+         "HAVING region IS NOT NULL", "HAVING NOT region IS NULL"),
+        # ...while a plain alias reference is inlined, whatever its case.
+        ("SELECT g, SUM(x) AS total FROM t GROUP BY g HAVING Total > 5", "HAVING SUM(x) > 5"),
+    ],
+)
+def test_the_mysql_having_inliner_reads_names_as_mysql_does(sql: str, tail: str) -> None:
+    assert QueryConverter().convert(sql).converted_sql.endswith(tail)
+
+
+@pytest.mark.parametrize(
+    ("sql", "named"),
+    [
+        # A backquoted definition keeps its case on Aurora DSQL; the unquoted reference folds.
+        ("SELECT O.id FROM `orders` AS `O` WHERE O.status = 'x'", "O"),
+        ("INSERT INTO t (a) SELECT d.UserId FROM (SELECT id AS `UserId` FROM x) d", "UserId"),
+    ],
+)
+def test_a_reference_that_only_folds_to_a_quoted_definition_is_flagged(sql: str, named: str) -> None:
+    result = QueryConverter().convert(sql)
+    (warning,) = [w for w in result.warnings if w.code == "MIXED_CASE_NAME"]
+    assert f"Name(s) {named} " in warning.message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE orders O SET status = 'shipped' WHERE O.id = 1",
+        "DELETE FROM orders AS O WHERE O.id = 1",
+        "UPDATE orders AS O SET status = 'x' WHERE EXISTS (SELECT 1 FROM items i WHERE i.order_id = O.id)",
+        "UPDATE orders o JOIN (SELECT order_id, SUM(qty) AS TotalQty FROM items GROUP BY order_id) t "
+        "ON t.order_id = o.id SET o.total_qty = t.TotalQty",
+        "SELECT C2.id FROM a JOIN (b JOIN c AS C2 ON b.id = C2.bid) ON a.id = b.aid",
+    ],
+)
+def test_dml_and_nested_join_aliases_are_the_statements_own(sql: str) -> None:
+    """Aliases outside a SELECT's FROM/JOIN list were flagged with advice to quote them,
+    which breaks the statement."""
+    result = QueryConverter().convert(sql)
+    assert "MIXED_CASE_NAME" not in [w.code for w in result.warnings], result.warnings
+
+
+def test_a_using_name_only_the_statements_own_sources_hold_is_not_a_schema_name() -> None:
+    result = QueryConverter().convert(
+        "WITH a AS (SELECT id AS UserId FROM t1), b AS (SELECT id AS UserId FROM t2) "
+        "SELECT * FROM a JOIN b USING (UserId)"
+    )
+    assert [w.code for w in result.warnings] == ["MIXED_CASE_LABEL"]
+
+
+def test_a_wide_statement_is_scanned_in_linear_time() -> None:
+    """Each column re-resolved its scope: 4,000 columns over a CTE took 10 s on the event
+    loop."""
+    import time
+
+    columns = ", ".join(f"c{i}" for i in range(3000))
+    sql = f"WITH cte AS (SELECT {columns} FROM t) SELECT {columns} FROM cte"
+    started = time.perf_counter()
+    QueryConverter().convert(sql)
+    assert time.perf_counter() - started < 3
