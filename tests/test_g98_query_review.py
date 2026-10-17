@@ -106,7 +106,8 @@ def test_a_bare_quoted_reference_to_an_unquoted_output_is_flagged(sql: str) -> N
 
 
 @pytest.mark.parametrize("modifier", ["LOW_PRIORITY", "QUICK"])
-def test_a_delete_modifier_is_named_as_one(modifier: str) -> None:
+def test_a_delete_modifier_is_left_out(modifier: str) -> None:
+    """G103: the conversion leaves it out itself (it only schedules MySQL's table-level
+    locks or index upkeep), where it was named for the operator to remove."""
     result = QueryConverter().convert(f"DELETE {modifier} FROM orders WHERE id = 99")
-    (warning,) = result.warnings
-    assert "modifier" in warning.message and "multi-table" not in warning.message
+    assert result.converted_sql == "DELETE FROM orders WHERE id = 99" and result.warnings == []

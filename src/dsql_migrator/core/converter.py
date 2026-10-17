@@ -7904,7 +7904,9 @@ def table_type_index(tables: "Iterable[TableDef]") -> "dict[str, tuple]":
 def _type_source_items(entry: Optional[exp.Expression]) -> "list[exp.Expression]":
     """The sources one FROM entry brings into scope: a table and the tables it joins, a
     derived table, and a parenthesised join's own entries -- MySQL stores every JOIN as
-    ``from (a join b on (...))``, nested ones as ``((a join b) join c)``."""
+    ``from (a join b on (...))``, nested ones as ``((a join b) join c)``, and one that
+    starts with a derived table as ``((select ...) x join b on (...))``, sqlglot hanging b
+    on x."""
     out: list = []
     pending = [entry] if isinstance(entry, exp.Expression) else []
     while pending:
@@ -7917,7 +7919,7 @@ def _type_source_items(entry: Optional[exp.Expression]) -> "list[exp.Expression]
             ]
             current = current.this
         out.append(current)
-        if isinstance(current, exp.Table):
+        if isinstance(current, (exp.Table, exp.Subquery)):
             pending.extend(
                 j.this for j in (current.args.get("joins") or []) if isinstance(j.this, exp.Expression)
             )
