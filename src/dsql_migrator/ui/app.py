@@ -1958,7 +1958,13 @@ def main() -> None:
             config.session_state_bucket,
             region=config.aws_region,
             aws_profile=config.aws_profile,
+            # Saves run off the event loop (every navigation and AI turn saved, and
+            # waited for the PUT, on it); the last ones are flushed at exit.
+            background=True,
         )
+        import atexit
+
+        atexit.register(SESSION_STATE_STORE.flush, 10.0)
     else:
         SESSION_STATE_STORE = SqliteSessionStateStore(config.session_state_path)
     SESSION_STATE_STORE.prune(_KEEP_SESSIONS)

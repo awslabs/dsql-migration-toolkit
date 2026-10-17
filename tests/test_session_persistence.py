@@ -327,6 +327,41 @@ def test_s3_session_store_save_swallows_serialization_error() -> None:
     assert store.load("s1") is None  # nothing was written
 
 
+def test_a_background_s3_store_uploads_off_the_caller_and_coalesces() -> None:
+    """Every navigation and AI turn saved -- serialized the whole Evaluation result and
+    waited for the PUT -- on the UI's event loop. In background mode save() only queues;
+    one session's saves coalesce; a load reads a queued one; delete and prune wait."""
+    import threading
+
+    gate = threading.Event()
+
+    class _SlowS3(_FakeS3):
+        puts: list = []
+
+        def put_object(self, **kwargs):  # noqa: N803
+            gate.wait(5)
+            type(self).puts.append(kwargs["Key"])
+            return super().put_object(**kwargs)
+
+    fake = _SlowS3(buckets=("b",))
+    store = S3SessionStateStore("b", s3_client=fake, background=True)
+    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:a"]))  # returns at once
+    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:b"]))
+    # Read-your-writes before anything reached S3.
+    assert store.load("s1").generated_node_ids == ["table:b"]
+    gate.set()
+    assert store.flush(timeout=5)
+    assert store.load("s1").generated_node_ids == ["table:b"]
+    assert len(_SlowS3.puts) <= 2  # the first may already be in flight; never three
+    # A Start over is not undone by a late upload.
+    gate.clear()
+    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:c"]))
+    gate.set()
+    store.delete("s1")
+    assert store.flush(timeout=5)
+    assert store.load("s1") is None
+
+
 def test_config_reads_session_state_bucket_env() -> None:
     from dsql_migrator.config import load_config
 

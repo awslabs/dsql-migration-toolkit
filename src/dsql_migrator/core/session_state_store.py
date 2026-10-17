@@ -480,6 +480,13 @@ class S3SessionStateStore:
     of breaking the live migration UI (the in-process session still functions).
     Concurrency: the control plane runs as a single task and boto3 clients are
     thread-safe, so only the lazy client build + one-time bucket ensure are guarded.
+
+    ``background``: :meth:`save` only hands the snapshot to one writer thread, which
+    serializes and uploads it. The UI saved on its event loop on every navigation and AI
+    turn, re-serializing the whole Evaluation result and waiting for the PUT each time,
+    which stalled every session's page. Saves of one session coalesce (only the newest
+    is written); :meth:`load` reads a pending one; :meth:`delete` and :meth:`prune` wait
+    for the writer first, so a Start over is never undone by a late upload.
     """
 
     def __init__(
@@ -490,6 +497,7 @@ class S3SessionStateStore:
         aws_profile: Optional[str] = None,
         prefix: str = "sessions/",
         s3_client: object = None,
+        background: bool = False,
     ) -> None:
         self._bucket = bucket
         self._region = region
@@ -498,6 +506,12 @@ class S3SessionStateStore:
         self._lock = threading.Lock()
         self._client = s3_client  # injected in tests; else built lazily
         self._ensured = False
+        self._background = background
+        # session id -> its newest snapshot not yet uploaded, and the one being uploaded.
+        self._pending: dict[str, SessionSnapshot] = {}
+        self._inflight: Optional[tuple[str, SessionSnapshot]] = None
+        self._writer_cv = threading.Condition()
+        self._writer: Optional[threading.Thread] = None
 
     # -- internals --------------------------------------------------------- #
     def _s3(self):
@@ -562,6 +576,19 @@ class S3SessionStateStore:
 
     # -- SessionStateStore protocol --------------------------------------- #
     def save(self, snapshot: SessionSnapshot) -> None:
+        if not self._background:
+            self._upload(snapshot)
+            return
+        with self._writer_cv:
+            self._pending[snapshot.session_id] = snapshot
+            if self._writer is None or not self._writer.is_alive():
+                self._writer = threading.Thread(
+                    target=self._drain, name="session-snapshot-writer", daemon=True
+                )
+                self._writer.start()
+            self._writer_cv.notify_all()
+
+    def _upload(self, snapshot: SessionSnapshot) -> None:
         try:
             # Serialize INSIDE the guard: SessionSnapshot has no validate_assignment,
             # so a caller that set a field post-construction could (in theory) make
@@ -585,7 +612,44 @@ class S3SessionStateStore:
                 exc_info=True,
             )
 
+    def _drain(self) -> None:
+        """The writer thread: upload each session's newest pending snapshot, in turn."""
+        while True:
+            with self._writer_cv:
+                while not self._pending:
+                    self._writer_cv.wait()
+                session_id = next(iter(self._pending))
+                snapshot = self._pending.pop(session_id)
+                self._inflight = (session_id, snapshot)
+            try:
+                self._upload(snapshot)
+            finally:
+                with self._writer_cv:
+                    self._inflight = None
+                    self._writer_cv.notify_all()
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Wait until every pending snapshot is uploaded; ``False`` on timeout."""
+        with self._writer_cv:
+            return self._writer_cv.wait_for(
+                lambda: not self._pending and self._inflight is None, timeout=timeout
+            )
+
+    def _unwritten(self, session_id: str) -> Optional[SessionSnapshot]:
+        """A snapshot of ``session_id`` saved but not uploaded yet (newest first)."""
+        with self._writer_cv:
+            pending = self._pending.get(session_id)
+            if pending is None and self._inflight is not None and self._inflight[0] == session_id:
+                pending = self._inflight[1]
+        return pending
+
     def load(self, session_id: str) -> Optional[SessionSnapshot]:
+        unwritten = self._unwritten(session_id) if self._background else None
+        if unwritten is not None:
+            try:  # a detached copy, as a read from S3 would give
+                return SessionSnapshot.model_validate_json(unwritten.model_dump_json())
+            except Exception:  # noqa: BLE001 - fall back to what S3 holds
+                pass
         try:
             obj = self._s3().get_object(Bucket=self._bucket, Key=self._key(session_id))
             payload = obj["Body"].read().decode("utf-8")
@@ -605,6 +669,14 @@ class S3SessionStateStore:
             return None
 
     def delete(self, session_id: str) -> None:
+        if self._background:
+            with self._writer_cv:
+                self._pending.pop(session_id, None)
+                # An upload already under way would land after the DELETE.
+                self._writer_cv.wait_for(
+                    lambda: self._inflight is None or self._inflight[0] != session_id,
+                    timeout=30,
+                )
         try:
             self._s3().delete_object(Bucket=self._bucket, Key=self._key(session_id))
         except Exception:  # noqa: BLE001 - best-effort
@@ -616,6 +688,8 @@ class S3SessionStateStore:
             )
 
     def prune(self, keep_most_recent: int) -> list[str]:
+        if self._background:
+            self.flush(timeout=30)  # the listing must see what was saved
         try:
             with self._lock:
                 self._ensure_bucket()
