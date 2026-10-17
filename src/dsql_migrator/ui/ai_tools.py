@@ -431,6 +431,21 @@ def build_ai_tool_executor(
                     return _json.dumps({"status": "not_found", "object_name": _obj})
                 _edited_of = getattr(_cs, "get_edited_target_ddl", None)
                 _edited = _edited_of(_p.object_name) if callable(_edited_of) else None
+                _view = next(
+                    (v for v in getattr(_res, "views", ()) or () if v.view == _p.object_name),
+                    None,
+                )
+                if _view is not None and not _view.auto_converted:
+                    # No apply path creates a view the conversion could not convert, an
+                    # edit stored for it included: never reported as what Apply runs.
+                    return _json.dumps(
+                        {"status": "ok", "object_name": _p.object_name,
+                         "source_ddl": _p.source_ddl, "target_ddl": _p.target_ddl,
+                         "edited": False,
+                         "note": ("This view is not converted: Schema Apply does not create "
+                                  "it (an edited target DDL for it is not applied either); "
+                                  "it is re-created by hand on Aurora DSQL.")}
+                    )
                 if _edited:
                     # As Schema Conversion shows and Apply / Full Load run it: the stored
                     # text named a pre-rename index and kept foreign keys the operator had

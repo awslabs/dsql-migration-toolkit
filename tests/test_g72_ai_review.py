@@ -39,7 +39,9 @@ def test_the_dlq_cards_ai_facts_carry_no_row_values(monkeypatch) -> None:
 def test_the_grounding_does_not_promise_generation_for_every_key() -> None:
     from dsql_migrator.core.assessment_strategist import DSQL_CONSTRAINTS
 
-    assert "kept as a plain integer WITHOUT generation" in DSQL_CONSTRAINTS
+    assert "kept WITHOUT generation" in DSQL_CONSTRAINTS
+    # G84: a numeric key fed by a sequence is narrowed to a bigint identity, not kept.
+    assert "narrowed to bigint" in DSQL_CONSTRAINTS
     assert "MySQL" not in DSQL_CONSTRAINTS  # engine-neutral: PostgreSQL prompts carry it
 
 

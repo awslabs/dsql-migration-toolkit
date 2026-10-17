@@ -205,6 +205,11 @@ def build_ai_panel(
         # An index alone was shifted by a late reply landing before it (another tab of
         # the same session, or a turn still streaming when a new scope opened).
         "scope_first": None,
+        # This tab's scope, and the turns it asked and answered there (by identity): its
+        # window is those, so another tab's exchange in the shared transcript is not
+        # sent with this tab's follow-up.
+        "scope_id": None,
+        "own": {},
         # Count of activity events posted while the panel was closed -- shown as a
         # badge on the right-edge reopen tab so an action is noticed even with the
         # panel hidden. Reset to 0 when the panel is opened.
@@ -1004,16 +1009,18 @@ def build_ai_panel(
         by an index another tab or a late reply could have shifted."""
         active = conversation.active_scope
         at = _index_of(question)
-        if (
-            asked_scope is not None
-            and (active is None or active.scope_id != asked_scope)
-            and at is not None
-        ):
+        if at is None:
+            # Its question is gone (Start over in another tab of this session): the reply
+            # belongs to a journey that no longer exists, so it is not recorded.
+            return
+        if asked_scope is not None and (active is None or active.scope_id != asked_scope):
             conversation.messages.insert(at + 1, message)
             if at + 1 <= int(conv["scope_start"]):  # type: ignore[arg-type]
                 conv["scope_start"] = int(conv["scope_start"]) + 1  # type: ignore[arg-type]
         else:
             conversation.messages.append(message)
+        own = conv["own"]
+        own[id(message)] = message  # type: ignore[index]
 
     def _run_pending_seed() -> None:
         """Ask the seed question of the scope opened while a turn was running -- if that
@@ -1026,7 +1033,15 @@ def build_ai_panel(
     def _run_turn(user_text: str) -> None:
         text = (user_text or "").strip()
         streamer = conv["streamer"]
-        if not text or conv["busy"] or streamer is None:
+        if not text or streamer is None:
+            return
+        if conv["busy"]:
+            # A question asked while a turn streams (the composer guards itself, so this
+            # is a programmatic ask: a 'What's next?' re-run) is asked when the turn
+            # ends, never dropped and never run beside it.
+            active = conversation.active_scope
+            if active is not None:
+                conv["pending_seed"] = (active.scope_id, text)
             return
         if not is_enabled():
             # AI Assist was turned off (Connect) after this scope was opened. NEVER call
@@ -1040,12 +1055,15 @@ def build_ai_panel(
         # and AWS profile stay editable while it streams, so its outcome may latch -- or
         # clear -- the session's AI verdict only if they still hold when it arrives.
         sent_with = ai_settings_key(state)
-        # The scope this turn is asked in: its reply belongs there, even when another
-        # object's AI button opened a new scope while it streamed.
-        asked_scope = getattr(conversation.active_scope, "scope_id", None)
+        # The scope this turn is asked in -- this tab's own, not whichever another tab of
+        # the session opened last: its reply belongs there, even when another object's
+        # AI button opened a new scope while it streamed.
+        asked_scope = conv.get("scope_id") or getattr(conversation.active_scope, "scope_id", None)
         _set_busy(True)
         question = {"role": "user", "text": text}
         conversation.messages.append(question)
+        own = conv["own"]
+        own[id(question)] = question  # type: ignore[index]
         if conv.get("scope_first") is None or _index_of(conv.get("scope_first")) is None:
             conv["scope_first"] = question
         # Ground the streamer on the CURRENT scope only: send the turns since this
@@ -1060,6 +1078,10 @@ def build_ai_panel(
             dict(m)
             for m in conversation.messages[scope_start:]
             if (m or {}).get("role") in ("user", "assistant")
+            # Only this tab's turns: another tab's exchange interleaved in the shared
+            # transcript is not part of this conversation (a restored transcript's turns,
+            # owned by no tab, are kept).
+            and (own.get(id(m)) is m or not own)  # type: ignore[union-attr]
         ]
         recent_events = [
             str((m or {}).get("text", ""))
@@ -1413,10 +1435,12 @@ def build_ai_panel(
             )
             conv["scope_start"] = len(conversation.messages)
             conv["scope_first"] = None
+            conv["own"] = {}
             # A seed queued for an earlier scope belongs to a scope no longer open.
             conv.pop("pending_seed", None)
             if conversation.messages:
                 _divider(f"Now: {title}" if title else "New topic")
+        conv["scope_id"] = scope_id
         try:
             title_label.set_text(title or "AI DBA")  # type: ignore[attr-defined]
             subtitle_label.set_text(subtitle)  # type: ignore[attr-defined]
@@ -1481,6 +1505,8 @@ def build_ai_panel(
         conv["stop_requested"] = False
         conv["scope_start"] = 0
         conv["scope_first"] = None
+        conv["scope_id"] = None
+        conv["own"] = {}
         conv.pop("pending_seed", None)  # a seed of the old journey is never asked
         conv["unseen"] = 0
         pending = conv.get("pending")
