@@ -2787,7 +2787,7 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
 
     # A jar is itself a DEFLATE-compressed ZIP, so its raw bytes carry no readable strings --
     # the class entries have to be decompressed before a marker can be found in them.
-    chunks: list[bytes] = []
+    classes: dict[str, bytes] = {}
     with zipfile.ZipFile(zip_path) as bundle:
         jars = [n for n in bundle.namelist() if n.endswith(".jar")]
         assert jars, bundle.namelist()
@@ -2795,12 +2795,21 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
             with bundle.open(name) as raw, zipfile.ZipFile(io.BytesIO(raw.read())) as jar:
                 for entry in jar.namelist():
                     if entry.endswith(".class"):
-                        chunks.append(jar.read(entry))
-    blob = b"".join(chunks)
+                        classes[entry] = classes.get(entry, b"") + jar.read(entry)
+    blob = b"".join(classes.values())
 
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v54: a PostgreSQL infinity / -infinity date or timestamp is mapped, and any
+        # RuntimeException a value's conversion throws is a DataException naming the column
+        # (dead-letters one record instead of killing the task).
+        "conversion failure names its column": b"Cannot convert the value of column '",
+        # v54 (rebuilt in place): a PostgreSQL point is written as its own text.
+        "pg point as text": b"A PostgreSQL point arrived without its x/y coordinates",
+        # ...a MySQL TIME duration is refused by name from a time column (ValueFit DURATION,
+        # and at bind time when the column types could not be read).
+        "time duration refused": b"is a duration, which a time-of-day column",
         # v53 (G25, rebuilt in place): a hold that ends -- applied, dead-lettered, or replaced
         # by a later change of its row -- is released only when the put returns normally, and
         # a probe's transient failure no longer fails the put: Connect's redelivery of a failed
@@ -2893,7 +2902,22 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
         # dead-letter (re-read the source) from an unrecoverable one (a lost DELETE).
         "quarantine op tag": b"| op: ",
     }
-    missing = [name for name, marker in markers.items() if marker not in blob]
+    # A marker a shaded dependency also holds proves nothing blob-wide, so it is looked for
+    # in the class that owns it.
+    class_markers = {
+        # v54 (G65, rebuilt in place): a whole decimal bound into an integer parameter is
+        # bound as a long (`"id" = ?` on a numeric(12,0) serial key made a bigint identity
+        # became `"id"::numeric = $1`, a full scan per DELETE). The shaded pgjdbc
+        # ByteConverter also calls longValueExact, so only DsqlSinkTask's own use counts.
+        "whole decimal key bound as a long": (
+            "dev/dsqlmigrator/connect/DsqlSinkTask.class", b"longValueExact"
+        ),
+    }
+    missing = [name for name, marker in markers.items() if marker not in blob] + [
+        name
+        for name, (entry, marker) in class_markers.items()
+        if marker not in classes.get(entry, b"")
+    ]
     assert not missing, (
         "connectors/plugins/dsql-sink-plugin.zip is STALE for: "
         + ", ".join(missing)

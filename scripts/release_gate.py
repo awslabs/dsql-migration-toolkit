@@ -50,11 +50,12 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 def _read_env(path: str) -> dict:
     out: dict = {}
     try:
-        for raw in open(path, encoding="utf-8"):
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                out[k.strip()] = v.strip().strip('"').strip("'")
+        with open(path, encoding="utf-8") as lines:
+            for raw in lines:
+                line = raw.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    out[k.strip()] = v.strip().strip('"').strip("'")
     except FileNotFoundError:
         pass
     return out

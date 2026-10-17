@@ -799,6 +799,7 @@ class PgIdentityKeyRule(Rule):
         from dsql_migrator.core.assessor import _MONOTONIC_KEY_NOTE
         from dsql_migrator.core.converter import (
             IDENTITY_FALLBACK_CAVEAT,
+            identity_key_narrowing,
             identity_strategy_applies,
         )
 
@@ -809,18 +810,41 @@ class PgIdentityKeyRule(Rule):
                 continue
             keeps = identity_strategy_applies(table)
             declared = next((c.mysql_type for c in table.columns if c.name == column), "")
+            # A numeric key the identity narrows is graded as Schema Conversion notes it:
+            # a LOSS for the existing values bigint cannot hold, not "no action needed".
+            narrowing = identity_key_narrowing(table) if keeps else None
             # The headline says what the default conversion does with THIS key: a single
             # integer key keeps generating; a composite or non-integer one does not.
             if keeps:
+                type_change = (
+                    f"The column is NARROWED from {declared} to bigint (Aurora DSQL "
+                    "supports an identity only on bigint): every value a sequence "
+                    "generated fits, but "
+                    + " and ".join(
+                        part
+                        for part, applies in zip(
+                            (
+                                "an EXISTING value above 9223372036854775807 (2^63-1) "
+                                "would fail to load",
+                                "a value with a fractional part has no bigint form, so "
+                                "the table's Full Load refuses it",
+                            ),
+                            narrowing[1],
+                        )
+                        if applies
+                    )
+                    + "."
+                    if narrowing is not None
+                    else "The column is WIDENED to bigint (Aurora DSQL supports an "
+                    "identity only on bigint) — lossless for this key, but check anything "
+                    "that assumes a 4-byte id."
+                )
                 risk = (
                     f"The key from serial / identity column '{column}' converts cleanly "
                     "AND keeps generating values: the default conversion makes it a "
                     "cached identity, so the application still does not supply the key. "
-                    "Two things change. The column is WIDENED to bigint (Aurora DSQL "
-                    "supports an identity only on bigint) — lossless for an integer key (a "
-                    "numeric one is narrowed instead: every value a sequence generated fits, "
-                    "a larger one supplied by hand would not load), but check anything that "
-                    "assumes a 4-byte id. And because each DSQL node draws its own block of values "
+                    f"Two things change. {type_change} And because each DSQL node draws "
+                    "its own block of values "
                     "from the cache, the key is no longer gap-free or strictly increasing, "
                     "which also spreads inserts instead of concentrating them on one "
                     "partition (DSQL stores rows in primary-key order)."
@@ -851,7 +875,15 @@ class PgIdentityKeyRule(Rule):
                     # State the DEFAULT, then the opt-out -- see the MySQL rule.
                     recommendation=(
                         (
-                            "No action needed to keep the behaviour: Schema Conversion "
+                            "Check that every existing key is a whole number within "
+                            "bigint's range before applying; if one is not, keep the "
+                            "source PK (no identity) or move to a uuid key. Otherwise no "
+                            "action is needed: Schema Conversion defaults to "
+                            "'Server-generated (IDENTITY)' for this table, and Full Load "
+                            "loads the source's own ids before advancing the sequence past "
+                            "them."
+                            if narrowing is not None
+                            else "No action needed to keep the behaviour: Schema Conversion "
                             "defaults to 'Server-generated (IDENTITY)' for this table, and "
                             "Full Load loads the source's own ids before advancing the "
                             "sequence past them. Switch to 'Keep source PK' only if the "
@@ -874,9 +906,12 @@ class PgIdentityKeyRule(Rule):
                         "writes further."
                     ),
                     effort=EffortLevel.MEDIUM,
-                    # Advice where the key keeps generating; a gap where nothing does.
+                    # Advice where the key keeps generating whole; a gap where nothing
+                    # does, or where the narrowing can refuse existing values.
                     note_kind=(
-                        ConversionNoteKind.RECOMMENDATION if keeps else ConversionNoteKind.LOSS
+                        ConversionNoteKind.RECOMMENDATION
+                        if keeps and narrowing is None
+                        else ConversionNoteKind.LOSS
                     ),
                 )
             )

@@ -4055,6 +4055,26 @@ def _apply_pk_strategy(
     return warnings
 
 
+def identity_key_narrowing(table: TableDef) -> "Optional[tuple[str, tuple[bool, bool]]]":
+    """``(declared type, (may exceed bigint, may hold a fraction))`` when the identity
+    strategy NARROWS ``table``'s numeric / decimal key to bigint, else ``None`` -- the
+    converter's own predicate (:func:`_decimal_narrowing`), so Evaluation grades the key
+    as Schema Conversion notes it. For a key spelled as PostgreSQL declares it (a MySQL
+    ``bigint unsigned`` key is not made an identity by default)."""
+    column = table.auto_increment_column
+    if not column or not identity_strategy_applies(table):
+        return None
+    declared = next((c.mysql_type for c in table.columns if c.name == column), "") or ""
+    if re.split(r"[\s(]", declared.strip().lower(), maxsplit=1)[0] not in ("numeric", "decimal"):
+        return None
+    try:
+        data_type = exp.DataType.build(declared, dialect=_POSTGRES)
+    except Exception:  # noqa: BLE001 - an unreadable spelling: nothing to grade
+        return None
+    narrowing = _decimal_narrowing(data_type)
+    return None if narrowing is None else (declared, narrowing)
+
+
 def _decimal_narrowing(data_type: exp.DataType) -> "Optional[tuple[bool, bool]]":
     """``(may exceed bigint, may hold a fraction)`` of a numeric/DECIMAL key made bigint, or
     ``None`` when bigint holds every value it declares (``numeric(p<=18, 0)``). A bare

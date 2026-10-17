@@ -152,3 +152,145 @@ def test_a_column_cdc_drops_is_worded_by_its_target_default() -> None:
     assert "drop the NOT NULL" not in todo  # the source schema is what makes it required
     what, _todo = uncarryable_column_texts([col("flags", "bit(8)[]", True)])
     assert "NULL on every row CDC delivers" in what
+
+
+def _fk_tables() -> "tuple[TableDef, TableDef]":
+    from dsql_migrator.core.models import ForeignKeyDef
+
+    customers = TableDef(
+        name="shop.customers",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+    )
+    orders = TableDef(
+        name="shop.orders",
+        columns=[
+            ColumnDef(name="id", mysql_type="int", nullable=False),
+            ColumnDef(name="customer_id", mysql_type="int"),
+            ColumnDef(name="created", mysql_type="datetime"),
+        ],
+        primary_key=["id"],
+        auto_increment_column="id",
+        foreign_keys=[ForeignKeyDef(
+            name="fk_orders_customer", columns=["customer_id"],
+            referenced_table="shop.customers", referenced_columns=["id"],
+        )],
+    )
+    return customers, orders
+
+
+def test_a_pick_swaps_only_the_strategy_notes() -> None:
+    """G75: the swap replaced the whole note list with a per-table conversion's: with
+    'preserve foreign keys' off the table said its FKs were preserved (losing the 'removed
+    at your request' LOSS), and an index rename's note vanished."""
+    from dsql_migrator.core.converter import SchemaConvertOptions
+    from dsql_migrator.ui.schema_conversion import (
+        TABLE_PREFIX,
+        generate_previews,
+        render_target_ddl,
+    )
+    from dsql_migrator.ui.schema_conversion_apply import build_keep_conversion
+
+    customers, orders = _fk_tables()
+    inventory = SourceInventory(tables=[customers, orders])
+    converter = SchemaConverter()
+    result = converter.convert(inventory, SchemaConvertOptions(preserve_foreign_keys=False))
+    stored = {"shop.orders": render_target_ddl(build_keep_conversion(converter, orders))}
+    (preview,) = generate_previews(
+        [TABLE_PREFIX + "shop.orders"], inventory, result, stored_ddl_of=stored.get
+    )
+    notes = " ".join(w.message for w in preview.warnings)
+    assert "kept as a plain integer" in notes
+    assert "KEEPS its value generation" not in notes
+    assert "removed at your request" in notes
+    assert "are preserved and re-created" not in notes
+
+
+def test_a_script_the_picker_did_not_make_keeps_the_default_notes() -> None:
+    """G75: an identity script laid out differently (one line, an adopted AI suggestion)
+    read as Keep, so the notes said 'kept as a plain integer' beside an identity column."""
+    from dsql_migrator.ui.schema_conversion import (
+        TABLE_PREFIX,
+        generate_previews,
+        render_target_ddl,
+    )
+    from dsql_migrator.ui.schema_conversion_apply import build_identity_conversion
+
+    table = TableDef(
+        name="shop.users",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    inventory = SourceInventory(tables=[table])
+    converter = SchemaConverter()
+    result = converter.convert(inventory)
+    one_line = " ".join(render_target_ddl(build_identity_conversion(converter, table)).split())
+    (preview,) = generate_previews(
+        [TABLE_PREFIX + "shop.users"], inventory, result, stored_ddl_of={"shop.users": one_line}.get
+    )
+    notes = " ".join(w.message for w in preview.warnings)
+    assert "KEEPS its value generation" in notes and "kept as a plain integer" not in notes
+
+
+def test_a_pick_keeps_the_index_rename_note() -> None:
+    from dsql_migrator.core.models import IndexDef
+    from dsql_migrator.ui.schema_conversion import (
+        TABLE_PREFIX,
+        generate_previews,
+        render_target_ddl,
+    )
+    from dsql_migrator.ui.schema_conversion_apply import build_keep_conversion
+
+    def table(name: str) -> TableDef:
+        return TableDef(
+            name=name,
+            columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                     ColumnDef(name="created", mysql_type="datetime")],
+            primary_key=["id"],
+            auto_increment_column="id",
+            indexes=[IndexDef(name="idx_created", columns=["created"])],
+        )
+
+    orders, items = table("shop.orders"), table("shop.items")
+    inventory = SourceInventory(tables=[orders, items])
+    converter = SchemaConverter()
+    result = converter.convert(inventory)
+    renames = result.index_renames.get("shop.orders")
+    assert renames  # the shared index name is renamed per table
+    (default,) = generate_previews([TABLE_PREFIX + "shop.orders"], inventory, result)
+    rename_notes = [w for w in default.warnings if "idx_created" in w.message and "renamed" in w.message.lower()]
+    assert rename_notes
+    stored = {"shop.orders": render_target_ddl(
+        build_keep_conversion(converter, orders, index_names=renames)
+    )}
+    (picked,) = generate_previews(
+        [TABLE_PREFIX + "shop.orders"], inventory, result, stored_ddl_of=stored.get
+    )
+    assert all(note in picked.warnings for note in rename_notes)
+    assert "kept as a plain integer" in " ".join(w.message for w in picked.warnings)
+
+
+def test_evaluation_grades_a_narrowed_identity_key_as_schema_conversion_notes_it() -> None:
+    """G75: Evaluation said 'converts cleanly ... No action needed' (AUTO) for a numeric
+    serial key while Schema Conversion noted a LOSS for the values bigint cannot hold."""
+    from dsql_migrator.core.models import ConversionNoteKind
+
+    assessor = CompatibilityAssessor(source_type=SourceType.POSTGRES)
+    for type_, loss, says in (
+        ("numeric", True, "fractional part"),
+        ("numeric(20,0)", True, "2^63-1"),
+        ("numeric(10,2)", True, "fractional part"),
+        ("numeric(12,0)", False, "lossless for this key"),
+        ("integer", False, "lossless for this key"),
+    ):
+        (item,) = assessor.assess(SourceInventory(tables=[_pg_key(type_)])).items
+        (concern,) = [c for c in item.concerns if c.rule_id == "AUTO_INCREMENT"]
+        assert says in concern.risk, type_
+        if loss:
+            assert concern.note_kind is ConversionNoteKind.LOSS, type_
+            assert item.classification.value == "MANUAL", type_
+            assert "NARROWED from" in concern.risk
+        else:
+            assert concern.note_kind is ConversionNoteKind.RECOMMENDATION, type_
+            assert "NARROWED" not in concern.risk

@@ -410,9 +410,13 @@ def generate_previews(
             if preview is None:
                 continue
             stored = stored_ddl_of(preview.object_name) if stored_ddl_of is not None else None
-            if stored and node_id.startswith(TABLE_PREFIX):
+            if (
+                stored
+                and node_id.startswith(TABLE_PREFIX)
+                and not is_name_collision_placeholder(preview.target_ddl)
+            ):
                 table = _find_table(inventory, preview.object_name)
-                notes = (
+                swap = (
                     stored_strategy_notes(
                         table, stored, source_type=source_type,
                         index_names=result.index_renames.get(table.name),
@@ -420,8 +424,12 @@ def generate_previews(
                     if table is not None
                     else None
                 )
-                if notes is not None:
-                    preview = replace(preview, warnings=notes)
+                if swap is not None:
+                    removed, added = swap
+                    preview = replace(
+                        preview,
+                        warnings=[w for w in preview.warnings if w not in removed] + added,
+                    )
             previews.append(preview)
     return previews
 
@@ -432,20 +440,25 @@ def stored_strategy_notes(
     *,
     source_type: SourceType = SourceType.MYSQL,
     index_names: "Optional[Mapping[str, str]]" = None,
-) -> "Optional[list[ConversionWarning]]":
-    """The notes of the primary-key strategy a stored per-table script encodes, when it is
-    not the table's default -- ``None`` otherwise.
+) -> "Optional[tuple[list[ConversionWarning], list[ConversionWarning]]]":
+    """``(the default strategy's own notes, the picked one's)`` when ``stored`` is the
+    script the primary-key picker made for a strategy other than the table's default --
+    ``None`` otherwise (nothing to swap).
 
     The picker stores only the script; the notes came from the whole-inventory default
     conversion, so after picking Server-generated for a ``bigint unsigned`` key the screen
     still said the key 'was kept as a plain integer' beside an identity DDL (and never the
     narrowing it costs), and after Keep source PK it still said the key keeps generating.
-    Cached by the table and script: the screen asks on every render."""
-    notes = _stored_strategy_notes(
+    Only the notes the two strategies' per-table conversions do NOT share are swapped, so
+    every other note -- an index rename, a foreign-key choice, a name collision -- stays as
+    the screen's own conversion has it. A script the picker did not produce (an edit, an
+    adopted AI suggestion, a pasted CREATE) keeps the default notes: its strategy is not
+    known. Cached by the table and script: the screen asks on every render."""
+    swap = _stored_strategy_notes(
         table.model_dump_json(), stored, source_type,
         tuple(sorted((index_names or {}).items())),
     )
-    return None if notes is None else list(notes)
+    return None if swap is None else (list(swap[0]), list(swap[1]))
 
 
 @functools.lru_cache(maxsize=1024)
@@ -454,26 +467,33 @@ def _stored_strategy_notes(
     stored: str,
     source_type: SourceType,
     index_names: "tuple[tuple[str, str], ...]",
-) -> "Optional[tuple[ConversionWarning, ...]]":
+) -> "Optional[tuple[tuple[ConversionWarning, ...], tuple[ConversionWarning, ...]]]":
     table = TableDef.model_validate_json(table_json)
     converter = SchemaConverter(source_type=source_type)
     names = dict(index_names) or None
+    picked = None
     leading = composite_leading_from_ddl(table, stored)
+    candidates = []
     if leading is not None:
-        conversion = build_composite_conversion(converter, table, leading, index_names=names)
-    elif table.auto_increment_column:
-        stored_identity = identity_from_ddl(table, stored)
-        default_identity = (
-            default_primary_key_strategy(table, is_postgres=source_type is SourceType.POSTGRES)
-            is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+        candidates.append(
+            lambda: build_composite_conversion(converter, table, leading, index_names=names)
         )
-        if stored_identity == default_identity:
-            return None
-        build = build_identity_conversion if stored_identity else build_keep_conversion
-        conversion = build(converter, table, index_names=names)
-    else:
+    if table.auto_increment_column:
+        candidates.append(lambda: build_identity_conversion(converter, table, index_names=names))
+        candidates.append(lambda: build_keep_conversion(converter, table, index_names=names))
+    for build in candidates:
+        conversion = build()
+        if render_target_ddl(conversion) == stored:
+            picked = conversion
+            break
+    if picked is None:
         return None
-    return tuple(conversion.warnings)
+    default = converter.convert_table(table, index_names=names)
+    removed = tuple(w for w in default.warnings if w not in picked.warnings)
+    added = tuple(w for w in picked.warnings if w not in default.warnings)
+    if not removed and not added:
+        return None
+    return removed, added
 
 
 # Object-leaf node id prefixes (a tick on one maps back to a source object).
