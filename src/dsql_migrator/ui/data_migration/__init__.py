@@ -1608,20 +1608,22 @@ def build_data_migration_screen(
                     )
                     return
                 ui.notify("Refreshing source/target objects...", type="info")
-                # Of the config being read, now: another source tested on Connect while
-                # the read runs must not lend its name to this inventory.
+                # Everything about the connections being read, taken once, now: another
+                # source or cluster tested on Connect while the reads run must not lend
+                # its name, engine or endpoint to these catalogs.
                 source_label = session_source_label(session)
+                source_config = session.source_config
+                source_engine = session_source_type(session)
+                target_config = session.target_config
                 try:
                     introspector = _default_introspector_factory(
                         session.source_password
                     )
                     new_inventory = await _run.io_bound(
-                        introspector.introspect, session.source_config
+                        introspector.introspect, source_config
                     )
                     browser = _default_target_browser_factory(session.aws_profile)
-                    new_target = await _run.io_bound(
-                        browser.browse, session.target_config
-                    )
+                    new_target = await _run.io_bound(browser.browse, target_config)
                 except Exception as exc:  # noqa: BLE001
                     ui.notify(f"Could not refresh objects: {exc}", type="negative")
                     return
@@ -1638,10 +1640,8 @@ def build_data_migration_screen(
                     target_inventory=new_target,
                     # Re-stamp with the cluster this catalog was just read from, or
                     # the pair stays flagged stale and the refresh fixes nothing.
-                    target_endpoint=getattr(
-                        session.target_config, "cluster_endpoint", None
-                    ),
-                    source_type=session_source_type(session),
+                    target_endpoint=getattr(target_config, "cluster_endpoint", None),
+                    source_type=source_engine,
                     vanished=list(getattr(introspector, "last_vanished", None) or []),
                     source_label=source_label,
                 )

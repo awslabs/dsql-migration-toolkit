@@ -362,13 +362,17 @@ def capture_session_snapshot(
         )
 
         label = getattr(result, "source_label", None)
-        if label and not same_source_address(
-            source_address(label), describe_source(source)
+        engine = getattr(getattr(result, "source_type", None), "value", None)
+        # Each kept on its own: an engine switch at the same host:port/database (a fixed
+        # local port-forward) restored the report under the connected engine's rules.
+        other_engine = bool(engine) and engine != snapshot.source_type
+        if label and (
+            other_engine
+            or not same_source_address(source_address(label), describe_source(source))
         ):
             snapshot.evaluation_source_label = label
-            engine = getattr(getattr(result, "source_type", None), "value", None)
-            if engine and engine != snapshot.source_type:
-                snapshot.evaluation_source_type = engine
+        if other_engine:
+            snapshot.evaluation_source_type = engine
     # Step 4 (Validation): persist the last completed report so a reconnect reopens
     # the result page (credential-free; mirrors the Evaluation result restore).
     if validation_state is not None:
@@ -1058,6 +1062,10 @@ def session_signature(
             # provenance (same catalog, different cluster read) must still persist, or
             # the restored session keeps reporting the pair as stale.
             result.target_endpoint,
+            # ... and so must a source refresh that only re-stamps which source (and
+            # engine) the report describes.
+            getattr(result, "source_label", None),
+            _mode_value(getattr(result, "source_type", None)),
         )
     generated = conv_state.generated_node_ids  # type: ignore[attr-defined]
     generated_sig = tuple(generated) if generated is not None else None
@@ -1069,6 +1077,15 @@ def session_signature(
     target_sig = (
         getattr(target, "cluster_endpoint", None),
         getattr(target, "region", None),
+    )
+    # The source coordinates the snapshot stores (and the evaluation_source_* fields are
+    # derived against): a source switch on Connect alone must persist too.
+    source = getattr(session, "source_config", None)  # type: ignore[attr-defined]
+    source_sig = (
+        _mode_value(getattr(source, "source_type", None)),
+        getattr(source, "host", None),
+        getattr(source, "port", None),
+        getattr(source, "database", None),
     )
     # Part of the dirty-check, or a newly-recorded secret reference / a just-accepted
     # quarantine gap would never be written and the restore would lose it again.
@@ -1082,6 +1099,7 @@ def session_signature(
     return (
         workflow_sig,
         eval_sig,
+        source_sig,
         generated_sig,
         migration_state.job_id,  # type: ignore[attr-defined]
         selection,

@@ -2409,6 +2409,27 @@ def source_visibility_items(gaps: "Sequence[str]") -> list[AssessmentItem]:
     return [item.model_copy(update={"concerns": _single_concern(item, ConversionNoteKind.LOSS)})]
 
 
+def source_visibility_not_checked_items() -> list[AssessmentItem]:
+    """The database-level item for a report refreshed from ANOTHER source than its run
+    read: that run's listing-privilege probe described its own source, and only an
+    Evaluation run probes this one."""
+    item = AssessmentItem(
+        object_name="source privileges",
+        rule_id=SOURCE_VISIBILITY_RULE_ID,
+        classification=Classification.MANUAL,
+        risk=(
+            "Whether the source user can list every object was not checked for this "
+            "source: the report was refreshed from a catalog read of another source than "
+            "the Evaluation run probed. Objects the user cannot list are not assessed, "
+            "converted or migrated."
+        ),
+        recommendation="Re-run Step 1 (Evaluation) to probe this source's privileges.",
+        effort=EffortLevel.SIMPLE,
+        kind=KIND_DATABASE.upper(),
+    )
+    return [item.model_copy(update={"concerns": _single_concern(item, ConversionNoteKind.LOSS)})]
+
+
 # Findings from the PostgreSQL catalog probe (core.catalog_postgres; graded in
 # core.assessor_postgres): row-level security on a table, a sequence no column owns, and the
 # probe itself failing.

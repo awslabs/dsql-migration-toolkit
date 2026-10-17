@@ -2333,39 +2333,47 @@ def test_a_second_run_is_refused_while_one_is_running() -> None:
     assert manager.wait(first, timeout=5.0)
 
 
-def test_a_restored_source_without_a_password_is_refused_before_any_job() -> None:
+def test_a_restored_source_without_a_password_is_refused_before_any_job(monkeypatch) -> None:
     """After a restart the source config is restored untested and without its password:
-    a run failed minutes in with a raw driver error instead of saying what to do."""
+    a run failed minutes in with a raw driver error instead of saying what to do. Said in
+    a toast (G79): a sticky set_error outlived the re-test over a kept report."""
+    import dsql_migrator.ui.evaluation as evaluation
 
     class _Never:
         def introspect(self, conn, *, progress=None):
             raise AssertionError("an untested connection must not be read")
 
+    toasts: list = []
+    monkeypatch.setattr(evaluation, "_notify_quietly", lambda _ui, message, **_k: toasts.append(message))
     tgt_factory, _ = _target_factory(_empty_target())
     runner, manager, state, session = _screen_runner(lambda _p: _Never(), tgt_factory)
     session.set_source_verified(False)  # what a restore leaves behind
     runner()
     assert state.job_id is None
-    assert state.error == (
+    assert state.error is None
+    assert toasts == [
         "The source connection has not been tested in this session. Test it on the "
         "Connect screen (after a restart, re-enter the source password), then run the "
         "evaluation."
-    )
+    ]
 
 
-def test_an_untested_target_alone_is_named_without_the_password_hint() -> None:
+def test_an_untested_target_alone_is_named_without_the_password_hint(monkeypatch) -> None:
+    import dsql_migrator.ui.evaluation as evaluation
     from dsql_migrator.ui.evaluation import untested_connections, untested_connections_text
 
+    toasts: list = []
+    monkeypatch.setattr(evaluation, "_notify_quietly", lambda _ui, message, **_k: toasts.append(message))
     tgt_factory, _ = _target_factory(_empty_target())
     runner, _manager, state, session = _screen_runner(lambda _p: None, tgt_factory)
     session.set_target_verified(False)
     assert untested_connections(session) == ["target"]
     runner()
     assert state.job_id is None
-    assert state.error == (
+    assert toasts == [
         "The target connection has not been tested in this session. Test it on the "
         "Connect screen, then run the evaluation."
-    )
+    ]
     session.set_source_verified(False)
     assert untested_connections_text(untested_connections(session)) == (
         "The source and target connections have not been tested in this session. Test "

@@ -2696,6 +2696,16 @@ def build_schema_conversion_screen(
                     return
                 source_conn = session.source_config
                 assert source_conn is not None
+                # The result this refresh replaces, taken BEFORE the read: an Evaluation
+                # (or a Start over) that lands while the catalog is read is newer, and the
+                # step-aside below has to cover the whole read, not just the re-grade.
+                old_result = eval_state.result
+                if old_result is None:
+                    ui.notify(  # type: ignore[attr-defined]
+                        "Run Step 1 (Evaluation) first to introspect the schema.",
+                        type="warning",
+                    )
+                    return
                 # Of the config being read, now: another source tested on Connect while
                 # the read runs must not lend its name to this inventory.
                 source_label = session_source_label(session)
@@ -2709,7 +2719,6 @@ def build_schema_conversion_screen(
                         f"Could not refresh source: {exc}", type="negative"
                     )
                     return
-                old_result = eval_state.result
                 if old_result is not None:
                     # The assessment and the name conflicts are recomputed from the re-read
                     # inventory -- graded by the engine it was just read with -- off the
@@ -2761,6 +2770,8 @@ def build_schema_conversion_screen(
                     return
                 target_conn = session.target_config
                 assert target_conn is not None
+                # Taken before the browse, so the step-aside covers the whole read.
+                old_result = eval_state.result
                 browser = _default_target_browser_factory(session.aws_profile)
                 try:
                     new_target = await _run.io_bound(browser.browse, target_conn)
@@ -2769,7 +2780,12 @@ def build_schema_conversion_screen(
                         f"Could not refresh target: {exc}", type="negative"
                     )
                     return
-                old_result = eval_state.result
+                # The target catalog just changed, so drop the cached applier (its browsed
+                # existence snapshot is now stale) -- the next apply rebuilds and re-browses.
+                _applier_cache.clear()
+                # None: applied (or nothing to apply); text: stepped aside, say so ('' after
+                # Start over, when there is nothing to speak of).
+                stepped_aside: Optional[str] = None
                 if old_result is not None:
                     refreshed = await _run.io_bound(
                         with_refreshed_catalogs,
@@ -2782,12 +2798,15 @@ def build_schema_conversion_screen(
                         target_endpoint=target_conn.cluster_endpoint,
                     )
                     # Never over a newer Evaluation that finished while this ran.
-                    set_result_if_unchanged(eval_state, old_result, refreshed)
-                # The target catalog just changed, so drop the cached applier (its browsed
-                # existence snapshot is now stale) -- the next apply rebuilds and re-browses.
-                _applier_cache.clear()
+                    if not set_result_if_unchanged(eval_state, old_result, refreshed):
+                        from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
+
+                        stepped_aside = refresh_stepped_aside_text(eval_state) or ""
                 if announce:
-                    ui.notify("Target browser refreshed.", type="positive")  # type: ignore[attr-defined]
+                    if stepped_aside is None:
+                        ui.notify("Target browser refreshed.", type="positive")  # type: ignore[attr-defined]
+                    elif stepped_aside:
+                        ui.notify(stepped_aside, type="warning")  # type: ignore[attr-defined]
                     refresh()
 
             # Shared AI chat drawer (same component/look as the Evaluation

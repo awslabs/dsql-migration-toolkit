@@ -118,3 +118,115 @@ def test_a_restored_report_of_another_engine_keeps_its_engine() -> None:
         SessionConnectionState(), restored, SchemaConversionState(), DataMigrationState(),
     )
     assert restored.result.source_type is SourceType.MYSQL
+
+
+# --- G81: the review of G68-G78 (evaluation state) --------------------------------------
+
+
+def _mysql_result(label: str = "MySQL 8.0.39 at mysql-a.example:3306/shop") -> EvaluationResult:
+    return EvaluationResult(
+        inventory=SourceInventory(tables=[]),
+        assessment=AssessmentReport.from_items([]),
+        target_inventory=TargetInventory(schemas=[]),
+        target_conflicts=[],
+        source_type=SourceType.MYSQL,
+        source_label=label,
+    )
+
+
+def test_a_mysql_refresh_onto_another_source_says_its_privileges_were_not_checked() -> None:
+    """A's listing probe was rightly not carried onto B, but nothing said B's was never run:
+    the report read 100/Ready."""
+    from dsql_migrator.core.assessor import SOURCE_VISIBILITY_RULE_ID
+
+    other = with_refreshed_catalogs(
+        _mysql_result(), inventory=SourceInventory(tables=[]),
+        target_inventory=TargetInventory(schemas=[]), target_endpoint=None,
+        source_label="MySQL 8.0.39 at mysql-b.example:3306/shop",
+    )
+    (item,) = [i for i in other.assessment.items if i.rule_id == SOURCE_VISIBILITY_RULE_ID]
+    assert "was not checked for this source" in item.risk
+    same = with_refreshed_catalogs(
+        _mysql_result(), inventory=SourceInventory(tables=[]),
+        target_inventory=TargetInventory(schemas=[]), target_endpoint=None,
+        source_label="MySQL 8.0.39 at mysql-a.example:3306/shop",
+    )
+    assert SOURCE_VISIBILITY_RULE_ID not in {i.rule_id for i in same.assessment.items}
+
+
+def test_an_ipv6_source_is_bracketed_and_an_unreadable_address_is_never_the_same() -> None:
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.ui.evaluation import describe_source, same_source_address, source_address
+
+    a = describe_source(SourceConnectionConfig(
+        source_type=SourceType.POSTGRES, host="fd00::a", port=5432, database="sales"
+    ), "PostgreSQL")
+    b = describe_source(SourceConnectionConfig(
+        source_type=SourceType.POSTGRES, host="fd00::b", port=5432, database="billing"
+    ), "PostgreSQL")
+    assert a == "PostgreSQL at [fd00::a]:5432/sales"
+    assert source_address(a) == "[fd00::a]:5432/sales"
+    assert not same_source_address(source_address(a), source_address(b))
+    assert same_source_address(source_address(a), source_address(a))
+    assert not same_source_address("fd00::a:5432/sales", "fd00::b:5432/billing")
+
+
+def test_an_engine_switch_at_the_same_address_keeps_the_assessed_engine() -> None:
+    """A fixed local port-forward re-pointed from MySQL to PostgreSQL: the snapshot kept
+    neither label nor engine, and the MySQL report was restored under PostgreSQL rules."""
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import (
+        apply_session_snapshot,
+        capture_session_snapshot,
+    )
+
+    session = SessionConnectionState()
+    session.set_source(
+        SourceConnectionConfig(source_type=SourceType.POSTGRES, host="127.0.0.1", port=15000,
+                               database="app"),
+        None,
+    )
+    eval_state = EvaluationState()
+    eval_state.set_result(_mysql_result("MySQL 8.0.39 at 127.0.0.1:15000/app"))
+    snapshot = capture_session_snapshot(
+        "s1", session, eval_state, SchemaConversionState(), DataMigrationState()
+    )
+    assert snapshot.evaluation_source_type == "mysql"
+    assert snapshot.evaluation_source_label == "MySQL 8.0.39 at 127.0.0.1:15000/app"
+    restored = EvaluationState()
+    apply_session_snapshot(
+        SessionSnapshot.model_validate_json(snapshot.model_dump_json()),
+        SessionConnectionState(), restored, SchemaConversionState(), DataMigrationState(),
+    )
+    assert restored.result.source_type is SourceType.MYSQL
+
+
+def test_a_re_stamp_or_a_source_switch_changes_the_snapshot_signature() -> None:
+    """A refresh that only re-stamped the label, and a Connect source switch, left the
+    signature unchanged, so neither was saved and a restart restored the old label."""
+    from dataclasses import replace
+
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import session_signature
+
+    session = SessionConnectionState()
+    eval_state = EvaluationState()
+    eval_state.set_result(_mysql_result())
+    conv, migration = SchemaConversionState(), DataMigrationState()
+    before = session_signature(session, eval_state, conv, migration)
+    eval_state.set_result(replace(eval_state.result, source_label="MySQL 8.0.39 at b.example:3306/shop"))
+    restamped = session_signature(session, eval_state, conv, migration)
+    assert restamped != before
+    session.set_source(
+        SourceConnectionConfig(source_type=SourceType.MYSQL, host="b.example", port=3306,
+                               database="shop"),
+        None,
+    )
+    assert session_signature(session, eval_state, conv, migration) != restamped

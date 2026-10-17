@@ -359,6 +359,15 @@ def with_refreshed_catalogs(
     )
     if engine is result.source_type and same_source:
         assessment = carry_probe_results(result.assessment, assessment)
+    elif engine is not SourceType.POSTGRES:
+        # The listing-privilege probe ran for the source the report was made from, not
+        # this one: say so, as the PostgreSQL path does for its catalog probe below,
+        # rather than let the report read 'Ready' over objects nobody checked are listed.
+        from dsql_migrator.core.assessor import source_visibility_not_checked_items
+
+        assessment = AssessmentReport.from_items(
+            [*assessment.items, *source_visibility_not_checked_items()]
+        )
     from dsql_migrator.core.assessor import CATALOG_CHANGED_RULE_ID, catalog_changed_items
 
     if vanished is not None:
@@ -1125,7 +1134,7 @@ def set_result_if_unchanged(
 # The address of a describe_source() label -- its host, and its database when there is one:
 # the leftmost " at " (or the start) followed by a whole host[:port][/database].
 _SOURCE_ADDRESS_RE = re.compile(
-    r"(?:^| at )(?P<address>(?P<host>[^\s:/]+)(?::\d*)?(?:/(?P<database>.+))?)$"
+    r"(?:^| at )(?P<address>(?P<host>\[[^\]\s]+\]|[^\s:/\[]+)(?::\d*)?(?:/(?P<database>.+))?)$"
 )
 
 
@@ -1151,6 +1160,8 @@ def describe_source(
     host = (getattr(config, "host", None) or "").strip()
     if not host:
         return None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # an IPv6 literal, bracketed so its port stays readable
     database = (getattr(config, "database", None) or "").strip()
     port = getattr(config, "port", None)
     address = host + (f":{port}" if port else "") + (f"/{database}" if database else "")
@@ -1174,7 +1185,7 @@ def same_source_address(a: Optional[str], b: Optional[str]) -> bool:
         return a == b
     first, second = _SOURCE_ADDRESS_RE.search(a), _SOURCE_ADDRESS_RE.search(b)
     if first is None or second is None:
-        return a == b
+        return False  # an address that cannot be read is never taken for the same one
 
     def key(match: "re.Match[str]") -> tuple[str, str]:
         host = match.group("host")
@@ -1308,10 +1319,10 @@ def _eval_job_running(job_manager: JobManager, job_id: Optional[str]) -> bool:
         return False
 
 
-def _notify_quietly(ui: object, message: str) -> None:
-    """``ui.notify`` an info message when a client context exists (a no-op otherwise)."""
+def _notify_quietly(ui: object, message: str, *, kind: str = "info") -> None:
+    """``ui.notify`` a message when a client context exists (a no-op otherwise)."""
     try:
-        ui.notify(message, type="info")  # type: ignore[attr-defined]
+        ui.notify(message, type=kind)  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 - no client context (a test, a background call)
         pass
 
@@ -1737,7 +1748,10 @@ def build_evaluation_screen(
             return
         untested = untested_connections(session)
         if untested:
-            eval_state.set_error(untested_connections_text(untested))
+            # A toast, not set_error: the screen already says so above a disabled Run, and
+            # a sticky red 'Evaluation failed' over a kept report (a stale Re-run in
+            # another tab) outlived the re-test.
+            _notify_quietly(ui, untested_connections_text(untested), kind="warning")
             return
 
         source_config = session.source_config
@@ -2148,6 +2162,9 @@ def build_evaluation_screen(
                         None,
                     ),
                     live_source=describe_source(getattr(session, "source_config", None)),
+                    live_engine=getattr(
+                        getattr(session, "source_config", None), "source_type", None
+                    ),
                 )
 
     return content, runner
@@ -2241,6 +2258,7 @@ def _render_result(
     open_ai_scope: Optional[Callable[..., object]] = None,
     live_target_endpoint: Optional[str] = None,
     live_source: Optional[str] = None,
+    live_engine: "Optional[SourceType]" = None,
 ) -> None:
     """Render the result as distinct, readable sections (one card per group).
 
@@ -2289,13 +2307,26 @@ def _render_result(
     # The SOURCE can change too (the Connect step accepts another host or database at any
     # time), and then every finding describes a database the migration will not read.
     assessed = source_address(result.source_label)
-    if assessed and live_source and not same_source_address(assessed, live_source):
+    # ... or the engine, at the same address (a fixed local port-forward re-pointed).
+    other_engine = (
+        live_engine is not None
+        and result.source_type is not None
+        and live_engine is not result.source_type
+    )
+    if (assessed and live_source and not same_source_address(assessed, live_source)) or (
+        other_engine
+    ):
+        def _said(address: Optional[str], engine: object) -> str:
+            word = source_engine_word(engine)
+            return f"{word} at {address}" if address else word
+
         render_notice(
             ui,
             tone="warning",
             header="This report describes another source",
             body=(
-                f"Evaluation read {assessed}; the connected source is now {live_source}. "
+                f"Evaluation read {_said(assessed, result.source_type)}; the connected "
+                f"source is now {_said(live_source, live_engine or result.source_type)}. "
                 "Re-run Evaluation before converting, so the report, the conversion and the "
                 "migration describe the same database."
             ),
