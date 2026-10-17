@@ -338,7 +338,11 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
 - **뷰** — MySQL 뷰는 PostgreSQL `CREATE VIEW`로 변환합니다. 파싱할 수 없는 정의는 조용히 버리지 않고,
   수동 작업 플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다. 변환기가 번역하지 않는 함수
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, 사용자 함수)를 호출하는 뷰는 두 단계 모두에서 MANUAL로 표시됩니다
-  (`VIEW_NOT_CONVERTED`): 그 함수가 Aurora DSQL에 없으면 `CREATE VIEW`가 실패합니다. **PostgreSQL** 뷰의 정의
+  (`VIEW_NOT_CONVERTED`): 그 함수가 Aurora DSQL에 없으면 `CREATE VIEW`가 실패합니다. 충실한 PostgreSQL 형태가 있는
+  MySQL 호출은 그것으로 다시 씁니다(`YEAR()`/`HOUR()`/`DAYOFWEEK()`는 `EXTRACT`로, `DATEDIFF`, `CURTIME()`은 `LOCALTIME`으로,
+  `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로, `CAST(x AS CHAR)`는 text로, `GROUP_CONCAT`은 text 위의 집계로,
+  `FROM_UNIXTIME(x, fmt)`는 `TO_CHAR`로). 나머지(`WEEK`, `SUBSTRING_INDEX`, `SHA2` 등)는 같은 방식으로 표시되며,
+  Aurora DSQL 표기가 없는 `DATE_FORMAT`/`STR_TO_DATE` 형식 토큰(`%p`, `%D` 등)도 표시됩니다: 뷰는 만들어지지만 다른 텍스트를 반환합니다. **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
   같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
   `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum

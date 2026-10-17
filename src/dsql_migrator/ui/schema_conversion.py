@@ -835,6 +835,23 @@ def render_source_table_ddl(
         # the one detail that silently changes query results after cut-over.
         if column.collation:
             clause += f" COLLATE {column.collation}"
+        # A generated column shows MySQL's own expression (GENERATION_EXPRESSION) and its
+        # kind, right after the type as MySQL's grammar has it (NOT NULL follows); an
+        # inventory read before that was captured only says so -- emitting invented
+        # syntax would make the source DDL lie.
+        if column.generated:
+            expression = getattr(column, "mysql_generated_expression", None)
+            clause += (
+                f" GENERATED ALWAYS AS ({expression}) {column.generated_kind or 'STORED'}"
+                + (
+                    " /* non-ASCII expression: information_schema may report it garbled "
+                    "-- check SHOW CREATE TABLE */"
+                    if not expression.isascii()
+                    else ""
+                )
+                if expression
+                else "  /* GENERATED column - expression not captured */"
+            )
         if not column.nullable:
             clause += " NOT NULL"
         if column.default is not None:
@@ -850,16 +867,6 @@ def render_source_table_ddl(
             )
         if table.auto_increment_column and column.name == table.auto_increment_column:
             clause += " AUTO_INCREMENT"
-        # A generated column shows MySQL's own expression (GENERATION_EXPRESSION) and its
-        # kind; an inventory read before that was captured only says so -- emitting
-        # invented syntax would make the source DDL lie.
-        if column.generated:
-            expression = getattr(column, "mysql_generated_expression", None)
-            clause += (
-                f" GENERATED ALWAYS AS ({expression}) {column.generated_kind or 'STORED'}"
-                if expression
-                else "  /* GENERATED column - expression not captured */"
-            )
         clauses.append(clause)
 
     if table.primary_key:

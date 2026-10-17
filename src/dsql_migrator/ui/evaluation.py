@@ -793,9 +793,9 @@ def filter_assessment_items(
     ``AUTO`` objects carry no effort, selecting a specific effort naturally
     excludes them. ``name`` keeps the objects whose name contains it, ignoring case and
     surrounding spaces -- the rule Schema Conversion's "Filter objects by name" box
-    applies to its tree -- or that carry a finding whose rule id contains it (BYTEA_KEY,
-    collation): one fix often applies across many tables. Order is preserved, so callers
-    can sort first and filter after.
+    applies to its tree -- or that carry a finding whose rule id is it, holds it with its
+    underscores, or has it as a word (BYTEA_KEY, bytea, collation): one fix often applies
+    across many tables. Order is preserved, so callers can sort first and filter after.
     """
     from dsql_migrator.core.models import Classification, EffortLevel
 
@@ -811,15 +811,23 @@ def filter_assessment_items(
     }.get(effort)
     needle = (name or "").strip().lower()
 
+    def _rule_matches(rule_id: Optional[str]) -> bool:
+        # A rule id is searched as one: whole (or a part with '_'), or one of its words --
+        # 'bytea' finds BYTEA_KEY -- never a fragment, so a name search such as 'comp' does
+        # not list every object of the synthetic COMPATIBLE id (no finding at all).
+        rule = (rule_id or "").lower()
+        if not rule or rule == "compatible":
+            return False
+        return needle in rule if "_" in needle else needle in rule.split("_")
+
     def _keep(item) -> bool:
         if class_target is not None and item.classification != class_target:
             return False
         if effort_target is not None and item.effort != effort_target:
             return False
         if needle and needle not in item.object_name.lower() and not any(
-            needle in (concern.rule_id or "").lower()
-            for concern in (item.concerns or ())
-        ) and needle not in (item.rule_id or "").lower():
+            _rule_matches(concern.rule_id) for concern in (item.concerns or ())
+        ) and not _rule_matches(item.rule_id):
             return False
         return True
 

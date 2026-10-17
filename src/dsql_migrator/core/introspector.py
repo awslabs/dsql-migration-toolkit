@@ -885,7 +885,14 @@ def enrich_columns(
                 )
                 expression = expression_by_column.get((table.name, column.name))
                 if expression:
-                    column.mysql_generated_expression = expression
+                    from dsql_migrator.core.converter import _mysql_print_unescape
+
+                    # MySQL 8 prints it through String::print, one escape layer deep
+                    # (_utf8mb4\'$.email\'), as it does an expression DEFAULT: undone,
+                    # as SHOW CREATE TABLE writes it (text not print-escaped is kept).
+                    column.mysql_generated_expression = (
+                        _mysql_print_unescape(expression) or expression
+                    )
             if "on update" in extra_text:
                 column.auto_update_timestamp = True
             # MySQL flags an EXPRESSION default (as opposed to a literal) with

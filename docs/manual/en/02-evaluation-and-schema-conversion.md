@@ -435,7 +435,12 @@ MySQL→PostgreSQL transpile:
   can't be parsed becomes a clearly-marked placeholder flagged for manual work rather than
   silently dropped, and a view calling a function the transpiler does not translate
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, a user function) is flagged MANUAL at both steps
-  (`VIEW_NOT_CONVERTED`): its `CREATE VIEW` fails unless the function exists on Aurora DSQL. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  (`VIEW_NOT_CONVERTED`): its `CREATE VIEW` fails unless the function exists on Aurora DSQL. MySQL calls with a
+  faithful PostgreSQL form are rewritten to it (`YEAR()`/`HOUR()`/`DAYOFWEEK()` as `EXTRACT`, `DATEDIFF`,
+  `CURTIME()` as `LOCALTIME`, `STDDEV`/`VARIANCE` as the population forms MySQL computes, `CAST(x AS CHAR)` as
+  text, `GROUP_CONCAT` over text, `FROM_UNIXTIME(x, fmt)` as `TO_CHAR`); others (`WEEK`, `SUBSTRING_INDEX`,
+  `SHA2`, ...) are flagged the same way, and a `DATE_FORMAT`/`STR_TO_DATE` format token with no Aurora DSQL
+  spelling (`%p`, `%D`, ...) is flagged too: the view would be created but return different text. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column
