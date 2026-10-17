@@ -57,7 +57,11 @@ from dsql_migrator.ui.data_migration import (
     full_load_run_guard_reason,
     prereq_mode_for_type,
 )
-from dsql_migrator.ui.evaluation import EvaluationStore, build_evaluation_screen
+from dsql_migrator.ui.evaluation import (
+    EvaluationStore,
+    build_evaluation_screen,
+    evaluation_run_guard_reason,
+)
 from dsql_migrator.ui.schema_conversion import (
     SchemaConversionStore,
     build_schema_conversion_screen,
@@ -1390,6 +1394,11 @@ def build_page(
             WorkflowStep.CUT_OVER: cutover_runner,
         },
         run_guards={
+            # After a restart only the shell's Re-run is shown, and it ran over untested
+            # connections into a red 'Evaluation failed' that stayed after they passed.
+            WorkflowStep.EVALUATION: lambda: evaluation_run_guard_reason(
+                SESSION_STORE.get_or_create(session_id)
+            ),
             WorkflowStep.SCHEMA_CONVERSION: schema_run_guard,
             WorkflowStep.FULL_LOAD: data_migration_run_guard,
             WorkflowStep.VALIDATION: validation_run_guard,

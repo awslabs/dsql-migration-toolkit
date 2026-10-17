@@ -2671,6 +2671,9 @@ def build_schema_conversion_screen(
                     return
                 source_conn = session.source_config
                 assert source_conn is not None
+                # Of the config being read, now: another source tested on Connect while
+                # the read runs must not lend its name to this inventory.
+                source_label = session_source_label(session)
                 introspector = _default_introspector_factory(session.source_password)
                 try:
                     new_inventory = await _run.io_bound(
@@ -2694,16 +2697,16 @@ def build_schema_conversion_screen(
                         target_endpoint=old_result.target_endpoint,
                         source_type=source_conn.source_type,
                         vanished=list(getattr(introspector, "last_vanished", None) or []),
-                        source_label=session_source_label(session),
+                        source_label=source_label,
                     )
                     # Applied only over the result it was computed from: an Evaluation that
                     # finished while this ran is newer, and must not be overwritten.
                     if not set_result_if_unchanged(eval_state, old_result, refreshed):
-                        ui.notify(  # type: ignore[attr-defined]
-                            "A newer evaluation finished meanwhile; the refresh was not "
-                            "applied over it.",
-                            type="warning",
-                        )
+                        from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
+
+                        stepped_aside = refresh_stepped_aside_text(eval_state)
+                        if stepped_aside:
+                            ui.notify(stepped_aside, type="warning")  # type: ignore[attr-defined]
                         refresh()
                         return
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]

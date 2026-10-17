@@ -408,12 +408,14 @@ def _qualified_default_calls(default: str, functions: "Sequence[tuple[str, str]]
 
 def _enrich_name(name: str, schema: Optional[str]) -> "tuple[str, str]":
     """``(schema, relation)`` of a table name as enrichment sees it. Inside a schema read
-    the name is the BARE relation name, which may itself contain a dot ("orders.v2"):
+    the name is the BARE relation name (enrich runs before the names are qualified), which
+    may itself contain a dot ("orders.v2"):
     splitting it at its last dot looked up a relation "v2" in schema "orders", so the table
     silently kept its reflected types (timestamptz read as TIMESTAMP, its identity lost)."""
     if schema:
-        prefix = f"{schema}."
-        return schema, (name[len(prefix):] if name.startswith(prefix) else name)
+        # As read, prefix and all: a relation literally named "public.orders" (pandas
+        # to_sql makes one) is not schema public's "orders".
+        return schema, name
     head, _, tail = name.rpartition(".")
     return head, tail
 

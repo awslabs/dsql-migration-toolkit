@@ -2944,7 +2944,10 @@ def test_both_source_refreshes_restamp_the_connected_source() -> None:
     from dsql_migrator.ui import data_migration, schema_conversion
 
     for module in (schema_conversion, data_migration):
-        assert "source_label=session_source_label(session)" in inspect.getsource(module)
+        text = inspect.getsource(module)
+        # Taken before the catalog read, from the config being read, and passed on.
+        assert "source_label = session_source_label(session)" in text
+        assert "source_label=source_label" in text
 
 
 def test_the_connected_source_label_carries_the_engine_a_run_stamps() -> None:

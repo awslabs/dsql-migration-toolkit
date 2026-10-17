@@ -1240,5 +1240,6 @@ def test_a_table_name_with_a_dot_is_enriched_under_its_own_name() -> None:
     from dsql_migrator.core.source_dialect.postgres import _enrich_name
 
     assert _enrich_name("orders.v2", "app") == ("app", "orders.v2")
-    assert _enrich_name("app.orders.v2", "app") == ("app", "orders.v2")
+    # Bare as read, prefix and all: a relation literally named "public.orders" in public.
+    assert _enrich_name("public.orders", "public") == ("public", "public.orders")
     assert _enrich_name("app.orders", None) == ("app", "orders")

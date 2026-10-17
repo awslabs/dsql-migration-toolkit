@@ -1608,6 +1608,9 @@ def build_data_migration_screen(
                     )
                     return
                 ui.notify("Refreshing source/target objects...", type="info")
+                # Of the config being read, now: another source tested on Connect while
+                # the read runs must not lend its name to this inventory.
+                source_label = session_source_label(session)
                 try:
                     introspector = _default_introspector_factory(
                         session.source_password
@@ -1640,17 +1643,17 @@ def build_data_migration_screen(
                     ),
                     source_type=session_source_type(session),
                     vanished=list(getattr(introspector, "last_vanished", None) or []),
-                    source_label=session_source_label(session),
+                    source_label=source_label,
                 )
                 from dsql_migrator.ui.evaluation import set_result_if_unchanged
 
                 # Never over a newer Evaluation that finished while the catalogs were read.
                 if not set_result_if_unchanged(eval_state, current, refreshed):
-                    ui.notify(
-                        "A newer evaluation finished meanwhile; the refresh was not "
-                        "applied over it.",
-                        type="warning",
-                    )
+                    from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
+
+                    stepped_aside = refresh_stepped_aside_text(eval_state)
+                    if stepped_aside:
+                        ui.notify(stepped_aside, type="warning")
                     refresh()
                     return
                 ui.notify("Object browser refreshed.", type="positive")

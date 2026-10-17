@@ -277,6 +277,12 @@ class SessionSnapshot(BaseModel):
     evaluation_source_label: Optional[str] = Field(
         default=None, exclude_if=lambda v: not v
     )
+    # ... and its ENGINE when that is not the connected one's (``source_type`` above): a
+    # MySQL report restored under a PostgreSQL connection was re-graded by PostgreSQL
+    # rules under its MySQL label. Left OUT of the payload otherwise, like the label.
+    evaluation_source_type: Optional[str] = Field(
+        default=None, exclude_if=lambda v: not v
+    )
     # AI Assist preference (non-secret: a toggle + Bedrock model id/region, never a
     # credential). Persisted so a reconnecting session keeps the user's choice
     # instead of resetting the toggle to off on every restart. Optional/defaulted

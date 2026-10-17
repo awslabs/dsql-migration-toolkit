@@ -366,6 +366,9 @@ def capture_session_snapshot(
             source_address(label), describe_source(source)
         ):
             snapshot.evaluation_source_label = label
+            engine = getattr(getattr(result, "source_type", None), "value", None)
+            if engine and engine != snapshot.source_type:
+                snapshot.evaluation_source_type = engine
     # Step 4 (Validation): persist the last completed report so a reconnect reopens
     # the result page (credential-free; mirrors the Evaluation result restore).
     if validation_state is not None:
@@ -629,8 +632,8 @@ def apply_session_snapshot(
         # otherwise silently fall back to MySQL.
         try:
             restored_source_type = (
-                SourceType(snapshot.source_type)
-                if snapshot.source_type
+                SourceType(snapshot.evaluation_source_type or snapshot.source_type)
+                if (snapshot.evaluation_source_type or snapshot.source_type)
                 else SourceType.MYSQL
             )
         except ValueError:

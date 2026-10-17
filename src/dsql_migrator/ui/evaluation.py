@@ -351,8 +351,13 @@ def with_refreshed_catalogs(
     # What the run's own probes of the source found -- the privilege gap, and for
     # PostgreSQL row-level security and standalone sequences -- is not in the inventory, so
     # a re-assessment carries it over (re-run Step 1 to probe again). Not across an engine
-    # switch: those findings describe the other engine's source.
-    if engine is result.source_type:
+    # switch, nor onto a fresh read of ANOTHER source: those findings describe the source
+    # that was probed, and carried under the new source's name (now re-stamped) they read
+    # 'no row-level security' for a database nobody checked.
+    same_source = source_label is None or same_source_address(
+        source_address(result.source_label), source_address(source_label)
+    )
+    if engine is result.source_type and same_source:
         assessment = carry_probe_results(result.assessment, assessment)
     from dsql_migrator.core.assessor import CATALOG_CHANGED_RULE_ID, catalog_changed_items
 
@@ -1124,6 +1129,20 @@ _SOURCE_ADDRESS_RE = re.compile(
 )
 
 
+def refresh_stepped_aside_text(eval_state: "EvaluationState") -> Optional[str]:
+    """What to tell the operator when a refresh was not applied (``set_result_if_unchanged``
+    stepped aside), or ``None`` to say nothing: after Start over there is no result to
+    speak of, and 'a newer evaluation finished' was wrong whenever another refresh, or
+    another tab, had replaced the result instead."""
+    if eval_state.result is None:
+        return None
+    return (
+        "The Evaluation result changed while this refresh read the catalogs (a re-run, "
+        "another refresh, or another tab), so it was not applied over it. Refresh again "
+        "to read the current catalogs."
+    )
+
+
 def describe_source(
     config: "Optional[SourceConnectionConfig]", engine: Optional[str] = None
 ) -> Optional[str]:
@@ -1588,6 +1607,13 @@ def untested_connections(session: Any) -> list[str]:
         )
         if configured and verified is False
     ]
+
+
+def evaluation_run_guard_reason(session: Any) -> Optional[str]:
+    """Why the shell's Run / Re-run evaluation is disabled, or ``None``: a connection not
+    tested this session (the on-screen Run button is gated the same way)."""
+    untested = untested_connections(session)
+    return untested_connections_text(untested) if untested else None
 
 
 def untested_connections_text(untested: list[str]) -> str:
