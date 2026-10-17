@@ -336,7 +336,9 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
 - **트랜잭션당 한 개 DDL** — 변환은 각 DDL을 자체 실행 단위로 내보내며(DSQL은 트랜잭션당 한 개 DDL),
   적용 경로는 낙관적 동시성 충돌(`40001`)을 재시도(다시 적용해도 중복이 안 생기므로 안전).
 - **뷰** — MySQL 뷰는 PostgreSQL `CREATE VIEW`로 변환합니다. 파싱할 수 없는 정의는 조용히 버리지 않고,
-  수동 작업 플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다. **PostgreSQL** 뷰의 정의
+  수동 작업 플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다. 변환기가 번역하지 않는 함수
+  (`FIND_IN_SET`, `UNIX_TIMESTAMP`, 사용자 함수)를 호출하는 뷰는 두 단계 모두에서 MANUAL로 표시됩니다
+  (`VIEW_NOT_CONVERTED`): 그 함수가 Aurora DSQL에 없으면 `CREATE VIEW`가 실패합니다. **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
   같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
   `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum

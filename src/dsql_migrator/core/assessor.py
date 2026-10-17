@@ -2093,6 +2093,42 @@ class ViewDefinitionUnreadableRule(Rule):
         return findings
 
 
+class MySqlViewConversionRule(Rule):
+    """Grade a MySQL view by what Schema Conversion does with it: a body it cannot convert
+    (the conversion leaves a placeholder), or one calling a function it leaves untranslated
+    (FIND_IN_SET, UNIX_TIMESTAMP, a user function) and that therefore fails its CREATE VIEW.
+    The converter's own notes, so the two steps agree -- Evaluation used to read such a
+    view AUTO beside Schema Conversion's MANUAL."""
+
+    rule_id = "VIEW_NOT_CONVERTED"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import SchemaConverter
+
+        converter = SchemaConverter(source_type=SourceType.MYSQL)
+        findings: list[Finding] = []
+        for view in inventory.views:
+            if getattr(view, "unsupported_kind", None) or not (view.definition or "").strip():
+                continue  # graded by VIEW_DEFINITION_UNREADABLE and the kind rules
+            converted = converter.convert_view(view)
+            for warning in converted.warnings:
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_VIEW, view.name),
+                        rule_id=self.rule_id,
+                        classification=warning.classification,
+                        risk=warning.message,
+                        recommendation=(
+                            "Rewrite the view's target DDL in Schema Conversion before "
+                            "applying, or re-create the view by hand after the load."
+                        ),
+                        effort=EffortLevel.MEDIUM,
+                        note_kind=warning.kind,
+                    )
+                )
+        return findings
+
+
 class ViewCompatibilityRule(Rule):
     """Flag views whose definition uses DSQL-unsupported/risky SQL constructs.
 
@@ -2124,6 +2160,13 @@ class ViewCompatibilityRule(Rule):
                 files=[SourceFile(path=view.name, content=definition)]
             )
             matches = self._linter.scan(source)  # type: ignore[attr-defined]
+            # A function call is judged by the conversion instead (VIEW_NOT_CONVERTED):
+            # GROUP_CONCAT, DATE_FORMAT, STR_TO_DATE and FROM_UNIXTIME are translated, and
+            # the name list missed every function that is not (FIND_IN_SET, a user one).
+            matches = [
+                match for match in matches
+                if getattr(getattr(match, "pattern", None), "value", None) != "UNSUPPORTED_FUNCTION"
+            ]
             if not matches:
                 continue
             # The linter already returns the matched TEXT, its line, and a per-match
@@ -2961,6 +3004,7 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         AutoUpdateTimestampRule(),
         UnsupportedIndexTypeRule(),
         ViewDefinitionUnreadableRule(),
+        MySqlViewConversionRule(),
         ViewCompatibilityRule(),
     ]
 

@@ -6908,38 +6908,71 @@ class SchemaConverter:
                 auto_converted=True,
                 warnings=_remodelled_reference_warnings(view, remodelling),
             )
-        try:
-            parsed = sqlglot.parse_one(definition, read=_MYSQL)
-            select = parsed.expression if isinstance(parsed, exp.Create) else parsed
-            if select is None:
-                raise ValueError("no SELECT body parsed from the view definition")
-            # The name is QUOTED, like every table and index name the converter emits:
-            # unquoted, Aurora DSQL folded it (``V_Orders`` became ``v_orders``, and a
-            # view in schema ``MyApp`` landed in a different schema, ``myapp``), so it
-            # could collide with a relation whose name differs only in case.
-            view_schema, view_name = _split_qualified(view.name)
-            create = exp.Create(
-                this=exp.Table(
-                    this=exp.to_identifier(view_name, quoted=True),
-                    db=(
-                        exp.to_identifier(view_schema, quoted=True)
-                        if view_schema
-                        else None
-                    ),
-                ),
-                kind="VIEW",
-                expression=select,
-            )
-            target_ddl = create.sql(dialect=_POSTGRES, pretty=True)
-        except Exception:  # noqa: BLE001 - any parse/generation failure -> manual
+        converted = _converted_mysql_view(view.name, definition)
+        if converted is None:
             return _manual_view_conversion(view.name, schema_ddls)
+        target_ddl, untranslated = converted
+        warnings = []
+        if untranslated:
+            calls = ", ".join(f"{name}()" for name in untranslated)
+            one = len(untranslated) == 1
+            warnings.append(
+                ConversionWarning(
+                    object_name=view.name,
+                    classification=Classification.MANUAL,
+                    kind=ConversionNoteKind.LOSS,
+                    message=(
+                        f"The view calls {calls}, which the conversion does not translate "
+                        "(a MySQL-only or user-defined function): the CREATE VIEW fails on "
+                        f"Aurora DSQL unless {'it exists' if one else 'they exist'} there. "
+                        f"Rewrite {'it' if one else 'them'} in the view's target DDL before "
+                        "applying."
+                    ),
+                )
+            )
         return ViewConversion(
             view=view.name,
             target_ddl=target_ddl,
             schema_ddls=schema_ddls,
             auto_converted=True,
-            warnings=[],
+            warnings=warnings,
         )
+
+
+@functools.lru_cache(maxsize=8192)
+def _converted_mysql_view(
+    name: str, definition: str
+) -> "Optional[tuple[str, tuple[str, ...]]]":
+    """``(target CREATE VIEW, functions left untranslated)`` for a MySQL view, or ``None``
+    when its body does not parse or render. Cached by name and body: Schema Conversion and
+    Evaluation (VIEW_NOT_CONVERTED) convert the same views."""
+    try:
+        parsed = sqlglot.parse_one(definition, read=_MYSQL)
+        select = parsed.expression if isinstance(parsed, exp.Create) else parsed
+        if select is None:
+            raise ValueError("no SELECT body parsed from the view definition")
+        # A call sqlglot does not know stays an Anonymous function and is emitted as
+        # written: a MySQL-only function (FIND_IN_SET, UNIX_TIMESTAMP) or a user one.
+        untranslated: list[str] = []
+        for node in select.find_all(exp.Anonymous):
+            if node.name and node.name.lower() not in {n.lower() for n in untranslated}:
+                untranslated.append(node.name)
+        # The name is QUOTED, like every table and index name the converter emits:
+        # unquoted, Aurora DSQL folded it (``V_Orders`` became ``v_orders``, and a
+        # view in schema ``MyApp`` landed in a different schema, ``myapp``), so it
+        # could collide with a relation whose name differs only in case.
+        view_schema, view_name = _split_qualified(name)
+        create = exp.Create(
+            this=exp.Table(
+                this=exp.to_identifier(view_name, quoted=True),
+                db=(exp.to_identifier(view_schema, quoted=True) if view_schema else None),
+            ),
+            kind="VIEW",
+            expression=select,
+        )
+        return create.sql(dialect=_POSTGRES, pretty=True), tuple(untranslated)
+    except Exception:  # noqa: BLE001 - any parse/generation failure -> manual
+        return None
 
 
 def pg_remodelled_columns(table: TableDef) -> "dict[str, tuple[str, str]]":

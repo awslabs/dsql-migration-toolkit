@@ -433,7 +433,9 @@ MySQL→PostgreSQL transpile:
   optimistic-concurrency conflicts (`40001`) idempotently.
 - **Views** — a MySQL view is transpiled to PostgreSQL `CREATE VIEW`; a definition that
   can't be parsed becomes a clearly-marked placeholder flagged for manual work rather than
-  silently dropped. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  silently dropped, and a view calling a function the transpiler does not translate
+  (`FIND_IN_SET`, `UNIX_TIMESTAMP`, a user function) is flagged MANUAL at both steps
+  (`VIEW_NOT_CONVERTED`): its `CREATE VIEW` fails unless the function exists on Aurora DSQL. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column

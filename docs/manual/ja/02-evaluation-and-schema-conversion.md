@@ -353,6 +353,8 @@ MySQL→PostgreSQL トランスパイルではありません。
   リトライします。
 - **ビュー** — MySQL のビューは PostgreSQL の `CREATE VIEW` にトランスパイルされます。パースできない定義は、
   黙って捨てられるのではなく、手作業のフラグが付いた明示的なプレースホルダーとして表示されます。
+  トランスパイラが変換しない関数(`FIND_IN_SET`、`UNIX_TIMESTAMP`、ユーザー関数)を呼ぶビューは、両方のステップで
+  MANUAL とされます(`VIEW_NOT_CONVERTED`): その関数が Aurora DSQL にない限り `CREATE VIEW` は失敗します。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

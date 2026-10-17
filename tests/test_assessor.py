@@ -655,6 +655,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "DEFAULT_DROPPED",
         "VIEW_UNSUPPORTED_SQL",
         "VIEW_DEFINITION_UNREADABLE",
+        "VIEW_NOT_CONVERTED",
         "GENERATED_COLUMN",
         "ON_UPDATE_TIMESTAMP",
         "UNSUPPORTED_INDEX_TYPE",
@@ -842,18 +843,28 @@ def test_enum_set_rule_classifies_table_manual() -> None:
 
 
 def test_view_rule_flags_unsupported_sql_manual() -> None:
+    """Graded by the conversion: a function it leaves untranslated fails the CREATE VIEW;
+    one it translates (GROUP_CONCAT -> string_agg) is no finding -- the old name list
+    flagged that and missed this."""
     inventory = SourceInventory(
         views=[
             ViewDef(
                 name="v_report",
+                definition="SELECT FIND_IN_SET('a', tags) AS hit FROM app.users",
+            ),
+            ViewDef(
+                name="v_names",
                 definition="SELECT GROUP_CONCAT(name) AS names FROM app.users",
-            )
+            ),
         ]
     )
-    item = _item_for(_assess(inventory), "v_report")
-    assert item.rule_id == "VIEW_UNSUPPORTED_SQL"
+    report = _assess(inventory)
+    item = _item_for(report, "v_report")
+    assert item.rule_id == "VIEW_NOT_CONVERTED"
     assert item.classification is Classification.MANUAL
     assert item.kind == "VIEW"
+    assert "FIND_IN_SET()" in item.risk
+    assert _item_for(report, "v_names").classification is Classification.AUTO
 
 
 def test_view_rule_leaves_clean_view_auto() -> None:
@@ -2060,15 +2071,19 @@ def test_the_view_finding_names_the_real_constructs_not_internal_tokens() -> Non
     )
     f = ViewCompatibilityRule().evaluate(inventory)[0]
     # The operator's OWN text, with a location.
-    assert "SLEEP (line 1)" in f.risk, f.risk
     assert "FOR UPDATE (line 1)" in f.risk, f.risk
+    # A function is judged by the conversion (VIEW_NOT_CONVERTED), not this name list.
+    assert "SLEEP" not in f.risk, f.risk
     # Internal enum tokens are gone.
     assert "PESSIMISTIC_LOCK" not in f.risk, f.risk
     assert "UNSUPPORTED_FUNCTION" not in f.risk, f.risk
     # The dead pointer is gone, replaced by the linter's own per-match advice.
     assert "anti-pattern report" not in f.recommendation, f.recommendation
     assert "optimistic concurrency" in f.recommendation.lower(), f.recommendation
-    assert "no direct Aurora DSQL" in f.recommendation, f.recommendation
+    from dsql_migrator.core.assessor import MySqlViewConversionRule
+
+    (call,) = MySqlViewConversionRule().evaluate(inventory)
+    assert "SLEEP()" in call.risk, call.risk
 
 
 def test_the_numeric_precision_rule_uses_dsqls_documented_maximum() -> None:

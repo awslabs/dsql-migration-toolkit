@@ -74,3 +74,23 @@ def test_a_mysql_generated_columns_expression_is_read_and_shown() -> None:
     older = [TableDef(name="orders", columns=[ColumnDef(name="total", mysql_type="INT")])]
     enrich_columns(_FakeConnection([("orders", "total", None, "STORED GENERATED", "int", None)]), "app", older)
     assert older[0].columns[0].generated and older[0].columns[0].generated_expression is None
+
+
+def test_a_mysql_view_is_graded_by_its_conversion_at_both_steps() -> None:
+    """An 8-name regex flagged GROUP_CONCAT (translated to string_agg) and missed
+    FIND_IN_SET (left as written, so the CREATE VIEW fails)."""
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.core.models import ViewDef
+
+    inventory = SourceInventory(views=[
+        ViewDef(name="shop.v_hits", definition="select find_in_set('a', `tags`) AS `hit` from `shop`.`t`"),
+        ViewDef(name="shop.v_names", definition="select group_concat(`name` separator ',') AS `n` from `shop`.`t`"),
+    ])
+    by_view = {v.view: v for v in SchemaConverter().convert(inventory).views}
+    (note,) = by_view["shop.v_hits"].warnings
+    assert "find_in_set()" in note.message and by_view["shop.v_hits"].auto_converted
+    assert by_view["shop.v_names"].warnings == []
+    items = {i.object_name: i for i in CompatibilityAssessor().assess(inventory).items}
+    assert items["shop.v_hits"].classification.value == "MANUAL"
+    assert items["shop.v_hits"].risk == note.message
+    assert items["shop.v_names"].classification.value == "AUTO"
