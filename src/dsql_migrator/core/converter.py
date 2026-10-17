@@ -515,6 +515,9 @@ def _scan_sql_names(text: str) -> _SqlNames:
     relations: list[tuple[Optional[str], str]] = []
     relation_at: list[int] = []  # where each relation is read
     spans: list[tuple[int, int]] = []  # the bracket levels, (open, close)
+    # Each bracket level's WITHs: (where, whether RECURSIVE follows), by the level's span.
+    level_withs: dict[tuple[int, int], list[tuple[int, bool]]] = {}
+    recursive_next = re.compile(r"\s+RECURSIVE\b", re.IGNORECASE)
     items: list[tuple[Optional[str], int, int]] = []
     frames: list[dict] = [_new_frame()]
 
@@ -544,11 +547,20 @@ def _scan_sql_names(text: str) -> _SqlNames:
             prev, frame["prev"] = frame["prev"], word
             item = frame["item"]
             if word is not None:
-                if word == "select" or (word == "with" and item is None and not frame["in_from"]):
+                # A WITH opens a query also as the first word of a derived table, where a
+                # relation is expected (``FROM (WITH x AS (...) SELECT ...)``): read as
+                # WITH ORDINALITY there, its CTE name was taken for a read of a relation.
+                if word == "select" or (
+                    word == "with" and item is None and (not frame["in_from"] or frame["expect"])
+                ):
                     close_item(frame, match.start())
                     frame.update(in_from=False, expect=False, query=True)
                     if word == "select":
                         frame["item"] = _SelectItem(start=match.end())
+                    else:
+                        frame.setdefault("withs", []).append(
+                            (match.start(), recursive_next.match(masked, match.end()) is not None)
+                        )
                     continue
                 if word == "from" and prev != "distinct" and frame["query"]:
                     close_item(frame, match.start())
@@ -615,6 +627,7 @@ def _scan_sql_names(text: str) -> _SqlNames:
                 close_item(frames[-1], match.start())
                 closed = frames.pop()
                 spans.append((closed["start"], match.end()))
+                level_withs.setdefault(spans[-1], []).extend(closed.get("withs", ()))
                 if closed["from_item"]:
                     frames[-1]["expect"] = False
                 if closed["distinct_on"] and frames[-1]["item"] is not None:
@@ -632,6 +645,7 @@ def _scan_sql_names(text: str) -> _SqlNames:
     for frame in frames:
         close_item(frame, len(masked))
         spans.append((frame["start"], len(masked)))
+        level_withs.setdefault(spans[-1], []).extend(frame.get("withs", ()))
     # A name a WITH defines (``name AS (``, with an optional column list or MATERIALIZED)
     # is read FROM like a relation, but it is the statement's own: bound to a same-named
     # view or table it made a false edge (a cycle) and a false re-typed read. It is the
@@ -650,8 +664,11 @@ def _scan_sql_names(text: str) -> _SqlNames:
             default=(0, len(masked)),
         )
         # Without RECURSIVE a CTE joins the namespace after its own body: its body and the
-        # CTEs before it read the real relation of that name.
-        recursive = re.search(r"\bWITH\s+RECURSIVE\b", masked[level[0]:at], re.IGNORECASE)
+        # CTEs before it read the real relation of that name. RECURSIVE is the WITH's that
+        # opens this CTE list -- the last one at this level before the name -- never a
+        # nested WITH RECURSIVE inside an earlier sibling's body.
+        withs = [rec for pos, rec in level_withs.get(level, ()) if pos < at]
+        recursive = bool(withs) and withs[-1]
         body_end = body_ends.get(m.end() - 1, at)
         ctes.setdefault(parts[-1], []).append(level if recursive else (body_end, level[1]))
     if ctes:

@@ -52,11 +52,14 @@ def test_a_non_recursive_cte_reads_the_real_table_in_its_own_body() -> None:
 def test_the_conversion_chat_adopts_only_ddl_for_its_object() -> None:
     """It used the Query Playground's SELECT-only extractor: a DDL reply had no button,
     and one with a verification SELECT stored that SELECT as the table's DDL."""
-    from dsql_migrator.ui.schema_conversion import extract_ddl_from_reply
+    from dsql_migrator.ui.schema_conversion import extract_ddl_from_reply, split_sql_statements
 
     ddl = 'CREATE TABLE "shop"."orders" ("id" BIGINT NOT NULL, PRIMARY KEY ("id"));\nCREATE INDEX ASYNC "ix" ON "shop"."orders" ("id");'
     reply = f"Here is the fix:\n```sql\n{ddl}\n```\nCheck it with:\n```sql\nSELECT count(*) FROM \"shop\".\"orders\";\n```"
-    assert extract_ddl_from_reply(reply, "shop.orders") == ddl
+    # G105: the object's own statements, one per paragraph (no longer the block verbatim:
+    # a SELECT or another object's CREATE in the same block is left out).
+    adopted = extract_ddl_from_reply(reply, "shop.orders")
+    assert split_sql_statements(adopted) == split_sql_statements(ddl)
     assert extract_ddl_from_reply(reply, "shop.items") is None
     assert extract_ddl_from_reply("```sql\nSELECT 1;\n```", "shop.orders") is None
 

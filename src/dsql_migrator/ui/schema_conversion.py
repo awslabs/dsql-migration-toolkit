@@ -78,6 +78,9 @@ from dsql_migrator.core.converter import (
     parse_target_primary_key,
     pg_view_ddl,
     rename_index_script,
+    rename_index_statements,
+    sql_without_comments,
+    terminated_sql_statement,
     validate_composite_leading_column,
     without_composite_placeholder,
 )
@@ -151,8 +154,10 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     StatementApplyResult,
     TargetDdlExecutor,
     TargetExistenceChecker,
+    _FOREIGN_KEY_ROLE,
     _INDEX_KIND,
     _SCHEMA_KIND,
+    _TABLE_KIND,
     _VIEW_KIND,
     _apply_should_replace,
     _apply_success_detail,
@@ -185,16 +190,22 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     composite_leading_from_ddl,
     default_applier_factory,
     default_composite_leading,
+    edited_statements,
     format_statement_summary,
     identity_from_ddl,
+    is_object_scaffolding,
     job_status_to_step_status,
     join_target_ddl_fk_sections,
+    merge_object_ddl,
+    object_create_kind,
+    object_statement_role,
     override_apply_objects,
     replace_confirmation_message,
     run_schema_apply,
     schema_apply_is_complete,
     split_sql_statements,
     split_target_ddl_fk_sections,
+    statement_label,
 )
 
 # Tree node id prefixes, so a selected node maps back to a source object.
@@ -1549,10 +1560,10 @@ def build_schema_conversion_screen(
     target :class:`SchemaApplier`; when it (or the target connection) is
     unavailable the runner surfaces a clear status instead of breaking. AI help
     is the per-object AI DBA chat (``open_ai_scope``): a per-warning icon and,
-    for a not-auto-converted object, a per-object icon open a conversion chat
-    whose "Use as target DDL" reply footer adopts a fix into the editable target
-    -> Apply (no separate approve/reject suggestion surface). Both returns plug
-    into :func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`.
+    for a not-auto-converted object, a per-object icon open a conversion chat; for an
+    object with an editable target its "Use as target DDL" reply footer merges a fix
+    into that target -> Apply (no separate approve/reject suggestion surface). Both
+    returns plug into :func:`~dsql_migrator.ui.workflow.build_workflow_sidebar`.
     """
     from nicegui import ui
 
@@ -2882,9 +2893,11 @@ def build_schema_conversion_screen(
                         source_engine=engine,
                     )
 
+                # An object no reply can become the target DDL of gets no footer button, so
+                # the chat is told -- its answer says what to do instead.
                 system = build_conversion_chat_system(
                     object_name, source_ddl, deterministic, source_engine=engine
-                )
+                ) + conversion_chat_note(object_name, deterministic)
 
                 def _conversion_streamer(messages, on_delta):
                     # With the shared read-only tools, the chat can look up the real
@@ -2912,38 +2925,33 @@ def build_schema_conversion_screen(
                         "Walk me through the DDL changes."
                     )
 
-                # "Use as target DDL" footer: closes the advisory loop chat-natively.
-                # When a reply contains a single fenced ```sql block, one click adopts
-                # it as THIS object's edited target DDL (validated against the small
-                # denylist first), so an AI fix flows into the editor -> Apply instead
-                # of hand-copying. The footer button IS the explicit human approval
-                # (Property 13); nothing is written to the target here -- Apply still does.
+                # "Use as target DDL" footer: closes the advisory loop chat-natively. One
+                # click merges the reply's statements for THIS object into its current
+                # target DDL (adopt_ddl_from_reply: denylist-checked, the rest of the script
+                # kept), so an AI fix flows into the editor -> Apply instead of
+                # hand-copying. Shown exactly when that yields a script -- the same check
+                # as the click -- so the button never refuses what it offered. It IS the
+                # explicit human approval (Property 13); nothing is written to the target
+                # here -- Apply still does.
+                def _adoption(md: str) -> DdlAdoption:
+                    return adopt_ddl_from_reply(
+                        md,
+                        object_name,
+                        deterministic,
+                        conv_state.get_edited_target_ddl(object_name),
+                        index_renames=get_conversion().index_renames.get(object_name),
+                    )
+
                 def _footer_visible(md: str) -> bool:
-                    return extract_ddl_from_reply(md, object_name) is not None
+                    return _adoption(md).script is not None
 
                 def _use_as_target_ddl(md: str) -> None:
-                    sql = extract_ddl_from_reply(md, object_name)
-                    if not sql:
+                    adoption = _adoption(md)
+                    if adoption.script is None:
+                        ui.notify(adoption.notice, type="warning")  # type: ignore[attr-defined]
                         return
-                    if is_name_collision_placeholder(deterministic):
-                        ui.notify(  # type: ignore[attr-defined]
-                            f"{object_name} cannot be fixed in its target DDL: its name "
-                            "shares its first 63 bytes with another table or view. "
-                            "Shorten the names on the source.",
-                            type="info",
-                        )
-                        return
-                    verdict = validate_suggested_sql(sql)
-                    if not verdict.is_safe:
-                        ui.notify(  # type: ignore[attr-defined]
-                            f"Can't adopt this SQL: {verdict.reason}", type="warning"
-                        )
-                        return
-                    conv_state.set_edited_target_ddl(object_name, sql)
-                    ui.notify(  # type: ignore[attr-defined]
-                        f"Set as {object_name}'s target DDL — review it and Apply.",
-                        type="positive",
-                    )
+                    conv_state.set_edited_target_ddl(object_name, adoption.script)
+                    ui.notify(adoption.notice, type="positive")  # type: ignore[attr-defined]
                     refresh()
 
                 open_ai_scope(
@@ -4416,8 +4424,9 @@ def _render_preview(
     remembered per object and used on apply, and the diff re-computes against the
     edit). Objects that are not auto-converted (views, triggers, routines) show
     their source + a read-only not-converted note, plus (for an AI candidate) the
-    per-object AI-chat icon so the user can convert it with AI DBA -- whose
-    "Use as target DDL" reply footer flows a fix into the editor -> Apply.
+    per-object AI-chat icon so the user can reimplement it with AI DBA -- with no
+    "Use as target DDL" footer: Schema Apply does not create such an object, so the
+    chat says to create it on the target by hand.
     """
     if preview.held_on_target is not None:
         render_notice(
@@ -4535,46 +4544,194 @@ _WARNING_BADGE_COLOR: dict[str, str] = {
 }
 
 
-_FENCED_SQL_RE = re.compile(r"```[ \t]*(?:sql|postgresql|postgres|pgsql)?[ \t]*\n(.*?)```", re.IGNORECASE | re.DOTALL)
-_CREATED_NAME_RE = re.compile(
-    r'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?'
-    r'((?:"(?:[^"]|"")+"|[\w$]+)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[\w$]+))?)',
-    re.IGNORECASE,
-)
+# The fence languages a target DDL is read from: SQL, or none. A ```mysql block is the
+# source shown for comparison; a ```text error or a ```diff never holds the DDL to adopt.
+_SQL_FENCE_LANGUAGES = frozenset({"", "sql", "postgresql", "postgres", "pgsql", "psql", "plpgsql"})
+
+
+def _reply_object_ddl(
+    markdown: str, object_name: str, kind: Optional[str] = None
+) -> "Optional[tuple[list[str], list[str]]]":
+    """``(the object's statements, labels of the rest)`` from the LAST sql block of an AI
+    reply that creates ``object_name`` (as ``kind`` -- TABLE / VIEW -- when given); ``None``
+    when no block does.
+
+    Fences are paired as the AI panel renders them, whatever their language, so the block
+    is the one the user sees; one tagged other than SQL is never read (a ```mysql 'before'
+    block, a ```text error message). Only the object's own statements are taken -- its
+    CREATE, and for a table its indexes and foreign keys -- never a verification SELECT or
+    another object's CREATE beside them. Its schema ensure and its own DROP are no reason to
+    refuse and go unmentioned: the tool writes the one itself, and an edit applies in
+    REPLACE mode, which drops the object."""
+    import textwrap
+
+    from dsql_migrator.ui.ai_chat_drawer import split_markdown_segments
+
+    blocks = [
+        # A fence in a list item is indented: stored as such, every line after the first
+        # kept the item's indent in the editor.
+        textwrap.dedent(body)
+        for segment, body, language in split_markdown_segments(markdown or "")
+        if segment == "code" and language.lower() in _SQL_FENCE_LANGUAGES
+    ]
+    for block in reversed(blocks):
+        statements = [
+            statement.strip()
+            for statement in split_sql_statements(block)
+            if sql_without_comments(statement).strip()
+        ]
+        roles = [object_statement_role(statement, object_name) for statement in statements]
+        created = [
+            role[0]
+            for role in roles
+            if role is not None and role[0] in (_TABLE_KIND, _VIEW_KIND) and kind in (None, role[0])
+        ]
+        if not created:
+            continue
+        own_kind = created[-1]
+        own: list[str] = []
+        others: list[str] = []
+        for statement, role in zip(statements, roles):
+            if role is not None and (
+                role[0] == own_kind
+                or (own_kind == _TABLE_KIND and role[0] in (_INDEX_KIND, _FOREIGN_KEY_ROLE))
+            ):
+                own.append(statement)
+            elif not is_object_scaffolding(statement, object_name):
+                others.append(statement_label(statement))
+        return own, list(dict.fromkeys(others))
+    return None
 
 
 def extract_ddl_from_reply(markdown: str, object_name: str) -> Optional[str]:
-    """The target DDL an AI reply proposes for ``object_name``, or ``None``: the LAST fenced
-    sql block that creates this very table or view (with its indexes and foreign keys) --
-    never a verification SELECT beside it, and never a block about another object. Pure."""
-    from dsql_migrator.ui.schema_conversion_apply import edited_statements
+    """The target DDL an AI reply proposes for ``object_name``, or ``None``: the object's
+    own statements from the last sql block that creates it (:func:`_reply_object_ddl`),
+    one per paragraph. Pure."""
+    found = _reply_object_ddl(markdown, object_name)
+    if found is None:
+        return None
+    return "\n\n".join(terminated_sql_statement(statement) for statement in found[0])
 
-    wanted = object_name.replace('"', "").lower()
-    for block in reversed(_FENCED_SQL_RE.findall(markdown or "")):
-        for stmt in edited_statements(block):
-            match = _CREATED_NAME_RE.match(stmt)
-            if match and re.sub(r'\s|"', "", match.group(1)).lower() in (wanted, wanted.split(".", 1)[-1]):
-                return block.strip()
+
+@dataclass(frozen=True)
+class DdlAdoption:
+    """What "Use as target DDL" makes of one AI reply: the target-DDL script it stores
+    (``None``: nothing to adopt) and what it tells the user."""
+
+    script: Optional[str]
+    notice: str
+
+
+def adoption_blocker(object_name: str, deterministic: str) -> Optional[str]:
+    """Why no reply can become ``object_name``'s target DDL, or ``None``.
+
+    Adoption is offered only where the screen shows the target DDL to review, edit and
+    reset, and an apply path runs it: never for a view the conversion could not convert (no
+    apply path creates it, an edit included), a table it could not convert (shown
+    read-only, with nothing to review), or a name-collision placeholder (only a source
+    rename helps)."""
+    if is_name_collision_placeholder(deterministic):
+        return (
+            f"{object_name} cannot be fixed in its target DDL: its name shares its first 63 "
+            "bytes with another table or view. Shorten the names on the source."
+        )
+    if object_create_kind(deterministic, object_name) is None:
+        return (
+            f"{object_name} has no target DDL to set: the conversion could not convert it, "
+            "so Schema Apply does not create it. Create it on the Aurora DSQL target yourself."
+        )
     return None
+
+
+def conversion_chat_note(object_name: str, deterministic: str) -> str:
+    """What the conversion chat's grounding adds for an object no reply can become the
+    target DDL of (:func:`adoption_blocker`), so the answer itself says what to do: there is
+    no "Use as target DDL" button to say it. Empty for any other object."""
+    if is_name_collision_placeholder(deterministic):
+        return (
+            "\n\nNo target DDL can create this object: its name shares its first 63 bytes "
+            "with another table or view. Tell the user to shorten the names on the source."
+        )
+    if adoption_blocker(object_name, deterministic) is not None:
+        return (
+            "\n\nSchema Apply does not create this object (the conversion could not convert "
+            "it), and this chat cannot set its target DDL. When you propose DDL for it, tell "
+            "the user to run it on the Aurora DSQL target themselves."
+        )
+    return ""
+
+
+def _listing(labels: Sequence[str], limit: int = 3) -> str:
+    """``a, b and c`` -- past ``limit`` items, ``a, b, c and 2 more``."""
+    if len(labels) > limit:
+        return ", ".join(labels[:limit]) + f" and {len(labels) - limit} more"
+    if len(labels) > 1:
+        return ", ".join(labels[:-1]) + " and " + labels[-1]
+    return labels[0] if labels else ""
+
+
+def adopt_ddl_from_reply(
+    markdown: str,
+    object_name: str,
+    deterministic: str,
+    stored: Optional[str] = None,
+    *,
+    index_renames: "Optional[Mapping[str, str]]" = None,
+) -> DdlAdoption:
+    """What "Use as target DDL" makes of an AI reply for ``object_name``. Pure.
+
+    The reply's statements for the object (:func:`_reply_object_ddl`) go into its current
+    target DDL -- the ``stored`` edit, else the generated ``deterministic`` script -- each
+    replacing the statement of the same kind and name, the rest kept
+    (:func:`merge_object_ddl`); the notice names what was kept and what of the block was
+    not taken. Untrusted model SQL, so each taken statement passes the denylist first. The
+    footer is shown exactly when this yields a script, so a click never refuses what it was
+    offered for."""
+    blocker = adoption_blocker(object_name, deterministic)
+    if blocker is not None:
+        return DdlAdoption(None, blocker)
+    found = _reply_object_ddl(
+        markdown, object_name, object_create_kind(deterministic, object_name)
+    )
+    if found is None:
+        return DdlAdoption(None, f"No SQL block in this reply creates {object_name}.")
+    own, others = found
+    # Applied under its new name, a colliding index is matched under it too.
+    own = rename_index_statements(own, index_renames or {})
+    for statement in own:
+        verdict = validate_suggested_sql(sql_without_comments(statement))
+        if not verdict.is_safe:
+            return DdlAdoption(None, f"Can't adopt this SQL: {verdict.reason}")
+    # The current target DDL as the apply paths run it: the edit under its renamed index
+    # names, or the generated script when the edit holds no statement.
+    current = deterministic
+    if stored is not None and edited_statements(stored):
+        current = rename_index_script(stored, index_renames or {})
+    script, kept = merge_object_ddl(current, own, object_name)
+    notice = f"Set as {object_name}'s target DDL"
+    if kept:
+        notice += f", keeping {_listing(kept)} from its current DDL"
+    notice += " — review it and Apply."
+    if others:
+        notice += f" Not taken from the reply: {_listing(others)}."
+    return DdlAdoption(script, notice)
 
 
 def _note_scope_key(note: ConversionWarning) -> str:
     """A stable, short scope suffix identifying ONE conversion note on an object.
 
-    Uses the note kind + its column (like Evaluation keys a finding by rule), so a
-    per-note AI chat gets its own scope -- clicking a different warning re-seeds with
-    that warning instead of re-focusing the first one's conversation.
+    The note kind, its column and a digest of its text (like Evaluation keys a finding by
+    rule), so a per-note AI chat gets its own scope -- clicking a different warning re-seeds
+    with that warning instead of re-focusing the first one's conversation. The digest tells
+    apart two notes on one column (a dropped collation and a SET mapped to text) and a
+    view's notes, which have no column.
     """
-    kind = getattr(getattr(note, "kind", None), "value", "") or "note"
-    column = (getattr(note, "column_name", "") or "").strip()
-    if column:
-        return f"{kind}:{column}"
-    # A view's notes carry no column: told apart by their text, so each note's AI icon
-    # opens its own chat instead of re-focusing the first one's.
     import hashlib
 
-    digest = hashlib.sha256((getattr(note, "message", "") or "").encode("utf-8")).hexdigest()
-    return f"{kind}:{digest[:10]}"
+    kind = getattr(getattr(note, "kind", None), "value", "") or "note"
+    column = (getattr(note, "column_name", "") or "").strip()
+    digest = hashlib.sha256((getattr(note, "message", "") or "").encode("utf-8")).hexdigest()[:10]
+    return f"{kind}:{column}:{digest}" if column else f"{kind}:{digest}"
 
 
 def _note_subtitle(object_name: str, note: ConversionWarning) -> str:
@@ -5258,9 +5415,9 @@ def _render_generate_suggestion(
 
     Matches the Evaluation screen's AI button (flat, indigo ``auto_awesome``) and
     opens the SAME right chat drawer, scoped to converting THIS object, so the
-    AI-assistance experience is identical across the app. The chat is advisory;
-    its in-drawer "Use as target DDL" action pulls the latest reply's SQL into
-    the editable target so it still flows into Apply. When AI is off (no opener
+    AI-assistance experience is identical across the app. The chat is advisory:
+    Schema Apply does not create such an object, so it offers no "Use as target DDL"
+    and says to create the object on the target by hand. When AI is off (no opener
     wired) the icon is shown disabled with a hint, so it stays discoverable.
     """
     if on_ai_chat is None:

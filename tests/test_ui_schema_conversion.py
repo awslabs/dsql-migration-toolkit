@@ -2763,9 +2763,12 @@ def test_conversion_chat_wires_use_as_target_ddl_footer() -> None:
 
     src = inspect.getsource(sc.build_schema_conversion_screen)
     assert 'footer_label="Use as target DDL"' in src
-    # G100: gated on a block that CREATEs this object (never a verification SELECT).
-    assert "extract_ddl_from_reply" in src
-    assert "validate_suggested_sql" in src  # untrusted model SQL is denylist-checked
+    # G105: the footer's visibility and its click run the same adopt_ddl_from_reply, which
+    # takes only this object's statements from the reply, denylist-checks them and merges
+    # them into its current target DDL -- so a shown button never refuses.
+    assert "adopt_ddl_from_reply" in src
+    assert src.count("_adoption(md)") == 2
+    assert "validate_suggested_sql" in inspect.getsource(sc.adopt_ddl_from_reply)
     assert "set_edited_target_ddl" in src   # adopts into the editor, not the target
 
 

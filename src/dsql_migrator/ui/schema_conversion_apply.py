@@ -531,6 +531,220 @@ def edited_statements(script: str) -> list[str]:
     ]
 
 
+# One identifier as the core applier's parser reads it (quoted with "" escapes, or bare), and
+# a one- or two-part name of them. Never a shorter reading of a longer name: a bare part ends
+# at its last name character, a quoted one at its real closing quote, and no further '.' may
+# follow -- ``"shop" . "orders"`` and ``db.shop.orders``, which the applier reads as another
+# name than PostgreSQL creates, name nothing here.
+_IDENT_PART = r'(?:"(?:[^"]|"")+"(?!")|[A-Za-z_][\w$]*(?![\w$]))'
+_RELATION_NAME = rf"{_IDENT_PART}(?:\.{_IDENT_PART})?(?!\s*\.)"
+_OWN_CREATE_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+(?=VIEW\b))?(TABLE|VIEW)\s+"
+    rf"(?:IF\s+NOT\s+EXISTS\s+)?({_RELATION_NAME})",
+    re.IGNORECASE,
+)
+_OWN_INDEX_RE = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:ASYNC\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"(?:({_IDENT_PART})\s+)?ON\s+(?:ONLY\s+)?({_RELATION_NAME})",
+    re.IGNORECASE,
+)
+_OWN_FOREIGN_KEY_RE = re.compile(
+    rf"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?({_RELATION_NAME})\s+ADD\s+"
+    rf"(?:CONSTRAINT\s+({_IDENT_PART})\s+)?FOREIGN\s+KEY\b",
+    re.IGNORECASE,
+)
+_OWN_SCHEMA_RE = re.compile(
+    rf"CREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT_PART})(?!\s*\.)", re.IGNORECASE
+)
+_OWN_DROP_RE = re.compile(
+    rf"DROP\s+(?:TABLE|VIEW)\s+(?:IF\s+EXISTS\s+)?({_RELATION_NAME})", re.IGNORECASE
+)
+# object_statement_role's role of a foreign-key ALTER.
+_FOREIGN_KEY_ROLE = "FOREIGN KEY"
+
+
+def _stored_parts(raw_name: str) -> "tuple[str, ...]":
+    """A written name's parts as PostgreSQL stores them: quoted as written, unquoted folded,
+    each cut to 63 bytes."""
+    from dsql_migrator.core.converter import _chain_parts
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    return tuple(pg_stored_name(part) for part in _chain_parts(raw_name)[0])
+
+
+def _object_stored_parts(object_name: str) -> "tuple[str, str]":
+    """``(schema, name)`` of a source object as the converter creates it: split on the first
+    dot, an unqualified one in public (where Aurora DSQL's search_path puts it)."""
+    from dsql_migrator.core.target_introspector import pg_stored_name
+
+    schema, dot, name = object_name.partition(".")
+    if not (dot and schema and name):
+        schema, name = "public", object_name
+    return pg_stored_name(schema), pg_stored_name(name)
+
+
+def _names_object(raw_name: str, object_name: str) -> bool:
+    """Whether a written relation name is ``object_name`` as PostgreSQL resolves it. A
+    one-part name is public's: a bare ``CREATE TABLE orders`` for ``shop.orders`` creates
+    ``public.orders``, while the load writes to ``"shop"."orders"``."""
+    parts = _stored_parts(raw_name)
+    schema, name = _object_stored_parts(object_name)
+    if len(parts) == 2:
+        return parts == (schema, name)
+    return len(parts) == 1 and schema == "public" and parts[0] == name
+
+
+def object_statement_role(statement: str, object_name: str) -> "Optional[tuple[str, str]]":
+    """``(role, name)`` when ``statement`` is one of ``object_name``'s own: ``("TABLE" |
+    "VIEW", "")`` for its CREATE, ``("INDEX", index name)`` for a CREATE INDEX on it,
+    ``("FOREIGN KEY", constraint name)`` for a foreign-key ALTER of it -- a name as
+    PostgreSQL stores it, ``""`` when the statement gives none. ``None`` for anything else
+    (a SELECT, another object's statement, a CHECK added by ALTER). Comments are ignored."""
+    clean = sql_without_comments(statement).strip()
+    match = _OWN_CREATE_RE.match(clean)
+    if match is not None:
+        return (match.group(1).upper(), "") if _names_object(match.group(2), object_name) else None
+    match = _OWN_INDEX_RE.match(clean)
+    if match is not None:
+        if not _names_object(match.group(2), object_name):
+            return None
+        return _INDEX_KIND, (_stored_parts(match.group(1))[0] if match.group(1) else "")
+    match = _OWN_FOREIGN_KEY_RE.match(clean)
+    # The same test the apply paths route a foreign key to the post-load pass by.
+    if match is not None and _is_foreign_key_ddl(clean):
+        if not _names_object(match.group(1), object_name):
+            return None
+        return _FOREIGN_KEY_ROLE, (_stored_parts(match.group(2))[0] if match.group(2) else "")
+    return None
+
+
+def object_create_kind(script: str, object_name: str) -> Optional[str]:
+    """``"TABLE"`` / ``"VIEW"``: what ``script`` creates ``object_name`` as; ``None`` when no
+    statement of it does (a not-converted note, a name-collision placeholder)."""
+    for statement in edited_statements(script):
+        role = object_statement_role(statement, object_name)
+        if role is not None and role[0] in (_TABLE_KIND, _VIEW_KIND):
+            return role[0]
+    return None
+
+
+def is_object_scaffolding(statement: str, object_name: str) -> bool:
+    """Whether ``statement`` only prepares ``object_name``'s CREATE: the ``CREATE SCHEMA [IF
+    NOT EXISTS]`` of its schema (which the tool writes itself) or a ``DROP`` of the object
+    itself (an edit is applied in REPLACE mode, which drops it)."""
+    clean = sql_without_comments(statement).strip()
+    match = _OWN_SCHEMA_RE.match(clean)
+    if match is not None:
+        return _stored_parts(match.group(1)) == (_object_stored_parts(object_name)[0],)
+    match = _OWN_DROP_RE.match(clean)
+    return match is not None and _names_object(match.group(1), object_name)
+
+
+_ALTER_OR_DROP_RE = re.compile(
+    rf"(ALTER|DROP)\s+(TABLE|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?({_RELATION_NAME})",
+    re.IGNORECASE,
+)
+
+
+def statement_label(statement: str) -> str:
+    """A statement named for a notice: ``CREATE TABLE shop.order_status`` for a CREATE,
+    ``ALTER TABLE shop.orders`` for an ALTER or DROP, else its leading keyword (``SELECT``),
+    with the next one for ``COMMENT ON`` and its kin."""
+    clean = sql_without_comments(statement).strip()
+    label, kind = _describe_ddl(clean)
+    if kind is not None:
+        return f"CREATE {label}"
+    match = _ALTER_OR_DROP_RE.match(clean)
+    if match is not None:
+        name = ".".join(_stored_parts(match.group(3)))
+        return f"{match.group(1)} {match.group(2)} ".upper() + name
+    words = clean.split()
+    if not words:
+        return "a comment"
+    if words[0].upper() in ("ALTER", "CREATE", "DROP", "COMMENT") and len(words) > 1:
+        return f"{words[0]} {words[1]}".upper()
+    return words[0].upper()
+
+
+def merge_object_ddl(
+    current: str, statements: Sequence[str], object_name: str
+) -> "tuple[str, list[str]]":
+    """``current`` -- an object's target-DDL script, edited or generated -- with
+    ``statements``, the object's own from an AI reply, put in: each replaces the statement of
+    the same kind and name (its CREATE, the index or foreign key of that name), one without a
+    counterpart is added, and everything else of ``current`` is kept as written.
+
+    Returns the script and what was kept that the reply did not give (an index, a foreign
+    key, another statement of the script; never its schema ensure). A reply usually shows
+    only the corrected CREATE TABLE: taken as the whole script, it dropped every secondary
+    index and preserved foreign key of the table, which no apply path then created."""
+    incoming: dict = {}
+    for position, statement in enumerate(statements):
+        role = object_statement_role(statement, object_name)
+        if role is None:
+            continue
+        kind, name = role
+        # An unnamed index or foreign key matches none of the script's: it is added.
+        key = ("CREATE", "") if kind in (_TABLE_KIND, _VIEW_KIND) else (kind, name or position)
+        incoming.pop(key, None)  # the block's last one wins
+        incoming[key] = statement.strip()
+
+    def key_of(statement: str) -> "Optional[tuple]":
+        role = object_statement_role(statement, object_name)
+        if role is None:
+            return None
+        return ("CREATE", "") if role[0] in (_TABLE_KIND, _VIEW_KIND) else role
+
+    merged: list[str] = []
+    kept: list[str] = []
+    placed: set = set()
+    for statement in split_sql_statements(current):
+        key = key_of(statement)
+        if key in incoming:
+            if key not in placed:
+                merged.append(incoming[key])
+                placed.add(key)
+            continue  # a second copy of a replaced statement would create it twice
+        merged.append(statement)
+        clean = sql_without_comments(statement).strip()
+        if key is not None and key[0] in (_INDEX_KIND, _FOREIGN_KEY_ROLE):
+            what = "index" if key[0] == _INDEX_KIND else "foreign key"
+            kept.append(f"{what} {key[1]}" if key[1] else f"an unnamed {what}")
+        elif clean and not is_object_scaffolding(clean, object_name):
+            kept.append(statement_label(clean))
+    for key, statement in incoming.items():
+        if key in placed:
+            continue
+        keys = [key_of(existing) for existing in merged]
+        if key == ("CREATE", ""):
+            # After the schema it is created in.
+            at = next(
+                (
+                    i for i, existing in enumerate(merged)
+                    if not is_object_scaffolding(existing, object_name)
+                ),
+                len(merged),
+            )
+        elif key[0] == _INDEX_KIND:
+            # After the object's last index (or its CREATE); foreign keys come last.
+            at = 1 + max(
+                (i for i, k in enumerate(keys) if k is not None and k[0] != _FOREIGN_KEY_ROLE),
+                default=len(merged) - 1,
+            )
+        else:
+            at = len(merged)
+        merged.insert(at, statement)
+    from dsql_migrator.core.converter import terminated_sql_statement
+
+    script = "\n\n".join(
+        # A comment-only piece (a note at the end of an edit) stays as written.
+        terminated_sql_statement(piece) if sql_without_comments(piece).strip() else piece
+        for piece in merged
+        if piece.strip()
+    )
+    return script, kept
+
+
 def override_apply_objects(
     objects: Sequence[ApplyObject],
     edited_ddls: dict[str, str],
@@ -989,14 +1203,20 @@ def applied_view_ddls(
         edited = edited_target_ddls.get(view.view)
         if edited is not None:
             # As Schema Apply runs it: the edit's CREATE VIEW, without its comments (a note
-            # above it made the reload's pre-drop and re-create refuse the view).
-            created = next(
-                (
-                    stmt for stmt in edited_statements(edited)
-                    if re.match(r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+)?VIEW\b", stmt, re.IGNORECASE)
-                ),
-                None,
-            )
+            # above it made the reload's pre-drop and re-create refuse the view) -- the one
+            # that creates THIS view, never a helper view the edit creates first.
+            statements = edited_statements(edited)
+            own = [
+                stmt for stmt in statements
+                if object_statement_role(stmt, view.view) == (_VIEW_KIND, "")
+            ]
+            views = [
+                stmt for stmt in statements
+                if re.match(
+                    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+)?VIEW\b", stmt, re.IGNORECASE
+                )
+            ]
+            created = (own or views or [None])[-1]
             ddls[view.view] = created if created is not None else view.target_ddl
         else:
             ddls[view.view] = view.target_ddl
