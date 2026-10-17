@@ -54,12 +54,13 @@ def _tool_chat(second):
     [
         RuntimeError("ThrottlingException: Rate exceeded"),
         {"stop_reason": "end_turn", "content": []},
-        {"stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "t", "name": "x", "input": {}}]},
+        # G104: a nudge round that calls a tool says the first reply was a punt, so when its
+        # look-ups never answer, the failure is the outcome (test_g104_ai_review), not that reply.
     ],
 )
 def test_a_failed_nudge_round_keeps_the_first_reply(second) -> None:
-    """A throttled, empty or never-answering nudge round showed 'AI reply unavailable'
-    and lost the answer already received."""
+    """A throttled or empty nudge round showed 'AI reply unavailable' and lost the answer
+    already received."""
     outcome, shown, calls = _tool_chat(second)
     assert outcome.available and outcome.markdown == _ANSWER and shown == [_ANSWER]
     assert calls >= 2

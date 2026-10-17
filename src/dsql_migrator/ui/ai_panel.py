@@ -1031,15 +1031,26 @@ def build_ai_panel(
         own = conv["own"]
         own[id(message)] = message  # type: ignore[index]
 
-    def _not_sent() -> None:
+    def _not_sent(ai_off: bool = False) -> None:
         try:
             ui.notify(  # type: ignore[attr-defined]
-                "Not sent to the AI DBA: the chat it was for is no longer open. Open "
+                "Not sent to the AI DBA: AI Assist is off. Turn it on on the Connect screen, "
+                "then open that chat again and repeat the request there."
+                if ai_off
+                else "Not sent to the AI DBA: the chat it was for is no longer open. Open "
                 "that chat again and repeat the request there.",
                 type="info",
             )
         except Exception:  # noqa: BLE001
             pass
+
+    def _queue_ask(token: object, text: str) -> None:
+        """Queue a question to ask when the running turn ends -- once: the same ask queued
+        again for the same instance (a second 'What's next?' click while a reply streams,
+        before its question shows) is one turn, never a second identical briefing."""
+        queue = conv.setdefault("pending_asks", [])
+        if (token, text) not in queue:  # type: ignore[operator]
+            queue.append((token, text))  # type: ignore[union-attr]
 
     def _run_pending_seed() -> None:
         """Ask the next question queued while a turn was running (first in, first out) --
@@ -1064,8 +1075,20 @@ def build_ai_panel(
             # thread.
             _not_sent()
             return
+        if not is_enabled():
+            # AI Assist was turned off (Connect) after this scope was opened. NEVER call
+            # the model -- that would bill the user for a disabled feature. Inert the
+            # composer instead of running the turn.
+            conv["streamer"] = None
+            _apply_composer_state()
         streamer = conv["streamer"]
         if streamer is None:
+            if token is not None:
+                # A programmatic ask (a re-test, a queued question) is never dropped silently:
+                # its chat can no longer ask -- AI Assist is off, or its streamer went with it
+                # -- and neither can a question queued behind it.
+                conv["pending_asks"] = []
+                _not_sent(ai_off=not is_enabled())
             return
         if conv["busy"]:
             # A question asked while a turn streams (the composer guards itself, so this
@@ -1073,14 +1096,7 @@ def build_ai_panel(
             # ends, in the scope it was asked for -- never dropped, never run beside it.
             target = token if token is not None else conv.get("scope_token")
             if target is not None:
-                conv.setdefault("pending_asks", []).append((target, text))  # type: ignore[union-attr]
-            return
-        if not is_enabled():
-            # AI Assist was turned off (Connect) after this scope was opened. NEVER call
-            # the model -- that would bill the user for a disabled feature. Inert the
-            # composer instead of running the turn.
-            conv["streamer"] = None
-            _apply_composer_state()
+                _queue_ask(target, text)
             return
         conv["stop_requested"] = False  # clear any stale flag from a prior turn
         # The settings this reply is sent with, BY VALUE (G20): the switch, model, region
@@ -1495,17 +1511,20 @@ def build_ai_panel(
             if was_busy:
                 # Another turn is still streaming: ask this one when it ends (if this scope
                 # is still the open one then), never beside it.
-                conv.setdefault("pending_asks", []).append((token, seed_question))  # type: ignore[union-attr]
+                _queue_ask(token, seed_question)
             else:
                 _run_turn(seed_question, token=token)
 
         # Bound to this scope instance: a later ask through it (a re-test, a re-run)
         # belongs here, and nowhere once it is gone -- is_open() tells a caller before it
-        # does costly work for an ask that would be refused.
+        # does costly work for an ask that would be refused: another instance is open, AI
+        # Assist is off, or its streamer was dropped with it (and not given back since).
         def send(text: str) -> None:
             _run_turn(text, token=token)
 
-        send.is_open = lambda: conv.get("scope_token") is token  # type: ignore[attr-defined]
+        send.is_open = lambda: (  # type: ignore[attr-defined]
+            conv.get("scope_token") is token and conv["streamer"] is not None and is_enabled()
+        )
         return send
 
     def set_visible(visible: bool) -> None:

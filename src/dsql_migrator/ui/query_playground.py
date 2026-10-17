@@ -62,7 +62,7 @@ from dsql_migrator.core.query_playground import (
     probe_statement,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.ui.ai_assist import ai_is_usable
+from dsql_migrator.ui.ai_assist import AI_OFF, ai_availability, ai_is_usable
 from dsql_migrator.ui.design import badge_classes, render_notice, section_header
 from dsql_migrator.ui.session import SessionStore
 
@@ -1000,11 +1000,14 @@ def build_query_playground_screen(
                         return
                     is_open = getattr(send, "is_open", None)
                     if callable(is_open) and not is_open():
-                        # A reply of an earlier chat: its re-test would be refused, so the
-                        # probe is not run on the target for nothing.
+                        # Its re-test would not be asked -- AI Assist is off, or the reply is
+                        # of a chat no longer open -- so the probe is not run on the target
+                        # for nothing.
                         ui.notify(
-                            "This rewrite came from an earlier AI chat: use Test rewrite on "
-                            "a reply in the chat that is open now.",
+                            "Enable AI Assist on the Connect screen to use AI DBA."
+                            if ai_availability(session) == AI_OFF
+                            else "This rewrite came from an AI chat that is no longer open: "
+                            "open Tune with AI DBA again and use Test rewrite on a reply there.",
                             type="info",
                         )
                         return

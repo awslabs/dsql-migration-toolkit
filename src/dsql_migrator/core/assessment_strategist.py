@@ -136,10 +136,17 @@ _MAX_TOOL_ROUNDS = 6
 # is the failure that matters.
 _TOOL_PREAMBLE_RE = re.compile(
     r"\b(?:let me(?! know)|i'?ll|i will|i'?m going to|i am going to)\b"
-    # A look-up verb: a strong one anywhere after the cue, a weak one ('see', 'review')
-    # only right after it -- "let me explain why you see it" is no look-up.
-    r"(?:.{0,60}\b(?:check|look|pull|fetch|inspect|examine|gather|retrieve|take a look|dig)\b"
-    r"|\s+(?:\w+\s+)?(?:see|review|query|read)\b)",
+    # Explaining is no look-up: "let me explain what this check does".
+    r"(?!\s+(?:\w+\s+)?(?:explain|describe|clarify|summarize|recap|outline|walk you through|"
+    r"show you (?:why|how|what))\b)"
+    # A look-up verb: a strong one anywhere after the cue ('start by checking' included), a
+    # weak one ('see', 'review') only right after it or after a short helper phrase ('go
+    # ahead and review', 'need to review') -- "I'll keep the query as is" is no look-up.
+    r"(?:.{0,60}\b(?:check(?:ing)?|look(?:ing)?|pull(?:ing)?|fetch(?:ing)?|inspect(?:ing)?|"
+    r"examin(?:e|ing)|gather(?:ing)?|retriev(?:e|ing)|tak(?:e|ing) a look|dig(?:ging)?)\b"
+    r"|\s+(?:\w+\s+)?(?:(?:go ahead and|need to|have to|start by|begin by|"
+    r"take a (?:moment|minute|second) to|run an?(?: quick)? (?:query|check) to)\s+)?"
+    r"(?:see|review|query|read)(?:ing)?\b)",
     re.IGNORECASE | re.DOTALL,
 )
 # The same announcement in Korean or Japanese: the operator may ask in either, and the
@@ -148,17 +155,34 @@ _CJK_PREAMBLE_RE = re.compile(
     r"(?:확인|조회|점검|검토|분석)\s*(?:해\s*보|해\s*드리|해서\s*알려\s*드리|하|해\s*보도록\s*하)\s*겠"
     r"|(?:확인|조회|점검|검토|분석)\s*(?:해\s*볼게|할게)"
     r"|(?:살펴|알아|찾아)\s*보(?:도록\s*하)?\s*겠|살펴보고\s*알려\s*드리겠|(?:가져|불러)\s*오겠"
-    r"|(?:確認|調査|チェック|取得|参照|分析)(?:してみます|いたします|させていただきます|しましょう|していきます)"
+    r"|(?:確認|調査|チェック|取得|参照|分析)(?:してみます|いたします|させていただきます|していきます)"
     r"|調べてみます|お調べします|見て(?:みます|いきます)"
 )
-# A plain Japanese 〜します is an announcement only with no subject before it (確認します);
-# with one it states what something does (外部キーは親テーブルを参照します).
-_JA_PLAIN_PREAMBLE_RE = re.compile(r"(?:確認|調査|チェック|取得|参照)します|調べます")
-_JA_SUBJECT_RE = re.compile(r"(?:は|が|では)[^。]*(?:確認|調査|チェック|取得|参照)します")
-# An offer to the user, or a closing, is no announcement of what the model is about to do
-# ("to see if you have ..." is no offer).
+# Japanese 〜しましょう ('let's check') is advice to the operator beside an answer ("次に検証結果を
+# 確認しましょう。"), and the punt alone ("では、DLQの状態を確認しましょう。").
+_ADVICE_RE = re.compile(r"(?:確認|調査|チェック|取得|参照|分析)しましょう(?!か)|(?:見て|調べて)みましょう(?!か)")
+# A plain Japanese 〜します is an announcement only when no topic governs the verb
+# (確認します); with one it states what something does (外部キーは親テーブルを参照します,
+# Validationでは…を確認します). An opener (まずは, では, はい) is no topic, and the subject of an
+# embedded question (DLQにレコードが残っていないか確認します) is not the verb's.
+_JA_VERB = r"(?:(?:確認|調査|チェック|取得|参照)します|調べます)(?!か)"
+_JA_PLAIN_PREAMBLE_RE = re.compile(_JA_VERB)
+_JA_OPENER_RE = re.compile(
+    r"^(?:(?:まずは|まず|では|それでは|じゃあ|はい|ええ|はじめに|最初に|次に|続いて|今回は|ここでは|念のため|"
+    r"早速|今から)[、,]?\s*)+"
+)
+_JA_TOPIC_RE = re.compile(r"(?<!私)(?:では|は)(?!なく)[^。]*" + _JA_VERB)
+_JA_SUBJECT_RE = re.compile(r"(?<!私)(?<!ます)(?<!です)が[^。]*" + _JA_VERB)
+_JA_EMBEDDED_QUESTION_RE = re.compile(r"か(?:どうか)?を?\s*" + _JA_VERB)
+# An offer to the user, a question to them, or a closing is no announcement of what the
+# model is about to do ("to see if you have ..." is no offer): 'if you want', '필요하시면 …
+# 확인해 드리겠습니다', '必要であれば…確認します', 'お知らせください'.
 _TOOL_OFFER_RE = re.compile(
-    r"\b(?:if you(?:'d| would) like|would you like|do you want|should i|let me know)\b",
+    r"\b(?:if you(?:'d| would) like|would you like|do you want|should i|let me know)\b"
+    r"|\bif you (?:want|prefer)(?=\s*(?:[.!?,;:]|$)|\s+(?:me|us|i)\b)"
+    r"|(?:필요|원)하(?:시|신다)면|(?:필요|원)하실\s*경우|요청하시면|말씀해\s*주(?:시면|세요)|(?:드릴|볼)까요"
+    r"|必要(?:であれば|でしたら)|ご希望(?:であれば|でしたら|の場合)|よろしければ|お知らせください"
+    r"|お申し付けください|(?:しましょう|します)か[？?]",
     re.IGNORECASE,
 )
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
@@ -170,11 +194,58 @@ _LATER_RE = re.compile(
     r"|나중에|後で|次回|後ほど",
     re.IGNORECASE,
 )
-# A look-up tied to a moment ('before you cut over', 'if it recurs', 'after you deployed
-# CDC', '컷오버 전에') is part of an answer only beside one: in a reply with nothing else to
-# say it is the punt ("I'll check ... to find what blocks you before you cut over.").
+# A look-up tied to a moment still to come ('before you cut over', 'if it recurs', 'after
+# you reload it', '컷오버 전에', 'カットオーバーの前に') is part of an answer only beside one: in
+# a reply with nothing else to say it is the punt ("I'll check ... to find what blocks you
+# before you cut over."). A marker that names no such moment never defers one: an indirect
+# question ('to see if the sink caught up', '…있었는지', '…か確認します'), a moment already
+# past ('when it reconnected', 'after the Full Load finished', '얼마 전에'), or part of a word
+# ('이전에' previously, '最後に' finally).
+_PAST = (
+    r"(?:was|were|had|did|ran|began|got|went|saw|came|took|broke|fell|grew|left|lost|sent|made|"
+    r"caught|kept|became|found|gave|knew|told|brought|built|stuck|\w+[^\We]ed)"
+)
+_KO_QUESTION = r"(?![^.]*?(?:는지|은지|인지|던지|할지|될지))"
+_JA_QUESTION = r"(?![^。]*?か(?:どうか)?を?(?:確認|調査|チェック|取得|参照|調べ))"
 _DEFERRED_RE = re.compile(
-    r"\b(?:before|after|when|if)\s+(?:you|it|a new|the)\b|전에|후에|이후에|되면|하면|前に|後に|たら",
+    r"(?<!\bsee )(?<!\bcheck )(?<!\bdetermine )(?<!\bfind out )(?<!\bknow )(?<!\bverify )"
+    r"(?<!\btell )(?<!\bconfirm )(?<!\bask )(?<!\bat )(?<!\bhappened )"
+    r"\b(?:before|after|when|if|until)\s+(?:you|we|it|they|a new|the|any|more)\b"
+    r"(?!(?:\s+(?!(?:is|are|be|been|being|has|have|will|gets?)\b)[\w.'-]+){0,3}?\s+"
+    + _PAST + r"\b)"
+    r"|[가-힣A-Za-z0-9](?<!얼마|조금|방금|며칠|시간|개월|오래|잠시)(?<![0-9 ][분초일주달년])"
+    r"\s+(?:직|이)?전에" + _KO_QUESTION
+    + r"|[가-힣A-Za-z0-9](?<![그이])\s+(?:직|이)?(?:후|뒤)에" + _KO_QUESTION
+    + r"|(?:끝나|완료되|재발하|발생하|생기|나타나|들어오)면"
+    r"|(?<![以午分間日週月年秒事名])前に" + _JA_QUESTION
+    + r"|(?<![最以午])(?<!その)後に" + _JA_QUESTION
+    + r"|(?:終わっ|完了し|終了し|再発し|発生し)たら",
+    re.IGNORECASE,
+)
+# Said for now, whatever moment the sentence names: 'let me' asks to look at once ("Before
+# you cut over, let me check ..."), and so do 'now', 'first', 해 보겠습니다, 먼저, まず, てみます.
+_IMMEDIATE_RE = re.compile(
+    r"\blet me\b(?! know)|(?<!for )(?<!by )(?<!until )\bnow\b|\bright away\b"
+    r"|\bfirst\b(?=\s*[,.;:!?]|\s*$)|\b(?:i'?ll|i will|let me)\s+first\b|^first\b"
+    r"|해\s*보(?:겠|도록)|해\s*볼게|지금|먼저|우선|まず|今から|早速|てみます",
+    re.IGNORECASE,
+)
+# What only says why the model looks, or asks the operator to wait, is no answer beside a
+# look-up tied to a moment: 'This will show what blocks you', 'Then I can tell you what to
+# fix', 'One moment.', '이를 통해 … 알 수 있습니다', 'これにより…がわかります'.
+_MOTIVE_RE = re.compile(
+    r"^(?:this|that|it|these|those|doing so|which)\s+(?:(?:will|would|should|can|could|may|might)"
+    r"\s+(?:also\s+)?(?:tell|show|explain|help|let|give|reveal|confirm|determine|clarify|indicate|"
+    r"identify|narrow)|(?:tells?|shows?|helps?|lets?|gives?)\s+(?:us|me)"
+    r"|(?:determines?|decides?)\s+(?:whether|if|which|what|how))\b"
+    r"|^(?:then|that way|this way|from there|with that|with this|after that),?\s+(?:i|we)\b"
+    r"|^(?:one moment|just a moment|give me a (?:moment|second)|please wait|bear with me|hang on|"
+    r"good question|great question|thanks(?: for asking)?|thank you|sure|of course|certainly)\b"
+    r"[\s,]*(?:please)?[.!]*$"
+    r"|^(?:이를 통해|이렇게 하면|그러면|그래야|이 정보로|이 정보를 통해|이를 바탕으로)"
+    r"|^(?:잠시만|잠시)\s*기다려\s*주세요|^좋은 질문입니다|^감사합니다"
+    r"|^(?:これにより|これによって|そうすれば|それにより)"
+    r"|^(?:少々|しばらく)?お待ちください|^(?:ご質問)?ありがとうございます",
     re.IGNORECASE,
 )
 # 'To answer that I need ...': what the model is about to fetch, said as a need -- never
@@ -192,6 +263,11 @@ _TOOL_PREAMBLE_MAX_CHARS = 800
 # A sentence of this many words that announces nothing (or twice as many words in all) is
 # substance: beside it, a look-up tied to a moment is a promise in an answer, not a punt.
 _SUBSTANCE_WORDS = 6
+# Words, counted alike in the three languages: a run of Latin letters or digits ('CDC', '0')
+# or of Hangul is one, and Japanese, written without spaces, counts its kana and kanji, two
+# and a half to a word ("欠落行はないので、カットオーバーできます。" is a sentence of substance).
+_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.'-]*|[가-힣]+")
+_JA_CHAR_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
 # What a nudged model replies, alone, when its reply already was the complete answer: that
 # reply is kept, so a nudge sent by mistake never replaces an answer.
 KEEP_REPLY_MARKER = "KEEP_PREVIOUS_REPLY"
@@ -200,20 +276,34 @@ KEEP_REPLY_MARKER = "KEEP_PREVIOUS_REPLY"
 def _announces_look_up(unit: str) -> bool:
     """Whether a sentence or line announces a look-up (English, Korean or Japanese)."""
     if _TOOL_OFFER_RE.search(unit):
-        return False  # an offer to the operator, or a closing
-    if _TOOL_PREAMBLE_RE.search(unit) or _NEED_RE.search(unit) or _CJK_PREAMBLE_RE.search(unit):
+        return False  # an offer to the operator, a question to them, or a closing
+    if (
+        _TOOL_PREAMBLE_RE.search(unit)
+        or _NEED_RE.search(unit)
+        or _CJK_PREAMBLE_RE.search(unit)
+        or _ADVICE_RE.search(unit)
+    ):
         return True
-    return bool(_JA_PLAIN_PREAMBLE_RE.search(unit)) and not _JA_SUBJECT_RE.search(unit)
+    body = _JA_OPENER_RE.sub("", unit)
+    if not _JA_PLAIN_PREAMBLE_RE.search(body) or _JA_TOPIC_RE.search(body):
+        return False
+    return bool(_JA_EMBEDDED_QUESTION_RE.search(body)) or not _JA_SUBJECT_RE.search(body)
+
+
+def _words(unit: str) -> int:
+    """About how many words ``unit`` says, in any of the three languages (see :data:`_WORD_RE`)."""
+    return len(_WORD_RE.findall(unit)) + len(_JA_CHAR_RE.findall(unit)) * 2 // 5
 
 
 def is_tool_preamble(text: str) -> bool:
     """Whether ``text`` may be only an announcement of tool use (``let me pull``, ``I'll
     check``, ``확인해 보겠습니다``): a reply up to :data:`_TOOL_PREAMBLE_MAX_CHARS`, with no
-    code, that announces a look-up not said for later -- one tied to a moment ('before
-    you cut over') only when nothing else in the reply has substance. It errs toward True:
-    the nudge it triggers lets the model keep a reply that already was the answer
-    (:data:`KEEP_REPLY_MARKER`), and tool_chat falls back to that reply when the nudge
-    round fails. Pure."""
+    code, that announces a look-up not said for later -- one tied to a moment still to
+    come ('before you cut over') or given as advice ('確認しましょう') only when nothing else
+    in the reply has substance (a sentence that only motivates the look-up has none). It
+    errs toward True: the nudge it triggers lets the model keep a reply that already was
+    the answer (:data:`KEEP_REPLY_MARKER`), and tool_chat falls back to that reply when
+    the nudge round fails before looking anything up. Pure."""
     stripped = (text or "").strip()
     if not stripped or len(stripped) > _TOOL_PREAMBLE_MAX_CHARS or "```" in stripped:
         return False
@@ -226,9 +316,16 @@ def is_tool_preamble(text: str) -> bool:
     announcing = [u for u in units if _announces_look_up(u) and not _LATER_RE.search(u)]
     if not announcing:
         return False
-    if any(not _DEFERRED_RE.search(u) for u in announcing):
+    if any(
+        not _ADVICE_RE.search(u) and (_IMMEDIATE_RE.search(u) or not _DEFERRED_RE.search(u))
+        for u in announcing
+    ):
         return True
-    said = [len(u.split()) for u in units if u not in announcing and not _TOOL_OFFER_RE.search(u)]
+    said = [
+        _words(u)
+        for u in units
+        if not (_announces_look_up(u) or _TOOL_OFFER_RE.search(u) or _MOTIVE_RE.search(u))
+    ]
     return not (any(words >= _SUBSTANCE_WORDS for words in said) or sum(said) >= 2 * _SUBSTANCE_WORDS)
 
 # A tool result handed back to the model: larger than a prompt field (a list of objects is
@@ -2075,9 +2172,17 @@ class AssessmentStrategist:
         nudged = False
         nudged_reply: Optional[str] = None
 
+        def first_reply_stands() -> bool:
+            """Whether the first reply is the answer to fall back on: it was nudged, and the
+            nudge round has looked nothing up. A model that answers the nudge by calling a
+            tool says the first reply was a punt, so when that look-up then fails (throttled,
+            denied, empty, out of rounds) the failure is the outcome -- its reason latching a
+            denial as on any turn -- never the punt shown as the answer."""
+            return nudged_reply is not None and not tools_used
+
         def kept() -> "ObjectGuidanceOutcome":
             """The first reply, as the answer: it was received (and paid for) before the
-            nudge, whatever the nudge round did."""
+            nudge, and the nudge round failed before looking anything up."""
             on_delta(nudged_reply or "")
             return ObjectGuidanceOutcome(
                 available=True,
@@ -2194,10 +2299,12 @@ class AssessmentStrategist:
                         }
                     )
                     continue
-                if nudged_reply is not None and (not final or KEEP_REPLY_MARKER in final.upper()):
+                if (nudged_reply is not None and KEEP_REPLY_MARKER in final.upper()) or (
+                    not final and first_reply_stands()
+                ):
                     # Nudged by mistake (the model says its first reply was the answer), or
                     # the nudge round came back empty: the first reply is the answer.
-                    final = nudged_reply
+                    final = nudged_reply or ""
                 if not final:
                     err = AiAssistUnavailableError("INVALID_OUTPUT")
                     return ObjectGuidanceOutcome(
@@ -2211,8 +2318,8 @@ class AssessmentStrategist:
                     markdown=final[:_MAX_NARRATIVE_CHARS],
                     model_id=self._config.model_id,
                 )
-            if nudged_reply is not None:
-                return kept()  # the nudge's look-ups never answered: the first reply did
+            if first_reply_stands():
+                return kept()  # the rounds ran out on the nudge itself: the first reply did
             return ObjectGuidanceOutcome(
                 available=False,
                 reason="UNAVAILABLE",
@@ -2222,13 +2329,13 @@ class AssessmentStrategist:
                 ),
             )
         except AiAssistUnavailableError as error:
-            if nudged_reply is not None:
+            if first_reply_stands():
                 return kept()  # a throttled / failed nudge round never costs the answer
             return ObjectGuidanceOutcome(
                 available=False, reason=error.reason, detail=error.detail
             )
         except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            if nudged_reply is not None:
+            if first_reply_stands():
                 return kept()
             error = AiAssistUnavailableError(_classify_bedrock_error(exc))
             return ObjectGuidanceOutcome(
