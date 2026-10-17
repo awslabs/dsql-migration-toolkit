@@ -8630,28 +8630,40 @@ def _put(node: exp.Expression, expression: exp.Expression) -> None:
 
 def _source_holds(
     column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]" = (),
-) -> "Callable[[exp.Select, str], Optional[bool]]":
-    """``(select, column) ->`` whether a FROM source of that select has the (lower-cased)
-    column: a derived table or a CTE by its outputs, a table by ``column_types`` (the
-    Evaluation inventory's :func:`table_type_index` entries; a table found by its name as
-    :func:`_column_type_resolver` finds a Query Converter statement's). ``None`` when it
-    cannot be told -- a table the inventory lacks, a ``*`` output, a LATERAL."""
-    columns = {
-        table: frozenset(name for name, _type in entries) for table, entries in column_types
-    }
-    folded: dict[str, list[str]] = {}
-    bare: dict[str, list[str]] = {}
-    bare_folded: dict[str, list[str]] = {}
-    for table in columns:
-        short = table.rsplit(".", 1)[-1]
-        folded.setdefault(table.lower(), []).append(table)
-        bare.setdefault(short, []).append(table)
-        bare_folded.setdefault(short.lower(), []).append(table)
+) -> "Callable[[exp.Expression, str], Optional[bool]]":
+    """``(select, column) ->`` whether a FROM source of that select -- or that one source --
+    has the (lower-cased) column: a derived table or a CTE by its outputs, a table by
+    ``column_types`` (the Evaluation inventory's :func:`table_type_index` entries; a table
+    found by its name as :func:`_column_type_resolver` finds a Query Converter statement's).
+    ``None`` when it cannot be told -- a table the inventory lacks, a ``*`` output, a
+    LATERAL."""
+    # The inventory by name, indexed when a lookup first asks for a table, and a table's
+    # columns when it is asked for: a statement without HAVING or ANY_VALUE asks for none,
+    # however many tables the inventory has. A name in another case, or without its
+    # schema, is the one table that has it ("" when more do).
+    entries: dict[str, "Sequence[tuple[str, str]]"] = {}
+    columns: dict[str, frozenset] = {}
+    folded: dict[str, str] = {}
+    bare: dict[str, str] = {}
+    bare_folded: dict[str, str] = {}
     # Per source: a WITH above it is walked once, however many names ask.
     looked_up: dict[int, tuple] = {}
 
-    def one(owners: "Optional[list[str]]") -> "Optional[frozenset]":
-        return columns[owners[0]] if owners and len(owners) == 1 else None
+    def index() -> None:
+        if entries or not column_types:
+            return
+        for table, listed in column_types:
+            entries[table] = listed
+            short = table.rsplit(".", 1)[-1]
+            for names, name in ((folded, table.lower()), (bare, short), (bare_folded, short.lower())):
+                names[name] = "" if name in names else table
+
+    def one(owner: Optional[str]) -> "Optional[frozenset]":
+        if not owner:
+            return None
+        if owner not in columns:
+            columns[owner] = frozenset(name for name, _type in entries[owner])
+        return columns[owner]
 
     def outputs(node: exp.Expression) -> "Optional[frozenset]":
         names = node.alias_column_names or (
@@ -8677,14 +8689,15 @@ def _source_holds(
             return None
         db = item.args.get("db")
         key = f"{db.name}.{item.name}" if db is not None else item.name
-        found = columns[key] if key in columns else one(folded.get(key.lower()))
+        index()
+        found = one(key) if key in entries else one(folded.get(key.lower()))
         if found is None and db is None:
             found = one(bare.get(key) or bare_folded.get(key.lower()))
         return found
 
-    def holds(select: exp.Select, name: str) -> Optional[bool]:
+    def holds(scope: exp.Expression, name: str) -> Optional[bool]:
         unknown = False
-        for item in _select_sources(select):
+        for item in _select_sources(scope) if isinstance(scope, exp.Select) else (scope,):
             cached = looked_up.get(id(item))
             if cached is None or cached[0] is not item:
                 cached = looked_up[id(item)] = (item, source_columns(item))
@@ -8785,25 +8798,33 @@ def inline_having_aliases(
     stores it (``stored``: every column qualified, a bare GROUP BY name the alias it
     resolved to), a Query Converter statement's as written, its tables' columns read from
     ``column_types`` (the Evaluation inventory): they never read an output name in HAVING
-    (``column "total" does not exist``). Returns what a statement's HAVING reads that
-    cannot be written faithfully (one sentence each).
+    (``column "total" does not exist``). Returns what a HAVING reads that cannot be written
+    faithfully (one sentence each).
 
     A HAVING name is what MySQL makes it -- a GROUP BY column, else a select-list item:
     MySQL reads no other name of the query there. In a subquery it reads any other from the
     enclosing query, as Aurora DSQL does only when no source of the subquery has the name:
-    else the HAVING is left as written, and named. A GROUP BY column of that name wins (its
-    documented preference): a qualified one -- also the column GROUP BY 1 or a GROUP BY
-    alias points to -- is written in the HAVING as that column, qualified (bare, it is
-    ambiguous on PostgreSQL when a joined table has the name too). A bare GROUP BY name
-    that is an alias is a FROM column when the alias is an aggregate or a window at its own
-    level (MySQL refuses to GROUP BY either); stored, when the alias reads a column of its
-    own name at its own level; written, when a FROM source of its query has the column
-    (MySQL reads FROM first, warning 1052) -- told by the inventory or a derived table's
-    outputs, else by a column of the name anywhere in the alias (kept bare on a wrong
-    guess, the name is one Aurora DSQL does not find). Else an alias is inlined, and a
-    select-list column (``o.customer_id``, also behind an alias) is written as that column.
-    A qualified HAVING name, one inside an aggregate's argument (MySQL reads that from
-    FROM) or in a nested query, is never an alias.
+    else the HAVING is left as written, and named (t.* beside other sources lists t's
+    columns where they can be told; named as either reading where not). A view stores such
+    a name qualified, and an enclosing select-list alias bare: that alias's value is written
+    in, a correlated reference to Aurora DSQL -- named where it cannot be (an aggregate, a
+    shadowed table). A GROUP BY column of that name wins (its documented preference): a
+    qualified one -- also the column GROUP BY 1 or a GROUP BY alias points to -- is written
+    in the HAVING as that column, qualified (bare, it is ambiguous on PostgreSQL when a
+    joined table has the name too). A bare GROUP BY name that is an alias is a FROM column
+    when the alias is an aggregate or a window at its own level (MySQL refuses to GROUP BY
+    either); stored, when the alias reads a column of its own name at its own level;
+    written, when a FROM source of its query has the column (MySQL reads FROM first,
+    warning 1052) -- told by the inventory or a derived table's outputs, else by the alias
+    reading the query's column of that name (``o.status AS status``). Untold, the alias is
+    the group when it reads another column of the query outside an aggregate (grouped by
+    the FROM column, ONLY_FULL_GROUP_BY refuses it); else the name is guessed the FROM
+    column, in a subquery written with its one source (bare, a wrong guess reads the
+    enclosing query's column of the name on Aurora DSQL) and named beside others. Else an
+    alias is inlined, and a select-list column (``o.customer_id``, also behind an alias or
+    in parentheses) is written as that column. A qualified HAVING name, one inside an
+    aggregate's argument (MySQL reads that from FROM) or in a nested query, is never an
+    alias.
 
     Without GROUP BY or an aggregate computed in the query (:func:`_one_group`), MySQL's
     HAVING filters rows (before windows, DISTINCT and LIMIT), where PostgreSQL makes the
@@ -8835,17 +8856,62 @@ def inline_having_aliases(
             scope = scope.find_ancestor(exp.AggFunc, exp.Query, exp.Anonymous)
         return scope
 
-    def from_column(select: exp.Select, name: str, expression: exp.Expression) -> bool:
-        # Whether MySQL reads a bare GROUP BY name that is also an alias as a FROM column.
+    def from_column(select: exp.Select, name: str, expression: exp.Expression) -> Optional[bool]:
+        # Whether MySQL reads a bare GROUP BY name that is also an alias as a FROM column --
+        # in a statement None when no source can be told to have it and the alias reads none
+        # of the query's columns to tell it by: a guess.
         if any(_is_aggregate(node) or isinstance(node, exp.Window) for node in own(expression)):
             return True
-        found = None if stored else holds(select, name.lower())
+        if stored:
+            return any(
+                isinstance(node, exp.Column) and key(node.args.get("this")) == name
+                for node in own(expression)
+            )
+        found = holds(select, name.lower())
         if found is not None:
             return found
-        reads = own(expression) if stored else expression.walk()
-        return any(
-            isinstance(node, exp.Column) and key(node.args.get("this")) == name for node in reads
-        )
+
+        def aggregated(column: exp.Column) -> bool:
+            # Inside an aggregate the query computes (SELECT MAX(o.qty) FROM p): no row's.
+            node: Optional[exp.Expression] = column
+            while node is not expression and node is not None:
+                node = node.parent
+                if (
+                    node is not None and _is_aggregate(node) and not _is_window_function(node)
+                    and _aggregated_in(node, holds) is select
+                ):
+                    return True
+            return False
+
+        others = set()
+        count = len(select.expressions)
+        for item in select.args["group"].expressions:
+            if isinstance(item, exp.Literal) and item.is_int and 0 < int(item.name) <= count:
+                item = select.expressions[int(item.name) - 1].unalias()
+            if isinstance(item, exp.Column):
+                others.add(key(item.args.get("this")))
+        others.discard(name)
+        ungrouped = False
+        for column in expression.find_all(exp.Column):
+            if _reading_query(column, holds) is not select:
+                continue  # a nested query's own column, or the enclosing query's
+            read = key(column.args.get("this"))
+            if read == name and column.table:
+                return True  # o.status AS status: o has the column
+            if read != name and read not in others and not aggregated(column):
+                ungrouped = True
+        if not ungrouped:
+            return None
+        # Grouped by the FROM column, MySQL (ONLY_FULL_GROUP_BY) refuses an alias that reads
+        # another column of the query outside an aggregate: it groups by the alias -- unless
+        # another GROUP BY column is a key that column depends on (GROUP BY amount, o.id),
+        # which cannot be told: then a column of the name anywhere in the alias guesses it.
+        if others and any(
+            isinstance(node, exp.Column) and key(node.args.get("this")) == name
+            for node in expression.walk()
+        ):
+            return None
+        return False
 
     def read_outside(select: exp.Select, column: exp.Column) -> bool:
         # A name no source of its query has, Aurora DSQL reads from the enclosing query as
@@ -8863,24 +8929,78 @@ def inline_having_aliases(
             scope = scope.find_ancestor(exp.Select)
         return True
 
+    def writable(value: exp.Expression, shadowed: set) -> bool:
+        # An enclosing alias's value Aurora DSQL reads the same in a subquery: no aggregate or
+        # window of its own (its level would move), every column qualified with a table no
+        # source in between shadows.
+        if any(_is_aggregate(node) or isinstance(node, exp.Window) for node in own(value)):
+            return False
+        inner = {id(query) for query in value.find_all(exp.Select)}
+        return all(
+            column.table
+            and (id(_reading_query(column, holds)) in inner or column.table not in shadowed)
+            for column in value.find_all(exp.Column)
+        )
+
+    def enclosing(select: exp.Select, name: str) -> "tuple[bool, Optional[exp.Expression]]":
+        # Whether a view's subquery HAVING name is an enclosing select-list alias (MySQL stores
+        # a column it read from a FROM qualified) -- of the nearest query that holds the
+        # subquery in its select list, HAVING or ORDER BY, MySQL reads no other's -- and its
+        # value where it can be written in.
+        shadowed = {item.alias_or_name for item in _select_sources(select)}
+        node: exp.Expression = select
+        while node.parent is not None:
+            parent = node.parent
+            if isinstance(parent, exp.Select):
+                if node.arg_key in ("expressions", "having", "order"):
+                    for projection in parent.expressions:
+                        if isinstance(projection, exp.Alias) and key(projection.args.get("alias")) == name:
+                            value = _unshown(projection.this)
+                            return True, value if writable(value, shadowed) else None
+                shadowed |= {item.alias_or_name for item in _select_sources(parent)}
+            node = parent
+        return False, None
+
+    def label(source: exp.Expression) -> Optional[exp.Identifier]:
+        # The name a FROM source's columns are qualified with: its alias, else a table's own.
+        alias = source.args.get("alias")
+        if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
+            return alias.this
+        if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+            return source.this
+        return None
+
+    def note(text: str) -> None:
+        if text not in notes:
+            notes.append(text)
+
+    # A HAVING that filters rows becomes a WHERE once every query is read: until then a
+    # subquery in it is still where MySQL read an enclosing alias from.
+    filters: list = []
     for select in tree.find_all(exp.Select):
         having = select.args.get("having")
         if having is None:
             continue
+        nested = select.find_ancestor(exp.Select, exp.Update, exp.Delete) is not None
+        sources = _select_sources(select)
         aliases = {
             key(projection.args.get("alias")): _unshown(projection.this)
             for projection in select.expressions
             if isinstance(projection, exp.Alias)
         }
-        # A select-list column by its name: an unaliased one, else one behind an alias
-        # (MySQL reads that only when no other item has the name).
+        # A select-list column by its name, parenthesised too: an unaliased one, else one
+        # behind an alias (MySQL reads that only when no other item has the name).
         listed: dict[str, exp.Column] = {}
         for projection in sorted(select.expressions, key=lambda p: isinstance(p, exp.Alias)):
-            if isinstance(projection.unalias(), exp.Column):
-                listed.setdefault(key(projection.unalias().args.get("this")), projection.unalias())
+            value = projection.unalias()
+            while isinstance(value, exp.Paren):
+                value = value.this
+            if isinstance(value, exp.Column):
+                listed.setdefault(key(value.args.get("this")), value)
         group = select.args.get("group")
         grouped: set = set()
         qualified: dict[str, exp.Column] = {}
+        unsure: set = set()
         for item in group.expressions if group is not None else []:
             if isinstance(item, exp.Literal) and item.is_int:
                 # GROUP BY 1 groups by that select-list item.
@@ -8889,9 +9009,20 @@ def inline_having_aliases(
             elif isinstance(item, exp.Column) and not item.table:
                 name = key(item.args.get("this"))
                 expression = aliases.get(name)
-                if expression is not None and not from_column(select, name, expression):
+                reading = True if expression is None else from_column(select, name, expression)
+                if reading is False:
                     # GROUP BY the alias: the group is what it names (o.customer_id AS cid).
                     item = expression
+                elif reading is None and nested:
+                    # A guessed FROM column in a subquery: bare in HAVING, Aurora DSQL reads the
+                    # enclosing query's column of the name when no source has it. With the one
+                    # source a wrong guess fails; beside others it is named. (Its GROUP BY
+                    # reads the name as MySQL does, a FROM column first.)
+                    table = label(sources[0]) if len(sources) == 1 else None
+                    if table is not None:
+                        item = exp.Column(this=item.this.copy(), table=table.copy())
+                    else:
+                        unsure.add(name)
             if not isinstance(item, exp.Column):
                 continue
             name = key(item.args.get("this"))
@@ -8900,15 +9031,23 @@ def inline_having_aliases(
             else:
                 grouped.add(name)
         # SELECT * (or t.* of its one source) lists every FROM column: MySQL reads a name
-        # there, else in the enclosing query -- where Aurora DSQL reads it too.
+        # there, else in the enclosing query -- where Aurora DSQL reads it too. t.* beside
+        # other sources lists t's, as the inventory or a derived table's outputs tell them.
         stars = [
             p for p in select.expressions
             if isinstance(p, exp.Star) or isinstance(p, exp.Column) and isinstance(p.this, exp.Star)
         ]
         every_column = any(isinstance(p, exp.Star) for p in stars) or (
-            bool(stars) and len(_select_sources(select)) == 1
+            bool(stars) and len(sources) == 1
         )
+        starred = [
+            (item, star) for star in stars if isinstance(star, exp.Column)
+            for item in sources if item.alias_or_name == star.table
+        ]
         outer: list[str] = []
+        through: list[tuple] = []
+        unread: list[str] = []
+        guessed: list[str] = []
         for column in list(having.find_all(exp.Column)):
             if column.table or read_in(column) is not select:
                 continue
@@ -8916,30 +9055,74 @@ def inline_having_aliases(
             if name in qualified:
                 column.replace(qualified[name].copy())
             elif name in grouped:
-                continue
+                if name in unsure and column.name not in guessed:
+                    guessed.append(column.name)
             elif name in aliases:
                 _put(column, aliases[name].copy())
             elif name in listed:
                 column.replace(listed[name].copy())
-            elif not every_column and column.name not in outer and not read_outside(select, column):
-                outer.append(column.name)
-        if outer and select.find_ancestor(exp.Select, exp.Update, exp.Delete) is not None:
+            else:
+                aliased, value = enclosing(select, name) if stored else (False, None)
+                if value is not None:
+                    _put(column, value.copy())
+                elif aliased:
+                    if column.name not in unread:
+                        unread.append(column.name)
+                elif not every_column:
+                    lowered = column.name.lower()
+                    held = [(item, star) for item, star in starred if holds(item, lowered) is not False]
+                    lister = next((star for item, star in held if holds(item, lowered)), None)
+                    if lister is not None:
+                        column.set("table", lister.args["table"].copy())
+                    elif held and (column.name, held[0][1].table) not in through:
+                        through.append((column.name, held[0][1].table))
+                    elif not held and column.name not in outer and not read_outside(select, column):
+                        outer.append(column.name)
+        if nested and (outer or through or unread):
             # MySQL reads it from the enclosing query, where Aurora DSQL reads the subquery's
-            # own column first; a view stores it qualified.
-            note = (
-                f"MySQL reads {', '.join(outer)} in a subquery's HAVING from the enclosing "
-                "query (a HAVING reads only its own select list and GROUP BY), where Aurora "
-                "DSQL reads the subquery's own column of that name if it has one and makes a "
-                "subquery with HAVING but no GROUP BY one group: it is left as written -- "
-                "qualify the name with the enclosing query's table, in the subquery's WHERE "
-                "when it has neither GROUP BY nor an aggregate."
-            )
-            if not stored and note not in notes:
-                notes.append(note)
+            # own column first; a view stores it qualified, and an alias bare.
+            if outer and not stored:
+                note(
+                    f"MySQL reads {', '.join(outer)} in a subquery's HAVING from the enclosing "
+                    "query (a HAVING reads only its own select list and GROUP BY), where Aurora "
+                    "DSQL reads the subquery's own column of that name if it has one and makes a "
+                    "subquery with HAVING but no GROUP BY one group: it is left as written -- "
+                    "qualify the name with the enclosing query's table, in the subquery's WHERE "
+                    "when it has neither GROUP BY nor an aggregate."
+                )
+            for name, star in through:
+                note(
+                    f"MySQL reads {name} in a subquery's HAVING through {star}.* if {star} has a "
+                    f"column {name}, else from the enclosing query (a HAVING reads only its own "
+                    "select list and GROUP BY), where Aurora DSQL makes a subquery with HAVING "
+                    f"but no GROUP BY one group: it is left as written -- write it {star}.{name}, "
+                    "or qualified with the enclosing query's table, as the tables' columns have "
+                    "it, in the subquery's WHERE when it has neither GROUP BY nor an aggregate."
+                )
+            if unread:
+                note(
+                    f"MySQL reads {', '.join(unread)} in a subquery's HAVING as the enclosing "
+                    "query's select-list alias, which Aurora DSQL cannot read there, and its "
+                    "expression cannot be written in as it is (an aggregate or a window, or a "
+                    "table a nearer source's name shadows): it is left as written, and fails -- "
+                    "write the expression there by hand."
+                )
         elif group is None and _one_group(select, holds) is False:
             # A row filter on MySQL: a WHERE, now that it names no output alias.
-            select.set("having", None)
-            select.where(having.this, copy=False)
+            filters.append((select, having))
+        for name in guessed:
+            note(
+                f"MySQL groups by {name} as the column of "
+                f"{' or '.join(item.alias_or_name for item in sources)} that has it (warning "
+                f"1052), else by the select-list alias {name}, and its HAVING reads {name} the "
+                "same way, where Aurora DSQL's HAVING in a subquery reads a name none of them "
+                "has from the enclosing query: it is left as written -- qualify it with its "
+                "table, or write the alias's expression in the HAVING, as the tables' columns "
+                "have it."
+            )
+    for select, having in filters:
+        select.set("having", None)
+        select.where(having.this, copy=False)
     _any_value_as_value(tree, holds)
     return notes
 
@@ -11494,7 +11677,7 @@ def _converted_mysql_view(
         )
         # MySQL stores a HAVING name by its alias (having (`total` > 1000)), which Aurora
         # DSQL never resolves there.
-        inline_having_aliases(select)
+        issues.extend(inline_having_aliases(select))
         # The name is QUOTED, like every table and index name the converter emits:
         # unquoted, Aurora DSQL folded it (``V_Orders`` became ``v_orders``, and a
         # view in schema ``MyApp`` landed in a different schema, ``myapp``), so it

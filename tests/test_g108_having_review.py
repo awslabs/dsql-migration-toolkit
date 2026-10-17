@@ -107,10 +107,13 @@ def test_a_group_by_alias_no_from_table_has_is_inlined_by_the_inventory() -> Non
     assert converted.endswith(
         "HAVING (SELECT MAX(p.amount) FROM payments AS p WHERE p.order_id = o.id) > 10"
     ), converted
-    # Without it, the name stays the FROM column it most likely is: a wrong guess fails on
-    # Aurora DSQL ('column "amount" does not exist') instead of grouping other rows.
+    # Without it too (G114): the alias reads o.id, so grouped by an o.amount MySQL would
+    # refuse it (1055, ONLY_FULL_GROUP_BY) -- it groups by the alias. Kept bare, Aurora DSQL
+    # failed ('column "amount" does not exist').
     converted, _ = _convert(sql)
-    assert converted.endswith("HAVING amount > 10"), converted
+    assert converted.endswith(
+        "HAVING (SELECT MAX(p.amount) FROM payments AS p WHERE p.order_id = o.id) > 10"
+    ), converted
 
 
 @pytest.mark.parametrize(

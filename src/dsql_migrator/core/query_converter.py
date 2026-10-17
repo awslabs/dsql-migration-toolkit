@@ -393,8 +393,9 @@ def _inline_having_aliases(
 ) -> "list[QueryWarning]":
     """MySQL's HAVING written as a view's is (:func:`inline_having_aliases`), read as
     written: a bare GROUP BY name through the Evaluation inventory's columns
-    (``column_types``), and a subquery's HAVING name MySQL reads from the enclosing query
-    flagged MANUAL."""
+    (``column_types``), and a subquery's HAVING name MySQL reads from the enclosing query --
+    or may, through t.* of a table the inventory lacks, or by a GROUP BY name guessed beside
+    several sources -- flagged MANUAL."""
     return [
         QueryWarning(code=CODE_MYSQL_SEMANTICS, classification=Classification.MANUAL, message=text)
         for text in inline_having_aliases(
