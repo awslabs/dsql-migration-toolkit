@@ -252,25 +252,28 @@ def test_json_of_a_datetime_beside_a_string_is_mysqls_string() -> None:
 # --- Numbers ----------------------------------------------------------------------------
 
 
-_QUOTIENT = '(CAST("t"."i" AS DECIMAL) / NULLIF(3, 0))'
+# G106 (ES-8): MySQL's quotient is its 9 kept digits, truncated -- DIV(x * 10^9, y) * 10^-9,
+# where this was the numeric division (20 digits, or 16 significant).
+_QUOTIENT = '(DIV(CAST("t"."i" AS DECIMAL) * 1000000000, NULLIF(3, 0)) * 0.000000001)'
 
 
 def test_mysqls_exact_division_is_numeric_at_its_scale() -> None:
     """G97P-7: 10 / 3 was the double 3.3333333333333335 (MySQL 3.3333), TRUNCATE(a / b, 6)
-    3.333333, LENGTH 18."""
+    3.333333, LENGTH 18. (The view has an AVG, so MySQL materializes it: its outputs are
+    shown at their scale -- G106.)"""
     ddl, _ = _select(
         "(`t`.`i` / 3) AS `a`,(`t`.`dec4` / 3) AS `b`,((`t`.`i` / `t`.`n`) * 100) AS `c`,"
         "truncate((`t`.`i` / 3),6) AS `e`,length((`t`.`i` / 3)) AS `g`,concat((`t`.`i` / 3),'%') AS `h`,"
         "avg(`t`.`i`) AS `k`,(`t`.`db` / 2) AS `m`"
     )
-    assert f'ROUND({_QUOTIENT}, 4) AS "a"' in ddl
-    assert 'ROUND(("t"."dec4" / NULLIF(3, 0)), 8) AS "b"' in ddl
+    assert f'ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) AS "a"' in ddl
+    assert 'ROUND((DIV("t"."dec4" * 1000000000, NULLIF(3, 0)) * 0.000000001), 8) AS "b"' in ddl
     # MySQL computes with the digits it does not show: 2 / 3 * 100 is 66.6667, not 66.67.
-    assert 'ROUND(((CAST("t"."i" AS DECIMAL) / NULLIF("t"."n", 0)) * 100), 4) AS "c"' in ddl
+    assert 'ROUND(((DIV(CAST("t"."i" AS DECIMAL) * 1000000000, NULLIF("t"."n", 0)) * 0.000000001) * 100), 4) AS "c"' in ddl
     assert f'TRUNC({_QUOTIENT}, 4) AS "e"' in ddl
-    assert f'OCTET_LENGTH(CAST(ROUND({_QUOTIENT}, 4) AS TEXT)) AS "g"' in ddl
-    assert f"ROUND({_QUOTIENT}, 4) || '%'" in ddl
-    assert 'ROUND(CAST(AVG("t"."i") AS DECIMAL), 4) AS "k"' in ddl
+    assert f'OCTET_LENGTH(CAST(ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) AS TEXT)) AS "g"' in ddl
+    assert f"ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) || '%'" in ddl
+    assert 'ROUND(TRUNC(AVG("t"."i"), 9), 4) AS "k"' in ddl  # G106: AVG keeps 9 digits too
     assert '(CAST("t"."db" AS DOUBLE PRECISION) / NULLIF(2, 0)) AS "m"' in ddl  # a double's is a double
 
 
@@ -281,7 +284,7 @@ def test_a_quotient_is_compared_and_inlined_with_every_digit() -> None:
     ddl, _ = _view(
         "select `t`.`n` AS `n`,(sum(`t`.`i`) / 3) AS `r` from `shop`.`t` `t` group by `t`.`n` having (`r` > 1.6666)"
     )
-    assert 'HAVING ((CAST(SUM("t"."i") AS DECIMAL) / NULLIF(3, 0)) > 1.6666)' in ddl
+    assert 'HAVING ((DIV(CAST(SUM("t"."i") AS DECIMAL) * 1000000000, NULLIF(3, 0)) * 0.000000001) > 1.6666)' in ddl
 
 
 @pytest.mark.parametrize(
@@ -292,7 +295,8 @@ def test_a_quotient_is_compared_and_inlined_with_every_digit() -> None:
         ("round((`t`.`db` * `t`.`i`),1)", '(ROUND(CAST(("t"."db" * "t"."i") AS DOUBLE PRECISION) * 10) / 10)'),
         ("round(`t`.`db`,-(1))", '(ROUND(CAST("t"."db" AS DOUBLE PRECISION) / 10) * 10)'),
         ("round(0.125e0,2)", "(ROUND(CAST(0.125e0 AS DOUBLE PRECISION) * 100) / 100)"),
-        ("truncate(sum(`t`.`f`),2)", '(TRUNC(CAST(SUM("t"."f") AS DOUBLE PRECISION) * 100) / 100)'),
+        # G106 (P3): MySQL sums a FLOAT in double precision -- the cast goes inside the SUM.
+        ("truncate(sum(`t`.`f`),2)", '(TRUNC(CAST(SUM(CAST("t"."f" AS DOUBLE PRECISION)) AS DOUBLE PRECISION) * 100) / 100)'),
         ("truncate(coalesce(`t`.`f`,0),2)", '(TRUNC(CAST(COALESCE("t"."f", 0) AS DOUBLE PRECISION) * 100) / 100)'),
         ("truncate((`t`.`f` + `t`.`f`),2)", '(TRUNC(CAST(("t"."f" + "t"."f") AS DOUBLE PRECISION) * 100) / 100)'),
         ("truncate(abs(`t`.`f`),2)", '(TRUNC(CAST(ABS("t"."f") AS DOUBLE PRECISION) * 100) / 100)'),
@@ -312,8 +316,9 @@ def test_round_and_truncate_compute_as_mysql_does(call: str, emitted: str) -> No
 def test_round_of_an_unknown_value_is_in_numeric() -> None:
     sql, _ = _query("SELECT ROUND(x, 2), ROUND(paid / total * 100, 2) FROM o", typed=False)
     assert "ROUND(CAST(x AS DECIMAL), 2)" in sql
-    # An untyped division is sqlglot's double, so it is rounded in double precision.
-    assert "(ROUND(CAST(CAST(paid AS DOUBLE PRECISION) / NULLIF(total, 0) * 100 AS DOUBLE PRECISION) * 100) / 100)" in sql
+    # G106 (P1): a division of operands not typed is exact in MySQL as like as not, so it is
+    # rounded in numeric, half away from zero (in double precision 1 / 8 rounded to 0.12).
+    assert "ROUND(CAST(CAST(paid AS DOUBLE PRECISION) / NULLIF(total, 0) * 100 AS DECIMAL), 2)" in sql
 
 
 @pytest.mark.parametrize(

@@ -443,13 +443,17 @@ MySQL→PostgreSQL transpile:
   `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
   a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (dropped in a comparison, an
   `ORDER BY` or a `GROUP BY`, which Aurora DSQL makes byte-wise already), `CAST(x AS UNSIGNED)` rounding first
-  and wrapping a negative number as MySQL does, `/` of integers and decimals as MySQL's exact division (a decimal
-  shown at the dividend's scale plus 4 — `10 / 3` is `3.3333` — and NULL for a zero divisor) and `AVG` likewise,
-  `ROUND`/`TRUNCATE(x, d)` of a `FLOAT`/`DOUBLE` in double precision as MySQL computes them (of an integer, the
-  integer), `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL
+  (a string read by its leading integer) and wrapping a negative number as MySQL does, `/` of integers and
+  decimals as MySQL's exact division (computed with the fraction digits MySQL keeps, truncated — 9 for integers,
+  so `2 / 3 * 1000000` is `666666.6660` — shown at the dividend's scale plus 4 — `10 / 3` is `3.3333` — and NULL
+  for a zero divisor) and `AVG` likewise, `SUM` of a `FLOAT` in double precision as MySQL adds it,
+  `ROUND`/`TRUNCATE(x, d)` of a `FLOAT`/`DOUBLE` in double precision as MySQL computes them (to places read at
+  run time too; of an integer, the integer), a `TINYINT(1)` (a boolean on Aurora DSQL) used as a number as its
+  integer, `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL
   does, `LENGTH` as the bytes of its text (a `CHAR(n)` column without its padding, a JSON value as its text), a
   `DATE` plus days/months staying a `DATE` (an amount read from a column or an expression, or a fraction,
-  counted in whole units as MySQL counts it; a date string with a two-digit year read as MySQL reads it),
+  counted in whole units as MySQL counts it — a string by its leading integer — and a composite unit such as
+  `'1 2' DAY_HOUR` by its parts; a date string with a two-digit year, or as `yyyymmdd`, read as MySQL reads it),
   `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column), `JSON_ARRAY`/`JSON_ARRAYAGG`
   keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL does, MySQL's `->>` (which MySQL stores in a
   view as `json_unquote(json_extract(...))`) as `JSON_EXTRACT_PATH_TEXT`, `STR_TO_DATE` typed as MySQL types it
@@ -470,7 +474,21 @@ MySQL→PostgreSQL transpile:
   way (in an `UPDATE`, a `DELETE` and an `ON DUPLICATE KEY UPDATE` too), typed by the Evaluation inventory once
   Step 1 has run. `LENGTH` and `BINARY` of a column whose type cannot be told — read through another view, a
   derived table or a CTE, or in the Query Converter before Step 1 — read the column's own bytes, which is right for
-  a text or a binary column; over a number or a date, Aurora DSQL refuses it. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  a text or a binary column; over a number or a date, Aurora DSQL refuses it. A quotient is shown at its scale
+  where MySQL shows it: a statement's output and a text, and the rows of a view, derived table or CTE that MySQL
+  materializes — one with an aggregate, a window, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, a `UNION`, no table,
+  or an output holding a subquery that reads its row — each stored at its column's scale (a window's values too).
+  A view MySQL merges into the query that reads it is computed there, with every digit the quotient keeps, so the
+  view is left unrounded and its readers return MySQL's results; its own `SELECT *` then shows `0.333333333` where
+  MySQL shows `0.3333`, and a view reading it, which cannot know the column is a quotient (a PostgreSQL view does
+  not merge into its reader), shows what it computes from it with those digits too and rounds or truncates it to
+  as many places as asked (MySQL keeps no more than the quotient's scale: `TRUNCATE(v.q, 6)` of `1 / 3` is
+  `0.3333`). Not reproduced: MySQL keys a
+  `GROUP BY`, a window's `PARTITION BY` / `ORDER BY` and a `COUNT(DISTINCT ...)` on a quotient at its shown scale
+  (`1 / 3` and `3333 / 10000` are one key), and grouping through a temporary table (no index on the grouping
+  columns) it also sums a quotient at that scale; the conversion keys and sums on the digits kept — group by
+  `ROUND(q, 4)` where that matters. A `GREATEST`/`LEAST` nested more than three levels deep behind `IFNULL`, `IF`,
+  `CASE` or another function, and a composite-unit interval read from a column, are flagged MANUAL. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column

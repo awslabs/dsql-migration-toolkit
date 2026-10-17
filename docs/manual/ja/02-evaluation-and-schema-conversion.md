@@ -361,12 +361,16 @@ MySQL→PostgreSQL トランスパイルではありません。
   MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
   あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
   そのバイトに(比較・`ORDER BY`・`GROUP BY` では Aurora DSQL がすでにバイト単位で比較するので省略)、`CAST(x AS UNSIGNED)` は
-  MySQL と同じく先に丸めてから負の数を循環させて、整数と decimal の `/` は MySQL の正確な除算として(被除数のスケールに 4 を
-  足した decimal で表示し — `10 / 3` は `3.3333` — 0 で割ると NULL)`AVG` も同様に、`FLOAT`/`DOUBLE` の
-  `ROUND`/`TRUNCATE(x, d)` は MySQL と同じく倍精度で計算して(整数はその整数のまま)、`GROUP_CONCAT` は text 上の集計に、
+  MySQL と同じく先に丸めてから(文字列は先頭の整数として読んで)負の数を循環させて、整数と decimal の `/` は MySQL の正確な
+  除算として(MySQL が保つ小数桁で切り捨てて計算し — 整数なら 9 桁で、`2 / 3 * 1000000` は `666666.6660` — 被除数のスケールに
+  4 を足した decimal で表示し — `10 / 3` は `3.3333` — 0 で割ると NULL)`AVG` も同様に、`FLOAT` の `SUM` は MySQL と同じく
+  倍精度で足して、`FLOAT`/`DOUBLE` の `ROUND`/`TRUNCATE(x, d)` は MySQL と同じく倍精度で計算して(実行時に読む桁数でも。
+  整数はその整数のまま)、数値として使う `TINYINT(1)`(Aurora DSQL では boolean)はその整数として、`GROUP_CONCAT` は text
+  上の集計に、
   `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はテキストのバイト数に
   (`CHAR(n)` 列は埋め草の空白なしで、JSON 値はそのテキストで)、`DATE` に日・月を足しても `DATE` のままに(列や式から読む量や
-  小数は MySQL と同じく整数単位で数え、2 桁の年の日付文字列は MySQL と同じく解釈)、`+hh:mm` オフセットの `CONVERT_TZ`
+  小数は MySQL と同じく整数単位で数え — 文字列は先頭の整数として — `'1 2' DAY_HOUR` のような複合単位はその各部分として、
+  2 桁の年や `yyyymmdd` の日付文字列は MySQL と同じく解釈)、`+hh:mm` オフセットの `CONVERT_TZ`
   (リテラルでも列から読む値でも)、NULL を保ち `DATETIME` と `TINYINT(1)` を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、
   MySQL の `->>`(MySQL はビューに `json_unquote(json_extract(...))` として保存します)は `JSON_EXTRACT_PATH_TEXT` に、MySQL と
   同じく書式に応じて `TIME`/`DATE`/`DATETIME` を返す `STR_TO_DATE`(空文字列は NULL、2 桁の年は MySQL と同じく解釈、書式を
@@ -383,7 +387,19 @@ MySQL→PostgreSQL トランスパイルではありません。
   Query Converter も同じ MySQL の式を同じように書き(`UPDATE`、`DELETE`、`ON DUPLICATE KEY UPDATE` でも)、ステップ 1 を
   実行していれば Evaluation のインベントリの型を使います。型がわからない列 — 別のビューや派生テーブル、CTE を経て読む列や、
   ステップ 1 の前の Query Converter の列 — の `LENGTH` と `BINARY` は、その列自体のバイトを読みます。テキストやバイナリの列には
-  正しいものの、数値や日付には Aurora DSQL が拒否します。
+  正しいものの、数値や日付には Aurora DSQL が拒否します。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
+  テキスト、そして MySQL が実体化(materialize)するビュー・派生テーブル・CTE — 集計、ウィンドウ、`DISTINCT`、`GROUP BY`、
+  `HAVING`、`LIMIT`、`UNION` を持つもの、テーブルのないもの、自身の行を読むサブクエリを含む出力を持つもの — の行で、それぞれ
+  その列のスケールで保存されます(ウィンドウの値も)。MySQL が読み手のクエリにマージするビューはそこで商が保つすべての桁で
+  計算されるため、ビューは丸めずに残し、読み手のクエリは MySQL と同じ結果を返します。その代わり、そのビュー自体の
+  `SELECT *` は MySQL が `0.3333` を表示するところで `0.333333333` を表示し、そのビューを読むビューはその列が商だと知り得ない
+  ため(PostgreSQL のビューは読み手にマージされません)、そこから計算した値もその桁で表示し、求められた桁数どおりに丸め・
+  切り捨てます(MySQL は商のスケールより多い桁を残さず、`1 / 3` の `TRUNCATE(v.q, 6)` は `0.3333`)。再現しないもの: MySQL は
+  商の `GROUP BY`、ウィンドウの `PARTITION BY` / `ORDER BY`、`COUNT(DISTINCT ...)` を表示スケールでキーにし(`1 / 3` と
+  `3333 / 10000` は同じキー)、一時テーブルでグループ化するとき(グループ化列にインデックスがないとき)は商をそのスケールで
+  足しもします。変換は保った桁でキーにして足すため、それが重要なら `ROUND(q, 4)` でグループ化してください。`IFNULL`、`IF`、
+  `CASE` などの関数の奥に 3 段より深く入れ子になった `GREATEST`/`LEAST` と、列から読む複合単位の interval には MANUAL の
+  フラグが付きます。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

@@ -1520,6 +1520,20 @@ class QueryConverter:
         return self._source_type is SourceType.POSTGRES
 
     def convert(self, sql: str, *, pretty: bool = False) -> QueryConversionResult:
+        """:meth:`_convert`, which never raises: a statement nested deeper than the
+        conversion walks (a generated expression of thousands of operators or parentheses)
+        is flagged for manual review, as a view is."""
+        try:
+            return self._convert(sql, pretty=pretty)
+        except RecursionError:
+            return self._manual_review(
+                sql,
+                CODE_RENDER_ERROR,
+                "The statement is nested too deeply to convert (an expression of thousands of "
+                "operators or parentheses); flag for manual review, or split the expression.",
+            )
+
+    def _convert(self, sql: str, *, pretty: bool = False) -> QueryConversionResult:
         """Convert one source statement and return the original/converted pair.
 
         Parses ``sql`` in the source dialect, rewrites ``ON DUPLICATE KEY UPDATE``,
