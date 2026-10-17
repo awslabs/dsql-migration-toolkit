@@ -344,11 +344,11 @@ write-contract test enforces it), so a row lands the same whichever path migrate
 PG-16 → DSQL pass-through** — DSQL-supported types (the int family, `numeric`/`decimal`,
 `char`/`varchar`/`text`, date/time/`timestamp[tz]`, `interval`, `boolean`, `bytea`,
 `uuid`, `json`, `jsonb`) carry over **verbatim**, with no MySQL-style translation.
-PostgreSQL types with no DSQL equivalent are flagged **UNSUPPORTED** and must be
-remodeled; where a stand-in keeps the value, Schema Conversion emits it with a warning
-naming the type change (never silently): arrays → `jsonb` / child table; geometric,
+PostgreSQL types with no DSQL equivalent are re-typed where a stand-in keeps the value,
+with a warning naming the type change, and graded **MANUAL** (the application adapts); a
+composite type, a domain or pgvector has none and is **UNSUPPORTED** until remodeled: arrays → `jsonb` / child table; geometric,
 network (`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`, `tsvector`/`tsquery`,
-`range` / multirange → `text`; `money` → `numeric`; `pgvector` → `jsonb`/`text`;
+`range` / multirange → `text`; `money` → `numeric(23,4)`; `pgvector` → `jsonb`/`text`;
 `enum` → `text`; composite → columns / `jsonb`. `numeric(p,s)` is kept (Aurora DSQL allows
 the same precision 1000 PostgreSQL does); a bare `numeric`/`decimal` → DSQL `numeric(18,6)`;
 column `DEFAULT`s are kept **as written**, except a `nextval` (a key's is governed by the
@@ -379,9 +379,11 @@ as `pg_cron` — move to EventBridge / Lambda). See
 
 **Q21. My table has no primary key. Can I migrate it?**
 
-Not as-is. DSQL **requires a primary key**, and the tool's keyset export also needs
-one, so a PK-less table is flagged **UNSUPPORTED** and can't be loaded. Add a
-primary key on the source (or in your redesign) first.
+Not as-is. Aurora DSQL can create a table without a primary key, but this tool needs
+one — Full Load reads by primary-key keyset and CDC applies changes by key — so a PK-less
+table is flagged **UNSUPPORTED** and can't be loaded. Add a primary key on the source (or in
+your redesign) first; Evaluation names a UNIQUE index whose columns are all NOT NULL, which
+already identifies each row, when there is one.
 
 ---
 

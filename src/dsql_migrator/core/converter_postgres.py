@@ -166,7 +166,9 @@ def pg_column_default_sql(
         )
     bad_type = _pg_default_unsupported_type(raw)
     if bad_type is not None:
-        example = "a number" if substitute == "numeric" else "a plain text literal"
+        example = (
+            "a number" if (substitute or "").startswith("numeric") else "a plain text literal"
+        )
         return None, (
             f"source default ({raw}) casts to '{bad_type}', a PostgreSQL type Aurora DSQL "
             "does not support as a column type, so the default is not carried -- it would "
@@ -655,7 +657,10 @@ def clamp_pg_character(pg_type: str) -> "tuple[str, Optional[str]]":
 # a bit string as its TEXT, so binding it to bytea stored the ASCII digits of "10101010"
 # rather than the byte 0xAA.
 _PG_SUBSTITUTE_TARGET = {
-    "money": "numeric",
+    # Declared, not bare: Aurora DSQL stores a bare numeric as numeric(18,6), which refused
+    # every amount from 10^12 up. money is an int64 of the locale's minor unit, so 19
+    # integer digits (no decimals) to 4 decimals covers every lc_monetary.
+    "money": "numeric(23,4)",
     "inet": "text",
     "cidr": "text",
     "macaddr": "text",
@@ -800,7 +805,7 @@ _PG_UNSUPPORTED_REMODEL = {
     "macaddr": "text",
     "macaddr8": "text",
     "xml": "text",
-    "money": "numeric (preserves the exact amount; avoid locale-formatted text)",
+    "money": "numeric(23,4) (preserves the exact amount; avoid locale-formatted text)",
     # NOT bytea: the loader reads a bit string as its text, so binding it to bytea
     # stored the ASCII digits of "10101010" rather than the byte 0xAA -- silent
     # corruption a green DONE hid, catchable only by a CHECKSUM validation. Advise only

@@ -1938,9 +1938,9 @@ def test_ui_chart_axis_uses_friendly_kind_labels() -> None:
 
 
 def test_run_evaluation_threads_postgres_source_type_to_assessor() -> None:
-    # Tier-3 #25: a PostgreSQL array column is UNSUPPORTED under PG assessor rules but would
-    # be assessed differently under MySQL rules, so this proves run_evaluation built the
-    # assessor with the SESSION's source_type (POSTGRES), not the MySQL default.
+    # Tier-3 #25: a PostgreSQL array column is graded by the PG assessor rules (re-typed to
+    # jsonb: MANUAL) but would be assessed differently under MySQL rules, so this proves
+    # run_evaluation built the assessor with the SESSION's source_type (POSTGRES).
     inv = SourceInventory(tables=[TableDef(
         name="t",
         columns=[
@@ -1968,7 +1968,7 @@ def test_run_evaluation_threads_postgres_source_type_to_assessor() -> None:
     }
     assert "PG_UNSUPPORTED_TYPE" in rule_ids  # PG rules ran (not MySQL)
     item = next(it for it in result.assessment.items if it.object_name == "t")
-    assert item.classification is Classification.UNSUPPORTED
+    assert item.classification is Classification.MANUAL
 
 
 def test_an_evaluation_over_zero_tables_says_check_the_database() -> None:

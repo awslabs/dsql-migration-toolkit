@@ -332,10 +332,11 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 **PostgreSQL 소스**의 경우, 변환과 데이터 경로는 **거의 동일한(near-identity) PG-16 → DSQL 패스스루**입니다
 — DSQL이 지원하는 타입(정수 계열, `numeric`/`decimal`, `char`/`varchar`/`text`, date/time/`timestamp[tz]`,
 `interval`, `boolean`, `bytea`, `uuid`, `json`, `jsonb`)은 MySQL식 변환 없이 **그대로** 넘어갑니다.
-DSQL에 대응이 없는 PostgreSQL 타입은 **UNSUPPORTED**로 표시되고 재모델링해야 합니다(값을 보존하는 대체
-타입이 있으면 Schema Conversion이 타입 변경을 밝히는 경고와 함께 출력하며, 조용히 바꾸지 않습니다):
+DSQL에 대응이 없는 PostgreSQL 타입은 값을 보존하는 대체 타입이 있으면 타입 변경을 밝히는 경고와 함께
+바뀌고 **MANUAL**로 평가됩니다(애플리케이션이 맞춤). composite 타입, domain, pgvector는 대체 타입이 없어
+재모델링 전까지 **UNSUPPORTED**입니다:
 배열 → `jsonb` / 자식 테이블; 기하(geometric), 네트워크(`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`,
-`tsvector`/`tsquery`, `range` / multirange → `text`; `money` → `numeric`; `pgvector` → `jsonb`/`text`;
+`tsvector`/`tsquery`, `range` / multirange → `text`; `money` → `numeric(23,4)`; `pgvector` → `jsonb`/`text`;
 `enum` → `text`; composite → 컬럼 / `jsonb`. `numeric(p,s)`는 그대로 유지되고(Aurora DSQL도 PostgreSQL과
 같은 정밀도 1000을 허용), 순수 `numeric`/`decimal`은 DSQL `numeric(18,6)`이 되며, 컬럼 `DEFAULT`는
 **원문 그대로** 유지됩니다(`nextval`은 예외: 키의 것은 PK 전략이 관장하고, 키가 아닌 것은 계속 값을
@@ -366,8 +367,9 @@ DSQL에 대응이 없는 PostgreSQL 타입은 **UNSUPPORTED**로 표시되고 �
 
 **Q21. 테이블에 기본 키가 없습니다. 이전할 수 있나요?**
 
-그대로는 옮길 수 없습니다. DSQL은 **기본 키가 반드시 있어야** 하고, 도구가 데이터를 읽는 방식(PK 기준
-keyset 페이지네이션)도 기본 키를 필요로 합니다. 그래서 기본 키가 없는 테이블은 **UNSUPPORTED로
+그대로는 옮길 수 없습니다. Aurora DSQL은 기본 키 없는 테이블도 만들 수 있지만, 이 도구는 기본 키가 필요합니다 —
+Full Load는 PK 기준 keyset으로 읽고 CDC는 키로 변경을 적용합니다. 모든 컬럼이 NOT NULL인 UNIQUE 인덱스가 있으면
+Evaluation이 그 인덱스를 후보로 알려 줍니다. 그래서 기본 키가 없는 테이블은 **UNSUPPORTED로
 표시되어** 적재되지 않습니다. 먼저 소스에(또는 재설계 과정에서) 기본 키를 추가한 뒤 진행하세요.
 
 ---

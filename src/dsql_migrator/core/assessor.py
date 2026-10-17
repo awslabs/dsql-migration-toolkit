@@ -886,7 +886,8 @@ class AutoIncrementRule(Rule):
 
 
 class NoPrimaryKeyRule(Rule):
-    """Flag tables without a primary key (DSQL requires a primary key)."""
+    """Flag tables without a primary key: Aurora DSQL creates one (verified live), but this
+    tool cannot migrate it -- Full Load reads by primary-key keyset and CDC applies by key."""
 
     rule_id = "NO_PRIMARY_KEY"
 
@@ -894,16 +895,34 @@ class NoPrimaryKeyRule(Rule):
         findings: list[Finding] = []
         for table in inventory.tables:
             if not table.primary_key:
+                # A UNIQUE index whose columns are all NOT NULL already identifies a row:
+                # the natural key to promote, named rather than a generic "add a UUID".
+                nullable = {c.name for c in table.columns if c.nullable}
+                candidates = [
+                    f"{index.name} ({', '.join(index.columns)})"
+                    for index in table.indexes
+                    if index.unique and index.columns and not set(index.columns) & nullable
+                ]
+                recommendation = (
+                    f"Promote a unique key to the primary key on the source -- "
+                    f"{', '.join(candidates[:3])} already identifies each row -- or add one "
+                    "(e.g. a UUID/random key) before migrating the table."
+                    if candidates
+                    else "Add a primary key on the source (e.g. a UUID/random key) before "
+                    "migrating the table."
+                )
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
                         rule_id=self.rule_id,
                         classification=Classification.UNSUPPORTED,
-                        risk="Aurora DSQL requires every table to have a primary key.",
-                        recommendation=(
-                            "Add a primary key (e.g., a UUID/random key) before "
-                            "migrating the table."
+                        risk=(
+                            "This table has no primary key. Aurora DSQL can create a table "
+                            "without one, but this migrator cannot migrate it: Full Load "
+                            "reads rows by primary-key keyset and CDC replicates by primary "
+                            "key, so there is no unit to paginate or stable row identity."
                         ),
+                        recommendation=recommendation,
                         effort=EffortLevel.MEDIUM,
                     )
                 )
@@ -1242,9 +1261,9 @@ class TooManyKeyColumnsRule(Rule):
                 )
             if wide_indexes:
                 when.append(
-                    "A wide secondary index fails its CREATE INDEX ASYNC, which runs "
-                    "AFTER Full Load, so the failure appears only once every row has "
-                    "already been written"
+                    "A wide secondary index is left out of the converted DDL (it would "
+                    "fail its CREATE INDEX ASYNC after Full Load), so queries relying on it "
+                    "fall back to a scan, and a UNIQUE one's uniqueness is not enforced"
                 )
 
             findings.append(
@@ -1257,8 +1276,8 @@ class TooManyKeyColumnsRule(Rule):
                     risk=(
                         f"{'; '.join(risk_parts)}. Aurora DSQL allows at most "
                         f"{_MAX_KEY_COLUMNS} columns in a primary key or secondary "
-                        "index, so these fail with error 54011 "
-                        f'"more than {_MAX_KEY_COLUMNS} column keys are not allowed". '
+                        "index (error 54011 "
+                        f'"more than {_MAX_KEY_COLUMNS} column keys are not allowed"). '
                         f"{'. '.join(when)}."
                     ),
                     recommendation=(

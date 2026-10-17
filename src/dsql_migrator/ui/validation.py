@@ -3474,7 +3474,9 @@ def build_validation_screen(
                     ),
                 )
 
-        validation_state.job_id = job_manager.submit(work)
+        # Not durable (as Evaluation): a run is not resumed after a restart, and a stored
+        # one counted toward the retention cap that could evict a Full Load job.
+        validation_state.job_id = job_manager.submit(work, durable=False)
 
     def _recheck(tables: "Sequence[str]") -> None:
         """Re-validate ONLY ``tables`` and merge the result into the current report.
@@ -3611,7 +3613,7 @@ def build_validation_screen(
                 orphan_findings=(orphans if options.check_orphans else None),
             )
 
-        validation_state.job_id = job_manager.submit(work)
+        validation_state.job_id = job_manager.submit(work, durable=False)
 
     def _legacy_context_safe():
         try:

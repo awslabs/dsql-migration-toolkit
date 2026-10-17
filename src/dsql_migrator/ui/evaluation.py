@@ -1784,8 +1784,10 @@ def build_evaluation_screen(
                 )
 
         eval_state.job_token = token
+        # Not durable: nothing resumes a read-only Evaluation after a restart, and stored
+        # runs counted toward the retention cap that could evict a Full Load job.
         eval_state.job_id = job_manager.submit(
-            work, stall_message=EVALUATION_STALL_MESSAGE
+            work, stall_message=EVALUATION_STALL_MESSAGE, durable=False
         )
 
     def content(refresh: Callable[[], None]) -> None:

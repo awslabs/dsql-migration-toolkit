@@ -680,3 +680,24 @@ def test_a_raising_stall_listener_never_breaks_the_reap() -> None:
     finally:
         release.set()
         mgr.shutdown()
+
+
+def test_a_non_durable_job_never_reaches_the_store() -> None:
+    """Every Evaluation and Validation run was stored, so they counted toward the startup
+    prune's 100 DONE jobs -- enough of them evicted a Full Load job and the watermark it
+    carries for Start CDC."""
+    import time as _t
+
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.core.job_store import InMemoryJobStore
+
+    store = InMemoryJobStore()
+    manager = JobManager(store=store)
+    kept = manager.submit(lambda handle: None)
+    transient = manager.submit(lambda handle: None, durable=False)
+    deadline = _t.monotonic() + 5
+    while _t.monotonic() < deadline and manager.get_status(transient).status != "DONE":
+        _t.sleep(0.01)
+    stored = {p.job.job_id for p in store.load_all()}
+    assert kept in stored and transient not in stored
+    assert manager.get_status(transient).status == "DONE"  # still served from memory

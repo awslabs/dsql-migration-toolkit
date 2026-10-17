@@ -1308,7 +1308,9 @@ def test_wide_secondary_index_is_manual_and_names_the_post_load_timing() -> None
     assert "ix_1 (10 columns)" in finding.risk
     assert "ix_3 (16 columns)" in finding.risk
     assert "ix_2" not in finding.risk
-    assert "AFTER Full Load" in finding.risk
+    # Schema Conversion leaves a wide index out (it would fail after Full Load), and the
+    # finding says what the conversion does rather than a failure that no longer happens.
+    assert "left out of the converted DDL" in finding.risk
 
 
 def test_wide_pk_and_wide_index_report_the_worst_case_once() -> None:
@@ -2347,3 +2349,23 @@ def test_too_many_indexes_counts_only_the_indexes_the_conversion_can_create() ->
     item = _item_for(_assess(SourceInventory(tables=[table])), "app.wide")
     assert "TOO_MANY_INDEXES" not in {c.rule_id for c in item.concerns}
     assert "BYTEA_KEY" in {c.rule_id for c in item.concerns}
+
+
+
+def test_a_table_without_a_primary_key_names_its_natural_key() -> None:
+    """The finding said 'Aurora DSQL requires every table to have a primary key' (it does
+    not -- the migrator does) and named no candidate."""
+    from dsql_migrator.core.assessor import NoPrimaryKeyRule
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="shop.events",
+        columns=[ColumnDef(name="code", mysql_type="varchar(20)", nullable=False),
+                 ColumnDef(name="note", mysql_type="text")],
+        primary_key=[],
+        indexes=[IndexDef(name="ux_code", columns=["code"], unique=True),
+                 IndexDef(name="ux_note", columns=["note"], unique=True)],
+    )
+    (finding,) = NoPrimaryKeyRule().evaluate(SourceInventory(tables=[table]))
+    assert "Aurora DSQL can create a table without one" in finding.risk
+    assert "ux_code (code)" in finding.recommendation and "ux_note" not in finding.recommendation

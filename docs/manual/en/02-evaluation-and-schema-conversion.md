@@ -320,7 +320,7 @@ Work the list top-down by severity:
 
 > **PostgreSQL source.** The same top-down triage applies. Remodel unsupported PG types
 > before you convert — arrays → `jsonb` or a child table; `network`/`xml`/`bit`/range →
-> `text`; `money` → `numeric`; `enum` → `text`; composite → separate columns or `jsonb`.
+> `text`; `money` → `numeric(23,4)`; `enum` → `text`; composite → separate columns or `jsonb`.
 > The PG **CDC** prerequisite of a usable `REPLICA IDENTITY` on each replicated table
 > belongs to the Data Migration step, not here (see
 > [Chapter 4](04-cdc-and-dsql-constraints.md)).

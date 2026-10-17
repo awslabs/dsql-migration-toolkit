@@ -1752,7 +1752,8 @@ def test_a_dsql_unsupported_pg_type_is_substituted_so_the_ddl_applies() -> None:
         ("integer[]", "jsonb"),
         ("numrange", "text"),
         ("int4range", "text"),
-        ("money", "numeric"),
+        # Declared: a bare numeric is numeric(18,6) on Aurora DSQL, which refuses 10^12.
+        ("money", "numeric(23,4)"),
         ("inet", "text"),
         ("cidr", "text"),
         ("xml", "text"),
@@ -1827,12 +1828,14 @@ def test_the_read_expression_matches_the_type_the_converter_now_emits() -> None:
         # The applied DDL really carries the substitute (this is what the loader reads).
         # `numeric` round-trips through sqlglot as its `decimal` alias, which the reader
         # accepts as the same target -- so the pair is treated as equivalent here.
-        equivalent = {"numeric": {"numeric", "decimal"}}.get(expected, {expected})
-        assert applied.get(column.name) in equivalent, (column.mysql_type, applied)
+        equivalent = {"numeric": {"numeric", "decimal"}}.get(
+            expected.split("(", 1)[0], {expected}
+        )
+        assert applied.get(column.name).split("(", 1)[0] in equivalent, (column.mysql_type, applied)
         read = dialect.select_column_sql(column, target_type=applied.get(column.name))
         if expected == "jsonb":
             assert "to_jsonb(" in read, read
-        elif expected == "numeric":
+        elif expected.startswith("numeric"):
             assert "AS numeric)" in read, read
         else:
             assert "AS text)" in read, read

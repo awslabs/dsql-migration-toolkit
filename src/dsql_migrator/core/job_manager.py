@@ -134,6 +134,8 @@ class _JobRecord:
     # What the stall watchdog reports for THIS job ("{seconds}" is filled in); None keeps
     # the Full Load wording, which a read-only Evaluation must not get.
     stall_message: Optional[str] = None
+    # False: never written to the store (see JobManager.submit).
+    durable: bool = True
 
 
 class JobHandle:
@@ -298,8 +300,9 @@ class JobManager:
                 self._persist_locked(record)
 
     def _persist_locked(self, record: _JobRecord) -> None:
-        """Persist ``record`` to the store, if any. Must hold the lock."""
-        if self._store is not None:
+        """Persist ``record`` to the store, if any (a non-durable job never is). Must hold
+        the lock."""
+        if self._store is not None and record.durable:
             self._store.save(record.job, record.error)
 
     def prune_terminal(self, keep_most_recent: int) -> int:
@@ -332,8 +335,14 @@ class JobManager:
         *,
         job_id: Optional[str] = None,
         stall_message: Optional[str] = None,
+        durable: bool = True,
     ) -> str:
         """Start ``work`` on a background thread and return its ``job_id`` now.
+
+        ``durable=False`` keeps the job out of the store: a run nothing resumes after a
+        restart (an Evaluation, a Validation run) must not count toward the store's
+        retention cap, where enough of them evicted a Full Load job -- and the watermark it
+        carries for Start CDC -- at the next startup prune.
 
         Creates the job in ``PENDING`` state and launches a daemon thread that
         transitions it to ``RUNNING``, runs ``work(handle)``, then marks it
@@ -360,6 +369,7 @@ class JobManager:
                 thread=thread,
                 last_progress_at=self._clock(),
                 stall_message=stall_message,
+                durable=durable,
             )
             self._records[new_id] = record
             self._persist_locked(record)

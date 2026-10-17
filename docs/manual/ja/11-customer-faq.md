@@ -312,9 +312,10 @@ Evaluation は **すべてのオブジェクト** を、**AUTO**（自動的に�
 **PostgreSQL ソース** の場合、変換とデータパスは **ほぼ同一（near-identity）の PG-16 → DSQL パススルー** です
 — DSQL がサポートする型（整数系、`numeric`/`decimal`、`char`/`varchar`/`text`、date/time/`timestamp[tz]`、
 `interval`、`boolean`、`bytea`、`uuid`、`json`、`jsonb`）は MySQL 式の変換なしに **そのまま** 引き継がれます。
-DSQL に相当のない PostgreSQL 型は **UNSUPPORTED** としてフラグが立ち、再モデリングが必要です（値を保つ
-代替型がある場合、Schema Conversion は型の変更を示す警告付きでそれを出力し、黙って置き換えることはありません）: 配列 → `jsonb` / 子テーブル、幾何（geometric）・ネットワーク（`inet`/`cidr`/`macaddr`）・`xml`・
-`bit`/`varbit`・`tsvector`/`tsquery`・`range` / マルチレンジ → `text`、`money` → `numeric`、
+DSQL に相当のない PostgreSQL 型は、値を保つ代替型がある場合は型の変更を示す警告付きで置き換えられ、
+**MANUAL** と評価されます（アプリケーションが合わせます）。composite 型、domain、pgvector には代替型がなく、
+再モデリングするまで **UNSUPPORTED** です: 配列 → `jsonb` / 子テーブル、幾何（geometric）・ネットワーク（`inet`/`cidr`/`macaddr`）・`xml`・
+`bit`/`varbit`・`tsvector`/`tsquery`・`range` / マルチレンジ → `text`、`money` → `numeric(23,4)`、
 `pgvector` → `jsonb`/`text`、`enum` → `text`、composite → 列 / `jsonb`。`numeric(p,s)` はそのまま維持され
 （Aurora DSQL も PostgreSQL と同じ精度 1000 を許可）、素の `numeric`/`decimal` は DSQL の `numeric(18,6)` になり、
 列の `DEFAULT` は **記述どおり** 維持されます（`nextval` は例外: キーのものは PK 戦略が管理し、キー以外のものは値を
@@ -341,7 +342,7 @@ post-load の `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` として DSQL �
 
 **Q21. テーブルに主キーがありません。移行できますか？**
 
-そのままでは移行できません。DSQL は **主キーを必須とし**、ツールの keyset エクスポートも主キーを必要とするため、
+そのままでは移行できません。Aurora DSQL は主キーのないテーブルも作成できますが、このツールは主キーを必要とします — Full Load は主キーの keyset で読み、CDC はキーで変更を適用します (全列が NOT NULL の UNIQUE インデックスがあれば Evaluation が候補として示します)。そのため、
 主キーのないテーブルは **UNSUPPORTED** としてフラグが立ち、ロードできません。まずソースで（または再設計の中で）
 主キーを追加してください。
 

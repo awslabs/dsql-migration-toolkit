@@ -256,7 +256,7 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 3. **AUTO 항목**은 할 일 없음.
 
 > **PostgreSQL 소스.** 동일한 하향식 분류가 적용됩니다. 변환 전에 미지원 PG 타입을 다시 모델링하세요 —
-> 배열 → `jsonb` 또는 자식 테이블, `network`/`xml`/`bit`/range → `text`, `money` → `numeric`,
+> 배열 → `jsonb` 또는 자식 테이블, `network`/`xml`/`bit`/range → `text`, `money` → `numeric(23,4)`,
 > `enum` → `text`, composite → 개별 컬럼 또는 `jsonb`. 각 복제 테이블에 사용 가능한 `REPLICA IDENTITY`가
 > 있어야 한다는 PG **CDC** 전제조건은 여기가 아니라 Data Migration 단계에 속합니다
 > ([4장](04-cdc-and-dsql-constraints.md) 참고).

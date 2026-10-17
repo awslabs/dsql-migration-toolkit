@@ -275,7 +275,7 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 
 > **PostgreSQL ソース。** 同じトップダウンのトリアージが適用されます。変換の前に、サポートされない PG 型を
 > 作り直してください — 配列 → `jsonb` または子テーブル、`network`/`xml`/`bit`/range → `text`、
-> `money` → `numeric`、`enum` → `text`、composite → 個別のカラムまたは `jsonb`。各複製テーブルに
+> `money` → `numeric(23,4)`、`enum` → `text`、composite → 個別のカラムまたは `jsonb`。各複製テーブルに
 > 使用可能な `REPLICA IDENTITY` が必要という PG **CDC** の前提条件は、ここではなく Data Migration
 > ステップに属します([第 4 章](04-cdc-and-dsql-constraints.md) を参照)。
 

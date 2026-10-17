@@ -144,19 +144,60 @@ class UnsupportedPostgresTypeRule(Rule):
     rule_id = "PG_UNSUPPORTED_TYPE"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
-        from dsql_migrator.core.converter_postgres import unsupported_dsql_reason
+        from dsql_migrator.core.converter_postgres import (
+            substitute_pg_unsupported_type,
+            unsupported_dsql_reason,
+        )
 
         findings: list[Finding] = []
         for table in inventory.tables:
             bad = []
+            retyped = []
+            guidance = []  # every such column's own remodel line, in table order
             for col in table.columns:
                 reason = unsupported_dsql_reason(
                     col.mysql_type,
                     type_kind=col.type_kind,
                     enum_labels=col.enum_labels,
                 )
-                if reason is not None:
+                if reason is None:
+                    continue
+                # What Schema Conversion does with the column decides the grade, as it
+                # decides the conversion's: a type it re-types (an array as jsonb, an enum
+                # as text with a CHECK, inet as text, money as numeric) applies -- the
+                # application adapts to the new type -- while one with no stand-in (a
+                # composite, a domain, a label-less enum) is rejected as-is.
+                target = (
+                    "text" if col.type_kind == "enum" and col.enum_labels
+                    else substitute_pg_unsupported_type(col.mysql_type, type_kind=col.type_kind)[0]
+                )
+                if target is not None:
+                    retyped.append((col.name, col.mysql_type, target))
+                    guidance.append((col.name, col.mysql_type, reason, col.type_kind))
+                else:
                     bad.append((col.name, col.mysql_type, reason, col.type_kind))
+                    guidance.append((col.name, col.mysql_type, reason, col.type_kind))
+            if retyped and not bad:
+                listed = ", ".join(f'"{name}" ({old} -> {new})' for name, old, new in retyped)
+                findings.append(
+                    Finding(
+                        object=ObjectKey(KIND_TABLE, table.name),
+                        rule_id=self.rule_id,
+                        classification=Classification.MANUAL,
+                        risk=(
+                            f"{len(retyped)} column(s) of this table use a PostgreSQL type "
+                            "Aurora DSQL does not have, so Schema Conversion re-types each "
+                            f"to one that holds the same data: {listed}. The table applies "
+                            "and Full Load carries every value, but the TYPE changes, so "
+                            "application code that relies on the old type's operators or "
+                            "functions (array subscripts, range or network operators, enum "
+                            "ordering) must change."
+                        ),
+                        recommendation=_render_remodel_guidance(guidance),
+                        effort=EffortLevel.MEDIUM,
+                    )
+                )
+                continue
             if not bad:
                 continue
             findings.append(
@@ -168,6 +209,14 @@ class UnsupportedPostgresTypeRule(Rule):
                         f"{len(bad)} column(s) of this table use a PostgreSQL data type "
                         "Aurora DSQL does not support as a column type, so its CREATE "
                         f"would be rejected as-is: {_render_bad_columns(bad)}."
+                        + (
+                            " Schema Conversion re-types the others to a type that holds the "
+                            "same data, which the application must adapt to: "
+                            + ", ".join(f'"{n}" ({o} -> {t})' for n, o, t in retyped)
+                            + "."
+                            if retyped
+                            else ""
+                        )
                         # The KIND is what the operator needs first -- a user-defined type
                         # cannot be created on DSQL at all (no CREATE TYPE), which is a
                         # different problem from a built-in type that is merely outside the
@@ -186,7 +235,7 @@ class UnsupportedPostgresTypeRule(Rule):
                     # generic mappings and left to work out which of them applied, while
                     # Schema Conversion (the same function, same column) told them
                     # precisely. Two steps, one column, different answers.
-                    recommendation=_render_remodel_guidance(bad),
+                    recommendation=_render_remodel_guidance(guidance),
                     effort=EffortLevel.MEDIUM,
                 )
             )

@@ -172,11 +172,19 @@ def test_pg_unsupported_type_rule_flags_dsql_unsupported_columns() -> None:
     assert len(findings) == 1
     f = findings[0]
     assert f.rule_id == "PG_UNSUPPORTED_TYPE"
-    assert f.classification is Classification.UNSUPPORTED
+    # Schema Conversion re-types both (text[] -> jsonb, inet -> text): the table applies,
+    # the application adapts -- MANUAL, as the conversion grades it, not UNSUPPORTED.
+    assert f.classification is Classification.MANUAL
     assert f.effort is EffortLevel.MEDIUM
-    assert "tags" in f.risk and "ip" in f.risk  # the unsupported columns are named
+    assert '"tags" (text[] -> jsonb)' in f.risk and '"ip" (inet -> text)' in f.risk
     assert "note" not in f.risk  # a supported column is not
-    assert "jsonb" in f.recommendation  # names the faithful remodel targets
+    # A type with no stand-in (a composite) is still rejected as-is.
+    composite = table.model_copy(update={"columns": [*table.columns, ColumnDef(
+        name="addr", mysql_type="app.address", type_kind="composite")]})
+    (g,) = UnsupportedPostgresTypeRule().evaluate(SourceInventory(tables=[composite]))
+    assert g.classification is Classification.UNSUPPORTED and "addr" in g.risk
+    assert '"tags" (text[] -> jsonb)' in g.risk  # the re-typed ones are still named
+    assert "jsonb" in g.recommendation or "jsonb" in g.risk
 
 
 def test_pg_unsupported_type_rule_ignores_fully_supported_tables() -> None:
