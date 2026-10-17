@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime  # noqa: F401 - referenced by string annotations
-from typing import Optional
+from typing import Optional, Sequence
 
 from sqlalchemy import text
 
@@ -387,10 +387,23 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
 )
 
 
-# The column types a serial's sequence can feed as a generated KEY (format_type spellings).
-_PG_GENERATED_KEY_TYPES = frozenset(
-    {"smallint", "integer", "bigint", "int2", "int4", "int8", "numeric", "decimal"}
-)
+def _qualified_default_calls(default: str, functions: "Sequence[tuple[str, str]]") -> str:
+    """``default`` with each bare call of a function outside pg_catalog named
+    ``schema.function`` -- how pg_get_expr prints one that is not on the search path,
+    which is what Schema Conversion tells apart from a built-in. ``functions`` holds
+    ``(quoted schema.name, quoted name)``; a call inside a string literal is left alone."""
+    from dsql_migrator.core.converter import _mask_sql_literals
+
+    out = default
+    for qualified, name in functions:
+        masked = _mask_sql_literals(out)
+        spans = [
+            match.span(1)
+            for match in re.finditer(rf'(?<![\w$."])({re.escape(name)})\s*\(', masked)
+        ]
+        for start, end in reversed(spans):
+            out = out[:start] + qualified + out[end:]
+    return out
 
 
 def _enrich_name(name: str, schema: Optional[str]) -> "tuple[str, str]":
@@ -481,6 +494,28 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 ", CASE WHEN t.typtype = 'e' THEN ("
                 "    SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder) "
                 "    FROM pg_enum e WHERE e.enumtypid = t.oid) END AS enum_labels "
+                # The functions outside pg_catalog a DEFAULT calls, from pg_depend (each
+                # schema, then each name, both as quote_ident prints them). pg_get_expr
+                # prints such a function BARE when it is on the search path (public), so
+                # its spelling cannot tell an application's next_token() from a built-in:
+                # carried verbatim, it failed the CREATE TABLE on Aurora DSQL.
+                ", CASE WHEN ad.oid IS NOT NULL AND a.attgenerated = '' THEN ("
+                "    SELECT array_agg(quote_ident(pn.nspname) || '.' || quote_ident(p.proname)"
+                "                     ORDER BY p.oid) "
+                "    FROM pg_depend dep "
+                "    JOIN pg_proc p ON p.oid = dep.refobjid "
+                "    JOIN pg_namespace pn ON pn.oid = p.pronamespace "
+                "    WHERE dep.classid = 'pg_attrdef'::regclass AND dep.objid = ad.oid "
+                "      AND dep.refclassid = 'pg_proc'::regclass "
+                "      AND pn.nspname <> 'pg_catalog') END AS default_functions "
+                ", CASE WHEN ad.oid IS NOT NULL AND a.attgenerated = '' THEN ("
+                "    SELECT array_agg(quote_ident(p.proname) ORDER BY p.oid) "
+                "    FROM pg_depend dep "
+                "    JOIN pg_proc p ON p.oid = dep.refobjid "
+                "    JOIN pg_namespace pn ON pn.oid = p.pronamespace "
+                "    WHERE dep.classid = 'pg_attrdef'::regclass AND dep.objid = ad.oid "
+                "      AND dep.refclassid = 'pg_proc'::regclass "
+                "      AND pn.nspname <> 'pg_catalog') END AS default_function_names "
                 "FROM pg_attribute a "
                 "JOIN pg_type t ON t.oid = a.atttypid "
                 "JOIN pg_class c ON c.oid = a.attrelid "
@@ -497,6 +532,9 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 row["typ"], row.get("gen"), row.get("ident"), row.get("coll"),
                 row.get("base_typ"), row.get("gen_expr"), row.get("typkind"),
                 row.get("enum_labels"),
+                tuple(
+                    zip(row.get("default_functions") or (), row.get("default_function_names") or ())
+                ),
             )
             for row in rows
         }
@@ -545,6 +583,8 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                     column.type_kind = _PG_TYPE_KINDS.get(str(resolved[6]))
                 if len(resolved) > 7 and resolved[7]:
                     column.enum_labels = tuple(str(label) for label in resolved[7])
+                if len(resolved) > 8 and resolved[8] and column.default:
+                    column.default = _qualified_default_calls(column.default, resolved[8])
         # A serial/identity PRIMARY-KEY column becomes the auto_increment_column so the
         # converter's primary-key strategy (IDENTITY / UUID / KEEP) applies to it.
         if table.auto_increment_column is None:
@@ -553,16 +593,15 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 if column.name not in primary_key:
                     continue
                 identity_flag = exact.get(column.name, (None, None, None))[2]
-                # A serial's own DEFAULT on a number column: an expression that formats a
-                # sequence value into a text key is no generated key -- an identity
-                # (bigint) cannot hold or reproduce it.
+                # A serial's own DEFAULT -- the sequence's value, even under a number cast
+                # or in the late-binding spelling -- whatever the key's type: the strategy
+                # makes an integer one an identity and says, for any other, that the
+                # value now has to come from the application. An expression that FORMATS
+                # a sequence value into a text key is no generated key (an identity cannot
+                # reproduce it); its DEFAULT note says so.
                 from dsql_migrator.core.converter_postgres import pg_is_bare_nextval
 
-                has_nextval = pg_is_bare_nextval(column.default) and (
-                    (column.mysql_type or "").strip().lower().split("(")[0].strip()
-                    in _PG_GENERATED_KEY_TYPES
-                )
-                if identity_flag in ("a", "d") or has_nextval:
+                if identity_flag in ("a", "d") or pg_is_bare_nextval(column.default):
                     table.auto_increment_column = column.name
                     break
 

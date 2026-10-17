@@ -80,6 +80,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dsql_migrator.core.models import (
     Classification,
+    ColumnDef,
     ConversionNoteKind,
     ForeignKeyDef,
     IndexDef,
@@ -2669,8 +2670,25 @@ def _resolve_column_default(
     # ``None`` is "no default"; the EMPTY string is a real one (``DEFAULT ''`` reports '').
     if column.generated or column.default is None:
         return None, None
+    return _resolved_mysql_default(
+        column.mysql_type, column.default, bool(column.default_is_expression)
+    )
+
+
+@functools.lru_cache(maxsize=16384)
+def _resolved_mysql_default(
+    mysql_type: str, default: str, default_is_expression: bool
+) -> tuple[Optional[str], Optional[str]]:
+    """:func:`_resolve_column_default` by its inputs. Cached: Evaluation's DEFAULT_DROPPED
+    and Schema Conversion resolve every default of every table, each with a sqlglot type
+    parse, and the same few (type, default) pairs repeat across thousands of columns --
+    3,000 tables took seconds on every assess."""
+    column = ColumnDef(
+        name="c", mysql_type=mysql_type, default=default,
+        default_is_expression=default_is_expression,
+    )
     try:
-        target_type, _mapping_warning = map_mysql_type(column.mysql_type)
+        target_type, _mapping_warning = map_mysql_type(mysql_type)
     except ValueError:
         # An unparseable type is reported elsewhere (the table is surfaced as
         # UNSUPPORTED); emit no default rather than guessing.
@@ -2679,7 +2697,7 @@ def _resolve_column_default(
     if target_type.strip().lower().startswith("text"):
         try:
             parsed = sqlglot.parse_one(
-                f"CAST(NULL AS {_normalize_mysql_type(column.mysql_type)})", read=_MYSQL
+                f"CAST(NULL AS {_normalize_mysql_type(mysql_type)})", read=_MYSQL
             ).to
             if isinstance(parsed, exp.DataType) and parsed.this is _DType.ENUM:
                 enum_values = list(_enum_values(parsed))
@@ -4197,13 +4215,21 @@ def dropped_default_notes(
 
 def _dropped_default_warning(table: TableDef, *, is_postgres: bool) -> Optional[ConversionWarning]:
     """The table's dropped DEFAULTs as one note, for Evaluation (DEFAULT_DROPPED). A
-    PostgreSQL sequence DEFAULT is left to NON_KEY_SEQUENCE, which says the same."""
-    from dsql_migrator.core.converter_postgres import pg_nextval_sequence
+    PostgreSQL serial / identity column is left to the rule that already reports it --
+    NON_KEY_SEQUENCE for a non-key column, the primary-key strategy for the generated key
+    (which this list never holds). A DEFAULT that FORMATS a sequence value, on a key or not,
+    is reported here: no other rule covers it, and it read AUTO while Schema Conversion
+    called it a LOSS."""
+    from dsql_migrator.core.converter_postgres import pg_is_bare_nextval
 
     notes = [
         message
         for column, message in dropped_default_notes(table, is_postgres=is_postgres)
-        if not (is_postgres and (column.identity or pg_nextval_sequence(column.default)))
+        if not (
+            is_postgres
+            and column.name not in table.primary_key
+            and (column.identity or pg_is_bare_nextval(column.default))
+        )
     ]
     if not notes:
         return None

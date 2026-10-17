@@ -613,7 +613,7 @@ class PgNonKeySequenceRule(Rule):
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
         # The identity fallback is the converter's own clause, so Step 1 and Step 2 give the
         # same (bigint-aware) instruction for the same column.
-        from dsql_migrator.core.converter_postgres import pg_identity_fallback
+        from dsql_migrator.core.converter_postgres import pg_identity_fallback, pg_is_bare_nextval
 
         findings: list[Finding] = []
         for table in inventory.tables:
@@ -624,10 +624,10 @@ class PgNonKeySequenceRule(Rule):
             for column in table.columns:
                 if column.name in key_columns:
                     continue
-                if not (
-                    column.identity
-                    or "nextval(" in (column.default or "").lower()
-                ):
+                # A counter only. A DEFAULT that FORMATS a sequence value ('INV-' ||
+                # lpad(nextval(...)::text, 8, '0')) is no serial: an identity cannot hold
+                # it, and DEFAULT_DROPPED gives the re-attach advice instead.
+                if not (column.identity or pg_is_bare_nextval(column.default)):
                     continue
                 mechanism = "GENERATED AS IDENTITY" if column.identity else "serial"
                 label = f"{column.name} ({mechanism})"

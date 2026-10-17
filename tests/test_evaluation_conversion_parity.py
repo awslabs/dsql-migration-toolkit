@@ -174,6 +174,26 @@ _PG_CORPUS = [
         columns=[ColumnDef(name="span", mysql_type="interval", nullable=False)],
         primary_key=["span"],
     ),
+    # A text key whose DEFAULT FORMATS a sequence value: no generated key, and the
+    # conversion drops the DEFAULT with a LOSS note (it read AUTO at Evaluation).
+    TableDef(
+        name="app.formatted_key",
+        columns=[
+            ColumnDef(
+                name="order_no", mysql_type="text", nullable=False,
+                default="('ORD-'::text || lpad((nextval('app.order_seq'::regclass))::text, 8, '0'::text))",
+            )
+        ],
+        primary_key=["order_no"],
+    ),
+    # A non-key column formatting a sequence value (NON_KEY_SEQUENCE advised an identity).
+    _t(
+        "formatted_nonkey",
+        [ColumnDef(
+            name="invoice_no", mysql_type="text", nullable=False,
+            default="('INV-'::text || lpad((nextval('app.inv_seq'::regclass))::text, 8, '0'::text))",
+        )],
+    ),
     # A partial UNIQUE index whose predicate reads a column the conversion re-types.
     _t(
         "partial_retyped",
@@ -268,3 +288,6 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
     assert "DEFAULT_DROPPED" not in concerns["app.v4_default"]
     assert pg["app.interval_pk"] == "PG_UNINDEXABLE_COLUMN"  # UNSUPPORTED: leads the item
     assert "PG_INDEX_NOT_PRESERVED" in concerns["app.partial_retyped"]
+    assert pg["app.formatted_key"] == "DEFAULT_DROPPED"
+    assert "DEFAULT_DROPPED" in concerns["app.formatted_nonkey"]
+    assert "NON_KEY_SEQUENCE" not in concerns["app.formatted_nonkey"]  # no identity advice

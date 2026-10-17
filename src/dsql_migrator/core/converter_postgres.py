@@ -25,6 +25,7 @@ column it is a reported loss (see :func:`pg_column_default_sql`).
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import TYPE_CHECKING, Optional, Sequence
 
@@ -43,15 +44,55 @@ _PG = PostgresSourceDialect()
 # sequences' at cut over), NOT a value to re-emit as a literal DEFAULT.
 _PG_NEXTVAL_DEFAULT_RE = re.compile(r"nextval\s*\(", re.IGNORECASE)
 # A DEFAULT that IS the sequence's next value (a serial's), as pg_get_expr prints it --
-# not an expression that formats one ('ORD-' || lpad(nextval(...)::text, 8, '0')).
+# ``nextval('s'::regclass)``, or the late-binding ``nextval(('s'::text)::regclass)`` of an
+# old dump -- not an expression that formats one ('ORD-' || lpad(nextval(...)::text, ...)).
 _PG_BARE_NEXTVAL_RE = re.compile(
-    r"^\s*nextval\s*\(\s*'(?:[^']|'')+'(?:\s*::\s*regclass)?\s*\)\s*$", re.IGNORECASE
+    r"^\s*nextval\s*\(\s*(?:'(?:[^']|'')+'(?:\s*::\s*regclass)?"
+    r"|\(\s*'(?:[^']|'')+'\s*::\s*text\s*\)\s*::\s*regclass)\s*\)\s*$",
+    re.IGNORECASE,
+)
+# A trailing cast to a number type, which still yields the sequence's value:
+# ``(nextval('s'::regclass))::integer`` for an int key fed by a bigint sequence.
+_PG_NUMBER_CAST_SUFFIX_RE = re.compile(
+    r"^(?P<inner>.*?)\s*::\s*(?:smallint|integer|bigint|int2|int4|int8|int|numeric|decimal)"
+    r"(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?\s*$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
+def _wrapped_in_parentheses(text: str) -> bool:
+    """Whether ``text`` is one parenthesised expression (``(a)``, not ``(a) + (b)``)."""
+    if not (text.startswith("(") and text.endswith(")")):
+        return False
+    depth, in_string = 0, False
+    for index, ch in enumerate(text):
+        if ch == "'":
+            in_string = not in_string
+        elif not in_string and ch == "(":
+            depth += 1
+        elif not in_string and ch == ")":
+            depth -= 1
+            if depth == 0 and index != len(text) - 1:
+                return False
+    return depth == 0
+
+
 def pg_is_bare_nextval(default: Optional[str]) -> bool:
-    """Whether ``default`` is exactly ``nextval('<sequence>'::regclass)`` (a serial's)."""
-    return bool(_PG_BARE_NEXTVAL_RE.match(default or ""))
+    """Whether ``default`` is the sequence's next value itself (a serial's): ``nextval(
+    '<sequence>'::regclass)``, the late-binding ``nextval(('<sequence>'::text)::regclass)``,
+    either under a cast to a number type (``(nextval(...))::integer``). Not an expression
+    that formats or computes from it."""
+    text = (default or "").strip()
+    while True:
+        if _PG_BARE_NEXTVAL_RE.match(text):
+            return True
+        cast = _PG_NUMBER_CAST_SUFFIX_RE.match(text)
+        if cast is not None and cast.group("inner").strip():
+            text = cast.group("inner").strip()
+        elif _wrapped_in_parentheses(text):
+            text = text[1:-1].strip()
+        else:
+            return False
 
 
 def pg_column_default_sql(
@@ -103,9 +144,10 @@ def pg_column_default_sql(
         return None, (
             f"formats a value from sequence {sequence or '(unknown)'} (DEFAULT {raw}), and "
             "that sequence is not created on Aurora DSQL, so the column is created with no "
-            "default and an INSERT that omits it gets no value. Create the sequence and "
-            "re-attach this DEFAULT after apply, as the sequence's own Step 1 item says (an "
-            "identity would not reproduce the formatting)."
+            "default and an INSERT that omits it gets no value. After apply, create the "
+            f"sequence (CREATE SEQUENCE {sequence or '<sequence>'} CACHE 65536, then setval "
+            "it past the source's current value before cut over) and re-attach this DEFAULT "
+            "with ALTER TABLE ... SET DEFAULT; an identity would not reproduce the formatting."
         )
     if column.identity or (raw and _PG_NEXTVAL_DEFAULT_RE.search(raw)):
         if is_key_column:
@@ -124,9 +166,7 @@ def pg_column_default_sql(
     # one is dropped with a warning instead of leaving the emitted CREATE TABLE unreadable
     # to the applied-DDL readers. (Over realistic pg_get_expr output this SELECT-context
     # check agrees with the DEFAULT-clause context those readers parse.)
-    try:
-        sqlglot.parse_one(f"SELECT {raw}", read="postgres")
-    except sqlglot.errors.SqlglotError:
+    if not _pg_default_parses(raw):
         return None, (
             f"source default ({raw}) is not a PostgreSQL expression the converter can "
             "carry, so the column is created without a default; set it in the application "
@@ -178,6 +218,18 @@ def pg_column_default_sql(
     return raw, None
 
 
+@functools.lru_cache(maxsize=16384)
+def _pg_default_parses(raw: str) -> bool:
+    """Whether a DEFAULT parses as a PostgreSQL expression. Cached: Evaluation's
+    DEFAULT_DROPPED and Schema Conversion resolve every default of every table, and the
+    same few spellings repeat across thousands of columns."""
+    try:
+        sqlglot.parse_one(f"SELECT {raw}", read="postgres")
+    except sqlglot.errors.SqlglotError:
+        return False
+    return True
+
+
 # An empty array DEFAULT as pg_get_expr prints it: '{}'::text[], ARRAY[]::integer[].
 _PG_EMPTY_ARRAY_DEFAULT_RE = re.compile(r"^\s*(?:'\{\}'|ARRAY\[\s*\])\s*::\s*[^']+\[\]\s*$", re.IGNORECASE)
 # uuid-ossp's random UUID, as a DEFAULT names it (bare when the extension sits on the
@@ -185,6 +237,13 @@ _PG_EMPTY_ARRAY_DEFAULT_RE = re.compile(r"^\s*(?:'\{\}'|ARRAY\[\s*\])\s*::\s*[^'
 # gen_random_uuid() returns the same thing, a version-4 UUID.
 _UUID_V4_DEFAULT_RE = re.compile(
     r'(?<![\w$."])(?:(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*\.\s*)?uuid_generate_v4\s*\(\s*\)',
+    re.IGNORECASE,
+)
+# pgcrypto's gen_random_uuid(), schema-qualified (pg_get_expr qualifies it because a
+# database upgraded from PostgreSQL 12 or earlier still calls the extension's copy, not the
+# built-in one): Aurora DSQL's built-in gen_random_uuid() returns the same version-4 UUID.
+_QUALIFIED_GEN_RANDOM_UUID_RE = re.compile(
+    r'(?<![\w$."])(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*\.\s*gen_random_uuid\s*\(\s*\)',
     re.IGNORECASE,
 )
 # The other uuid-ossp generators (time-based or name-based): no Aurora DSQL equivalent.
@@ -207,7 +266,9 @@ def _pg_default_functions(raw: str) -> "tuple[str, Optional[str]]":
     target does not have: another uuid-ossp generator, or a schema-qualified function
     outside pg_catalog (an extension's or the application's own). Carried verbatim, either
     made the CREATE TABLE fail at apply."""
-    translated = _UUID_V4_DEFAULT_RE.sub("gen_random_uuid()", raw)
+    translated = _QUALIFIED_GEN_RANDOM_UUID_RE.sub(
+        "gen_random_uuid()", _UUID_V4_DEFAULT_RE.sub("gen_random_uuid()", raw)
+    )
     code = _SQL_STRING_RE.sub("''", translated)  # never a name inside a string literal
     other = _UUID_OSSP_OTHER_RE.search(code)
     if other is not None:
@@ -236,7 +297,12 @@ _PG_BIGINT_TYPES = frozenset({"bigint", "int8"})
 
 # ``nextval('<sequence>'::regclass)`` as PostgreSQL renders a sequence DEFAULT: the literal
 # names the sequence, quoted parts as written (an unquoted part is already folded).
-_NEXTVAL_RE = re.compile(r"\bnextval\s*\(\s*'((?:[^']|'')+)'(?:\s*::\s*regclass)?\s*\)", re.IGNORECASE)
+# (or the late-binding ``nextval(('<sequence>'::text)::regclass)`` of an old dump).
+_NEXTVAL_RE = re.compile(
+    r"\bnextval\s*\(\s*(?:'((?:[^']|'')+)'(?:\s*::\s*regclass)?"
+    r"|\(\s*'((?:[^']|'')+)'\s*::\s*text\s*\)\s*::\s*regclass)\s*\)",
+    re.IGNORECASE,
+)
 
 
 def pg_nextval_sequence(default: Optional[str]) -> Optional[str]:
@@ -245,7 +311,7 @@ def pg_nextval_sequence(default: Optional[str]) -> Optional[str]:
     match = _NEXTVAL_RE.search(default or "")
     if match is None:
         return None
-    literal = match.group(1).replace("''", "'")
+    literal = (match.group(1) or match.group(2)).replace("''", "'")
     parts = re.findall(r'"((?:[^"]|"")*)"|([^."]+)', literal)
     names = [quoted.replace('""', '"') if quoted else bare for quoted, bare in parts]
     return ".".join(names) if names else None
