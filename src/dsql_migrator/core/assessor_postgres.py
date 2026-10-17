@@ -179,6 +179,20 @@ class UnsupportedPostgresTypeRule(Rule):
                     guidance.append((col.name, col.mysql_type, reason, col.type_kind))
             if retyped and not bad:
                 listed = ", ".join(f'"{name}" ({old} -> {new})' for name, old, new in retyped)
+                # A key column re-typed to one Aurora DSQL cannot index (an array key, now
+                # jsonb) has the CREATE TABLE rejected: PG_UNINDEXABLE_COLUMN grades that.
+                keyed = [
+                    name for name, _old, new in retyped
+                    if name in (table.primary_key or ()) and new in ("json", "jsonb", "bytea")
+                ]
+                applies = (
+                    "The table applies and Full Load carries every value, but the TYPE "
+                    "changes"
+                    if not keyed
+                    else f"Its primary key includes {', '.join(keyed)}, whose new type Aurora "
+                    "DSQL cannot index, so the CREATE TABLE is rejected until the table has a "
+                    "key of indexable columns; beyond that the TYPE changes"
+                )
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
@@ -187,8 +201,7 @@ class UnsupportedPostgresTypeRule(Rule):
                         risk=(
                             f"{len(retyped)} column(s) of this table use a PostgreSQL type "
                             "Aurora DSQL does not have, so Schema Conversion re-types each "
-                            f"to one that holds the same data: {listed}. The table applies "
-                            "and Full Load carries every value, but the TYPE changes, so "
+                            f"to one that holds the same data: {listed}. {applies}, so "
                             "application code that relies on the old type's operators or "
                             "functions (array subscripts, range or network operators, enum "
                             "ordering) must change."

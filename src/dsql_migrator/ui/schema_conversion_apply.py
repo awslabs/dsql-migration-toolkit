@@ -30,6 +30,7 @@ from dsql_migrator.core.converter import (
     is_name_collision_placeholder,
     parse_target_primary_key,
     rename_index_statements,
+    unkeyable_columns,
     views_in_dependency_order,
 )
 from dsql_migrator.core.models import (
@@ -588,29 +589,33 @@ def ai_candidate_object_names(assessment: AssessmentReport) -> list[str]:
     return names
 
 
-def composite_leading_candidates(table: TableDef) -> list[str]:
+def composite_leading_candidates(table: TableDef, *, is_postgres: bool = False) -> list[str]:
     """Columns eligible to lead a composite primary key for ``table``.
 
-    A valid leading column is NOT NULL and not already part of the primary key
-    (mirrors :func:`validate_composite_leading_column` so the picker never offers
-    a choice that would then be rejected). Order follows the table's column order
-    so the dropdown reads like the source schema.
+    A valid leading column is NOT NULL, not already part of the primary key and of a type
+    Aurora DSQL can index (mirrors :func:`validate_composite_leading_column` so the picker
+    never offers a choice that would then be rejected: an interval or time with time zone
+    leader made a PRIMARY KEY the CREATE TABLE was refused for). Order follows the
+    table's column order so the dropdown reads like the source schema.
     """
+    unkeyable = unkeyable_columns(table, is_postgres=is_postgres)
     return [
         column.name
         for column in table.columns
-        if not column.nullable and column.name not in table.primary_key
+        if not column.nullable
+        and column.name not in table.primary_key
+        and column.name not in unkeyable
     ]
 
 
-def default_composite_leading(table: TableDef) -> Optional[str]:
+def default_composite_leading(table: TableDef, *, is_postgres: bool = False) -> Optional[str]:
     """A sensible default leading column, or ``None`` when none is eligible.
 
     Picks the first eligible NOT-NULL non-PK column so selecting "Composite key"
     always yields a representable (valid) state without forcing the user to also
     pick a column in the same click. The user can refine it via the dropdown.
     """
-    candidates = composite_leading_candidates(table)
+    candidates = composite_leading_candidates(table, is_postgres=is_postgres)
     return candidates[0] if candidates else None
 
 
@@ -1312,12 +1317,19 @@ def schema_apply_is_complete(
 
 
 def split_sql_statements(text: str) -> list[str]:
-    """Split ``text`` into individual SQL statements on ``;`` (empties dropped).
+    """Split ``text`` into individual SQL statements on ``;`` (empties dropped), never on
+    one inside a string literal, quoted identifier, dollar body or comment.
 
     A single edited target-DDL script is split here so each statement is applied
     as one DDL in its own transaction (Property 2) by the apply path.
     """
-    return [statement.strip() for statement in text.split(";") if statement.strip()]
+    from dsql_migrator.core.converter import sql_statement_spans
+
+    return [
+        text[start:end].strip()
+        for start, end in sql_statement_spans(text)
+        if text[start:end].strip()
+    ]
 
 
 def _join_sql_statements(statements: Sequence[str]) -> str:

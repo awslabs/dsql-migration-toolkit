@@ -897,11 +897,19 @@ class NoPrimaryKeyRule(Rule):
             if not table.primary_key:
                 # A UNIQUE index whose columns are all NOT NULL already identifies a row:
                 # the natural key to promote, named rather than a generic "add a UUID".
+                # Not a partial one (unique only over the rows its WHERE matches: soft-
+                # deleted rows may share the email) nor an expression one (reflected
+                # without its expression, so its columns are not what is unique).
                 nullable = {c.name for c in table.columns if c.nullable}
+                expression = set(table.expression_indexes)
                 candidates = [
                     f"{index.name} ({', '.join(index.columns)})"
                     for index in table.indexes
-                    if index.unique and index.columns and not set(index.columns) & nullable
+                    if index.unique
+                    and index.columns
+                    and not set(index.columns) & nullable
+                    and not (index.where or "").strip()
+                    and index.name not in expression
                 ]
                 recommendation = (
                     f"Promote a unique key to the primary key on the source -- "
@@ -1892,6 +1900,14 @@ class TimeTypeRule(Rule):
             columns = [
                 column.name for column in table.columns if _base_type(column.mysql_type) == "time"
             ]
+            # A key or index over the column refuses an interval (no index support on
+            # Aurora DSQL), so the remap advice has to name text for those.
+            keyed = [
+                name
+                for name in columns
+                if name in table.primary_key
+                or any(name in index.columns for index in table.indexes)
+            ]
             if columns:
                 findings.append(
                     Finding(
@@ -1906,7 +1922,14 @@ class TimeTypeRule(Rule):
                         ),
                         recommendation=(
                             "Only time-of-day values: no action. Durations: remap the "
-                            "column to interval in Schema Conversion before loading."
+                            "column to interval in Schema Conversion before loading"
+                            + (
+                                f" -- to text for {', '.join(keyed)}, which "
+                                f"{'an index or the primary key uses' if len(keyed) == 1 else 'indexes or the primary key use'}"
+                                ": Aurora DSQL cannot index an interval."
+                                if keyed
+                                else "."
+                            )
                         ),
                         effort=EffortLevel.SIMPLE,
                     )

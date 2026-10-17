@@ -854,8 +854,9 @@ MYSQL_TIME_NOTE = (
     "a time-of-day (00:00:00..24:00:00). In-range values convert cleanly, but "
     "a value outside that range has no 'time' representation and fails the "
     "table's Full Load. If this column stores durations, remap it to "
-    "interval or text (the converted DDL is editable) before loading: Full Load and "
-    "CDC then both write [-]HH:MM:SS[.f] with the hours not capped at 24, and "
+    "interval or text (the converted DDL is editable) before loading -- text if an index "
+    "or the primary key includes it, since Aurora DSQL cannot index an interval: Full "
+    "Load and CDC then both write [-]HH:MM:SS[.f] with the hours not capped at 24, and "
     "Validation compares the durations."
 )
 
@@ -3152,6 +3153,32 @@ def _pg_unindexable_native_columns(table: TableDef) -> "dict[str, str]":
     return found
 
 
+def unkeyable_columns(table: TableDef, *, is_postgres: bool = False) -> "dict[str, str]":
+    """``{column: target type}`` of the columns Aurora DSQL cannot make part of a primary
+    key or an index ("Index support: No"): bytea (BINARY/VARBINARY/BLOB/spatial, PG
+    bytea), json/jsonb (a MySQL JSON, a PostgreSQL array now jsonb), interval and time with
+    time zone. What a composite key's leading column must not be."""
+    found: dict[str, str] = {}
+    for column in table.columns:
+        if _maps_to_bytea(column, is_postgres=is_postgres):
+            found[column.name] = "bytea"
+        elif not is_postgres and (column.mysql_type or "").strip().lower().startswith("json"):
+            found[column.name] = "json"
+    if is_postgres:
+        from dsql_migrator.core.converter_postgres import substitute_pg_unsupported_type
+
+        for name in sorted(_pg_unsupported_key_columns(table)):
+            column = next(c for c in table.columns if c.name == name)
+            found.setdefault(
+                name,
+                substitute_pg_unsupported_type(column.mysql_type, type_kind=column.type_kind)[0]
+                or column.mysql_type,
+            )
+        for name, type_name in _pg_unindexable_native_columns(table).items():
+            found.setdefault(name, type_name)
+    return found
+
+
 def _carried_index_predicate(table: TableDef, index: IndexDef) -> Optional[str]:
     """A PostgreSQL partial index's ``WHERE`` predicate as Aurora DSQL is given it (it
     accepts partial indexes: ``CREATE INDEX ASYNC ... WHERE``), with each cast to a
@@ -3508,6 +3535,11 @@ def _estimate_key_column_bytes(create: exp.Expression, column_name: str) -> int:
     """
     column_def = _find_column_def(create, column_name)
     data_type = column_def.args.get("kind") if column_def is not None else None
+    return _estimate_type_key_bytes(data_type)
+
+
+def _estimate_type_key_bytes(data_type: object) -> int:
+    """:func:`_estimate_key_column_bytes` of one parsed type."""
     if not isinstance(data_type, exp.DataType):
         return _UNBOUNDED_VARLEN_KEY_BYTES
     kind = data_type.this
@@ -3556,7 +3588,11 @@ def _composite_key_columns(table: TableDef, leading: str) -> list[str]:
 
 
 def validate_composite_leading_column(
-    table: TableDef, leading: str, create: Optional[exp.Expression] = None
+    table: TableDef,
+    leading: str,
+    create: Optional[exp.Expression] = None,
+    *,
+    is_postgres: bool = False,
 ) -> Optional[str]:
     """Return an error message if ``leading`` is an invalid composite-key leader.
 
@@ -3572,6 +3608,7 @@ def validate_composite_leading_column(
     - the leading column exists on the table;
     - the leading column is NOT NULL (a key column cannot be nullable);
     - the leading column is not already part of the primary key (no-op / reorder);
+    - the leading column is of a type Aurora DSQL can index (:func:`unkeyable_columns`);
     - the resulting key has at most 8 columns;
     - the estimated combined key size is at most 1 KiB.
     """
@@ -3597,6 +3634,12 @@ def validate_composite_leading_column(
             "prepending it would not change write distribution. Choose a "
             "high-cardinality column that is not already in the key."
         )
+    unkeyable = unkeyable_columns(table, is_postgres=is_postgres).get(leading)
+    if unkeyable is not None:
+        return (
+            f"Leading column '{leading}' becomes {unkeyable} on Aurora DSQL, a type it "
+            "cannot index, so it cannot be part of the primary key. Choose another column."
+        )
     key_columns = _composite_key_columns(table, leading)
     if len(key_columns) > _DSQL_MAX_PK_COLUMNS:
         return (
@@ -3615,7 +3658,7 @@ def validate_composite_leading_column(
 
 
 def _apply_composite_key(
-    create: exp.Expression, table: TableDef, leading: str
+    create: exp.Expression, table: TableDef, leading: str, *, is_postgres: bool = False
 ) -> ConversionWarning:
     """Prepend ``leading`` to the primary key in ``create`` (COMPOSITE_KEY).
 
@@ -3628,7 +3671,7 @@ def _apply_composite_key(
     the consequence (the application must key on the new composite key, and the
     leading column must be immutable).
     """
-    error = validate_composite_leading_column(table, leading, create)
+    error = validate_composite_leading_column(table, leading, create, is_postgres=is_postgres)
     if error is not None:
         raise CompositeKeyError(error)
 
@@ -4701,8 +4744,8 @@ def _key_size_warning(
             continue
         if any(column in skip_columns for column in index.columns):
             continue
-        if index.name not in emitted and index.name not in set(table.expression_indexes):
-            continue
+        if index.name not in emitted:
+            continue  # an expression index too: EXPRESSION_INDEX says it is not emitted
         index_bytes = estimate(index.columns)
         if index_bytes > _DSQL_MAX_KEY_BYTES:
             at_risk.append(f"index {index.name} at up to ~{index_bytes} bytes")
@@ -4899,7 +4942,7 @@ def _prefix_index_warning(table: TableDef) -> Optional[ConversionWarning]:
 
 
 def _pg_partial_or_nonbtree_index_warning(
-    table: TableDef,
+    table: TableDef, create: Optional[exp.Expression] = None
 ) -> Optional[ConversionWarning]:
     """Warn about the PostgreSQL index features the target does not keep as they are.
 
@@ -4933,7 +4976,29 @@ def _pg_partial_or_nonbtree_index_warning(
     # answers). A GIN/GiST/SP-GiST one served operators a btree cannot, and a partial
     # UNIQUE left out enforces nothing: those are gaps.
     serves_the_same = {"hash", "brin"}
-    lost_methods = [(n, m) for n, m in nonbtree if m.strip().lower() not in serves_the_same]
+    # ... except a hash index over values too long for a btree, which is the usual reason
+    # to choose hash (it stores only the hash): the btree's 1 KiB key cap then fails the
+    # post-load build or a later INSERT.
+    by_name = {index.name: index for index in table.indexes}
+    types = {column.name: column.mysql_type for column in table.columns}
+
+    def key_bytes(column: str) -> int:
+        if create is not None:
+            return _estimate_key_column_bytes(create, column)
+        try:  # Evaluation has no converted CREATE: a PostgreSQL type is near-identity
+            return _estimate_type_key_bytes(exp.DataType.build(types.get(column) or "", dialect="postgres"))
+        except Exception:  # noqa: BLE001 - an unsizable type counts as unbounded
+            return _UNBOUNDED_VARLEN_KEY_BYTES
+
+    too_long = {
+        name
+        for name, method in nonbtree
+        if method.strip().lower() == "hash"
+        and sum(key_bytes(c) for c in by_name[name].columns) > _DSQL_MAX_KEY_BYTES
+    }
+    lost_methods = [
+        (n, m) for n, m in nonbtree if m.strip().lower() not in serves_the_same or n in too_long
+    ]
     if not full and not left_out and not nonbtree:
         return None
     is_loss = bool(left_out or lost_methods)
@@ -4963,22 +5028,33 @@ def _pg_partial_or_nonbtree_index_warning(
                 "not enforced until you re-create it with a predicate over the new type"
             )
         parts.append(partial)
-    same = [(n, m) for n, m in nonbtree if m.strip().lower() in serves_the_same]
+    same = [
+        (n, m) for n, m in nonbtree if m.strip().lower() in serves_the_same and n not in too_long
+    ]
     if same:
         listed = ", ".join(f"{name} ({method})" for name, method in same)
         parts.append(
             f"index(es) {listed} are created as btree, which serves every comparison those "
             "methods did (a BRIN index's small size is what changes)"
         )
-    if lost_methods:
-        listed = ", ".join(f"{name} ({method})" for name, method in lost_methods)
+    lost_other = [(n, m) for n, m in lost_methods if n not in too_long]
+    if lost_other:
+        listed = ", ".join(f"{name} ({method})" for name, method in lost_other)
         parts.append(
             f"index(es) {listed} use a non-btree access method DSQL does not provide, so "
             "a plain btree index is created instead and the operators/queries that method "
             "served will not use it"
         )
+    if too_long:
+        parts.append(
+            f"hash index(es) {', '.join(sorted(too_long))} become btree, whose keys Aurora "
+            f"DSQL caps at {_DSQL_MAX_KEY_BYTES} bytes, and the columns can hold longer "
+            "values (a hash index stores only the hash): the post-load CREATE INDEX or a "
+            "later INSERT of such a value fails. Index a hash of the value instead (e.g. "
+            "a column holding md5 of it) or leave the index out"
+        )
     message = "Aurora DSQL secondary indexes are btree-only: " + "; ".join(parts) + "."
-    if lost_methods:
+    if lost_other:
         message += (
             " Move a search a non-btree method served outside the database (e.g. a "
             "full-text or geospatial service) or redesign the query."
@@ -4997,7 +5073,19 @@ def _pg_unindexable_column_warning(table: TableDef) -> Optional[ConversionWarnin
     TABLE rejected (UNSUPPORTED), and a secondary index over one is NOT emitted (a doomed
     CREATE INDEX ASYNC would fail at apply) -- a UNIQUE one's uniqueness then goes
     unenforced. Shared with Evaluation (PG_UNINDEXABLE_COLUMN). PostgreSQL-source only."""
+    from dsql_migrator.core.converter_postgres import substitute_pg_unsupported_type
+
     unindexable = _pg_unindexable_native_columns(table)
+    # A key column whose stand-in cannot be indexed either (an array key, now jsonb): the
+    # CREATE TABLE is rejected just the same, and only its type note said MANUAL.
+    by_name = {column.name: column for column in table.columns}
+    for name in table.primary_key or ():
+        column = by_name.get(name)
+        if column is None or name in unindexable:
+            continue
+        stand_in = substitute_pg_unsupported_type(column.mysql_type, type_kind=column.type_kind)[0]
+        if stand_in in ("json", "jsonb", "bytea"):
+            unindexable[name] = f"{column.mysql_type} (now {stand_in})"
     if not unindexable:
         return None
     keyed = [name for name in table.primary_key or () if name in unindexable]
@@ -5315,7 +5403,10 @@ def rename_index_statements(
 # A ``CREATE [UNIQUE] INDEX ASYNC "<name>" ON`` at the start of a statement, as the tool
 # emits it (and as the apply paths see a stored edit: split on ``;``, then stripped).
 _INDEX_HEAD_RE = re.compile(
-    r'\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+"((?:[^"]|"")+)"\s+ON\s', re.IGNORECASE
+    # Leading whitespace and comments: an edited script's note above a statement.
+    r'(?:\s|--[^\n]*(?:\n|$)|/\*(?:[^*]|\*(?!/))*\*/)*'
+    r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+"((?:[^"]|"")+)"\s+ON\s',
+    re.IGNORECASE,
 )
 
 
@@ -5346,6 +5437,30 @@ def _splice(text: str, spots: "Sequence[tuple[int, int, str]]") -> str:
     return "".join(out)
 
 
+_STATEMENT_SCAN_RE = re.compile(r"""['"$;]|--|/\*|[eE](?=')""")
+
+
+def sql_statement_spans(text: str) -> "list[tuple[int, int]]":
+    """The ``(start, end)`` of each statement of a script: split at each ``;`` outside a
+    string literal, a quoted identifier, a dollar-quoted body or a comment -- a carried
+    index predicate (``WHERE sep <> ';'``) is one statement, not two broken halves."""
+    spans: list[tuple[int, int]] = []
+    start = pos = 0
+    while True:
+        match = _STATEMENT_SCAN_RE.search(text, pos)
+        if match is None:
+            break
+        at = match.start()
+        if match.group(0) == ";":
+            spans.append((start, at))
+            start = pos = at + 1
+            continue
+        skipped = _sql_skip(text, at)
+        pos = at + 1 if skipped is None else skipped[1]
+    spans.append((start, len(text)))
+    return spans
+
+
 def rename_index_script(script: str, renames: "Mapping[str, str]") -> str:
     """``script`` (a stored target-DDL edit) renamed exactly as the apply paths rename it
     (split on ``;``, then :func:`rename_index_statements`), with every other character
@@ -5353,12 +5468,7 @@ def rename_index_script(script: str, renames: "Mapping[str, str]") -> str:
     ``CREATE INDEX`` text inside a comment is not a statement head and is left alone."""
     if not renames:
         return script
-    spans, start = [], 0
-    for position, char in enumerate(script):
-        if char == ";":
-            spans.append((start, position))
-            start = position + 1
-    spans.append((start, len(script)))
+    spans = sql_statement_spans(script)
     heads = [
         head for begin, end in spans if (head := _INDEX_HEAD_RE.match(script, begin, end))
     ]
@@ -5916,6 +6026,15 @@ def _expression_index_warning(table: TableDef) -> Optional[ConversionWarning]:
             "uniqueness is NOT enforced on the target until recreated (CREATE UNIQUE INDEX "
             "ASYNC ... ((expr))), and duplicates written meanwhile make that build fail."
         )
+    # An index over expressions only is reflected by name alone, so whether it is UNIQUE
+    # is not known here -- and lower(email) is the classic case-insensitive uniqueness.
+    unread = [name for name in table.expression_indexes if name not in {i.name for i in table.indexes}]
+    if unread:
+        message += (
+            f" If {', '.join(unread)} {'is' if len(unread) == 1 else 'are'} UNIQUE on the "
+            "source, that uniqueness is not enforced on the target either until recreated "
+            "(CREATE UNIQUE INDEX ASYNC ... ((expr)))."
+        )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
@@ -6413,7 +6532,9 @@ class SchemaConverter:
         if options.primary_key_strategy is PrimaryKeyStrategy.COMPOSITE_KEY:
             leading = options.composite_leading_column or ""
             try:
-                composite_warning = _apply_composite_key(create, table, leading)
+                composite_warning = _apply_composite_key(
+                    create, table, leading, is_postgres=is_postgres
+                )
             except CompositeKeyError as exc:
                 return _invalid_composite_conversion(table, str(exc))
             if composite_warning is not None:
@@ -6498,7 +6619,7 @@ class SchemaConverter:
             # PostgreSQL non-btree indexes lose their access method on DSQL (btree-only),
             # and a partial one whose predicate reads a re-typed column its predicate; the
             # MySQL FULLTEXT/SPATIAL and prefix-index notes above are the MySQL analogs.
-            (_pg_partial_or_nonbtree_index_warning(table) if is_postgres else None),
+            (_pg_partial_or_nonbtree_index_warning(table, create) if is_postgres else None),
             (_pg_unindexable_column_warning(table) if is_postgres else None),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(
@@ -7088,4 +7209,6 @@ __all__ = [
     "parse_target_primary_key",
     "CompositeKeyError",
     "validate_composite_leading_column",
+    "unkeyable_columns",
+    "sql_statement_spans",
 ]

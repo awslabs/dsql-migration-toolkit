@@ -1938,7 +1938,10 @@ def test_a_harmless_index_method_change_is_advice_and_an_expression_index_is_gra
 
     sessions = TableDef(
         name="app.sessions",
-        columns=[_col("id", "bigint", False), _col("token", "text"), _col("at", "timestamp with time zone")],
+        columns=[
+            _col("id", "bigint", False), _col("token", "character varying(64)"),
+            _col("at", "timestamp with time zone"),
+        ],
         primary_key=["id"],
         indexes=[
             IndexDef(name="ix_token", columns=["token"], method="hash"),

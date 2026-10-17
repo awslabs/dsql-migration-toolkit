@@ -685,9 +685,14 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
     for index in table.indexes:
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_ident(name) for name in index.columns)
+        method = (index.method or "").strip()
+        # The access method and predicate as the source has them: without them a partial
+        # UNIQUE read as a full one beside its carried predicate on the target side.
+        using = f" USING {method}" if method and method.lower() != "btree" else ""
+        where = f" WHERE {index.where.strip()}" if (index.where or "").strip() else ""
         rendered += (
             f";\nCREATE {unique}INDEX {_quote_pg_ident(index.name)} "
-            f"ON {_quote_pg_table(table.name)} ({columns})"
+            f"ON {_quote_pg_table(table.name)}{using} ({columns}){where}"
         )
     if table.partitioned:
         rendered += "\n/* PARTITION BY ... - partitioned source table; clause not captured */"
@@ -3919,7 +3924,9 @@ def _render_pk_strategy_picker(
     _key_word = (
         "serial / identity" if source_type is SourceType.POSTGRES else "AUTO_INCREMENT"
     )
-    candidates = composite_leading_candidates(table)
+    candidates = composite_leading_candidates(
+        table, is_postgres=source_type is SourceType.POSTGRES
+    )
     identity_ok = _identity_eligible(table)
     # What this table gets with NOTHING stored. Not the same as identity_ok: a MySQL
     # `bigint unsigned` key is eligible for the tile (an operator may accept the
@@ -3952,7 +3959,9 @@ def _render_pk_strategy_picker(
     def _select_strategy(choice: str) -> None:
         """Apply a primary-key strategy choice (called with the tile's value)."""
         if choice == _COMPOSITE_PK:
-            leading = default_composite_leading(table)
+            leading = default_composite_leading(
+                table, is_postgres=source_type is SourceType.POSTGRES
+            )
             if leading is None:
                 return  # no eligible column; the control stays on Keep (see below)
             conv_state.set_edited_target_ddl(
