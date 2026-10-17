@@ -2617,6 +2617,7 @@ def build_schema_conversion_screen(
                             target_inventory=old_result.target_inventory,
                             target_endpoint=old_result.target_endpoint,
                             source_type=source_conn.source_type,
+                            vanished=list(getattr(introspector, "last_vanished", None) or []),
                         )
                     )
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]

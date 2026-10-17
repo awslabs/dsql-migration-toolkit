@@ -443,6 +443,15 @@ class PrimaryKeyStrategy(str, Enum):
     COMPOSITE_KEY = "COMPOSITE_KEY"
 
 
+# The key types an identity can take over (widened or narrowed to bigint): the integer
+# families of both engines, and a numeric key a sequence feeds. Anything else -- float,
+# text, uuid -- is no identity candidate.
+_IDENTITY_KEY_BASES = frozenset(
+    {"tinyint", "smallint", "mediumint", "int", "integer", "bigint", "int2", "int4", "int8",
+     "serial", "smallserial", "bigserial", "numeric", "decimal"}
+)
+
+
 def identity_strategy_applies(table: TableDef) -> bool:
     """Return whether ``IDENTITY_WITH_CACHE`` can be applied to ``table``'s key.
 
@@ -466,7 +475,7 @@ def identity_strategy_applies(table: TableDef) -> bool:
     # bigint with its own note.
     declared = next((c.mysql_type for c in table.columns if c.name == column), "") or ""
     base = re.split(r"[\s(]", declared.strip().lower(), maxsplit=1)[0]
-    return base not in ("float", "double", "real") or base == ""
+    return base in _IDENTITY_KEY_BASES or base == ""
 
 
 def default_primary_key_strategy(

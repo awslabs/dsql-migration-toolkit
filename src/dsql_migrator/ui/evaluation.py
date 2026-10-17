@@ -316,8 +316,14 @@ def with_refreshed_catalogs(
     target_inventory: TargetInventory,
     target_endpoint: "Optional[str]",
     source_type: "Optional[SourceType]" = None,
+    vanished: "Optional[Sequence[str]]" = None,
 ) -> EvaluationResult:
     """``result`` with a re-read source inventory and/or target catalog, and what they feed.
+
+    ``vanished`` is what a fresh source read listed but found gone (its introspector's
+    ``last_vanished``): it replaces the result's own CATALOG_CHANGED_DURING_READ item. With
+    no fresh read (the result's own inventory: a target refresh, Generate, a restore) the
+    item is carried, so the tables it names are not silently forgotten.
 
     The assessment is recomputed together with the catalogs: Aurora DSQL's database-level
     limits (tables, schemas, views per database) are counted against the TARGET as well as
@@ -342,6 +348,16 @@ def with_refreshed_catalogs(
     # switch: those findings describe the other engine's source.
     if engine is result.source_type:
         assessment = carry_probe_results(result.assessment, assessment)
+    from dsql_migrator.core.assessor import CATALOG_CHANGED_RULE_ID, catalog_changed_items
+
+    if vanished is not None:
+        changed = catalog_changed_items(list(vanished))
+    elif inventory is result.inventory:
+        changed = [i for i in result.assessment.items if i.rule_id == CATALOG_CHANGED_RULE_ID]
+    else:
+        changed = []
+    if changed:
+        assessment = AssessmentReport.from_items([*assessment.items, *changed])
     if engine is SourceType.POSTGRES and not any(
         item.rule_id in (PG_CATALOG_CHECKED_RULE_ID, PG_CATALOG_UNREAD_RULE_ID)
         for item in assessment.items

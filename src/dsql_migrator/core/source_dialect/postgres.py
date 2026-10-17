@@ -385,6 +385,12 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
 )
 
 
+# The column types a serial's sequence can feed as a generated KEY (format_type spellings).
+_PG_GENERATED_KEY_TYPES = frozenset(
+    {"smallint", "integer", "bigint", "int2", "int4", "int8", "numeric", "decimal"}
+)
+
+
 def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None:
     """Overwrite each column's type with the EXACT ``format_type`` string + generated flag,
     and flag a serial/identity PRIMARY-KEY column as the table's ``auto_increment_column``.
@@ -533,7 +539,15 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
                 if column.name not in primary_key:
                     continue
                 identity_flag = exact.get(column.name, (None, None, None))[2]
-                has_nextval = "nextval(" in (column.default or "").lower()
+                # A serial's own DEFAULT on a number column: an expression that formats a
+                # sequence value into a text key is no generated key -- an identity
+                # (bigint) cannot hold or reproduce it.
+                from dsql_migrator.core.converter_postgres import pg_is_bare_nextval
+
+                has_nextval = pg_is_bare_nextval(column.default) and (
+                    (column.mysql_type or "").strip().lower().split("(")[0].strip()
+                    in _PG_GENERATED_KEY_TYPES
+                )
                 if identity_flag in ("a", "d") or has_nextval:
                     table.auto_increment_column = column.name
                     break
@@ -802,7 +816,7 @@ def pg_read_standalone_sequences(
         {"schemas": list(schemas)},
     ).mappings()
     rows = list(rows)
-    callers = _sequence_callers(connection, schemas) if rows else {}
+    callers = _sequence_callers(connection, schemas) if rows else {}  # None: unread
     sequences = []
     for row in rows:
         last_value = int(row["last_value"]) if row["last_value"] is not None else None
@@ -822,7 +836,11 @@ def pg_read_standalone_sequences(
                 last_value=last_value,
                 readable=bool(row["readable"]),
                 is_called=is_called,
-                callers=tuple(callers.get(f"{row['nsp']}.{row['name']}", ())),
+                callers=(
+                    tuple(callers.get(f"{row['nsp']}.{row['name']}", ()))
+                    if callers is not None
+                    else None
+                ),
             )
         )
     return tuple(sequences)
@@ -830,11 +848,13 @@ def pg_read_standalone_sequences(
 
 def _sequence_callers(
     connection: object, schemas: "list[str]"
-) -> "dict[str, list[tuple[str, str, str]]]":
+) -> "Optional[dict[str, list[tuple[str, str, str]]]]":
     """``{sequence: [(table, column, DEFAULT expression)]}`` for the sequences of
     ``schemas``, from the catalog: a column DEFAULT that calls ``nextval`` depends on the
     sequence (``pg_depend`` from its ``pg_attrdef`` row), whichever schema the table is in
-    and however the expression spells the name. Read-only; ``{}`` when it cannot be read."""
+    and however the expression spells the name. Ordinary and partitioned tables only: a
+    partition copies its parent's DEFAULT, and another session's temp table is no
+    migration object. Read-only; ``None`` when it cannot be read."""
     try:
         rows = connection.execute(  # type: ignore[attr-defined]
             text(
@@ -848,12 +868,14 @@ def _sequence_callers(
                 "JOIN pg_class s ON s.oid = d.refobjid AND s.relkind = 'S' "
                 "JOIN pg_namespace sn ON sn.oid = s.relnamespace "
                 "WHERE d.refclassid = 'pg_class'::regclass AND sn.nspname = ANY(:schemas) "
+                "AND t.relkind IN ('r', 'p') AND NOT t.relispartition "
+                "AND t.relpersistence <> 't' "
                 "ORDER BY tn.nspname, t.relname, a.attnum"
             ),
             {"schemas": list(schemas)},
         ).mappings()
     except Exception:  # noqa: BLE001 - the item then falls back to the DEFAULT text
-        return {}
+        return None
     out: dict[str, list[tuple[str, str, str]]] = {}
     for row in rows:
         out.setdefault(f"{row['seq_nsp']}.{row['seq_name']}", []).append(
@@ -1063,6 +1085,23 @@ class PostgresSourceDialect(SourceDialect):
         triggers = _pg_collect_triggers(connection, enrich_db)
         routines = _pg_collect_routines(connection, enrich_db)
         return (triggers, routines, [])
+
+    def partition_children(self, connection: object, schema: "Optional[str]") -> "set[str]":
+        dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
+        if dialect_name != "postgresql" or not schema:
+            return set()
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = :nsp AND c.relispartition"
+                ),
+                {"nsp": schema},
+            )
+            return {str(row[0]) for row in rows}
+        except Exception:  # noqa: BLE001 - best effort: nothing is filtered then
+            return set()
 
     def extra_relations(self, connection: object, enrich_db: str) -> list:
         # Materialized views (relkind 'm') and foreign tables (relkind 'f') for the schema.

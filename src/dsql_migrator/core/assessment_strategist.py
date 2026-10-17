@@ -229,7 +229,7 @@ class AiAssessmentOutcome:
 def _summarize_assessment(report: AssessmentReport) -> str:
     """Render the deterministic assessment as compact grounding text."""
     lines = []
-    for item in report.items:
+    for item in report.assessed_items:  # never the report's own markers
         effort = item.effort.value if item.effort is not None else "NONE"
         risk = item.risk or "-"
         lines.append(

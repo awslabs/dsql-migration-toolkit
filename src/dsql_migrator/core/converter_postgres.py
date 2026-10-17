@@ -42,6 +42,16 @@ _PG = PostgresSourceDialect()
 # mechanism, governed by the primary-key strategy (and advanced by 'Sync identity
 # sequences' at cut over), NOT a value to re-emit as a literal DEFAULT.
 _PG_NEXTVAL_DEFAULT_RE = re.compile(r"nextval\s*\(", re.IGNORECASE)
+# A DEFAULT that IS the sequence's next value (a serial's), as pg_get_expr prints it --
+# not an expression that formats one ('ORD-' || lpad(nextval(...)::text, 8, '0')).
+_PG_BARE_NEXTVAL_RE = re.compile(
+    r"^\s*nextval\s*\(\s*'(?:[^']|'')+'(?:\s*::\s*regclass)?\s*\)\s*$", re.IGNORECASE
+)
+
+
+def pg_is_bare_nextval(default: Optional[str]) -> bool:
+    """Whether ``default`` is exactly ``nextval('<sequence>'::regclass)`` (a serial's)."""
+    return bool(_PG_BARE_NEXTVAL_RE.match(default or ""))
 
 
 def pg_column_default_sql(
@@ -86,6 +96,17 @@ def pg_column_default_sql(
     # testing the default alone silently missed the spelling PostgreSQL 10+ RECOMMENDS --
     # only the legacy one was covered. Checked BEFORE the empty-default return for that
     # reason: an identity column arrives with ``default`` None.
+    if raw and not column.identity and _PG_NEXTVAL_DEFAULT_RE.search(raw) and not pg_is_bare_nextval(raw):
+        # An expression that FORMATS a sequence value (an order number): no identity can
+        # reproduce it, key or not, so nothing governs it -- it must be re-attached.
+        sequence = pg_nextval_sequence(raw)
+        return None, (
+            f"formats a value from sequence {sequence or '(unknown)'} (DEFAULT {raw}), and "
+            "that sequence is not created on Aurora DSQL, so the column is created with no "
+            "default and an INSERT that omits it gets no value. Create the sequence and "
+            "re-attach this DEFAULT after apply, as the sequence's own Step 1 item says (an "
+            "identity would not reproduce the formatting)."
+        )
     if column.identity or (raw and _PG_NEXTVAL_DEFAULT_RE.search(raw)):
         if is_key_column:
             return None, None

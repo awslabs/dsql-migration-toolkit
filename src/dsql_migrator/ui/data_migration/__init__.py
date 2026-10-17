@@ -1639,6 +1639,7 @@ def build_data_migration_screen(
                             session.target_config, "cluster_endpoint", None
                         ),
                         source_type=session_source_type(session),
+                        vanished=list(getattr(introspector, "last_vanished", None) or []),
                     )
                 )
                 ui.notify("Object browser refreshed.", type="positive")

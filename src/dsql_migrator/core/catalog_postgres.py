@@ -109,8 +109,9 @@ class StandaloneSequence:
     is_called: Optional[bool] = None
     # ``(table, column, DEFAULT expression)`` of every column whose DEFAULT calls this
     # sequence, read from the catalog (pg_depend from the DEFAULT to the sequence) -- not
-    # from DEFAULT text, whose sequence names follow the search_path.
-    callers: "tuple[tuple[str, str, str], ...]" = ()
+    # from DEFAULT text, whose sequence names follow the search_path. ``None`` when that
+    # read failed (the DEFAULT text is the fallback then), ``()`` when it found none.
+    callers: "Optional[tuple[tuple[str, str, str], ...]]" = None
 
 
 @dataclass(frozen=True)

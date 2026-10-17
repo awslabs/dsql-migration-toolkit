@@ -1692,3 +1692,84 @@ def test_evaluation_names_what_disappeared_during_the_read() -> None:
     (item,) = catalog_changed_items(["shop.daily_summary"])
     assert item.rule_id == "CATALOG_CHANGED_DURING_READ" and "shop.daily_summary" in item.risk
     assert catalog_changed_items([]) == []
+
+
+def test_the_second_look_reads_a_relation_as_what_it_is_now(monkeypatch) -> None:
+    """A table replaced by a same-named view was re-read as a TABLE beside the view (a
+    phantom no-PK table and a false name collision); a partition dropped by retention was
+    reported as a lost table though partitions never migrate on their own."""
+    from sqlalchemy.engine.reflection import Inspector
+    from sqlalchemy.exc import NoSuchTableError
+
+    from dsql_migrator.core.source_dialect.base import SourceDialect
+
+    real_columns = Inspector.get_columns
+    real_tables = Inspector.get_table_names
+    real_views = Inspector.get_view_names
+    real_view_def = Inspector.get_view_definition
+    listings = {"tables": 0, "views": 0}
+
+    def get_columns(self, table_name, schema=None, **kw):
+        if table_name in ("orders", "customers"):
+            raise NoSuchTableError(table_name)
+        return real_columns(self, table_name, schema=schema, **kw)
+
+    def get_table_names(self, schema=None, **kw):
+        listings["tables"] += 1
+        names = real_tables(self, schema=schema, **kw)
+        # The second listing: orders is a view now, customers is gone.
+        return names if listings["tables"] == 1 else [n for n in names if n not in ("orders", "customers")]
+
+    def get_view_names(self, schema=None, **kw):
+        listings["views"] += 1
+        names = real_views(self, schema=schema, **kw)
+        return names if listings["views"] == 1 else [*names, "orders"]
+
+    def get_view_definition(self, view_name, schema=None, **kw):
+        if view_name == "orders":
+            return "SELECT 1 AS id"
+        return real_view_def(self, view_name, schema=schema, **kw)
+
+    monkeypatch.setattr(Inspector, "get_columns", get_columns)
+    monkeypatch.setattr(Inspector, "get_table_names", get_table_names)
+    monkeypatch.setattr(Inspector, "get_view_names", get_view_names)
+    monkeypatch.setattr(Inspector, "get_view_definition", get_view_definition)
+    monkeypatch.setattr(SourceDialect, "partition_children", lambda self, c, s: {"customers"})
+    introspector = SourceIntrospector(engine_factory=_sqlite_factory())
+    inventory = introspector.introspect(_source_config())
+    assert "orders" not in {t.name.split(".")[-1] for t in inventory.tables}
+    assert "orders" in {v.name.split(".")[-1] for v in inventory.views}
+    # customers was a partition child: no "disappeared" item for it.
+    assert introspector.last_vanished == []
+
+
+def test_a_target_refresh_keeps_the_catalog_changed_item_and_a_source_reread_replaces_it() -> None:
+    """Generate, the target refresh and every restore went through with_refreshed_catalogs,
+    which dropped the item: the table stayed out of the migration with no word."""
+    from dsql_migrator.core.assessor import catalog_changed_items
+    from dsql_migrator.core.models import AssessmentReport, SourceInventory, TargetInventory
+    from dsql_migrator.ui.evaluation import EvaluationResult, with_refreshed_catalogs
+
+    inventory = SourceInventory(tables=[])
+    result = EvaluationResult(
+        inventory=inventory,
+        assessment=AssessmentReport.from_items(catalog_changed_items(["shop.daily"])),
+        target_inventory=TargetInventory(schemas=[]),
+        target_conflicts=[],
+    )
+
+    def changed(r):
+        return [i.risk for i in r.assessment.items if i.rule_id == "CATALOG_CHANGED_DURING_READ"]
+
+    kept = with_refreshed_catalogs(result, inventory=inventory, target_inventory=TargetInventory(schemas=[]), target_endpoint=None)
+    assert changed(kept) and "shop.daily" in changed(kept)[0]
+    reread = with_refreshed_catalogs(
+        result, inventory=SourceInventory(tables=[]), target_inventory=TargetInventory(schemas=[]),
+        target_endpoint=None, vanished=["shop.weekly"],
+    )
+    assert len(changed(reread)) == 1 and "shop.weekly" in changed(reread)[0]
+    clean = with_refreshed_catalogs(
+        result, inventory=SourceInventory(tables=[]), target_inventory=TargetInventory(schemas=[]),
+        target_endpoint=None, vanished=[],
+    )
+    assert changed(clean) == []

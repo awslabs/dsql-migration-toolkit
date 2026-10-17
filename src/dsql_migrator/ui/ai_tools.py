@@ -374,7 +374,8 @@ def build_ai_tool_executor(
                 _r = _ev.result if _ev else None
                 if _r is None:
                     return _json.dumps({"status": "not_run", "objects": []})
-                _items = _r.assessment.items
+                # The objects the screen counts: never the report's own markers.
+                _items = _r.assessment.assessed_items
                 _want = str(args.get("classification", "")).strip().upper()
                 if _want:
                     _items = [it for it in _items if it.classification.value == _want]

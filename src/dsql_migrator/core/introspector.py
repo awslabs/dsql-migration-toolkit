@@ -1124,25 +1124,39 @@ def _assemble_inventory(
         on_table = _one_table if progress is not None else None
         gone_tables: list[str] = []
         gone_views: list[str] = []
+        # Read first: a partition child dropped mid-read (retention) is no lost table.
+        partitions = dialect.partition_children(connection, reflect_schema or enrich_db)
         tables = _reflect_tables(inspector, schema=reflect_schema, on_table=on_table,
                                  vanished=gone_tables)
         views = _reflect_views(inspector, schema=reflect_schema, vanished=gone_views)
         if gone_tables or gone_views:
             # Look once more, with a fresh inspector (the first one caches its listings):
-            # a relation replaced mid-read is back, and is read like any other.
+            # a relation replaced mid-read is back, and is read like any other -- as what
+            # it is NOW (a table replaced by a same-named view is read as the view, once).
             fresh = inspect(connection)
-            still_tables: list[str] = []
-            still_views: list[str] = []
+            try:
+                now_tables = set(fresh.get_table_names(schema=reflect_schema))  # type: ignore[attr-defined]
+                now_views = set(fresh.get_view_names(schema=reflect_schema))  # type: ignore[attr-defined]
+            except ReadOnlySourceError:
+                raise
+            except Exception:  # noqa: BLE001 - unlisted: look again as the same kind
+                now_tables, now_views = set(gone_tables), set(gone_views)
+            have = {t.name for t in tables} | {v.name for v in views}
+            gone = [name for name in dict.fromkeys((*gone_tables, *gone_views)) if name not in have]
+            as_tables = [name for name in gone if name in now_tables]
+            as_views = [name for name in gone if name in now_views and name not in now_tables]
+            still: list[str] = [n for n in gone if n not in now_tables and n not in now_views]
             tables.extend(
-                _reflect_tables(fresh, schema=reflect_schema, names=gone_tables, vanished=still_tables)
+                _reflect_tables(fresh, schema=reflect_schema, names=as_tables, vanished=still)
             )
             views.extend(
-                _reflect_views(fresh, schema=reflect_schema, names=gone_views, vanished=still_views)
+                _reflect_views(fresh, schema=reflect_schema, names=as_views, vanished=still)
             )
             if vanished_out is not None:
                 vanished_out.extend(
                     f"{enrich_db}.{name}" if qualify else name
-                    for name in (*still_tables, *still_views)
+                    for name in still
+                    if name not in partitions
                 )
         # Engine-specific enrichment (columns/indexes/partitions in place + stored
         # triggers/routines/events). No-ops for a dialect/connection without it.

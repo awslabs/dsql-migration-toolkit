@@ -251,6 +251,13 @@ class SourceDialect(ABC):
         """
         return []
 
+    def partition_children(self, connection: object, schema: "Optional[str]") -> "set[str]":
+        """The bare names of the schema's partition CHILDREN, read before reflection: a
+        child is listed with the tables but never migrates on its own (its parent does), so
+        one dropped mid-read (partition retention) is no table the migration loses.
+        Default none (MySQL partitions are no tables). Best effort: empty on a failed read."""
+        return set()
+
     def extra_relations(self, connection: object, enrich_db: str) -> "list":
         """Relations with NO Aurora DSQL target that structural reflection MISSES.
 

@@ -275,7 +275,11 @@ def test_standalone_sequences_exclude_owned_identity_and_extension_sequences() -
     assert "deptype IN ('a', 'i')" in sql
     assert "d.deptype = 'e'" in sql
     assert "has_sequence_privilege(c.oid, 'SELECT,USAGE')" in sql
-    assert sequences[0] == _sequence(data_type="integer", maximum=2147483647)
+    # The callers were read (none found), which is not "unread" (None).
+    assert sequences[0].callers == ()
+    assert sequences[0].__class__(**{**sequences[0].__dict__, "callers": None}) == _sequence(
+        data_type="integer", maximum=2147483647
+    )
     assert sequences[1].readable is False and sequences[1].last_value is None
     assert pg_read_standalone_sequences(conn, []) == ()
 
@@ -1122,10 +1126,11 @@ def test_the_sequence_item_follows_the_catalog_and_keeps_formatted_defaults() ->
         "SET DEFAULT ('ORD-'::text || lpad((nextval('\"public\".\"order_seq\"'))::text, 8, "
         "'0'::text));" in item.recommendation
     )
-    # The identity primary key: no SET DEFAULT, and how to keep the shared numbering.
-    assert '"invoices" ALTER COLUMN "id" SET DEFAULT' not in item.recommendation
+    # The identity primary key: its SET DEFAULT only after choosing Keep source PK (an
+    # identity column takes none), so it keeps drawing from the shared sequence.
     assert "It is the primary key DEFAULT of app.invoices.id" in item.risk
-    assert "choose 'Keep source PK' for those tables" in item.recommendation
+    keep = item.recommendation.index("choose 'Keep source PK' for that table")
+    assert item.recommendation.index('"invoices" ALTER COLUMN "id" SET DEFAULT') > keep
 
 
 def test_a_report_without_the_probe_says_so_after_a_refresh_or_restore() -> None:
@@ -1183,3 +1188,46 @@ def test_the_probe_note_is_never_counted_as_an_object() -> None:
     assert empty.assessed_items == []
     assert sum(empty.summary.values()) == 0
     assert compute_migration_score(empty) is None
+
+
+def test_sequence_callers_are_the_migrations_own_and_unread_means_fallback() -> None:
+    """G43 read callers from pg_depend unfiltered: every partition (its parent carries the
+    DEFAULT) got its own SET DEFAULT on a relation Aurora DSQL never has; a currval() reader
+    was 'dropped'; and an empty catalog answer fell back to DEFAULT text, misattributing a
+    bare name to a same-named sequence in another schema."""
+    seq = _sequence(name="public.event_id_seq")
+    events = _pg_table("public.events", ColumnDef(name="id", mysql_type="bigint", default="nextval('event_id_seq'::regclass)"))
+    with_partitions = seq.__class__(**{**seq.__dict__, "callers": (
+        ("public.events", "id", "nextval('event_id_seq'::regclass)"),
+        ("public.events_2026_01", "id", "nextval('event_id_seq'::regclass)"),
+        ("public.audit", "last_id", "currval('event_id_seq'::regclass)"),
+    )})
+    (item,) = standalone_sequence_items([with_partitions], SourceInventory(tables=[events]))
+    assert "events_2026_01" not in item.recommendation and "audit" not in item.risk
+    assert item.recommendation.count("SET DEFAULT") == 1
+
+    # Read, none found: no DEFAULT-text guess (app.order_seq is not what app.orders calls).
+    other = _sequence(name="app.order_seq").__class__(**{**_sequence(name="app.order_seq").__dict__, "callers": ()})
+    orders = _pg_table("app.orders", ColumnDef(name="order_no", mysql_type="bigint", default="nextval('order_seq'::regclass)"))
+    (item,) = standalone_sequence_items([other], SourceInventory(tables=[orders]))
+    assert "A DEFAULT calls it" not in item.risk
+    # Unread (None): the DEFAULT text is the fallback.
+    (item,) = standalone_sequence_items([_sequence(name="app.order_seq")], SourceInventory(tables=[orders]))
+    assert "A DEFAULT calls it on app.orders.order_no" in item.risk
+
+
+def test_a_formatted_text_key_is_no_generated_key() -> None:
+    """A text primary key fed by ('ORD-' || lpad(nextval(...)::text, 8, '0')) became the
+    table's generated key, so the converter emitted a TEXT identity Aurora DSQL rejects and
+    the formatted DEFAULT was dropped without a word."""
+    from dsql_migrator.core.converter import identity_strategy_applies
+    from dsql_migrator.core.converter_postgres import pg_column_default_sql, pg_is_bare_nextval
+
+    formatted = "('ORD-'::text || lpad((nextval('shop.order_seq'::regclass))::text, 8, '0'::text))"
+    assert not pg_is_bare_nextval(formatted) and pg_is_bare_nextval("nextval('shop.order_seq'::regclass)")
+    column = ColumnDef(name="order_no", mysql_type="text", nullable=False, default=formatted)
+    emitted, reason = pg_column_default_sql(column, is_key_column=True)
+    assert emitted is None and "re-attach this DEFAULT" in reason
+    text_key = TableDef(name="shop.orders", columns=[column], primary_key=["order_no"],
+                        auto_increment_column="order_no")
+    assert identity_strategy_applies(text_key) is False

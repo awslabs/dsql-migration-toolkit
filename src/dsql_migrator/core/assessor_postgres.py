@@ -1030,6 +1030,19 @@ def _default_callers(inventory) -> "dict[str, list[tuple[str, str, str]]]":
     return calls
 
 
+def _calls_nextval_of(expression: str, sequence_name: str) -> bool:
+    """Whether ``expression`` draws from ``sequence_name`` (``schema.name``; a bare name in
+    the expression counts) -- a currval() or a cast only reads it."""
+    from dsql_migrator.core.converter_postgres import _NEXTVAL_RE, pg_nextval_sequence
+
+    bare = sequence_name.rsplit(".", 1)[-1]
+    for match in _NEXTVAL_RE.finditer(expression or ""):
+        called = pg_nextval_sequence(match.group(0)) or ""
+        if called == sequence_name or called == bare:
+            return True
+    return False
+
+
 def _reattached_default(expression: str, sequence_name: str, quoted: str) -> str:
     """``expression`` with each ``nextval`` of ``sequence_name`` pointing at the sequence
     created on Aurora DSQL -- the column's own DEFAULT, never a bare ``nextval`` standing in
@@ -1128,19 +1141,32 @@ def standalone_sequence_items(
                 "application already tolerates gaps; Aurora DSQL accepts only CACHE 1 or at "
                 "least 65536, so the statement uses 65536."
             )
-        calling = list(sequence.callers) or list(fallback.get(sequence.name, ()))
+        # The catalog's own links when they were read (None: the read failed, so the
+        # DEFAULT text decides) -- but only callers this migration has: a partition (its
+        # parent carries the DEFAULT), another session's temp table, and a DEFAULT that only
+        # reads the sequence (currval, which the conversion keeps) are none of them.
+        calling = [
+            (table, column, expr)
+            for table, column, expr in (
+                list(sequence.callers)
+                if sequence.callers is not None
+                else list(fallback.get(sequence.name, ()))
+            )
+            if (not tables_by_name or table in tables_by_name)
+            and _calls_nextval_of(expr, sequence.name)
+        ]
         # A primary key whose DEFAULT calls the sequence becomes an identity of its own under
         # the default strategy: a DEFAULT cannot be re-attached to it, and keeping the shared
         # numbering means choosing Keep source PK for those tables first.
         keyed = [
-            (table, column)
-            for table, column, _expr in calling
+            (table, column, expr)
+            for table, column, expr in calling
             if (owner := tables_by_name.get(table)) is not None
             and owner.auto_increment_column == column
             and default_primary_key_strategy(owner, is_postgres=True)
             is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
         ]
-        dropped = [entry for entry in calling if (entry[0], entry[1]) not in set(keyed)]
+        dropped = [entry for entry in calling if entry not in keyed]
         defaults = ""
         if dropped:
             shown = ", ".join(f"{table}.{column}" for table, column, _expr in dropped)
@@ -1162,15 +1188,24 @@ def standalone_sequence_items(
                 "sequence they share would hand out the same numbers twice."
             )
         if keyed:
-            shown = ", ".join(f"{table}.{column}" for table, column in keyed)
+            shown = ", ".join(f"{table}.{column}" for table, column, _expr in keyed)
+            several = len(keyed) > 1 or bool(dropped)
             state += (
                 f" It is the primary key DEFAULT of {shown}, which Schema Conversion makes an "
-                "identity of its own, so those tables stop sharing its numbers."
+                "identity of its own"
+                + (", so those tables stop sharing its numbers." if several else ".")
+            )
+            reattach_keys = " ".join(
+                f"ALTER TABLE {pg.quote_table(table)} ALTER COLUMN "
+                f"{pg.quote_identifier(column)} SET DEFAULT "
+                f"{_reattached_default(expr, sequence.name, quoted) or f'nextval({_sql_literal(quoted)})'};"
+                for table, column, expr in keyed
             )
             defaults += (
-                " To keep them sharing it, choose 'Keep source PK' for those tables in Schema "
-                "Conversion, then re-attach the DEFAULT as above (an identity column takes no "
-                "DEFAULT)."
+                f" To keep {'them sharing it' if several else 'the key drawing from it'}, choose "
+                f"'Keep source PK' for {'those tables' if len(keyed) > 1 else 'that table'} in "
+                "Schema Conversion (an identity column takes no DEFAULT), then run after apply: "
+                f"{reattach_keys}"
             )
         item = AssessmentItem(
             object_name=sequence.name,
