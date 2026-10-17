@@ -360,20 +360,30 @@ MySQL→PostgreSQL トランスパイルではありません。
   `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` は UTC の壁時計に(MySQL と同じく精度に合わせて丸めずに切り捨てて)、`STDDEV`/`VARIANCE` は
   MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
   あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
-  そのバイトに(比較では Aurora DSQL がすでにバイト単位で比較するので省略)、`CAST(x AS UNSIGNED)` は MySQL と同じく負の数を
-  循環させて、`GROUP_CONCAT` は text 上の集計に、`CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を
-  返すように、`LENGTH` はテキストのバイト数に(`CHAR(n)` 列は埋め草の空白なしで)、`TRUNCATE(x, d)`、`DATE` に日・月を足しても
-  `DATE` のままに、`+hh:mm` オフセットの `CONVERT_TZ`(リテラルでも列から読む値でも)、NULL を保ち `DATETIME` と
-  `TINYINT(1)` を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、MySQL と同じく書式に応じて `TIME`/`DATE`/`DATETIME` を
-  返す `STR_TO_DATE`(空文字列は NULL、2 桁の年は MySQL と同じく解釈)、そしてすべての `DATE_FORMAT`/`STR_TO_DATE`/
-  `FROM_UNIXTIME` の書式を `%%` や未知の指定子まで MySQL 自身の指定子から)。その他(ISO 以外のモードの `WEEK`、
-  `SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じようにフラグが付き、Aurora DSQL にパターンのない書式トークン(MySQL の
-  `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、異なるテキストを返します。列に対する `STR_TO_DATE`
-  (書式と完全に一致しない値に MySQL は NULL を返しますが、Aurora DSQL は読めない値にはエラーを返し、区切り文字だけが違う値は
-  日付として読みます)、バイトのデコード(不正なバイトは MySQL では NULL、Aurora DSQL ではエラー)、列から読む書式、
+  そのバイトに(比較・`ORDER BY`・`GROUP BY` では Aurora DSQL がすでにバイト単位で比較するので省略)、`CAST(x AS UNSIGNED)` は
+  MySQL と同じく先に丸めてから負の数を循環させて、整数と decimal の `/` は MySQL の正確な除算として(被除数のスケールに 4 を
+  足した decimal で表示し — `10 / 3` は `3.3333` — 0 で割ると NULL)`AVG` も同様に、`FLOAT`/`DOUBLE` の
+  `ROUND`/`TRUNCATE(x, d)` は MySQL と同じく倍精度で計算して(整数はその整数のまま)、`GROUP_CONCAT` は text 上の集計に、
+  `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はテキストのバイト数に
+  (`CHAR(n)` 列は埋め草の空白なしで、JSON 値はそのテキストで)、`DATE` に日・月を足しても `DATE` のままに(列や式から読む量や
+  小数は MySQL と同じく整数単位で数え、2 桁の年の日付文字列は MySQL と同じく解釈)、`+hh:mm` オフセットの `CONVERT_TZ`
+  (リテラルでも列から読む値でも)、NULL を保ち `DATETIME` と `TINYINT(1)` を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、
+  MySQL の `->>`(MySQL はビューに `json_unquote(json_extract(...))` として保存します)は `JSON_EXTRACT_PATH_TEXT` に、MySQL と
+  同じく書式に応じて `TIME`/`DATE`/`DATETIME` を返す `STR_TO_DATE`(空文字列は NULL、2 桁の年は MySQL と同じく解釈、書式を
+  読み終えて残った入力は無視)、MySQL が保存した結合の中の `ON` のない結合(`CROSS JOIN`、`LATERAL`)は `CROSS JOIN` に、
+  `STRAIGHT_JOIN` は `JOIN` に、そしてすべての `DATE_FORMAT`/`STR_TO_DATE`/`FROM_UNIXTIME` の書式を `%%` や未知の指定子まで
+  MySQL 自身の指定子から)。その他(ISO 以外のモードの `WEEK`、`SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じように
+  フラグが付き、PostgreSQL に同じ名前の関数があってもストアド関数(`date_trunc`)にはフラグが付き、Aurora DSQL にパターンの
+  ない書式トークン(MySQL の `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、異なるテキストを
+  返します。列に対する `STR_TO_DATE`(書式で読めない値に MySQL は NULL を返しますが、Aurora DSQL はそうした値にはエラーを返し、
+  区切り文字だけが違う値は日付として読みます。また夏時間のあるセッションのタイムゾーンでは、時計が飛ばす 1 時間の中の時刻が
+  1 時間後として読まれます)、バイトのデコード(不正なバイトは MySQL では NULL、Aurora DSQL ではエラー)、列から読む書式、
   `GROUP_CONCAT(DISTINCT x ORDER BY y)` にもフラグが付きます。各値はその内容に合わせて書きます — 列はその型で(MySQL が保存した
-  結合を経ても)、式はその計算結果で — そして Query Converter も同じ MySQL の式を同じように書き、ステップ 1 を実行していれば
-  Evaluation のインベントリの型を使います。
+  結合を経ても、MySQL が束縛するとおりに — `db`.`table`.`col` はそのデータベースのテーブルに)、式はその計算結果で — そして
+  Query Converter も同じ MySQL の式を同じように書き(`UPDATE`、`DELETE`、`ON DUPLICATE KEY UPDATE` でも)、ステップ 1 を
+  実行していれば Evaluation のインベントリの型を使います。型がわからない列 — 別のビューや派生テーブル、CTE を経て読む列や、
+  ステップ 1 の前の Query Converter の列 — の `LENGTH` と `BINARY` は、その列自体のバイトを読みます。テキストやバイナリの列には
+  正しいものの、数値や日付には Aurora DSQL が拒否します。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

@@ -65,9 +65,9 @@ def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
         ("date_format(d, '%h:%i %p')", "'HH12:MI AM'"),
         ("date_format(d, 'Date: %Y')", "'\"Date: \"YYYY'"),
         # G95: a DATETIME as MySQL types it, '' NULL, a two-digit year read as MySQL reads it.
-        # G97: parsed at a fixed offset, whatever the session time zone.
+        # G101: read in the session's time zone (G97's fixed offset read leftover input as one).
         ("str_to_date(s, '%d/%m/%Y %H:%i')",
-         "CAST(TO_TIMESTAMP(NULLIF(s, '') || ' +00', 'DD/MM/YY HH24:MI TZH') AT TIME ZONE 'UTC' AS TIMESTAMP)"),
+         "CAST(TO_TIMESTAMP(NULLIF(s, ''), 'DD/MM/YY HH24:MI') AS TIMESTAMP)"),
         ("from_unixtime(a, '%Y-%m-%d')", "TO_CHAR(TO_TIMESTAMP(a), 'YYYY-MM-DD')"),
         ("now()", "DATE_TRUNC('second', LOCALTIMESTAMP)"),  # whole seconds, truncated (G97)
     ],

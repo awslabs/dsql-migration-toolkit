@@ -60,6 +60,7 @@ from dsql_migrator.core.converter import (
     MYSQL_EXPRESSION_DIALECT,
     inline_having_aliases,
     rewrite_mysql_expressions,
+    unquote_json_extracts,
 )
 from dsql_migrator.core.models import Classification, SourceType
 
@@ -336,24 +337,18 @@ def _rewrite_json_unquote(tree: exp.Expression) -> list[QueryWarning]:
     ``function json_unquote(json) does not exist``. This rewrites the
     ``JSON_UNQUOTE(JSON_EXTRACT(...))`` pair in place to a single
     :class:`sqlglot.exp.JSONExtractScalar`, so it renders as
-    ``JSON_EXTRACT_PATH_TEXT(col, 'k', ...)`` and runs on DSQL.
+    ``JSON_EXTRACT_PATH_TEXT(col, 'k', ...)`` and runs on DSQL -- the converter's own
+    rewrite (:func:`unquote_json_extracts`), which a view's ``->>`` gets too.
 
     A ``JSON_UNQUOTE`` wrapping anything else has no automatic equivalent, so it is
     left unchanged and flagged ``MANUAL`` rather than silently emitting SQL the
     target will reject (Property 6). Returns the warnings produced (empty when
     there was no ``JSON_UNQUOTE`` or every occurrence was rewritten cleanly).
     """
+    unquote_json_extracts(tree)
     warnings: list[QueryWarning] = []
     for node in list(tree.find_all(exp.Anonymous)):
-        if not _is_json_unquote(node):
-            continue
-        inner = node.expressions[0]
-        if isinstance(inner, exp.JSONExtract):
-            # JSON_UNQUOTE(JSON_EXTRACT(col, path)) -> scalar (text) extraction.
-            node.replace(
-                exp.JSONExtractScalar(this=inner.this, expression=inner.expression)
-            )
-        else:
+        if _is_json_unquote(node):
             warnings.append(
                 QueryWarning(
                     code=CODE_JSON_UNQUOTE_UNSUPPORTED,

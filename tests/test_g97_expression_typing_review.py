@@ -201,7 +201,8 @@ def test_a_literal_str_to_date_is_not_reported() -> None:
         ("(curdate() + interval 1 day)", "CAST(CURRENT_DATE + INTERVAL '1 DAY' AS DATE)"),
         ("('2024-01-31' + interval 1 month)",
          "CAST(CAST('2024-01-31' AS DATE) + INTERVAL '1 MONTH' AS DATE)"),
-        ("truncate(`i`.`fl`,2)", "TRUNC(CAST(CAST(\"i\".\"fl\" AS DOUBLE PRECISION) AS DECIMAL), 2)"),
+        # G101: in double precision, as MySQL computes it (numeric made TRUNCATE(0.29e0, 2) 0.29).
+        ("truncate(`i`.`fl`,2)", "( TRUNC(CAST(\"i\".\"fl\" AS DOUBLE PRECISION) * 100) / 100 )"),
         ("truncate(`i`.`id`,1)", "\"i\".\"id\" AS \"x\""),
         ("date_format(`o`.`t`,'%h:%i %p')", "TO_CHAR(CAST(( CURRENT_DATE + \"o\".\"t\" ) AS TIMESTAMP)"),
         ("str_to_date(`i`.`day_key`,'%Y%m%d')", "TO_DATE(NULLIF(CAST(\"i\".\"day_key\" AS TEXT), '')"),
@@ -219,7 +220,8 @@ def test_a_format_chosen_at_run_time_is_a_datetime() -> None:
     ddl, _ = _view(
         "select str_to_date(`o`.`s`,if(`o`.`paid`,'%d/%m/%Y','%e/%c/%y')) AS `x` from `shop`.`orders` `o`"
     )
-    assert "AT TIME ZONE 'UTC' AS TIMESTAMP)" in ddl and "TO_DATE(" not in ddl
+    # G101: read in the session's time zone -- G97's fixed offset read leftover input as one.
+    assert "CAST(TO_TIMESTAMP(NULLIF(" in ddl and "TZH" not in ddl and "TO_DATE(" not in ddl
 
 
 def test_the_str_to_date_note_says_both_ways_it_differs() -> None:

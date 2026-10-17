@@ -441,23 +441,36 @@ MySQL→PostgreSQL transpile:
   `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` as the UTC one, truncated to their precision as MySQL does,
   `STDDEV`/`VARIANCE` as the population forms MySQL computes and `VAR_SAMP`/`STDDEV_SAMP` as the sample ones,
   `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
-  a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (dropped in a comparison, which
-  Aurora DSQL makes byte-wise already), `CAST(x AS UNSIGNED)` wrapping a negative number as MySQL does,
-  `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL does,
-  `LENGTH` as the bytes of its text (a `CHAR(n)` column without its padding), `TRUNCATE(x, d)`, a `DATE` plus
-  days/months staying a `DATE`, `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a
-  column), `JSON_ARRAY`/`JSON_ARRAYAGG` keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL
-  does, `STR_TO_DATE` typed as MySQL types it (a `TIME`, `DATE` or `DATETIME` by its format, an empty string
-  NULL, a two-digit year read as MySQL reads it), and every `DATE_FORMAT` / `STR_TO_DATE` / `FROM_UNIXTIME`
-  format written from MySQL's own specifiers, `%%` and unknown ones included); others (`WEEK` in a mode other
-  than ISO's, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET`, ...) are flagged the same way, and a format token with no
+  a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (dropped in a comparison, an
+  `ORDER BY` or a `GROUP BY`, which Aurora DSQL makes byte-wise already), `CAST(x AS UNSIGNED)` rounding first
+  and wrapping a negative number as MySQL does, `/` of integers and decimals as MySQL's exact division (a decimal
+  shown at the dividend's scale plus 4 — `10 / 3` is `3.3333` — and NULL for a zero divisor) and `AVG` likewise,
+  `ROUND`/`TRUNCATE(x, d)` of a `FLOAT`/`DOUBLE` in double precision as MySQL computes them (of an integer, the
+  integer), `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL
+  does, `LENGTH` as the bytes of its text (a `CHAR(n)` column without its padding, a JSON value as its text), a
+  `DATE` plus days/months staying a `DATE` (an amount read from a column or an expression, or a fraction,
+  counted in whole units as MySQL counts it; a date string with a two-digit year read as MySQL reads it),
+  `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column), `JSON_ARRAY`/`JSON_ARRAYAGG`
+  keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL does, MySQL's `->>` (which MySQL stores in a
+  view as `json_unquote(json_extract(...))`) as `JSON_EXTRACT_PATH_TEXT`, `STR_TO_DATE` typed as MySQL types it
+  (a `TIME`, `DATE` or `DATETIME` by its format, an empty string NULL, a two-digit year read as MySQL reads it,
+  input left over after the format ignored), a join without `ON` inside MySQL's stored joins (`CROSS JOIN`,
+  `LATERAL`) as a `CROSS JOIN` and `STRAIGHT_JOIN` as a `JOIN`, and every `DATE_FORMAT` / `STR_TO_DATE` /
+  `FROM_UNIXTIME` format written from MySQL's own specifiers, `%%` and unknown ones included); others (`WEEK` in a
+  mode other than ISO's, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET`, ...) are flagged the same way, as is a stored
+  function even when PostgreSQL has one of its name (`date_trunc`), and a format token with no
   Aurora DSQL pattern (MySQL's `%U`/`%u`/`%V`/`%X` week numbers, `%w`) is flagged too: the view would be
-  created but return different text. So are `STR_TO_DATE` over a column (MySQL returns NULL for a value that does
-  not match its format exactly; Aurora DSQL raises an error for one it cannot read and reads one whose separators
-  differ as a date), decoding bytes (invalid bytes are NULL in MySQL, an error on Aurora DSQL), a format read from
+  created but return different text. So are `STR_TO_DATE` over a column (MySQL returns NULL for a value it cannot
+  read with its format; Aurora DSQL raises an error for one and reads one whose separators differ as a date — and
+  in a session time zone with daylight saving time, a time in the hour the clocks skip comes back an hour later),
+  decoding bytes (invalid bytes are NULL in MySQL, an error on Aurora DSQL), a format read from
   a column, and `GROUP_CONCAT(DISTINCT x ORDER BY y)`. Each value is written by what it holds — a column by its
-  type, read through MySQL's stored joins, an expression by what it computes — and the Query Converter writes the
-  same MySQL expressions the same way, typed by the Evaluation inventory once Step 1 has run. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  type, read through MySQL's stored joins and bound as MySQL binds it (`db`.`table`.`col` to that database's
+  table), an expression by what it computes — and the Query Converter writes the same MySQL expressions the same
+  way (in an `UPDATE`, a `DELETE` and an `ON DUPLICATE KEY UPDATE` too), typed by the Evaluation inventory once
+  Step 1 has run. `LENGTH` and `BINARY` of a column whose type cannot be told — read through another view, a
+  derived table or a CTE, or in the Query Converter before Step 1 — read the column's own bytes, which is right for
+  a text or a binary column; over a number or a date, Aurora DSQL refuses it. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column

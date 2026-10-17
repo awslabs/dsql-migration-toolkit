@@ -145,8 +145,8 @@ def test_a_distinct_group_concat_ordered_by_another_expression_is_explained() ->
     [
         ("str_to_date(`o`.`s`,'%H:%i')", "CAST(TO_TIMESTAMP(\"o\".\"s\", 'HH24:MI') AS TIME)"),
         ("str_to_date(`o`.`s`,'%d/%m/%Y')", "TO_DATE(NULLIF(\"o\".\"s\", ''), 'DD/MM/YY')"),
-        ("str_to_date(`o`.`s`,'%Y-%m-%d %H:%i')",
-         "CAST(TO_TIMESTAMP(NULLIF(\"o\".\"s\", '') || ' +00', 'YY-MM-DD HH24:MI TZH') AT TIME ZONE 'UTC' AS TIMESTAMP)"),
+        ("str_to_date(`o`.`s`,'%Y-%m-%d %H:%i')",  # G101: no fixed offset (it read leftover input)
+         "CAST(TO_TIMESTAMP(NULLIF(\"o\".\"s\", ''), 'YY-MM-DD HH24:MI') AS TIMESTAMP)"),
         ("str_to_date(`o`.`s`,'%Y%m%d')", "TO_DATE(NULLIF(\"o\".\"s\", ''), 'YYYY\"\"MM\"\"DD')"),
         # %% is a %, an unknown specifier its letter, adjacent patterns kept apart.
         ("date_format(`o`.`created_at`,'%Y%%i|%d%a|%A, %-d')", "'YYYY\"%i|\"DD\"\"Dy\"|A, -d\"'"),
