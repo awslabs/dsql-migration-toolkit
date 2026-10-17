@@ -91,3 +91,61 @@ def test_a_mixed_case_result_label_is_named(sql: str) -> None:
 def test_a_flagged_name_gets_no_second_label_note() -> None:
     result = QueryConverter().convert("SELECT CustomerId FROM orders")
     assert [w.code for w in result.warnings] == ["MIXED_CASE_NAME"]
+
+
+# --- G80: the review of G76 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "named"),
+    [
+        ("INSERT INTO orders (CustomerId, OrderDate) VALUES (1, NOW())", "CustomerId, OrderDate"),
+        ("SELECT o.id FROM orders o JOIN items USING (OrderId)", "OrderId"),
+        # A non-recursive CTE sees only the CTEs before it: Orders is the real table here.
+        ("WITH recent AS (SELECT * FROM Orders WHERE id > 1), orders AS (SELECT * FROM recent) "
+         "SELECT * FROM orders", "Orders"),
+        # A CTE of another subquery is not in scope.
+        ("SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM Customers) AND EXISTS "
+         "(WITH Customers AS (SELECT 1 AS a) SELECT a FROM Customers)", "Customers"),
+    ],
+)
+def test_names_are_resolved_in_their_own_scope(sql: str, named: str) -> None:
+    """INSERT column lists and JOIN ... USING were never read, and a CTE hid a real table
+    anywhere in the statement: SQL that fails on Aurora DSQL read 'Converted cleanly'."""
+    result = QueryConverter().convert(sql)
+    (warning,) = [w for w in result.warnings if w.code == "MIXED_CASE_NAME"]
+    assert f"Name(s) {named} " in warning.message
+
+
+def test_a_reused_derived_alias_is_resolved_per_branch() -> None:
+    """t was keyed by alias text, the last one winning: t.UserId read as a real column and
+    the advice to quote it broke the query."""
+    result = QueryConverter().convert(
+        "SELECT t.UserId FROM (SELECT id AS UserId FROM a) t "
+        "UNION ALL SELECT t.Name FROM (SELECT name AS Name FROM b) t"
+    )
+    assert [w.code for w in result.warnings] == ["MIXED_CASE_LABEL"]
+
+
+def test_a_having_alias_is_inlined_whatever_its_case() -> None:
+    """MySQL resolves `HAVING Total` to the alias total; the inliner matched case-sensitively
+    and left a reference Aurora DSQL rejects."""
+    result = QueryConverter().convert(
+        "SELECT g, SUM(x) AS total FROM t GROUP BY g HAVING Total > 5"
+    )
+    assert result.converted_sql.endswith("HAVING SUM(x) > 5")
+    assert result.classification.value == "AUTO"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH totals AS (SELECT customer_id, SUM(amount) AS TotalSpent FROM orders "
+        "GROUP BY customer_id) SELECT * FROM totals",
+        "SELECT * FROM (SELECT id AS UserId FROM users) d",
+        "(SELECT id AS UserId FROM a) UNION (SELECT id FROM b)",
+    ],
+)
+def test_a_label_that_reaches_the_client_through_a_star_is_named(sql: str) -> None:
+    result = QueryConverter().convert(sql)
+    assert [w.code for w in result.warnings] == ["MIXED_CASE_LABEL"]
