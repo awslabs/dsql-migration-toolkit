@@ -38,10 +38,9 @@ def _view(body: str):
         ("SELECT (SELECT COUNT(*) FROM payments p WHERE p.order_id = o.id) AS pay_count, "
          "COUNT(*) AS orders FROM orders o GROUP BY pay_count HAVING pay_count > 0",
          "HAVING (SELECT COUNT(*) FROM payments AS p WHERE p.order_id = o.id) > 0"),
-        # The subquery's p.amount is no FROM column of the outer query.
-        ("SELECT (SELECT MAX(p.amount) FROM payments p WHERE p.order_id = o.id) AS amount, "
-         "COUNT(*) AS n FROM orders o GROUP BY amount HAVING amount > 10",
-         "HAVING (SELECT MAX(p.amount) FROM payments AS p WHERE p.order_id = o.id) > 10"),
+        # (SELECT MAX(p.amount) ...) AS amount is grouped by itself only when orders has no
+        # amount -- MySQL reads a FROM column first: told by the inventory since G108
+        # (test_g108_having_review).
         # An aggregate of the alias's own level still makes the GROUP BY name a FROM column.
         ("SELECT COUNT(*) + (SELECT 1) AS n FROM t GROUP BY n HAVING n > 1", "HAVING n > 1"),
     ],

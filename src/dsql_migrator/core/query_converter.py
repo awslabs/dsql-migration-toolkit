@@ -373,9 +373,22 @@ def _rewrite_json_unquote(tree: exp.Expression) -> list[QueryWarning]:
     return warnings
 
 
-def _inline_having_aliases(tree: exp.Expression, *, case_insensitive: bool = True) -> None:
-    """MySQL's HAVING aliases inlined as a view's are: :func:`inline_having_aliases`."""
-    inline_having_aliases(tree, case_insensitive=case_insensitive)
+def _inline_having_aliases(
+    tree: exp.Expression,
+    column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]" = (),
+    *,
+    case_insensitive: bool = True,
+) -> "list[QueryWarning]":
+    """MySQL's HAVING written as a view's is (:func:`inline_having_aliases`), read as
+    written: a bare GROUP BY name through the Evaluation inventory's columns
+    (``column_types``), and a subquery's HAVING name MySQL reads from the enclosing query
+    flagged MANUAL."""
+    return [
+        QueryWarning(code=CODE_MYSQL_SEMANTICS, classification=Classification.MANUAL, message=text)
+        for text in inline_having_aliases(
+            tree, case_insensitive=case_insensitive, stored=False, column_types=column_types
+        )
+    ]
 
 
 def _mysql_expression_warnings(
@@ -1618,7 +1631,7 @@ class QueryConverter:
         if not self._is_postgres:
             # MySQL-only: PostgreSQL's HAVING never names an output alias, so on a
             # PostgreSQL source a HAVING name matching one is a real column.
-            _inline_having_aliases(tree)
+            warnings.extend(_inline_having_aliases(tree, self._column_types))
         warnings.extend(_for_update_warnings(tree))
 
         try:
