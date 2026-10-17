@@ -153,6 +153,12 @@ _PG_CORPUS = [
     _t("coll_col", [ColumnDef(name="n", mysql_type="text", collation="en_US")]),
     TableDef(name="app.nopk", columns=[_PK], primary_key=[]),
     _t("parted", partitioned=True),
+    # A PostgreSQL expression index (reflection holds it in expression_indexes only).
+    _t(
+        "pg_expr_idx",
+        [ColumnDef(name="email", mysql_type="text")],
+        expression_indexes=["ux_pg_expr_idx_lower_email"],
+    ),
     # DEFAULTs calling functions the target lacks (uuid_generate_v4 is translated instead).
     _t("fn_default", [ColumnDef(name="code", mysql_type="text", default="app.next_code()")]),
     _t("v1_default", [ColumnDef(name="u", mysql_type="uuid", default="uuid_generate_v1mc()")]),
@@ -256,6 +262,7 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
         for item, _ in _grades(SourceType.POSTGRES, _PG_CORPUS)
     }
     assert "PG_UNINDEXABLE_COLUMN" in concerns["app.jsonb_idx"]
+    assert pg["app.pg_expr_idx"] == "EXPRESSION_INDEX"
     assert mysql["app.zero_default"] == "DEFAULT_DROPPED"
     assert pg["app.fn_default"] == pg["app.v1_default"] == "DEFAULT_DROPPED"
     assert "DEFAULT_DROPPED" not in concerns["app.v4_default"]

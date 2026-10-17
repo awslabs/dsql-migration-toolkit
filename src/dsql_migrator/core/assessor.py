@@ -1775,13 +1775,17 @@ class ConversionWarningRule(Rule):
                     risk=warning.message,
                     recommendation=self._recommendation,
                     effort=self._effort,
+                    # Advice where the conversion says so (a harmless index method change),
+                    # a gap otherwise: graded the way the conversion files it.
+                    note_kind=warning.kind,
                 )
             )
         return findings
 
 
 def expression_index_rule() -> ConversionWarningRule:
-    """MySQL functional indexes, which the conversion cannot carry (EXPRESSION_INDEX)."""
+    """Expression indexes (MySQL functional, PostgreSQL expression), which the conversion
+    does not carry (EXPRESSION_INDEX)."""
     return ConversionWarningRule(
         "EXPRESSION_INDEX",
         "_expression_index_warning",
@@ -2757,8 +2761,13 @@ def check_mixed_case_identifiers(
     nothing after cut over -- with no finding anywhere until then. Tables whose names differ
     only by case (possible where MySQL's table names are case-sensitive) cannot both be
     reached unquoted at all."""
+    # Aurora DSQL (a UTF8 database) folds only ASCII A-Z in an unquoted name, so a name
+    # whose only capitals are non-ASCII (Ürün, Сумма) is reached unquoted as spelled.
     def upper(name: str) -> bool:
-        return name != name.lower()
+        return any("A" <= ch <= "Z" for ch in name)
+
+    def folded(name: str) -> str:
+        return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in name)
 
     schemas: set[str] = set()
     relations: list[str] = []
@@ -2772,7 +2781,7 @@ def check_mixed_case_identifiers(
             schemas.add(schema)
         if upper(bare):
             relations.append(relation.name)
-        by_folded.setdefault((schema.lower(), bare.lower()), []).append(relation.name)
+        by_folded.setdefault((folded(schema), folded(bare)), []).append(relation.name)
     for table in inventory.tables:
         columns.extend(f"{table.name}.{c.name}" for c in table.columns if upper(c.name))
     if not (schemas or relations or columns):
@@ -2808,8 +2817,11 @@ def check_mixed_case_identifiers(
         risk=risk,
         recommendation=(
             "Before cut over, quote these names in the application's SQL exactly as they "
-            "are spelled (\"CustomerId\"), or rename them to lower case on the target "
-            "(ALTER TABLE ... RENAME ...) and use lower case throughout."
+            "are spelled (\"CustomerId\"). Or rename them to lower case on the SOURCE "
+            "before Schema Conversion (MySQL still finds a column whatever case unquoted SQL "
+            "writes; a table rename needs lower_case_table_names or the application's own "
+            "change). Never rename them on the target before cut over: Full Load, CDC, "
+            "Validation and the cut-over DDL all address the source spelling."
         ),
         effort=EffortLevel.MEDIUM,
         kind=KIND_DATABASE.upper(),

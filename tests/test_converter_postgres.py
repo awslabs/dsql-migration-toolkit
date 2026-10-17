@@ -1924,3 +1924,58 @@ def test_a_uuid_ossp_default_becomes_gen_random_uuid_and_a_foreign_function_is_d
     notes = {w.column_name: w.message for w in r.warnings if w.column_name in ("code", "v1")}
     assert "app.next_code()" in notes["code"] and "REJECTED on Aurora DSQL" in notes["code"]
     assert "uuid-ossp function" in notes["v1"]
+
+
+def test_a_harmless_index_method_change_is_advice_and_an_expression_index_is_graded() -> None:
+    """A hash or BRIN index made btree serves the same comparisons, yet each table read
+    MANUAL/MEDIUM with 'move the search outside the database'; a PostgreSQL expression
+    index (lower(email)) was a conversion LOSS while Evaluation graded the table AUTO."""
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import ConversionNoteKind, IndexDef, SourceInventory
+
+    sessions = TableDef(
+        name="app.sessions",
+        columns=[_col("id", "bigint", False), _col("token", "text"), _col("at", "timestamp with time zone")],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ix_token", columns=["token"], method="hash"),
+            IndexDef(name="ix_at", columns=["at"], method="brin"),
+        ],
+    )
+    (note,) = [w for w in SchemaConverter(source_type=SourceType.POSTGRES).convert_table(sessions).warnings
+               if "btree-only" in w.message]
+    assert note.kind is ConversionNoteKind.RECOMMENDATION and "outside the database" not in note.message
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(SourceInventory(tables=[sessions]))
+    (item,) = report.items
+    (concern,) = [c for c in item.concerns if c.rule_id == "PG_INDEX_NOT_PRESERVED"]
+    assert concern.note_kind is ConversionNoteKind.RECOMMENDATION
+
+    users = TableDef(
+        name="app.users",
+        columns=[_col("id", "bigint", False), _col("email", "text")],
+        primary_key=["id"],
+        expression_indexes=["ux_users_email"],
+    )
+    report = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(SourceInventory(tables=[users]))
+    (item,) = report.items
+    assert item.classification is Classification.MANUAL
+    assert any(c.rule_id == "EXPRESSION_INDEX" for c in item.concerns)
+
+
+def test_an_array_default_is_judged_by_what_the_column_becomes() -> None:
+    """ARRAY['user'::text] has no cast for the G40 check to catch, so it was kept on a
+    column that becomes jsonb and the CREATE TABLE failed; an empty array was dropped with
+    a 'plain text literal' hint, wrong for jsonb."""
+    from dsql_migrator.core.converter_postgres import pg_column_default_sql
+
+    def resolve(typ, default):
+        return pg_column_default_sql(
+            ColumnDef(name="c", mysql_type=typ, type_kind="array", default=default), is_key_column=False
+        )
+
+    assert resolve("text[]", "'{}'::text[]") == ("'[]'::jsonb", None)
+    assert resolve("integer[]", "ARRAY[]::integer[]") == ("'[]'::jsonb", None)
+    emitted, reason = resolve("text[]", "ARRAY['user'::text]")
+    assert emitted is None and "'[\"user\"]'::jsonb" in reason
+    emitted, reason = resolve("integer[]", "ARRAY[0, 0]")
+    assert emitted is None and "becomes jsonb" in reason

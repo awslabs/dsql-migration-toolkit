@@ -151,18 +151,33 @@ def pg_column_default_sql(
     raw, function_reason = _pg_default_functions(raw)
     if function_reason is not None:
         return None, function_reason
+    # Judged by what the COLUMN becomes, not by how the default is spelled: an array
+    # column becomes jsonb, whatever its DEFAULT looks like (ARRAY['user'::text] has no
+    # cast to catch, and is still rejected for a jsonb column).
+    substitute = substitute_pg_unsupported_type(column.mysql_type, type_kind=column.type_kind)[0]
+    if substitute == "jsonb":
+        if _PG_EMPTY_ARRAY_DEFAULT_RE.match(raw):
+            return "'[]'::jsonb", None  # what Full Load writes for an empty array
+        return None, (
+            f"source default ({raw}) is an array, and the column becomes jsonb, so the "
+            "default is not carried. Re-add it as JSON after apply (e.g. ALTER TABLE ... "
+            "ALTER COLUMN ... SET DEFAULT '[\"user\"]'::jsonb): Full Load writes the "
+            "column's arrays as JSON arrays."
+        )
     bad_type = _pg_default_unsupported_type(raw)
     if bad_type is not None:
+        example = "a number" if substitute == "numeric" else "a plain text literal"
         return None, (
             f"source default ({raw}) casts to '{bad_type}', a PostgreSQL type Aurora DSQL "
             "does not support as a column type, so the default is not carried -- it would "
             "keep failing even after the column itself is remodelled. Re-add it with the "
-            "remodelled type (e.g. a plain text literal) in the DDL or with ALTER TABLE "
-            "after apply."
+            f"remodelled type (e.g. {example}) in the DDL or with ALTER TABLE after apply."
         )
     return raw, None
 
 
+# An empty array DEFAULT as pg_get_expr prints it: '{}'::text[], ARRAY[]::integer[].
+_PG_EMPTY_ARRAY_DEFAULT_RE = re.compile(r"^\s*(?:'\{\}'|ARRAY\[\s*\])\s*::\s*[^']+\[\]\s*$", re.IGNORECASE)
 # uuid-ossp's random UUID, as a DEFAULT names it (bare when the extension sits on the
 # search_path, else schema-qualified): Aurora DSQL has no uuid-ossp, and its built-in
 # gen_random_uuid() returns the same thing, a version-4 UUID.

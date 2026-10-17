@@ -2419,3 +2419,30 @@ def test_a_numeric_sequence_key_keeps_its_generator_and_notes_name_only_offered_
     ).warnings
     (composite,) = [w for w in notes if "With the composite key" in w.message]
     assert "the default for this table" not in composite.message
+
+
+def test_mixed_case_review_fixes() -> None:
+    """MIXED_CASE_IDENTIFIERS advised renaming on the TARGET (which breaks every later
+    step), counted non-ASCII capitals DSQL does not fold, and the Query Playground called
+    unquoted mixed-case SQL AUTO."""
+    from dsql_migrator.core.assessor import check_mixed_case_identifiers
+    from dsql_migrator.core.query_converter import CODE_MIXED_CASE_NAME, QueryConverter
+
+    turkish = SourceInventory(tables=[
+        TableDef(name="shop.Ürün", columns=[ColumnDef(name="Сумма", mysql_type="int")], primary_key=["Сумма"]),
+        TableDef(name="shop.ürün", columns=[ColumnDef(name="id", mysql_type="int")], primary_key=["id"]),
+    ])
+    assert check_mixed_case_identifiers(turkish) == []
+    (item,) = check_mixed_case_identifiers(SourceInventory(tables=[
+        TableDef(name="shop.Orders", columns=[ColumnDef(name="CustomerId", mysql_type="int")], primary_key=["CustomerId"]),
+    ]))
+    assert "Never rename them on the target before cut over" in item.recommendation
+    assert "on the SOURCE before Schema Conversion" in item.recommendation
+
+    result = QueryConverter().convert("SELECT CustomerId FROM Orders WHERE id = 1")
+    assert result.classification.value == "MANUAL"
+    assert [w.code for w in result.warnings] == [CODE_MIXED_CASE_NAME]
+    upsert = QueryConverter().convert(
+        "INSERT INTO t (id, n) VALUES (1, 2) ON DUPLICATE KEY UPDATE n = VALUES(n)"
+    )
+    assert CODE_MIXED_CASE_NAME not in [w.code for w in upsert.warnings]  # EXCLUDED is the tool's

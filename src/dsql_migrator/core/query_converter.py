@@ -188,6 +188,8 @@ CODE_FOR_UPDATE_VERIFY_PK = "FOR_UPDATE_VERIFY_PK"
 # JSON_UNQUOTE that wraps something other than JSON_EXTRACT (no direct PG
 # equivalent), left as-is and flagged for manual review.
 CODE_JSON_UNQUOTE_UNSUPPORTED = "JSON_UNQUOTE_UNSUPPORTED"
+# An unquoted table/column name with upper-case ASCII letters (a MySQL source).
+CODE_MIXED_CASE_NAME = "MIXED_CASE_NAME"
 
 # Severity ordering used to derive the overall result classification from its
 # warnings (higher value is more severe). Matches the assessor's convention.
@@ -480,6 +482,38 @@ def _for_update_warnings(tree: exp.Expression) -> list[QueryWarning]:
     return warnings
 
 
+def _mixed_case_name_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
+    """MANUAL when the statement names a table or column unquoted with upper-case ASCII
+    letters. MySQL matched it whatever the case; Aurora DSQL folds an unquoted name to
+    lower case while Schema Conversion keeps the source spelling (quoted), so the same SQL
+    finds nothing after cut over. Quoting is not done for the operator: this converter
+    does not know the schema, and "Orders" would break a table actually named orders."""
+    names: list[str] = []
+    for node in (*tree.find_all(exp.Table), *tree.find_all(exp.Column)):
+        for part in (node.args.get("this"), node.args.get("table"), node.args.get("db")):
+            if (
+                isinstance(part, exp.Identifier)
+                and not part.quoted
+                and any("A" <= ch <= "Z" for ch in part.name)
+                and part.name not in names
+            ):
+                names.append(part.name)
+    if not names:
+        return None
+    return QueryWarning(
+        code=CODE_MIXED_CASE_NAME,
+        classification=Classification.MANUAL,
+        message=(
+            f"Name(s) {', '.join(names[:5])}{' ...' if len(names) > 5 else ''} are written "
+            "unquoted with upper-case letters. Aurora DSQL folds an unquoted name to lower "
+            "case, while Schema Conversion keeps each name as the source spells it (quoted), "
+            "so this SQL finds nothing after cut over: quote each exactly as the schema "
+            "spells it (\"CustomerId\"). Evaluation lists such names "
+            "(MIXED_CASE_IDENTIFIERS)."
+        ),
+    )
+
+
 class QueryConverter:
     """Converts source DML/SELECT to DSQL PostgreSQL and flags lock anti-patterns.
 
@@ -546,10 +580,14 @@ class QueryConverter:
         warnings: list[QueryWarning] = []
 
         if not self._is_postgres:
+            # On the SOURCE's names, before a rewrite adds its own (EXCLUDED.col).
+            mixed_case = _mixed_case_name_warning(tree)
             on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
             if on_duplicate_warning is not None:
                 warnings.append(on_duplicate_warning)
             warnings.extend(_rewrite_json_unquote(tree))
+            if mixed_case is not None:
+                warnings.append(mixed_case)
         _inline_having_aliases(tree)
         warnings.extend(_for_update_warnings(tree))
 
@@ -609,4 +647,5 @@ __all__ = [
     "CODE_FOR_UPDATE_NO_EQUALITY",
     "CODE_FOR_UPDATE_VERIFY_PK",
     "CODE_JSON_UNQUOTE_UNSUPPORTED",
+    "CODE_MIXED_CASE_NAME",
 ]

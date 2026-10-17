@@ -4524,8 +4524,15 @@ def _pg_partial_or_nonbtree_index_warning(
         and index.method.strip().lower() not in ("", "btree")
         and index.name in emitted
     ]
+    # A hash or BRIN index served only what a btree serves (=, <, <=, >=, >), so its btree
+    # is advice, like a non-UNIQUE partial index made FULL (a bigger index, the same
+    # answers). A GIN/GiST/SP-GiST one served operators a btree cannot, and a partial
+    # UNIQUE left out enforces nothing: those are gaps.
+    serves_the_same = {"hash", "brin"}
+    lost_methods = [(n, m) for n, m in nonbtree if m.strip().lower() not in serves_the_same]
     if not full and not left_out and not nonbtree:
         return None
+    is_loss = bool(left_out or lost_methods)
     parts: list[str] = []
     if full or left_out:
         kinds = {column.name: column.type_kind for column in table.columns}
@@ -4552,23 +4559,31 @@ def _pg_partial_or_nonbtree_index_warning(
                 "not enforced until you re-create it with a predicate over the new type"
             )
         parts.append(partial)
-    if nonbtree:
-        listed = ", ".join(f"{name} ({method})" for name, method in nonbtree)
+    same = [(n, m) for n, m in nonbtree if m.strip().lower() in serves_the_same]
+    if same:
+        listed = ", ".join(f"{name} ({method})" for name, method in same)
+        parts.append(
+            f"index(es) {listed} are created as btree, which serves every comparison those "
+            "methods did (a BRIN index's small size is what changes)"
+        )
+    if lost_methods:
+        listed = ", ".join(f"{name} ({method})" for name, method in lost_methods)
         parts.append(
             f"index(es) {listed} use a non-btree access method DSQL does not provide, so "
             "a plain btree index is created instead and the operators/queries that method "
             "served will not use it"
         )
+    message = "Aurora DSQL secondary indexes are btree-only: " + "; ".join(parts) + "."
+    if lost_methods:
+        message += (
+            " Move a search a non-btree method served outside the database (e.g. a "
+            "full-text or geospatial service) or redesign the query."
+        )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
-        kind=ConversionNoteKind.LOSS,
-        message=(
-            "Aurora DSQL secondary indexes are btree-only: "
-            + "; ".join(parts)
-            + ". Move a search a non-btree method served outside the database (e.g. a "
-            "full-text or geospatial service) or redesign the query."
-        ),
+        kind=ConversionNoteKind.LOSS if is_loss else ConversionNoteKind.RECOMMENDATION,
+        message=message,
     )
 
 
@@ -5468,28 +5483,40 @@ def _identifier_length_warning(
 
 
 def _expression_index_warning(table: TableDef) -> Optional[ConversionWarning]:
-    """Warn that a MySQL functional/expression index was not carried over.
+    """Warn that an expression index was not carried over (both engines).
 
-    A MySQL 8 functional index (``KEY ((LOWER(email)))``) indexes a computed expression.
-    The introspector reflects only plain column key-parts, so an all-expression index is
-    dropped entirely (a mixed index keeps only its column parts) -- previously with no
-    note at all, so the index simply vanished and queries relying on it silently fell back
-    to a scan. DSQL supports expression indexes, so it can be recreated by hand.
+    A MySQL 8 functional index (``KEY ((LOWER(email)))``) or a PostgreSQL expression index
+    (``(lower(email))``) indexes a computed expression. Reflection reads only plain column
+    key-parts, so such an index -- a mixed column+expression one included -- is skipped
+    entirely rather than emitted narrower. Aurora DSQL supports expression indexes, so it
+    can be recreated by hand; a UNIQUE one enforces nothing on the target until then.
     """
     if not table.expression_indexes:
         return None
     names = ", ".join(table.expression_indexes)
+    unique = [
+        index.name
+        for index in table.indexes
+        if index.unique and index.name in set(table.expression_indexes)
+    ]
+    message = (
+        f"Expression index(es) ({names}) index a computed expression (e.g. "
+        "((lower(email)))), which the converter does not carry, so they are NOT emitted -- "
+        "a mixed column+expression index is skipped entirely, not narrowed. Queries relying "
+        "on them fall back to a table scan: recreate each on the target as an expression "
+        "index (CREATE INDEX ASYNC ... ((expr))), which Aurora DSQL supports, after the load."
+    )
+    if unique:
+        message += (
+            f" {', '.join(unique)} {'is' if len(unique) == 1 else 'are'} UNIQUE: that "
+            "uniqueness is NOT enforced on the target until recreated (CREATE UNIQUE INDEX "
+            "ASYNC ... ((expr))), and duplicates written meanwhile make that build fail."
+        )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
-        message=(
-            f"Functional/expression index(es) ({names}) index a computed expression (e.g. "
-            "((LOWER(email)))). The converter reflects only plain column key-parts, so such "
-            "an index is NOT emitted (a mixed column+expression index keeps only its plain "
-            "columns). Queries relying on it fall back to a table scan — recreate it on the "
-            "target as a DSQL expression index (CREATE INDEX ASYNC ... ((expr))) after load."
-        ),
+        message=message,
     )
 
 

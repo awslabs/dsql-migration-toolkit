@@ -1447,6 +1447,7 @@ def default_rules() -> "list[Rule]":
         ViewDefinitionUnreadableRule,
         pg_collation_rule,
         default_dropped_rule,
+        expression_index_rule,
         pg_index_not_preserved_rule,
         pg_unindexable_column_rule,
     )
@@ -1494,6 +1495,7 @@ def default_rules() -> "list[Rule]":
         PgViewRemodelledColumnRule(),
         # Conversion warnings Evaluation had no finding for (the parity test's known gaps).
         pg_index_not_preserved_rule(),
+        expression_index_rule(),
         pg_unindexable_column_rule(),
         default_dropped_rule(is_postgres=True),
         pg_collation_rule(),
