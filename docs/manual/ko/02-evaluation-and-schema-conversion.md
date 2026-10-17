@@ -42,7 +42,7 @@ PostgreSQL 소스에서는 Evaluation이 인벤토리에 없는 두 가지도 �
 | 분류 | 의미 | 예시 |
 |---|---|---|
 | **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고); 다중 데이터베이스 MySQL 소스(각 데이터베이스가 자체 스키마가 되며 `RECOMMENDED`로 표시); 같은 스키마의 다른 테이블·뷰·인덱스도 쓰는 인덱스 이름(인덱스가 자동으로 이름이 바뀌며 `RECOMMENDED`로 표시). |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 파티션 테이블, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼이나 Aurora DSQL이 인덱싱할 수 없는 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 보조 인덱스(생성되지 않으며 UNIQUE 인덱스는 유일성 보장을 잃음), PostgreSQL의 btree가 아닌 인덱스(btree로 생성)와 조건식이 타입이 바뀌는 컬럼을 읽는 부분 인덱스(다른 부분 인덱스는 `WHERE`를 유지), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장), 소스가 정의를 돌려주지 않은 뷰, 소스 사용자가 나열할 수 없는 객체(`SOURCE_VISIBILITY`), 어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스(`PG_STANDALONE_SEQUENCE`). |
+| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼이나 Aurora DSQL이 인덱싱할 수 없는 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 보조 인덱스(생성되지 않으며 UNIQUE 인덱스는 유일성 보장을 잃음), PostgreSQL의 btree가 아닌 인덱스(btree로 생성)와 조건식이 타입이 바뀌는 컬럼을 읽는 부분 인덱스(다른 부분 인덱스는 `WHERE`를 유지), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장), 소스가 정의를 돌려주지 않은 뷰, 소스 사용자가 나열할 수 없는 객체(`SOURCE_VISIBILITY`), 어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스(`PG_STANDALONE_SEQUENCE`). |
 | **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `bytea` 컬럼(`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`)이나 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 기본 키, 63바이트로 잘리면 충돌하는 이름(한 테이블의 두 컬럼, 또는 한 스키마의 두 테이블/뷰), `DECIMAL` 정밀도 > 1000, 테이블당 컬럼 > 255, 타깃 데이터베이스의 테이블 1,000개·스키마 10개·뷰 5,000개 초과(클러스터에 이미 있는 것 포함), FULLTEXT/SPATIAL 인덱스, PostgreSQL 테이블의 행 수준 보안(`PG_ROW_LEVEL_SECURITY`). |
 
 위 예시는 대부분 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
@@ -184,16 +184,17 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
   **Anthropic/OpenAI(또는 그 외) API 키 입력란이 없습니다.** AI는 *오직* Bedrock을 통해서만, AWS
   자격증명으로 인증해 동작합니다. 덕분에 AI도 나머지 기능과 동일한 IAM/자격증명 모델을 그대로
   따르며, 별도로 저장할 시크릿이 없습니다.
-- AI 어시스트는 **`bedrock:InvokeModel`** 권한 하나로만 Bedrock을 호출합니다 — 그 외엔 없습니다.
+- AI 어시스트는 **`bedrock:InvokeModel`** 과 **`bedrock:InvokeModelWithResponseStream`**(채팅이 답을 스트리밍)으로만
+  Bedrock을 호출합니다 — 그 외엔 없습니다.
   **도구의 나머지와 동일한 자격증명**(Connect에서 선택한 AWS 프로필, 또는 환경/역할 자격증명 체인)을
   사용합니다.
-- **로컬 실행:** 자격증명 체인이 선택 모델에 대해 `bedrock:InvokeModel`을 허용해야 하고, 그 모델이
+- **로컬 실행:** 자격증명 체인이 선택 모델에 대해 두 동작을 모두 허용해야 하고, 그 모델이
   **AWS 계정에서 활성화**되어 있어야 합니다(아래 *모델 액세스* 참조).
 - **Fargate 배포:** AI 어시스트는 **`EnableAiAssist=true`로 배포하지 않으면 꺼져 있습니다.** 이 값을
-  켜면 태스크 역할에 **범위가 제한된** `bedrock:InvokeModel`이 부여됩니다(최소 권한 — 범위에 든 모델만
-  호출 가능). 기본적으로 `BedrockModelArns`는 비어 있고 그 범위는 **`BedrockModelId`에서 자동으로
-  도출**되므로 아무것도 나열할 필요가 없습니다 — `BedrockModelArns`는 **선택 사항**이며 자동 도출된
-  범위를 재정의할 때만 사용합니다. `BedrockRegion`도 설정해야 하고, 태스크의 아웃바운드
+  켜면 태스크 역할에 두 동작이 **`anthropic.` 공급자로 범위를 제한해** 부여됩니다: 계정의 모든 Anthropic 파운데이션
+  모델과 리전 간 추론 프로필이므로, 재배포 없이 Model ID를 Anthropic 모델 사이에서 바꿀 수 있습니다(`*` 전체나 다른
+  공급자는 절대 아님). `BedrockModelArns`는 **선택 사항**이며 그 범위를 특정 ARN으로 좁히거나 Anthropic이 아닌
+  모델을 허용할 때 사용합니다. `BedrockRegion`도 설정해야 하고, 태스크의 아웃바운드
   트래픽(egress)이 Bedrock 런타임 엔드포인트에 도달할 수 있어야 합니다(NAT 또는 Bedrock VPC 엔드포인트).
   [`deploy/DEPLOYMENT.md`: "Enable AI-assisted conversion (optional)"](../../../deploy/DEPLOYMENT.md) 참조.
 - **모델:** 기본은 `global.anthropic.claude-sonnet-5`(범용·비용 효율 선택). `BedrockModelId`(배포) 또는
@@ -248,7 +249,7 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 1. **모든 UNSUPPORTED 항목 해결.** 이 항목들은 깨끗한 마이그레이션을 가로막습니다. PK가 없으면 추가,
    트리거/루틴/이벤트는 애플리케이션(또는 EventBridge/Lambda)으로 이전, 공간 타입은 대체, `DECIMAL`
    정밀도는 ≤ 1000으로 축소.
-2. **모든 MANUAL 항목 결정.** 파티셔닝 제거, 기본 collation 수용, 대소문자 무시 collation 처리,
+2. **모든 MANUAL 항목 결정.** 기본 collation 수용, 대소문자 무시 collation 처리,
    `ENUM`/`SET` 처리 등. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전 점검(또는
    **Check sizes**, [§13.5](13-excluding-tables-and-columns.md#135-초대형-lob-후보와-check-sizes))을
    실행하세요. 값이 이미 한도를 넘는 경우에만 그 내용을 외부 스토리지(예: Amazon S3)로 옮기거나 컬럼을
@@ -513,7 +514,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 PostgreSQL이 저장한 텍스트 **그대로** 가져옵니다(다시 렌더링하지 않음) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고 uuid-ossp의 `uuid_generate_v4()`는 `gen_random_uuid()`가 되며, DSQL에 없는 다른 타입으로 캐스팅하거나 DSQL에 없는 함수를 호출하는 기본값은 노트와 함께 제외됩니다. |
 | **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
 | **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
-| **네이티브 파티셔닝 없음** | DSQL이 자동 분산; 파티션 테이블은 MANUAL. |
+| **네이티브 파티셔닝 없음** | DSQL이 자동 분산; Schema Conversion이 파티셔닝을 제거하며, 파티션 테이블에는 갭이 아니라 권장사항(파티션에 의존하던 것, CDC 중 파티션 관리 중지)이 붙음. |
 | **클러스터당 하나의 DB** | 다중 DB MySQL 소스의 각 데이터베이스는 자동으로 자체 스키마가 됩니다(`RECOMMENDED`로 표시). 몇 개까지 되는지는 다음 행을 참고하세요. |
 | **데이터베이스당 스키마 ≤ 10, 테이블 ≤ 1,000, 뷰 ≤ 5,000** | Evaluation은 마이그레이션 후 타깃 데이터베이스가 담게 될 개수(소스 객체 + 클러스터에 이미 있는 것; 기본 제공 `public` 스키마는 세지 않고, 빈 스키마는 세며, 이름은 63바이트로 잘린 저장 형태로 비교함)를 세어 초과하면 **UNSUPPORTED**(`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`)로 표시하고, 준비도 점수는 **Blocked**가 됩니다. 그렇지 않으면 적용이 처음 객체들을 만든 뒤 `54000`으로 실패합니다. 한도에 도달하면 Aurora DSQL은 이미 있는 스키마에 대한 `IF NOT EXISTS`까지 모든 `CREATE SCHEMA`를 거부하므로(라이브 확인), 적용은 카탈로그를 확인해 이미 있는 스키마는 생성된 것으로 처리합니다. |
 | **소스 `CHECK` 제약은 드롭됨** | 소스 `CHECK` 제약(MySQL `CHECK`는 8.0.16+ 필요)은 타깃으로 넘어가지 않고 — 함수/연산자가 DSQL과 다를 수 있음 — **MANUAL**로 표시됩니다: DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제하세요. (도구가 `ENUM`용으로 *생성*하는 `CHECK … IN (...)`은 영향 없음.) |

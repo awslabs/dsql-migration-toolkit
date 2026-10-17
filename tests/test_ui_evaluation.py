@@ -2819,3 +2819,30 @@ def test_an_export_never_lists_a_report_marker() -> None:
     data = json.loads(assessment_download(marked, "json", exported_at=_EXPORTED_AT).content)
     assert all(item["rule_id"] != "PG_CATALOG_CHECKED" for item in data["items"])
     assert "PG_CATALOG_CHECKED" not in assessment_download(marked, "text").content
+
+
+def test_a_report_of_another_source_says_so_and_an_empty_one_names_its_database() -> None:
+    """Changing the source after Evaluation was never flagged (only the target was), and
+    the empty-inventory notice read a field the inventory does not have ('the connected
+    database') and pointed at a score card that is not rendered for an empty report."""
+    from dsql_migrator.core.models import AssessmentReport, SourceInventory
+    from dsql_migrator.ui.evaluation import empty_inventory_message, source_address
+
+    result = EvaluationResult(
+        inventory=SourceInventory(tables=[]),
+        assessment=AssessmentReport(items=[]),
+        target_inventory=_empty_target(),
+        target_conflicts=[],
+        source_label="MySQL 8.0.39 at db.example:3306/shop",
+    )
+    assert source_address(result.source_label) == "db.example:3306/shop"
+    body = empty_inventory_message(result)
+    assert "No tables were found in shop" in body and "score above" not in body
+    from dsql_migrator.ui.evaluation import _render_result
+
+    ui = _ItemUi()
+    _render_result(ui, result, eval_state=EvaluationState(), live_source="db.example:3306/other")
+    assert "This report describes another source" in ui.texts
+    same = _ItemUi()
+    _render_result(same, result, eval_state=EvaluationState(), live_source="db.example:3306/shop")
+    assert "This report describes another source" not in same.texts

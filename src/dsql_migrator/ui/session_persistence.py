@@ -633,7 +633,9 @@ def apply_session_snapshot(
             source_label=describe_source(
                 SimpleNamespace(
                     host=snapshot.source_host,
-                    port=snapshot.source_port,
+                    # As the restored connection takes it (an older snapshot has none).
+                    port=snapshot.source_port
+                    or (5432 if restored_source_type is SourceType.POSTGRES else 3306),
                     database=snapshot.source_database,
                 )
             ),

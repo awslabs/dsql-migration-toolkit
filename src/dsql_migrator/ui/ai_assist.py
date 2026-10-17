@@ -211,7 +211,8 @@ def ai_unavailable_hint(state: object) -> str:
         return (
             getattr(state, "ai_unavailable_detail", None)
             or "AI Assist is unavailable: Amazon Bedrock denied the last request. "
-            "Re-authenticate (or grant bedrock:InvokeModel) and re-verify AI access "
+            "Re-authenticate (or grant bedrock:InvokeModel and "
+            "bedrock:InvokeModelWithResponseStream) and re-verify AI access "
             "on the Connect screen."
         )
     return "Enable AI Assist on the Connect screen to use AI DBA."

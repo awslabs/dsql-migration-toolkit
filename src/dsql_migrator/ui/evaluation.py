@@ -1111,8 +1111,16 @@ def describe_source(
     if not host:
         return None
     database = (getattr(config, "database", None) or "").strip()
-    address = f"{host}:{getattr(config, 'port', '')}" + (f"/{database}" if database else "")
+    port = getattr(config, "port", None)
+    address = host + (f":{port}" if port else "") + (f"/{database}" if database else "")
     return f"{engine} at {address}" if engine else address
+
+
+def source_address(label: Optional[str]) -> Optional[str]:
+    """The ``host:port[/database]`` of a :func:`describe_source` label (``None`` without)."""
+    if not label:
+        return None
+    return label.rsplit(" at ", 1)[-1].strip() or None
 
 
 def _utc_stamp() -> str:
@@ -2015,6 +2023,7 @@ def build_evaluation_screen(
                         "cluster_endpoint",
                         None,
                     ),
+                    live_source=describe_source(getattr(session, "source_config", None)),
                 )
 
     return content, runner
@@ -2107,6 +2116,7 @@ def _render_result(
     ] = None,
     open_ai_scope: Optional[Callable[..., object]] = None,
     live_target_endpoint: Optional[str] = None,
+    live_source: Optional[str] = None,
 ) -> None:
     """Render the result as distinct, readable sections (one card per group).
 
@@ -2150,6 +2160,20 @@ def _render_result(
                 f"{result.target_endpoint}; the connected target is now "
                 f"{live_target_endpoint}. Re-run Evaluation, or refresh the target catalog "
                 "in Schema Conversion, to count them for the current cluster."
+            ),
+        )
+    # The SOURCE can change too (the Connect step accepts another host or database at any
+    # time), and then every finding describes a database the migration will not read.
+    assessed = source_address(result.source_label)
+    if assessed and live_source and assessed != live_source:
+        render_notice(
+            ui,
+            tone="warning",
+            header="This report describes another source",
+            body=(
+                f"Evaluation read {assessed}; the connected source is now {live_source}. "
+                "Re-run Evaluation before converting, so the report, the conversion and the "
+                "migration describe the same database."
             ),
         )
     # Directly under the score, because it is the score that needs qualifying: an
@@ -2258,11 +2282,14 @@ def empty_inventory_message(result: EvaluationResult) -> "Optional[str]":
     if inventory.tables:
         return None
     others = [name for name in (inventory.sibling_databases or []) if name]
-    database = getattr(inventory, "database", None) or "the connected database"
+    match = _SOURCE_ADDRESS_RE.search(result.source_label or "")
+    database = (match.group(2) if match and match.group(2) else None) or "the connected database"
+    scored = compute_migration_score(result.assessment) is not None
     body = (
-        f"No tables were found in {database}, so there is nothing to migrate and the "
-        "score above is a report on an empty schema. The usual cause is the wrong "
-        "Database on the Connect step -- it is the DATABASE name, not the schema name."
+        f"No tables were found in {database}, so there is nothing to migrate"
+        + (" and the score above is a report on an empty schema." if scored else ".")
+        + " The usual cause is the wrong Database on the Connect step -- it is the "
+        "DATABASE name, not the schema name."
     )
     if others:
         listed = ", ".join(others[:8])

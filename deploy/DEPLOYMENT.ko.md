@@ -449,7 +449,8 @@ aws cloudformation deploy \
 > [!TIP]
 > **AI 어시스트(권장).** `EnableAiAssist=true` + `BedrockRegion`으로 Schema
 > Conversion과 Query Converter의 AI DBA를 켭니다 — 옵트인·자문 전용 기능이며,
-> 선택한 모델에 대한 `bedrock:InvokeModel`로만 범위가 제한됩니다. 모델(`BedrockModelId`,
+> Anthropic 모델(`anthropic.` 파운데이션 모델·추론 프로필)에 대한 `bedrock:InvokeModel`과
+> `bedrock:InvokeModelWithResponseStream`이 부여됩니다. 모델(`BedrockModelId`,
 > 기본 `global.anthropic.claude-sonnet-5`)도 **AWS 계정에서 한 번 활성화**되어 있어야
 > 합니다 — AWS Marketplace 권한이 있는 사람이 모델 약관(agreement)을 수락해야 하는데,
 > 태스크 역할에는 그 권한이 의도적으로 없기 때문입니다(§8). 또한 태스크가 Bedrock
@@ -537,7 +538,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `AppDomainName` | no | `""` | ALB 앞단 DNS 이름(인증서와 일치해야 함). **비워 두면** ALB 자체 DNS 이름을 Cognito 콜백 호스트로 사용 — 커스텀 도메인이나 Route 53 레코드가 필요 없습니다. |
 | `CognitoDomainPrefix` | Cognito 시 | `""` | 전역 유니크 Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
 | `CognitoAdminEmail` | Cognito 시 | `""` | 스택이 생성하는 **첫 로그인 사용자**의 이메일. Cognito가 임시 비밀번호를 이 주소로 발송하고, hosted UI가 첫 로그인 시 새 비밀번호를 요구합니다. **Cognito를 켜면 필수** — 유저풀이 self sign-up을 막아 두므로, 이 값이 없으면 배포는 성공하지만 아무도 로그인할 수 없는 앱이 됩니다(템플릿이 그 조합을 거부). 사용자 추가는 [§운영자 사용자 만들기](#운영자-사용자-만들기-cognito--cognito를-켰을-때만) 참고. |
-| `EnableAiAssist` | no | `false` | opt-in; 범위 제한된 `bedrock:InvokeModel` 부여. |
+| `EnableAiAssist` | no | `false` | opt-in; Anthropic 모델에 대한 `bedrock:InvokeModel` / `InvokeModelWithResponseStream` 부여. |
 | `BedrockModelArns` | no | `""` | **선택적 override**; 비우면 `BedrockModelId`에서 자동 도출. |
 | `BedrockRegion` | no | `""` | 앱의 `BEDROCK_REGION`. |
 | `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic 모델(드롭다운); IAM 스코프 자동 도출. |
@@ -701,7 +702,8 @@ aws cloudformation deploy \
 
 ### AI 보조 변환 활성화 (Optional)
 
-AI 보조는 opt-in이며 **범위 제한된** `bedrock:InvokeModel`을 부여합니다:
+AI 보조는 opt-in이며 `bedrock:InvokeModel`과 `bedrock:InvokeModelWithResponseStream`을 **`anthropic.` 공급자로
+범위를 제한해** 부여합니다:
 
 ```bash
 aws cloudformation deploy ... \
@@ -726,9 +728,10 @@ aws cloudformation deploy ... \
 | Claude Sonnet 4.6 | `global.anthropic.claude-sonnet-4-6` | 이전 세대 Sonnet. |
 
 `BedrockModelId`는 위 `global.` cross-region inference profile들의 **드롭다운**이고(모든
-상용 리전에서 해석되므로 하나의 목록으로 어떤 배포든 커버), 태스크 역할의 `bedrock:InvokeModel`
-스코프는 여기서 **자동 도출**됩니다 — 따라서 `BedrockModelArns`는
-**설정할 필요가 없습니다**(다른 모델/ARN으로 바꿀 때만 override로 사용).
+상용 리전에서 해석되므로 하나의 목록으로 어떤 배포든 커버), 태스크 역할은
+Anthropic 모델(파운데이션 모델이나 추론 프로필, 모든 리전)을 **모두** 호출할 수 있습니다 — 따라서 재배포 없이 모델을
+바꿀 수 있고 `BedrockModelArns`는 **설정할 필요가 없습니다**(특정 ARN으로 좁히거나 Anthropic이 아닌 모델을 허용할
+때만 사용).
 
 **모델 액세스는 스택이 대신 해 주지 않는, 계정당 한 번의 단계입니다.** Anthropic 모델은 AWS
 Marketplace를 통해 제공되는데, 태스크 역할은 모델을 호출만 할 수 있습니다. 의도적으로
@@ -822,8 +825,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - **최소 권한**: task role은 `dsql:DbConnect` + `dsql:DbConnectAdmin`(클러스터 범위; 앱은 기본적으로
   DSQL `admin` 역할로 연결), 읽기 전용 `dsql:GetCluster` + `dsql:ListTagsForResource`(클러스터
   범위; 개요 다이어그램에 클러스터의 `Name` 태그를 표시하는 데만 사용), `secretsmanager:GetSecretValue`
-  (소스 시크릿 범위)만 부여; `bedrock:InvokeModel`은 AI 보조를 켤 때만 추가되며 허용 모델 ARN(들)로
-  범위 제한됨. 별도의 execution role이 ECR pull + 로그를 처리하고 컨테이너 시작 시 주입할 자동 생성
+  (소스 시크릿 범위)만 부여; `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`은 AI 보조를 켤 때만
+  추가되며 Anthropic 모델로(설정했다면 `BedrockModelArns`로) 범위 제한됨. 별도의 execution role이 ECR pull + 로그를 처리하고 컨테이너 시작 시 주입할 자동 생성
   세션 쿠키 시크릿만 읽음(범위 제한된 `secretsmanager:GetSecretValue`).
 - **자동 생성 세션 쿠키 시크릿**: 스택이 브라우저 세션 쿠키(`DSQL_MIGRATOR_STORAGE_SECRET`)를 서명하는
   `AWS::SecretsManager::Secret`(운영자 입력 없음)을 생성해, 재시작 간에도 브라우저 세션 id가 안정적으로

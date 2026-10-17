@@ -65,7 +65,7 @@ there were none.
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below); a multi-database MySQL source (each database becomes its own schema, flagged `RECOMMENDED`); an index name another table, view or index of the schema also uses (the index is renamed automatically, flagged `RECOMMENDED`). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, partitioned tables, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns, or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, which Aurora DSQL cannot index (they are not emitted; a UNIQUE one stops enforcing uniqueness), PostgreSQL non-btree indexes (built as btree) and partial indexes whose predicate reads a re-typed column (other partial indexes keep their `WHERE`), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns, or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, which Aurora DSQL cannot index (they are not emitted; a UNIQUE one stops enforcing uniqueness), PostgreSQL non-btree indexes (built as btree) and partial indexes whose predicate reads a re-typed column (other partial indexes keep their `WHERE`), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`) or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), FULLTEXT/SPATIAL indexes, row-level security on a PostgreSQL table (`PG_ROW_LEVEL_SECURITY`). |
 
 The examples above are mostly drawn from a MySQL source. For a **PostgreSQL source** the same
@@ -234,18 +234,18 @@ never touches.
   tool has **no field for an Anthropic/OpenAI (or any other) API key**; AI works
   *only* through Bedrock, authenticated with your AWS credentials. This keeps AI on
   the same IAM/credential model as everything else (no extra secret to store).
-- AI assist calls Bedrock with the **`bedrock:InvokeModel`** permission only —
-  nothing else. It uses the **same credentials as the rest of the tool** (the AWS
+- AI assist calls Bedrock with **`bedrock:InvokeModel`** and
+  **`bedrock:InvokeModelWithResponseStream`** (the chat streams its answer) — nothing else. It uses the **same credentials as the rest of the tool** (the AWS
   profile you selected on Connect, or the environment/role credential chain).
-- **Running locally:** your credential chain must allow `bedrock:InvokeModel` for
+- **Running locally:** your credential chain must allow both actions for
   the chosen model, and the model must be **enabled for your AWS account** (see
   *Model access* below).
 - **Deployed on Fargate:** AI assist is **off unless you deploy with
-  `EnableAiAssist=true`**, which grants the task role a **scoped**
-  `bedrock:InvokeModel` (least privilege — it can invoke only the model(s) in scope).
-  By default `BedrockModelArns` is empty and that scope is **auto-derived from
-  `BedrockModelId`**, so you don't have to list anything; `BedrockModelArns` is
-  **optional** and only overrides the auto-derived scope. You also set `BedrockRegion`
+  `EnableAiAssist=true`**, which grants the task role both actions, **scoped to the
+  `anthropic.` provider**: any Anthropic foundation model or cross-region inference
+  profile in the account, so you can switch the Model ID among Anthropic models without
+  redeploying (never a blanket `*`, never another provider). `BedrockModelArns` is
+  **optional** and narrows that scope to specific ARN(s) (or allows a non-Anthropic model). You also set `BedrockRegion`
   and the task's egress must be able to reach the Bedrock runtime endpoint (NAT or
   a Bedrock VPC endpoint). See [`deploy/DEPLOYMENT.md`: "Enable AI-assisted conversion (optional)"](../../../deploy/DEPLOYMENT.md).
 - **Model:** the default is `global.anthropic.claude-sonnet-5` (a general,
@@ -308,7 +308,7 @@ Work the list top-down by severity:
 1. **Resolve every UNSUPPORTED item.** These block a clean migration. Add a PK
    where missing; move triggers/routines/events into the application (or
    EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 1000.
-2. **Decide every MANUAL item.** Drop partitioning, accept the default collation,
+2. **Decide every MANUAL item.** Accept the default collation,
    handle `ENUM`/`SET`, decide `ON UPDATE` timestamps, replace a cascade action CDC
    can't replicate, etc. For an oversized LOB or JSON column (`OVERSIZED_LOB`), run the
    Data Migration prerequisite checks (or **Check sizes**,
@@ -639,7 +639,7 @@ conversion (redesign).
 | **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across verbatim (the exact text PostgreSQL stores, never re-rendered) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. A converted enum column keeps its default as a plain text literal, and uuid-ossp's `uuid_generate_v4()` becomes `gen_random_uuid()`; a default that casts to another type DSQL lacks, or calls a function it lacks, is dropped with a note. |
 | **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
 | **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
-| **No native partitioning** | DSQL auto-distributes; partitioned tables are flagged MANUAL. |
+| **No native partitioning** | DSQL auto-distributes; Schema Conversion drops the partitioning, and a partitioned table gets a recommendation (what depended on its partitions, and pausing partition maintenance under CDC), not a gap. |
 | **One database per cluster** | Each source database of a multi-database MySQL source becomes its own schema automatically (flagged `RECOMMENDED`); see the next row for how many fit. |
 | **≤ 10 schemas, ≤ 1,000 tables, ≤ 5,000 views per database** | Evaluation counts what the target database will hold after the migration (the source's objects plus those already on the cluster; the built-in `public` schema is not counted, an empty schema is, and names are compared as stored, cut to 63 bytes) and flags any excess **UNSUPPORTED** (`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`), which makes the readiness score read **Blocked**. Otherwise the apply would create the first objects and then fail with `54000`. At the limit Aurora DSQL rejects every `CREATE SCHEMA`, even `IF NOT EXISTS` for a schema that already exists (live-verified), so the apply checks the catalog and treats ensuring an existing schema as done. |
 | **Source `CHECK` constraints are dropped** | A source `CHECK` constraint (a MySQL `CHECK` requires 8.0.16+) is **not** carried to the target — its functions/operators may differ on DSQL — and is flagged **MANUAL**: re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool *generates* for an `ENUM` is unaffected.) |

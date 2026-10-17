@@ -43,7 +43,7 @@ PostgreSQL ソースでは、Evaluation はインベントリにない 2 つの�
 | 分類 | 意味 | 例 |
 |---|---|---|
 | **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。**外部キー**(自動変換され、`RECOMMENDED` としてフラグ付け — 下記参照)。複数データベースの MySQL ソース(各データベースが独自のスキーマになり、`RECOMMENDED` としてフラグ付け)。同じスキーマの別のテーブル・ビュー・インデックスも使うインデックス名(インデックスは自動的に名前が変更され、`RECOMMENDED` としてフラグ付け)。 |
-| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、パーティションテーブル、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム、または Aurora DSQL がインデックスを作れない PostgreSQL の `json`/`jsonb`/`interval`/`time with time zone` カラム上のセカンダリインデックス(出力されず、UNIQUE インデックスは一意性を失います)、PostgreSQL の btree 以外のインデックス(btree として作成)と、述語が型の変わるカラムを読む部分インデックス(それ以外の部分インデックスは `WHERE` を保持)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)、ソースが定義を返さなかったビュー、ソースユーザーが一覧できないオブジェクト(`SOURCE_VISIBILITY`)、どの列にも所有されていない PostgreSQL のシーケンス(`PG_STANDALONE_SEQUENCE`)。 |
+| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム、または Aurora DSQL がインデックスを作れない PostgreSQL の `json`/`jsonb`/`interval`/`time with time zone` カラム上のセカンダリインデックス(出力されず、UNIQUE インデックスは一意性を失います)、PostgreSQL の btree 以外のインデックス(btree として作成)と、述語が型の変わるカラムを読む部分インデックス(それ以外の部分インデックスは `WHERE` を保持)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)、ソースが定義を返さなかったビュー、ソースユーザーが一覧できないオブジェクト(`SOURCE_VISIBILITY`)、どの列にも所有されていない PostgreSQL のシーケンス(`PG_STANDALONE_SEQUENCE`)。 |
 | **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`bytea` カラム(`BINARY`/`VARBINARY`/`BLOB`、PostgreSQL の `bytea`)または PostgreSQL の `json`/`jsonb`/`interval`/`time with time zone` カラムの主キー、63 バイトに切り詰めると衝突する名前(1 つのテーブルの 2 つのカラム、または 1 つのスキーマの 2 つのテーブル/ビュー)、`DECIMAL` 精度 > 1000、テーブルあたりカラム > 255、ターゲットデータベースのテーブル 1,000 個・スキーマ 10 個・ビュー 5,000 個超(クラスターに既にあるものを含む)、FULLTEXT/SPATIAL インデックス、PostgreSQL テーブルの行レベルセキュリティ(`PG_ROW_LEVEL_SECURITY`)。 |
 
 上記の例は主に MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
@@ -197,17 +197,18 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
   **Anthropic/OpenAI(またはその他)の API キー入力欄がありません。** AI は *Bedrock 経由でのみ*、
   AWS 認証情報で認証して動作します。これにより、AI も他のすべての機能と同じ IAM/認証情報モデルに
   そのまま従うため、別途保存するシークレットがありません。
-- AI アシストは **`bedrock:InvokeModel`** 権限 1 つだけで Bedrock を呼び出します — それ以外はありません。
+- AI アシストは **`bedrock:InvokeModel`** と **`bedrock:InvokeModelWithResponseStream`** (チャットが回答をストリーミング)
+  だけで Bedrock を呼び出します — それ以外はありません。
   **ツールの他の部分と同じ認証情報**(Connect で選択した AWS プロファイル、または環境/ロールの認証情報
   チェーン)を使用します。
-- **ローカルで実行する場合:** 認証情報チェーンが選択したモデルに対して `bedrock:InvokeModel` を許可して
+- **ローカルで実行する場合:** 認証情報チェーンが選択したモデルに対して両方のアクションを許可して
   いる必要があり、そのモデルが **AWS アカウントで有効化** されている必要があります(下記の *モデルアクセス*
   を参照)。
 - **Fargate にデプロイする場合:** AI アシストは **`EnableAiAssist=true` でデプロイしない限り無効です。**
-  この値を有効にすると、タスクロールに **スコープを限定した** `bedrock:InvokeModel` が付与されます
-  (最小権限 — スコープ内のモデルのみ呼び出し可能)。デフォルトでは `BedrockModelArns` は空で、その
-  スコープは **`BedrockModelId` から自動的に導出** されるため、何も列挙する必要はありません。
-  `BedrockModelArns` は **任意** で、自動導出されたスコープを上書きする場合にのみ使用します。あわせて
+  この値を有効にすると、タスクロールに両方のアクションが **`anthropic.` プロバイダーにスコープを限定して** 付与されます:
+  アカウントのすべての Anthropic 基盤モデルとクロスリージョン推論プロファイルなので、再デプロイせずに Model ID を
+  Anthropic モデル間で切り替えられます (`*` 全体や他のプロバイダーには決してなりません)。`BedrockModelArns` は
+  **任意** で、そのスコープを特定の ARN に絞るか、Anthropic 以外のモデルを許可する場合に使用します。あわせて
   `BedrockRegion` も設定し、タスクの送信(egress)トラフィックが Bedrock ランタイムエンドポイントに
   到達できる必要があります(NAT または Bedrock VPC エンドポイント)。
   [`deploy/DEPLOYMENT.md`: 「AI 支援変換の有効化 (オプション)」](../../../deploy/DEPLOYMENT.ja.md) を参照してください。
@@ -265,7 +266,7 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 1. **すべての UNSUPPORTED 項目を解決します。** これらはクリーンなマイグレーションを妨げます。PK が
    ない場合は追加し、トリガー/ルーチン/イベントはアプリケーション(または EventBridge/Lambda)へ移し、
    空間型は置き換え、`DECIMAL` 精度は ≤ 1000 に縮小します。
-2. **すべての MANUAL 項目を判断します。** パーティショニングの削除、デフォルト collation の受け入れ、
+2. **すべての MANUAL 項目を判断します。** デフォルト collation の受け入れ、
    `ENUM`/`SET` の扱い、`ON UPDATE` タイムスタンプの判断、CDC が複製できないカスケードアクションの置き換え
    などを決めます。過大な LOB/JSON カラム(`OVERSIZED_LOB`)は、まず Data Migration の前提条件チェック
    (または **Check sizes**、[§13.5](13-excluding-tables-and-columns.md#135-特大-lob-の候補と-check-sizes))
@@ -529,7 +530,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** ソースの `DEFAULT` を PostgreSQL が保存しているテキストの **まま** 引き継ぎます(再レンダリングしません) — 除去されるのは `serial`/`IDENTITY` `nextval` と生成カラムの式だけで、identity はターゲット側で選択した PK 戦略が決定します。変換された enum 列はデフォルトをプレーンなテキストリテラルとして保持し、uuid-ossp の `uuid_generate_v4()` は `gen_random_uuid()` になります。DSQL にない別の型へキャストする、または DSQL にない関数を呼ぶデフォルトは注記付きで除外されます。 |
 | **`ON UPDATE CURRENT_TIMESTAMP` なし** | 再現不可: DSQL には `ON UPDATE` 句も、(PostgreSQL で通常用いる回避策の)トリガーもありません。列は挿入時のデフォルトを保持し **MANUAL** としてフラグ付けされます — 更新時のタイムスタンプはアプリケーションで明示的に設定してください。 |
 | **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
-| **ネイティブパーティショニングなし** | DSQL が自動分散します。パーティション化されたテーブルは MANUAL としてフラグ付けされます。 |
+| **ネイティブパーティショニングなし** | DSQL が自動分散します。Schema Conversion はパーティショニングを削除し、パーティション化されたテーブルにはギャップではなく推奨事項 (パーティションに依存していたもの、CDC 中のパーティション保守の停止) が付きます。 |
 | **クラスターあたり 1 つのデータベース** | 複数データベースの MySQL ソースの各データベースは、自動的に独自のスキーマになります(`RECOMMENDED` としてフラグ付け)。いくつまで収まるかは次の行を参照してください。 |
 | **データベースあたりスキーマ ≤ 10、テーブル ≤ 1,000、ビュー ≤ 5,000** | Evaluation はマイグレーション後にターゲットデータベースが保持する数(ソースのオブジェクト + クラスターに既にあるもの。組み込みの `public` スキーマは数えず、空のスキーマは数え、名前は 63 バイトに切り詰めた格納形で比較します)を数え、超過分を **UNSUPPORTED**(`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`)としてフラグ付けし、準備度スコアは **Blocked** になります。そうしないと、適用は最初のオブジェクトを作成した後に `54000` で失敗します。制限に達すると Aurora DSQL は既存スキーマに対する `IF NOT EXISTS` も含めてすべての `CREATE SCHEMA` を拒否するため(ライブで確認)、適用はカタログを確認し、既存スキーマは作成済みとして扱います。 |
 | **ソースの `CHECK` 制約は破棄** | ソースの `CHECK` 制約(MySQL の `CHECK` は 8.0.16+ が必要)はターゲットに引き継がれず — 関数/演算子が DSQL と異なる場合がある — **MANUAL** としてフラグ付けされます: DSQL 互換の `CHECK` を手動で再追加するか、アプリで強制してください。(ツールが `ENUM` 用に *生成* する `CHECK … IN (...)` は影響を受けません。) |

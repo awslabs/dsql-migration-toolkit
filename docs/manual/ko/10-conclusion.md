@@ -42,7 +42,7 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 
 1. **Connect** — 소스(읽기 전용)와 타깃(DSQL, IAM 토큰)에 연결.
 2. **Evaluation** — 호환성 리포트를 읽습니다. 모든 **UNSUPPORTED** 항목(PK 없음, 트리거, 루틴,
-   FULLTEXT/SPATIAL 인덱스, DSQL에 대응이 없는 PostgreSQL 타입)을 해결하고 각 **MANUAL** 항목(파티셔닝, 공간 타입, 대소문자 무시 collation, `ENUM`/`SET`, 크기부터
+   FULLTEXT/SPATIAL 인덱스, DSQL에 대응이 없는 PostgreSQL 타입)을 해결하고 각 **MANUAL** 항목(공간 타입, 대소문자 무시 collation, `ENUM`/`SET`, 크기부터
    점검할 초대형 LOB·JSON 컬럼 등)을 결정하세요. *건너뛰지 마세요* — "적재가 영문도 모른 채 실패했다"를 "그 객체는 변경이 필요하다는 걸
    알고 있었다"로 바꿔 주는 단계입니다. 또한 캐스케이딩 외래 키가 CDC에 어떤 영향을 주는지도 여기서 알게
    됩니다: 캐스케이딩 외래 키는 바이너리 로그에 남지 않아 CDC가 복제하지 못하므로, 소스가 캐스케이드한

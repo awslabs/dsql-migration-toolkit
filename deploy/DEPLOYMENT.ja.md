@@ -476,7 +476,8 @@ aws cloudformation deploy \
 > [!TIP]
 > **AI アシスト（推奨）。** `EnableAiAssist=true` + `BedrockRegion` で Schema
 > Conversion と Query Converter の AI DBA を有効にします — オプトインかつ助言専用の
-> 機能で、選択したモデルに対する `bedrock:InvokeModel` のみにスコープされます。
+> 機能で、Anthropic モデル(`anthropic.` 基盤モデル・推論プロファイル)に対する `bedrock:InvokeModel` と
+> `bedrock:InvokeModelWithResponseStream` が付与されます。
 > モデル（`BedrockModelId`、デフォルト `global.anthropic.claude-sonnet-5`）も **AWS
 > アカウントで 1 回有効化** されている必要があります — AWS Marketplace の権限を持つ人が
 > モデルの契約（agreement）を承諾する必要があり、タスクロールにはその権限が意図的に
@@ -570,7 +571,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `AppDomainName` | no | `""` | ALB をフロントする DNS 名（証明書と一致する必要があります）。**空のままにすると** ALB 自身の DNS 名を Cognito のコールバックホストとして使用します — カスタムドメインや Route 53 レコードは不要です。 |
 | `CognitoDomainPrefix` | Cognito 時 | `""` | グローバルに一意な Cognito hosted-UI プレフィックス（`https://<prefix>.auth.<region>.amazoncognito.com`）。 |
 | `CognitoAdminEmail` | Cognito 時 | `""` | スタックが作成する**最初のログインユーザー**のメールアドレス。Cognito がこのアドレスに一時パスワードを送信し、hosted UI が初回サインイン時に新しいパスワードを求めます。**Cognito を有効にする場合は必須** — ユーザープールはセルフサインアップを無効にしているため、この値がないとデプロイは成功しても誰もログインできないアプリになります（テンプレートがその組み合わせを拒否します）。ユーザーの追加は [§運用者ユーザーの作成](#運用者ユーザーの作成-cognito--cognito-を有効にした場合のみ) を参照。 |
-| `EnableAiAssist` | no | `false` | opt-in。スコープが絞られた `bedrock:InvokeModel` を付与。 |
+| `EnableAiAssist` | no | `false` | opt-in。Anthropic モデルに対する `bedrock:InvokeModel` / `InvokeModelWithResponseStream` を付与。 |
 | `BedrockModelArns` | no | `""` | invoke スコープの**オプションのオーバーライド**。空欄 = `BedrockModelId` から自動導出。 |
 | `BedrockRegion` | no | `""` | アプリの `BEDROCK_REGION`。 |
 | `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic モデル（ドロップダウン）。IAM スコープはこれから自動導出。 |
@@ -748,7 +749,8 @@ aws cloudformation deploy \
 
 ### AI 支援変換の有効化 (オプション)
 
-AI アシストは opt-in であり、**スコープが絞られた** `bedrock:InvokeModel` を付与します:
+AI アシストは opt-in であり、`bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream` を **`anthropic.`
+プロバイダーにスコープを限定して** 付与します:
 
 ```bash
 aws cloudformation deploy ... \
@@ -775,9 +777,9 @@ aws cloudformation deploy ... \
 
 `BedrockModelId` はこれらの `global.` クロスリージョン推論プロファイルの**ドロップダウン**
 であり（すべての商用リージョンから解決できるため、1 つのリストでどのデプロイにも対応します）、
-タスクロールの `bedrock:InvokeModel` スコープはそこから**自動的に導出**されます
-— したがって `BedrockModelArns` は**設定する必要はありません**（別のモデル/ARN で
-オーバーライドする場合にのみ使用）。
+タスクロールは Anthropic モデル(基盤モデルまたは推論プロファイル、全リージョン)を**すべて**呼び出せます
+— したがって再デプロイせずにモデルを切り替えられ、`BedrockModelArns` は**設定する必要はありません**（特定の ARN に
+絞る場合や、Anthropic 以外のモデルを許可する場合にのみ使用）。
 
 **モデルアクセスは、スタックが代わりに行わない、アカウントごとに 1 回の手順です。**
 Anthropic のモデルは AWS Marketplace を通じて提供されますが、タスクロールはモデルを呼び出す
@@ -882,8 +884,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   専用の `dsql:GetCluster` + `dsql:ListTagsForResource`（クラスターにスコープ限定。
   概要図にクラスターの `Name` タグを表示するためだけに使用）、および
   `secretsmanager:GetSecretValue`（ソースシークレットにスコープ限定）のみを付与します。
-  `bedrock:InvokeModel` は AI アシストを有効化した場合にのみ追加され、許可されたモデル
-  ARN にスコープ限定されます。別の実行ロールが ECR の pull + ログを処理し、自動生成の
+  `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream` は AI アシストを有効化した場合にのみ
+  追加され、Anthropic モデル(設定した場合は `BedrockModelArns`)にスコープ限定されます。別の実行ロールが ECR の pull + ログを処理し、自動生成の
   セッションクッキーシークレットのみを読み取って（`secretsmanager:GetSecretValue` に
   スコープ限定）、コンテナ起動時に注入します。
 - **自動生成のセッションクッキーシークレット**: スタックは、ブラウザセッションクッキー

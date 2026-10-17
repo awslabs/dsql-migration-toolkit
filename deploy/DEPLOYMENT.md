@@ -478,7 +478,8 @@ aws cloudformation deploy \
 > [!TIP]
 > **AI assist (recommended).** `EnableAiAssist=true` + `BedrockRegion` turns on the
 > AI DBA for Schema Conversion and the Query Converter — an opt-in, advisory-only
-> feature scoped to `bedrock:InvokeModel` for the selected model. The model
+> feature granted `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on
+> Anthropic models (any `anthropic.` foundation model or inference profile). The model
 > (`BedrockModelId`, default `global.anthropic.claude-sonnet-5`) must also be
 > **enabled once for your AWS account** — its AWS Marketplace agreement accepted by
 > someone with AWS Marketplace permissions, because the task role deliberately has
@@ -571,7 +572,7 @@ Optional deep-dives — expand what you need; none of this is required for a fir
 | `AppDomainName` | no | `""` | DNS name fronting the ALB (must match the cert). Leave **empty** to use the ALB's own DNS name as the Cognito callback host — then no custom domain or Route 53 record is needed. |
 | `CognitoDomainPrefix` | if Cognito | `""` | Globally-unique Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
 | `CognitoAdminEmail` | if Cognito | `""` | Email of the **first login user**, created by the stack. Cognito mails it a temporary password; the hosted UI asks for a new one on first sign-in. **Required with Cognito** — the user pool disables self sign-up, so without it the deploy succeeds and produces an app nobody can log in to (the template rejects that combination). Add more users later — see [§Create operator users](#create-operator-users-cognito--only-with-cognito). |
-| `EnableAiAssist` | no | `false` | Opt-in; grants scoped `bedrock:InvokeModel`. |
+| `EnableAiAssist` | no | `false` | Opt-in; grants `bedrock:InvokeModel` / `InvokeModelWithResponseStream` on Anthropic models. |
 | `BedrockModelArns` | no | `""` | **Optional override** of the invoke scope; blank = auto-derived from `BedrockModelId`. |
 | `BedrockRegion` | no | `""` | `BEDROCK_REGION` for the app. |
 | `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic model (dropdown); IAM scope auto-derived from it. |
@@ -751,7 +752,8 @@ aws cloudformation deploy \
 
 ### Enable AI-assisted conversion (optional)
 
-AI assist is opt-in and grants a **scoped** `bedrock:InvokeModel`:
+AI assist is opt-in and grants `bedrock:InvokeModel` and
+`bedrock:InvokeModelWithResponseStream`, **scoped to the `anthropic.` provider**:
 
 ```bash
 aws cloudformation deploy ... \
@@ -778,9 +780,10 @@ credentials. Set the model with `BedrockModelId` (default
 
 `BedrockModelId` is a **dropdown** of these `global.` cross-region inference profiles
 (they resolve from every commercial region, so one list serves any deploy),
-and the task role's `bedrock:InvokeModel` scope is **derived from it
-automatically** — so you do **not** set `BedrockModelArns` (use it only to
-override with a different model/ARNs).
+and the task role may invoke **any** Anthropic model (foundation model or
+inference profile, any region) — so you can switch models without redeploying and do
+**not** set `BedrockModelArns` (use it only to narrow the scope to specific ARNs, or to
+allow a non-Anthropic model).
 
 **Model access is a one-time, per-account step the stack does not do for you.**
 Anthropic models are provided through AWS Marketplace, and the task role can only
@@ -885,8 +888,9 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   `dsql:ListTagsForResource` (scoped to the cluster; used only to show the
   cluster's `Name` tag on the overview diagram), and
   `secretsmanager:GetSecretValue` (scoped to the
-  source secret); `bedrock:InvokeModel` is added only when AI assist is enabled
-  and is scoped to the allowed model ARN(s). A separate execution role handles
+  source secret); `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream` are
+  added only when AI assist is enabled and are scoped to Anthropic models (or to
+  `BedrockModelArns` when set). A separate execution role handles
   ECR pull + logs and reads only the auto-generated session-cookie secret
   (scoped `secretsmanager:GetSecretValue`) to inject it at container start.
 - **Auto-generated session-cookie secret**: the stack creates an
