@@ -50,7 +50,7 @@ emits a *verify* warning rather than asserting a violation.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Optional, Sequence
 
 import sqlglot
 from sqlglot import exp
@@ -190,6 +190,8 @@ CODE_FOR_UPDATE_VERIFY_PK = "FOR_UPDATE_VERIFY_PK"
 CODE_JSON_UNQUOTE_UNSUPPORTED = "JSON_UNQUOTE_UNSUPPORTED"
 # An unquoted table/column name with upper-case ASCII letters (a MySQL source).
 CODE_MIXED_CASE_NAME = "MIXED_CASE_NAME"
+# An unquoted mixed-case select-list alias: the result column's label is folded.
+CODE_MIXED_CASE_LABEL = "MIXED_CASE_LABEL"
 
 # Severity ordering used to derive the overall result classification from its
 # warnings (higher value is more severe). Matches the assessor's convention.
@@ -485,47 +487,171 @@ def _for_update_warnings(tree: exp.Expression) -> list[QueryWarning]:
 def _drop_from_dual(tree: exp.Expression) -> None:
     """``SELECT ... FROM DUAL`` without its FROM, in place: MySQL's DUAL is no table on
     Aurora DSQL (the converted SQL failed with 'relation "dual" does not exist'), and a
-    PostgreSQL SELECT needs no FROM, WHERE included. Only a FROM that is DUAL alone."""
+    PostgreSQL SELECT needs no FROM, WHERE included. Only a FROM that is DUAL alone, and
+    never a backquoted `dual`: MySQL's keyword is never quoted, so that is a real table."""
     for select in tree.find_all(exp.Select):
         source = select.args.get("from_") or select.args.get("from")
         table = getattr(source, "this", None)
         if (
             isinstance(table, exp.Table)
-            and not table.args.get("db")
-            and table.name.lower() == "dual"
+            and _is_dual_keyword(table)
             and not table.alias
             and not select.args.get("joins")
         ):
             select.set("from_" if "from_" in select.args else "from", None)
 
 
-def _mixed_case_name_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
-    """MANUAL when the statement names a table or column unquoted with upper-case ASCII
-    letters. MySQL matched it whatever the case; Aurora DSQL folds an unquoted name to
-    lower case while Schema Conversion keeps the source spelling (quoted), so the same SQL
-    finds nothing after cut over. Quoting is not done for the operator: this converter
-    does not know the schema, and "Orders" would break a table actually named orders."""
-    # The names the statement defines itself -- a table alias (FROM orders AS O), a CTE
-    # (WITH Recent AS ...), a select-list alias (id AS UserId, used again in ORDER BY), and
-    # DUAL -- are folded the same where they are defined and where they are used, so they
-    # run unchanged on Aurora DSQL: quoting them as advised would break the query.
-    fold = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
-    defined = {"dual"}
-    for node in tree.find_all(exp.TableAlias, exp.CTE, exp.Alias):
-        name = node.alias if isinstance(node, (exp.CTE, exp.Alias)) else node.name
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _is_dual_keyword(table: exp.Table) -> bool:
+    """MySQL's DUAL: unqualified and unquoted (a backquoted `dual` is a real table)."""
+    this = table.args.get("this")
+    return (
+        not table.args.get("db")
+        and isinstance(this, exp.Identifier)
+        and not this.quoted
+        and this.name.lower() == "dual"
+    )
+
+
+def _output_names(query: Optional[exp.Expression], alias: Optional[exp.Expression]) -> set:
+    """The column names a derived table or CTE puts out, folded: its column list, else its
+    select list's names."""
+    columns = [c.name for c in (getattr(alias, "columns", None) or []) if c.name]
+    if not columns and isinstance(query, exp.Query):
+        columns = [name for name in query.named_selects if name]
+    return {name.translate(_ASCII_FOLD) for name in columns}
+
+
+def _refers_to_cte(table: exp.Table, folded: str) -> bool:
+    """A Table named like a CTE refers to it -- except inside that CTE's own body, where a
+    non-recursive WITH still means the real table."""
+    cte = table.find_ancestor(exp.CTE)
+    while cte is not None:
+        if (cte.alias or "").translate(_ASCII_FOLD) == folded:
+            with_ = cte.parent
+            return bool(isinstance(with_, exp.With) and with_.args.get("recursive"))
+        cte = cte.find_ancestor(exp.CTE)
+    return True
+
+
+def _in_alias_clause(column: exp.Column) -> bool:
+    """A column in ORDER BY / GROUP BY / HAVING -- where a bare name may be a select-list
+    alias -- and not in a window's ORDER BY, which cannot name one."""
+    node = column.parent
+    while node is not None and not isinstance(node, exp.Select):
+        if isinstance(node, exp.Window):
+            return False
+        if isinstance(node, (exp.Order, exp.Group, exp.Having)):
+            return True
+        node = node.parent
+    return False
+
+
+def _mixed_case_names(tree: exp.Expression) -> "list[str]":
+    """The table and column names the statement writes unquoted with upper-case ASCII
+    letters, in order: see :func:`_mixed_case_name_warning`."""
+    # Only REFERENCES to a name the statement defines are skipped, because they fold the
+    # same where defined and where used: a qualifier naming a table alias or CTE, a table
+    # naming a CTE, a bare ORDER BY / GROUP BY / HAVING name equal to a select-list alias,
+    # a derived table's or CTE's own output column, and DUAL. The table that carries an
+    # alias and the column inside an aliased expression are real names, and checked.
+    table_aliases = {
+        n.name.translate(_ASCII_FOLD) for n in tree.find_all(exp.TableAlias) if n.name
+    }
+    ctes = {c.alias.translate(_ASCII_FOLD) for c in tree.find_all(exp.CTE) if c.alias}
+    select_aliases = {
+        a.alias.translate(_ASCII_FOLD) for a in tree.find_all(exp.Alias) if a.alias
+    }
+    # What each derived table and CTE puts out, by its folded name.
+    derived: dict = {}
+    for node in tree.find_all(exp.Subquery, exp.CTE):
+        alias = node.args.get("alias")
+        name = getattr(alias, "name", "") if alias is not None else ""
         if name:
-            defined.add(name.translate(fold))
-    names: list[str] = []
-    for node in (*tree.find_all(exp.Table), *tree.find_all(exp.Column)):
-        for part in (node.args.get("this"), node.args.get("table"), node.args.get("db")):
-            if (
-                isinstance(part, exp.Identifier)
-                and not part.quoted
-                and any("A" <= ch <= "Z" for ch in part.name)
-                and part.name.translate(fold) not in defined
-                and part.name not in names
+            derived[name.translate(_ASCII_FOLD)] = _output_names(node.this, alias)
+
+    def _own_sources_outputs(column: exp.Column) -> "Optional[set]":
+        """The output names of the column's SELECT sources when every one is a derived
+        table or CTE (a bare name may then only be theirs); None when any is a table."""
+        select = column.find_ancestor(exp.Select)
+        if select is None:
+            return None
+        source = select.args.get("from_") or select.args.get("from")
+        items = [getattr(source, "this", None)] + [
+            j.this for j in (select.args.get("joins") or [])
+        ]
+        outputs: set = set()
+        for item in items:
+            if isinstance(item, exp.Subquery) and item.alias:
+                outputs |= derived.get(item.alias.translate(_ASCII_FOLD), set())
+            elif (
+                isinstance(item, exp.Table)
+                and not item.args.get("db")
+                and item.name.translate(_ASCII_FOLD) in ctes
             ):
-                names.append(part.name)
+                outputs |= derived.get(item.name.translate(_ASCII_FOLD), set())
+            else:
+                return None
+        return outputs
+
+    names: list[str] = []
+
+    def _flag(part) -> None:
+        if (
+            isinstance(part, exp.Identifier)
+            and not part.quoted
+            and any("A" <= ch <= "Z" for ch in part.name)
+            and part.name not in names
+        ):
+            names.append(part.name)
+
+    for table in tree.find_all(exp.Table):
+        this = table.args.get("this")
+        if _is_dual_keyword(table):
+            continue
+        if (
+            not table.args.get("db")
+            and isinstance(this, exp.Identifier)
+            and this.name.translate(_ASCII_FOLD) in ctes
+            and _refers_to_cte(table, this.name.translate(_ASCII_FOLD))
+        ):
+            continue
+        for part in (this, table.args.get("db"), table.args.get("catalog")):
+            _flag(part)
+    for column in tree.find_all(exp.Column):
+        qualifier = column.args.get("table")
+        this = column.args.get("this")
+        folded_qualifier = (
+            qualifier.name.translate(_ASCII_FOLD)
+            if isinstance(qualifier, exp.Identifier) and not column.args.get("db")
+            else None
+        )
+        if folded_qualifier is None or folded_qualifier not in table_aliases | ctes:
+            _flag(qualifier)
+        _flag(column.args.get("db"))
+        if isinstance(this, exp.Identifier):
+            folded = this.name.translate(_ASCII_FOLD)
+            if folded_qualifier is not None and folded in derived.get(folded_qualifier, ()):
+                continue  # a derived table's / CTE's own output column
+            if qualifier is None:
+                if folded in select_aliases and _in_alias_clause(column):
+                    continue
+                own = _own_sources_outputs(column)
+                if own is not None and folded in own:
+                    continue
+        _flag(this)
+    return names
+
+
+def _mixed_case_name_warning(names: "Sequence[str]") -> "Optional[QueryWarning]":
+    """MANUAL when the statement names a table or column unquoted with upper-case ASCII
+    letters (``names``, from :func:`_mixed_case_names`). MySQL matched it whatever the
+    case; Aurora DSQL folds an unquoted name to lower case while Schema Conversion keeps
+    the source spelling (quoted), so the same SQL finds nothing after cut over. Quoting is
+    not done for the operator: this converter does not know the schema, and "Orders"
+    would break a table actually named orders."""
     if not names:
         return None
     return QueryWarning(
@@ -538,6 +664,52 @@ def _mixed_case_name_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
             "so this SQL finds nothing after cut over: quote each exactly as the schema "
             "spells it (\"CustomerId\"). Evaluation lists such names "
             "(MIXED_CASE_IDENTIFIERS)."
+        ),
+    )
+
+
+def _mixed_case_label_warning(
+    tree: exp.Expression, flagged: "Sequence[str]" = ()
+) -> "Optional[QueryWarning]":
+    """MANUAL when a result column's label is written unquoted with upper-case ASCII
+    letters: the query runs, but Aurora DSQL folds the label (id AS UserId comes back as
+    userid where MySQL returned UserId), so a client reading columns by name misses it.
+    Only the statement's own result (a derived table's alias never reaches the client),
+    and not a name already ``flagged`` as a schema name: quoting that keeps its label."""
+    query = tree
+    while isinstance(query, exp.SetOperation):
+        query = query.this  # a UNION's labels are its first branch's
+    if not isinstance(query, exp.Select):
+        return None
+    labels = []
+    for projection in query.expressions:
+        if isinstance(projection, exp.Alias):
+            label = projection.args.get("alias")
+        elif isinstance(projection, exp.Column):
+            label = projection.args.get("this")  # the column's own name labels it
+        else:
+            continue
+        if (
+            isinstance(label, exp.Identifier)
+            and not label.quoted
+            and any("A" <= ch <= "Z" for ch in label.name)
+            and label.name not in labels
+            and label.name not in flagged
+        ):
+            labels.append(label.name)
+    if not labels:
+        return None
+    shown = ", ".join(labels[:5]) + (" ..." if len(labels) > 5 else "")
+    return QueryWarning(
+        code=CODE_MIXED_CASE_LABEL,
+        classification=Classification.MANUAL,
+        message=(
+            f"Result column label(s) {shown} come back from Aurora DSQL in lower case "
+            f"({', '.join(name.translate(_ASCII_FOLD) for name in labels[:5])}): an "
+            "unquoted label is folded, where MySQL kept its case. The query itself runs; a "
+            "client that reads result columns by name (an ORM, dictionary rows) no longer "
+            f"finds {labels[0]}. If yours does, label it quoted (AS \"{labels[0]}\") and "
+            f"write every reference to that alias the same way (ORDER BY \"{labels[0]}\")."
         ),
     )
 
@@ -609,7 +781,9 @@ class QueryConverter:
 
         if not self._is_postgres:
             # On the SOURCE's names, before a rewrite adds its own (EXCLUDED.col).
-            mixed_case = _mixed_case_name_warning(tree)
+            mixed_names = _mixed_case_names(tree)
+            mixed_case = _mixed_case_name_warning(mixed_names)
+            mixed_label = _mixed_case_label_warning(tree, mixed_names)
             on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
             if on_duplicate_warning is not None:
                 warnings.append(on_duplicate_warning)
@@ -617,6 +791,8 @@ class QueryConverter:
             _drop_from_dual(tree)
             if mixed_case is not None:
                 warnings.append(mixed_case)
+            if mixed_label is not None:
+                warnings.append(mixed_label)
         _inline_having_aliases(tree)
         warnings.extend(_for_update_warnings(tree))
 
