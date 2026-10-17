@@ -1231,3 +1231,14 @@ def test_a_formatted_text_key_is_no_generated_key() -> None:
     text_key = TableDef(name="shop.orders", columns=[column], primary_key=["order_no"],
                         auto_increment_column="order_no")
     assert identity_strategy_applies(text_key) is False
+
+
+def test_a_table_name_with_a_dot_is_enriched_under_its_own_name() -> None:
+    """Inside a schema read the name is bare, and "orders.v2" was split at its dot: the
+    lookup asked for relation "v2" in schema "orders", so the table kept its reflected
+    types (timestamptz as TIMESTAMP) and lost its identity."""
+    from dsql_migrator.core.source_dialect.postgres import _enrich_name
+
+    assert _enrich_name("orders.v2", "app") == ("app", "orders.v2")
+    assert _enrich_name("app.orders.v2", "app") == ("app", "orders.v2")
+    assert _enrich_name("app.orders", None) == ("app", "orders")

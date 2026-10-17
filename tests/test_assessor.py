@@ -967,7 +967,7 @@ def test_export_report_html_includes_compatibility_chart() -> None:
     assert "Compatibility by object kind" in markup
     assert 'class="chart"' in markup
     assert "% need attention" in markup
-    for label in ("Auto-converted", "Review needed", "Unsupported"):
+    for label in ("Automatic", "Review needed", "Unsupported"):
         assert label in markup
     # Effort words belong to the effort summary, not to this chart's legend.
     assert "Simple actions" not in markup

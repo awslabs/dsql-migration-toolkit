@@ -1858,7 +1858,7 @@ def build_evaluation_screen(
             # that this step is read-only.
             if status is StepStatus.NOT_STARTED:
                 with ui.card().classes("w-full bg-gray-50"):
-                    ui.label("Ready to evaluate").classes("text-md font-semibold")
+                    ui.label("Ready to evaluate").classes("text-base font-semibold")
                     ui.label(
                         "This step only reads the source and target (no changes "
                         "are made), classifies every object (Automatic / Review "
@@ -2422,7 +2422,7 @@ def _render_assessment_chart(ui: object, report: AssessmentReport) -> None:
             for cls in _CHART_ORDER
         ],
     }
-    ui.label("Compatibility by object kind").classes("text-md font-semibold")  # type: ignore[attr-defined]
+    ui.label("Compatibility by object kind").classes("text-base font-semibold")  # type: ignore[attr-defined]
     ui.echart(option).classes("w-full").style("height: 320px")  # type: ignore[attr-defined]
 
 
@@ -2493,13 +2493,13 @@ def _render_assessment(
     # objects in a large schema instead of scrolling past every AUTO object.
     if not report.assessed_items:
         ui.label("Objects by importance (most critical first)").classes(  # type: ignore[attr-defined]
-            "text-md font-semibold"
+            "text-base font-semibold"
         )
         ui.label("No objects were assessed.").classes("text-sm text-gray-500")  # type: ignore[attr-defined]
         return
 
     ui.label("Objects by importance (most critical first)").classes(  # type: ignore[attr-defined]
-        "text-md font-semibold"
+        "text-base font-semibold"
     )
     # Effort distribution, beside the list and the effort filter it describes. The count
     # is spelled out as "objects needing work" because it is NOT the object total: an

@@ -3294,15 +3294,17 @@ _CHART_ORDER: tuple[Classification, ...] = (
 # Chart labels. "Review needed" rather than the raw MANUAL, matching the wording the UI
 # badges use, so the exported report and the screen agree.
 _CLASS_CHART_LABELS: dict[Classification, str] = {
-    Classification.AUTO: "Auto-converted",
+    Classification.AUTO: "Automatic",
     Classification.MANUAL: "Review needed",
     Classification.UNSUPPORTED: "Unsupported",
 }
 
+# The design system's one palette (Tailwind green / amber / red 600): amber, never orange,
+# for a warning tone.
 _CHART_CLASS_COLORS: dict[Classification, str] = {
-    Classification.AUTO: "#2e7d32",
-    Classification.MANUAL: "#ef6c00",
-    Classification.UNSUPPORTED: "#c62828",
+    Classification.AUTO: "#16a34a",
+    Classification.MANUAL: "#d97706",
+    Classification.UNSUPPORTED: "#dc2626",
 }
 
 
