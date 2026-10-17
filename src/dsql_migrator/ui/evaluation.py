@@ -37,7 +37,7 @@ import itertools
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 from dsql_migrator.config import SecretValue
 from dsql_migrator.core.assessment_strategist import (
@@ -1513,6 +1513,36 @@ class EvaluationState:
             self._progress_message = ""
 
 
+def untested_connections(session: Any) -> list[str]:
+    """The configured connections NOT tested live this session (``source``/``target``).
+
+    Configured is not enough to run: after a restart the source is restored without its
+    password and neither side is tested, so a run failed minutes in with a raw driver
+    error. A missing flag (a UI double) reads as tested.
+    """
+    return [
+        name
+        for name, configured, verified in (
+            ("source", session.has_source(), getattr(session, "source_verified", True)),
+            ("target", session.has_target(), getattr(session, "target_verified", True)),
+        )
+        if configured and verified is False
+    ]
+
+
+def untested_connections_text(untested: list[str]) -> str:
+    """What to do about :func:`untested_connections`, for a notice or a refusal."""
+    one = len(untested) == 1
+    reenter = (
+        " (after a restart, re-enter the source password)" if "source" in untested else ""
+    )
+    return (
+        f"The {' and '.join(untested)} {'connection has' if one else 'connections have'} "
+        f"not been tested in this session. Test {'it' if one else 'them'} on the Connect "
+        f"screen{reenter}, then run the evaluation."
+    )
+
+
 @dataclass
 class EvaluationStore:
     """Process-memory map of session id to :class:`EvaluationState`.
@@ -1618,6 +1648,10 @@ def build_evaluation_screen(
                 "Configure and test the target connection first, then run the "
                 "evaluation."
             )
+            return
+        untested = untested_connections(session)
+        if untested:
+            eval_state.set_error(untested_connections_text(untested))
             return
 
         source_config = session.source_config
@@ -1854,6 +1888,7 @@ def build_evaluation_screen(
                     ),
                 )
 
+            untested = untested_connections(session)
             if not session.has_source() or not session.has_target():
                 render_notice(
                     ui,
@@ -1861,8 +1896,15 @@ def build_evaluation_screen(
                     header="Source and target required",
                     body=(
                         "Both a source and a target connection are required. Set "
-                        "them up in the Connect section above."
+                        "them up on the Connect screen."
                     ),
+                )
+            elif untested and status is not StepStatus.IN_PROGRESS:
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header="Test the connections first",
+                    body=untested_connections_text(untested),
                 )
 
             # Empty-state call-to-action: before the first run, give an on-screen
@@ -1879,7 +1921,7 @@ def build_evaluation_screen(
                     run_button = ui.button(
                         "Run evaluation", on_click=run_now
                     ).props("color=primary")
-                    if not (session.has_source() and session.has_target()):
+                    if not (session.has_source() and session.has_target()) or untested:
                         run_button.disable()
                         run_button.tooltip(
                             "Configure and test the source and target "

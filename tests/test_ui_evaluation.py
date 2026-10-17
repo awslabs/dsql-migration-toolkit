@@ -2247,6 +2247,8 @@ def _screen_runner(introspector_factory, target_browser_factory, *, manager=None
     session = store.get_or_create("s1")
     session.set_source(SourceConnectionConfig(host="db", database="shop"), None)
     session.set_target(TargetConnectionConfig(cluster_endpoint="c.dsql.example", region="us-east-1"))
+    session.set_source_verified(True)
+    session.set_target_verified(True)
     eval_store = EvaluationStore()
     manager = manager or JobManager()
     _content, runner = build_evaluation_screen(
@@ -2329,6 +2331,59 @@ def test_a_second_run_is_refused_while_one_is_running() -> None:
     assert state.job_id == first
     release.set()
     assert manager.wait(first, timeout=5.0)
+
+
+def test_a_restored_source_without_a_password_is_refused_before_any_job() -> None:
+    """After a restart the source config is restored untested and without its password:
+    a run failed minutes in with a raw driver error instead of saying what to do."""
+
+    class _Never:
+        def introspect(self, conn, *, progress=None):
+            raise AssertionError("an untested connection must not be read")
+
+    tgt_factory, _ = _target_factory(_empty_target())
+    runner, manager, state, session = _screen_runner(lambda _p: _Never(), tgt_factory)
+    session.set_source_verified(False)  # what a restore leaves behind
+    runner()
+    assert state.job_id is None
+    assert state.error == (
+        "The source connection has not been tested in this session. Test it on the "
+        "Connect screen (after a restart, re-enter the source password), then run the "
+        "evaluation."
+    )
+
+
+def test_an_untested_target_alone_is_named_without_the_password_hint() -> None:
+    from dsql_migrator.ui.evaluation import untested_connections, untested_connections_text
+
+    tgt_factory, _ = _target_factory(_empty_target())
+    runner, _manager, state, session = _screen_runner(lambda _p: None, tgt_factory)
+    session.set_target_verified(False)
+    assert untested_connections(session) == ["target"]
+    runner()
+    assert state.job_id is None
+    assert state.error == (
+        "The target connection has not been tested in this session. Test it on the "
+        "Connect screen, then run the evaluation."
+    )
+    session.set_source_verified(False)
+    assert untested_connections_text(untested_connections(session)) == (
+        "The source and target connections have not been tested in this session. Test "
+        "them on the Connect screen (after a restart, re-enter the source password), "
+        "then run the evaluation."
+    )
+
+
+def test_untested_connections_ignores_unconfigured_sides_and_flagless_doubles() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.evaluation import untested_connections
+    from dsql_migrator.ui.session import SessionStore
+
+    fresh = SessionStore().get_or_create("s1")  # nothing configured: a different notice
+    assert untested_connections(fresh) == []
+    double = SimpleNamespace(has_source=lambda: True, has_target=lambda: True)
+    assert untested_connections(double) == []
 
 
 def test_a_superseded_or_retired_run_cannot_write_its_result() -> None:
