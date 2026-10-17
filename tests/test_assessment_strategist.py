@@ -613,9 +613,9 @@ def test_stream_validation_chat_routes_to_tool_chat_when_tools_given() -> None:
                                  "name": "get_validation_summary", "input": {}}],
                 })}
             return {"body": json.dumps({
-                "stop_reason": "end_turn",
-                "content": [{"type": "text",
-                             "text": "orders is short 74 rows -- a standing gap."}],
+                "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "a1", "name": "answer",
+                             "input": {"markdown": "orders is short 74 rows -- a standing gap."}}],
             })}
 
     strategist = AssessmentStrategist(_config(), client=_ToolClient())
@@ -697,8 +697,9 @@ def test_stream_full_load_error_chat_routes_to_tool_chat_when_tools_given() -> N
                                  "input": {"object_name": "orders"}}],
                 })}
             return {"body": json.dumps({
-                "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": "The DDL dropped a NOT NULL."}],
+                "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "a1", "name": "answer",
+                             "input": {"markdown": "The DDL dropped a NOT NULL."}}],
             })}
 
     strategist = AssessmentStrategist(_config(), client=_ToolClient())
@@ -781,9 +782,9 @@ def test_stream_cdc_chat_routes_to_tool_chat_when_tools_given() -> None:
                                  "name": "get_cdc_status", "input": {}}],
                 })}
             return {"body": json.dumps({
-                "stop_reason": "end_turn",
-                "content": [{"type": "text",
-                             "text": "SQLSTATE 23502 means a dropped/added column."}],
+                "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "a1", "name": "answer", "input": {
+                    "markdown": "SQLSTATE 23502 means a dropped/added column."}}],
             })}
 
     strategist = AssessmentStrategist(_config(), client=_ToolClient())
@@ -831,9 +832,10 @@ def test_build_connection_error_chat_system_grounds_on_side_and_error() -> None:
 
 def test_tool_chat_runs_a_tool_then_answers() -> None:
     # The agentic loop: round 1 the model asks to call a tool, we execute it and feed
-    # the result back, round 2 the model answers. Verify the tool ran with the model's
-    # input, the result was fed back as a tool_result user turn, and the final text is
-    # returned + streamed. Tools + the response-style directive ride in the request.
+    # the result back, round 2 the model answers (through the answer tool). Verify the
+    # tool ran with the model's input, the result was fed back as a tool_result user
+    # turn, and the answer is returned + streamed. Tools + the response-style directive
+    # ride in the request.
     class _ToolClient:
         def __init__(self) -> None:
             self.calls: list[dict] = []
@@ -860,9 +862,14 @@ def test_tool_chat_runs_a_tool_then_answers() -> None:
             else:
                 body = json.dumps(
                     {
-                        "stop_reason": "end_turn",
+                        "stop_reason": "tool_use",
                         "content": [
-                            {"type": "text", "text": "Here is the `orders` DDL."}
+                            {
+                                "type": "tool_use",
+                                "id": "a1",
+                                "name": "answer",
+                                "input": {"markdown": "Here is the `orders` DDL."},
+                            }
                         ],
                     }
                 )
@@ -904,85 +911,6 @@ def test_tool_chat_runs_a_tool_then_answers() -> None:
     second = json.loads(client.calls[1]["body"])
     assert second["messages"][-1]["role"] == "user"
     assert second["messages"][-1]["content"][0]["type"] == "tool_result"
-
-
-def test_tool_chat_nudges_when_model_punts_with_a_preamble_only_turn() -> None:
-    # Reported on the "What's next?" briefing: the model ended its turn with only a
-    # "Let me pull the assessment details..." preamble and NO tool_use, so the user got
-    # that preamble as the whole answer. tool_chat must nudge ONCE and continue, so the
-    # corrective round produces the real answer instead of the bare preamble.
-    class _PuntThenAnswer:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-            self._round = 0
-
-        def invoke_model(self, **kwargs: object) -> dict:
-            self.calls.append(kwargs)
-            self._round += 1
-            if self._round == 1:
-                # A punt: end_turn, text only, NO tool_use.
-                body = json.dumps(
-                    {
-                        "stop_reason": "end_turn",
-                        "content": [
-                            {"type": "text",
-                             "text": "Let me pull the actual assessment details and "
-                                     "check the current state across the pipeline."},
-                        ],
-                    }
-                )
-            else:
-                body = json.dumps(
-                    {
-                        "stop_reason": "end_turn",
-                        "content": [{"type": "text", "text": "Your top risk is table X."}],
-                    }
-                )
-            return {"body": body}
-
-    client = _PuntThenAnswer()
-    strategist = AssessmentStrategist(_config(), client=client)
-    deltas: list[str] = []
-    outcome = strategist.tool_chat(
-        "SYSTEM", [{"role": "user", "text": "what's next?"}], deltas.append,
-        tools=[{"name": "get_prerequisite_verdicts", "description": "x",
-                "input_schema": {"type": "object", "properties": {}}}],
-        execute=lambda _n, _i: "{}",
-    )
-    assert outcome.available
-    # The REAL answer is returned/streamed, not the preamble.
-    assert "top risk is table X" in outcome.markdown
-    assert "Let me pull" not in outcome.markdown
-    assert len(client.calls) == 2  # punt round, then the nudged answer round
-    # The nudge was fed back as a trailing user turn before the answer round.
-    second = json.loads(client.calls[1]["body"])
-    assert second["messages"][-1]["role"] == "user"
-    assert "CALL the tools" in second["messages"][-1]["content"][0]["text"]
-
-
-def test_tool_chat_does_not_nudge_a_genuine_answer() -> None:
-    # A normal complete answer (no intent-to-look-it-up cue) must be returned as-is,
-    # with no extra round -- the nudge must not fire on a real reply.
-    class _Answer:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        def invoke_model(self, **kwargs: object) -> dict:
-            self.calls.append(kwargs)
-            return {"body": json.dumps({
-                "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": "Aurora DSQL requires a primary key."}],
-            })}
-
-    client = _Answer()
-    outcome = AssessmentStrategist(_config(), client=client).tool_chat(
-        "SYSTEM", [{"role": "user", "text": "does DSQL need a PK?"}], lambda _t: None,
-        tools=[{"name": "x", "description": "x",
-                "input_schema": {"type": "object", "properties": {}}}],
-        execute=lambda _n, _i: "{}",
-    )
-    assert outcome.available and "primary key" in outcome.markdown
-    assert len(client.calls) == 1  # answered directly, no nudge round
 
 
 def test_tool_chat_maps_bedrock_failure_to_unavailable() -> None:
@@ -1221,33 +1149,11 @@ def test_the_cdc_chat_knows_every_classified_sqlstate_and_its_dsql_repair() -> N
     assert "MySQL ENUM" in mysql and "TOAST" not in mysql
 
 
-def test_only_a_short_announcement_is_nudged_and_the_constraints_are_current() -> None:
-    """A full answer that said "I'll check the logs" in a bullet was nudged as if it were
-    only a 'let me look that up' preamble; the grounding said every table requires a
-    primary key and that auto-increment keys cause hot partitions."""
-    from dsql_migrator.core.assessment_strategist import DSQL_CONSTRAINTS, is_tool_preamble
+def test_the_constraints_are_current() -> None:
+    """The grounding said every table requires a primary key and that auto-increment keys
+    cause hot partitions."""
+    from dsql_migrator.core.assessment_strategist import DSQL_CONSTRAINTS
 
-    assert is_tool_preamble("Let me pull the assessment details for that table.")
-    answer = "**Verdict:** ready.\n\n" + "- a point\n" * 40 + "- I'll check the logs if it recurs."
-    assert not is_tool_preamble(answer)
-    # Judged by the LAST sentence: a closing offer is an answer, a long single-paragraph
-    # announcement is a preamble (it was length-only, with the cue anywhere).
-    for complete in (
-        "The table is ready to migrate: its key is an identity and every column maps. "
-        "Let me know if you'd like me to review the trigger body.",
-        "The DLQ holds 3 records, all 23505 on app.users. If you're going to cut over "
-        "today, check the DLQ depth first.",
-        "Full Load runs at 8K rows/s. Let's look at throughput instead of the index.",
-    ):
-        assert not is_tool_preamble(complete), complete
-    long_preamble = (
-        "To answer that I need the current state of three things: the Evaluation verdict "
-        "for app.orders, the converted DDL Schema Conversion would apply for it, and the "
-        "dead-letter samples the CDC sink has recorded for it since the stream started, "
-        "because the duplicate-key errors you describe could come from either the key "
-        "strategy or a re-snapshot. Let me pull each of those from your session now."
-    )
-    assert len(long_preamble) > 300 and is_tool_preamble(long_preamble)
     assert "every table requires a primary key" not in DSQL_CONSTRAINTS
     assert "cached identity by default" in DSQL_CONSTRAINTS
 

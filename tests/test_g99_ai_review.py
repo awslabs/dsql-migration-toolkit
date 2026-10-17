@@ -1,109 +1,16 @@
-"""G99: the review of G93 -- a failed nudge round never costs the first reply, the punt
-detector reads deferrals by what else the reply says and knows more Korean / Japanese
-forms, a not-converted view's note names only what blocks it, a chat instance is this
-tab's, and programmatic asks queue first in, first out."""
+"""G99: the review of G93 -- a not-converted view's note names only what blocks it, a chat
+instance is this tab's, and programmatic asks queue first in, first out. (Its punt-detector
+and nudge tests went with the detector in G116: tool_chat's reply comes through an answer
+tool, test_g116_ai_protocol.)"""
 
 from __future__ import annotations
 
-import io
 import json
 import threading
 from types import SimpleNamespace
 
-import pytest
-
 from tests.test_ai_panel import _Ui, _enabled_state, _make_streamer, _pump
 from tests.test_g72_ai_review import _executor
-
-_ANSWER = (
-    "Let me review your blockers:\n1. app.orders has 3 missing rows (CHECKSUM mismatch).\n"
-    "2. The DLQ holds 2 records (23505) on app.users.\nReload app.orders, then re-validate."
-)
-
-
-def _tool_chat(second):
-    """tool_chat whose first round answers (and is nudged) and whose second round is
-    ``second``: a reply body, or an exception to raise."""
-    from dsql_migrator.core.assessment_strategist import AssessmentStrategist
-    from dsql_migrator.core.models import AiAssistConfig
-
-    calls: list = []
-
-    class Bedrock:
-        def invoke_model(self, **_kw):  # noqa: ANN003
-            calls.append(1)
-            if len(calls) == 1:
-                body = {"stop_reason": "end_turn", "content": [{"type": "text", "text": _ANSWER}]}
-            elif isinstance(second, Exception):
-                raise second
-            else:
-                body = second
-            return {"body": io.BytesIO(json.dumps(body).encode())}
-
-    shown: list = []
-    outcome = AssessmentStrategist(AiAssistConfig(enabled=True), client=Bedrock()).tool_chat(
-        "sys", [{"role": "user", "text": "What's blocking me?"}], shown.append,
-        tools=[{"name": "x", "description": "x", "input_schema": {"type": "object", "properties": {}}}],
-        execute=lambda _n, _i: "{}", max_rounds=3,
-    )
-    return outcome, shown, len(calls)
-
-
-@pytest.mark.parametrize(
-    "second",
-    [
-        RuntimeError("ThrottlingException: Rate exceeded"),
-        {"stop_reason": "end_turn", "content": []},
-        # G104: a nudge round that calls a tool says the first reply was a punt, so when its
-        # look-ups never answer, the failure is the outcome (test_g104_ai_review), not that reply.
-    ],
-)
-def test_a_failed_nudge_round_keeps_the_first_reply(second) -> None:
-    """A throttled or empty nudge round showed 'AI reply unavailable' and lost the answer
-    already received."""
-    outcome, shown, calls = _tool_chat(second)
-    assert outcome.available and outcome.markdown == _ANSWER and shown == [_ANSWER]
-    assert calls >= 2
-
-
-@pytest.mark.parametrize(
-    "punt",
-    [
-        "I'll check your assessment, schema conversion, data load, CDC health and validation "
-        "state to show what is blocking you before you cut over.",
-        "Before you cut over, let me check your DLQ, CDC lag and validation results.",
-        "Let me check what happened to the sink after you deployed CDC.",
-        "Let me check the DLQ. Would you like me to focus on CDC?",
-        "현재 마이그레이션 상태를 확인해 드리겠습니다.",
-        "현재 상태를 확인해 보도록 하겠습니다.",
-        "다음에 해야 할 작업을 확인해 보겠습니다.",
-        "Full Load 이후에 무슨 일이 있었는지 확인해 보겠습니다.",
-        "確認させていただきます。",
-        "見ていきます。",
-        "お調べします。",
-    ],
-)
-def test_punts_are_nudged(punt: str) -> None:
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
-
-    assert is_tool_preamble(punt)
-
-
-@pytest.mark.parametrize(
-    "answer",
-    [
-        "外部キーは親テーブルを参照します。",
-        "Validation ステップでは行数とチェックサムを確認します。",
-        "Let me explain why you see it missing: the view reads the table before the load.",
-        "I'll keep the query as is; it already uses the primary key.",
-        "To answer that, I need to know which schema you migrated it to.",
-        "Your DLQ holds 3 records; they need no repair. I'll review it again if a new code appears.",
-    ],
-)
-def test_statements_of_fact_and_promises_beside_an_answer_are_not_nudged(answer: str) -> None:
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
-
-    assert not is_tool_preamble(answer)
 
 
 def test_a_colliding_views_note_names_only_what_blocks_it() -> None:

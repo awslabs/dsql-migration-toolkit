@@ -34,15 +34,18 @@ def test_a_paged_listing_is_answered_within_the_tool_budget() -> None:
     budget_seen: list = []
 
     class Bedrock:
-        """Pages until told the budget is spent, then answers with what it has."""
+        """Pages until the round that can only answer, then answers with what it has."""
 
         def invoke_model(self, **kw):  # noqa: ANN003
-            last = json.loads(kw["body"])["messages"][-1]
+            body = json.loads(kw["body"])
+            last = body["messages"][-1]
             blocks = last["content"] if isinstance(last["content"], list) else []
             if any(b.get("type") == "text" and "Tool budget" in b.get("text", "") for b in blocks):
-                budget_seen.append(True)
-                out = {"stop_reason": "end_turn", "content": [
-                    {"type": "text", "text": "3,000 tables convert automatically; the first pages are listed."}]}
+                budget_seen.append(body["tool_choice"])
+            if body["tool_choice"]["type"] == "tool":
+                answer = "3,000 tables convert automatically; the first pages are listed."
+                out = {"stop_reason": "tool_use", "content": [{
+                    "type": "tool_use", "id": "a1", "name": "answer", "input": {"markdown": answer}}]}
                 return {"body": io.BytesIO(json.dumps(out).encode())}
             offset = 0
             if blocks and blocks[0].get("type") == "tool_result":
@@ -56,7 +59,9 @@ def test_a_paged_listing_is_answered_within_the_tool_budget() -> None:
         "sys", [{"role": "user", "text": "List every table that converts automatically."}],
         lambda _d: None, tools=AI_TOOL_SCHEMAS, execute=execute,
     )
-    assert budget_seen and outcome.available, outcome.detail
+    # The budget is told with the round that can only answer.
+    assert budget_seen == [{"type": "tool", "name": "answer"}]
+    assert outcome.available and "3,000 tables" in outcome.markdown, outcome.detail
 
 
 def test_a_whats_next_asked_while_a_reply_streams_is_asked_after_it() -> None:
@@ -152,28 +157,3 @@ def test_a_view_no_apply_path_creates_is_not_reported_as_applied() -> None:
     out = json.loads(execute("get_converted_ddl", {"object_name": "shop.v_orders"}))
     assert out["edited"] is False and "not converted" in out["note"]
     assert "SELECT \"id\"" not in out["target_ddl"]
-
-
-def test_short_preambles_and_answers_are_told_apart() -> None:
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
-
-    for preamble in (
-        "Let me check your DLQ and the Full Load status. One moment.",
-        "Let me check the dead-letter queue to see if you have any 23505 records.",
-        "I'll check a few things first:\n1. The Evaluation verdict\n2. Its converted DDL",
-    ):
-        assert is_tool_preamble(preamble), preamble
-    long_answer = (
-        "Your dead-letter queue holds 3 records, all SQLSTATE 23505 on app.users, and every "
-        "one of them is an INSERT that a re-snapshot replayed after the Full Load had already "
-        "written the same rows, so the target already holds exactly what the source holds and "
-        "they need no repair; Validation's CHECKSUM for app.users matched after the last dead "
-        "letter, which is why Cut over no longer holds the table, and nothing else in the "
-        "stream is failing right now. I'll check the DLQ depth again before you cut over."
-    )
-    for answer in (
-        long_answer,
-        "app.orders converts automatically. Once Schema Apply has run, I'll be able to check the index build.",
-        "Your DLQ holds 3 records; they need no repair. I'll review it again if a new code appears.",
-    ):
-        assert not is_tool_preamble(answer), answer

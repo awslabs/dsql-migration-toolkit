@@ -1,95 +1,15 @@
-"""G93: the review of G91 -- a nudge that can keep an answer, so the preamble detector errs
-toward nudging; a send bound to its scope INSTANCE; a chat per Query Converter query; a
-not-converted view's note with every reason."""
+"""G93: the review of G91 -- a send bound to its scope INSTANCE; a chat per Query Converter
+query; a not-converted view's note with every reason. (Its punt-detector and nudge tests went
+with the detector in G116: tool_chat's reply comes through an answer tool,
+test_g116_ai_protocol.)"""
 
 from __future__ import annotations
 
-import io
 import json
 from types import SimpleNamespace
 
 from tests.test_ai_panel import _Ui, _enabled_state, _make_streamer, _pump
 from tests.test_g72_ai_review import _executor
-
-
-def test_punts_in_every_shape_are_nudged() -> None:
-    """Two-sentence punts, plans of questions or '**Area**: what' items, look-ups of what
-    already happened, 'again', and Korean / Japanese punts were shown as the answer."""
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
-
-    for punt in (
-        "I'll check your assessment, schema conversion, data load, CDC health and validation "
-        "state. This will show what is blocking you before you cut over.",
-        "Let me pull your real migration state. That way I can name the exact tables "
-        "blocking cut over.",
-        "I'll start with the assessment results. Then I'll look at the data load and CDC health.",
-        "Let me check a few things first:\n1. Is CDC caught up?\n2. Are there DLQ records?",
-        "I'll check these areas:\n- **Assessment**: blockers on your tables\n- **CDC**: lag",
-        "Let me check what happened to the sink after you started the Full Load.",
-        "Let me look into why the sink stalled when it reconnected.",
-        "Let me check the DLQ to determine if it has any failed records.",
-        "Let me check the DLQ again.",
-        "현재 마이그레이션 상태를 확인해 보겠습니다.",
-        "移行の状態を確認します。少々お待ちください。",
-    ):
-        assert is_tool_preamble(punt), punt
-
-
-def test_a_correction_or_a_question_to_the_operator_is_not_nudged() -> None:
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
-
-    for answer in (
-        "To answer that, Validation (Step 4) has to run first -- it compares row counts "
-        "and checksums for every table.",
-        "You're right, I need to correct that: Aurora DSQL supports and enforces foreign keys.",
-        "I need to know which table you mean.",
-        "Your DLQ holds 3 records; they need no repair. I'll review it again if a new code appears.",
-        # G99: "The DLQ is empty. I'll check it before you cut over." is nudged now -- a look-up
-        # tied to a moment with little else said is the What's next? punt; the model keeps it.
-    ):
-        assert not is_tool_preamble(answer), answer
-
-
-def _tool_chat(replies: list):
-    from dsql_migrator.core.assessment_strategist import AssessmentStrategist
-    from dsql_migrator.core.models import AiAssistConfig
-
-    sent: list = []
-
-    class Bedrock:
-        def invoke_model(self, **kw):  # noqa: ANN003
-            sent.append(json.loads(kw["body"])["messages"])
-            out = replies[min(len(sent), len(replies)) - 1]
-            return {"body": io.BytesIO(json.dumps(out).encode())}
-
-    outcome = AssessmentStrategist(AiAssistConfig(enabled=True), client=Bedrock()).tool_chat(
-        "sys", [{"role": "user", "text": "What's next?"}], lambda _d: None,
-        tools=[{"name": "get_dlq", "description": "x",
-                "input_schema": {"type": "object", "properties": {}}}],
-        execute=lambda _n, _i: '{"dlq": 0}',
-    )
-    return outcome, sent
-
-
-def _text(text: str) -> dict:
-    return {"stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}
-
-
-def test_a_nudge_lets_the_model_keep_its_answer_or_look_things_up() -> None:
-    from dsql_migrator.core.assessment_strategist import KEEP_REPLY_MARKER
-
-    answer = "Let me look at that. app.orders converts automatically."
-    outcome, sent = _tool_chat([_text(answer), _text(f"`{KEEP_REPLY_MARKER}`")])
-    assert outcome.markdown == answer and len(sent) == 2
-    assert KEEP_REPLY_MARKER in sent[1][-1]["content"][0]["text"]
-
-    outcome, sent = _tool_chat([
-        _text("Let me check the DLQ."),
-        {"stop_reason": "tool_use", "content": [
-            {"type": "tool_use", "id": "t1", "name": "get_dlq", "input": {}}]},
-        _text("The DLQ is empty."),
-    ])
-    assert outcome.markdown == "The DLQ is empty." and len(sent) == 3
 
 
 def _panel():

@@ -1,68 +1,15 @@
-"""G91: the review of G84 -- a preamble that names when it looks, an answer that opens
-with an announcement, a programmatic ask bound to its own scope, and the remedy of a view
-the conversion could not convert."""
+"""G91: the review of G84 -- a programmatic ask bound to its own scope, and the remedy of a
+view the conversion could not convert. (Its punt-detector tests went with the detector in
+G116: tool_chat's reply comes through an answer tool, test_g116_ai_protocol.)"""
 
 from __future__ import annotations
 
-import io
 import json
 import threading
 from types import SimpleNamespace
 
 from tests.test_ai_panel import _Ui, _enabled_state, _make_streamer, _pump
 from tests.test_g72_ai_review import _executor
-
-
-def test_a_preamble_that_says_when_it_looks_is_still_a_preamble() -> None:
-    """'before' / 'after' / 'when' / 'if' read as 'said for later': the bare preamble was
-    returned as the whole answer."""
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
-
-    for preamble in (
-        "I'll check your assessment, schema conversion, data load, CDC health and validation "
-        "state to find what is blocking you before cut over.",
-        "Let me check what happened to the sink after the Full Load finished.",
-        "Let me look at when the DLQ records started arriving.",
-        "Let me check the DLQ to determine if any records failed.",
-        "Let me check whether CDC caught up after the last workload.",
-        "Let me look into why the sink stalled when the schema changed.",
-        "To answer that I need the Full Load status. One moment.",
-    ):
-        assert is_tool_preamble(preamble), preamble
-
-
-def test_an_answer_that_opens_with_an_announcement_is_kept() -> None:
-    """A structured reply under 'Let me review…:' was discarded and the question re-asked.
-    G93: such a reply may be nudged, but the model keeps it (KEEP_PREVIOUS_REPLY) and it
-    is the answer shown -- a nudge the model answers that way never replaces it."""
-    from dsql_migrator.core.assessment_strategist import (
-        KEEP_REPLY_MARKER,
-        AssessmentStrategist,
-    )
-    from dsql_migrator.core.models import AiAssistConfig
-
-    answer = (
-        "Let me review your blockers:\n1. app.orders has 3 missing rows (CHECKSUM mismatch).\n"
-        "2. The DLQ holds 2 records (23505) on app.users.\nReload app.orders, then re-validate."
-    )
-
-    class Bedrock:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def invoke_model(self, **_kw):  # noqa: ANN003
-            self.calls += 1
-            text = answer if self.calls == 1 else KEEP_REPLY_MARKER
-            out = {"stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}
-            return {"body": io.BytesIO(json.dumps(out).encode())}
-
-    client = Bedrock()
-    outcome = AssessmentStrategist(AiAssistConfig(enabled=True), client=client).tool_chat(
-        "sys", [{"role": "user", "text": "What's blocking me?"}], lambda _d: None,
-        tools=[{"name": "x", "description": "x", "input_schema": {"type": "object", "properties": {}}}],
-        execute=lambda _n, _i: "{}",
-    )
-    assert outcome.available and outcome.markdown == answer and client.calls <= 2
 
 
 def test_a_retest_that_finishes_after_another_scope_opened_is_not_asked_there() -> None:

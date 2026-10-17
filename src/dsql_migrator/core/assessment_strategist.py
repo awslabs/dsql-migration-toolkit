@@ -111,7 +111,8 @@ _CHAT_MAX_TOKENS = 8192
 # context carry the facts, not deep model reasoning) and _RESPONSE_STYLE keeps them
 # concise, we turn thinking OFF for every AI-DBA generation: the full budget goes to
 # the answer, so the empty-thinking failure cannot occur. (sonnet-5 rejects
-# thinking.type.enabled/budget -- "disabled" is the supported off switch here.)
+# thinking.type.enabled/budget -- "disabled" is the supported off switch here.) tool_chat's
+# forced tool_choice (see _ANSWER_TOOL) needs it off as well.
 _THINKING_OFF = {"type": "disabled"}
 
 # Upper bound on the running multi-turn chat transcript (characters) sent to the
@@ -125,309 +126,57 @@ _MAX_CHAT_TRANSCRIPT_CHARS = 24000
 # call-loop and bounds cost. A handful is plenty for "look up X, then answer".
 _MAX_TOOL_ROUNDS = 6
 
-# A model sometimes ENDS its turn (stop_reason="end_turn") with only a "let me look
-# that up" preamble and NO tool_use block -- announcing tool use but never emitting the
-# call. Returning that as the answer leaves the user staring at "Let me pull the
-# assessment details..." with no real reply (reported on the "What's next?" briefing).
-# When that happens before any tool has run, tool_chat nudges ONCE to actually proceed. The
-# nudge tells the model to keep a reply that already answered (:data:`KEEP_REPLY_MARKER`),
-# yet a reply nudged by mistake still costs a round -- and its answer, if the model looks
-# something up instead and that round fails (a punt the model confirmed by looking things up
-# is never shown as the answer). So a reply is read by what it says before its look-up: a
-# punt announces first and explains after, an answer answers first and closes with its
-# promise or offer.
-_CUE_RE = re.compile(
-    r"\b(?:let me(?! know)|i'?ll|i will|i'?m going to|i am going to)\b", re.IGNORECASE
+# tool_chat's reply comes through a tool. A model sometimes ENDED its turn with only "Let me
+# pull the assessment details..." and no tool call, and that preamble was the whole reply (the
+# "What's next?" briefing). Telling such a punt from an answer that promises a later check by
+# the reply's wording never settled: each round of tuning missed new punts and nudged complete
+# answers (lost when the nudged round then failed). So every round asks for a tool call
+# (tool_choice "any") -- a look-up, or this one, whose Markdown is the reply: a turn cannot end
+# with an announcement, and the last round can only answer (tool_choice "tool"), so a turn
+# always ends with one.
+#
+# Forced tool use needs thinking off (_THINKING_OFF: the API refuses tool_choice "any" / "tool"
+# beside extended thinking). The models that refuse forced tool use (Claude Sonnet 5.5, Opus 5.5,
+# Fable 5.1) refuse disabled thinking too, so a move to one of them changes both.
+_ANSWER_TOOL = "answer"
+_ANSWER_TOOL_SCHEMA: dict = {
+    "name": _ANSWER_TOOL,
+    "description": (
+        "Deliver your reply to the operator: the complete answer, in Markdown. Call it once "
+        "you have what you need -- after the look-ups the question needs. The operator sees "
+        "nothing else you write, so never use it to say you will look something up: call "
+        "that tool instead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "markdown": {
+                "type": "string",
+                "description": "The complete reply to the operator, in Markdown.",
+            }
+        },
+        "required": ["markdown"],
+    },
+}
+# Appended after _RESPONSE_STYLE in tool_chat only (stream_chat has no tools).
+_TOOL_CHAT_STYLE = (
+    "\n- Call the look-up tools the question needs (several at once when they are "
+    "independent), then deliver the reply with the answer tool: the operator sees nothing "
+    "else. Never reply that you will look something up -- call the tool."
 )
-# A look-up the model does, within reach of the cue and in its clause: "I'll check", "let me
-# try to review", "I'll do a quick review of", "let me run a query to see" -- not what follows
-# a colon or semicolon ("I'll give you the steps: reload it, then check the CHECKSUM").
-_LOOK = r"(?:check|look|pull|fetch|inspect|examine|gather|retrieve|dig|see|review|query|read)"
-_LOOK_RE = re.compile(r"\b" + _LOOK + r"\b", re.IGNORECASE)
-# Explaining is no look-up ("let me explain what this check does"), unless one follows it
-# ("let me summarize what we know, then check the DLQ").
-_EXPLAINS_RE = re.compile(
-    r"\s+(?:\w+\s+)?(?:explain|describe|clarify|summarize|recap|outline|walk you through|"
-    r"show you (?:why|how|what))\b"
-    r"(?![^.!?]*\b(?:then|and)\s+(?:i'?ll\s+|i will\s+)?" + _LOOK + r"\b)",
-    re.IGNORECASE,
-)
-# An -ing form is a look-up only as the cue's own verb ("start by checking", "keep checking"),
-# never "I'm going to recommend checking the DLQ ..." or "I'll assume you're looking at ...".
-_LOOK_ING_RE = re.compile(
-    r"\s+(?:\w+\s+)?(?:start by|begin by|keep|continue|be)\s+(?:\w+\s+)?"
-    r"(?:check|look|pull|fetch|inspect|examin|gather|retriev|digg|see|review|query|read)ing\b",
-    re.IGNORECASE,
-)
-# After a determiner a look-up word is a noun ("I'll keep the query as is") unless the model's
-# own light verb takes it ("run a check", "take a quick look"); after another subject it is
-# someone else's verb ("so you can see it", "I'll leave it to you to check").
-_LOOK_NOUN_RE = re.compile(
-    r"\b(?:the|a|an|this|that|these|those|your|my|our|its|their|each|every|no|another)\s+"
-    r"(?:[\w-]+\s+)?$",
-    re.IGNORECASE,
-)
-_LIGHT_VERB_RE = re.compile(
-    r"\b(?:do|run|take|have|give (?:it|them|this|that))\s+(?:a|an|the|this|that|another)\s+"
-    r"(?:[\w-]+\s+)?$",
-    re.IGNORECASE,
-)
-_OTHER_SUBJECT_RE = re.compile(
-    r"\b(?:(?:you|we|they|it|he|she)(?:'ll|'d|'re| will| can| could| would| should| may| might)?"
-    r"|you to)\s+$",
-    re.IGNORECASE,
-)
-# The same announcement in Korean or Japanese: the operator may ask in either, and the
-# model answers in kind ("확인해 보겠습니다", "確認させていただきます").
-_CJK_PREAMBLE_RE = re.compile(
-    r"(?:확인|조회|점검|검토|분석)\s*(?:해\s*보|해\s*드리|해서\s*알려\s*드리|하|해\s*보도록\s*하)\s*겠"
-    r"|(?:확인|조회|점검|검토|분석)\s*(?:해\s*볼게|할게)"
-    r"|(?:살펴|알아|찾아)\s*보(?:도록\s*하)?\s*겠|살펴보고\s*알려\s*드리겠|(?:가져|불러)\s*오겠"
-    r"|(?:確認|調査|チェック|取得|参照|分析)(?:してみます|いたします|させていただきます|していきます)"
-    r"|調べてみます|お調べします|見て(?:みます|いきます)"
-)
-# Japanese 〜しましょう ('let's check') is advice to the operator beside an answer ("次に検証結果を
-# 確認しましょう。"), and the punt alone ("では、DLQの状態を確認しましょう。").
-_ADVICE_RE = re.compile(r"(?:確認|調査|チェック|取得|参照|分析)しましょう(?!か)|(?:見て|調べて)みましょう(?!か)")
-# A plain Japanese 〜します is an announcement only when no topic governs the verb
-# (確認します); with one it states what something does (外部キーは親テーブルを参照します,
-# Validationでは…を確認します), and so does a topic an earlier statement set (Validationでは…を比較
-# します。各テーブルの行数が一致するか確認します。). No topic is an opener at the start of a clause
-# (まずは, では, 次は, 今は), a frame (〜するには, については, に関しては, の件は), a particle whose clause
-# a conjunction closes (前回はFull Loadが失敗しましたが、…), or the は of an embedded question
-# (DLQのレコードは残っていないか確認します) -- whose が is not the verb's subject either.
-_JA_VERB = r"(?:(?:確認|調査|チェック|取得|参照)します|調べます)(?!か)"
-_JA_PLAIN_PREAMBLE_RE = re.compile(_JA_VERB)
-_JA_OPENER_RE = re.compile(
-    r"(?:^|(?<=[、,]))\s*(?:(?:まずは|まず|では|それでは|じゃあ|はい|ええ|はじめに|最初に|次に|次は|続いて|"
-    r"今回は|今度は|最後は|ひとまずは|とりあえずは|今は|ここでは|念のため|早速|今から)[、,]?\s*)+"
-)
-_JA_TOPIC = r"(?<!私)(?<!に)(?<!について)(?<!に関して)(?<!の件)(?<!こんにち)(?<!こんばん)(?:では|は)(?!なく)"
-_JA_OPEN_CLAUSE = r"(?:(?!(?:が|けど|けれど|ので|から|ため|ために|には)[、,])[^。])*"
-_JA_TOPIC_RE = re.compile(_JA_TOPIC + _JA_OPEN_CLAUSE + _JA_VERB)
-_JA_TOPIC_SET_RE = re.compile(_JA_TOPIC + _JA_OPEN_CLAUSE + r"(?:ます|です|ません)[。！]?$")
-_JA_QUESTION_TOPIC_RE = re.compile(r"は[^が。]*か(?:どうか)?を?\s*" + _JA_VERB)
-_JA_SUBJECT_RE = re.compile(r"(?<!私)(?<!ます)(?<!です)(?<!な)が(?![らっ、,])" + _JA_OPEN_CLAUSE + _JA_VERB)
-_JA_EMBEDDED_QUESTION_RE = re.compile(r"か(?:どうか)?を?\s*" + _JA_VERB)
-# An offer to the user, a question to them, or a closing is no announcement of what the
-# model is about to do ("to see if you have ..." is no offer): 'if you want', 'if needed'
-# opening or closing the sentence, '필요하면 … 확인해 드리겠습니다', '必要なら…確認します',
-# 'お知らせください'.
-_TOOL_OFFER_RE = re.compile(
-    r"\b(?:if you(?:'d| would) like|would you like|do you want|should i|let me know)\b"
-    r"|\bif you (?:want|prefer)(?=\s*(?:[.!?,;:]|$)|\s+(?:me|us|i)\b)"
-    r"|^if (?:needed|necessary)\b|\bif (?:needed|necessary)[.!]?$"
-    r"|(?:필요|원)하(?:시|신다|다)?면|(?:필요|원)하(?:신|실)\s*경우|궁금하(?:시)?면|알려\s*주시면"
-    r"|요청하시면|말씀해\s*주(?:시면|세요)|(?:드릴|볼)까요"
-    r"|必要(?:であれば|でしたら|なら|に応じて|があれば)|ご(?:希望|要望)(?:であれば|でしたら|の場合|があれば)"
-    r"|よろしければ|お知らせください|お申し付けください|(?:しましょう|します)か[？?]",
-    re.IGNORECASE,
-)
-# A reply that asks the operator for a fact the model has no tool for ("Could you paste the
-# CREATE TABLE here?") waits for the operator, not for a tool: it is no punt.
-_ASKS_OPERATOR_RE = re.compile(
-    r"\b(?:could|can|would) you (?:please )?(?:paste|share|send|copy|provide|upload)\b"
-    r"|\bplease (?:paste|share|send|copy|provide|upload)\b"
-    r"|^(?:paste|share|send|copy|upload) (?:it|them|the|your)\b"
-    r"|(?:붙여\s*넣어|공유해|보내|알려)\s*주(?:세요|시겠어요|시겠습니까)"
-    r"|(?:貼り付け|共有し|送っ|教え)て(?:ください|いただけますか)",
-    re.IGNORECASE,
-)
-_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
-# A look-up said for LATER is part of an answer: 'later', 'next time', 'once Schema Apply
-# has run' never announce one.
-_LATER_RE = re.compile(
-    r"\b(?:later|next time|whenever|from now on)\b"
-    r"|\bonce\b(?!\s+more\b)(?=[^.]*\b(?:has|have|is|are|runs?|finishes|completes)\b)"
-    r"|나중에|後で|次回|後ほど",
-    re.IGNORECASE,
-)
-# A look-up tied to a moment still to come ('before you cut over', 'if it recurs', 'once you
-# reload it', 'after the converted DDL is applied', '컷오버 전에', 'カットオーバーの前に') is part
-# of an answer only after one: with nothing said before it, it is the punt ("I'll check ... to
-# find what blocks you before you cut over."). A moment already past is none ('when it
-# reconnected', 'after the Full Load finished' -- but not 'after the converted DDL is
-# applied'), and an if / when after a verb of finding out ('see if'), a purpose infinitive
-# ('to understand if') or a wh-word ('what happens when') asks a question instead.
-_PAST = (
-    r"(?:was|were|had|did|ran|began|got|went|saw|came|took|broke|fell|grew|left|lost|sent|made|"
-    r"caught|kept|became|found|gave|knew|told|brought|built|stuck|\w+[^\We]ed)"
-    r"(?!\s+[\w.'-]+\s+(?:is|are|has|have|gets?|will|be)\b)"
-)
-_MOMENT_RE = re.compile(
-    r"\b(?P<marker>before|after|once(?!\s+more\b)|when|if)\s+(?:you|it|they|a new|the|any|more)\b"
-    r"(?!(?:\s+(?!(?:is|are|be|been|being|has|have|will|gets?)\b)[\w.'-]+){0,3}?\s+"
-    + _PAST + r"\b)",
-    re.IGNORECASE,
-)
-_INDIRECT_QUESTION_RE = re.compile(
-    r"(?:\b(?:see|check|determine|find out|know|verify|tell|confirm|ask|learn|wonder|at)"
-    r"|\bto\s+(?!(?:it|you|them|me|us|the|a|an)\b)[\w-]+(?:\s+[\w-]+){0,2}"
-    r"|\b(?:what|why|how|which|who|where|whether)(?:\s+[\w'-]+){0,3})\s+$",
-    re.IGNORECASE,
-)
-# Korean and Japanese moments -- never one already past (얼마 전에, 5분 전에, 以前に) or part of a
-# word (이전에 previously, 最後に finally). Only a question about the past cancels one, and only one
-# that asks what happened then ('CDC를 배포한 후에 싱크에 무슨 일이 있었는지', 'フルロードの後に何が
-# 起きたか'): asked whether something happened, the moment is when the model will look ('컷오버
-# 전에 DLQ에 새 레코드가 들어왔는지 한 번 더 확인해 드리겠습니다', 'Schema Applyの後にインデックスが作成
-# されたか確認します'), and asked in the present ('…있는지', '…ないか') it never is a question
-# about the past.
-_KO_PAST_SYLLABLE = "[" + "".join(  # closed by the past ㅆ (했, 됐, 었, 왔), not 있 'is' or 겠 'will'
-    chr(code)
-    for code in range(0xAC00, 0xD7A4)
-    if (code - 0xAC00) % 28 == 20 and chr(code) not in "있겠"
-) + "]"
-_KO_PAST_QUESTION = (
-    r"(?![^.]*?(?:무슨|무엇|뭐|왜|어떻게|언제|어디|누가|누구|어떤|얼마나|몇)[^.]*?(?:"
-    + _KO_PAST_SYLLABLE + r"는지|던지))"
-)
-_JA_PAST_QUESTION = (
-    r"(?![^。]*?(?:何|なぜ|どう|いつ|どこ|誰|どの|どれ|どんな)[^。]*?たか(?:どうか)?を?"
-    r"(?:確認|調査|チェック|取得|参照|調べ))"
-)
-_CJK_MOMENT_RE = re.compile(
-    r"[가-힣A-Za-z0-9](?<!얼마|조금|방금|며칠|시간|개월|오래|잠시)(?<![0-9 ][분초일주달년])"
-    r"\s+(?:직|이)?전에" + _KO_PAST_QUESTION
-    + r"|[가-힣A-Za-z0-9]\s+(?:직|이)?(?:후|뒤)에" + _KO_PAST_QUESTION
-    + r"|(?:끝나|생기|나타나|들어오|되|하|하시)면"
-    r"|(?<![以午分間日週月年秒事名])前に" + _JA_PAST_QUESTION
-    + r"|(?<![最以午])(?<!その)後に" + _JA_PAST_QUESTION
-    + r"|(?:終わっ|完了し|終了し|再発し|発生し)たら"
-)
-# A sentence of courtesies or a request to wait says nothing: 'Good question.', 'Okay, sounds
-# good.', 'One moment, please.', '네, 알겠습니다', 'はい、わかりました', 'ご質問ありがとうございます'.
-_COURTESY_RE = re.compile(
-    r"^(?:(?:one moment|just a moment|give me a (?:moment|second)|please wait|bear with me|hang on|"
-    r"(?:that's |that is )?(?:a )?(?:good|great) question|thanks(?: for (?:asking|the question))?|"
-    r"thank you|sure(?: thing)?|of course|certainly|happy to help|okay|ok|alright|all right|got it|"
-    r"understood|sounds good|great|perfect|absolutely|no problem|please)\b[\s,.!]*)+$"
-    r"|^(?:네|예)?[,\s]*(?:알겠습니다|좋은 질문입니다|감사합니다|(?:잠시만|잠시)\s*기다려\s*주세요)"
-    r"|^(?:はい|ええ)?[、,]?\s*(?:(?:少々|しばらく)?お待ちください|(?:ご質問)?ありがとうございます|"
-    r"かしこまりました|(?:承知|了解)(?:しました|いたしました)|わかりました|(?:それは)?(?:良い|いい)(?:ご)?質問です)",
-    re.IGNORECASE,
-)
-# 'To answer that I need ...': what the model is about to fetch, said as a need -- never
-# 'I need to correct that' or 'to answer that, I need to know which table you mean' (a
-# question to the operator).
-_NEED_RE = re.compile(
-    r"\bto answer (?:that|this),? i(?:'ll| will)? need\b(?!\s+(?:to know|your|you\b|the name|more))"
-    r"|\bi need (?:to (?:check|look|pull|fetch|see|review|query|read|gather|confirm|"
-    r"inspect)\b|the (?:current|latest|actual|live)\b)",
-    re.IGNORECASE,
-)
-# A preamble is short: a long answer that says "I'll check the logs" in its third bullet
-# is an answer. Code is always an answer.
-_TOOL_PREAMBLE_MAX_CHARS = 800
-# A sentence of this many words before the look-up (or twice as many words in all) is
-# substance -- "Yes, it's safe.", "All 11 tables match." -- after which a look-up tied to a
-# moment is a promise in an answer, not a punt. A punt says nothing before its look-up but a
-# courtesy.
-_SUBSTANCE_WORDS = 3
-# Words, counted alike in the three languages: a run of Latin letters or digits ('CDC', '0')
-# or of Hangul is one, and Japanese, written without spaces, counts its kana and kanji, two
-# and a half to a word ("欠落行はないので、カットオーバーできます。" is a sentence of substance).
-_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.'-]*|[가-힣]+")
-_JA_CHAR_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
-# What a nudged model replies, alone, when its reply already answered: that reply is kept.
-KEEP_REPLY_MARKER = "KEEP_PREVIOUS_REPLY"
+# A reply cut short -- at the model's output limit, or at the cap on what the panel shows --
+# says so, rather than ending mid-sentence as if it were whole. A code fence it cut stays open:
+# closed, the cut statement would be a complete block that "Use as target DDL" or "Test
+# rewrite on target" takes.
+_CUT_NOTE = "\n\n_(The reply was cut at its length limit: ask for one part at a time.)_"
 
 
-def _says_look_up(unit: str) -> bool:
-    """Whether an English sentence announces a look-up the model is about to do."""
-    for cue in _CUE_RE.finditer(unit):
-        rest = re.split(r"[:;]", unit[cue.end():], maxsplit=1)[0]
-        if _EXPLAINS_RE.match(rest):
-            continue
-        if _LOOK_ING_RE.match(rest):
-            return True
-        for word in _LOOK_RE.finditer(rest):
-            if word.start() > 60:
-                break
-            before = rest[: word.start()]
-            if not _OTHER_SUBJECT_RE.search(before) and not (
-                _LOOK_NOUN_RE.search(before) and not _LIGHT_VERB_RE.search(before)
-            ):
-                return True
-    return False
+def _answer_markdown(block: Mapping[str, Any]) -> str:
+    """The Markdown an answer call carries; ``""`` for any other shape (untrusted). Pure."""
+    given = block.get("input")
+    markdown = given.get("markdown") if isinstance(given, Mapping) else None
+    return markdown.strip() if isinstance(markdown, str) else ""
 
-
-def _ja_announces(unit: str, topic: bool) -> bool:
-    """Whether a plain Japanese 〜します announces a look-up: neither a topic in ``unit`` (see
-    :data:`_JA_VERB`) nor ``topic`` -- one an earlier statement set -- governs its verb."""
-    body = _JA_OPENER_RE.sub("", unit)
-    if topic or not _JA_PLAIN_PREAMBLE_RE.search(body):
-        return False
-    for found in _JA_TOPIC_RE.finditer(body):
-        if not _JA_QUESTION_TOPIC_RE.match(body, found.start()):
-            return False  # a topic that governs the verb states what something does
-    return bool(_JA_EMBEDDED_QUESTION_RE.search(body)) or not _JA_SUBJECT_RE.search(body)
-
-
-def _announces_look_up(unit: str, topic: bool = False) -> bool:
-    """Whether a sentence or line announces a look-up (English, Korean or Japanese)."""
-    if _TOOL_OFFER_RE.search(unit):
-        return False  # an offer to the operator, a question to them, or a closing
-    if (
-        _says_look_up(unit)
-        or _NEED_RE.search(unit)
-        or _CJK_PREAMBLE_RE.search(unit)
-        or _ADVICE_RE.search(unit)
-    ):
-        return True
-    return _ja_announces(unit, topic)
-
-
-def _deferred(unit: str) -> bool:
-    """Whether ``unit`` ties its look-up to a moment still to come (see :data:`_MOMENT_RE`)."""
-    return bool(_CJK_MOMENT_RE.search(unit)) or any(
-        moment.group("marker").lower() not in ("if", "when")
-        or not _INDIRECT_QUESTION_RE.search(unit, 0, moment.start())
-        for moment in _MOMENT_RE.finditer(unit)
-    )
-
-
-def _words(unit: str) -> int:
-    """About how many words ``unit`` says, in any of the three languages (see :data:`_WORD_RE`)."""
-    return len(_WORD_RE.findall(unit)) + len(_JA_CHAR_RE.findall(unit)) * 2 // 5
-
-
-def is_tool_preamble(text: str) -> bool:
-    """Whether ``text`` may be only an announcement of tool use (``let me pull``, ``I'll
-    check``, ``확인해 보겠습니다``): a reply up to :data:`_TOOL_PREAMBLE_MAX_CHARS`, with no
-    code and no request to the operator for a fact, that announces a look-up not said for
-    later -- one for now, or one tied to a moment still to come ('before you cut over') or
-    given as advice ('確認しましょう') when nothing of substance comes before it. What follows
-    the look-up never makes it an answer: a punt explains after its look-up, an answer
-    answers first. Pure."""
-    stripped = (text or "").strip()
-    if not stripped or len(stripped) > _TOOL_PREAMBLE_MAX_CHARS or "```" in stripped:
-        return False
-    units = [
-        part.strip()
-        for line in stripped.splitlines()
-        for part in _SENTENCE_BREAK_RE.split(line)
-        if part.strip()
-    ]
-    looks: list[bool] = []
-    topic = False  # a Japanese topic a statement set: it governs the plain 〜します after it
-    for unit in units:
-        looks.append(_announces_look_up(unit, topic))
-        if not (looks[-1] or _COURTESY_RE.search(unit)) and _JA_TOPIC_SET_RE.search(
-            _JA_OPENER_RE.sub("", unit)
-        ):
-            topic = True
-    announcing = [i for i, unit in enumerate(units) if looks[i] and not _LATER_RE.search(unit)]
-    if not announcing or any(_ASKS_OPERATOR_RE.search(unit) for unit in units):
-        return False
-    if any(not _ADVICE_RE.search(units[i]) and not _deferred(units[i]) for i in announcing):
-        return True  # a look-up said for now
-    said = [
-        _words(unit)
-        for unit in units[: announcing[0]]
-        if not (_TOOL_OFFER_RE.search(unit) or _COURTESY_RE.search(unit))
-    ]
-    return not (any(words >= _SUBSTANCE_WORDS for words in said) or sum(said) >= 2 * _SUBSTANCE_WORDS)
 
 # A tool result handed back to the model: larger than a prompt field (a list of objects is
 # what the tools exist for), and when cut it SAYS so -- cut silently mid-JSON, the model read
@@ -2253,8 +2002,12 @@ class AssessmentStrategist:
         the converted DDL of a table, the assessment of an object, the validation
         verdict. Each requested tool is run via ``execute(name, input) -> str`` (a
         read-only, credential-free callable the shell supplies over its own state) and
-        the result fed back, in a bounded agentic loop; the final assistant text is
-        delivered through ``on_delta`` and returned as :class:`ObjectGuidanceOutcome`.
+        the result fed back, in a bounded agentic loop. The reply comes through one more
+        tool, the answer tool (:data:`_ANSWER_TOOL_SCHEMA`), and every round asks for a
+        tool call, so a turn is a look-up or the answer -- never only "let me check ...".
+        The answer's Markdown is delivered through ``on_delta`` and returned as
+        :class:`ObjectGuidanceOutcome`; a turn of plain text (from a model or proxy that
+        ignored ``tool_choice``) is the reply as it stands.
 
         Non-streaming per round (tool-use and token streaming do not compose cleanly),
         so the final answer arrives at once; ``on_delta`` still receives it so the
@@ -2269,39 +2022,24 @@ class AssessmentStrategist:
             }
             for m in _trim_chat_messages(messages, _MAX_CHAT_TRANSCRIPT_CHARS)
         ]
-        tools_used = False
-        nudged = False
-        nudged_reply: Optional[str] = None
-
-        def first_reply_stands() -> bool:
-            """Whether the first reply is the answer to fall back on: it was nudged, and the
-            nudge round has looked nothing up. A model that answers the nudge by calling a
-            tool says the first reply was a punt, so when that look-up then fails (throttled,
-            denied, empty, out of rounds) the failure is the outcome -- its reason latching a
-            denial as on any turn -- never the punt shown as the answer."""
-            return nudged_reply is not None and not tools_used
-
-        def kept() -> "ObjectGuidanceOutcome":
-            """The first reply, as the answer: it was received (and paid for) before the
-            nudge, and the nudge round failed before looking anything up."""
-            on_delta(nudged_reply or "")
-            return ObjectGuidanceOutcome(
-                available=True,
-                reason="OK",
-                detail="",
-                markdown=(nudged_reply or "")[:_MAX_NARRATIVE_CHARS],
-                model_id=self._config.model_id,
-            )
-
+        rounds = max(1, max_rounds)
         try:
-            for round_number in range(max(1, max_rounds)):
+            for round_number in range(rounds):
+                last = round_number == rounds - 1
                 body = json.dumps(
                     {
                         "anthropic_version": _ANTHROPIC_VERSION,
                         "max_tokens": _CHAT_MAX_TOKENS,
                         "thinking": _THINKING_OFF,
-                        "system": system + _RESPONSE_STYLE,
-                        "tools": list(tools),
+                        "system": system + _RESPONSE_STYLE + _TOOL_CHAT_STYLE,
+                        "tools": [*tools, _ANSWER_TOOL_SCHEMA],
+                        # A tool call every round -- a look-up or the answer -- and on the
+                        # last one the answer.
+                        "tool_choice": (
+                            {"type": "tool", "name": _ANSWER_TOOL}
+                            if last
+                            else {"type": "any"}
+                        ),
                         "messages": convo,
                     }
                 )
@@ -2322,18 +2060,30 @@ class AssessmentStrategist:
                     for b in content
                     if isinstance(b, Mapping) and b.get("type") == "tool_use"
                 ]
-                if stop == "tool_use" and tool_uses:
-                    # Record the assistant's tool-call turn verbatim, then answer each.
+                answers = [b for b in tool_uses if b.get("name") == _ANSWER_TOOL]
+                look_ups = [b for b in tool_uses if b.get("name") != _ANSWER_TOOL]
+                if stop == "tool_use" and look_ups and not (answers and last):
+                    # Record the assistant's tool-call turn verbatim, then answer each call.
+                    # An answer called beside look-ups was written before their results came
+                    # back, so it is not the reply: the model answers again from them -- but
+                    # on the last round, with no round left to read them, the answer is.
                     convo.append({"role": "assistant", "content": content})
                     results: list[dict] = []
                     for block in tool_uses:
                         name = str(block.get("name", ""))
-                        inp = block.get("input")
-                        inp = dict(inp) if isinstance(inp, Mapping) else {}
-                        try:
-                            out = execute(name, inp)
-                        except Exception:  # noqa: BLE001 - a bad tool never breaks chat
-                            out = "{\"error\": \"tool failed\"}"
+                        if name == _ANSWER_TOOL:
+                            out = (
+                                "Not shown to the operator: it was written before the "
+                                "results of the look-ups called with it. Read them, then "
+                                "call answer with the complete reply."
+                            )
+                        else:
+                            inp = block.get("input")
+                            inp = dict(inp) if isinstance(inp, Mapping) else {}
+                            try:
+                                out = execute(name, inp)
+                            except Exception:  # noqa: BLE001 - a bad tool never breaks chat
+                                out = "{\"error\": \"tool failed\"}"
                         results.append(
                             {
                                 "type": "tool_result",
@@ -2341,88 +2091,50 @@ class AssessmentStrategist:
                                 "content": bounded_tool_output(str(out)),
                             }
                         )
-                    if round_number == max(1, max_rounds) - 2:
-                        # The next round is the last: say so, or a paged listing read to
-                        # its end exhausts the budget and the turn has no answer at all.
+                    if round_number == rounds - 2:
+                        # The next round can only answer: say so, or the answer to a paged
+                        # listing read to the end of the budget presents part of it as all.
                         results.append(
                             {
                                 "type": "text",
                                 "text": (
-                                    "Tool budget: this is the last tool result you get in "
-                                    "this reply. Do not call another tool -- answer now "
-                                    "from the results you have, and say what was not "
-                                    "fetched (e.g. the remaining pages of a list; the "
-                                    "Evaluation export lists every object)."
+                                    "Tool budget: these are the last tool results you get "
+                                    "in this reply. Answer now from the results you have, "
+                                    "and say what was not fetched (e.g. the remaining pages "
+                                    "of a list; the Evaluation export lists every object)."
                                 ),
                             }
                         )
                     convo.append({"role": "user", "content": results})
-                    tools_used = True
                     continue
-                # Final answer (end_turn, or a turn with no tool call): join text blocks.
-                final = "".join(
-                    b.get("text", "")
-                    for b in content
-                    if isinstance(b, Mapping)
-                    and b.get("type") == "text"
-                    and isinstance(b.get("text"), str)
-                ).strip()
-                # The model punted: it ended the turn with only an intent-to-look-it-up
-                # preamble and no tool_use, before running ANY tool. Nudge once to make
-                # it actually call the tools + answer, then continue -- rather than
-                # handing the user a bare "Let me pull the assessment details...".
-                if (
-                    final
-                    and not tools_used
-                    and not nudged
-                    and is_tool_preamble(final)
-                ):
-                    nudged = True
-                    nudged_reply = final
-                    convo.append({"role": "assistant", "content": content})
-                    convo.append(
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "Go ahead now: in THIS reply, CALL the tools you "
-                                        "just described to fetch the real data, then give "
-                                        "the full answer. Do not reply with only a 'let "
-                                        "me check' preamble. If your previous reply "
-                                        "already answered the question -- even if it "
-                                        "offers or promises a later check, or asks the "
-                                        "operator for a fact you cannot look up -- reply "
-                                        f"with only {KEEP_REPLY_MARKER}, and do not start "
-                                        "a new look-up only because that reply offered one."
-                                    ),
-                                }
-                            ],
-                        }
-                    )
-                    continue
-                if (nudged_reply is not None and KEEP_REPLY_MARKER in final.upper()) or (
-                    not final and first_reply_stands()
-                ):
-                    # Nudged by mistake (the model says its first reply was the answer), or
-                    # the nudge round came back empty: the first reply is the answer.
-                    final = nudged_reply or ""
+                # The reply: the answer's Markdown -- or, from a turn that called no tool at
+                # all, its text.
+                if answers:
+                    final = "\n\n".join(md for md in map(_answer_markdown, answers) if md)
+                else:
+                    final = "".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, Mapping)
+                        and b.get("type") == "text"
+                        and isinstance(b.get("text"), str)
+                    ).strip()
                 if not final:
                     err = AiAssistUnavailableError("INVALID_OUTPUT")
                     return ObjectGuidanceOutcome(
                         available=False, reason=err.reason, detail=err.detail
                     )
-                on_delta(final)
+                markdown = final[:_MAX_NARRATIVE_CHARS]
+                if stop == "max_tokens" or len(final) > _MAX_NARRATIVE_CHARS:
+                    markdown += _CUT_NOTE
+                on_delta(markdown)
                 return ObjectGuidanceOutcome(
                     available=True,
                     reason="OK",
                     detail="",
-                    markdown=final[:_MAX_NARRATIVE_CHARS],
+                    markdown=markdown,
                     model_id=self._config.model_id,
                 )
-            if first_reply_stands():
-                return kept()  # the rounds ran out on the nudge itself: the first reply did
             return ObjectGuidanceOutcome(
                 available=False,
                 reason="UNAVAILABLE",
@@ -2432,14 +2144,10 @@ class AssessmentStrategist:
                 ),
             )
         except AiAssistUnavailableError as error:
-            if first_reply_stands():
-                return kept()  # the nudge round failed before looking anything up
             return ObjectGuidanceOutcome(
                 available=False, reason=error.reason, detail=error.detail
             )
         except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            if first_reply_stands():
-                return kept()
             error = AiAssistUnavailableError(_classify_bedrock_error(exc))
             return ObjectGuidanceOutcome(
                 available=False, reason=error.reason, detail=error.detail
