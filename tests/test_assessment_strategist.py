@@ -1219,3 +1219,27 @@ def test_the_cdc_chat_knows_every_classified_sqlstate_and_its_dsql_repair() -> N
     pg, mysql = _cdc_recovery_context("PostgreSQL"), _cdc_recovery_context("MySQL")
     assert "ALTER TYPE ... ADD VALUE" in pg and "TOASTed" in pg and "MySQL" not in pg
     assert "MySQL ENUM" in mysql and "TOAST" not in mysql
+
+
+def test_only_a_short_announcement_is_nudged_and_the_constraints_are_current() -> None:
+    """A full answer that said "I'll check the logs" in a bullet was nudged as if it were
+    only a 'let me look that up' preamble; the grounding said every table requires a
+    primary key and that auto-increment keys cause hot partitions."""
+    from dsql_migrator.core.assessment_strategist import DSQL_CONSTRAINTS, is_tool_preamble
+
+    assert is_tool_preamble("Let me pull the assessment details for that table.")
+    answer = "**Verdict:** ready.\n\n" + "- a point\n" * 40 + "- I'll check the logs if it recurs."
+    assert not is_tool_preamble(answer)
+    assert "every table requires a primary key" not in DSQL_CONSTRAINTS
+    assert "cached identity by default" in DSQL_CONSTRAINTS
+
+
+def test_a_cut_tool_result_says_it_was_cut() -> None:
+    """Tool output was cut at 4,000 characters mid-JSON with no marker, so the model read
+    a broken list as the whole answer."""
+    from dsql_migrator.core.assessment_strategist import _MAX_TOOL_OUTPUT_CHARS, bounded_tool_output
+
+    assert bounded_tool_output("{}") == "{}"
+    long = '{"objects": [' + ",".join('"x"' for _ in range(10_000)) + "]}"
+    cut = bounded_tool_output(long)
+    assert cut.startswith(long[:_MAX_TOOL_OUTPUT_CHARS]) and "TRUNCATED" in cut

@@ -388,3 +388,17 @@ def test_get_cdc_status_names_a_check_groups_constraint_not_a_column(monkeypatch
     # A unique-conflict's index is a constraint name, never a column.
     assert drift[2] == {"table": "app.c", "kind": "unique-conflict", "count": 1,
                         "constraints": ["uk_email"], "codes": ["23505"]}
+
+
+def test_dlq_samples_sent_to_the_model_carry_no_row_values() -> None:
+    """The tool said the failing row's key VALUE was excluded, but the message it sent kept
+    ' | pk: id=14' and the server's echo of the value (Key (email)=(a@b.c))."""
+    from dsql_migrator.ui.ai_tools import ai_safe_dlq_message
+
+    text = ai_safe_dlq_message(
+        'DLQ offset=5: duplicate key value violates unique constraint "ux_email" '
+        "Detail: Key (email)=(a@b.c) already exists. | pk: id=14 | op: c | sql: INSERT INTO x VALUES (?)"
+    )
+    assert "a@b.c" not in text and "id=14" not in text and "INSERT" not in text
+    assert 'violates unique constraint "ux_email"' in text and "| op: c" in text
+    assert "secret" not in ai_safe_dlq_message("violates check constraint \"c\" Failing row contains (1, secret).")

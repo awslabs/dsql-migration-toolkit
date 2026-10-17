@@ -23,6 +23,7 @@ avoids a circular import with ``ui/app.py`` while leaving the tool bodies unchan
 
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 # Imported at module level (as in app.py) so the tool bodies reference it as a bare
@@ -283,6 +284,37 @@ AI_TOOLS_SYSTEM_HINT = (
 )
 
 
+
+# The most objects one list tool returns; the count stays exact.
+_MAX_LISTED_OBJECTS = 200
+
+# get_converted_ddl's one-entry memo: the conversion of the current inventory (by identity),
+# foreign-key choice and engine -- a lookup used to re-convert the whole schema.
+_DDL_TOOL_MEMO: dict = {}
+
+# What a dead-letter reason may carry that is row DATA, not the reason: the sink's
+# " | pk: id=14" and " | sql: ..." sections, and PostgreSQL's own echo of a value
+# ("Key (email)=(a@b.c) already exists", "Failing row contains (...)", a "Detail:" line).
+_DLQ_ROW_DATA = (
+    re.compile(r"\s*\|\s*pk:[^|]*"),
+    re.compile(r"\s*\|\s*sql:.*", re.DOTALL),
+    re.compile(r"Key \((?P<cols>[^)]*)\)=\([^)]*\)"),
+    re.compile(r"Failing row contains \(.*?\)(?=\.|$)", re.DOTALL),
+    re.compile(r"\s*Detail:[^\n|]*"),
+)
+
+
+def ai_safe_dlq_message(text: str) -> str:
+    """``text`` with every row value removed, for a model (Property 7): the failing row's key
+    and the server's echo of a value go, the reason stays. Pure."""
+    out = text or ""
+    for pattern in _DLQ_ROW_DATA:
+        if "cols" in pattern.groupindex:
+            out = pattern.sub(lambda m: f"Key ({m.group('cols')})=(...)", out)
+        else:
+            out = pattern.sub("", out)
+    return re.sub(r"\s*\|\s*", " | ", re.sub(r"\s+\.$", ".", out)).strip()
+
 def build_ai_tool_executor(
     *,
     session_id: str,
@@ -357,7 +389,20 @@ def build_ai_tool_executor(
                 # previews with PG (not MySQL) semantics.
                 _sc = getattr(SESSION_STORE.get_or_create(session_id), "source_config", None)
                 _stype = _sc.source_type if _sc is not None else SourceType.MYSQL
-                _res = SchemaConverter(source_type=_stype).convert(_inv, SchemaConvertOptions())
+                # The DDL Schema Conversion shows and applies: its foreign-key choice, and the
+                # operator's edit (a primary-key strategy is stored as one) when there is
+                # one. Converted once per inventory, not on every lookup.
+                _cs = SCHEMA_CONVERSION_STORE.get_or_create(session_id)
+                _pfk = bool(getattr(_cs, "preserve_foreign_keys", True))
+                # One tuple, swapped whole: sessions on other threads never see half of it.
+                _entry = _DDL_TOOL_MEMO.get("entry")
+                if _entry and _entry[0] is _inv and _entry[1] == _pfk and _entry[2] is _stype:
+                    _res = _entry[3]
+                else:
+                    _res = SchemaConverter(source_type=_stype).convert(
+                        _inv, SchemaConvertOptions(preserve_foreign_keys=_pfk)
+                    )
+                    _DDL_TOOL_MEMO["entry"] = (_inv, _pfk, _stype, _res)
                 _pv = generate_previews(
                     [f"{TABLE_PREFIX}{_obj}", f"{VIEW_PREFIX}{_obj}"],
                     _inv, _res, existence_checker=None, source_type=_stype,
@@ -365,9 +410,13 @@ def build_ai_tool_executor(
                 _p = next((p for p in _pv if p.object_name == _obj), None)
                 if _p is None:
                     return _json.dumps({"status": "not_found", "object_name": _obj})
+                _edited_of = getattr(_cs, "get_edited_target_ddl", None)
+                _edited = _edited_of(_p.object_name) if callable(_edited_of) else None
                 return _json.dumps(
                     {"status": "ok", "object_name": _p.object_name,
-                     "source_ddl": _p.source_ddl, "target_ddl": _p.target_ddl}
+                     "source_ddl": _p.source_ddl,
+                     "target_ddl": _edited or _p.target_ddl,
+                     "edited": bool(_edited)}
                 )
             if name == "list_objects_by_status":
                 _ev = EVALUATION_STORE.get(session_id)
@@ -379,12 +428,15 @@ def build_ai_tool_executor(
                 _want = str(args.get("classification", "")).strip().upper()
                 if _want:
                     _items = [it for it in _items if it.classification.value == _want]
+                # Bounded: the count is exact, the list stops at the cap and says so.
+                _shown = _items[:_MAX_LISTED_OBJECTS]
                 return _json.dumps(
                     {"status": "ok", "count": len(_items),
+                     "listed": len(_shown), "truncated": len(_items) > len(_shown),
                      "objects": [
                          {"object_name": it.object_name, "kind": it.kind,
                           "classification": it.classification.value}
-                         for it in _items
+                         for it in _shown
                      ]}
                 )
             if name == "get_assessment":
@@ -987,7 +1039,7 @@ def build_ai_tool_executor(
                     # record list's (no source TRUNCATE "reload ... on the Full Load step").
                     _samples.append(
                         {"table": _tbl, "sqlstate": _code,
-                         "message": cdc_dlq_shown_message(r)[:400],
+                         "message": ai_safe_dlq_message(cdc_dlq_shown_message(r))[:400],
                          "occurred_at": _occ.isoformat() if _occ else None}
                     )
                     if len(_samples) >= 20:
@@ -1018,11 +1070,13 @@ def build_ai_tool_executor(
                     for r in (list(sch.tables) + list(sch.views))
                 ]
                 if name == "list_target_tables":
+                    _shown_rels = _rels[:_MAX_LISTED_OBJECTS]
                     return _json.dumps(
                         {"status": "ok", "count": len(_rels),
+                         "listed": len(_shown_rels), "truncated": len(_rels) > len(_shown_rels),
                          "objects": [
                              {"name": r.qualified_name, "kind": r.kind.value}
-                             for r in _rels
+                             for r in _shown_rels
                          ]}
                     )
                 _obj = str(args.get("object_name", "")).strip().lower()
