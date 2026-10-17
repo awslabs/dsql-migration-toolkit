@@ -652,6 +652,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "YEAR_TYPE",
         "TIME_TYPE",
         "EXPRESSION_INDEX",
+        "DEFAULT_DROPPED",
         "VIEW_UNSUPPORTED_SQL",
         "VIEW_DEFINITION_UNREADABLE",
         "GENERATED_COLUMN",

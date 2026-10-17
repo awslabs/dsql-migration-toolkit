@@ -1792,6 +1792,25 @@ def pg_index_not_preserved_rule() -> ConversionWarningRule:
     )
 
 
+_DEFAULT_DROPPED_ADVICE = (
+    "Before cut over, have the application supply these values, or add an equivalent "
+    "default with ALTER TABLE ... ALTER COLUMN ... SET DEFAULT after apply; a NOT NULL "
+    "column without its default rejects every INSERT that omits it."
+)
+
+
+def default_dropped_rule(*, is_postgres: bool = False) -> ConversionWarningRule:
+    """Column DEFAULTs Schema Conversion cannot carry (DEFAULT_DROPPED): a MySQL zero date
+    or an expression with no equivalent, a PostgreSQL default calling a function the target
+    lacks or casting to a type it lacks -- the converter's own decision and words."""
+    return ConversionWarningRule(
+        "DEFAULT_DROPPED",
+        "_pg_dropped_default_warning" if is_postgres else "_mysql_dropped_default_warning",
+        _DEFAULT_DROPPED_ADVICE,
+        EffortLevel.SIMPLE,
+    )
+
+
 def pg_unindexable_column_rule() -> ConversionWarningRule:
     """Keys and indexes over PostgreSQL json/jsonb/interval/timetz columns, which Aurora
     DSQL cannot index (PG_UNINDEXABLE_COLUMN)."""
@@ -2861,6 +2880,7 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         YearTypeRule(),
         TimeTypeRule(),
         expression_index_rule(),
+        default_dropped_rule(),
         GeneratedColumnRule(),
         AutoUpdateTimestampRule(),
         UnsupportedIndexTypeRule(),
@@ -3711,6 +3731,7 @@ __all__ = [
     "catalog_changed_items",
     "check_mixed_case_identifiers",
     "pg_unindexable_column_rule",
+    "default_dropped_rule",
     "default_rules",
     "CompatibilityAssessor",
     "render_text_report",

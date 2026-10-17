@@ -3739,6 +3739,79 @@ def _apply_pg_generated_columns(
         column_def.set("constraints", constraints)
 
 
+def dropped_default_notes(
+    table: TableDef, *, is_postgres: bool
+) -> "list[tuple[ColumnDef, str]]":
+    """``(column, note)`` for each source DEFAULT the conversion cannot carry, worded as
+    Schema Conversion's per-column warning (a NOT NULL column's note says an INSERT that
+    omits it is then rejected). The generated column's value and the generated key are
+    governed elsewhere and never listed. Shared with Evaluation (DEFAULT_DROPPED). Pure."""
+    notes: list[tuple[ColumnDef, str]] = []
+    if is_postgres:
+        from dsql_migrator.core.converter_postgres import pg_column_default_sql
+
+        for column in table.columns:
+            if column.name == table.auto_increment_column:
+                continue
+            _emitted, reason = pg_column_default_sql(
+                column, is_key_column=column.name in table.primary_key
+            )
+            if reason is None:
+                continue
+            message = f"Column '{column.name}' " + reason
+            if not column.nullable:
+                message += (
+                    " This column is NOT NULL, so an INSERT that omits it succeeds "
+                    "on the source but is REJECTED on Aurora DSQL -- set the value "
+                    "explicitly before cutting over."
+                )
+            notes.append((column, message))
+        return notes
+    for column in table.columns:
+        if column.default is None or column.generated:
+            continue
+        if column.name == table.auto_increment_column:
+            continue
+        emitted, reason = _resolve_column_default(column)
+        if reason is None:
+            continue
+        if not column.nullable and emitted is None:
+            reason += (
+                " This column is NOT NULL, so an INSERT that omits it succeeds on "
+                "MySQL but will be REJECTED on Aurora DSQL -- set the value "
+                "explicitly in the application before cutting over."
+            )
+        notes.append((column, reason))
+    return notes
+
+
+def _dropped_default_warning(table: TableDef, *, is_postgres: bool) -> Optional[ConversionWarning]:
+    """The table's dropped DEFAULTs as one note, for Evaluation (DEFAULT_DROPPED). A
+    PostgreSQL sequence DEFAULT is left to NON_KEY_SEQUENCE, which says the same."""
+    from dsql_migrator.core.converter_postgres import pg_nextval_sequence
+
+    notes = [
+        message
+        for column, message in dropped_default_notes(table, is_postgres=is_postgres)
+        if not (is_postgres and (column.identity or pg_nextval_sequence(column.default)))
+    ]
+    if not notes:
+        return None
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        message=" ".join(notes),
+    )
+
+
+def _mysql_dropped_default_warning(table: TableDef) -> Optional[ConversionWarning]:
+    return _dropped_default_warning(table, is_postgres=False)
+
+
+def _pg_dropped_default_warning(table: TableDef) -> Optional[ConversionWarning]:
+    return _dropped_default_warning(table, is_postgres=True)
+
+
 def _apply_pg_column_defaults(
     create: exp.Expression,
     table: TableDef,
@@ -5591,20 +5664,9 @@ class SchemaConverter:
         # a NOT NULL column losing its default is a functional break (an application
         # INSERT that omits the column succeeds on MySQL and is REJECTED on the target),
         # whereas a nullable column merely starts defaulting to NULL.
-        for column in (() if is_postgres else table.columns):
-            if column.default is None or column.generated:
-                continue
-            if column.name == table.auto_increment_column:
-                continue
-            _emitted, default_warning = _resolve_column_default(column)
-            if default_warning is None:
-                continue
-            if not column.nullable and _emitted is None:
-                default_warning += (
-                    " This column is NOT NULL, so an INSERT that omits it succeeds on "
-                    "MySQL but will be REJECTED on Aurora DSQL -- set the value "
-                    "explicitly in the application before cutting over."
-                )
+        for column, default_warning in (
+            () if is_postgres else dropped_default_notes(table, is_postgres=False)
+        ):
             warnings.append(
                 ConversionWarning(
                     object_name=table.name,
@@ -5843,21 +5905,7 @@ class SchemaConverter:
             # computed value is governed elsewhere and yields no reason. Mirrors the MySQL
             # default-loss loop, which likewise skips the auto_increment column and reports
             # only the genuinely-dropped ones.
-            for column in table.columns:
-                if column.name == table.auto_increment_column:
-                    continue
-                _emitted, drop_reason = pg_column_default_sql(
-                    column, is_key_column=column.name in table.primary_key
-                )
-                if drop_reason is None:
-                    continue
-                message = f"Column '{column.name}' " + drop_reason
-                if not column.nullable:
-                    message += (
-                        " This column is NOT NULL, so an INSERT that omits it succeeds "
-                        "on the source but is REJECTED on Aurora DSQL -- set the value "
-                        "explicitly before cutting over."
-                    )
+            for column, message in dropped_default_notes(table, is_postgres=True):
                 warnings.append(
                     ConversionWarning(
                         object_name=table.name,
@@ -6332,6 +6380,7 @@ __all__ = [
     "parse_target_column_constraints",
     "parse_target_column_default_texts",
     "views_in_dependency_order",
+    "dropped_default_notes",
     "parse_target_column_types",
     "parse_target_identity_columns",
     "parse_target_primary_key",

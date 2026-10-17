@@ -34,6 +34,8 @@ _EXPECTED_PG_RULE_IDS = {
     # PG-specific conversion warnings, decided by the converter's own helpers.
     "PG_INDEX_NOT_PRESERVED",
     "PG_UNINDEXABLE_COLUMN",
+    # A column DEFAULT the conversion cannot carry (shared with MySQL, PG decision).
+    "DEFAULT_DROPPED",
     "PG_COLLATION_DROPPED",
     # PG-specific: a view over columns the conversion re-types.
     "VIEW_REMODELLED_COLUMN",

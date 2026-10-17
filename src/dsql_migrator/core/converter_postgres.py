@@ -127,6 +127,9 @@ def pg_column_default_sql(
         literal = _pg_enum_default_literal(raw, column.enum_labels)
         if literal is not None:
             return literal, None
+    raw, function_reason = _pg_default_functions(raw)
+    if function_reason is not None:
+        return None, function_reason
     bad_type = _pg_default_unsupported_type(raw)
     if bad_type is not None:
         return None, (
@@ -137,6 +140,56 @@ def pg_column_default_sql(
             "after apply."
         )
     return raw, None
+
+
+# uuid-ossp's random UUID, as a DEFAULT names it (bare when the extension sits on the
+# search_path, else schema-qualified): Aurora DSQL has no uuid-ossp, and its built-in
+# gen_random_uuid() returns the same thing, a version-4 UUID.
+_UUID_V4_DEFAULT_RE = re.compile(
+    r'(?<![\w$."])(?:(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*\.\s*)?uuid_generate_v4\s*\(\s*\)',
+    re.IGNORECASE,
+)
+# The other uuid-ossp generators (time-based or name-based): no Aurora DSQL equivalent.
+_UUID_OSSP_OTHER_RE = re.compile(
+    r"(?<![\w$])(uuid_generate_v1mc|uuid_generate_v1|uuid_generate_v3|uuid_generate_v5|"
+    r"uuid_nil|uuid_ns_\w+)\s*\(",
+    re.IGNORECASE,
+)
+# A schema-qualified function call; pg_get_expr qualifies a function that is not on the
+# search_path, which a built-in (pg_catalog) never needs.
+_QUALIFIED_CALL_RE = re.compile(
+    r'(?<![\w$."])((?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*))\s*\.\s*((?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*))\s*\('
+)
+_SQL_STRING_RE = re.compile(r"'(?:[^']|'')*'")
+
+
+def _pg_default_functions(raw: str) -> "tuple[str, Optional[str]]":
+    """``(default, None)`` with uuid-ossp's ``uuid_generate_v4()`` made Aurora DSQL's
+    ``gen_random_uuid()``, or ``(raw, reason)`` for a default that calls a function the
+    target does not have: another uuid-ossp generator, or a schema-qualified function
+    outside pg_catalog (an extension's or the application's own). Carried verbatim, either
+    made the CREATE TABLE fail at apply."""
+    translated = _UUID_V4_DEFAULT_RE.sub("gen_random_uuid()", raw)
+    code = _SQL_STRING_RE.sub("''", translated)  # never a name inside a string literal
+    other = _UUID_OSSP_OTHER_RE.search(code)
+    if other is not None:
+        return raw, (
+            f"source default ({raw}) calls {other.group(1)}(), a uuid-ossp function Aurora "
+            "DSQL does not have, so the column is created without a default. Generate the "
+            "value in the application, or use gen_random_uuid() (a random version-4 UUID) "
+            "with ALTER TABLE ... SET DEFAULT after apply if that is acceptable."
+        )
+    for match in _QUALIFIED_CALL_RE.finditer(code):
+        schema = match.group(1).strip('"')
+        if schema.lower() != "pg_catalog":
+            name = f"{match.group(1)}.{match.group(2)}"
+            return raw, (
+                f"source default ({raw}) calls {name}(), a function outside pg_catalog that "
+                "Aurora DSQL does not have unless you create it, so the column is created "
+                "without a default. Generate the value in the application, or create an "
+                "equivalent and add the default with ALTER TABLE ... SET DEFAULT after apply."
+            )
+    return translated, None
 
 
 # PostgreSQL spellings of bigint, the only type Aurora DSQL allows an identity on.

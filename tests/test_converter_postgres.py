@@ -1903,3 +1903,24 @@ def test_a_partial_index_predicate_is_carried_unless_it_reads_a_retyped_column()
     (note,) = [w for w in r.warnings if "cannot be carried" in w.message]
     assert "ix_vip is created as a FULL index" in note.message
     assert "ux_vip is UNIQUE and NOT emitted" in note.message and "(tags)" in note.message
+
+
+def test_a_uuid_ossp_default_becomes_gen_random_uuid_and_a_foreign_function_is_dropped() -> None:
+    """uuid_generate_v4() does not exist on Aurora DSQL (checked live on 2026-10-16), so a
+    DEFAULT carried verbatim made the CREATE TABLE fail at apply over a table Evaluation
+    read AUTO."""
+    table = TableDef(
+        name="app.accounts",
+        columns=[
+            ColumnDef(name="id", mysql_type="uuid", nullable=False, default="public.uuid_generate_v4()"),
+            ColumnDef(name="code", mysql_type="text", nullable=False, default="app.next_code()"),
+            ColumnDef(name="v1", mysql_type="uuid", default="uuid_generate_v1mc()"),
+        ],
+        primary_key=["id"],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert '"id" UUID NOT NULL DEFAULT gen_random_uuid()' in r.target_ddl
+    assert "uuid_generate" not in r.target_ddl and "next_code" not in r.target_ddl
+    notes = {w.column_name: w.message for w in r.warnings if w.column_name in ("code", "v1")}
+    assert "app.next_code()" in notes["code"] and "REJECTED on Aurora DSQL" in notes["code"]
+    assert "uuid-ossp function" in notes["v1"]
