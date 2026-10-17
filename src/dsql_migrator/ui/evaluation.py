@@ -747,28 +747,12 @@ def sort_assessment_items(items: list) -> list:
 
     Primary key is classification severity (UNSUPPORTED > MANUAL > AUTO),
     secondary key is estimated effort (SIGNIFICANT > MEDIUM > SIMPLE > none), and
-    ties break by object name for a stable, readable order.
+    ties break by object name for a stable, readable order -- the exports' order too
+    (:func:`~dsql_migrator.core.assessor.importance_order`).
     """
-    from dsql_migrator.core.models import Classification, EffortLevel
+    from dsql_migrator.core.assessor import importance_order
 
-    severity = {
-        Classification.UNSUPPORTED: 2,
-        Classification.MANUAL: 1,
-        Classification.AUTO: 0,
-    }
-    effort_rank = {
-        EffortLevel.SIGNIFICANT: 3,
-        EffortLevel.MEDIUM: 2,
-        EffortLevel.SIMPLE: 1,
-    }
-    return sorted(
-        items,
-        key=lambda item: (
-            -severity.get(item.classification, 0),
-            -effort_rank.get(item.effort, 0),
-            item.object_name,
-        ),
-    )
+    return importance_order(items)
 
 
 def filter_assessment_items(
@@ -2360,12 +2344,15 @@ def _build_guidance_drawer(
         # that specific finding; the object-level fallback (concern None) keeps the
         # whole-object question. Either way the streamer grounds on the whole item.
         rule = getattr(concern, "rule_id", None)
+        # The KIND is part of the id: a trigger, an event or a routine may share its name
+        # with a table, and a shared id reopened the other object's conversation instead
+        # of asking about this one.
         if concern is not None and rule:
-            scope_id = f"evaluation:{item.object_name}:{rule}"
+            scope_id = f"evaluation:{item.kind}:{item.object_name}:{rule}"
             subtitle = f"{item.object_name} \u00b7 {rule}"
             seed = _concern_question(item, concern)
         else:
-            scope_id = f"evaluation:{item.object_name}"
+            scope_id = f"evaluation:{item.kind}:{item.object_name}"
             subtitle = f"{item.object_name} \u00b7 {item.kind}"
             seed = _guidance_question(item)
         open_ai_scope(
@@ -3131,9 +3118,9 @@ def _render_item_ai_action(
         disabled.props("flat round dense size=sm color=grey-5")
         disabled.disable()  # type: ignore[attr-defined]
         disabled.tooltip(  # type: ignore[attr-defined]
-            "Enable AI Assist on the Connect screen (toggle it on, set the Bedrock "
-            "model, and re-test the connection) to get on-demand guidance for this "
-            "finding."
+            "AI DBA is not available: turn AI Assist on in the Connect screen (set the "
+            "Bedrock model and re-test), or, if Amazon Bedrock denied access, fix the "
+            "permission or model access and re-verify AI access there."
         )
 
 

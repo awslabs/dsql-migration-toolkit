@@ -702,7 +702,8 @@ def test_unsupported_index_type_rule_flags_fulltext_spatial() -> None:
     )
     item = _item_for(_assess(SourceInventory(tables=[table])), "articles")
     assert item.rule_id == "UNSUPPORTED_INDEX_TYPE"
-    assert item.classification is Classification.UNSUPPORTED
+    # The table migrates; only the full-text search is lost -- graded as the conversion does.
+    assert item.classification is Classification.MANUAL
     assert "ft_body" in item.risk and "ix_name" not in item.risk
 
 
@@ -2369,3 +2370,16 @@ def test_a_table_without_a_primary_key_names_its_natural_key() -> None:
     (finding,) = NoPrimaryKeyRule().evaluate(SourceInventory(tables=[table]))
     assert "Aurora DSQL can create a table without one" in finding.risk
     assert "ux_code (code)" in finding.recommendation and "ux_note" not in finding.recommendation
+
+
+def test_human_exports_read_in_the_screens_order_and_never_round_to_zero() -> None:
+    """The text and HTML exports listed objects in inventory order while the screen sorts
+    them by importance, and a chart caption read '0% need attention' over 1 of 1,000."""
+    from dsql_migrator.core.assessor import _attention_share, render_text_report
+
+    report = _assess(_representative_inventory())
+    text = render_text_report(report)
+    lines = [line for line in text.splitlines() if line.startswith("- ")]
+    assert lines and "[UNSUPPORTED]" in lines[0]
+    assert _attention_share(1, 1000) == "<1%" and _attention_share(999, 1000) == ">99%"
+    assert _attention_share(1, 2) == "50%"

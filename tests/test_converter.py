@@ -2256,15 +2256,14 @@ def test_fulltext_index_conversion_reports_the_lost_capability() -> None:
     # LOSS, not RECOMMENDATION: there is no target-side substitute, unlike partitioning
     # (where DSQL's own distribution replaces the mechanism).
     assert note.kind is ConversionNoteKind.LOSS
-    assert note.classification is Classification.UNSUPPORTED
+    # MANUAL: the table and its data migrate; the search the index served does not.
+    assert note.classification is Classification.MANUAL
     assert "ft_body" in note.message
-    # It says what actually happens for FULLTEXT (the index IS created on a text column,
-    # just not equivalent) and what to do instead.
-    assert "not equivalent" in note.message.lower()
+    # It says what happens -- the index is NOT emitted (a btree stand-in serves no
+    # MATCH ... AGAINST and fails on long values) -- and what to do instead.
+    assert "NOT emitted" in note.message
     assert "OpenSearch" in note.message
-    # The DDL is unchanged for a FULLTEXT index on a text column -- this adds a note, it
-    # does not alter output (only a bytea/spatial-column index is skipped).
-    assert any("ft_body" in ddl for ddl in result.index_ddls)
+    assert not any("ft_body" in ddl for ddl in result.index_ddls)
 
 
 def test_spatial_index_is_reported_too_and_plain_indexes_are_not() -> None:

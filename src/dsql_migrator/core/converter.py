@@ -2868,6 +2868,10 @@ def _emittable_secondary_indexes(
     for index in table.indexes:
         if index.name in expression_index_names:
             continue
+        # FULLTEXT/SPATIAL have no DSQL equivalent (reported by
+        # _unsupported_index_type_warning): a btree stand-in serves none of their queries.
+        if (index.index_type or "").strip().lower() in _UNSUPPORTED_INDEX_TYPES:
+            continue
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
             continue
         if any(column in skip_columns for column in index.columns):
@@ -4443,15 +4447,16 @@ def _unsupported_index_type_warning(table: TableDef) -> Optional[ConversionWarni
     names = ", ".join(flagged)
     return ConversionWarning(
         object_name=table.name,
-        classification=Classification.UNSUPPORTED,
+        # The table and its data migrate; the search the index served does not -- a gap
+        # to plan around, not a table that cannot move.
+        classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
         message=(
-            f"Aurora DSQL has no FULLTEXT or SPATIAL index type ({names}). A FULLTEXT "
-            "index is emitted as an ordinary CREATE INDEX ASYNC on the same column(s), "
-            "which is created but is NOT equivalent (MATCH ... AGAINST cannot use it). A "
-            "SPATIAL index is on a geometry column, which converts to bytea — and DSQL "
-            "cannot index bytea — so it CANNOT be created and is NOT emitted at all. "
-            "Either way the original search capability is gone: move that search outside "
+            f"Aurora DSQL has no FULLTEXT or SPATIAL index type ({names}), so these "
+            "indexes are NOT emitted: a btree over the same text column would serve no "
+            "MATCH ... AGAINST and fail on long values, and a SPATIAL index is on a geometry "
+            "column, which converts to bytea, which DSQL cannot index. The table and its "
+            "data migrate, but the search those indexes served is gone: move it outside "
             "the database (e.g. Amazon OpenSearch Service) or redesign the query."
         ),
     )

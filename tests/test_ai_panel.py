@@ -1371,3 +1371,39 @@ def test_g20_ai_settings_key_is_by_value() -> None:
     state.ai_assist.region = "us-west-2"  # in place
     assert ai_settings_key(state) != before
     assert ai_settings_key(None) == (False, None, None, None)
+
+
+def test_a_reply_lands_in_the_scope_it_was_asked_in_and_a_queued_seed_is_asked() -> None:
+    """Opening another object's AI while a reply streamed: the reply landed as the NEW
+    scope's first turn (its next question went out with another object's answer, an
+    assistant turn first), and the new scope's seed question was dropped."""
+    import threading
+
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    gate = threading.Event()
+
+    def slow(messages, on_delta):  # noqa: ANN001
+        gate.wait(5)
+        on_delta("A1")
+        return ObjectGuidanceOutcome(available=True, reason="OK", detail="", markdown="A1")
+
+    panel.open_scope(scope_id="eval:orders", title="orders", streamer=slow, seed_question="Q1")
+    first = ui.timers[-1]
+    second_sent: list = []
+    panel.open_scope(
+        scope_id="eval:items", title="items",
+        streamer=_make_streamer("A2", record=second_sent), seed_question="Q2",
+    )
+    gate.set()
+    for _ in range(400):  # finish the first turn; that asks the queued Q2
+        if not first.active:
+            break
+        first.cb()
+        time.sleep(0.003)
+    _pump(ui)
+    texts = [m["text"] for m in state.ai_conversation.messages]
+    assert texts == ["Q1", "A1", "Q2", "A2"]
+    # The items scope's window held only its own question.
+    assert second_sent and [m["text"] for m in second_sent[0]] == ["Q2"]

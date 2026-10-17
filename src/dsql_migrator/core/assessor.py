@@ -1978,38 +1978,35 @@ class AutoUpdateTimestampRule(Rule):
 
 
 class UnsupportedIndexTypeRule(Rule):
-    """Flag FULLTEXT/SPATIAL indexes (no Aurora DSQL equivalent)."""
+    """Flag FULLTEXT/SPATIAL indexes (no Aurora DSQL equivalent).
+
+    MANUAL/LOSS, not UNSUPPORTED: the table and its data migrate; only the search the index
+    served is gone (the conversion leaves the index out). The risk is the converter's own
+    note (:func:`converter._unsupported_index_type_warning`), so both steps say the same."""
 
     rule_id = "UNSUPPORTED_INDEX_TYPE"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import _unsupported_index_type_warning
+
         findings: list[Finding] = []
         for table in inventory.tables:
-            flagged = [
-                f"{index.name} ({index.index_type})"
-                for index in table.indexes
-                if index.index_type
-                and index.index_type.lower() in _UNSUPPORTED_INDEX_TYPES
-            ]
-            if flagged:
-                names = ", ".join(flagged)
-                findings.append(
-                    Finding(
-                        object=ObjectKey(KIND_TABLE, table.name),
-                        rule_id=self.rule_id,
-                        classification=Classification.UNSUPPORTED,
-                        risk=(
-                            f"Indexes ({names}) use a MySQL index type Aurora "
-                            "DSQL does not support (FULLTEXT/SPATIAL)."
-                        ),
-                        recommendation=(
-                            "Drop the index and implement full-text/spatial "
-                            "search outside the database (e.g. Amazon OpenSearch "
-                            "Service), or redesign the query."
-                        ),
-                        effort=EffortLevel.SIGNIFICANT,
-                    )
+            warning = _unsupported_index_type_warning(table)
+            if warning is None:
+                continue
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, table.name),
+                    rule_id=self.rule_id,
+                    classification=warning.classification,
+                    risk=warning.message,
+                    recommendation=(
+                        "Implement full-text/spatial search outside the database (e.g. "
+                        "Amazon OpenSearch Service), or redesign the query, before cut over."
+                    ),
+                    effort=EffortLevel.SIGNIFICANT,
                 )
+            )
         return findings
 
 
@@ -3118,6 +3115,33 @@ class CompatibilityAssessor:
 # ---------------------------------------------------------------------------
 
 
+def importance_order(items: "Sequence[AssessmentItem]") -> "list[AssessmentItem]":
+    """``items`` most critical first: UNSUPPORTED > MANUAL > AUTO, then effort SIGNIFICANT >
+    MEDIUM > SIMPLE > none, then the name -- the screen's order, so an export reads in the
+    same order as the report it was taken from. Pure."""
+    severity = {Classification.UNSUPPORTED: 2, Classification.MANUAL: 1, Classification.AUTO: 0}
+    effort_rank = {EffortLevel.SIGNIFICANT: 3, EffortLevel.MEDIUM: 2, EffortLevel.SIMPLE: 1}
+    return sorted(
+        items,
+        key=lambda item: (
+            -severity.get(item.classification, 0),
+            -effort_rank.get(item.effort, 0),
+            item.object_name,
+        ),
+    )
+
+
+def _attention_share(attention: int, total: int) -> str:
+    """``attention / total`` as a whole percentage that never reads 0% or 100% when it is
+    neither (1 of 1,000 is "<1%", not "0%")."""
+    share = attention / total * 100
+    if 0 < share < 1:
+        return "<1%"
+    if 99 < share < 100:
+        return ">99%"
+    return f"{round(share)}%"
+
+
 def render_text_report(
     report: AssessmentReport,
     *,
@@ -3144,7 +3168,7 @@ def render_text_report(
         lines.append(f"  {level.value}: {report.effort_summary.get(level, 0)}")
     lines.append("")
     lines.append(f"Items ({len(report.assessed_items)}):")
-    for item in report.assessed_items:
+    for item in importance_order(report.assessed_items):
         effort = item.effort.value if item.effort is not None else "NONE"
         lines.append(
             f"- {item.object_name} [{item.classification.value}] "
@@ -3221,6 +3245,8 @@ def export_report(
                 re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_"): value
                 for label, value in metadata
             }
+        # The report's own order (the human-read text and HTML are sorted by importance):
+        # the JSON reloads as the same report.
         data.update(
             report.model_copy(update={"items": report.assessed_items}).model_dump(mode="json")
         )
@@ -3351,7 +3377,7 @@ def _render_html_chart(report: AssessmentReport) -> str:
         attention = total - by_class[Classification.AUTO]
         meta = f"{total} object{'s' if total != 1 else ''}"
         if attention:
-            meta += f" &middot; {round(attention / total * 100)}% need attention"
+            meta += f" &middot; {_attention_share(attention, total)} need attention"
         rows.append(
             '<div class="bar-row">'
             f'<div class="bar-label">{html.escape(kind_label(kind))}</div>'
@@ -3535,7 +3561,7 @@ def render_html_report(
     )
 
     rows = []
-    for item in report.assessed_items:
+    for item in importance_order(report.assessed_items):
         color = _HTML_CLASS_COLOR.get(item.classification, "#ffffff")
         effort = item.effort.value if item.effort is not None else "-"
         # ONE ROW PER CONCERN, with the object/kind cells spanning them. A single row
@@ -3778,6 +3804,7 @@ __all__ = [
     "check_mixed_case_identifiers",
     "pg_unindexable_column_rule",
     "default_dropped_rule",
+    "importance_order",
     "default_rules",
     "CompatibilityAssessor",
     "render_text_report",
