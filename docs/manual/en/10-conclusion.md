@@ -47,8 +47,9 @@ replication; otherwise Full Load alone is simpler and cheaper.
 
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
 2. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
-   item (PK, triggers, routines, spatial types, precision > 38) and decide each
-   **MANUAL** item (cascade FKs that CDC can't replicate, partitioning,
+   item (no primary key, triggers, routines, FULLTEXT/SPATIAL indexes, PostgreSQL types
+   with no DSQL equivalent) and decide each
+   **MANUAL** item (cascade FKs that CDC can't replicate, partitioning, spatial types,
    `ENUM`/`SET`, oversized LOB/JSON columns — check their sizes first, etc.).
    *Don't skip this* — it's what turns "the load failed mysteriously" into "I knew
    that object needed changing." It is also where you learn whether CDC is viable

@@ -298,7 +298,7 @@ Evaluation は **すべてのオブジェクト** を、**AUTO**（自動的に�
 | `TINYINT(1)` | `boolean` | MySQL の boolean 慣例。 |
 | `…INT UNSIGNED`（符号なし整数） | `smallint` / `integer` / `bigint` / `numeric(20,0)` | より広い型に **無損失で** 拡張。 |
 | `BIT(n)` | サイズ付き整数（`smallint`…`numeric(20,0)`） | DSQL に `BIT` 型はない。 |
-| `DECIMAL(p,s)` | `numeric(p,s)` | 精度 > 38 は非対応。 |
+| `DECIMAL(p,s)` | `numeric(p,s)` | 精度とスケールを維持（Aurora DSQL は精度 1000 まで許可）。 |
 | `DATETIME` | `timestamp`（UTC） | UTC に正規化。 |
 | `ENUM` | `text` + `CHECK` | DSQL に `ENUM` はない。 |
 | `BLOB` / `BINARY` | `bytea` | 生バイトを保持。 |
@@ -312,12 +312,13 @@ Evaluation は **すべてのオブジェクト** を、**AUTO**（自動的に�
 **PostgreSQL ソース** の場合、変換とデータパスは **ほぼ同一（near-identity）の PG-16 → DSQL パススルー** です
 — DSQL がサポートする型（整数系、`numeric`/`decimal`、`char`/`varchar`/`text`、date/time/`timestamp[tz]`、
 `interval`、`boolean`、`bytea`、`uuid`、`json`、`jsonb`）は MySQL 式の変換なしに **そのまま** 引き継がれます。
-DSQL に相当のない PostgreSQL 型は **UNSUPPORTED** としてフラグが立ち（自動置換はされません）、再モデリングが
-必要です: 配列 → `jsonb` / 子テーブル、幾何（geometric）・ネットワーク（`inet`/`cidr`/`macaddr`）・`xml`・
+DSQL に相当のない PostgreSQL 型は **UNSUPPORTED** としてフラグが立ち、再モデリングが必要です（値を保つ
+代替型がある場合、Schema Conversion は型の変更を示す警告付きでそれを出力し、黙って置き換えることはありません）: 配列 → `jsonb` / 子テーブル、幾何（geometric）・ネットワーク（`inet`/`cidr`/`macaddr`）・`xml`・
 `bit`/`varbit`・`tsvector`/`tsquery`・`range` / マルチレンジ → `text`、`money` → `numeric`、
-`pgvector` → `jsonb`/`text`、`enum` → `text`、composite → 列 / `jsonb`。`numeric(p,s)` で p > 38 は警告付きで
-クランプされ、素の `numeric`/`decimal` は DSQL の `numeric(18,6)` になり、列の `DEFAULT` / `serial` /
-identity の `nextval` は **出力されません**（identity は PK 戦略が管理）。`STORED` 生成列は **保持**され
+`pgvector` → `jsonb`/`text`、`enum` → `text`、composite → 列 / `jsonb`。`numeric(p,s)` はそのまま維持され
+（Aurora DSQL も PostgreSQL と同じ精度 1000 を許可）、素の `numeric`/`decimal` は DSQL の `numeric(18,6)` になり、
+列の `DEFAULT` は **記述どおり** 維持されます（`nextval` は例外: キーのものは PK 戦略が管理し、キー以外のものは値を
+生成し続ける方法とともに除外。DSQL に相当のない既定値も報告とともに除外）。`STORED` 生成列は **保持**され
 （Aurora DSQL が対応し値を維持します）、`VIRTUAL` 生成列は通常の列になりアプリケーションでの再計算が必要です。
 型と制約のリファレンスは
 [第 2 章 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-の型と制約の処理-リファレンス) をご覧ください。

@@ -1604,6 +1604,10 @@ def test_restored_session_keeps_the_source_engine_on_the_evaluation_result() -> 
     )
     assert restored.result is not None
     assert restored.result.source_type is SourceType.POSTGRES
+    # The exported report's header names the assessed source by its address (the engine
+    # version is read again by the next source test; the run time is not kept).
+    assert restored.result.source_label == "pg.example.com:5432/app"
+    assert restored.result.assessed_at is None
 
     # A MySQL snapshot (and an older one with no engine recorded) still restores MySQL.
     mysql_snapshot = capture_session_snapshot(

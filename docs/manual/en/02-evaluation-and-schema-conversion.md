@@ -161,7 +161,13 @@ On screen, the list shows the objects by kind, most critical first. A kind with 
 do opens on its own; each kind shows 50 objects at a time with a page control, and an
 object's risks and recommendations appear when you expand its row. The
 **Classification** and **Estimated manual effort** filters and the **Filter objects by
-name** box narrow the list. The HTML, JSON and Text exports always list every object.
+name** box narrow the list. The HTML, JSON and Text exports always list every object, and each
+opens with what it describes: the source (engine and address, never a credential), the target
+endpoint, when it was exported (and when the assessment ran, for a run made since the app last
+started), the tool version, the readiness band with
+its counts, and what the effort levels mean. Each also lists the names that already exist or
+are held on the target. The file name carries the database (or host) and the export time, so
+two exports do not overwrite each other.
 
 ### The migration readiness score
 

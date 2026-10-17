@@ -85,7 +85,7 @@ stored procedures, and several types.
 |---|---|---|
 | Foreign keys enforced | An FK-laden source | Each source FK is preserved and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT` (deferred to cut over for a CDC migration), gated by an orphan pre-check; Validation's **orphan check** is that pre-apply gate (and the safety net when FKs are stripped) (`test_orphan_records_are_detected_and_fail_the_match`) |
 | Primary key required | A table with **no** PK; a **composite** PK | No-PK is blocked up front (`UNSUPPORTED`) and keyset export refuses it; composite PK loads via an explicit lexicographic-disjunction keyset predicate (`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`) — deliberately **not** the row-value tuple form, which isn't PK-index-friendly on MySQL 5.7+ (`test_exporter.py`, scenario doc) |
-| Unsupported types/objects | **MySQL:** `DECIMAL` precision > 38, > 255 columns, triggers/routines. **PostgreSQL:** unsupported column types — arrays, geometric (point/line/box/…), network (inet/cidr/macaddr), xml, money, bit/bit varying, tsvector/tsquery, range/multirange, enum, composite, pgvector | Flagged `UNSUPPORTED` in Evaluation with a reason and **never auto-substituted** (`test_converter.py`, assessor tests). Behavioral difference: a PG `numeric(p,s)` with p > 38 is **clamped** with a warning (not rejected like MySQL `DECIMAL` > 38), and a bare `numeric`/`decimal` defaults to `numeric(18,6)` |
+| Unsupported types/objects | **MySQL:** > 255 columns, triggers/routines, FULLTEXT/SPATIAL indexes. **PostgreSQL:** unsupported column types — arrays, geometric (point/line/box/…), network (inet/cidr/macaddr), xml, money, bit/bit varying, tsvector/tsquery, range/multirange, enum, composite, pgvector | Flagged `UNSUPPORTED` in Evaluation with a reason and the remodel target; where a stand-in keeps the value (an array as `jsonb`, a range or network type as `text`, `money` as `numeric`, an enum as `text` with a `CHECK`), Schema Conversion emits it **with a warning** naming the type change the application must follow — never silently (`test_converter.py`, assessor tests). A bare PG `numeric`/`decimal` is stored as `numeric(18,6)` (flagged `MANUAL`). Numeric precision is no longer a gate: Aurora DSQL allows 1000, beyond MySQL's 65 and equal to PostgreSQL's own limit |
 | TINYINT(1) → boolean, out of range (MySQL source only) | A `TINYINT(1)` holding `2` | A **loud, table-fatal** error — refuses to flatten `2` to `true` (no silent corruption). A PostgreSQL source has a native `boolean` that passes through unchanged, so it has no analogous flattening risk |
 | Type heterogeneity (MySQL → PG dialect; PostgreSQL source is near-identity pass-through) | Max type-diversity schema | Full Load (Python) and CDC sink (Java) must encode each value to the **identical** stored form — enforced by a shared **write-contract** parity test (`test_dsql_write_contract.py`). For a MySQL source this includes the MySQL→PostgreSQL dialect translation; for a PostgreSQL source there is no translation (both source and DSQL target are PostgreSQL-16 wire), so both loaders pass the value through verbatim — but the parity requirement still holds for both engines |
 
@@ -150,8 +150,8 @@ hit as many DSQL characteristics as possible in one run:
 
 - A parent → child / lob foreign-key chain (forces the **FK-preservation** + **PK** +
   **orphan-check** scenarios).
-- Maximum type diversity — every integer/unsigned variant, `DECIMAL` incl.
-  precision > 38, `FLOAT`/`DOUBLE`, `BIT`, collation, the full DATE/TIME family,
+- Maximum type diversity — every integer/unsigned variant, `DECIMAL` up to
+  MySQL's maximum (65,30), `FLOAT`/`DOUBLE`, `BIT`, collation, the full DATE/TIME family,
   `ENUM`/`SET`/`JSON`, and the full LOB family (forces the **type-heterogeneity**
   and **unsupported-type** scenarios).
 - **Deliberately failing rows**: ~1.5 MiB LOB values (forces the **1 MiB

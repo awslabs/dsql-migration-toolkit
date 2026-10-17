@@ -329,7 +329,7 @@ For a **MySQL source**, here are the highlights:
 | `TINYINT(1)` | `boolean` | MySQL's boolean convention. |
 | `…INT UNSIGNED` (unsigned integers) | `smallint` / `integer` / `bigint` / `numeric(20,0)` | Widened **losslessly** to a wider type. |
 | `BIT(n)` | sized integer (`smallint`…`numeric(20,0)`) | DSQL has no `BIT` type. |
-| `DECIMAL(p,s)` | `numeric(p,s)` | Precision > 38 is unsupported. |
+| `DECIMAL(p,s)` | `numeric(p,s)` | Precision and scale kept (Aurora DSQL allows precision up to 1000). |
 | `DATETIME` | `timestamp` (UTC) | Normalized to UTC. |
 | `ENUM` | `text` + `CHECK` | DSQL has no `ENUM`. |
 | `BLOB` / `BINARY` | `bytea` | Raw bytes preserved. |
@@ -344,13 +344,16 @@ write-contract test enforces it), so a row lands the same whichever path migrate
 PG-16 → DSQL pass-through** — DSQL-supported types (the int family, `numeric`/`decimal`,
 `char`/`varchar`/`text`, date/time/`timestamp[tz]`, `interval`, `boolean`, `bytea`,
 `uuid`, `json`, `jsonb`) carry over **verbatim**, with no MySQL-style translation.
-PostgreSQL types with no DSQL equivalent are flagged **UNSUPPORTED** (never
-auto-substituted) and must be remodeled: arrays → `jsonb` / child table; geometric,
+PostgreSQL types with no DSQL equivalent are flagged **UNSUPPORTED** and must be
+remodeled; where a stand-in keeps the value, Schema Conversion emits it with a warning
+naming the type change (never silently): arrays → `jsonb` / child table; geometric,
 network (`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`, `tsvector`/`tsquery`,
 `range` / multirange → `text`; `money` → `numeric`; `pgvector` → `jsonb`/`text`;
-`enum` → `text`; composite → columns / `jsonb`. `numeric(p,s)` with p > 38 is clamped
-with a warning; a bare `numeric`/`decimal` → DSQL `numeric(18,6)`; column `DEFAULT`s /
-`serial` / identity `nextval` are **not** emitted (the PK strategy governs identity);
+`enum` → `text`; composite → columns / `jsonb`. `numeric(p,s)` is kept (Aurora DSQL allows
+the same precision 1000 PostgreSQL does); a bare `numeric`/`decimal` → DSQL `numeric(18,6)`;
+column `DEFAULT`s are kept **as written**, except a `nextval` (a key's is governed by the
+PK strategy; a non-key one is dropped with how to keep it generated) and a default with
+no DSQL equivalent, each reported;
 `STORED` generated columns are **preserved** (Aurora DSQL supports them and maintains the
 value); `VIRTUAL` ones become ordinary columns and must be recomputed in the application.
 See the type-and-constraint

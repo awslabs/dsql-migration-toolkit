@@ -66,7 +66,7 @@ Aurora DSQL は外部キーを強制し、プライマリキーを必須とし�
 |---|---|---|
 | 外部キーは強制される | FK を多用したソース | 各ソースの FK は保持され、post-load の `ALTER TABLE … ADD CONSTRAINT` として再作成される(CDC マイグレーションではカットオーバーまで延期)。孤立の事前チェックでゲートされる。Validation の **孤立チェック** がその適用前ゲートであり(そして FK を取り除いた場合はセーフティネットになる)(`test_orphan_records_are_detected_and_fail_the_match`) |
 | プライマリキー必須 | PK が **ない** テーブル。**複合** PK | PK なしは前段でブロックされ(`UNSUPPORTED`)、keyset(キーセット)エクスポートはそれを拒否する。複合 PK は明示的な辞書式選言のキーセット述語(`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`)によってロードされる — これは意図的に行値タプル形式を **使わない**。行値タプル形式は MySQL 5.7 以降で PK インデックスを活用しにくいためである(`test_exporter.py`、シナリオドキュメント) |
-| 非対応の型/オブジェクト | **MySQL:** 精度が 38 を超える `DECIMAL`、255 を超えるカラム、トリガー/ルーチン。**PostgreSQL:** 非対応のカラム型 — 配列、幾何型(point/line/box など)、ネットワーク型(inet/cidr/macaddr)、xml、money、bit/bit varying、tsvector/tsquery、range/multirange、enum、複合型、pgvector | Evaluation で理由付きで `UNSUPPORTED` としてフラグが立てられ、**自動的に代替されることはない**(`test_converter.py`、アセッサのテスト)。挙動の違い: PostgreSQL の `numeric(p,s)` で p > 38 の場合は(MySQL の `DECIMAL` > 38 のように拒否せず)警告付きで **クランプ** され、精度指定のない `numeric`/`decimal` は `numeric(18,6)` が既定になる |
+| 非対応の型/オブジェクト | **MySQL:** 255 を超えるカラム、トリガー/ルーチン、FULLTEXT/SPATIAL インデックス。**PostgreSQL:** 非対応のカラム型 — 配列、幾何型(point/line/box など)、ネットワーク型(inet/cidr/macaddr)、xml、money、bit/bit varying、tsvector/tsquery、range/multirange、enum、複合型、pgvector | Evaluation で理由と再モデリング先付きで `UNSUPPORTED` としてフラグが立てられる。値を保つ代替型がある場合(配列 → `jsonb`、range・ネットワーク型 → `text`、`money` → `numeric`、enum → `CHECK` 付きの `text`)、Schema Conversion はアプリケーションが追従すべき型の変更を示す **警告付きで** それを出力する — 黙って置き換えることはない(`test_converter.py`、アセッサのテスト)。精度指定のない PostgreSQL の `numeric`/`decimal` は `numeric(18,6)` で保存される(`MANUAL` としてフラグ)。数値の精度はもはや関門ではない: Aurora DSQL は 1000 まで許可し、これは MySQL の 65 を超え、PostgreSQL 自身の上限と同じ |
 | TINYINT(1) → boolean、範囲外(MySQL ソースのみ) | `2` を保持する `TINYINT(1)` | **明示的でテーブル単位で致命的な** エラー。`2` を `true` に平坦化することを拒否する(静かな破損はしない)。PostgreSQL ソースにはネイティブの `boolean` 型があり、そのまま通過するため、これに類する平坦化のリスクはない |
 | 型の不均一性(MySQL → PG 方言。PostgreSQL ソースはほぼ恒等の通過) | 型の多様性が最大となるスキーマ | Full Load(Python)と CDC シンク(Java)は各値を **同一の** 保存形式にエンコードしなければならない。共有の **書き込みコントラクト** の同等性テストによって強制される(`test_dsql_write_contract.py`)。MySQL ソースではこれに MySQL→PostgreSQL の方言変換が含まれるが、PostgreSQL ソースでは変換がなく(ソースと DSQL ターゲットはどちらも PostgreSQL-16 ワイヤ)、両ローダーは値をそのまま通過させる — ただし同等性の要件は両エンジンで依然として成り立つ |
 
@@ -116,7 +116,7 @@ RUN_E2E_CONNECTED=1 .venv/bin/python -m pytest -m e2e   # connected tier too
 上記のシナリオは、実際の AWS 上で **まとめて** も検証しました — **MySQL ソース**(RDS MySQL + Aurora DSQL + MSK)について、1 回の実行でできる限り多くの DSQL 特性を突くように設計された、専用のスキーマを用いています。
 
 - parent → child / lob の外部キーチェーン(**FK の保持** + **PK** + **孤立チェック** のシナリオを強制)。
-- 最大限の型の多様性 — あらゆる整数/unsigned のバリアント、精度が 38 を超えるものを含む `DECIMAL`、`FLOAT`/`DOUBLE`、`BIT`、collation、DATE/TIME ファミリー一式、`ENUM`/`SET`/`JSON`、そして LOB ファミリー一式(**型の不均一性** と **非対応型** のシナリオを強制)。
+- 最大限の型の多様性 — あらゆる整数/unsigned のバリアント、MySQL の最大(65,30)までの `DECIMAL`、`FLOAT`/`DOUBLE`、`BIT`、collation、DATE/TIME ファミリー一式、`ENUM`/`SET`/`JSON`、そして LOB ファミリー一式(**型の不均一性** と **非対応型** のシナリオを強制)。
 - **意図的に失敗させる行**: 約 1.5 MiB の LOB 値(**1 MiB の隔離/DLQ** シナリオを強制)、および分離したテーブル内の `TINYINT(1)` = `2`(**明示的でテーブル単位で致命的な** シナリオを強制)。
 
 > **PostgreSQL ソース。** 同じ end-to-end 経路を、PostgreSQL ソース(RDS/Aurora PostgreSQL → MSK → Aurora DSQL)についても実インフラ上で別途検証しました — Schema Conversion + Full Load + CDC + カットオーバー(外部キーの保持を含む)。PostgreSQL ソースは PG-16→DSQL のほぼ恒等の通過であるため、上記の型の不均一性と `TINYINT(1)` の平坦化のシナリオは当てはまりませんが、分散、サーバーレス、IAM 認証、OCC、ギャップのない Full Load → CDC の引き継ぎのシナリオはすべて当てはまります。

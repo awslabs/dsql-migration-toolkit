@@ -74,8 +74,8 @@ plus a pointer to the chapter that covers it in depth.
 
 - [ ] **DSQL intentionally omits some features your source engine (MySQL or
       PostgreSQL) may have.** No **triggers / stored procedures / events**, a
-      **per-transaction row limit (≤ 3000)**, a **1 MiB per-value limit**,
-      `DECIMAL` **precision ≤ 38**, and **no spatial types**. (**Foreign keys are
+      **per-transaction row limit (≤ 3000)**, a **1 MiB per-value limit**, and
+      **no spatial types**. (**Foreign keys are
       supported** — Aurora DSQL enforces them — so the tool preserves them and
       re-creates them after the data load; they are *not* an omitted feature.) You
       don't have to find these yourself — the **Evaluation** step inspects your

@@ -34,6 +34,7 @@ independent of NiceGUI so they can be unit tested directly; only
 from __future__ import annotations
 
 import itertools
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
@@ -88,7 +89,12 @@ from dsql_migrator.ui.design import (
     section_header,
 )
 from dsql_migrator.ui.session import SessionStore
-from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
+from dsql_migrator.ui.workflow import (
+    WorkflowStep,
+    format_source_engine,
+    get_status,
+    with_status,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +222,9 @@ class EvaluationInputs:
     source_password: Optional[SecretValue]
     target_config: TargetConnectionConfig
     aws_profile: Optional[str] = None
+    # The engine the last source test read ("Aurora MySQL 3.07.1 (MySQL 8.0.39)"), for the
+    # exported report's header.
+    source_engine: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +266,12 @@ class EvaluationResult:
     # ``None`` means unknown provenance (a pre-0.1.524 snapshot, or a test fixture) and is
     # trusted, so older sessions keep working exactly as before.
     target_endpoint: Optional[str] = None
+    # What was assessed and when, for the exported report's header: the source's engine
+    # and address (never a credential) and the UTC time the run finished. Not persisted: a
+    # restored report keeps the address from the snapshot and has no time, and its export
+    # then says only when it was exported.
+    source_label: Optional[str] = None
+    assessed_at: Optional[str] = None
 
 
 class _EndpointOnly:
@@ -1066,7 +1081,28 @@ def run_evaluation(
         target_conflicts=target_conflicts,
         source_type=inputs.source_config.source_type,
         target_endpoint=inputs.target_config.cluster_endpoint,
+        source_label=describe_source(inputs.source_config, inputs.source_engine),
+        assessed_at=_utc_stamp(),
     )
+
+
+def describe_source(
+    config: "Optional[SourceConnectionConfig]", engine: Optional[str] = None
+) -> Optional[str]:
+    """``"<engine> at host:port/database"`` for a report header -- never a credential.
+    ``None`` without a host."""
+    host = (getattr(config, "host", None) or "").strip()
+    if not host:
+        return None
+    database = (getattr(config, "database", None) or "").strip()
+    address = f"{host}:{getattr(config, 'port', '')}" + (f"/{database}" if database else "")
+    return f"{engine} at {address}" if engine else address
+
+
+def _utc_stamp() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _listing_databases(
@@ -1224,33 +1260,105 @@ def _download_parts(stem: str, fmt: str) -> tuple[str, str]:
     return f"{stem}.{_EXTENSIONS[normalized]}", _MEDIA_TYPES[normalized]
 
 
-def assessment_download(result: EvaluationResult, fmt: str = "json") -> ReportDownload:
+# The SCT-style effort buckets (EffortLevel), spelled out in every export that counts them.
+EFFORT_SCALE = (
+    "SIMPLE under 2 hours, MEDIUM 2 to 6 hours, SIGNIFICANT over 6 hours, per object that "
+    "does not convert automatically"
+)
+
+
+def report_metadata(result: EvaluationResult, *, exported_at: str) -> "list[tuple[str, str]]":
+    """The ``(label, value)`` header of every export: what was assessed, against what,
+    when, by which version, and the verdict with the counts behind it -- so a shared copy
+    stands on its own. Never a credential."""
+    from dsql_migrator import __version__
+
+    lines: list[tuple[str, str]] = []
+    if result.source_label:
+        lines.append(("Source", result.source_label))
+    if result.target_endpoint:
+        lines.append(("Target", result.target_endpoint))
+    if result.assessed_at:
+        lines.append(("Assessed", result.assessed_at))
+    lines.append(("Exported", exported_at))
+    lines.append(("Tool version", __version__))
+    score = compute_migration_score(result.assessment)
+    if score is None:
+        lines.append(("Readiness", "No objects to rate"))
+    else:
+        caption = "per-object readiness" if score.band == _BLOCKED_BAND[0] else "readiness"
+        lines.append(("Readiness", f"{score.band} ({score.score} / 100 {caption})"))
+        lines.append((
+            "Objects",
+            f"{score.total:,} assessed: {score.auto:,} automatic, {score.manual:,} review "
+            f"needed, {score.unsupported:,} unsupported",
+        ))
+    lines.append(("Effort scale", EFFORT_SCALE))
+    return lines
+
+
+# The host, and the database when there is one, of a describe_source() label.
+_SOURCE_ADDRESS_RE = re.compile(r"(?:^| at )([^\s:/]+)(?::\d*)?(?:/(.+))?$")
+
+
+def report_filename_stem(result: EvaluationResult, exported_at: str) -> str:
+    """``compatibility_assessment_<database or host>_<YYYYMMDD-HHMMSS>``: two exports of two
+    sources, or of one source twice, no longer overwrite each other."""
+    parts = ["compatibility_assessment"]
+    match = _SOURCE_ADDRESS_RE.search(result.source_label or "")
+    if match:
+        name = match.group(2) or match.group(1).split(".")[0]
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")[:40]
+        if slug:
+            parts.append(slug)
+    digits = re.sub(r"\D", "", exported_at)
+    if len(digits) >= 14:
+        parts.append(f"{digits[:8]}-{digits[8:14]}")
+    return "_".join(parts)
+
+
+def assessment_download(
+    result: EvaluationResult, fmt: str = "json", *, exported_at: Optional[str] = None
+) -> ReportDownload:
     """Serialize the compatibility assessment report for download (Req 8.4).
 
-    For HTML, the Target analysis (Aurora DSQL catalog + name conflicts) is
-    appended so the exported report mirrors what the screen shows; JSON/text
-    export the deterministic assessment only. No AI section is included in any
-    format: AI assistance is on-demand and per-object (the Evaluation screen's AI
-    drawer), so it is not part of the exported, shareable report.
+    Every format opens with :func:`report_metadata` (source, target, times, tool
+    version, readiness, counts and the effort scale) and carries the target's existing
+    and held names: the HTML in its Target analysis section (with the catalog), JSON
+    under ``"target"``, text after the items. No AI section is included in any format:
+    AI assistance is on-demand and per object (the Evaluation screen's AI drawer), so it
+    is not part of the exported, shareable report.
     """
+    exported_at = exported_at or _utc_stamp()
+    metadata = report_metadata(result, exported_at=exported_at)
+    # The screen's "Names held on the target by another object" list: without it the
+    # export printed the all-clear over objects neither apply mode can create.
+    blocked = _find_target_blockers(
+        result.inventory,
+        result.target_inventory,
+        is_postgres=result.source_type is SourceType.POSTGRES,
+    )
     if fmt.lower() == "html":
         content = render_html_report(
             result.assessment,
             target=result.target_inventory,
             conflicts=result.target_conflicts,
             source_type=result.source_type,
-            # The screen's "Names held on the target by another object" list: without it
-            # the export printed the all-clear over objects neither apply mode can create.
-            blocked=_find_target_blockers(
-                result.inventory,
-                result.target_inventory,
-                is_postgres=result.source_type is SourceType.POSTGRES,
-            ),
+            blocked=blocked,
             target_endpoint=result.target_endpoint,
+            metadata=metadata,
         )
     else:
-        content = export_assessment_report(result.assessment, fmt)
-    filename, media_type = _download_parts("compatibility_assessment", fmt)
+        content = export_assessment_report(
+            result.assessment,
+            fmt,
+            source_type=result.source_type,
+            metadata=metadata,
+            target_endpoint=result.target_endpoint,
+            conflicts=result.target_conflicts,
+            blocked=blocked,
+        )
+    filename, media_type = _download_parts(report_filename_stem(result, exported_at), fmt)
     return ReportDownload(filename=filename, content=content, media_type=media_type)
 
 
@@ -1501,6 +1609,12 @@ def build_evaluation_screen(
             source_password=session.source_password,
             target_config=target_config,
             aws_profile=session.aws_profile,
+            source_engine=format_source_engine(
+                getattr(session, "source_server_version", None),
+                getattr(session, "source_engine_version", None),
+                getattr(session, "source_aurora_version", None),
+                source_type=source_config.source_type,
+            ),
         )
         token = eval_state.begin_run()
         session.set_workflow(
@@ -3081,19 +3195,19 @@ def _render_downloads(ui: object, result: EvaluationResult) -> None:
             "HTML",
             on_click=lambda: _download(assessment_download(result, "html")),
         ).props("dense outline").tooltip(
-            "Full report: assessment + target analysis (deterministic; no AI)."
+            "Full report: what was assessed, the assessment and the target analysis (deterministic; no AI)."
         )
         ui.button(  # type: ignore[attr-defined]
             "JSON",
             on_click=lambda: _download(assessment_download(result, "json")),
         ).props("dense outline").tooltip(
-            "Deterministic assessment data (no AI section)."
+            "Assessment data with its header and the target's existing names (deterministic; no AI)."
         )
         ui.button(  # type: ignore[attr-defined]
             "Text",
             on_click=lambda: _download(assessment_download(result, "text")),
         ).props("dense outline").tooltip(
-            "Deterministic assessment, human-readable (no AI section)."
+            "The same, human-readable (deterministic; no AI)."
         )
 
 

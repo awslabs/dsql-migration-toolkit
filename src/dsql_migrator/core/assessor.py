@@ -3038,9 +3038,23 @@ class CompatibilityAssessor:
 # ---------------------------------------------------------------------------
 
 
-def render_text_report(report: AssessmentReport) -> str:
-    """Render a human-readable text version of an assessment report (English)."""
+def render_text_report(
+    report: AssessmentReport,
+    *,
+    metadata: "Sequence[tuple[str, str]]" = (),
+    conflicts: "Sequence[str]" = (),
+    blocked: "Sequence[tuple[str, str]]" = (),
+) -> str:
+    """Render a human-readable text version of an assessment report (English).
+
+    ``metadata`` is the ``(label, value)`` header saying what was assessed (see the
+    Evaluation export); ``conflicts`` / ``blocked`` are the target's existing and held
+    names, listed after the items."""
     lines = ["Compatibility Assessment Report", "=" * 31, ""]
+    if metadata:
+        width = max(len(label) for label, _value in metadata) + 2
+        lines.extend(f"{label + ':':<{width}}{value}" for label, value in metadata)
+        lines.append("")
     lines.append("Difficulty summary (objects by classification):")
     for classification in Classification:
         lines.append(f"  {classification.value}: {report.summary.get(classification, 0)}")
@@ -3087,6 +3101,14 @@ def render_text_report(report: AssessmentReport) -> str:
                 lines.append(f"    Risk: {item.risk}")
             if item.recommendation:
                 lines.append(f"    Recommendation: {item.recommendation}")
+    if conflicts:
+        lines.append("")
+        lines.append(f"Already on the target ({len(conflicts)}):")
+        lines.extend(f"- {name}" for name in conflicts)
+    if blocked:
+        lines.append("")
+        lines.append(f"Names held on the target by another object ({len(blocked)}):")
+        lines.extend(f"- {name}: {holder}" for name, holder in blocked)
     return "\n".join(lines)
 
 
@@ -3095,21 +3117,46 @@ def export_report(
     fmt: str = "json",
     *,
     source_type: SourceType = SourceType.MYSQL,
+    metadata: "Sequence[tuple[str, str]]" = (),
+    target_endpoint: Optional[str] = None,
+    conflicts: "Sequence[str]" = (),
+    blocked: "Sequence[tuple[str, str]]" = (),
 ) -> str:
     """Export an assessment report as ``"json"``, ``"text"``, or ``"html"``.
 
-    JSON is produced from the Pydantic model (machine-readable, downloadable);
-    text is a readable summary; HTML is a styled, standalone document suitable
-    for sharing (its title reflects the ``source_type``). Raises ``ValueError`` for
-    unknown formats.
+    JSON is produced from the Pydantic model (machine-readable, downloadable), with the
+    ``metadata`` header under ``"metadata"`` and the target's endpoint and names under
+    ``"target"`` beside the model's own keys; text is a readable summary; HTML is a
+    styled, standalone document suitable for sharing (its title reflects the
+    ``source_type``). Each lists the assessed objects only (never a report marker).
+    Raises ``ValueError`` for unknown formats.
     """
     normalized = fmt.lower()
     if normalized == "json":
-        return report.model_dump_json(indent=2)
+        import json
+
+        data: dict[str, object] = {}
+        if metadata:
+            data["metadata"] = {
+                re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_"): value
+                for label, value in metadata
+            }
+        data.update(
+            report.model_copy(update={"items": report.assessed_items}).model_dump(mode="json")
+        )
+        if target_endpoint or conflicts or blocked:
+            data["target"] = {
+                "endpoint": target_endpoint,
+                "conflicts": list(conflicts),
+                "blocked": [{"name": name, "holder": holder} for name, holder in blocked],
+            }
+        return json.dumps(data, indent=2)
     if normalized == "text":
-        return render_text_report(report)
+        return render_text_report(
+            report, metadata=metadata, conflicts=conflicts, blocked=blocked
+        )
     if normalized == "html":
-        return render_html_report(report, source_type=source_type)
+        return render_html_report(report, source_type=source_type, metadata=metadata)
     raise ValueError(
         f"unsupported report format: {fmt!r} (use 'json', 'text', or 'html')"
     )
@@ -3381,6 +3428,7 @@ def render_html_report(
     source_type: SourceType = SourceType.MYSQL,
     blocked: "Optional[Sequence[tuple[str, str]]]" = None,
     target_endpoint: Optional[str] = None,
+    metadata: "Sequence[tuple[str, str]]" = (),
 ) -> str:
     """Render a styled, standalone HTML assessment report (English).
 
@@ -3533,6 +3581,17 @@ def render_html_report(
         else ""
     )
     chart_section = _render_html_chart(report)
+    # What was assessed, against what, when and by which version: a shared copy has to
+    # stand on its own.
+    meta_section = (
+        '<table class="meta">'
+        + "".join(
+            f"<tr><th>{esc(label)}</th><td>{esc(value)}</td></tr>" for label, value in metadata
+        )
+        + "</table>\n"
+        if metadata
+        else ""
+    )
 
     return (
         "<!DOCTYPE html>\n"
@@ -3576,8 +3635,10 @@ def render_html_report(
         "font-size:12px;}\n"
         ".conflict{display:inline-block;border:1px solid #e0a800;color:#8a6d00;"
         "border-radius:10px;padding:1px 8px;margin:2px;font-size:12px;}\n"
+        "table.meta{width:auto;} table.meta th{width:9em;}\n"
         "</style>\n</head>\n<body>\n"
         f"<h1>{report_title}</h1>\n"
+        f"{meta_section}"
         "<h2>Classification summary</h2>\n"
         f"<ul>{classification_summary}</ul>\n"
         "<h2>Estimated manual effort (non-automatic objects)</h2>\n"

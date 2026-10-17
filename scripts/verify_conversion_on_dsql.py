@@ -14,7 +14,8 @@ that blind spot:
   ``CACHE >= 65536``, so every identity-strategy table failed to apply.
 * an ``INT`` identity column -- DSQL sequences are BIGINT-only, and MySQL
   ``int AUTO_INCREMENT`` is the most common primary key there is.
-* ``DECIMAL(65,30)`` -- MySQL's maximum, past DSQL's ``(38,37)`` ceiling.
+* ``DECIMAL(65,30)`` -- MySQL's maximum, past what was then DSQL's ``(38,37)`` ceiling
+  (Aurora DSQL now allows precision 1000).
 
 The end-to-end run did not catch them either, because it exercises one hand-built schema
 that happens to contain none of those shapes.

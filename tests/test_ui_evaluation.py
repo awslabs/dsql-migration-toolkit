@@ -18,6 +18,7 @@ These tests cover the parts of the Evaluation screen that do not touch NiceGUI:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -845,9 +846,12 @@ def _result() -> EvaluationResult:
     )
 
 
+_EXPORTED_AT = "2026-10-17 01:05:09 UTC"
+
+
 def test_assessment_download_json_is_valid_and_named() -> None:
-    download = assessment_download(_result(), "json")
-    assert download.filename == "compatibility_assessment.json"
+    download = assessment_download(_result(), "json", exported_at=_EXPORTED_AT)
+    assert download.filename == "compatibility_assessment_app_20261017-010509.json"
     assert download.media_type == "application/json"
     parsed = json.loads(download.content)
     assert "items" in parsed and "summary" in parsed
@@ -855,16 +859,16 @@ def test_assessment_download_json_is_valid_and_named() -> None:
 
 
 def test_assessment_download_text_is_human_readable() -> None:
-    download = assessment_download(_result(), "text")
-    assert download.filename == "compatibility_assessment.txt"
+    download = assessment_download(_result(), "text", exported_at=_EXPORTED_AT)
+    assert download.filename == "compatibility_assessment_app_20261017-010509.txt"
     assert download.media_type == "text/plain"
     assert "Compatibility Assessment Report" in download.content
     assert "Estimated manual effort" in download.content
 
 
 def test_assessment_download_html_is_named_and_typed() -> None:
-    download = assessment_download(_result(), "html")
-    assert download.filename == "compatibility_assessment.html"
+    download = assessment_download(_result(), "html", exported_at=_EXPORTED_AT)
+    assert download.filename == "compatibility_assessment_app_20261017-010509.html"
     assert download.media_type == "text/html"
     assert download.content.startswith("<!DOCTYPE html>")
 
@@ -2768,3 +2772,50 @@ def test_filter_assessment_items_by_name_ignores_case_and_spaces() -> None:
     assert filter_assessment_items(items, name="") == items
     # Combined with the other filters (AND).
     assert filter_assessment_items(items, name="app.", classification="UNSUPPORTED") == []
+
+
+def test_every_export_says_what_was_assessed_against_what_and_when() -> None:
+    """No export said which source or target it described, when it was made or by which
+    version, or what its effort figures meant; JSON and text also dropped the target's
+    existing names the screen shows."""
+    from dsql_migrator import __version__
+
+    result = replace(_result(), target_conflicts=["app.orders"])
+    assert result.source_label and result.source_label.endswith(":3306/app")
+    assert result.assessed_at and result.assessed_at.endswith(" UTC")
+
+    data = json.loads(assessment_download(result, "json", exported_at=_EXPORTED_AT).content)
+    meta = data["metadata"]
+    assert meta["source"] == result.source_label
+    assert meta["exported"] == _EXPORTED_AT and meta["assessed"] == result.assessed_at
+    assert meta["tool_version"] == __version__
+    assert meta["readiness"].endswith("/ 100 readiness)") and "SIMPLE under 2 hours" in meta["effort_scale"]
+    assert data["target"]["conflicts"] == ["app.orders"]
+    assert data["target"]["endpoint"] == result.target_endpoint
+    # The model's own keys stay where they were.
+    assert {"items", "summary", "effort_summary"} <= set(data)
+
+    text = assessment_download(result, "text", exported_at=_EXPORTED_AT).content
+    assert f"Source:" in text and result.source_label in text
+    assert f"Tool version: {__version__}" in text
+    assert "Already on the target (1):\n- app.orders" in text
+
+    markup = assessment_download(result, "html", exported_at=_EXPORTED_AT).content
+    assert '<table class="meta">' in markup and "<th>Exported</th><td>2026-10-17 01:05:09 UTC</td>" in markup
+
+
+def test_an_export_never_lists_a_report_marker() -> None:
+    from dsql_migrator.core.assessor_postgres import with_pg_catalog_facts
+    from dsql_migrator.core.catalog_postgres import PgCatalogFacts, RowSecurityFacts
+
+    result = _result()
+    marked = replace(
+        result,
+        assessment=with_pg_catalog_facts(
+            result.assessment, PgCatalogFacts(row_security=RowSecurityFacts(login=None), sequences=())
+        ),
+    )
+    assert any(i.rule_id == "PG_CATALOG_CHECKED" for i in marked.assessment.items)
+    data = json.loads(assessment_download(marked, "json", exported_at=_EXPORTED_AT).content)
+    assert all(item["rule_id"] != "PG_CATALOG_CHECKED" for item in data["items"])
+    assert "PG_CATALOG_CHECKED" not in assessment_download(marked, "text").content

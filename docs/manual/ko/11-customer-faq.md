@@ -318,7 +318,7 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 | `TINYINT(1)` | `boolean` | MySQL의 boolean 관례. |
 | `…INT UNSIGNED` (unsigned 정수) | `smallint` / `integer` / `bigint` / `numeric(20,0)` | 더 넓은 타입으로 **무손실 확장**. |
 | `BIT(n)` | 크기별 정수(`smallint`~`numeric(20,0)`) | DSQL에 `BIT` 타입 없음. |
-| `DECIMAL(p,s)` | `numeric(p,s)` | 정밀도 > 38은 미지원. |
+| `DECIMAL(p,s)` | `numeric(p,s)` | 정밀도·스케일 유지(Aurora DSQL은 정밀도 1000까지 허용). |
 | `DATETIME` | `timestamp` (UTC) | UTC로 정규화. |
 | `ENUM` | `text` + `CHECK` | DSQL에 `ENUM` 없음. |
 | `BLOB` / `BINARY` | `bytea` | 원시 바이트 보존. |
@@ -332,12 +332,15 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 **PostgreSQL 소스**의 경우, 변환과 데이터 경로는 **거의 동일한(near-identity) PG-16 → DSQL 패스스루**입니다
 — DSQL이 지원하는 타입(정수 계열, `numeric`/`decimal`, `char`/`varchar`/`text`, date/time/`timestamp[tz]`,
 `interval`, `boolean`, `bytea`, `uuid`, `json`, `jsonb`)은 MySQL식 변환 없이 **그대로** 넘어갑니다.
-DSQL에 대응이 없는 PostgreSQL 타입은 **UNSUPPORTED**로 표시되고(자동 치환하지 않음) 재모델링해야 합니다:
+DSQL에 대응이 없는 PostgreSQL 타입은 **UNSUPPORTED**로 표시되고 재모델링해야 합니다(값을 보존하는 대체
+타입이 있으면 Schema Conversion이 타입 변경을 밝히는 경고와 함께 출력하며, 조용히 바꾸지 않습니다):
 배열 → `jsonb` / 자식 테이블; 기하(geometric), 네트워크(`inet`/`cidr`/`macaddr`), `xml`, `bit`/`varbit`,
 `tsvector`/`tsquery`, `range` / multirange → `text`; `money` → `numeric`; `pgvector` → `jsonb`/`text`;
-`enum` → `text`; composite → 컬럼 / `jsonb`. `numeric(p,s)`에서 p > 38은 경고와 함께 클램핑되고, 순수
-`numeric`/`decimal`은 DSQL `numeric(18,6)`이 되며, 컬럼 `DEFAULT` / `serial` / identity `nextval`은
-**생성되지 않고**(identity는 PK 전략이 관장), `STORED` 생성 컬럼은 일반 컬럼이 됩니다. 타입·제약 참조는
+`enum` → `text`; composite → 컬럼 / `jsonb`. `numeric(p,s)`는 그대로 유지되고(Aurora DSQL도 PostgreSQL과
+같은 정밀도 1000을 허용), 순수 `numeric`/`decimal`은 DSQL `numeric(18,6)`이 되며, 컬럼 `DEFAULT`는
+**원문 그대로** 유지됩니다(`nextval`은 예외: 키의 것은 PK 전략이 관장하고, 키가 아닌 것은 계속 값을
+생성하는 방법과 함께 제외. DSQL에 대응이 없는 기본값도 보고와 함께 제외). `STORED` 생성 컬럼은 **보존**되고(Aurora DSQL이 지원하며 값을 유지),
+`VIRTUAL` 생성 컬럼은 일반 컬럼이 되어 애플리케이션에서 다시 계산해야 합니다. 타입·제약 참조는
 [2장 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--dsql-타입과-제약-처리-참조)을 참조하세요.
 
 

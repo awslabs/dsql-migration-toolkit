@@ -481,8 +481,10 @@ def apply_session_snapshot(
     # current qualified vintage before anything reads them (see the helper).
     _qualify_restored_table_names(snapshot)
 
+    from types import SimpleNamespace
+
     from dsql_migrator.ui.data_migration import MigrationType
-    from dsql_migrator.ui.evaluation import EvaluationResult
+    from dsql_migrator.ui.evaluation import EvaluationResult, describe_source
 
     session.set_workflow(snapshot.workflow.model_copy(deep=True))  # type: ignore[attr-defined]
     # Restore the NON-SECRET source connection (host/port/database/username + engine)
@@ -627,6 +629,14 @@ def apply_session_snapshot(
             target_conflicts=list(snapshot.target_conflicts),
             source_type=restored_source_type,
             target_endpoint=snapshot.target_inventory_endpoint,
+            # The address only: the engine version is read again by the next source test.
+            source_label=describe_source(
+                SimpleNamespace(
+                    host=snapshot.source_host,
+                    port=snapshot.source_port,
+                    database=snapshot.source_database,
+                )
+            ),
         )
         # Re-graded with this version's rules, as every refresh is: a snapshot saved by an
         # earlier version carries that version's verdict (no BYTEA_KEY, no schema-limit
