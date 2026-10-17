@@ -34,7 +34,7 @@ def test_a_preamble_that_says_when_it_looks_is_still_a_preamble() -> None:
 def test_an_answer_that_opens_with_an_announcement_is_kept() -> None:
     """A structured reply under 'Let me review…:' was discarded and the question re-asked.
     G93: such a reply may be nudged, but the model keeps it (KEEP_PREVIOUS_REPLY) and it
-    is the answer shown -- the nudge never replaces an answer."""
+    is the answer shown -- a nudge the model answers that way never replaces it."""
     from dsql_migrator.core.assessment_strategist import (
         KEEP_REPLY_MARKER,
         AssessmentStrategist,
