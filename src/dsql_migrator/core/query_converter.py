@@ -56,6 +56,7 @@ import sqlglot
 from sqlglot import exp
 from pydantic import BaseModel, ConfigDict, Field
 
+from dsql_migrator.core.converter import MYSQL_EXPRESSION_DIALECT, rewrite_mysql_expressions
 from dsql_migrator.core.models import Classification, SourceType
 
 _MYSQL = "mysql"
@@ -192,6 +193,14 @@ CODE_JSON_UNQUOTE_UNSUPPORTED = "JSON_UNQUOTE_UNSUPPORTED"
 CODE_MIXED_CASE_NAME = "MIXED_CASE_NAME"
 # An unquoted mixed-case select-list alias: the result column's label is folded.
 CODE_MIXED_CASE_LABEL = "MIXED_CASE_LABEL"
+# A MySQL call the conversion leaves as written (a MySQL-only or user function): it fails
+# on Aurora DSQL unless the function exists there.
+CODE_UNTRANSLATED_CALL = "UNTRANSLATED_CALL"
+# A DATE_FORMAT / STR_TO_DATE specifier Aurora DSQL has no pattern for.
+CODE_UNMAPPED_DATE_FORMAT = "UNMAPPED_DATE_FORMAT"
+# A MySQL expression whose result Aurora DSQL computes differently (STR_TO_DATE on a value
+# that does not match, a format read at run time, ...).
+CODE_MYSQL_SEMANTICS = "MYSQL_SEMANTICS"
 
 # Severity ordering used to derive the overall result classification from its
 # warnings (higher value is more severe). Matches the assessor's convention.
@@ -410,6 +419,45 @@ def _inline_having_aliases(tree: exp.Expression, *, case_insensitive: bool = Tru
             replacement = aliases.get(name)
             if replacement is not None:
                 column.replace(replacement.copy())
+
+
+def _mysql_expression_warnings(
+    untranslated: "Sequence[str]", misformatted: "Sequence[str]", issues: "Sequence[str]"
+) -> "list[QueryWarning]":
+    """The Query Converter's findings for what :func:`rewrite_mysql_expressions` could not
+    write faithfully -- the same as a view's in Schema Conversion."""
+    warnings: list[QueryWarning] = []
+    if untranslated:
+        one = len(untranslated) == 1
+        warnings.append(QueryWarning(
+            code=CODE_UNTRANSLATED_CALL,
+            classification=Classification.MANUAL,
+            message=(
+                f"The statement calls {', '.join(f'{name}()' for name in untranslated)}, "
+                "which the conversion does not translate (a MySQL-only or user-defined "
+                f"function): it fails on Aurora DSQL unless {'it exists' if one else 'they exist'} "
+                f"there. Rewrite {'it' if one else 'them'} before running it."
+            ),
+        ))
+    if misformatted:
+        one = sum(entry.count("%") for entry in misformatted) == 1
+        warnings.append(QueryWarning(
+            code=CODE_UNMAPPED_DATE_FORMAT,
+            classification=Classification.MANUAL,
+            message=(
+                f"The statement formats a date with {', '.join(misformatted)}: "
+                f"{'that MySQL format token has' if one else 'those MySQL format tokens have'} "
+                "no Aurora DSQL (TO_CHAR / TO_TIMESTAMP) pattern (MySQL's week numbers other "
+                f"than ISO's, and its 0-based day of week), so {'it is' if one else 'they are'} "
+                "written as literal text -- rewrite the format before running it."
+            ),
+        ))
+    for text in issues:
+        warnings.append(QueryWarning(
+            code=CODE_MYSQL_SEMANTICS, classification=Classification.MANUAL,
+            message=text,
+        ))
+    return warnings
 
 
 def _has_equality_predicate(where: exp.Where) -> bool:
@@ -998,7 +1046,7 @@ class QueryConverter:
         engine = "PostgreSQL" if self._is_postgres else "MySQL"
         try:
             tree = sqlglot.parse_one(
-                sql, read=_POSTGRES if self._is_postgres else _MYSQL
+                sql, read=_POSTGRES if self._is_postgres else MYSQL_EXPRESSION_DIALECT
             )
         except sqlglot.errors.ParseError as exc:
             return self._manual_review(
@@ -1028,6 +1076,10 @@ class QueryConverter:
             if on_duplicate_warning is not None:
                 warnings.append(on_duplicate_warning)
             warnings.extend(_rewrite_json_unquote(tree))
+            # The MySQL expression semantics a view gets (Schema Conversion), so the two
+            # steps never disagree on one: VARIANCE is the population one, CAST AS CHAR is
+            # text, GREATEST is NULL for a NULL argument, NOW() whole seconds, ...
+            warnings.extend(_mysql_expression_warnings(*rewrite_mysql_expressions(tree)))
             _drop_from_dual(tree)
             if mixed_case is not None:
                 warnings.append(mixed_case)
@@ -1096,4 +1148,8 @@ __all__ = [
     "CODE_FOR_UPDATE_VERIFY_PK",
     "CODE_JSON_UNQUOTE_UNSUPPORTED",
     "CODE_MIXED_CASE_NAME",
+    "CODE_MIXED_CASE_LABEL",
+    "CODE_UNTRANSLATED_CALL",
+    "CODE_UNMAPPED_DATE_FORMAT",
+    "CODE_MYSQL_SEMANTICS",
 ]

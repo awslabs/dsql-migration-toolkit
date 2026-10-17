@@ -356,13 +356,21 @@ MySQL→PostgreSQL トランスパイルではありません。
   トランスパイラが変換しない関数(`FIND_IN_SET`、`UNIX_TIMESTAMP`、ユーザー関数)を呼ぶビューは、両方のステップで
   MANUAL とされます(`VIEW_NOT_CONVERTED`): その関数が Aurora DSQL にない限り `CREATE VIEW` は失敗します。
   忠実な PostgreSQL の形がある MySQL の呼び出しはその形に書き換えます(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` は
-  `EXTRACT` に、`DATEDIFF`、`CURTIME()` は `LOCALTIME` に、`STDDEV`/`VARIANCE` は MySQL が計算する母集団の形に、
-  `VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に、`GROUP_CONCAT` は text 上の集計に、
-  `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はバイト数に、`+hh:mm` の
-  オフセットの `CONVERT_TZ`、NULL を保つ `JSON_ARRAY`/`JSON_ARRAYAGG`、そしてすべての `DATE_FORMAT`/`STR_TO_DATE` の書式を
-  トークンごとに)。その他(`WEEK`、`SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じようにフラグが付き、Aurora DSQL に
-  パターンのない書式トークン(MySQL の `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、
-  異なるテキストを返します。
+  `EXTRACT` に、`DATEDIFF`/`TO_DAYS`、`CURTIME()` は `LOCALTIME` に、`NOW()`/`CURRENT_TIMESTAMP` は `LOCALTIMESTAMP(0)` に
+  (MySQL の値は秒単位の `DATETIME`)、`UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` は UTC の壁時計に、`STDDEV`/`VARIANCE` は
+  MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
+  あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
+  そのバイトに(比較では Aurora DSQL がすでにバイト単位で比較するので省略)、`CAST(x AS UNSIGNED)` は MySQL と同じく負の数を
+  循環させて、`GROUP_CONCAT` は text 上の集計に、`CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を
+  返すように、`LENGTH` はテキストのバイト数に(`CHAR(n)` 列は埋め草の空白なしで)、`TRUNCATE(x, d)`、`DATE` に日・月を足しても
+  `DATE` のままに、`+hh:mm` オフセットの `CONVERT_TZ`(リテラルでも列から読む値でも)、NULL を保ち `DATETIME` と
+  `TINYINT(1)` を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、MySQL と同じく書式に応じて `TIME`/`DATE`/`DATETIME` を
+  返す `STR_TO_DATE`(空文字列は NULL、2 桁の年は MySQL と同じく解釈)、そしてすべての `DATE_FORMAT`/`STR_TO_DATE`/
+  `FROM_UNIXTIME` の書式を `%%` や未知の指定子まで MySQL 自身の指定子から)。その他(ISO 以外のモードの `WEEK`、
+  `SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じようにフラグが付き、Aurora DSQL にパターンのない書式トークン(MySQL の
+  `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、異なるテキストを返します。`STR_TO_DATE`
+  (書式に合わない値に MySQL は NULL を、Aurora DSQL はエラーを返します)、列から読む書式、`GROUP_CONCAT(DISTINCT x ORDER BY y)`
+  にもフラグが付きます。Query Converter も同じ MySQL の式を同じように書きます。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

@@ -2134,10 +2134,15 @@ class MySqlViewConversionRule(Rule):
 
         converter = SchemaConverter(source_type=SourceType.MYSQL)
         findings: list[Finding] = []
+        # With the tables' column types, as Schema Conversion converts each view (a binary
+        # column's bytes, a CHAR(n) column's padding): the two steps grade it alike.
+        table_index = {table.name.lower(): table for table in inventory.tables}
         for view in inventory.views:
             if getattr(view, "unsupported_kind", None) or not (view.definition or "").strip():
                 continue  # graded by VIEW_DEFINITION_UNREADABLE and the kind rules
-            converted = converter.convert_view(view)
+            converted = converter.convert_view(
+                view, tables=inventory.tables, table_index=table_index
+            )
             for warning in converted.warnings:
                 findings.append(
                     Finding(

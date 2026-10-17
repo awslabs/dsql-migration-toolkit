@@ -17,7 +17,7 @@ from dsql_migrator.core.models import (
 def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
     from dsql_migrator.core.converter import _converted_mysql_view
 
-    ddl, untranslated, misformatted = _converted_mysql_view("v", f"select {body} AS `x` from `t`")
+    ddl, untranslated, misformatted, _issues = _converted_mysql_view("v", f"select {body} AS `x` from `t`")
     return " ".join(ddl.split()), untranslated, misformatted
 
 
@@ -48,23 +48,27 @@ def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
         ("concat_ws(' ', a, b)", "CONCAT_WS(' ', a, b)"),
         ("convert_tz(d, '+00:00', '+09:00')", "AT TIME ZONE INTERVAL '+00:00' AT TIME ZONE INTERVAL '+09:00'"),
         ("greatest(a, b)", "CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE GREATEST(a, b) END"),
-        ("length(s)", "OCTET_LENGTH(s)"),
+        # G95: the bytes of its text (a CHAR(n) column's without the padding).
+        ("length(s)", "OCTET_LENGTH(CAST(s AS TEXT))"),
         ("cast(a as char charset utf8mb4)", "CAST(a AS TEXT)"),
         ("cast(a as char(10) charset utf8mb4)", "CAST(a AS VARCHAR(10))"),
         ("convert(a using utf8mb4)", "CAST(a AS TEXT)"),
-        ("cast(a as char charset binary)", "CAST(a AS BYTEA)"),
+        # G95: its bytes (a comparison drops it: Aurora DSQL compares bytes already).
+        ("cast(a as char charset binary)", "CONVERT_TO(CAST(a AS TEXT), 'UTF8')"),
         ("cast(a as unsigned)", "CAST(a AS DECIMAL(20))"),
         ("json_array(1, null)", "JSON_BUILD_ARRAY(1, NULL)"),
         ("json_arrayagg(a)", "JSON_AGG(a)"),
         ("weekofyear(d)", "CAST(EXTRACT(WEEK FROM CAST(d AS DATE)) AS INT)"),
         ("now(3)", "LOCALTIMESTAMP(3)"),
-        ("dayname(d)", "TO_CHAR(d, 'FMDay')"),
+        ("dayname(d)", "TO_CHAR(CAST(d AS DATE), 'FMDay')"),  # G95: of its date
         ("date_format(d, '%Y-%m-%dT%H:%i:%s')", "'YYYY-MM-DD\"T\"HH24:MI:SS'"),
         ("date_format(d, '%h:%i %p')", "'HH12:MI AM'"),
         ("date_format(d, 'Date: %Y')", "'\"Date: \"YYYY'"),
-        ("str_to_date(s, '%d/%m/%Y %H:%i')", "TO_TIMESTAMP(s, 'DD/MM/YYYY HH24:MI')"),
+        # G95: a DATETIME as MySQL types it, '' NULL, a two-digit year read as MySQL reads it.
+        ("str_to_date(s, '%d/%m/%Y %H:%i')",
+         "CAST(TO_TIMESTAMP(NULLIF(s, ''), 'DD/MM/YY HH24:MI') AS TIMESTAMP)"),
         ("from_unixtime(a, '%Y-%m-%d')", "TO_CHAR(TO_TIMESTAMP(a), 'YYYY-MM-DD')"),
-        ("now()", "NOW()"),
+        ("now()", "LOCALTIMESTAMP(0)"),  # G95: MySQL's NOW() is a DATETIME of whole seconds
     ],
 )
 def test_a_mysql_call_is_written_as_postgresql_runs_it(call: str, emitted: str) -> None:
@@ -86,8 +90,6 @@ def test_a_mysql_call_is_written_as_postgresql_runs_it(call: str, emitted: str) 
         ("timestamp(d, t)", "TIMESTAMP"),
         ("find_in_set('a', s)", "find_in_set"),
         ("json_set(j, '$.a', 1)", "JSON_SET"),
-        ("utc_time()", "UTC_TIME"),
-        ("group_concat(distinct a order by b)", "GROUP_CONCAT"),
     ],
 )
 def test_a_call_postgresql_lacks_is_reported(call: str, named: str) -> None:

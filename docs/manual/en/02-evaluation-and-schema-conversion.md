@@ -437,13 +437,24 @@ MySQL→PostgreSQL transpile:
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, a user function) is flagged MANUAL at both steps
   (`VIEW_NOT_CONVERTED`): its `CREATE VIEW` fails unless the function exists on Aurora DSQL. MySQL calls with a
   faithful PostgreSQL form are rewritten to it (`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` as `EXTRACT`,
-  `DATEDIFF`, `CURTIME()` as `LOCALTIME`, `STDDEV`/`VARIANCE` as the population forms MySQL computes and
-  `VAR_SAMP`/`STDDEV_SAMP` as the sample ones, `CAST(x AS CHAR [CHARSET ...])` as text, `GROUP_CONCAT` over
-  text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL does, `LENGTH` as bytes,
-  `CONVERT_TZ` with a `+hh:mm` offset, `JSON_ARRAY`/`JSON_ARRAYAGG` keeping NULLs, and every `DATE_FORMAT` /
-  `STR_TO_DATE` format written token by token); others (`WEEK`, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET`, ...)
-  are flagged the same way, and a format token with no Aurora DSQL pattern (MySQL's `%U`/`%u`/`%V`/`%X`
-  week numbers, `%w`) is flagged too: the view would be created but return different text. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  `DATEDIFF`/`TO_DAYS`, `CURTIME()` as `LOCALTIME`, `NOW()`/`CURRENT_TIMESTAMP` as `LOCALTIMESTAMP(0)` (MySQL's
+  is a `DATETIME` of whole seconds) and `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` as the UTC wall clock,
+  `STDDEV`/`VARIANCE` as the population forms MySQL computes and `VAR_SAMP`/`STDDEV_SAMP` as the sample ones,
+  `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
+  a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (dropped in a comparison, which
+  Aurora DSQL makes byte-wise already), `CAST(x AS UNSIGNED)` wrapping a negative number as MySQL does,
+  `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and `GREATEST`/`LEAST` returning NULL as MySQL does,
+  `LENGTH` as the bytes of its text (a `CHAR(n)` column without its padding), `TRUNCATE(x, d)`, a `DATE` plus
+  days/months staying a `DATE`, `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a
+  column), `JSON_ARRAY`/`JSON_ARRAYAGG` keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL
+  does, `STR_TO_DATE` typed as MySQL types it (a `TIME`, `DATE` or `DATETIME` by its format, an empty string
+  NULL, a two-digit year read as MySQL reads it), and every `DATE_FORMAT` / `STR_TO_DATE` / `FROM_UNIXTIME`
+  format written from MySQL's own specifiers, `%%` and unknown ones included); others (`WEEK` in a mode other
+  than ISO's, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET`, ...) are flagged the same way, and a format token with no
+  Aurora DSQL pattern (MySQL's `%U`/`%u`/`%V`/`%X` week numbers, `%w`) is flagged too: the view would be
+  created but return different text. So are `STR_TO_DATE` (MySQL returns NULL for a value that does not match
+  its format, Aurora DSQL raises an error), a format read from a column, and `GROUP_CONCAT(DISTINCT x ORDER BY
+  y)`. The Query Converter writes the same MySQL expressions the same way. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column

@@ -996,9 +996,14 @@ def render_source_view_ddl(
         # the pretty-printed source would silently lose the object's identity.
         if not stripped.upper().startswith("CREATE"):
             stripped = f"CREATE VIEW {view.name} AS {stripped}"
-        parsed = sqlglot.parse_one(stripped, read="mysql")
+        from dsql_migrator.core.converter import MYSQL_EXPRESSION_DIALECT
+
+        # Read and written back as the conversion reads MySQL: VAR_SAMP stays VAR_SAMP (not
+        # VARIANCE, MySQL's population one), a CHAR(n) cast keeps its n, and a DATE_FORMAT
+        # its format -- so the source pane, Copy and the AI chat show what MySQL computes.
+        parsed = sqlglot.parse_one(stripped, read=MYSQL_EXPRESSION_DIALECT)
         if parsed is not None:
-            pretty = parsed.sql(dialect="mysql", pretty=True).strip()
+            pretty = parsed.sql(dialect=MYSQL_EXPRESSION_DIALECT, pretty=True).strip()
             if pretty:
                 return pretty
     except Exception:  # noqa: BLE001 - unparseable: show the source verbatim
