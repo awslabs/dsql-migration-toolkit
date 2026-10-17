@@ -6990,7 +6990,9 @@ class BatchedTableMigrator:
         if self._inputs.cdc_coexisting or not self._inputs.replace_tables:
             return []
         return _views_referencing(
-            self._inputs.dependent_view_ddls, self._inputs.replace_tables
+            self._inputs.dependent_view_ddls,
+            self._inputs.replace_tables,
+            known_tables=list(self._inputs.table_conversions or ()),
         )
 
     def predrop_blocking_foreign_keys(self) -> None:

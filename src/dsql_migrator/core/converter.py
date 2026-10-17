@@ -493,6 +493,7 @@ def _new_frame(*, in_from: bool = False, query: bool = False) -> dict:
         "item": None,
         "as": False,
         "prev": None,  # the previous bare word at this level
+        "distinct_on": False,  # the (...) of a DISTINCT ON, closing before the first item
     }
 
 
@@ -595,6 +596,7 @@ def _scan_sql_names(text: str) -> _SqlNames:
             if item is not None:
                 if item.skip_paren:
                     item.skip_paren = False
+                    frames[-1]["distinct_on"] = True
                 else:
                     item.chains += 2  # an expression: no longer a lone column
         elif kind == "close":
@@ -603,6 +605,10 @@ def _scan_sql_names(text: str) -> _SqlNames:
                 closed = frames.pop()
                 if closed["from_item"]:
                     frames[-1]["expect"] = False
+                if closed["distinct_on"] and frames[-1]["item"] is not None:
+                    # The first item starts after the DISTINCT ON key, whose names are not
+                    # part of what it puts out.
+                    frames[-1]["item"].start = match.end()
         elif kind == "comma":
             if frame["in_from"]:
                 frame["expect"] = True
@@ -616,7 +622,9 @@ def _scan_sql_names(text: str) -> _SqlNames:
     return _SqlNames(names=names, relations=relations, items=items, masked=masked)
 
 
-def views_in_dependency_order(views: "Sequence[ViewConversion]") -> "list[ViewConversion]":
+def views_in_dependency_order(
+    views: "Sequence[ViewConversion]", *, tables: "Iterable[str]" = ()
+) -> "list[ViewConversion]":
     """``views`` with each one after the other views it reads, so a ``CREATE VIEW`` over
     another view never runs first and fails (the view it reads does not exist yet).
 
@@ -624,33 +632,58 @@ def views_in_dependency_order(views: "Sequence[ViewConversion]") -> "list[ViewCo
     its schema when qualified, so a column, an alias or another schema's table spelled like
     a view is no dependency. The given order is kept wherever nothing forces a change; a
     cycle (only a false match can make one: PostgreSQL refuses a real one) is broken
-    inside it, never by placing a view that waits on it. Memoized by the DDL texts: the
+    inside it, never by placing a view that waits on it. ``tables`` are the tables' names:
+    a bare relation that is a public TABLE reads no view. Memoized by the DDL texts: the
     Schema Conversion screen asks on every render. Pure."""
     key = tuple((view.view, view.target_ddl or "") for view in views)
-    return [views[index] for index in _view_order_indices(key)]
+    return [views[index] for index in _view_order_indices(key, _public_names(tables))]
 
 
 @functools.lru_cache(maxsize=8)
-def _view_order_indices(key: "tuple[tuple[str, str], ...]") -> "tuple[int, ...]":
-    return tuple(_dependency_order_indices([(name, text) for name, text in key]))
+def _view_order_indices(
+    key: "tuple[tuple[str, str], ...]", public_tables: "frozenset[str]" = frozenset()
+) -> "tuple[int, ...]":
+    return tuple(
+        _dependency_order_indices([(name, text) for name, text in key], public_tables=public_tables)
+    )
 
 
-def _dependency_order(items: list, *, name_of, text_of) -> list:
+def _public_names(names: "Iterable[str]") -> "frozenset[str]":
+    """The bare names of the relations in schema ``public``, among ``names``."""
+    found = set()
+    for name in names or ():
+        schema, bare = _split_qualified(name)
+        if schema == "public":
+            found.add(bare)
+    return frozenset(found)
+
+
+def _dependency_order(items: list, *, name_of, text_of, tables: "Iterable[str]" = ()) -> list:
     """:func:`views_in_dependency_order` over any named view texts."""
-    order = _dependency_order_indices([(name_of(item), text_of(item)) for item in items])
+    order = _dependency_order_indices(
+        [(name_of(item), text_of(item)) for item in items], public_tables=_public_names(tables)
+    )
     return [items[index] for index in order]
 
 
 def _dependency_order_indices(
-    named_texts: "list[tuple[str, str]]", scans: "Optional[list[_SqlNames]]" = None
+    named_texts: "list[tuple[str, str]]",
+    scans: "Optional[list[_SqlNames]]" = None,
+    *,
+    public_tables: "frozenset[str]" = frozenset(),
 ) -> "list[int]":
     """The order (indices) of :func:`views_in_dependency_order`; ``scans`` are the texts'
-    :func:`_scan_sql_names`, when the caller has them already.
+    :func:`_scan_sql_names`, when the caller has them already, and ``public_tables`` the
+    bare names of the tables in schema ``public``.
 
-    The strongly connected components are found ONCE and placed in dependency order, each
-    one's members in the given order: a false cycle (only a false match makes one) costs
-    nothing extra. Re-running the cycle search per placed view was cubic -- per-tenant
-    views of one name, all reading a shared table, took 16 s at 1,000 views."""
+    A bare relation is the one on the search path -- pg_get_viewdef prints a name bare
+    only when it resolves there -- so it reads the public table or view of that name. With
+    neither, it reads another schema's view only when exactly one has the name: binding it
+    to every same-named view (per-tenant views over a shared table) made one false cycle
+    of all of them, and a quadratic edge set. The strongly connected components are found
+    ONCE and placed in dependency order; inside one, members are placed as their reads in
+    it are (smallest first), a member breaking the cycle only when none is ready -- so a
+    real chain inside a false cycle keeps its order."""
     import heapq
 
     count = len(named_texts)
@@ -658,14 +691,14 @@ def _dependency_order_indices(
         return list(range(count))
     by_bare: dict[str, list[int]] = {}
     by_qualified: dict[tuple[str, str], list[int]] = {}
-    in_public: set[int] = set()
+    public_by_bare: dict[str, list[int]] = {}
     for index, (name, _text) in enumerate(named_texts):
         schema, bare = _split_qualified(name)
         by_bare.setdefault(bare, []).append(index)
         if schema is not None:
             by_qualified.setdefault((schema, bare), []).append(index)
         if schema == "public":
-            in_public.add(index)
+            public_by_bare.setdefault(bare, []).append(index)
     reads: list[set[int]] = []
     for index, (_name, text) in enumerate(named_texts):
         found: set[int] = set()
@@ -674,11 +707,15 @@ def _dependency_order_indices(
             if schema is not None:
                 found.update(by_qualified.get((schema, bare), ()))
                 continue
-            # A bare relation is the one on the search path: pg_get_viewdef prints a name
-            # bare only when it resolves there, so the public view wins when there is one.
-            candidates = by_bare.get(bare, ())
-            public = [other for other in candidates if other in in_public]
-            found.update(public or candidates)
+            if bare in public_tables:
+                continue  # the public table: no view
+            public = public_by_bare.get(bare)
+            if public:
+                found.update(public)
+            else:
+                candidates = by_bare.get(bare, ())
+                if len(candidates) == 1:
+                    found.update(candidates)
         found.discard(index)
         reads.append(found)
     component_of, components = _strongly_connected(reads)
@@ -696,12 +733,53 @@ def _dependency_order_indices(
     ordered: list[int] = []
     while ready:
         _first, component = heapq.heappop(ready)
-        ordered.extend(sorted(components[component]))
+        ordered.extend(_component_order(components[component], reads, component_of))
         for dependent in feeds[component]:
             waiting[dependent] -= 1
             if waiting[dependent] == 0:
                 heapq.heappush(ready, (min(components[dependent]), dependent))
     return ordered
+
+
+def _component_order(
+    members: "list[int]", reads: "list[set[int]]", component_of: "list[int]"
+) -> "list[int]":
+    """One strongly connected component's members, each after the members it reads when it
+    can be (smallest ready first), the smallest unplaced member breaking a cycle only when
+    none is ready."""
+    import heapq
+
+    if len(members) == 1:
+        return list(members)
+    component = component_of[members[0]]
+    inside = {m: {r for r in reads[m] if component_of[r] == component} for m in members}
+    readers: dict[int, list[int]] = {m: [] for m in members}
+    for member, its_reads in inside.items():
+        for read in its_reads:
+            readers[read].append(member)
+    waiting = {m: len(inside[m]) for m in members}
+    ready = [m for m in members if waiting[m] == 0]
+    heapq.heapify(ready)
+    unplaced = sorted(members)
+    unplaced_heap = list(unplaced)
+    placed: set[int] = set()
+    out: list[int] = []
+    while len(out) < len(members):
+        if ready:
+            member = heapq.heappop(ready)
+            if member in placed:
+                continue
+        else:
+            while unplaced_heap[0] in placed:
+                heapq.heappop(unplaced_heap)
+            member = heapq.heappop(unplaced_heap)  # break the cycle with the smallest
+        placed.add(member)
+        out.append(member)
+        for reader in readers[member]:
+            waiting[reader] -= 1
+            if waiting[reader] == 0 and reader not in placed:
+                heapq.heappush(ready, reader)
+    return out
 
 
 def _strongly_connected(edges: "list[set[int]]") -> "tuple[list[int], list[list[int]]]":
@@ -1086,7 +1164,9 @@ class SchemaConversionResult(BaseModel):
         # Views come AFTER tables/indexes because a view selects from the tables, and each
         # after the views it reads.
         view_units: list[ExecutionUnit] = []
-        for view in views_in_dependency_order(self.views):
+        for view in views_in_dependency_order(
+            self.views, tables=[table.table for table in self.tables]
+        ):
             for schema_ddl in view.schema_ddls:
                 if schema_ddl not in seen_schema_ddls:
                     seen_schema_ddls.add(schema_ddl)
@@ -7509,8 +7589,13 @@ def pg_views_remodelling(
     enum_types = _enum_cast_types(tables)
     every = [_scan_sql_names(view.definition or "") for view in views]
     order = _dependency_order_indices(
-        [(view.name, view.definition or "") for view in views], every
+        [(view.name, view.definition or "") for view in views],
+        every,
+        public_tables=_public_names(table.name for table in tables),
     )
+    # Every public relation's bare name: a bare name binds there whether or not it is
+    # re-typed (a plain public table hands on nothing).
+    public_names = _public_names([*(t.name for t in tables), *(v.name for v in views)])
     ordered = [views[index] for index in order]
     scans = [every[index] for index in order]
     readers: dict[str, list[int]] = {}
@@ -7525,7 +7610,9 @@ def pg_views_remodelling(
         position = queue.popleft()
         queued.discard(position)
         view = ordered[position]
-        result, hand_on = _remodel_view(view, scans[position], sources, enum_types)
+        result, hand_on = _remodel_view(
+            view, scans[position], sources, enum_types, public_names=public_names
+        )
         out[view.name] = result
         if hand_on and hand_on != handed.get(view.name):
             handed[view.name] = hand_on
@@ -7543,9 +7630,12 @@ def _remodel_view(
     scan: "_SqlNames",
     sources: "Mapping[str, Mapping[str, Mapping[str, tuple[str, str]]]]",
     enum_types: "Mapping[tuple[str, ...], str]",
+    *,
+    public_names: "frozenset[str]" = frozenset(),
 ) -> "tuple[PgViewRemodelling, dict[str, tuple[str, str]]]":
     """One view's :class:`PgViewRemodelling` given what the relations it reads hand on, and
-    what it hands on in turn (empty unless flagged)."""
+    what it hands on in turn (empty unless flagged). ``public_names``: the bare names of
+    every public table and view, where a bare name resolves."""
     definition = view.definition or ""
     if not definition:
         return PgViewRemodelling(definition), {}
@@ -7553,11 +7643,13 @@ def _remodel_view(
     references: list[tuple[str, str, str, str]] = []
     read: set[str] = set()
     for schema, bare in scan.relations:
-        candidates = sorted(sources.get(bare, {}).items())
-        if schema is None:
-            # A bare name resolves on the search path: the public relation when there is one.
-            public = [entry for entry in candidates if _split_qualified(entry[0])[0] == "public"]
-            candidates = public or candidates
+        entries = sources.get(bare, {})
+        if schema is None and bare in public_names:
+            # A bare name resolves on the search path: the public relation, re-typed or not.
+            public = f"public.{bare}"
+            candidates = [(public, entries[public])] if public in entries else []
+        else:
+            candidates = list(entries.items())
         for relation, columns in candidates:
             if relation == view.name or relation in read:
                 continue
@@ -7569,7 +7661,7 @@ def _remodel_view(
                 for column, (old, new) in columns.items()
                 if column in scan.names
             )
-    result = PgViewRemodelling(emitted, tuple(references), tuple(rewritten))
+    result = PgViewRemodelling(emitted, tuple(sorted(set(references))), tuple(rewritten))
     if not result.flagged:
         return result, {}
     carrying = {column: (old, new) for _relation, column, old, new in references}

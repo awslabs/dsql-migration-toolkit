@@ -490,7 +490,9 @@ def build_apply_objects(result: SchemaConversionResult) -> list[ApplyObject]:
         )
         # Each view after the views it reads: in catalog (name) order a view over a later
         # view failed, and only a second apply created it.
-        for view in views_in_dependency_order(result.views)
+        for view in views_in_dependency_order(
+            result.views, tables=[table.table for table in result.tables]
+        )
         if view.auto_converted
     )
     return objects

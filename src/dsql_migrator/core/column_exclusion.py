@@ -506,7 +506,10 @@ T4 = "T4"  # column rules on it are inert
 
 
 def views_referencing(
-    view_ddls: Mapping[str, str], tables: "frozenset[str]"
+    view_ddls: Mapping[str, str],
+    tables: "frozenset[str]",
+    *,
+    known_tables: "Iterable[str]" = (),
 ) -> list[str]:
     """Return the CREATE-VIEW DDLs to drop before ``tables`` are DROP+recreated, in
     CREATE order -- each after the views it reads; drop them in reverse.
@@ -521,7 +524,8 @@ def views_referencing(
     otherwise "reference" the table ``shop.orders``. In name order they were dropped and
     re-created regardless of which reads which: a view over a later-named view failed
     its CREATE (and was left missing), or an earlier-named view still read blocked the
-    DROP and with it the reload.
+    DROP and with it the reload. ``known_tables`` are every table's name, so a bare
+    relation that is a public table orders no view after another.
     """
     if not view_ddls or not tables:
         return []
@@ -536,7 +540,11 @@ def views_referencing(
         ddl = view_ddls[view_name]
         head = _VIEW_HEAD_RE.match(ddl)
         body = (ddl[head.end():] if head is not None else ddl).lower()
-        for word in set(_BODY_WORD_RE.findall(body)):
+        words = set(_BODY_WORD_RE.findall(body))
+        # A quoted name is one word whatever it holds ("Order Details", "order-items"),
+        # or a table or view so named was never found and its readers stayed in place.
+        words.update(q.replace('""', '"') for q in _QUOTED_NAME_RE.findall(body))
+        for word in words:
             readers_of.setdefault(word, []).append(view_name)
 
     def readers(names: "Iterable[str]") -> "set[str]":
@@ -553,13 +561,18 @@ def views_referencing(
         selected.extend(new)
         frontier = new
     ordered = _dependency_order(
-        sorted(selected), name_of=lambda name: name, text_of=lambda name: view_ddls[name]
+        sorted(selected),
+        name_of=lambda name: name,
+        text_of=lambda name: view_ddls[name],
+        tables=[*known_tables, *tables],  # the reloaded ones are tables too
     )
     return [view_ddls[name] for name in ordered]
 
 
 # A word of a lower-cased view body, as names_in bounds it (identifier characters).
 _BODY_WORD_RE = re.compile(r"[\w$]+")
+# The contents of a quoted identifier.
+_QUOTED_NAME_RE = re.compile(r'"((?:[^"]|"")+)"')
 
 # ``CREATE [OR REPLACE] [MATERIALIZED] VIEW <name>``: the part of a view DDL that names the
 # view itself, not what it reads.
