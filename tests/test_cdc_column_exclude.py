@@ -414,3 +414,41 @@ def test_an_oversized_capture_is_e4_unless_generated_alone_overflow_and_deployed
                                        capture=_capture_hook(gen))
     assert not any(e.code == "E4" for e in only_gen.global_errors)
     assert only_gen.capture_warning and "alone need" in only_gen.capture_warning
+
+
+def test_the_applied_ddl_decides_which_columns_cdc_leaves_out():
+    """A column made GENERATED in Schema Conversion (the MySQL generated-column advice) was
+    still captured, so every CDC insert and update of the table was refused (428C9); one
+    edited back to ordinary stayed excluded, so CDC never wrote it."""
+    from dsql_migrator.ui.data_migration._models import (
+        cdc_capture_exclusions,
+        target_generated_capture_columns,
+    )
+
+    orders = TableDef(
+        name="shop.orders",
+        columns=[ColumnDef(name=c, mysql_type="int") for c in ("id", "qty", "price", "Total")],
+        primary_key=["id"],
+    )
+    ddl = (
+        'CREATE TABLE "shop"."orders" ("id" integer GENERATED ALWAYS AS (1) STORED NOT NULL, '
+        '"qty" integer, "price" integer, '
+        'total integer GENERATED ALWAYS AS ("qty" * "price") STORED, PRIMARY KEY ("id"))'
+    )
+    applied = {"shop.orders": SimpleNamespace(target_ddl=ddl, index_ddls=[])}
+    # By the SOURCE name (an unquoted edit folds Total), and never a key column.
+    assert target_generated_capture_columns(orders, applied) == ["Total"]
+
+    state = _state([])
+    state.set_applied_conversions(applied, preserve_foreign_keys=True)
+    inv = SourceInventory(tables=[orders, DOCS])
+    cx = cdc_capture_exclusions(state, inv, inv.tables)
+    assert cx.structured == {"shop.docs": ["gen"], "shop.orders": ["Total"]}
+
+    # DOCS' preserved STORED column edited back to ordinary is captured again.
+    plain = 'CREATE TABLE "shop"."docs" ("id" text NOT NULL, "body" text, "gen" text, PRIMARY KEY ("id"))'
+    state.set_applied_conversions(
+        {**applied, "shop.docs": SimpleNamespace(target_ddl=plain, index_ddls=[])},
+        preserve_foreign_keys=True,
+    )
+    assert cdc_capture_exclusions(state, inv, inv.tables).structured == {"shop.orders": ["Total"]}

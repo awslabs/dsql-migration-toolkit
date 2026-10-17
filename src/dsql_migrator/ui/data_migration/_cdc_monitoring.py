@@ -1862,8 +1862,9 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "a GENERATED column was sent a value",
         "the Aurora DSQL column is GENERATED (it computes its own value), and the change "
         "records carry one, so DSQL rejected every insert and update for this table "
-        "(SQLSTATE 428C9). This is not a source change: the column was made GENERATED on "
-        "the target, which CDC cannot write",
+        "(SQLSTATE 428C9). This is not a source change: the column is GENERATED on the "
+        "target but not in the conversion CDC started with (made so afterwards, or outside "
+        "Schema Conversion), so the stream still carries its value",
     ),
     "check-violation": (
         "a CHECK constraint rejected the row",

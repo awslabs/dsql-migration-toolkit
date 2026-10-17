@@ -368,10 +368,12 @@ def catalog_drift_request(
     migration_state: object, baseline: CatalogBaseline
 ) -> CatalogDriftRequest:
     """Build one read's input ON THE LOOP (once per read, never per render): the tables, the
-    concrete columns CDC does not capture (effective exclusions + PostgreSQL STORED generated
-    columns, exactly ``CdcCaptureExclusions.structured``) and the Fix-added columns."""
-    from dsql_migrator.core.converter import pg_preserved_generated_columns
-    from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
+    concrete columns CDC does not capture (effective exclusions + the columns the target
+    generates, exactly ``CdcCaptureExclusions.structured``) and the Fix-added columns."""
+    from dsql_migrator.ui.data_migration._models import (
+        effective_lob_exclusions,
+        generated_capture_columns,
+    )
 
     tables, gone = _scope_parts(migration_state, baseline)
     try:
@@ -386,11 +388,12 @@ def catalog_drift_request(
     excluded: dict[str, frozenset] = {}
     rekey_all = cdc_rekey_columns(migration_state)
     rekey: dict[str, frozenset] = {}
+    generated = generated_capture_columns(migration_state, tables.values())
     for name, table in tables.items():
         names = {str(c) for c in (effective.get(name) or ())}
         if names:
             excluded[name] = frozenset(names)
-        names.update(c.name for c in pg_preserved_generated_columns(table))
+        names.update(generated.get(name, ()))
         if names:
             skip[name] = frozenset(names)
         if rekey_all.get(name):

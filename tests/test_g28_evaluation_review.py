@@ -1743,7 +1743,9 @@ def test_generated_column_advice_never_sends_a_cdc_migration_to_a_generated_targ
     (concern,) = [c for c in item.concerns if c.rule_id == "GENERATED_COLUMN"]
     assert "STORED (total): MySQL stores the value, so Full Load copies it and CDC carries" in concern.risk
     assert "VIRTUAL (label)" in concern.risk
-    assert "Not with CDC" in concern.recommendation and "428C9" in concern.recommendation
+    # CDC leaves a column the applied DDL makes GENERATED out of the stream (G46).
+    assert "Full Load and CDC then leave the column out" in concern.recommendation
+    assert "428C9" in concern.recommendation
     assert concern.recommendation == MYSQL_GENERATED_COLUMN_ADVICE
     # Step 2 says the same thing.
     notes = SchemaConverter().convert_table(table, None).warnings  # type: ignore[arg-type]

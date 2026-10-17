@@ -2894,7 +2894,8 @@ def popup_resolution(
     if capture_tables is not None:
         def capture(columns, selected):
             return capture_exclusions_for(
-                columns, columns, inventory, list(capture_tables(selected)), deployed)
+                columns, columns, inventory, list(capture_tables(selected)), deployed,
+                applied=inputs.applied)
 
     reselect_lock = None
     if add_lock is not None:
@@ -3470,8 +3471,6 @@ def deployed_capture_exclusions(
         infer_column_exclusions,
         split_column_exclude_value,
     )
-    from dsql_migrator.core.converter import pg_preserved_generated_columns
-
     deployed = getattr(migration_state, "cdc_deployed_column_exclude_list", None)
     if deployed is None:
         return None
@@ -3479,9 +3478,7 @@ def deployed_capture_exclusions(
         return DeployedCaptureExclusions({}, "plain")
     tables = list(getattr(inventory, "tables", None) or ())
     by_name = {t.name: t for t in tables}
-    generated_all = {
-        t.name: {c.name for c in pg_preserved_generated_columns(t)} for t in tables
-    }
+    generated_all = generated_capture_columns(migration_state, tables)
 
     def _operator(found):
         return {
@@ -3547,16 +3544,10 @@ def capture_exclusion_mismatch(
         or phase in ("running", "partial", "unstable")
     ):
         return None
-    from dsql_migrator.core.converter import pg_preserved_generated_columns
-
     now_names = {getattr(t, "name", None) for t in captured_tables or ()}
     stack_names = set(getattr(migration_state, "cdc_reconciled_table_names", None) or ())
     shared = (now_names & stack_names) if stack_names else now_names
-    generated = {
-        t.name: {c.name for c in pg_preserved_generated_columns(t)}
-        for t in captured_tables or ()
-        if getattr(t, "name", None)
-    }
+    generated = generated_capture_columns(migration_state, captured_tables)
     session = {
         t: sorted(set(cols) - generated.get(t, set()))
         for t, cols in capture.structured.items()
@@ -3644,7 +3635,63 @@ def cdc_capture_exclusions(
         inventory,
         captured_tables,
         getattr(migration_state, "cdc_deployed_column_exclude_list", None),
+        applied=applied_conversions_of(migration_state),
     )
+
+
+def applied_conversions_of(migration_state) -> "Optional[Mapping[str, object]]":
+    """The applied Schema Conversion recorded on ``migration_state`` (``None`` when there is
+    none to read, e.g. a test double)."""
+    applied_of = getattr(migration_state, "applied_conversions", None)
+    if not callable(applied_of):
+        return None
+    try:
+        return applied_of()[0]
+    except Exception:  # noqa: BLE001 - no applied conversion: the source decides
+        return None
+
+
+def generated_capture_columns(migration_state, tables) -> "dict[str, set[str]]":
+    """``{table: columns}`` CDC leaves out because Aurora DSQL computes them (see
+    :func:`target_generated_capture_columns`) -- the set every reading of the capture
+    exclusions subtracts or adds, so they all agree with what Start CDC sends."""
+    applied = applied_conversions_of(migration_state)
+    return {
+        t.name: set(target_generated_capture_columns(t, applied))
+        for t in tables or ()
+        if getattr(t, "name", None)
+    }
+
+
+def target_generated_capture_columns(table, applied: "Optional[Mapping[str, object]]") -> "list[str]":
+    """The columns of ``table`` Aurora DSQL computes, by their SOURCE names: CDC must not
+    send them (a value for a generated column is refused, 428C9, so every change of the
+    table would be dead-lettered). The APPLIED DDL decides when there is one -- it is what
+    the target has, a column the operator made GENERATED in Schema Conversion included, and
+    one edited back to ordinary excluded -- else the source's preserved PostgreSQL STORED
+    columns. A key column is never listed: the sink needs it to write and delete."""
+    from dsql_migrator.core.converter import (
+        parse_target_generated_columns,
+        pg_preserved_generated_columns,
+    )
+
+    ddl = getattr((applied or {}).get(table.name), "target_ddl", None)
+    if not ddl:
+        names = [c.name for c in pg_preserved_generated_columns(table)]
+    else:
+        named = parse_target_generated_columns(ddl, folded=True)
+        exact = {c.name for c in table.columns}
+        lowered: dict[str, list[str]] = {}
+        for column in table.columns:
+            lowered.setdefault(column.name.lower(), []).append(column.name)
+        names = []
+        for name in sorted(named):
+            if name in exact:
+                names.append(name)
+            elif len(lowered.get(name.lower(), ())) == 1:
+                names.append(lowered[name.lower()][0])
+    keys = set(getattr(table, "primary_key", None) or ())
+    return sorted(name for name in names if name not in keys)
 
 
 def capture_exclusions_for(
@@ -3653,11 +3700,14 @@ def capture_exclusions_for(
     inventory,
     captured_tables: "Sequence[object]",
     deployed_value: "Optional[str]",
+    *,
+    applied: "Optional[Mapping[str, object]]" = None,
 ) -> CdcCaptureExclusions:
     """:func:`cdc_capture_exclusions` for ANY set -- pure, so the exclusion popup previews
     exactly what Start CDC would send after its Save: ``effective`` is the exclusion set
     every path reads, ``raw_stored`` the stored set the 0.1.561 legacy form is built from,
-    ``deployed_value`` the stack's recorded ColumnExcludeList."""
+    ``deployed_value`` the stack's recorded ColumnExcludeList, ``applied`` the applied
+    Schema Conversion (which columns the target generates)."""
     from dsql_migrator.core.cdc import (
         CDC_PARAMETER_BYTE_LIMIT,
         choose_column_exclude_value,
@@ -3665,7 +3715,6 @@ def capture_exclusions_for(
         column_exclude_inexact_entries,
         format_column_exclude_value,
     )
-    from dsql_migrator.core.converter import pg_preserved_generated_columns
 
     captured = list(captured_tables or ())
     captured_names = {t.name for t in captured}
@@ -3679,7 +3728,7 @@ def capture_exclusions_for(
     }
     generated: dict[str, list[str]] = {}
     for table in captured:
-        preserved = [c.name for c in pg_preserved_generated_columns(table)]
+        preserved = target_generated_capture_columns(table, applied)
         if preserved:
             merged.setdefault(table.name, set()).update(preserved)
             generated[table.name] = sorted(preserved)

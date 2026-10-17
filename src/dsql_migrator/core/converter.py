@@ -3508,14 +3508,13 @@ def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
 # What to do about a MySQL generated column (Evaluation's recommendation; the conversion
 # note carries it too).
 MYSQL_GENERATED_COLUMN_ADVICE = (
-    "Compute the value in the application after cut over. For a Full load only migration "
-    "you can instead re-add the expression before applying: read it with SHOW CREATE TABLE, "
-    "translate it to PostgreSQL and edit the target DDL in Schema Conversion to GENERATED "
-    "ALWAYS AS (<expression>) STORED; Full Load then lets Aurora DSQL compute it. Not with "
-    "CDC: a GENERATED column rejects the value every CDC insert and update carries, so each "
-    "of them would be set aside (SQLSTATE 428C9). Decide before applying: Aurora DSQL can "
-    "turn a generated column into an ordinary one (ALTER COLUMN ... DROP EXPRESSION) but "
-    "cannot add an expression to an existing column."
+    "Compute the value in the application after cut over, or re-add the expression before "
+    "applying: read it with SHOW CREATE TABLE, translate it to PostgreSQL and edit the "
+    "target DDL in Schema Conversion to GENERATED ALWAYS AS (<expression>) STORED. Full Load "
+    "and CDC then leave the column out of every write (Aurora DSQL refuses a value for a "
+    "generated column, SQLSTATE 428C9), and Aurora DSQL computes it. Decide before applying: "
+    "Aurora DSQL can turn a generated column into an ordinary one (ALTER COLUMN ... DROP "
+    "EXPRESSION) but cannot add an expression to an existing column."
 )
 
 
@@ -3531,7 +3530,7 @@ def mysql_generated_column_advice(table: TableDef) -> str:
     if not keyed:
         return MYSQL_GENERATED_COLUMN_ADVICE
     key_advice = (
-        f"Keep {', '.join(keyed)} ordinary, even for a Full load only migration: "
+        f"Keep {', '.join(keyed)} ordinary: "
         f"{'it is' if len(keyed) == 1 else 'they are'} part of the primary key, and Full "
         "Load writes every key column, so a GENERATED one would have every batch rejected "
         "(SQLSTATE 428C9)."

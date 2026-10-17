@@ -545,11 +545,12 @@ shared "write contract" keeps them identical).
 >
 > A **MySQL** generated column is created as an ordinary column (the tool does not read its
 > expression): Full Load copies the computed value, and CDC carries a `STORED` one's value. You
-> can re-add the expression (`GENERATED ALWAYS AS (...) STORED`) in Schema Conversion for a
-> **Full load only** migration — never with CDC, which sends every column's value and so would
-> have every insert and update rejected (SQLSTATE `428C9`). A generated column that is part of
-> the primary key stays ordinary even then: Full Load writes every key column, so a `GENERATED`
-> key column would have every batch rejected.
+> can re-add the expression (`GENERATED ALWAYS AS (...) STORED`) in Schema Conversion before
+> applying, for any migration type: Full Load and CDC then leave every column the applied DDL
+> makes `GENERATED` out of their writes (Aurora DSQL refuses a value for one, SQLSTATE `428C9`),
+> and Aurora DSQL computes it. A generated column that is part of the primary key stays
+> ordinary: Full Load and CDC write every key column, so a `GENERATED` key column would have
+> every write rejected.
 
 ### Type mapping (complete reference)
 
