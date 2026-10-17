@@ -160,17 +160,7 @@ def pg_nextval_sequence(default: Optional[str]) -> Optional[str]:
     return ".".join(names) if names else None
 
 
-def _own_serial_sequence(sequence: str, column: str, table: Optional[str]) -> bool:
-    """Whether ``sequence`` looks like ``column``'s own serial sequence, which PostgreSQL
-    names ``<table>_<column>_seq`` (a number appended when that is taken). Without the
-    table, the ``_<column>_seq`` ending is what can be told."""
-    bare = sequence.rsplit(".", 1)[-1]
-    if table:
-        return bare.startswith(f"{table.rsplit('.', 1)[-1]}_{column}_seq")
-    return bare.endswith(f"_{column}_seq")
-
-
-def pg_identity_fallback(columns: "Sequence[ColumnDef]", table: Optional[str] = None) -> str:
+def pg_identity_fallback(columns: "Sequence[ColumnDef]") -> str:
     """How to have Aurora DSQL generate these sequence-fed columns' values with an identity:
     the clause both Schema Conversion's note on a non-key ``serial`` / identity column and
     Evaluation's ``NON_KEY_SEQUENCE`` finding give, so the two steps say the same thing.
@@ -213,31 +203,15 @@ def pg_identity_fallback(columns: "Sequence[ColumnDef]", table: Optional[str] = 
             "DDL before applying (an identity column holds no NULL)"
         )
     text = "; ".join(parts) + "; then " + IDENTITY_RESTART_ADVICE
-    # CACHE 1 is the source's own default: one value at a time, no gaps. Said, because the
+    # CACHE 1 is the source's own default: one value at a time, in order. Said, because the
     # clause above silently traded that for throughput.
     text += (
-        f" (CACHE {_IDENTITY_CACHE_SIZE} serves concurrent inserts faster but leaves gaps "
-        "and out-of-order values; CACHE 1 keeps the source's one-value-at-a-time numbering, "
-        "and Aurora DSQL accepts only those two kinds of size)"
+        f" (CACHE {_IDENTITY_CACHE_SIZE} serves concurrent inserts faster but hands each "
+        "session a block, so values arrive out of order with large gaps; CACHE 1 hands them "
+        "out one at a time and in order, as the source does -- though an aborted or retried "
+        "transaction still uses one up, there as here -- and Aurora DSQL accepts only those "
+        "two kinds of size)"
     )
-    # A DEFAULT that calls a sequence other than the column's own serial one may be a
-    # sequence several tables share: an identity per table would give each its own
-    # counter, and they would hand out the same numbers.
-    shared = [
-        (column.name, sequence)
-        for column in columns
-        if not column.identity
-        and (sequence := pg_nextval_sequence(column.default)) is not None
-        and not _own_serial_sequence(sequence, column.name, table)
-    ]
-    if shared:
-        named = ", ".join(f"'{name}' calls {sequence}" for name, sequence in shared)
-        text += (
-            f". {named}, which is not its own serial sequence: if other tables share it, "
-            "do not add an identity -- create the sequence on Aurora DSQL and re-attach the "
-            "DEFAULT (ALTER TABLE ... ALTER COLUMN ... SET DEFAULT nextval(...)), as Step 1's "
-            "item for that sequence says"
-        )
     return text
 
 

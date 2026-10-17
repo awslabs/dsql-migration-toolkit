@@ -576,7 +576,7 @@ def compute_migration_score(report: AssessmentReport) -> Optional[MigrationScore
     Pure and deterministic so it is unit-testable and matches the on-screen and exported
     values.
     """
-    items = report.items
+    items = report.assessed_items
     if not items:
         return None
 
@@ -1038,6 +1038,14 @@ def run_evaluation(
         assessor
         or CompatibilityAssessor(source_type=inputs.source_config.source_type)
     ).assess(inventory, target_inventory=target_inventory)
+    # What the read listed but found gone (twice): said, never silently left out.
+    vanished = list(getattr(introspector, "last_vanished", None) or [])
+    if vanished:
+        from dsql_migrator.core.assessor import catalog_changed_items
+
+        assessment = AssessmentReport.from_items(
+            [*assessment.items, *catalog_changed_items(vanished)]
+        )
     if listing_gaps:
         assessment = AssessmentReport.from_items(
             [*assessment.items, *source_visibility_items(listing_gaps)]
@@ -1617,7 +1625,7 @@ def build_evaluation_screen(
                 "run assessment",
                 status=ActivityStatus.SUCCESS,
                 detail=(
-                    f"{len(report.items)} object(s) assessed ({counts}); "
+                    f"{len(report.assessed_items)} object(s) assessed ({counts}); "
                     f"{conflicts} target conflict(s)"
                 ),
             )
@@ -1630,14 +1638,14 @@ def build_evaluation_screen(
                 _uns = _sm.get("UNSUPPORTED", 0)
                 ai_post_event(
                     text=(
-                        f"Assessment complete: {len(report.items)} objects — "
+                        f"Assessment complete: {len(report.assessed_items)} objects — "
                         f"{_auto} automatic, {_man} need review, {_uns} unsupported"
                         + (f"; {conflicts} already on target" if conflicts else "")
                     ),
                     status="success",
                     kind="assessment",
                     data={
-                        "total": len(report.items),
+                        "total": len(report.assessed_items),
                         "auto": _auto,
                         "manual": _man,
                         "unsupported": _uns,
@@ -2325,7 +2333,7 @@ def _render_assessment(
     # a distinct section between the summary badges above and the
     # per-object list below. Only when there is a chart to show (non-empty
     # report), so an empty report does not render stray rules.
-    if report.items:
+    if report.assessed_items:
         ui.separator().classes("my-2")  # type: ignore[attr-defined]
         _render_assessment_chart(ui, report)
         ui.separator().classes("my-2")  # type: ignore[attr-defined]
@@ -2337,7 +2345,7 @@ def _render_assessment(
     # (Classification / Estimated manual effort — the same color-coded categories
     # the summary badges show) and a name search let the user focus on actionable
     # objects in a large schema instead of scrolling past every AUTO object.
-    if not report.items:
+    if not report.assessed_items:
         ui.label("Objects by importance (most critical first)").classes(  # type: ignore[attr-defined]
             "text-md font-semibold"
         )
@@ -2351,7 +2359,7 @@ def _render_assessment(
     # is spelled out as "objects needing work" because it is NOT the object total: an
     # object with no required work (all-AUTO, or only a recommendation) carries no effort
     # estimate and so appears in none of these buckets.
-    if any(item.effort is not None for item in report.items):
+    if any(item.effort is not None for item in report.assessed_items):
         with ui.row().classes("items-center gap-2 flex-wrap"):  # type: ignore[attr-defined]
             ui.label("Estimated manual effort").classes(  # type: ignore[attr-defined]
                 "text-sm font-semibold text-gray-700"
@@ -2362,14 +2370,14 @@ def _render_assessment(
                 ).classes("text-sm q-px-sm q-py-xs")
             needing = sum(report.effort_summary.values())
             ui.label(  # type: ignore[attr-defined]
-                f"({needing:,} of {len(report.items):,} objects need work)"
+                f"({needing:,} of {len(report.assessed_items):,} objects need work)"
             ).classes("text-xs text-gray-500")
 
     # The list's filters, search and pages. A non-UI caller (no eval_state) gets the list
     # with its defaults and no filter bar.
     view = eval_state if eval_state is not None else EvaluationState()
     # Sorted once per render; a filter, the search or Clear filters only re-filters it.
-    ordered = sort_assessment_items(report.items)
+    ordered = sort_assessment_items(report.assessed_items)
     controls: dict[str, object] = {}
     # Set while Clear filters puts the controls back: their change handlers then fire
     # with values already applied, and the one redraw is Clear's own.
@@ -2478,7 +2486,7 @@ def _render_assessment(
             ui,
             ordered,
             view=view,
-            total=len(report.items),
+            total=len(report.assessed_items),
             on_clear=on_clear,
             on_ai=on_ai,
             ai_enabled=ai_enabled,

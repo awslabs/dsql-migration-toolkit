@@ -48,6 +48,7 @@ on PostgreSQL-catalog enrichment) are still later refinements.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from dsql_migrator.core.assessor import (
@@ -610,9 +611,7 @@ class PgNonKeySequenceRule(Rule):
             # an identity only on bigint and cannot change a column's type after apply, so
             # the bare "add an identity on the target" could not be followed on an integer
             # column -- which is what a plain serial is.
-            remedies.append(
-                "For an identity: " + pg_identity_fallback(sequenced, table.name) + "."
-            )
+            remedies.append("For an identity: " + pg_identity_fallback(sequenced) + ".")
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
@@ -983,20 +982,40 @@ def _sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def _columns_calling(sequence_name: str, inventory) -> "list[tuple[str, str]]":
-    """``(table, column)`` of every source column whose DEFAULT calls ``sequence_name``
-    (``schema.name``); a bare name in the DEFAULT counts for a table of that schema."""
+def _default_callers(inventory) -> "dict[str, list[tuple[str, str, str]]]":
+    """``{called sequence: [(table, column, DEFAULT)]}`` from the inventory's DEFAULT text,
+    in one pass -- the fallback when the probe could not read the catalog's own links. A
+    bare name counts under the table's own schema (and the ``public`` default)."""
     from dsql_migrator.core.converter_postgres import pg_nextval_sequence
 
-    schema, _, bare = sequence_name.partition(".")
-    calling: list[tuple[str, str]] = []
+    calls: dict[str, list[tuple[str, str, str]]] = {}
     for table in getattr(inventory, "tables", None) or ():
         table_schema = table.name.partition(".")[0]
         for column in table.columns:
             called = pg_nextval_sequence(column.default)
-            if called == sequence_name or (called == bare and table_schema == schema):
-                calling.append((table.name, column.name))
-    return calling
+            if not called:
+                continue
+            names = {called} if "." in called else {f"{table_schema}.{called}", f"public.{called}"}
+            for name in names:
+                calls.setdefault(name, []).append((table.name, column.name, column.default or ""))
+    return calls
+
+
+def _reattached_default(expression: str, sequence_name: str, quoted: str) -> str:
+    """``expression`` with each ``nextval`` of ``sequence_name`` pointing at the sequence
+    created on Aurora DSQL -- the column's own DEFAULT, never a bare ``nextval`` standing in
+    for a formatted one (``'ORD-' || lpad(nextval(...)::text, 8, '0')``)."""
+    from dsql_migrator.core.converter_postgres import _NEXTVAL_RE, pg_nextval_sequence
+
+    bare = sequence_name.rsplit(".", 1)[-1]
+
+    def _point(match: "re.Match[str]") -> str:
+        called = pg_nextval_sequence(match.group(0)) or ""
+        if called.rsplit(".", 1)[-1] == bare:
+            return f"nextval({_sql_literal(quoted)})"
+        return match.group(0)
+
+    return _NEXTVAL_RE.sub(_point, expression or "")
 
 
 def standalone_sequence_items(
@@ -1021,7 +1040,13 @@ def standalone_sequence_items(
     from dsql_migrator.core.models import SourceType
     from dsql_migrator.core.source_dialect import dialect_for
 
+    from dsql_migrator.core.converter import PrimaryKeyStrategy, default_primary_key_strategy
+
     pg = dialect_for(SourceType.POSTGRES)
+    tables_by_name = {t.name: t for t in (getattr(inventory, "tables", None) or ())}
+    # One pass over the inventory, used only for a sequence the catalog read gave no
+    # callers for (a probe that could not read pg_depend).
+    fallback = _default_callers(inventory) if inventory is not None else {}
     items: list[AssessmentItem] = []
     for sequence in sequences:
         quoted = pg.quote_table(sequence.name)
@@ -1063,9 +1088,10 @@ def standalone_sequence_items(
             )
         if sequence.cache_size <= 1:
             cache_note = (
-                "CACHE 1 keeps the source's one-value-at-a-time allocation; Aurora DSQL also "
-                "accepts CACHE 65536 or more, which serves concurrent sessions faster but "
-                "leaves gaps and out-of-order values."
+                "CACHE 1 hands values out one at a time and in order, as the source does (an "
+                "aborted or retried transaction still uses one up, there as here); Aurora DSQL "
+                "also accepts CACHE 65536 or more, which serves concurrent sessions faster but "
+                "hands each a block, so values arrive out of order with large gaps."
             )
         else:
             cache_note = (
@@ -1073,24 +1099,49 @@ def standalone_sequence_items(
                 "application already tolerates gaps; Aurora DSQL accepts only CACHE 1 or at "
                 "least 65536, so the statement uses 65536."
             )
-        calling = _columns_calling(sequence.name, inventory)
+        calling = list(sequence.callers) or list(fallback.get(sequence.name, ()))
+        # A primary key whose DEFAULT calls the sequence becomes an identity of its own under
+        # the default strategy: a DEFAULT cannot be re-attached to it, and keeping the shared
+        # numbering means choosing Keep source PK for those tables first.
+        keyed = [
+            (table, column)
+            for table, column, _expr in calling
+            if (owner := tables_by_name.get(table)) is not None
+            and owner.auto_increment_column == column
+            and default_primary_key_strategy(owner, is_postgres=True)
+            is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+        ]
+        dropped = [entry for entry in calling if (entry[0], entry[1]) not in set(keyed)]
         defaults = ""
-        if calling:
-            shown = ", ".join(f"{table}.{column}" for table, column in calling)
+        if dropped:
+            shown = ", ".join(f"{table}.{column}" for table, column, _expr in dropped)
             state += (
                 f" A DEFAULT calls it on {shown}; Schema Conversion drops that DEFAULT, so an "
                 "INSERT that omits the column gets no value."
             )
             reattach = " ".join(
                 f"ALTER TABLE {pg.quote_table(table)} ALTER COLUMN "
-                f"{pg.quote_identifier(column)} SET DEFAULT nextval({_sql_literal(quoted)});"
-                for table, column in calling
+                f"{pg.quote_identifier(column)} SET DEFAULT "
+                f"{_reattached_default(expr, sequence.name, quoted) or f'nextval({_sql_literal(quoted)})'};"
+                for table, column, expr in dropped
             )
             defaults = (
-                f" Then re-attach {'that DEFAULT' if len(calling) == 1 else 'those DEFAULTs'}: "
-                f"{reattach} Do not give {'that column' if len(calling) == 1 else 'those columns'} "
-                "an identity instead: each table would get its own counter, and a sequence "
-                "they share would hand out the same numbers twice."
+                f" Then re-attach {'that DEFAULT' if len(dropped) == 1 else 'those DEFAULTs'}, "
+                f"as written on the source: {reattach} Do not give "
+                f"{'that column' if len(dropped) == 1 else 'those columns'} an identity instead "
+                "(the NON_KEY_SEQUENCE advice): each table would get its own counter, and a "
+                "sequence they share would hand out the same numbers twice."
+            )
+        if keyed:
+            shown = ", ".join(f"{table}.{column}" for table, column in keyed)
+            state += (
+                f" It is the primary key DEFAULT of {shown}, which Schema Conversion makes an "
+                "identity of its own, so those tables stop sharing its numbers."
+            )
+            defaults += (
+                " To keep them sharing it, choose 'Keep source PK' for those tables in Schema "
+                "Conversion, then re-attach the DEFAULT as above (an identity column takes no "
+                "DEFAULT)."
             )
         item = AssessmentItem(
             object_name=sequence.name,

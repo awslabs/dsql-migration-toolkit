@@ -1260,6 +1260,7 @@ def _column_default_texts(create_ddl: str) -> "tuple[tuple[str, str], ...]":
         return ()
     literal = (TokenType.STRING, TokenType.IDENTIFIER)
     out: list[tuple[str, str]] = []
+    cases: list[int] = []  # the depth each open CASE raised the nesting to
 
     def _read(definition: "list[tuple[object, int]]") -> None:
         if not definition:
@@ -1295,6 +1296,11 @@ def _column_default_texts(create_ddl: str) -> "tuple[tuple[str, str], ...]":
                 _read(definition)
                 break
             depth -= 1
+        elif token.token_type == TokenType.END and depth > 0 and cases and cases[-1] == depth:
+            # The END closing a CASE: a CASE nests like a parenthesis, so its NULL / NOT
+            # (PostgreSQL deparses an ELSE NULL::text into every CASE) never ends the DEFAULT.
+            cases.pop()
+            depth -= 1
         elif token.token_type == TokenType.COMMA and depth == 0:
             _read(definition)
             definition = []
@@ -1302,6 +1308,9 @@ def _column_default_texts(create_ddl: str) -> "tuple[tuple[str, str], ...]":
         definition.append((token, depth))
         if token.token_type == TokenType.L_PAREN:
             depth += 1
+        elif token.token_type == TokenType.CASE:
+            depth += 1
+            cases.append(depth)
     return tuple(out)
 
 

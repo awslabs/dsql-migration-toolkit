@@ -531,12 +531,17 @@ fails **loudly** where it can't.
     PostgreSQL-16-compatible and its `interval` input parser rejects these values, so
     a row carrying an *infinite* `interval` is **quarantined** during Full Load
     (visible in the quarantine count) and surfaced by Validation as a count/checksum
-    mismatch — never silently altered. Finite intervals are unaffected, and so is
+    mismatch. CDC, however, carries it as a **zero** interval (`00:00:00`), silently:
+    Debezium's driver reads `infinity` as 0, and only a CHECKSUM validation shows it.
+    Remodel infinite-`interval` rows (e.g. to a finite sentinel) before migrating the
+    column or starting CDC. Finite intervals are unaffected, and so is
     `date`/`timestamp`/`timestamptz` `infinity`/`-infinity`: Full Load and CDC (sink
-    plugin v54 and later) both store it as `infinity`. A CDC stack deployed with an
-    earlier plugin stops its sink task at the first such `timestamptz` value; **Delete CDC
-    infrastructure** and deploy it again. Remodel infinite-`interval` rows (e.g. to a
-    finite sentinel) before migrating the column.
+    plugin v54 and later, streamed or snapshot) both store it as `infinity`. An earlier
+    plugin stopped its sink task at the first such `timestamptz` value, stored a
+    `timestamp` `+infinity` as the year 294247, and dead-lettered `-infinity` and a date
+    infinity: **Delete CDC infrastructure**, deploy it again, then reload such tables
+    (Drop & reload, or the re-snapshot the next Start offers) and validate with CHECKSUM,
+    even if no task stopped.
   - **VIRTUAL generated columns (the DEFAULT kind on PG18).** Aurora DSQL supports
     `GENERATED ALWAYS AS (expr) **STORED**` and maintains the value itself, so a STORED
     column is **preserved** — nothing to recompute and no drift (a write must simply omit

@@ -2084,3 +2084,17 @@ def test_the_monitor_names_the_sinks_value_fit_code_exactly() -> None:
     from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
 
     assert cm._SINK_VALUE_FIT_CODE == VALUE_DOES_NOT_FIT_CODE
+
+
+def test_a_generated_column_mixed_with_other_drift_never_claims_a_source_truncate() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _drift_ai_case
+
+    def groups(*kinds):
+        return [SimpleNamespace(kind=k) for k in kinds]
+
+    assert _drift_ai_case(groups("generated-column")) == "generated"
+    assert _drift_ai_case(groups("generated-column", "value-does-not-fit")) == "target-side"
+    assert _drift_ai_case(groups("generated-column", "source-truncate")) == "target-side"
+    assert _drift_ai_case(groups("source-truncate", "value-does-not-fit")) == "truncate-value-fit"

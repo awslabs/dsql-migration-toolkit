@@ -3238,7 +3238,9 @@ def _drift_ai_case(drift) -> str:
         return "generated"  # a target-side refusal with its own repair, no source change
     if not kinds or kinds - _NON_DDL_SOURCE_KINDS - _TARGET_SIDE_DRIFT_KINDS - {"generated-column"}:
         return "ddl"
-    if kinds & _TARGET_SIDE_DRIFT_KINDS:
+    # A GENERATED column alongside other kinds is one more target-side refusal: never the
+    # TRUNCATE / value-fit case, which would claim a source TRUNCATE that never happened.
+    if kinds & (_TARGET_SIDE_DRIFT_KINDS | {"generated-column"}):
         return "target-side"
     if kinds == {"value-does-not-fit"}:
         return "value-fit"

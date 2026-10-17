@@ -498,12 +498,26 @@ _EXECUTE_SENTINEL = object()
 _TABLE_SAVEPOINT = "SAVEPOINT dsql_migrator_validate_table"
 
 
+def _open_table_savepoint(connection) -> bool:
+    """Open the per-table savepoint; ``False`` (none opened) on a lost connection."""
+    if getattr(connection, "invalidated", False):
+        return False
+    try:
+        connection.execute(text(_TABLE_SAVEPOINT))
+    except Exception:  # noqa: BLE001 - the table's own reads report the connection's state
+        return False
+    return True
+
+
 def _rollback_to_table_savepoint(connection) -> None:
     """Undo a table's reads (all of them read-only) so a failed one leaves the snapshot
-    transaction usable. Best effort: a lost connection fails the next table's reads with
-    its own error, as before."""
+    transaction usable, then release the savepoint: ROLLBACK TO keeps it established, so a
+    run over thousands of tables would otherwise nest one subtransaction per table on the
+    source until the final COMMIT. Best effort: a lost connection fails the next table's
+    reads with its own error, as before."""
     try:
         connection.execute(text("ROLLBACK TO SAVEPOINT dsql_migrator_validate_table"))
+        connection.execute(text("RELEASE SAVEPOINT dsql_migrator_validate_table"))
     except Exception:  # noqa: BLE001 - the next table reports the connection's state
         pass
 
@@ -1622,8 +1636,12 @@ class Validator:
                                     "tables."
                                 )
                             _report_progress(table.name, index, total)
-                            if savepoints:
-                                source_connection.execute(text(_TABLE_SAVEPOINT))
+                            # Best effort, like the rollback: a lost connection makes
+                            # the table's own reads fail with their own error, as before,
+                            # instead of the SAVEPOINT aborting the whole run.
+                            in_savepoint = savepoints and _open_table_savepoint(
+                                source_connection
+                            )
                             items.append(
                                 self._validate_table(
                                     source_connection,
@@ -1639,7 +1657,7 @@ class Validator:
                                     ),
                                 )
                             )
-                            if savepoints:
+                            if in_savepoint:
                                 _rollback_to_table_savepoint(source_connection)
                             if check_orphans:
                                 orphan_findings.extend(

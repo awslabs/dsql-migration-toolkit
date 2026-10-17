@@ -799,7 +799,11 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #     instead of the raw microseconds: a column remapped to interval stores it, and a time
 #     column refuses it by name (ValueFit Rule.DURATION, a VALUE_DOES_NOT_FIT dead letter)
 #     where the bind error used to read as "the column's type changed at the source".
-#     Exactly 24:00:00 is bound as time's own upper bound.
+#     Exactly 24:00:00 is bound as time's own upper bound;
+#   * a PostgreSQL date infinity read by a Debezium SNAPSHOT (JDBC) is mapped too: pgjdbc's
+#     infinity Date, whose epoch day Debezium wraps to int (-622191234 / -625821272, a day
+#     apart by the worker's time zone) -- the streaming sentinels alone left those rows
+#     dead-lettered as dates far below PostgreSQL's range.
 PLUGIN_VERSION = "v54"
 
 

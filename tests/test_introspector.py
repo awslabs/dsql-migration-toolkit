@@ -1651,3 +1651,44 @@ def test_a_lock_another_session_holds_fails_fast_with_what_to_do() -> None:
         SourceIntrospector(engine_factory=lambda _c: engine).introspect(
             SourceConnectionConfig(host="x", database=None)
         )
+
+
+def test_a_relation_gone_during_the_read_is_looked_for_again_then_reported(monkeypatch) -> None:
+    """Skipped silently, a table replaced mid-read (DROP + CREATE AS, a rename swap) left
+    the whole migration without it; a view gone the same way read as 'unreadable'."""
+    from sqlalchemy.engine.reflection import Inspector
+    from sqlalchemy.exc import NoSuchTableError
+
+    calls: dict[str, int] = {}
+    real_columns = Inspector.get_columns
+    real_view = Inspector.get_view_definition
+
+    def get_columns(self, table_name, schema=None, **kw):
+        calls[table_name] = calls.get(table_name, 0) + 1
+        if table_name == "orders" and calls[table_name] == 1:
+            raise NoSuchTableError(table_name)  # mid-replace: back on the second look
+        if table_name == "customers":
+            raise NoSuchTableError(table_name)  # dropped for good
+        return real_columns(self, table_name, schema=schema, **kw)
+
+    def get_view_definition(self, view_name, schema=None, **kw):
+        raise NoSuchTableError(view_name)
+
+    monkeypatch.setattr(Inspector, "get_columns", get_columns)
+    monkeypatch.setattr(Inspector, "get_view_definition", get_view_definition)
+    introspector = SourceIntrospector(engine_factory=_sqlite_factory())
+    inventory = introspector.introspect(_source_config())
+    names = {t.name.split(".")[-1] for t in inventory.tables}
+    assert "orders" in names and "customers" not in names
+    assert not inventory.views  # not an "unreadable" view
+    gone = {n.split(".")[-1] for n in introspector.last_vanished}
+    assert gone == {"customers", "active_orders"}
+    monkeypatch.setattr(Inspector, "get_view_definition", real_view)
+
+
+def test_evaluation_names_what_disappeared_during_the_read() -> None:
+    from dsql_migrator.core.assessor import catalog_changed_items
+
+    (item,) = catalog_changed_items(["shop.daily_summary"])
+    assert item.rule_id == "CATALOG_CHANGED_DURING_READ" and "shop.daily_summary" in item.risk
+    assert catalog_changed_items([]) == []

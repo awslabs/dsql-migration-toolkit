@@ -794,6 +794,13 @@ class AssessmentConcern(BaseModel):
         return self.note_kind is ConversionNoteKind.RECOMMENDATION
 
 
+# Items that record how a report was made rather than an object to migrate -- the
+# PostgreSQL catalog probe's "checked" note, which lets a refresh or a restore tell a
+# report whose probe found nothing from one made before the probe existed. Kept in the
+# report (and its exports' data), never counted, listed or scored.
+REPORT_MARKER_RULE_IDS = frozenset({"PG_CATALOG_CHECKED"})
+
+
 class AssessmentReport(BaseModel):
     """Result of the compatibility assessment over a source inventory."""
 
@@ -802,6 +809,12 @@ class AssessmentReport(BaseModel):
     items: list[AssessmentItem] = Field(default_factory=list)
     summary: dict[Classification, int] = Field(default_factory=dict)
     effort_summary: dict[EffortLevel, int] = Field(default_factory=dict)
+
+    @property
+    def assessed_items(self) -> list[AssessmentItem]:
+        """The items that are objects to migrate: every item but the report's own markers
+        (:data:`REPORT_MARKER_RULE_IDS`), which every count, list and score leaves out."""
+        return [item for item in self.items if item.rule_id not in REPORT_MARKER_RULE_IDS]
 
     @classmethod
     def from_items(cls, items: list[AssessmentItem]) -> "AssessmentReport":
@@ -815,6 +828,8 @@ class AssessmentReport(BaseModel):
         summary = {classification: 0 for classification in Classification}
         effort_summary = {level: 0 for level in EffortLevel}
         for item in items:
+            if item.rule_id in REPORT_MARKER_RULE_IDS:
+                continue
             summary[item.classification] += 1
             if item.effort is not None:
                 effort_summary[item.effort] += 1

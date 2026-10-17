@@ -956,3 +956,22 @@ def test_w2_quotes_each_default_as_the_applied_ddl_writes_it():
     assert "DEFAULT date_trunc('day'::text, now(), 'Asia/Seoul'::text) is dropped" in notes[W2]
     notes = {f.code: f.message for f in column_exclusion_warnings("s.t", "clock", ctx)}
     assert "DEFAULT CURRENT_TIME is dropped" in notes[W2]
+
+
+def test_w2_quotes_a_case_default_whole():
+    """PostgreSQL deparses an ``ELSE NULL::text`` into every CASE, and the scanner stopped at
+    that NULL -- quoting ``CASE WHEN ... ELSE`` as the DEFAULT 'restored at Cut over'."""
+    from dsql_migrator.core.converter import parse_target_column_default_texts
+
+    case = "CASE WHEN (now() > '2020-01-01'::timestamptz) THEN 'KRW'::text ELSE NULL::text END"
+    ddl = (
+        'CREATE TABLE "s"."t" ("id" bigint NOT NULL, '
+        f'"cur" text DEFAULT {case} NOT NULL, '
+        '"nested" text DEFAULT (CASE WHEN true THEN CASE WHEN false THEN NULL END END), '
+        '"n" int DEFAULT 5)'
+    )
+    assert parse_target_column_default_texts(ddl) == {
+        "cur": case,
+        "nested": "(CASE WHEN true THEN CASE WHEN false THEN NULL END END)",
+        "n": "5",
+    }

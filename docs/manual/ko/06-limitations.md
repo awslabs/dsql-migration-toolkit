@@ -416,12 +416,16 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   지원하며, 17·18에서 유의할 점이 3가지 있습니다:
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그
     `interval` 입력 파서가 이 값을 거부합니다. 따라서 *무한* `interval`을 담은 행은 Full Load 중
-    **격리(quarantine)**되어(격리 카운트에 표시됨) Validation에서 count/checksum 불일치로 드러납니다 —
-    조용히 변형되는 일은 없습니다. 유한 interval은 영향받지 않고, `date`/`timestamp`/`timestamptz`의
-    `infinity`/`-infinity`도 마찬가지입니다: Full Load와 CDC(싱크 플러그인 v54 이상) 모두 `infinity`로
-    저장합니다. 이전 플러그인으로 배포한 CDC 스택은 그런 `timestamptz` 값을 처음 만나면 싱크 태스크가
-    멈추므로 **Delete CDC infrastructure** 후 다시 배포하세요. 무한 `interval` 행은 해당 컬럼을
-    마이그레이션하기 전에 재모델링(예: 유한 sentinel 값)하세요.
+    **격리(quarantine)**되어(격리 카운트에 표시됨) Validation에서 count/checksum 불일치로 드러납니다.
+    하지만 CDC는 이 값을 조용히 **0** interval(`00:00:00`)로 옮깁니다: Debezium의 드라이버가 `infinity`를
+    0으로 읽으며, CHECKSUM 검증에서만 드러납니다. 무한 `interval` 행은 해당 컬럼을 마이그레이션하거나 CDC를
+    시작하기 전에 재모델링(예: 유한 sentinel 값)하세요. 유한 interval은 영향받지 않고,
+    `date`/`timestamp`/`timestamptz`의 `infinity`/`-infinity`도 마찬가지입니다: Full Load와 CDC(싱크 플러그인
+    v54 이상, 스트리밍이든 스냅샷이든) 모두 `infinity`로 저장합니다. 이전 플러그인은 그런 `timestamptz` 값을
+    처음 만나면 싱크 태스크를 멈추고, `timestamp`의 `+infinity`를 294247년으로 저장했으며, `-infinity`와
+    date infinity는 dead-letter 처리했습니다: **Delete CDC infrastructure** 후 다시 배포하고, 태스크가 멈추지
+    않았더라도 그런 테이블을 다시 적재(Drop & reload, 또는 다음 Start가 제안하는 재스냅샷)한 뒤 CHECKSUM으로
+    검증하세요.
   - **VIRTUAL 생성 컬럼(PG18의 기본 종류).** Aurora DSQL은 `GENERATED ALWAYS AS (expr) **STORED**`를
     지원하고 값을 스스로 유지하므로 STORED 컬럼은 **보존**됩니다 — 다시 계산할 것도, 드리프트도
     없습니다(쓰기에서 그 컬럼을 빼면 되고, Full Load와 CDC 싱크가 그렇게 합니다. DSQL은 값을 명시하면

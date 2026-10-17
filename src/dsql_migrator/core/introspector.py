@@ -506,6 +506,9 @@ def _reflect_tables(
     inspector: object,
     schema: Optional[str] = None,
     on_table: Optional[Callable[[], None]] = None,
+    *,
+    names: "Optional[Sequence[str]]" = None,
+    vanished: "Optional[list[str]]" = None,
 ) -> list[TableDef]:
     """Collect table/column/PK/index/FK structure via SQLAlchemy reflection.
 
@@ -516,13 +519,20 @@ def _reflect_tables(
     catalog round trips): progress and liveness for a long read, and where a stop lands.
     """
     tables: list[TableDef] = []
-    for table_name in inspector.get_table_names(schema=schema):  # type: ignore[attr-defined]
+    listed = (
+        names if names is not None else inspector.get_table_names(schema=schema)  # type: ignore[attr-defined]
+    )
+    for table_name in listed:
         try:
             reflected_columns = inspector.get_columns(table_name, schema=schema)  # type: ignore[attr-defined]
         except NoSuchTableError:
-            # Dropped since the schema was listed (a pg_repack or gh-ost work table, an
-            # ETL staging table): no longer a migration object, and no reason to fail a
-            # read that may have run for minutes.
+            # Gone since the schema was listed: dropped for good (a pg_repack or gh-ost
+            # work table), or mid-replace (DROP + CREATE AS, a rename swap). Recorded in
+            # ``vanished`` so the caller can look again and report what stays gone,
+            # rather than fail a read that may have run for minutes -- or drop the table
+            # from the migration without a word.
+            if vanished is not None:
+                vanished.append(table_name)
             if on_table is not None:
                 on_table()
             continue
@@ -686,7 +696,13 @@ def _reflect_tables(
     return tables
 
 
-def _reflect_views(inspector: object, schema: Optional[str] = None) -> list[ViewDef]:
+def _reflect_views(
+    inspector: object,
+    schema: Optional[str] = None,
+    *,
+    names: "Optional[Sequence[str]]" = None,
+    vanished: "Optional[list[str]]" = None,
+) -> list[ViewDef]:
     """Collect view names and definitions via SQLAlchemy reflection.
 
     The per-view ``get_view_definition`` is best-effort: a single view that cannot
@@ -698,9 +714,18 @@ def _reflect_views(inspector: object, schema: Optional[str] = None) -> list[View
     is never masked (Property 1): a ``ReadOnlySourceError`` is re-raised.
     """
     views: list[ViewDef] = []
-    for view_name in inspector.get_view_names(schema=schema):  # type: ignore[attr-defined]
+    listed = (
+        names if names is not None else inspector.get_view_names(schema=schema)  # type: ignore[attr-defined]
+    )
+    for view_name in listed:
         try:
             definition = inspector.get_view_definition(view_name, schema=schema) or ""  # type: ignore[attr-defined]
+        except NoSuchTableError:
+            # Gone since the schema was listed (dropped or mid-replace): like a table, not
+            # a view whose definition cannot be read.
+            if vanished is not None:
+                vanished.append(view_name)
+            continue
         except ReadOnlySourceError:
             # Never swallow the read-only guard sentinel -- it means a write/DDL was
             # attempted on the source, which must surface, not be silently skipped.
@@ -1030,8 +1055,13 @@ def _assemble_inventory(
     *,
     dialect: "SourceDialect",
     progress: Optional[Callable[[int, int], None]] = None,
+    vanished_out: "Optional[list[str]]" = None,
 ) -> SourceInventory:
     """Assemble a :class:`SourceInventory` from one or all schemas.
+
+    ``vanished_out`` collects the (qualified) tables and views that were listed but gone
+    when read, and still gone when looked for again: not in the inventory, and reported
+    so (dropped at that moment, or replaced by a statement still running).
 
     For an engine whose ``database`` IS a schema (MySQL, ``dialect.database_is_schema``):
     when ``database`` is set, that single schema is reflected and its names are qualified
@@ -1092,8 +1122,28 @@ def _assemble_inventory(
 
     for reflect_schema, enrich_db, qualify in plans:
         on_table = _one_table if progress is not None else None
-        tables = _reflect_tables(inspector, schema=reflect_schema, on_table=on_table)
-        views = _reflect_views(inspector, schema=reflect_schema)
+        gone_tables: list[str] = []
+        gone_views: list[str] = []
+        tables = _reflect_tables(inspector, schema=reflect_schema, on_table=on_table,
+                                 vanished=gone_tables)
+        views = _reflect_views(inspector, schema=reflect_schema, vanished=gone_views)
+        if gone_tables or gone_views:
+            # Look once more, with a fresh inspector (the first one caches its listings):
+            # a relation replaced mid-read is back, and is read like any other.
+            fresh = inspect(connection)
+            still_tables: list[str] = []
+            still_views: list[str] = []
+            tables.extend(
+                _reflect_tables(fresh, schema=reflect_schema, names=gone_tables, vanished=still_tables)
+            )
+            views.extend(
+                _reflect_views(fresh, schema=reflect_schema, names=gone_views, vanished=still_views)
+            )
+            if vanished_out is not None:
+                vanished_out.extend(
+                    f"{enrich_db}.{name}" if qualify else name
+                    for name in (*still_tables, *still_views)
+                )
         # Engine-specific enrichment (columns/indexes/partitions in place + stored
         # triggers/routines/events). No-ops for a dialect/connection without it.
         triggers, routines, events = dialect.enrich(
@@ -1184,6 +1234,9 @@ class SourceIntrospector:
         inject a factory to supply an alternative engine.
         """
         self._engine_factory = engine_factory or _default_engine_factory
+        # The tables and views the last introspect() listed but found gone, twice (see
+        # _assemble_inventory): read by Evaluation to say so, never persisted.
+        self.last_vanished: list[str] = []
 
     def test_connection(self, conn: SourceConnectionConfig) -> ConnectionResult:
         """Validate connectivity and return a success/failure result.
@@ -1258,9 +1311,16 @@ class SourceIntrospector:
                 connection = connection.execution_options(isolation_level="AUTOCOMMIT")
                 _limit_lock_waits(connection)
                 inspector = inspect(connection)
+                vanished: list[str] = []
+                self.last_vanished = vanished
                 try:
                     return _assemble_inventory(
-                        inspector, connection, conn.database, dialect=dialect, progress=progress
+                        inspector,
+                        connection,
+                        conn.database,
+                        dialect=dialect,
+                        progress=progress,
+                        vanished_out=vanished,
                     )
                 except Exception as exc:
                     if _is_lock_timeout(exc):

@@ -1957,7 +1957,8 @@ class ViewDefinitionUnreadableRule(Rule):
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         causes = (
-            "the view may be invalid (a relation it reads was dropped)"
+            "the read of its definition failed (a view dropped or replaced while the "
+            "catalog was read is reported separately, as a change during the read)"
             if self._is_postgres
             else "the migration user may lack the SHOW VIEW privilege on it, or the view "
             "may be invalid (a table it reads was dropped)"
@@ -2177,6 +2178,36 @@ def _ceil_div(value: int, limit: int) -> int:
 
 
 SOURCE_VISIBILITY_RULE_ID = "SOURCE_VISIBILITY"
+
+
+CATALOG_CHANGED_RULE_ID = "CATALOG_CHANGED_DURING_READ"
+
+
+def catalog_changed_items(names: "Sequence[str]") -> list[AssessmentItem]:
+    """The database-level item for tables and views the read listed but found gone, twice
+    (dropped at that moment, or replaced by a statement that was still running): they are
+    in neither this report nor the migration, which a silent skip used to hide."""
+    if not names:
+        return []
+    shown = ", ".join(list(names)[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
+    item = AssessmentItem(
+        object_name="source catalog",
+        rule_id=CATALOG_CHANGED_RULE_ID,
+        classification=Classification.MANUAL,
+        risk=(
+            f"{len(names)} table(s) or view(s) disappeared while the catalog was read, and "
+            f"were still gone when looked for again: {shown}. They were dropped at that "
+            "moment, or are being replaced (a DROP + CREATE ... AS still running, a rename "
+            "swap), so they are not in this report or the migration."
+        ),
+        recommendation=(
+            "If they should migrate, re-run Step 1 (Evaluation) once whatever replaces them "
+            "has finished."
+        ),
+        effort=EffortLevel.SIMPLE,
+        kind=KIND_DATABASE.upper(),
+    )
+    return [item.model_copy(update={"concerns": _single_concern(item)})]
 
 
 def source_visibility_items(gaps: "Sequence[str]") -> list[AssessmentItem]:
@@ -3018,8 +3049,8 @@ def render_text_report(report: AssessmentReport) -> str:
     for level in EffortLevel:
         lines.append(f"  {level.value}: {report.effort_summary.get(level, 0)}")
     lines.append("")
-    lines.append(f"Items ({len(report.items)}):")
-    for item in report.items:
+    lines.append(f"Items ({len(report.assessed_items)}):")
+    for item in report.assessed_items:
         effort = item.effort.value if item.effort is not None else "NONE"
         lines.append(
             f"- {item.object_name} [{item.classification.value}] "
@@ -3142,7 +3173,7 @@ def classification_stats_by_kind(
     "% need attention" caption.
     """
     counts: dict[str, dict[Classification, int]] = {}
-    for item in report.items:
+    for item in report.assessed_items:
         bucket = counts.setdefault(item.kind, {c: 0 for c in Classification})
         bucket[item.classification] += 1
 
@@ -3376,7 +3407,7 @@ def render_html_report(
     )
 
     rows = []
-    for item in report.items:
+    for item in report.assessed_items:
         color = _HTML_CLASS_COLOR.get(item.classification, "#ffffff")
         effort = item.effort.value if item.effort is not None else "-"
         # ONE ROW PER CONCERN, with the object/kind cells spanning them. A single row
@@ -3443,7 +3474,7 @@ def render_html_report(
     )
 
     # Distinct kinds present, for the Kind filter dropdown.
-    kinds_present = sorted({item.kind for item in report.items})
+    kinds_present = sorted({item.kind for item in report.assessed_items})
 
     def _options(values: "list[str]") -> str:
         return "".join(f'<option value="{esc(v)}">{esc(v)}</option>' for v in values)
@@ -3602,6 +3633,7 @@ __all__ = [
     "check_view_count",
     "DSQL_DATABASE_LIMITS",
     "default_inventory_rules",
+    "catalog_changed_items",
     "check_mixed_case_identifiers",
     "default_rules",
     "CompatibilityAssessor",

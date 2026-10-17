@@ -128,6 +128,12 @@ final class DebeziumTypeConverter {
   static final long PG_NEGATIVE_INFINITY_MILLIS = PG_NEGATIVE_INFINITY_MICROS / 1_000L;
   static final int PG_INFINITY_DAYS = -2_147_472_692;
   static final int PG_NEGATIVE_INFINITY_DAYS = -2_147_472_691;
+  // A date read by a Debezium SNAPSHOT (JDBC, not the replication stream) arrives as
+  // pgjdbc's java.sql.Date(DATE_POSITIVE/NEGATIVE_INFINITY), whose epoch day Debezium casts
+  // to int -- it wraps, and depends on the worker's time zone by a day. Both are about 1.7
+  // million years BC, far below PostgreSQL's earliest date, so no real date is near them.
+  static final int PG_SNAPSHOT_INFINITY_DAYS = -622_191_234;
+  static final int PG_SNAPSHOT_NEGATIVE_INFINITY_DAYS = -625_821_272;
 
   private static final long MICROS_PER_MILLI = 1_000L;
   private static final int NANOS_PER_MICRO = 1_000;
@@ -172,6 +178,11 @@ final class DebeziumTypeConverter {
       case DATE: {
         long days = ((Number) value).longValue();
         Object infinity = infinity("date", days, PG_INFINITY_DAYS, PG_NEGATIVE_INFINITY_DAYS);
+        if (infinity == null && Math.abs(days - PG_SNAPSHOT_INFINITY_DAYS) <= 1) {
+          infinity = pgObject("date", "infinity");
+        } else if (infinity == null && Math.abs(days - PG_SNAPSHOT_NEGATIVE_INFINITY_DAYS) <= 1) {
+          infinity = pgObject("date", "-infinity");
+        }
         return infinity != null ? infinity : java.sql.Date.valueOf(LocalDate.ofEpochDay(days));
       }
       case JSON_TYPE:

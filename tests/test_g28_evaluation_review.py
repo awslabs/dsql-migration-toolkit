@@ -1906,6 +1906,12 @@ def test_listing_gaps_follow_how_mysql_itself_applies_the_grants() -> None:
     # Tied patterns: MySQL's pick is not observable, so only what they all grant counts.
     tied = [f"GRANT ALL ON `a%`.* {to}", f"GRANT TRIGGER ON `a_`.* {to}"]
     assert kinds(mysql_listing_gaps(tied, ["ab"])) == ["scheduled events", "stored procedures and functions"]
+    # With active roles MySQL adds the matching patterns up (no exact-name grant here).
+    via_role = [f"GRANT SELECT, SHOW VIEW ON `app%`.* {to}", f"GRANT TRIGGER, EVENT ON `%`.* {to}"]
+    assert kinds(mysql_listing_gaps(via_role, ["app1"])) == every  # most specific only
+    assert kinds(mysql_listing_gaps(via_role, ["app1"], roles_active=True)) == [
+        "stored procedures and functions"
+    ]
     # Case folds only where the server folds it (lower_case_table_names != 0).
     assert mysql_listing_gaps([f"GRANT ALL ON `Shop`.* {to}"], ["shop"], case_insensitive=True) == []
     assert kinds(mysql_listing_gaps([f"GRANT ALL ON `Shop`.* {to}"], ["shop"])) == every
@@ -2321,3 +2327,21 @@ def test_where_nothing_generates_an_auto_increment_key_the_table_is_graded_for_i
                              composite_leading_column="customer_id"),
     )
     assert any("WITHOUT the source's value generation" in w.message for w in conversion.warnings)
+
+
+def test_the_replace_list_leaves_out_views_the_apply_never_creates() -> None:
+    from dsql_migrator.ui.schema_conversion import _InventoryExistenceChecker, _existing_object_names
+
+    source = SourceInventory(
+        tables=[_table("shop.ok")],
+        views=[
+            ViewDef(name="shop.v_hidden", definition=""),
+            ViewDef(name="shop.daily", definition="SELECT 1", unsupported_kind="materialized view"),
+            ViewDef(name="shop.v_ok", definition="SELECT 1"),
+        ],
+    )
+    checker = _InventoryExistenceChecker(
+        _held_target(tables=["ok"], views=["v_hidden", "daily", "v_ok"]),
+        view_names=[v.name for v in source.views],
+    )
+    assert _existing_object_names(source, checker) == ["shop.ok", "shop.v_ok"]

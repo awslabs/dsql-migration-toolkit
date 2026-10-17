@@ -107,6 +107,10 @@ class StandaloneSequence:
     last_value: Optional[int]
     readable: bool
     is_called: Optional[bool] = None
+    # ``(table, column, DEFAULT expression)`` of every column whose DEFAULT calls this
+    # sequence, read from the catalog (pg_depend from the DEFAULT to the sequence) -- not
+    # from DEFAULT text, whose sequence names follow the search_path.
+    callers: "tuple[tuple[str, str, str], ...]" = ()
 
 
 @dataclass(frozen=True)

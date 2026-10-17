@@ -3643,6 +3643,7 @@ def test_a_refused_postgres_table_read_cannot_fail_the_tables_after_it(monkeypat
     assert saves == [
         "SAVEPOINT dsql_migrator_validate_table",
         "ROLLBACK TO SAVEPOINT dsql_migrator_validate_table",
+        "RELEASE SAVEPOINT dsql_migrator_validate_table",  # depth stays at one
     ] * 2
     # MySQL keeps its transaction through an error: no savepoints there.
     mysql = _FakeSourceConnection(counts={"items": 2})

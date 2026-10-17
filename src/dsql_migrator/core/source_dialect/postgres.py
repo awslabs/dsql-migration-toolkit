@@ -801,6 +801,8 @@ def pg_read_standalone_sequences(
         ),
         {"schemas": list(schemas)},
     ).mappings()
+    rows = list(rows)
+    callers = _sequence_callers(connection, schemas) if rows else {}
     sequences = []
     for row in rows:
         last_value = int(row["last_value"]) if row["last_value"] is not None else None
@@ -820,9 +822,44 @@ def pg_read_standalone_sequences(
                 last_value=last_value,
                 readable=bool(row["readable"]),
                 is_called=is_called,
+                callers=tuple(callers.get(f"{row['nsp']}.{row['name']}", ())),
             )
         )
     return tuple(sequences)
+
+
+def _sequence_callers(
+    connection: object, schemas: "list[str]"
+) -> "dict[str, list[tuple[str, str, str]]]":
+    """``{sequence: [(table, column, DEFAULT expression)]}`` for the sequences of
+    ``schemas``, from the catalog: a column DEFAULT that calls ``nextval`` depends on the
+    sequence (``pg_depend`` from its ``pg_attrdef`` row), whichever schema the table is in
+    and however the expression spells the name. Read-only; ``{}`` when it cannot be read."""
+    try:
+        rows = connection.execute(  # type: ignore[attr-defined]
+            text(
+                "SELECT sn.nspname AS seq_nsp, s.relname AS seq_name, tn.nspname AS nsp, "
+                "t.relname AS rel, a.attname AS col, pg_get_expr(ad.adbin, ad.adrelid) AS expr "
+                "FROM pg_depend d "
+                "JOIN pg_attrdef ad ON d.classid = 'pg_attrdef'::regclass AND d.objid = ad.oid "
+                "JOIN pg_class t ON t.oid = ad.adrelid "
+                "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
+                "JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+                "JOIN pg_class s ON s.oid = d.refobjid AND s.relkind = 'S' "
+                "JOIN pg_namespace sn ON sn.oid = s.relnamespace "
+                "WHERE d.refclassid = 'pg_class'::regclass AND sn.nspname = ANY(:schemas) "
+                "ORDER BY tn.nspname, t.relname, a.attnum"
+            ),
+            {"schemas": list(schemas)},
+        ).mappings()
+    except Exception:  # noqa: BLE001 - the item then falls back to the DEFAULT text
+        return {}
+    out: dict[str, list[tuple[str, str, str]]] = {}
+    for row in rows:
+        out.setdefault(f"{row['seq_nsp']}.{row['seq_name']}", []).append(
+            (f"{row['nsp']}.{row['rel']}", str(row["col"]), str(row["expr"] or ""))
+        )
+    return out
 
 
 def _sequence_row(

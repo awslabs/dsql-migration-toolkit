@@ -87,6 +87,16 @@ class DebeziumTypeConverterTest {
         DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, -2_147_472_692));
     assertInfinity("date", "-infinity",
         DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, -2_147_472_691));
+    // A Debezium SNAPSHOT reads a date over JDBC: pgjdbc's infinity Date, whose epoch day
+    // Debezium wraps to int -- a day apart by the worker's time zone (UTC / Asia/Seoul).
+    for (int days : new int[] {-622_191_234, -622_191_233}) {
+      assertInfinity("date", "infinity",
+          DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, days));
+    }
+    for (int days : new int[] {-625_821_272, -625_821_271}) {
+      assertInfinity("date", "-infinity",
+          DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, days));
+    }
     // A neighbour of a sentinel is an ordinary value.
     assertInstanceOf(Timestamp.class, DebeziumTypeConverter.convert(
         DebeziumTypeConverter.MICRO_TIMESTAMP, 9_223_372_036_825_199_999L));

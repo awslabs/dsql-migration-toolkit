@@ -2109,9 +2109,14 @@ def build_schema_conversion_screen(
             # A REPLACE also drops the lower-case copy an earlier version left of a view
             # in scope: name it, or the dialog understates what is dropped.
             if inventory is not None:
+                from dsql_migrator.core.converter import relation_clash_names
+
+                clashing = relation_clash_names(inventory)
                 for view in inventory.views:
-                    in_scope = view.name in selected and (
-                        only_names is None or view.name in only_names
+                    in_scope = (
+                        view.name in selected
+                        and (only_names is None or view.name in only_names)
+                        and _view_is_applied(view, clashing)
                     )
                     copy = _check_old_copy(existence_checker, view.name) if in_scope else None
                     if copy is not None:
@@ -5241,17 +5246,28 @@ def _existing_object_names(
         return []
     from dsql_migrator.core.converter import relation_clash_names
 
-    # A name-collision placeholder is never applied, so a REPLACE never drops what holds
-    # its name: listing it would name a table the confirmed REPLACE leaves alone.
+    # A placeholder is never applied, so a REPLACE never drops what holds its name: listing
+    # it would name an object the confirmed REPLACE leaves alone.
     clashing = relation_clash_names(inventory)
     names: list[str] = []
     for table in inventory.tables:
         if table.name not in clashing and existence_checker.object_exists(table.name):
             names.append(table.name)
     for view in inventory.views:
-        if view.name not in clashing and existence_checker.object_exists(view.name):
+        if _view_is_applied(view, clashing) and existence_checker.object_exists(view.name):
             names.append(view.name)
     return names
+
+
+def _view_is_applied(view: ViewDef, clashing: "frozenset[str]") -> bool:
+    """Whether Schema Apply creates ``view`` at all: not a name-collision placeholder, its
+    definition read, and not a PostgreSQL materialized view or foreign table (the same
+    rule Evaluation's held names use)."""
+    return (
+        view.name not in clashing
+        and bool((view.definition or "").strip())
+        and not getattr(view, "unsupported_kind", None)
+    )
 
 
 __all__ = [

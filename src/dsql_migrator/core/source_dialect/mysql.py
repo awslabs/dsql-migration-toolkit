@@ -206,7 +206,8 @@ class MySQLSourceDialect(SourceDialect):
         except Exception:  # noqa: BLE001 - MySQL 5.7 has no roles
             roles = None
         statement = "SHOW GRANTS"
-        if roles and str(roles).strip().upper() != "NONE":
+        roles_active = bool(roles) and str(roles).strip().upper() != "NONE"
+        if roles_active:
             statement = f"SHOW GRANTS FOR CURRENT_USER() USING {roles}"
         try:
             rows = connection.execute(text(statement)).fetchall()  # type: ignore[attr-defined]
@@ -217,6 +218,7 @@ class MySQLSourceDialect(SourceDialect):
             databases,
             case_insensitive=probe_scalar(connection, "SELECT @@lower_case_table_names") not in (None, "0"),
             partial_revokes=probe_scalar(connection, "SELECT @@partial_revokes") in ("1", "ON"),
+            roles_active=roles_active,
         )
 
     def read_next_key_values(self, connection: object, tables) -> "dict[str, int]":
@@ -365,6 +367,7 @@ def mysql_listing_gaps(
     *,
     case_insensitive: bool = False,
     partial_revokes: bool = False,
+    roles_active: bool = False,
 ) -> list[str]:
     """The object kinds a MySQL user with ``grant_lines`` cannot list completely, in
     ``databases``: one human line per kind naming the databases and the privilege. Pure.
@@ -381,7 +384,10 @@ def mysql_listing_gaps(
     observable (and active roles add them up instead), so only what they all grant is
     counted: an unsure answer names the gap rather than hiding it. ``case_insensitive``
     is ``lower_case_table_names`` != 0; ``partial_revokes`` makes ``%`` and ``_`` in a
-    grant's database name plain characters, as MySQL then does."""
+    grant's database name plain characters, as MySQL then does. ``roles_active``: the
+    session has active roles (the lines came from ``SHOW GRANTS ... USING``), and MySQL
+    then checks a database against an exact-name grant if there is one and otherwise ADDS
+    UP every matching pattern, instead of taking the most specific one."""
     if not grant_lines:
         return []
 
@@ -421,6 +427,11 @@ def mysql_listing_gaps(
         if not ranked:
             return set()
         top = max(rank for rank, _ in ranked)
+        if roles_active and top < 128:
+            merged: set[str] = set()
+            for _rank, privileges in ranked:
+                merged |= privileges
+            return merged
         tied = [privileges for rank, privileges in ranked if rank == top]
         narrower = [privileges for privileges in tied if "ALL PRIVILEGES" not in privileges]
         return set.intersection(*narrower) if narrower else {"ALL PRIVILEGES"}

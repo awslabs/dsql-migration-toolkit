@@ -1092,16 +1092,40 @@ def test_a_sequence_shared_by_column_defaults_is_re_attached_not_replaced_by_ide
         'ALTER TABLE "shop"."web_orders" ALTER COLUMN "order_no" SET DEFAULT '
         "nextval('\"shop\".\"order_no_seq\"');" in item.recommendation
     )
-    assert "Do not give those columns an identity" in item.recommendation
-    # The identity advice says the same for a DEFAULT that is not the column's own serial.
+    assert "Do not give those columns an identity instead" in item.recommendation
+    # Both CACHE choices are offered, and CACHE 1 is described as in-order, not gap-free.
     advice = pg_identity_fallback([tables[0].columns[1]])
-    assert "'order_no' calls shop.order_no_seq" in advice and "do not add an identity" in advice
-    own = ColumnDef(name="n", mysql_type="integer", nullable=False,
-                    default="nextval('shop.t_n_seq'::regclass)")
-    assert "do not add an identity" not in pg_identity_fallback([own])
-    # Both CACHE choices are offered: 1 keeps the source's gap-free numbering.
-    assert "CACHE 1 keeps the source's one-value-at-a-time numbering" in advice
+    assert "CACHE 1 hands them out one at a time and in order" in advice
+    assert "without gaps" not in advice
     assert pg_nextval_sequence("""nextval('"Shop"."Seq"'::regclass)""") == "Shop.Seq"
+
+
+def test_the_sequence_item_follows_the_catalog_and_keeps_formatted_defaults() -> None:
+    """Callers came from DEFAULT text, whose names follow the search_path (a cross-schema
+    caller was missed); a formatted DEFAULT was re-attached as a bare nextval; and a primary
+    key the conversion makes an identity was told to SET DEFAULT, which it cannot take."""
+    formatted = "('ORD-'::text || lpad((nextval('order_seq'::regclass))::text, 8, '0'::text))"
+    sequence = _sequence(name="public.order_seq").__class__(
+        **{**_sequence(name="public.order_seq").__dict__,
+           "callers": (("app.orders", "order_no", formatted), ("app.invoices", "id", "nextval('order_seq'::regclass)"))}
+    )
+    orders = _pg_table("app.orders", ColumnDef(name="order_no", mysql_type="text", default=formatted))
+    invoices = TableDef(
+        name="app.invoices",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False,
+                           default="nextval('order_seq'::regclass)")],
+        primary_key=["id"], auto_increment_column="id",
+    )
+    (item,) = standalone_sequence_items([sequence], SourceInventory(tables=[orders, invoices]))
+    assert "A DEFAULT calls it on app.orders.order_no;" in item.risk  # from the catalog
+    assert (
+        "SET DEFAULT ('ORD-'::text || lpad((nextval('\"public\".\"order_seq\"'))::text, 8, "
+        "'0'::text));" in item.recommendation
+    )
+    # The identity primary key: no SET DEFAULT, and how to keep the shared numbering.
+    assert '"invoices" ALTER COLUMN "id" SET DEFAULT' not in item.recommendation
+    assert "It is the primary key DEFAULT of app.invoices.id" in item.risk
+    assert "choose 'Keep source PK' for those tables" in item.recommendation
 
 
 def test_a_report_without_the_probe_says_so_after_a_refresh_or_restore() -> None:
@@ -1143,3 +1167,19 @@ def test_a_report_without_the_probe_says_so_after_a_refresh_or_restore() -> None
     assert compute_migration_score(again.assessment).score == compute_migration_score(
         old.assessment
     ).score
+
+
+def test_the_probe_note_is_never_counted_as_an_object() -> None:
+    """An empty database read 'Ready 100/100' over the probe's own note, and every count
+    was one higher than the objects."""
+    from dsql_migrator.core.models import AssessmentReport
+    from dsql_migrator.ui.evaluation import compute_migration_score
+
+    empty = with_pg_catalog_facts(
+        AssessmentReport.from_items([]),
+        PgCatalogFacts(row_security=RowSecurityFacts(login=None), sequences=()),
+    )
+    assert [i.rule_id for i in empty.items] == ["PG_CATALOG_CHECKED"]  # kept for refresh
+    assert empty.assessed_items == []
+    assert sum(empty.summary.values()) == 0
+    assert compute_migration_score(empty) is None
