@@ -485,8 +485,9 @@ class _SqlNames:
     masked: str
 
 
-def _new_frame(*, in_from: bool = False, query: bool = False) -> dict:
+def _new_frame(*, in_from: bool = False, query: bool = False, start: int = 0) -> dict:
     return {
+        "start": start,  # where this bracket level opens (0: the text itself)
         "in_from": in_from,  # inside this level's FROM clause
         "expect": in_from,  # the next name is a relation
         "from_item": in_from,  # this bracket opened where a relation was expected
@@ -510,6 +511,8 @@ def _scan_sql_names(text: str) -> _SqlNames:
     masked = _mask_sql_literals(text)
     names: set[str] = set()
     relations: list[tuple[Optional[str], str]] = []
+    relation_at: list[int] = []  # where each relation is read
+    spans: list[tuple[int, int]] = []  # the bracket levels, (open, close)
     items: list[tuple[Optional[str], int, int]] = []
     frames: list[dict] = [_new_frame()]
 
@@ -576,6 +579,7 @@ def _scan_sql_names(text: str) -> _SqlNames:
                         continue
             if frame["in_from"] and frame["expect"]:
                 relations.append((parts[-2] if len(parts) >= 2 else None, parts[-1]))
+                relation_at.append(match.start())
                 frame["expect"] = False
             elif item is not None:
                 if frame["as"]:
@@ -592,7 +596,11 @@ def _scan_sql_names(text: str) -> _SqlNames:
         frame["prev"] = None
         if kind == "open":
             opened_for_relation = frame["in_from"] and frame["expect"]
-            frames.append(_new_frame(in_from=opened_for_relation, query=opened_for_relation))
+            frames.append(
+                _new_frame(
+                    in_from=opened_for_relation, query=opened_for_relation, start=match.start()
+                )
+            )
             item = frame["item"]
             if item is not None:
                 if item.skip_paren:
@@ -604,6 +612,7 @@ def _scan_sql_names(text: str) -> _SqlNames:
             if len(frames) > 1:
                 close_item(frames[-1], match.start())
                 closed = frames.pop()
+                spans.append((closed["start"], match.end()))
                 if closed["from_item"]:
                     frames[-1]["expect"] = False
                 if closed["distinct_on"] and frames[-1]["item"] is not None:
@@ -620,23 +629,40 @@ def _scan_sql_names(text: str) -> _SqlNames:
             frame["item"].chains += 2  # an expression: no longer a lone column
     for frame in frames:
         close_item(frame, len(masked))
+        spans.append((frame["start"], len(masked)))
     # A name a WITH defines (``name AS (``, with an optional column list or MATERIALIZED)
     # is read FROM like a relation, but it is the statement's own: bound to a same-named
-    # view or table it made a false edge (a cycle) and a false re-typed read.
-    ctes = {
-        _chain_parts(m.group(1))[0][-1]
-        for m in _CTE_DEFINITION_RE.finditer(masked)
-        if _chain_parts(m.group(1))[0]
-    }
+    # view or table it made a false edge (a cycle) and a false re-typed read. It is the
+    # statement's own only within the bracket level that defines it (and the levels inside
+    # it): a nested WITH named like an outer read leaves that read a real relation.
+    ctes: dict[str, list[tuple[int, int]]] = {}
+    for m in _CTE_DEFINITION_RE.finditer(masked):
+        parts = _chain_parts(m.group(1))[0]
+        if not parts:
+            continue
+        at = m.start(1)
+        level = min(
+            (span for span in spans if span[0] <= at < span[1]),
+            key=lambda span: span[1] - span[0],
+            default=(0, len(masked)),
+        )
+        ctes.setdefault(parts[-1], []).append(level)
     if ctes:
-        relations = [(schema, bare) for schema, bare in relations if schema is not None or bare not in ctes]
+        relations = [
+            (schema, bare)
+            for (schema, bare), at in zip(relations, relation_at)
+            if schema is not None
+            or not any(start <= at < end for start, end in ctes.get(bare, ()))
+        ]
     return _SqlNames(names=names, relations=relations, items=items, masked=masked)
 
 
 # ``name [(columns)] AS [NOT] [MATERIALIZED] (``: only a CTE definition reads so (a derived
 # table is ``) AS name``, a column alias ``expr AS name``).
+# One way to read the blanks between the name and AS (a masked literal is a run of them):
+# the optional column list carries its own trailing blanks, never a second \s* beside it.
 _CTE_DEFINITION_RE = re.compile(
-    r'(?:^|[\s,(])("(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*(?:\([^()]*\))?\s*\bAS\s+'
+    r'(?:^|[\s,(])("(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*(?:\([^()]*\)\s*)?\bAS\s+'
     r"(?:NOT\s+)?(?:MATERIALIZED\s+)?\(",
     re.IGNORECASE,
 )
@@ -3944,9 +3970,25 @@ _COMPOSITE_PLACEHOLDER_LEAD = "-- Could not apply a composite primary key to "
 def is_composite_key_placeholder(target_ddl: str) -> bool:
     """Whether ``target_ddl`` is the comment a refused COMPOSITE_KEY request yields, and
     nothing else -- never a script to store or apply. An edit that only starts with that
-    comment (statements typed beneath it) is a real script."""
+    comment (statements typed beneath it) is a real script: see
+    :func:`without_composite_placeholder`."""
     text = (target_ddl or "").lstrip()
     return text.startswith(_COMPOSITE_PLACEHOLDER_LEAD) and not sql_without_comments(text).strip()
+
+
+def without_composite_placeholder(target_ddl: str) -> str:
+    """``target_ddl`` without the refusal comment of a COMPOSITE_KEY request when that
+    comment leads it: '' when it is all there is, else the statements typed beneath it,
+    standing alone. 0.1.570's picker stored the comment as the table's DDL with its ';'
+    inside it, so an edit typed on the next line read as ONE comment-led statement --
+    Schema Apply refused it and Full Load fell back to the generated DDL without the
+    table's indexes and foreign keys."""
+    text = target_ddl or ""
+    stripped = text.lstrip()
+    if not stripped.startswith(_COMPOSITE_PLACEHOLDER_LEAD):
+        return text
+    rest = stripped.partition("\n")[2]
+    return rest.lstrip("\n") if sql_without_comments(rest).strip() else ""
 
 
 def _apply_composite_key(

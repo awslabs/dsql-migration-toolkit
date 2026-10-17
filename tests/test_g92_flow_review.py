@@ -142,16 +142,23 @@ def test_a_refresh_still_steps_aside_for_a_newer_evaluation() -> None:
     assert refresh_rebase(state, old, "inventory") is None
 
 
-def _pg_probe(monkeypatch, tables, catalog, applied):
+# A Full load + CDC run's watermark: the slot provisioned at the load's LSN (gapless, the
+# start only streams: snapshot.mode=never).
+_GAPLESS = SimpleNamespace(binlog_file=None, binlog_position=None, gtid_executed=None,
+                           server_uuid=None, wal_lsn="0/16B3748", slot_name="dsqlmig_s")
+
+
+def _pg_probe(monkeypatch, tables, catalog, applied, watermark=_GAPLESS, mode="automatic"):
     import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
     from dsql_migrator.core.models import SourceType
 
-    state = SimpleNamespace(applied_conversions=lambda: (applied, True))
+    state = SimpleNamespace(applied_conversions=lambda: (applied, True),
+                            cdc_start_mode=lambda: mode, cdc_start_override=lambda: None)
     monkeypatch.setattr(cdc_ui, "_cdc_tables_for_config", lambda *_a: tables)
     monkeypatch.setattr(cdc_ui, "_cdc_fk_connection_factory",
                         lambda _s: _catalog_factory(catalog, ()))
     session = SimpleNamespace(source_config=SimpleNamespace(source_type=SourceType.POSTGRES))
-    return cdc_ui._probe_cdc_generated_mismatch(state, session, None, None)
+    return cdc_ui._probe_cdc_generated_mismatch(state, session, None, watermark)
 
 
 def test_a_target_computing_a_pg_source_generated_column_is_not_refused(monkeypatch) -> None:
@@ -170,6 +177,30 @@ def test_a_target_computing_a_pg_source_generated_column_is_not_refused(monkeypa
     plain = {"shop.orders": {"id": "", "price": "", "qty": "", "total": ""}}
     generated = {"shop.orders": SimpleNamespace(target_ddl=_GENERATED_DDL)}
     assert _pg_probe(monkeypatch, [orders], plain, generated) == [("shop.orders", ["total"], [])]
+
+
+def test_a_pg_start_that_snapshots_still_refuses_a_target_computed_source_column(
+    monkeypatch,
+) -> None:
+    """G94 (review of G92): an initial snapshot SELECTs every captured column, so a target
+    computing the source-generated 'total' refuses each snapshot row (428C9): a CDC-only
+    or Manual start was let through and dead-lettered the table's existing rows."""
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+
+    orders = _orders()
+    orders.columns[3].generated = True
+    orders.columns[3].generated_kind = "STORED"
+    ordinary = _GENERATED_DDL.replace(" GENERATED ALWAYS AS ((price * qty)) STORED", "")
+    computes = {"shop.orders": {"id": "", "price": "", "qty": "", "total": "s"}}
+    applied = {"shop.orders": SimpleNamespace(target_ddl=ordinary)}
+    for watermark, mode in ((None, "automatic"), (_GAPLESS, "manual")):
+        mismatched = _pg_probe(monkeypatch, [orders], computes, applied, watermark, mode)
+        assert mismatched == [("shop.orders", [], ["total"])], (watermark, mode)
+    _t, _i, _h, body = cdc_ui._cdc_generated_mismatch_notice(
+        mismatched, is_pg=True, source_generated={("shop.orders", "total")}
+    )
+    assert "initial snapshot sends it" in body
+    assert "not for shop.orders.total, generated on the PostgreSQL source: CDC never streams it" in body
 
 
 def test_the_start_cdc_refusal_lists_are_bounded_and_read_right() -> None:

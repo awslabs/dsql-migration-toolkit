@@ -229,7 +229,8 @@ def test_an_edit_that_only_starts_with_the_refusal_comment_is_kept() -> None:
     assert not is_composite_key_placeholder(edited)
     state = SchemaConversionState()
     state.set_edited_target_ddl("shop.orders", edited)
-    assert state.get_edited_target_ddl("shop.orders") == edited
+    # G94: kept without the comment, so the typed statement stands alone.
+    assert state.get_edited_target_ddl("shop.orders") == edited.split("\n", 1)[1]
 
 
 def test_a_stored_composite_key_the_estimate_refuses_keeps_its_notes() -> None:

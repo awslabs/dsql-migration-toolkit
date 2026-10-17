@@ -7915,7 +7915,27 @@ def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark
     if connect is None:
         return []  # no target to read: Start CDC's connection checks stop it first
     read = target_generated_columns_of([t.name for t in tables], connection_factory=connect)
-    is_pg = _cdc_source_type(session) is SourceType.POSTGRES
+    # A PostgreSQL publication never carries a column generated on the source, so a start
+    # that only STREAMS (from the gapless slot: snapshot.mode=never) never sends one. An
+    # initial snapshot does: it SELECTs every captured column, so a target that computes
+    # one Schema Conversion keeps ordinary refuses each snapshot row (428C9) -- as the
+    # Start config decides it (pg_snapshot_mode), and unknown counts as a snapshot.
+    pg_streams_only = False
+    if _cdc_source_type(session) is SourceType.POSTGRES:
+        from dsql_migrator.core.cdc_postgres import pg_snapshot_mode
+
+        try:
+            resume_override, force_initial = _cdc_resume_signal(migration_state, session)
+            pg_streams_only = (
+                pg_snapshot_mode(
+                    watermark,
+                    resume_override=resume_override,
+                    force_initial_snapshot=force_initial,
+                )
+                == "never"
+            )
+        except Exception:  # noqa: BLE001 - an unknown start mode is taken as a snapshot
+            pg_streams_only = False
     mismatched: list = []
     for table in tables:
         expected = set(target_generated_capture_columns(table, applied))
@@ -7944,10 +7964,10 @@ def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark
                 if source not in on_target:
                     live.add(source)
         live -= set(getattr(table, "primary_key", None) or ())
-        if is_pg:
-            # A PostgreSQL publication never carries a column generated on the source, so
-            # the target computing one is no 428C9 -- CDC never sends it -- and is what
-            # keeps it current (an ordinary one there would be left stale).
+        if pg_streams_only:
+            # Streamed only, a column generated on the source is never sent: the target
+            # computing it is no 428C9, and is what keeps it current (an ordinary one there
+            # would be left stale).
             live -= {c.name for c in table.columns if getattr(c, "generated", False)} - expected
         if live != expected:
             mismatched.append((table.name, sorted(expected), sorted(live)))
@@ -8010,10 +8030,20 @@ def _cdc_generated_mismatch_notice(
                 f"{', '.join(left_out)} GENERATED in Schema Conversion but ordinary on the "
                 "target (CDC would stop writing it)"
             )
+        snapshot_sent = [
+            c for c in sent if is_pg and (table, c) in (source_generated or set())
+        ]
+        sent = [c for c in sent if c not in snapshot_sent]
         if sent:
             parts.append(
                 f"{', '.join(sent)} GENERATED on the target but not in Schema Conversion "
                 "(every change would be refused, 428C9)"
+            )
+        if snapshot_sent:
+            parts.append(
+                f"{', '.join(snapshot_sent)} GENERATED on the target but not in Schema "
+                "Conversion (this start's initial snapshot sends it, and every snapshot row "
+                "would be refused, 428C9)"
             )
         lines.append(f"{table}: " + "; ".join(parts))
     if len(differing) > 5:
@@ -8037,6 +8067,14 @@ def _cdc_generated_mismatch_notice(
         for c in expected
         if c not in live and is_pg and (t, c) in (source_generated or set())
     )
+    # The target computes it, Schema Conversion does not, and it is generated on a
+    # PostgreSQL SOURCE: dropping the expression would leave it stale under CDC.
+    computed_pinned = sorted(
+        f"{t}.{c}"
+        for t, expected, live in differing
+        for c in live
+        if c not in expected and is_pg and (t, c) in (source_generated or set())
+    )
     recreate = (
         "re-create the table from that DDL (a Replace in Schema Conversion empties it) and "
         "load its rows again the way they were first loaded"
@@ -8055,7 +8093,13 @@ def _cdc_generated_mismatch_notice(
         )
         + " For a column only the target computes: make the Schema Conversion DDL match it "
         "(GENERATED ALWAYS AS (...) STORED), or make the target column ordinary (ALTER "
-        "TABLE ... ALTER COLUMN ... DROP EXPRESSION)."
+        "TABLE ... ALTER COLUMN ... DROP EXPRESSION)"
+        + (
+            f" -- not for {_listed(computed_pinned)}, generated on the PostgreSQL source: "
+            "CDC never streams it, so an ordinary column would be left stale."
+            if computed_pinned
+            else "."
+        )
     )
     return (
         "error",

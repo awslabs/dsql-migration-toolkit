@@ -30,6 +30,7 @@ from dsql_migrator.core.converter import (
     is_name_collision_placeholder,
     parse_target_primary_key,
     rename_index_statements,
+    sql_without_comments,
     unkeyable_columns,
     views_in_dependency_order,
 )
@@ -513,8 +514,20 @@ def _is_foreign_key_ddl(statement: str) -> bool:
     where both ``ALTER TABLE`` and ``FOREIGN KEY`` always appear (this is the
     single source of truth reused by :func:`_classify_edited_table_conversion`).
     """
-    head = statement.strip().upper().split("(", 1)[0]
+    head = sql_without_comments(statement).strip().upper().split("(", 1)[0]
     return head.startswith("ALTER TABLE") and "FOREIGN KEY" in head
+
+
+def edited_statements(script: str) -> list[str]:
+    """The statements of an edited target-DDL script as they are applied: each without its
+    comments, and a comment-only one dropped. A note typed above a statement made it one
+    comment-led statement, which Schema Apply refused (it reads a CREATE) and Full Load
+    filed under no kind -- falling back to the generated DDL without the edit's indexes."""
+    return [
+        clean
+        for statement in split_sql_statements(script)
+        if (clean := sql_without_comments(statement).strip())
+    ]
 
 
 def override_apply_objects(
@@ -557,7 +570,7 @@ def override_apply_objects(
         if edited is not None:
             ddls = tuple(
                 stmt
-                for stmt in split_sql_statements(edited)
+                for stmt in edited_statements(edited)
                 if not _is_foreign_key_ddl(stmt)
             )
             renames = renames_by_table.get(obj.object_name)
@@ -856,8 +869,8 @@ def composite_leading_from_ddl(table: TableDef, target_ddl: str) -> Optional[str
     create_table = next(
         (
             stmt
-            for stmt in split_sql_statements(target_ddl)
-            if stmt.strip().upper().split("(", 1)[0].startswith("CREATE TABLE")
+            for stmt in edited_statements(target_ddl)
+            if stmt.upper().split("(", 1)[0].startswith("CREATE TABLE")
         ),
         target_ddl,
     )
@@ -885,10 +898,7 @@ def _classify_edited_table_conversion(
     create_ddl: Optional[str] = None
     index_ddls: list[str] = []
     foreign_key_ddls: list[str] = []
-    for statement in split_sql_statements(edited_script):
-        stmt = statement.strip()
-        if not stmt:
-            continue
+    for stmt in edited_statements(edited_script):
         head = stmt.upper().split("(", 1)[0]
         if head.startswith("CREATE SCHEMA"):
             schema_ddls.append(stmt)

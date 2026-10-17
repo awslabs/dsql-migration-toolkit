@@ -79,6 +79,7 @@ from dsql_migrator.core.converter import (
     pg_view_ddl,
     rename_index_script,
     validate_composite_leading_column,
+    without_composite_placeholder,
 )
 from dsql_migrator.core.assessor import kind_label
 from dsql_migrator.core.models import (
@@ -1240,7 +1241,8 @@ class SchemaConversionState:
         generated DDL as-is") so the user can revert by emptying the field -- and so does
         the comment a refused composite key yields, which is no DDL to apply.
         """
-        if ddl.strip() and not is_composite_key_placeholder(ddl):
+        ddl = without_composite_placeholder(ddl)
+        if ddl.strip():
             self.edited_target_ddls[object_name] = ddl
         else:
             self.edited_target_ddls.pop(object_name, None)
