@@ -639,6 +639,7 @@ def build_composite_conversion(
     leading: str,
     *,
     index_names: "Optional[Mapping[str, str]]" = None,
+    size_checked: bool = True,
 ) -> TableConversion:
     """Per-table conversion for ``table`` under a composite PK on ``leading``.
 
@@ -658,6 +659,9 @@ def build_composite_conversion(
             composite_leading_column=leading,
         ),
         index_names=index_names,
+        # The notes of a key already stored (hand-written, or sized more laxly before)
+        # are its own whatever the estimate says now; only a NEW pick is refused.
+        composite_size_checked=size_checked,
     )
 
 
@@ -746,11 +750,13 @@ def _first_create_table(target_ddl: str) -> str:
     The stored DDL is the whole script (CREATE TABLE + CREATE INDEX ...), but the
     single-statement parsers here read one statement -- isolate the CREATE TABLE.
     """
+    from dsql_migrator.core.converter import sql_without_comments
+
     return next(
         (
             stmt
             for stmt in split_sql_statements(target_ddl)
-            if stmt.strip().upper().split("(", 1)[0].startswith("CREATE TABLE")
+            if sql_without_comments(stmt).strip().upper().split("(", 1)[0].startswith("CREATE TABLE")
         ),
         target_ddl,
     )
@@ -761,48 +767,76 @@ def _column_clause(create_table_ddl: str, column: str) -> Optional[str]:
 
     The clause is the element of the column list -- split at its top-level commas, so a
     one-line or hand-laid-out CREATE reads like the converter's one-column-per-line one --
-    whose first token is the (optionally double-quoted) column identifier. Matching on the
-    leading token -- not a substring -- keeps a column merely NAMED like another from
-    being confused for it. Returns ``None`` when no such column is found.
+    whose leading identifier is the column (quoted, with ``""`` escapes and spaces, or
+    bare). Matching on the leading identifier -- not a substring -- keeps a column merely
+    NAMED like another from being confused for it. Returns ``None`` when no such column is
+    found.
     """
     for element in _column_list_elements(create_table_ddl):
-        token = element.split(None, 1)[0] if element.split() else ""
-        if token in (f'"{column}"', column):
+        if _leading_identifier(element) == column:
             return element
     return None
 
 
+def _leading_identifier(element: str) -> Optional[str]:
+    """The identifier an element of a column list starts with (unquoted as written)."""
+    text = element.lstrip()
+    if text.startswith('"'):
+        end = 1
+        while end < len(text):
+            if text[end] == '"':
+                if text[end + 1:end + 2] == '"':
+                    end += 2
+                    continue
+                return text[1:end].replace('""', '"')
+            end += 1
+        return None
+    token = text.split(None, 1)[0] if text.split() else ""
+    return token or None
+
+
 def _column_list_elements(create_table_ddl: str) -> "list[str]":
     """The comma-separated elements of a CREATE TABLE's parenthesised column list (column
-    definitions and table constraints), whitespace-collapsed -- commas inside parentheses,
-    string literals and quoted identifiers do not split."""
+    definitions and table constraints), comments dropped and whitespace collapsed -- the
+    list's '(' found outside quoted names, strings and comments, and no comma inside
+    parentheses, a string literal, a quoted identifier or a comment splitting it."""
+    from dsql_migrator.core.converter import _sql_skip
+
     text = create_table_ddl or ""
-    start = text.find("(")
-    if start < 0:
-        return []
     elements: list[str] = []
-    depth, quote, begin = 0, "", start + 1
-    i = start + 1
+    current: list[str] = []
+    depth = 0
+    started = False
+    i = 0
     while i < len(text):
         ch = text[i]
-        if quote:
-            if ch == quote:
-                if i + 1 < len(text) and text[i + 1] == quote:
-                    i += 1  # a doubled quote inside the literal / identifier
-                else:
-                    quote = ""
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "(":
+        skipped = _sql_skip(text, i) if ch in "'\"$-/eE" else None
+        if skipped is not None:
+            kind, end = skipped
+            if started and kind != "comment":
+                current.append(text[i:end])
+            elif started:
+                current.append(" ")
+            i = end
+            continue
+        if not started:
+            if ch == "(":
+                started = True
+            i += 1
+            continue
+        if ch == "(":
             depth += 1
         elif ch == ")":
             if depth == 0:
-                elements.append(text[begin:i])
+                elements.append("".join(current))
                 break
             depth -= 1
         elif ch == "," and depth == 0:
-            elements.append(text[begin:i])
-            begin = i + 1
+            elements.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
         i += 1
     return [" ".join(element.split()) for element in elements if element.strip()]
 

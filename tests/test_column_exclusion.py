@@ -872,7 +872,10 @@ def test_views_are_matched_by_what_they_read_not_by_the_bare_name():
     assert not any(f.code == T3 for f in table_exclusion_findings("shop.category", ctx))
     assert any(f.code == T3 for f in table_exclusion_findings("tenant2.orders", ctx))
     assert W6 in _wcodes(column_exclusion_warnings("tenant2.orders", "notes", ctx))
-    assert views_referencing(views, frozenset({"tenant1.orders"}))  # the drop path is unchanged
+    # G90: the reload's drop path binds by what a view reads too -- tenant2's view is no
+    # reader of tenant1.orders.
+    assert views_referencing(views, frozenset({"tenant1.orders"})) == []
+    assert views_referencing(views, frozenset({"tenant2.orders"})) == [views["tenant2.v_orders"]]
 
 
 def test_the_view_scan_runs_once_per_table_not_per_column(monkeypatch):

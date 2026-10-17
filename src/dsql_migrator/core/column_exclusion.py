@@ -516,12 +516,12 @@ def views_referencing(
 
     A view that SELECTs from a table being DROP+recreated blocks that table's DROP, and a
     view over such a view blocks ITS drop (there is no CASCADE), so the selection takes
-    every view that names one of ``tables`` -- the qualified ``schema.table`` or the bare
-    name as a word of the view's DDL -- and then every view that names a selected view.
-    An unrelated view is never needlessly dropped. Case-insensitive, word-boundary match
-    to avoid matching a substring of a longer identifier. Only the view's body is
-    searched, never its own name: a quoted ``CREATE VIEW "archive"."orders"`` would
-    otherwise "reference" the table ``shop.orders``. In name order they were dropped and
+    every view that reads one of ``tables`` -- by its FROM / JOIN relations, bound as the
+    target resolves them (a bare name is public's) -- and then every view that reads a
+    selected view. An unrelated view is never needlessly dropped. Case-insensitive. Only
+    the view's body is read, never its own name: a quoted ``CREATE VIEW
+    "archive"."orders"`` would otherwise "reference" the table ``shop.orders``. In name
+    order they were dropped and
     re-created regardless of which reads which: a view over a later-named view failed
     its CREATE (and was left missing), or an earlier-named view still read blocked the
     DROP and with it the reload. ``known_tables`` are every table's name, so a bare
@@ -529,28 +529,41 @@ def views_referencing(
     """
     if not view_ddls or not tables:
         return []
-    from dsql_migrator.core.converter import _dependency_order
+    from dsql_migrator.core.converter import _dependency_order, _mask_sql_literals, _scan_sql_names
 
-    # Each body's words, once, and a word -> views index: a regex per (view, name) pair
-    # made a reload over thousands of views stall for minutes (the pattern cache thrashed).
-    # The same bounded-word match as names_in (a qualified name matches only if its bare
-    # name does, so the bare word decides; this errs toward selecting a view).
+    # Each body's reads, once, and a relation -> views index (a regex per (view, name)
+    # pair made a reload over thousands of views stall for minutes). A view reads what
+    # its FROM / JOIN names, bound as the target resolves it -- a qualified name that
+    # exact relation, a bare one public's -- so a reload of one tenant's table no longer
+    # takes every tenant's same-named views. A body the scanner reads no relation from
+    # falls back to its words (literals masked), which errs toward selecting a view.
     readers_of: dict[str, list[str]] = {}
     for view_name in sorted(view_ddls):
         ddl = view_ddls[view_name]
         head = _VIEW_HEAD_RE.match(ddl)
-        body = (ddl[head.end():] if head is not None else ddl).lower()
-        words = set(_BODY_WORD_RE.findall(body))
-        # A quoted name is one word whatever it holds ("Order Details", "order-items"),
-        # or a table or view so named was never found and its readers stayed in place.
-        words.update(q.replace('""', '"') for q in _QUOTED_NAME_RE.findall(body))
-        for word in words:
-            readers_of.setdefault(word, []).append(view_name)
+        body = ddl[head.end():] if head is not None else ddl
+        relations = _scan_sql_names(body).relations
+        if relations:
+            keys = {
+                f"{(schema if schema is not None else 'public').lower()}.{bare.lower()}"
+                for schema, bare in relations
+            }
+        else:
+            masked = _mask_sql_literals(body).lower()
+            keys = {f"*.{word}" for word in _BODY_WORD_RE.findall(masked)}
+            # A quoted name is one word whatever it holds ("Order Details").
+            keys.update(f"*.{q.replace(chr(34) * 2, chr(34))}" for q in _QUOTED_NAME_RE.findall(masked))
+        for key in keys:
+            readers_of.setdefault(key, []).append(view_name)
 
     def readers(names: "Iterable[str]") -> "set[str]":
-        return {
-            view for name in names for view in readers_of.get(name.split(".")[-1].lower(), ())
-        }
+        found: set[str] = set()
+        for name in names:
+            schema, _, bare = name.rpartition(".")
+            bare = bare.lower()
+            found.update(readers_of.get(f"{(schema or 'public').lower()}.{bare}", ()))
+            found.update(readers_of.get(f"*.{bare}", ()))
+        return found
 
     selected = sorted(readers(tables))
     chosen = set(selected)

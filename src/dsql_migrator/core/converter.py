@@ -620,7 +620,26 @@ def _scan_sql_names(text: str) -> _SqlNames:
             frame["item"].chains += 2  # an expression: no longer a lone column
     for frame in frames:
         close_item(frame, len(masked))
+    # A name a WITH defines (``name AS (``, with an optional column list or MATERIALIZED)
+    # is read FROM like a relation, but it is the statement's own: bound to a same-named
+    # view or table it made a false edge (a cycle) and a false re-typed read.
+    ctes = {
+        _chain_parts(m.group(1))[0][-1]
+        for m in _CTE_DEFINITION_RE.finditer(masked)
+        if _chain_parts(m.group(1))[0]
+    }
+    if ctes:
+        relations = [(schema, bare) for schema, bare in relations if schema is not None or bare not in ctes]
     return _SqlNames(names=names, relations=relations, items=items, masked=masked)
+
+
+# ``name [(columns)] AS [NOT] [MATERIALIZED] (``: only a CTE definition reads so (a derived
+# table is ``) AS name``, a column alias ``expr AS name``).
+_CTE_DEFINITION_RE = re.compile(
+    r'(?:^|[\s,(])("(?:[^"]|"")+"|[A-Za-z_][\w$]*)\s*(?:\([^()]*\))?\s*\bAS\s+'
+    r"(?:NOT\s+)?(?:MATERIALIZED\s+)?\(",
+    re.IGNORECASE,
+)
 
 
 def views_in_dependency_order(
@@ -3923,13 +3942,20 @@ _COMPOSITE_PLACEHOLDER_LEAD = "-- Could not apply a composite primary key to "
 
 
 def is_composite_key_placeholder(target_ddl: str) -> bool:
-    """Whether ``target_ddl`` is the comment a refused COMPOSITE_KEY request yields -- never
-    a script to store or apply."""
-    return (target_ddl or "").lstrip().startswith(_COMPOSITE_PLACEHOLDER_LEAD)
+    """Whether ``target_ddl`` is the comment a refused COMPOSITE_KEY request yields, and
+    nothing else -- never a script to store or apply. An edit that only starts with that
+    comment (statements typed beneath it) is a real script."""
+    text = (target_ddl or "").lstrip()
+    return text.startswith(_COMPOSITE_PLACEHOLDER_LEAD) and not sql_without_comments(text).strip()
 
 
 def _apply_composite_key(
-    create: exp.Expression, table: TableDef, leading: str, *, is_postgres: bool = False
+    create: exp.Expression,
+    table: TableDef,
+    leading: str,
+    *,
+    is_postgres: bool = False,
+    size_checked: bool = True,
 ) -> ConversionWarning:
     """Prepend ``leading`` to the primary key in ``create`` (COMPOSITE_KEY).
 
@@ -3942,7 +3968,9 @@ def _apply_composite_key(
     the consequence (the application must key on the new composite key, and the
     leading column must be immutable).
     """
-    error = validate_composite_leading_column(table, leading, create, is_postgres=is_postgres)
+    error = validate_composite_leading_column(
+        table, leading, create if size_checked else None, is_postgres=is_postgres
+    )
     if error is not None:
         raise CompositeKeyError(error)
 
@@ -6602,6 +6630,7 @@ class SchemaConverter:
         options: SchemaConvertOptions | None = None,
         *,
         index_names: "Optional[Mapping[str, str]]" = None,
+        composite_size_checked: bool = True,
     ) -> TableConversion:
         """Convert a single table definition to DSQL-compatible DDL.
 
@@ -6969,7 +6998,8 @@ class SchemaConverter:
             leading = options.composite_leading_column or ""
             try:
                 composite_warning = _apply_composite_key(
-                    create, table, leading, is_postgres=is_postgres
+                    create, table, leading, is_postgres=is_postgres,
+                    size_checked=composite_size_checked,
                 )
             except CompositeKeyError as exc:
                 return _invalid_composite_conversion(table, str(exc))
@@ -7774,10 +7804,12 @@ def pg_views_remodelling(
     public_names = _public_names([*(t.name for t in tables), *(v.name for v in views)])
     ordered = [views[index] for index in order]
     scans = [every[index] for index in order]
+    # Each view's readers by the relation each read binds to (qualified: that one; bare:
+    # public's), so a hand-on re-queues only the views that really read it.
     readers: dict[str, list[int]] = {}
     for position, scan in enumerate(scans):
-        for _schema, bare in scan.relations:
-            readers.setdefault(bare, []).append(position)
+        for schema, bare in scan.relations:
+            readers.setdefault(f"{schema if schema is not None else 'public'}.{bare}", []).append(position)
     out: dict[str, PgViewRemodelling] = {}
     handed: dict[str, dict[str, tuple[str, str]]] = {}
     queue = deque(range(len(ordered)))
@@ -7792,9 +7824,9 @@ def pg_views_remodelling(
         out[view.name] = result
         if hand_on and hand_on != handed.get(view.name):
             handed[view.name] = hand_on
-            bare = _split_qualified(view.name)[1]
+            view_schema, bare = _split_qualified(view.name)
             sources.setdefault(bare, {})[view.name] = hand_on
-            for reader in readers.get(bare, ()):
+            for reader in readers.get(f"{view_schema or 'public'}.{bare}", ()):
                 if reader != position and reader not in queued:
                     queue.append(reader)
                     queued.add(reader)
@@ -7820,12 +7852,13 @@ def _remodel_view(
     read: set[str] = set()
     for schema, bare in scan.relations:
         entries = sources.get(bare, {})
-        if schema is None and bare in public_names:
-            # A bare name resolves on the search path: the public relation, re-typed or not.
-            public = f"public.{bare}"
-            candidates = [(public, entries[public])] if public in entries else []
-        else:
-            candidates = list(entries.items())
+        # A bare name resolves on the search path -- public, re-typed or not; one that is no
+        # public relation (another schema's, which the verbatim DDL cannot reach on the
+        # target) binds to nothing. A qualified one is that exact relation.
+        relation_name = f"{schema if schema is not None else 'public'}.{bare}"
+        candidates = (
+            [(relation_name, entries[relation_name])] if relation_name in entries else []
+        )
         for relation, columns in candidates:
             if relation == view.name or relation in read:
                 continue

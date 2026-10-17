@@ -477,7 +477,9 @@ def _stored_strategy_notes(
     # renders differently today but keys the table the same way).
     leading = composite_leading_from_ddl(table, stored)
     if leading is not None:
-        picked = build_composite_conversion(converter, table, leading, index_names=names)
+        picked = build_composite_conversion(
+            converter, table, leading, index_names=names, size_checked=False
+        )
         if is_composite_key_placeholder(picked.target_ddl):
             return None
     elif table.auto_increment_column:
