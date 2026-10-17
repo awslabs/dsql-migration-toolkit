@@ -89,7 +89,7 @@ def test_several_rows_of_defaults_are_manual() -> None:
         ("SELECT SQL_SMALL_RESULT customer_id, COUNT(*) FROM orders GROUP BY customer_id",
          "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id"),
         ("SELECT SQL_BIG_RESULT customer_id FROM orders", "SELECT customer_id FROM orders"),
-        ("SELECT SQL_CACHE id FROM orders", "SELECT id FROM orders"),
+        # (SQL_CACHE, a name on MySQL 8, is left as written: tests/test_g115_query_review.py.)
         ("SELECT STRAIGHT_JOIN o.id FROM orders o JOIN payments p ON p.order_id = o.id",
          "SELECT o.id FROM orders AS o JOIN payments AS p ON p.order_id = o.id"),
         # In any order among DISTINCT / DISTINCTROW (SQL_NO_CACHE DISTINCT was a PARSE_ERROR).
@@ -160,9 +160,8 @@ def test_on_duplicate_key_update_to_default_is_the_keyword() -> None:
         "WITH recent AS (SELECT customer_id AS CustomerId, MAX(created_at) AS last_order FROM "
         "orders GROUP BY customer_id) SELECT r.last_order FROM recent r NATURAL JOIN mc2 WHERE "
         "CustomerId > 10",
-        # The same with no bare name: 3 rows on MySQL, 12 converted.
-        "SELECT a.n FROM (SELECT customer_id AS CustomerId, COUNT(*) AS n FROM orders GROUP BY "
-        "customer_id) a NATURAL JOIN mc2",
+        # (The same with no bare name -- 3 rows on MySQL, 12 converted -- is the NATURAL JOIN's
+        # own note now: tests/test_g115_query_review.py.)
         # An ON sees only its join's operands: RowNum is mc's ('column "rownum" does not
         # exist'), not the derived table's joined after it.
         "SELECT mc.id FROM mc JOIN mc2 ON mc2.id = RowNum JOIN (SELECT 1 AS RowNum) d ON 1 = 1",
@@ -189,10 +188,8 @@ def test_the_relaxed_bare_name_rule_holds_only_where_mysql_refuses_ambiguity(sql
         "SELECT c.name, d.total FROM customers c LEFT JOIN (SELECT *, ROW_NUMBER() OVER "
         "(PARTITION BY customer_id ORDER BY created_at DESC) AS RowNum FROM orders) d ON "
         "d.customer_id = c.id AND RowNum = 1",
-        # A NATURAL JOIN's label quoted as the schema spells it matches on both engines.
-        "WITH recent AS (SELECT customer_id AS `CustomerId`, MAX(created_at) AS last_order "
-        "FROM orders GROUP BY customer_id) SELECT r.last_order FROM recent r NATURAL JOIN mc2 "
-        "WHERE `CustomerId` > 10",
+        # (A NATURAL JOIN's quoted label matches only if the schema spells it so, which the
+        # converter cannot tell: tests/test_g115_query_review.py.)
     ],
 )
 def test_the_top_n_per_group_idiom_stays_auto(sql: str) -> None:

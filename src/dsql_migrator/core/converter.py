@@ -11639,6 +11639,42 @@ def rewrite_mysql_expressions(
 MYSQL_EXPRESSION_DIALECT = _MySqlViewDialect
 
 
+def _mysql_select_options(select: exp.Expression) -> "list[str]":
+    """MySQL's SELECT options a view stores (select straight_join high_priority ..., FROM
+    `t` PARTITION (`p0`)), which Aurora DSQL has no syntax for: the modifiers left out, in
+    place -- they steer MySQL's optimizer and result buffering, not the rows -- and what is
+    not the same reported: SQL_CALC_FOUND_ROWS left out, a PARTITION selection left as
+    written. A view only: a Query Converter statement loses its modifiers before it is
+    parsed, and what sqlglot reads as one there is a backquoted column (SELECT
+    `high_priority` FROM t), which must stay."""
+    notes: list[str] = []
+    found_rows = False
+    for node in select.find_all(exp.Select):
+        modifiers = node.args.get("operation_modifiers") or []
+        found_rows = found_rows or any(m.name.upper() == "SQL_CALC_FOUND_ROWS" for m in modifiers)
+        node.set("operation_modifiers", None)
+    if found_rows:
+        notes.append(
+            "SQL_CALC_FOUND_ROWS is MySQL-only and left out: the view returns the same rows. The "
+            "FOUND_ROWS() an application reads after it -- how many rows there would be without "
+            "the LIMIT -- has no Aurora DSQL form: count them with a separate SELECT COUNT(*) "
+            "instead."
+        )
+    named = ", ".join(dict.fromkeys(
+        f"{t.name} {t.args['partition'].sql(dialect=_MySqlViewDialect)}"
+        for t in select.find_all(exp.Table)
+        if t.args.get("partition")
+    ))
+    if named:
+        notes.append(
+            f"{named} is MySQL-only and left as written, so the CREATE VIEW fails on Aurora "
+            "DSQL, which has no partitions. MySQL reads only the rows of the partitions named, "
+            "so leaving it out takes in the whole table: put the partitions' bounds -- what the "
+            "table is partitioned by -- in the view's WHERE instead."
+        )
+    return notes
+
+
 def view_column_types(definition: str, type_index: "Mapping[str, tuple]") -> "tuple":
     """The column types of the tables a MySQL view body names (MySQL writes each as
     `db`.`table`): the :func:`table_type_index` entries themselves, shared by every view
@@ -11675,6 +11711,7 @@ def _converted_mysql_view(
         untranslated, misformatted, issues = _rewrite_mysql_calls(
             select, _column_type_resolver(column_types), view=True, materialized=temptable
         )
+        issues = [*issues, *_mysql_select_options(select)]
         # MySQL stores a HAVING name by its alias (having (`total` > 1000)), which Aurora
         # DSQL never resolves there.
         issues.extend(inline_having_aliases(select))
