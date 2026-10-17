@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import sqlglot
 from sqlglot import exp
@@ -204,11 +204,23 @@ CODE_MIXED_CASE_LABEL = "MIXED_CASE_LABEL"
 CODE_QUOTE_MISMATCH = "QUOTE_MISMATCH"
 # Two unquoted table aliases that differ only by case, in one scope or nested ones.
 CODE_CASE_ONLY_ALIASES = "CASE_ONLY_ALIASES"
+# A qualified column MySQL reads from an outer alias, past an inner one of the same name
+# that lacks the column -- where Aurora DSQL stops, and fails.
+CODE_SHADOWED_ALIAS = "SHADOWED_ALIAS"
 # MySQL's multi-table UPDATE / DELETE (UPDATE ... JOIN, DELETE t FROM ... JOIN).
 CODE_MULTI_TABLE_DML = "MULTI_TABLE_DML"
 # A MySQL-only DML clause Aurora DSQL has no syntax for: DELETE / UPDATE ... ORDER BY /
-# LIMIT, the IGNORE modifier, REPLACE.
+# LIMIT, the IGNORE modifier, REPLACE, a PARTITION (p) selection.
 CODE_MYSQL_ONLY_DML = "MYSQL_ONLY_DML"
+# A MySQL-only SELECT clause Aurora DSQL has no form for: SQL_CALC_FOUND_ROWS, a
+# PARTITION (p) selection.
+CODE_MYSQL_ONLY_SELECT = "MYSQL_ONLY_SELECT"
+# MySQL's GROUP BY ... WITH ROLLUP, written GROUP BY ROLLUP (...): confirm it on the target.
+CODE_WITH_ROLLUP = "WITH_ROLLUP"
+# A MySQL user variable (@x, @x := ...): Aurora DSQL has none.
+CODE_USER_VARIABLE = "USER_VARIABLE"
+# MySQL's EXPLAIN / DESCRIBE, which is written DESCRIBE: Aurora DSQL has no such statement.
+CODE_EXPLAIN_STATEMENT = "EXPLAIN_STATEMENT"
 # A MySQL call the conversion leaves as written (a MySQL-only or user function): it fails
 # on Aurora DSQL unless the function exists there.
 CODE_UNTRANSLATED_CALL = "UNTRANSLATED_CALL"
@@ -668,7 +680,11 @@ class _Scopes:
     """The statement's own names, resolved per scope and memoized for one scan (a wide
     statement asked for them once per column made the scan quadratic)."""
 
-    def __init__(self, tree: exp.Expression) -> None:
+    def __init__(
+        self,
+        tree: exp.Expression,
+        table_columns: "Optional[Callable[[exp.Table], Optional[frozenset]]]" = None,
+    ) -> None:
         self.aliases = {_key(n) for n in tree.find_all(exp.TableAlias) if n.name}
         self._ctes: dict = {}
         self._outputs: dict[int, Optional[set]] = {}
@@ -677,19 +693,33 @@ class _Scopes:
         self._outer: dict[int, Optional[exp.Expression]] = {}
         self._names: dict = {}
         self._bound: dict = {}
+        self._operands: dict[int, tuple] = {}
+        self._coalesced: dict = {}
+        self._known: dict[int, Optional[frozenset]] = {}
+        # A real table's columns from the Evaluation inventory, when there is one.
+        self._table_columns = table_columns
         # Each node's enclosing scope, query level, and whether it sits in its query's
         # ORDER BY / GROUP BY / HAVING (None inside a window, which cannot name an alias)
         # -- in ONE top-down pass: walked up per column, a long AND/OR chain made the scan
-        # quadratic in its depth.
+        # quadratic in its depth. Also the join whose ON a node is in, and each scope's
+        # NATURAL / USING joins.
         self._enclosing: dict[int, Optional[exp.Expression]] = {}
         self._query: dict[int, Optional[exp.Expression]] = {}
         self._clause: dict[int, Optional[bool]] = {}
-        stack: list = [(tree, None, None, False)]
+        self._on: dict[int, exp.Join] = {}
+        self._coalescing: dict[int, list] = {}
+        stack: list = [(tree, None, None, False, None)]
         while stack:
-            node, scope, query, clause = stack.pop()
+            node, scope, query, clause, on = stack.pop()
             self._enclosing[id(node)] = scope
             self._query[id(node)] = query
             self._clause[id(node)] = clause
+            if on is not None:
+                self._on[id(node)] = on
+            if isinstance(node, exp.Join) and (
+                node.args.get("using") or (node.args.get("method") or "").upper() == "NATURAL"
+            ):
+                self._coalescing.setdefault(id(scope), []).append(node)
             child_scope = node if isinstance(node, _SCOPE_NODES) else scope
             child_query = node if isinstance(node, (exp.Select, exp.SetOperation)) else query
             if isinstance(node, exp.Select):
@@ -701,7 +731,13 @@ class _Scopes:
             else:
                 child_clause = clause
             for child in node.iter_expressions():
-                stack.append((child, child_scope, child_query, child_clause))
+                if isinstance(node, _SCOPE_NODES):
+                    child_on = None  # a subquery in an ON sees its own FROM
+                elif isinstance(node, exp.Join) and child.arg_key == "on":
+                    child_on = node
+                else:
+                    child_on = on
+                stack.append((child, child_scope, child_query, child_clause, child_on))
 
     def scope_of(self, node: exp.Expression) -> Optional[exp.Expression]:
         """The scope enclosing ``node`` (its query level or DML statement)."""
@@ -715,6 +751,43 @@ class _Scopes:
         if id(column) in self._clause:
             return self._clause[id(column)] is True
         return _in_alias_clause(column)
+
+    def on_of(self, node: exp.Expression) -> "Optional[exp.Join]":
+        """The join whose ON ``node`` is in, in its own scope."""
+        return self._on.get(id(node))
+
+    def coalesced(self, scope: exp.Expression, key: str) -> list:
+        """The joins of ``scope`` that may make ``key`` one column of two sources: a NATURAL
+        join, or a USING that lists it, joining a source that may hold it unseen (a real
+        table). MySQL makes them one column whatever their case, Aurora DSQL only when they
+        fold alike (an unquoted label folds, a real table's mixed-case column stays quoted),
+        so the source that holds it for certain no longer decides what the name reads there.
+        Memoized per scope and key."""
+        memo = (id(scope), key)
+        if memo not in self._coalesced:
+            folded = key.translate(_ASCII_FOLD)
+            found: list = []
+            for join in self._coalescing.get(id(scope), []):
+                natural = (join.args.get("method") or "").upper() == "NATURAL"
+                if not natural and all(
+                    _key(part).translate(_ASCII_FOLD) != folded
+                    for part in join.args.get("using") or []
+                ):
+                    continue
+                if any(
+                    _holds(self.source_outputs(item), key) is None
+                    for side in self.operands(join)
+                    for item in side
+                ):
+                    found.append(join)
+            self._coalesced[memo] = found
+        return self._coalesced[memo]
+
+    def operands(self, join: exp.Join) -> "tuple[list, list]":
+        """:func:`_join_operands`, memoized."""
+        if id(join) not in self._operands:
+            self._operands[id(join)] = _join_operands(join)
+        return self._operands[id(join)]
 
     def visible_ctes(self, node: exp.Expression) -> "dict[str, exp.CTE]":
         """The CTEs a name at ``node`` can refer to, by key, innermost first: every CTE of
@@ -862,6 +935,40 @@ class _Scopes:
             self._bound[(id(current), written, name)] = found
         return found
 
+    def mysql_bound(
+        self, scope: exp.Expression, name: str, column: str
+    ) -> "Optional[exp.Expression]":
+        """The FROM item MySQL reads ``name.column`` from. It resolves a qualified column by
+        the qualifier and the column together, so it reads past the nearest item of that
+        written name when that one's columns are known and lack ``column`` (SELECT ... FROM
+        orders o WHERE EXISTS (SELECT 1 FROM customers o WHERE o.customer_id = ...): the
+        outer o's) -- where Aurora DSQL stops."""
+        item = self.bound(scope, name, written=True)
+        while item is not None:
+            listed_in = self.scope_of(item)
+            outer = self._enclosing_items_scope(listed_in) if listed_in is not None else None
+            further = self.bound(outer, name, written=True) if outer is not None else None
+            if further is None or not self.lacks(item, column):
+                return item
+            item = further
+        return item
+
+    def lacks(self, item: exp.Expression, column: str) -> bool:
+        """``item`` has no column ``column`` for certain: its columns are known (a derived
+        table's or CTE's outputs, a table's from the Evaluation inventory) and none is named
+        so, whatever the case -- MySQL's column names have none."""
+        if id(item) not in self._known:
+            outputs = self.source_outputs(item)
+            if outputs is None and isinstance(item, exp.Table) and self._table_columns is not None:
+                outputs = self._table_columns(item)
+            self._known[id(item)] = (
+                None
+                if outputs is None or isinstance(outputs, _OpenOutputs)
+                else frozenset(key.lower() for key in outputs)
+            )
+        known = self._known[id(item)]
+        return known is not None and column.lower() not in known
+
     def _named(self, scope: exp.Expression, written: bool) -> dict:
         """``scope``'s FROM items by the name a qualifier reaches them by (the first of a
         name wins, as in the scope's own list)."""
@@ -909,12 +1016,47 @@ def _holds(outputs: "Optional[set]", key: str) -> "Optional[bool]":
     return None if isinstance(outputs, _OpenOutputs) else False
 
 
-def _own_name(sources: "list", key: str) -> bool:
+def _own_name(sources: "list", key: str, *, relaxed: bool) -> bool:
     """``key`` is a name the statement's own sources put out: one of them holds it for
-    certain. MySQL refuses an unqualified name two sources hold ('Column ... is
-    ambiguous'), so in a statement that runs there it resolves to that one, even beside a
-    real table (the top-N-per-group idiom joined to the table it names)."""
-    return any(_holds(o, key) is True for o in sources)
+    certain and none of the others may hold it unseen -- or, ``relaxed``, one holds it for
+    certain. Relaxed only where MySQL refuses an unqualified name two of ``sources`` hold
+    ('Column ... is ambiguous'): a statement that runs there resolves it to that one, even
+    beside a real table (the top-N-per-group idiom joined to the table it names)."""
+    held = [_holds(o, key) for o in sources]
+    return any(h is True for h in held) and (relaxed or all(h is not None for h in held))
+
+
+def _is_comma_join(join: exp.Join) -> bool:
+    """A join with no condition, kind, side or method: a comma, or a JOIN with no ON, which
+    sqlglot reads (and writes) as one -- the narrower of the two operands MySQL may mean."""
+    return not any(join.args.get(part) for part in ("on", "using", "kind", "side", "method"))
+
+
+def _join_operands(join: exp.Join) -> "tuple[list, list]":
+    """The FROM items ``join`` joins, as MySQL's join tree has them: on the left what is
+    joined before it, back to the comma that starts its operand (the comma binds looser
+    than JOIN: in a, b JOIN c the left one is b alone), on the right its own item -- a
+    parenthesised join's items included. Listed per join, which MySQL bounds: it joins at
+    most 61 tables."""
+    holder = join.parent
+    joins = list(holder.args.get("joins") or []) if holder is not None else []
+    index = next((i for i, j in enumerate(joins) if j is join), None)
+    right = _source_items(join.this)
+    if index is None:
+        return [], right
+    start = index - 1
+    while start >= 0 and not _is_comma_join(joins[start]):
+        start -= 1
+    if start >= 0:
+        return [i for j in joins[start:index] for i in _source_items(j.this)], right
+    if isinstance(holder, exp.Select):
+        source = holder.args.get("from_") or holder.args.get("from")
+        left = _source_items(getattr(source, "this", None))
+    elif _is_join_container(holder):
+        left = _source_items(holder.this)
+    else:
+        left = [holder]  # the entry the joins hang on, without them
+    return left + [i for j in joins[:index] for i in _source_items(j.this)], right
 
 
 def _projects_star(query: Optional[exp.Expression], alias: Optional[exp.Expression]) -> bool:
@@ -968,6 +1110,18 @@ def _in_alias_clause(column: exp.Column) -> bool:
     return False
 
 
+def _is_assigned(column: exp.Column) -> bool:
+    """``column`` is the whole value of an UPDATE's SET or an ON DUPLICATE KEY UPDATE
+    assignment, where a bare DEFAULT is the keyword."""
+    assignment = column.parent
+    return (
+        isinstance(assignment, exp.EQ)
+        and column.arg_key == "expression"
+        and isinstance(assignment.parent, (exp.Update, exp.OnConflict))
+        and assignment.arg_key == "expressions"
+    )
+
+
 def _mixed_case_names(
     tree: exp.Expression,
     scopes: "Optional[_Scopes]" = None,
@@ -982,9 +1136,9 @@ def _mixed_case_names(
     # -- because they name the same thing where defined and where used: a qualifier naming
     # a FROM item's alias or a visible CTE, a table naming a visible CTE, a bare ORDER BY /
     # GROUP BY / HAVING name equal to its query's select alias, a derived table's or CTE's
-    # own output column, a USING name only the statement's own sources hold, and DUAL. The
-    # table that carries an alias, the column inside an aliased expression and an INSERT's
-    # column list are real names.
+    # own output column, a bare or USING name only the statement's own sources hold, and
+    # DUAL -- and SET col = DEFAULT's keyword. The table that carries an alias, the column
+    # inside an aliased expression and an INSERT's column list are real names.
     scopes = scopes or _Scopes(tree)
     names: list[str] = []
 
@@ -1029,22 +1183,41 @@ def _mixed_case_names(
             for part in schema.expressions:
                 _flag(part)
     for join in tree.find_all(exp.Join):
+        if (join.args.get("method") or "").upper() == "NATURAL":
+            # MySQL's NATURAL JOIN matches common columns whatever their case, Aurora DSQL only
+            # those whose names fold alike: an unquoted label folds where a real table's
+            # mixed-case column stays quoted, so the join loses it and multiplies the rows.
+            sides = scopes.operands(join)
+            for side, other in (sides, sides[::-1]):
+                unseen = [scopes.source_outputs(i) for i in other]
+                unseen = [o for o in unseen if o is None or isinstance(o, _OpenOutputs)]
+                if not unseen:
+                    continue  # only known outputs there: the labels fold alike on both sides
+                for item in side:
+                    for label in _star_labels(item, scopes):
+                        key = _key(label)
+                        if any(_holds(outputs, key) is None for outputs in unseen):
+                            _flag(label)
         using = join.args.get("using") or []
         if not using:
             continue
-        # The join's right side, and what it joins to (every source listed before it).
-        right = [scopes.source_outputs(i) for i in _source_items(join.this)]
+        # The join's two operands as its join tree has them: in a, b JOIN c USING (k) the
+        # left one is b alone. MySQL refuses a USING name two sources of one operand hold.
+        left_items, right_items = scopes.operands(join)
+        left = [scopes.source_outputs(i) for i in left_items]
+        right = [scopes.source_outputs(i) for i in right_items]
         scope = scopes.scope_of(join)
-        listed = scopes.items(scope) if scope is not None else []
-        right_ids = {id(i) for i in _source_items(join.this)}
-        left: list = []
-        for item in listed:
-            if id(item) in right_ids:
-                break
-            left.append(scopes.source_outputs(item))
         for part in using:
             key = _key(part)
-            if right and left and _own_name(right, key) and _own_name(left, key):
+            relaxed = scope is not None and all(
+                other is join for other in scopes.coalesced(scope, key)
+            )
+            if (
+                right
+                and left
+                and _own_name(right, key, relaxed=relaxed)
+                and _own_name(left, key, relaxed=relaxed)
+            ):
                 continue  # only the statement's own outputs, on both sides
             _flag(part)
     for column in tree.find_all(exp.Column):
@@ -1101,12 +1274,24 @@ def _mixed_case_names(
                     continue
                 if not this.quoted and key in ("utc_timestamp", "utc_date", "utc_time"):
                     continue  # MySQL's UTC clock written without parentheses
+                if not this.quoted and key == "default" and _is_assigned(column):
+                    continue  # SET col = DEFAULT: the keyword, on MySQL and PostgreSQL alike
                 scope = scopes.scope_of(column)
-                sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
-                if _own_name(sources, key):
+                # What the name can mean: every FROM item, but in an ON only its join's
+                # operands -- MySQL's ON sees no item joined after it. MySQL's ambiguity
+                # check decides among them unless a NATURAL / USING join may make the name
+                # one column with a real table's.
+                on = scopes.on_of(column)
+                if on is not None:
+                    visible = [item for side in scopes.operands(on) for item in side]
+                else:
+                    visible = scopes.items(scope) if scope is not None else []
+                sources = [scopes.source_outputs(i) for i in visible]
+                relaxed = scope is not None and not scopes.coalesced(scope, key)
+                if _own_name(sources, key, relaxed=relaxed):
                     continue  # only the statement's own outputs are in scope
                 folded = key.translate(_ASCII_FOLD)
-                if this.quoted and folded != key and _own_name(sources, folded):
+                if this.quoted and folded != key and _own_name(sources, folded, relaxed=relaxed):
                     _mismatch(this)  # `UserId` over an unquoted derived output UserId
                     continue
         _flag(this)
@@ -1226,7 +1411,9 @@ def _quote_mismatch_warning(names: "Sequence[str]") -> "Optional[QueryWarning]":
     )
 
 
-def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Optional[QueryWarning]":
+def _case_only_alias_warning(
+    tree: exp.Expression, scopes: "_Scopes", shadowed: "Optional[list[str]]" = None
+) -> "Optional[QueryWarning]":
     """MANUAL when table aliases that differ only by case (or quoting) meet where Aurora DSQL
     makes them one: two in one FROM ('table name specified more than once'), or a reference
     MySQL resolves to one and Aurora DSQL to the other -- (SELECT ... FROM orders O WHERE
@@ -1234,7 +1421,9 @@ def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Option
     the outer row; folded, the inner O captures it, and the correlated subquery compares a
     row with itself, returning other rows with no error. A quoted alias takes part as
     written: a backquoted `o` is what an unquoted O folds to. Aliases in scopes no
-    reference crosses (a CTE body, an uncorrelated subquery) never meet."""
+    reference crosses (a CTE body, an uncorrelated subquery) never meet. ``shadowed``
+    collects the references Aurora DSQL reads from an inner item that lacks the column,
+    where MySQL reads on to an outer one: see :func:`_shadowed_alias_warning`."""
 
     def shown(item: exp.Expression) -> str:
         alias = item.args.get("alias")
@@ -1270,12 +1459,20 @@ def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Option
             or scope is None
         ):
             continue
-        # Each engine's own reading of the qualifier: MySQL by the name as written, Aurora
-        # DSQL by its key (a quoted name as written, an unquoted one folded).
-        mysql_item = scopes.bound(scope, qualifier.name, written=True)
+        # Each engine's own reading of the qualifier: MySQL by the name as written, and with
+        # the column (it reads past an item that lacks it), Aurora DSQL by its key (a quoted
+        # name as written, an unquoted one folded) at the first item that has it.
+        mysql_item = scopes.mysql_bound(scope, qualifier.name, column.name)
         postgres_item = scopes.bound(scope, _key(qualifier))
-        if mysql_item is not None and postgres_item is not None and mysql_item is not postgres_item:
-            clash(mysql_item, postgres_item)
+        if mysql_item is None or postgres_item is None or mysql_item is postgres_item:
+            continue
+        if scopes.lacks(postgres_item, column.name):
+            written = f"`{qualifier.name}`" if qualifier.quoted else qualifier.name
+            reference = f"{written}.{column.name}"
+            if shadowed is not None and reference not in shadowed:
+                shadowed.append(reference)
+            continue
+        clash(mysql_item, postgres_item)
     if not clashes:
         return None
     first, second = clashes[0]
@@ -1293,6 +1490,27 @@ def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Option
     )
 
 
+def _shadowed_alias_warning(references: "Sequence[str]") -> "Optional[QueryWarning]":
+    """MANUAL for the qualified columns (``references``, from :func:`_case_only_alias_warning`)
+    MySQL reads from an outer alias, past an inner one of that name without the column --
+    SELECT ... FROM orders o WHERE EXISTS (SELECT 1 FROM (SELECT order_id FROM payments) o
+    WHERE o.order_id = o.id): Aurora DSQL stops at the inner one and fails."""
+    if not references:
+        return None
+    return QueryWarning(
+        code=CODE_SHADOWED_ALIAS,
+        classification=Classification.MANUAL,
+        message=(
+            f"{', '.join(references[:5])}{' ...' if len(references) > 5 else ''}: an inner "
+            "table of that alias has no such column, so MySQL reads it from the outer one -- "
+            "it resolves a qualified column by the alias and the column together. Aurora DSQL "
+            "stops at the inner table and fails ('column "
+            f"{references[0].replace('`', '')} does not exist'). "
+            "Give the inner table an alias of its own."
+        ),
+    )
+
+
 # MySQL's DML modifiers, by the verb they follow (MySQL 8.4 takes DELETE's in any order).
 # LOW_PRIORITY / HIGH_PRIORITY / QUICK only schedule MySQL's table-level locks (MyISAM,
 # MEMORY) or tune its index upkeep, and MySQL 8 ignores DELAYED: Aurora DSQL has none of
@@ -1303,22 +1521,62 @@ _DML_MODIFIERS: "dict[str, frozenset[str]]" = {
     "UPDATE": frozenset({"LOW_PRIORITY", "IGNORE"}),
     "DELETE": frozenset({"LOW_PRIORITY", "QUICK", "IGNORE"}),
 }
+# MySQL's SELECT modifiers, which it takes after any SELECT -- a subquery's too -- in any
+# order among ALL / DISTINCT / DISTINCTROW: they only steer its optimizer (HIGH_PRIORITY,
+# STRAIGHT_JOIN, SQL_SMALL_RESULT / SQL_BIG_RESULT), result buffering and query cache, so
+# the conversion leaves them out and the query returns what it did. SQL_CALC_FOUND_ROWS
+# goes too, for the same rows, but is reported: see _found_rows_warning.
+_SELECT_MODIFIERS = frozenset({
+    "HIGH_PRIORITY", "STRAIGHT_JOIN", "SQL_SMALL_RESULT", "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT", "SQL_NO_CACHE", "SQL_CACHE", "SQL_CALC_FOUND_ROWS",
+})
+# A word before one of these is a column, not a modifier: MySQL 8 dropped SQL_CACHE, and
+# reads SELECT SQL_CACHE, id as a column of that name (the others it refuses there).
+_COLUMN_FOLLOWERS = frozenset({
+    TokenType.COMMA, TokenType.FROM, TokenType.ALIAS, TokenType.DOT, TokenType.R_PAREN,
+})
 _VERB_TOKENS = (TokenType.SELECT, TokenType.INSERT, TokenType.UPDATE, TokenType.DELETE)
 # A statement with none of these words has no modifier to remove, and is not tokenized twice.
 _MODIFIER_WORD = re.compile(
-    r"\b(?:LOW_PRIORITY|HIGH_PRIORITY|DELAYED|QUICK|IGNORE)\b", re.IGNORECASE
+    r"\b(?:LOW_PRIORITY|HIGH_PRIORITY|DELAYED|QUICK|IGNORE|STRAIGHT_JOIN"
+    r"|SQL_(?:SMALL_RESULT|BIG_RESULT|BUFFER_RESULT|NO_CACHE|CACHE|CALC_FOUND_ROWS))\b",
+    re.IGNORECASE,
 )
 
 
+def _statements(tokens: "Sequence") -> "list[list]":
+    """Each statement's tokens, in order: an input the Query Playground takes may hold several
+    (sqlglot reads them as one block, leaving out the empty ones, as this does)."""
+    statements: list = [[]]
+    for token in tokens:
+        if token.token_type is TokenType.SEMICOLON:
+            statements.append([])
+        else:
+            statements[-1].append(token)
+    return [statement for statement in statements if statement]
+
+
 def _verb_index(tokens: "Sequence") -> "Optional[int]":
-    """Where the statement's verb is among its tokens: the first, or after a leading WITH
+    """Where the statement's verb is among its tokens: the first, the first that is one
+    after a leading EXPLAIN / DESCRIBE [ANALYZE | FORMAT = ...], and after a leading WITH
     the first outside its CTEs' parentheses (a CTE's name is never a verb, all reserved)."""
     if not tokens:
         return None
-    if tokens[0].token_type is not TokenType.WITH:
-        return 0
+    start = 0
+    if tokens[0].token_type in (TokenType.DESCRIBE, TokenType.DESC):
+        verbs = [
+            index
+            for index, token in enumerate(tokens)
+            if token.token_type in _VERB_TOKENS or token.token_type is TokenType.WITH
+        ]
+        if not verbs:
+            return None
+        start = verbs[0]
+    if tokens[start].token_type is not TokenType.WITH:
+        return start
     depth = 0
-    for index, token in enumerate(tokens):
+    for index in range(start, len(tokens)):
+        token = tokens[index]
         if token.token_type is TokenType.L_PAREN:
             depth += 1
         elif token.token_type is TokenType.R_PAREN:
@@ -1328,45 +1586,94 @@ def _verb_index(tokens: "Sequence") -> "Optional[int]":
     return None
 
 
-def _without_dml_modifiers(sql: str) -> "tuple[str, str, list[str]]":
-    """``sql`` without the MySQL modifiers after its INSERT / UPDATE / DELETE, its verb, and
-    the modifiers removed (upper-case). sqlglot refuses DELETE / UPDATE IGNORE and INSERT
-    LOW_PRIORITY, and reads UPDATE LOW_PRIORITY t as a table aliased t, so they go before
-    parsing. Unquoted there, each is always a modifier: MySQL reserves all but QUICK, and
-    reads QUICK after DELETE as one even before a table's name. INSERT IGNORE stays: sqlglot
-    reads it."""
+def _select_modifiers(tokens: "Sequence", start: int) -> list:
+    """The modifier tokens among the options of the SELECT whose options begin at ``start``:
+    in any order, among its ALL / DISTINCT / DISTINCTROW and an optimizer hint, as MySQL
+    takes them -- unquoted, and not a column's name."""
+    found: list = []
+    for position in range(start, len(tokens)):
+        token = tokens[position]
+        if token.token_type in (TokenType.HINT, TokenType.ALL, TokenType.DISTINCT):
+            continue
+        if (
+            token.token_type not in (TokenType.VAR, TokenType.STRAIGHT_JOIN)
+            or token.text.upper() not in _SELECT_MODIFIERS
+        ):
+            break
+        following = tokens[position + 1] if position + 1 < len(tokens) else None
+        if following is None or following.token_type in _COLUMN_FOLLOWERS:
+            break
+        found.append(token)
+    return found
+
+
+def _without_dml_modifiers(sql: str) -> "tuple[str, list[tuple[int, str, str]]]":
+    """``sql`` without MySQL's DML and SELECT modifiers, and those removed: ``(statement,
+    verb, modifier)``, by the statement's place in the input, upper-case. sqlglot refuses
+    DELETE / UPDATE IGNORE and INSERT LOW_PRIORITY, and reads UPDATE LOW_PRIORITY t as a
+    table aliased t and SELECT HIGH_PRIORITY id as a column aliased id, so they go before
+    parsing -- in each statement, after its verb (an EXPLAIN's too) and an optimizer hint,
+    and after every SELECT. Unquoted there, each is always a modifier: MySQL reserves most,
+    and reads QUICK after DELETE as one even before a table's name. INSERT IGNORE stays:
+    sqlglot reads it."""
     if not _MODIFIER_WORD.search(sql):
-        return sql, "", []
+        return sql, []
     try:
         tokens = MYSQL_EXPRESSION_DIALECT().tokenize(sql)
     except sqlglot.errors.TokenError:
-        return sql, "", []  # parsing reports it
-    index = _verb_index(tokens)
-    if index is None:
-        return sql, "", []
-    verb = tokens[index].text.upper()
-    allowed = _DML_MODIFIERS.get(verb, frozenset())
+        return sql, []  # parsing reports it
     removed: list = []
-    for token in tokens[index + 1 :]:
-        word = token.token_type in (TokenType.VAR, TokenType.IGNORE)  # unquoted
-        if not word or token.text.upper() not in allowed:
-            break
-        removed.append(token)
-    for token in reversed(removed):
+    for statement, part in enumerate(_statements(tokens)):
+        index = _verb_index(part)
+        if index is not None:
+            verb = part[index].text.upper()
+            allowed = _DML_MODIFIERS.get(verb, frozenset())
+            for token in part[index + 1 :]:
+                if token.token_type is TokenType.HINT:
+                    continue  # DELETE /*+ BKA(o) */ LOW_PRIORITY FROM ...
+                word = token.token_type in (TokenType.VAR, TokenType.IGNORE)  # unquoted
+                if not word or token.text.upper() not in allowed:
+                    break
+                removed.append((statement, verb, token))
+        for position, token in enumerate(part):
+            if token.token_type is TokenType.SELECT:
+                removed.extend(
+                    (statement, "SELECT", modifier)
+                    for modifier in _select_modifiers(part, position + 1)
+                )
+    for _statement, _verb, token in sorted(removed, key=lambda entry: entry[2].start, reverse=True):
         sql = sql[: token.start] + sql[token.end + 1 :]
-    return sql, verb, [token.text.upper() for token in removed]
+    return sql, [(statement, verb, token.text.upper()) for statement, verb, token in removed]
 
 
-def _with_ignore(converted: str) -> str:
-    """``converted`` with IGNORE back after its verb: an UPDATE / DELETE IGNORE is left as
-    written, so the statement fails on Aurora DSQL until it is rewritten, instead of
-    running with its errors no longer ignored."""
+def _with_ignore(converted: str, statements: "Sequence[int]") -> str:
+    """``converted`` with IGNORE back after the verb of each of ``statements`` (by place): an
+    UPDATE / DELETE IGNORE is left as written, so the statement fails on Aurora DSQL until
+    it is rewritten, instead of running with its errors no longer ignored."""
     tokens = sqlglot.Dialect.get_or_raise(_POSTGRES).tokenize(converted)
-    index = _verb_index(tokens)
-    if index is None:
-        return converted
-    end = tokens[index].end + 1
-    return f"{converted[:end]} IGNORE{converted[end:]}"
+    ends: list = []
+    for statement, part in enumerate(_statements(tokens)):
+        index = _verb_index(part) if statement in statements else None
+        if index is not None:
+            ends.append(part[index].end + 1)
+    for end in reversed(ends):
+        converted = f"{converted[:end]} IGNORE{converted[end:]}"
+    return converted
+
+
+def _found_rows_warning() -> QueryWarning:
+    """MANUAL for MySQL's SELECT SQL_CALC_FOUND_ROWS, left out: the query returns the same
+    rows, but the FOUND_ROWS() an application reads after it has no Aurora DSQL form."""
+    return QueryWarning(
+        code=CODE_MYSQL_ONLY_SELECT,
+        classification=Classification.MANUAL,
+        message=(
+            "SQL_CALC_FOUND_ROWS is MySQL-only and left out: the query returns the same rows. "
+            "The FOUND_ROWS() an application reads after it -- how many rows there would be "
+            "without the LIMIT -- has no Aurora DSQL form: count them with a separate "
+            "SELECT COUNT(*) over the same FROM and WHERE instead."
+        ),
+    )
 
 
 def _ignore_warning(verb: str) -> QueryWarning:
@@ -1397,10 +1704,17 @@ def _ignore_warning(verb: str) -> QueryWarning:
 def _mysql_only_clause_warnings(tree: exp.Expression) -> "list[QueryWarning]":
     """MANUAL for the MySQL-only clauses of a DML statement Aurora DSQL's grammar lacks, left
     as written (a DML statement is never test-run, so nothing else would tell): REPLACE,
-    INSERT IGNORE, and DELETE / UPDATE ... ORDER BY / LIMIT -- the chunked delete a MySQL
-    application runs."""
+    INSERT IGNORE, DELETE / UPDATE ... ORDER BY / LIMIT -- the chunked delete a MySQL
+    application runs -- and a PARTITION (p) selection, a SELECT's too. MySQL's INSERT INTO t
+    () VALUES (), a row of defaults, is written INSERT INTO t DEFAULT VALUES (in place)."""
     warnings: list[QueryWarning] = []
-    if isinstance(tree, exp.Command) and (tree.name or "").strip().upper() == "REPLACE":
+    # One walk for every clause below: a long statement is walked once, not per clause.
+    nodes = list(tree.find_all(exp.Command, exp.Insert, exp.Delete, exp.Update, exp.Table))
+    inserts = [node for node in nodes if isinstance(node, exp.Insert)]
+    if any(
+        isinstance(node, exp.Command) and (node.name or "").strip().upper() == "REPLACE"
+        for node in nodes
+    ):
         warnings.append(QueryWarning(
             code=CODE_MYSQL_ONLY_DML,
             classification=Classification.MANUAL,
@@ -1413,10 +1727,12 @@ def _mysql_only_clause_warnings(tree: exp.Expression) -> "list[QueryWarning]":
                 "key still fails. Rewrite it before running it."
             ),
         ))
-    if isinstance(tree, exp.Insert) and tree.args.get("ignore"):
+    if any(insert.args.get("ignore") for insert in inserts):
         warnings.append(_ignore_warning("INSERT"))
-    for node in tree.find_all(exp.Delete, exp.Update):
-        if not (node.args.get("order") or node.args.get("limit")):
+    for node in nodes:
+        if not isinstance(node, (exp.Delete, exp.Update)) or not (
+            node.args.get("order") or node.args.get("limit")
+        ):
             continue
         verb = "DELETE" if isinstance(node, exp.Delete) else "UPDATE"
         written = " ... ".join(
@@ -1431,14 +1747,72 @@ def _mysql_only_clause_warnings(tree: exp.Expression) -> "list[QueryWarning]":
                 "key> IN (SELECT <primary key> FROM t WHERE ... ORDER BY ... LIMIT n) -- keeping n "
                 "within Aurora DSQL's 3,000 rows per transaction."
             )
-        else:
+        elif verb == "DELETE":
             remedy = "Without a LIMIT, the order does not change which rows are touched: remove it."
-        warnings.append(QueryWarning(
+        else:
+            # MySQL checks a unique key row by row, so the order decides whether a key shift
+            # passes; PostgreSQL (and MySQL itself, unordered) refuses the duplicate midway.
+            remedy = (
+                "MySQL applies the order row by row, checking each unique key as it goes, so an "
+                "UPDATE that shifts a unique or primary key (SET pos = pos + 1 ... ORDER BY pos "
+                "DESC) depends on it: without it the statement fails with a duplicate-key error, "
+                "on MySQL and PostgreSQL alike. Shift such a key in two steps instead: move the "
+                "keys out of range (SET pos = -(pos + 1) WHERE ...), then into place (SET pos = "
+                "-pos WHERE pos < 0). If the SET changes no unique or primary key column, "
+                "removing the ORDER BY is enough."
+            )
+        found = QueryWarning(
             code=CODE_MYSQL_ONLY_DML,
             classification=Classification.MANUAL,
             message=(
                 f"{verb} ... {written} is MySQL-only: Aurora DSQL's {verb} takes no ORDER BY or "
                 f"LIMIT, so it is left as written. {remedy}"
+            ),
+        )
+        if found not in warnings:
+            warnings.append(found)
+    partitions = [t for t in nodes if isinstance(t, exp.Table) and t.args.get("partition")]
+    if partitions:
+        dml = any(isinstance(node, _DML_TYPES) for node in nodes)
+        named = ", ".join(dict.fromkeys(
+            f"{t.name} {t.args['partition'].sql(dialect=MYSQL_EXPRESSION_DIALECT)}"
+            for t in partitions
+        ))
+        warnings.append(QueryWarning(
+            code=CODE_MYSQL_ONLY_DML if dml else CODE_MYSQL_ONLY_SELECT,
+            classification=Classification.MANUAL,
+            message=(
+                f"{named} is MySQL-only and left as written: Aurora DSQL has no partitions. "
+                "MySQL reads and changes only the rows of the partitions named (an INSERT takes "
+                "only rows that belong in them), so leaving it out takes in the whole table: put "
+                "the partitions' bounds -- what the table is partitioned by -- in the WHERE "
+                "instead (for an INSERT, check that each row falls within them)."
+            ),
+        ))
+    for insert in inserts:
+        target, values = insert.this, insert.args.get("expression")
+        if (
+            not isinstance(values, exp.Values)
+            or not values.expressions
+            or any(row.expressions for row in values.expressions)
+            or isinstance(target, exp.Schema) and target.expressions
+        ):
+            continue
+        if len(values.expressions) == 1:
+            # INSERT INTO t () VALUES (): a row of every column's default, PostgreSQL's
+            # DEFAULT VALUES ('syntax error at or near ")"' as written).
+            insert.set("this", target.this if isinstance(target, exp.Schema) else target)
+            insert.set("expression", None)
+            insert.set("default", True)
+            continue
+        warnings.append(QueryWarning(
+            code=CODE_MYSQL_ONLY_DML,
+            classification=Classification.MANUAL,
+            message=(
+                "INSERT ... VALUES (), () -- rows of every column's default -- has no Aurora DSQL "
+                "form as written, and DEFAULT VALUES inserts one row: name one column and give "
+                "each row its default (INSERT INTO t (id) VALUES (DEFAULT), (DEFAULT)), or insert "
+                "the rows one by one with INSERT INTO t DEFAULT VALUES."
             ),
         ))
     return warnings
@@ -1499,6 +1873,114 @@ def _mysql_only_dml_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
             "on the target."
         ),
     )
+
+
+def _rewrite_with_rollup(tree: exp.Expression) -> "Optional[QueryWarning]":
+    """MySQL's GROUP BY a, b WITH ROLLUP written GROUP BY ROLLUP (a, b), in place -- the same
+    rows on PostgreSQL (each group's, then each subtotal with NULL in what it rolls up) --
+    and MANUAL: Aurora DSQL documents no ROLLUP. After the HAVING is inlined, which reads
+    the GROUP BY's own columns."""
+    rolled = False
+    for group in tree.find_all(exp.Group):
+        rollup = group.args.get("rollup") or []
+        # WITH ROLLUP reads as an empty Rollup beside the GROUP BY's own expressions.
+        if group.expressions and any(
+            isinstance(r, exp.Rollup) and not r.expressions for r in rollup
+        ):
+            group.set("rollup", [exp.Rollup(expressions=list(group.expressions))])
+            group.set("expressions", [])
+            rolled = True
+    if not rolled:
+        return None
+    return QueryWarning(
+        code=CODE_WITH_ROLLUP,
+        classification=Classification.MANUAL,
+        message=(
+            "GROUP BY ... WITH ROLLUP is written GROUP BY ROLLUP (...), which returns the same "
+            "rows on PostgreSQL: each group's, then a subtotal with NULL in each column it rolls "
+            "up. Aurora DSQL's documented GROUP BY lists only ALL and DISTINCT, so confirm it "
+            "with Test on target before relying on it. MySQL returns the rows in GROUP BY order, "
+            "each subtotal after its group; if that order matters, add ORDER BY GROUPING(col), "
+            "col for each grouped column in turn."
+        ),
+    )
+
+
+def _user_variable_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
+    """MANUAL for MySQL's user variables (@rn, @rn := @rn + 1, SET @x = 1), which Aurora DSQL
+    has no form for -- each written back as MySQL spells it (PostgreSQL's rendering, $rn, is
+    neither engine's)."""
+    names: list[str] = []
+    for parameter in list(tree.find_all(exp.Parameter)):
+        written = parameter.sql(dialect=MYSQL_EXPRESSION_DIALECT)
+        if written not in names:
+            names.append(written)
+        parameter.replace(exp.var(written))
+    if not names:
+        return None
+    shown = ", ".join(names[:5]) + (" ..." if len(names) > 5 else "")
+    one = len(names) == 1
+    return QueryWarning(
+        code=CODE_USER_VARIABLE,
+        classification=Classification.MANUAL,
+        message=(
+            f"{shown} {'is a MySQL user variable' if one else 'are MySQL user variables'}, and "
+            f"Aurora DSQL has none: {'it is' if one else 'they are'} left as written, and the "
+            "statement fails there. Number rows with ROW_NUMBER() OVER (ORDER BY ...) instead of "
+            "a counter (@rn := @rn + 1 over an ordered scan; PARTITION BY for one count per "
+            "group); compute any other value in a CTE, or pass it in as a bound parameter."
+        ),
+    )
+
+
+def _explain_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
+    """MANUAL for MySQL's EXPLAIN / DESCRIBE (of a statement or a table), which the
+    conversion writes DESCRIBE ...: Aurora DSQL has no such statement, so it fails there."""
+    statements = tree.expressions if isinstance(tree, exp.Block) else [tree]
+    if not any(isinstance(statement, exp.Describe) for statement in statements):
+        return None
+    return QueryWarning(
+        code=CODE_EXPLAIN_STATEMENT,
+        classification=Classification.MANUAL,
+        message=(
+            "EXPLAIN / DESCRIBE is written DESCRIBE ..., which Aurora DSQL has no statement for: "
+            "its own is EXPLAIN [ANALYZE] <statement>, and shows its own plan. Convert the "
+            "statement without the EXPLAIN and use Test on target for Aurora DSQL's plan; a "
+            "table's columns are in information_schema.columns there."
+        ),
+    )
+
+
+def _inventory_columns(
+    column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]",
+) -> "Optional[Callable[[exp.Table], Optional[frozenset]]]":
+    """A real table's columns (lower-cased) from the Evaluation inventory's column types: the
+    table named as written (with its schema, else without), else in another case, when only
+    one table can be meant; ``None`` when the inventory has no such table."""
+    if not column_types:
+        return None
+    index: dict = {}
+
+    def columns(table: exp.Table) -> "Optional[frozenset]":
+        if not index:
+            for name, typed in column_types:
+                known = frozenset(column for column, _type in typed)
+                short = name.rsplit(".", 1)[-1]
+                for kind, key in (("exact", name), ("folded", name.lower()), ("bare", short),
+                                  ("bare folded", short.lower())):
+                    index.setdefault((kind, key), []).append(known)
+        db = table.args.get("db")
+        name = f"{db.name}.{table.name}" if db is not None else table.name
+        kinds = [("exact", name), ("folded", name.lower())]
+        if db is None:
+            kinds += [("bare", name), ("bare folded", name.lower())]
+        for kind in kinds:
+            found = index.get(kind) or []
+            if found:
+                return found[0] if len(found) == 1 else None
+        return None
+
+    return columns
 
 
 class QueryConverter:
@@ -1566,11 +2048,11 @@ class QueryConverter:
         there, so running them could only misfire.
         """
         engine = "PostgreSQL" if self._is_postgres else "MySQL"
-        # MySQL's LOW_PRIORITY / QUICK / IGNORE ... after the verb, which sqlglot refuses
-        # or reads as a table: the parse is of the statement without them.
-        parsed, verb, modifiers = (
-            (sql, "", []) if self._is_postgres else _without_dml_modifiers(sql)
-        )
+        # MySQL's LOW_PRIORITY / QUICK / IGNORE ... after the verb and HIGH_PRIORITY /
+        # SQL_NO_CACHE ... after a SELECT, which sqlglot refuses or reads as a table or a
+        # column: the parse is of the statement without them.
+        parsed, removed = (sql, []) if self._is_postgres else _without_dml_modifiers(sql)
+        ignored = [statement for statement, _verb, word in removed if word == "IGNORE"]
         try:
             tree = sqlglot.parse_one(
                 parsed, read=_POSTGRES if self._is_postgres else MYSQL_EXPRESSION_DIALECT
@@ -1597,20 +2079,25 @@ class QueryConverter:
 
         if not self._is_postgres:
             # On the SOURCE's names, before a rewrite adds its own (EXCLUDED.col).
-            scopes = _Scopes(tree)
+            scopes = _Scopes(tree, _inventory_columns(self._column_types))
             mismatched: list[str] = []
+            shadowed: list[str] = []
             mixed_names = _mixed_case_names(tree, scopes, mismatched)
             mixed_case = _mixed_case_name_warning(mixed_names)
             mixed_label = _mixed_case_label_warning(tree, mixed_names, scopes)
             for found in (
                 _quote_mismatch_warning(mismatched),
-                _case_only_alias_warning(tree, scopes),
+                _case_only_alias_warning(tree, scopes, shadowed),
+                _shadowed_alias_warning(shadowed),
                 _mysql_only_dml_warning(tree),
+                _explain_warning(tree),
             ):
                 if found is not None:
                     warnings.append(found)
-            if "IGNORE" in modifiers:
+            for verb in dict.fromkeys(verb for _s, verb, word in removed if word == "IGNORE"):
                 warnings.append(_ignore_warning(verb))
+            if any(word == "SQL_CALC_FOUND_ROWS" for _s, _verb, word in removed):
+                warnings.append(_found_rows_warning())
             warnings.extend(_mysql_only_clause_warnings(tree))
             on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
             if on_duplicate_warning is not None:
@@ -1632,12 +2119,17 @@ class QueryConverter:
             # MySQL-only: PostgreSQL's HAVING never names an output alias, so on a
             # PostgreSQL source a HAVING name matching one is a real column.
             warnings.extend(_inline_having_aliases(tree, self._column_types))
+            # After the HAVING is inlined: it reads the GROUP BY's own columns, and may copy
+            # a user variable's assignment.
+            for found in (_rewrite_with_rollup(tree), _user_variable_warning(tree)):
+                if found is not None:
+                    warnings.append(found)
         warnings.extend(_for_update_warnings(tree))
 
         try:
             converted_sql = tree.sql(dialect=_POSTGRES, pretty=pretty)
-            if "IGNORE" in modifiers:
-                converted_sql = _with_ignore(converted_sql)
+            if ignored:
+                converted_sql = _with_ignore(converted_sql, ignored)
         except sqlglot.errors.SqlglotError as exc:
             return self._manual_review(
                 sql,
@@ -1696,8 +2188,13 @@ __all__ = [
     "CODE_MIXED_CASE_LABEL",
     "CODE_QUOTE_MISMATCH",
     "CODE_CASE_ONLY_ALIASES",
+    "CODE_SHADOWED_ALIAS",
     "CODE_MULTI_TABLE_DML",
     "CODE_MYSQL_ONLY_DML",
+    "CODE_MYSQL_ONLY_SELECT",
+    "CODE_WITH_ROLLUP",
+    "CODE_USER_VARIABLE",
+    "CODE_EXPLAIN_STATEMENT",
     "CODE_UNTRANSLATED_CALL",
     "CODE_UNMAPPED_DATE_FORMAT",
     "CODE_MYSQL_SEMANTICS",
