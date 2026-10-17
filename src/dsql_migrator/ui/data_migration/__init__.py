@@ -4034,8 +4034,9 @@ def prereq_exclusion_change_hint(state, prereq_mode) -> Optional[str]:
     at = state.prereq_report_checked_at(prereq_mode)
     when = f" at {at.strftime('%H:%M')} UTC" if at is not None else ""
     return (
-        f"Exclusions changed since these checks ran{when}; size results describe the "
-        "earlier set."
+        f"Exclusions changed since these checks ran{when}; their size and column results "
+        "describe the earlier set -- run the checks again to judge the current one (a "
+        "column now excluded no longer fails them)."
     )
 
 
@@ -6048,13 +6049,17 @@ def _render_prereq_phase_verdicts(ui, report) -> None:
     # When only the CDC phase is blocked, spell out that the Full Load can still
     # run -- this is the common "binlog/replication not ready" case.
     if full is not None and cdc is not None and full.can_proceed and not cdc.can_proceed:
+        # Said as the run guard holds it: a Full load + CDC run starts only once CDC can
+        # follow it (the load's start point is the stream's), so 'the Full Load can run
+        # now' was not so on this panel.
         render_notice(
             ui,
             tone="warning",
             header="CDC stream blocked",
-            body="The Full Load can run now; only the CDC stream is blocked "
-            f"({', '.join(cdc.blocking_titles)}). Fix these to enable CDC, or "
-            "run Full load only.",
+            body="The Full Load itself needs none of these, but this Full load + CDC run "
+            "starts only once CDC can follow it "
+            f"({', '.join(cdc.blocking_titles)}). Fix them to start it, or switch to Full "
+            "load only to load now.",
         )
 
 

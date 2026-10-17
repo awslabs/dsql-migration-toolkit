@@ -360,8 +360,10 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
     # domain column. numeric(p,s)[] vs numeric[] is the only place it decides anything.
     "CASE WHEN a.atttypmod <> -1 THEN a.atttypmod "
     "     WHEN t.typtype = 'd' THEN t.typtypmod ELSE -1 END AS element_typmod, "
-    # NOT NULL: a column left out of the event then has every write refused (23502).
-    "a.attnotnull AS not_null "
+    # NOT NULL: a column left out of the event then has every write refused (23502). A
+    # domain's own NOT NULL counts too, one level deep, as pgjdbc's getColumns (which
+    # Debezium marks the field optional or required by) and cdc_catalog_drift read it.
+    "(a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS not_null "
     "FROM pg_catalog.pg_attribute a "
     "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "

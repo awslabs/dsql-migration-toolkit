@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 import time as _time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence, Union
 
 from dsql_migrator.core.models import (
@@ -871,6 +871,8 @@ class GeneratedColumnsRead:
     columns: "dict[str, set[str]]"
     missing: "tuple[str, ...]" = ()
     unreadable: "tuple[str, ...]" = ()
+    # Every column of each existing table, generated or not.
+    names: "dict[str, set[str]]" = field(default_factory=dict)
 
 
 def target_generated_columns_of(
@@ -883,6 +885,7 @@ def target_generated_columns_of(
     table this way. A missing table is told apart from an unreadable one (a connection
     failure makes every table unreadable)."""
     columns: dict[str, set[str]] = {}
+    names: dict[str, set[str]] = {}
     missing: list[str] = []
     unreadable: list[str] = []
     try:
@@ -917,6 +920,7 @@ def target_generated_columns_of(
                 columns[table_name] = {
                     str(row[0]) for row in rows if row and row[0] and row[1] not in (None, "")
                 }
+                names[table_name] = {str(row[0]) for row in rows if row and row[0]}
             except Exception:  # noqa: BLE001 - unreadable catalog -> unknown for this one
                 unreadable.append(table_name)
             finally:
@@ -925,7 +929,7 @@ def target_generated_columns_of(
     finally:
         _safe_close(connection)
     return GeneratedColumnsRead(
-        columns=columns, missing=tuple(missing), unreadable=tuple(unreadable)
+        columns=columns, missing=tuple(missing), unreadable=tuple(unreadable), names=names
     )
 
 

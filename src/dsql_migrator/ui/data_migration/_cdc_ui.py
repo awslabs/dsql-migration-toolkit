@@ -7931,20 +7931,34 @@ def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark
         folded: dict[str, list[str]] = {}
         for column in table.columns:
             folded.setdefault(column.name.lower(), []).append(column.name)
+        on_target = read.names.get(table.name, set())
         live: set[str] = set()
         for name in read.columns[table.name]:
             if name in exact:
                 live.add(name)
             elif len(folded.get(name.lower(), ())) == 1:
-                live.add(folded[name.lower()][0])
+                source = folded[name.lower()][0]
+                # Not when the target has that exact name as a column of its own: a
+                # target-only "total" beside the source's "Total" is another column.
+                if source not in on_target:
+                    live.add(source)
         live -= set(getattr(table, "primary_key", None) or ())
         if live != expected:
             mismatched.append((table.name, sorted(expected), sorted(live)))
     return mismatched
 
 
-def _cdc_generated_mismatch_notice(mismatched, *, is_pg: bool = False) -> tuple:
-    """The Start CDC refusal for :func:`_probe_cdc_generated_mismatch`."""
+def _cdc_generated_mismatch_notice(
+    mismatched,
+    *,
+    is_pg: bool = False,
+    cdc_only: bool = False,
+    source_generated: "Optional[set]" = None,
+) -> tuple:
+    """The Start CDC refusal for :func:`_probe_cdc_generated_mismatch`. ``cdc_only``: the
+    migration has no Full Load to reload with; ``source_generated``: the
+    ``(table, column)`` pairs GENERATED on the source, which a PostgreSQL publication
+    never carries."""
     unreadable = [t for t, _e, live in mismatched if live is None]
     missing = [t for t, _e, live in mismatched if live == _TARGET_TABLE_MISSING]
     differing = [
@@ -7959,12 +7973,19 @@ def _cdc_generated_mismatch_notice(mismatched, *, is_pg: bool = False) -> tuple:
     # catalog wants the connection checked, a missing table an apply -- never a Replace.
     unchecked = []
     if missing:
+        them = "it" if len(missing) == 1 else "them"
         unchecked.append(
             f"{_listed(missing)} {'does' if len(missing) == 1 else 'do'} not exist on the "
-            "target, so CDC would dead-letter every change to "
-            f"{'it' if len(missing) == 1 else 'them'}: apply "
-            f"{'it' if len(missing) == 1 else 'them'} from Schema Conversion (or leave "
-            f"{'it' if len(missing) == 1 else 'them'} out of the selection)."
+            f"target, so CDC would dead-letter every change to {them}: apply {them} from "
+            "Schema Conversion"
+            + (
+                # A CDC-only migration's set is fixed once its infrastructure exists, and
+                # the rows already loaded by other means have to be loaded again.
+                f", then load {them} again the way {them} were first loaded."
+                if cdc_only
+                else f", then reload {them} with the Full Load step's per-table 'Drop & "
+                "reload' (the rows the Full Load wrote went with the table)."
+            )
         )
     if unreadable:
         unchecked.append(
@@ -8001,15 +8022,29 @@ def _cdc_generated_mismatch_notice(mismatched, *, is_pg: bool = False) -> tuple:
             else "Captured tables do not exist on the target",
             " ".join(unchecked) + " Nothing was changed.",
         )
+    # Editing the DDL back to ordinary helps unless the column is generated on a
+    # PostgreSQL SOURCE, whose publication never carries it.
+    pinned = sorted(
+        f"{t}.{c}"
+        for t, expected, live in differing
+        for c in expected
+        if c not in live and is_pg and (t, c) in (source_generated or set())
+    )
+    recreate = (
+        "re-create the table from that DDL (a Replace in Schema Conversion empties it) and "
+        "load its rows again the way they were first loaded"
+        if cdc_only
+        else "re-create the table from that DDL and reload it with Full Load's per-table "
+        "'Drop & reload' (a Replace in Schema Conversion would empty the loaded table)"
+    )
     remedy = (
-        " For a column Schema Conversion makes GENERATED: re-create the table from that DDL "
-        "and reload it with Full Load's per-table 'Drop & reload' (a Replace in Schema "
-        "Conversion would empty the loaded table)"
+        f" For a column Schema Conversion makes GENERATED: {recreate}, or edit the DDL back "
+        "to ordinary if CDC should write it"
         + (
-            "; editing the DDL back to ordinary does not help on a PostgreSQL source, which "
-            "never publishes a generated column, so CDC would leave the column stale."
-            if is_pg
-            else ", or edit the DDL back to ordinary if CDC should write it."
+            f" -- not for {', '.join(pinned)}, generated on the PostgreSQL source, which "
+            "never publishes a generated column: CDC would leave it stale."
+            if pinned
+            else "."
         )
         + " For a column only the target computes: make the Schema Conversion DDL match it "
         "(GENERATED ALWAYS AS (...) STORED), or make the target column ordinary (ALTER "
@@ -8798,6 +8833,14 @@ def _start_cdc_deploy(
                 _cdc_generated_mismatch_notice(
                     _generated_mismatch,
                     is_pg=_is_pg_start,
+                    cdc_only=getattr(migration_state, "migration_type", None)
+                    is MigrationType.CDC_ONLY,
+                    source_generated={
+                        (t.name, c.name)
+                        for t in (getattr(inventory, "tables", None) or ())
+                        for c in t.columns
+                        if getattr(c, "generated", False)
+                    },
                 ),
                 getattr(handle, "job_id", None),
             )

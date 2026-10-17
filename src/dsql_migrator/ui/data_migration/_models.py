@@ -3671,6 +3671,7 @@ def target_generated_capture_columns(table, applied: "Optional[Mapping[str, obje
     one edited back to ordinary excluded -- else the source's preserved PostgreSQL STORED
     columns. A key column is never listed: the sink needs it to write and delete."""
     from dsql_migrator.core.converter import (
+        parse_target_column_names,
         parse_target_generated_columns,
         pg_preserved_generated_columns,
     )
@@ -3684,12 +3685,17 @@ def target_generated_capture_columns(table, applied: "Optional[Mapping[str, obje
         lowered: dict[str, list[str]] = {}
         for column in table.columns:
             lowered.setdefault(column.name.lower(), []).append(column.name)
+        # A fold names a source column only when the DDL does not define that exact name
+        # too: a target-only "total" beside the source's own "Total" is another column.
+        defined = set(parse_target_column_names(ddl) or ())
         names = []
         for name in sorted(named):
             if name in exact:
                 names.append(name)
             elif len(lowered.get(name.lower(), ())) == 1:
-                names.append(lowered[name.lower()][0])
+                source = lowered[name.lower()][0]
+                if source not in defined:
+                    names.append(source)
     keys = set(getattr(table, "primary_key", None) or ())
     return sorted(name for name in names if name not in keys)
 

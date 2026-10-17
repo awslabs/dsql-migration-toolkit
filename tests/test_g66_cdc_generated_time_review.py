@@ -263,9 +263,17 @@ def test_the_refusal_never_advises_a_replace_and_says_what_it_could_not_check(mo
     _t, _i, _h, mysql_body = cdc_ui._cdc_generated_mismatch_notice(differs)
     assert "'Drop & reload'" in mysql_body and "would empty the loaded table" in mysql_body
     assert "edit the DDL back to ordinary if CDC should write it" in mysql_body
-    _t, _i, _h, pg_body = cdc_ui._cdc_generated_mismatch_notice(differs, is_pg=True)
-    assert "edit the DDL back to ordinary if CDC should write it" not in pg_body
+    # G85: 'editing back does not help' only for a column generated on the PG SOURCE.
+    _t, _i, _h, pg_body = cdc_ui._cdc_generated_mismatch_notice(
+        differs, is_pg=True, source_generated={("shop.orders", "total")}
+    )
+    assert "not for shop.orders.total" in pg_body
     assert "never publishes a generated column" in pg_body
+    _t, _i, _h, pg_ordinary = cdc_ui._cdc_generated_mismatch_notice(differs, is_pg=True)
+    assert "edit the DDL back to ordinary if CDC should write it." in pg_ordinary
+    assert "never publishes" not in pg_ordinary
+    _t, _i, _h, cdc_only = cdc_ui._cdc_generated_mismatch_notice(differs, cdc_only=True)
+    assert "Drop & reload" not in cdc_only and "the way they were first loaded" in cdc_only
 
     broken = _probe(monkeypatch, [orders], {}, applied, broken={"shop.orders"})
     assert broken == [("shop.orders", ["total"], None)]
@@ -279,6 +287,7 @@ def test_the_refusal_never_advises_a_replace_and_says_what_it_could_not_check(mo
     assert header == "A captured table does not exist on the target"
     assert "shop.orders does not exist on the target" in body
     assert "apply it from Schema Conversion" in body
+    assert "'Drop & reload'" in body  # the Full Load's rows went with the table
 
 
 def test_a_not_null_bit_array_blocks_cdc_like_an_unlogged_table() -> None:
@@ -406,3 +415,81 @@ def test_a_schema_without_a_generated_column_opens_no_connection(monkeypatch) ->
 
     monkeypatch.setattr(cdc_ui, "_cdc_fk_connection_factory", no_connection)
     assert cdc_ui._probe_cdc_generated_mismatch(state, object(), None, None) == []
+
+
+def test_a_target_only_generated_column_beside_a_source_column_of_another_case(monkeypatch) -> None:
+    """A computed "total" added in Schema Conversion beside the source's ordinary "Total"
+    was folded onto it: CDC left "Total" out, and the probe agreed (G85)."""
+    import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    from dsql_migrator.ui.data_migration._models import target_generated_capture_columns
+
+    items = TableDef(
+        name="app.items",
+        columns=[ColumnDef(name="id", mysql_type="bigint", nullable=False),
+                 ColumnDef(name="Total", mysql_type="numeric(12,2)")],
+        primary_key=["id"],
+    )
+    ddl = (
+        'CREATE TABLE "app"."items" ("id" BIGINT NOT NULL, "Total" NUMERIC(12, 2), '
+        '"total" NUMERIC GENERATED ALWAYS AS (("Total" * 2)) STORED, PRIMARY KEY ("id"))'
+    )
+    applied = {"app.items": SimpleNamespace(target_ddl=ddl)}
+    assert target_generated_capture_columns(items, applied) == []
+    catalog = {"app.items": {"id": "", "Total": "", "total": "s"}}
+    assert _probe(monkeypatch, [items], catalog, applied) == []
+
+
+def test_a_domains_not_null_counts_for_the_uncarryable_column_probe() -> None:
+    """CREATE DOMAIN flagset AS bit(8)[] NOT NULL: attnotnull is false, but pgjdbc (and so
+    Debezium) reads the field as required -- the connector stops; it was graded WARN."""
+    from dsql_migrator.core.source_dialect.postgres import _PG_CDC_UNCARRYABLE_COLUMNS_SQL
+
+    assert "(a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS not_null" in (
+        _PG_CDC_UNCARRYABLE_COLUMNS_SQL
+    )
+
+
+def test_the_combined_panel_says_the_run_waits_for_cdc(monkeypatch) -> None:
+    """'The Full Load can run now' sat beside a Run held by the same CDC-only FAIL."""
+    import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.core.models import (
+        MigrationMode,
+        PrerequisiteCheckId,
+        PrerequisiteReport,
+        PrerequisiteResult,
+        PrerequisiteStatus,
+    )
+
+    class _Ui:
+        def row(self):
+            return self
+
+        def classes(self, *_a):
+            return self
+
+        def props(self, *_a):
+            return self
+
+        def badge(self, *_a):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    report = PrerequisiteReport.build(MigrationMode.CDC, [
+        PrerequisiteResult(
+            check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
+            title="Every column's type can be carried by CDC",
+            status=PrerequisiteStatus.FAIL, required=True, target="app.devices",
+            detail="x",
+        )
+    ])
+    shown: list = []
+    monkeypatch.setattr(dm, "render_notice", lambda _ui, **kw: shown.append(kw.get("body", "")))
+    dm._render_prereq_phase_verdicts(_Ui(), report)
+    (text,) = shown
+    assert "starts only once CDC can follow it" in text
+    assert "The Full Load can run now" not in text

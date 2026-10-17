@@ -11362,8 +11362,9 @@ def test_a_column_excluded_after_the_checks_no_longer_blocks_and_gets_a_neutral_
     assert full_load_run_guard_reason(state, _inventory()) is None
     hint = prereq_exclusion_change_hint(state, MigrationMode.FULL_LOAD)
     at = state.prereq_report_checked_at(MigrationMode.FULL_LOAD).strftime("%H:%M")
-    assert hint == (f"Exclusions changed since these checks ran at {at} UTC; size results "
-                    "describe the earlier set.")
+    assert hint == (f"Exclusions changed since these checks ran at {at} UTC; their size and "
+                    "column results describe the earlier set -- run the checks again to judge "
+                    "the current one (a column now excluded no longer fails them).")
 
     # Re-running the checks with the exclusion in place clears the hint.
     state.set_prereq_report(MigrationMode.FULL_LOAD, _fl_report("orders"))
