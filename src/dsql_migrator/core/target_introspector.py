@@ -28,6 +28,7 @@ Design seams:
 
 from __future__ import annotations
 
+import re
 import time as _time
 from dataclasses import dataclass
 from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence, Union
@@ -1599,19 +1600,22 @@ def sync_identity_sequences(
                 # Identity columns only: ``is_identity`` is the catalog's own answer, so a
                 # plain integer key (a Keep source PK table) is correctly skipped rather
                 # than having a sequence invented for it. Bound parameters throughout.
+                # The catalog holds a name cut to 63 bytes (a 64-character MySQL name
+                # migrates shortened), so it is matched that way; the statements below
+                # name the full form, which PostgreSQL cuts itself.
                 if schema_name is not None:
                     cursor.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_schema = %s AND table_name = %s "
                         "AND is_identity = 'YES'",
-                        (schema_name, bare),
+                        (pg_stored_name(schema_name), pg_stored_name(bare)),
                     )
                 else:
                     cursor.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = %s AND is_identity = 'YES' "
                         "AND table_schema = ANY (current_schemas(false))",
-                        (bare,),
+                        (pg_stored_name(bare),),
                     )
                 rows = cursor.fetchall() or []
             except Exception as exc:  # noqa: BLE001 - unreadable catalog is a FAILURE
@@ -1682,6 +1686,16 @@ def sync_identity_sequences(
                 restart_at = floor
             else:
                 restart_at = max(current_max + 1, floor if isinstance(floor, int) else 0)
+            # NEVER BACKWARDS. A sync can run again after cut over (the runbook says it is
+            # safe to repeat), when the application has drawn ids the table no longer holds
+            # (an outbox emptied by its consumer), or without the source counter (a restart
+            # dropped the password, the source is stopped): restarting at MAX + 1 or at the
+            # floor then reissued ids already handed out -- below a restart this tool made
+            # itself. The sequence's own position is the bound; unreadable, the sync does
+            # what it always did.
+            position = _identity_next_value(connection, schema_name, bare, column)
+            if isinstance(position, int) and restart_at <= position:
+                continue  # already at or past it: nothing to advance
             cursor = connection.cursor()
             try:
                 cursor.execute(
@@ -1710,6 +1724,48 @@ def sync_identity_sequences(
         if connection is not None:
             _safe_close(connection)
     return out
+
+
+def _identity_next_value(
+    connection: Any, schema_name: "Optional[str]", bare: str, column: str
+) -> Optional[int]:
+    """The value the identity sequence of ``column`` hands out next (``last_value`` +1
+    once drawn from; with CACHE it counts every block a session reserved), or ``None``
+    when it cannot be read. Read-only; a failed read leaves no aborted transaction behind
+    (the sync's connection is in autocommit, as every target connection is)."""
+    from psycopg import sql
+
+    qualified = ".".join(
+        '"' + part.replace('"', '""') + '"' for part in ((schema_name, bare) if schema_name else (bare,))
+    )
+    cursor = connection.cursor()
+    try:
+        cursor.execute("SELECT pg_get_serial_sequence(%s, %s)", (qualified, column))
+        row = cursor.fetchone()
+        sequence = row[0] if row is not None else None
+        if not sequence:
+            return None
+        cursor.execute(
+            sql.SQL("SELECT last_value, is_called FROM {}").format(
+                sql.Identifier(*_split_regclass(str(sequence)))
+            )
+        )
+        row = cursor.fetchone()
+    except Exception:  # noqa: BLE001 - unknown position: the caller restarts as before
+        return None
+    finally:
+        _safe_close(cursor)
+    if row is None or len(row) < 2 or not isinstance(row[0], int):
+        return None
+    return row[0] + 1 if row[1] else row[0]
+
+
+def _split_regclass(text: str) -> "list[str]":
+    """The parts of a regclass's text form (``app."Odd.Name_seq"``), quotes removed."""
+    return [
+        quoted.replace('""', '"') if quoted else bare
+        for quoted, bare in re.findall(r'"((?:[^"]|"")*)"|([^."]+)', text)
+    ]
 
 
 def partition_identity_sync(

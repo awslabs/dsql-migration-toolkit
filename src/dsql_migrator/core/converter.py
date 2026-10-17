@@ -460,10 +460,13 @@ def identity_strategy_applies(table: TableDef) -> bool:
     if not column or table.primary_key != [column]:
         return False
     # An identity is an integer: a float/double AUTO_INCREMENT key (older MySQL allowed
-    # one) would make it DOUBLE PRECISION ... AS IDENTITY, which Aurora DSQL rejects.
+    # one) would make it DOUBLE PRECISION ... AS IDENTITY, which Aurora DSQL rejects. A
+    # numeric key fed by a sequence (a PostgreSQL schema ported from Oracle) is not
+    # excluded: a sequence's values are bigint, and the strategy narrows the column to
+    # bigint with its own note.
     declared = next((c.mysql_type for c in table.columns if c.name == column), "") or ""
     base = re.split(r"[\s(]", declared.strip().lower(), maxsplit=1)[0]
-    return base not in ("float", "double", "real", "decimal", "numeric") or base == ""
+    return base not in ("float", "double", "real") or base == ""
 
 
 def default_primary_key_strategy(
@@ -475,8 +478,9 @@ def default_primary_key_strategy(
     already IS an identity (or a ``serial``, the same mechanism spelled differently), so
     an identity on the target is the faithful port -- and keeping the column's exact TYPE
     instead is what DROPS the generation, since an Aurora DSQL identity must be
-    ``bigint``. A PG serial / identity key is always int2/int4/int8, so that widening is
-    always lossless.
+    ``bigint``. A serial / identity key is int2/int4/int8 (a numeric one fed by a
+    sequence -- a schema ported from Oracle -- is narrowed instead, with its own note), so
+    the widening is lossless for every value a sequence generated.
 
     MySQL: ``IDENTITY_WITH_CACHE`` too, wherever the widening to ``bigint`` is lossless
     (:func:`mysql_identity_is_lossless`). ``KEEP_INTEGER`` used to be the MySQL default,
@@ -484,9 +488,10 @@ def default_primary_key_strategy(
     leaves the key out -- the usual one -- found no generator and failed. The column keeps
     working as the database's own key generator; Full Load and CDC still write the source's
     ids (``BY DEFAULT``), and the sequence is restarted past them after the load and at cut
-    over. One difference from MySQL remains: an id the application supplies itself after
-    cut over does not advance the sequence. ``bigint unsigned`` keeps ``KEEP_INTEGER``: it
-    maps to ``numeric(20, 0)`` to keep its range, and an identity must be ``bigint``.
+    over (never moved backwards). The insert idioms an identity does not reproduce are
+    :data:`MYSQL_IDENTITY_DIFFERENCES` (an explicit NULL/0, LAST_INSERT_ID(), an id the
+    application supplies). ``bigint unsigned`` keeps ``KEEP_INTEGER``: it maps to
+    ``numeric(20, 0)`` to keep its range, and an identity must be ``bigint``.
 
     Resolved PER TABLE, so one global option cannot force an identity onto a composite
     key.
@@ -3416,6 +3421,10 @@ def _apply_pk_strategy(
             + (
                 "Choose the 'Server-generated (IDENTITY)' strategy instead if you want "
                 "DSQL to fill the key. "
+                if identity_strategy_applies(table)
+                else "The 'Server-generated (IDENTITY)' strategy cannot be used for this "
+                "table because its key is not an integer (an Aurora DSQL identity is "
+                "bigint), so the value has to come from the application. "
                 if table.primary_key == [column_name]
                 else "The 'Server-generated (IDENTITY)' strategy cannot be used for this "
                 "table because its primary key is composite "
@@ -3431,15 +3440,20 @@ def _apply_pk_strategy(
             "writes on one partition."
         )
 
-    # A RECOMMENDATION, not a LOSS: every strategy produces a correct, complete target
-    # key -- this is throughput advice about DSQL's partitioning, so it must not be
-    # styled like a removed foreign key (which genuinely lost a constraint).
+    # An identity (or a UUID the application now generates) is advice about DSQL's
+    # partitioning; a key KEPT without its generation is a gap -- every INSERT that omits
+    # it fails after cut over -- so it is a LOSS here as it is at Evaluation, never filed
+    # under "Recommendations -- not problems to fix".
     warnings = [
         ConversionWarning(
             object_name=table.name,
             column_name=column_name,
             classification=Classification.MANUAL,
-            kind=ConversionNoteKind.RECOMMENDATION,
+            kind=(
+                ConversionNoteKind.LOSS
+                if strategy is PrimaryKeyStrategy.KEEP_INTEGER
+                else ConversionNoteKind.RECOMMENDATION
+            ),
             message=message,
         )
     ]
@@ -5688,6 +5702,20 @@ class SchemaConverter:
                 )
             )
 
+        # A tinyint(1) AUTO_INCREMENT key the identity strategy makes a bigint identity is
+        # an integer key, not a boolean: the "mapped to boolean" note would describe a type
+        # its DDL does not have.
+        effective_strategy = (
+            options.primary_key_strategy
+            if "primary_key_strategy" in options.model_fields_set
+            else default_primary_key_strategy(table, is_postgres=is_postgres)
+        )
+        identity_key = (
+            table.auto_increment_column
+            if effective_strategy is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+            and identity_strategy_applies(table)
+            else None
+        )
         for column_def in (() if is_postgres else create.find_all(exp.ColumnDef)):
             # Drop any MySQL column COLLATE clause: DSQL/PostgreSQL does not have
             # MySQL collation names (e.g. utf8mb4_general_ci), and the reconstructed
@@ -5720,7 +5748,7 @@ class SchemaConverter:
             if mapping.enum_values is not None:
                 _add_enum_check(column_def, mapping.enum_values)
 
-            if mapping.message is not None:
+            if mapping.message is not None and column_def.name != identity_key:
                 warnings.append(
                     ConversionWarning(
                         object_name=table.name,
@@ -5952,7 +5980,19 @@ class SchemaConverter:
                 pk_strategy_warnings.append(composite_warning)
             if table.auto_increment_column:
                 # The composite rewrite keeps the generated column a plain integer, so
-                # nothing generates it -- the default identity would have.
+                # nothing generates it. Name the IDENTITY strategy only as the picker
+                # offers it: the default, available, or not at all.
+                if default_primary_key_strategy(
+                    table, is_postgres=is_postgres
+                ) is PrimaryKeyStrategy.IDENTITY_WITH_CACHE:
+                    alternative = (
+                        " (Server-generated IDENTITY, the default for this table, keeps it "
+                        "generated)"
+                    )
+                elif identity_strategy_applies(table):
+                    alternative = " (Server-generated IDENTITY keeps it generated)"
+                else:
+                    alternative = ""
                 pk_strategy_warnings.append(
                     ConversionWarning(
                         object_name=table.name,
@@ -5962,8 +6002,7 @@ class SchemaConverter:
                             f"With the composite key, '{table.auto_increment_column}' stays "
                             "a plain integer WITHOUT the source's value generation: Aurora "
                             "DSQL will NOT generate it after cut over, so the application "
-                            "must supply it on every insert (Server-generated IDENTITY, "
-                            "the default for this table, keeps it generated)."
+                            f"must supply it on every insert{alternative}."
                         ),
                     )
                 )

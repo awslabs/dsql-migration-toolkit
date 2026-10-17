@@ -766,6 +766,11 @@ class _SeqCursor:
             self._rows = [(self._c.max_pk,)]
         elif "RESTART WITH" in text:
             self._c.restarts.append(text)
+        elif "pg_get_serial_sequence" in text and self._c.position is not None:
+            self._rows = [('ecommerce."orders_id_seq"',)]
+        elif "last_value, is_called" in text and self._c.position is not None:
+            assert '"ecommerce"."orders_id_seq"' in text  # the regclass, parsed and requoted
+            self._rows = [self._c.position]
 
     def fetchall(self) -> list:
         return self._rows
@@ -778,9 +783,11 @@ class _SeqCursor:
 
 
 class _SeqConnection:
-    def __init__(self, *, identity_by_table: dict, max_pk) -> None:
+    def __init__(self, *, identity_by_table: dict, max_pk, position=None) -> None:
         self.identity_by_table = identity_by_table
         self.max_pk = max_pk
+        # (last_value, is_called) of the identity's sequence; None: not readable.
+        self.position = position
         self.executed: list[str] = []
         self.restarts: list[str] = []
         self.closed = False
@@ -1521,3 +1528,40 @@ def test_an_empty_schema_on_the_target_is_part_of_the_tree() -> None:
     )
     assert [schema.name for schema in inventory.schemas] == ["shop", "analytics"]
     assert inventory.schemas[1].tables == [] and inventory.schemas[1].views == []
+
+
+def test_a_repeated_sync_never_moves_an_identity_backwards() -> None:
+    """A re-run after cut over restarted an emptied table at the source counter, and a sync
+    without the source counter (a restart dropped the password) restarted at MAX + 1 --
+    below the restart the tool had made itself, so ids already handed out were reissued."""
+    from dsql_migrator.core.target_introspector import sync_identity_sequences
+
+    # Emptied outbox: the app drew 5001..70536 (a CACHE block), the floor is 5001.
+    drawn = _SeqConnection(identity_by_table={"orders": "id"}, max_pk=None, position=(70536, True))
+    out = sync_identity_sequences(
+        ["ecommerce.orders"], connection_factory=lambda: drawn,
+        source_next_values={"ecommerce.orders": 5001},
+    )
+    assert out == {"ecommerce.orders": None} and drawn.restarts == []
+    # The earlier sync left it at 151 (not drawn yet); now the counter cannot be read.
+    restarted = _SeqConnection(identity_by_table={"orders": "id"}, max_pk=100, position=(151, False))
+    out = sync_identity_sequences(["ecommerce.orders"], connection_factory=lambda: restarted)
+    assert out == {"ecommerce.orders": None} and restarted.restarts == []
+    # Behind the loaded rows it still advances.
+    behind = _SeqConnection(identity_by_table={"orders": "id"}, max_pk=742, position=(1, False))
+    out = sync_identity_sequences(["ecommerce.orders"], connection_factory=lambda: behind)
+    assert out == {"ecommerce.orders": 743}
+
+
+def test_a_long_table_name_is_matched_as_the_catalog_stores_it() -> None:
+    """MySQL allows 64 characters, the catalog keeps 63 bytes: the identity was not found
+    and the table was reported as not an identity, with a reload that cannot help."""
+    from dsql_migrator.core.target_introspector import sync_identity_sequences
+
+    long_name = "o" * 64
+    conn = _SeqConnection(identity_by_table={"o" * 63: "id"}, max_pk=9)
+    out = sync_identity_sequences(
+        [f"ecommerce.{long_name}"], connection_factory=lambda: conn,
+        expected_identity={f"ecommerce.{long_name}"},
+    )
+    assert out == {f"ecommerce.{long_name}": 10}

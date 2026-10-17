@@ -1630,12 +1630,24 @@ class TinyIntBooleanRule(Rule):
     rule_id = "TINYINT_BOOLEAN"
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import (
+            PrimaryKeyStrategy,
+            default_primary_key_strategy,
+        )
+
         findings: list[Finding] = []
         for table in inventory.tables:
+            # A tinyint(1) AUTO_INCREMENT key the default conversion makes a bigint
+            # identity is no boolean (its own finding says what it becomes).
+            identity_key = (
+                table.auto_increment_column
+                if default_primary_key_strategy(table) is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+                else None
+            )
             columns = [
                 column.name
                 for column in table.columns
-                if _is_tinyint_one(column.mysql_type)
+                if _is_tinyint_one(column.mysql_type) and column.name != identity_key
             ]
             if columns:
                 names = ", ".join(columns)

@@ -714,30 +714,58 @@ class PgIdentityKeyRule(Rule):
     rule_id = "AUTO_INCREMENT"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
-        from dsql_migrator.core.converter import IDENTITY_FALLBACK_CAVEAT
+        from dsql_migrator.core.assessor import _MONOTONIC_KEY_NOTE
+        from dsql_migrator.core.converter import (
+            IDENTITY_FALLBACK_CAVEAT,
+            identity_strategy_applies,
+        )
 
         findings: list[Finding] = []
         for table in inventory.tables:
             column = table.auto_increment_column
             if not column:
                 continue
+            keeps = identity_strategy_applies(table)
+            declared = next((c.mysql_type for c in table.columns if c.name == column), "")
+            # The headline says what the default conversion does with THIS key: a single
+            # integer key keeps generating; a composite or non-integer one does not.
+            if keeps:
+                risk = (
+                    f"The key from serial / identity column '{column}' converts cleanly "
+                    "AND keeps generating values: the default conversion makes it a "
+                    "cached identity, so the application still does not supply the key. "
+                    "Two things change. The column is WIDENED to bigint (Aurora DSQL "
+                    "supports an identity only on bigint) — lossless for an integer key (a "
+                    "numeric one is narrowed instead: every value a sequence generated fits, "
+                    "a larger one supplied by hand would not load), but check anything that "
+                    "assumes a 4-byte id. And because each DSQL node draws its own block of values "
+                    "from the cache, the key is no longer gap-free or strictly increasing, "
+                    "which also spreads inserts instead of concentrating them on one "
+                    "partition (DSQL stores rows in primary-key order)."
+                )
+            elif table.primary_key == [column]:
+                risk = (
+                    f"The {declared} key from serial / identity column '{column}' is not "
+                    "an integer, and an Aurora DSQL identity is (bigint), so Aurora DSQL "
+                    "will NOT generate it: the APPLICATION must supply the value on every "
+                    "insert — code that relied on the database generating it fails or "
+                    "collides." + _MONOTONIC_KEY_NOTE
+                )
+            else:
+                risk = (
+                    f"The key from serial / identity column '{column}' converts cleanly, "
+                    "but Aurora DSQL will NOT generate it: the primary key is composite "
+                    f"({', '.join(table.primary_key)}) and an identity applies to a single "
+                    "column, so the column stays a plain integer and the APPLICATION must "
+                    "supply the value on every insert — code that relied on the database "
+                    "generating it fails or collides." + _MONOTONIC_KEY_NOTE
+                )
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
                     rule_id=self.rule_id,
                     classification=Classification.MANUAL,
-                    risk=(
-                        f"The key from serial / identity column '{column}' converts cleanly "
-                        "AND keeps generating values: the default conversion makes it a "
-                        "cached identity, so the application still does not supply the key. "
-                        "Two things change. The column is WIDENED to bigint (Aurora DSQL "
-                        "supports an identity only on bigint) — lossless for the values, "
-                        "but check anything that assumes a 4-byte id. And because each DSQL "
-                        "node draws its own block of values from the cache, the key is no "
-                        "longer gap-free or strictly increasing, which also spreads inserts "
-                        "instead of concentrating them on one partition (DSQL stores rows "
-                        "in primary-key order)."
-                    ),
+                    risk=risk,
                     # State the DEFAULT, then the opt-out -- see the MySQL rule.
                     recommendation=(
                         (
@@ -747,6 +775,9 @@ class PgIdentityKeyRule(Rule):
                             "sequence past them. Switch to 'Keep source PK' only if the "
                             "application supplies the key itself — that leaves the column a "
                             "plain integer with neither identity nor sequence."
+                            if keeps
+                            else "Supply the value from the application, or remodel the "
+                            "key as an integer before migrating it."
                             if table.primary_key == [column]
                             else "IDENTITY cannot be used for this table because its "
                             f"primary key is composite ({', '.join(table.primary_key)}) and "
@@ -763,9 +794,7 @@ class PgIdentityKeyRule(Rule):
                     effort=EffortLevel.MEDIUM,
                     # Advice where the key keeps generating; a gap where nothing does.
                     note_kind=(
-                        ConversionNoteKind.RECOMMENDATION
-                        if table.primary_key == [column]
-                        else ConversionNoteKind.LOSS
+                        ConversionNoteKind.RECOMMENDATION if keeps else ConversionNoteKind.LOSS
                     ),
                 )
             )

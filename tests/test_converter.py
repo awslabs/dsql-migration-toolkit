@@ -748,13 +748,14 @@ def test_pk_strategy_keep_integer_keeps_type_and_warns_hot_partition() -> None:
     result = SchemaConverter().convert_table(_auto_increment_table(), options)
     assert "UUID" not in result.target_ddl.upper()
     assert "IDENTITY" not in result.target_ddl.upper()
-    # Match on the note's KIND + column, not on wording: a kept AUTO_INCREMENT key
-    # converts cleanly, so this is a throughput RECOMMENDATION, never a loss.
+    # Match on the note's KIND + column, not on wording: a key KEPT without its
+    # generation is a gap (every INSERT that omits it fails after cut over), a LOSS as
+    # at Evaluation -- not "Recommendations -- not problems to fix" (G42-R5).
     notes = [w for w in result.warnings if w.column_name == "id"]
     assert len(notes) == 1
-    assert notes[0].kind is ConversionNoteKind.RECOMMENDATION
+    assert notes[0].kind is ConversionNoteKind.LOSS
     assert notes[0].classification is Classification.MANUAL
-    assert "consider" in notes[0].message.lower()  # it advises; it reports no defect
+    assert "will not auto-generate this key" in notes[0].message.lower()
 
 
 def test_pk_strategy_convert_to_uuid_changes_key_type() -> None:
@@ -2150,7 +2151,7 @@ def test_identity_narrowing_warning_absent_for_other_strategies() -> None:
         _identity_table("bigint unsigned"),
         SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER),
     )
-    assert [w for w in result.warnings if w.kind is ConversionNoteKind.LOSS] == []
+    assert not [w for w in result.warnings if w.target_type == "bigint" or "narrowed" in w.message]
     # The kept key retains the full unsigned range as decimal(20,0) (not narrowed).
     assert "DECIMAL(20, 0)" in result.target_ddl
     assert "IDENTITY" not in result.target_ddl

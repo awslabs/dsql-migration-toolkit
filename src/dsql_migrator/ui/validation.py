@@ -4680,6 +4680,35 @@ def _cutover_foreign_keys_stripped(
     return conv_state is not None and not conv_state.preserve_foreign_keys
 
 
+def _split_not_identity(failed: "Mapping[str, str]") -> "tuple[dict[str, str], list[str]]":
+    """``(real failures, tables whose target key is no identity)``: the second is no failed
+    RESTART -- there is no sequence to retry or advance -- and gets its own notice."""
+    from dsql_migrator.core.target_introspector import NOT_AN_IDENTITY_REASON
+
+    real = {name: reason for name, reason in failed.items() if reason != NOT_AN_IDENTITY_REASON}
+    plain = sorted(name for name, reason in failed.items() if reason == NOT_AN_IDENTITY_REASON)
+    return real, plain
+
+
+def _render_not_identity_notice(ui: object, tables: "Sequence[str]") -> None:
+    """The keys the conversion makes identities that the target holds as plain integers."""
+    if not tables:
+        return
+    render_notice(
+        ui,
+        tone="error",
+        header="No identity on the target — an INSERT that omits the key will fail",
+        body=(
+            f"{len(tables)} table(s) whose conversion makes the key an identity hold it as "
+            f"a plain integer on the target ({', '.join(tables)}), so nothing generates "
+            "it: after cut over an INSERT that leaves the key out fails. If the "
+            "application supplies the ids itself, choose 'Keep source PK' for these "
+            "tables in Schema Conversion (this clears the report); otherwise re-apply "
+            "each table with Replace and reload it, so it gets the identity."
+        ),
+    )
+
+
 def _cutover_integrity_detail(
     validation_state: "ValidationState",
     pending: int,
@@ -4737,6 +4766,14 @@ def _cutover_integrity_detail(
         if synced is None
         else "identity sequences synced (nothing to advance)"
     )
+    # A failed or impossible sync is said, never folded into "synced".
+    failed = dict(getattr(validation_state, "cutover_identity_sync_failed", None) or {})
+    if synced is not None and failed:
+        real, not_identity = _split_not_identity(failed)
+        if real:
+            identity += f", {len(real)} FAILED"
+        if not_identity:
+            identity += f", {len(not_identity)} with no identity on the target"
     return f"{fk}; {identity}"
 
 
@@ -6989,17 +7026,19 @@ def _render_result(
     # left only in the activity log: surface it on the results panel as an error so the
     # verdict is not read as "ready" while a sequence still lags the migrated rows
     # (FIX 7). The reasons are value-free (Property 7).
-    if identity_sync_failed:
+    _real_failed, _not_identity = _split_not_identity(identity_sync_failed or {})
+    _render_not_identity_notice(ui, _not_identity)
+    if _real_failed:
         _failed_detail = "; ".join(
             f"{name} ({reason})"
-            for name, reason in sorted(identity_sync_failed.items())
+            for name, reason in sorted(_real_failed.items())
         )
         render_notice(
             ui,
             tone="error",
             header="Identity sequence sync failed — do not cut over yet",
             body=(
-                f"{len(identity_sync_failed)} identity sequence(s) could NOT be "
+                f"{len(_real_failed)} identity sequence(s) could NOT be "
                 "advanced past the migrated rows, so the application's first insert "
                 "after cut-over may hit a duplicate key. Re-run validation (the sync "
                 "is idempotent), or advance the sequence(s) manually with ALTER TABLE "
@@ -8215,17 +8254,19 @@ def _render_cutover_section(
                 # so the operator does not repoint the app onto lagging sequences (the
                 # app's first insert would collide, 23505). Audit finding D2 — this used
                 # to be swallowed and painted as the success line above.
-                if identity_sync_failed:
+                real_failed, not_identity = _split_not_identity(identity_sync_failed or {})
+                _render_not_identity_notice(ui, not_identity)
+                if real_failed:
                     failed_detail = "; ".join(
                         f"{name} ({reason})"
-                        for name, reason in sorted(identity_sync_failed.items())
+                        for name, reason in sorted(real_failed.items())
                     )
                     render_notice(
                         ui,
                         tone="error",
                         header="Identity sequence sync failed — do not cut over yet",
                         body=(
-                            f"{len(identity_sync_failed)} identity sequence(s) could "
+                            f"{len(real_failed)} identity sequence(s) could "
                             "NOT be advanced past the migrated rows, so your "
                             "application's first insert after cut-over may hit a "
                             "duplicate key. Retry the sync (it is idempotent); if it "
