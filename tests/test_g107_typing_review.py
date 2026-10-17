@@ -371,12 +371,13 @@ def test_a_number_compared_with_like_is_its_text() -> None:
 def test_a_recursive_ctes_widened_anchor_column_is_text() -> None:
     """ES-18: the anchor's VARCHAR(10) beside the recursive term's text: 'recursive query "r"
     column 2 has type character varying(10) in non-recursive term but type character varying
-    overall'."""
+    overall'. G113 (T8 / S5): the recursive SELECT's value is cast to the anchor's type, as
+    MySQL types each recursive row by it (the anchor's TEXT form lost the cut to 10)."""
     sql, _ = _query(
         "WITH RECURSIVE r AS (SELECT 1 AS n, CAST('a' AS CHAR(10)) AS p UNION ALL "
         "SELECT n + 1, CONCAT(p, '/b') FROM r WHERE n < 3) SELECT n, p FROM r"
     )
-    assert "CAST(CAST('a' AS VARCHAR(10)) AS TEXT) AS p" in sql
+    assert "CAST('a' AS VARCHAR(10)) AS p UNION ALL SELECT n + 1, CAST(p || '/b' AS VARCHAR(10))" in sql
 
 
 # --- Joins and binding --------------------------------------------------------------------

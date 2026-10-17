@@ -198,8 +198,9 @@ def test_length_and_binary_of_a_json_or_computed_value_read_its_text(call: str, 
 
 def test_an_unknown_expression_is_made_text_and_a_bare_column_keeps_its_own_bytes() -> None:
     sql, _ = _query("SELECT LENGTH(i), LENGTH(i + 1), CAST(i AS BINARY), CAST(i + 1 AS BINARY) FROM x", typed=False)
-    # G107: the text of any type (noted), where OCTET_LENGTH(integer) does not exist.
-    assert "OCTET_LENGTH(i || ''), OCTET_LENGTH(CAST(i + 1 AS TEXT))" in sql
+    # G107: the text of any type (noted), where OCTET_LENGTH(integer) does not exist. G113
+    # (S13): x || '' whatever its shape -- CAST(bytes AS TEXT) counted their hex.
+    assert "OCTET_LENGTH(i || ''), OCTET_LENGTH((i + 1) || '')" in sql
     assert "CAST(i AS BYTEA), CONVERT_TO(CAST(i + 1 AS TEXT), 'UTF8')" in sql
 
 

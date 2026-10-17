@@ -360,8 +360,10 @@ MySQL→PostgreSQL トランスパイルではありません。
   `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` は UTC の壁時計に(MySQL と同じく精度に合わせて丸めずに切り捨てて)、`STDDEV`/`VARIANCE` は
   MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
   あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
-  そのバイトに(比較・`ORDER BY`・`GROUP BY` ではテキストのものは Aurora DSQL がすでにバイト単位で比較するので省略し —
-  `SELECT DISTINCT` では選択リストと同じ形に — 型がわからない値はそのテキストのバイト順に並べ)、`CAST(x AS UNSIGNED)` は
+  そのバイトに(比較では x のテキストを、Aurora DSQL がすでにするとおりバイト単位で — 数値や日付は MySQL のそのテキストで、
+  `'010'` は `10` ではない — `GROUP BY`・`PARTITION BY`・`COUNT(DISTINCT ...)` のキーは値そのものに、`ORDER BY` のキーは
+  テキスト・日付・バイトならそのまま、数値や型がわからない値はそのテキストのバイト順に — 出力名はそれが指す式で — 選ぶもの
+  でしか並べられない `UNION` と `SELECT DISTINCT` のキーは x そのままにしてフラグを付け)、`CAST(x AS UNSIGNED)` は
   MySQL と同じく先に丸めてから(文字列は先頭の整数として読んで)負の数を循環させて、整数と decimal の `/` は MySQL の正確な
   除算として(MySQL が保つ小数桁で切り捨てて計算し — 整数なら 9 桁で、`2 / 3 * 1000000` は `666666.6660` — 被除数のスケールに
   4 を足した decimal で表示し — `10 / 3` は `3.3333` — 0 で割ると `%`・`MOD`・`DIV` と同じく NULL)`AVG` はその `SUM` を
@@ -372,26 +374,34 @@ MySQL→PostgreSQL トランスパイルではありません。
   代入する数値(`SET paid = 1`)は boolean として、`GROUP_CONCAT` は text 上の集計に、
   `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はテキストのバイト数に、
   `CHAR_LENGTH` はその文字数に(`CHAR(n)` 列は埋め草の空白なしで、JSON 値はそのテキストで)、MySQL が文字列を求める
-  ところ(`CONCAT`/`CONCAT_WS`、`LPAD`/`RPAD`、`LEFT`/`RIGHT`、`SUBSTRING`、`REPLACE`、`UPPER`/`LOWER`、`LIKE`、数値と
-  テキストや日付の `COALESCE`/`CASE`/`IF`)の数値・日付・`TINYINT(1)` は MySQL のテキストに(`DATETIME(6)` は小数 6 桁すべて)、
-  日付でない文字列(`IFNULL(d, '')`、`'N/A'`)と並ぶ日付は MySQL の文字列に(日付文字列 — `'2024-06-01'`、
-  `'20240601'` — と並ぶなら日付のまま、時刻付きの文字列と並ぶ `DATE` はタイムスタンプに)、`DATE` に日・月を足しても `DATE`
+  ところ(`CONCAT`/`CONCAT_WS` — テキストと並ぶバイトはデコードしてフラグ付き — `LPAD`/`RPAD`、`LEFT`/`RIGHT`、
+  `SUBSTRING`、`REPLACE`、`UPPER`/`LOWER`、`TRIM`、`REVERSE`、`REPEAT`、`MD5`、`ASCII`、`LOCATE`/`INSTR`、`LIKE`、
+  `REGEXP`、文字列と並ぶ `GREATEST`/`LEAST`、数値や日付と文字列からなる `UNION` の列)の数値・日付・`TINYINT(1)`・比較は
+  MySQL のテキストに(`DATETIME(6)` は小数 6 桁すべて)、MySQL が文字列にする `COALESCE`/`CASE`/`IF` — 文字列やテキスト列と
+  並ぶ日付・時刻、文字列や日付と並ぶ数値、そのどちらかと並ぶ JSON 値 — はその場所で MySQL がその文字列を読むとおりに(数値
+  として読む場所 — 算術、`SUM`/`AVG`、数値関数、数値との比較 — では MySQL が読む倍精度に。`IFNULL(qty, '0') + 1` は
+  足し算になり `''` は 0。日付として読む場所 — 日付関数、日付の算術、日付との比較 — では、文字列がその種類の日付なら日付の
+  まま、時刻付きの文字列と並ぶ `DATE` はタイムスタンプに、数字のない文字列は NULL に。それ以外 — 表示、テキスト化、JSON、
+  並べ替え — では MySQL の文字列: 各値のテキストとリテラルは書かれたとおり)、日付と並ぶ `TIME` は MySQL の `DATETIME` に、
+  正確な数値の `COALESCE` は最も広いスケールに(`IFNULL(price, 0)` は `0.00`)、`DATE` に日・月を足しても `DATE`
   のままに(列や式から読む量や小数は MySQL と同じく整数単位で数え — 文字列は先頭の整数として — `'1 2' DAY_HOUR` のような
   複合単位はその各部分として、2 桁の年や `yyyymmdd` の日付文字列は MySQL と同じく解釈)、`INTERVAL x unit + d` は `d + INTERVAL x unit` として、`TIMESTAMP '...'`
   リテラルはそれが表す `DATETIME` として、`+hh:mm` オフセットの `CONVERT_TZ`
   (リテラルでも列から読む値でも)、NULL を保ち `DATETIME` と `TINYINT(1)` を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、
   メンバー名と配列の添字からなるパスの `JSON_EXTRACT`/`->` と MySQL の `->>`(MySQL はビューに
-  `json_unquote(json_extract(...))` として保存します)は MySQL と同じくパスをたどって(配列でない値の `[0]` はその値自体)
-  — `->>` の JSON null はテキスト `'null'` に、数値と比較・算術・`SUM`/`AVG`・`ROUND` で使うそのテキストは MySQL と同じく
-  倍精度に(フラグ付き: 数値でないテキストはそこで失敗します)— MySQL と
+  `json_unquote(json_extract(...))` として保存します)は MySQL と同じくパスをたどって(配列でない値の `[0]` はその値自体、`[0]` は 3 つまで。型がわからない
+  ドキュメントは `json` にキャスト)— `->>` の JSON null はテキスト `'null'` に(日付関数が読む場所では MySQL と同じく
+  NULL に。グループ化した `->>` はクエリが読むどこでもその `GROUP BY` キーの形に)、数値と比較・算術・`SUM`/`AVG`・`ROUND`・
+  数値関数で使うそのテキストや JSON 値は MySQL と同じく倍精度に(フラグ付き: 数値でないテキストはそこで失敗します)— MySQL と
   同じく書式に応じて `TIME`/`DATE`/`DATETIME` を返す `STR_TO_DATE`(空文字列は NULL、2 桁の年は MySQL と同じく解釈、書式を
   読み終えて残った入力は無視)、`ON` のない結合(`CROSS JOIN`、`LATERAL`、`INNER JOIN`、Query Converter の文の最上位の
   `JOIN` — カンマはカンマのまま)は `CROSS JOIN` に、`CROSS JOIN ... ON` と `STRAIGHT_JOIN` は `JOIN` に、再帰 CTE の
-  `CAST(x AS CHAR(n))`(列を広げる MySQL の方法)は n で切った text に、そしてすべての `DATE_FORMAT`/`STR_TO_DATE`/`FROM_UNIXTIME` の書式を `%%` や未知の指定子まで
+  再帰部分の値は最初の SELECT の型に修飾子があればその型にキャストし(列を広げる MySQL の方法 `CAST(x AS CHAR(n))`、
+  `VARCHAR(n)` や `DECIMAL(p,s)` の列。再帰部分の小数と並ぶ整数にはフラグ)、そしてすべての `DATE_FORMAT`/`STR_TO_DATE`/`FROM_UNIXTIME` の書式を `%%` や未知の指定子まで
   MySQL 自身の指定子から)。その他(ISO 以外のモードの `WEEK`、`SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じように
   フラグが付き、PostgreSQL に同じ名前の関数があってもストアド関数(`date_trunc`)、Aurora DSQL がたどれない JSON パス
-  (`'$'`、ワイルドカード、`last`、範囲、実行時に計算するパス、複数のパス)、比較される JSON 値(Aurora DSQL には json 値の
-  比較がありません)にはフラグが付き、Aurora DSQL にパターンの
+  (`'$'`、ワイルドカード、`last`、範囲、実行時に計算するパス、4 つ以上の `[0]`、複数のパス)、比較・並べ替え・グループ化・
+  重複除去される JSON 値(Aurora DSQL には json 値の比較がありません)にはフラグが付き、Aurora DSQL にパターンの
   ない書式トークン(MySQL の `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、異なるテキストを
   返します。列に対する `STR_TO_DATE`(書式で読めない値に MySQL は NULL を返しますが、Aurora DSQL はそうした値にはエラーを返し、
   区切り文字だけが違う値は日付として読みます。また夏時間のあるセッションのタイムゾーンでは、時計が飛ばす 1 時間の中の時刻が
@@ -399,12 +409,13 @@ MySQL→PostgreSQL トランスパイルではありません。
   `FLOAT`/`DOUBLE` の `MOD`(MySQL のものは C の fmod で、Aurora DSQL にはその演算子も正確な形もありません)、
   `GROUP_CONCAT(DISTINCT x ORDER BY y)` にもフラグが付きます。各値はその内容に合わせて書きます — 列はその型で(MySQL が保存した
   結合を経ても、MySQL が束縛するとおりに — `db`.`table`.`col` はそのデータベースのテーブルに、その列を持たないテーブルの
-  別名は越えて)、派生テーブルや CTE の列はその本体が選ぶもので(読むテーブルと同じ名前の CTE も)、式はその計算結果で — そして
+  別名は越えて、派生テーブルや CTE には決して束縛せず)、派生テーブルや CTE の列はその本体が選ぶもので(読むテーブルと同じ名前の CTE も)、式はその計算結果で — そして
   Query Converter も同じ MySQL の式を同じように書き(`UPDATE`、`DELETE`、`ON DUPLICATE KEY UPDATE` でも)、ステップ 1 を
-  実行していれば Evaluation のインベントリの型を使います。型がわからない列 — 別のビューの列、派生テーブルや CTE が計算する列、
-  ステップ 1 の前の Query Converter の列 — の `LENGTH` と `BINARY` にはフラグが付きます: `LENGTH` は `x || ''` のテキストを
-  数え、テキスト・バイト・数値・日付には MySQL と同じ数になります(`TINYINT(1)`、`TIMESTAMP`、小数部のある `DATETIME` は
-  別)。`BINARY` は `CAST(x AS BYTEA)` で、バイナリの列にだけ正しい形です。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
+  実行していれば Evaluation のインベントリの型を使います。型がわからない値 — 別のビューの列、派生テーブルや CTE が計算する列、
+  ステップ 1 の前の Query Converter の列 — の `LENGTH`、文字列関数、`LIKE`、テキストを含まない `CONCAT`、そして `BINARY` には
+  フラグが付きます: 前者は `x || ''` でテキストにし、テキスト・バイト・整数・decimal・日付には MySQL と同じテキストになります
+  (`TINYINT(1)`、`FLOAT`、`TIMESTAMP`、小数部のある `DATETIME` は別)。`BINARY` は `CAST(x AS BYTEA)` で、バイナリの列にだけ
+  正しい形です。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
   テキスト、そして MySQL が実体化(materialize)するビュー・派生テーブル・CTE — `ALGORITHM=TEMPTABLE` で宣言したビュー、
   または集計、ウィンドウ、`DISTINCT`、`GROUP BY`、`HAVING`、`LIMIT`、`UNION` を持つもの、テーブルのないもの、自身の行を読む
   サブクエリを含む出力を持つもの — の行で、それぞれその列のスケールで保存されます(ウィンドウの値も、クエリがそれでグループ化
@@ -425,9 +436,9 @@ MySQL→PostgreSQL トランスパイルではありません。
   してください。引数にウィンドウ関数を含む `JSON_ARRAY`/`JSON_OBJECT` はウィンドウの後で計算され、その商の引数をスケール
   どおりに読みますが(`[7.1429, 2.6667]`)、変換は保ったすべての桁を書きます(`7.142857142`)。`IFNULL`、`IF`、`CASE` などの
   関数の奥に 3 段より深く入れ子になった `GREATEST`/`LEAST`、列から読む複合単位の interval、200 段より深く入れ子になった式
-  (変換が型を読む範囲の外)には MANUAL のフラグが付きます。 まだ異なるもの: `FLOAT` のテキスト(MySQL は
-  有効数字 6 桁で `1234.57`)と JSON の中の `FLOAT`、日付だけの文字列と並ぶ `DATETIME` はその文字列の行を
-  `2024-06-01 00:00:00` と示します(MySQL は書かれたとおり)。
+  (変換が型を読む範囲の外)には MANUAL のフラグが付きます。 フラグ付きでまだ異なるもの: `FLOAT` のテキスト(MySQL は
+  有効数字 6 桁で `1234.57`)と JSON の中の `FLOAT`、もう一方の種類の日付文字列と並ぶ日付の算術
+  (`IFNULL(d, '2024-06-01 10:00:00') + INTERVAL 1 DAY`: MySQL の結果は行ごとに形が変わる文字列で、日付の行は `2024-03-06`)。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。
