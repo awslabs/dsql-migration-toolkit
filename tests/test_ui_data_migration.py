@@ -2591,6 +2591,45 @@ def test_migrator_predrops_and_recreates_dependent_views_on_replace(monkeypatch)
     assert recreated == [([], view_ddl)]
 
 
+def test_reload_drops_readers_first_and_recreates_in_dependency_order(monkeypatch) -> None:
+    """Views were dropped and re-created in NAME order: a_summary (over b_base) was created
+    before b_base existed and left missing, silently; and a view over a dropped view
+    (c_top, which names no replaced table) blocked that view's DROP."""
+    from dsql_migrator.core import activity_log
+
+    ddls = {
+        "shop.a_summary": 'CREATE VIEW "shop"."a_summary" AS SELECT b.id FROM "shop"."b_base" b '
+        'JOIN "shop"."orders" o ON o.id = b.id',
+        "shop.b_base": 'CREATE VIEW "shop"."b_base" AS SELECT o.id FROM "shop"."orders" o',
+        "shop.c_top": 'CREATE VIEW "shop"."c_top" AS SELECT a.id FROM "shop"."a_summary" a',
+        "shop.unrelated": 'CREATE VIEW "shop"."unrelated" AS SELECT 1 AS one',
+    }
+    migrator = _view_migrator(
+        replace_tables=frozenset({"shop.orders"}), dependent_view_ddls=ddls
+    )
+    dropped, recreated = _patch_view_ddl_calls(monkeypatch, migrator)
+    migrator.predrop_dependent_views()
+    migrator.recreate_dependent_views()
+    order = [ddls["shop.b_base"], ddls["shop.a_summary"], ddls["shop.c_top"]]
+    assert dropped == list(reversed(order))
+    assert [ddl for _schema, ddl in recreated] == order
+
+    # A CREATE that fails is said in the activity log, not only the server log.
+    def _fail(schema_ddls, target_ddl, *, connection_factory):
+        raise RuntimeError("relation does not exist")
+
+    monkeypatch.setattr("dsql_migrator.core.schema_applier.recreate_table", _fail)
+    logged: list = []
+    monkeypatch.setattr(
+        "dsql_migrator.ui.data_migration._full_load_engine.log_activity",
+        lambda *a, **k: logged.append((a, k)),
+    )
+    migrator.recreate_dependent_views()
+    targets = [k.get("target") for _a, k in logged]
+    assert targets == ["shop.b_base", "shop.a_summary", "shop.c_top"]
+    assert all(k["status"] is activity_log.ActivityStatus.FAILURE for _a, k in logged)
+
+
 def test_migrator_skips_view_pass_on_append_or_cdc(monkeypatch) -> None:
     view_ddl = "CREATE VIEW v AS SELECT * FROM orders"
 

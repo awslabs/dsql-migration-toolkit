@@ -65,6 +65,7 @@ data migrator, keeping the DDL/DML separation rule intact (Property 2).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
@@ -334,71 +335,387 @@ class ViewConversion(BaseModel):
     warnings: list[ConversionWarning] = Field(default_factory=list)
 
 
-# An identifier in a view's DDL: quoted (as written) or bare (folded).
-_VIEW_IDENTIFIER_RE = re.compile(r'"((?:[^"]|"")+)"|([A-Za-z_][\w$]*)')
+# ---------------------------------------------------------------------------------------
+# Reading SQL text for names: what a view reads, what it outputs, what an index predicate
+# compares. Not a parser -- a scan that never reads into a string literal, a dollar-quoted
+# body or a comment, so a '"' or a name inside one is no identifier.
+# ---------------------------------------------------------------------------------------
+
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_]\w*)?\$")
+# Where something a name scan must step over may start.
+_SQL_SPECIAL_RE = re.compile(r"""['"$]|--|/\*|[eE](?=')""")
+
+
+def _sql_skip(text: str, i: int) -> "Optional[tuple[str, int]]":
+    """The literal, quoted identifier or comment starting at ``text[i]``, and its end.
+
+    ``("string", end)`` for ``'...'`` and ``E'...'`` (doubled quotes; backslash escapes in
+    an E-string), ``("dollar", end)`` for ``$tag$...$tag$``, ``("comment", end)`` for ``--``
+    and (nested) ``/* */``, ``("quoted", end)`` for ``"..."``; ``None`` for anything else.
+    An unterminated one runs to the end of the text."""
+    n = len(text)
+    ch = text[i]
+    word_before = i > 0 and (text[i - 1].isalnum() or text[i - 1] in "_$")
+    if ch == "'" or (ch in "eE" and text[i + 1 : i + 2] == "'" and not word_before):
+        escape = ch in "eE"
+        j = i + (2 if escape else 1)
+        while j < n:
+            if escape and text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == "'":
+                if text[j + 1 : j + 2] == "'":
+                    j += 2
+                    continue
+                return "string", j + 1
+            j += 1
+        return "string", n
+    if ch == '"':
+        j = i + 1
+        while j < n:
+            if text[j] == '"':
+                if text[j + 1 : j + 2] == '"':
+                    j += 2
+                    continue
+                return "quoted", j + 1
+            j += 1
+        return "quoted", n
+    if ch == "$":
+        if word_before:
+            return None
+        tag = _DOLLAR_TAG_RE.match(text, i)
+        if tag is None:
+            return None
+        close = text.find(tag.group(0), tag.end())
+        return "dollar", (n if close < 0 else close + len(tag.group(0)))
+    if text.startswith("--", i):
+        line_end = text.find("\n", i)
+        return "comment", (n if line_end < 0 else line_end)
+    if text.startswith("/*", i):
+        depth, j = 1, i + 2
+        while j < n and depth:
+            if text.startswith("/*", j):
+                depth, j = depth + 1, j + 2
+            elif text.startswith("*/", j):
+                depth, j = depth - 1, j + 2
+            else:
+                j += 1
+        return "comment", j
+    return None
+
+
+def _mask_sql_literals(text: str) -> str:
+    """``text`` with every string literal, dollar-quoted body and comment blanked to spaces
+    (the same length, so offsets hold); quoted identifiers are kept."""
+    if not _SQL_SPECIAL_RE.search(text):
+        return text
+    out: list[str] = []
+    pos = 0
+    while True:
+        match = _SQL_SPECIAL_RE.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            return "".join(out)
+        start = match.start()
+        skipped = _sql_skip(text, start)
+        if skipped is None:
+            out.append(text[pos : start + 1])
+            pos = start + 1
+            continue
+        kind, end = skipped
+        out.append(text[pos:start])
+        out.append(text[start:end] if kind == "quoted" else " " * (end - start))
+        pos = end
+
+
+_SQL_NAME_PART = r'"(?:[^"]|"")+"|[^\W\d][\w$]*'
+# One token of masked SQL: a dotted name (``app."Orders".id``, ``t.*``), a cast, a bracket,
+# a comma, a number or an operator. Anything else (whitespace, ';', ':') is stepped over.
+_SQL_TOKEN_RE = re.compile(
+    rf"(?P<chain>(?<![\w$])(?:{_SQL_NAME_PART})(?:\s*\.\s*(?:{_SQL_NAME_PART}|\*))*)"
+    r"|(?P<cast>::)|(?P<open>\()|(?P<close>\))|(?P<comma>,)|(?P<number>\d[\w.]*)"
+    r"|(?P<op>[<>=!~+\-*/%^&|#@?\[\]]+)"
+)
+_SQL_PART_RE = re.compile(r'"((?:[^"]|"")+)"|([^\W\d][\w$]*)')
+
+# The words that open a FROM item, may precede its relation, or end the FROM list.
+_FROM_OPEN_WORDS = frozenset({"from", "join"})
+_FROM_PREFIX_WORDS = frozenset({"only", "lateral"})
+_CLAUSE_WORDS = frozenset(
+    {
+        "where", "group", "having", "order", "limit", "offset", "fetch", "window",
+        "union", "intersect", "except", "on", "using", "select", "values", "returning",
+        "for", "into", "with",
+    }
+)
+# The words that end a select list.
+_SELECT_LIST_END_WORDS = _CLAUSE_WORDS | _FROM_OPEN_WORDS
+
+
+@functools.lru_cache(maxsize=65536)
+def _chain_parts(raw: str) -> "tuple[tuple[str, ...], Optional[str]]":
+    """A dotted name's parts as PostgreSQL compares them (quoted as written, unquoted
+    folded), and the lower-cased word when it is one unquoted part (a keyword candidate)."""
+    parts = tuple(
+        quoted.replace('""', '"') if quoted else fold_identifier(bare)
+        for quoted, bare in _SQL_PART_RE.findall(raw)
+        if quoted or bare
+    )
+    word = parts[0].lower() if len(parts) == 1 and not raw.startswith('"') else None
+    return parts, word
+
+
+@dataclass
+class _SelectItem:
+    start: int
+    output: Optional[str] = None  # its alias (``AS x``), or the column of a lone ``t.x``
+    chains: int = 0  # dotted names at its own level (one, and no alias: a plain column)
+    last: Optional[str] = None
+    end: int = 0
+
+
+@dataclass
+class _SqlNames:
+    """What :func:`_scan_sql_names` read from one SQL text."""
+
+    names: "set[str]"  # every name part outside literals and comments
+    relations: "list[tuple[Optional[str], str]]"  # (schema or None, name) after FROM/JOIN
+    items: "list[tuple[Optional[str], int, int]]"  # select items: (output name, start, end)
+    masked: str
+
+
+def _scan_sql_names(text: str) -> _SqlNames:
+    """The names in a view body or a CREATE VIEW: every identifier outside literals, the
+    relations it reads (the name right after ``FROM``/``JOIN``/a FROM-list comma, through
+    parenthesised joins and subqueries) and its select items with their output names --
+    a column alias or a lone column. ``CREATE VIEW x AS`` names no relation, so the
+    header never reads as a read of the view itself."""
+    masked = _mask_sql_literals(text)
+    names: set[str] = set()
+    relations: list[tuple[Optional[str], str]] = []
+    items: list[tuple[Optional[str], int, int]] = []
+    # Per bracket depth: the FROM state (None / "expect" / "after"), whether the bracket
+    # opened in a FROM item (a parenthesised join or a subquery), the open select item.
+    frames: list[dict] = [{"from": None, "in_from": False, "item": None, "as": False}]
+
+    def close_item(frame: dict, end: int) -> None:
+        item = frame["item"]
+        if item is None:
+            return
+        output = item.output
+        if output is None and item.chains == 1:
+            output = item.last
+        items.append((output, item.start, end))
+        frame["item"] = None
+
+    pending_cast = False
+    for match in _SQL_TOKEN_RE.finditer(masked):
+        kind = match.lastgroup
+        frame = frames[-1]
+        if kind == "chain":
+            parts, word = _chain_parts(match.group("chain"))
+            if not parts:
+                continue
+            if pending_cast:  # a type name, not a reference
+                pending_cast = False
+                continue
+            names.update(parts)
+            if word is not None and (
+                word in _SELECT_LIST_END_WORDS or word in _FROM_PREFIX_WORDS or word == "as"
+                or word == "distinct" or word == "all"
+            ):
+                if word in _SELECT_LIST_END_WORDS:
+                    close_item(frame, match.start())
+                if word in _FROM_OPEN_WORDS:
+                    frame["from"] = "expect"
+                elif word in _CLAUSE_WORDS:
+                    frame["from"] = None
+                if word == "select":
+                    frame["item"] = _SelectItem(start=match.end())
+                frame["as"] = word == "as"
+                continue
+            item = frame["item"]
+            if frame["from"] == "expect":
+                relations.append((parts[-2] if len(parts) >= 2 else None, parts[-1]))
+                frame["from"] = "after"
+            elif item is not None:
+                if frame["as"]:
+                    item.output = parts[-1]
+                elif match.group("chain").endswith("*"):
+                    item.chains += 2  # t.*: many outputs, none of them named t
+                else:
+                    item.chains += 1
+                    item.last = parts[-1]
+            frame["as"] = False
+            continue
+        pending_cast = kind == "cast"
+        frame["as"] = False
+        if kind == "open":
+            in_from = frame["from"] == "expect"
+            frames.append(
+                {"from": "expect" if in_from else None, "in_from": in_from, "item": None,
+                 "as": False}
+            )
+            if frame["item"] is not None:
+                frame["item"].chains += 2  # an expression: no longer a lone column
+        elif kind == "close":
+            if len(frames) > 1:
+                close_item(frames[-1], match.start())
+                closed = frames.pop()
+                if closed["in_from"]:
+                    frames[-1]["from"] = "after"
+        elif kind == "comma":
+            if frame["from"] == "after":
+                frame["from"] = "expect"
+            elif frame["item"] is not None:
+                close_item(frame, match.start())
+                frame["item"] = _SelectItem(start=match.end())
+        elif frame["item"] is not None and kind in ("op", "number"):
+            frame["item"].chains += 2  # an expression: no longer a lone column
+    for frame in frames:
+        close_item(frame, len(masked))
+    return _SqlNames(names=names, relations=relations, items=items, masked=masked)
 
 
 def views_in_dependency_order(views: "Sequence[ViewConversion]") -> "list[ViewConversion]":
-    """``views`` with each one after the other views its DDL names, so a ``CREATE VIEW``
-    over another view never runs first and fails (the view it reads does not exist yet).
+    """``views`` with each one after the other views it reads, so a ``CREATE VIEW`` over
+    another view never runs first and fails (the view it reads does not exist yet).
 
-    A name match, so it errs toward a dependency (a column or literal spelled like another
-    view only moves that view later). The given order is kept wherever nothing forces a
-    change, and a cycle (a false match can make one) places its first view first. Linear
-    in the DDL text, then a heap: thousands of views stay cheap. Pure."""
-    return _dependency_order(
-        list(views),
-        name_of=lambda view: view.view,
-        text_of=lambda view: view.target_ddl or "",
-        has_header=True,
-    )
+    Only a relation the DDL reads counts -- the name after ``FROM`` / ``JOIN`` -- matched by
+    its schema when qualified, so a column, an alias or another schema's table spelled like
+    a view is no dependency. The given order is kept wherever nothing forces a change; a
+    cycle (only a false match can make one: PostgreSQL refuses a real one) is broken
+    inside it, never by placing a view that waits on it. Memoized by the DDL texts: the
+    Schema Conversion screen asks on every render. Pure."""
+    key = tuple((view.view, view.target_ddl or "") for view in views)
+    return [views[index] for index in _view_order_indices(key)]
 
 
-def _dependency_order(items: list, *, name_of, text_of, has_header: bool) -> list:
-    """:func:`views_in_dependency_order` over any named texts. ``has_header``: the text
-    opens with the item's own name (a CREATE VIEW), which is not a read."""
+@functools.lru_cache(maxsize=8)
+def _view_order_indices(key: "tuple[tuple[str, str], ...]") -> "tuple[int, ...]":
+    return tuple(_dependency_order_indices([(name, text) for name, text in key]))
+
+
+def _dependency_order(items: list, *, name_of, text_of) -> list:
+    """:func:`views_in_dependency_order` over any named view texts."""
+    order = _dependency_order_indices([(name_of(item), text_of(item)) for item in items])
+    return [items[index] for index in order]
+
+
+def _dependency_order_indices(
+    named_texts: "list[tuple[str, str]]", scans: "Optional[list[_SqlNames]]" = None
+) -> "list[int]":
+    """The order (indices) of :func:`views_in_dependency_order`; ``scans`` are the texts'
+    :func:`_scan_sql_names`, when the caller has them already."""
     import heapq
 
-    if len(items) < 2:
-        return items
-    by_name: dict[str, list[int]] = {}
-    for index, item in enumerate(items):
-        by_name.setdefault(_split_qualified(name_of(item))[1], []).append(index)
-    dependents: list[set[int]] = [set() for _ in items]
-    waiting = [0] * len(items)
-    for index, item in enumerate(items):
-        own = _split_qualified(name_of(item))[1]
-        named: set[str] = set()
-        past_header = not has_header  # the CREATE VIEW's own name is not a read
-        for match in _VIEW_IDENTIFIER_RE.finditer(text_of(item)):
-            quoted, bare = match.groups()
-            name = quoted.replace('""', '"') if quoted is not None else fold_identifier(bare)
-            if not past_header:
-                past_header = name == own
-                continue
-            named.add(name)
-        reads = {other for name in named for other in by_name.get(name, ()) if other != index}
-        for other in reads:
-            dependents[other].add(index)
-        waiting[index] = len(reads)
-    ready = [index for index, count in enumerate(waiting) if count == 0]
+    count = len(named_texts)
+    if count < 2:
+        return list(range(count))
+    by_bare: dict[str, list[int]] = {}
+    by_qualified: dict[tuple[str, str], list[int]] = {}
+    for index, (name, _text) in enumerate(named_texts):
+        schema, bare = _split_qualified(name)
+        by_bare.setdefault(bare, []).append(index)
+        if schema is not None:
+            by_qualified.setdefault((schema, bare), []).append(index)
+    reads: list[set[int]] = []
+    for index, (_name, text) in enumerate(named_texts):
+        found: set[int] = set()
+        scan = scans[index] if scans is not None else _scan_sql_names(text)
+        for schema, bare in scan.relations:
+            found.update(by_bare.get(bare, ()) if schema is None else by_qualified.get((schema, bare), ()))
+        found.discard(index)
+        reads.append(found)
+    dependents: list[list[int]] = [[] for _ in range(count)]
+    waiting = [len(found) for found in reads]
+    for index, found in enumerate(reads):
+        for other in found:
+            dependents[other].append(index)
+    ready = [index for index, left in enumerate(waiting) if left == 0]
     heapq.heapify(ready)
-    placed = [False] * len(items)
-    ordered: list = []
-    while len(ordered) < len(items):
+    placed = [False] * count
+    ordered: list[int] = []
+    while len(ordered) < count:
         if ready:
             index = heapq.heappop(ready)
             if placed[index]:
                 continue
-        else:  # a cycle: its first item goes first
-            index = next(i for i, done in enumerate(placed) if not done)
+        else:
+            index = _cycle_breaker(reads, placed)
         placed[index] = True
-        ordered.append(items[index])
+        ordered.append(index)
         for dependent in dependents[index]:
             waiting[dependent] -= 1
             if waiting[dependent] == 0 and not placed[dependent]:
                 heapq.heappush(ready, dependent)
     return ordered
+
+
+def _cycle_breaker(reads: "list[set[int]]", placed: "list[bool]") -> int:
+    """Which unplaced item to place when every one still waits: the first item of the first
+    cycle (strongly connected component) that waits on nothing outside itself -- never an
+    item that only waits on a cycle. Tarjan's algorithm, iterative."""
+    left = [index for index, done in enumerate(placed) if not done]
+    position: dict[int, int] = {}
+    low: dict[int, int] = {}
+    on_stack: set[int] = set()
+    stack: list[int] = []
+    component_of: dict[int, int] = {}
+    components: list[list[int]] = []
+    counter = 0
+    for root in left:
+        if root in position:
+            continue
+        work = [(root, iter(sorted(r for r in reads[root] if not placed[r])))]
+        position[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, edges = work[-1]
+            advanced = False
+            for nxt in edges:
+                if nxt not in position:
+                    position[nxt] = low[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(sorted(r for r in reads[nxt] if not placed[r]))))
+                    advanced = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], position[nxt])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == position[node]:
+                component: list[int] = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    component_of[member] = len(components)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(component)
+    best: Optional[int] = None
+    for number, component in enumerate(components):
+        members = set(component)
+        if any(
+            component_of[r] != number
+            for member in component
+            for r in reads[member]
+            if not placed[r]
+        ):
+            continue  # it waits on another component: that one goes first
+        first = min(members)
+        if best is None or first < best:
+            best = first
+    return best if best is not None else left[0]
 
 
 class PrimaryKeyStrategy(str, Enum):
@@ -1408,13 +1725,16 @@ def _folded_name(node) -> str:
     return name if quoted else fold_identifier(name)
 
 
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
 def fold_identifier(name: str) -> str:
     """Fold an UNQUOTED identifier the way PostgreSQL does: ASCII A-Z only.
 
     ``str.lower()`` also lowercases non-ASCII letters (``É`` -> ``é``), which PostgreSQL
     leaves as written, so it would name a column the target does not have.
     """
-    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in name)
+    return name.translate(_ASCII_FOLD)
 
 
 def parse_target_generated_columns(create_ddl: str, *, folded: bool = False) -> set[str]:
@@ -2817,20 +3137,71 @@ def _pg_unindexable_native_columns(table: TableDef) -> "dict[str, str]":
 def _carried_index_predicate(table: TableDef, index: IndexDef) -> Optional[str]:
     """A PostgreSQL partial index's ``WHERE`` predicate as Aurora DSQL is given it (it
     accepts partial indexes: ``CREATE INDEX ASYNC ... WHERE``), with each cast to a
-    converted enum made a cast to text. ``None`` for a full index, or for a predicate that
-    reads a column the conversion re-types otherwise (an array now jsonb, a range now
-    text), whose meaning the new type changes."""
+    converted enum (or an array of one) made a cast to text. ``None`` for a full index, or
+    for a predicate whose meaning the conversion changes (:func:`_index_predicate_carry`)."""
+    return _index_predicate_carry(table, index)[0]
+
+
+_ORDERING_OPERATORS = frozenset({"<", ">", "<=", ">="})
+_ORDERING_WORDS = frozenset({"between", "greatest", "least"})
+
+
+def _orders_values(masked: str) -> bool:
+    """Whether masked SQL compares by order: ``<``, ``<=``, ``>``, ``>=``, BETWEEN,
+    GREATEST/LEAST (a trailing sign is the operand's: ``x >-1``)."""
+    for match in _SQL_TOKEN_RE.finditer(masked):
+        if match.lastgroup == "op" and match.group(0).rstrip("+-") in _ORDERING_OPERATORS:
+            return True
+        if match.lastgroup == "chain" and _chain_parts(match.group(0))[1] in _ORDERING_WORDS:
+            return True
+    return False
+
+
+def _without_null_tests(masked: str, name: str) -> str:
+    """``masked`` with every ``<name> IS [NOT] NULL`` (or ``IS [NOT] DISTINCT FROM NULL``)
+    removed: a test whose answer no change of the column's type can alter."""
+    return re.sub(
+        rf'(?:"{re.escape(name)}"|(?<![\w$"]){re.escape(name)}(?![\w$"]))\s*\)?\s+IS\s+'
+        r"(?:NOT\s+)?(?:DISTINCT\s+FROM\s+)?NULL\b",
+        " ",
+        masked,
+        flags=re.IGNORECASE,
+    )
+
+
+def _index_predicate_carry(
+    table: TableDef, index: IndexDef
+) -> "tuple[Optional[str], list[str], list[str]]":
+    """``(carried predicate, re-typed columns that stop it, enums whose order it compares)``.
+
+    A predicate is not carried when it reads a column the conversion re-types otherwise
+    (an array now jsonb, a range now text) beyond an ``IS [NOT] NULL`` test, or when it
+    compares a converted enum by ORDER (``status > 'shipped'::order_status``): as text no
+    label may sort after 'shipped', so the index would cover other rows -- a UNIQUE one
+    enforcing a different row set, silently. An equality or ``= ANY (...)`` over an enum
+    holds as text and is carried with its casts rewritten."""
     predicate = (index.where or "").strip()
     if not predicate:
-        return None
+        return None, [], []
     by_name = {column.name: column for column in table.columns}
-    if any(
-        by_name[name].type_kind != "enum" and _mentions_identifier(predicate, name)
+    masked = _mask_sql_literals(predicate)
+    retyped = sorted(
+        name
         for name in pg_remodelled_columns(table)
         if name in by_name
-    ):
-        return None
-    return _rewrite_enum_casts(predicate, _enum_cast_types([table]))[0]
+        and by_name[name].type_kind != "enum"
+        and _mentions_identifier(_without_null_tests(masked, name), name)
+    )
+    carried, rewritten = _rewrite_enum_casts(predicate, _enum_cast_types([table]), arrays=True)
+    enums_read = [
+        column.mysql_type
+        for column in table.columns
+        if column.type_kind == "enum" and _mentions_identifier(masked, column.name)
+    ]
+    ordered = sorted(set(rewritten) | set(enums_read)) if (rewritten or enums_read) and _orders_values(masked) else []
+    if retyped or ordered:
+        return None, retyped, ordered
+    return carried, [], []
 
 
 def _emittable_secondary_indexes(
@@ -4542,19 +4913,19 @@ def _pg_partial_or_nonbtree_index_warning(
     is_loss = bool(left_out or lost_methods)
     parts: list[str] = []
     if full or left_out:
-        kinds = {column.name: column.type_kind for column in table.columns}
-        reread = sorted(
-            {
-                name
-                for index in uncarried
-                for name in pg_remodelled_columns(table)
-                if kinds.get(name) != "enum" and _mentions_identifier(index.where or "", name)
-            }
-        )
+        reread = sorted({name for index in uncarried for name in _index_predicate_carry(table, index)[1]})
+        ordered = sorted({name for index in uncarried for name in _index_predicate_carry(table, index)[2]})
+        reasons = []
+        if reread:
+            reasons.append(f"reads column(s) the conversion re-types ({', '.join(reread)})")
+        if ordered:
+            reasons.append(
+                f"compares {', '.join(ordered)} by order, and as text its labels sort "
+                "alphabetically, not in the enum's declared order"
+            )
         partial = (
-            f"the predicate of partial index(es) {', '.join(full + left_out)} reads "
-            f"column(s) the conversion re-types ({', '.join(reread)}), so it cannot be "
-            "carried"
+            f"the predicate of partial index(es) {', '.join(full + left_out)} "
+            f"{' and '.join(reasons)}, so it cannot be carried"
         )
         if full:
             partial += f": {', '.join(full)} {'is' if len(full) == 1 else 'are'} created as a FULL index"
@@ -6392,53 +6763,133 @@ def pg_views_remodelling(
     """:class:`PgViewRemodelling` for each view, computed ONCE per inventory -- per view it
     rebuilt every table's re-typed columns, which grew with views x tables x columns.
 
-    Views are read in dependency order, so a view over a flagged view inherits the re-typed
-    columns it names (``SELECT ... FROM v_orders WHERE status >= 'shipped'``, where
-    v_orders reads an enum turned text, now compares text). A text match, so it errs toward
-    naming a column. Pure."""
-    # relation bare name -> [(relation, {column: (old, new)})]: the tables with re-typed
-    # columns, then each flagged view (what it hands on), so a lookup per NAME the view
-    # mentions replaces a scan of every table per view.
-    sources: dict[str, list[tuple[str, dict[str, tuple[str, str]]]]] = {}
+    A view over a flagged view inherits what it names of it: a re-typed column, or an
+    OUTPUT that carries one -- ``o.status AS order_state``, a rewritten enum cast's ``AS
+    level`` -- since ``max(v_orders.order_state)`` compares text just the same. Views are
+    read in dependency order, and a view whose hand-on grows sends its readers round
+    again, so the result does not depend on the order. A name match inside each relation
+    the view reads, so it errs toward naming a column. Pure."""
+    from collections import deque
+
+    # relation bare name -> {relation: {column or output: (source type, target type)}}:
+    # the tables with re-typed columns, then each flagged view (what it hands on).
+    sources: dict[str, dict[str, dict[str, tuple[str, str]]]] = {}
     for table in tables:
         remodelled = pg_remodelled_columns(table)
         if remodelled:
-            sources.setdefault(_split_qualified(table.name)[1], []).append((table.name, remodelled))
+            sources.setdefault(_split_qualified(table.name)[1], {})[table.name] = remodelled
     enum_types = _enum_cast_types(tables)
-    ordered = _dependency_order(
-        list(views),
-        name_of=lambda view: view.name,
-        text_of=lambda view: view.definition or "",
-        has_header=False,
+    every = [_scan_sql_names(view.definition or "") for view in views]
+    order = _dependency_order_indices(
+        [(view.name, view.definition or "") for view in views], every
     )
+    ordered = [views[index] for index in order]
+    scans = [every[index] for index in order]
+    readers: dict[str, list[int]] = {}
+    for position, scan in enumerate(scans):
+        for _schema, bare in scan.relations:
+            readers.setdefault(bare, []).append(position)
     out: dict[str, PgViewRemodelling] = {}
-    for view in ordered:
-        definition = view.definition or ""
-        if not definition:
-            out[view.name] = PgViewRemodelling(definition)
-            continue
-        emitted, rewritten = _rewrite_enum_casts(definition, enum_types)
-        named = {
-            quoted.replace('""', '"') if quoted is not None else fold_identifier(bare)
-            for quoted, bare in (m.groups() for m in _VIEW_IDENTIFIER_RE.finditer(definition))
-        }
-        references: list[tuple[str, str, str, str]] = []
-        for name in sorted(named & sources.keys()):
-            for relation, columns in sources[name]:
-                if relation == view.name:
-                    continue
-                references.extend(
-                    (relation, column, old, new)
-                    for column, (old, new) in columns.items()
-                    if column in named
-                )
-        result = PgViewRemodelling(emitted, tuple(references), tuple(rewritten))
-        if result.flagged:
-            sources.setdefault(_split_qualified(view.name)[1], []).append(
-                (view.name, {column: (old, new) for _r, column, old, new in references})
-            )
+    handed: dict[str, dict[str, tuple[str, str]]] = {}
+    queue = deque(range(len(ordered)))
+    queued = set(queue)
+    while queue:
+        position = queue.popleft()
+        queued.discard(position)
+        view = ordered[position]
+        result, hand_on = _remodel_view(view, scans[position], sources, enum_types)
         out[view.name] = result
+        if hand_on and hand_on != handed.get(view.name):
+            handed[view.name] = hand_on
+            bare = _split_qualified(view.name)[1]
+            sources.setdefault(bare, {})[view.name] = hand_on
+            for reader in readers.get(bare, ()):
+                if reader != position and reader not in queued:
+                    queue.append(reader)
+                    queued.add(reader)
     return out
+
+
+def _remodel_view(
+    view: ViewDef,
+    scan: "_SqlNames",
+    sources: "Mapping[str, Mapping[str, Mapping[str, tuple[str, str]]]]",
+    enum_types: "Mapping[tuple[str, ...], str]",
+) -> "tuple[PgViewRemodelling, dict[str, tuple[str, str]]]":
+    """One view's :class:`PgViewRemodelling` given what the relations it reads hand on, and
+    what it hands on in turn (empty unless flagged)."""
+    definition = view.definition or ""
+    if not definition:
+        return PgViewRemodelling(definition), {}
+    emitted, rewritten = _rewrite_enum_casts(definition, enum_types)
+    references: list[tuple[str, str, str, str]] = []
+    read: set[str] = set()
+    for schema, bare in scan.relations:
+        for relation, columns in sorted(sources.get(bare, {}).items()):
+            if relation == view.name or relation in read:
+                continue
+            if schema is not None and _split_qualified(relation)[0] != schema:
+                continue
+            read.add(relation)
+            references.extend(
+                (relation, column, old, new)
+                for column, (old, new) in columns.items()
+                if column in scan.names
+            )
+    result = PgViewRemodelling(emitted, tuple(references), tuple(rewritten))
+    if not result.flagged:
+        return result, {}
+    carrying = {column: (old, new) for _relation, column, old, new in references}
+    outputs: list[tuple[str, list[str], Optional[str]]] = []
+    for output, item_start, item_end in scan.items:
+        if output is not None:
+            names, cast = _item_names_and_enum_cast(scan.masked[item_start:item_end], enum_types)
+            outputs.append((output, names, cast))
+    grew = True
+    while grew:
+        grew = False
+        for output, names, cast in outputs:
+            if output in carrying:
+                continue
+            hit = next((name for name in names if name in carrying), None)
+            if cast is not None:
+                carrying[output] = (cast, "text")
+            elif hit is not None:
+                carrying[output] = carrying[hit]
+            else:
+                continue
+            grew = True
+    return result, carrying
+
+
+_ARRAY_SUFFIX_RE = re.compile(r"\s*\[")
+
+
+def _item_names_and_enum_cast(
+    masked_item: str, enum_types: "Mapping[tuple[str, ...], str]"
+) -> "tuple[list[str], Optional[str]]":
+    """A select item's name parts (sorted) and the converted enum it casts to, if any."""
+    names: set[str] = set()
+    cast: Optional[str] = None
+    after_cast = False
+    for match in _SQL_TOKEN_RE.finditer(masked_item):
+        if match.lastgroup == "cast":
+            after_cast = True
+            continue
+        if match.lastgroup == "chain":
+            parts, _word = _chain_parts(match.group("chain"))
+            if after_cast:
+                spelling = enum_types.get(parts)
+                if (
+                    spelling is not None
+                    and cast is None
+                    and _ARRAY_SUFFIX_RE.match(masked_item, match.end()) is None
+                ):
+                    cast = spelling
+            else:
+                names.update(parts)
+        after_cast = False
+    return sorted(names), cast
 
 
 def pg_view_remodelled_references(
@@ -6471,78 +6922,55 @@ def _enum_cast_types(tables: "Sequence[TableDef]") -> "dict[tuple[str, ...], str
     }
 
 
+_CAST_SCAN_RE = re.compile(r"""['"$]|--|/\*|[eE](?=')|::""")
+
+
 def _rewrite_enum_casts(
-    definition: str, enum_types: "Mapping[tuple[str, ...], str]"
+    definition: str,
+    enum_types: "Mapping[tuple[str, ...], str]",
+    *,
+    arrays: bool = False,
 ) -> "tuple[str, list[str]]":
     """``(definition, rewritten types)``: each ``::`` cast to a converted enum type
     (``'x'::mood``, ``(c)::app.mood``) made a cast to text -- the type does not exist on
     Aurora DSQL (no CREATE TYPE) and its columns become text. Token-aware: a string
-    literal, a quoted identifier or a dollar-quoted body is never touched, an alias
-    (``AS status``) is not a cast (pg_get_viewdef and pg_get_expr always write ``::``),
-    a type is matched by its exact parts (``b.status`` is not ``status``), and an array
-    of the enum (``::mood[]``) is left as it is. The rest stays byte-for-byte."""
+    literal, a quoted identifier, a dollar-quoted body or a comment is never touched, an
+    alias (``AS status``) is not a cast (pg_get_viewdef and pg_get_expr always write
+    ``::``), and a type is matched by its exact parts (``b.status`` is not ``status``). An
+    array of the enum (``::mood[]``) is left as it is unless ``arrays`` (an index predicate
+    comparing the column, now text, with ``= ANY (...)``): there it becomes ``text[]``. The
+    rest stays byte-for-byte."""
     if not enum_types or "::" not in definition:
         return definition, []
     out: list[str] = []
     rewritten: set[str] = set()
-    i, n = 0, len(definition)
-    while i < n:
-        ch = definition[i]
-        word_before = i > 0 and (definition[i - 1].isalnum() or definition[i - 1] in "_$")
-        if ch == "'" or (ch in "eE" and definition[i + 1 : i + 2] == "'" and not word_before):
-            escape = ch in "eE"
-            j = i + (2 if escape else 1)
-            while j < n:
-                if escape and definition[j] == "\\":
-                    j += 2
-                    continue
-                if definition[j] == "'":
-                    if definition[j + 1 : j + 2] == "'":
-                        j += 2
-                        continue
-                    j += 1
-                    break
-                j += 1
-            out.append(definition[i:j])
-            i = j
-            continue
-        if ch == '"':
-            j = i + 1
-            while j < n:
-                if definition[j] == '"':
-                    if definition[j + 1 : j + 2] == '"':
-                        j += 2
-                        continue
-                    j += 1
-                    break
-                j += 1
-            out.append(definition[i:j])
-            i = j
-            continue
-        if ch == "$" and not word_before:
-            tag = re.match(r"\$(?:[A-Za-z_]\w*)?\$", definition[i:])
-            if tag is not None:
-                close = definition.find(tag.group(0), i + len(tag.group(0)))
-                j = n if close < 0 else close + len(tag.group(0))
-                out.append(definition[i:j])
-                i = j
-                continue
-        if definition.startswith("::", i):
-            target = _CAST_TARGET_RE.match(definition, i + 2)
+    pos = 0
+    while True:
+        match = _CAST_SCAN_RE.search(definition, pos)
+        if match is None:
+            out.append(definition[pos:])
+            break
+        start = match.start()
+        if match.group(0) == "::":
+            target = _CAST_TARGET_RE.match(definition, start + 2)
             if target is not None:
-                after = target.end()
-                rest = definition[after:].lstrip()
                 spelling = enum_types.get(_type_parts(target.group(1)))
-                if spelling is not None and not rest.startswith("["):
-                    out.append(definition[i : target.start(1)] + "text")
+                is_array = _ARRAY_SUFFIX_RE.match(definition, target.end()) is not None
+                if spelling is not None and (arrays or not is_array):
+                    out.append(definition[pos : target.start(1)] + "text")
                     rewritten.add(spelling)
-                    i = after
+                    pos = target.end()
                     continue
-            out.append("::")
-            i += 2
+            out.append(definition[pos : start + 2])
+            pos = start + 2
             continue
-        out.append(ch)
-        i += 1
+        skipped = _sql_skip(definition, start)
+        if skipped is None:
+            out.append(definition[pos : start + 1])
+            pos = start + 1
+            continue
+        out.append(definition[pos : skipped[1]])
+        pos = skipped[1]
     return "".join(out), sorted(rewritten)
 
 

@@ -508,31 +508,47 @@ T4 = "T4"  # column rules on it are inert
 def views_referencing(
     view_ddls: Mapping[str, str], tables: "frozenset[str]"
 ) -> list[str]:
-    """Return the CREATE-VIEW DDLs whose SQL references any of ``tables``.
+    """Return the CREATE-VIEW DDLs to drop before ``tables`` are DROP+recreated, in
+    CREATE order -- each after the views it reads; drop them in reverse.
 
-    A view that SELECTs from a table being DROP+recreated blocks that table's
-    DROP. We select exactly the views that name one of the replace ``tables`` --
-    matching either the qualified ``schema.table`` or the bare table name as a
-    word in the view's DDL -- so an unrelated view is never needlessly dropped.
-    Case-insensitive, word-boundary match to avoid matching a substring of a
-    longer identifier. Only the view's body is searched, never its own name: a quoted
-    ``CREATE VIEW "archive"."orders"`` would otherwise "reference" the table
-    ``shop.orders``. Deterministic order (by view name) for stable behavior.
+    A view that SELECTs from a table being DROP+recreated blocks that table's DROP, and a
+    view over such a view blocks ITS drop (there is no CASCADE), so the selection takes
+    every view that names one of ``tables`` -- the qualified ``schema.table`` or the bare
+    name as a word of the view's DDL -- and then every view that names a selected view.
+    An unrelated view is never needlessly dropped. Case-insensitive, word-boundary match
+    to avoid matching a substring of a longer identifier. Only the view's body is
+    searched, never its own name: a quoted ``CREATE VIEW "archive"."orders"`` would
+    otherwise "reference" the table ``shop.orders``. In name order they were dropped and
+    re-created regardless of which reads which: a view over a later-named view failed
+    its CREATE (and was left missing), or an earlier-named view still read blocked the
+    DROP and with it the reload.
     """
     if not view_ddls or not tables:
         return []
-    wanted: list[str] = []
+    from dsql_migrator.core.converter import _dependency_order
+
+    bodies = {}
     for view_name in sorted(view_ddls):
         ddl = view_ddls[view_name]
         head = _VIEW_HEAD_RE.match(ddl)
-        low = (ddl[head.end():] if head is not None else ddl).lower()
-        for table in tables:
-            bare = table.split(".")[-1].lower()
-            qualified = table.lower()
-            if names_in(low, (qualified, bare)):
-                wanted.append(ddl)
-                break
-    return wanted
+        bodies[view_name] = (ddl[head.end():] if head is not None else ddl).lower()
+
+    def names_one(body: str, names: "Iterable[str]") -> bool:
+        return any(names_in(body, (name.lower(), name.split(".")[-1].lower())) for name in names)
+
+    selected = [name for name, body in bodies.items() if names_one(body, tables)]
+    frontier = list(selected)
+    while frontier:
+        readers = [
+            name for name, body in bodies.items()
+            if name not in selected and names_one(body, frontier)
+        ]
+        selected.extend(readers)
+        frontier = readers
+    ordered = _dependency_order(
+        sorted(selected), name_of=lambda name: name, text_of=lambda name: view_ddls[name]
+    )
+    return [view_ddls[name] for name in ordered]
 
 
 # ``CREATE [OR REPLACE] [MATERIALIZED] VIEW <name>``: the part of a view DDL that names the

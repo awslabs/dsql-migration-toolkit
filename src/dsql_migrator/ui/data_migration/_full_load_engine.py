@@ -7067,7 +7067,8 @@ class BatchedTableMigrator:
             {},
         ).views
         connect = self._view_connection_factory()
-        for view_ddl in ddls:
+        # Readers first: a view still read by another refuses its DROP (no CASCADE).
+        for view_ddl in reversed(ddls):
             try:
                 drop_object(view_ddl, connection_factory=connect, own_views=own_views)
             except Exception:  # noqa: BLE001 - best-effort; a real block surfaces on the table DROP
@@ -7085,16 +7086,33 @@ class BatchedTableMigrator:
         ddls = self._dependent_view_ddls_for_replace()
         if not ddls:
             return
-        from dsql_migrator.core.schema_applier import recreate_table
+        from dsql_migrator.core.schema_applier import parse_create_object, recreate_table
 
         connect = self._view_connection_factory()
-        for view_ddl in ddls:
+        for view_ddl in ddls:  # each after the views it reads
             try:
                 # DROP VIEW IF EXISTS + CREATE VIEW (no schema DDLs -- the view's
                 # schema was already ensured when its tables were recreated).
                 recreate_table([], view_ddl, connection_factory=connect)
-            except Exception:  # noqa: BLE001 - best-effort; the tables/data are already loaded
+            except Exception as exc:  # noqa: BLE001 - the tables/data are already loaded
                 _LOGGER.warning("Could not recreate dependent view", exc_info=True)
+                try:
+                    name = parse_create_object(view_ddl)[0]
+                except Exception:  # noqa: BLE001 - name it generically
+                    name = "a dependent view"
+                # Said only in the server log before: the run reported success with the
+                # view missing from the target.
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "view not re-created after reload",
+                    status=ActivityStatus.FAILURE,
+                    target=name,
+                    detail=(
+                        f"dropped so its tables could be reloaded, but its CREATE failed "
+                        f"({type(exc).__name__}): it is missing on the target. Apply it "
+                        "again from Schema Conversion."
+                    ),
+                )
 
     def apply_foreign_keys(
         self,
