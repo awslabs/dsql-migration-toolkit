@@ -193,6 +193,12 @@ CODE_JSON_UNQUOTE_UNSUPPORTED = "JSON_UNQUOTE_UNSUPPORTED"
 CODE_MIXED_CASE_NAME = "MIXED_CASE_NAME"
 # An unquoted mixed-case select-list alias: the result column's label is folded.
 CODE_MIXED_CASE_LABEL = "MIXED_CASE_LABEL"
+# A name quoted in one place and not in another (`O`.id over orders O).
+CODE_QUOTE_MISMATCH = "QUOTE_MISMATCH"
+# Two unquoted table aliases that differ only by case, in one scope or nested ones.
+CODE_CASE_ONLY_ALIASES = "CASE_ONLY_ALIASES"
+# MySQL's multi-table UPDATE / DELETE (UPDATE ... JOIN, DELETE t FROM ... JOIN).
+CODE_MULTI_TABLE_DML = "MULTI_TABLE_DML"
 # A MySQL call the conversion leaves as written (a MySQL-only or user function): it fails
 # on Aurora DSQL unless the function exists there.
 CODE_UNTRANSLATED_CALL = "UNTRANSLATED_CALL"
@@ -396,14 +402,25 @@ def _inline_having_aliases(tree: exp.Expression, *, case_insensitive: bool = Tru
         }
         if not aliases:
             continue
-        # A HAVING name that is also a bare GROUP BY column means that column (MySQL's
-        # documented preference), never the alias.
+        # A HAVING name that is also a GROUP BY column means that column (MySQL's documented
+        # preference), never the alias -- when the GROUP BY name IS a FROM column: a
+        # qualified one always is; a bare one is, unless it is the alias itself (GROUP BY
+        # day over DATE(created_at) AS day groups by the alias, and HAVING day means it
+        # too) -- an alias whose own expression reads a column of that name tells us the
+        # FROM clause has one (COALESCE(region, 'n/a') AS region ... GROUP BY region).
         group = select.args.get("group")
-        grouped = {
-            key(c.args.get("this"))
-            for c in (group.expressions if group is not None else [])
-            if isinstance(c, exp.Column) and not c.table
-        }
+        grouped: set = set()
+        for c in group.expressions if group is not None else []:
+            if not isinstance(c, exp.Column):
+                continue
+            name = key(c.args.get("this"))
+            expression = aliases.get(name)
+            if (
+                c.table
+                or expression is None
+                or any(key(read.args.get("this")) == name for read in expression.find_all(exp.Column))
+            ):
+                grouped.add(name)
         for column in list(having.find_all(exp.Column)):
             # A qualified column (table.col) is a real column reference, never an
             # output alias; only bare names can shadow a SELECT-list alias -- and not
@@ -657,16 +674,32 @@ def _from_items(select: exp.Expression) -> "list[exp.Expression]":
         items.append(getattr(source, "this", None))
         items.extend(j.this for j in (select.args.get("joins") or []))
     out: list = []
-    pending = [item for item in items if item is not None]
+    for item in items:
+        out.extend(_source_items(item))
+    return out
+
+
+def _is_join_container(item: Optional[exp.Expression]) -> bool:
+    """A parenthesised join -- (b JOIN c) reads as Subquery(Table(b, joins=[...])), and
+    ((b JOIN c) JOIN d) as Subquery(Subquery(...), joins=[...]) -- not a derived table."""
+    return isinstance(item, exp.Subquery) and isinstance(item.this, (exp.Table, exp.Subquery))
+
+
+def _source_items(item: Optional[exp.Expression]) -> "list[exp.Expression]":
+    """The sources one FROM entry brings into scope, in order: a table (and the tables it
+    joins), a derived table, a LATERAL, and a parenthesised join's own entries."""
+    out: list = []
+    pending = [item] if item is not None else []
     while pending:
-        item = pending.pop(0)
-        out.append(item)
-        # A parenthesised join (b JOIN c AS C2) reads as Subquery(Table(b, joins=[...])).
-        inner = item.this if isinstance(item, exp.Subquery) and isinstance(item.this, exp.Table) else item
-        if isinstance(inner, exp.Table):
-            pending.extend(j.this for j in (inner.args.get("joins") or []) if j.this is not None)
-            if inner is not item:
-                pending.append(inner)
+        current = pending.pop(0)
+        if _is_join_container(current):
+            pending[:0] = [current.this] + [
+                j.this for j in (current.args.get("joins") or []) if j.this is not None
+            ]
+            continue
+        out.append(current)
+        if isinstance(current, exp.Table):
+            pending.extend(j.this for j in (current.args.get("joins") or []) if j.this is not None)
     return out
 
 
@@ -677,16 +710,54 @@ class _Scopes:
     def __init__(self, tree: exp.Expression) -> None:
         self.aliases = {_key(n) for n in tree.find_all(exp.TableAlias) if n.name}
         self._ctes: dict = {}
-        self._outputs: dict[int, set] = {}
+        self._outputs: dict[int, Optional[set]] = {}
         self._labels: dict[int, set] = {}
         self._items: dict[int, list] = {}
+        # Each node's enclosing scope, query level, and whether it sits in its query's
+        # ORDER BY / GROUP BY / HAVING (None inside a window, which cannot name an alias)
+        # -- in ONE top-down pass: walked up per column, a long AND/OR chain made the scan
+        # quadratic in its depth.
+        self._enclosing: dict[int, Optional[exp.Expression]] = {}
+        self._query: dict[int, Optional[exp.Expression]] = {}
+        self._clause: dict[int, Optional[bool]] = {}
+        stack: list = [(tree, None, None, False)]
+        while stack:
+            node, scope, query, clause = stack.pop()
+            self._enclosing[id(node)] = scope
+            self._query[id(node)] = query
+            self._clause[id(node)] = clause
+            child_scope = node if isinstance(node, _SCOPE_NODES) else scope
+            child_query = node if isinstance(node, (exp.Select, exp.SetOperation)) else query
+            if isinstance(node, exp.Select):
+                child_clause: Optional[bool] = False
+            elif isinstance(node, exp.Window) or clause is None:
+                child_clause = None
+            elif isinstance(node, (exp.Order, exp.Group, exp.Having)):
+                child_clause = True
+            else:
+                child_clause = clause
+            for child in node.iter_expressions():
+                stack.append((child, child_scope, child_query, child_clause))
+
+    def scope_of(self, node: exp.Expression) -> Optional[exp.Expression]:
+        """The scope enclosing ``node`` (its query level or DML statement)."""
+        if id(node) in self._enclosing:
+            return self._enclosing[id(node)]
+        return _scope_of(node)
+
+    def in_alias_clause(self, column: exp.Column) -> bool:
+        """In ORDER BY / GROUP BY / HAVING -- where a bare name may be a select-list alias
+        -- and not in a window's ORDER BY, which cannot name one."""
+        if id(column) in self._clause:
+            return self._clause[id(column)] is True
+        return _in_alias_clause(column)
 
     def visible_ctes(self, node: exp.Expression) -> "dict[str, exp.CTE]":
         """The CTEs a name at ``node`` can refer to, by key, innermost first: every CTE of
         an enclosing WITH whose query ``node`` is in, and inside a CTE's own body only the
         CTEs before it (all of them in a WITH RECURSIVE). Memoized per scope, each scope's
         from its enclosing one's, so a deep UNION chain costs one walk."""
-        anchor = node if isinstance(node, _SCOPE_NODES) else _scope_of(node)
+        anchor = node if isinstance(node, _SCOPE_NODES) else self.scope_of(node)
         if anchor is None:
             return {}
         if id(anchor) in self._ctes:
@@ -709,7 +780,7 @@ class _Scopes:
         node = scope
         while node is not None and ("above", id(node)) not in self._ctes:
             chain.append(node)
-            node = _scope_of(node)
+            node = self.scope_of(node)
         inherited = self._ctes[("above", id(node))] if node is not None else {}
         for current in reversed(chain):
             visible: dict[str, exp.CTE] = {}
@@ -738,16 +809,25 @@ class _Scopes:
             inherited = visible
         return self._ctes[("above", id(scope))]
 
-    def outputs(self, query, alias) -> set:
+    def outputs(self, query, alias) -> "Optional[set]":
+        """The output keys of a derived table or CTE -- ``None`` when it puts out a ``*``
+        (what it returns is a real table's columns, unknown here)."""
         memo = id(alias) if alias is not None else id(query)
         if memo not in self._outputs:
-            self._outputs[memo] = {_key(i) for i in _output_identifiers(query, alias) if i.name}
+            self._outputs[memo] = (
+                None
+                if _projects_star(query, alias)
+                else {_key(i) for i in _output_identifiers(query, alias) if i.name}
+            )
         return self._outputs[memo]
 
     def source_outputs(self, item: Optional[exp.Expression]) -> "Optional[set]":
-        """The output keys of a FROM item the statement defines itself (a derived table,
-        or a table naming a visible CTE), or ``None`` for a real table."""
-        if isinstance(item, exp.Subquery) and not isinstance(item.this, exp.Table):
+        """The output keys of a FROM item the statement defines itself (a derived table, a
+        LATERAL, or a table naming a visible CTE), or ``None`` for a real table (or one
+        whose outputs are a real table's: a ``SELECT *``)."""
+        if isinstance(item, exp.Lateral) and isinstance(item.this, exp.Subquery):
+            return self.outputs(item.this.this, item.args.get("alias"))
+        if isinstance(item, exp.Subquery) and not _is_join_container(item):
             return self.outputs(item.this, item.args.get("alias"))
         if isinstance(item, exp.Table) and not item.args.get("db") and item.name:
             cte = self.visible_ctes(item).get(_key(item.args.get("this")))
@@ -763,9 +843,12 @@ class _Scopes:
     def labels(self, column: exp.Column) -> set:
         """The keys a bare ORDER BY / GROUP BY / HAVING name of ``column``'s query can mean:
         its select-list aliases, and for a set operation its first branch's labels."""
-        node = column.parent
-        while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
-            node = node.parent
+        if id(column) in self._query:
+            node = self._query[id(column)]
+        else:
+            node = column.parent
+            while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
+                node = node.parent
         if node is None:
             return set()
         if id(node) in self._labels:
@@ -786,13 +869,26 @@ class _Scopes:
         (its own query level or statement, then the enclosing ones a correlated reference
         reaches): ``outputs`` is the item's output keys when the statement defines it,
         ``None`` for a real table."""
-        scope = _scope_of(column)
+        scope = self.scope_of(column)
         while scope is not None:
             for item in self.items(scope):
                 if _item_key(item) == qualifier:
                     return True, self.source_outputs(item)
-            scope = _scope_of(scope)
+            scope = self.scope_of(scope)
         return False, None
+
+
+def _projects_star(query: Optional[exp.Expression], alias: Optional[exp.Expression]) -> bool:
+    """A derived table or CTE whose first branch puts out ``*`` / ``t.*`` and that names no
+    columns of its own."""
+    if [c for c in (getattr(alias, "columns", None) or []) if isinstance(c, exp.Identifier)]:
+        return False
+    while isinstance(query, (exp.SetOperation, exp.Subquery)):
+        query = query.this
+    return isinstance(query, exp.Select) and any(
+        isinstance(p, exp.Star) or isinstance(p, exp.Column) and isinstance(p.this, exp.Star)
+        for p in query.expressions
+    )
 
 
 def _item_key(item: Optional[exp.Expression]) -> str:
@@ -820,9 +916,15 @@ def _in_alias_clause(column: exp.Column) -> bool:
     return False
 
 
-def _mixed_case_names(tree: exp.Expression) -> "list[str]":
+def _mixed_case_names(
+    tree: exp.Expression,
+    scopes: "Optional[_Scopes]" = None,
+    mismatched: "Optional[list[str]]" = None,
+) -> "list[str]":
     """The table and column names the statement writes unquoted with upper-case ASCII
-    letters, in order: see :func:`_mixed_case_name_warning`."""
+    letters, in order: see :func:`_mixed_case_name_warning`. ``mismatched`` collects the
+    names quoted in one place and not in another (`O`.id over orders O), which Aurora DSQL
+    no longer matches: see :func:`_quote_mismatch_warning`."""
     # Only REFERENCES to a name the statement defines are skipped -- resolved in their own
     # scope, and matched as PostgreSQL names them (a backquoted `O` is not an unquoted O)
     # -- because they name the same thing where defined and where used: a qualifier naming
@@ -831,8 +933,12 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
     # own output column, a USING name only the statement's own sources hold, and DUAL. The
     # table that carries an alias, the column inside an aliased expression and an INSERT's
     # column list are real names.
-    scopes = _Scopes(tree)
+    scopes = scopes or _Scopes(tree)
     names: list[str] = []
+
+    def _mismatch(part) -> None:
+        if mismatched is not None and isinstance(part, exp.Identifier) and part.name not in mismatched:
+            mismatched.append(part.name)
 
     def _flag(part) -> None:
         if (
@@ -843,9 +949,19 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
         ):
             names.append(part.name)
 
+    # MySQL's DELETE t FROM ... lists the aliases it deletes from: names of the statement's
+    # own (the statement is flagged as MySQL-only DML anyway).
+    delete_targets = {
+        id(t) for d in tree.find_all(exp.Delete) for t in (d.args.get("tables") or [])
+    } | {
+        id(d.this) for d in tree.find_all(exp.Delete)
+        if isinstance(d.args.get("using"), list) and isinstance(d.this, exp.Table)
+    }
     for table in tree.find_all(exp.Table):
         this = table.args.get("this")
         if _is_dual_keyword(table):
+            continue
+        if id(table) in delete_targets and _key(this) in scopes.aliases:
             continue
         if (
             not table.args.get("db")
@@ -861,12 +977,28 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
             for part in schema.expressions:
                 _flag(part)
     for join in tree.find_all(exp.Join):
-        scope = _scope_of(join)
-        sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
-        own = bool(sources) and all(o is not None for o in sources)
-        for part in join.args.get("using") or []:
-            if own and any(_key(part) in o for o in sources):
-                continue  # only the statement's own outputs on both sides
+        using = join.args.get("using") or []
+        if not using:
+            continue
+        # The join's right side, and what it joins to (every source listed before it).
+        right = [scopes.source_outputs(i) for i in _source_items(join.this)]
+        scope = scopes.scope_of(join)
+        listed = scopes.items(scope) if scope is not None else []
+        right_ids = {id(i) for i in _source_items(join.this)}
+        left: list = []
+        for item in listed:
+            if id(item) in right_ids:
+                break
+            left.append(scopes.source_outputs(item))
+        for part in using:
+            key = _key(part)
+            if (
+                right and left
+                and all(o is not None for o in right + left)
+                and any(key in o for o in right)
+                and any(key in o for o in left)
+            ):
+                continue  # only the statement's own outputs, on both sides
             _flag(part)
     for column in tree.find_all(exp.Column):
         qualifier = column.args.get("table")
@@ -881,6 +1013,17 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
             if qualifier_key is not None
             else (False, None)
         )
+        if (
+            qualifier_key is not None
+            and not found
+            and isinstance(qualifier, exp.Identifier)
+            and qualifier.quoted
+        ):
+            # `O`.id over orders O: the alias folds to o, the quoted reference stays O.
+            folded = qualifier.name.translate(_ASCII_FOLD)
+            if folded != qualifier.name and scopes.qualified_source(column, folded)[0]:
+                _mismatch(qualifier)
+                found, outputs = scopes.qualified_source(column, folded)
         # A qualifier naming a FROM item's alias, or a CTE, is the statement's own name --
         # and so is one naming an alias defined anywhere else in it (an INSERT row alias).
         if not (
@@ -898,10 +1041,18 @@ def _mixed_case_names(tree: exp.Expression) -> "list[str]":
             key = _key(this)
             if outputs is not None and key in outputs:
                 continue  # a derived table's / CTE's own output column
+            if (
+                outputs is not None
+                and this.quoted
+                and key.translate(_ASCII_FOLD) != key
+                and key.translate(_ASCII_FOLD) in outputs
+            ):
+                _mismatch(this)  # d.`UserId` over an unquoted output UserId (userid)
+                continue
             if qualifier is None:
-                if key in scopes.labels(column) and _in_alias_clause(column):
+                if key in scopes.labels(column) and scopes.in_alias_clause(column):
                     continue
-                scope = _scope_of(column)
+                scope = scopes.scope_of(column)
                 sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
                 if sources and all(o is not None for o in sources) and any(
                     key in o for o in sources
@@ -937,7 +1088,9 @@ def _mixed_case_name_warning(names: "Sequence[str]") -> "Optional[QueryWarning]"
 def _star_labels(item: Optional[exp.Expression], scopes: "_Scopes") -> "list[exp.Identifier]":
     """The labels a ``*`` over FROM item ``item`` returns, when the statement defines it (a
     derived table or a CTE); a real table's columns are its schema's, already quoted."""
-    if isinstance(item, exp.Subquery) and not isinstance(item.this, exp.Table):
+    if isinstance(item, exp.Lateral) and isinstance(item.this, exp.Subquery):
+        return _output_identifiers(item.this.this, item.args.get("alias"))
+    if isinstance(item, exp.Subquery) and not _is_join_container(item):
         return _output_identifiers(item.this, item.args.get("alias"))
     if isinstance(item, exp.Table) and not item.args.get("db") and item.name:
         cte = scopes.visible_ctes(item).get(_key(item.args.get("this")))
@@ -947,7 +1100,7 @@ def _star_labels(item: Optional[exp.Expression], scopes: "_Scopes") -> "list[exp
 
 
 def _mixed_case_label_warning(
-    tree: exp.Expression, flagged: "Sequence[str]" = ()
+    tree: exp.Expression, flagged: "Sequence[str]" = (), scopes: "Optional[_Scopes]" = None
 ) -> "Optional[QueryWarning]":
     """MANUAL when a result column's label is written unquoted with upper-case ASCII
     letters: the query runs, but Aurora DSQL folds the label (id AS UserId comes back as
@@ -959,7 +1112,7 @@ def _mixed_case_label_warning(
         query = query.this  # a UNION's labels are its first branch's
     if not isinstance(query, exp.Select):
         return None
-    scopes = _Scopes(tree)
+    scopes = scopes or _Scopes(tree)
     labels = []
     candidates: list = []
     for projection in query.expressions:
@@ -998,6 +1151,122 @@ def _mixed_case_label_warning(
             "client that reads result columns by name (an ORM, dictionary rows) no longer "
             f"finds {labels[0]}. If yours does, label it quoted (AS \"{labels[0]}\") and "
             f"write every reference to that alias the same way (ORDER BY \"{labels[0]}\")."
+        ),
+    )
+
+
+def _quote_mismatch_warning(names: "Sequence[str]") -> "Optional[QueryWarning]":
+    """MANUAL when a name is quoted in one place and not in another (``names``, from
+    :func:`_mixed_case_names`): MySQL matched them whatever the case, Aurora DSQL folds the
+    unquoted spelling to lower case, so the two no longer name the same alias or column."""
+    if not names:
+        return None
+    first = names[0]
+    return QueryWarning(
+        code=CODE_QUOTE_MISMATCH,
+        classification=Classification.MANUAL,
+        message=(
+            f"{', '.join(names[:5])}{' ...' if len(names) > 5 else ''} "
+            f"{'is' if len(names) == 1 else 'are'} quoted in one place and not in another: "
+            "Aurora DSQL folds the unquoted spelling to lower case, so the two no longer name "
+            f'the same alias or column ("{first}" is not {first.translate(_ASCII_FOLD)}) and '
+            "the statement fails. Write each the same way everywhere."
+        ),
+    )
+
+
+def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Optional[QueryWarning]":
+    """MANUAL when two FROM items in one scope, or in a scope and one enclosing it, carry
+    unquoted aliases that differ only by case (orders o ... (SELECT ... FROM orders O WHERE
+    O.cid = o.cid)): MySQL keeps table aliases apart by case, Aurora DSQL folds both to
+    one -- the inner one captures the outer reference, so a correlated subquery compares a
+    row with itself and returns other rows, with no error."""
+    visible: dict[int, dict[str, str]] = {}
+    clashes: list[tuple[str, str]] = []
+
+    def spelling(item: exp.Expression) -> "Optional[tuple[str, str]]":
+        alias = item.args.get("alias")
+        identifier = alias.this if isinstance(alias, exp.TableAlias) else (
+            item.args.get("this") if isinstance(item, exp.Table) and alias is None else None
+        )
+        if not isinstance(identifier, exp.Identifier) or identifier.quoted or not identifier.name:
+            return None
+        return _key(identifier), identifier.name
+
+    # Scopes top-down (an enclosing one before those inside it): each sees its own items
+    # and what the scopes around it see.
+    for node in tree.walk(bfs=True):
+        if not isinstance(node, _SCOPE_NODES):
+            continue
+        outer = scopes.scope_of(node)
+        seen = dict(visible.get(id(outer), {})) if outer is not None else {}
+        own: dict[str, str] = {}
+        for item in scopes.items(node):
+            found = spelling(item)
+            if found is None:
+                continue
+            key, name = found
+            other = own.get(key) or seen.get(key)
+            if other is not None and other != name and (other, name) not in clashes and (name, other) not in clashes:
+                clashes.append((other, name))
+            own.setdefault(key, name)
+        seen.update(own)
+        visible[id(node)] = seen
+    if not clashes:
+        return None
+    first, second = clashes[0]
+    return QueryWarning(
+        code=CODE_CASE_ONLY_ALIASES,
+        classification=Classification.MANUAL,
+        message=(
+            f"Aliases {first} and {second} differ only by case. MySQL keeps table aliases "
+            "apart by case, but Aurora DSQL folds an unquoted alias to lower case, so one "
+            "captures the other's references: a correlated subquery then compares a row with "
+            "itself (other rows come back, with no error), and a self-join fails ('table name "
+            "specified more than once'). Rename one of them."
+        ),
+    )
+
+
+def _mysql_only_dml_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
+    """MANUAL for MySQL's multi-table UPDATE / DELETE (``UPDATE a JOIN b ... SET a.x = ...``,
+    ``UPDATE a, b ...``, ``DELETE a FROM a JOIN b ...``, ``DELETE FROM a USING a JOIN b``):
+    PostgreSQL has none of these shapes, and a qualified SET target is refused. A
+    single-table UPDATE's ``SET t.col`` naming its own target is written unqualified
+    instead (rewritten in place)."""
+    shapes: list[str] = []
+    for update in tree.find_all(exp.Update):
+        target = update.this
+        if isinstance(target, exp.Table) and target.args.get("joins"):
+            if "UPDATE ... JOIN" not in shapes:
+                shapes.append("UPDATE ... JOIN")
+            continue
+        own = {_item_key(target)} if isinstance(target, exp.Table) else set()
+        for assignment in update.expressions:
+            column = assignment.this if isinstance(assignment, exp.EQ) else None
+            if isinstance(column, exp.Column) and column.table and _key(column.args.get("table")) in own:
+                column.set("table", None)  # SET o.status = ...: the target's own column
+    for delete in tree.find_all(exp.Delete):
+        using = delete.args.get("using")
+        target = delete.this
+        if delete.args.get("tables") or (
+            isinstance(using, list)
+            and isinstance(target, exp.Table)
+            and any(_item_key(i) == _item_key(target) for u in using for i in _source_items(u))
+        ):
+            if "DELETE t FROM ... JOIN" not in shapes:
+                shapes.append("DELETE t FROM ... JOIN")
+    if not shapes:
+        return None
+    return QueryWarning(
+        code=CODE_MULTI_TABLE_DML,
+        classification=Classification.MANUAL,
+        message=(
+            f"MySQL's multi-table {' / '.join(shapes)} has no PostgreSQL form as written: "
+            "Aurora DSQL needs UPDATE t SET col = ... FROM other WHERE <join condition> "
+            "(DELETE FROM t USING other WHERE <join condition>), with each SET target "
+            "unqualified. Rewrite it before running it -- a DML statement is not test-run "
+            "on the target."
         ),
     )
 
@@ -1069,9 +1338,18 @@ class QueryConverter:
 
         if not self._is_postgres:
             # On the SOURCE's names, before a rewrite adds its own (EXCLUDED.col).
-            mixed_names = _mixed_case_names(tree)
+            scopes = _Scopes(tree)
+            mismatched: list[str] = []
+            mixed_names = _mixed_case_names(tree, scopes, mismatched)
             mixed_case = _mixed_case_name_warning(mixed_names)
-            mixed_label = _mixed_case_label_warning(tree, mixed_names)
+            mixed_label = _mixed_case_label_warning(tree, mixed_names, scopes)
+            for found in (
+                _quote_mismatch_warning(mismatched),
+                _case_only_alias_warning(tree, scopes),
+                _mysql_only_dml_warning(tree),
+            ):
+                if found is not None:
+                    warnings.append(found)
             on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
             if on_duplicate_warning is not None:
                 warnings.append(on_duplicate_warning)
@@ -1149,6 +1427,9 @@ __all__ = [
     "CODE_JSON_UNQUOTE_UNSUPPORTED",
     "CODE_MIXED_CASE_NAME",
     "CODE_MIXED_CASE_LABEL",
+    "CODE_QUOTE_MISMATCH",
+    "CODE_CASE_ONLY_ALIASES",
+    "CODE_MULTI_TABLE_DML",
     "CODE_UNTRANSLATED_CALL",
     "CODE_UNMAPPED_DATE_FORMAT",
     "CODE_MYSQL_SEMANTICS",
