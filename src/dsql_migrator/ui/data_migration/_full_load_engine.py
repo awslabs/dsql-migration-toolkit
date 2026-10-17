@@ -346,6 +346,62 @@ class DataMigrator(Protocol):
 MigratorFactory = Callable[[DataMigrationInputs], DataMigrator]
 
 
+def source_next_key_values(
+    source_config: object, source_password: object, tables: "Sequence[TableDef]"
+) -> "dict[str, int]":
+    """``{table: the next value the SOURCE would generate}`` for ``tables`` with a
+    generated key -- the floor :func:`sync_identity_sequences` restarts an identity at.
+    Read only (an autocommit catalog read); ``{}`` when the source cannot be read."""
+    wanted = [t for t in tables if getattr(t, "auto_increment_column", None)]
+    if not wanted or source_config is None:
+        return {}
+    try:
+        engine = make_source_engine_factory(source_password)(source_config)
+        try:
+            with engine.connect() as connection:
+                connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+                return dict(
+                    dialect_for(source_config.source_type).read_next_key_values(
+                        connection, wanted
+                    )
+                )
+        finally:
+            engine.dispose()
+    except Exception:  # noqa: BLE001 - best effort: the sync then uses the target's MAX
+        return {}
+
+
+def identity_sync_extras(
+    *,
+    source_config: object,
+    source_password: object,
+    tables: "Sequence[TableDef]",
+    table_conversions: "Mapping[str, object]",
+    table_names: "Sequence[str]",
+) -> "dict[str, object]":
+    """The keyword arguments every identity sync passes beyond the tables: the source's
+    own counters (a floor, so ids it issued and deleted are not issued again) and the
+    tables whose applied conversion makes the key an identity (one that is not an identity
+    on the target is then reported, never a quiet no-op). Empty entries are left out."""
+    from dsql_migrator.ui.schema_conversion_apply import identity_from_ddl
+
+    names = set(table_names)
+    in_scope = [t for t in tables if t.name in names]
+    extras: dict[str, object] = {}
+    floors = source_next_key_values(source_config, source_password, in_scope)
+    if floors:
+        extras["source_next_values"] = floors
+    expected = {
+        t.name
+        for t in in_scope
+        if t.name in table_conversions
+        and identity_from_ddl(t, getattr(table_conversions[t.name], "target_ddl", "") or "")
+    }
+    if expected:
+        extras["expected_identity"] = expected
+    return extras
+
+
 def _sync_identity_sequences_after_load(
     inputs: "DataMigrationInputs",
     table_names: "Sequence[str]",
@@ -388,7 +444,17 @@ def _sync_identity_sequences_after_load(
                 inputs.target_config, aws_profile=inputs.aws_profile
             ).connect()
 
-        return sync(list(table_names), connection_factory=_factory) or {}
+        try:
+            extras = identity_sync_extras(
+                source_config=getattr(inputs, "source_config", None),
+                source_password=getattr(inputs, "source_password", None),
+                tables=getattr(getattr(inputs, "inventory", None), "tables", None) or (),
+                table_conversions=getattr(inputs, "table_conversions", None) or {},
+                table_names=table_names,
+            )
+        except Exception:  # noqa: BLE001 - the extras refine the sync; never block it
+            extras = {}
+        return sync(list(table_names), connection_factory=_factory, **extras) or {}
     except Exception as exc:  # noqa: BLE001 - never fail a completed load on this
         log_activity(
             ActivityCategory.FULL_LOAD,

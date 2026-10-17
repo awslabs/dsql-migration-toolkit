@@ -762,7 +762,12 @@ class PgIdentityKeyRule(Rule):
                         "writes further."
                     ),
                     effort=EffortLevel.MEDIUM,
-                    note_kind=ConversionNoteKind.RECOMMENDATION,
+                    # Advice where the key keeps generating; a gap where nothing does.
+                    note_kind=(
+                        ConversionNoteKind.RECOMMENDATION
+                        if table.primary_key == [column]
+                        else ConversionNoteKind.LOSS
+                    ),
                 )
             )
         return findings

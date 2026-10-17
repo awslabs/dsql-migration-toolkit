@@ -831,6 +831,86 @@ def test_sync_identity_sequences_skips_tables_without_an_identity_column() -> No
     assert not any("MAX(" in stmt for stmt in conn.executed)
 
 
+def test_sync_identity_sequences_never_reissues_ids_the_source_already_issued() -> None:
+    """The restart used the target's MAX alone: ids the source issued and deleted (an
+    emptied job table, deleted top rows) were handed out again after cut over."""
+    from dsql_migrator.core.target_introspector import sync_identity_sequences
+
+    behind = _SeqConnection(identity_by_table={"orders": "id"}, max_pk=100)
+    out = sync_identity_sequences(
+        ["ecommerce.orders"],
+        connection_factory=lambda: behind,
+        source_next_values={"ecommerce.orders": 151},
+    )
+    assert out == {"ecommerce.orders": 151} and "RESTART WITH 151" in behind.restarts[0]
+    # An empty table restarts at the source's counter instead of staying at 1.
+    empty = _SeqConnection(identity_by_table={"jobs": "id"}, max_pk=None)
+    out = sync_identity_sequences(
+        ["ecommerce.jobs"],
+        connection_factory=lambda: empty,
+        source_next_values={"ecommerce.jobs": 1234568},
+    )
+    assert out == {"ecommerce.jobs": 1234568}
+    # The target ahead of the counter (rows CDC wrote last): MAX + 1 still wins.
+    ahead = _SeqConnection(identity_by_table={"orders": "id"}, max_pk=900)
+    out = sync_identity_sequences(
+        ["ecommerce.orders"],
+        connection_factory=lambda: ahead,
+        source_next_values={"ecommerce.orders": 151},
+    )
+    assert out == {"ecommerce.orders": 901}
+
+
+def test_a_key_the_conversion_makes_an_identity_but_the_target_does_not_is_reported() -> None:
+    """A session applied as a plain integer before the identity default: the cut over sync
+    said "Done -- nothing needed advancing" over a key nothing generates."""
+    from dsql_migrator.core.target_introspector import (
+        NOT_AN_IDENTITY_REASON,
+        sync_identity_sequences,
+    )
+
+    conn = _SeqConnection(identity_by_table={}, max_pk=99)
+    out = sync_identity_sequences(
+        ["ecommerce.orders", "ecommerce.plain"],
+        connection_factory=lambda: conn,
+        expected_identity={"ecommerce.orders"},
+    )
+    assert out == {"ecommerce.orders": NOT_AN_IDENTITY_REASON, "ecommerce.plain": None}
+    assert conn.restarts == []
+
+
+def test_the_mysql_counter_is_read_live_from_information_schema() -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.source_dialect.mysql import MySQLSourceDialect
+
+    executed: list[str] = []
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        def execute(self, statement, params=None):
+            executed.append(str(statement))
+            if "information_schema.TABLES" in str(statement):
+                assert params == {"schemas": ["shop"]}
+                return _Result([("shop", "orders", 151), ("shop", "other", 9), ("shop", "plain", None)])
+            return _Result([])
+
+    tables = [
+        SimpleNamespace(name="shop.orders", auto_increment_column="id"),
+        SimpleNamespace(name="shop.plain", auto_increment_column="id"),
+        SimpleNamespace(name="shop.nokey", auto_increment_column=None),
+    ]
+    assert MySQLSourceDialect().read_next_key_values(_Conn(), tables) == {"shop.orders": 151}
+    # Statistics are cached up to a day unless the session asks for them live.
+    assert executed[0] == "SET SESSION information_schema_stats_expiry = 0"
+
+
 class _RestartFailsCursor(_SeqCursor):
     """A cursor whose RESTART WITH raises (simulates a 40001 / token-expiry DDL)."""
 

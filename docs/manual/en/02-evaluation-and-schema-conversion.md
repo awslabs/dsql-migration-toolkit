@@ -138,7 +138,9 @@ to `MEDIUM` by that key alone. The finding still shows what taking the advice wo
 > It runs only after a **complete** load: `MAX(pk)` is the value the sequence has to
 > clear, so syncing a partial load could still leave a collision for the rows yet to
 > arrive. A retry that completes the load performs the sync. Tables with a plain integer
-> key (the default) have no sequence and are left untouched.
+> key (Keep source PK, a composite key, or a `bigint unsigned` key) have no sequence and
+> are left untouched. The sequence is also moved past the source's own counter, so an id
+> the source issued and then deleted is not issued again.
 
 ### What each report item tells you
 
@@ -400,9 +402,8 @@ MySQL→PostgreSQL transpile:
   you can apply it at cut over. You can instead **opt to strip** the foreign keys
   (`SchemaConvertOptions.preserve_foreign_keys=False`) and enforce referential
   integrity in the application layer.
-- **Primary-key strategies** — keep the integer PK, convert to UUID, or use an
-  identity column with caching (to avoid hot-partition contention on a
-  monotonic key). Each table's card also has a **primary-key picker** to switch it
+- **Primary-key strategies** — a cached identity column (the default for a
+  single-column generated key that `bigint` holds), or keep the integer PK. Each table's card also has a **primary-key picker** to switch it
   to a **composite key** (a high-cardinality column prepended to the original key,
   e.g. `(customer_id, id)`) — the one strategy that spreads writes across DSQL
   partitions and moves a write hot-partition wall. It validates the choice against

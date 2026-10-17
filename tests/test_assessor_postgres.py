@@ -682,8 +682,9 @@ def test_identity_finding_states_who_generates_the_key_not_only_throughput() -> 
     assert "keeps generating values" in mysql.risk, mysql.risk
     assert "WIDENED to bigint" in mysql.risk and "no longer gap-free" in mysql.risk
     assert "APPLICATION must supply" not in mysql.risk, mysql.risk
-    # The one AUTO_INCREMENT semantic an identity does not reproduce.
-    assert "does not advance the sequence" in mysql.risk, mysql.risk
+    # The AUTO_INCREMENT idioms an identity does not reproduce.
+    for idiom in ("an explicit NULL or 0 for the key", "LAST_INSERT_ID()", "advancing the counter"):
+        assert idiom in mysql.risk, idiom
     assert "defaults to 'Server-generated (IDENTITY)'" in mysql.recommendation
 
     unsigned = table.model_copy(

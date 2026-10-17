@@ -219,6 +219,37 @@ class MySQLSourceDialect(SourceDialect):
             partial_revokes=probe_scalar(connection, "SELECT @@partial_revokes") in ("1", "ON"),
         )
 
+    def read_next_key_values(self, connection: object, tables) -> "dict[str, int]":
+        # information_schema.TABLES.AUTO_INCREMENT is the counter MySQL 8 persists; its
+        # statistics are cached up to a day unless the session asks for them live
+        # (information_schema_stats_expiry = 0, a session SET: MySQL 5.7 has no cache).
+        from sqlalchemy import bindparam, text
+
+        wanted = {t.name for t in tables if getattr(t, "auto_increment_column", None)}
+        schemas = sorted({name.partition(".")[0] for name in wanted if "." in name})
+        if not schemas:
+            return {}
+        try:
+            connection.execute(text("SET SESSION information_schema_stats_expiry = 0"))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - MySQL 5.7: always live
+            pass
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(
+                    "SELECT TABLE_SCHEMA, TABLE_NAME, AUTO_INCREMENT "
+                    "FROM information_schema.TABLES WHERE TABLE_SCHEMA IN :schemas"
+                ).bindparams(bindparam("schemas", expanding=True)),
+                {"schemas": schemas},
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - best effort: no floor
+            return {}
+        out: dict[str, int] = {}
+        for schema, table, counter in rows:
+            name = f"{schema}.{table}"
+            if name in wanted and counter is not None:
+                out[name] = int(counter)
+        return out
+
     @property
     def engine_display_name(self) -> str:
         return "MySQL"

@@ -163,8 +163,8 @@ DSQL distributes storage **by primary key**, and a monotonic auto-incrementing P
 makes every insert target the same "rightmost" key range — a **write hot-spot**. At
 high parallelism this raises the optimistic-concurrency conflict rate (`SQLSTATE
 40001`), so throughput gains flatten. This is why Evaluation flags such monotonic PKs
-regardless of source engine and Schema Conversion offers PK strategies (keep integer /
-convert to UUID / identity-with-caching). See [Chapter 7 §7.1](07-performance-and-tuning.md#71-why-this-design-the-technical-case).
+regardless of source engine and Schema Conversion offers PK strategies (a cached
+identity — the default for a generated key — / keep integer / composite key). See [Chapter 7 §7.1](07-performance-and-tuning.md#71-why-this-design-the-technical-case).
 
 ---
 

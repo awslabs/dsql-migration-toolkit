@@ -786,6 +786,8 @@ class AutoIncrementRule(Rule):
         # Lazy: converter imports this module at load time.
         from dsql_migrator.core.converter import (
             IDENTITY_FALLBACK_CAVEAT,
+            MYSQL_IDENTITY_DIFFERENCES,
+            identity_strategy_applies,
             mysql_identity_is_lossless,
         )
 
@@ -795,7 +797,9 @@ class AutoIncrementRule(Rule):
             if not column:
                 continue
             single = table.primary_key == [column]
-            if single and mysql_identity_is_lossless(table):
+            declared = next((c.mysql_type for c in table.columns if c.name == column), "")
+            keeps = single and mysql_identity_is_lossless(table)
+            if keeps:
                 risk = (
                     f"The key from AUTO_INCREMENT column '{column}' converts cleanly AND "
                     "keeps generating values: the default conversion makes it a cached "
@@ -806,16 +810,28 @@ class AutoIncrementRule(Rule):
                     "its own block of values from the cache, the key is no longer "
                     "gap-free or strictly increasing, which also spreads inserts instead of "
                     "concentrating them on one partition (DSQL stores rows in primary-key "
-                    "order). Unlike AUTO_INCREMENT, an id the application supplies itself "
-                    "after cut over does not advance the sequence."
+                    "order). " + MYSQL_IDENTITY_DIFFERENCES
                 )
                 recommendation = (
-                    "No action needed to keep the behaviour: Schema Conversion defaults to "
-                    "'Server-generated (IDENTITY)' for this table, and Full Load loads the "
-                    "source's own ids before advancing the sequence past them (again at "
-                    "cut over). Switch to 'Keep source PK' only if the application "
-                    "supplies the key itself — that leaves the column a plain integer "
-                    "with no generator."
+                    "Schema Conversion defaults to 'Server-generated (IDENTITY)' for this "
+                    "table, and Full Load loads the source's own ids before advancing the "
+                    "sequence past them and past the source's own counter (again at cut "
+                    "over); check the insert idioms above in the application. Switch to "
+                    "'Keep source PK' only if the application supplies the key itself — "
+                    "that, like a 'Composite key', leaves the column a plain integer with "
+                    "no generator."
+                )
+            elif single and not identity_strategy_applies(table):
+                risk = (
+                    f"The {declared} key from AUTO_INCREMENT column '{column}' is not an "
+                    "integer, and an Aurora DSQL identity is (bigint), so Aurora DSQL will "
+                    "NOT generate it: the APPLICATION must supply the value on every "
+                    "insert — code that relied on the database generating it fails or "
+                    "collides." + _MONOTONIC_KEY_NOTE
+                )
+                recommendation = (
+                    "Supply the value from the application, or remodel the key as an "
+                    "integer on the source before migrating it."
                 )
             elif single:
                 risk = (
@@ -858,7 +874,12 @@ class AutoIncrementRule(Rule):
                     + " Optional, for throughput only: a UUID/random key spreads the "
                     "writes further.",
                     effort=EffortLevel.MEDIUM,
-                    note_kind=ConversionNoteKind.RECOMMENDATION,
+                    # Advice only where the key keeps generating; where nothing generates
+                    # it, the inserts that leave it out fail after cut over -- a gap the
+                    # table is graded for, not optional advice.
+                    note_kind=(
+                        ConversionNoteKind.RECOMMENDATION if keeps else ConversionNoteKind.LOSS
+                    ),
                 )
             )
         return findings

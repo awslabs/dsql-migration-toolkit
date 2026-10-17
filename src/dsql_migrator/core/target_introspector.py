@@ -1495,12 +1495,33 @@ def max_pk_target(
     return out
 
 
+# The reason a table the conversion makes an identity has none on the target (applied as a
+# plain integer -- with Keep source PK, or by a version that defaulted to it): reported as a
+# FAILED sync so cut over says so instead of "Done -- nothing needed advancing".
+NOT_AN_IDENTITY_REASON = (
+    "the target key is not an identity column (it was applied as a plain integer, with "
+    "Keep source PK or by an earlier version that defaulted to it), so nothing generates "
+    "it: the application must supply ids, or re-apply the table with Replace and reload it"
+)
+
+
 def sync_identity_sequences(
     table_names: "Sequence[str]",
     *,
     connection_factory: Callable[[], Any],
+    source_next_values: "Optional[Mapping[str, int]]" = None,
+    expected_identity: "Collection[str]" = (),
 ) -> dict[str, "Union[int, str, None]"]:
     """Advance each target identity sequence past the loaded rows.
+
+    ``source_next_values`` (table -> the next value the SOURCE would generate: MySQL's
+    AUTO_INCREMENT counter, a PostgreSQL sequence's next value) is a floor: ids the source
+    issued and then deleted stay issued, so a sequence restarted at the target's
+    ``MAX + 1`` alone handed them out again after cut over (an empty table restarted at 1),
+    and anything still holding such an id -- an audit row, an outside system -- silently
+    pointed at the new row. ``expected_identity`` names the tables whose conversion makes
+    the key an identity: one whose target key is NOT an identity is reported as a FAILED
+    sync (:data:`NOT_AN_IDENTITY_REASON`) instead of a quiet no-op.
 
     Per-table result value:
     - ``int`` -- the ``RESTART WITH`` value actually applied (the sequence advanced);
@@ -1540,6 +1561,8 @@ def sync_identity_sequences(
     from psycopg import sql
 
     out: dict[str, Optional[int]] = {}
+    floors = dict(source_next_values or {})
+    expected = set(expected_identity or ())
     # RECONNECT per table, and never let one table's connection loss discard the work
     # already recorded. This pass runs at the END of a load that can have taken hours, so
     # its connection is the most likely in the tool to be dead: a DSQL IAM token is
@@ -1607,6 +1630,8 @@ def sync_identity_sequences(
                 continue
             _safe_close(cursor)
             if not rows:
+                if name in expected:
+                    out[name] = NOT_AN_IDENTITY_REASON
                 continue  # no identity column: nothing to sync
             column = str(rows[0][0])
 
@@ -1646,12 +1671,15 @@ def sync_identity_sequences(
                 connection = None
                 continue
             _safe_close(cursor)
+            floor = floors.get(name)
             if not isinstance(current_max, int):
-                # Empty table (or a non-integer identity): the sequence's own start is
-                # already correct, so touching it would only risk moving it backwards.
-                continue
-
-            restart_at = current_max + 1
+                if not isinstance(floor, int) or floor <= 1:
+                    # Empty table (or a non-integer identity) with no source counter past
+                    # its start: the sequence's own start is already correct.
+                    continue
+                restart_at = floor
+            else:
+                restart_at = max(current_max + 1, floor if isinstance(floor, int) else 0)
             cursor = connection.cursor()
             try:
                 cursor.execute(

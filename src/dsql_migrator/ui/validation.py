@@ -534,6 +534,7 @@ def resync_identity_sequences(
     *,
     aws_profile: Optional[str] = None,
     sync: "Optional[Callable[..., dict]]" = None,
+    extras: "Optional[Mapping[str, object]]" = None,
 ) -> dict[str, int]:
     """Advance target identity sequences past the CURRENT ``MAX(pk)``. Best-effort.
 
@@ -573,7 +574,9 @@ def resync_identity_sequences(
         def _factory():
             return DsqlConnector(target_config, aws_profile=aws_profile).connect()
 
-        result = sync(list(table_names), connection_factory=_factory) or {}
+        # ``extras``: the source counters and the tables the conversion makes an identity
+        # (see identity_sync_extras); only keys that carry something are passed.
+        result = sync(list(table_names), connection_factory=_factory, **dict(extras or {})) or {}
     except Exception as exc:  # noqa: BLE001 - never fail a completed validation on this
         # A setup/connection failure is NOT a no-op. Collapsing it into an empty
         # (advanced, failed) pair is indistinguishable from a genuine "nothing to
@@ -3426,11 +3429,16 @@ def build_validation_screen(
                 )
                 advanced, failed = {}, {}
             else:
+                _names = [table.name for table in scoped_tables]
                 advanced, failed = resync_identity_sequences(
                     target_config,
-                    [table.name for table in scoped_tables],
+                    _names,
                     aws_profile=session.aws_profile,
                     sync=sync_sequences,
+                    extras=_identity_sync_extras(
+                        session, eval_store, conversion_store, session_id, _names,
+                        migration_state=migration_state,
+                    ),
                 )
                 validation_state.set_identity_sync(advanced, failed)
             if advanced:
@@ -4215,6 +4223,7 @@ def _run_cutover_identity_sync(
     job_manager: "Optional[JobManager]" = None,
     sync: "Optional[Callable[..., dict]]" = None,
     refresh: "Optional[Callable[[], None]]" = None,
+    extras: "Optional[Callable[[Sequence[str]], Mapping[str, object]]]" = None,
 ) -> None:
     """Advance identity sequences past the current target ``MAX(pk)`` (operator action).
 
@@ -4239,8 +4248,13 @@ def _run_cutover_identity_sync(
     aws_profile = getattr(session, "aws_profile", None)
 
     def _work(_handle: object = None) -> None:
+        # Read in the background job, like the sync: it reads the source.
         advanced, failed = resync_identity_sequences(
-            target_config, table_names, aws_profile=aws_profile, sync=sync
+            target_config,
+            table_names,
+            aws_profile=aws_profile,
+            sync=sync,
+            extras=extras(table_names) if extras is not None else None,
         )
         if advanced:
             detail = ", ".join(
@@ -4775,18 +4789,43 @@ def _cutover_pending_identity_tables(
     the same tables ``sync_identity_sequences`` reaches via ``is_identity`` in the
     catalog. Pure and side-effect-free (no DB); cut over is not a hot path.
     """
-    if conversion_store is None or eval_store is None:
+    context = _identity_sync_context(
+        session, eval_store, conversion_store, session_id, migration_state=migration_state
+    )
+    if context is None:
         return 0
+    from dsql_migrator.ui.schema_conversion_apply import identity_from_ddl
+
+    tables, applied = context
+    by_name = {table.name: table for table in tables}
+    return sum(
+        1
+        for name, conv in applied.items()
+        if name in by_name and identity_from_ddl(by_name[name], conv.target_ddl)
+    )
+
+
+def _identity_sync_context(
+    session: object,
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+    *,
+    migration_state: object = None,
+) -> "Optional[tuple[list, dict]]":
+    """``(inventory tables, applied conversions in migration scope)``, rebuilt exactly as
+    :func:`_cutover_pending_foreign_keys` does, or ``None`` without the schema inputs."""
+    if conversion_store is None or eval_store is None:
+        return None
     conv_state = conversion_store.get(session_id)
     if conv_state is None:
-        return 0
+        return None
     result = eval_store.get_or_create(session_id).result
     inventory = result.inventory if result is not None else None
     if inventory is None:
-        return 0
+        return None
     from dsql_migrator.core.converter import SchemaConverter
     from dsql_migrator.ui.schema_conversion import applied_table_conversions
-    from dsql_migrator.ui.schema_conversion_apply import identity_from_ddl
 
     stype = (
         session.source_config.source_type  # type: ignore[attr-defined]
@@ -4799,13 +4838,38 @@ def _cutover_pending_identity_tables(
         preserve_foreign_keys=conv_state.preserve_foreign_keys,
     )
     # Only the migrated tables (the FK count is scoped the same way).
-    applied = _in_migration_scope(applied, migration_state)
-    by_name = {table.name: table for table in inventory.tables}
-    return sum(
-        1
-        for name, conv in applied.items()
-        if name in by_name and identity_from_ddl(by_name[name], conv.target_ddl)
-    )
+    return list(inventory.tables), _in_migration_scope(applied, migration_state)
+
+
+def _identity_sync_extras(
+    session: object,
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+    table_names: "Sequence[str]",
+    *,
+    migration_state: object = None,
+) -> "dict[str, object]":
+    """The source counters and expected identities for a Validation / cut over sync
+    (:func:`identity_sync_extras`). Reads the source; ``{}`` when it cannot be told."""
+    try:
+        context = _identity_sync_context(
+            session, eval_store, conversion_store, session_id, migration_state=migration_state
+        )
+        if context is None:
+            return {}
+        from dsql_migrator.ui.data_migration._full_load_engine import identity_sync_extras
+
+        tables, applied = context
+        return identity_sync_extras(
+            source_config=getattr(session, "source_config", None),
+            source_password=getattr(session, "source_password", None),
+            tables=tables,
+            table_conversions=applied,
+            table_names=table_names,
+        )
+    except Exception:  # noqa: BLE001 - the extras refine the sync; never block it
+        return {}
 
 
 def _run_cutover_foreign_keys(
@@ -5263,6 +5327,10 @@ def build_cutover_screen(
             _run_cutover_identity_sync(
                 session, validation_state, report,
                 job_manager=job_manager, sync=sync_sequences, refresh=refresh,
+                extras=lambda names: _identity_sync_extras(
+                    session, eval_store, conversion_store, session_id, names,
+                    migration_state=migration_state,
+                ),
             )
 
         # For a CDC migration, foreign keys were deferred during the stream; the runbook's

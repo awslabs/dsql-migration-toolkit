@@ -393,6 +393,14 @@ class SourceDialect(ABC):
         kind (``[]`` when nothing is or when it cannot be told). Read only; best effort."""
         return []
 
+    def read_next_key_values(self, connection: object, tables: "Sequence[object]") -> "dict[str, int]":
+        """``{table: the next value the source would generate}`` for the tables of
+        ``tables`` with a generated key (``auto_increment_column``): the floor an identity
+        sequence on the target is restarted at, so ids the source issued and then deleted
+        are not issued again after cut over. Read only; best effort (a table that cannot
+        be read is left out)."""
+        return {}
+
     @property
     def session_setup_sql(self) -> "tuple[str, ...]":
         """Statements every new source connection runs (committed) before it is used.

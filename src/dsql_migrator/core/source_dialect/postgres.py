@@ -845,6 +845,35 @@ def _sequence_row(
 class PostgresSourceDialect(SourceDialect):
     """RDS/Aurora PostgreSQL source dialect (read-only)."""
 
+    def read_next_key_values(self, connection: object, tables) -> "dict[str, int]":
+        # The generated key's own sequence (serial or identity: pg_get_serial_sequence
+        # finds both). pg_sequences hides last_value when the sequence was never drawn
+        # from or was reset, or when the user may not read it: then no floor is claimed.
+        out: dict[str, int] = {}
+        for table in tables:
+            column = getattr(table, "auto_increment_column", None)
+            if not column:
+                continue
+            schema, _, bare = table.name.partition(".")
+            qualified = ".".join(
+                '"' + part.replace('"', '""') + '"' for part in ((schema, bare) if bare else (schema,))
+            )
+            try:
+                row = connection.execute(  # type: ignore[attr-defined]
+                    text(
+                        "SELECT s.last_value, s.increment_by FROM pg_sequences s "
+                        "JOIN pg_namespace n ON n.nspname = s.schemaname "
+                        "JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = s.sequencename "
+                        "WHERE c.oid = pg_get_serial_sequence(:table, :column)::regclass"
+                    ),
+                    {"table": qualified, "column": column},
+                ).first()
+            except Exception:  # noqa: BLE001 - best effort: no floor for this table
+                continue
+            if row is not None and row[0] is not None:
+                out[table.name] = int(row[0]) + int(row[1] or 1)
+        return out
+
     source_type = SourceType.POSTGRES
     # A PostgreSQL "database" is the connection target; its user data lives in SCHEMAS
     # inside it. So a set ``database`` must reflect ALL non-system schemas (public, app,
