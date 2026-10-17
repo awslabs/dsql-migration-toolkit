@@ -356,8 +356,8 @@ MySQL→PostgreSQL トランスパイルではありません。
   トランスパイラが変換しない関数(`FIND_IN_SET`、`UNIX_TIMESTAMP`、ユーザー関数)を呼ぶビューは、両方のステップで
   MANUAL とされます(`VIEW_NOT_CONVERTED`): その関数が Aurora DSQL にない限り `CREATE VIEW` は失敗します。
   忠実な PostgreSQL の形がある MySQL の呼び出しはその形に書き換えます(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` は
-  `EXTRACT` に、`DATEDIFF`/`TO_DAYS`、`CURTIME()` は `LOCALTIME` に、`NOW()`/`CURRENT_TIMESTAMP` は `LOCALTIMESTAMP(0)` に
-  (MySQL の値は秒単位の `DATETIME`)、`UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` は UTC の壁時計に、`STDDEV`/`VARIANCE` は
+  `EXTRACT` に、`DATEDIFF`/`TO_DAYS`、`NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP` と `CURTIME()` はセッションの壁時計に、
+  `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` は UTC の壁時計に(MySQL と同じく精度に合わせて丸めずに切り捨てて)、`STDDEV`/`VARIANCE` は
   MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
   あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
   そのバイトに(比較では Aurora DSQL がすでにバイト単位で比較するので省略)、`CAST(x AS UNSIGNED)` は MySQL と同じく負の数を
@@ -368,9 +368,12 @@ MySQL→PostgreSQL トランスパイルではありません。
   返す `STR_TO_DATE`(空文字列は NULL、2 桁の年は MySQL と同じく解釈)、そしてすべての `DATE_FORMAT`/`STR_TO_DATE`/
   `FROM_UNIXTIME` の書式を `%%` や未知の指定子まで MySQL 自身の指定子から)。その他(ISO 以外のモードの `WEEK`、
   `SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じようにフラグが付き、Aurora DSQL にパターンのない書式トークン(MySQL の
-  `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、異なるテキストを返します。`STR_TO_DATE`
-  (書式に合わない値に MySQL は NULL を、Aurora DSQL はエラーを返します)、列から読む書式、`GROUP_CONCAT(DISTINCT x ORDER BY y)`
-  にもフラグが付きます。Query Converter も同じ MySQL の式を同じように書きます。
+  `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、異なるテキストを返します。列に対する `STR_TO_DATE`
+  (書式と完全に一致しない値に MySQL は NULL を返しますが、Aurora DSQL は読めない値にはエラーを返し、区切り文字だけが違う値は
+  日付として読みます)、バイトのデコード(不正なバイトは MySQL では NULL、Aurora DSQL ではエラー)、列から読む書式、
+  `GROUP_CONCAT(DISTINCT x ORDER BY y)` にもフラグが付きます。各値はその内容に合わせて書きます — 列はその型で(MySQL が保存した
+  結合を経ても)、式はその計算結果で — そして Query Converter も同じ MySQL の式を同じように書き、ステップ 1 を実行していれば
+  Evaluation のインベントリの型を使います。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

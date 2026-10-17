@@ -340,8 +340,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, 사용자 함수)를 호출하는 뷰는 두 단계 모두에서 MANUAL로 표시됩니다
   (`VIEW_NOT_CONVERTED`): 그 함수가 Aurora DSQL에 없으면 `CREATE VIEW`가 실패합니다. 충실한 PostgreSQL 형태가 있는
   MySQL 호출은 그것으로 다시 씁니다(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()`는 `EXTRACT`로, `DATEDIFF`/`TO_DAYS`,
-  `CURTIME()`은 `LOCALTIME`으로, `NOW()`/`CURRENT_TIMESTAMP`는 `LOCALTIMESTAMP(0)`으로(MySQL의 값은 초 단위 `DATETIME`),
-  `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()`은 UTC 벽시계로, `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로,
+  `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP`와 `CURTIME()`은 세션의 벽시계로, `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()`은
+  UTC 벽시계로(MySQL처럼 정밀도에 맞춰 반올림이 아니라 잘라서), `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로,
   `VAR_SAMP`/`STDDEV_SAMP`는 표본 형태로, `CAST(x AS CHAR [CHARSET ...])`는 text로 — 길이가 있으면 자르기만 하고 채우지
   않는 `varchar(n)`으로 — 바이너리 컬럼은 그 바이트를 디코딩해서(`CONVERT_FROM`), `BINARY x`는 그 바이트로(비교에서는
   Aurora DSQL이 이미 바이트 단위로 비교하므로 생략), `CAST(x AS UNSIGNED)`는 MySQL처럼 음수를 순환시켜, `GROUP_CONCAT`은
@@ -352,8 +352,11 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   두 자리 연도는 MySQL처럼 해석), 그리고 모든 `DATE_FORMAT`/`STR_TO_DATE`/`FROM_UNIXTIME` 형식은 `%%`와 알 수 없는 지정자까지
   MySQL 자체의 지정자로부터 씁니다). 나머지(ISO 이외 모드의 `WEEK`, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET` 등)는 같은 방식으로
   표시되며, Aurora DSQL 패턴이 없는 형식 토큰(MySQL의 `%U`/`%u`/`%V`/`%X` 주 번호, `%w`)도 표시됩니다: 뷰는 만들어지지만
-  다른 텍스트를 반환합니다. `STR_TO_DATE`(형식에 맞지 않는 값에 MySQL은 NULL을, Aurora DSQL은 오류를 냅니다), 컬럼에서
-  읽는 형식, `GROUP_CONCAT(DISTINCT x ORDER BY y)`도 표시됩니다. Query Converter도 같은 MySQL 식을 같은 방식으로 씁니다. **PostgreSQL** 뷰의 정의
+  다른 텍스트를 반환합니다. 컬럼에 대한 `STR_TO_DATE`(형식과 정확히 맞지 않는 값에 MySQL은 NULL을 돌려주지만, Aurora DSQL은
+  읽을 수 없는 값에는 오류를 내고 구분자만 다른 값은 날짜로 읽습니다), 바이트 디코딩(잘못된 바이트는 MySQL에서 NULL, Aurora
+  DSQL에서 오류), 컬럼에서 읽는 형식, `GROUP_CONCAT(DISTINCT x ORDER BY y)`도 표시됩니다. 각 값은 그 내용에 맞게 씁니다 —
+  컬럼은 그 타입으로(MySQL이 저장한 조인을 거쳐서도), 식은 그 계산 결과로 — 그리고 Query Converter도 같은 MySQL 식을 같은
+  방식으로 쓰며, 1단계를 실행했다면 Evaluation 인벤토리의 타입을 씁니다. **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
   같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
   `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum

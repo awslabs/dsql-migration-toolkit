@@ -1052,6 +1052,8 @@ def _mixed_case_names(
             if qualifier is None:
                 if key in scopes.labels(column) and scopes.in_alias_clause(column):
                     continue
+                if not this.quoted and key in ("utc_timestamp", "utc_date", "utc_time"):
+                    continue  # MySQL's UTC clock written without parentheses
                 scope = scopes.scope_of(column)
                 sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
                 if sources and all(o is not None for o in sources) and any(
@@ -1289,8 +1291,17 @@ class QueryConverter:
     real target.
     """
 
-    def __init__(self, *, source_type: SourceType = SourceType.MYSQL) -> None:
+    def __init__(
+        self,
+        *,
+        source_type: SourceType = SourceType.MYSQL,
+        column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]" = (),
+    ) -> None:
         self._source_type = source_type
+        # The Evaluation inventory's column types (table_type_index entries), so a MySQL
+        # expression is written by what its columns hold -- a BLOB's LENGTH its own bytes,
+        # CONVERT(blob USING ...) its decoded text -- as a view's is.
+        self._column_types = tuple(column_types)
 
     @property
     def _is_postgres(self) -> bool:
@@ -1357,7 +1368,10 @@ class QueryConverter:
             # The MySQL expression semantics a view gets (Schema Conversion), so the two
             # steps never disagree on one: VARIANCE is the population one, CAST AS CHAR is
             # text, GREATEST is NULL for a NULL argument, NOW() whole seconds, ...
-            warnings.extend(_mysql_expression_warnings(*rewrite_mysql_expressions(tree)))
+            untranslated, misformatted, issues = rewrite_mysql_expressions(tree, self._column_types)
+            # JSON_UNQUOTE that is not over JSON_EXTRACT is reported by its own code above.
+            untranslated = [name for name in untranslated if name.upper() != "JSON_UNQUOTE"]
+            warnings.extend(_mysql_expression_warnings(untranslated, misformatted, issues))
             _drop_from_dual(tree)
             if mixed_case is not None:
                 warnings.append(mixed_case)

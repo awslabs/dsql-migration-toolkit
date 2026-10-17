@@ -54,8 +54,8 @@ def _query(sql: str):
         ("GREATEST(a, b)", "CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE GREATEST(a, b) END"),
         ("CONCAT_WS(',', a, b)", "CONCAT_WS(',', a, b)"),
         ("JSON_ARRAY(1, NULL)", "JSON_BUILD_ARRAY(1, NULL)"),
-        ("NOW()", "LOCALTIMESTAMP(0)"),
-        ("CURRENT_TIMESTAMP", "LOCALTIMESTAMP(0)"),
+        ("NOW()", "DATE_TRUNC('second', LOCALTIMESTAMP)"),
+        ("CURRENT_TIMESTAMP", "DATE_TRUNC('second', LOCALTIMESTAMP)"),
         ("DATE_FORMAT(d, '%Y-%m-%d')", "TO_CHAR(CAST(d AS TIMESTAMP), 'YYYY-MM-DD')"),
     ],
 )
@@ -69,8 +69,8 @@ def test_the_query_converter_writes_mysql_expressions_as_a_view_does(mysql: str,
 
 def test_a_nested_greatest_keeps_mysql_null_semantics() -> None:
     ddl, _ = _view("least(greatest(`o`.`score`,0),100) AS `clamped`")
-    inner = 'CASE WHEN "o"."score" IS NULL THEN NULL ELSE GREATEST("o"."score", 0) END'
-    assert f"LEAST({inner}, 100)" in ddl and f"WHEN {inner} IS NULL" in ddl
+    # G97: the whole nest's arguments checked once, by the outermost call.
+    assert 'CASE WHEN "o"."score" IS NULL THEN NULL ELSE LEAST(GREATEST("o"."score", 0), 100) END' in ddl
     assert "OR 0 IS NULL" not in ddl and "100 IS NULL" not in ddl  # a literal is never NULL
 
 
@@ -116,7 +116,7 @@ def test_nested_calls_are_all_rewritten() -> None:
         "date_format(str_to_date(`o`.`s`,'%d/%m/%Y'),'%Y-%m-%d') AS `f`"
     )
     assert "JSON_AGG(JSON_BUILD_ARRAY(" in ddl and "JSON_ARRAY(" not in ddl
-    assert "LOCALTIMESTAMP(3)" in ddl and "NOW(" not in ddl
+    assert "DATE_TRUNC('milliseconds', LOCALTIMESTAMP)" in ddl and "NOW(" not in ddl
     assert "TO_DATE(NULLIF(\"o\".\"s\", ''), 'DD/MM/YY')" in ddl and "%" not in ddl
     assert view.auto_converted and all("json_array" not in w.message for w in view.warnings)
 
@@ -146,18 +146,18 @@ def test_a_distinct_group_concat_ordered_by_another_expression_is_explained() ->
         ("str_to_date(`o`.`s`,'%H:%i')", "CAST(TO_TIMESTAMP(\"o\".\"s\", 'HH24:MI') AS TIME)"),
         ("str_to_date(`o`.`s`,'%d/%m/%Y')", "TO_DATE(NULLIF(\"o\".\"s\", ''), 'DD/MM/YY')"),
         ("str_to_date(`o`.`s`,'%Y-%m-%d %H:%i')",
-         "CAST(TO_TIMESTAMP(NULLIF(\"o\".\"s\", ''), 'YY-MM-DD HH24:MI') AS TIMESTAMP)"),
+         "CAST(TO_TIMESTAMP(NULLIF(\"o\".\"s\", '') || ' +00', 'YY-MM-DD HH24:MI TZH') AT TIME ZONE 'UTC' AS TIMESTAMP)"),
         ("str_to_date(`o`.`s`,'%Y%m%d')", "TO_DATE(NULLIF(\"o\".\"s\", ''), 'YYYY\"\"MM\"\"DD')"),
         # %% is a %, an unknown specifier its letter, adjacent patterns kept apart.
         ("date_format(`o`.`created_at`,'%Y%%i|%d%a|%A, %-d')", "'YYYY\"%i|\"DD\"\"Dy\"|A, -d\"'"),
         ("dayname(`o`.`s`)", "TO_CHAR(CAST(\"o\".\"s\" AS DATE), 'FMDay')"),
         ("utc_date()", "CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS DATE)"),
-        ("utc_timestamp()", "CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS TIMESTAMP(0))"),
-        ("utc_time()", "CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS TIME(0))"),
+        ("utc_timestamp()", "DATE_TRUNC('second', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')"),
+        ("utc_time()", "CAST(DATE_TRUNC('second', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') AS TIME)"),
         ("(to_days(`o`.`d`) - to_days('2024-01-01'))",
          "CAST(\"o\".\"d\" AS DATE) - CAST('0001-01-01' AS DATE)"),
         ("week(`o`.`d`,3)", "CAST(EXTRACT(WEEK FROM CAST(\"o\".\"d\" AS DATE)) AS INT)"),
-        ("truncate(`o`.`ratio`,1)", "TRUNC(CAST(\"o\".\"ratio\" AS DECIMAL), 1)"),
+        ("truncate(`o`.`ratio`,1)", "TRUNC(\"o\".\"ratio\", 1)"),  # a decimal is truncated as is
         ("(`o`.`d` + interval 1 month)", "CAST(\"o\".\"d\" + INTERVAL '1 MONTH' AS DATE)"),
     ],
 )
@@ -182,7 +182,7 @@ def test_formats_read_at_run_time_and_unmatched_values_are_reported() -> None:
     )
     assert "'FMMonth FMDD, YYYY'" in ddl and "'YYYY-MM-DD'" in ddl
     messages = " ".join(w.message for w in view.warnings)
-    assert "format read at run time" in messages and "raise an error instead" in messages
+    assert "format read at run time" in messages and "raise an error" in messages
     # The IF's condition is no format.
     assert "CASE WHEN \"o\".\"paid\"" in ddl
 

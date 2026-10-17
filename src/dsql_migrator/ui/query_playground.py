@@ -532,6 +532,7 @@ def build_query_playground_screen(
     *,
     playground_store: PlaygroundStore,
     converter: Optional[QueryConverter] = None,
+    eval_store: Optional[object] = None,
     target_connection_factory: Optional[
         Callable[[TargetConnectionConfig, Optional[str]], TargetConnectionFactory]
     ] = None,
@@ -577,8 +578,24 @@ def build_query_playground_screen(
                 "source_type",
                 SourceType.MYSQL,
             )
-            or SourceType.MYSQL
+            or SourceType.MYSQL,
+            column_types=_inventory_column_types(),
         )
+
+    def _inventory_column_types() -> tuple:
+        """The Evaluation inventory's column types, when Step 1 ran: a MySQL expression
+        is then written by what its columns hold, as a view's is (a BLOB's LENGTH its own
+        bytes, CONVERT(blob USING ...) its decoded text)."""
+        if eval_store is None:
+            return ()
+        try:
+            from dsql_migrator.core.converter import table_type_index
+
+            result = eval_store.get_or_create(session_id).result  # type: ignore[attr-defined]
+            inventory = getattr(result, "inventory", None) if result is not None else None
+            return tuple(table_type_index(getattr(inventory, "tables", None) or ()).values())
+        except Exception:  # noqa: BLE001 - no inventory: the columns are untyped
+            return ()
 
     def _inferred_source_schema() -> Optional[str]:
         """The schema inferred from the connection: a MySQL DB maps to a same-named

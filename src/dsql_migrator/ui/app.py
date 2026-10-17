@@ -624,6 +624,7 @@ def build_page(
         SESSION_STORE,
         session_id,
         playground_store=PLAYGROUND_STORE,
+        eval_store=EVALUATION_STORE,
         open_ai_scope=_open_ai_scope,
         ai_post_event=_ai_post_event,
         # The query chat can check its statement against the real converted/target

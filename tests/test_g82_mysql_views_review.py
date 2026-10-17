@@ -48,27 +48,28 @@ def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
         ("concat_ws(' ', a, b)", "CONCAT_WS(' ', a, b)"),
         ("convert_tz(d, '+00:00', '+09:00')", "AT TIME ZONE INTERVAL '+00:00' AT TIME ZONE INTERVAL '+09:00'"),
         ("greatest(a, b)", "CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE GREATEST(a, b) END"),
-        # G95: the bytes of its text (a CHAR(n) column's without the padding).
-        ("length(s)", "OCTET_LENGTH(CAST(s AS TEXT))"),
+        # G97: an operand of unknown type counts its own bytes (text or bytea alike).
+        ("length(s)", "OCTET_LENGTH(s)"),
         ("cast(a as char charset utf8mb4)", "CAST(a AS TEXT)"),
         ("cast(a as char(10) charset utf8mb4)", "CAST(a AS VARCHAR(10))"),
         ("convert(a using utf8mb4)", "CAST(a AS TEXT)"),
-        # G95: its bytes (a comparison drops it: Aurora DSQL compares bytes already).
-        ("cast(a as char charset binary)", "CONVERT_TO(CAST(a AS TEXT), 'UTF8')"),
+        # G97: unknown, a bytea's own bytes or a text's UTF-8 (a comparison drops it).
+        ("cast(a as char charset binary)", "CAST(a AS BYTEA)"),
         ("cast(a as unsigned)", "CAST(a AS DECIMAL(20))"),
         ("json_array(1, null)", "JSON_BUILD_ARRAY(1, NULL)"),
         ("json_arrayagg(a)", "JSON_AGG(a)"),
         ("weekofyear(d)", "CAST(EXTRACT(WEEK FROM CAST(d AS DATE)) AS INT)"),
-        ("now(3)", "LOCALTIMESTAMP(3)"),
+        ("now(3)", "DATE_TRUNC('milliseconds', LOCALTIMESTAMP)"),  # G97: truncated, as MySQL
         ("dayname(d)", "TO_CHAR(CAST(d AS DATE), 'FMDay')"),  # G95: of its date
         ("date_format(d, '%Y-%m-%dT%H:%i:%s')", "'YYYY-MM-DD\"T\"HH24:MI:SS'"),
         ("date_format(d, '%h:%i %p')", "'HH12:MI AM'"),
         ("date_format(d, 'Date: %Y')", "'\"Date: \"YYYY'"),
         # G95: a DATETIME as MySQL types it, '' NULL, a two-digit year read as MySQL reads it.
+        # G97: parsed at a fixed offset, whatever the session time zone.
         ("str_to_date(s, '%d/%m/%Y %H:%i')",
-         "CAST(TO_TIMESTAMP(NULLIF(s, ''), 'DD/MM/YY HH24:MI') AS TIMESTAMP)"),
+         "CAST(TO_TIMESTAMP(NULLIF(s, '') || ' +00', 'DD/MM/YY HH24:MI TZH') AT TIME ZONE 'UTC' AS TIMESTAMP)"),
         ("from_unixtime(a, '%Y-%m-%d')", "TO_CHAR(TO_TIMESTAMP(a), 'YYYY-MM-DD')"),
-        ("now()", "LOCALTIMESTAMP(0)"),  # G95: MySQL's NOW() is a DATETIME of whole seconds
+        ("now()", "DATE_TRUNC('second', LOCALTIMESTAMP)"),  # whole seconds, truncated (G97)
     ],
 )
 def test_a_mysql_call_is_written_as_postgresql_runs_it(call: str, emitted: str) -> None:

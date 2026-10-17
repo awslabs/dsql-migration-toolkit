@@ -2136,7 +2136,9 @@ class MySqlViewConversionRule(Rule):
         findings: list[Finding] = []
         # With the tables' column types, as Schema Conversion converts each view (a binary
         # column's bytes, a CHAR(n) column's padding): the two steps grade it alike.
-        table_index = {table.name.lower(): table for table in inventory.tables}
+        from dsql_migrator.core.converter import table_type_index
+
+        table_index = table_type_index(inventory.tables)
         for view in inventory.views:
             if getattr(view, "unsupported_kind", None) or not (view.definition or "").strip():
                 continue  # graded by VIEW_DEFINITION_UNREADABLE and the kind rules

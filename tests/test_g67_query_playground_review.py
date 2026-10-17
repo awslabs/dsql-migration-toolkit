@@ -37,7 +37,7 @@ def test_a_real_mixed_case_name_is_still_flagged() -> None:
 def test_from_dual_is_dropped_not_carried() -> None:
     """Aurora DSQL has no dual: the converted SQL failed with relation "dual" does not exist."""
     assert QueryConverter().convert("SELECT NOW() FROM dual WHERE 1 = 1").converted_sql == (
-        "SELECT LOCALTIMESTAMP(0) WHERE 1 = 1"  # G95: MySQL NOW() is whole seconds
+        "SELECT DATE_TRUNC('second', LOCALTIMESTAMP) WHERE 1 = 1"  # G97: whole seconds, truncated
     )
     assert QueryConverter().convert("SELECT 1 FROM shop.dual").converted_sql == (
         "SELECT 1 FROM shop.dual"  # a real table of that name stays

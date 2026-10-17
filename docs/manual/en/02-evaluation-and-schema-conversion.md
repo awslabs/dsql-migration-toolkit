@@ -437,8 +437,8 @@ MySQL→PostgreSQL transpile:
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, a user function) is flagged MANUAL at both steps
   (`VIEW_NOT_CONVERTED`): its `CREATE VIEW` fails unless the function exists on Aurora DSQL. MySQL calls with a
   faithful PostgreSQL form are rewritten to it (`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` as `EXTRACT`,
-  `DATEDIFF`/`TO_DAYS`, `CURTIME()` as `LOCALTIME`, `NOW()`/`CURRENT_TIMESTAMP` as `LOCALTIMESTAMP(0)` (MySQL's
-  is a `DATETIME` of whole seconds) and `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` as the UTC wall clock,
+  `DATEDIFF`/`TO_DAYS`, `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP` and `CURTIME()` as the session's wall clock and
+  `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` as the UTC one, truncated to their precision as MySQL does,
   `STDDEV`/`VARIANCE` as the population forms MySQL computes and `VAR_SAMP`/`STDDEV_SAMP` as the sample ones,
   `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
   a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (dropped in a comparison, which
@@ -452,9 +452,12 @@ MySQL→PostgreSQL transpile:
   format written from MySQL's own specifiers, `%%` and unknown ones included); others (`WEEK` in a mode other
   than ISO's, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET`, ...) are flagged the same way, and a format token with no
   Aurora DSQL pattern (MySQL's `%U`/`%u`/`%V`/`%X` week numbers, `%w`) is flagged too: the view would be
-  created but return different text. So are `STR_TO_DATE` (MySQL returns NULL for a value that does not match
-  its format, Aurora DSQL raises an error), a format read from a column, and `GROUP_CONCAT(DISTINCT x ORDER BY
-  y)`. The Query Converter writes the same MySQL expressions the same way. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  created but return different text. So are `STR_TO_DATE` over a column (MySQL returns NULL for a value that does
+  not match its format exactly; Aurora DSQL raises an error for one it cannot read and reads one whose separators
+  differ as a date), decoding bytes (invalid bytes are NULL in MySQL, an error on Aurora DSQL), a format read from
+  a column, and `GROUP_CONCAT(DISTINCT x ORDER BY y)`. Each value is written by what it holds — a column by its
+  type, read through MySQL's stored joins, an expression by what it computes — and the Query Converter writes the
+  same MySQL expressions the same way, typed by the Evaluation inventory once Step 1 has run. A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column
