@@ -170,9 +170,21 @@ class ColumnDef(BaseModel):
             "recomputed on UPDATE, pg_attribute.attgenerated='s', and an INSERT that "
             "supplies a value rejected). It used to be discarded on the claim that 'Aurora "
             "DSQL has no generated columns', which was simply false. A MySQL source never "
-            "populates this (introspection does not read "
-            "information_schema.COLUMNS.GENERATION_EXPRESSION), which is why a MySQL "
-            "generated column still cannot be preserved."
+            "populates this -- its expression is MySQL syntax, kept apart in "
+            "``mysql_generated_expression`` -- which is why a MySQL generated column still "
+            "cannot be preserved."
+        ),
+    )
+    mysql_generated_expression: Optional[str] = Field(
+        default=None,
+        exclude_if=lambda v: not v,
+        description=(
+            "The expression a MySQL generated column computes, as MySQL prints it "
+            "(information_schema.COLUMNS.GENERATION_EXPRESSION): shown with the "
+            "GENERATED_COLUMN finding and in the source DDL, NEVER emitted. Its own field "
+            "because every source-neutral reader of ``generated_expression`` (the CDC "
+            "capture, Full Load's generated-column read, the exclusion overlay) takes a "
+            "value there for a PostgreSQL expression Aurora DSQL computes."
         ),
     )
     generated_kind: Optional[str] = Field(

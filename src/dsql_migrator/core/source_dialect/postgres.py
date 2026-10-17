@@ -1893,6 +1893,7 @@ class PostgresSourceDialect(SourceDialect):
                             declared_type=str(r[2]),
                             reason=reason,
                             nullable=(not bool(r[6])) if len(r) > 6 else None,
+                            in_event=bool(r[3]) and str(r[4]) == "bit",
                         )
                     )
                 uncarryable = {k: tuple(v) for k, v in found.items()}

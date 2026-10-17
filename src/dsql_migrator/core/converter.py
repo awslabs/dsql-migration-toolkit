@@ -4137,7 +4137,7 @@ def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
     stored = [c.name for c in columns if c.generated_kind == "STORED"]
     virtual = [c.name for c in columns if c.generated_kind == "VIRTUAL"]
     unknown = [c.name for c in columns if c.generated_kind not in ("STORED", "VIRTUAL")]
-    captured = [c for c in columns if c.generated_expression]
+    captured = [c for c in columns if c.mysql_generated_expression]
     parts = [
         f"Columns ({', '.join(c.name for c in columns)}) are MySQL generated columns, "
         "created as ORDINARY columns: the tool does not translate MySQL's generating "
@@ -4146,7 +4146,7 @@ def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
     if captured:
         parts.append(
             "Their MySQL expressions: "
-            + "; ".join(f"{c.name} AS {c.generated_expression}" for c in captured)
+            + "; ".join(f"{c.name} AS {c.mysql_generated_expression}" for c in captured)
             + "."
         )
     if stored:
@@ -4212,7 +4212,7 @@ def mysql_generated_column_advice(table: TableDef) -> str:
     keyed = [name for name in generated if name in primary_key]
     advice = (
         MYSQL_GENERATED_COLUMN_ADVICE_READ
-        if all(c.generated_expression for c in table.columns if c.generated)
+        if all(c.mysql_generated_expression for c in table.columns if c.generated)
         else MYSQL_GENERATED_COLUMN_ADVICE
     )
     if not keyed:
@@ -4261,8 +4261,8 @@ def pg_preserved_generated_columns(table: TableDef) -> "list[ColumnDef]":
       and maintains it (INSERT computes, UPDATE recomputes, an explicitly supplied value is
       rejected). ``VIRTUAL`` is a syntax error there, so it stays an ordinary column.
     * an expression was captured -- a MySQL source never populates
-      ``generated_expression`` (introspection does not read
-      ``information_schema.COLUMNS.GENERATION_EXPRESSION``), so this condition is what keeps
+      ``generated_expression`` (its MySQL-syntax expression is kept apart, in
+      ``mysql_generated_expression``, for display only), so this condition is what keeps
       MySQL behaviour byte-identical without testing the engine.
     * the column is NOT part of the primary key -- DSQL accepts that shape, but the Full
       Load path cannot write it: the batch INSERT must OMIT a generated column, while

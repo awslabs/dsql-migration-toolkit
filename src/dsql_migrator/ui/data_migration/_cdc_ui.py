@@ -7859,70 +7859,121 @@ def cdc_foreign_keys_in_stream_scope(preserved, streamed, inventory):
     }
 
 
+# The target side of a :func:`_probe_cdc_generated_mismatch` entry for a table the target
+# does not have: CDC would dead-letter every change to it.
+_TARGET_TABLE_MISSING = "missing"
+
+
 def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark):
     """``[(table, CDC leaves out, the target computes)]`` for each streamed table whose
     GENERATED columns the capture (read from the applied Schema Conversion DDL) and the
-    LIVE target disagree on. BLOCKING I/O.
+    LIVE target disagree on -- the target side ``None`` when its catalog could not be read,
+    :data:`_TARGET_TABLE_MISSING` when the table is not there. BLOCKING I/O, one connection
+    for every captured table.
 
     The capture set follows the DDL in Schema Conversion, but a GENERATED edit that never
     reached the target (an edit after the apply, a cancelled Replace, a target built
     outside the tool) leaves an ordinary column there: CDC would stop writing it -- inserts
     NULL or DEFAULT, updates stale -- with nothing dead-lettered, while Full Load's append
-    path, which reads the live catalog, wrote it. The other way round every change is
-    refused (428C9). Only tables with a GENERATED column on either side are read; an
-    unreadable one is reported as unknown (``None``), never as agreeing."""
-    from dsql_migrator.core.converter import (
-        parse_target_generated_columns,
-        pg_preserved_generated_columns,
-    )
-    from dsql_migrator.core.target_introspector import target_generated_columns
+    path, which reads the live catalog, wrote it. The other way round (the target computes
+    a column CDC sends) every change is refused (428C9). The target's columns are mapped to
+    the source's as the capture maps them (exact, then a unique case-fold); a column only
+    the target has is no concern of CDC's, which never sends it.
+
+    Only tables with a generated column on the source or in Schema Conversion are read (a
+    target that computes a source GENERATED column Schema Conversion made ordinary
+    included): no connection at all for a schema without one. A target built outside the
+    tool that computes some other column still dead-letters visibly, 428C9, which the
+    dead-letter banner names with its fix."""
+    from dsql_migrator.core.converter import parse_target_generated_columns
+    from dsql_migrator.core.target_introspector import target_generated_columns_of
     from dsql_migrator.ui.data_migration._models import (
         applied_conversions_of,
         target_generated_capture_columns,
     )
 
     applied = applied_conversions_of(migration_state)
-    tables = _cdc_tables_for_config(migration_state, inventory, watermark)
-    connect = None  # built for the first table that needs a read: most have none
+
+    def _generated_anywhere(table) -> bool:
+        ddl = getattr((applied or {}).get(table.name), "target_ddl", None)
+        return (
+            any(getattr(c, "generated", False) for c in table.columns)
+            or bool(target_generated_capture_columns(table, applied))
+            or bool(ddl and parse_target_generated_columns(ddl))
+        )
+
+    tables = [
+        t for t in (_cdc_tables_for_config(migration_state, inventory, watermark) or ())
+        if _generated_anywhere(t)
+    ]
+    if not tables:
+        return []
+    try:
+        connect = _cdc_fk_connection_factory(session)
+    except Exception:  # noqa: BLE001 - no usable target: unknown, never agreeing
+        connect = None
+    if connect is None:
+        return []  # no target to read: Start CDC's connection checks stop it first
+    read = target_generated_columns_of([t.name for t in tables], connection_factory=connect)
     mismatched: list = []
     for table in tables:
         expected = set(target_generated_capture_columns(table, applied))
-        ddl = getattr((applied or {}).get(table.name), "target_ddl", None)
-        if not expected and not (ddl and parse_target_generated_columns(ddl)) and not (
-            pg_preserved_generated_columns(table)
-        ):
-            continue  # nothing generated on either side: nothing to disagree about
-        if connect is None:
-            try:
-                connect = _cdc_fk_connection_factory(session)
-            except Exception:  # noqa: BLE001 - no usable target: unknown, never agreeing
-                connect = None
-        live = (
-            target_generated_columns(table.name, connection_factory=connect)
-            if connect is not None
-            else None
-        )
-        if live is None:
-            mismatched.append((table.name, sorted(expected), None))
+        if table.name in read.unreadable:
+            # Unknown is never taken as agreeing where CDC leaves a column out; a table
+            # with nothing generated in Schema Conversion is not held on an unread catalog.
+            if expected:
+                mismatched.append((table.name, sorted(expected), None))
             continue
-        keys = set(getattr(table, "primary_key", None) or ())
-        by_lower = {c.name.lower(): c.name for c in table.columns}
-        live_source = {
-            name if name in by_lower.values() else by_lower.get(name.lower(), name)
-            for name in live
-        } - keys
-        if live_source != expected:
-            mismatched.append((table.name, sorted(expected), sorted(live_source)))
+        if table.name in read.missing:
+            mismatched.append((table.name, sorted(expected), _TARGET_TABLE_MISSING))
+            continue
+        exact = {c.name for c in table.columns}
+        folded: dict[str, list[str]] = {}
+        for column in table.columns:
+            folded.setdefault(column.name.lower(), []).append(column.name)
+        live: set[str] = set()
+        for name in read.columns[table.name]:
+            if name in exact:
+                live.add(name)
+            elif len(folded.get(name.lower(), ())) == 1:
+                live.add(folded[name.lower()][0])
+        live -= set(getattr(table, "primary_key", None) or ())
+        if live != expected:
+            mismatched.append((table.name, sorted(expected), sorted(live)))
     return mismatched
 
 
-def _cdc_generated_mismatch_notice(mismatched) -> tuple:
+def _cdc_generated_mismatch_notice(mismatched, *, is_pg: bool = False) -> tuple:
     """The Start CDC refusal for :func:`_probe_cdc_generated_mismatch`."""
+    unreadable = [t for t, _e, live in mismatched if live is None]
+    missing = [t for t, _e, live in mismatched if live == _TARGET_TABLE_MISSING]
+    differing = [
+        (t, e, live) for t, e, live in mismatched
+        if live is not None and live != _TARGET_TABLE_MISSING
+    ]
+
+    def _listed(names) -> str:
+        return ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+
+    # The tables Start CDC could not check, said apart from a real difference: an unread
+    # catalog wants the connection checked, a missing table an apply -- never a Replace.
+    unchecked = []
+    if missing:
+        unchecked.append(
+            f"{_listed(missing)} {'does' if len(missing) == 1 else 'do'} not exist on the "
+            "target, so CDC would dead-letter every change to "
+            f"{'it' if len(missing) == 1 else 'them'}: apply "
+            f"{'it' if len(missing) == 1 else 'them'} from Schema Conversion (or leave "
+            f"{'it' if len(missing) == 1 else 'them'} out of the selection)."
+        )
+    if unreadable:
+        unchecked.append(
+            f"Start CDC could not read the columns of {_listed(unreadable)} on the target, so "
+            "it cannot tell whether CDC would write a column the target computes: check the "
+            "target connection and Start CDC again."
+        )
     lines = []
-    for table, expected, live in mismatched[:5]:
-        if live is None:
-            lines.append(f"{table}: the target's columns could not be read")
-            continue
+    for table, expected, live in differing[:5]:
         left_out = [c for c in expected if c not in live]
         sent = [c for c in live if c not in expected]
         parts = []
@@ -7937,15 +7988,41 @@ def _cdc_generated_mismatch_notice(mismatched) -> tuple:
                 "(every change would be refused, 428C9)"
             )
         lines.append(f"{table}: " + "; ".join(parts))
-    more = f" (and {len(mismatched) - 5} more)" if len(mismatched) > 5 else ""
+    if len(differing) > 5:
+        lines.append(f"and {len(differing) - 5} more")
+    if not differing:
+        return (
+            "error",
+            "functions",
+            "The target's generated columns could not be verified"
+            if unreadable
+            else "A captured table does not exist on the target"
+            if len(missing) == 1
+            else "Captured tables do not exist on the target",
+            " ".join(unchecked) + " Nothing was changed.",
+        )
+    remedy = (
+        " For a column Schema Conversion makes GENERATED: re-create the table from that DDL "
+        "and reload it with Full Load's per-table 'Drop & reload' (a Replace in Schema "
+        "Conversion would empty the loaded table)"
+        + (
+            "; editing the DDL back to ordinary does not help on a PostgreSQL source, which "
+            "never publishes a generated column, so CDC would leave the column stale."
+            if is_pg
+            else ", or edit the DDL back to ordinary if CDC should write it."
+        )
+        + " For a column only the target computes: make the Schema Conversion DDL match it "
+        "(GENERATED ALWAYS AS (...) STORED), or make the target column ordinary (ALTER "
+        "TABLE ... ALTER COLUMN ... DROP EXPRESSION)."
+    )
     return (
         "error",
         "functions",
         "The target's generated columns differ from Schema Conversion",
         "CDC leaves out the columns the target computes, read from the Schema Conversion "
-        "DDL, but the target does not match it: " + "; ".join(lines) + more + ". Apply the "
-        "table again from Schema Conversion (Replace), or edit its DDL back to what the "
-        "target has, then Start CDC. Nothing was changed.",
+        "DDL, but the target does not match it: " + "; ".join(lines) + "." + remedy
+        + "".join(" " + sentence for sentence in unchecked)
+        + " Nothing was changed.",
     )
 
 
@@ -8718,7 +8795,10 @@ def _start_cdc_deploy(
         if _generated_mismatch:
             raise _start_refusal(
                 migration_state,
-                _cdc_generated_mismatch_notice(_generated_mismatch),
+                _cdc_generated_mismatch_notice(
+                    _generated_mismatch,
+                    is_pg=_is_pg_start,
+                ),
                 getattr(handle, "job_id", None),
             )
         # BACKSTOP for the PostgreSQL publication/slot precondition, on the worker thread

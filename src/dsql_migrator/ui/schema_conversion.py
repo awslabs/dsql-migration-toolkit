@@ -830,7 +830,7 @@ def render_source_table_ddl(
         # kind; an inventory read before that was captured only says so -- emitting
         # invented syntax would make the source DDL lie.
         if column.generated:
-            expression = getattr(column, "generated_expression", None)
+            expression = getattr(column, "mysql_generated_expression", None)
             clause += (
                 f" GENERATED ALWAYS AS ({expression}) {column.generated_kind or 'STORED'}"
                 if expression

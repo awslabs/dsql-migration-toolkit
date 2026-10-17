@@ -2402,8 +2402,9 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
         if not cdc_only:
             generated += (
                 " Then backfill the rows already set aside: stop CDC and reload the table with "
-                "'Drop & reload' after removing GENERATED from its target DDL in Schema "
-                "Conversion."
+                "'Drop & reload'. If you made the column ordinary, first remove GENERATED from "
+                "its target DDL in Schema Conversion as well, or the reload recreates it "
+                "GENERATED; if it stays GENERATED, reload it as it is."
             )
         else:
             generated += (

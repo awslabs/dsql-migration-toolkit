@@ -885,7 +885,7 @@ def enrich_columns(
                 )
                 expression = expression_by_column.get((table.name, column.name))
                 if expression:
-                    column.generated_expression = expression
+                    column.mysql_generated_expression = expression
             if "on update" in extra_text:
                 column.auto_update_timestamp = True
             # MySQL flags an EXPRESSION default (as opposed to a literal) with

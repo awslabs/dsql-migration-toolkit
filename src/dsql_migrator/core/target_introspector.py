@@ -863,6 +863,72 @@ def target_generated_columns(
         _safe_close(connection)
 
 
+@dataclass(frozen=True)
+class GeneratedColumnsRead:
+    """What :func:`target_generated_columns_of` read: each existing table's generated
+    columns, the tables that do not exist, and those whose catalog could not be read."""
+
+    columns: "dict[str, set[str]]"
+    missing: "tuple[str, ...]" = ()
+    unreadable: "tuple[str, ...]" = ()
+
+
+def target_generated_columns_of(
+    table_names: Sequence[str],
+    *,
+    connection_factory: Callable[[], Any],
+) -> GeneratedColumnsRead:
+    """The bulk twin of :func:`target_generated_columns`, over ONE connection: a DSQL
+    connect mints an IAM token and does a TLS handshake, and Start CDC read every captured
+    table this way. A missing table is told apart from an unreadable one (a connection
+    failure makes every table unreadable)."""
+    columns: dict[str, set[str]] = {}
+    missing: list[str] = []
+    unreadable: list[str] = []
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> every table unreadable
+        return GeneratedColumnsRead(columns={}, unreadable=tuple(table_names))
+    try:
+        for table_name in table_names:
+            parts = table_name.split(".", 1)
+            if len(parts) == 2:
+                where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+                params: dict[str, object] = {"schema": parts[0], "table": parts[1]}
+            else:
+                where_relation = "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+                params = {"table": parts[0]}
+            cursor = None
+            try:
+                cursor = connection.cursor()
+                cursor.execute(
+                    "SELECT a.attname, a.attgenerated "
+                    "FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                    "  AND a.attnum > 0 AND NOT a.attisdropped "
+                    f"WHERE {where_relation}",
+                    params,
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    missing.append(table_name)
+                    continue
+                columns[table_name] = {
+                    str(row[0]) for row in rows if row and row[0] and row[1] not in (None, "")
+                }
+            except Exception:  # noqa: BLE001 - unreadable catalog -> unknown for this one
+                unreadable.append(table_name)
+            finally:
+                if cursor is not None:
+                    _safe_close(cursor)
+    finally:
+        _safe_close(connection)
+    return GeneratedColumnsRead(
+        columns=columns, missing=tuple(missing), unreadable=tuple(unreadable)
+    )
+
+
 def target_primary_keys(
     table_names: Sequence[str],
     *,

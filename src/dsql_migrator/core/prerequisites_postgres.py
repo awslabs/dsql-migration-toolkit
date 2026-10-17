@@ -236,6 +236,7 @@ def uncarryable_columns_of(table: TableDef) -> "list[UncarryableCdcColumn]":
                     declared_type=column.mysql_type,
                     reason=reason,
                     nullable=column.nullable,
+                    in_event=is_array and base == "bit",
                 )
             )
     return found
@@ -292,6 +293,10 @@ class UncarryableCdcColumn:
     # NOT NULL on the source (and so on the target): a column left out of the change event
     # then has every insert and update refused (23502), not landed NULL. None: not read.
     nullable: Optional[bool] = None
+    # The column stays IN the change event as a field Debezium failed to convert (a
+    # bit(n)[], whatever its declared name -- a domain over one included). None: judged
+    # from ``declared_type``.
+    in_event: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1259,10 @@ def check_columns_replicable(
       append reload only inserts primary keys the target is missing and so cannot rewrite
       the NULL a row already carries -- and Validation reports it meanwhile.
 
+    The one exception is a NOT NULL bit(n)[] (:func:`connector_stopping_columns`): it stops
+    the source connector, so CDC halts for every captured table -- the TABLE_REPLICABLE
+    consequence, graded FAIL / required like it.
+
     The silent class is WARN rather than INFO for the opposite reason: ``INFO`` means
     expected / optional / no action needed, and a column that arrives NULL with no error is
     none of those -- it fails the table's CHECKSUM, which the cut-over gate reads.
@@ -1283,11 +1292,14 @@ def check_columns_replicable(
     detail, remediation = uncarryable_column_texts(
         found, defaulted=target_defaulted_columns(table)
     )
+    # A column that stops the source connector halts CDC for EVERY captured table, as an
+    # UNLOGGED table aborts the whole publication: graded like TABLE_REPLICABLE.
+    blocks_all = bool(connector_stopping_columns(found))
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
         title=_COLUMN_REPLICABLE_TITLE,
-        status=PrerequisiteStatus.WARN,
-        required=False,
+        status=PrerequisiteStatus.FAIL if blocks_all else PrerequisiteStatus.WARN,
+        required=blocks_all,
         target=table.name,
         detail=detail,
         remediation=remediation,
@@ -1307,6 +1319,31 @@ def target_defaulted_columns(table: TableDef) -> "set[str]":
     }
 
 
+def _stays_in_event(column: UncarryableCdcColumn) -> bool:
+    """A column that arrives NULL because it stays IN the change event as a field Debezium
+    failed to convert (a bit(n)[]), rather than being left out of it."""
+    if column.in_event is not None:
+        return column.in_event
+    return _catalog_discriminators(column.declared_type)[:2] == (True, "bit")
+
+
+def connector_stopping_columns(
+    found: "Sequence[UncarryableCdcColumn]",
+) -> "list[UncarryableCdcColumn]":
+    """The columns of ``found`` that stop the PostgreSQL source connector -- and so CDC for
+    every captured table -- at the first change to their table. A bit(n)[] stays IN the
+    event as a field Debezium failed to convert: a nullable one is NULL on every insert and
+    update, but a NOT NULL one is a required field left null, and
+    ``event.processing.failure.handling.mode`` defaults to fail -- nothing is dead-lettered.
+    Pure."""
+    return [
+        c for c in found
+        if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL
+        and _stays_in_event(c)
+        and c.nullable is False
+    ]
+
+
 def uncarryable_column_texts(
     found: "Sequence[UncarryableCdcColumn]",
     *,
@@ -1319,12 +1356,8 @@ def uncarryable_column_texts(
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
     has_default = set(defaulted)
     lost = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
-    # A bit(n)[] stays IN the event, as a field Debezium failed to convert: a nullable one
-    # is NULL on every insert and update, but a NOT NULL one is a required field left null,
-    # which stops the PostgreSQL source connector (event.processing.failure.handling.mode
-    # defaults to fail) -- nothing is dead-lettered, and every captured table stops.
-    present = [c for c in lost if _catalog_discriminators(c.declared_type)[:2] == (True, "bit")]
-    stopped = [c for c in present if c.nullable is False]
+    present = [c for c in lost if _stays_in_event(c)]
+    stopped = connector_stopping_columns(found)
     nulled_always = [c for c in present if c.nullable is not False]
     # The others are left OUT of the event, so the sink's upsert never names them: an
     # insert takes the column's DEFAULT (or NULL) and an update leaves it as it was -- but
@@ -1384,7 +1417,7 @@ def uncarryable_column_texts(
             f"{'arrives' if len(wrong) == 1 else 'arrive'} with a different value than "
             "Full Load writes for the same row."
         )
-    if nulled or wrong:
+    if nulled or nulled_always or landed_default or wrong:
         sentences.append(
             "That column-level loss is SILENT: the row lands, nothing is dead-lettered, "
             "nothing is logged, and only a Validation CHECKSUM can see it."
@@ -1419,10 +1452,16 @@ def uncarryable_column_texts(
         "carries every one of these), or leave this table out of the selection and "
         "migrate it with Full Load only -- the capture set follows the table "
         "selection, so there is no per-table \"load but do not stream\" switch. "
-        "Accepting it is also a valid choice: every other table streams normally, "
-        "Validation will report this one as a mismatch, and the table is made correct "
-        "again by stopping writes to it and using the Full Load step's per-table "
-        "Reload before you cut over."
+        + (
+            # Not for a column that stops the source connector: no table streams then.
+            "Accepting it is also a valid choice: every other table streams normally, "
+            "Validation will report this one as a mismatch, and the table is made correct "
+            "again by stopping writes to it and using the Full Load step's per-table "
+            "Reload before you cut over."
+            if not stopped
+            else "Do not accept it as it is: the first change to the table stops CDC for "
+            "every captured table."
+        )
     )
     return " ".join(sentences), remediation
 

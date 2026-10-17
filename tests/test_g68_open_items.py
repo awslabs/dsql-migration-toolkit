@@ -65,7 +65,10 @@ def test_a_mysql_generated_columns_expression_is_read_and_shown() -> None:
     enrich_columns(_FakeConnection(rows), "app", tables)
     total = tables[0].columns[3]
     assert total.generated and total.generated_kind == "STORED"
-    assert total.generated_expression == "(`price` * `qty`)"
+    assert total.mysql_generated_expression == "(`price` * `qty`)"
+    # MySQL syntax, never the field a PostgreSQL STORED column is re-emitted (and left out
+    # of CDC and Full Load writes) from.
+    assert total.generated_expression is None
     assert "total AS (`price` * `qty`)" in mysql_generated_column_detail(tables[0])
     assert mysql_generated_column_advice(tables[0]) == MYSQL_GENERATED_COLUMN_ADVICE_READ
     assert "SHOW CREATE TABLE" not in MYSQL_GENERATED_COLUMN_ADVICE_READ
@@ -73,7 +76,7 @@ def test_a_mysql_generated_columns_expression_is_read_and_shown() -> None:
     # A six-column row (an older reader / test double) still works: nothing captured.
     older = [TableDef(name="orders", columns=[ColumnDef(name="total", mysql_type="INT")])]
     enrich_columns(_FakeConnection([("orders", "total", None, "STORED GENERATED", "int", None)]), "app", older)
-    assert older[0].columns[0].generated and older[0].columns[0].generated_expression is None
+    assert older[0].columns[0].generated and older[0].columns[0].mysql_generated_expression is None
 
 
 def test_a_mysql_view_is_graded_by_its_conversion_at_both_steps() -> None:
