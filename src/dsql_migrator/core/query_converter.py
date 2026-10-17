@@ -56,7 +56,11 @@ import sqlglot
 from sqlglot import exp
 from pydantic import BaseModel, ConfigDict, Field
 
-from dsql_migrator.core.converter import MYSQL_EXPRESSION_DIALECT, rewrite_mysql_expressions
+from dsql_migrator.core.converter import (
+    MYSQL_EXPRESSION_DIALECT,
+    inline_having_aliases,
+    rewrite_mysql_expressions,
+)
 from dsql_migrator.core.models import Classification, SourceType
 
 _MYSQL = "mysql"
@@ -367,75 +371,8 @@ def _rewrite_json_unquote(tree: exp.Expression) -> list[QueryWarning]:
 
 
 def _inline_having_aliases(tree: exp.Expression, *, case_insensitive: bool = True) -> None:
-    """Inline SELECT-list aliases referenced in ``HAVING`` (MySQL -> PostgreSQL).
-
-    MySQL lets a ``HAVING`` clause reference a column ALIAS defined in the SELECT
-    list (e.g. ``SELECT SUM(x) AS total ... HAVING total > 10``). PostgreSQL /
-    Aurora DSQL do NOT: ``HAVING`` may only reference grouped columns or aggregate
-    expressions, so the alias resolves to nothing and the target rejects the
-    statement with ``column "total" does not exist``. (``ORDER BY`` may use output
-    aliases on both engines, so it is intentionally left untouched.)
-
-    For each ``SELECT`` that has a ``HAVING``, this replaces any unqualified column
-    in ``HAVING`` whose name matches a SELECT-list alias with a copy of that
-    alias's underlying expression, so the predicate runs on DSQL. A qualified
-    reference (``t.col``) is never treated as an output alias. Done in place on the
-    parsed tree before rendering; formatting/semantics of the predicate are
-    preserved (the aggregate expression is simply written out in full).
-    """
-    def key(identifier: object) -> str:
-        # MySQL resolves a column alias whatever its case; PostgreSQL folds an unquoted
-        # name and keeps a quoted one as written.
-        name = getattr(identifier, "name", "") or ""
-        if case_insensitive or not getattr(identifier, "quoted", False):
-            return name.translate(_ASCII_FOLD)
-        return name
-
-    for select in tree.find_all(exp.Select):
-        having = select.args.get("having")
-        if having is None:
-            continue
-        aliases = {
-            key(projection.args.get("alias")): projection.this
-            for projection in select.expressions
-            if isinstance(projection, exp.Alias)
-        }
-        if not aliases:
-            continue
-        # A HAVING name that is also a GROUP BY column means that column (MySQL's documented
-        # preference), never the alias -- when the GROUP BY name IS a FROM column: a
-        # qualified one always is; a bare one is, unless it is the alias itself (GROUP BY
-        # day over DATE(created_at) AS day groups by the alias, and HAVING day means it
-        # too) -- an alias whose own expression reads a column of that name tells us the
-        # FROM clause has one (COALESCE(region, 'n/a') AS region ... GROUP BY region).
-        group = select.args.get("group")
-        grouped: set = set()
-        for c in group.expressions if group is not None else []:
-            if not isinstance(c, exp.Column):
-                continue
-            name = key(c.args.get("this"))
-            expression = aliases.get(name)
-            if (
-                c.table
-                or expression is None
-                or any(key(read.args.get("this")) == name for read in expression.find_all(exp.Column))
-            ):
-                grouped.add(name)
-        for column in list(having.find_all(exp.Column)):
-            # A qualified column (table.col) is a real column reference, never an
-            # output alias; only bare names can shadow a SELECT-list alias -- and not
-            # inside an aggregate's argument (MySQL reads that name from FROM) or a
-            # nested query.
-            if column.table:
-                continue
-            if column.find_ancestor(exp.AggFunc, exp.Select) is not select:
-                continue
-            name = key(column.args.get("this"))
-            if name in grouped:
-                continue
-            replacement = aliases.get(name)
-            if replacement is not None:
-                column.replace(replacement.copy())
+    """MySQL's HAVING aliases inlined as a view's are: :func:`inline_having_aliases`."""
+    inline_having_aliases(tree, case_insensitive=case_insensitive)
 
 
 def _mysql_expression_warnings(
@@ -675,21 +612,28 @@ def _from_items(select: exp.Expression) -> "list[exp.Expression]":
         items.extend(j.this for j in (select.args.get("joins") or []))
     out: list = []
     for item in items:
-        out.extend(_source_items(item))
+        if isinstance(item, exp.Expression):
+            out.extend(_source_items(item))
     return out
 
 
 def _is_join_container(item: Optional[exp.Expression]) -> bool:
     """A parenthesised join -- (b JOIN c) reads as Subquery(Table(b, joins=[...])), and
-    ((b JOIN c) JOIN d) as Subquery(Subquery(...), joins=[...]) -- not a derived table."""
-    return isinstance(item, exp.Subquery) and isinstance(item.this, (exp.Table, exp.Subquery))
+    ((b JOIN c) JOIN d) as Subquery(Subquery(...), joins=[...]) -- not a derived table:
+    no alias, and a table at the bottom (``((SELECT ...)) AS x`` is a derived table)."""
+    if not isinstance(item, exp.Subquery) or item.args.get("alias"):
+        return False
+    inner = item.this
+    while isinstance(inner, exp.Subquery) and not inner.args.get("alias"):
+        inner = inner.this
+    return isinstance(inner, exp.Table)
 
 
 def _source_items(item: Optional[exp.Expression]) -> "list[exp.Expression]":
     """The sources one FROM entry brings into scope, in order: a table (and the tables it
     joins), a derived table, a LATERAL, and a parenthesised join's own entries."""
     out: list = []
-    pending = [item] if item is not None else []
+    pending = [item] if isinstance(item, exp.Expression) else []
     while pending:
         current = pending.pop(0)
         if _is_join_container(current):
@@ -810,15 +754,13 @@ class _Scopes:
         return self._ctes[("above", id(scope))]
 
     def outputs(self, query, alias) -> "Optional[set]":
-        """The output keys of a derived table or CTE -- ``None`` when it puts out a ``*``
-        (what it returns is a real table's columns, unknown here)."""
+        """The output keys of a derived table or CTE: its explicit labels, as an
+        :class:`_OpenOutputs` when it also puts out a ``*`` (more columns, a real table's,
+        unknown here)."""
         memo = id(alias) if alias is not None else id(query)
         if memo not in self._outputs:
-            self._outputs[memo] = (
-                None
-                if _projects_star(query, alias)
-                else {_key(i) for i in _output_identifiers(query, alias) if i.name}
-            )
+            labels = {_key(i) for i in _output_identifiers(query, alias) if i.name}
+            self._outputs[memo] = _OpenOutputs(labels) if _projects_star(query, alias) else labels
         return self._outputs[memo]
 
     def source_outputs(self, item: Optional[exp.Expression]) -> "Optional[set]":
@@ -876,6 +818,29 @@ class _Scopes:
                     return True, self.source_outputs(item)
             scope = self.scope_of(scope)
         return False, None
+
+
+class _OpenOutputs(set):
+    """A derived table's / CTE's explicit labels when it also puts out ``*``: a name among
+    them is its own (MySQL refuses a duplicate column there), any other may be a real
+    table's column."""
+
+
+def _holds(outputs: "Optional[set]", key: str) -> "Optional[bool]":
+    """Whether a source puts out ``key``: True / False when known, None when it may (a
+    real table, or a ``*`` beyond its explicit labels)."""
+    if outputs is None:
+        return None
+    if key in outputs:
+        return True
+    return None if isinstance(outputs, _OpenOutputs) else False
+
+
+def _own_name(sources: "list", key: str) -> bool:
+    """``key`` is a name only the statement's own sources put out: one holds it and none
+    may hold it unseen."""
+    held = [_holds(o, key) for o in sources]
+    return bool(held) and any(h is True for h in held) and all(h is not None for h in held)
 
 
 def _projects_star(query: Optional[exp.Expression], alias: Optional[exp.Expression]) -> bool:
@@ -961,7 +926,9 @@ def _mixed_case_names(
         this = table.args.get("this")
         if _is_dual_keyword(table):
             continue
-        if id(table) in delete_targets and _key(this) in scopes.aliases:
+        if id(table) in delete_targets and (
+            _key(this) in scopes.aliases or (this.name or "").upper() in _DELETE_MODIFIERS
+        ):
             continue
         if (
             not table.args.get("db")
@@ -992,12 +959,7 @@ def _mixed_case_names(
             left.append(scopes.source_outputs(item))
         for part in using:
             key = _key(part)
-            if (
-                right and left
-                and all(o is not None for o in right + left)
-                and any(key in o for o in right)
-                and any(key in o for o in left)
-            ):
+            if right and left and _own_name(right, key) and _own_name(left, key):
                 continue  # only the statement's own outputs, on both sides
             _flag(part)
     for column in tree.find_all(exp.Column):
@@ -1056,10 +1018,12 @@ def _mixed_case_names(
                     continue  # MySQL's UTC clock written without parentheses
                 scope = scopes.scope_of(column)
                 sources = [scopes.source_outputs(i) for i in scopes.items(scope)] if scope is not None else []
-                if sources and all(o is not None for o in sources) and any(
-                    key in o for o in sources
-                ):
+                if _own_name(sources, key):
                     continue  # only the statement's own outputs are in scope
+                folded = key.translate(_ASCII_FOLD)
+                if this.quoted and folded != key and _own_name(sources, folded):
+                    _mismatch(this)  # `UserId` over an unquoted derived output UserId
+                    continue
         _flag(this)
     return names
 
@@ -1178,42 +1142,66 @@ def _quote_mismatch_warning(names: "Sequence[str]") -> "Optional[QueryWarning]":
 
 
 def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Optional[QueryWarning]":
-    """MANUAL when two FROM items in one scope, or in a scope and one enclosing it, carry
-    unquoted aliases that differ only by case (orders o ... (SELECT ... FROM orders O WHERE
-    O.cid = o.cid)): MySQL keeps table aliases apart by case, Aurora DSQL folds both to
-    one -- the inner one captures the outer reference, so a correlated subquery compares a
-    row with itself and returns other rows, with no error."""
-    visible: dict[int, dict[str, str]] = {}
-    clashes: list[tuple[str, str]] = []
+    """MANUAL when unquoted table aliases that differ only by case meet where Aurora DSQL
+    folds them into one: two in one FROM ('table name specified more than once'), or a
+    reference MySQL resolves to one and Aurora DSQL to the other -- (SELECT ... FROM orders
+    O WHERE O.cid = o.cid) under FROM orders o: MySQL keeps table aliases apart by case,
+    so o is the outer row; folded, the inner O captures it, and the correlated subquery
+    compares a row with itself, returning other rows with no error. Aliases in scopes no
+    reference crosses (a CTE body, an uncorrelated subquery) never meet."""
 
-    def spelling(item: exp.Expression) -> "Optional[tuple[str, str]]":
+    def spelling(item: exp.Expression) -> "Optional[str]":
         alias = item.args.get("alias")
         identifier = alias.this if isinstance(alias, exp.TableAlias) else (
             item.args.get("this") if isinstance(item, exp.Table) and alias is None else None
         )
         if not isinstance(identifier, exp.Identifier) or identifier.quoted or not identifier.name:
             return None
-        return _key(identifier), identifier.name
+        return identifier.name
 
-    # Scopes top-down (an enclosing one before those inside it): each sees its own items
-    # and what the scopes around it see.
+    clashes: list[tuple[str, str]] = []
+
+    def clash(first: str, second: str) -> None:
+        if (first, second) not in clashes and (second, first) not in clashes:
+            clashes.append((first, second))
+
     for node in tree.walk(bfs=True):
         if not isinstance(node, _SCOPE_NODES):
             continue
-        outer = scopes.scope_of(node)
-        seen = dict(visible.get(id(outer), {})) if outer is not None else {}
-        own: dict[str, str] = {}
+        seen: dict[str, str] = {}
         for item in scopes.items(node):
-            found = spelling(item)
-            if found is None:
+            name = spelling(item)
+            if name is None:
                 continue
-            key, name = found
-            other = own.get(key) or seen.get(key)
-            if other is not None and other != name and (other, name) not in clashes and (name, other) not in clashes:
-                clashes.append((other, name))
-            own.setdefault(key, name)
-        seen.update(own)
-        visible[id(node)] = seen
+            other = seen.setdefault(_key(item.args.get("alias") or item.args.get("this")), name)
+            if other != name:
+                clash(other, name)
+    for column in tree.find_all(exp.Column):
+        qualifier = column.args.get("table")
+        if (
+            not isinstance(qualifier, exp.Identifier)
+            or qualifier.quoted
+            or column.args.get("db") is not None
+        ):
+            continue
+        written, folded = qualifier.name, _key(qualifier)
+        mysql_item = postgres_item = None
+        scope = scopes.scope_of(column)
+        while scope is not None and (mysql_item is None or postgres_item is None):
+            for item in scopes.items(scope):
+                name = spelling(item)
+                if name is None:
+                    continue
+                if mysql_item is None and name == written:
+                    mysql_item = item
+                if postgres_item is None and _key(
+                    item.args.get("alias").this if isinstance(item.args.get("alias"), exp.TableAlias)
+                    else item.args.get("this")
+                ) == folded:
+                    postgres_item = item
+            scope = scopes.scope_of(scope)
+        if mysql_item is not None and postgres_item is not None and mysql_item is not postgres_item:
+            clash(written, spelling(postgres_item) or written)
     if not clashes:
         return None
     first, second = clashes[0]
@@ -1228,6 +1216,9 @@ def _case_only_alias_warning(tree: exp.Expression, scopes: "_Scopes") -> "Option
             "specified more than once'). Rename one of them."
         ),
     )
+
+
+_DELETE_MODIFIERS = frozenset({"LOW_PRIORITY", "QUICK", "IGNORE"})
 
 
 def _mysql_only_dml_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
@@ -1247,17 +1238,43 @@ def _mysql_only_dml_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
         for assignment in update.expressions:
             column = assignment.this if isinstance(assignment, exp.EQ) else None
             if isinstance(column, exp.Column) and column.table and _key(column.args.get("table")) in own:
-                column.set("table", None)  # SET o.status = ...: the target's own column
+                # SET o.status = ... / SET db.orders.status = ...: the target's own column.
+                for part in ("table", "db", "catalog"):
+                    column.set(part, None)
+    modifiers: list[str] = []
     for delete in tree.find_all(exp.Delete):
         using = delete.args.get("using")
         target = delete.this
-        if delete.args.get("tables") or (
+        if not isinstance(target, exp.Expression):
+            # DELETE t WHERE ... (no FROM): neither engine's syntax.
+            return QueryWarning(
+                code=CODE_MULTI_TABLE_DML,
+                classification=Classification.MANUAL,
+                message=(
+                    "DELETE without FROM is not MySQL's or PostgreSQL's syntax: write DELETE "
+                    "FROM t WHERE ... before running the statement."
+                ),
+            )
+        listed = [t for t in delete.args.get("tables") or [] if isinstance(t, exp.Table)]
+        # MySQL's DELETE LOW_PRIORITY / QUICK / IGNORE FROM t: modifiers, no tables.
+        named = [t for t in listed if t.name.upper() not in _DELETE_MODIFIERS or t.args.get("db")]
+        modifiers += [t.name.upper() for t in listed if t not in named and t.name.upper() not in modifiers]
+        if named or (
             isinstance(using, list)
             and isinstance(target, exp.Table)
             and any(_item_key(i) == _item_key(target) for u in using for i in _source_items(u))
         ):
             if "DELETE t FROM ... JOIN" not in shapes:
                 shapes.append("DELETE t FROM ... JOIN")
+    if modifiers and not shapes:
+        return QueryWarning(
+            code=CODE_MULTI_TABLE_DML,
+            classification=Classification.MANUAL,
+            message=(
+                f"DELETE {' / '.join(modifiers)} is a MySQL modifier PostgreSQL has no form "
+                "for: remove it (DELETE FROM t WHERE ...) before running the statement."
+            ),
+        )
     if not shapes:
         return None
     return QueryWarning(

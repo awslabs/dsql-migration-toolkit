@@ -29,7 +29,7 @@ def _convert(sql: str):
          "HAVING customer_id > 100"),
         # A qualified GROUP BY column is a FROM column: it wins over the alias, as in MySQL.
         ("SELECT COALESCE(s.region, 'n/a') AS region, SUM(s.amount) AS total FROM sales s "
-         "GROUP BY s.region HAVING region IS NOT NULL", "HAVING NOT region IS NULL"),
+         "GROUP BY s.region HAVING region IS NOT NULL", "HAVING NOT s.region IS NULL"),  # G98: qualified
         # The alias reads a column of its own name: the FROM clause has it.
         ("SELECT COALESCE(region, 'n/a') AS region, SUM(amount) AS t FROM sales GROUP BY region "
          "HAVING region IS NOT NULL", "HAVING NOT region IS NULL"),
