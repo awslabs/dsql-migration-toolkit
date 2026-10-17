@@ -2584,6 +2584,7 @@ def build_schema_conversion_screen(
 
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
+                    set_result_if_unchanged,
                     with_refreshed_catalogs,
                 )
 
@@ -2609,17 +2610,25 @@ def build_schema_conversion_screen(
                     # The assessment and the name conflicts are recomputed from the re-read
                     # inventory -- graded by the engine it was just read with -- off the
                     # event loop (it scales with the schema); every other field is copied.
-                    eval_state.set_result(
-                        await _run.io_bound(
-                            with_refreshed_catalogs,
-                            old_result,
-                            inventory=new_inventory,
-                            target_inventory=old_result.target_inventory,
-                            target_endpoint=old_result.target_endpoint,
-                            source_type=source_conn.source_type,
-                            vanished=list(getattr(introspector, "last_vanished", None) or []),
-                        )
+                    refreshed = await _run.io_bound(
+                        with_refreshed_catalogs,
+                        old_result,
+                        inventory=new_inventory,
+                        target_inventory=old_result.target_inventory,
+                        target_endpoint=old_result.target_endpoint,
+                        source_type=source_conn.source_type,
+                        vanished=list(getattr(introspector, "last_vanished", None) or []),
                     )
+                    # Applied only over the result it was computed from: an Evaluation that
+                    # finished while this ran is newer, and must not be overwritten.
+                    if not set_result_if_unchanged(eval_state, old_result, refreshed):
+                        ui.notify(  # type: ignore[attr-defined]
+                            "A newer evaluation finished meanwhile; the refresh was not "
+                            "applied over it.",
+                            type="warning",
+                        )
+                        refresh()
+                        return
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]
                 refresh()
 
@@ -2636,6 +2645,7 @@ def build_schema_conversion_screen(
 
                 from dsql_migrator.ui.evaluation import (
                     _default_target_browser_factory,
+                    set_result_if_unchanged,
                     with_refreshed_catalogs,
                 )
 
@@ -2656,18 +2666,18 @@ def build_schema_conversion_screen(
                     return
                 old_result = eval_state.result
                 if old_result is not None:
-                    eval_state.set_result(
-                        await _run.io_bound(
-                            with_refreshed_catalogs,
-                            old_result,
-                            inventory=old_result.inventory,
-                            target_inventory=new_target,
-                            # Re-stamp: this catalog was just read from the CURRENT
-                            # cluster, so without it the pair would stay flagged stale
-                            # forever and the refresh would fix nothing.
-                            target_endpoint=target_conn.cluster_endpoint,
-                        )
+                    refreshed = await _run.io_bound(
+                        with_refreshed_catalogs,
+                        old_result,
+                        inventory=old_result.inventory,
+                        target_inventory=new_target,
+                        # Re-stamp: this catalog was just read from the CURRENT
+                        # cluster, so without it the pair would stay flagged stale
+                        # forever and the refresh would fix nothing.
+                        target_endpoint=target_conn.cluster_endpoint,
                     )
+                    # Never over a newer Evaluation that finished while this ran.
+                    set_result_if_unchanged(eval_state, old_result, refreshed)
                 # The target catalog just changed, so drop the cached applier (its browsed
                 # existence snapshot is now stale) -- the next apply rebuilds and re-browses.
                 _applier_cache.clear()

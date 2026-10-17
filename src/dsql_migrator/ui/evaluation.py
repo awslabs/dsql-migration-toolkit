@@ -1086,6 +1086,18 @@ def run_evaluation(
     )
 
 
+def set_result_if_unchanged(
+    eval_state: "EvaluationState", expected: "Optional[EvaluationResult]", result: EvaluationResult
+) -> bool:
+    """Store ``result`` only while ``expected`` is still the current result -- a refresh
+    computed from an older result must not overwrite an Evaluation that finished while it
+    ran. Returns whether it was stored."""
+    if eval_state.result is not expected:
+        return False
+    eval_state.set_result(result)
+    return True
+
+
 def describe_source(
     config: "Optional[SourceConnectionConfig]", engine: Optional[str] = None
 ) -> Optional[str]:

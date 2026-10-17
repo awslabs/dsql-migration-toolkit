@@ -2846,3 +2846,19 @@ def test_a_report_of_another_source_says_so_and_an_empty_one_names_its_database(
     same = _ItemUi()
     _render_result(same, result, eval_state=EvaluationState(), live_source="db.example:3306/shop")
     assert "This report describes another source" not in same.texts
+
+
+def test_a_refresh_never_overwrites_a_newer_evaluation() -> None:
+    """refresh_source / refresh_target / the Data Migration refresh stored their result
+    after an await without checking: an Evaluation that finished meanwhile was replaced
+    by a refresh of the older one."""
+    from dsql_migrator.ui.evaluation import set_result_if_unchanged
+
+    state = EvaluationState()
+    old, newer, refreshed = _result(), _result(), _result()
+    state.set_result(old)
+    state.set_result(newer)  # a re-run finished while the refresh read the catalogs
+    assert set_result_if_unchanged(state, old, refreshed) is False
+    assert state.result is newer
+    assert set_result_if_unchanged(state, newer, refreshed) is True
+    assert state.result is refreshed

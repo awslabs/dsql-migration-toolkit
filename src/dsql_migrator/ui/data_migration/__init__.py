@@ -1627,21 +1627,30 @@ def build_data_migration_screen(
                 # The assessment is recomputed with both catalogs (the database-level
                 # limits count the target too), graded by the engine the inventory was
                 # just read with, off the event loop; every other field is copied.
-                eval_state.set_result(
-                    await _run.io_bound(
-                        with_refreshed_catalogs,
-                        current,
-                        inventory=new_inventory,
-                        target_inventory=new_target,
-                        # Re-stamp with the cluster this catalog was just read from, or
-                        # the pair stays flagged stale and the refresh fixes nothing.
-                        target_endpoint=getattr(
-                            session.target_config, "cluster_endpoint", None
-                        ),
-                        source_type=session_source_type(session),
-                        vanished=list(getattr(introspector, "last_vanished", None) or []),
-                    )
+                refreshed = await _run.io_bound(
+                    with_refreshed_catalogs,
+                    current,
+                    inventory=new_inventory,
+                    target_inventory=new_target,
+                    # Re-stamp with the cluster this catalog was just read from, or
+                    # the pair stays flagged stale and the refresh fixes nothing.
+                    target_endpoint=getattr(
+                        session.target_config, "cluster_endpoint", None
+                    ),
+                    source_type=session_source_type(session),
+                    vanished=list(getattr(introspector, "last_vanished", None) or []),
                 )
+                from dsql_migrator.ui.evaluation import set_result_if_unchanged
+
+                # Never over a newer Evaluation that finished while the catalogs were read.
+                if not set_result_if_unchanged(eval_state, current, refreshed):
+                    ui.notify(
+                        "A newer evaluation finished meanwhile; the refresh was not "
+                        "applied over it.",
+                        type="warning",
+                    )
+                    refresh()
+                    return
                 ui.notify("Object browser refreshed.", type="positive")
                 refresh()
 
