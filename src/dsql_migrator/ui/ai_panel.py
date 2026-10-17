@@ -1024,24 +1024,36 @@ def build_ai_panel(
 
     def _run_pending_seed() -> None:
         """Ask the seed question of the scope opened while a turn was running -- if that
-        scope is still the active one (a later scope replaced it otherwise)."""
+        scope is still THIS tab's scope (a later scope replaced it otherwise; another
+        tab's scope change does not)."""
         pending = conv.pop("pending_seed", None)
-        active = conversation.active_scope
-        if pending and active is not None and active.scope_id == pending[0]:
-            _run_turn(str(pending[1]))
+        if pending and conv.get("scope_id") == pending[0]:
+            _run_turn(str(pending[1]), scope_id=pending[0])
 
-    def _run_turn(user_text: str) -> None:
+    def _run_turn(user_text: str, scope_id: "Optional[str]" = None) -> None:
         text = (user_text or "").strip()
         streamer = conv["streamer"]
         if not text or streamer is None:
             return
+        if scope_id is not None and conv.get("scope_id") not in (None, scope_id):
+            # Asked for a scope this tab no longer has open (a re-test that finished
+            # after the operator opened another scope): never asked in the wrong thread.
+            try:
+                ui.notify(  # type: ignore[attr-defined]
+                    "Not sent to the AI DBA: another topic is open in the panel now. "
+                    "Open the earlier topic again to ask it there.",
+                    type="info",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
         if conv["busy"]:
             # A question asked while a turn streams (the composer guards itself, so this
             # is a programmatic ask: a 'What's next?' re-run) is asked when the turn
-            # ends, never dropped and never run beside it.
-            active = conversation.active_scope
-            if active is not None:
-                conv["pending_seed"] = (active.scope_id, text)
+            # ends, in the scope it was asked for -- never dropped, never run beside it.
+            target = scope_id or conv.get("scope_id")
+            if target is not None:
+                conv["pending_seed"] = (target, text)
             return
         if not is_enabled():
             # AI Assist was turned off (Connect) after this scope was opened. NEVER call
@@ -1456,8 +1468,9 @@ def build_ai_panel(
                 # is still the open one then), never beside it.
                 conv["pending_seed"] = (scope_id, seed_question)
             else:
-                _run_turn(seed_question)
-        return _run_turn
+                _run_turn(seed_question, scope_id=scope_id)
+        # Bound to this scope: a later ask through it (a re-test, a re-run) belongs here.
+        return lambda text: _run_turn(text, scope_id=scope_id)
 
     def set_visible(visible: bool) -> None:
         _set_visible(visible)

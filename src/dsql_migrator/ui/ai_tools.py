@@ -437,14 +437,22 @@ def build_ai_tool_executor(
                 )
                 if _view is not None and not _view.auto_converted:
                     # No apply path creates a view the conversion could not convert, an
-                    # edit stored for it included: never reported as what Apply runs.
+                    # edit stored for it included: never reported as what Apply runs. The
+                    # remedy is the conversion's own (its last note says why): a view whose
+                    # name collides is not re-created by hand, it is renamed on the source,
+                    # and a materialized view or foreign table has no view to re-create.
+                    _why = (
+                        _view.warnings[-1].message
+                        if _view.warnings
+                        else "Reimplement it manually on Aurora DSQL."
+                    )
                     return _json.dumps(
                         {"status": "ok", "object_name": _p.object_name,
                          "source_ddl": _p.source_ddl, "target_ddl": _p.target_ddl,
                          "edited": False,
                          "note": ("This view is not converted: Schema Apply does not create "
-                                  "it (an edited target DDL for it is not applied either); "
-                                  "it is re-created by hand on Aurora DSQL.")}
+                                  "it (an edited target DDL for it is not applied either). "
+                                  + _why)}
                     )
                 if _edited:
                     # As Schema Conversion shows and Apply / Full Load run it: the stored

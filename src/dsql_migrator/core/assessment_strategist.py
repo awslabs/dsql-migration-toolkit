@@ -148,7 +148,22 @@ _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+")
 # "once Schema Apply has run, I'll check ...") is part of an answer, not an announcement --
 # "to see if you have" is no condition.
 _LATER_RE = re.compile(
-    r"\b(?:once|when|whenever|before|after|again|later|next time)\b|(?<!see )(?<!check )\bif\b",
+    r"\b(?:again|later|next time|whenever)\b"
+    r"|\bonce\b(?=[^.]*\b(?:has|have|is|are|runs?|ran|finishes|completes|finished|completed)\b)"
+    r"|(?<!see )(?<!check )\b(?:before|after|when|if)\s+(?:you|it|a new)\b",
+    re.IGNORECASE,
+)
+# 'To answer that I need ...': what the model is about to fetch, said as a need.
+_NEED_RE = re.compile(r"\b(?:to answer (?:that|this)|i need (?:to|the))\b", re.IGNORECASE)
+# A short courtesy around an announcement ('One moment.', 'Good question.').
+_FILLER_RE = re.compile(
+    r"^(?:one moment|just a moment|good question|sure|okay|ok|certainly|got it|great)\b",
+    re.IGNORECASE,
+)
+# A list item that carries a finding (a value, a verdict, a fix) is an answer, not a plan.
+_FINDING_ITEM_RE = re.compile(
+    r"\d|:\s*\S|\b(?:is|are|has|have|holds|needs|returns|fails|matches|becomes|keeps|"
+    r"was|were|reload|re-run|run|fix|apply)\b",
     re.IGNORECASE,
 )
 # A structured reply (a list, a heading, code) is an answer, whatever its last line says.
@@ -175,16 +190,30 @@ def is_tool_preamble(text: str) -> bool:
         return False
 
     def announces(sentence: str) -> bool:
-        return bool(_TOOL_PREAMBLE_RE.search(sentence)) and not _LATER_RE.search(sentence)
+        return bool(
+            _TOOL_PREAMBLE_RE.search(sentence) or _NEED_RE.search(sentence)
+        ) and not _LATER_RE.search(sentence)
+
+    def filler(sentence: str) -> bool:
+        return len(sentence.split()) <= 3 or bool(_FILLER_RE.match(sentence.strip()))
 
     if _STRUCTURED_REPLY_RE.search(stripped):
-        lead = stripped.splitlines()[0].strip()
-        return lead.endswith(":") and announces(lead)
-    if len(stripped) <= _TOOL_PREAMBLE_SHORT_CHARS:
-        return any(announces(sentence) for sentence in sentences)
-    # A longer reply announces only at its start or its end (what it needs, then
-    # 'let me pull those now'); in between is substance.
-    return bool(sentences) and (announces(sentences[0]) or announces(sentences[-1]))
+        # A plan announced before a list of what it will fetch -- not a list of findings
+        # (values, verdicts, fixes), and never code.
+        if "```" in stripped:
+            return False
+        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+        lead, items = lines[0], lines[1:]
+        return (
+            lead.endswith(":")
+            and announces(lead)
+            and not any(_FINDING_ITEM_RE.search(re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", item)) for item in items)
+        )
+    # Preamble-only: every sentence announces a look-up or is a courtesy around one; a
+    # sentence of substance makes it an answer, whatever it opens with.
+    return bool(sentences) and all(announces(s) or filler(s) for s in sentences) and any(
+        announces(s) for s in sentences
+    )
 
 # A tool result handed back to the model: larger than a prompt field (a list of objects is
 # what the tools exist for), and when cut it SAYS so -- cut silently mid-JSON, the model read
