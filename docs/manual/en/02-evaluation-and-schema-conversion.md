@@ -554,9 +554,10 @@ shared "write contract" keeps them identical).
 > (`GENERATED ALWAYS AS (expr) STORED`), because Aurora DSQL supports and maintains those;
 > a `VIRTUAL` one becomes an ordinary column.
 >
-> A **MySQL** generated column is created as an ordinary column (the tool does not read its
-> expression): Full Load copies the computed value, and CDC carries a `STORED` one's value. You
-> can re-add the expression (`GENERATED ALWAYS AS (...) STORED`) in Schema Conversion before
+> A **MySQL** generated column is created as an ordinary column (the tool reads its MySQL
+> expression and shows it in the finding and the source DDL, but does not translate it): Full
+> Load copies the computed value, and CDC carries a `STORED` one's value. You can re-add the
+> translated expression (`GENERATED ALWAYS AS (...) STORED`) in Schema Conversion before
 > applying, for any migration type: Full Load and CDC then leave every column the applied DDL
 > makes `GENERATED` out of their writes (Aurora DSQL refuses a value for one, SQLSTATE `428C9`),
 > and Aurora DSQL computes it. A generated column that is part of the primary key stays

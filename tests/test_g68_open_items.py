@@ -35,3 +35,42 @@ def test_several_large_columns_name_the_row_limit_too() -> None:
     )
     (concern,) = [c for c in _lob_concern(pg, SourceType.POSTGRES)]
     assert "2 MiB row limit" in concern.risk
+
+
+def test_a_mysql_generated_columns_expression_is_read_and_shown() -> None:
+    """GENERATION_EXPRESSION was in the very query the tool runs, yet dropped: the finding
+    told the operator to read it with SHOW CREATE TABLE, and the source pane said
+    'expression not captured'."""
+    from dsql_migrator.core.converter import (
+        MYSQL_GENERATED_COLUMN_ADVICE_READ,
+        mysql_generated_column_advice,
+        mysql_generated_column_detail,
+    )
+    from dsql_migrator.core.introspector import enrich_columns
+    from dsql_migrator.ui.schema_conversion import render_source_table_ddl
+    from tests.test_introspector import _FakeConnection
+
+    tables = [TableDef(
+        name="orders",
+        columns=[ColumnDef(name="id", mysql_type="INT"), ColumnDef(name="price", mysql_type="INT"),
+                 ColumnDef(name="qty", mysql_type="INT"), ColumnDef(name="total", mysql_type="INT")],
+        primary_key=["id"],
+    )]
+    rows = [
+        ("orders", "id", None, "auto_increment", "int", None, ""),
+        ("orders", "price", None, "", "int", None, ""),
+        ("orders", "qty", None, "", "int", None, ""),
+        ("orders", "total", None, "STORED GENERATED", "int", None, "(`price` * `qty`)"),
+    ]
+    enrich_columns(_FakeConnection(rows), "app", tables)
+    total = tables[0].columns[3]
+    assert total.generated and total.generated_kind == "STORED"
+    assert total.generated_expression == "(`price` * `qty`)"
+    assert "total AS (`price` * `qty`)" in mysql_generated_column_detail(tables[0])
+    assert mysql_generated_column_advice(tables[0]) == MYSQL_GENERATED_COLUMN_ADVICE_READ
+    assert "SHOW CREATE TABLE" not in MYSQL_GENERATED_COLUMN_ADVICE_READ
+    assert "GENERATED ALWAYS AS ((`price` * `qty`)) STORED" in render_source_table_ddl(tables[0])
+    # A six-column row (an older reader / test double) still works: nothing captured.
+    older = [TableDef(name="orders", columns=[ColumnDef(name="total", mysql_type="INT")])]
+    enrich_columns(_FakeConnection([("orders", "total", None, "STORED GENERATED", "int", None)]), "app", older)
+    assert older[0].columns[0].generated and older[0].columns[0].generated_expression is None

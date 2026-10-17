@@ -826,14 +826,16 @@ def render_source_table_ddl(
             )
         if table.auto_increment_column and column.name == table.auto_increment_column:
             clause += " AUTO_INCREMENT"
-        # A generated column is marked, NOT reconstructed: introspection captures only the
-        # boolean, never the ``GENERATED ALWAYS AS (<expr>)`` body. Emitting invented
-        # syntax would make the source DDL lie in a new way, so this states the fact and
-        # says the expression is not shown -- the assessor's GENERATED_COLUMN rule carries
-        # the consequence (DSQL has no generated columns; the value must be computed by
-        # the application or on read).
+        # A generated column shows MySQL's own expression (GENERATION_EXPRESSION) and its
+        # kind; an inventory read before that was captured only says so -- emitting
+        # invented syntax would make the source DDL lie.
         if column.generated:
-            clause += "  /* GENERATED column - expression not captured */"
+            expression = getattr(column, "generated_expression", None)
+            clause += (
+                f" GENERATED ALWAYS AS ({expression}) {column.generated_kind or 'STORED'}"
+                if expression
+                else "  /* GENERATED column - expression not captured */"
+            )
         clauses.append(clause)
 
     if table.primary_key:

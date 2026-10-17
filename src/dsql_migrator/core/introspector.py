@@ -810,7 +810,9 @@ def enrich_columns(
     rows = connection.execute(
         text(
             "SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME, EXTRA, COLUMN_TYPE, "
-            "COLUMN_DEFAULT "
+            # GENERATION_EXPRESSION (5.7+): a generated column's own expression, so the
+            # operator no longer has to read it with SHOW CREATE TABLE.
+            "COLUMN_DEFAULT, GENERATION_EXPRESSION "
             "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = :db"
         ),
         {"db": database},
@@ -821,14 +823,11 @@ def enrich_columns(
     column_type_by_column: dict[tuple[str, str], str] = {}
     default_by_column: dict[tuple[str, str], Optional[str]] = {}
     auto_increment_by_table: dict[str, str] = {}
-    for (
-        table_name,
-        column_name,
-        collation_name,
-        extra,
-        column_type,
-        column_default,
-    ) in rows:
+    expression_by_column: dict[tuple[str, str], str] = {}
+    for row in rows:
+        table_name, column_name, collation_name, extra, column_type, column_default = row[:6]
+        if len(row) > 6 and row[6]:
+            expression_by_column[(table_name, column_name)] = str(row[6])
         collation_by_column[(table_name, column_name)] = collation_name
         extra_text = str(extra).lower() if extra else ""
         extra_by_column[(table_name, column_name)] = extra_text
@@ -884,6 +883,9 @@ def enrich_columns(
                 column.generated_kind = (
                     "STORED" if "stored generated" in extra_text else "VIRTUAL"
                 )
+                expression = expression_by_column.get((table.name, column.name))
+                if expression:
+                    column.generated_expression = expression
             if "on update" in extra_text:
                 column.auto_update_timestamp = True
             # MySQL flags an EXPRESSION default (as opposed to a literal) with

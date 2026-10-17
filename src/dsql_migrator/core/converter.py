@@ -4057,11 +4057,18 @@ def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
     stored = [c.name for c in columns if c.generated_kind == "STORED"]
     virtual = [c.name for c in columns if c.generated_kind == "VIRTUAL"]
     unknown = [c.name for c in columns if c.generated_kind not in ("STORED", "VIRTUAL")]
+    captured = [c for c in columns if c.generated_expression]
     parts = [
-        f"Columns ({', '.join(c.name for c in columns)}) are MySQL generated columns. The "
-        "tool does not read MySQL's generating expression, so they are created as ORDINARY "
-        "columns (Aurora DSQL itself supports STORED generated columns)."
+        f"Columns ({', '.join(c.name for c in columns)}) are MySQL generated columns, "
+        "created as ORDINARY columns: the tool does not translate MySQL's generating "
+        "expression (Aurora DSQL itself supports STORED generated columns)."
     ]
+    if captured:
+        parts.append(
+            "Their MySQL expressions: "
+            + "; ".join(f"{c.name} AS {c.generated_expression}" for c in captured)
+            + "."
+        )
     if stored:
         parts.append(
             f"STORED ({', '.join(stored)}): MySQL stores the value, so Full Load copies it "
@@ -4106,6 +4113,14 @@ MYSQL_GENERATED_COLUMN_ADVICE = (
 )
 
 
+# The advice when every generated column's MySQL expression was read (it is shown with
+# the finding and in the source DDL, so SHOW CREATE TABLE is no longer needed).
+MYSQL_GENERATED_COLUMN_ADVICE_READ = MYSQL_GENERATED_COLUMN_ADVICE.replace(
+    "read it with SHOW CREATE TABLE, translate it to PostgreSQL",
+    "translate the MySQL expression shown above to PostgreSQL",
+)
+
+
 def mysql_generated_column_advice(table: TableDef) -> str:
     """What to do about ``table``'s MySQL generated columns: Evaluation's recommendation,
     which the conversion note carries too. A generated column in the primary key must stay
@@ -4115,8 +4130,13 @@ def mysql_generated_column_advice(table: TableDef) -> str:
     primary_key = set(table.primary_key or [])
     generated = [c.name for c in table.columns if c.generated]
     keyed = [name for name in generated if name in primary_key]
+    advice = (
+        MYSQL_GENERATED_COLUMN_ADVICE_READ
+        if all(c.generated_expression for c in table.columns if c.generated)
+        else MYSQL_GENERATED_COLUMN_ADVICE
+    )
     if not keyed:
-        return MYSQL_GENERATED_COLUMN_ADVICE
+        return advice
     key_advice = (
         f"Keep {', '.join(keyed)} ordinary: "
         f"{'it is' if len(keyed) == 1 else 'they are'} part of the primary key, and Full "
@@ -4125,7 +4145,7 @@ def mysql_generated_column_advice(table: TableDef) -> str:
     )
     if len(keyed) == len(generated):
         return f"Compute the value in the application after cut over. {key_advice}"
-    return f"{MYSQL_GENERATED_COLUMN_ADVICE} {key_advice}"
+    return f"{advice} {key_advice}"
 
 
 def _generated_column_warning(table: TableDef) -> Optional[ConversionWarning]:
