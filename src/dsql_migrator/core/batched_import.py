@@ -771,6 +771,21 @@ _MAX_QUARANTINE_RECORDS = MAX_QUARANTINE_RECORDS
 _BPCHAR_OID = 1042
 
 
+def _key_parameter(value: object) -> object:
+    """A key value as the SELECT-filter binds it: a whole ``Decimal`` as an ``int``.
+
+    A numeric source key made a bigint identity (a PostgreSQL ``numeric(12,0)`` serial)
+    comes off the driver as a Decimal, which psycopg binds as numeric, and
+    ``"id" IN ($1, ...)`` then resolves to ``"id"::numeric = ...``: the bigint primary key
+    cannot serve it, so every retried batch scanned the table. An int is compared as the
+    column's own type (and widened, not cast column-side, for a numeric key)."""
+    from decimal import Decimal
+
+    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        return int(value)
+    return value
+
+
 def _normalize_key(values: tuple, description: object) -> tuple:
     """Make a key tuple comparable across the wire's padding rules (see :data:`_BPCHAR_OID`)."""
     columns = tuple(description or ())
@@ -1688,7 +1703,7 @@ class BatchedImporter:
             table=_pg_table_identifier(work.table_name),
             tuples=sql.SQL(", ").join(row_placeholder for _ in work.rows),
         )
-        select_params = [row[name] for row in work.rows for name in key_columns]
+        select_params = [_key_parameter(row[name]) for row in work.rows for name in key_columns]
         max_attempts = max(1, self._occ_max_attempts)
         last_error: Optional[BaseException] = None
         for _attempt in range(max_attempts):

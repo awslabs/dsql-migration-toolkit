@@ -893,14 +893,30 @@ class PgUnconstrainedNumericRule(Rule):
     rule_id = "PG_UNCONSTRAINED_NUMERIC"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
+        from dsql_migrator.core.converter import (
+            PrimaryKeyStrategy,
+            default_primary_key_strategy,
+            identity_strategy_applies,
+        )
         from dsql_migrator.core.converter_postgres import unconstrained_numeric_note
 
         findings: list[Finding] = []
         for table in inventory.tables:
+            # The key the identity strategy makes bigint is no numeric any more (its
+            # narrowing is graded by the key rule); "give it an explicit numeric(p,s)"
+            # would remove the identity.
+            identity_key = (
+                table.auto_increment_column
+                if identity_strategy_applies(table)
+                and default_primary_key_strategy(table, is_postgres=True)
+                is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+                else None
+            )
             columns = [
                 column
                 for column in table.columns
                 if unconstrained_numeric_note(column.mysql_type) is not None
+                and column.name != identity_key
             ]
             if not columns:
                 continue

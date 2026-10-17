@@ -1508,6 +1508,25 @@ NOT_AN_IDENTITY_REASON = (
 )
 
 
+def split_not_identity(failed: "Mapping[str, str]") -> "tuple[dict[str, str], list[str]]":
+    """``(real failures, tables whose target key is no identity)``: the second is no failed
+    RESTART -- there is no sequence to retry or advance -- and needs other advice."""
+    real = {name: reason for name, reason in failed.items() if reason != NOT_AN_IDENTITY_REASON}
+    plain = sorted(name for name, reason in failed.items() if reason == NOT_AN_IDENTITY_REASON)
+    return real, plain
+
+
+def not_identity_detail(tables: "Sequence[str]") -> str:
+    """The activity-log detail for :func:`split_not_identity`'s second list."""
+    return (
+        f"{len(tables)} table(s) whose conversion makes the key an identity hold it as a "
+        f"plain integer on the target ({', '.join(tables)}), so nothing generates it and an "
+        "INSERT that omits the key fails after cut over. If the application supplies the "
+        "ids, choose 'Keep source PK' for them in Schema Conversion; otherwise re-apply "
+        "each table with Replace and reload it, so it gets the identity."
+    )
+
+
 def sync_identity_sequences(
     table_names: "Sequence[str]",
     *,

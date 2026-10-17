@@ -3781,6 +3781,7 @@ def _apply_pk_strategy(
     # Set when the identity widening NARROWED the declared range (see below), so the
     # caller can add a LOSS warning alongside the throughput recommendation.
     narrowed_from: Optional[str] = None
+    narrowed_how: "tuple[bool, bool]" = (True, False)
 
     if strategy is PrimaryKeyStrategy.CONVERT_TO_UUID:
         if column_def is not None:
@@ -3822,9 +3823,14 @@ def _apply_pk_strategy(
                 exp.DataType.Type.BOOLEAN,
             ):
                 # numeric/DECIMAL is the only source kind whose range EXCEEDS signed
-                # BIGINT, so it is the only one the BIGINT widening actually narrows.
+                # BIGINT, so it is the only one the BIGINT widening actually narrows --
+                # and only when its declaration allows more than 18 integer digits or a
+                # fraction (numeric(12,0) fits bigint whole).
                 if data_type.this is exp.DataType.Type.DECIMAL:
-                    narrowed_from = data_type.sql(dialect=_POSTGRES)
+                    narrowing = _decimal_narrowing(data_type)
+                    if narrowing is not None:
+                        narrowed_from = data_type.sql(dialect=_POSTGRES)
+                        narrowed_how = narrowing
                 column_def.set("kind", exp.DataType.build("BIGINT"))
             # sqlglot cannot render an identity CACHE clause, so the constraint
             # text is injected as a fixed (non-user) constant.
@@ -3920,17 +3926,41 @@ def _apply_pk_strategy(
                 kind=ConversionNoteKind.LOSS,
                 message=(
                     f"The identity key '{column_name}' was narrowed from "
-                    f"{narrowed_from} to bigint. Aurora DSQL identity columns must be "
-                    "bigint, so an unsigned/large-decimal key cannot keep its full "
-                    "range. Newly generated ids are unaffected, but any EXISTING source "
-                    "value above 9223372036854775807 (2^63-1) will not fit and that row "
-                    "would fail to load. If this key never exceeds that value the "
+                    f"{narrowed_from} to bigint (an Aurora DSQL identity column must be "
+                    "bigint). Newly generated ids are unaffected, but "
+                    + " and ".join(
+                        part
+                        for part, applies in zip(
+                            (
+                                "any EXISTING source value above 9223372036854775807 "
+                                "(2^63-1) will not fit and that row would fail to load",
+                                "a value with a fractional part has no bigint form, so "
+                                "the table's Full Load refuses it",
+                            ),
+                            narrowed_how,
+                        )
+                        if applies
+                    )
+                    + ". If every existing key is a whole number within that range the "
                     "conversion is safe; otherwise keep the source PK (no identity) or "
                     "move to a uuid key instead."
                 ),
             )
         )
     return warnings
+
+
+def _decimal_narrowing(data_type: exp.DataType) -> "Optional[tuple[bool, bool]]":
+    """``(may exceed bigint, may hold a fraction)`` of a numeric/DECIMAL key made bigint, or
+    ``None`` when bigint holds every value it declares (``numeric(p<=18, 0)``). A bare
+    ``numeric`` declares neither bound, so both may happen."""
+    params = [int(e.name) for e in data_type.expressions if e.name.isdigit()]
+    if not params:
+        return True, True
+    precision = params[0]
+    scale = params[1] if len(params) > 1 else 0
+    exceeds, fractional = precision - scale > 18, scale > 0
+    return (exceeds, fractional) if exceeds or fractional else None
 
 
 def _foreign_key_warning(
@@ -6461,6 +6491,11 @@ class SchemaConverter:
                 # in the emitted DDL (converter_postgres._ddl_column_type); surface the
                 # lossy reduction here so it is not a silent range/scale change. Mirrors the
                 # MySQL DECIMAL clamp warning.
+                # The key the identity strategy makes bigint is no numeric any more: its
+                # own narrowing note says what that costs (a numeric(18,6) note would sit
+                # beside a BIGINT DDL and advise a type that removes the identity).
+                if column.name == identity_key:
+                    continue
                 clamped, clamp_note = clamp_pg_numeric(column.mysql_type)
                 if clamp_note is not None:
                     warnings.append(

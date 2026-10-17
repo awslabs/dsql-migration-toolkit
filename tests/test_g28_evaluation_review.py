@@ -2366,7 +2366,8 @@ def test_a_key_with_no_identity_on_the_target_is_not_shown_as_a_failed_restart()
     state = ValidationState()
     state.set_cutover_identity_sync({}, {"shop.orders": NOT_AN_IDENTITY_REASON})
     detail = _cutover_integrity_detail(state, 0)
-    assert "1 with no identity on the target" in detail and "nothing to advance" in detail
+    assert detail.endswith("identity sequences: 1 with no identity on the target")
+    assert "synced" not in detail  # built from the counts, never "synced (nothing to advance), ..."
 
 
 def test_a_numeric_sequence_key_keeps_its_generator_and_notes_name_only_offered_strategies() -> None:

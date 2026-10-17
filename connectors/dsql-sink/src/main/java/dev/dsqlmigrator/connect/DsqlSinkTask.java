@@ -2446,7 +2446,9 @@ public class DsqlSinkTask extends SinkTask {
       boolean booleanParam =
           value instanceof Number && meta != null && isBooleanParam(meta, i + 1);
       boolean integerParam =
-          value instanceof Boolean && meta != null && isIntegerParam(meta, i + 1);
+          (value instanceof Boolean || value instanceof java.math.BigDecimal)
+              && meta != null
+              && isIntegerParam(meta, i + 1);
       // A MySQL TIME duration (bound as an interval) into a time column: PostgreSQL's
       // assignment cast interval -> time keeps only the time of day (30:00:00 would land as
       // 06:00:00), so when the value-fit guard could not read the column types this refuses
@@ -2480,8 +2482,16 @@ public class DsqlSinkTask extends SinkTask {
   /**
    * The object to bind for {@code value}: a Number becomes a Boolean only when it is EXACTLY
    * 0 or 1 and the parameter is boolean; a Boolean becomes 0/1 when the parameter is an
-   * integer; anything else is the ORIGINAL object (never a rescaled or converted copy). Pure
+   * integer; a whole {@link java.math.BigDecimal} becomes a {@code Long} when the parameter is
+   * an integer; anything else is the ORIGINAL object (never a rescaled or converted copy). Pure
    * and package-private for tests.
+   *
+   * <p>The BigDecimal case is the key of a numeric column made a bigint identity (a PostgreSQL
+   * {@code numeric(12,0)} serial key, or an opted-in MySQL {@code bigint unsigned}), which
+   * Debezium sends as a decimal: bound as NUMERIC, {@code "id" = ?} resolves to
+   * {@code "id"::numeric = $1}, which the bigint primary key cannot serve, so every DELETE
+   * (and move) scanned the whole table. A fractional or out-of-range one is bound unchanged,
+   * for the value-fit guard or Aurora DSQL to refuse by name.
    */
   static Object bindValue(Object value, boolean booleanParam, boolean integerParam) {
     if (booleanParam && value instanceof Number n && ValueFit.isZeroOrOne(n)) {
@@ -2489,6 +2499,13 @@ public class DsqlSinkTask extends SinkTask {
     }
     if (integerParam && value instanceof Boolean b) {
       return b ? 1 : 0;
+    }
+    if (integerParam && value instanceof java.math.BigDecimal d) {
+      try {
+        return d.longValueExact();
+      } catch (ArithmeticException notWhole) {
+        return value;
+      }
     }
     return value;
   }

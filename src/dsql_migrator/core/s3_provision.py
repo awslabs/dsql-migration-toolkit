@@ -809,7 +809,11 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #     assignment cast interval -> time kept only the time of day (30:00:00 landed as 06:00:00);
 #   * float8out's shortest digits at a power of two (2^-24 is 5.960464477539063e-08): the
 #     half-ulp interval is asymmetric there, and only the nearest candidate was tried, so a
-#     CDC-written point (or float8[]) differed from Full Load's text.
+#     CDC-written point (or float8[]) differed from Full Load's text;
+#   * a whole decimal bound into an integer parameter is bound as a long: the key of a numeric
+#     column made a bigint identity (a PostgreSQL numeric(12,0) serial) arrives as a decimal,
+#     and as NUMERIC `"id" = ?` became `"id"::numeric = $1`, which the primary key cannot
+#     serve -- every DELETE (and move) scanned the table.
 PLUGIN_VERSION = "v54"
 
 

@@ -409,6 +409,22 @@ class DsqlSinkTaskTest {
     assertSame(amount, DsqlSinkTask.bindValue(amount, false, false));
   }
 
+  @Test
+  void bindValueBindsAWholeDecimalIntoAnIntegerParameterAsALong() {
+    // A numeric(12,0) key made a bigint identity arrives as a BigDecimal: bound as NUMERIC,
+    // `"id" = ?` became `"id"::numeric = $1` and every DELETE scanned the table.
+    assertEquals(42L, DsqlSinkTask.bindValue(new BigDecimal("42"), false, true));
+    assertEquals(42L, DsqlSinkTask.bindValue(new BigDecimal("42.000"), false, true));
+    // A fractional or out-of-range one is bound unchanged, for the guard / DSQL to refuse.
+    BigDecimal fraction = new BigDecimal("1.5");
+    assertSame(fraction, DsqlSinkTask.bindValue(fraction, false, true));
+    BigDecimal huge = new BigDecimal("99999999999999999999");
+    assertSame(huge, DsqlSinkTask.bindValue(huge, false, true));
+    // Not an integer parameter: unchanged, as before.
+    BigDecimal whole = new BigDecimal("42");
+    assertSame(whole, DsqlSinkTask.bindValue(whole, false, false));
+  }
+
   /** A task whose catalog read is scripted (a Map, null, or an SQLException to throw). */
   private static final class ScriptedCatalogTask extends DsqlSinkTask {
     private final Deque<Object> answers = new ArrayDeque<>();

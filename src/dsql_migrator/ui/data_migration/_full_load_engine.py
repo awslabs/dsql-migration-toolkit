@@ -3416,19 +3416,30 @@ def _log_identity_sequence_sync_outcome(synced: "Mapping[str, object]") -> None:
                 f"{detail}"
             ),
         )
-    if failed:
+    from dsql_migrator.core.target_introspector import not_identity_detail, split_not_identity
+
+    real_failed, not_identity = split_not_identity(failed or {})
+    if real_failed:
         fdetail = ", ".join(
-            f"{name}: {reason}" for name, reason in sorted(failed.items())
+            f"{name}: {reason}" for name, reason in sorted(real_failed.items())
         )
         log_activity(
             ActivityCategory.FULL_LOAD,
             "identity sequence sync failed",
             status=ActivityStatus.FAILURE,
             detail=(
-                f"{len(failed)} identity sequence(s) could NOT be advanced past the "
+                f"{len(real_failed)} identity sequence(s) could NOT be advanced past the "
                 f"loaded rows; the application's first insert after cut-over may "
                 f"collide — advance them manually before cut-over: {fdetail}"
             ),
+        )
+    if not_identity:
+        # No sequence to advance: the RESTART advice above cannot work for these.
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "no identity on the target",
+            status=ActivityStatus.FAILURE,
+            detail=not_identity_detail(not_identity),
         )
 
 

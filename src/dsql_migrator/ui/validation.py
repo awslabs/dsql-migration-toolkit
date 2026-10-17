@@ -3456,22 +3456,33 @@ def build_validation_screen(
                         f"cut-over cannot collide: {detail}"
                     ),
                 )
-            if failed:
+            real_failed, not_identity = _split_not_identity(failed or {})
+            if real_failed:
                 # A failed RESTART WITH is a post-cut-over duplicate-key risk, so log it
                 # as an ERROR (never swallowed / painted as success). Reasons are
                 # value-free (Property 7).
                 fdetail = ", ".join(
-                    f"{name}: {reason}" for name, reason in sorted(failed.items())
+                    f"{name}: {reason}" for name, reason in sorted(real_failed.items())
                 )
                 log_activity(
                     ActivityCategory.VALIDATION,
                     "identity sequence sync failed",
                     status=ActivityStatus.FAILURE,
                     detail=(
-                        f"{len(failed)} identity sequence(s) could NOT be advanced; the "
+                        f"{len(real_failed)} identity sequence(s) could NOT be advanced; the "
                         f"application's first insert after cut-over may collide — retry "
                         f"the sync or advance them manually: {fdetail}"
                     ),
+                )
+            if not_identity:
+                from dsql_migrator.core.target_introspector import not_identity_detail
+
+                # No sequence to retry or advance: the RESTART advice cannot work here.
+                log_activity(
+                    ActivityCategory.VALIDATION,
+                    "no identity on the target",
+                    status=ActivityStatus.FAILURE,
+                    detail=not_identity_detail(not_identity),
                 )
 
         # Not durable (as Evaluation): a run is not resumed after a restart, and a stored
@@ -4277,19 +4288,30 @@ def _run_cutover_identity_sync(
             # Surface a failed RESTART WITH as an ERROR — the cut-over runbook renders it
             # so the operator cannot repoint the app believing the sequences are safe
             # (audit finding D2). Reasons are value-free (Property 7).
-            fdetail = ", ".join(
-                f"{name}: {reason}" for name, reason in sorted(failed.items())
-            )
-            log_activity(
-                ActivityCategory.VALIDATION,
-                "identity sequence sync failed (cut-over)",
-                status=ActivityStatus.FAILURE,
-                detail=(
-                    f"{len(failed)} identity sequence(s) could NOT be advanced before "
-                    f"cut-over; the application's first insert may collide — retry the "
-                    f"sync or advance them manually before repointing: {fdetail}"
-                ),
-            )
+            real_failed, not_identity = _split_not_identity(failed)
+            if real_failed:
+                fdetail = ", ".join(
+                    f"{name}: {reason}" for name, reason in sorted(real_failed.items())
+                )
+                log_activity(
+                    ActivityCategory.VALIDATION,
+                    "identity sequence sync failed (cut-over)",
+                    status=ActivityStatus.FAILURE,
+                    detail=(
+                        f"{len(real_failed)} identity sequence(s) could NOT be advanced "
+                        f"before cut-over; the application's first insert may collide — "
+                        f"retry the sync or advance them manually before repointing: {fdetail}"
+                    ),
+                )
+            if not_identity:
+                from dsql_migrator.core.target_introspector import not_identity_detail
+
+                log_activity(
+                    ActivityCategory.VALIDATION,
+                    "no identity on the target (cut-over)",
+                    status=ActivityStatus.FAILURE,
+                    detail=not_identity_detail(not_identity),
+                )
         validation_state.set_cutover_identity_sync(advanced, failed)
         if refresh is not None:
             refresh()
@@ -4685,11 +4707,9 @@ def _cutover_foreign_keys_stripped(
 def _split_not_identity(failed: "Mapping[str, str]") -> "tuple[dict[str, str], list[str]]":
     """``(real failures, tables whose target key is no identity)``: the second is no failed
     RESTART -- there is no sequence to retry or advance -- and gets its own notice."""
-    from dsql_migrator.core.target_introspector import NOT_AN_IDENTITY_REASON
+    from dsql_migrator.core.target_introspector import split_not_identity
 
-    real = {name: reason for name, reason in failed.items() if reason != NOT_AN_IDENTITY_REASON}
-    plain = sorted(name for name, reason in failed.items() if reason == NOT_AN_IDENTITY_REASON)
-    return real, plain
+    return split_not_identity(failed)
 
 
 def _render_not_identity_notice(ui: object, tables: "Sequence[str]") -> None:
@@ -4761,21 +4781,25 @@ def _cutover_integrity_detail(
             if skipped or failed:
                 fk += f" ({skipped} skipped on orphan rows, {failed} failed)"
     synced = validation_state.cutover_identity_sync
-    identity = (
-        f"identity sequences synced ({len(synced)} advanced)"
-        if synced
-        else "identity sequences not synced"
-        if synced is None
-        else "identity sequences synced (nothing to advance)"
-    )
-    # A failed or impossible sync is said, never folded into "synced".
+    # A failed or impossible sync is said, never folded into "synced" -- the clause is
+    # built from the counts, so a failure never reads "synced (nothing to advance), 1 FAILED".
     failed = dict(getattr(validation_state, "cutover_identity_sync_failed", None) or {})
-    if synced is not None and failed:
-        real, not_identity = _split_not_identity(failed)
+    real, not_identity = _split_not_identity(failed) if synced is not None else ({}, [])
+    if synced is None:
+        identity = "identity sequences not synced"
+    elif not real and not not_identity:
+        identity = (
+            f"identity sequences synced ({len(synced)} advanced)"
+            if synced
+            else "identity sequences synced (nothing to advance)"
+        )
+    else:
+        counts = [f"{len(synced)} advanced"] if synced else []
         if real:
-            identity += f", {len(real)} FAILED"
+            counts.append(f"{len(real)} FAILED")
         if not_identity:
-            identity += f", {len(not_identity)} with no identity on the target"
+            counts.append(f"{len(not_identity)} with no identity on the target")
+        identity = "identity sequences: " + ", ".join(counts)
     return f"{fk}; {identity}"
 
 

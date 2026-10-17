@@ -47,6 +47,7 @@ import inspect
 import logging
 import re
 import threading
+import functools
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Mapping, Optional, Protocol, Sequence
@@ -388,13 +389,16 @@ def generate_previews(
     *,
     existence_checker: Optional[TargetExistenceChecker] = None,
     source_type: SourceType = SourceType.MYSQL,
+    stored_ddl_of: "Optional[Callable[[str], Optional[str]]]" = None,
 ) -> list["DdlPreview"]:
     """Build DDL previews for the ticked table/view node ids (Requirement 10.2).
 
     Only object leaves (table/view nodes) are considered; schema/category ticks
     and trigger/routine ticks are ignored (the latter are not auto-converted).
     Each selected object is paired with its converted target DDL. Order follows
-    ``node_ids``; unknown or non-previewable nodes are skipped.
+    ``node_ids``; unknown or non-previewable nodes are skipped. ``stored_ddl_of``
+    gives a table's stored script: one the primary-key picker made for another strategy
+    than the default brings that strategy's notes (:func:`stored_strategy_notes`).
     """
     previews: list[DdlPreview] = []
     for node_id in node_ids:
@@ -403,9 +407,73 @@ def generate_previews(
                 node_id, inventory, result,
                 existence_checker=existence_checker, source_type=source_type,
             )
-            if preview is not None:
-                previews.append(preview)
+            if preview is None:
+                continue
+            stored = stored_ddl_of(preview.object_name) if stored_ddl_of is not None else None
+            if stored and node_id.startswith(TABLE_PREFIX):
+                table = _find_table(inventory, preview.object_name)
+                notes = (
+                    stored_strategy_notes(
+                        table, stored, source_type=source_type,
+                        index_names=result.index_renames.get(table.name),
+                    )
+                    if table is not None
+                    else None
+                )
+                if notes is not None:
+                    preview = replace(preview, warnings=notes)
+            previews.append(preview)
     return previews
+
+
+def stored_strategy_notes(
+    table: TableDef,
+    stored: str,
+    *,
+    source_type: SourceType = SourceType.MYSQL,
+    index_names: "Optional[Mapping[str, str]]" = None,
+) -> "Optional[list[ConversionWarning]]":
+    """The notes of the primary-key strategy a stored per-table script encodes, when it is
+    not the table's default -- ``None`` otherwise.
+
+    The picker stores only the script; the notes came from the whole-inventory default
+    conversion, so after picking Server-generated for a ``bigint unsigned`` key the screen
+    still said the key 'was kept as a plain integer' beside an identity DDL (and never the
+    narrowing it costs), and after Keep source PK it still said the key keeps generating.
+    Cached by the table and script: the screen asks on every render."""
+    notes = _stored_strategy_notes(
+        table.model_dump_json(), stored, source_type,
+        tuple(sorted((index_names or {}).items())),
+    )
+    return None if notes is None else list(notes)
+
+
+@functools.lru_cache(maxsize=1024)
+def _stored_strategy_notes(
+    table_json: str,
+    stored: str,
+    source_type: SourceType,
+    index_names: "tuple[tuple[str, str], ...]",
+) -> "Optional[tuple[ConversionWarning, ...]]":
+    table = TableDef.model_validate_json(table_json)
+    converter = SchemaConverter(source_type=source_type)
+    names = dict(index_names) or None
+    leading = composite_leading_from_ddl(table, stored)
+    if leading is not None:
+        conversion = build_composite_conversion(converter, table, leading, index_names=names)
+    elif table.auto_increment_column:
+        stored_identity = identity_from_ddl(table, stored)
+        default_identity = (
+            default_primary_key_strategy(table, is_postgres=source_type is SourceType.POSTGRES)
+            is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
+        )
+        if stored_identity == default_identity:
+            return None
+        build = build_identity_conversion if stored_identity else build_keep_conversion
+        conversion = build(converter, table, index_names=names)
+    else:
+        return None
+    return tuple(conversion.warnings)
 
 
 # Object-leaf node id prefixes (a tick on one maps back to a source object).
@@ -3661,6 +3729,7 @@ def _render_browser_and_preview(
         conversion_result,
         existence_checker=existence_checker,
         source_type=source_type,
+        stored_ddl_of=conv_state.get_edited_target_ddl,
     )
     if not previews:
         # Unreachable in practice: a committed scope that converts nothing is healed to
