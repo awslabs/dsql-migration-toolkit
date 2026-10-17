@@ -1291,22 +1291,25 @@ class PgViewRemodelledColumnRule(Rule):
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
         from dsql_migrator.core.converter import (
-            pg_view_remodelled_references,
+            pg_views_remodelling,
             remodelled_reference_note,
         )
 
         findings: list[Finding] = []
+        remodellings = pg_views_remodelling(inventory.views, inventory.tables)
         for view in inventory.views:
             if getattr(view, "unsupported_kind", None):
                 continue
-            references = pg_view_remodelled_references(view, inventory.tables)
-            if references:
+            remodelling = remodellings.get(view.name)
+            if remodelling is not None and remodelling.flagged:
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_VIEW, view.name),
                         rule_id=self.rule_id,
                         classification=Classification.MANUAL,
-                        risk=remodelled_reference_note(references),
+                        risk=remodelled_reference_note(
+                            remodelling.references, remodelling.rewritten
+                        ),
                         recommendation=(
                             "Open the view in Schema Conversion and adapt the expressions "
                             "on those columns to their new type (the target DDL is "

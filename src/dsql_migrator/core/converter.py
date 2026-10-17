@@ -346,21 +346,31 @@ def views_in_dependency_order(views: "Sequence[ViewConversion]") -> "list[ViewCo
     view only moves that view later). The given order is kept wherever nothing forces a
     change, and a cycle (a false match can make one) places its first view first. Linear
     in the DDL text, then a heap: thousands of views stay cheap. Pure."""
+    return _dependency_order(
+        list(views),
+        name_of=lambda view: view.view,
+        text_of=lambda view: view.target_ddl or "",
+        has_header=True,
+    )
+
+
+def _dependency_order(items: list, *, name_of, text_of, has_header: bool) -> list:
+    """:func:`views_in_dependency_order` over any named texts. ``has_header``: the text
+    opens with the item's own name (a CREATE VIEW), which is not a read."""
     import heapq
 
-    views = list(views)
-    if len(views) < 2:
-        return views
+    if len(items) < 2:
+        return items
     by_name: dict[str, list[int]] = {}
-    for index, view in enumerate(views):
-        by_name.setdefault(_split_qualified(view.view)[1], []).append(index)
-    dependents: list[set[int]] = [set() for _ in views]
-    waiting = [0] * len(views)
-    for index, view in enumerate(views):
-        own = _split_qualified(view.view)[1]
+    for index, item in enumerate(items):
+        by_name.setdefault(_split_qualified(name_of(item))[1], []).append(index)
+    dependents: list[set[int]] = [set() for _ in items]
+    waiting = [0] * len(items)
+    for index, item in enumerate(items):
+        own = _split_qualified(name_of(item))[1]
         named: set[str] = set()
-        past_header = False  # the CREATE VIEW's own name is not a read
-        for match in _VIEW_IDENTIFIER_RE.finditer(view.target_ddl or ""):
+        past_header = not has_header  # the CREATE VIEW's own name is not a read
+        for match in _VIEW_IDENTIFIER_RE.finditer(text_of(item)):
             quoted, bare = match.groups()
             name = quoted.replace('""', '"') if quoted is not None else fold_identifier(bare)
             if not past_header:
@@ -373,17 +383,17 @@ def views_in_dependency_order(views: "Sequence[ViewConversion]") -> "list[ViewCo
         waiting[index] = len(reads)
     ready = [index for index, count in enumerate(waiting) if count == 0]
     heapq.heapify(ready)
-    placed = [False] * len(views)
-    ordered: list[ViewConversion] = []
-    while len(ordered) < len(views):
+    placed = [False] * len(items)
+    ordered: list = []
+    while len(ordered) < len(items):
         if ready:
             index = heapq.heappop(ready)
             if placed[index]:
                 continue
-        else:  # a cycle: its first view goes first
+        else:  # a cycle: its first item goes first
             index = next(i for i, done in enumerate(placed) if not done)
         placed[index] = True
-        ordered.append(views[index])
+        ordered.append(items[index])
         for dependent in dependents[index]:
             waiting[dependent] -= 1
             if waiting[dependent] == 0 and not placed[dependent]:
@@ -2804,7 +2814,7 @@ def _carried_index_predicate(table: TableDef, index: IndexDef) -> Optional[str]:
         if name in by_name
     ):
         return None
-    return _rewrite_enum_casts(predicate, [table])
+    return _rewrite_enum_casts(predicate, _enum_cast_types([table]))[0]
 
 
 def _emittable_secondary_indexes(
@@ -6079,8 +6089,15 @@ class SchemaConverter:
             self.convert_table(table, options, index_names=renames.get(table.name))
             for table in inventory.tables
         ]
+        # What the conversion changes under each PostgreSQL view, once for all of them.
+        remodellings = (
+            pg_views_remodelling(inventory.views, inventory.tables) if is_postgres else {}
+        )
         view_conversions = [
-            self.convert_view(view, tables=inventory.tables) for view in inventory.views
+            self.convert_view(
+                view, tables=inventory.tables, remodelling=remodellings.get(view.name)
+            )
+            for view in inventory.views
         ]
         collisions = name_collisions(
             inventory, is_postgres=is_postgres, namespaces=namespaces
@@ -6117,7 +6134,11 @@ class SchemaConverter:
         )
 
     def convert_view(
-        self, view: ViewDef, *, tables: "Sequence[TableDef]" = ()
+        self,
+        view: ViewDef,
+        *,
+        tables: "Sequence[TableDef]" = (),
+        remodelling: "Optional[PgViewRemodelling]" = None,
     ) -> ViewConversion:
         """Convert a single source view to a DSQL-compatible ``CREATE VIEW``.
 
@@ -6195,7 +6216,9 @@ class SchemaConverter:
             # the jsonb `@?` operator, for one) is still the text PostgreSQL deparsed
             # itself, and Evaluation grades the view AUTO. The one rewrite is a cast to an
             # enum the conversion turns into text (that type does not exist on DSQL).
-            verbatim = pg_view_ddl(view.name, _rewrite_enum_casts(definition, tables))
+            if remodelling is None:  # a lone view: only what it reads directly
+                remodelling = pg_views_remodelling([view], tables)[view.name]
+            verbatim = pg_view_ddl(view.name, remodelling.definition)
             if verbatim is None:
                 return _manual_view_conversion(view.name, schema_ddls)
             return ViewConversion(
@@ -6203,7 +6226,7 @@ class SchemaConverter:
                 target_ddl=verbatim,
                 schema_ddls=schema_ddls,
                 auto_converted=True,
-                warnings=_remodelled_reference_warnings(view, tables),
+                warnings=_remodelled_reference_warnings(view, remodelling),
             )
         try:
             parsed = sqlglot.parse_one(definition, read=_MYSQL)
@@ -6263,78 +6286,219 @@ def _mentions_identifier(text: str, name: str) -> bool:
     return re.search(rf'(?<![\w"$]){re.escape(name)}(?![\w"$])|"{re.escape(name)}"', text) is not None
 
 
+@dataclass(frozen=True)
+class PgViewRemodelling:
+    """What Schema Conversion changes under one PostgreSQL view (:func:`pg_views_remodelling`).
+
+    ``definition`` is the body as emitted (each ``::`` cast to a converted enum made a cast
+    to text); ``references`` the ``(relation, column, source type, target type)`` of each
+    re-typed column it reads, through a table or through another such view; ``rewritten``
+    the enum types whose casts were rewritten."""
+
+    definition: str
+    references: "tuple[tuple[str, str, str, str], ...]" = ()
+    rewritten: "tuple[str, ...]" = ()
+
+    @property
+    def flagged(self) -> bool:
+        return bool(self.references or self.rewritten)
+
+
+def pg_views_remodelling(
+    views: "Sequence[ViewDef]", tables: "Sequence[TableDef]"
+) -> "dict[str, PgViewRemodelling]":
+    """:class:`PgViewRemodelling` for each view, computed ONCE per inventory -- per view it
+    rebuilt every table's re-typed columns, which grew with views x tables x columns.
+
+    Views are read in dependency order, so a view over a flagged view inherits the re-typed
+    columns it names (``SELECT ... FROM v_orders WHERE status >= 'shipped'``, where
+    v_orders reads an enum turned text, now compares text). A text match, so it errs toward
+    naming a column. Pure."""
+    # relation bare name -> [(relation, {column: (old, new)})]: the tables with re-typed
+    # columns, then each flagged view (what it hands on), so a lookup per NAME the view
+    # mentions replaces a scan of every table per view.
+    sources: dict[str, list[tuple[str, dict[str, tuple[str, str]]]]] = {}
+    for table in tables:
+        remodelled = pg_remodelled_columns(table)
+        if remodelled:
+            sources.setdefault(_split_qualified(table.name)[1], []).append((table.name, remodelled))
+    enum_types = _enum_cast_types(tables)
+    ordered = _dependency_order(
+        list(views),
+        name_of=lambda view: view.name,
+        text_of=lambda view: view.definition or "",
+        has_header=False,
+    )
+    out: dict[str, PgViewRemodelling] = {}
+    for view in ordered:
+        definition = view.definition or ""
+        if not definition:
+            out[view.name] = PgViewRemodelling(definition)
+            continue
+        emitted, rewritten = _rewrite_enum_casts(definition, enum_types)
+        named = {
+            quoted.replace('""', '"') if quoted is not None else fold_identifier(bare)
+            for quoted, bare in (m.groups() for m in _VIEW_IDENTIFIER_RE.finditer(definition))
+        }
+        references: list[tuple[str, str, str, str]] = []
+        for name in sorted(named & sources.keys()):
+            for relation, columns in sources[name]:
+                if relation == view.name:
+                    continue
+                references.extend(
+                    (relation, column, old, new)
+                    for column, (old, new) in columns.items()
+                    if column in named
+                )
+        result = PgViewRemodelling(emitted, tuple(references), tuple(rewritten))
+        if result.flagged:
+            sources.setdefault(_split_qualified(view.name)[1], []).append(
+                (view.name, {column: (old, new) for _r, column, old, new in references})
+            )
+        out[view.name] = result
+    return out
+
+
 def pg_view_remodelled_references(
     view: ViewDef, tables: "Sequence[TableDef]"
 ) -> "list[tuple[str, str, str, str]]":
-    """``(table, column, source type, target type)`` for each re-typed column of a table
-    ``view`` reads whose name its definition mentions. A text match, so it errs toward
-    naming a column: the view is then flagged for a review rather than reaching apply with
-    an expression that relies on the old type (an array subscript, a range operator) and
-    failing there, or quietly changing what it returns. Pure."""
-    definition = view.definition or ""
-    if not definition:
-        return []
-    found: list[tuple[str, str, str, str]] = []
-    for table in tables:
-        remodelled = pg_remodelled_columns(table)
-        if not remodelled:
-            continue
-        _schema, bare = _split_qualified(table.name)
-        if not _mentions_identifier(definition, bare):
-            continue
-        for column, (old, new) in remodelled.items():
-            if _mentions_identifier(definition, column):
-                found.append((table.name, column, old, new))
-    return found
+    """The re-typed columns ``view`` itself reads from ``tables`` (no other view in sight;
+    :func:`pg_views_remodelling` follows views over views). Pure."""
+    return list(pg_views_remodelling([view], tables)[view.name].references)
 
 
-def _rewrite_enum_casts(definition: str, tables: "Sequence[TableDef]") -> str:
-    """``definition`` with every cast to a converted enum type (``'x'::mood``,
-    ``CAST(c AS app.mood)``) made a cast to text: the type does not exist on Aurora DSQL
-    (no CREATE TYPE), and its columns become text, so the cast is what made CREATE VIEW
-    fail. Only these casts change; the rest of the body stays verbatim."""
-    names = {
-        column.mysql_type.strip()
+_IDENTIFIER_PART = r'"(?:[^"]|"")+"|[A-Za-z_][\w$]*'
+_CAST_TARGET_RE = re.compile(rf"\s*((?:{_IDENTIFIER_PART})(?:\s*\.\s*(?:{_IDENTIFIER_PART}))*)")
+
+
+def _type_parts(spelling: str) -> "tuple[str, ...]":
+    """A type name's parts as PostgreSQL compares them: quoted as written, unquoted folded."""
+    return tuple(
+        quoted.replace('""', '"') if quoted else fold_identifier(bare)
+        for quoted, bare in re.findall(r'"((?:[^"]|"")+)"|([A-Za-z_][\w$]*)', spelling)
+    )
+
+
+def _enum_cast_types(tables: "Sequence[TableDef]") -> "dict[tuple[str, ...], str]":
+    """``{type parts: spelling}`` of the enum types the conversion turns into text."""
+    return {
+        _type_parts(column.mysql_type): column.mysql_type.strip()
         for table in tables
         for column in table.columns
         if column.type_kind == "enum" and column.enum_labels and column.mysql_type
     }
-    for name in sorted(names, key=len, reverse=True):
-        parts = [re.escape(part.strip('"')) for part in name.split(".")]
-        pattern = r'\.'.join(rf'"?{part}"?' for part in parts)
-        definition = re.sub(
-            rf"(::\s*|\bAS\s+)(?:[\w\"]+\.)?{pattern}(?![\w\"$])",
-            lambda match: match.group(1) + "text",
-            definition,
-            flags=re.IGNORECASE,
+
+
+def _rewrite_enum_casts(
+    definition: str, enum_types: "Mapping[tuple[str, ...], str]"
+) -> "tuple[str, list[str]]":
+    """``(definition, rewritten types)``: each ``::`` cast to a converted enum type
+    (``'x'::mood``, ``(c)::app.mood``) made a cast to text -- the type does not exist on
+    Aurora DSQL (no CREATE TYPE) and its columns become text. Token-aware: a string
+    literal, a quoted identifier or a dollar-quoted body is never touched, an alias
+    (``AS status``) is not a cast (pg_get_viewdef and pg_get_expr always write ``::``),
+    a type is matched by its exact parts (``b.status`` is not ``status``), and an array
+    of the enum (``::mood[]``) is left as it is. The rest stays byte-for-byte."""
+    if not enum_types or "::" not in definition:
+        return definition, []
+    out: list[str] = []
+    rewritten: set[str] = set()
+    i, n = 0, len(definition)
+    while i < n:
+        ch = definition[i]
+        word_before = i > 0 and (definition[i - 1].isalnum() or definition[i - 1] in "_$")
+        if ch == "'" or (ch in "eE" and definition[i + 1 : i + 2] == "'" and not word_before):
+            escape = ch in "eE"
+            j = i + (2 if escape else 1)
+            while j < n:
+                if escape and definition[j] == "\\":
+                    j += 2
+                    continue
+                if definition[j] == "'":
+                    if definition[j + 1 : j + 2] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(definition[i:j])
+            i = j
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if definition[j] == '"':
+                    if definition[j + 1 : j + 2] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(definition[i:j])
+            i = j
+            continue
+        if ch == "$" and not word_before:
+            tag = re.match(r"\$(?:[A-Za-z_]\w*)?\$", definition[i:])
+            if tag is not None:
+                close = definition.find(tag.group(0), i + len(tag.group(0)))
+                j = n if close < 0 else close + len(tag.group(0))
+                out.append(definition[i:j])
+                i = j
+                continue
+        if definition.startswith("::", i):
+            target = _CAST_TARGET_RE.match(definition, i + 2)
+            if target is not None:
+                after = target.end()
+                rest = definition[after:].lstrip()
+                spelling = enum_types.get(_type_parts(target.group(1)))
+                if spelling is not None and not rest.startswith("["):
+                    out.append(definition[i : target.start(1)] + "text")
+                    rewritten.add(spelling)
+                    i = after
+                    continue
+            out.append("::")
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), sorted(rewritten)
+
+
+def remodelled_reference_note(
+    references: "Sequence[tuple[str, str, str, str]]", rewritten: "Sequence[str]" = ()
+) -> str:
+    """The note for a view the conversion changes underneath (Schema Conversion and
+    Evaluation): the re-typed columns it reads, and the enum casts rewritten to text."""
+    sentences: list[str] = []
+    if references:
+        listed = ", ".join(f"{t}.{c} ({old} -> {new})" for t, c, old, new in references)
+        sentences.append(f"This view reads columns Schema Conversion re-types: {listed}.")
+    if rewritten:
+        sentences.append(
+            f"{'Its' if references else 'This view'} casts to {', '.join(rewritten)} (an enum "
+            "the conversion makes text, a type Aurora DSQL does not have) are rewritten to "
+            "text, so a comparison or sort over them follows text order, not the enum's "
+            "declared order."
         )
-    return definition
-
-
-def remodelled_reference_note(references: "Sequence[tuple[str, str, str, str]]") -> str:
-    """The note for a view that reads re-typed columns (Schema Conversion and Evaluation)."""
-    listed = ", ".join(f"{t}.{c} ({old} -> {new})" for t, c, old, new in references)
-    return (
-        f"This view reads columns Schema Conversion re-types: {listed}. A cast to a "
-        "converted enum is rewritten to text, but an expression that relies on the old "
-        "type -- an array subscript or ANY(), a range operator, an enum ordering -- fails "
-        "at apply or returns something else on Aurora DSQL. Review the view's target DDL "
-        "before applying."
+    sentences.append(
+        "An expression that relies on the old type -- an array subscript or ANY(), a range "
+        "operator, an enum ordering -- fails at apply or returns something else on Aurora "
+        "DSQL. Review the view's target DDL before applying."
     )
+    return " ".join(sentences)
 
 
 def _remodelled_reference_warnings(
-    view: ViewDef, tables: "Sequence[TableDef]"
+    view: ViewDef, remodelling: "PgViewRemodelling"
 ) -> "list[ConversionWarning]":
-    references = pg_view_remodelled_references(view, tables)
-    if not references:
+    if not remodelling.flagged:
         return []
     return [
         ConversionWarning(
             object_name=view.name,
             classification=Classification.MANUAL,
             kind=ConversionNoteKind.LOSS,
-            message=remodelled_reference_note(references),
+            message=remodelled_reference_note(remodelling.references, remodelling.rewritten),
         )
     ]
 
@@ -6380,6 +6544,8 @@ __all__ = [
     "parse_target_column_constraints",
     "parse_target_column_default_texts",
     "views_in_dependency_order",
+    "pg_views_remodelling",
+    "PgViewRemodelling",
     "dropped_default_notes",
     "parse_target_column_types",
     "parse_target_identity_columns",

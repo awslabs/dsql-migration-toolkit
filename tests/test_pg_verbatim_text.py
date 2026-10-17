@@ -512,3 +512,92 @@ def test_a_view_over_re_typed_columns_is_flagged_and_its_enum_casts_become_text(
         SourceInventory(tables=[orders], views=[plain])
     ).views
     assert clean.warnings == [] and clean.target_ddl.endswith("SELECT o.id FROM app.orders o")
+
+
+def _enum_table(name="app.orders", enum_type="order_status"):
+    return TableDef(
+        name=name,
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="status", mysql_type=enum_type, type_kind="enum",
+                      enum_labels=["pending", "shipped", "delivered"]),
+            ColumnDef(name="tags", mysql_type="text[]", type_kind="array"),
+        ],
+        primary_key=["id"],
+    )
+
+
+def test_the_enum_cast_rewrite_touches_only_casts_to_the_converted_type() -> None:
+    """The rewrite renamed an alias spelled like the enum (`END AS status` -> `AS text`),
+    rewrote string literals and a built-in cast matching a quoted enum case-insensitively,
+    and another schema's type of the same bare name -- in views graded AUTO."""
+    from dsql_migrator.core.converter import _enum_cast_types, _rewrite_enum_casts
+
+    types = _enum_cast_types([_enum_table(enum_type="status"), _enum_table("app.t2", '"Interval"')])
+    body = (
+        "SELECT CASE WHEN done THEN 'x'::text END AS status, 'shown as status'::text AS label, "
+        "(started_at + '14 days'::interval) AS ends, (code)::b.status AS other, "
+        "'a''b::status'::status AS lit, E'it\\'s ::status'::text AS esc, "
+        "'y'::\"Interval\" AS q, $$ ::status $$ AS body, ARRAY['p']::status[] AS arr FROM jobs"
+    )
+    out, rewritten = _rewrite_enum_casts(body, types)
+    assert out == body.replace("'a''b::status'::status", "'a''b::status'::text").replace(
+        "'y'::\"Interval\"", "'y'::text"
+    )
+    assert rewritten == ['"Interval"', "status"]
+
+
+def test_a_view_over_a_flagged_view_is_flagged_too() -> None:
+    """v_progressed names v_orders, not orders, so it read AUTO in both steps while its
+    rewritten 'shipped'::text compared text order (only 'shipped', not 'delivered')."""
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.models import SourceInventory
+
+    inventory = SourceInventory(
+        tables=[_enum_table()],
+        views=[
+            ViewDef(name="app.v_progressed",
+                    definition=" SELECT id, tags[1] AS first_tag FROM app.v_orders "
+                               "WHERE status >= 'shipped'::order_status;"),
+            ViewDef(name="app.v_orders", definition=" SELECT id, status, tags FROM app.orders;"),
+            ViewDef(name="app.v_plain", definition=" SELECT 1 AS status;"),
+        ],
+    )
+    result = SchemaConverter(source_type=_PG).convert(inventory)
+    by_view = {v.view: v for v in result.views}
+    (note,) = by_view["app.v_progressed"].warnings
+    assert "app.v_orders.status (order_status -> text)" in note.message
+    assert "app.v_orders.tags (text[] -> jsonb)" in note.message
+    assert "WHERE status >= 'shipped'::text" in by_view["app.v_progressed"].target_ddl
+    assert by_view["app.v_plain"].warnings == []
+    assert "AS status" in by_view["app.v_plain"].target_ddl
+    report = CompatibilityAssessor(source_type=_PG).assess(inventory)
+    graded = {i.object_name: i for i in report.items}
+    assert graded["app.v_progressed"].classification.value == "MANUAL"
+    assert graded["app.v_progressed"].risk == note.message
+
+
+def test_the_view_analysis_is_once_per_inventory() -> None:
+    """Per view it rebuilt every table's re-typed columns: 2,000 tables x 300 views took
+    seconds in convert() and assess(), on the UI's event loop."""
+    import time
+
+    from dsql_migrator.core.converter import pg_views_remodelling
+
+    tables = [
+        TableDef(
+            name=f"app.t{i}",
+            columns=[ColumnDef(name=f"c{j}", mysql_type="text") for j in range(30)]
+            + [ColumnDef(name="tags", mysql_type="text[]", type_kind="array")],
+            primary_key=["c0"],
+        )
+        for i in range(2000)
+    ]
+    views = [
+        ViewDef(name=f"app.v{k}", definition=f" SELECT c1, tags FROM app.t{k};")
+        for k in range(300)
+    ]
+    started = time.perf_counter()
+    remodelling = pg_views_remodelling(views, tables)
+    assert time.perf_counter() - started < 3.0
+    assert remodelling["app.v7"].references == (("app.t7", "tags", "text[]", "jsonb"),)
