@@ -866,12 +866,10 @@ def test_pg_geometric_key_column_is_not_mislabeled_as_bytea() -> None:
 # --- Tier-4 PG index metadata + relation surfacing ---------------------------
 
 
-def test_pg_partial_and_nonbtree_indexes_warn_but_still_emit() -> None:
-    # A PostgreSQL PARTIAL index (WHERE predicate) and a non-btree method (GIN/GiST/...) have
-    # no Aurora DSQL equivalent (btree-only, no partial index). The converter still emits a
-    # plain btree/full CREATE INDEX ASYNC (never silently dropped), but MUST warn MANUAL/LOSS
-    # -- a partial UNIQUE becoming a FULL unique changes semantics, and a GIN becomes a plain
-    # btree that the operators it served cannot use.
+def test_pg_partial_index_keeps_its_predicate_and_nonbtree_warns() -> None:
+    # Aurora DSQL accepts a partial index (CREATE INDEX ASYNC ... WHERE), so the predicate is
+    # carried and a partial UNIQUE keeps its semantics. A non-btree method (GIN/GiST/...) has
+    # no DSQL equivalent: the index is emitted as a plain btree with a MANUAL/LOSS warning.
     from dsql_migrator.core.models import ConversionNoteKind, IndexDef
 
     table = TableDef(
@@ -884,15 +882,15 @@ def test_pg_partial_and_nonbtree_indexes_warn_but_still_emit() -> None:
         ],
     )
     r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert 'CREATE UNIQUE INDEX ASYNC "ix_active" ON "public"."docs" ("active") WHERE active IS true' in r.index_ddls
     index_warnings = [
         w for w in r.warnings
         if w.classification is Classification.MANUAL
         and w.kind is ConversionNoteKind.LOSS
-        and ("partial" in w.message.lower() or "btree" in w.message.lower())
+        and "btree" in w.message.lower()
     ]
-    assert index_warnings, "expected a partial/non-btree index warning"
-    msg = index_warnings[0].message
-    assert "ix_active" in msg and "ix_body" in msg and "gin" in msg.lower()
+    (msg,) = [w.message for w in index_warnings]
+    assert "ix_body" in msg and "gin" in msg.lower() and "ix_active" not in msg
 
 
 def test_pg_plain_btree_index_produces_no_index_metadata_warning() -> None:
@@ -1838,3 +1836,70 @@ def test_the_read_expression_matches_the_type_the_converter_now_emits() -> None:
             assert "AS numeric)" in read, read
         else:
             assert "AS text)" in read, read
+
+
+def test_an_index_dsql_cannot_build_is_not_emitted_and_said_so() -> None:
+    """json/jsonb/interval/timetz have no index support on Aurora DSQL: the CREATE INDEX
+    ASYNC failed at apply (a GIN over jsonb, emitted as btree, is the common case), and a
+    key over one had its CREATE TABLE rejected while Evaluation read AUTO."""
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="app.events",
+        columns=[
+            _col("id", "bigint", False),
+            _col("doc", "jsonb"),
+            _col("span", "interval day to second"),
+            _col("at_tz", "time with time zone"),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ix_doc", columns=["doc"], method="gin"),
+            IndexDef(name="ux_span", columns=["span"], unique=True),
+            IndexDef(name="ix_at", columns=["at_tz"]),
+        ],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert r.index_ddls == []
+    (note,) = [w for w in r.warnings if "cannot index json" in w.message]
+    assert note.classification is Classification.MANUAL
+    assert "ix_doc (on doc jsonb)" in note.message and "ux_span" in note.message
+    assert "uniqueness is NOT enforced" in note.message
+    # Not also claimed as a btree substitute or a key-size risk.
+    assert not any("ix_doc" in w.message for w in r.warnings if w is not note)
+
+    keyed = table.model_copy(update={"primary_key": ["span"], "indexes": []})
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(keyed)
+    (note,) = [w for w in r.warnings if "cannot index json" in w.message]
+    assert note.classification is Classification.UNSUPPORTED and "REJECTED" in note.message
+
+
+def test_a_partial_index_predicate_is_carried_unless_it_reads_a_retyped_column() -> None:
+    from dsql_migrator.core.models import IndexDef
+
+    table = TableDef(
+        name="app.orders",
+        columns=[
+            _col("id", "bigint", False),
+            _col("email", "text"),
+            ColumnDef(name="status", mysql_type="app.order_status", type_kind="enum",
+                      enum_labels=["new", "paid"]),
+            ColumnDef(name="tags", mysql_type="text[]", type_kind="array"),
+        ],
+        primary_key=["id"],
+        indexes=[
+            IndexDef(name="ix_paid", columns=["email"], where="(status = 'paid'::app.order_status)"),
+            IndexDef(name="ux_vip", columns=["email"], unique=True, where="(tags @> '{vip}'::text[])"),
+            IndexDef(name="ix_vip", columns=["email"], where="(tags @> '{vip}'::text[])"),
+        ],
+    )
+    r = SchemaConverter(source_type=SourceType.POSTGRES).convert_table(table)
+    assert r.index_ddls == [
+        # The enum became text, so its cast does too.
+        'CREATE INDEX ASYNC "ix_paid" ON "app"."orders" ("email") WHERE (status = \'paid\'::text)',
+        # A predicate over the array (now jsonb) cannot be carried: a full index ...
+        'CREATE INDEX ASYNC "ix_vip" ON "app"."orders" ("email")',
+    ]  # ... and the UNIQUE one is left out rather than enforced over every row.
+    (note,) = [w for w in r.warnings if "cannot be carried" in w.message]
+    assert "ix_vip is created as a FULL index" in note.message
+    assert "ux_vip is UNIQUE and NOT emitted" in note.message and "(tags)" in note.message

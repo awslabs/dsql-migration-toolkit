@@ -612,6 +612,8 @@ def test_default_rules_source_type_seam() -> None:
         # PostgreSQL partial / non-btree indexes and column collations.
         "PG_INDEX_NOT_PRESERVED",
         "PG_COLLATION_DROPPED",
+        # Keys and indexes over json/jsonb/interval/timetz columns (no index support).
+        "PG_UNINDEXABLE_COLUMN",
         # A PostgreSQL view over enum / array / range columns the conversion re-types.
         "VIEW_REMODELLED_COLUMN",
     }

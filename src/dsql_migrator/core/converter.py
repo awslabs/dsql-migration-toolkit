@@ -2761,6 +2761,52 @@ def _pg_unsupported_key_columns(table: TableDef) -> set[str]:
     return excluded
 
 
+# The DSQL column types with "Index support: No" on the supported-data-types page (bytea,
+# the other one, has its own handling): a column of one is valid, but it cannot be part of
+# a primary key or an index.
+_DSQL_UNINDEXABLE_BASES = frozenset({"json", "jsonb", "time with time zone", "timetz"})
+
+
+def _pg_unindexable_native_columns(table: TableDef) -> "dict[str, str]":
+    """``{column: type}`` of the PG-source columns Aurora DSQL keeps as they are but cannot
+    index: json, jsonb, interval (with any fields) and time with time zone. A substituted
+    type is judged by :func:`_pg_unsupported_key_columns` instead."""
+    from dsql_migrator.core.converter_postgres import (
+        normalize_pg_base_type,
+        substitute_pg_unsupported_type,
+    )
+
+    found: dict[str, str] = {}
+    for column in table.columns:
+        if column.type_kind in ("enum", "composite", "domain") or not column.mysql_type:
+            continue
+        if substitute_pg_unsupported_type(column.mysql_type, type_kind=column.type_kind)[0]:
+            continue
+        base = normalize_pg_base_type(column.mysql_type)
+        if base in _DSQL_UNINDEXABLE_BASES or base.split(" ", 1)[0] == "interval":
+            found[column.name] = column.mysql_type
+    return found
+
+
+def _carried_index_predicate(table: TableDef, index: IndexDef) -> Optional[str]:
+    """A PostgreSQL partial index's ``WHERE`` predicate as Aurora DSQL is given it (it
+    accepts partial indexes: ``CREATE INDEX ASYNC ... WHERE``), with each cast to a
+    converted enum made a cast to text. ``None`` for a full index, or for a predicate that
+    reads a column the conversion re-types otherwise (an array now jsonb, a range now
+    text), whose meaning the new type changes."""
+    predicate = (index.where or "").strip()
+    if not predicate:
+        return None
+    by_name = {column.name: column for column in table.columns}
+    if any(
+        by_name[name].type_kind != "enum" and _mentions_identifier(predicate, name)
+        for name in pg_remodelled_columns(table)
+        if name in by_name
+    ):
+        return None
+    return _rewrite_enum_casts(predicate, [table])
+
+
 def _emittable_secondary_indexes(
     table: TableDef, *, is_postgres: bool = False
 ) -> list[IndexDef]:
@@ -2785,6 +2831,9 @@ def _emittable_secondary_indexes(
     # that cannot be a valid column, let alone indexed -- skip an index over them too.
     if is_postgres:
         skip_columns |= _pg_unsupported_key_columns(table)
+        # ... and the types Aurora DSQL keeps but cannot index (json/jsonb/interval/timetz;
+        # reported by _pg_unindexable_column_warning).
+        skip_columns |= set(_pg_unindexable_native_columns(table))
     # An expression index reflected with an incomplete column set (SQLAlchemy dropped its
     # expression key-part) would create a WRONG, narrower index, so it is skipped entirely
     # (reported by _expression_index_warning).
@@ -2796,6 +2845,16 @@ def _emittable_secondary_indexes(
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
             continue
         if any(column in skip_columns for column in index.columns):
+            continue
+        # A partial UNIQUE index whose predicate cannot be carried would enforce uniqueness
+        # over every row -- refusing rows the source allowed -- so it is left out
+        # (reported by _pg_partial_or_nonbtree_index_warning).
+        if (
+            is_postgres
+            and index.unique
+            and (index.where or "").strip()
+            and _carried_index_predicate(table, index) is None
+        ):
             continue
         kept.append(index)
     return kept
@@ -2842,9 +2901,12 @@ def _build_index_ddls(
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_identifier(column) for column in index.columns)
         name = renamed.get(index.name, index.name)
+        # A PostgreSQL partial index keeps its predicate: Aurora DSQL accepts it.
+        predicate = _carried_index_predicate(table, index) if is_postgres else None
         statements.append(
             f"CREATE {unique}INDEX ASYNC {_quote_pg_identifier(name)} "
             f"ON {table_identifier} ({columns})"
+            + (f" WHERE {predicate}" if predicate else "")
         )
     return statements
 
@@ -4108,6 +4170,10 @@ def _key_size_warning(
     # the unbounded-varlen fallback (an unrecognized type is assumed max-width).
     if is_postgres:
         skip_columns |= _pg_unsupported_key_columns(table)
+        # ... and the json/jsonb/interval/timetz columns DSQL cannot index at all
+        # (_pg_unindexable_column_warning says so).
+        skip_columns |= set(_pg_unindexable_native_columns(table))
+    emitted = {index.name for index in _emittable_secondary_indexes(table, is_postgres=is_postgres)}
 
     def estimate(columns: list[str]) -> int:
         return sum(_estimate_key_column_bytes(create, c) for c in columns)
@@ -4120,11 +4186,13 @@ def _key_size_warning(
                 f"the primary key ({', '.join(target_pk)}) at up to ~{pk_bytes} bytes"
             )
     for index in table.indexes:
-        # Skip an index the converter does not emit anyway (over the 8-column cap, or
-        # on a bytea column).
+        # Skip an index the converter does not emit anyway (over the 8-column cap, on a
+        # column DSQL cannot index, a partial UNIQUE whose predicate cannot be carried).
         if len(index.columns) > _DSQL_MAX_PK_COLUMNS:
             continue
         if any(column in skip_columns for column in index.columns):
+            continue
+        if index.name not in emitted and index.name not in set(table.expression_indexes):
             continue
         index_bytes = estimate(index.columns)
         if index_bytes > _DSQL_MAX_KEY_BYTES:
@@ -4323,38 +4391,61 @@ def _prefix_index_warning(table: TableDef) -> Optional[ConversionWarning]:
 def _pg_partial_or_nonbtree_index_warning(
     table: TableDef,
 ) -> Optional[ConversionWarning]:
-    """Warn that a PostgreSQL PARTIAL index / non-btree method is not preserved on DSQL.
+    """Warn about the PostgreSQL index features the target does not keep as they are.
 
-    Aurora DSQL builds only btree secondary indexes and has no partial (predicate) index,
-    yet ``_build_index_ddls`` emits every index as a plain ``CREATE INDEX ASYNC`` -- so
-    without this note the metadata is dropped silently:
-
-    - a PARTIAL index's ``WHERE`` predicate is dropped, turning it into a FULL index. For a
-      partial UNIQUE index this ENFORCES uniqueness over ALL rows (a semantics change), and
-      CREATE INDEX ASYNC even fails if the previously-excluded rows held duplicates;
-    - a GIN/GiST/BRIN/hash index is emitted as a plain btree, which does not serve the
-      operators/queries the specialized access method existed for.
-
-    The index is still emitted (never silently dropped), but it is NOT equivalent -- a
-    LOSS the operator must see before a multi-hour load. PostgreSQL-source only: the
-    ``where``/``method`` fields are ``None`` on every MySQL index.
+    Aurora DSQL builds only btree secondary indexes, so a GIN/GiST/BRIN/hash index is
+    emitted as a plain btree, which does not serve the operators its method existed for.
+    A PARTIAL index keeps its predicate (Aurora DSQL accepts ``CREATE INDEX ASYNC ...
+    WHERE``) -- except when the predicate reads a column the conversion re-types (an array
+    now jsonb, a range now text): then a non-UNIQUE one is created as a FULL index, and a
+    UNIQUE one is left out, because over every row it would refuse rows the source allowed.
+    An index the conversion does not emit at all (over a column DSQL cannot index) is
+    reported by that column's note instead. PostgreSQL-source only: the ``where`` /
+    ``method`` fields are ``None`` on every MySQL index.
     """
-    partial = [index.name for index in table.indexes if (index.where or "").strip()]
+    emitted = {index.name for index in _emittable_secondary_indexes(table, is_postgres=True)}
+    uncarried = [
+        index
+        for index in table.indexes
+        if (index.where or "").strip() and _carried_index_predicate(table, index) is None
+    ]
+    full = [index.name for index in uncarried if not index.unique and index.name in emitted]
+    left_out = [index.name for index in uncarried if index.unique]
     nonbtree = [
         (index.name, index.method)
         for index in table.indexes
-        if index.method and index.method.strip().lower() not in ("", "btree")
+        if index.method
+        and index.method.strip().lower() not in ("", "btree")
+        and index.name in emitted
     ]
-    if not partial and not nonbtree:
+    if not full and not left_out and not nonbtree:
         return None
     parts: list[str] = []
-    if partial:
-        parts.append(
-            f"partial index(es) {', '.join(partial)} carry a WHERE predicate DSQL cannot "
-            "express, so the predicate is dropped and a FULL index is created (a partial "
-            "UNIQUE index then enforces uniqueness over ALL rows -- a semantics change, "
-            "and CREATE INDEX ASYNC fails if the previously-excluded rows held duplicates)"
+    if full or left_out:
+        kinds = {column.name: column.type_kind for column in table.columns}
+        reread = sorted(
+            {
+                name
+                for index in uncarried
+                for name in pg_remodelled_columns(table)
+                if kinds.get(name) != "enum" and _mentions_identifier(index.where or "", name)
+            }
         )
+        partial = (
+            f"the predicate of partial index(es) {', '.join(full + left_out)} reads "
+            f"column(s) the conversion re-types ({', '.join(reread)}), so it cannot be "
+            "carried"
+        )
+        if full:
+            partial += f": {', '.join(full)} {'is' if len(full) == 1 else 'are'} created as a FULL index"
+        if left_out:
+            partial += (
+                f"{';' if full else ':'} {', '.join(left_out)} "
+                f"{'is' if len(left_out) == 1 else 'are'} UNIQUE and NOT emitted (over "
+                "every row it would refuse rows the source allowed), so that uniqueness is "
+                "not enforced until you re-create it with a predicate over the new type"
+            )
+        parts.append(partial)
     if nonbtree:
         listed = ", ".join(f"{name} ({method})" for name, method in nonbtree)
         parts.append(
@@ -4367,11 +4458,70 @@ def _pg_partial_or_nonbtree_index_warning(
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
         message=(
-            "Aurora DSQL secondary indexes are btree-only and cannot be partial: "
+            "Aurora DSQL secondary indexes are btree-only: "
             + "; ".join(parts)
-            + ". Move the affected search outside the database (e.g. a full-text or "
-            "geospatial service) or redesign the query, and re-check uniqueness for any "
-            "partial UNIQUE index before loading."
+            + ". Move a search a non-btree method served outside the database (e.g. a "
+            "full-text or geospatial service) or redesign the query."
+        ),
+    )
+
+
+def _pg_unindexable_column_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """Name what Aurora DSQL cannot build over a json, jsonb, interval or time with time
+    zone column (each has "Index support: No"): a primary key over one has the CREATE
+    TABLE rejected (UNSUPPORTED), and a secondary index over one is NOT emitted (a doomed
+    CREATE INDEX ASYNC would fail at apply) -- a UNIQUE one's uniqueness then goes
+    unenforced. Shared with Evaluation (PG_UNINDEXABLE_COLUMN). PostgreSQL-source only."""
+    unindexable = _pg_unindexable_native_columns(table)
+    if not unindexable:
+        return None
+    keyed = [name for name in table.primary_key or () if name in unindexable]
+    unsupported = _pg_unsupported_key_columns(table)  # those indexes have their own note
+    skipped = [
+        index
+        for index in table.indexes
+        if any(column in unindexable for column in index.columns)
+        and not any(column in unsupported for column in index.columns)
+    ]
+    if not keyed and not skipped:
+        return None
+
+    def _typed(names: "Sequence[str]") -> str:
+        return ", ".join(f"{name} {unindexable[name]}" for name in names)
+
+    parts: list[str] = []
+    if keyed:
+        parts.append(
+            f"the primary key includes {_typed(keyed)}, so the generated CREATE TABLE "
+            "will be REJECTED as-is and neither the table nor its data migrates -- give "
+            "the table a key of indexable columns before applying"
+        )
+    if skipped:
+        listed = "; ".join(
+            f"{index.name} (on {_typed([c for c in index.columns if c in unindexable])})"
+            for index in skipped
+        )
+        part = (
+            f"secondary index(es) {listed} were NOT emitted (queries relying on them fall "
+            "back to a scan)"
+        )
+        unique = [index.name for index in skipped if index.unique]
+        if unique:
+            part += (
+                f"; {', '.join(unique)} {'is' if len(unique) == 1 else 'are'} UNIQUE, so "
+                "that uniqueness is NOT enforced on the target"
+            )
+        parts.append(part)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.UNSUPPORTED if keyed else Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            "Aurora DSQL cannot index json, jsonb, interval or time with time zone columns: "
+            + "; also, ".join(parts)
+            + ". For a json/jsonb column, index the value the queries look up instead, with "
+            "an expression index (CREATE INDEX ASYNC ... ((doc->>'sku'))), which Aurora "
+            "DSQL supports."
         ),
     )
 
@@ -5808,10 +5958,11 @@ class SchemaConverter:
             _partitioned_table_warning(table, is_postgres=is_postgres),
             (_unsupported_index_type_warning(table) if not is_postgres else None),
             (_prefix_index_warning(table) if not is_postgres else None),
-            # PostgreSQL partial / non-btree indexes lose their predicate / access method
-            # on DSQL (btree-only, no partial index); the MySQL FULLTEXT/SPATIAL and
-            # prefix-index notes above are the MySQL analogs of this.
+            # PostgreSQL non-btree indexes lose their access method on DSQL (btree-only),
+            # and a partial one whose predicate reads a re-typed column its predicate; the
+            # MySQL FULLTEXT/SPATIAL and prefix-index notes above are the MySQL analogs.
             (_pg_partial_or_nonbtree_index_warning(table) if is_postgres else None),
+            (_pg_unindexable_column_warning(table) if is_postgres else None),
             _too_many_columns_warning(table),
             _too_many_indexes_warning(
                 table, len(extra_index_ddls), is_postgres=is_postgres

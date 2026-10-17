@@ -1780,13 +1780,27 @@ def expression_index_rule() -> ConversionWarningRule:
 
 
 def pg_index_not_preserved_rule() -> ConversionWarningRule:
-    """PostgreSQL partial and non-btree indexes (PG_INDEX_NOT_PRESERVED)."""
+    """PostgreSQL non-btree indexes, and partial ones whose predicate reads a re-typed
+    column (PG_INDEX_NOT_PRESERVED)."""
     return ConversionWarningRule(
         "PG_INDEX_NOT_PRESERVED",
         "_pg_partial_or_nonbtree_index_warning",
-        "Before loading, check that the rows a partial UNIQUE index left out hold no "
-        "duplicates; for a non-btree index, move that search outside the database or "
-        "redesign the query.",
+        "After apply, re-create a partial index the conversion could not carry with a "
+        "predicate over the column's new type; for a non-btree index, move that search "
+        "outside the database or redesign the query.",
+        EffortLevel.MEDIUM,
+    )
+
+
+def pg_unindexable_column_rule() -> ConversionWarningRule:
+    """Keys and indexes over PostgreSQL json/jsonb/interval/timetz columns, which Aurora
+    DSQL cannot index (PG_UNINDEXABLE_COLUMN)."""
+    return ConversionWarningRule(
+        "PG_UNINDEXABLE_COLUMN",
+        "_pg_unindexable_column_warning",
+        "Give a table keyed on such a column a key of indexable columns before applying; "
+        "for an index, index the looked-up value instead with an expression index after "
+        "the load, and enforce a UNIQUE one's rule in the application meanwhile.",
         EffortLevel.MEDIUM,
     )
 
@@ -3696,6 +3710,7 @@ __all__ = [
     "default_inventory_rules",
     "catalog_changed_items",
     "check_mixed_case_identifiers",
+    "pg_unindexable_column_rule",
     "default_rules",
     "CompatibilityAssessor",
     "render_text_report",

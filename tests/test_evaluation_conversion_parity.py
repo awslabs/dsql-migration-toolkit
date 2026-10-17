@@ -148,6 +148,31 @@ _PG_CORPUS = [
     _t("coll_col", [ColumnDef(name="n", mysql_type="text", collation="en_US")]),
     TableDef(name="app.nopk", columns=[_PK], primary_key=[]),
     _t("parted", partitioned=True),
+    # json/jsonb/interval/timetz have no index support on Aurora DSQL.
+    _t(
+        "jsonb_idx",
+        [ColumnDef(name="doc", mysql_type="jsonb")],
+        indexes=[IndexDef(name="ix_jsonb_idx_doc", columns=["doc"], method="gin")],
+    ),
+    TableDef(
+        name="app.interval_pk",
+        columns=[ColumnDef(name="span", mysql_type="interval", nullable=False)],
+        primary_key=["span"],
+    ),
+    # A partial UNIQUE index whose predicate reads a column the conversion re-types.
+    _t(
+        "partial_retyped",
+        [
+            ColumnDef(name="e", mysql_type="text"),
+            ColumnDef(name="tags", mysql_type="text[]", type_kind="array"),
+        ],
+        indexes=[
+            IndexDef(
+                name="ix_partial_retyped_e", columns=["e"], unique=True,
+                where="(tags @> '{vip}'::text[])",
+            )
+        ],
+    ),
 ]
 
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
@@ -217,3 +242,10 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
     assert mysql["app.idx_reuse_a"] == mysql["app.idx_reuse_b"] == "NAME_COLLISION"
     assert pg["app.bytea_pk"] == "BYTEA_KEY"
     assert pg["app.bare_numeric"] == "PG_UNCONSTRAINED_NUMERIC"
+    concerns = {
+        item.object_name: {c.rule_id for c in item.concerns or ()}
+        for item, _ in _grades(SourceType.POSTGRES, _PG_CORPUS)
+    }
+    assert "PG_UNINDEXABLE_COLUMN" in concerns["app.jsonb_idx"]
+    assert pg["app.interval_pk"] == "PG_UNINDEXABLE_COLUMN"  # UNSUPPORTED: leads the item
+    assert "PG_INDEX_NOT_PRESERVED" in concerns["app.partial_retyped"]

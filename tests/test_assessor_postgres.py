@@ -33,6 +33,7 @@ _EXPECTED_PG_RULE_IDS = {
     "CDC_UNCARRYABLE_COLUMN",
     # PG-specific conversion warnings, decided by the converter's own helpers.
     "PG_INDEX_NOT_PRESERVED",
+    "PG_UNINDEXABLE_COLUMN",
     "PG_COLLATION_DROPPED",
     # PG-specific: a view over columns the conversion re-types.
     "VIEW_REMODELLED_COLUMN",

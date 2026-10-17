@@ -300,10 +300,10 @@ class IndexDef(BaseModel):
         default=None,
         description=(
             "PostgreSQL PARTIAL-index predicate (the reflected ``postgresql_where`` "
-            "clause, e.g. ``active IS true``), if any. Aurora DSQL has no partial index, "
-            "so the converter emits the index WITHOUT the predicate (a FULL index) and "
-            "warns -- for a UNIQUE partial index this changes uniqueness semantics "
-            "(uniqueness would then be enforced over ALL rows). None for a normal "
+            "clause, e.g. ``active IS true``), if any. Aurora DSQL accepts a partial "
+            "index, so the converter emits it with this predicate -- unless the predicate "
+            "reads a column the conversion re-types, when a non-UNIQUE index is emitted "
+            "FULL and a UNIQUE one not at all, with a warning. None for a normal "
             "(non-partial) index and for every MySQL index."
         ),
     )

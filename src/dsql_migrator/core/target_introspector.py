@@ -1347,7 +1347,9 @@ def unique_index_state(
         "JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid "
         "JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid "
         "JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace "
-        f"WHERE ix.indisunique AND {where_relation}"
+        # A partial unique index (Schema Conversion carries PostgreSQL's) is unique only
+        # within its predicate, so it is no key for the stream.
+        f"WHERE ix.indisunique AND ix.indpred IS NULL AND {where_relation}"
     )
     cursor = None
     try:
