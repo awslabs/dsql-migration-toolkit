@@ -482,12 +482,39 @@ def _for_update_warnings(tree: exp.Expression) -> list[QueryWarning]:
     return warnings
 
 
+def _drop_from_dual(tree: exp.Expression) -> None:
+    """``SELECT ... FROM DUAL`` without its FROM, in place: MySQL's DUAL is no table on
+    Aurora DSQL (the converted SQL failed with 'relation "dual" does not exist'), and a
+    PostgreSQL SELECT needs no FROM, WHERE included. Only a FROM that is DUAL alone."""
+    for select in tree.find_all(exp.Select):
+        source = select.args.get("from_") or select.args.get("from")
+        table = getattr(source, "this", None)
+        if (
+            isinstance(table, exp.Table)
+            and not table.args.get("db")
+            and table.name.lower() == "dual"
+            and not table.alias
+            and not select.args.get("joins")
+        ):
+            select.set("from_" if "from_" in select.args else "from", None)
+
+
 def _mixed_case_name_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
     """MANUAL when the statement names a table or column unquoted with upper-case ASCII
     letters. MySQL matched it whatever the case; Aurora DSQL folds an unquoted name to
     lower case while Schema Conversion keeps the source spelling (quoted), so the same SQL
     finds nothing after cut over. Quoting is not done for the operator: this converter
     does not know the schema, and "Orders" would break a table actually named orders."""
+    # The names the statement defines itself -- a table alias (FROM orders AS O), a CTE
+    # (WITH Recent AS ...), a select-list alias (id AS UserId, used again in ORDER BY), and
+    # DUAL -- are folded the same where they are defined and where they are used, so they
+    # run unchanged on Aurora DSQL: quoting them as advised would break the query.
+    fold = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    defined = {"dual"}
+    for node in tree.find_all(exp.TableAlias, exp.CTE, exp.Alias):
+        name = node.alias if isinstance(node, (exp.CTE, exp.Alias)) else node.name
+        if name:
+            defined.add(name.translate(fold))
     names: list[str] = []
     for node in (*tree.find_all(exp.Table), *tree.find_all(exp.Column)):
         for part in (node.args.get("this"), node.args.get("table"), node.args.get("db")):
@@ -495,6 +522,7 @@ def _mixed_case_name_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
                 isinstance(part, exp.Identifier)
                 and not part.quoted
                 and any("A" <= ch <= "Z" for ch in part.name)
+                and part.name.translate(fold) not in defined
                 and part.name not in names
             ):
                 names.append(part.name)
@@ -586,6 +614,7 @@ class QueryConverter:
             if on_duplicate_warning is not None:
                 warnings.append(on_duplicate_warning)
             warnings.extend(_rewrite_json_unquote(tree))
+            _drop_from_dual(tree)
             if mixed_case is not None:
                 warnings.append(mixed_case)
         _inline_having_aliases(tree)
