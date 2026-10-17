@@ -7859,6 +7859,96 @@ def cdc_foreign_keys_in_stream_scope(preserved, streamed, inventory):
     }
 
 
+def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark):
+    """``[(table, CDC leaves out, the target computes)]`` for each streamed table whose
+    GENERATED columns the capture (read from the applied Schema Conversion DDL) and the
+    LIVE target disagree on. BLOCKING I/O.
+
+    The capture set follows the DDL in Schema Conversion, but a GENERATED edit that never
+    reached the target (an edit after the apply, a cancelled Replace, a target built
+    outside the tool) leaves an ordinary column there: CDC would stop writing it -- inserts
+    NULL or DEFAULT, updates stale -- with nothing dead-lettered, while Full Load's append
+    path, which reads the live catalog, wrote it. The other way round every change is
+    refused (428C9). Only tables with a GENERATED column on either side are read; an
+    unreadable one is reported as unknown (``None``), never as agreeing."""
+    from dsql_migrator.core.converter import (
+        parse_target_generated_columns,
+        pg_preserved_generated_columns,
+    )
+    from dsql_migrator.core.target_introspector import target_generated_columns
+    from dsql_migrator.ui.data_migration._models import (
+        applied_conversions_of,
+        target_generated_capture_columns,
+    )
+
+    applied = applied_conversions_of(migration_state)
+    tables = _cdc_tables_for_config(migration_state, inventory, watermark)
+    connect = None  # built for the first table that needs a read: most have none
+    mismatched: list = []
+    for table in tables:
+        expected = set(target_generated_capture_columns(table, applied))
+        ddl = getattr((applied or {}).get(table.name), "target_ddl", None)
+        if not expected and not (ddl and parse_target_generated_columns(ddl)) and not (
+            pg_preserved_generated_columns(table)
+        ):
+            continue  # nothing generated on either side: nothing to disagree about
+        if connect is None:
+            try:
+                connect = _cdc_fk_connection_factory(session)
+            except Exception:  # noqa: BLE001 - no usable target: unknown, never agreeing
+                connect = None
+        live = (
+            target_generated_columns(table.name, connection_factory=connect)
+            if connect is not None
+            else None
+        )
+        if live is None:
+            mismatched.append((table.name, sorted(expected), None))
+            continue
+        keys = set(getattr(table, "primary_key", None) or ())
+        by_lower = {c.name.lower(): c.name for c in table.columns}
+        live_source = {
+            name if name in by_lower.values() else by_lower.get(name.lower(), name)
+            for name in live
+        } - keys
+        if live_source != expected:
+            mismatched.append((table.name, sorted(expected), sorted(live_source)))
+    return mismatched
+
+
+def _cdc_generated_mismatch_notice(mismatched) -> tuple:
+    """The Start CDC refusal for :func:`_probe_cdc_generated_mismatch`."""
+    lines = []
+    for table, expected, live in mismatched[:5]:
+        if live is None:
+            lines.append(f"{table}: the target's columns could not be read")
+            continue
+        left_out = [c for c in expected if c not in live]
+        sent = [c for c in live if c not in expected]
+        parts = []
+        if left_out:
+            parts.append(
+                f"{', '.join(left_out)} GENERATED in Schema Conversion but ordinary on the "
+                "target (CDC would stop writing it)"
+            )
+        if sent:
+            parts.append(
+                f"{', '.join(sent)} GENERATED on the target but not in Schema Conversion "
+                "(every change would be refused, 428C9)"
+            )
+        lines.append(f"{table}: " + "; ".join(parts))
+    more = f" (and {len(mismatched) - 5} more)" if len(mismatched) > 5 else ""
+    return (
+        "error",
+        "functions",
+        "The target's generated columns differ from Schema Conversion",
+        "CDC leaves out the columns the target computes, read from the Schema Conversion "
+        "DDL, but the target does not match it: " + "; ".join(lines) + more + ". Apply the "
+        "table again from Schema Conversion (Replace), or edit its DDL back to what the "
+        "target has, then Start CDC. Nothing was changed.",
+    )
+
+
 def _probe_cdc_blocking_foreign_keys(migration_state, session, inventory, watermark):
     """Read the target's enforced FKs on the to-be-streamed tables. BLOCKING I/O.
 
@@ -8618,6 +8708,17 @@ def _start_cdc_deploy(
                     _clause[:1].upper() + _clause[1:],
                     _cdc_fk_block_body(fk_state, can_remove_here=False, bounded=True),
                 ),
+                getattr(handle, "job_id", None),
+            )
+        # The GENERATED columns the capture leaves out (from the applied DDL) must be the
+        # ones the live target computes (G46): fails closed on an unreadable table.
+        _generated_mismatch = _probe_cdc_generated_mismatch(
+            migration_state, session, inventory, watermark
+        )
+        if _generated_mismatch:
+            raise _start_refusal(
+                migration_state,
+                _cdc_generated_mismatch_notice(_generated_mismatch),
                 getattr(handle, "job_id", None),
             )
         # BACKSTOP for the PostgreSQL publication/slot precondition, on the worker thread

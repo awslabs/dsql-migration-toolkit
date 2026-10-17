@@ -343,7 +343,10 @@ class ValueConverter:
             column.name
             for column in table.columns
             if column.mysql_type.strip().lower().split("(", 1)[0] == "time"
-            and self._kinds.get(column.name) in _DURATION_TARGET_KINDS
+            and (
+                self._kinds.get(column.name) in _DURATION_TARGET_KINDS
+                or (self._kinds.get(column.name) or "").startswith("interval")
+            )
         )
         # Fast-path: columns whose target kind needs no conversion (int, varchar,
         # numeric, text, etc.). For a typical OLTP table 80-90% of columns fall

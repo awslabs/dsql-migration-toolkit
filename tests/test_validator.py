@@ -1833,7 +1833,7 @@ def test_checksum_temporal_columns_fixed_fraction_no_zone() -> None:
     mysql_sql, pg_sql, _mysql_tok, _pg_tok = _all_four_rendered(_typed_table())
     # MySQL: fixed 6-digit fraction, no zone.
     assert "DATE_FORMAT(`created_at`, '%Y-%m-%d %H:%i:%s.%f')" in mysql_sql
-    assert "DATE_FORMAT(`t_of_day`, '%H:%i:%s.%f')" in mysql_sql
+    assert "TIME_FORMAT(`t_of_day`, '%H:%i:%s.%f')" in mysql_sql
     # PG: a plain timestamp (DATETIME -> created_at) renders DIRECTLY -- AT TIME ZONE
     # 'UTC' is NOT a no-op on `timestamp without time zone` (it converts through the
     # session TimeZone and shifts the wall-clock), so it must NOT be applied here.

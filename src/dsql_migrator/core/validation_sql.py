@@ -290,10 +290,12 @@ def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str
     # as a count of microseconds on both ends, so the spelling a write path chose (Full
     # Load's and the sink's [-]HH:MM:SS[.f], or an older '1 day 06:00:00') cannot matter,
     # and a TIME(6)'s fixed fraction ('05:00:00.000000') is no mismatch.
+    applied_base = (applied or "").split("(", 1)[0].strip().lower()
     if (
         not source_is_postgres
         and base == "time"
-        and (applied or "").split("(", 1)[0].strip().lower() in _DURATION_TARGET_KINDS
+        # interval(6), interval hour to second: one kind, whatever the fields/precision.
+        and (applied_base in _DURATION_TARGET_KINDS or applied_base.startswith("interval"))
     ):
         return "duration"
     # PostgreSQL timetz must be detected on the FULL type string BEFORE the "(" split
@@ -432,7 +434,11 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         # Fixed 6-digit fraction, no zone -> matches PG to_char(... 'YYYY-MM-DD HH24:MI:SS.US').
         return f"DATE_FORMAT({ident}, '%Y-%m-%d %H:%i:%s.%f')"
     if kind == "time":
-        return f"DATE_FORMAT({ident}, '%H:%i:%s.%f')"
+        # TIME_FORMAT, not DATE_FORMAT: DATE_FORMAT reads a TIME as a DATETIME (today plus
+        # the time), so 24:00:00 -- which Aurora DSQL's time holds and Full Load writes --
+        # printed as the next day's 00:00:00 and could never match. Identical for
+        # 00:00:00..23:59:59.999999.
+        return f"TIME_FORMAT({ident}, '%H:%i:%s.%f')"
     if kind == "duration":
         # Signed microseconds; HOUR/MINUTE/SECOND/MICROSECOND of a negative TIME are the
         # magnitude's parts, so the sign is applied once.

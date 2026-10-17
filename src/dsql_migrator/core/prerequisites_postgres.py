@@ -1280,7 +1280,9 @@ def check_columns_replicable(
     found = [c for c in (per_table.get(table.name) or ()) if c.column not in skip]
     if not found:
         return None
-    detail, remediation = uncarryable_column_texts(found)
+    detail, remediation = uncarryable_column_texts(
+        found, defaulted=target_defaulted_columns(table)
+    )
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
         title=_COLUMN_REPLICABLE_TITLE,
@@ -1292,18 +1294,46 @@ def check_columns_replicable(
     )
 
 
+def target_defaulted_columns(table: TableDef) -> "set[str]":
+    """The columns of a PostgreSQL ``table`` that Schema Conversion gives a DEFAULT on the
+    target: an insert that leaves one out takes it rather than NULL. Pure."""
+    from dsql_migrator.core.converter_postgres import pg_column_default_sql
+
+    return {
+        column.name
+        for column in table.columns
+        if pg_column_default_sql(column, is_key_column=column.name in table.primary_key)[0]
+        is not None
+    }
+
+
 def uncarryable_column_texts(
     found: "Sequence[UncarryableCdcColumn]",
+    *,
+    defaulted: "Iterable[str]" = (),
 ) -> "tuple[str, str]":
     """``(what happens, what to do)`` for ``found``: the Step 3 ``COLUMN_REPLICABLE`` row's
     wording, which Evaluation's ``CDC_UNCARRYABLE_COLUMN`` finding repeats, so both steps
-    describe the same columns the same way. Pure."""
+    describe the same columns the same way. ``defaulted`` names the columns that have a
+    DEFAULT on the target. Pure."""
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
-    # Left out of the event: NULL on a nullable column, but a NOT NULL one has every insert
-    # and update refused -- Aurora DSQL checks NOT NULL before ON CONFLICT.
-    dropped = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
-    refused = [c for c in dropped if c.nullable is False]
-    nulled = [c for c in dropped if c.nullable is not False]
+    has_default = set(defaulted)
+    lost = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
+    # A bit(n)[] stays IN the event, as a field Debezium failed to convert: a nullable one
+    # is NULL on every insert and update, but a NOT NULL one is a required field left null,
+    # which stops the PostgreSQL source connector (event.processing.failure.handling.mode
+    # defaults to fail) -- nothing is dead-lettered, and every captured table stops.
+    present = [c for c in lost if _catalog_discriminators(c.declared_type)[:2] == (True, "bit")]
+    stopped = [c for c in present if c.nullable is False]
+    nulled_always = [c for c in present if c.nullable is not False]
+    # The others are left OUT of the event, so the sink's upsert never names them: an
+    # insert takes the column's DEFAULT (or NULL) and an update leaves it as it was -- but
+    # a NOT NULL one with no DEFAULT has every insert and update refused, because Aurora
+    # DSQL checks NOT NULL before ON CONFLICT.
+    dropped = [c for c in lost if c not in present]
+    refused = [c for c in dropped if c.nullable is False and c.column not in has_default]
+    landed_default = [c for c in dropped if c.column in has_default]
+    nulled = [c for c in dropped if c.nullable is not False and c.column not in has_default]
     wrong = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
 
     sentences: list[str] = []
@@ -1317,22 +1347,37 @@ def uncarryable_column_texts(
             "reached for a non-NULL value, live-verified -- so this is not necessarily the "
             "whole table."
         )
+    if stopped:
+        sentences.append(
+            f"{_describe_columns(stopped)} {_is_are(stopped)} NOT NULL, and Debezium cannot "
+            f"convert {'it' if len(stopped) == 1 else 'them'}: the first change to this table "
+            "leaves a required field null, which STOPS the PostgreSQL source connector -- "
+            "CDC halts for every captured table, and nothing is dead-lettered."
+        )
     if refused:
         sentences.append(
             f"{_describe_columns(refused)} {_is_are(refused)} dropped from the change event "
-            "but NOT NULL on the target, so Aurora DSQL refuses EVERY insert and update CDC "
-            "writes for this table (SQLSTATE 23502): they are dead-lettered (counted on the "
-            "CDC step's dead-letter panel) and do not reach the target."
+            "but NOT NULL with no DEFAULT on the target, so Aurora DSQL refuses EVERY insert "
+            "and update CDC writes for this table (SQLSTATE 23502): they are dead-lettered "
+            "(counted on the CDC step's dead-letter panel) and do not reach the target."
         )
     # "Separately" because when the table already dead-letters, a column-level loss is a
     # SECOND finding about the same table rather than a milder description of the first.
-    lead = "Separately, " if fatal or refused else ""
-    if nulled:
+    lead = "Separately, " if fatal or refused or stopped else ""
+    if nulled_always:
         sentences.append(
-            f"{lead}{_describe_columns(nulled)} {_is_are(nulled)} dropped from the change "
-            f"event, so {_it_they(nulled)} NULL on every row CDC delivers."
+            f"{lead}{_describe_columns(nulled_always)} {_is_are(nulled_always)} sent "
+            f"unconverted, so {_it_they(nulled_always)} NULL on every row CDC delivers."
         )
         lead = ""
+    for group, lands in ((nulled, "NULL"), (landed_default, "the column's DEFAULT")):
+        if group:
+            sentences.append(
+                f"{lead}{_describe_columns(group)} {_is_are(group)} dropped from the change "
+                f"event, so a row CDC inserts gets {lands} and an update leaves "
+                f"{'it' if len(group) == 1 else 'them'} as before (stale)."
+            )
+            lead = ""
     if wrong:
         sentences.append(
             f"{lead}{_describe_columns(wrong)} "

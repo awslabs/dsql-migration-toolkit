@@ -3738,6 +3738,14 @@ def capture_exclusions_for(
         {t: set(c) for t, c in (raw_stored or {}).items()}, inventory)
     legacy = format_column_exclude_list(legacy_columns)
     deployed = deployed_value
+    # The 0.1.561 form is kept only for a stack that carries it AND only while the capture
+    # adds nothing it cannot express: it is built from the stored exclusions alone, so a
+    # stack deployed with nothing excluded carries '' -- the legacy formula's value too --
+    # and a column made GENERATED afterwards was never left out: every change of its table
+    # was refused (428C9) with the stack reading "as deployed".
+    legacy_sets = {t: set(c) for t, c in legacy_columns.items()}
+    if any(set(cols) - legacy_sets.get(t, set()) for t, cols in generated.items()):
+        legacy = None
     sent = choose_column_exclude_value(value, legacy, deployed)
     error: "Optional[str]" = None
     inexact: "tuple[str, ...]" = ()

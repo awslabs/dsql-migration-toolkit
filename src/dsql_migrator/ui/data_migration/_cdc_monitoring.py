@@ -1863,8 +1863,8 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
         "the Aurora DSQL column is GENERATED (it computes its own value), and the change "
         "records carry one, so DSQL rejected every insert and update for this table "
         "(SQLSTATE 428C9). This is not a source change: the column is GENERATED on the "
-        "target but not in the conversion CDC started with (made so afterwards, or outside "
-        "Schema Conversion), so the stream still carries its value",
+        "target but the stream still carries its value -- the capture was set up before "
+        "the column became GENERATED (in Schema Conversion or outside it)",
     ),
     "check-violation": (
         "a CHECK constraint rejected the row",
@@ -2393,9 +2393,11 @@ def _ddl_runbook(drift, migration_type, *, is_pg: bool, migration_state=None) ->
         parts.append(check)
     if "generated-column" in by_kind:
         generated = (
-            f"For {names('generated-column')} (a GENERATED column was sent a value): make it "
-            "an ordinary column on Aurora DSQL with ALTER TABLE ... ALTER COLUMN ... DROP "
-            "EXPRESSION (it keeps the stored values), so new changes apply again."
+            f"For {names('generated-column')} (a GENERATED column was sent a value): if the "
+            "column is meant to be GENERATED, as Schema Conversion has it, Stop CDC and Start "
+            "CDC again -- the capture is then updated to leave it out; otherwise make it an "
+            "ordinary column on Aurora DSQL with ALTER TABLE ... ALTER COLUMN ... DROP "
+            "EXPRESSION (it keeps the stored values). Either way new changes apply again."
         )
         if not cdc_only:
             generated += (

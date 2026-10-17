@@ -1408,7 +1408,9 @@ def _column_types(create_ddl: str) -> "tuple[tuple[str, str], ...]":
         kind = column_def.args.get("kind")
         if not name or kind is None:
             continue
-        types[name] = kind.sql(dialect="postgres").split("(", 1)[0].strip().lower()
+        spelled = kind.sql(dialect="postgres").split("(", 1)[0].strip().lower()
+        # interval(6) reads 'interval 6': one kind, whatever its precision or fields.
+        types[name] = "interval" if spelled.startswith("interval") else spelled
     return tuple(types.items())
 
 
@@ -1452,9 +1454,24 @@ def _sub_outside_quotes(pattern: "re.Pattern[str]", repl: str, text: str) -> str
     return "".join(out)
 
 
+# An interval type's fields and precision (``INTERVAL HOUR TO SECOND(6)``, ``interval
+# second(3)``), which Aurora DSQL documents and sqlglot's postgres reader rejects: a table
+# with one read as unparsable, so every applied-DDL reader fell back to the SOURCE type
+# (a TIME remapped that way failed its Full Load as if never remapped).
+_INTERVAL_FIELDS_RE = re.compile(
+    r"\bINTERVAL\s+(?:YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)"
+    r"(?:\s+TO\s+(?:MONTH|HOUR|MINUTE|SECOND))?(?:\s*\(\s*\d+\s*\))?",
+    re.IGNORECASE,
+)
+
+
 def _strip_identity_clauses(create_ddl: str) -> str:
-    """The DDL with every identity clause removed (outside quotes; see above)."""
-    return _sub_outside_quotes(_IDENTITY_CLAUSE_RE, "", create_ddl or "")
+    """The DDL with every identity clause removed and every interval type's fields dropped
+    (outside quotes; see above): what sqlglot's postgres reader can parse."""
+    return _sub_outside_quotes(
+        _INTERVAL_FIELDS_RE, "INTERVAL",
+        _sub_outside_quotes(_IDENTITY_CLAUSE_RE, "", create_ddl or ""),
+    )
 
 
 class TargetValueSpec(NamedTuple):
@@ -1761,7 +1778,15 @@ def parse_target_generated_columns(create_ddl: str, *, folded: bool = False) -> 
     them as PostgreSQL stores them (quoted as written, unquoted folded), which is how the
     column-exclusion rule and the overlay's DDL facts compare, beside the other folded
     readers.
+
+    Cached by DDL text (every CDC capture-set reading parses each captured table's DDL,
+    several times per render of the CDC step); the returned set is a fresh copy.
     """
+    return set(_generated_columns(create_ddl or "", folded))
+
+
+@lru_cache(maxsize=DDL_CACHE_SIZE)
+def _generated_columns(create_ddl: str, folded: bool) -> "frozenset[str]":
     # Strip the identity clause FIRST. sqlglot cannot parse the CACHE option (which is
     # exactly why the identity is injected as raw text -- see _apply_pk_strategy), so any
     # applied DDL carrying an identity column raises ParseError. That would return "no
@@ -1772,9 +1797,9 @@ def parse_target_generated_columns(create_ddl: str, *, folded: bool = False) -> 
     try:
         parsed = sqlglot.parse_one(stripped, read="postgres")
     except Exception:  # noqa: BLE001 - unparseable DDL -> unknown (send the column)
-        return set()
+        return frozenset()
     if not isinstance(parsed, exp.Create):
-        return set()
+        return frozenset()
     generated: set[str] = set()
     for column_def in parsed.find_all(exp.ColumnDef):
         name = column_def.name
@@ -1801,7 +1826,7 @@ def parse_target_generated_columns(create_ddl: str, *, folded: bool = False) -> 
             ):
                 generated.add(_folded_name(column_def.this) if folded else name)
                 break
-    return generated
+    return frozenset(generated)
 
 
 # The raw-text shape of a stored generated column clause (anchored: see above).

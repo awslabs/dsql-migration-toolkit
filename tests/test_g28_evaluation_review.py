@@ -2474,7 +2474,7 @@ def test_a_not_null_column_cdc_drops_has_every_write_refused_not_landed_null() -
     assert {c.column: c.nullable for c in found} == {"area": False, "q": True}
     what, todo = uncarryable_column_texts(found)
     assert "refuses EVERY insert and update CDC writes for this table (SQLSTATE 23502)" in what
-    assert "`q` (tsquery)" in what and "NULL on every row" in what  # the nullable one
+    assert "`q` (tsquery)" in what and "a row CDC inserts gets NULL" in what  # the nullable one
     assert "drop the NOT NULL from the target DDL" in todo
     unknown = [UncarryableCdcColumn("c", "box", UNCARRYABLE_COLUMN_ARRIVES_NULL)]
     assert "23502" not in uncarryable_column_texts(unknown)[0]  # not read: as before

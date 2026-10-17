@@ -113,3 +113,42 @@ def test_the_picker_choice_brings_its_own_notes() -> None:
     # Nothing stored: the default conversion's notes, as before.
     (plain,) = generate_previews([TABLE_PREFIX + "shop.users"], inventory, result)
     assert "KEEPS its value generation" in " ".join(w.message for w in plain.warnings)
+
+
+def test_a_column_cdc_drops_is_worded_by_its_target_default() -> None:
+    """'refuses EVERY insert and update' ignored a target DEFAULT (rows land with it), and
+    'NULL on every row' an update (the upsert never names the column: it stays as it was);
+    a NOT NULL bit(n)[] stops the PostgreSQL source connector instead."""
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL,
+        UncarryableCdcColumn,
+        target_defaulted_columns,
+        uncarryable_column_texts,
+    )
+
+    def col(name: str, type_: str, nullable: bool) -> UncarryableCdcColumn:
+        return UncarryableCdcColumn(
+            column=name, declared_type=type_, reason=UNCARRYABLE_COLUMN_ARRIVES_NULL,
+            nullable=nullable,
+        )
+
+    table = TableDef(
+        name="app.t",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="spans", mysql_type="interval[]", type_kind="array", nullable=False,
+                      default="'{}'::interval[]"),
+        ],
+        primary_key=["id"],
+    )
+    assert target_defaulted_columns(table) == {"spans"}
+    what, _todo = uncarryable_column_texts(
+        [col("spans", "interval[]", False)], defaulted=target_defaulted_columns(table)
+    )
+    assert "refuses" not in what
+    assert "a row CDC inserts gets the column's DEFAULT and an update leaves it as before" in what
+    what, todo = uncarryable_column_texts([col("flags", "bit(8)[]", False)])
+    assert "STOPS the PostgreSQL source connector" in what and "refuses" not in what
+    assert "drop the NOT NULL" not in todo  # the source schema is what makes it required
+    what, _todo = uncarryable_column_texts([col("flags", "bit(8)[]", True)])
+    assert "NULL on every row CDC delivers" in what

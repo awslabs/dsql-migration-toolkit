@@ -1924,7 +1924,9 @@ def test_uncarryable_columns_name_the_column_the_type_and_the_consequence() -> N
     )
     assert lossy is not None
     assert "`iv_arr` (interval[])" in lossy.detail
-    assert "it arrives NULL on every row CDC delivers" in lossy.detail
+    # Left out of the event: the upsert never names it, so an insert gets NULL (no DEFAULT)
+    # and an update leaves the Full Load value -- not "NULL on every row".
+    assert "a row CDC inserts gets NULL and an update leaves it as before (stale)" in lossy.detail
     assert "`oid_arr` (oid[])" in lossy.detail
     assert "CHECKSUM" in lossy.detail, "silent loss: name the only surface that sees it"
     assert "dead-letter" not in lossy.detail.split("SILENT")[0], (
@@ -1948,7 +1950,7 @@ def test_uncarryable_columns_name_the_column_the_type_and_the_consequence() -> N
     assert both is not None
     assert both.detail.startswith("CDC cannot render `b_arr` (bytea[])")
     assert "Separately, `iv_arr` (interval[]), `xml_arr` (xml[]) are dropped" in both.detail
-    assert "they arrive NULL" in both.detail, "two columns -> plural"
+    assert "an update leaves them as before" in both.detail, "two columns -> plural"
 
 
 def test_uncarryable_columns_warn_and_do_not_block_the_deploy_or_the_full_load() -> None:

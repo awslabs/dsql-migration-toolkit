@@ -1491,6 +1491,7 @@ class PgCdcUncarryableColumnRule(Rule):
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
         from dsql_migrator.core.prerequisites_postgres import (
+            target_defaulted_columns,
             uncarryable_column_texts,
             uncarryable_columns_of,
         )
@@ -1500,7 +1501,9 @@ class PgCdcUncarryableColumnRule(Rule):
             found = uncarryable_columns_of(table)
             if not found:
                 continue
-            detail, remediation = uncarryable_column_texts(found)
+            detail, remediation = uncarryable_column_texts(
+                found, defaulted=target_defaulted_columns(table)
+            )
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
