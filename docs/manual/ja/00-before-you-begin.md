@@ -125,7 +125,8 @@ _言語: [English](../en/00-before-you-begin.md) | [한국어](../ko/00-before-y
       → [§1.5](01-setup.md#15-ソースとターゲットへの接続)
 
 - [ ] **AI アシストはオプションで、Amazon Bedrock 専用です。** AI は**デフォルトでオフ**です。有効に
-      すると、AWS 認証情報（`bedrock:InvokeModel` 権限）を使って**もっぱら Amazon Bedrock を通じてのみ**
+      すると、AWS 認証情報（`bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream` の権限 —
+      チャットは応答をストリーミングします）を使って**もっぱら Amazon Bedrock を通じてのみ**
       動作し、選択したモデルは AWS アカウントで 1 回有効化されている必要があります（モデルの AWS
       Marketplace の契約（agreement）を承諾 — 第 2 章）。**直接 API キーを入力する手段はありません**
       （Anthropic/OpenAI のキー入力欄はありません）— AI を使う唯一の方法は Bedrock です。すべての提案は

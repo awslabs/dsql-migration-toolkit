@@ -2903,6 +2903,102 @@ def test_a_report_of_another_source_says_so_and_an_empty_one_names_its_database(
     assert "This report describes another source" not in same.texts
 
 
+def test_a_fresh_source_read_restamps_the_report_source_and_time() -> None:
+    """Refreshing the source kept the first run's label and time (dataclasses.replace
+    copied them): exports, the file name, the empty-database notice and the 'describes
+    another source' check kept naming shop above the objects of other."""
+    from dsql_migrator.core.models import AssessmentReport, SourceInventory
+    from dsql_migrator.ui.evaluation import with_refreshed_catalogs
+
+    result = EvaluationResult(
+        inventory=SourceInventory(tables=[]),
+        assessment=AssessmentReport(items=[]),
+        target_inventory=_empty_target(),
+        target_conflicts=[],
+        source_label="MySQL 8.0.39 at db.example:3306/shop",
+        assessed_at="2000-01-01 00:00:00 UTC",
+    )
+    target_only = with_refreshed_catalogs(
+        result,
+        inventory=result.inventory,
+        target_inventory=_empty_target(),
+        target_endpoint=None,
+    )
+    assert target_only.source_label == result.source_label
+    assert target_only.assessed_at == result.assessed_at
+    reread = with_refreshed_catalogs(
+        result,
+        inventory=SourceInventory(tables=[]),
+        target_inventory=_empty_target(),
+        target_endpoint=None,
+        source_label="MySQL 8.0.39 at db.example:3306/other",
+    )
+    assert reread.source_label == "MySQL 8.0.39 at db.example:3306/other"
+    assert reread.assessed_at and reread.assessed_at != result.assessed_at
+
+
+def test_both_source_refreshes_restamp_the_connected_source() -> None:
+    import inspect
+
+    from dsql_migrator.ui import data_migration, schema_conversion
+
+    for module in (schema_conversion, data_migration):
+        assert "source_label=session_source_label(session)" in inspect.getsource(module)
+
+
+def test_the_connected_source_label_carries_the_engine_a_run_stamps() -> None:
+    from dsql_migrator.ui.evaluation import session_source_label
+    from dsql_migrator.ui.session import SessionStore
+
+    session = SessionStore().get_or_create("s1")
+    assert session_source_label(session) is None
+    session.set_source(SourceConnectionConfig(host="db", port=3306, database="shop"), None)
+    session.set_source_version("8.0.39", "8.0.39")
+    assert session_source_label(session) == "MySQL 8.0.39 at db:3306/shop"
+
+
+def test_a_database_named_with_at_is_not_cut_and_hosts_compare_case_insensitively() -> None:
+    """source_address cut the label at its LAST ' at ', so a database 'sales at hq' read as
+    'hq' and every render warned that the report describes another source."""
+    from dsql_migrator.core.models import AssessmentReport, SourceInventory
+    from dsql_migrator.ui.evaluation import (
+        empty_inventory_message,
+        report_filename_stem,
+        same_source_address,
+        source_address,
+    )
+
+    for label in (
+        "PostgreSQL 16.4 at pg.example.com:5432/sales at hq",
+        "pg.example.com:5432/sales at hq",  # a restored label: no engine
+    ):
+        assert source_address(label) == "pg.example.com:5432/sales at hq"
+    assert source_address("MySQL at db:3306") == "db:3306"
+    assert source_address(None) is None and source_address("") is None
+    assert same_source_address("DB.Example.com:3306/shop", "db.example.com:3306/shop")
+    assert not same_source_address("db.example.com:3306/Shop", "db.example.com:3306/shop")
+    assert not same_source_address("db.example.com:3306/shop", "db.example.com:3307/shop")
+    result = EvaluationResult(
+        inventory=SourceInventory(tables=[]),
+        assessment=AssessmentReport(items=[]),
+        target_inventory=_empty_target(),
+        target_conflicts=[],
+        source_label="PostgreSQL 16.4 at pg.example.com:5432/sales at hq",
+    )
+    assert "No tables were found in sales at hq" in empty_inventory_message(result)
+    assert report_filename_stem(result, "2026-10-17 01:02:03 UTC") == (
+        "compatibility_assessment_sales-at-hq_20261017-010203"
+    )
+    from dsql_migrator.ui.evaluation import _render_result
+
+    ui = _ItemUi()
+    _render_result(
+        ui, result, eval_state=EvaluationState(),
+        live_source="PG.example.com:5432/sales at hq",
+    )
+    assert "This report describes another source" not in ui.texts
+
+
 def test_a_refresh_never_overwrites_a_newer_evaluation() -> None:
     """refresh_source / refresh_target / the Data Migration refresh stored their result
     after an await without checking: an Evaluation that finished meanwhile was replaced

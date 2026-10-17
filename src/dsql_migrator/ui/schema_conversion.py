@@ -2584,6 +2584,7 @@ def build_schema_conversion_screen(
 
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
+                    session_source_label,
                     set_result_if_unchanged,
                     with_refreshed_catalogs,
                 )
@@ -2618,6 +2619,7 @@ def build_schema_conversion_screen(
                         target_endpoint=old_result.target_endpoint,
                         source_type=source_conn.source_type,
                         vanished=list(getattr(introspector, "last_vanished", None) or []),
+                        source_label=session_source_label(session),
                     )
                     # Applied only over the result it was computed from: an Evaluation that
                     # finished while this ran is newer, and must not be overwritten.

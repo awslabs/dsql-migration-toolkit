@@ -317,6 +317,7 @@ def with_refreshed_catalogs(
     target_endpoint: "Optional[str]",
     source_type: "Optional[SourceType]" = None,
     vanished: "Optional[Sequence[str]]" = None,
+    source_label: Optional[str] = None,
 ) -> EvaluationResult:
     """``result`` with a re-read source inventory and/or target catalog, and what they feed.
 
@@ -324,6 +325,11 @@ def with_refreshed_catalogs(
     ``last_vanished``): it replaces the result's own CATALOG_CHANGED_DURING_READ item. With
     no fresh read (the result's own inventory: a target refresh, Generate, a restore) the
     item is carried, so the tables it names are not silently forgotten.
+
+    ``source_label`` is the source a fresh read came from (:func:`session_source_label`):
+    it re-stamps the report's Source and Assessed lines, which otherwise kept naming the
+    database the first run read -- in every export, the file name, the empty-database
+    notice and the "describes another source" check -- above another database's objects.
 
     The assessment is recomputed together with the catalogs: Aurora DSQL's database-level
     limits (tables, schemas, views per database) are counted against the TARGET as well as
@@ -378,6 +384,11 @@ def with_refreshed_catalogs(
         target_inventory=target_inventory,
         target_conflicts=_find_target_conflicts(inventory, target_inventory),
         target_endpoint=target_endpoint,
+        **(
+            {"source_label": source_label, "assessed_at": _utc_stamp()}
+            if source_label is not None
+            else {}
+        ),
     )
 
 
@@ -1098,6 +1109,13 @@ def set_result_if_unchanged(
     return True
 
 
+# The address of a describe_source() label -- its host, and its database when there is one:
+# the leftmost " at " (or the start) followed by a whole host[:port][/database].
+_SOURCE_ADDRESS_RE = re.compile(
+    r"(?:^| at )(?P<address>(?P<host>[^\s:/]+)(?::\d*)?(?:/(?P<database>.+))?)$"
+)
+
+
 def describe_source(
     config: "Optional[SourceConnectionConfig]", engine: Optional[str] = None
 ) -> Optional[str]:
@@ -1113,10 +1131,46 @@ def describe_source(
 
 
 def source_address(label: Optional[str]) -> Optional[str]:
-    """The ``host:port[/database]`` of a :func:`describe_source` label (``None`` without)."""
-    if not label:
+    """The ``host:port[/database]`` of a :func:`describe_source` label (``None`` without).
+
+    The address follows the FIRST `` at `` that starts one (an engine label holds no
+    `` at ``; a database name may: ``sales at hq``, which the last one cut to ``hq``).
+    """
+    match = _SOURCE_ADDRESS_RE.search(label or "")
+    return match.group("address") if match else None
+
+
+def same_source_address(a: Optional[str], b: Optional[str]) -> bool:
+    """Whether two :func:`source_address` values name one source: the host compares
+    case-insensitively (DNS does), the port and database exactly."""
+    if a is None or b is None:
+        return a == b
+    first, second = _SOURCE_ADDRESS_RE.search(a), _SOURCE_ADDRESS_RE.search(b)
+    if first is None or second is None:
+        return a == b
+
+    def key(match: "re.Match[str]") -> tuple[str, str]:
+        host = match.group("host")
+        return host.lower(), match.group("address")[len(host):]
+
+    return key(first) == key(second)
+
+
+def session_source_label(session: Any) -> Optional[str]:
+    """:func:`describe_source` of the session's connected source, with its engine, as a
+    run stamps it: what a fresh source read re-stamps a refreshed report with."""
+    config = getattr(session, "source_config", None)
+    if config is None:
         return None
-    return label.rsplit(" at ", 1)[-1].strip() or None
+    return describe_source(
+        config,
+        format_source_engine(
+            getattr(session, "source_server_version", None),
+            getattr(session, "source_engine_version", None),
+            getattr(session, "source_aurora_version", None),
+            source_type=config.source_type,
+        ),
+    )
 
 
 def _utc_stamp() -> str:
@@ -1317,8 +1371,6 @@ def report_metadata(result: EvaluationResult, *, exported_at: str) -> "list[tupl
     return lines
 
 
-# The host, and the database when there is one, of a describe_source() label.
-_SOURCE_ADDRESS_RE = re.compile(r"(?:^| at )([^\s:/]+)(?::\d*)?(?:/(.+))?$")
 
 
 def report_filename_stem(result: EvaluationResult, exported_at: str) -> str:
@@ -1327,7 +1379,7 @@ def report_filename_stem(result: EvaluationResult, exported_at: str) -> str:
     parts = ["compatibility_assessment"]
     match = _SOURCE_ADDRESS_RE.search(result.source_label or "")
     if match:
-        name = match.group(2) or match.group(1).split(".")[0]
+        name = match.group("database") or match.group("host").split(".")[0]
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")[:40]
         if slug:
             parts.append(slug)
@@ -2203,7 +2255,7 @@ def _render_result(
     # The SOURCE can change too (the Connect step accepts another host or database at any
     # time), and then every finding describes a database the migration will not read.
     assessed = source_address(result.source_label)
-    if assessed and live_source and assessed != live_source:
+    if assessed and live_source and not same_source_address(assessed, live_source):
         render_notice(
             ui,
             tone="warning",
@@ -2321,7 +2373,7 @@ def empty_inventory_message(result: EvaluationResult) -> "Optional[str]":
         return None
     others = [name for name in (inventory.sibling_databases or []) if name]
     match = _SOURCE_ADDRESS_RE.search(result.source_label or "")
-    database = (match.group(2) if match and match.group(2) else None) or "the connected database"
+    database = (match.group("database") if match else None) or "the connected database"
     scored = compute_migration_score(result.assessment) is not None
     body = (
         f"No tables were found in {database}, so there is nothing to migrate"

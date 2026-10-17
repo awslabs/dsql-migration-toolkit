@@ -510,7 +510,7 @@ Fargate — what differs is **where those permissions attach**:
 - **Required (both modes):** `dsql:DbConnect` / `dsql:DbConnectAdmin` to mint the
   DSQL IAM token (scoped to your cluster), plus read-only access to the source
   (MySQL or PostgreSQL). Optionally `secretsmanager:GetSecretValue` (to reuse a source-credentials
-  secret) and `bedrock:InvokeModel` (only if you enable AI-assist).
+  secret) and `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` (only if you enable AI-assist).
 - **Run locally** — the tool uses **your own IAM identity** via the standard
   credential chain (`~/.aws`, env vars, `AWS_PROFILE`, SSO), so *your* identity must
   hold those permissions directly. In particular, to use CDC your identity needs the
@@ -533,7 +533,7 @@ identity must hold them**):
 | **Target DSQL (always)** | `dsql:DbConnect`, `dsql:DbConnectAdmin` (mint the IAM token), `dsql:GetCluster` |
 | **Source (always)** | none in IAM — an ordinary read-only MySQL or PostgreSQL user/password (or the Secrets Manager secret below) |
 | **Source secret (optional)** | `secretsmanager:GetSecretValue` — only if the source credentials come from a Secrets Manager secret |
-| **AI assist (optional)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — scoped to the chosen model; only when AI is enabled |
+| **AI assist (optional)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — on the Fargate stack any Anthropic model unless `BedrockModelArns` narrows it (the EC2 stack scopes it to the chosen model); only when AI is enabled |
 | **CDC — deploy/tear down the pipeline** | the broad infra-creation set the cdc-stack needs: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; a wide `ec2:*` set (VPC subnets, NAT, EIP, route tables, security groups, VPC endpoints, network interfaces); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/… (the connector roles); `kafka:*` / `kafkaconnect:*` (MSK Serverless + MSK Connect); `logs:*`; `s3:*` on the plugin bucket. Full-Load-only migrations need **none** of this. |
 
 > **Full Load only** needs just the first three rows. **CDC** adds the last row —

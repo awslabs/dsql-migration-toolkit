@@ -201,7 +201,7 @@ every other parameter keeps a sensible default.
 | **Source DB reachability** | `SourceDbSecurityGroupId` (preferred) / `SourceDbCidr` | **Provide at least one** so the task gets egress to the source DB on `SourceDbPort`. `SourceDbSecurityGroupId` scopes egress to the source DB's SG; use `SourceDbCidr` if you have no SG id. With both empty the deploy is rejected (the task would have no route to the source). |
 | **Custom domain** | `AppDomainName` | Only if you front the ALB with your own Route 53 domain. |
 | **Public access / Cognito** | `AlbScheme`, `AllowedIngressCidr`, `EnableCognitoAuth`, `CognitoDomainPrefix` | Only to expose the UI publicly; defaults keep it `internal` (no login). |
-| **AI assist** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Only to enable Amazon Bedrock-assisted conversion (pick a model; IAM scope auto-derived). |
+| **AI assist** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Only to enable Amazon Bedrock-assisted conversion (pick a model; IAM allows any Anthropic model unless `BedrockModelArns` narrows it). |
 | **Custom image / sizing** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | Only for a private-ECR image or non-default task size. |
 
 </details>
@@ -573,9 +573,9 @@ Optional deep-dives — expand what you need; none of this is required for a fir
 | `CognitoDomainPrefix` | if Cognito | `""` | Globally-unique Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
 | `CognitoAdminEmail` | if Cognito | `""` | Email of the **first login user**, created by the stack. Cognito mails it a temporary password; the hosted UI asks for a new one on first sign-in. **Required with Cognito** — the user pool disables self sign-up, so without it the deploy succeeds and produces an app nobody can log in to (the template rejects that combination). Add more users later — see [§Create operator users](#create-operator-users-cognito--only-with-cognito). |
 | `EnableAiAssist` | no | `false` | Opt-in; grants `bedrock:InvokeModel` / `InvokeModelWithResponseStream` on Anthropic models. |
-| `BedrockModelArns` | no | `""` | **Optional override** of the invoke scope; blank = auto-derived from `BedrockModelId`. |
+| `BedrockModelArns` | no | `""` | **Optional override** that narrows the invoke scope; blank = any Anthropic model (so the UI can switch models without a redeploy). |
 | `BedrockRegion` | no | `""` | `BEDROCK_REGION` for the app. |
-| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic model (dropdown); IAM scope auto-derived from it. |
+| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic model (dropdown); the IAM scope does not depend on it. |
 
 ### Task sizing — `ContainerCpu` / `ContainerMemory`
 
@@ -1015,7 +1015,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 | `InstanceType` | no | `t3.large` | Control-plane host size. |
 | `StateVolumeSizeGiB` | no | `20` | Retained EBS state volume; size up for a large-table Full Load's local CSV spillover. |
 | `SourceSecretArn` | no | `""` | Only to reuse an existing source-creds secret (else enter username/password in the UI). |
-| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | no | off / `global.anthropic.claude-sonnet-5` | Same opt-in Bedrock AI assist as Fargate (IAM scope auto-derived from the model). |
+| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | no | off / `global.anthropic.claude-sonnet-5` | Opt-in Bedrock AI assist (on EC2 the IAM scope is derived from the model). |
 | `KeyName` | no | `""` | Optional SSH key; SSM is the primary access path, so usually left empty (the host has no inbound rule at all). |
 
 > [!WARNING]

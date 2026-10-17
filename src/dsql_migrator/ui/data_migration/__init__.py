@@ -1589,6 +1589,7 @@ def build_data_migration_screen(
                 from dsql_migrator.ui.evaluation import (
                     _default_introspector_factory,
                     _default_target_browser_factory,
+                    session_source_label,
                     with_refreshed_catalogs,
                 )
 
@@ -1639,6 +1640,7 @@ def build_data_migration_screen(
                     ),
                     source_type=session_source_type(session),
                     vanished=list(getattr(introspector, "last_vanished", None) or []),
+                    source_label=session_source_label(session),
                 )
                 from dsql_migrator.ui.evaluation import set_result_if_unchanged
 

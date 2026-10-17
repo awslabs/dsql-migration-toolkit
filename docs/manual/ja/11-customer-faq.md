@@ -456,8 +456,8 @@ Manager のユーザー名/パスワード — **IAM ではありません**。I
 
 - **必須（両モード）：** DSQL IAM トークンを発行するための `dsql:DbConnect` / `dsql:DbConnectAdmin`
   （お客様のクラスタにスコープされる）、加えてソース（MySQL または PostgreSQL）への読み取り専用アクセス。オプションで
-  `secretsmanager:GetSecretValue`（ソース認証情報のシークレットを再利用するため）と `bedrock:InvokeModel`
-  （AI アシストを有効にした場合のみ）。
+  `secretsmanager:GetSecretValue`（ソース認証情報のシークレットを再利用するため）と `bedrock:InvokeModel` /
+  `bedrock:InvokeModelWithResponseStream`（AI アシストを有効にした場合のみ）。
 - **ローカルで実行** — ツールは標準の認証情報チェーン（`~/.aws`、環境変数、`AWS_PROFILE`、SSO）を介して
   **お客様自身の IAM アイデンティティ** を使用するため、*お客様の* アイデンティティがこれらの権限を直接
   保持している必要があります。特に、CDC を使用するには、cdc-stack が CloudFormation を介して MSK、
@@ -477,7 +477,7 @@ Manager のユーザー名/パスワード — **IAM ではありません**。I
 | **ターゲット DSQL（常時）** | `dsql:DbConnect`、`dsql:DbConnectAdmin`（IAM トークン発行）、`dsql:GetCluster` |
 | **ソース（常時）** | IAM アクションなし — 読み取り専用の MySQL または PostgreSQL ユーザー/パスワード（または下記の Secrets Manager シークレット） |
 | **ソースシークレット（任意）** | `secretsmanager:GetSecretValue` — ソース認証情報が Secrets Manager シークレットにある場合のみ |
-| **AI アシスト（任意）** | `bedrock:InvokeModel`、`bedrock:InvokeModelWithResponseStream` — 選択したモデルにスコープ。AI を有効にした場合のみ |
+| **AI アシスト（任意）** | `bedrock:InvokeModel`、`bedrock:InvokeModelWithResponseStream` — Fargate スタックでは `BedrockModelArns` で絞らない限りすべての Anthropic モデル(EC2 スタックは選択したモデルにスコープ)。AI を有効にした場合のみ |
 | **CDC — パイプラインのデプロイ/削除** | cdc-stack が必要とする広範なインフラ作成権限: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`、広範な `ec2:*`（VPC サブネット・NAT・EIP・ルートテーブル・セキュリティグループ・VPC エンドポイント・ネットワークインターフェイス）、`iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…（コネクタロール）、`kafka:*` / `kafkaconnect:*`（MSK Serverless + MSK Connect）、`logs:*`、プラグインバケットへの `s3:*`。Full Load のみの移行では **一切不要**。 |
 
 > **Full Load のみ** なら上表の最初の 3 行だけで十分です。**CDC** は最後の行（広範なインフラ作成権限）を

@@ -267,6 +267,16 @@ class SessionSnapshot(BaseModel):
     source_port: Optional[int] = None
     source_database: Optional[str] = None
     source_username: Optional[str] = None
+    # The source the Evaluation result was read from (``EvaluationResult.source_label``:
+    # engine plus host:port/database, no credential) when it is NOT the connected source
+    # above -- the operator switched host or database on Connect after evaluating. The
+    # restore labelled the report with the live coordinates instead, which hid the
+    # "describes another source" notice and named the wrong database in every export.
+    # Left OUT of the payload while the two agree (the usual case), so a snapshot without
+    # it still loads on an older build (this model is extra="forbid").
+    evaluation_source_label: Optional[str] = Field(
+        default=None, exclude_if=lambda v: not v
+    )
     # AI Assist preference (non-secret: a toggle + Bedrock model id/region, never a
     # credential). Persisted so a reconnecting session keeps the user's choice
     # instead of resetting the toggle to off on every restart. Optional/defaulted

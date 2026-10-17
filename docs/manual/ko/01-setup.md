@@ -53,7 +53,8 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 - 표준 자격증명 체인(환경 변수, `~/.aws`, 또는 명명된 프로파일)으로 도달 가능한 AWS 자격증명으로,
   **Aurora DSQL IAM 토큰 생성**(`dsql:DbConnect` / `dsql:DbConnectAdmin`) 권한 필요. 선택적으로
   `secretsmanager:GetSecretValue`(소스 자격증명이 Secrets Manager에 있을 때),
-  `bedrock:InvokeModel`(AI 어시스트를 켤 때).
+  `bedrock:InvokeModel`과 `bedrock:InvokeModelWithResponseStream`(AI 어시스트를 켤 때; 채팅은 응답을
+  스트리밍하므로 앞의 것만으로는 부족합니다).
 
 **AWS 배포 시** — 전체는 [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md) 참조. 요약은 §1.3.
 

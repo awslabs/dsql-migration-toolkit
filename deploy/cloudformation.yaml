@@ -120,11 +120,11 @@ Metadata:
       EnableAiAssist:
         default: "Enable AI assist  [Optional, default off] — AI-assisted schema conversion via Amazon Bedrock"
       BedrockModelArns:
-        default: "Bedrock model ARN(s)  [Optional] — blank = auto-derive from the model id"
+        default: "Bedrock model ARN(s)  [Optional] — blank = any Anthropic model; set to narrow the IAM scope"
       BedrockRegion:
         default: "Bedrock region  [Optional]"
       BedrockModelId:
-        default: "Bedrock model id  [Optional] — Anthropic model for AI assist; IAM scope auto-derived"
+        default: "Bedrock model id  [Optional] — Anthropic model for AI assist (the IAM scope is any Anthropic model unless BedrockModelArns narrows it)"
 
 Parameters:
   VpcId:
@@ -500,7 +500,7 @@ Conditions:
     Fn::Equals: [Ref: EnableAiAssist, "true"]
 
   # True when the operator supplied explicit BedrockModelArns; otherwise the IAM
-  # scope is auto-derived from BedrockModelId. BedrockModelArns is a
+  # scope is provider-wide (any `anthropic.` model; see BedrockInvokePolicy). BedrockModelArns is a
   # CommaDelimitedList, so join it and compare to "" to detect the empty default.
   HasBedrockModelArnsOverride:
     Fn::Not:
@@ -1340,7 +1340,8 @@ Resources:
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
 
-  # Granted only when AI assist is enabled; scoped to the allowed model ARN(s).
+  # Granted only when AI assist is enabled; scoped to Anthropic models, or to the
+  # BedrockModelArns override.
   BedrockInvokePolicy:
     Type: AWS::IAM::Policy
     Condition: AiAssistEnabled

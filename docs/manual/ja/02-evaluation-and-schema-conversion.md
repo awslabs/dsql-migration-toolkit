@@ -49,7 +49,10 @@ PostgreSQL ソースでは、Evaluation はインベントリにない 2 つの�
 上記の例は主に MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
 ない PG カラム型 — 配列(`[]`)、geometric(`point`/`line`/`box`/…)、network(`inet`/`cidr`/`macaddr`/`macaddr8`)、
 `xml`、`money`、`bit`/`bit varying`/`varbit`、`tsvector`/`tsquery`、range + multirange、`pgvector`、`enum`、
-composite — は **MANUAL**/**UNSUPPORTED** としてフラグ付けされ、**決して自動置換されません**。構造上の
+composite — が黙って移行されることはありません: 値を保持する代替型がある場合(配列は `jsonb`、range・network・
+`xml`・geometric・bit・テキスト検索型は `text`、`money` は `numeric(23,4)`、enum は `CHECK` 付きの `text`)は
+Schema Conversion が警告付きで出力し、テーブルは **MANUAL**、代替型のない型(composite、domain、`pgvector`)は
+**UNSUPPORTED** です。構造上の
 ゲート(PK なし、`numeric` 精度 > 1000、キー列 > 8 個 など)も PostgreSQL ソースに等しく適用されます。
 
 分類されないオブジェクトはありません — どのルールにも一致しないオブジェクトはデフォルトで **AUTO** に
@@ -265,9 +268,9 @@ AI アシストは **オプトイン・デフォルト無効** の補強機能�
 
 1. **すべての UNSUPPORTED 項目を解決します。** これらはクリーンなマイグレーションを妨げます。PK が
    ない場合は追加し、トリガー/ルーチン/イベントはアプリケーション(または EventBridge/Lambda)へ移し、
-   空間型は置き換え、`DECIMAL` 精度は ≤ 1000 に縮小します。
+   `DECIMAL` 精度は ≤ 1000 に縮小します。
 2. **すべての MANUAL 項目を判断します。** デフォルト collation の受け入れ、
-   `ENUM`/`SET` の扱い、`ON UPDATE` タイムスタンプの判断、CDC が複製できないカスケードアクションの置き換え
+   `ENUM`/`SET` の扱い、置換された型(`bytea` になった空間列、`jsonb` になった PostgreSQL の配列)への対応、`ON UPDATE` タイムスタンプの判断、CDC が複製できないカスケードアクションの置き換え
    などを決めます。過大な LOB/JSON カラム(`OVERSIZED_LOB`)は、まず Data Migration の前提条件チェック
    (または **Check sizes**、[§13.5](13-excluding-tables-and-columns.md#135-特大-lob-の候補と-check-sizes))
    を実行します。値がすでに上限を超えている場合にのみ、その内容を外部ストレージ(例: Amazon S3)へ移すか、
@@ -440,8 +443,10 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 > MySQL 式の型変換は **一切** 行われません。DSQL がサポートする PG 型はそのまま通過します(整数系、
 > `numeric`/`decimal`、`real`/`double precision`、`char`/`varchar`/`text`/`bpchar`、
 > `date`/`time`/`timetz`/`timestamp`/`timestamptz`、`interval`、`boolean`、`bytea`、`uuid`、`json`、
-> `jsonb`)。別の **UNSUPPORTED** の集合は、Evaluation と Schema Conversion の両方で
-> **MANUAL**/**UNSUPPORTED** としてフラグ付けされ、**決して自動置換されません**: 配列(`[]`)、
+> `jsonb`)。DSQL に対応する型のない別の集合は、Evaluation と Schema Conversion の両方でフラグ付け
+> されます: 値を保持する代替型は警告付きで出力されて **MANUAL**(配列は `jsonb`、`money` は
+> `numeric(23,4)`、enum は `CHECK` 付きの `text`、その他は `text`)、代替型のない型(composite、domain、
+> `pgvector`)は **UNSUPPORTED** です: 配列(`[]`)、
 > geometric(`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`)、
 > network(`inet`/`cidr`/`macaddr`/`macaddr8`)、`xml`、`money`、`bit`/`bit varying`/`varbit`、
 > `tsvector`/`tsquery`、range + PG14 multirange、`pgvector`、`enum`、composite。PG の numeric ルールは

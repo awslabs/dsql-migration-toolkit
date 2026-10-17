@@ -197,7 +197,7 @@ VPC 内のプライベートなデータ経路（ソース → EC2 → DSQL）�
 - **AI アシストはコントロールプレーンのみ** — 有効にすると Amazon Bedrock が変換案の
   提示・CDC 準備状況の評価・DLQ トリアージを行いますが、Full Load / CDC の行データには
   一切アクセスしません。スキーマ/DDL/プランのメタデータのみを使用します。既定はオフ、
-  サードパーティ API キー不要（スコープ限定の `bedrock:InvokeModel`）。
+  サードパーティ API キー不要（スコープ限定の `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`）。
 - **CDC は別スタック**（`cdc-stack`）— Amazon MSK + Debezium → マネージド
   MSK Connect 上の**カスタム Aurora DSQL シンクコネクタ**
   ([`connectors/dsql-sink/`](connectors/dsql-sink))。既製の JDBC シンクでは DSQL の短
@@ -267,7 +267,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 - ソースと**同一リージョン**のターゲット **Aurora DSQL** クラスター（IAM トークン認証、パスワードなし）。
 - 標準チェーン（環境変数 / `~/.aws` / プロファイル）で利用可能な、`dsql:DbConnect`（`admin`
   ユーザーは `dsql:DbConnectAdmin`）権限を持つ **AWS 認証情報**。オプションで
-  `secretsmanager:GetSecretValue`、`bedrock:InvokeModel`。
+  `secretsmanager:GetSecretValue`、`bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`(AI アシスト)。
 - **ローカル実行時のみ:** Python 3.10 以降（3.12 固定）、[`uv`](https://docs.astral.sh/uv/)。
 
 > ソース DB・CDC のセットアップ（binlog / 論理レプリケーション など）を含む完全なチェックリストは

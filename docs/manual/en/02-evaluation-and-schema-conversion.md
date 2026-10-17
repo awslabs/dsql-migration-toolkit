@@ -72,8 +72,11 @@ The examples above are mostly drawn from a MySQL source. For a **PostgreSQL sour
 scale applies: unsupported PG column types — arrays (`[]`), geometric
 (`point`/`line`/`box`/…), network (`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`,
 `bit`/`bit varying`/`varbit`, `tsvector`/`tsquery`, range + multirange, `pgvector`,
-`enum`, composite — are flagged **MANUAL**/**UNSUPPORTED** and **never auto-substituted**,
-and the structural gates (no PK, `numeric` precision > 1000, > 8-column keys, etc.) apply to
+`enum`, composite — are never migrated silently: where a stand-in keeps the value (an array
+as `jsonb`; a range, network, `xml`, geometric, bit or text-search type as `text`; `money` as
+`numeric(23,4)`; an enum as `text` with a `CHECK`) Schema Conversion emits it with a warning and
+the table is **MANUAL**, and a type with no stand-in (composite, domain, `pgvector`) is
+**UNSUPPORTED**; the structural gates (no PK, `numeric` precision > 1000, > 8-column keys, etc.) apply to
 a PostgreSQL source equally.
 
 Nothing is left unclassified — an object matched by no rule defaults to **AUTO**.
@@ -307,9 +310,10 @@ Work the list top-down by severity:
 
 1. **Resolve every UNSUPPORTED item.** These block a clean migration. Add a PK
    where missing; move triggers/routines/events into the application (or
-   EventBridge/Lambda); replace spatial types; reduce `DECIMAL` precision to ≤ 1000.
+   EventBridge/Lambda); reduce `DECIMAL` precision to ≤ 1000.
 2. **Decide every MANUAL item.** Accept the default collation,
-   handle `ENUM`/`SET`, decide `ON UPDATE` timestamps, replace a cascade action CDC
+   handle `ENUM`/`SET`, adapt to a substituted type (a spatial column as `bytea`, a
+   PostgreSQL array as `jsonb`), decide `ON UPDATE` timestamps, replace a cascade action CDC
    can't replicate, etc. For an oversized LOB or JSON column (`OVERSIZED_LOB`), run the
    Data Migration prerequisite checks (or **Check sizes**,
    [§13.5](13-excluding-tables-and-columns.md#135-oversized-lob-candidates-and-check-sizes))
@@ -532,9 +536,11 @@ shared "write contract" keeps them identical).
 > DSQL-supported PG types pass unchanged (int family; `numeric`/`decimal`;
 > `real`/`double precision`; `char`/`varchar`/`text`/`bpchar`;
 > `date`/`time`/`timetz`/`timestamp`/`timestamptz`; `interval`; `boolean`; `bytea`;
-> `uuid`; `json`; `jsonb`). A different **UNSUPPORTED** set is flagged
-> **MANUAL**/**UNSUPPORTED** at both Evaluation and Schema Conversion and is **never
-> auto-substituted**: arrays (`[]`), geometric
+> `uuid`; `json`; `jsonb`). A different set has no DSQL equivalent and is flagged at both
+> Evaluation and Schema Conversion: a stand-in that keeps the value is emitted with a warning
+> and graded **MANUAL** (an array as `jsonb`, `money` as `numeric(23,4)`, an enum as `text`
+> with a `CHECK`, the others as `text`), and a type with no stand-in (composite, domain,
+> `pgvector`) is **UNSUPPORTED**: arrays (`[]`), geometric
 > (`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`), network
 > (`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`, `bit`/`bit varying`/`varbit`,
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. The PG

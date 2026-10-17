@@ -520,7 +520,8 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 
 - **필수 권한(공통)**: DSQL IAM 토큰 발급을 위한 `dsql:DbConnect` / `dsql:DbConnectAdmin`(해당 클러스터로
   스코핑), 소스는 읽기 전용 접근(MySQL 또는 PostgreSQL). 선택적으로 소스 자격증명을 Secrets Manager에서 재사용할 때
-  `secretsmanager:GetSecretValue`, AI 보조를 켤 때 `bedrock:InvokeModel`.
+  `secretsmanager:GetSecretValue`, AI 보조를 켤 때 `bedrock:InvokeModel`과
+  `bedrock:InvokeModelWithResponseStream`.
 - **로컬 실행** — 표준 자격증명 체인(`~/.aws`, 환경 변수, `AWS_PROFILE`, SSO)으로 **실행하는 사용자 본인의
   IAM 신원**을 그대로 씁니다. 즉, 위 권한을 **사용자 신원이 직접** 갖고 있어야 합니다. 특히 CDC까지 쓰려면
   cdc-stack이 CloudFormation으로 MSK·MSK Connect·IAM 역할 등을 생성하므로, 사용자 신원에 그만큼 **넓은
@@ -539,7 +540,7 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 | **타깃 DSQL (항상)** | `dsql:DbConnect`, `dsql:DbConnectAdmin`(IAM 토큰 발급), `dsql:GetCluster` |
 | **소스 (항상)** | IAM 액션 없음 — 읽기 전용 MySQL 또는 PostgreSQL 사용자/비밀번호(또는 아래 Secrets Manager 시크릿) |
 | **소스 시크릿 (선택)** | `secretsmanager:GetSecretValue` — 소스 자격증명이 Secrets Manager 시크릿에 있을 때만 |
-| **AI 어시스트 (선택)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — 선택 모델로 스코핑; AI 켤 때만 |
+| **AI 어시스트 (선택)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — Fargate 스택은 `BedrockModelArns`로 좁히지 않으면 모든 Anthropic 모델(EC2 스택은 선택 모델로 스코핑); AI 켤 때만 |
 | **CDC — 파이프라인 배포/철거** | cdc-stack이 요구하는 넓은 인프라 생성 권한: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; 광범위한 `ec2:*`(VPC 서브넷·NAT·EIP·라우트 테이블·보안 그룹·VPC 엔드포인트·네트워크 인터페이스); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…(커넥터 역할); `kafka:*` / `kafkaconnect:*`(MSK Serverless + MSK Connect); `logs:*`; 플러그인 버킷에 대한 `s3:*`. Full Load만 하는 경우 **전혀 필요 없음**. |
 
 > **Full Load만**이면 위 표의 앞 3행만 필요합니다. **CDC**는 마지막 행(넓은 인프라 생성 권한)이

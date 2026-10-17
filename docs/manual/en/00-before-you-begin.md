@@ -139,7 +139,8 @@ plus a pointer to the chapter that covers it in depth.
 
 - [ ] **AI assist is optional and Amazon Bedrock-only.** AI is **off by default**;
       when enabled it works **exclusively through Amazon Bedrock** using your AWS
-      credentials (the `bedrock:InvokeModel` permission), and the chosen model must be
+      credentials (the `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`
+      permissions — the chat streams its replies), and the chosen model must be
       enabled once for your AWS account (its AWS Marketplace agreement accepted —
       Chapter 2). There is **no direct
       API-key entry** (no Anthropic/OpenAI key field) — the only way to use AI is

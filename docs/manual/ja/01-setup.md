@@ -57,7 +57,8 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 - 標準の認証情報チェーン(環境変数、`~/.aws`、または名前付きプロファイル)経由で到達でき、
   **Aurora DSQL IAM トークンを生成** できる(`dsql:DbConnect` / `dsql:DbConnectAdmin`)AWS
   認証情報。任意で `secretsmanager:GetSecretValue`(ソース認証情報が Secrets Manager にある場合)
-  および `bedrock:InvokeModel`(AI アシストを有効にする場合のみ)も必要です。
+  および `bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream`(AI アシストを有効にする場合のみ。
+  チャットは応答をストリーミングするため、前者だけでは足りません)も必要です。
 
 **AWS へデプロイする場合** — 完全版は [`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md)
 を参照してください。要約は §1.3 にあります。

@@ -197,7 +197,7 @@ VPC 内から — VPN、Direct Connect、または SSM ポートフォワード�
 | **ソース DB への到達性** | `SourceDbSecurityGroupId`（推奨） / `SourceDbCidr` | タスクが `SourceDbPort` でソース DB への egress を得られるよう、**少なくとも一方を指定**してください。`SourceDbSecurityGroupId` は egress をソース DB の SG に絞り込みます。SG id がない場合は `SourceDbCidr` を使用します。両方とも空だとデプロイは拒否されます（タスクにソースへの経路がなくなるため）。 |
 | **カスタムドメイン** | `AppDomainName` | ご自身の Route 53 ドメインで ALB をフロントする場合のみ。 |
 | **公開アクセス / Cognito** | `AlbScheme`, `AllowedIngressCidr`, `EnableCognitoAuth`, `CognitoDomainPrefix` | UI を公開する場合のみ。デフォルトは `internal`（ログインなし）のままです。 |
-| **AI アシスト** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 支援の変換を有効化する場合のみ（モデルを選択。IAM スコープは自動的に導出）。 |
+| **AI アシスト** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 支援の変換を有効化する場合のみ（モデルを選択。`BedrockModelArns` で絞らない限り IAM はすべての Anthropic モデルを許可）。 |
 | **カスタムイメージ / サイジング** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | プライベート ECR イメージ、またはデフォルト以外のタスクサイズの場合のみ。 |
 
 </details>
@@ -572,9 +572,9 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `CognitoDomainPrefix` | Cognito 時 | `""` | グローバルに一意な Cognito hosted-UI プレフィックス（`https://<prefix>.auth.<region>.amazoncognito.com`）。 |
 | `CognitoAdminEmail` | Cognito 時 | `""` | スタックが作成する**最初のログインユーザー**のメールアドレス。Cognito がこのアドレスに一時パスワードを送信し、hosted UI が初回サインイン時に新しいパスワードを求めます。**Cognito を有効にする場合は必須** — ユーザープールはセルフサインアップを無効にしているため、この値がないとデプロイは成功しても誰もログインできないアプリになります（テンプレートがその組み合わせを拒否します）。ユーザーの追加は [§運用者ユーザーの作成](#運用者ユーザーの作成-cognito--cognito-を有効にした場合のみ) を参照。 |
 | `EnableAiAssist` | no | `false` | opt-in。Anthropic モデルに対する `bedrock:InvokeModel` / `InvokeModelWithResponseStream` を付与。 |
-| `BedrockModelArns` | no | `""` | invoke スコープの**オプションのオーバーライド**。空欄 = `BedrockModelId` から自動導出。 |
+| `BedrockModelArns` | no | `""` | invoke スコープを絞る**オプションのオーバーライド**。空欄 = すべての Anthropic モデル（再デプロイなしで UI からモデルを切り替え可能）。 |
 | `BedrockRegion` | no | `""` | アプリの `BEDROCK_REGION`。 |
-| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic モデル（ドロップダウン）。IAM スコープはこれから自動導出。 |
+| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic モデル（ドロップダウン）。IAM スコープはこの値に依存しません。 |
 
 ### タスクのサイジング — `ContainerCpu` / `ContainerMemory`
 
@@ -1006,7 +1006,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 | `InstanceType` | いいえ | `t3.large` | コントロールプレーンホストのサイズ。 |
 | `StateVolumeSizeGiB` | いいえ | `20` | 保持型 EBS 状態ボリューム。大きなテーブルの Full Load でローカル CSV がスピルする場合は大きく。 |
 | `SourceSecretArn` | いいえ | `""` | 既存のソース資格情報シークレットを再利用する場合のみ（それ以外は UI でユーザー名/パスワードを入力）。 |
-| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | いいえ | off / `global.anthropic.claude-sonnet-5` | Fargate と同じ opt-in の Bedrock AI アシスト（IAM スコープはモデルから自動導出）。 |
+| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | いいえ | off / `global.anthropic.claude-sonnet-5` | opt-in の Bedrock AI アシスト（EC2 では IAM スコープをモデルから導出）。 |
 | `KeyName` | いいえ | `""` | オプションの SSH キー。SSM が主要なアクセス経路なので通常は空（ホストにはインバウンドルールが一切なし）。 |
 
 > [!WARNING]

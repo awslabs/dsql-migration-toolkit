@@ -181,7 +181,8 @@ EC2 호스트에서 소스로**(systemd + SSM 포트포워드, ALB/ECR 없음) �
 
 - **AI 보조는 컨트롤 플레인만** — 켜면 Amazon Bedrock이 변환 제안·CDC 준비도·DLQ 분류를 더해
   주지만, Full Load / CDC 행 데이터는 보지도 건드리지도 않고 스키마/DDL/플랜 메타데이터만
-  사용합니다. 기본 off, 서드파티 API 키 없음(범위 제한된 `bedrock:InvokeModel`).
+  사용합니다. 기본 off, 서드파티 API 키 없음(범위 제한된 `bedrock:InvokeModel` /
+  `bedrock:InvokeModelWithResponseStream`).
 - **CDC는 별도 스택**(`cdc-stack`) — Amazon MSK + Debezium → 관리형 MSK Connect 위의
   **커스텀 Aurora DSQL 싱크 커넥터**([`connectors/dsql-sink/`](connectors/dsql-sink)). 표준 JDBC
   싱크로는 DSQL의 단기 IAM 토큰, OCC 충돌(`40001` — 충돌한 트랜잭션 전체를 지터 백오프로 다시
@@ -250,7 +251,7 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 - 소스와 **동일 리전**의 타깃 **Aurora DSQL** 클러스터(IAM 토큰 인증, 비밀번호 없음).
 - 표준 체인(환경 변수 / `~/.aws` / 프로필)으로 도달 가능하고 `dsql:DbConnect`(admin 사용자는
   `dsql:DbConnectAdmin`) 권한이 있는 **AWS 자격증명**. 선택적으로 `secretsmanager:GetSecretValue`,
-  `bedrock:InvokeModel`.
+  `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`(AI 보조).
 - **로컬 실행 시에만:** Python 3.10+(3.12 고정), [`uv`](https://docs.astral.sh/uv/).
 
 > 소스 DB·CDC 설정(binlog / 논리 복제 등)을 포함한 전체 체크리스트:

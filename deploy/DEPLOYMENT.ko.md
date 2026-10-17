@@ -190,7 +190,7 @@ Well-Architected SEC05-BP02. 외부에 공개하려면 [app-stack 배포](#2-app
 | **소스 DB 도달 경로** | `SourceDbSecurityGroupId`(권장) / `SourceDbCidr` | **둘 중 최소 하나 필수** — 태스크가 소스 DB(`SourceDbPort`)로 egress하도록. `SourceDbSecurityGroupId`는 소스 DB SG로 egress를 범위 제한, SG id가 없으면 `SourceDbCidr` 사용. 둘 다 비우면 배포가 거부됩니다(소스로 가는 경로 없음). |
 | **커스텀 도메인** | `AppDomainName` | 자체 Route 53 도메인으로 ALB를 front할 때만. |
 | **공개 접근 / Cognito** | `AlbScheme`, `AllowedIngressCidr`, `EnableCognitoAuth`, `CognitoDomainPrefix` | UI를 공개할 때만; 기본은 `internal`(로그인 없음). |
-| **AI 보조** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 보조 변환을 켤 때만(모델 선택; IAM 스코프 자동 도출). |
+| **AI 보조** | `EnableAiAssist`, `BedrockModelId`, `BedrockRegion` | Amazon Bedrock 보조 변환을 켤 때만(모델 선택; `BedrockModelArns`로 좁히지 않으면 IAM은 모든 Anthropic 모델 허용). |
 | **커스텀 이미지 / 사이징** | `ContainerImageUri`, `ContainerCpu`, `ContainerMemory` | 프라이빗 ECR 이미지나 기본 외 태스크 크기일 때만. |
 
 </details>
@@ -539,9 +539,9 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `CognitoDomainPrefix` | Cognito 시 | `""` | 전역 유니크 Cognito hosted-UI prefix (`https://<prefix>.auth.<region>.amazoncognito.com`). |
 | `CognitoAdminEmail` | Cognito 시 | `""` | 스택이 생성하는 **첫 로그인 사용자**의 이메일. Cognito가 임시 비밀번호를 이 주소로 발송하고, hosted UI가 첫 로그인 시 새 비밀번호를 요구합니다. **Cognito를 켜면 필수** — 유저풀이 self sign-up을 막아 두므로, 이 값이 없으면 배포는 성공하지만 아무도 로그인할 수 없는 앱이 됩니다(템플릿이 그 조합을 거부). 사용자 추가는 [§운영자 사용자 만들기](#운영자-사용자-만들기-cognito--cognito를-켰을-때만) 참고. |
 | `EnableAiAssist` | no | `false` | opt-in; Anthropic 모델에 대한 `bedrock:InvokeModel` / `InvokeModelWithResponseStream` 부여. |
-| `BedrockModelArns` | no | `""` | **선택적 override**; 비우면 `BedrockModelId`에서 자동 도출. |
+| `BedrockModelArns` | no | `""` | invoke 범위를 좁히는 **선택적 override**; 비우면 모든 Anthropic 모델(재배포 없이 UI에서 모델 전환 가능). |
 | `BedrockRegion` | no | `""` | 앱의 `BEDROCK_REGION`. |
-| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic 모델(드롭다운); IAM 스코프 자동 도출. |
+| `BedrockModelId` | no | `global.anthropic.claude-sonnet-5` | Anthropic 모델(드롭다운); IAM 스코프는 이 값과 무관. |
 
 ### 태스크 사이징 — `ContainerCpu` / `ContainerMemory`
 
@@ -931,7 +931,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 | `InstanceType` | 아니오 | `t3.large` | 컨트롤 플레인 호스트 크기. |
 | `StateVolumeSizeGiB` | 아니오 | `20` | 보존형 EBS 상태 볼륨; 대형 테이블 Full Load의 로컬 CSV 스필오버는 크게. |
 | `SourceSecretArn` | 아니오 | `""` | 기존 소스 자격증명 시크릿 재사용 시에만(그 외에는 UI에서 사용자/비밀번호 입력). |
-| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | 아니오 | off / `global.anthropic.claude-sonnet-5` | Fargate와 동일한 opt-in Bedrock AI 보조(IAM 범위는 모델에서 자동 도출). |
+| `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | 아니오 | off / `global.anthropic.claude-sonnet-5` | opt-in Bedrock AI 보조(EC2에서는 IAM 범위를 모델에서 도출). |
 | `KeyName` | 아니오 | `""` | 선택적 SSH 키; SSM이 기본 접속 경로라 보통 비워둠(호스트에 인바운드 규칙 자체가 없음). |
 
 > [!WARNING]

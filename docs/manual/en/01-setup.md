@@ -62,7 +62,8 @@ You connect to the **same** source and target in every case; only where the tool
   `~/.aws`, or a named profile) that can **generate Aurora DSQL IAM tokens**
   (`dsql:DbConnect` / `dsql:DbConnectAdmin`). Optionally
   `secretsmanager:GetSecretValue` (if your source credentials live in Secrets
-  Manager) and `bedrock:InvokeModel` (only if you turn on AI assist).
+  Manager) and `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` (only if you turn on AI
+  assist; the chat streams its replies, so the first alone is not enough).
 
 **For deploying on AWS** — see the full [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md);
 the short version is in §1.3.

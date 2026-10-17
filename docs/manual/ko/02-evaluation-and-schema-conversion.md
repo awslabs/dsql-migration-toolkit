@@ -48,7 +48,10 @@ PostgreSQL 소스에서는 Evaluation이 인벤토리에 없는 두 가지도 �
 위 예시는 대부분 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
 컬럼 타입 — 배열(`[]`), geometric(`point`/`line`/`box`/…), network(`inet`/`cidr`/`macaddr`/`macaddr8`),
 `xml`, `money`, `bit`/`bit varying`/`varbit`, `tsvector`/`tsquery`, range + multirange, `pgvector`,
-`enum`, composite — 은 **MANUAL**/**UNSUPPORTED**로 표시되며 **절대 자동 대체되지 않고**, 구조적
+`enum`, composite — 은 조용히 옮겨지지 않습니다: 값을 보존하는 대체 타입이 있으면(배열은 `jsonb`, range·network·
+`xml`·geometric·bit·텍스트 검색 타입은 `text`, `money`는 `numeric(23,4)`, enum은 `CHECK`가 붙은 `text`)
+Schema Conversion이 경고와 함께 생성하고 테이블은 **MANUAL**, 대체 타입이 없는 타입(composite, domain,
+`pgvector`)은 **UNSUPPORTED**입니다. 구조적
 게이트(PK 없음, `numeric` 정밀도 > 1000, 키 컬럼 > 8개 등)도 PostgreSQL 소스에 동일하게 적용됩니다.
 
 분류되지 않는 객체는 없습니다 — 어떤 규칙에도 걸리지 않으면 기본 **AUTO**. 한 객체에 여러 규칙이
@@ -247,10 +250,10 @@ AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Be
 심각도 순으로 위에서부터 처리하세요:
 
 1. **모든 UNSUPPORTED 항목 해결.** 이 항목들은 깨끗한 마이그레이션을 가로막습니다. PK가 없으면 추가,
-   트리거/루틴/이벤트는 애플리케이션(또는 EventBridge/Lambda)으로 이전, 공간 타입은 대체, `DECIMAL`
+   트리거/루틴/이벤트는 애플리케이션(또는 EventBridge/Lambda)으로 이전, `DECIMAL`
    정밀도는 ≤ 1000으로 축소.
 2. **모든 MANUAL 항목 결정.** 기본 collation 수용, 대소문자 무시 collation 처리,
-   `ENUM`/`SET` 처리 등. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전 점검(또는
+   `ENUM`/`SET` 처리, 대체된 타입(`bytea`가 된 공간 컬럼, `jsonb`가 된 PostgreSQL 배열)에 맞추기 등. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전 점검(또는
    **Check sizes**, [§13.5](13-excluding-tables-and-columns.md#135-초대형-lob-후보와-check-sizes))을
    실행하세요. 값이 이미 한도를 넘는 경우에만 그 내용을 외부 스토리지(예: Amazon S3)로 옮기거나 컬럼을
    제외합니다(제외한 컬럼은 NULL로 마이그레이션됩니다).
@@ -420,8 +423,10 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 > MySQL 식 타입 변환은 **전혀** 일어나지 않습니다. DSQL이 지원하는 PG 타입은 그대로 통과합니다(정수 계열,
 > `numeric`/`decimal`, `real`/`double precision`, `char`/`varchar`/`text`/`bpchar`,
 > `date`/`time`/`timetz`/`timestamp`/`timestamptz`, `interval`, `boolean`, `bytea`, `uuid`,
-> `json`, `jsonb`). 별도의 **UNSUPPORTED** 집합은 Evaluation과 Schema Conversion 양쪽에서
-> **MANUAL**/**UNSUPPORTED**로 표시되며 **절대 자동 대체되지 않습니다**: 배열(`[]`),
+> `json`, `jsonb`). DSQL에 대응 타입이 없는 별도의 집합은 Evaluation과 Schema Conversion 양쪽에서
+> 표시됩니다: 값을 보존하는 대체 타입은 경고와 함께 생성되고 **MANUAL**(배열은 `jsonb`, `money`는
+> `numeric(23,4)`, enum은 `CHECK`가 붙은 `text`, 나머지는 `text`), 대체 타입이 없는 타입(composite,
+> domain, `pgvector`)은 **UNSUPPORTED**: 배열(`[]`),
 > geometric(`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`),
 > network(`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`, `bit`/`bit varying`/`varbit`,
 > `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. PG의 numeric

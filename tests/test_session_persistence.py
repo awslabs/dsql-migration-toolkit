@@ -1625,6 +1625,50 @@ def test_restored_session_keeps_the_source_engine_on_the_evaluation_result() -> 
     assert restored_mysql.result.source_type is SourceType.MYSQL
 
 
+def test_a_report_of_another_source_keeps_its_source_across_a_restart() -> None:
+    """The restore labelled the report with the LIVE coordinates saved at snapshot time:
+    after the operator switched databases on Connect, a restart hid the 'describes another
+    source' notice and every export named the wrong database."""
+    from dsql_migrator.core.models import SourceConnectionConfig, SourceType
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+
+    def _snapshot(live_database: str):
+        session, eval_state, conv_state, migration_state = _populated_states()
+        session.set_source(
+            SourceConnectionConfig(host="db.example.com", port=3306, database=live_database),
+            None,
+        )
+        eval_state.set_result(
+            EvaluationResult(
+                inventory=_inventory(),
+                assessment=AssessmentReport.from_items([]),
+                target_inventory=TargetInventory(schemas=[]),
+                target_conflicts=[],
+                source_type=SourceType.MYSQL,
+                source_label="MySQL 8.0.39 at DB.example.com:3306/shop",
+            )
+        )
+        return capture_session_snapshot("s1", session, eval_state, conv_state, migration_state)
+
+    same = _snapshot("shop")
+    # The usual case stays out of the payload, so an older build still loads it.
+    assert same.evaluation_source_label is None
+    assert "evaluation_source_label" not in same.model_dump_json()
+    switched = _snapshot("other")
+    assert switched.evaluation_source_label == "MySQL 8.0.39 at DB.example.com:3306/shop"
+    round_tripped = SessionSnapshot.model_validate_json(switched.model_dump_json())
+    restored = EvaluationState()
+    apply_session_snapshot(
+        round_tripped,
+        SessionConnectionState(),
+        restored,
+        SchemaConversionState(),
+        DataMigrationState(),
+    )
+    assert restored.result is not None
+    assert restored.result.source_label == "MySQL 8.0.39 at DB.example.com:3306/shop"
+
+
 def test_the_dlq_read_cursor_round_trips_so_a_restart_keeps_its_coverage() -> None:
     """The cursor is what stops a restart from re-bounding the quarantine window.
 

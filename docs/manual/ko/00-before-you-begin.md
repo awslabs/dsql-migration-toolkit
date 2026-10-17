@@ -112,7 +112,8 @@ PostgreSQL)을 그대로 대체하는 드롭인 대체재가 **아니라** 고�
       폐기됩니다 — 재시작하면 연결 정보를 다시 입력합니다. → [§1.5](01-setup.md#15-소스와-타깃-연결)
 
 - [ ] **AI 어시스트는 선택이며 Amazon Bedrock으로만 가능합니다.** AI는 **기본 꺼짐**이고, 켜면 AWS
-      자격증명(`bedrock:InvokeModel` 권한)으로 **오직 Amazon Bedrock을 통해서만** 동작하며, 선택한
+      자격증명(`bedrock:InvokeModel`과 `bedrock:InvokeModelWithResponseStream` 권한 — 채팅은 응답을
+      스트리밍합니다)으로 **오직 Amazon Bedrock을 통해서만** 동작하며, 선택한
       모델은 AWS 계정에서 한 번 활성화되어 있어야 합니다(모델의 AWS Marketplace 약관(agreement) 수락 —
       2장).
       **직접 API 키 입력은 지원하지 않습니다**(Anthropic/OpenAI 키 입력란 없음) — AI를 쓰는 유일한

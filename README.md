@@ -199,7 +199,7 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
 - **AI assist is control-plane only** — when enabled, Amazon Bedrock adds conversion
   suggestions, CDC-readiness assessment, and DLQ triage. It never sees Full Load /
   CDC row data — only schema/DDL/plan metadata. Off by default; no third-party API
-  keys (scoped `bedrock:InvokeModel`).
+  keys (scoped `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`).
 - **CDC is a separate stack** (`cdc-stack`) — Amazon MSK + Debezium → a
   **custom Aurora DSQL sink connector**
   ([`connectors/dsql-sink/`](connectors/dsql-sink)) on managed MSK Connect. A stock
@@ -270,7 +270,8 @@ to both stacks. Debezium is open-source software running *on* MSK Connect.
 - A target **Aurora DSQL** cluster in the **same region** (IAM-token auth, no password).
 - **AWS credentials** via the standard chain (env / `~/.aws` / profile) with
   `dsql:DbConnect` (or `dsql:DbConnectAdmin` for the `admin` user). Optionally
-  `secretsmanager:GetSecretValue` and `bedrock:InvokeModel`.
+  `secretsmanager:GetSecretValue` and `bedrock:InvokeModel` /
+  `bedrock:InvokeModelWithResponseStream` (AI assist).
 - **Local run only:** Python 3.10+ (pinned 3.12) and [`uv`](https://docs.astral.sh/uv/).
 
 > Full checklist incl. source-DB / CDC setup (binlog / logical replication, etc.):

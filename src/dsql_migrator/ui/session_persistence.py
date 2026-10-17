@@ -353,6 +353,19 @@ def capture_session_snapshot(
         snapshot.target_inventory = result.target_inventory
         snapshot.target_inventory_endpoint = result.target_endpoint
         snapshot.target_conflicts = list(result.target_conflicts)
+        # What the report was read from, kept only when it is not the connected source
+        # (whose coordinates the restore otherwise labels the report with).
+        from dsql_migrator.ui.evaluation import (
+            describe_source,
+            same_source_address,
+            source_address,
+        )
+
+        label = getattr(result, "source_label", None)
+        if label and not same_source_address(
+            source_address(label), describe_source(source)
+        ):
+            snapshot.evaluation_source_label = label
     # Step 4 (Validation): persist the last completed report so a reconnect reopens
     # the result page (credential-free; mirrors the Evaluation result restore).
     if validation_state is not None:
@@ -629,8 +642,10 @@ def apply_session_snapshot(
             target_conflicts=list(snapshot.target_conflicts),
             source_type=restored_source_type,
             target_endpoint=snapshot.target_inventory_endpoint,
-            # The address only: the engine version is read again by the next source test.
-            source_label=describe_source(
+            # What the report was read from when that was not the connected source, else
+            # the address only: the engine version is read again by the next source test.
+            source_label=snapshot.evaluation_source_label
+            or describe_source(
                 SimpleNamespace(
                     host=snapshot.source_host,
                     # As the restored connection takes it (an older snapshot has none).
