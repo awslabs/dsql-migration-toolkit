@@ -355,11 +355,14 @@ MySQL→PostgreSQL トランスパイルではありません。
   黙って捨てられるのではなく、手作業のフラグが付いた明示的なプレースホルダーとして表示されます。
   トランスパイラが変換しない関数(`FIND_IN_SET`、`UNIX_TIMESTAMP`、ユーザー関数)を呼ぶビューは、両方のステップで
   MANUAL とされます(`VIEW_NOT_CONVERTED`): その関数が Aurora DSQL にない限り `CREATE VIEW` は失敗します。
-  忠実な PostgreSQL の形がある MySQL の呼び出しはその形に書き換えます(`YEAR()`/`HOUR()`/`DAYOFWEEK()` は `EXTRACT` に、
-  `DATEDIFF`、`CURTIME()` は `LOCALTIME` に、`STDDEV`/`VARIANCE` は MySQL が計算する母集団の形に、`CAST(x AS CHAR)` は text に、
-  `GROUP_CONCAT` は text 上の集計に、`FROM_UNIXTIME(x, fmt)` は `TO_CHAR` に)。その他(`WEEK`、`SUBSTRING_INDEX`、`SHA2` など)は
-  同じようにフラグが付き、Aurora DSQL に表記のない `DATE_FORMAT`/`STR_TO_DATE` の書式トークン(`%p`、`%D` など)もフラグが付きます:
-  ビューは作成されますが、異なるテキストを返します。
+  忠実な PostgreSQL の形がある MySQL の呼び出しはその形に書き換えます(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` は
+  `EXTRACT` に、`DATEDIFF`、`CURTIME()` は `LOCALTIME` に、`STDDEV`/`VARIANCE` は MySQL が計算する母集団の形に、
+  `VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に、`GROUP_CONCAT` は text 上の集計に、
+  `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はバイト数に、`+hh:mm` の
+  オフセットの `CONVERT_TZ`、NULL を保つ `JSON_ARRAY`/`JSON_ARRAYAGG`、そしてすべての `DATE_FORMAT`/`STR_TO_DATE` の書式を
+  トークンごとに)。その他(`WEEK`、`SUBSTRING_INDEX`、`SHA2`、`JSON_SET` など)は同じようにフラグが付き、Aurora DSQL に
+  パターンのない書式トークン(MySQL の `%U`/`%u`/`%V`/`%X` の週番号、`%w`)もフラグが付きます: ビューは作成されますが、
+  異なるテキストを返します。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

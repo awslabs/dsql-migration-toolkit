@@ -39,8 +39,30 @@ def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
         ("group_concat(a, b)", "STRING_AGG(CAST(a AS TEXT) || CAST(b AS TEXT), ',')"),
         ("group_concat(distinct a)", "STRING_AGG(DISTINCT CAST(a AS TEXT), ',')"),
         ("group_concat(a order by b)", "STRING_AGG(CAST(a AS TEXT), ',' ORDER BY b"),
-        # A DISTINCT aggregate's ORDER BY must be its argument: no cast there.
-        ("group_concat(distinct a order by a separator ';')", "STRING_AGG(DISTINCT a, ';' ORDER BY a"),
+        # A DISTINCT aggregate's ORDER BY must be its argument: as an array, any type.
+        ("group_concat(distinct a order by a separator ';')",
+         "ARRAY_TO_STRING(ARRAY_AGG(DISTINCT a ORDER BY a NULLS FIRST) FILTER(WHERE NOT a IS NULL), ';')"),
+        # G88: what sqlglot reads alike, or writes with another meaning.
+        ("var_samp(a)", "VAR_SAMP(a)"),
+        ("stddev_samp(a)", "STDDEV_SAMP(a)"),
+        ("concat_ws(' ', a, b)", "CONCAT_WS(' ', a, b)"),
+        ("convert_tz(d, '+00:00', '+09:00')", "AT TIME ZONE INTERVAL '+00:00' AT TIME ZONE INTERVAL '+09:00'"),
+        ("greatest(a, b)", "CASE WHEN a IS NULL OR b IS NULL THEN NULL ELSE GREATEST(a, b) END"),
+        ("length(s)", "OCTET_LENGTH(s)"),
+        ("cast(a as char charset utf8mb4)", "CAST(a AS TEXT)"),
+        ("cast(a as char(10) charset utf8mb4)", "CAST(a AS VARCHAR(10))"),
+        ("convert(a using utf8mb4)", "CAST(a AS TEXT)"),
+        ("cast(a as char charset binary)", "CAST(a AS BYTEA)"),
+        ("cast(a as unsigned)", "CAST(a AS DECIMAL(20))"),
+        ("json_array(1, null)", "JSON_BUILD_ARRAY(1, NULL)"),
+        ("json_arrayagg(a)", "JSON_AGG(a)"),
+        ("weekofyear(d)", "CAST(EXTRACT(WEEK FROM CAST(d AS DATE)) AS INT)"),
+        ("now(3)", "LOCALTIMESTAMP(3)"),
+        ("dayname(d)", "TO_CHAR(d, 'FMDay')"),
+        ("date_format(d, '%Y-%m-%dT%H:%i:%s')", "'YYYY-MM-DD\"T\"HH24:MI:SS'"),
+        ("date_format(d, '%h:%i %p')", "'HH12:MI AM'"),
+        ("date_format(d, 'Date: %Y')", "'\"Date: \"YYYY'"),
+        ("str_to_date(s, '%d/%m/%Y %H:%i')", "TO_TIMESTAMP(s, 'DD/MM/YYYY HH24:MI')"),
         ("from_unixtime(a, '%Y-%m-%d')", "TO_CHAR(TO_TIMESTAMP(a), 'YYYY-MM-DD')"),
         ("now()", "NOW()"),
     ],
@@ -62,8 +84,10 @@ def test_a_mysql_call_is_written_as_postgresql_runs_it(call: str, emitted: str) 
         ("sha2(s, 256)", "SHA2"),
         ("json_keys(j)", "JSON_KEYS"),
         ("timestamp(d, t)", "TIMESTAMP"),
-        ("now(3)", "now"),
         ("find_in_set('a', s)", "find_in_set"),
+        ("json_set(j, '$.a', 1)", "JSON_SET"),
+        ("utc_time()", "UTC_TIME"),
+        ("group_concat(distinct a order by b)", "GROUP_CONCAT"),
     ],
 )
 def test_a_call_postgresql_lacks_is_reported(call: str, named: str) -> None:
@@ -77,19 +101,22 @@ def test_postgresql_builtins_are_not_reported_untranslated() -> None:
         assert _view_ddl(call)[1] == (), call
 
 
-def test_a_date_format_token_with_no_postgresql_spelling_is_reported() -> None:
-    """'%p' stayed in TO_CHAR's format: the view was created and returned '03:15 %p'."""
+def test_a_date_format_token_with_no_postgresql_pattern_is_reported() -> None:
+    """'%U' (MySQL's Sunday weeks from 00) has no TO_CHAR pattern -- PostgreSQL's WW counts
+    7-day blocks from Jan 1 -- and stayed graded AUTO (G88: every other token is mapped
+    by the converter itself, %p to AM included)."""
     from dsql_migrator.core.assessor import CompatibilityAssessor
     from dsql_migrator.core.converter import SchemaConverter
 
-    _ddl, _untranslated, misformatted = _view_ddl("date_format(d, '%h:%i %p')")
-    assert misformatted == ("DATE_FORMAT (%p)",)
-    view = ViewDef(name="shop.v_clock", definition="select date_format(`d`, '%h:%i %p') AS `t` from `shop`.`o`")
+    ddl, _untranslated, misformatted = _view_ddl("date_format(d, '%Y-%U')")
+    assert misformatted == ("DATE_FORMAT (%U)",)
+    assert """'YYYY"-%U"'""" in ddl  # visible in the DDL, never silently dropped
+    view = ViewDef(name="shop.v_week", definition="select date_format(`d`, '%x-%u') AS `w` from `shop`.`o`")
     converted = SchemaConverter().convert_view(view)
     (note,) = converted.warnings
-    assert "DATE_FORMAT (%p)" in note.message and "returns different text" in note.message
+    assert "DATE_FORMAT (%u)" in note.message and "returns different text" in note.message
     inventory = SourceInventory(views=[view])
-    (item,) = [i for i in CompatibilityAssessor().assess(inventory).items if i.object_name == "shop.v_clock"]
+    (item,) = [i for i in CompatibilityAssessor().assess(inventory).items if i.object_name == "shop.v_week"]
     assert item.classification.value == "MANUAL"
 
 

@@ -76,6 +76,7 @@ from typing import NamedTuple, Optional
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.dialects.mysql import MySQL as _SqlglotMySQL
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dsql_migrator.core.models import (
@@ -7274,7 +7275,8 @@ class SchemaConverter:
         target_ddl, untranslated, misformatted = converted
         warnings = []
         if misformatted:
-            one = len(misformatted) == 1
+            tokens = sum(entry.count("%") for entry in misformatted)
+            one = tokens == 1
             warnings.append(
                 ConversionWarning(
                     object_name=view.name,
@@ -7283,10 +7285,11 @@ class SchemaConverter:
                     message=(
                         f"The view formats a date with {', '.join(misformatted)}: "
                         f"{'that MySQL format token has' if one else 'those MySQL format tokens have'} "
-                        "no Aurora DSQL (TO_CHAR / TO_TIMESTAMP) equivalent the conversion "
-                        "writes, so they are left as written -- the view is created but "
-                        "returns different text (or fails to parse the value). Rewrite the "
-                        "format in the view's target DDL before applying."
+                        "no Aurora DSQL (TO_CHAR / TO_TIMESTAMP) pattern (MySQL's week numbers "
+                        "other than ISO's, and its 0-based day of week), so "
+                        f"{'it is' if one else 'they are'} written as literal text -- the view "
+                        "is created but returns different text (or fails to parse the value). "
+                        "Rewrite the format in the view's target DDL before applying."
                     ),
                 )
             )
@@ -7320,40 +7323,55 @@ class SchemaConverter:
 # does not have (YEAR(), SUBSTRING_INDEX(), JSON_KEYS(), ...) -- by the MySQL name they
 # are reported under -- so the CREATE VIEW fails. The simple ones are rewritten instead
 # (:func:`_rewrite_mysql_calls`).
-_UNTRANSLATED_MYSQL_NODES: "dict[type, str]" = {
-    exp.Week: "WEEK",
-    exp.Dayname: "DAYNAME",
-    exp.TimestampDiff: "TIMESTAMPDIFF",
-    exp.Elt: "ELT",
-    exp.SubstringIndex: "SUBSTRING_INDEX",
-    exp.NumberToStr: "FORMAT",
-    exp.Hex: "HEX",
-    exp.Unhex: "UNHEX",
-    exp.JSONKeys: "JSON_KEYS",
-    exp.JSONType: "JSON_TYPE",
-    exp.JSONObjectAgg: "JSON_OBJECTAGG",
-    exp.Soundex: "SOUNDEX",
-    exp.ToBase64: "TO_BASE64",
-    exp.FromBase64: "FROM_BASE64",
-    exp.BitwiseCount: "BIT_COUNT",
-    exp.Stuff: "INSERT",
-    exp.SHA: "SHA1",
-    exp.SHA2: "SHA2",
-}
+def _node_names(**names: str) -> "dict[type, str]":
+    """``{sqlglot node class: MySQL name}`` for the classes this sqlglot has."""
+    return {getattr(exp, cls): name for cls, name in names.items() if hasattr(exp, cls)}
+
+
+_UNTRANSLATED_MYSQL_NODES: "dict[type, str]" = _node_names(
+    Week="WEEK",
+    TimestampDiff="TIMESTAMPDIFF",
+    Elt="ELT",
+    SubstringIndex="SUBSTRING_INDEX",
+    NumberToStr="FORMAT",
+    Hex="HEX",
+    Unhex="UNHEX",
+    JSONKeys="JSON_KEYS",
+    JSONType="JSON_TYPE",
+    JSONObjectAgg="JSON_OBJECTAGG",
+    JSONSet="JSON_SET",
+    JSONRemove="JSON_REMOVE",
+    JSONArrayAppend="JSON_ARRAY_APPEND",
+    JSONArrayInsert="JSON_ARRAY_INSERT",
+    JSONValue="JSON_VALUE",
+    Soundex="SOUNDEX",
+    ToBase64="TO_BASE64",
+    FromBase64="FROM_BASE64",
+    BitwiseCount="BIT_COUNT",
+    Stuff="INSERT",
+    SHA="SHA1",
+    SHA2="SHA2",
+    UtcTime="UTC_TIME",
+    CurrentRole="CURRENT_ROLE",
+    Collation="COLLATION",
+    Compress="COMPRESS",
+    StDistance="ST_DISTANCE",
+)
 
 # MySQL functions sqlglot leaves as written (Anonymous) that PostgreSQL / Aurora DSQL has
-# under the same name and meaning, by argument count (None: any).
+# under the same name AND meaning, by argument count (None: any). Not json_array /
+# json_arrayagg: PostgreSQL's drop NULL elements (ABSENT ON NULL), MySQL's keep them --
+# they are rewritten instead.
 _PG_BUILTIN_ANONYMOUS: "dict[str, Optional[int]]" = {
     "now": 0,  # MySQL stores NOW()/CURRENT_TIMESTAMP in a view as now()
     "octet_length": None,
     "regexp_substr": None,
     "regexp_instr": None,
     "regexp_count": None,
-    "json_array": None,
-    "json_arrayagg": None,
 }
 
-# EXTRACT field of each MySQL date-part call (an integer on both engines).
+# EXTRACT field of each MySQL date-part call (an integer on both engines). WEEKOFYEAR is
+# the ISO week on both.
 _EXTRACT_FIELDS: "dict[type, str]" = {
     exp.Year: "YEAR",
     exp.Month: "MONTH",
@@ -7363,7 +7381,27 @@ _EXTRACT_FIELDS: "dict[type, str]" = {
     exp.Quarter: "QUARTER",
     exp.Hour: "HOUR",
     exp.Minute: "MINUTE",
+    **_node_names(WeekOfYear="WEEK"),
 }
+
+
+class _MySqlViewDialect(_SqlglotMySQL):
+    """MySQL as a view body is read: VARIANCE / VAR_POP and STD / STDDEV / STDDEV_POP are
+    the POPULATION statistics MySQL computes, VAR_SAMP / STDDEV_SAMP the sample ones --
+    sqlglot reads VARIANCE and VAR_SAMP alike (and STDDEV as the sample one), which no
+    later rewrite can tell apart."""
+
+    class Parser(_SqlglotMySQL.Parser):
+        FUNCTIONS = {
+            **_SqlglotMySQL.Parser.FUNCTIONS,
+            "VARIANCE": exp.VariancePop.from_arg_list,
+            "VAR_POP": exp.VariancePop.from_arg_list,
+            "VAR_SAMP": exp.Variance.from_arg_list,
+            "STD": exp.StddevPop.from_arg_list,
+            "STDDEV": exp.StddevPop.from_arg_list,
+            "STDDEV_POP": exp.StddevPop.from_arg_list,
+            "STDDEV_SAMP": exp.StddevSamp.from_arg_list,
+        }
 
 
 def _as_integer(node: exp.Expression) -> exp.Expression:
@@ -7381,23 +7419,97 @@ def _texted(node: exp.Expression) -> exp.Expression:
     return exp.Cast(this=node, to=exp.DataType.build("TEXT"))
 
 
-def _rewrite_mysql_calls(select: exp.Expression) -> "tuple[list[str], list[str]]":
+# A DATE_FORMAT / STR_TO_DATE format token, as sqlglot holds it after reading MySQL (its
+# strftime-like spelling: MySQL %i is %M, %M is %B, %u is %W, %e is %-d ...) -> the
+# PostgreSQL TO_CHAR / TO_TIMESTAMP pattern, for the tokens with a faithful one (English
+# names, as MySQL's default lc_time_names).
+_FORMAT_TOKEN_TO_PG: "dict[str, str]" = {
+    "%Y": "YYYY", "%y": "YY", "%m": "MM", "%-m": "FMMM", "%d": "DD", "%-d": "FMDD",
+    "%H": "HH24", "%-H": "FMHH24", "%I": "HH12", "%-I": "FMHH12", "%M": "MI",
+    "%S": "SS", "%f": "US", "%j": "DDD", "%B": "FMMonth", "%b": "Mon", "%A": "FMDay",
+    "%a": "Dy", "%p": "AM", "%D": "FMDDth", "%r": "HH12:MI:SS AM", "%v": "IW",
+    "%x": "IYYY", "%T": "HH24:MI:SS",
+}
+# Tokens with no PostgreSQL pattern -- MySQL's week numbers other than ISO's, its year for
+# them, its 0-based day of week -- by the MySQL spelling the operator wrote.
+_FORMAT_TOKEN_NO_PG: "dict[str, str]" = {
+    "%U": "%U", "%W": "%u", "%V": "%V", "%X": "%X", "%w": "%w",
+}
+
+
+def _pg_format(sqlglot_format: str) -> "tuple[str, list[str]]":
+    """``(PostgreSQL pattern, MySQL tokens it cannot write)`` for a format as sqlglot reads
+    MySQL's: each token mapped, and a literal run holding a letter double-quoted (a 'T' or
+    a 'Date: ' is not read as a pattern -- DDTH is DD plus the ordinal suffix)."""
+    out: list[str] = []
+    unmapped: list[str] = []
+    literal: list[str] = []
+
+    def flush() -> None:
+        if literal:
+            text = "".join(literal)
+            if any(ch.isalpha() or ch in '"\\' for ch in text):
+                text = '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            out.append(text)
+            literal.clear()
+
+    i = 0
+    while i < len(sqlglot_format):
+        if sqlglot_format[i] == "%" and i + 1 < len(sqlglot_format):
+            width = 3 if sqlglot_format[i + 1] == "-" and i + 2 < len(sqlglot_format) else 2
+            token = sqlglot_format[i:i + width]
+            i += width
+            if token in _FORMAT_TOKEN_TO_PG:
+                flush()
+                out.append(_FORMAT_TOKEN_TO_PG[token])
+            elif token in _FORMAT_TOKEN_NO_PG:
+                # Written as the literal MySQL token, so the wrong text is visible, and
+                # reported.
+                literal.append(_FORMAT_TOKEN_NO_PG[token])
+                if _FORMAT_TOKEN_NO_PG[token] not in unmapped:
+                    unmapped.append(_FORMAT_TOKEN_NO_PG[token])
+            else:
+                literal.append(token[-1])  # %% and an unknown %x are the character itself
+            continue
+        literal.append(sqlglot_format[i])
+        i += 1
+    flush()
+    return "".join(out), unmapped
+
+
+_UTC_OFFSET_RE = re.compile(r"^[+-]\d{1,2}:\d{2}$")
+_CHAR_CAST_RE = re.compile(r"\bas\s+char\s*(?:\(\s*(\d+)\s*\))?\s+charset\b|\busing\s+\w+", re.IGNORECASE)
+
+
+def _rewrite_mysql_calls(
+    select: exp.Expression, definition: str = ""
+) -> "tuple[list[str], list[str]]":
     """Rewrite in place the MySQL calls sqlglot writes wrongly for PostgreSQL, and return
     ``(untranslated, misformatted)`` -- the calls left that fail the CREATE VIEW, and the
-    date formats with a token Aurora DSQL spells differently (the view is created but
+    date formats with a token Aurora DSQL has no pattern for (the view is created but
     returns different text). Rewritten, faithfully:
 
-    * YEAR/MONTH/DAY/DAYOFMONTH/DAYOFYEAR/QUARTER/HOUR/MINUTE(x) -> EXTRACT as an integer,
-      SECOND(x) its whole seconds, DAYOFWEEK(x) EXTRACT(DOW) + 1 (MySQL counts Sunday 1);
-    * DATEDIFF(a, b) -> the day difference of their dates; TIME(x) / TIMESTAMP(x) -> casts;
-      CURTIME() -> LOCALTIME (CURRENT_TIME() is a syntax error, and timetz);
-    * VARIANCE / STDDEV / STD -> the population forms MySQL computes (sqlglot wrote the
-      sample ones: a silently different value);
-    * CAST(x AS CHAR) -> text (PostgreSQL's CHAR is char(1): the value was cut to one
-      character);
-    * GROUP_CONCAT(x) -> STRING_AGG over text (string_agg takes no integer);
-    * FROM_UNIXTIME(x, fmt) -> TO_CHAR(TO_TIMESTAMP(x), fmt) (TO_TIMESTAMP(x, fmt) parses
-      a string, and rejects an integer)."""
+    * YEAR/MONTH/DAY/DAYOFMONTH/DAYOFYEAR/QUARTER/HOUR/MINUTE/WEEKOFYEAR(x) -> EXTRACT as
+      an integer, SECOND(x) its whole seconds, DAYOFWEEK(x) EXTRACT(DOW) + 1;
+    * DATEDIFF(a, b) -> the day difference of their dates; TIME(x) / TIMESTAMP(x) ->
+      casts; CURTIME() -> LOCALTIME, NOW(fsp) -> LOCALTIMESTAMP(fsp);
+    * CAST / CONVERT to CHAR (MySQL stores it with its CHARSET) -> text, or varchar(n)
+      with a length; to CHARSET binary -> bytea; to UNSIGNED -> numeric(20);
+    * GROUP_CONCAT(x) -> STRING_AGG over text, and with DISTINCT x ORDER BY x ->
+      ARRAY_TO_STRING(ARRAY_AGG(DISTINCT x ORDER BY x) FILTER (WHERE x IS NOT NULL));
+    * CONCAT_WS skipping NULLs as MySQL does, GREATEST/LEAST returning NULL for a NULL
+      argument as MySQL does, LENGTH as bytes (OCTET_LENGTH), CONVERT_TZ with a UTC offset
+      as an ISO interval (a '+09:00' string is a POSIX zone, west of Greenwich);
+    * JSON_ARRAY / JSON_ARRAYAGG -> JSON_BUILD_ARRAY / JSON_AGG, which keep NULLs;
+    * FROM_UNIXTIME(x, fmt) -> TO_CHAR(TO_TIMESTAMP(x), fmt), and every DATE_FORMAT /
+      STR_TO_DATE format written by :func:`_pg_format`.
+    The statistics are read right by :class:`_MySqlViewDialect` (VAR_SAMP, STDDEV ...)."""
+    untranslated: list[str] = []
+
+    def note(name: str) -> None:
+        if name.lower() not in {n.lower() for n in untranslated}:
+            untranslated.append(name)
+
     for node in list(select.find_all(*_EXTRACT_FIELDS)):
         node.replace(
             _as_integer(exp.Extract(this=exp.var(_EXTRACT_FIELDS[type(node)]), expression=node.this))
@@ -7424,44 +7536,115 @@ def _rewrite_mysql_calls(select: exp.Expression) -> "tuple[list[str], list[str]]
     for node in list(select.find_all(exp.Timestamp)):
         if node.args.get("zone") is None:
             node.replace(exp.Cast(this=node.this, to=exp.DataType.build("TIMESTAMP")))
+        else:
+            note("TIMESTAMP")  # the two-argument form, which adds a time
+    for node in list(select.find_all(exp.Dayname)):
+        node.replace(exp.func("TO_CHAR", node.this, exp.Literal.string("FMDay")))
     for node in list(select.find_all(exp.CurrentTime)):
         precision = node.this
         node.replace(exp.func("LOCALTIME", precision) if precision is not None else exp.var("LOCALTIME"))
-    for node in list(select.find_all(exp.Variance)):
-        node.replace(exp.VariancePop(this=node.this))
-    for node in list(select.find_all(exp.Stddev)):
-        node.replace(exp.StddevPop(this=node.this))
-    for node in list(select.find_all(exp.Anonymous)):
-        if (node.name or "").lower() == "std" and len(node.expressions) == 1:
-            node.replace(exp.StddevPop(this=node.expressions[0]))
+    # CHAR casts in their stored form: the lengths sqlglot drops, read in order from the
+    # definition (MySQL writes each `as char(n) charset x` / `using x` once per cast).
+    lengths = [m.group(1) for m in _CHAR_CAST_RE.finditer(_mask_sql_literals(definition))]
+    charset_casts = [
+        node for node in select.find_all(exp.Cast)
+        if isinstance(node.args.get("to"), exp.DataType)
+        and node.args["to"].this is exp.DataType.Type.CHARACTER_SET
+    ]
+    for position, node in enumerate(charset_casts):
+        charset = (node.args["to"].args.get("kind") or "")
+        charset = charset.name if isinstance(charset, exp.Expression) else str(charset)
+        length = lengths[position] if len(lengths) == len(charset_casts) else None
+        if charset.lower() == "binary":
+            node.set("to", exp.DataType.build("BYTEA"))
+        elif length:
+            node.set("to", exp.DataType.build(f"VARCHAR({length})"))
+        else:
+            node.set("to", exp.DataType.build("TEXT"))
     for node in list(select.find_all(exp.Cast)):
         to = node.args.get("to")
-        if isinstance(to, exp.DataType) and to.this is exp.DataType.Type.CHAR and not to.expressions:
+        if not isinstance(to, exp.DataType):
+            continue
+        if to.this is exp.DataType.Type.CHAR and not to.expressions:
             node.set("to", exp.DataType.build("TEXT"))
+        elif to.this is exp.DataType.Type.UBIGINT:
+            node.set("to", exp.DataType.build("NUMERIC(20)"))
     for node in list(select.find_all(exp.GroupConcat)):
+        separator = node.args.get("separator") or exp.Literal.string(",")
         holder, key, value = node, "this", node.this
         ordered = isinstance(value, exp.Order)
         if ordered:
             holder, key, value = value, "this", value.this
-        if isinstance(value, exp.Distinct):
-            # A DISTINCT aggregate's ORDER BY must be its argument: cast under an ORDER BY
-            # it would be refused, so it stays as written (fine over text, refused -- not
-            # wrong -- over a number).
-            if not ordered:
-                value.set("expressions", [_texted(e) for e in value.expressions])
+        if isinstance(value, exp.Distinct) and ordered:
+            # A DISTINCT aggregate's ORDER BY must be its argument: as an array, sorted
+            # by the value itself and without NULLs, it is the same list for any type.
+            orders = [o.this for o in holder.expressions]
+            if len(value.expressions) == 1 and len(orders) == 1 and orders[0] == value.expressions[0]:
+                item = value.expressions[0]
+                ordered_by = holder.expressions[0].copy()
+                aggregated = exp.ArrayAgg(
+                    this=exp.Order(this=exp.Distinct(expressions=[item.copy()]), expressions=[ordered_by])
+                )
+                node.replace(exp.func(
+                    "ARRAY_TO_STRING",
+                    exp.Filter(this=aggregated, expression=exp.Where(
+                        this=exp.Not(this=exp.Is(this=item.copy(), expression=exp.Null()))
+                    )),
+                    separator.copy(),
+                ))
+            else:
+                note("GROUP_CONCAT")  # DISTINCT ordered by another expression
+        elif isinstance(value, exp.Distinct):
+            value.set("expressions", [_texted(e) for e in value.expressions])
         elif value is not None:
             holder.set(key, _texted(value))
+    for node in list(select.find_all(exp.ConcatWs)):
+        node.set("coalesce", True)  # MySQL's CONCAT_WS skips a NULL argument, as PG's does
+    for node in list(select.find_all(exp.Greatest, exp.Least)):
+        if node.args.get("ignore_nulls"):
+            continue
+        arguments = [node.this, *node.expressions]
+        any_null = arguments[0].copy().is_(exp.Null())
+        for argument in arguments[1:]:
+            any_null = exp.or_(any_null, argument.copy().is_(exp.Null()))
+        node.replace(exp.Case(ifs=[exp.If(this=any_null, true=exp.Null())], default=node.copy()))
+    for node in list(select.find_all(exp.Length)):
+        if node.args.get("binary"):
+            node.replace(exp.func("OCTET_LENGTH", node.this))
+    for node in list(select.find_all(exp.ConvertTimezone)):
+        for part in ("source_tz", "target_tz"):
+            zone = node.args.get(part)
+            if isinstance(zone, exp.Literal) and zone.is_string and _UTC_OFFSET_RE.match(zone.name):
+                node.set(part, exp.Interval(this=exp.Literal.string(zone.name)))
     for node in list(select.find_all(exp.UnixToTime)):
         if node.args.get("format") is not None:
             node.replace(exp.TimeToStr(
                 this=exp.UnixToTime(this=node.this), format=node.args["format"]
             ))
-
-    untranslated: list[str] = []
-
-    def note(name: str) -> None:
-        if name.lower() not in {n.lower() for n in untranslated}:
-            untranslated.append(name)
+    misformatted: list[str] = []
+    for node in list(select.find_all(exp.TimeToStr, exp.StrToTime, exp.StrToDate)):
+        fmt = node.args.get("format")
+        if not (isinstance(fmt, exp.Literal) and fmt.is_string):
+            continue
+        pattern, unmapped = _pg_format(fmt.name)
+        word = "DATE_FORMAT" if isinstance(node, exp.TimeToStr) else "STR_TO_DATE"
+        function = (
+            "TO_CHAR" if isinstance(node, exp.TimeToStr)
+            else "TO_DATE" if isinstance(node, exp.StrToDate) else "TO_TIMESTAMP"
+        )
+        node.replace(exp.func(function, node.this, exp.Literal.string(pattern)))
+        for token in unmapped:
+            entry = f"{word} ({token})"
+            if entry not in misformatted:
+                misformatted.append(entry)
+    for node in list(select.find_all(exp.Anonymous)):
+        name = (node.name or "").lower()
+        if name == "json_array":
+            node.replace(exp.func("JSON_BUILD_ARRAY", *node.expressions))
+        elif name == "json_arrayagg" and len(node.expressions) == 1:
+            node.replace(exp.func("JSON_AGG", node.expressions[0]))
+        elif name == "now" and len(node.expressions) == 1:
+            node.replace(exp.func("LOCALTIMESTAMP", node.expressions[0]))
 
     # A call sqlglot does not know stays an Anonymous function and is emitted as written:
     # a MySQL-only function (FIND_IN_SET, UNIX_TIMESTAMP) or a user one -- unless
@@ -7471,24 +7654,12 @@ def _rewrite_mysql_calls(select: exp.Expression) -> "tuple[list[str], list[str]]
         arity = _PG_BUILTIN_ANONYMOUS.get(name.lower(), -1)
         if arity is None or arity == len(node.expressions):
             continue
-        if name:
+        if name and name.upper() not in ("ARRAY_TO_STRING", "JSON_BUILD_ARRAY", "JSON_AGG",
+                                         "LOCALTIMESTAMP", "LOCALTIME", "OCTET_LENGTH",
+                                         "TO_CHAR", "TO_DATE", "TO_TIMESTAMP"):
             note(name)
     for node in select.find_all(*_UNTRANSLATED_MYSQL_NODES):
-        if isinstance(node, exp.Timestamp):
-            continue
         note(_UNTRANSLATED_MYSQL_NODES[type(node)])
-    for node in select.find_all(exp.Timestamp):
-        note("TIMESTAMP")  # the two-argument form, which adds a time
-    misformatted: list[str] = []
-    for node in select.find_all(exp.TimeToStr, exp.StrToTime, exp.StrToDate):
-        rendered = node.sql(dialect=_POSTGRES)
-        literal = re.findall(r"'((?:[^']|'')*)'", rendered)
-        tokens = sorted(set(re.findall(r"%.", literal[-1]))) if literal else []
-        if tokens:
-            word = "DATE_FORMAT" if isinstance(node, exp.TimeToStr) else "STR_TO_DATE"
-            entry = f"{word} ({', '.join(tokens)})"
-            if entry not in misformatted:
-                misformatted.append(entry)
     return untranslated, misformatted
 
 
@@ -7501,11 +7672,11 @@ def _converted_mysql_view(
     by name and body: Schema Conversion and Evaluation (VIEW_NOT_CONVERTED) convert the
     same views."""
     try:
-        parsed = sqlglot.parse_one(definition, read=_MYSQL)
+        parsed = sqlglot.parse_one(definition, read=_MySqlViewDialect)
         select = parsed.expression if isinstance(parsed, exp.Create) else parsed
         if select is None:
             raise ValueError("no SELECT body parsed from the view definition")
-        untranslated, misformatted = _rewrite_mysql_calls(select)
+        untranslated, misformatted = _rewrite_mysql_calls(select, definition)
         # The name is QUOTED, like every table and index name the converter emits:
         # unquoted, Aurora DSQL folded it (``V_Orders`` became ``v_orders``, and a
         # view in schema ``MyApp`` landed in a different schema, ``myapp``), so it
