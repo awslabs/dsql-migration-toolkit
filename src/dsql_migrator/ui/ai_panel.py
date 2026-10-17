@@ -201,6 +201,10 @@ def build_ai_panel(
         "footer_action": None,
         "footer_visible": None,
         "scope_start": len(conversation.messages),
+        # The first message of the current scope, by IDENTITY: its window starts there.
+        # An index alone was shifted by a late reply landing before it (another tab of
+        # the same session, or a turn still streaming when a new scope opened).
+        "scope_first": None,
         # Count of activity events posted while the panel was closed -- shown as a
         # badge on the right-edge reopen tab so an action is noticed even with the
         # panel hidden. Reset to 0 when the panel is opened.
@@ -487,6 +491,7 @@ def build_ai_panel(
                 scope_id="general", title="AI DBA", chip=_baseline_chip()
             )
             conv["scope_start"] = len(conversation.messages)
+            conv["scope_first"] = None
         try:
             title_label.set_text("AI DBA")  # type: ignore[attr-defined]
             subtitle_label.set_text("")  # type: ignore[attr-defined]
@@ -977,24 +982,46 @@ def build_ai_panel(
             _autoscroll()
             _notify_change()  # persist the newly-recorded events (crash-durable)
 
-    def _land_reply(message: dict, asked_scope: "Optional[str]") -> None:
-        """Record a reply in the scope it was asked in. When another scope opened while it
-        streamed, it goes just before that scope's window, beside its own question -- in
-        the window it was the new scope's first turn, so the next question there was sent
-        with another object's answer (and an assistant turn first)."""
+    def _index_of(message: object) -> "Optional[int]":
+        """Where ``message`` (this very object) is in the shared transcript."""
+        return next(
+            (i for i, m in enumerate(conversation.messages) if m is message), None
+        )
+
+    def _window_start() -> int:
+        """Where the current scope's window starts in the shared transcript."""
+        first = conv.get("scope_first")
+        at = _index_of(first) if first is not None else None
+        if at is not None:
+            return at
+        return min(int(conv["scope_start"]), len(conversation.messages))  # type: ignore[arg-type]
+
+    def _land_reply(message: dict, asked_scope: "Optional[str]", question: object) -> None:
+        """Record a reply in the scope it was asked in: right after its own question when
+        another scope opened while it streamed (in that scope's window it was the first
+        turn, so the next question there was sent with another object's answer, an
+        assistant turn first), else at the end. Placed by the question's identity, never
+        by an index another tab or a late reply could have shifted."""
         active = conversation.active_scope
-        if asked_scope is not None and (active is None or active.scope_id != asked_scope):
-            at = min(int(conv["scope_start"]), len(conversation.messages))  # type: ignore[arg-type]
-            conversation.messages.insert(at, message)
-            conv["scope_start"] = at + 1
+        at = _index_of(question)
+        if (
+            asked_scope is not None
+            and (active is None or active.scope_id != asked_scope)
+            and at is not None
+        ):
+            conversation.messages.insert(at + 1, message)
+            if at + 1 <= int(conv["scope_start"]):  # type: ignore[arg-type]
+                conv["scope_start"] = int(conv["scope_start"]) + 1  # type: ignore[arg-type]
         else:
             conversation.messages.append(message)
 
     def _run_pending_seed() -> None:
-        """Ask the seed question a scope opened while a turn was running (it was dropped)."""
+        """Ask the seed question of the scope opened while a turn was running -- if that
+        scope is still the active one (a later scope replaced it otherwise)."""
         pending = conv.pop("pending_seed", None)
-        if pending:
-            _run_turn(str(pending))
+        active = conversation.active_scope
+        if pending and active is not None and active.scope_id == pending[0]:
+            _run_turn(str(pending[1]))
 
     def _run_turn(user_text: str) -> None:
         text = (user_text or "").strip()
@@ -1017,10 +1044,13 @@ def build_ai_panel(
         # object's AI button opened a new scope while it streamed.
         asked_scope = getattr(conversation.active_scope, "scope_id", None)
         _set_busy(True)
-        conversation.messages.append({"role": "user", "text": text})
+        question = {"role": "user", "text": text}
+        conversation.messages.append(question)
+        if conv.get("scope_first") is None or _index_of(conv.get("scope_first")) is None:
+            conv["scope_first"] = question
         # Ground the streamer on the CURRENT scope only: send the turns since this
         # scope began, not the whole cross-scope scrollback.
-        scope_start = int(conv["scope_start"])  # type: ignore[arg-type]
+        scope_start = _window_start()
         # The model only ever sees user/assistant TURNS within the current scope's
         # window (the streamer maps any other role to "user", which would corrupt the
         # alternation). Activity events are folded in SEPARATELY as grounding context,
@@ -1135,7 +1165,9 @@ def build_ai_panel(
                         pass
                 # Persist the partial as the assistant turn so it survives refresh and
                 # keeps the user/assistant alternation valid for the next turn.
-                _land_reply({"role": "assistant", "text": partial or "_(stopped)_"}, asked_scope)
+                _land_reply(
+                    {"role": "assistant", "text": partial or "_(stopped)_"}, asked_scope, question
+                )
                 try:
                     meta.set_text("Stopped")  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001
@@ -1178,10 +1210,13 @@ def build_ai_panel(
                         body=outcome.detail,
                     )
                 meta.set_text("")  # type: ignore[attr-defined]
-                # Roll back the user turn so a retry is not blocked / mis-grounded.
-                msgs = conversation.messages
-                if msgs and msgs[-1].get("role") == "user":
-                    msgs.pop()
+                # Roll back THIS turn's question so a retry is not blocked / mis-grounded
+                # -- by identity: the last message may be another scope's question by now.
+                at = _index_of(question)
+                if at is not None:
+                    del conversation.messages[at]
+                    if conv.get("scope_first") is question:
+                        conv["scope_first"] = None
             elif isinstance(outcome, ObjectGuidanceOutcome) and outcome.available:
                 # Live evidence the other way: a reply just SUCCEEDED, so clear any stale
                 # latch (the grant was added, expired credentials were renewed -- note the
@@ -1215,7 +1250,7 @@ def build_ai_panel(
                 meta.set_text(  # type: ignore[attr-defined]
                     f"Generated by model {outcome.model_id}" if outcome.model_id else ""
                 )
-                _land_reply({"role": "assistant", "text": outcome.markdown}, asked_scope)
+                _land_reply({"role": "assistant", "text": outcome.markdown}, asked_scope, question)
                 show_footer = footer_action is not None and bool(footer_label)
                 if show_footer and callable(footer_visible):
                     try:
@@ -1363,6 +1398,9 @@ def build_ai_panel(
         or a follow-up after a model / profile switch answers (and latches a denial)
         with the old settings.
         """
+        # Read before anything changes: a turn still streaming keeps the composer busy
+        # (clearing it here let the new scope's seed run beside it).
+        was_busy = bool(conv["busy"])
         conv["streamer"] = streamer
         conv["footer_label"] = footer_label
         conv["footer_action"] = footer_action
@@ -1374,6 +1412,9 @@ def build_ai_panel(
                 scope_id=scope_id, title=title, subtitle=subtitle, chip=chip
             )
             conv["scope_start"] = len(conversation.messages)
+            conv["scope_first"] = None
+            # A seed queued for an earlier scope belongs to a scope no longer open.
+            conv.pop("pending_seed", None)
             if conversation.messages:
                 _divider(f"Now: {title}" if title else "New topic")
         try:
@@ -1383,12 +1424,13 @@ def build_ai_panel(
         except Exception:  # noqa: BLE001
             pass
         _set_visible(True)
-        _set_busy(False)
+        _apply_composer_state()
         _autoscroll(force=True)
         if is_new_scope and seed_question:
-            if conv["busy"]:
-                # Another turn is still streaming: ask this one when it ends, not never.
-                conv["pending_seed"] = seed_question
+            if was_busy:
+                # Another turn is still streaming: ask this one when it ends (if this scope
+                # is still the open one then), never beside it.
+                conv["pending_seed"] = (scope_id, seed_question)
             else:
                 _run_turn(seed_question)
         return _run_turn
@@ -1438,6 +1480,8 @@ def build_ai_panel(
         conv["busy"] = False
         conv["stop_requested"] = False
         conv["scope_start"] = 0
+        conv["scope_first"] = None
+        conv.pop("pending_seed", None)  # a seed of the old journey is never asked
         conv["unseen"] = 0
         pending = conv.get("pending")
         if pending is not None:

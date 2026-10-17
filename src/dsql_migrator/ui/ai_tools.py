@@ -60,7 +60,8 @@ AI_TOOL_SCHEMAS: list[dict] = [
         "name": "list_objects_by_status",
         "description": (
             "List assessed source objects, optionally filtered by migration "
-            "classification (AUTO, MANUAL, or UNSUPPORTED)."
+            "classification (AUTO, MANUAL, or UNSUPPORTED). A long list comes in pages: "
+            "when 'next_offset' is set, call again with that offset for the rest."
         ),
         "input_schema": {
             "type": "object",
@@ -68,7 +69,8 @@ AI_TOOL_SCHEMAS: list[dict] = [
                 "classification": {
                     "type": "string",
                     "enum": ["AUTO", "MANUAL", "UNSUPPORTED"],
-                }
+                },
+                "offset": {"type": "integer", "minimum": 0},
             },
         },
     },
@@ -287,6 +289,8 @@ AI_TOOLS_SYSTEM_HINT = (
 
 # The most objects one list tool returns; the count stays exact.
 _MAX_LISTED_OBJECTS = 200
+# A listing page stays below the tool-result bound (assessment_strategist's 12,000).
+_MAX_LISTED_CHARS = 11000
 
 # get_converted_ddl's one-entry memo: the conversion of the current inventory (by identity),
 # foreign-key choice and engine -- a lookup used to re-convert the whole schema.
@@ -302,17 +306,32 @@ _DLQ_ROW_DATA = (
     re.compile(r"Failing row contains \(.*?\)(?=\.|$)", re.DOTALL),
     re.compile(r"\s*Detail:[^\n|]*"),
 )
+# A PRIMARY message that echoes the value it refused (22P02, 22008, 22003): the value goes,
+# the message's own words stay.
+_DLQ_VALUE_ECHO = (
+    re.compile(
+        r'(?P<lead>invalid input syntax for type [^:"]+: |invalid input value for enum '
+        r'[^:"]+: |date/time field value out of range: |invalid input syntax for '
+        r'[^:"]+: )"(?:[^"]|"")*"'
+    ),
+    re.compile(r'(?P<lead>value )"(?:[^"]|"")*"(?= is out of range)'),
+    re.compile(r"(?P<lead>invalid byte sequence for encoding \S+: )(?:0x[0-9a-fA-F]{2}\s*)+"),
+)
 
 
 def ai_safe_dlq_message(text: str) -> str:
-    """``text`` with every row value removed, for a model (Property 7): the failing row's key
-    and the server's echo of a value go, the reason stays. Pure."""
+    """``text`` with every row value removed, for a model (Property 7): the failing row's
+    key, the server's echo of a value (its DETAIL, and a primary message that quotes the
+    refused value) and the statement go; the reason stays. Every DLQ text a model is given
+    goes through this. Pure."""
     out = text or ""
     for pattern in _DLQ_ROW_DATA:
         if "cols" in pattern.groupindex:
             out = pattern.sub(lambda m: f"Key ({m.group('cols')})=(...)", out)
         else:
             out = pattern.sub("", out)
+    for pattern in _DLQ_VALUE_ECHO:
+        out = pattern.sub(lambda m: f'{m.group("lead")}"..."', out)
     return re.sub(r"\s*\|\s*", " | ", re.sub(r"\s+\.$", ".", out)).strip()
 
 def build_ai_tool_executor(
@@ -412,6 +431,26 @@ def build_ai_tool_executor(
                     return _json.dumps({"status": "not_found", "object_name": _obj})
                 _edited_of = getattr(_cs, "get_edited_target_ddl", None)
                 _edited = _edited_of(_p.object_name) if callable(_edited_of) else None
+                if _edited:
+                    # As Schema Conversion shows and Apply / Full Load run it: the stored
+                    # text named a pre-rename index and kept foreign keys the operator had
+                    # turned off, and a name-collision placeholder ignores any edit.
+                    from dsql_migrator.core.converter import (
+                        is_name_collision_placeholder,
+                        rename_index_script,
+                    )
+                    from dsql_migrator.ui.schema_conversion_apply import (
+                        split_target_ddl_fk_sections,
+                    )
+
+                    if is_name_collision_placeholder(_p.target_ddl):
+                        _edited = None
+                    else:
+                        _renames = (getattr(_res, "index_renames", None) or {}).get(_p.object_name)
+                        if _renames:
+                            _edited = rename_index_script(_edited, _renames)
+                        if not _pfk:
+                            _edited = split_target_ddl_fk_sections(_edited)[0]
                 return _json.dumps(
                     {"status": "ok", "object_name": _p.object_name,
                      "source_ddl": _p.source_ddl,
@@ -428,16 +467,30 @@ def build_ai_tool_executor(
                 _want = str(args.get("classification", "")).strip().upper()
                 if _want:
                     _items = [it for it in _items if it.classification.value == _want]
-                # Bounded: the count is exact, the list stops at the cap and says so.
-                _shown = _items[:_MAX_LISTED_OBJECTS]
+                # Paged to fit the tool-result bound: the count is exact, a page stops at
+                # the cap or before the bound would cut it (200 entries outgrew it and the
+                # model got ~140 of them, cut mid-entry, under "listed: 200"), and the next
+                # offset says where the rest starts.
+                try:
+                    _offset = max(0, int(args.get("offset") or 0))
+                except (TypeError, ValueError):
+                    _offset = 0
+                _page: list = []
+                _size = 200  # the envelope
+                for it in _items[_offset:_offset + _MAX_LISTED_OBJECTS]:
+                    _entry = {"object_name": it.object_name, "kind": it.kind,
+                              "classification": it.classification.value}
+                    _size += len(_json.dumps(_entry)) + 2
+                    if _size > _MAX_LISTED_CHARS:
+                        break
+                    _page.append(_entry)
+                _next = _offset + len(_page)
                 return _json.dumps(
-                    {"status": "ok", "count": len(_items),
-                     "listed": len(_shown), "truncated": len(_items) > len(_shown),
-                     "objects": [
-                         {"object_name": it.object_name, "kind": it.kind,
-                          "classification": it.classification.value}
-                         for it in _shown
-                     ]}
+                    {"status": "ok", "count": len(_items), "offset": _offset,
+                     "listed": len(_page),
+                     "next_offset": _next if _next < len(_items) else None,
+                     "truncated": _next < len(_items),
+                     "objects": _page}
                 )
             if name == "get_assessment":
                 _ev = EVALUATION_STORE.get(session_id)

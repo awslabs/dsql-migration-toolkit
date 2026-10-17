@@ -1396,6 +1396,8 @@ def test_a_reply_lands_in_the_scope_it_was_asked_in_and_a_queued_seed_is_asked()
         scope_id="eval:items", title="items",
         streamer=_make_streamer("A2", record=second_sent), seed_question="Q2",
     )
+    # Queued, never asked beside the streaming turn (open_scope cleared busy first).
+    assert second_sent == [] and [m["text"] for m in state.ai_conversation.messages] == ["Q1"]
     gate.set()
     for _ in range(400):  # finish the first turn; that asks the queued Q2
         if not first.active:
@@ -1407,3 +1409,66 @@ def test_a_reply_lands_in_the_scope_it_was_asked_in_and_a_queued_seed_is_asked()
     assert texts == ["Q1", "A1", "Q2", "A2"]
     # The items scope's window held only its own question.
     assert second_sent and [m["text"] for m in second_sent[0]] == ["Q2"]
+
+
+def test_a_failed_reply_removes_its_own_question_and_a_late_reply_follows_its_question() -> None:
+    """The failure branch popped the LAST message -- another scope's question by then --
+    and a late reply landed at a per-tab index that another tab's window had moved."""
+    import threading
+
+    state = _enabled_state()
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    gate = threading.Event()
+
+    def failing(messages, on_delta):  # noqa: ANN001
+        gate.wait(5)
+        return ObjectGuidanceOutcome(available=False, reason="THROTTLED", detail="slow down")
+
+    panel.open_scope(scope_id="eval:orders", title="orders", streamer=failing, seed_question="QA")
+    first = ui.timers[-1]
+    # Another tab of the same session asks about items while QA streams.
+    other = build_ai_panel(_Ui(), state=state)
+    other.open_scope(
+        scope_id="eval:items", title="items", streamer=_make_streamer("B"), seed_question="QB"
+    )
+    gate.set()
+    for _ in range(400):
+        if not first.active:
+            break
+        first.cb()
+        time.sleep(0.003)
+    texts = [m["text"] for m in state.ai_conversation.messages]
+    assert "QB" in texts and "QA" not in texts  # QA rolled back, QB kept
+
+
+def test_two_tabs_a_late_reply_follows_its_own_question() -> None:
+    import threading
+
+    state = _enabled_state()
+    ui1, ui2 = _Ui(), _Ui()
+    tab1 = build_ai_panel(ui1, state=state)
+    tab2 = build_ai_panel(ui2, state=state)
+    gate = threading.Event()
+
+    def slow(messages, on_delta):  # noqa: ANN001
+        gate.wait(5)
+        on_delta("A1")
+        return ObjectGuidanceOutcome(available=True, reason="OK", detail="", markdown="A1")
+
+    tab1.open_scope(scope_id="eval:orders", title="orders", streamer=slow, seed_question="QA")
+    second_sent: list = []
+    tab2.open_scope(
+        scope_id="eval:items", title="items",
+        streamer=_make_streamer("B", record=second_sent), seed_question="QB",
+    )
+    _pump(ui2)
+    gate.set()
+    _pump(ui1, max_iters=400)
+    assert [m["text"] for m in state.ai_conversation.messages] == ["QA", "A1", "QB", "B"]
+    # tab2's follow-up window is its own scope only.
+    tab2_send = tab2.open_scope(scope_id="eval:items", title="items",
+                                streamer=_make_streamer("C", record=second_sent))
+    tab2_send("more about items")
+    _pump(ui2)
+    assert [m["text"] for m in second_sent[-1]] == ["QB", "B", "more about items"]

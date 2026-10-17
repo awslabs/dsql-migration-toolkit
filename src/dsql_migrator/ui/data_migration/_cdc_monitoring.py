@@ -3392,12 +3392,17 @@ def _cdc_dlq_facts(migration_state, log_key: str, job_manager=None) -> str:
     # Each reason as the record list shows it (cdc_dlq_shown_message): the facts are
     # authoritative to the chat, so a source TRUNCATE's sink clause "reload this table on the
     # Full Load step" must not reach it -- on CDC only there is no such step.
+    # Row-free (Property 7): the shown message still carries the record's pk, its SQL and,
+    # from a pre-v29 sink, pgjdbc's "Failing row contains (...)" -- all of which went to
+    # Bedrock here while the chat's DLQ tool stripped them.
     from types import SimpleNamespace
+
+    from dsql_migrator.ui.ai_tools import ai_safe_dlq_message
 
     lines.append(_summarize_errors([
         SimpleNamespace(
             table=r.table, error_code=getattr(r, "error_code", None),
-            message=cdc_dlq_shown_message(r),
+            message=ai_safe_dlq_message(cdc_dlq_shown_message(r)),
         )
         for r in records
     ]))

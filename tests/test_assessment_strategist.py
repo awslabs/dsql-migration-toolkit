@@ -1230,6 +1230,24 @@ def test_only_a_short_announcement_is_nudged_and_the_constraints_are_current() -
     assert is_tool_preamble("Let me pull the assessment details for that table.")
     answer = "**Verdict:** ready.\n\n" + "- a point\n" * 40 + "- I'll check the logs if it recurs."
     assert not is_tool_preamble(answer)
+    # Judged by the LAST sentence: a closing offer is an answer, a long single-paragraph
+    # announcement is a preamble (it was length-only, with the cue anywhere).
+    for complete in (
+        "The table is ready to migrate: its key is an identity and every column maps. "
+        "Let me know if you'd like me to review the trigger body.",
+        "The DLQ holds 3 records, all 23505 on app.users. If you're going to cut over "
+        "today, check the DLQ depth first.",
+        "Full Load runs at 8K rows/s. Let's look at throughput instead of the index.",
+    ):
+        assert not is_tool_preamble(complete), complete
+    long_preamble = (
+        "To answer that I need the current state of three things: the Evaluation verdict "
+        "for app.orders, the converted DDL Schema Conversion would apply for it, and the "
+        "dead-letter samples the CDC sink has recorded for it since the stream started, "
+        "because the duplicate-key errors you describe could come from either the key "
+        "strategy or a re-snapshot. Let me pull each of those from your session now."
+    )
+    assert len(long_preamble) > 300 and is_tool_preamble(long_preamble)
     assert "every table requires a primary key" not in DSQL_CONSTRAINTS
     assert "cached identity by default" in DSQL_CONSTRAINTS
 
