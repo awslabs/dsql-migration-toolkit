@@ -135,19 +135,26 @@ _MAX_TOOL_ROUNDS = 6
 # the answer. The detector therefore errs toward nudging: a punt shown as the whole reply
 # is the failure that matters.
 _TOOL_PREAMBLE_RE = re.compile(
-    r"\b(let me(?! know)|i'?ll|i will|i'?m going to|i am going to)\b"
-    r".{0,60}\b(check|look|pull|fetch|inspect|review|examine|gather|retrieve|see|"
-    r"take a look|dig|query|read)\b",
+    r"\b(?:let me(?! know)|i'?ll|i will|i'?m going to|i am going to)\b"
+    # A look-up verb: a strong one anywhere after the cue, a weak one ('see', 'review')
+    # only right after it -- "let me explain why you see it" is no look-up.
+    r"(?:.{0,60}\b(?:check|look|pull|fetch|inspect|examine|gather|retrieve|take a look|dig)\b"
+    r"|\s+(?:\w+\s+)?(?:see|review|query|read)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 # The same announcement in Korean or Japanese: the operator may ask in either, and the
-# model answers in kind ("확인해 보겠습니다", "確認します").
+# model answers in kind ("확인해 보겠습니다", "確認させていただきます").
 _CJK_PREAMBLE_RE = re.compile(
-    r"(?:확인|조회|점검|검토|분석)\s*(?:해\s*보겠|하겠|해\s*볼게|할게)"
-    r"|(?:살펴|알아|찾아)\s*보겠|(?:가져|불러)\s*오겠"
-    r"|(?:確認|調査|チェック|取得|参照)(?:します|してみます|いたします)"
-    r"|調べ(?:ます|てみます)|見てみます"
+    r"(?:확인|조회|점검|검토|분석)\s*(?:해\s*보|해\s*드리|해서\s*알려\s*드리|하|해\s*보도록\s*하)\s*겠"
+    r"|(?:확인|조회|점검|검토|분석)\s*(?:해\s*볼게|할게)"
+    r"|(?:살펴|알아|찾아)\s*보(?:도록\s*하)?\s*겠|살펴보고\s*알려\s*드리겠|(?:가져|불러)\s*오겠"
+    r"|(?:確認|調査|チェック|取得|参照|分析)(?:してみます|いたします|させていただきます|しましょう|していきます)"
+    r"|調べてみます|お調べします|見て(?:みます|いきます)"
 )
+# A plain Japanese 〜します is an announcement only with no subject before it (確認します);
+# with one it states what something does (外部キーは親テーブルを参照します).
+_JA_PLAIN_PREAMBLE_RE = re.compile(r"(?:確認|調査|チェック|取得|参照)します|調べます")
+_JA_SUBJECT_RE = re.compile(r"(?:は|が|では)[^。]*(?:確認|調査|チェック|取得|参照)します")
 # An offer to the user, or a closing, is no announcement of what the model is about to do
 # ("to see if you have ..." is no offer).
 _TOOL_OFFER_RE = re.compile(
@@ -155,26 +162,26 @@ _TOOL_OFFER_RE = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
-# A look-up said for LATER ("I'll check it before you cut over", "once Schema Apply has
-# run, I'll check ...", "if it recurs") is part of an answer, not an announcement. Only
-# deferrals count: a look-up of what already happened ("after you started the Full
-# Load", "when it reconnected"), an indirect question ("to determine if it has ..."), or
-# one asked for again ("let me check the DLQ again") is an announcement.
+# A look-up said for LATER is part of an answer: 'later', 'next time', 'once Schema Apply
+# has run' never announce one.
 _LATER_RE = re.compile(
     r"\b(?:later|next time|whenever|from now on)\b"
     r"|\bonce\b(?!\s+more\b)(?=[^.]*\b(?:has|have|is|are|runs?|finishes|completes)\b)"
-    r"|(?<!see )(?<!check )(?<!determine )(?<!find out )(?<!know )(?<!verify )(?<!tell )"
-    r"\b(?:before|after|when|if)\s+(?:you(?:'re|'ve| are| have)?|it(?:'s| is)?|a new)\s+"
-    r"(?!(?:started|ran|saw|first|reconnected|failed|finished|stopped|changed|began|got|"
-    r"went|was|were|had|did)\b)"
-    r"|나중에|다음에|이후에|後で|次回|後ほど",
+    r"|나중에|後で|次回|後ほど",
+    re.IGNORECASE,
+)
+# A look-up tied to a moment ('before you cut over', 'if it recurs', 'after you deployed
+# CDC', '컷오버 전에') is part of an answer only beside one: in a reply with nothing else to
+# say it is the punt ("I'll check ... to find what blocks you before you cut over.").
+_DEFERRED_RE = re.compile(
+    r"\b(?:before|after|when|if)\s+(?:you|it|a new|the)\b|전에|후에|이후에|되면|하면|前に|後に|たら",
     re.IGNORECASE,
 )
 # 'To answer that I need ...': what the model is about to fetch, said as a need -- never
-# 'I need to correct that' or 'I need to know which table you mean' (a question to the
-# operator).
+# 'I need to correct that' or 'to answer that, I need to know which table you mean' (a
+# question to the operator).
 _NEED_RE = re.compile(
-    r"\bto answer (?:that|this),? i(?:'ll| will)? need\b"
+    r"\bto answer (?:that|this),? i(?:'ll| will)? need\b(?!\s+(?:to know|your|you\b|the name|more))"
     r"|\bi need (?:to (?:check|look|pull|fetch|see|review|query|read|gather|confirm|"
     r"inspect)\b|the (?:current|latest|actual|live)\b)",
     re.IGNORECASE,
@@ -182,18 +189,31 @@ _NEED_RE = re.compile(
 # A preamble is short: a long answer that says "I'll check the logs" in its third bullet
 # is an answer. Code is always an answer.
 _TOOL_PREAMBLE_MAX_CHARS = 800
+# A sentence of this many words that announces nothing (or twice as many words in all) is
+# substance: beside it, a look-up tied to a moment is a promise in an answer, not a punt.
+_SUBSTANCE_WORDS = 6
 # What a nudged model replies, alone, when its reply already was the complete answer: that
 # reply is kept, so a nudge sent by mistake never replaces an answer.
 KEEP_REPLY_MARKER = "KEEP_PREVIOUS_REPLY"
 
 
+def _announces_look_up(unit: str) -> bool:
+    """Whether a sentence or line announces a look-up (English, Korean or Japanese)."""
+    if _TOOL_OFFER_RE.search(unit):
+        return False  # an offer to the operator, or a closing
+    if _TOOL_PREAMBLE_RE.search(unit) or _NEED_RE.search(unit) or _CJK_PREAMBLE_RE.search(unit):
+        return True
+    return bool(_JA_PLAIN_PREAMBLE_RE.search(unit)) and not _JA_SUBJECT_RE.search(unit)
+
+
 def is_tool_preamble(text: str) -> bool:
     """Whether ``text`` may be only an announcement of tool use (``let me pull``, ``I'll
-    check``, ``확인해 보겠습니다``): a reply up to :data:`_TOOL_PREAMBLE_MAX_CHARS` with an
-    announcing sentence or line that is not said for later -- never one that ends with an
-    offer or a closing (``would you like``, ``let me know``), and never one with code. It
-    errs toward True: the nudge it triggers lets the model keep a reply that already was
-    the answer (:data:`KEEP_REPLY_MARKER`). Pure."""
+    check``, ``확인해 보겠습니다``): a reply up to :data:`_TOOL_PREAMBLE_MAX_CHARS`, with no
+    code, that announces a look-up not said for later -- one tied to a moment ('before
+    you cut over') only when nothing else in the reply has substance. It errs toward True:
+    the nudge it triggers lets the model keep a reply that already was the answer
+    (:data:`KEEP_REPLY_MARKER`), and tool_chat falls back to that reply when the nudge
+    round fails. Pure."""
     stripped = (text or "").strip()
     if not stripped or len(stripped) > _TOOL_PREAMBLE_MAX_CHARS or "```" in stripped:
         return False
@@ -203,17 +223,13 @@ def is_tool_preamble(text: str) -> bool:
         for part in _SENTENCE_BREAK_RE.split(line)
         if part.strip()
     ]
-    if units and _TOOL_OFFER_RE.search(units[-1]):
+    announcing = [u for u in units if _announces_look_up(u) and not _LATER_RE.search(u)]
+    if not announcing:
         return False
-    return any(
-        bool(
-            _TOOL_PREAMBLE_RE.search(unit)
-            or _NEED_RE.search(unit)
-            or _CJK_PREAMBLE_RE.search(unit)
-        )
-        and not _LATER_RE.search(unit)
-        for unit in units
-    )
+    if any(not _DEFERRED_RE.search(u) for u in announcing):
+        return True
+    said = [len(u.split()) for u in units if u not in announcing and not _TOOL_OFFER_RE.search(u)]
+    return not (any(words >= _SUBSTANCE_WORDS for words in said) or sum(said) >= 2 * _SUBSTANCE_WORDS)
 
 # A tool result handed back to the model: larger than a prompt field (a list of objects is
 # what the tools exist for), and when cut it SAYS so -- cut silently mid-JSON, the model read
@@ -2058,6 +2074,19 @@ class AssessmentStrategist:
         tools_used = False
         nudged = False
         nudged_reply: Optional[str] = None
+
+        def kept() -> "ObjectGuidanceOutcome":
+            """The first reply, as the answer: it was received (and paid for) before the
+            nudge, whatever the nudge round did."""
+            on_delta(nudged_reply or "")
+            return ObjectGuidanceOutcome(
+                available=True,
+                reason="OK",
+                detail="",
+                markdown=(nudged_reply or "")[:_MAX_NARRATIVE_CHARS],
+                model_id=self._config.model_id,
+            )
+
         try:
             for round_number in range(max(1, max_rounds)):
                 body = json.dumps(
@@ -2165,8 +2194,9 @@ class AssessmentStrategist:
                         }
                     )
                     continue
-                if nudged_reply is not None and KEEP_REPLY_MARKER in final.upper():
-                    # Nudged by mistake: the model says its first reply was the answer.
+                if nudged_reply is not None and (not final or KEEP_REPLY_MARKER in final.upper()):
+                    # Nudged by mistake (the model says its first reply was the answer), or
+                    # the nudge round came back empty: the first reply is the answer.
                     final = nudged_reply
                 if not final:
                     err = AiAssistUnavailableError("INVALID_OUTPUT")
@@ -2181,6 +2211,8 @@ class AssessmentStrategist:
                     markdown=final[:_MAX_NARRATIVE_CHARS],
                     model_id=self._config.model_id,
                 )
+            if nudged_reply is not None:
+                return kept()  # the nudge's look-ups never answered: the first reply did
             return ObjectGuidanceOutcome(
                 available=False,
                 reason="UNAVAILABLE",
@@ -2190,10 +2222,14 @@ class AssessmentStrategist:
                 ),
             )
         except AiAssistUnavailableError as error:
+            if nudged_reply is not None:
+                return kept()  # a throttled / failed nudge round never costs the answer
             return ObjectGuidanceOutcome(
                 available=False, reason=error.reason, detail=error.detail
             )
         except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
+            if nudged_reply is not None:
+                return kept()
             error = AiAssistUnavailableError(_classify_bedrock_error(exc))
             return ObjectGuidanceOutcome(
                 available=False, reason=error.reason, detail=error.detail

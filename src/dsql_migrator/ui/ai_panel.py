@@ -1031,13 +1031,27 @@ def build_ai_panel(
         own = conv["own"]
         own[id(message)] = message  # type: ignore[index]
 
+    def _not_sent() -> None:
+        try:
+            ui.notify(  # type: ignore[attr-defined]
+                "Not sent to the AI DBA: the chat it was for is no longer open. Open "
+                "that chat again and repeat the request there.",
+                type="info",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     def _run_pending_seed() -> None:
-        """Ask the seed question of the scope opened while a turn was running -- if that
-        scope instance is still THIS tab's (a later scope replaced it otherwise; another
-        tab's scope change does not)."""
-        pending = conv.pop("pending_seed", None)
-        if pending and conv.get("scope_token") is pending[0]:
-            _run_turn(str(pending[1]), token=pending[0])
+        """Ask the next question queued while a turn was running (first in, first out) --
+        if its scope instance is still THIS tab's; one whose chat closed meanwhile is
+        dropped with a notice, never asked in another thread."""
+        queue = conv.setdefault("pending_asks", [])
+        while queue:
+            token, text = queue.pop(0)  # type: ignore[union-attr]
+            if conv.get("scope_token") is token:
+                _run_turn(str(text), token=token)
+                return
+            _not_sent()
 
     def _run_turn(user_text: str, token: object = None) -> None:
         text = (user_text or "").strip()
@@ -1048,14 +1062,7 @@ def build_ai_panel(
             # after the operator opened another scope (or the same one again, in a new
             # window), re-homed to general, or started over: never asked in the wrong
             # thread.
-            try:
-                ui.notify(  # type: ignore[attr-defined]
-                    "Not sent to the AI DBA: the chat it was for is no longer open. Open "
-                    "that chat again and repeat the request there.",
-                    type="info",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            _not_sent()
             return
         streamer = conv["streamer"]
         if streamer is None:
@@ -1066,7 +1073,7 @@ def build_ai_panel(
             # ends, in the scope it was asked for -- never dropped, never run beside it.
             target = token if token is not None else conv.get("scope_token")
             if target is not None:
-                conv["pending_seed"] = (target, text)
+                conv.setdefault("pending_asks", []).append((target, text))  # type: ignore[union-attr]
             return
         if not is_enabled():
             # AI Assist was turned off (Connect) after this scope was opened. NEVER call
@@ -1454,7 +1461,9 @@ def build_ai_panel(
         conv["footer_visible"] = footer_visible
         active = conversation.active_scope
         is_new_scope = active is None or active.scope_id != scope_id
-        if is_new_scope or conv.get("scope_token") is None or conv.get("scope_id") != scope_id:
+        # A new instance when THIS tab opens another scope (or the same one again after
+        # another): another tab moving the session's scope does not close this tab's chat.
+        if conv.get("scope_token") is None or conv.get("scope_id") != scope_id:
             conv["scope_token"] = object()
         token = conv["scope_token"]
         if is_new_scope:
@@ -1464,8 +1473,12 @@ def build_ai_panel(
             conv["scope_start"] = len(conversation.messages)
             conv["scope_first"] = None
             conv["own"] = {}
-            # A seed queued for an earlier scope belongs to a scope no longer open.
-            conv.pop("pending_seed", None)
+            # A question queued for an earlier instance belongs to a chat no longer open.
+            queue = conv.setdefault("pending_asks", [])
+            stale = [ask for ask in queue if ask[0] is not token]  # type: ignore[union-attr]
+            if stale:
+                conv["pending_asks"] = [ask for ask in queue if ask[0] is token]  # type: ignore[union-attr]
+                _not_sent()
             if conversation.messages:
                 _divider(f"Now: {title}" if title else "New topic")
         conv["scope_id"] = scope_id
@@ -1482,12 +1495,18 @@ def build_ai_panel(
             if was_busy:
                 # Another turn is still streaming: ask this one when it ends (if this scope
                 # is still the open one then), never beside it.
-                conv["pending_seed"] = (token, seed_question)
+                conv.setdefault("pending_asks", []).append((token, seed_question))  # type: ignore[union-attr]
             else:
                 _run_turn(seed_question, token=token)
+
         # Bound to this scope instance: a later ask through it (a re-test, a re-run)
-        # belongs here, and nowhere once it is gone.
-        return lambda text: _run_turn(text, token=token)
+        # belongs here, and nowhere once it is gone -- is_open() tells a caller before it
+        # does costly work for an ask that would be refused.
+        def send(text: str) -> None:
+            _run_turn(text, token=token)
+
+        send.is_open = lambda: conv.get("scope_token") is token  # type: ignore[attr-defined]
+        return send
 
     def set_visible(visible: bool) -> None:
         _set_visible(visible)
@@ -1538,7 +1557,7 @@ def build_ai_panel(
         conv["scope_id"] = None
         conv["scope_token"] = None  # a send of the old journey never asks in the new one
         conv["own"] = {}
-        conv.pop("pending_seed", None)  # a seed of the old journey is never asked
+        conv["pending_asks"] = []  # a question of the old journey is never asked
         conv["unseen"] = 0
         pending = conv.get("pending")
         if pending is not None:

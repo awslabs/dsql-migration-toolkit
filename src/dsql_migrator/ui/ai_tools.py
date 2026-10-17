@@ -387,11 +387,7 @@ def build_ai_tool_executor(
                     SchemaConverter,
                     SchemaConvertOptions,
                 )
-                from dsql_migrator.core.models import (
-                    Classification,
-                    ConversionNoteKind,
-                    SourceType,
-                )
+                from dsql_migrator.core.models import Classification, SourceType
                 from dsql_migrator.ui.schema_conversion import (
                     TABLE_PREFIX,
                     VIEW_PREFIX,
@@ -445,12 +441,19 @@ def build_ai_tool_executor(
                     # remedy is the conversion's own (its last note says why): a view whose
                     # name collides is not re-created by hand, it is renamed on the source,
                     # and a materialized view or foreign table has no view to re-create.
-                    # Every blocking reason, in order (a materialized view whose name
-                    # also collides needs both: renaming alone creates nothing).
+                    # Every reason it is not created, in order (a materialized view whose
+                    # name also collides needs both: renaming alone creates nothing) --
+                    # never a note on a part of its body, whose 'rewrite it in the target
+                    # DDL' would contradict 'an edit is not applied'.
+                    from dsql_migrator.core.converter import (
+                        VIEW_NOT_CAPTURED_REASON,
+                        VIEW_NOT_CONVERTIBLE_REASON,
+                    )
+
                     _reasons = list(dict.fromkeys(
                         w.message for w in _view.warnings
-                        if w.classification in (Classification.MANUAL, Classification.UNSUPPORTED)
-                        and getattr(w, "kind", None) is not ConversionNoteKind.RECOMMENDATION
+                        if w.classification is Classification.UNSUPPORTED
+                        or w.message in (VIEW_NOT_CAPTURED_REASON, VIEW_NOT_CONVERTIBLE_REASON)
                     ))
                     _why = " ".join(_reasons) or "Reimplement it manually on Aurora DSQL."
                     return _json.dumps(

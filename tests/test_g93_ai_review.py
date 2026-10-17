@@ -44,7 +44,8 @@ def test_a_correction_or_a_question_to_the_operator_is_not_nudged() -> None:
         "You're right, I need to correct that: Aurora DSQL supports and enforces foreign keys.",
         "I need to know which table you mean.",
         "Your DLQ holds 3 records; they need no repair. I'll review it again if a new code appears.",
-        "The DLQ is empty. I'll check it before you cut over.",
+        # G99: "The DLQ is empty. I'll check it before you cut over." is nudged now -- a look-up
+        # tied to a moment with little else said is the What's next? punt; the model keeps it.
     ):
         assert not is_tool_preamble(answer), answer
 

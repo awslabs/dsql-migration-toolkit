@@ -998,6 +998,16 @@ def build_query_playground_screen(
                     send = sender["send"]
                     if send is None:
                         return
+                    is_open = getattr(send, "is_open", None)
+                    if callable(is_open) and not is_open():
+                        # A reply of an earlier chat: its re-test would be refused, so the
+                        # probe is not run on the target for nothing.
+                        ui.notify(
+                            "This rewrite came from an earlier AI chat: use Test rewrite on "
+                            "a reply in the chat that is open now.",
+                            type="info",
+                        )
+                        return
                     rewrite = extract_sql_from_reply(reply_markdown)
                     if not rewrite:
                         ui.notify(

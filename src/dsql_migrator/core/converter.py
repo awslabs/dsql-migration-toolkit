@@ -7328,10 +7328,7 @@ class SchemaConverter:
                     ConversionWarning(
                         object_name=view.name,
                         classification=Classification.MANUAL,
-                        message=(
-                            "The view definition was not captured from the source; "
-                            "reimplement the view manually on Aurora DSQL."
-                        ),
+                        message=VIEW_NOT_CAPTURED_REASON,
                     )
                 ],
             )
@@ -9029,6 +9026,18 @@ def _remodelled_reference_warnings(
     ]
 
 
+# The reasons a view is not converted at all (beside an UNSUPPORTED kind or a name
+# collision): what a note about it names first, never a note on a part of its body.
+VIEW_NOT_CAPTURED_REASON = (
+    "The view definition was not captured from the source; reimplement the view manually "
+    "on Aurora DSQL."
+)
+VIEW_NOT_CONVERTIBLE_REASON = (
+    "The view's SQL could not be automatically converted; review and reimplement it "
+    "manually on Aurora DSQL."
+)
+
+
 def _manual_view_conversion(name: str, schema_ddls: "list[str]") -> ViewConversion:
     """The placeholder of a view whose definition could not be converted (MANUAL)."""
     return ViewConversion(
@@ -9043,10 +9052,7 @@ def _manual_view_conversion(name: str, schema_ddls: "list[str]") -> ViewConversi
             ConversionWarning(
                 object_name=name,
                 classification=Classification.MANUAL,
-                message=(
-                    "The view's SQL could not be automatically converted; "
-                    "review and reimplement it manually on Aurora DSQL."
-                ),
+                message=VIEW_NOT_CONVERTIBLE_REASON,
             )
         ],
     )
