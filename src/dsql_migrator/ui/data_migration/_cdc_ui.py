@@ -7915,6 +7915,7 @@ def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark
     if connect is None:
         return []  # no target to read: Start CDC's connection checks stop it first
     read = target_generated_columns_of([t.name for t in tables], connection_factory=connect)
+    is_pg = _cdc_source_type(session) is SourceType.POSTGRES
     mismatched: list = []
     for table in tables:
         expected = set(target_generated_capture_columns(table, applied))
@@ -7943,6 +7944,11 @@ def _probe_cdc_generated_mismatch(migration_state, session, inventory, watermark
                 if source not in on_target:
                     live.add(source)
         live -= set(getattr(table, "primary_key", None) or ())
+        if is_pg:
+            # A PostgreSQL publication never carries a column generated on the source, so
+            # the target computing one is no 428C9 -- CDC never sends it -- and is what
+            # keeps it current (an ordinary one there would be left stale).
+            live -= {c.name for c in table.columns if getattr(c, "generated", False)} - expected
         if live != expected:
             mismatched.append((table.name, sorted(expected), sorted(live)))
     return mismatched
@@ -7981,7 +7987,8 @@ def _cdc_generated_mismatch_notice(
             + (
                 # A CDC-only migration's set is fixed once its infrastructure exists, and
                 # the rows already loaded by other means have to be loaded again.
-                f", then load {them} again the way {them} were first loaded."
+                f", then load {them} again the way "
+                f"{'it was' if len(missing) == 1 else 'they were'} first loaded."
                 if cdc_only
                 else f", then reload {them} with the Full Load step's per-table 'Drop & "
                 "reload' (the rows the Full Load wrote went with the table)."
@@ -8041,7 +8048,7 @@ def _cdc_generated_mismatch_notice(
         f" For a column Schema Conversion makes GENERATED: {recreate}, or edit the DDL back "
         "to ordinary if CDC should write it"
         + (
-            f" -- not for {', '.join(pinned)}, generated on the PostgreSQL source, which "
+            f" -- not for {_listed(pinned)}, generated on the PostgreSQL source, which "
             "never publishes a generated column: CDC would leave it stale."
             if pinned
             else "."

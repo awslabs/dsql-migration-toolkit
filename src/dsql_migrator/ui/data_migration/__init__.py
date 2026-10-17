@@ -5629,7 +5629,11 @@ def prereq_phase_verdicts(report: object) -> list[PrereqPhaseVerdict]:
             # The Full Load phase ignores CDC-only checks; CDC considers all.
             if for_full_load and r.check_id in _CDC_ONLY_CHECK_IDS:
                 continue
-            titles.append(r.title)
+            # Named as the run guard names them: a per-table check by its table, once.
+            target = getattr(r, "target", None)
+            title = r.title if target is None else f"{r.title} ({target})"
+            if title not in titles:
+                titles.append(title)
         return tuple(titles)
 
     full_blocking = _blocking(for_full_load=True)
@@ -6052,14 +6056,17 @@ def _render_prereq_phase_verdicts(ui, report) -> None:
         # Said as the run guard holds it: a Full load + CDC run starts only once CDC can
         # follow it (the load's start point is the stream's), so 'the Full Load can run
         # now' was not so on this panel.
+        blocking = list(cdc.blocking_titles)
+        listed = "; ".join(blocking[:5]) + (
+            f"; and {len(blocking) - 5} more" if len(blocking) > 5 else ""
+        )
         render_notice(
             ui,
             tone="warning",
             header="CDC stream blocked",
             body="The Full Load itself needs none of these, but this Full load + CDC run "
-            "starts only once CDC can follow it "
-            f"({', '.join(cdc.blocking_titles)}). Fix them to start it, or switch to Full "
-            "load only to load now.",
+            f"starts only once CDC can follow it ({listed}). Fix them to start it, or "
+            "switch to Full load only to load now.",
         )
 
 

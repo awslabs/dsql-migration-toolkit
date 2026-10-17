@@ -2692,7 +2692,9 @@ def build_schema_conversion_screen(
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
+                    REFRESH_REBASE_ATTEMPTS,
                     _default_introspector_factory,
+                    refresh_rebase,
                     session_source_label,
                     set_result_if_unchanged,
                     with_refreshed_catalogs,
@@ -2728,30 +2730,41 @@ def build_schema_conversion_screen(
                         f"Could not refresh source: {exc}", type="negative"
                     )
                     return
-                if old_result is not None:
+                vanished = list(getattr(introspector, "last_vanished", None) or [])
+                base: Optional[object] = old_result
+                applied = False
+                for _attempt in range(REFRESH_REBASE_ATTEMPTS):
                     # The assessment and the name conflicts are recomputed from the re-read
                     # inventory -- graded by the engine it was just read with -- off the
                     # event loop (it scales with the schema); every other field is copied.
                     refreshed = await _run.io_bound(
                         with_refreshed_catalogs,
-                        old_result,
+                        base,
                         inventory=new_inventory,
-                        target_inventory=old_result.target_inventory,
-                        target_endpoint=old_result.target_endpoint,
+                        target_inventory=base.target_inventory,  # type: ignore[union-attr]
+                        target_endpoint=base.target_endpoint,  # type: ignore[union-attr]
                         source_type=source_conn.source_type,
-                        vanished=list(getattr(introspector, "last_vanished", None) or []),
+                        vanished=vanished,
                         source_label=source_label,
                     )
                     # Applied only over the result it was computed from: an Evaluation that
-                    # finished while this ran is newer, and must not be overwritten.
-                    if not set_result_if_unchanged(eval_state, old_result, refreshed):
-                        from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
+                    # finished while this ran is newer, and must not be overwritten. A
+                    # target re-browse that landed meanwhile (Generate's, the post-Apply
+                    # one) is no reason to throw this read away: it is applied over that.
+                    if set_result_if_unchanged(eval_state, base, refreshed):
+                        applied = True
+                        break
+                    base = refresh_rebase(eval_state, old_result, "inventory")
+                    if base is None:
+                        break
+                if not applied:
+                    from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
 
-                        stepped_aside = refresh_stepped_aside_text(eval_state)
-                        if stepped_aside:
-                            ui.notify(stepped_aside, type="warning")  # type: ignore[attr-defined]
-                        refresh()
-                        return
+                    stepped_aside = refresh_stepped_aside_text(eval_state)
+                    if stepped_aside:
+                        ui.notify(stepped_aside, type="warning")  # type: ignore[attr-defined]
+                    refresh()
+                    return
                 ui.notify("Source browser refreshed.", type="positive")  # type: ignore[attr-defined]
                 refresh()
 
@@ -2767,7 +2780,9 @@ def build_schema_conversion_screen(
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
+                    REFRESH_REBASE_ATTEMPTS,
                     _default_target_browser_factory,
+                    refresh_rebase,
                     set_result_if_unchanged,
                     with_refreshed_catalogs,
                 )
@@ -2796,18 +2811,29 @@ def build_schema_conversion_screen(
                 # Start over, when there is nothing to speak of).
                 stepped_aside: Optional[str] = None
                 if old_result is not None:
-                    refreshed = await _run.io_bound(
-                        with_refreshed_catalogs,
-                        old_result,
-                        inventory=old_result.inventory,
-                        target_inventory=new_target,
-                        # Re-stamp: this catalog was just read from the CURRENT
-                        # cluster, so without it the pair would stay flagged stale
-                        # forever and the refresh would fix nothing.
-                        target_endpoint=target_conn.cluster_endpoint,
-                    )
-                    # Never over a newer Evaluation that finished while this ran.
-                    if not set_result_if_unchanged(eval_state, old_result, refreshed):
+                    base: Optional[object] = old_result
+                    stepped_aside = ""
+                    for _attempt in range(REFRESH_REBASE_ATTEMPTS):
+                        refreshed = await _run.io_bound(
+                            with_refreshed_catalogs,
+                            base,
+                            inventory=base.inventory,  # type: ignore[union-attr]
+                            target_inventory=new_target,
+                            # Re-stamp: this catalog was just read from the CURRENT
+                            # cluster, so without it the pair would stay flagged stale
+                            # forever and the refresh would fix nothing.
+                            target_endpoint=target_conn.cluster_endpoint,
+                        )
+                        # Never over a newer Evaluation that finished while this ran; over
+                        # a source refresh that landed meanwhile, applied on top of it (so
+                        # Generate's diffs never fall back to the older target catalog).
+                        if set_result_if_unchanged(eval_state, base, refreshed):
+                            stepped_aside = None
+                            break
+                        base = refresh_rebase(eval_state, old_result, "target_inventory")
+                        if base is None:
+                            break
+                    if stepped_aside is not None:
                         from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
 
                         stepped_aside = refresh_stepped_aside_text(eval_state) or ""

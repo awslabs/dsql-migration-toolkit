@@ -1139,6 +1139,29 @@ def set_result_if_unchanged(
     return True
 
 
+def refresh_rebase(
+    eval_state: "EvaluationState", expected: "Optional[EvaluationResult]", half: str
+) -> "Optional[EvaluationResult]":
+    """The result a refresh that re-read one ``half`` of the catalogs (``"inventory"``: the
+    source; ``"target_inventory"``: the target) may still be applied over after
+    :func:`set_result_if_unchanged` found ``expected`` replaced: the current result, when
+    that half is still ``expected``'s -- only the OTHER half was re-read meanwhile (a
+    target refresh, Generate's re-browse, a source refresh), so this read is no older than
+    anything there. ``None`` -- step aside -- when a newer Evaluation, a Start over, a
+    restore, or a refresh of the same half replaced it."""
+    current = eval_state.result
+    if current is None or expected is None or current is expected:
+        return None
+    if getattr(current, half) is not getattr(expected, half):
+        return None
+    return current
+
+
+# A refresh re-applied over the other half's refresh at most this many times (each one
+# re-grades the schema): a third landing meanwhile steps aside as before.
+REFRESH_REBASE_ATTEMPTS = 3
+
+
 # The address of a describe_source() label -- its host, and its database when there is one:
 # the leftmost " at " (or the start) followed by a whole host[:port][/database].
 _SOURCE_ADDRESS_RE = re.compile(
