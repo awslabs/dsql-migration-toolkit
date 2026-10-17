@@ -527,29 +527,39 @@ def views_referencing(
         return []
     from dsql_migrator.core.converter import _dependency_order
 
-    bodies = {}
+    # Each body's words, once, and a word -> views index: a regex per (view, name) pair
+    # made a reload over thousands of views stall for minutes (the pattern cache thrashed).
+    # The same bounded-word match as names_in (a qualified name matches only if its bare
+    # name does, so the bare word decides; this errs toward selecting a view).
+    readers_of: dict[str, list[str]] = {}
     for view_name in sorted(view_ddls):
         ddl = view_ddls[view_name]
         head = _VIEW_HEAD_RE.match(ddl)
-        bodies[view_name] = (ddl[head.end():] if head is not None else ddl).lower()
+        body = (ddl[head.end():] if head is not None else ddl).lower()
+        for word in set(_BODY_WORD_RE.findall(body)):
+            readers_of.setdefault(word, []).append(view_name)
 
-    def names_one(body: str, names: "Iterable[str]") -> bool:
-        return any(names_in(body, (name.lower(), name.split(".")[-1].lower())) for name in names)
+    def readers(names: "Iterable[str]") -> "set[str]":
+        return {
+            view for name in names for view in readers_of.get(name.split(".")[-1].lower(), ())
+        }
 
-    selected = [name for name, body in bodies.items() if names_one(body, tables)]
+    selected = sorted(readers(tables))
+    chosen = set(selected)
     frontier = list(selected)
     while frontier:
-        readers = [
-            name for name, body in bodies.items()
-            if name not in selected and names_one(body, frontier)
-        ]
-        selected.extend(readers)
-        frontier = readers
+        new = sorted(readers(frontier) - chosen)
+        chosen.update(new)
+        selected.extend(new)
+        frontier = new
     ordered = _dependency_order(
         sorted(selected), name_of=lambda name: name, text_of=lambda name: view_ddls[name]
     )
     return [view_ddls[name] for name in ordered]
 
+
+# A word of a lower-cased view body, as names_in bounds it (identifier characters).
+_BODY_WORD_RE = re.compile(r"[\w$]+")
 
 # ``CREATE [OR REPLACE] [MATERIALIZED] VIEW <name>``: the part of a view DDL that names the
 # view itself, not what it reads.

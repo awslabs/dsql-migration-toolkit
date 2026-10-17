@@ -439,18 +439,16 @@ _SQL_TOKEN_RE = re.compile(
 )
 _SQL_PART_RE = re.compile(r'"((?:[^"]|"")+)"|([^\W\d][\w$]*)')
 
-# The words that open a FROM item, may precede its relation, or end the FROM list.
-_FROM_OPEN_WORDS = frozenset({"from", "join"})
-_FROM_PREFIX_WORDS = frozenset({"only", "lateral"})
-_CLAUSE_WORDS = frozenset(
+# The words that end a FROM clause (and a select list) at their own bracket level. ON,
+# USING and WITH (ORDINALITY) are inside a FROM item, so a comma after them still lists
+# the next relation.
+_FROM_END_WORDS = frozenset(
     {
         "where", "group", "having", "order", "limit", "offset", "fetch", "window",
-        "union", "intersect", "except", "on", "using", "select", "values", "returning",
-        "for", "into", "with",
+        "union", "intersect", "except", "returning", "for", "into", "values",
     }
 )
-# The words that end a select list.
-_SELECT_LIST_END_WORDS = _CLAUSE_WORDS | _FROM_OPEN_WORDS
+_FROM_PREFIX_WORDS = frozenset({"only", "lateral"})
 
 
 @functools.lru_cache(maxsize=65536)
@@ -473,6 +471,7 @@ class _SelectItem:
     chains: int = 0  # dotted names at its own level (one, and no alias: a plain column)
     last: Optional[str] = None
     end: int = 0
+    skip_paren: bool = False  # the (...) of DISTINCT ON is no expression of the item
 
 
 @dataclass
@@ -485,19 +484,32 @@ class _SqlNames:
     masked: str
 
 
+def _new_frame(*, in_from: bool = False, query: bool = False) -> dict:
+    return {
+        "in_from": in_from,  # inside this level's FROM clause
+        "expect": in_from,  # the next name is a relation
+        "from_item": in_from,  # this bracket opened where a relation was expected
+        "query": query,  # a query level (SELECT/WITH/VALUES), not a function's arguments
+        "item": None,
+        "as": False,
+        "prev": None,  # the previous bare word at this level
+    }
+
+
 def _scan_sql_names(text: str) -> _SqlNames:
     """The names in a view body or a CREATE VIEW: every identifier outside literals, the
-    relations it reads (the name right after ``FROM``/``JOIN``/a FROM-list comma, through
-    parenthesised joins and subqueries) and its select items with their output names --
-    a column alias or a lone column. ``CREATE VIEW x AS`` names no relation, so the
-    header never reads as a read of the view itself."""
+    relations it reads (the name right after ``FROM``/``JOIN``/a FROM-list comma --
+    through parenthesised joins, subqueries, ``ON``/``USING`` conditions and ``WITH
+    ORDINALITY`` -- until WHERE/GROUP BY/... ends the clause) and its select items with
+    their output names, a column alias or a lone column (``timestamp with time zone``,
+    ``DISTINCT ON (...)``, ``WITHIN GROUP`` and ``IS DISTINCT FROM`` do not end an item).
+    ``CREATE VIEW x AS`` names no relation, so the header never reads as a read of the
+    view itself."""
     masked = _mask_sql_literals(text)
     names: set[str] = set()
     relations: list[tuple[Optional[str], str]] = []
     items: list[tuple[Optional[str], int, int]] = []
-    # Per bracket depth: the FROM state (None / "expect" / "after"), whether the bracket
-    # opened in a FROM item (a parenthesised join or a subquery), the open select item.
-    frames: list[dict] = [{"from": None, "in_from": False, "item": None, "as": False}]
+    frames: list[dict] = [_new_frame()]
 
     def close_item(frame: dict, end: int) -> None:
         item = frame["item"]
@@ -519,26 +531,50 @@ def _scan_sql_names(text: str) -> _SqlNames:
                 continue
             if pending_cast:  # a type name, not a reference
                 pending_cast = False
+                frame["prev"] = word
                 continue
             names.update(parts)
-            if word is not None and (
-                word in _SELECT_LIST_END_WORDS or word in _FROM_PREFIX_WORDS or word == "as"
-                or word == "distinct" or word == "all"
-            ):
-                if word in _SELECT_LIST_END_WORDS:
-                    close_item(frame, match.start())
-                if word in _FROM_OPEN_WORDS:
-                    frame["from"] = "expect"
-                elif word in _CLAUSE_WORDS:
-                    frame["from"] = None
-                if word == "select":
-                    frame["item"] = _SelectItem(start=match.end())
-                frame["as"] = word == "as"
-                continue
+            prev, frame["prev"] = frame["prev"], word
             item = frame["item"]
-            if frame["from"] == "expect":
+            if word is not None:
+                if word == "select" or (word == "with" and item is None and not frame["in_from"]):
+                    close_item(frame, match.start())
+                    frame.update(in_from=False, expect=False, query=True)
+                    if word == "select":
+                        frame["item"] = _SelectItem(start=match.end())
+                    continue
+                if word == "from" and prev != "distinct" and frame["query"]:
+                    close_item(frame, match.start())
+                    frame.update(in_from=True, expect=True)
+                    continue
+                if word in _FROM_END_WORDS and not (word == "group" and prev == "within"):
+                    close_item(frame, match.start())
+                    frame.update(in_from=False, expect=False)
+                    if word == "values":
+                        frame["query"] = True
+                    continue
+                if frame["in_from"]:
+                    if word == "join":
+                        frame["expect"] = True
+                        continue
+                    if word in ("on", "using"):
+                        frame["expect"] = False
+                        continue
+                    if word in _FROM_PREFIX_WORDS or word in ("with", "ordinality", "as"):
+                        frame["as"] = word == "as"
+                        continue
+                elif item is not None:
+                    if word == "as":
+                        frame["as"] = True
+                        continue
+                    if word in ("distinct", "all"):
+                        continue
+                    if word == "on" and prev == "distinct":
+                        item.skip_paren = True
+                        continue
+            if frame["in_from"] and frame["expect"]:
                 relations.append((parts[-2] if len(parts) >= 2 else None, parts[-1]))
-                frame["from"] = "after"
+                frame["expect"] = False
             elif item is not None:
                 if frame["as"]:
                     item.output = parts[-1]
@@ -551,23 +587,25 @@ def _scan_sql_names(text: str) -> _SqlNames:
             continue
         pending_cast = kind == "cast"
         frame["as"] = False
+        frame["prev"] = None
         if kind == "open":
-            in_from = frame["from"] == "expect"
-            frames.append(
-                {"from": "expect" if in_from else None, "in_from": in_from, "item": None,
-                 "as": False}
-            )
-            if frame["item"] is not None:
-                frame["item"].chains += 2  # an expression: no longer a lone column
+            opened_for_relation = frame["in_from"] and frame["expect"]
+            frames.append(_new_frame(in_from=opened_for_relation, query=opened_for_relation))
+            item = frame["item"]
+            if item is not None:
+                if item.skip_paren:
+                    item.skip_paren = False
+                else:
+                    item.chains += 2  # an expression: no longer a lone column
         elif kind == "close":
             if len(frames) > 1:
                 close_item(frames[-1], match.start())
                 closed = frames.pop()
-                if closed["in_from"]:
-                    frames[-1]["from"] = "after"
+                if closed["from_item"]:
+                    frames[-1]["expect"] = False
         elif kind == "comma":
-            if frame["from"] == "after":
-                frame["from"] = "expect"
+            if frame["in_from"]:
+                frame["expect"] = True
             elif frame["item"] is not None:
                 close_item(frame, match.start())
                 frame["item"] = _SelectItem(start=match.end())
@@ -607,7 +645,12 @@ def _dependency_order_indices(
     named_texts: "list[tuple[str, str]]", scans: "Optional[list[_SqlNames]]" = None
 ) -> "list[int]":
     """The order (indices) of :func:`views_in_dependency_order`; ``scans`` are the texts'
-    :func:`_scan_sql_names`, when the caller has them already."""
+    :func:`_scan_sql_names`, when the caller has them already.
+
+    The strongly connected components are found ONCE and placed in dependency order, each
+    one's members in the given order: a false cycle (only a false match makes one) costs
+    nothing extra. Re-running the cycle search per placed view was cubic -- per-tenant
+    views of one name, all reading a shared table, took 16 s at 1,000 views."""
     import heapq
 
     count = len(named_texts)
@@ -615,77 +658,84 @@ def _dependency_order_indices(
         return list(range(count))
     by_bare: dict[str, list[int]] = {}
     by_qualified: dict[tuple[str, str], list[int]] = {}
+    in_public: set[int] = set()
     for index, (name, _text) in enumerate(named_texts):
         schema, bare = _split_qualified(name)
         by_bare.setdefault(bare, []).append(index)
         if schema is not None:
             by_qualified.setdefault((schema, bare), []).append(index)
+        if schema == "public":
+            in_public.add(index)
     reads: list[set[int]] = []
     for index, (_name, text) in enumerate(named_texts):
         found: set[int] = set()
         scan = scans[index] if scans is not None else _scan_sql_names(text)
         for schema, bare in scan.relations:
-            found.update(by_bare.get(bare, ()) if schema is None else by_qualified.get((schema, bare), ()))
+            if schema is not None:
+                found.update(by_qualified.get((schema, bare), ()))
+                continue
+            # A bare relation is the one on the search path: pg_get_viewdef prints a name
+            # bare only when it resolves there, so the public view wins when there is one.
+            candidates = by_bare.get(bare, ())
+            public = [other for other in candidates if other in in_public]
+            found.update(public or candidates)
         found.discard(index)
         reads.append(found)
-    dependents: list[list[int]] = [[] for _ in range(count)]
-    waiting = [len(found) for found in reads]
+    component_of, components = _strongly_connected(reads)
+    needs: list[set[int]] = [set() for _ in components]
+    feeds: list[set[int]] = [set() for _ in components]
     for index, found in enumerate(reads):
         for other in found:
-            dependents[other].append(index)
-    ready = [index for index, left in enumerate(waiting) if left == 0]
+            mine, theirs = component_of[index], component_of[other]
+            if mine != theirs:
+                needs[mine].add(theirs)
+                feeds[theirs].add(mine)
+    waiting = [len(n) for n in needs]
+    ready = [(min(components[c]), c) for c in range(len(components)) if waiting[c] == 0]
     heapq.heapify(ready)
-    placed = [False] * count
     ordered: list[int] = []
-    while len(ordered) < count:
-        if ready:
-            index = heapq.heappop(ready)
-            if placed[index]:
-                continue
-        else:
-            index = _cycle_breaker(reads, placed)
-        placed[index] = True
-        ordered.append(index)
-        for dependent in dependents[index]:
+    while ready:
+        _first, component = heapq.heappop(ready)
+        ordered.extend(sorted(components[component]))
+        for dependent in feeds[component]:
             waiting[dependent] -= 1
-            if waiting[dependent] == 0 and not placed[dependent]:
-                heapq.heappush(ready, dependent)
+            if waiting[dependent] == 0:
+                heapq.heappush(ready, (min(components[dependent]), dependent))
     return ordered
 
 
-def _cycle_breaker(reads: "list[set[int]]", placed: "list[bool]") -> int:
-    """Which unplaced item to place when every one still waits: the first item of the first
-    cycle (strongly connected component) that waits on nothing outside itself -- never an
-    item that only waits on a cycle. Tarjan's algorithm, iterative."""
-    left = [index for index, done in enumerate(placed) if not done]
-    position: dict[int, int] = {}
-    low: dict[int, int] = {}
-    on_stack: set[int] = set()
+def _strongly_connected(edges: "list[set[int]]") -> "tuple[list[int], list[list[int]]]":
+    """``(component of each node, components)`` of the graph ``edges`` (node -> the nodes
+    it reads): Tarjan's algorithm, iterative, over sorted edges (deterministic)."""
+    count = len(edges)
+    position = [-1] * count
+    low = [0] * count
+    on_stack = [False] * count
     stack: list[int] = []
-    component_of: dict[int, int] = {}
+    component_of = [-1] * count
     components: list[list[int]] = []
     counter = 0
-    for root in left:
-        if root in position:
+    for root in range(count):
+        if position[root] != -1:
             continue
-        work = [(root, iter(sorted(r for r in reads[root] if not placed[r])))]
         position[root] = low[root] = counter
         counter += 1
         stack.append(root)
-        on_stack.add(root)
+        on_stack[root] = True
+        work = [(root, iter(sorted(edges[root])))]
         while work:
-            node, edges = work[-1]
+            node, pending = work[-1]
             advanced = False
-            for nxt in edges:
-                if nxt not in position:
+            for nxt in pending:
+                if position[nxt] == -1:
                     position[nxt] = low[nxt] = counter
                     counter += 1
                     stack.append(nxt)
-                    on_stack.add(nxt)
-                    work.append((nxt, iter(sorted(r for r in reads[nxt] if not placed[r]))))
+                    on_stack[nxt] = True
+                    work.append((nxt, iter(sorted(edges[nxt]))))
                     advanced = True
                     break
-                if nxt in on_stack:
+                if on_stack[nxt]:
                     low[node] = min(low[node], position[nxt])
             if advanced:
                 continue
@@ -697,26 +747,13 @@ def _cycle_breaker(reads: "list[set[int]]", placed: "list[bool]") -> int:
                 component: list[int] = []
                 while True:
                     member = stack.pop()
-                    on_stack.discard(member)
+                    on_stack[member] = False
                     component_of[member] = len(components)
                     component.append(member)
                     if member == node:
                         break
                 components.append(component)
-    best: Optional[int] = None
-    for number, component in enumerate(components):
-        members = set(component)
-        if any(
-            component_of[r] != number
-            for member in component
-            for r in reads[member]
-            if not placed[r]
-        ):
-            continue  # it waits on another component: that one goes first
-        first = min(members)
-        if best is None or first < best:
-            best = first
-    return best if best is not None else left[0]
+    return component_of, components
 
 
 class PrimaryKeyStrategy(str, Enum):
@@ -3219,20 +3256,54 @@ _ORDERING_WORDS = frozenset({"between", "greatest", "least"})
 def _orders_values(masked: str) -> bool:
     """Whether masked SQL compares by order: ``<``, ``<=``, ``>``, ``>=``, BETWEEN,
     GREATEST/LEAST (a trailing sign is the operand's: ``x >-1``)."""
+    return bool(_ordering_spans(masked))
+
+
+def _ordering_spans(masked: str) -> "list[tuple[int, int]]":
+    """The innermost bracket group around each ordering comparison of masked SQL (the
+    whole text when it is not bracketed): what the comparison's operands are in.
+    pg_get_expr brackets every comparison, so the group is that comparison alone."""
+    spans: list[tuple[int, int]] = []
     for match in _SQL_TOKEN_RE.finditer(masked):
-        if match.lastgroup == "op" and match.group(0).rstrip("+-") in _ORDERING_OPERATORS:
-            return True
-        if match.lastgroup == "chain" and _chain_parts(match.group(0))[1] in _ORDERING_WORDS:
-            return True
-    return False
+        is_ordering = (
+            match.lastgroup == "op" and match.group(0).rstrip("+-") in _ORDERING_OPERATORS
+        ) or (match.lastgroup == "chain" and _chain_parts(match.group(0))[1] in _ORDERING_WORDS)
+        if not is_ordering:
+            continue
+        depth, start = 0, 0
+        for i in range(match.start() - 1, -1, -1):
+            ch = masked[i]
+            if ch == ")":
+                depth += 1
+            elif ch == "(":
+                if depth == 0:
+                    start = i
+                    break
+                depth -= 1
+        depth, end = 0, len(masked)
+        for i in range(match.end(), len(masked)):
+            ch = masked[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                if depth == 0:
+                    end = i + 1
+                    break
+                depth -= 1
+        spans.append((start, end))
+    return spans
 
 
 def _without_null_tests(masked: str, name: str) -> str:
     """``masked`` with every ``<name> IS [NOT] NULL`` (or ``IS [NOT] DISTINCT FROM NULL``)
-    removed: a test whose answer no change of the column's type can alter."""
+    removed: a test whose answer no change of the column's type can alter. Only of the
+    column itself, bare or in its own brackets -- ``upper(r) IS NULL`` tests a FUNCTION of
+    it, whose meaning the new type changes -- and never one with a cast (``NULL::macaddr``
+    names a type the target does not have)."""
+    ident = rf'(?:"{re.escape(name)}"|(?<![\w$."]){re.escape(name)}(?![\w$"]))'
     return re.sub(
-        rf'(?:"{re.escape(name)}"|(?<![\w$"]){re.escape(name)}(?![\w$"]))\s*\)?\s+IS\s+'
-        r"(?:NOT\s+)?(?:DISTINCT\s+FROM\s+)?NULL\b",
+        rf"(?:(?<![\w$])\(\s*{ident}\s*\)|{ident})\s+IS\s+"
+        r"(?:NOT\s+)?(?:DISTINCT\s+FROM\s+)?NULL\b(?!\s*::)",
         " ",
         masked,
         flags=re.IGNORECASE,
@@ -3262,13 +3333,22 @@ def _index_predicate_carry(
         and by_name[name].type_kind != "enum"
         and _mentions_identifier(_without_null_tests(masked, name), name)
     )
-    carried, rewritten = _rewrite_enum_casts(predicate, _enum_cast_types([table]), arrays=True)
-    enums_read = [
-        column.mysql_type
-        for column in table.columns
-        if column.type_kind == "enum" and _mentions_identifier(masked, column.name)
+    enum_types = _enum_cast_types([table])
+    carried, rewritten = _rewrite_enum_casts(predicate, enum_types, arrays=True)
+    enum_columns = [
+        column for column in table.columns if column.type_kind == "enum" and column.enum_labels
     ]
-    ordered = sorted(set(rewritten) | set(enums_read)) if (rewritten or enums_read) and _orders_values(masked) else []
+    # An enum compared by ORDER: an ordering comparison whose own bracket holds the enum
+    # column or a cast to the enum (``seats > 0`` beside ``status = 'active'`` does not).
+    ordered_set: set[str] = set()
+    for start, end in _ordering_spans(masked):
+        group = masked[start:end]
+        for column in enum_columns:
+            if _mentions_identifier(group, column.name):
+                ordered_set.add(column.mysql_type)
+        if enum_types:
+            ordered_set.update(_rewrite_enum_casts(predicate[start:end], enum_types)[1])
+    ordered = sorted(ordered_set)
     if retyped or ordered:
         return None, retyped, ordered
     return carried, [], []
@@ -7085,7 +7165,12 @@ def _remodel_view(
     references: list[tuple[str, str, str, str]] = []
     read: set[str] = set()
     for schema, bare in scan.relations:
-        for relation, columns in sorted(sources.get(bare, {}).items()):
+        candidates = sorted(sources.get(bare, {}).items())
+        if schema is None:
+            # A bare name resolves on the search path: the public relation when there is one.
+            public = [entry for entry in candidates if _split_qualified(entry[0])[0] == "public"]
+            candidates = public or candidates
+        for relation, columns in candidates:
             if relation == view.name or relation in read:
                 continue
             if schema is not None and _split_qualified(relation)[0] != schema:

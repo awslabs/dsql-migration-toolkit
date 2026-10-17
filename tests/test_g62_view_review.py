@@ -250,3 +250,128 @@ def test_a_null_test_on_a_re_typed_column_is_carried() -> None:
                  where="(mac <> '00:00:00:00:00:00'::macaddr)")
     ]})
     assert _index_ddls(reads) == []
+
+
+# --- the review of G62 (G74) ---------------------------------------------------------
+
+
+def test_a_relation_after_with_ordinality_or_a_join_condition_is_read() -> None:
+    """ON, USING and WITH (ORDINALITY) ended the FROM clause, so the relation after the next
+    comma was missed: a view over b_open_orders was created before it."""
+    from dsql_migrator.core.converter import _scan_sql_names
+
+    ordinality = _scan_sql_names(
+        " SELECT u.tag, o.id FROM unnest(ARRAY['x'::text, 'y'::text]) WITH ORDINALITY "
+        "u(tag, pos), app.b_open_orders o;"
+    )
+    assert ("app", "b_open_orders") in ordinality.relations
+    joined = _scan_sql_names("SELECT 1 FROM shop.a JOIN shop.b ON a.id = b.id, shop.c")
+    assert ("shop", "c") in joined.relations
+
+
+def test_select_items_survive_timestamptz_casts_distinct_on_and_within_group() -> None:
+    """'with', 'on' and 'group' ended the select list: an enum alias after them was never
+    handed on, and the view over it read AUTO."""
+    from dsql_migrator.core.converter import _scan_sql_names
+
+    for body in (
+        " SELECT o.id, (o.created_at)::timestamp with time zone AS created_tz, "
+        "o.status AS order_state FROM app.orders o;",
+        " SELECT DISTINCT ON (o.customer_id) o.id, o.status AS order_state FROM app.orders o;",
+        " SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY o.amount) AS med, "
+        "o.status AS order_state FROM app.orders o GROUP BY o.status;",
+    ):
+        outputs = [o for o, _a, _b in _scan_sql_names(body).items]
+        assert "order_state" in outputs, body
+    inventory = SourceInventory(
+        tables=[_table("app.orders", _enum(), ColumnDef(name="created_at", mysql_type="timestamp"))],
+        views=[
+            ViewDef(name="app.v_furthest",
+                    definition=" SELECT max(v_orders.order_state) AS furthest FROM app.v_orders;"),
+            ViewDef(name="app.v_orders",
+                    definition=" SELECT o.id, (o.created_at)::timestamp with time zone AS "
+                               "created_tz, o.status AS order_state FROM app.orders o;"),
+        ],
+    )
+    _converted, assessed = _graded(inventory)
+    assert assessed["app.v_furthest"].classification.value == "MANUAL"
+
+
+def test_a_function_of_a_re_typed_column_tested_for_null_is_not_carried() -> None:
+    """`upper(valid) IS NULL` on a tstzrange was taken for a plain null test and carried
+    onto the text column, where upper() upper-cases text: the UNIQUE index then covered
+    other rows."""
+    for where in ("(upper(valid) IS NULL)", "(cardinality(valid) IS NOT NULL)"):
+        table = _table(
+            "app.prices", ColumnDef(name="valid", mysql_type="tstzrange"),
+            ColumnDef(name="product_id", mysql_type="bigint"),
+            indexes=[IndexDef(name="ux_current", columns=["product_id"], unique=True, where=where)],
+        )
+        assert _index_ddls(table) == [], where
+    plain = _table(
+        "app.prices", ColumnDef(name="valid", mysql_type="tstzrange"),
+        ColumnDef(name="product_id", mysql_type="bigint"),
+        indexes=[IndexDef(name="ux_current", columns=["product_id"], unique=True,
+                          where="(valid IS NOT NULL)")],
+    )
+    (ddl,) = _index_ddls(plain)
+    assert ddl.endswith("WHERE (valid IS NOT NULL)")
+    cast = _table(
+        "app.devices", ColumnDef(name="mac", mysql_type="macaddr"),
+        indexes=[IndexDef(name="ux_mac", columns=["mac"], unique=True,
+                          where="(mac IS DISTINCT FROM NULL::macaddr)")],
+    )
+    assert _index_ddls(cast) == []
+
+
+def test_an_enum_equality_beside_another_columns_order_is_carried() -> None:
+    """Any ordering operator anywhere counted: `status = 'active' AND seats > 0` lost its
+    UNIQUE index for 'comparing the enum by order'."""
+    table = _table(
+        "app.subs", _enum("status", "app.sub_status"), ColumnDef(name="seats", mysql_type="integer"),
+        ColumnDef(name="user_id", mysql_type="bigint"),
+        indexes=[IndexDef(name="ux_one_live", columns=["user_id"], unique=True,
+                          where="((status = 'shipped'::app.sub_status) AND (seats > 0))")],
+    )
+    (ddl,) = _index_ddls(table)
+    assert ddl.endswith("WHERE ((status = 'shipped'::text) AND (seats > 0))")
+    ordered = table.model_copy(update={"indexes": [
+        IndexDef(name="ux_one_live", columns=["user_id"], unique=True,
+                 where="((status > 'shipped'::app.sub_status) AND (seats > 0))")
+    ]})
+    assert _index_ddls(ordered) == []
+
+
+def test_same_named_tenant_views_order_in_linear_time() -> None:
+    """Every tenant's `orders` view read the shared bare `orders`, making one false cycle
+    that the old breaker re-searched per placed view: 16 s at 1,000 views."""
+    import time
+
+    from dsql_migrator.core.converter import _dependency_order_indices
+
+    texts = [
+        (f"tenant_{i}.orders", f" SELECT o.id FROM orders o WHERE (o.tenant_id = {i});")
+        for i in range(1000)
+    ]
+    started = time.perf_counter()
+    order = _dependency_order_indices(texts)
+    assert time.perf_counter() - started < 2.0
+    assert sorted(order) == list(range(1000))
+    # A bare name resolves to public's view when there is one.
+    with_public = [("public.orders", " SELECT 1 AS id;"), *texts[:3]]
+    order = _dependency_order_indices(with_public)
+    assert order[0] == 0
+
+
+def test_the_reload_closure_is_linear_in_views() -> None:
+    import time
+
+    from dsql_migrator.core.column_exclusion import views_referencing
+
+    ddls = {f"app.r{i}": f'CREATE VIEW "app"."r{i}" AS SELECT o.id FROM "app"."orders" o'
+            for i in range(2000)}
+    ddls.update({f"app.u{i}": f'CREATE VIEW "app"."u{i}" AS SELECT x.id FROM "app"."t{i}" x'
+                 for i in range(2000)})
+    started = time.perf_counter()
+    assert len(views_referencing(ddls, frozenset({"app.orders"}))) == 2000
+    assert time.perf_counter() - started < 3.0
