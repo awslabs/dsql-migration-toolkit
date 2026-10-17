@@ -334,6 +334,63 @@ class ViewConversion(BaseModel):
     warnings: list[ConversionWarning] = Field(default_factory=list)
 
 
+# An identifier in a view's DDL: quoted (as written) or bare (folded).
+_VIEW_IDENTIFIER_RE = re.compile(r'"((?:[^"]|"")+)"|([A-Za-z_][\w$]*)')
+
+
+def views_in_dependency_order(views: "Sequence[ViewConversion]") -> "list[ViewConversion]":
+    """``views`` with each one after the other views its DDL names, so a ``CREATE VIEW``
+    over another view never runs first and fails (the view it reads does not exist yet).
+
+    A name match, so it errs toward a dependency (a column or literal spelled like another
+    view only moves that view later). The given order is kept wherever nothing forces a
+    change, and a cycle (a false match can make one) places its first view first. Linear
+    in the DDL text, then a heap: thousands of views stay cheap. Pure."""
+    import heapq
+
+    views = list(views)
+    if len(views) < 2:
+        return views
+    by_name: dict[str, list[int]] = {}
+    for index, view in enumerate(views):
+        by_name.setdefault(_split_qualified(view.view)[1], []).append(index)
+    dependents: list[set[int]] = [set() for _ in views]
+    waiting = [0] * len(views)
+    for index, view in enumerate(views):
+        own = _split_qualified(view.view)[1]
+        named: set[str] = set()
+        past_header = False  # the CREATE VIEW's own name is not a read
+        for match in _VIEW_IDENTIFIER_RE.finditer(view.target_ddl or ""):
+            quoted, bare = match.groups()
+            name = quoted.replace('""', '"') if quoted is not None else fold_identifier(bare)
+            if not past_header:
+                past_header = name == own
+                continue
+            named.add(name)
+        reads = {other for name in named for other in by_name.get(name, ()) if other != index}
+        for other in reads:
+            dependents[other].add(index)
+        waiting[index] = len(reads)
+    ready = [index for index, count in enumerate(waiting) if count == 0]
+    heapq.heapify(ready)
+    placed = [False] * len(views)
+    ordered: list[ViewConversion] = []
+    while len(ordered) < len(views):
+        if ready:
+            index = heapq.heappop(ready)
+            if placed[index]:
+                continue
+        else:  # a cycle: its first view goes first
+            index = next(i for i, done in enumerate(placed) if not done)
+        placed[index] = True
+        ordered.append(views[index])
+        for dependent in dependents[index]:
+            waiting[dependent] -= 1
+            if waiting[dependent] == 0 and not placed[dependent]:
+                heapq.heappush(ready, dependent)
+    return ordered
+
+
 class PrimaryKeyStrategy(str, Enum):
     """Strategy for handling a monotonic (``AUTO_INCREMENT``) primary key.
 
@@ -632,9 +689,10 @@ class SchemaConversionResult(BaseModel):
                 index_units.append(
                     ExecutionUnit(object_name=table.table, sql=index_ddl)
                 )
-        # Views come AFTER tables/indexes because a view selects from the tables.
+        # Views come AFTER tables/indexes because a view selects from the tables, and each
+        # after the views it reads.
         view_units: list[ExecutionUnit] = []
-        for view in self.views:
+        for view in views_in_dependency_order(self.views):
             for schema_ddl in view.schema_ddls:
                 if schema_ddl not in seen_schema_ddls:
                     seen_schema_ddls.add(schema_ddl)
@@ -6123,6 +6181,7 @@ __all__ = [
     "build_source_table_ddl",
     "parse_target_column_constraints",
     "parse_target_column_default_texts",
+    "views_in_dependency_order",
     "parse_target_column_types",
     "parse_target_identity_columns",
     "parse_target_primary_key",

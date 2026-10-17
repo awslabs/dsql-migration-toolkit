@@ -30,6 +30,7 @@ from dsql_migrator.core.converter import (
     is_name_collision_placeholder,
     parse_target_primary_key,
     rename_index_statements,
+    views_in_dependency_order,
 )
 from dsql_migrator.core.models import (
     AiConversionSuggestion,
@@ -486,7 +487,9 @@ def build_apply_objects(result: SchemaConversionResult) -> list[ApplyObject]:
             object_name=view.view,
             ddls=(*view.schema_ddls, view.target_ddl),
         )
-        for view in result.views
+        # Each view after the views it reads: in catalog (name) order a view over a later
+        # view failed, and only a second apply created it.
+        for view in views_in_dependency_order(result.views)
         if view.auto_converted
     )
     return objects

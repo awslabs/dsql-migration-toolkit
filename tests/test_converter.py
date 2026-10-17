@@ -3339,3 +3339,43 @@ def test_a_skipped_unique_bytea_index_says_its_uniqueness_is_lost() -> None:
     (note,) = [w for w in result.warnings if "bytea" in w.message.lower()]
     assert "ux_sha is UNIQUE" in note.message
     assert "duplicate values are accepted after cut over" in note.message
+
+
+def test_a_view_over_another_view_is_created_after_it() -> None:
+    """Views were applied in catalog (name) order, so a view over a later-named view failed
+    on its CREATE (the view it reads did not exist yet) and only a second apply made it."""
+    from dsql_migrator.core.converter import views_in_dependency_order
+    from dsql_migrator.core.models import ViewDef
+    from dsql_migrator.ui.schema_conversion_apply import build_apply_objects
+
+    inventory = SourceInventory(
+        tables=[
+            TableDef(
+                name="shop.orders",
+                columns=[ColumnDef(name="id", mysql_type="int", nullable=False)],
+                primary_key=["id"],
+            )
+        ],
+        views=[
+            ViewDef(name="shop.a_report", definition="select `id` from `shop`.`m_mid`"),
+            ViewDef(name="shop.b_plain", definition="select `id` from `shop`.`orders`"),
+            ViewDef(name="shop.m_mid", definition="select `id` from `shop`.`z_base`"),
+            ViewDef(name="shop.z_base", definition="select `id` from `shop`.`orders`"),
+        ],
+    )
+    result = SchemaConverter().convert(inventory)
+    assert all(view.auto_converted for view in result.views)
+
+    created = [u.object_name for u in result.execution_units() if u.sql.startswith("CREATE VIEW")]
+    assert created.index("shop.z_base") < created.index("shop.m_mid") < created.index("shop.a_report")
+    applied = [o.object_name for o in build_apply_objects(result) if o.object_name in created]
+    assert applied == created
+    assert created[0] == "shop.b_plain"  # nothing moves without a reason
+
+    # A cycle (or a false match making one) still places every view, its first one first.
+    x, y = result.views[0], result.views[2]
+    looped = [
+        x.model_copy(update={"target_ddl": 'CREATE VIEW "shop"."a_report" AS SELECT * FROM "shop"."m_mid"'}),
+        y.model_copy(update={"target_ddl": 'CREATE VIEW "shop"."m_mid" AS SELECT * FROM "shop"."a_report"'}),
+    ]
+    assert [v.view for v in views_in_dependency_order(looped)] == ["shop.a_report", "shop.m_mid"]
