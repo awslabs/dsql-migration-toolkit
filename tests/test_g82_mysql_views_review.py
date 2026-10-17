@@ -37,6 +37,10 @@ def _view_ddl(body: str) -> "tuple[str, tuple, tuple]":
         ("cast(a as char)", "CAST(a AS TEXT)"),
         ("group_concat(a)", "STRING_AGG(CAST(a AS TEXT), ',')"),
         ("group_concat(a, b)", "STRING_AGG(CAST(a AS TEXT) || CAST(b AS TEXT), ',')"),
+        ("group_concat(distinct a)", "STRING_AGG(DISTINCT CAST(a AS TEXT), ',')"),
+        ("group_concat(a order by b)", "STRING_AGG(CAST(a AS TEXT), ',' ORDER BY b"),
+        # A DISTINCT aggregate's ORDER BY must be its argument: no cast there.
+        ("group_concat(distinct a order by a separator ';')", "STRING_AGG(DISTINCT a, ';' ORDER BY a"),
         ("from_unixtime(a, '%Y-%m-%d')", "TO_CHAR(TO_TIMESTAMP(a), 'YYYY-MM-DD')"),
         ("now()", "NOW()"),
     ],

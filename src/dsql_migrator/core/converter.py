@@ -7440,10 +7440,15 @@ def _rewrite_mysql_calls(select: exp.Expression) -> "tuple[list[str], list[str]]
             node.set("to", exp.DataType.build("TEXT"))
     for node in list(select.find_all(exp.GroupConcat)):
         holder, key, value = node, "this", node.this
-        if isinstance(value, exp.Order):
+        ordered = isinstance(value, exp.Order)
+        if ordered:
             holder, key, value = value, "this", value.this
         if isinstance(value, exp.Distinct):
-            value.set("expressions", [_texted(e) for e in value.expressions])
+            # A DISTINCT aggregate's ORDER BY must be its argument: cast under an ORDER BY
+            # it would be refused, so it stays as written (fine over text, refused -- not
+            # wrong -- over a number).
+            if not ordered:
+                value.set("expressions", [_texted(e) for e in value.expressions])
         elif value is not None:
             holder.set(key, _texted(value))
     for node in list(select.find_all(exp.UnixToTime)):
