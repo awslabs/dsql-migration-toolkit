@@ -799,6 +799,7 @@ class PgIdentityKeyRule(Rule):
         from dsql_migrator.core.assessor import _MONOTONIC_KEY_NOTE
         from dsql_migrator.core.converter import (
             IDENTITY_FALLBACK_CAVEAT,
+            generated_key_is_integer,
             identity_key_narrowing,
             identity_strategy_applies,
         )
@@ -858,11 +859,14 @@ class PgIdentityKeyRule(Rule):
                     "collides." + _MONOTONIC_KEY_NOTE
                 )
             else:
+                integer_key = generated_key_is_integer(table)
                 risk = (
                     f"The key from serial / identity column '{column}' converts cleanly, "
                     "but Aurora DSQL will NOT generate it: the primary key is composite "
                     f"({', '.join(table.primary_key)}) and an identity applies to a single "
-                    "column, so the column stays a plain integer and the APPLICATION must "
+                    "column, so the column stays "
+                    + ("a plain integer" if integer_key else f"{declared}")
+                    + " and the APPLICATION must "
                     "supply the value on every insert — code that relied on the database "
                     "generating it fails or collides." + _MONOTONIC_KEY_NOTE
                 )
@@ -901,6 +905,12 @@ class PgIdentityKeyRule(Rule):
                             "target after apply, "
                             + IDENTITY_FALLBACK_CAVEAT
                             + "."
+                            if generated_key_is_integer(table)
+                            else "IDENTITY cannot be used for this table because its "
+                            f"primary key is composite ({', '.join(table.primary_key)}) and "
+                            f"its {declared} column is not an integer (a DSQL identity is "
+                            "a single bigint column), so the application must supply the "
+                            "value on every insert."
                         )
                         + " Optional, for throughput only: a UUID/random key spreads the "
                         "writes further."
@@ -1607,7 +1617,7 @@ def default_rules() -> "list[Rule]":
         TriggerRule(),
         ProcedureRule(),
         EventRule(),
-        NoPrimaryKeyRule(),
+        NoPrimaryKeyRule(is_postgres=True),
         ByteaKeyRule(is_postgres=True),
         # PG wording: declarative partitioning, leaves are separate tables.
         PartitionedTableRule(is_postgres=True),

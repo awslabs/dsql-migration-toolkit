@@ -109,8 +109,9 @@ single rightmost partition. Key points:
   `CREATE UNIQUE INDEX ASYNC` on the original key alongside the composite PK, so a
   lookup or constraint on the old key still holds.
 - **The tool validates the choice** against DSQL's key limits before you apply it
-  (the leading column must be `NOT NULL`, not already part of the key, and the
-  composite key must stay within ≤ 8 columns and ≤ 1 KiB), and spells out the
+  (the leading column must be `NOT NULL`, not already part of the key and of a type
+  DSQL can index, and the composite key must stay within ≤ 8 columns and ≤ 1 KiB;
+  the leading-column list offers only the columns that pass), and spells out the
   consequence at selection time: **after cutover the application's queries, joins,
   and upserts must use the new composite key, and the leading column must be
   immutable** (DSQL primary keys cannot be updated in place).

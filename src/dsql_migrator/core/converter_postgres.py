@@ -141,12 +141,16 @@ def pg_column_default_sql(
         # An expression that FORMATS a sequence value (an order number): no identity can
         # reproduce it, key or not, so nothing governs it -- it must be re-attached.
         sequence = pg_nextval_sequence(raw)
+        quoted = _PG.quote_table(sequence) if sequence else "<sequence>"
         return None, (
             f"formats a value from sequence {sequence or '(unknown)'} (DEFAULT {raw}), and "
             "that sequence is not created on Aurora DSQL, so the column is created with no "
             "default and an INSERT that omits it gets no value. After apply, create the "
-            f"sequence (CREATE SEQUENCE {sequence or '<sequence>'} CACHE 65536, then setval "
-            "it past the source's current value before cut over) and re-attach this DEFAULT "
+            "sequence -- with the statement Evaluation's PG_STANDALONE_SEQUENCE item gives "
+            "when no column owns it (the source's CACHE, bounds and next value kept), else "
+            f"CREATE SEQUENCE {quoted} CACHE 1 START WITH <its next value> (CACHE 1 hands "
+            "the numbers out one at a time and in order, as a gap-free number needs) -- "
+            "then move it past the source's value before cut over and re-attach this DEFAULT "
             "with ALTER TABLE ... SET DEFAULT; an identity would not reproduce the formatting."
         )
     if column.identity or (raw and _PG_NEXTVAL_DEFAULT_RE.search(raw)):

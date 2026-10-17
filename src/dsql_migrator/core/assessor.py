@@ -891,23 +891,33 @@ class NoPrimaryKeyRule(Rule):
 
     rule_id = "NO_PRIMARY_KEY"
 
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        """``is_postgres`` selects which column types Aurora DSQL cannot key."""
+        self._is_postgres = is_postgres
+
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.converter import unkeyable_columns
+
         findings: list[Finding] = []
         for table in inventory.tables:
             if not table.primary_key:
                 # A UNIQUE index whose columns are all NOT NULL already identifies a row:
                 # the natural key to promote, named rather than a generic "add a UUID".
                 # Not a partial one (unique only over the rows its WHERE matches: soft-
-                # deleted rows may share the email) nor an expression one (reflected
-                # without its expression, so its columns are not what is unique).
+                # deleted rows may share the email), an expression one (reflected without
+                # its expression, so its columns are not what is unique), nor one over a
+                # column Aurora DSQL cannot key (bytea, json, interval: promoted, the table
+                # would be refused at both steps).
                 nullable = {c.name for c in table.columns if c.nullable}
                 expression = set(table.expression_indexes)
+                unkeyable = unkeyable_columns(table, is_postgres=self._is_postgres)
                 candidates = [
                     f"{index.name} ({', '.join(index.columns)})"
                     for index in table.indexes
                     if index.unique
                     and index.columns
                     and not set(index.columns) & nullable
+                    and not set(index.columns) & set(unkeyable)
                     and not (index.where or "").strip()
                     and index.name not in expression
                 ]

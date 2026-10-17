@@ -101,7 +101,7 @@ def test_a_formatted_sequence_default_is_a_drop_note_not_identity_advice() -> No
     formatted = "('INV-'::text || lpad((nextval('app.inv_seq'::regclass))::text, 8, '0'::text))"
     column = ColumnDef(name="invoice_no", mysql_type="text", nullable=False, default=formatted)
     _emitted, reason = pg_column_default_sql(column)
-    assert "CREATE SEQUENCE app.inv_seq CACHE 65536" in reason
+    assert 'CREATE SEQUENCE "app"."inv_seq" CACHE 1 START WITH <its next value>' in reason
     assert "Step 1 item" not in reason  # an OWNED BY sequence has none
     inventory = SourceInventory(tables=[TableDef(
         name="app.invoices",

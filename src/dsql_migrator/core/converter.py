@@ -807,6 +807,16 @@ _IDENTITY_KEY_BASES = frozenset(
 )
 
 
+def generated_key_is_integer(table: TableDef) -> bool:
+    """Whether ``table``'s generated key column is declared an integer type (not numeric,
+    and not a text / uuid / floating key fed by a sequence): what a note may call "a plain
+    integer", and the only kind an identity can be added to after apply."""
+    column = table.auto_increment_column
+    declared = next((c.mysql_type for c in table.columns if c.name == column), "") or ""
+    base = re.split(r"[\s(]", declared.strip().lower(), maxsplit=1)[0]
+    return base == "" or (base in _IDENTITY_KEY_BASES and base not in ("numeric", "decimal"))
+
+
 def identity_strategy_applies(table: TableDef) -> bool:
     """Return whether ``IDENTITY_WITH_CACHE`` can be applied to ``table``'s key.
 
@@ -2985,9 +2995,7 @@ def _invalid_composite_conversion(table: TableDef, reason: str) -> "TableConvers
     """
     return TableConversion(
         table=table.name,
-        target_ddl=(
-            f"-- Could not apply a composite primary key to {table.name}: {reason}"
-        ),
+        target_ddl=f"{_COMPOSITE_PLACEHOLDER_LEAD}{table.name}: {reason}",
         schema_ddls=[],
         index_ddls=[],
         preserved_foreign_keys=list(table.foreign_keys),
@@ -3762,6 +3770,56 @@ def validate_composite_leading_column(
     return None
 
 
+def oversized_composite_leaders(
+    table: TableDef, names: "Sequence[str]", *, is_postgres: bool = False
+) -> "dict[str, str]":
+    """``{name: reason}`` for each of ``names`` whose composite key would exceed Aurora
+    DSQL's key-byte limit -- sized on the table's converted CREATE, as the COMPOSITE_KEY
+    conversion sizes it, so the picker never offers a leader the conversion then refuses.
+    Empty when the CREATE cannot be read (the conversion still refuses at the click)."""
+    if not names:
+        return {}
+    return dict(_oversized_composite_leaders(table.model_dump_json(), tuple(names), is_postgres))
+
+
+@functools.lru_cache(maxsize=1024)
+def _oversized_composite_leaders(
+    table_json: str, names: "tuple[str, ...]", is_postgres: bool
+) -> "tuple[tuple[str, str], ...]":
+    table = TableDef.model_validate_json(table_json)
+    source_type = SourceType.POSTGRES if is_postgres else SourceType.MYSQL
+    plain = SchemaConverter(source_type=source_type).convert_table(
+        table, SchemaConvertOptions(primary_key_strategy=PrimaryKeyStrategy.KEEP_INTEGER)
+    )
+    try:
+        create = sqlglot.parse_one(_strip_identity_clauses(plain.target_ddl), read="postgres")
+    except Exception:  # noqa: BLE001 - an unreadable CREATE: sized at the click instead
+        return ()
+    if not isinstance(create, exp.Create):
+        return ()
+    found = []
+    for name in names:
+        key_columns = _composite_key_columns(table, name)
+        total = sum(_estimate_key_column_bytes(create, c) for c in key_columns)
+        if total > _DSQL_MAX_KEY_BYTES:
+            found.append((
+                name,
+                f"The composite key {tuple(key_columns)} is estimated at ~{total} bytes, "
+                f"over Aurora DSQL's {_DSQL_MAX_KEY_BYTES}-byte key limit.",
+            ))
+    return tuple(found)
+
+
+# How :func:`_invalid_composite_conversion`'s target DDL begins.
+_COMPOSITE_PLACEHOLDER_LEAD = "-- Could not apply a composite primary key to "
+
+
+def is_composite_key_placeholder(target_ddl: str) -> bool:
+    """Whether ``target_ddl`` is the comment a refused COMPOSITE_KEY request yields -- never
+    a script to store or apply."""
+    return (target_ddl or "").lstrip().startswith(_COMPOSITE_PLACEHOLDER_LEAD)
+
+
 def _apply_composite_key(
     create: exp.Expression, table: TableDef, leading: str, *, is_postgres: bool = False
 ) -> ConversionWarning:
@@ -3964,9 +4022,15 @@ def _apply_pk_strategy(
         if key_word == "AUTO_INCREMENT":
             message += " " + MYSQL_IDENTITY_DIFFERENCES
     else:  # PrimaryKeyStrategy.KEEP_INTEGER
-        message = (
+        declared = next((c.mysql_type for c in table.columns if c.name == column_name), "")
+        kept = (
             f"The integer key from {key_word} column '{column_name}' was kept as a "
-            "plain integer, WITHOUT the source's value generation. IMPORTANT: Aurora "
+            "plain integer"
+            if generated_key_is_integer(table)
+            else f"The key from {key_word} column '{column_name}' was kept as {declared}"
+        )
+        message = (
+            f"{kept}, WITHOUT the source's value generation. IMPORTANT: Aurora "
             "DSQL will NOT auto-generate this key after "
             f"cut-over ({no_generator}), so the application "
             "must supply the value on every insert — an app that relied on the database "
@@ -3987,10 +4051,15 @@ def _apply_pk_strategy(
                 else "The 'Server-generated (IDENTITY)' strategy cannot be used for this "
                 "table because its primary key is composite "
                 f"({', '.join(table.primary_key)}) and DSQL's identity applies to a single "
-                "column, so the value has to come from the application (or add an identity "
-                "to the column on the target after apply, "
-                + IDENTITY_FALLBACK_CAVEAT
-                + "). "
+                "column, so the value has to come from the application"
+                + (
+                    " (or add an identity to the column on the target after apply, "
+                    + IDENTITY_FALLBACK_CAVEAT
+                    + "). "
+                    # An identity is bigint, and Aurora DSQL cannot change a column's type.
+                    if generated_key_is_integer(table)
+                    else ". "
+                )
             )
             + "For higher insert "
             "throughput, consider a UUID/random key or a cached identity: DSQL stores "
@@ -5155,13 +5224,30 @@ def _pg_partial_or_nonbtree_index_warning(
     # to choose hash (it stores only the hash): the btree's 1 KiB key cap then fails the
     # post-load build or a later INSERT.
     by_name = {index.name: index for index in table.indexes}
-    types = {column.name: column.mysql_type for column in table.columns}
+    columns_by_name = {column.name: column for column in table.columns}
+
+    def emitted_type(column: str) -> str:
+        """The type the conversion emits for ``column``, as Schema Conversion sizes it: an
+        enum is text, a domain its base type, an unsupported type its substitute (money is
+        numeric(23,4)), anything else near-identity."""
+        from dsql_migrator.core.converter_postgres import _ddl_column_type
+
+        definition = columns_by_name.get(column)
+        if definition is None:
+            return ""
+        if definition.type_kind == "enum":
+            return "text"
+        if definition.type_kind == "domain" and definition.base_type:
+            return _ddl_column_type(definition.base_type)
+        return _ddl_column_type(definition.mysql_type)
 
     def key_bytes(column: str) -> int:
         if create is not None:
             return _estimate_key_column_bytes(create, column)
-        try:  # Evaluation has no converted CREATE: a PostgreSQL type is near-identity
-            return _estimate_type_key_bytes(exp.DataType.build(types.get(column) or "", dialect="postgres"))
+        try:  # Evaluation has no converted CREATE: size the type the conversion emits
+            return _estimate_type_key_bytes(
+                exp.DataType.build(emitted_type(column), dialect="postgres")
+            )
         except Exception:  # noqa: BLE001 - an unsizable type counts as unbounded
             return _UNBOUNDED_VARLEN_KEY_BYTES
 
@@ -5634,6 +5720,18 @@ def sql_statement_spans(text: str) -> "list[tuple[int, int]]":
         pos = at + 1 if skipped is None else skipped[1]
     spans.append((start, len(text)))
     return spans
+
+
+def terminated_sql_statement(statement: str) -> str:
+    """``statement`` with one ``;`` that :func:`sql_statement_spans` splits at -- on its own
+    line when the statement's last line is a ``--`` comment, which would swallow it and
+    glue the next statement on, so a split -> join -> split round trip keeps every one."""
+    body = statement.rstrip().rstrip(";")
+    candidate = f"{body};"
+    spans = sql_statement_spans(candidate)
+    if len(spans) >= 2 and spans[-2][1] == len(body):
+        return candidate
+    return f"{body}\n;"
 
 
 def rename_index_script(script: str, renames: "Mapping[str, str]") -> str:
@@ -6741,7 +6839,12 @@ class SchemaConverter:
                         kind=ConversionNoteKind.LOSS,
                         message=(
                             f"With the composite key, '{table.auto_increment_column}' stays "
-                            "a plain integer WITHOUT the source's value generation: Aurora "
+                            + (
+                                "a plain integer"
+                                if generated_key_is_integer(table)
+                                else "as the source declares it"
+                            )
+                            + " WITHOUT the source's value generation: Aurora "
                             "DSQL will NOT generate it after cut over, so the application "
                             f"must supply it on every insert{alternative}."
                         ),

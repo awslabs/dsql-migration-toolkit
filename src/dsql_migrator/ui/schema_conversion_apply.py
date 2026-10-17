@@ -592,20 +592,26 @@ def ai_candidate_object_names(assessment: AssessmentReport) -> list[str]:
 def composite_leading_candidates(table: TableDef, *, is_postgres: bool = False) -> list[str]:
     """Columns eligible to lead a composite primary key for ``table``.
 
-    A valid leading column is NOT NULL, not already part of the primary key and of a type
-    Aurora DSQL can index (mirrors :func:`validate_composite_leading_column` so the picker
-    never offers a choice that would then be rejected: an interval or time with time zone
-    leader made a PRIMARY KEY the CREATE TABLE was refused for). Order follows the
-    table's column order so the dropdown reads like the source schema.
+    A valid leading column is NOT NULL, not already part of the primary key, of a type
+    Aurora DSQL can index, and small enough for the key-byte limit (mirrors
+    :func:`validate_composite_leading_column` so the picker never offers a choice that
+    would then be rejected: an interval or time with time zone leader made a PRIMARY KEY
+    the CREATE TABLE was refused for, and a varchar(255) one a key over 1 KiB, which
+    stored the refusal's comment as the table's script). Order follows the table's column
+    order so the dropdown reads like the source schema.
     """
+    from dsql_migrator.core.converter import oversized_composite_leaders
+
     unkeyable = unkeyable_columns(table, is_postgres=is_postgres)
-    return [
+    names = [
         column.name
         for column in table.columns
         if not column.nullable
         and column.name not in table.primary_key
         and column.name not in unkeyable
     ]
+    oversized = oversized_composite_leaders(table, names, is_postgres=is_postgres)
+    return [name for name in names if name not in oversized]
 
 
 def default_composite_leading(table: TableDef, *, is_postgres: bool = False) -> Optional[str]:
@@ -1338,7 +1344,9 @@ def _join_sql_statements(statements: Sequence[str]) -> str:
     Mirrors ``render_target_ddl``'s formatting so a split-then-join round-trips a
     rendered target script unchanged (modulo whitespace).
     """
-    return "\n\n".join(f"{s.rstrip().rstrip(';')};" for s in statements if s.strip())
+    from dsql_migrator.core.converter import terminated_sql_statement
+
+    return "\n\n".join(terminated_sql_statement(s) for s in statements if s.strip())
 
 
 def split_target_ddl_fk_sections(script: str) -> tuple[str, str]:

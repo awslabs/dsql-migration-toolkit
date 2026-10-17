@@ -73,6 +73,7 @@ from dsql_migrator.core.converter import (
     _mysql_source_base,
     default_primary_key_strategy,
     identity_strategy_applies,
+    is_composite_key_placeholder,
     is_name_collision_placeholder,
     parse_target_primary_key,
     pg_view_ddl,
@@ -4050,6 +4051,21 @@ def _render_pk_strategy_picker(
     )
     converter = SchemaConverter(source_type=source_type)
 
+    def _store_composite(leading: str) -> bool:
+        """Store the composite script for ``leading`` -- never the comment a refused key
+        yields (it would be the table's only DDL): the reason is shown instead."""
+        conversion = build_composite_conversion(
+            converter, table, leading, index_names=index_names
+        )
+        if is_composite_key_placeholder(conversion.target_ddl):
+            reason = next(
+                (w.message for w in conversion.warnings), "the composite key was refused"
+            )
+            ui.notify(reason, type="negative")  # type: ignore[attr-defined]
+            return False
+        conv_state.set_edited_target_ddl(name, render_target_ddl(conversion))
+        return True
+
     def _select_strategy(choice: str) -> None:
         """Apply a primary-key strategy choice (called with the tile's value)."""
         if choice == _COMPOSITE_PK:
@@ -4058,14 +4074,7 @@ def _render_pk_strategy_picker(
             )
             if leading is None:
                 return  # no eligible column; the control stays on Keep (see below)
-            conv_state.set_edited_target_ddl(
-                name,
-                render_target_ddl(
-                    build_composite_conversion(
-                        converter, table, leading, index_names=index_names
-                    )
-                ),
-            )
+            _store_composite(leading)  # refused: the refresh puts the tiles back
         elif choice == _IDENTITY_PK and identity_by_default:
             # The identity IS this table's default conversion: no override to keep.
             conv_state.clear_edited_target_ddl(name)
@@ -4096,13 +4105,8 @@ def _render_pk_strategy_picker(
         leading = getattr(event, "value", None)
         if not leading:
             return
-        conv_state.set_edited_target_ddl(
-            name,
-            render_target_ddl(
-                build_composite_conversion(converter, table, leading, index_names=index_names)
-            ),
-        )
-        refresh()
+        _store_composite(leading)
+        refresh()  # a refused leader: the dropdown goes back to the stored one
 
     # Offer only the strategies that actually apply to this table (radio_tiles has a
     # single group-level lock, so a tile that cannot be used is not shown rather than
@@ -4259,16 +4263,59 @@ def _render_pk_strategy_picker(
                 ),
             )
         elif not candidates and not identity_ok:
-            # No alternative strategy applies to this table (no eligible composite
-            # leading column, not a single-column AUTO_INCREMENT key), so only Keep is
-            # offered -- say why the alternatives are absent.
+            # No alternative strategy applies to this table, so only Keep is offered --
+            # say why the alternatives are absent, by the table's actual reasons.
             inline_hint(
                 ui,
-                "No alternative primary-key strategy applies: this table has no "
-                f"single-column {_key_word} key and no NOT NULL non-key column to "
-                "lead a composite key.",
+                "No alternative primary-key strategy applies: "
+                + _no_alternative_reasons(table, source_type=source_type)
+                + ".",
                 tone="neutral",
             )
+
+
+def _no_alternative_reasons(table: TableDef, *, source_type: SourceType) -> str:
+    """Why neither Server-generated nor Composite applies to ``table`` -- its actual
+    reasons: a generated key that is not an integer, or part of a composite key; NOT NULL
+    columns of types Aurora DSQL cannot index, or too large for its key."""
+    from dsql_migrator.core.converter import oversized_composite_leaders, unkeyable_columns
+
+    is_postgres = source_type is SourceType.POSTGRES
+    key_word = "serial / identity" if is_postgres else "AUTO_INCREMENT"
+    generated = table.auto_increment_column
+    if generated and table.primary_key == [generated]:
+        declared = next((c.mysql_type for c in table.columns if c.name == generated), "")
+        identity = (
+            f"its {key_word} key '{generated}' is {declared}, not an integer (an Aurora "
+            "DSQL identity is bigint)"
+        )
+    elif generated:
+        identity = (
+            f"its {key_word} column '{generated}' is part of a composite key (an identity "
+            "is a single column)"
+        )
+    else:
+        identity = f"this table has no single-column {key_word} key"
+    eligible = [
+        c.name for c in table.columns if not c.nullable and c.name not in table.primary_key
+    ]
+    if not eligible:
+        return f"{identity}, and no NOT NULL non-key column to lead a composite key"
+    unkeyable = unkeyable_columns(table, is_postgres=is_postgres)
+    oversized = oversized_composite_leaders(
+        table, [n for n in eligible if n not in unkeyable], is_postgres=is_postgres
+    )
+    parts = [
+        f"{n} becomes {unkeyable[n]}, which Aurora DSQL cannot index"
+        for n in eligible
+        if n in unkeyable
+    ]
+    parts += [f"{n} would take the key past its 1 KiB limit" for n in eligible if n in oversized]
+    return (
+        f"{identity}, and no NOT NULL non-key column can lead a composite key ("
+        + "; ".join(parts)
+        + ")"
+    )
 
 
 def _render_preview(
