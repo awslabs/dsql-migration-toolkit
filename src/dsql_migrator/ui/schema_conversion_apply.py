@@ -589,7 +589,9 @@ def ai_candidate_object_names(assessment: AssessmentReport) -> list[str]:
     return names
 
 
-def composite_leading_candidates(table: TableDef, *, is_postgres: bool = False) -> list[str]:
+def composite_leading_candidates(
+    table: TableDef, *, is_postgres: bool = False, sized: bool = True
+) -> list[str]:
     """Columns eligible to lead a composite primary key for ``table``.
 
     A valid leading column is NOT NULL, not already part of the primary key, of a type
@@ -598,7 +600,9 @@ def composite_leading_candidates(table: TableDef, *, is_postgres: bool = False) 
     would then be rejected: an interval or time with time zone leader made a PRIMARY KEY
     the CREATE TABLE was refused for, and a varchar(255) one a key over 1 KiB, which
     stored the refusal's comment as the table's script). Order follows the table's column
-    order so the dropdown reads like the source schema.
+    order so the dropdown reads like the source schema. ``sized=False`` skips the size
+    check, which converts the table: what the picker renders for every table (whether the
+    tile applies at all), the check itself running only when the choice is made.
     """
     from dsql_migrator.core.converter import oversized_composite_leaders
 
@@ -610,6 +614,8 @@ def composite_leading_candidates(table: TableDef, *, is_postgres: bool = False) 
         and column.name not in table.primary_key
         and column.name not in unkeyable
     ]
+    if not sized:
+        return names
     oversized = oversized_composite_leaders(table, names, is_postgres=is_postgres)
     return [name for name in names if name not in oversized]
 
@@ -751,17 +757,52 @@ def _first_create_table(target_ddl: str) -> str:
 def _column_clause(create_table_ddl: str, column: str) -> Optional[str]:
     """Return the single column-definition clause for ``column`` from a CREATE TABLE.
 
-    The converter pretty-prints one column per line, so the clause is the line whose
-    first token is the (optionally double-quoted) column identifier. Matching on the
+    The clause is the element of the column list -- split at its top-level commas, so a
+    one-line or hand-laid-out CREATE reads like the converter's one-column-per-line one --
+    whose first token is the (optionally double-quoted) column identifier. Matching on the
     leading token -- not a substring -- keeps a column merely NAMED like another from
-    being confused for it. Returns ``None`` when no such column line is found.
+    being confused for it. Returns ``None`` when no such column is found.
     """
-    for raw in create_table_ddl.splitlines():
-        line = raw.strip().rstrip(",")
-        token = line.split(" ", 1)[0]
+    for element in _column_list_elements(create_table_ddl):
+        token = element.split(None, 1)[0] if element.split() else ""
         if token in (f'"{column}"', column):
-            return line
+            return element
     return None
+
+
+def _column_list_elements(create_table_ddl: str) -> "list[str]":
+    """The comma-separated elements of a CREATE TABLE's parenthesised column list (column
+    definitions and table constraints), whitespace-collapsed -- commas inside parentheses,
+    string literals and quoted identifiers do not split."""
+    text = create_table_ddl or ""
+    start = text.find("(")
+    if start < 0:
+        return []
+    elements: list[str] = []
+    depth, quote, begin = 0, "", start + 1
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < len(text) and text[i + 1] == quote:
+                    i += 1  # a doubled quote inside the literal / identifier
+                else:
+                    quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                elements.append(text[begin:i])
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            elements.append(text[begin:i])
+            begin = i + 1
+        i += 1
+    return [" ".join(element.split()) for element in elements if element.strip()]
 
 
 def composite_leading_from_ddl(table: TableDef, target_ddl: str) -> Optional[str]:
@@ -1381,7 +1422,12 @@ def join_target_ddl_fk_sections(non_fk: str, fk: str) -> str:
     a full script and the deferred FKs still reach the post-load pass. The inverse
     of :func:`split_target_ddl_fk_sections`; an empty part is dropped.
     """
+    from dsql_migrator.core.converter import terminated_sql_script
+
     parts = [part.strip() for part in (non_fk, fk) if part.strip()]
+    if len(parts) == 2:
+        # An edit without its final ';' would glue the first deferred FK ALTER onto it.
+        parts[0] = terminated_sql_script(parts[0])
     return "\n\n".join(parts)
 
 

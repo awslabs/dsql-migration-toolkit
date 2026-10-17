@@ -814,6 +814,8 @@ def generated_key_is_integer(table: TableDef) -> bool:
     column = table.auto_increment_column
     declared = next((c.mysql_type for c in table.columns if c.name == column), "") or ""
     base = re.split(r"[\s(]", declared.strip().lower(), maxsplit=1)[0]
+    if base == "bigint" and "unsigned" in declared.lower():
+        return False  # a MySQL bigint unsigned is emitted numeric(20,0) to hold its range
     return base == "" or (base in _IDENTITY_KEY_BASES and base not in ("numeric", "decimal"))
 
 
@@ -3177,6 +3179,11 @@ def _pg_unsupported_key_columns(table: TableDef) -> set[str]:
     unindexable_substitutes = {"json", "jsonb", "bytea"}
     excluded: set[str] = set()
     for column in table.columns:
+        # An enum whose labels were read is converted to text with a CHECK over them (as
+        # the MySQL ENUM path does): a valid, indexable column. Its indexes -- a UNIQUE one
+        # included -- were left out with a stale "not a column type" note.
+        if column.type_kind == "enum" and column.enum_labels:
+            continue
         substituted, _note = substitute_pg_unsupported_type(
             column.mysql_type, type_kind=column.type_kind
         )
@@ -3648,7 +3655,27 @@ def _estimate_key_column_bytes(create: exp.Expression, column_name: str) -> int:
     """
     column_def = _find_column_def(create, column_name)
     data_type = column_def.args.get("kind") if column_def is not None else None
-    return _estimate_type_key_bytes(data_type)
+    estimate = _estimate_type_key_bytes(data_type)
+    # A column whose own CHECK lists its values (a converted ENUM: TEXT CHECK (col IN
+    # ('new', 'paid'))) can hold nothing longer than its longest value, so a key over it
+    # is not "up to ~1025 bytes" (the unbounded-text fallback).
+    allowed = _check_in_list_bytes(column_def) if column_def is not None else None
+    return estimate if allowed is None else min(estimate, allowed)
+
+
+def _check_in_list_bytes(column_def: exp.ColumnDef) -> Optional[int]:
+    """The UTF-8 length of the longest value a column's own ``CHECK (col IN ('a', ...))``
+    allows, or ``None`` when it has no such CHECK (string literals only)."""
+    for constraint in column_def.args.get("constraints") or []:
+        kind = constraint.args.get("kind")
+        check = kind.this if isinstance(kind, exp.CheckColumnConstraint) else None
+        if (
+            isinstance(check, exp.In)
+            and check.expressions
+            and all(isinstance(e, exp.Literal) and e.is_string for e in check.expressions)
+        ):
+            return max(len(e.name.encode("utf-8")) for e in check.expressions)
+    return None
 
 
 def _estimate_type_key_bytes(data_type: object) -> int:
@@ -4022,12 +4049,17 @@ def _apply_pk_strategy(
         if key_word == "AUTO_INCREMENT":
             message += " " + MYSQL_IDENTITY_DIFFERENCES
     else:  # PrimaryKeyStrategy.KEEP_INTEGER
-        declared = next((c.mysql_type for c in table.columns if c.name == column_name), "")
+        emitted = column_def.args.get("kind") if column_def is not None else None
         kept = (
             f"The integer key from {key_word} column '{column_name}' was kept as a "
             "plain integer"
             if generated_key_is_integer(table)
-            else f"The key from {key_word} column '{column_name}' was kept as {declared}"
+            else f"The key from {key_word} column '{column_name}' was kept as "
+            + (
+                emitted.sql(dialect=_POSTGRES)
+                if isinstance(emitted, exp.DataType)
+                else next((c.mysql_type for c in table.columns if c.name == column_name), "")
+            )
         )
         message = (
             f"{kept}, WITHOUT the source's value generation. IMPORTANT: Aurora "
@@ -5244,6 +5276,11 @@ def _pg_partial_or_nonbtree_index_warning(
     def key_bytes(column: str) -> int:
         if create is not None:
             return _estimate_key_column_bytes(create, column)
+        definition = columns_by_name.get(column)
+        if definition is not None and definition.type_kind == "enum" and definition.enum_labels:
+            # Its text holds only its labels (the converted CHECK), as Schema Conversion
+            # sizes it.
+            return max(len(label.encode("utf-8")) for label in definition.enum_labels)
         try:  # Evaluation has no converted CREATE: size the type the conversion emits
             return _estimate_type_key_bytes(
                 exp.DataType.build(emitted_type(column), dialect="postgres")
@@ -5720,6 +5757,40 @@ def sql_statement_spans(text: str) -> "list[tuple[int, int]]":
         pos = at + 1 if skipped is None else skipped[1]
     spans.append((start, len(text)))
     return spans
+
+
+def sql_without_comments(text: str) -> str:
+    """``text`` with its comments removed (``--`` and ``/* */``, outside literals and
+    quoted identifiers), everything else kept as written."""
+    out, last, pos = [], 0, 0
+    while True:
+        match = _STATEMENT_SCAN_RE.search(text, pos)
+        if match is None:
+            break
+        at = match.start()
+        if match.group(0) == ";":
+            pos = at + 1
+            continue
+        skipped = _sql_skip(text, at)
+        if skipped is None:
+            pos = at + 1
+            continue
+        if skipped[0] == "comment":
+            out.append(text[last:at])
+            last = skipped[1]
+        pos = skipped[1]
+    out.append(text[last:])
+    return "".join(out)
+
+
+def terminated_sql_script(script: str) -> str:
+    """``script`` with its last statement terminated when it is not (an edit that omits
+    the final ``;``), so text joined after it starts a statement of its own."""
+    start, end = sql_statement_spans(script)[-1]
+    tail = script[start:end]
+    if not sql_without_comments(tail).strip():
+        return script
+    return script[:start] + terminated_sql_statement(tail)
 
 
 def terminated_sql_statement(statement: str) -> str:

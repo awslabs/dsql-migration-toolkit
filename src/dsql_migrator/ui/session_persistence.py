@@ -697,9 +697,18 @@ def apply_session_snapshot(
     if snapshot.ticked_node_ids is not None:
         conv_state.ticked_node_ids = list(snapshot.ticked_node_ids)  # type: ignore[attr-defined]
     if snapshot.edited_target_ddls:
+        from dsql_migrator.core.converter import is_composite_key_placeholder
+
         # Restore the customized target DDLs so a re-run recreates tables with the
-        # user's schema (e.g. a smallint remap), not the deterministic conversion.
-        conv_state.edited_target_ddls = dict(snapshot.edited_target_ddls)  # type: ignore[attr-defined]
+        # user's schema (e.g. a smallint remap), not the deterministic conversion -- but
+        # never the refusal comment 0.1.570's picker stored for a composite key it could
+        # not build: as the table's only DDL Schema Apply rejected it, and Full Load lost
+        # the table's indexes and foreign keys. The table takes its generated DDL again.
+        conv_state.edited_target_ddls = {  # type: ignore[attr-defined]
+            name: ddl
+            for name, ddl in snapshot.edited_target_ddls.items()
+            if not is_composite_key_placeholder(ddl)
+        }
     # Restore the "Preserve foreign keys" choice so a strip-FKs decision survives a
     # reconnect/restart (older snapshots default True = preserve). Applied
     # unconditionally: unlike the collections above, a False must overwrite the

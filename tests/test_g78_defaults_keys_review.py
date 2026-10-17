@@ -167,7 +167,7 @@ def test_key_notes_word_a_non_integer_serial_key_by_its_type() -> None:
     converter = SchemaConverter(source_type=SourceType.POSTGRES)
     (converted,) = converter.convert(SourceInventory(tables=[codes])).tables
     notes = " ".join(w.message for w in converted.warnings)
-    assert "was kept as character varying(20)" in notes and "plain integer" not in notes
+    assert "was kept as VARCHAR(20)" in notes and "plain integer" not in notes
     (converted,) = converter.convert(SourceInventory(tables=[events])).tables
     notes = " ".join(w.message for w in converted.warnings)
     assert "plain integer" not in notes and "add an identity" not in notes
@@ -215,3 +215,200 @@ def test_a_hash_index_is_sized_on_the_type_the_conversion_emits() -> None:
         (converted,) = SchemaConverter(source_type=SourceType.POSTGRES).convert(inventory).tables
         (note,) = [w for w in converted.warnings if "hash" in w.message]
         assert concern.note_kind.value == note.kind.value == kind, type_
+
+
+# --- G79: the review of G68-G78 -----------------------------------------------------------
+
+
+def test_an_index_over_a_converted_enum_is_emitted_and_sized_by_its_labels() -> None:
+    """A PostgreSQL enum becomes text with a CHECK over its labels, yet every index over it
+    -- a UNIQUE one included -- was left out with a stale 'not a column type' note; and a
+    MySQL ENUM's index was flagged as 'up to ~1025 bytes'."""
+    from dsql_migrator.core.converter import SchemaConverter
+
+    pg = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="integer", nullable=False),
+                 ColumnDef(name="status", mysql_type="app.order_status", type_kind="enum",
+                           enum_labels=("new", "paid"), nullable=False)],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ix_status", columns=["status"]),
+                 IndexDef(name="ux_id_status", columns=["id", "status"], unique=True)],
+    )
+    (converted,) = SchemaConverter(source_type=SourceType.POSTGRES).convert(
+        SourceInventory(tables=[pg])
+    ).tables
+    assert converted.index_ddls == [
+        'CREATE INDEX ASYNC "ix_status" ON "app"."orders" ("status")',
+        'CREATE UNIQUE INDEX ASYNC "ux_id_status" ON "app"."orders" ("id", "status")',
+    ]
+    mysql = TableDef(
+        name="app.orders",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                 ColumnDef(name="status", mysql_type="enum('new','paid')", nullable=False)],
+        primary_key=["id"],
+        indexes=[IndexDef(name="ix_status", columns=["status"])],
+    )
+    for table, engine in ((pg, SourceType.POSTGRES), (mysql, SourceType.MYSQL)):
+        (converted,) = SchemaConverter(source_type=engine).convert(
+            SourceInventory(tables=[table])
+        ).tables
+        assert not any("1024 bytes combined" in w.message for w in converted.warnings), engine
+
+
+def test_a_unique_key_over_an_enum_is_still_offered_for_promotion() -> None:
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+
+    table = TableDef(
+        name="app.kinds",
+        columns=[ColumnDef(name="tenant_id", mysql_type="integer", nullable=False),
+                 ColumnDef(name="kind", mysql_type="app.kind_t", type_kind="enum",
+                           enum_labels=("a", "b"), nullable=False)],
+        indexes=[IndexDef(name="ux_tk", columns=["tenant_id", "kind"], unique=True)],
+    )
+    (item,) = CompatibilityAssessor(source_type=SourceType.POSTGRES).assess(
+        SourceInventory(tables=[table])
+    ).items
+    (concern,) = [c for c in item.concerns if c.rule_id == "NO_PRIMARY_KEY"]
+    assert "ux_tk (tenant_id, kind)" in concern.recommendation
+
+
+def test_a_mysql_bigint_unsigned_composite_key_is_not_told_to_add_an_identity() -> None:
+    """It is emitted numeric(20,0): no identity can be added to it after apply."""
+    from dsql_migrator.core.assessor import CompatibilityAssessor
+    from dsql_migrator.core.converter import SchemaConverter
+
+    table = TableDef(
+        name="shop.events",
+        columns=[ColumnDef(name="id", mysql_type="bigint unsigned", nullable=False),
+                 ColumnDef(name="created_at", mysql_type="datetime", nullable=False)],
+        primary_key=["id", "created_at"],
+        auto_increment_column="id",
+    )
+    inventory = SourceInventory(tables=[table])
+    (converted,) = SchemaConverter().convert(inventory).tables
+    notes = " ".join(w.message for w in converted.warnings)
+    assert "was kept as DECIMAL(20, 0)" in notes and "add an identity" not in notes
+    (item,) = CompatibilityAssessor().assess(inventory).items
+    (concern,) = [c for c in item.concerns if c.rule_id == "AUTO_INCREMENT"]
+    assert "plain integer" not in concern.risk and "add an identity" not in concern.recommendation
+
+
+def test_the_picker_renders_a_stored_leader_the_size_filter_hides() -> None:
+    """A stored (code, id) key over a varchar(255) leader: the dropdown's value was not
+    among its options and NiceGUI raised, stopping the whole generated list."""
+    import dsql_migrator.ui.schema_conversion as screen
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from tests.test_ui_schema_conversion import _PickerUi
+
+    table = _customers()
+    stored = (
+        'CREATE TABLE "shop"."customers" ("id" BIGINT NOT NULL, "email" VARCHAR(255) NOT NULL, '
+        '"tenant_id" INT NOT NULL, PRIMARY KEY ("email", "id"))'
+    )
+    state = SchemaConversionState()
+    state.set_edited_target_ddl("shop.customers", stored)
+    ui = _PickerUi()
+    screen._render_pk_strategy_picker(ui, table, state, lambda: None)
+    assert ui.select_value == "email"
+    options = ui.select_options
+    assert "email" in options and "tenant_id" in options
+
+
+def test_the_picker_does_not_convert_every_table_to_render() -> None:
+    """Sizing the composite leaders converted each generated table on every render
+    (12 s per render at 2,500 tables)."""
+    import dsql_migrator.ui.schema_conversion as screen
+    from dsql_migrator.core import converter as core
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from tests.test_ui_schema_conversion import _PickerUi
+
+    calls: list = []
+    original = core._oversized_composite_leaders
+
+    def counting(*args):
+        calls.append(args)
+        return original(*args)
+
+    core._oversized_composite_leaders = counting
+    try:
+        screen._render_pk_strategy_picker(
+            _PickerUi(), _customers(), SchemaConversionState(), lambda: None
+        )
+    finally:
+        core._oversized_composite_leaders = original
+    assert calls == []
+
+
+def test_a_resumed_or_renamed_pick_keeps_its_strategy_notes() -> None:
+    """A Keep script stored by an earlier version (or before an index rename) no longer
+    matched today's rendering byte for byte, so the screen showed the identity default's
+    'KEEPS its value generation' beside a Keep DDL."""
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.ui.schema_conversion import TABLE_PREFIX, generate_previews, render_target_ddl
+    from dsql_migrator.ui.schema_conversion_apply import build_keep_conversion
+
+    table = TableDef(
+        name="shop.users",
+        columns=[ColumnDef(name="id", mysql_type="int", nullable=False),
+                 ColumnDef(name="name", mysql_type="varchar(40)")],
+        primary_key=["id"],
+        auto_increment_column="id",
+    )
+    inventory = SourceInventory(tables=[table])
+    converter = SchemaConverter()
+    result = converter.convert(inventory)
+    keep = render_target_ddl(build_keep_conversion(converter, table))
+    older = " ".join(keep.split()).replace('"name" VARCHAR(40)', '"name" VARCHAR(40) NULL')
+    (preview,) = generate_previews(
+        [TABLE_PREFIX + "shop.users"], inventory, result, stored_ddl_of={"shop.users": older}.get
+    )
+    notes = " ".join(w.message for w in preview.warnings)
+    assert "kept as a plain integer" in notes and "KEEPS its value generation" not in notes
+
+
+def test_an_edit_without_its_final_semicolon_keeps_the_fk_section_apart() -> None:
+    from dsql_migrator.ui.schema_conversion_apply import (
+        join_target_ddl_fk_sections,
+        split_sql_statements,
+        split_target_ddl_fk_sections,
+    )
+
+    fk = (
+        'ALTER TABLE "app"."orders" ADD CONSTRAINT "fk_c" FOREIGN KEY ("cid") '
+        'REFERENCES "app"."customers" ("id") NOT VALID;'
+    )
+    edited = 'CREATE TABLE "app"."orders" ("id" INT, "cid" INT);\n\nCREATE INDEX ASYNC "ix_cid" ON "app"."orders" ("cid")'
+    joined = join_target_ddl_fk_sections(edited, fk)
+    assert len(split_sql_statements(joined)) == 3
+    assert split_target_ddl_fk_sections(joined)[1].strip() == fk
+
+
+def test_a_stored_composite_refusal_comment_is_no_edit() -> None:
+    """0.1.570's picker stored '-- Could not apply a composite primary key ...' as the
+    table's only DDL; a resumed session kept sending it to Schema Apply."""
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import (
+        apply_session_snapshot,
+        capture_session_snapshot,
+    )
+
+    placeholder = "-- Could not apply a composite primary key to shop.orders: too large"
+    state = SchemaConversionState()
+    state.set_edited_target_ddl("shop.orders", placeholder)
+    assert state.get_edited_target_ddl("shop.orders") is None
+    # A snapshot an earlier build wrote with the comment stored.
+    state.edited_target_ddls = {"shop.orders": placeholder, "shop.items": "CREATE TABLE x (a int)"}
+    snapshot = capture_session_snapshot(
+        "s1", SessionConnectionState(), EvaluationState(), state, DataMigrationState()
+    )
+    restored = SchemaConversionState()
+    apply_session_snapshot(
+        SessionSnapshot.model_validate_json(snapshot.model_dump_json()),
+        SessionConnectionState(), EvaluationState(), restored, DataMigrationState(),
+    )
+    assert restored.edited_target_ddls == {"shop.items": "CREATE TABLE x (a int)"}

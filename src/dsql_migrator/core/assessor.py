@@ -787,6 +787,7 @@ class AutoIncrementRule(Rule):
         from dsql_migrator.core.converter import (
             IDENTITY_FALLBACK_CAVEAT,
             MYSQL_IDENTITY_DIFFERENCES,
+            generated_key_is_integer,
             identity_strategy_applies,
             mysql_identity_is_lossless,
         )
@@ -847,7 +848,7 @@ class AutoIncrementRule(Rule):
                     "(IDENTITY)' if every value fits a signed bigint (up to "
                     "9223372036854775807) — a larger one fails to load."
                 )
-            else:
+            elif generated_key_is_integer(table):
                 risk = (
                     f"The integer key from AUTO_INCREMENT column '{column}' converts "
                     "cleanly, but Aurora DSQL will NOT generate it: the column stays a "
@@ -863,6 +864,22 @@ class AutoIncrementRule(Rule):
                     "applies to a single column, so the value must come from the "
                     "application — or add an identity to the column on the target after "
                     "apply, " + IDENTITY_FALLBACK_CAVEAT + "."
+                )
+            else:
+                # A bigint unsigned (numeric(20,0) on the target) or a non-integer key: no
+                # identity can be added to it later either (an identity is bigint, and
+                # Aurora DSQL cannot change a column's type).
+                risk = (
+                    f"The {declared} key from AUTO_INCREMENT column '{column}' is part of "
+                    f"a composite primary key ({', '.join(table.primary_key)}) and is not "
+                    "converted to an integer Aurora DSQL could generate, so Aurora DSQL "
+                    "will NOT generate it: the APPLICATION must supply the value on every "
+                    "insert — code that relied on the database generating it fails or "
+                    "collides." + _MONOTONIC_KEY_NOTE
+                )
+                recommendation = (
+                    "Supply the value from the application: IDENTITY cannot be used for "
+                    "this table (a DSQL identity is a single bigint column)."
                 )
             findings.append(
                 Finding(
