@@ -343,16 +343,28 @@ def test_a_background_s3_store_uploads_off_the_caller_and_coalesces() -> None:
             type(self).puts.append(kwargs["Key"])
             return super().put_object(**kwargs)
 
+    import time
+
     fake = _SlowS3(buckets=("b",))
     store = S3SessionStateStore("b", s3_client=fake, background=True)
-    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:a"]))  # returns at once
-    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:b"]))
+    started = time.monotonic()
+    store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:a"]))
+    # The first PUT is in flight (held by the gate) before the next saves queue.
+    for _ in range(500):
+        if store._unwritten("s1") is not None and store._inflight is not None:  # noqa: SLF001
+            break
+        time.sleep(0.002)
+    for name in ("table:b", "table:c", "table:d"):
+        store.save(SessionSnapshot(session_id="s1", generated_node_ids=[name]))
+    # Every save returned while the PUT was still held: nothing waits on S3.
+    assert time.monotonic() - started < 1.0 and _SlowS3.puts == []
     # Read-your-writes before anything reached S3.
-    assert store.load("s1").generated_node_ids == ["table:b"]
+    assert store.load("s1").generated_node_ids == ["table:d"]
     gate.set()
     assert store.flush(timeout=5)
-    assert store.load("s1").generated_node_ids == ["table:b"]
-    assert len(_SlowS3.puts) <= 2  # the first may already be in flight; never three
+    assert store.load("s1").generated_node_ids == ["table:d"]
+    # Coalesced: the one in flight, then only the newest -- b and c never reach S3.
+    assert len(_SlowS3.puts) == 2
     # A Start over is not undone by a late upload.
     gate.clear()
     store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:c"]))
@@ -2515,3 +2527,25 @@ def test_a_restart_during_an_evaluation_rerun_restores_done_with_a_notice() -> N
     assert get_status(s2.workflow, WorkflowStep.EVALUATION) is StepStatus.DONE
     assert e2.run_notice is not None
     assert e2.run_notice[1] == "The re-run was interrupted by a restart"
+
+
+def test_a_flush_that_times_out_names_the_unwritten_sessions(caplog) -> None:
+    """The exit flush returned False and said nothing: a resumed session came back older
+    with no trace of why (G86)."""
+    import logging
+    import threading
+
+    gate = threading.Event()
+
+    class _HeldS3(_FakeS3):
+        def put_object(self, **kwargs):  # noqa: N803
+            gate.wait(5)
+            return super().put_object(**kwargs)
+
+    store = S3SessionStateStore("b", s3_client=_HeldS3(buckets=("b",)), background=True)
+    store.save(SessionSnapshot(session_id="s9", generated_node_ids=["table:a"]))
+    with caplog.at_level(logging.WARNING, logger="dsql_migrator.core.session_state_store"):
+        assert store.flush(timeout=0.05) is False
+    assert "s9" in caplog.text and "not uploaded" in caplog.text
+    gate.set()
+    assert store.flush(timeout=5)

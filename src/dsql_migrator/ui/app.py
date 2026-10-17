@@ -1973,6 +1973,9 @@ def main() -> None:
         )
         import atexit
 
+        # On NiceGUI's shutdown (uvicorn's lifespan, before a signal is re-raised -- so
+        # also when the process is not PID 1), and at exit as the backstop.
+        app.on_shutdown(lambda: SESSION_STATE_STORE.flush(10.0))
         atexit.register(SESSION_STATE_STORE.flush, 10.0)
     else:
         SESSION_STATE_STORE = SqliteSessionStateStore(config.session_state_path)

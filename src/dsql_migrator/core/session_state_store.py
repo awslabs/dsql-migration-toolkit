@@ -635,11 +635,22 @@ class S3SessionStateStore:
                     self._writer_cv.notify_all()
 
     def flush(self, timeout: Optional[float] = None) -> bool:
-        """Wait until every pending snapshot is uploaded; ``False`` on timeout."""
+        """Wait until every pending snapshot is uploaded; ``False`` on timeout -- logged with
+        the sessions still unwritten (at exit they are lost, and nothing else says why a
+        resumed session came back older)."""
         with self._writer_cv:
-            return self._writer_cv.wait_for(
+            done = self._writer_cv.wait_for(
                 lambda: not self._pending and self._inflight is None, timeout=timeout
             )
+            unwritten = sorted(
+                {*self._pending, *([self._inflight[0]] if self._inflight is not None else [])}
+            )
+        if not done:
+            _LOGGER.warning(
+                "Session snapshots not uploaded to s3://%s within %ss: %s",
+                self._bucket, timeout, ", ".join(unwritten),
+            )
+        return done
 
     def _unwritten(self, session_id: str) -> Optional[SessionSnapshot]:
         """A snapshot of ``session_id`` saved but not uploaded yet (newest first)."""
