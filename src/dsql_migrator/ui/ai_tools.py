@@ -387,7 +387,11 @@ def build_ai_tool_executor(
                     SchemaConverter,
                     SchemaConvertOptions,
                 )
-                from dsql_migrator.core.models import SourceType
+                from dsql_migrator.core.models import (
+                    Classification,
+                    ConversionNoteKind,
+                    SourceType,
+                )
                 from dsql_migrator.ui.schema_conversion import (
                     TABLE_PREFIX,
                     VIEW_PREFIX,
@@ -441,11 +445,14 @@ def build_ai_tool_executor(
                     # remedy is the conversion's own (its last note says why): a view whose
                     # name collides is not re-created by hand, it is renamed on the source,
                     # and a materialized view or foreign table has no view to re-create.
-                    _why = (
-                        _view.warnings[-1].message
-                        if _view.warnings
-                        else "Reimplement it manually on Aurora DSQL."
-                    )
+                    # Every blocking reason, in order (a materialized view whose name
+                    # also collides needs both: renaming alone creates nothing).
+                    _reasons = list(dict.fromkeys(
+                        w.message for w in _view.warnings
+                        if w.classification in (Classification.MANUAL, Classification.UNSUPPORTED)
+                        and getattr(w, "kind", None) is not ConversionNoteKind.RECOMMENDATION
+                    ))
+                    _why = " ".join(_reasons) or "Reimplement it manually on Aurora DSQL."
                     return _json.dumps(
                         {"status": "ok", "object_name": _p.object_name,
                          "source_ddl": _p.source_ddl, "target_ddl": _p.target_ddl,

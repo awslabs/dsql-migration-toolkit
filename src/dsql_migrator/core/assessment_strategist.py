@@ -129,13 +129,24 @@ _MAX_TOOL_ROUNDS = 6
 # that up" preamble and NO tool_use block -- announcing tool use but never emitting the
 # call. Returning that as the answer leaves the user staring at "Let me pull the
 # assessment details..." with no real reply (reported on the "What's next?" briefing).
-# When that happens before any tool has run, tool_chat nudges ONCE to actually proceed.
-# This matches the intent-to-call cue without tripping on a genuine complete answer.
+# When that happens before any tool has run, tool_chat nudges ONCE to actually proceed --
+# and the nudge lets the model keep a reply that already WAS the answer
+# (:data:`KEEP_REPLY_MARKER`), so a reply nudged by mistake costs one short round, never
+# the answer. The detector therefore errs toward nudging: a punt shown as the whole reply
+# is the failure that matters.
 _TOOL_PREAMBLE_RE = re.compile(
     r"\b(let me(?! know)|i'?ll|i will|i'?m going to|i am going to)\b"
     r".{0,60}\b(check|look|pull|fetch|inspect|review|examine|gather|retrieve|see|"
     r"take a look|dig|query|read)\b",
     re.IGNORECASE | re.DOTALL,
+)
+# The same announcement in Korean or Japanese: the operator may ask in either, and the
+# model answers in kind ("확인해 보겠습니다", "確認します").
+_CJK_PREAMBLE_RE = re.compile(
+    r"(?:확인|조회|점검|검토|분석)\s*(?:해\s*보겠|하겠|해\s*볼게|할게)"
+    r"|(?:살펴|알아|찾아)\s*보겠|(?:가져|불러)\s*오겠"
+    r"|(?:確認|調査|チェック|取得|参照)(?:します|してみます|いたします)"
+    r"|調べ(?:ます|てみます)|見てみます"
 )
 # An offer to the user, or a closing, is no announcement of what the model is about to do
 # ("to see if you have ..." is no offer).
@@ -143,76 +154,65 @@ _TOOL_OFFER_RE = re.compile(
     r"\b(?:if you(?:'d| would) like|would you like|do you want|should i|let me know)\b",
     re.IGNORECASE,
 )
-_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+")
-# A look-up said for later or on a condition ("I'll check it again before you cut over",
-# "once Schema Apply has run, I'll check ...") is part of an answer, not an announcement --
-# "to see if you have" is no condition.
+_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])")
+# A look-up said for LATER ("I'll check it before you cut over", "once Schema Apply has
+# run, I'll check ...", "if it recurs") is part of an answer, not an announcement. Only
+# deferrals count: a look-up of what already happened ("after you started the Full
+# Load", "when it reconnected"), an indirect question ("to determine if it has ..."), or
+# one asked for again ("let me check the DLQ again") is an announcement.
 _LATER_RE = re.compile(
-    r"\b(?:again|later|next time|whenever)\b"
-    r"|\bonce\b(?=[^.]*\b(?:has|have|is|are|runs?|ran|finishes|completes|finished|completed)\b)"
-    r"|(?<!see )(?<!check )\b(?:before|after|when|if)\s+(?:you|it|a new)\b",
+    r"\b(?:later|next time|whenever|from now on)\b"
+    r"|\bonce\b(?!\s+more\b)(?=[^.]*\b(?:has|have|is|are|runs?|finishes|completes)\b)"
+    r"|(?<!see )(?<!check )(?<!determine )(?<!find out )(?<!know )(?<!verify )(?<!tell )"
+    r"\b(?:before|after|when|if)\s+(?:you(?:'re|'ve| are| have)?|it(?:'s| is)?|a new)\s+"
+    r"(?!(?:started|ran|saw|first|reconnected|failed|finished|stopped|changed|began|got|"
+    r"went|was|were|had|did)\b)"
+    r"|나중에|다음에|이후에|後で|次回|後ほど",
     re.IGNORECASE,
 )
-# 'To answer that I need ...': what the model is about to fetch, said as a need.
-_NEED_RE = re.compile(r"\b(?:to answer (?:that|this)|i need (?:to|the))\b", re.IGNORECASE)
-# A short courtesy around an announcement ('One moment.', 'Good question.').
-_FILLER_RE = re.compile(
-    r"^(?:one moment|just a moment|good question|sure|okay|ok|certainly|got it|great)\b",
+# 'To answer that I need ...': what the model is about to fetch, said as a need -- never
+# 'I need to correct that' or 'I need to know which table you mean' (a question to the
+# operator).
+_NEED_RE = re.compile(
+    r"\bto answer (?:that|this),? i(?:'ll| will)? need\b"
+    r"|\bi need (?:to (?:check|look|pull|fetch|see|review|query|read|gather|confirm|"
+    r"inspect)\b|the (?:current|latest|actual|live)\b)",
     re.IGNORECASE,
 )
-# A list item that carries a finding (a value, a verdict, a fix) is an answer, not a plan.
-_FINDING_ITEM_RE = re.compile(
-    r"\d|:\s*\S|\b(?:is|are|has|have|holds|needs|returns|fails|matches|becomes|keeps|"
-    r"was|were|reload|re-run|run|fix|apply)\b",
-    re.IGNORECASE,
-)
-# A structured reply (a list, a heading, code) is an answer, whatever its last line says.
-_STRUCTURED_REPLY_RE = re.compile(r"^\s*(?:[-*\u2022]\s|\d+[.)]\s|#)|```", re.MULTILINE)
-# A preamble is short: a full answer that says "I'll check the logs" in its third bullet is
-# an answer, and nudging it re-asked the question; one that closes with "Let me know if ..."
-# is an answer too. Up to _TOOL_PREAMBLE_SHORT_CHARS any announcing sentence makes one;
-# above it (to the max) only an opening announcement does, or a plan announced before a list.
+# A preamble is short: a long answer that says "I'll check the logs" in its third bullet
+# is an answer. Code is always an answer.
 _TOOL_PREAMBLE_MAX_CHARS = 800
-_TOOL_PREAMBLE_SHORT_CHARS = 300
+# What a nudged model replies, alone, when its reply already was the complete answer: that
+# reply is kept, so a nudge sent by mistake never replaces an answer.
+KEEP_REPLY_MARKER = "KEEP_PREVIOUS_REPLY"
 
 
 def is_tool_preamble(text: str) -> bool:
-    """Whether ``text`` is only an announcement of tool use (``let me pull``, ``I'll
-    check``): a short reply with such a sentence anywhere (``... One moment.`` included),
-    a longer one that opens with it, or a plan announced before a list (``I'll check a few
-    things first:`` then ``1. ...``) -- never one that ends with an offer or a closing
-    (``would you like``, ``let me know``), and never another structured reply. Pure."""
+    """Whether ``text`` may be only an announcement of tool use (``let me pull``, ``I'll
+    check``, ``확인해 보겠습니다``): a reply up to :data:`_TOOL_PREAMBLE_MAX_CHARS` with an
+    announcing sentence or line that is not said for later -- never one that ends with an
+    offer or a closing (``would you like``, ``let me know``), and never one with code. It
+    errs toward True: the nudge it triggers lets the model keep a reply that already was
+    the answer (:data:`KEEP_REPLY_MARKER`). Pure."""
     stripped = (text or "").strip()
-    if not stripped or len(stripped) > _TOOL_PREAMBLE_MAX_CHARS:
+    if not stripped or len(stripped) > _TOOL_PREAMBLE_MAX_CHARS or "```" in stripped:
         return False
-    sentences = [part for part in _SENTENCE_BREAK_RE.split(stripped) if part.strip()]
-    if sentences and _TOOL_OFFER_RE.search(sentences[-1]):
+    units = [
+        part.strip()
+        for line in stripped.splitlines()
+        for part in _SENTENCE_BREAK_RE.split(line)
+        if part.strip()
+    ]
+    if units and _TOOL_OFFER_RE.search(units[-1]):
         return False
-
-    def announces(sentence: str) -> bool:
-        return bool(
-            _TOOL_PREAMBLE_RE.search(sentence) or _NEED_RE.search(sentence)
-        ) and not _LATER_RE.search(sentence)
-
-    def filler(sentence: str) -> bool:
-        return len(sentence.split()) <= 3 or bool(_FILLER_RE.match(sentence.strip()))
-
-    if _STRUCTURED_REPLY_RE.search(stripped):
-        # A plan announced before a list of what it will fetch -- not a list of findings
-        # (values, verdicts, fixes), and never code.
-        if "```" in stripped:
-            return False
-        lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-        lead, items = lines[0], lines[1:]
-        return (
-            lead.endswith(":")
-            and announces(lead)
-            and not any(_FINDING_ITEM_RE.search(re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", item)) for item in items)
+    return any(
+        bool(
+            _TOOL_PREAMBLE_RE.search(unit)
+            or _NEED_RE.search(unit)
+            or _CJK_PREAMBLE_RE.search(unit)
         )
-    # Preamble-only: every sentence announces a look-up or is a courtesy around one; a
-    # sentence of substance makes it an answer, whatever it opens with.
-    return bool(sentences) and all(announces(s) or filler(s) for s in sentences) and any(
-        announces(s) for s in sentences
+        and not _LATER_RE.search(unit)
+        for unit in units
     )
 
 # A tool result handed back to the model: larger than a prompt field (a list of objects is
@@ -2057,6 +2057,7 @@ class AssessmentStrategist:
         ]
         tools_used = False
         nudged = False
+        nudged_reply: Optional[str] = None
         try:
             for round_number in range(max(1, max_rounds)):
                 body = json.dumps(
@@ -2142,6 +2143,7 @@ class AssessmentStrategist:
                     and is_tool_preamble(final)
                 ):
                     nudged = True
+                    nudged_reply = final
                     convo.append({"role": "assistant", "content": content})
                     convo.append(
                         {
@@ -2153,13 +2155,19 @@ class AssessmentStrategist:
                                         "Go ahead now: in THIS reply, CALL the tools you "
                                         "just described to fetch the real data, then give "
                                         "the full answer. Do not reply with only a 'let "
-                                        "me check' preamble."
+                                        "me check' preamble. If your previous reply "
+                                        "already was the complete answer (nothing is "
+                                        f"left to look up), reply with only "
+                                        f"{KEEP_REPLY_MARKER}."
                                     ),
                                 }
                             ],
                         }
                     )
                     continue
+                if nudged_reply is not None and KEEP_REPLY_MARKER in final.upper():
+                    # Nudged by mistake: the model says its first reply was the answer.
+                    final = nudged_reply
                 if not final:
                     err = AiAssistUnavailableError("INVALID_OUTPUT")
                     return ObjectGuidanceOutcome(

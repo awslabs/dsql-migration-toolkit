@@ -1042,7 +1042,9 @@ def test_query_converter_ai_dba_answers_with_the_current_settings(
             sys.modules["nicegui"] = saved
 
     ui.find_button(button).click()
-    assert [kw["scope_id"] for kw in opened] == [scope_id]
+    # A chat per query: the scope id carries the query's key.
+    assert [kw["scope_id"].rsplit(":", 1)[0] for kw in opened] == [scope_id]
+    assert opened[0]["scope_id"] == f"{scope_id}:{qp._query_scope_key(state.result)}"
 
     # On Connect, the operator switches model and profile (and Verify passes) while the
     # chat stays open in the panel; the next send must use them.

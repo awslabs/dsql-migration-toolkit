@@ -263,6 +263,17 @@ def extract_sql_from_reply(markdown: str) -> Optional[str]:
     return None
 
 
+def _query_scope_key(result: QueryConversionResult) -> str:
+    """A short, stable key of the query an AI chat is about (its source and converted
+    text): a chat per query, so a second one is never asked in the first one's thread."""
+    import hashlib
+
+    digest = hashlib.sha256(
+        f"{result.original_sql}\0{result.converted_sql or ''}".encode("utf-8")
+    ).hexdigest()
+    return digest[:12]
+
+
 def _pretty_sql(sql: str) -> str:
     """Pretty-print a SQL statement for readable display, best-effort.
 
@@ -907,7 +918,9 @@ def build_query_playground_screen(
                     "will it run on DSQL, and how would you improve it?"
                 )
                 open_ai_scope(
-                    scope_id="query-converter:review",
+                    # Per query: a second query opens its own conversation (and asks its
+                    # own seed) instead of continuing the first one's.
+                    scope_id=f"query-converter:review:{_query_scope_key(result)}",
                     title="AI DBA",
                     subtitle="Query Converter",
                     chip="Query Converter",
@@ -1029,7 +1042,7 @@ def build_query_playground_screen(
                 # open_scope returns the send(text) callable the "Test rewrite"
                 # follow-up turn drives.
                 sender["send"] = open_ai_scope(
-                    scope_id="query-converter:tune",
+                    scope_id=f"query-converter:tune:{_query_scope_key(result)}",
                     title="AI DBA",
                     subtitle="Query Converter · Aurora DSQL efficiency",
                     chip="Query Converter",

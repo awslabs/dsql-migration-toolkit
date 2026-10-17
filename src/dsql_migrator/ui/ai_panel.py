@@ -210,6 +210,10 @@ def build_ai_panel(
         # sent with this tab's follow-up.
         "scope_id": None,
         "own": {},
+        # The scope THIS tab has open, as an instance: a fresh one each time a scope opens
+        # (the same id reopened later included), re-homes to general, or a journey starts
+        # over. A send a scope handed out asks only while its instance is still open.
+        "scope_token": None,
         # Count of activity events posted while the panel was closed -- shown as a
         # badge on the right-edge reopen tab so an action is noticed even with the
         # panel hidden. Reset to 0 when the panel is opened.
@@ -490,6 +494,10 @@ def build_ai_panel(
             return
         conv["streamer"] = streamer
         active = conversation.active_scope
+        if active is None or active.scope_id != "general" or conv.get("scope_id") != "general":
+            # No scope, or a stale (non-reconstructable) screen scope -> (re)home general:
+            # a new instance, so a send the old scope handed out never asks here.
+            conv["scope_token"] = object()
         if active is None or active.scope_id != "general":
             # No scope, or a stale (non-reconstructable) screen scope -> (re)home general.
             conversation.active_scope = AiScope(
@@ -497,6 +505,7 @@ def build_ai_panel(
             )
             conv["scope_start"] = len(conversation.messages)
             conv["scope_first"] = None
+        conv["scope_id"] = "general"
         try:
             title_label.set_text("AI DBA")  # type: ignore[attr-defined]
             subtitle_label.set_text("")  # type: ignore[attr-defined]
@@ -1024,34 +1033,38 @@ def build_ai_panel(
 
     def _run_pending_seed() -> None:
         """Ask the seed question of the scope opened while a turn was running -- if that
-        scope is still THIS tab's scope (a later scope replaced it otherwise; another
+        scope instance is still THIS tab's (a later scope replaced it otherwise; another
         tab's scope change does not)."""
         pending = conv.pop("pending_seed", None)
-        if pending and conv.get("scope_id") == pending[0]:
-            _run_turn(str(pending[1]), scope_id=pending[0])
+        if pending and conv.get("scope_token") is pending[0]:
+            _run_turn(str(pending[1]), token=pending[0])
 
-    def _run_turn(user_text: str, scope_id: "Optional[str]" = None) -> None:
+    def _run_turn(user_text: str, token: object = None) -> None:
         text = (user_text or "").strip()
-        streamer = conv["streamer"]
-        if not text or streamer is None:
+        if not text:
             return
-        if scope_id is not None and conv.get("scope_id") not in (None, scope_id):
-            # Asked for a scope this tab no longer has open (a re-test that finished
-            # after the operator opened another scope): never asked in the wrong thread.
+        if token is not None and conv.get("scope_token") is not token:
+            # Asked for a scope this tab no longer has open -- a re-test that finished
+            # after the operator opened another scope (or the same one again, in a new
+            # window), re-homed to general, or started over: never asked in the wrong
+            # thread.
             try:
                 ui.notify(  # type: ignore[attr-defined]
-                    "Not sent to the AI DBA: another topic is open in the panel now. "
-                    "Open the earlier topic again to ask it there.",
+                    "Not sent to the AI DBA: the chat it was for is no longer open. Open "
+                    "that chat again and repeat the request there.",
                     type="info",
                 )
             except Exception:  # noqa: BLE001
                 pass
             return
+        streamer = conv["streamer"]
+        if streamer is None:
+            return
         if conv["busy"]:
             # A question asked while a turn streams (the composer guards itself, so this
             # is a programmatic ask: a 'What's next?' re-run) is asked when the turn
             # ends, in the scope it was asked for -- never dropped, never run beside it.
-            target = scope_id or conv.get("scope_id")
+            target = token if token is not None else conv.get("scope_token")
             if target is not None:
                 conv["pending_seed"] = (target, text)
             return
@@ -1441,6 +1454,9 @@ def build_ai_panel(
         conv["footer_visible"] = footer_visible
         active = conversation.active_scope
         is_new_scope = active is None or active.scope_id != scope_id
+        if is_new_scope or conv.get("scope_token") is None or conv.get("scope_id") != scope_id:
+            conv["scope_token"] = object()
+        token = conv["scope_token"]
         if is_new_scope:
             conversation.active_scope = AiScope(
                 scope_id=scope_id, title=title, subtitle=subtitle, chip=chip
@@ -1466,11 +1482,12 @@ def build_ai_panel(
             if was_busy:
                 # Another turn is still streaming: ask this one when it ends (if this scope
                 # is still the open one then), never beside it.
-                conv["pending_seed"] = (scope_id, seed_question)
+                conv["pending_seed"] = (token, seed_question)
             else:
-                _run_turn(seed_question, scope_id=scope_id)
-        # Bound to this scope: a later ask through it (a re-test, a re-run) belongs here.
-        return lambda text: _run_turn(text, scope_id=scope_id)
+                _run_turn(seed_question, token=token)
+        # Bound to this scope instance: a later ask through it (a re-test, a re-run)
+        # belongs here, and nowhere once it is gone.
+        return lambda text: _run_turn(text, token=token)
 
     def set_visible(visible: bool) -> None:
         _set_visible(visible)
@@ -1519,6 +1536,7 @@ def build_ai_panel(
         conv["scope_start"] = 0
         conv["scope_first"] = None
         conv["scope_id"] = None
+        conv["scope_token"] = None  # a send of the old journey never asks in the new one
         conv["own"] = {}
         conv.pop("pending_seed", None)  # a seed of the old journey is never asked
         conv["unseen"] = 0

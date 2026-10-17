@@ -4,6 +4,7 @@ the conversion could not convert."""
 
 from __future__ import annotations
 
+import io
 import json
 import threading
 from types import SimpleNamespace
@@ -30,23 +31,38 @@ def test_a_preamble_that_says_when_it_looks_is_still_a_preamble() -> None:
         assert is_tool_preamble(preamble), preamble
 
 
-def test_an_answer_that_opens_with_an_announcement_is_an_answer() -> None:
-    """A structured reply under 'Let me review…:' was discarded and the question re-asked."""
-    from dsql_migrator.core.assessment_strategist import is_tool_preamble
+def test_an_answer_that_opens_with_an_announcement_is_kept() -> None:
+    """A structured reply under 'Let me review…:' was discarded and the question re-asked.
+    G93: such a reply may be nudged, but the model keeps it (KEEP_PREVIOUS_REPLY) and it
+    is the answer shown -- the nudge never replaces an answer."""
+    from dsql_migrator.core.assessment_strategist import (
+        KEEP_REPLY_MARKER,
+        AssessmentStrategist,
+    )
+    from dsql_migrator.core.models import AiAssistConfig
 
-    for answer in (
+    answer = (
         "Let me review your blockers:\n1. app.orders has 3 missing rows (CHECKSUM mismatch).\n"
-        "2. The DLQ holds 2 records (23505) on app.users.\nReload app.orders, then re-validate.",
-        "Here is what I'll check at cut over:\n- DLQ depth: 0 records\n"
-        "- Validation: 11/11 tables MATCH",
-        "Let me look at the converted DDL:\n```sql\nCREATE TABLE \"app\".\"orders\" (id bigint);\n```\n"
-        "The key keeps generating values.",
-        "Let me look at that. app.orders converts automatically: its int key becomes a bigint "
-        "identity that keeps generating values.",
-        "Your migration has two blockers, and I'll review each with its fix:\n"
-        "1. app.orders has no primary key.\n2. app.users holds a SET column.",
-    ):
-        assert not is_tool_preamble(answer), answer
+        "2. The DLQ holds 2 records (23505) on app.users.\nReload app.orders, then re-validate."
+    )
+
+    class Bedrock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke_model(self, **_kw):  # noqa: ANN003
+            self.calls += 1
+            text = answer if self.calls == 1 else KEEP_REPLY_MARKER
+            out = {"stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}
+            return {"body": io.BytesIO(json.dumps(out).encode())}
+
+    client = Bedrock()
+    outcome = AssessmentStrategist(AiAssistConfig(enabled=True), client=client).tool_chat(
+        "sys", [{"role": "user", "text": "What's blocking me?"}], lambda _d: None,
+        tools=[{"name": "x", "description": "x", "input_schema": {"type": "object", "properties": {}}}],
+        execute=lambda _n, _i: "{}",
+    )
+    assert outcome.available and outcome.markdown == answer and client.calls <= 2
 
 
 def test_a_retest_that_finishes_after_another_scope_opened_is_not_asked_there() -> None:
@@ -76,7 +92,7 @@ def test_a_retest_that_finishes_after_another_scope_opened_is_not_asked_there() 
     texts = [m["text"] for m in state.ai_conversation.messages if m.get("role") == "user"]
     assert not any("RETEST" in t for t in texts)
     assert len(tune_asked) == 1 and len(briefing_asked) == 1
-    assert notices and "another topic" in notices[-1]
+    assert notices and "no longer open" in notices[-1]
 
 
 def test_a_briefing_queued_in_one_tab_survives_another_tabs_scope() -> None:
