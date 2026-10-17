@@ -535,10 +535,9 @@ def edited_statements(script: str) -> list[str]:
 # a one- or two-part name of them. Never a shorter reading of a longer name: a bare part ends
 # at its last name character, a quoted one at its real closing quote, and no further '.' may
 # follow -- ``"shop" . "orders"`` and ``db.shop.orders``, which the applier reads as another
-# name than PostgreSQL creates, name nothing here. A bare part is ASCII only: PostgreSQL folds
-# only A-Z and the applier lower()s every letter, so ``shop.ordersÉ`` (PostgreSQL's
-# "ordersÉ", the applier's "ordersé", which a REPLACE then dropped) names nothing either.
-_IDENT_PART = r'(?:"(?:[^"]|"")+"(?!")|[A-Za-z_][A-Za-z0-9_$]*(?![\w$]))'
+# name than PostgreSQL creates, name nothing here; nor does a bare part the two read apart
+# (:func:`_match_read_alike`).
+_IDENT_PART = r'(?:"(?:[^"]|"")+"(?!")|[A-Za-z_][\w$]*(?![\w$]))'
 _RELATION_NAME = rf"{_IDENT_PART}(?:\.{_IDENT_PART})?(?!\s*\.)"
 _OWN_CREATE_RE = re.compile(
     r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:RECURSIVE\s+(?=VIEW\b))?(TABLE|VIEW)\s+"
@@ -596,6 +595,23 @@ def _names_object(raw_name: str, object_name: str) -> bool:
     return len(parts) == 1 and schema == "public" and parts[0] == name
 
 
+def _match_read_alike(pattern: "re.Pattern[str]", clean: str) -> "Optional[re.Match[str]]":
+    """``pattern``'s match at the start of ``clean``, or ``None`` when PostgreSQL and the
+    core applier read a bare name of it apart. PostgreSQL folds only A-Z and the applier
+    lower()s every letter, so a bare ``shop.ordersÉ`` is PostgreSQL's "ordersÉ" and the
+    applier's "ordersé", which a REPLACE then dropped -- while ``shop.café`` or
+    ``shop.order_주문`` is one name to both."""
+    from dsql_migrator.core.converter import _SQL_PART_RE, fold_identifier
+
+    match = pattern.match(clean)
+    if match is None or any(
+        bare.lower() != fold_identifier(bare)
+        for _quoted, bare in _SQL_PART_RE.findall(match.group(0))
+    ):
+        return None
+    return match
+
+
 def object_statement_role(statement: str, object_name: str) -> "Optional[tuple[str, str]]":
     """``(role, name)`` when ``statement`` is one of ``object_name``'s own: ``("TABLE" |
     "VIEW", "")`` for its CREATE, ``("INDEX", index name)`` for a CREATE INDEX on it,
@@ -603,15 +619,15 @@ def object_statement_role(statement: str, object_name: str) -> "Optional[tuple[s
     PostgreSQL stores it, ``""`` when the statement gives none. ``None`` for anything else
     (a SELECT, another object's statement, a CHECK added by ALTER). Comments are ignored."""
     clean = sql_without_comments(statement).strip()
-    match = _OWN_CREATE_RE.match(clean)
+    match = _match_read_alike(_OWN_CREATE_RE, clean)
     if match is not None:
         return (match.group(1).upper(), "") if _names_object(match.group(2), object_name) else None
-    match = _OWN_INDEX_RE.match(clean)
+    match = _match_read_alike(_OWN_INDEX_RE, clean)
     if match is not None:
         if not _names_object(match.group(2), object_name):
             return None
         return _INDEX_KIND, (_stored_parts(match.group(1))[0] if match.group(1) else "")
-    match = _OWN_FOREIGN_KEY_RE.match(clean)
+    match = _match_read_alike(_OWN_FOREIGN_KEY_RE, clean)
     # The same test the apply paths route a foreign key to the post-load pass by.
     if match is not None and _is_foreign_key_ddl(clean):
         if not _names_object(match.group(1), object_name):
@@ -633,8 +649,10 @@ def object_create_kind(script: str, object_name: str) -> Optional[str]:
 def is_object_scaffolding(statement: str, object_name: str) -> bool:
     """Whether ``statement`` only prepares ``object_name``'s CREATE: the ``CREATE SCHEMA [IF
     NOT EXISTS]`` of its schema (a table's generated script has it, and Schema Apply puts the
-    generated one first for an edit that has none -- :func:`override_apply_objects`) or a
-    ``DROP`` of the object itself (an edit is applied in REPLACE mode, which drops it)."""
+    generated one first for an edit without it -- :func:`override_apply_objects`) or a
+    ``DROP`` of the object itself (an edit is applied in REPLACE mode, which drops it). Each
+    as PostgreSQL reads it: the core applier runs a schema ensure as written, and the DROP
+    is never taken."""
     clean = sql_without_comments(statement).strip()
     match = _OWN_SCHEMA_RE.match(clean)
     if match is not None:
@@ -643,10 +661,6 @@ def is_object_scaffolding(statement: str, object_name: str) -> bool:
     return match is not None and _names_object(match.group(1), object_name)
 
 
-_ALTER_OR_DROP_RE = re.compile(
-    rf"(ALTER|DROP)\s+(TABLE|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?({_RELATION_NAME})",
-    re.IGNORECASE,
-)
 # What may stand between CREATE and the kind it creates: ``CREATE OR REPLACE FUNCTION``,
 # ``CREATE UNIQUE INDEX``, ``CREATE TEMP TABLE``, ``CREATE CONSTRAINT TRIGGER``.
 _CREATE_MODIFIERS = (
@@ -665,36 +679,44 @@ _CREATE_LABEL_RE = re.compile(
     rf"CREATE\s+{_CREATE_MODIFIERS}([A-Za-z]+)(?:\s+IF\s+NOT\s+EXISTS)?(?:\s+({_ANY_NAME}))?",
     re.IGNORECASE,
 )
+_ALTER_OR_DROP_LABEL_RE = re.compile(
+    rf"(ALTER|DROP)\s+(TABLE|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?({_ANY_NAME})",
+    re.IGNORECASE,
+)
 
 
 def statement_label(statement: str) -> str:
     """A statement named for a notice: ``CREATE TABLE shop.order_status`` for a CREATE (its
     modifiers left out: ``CREATE FUNCTION shop.touch`` for a CREATE OR REPLACE FUNCTION;
     ``CREATE INDEX ON shop.customers`` for an unnamed index), ``ALTER TABLE shop.orders`` for
-    an ALTER or DROP, else its leading keyword (``SELECT``), with the next one for ``COMMENT
-    ON`` and its kin. The first two words read 'CREATE OR' for any CREATE OR REPLACE, and
-    the core parser takes an unnamed index's ON for its name."""
+    an ALTER or DROP, else its leading keyword (``SELECT``; a psql ``\\d`` as written), with
+    the next one for ``COMMENT ON`` and its kin. A name is read as written and shown as
+    PostgreSQL stores it, never through the core parser or the identity regexes, which stop
+    short of a name they do not take: ``CREATE TABLE shop.été`` read 'CREATE TABLE shop' and
+    ``DROP TABLE IF EXISTS shop.주문`` 'DROP TABLE if'. The first two words read 'CREATE OR'
+    for any CREATE OR REPLACE, and the core parser takes an unnamed index's ON for its name."""
     clean = sql_without_comments(statement).strip()
     match = _INDEX_LABEL_RE.match(clean)
     if match is not None:
         if match.group(1):
             return f"CREATE INDEX {'.'.join(_stored_parts(match.group(1)))}"
         return f"CREATE INDEX ON {'.'.join(_stored_parts(match.group(2)))}"
-    label, kind = _describe_ddl(clean)
-    if kind is not None:
-        return f"CREATE {label}"
     match = _CREATE_LABEL_RE.match(clean)
     if match is not None:
+        # The kind as the core parser reads it: CREATE MATERIALIZED VIEW.
+        kind = _describe_ddl(clean)[1] or match.group(1).upper()
         name = ".".join(_stored_parts(match.group(2))) if match.group(2) else ""
-        return f"CREATE {match.group(1).upper()} {name}".rstrip()
-    match = _ALTER_OR_DROP_RE.match(clean)
+        return f"CREATE {kind} {name}".rstrip()
+    match = _ALTER_OR_DROP_LABEL_RE.match(clean)
     if match is not None:
         name = ".".join(_stored_parts(match.group(3)))
         return f"{match.group(1)} {match.group(2)} ".upper() + name
     words = clean.split()
     if not words:
         return "a comment"
-    if words[0].upper() in ("ALTER", "CREATE", "DROP", "COMMENT") and len(words) > 1:
+    if words[0].startswith("\\"):
+        return words[0]  # a psql meta-command: \d and \D are two
+    if words[0].upper() in ("ALTER", "CREATE", "DROP", "COMMENT", "START") and len(words) > 1:
         return f"{words[0]} {words[1]}".upper()
     return words[0].upper()
 
@@ -705,11 +727,34 @@ _SQL_TOKEN_RE = re.compile(
 )
 
 
+# What PostgreSQL does when a statement leaves it out, as the unquoted words a restatement may
+# spell it with: an index's btree and a key's ASC; a foreign key's MATCH SIMPLE, NO ACTION --
+# and RESTRICT, which the converter writes as NO ACTION --, NOT DEFERRABLE and INITIALLY
+# IMMEDIATE. (A key's NULLS LAST, NULLS FIRST after DESC, is the other one.)
+_KEY_DEFAULTS = (
+    ("using", "btree"),
+    ("asc",),
+    ("match", "simple"),
+    ("on", "delete", "no", "action"),
+    ("on", "update", "no", "action"),
+    ("on", "delete", "restrict"),
+    ("on", "update", "restrict"),
+    ("not", "deferrable"),
+    ("initially", "immediate"),
+)
+_KEY_DEFAULT_STARTS = frozenset({"nulls", *(default[0] for default in _KEY_DEFAULTS)})
+
+
 def _key_definition(statement: str) -> "tuple[str, ...]":
     """What an index or foreign-key ALTER of an object creates, its name left out, token by
     token as PostgreSQL reads it (a quoted name as written, an unquoted word folded, comments
     and spacing dropped): UNIQUE or not and what follows ``ON <table>`` -- the key list, a
-    predicate -- or what follows ``FOREIGN KEY`` -- the columns, REFERENCES, its actions."""
+    predicate -- or what follows ``FOREIGN KEY`` -- the columns, REFERENCES, its actions.
+
+    PostgreSQL's defaults are left out (:data:`_KEY_DEFAULTS`): an unnamed restatement that
+    spelled out USING btree or ON DELETE NO ACTION matched nothing, and was added beside the
+    statement it restates -- two indexes or constraints on one column. Never more: a changed
+    action or predicate is another definition."""
     from dsql_migrator.core.converter import fold_identifier
 
     clean = sql_without_comments(statement).strip()
@@ -722,12 +767,25 @@ def _key_definition(statement: str) -> "tuple[str, ...]":
         if match is None:
             return ()
         head = ()
-    return head + tuple(
-        token.group("quoted").replace('""', '"') if token.group("quoted") is not None
-        else fold_identifier(token.group(0)) if token.group("word") is not None
-        else token.group(0)
+    tokens = [
+        (token.group("quoted").replace('""', '"'), False) if token.group("quoted") is not None
+        else (fold_identifier(token.group(0)), True) if token.group("word") is not None
+        else (token.group(0), False)
         for token in _SQL_TOKEN_RE.finditer(clean, match.end())
-    )
+    ]
+    kept: "list[tuple[str, bool]]" = []
+    at = 0
+    while at < len(tokens):
+        default: "tuple[str, ...]" = ()
+        if tokens[at][1] and tokens[at][0] in _KEY_DEFAULT_STARTS:
+            # The unquoted words from here: a quoted "asc" is a column.
+            words = tuple(text if bare else None for text, bare in tokens[at : at + 4])
+            nulls = ("nulls", "first" if kept[-1:] == [("desc", True)] else "last")
+            default = next((d for d in (*_KEY_DEFAULTS, nulls) if words[: len(d)] == d), ())
+        if not default:
+            kept.append(tokens[at])
+        at += len(default) or 1
+    return head + tuple(text for text, _bare in kept)
 
 
 def merge_object_ddl(
@@ -744,7 +802,10 @@ def merge_object_ddl(
 
     Of two statements that create the same, the named one stands, and the current one when
     both are: a foreign key is paired with its metadata by its constraint name (the orphan
-    check, a reload's pre-drop), which an unnamed or refolded restatement would lose.
+    check, a reload's pre-drop), which an unnamed or refolded restatement would lose. Only a
+    second copy under the same name goes: one of another name that creates the same -- MySQL
+    keeps two indexes or foreign keys of one definition -- is kept, and said, where it was
+    dropped without a word and no apply path created it.
 
     Returns the script and what was kept that the reply did not give (an index, a foreign
     key, another statement of the script; never its schema ensure) or gave under another
@@ -786,7 +847,7 @@ def merge_object_ddl(
 
     merged: list[str] = []
     kept: list[str] = []
-    placed: set = set()
+    placed: set = set()  # the incoming keys put in, and the names of the pieces put in for them
     for piece, ident in zip(pieces, identities):
         key, stands = None, False
         if ident is not None:
@@ -796,6 +857,10 @@ def merge_object_ddl(
             elif (kind, definition) in incoming:
                 key = (kind, definition)
                 stands = bool(name) or not incoming[key][0]
+                if key in placed and (kind, name) not in placed:
+                    # What an earlier statement stands for, under another name (MySQL keeps
+                    # two indexes or foreign keys of one definition): kept as written.
+                    key = None
         if key is None:
             merged.append(piece)
             said = True
@@ -804,6 +869,8 @@ def merge_object_ddl(
         else:
             merged.append(piece if stands else incoming[key][1])
             placed.add(key)
+            if name:
+                placed.add((kind, name))
             # Kept under its own name where the reply names it otherwise: that is said.
             said = stands and bool(ident[1]) and bool(incoming[key][0])
         label = kept_label(piece, ident) if said else None
@@ -874,10 +941,11 @@ def override_apply_objects(
     a stored edit never replaces the placeholder of tables whose names share a stored
     form (no target DDL can separate them).
 
-    An edit with no ``CREATE SCHEMA`` of its own is applied after the object's generated
-    schema ensure, as Full Load recreates an edited table: a view edit holds only its CREATE
-    VIEW (an AI reply's schema ensure is not taken, a hand-typed one rarely has it), so a
-    view in a schema with no tables failed with "schema does not exist".
+    An edit that does not ensure the object's own schema is applied after the object's
+    generated schema ensure: a view edit holds only its CREATE VIEW (an AI reply's schema
+    ensure is not taken, a hand-typed one rarely has it), so a view in a schema with no
+    tables failed with "schema does not exist" -- as did one whose edit ensures only a
+    helper view's schema, or ``"Reporting"`` for ``reporting``.
     """
     tables = {table.table: table for table in conversion.tables} if conversion else {}
     renames_by_table = conversion.index_renames if conversion else {}
@@ -897,7 +965,11 @@ def override_apply_objects(
             if ddls and renames:
                 ddls = tuple(rename_index_statements(ddls, renames))
             if ddls:
-                if not any(_describe_ddl(ddl)[1] == _SCHEMA_KIND for ddl in ddls):
+                if not any(
+                    _describe_ddl(ddl)[1] == _SCHEMA_KIND
+                    and is_object_scaffolding(ddl, obj.object_name)
+                    for ddl in ddls
+                ):
                     ddls = (
                         *(ddl for ddl in obj.ddls if _describe_ddl(ddl)[1] == _SCHEMA_KIND),
                         *ddls,
@@ -1789,7 +1861,9 @@ def split_sql_statements(text: str) -> list[str]:
 
 # A line that starts a statement of its own. A WITH only as a CTE list (``WITH x AS (``),
 # never ``WITH (fillfactor = 70)`` or ``WITH CHECK OPTION``; an ALTER / DROP / CREATE only of
-# an object kind, never the ``ALTER COLUMN`` / ``DROP CONSTRAINT`` action of an ALTER TABLE.
+# an object kind, never the ``ALTER COLUMN`` / ``DROP CONSTRAINT`` action of an ALTER TABLE;
+# a psql meta-command (``\d``); and the statements no other one goes on with at a line's
+# start (ANALYZE, COMMIT, START TRANSACTION, ...).
 _KIND_WORDS = (
     r"(?:TABLE|VIEW|INDEX|SCHEMA|SEQUENCE|FUNCTION|PROCEDURE|TRIGGER|TYPE|DOMAIN|EXTENSION"
     r"|ROLE|USER|POLICY|RULE|DATABASE)"
@@ -1799,26 +1873,47 @@ _CTE_HEAD = (
     r"AS\s*(?:(?:NOT\s+)?MATERIALIZED\s*)?\("
 )
 _STATEMENT_START_RE = re.compile(
-    r"(?:SELECT|UPDATE|GRANT|EXPLAIN|INSERT\s+INTO|DELETE\s+FROM|COMMENT\s+ON"
-    rf"|(?:CREATE\s+{_CREATE_MODIFIERS}|ALTER\s+|DROP\s+){_KIND_WORDS})(?![\w$])|{_CTE_HEAD}",
+    r"(?:SELECT|UPDATE|GRANT|REVOKE|EXPLAIN|ANALYZE|VACUUM|SHOW|TRUNCATE|CALL|REFRESH|COMMIT"
+    r"|ROLLBACK|INSERT\s+INTO|DELETE\s+FROM|MERGE\s+INTO|COMMENT\s+ON|START\s+TRANSACTION"
+    rf"|(?:CREATE\s+{_CREATE_MODIFIERS}|ALTER\s+|DROP\s+){_KIND_WORDS})(?![\w$])|{_CTE_HEAD}|\\",
     re.IGNORECASE,
 )
+# A line that starts a statement of its own only after one that cannot go on with it. BEGIN,
+# SET, VALUES, TABLE and DO also go on a function (BEGIN ATOMIC, SET search_path, RETURNS
+# TABLE), an UPDATE (SET), an INSERT (VALUES, ON CONFLICT ... DO) or a rule (DO INSTEAD), so
+# they are cut only after the object's own CREATE TABLE, VIEW or INDEX or foreign key, which
+# takes none of them -- but the SET of a foreign key's ON DELETE / ON UPDATE, or of an ALTER
+# COLUMN in its ALTER TABLE. END also ends a CASE: it is cut once every CASE has its END.
+_CLAUSE_START_RE = re.compile(r"(?:END|BEGIN|SET|VALUES|TABLE|DO)(?![\w$])", re.IGNORECASE)
+_OWN_STATEMENT_HEAD_RE = re.compile(
+    rf"CREATE\s+{_CREATE_MODIFIERS}(?:TABLE|VIEW|INDEX)(?![\w$])", re.IGNORECASE
+)
+_TAKES_SET_RE = re.compile(
+    rf"(?:ON\s+(?:DELETE|UPDATE)|ALTER\s+(?:COLUMN\s+)?{_ANY_NAME_PART})$", re.IGNORECASE
+)
+_CASE_OR_END_RE = re.compile(r"(?<![\w$])(CASE|END)(?![\w$])", re.IGNORECASE)
 # The last word or sign of a statement that goes on with the next line's SELECT, INSERT, ...:
 # a view's AS, a set operator, a rule's DO [INSTEAD], a MERGE's THEN, a trigger's BEFORE /
-# OR events, FOR UPDATE, ON UPDATE of a foreign key, a list's comma.
+# OR events, FOR UPDATE, ON UPDATE of a foreign key, a list's comma, a GRANT's or REVOKE's
+# privilege, a clause still without what it takes -- ``AS SELECT`` then a column named update
+# on the next line, which was cut off and left a view of no columns.
 _GOES_ON_RE = re.compile(
     r"(?:(?<![\w$])(?:AS|UNION|INTERSECT|EXCEPT|ALL|DISTINCT|DO|INSTEAD|ALSO|THEN|ELSE|BEFORE"
-    r"|AFTER|OF|OR|AND|NOT|FOR|ON|IN|IS|BY|BEGIN|ATOMIC|EXPLAIN|ANALYZE|VERBOSE|GRANT)"
+    r"|AFTER|OF|OR|AND|NOT|FOR|ON|IN|IS|BY|BEGIN|ATOMIC|EXPLAIN|ANALYZE|VERBOSE|GRANT|REVOKE"
+    r"|SELECT|FROM|WHERE|JOIN|HAVING|SET|RETURNING|INTO|USING|WHEN|CASE)"
     r"|[,(=<>+\-*/|:])$",
     re.IGNORECASE,
 )
 # A head still waiting for what the next line starts: an ALTER's action (``ALTER TABLE t`` /
-# ``ALTER type SET NOT NULL``, COLUMN left out), an INSERT's query, what an EXPLAIN explains.
+# ``ALTER type SET NOT NULL``, COLUMN left out), an INSERT's query, what an EXPLAIN explains,
+# the GRANT or REVOKE of an ALTER DEFAULT PRIVILEGES.
 _OPEN_HEAD_RE = re.compile(
     rf"ALTER\s+(?:MATERIALIZED\s+|FOREIGN\s+)?\w+\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{_ANY_NAME}"
     rf"|INSERT\s+INTO\s+{_ANY_NAME}(?:\s+AS\s+{_ANY_NAME_PART})?(?:\s*\(\s*\))?"
     r"(?:\s+OVERRIDING\s+\w+\s+VALUE)?"
-    r"|EXPLAIN(?:\s+(?:ANALYZE|VERBOSE))*(?:\s*\(\s*\))?",
+    r"|EXPLAIN(?:\s+(?:ANALYZE|VERBOSE))*(?:\s*\(\s*\))?"
+    rf"|ALTER\s+DEFAULT\s+PRIVILEGES(?:\s+(?:FOR\s+(?:ROLE|USER)|IN\s+SCHEMA)\s+{_ANY_NAME}"
+    rf"(?:\s*,\s*{_ANY_NAME})*)*",
     re.IGNORECASE,
 )
 _CTE_HEAD_RE = re.compile(rf"(?<![\w$]){_CTE_HEAD}", re.IGNORECASE)
@@ -1863,6 +1958,18 @@ def _statement_level(statement: str) -> "tuple[str, list[int]]":
     return "".join(out), starts
 
 
+def _takes_clause(word: str, before: str) -> bool:
+    """Whether ``before``, a statement's text so far, goes on with a line that starts with
+    ``word`` (:data:`_CLAUSE_START_RE`)."""
+    word = word.upper()
+    if word == "END":
+        ends = [found.upper() for found in _CASE_OR_END_RE.findall(before)]
+        return ends.count("CASE") > ends.count("END")
+    if word == "SET" and _TAKES_SET_RE.search(before):
+        return True
+    return not (_OWN_STATEMENT_HEAD_RE.match(before.lstrip()) or _is_foreign_key_ddl(before))
+
+
 def split_glued_statements(statement: str) -> list[str]:
     """``statement`` -- one ``;``-split statement of an AI reply -- cut where a line starts a
     statement of its own. A statement that lost its ``;`` ran into the next one, and the
@@ -1871,18 +1978,21 @@ def split_glued_statements(statement: str) -> list[str]:
 
     A line is a cut only at the statement's own level (outside brackets, literals and
     comments), and only when what comes before it is whole: not a view's ``AS``, a set
-    operator, the CTE list of the query that follows, an ALTER still without its action, and
-    the like. A comment just above the line goes with it."""
+    operator, the CTE list of the query that follows, an ALTER still without its action, a
+    SELECT still without its columns, and the like. A comment just above the line goes with
+    it."""
     level, starts = _statement_level(statement)
     cuts: list[int] = []
     begin = 0
     for start in starts:
         head = _INDENT_RE.match(level, start).end()
-        if not _STATEMENT_START_RE.match(level, head):
+        clause = _CLAUSE_START_RE.match(level, head)
+        if clause is None and not _STATEMENT_START_RE.match(level, head):
             continue
         before = level[begin:head].rstrip()
         if (
             not before.strip()
+            or (clause is not None and _takes_clause(clause.group(0), before))
             or _GOES_ON_RE.search(before[-16:])
             or _OPEN_HEAD_RE.fullmatch(before.strip())
         ):
