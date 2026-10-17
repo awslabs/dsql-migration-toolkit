@@ -2700,7 +2700,8 @@ def test_filters_and_the_name_search_redraw_only_the_object_list() -> None:
     _render_assessment(ui, report, eval_state=state)
     assert "320 objects" in ui.texts
     ((_box, on_name, placeholder),) = ui.inputs
-    assert placeholder == "Filter objects by name"  # Schema Conversion's wording
+    # Schema Conversion's wording, plus the rules it now also matches.
+    assert placeholder == "Filter by object name or rule (e.g. BYTEA_KEY)"
 
     rendered = ui.created
     ui.selects["Classification"](_Changed("UNSUPPORTED"))
@@ -3013,3 +3014,44 @@ def test_a_refresh_never_overwrites_a_newer_evaluation() -> None:
     assert state.result is newer
     assert set_result_if_unchanged(state, newer, refreshed) is True
     assert state.result is refreshed
+
+
+def test_the_search_matches_a_rule_and_the_conflict_badges_are_bounded() -> None:
+    """One fix (re-key a bytea PK, accept a collation) often applies across many tables,
+    and there was no way to list them; a target holding 1,000 of the tables drew 1,000
+    conflict badges."""
+    from dsql_migrator.core.models import AssessmentConcern, AssessmentItem
+    from dsql_migrator.ui.evaluation import TARGET_CONFLICT_BADGES, filter_assessment_items
+
+    def item(name: str, rule: str) -> AssessmentItem:
+        return AssessmentItem(
+            object_name=name,
+            rule_id=rule,
+            classification=Classification.MANUAL,
+            risk="r",
+            recommendation="x",
+            effort=EffortLevel.SIMPLE,
+            concerns=[AssessmentConcern(
+                rule_id=rule, classification=Classification.MANUAL, risk="r",
+                recommendation="x", effort=EffortLevel.SIMPLE,
+            )],
+        )
+
+    items = [item("app.orders", "BYTEA_KEY"), item("app.users", "CI_COLLATION")]
+    assert [i.object_name for i in filter_assessment_items(items, name="bytea_key")] == ["app.orders"]
+    assert [i.object_name for i in filter_assessment_items(items, name="users")] == ["app.users"]
+
+    from dsql_migrator.core.models import AssessmentReport, SourceInventory
+    from dsql_migrator.ui.evaluation import _render_target
+
+    names = [f"app.t{i}" for i in range(TARGET_CONFLICT_BADGES + 5)]
+    result = EvaluationResult(
+        inventory=SourceInventory(tables=[]),
+        assessment=AssessmentReport(items=[]),
+        target_inventory=_empty_target(),
+        target_conflicts=names,
+    )
+    ui = _ItemUi()
+    _render_target(ui, result)
+    assert "app.t0" in ui.texts and f"app.t{TARGET_CONFLICT_BADGES}" not in ui.texts
+    assert any("and 5 more" in text for text in ui.texts)

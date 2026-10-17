@@ -1486,6 +1486,15 @@ class NameCollisionRule(Rule):
         return findings
 
 
+# Two or more columns that can each hold up to their own limit can, together, exceed the
+# row limit -- which the per-column SOURCE_VALUE_SIZE probe cannot see.
+OVERSIZED_ROW_SENTENCE = (
+    " Together they can also exceed Aurora DSQL's 2 MiB row limit (maximum row size "
+    "exceeded) while each value fits its own limit, which the per-column size probe cannot "
+    "see: check the combined size of the widest rows before loading."
+)
+
+
 class OversizedLobRule(Rule):
     """Flag columns whose MySQL LOB/TEXT or JSON type can exceed the DSQL 1 MiB limit."""
 
@@ -1521,6 +1530,7 @@ class OversizedLobRule(Rule):
                             "the CDC message limit (4 MiB by default; an UPDATE carries "
                             "the value twice) is not dead-lettered: it stops CDC for "
                             "every table until the column is excluded at capture."
+                            + (OVERSIZED_ROW_SENTENCE if len(columns) > 1 else "")
                         ),
                         # "Confirm no value exceeds 1 MiB" was homework the tool can now
                         # do: the Data Migration prerequisite checks probe each column

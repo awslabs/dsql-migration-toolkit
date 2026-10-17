@@ -489,6 +489,7 @@ class PgOversizedLobRule(Rule):
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
         from dsql_migrator.core.assessor import (
+            OVERSIZED_ROW_SENTENCE,
             pg_lob_is_deliberately_large,
             pg_oversized_lob_column_names,
         )
@@ -588,6 +589,11 @@ class PgOversizedLobRule(Rule):
                             "change event larger than the CDC message limit (4 MiB by "
                             "default) is not dead-lettered: it stops CDC for every table "
                             "until the column is excluded at capture."
+                            + (
+                                OVERSIZED_ROW_SENTENCE
+                                if note_kind is ConversionNoteKind.LOSS and len(names) > 1
+                                else ""
+                            )
                         ),
                         recommendation=(
                             "Run the Data Migration prerequisite checks: they probe each "

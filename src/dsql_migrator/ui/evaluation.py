@@ -779,7 +779,9 @@ def filter_assessment_items(
     ``AUTO`` objects carry no effort, selecting a specific effort naturally
     excludes them. ``name`` keeps the objects whose name contains it, ignoring case and
     surrounding spaces -- the rule Schema Conversion's "Filter objects by name" box
-    applies to its tree. Order is preserved, so callers can sort first and filter after.
+    applies to its tree -- or that carry a finding whose rule id contains it (BYTEA_KEY,
+    collation): one fix often applies across many tables. Order is preserved, so callers
+    can sort first and filter after.
     """
     from dsql_migrator.core.models import Classification, EffortLevel
 
@@ -800,7 +802,10 @@ def filter_assessment_items(
             return False
         if effort_target is not None and item.effort != effort_target:
             return False
-        if needle and needle not in item.object_name.lower():
+        if needle and needle not in item.object_name.lower() and not any(
+            needle in (concern.rule_id or "").lower()
+            for concern in (item.concerns or ())
+        ) and needle not in (item.rule_id or "").lower():
             return False
         return True
 
@@ -811,6 +816,9 @@ def filter_assessment_items(
 # of its objects, most critical first, so the screen builds a bounded number of elements
 # however large the source is (the exports still list every object).
 OBJECTS_PER_PAGE = 50
+
+# Target name-conflict badges drawn before "and N more".
+TARGET_CONFLICT_BADGES = 20
 
 
 def assessment_page(
@@ -2724,7 +2732,7 @@ def _render_assessment(
             )
             controls["name"] = filter_input(
                 ui,
-                placeholder="Filter objects by name",
+                placeholder="Filter by object name or rule (e.g. BYTEA_KEY)",
                 value=view.name_filter,
                 on_change=on_name,
             )
@@ -3279,9 +3287,17 @@ def _render_target(
                 "the target and may conflict when applying converted DDL:"
             ),
         )
+        # Bounded like the object list: a target that already holds 1,000 of the tables
+        # drew 1,000 badges. The exports list every one.
+        shown = result.target_conflicts[:TARGET_CONFLICT_BADGES]
         with ui.row().classes("items-center gap-1 flex-wrap"):  # type: ignore[attr-defined]
-            for name in result.target_conflicts:
+            for name in shown:
                 ui.badge(name).props("color=amber-7 outline")  # type: ignore[attr-defined]
+            if len(result.target_conflicts) > len(shown):
+                ui.label(  # type: ignore[attr-defined]
+                    f"and {len(result.target_conflicts) - len(shown):,} more (every one is "
+                    "in the exported report)"
+                ).classes("text-xs text-gray-500")
         ui.label(  # type: ignore[attr-defined]
             "Resolve these in Schema Conversion: choose SKIP (keep the existing "
             "object) or REPLACE (recreate it) when you apply."

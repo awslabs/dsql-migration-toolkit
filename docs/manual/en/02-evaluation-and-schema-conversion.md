@@ -165,8 +165,9 @@ per effort level — your at-a-glance picture of how migratable the schema is.
 On screen, the list shows the objects by kind, most critical first. A kind with work to
 do opens on its own; each kind shows 50 objects at a time with a page control, and an
 object's risks and recommendations appear when you expand its row. The
-**Classification** and **Estimated manual effort** filters and the **Filter objects by
-name** box narrow the list. The HTML, JSON and Text exports always list every object, and each
+**Classification** and **Estimated manual effort** filters and the search box narrow the
+list; the box matches an object name or a finding's rule (type `BYTEA_KEY` to list every
+table one fix applies to). The HTML, JSON and Text exports always list every object, and each
 opens with what it describes: the source (engine and address, never a credential), the target
 endpoint, when it was exported (and when the assessment ran, for a run made since the app last
 started), the tool version, the readiness band with
