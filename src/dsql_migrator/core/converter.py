@@ -7573,9 +7573,25 @@ class _MySqlViewDialect(_SqlglotMySQL):
       the string of INTERVAL '1.5' DAY, which MySQL counts otherwise.
     * A comma join is marked as one: sqlglot builds the same node for a JOIN without ON,
       which binds as JOIN does.
+    * ``%`` / MOD bind as ``*`` and ``/`` do, left to right: sqlglot binds them as ``+``
+      and ``-``, so ``a % 3 / 7`` read as ``a % (3 / 7)`` and ``a + b % c`` as ``(a + b) %
+      c`` (MySQL stores a view's parentheses, so only a statement read otherwise).
+    * ``TIMESTAMP '...'`` is a DATETIME, no time zone: sqlglot reads MySQL's TIMESTAMP as
+      the zoned column type. One with a UTC offset ('... 10:00:00+05:00') is the session's
+      wall clock at that instant.
     Written back as MySQL (the Schema Conversion source pane), each reads as it did."""
 
     class Parser(_SqlglotMySQL.Parser):
+        TERM = {token: node for token, node in _SqlglotMySQL.Parser.TERM.items() if token != TokenType.MOD}
+        FACTOR = {**_SqlglotMySQL.Parser.FACTOR, TokenType.MOD: exp.Mod}
+        TYPE_LITERAL_PARSERS = {
+            **_SqlglotMySQL.Parser.TYPE_LITERAL_PARSERS,
+            exp.DataType.Type.TIMESTAMPTZ: lambda self, this, _: self.expression(exp.Cast(
+                this=exp.Cast(this=this, to=exp.DataType.build("TIMESTAMPTZ"))
+                if _DATETIME_OFFSET_RE.search(this.name) else this,
+                to=exp.DataType.build("DATETIME"),
+            )),
+        }
         FUNCTIONS = {
             **_SqlglotMySQL.Parser.FUNCTIONS,
             "VARIANCE": exp.VariancePop.from_arg_list,
@@ -7806,6 +7822,8 @@ def _format_leaves(node: exp.Expression) -> "list[exp.Expression]":
 
 
 _UTC_OFFSET_RE = re.compile(r"^[+-]\d{1,2}:\d{2}$")
+# A MySQL datetime literal's UTC offset (8.0.19+: '2024-01-31 10:00:00+05:00').
+_DATETIME_OFFSET_RE = re.compile(r"\d:\d\d(?::\d\d(?:\.\d*)?)?[+-]\d\d:\d\d\s*$")
 # UTC_DATE / UTC_TIMESTAMP / UTC_TIME, for the classes this sqlglot has.
 _UTC_CLOCKS: "tuple[type, ...]" = tuple(_node_names(UtcDate="", UtcTimestamp="", UtcTime=""))
 # NOW()'s synonyms as sqlglot reads them from a statement (a view stores each as now()).
@@ -7837,13 +7855,31 @@ _NULL_STRICT = (
     exp.Paren, exp.Neg, exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv, exp.Abs,
     exp.Round, exp.Trunc, exp.Floor, exp.Ceil, exp.Concat,
 )
-# The operations that read their operands as numbers -- a TINYINT(1) there is its integer.
-_NUMERIC_OPERATIONS = (
-    exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv, exp.Neg, exp.Abs,
-    exp.Sum, exp.Avg, exp.Min, exp.Max,
+# The aggregates that read their argument as a number.
+_NUMERIC_AGGREGATES = (
+    exp.Sum, exp.Avg, exp.Min, exp.Max, exp.Stddev, exp.StddevPop, exp.StddevSamp, exp.Variance,
+    exp.VariancePop,
 )
-# The deepest a typing read walks into an expression: a deeper one (a generated chain of
-# thousands of operators) is of unknown kind -- each level is a Python frame.
+# The operations that read their operands as numbers -- a TINYINT(1) there is its integer:
+# arithmetic, the bitwise operators (not ~, MySQL's 64-bit unsigned NOT), the numeric
+# functions and aggregates.
+_NUMERIC_OPERATIONS = (
+    exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv, exp.Neg, exp.BitwiseAnd, exp.BitwiseOr,
+    exp.BitwiseXor, exp.BitwiseLeftShift, exp.BitwiseRightShift, exp.Abs, exp.Round, exp.Trunc,
+    exp.Floor, exp.Ceil, exp.Sign, exp.Pow, exp.Sqrt, exp.Exp, exp.Ln, exp.Log, *_NUMERIC_AGGREGATES,
+)
+# What a left-deep chain of thousands of operators (a + b + c is ((a + b) + c)) is made of:
+# the typing reads walk one in a loop, not a Python frame per operator.
+_CHAINED = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
+# MySQL's window functions that return a row's value of their argument.
+_VALUE_WINDOW_FUNCTIONS = (exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.NthValue)
+# The nodes whose value has their argument's scale, and carries its quotient: -x, SUM, MIN /
+# MAX, ANY_VALUE, ABS, NULLIF, a window, a window's row value.
+_ARGUMENT_SCALED = (
+    exp.Neg, exp.Sum, exp.Min, exp.Max, exp.AnyValue, exp.Abs, exp.Nullif, exp.Window, *_VALUE_WINDOW_FUNCTIONS,
+)
+# The deepest a typing read walks into an expression: a deeper one is of unknown kind, and
+# reported -- each level is a Python frame (a chain of operators is walked in a loop).
 _MAX_TYPED_DEPTH = 200
 # How many GREATEST / LEAST nests may sit inside each other behind a node that is not
 # NULL-strict (IFNULL, IF, CASE, a function): each such level copies the inner nest into
@@ -8867,13 +8903,15 @@ def _rewrite_mysql_calls(
     column_type: "Optional[Callable[[exp.Expression], Optional[str]]]" = None,
     *,
     view: bool = False,
+    materialized: bool = False,
 ) -> "tuple[list[str], list[str], list[str]]":
     """Rewrite in place the MySQL calls sqlglot writes wrongly for PostgreSQL, and return
     ``(untranslated, misformatted, issues)`` -- the calls left that fail on Aurora DSQL,
     the date formats with a specifier it has no pattern for (the result is different
     text), and what else cannot be written faithfully (one sentence each). ``view``: the
     body of a view, whose outputs MySQL shows at their scale only where it materializes
-    the view -- else they are computed in the query that reads it.
+    the view -- else they are computed in the query that reads it; ``materialized``: one
+    MySQL materializes whatever its body (ALGORITHM=TEMPTABLE).
 
     A rewrite that depends on what a value holds reads it from the value's static kind
     (:func:`_mysql_kind`): a column's type where ``column_type`` knows it (a view over the
@@ -8904,9 +8942,12 @@ def _rewrite_mysql_calls(
     * MySQL's exact division (integers and decimals) -> numeric with the digits MySQL
       keeps, truncated, shown at its scale (the dividend's plus 4) where MySQL shows it --
       a statement's output, a text, a view or derived table MySQL materializes -- AVG of
-      an exact value likewise; SUM of a FLOAT in double precision; ROUND / TRUNCATE(x, d)
-      of a FLOAT / DOUBLE in double precision as MySQL computes it, of an integer the
-      integer; a TINYINT(1) used as a number as its integer;
+      an exact value as the same division of its SUM by its COUNT, and % / MOD / DIV by 0
+      NULL as MySQL's; a FLOAT in double precision (its SUM, real * real); ROUND /
+      TRUNCATE(x, d) of a FLOAT / DOUBLE in double precision as MySQL computes it, of an
+      integer the integer; a TINYINT(1) or a comparison read as a number as its integer, a
+      number assigned to a TINYINT(1) as a boolean; INTERVAL x unit + d as d + INTERVAL x
+      unit;
     * GROUP_CONCAT(x) -> STRING_AGG over text, and with DISTINCT x ORDER BY x ->
       ARRAY_TO_STRING(ARRAY_AGG(DISTINCT x ORDER BY x) FILTER (WHERE x IS NOT NULL));
     * CONCAT_WS skipping NULLs as MySQL does, GREATEST/LEAST returning NULL for a NULL
@@ -8996,16 +9037,20 @@ def _rewrite_mysql_calls(
                 hit = resolved[id(node)] = (node, resolve_type(node))
             return hit[1]
 
-    # How deep the typing reads below are nested (a Python frame or two each).
+    # How deep the typing reads below are nested (a Python frame or two each), and whether
+    # one gave up (reported).
     reading = [0]
+    too_deep = [False]
 
     def bounded(read: "Callable[[Any], Any]") -> "Callable[[Any], Any]":
         """``read`` -- a typing read, recursive over an expression -- of unknown result
-        (None) past _MAX_TYPED_DEPTH nested reads: a generated chain of thousands of
-        operators is a value of unknown type, not a RecursionError."""
+        (None) past _MAX_TYPED_DEPTH nested reads: a value nested that deep is of unknown
+        type, not a RecursionError -- and reported, MySQL's exact arithmetic not applied to
+        it. (A chain of operators is walked in a loop: :func:`chain`.)"""
 
         def guarded(node: Any) -> Any:
             if reading[0] >= _MAX_TYPED_DEPTH:
+                too_deep[0] = True
                 return None
             reading[0] += 1
             try:
@@ -9014,6 +9059,20 @@ def _rewrite_mysql_calls(
                 reading[0] -= 1
 
         return guarded
+
+    def chain(node: exp.Expression, types: "tuple[type, ...]") -> "tuple[list[exp.Expression], exp.Expression]":
+        """The operators of ``types`` down the left of a chain from ``node`` (a + b + c is
+        ((a + b) + c)), outermost first, and the operand it starts from -- a chain of
+        thousands of operators is read in a loop. A quotient already written and date
+        arithmetic end it."""
+        operators: list = []
+        while True:
+            while isinstance(node, exp.Paren):
+                node = node.this
+            if not isinstance(node, types) or _QUOTIENT_SCALE in node.meta or interval_of(node) is not None:
+                return operators, node
+            operators.append(node)
+            node = node.this
 
     # The kinds of the choices a pass has written (each its own once, however deep they
     # nest), while that pass runs.
@@ -9064,35 +9123,43 @@ def _rewrite_mysql_calls(
                 "TO_CHAR": "text", "CONVERT_FROM": "text", "ARRAY_TO_STRING": "text",
                 "CONVERT_TO": "binary", "JSON_BUILD_ARRAY": "json", "JSON_AGG": "json",
                 "JSON_ARRAY": "json", "JSON_ARRAYAGG": "json", "LOCALTIMESTAMP": "datetime",
-                "TO_DAYS": "integer", "OCTET_LENGTH": "integer",
+                "TO_DAYS": "integer", "OCTET_LENGTH": "integer", "ORD": "integer", "CRC32": "integer",
             }.get(name)
         if isinstance(node, (exp.JSONExtract, exp.JSONObject)):
             return "json"
         if isinstance(node, (exp.JSONExtractScalar, exp.JSONBExtractScalar)):
             return "text"
-        if isinstance(node, (exp.Add, exp.Sub, exp.DateAdd, exp.DateSub)):
-            if interval_of(node) is not None:
-                base = kind_of(node.this)
-                if base == "date" or (base == "text" and _is_date_literal(node.this)):
-                    return "date" if interval_unit(node) in _DATE_UNITS else "datetime"
-                if base == "text" and isinstance(node.this, exp.Literal):
-                    return "datetime"
-                return base if base in ("datetime", "timestamp") else None
-            if isinstance(node, (exp.Add, exp.Sub)):
-                return combine(kind_of(node.this), kind_of(node.expression))
-        if isinstance(node, (exp.Mul, exp.Mod)):
-            return combine(kind_of(node.this), kind_of(node.expression))
-        if isinstance(node, exp.Div):
-            # A DOUBLE when an operand is one; of exact operands MySQL's exact division (a
-            # pass below writes it, and marks it -- a derived table's column may be typed
-            # before); of operands not typed it may well be exact in MySQL (rounded,
-            # truncated or made UNSIGNED in numeric, as one).
-            kinds = {kind_of(node.this), kind_of(node.expression)}
-            return "float8" if kinds & _FLOAT_KINDS else "decimal" if kinds <= _EXACT_KINDS else None
+        if isinstance(node, (exp.Add, exp.Sub, exp.DateAdd, exp.DateSub)) and interval_of(node) is not None:
+            base = kind_of(node.this)
+            if base == "date" or (base == "text" and _is_date_literal(node.this)):
+                return "date" if interval_unit(node) in _DATE_UNITS else "datetime"
+            if base == "text" and isinstance(node.this, exp.Literal):
+                return "datetime"
+            return base if base in ("datetime", "timestamp") else None
+        if isinstance(node, _CHAINED):
+            operators, start = chain(node, _CHAINED)
+            kind = kind_of(start)
+            for operator in reversed(operators):
+                right = kind_of(operator.expression)
+                if not isinstance(operator, exp.Div):
+                    kind = combine(kind, right)
+                    continue
+                # A DOUBLE when an operand is one; of exact operands MySQL's exact division
+                # (a pass below writes it, and marks it -- a derived table's column may be
+                # typed before); of operands not typed it may well be exact in MySQL
+                # (rounded, truncated or made UNSIGNED in numeric, as one).
+                kinds = {kind, right}
+                kind = "float8" if kinds & _FLOAT_KINDS else "decimal" if kinds <= _EXACT_KINDS else None
+            return kind
         if isinstance(node, exp.Neg):
             return kind_of(node.this)
-        if isinstance(node, (exp.Count, exp.Length, exp.DateDiff, exp.Extract, exp.IntDiv, *_INTEGER_NODES)):
+        if isinstance(node, (
+            exp.Count, exp.Length, exp.DateDiff, exp.Extract, exp.IntDiv, exp.Sign, exp.StrPosition,
+            exp.Ascii, exp.BitwiseCount, *_INTEGER_NODES,
+        )):
             return "integer"
+        if isinstance(node, _VALUE_WINDOW_FUNCTIONS):
+            return kind_of(node.this)  # LAG(x) / FIRST_VALUE(x) ... OVER: an x
         if isinstance(node, exp.Sum):
             kind = kind_of(_aggregated(node))  # a REAL's is summed in double precision, as MySQL's (below)
             return "float8" if kind == "float4" else kind if kind in _NUMERIC_KINDS else None
@@ -9219,17 +9286,35 @@ def _rewrite_mysql_calls(
             params = to.expressions
             scale = int(params[1].name) if len(params) > 1 and params[1].name.isdigit() else 0
             return scale, scale
-        if isinstance(node, (exp.Neg, exp.Sum, exp.Min, exp.Max, exp.AnyValue, exp.Abs, exp.Nullif, exp.Window)):
+        if isinstance(node, _ARGUMENT_SCALED):
             return scales(_aggregated(node))
         if isinstance(node, exp.Subquery):
             projection = _scalar_projection(node)
             return scales(projection) if projection is not None else None
-        if isinstance(node, (exp.Avg, exp.Div)):
+        if isinstance(node, exp.Avg):
             dividend = scales(_aggregated(node))
-            divisor = (0, 0) if isinstance(node, exp.Avg) else scales(node.expression)
-            if dividend is None or divisor is None:
-                return None
-            return min(dividend[0] + 4, 30), _mysql_quotient_digits(dividend[1], divisor[1])
+            return None if dividend is None else (min(dividend[0] + 4, 30), _mysql_quotient_digits(dividend[1], 0))
+        if isinstance(node, (exp.Add, exp.Sub)) and interval_of(node) is not None:
+            return None  # a date
+        if isinstance(node, _CHAINED):
+            operators, start = chain(node, _CHAINED)
+            # A NULL operand (x + NULL) is left out of a sum or a product: () here.
+            value = () if isinstance(start, exp.Null) else scales(start)
+            for operator in reversed(operators):
+                right = () if isinstance(operator.expression, exp.Null) else scales(operator.expression)
+                if isinstance(operator, exp.Div):
+                    if not value or not right:
+                        return None
+                    value = min(value[0] + 4, 30), _mysql_quotient_digits(value[1], right[1])
+                    continue
+                found = [s for s in (value, right) if s != ()]
+                if not found or None in found:
+                    return None
+                if isinstance(operator, exp.Mul):
+                    value = min(sum(s[0] for s in found), 30), min(sum(s[1] for s in found), 30)
+                else:
+                    value = max(s[0] for s in found), max(s[1] for s in found)
+            return value or None
         if isinstance(node, (exp.Round, exp.Trunc)):
             decimals = node.args.get("decimals")
             inner = scales(node.this)
@@ -9239,9 +9324,7 @@ def _rewrite_mysql_calls(
             # MySQL rounds to no more places than the value shows: ROUND(2 / 3, 9) is 0.6667.
             return None if places is None else (max(0, min(places, inner[0])),) * 2
         branches: "list[Optional[exp.Expression]]" = []
-        if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Mod)):
-            branches = [node.this, node.expression]
-        elif isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
+        if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
             branches = [node.this, *node.expressions]
         elif isinstance(node, exp.If):
             branches = [node.args.get("true"), node.args.get("false")]
@@ -9252,8 +9335,6 @@ def _rewrite_mysql_calls(
         found = [scales(b) for b in branches if b is not None and not isinstance(b, exp.Null)]
         if not found or None in found:
             return None
-        if isinstance(node, exp.Mul):
-            return min(sum(s[0] for s in found), 30), min(sum(s[1] for s in found), 30)  # type: ignore[index]
         return max(s[0] for s in found), max(s[1] for s in found)  # type: ignore[index]
 
     def decimal_scale(node: exp.Expression) -> Optional[int]:
@@ -9275,12 +9356,15 @@ def _rewrite_mysql_calls(
         if isinstance(node, exp.Column):
             mysql_type = column_type(node) if column_type is not None else None
             return isinstance(mysql_type, _QuotientType) and _reads_derived(node)
-        if isinstance(node, (exp.Neg, exp.Sum, exp.Min, exp.Max, exp.AnyValue, exp.Abs, exp.Nullif, exp.Window)):
+        if isinstance(node, _ARGUMENT_SCALED):
             return carries_quotient(_aggregated(node))
         if isinstance(node, exp.Subquery):
             return carries_quotient(_scalar_projection(node))
+        if isinstance(node, (exp.Add, exp.Sub)) and interval_of(node) is not None:
+            return carries_quotient(node.this)  # a date
         if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Mod)):
-            return carries_quotient(node.this) or carries_quotient(node.expression)
+            operators, start = chain(node, (exp.Add, exp.Sub, exp.Mul, exp.Mod))
+            return carries_quotient(start) or any(carries_quotient(o.expression) for o in operators)
         if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
             return any(carries_quotient(n) for n in [node.this, *node.expressions])
         if isinstance(node, exp.If):
@@ -9566,43 +9650,136 @@ def _rewrite_mysql_calls(
         ):
             join.set("kind", "CROSS")
 
-    # A TINYINT(1) -- a boolean on Aurora DSQL -- is MySQL's integer 0 / 1: in arithmetic,
-    # SUM / AVG / MIN / MAX and beside a number (= 1, IN (0, 1), BETWEEN, IFNULL(x, 0), a
-    # CASE branch) it is written as that integer -- boolean + integer has no operator there,
-    # sum(boolean) no function.
-    # (The columns as first walked: no pass before this one replaces a column.)
-    for node in [n for n in walked if isinstance(n, exp.Column)]:
-        if kind_of(node) != "boolean":
-            continue
-        held = node
-        while isinstance(held.parent, exp.Paren):
-            held = held.parent
+    # MySQL adds an interval on either side (INTERVAL 1 DAY + d), and stores a view's as d +
+    # INTERVAL 1 DAY: the date first, as the passes below read it.
+    for node in [n for n in walked if isinstance(n, exp.Add)]:
+        if isinstance(node.this, exp.Interval) and not isinstance(node.expression, exp.Interval):
+            interval = node.this
+            node.set("this", node.expression)
+            node.set("expression", interval)
+
+    def assigned(node: exp.Expression) -> bool:
+        """An UPDATE's SET item, or an upsert's (ON DUPLICATE KEY UPDATE, ON CONFLICT)."""
+        return isinstance(node, exp.EQ) and node.arg_key == "expressions" and isinstance(
+            node.parent, (exp.Update, exp.OnConflict)
+        )
+
+    def read_as_number(held: exp.Expression) -> bool:
+        """Whether MySQL reads the value ``held`` (with its parentheses) as a number where it
+        stands: in arithmetic, a bitwise operator, a numeric function, cast or aggregate, or
+        beside a number -- compared (<=> too), IN, BETWEEN, IFNULL / COALESCE / NULLIF /
+        GREATEST, a branch of a CASE / IF, a simple CASE's operand or WHEN value."""
         parent = held.parent
-        if isinstance(parent, exp.Distinct) and isinstance(parent.parent, (exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        if isinstance(parent, exp.Distinct) and isinstance(parent.parent, _NUMERIC_AGGREGATES):
             parent = parent.parent
+        if isinstance(parent, _NUMERIC_OPERATIONS):
+            return interval_of(parent) is None  # not date arithmetic
+        if isinstance(parent, exp.Cast):
+            return _pg_type_kind(parent.args.get("to")) in _NUMERIC_KINDS
         beside: "list" = []
         if isinstance(parent, (exp.Coalesce, exp.Greatest, exp.Least, exp.In)):
             beside = [parent.this, *parent.expressions]
-        elif isinstance(parent, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Nullif)):
+        elif isinstance(
+            parent, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Nullif)
+        ):
             beside = [parent.this, parent.expression]
         elif isinstance(parent, exp.Between):
             beside = [parent.this, parent.args.get("low"), parent.args.get("high")]
+        elif isinstance(parent, exp.Case) and held.arg_key == "this":
+            beside = [branch.this for branch in parent.args.get("ifs") or ()]  # CASE x WHEN 1
+        elif isinstance(parent, exp.If) and held.arg_key == "this" and isinstance(parent.parent, exp.Case):
+            beside = [parent.parent.this]  # a simple CASE's WHEN value, beside its operand
         elif isinstance(parent, (exp.If, exp.Case)) and held.arg_key in ("true", "false", "default"):
             case = parent.parent if isinstance(parent.parent, exp.Case) and held.arg_key == "true" else parent
             beside = (
                 [case.args.get("true"), case.args.get("false")] if isinstance(case, exp.If)
                 else [b.args.get("true") for b in case.args.get("ifs") or ()] + [case.args.get("default")]
             )
-        numeric = isinstance(parent, _NUMERIC_OPERATIONS) and interval_of(parent) is None  # not date arithmetic
-        if numeric or any(kind_of(value) in _NUMERIC_KINDS for value in beside if value is not None and value is not held):
-            node.replace(_as_integer(node.copy()))
+        return any(kind_of(value) in _NUMERIC_KINDS for value in beside if value is not None and value is not held)
 
-    # MySQL sums a FLOAT in double precision; PostgreSQL's sum(real) adds in real, losing
-    # the cents of 100000.25 + 23456.53 before any later cast.
+    # A TINYINT(1) -- a boolean on Aurora DSQL -- is MySQL's integer 0 / 1, and so is a
+    # comparison or a condition (SUM(qty > 2) counts rows): where MySQL reads one as a number
+    # (read_as_number) it is written as that integer -- boolean + integer has no operator
+    # there, sum(boolean) no function. Elsewhere it stays a boolean: a condition, AND / OR /
+    # NOT, IS TRUE, a comparison with another boolean, an output -- and an assignment's
+    # target (SET paid = 1), a number assigned to one written as a boolean. Innermost first,
+    # each wrapped where it stands.
+    holders = (
+        exp.Column, exp.If, exp.Case, exp.Coalesce, exp.Nullif, exp.Greatest, exp.Least, exp.Subquery, exp.Window,
+    )
+    for node in reversed(walked):
+        predicate = isinstance(node, (exp.Predicate, exp.Connector, exp.Not, exp.Boolean))
+        if not predicate and not (isinstance(node, holders) and kind_of(node) == "boolean"):
+            continue
+        held = node
+        while isinstance(held.parent, exp.Paren):
+            held = held.parent
+        if assigned(held.parent) and held is held.parent.this:
+            continue
+        if read_as_number(held):
+            cast = _as_integer(exp.Null())
+            node.replace(cast)
+            cast.set("this", node)
+    for node in [n for n in walked if assigned(n)]:
+        value = node.expression
+        if kind_of(node.this) == "boolean" and kind_of(value) == "integer":
+            literal = _integer_literal(value)
+            node.set("expression", exp.Boolean(this=literal != 0) if literal is not None else exp.NEQ(
+                this=exp.Paren(this=value) if isinstance(value, exp.Binary) else value,
+                expression=exp.Literal.number(0),
+            ))
+
+    # MySQL computes a FLOAT in double precision: PostgreSQL computes real op real in real
+    # (with any other operand in double precision) -- and its sum(real) adds in real, losing
+    # the cents of 100000.25 + 23456.53 before any later cast. MOD of a FLOAT / DOUBLE is C's
+    # fmod in MySQL, which Aurora DSQL has no operator for, nor an exact form of: reported.
+    # Innermost first, each operator's kind read once (a chain of thousands stays linear):
+    # (f * f) * f is double precision once f * f is.
+    arithmetic: dict = {}
+
+    def operand_kind(node: exp.Expression) -> Optional[str]:
+        while isinstance(node, exp.Paren):
+            node = node.this
+        known = arithmetic.get(id(node))
+        return known[1] if known is not None and known[0] is node else kind_of(node)
+
+    for node in reversed(walked):
+        if not isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Mod)) or interval_of(node) is not None:
+            continue
+        kinds = [operand_kind(node.this), operand_kind(node.expression)]
+        if kinds == ["float4", "float4"] and not isinstance(node, exp.Mod):
+            for key in ("this", "expression"):
+                node.set(key, exp.Cast(this=node.args[key], to=exp.DataType.build("DOUBLE PRECISION")))
+            kinds = ["float8", "float8"]
+        if isinstance(node, exp.Mod) and set(kinds) & _FLOAT_KINDS:
+            issue(
+                "MOD() / % of a FLOAT or DOUBLE is C's fmod in MySQL, which Aurora DSQL has no "
+                "operator for (the statement fails there) and no exact form of: x - TRUNC(x / y) "
+                "* y in double precision gives fmod's value except where x / y rounds to a whole "
+                "number (MOD(1, 0.1e0) is 0.09999999999999995 in MySQL, 0 that way). Rewrite it "
+                "-- in numeric (CAST(x AS NUMERIC) % y) where the values are decimals at heart."
+            )
+        arithmetic[id(node)] = (node, combine(*kinds))
     for node in [n for n in walked if isinstance(n, exp.Sum)]:
         value = _aggregated(node)
         if value is not None and kind_of(value) == "float4":
             value.replace(exp.Cast(this=value.copy(), to=exp.DataType.build("DOUBLE PRECISION")))
+
+    # MySQL's a % b, MOD(a, b) and a DIV b are NULL for a 0 divisor, as its division is;
+    # Aurora DSQL raises division by zero.
+    for node in [n for n in walked if isinstance(n, (exp.Mod, exp.IntDiv))]:
+        divisor = node.expression
+        bare = divisor.unnest() if isinstance(divisor, exp.Expression) else None
+        if not (
+            (isinstance(bare, exp.Literal) and bare.is_number and float(bare.name) != 0)
+            or (isinstance(divisor, exp.Nullif) and _integer_literal(divisor.expression) == 0)
+        ):
+            node.set("expression", exp.Nullif(this=divisor, expression=exp.Literal.number(0)))
+    # MySQL's SIGN is an integer; PostgreSQL's sign(integer) a double precision.
+    for node in [n for n in walked if isinstance(n, exp.Sign)]:
+        cast = _as_integer(exp.Null())
+        node.replace(cast)
+        cast.set("this", node)
 
     def windowed(node: exp.Expression) -> Optional[exp.Window]:
         """The window ``node`` is the function of (under FILTER / RESPECT NULLS), or None."""
@@ -9618,6 +9795,23 @@ def _rewrite_mysql_calls(
         if value is not None and value.find(exp.Column) is not None and carries_quotient(value):
             value.replace(shown(value.copy(), stored=True))
 
+    def exact_quotient(
+        dividend: exp.Expression, divisor: exp.Expression, found: "tuple[int, int]"
+    ) -> exp.Expression:
+        """MySQL's exact division as written for Aurora DSQL: DIV(x * 10^k, NULLIF(y, 0)) *
+        10^-k, k the digits MySQL keeps (``found``: :func:`scales`)."""
+        if kind_of(dividend) == "integer":  # an integer times 10^k overflows int4 / int8
+            dividend = exp.Cast(this=dividend, to=exp.DataType.build("NUMERIC"))
+        if not (isinstance(divisor, exp.Nullif) and _integer_literal(divisor.expression) == 0):
+            divisor = exp.Nullif(this=divisor, expression=exp.Literal.number(0))  # a / NULLIF(b, 0) already is
+        shifted = exp.Mul(this=dividend, expression=exp.Literal.number(10 ** found[1]))
+        quotient = exp.Mul(
+            this=exp.IntDiv(this=shifted, expression=divisor),
+            expression=exp.Literal.number(f"{decimal.Decimal(1).scaleb(-found[1]):f}"),
+        )
+        quotient.meta[_QUOTIENT_SCALE] = found
+        return quotient
+
     # MySQL's exact division: integers and decimals divide to a DECIMAL shown at the
     # dividend's scale plus div_precision_increment (4) -- 10 / 3 is 3.3333 -- never a
     # double, and x / 0 is NULL. It computes with more digits, truncated
@@ -9625,7 +9819,9 @@ def _rewrite_mysql_calls(
     # is it written, exactly, as DIV(x * 10^k, y) * 10^-k -- PostgreSQL's numeric division
     # keeps 16 significant digits, rounded, fewer than MySQL's from a quotient of 10^8 on.
     # shown() gives an output MySQL's scale. An AVG of an exact value is MySQL's division of
-    # its sum, likewise truncated. Innermost first: a quotient divided is one too.
+    # its SUM by its COUNT (of the DISTINCT values, over the same window), the same exact
+    # division -- PostgreSQL's avg is the rounded one. Innermost first: a quotient divided is
+    # one too.
     for node in nodes(exp.Div, exp.Avg, innermost=True):
         if node.args.get("typed"):
             continue
@@ -9637,41 +9833,73 @@ def _rewrite_mysql_calls(
                 continue
             target = node
             while isinstance(target.parent, (exp.Window, exp.Filter)) and target.arg_key == "this":
-                target = target.parent  # TRUNC(AVG(x) OVER (...), k), never AVG(x) inside
-            quotient = exp.Trunc(this=target.copy(), decimals=exp.Literal.number(found[1]))
-            quotient.meta[_QUOTIENT_SCALE] = found
+                target = target.parent  # the window, never AVG(x) inside it
+
+            def over(function: exp.Expression) -> exp.Expression:
+                """``function`` in place of the AVG, under its window."""
+                if target is node:
+                    return function
+                copy = target.copy()
+                inner = copy
+                while not isinstance(inner, exp.Avg):
+                    inner = inner.this
+                inner.replace(function)
+                return copy
+
+            total = over(exp.Sum(this=node.this.copy()))
+            if kind_of(_aggregated(node)) == "integer":  # typed in place: the copy is no column of the tree
+                total = exp.Cast(this=total, to=exp.DataType.build("NUMERIC"))
+            quotient = exact_quotient(total, over(exp.Count(this=node.this.copy())), found)
+            if target is not node:
+                # A window's result is kept at its scale before what computes with it:
+                # AVG(x) OVER (...) * 1000000000 multiplies 1.3333, not 1.333333333.
+                quotient = shown(quotient, stored=True)
+            elif isinstance(target.parent, (exp.Div, exp.Mod, exp.IntDiv)) and target.arg_key == "expression":
+                quotient = exp.Paren(this=quotient)
             target.replace(quotient)
             continue
         kinds = {kind_of(node.this), kind_of(node.expression)}
         found = scales(node) if kinds <= _EXACT_KINDS else None
         if found is None:
             continue
-        dividend, divisor = node.this, node.expression
-        if kind_of(dividend) == "integer":  # an integer times 10^k overflows int4 / int8
-            dividend = exp.Cast(this=dividend, to=exp.DataType.build("NUMERIC"))
-        if not (isinstance(divisor, exp.Nullif) and _integer_literal(divisor.expression) == 0):
-            divisor = exp.Nullif(this=divisor, expression=exp.Literal.number(0))  # a / NULLIF(b, 0) already is
-        shifted = exp.Mul(this=dividend, expression=exp.Literal.number(10 ** found[1]))
-        quotient: exp.Expression = exp.Mul(
-            this=exp.IntDiv(this=shifted, expression=divisor),
-            expression=exp.Literal.number(f"{decimal.Decimal(1).scaleb(-found[1]):f}"),
-        )
-        quotient.meta[_QUOTIENT_SCALE] = found
+        quotient = exact_quotient(node.this, node.expression, found)
         if isinstance(node.parent, (exp.Div, exp.Mod, exp.IntDiv)) and node.arg_key == "expression":
             quotient = exp.Paren(this=quotient)
         node.replace(quotient)
 
     # A window function's result is kept at its scale too, before what computes with it:
-    # AVG(x) OVER (...) * 1000000000 multiplies 1.3333, not 1.333333333.
+    # SUM(1 / 3) OVER () * 1000000000 multiplies 0.3333 (an AVG's is kept above).
     for window in nodes(exp.Window):
         function = window.this
         while isinstance(function, (exp.Filter, exp.RespectNulls, exp.IgnoreNulls)):
             function = function.this
         if not isinstance(function, exp.Avg):  # an AVG's argument is kept above
             stored_argument(function)
-        value = window.parent if window.parent is not None and _QUOTIENT_SCALE in window.parent.meta else window
-        if carries_quotient(value):
-            value.replace(shown(value.copy(), stored=True))
+        if carries_quotient(window):
+            window.replace(shown(window.copy(), stored=True))
+
+    # MySQL keys a GROUP BY, a window's PARTITION BY / ORDER BY and a COUNT(DISTINCT ...) on
+    # a quotient at its shown scale -- 1 / 3 and 3333 / 10000 are one key, 0.3333 -- where
+    # Aurora DSQL keys on the digits it keeps; rewriting the key would change what the
+    # select list may read, so it is reported. GROUP BY 1 or an alias keys on the output,
+    # shown at that scale on both.
+    keys: list = []
+    for group in nodes(exp.Group):
+        keys += group.expressions
+    for window in nodes(exp.Window):
+        order = window.args.get("order")
+        keys += [*(window.args.get("partition_by") or ()), *(o.this for o in (order.expressions if order else ()))]
+    for count in nodes(exp.Count):
+        if isinstance(count.this, exp.Distinct):
+            keys += count.this.expressions
+    if any(carries_quotient(key) and decimal_scale(key) is not None for key in keys):
+        issue(
+            "A quotient (an AVG) is a GROUP BY, PARTITION BY, window ORDER BY or COUNT(DISTINCT "
+            "...) key: MySQL keys it at the scale it shows -- 1 / 3 and 3333 / 10000 are one "
+            "key, 0.3333 -- where Aurora DSQL keys it by every digit it keeps, so groups, ranks "
+            "or counts can differ. Key it by ROUND(q, 4) (the scale MySQL shows the quotient "
+            "at) where that matters."
+        )
 
     # Dates written with a format: from the format MySQL wrote (innermost first, so a
     # STR_TO_DATE inside a DATE_FORMAT is written too).
@@ -10520,18 +10748,25 @@ def _rewrite_mysql_calls(
             node.set("expression", json_value(value))
 
     # What the statement returns, as MySQL shows it (a quotient at its scale) -- a view's
-    # only where MySQL materializes it (_mysql_materializes): a view it merges into the
-    # query that reads it is computed there, with every digit a quotient keeps, so it is
-    # left unrounded (its own SELECT * shows those digits). And what a derived table or a
-    # CTE MySQL materializes holds: each output stored at its scale.
+    # only where MySQL materializes it (_mysql_materializes, or ALGORITHM=TEMPTABLE): a
+    # view it merges into the query that reads it is computed there, with every digit a
+    # quotient keeps, so it is left unrounded (its own SELECT * shows those digits). And
+    # what a derived table or a CTE MySQL materializes holds: each output stored at its
+    # scale.
     def show_outputs(query: exp.Select, show: "Callable[[int, exp.Expression], exp.Expression]") -> None:
         outputs = []
         for position, projection in enumerate(list(query.expressions)):
             if isinstance(projection, exp.Alias):
                 projection.set("this", show(position, projection.this))
                 outputs.append(projection)
-            else:
-                outputs.append(show(position, projection))
+                continue
+            value = show(position, projection)
+            if value is not projection and isinstance(projection, exp.Column) and isinstance(
+                projection.this, exp.Identifier
+            ):
+                # Named as MySQL names it: x.q is q (ROUND(x.q, 4) is round).
+                value = exp.Alias(this=value, alias=projection.this.copy())
+            outputs.append(value)
         query.set("expressions", outputs)
 
     def at_scale(value: exp.Expression, scale: int) -> exp.Expression:
@@ -10541,9 +10776,30 @@ def _rewrite_mysql_calls(
         rounded.meta[_SHOWN] = True
         return rounded
 
+    def group_key(query: exp.Select, position: int) -> bool:
+        """Whether the select list's item at ``position`` is a key of its query's GROUP BY --
+        by its position, its alias (a name no FROM column has) or as the same expression:
+        MySQL keeps it in the grouping's temporary table, at its column's scale, and Aurora
+        DSQL matches the GROUP BY expression only with the whole item."""
+        group = query.args.get("group")
+        if group is None:
+            return False
+        projection = query.expressions[position]
+        alias = projection.alias.lower() if isinstance(projection, exp.Alias) else ""
+        value = projection.unalias().unnest()
+        for key in group.expressions:
+            if isinstance(key, exp.Literal) and _integer_literal(key) == position + 1:
+                return True
+            if (
+                isinstance(key, exp.Column) and not key.table and alias and key.name.lower() == alias
+                and (column_type is None or column_type(key) is None)
+            ) or key.unnest() == value:
+                return True
+        return False
+
     top = select.this if isinstance(select, exp.Subquery) else select
     units: "list[tuple[exp.Expression, bool]]" = []
-    if not view or _mysql_materializes(top):
+    if not view or materialized or _mysql_materializes(top):
         # A statement's own rows are shown value by value -- through a temporary table
         # (DISTINCT, a UNION, a materialized view) every value is stored at its column's.
         units.append((top, view or isinstance(top, exp.SetOperation) or bool(top.args.get("distinct"))))
@@ -10558,20 +10814,42 @@ def _rewrite_mysql_calls(
         branches = _output_queries(query)  # none for an INSERT, UPDATE or DELETE
         if len(branches) < 2:
             for branch in branches:
-                show_outputs(branch, lambda _position, value: shown(value, stored=stored))
+                # A CASE / IF the query groups by is stored whole, padded (0.0000).
+                show_outputs(branch, lambda position, value: shown(value, stored=stored or (
+                    isinstance(value.unnest(), (exp.If, exp.Case)) and group_key(branch, position)
+                )))
             continue
         # A UNION column has one type, its branches' largest scale: each branch is stored at
-        # it, an integer one too (SELECT 1 / 3 UNION SELECT 1 is 0.3333 and 1.0000).
+        # it, an integer one too (SELECT 1 / 3 UNION SELECT 1 is 0.3333 and 1.0000) -- a NULL
+        # branch has none. With a FLOAT / DOUBLE branch the column is a DOUBLE, a quotient
+        # in it every digit it keeps -- a REAL branch beside another number one too (Aurora
+        # DSQL types the column real otherwise); with a string one it is a string (written
+        # by the typing of choices), its quotient left unrounded.
         targets: "dict[int, int]" = {}
+        unrounded: set = set()
+        doubled: set = set()
         for position in range(min(len(branch.expressions) for branch in branches)):
             values = [branch.expressions[position].unalias() for branch in branches]
+            values = [value for value in values if not isinstance(value.unnest(), exp.Null)]
+            kinds = {kind_of(value) for value in values}
+            if kinds & (_FLOAT_KINDS | {"text", "char"}):
+                unrounded.add(position)
+                if "float4" in kinds and kinds <= _NUMERIC_KINDS and kinds != {"float4"}:
+                    doubled.add(position)
+                continue
             found_scales = [decimal_scale(value) for value in values]
-            if None not in found_scales and any(carries_quotient(value) for value in values):
+            if found_scales and None not in found_scales and any(carries_quotient(value) for value in values):
                 targets[position] = max(found_scales)  # type: ignore[type-var]
+
+        def union_value(position: int, value: exp.Expression) -> exp.Expression:
+            if position in doubled and kind_of(value) == "float4":
+                return exp.Cast(this=value, to=exp.DataType.build("DOUBLE PRECISION"))
+            if position in unrounded or isinstance(value.unnest(), exp.Null):
+                return value
+            return at_scale(value, targets[position]) if position in targets else shown(value, stored=True)
+
         for branch in branches:
-            show_outputs(branch, lambda position, value: (
-                at_scale(value, targets[position]) if position in targets else shown(value, stored=True)
-            ))
+            show_outputs(branch, union_value)
 
     # A call sqlglot does not know stays an Anonymous function and is emitted as written:
     # a MySQL-only function (FIND_IN_SET, UNIX_TIMESTAMP) or a user one -- unless
@@ -10593,6 +10871,13 @@ def _rewrite_mysql_calls(
     for node in nodes(*_PG_ONLY_NODES):
         if not node.meta.get(_PG_WRITTEN):
             note(_PG_ONLY_NODES[type(node)])
+    if too_deep[0]:
+        issue(
+            f"An expression is nested more than {_MAX_TYPED_DEPTH} levels deep, past what the "
+            "conversion types: what depends on its type -- MySQL's exact division and the scale "
+            "it shows, ROUND / TRUNCATE, a TINYINT(1) read as a number -- is not written as MySQL "
+            "computes it there. Split or simplify the expression."
+        )
     return untranslated, misformatted, issues
 
 
@@ -10761,8 +11046,15 @@ def _converted_mysql_view(
         select = parsed.expression if isinstance(parsed, exp.Create) else parsed
         if select is None:
             raise ValueError("no SELECT body parsed from the view definition")
+        # SHOW CREATE VIEW's text (what the introspector reads) keeps the view's ALGORITHM:
+        # MySQL materializes an ALGORITHM=TEMPTABLE view whatever its body.
+        properties = parsed.args.get("properties") if isinstance(parsed, exp.Create) else None
+        temptable = any(
+            isinstance(prop, exp.AlgorithmProperty) and prop.name.upper() == "TEMPTABLE"
+            for prop in (properties.expressions if properties is not None else ())
+        )
         untranslated, misformatted, issues = _rewrite_mysql_calls(
-            select, _column_type_resolver(column_types), view=True
+            select, _column_type_resolver(column_types), view=True, materialized=temptable
         )
         # MySQL stores a HAVING name by its alias (having (`total` > 1000)), which Aurora
         # DSQL never resolves there.

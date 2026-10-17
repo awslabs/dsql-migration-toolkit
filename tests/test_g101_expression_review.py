@@ -277,7 +277,8 @@ def test_mysqls_exact_division_is_numeric_at_its_scale() -> None:
     assert f'TRUNC({_QUOTIENT}, 4) AS "e"' in ddl
     assert f'OCTET_LENGTH(CAST(ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) AS TEXT)) AS "g"' in ddl
     assert f"CAST(ROUND(CAST({_QUOTIENT} AS DECIMAL), 4) AS TEXT) || '%'" in ddl  # G107: as text
-    assert 'ROUND(TRUNC(AVG("t"."i"), 9), 4) AS "k"' in ddl  # G106: AVG keeps 9 digits too
+    # G112: AVG is MySQL's exact division of its SUM by its COUNT, 9 digits kept.
+    assert 'ROUND(CAST(DIV(CAST(SUM("t"."i") AS DECIMAL) * 1000000000, NULLIF(COUNT("t"."i"), 0)) * 0.000000001 AS DECIMAL), 4) AS "k"' in ddl
     assert '(CAST("t"."db" AS DOUBLE PRECISION) / NULLIF(2, 0)) AS "m"' in ddl  # a double's is a double
 
 
@@ -302,7 +303,11 @@ def test_a_quotient_is_compared_and_inlined_with_every_digit() -> None:
         # G106 (P3): MySQL sums a FLOAT in double precision -- the cast goes inside the SUM.
         ("truncate(sum(`t`.`f`),2)", '(TRUNC(CAST(SUM(CAST("t"."f" AS DOUBLE PRECISION)) AS DOUBLE PRECISION) * 100) / 100)'),
         ("truncate(coalesce(`t`.`f`,0),2)", '(TRUNC(CAST(COALESCE("t"."f", 0) AS DOUBLE PRECISION) * 100) / 100)'),
-        ("truncate((`t`.`f` + `t`.`f`),2)", '(TRUNC(CAST(("t"."f" + "t"."f") AS DOUBLE PRECISION) * 100) / 100)'),
+        # G112: real + real is added in double precision, as MySQL adds a FLOAT.
+        (
+            "truncate((`t`.`f` + `t`.`f`),2)",
+            '(TRUNC(CAST((CAST("t"."f" AS DOUBLE PRECISION) + CAST("t"."f" AS DOUBLE PRECISION)) AS DOUBLE PRECISION) * 100) / 100)',
+        ),
         ("truncate(abs(`t`.`f`),2)", '(TRUNC(CAST(ABS("t"."f") AS DOUBLE PRECISION) * 100) / 100)'),
         ("round(`t`.`i`,2)", 'SELECT "t"."i" AS "x"'),
         ("round(`t`.`dec2`,4)", 'ROUND("t"."dec2", 2)'),

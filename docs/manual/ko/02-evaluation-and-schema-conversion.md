@@ -348,10 +348,12 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   선택 목록과 같은 형태로 — 타입을 알 수 없는 값은 그 텍스트의 바이트 순으로 정렬), `CAST(x AS UNSIGNED)`는 MySQL처럼 먼저
   반올림한 뒤(문자열은 앞쪽 정수로 읽어) 음수를 순환시켜, 정수와 decimal의 `/`는 MySQL의 정확한 나눗셈으로(MySQL이
   유지하는 소수 자릿수로 잘라서 계산하고 — 정수는 9자리라 `2 / 3 * 1000000`은 `666666.6660` — 피제수의 scale에 4를 더한
-  decimal로 보여 주며 — `10 / 3`은 `3.3333` — 0으로 나누면 NULL) `AVG`도 마찬가지로, `FLOAT`의 `SUM`은 MySQL처럼
-  배정밀도로 더해서, `FLOAT`/`DOUBLE`의 `ROUND`/`TRUNCATE(x, d)`는 MySQL처럼 배정밀도로 계산해서(실행 시점에 읽는
-  자릿수도, 정수는 그 정수로), 숫자로 쓰인 `TINYINT(1)`(Aurora DSQL에서는 boolean)은 그 정수로, `GROUP_CONCAT`은 text
-  위의 집계로, `CONCAT_WS`는 NULL을 건너뛰고
+  decimal로 보여 주며 — `10 / 3`은 `3.3333` — 0으로 나누면 `%`·`MOD`·`DIV`와 마찬가지로 NULL) `AVG`는 그 `SUM`을
+  `COUNT`로 나누는 같은 나눗셈으로, `FLOAT`은 MySQL처럼 배정밀도로 계산해서(그 `SUM`, `f * f`), `FLOAT`/`DOUBLE`의
+  `ROUND`/`TRUNCATE(x, d)`는 MySQL처럼 배정밀도로 계산해서(실행 시점에 읽는 자릿수도, 정수는 그 정수로), 숫자로 읽히는
+  `TINYINT(1)`(Aurora DSQL에서는 boolean)과 비교식 — 산술, 비트 연산자, `ROUND`/`SIGN`/`POWER`나 숫자 캐스트, 집계
+  (`SUM(qty > 2)`는 행을 셉니다), 또는 숫자 옆(`= 1`, `<=> 1`, `IN`, 단순 `CASE`) — 은 그 정수로, `TINYINT(1)`에 대입하는
+  숫자(`SET paid = 1`)는 boolean으로, `GROUP_CONCAT`은 text 위의 집계로, `CONCAT_WS`는 NULL을 건너뛰고
   `GREATEST`/`LEAST`는 MySQL처럼 NULL을 반환하게, `LENGTH`는 텍스트의 바이트 수로, `CHAR_LENGTH`는 그 문자 수로
   (`CHAR(n)` 컬럼은 채움 공백 없이, JSON 값은 그 텍스트로), MySQL이 문자열을 원하는 곳(`CONCAT`/`CONCAT_WS`,
   `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`, `REPLACE`, `UPPER`/`LOWER`, `LIKE`, 숫자와 텍스트나 날짜의 `COALESCE`/`CASE`/`IF`)의
@@ -359,7 +361,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   `'N/A'`)과 나란한 날짜는 MySQL의 문자열로(날짜 문자열 — `'2024-06-01'`, `'20240601'` — 과 나란하면 날짜 그대로, 시각이
   있는 문자열과 나란한 `DATE`는 타임스탬프로), `DATE`에 일/월을 더해도 `DATE`로(컬럼이나 식에서 읽는 양, 또는 소수는
   MySQL처럼 정수 단위로 세고 — 문자열은 앞쪽 정수로 — `'1 2' DAY_HOUR` 같은 복합 단위는 그 부분들로, 두 자리 연도나
-  `yyyymmdd`의 날짜 문자열은 MySQL처럼 해석), `+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든), NULL을 유지하고
+  `yyyymmdd`의 날짜 문자열은 MySQL처럼 해석), `INTERVAL x unit + d`는 `d + INTERVAL x unit`으로, `TIMESTAMP '...'`
+  리터럴은 그것이 뜻하는 `DATETIME`으로, `+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든), NULL을 유지하고
   `DATETIME`과 `TINYINT(1)`을 MySQL처럼 쓰는 `JSON_ARRAY`/`JSON_ARRAYAGG`, 멤버 이름과 배열 첨자로 된 경로의
   `JSON_EXTRACT`/`->`와 MySQL의 `->>`(MySQL은 뷰에 `json_unquote(json_extract(...))`로 저장합니다)는 MySQL처럼 경로를
   따라가고(배열이 아닌 값의 `[0]`은 그 값 자체) — `->>`의 JSON null은 텍스트 `'null'`로, 숫자와의 비교·산술·`SUM`/`AVG`·
@@ -375,7 +378,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   `%w`)도 표시됩니다: 뷰는 만들어지지만 다른 텍스트를 반환합니다. 컬럼에 대한 `STR_TO_DATE`(형식으로 읽을 수 없는 값에 MySQL은
   NULL을 돌려주지만, Aurora DSQL은 그런 값에는 오류를 내고 구분자만 다른 값은 날짜로 읽습니다. 또 일광 절약 시간이 있는 세션
   시간대에서는 시계가 건너뛰는 한 시간 안의 시각이 한 시간 뒤로 읽힙니다), 바이트 디코딩(잘못된 바이트는 MySQL에서 NULL,
-  Aurora DSQL에서 오류), 컬럼에서 읽는 형식, `GROUP_CONCAT(DISTINCT x ORDER BY y)`도 표시됩니다. 각 값은 그 내용에 맞게
+  Aurora DSQL에서 오류), 컬럼에서 읽는 형식, `FLOAT`/`DOUBLE`의 `MOD`(MySQL의 것은 C의 fmod로, Aurora DSQL에는 그
+  연산자도 정확한 형태도 없습니다), `GROUP_CONCAT(DISTINCT x ORDER BY y)`도 표시됩니다. 각 값은 그 내용에 맞게
   씁니다 — 컬럼은 그 타입으로(MySQL이 저장한 조인을 거쳐서도, MySQL이 바인딩하는 대로 — `db`.`table`.`col`은 그 데이터베이스의
   테이블로, 그 컬럼이 없는 테이블의 별칭은 건너서), 파생 테이블이나 CTE의 컬럼은 그 본문이 고르는 것으로(읽는 테이블과
   같은 이름의 CTE도), 식은 그 계산 결과로 — 그리고 Query Converter도 같은 MySQL 식을 같은 방식으로 쓰며(`UPDATE`, `DELETE`,
@@ -383,19 +387,27 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   뷰의 컬럼, 파생 테이블이나 CTE가 계산하는 컬럼, 1단계 전 Query Converter의 컬럼 — 의 `LENGTH`와 `BINARY`는 표시됩니다:
   `LENGTH`는 `x || ''`의 텍스트를 세어 텍스트·바이트·숫자·날짜에는 MySQL과 같은 수가 되고(`TINYINT(1)`, `TIMESTAMP`, 소수부가
   있는 `DATETIME`은 다름), `BINARY`는 `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 몫은 MySQL이 보여 주는 곳에서
-  그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE — 집계, 윈도우,
-  `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나 테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는
-  것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의 값도). MySQL이 읽는 쿼리에 병합(merge)하는 뷰는 거기서 몫이
-  유지하는 모든 자릿수로 계산되므로 뷰는 반올림하지 않고 두며, 읽는 쿼리는 MySQL과 같은 결과를 돌려줍니다. 그 대신 그 뷰
-  자체의 `SELECT *`는 MySQL이 `0.3333`을 보여 주는 곳에서 `0.333333333`을 보여 주고, 그 뷰를 읽는 뷰는 그 컬럼이 몫인지 알
-  수 없어(PostgreSQL 뷰는 읽는 쿼리에 병합되지 않습니다) 거기서 계산한 값도 그 자릿수로 보여 주고, 요청한 자릿수대로
-  반올림하거나 자릅니다(MySQL은 몫의 scale보다 많은 자릿수를 남기지 않아 `1 / 3`의 `TRUNCATE(v.q, 6)`은 `0.3333`).
-  재현하지 않는 것:
-  MySQL은 몫의 `GROUP BY`, 윈도우의 `PARTITION BY` / `ORDER BY`, `COUNT(DISTINCT ...)`의 키를 보여 주는 scale로 만들고
-  (`1 / 3`과 `3333 / 10000`은 같은 키), 임시 테이블로 그룹화할 때(그룹화 컬럼에 인덱스가 없을 때)는 몫을 그 scale로
-  더하기도 합니다. 변환은 유지한 자릿수로 키를 만들고 더하므로, 그것이 중요하면 `ROUND(q, 4)`로 그룹화하세요. `IFNULL`,
-  `IF`, `CASE` 또는 다른 함수 뒤로 세 단계보다 깊게 중첩된 `GREATEST`/`LEAST`와, 컬럼에서 읽는 복합 단위 interval은
-  MANUAL로 표시됩니다. 아직 다른 것: `FLOAT`의
+  그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE —
+  `ALGORITHM=TEMPTABLE`로 선언한 뷰, 또는 집계, 윈도우, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나
+  테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는 것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의
+  값도, 쿼리가 그것으로 그룹화하는 `CASE`/`IF`도: `0.0000`). `FLOAT`/`DOUBLE` 브랜치가 있는 `UNION` 컬럼은 MySQL이 정하는
+  대로 `DOUBLE`입니다(그 몫은 모든 자릿수를 유지). MySQL이 읽는 쿼리에 병합(merge)하는 뷰는 거기서 몫이 유지하는 모든
+  자릿수로 계산되므로 뷰는 반올림하지 않고 두며, 읽는 쿼리는 MySQL과 같은 결과를 돌려줍니다. 그 대가: 그 뷰를 직접 조회하면
+  몫 컬럼은 MySQL이 계산에 쓰는 자릿수를 보여 줍니다 — MySQL이 `0.3333`을 보여 주는 곳에서 `0.333333333`을, `10.0000`을
+  보여 주는 `(x / 3) * 3`은 `9.999999999`를 — 이것은 AUTO로 평가되고 뷰마다의 안내는 없습니다. 또 그 뷰를 읽는 뷰는 그
+  컬럼이 몫인지 알 수 없어(PostgreSQL 뷰는 읽는 쿼리에 병합되지 않습니다) 거기서 계산한 값도 그 자릿수로 보여 주고, 요청한
+  자릿수대로 반올림하거나 자릅니다(MySQL은 몫의 scale보다 많은 자릿수를 남기지 않아 `1 / 3`의 `TRUNCATE(v.q, 6)`은
+  `0.3333`). 보여 주는 값이 중요하면 `ROUND(q, 4)`로 읽으세요. 재현하지 않는 것: MySQL은 몫의 `GROUP BY`, 윈도우의
+  `PARTITION BY` / `ORDER BY`, `COUNT(DISTINCT ...)`의 키를 보여 주는 scale로 만들지만(`1 / 3`과 `3333 / 10000`은 같은 키)
+  변환은 유지한 자릿수로 키를 만듭니다 — MANUAL로 표시됩니다(`GROUP BY 1`이나 `GROUP BY` 별칭은 두 엔진 모두 보여 주는
+  출력으로 키를 만듭니다). 임시 테이블로 그룹화할 때(그룹화 컬럼에 인덱스가 없을 때) MySQL은 몫의 `SUM`, `MAX`, `MIN`,
+  `AVG`도 그 scale로 저장하며, 이는 실행 계획에 따라 달라집니다 — 그것이 중요하면 `ROUND(q, 4)`로 그룹화하고 집계하세요.
+  MySQL 8.0.22 이상(Aurora MySQL 3)은 구체화하는 뷰나 파생 테이블의 몫에 대한 필터(`WHERE v.q = 0.3333`)를 그 안으로 밀어
+  넣어 모든 자릿수로 비교하지만, 돌려주는 행은 저장된 scale을 가집니다. Aurora DSQL은 저장된 값으로 비교하므로, 그것이
+  중요하면 `ROUND(q, s)`나 범위로 비교하세요. 인자에 윈도우 함수가 있는 `JSON_ARRAY`/`JSON_OBJECT`는 윈도우 다음에 계산되어
+  그 몫 인자를 scale대로 읽는데(`[7.1429, 2.6667]`), 변환은 유지한 모든 자릿수를 씁니다(`7.142857142`). `IFNULL`, `IF`,
+  `CASE` 또는 다른 함수 뒤로 세 단계보다 깊게 중첩된 `GREATEST`/`LEAST`, 컬럼에서 읽는 복합 단위 interval, 200단계보다 깊게
+  중첩된 식(변환이 타입을 읽는 범위 밖)은 MANUAL로 표시됩니다. 아직 다른 것: `FLOAT`의
   텍스트(MySQL은 유효 숫자 6자리로 `1234.57`)와 JSON 안의 `FLOAT`, 날짜만 있는 문자열과 나란한 `DATETIME`은 그 문자열의
   행을 `2024-06-01 00:00:00`으로 보여 줍니다(MySQL은 쓰인 그대로). **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도

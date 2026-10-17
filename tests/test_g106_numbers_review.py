@@ -153,11 +153,14 @@ def test_a_quotient_read_out_of_a_derived_table_is_shown_by_its_type() -> None:
 def test_a_scalar_subquery_window_and_nullif_carry_the_scale() -> None:
     """ES-6 / P5: they kept every digit at the output."""
     ddl, _ = _view("select (select avg(`o`.`qty`) from `shop`.`orders` `o`) AS `a`")
-    assert 'ROUND((SELECT TRUNC(AVG("o"."qty"), 9) FROM "shop"."orders" AS "o"), 4) AS "a"' in ddl
+    # G112: an AVG is MySQL's exact division of its SUM by its COUNT.
+    avg = 'DIV(CAST(SUM("o"."qty") AS DECIMAL) * 1000000000, NULLIF(COUNT("o"."qty"), 0)) * 0.000000001'
+    assert f'ROUND(CAST((SELECT {avg} FROM "shop"."orders" AS "o") AS DECIMAL), 4) AS "a"' in ddl
     ddl, _ = _select("nullif((`t`.`i` / `t`.`n`),0) AS `b`", group=True)
     assert f"ROUND(NULLIF(({_IN}), 0), 4)" in ddl
     ddl, _ = _select("avg(`t`.`i`) OVER ()  AS `c`")
-    assert 'ROUND(TRUNC(AVG("t"."i") OVER (), 9), 4) AS "c"' in ddl
+    over = 'DIV(CAST(SUM("t"."i") OVER () AS DECIMAL) * 1000000000, NULLIF(COUNT("t"."i") OVER (), 0)) * 0.000000001'
+    assert f'ROUND(CAST({over} AS DECIMAL), 4) AS "c"' in ddl
 
 
 def test_a_union_column_is_shown_at_its_largest_scale_every_branch() -> None:
@@ -215,7 +218,7 @@ def test_mysqls_quotient_is_its_kept_digits_truncated() -> None:
     """ES-8: MySQL computes with 9 fraction digits of an int / int quotient, truncated --
     2 / 3 * 1000000 is 666666.6660 -- where PostgreSQL's numeric division kept 20 (or 16
     significant, rounded: 123456789012 / 7 lost its 9th). Written DIV(x * 10^9, y) * 10^-9,
-    exactly; AVG truncated likewise."""
+    exactly; AVG likewise (G112: as the exact division of its SUM by its COUNT)."""
     ddl, _ = _select(
         "((`t`.`i` / 3) / 7) AS `q`,(`t`.`dec4` / 7) AS `d`,(avg(`t`.`dec4`) * 1000) AS `a`"
     )
@@ -224,7 +227,7 @@ def test_mysqls_quotient_is_its_kept_digits_truncated() -> None:
         "NULLIF(7, 0)) * 0.000000000000000001"
     ) in ddl
     assert 'DIV("t"."dec4" * 1000000000, NULLIF(7, 0)) * 0.000000001' in ddl
-    assert 'ROUND((TRUNC(AVG("t"."dec4"), 9) * 1000), 8) AS "a"' in ddl
+    assert 'ROUND((DIV(SUM("t"."dec4") * 1000000000, NULLIF(COUNT("t"."dec4"), 0)) * 0.000000001 * 1000), 8) AS "a"' in ddl
     # a / NULLIF(b, 0) is not wrapped twice.
     ddl, _ = _select("(`t`.`i` / nullif(`t`.`n`,0)) AS `q`")
     assert f"({_IN}) AS" in ddl
@@ -304,7 +307,8 @@ def test_a_tinyint1_used_as_a_number_is_its_integer() -> None:
     flag = 'CAST("t"."flag" AS INT)'
     assert f"DIV(CAST({flag} AS DECIMAL) * 1000000000, NULLIF(2, 0))" in ddl
     assert f"({flag} + 0)" in ddl and f"COALESCE({flag}, 0)" in ddl
-    assert f"SUM({flag})" in ddl and f"MAX({flag})" in ddl and f"TRUNC(AVG({flag}), 9)" in ddl
+    assert f"SUM({flag})" in ddl and f"MAX({flag})" in ddl
+    assert f"DIV(CAST(SUM({flag}) AS DECIMAL) * 1000000000, NULLIF(COUNT({flag}), 0))" in ddl  # G112: AVG's exact form
     assert f"({flag} = 1)" in ddl and f"({flag} IN (0, 1))" in ddl
     assert '("t"."flag" = TRUE)' in ddl  # a boolean beside a boolean is one
     assert view.warnings == []
@@ -382,7 +386,8 @@ def test_a_window_keeps_its_arguments_and_result_at_their_scale() -> None:
         "sum((1 / 3)) OVER ()  AS `k`"
     )
     assert 'SUM(ROUND(CAST((DIV(CAST("t"."i" AS DECIMAL) * 1000000000, NULLIF(3, 0)) * 0.000000001) AS DECIMAL), 4)) OVER' in ddl
-    assert '(ROUND(TRUNC(AVG("t"."i") OVER (), 9), 4) * 1000000000) AS "a"' in ddl
+    over = 'DIV(CAST(SUM("t"."i") OVER () AS DECIMAL) * 1000000000, NULLIF(COUNT("t"."i") OVER (), 0)) * 0.000000001'
+    assert f'(ROUND(CAST({over} AS DECIMAL), 4) * 1000000000) AS "a"' in ddl  # G112: AVG's exact form
     assert "ROUND(CAST(SUM((DIV(CAST(1 AS DECIMAL) * 1000000000, NULLIF(3, 0)) * 0.000000001)) OVER () AS DECIMAL), 4)" in ddl
 
 
