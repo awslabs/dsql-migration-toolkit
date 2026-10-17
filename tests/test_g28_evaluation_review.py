@@ -2179,7 +2179,7 @@ def test_partitioned_table_advice_warns_about_partition_rotation_under_cdc() -> 
     """'No action is required ... no data is lost' -- but a partition dropped or truncated
     during CDC leaves its rows on Aurora DSQL (no row-level delete reaches the stream)."""
     for engine, wording in ((SourceType.MYSQL, "DROP or TRUNCATE PARTITION"),
-                            (SourceType.POSTGRES, "dropping or detaching a partition")):
+                            (SourceType.POSTGRES, "dropping, detaching or truncating a partition")):
         table = _table("shop.events").model_copy(update={"partitioned": True})
         report = CompatibilityAssessor(source_type=engine).assess(SourceInventory(tables=[table]))
         (item,) = [i for i in report.items if i.object_name == "shop.events"]
@@ -2265,7 +2265,7 @@ def test_a_not_null_generated_column_cdc_never_carries_says_what_cdc_does() -> N
     report = CompatibilityAssessor().assess(SourceInventory(tables=[my_table]))
     (item,) = [i for i in report.items if i.object_name == "shop.orders"]
     (concern,) = [c for c in item.concerns if c.rule_id == "GENERATED_COLUMN"]
-    assert "label is NOT NULL, so such a row is refused instead (SQLSTATE 23502" in concern.risk
+    assert "label is NOT NULL, so such a row -- an insert or an update -- is refused instead (SQLSTATE" in concern.risk
 
 
 def test_mixed_case_mysql_names_are_named_before_unquoted_sql_breaks() -> None:
@@ -2446,3 +2446,39 @@ def test_mixed_case_review_fixes() -> None:
         "INSERT INTO t (id, n) VALUES (1, 2) ON DUPLICATE KEY UPDATE n = VALUES(n)"
     )
     assert CODE_MIXED_CASE_NAME not in [w.code for w in upsert.warnings]  # EXCLUDED is the tool's
+
+
+def test_a_not_null_column_cdc_drops_has_every_write_refused_not_landed_null() -> None:
+    """A NOT NULL box/tsquery column was said to 'arrive NULL, nothing dead-lettered',
+    while Aurora DSQL refuses every insert and update of the table (23502); a generated
+    primary-key column was told to drop its NOT NULL, which a key cannot."""
+    from dsql_migrator.core.assessor_postgres import _generated_not_null_cdc_note
+    from dsql_migrator.core.prerequisites_postgres import (
+        UNCARRYABLE_COLUMN_ARRIVES_NULL,
+        UncarryableCdcColumn,
+        uncarryable_column_texts,
+        uncarryable_columns_of,
+    )
+
+    zones = TableDef(
+        name="app.zones",
+        columns=[
+            ColumnDef(name="id", mysql_type="bigint", nullable=False),
+            ColumnDef(name="area", mysql_type="box", nullable=False),
+            ColumnDef(name="q", mysql_type="tsquery"),
+        ],
+        primary_key=["id"],
+    )
+    found = uncarryable_columns_of(zones)
+    assert {c.column: c.nullable for c in found} == {"area": False, "q": True}
+    what, todo = uncarryable_column_texts(found)
+    assert "refuses EVERY insert and update CDC writes for this table (SQLSTATE 23502)" in what
+    assert "`q` (tsquery)" in what and "NULL on every row" in what  # the nullable one
+    assert "drop the NOT NULL from the target DDL" in todo
+    unknown = [UncarryableCdcColumn("c", "box", UNCARRYABLE_COLUMN_ARRIVES_NULL)]
+    assert "23502" not in uncarryable_column_texts(unknown)[0]  # not read: as before
+
+    code = ColumnDef(name="code", mysql_type="text", nullable=False, generated=True)
+    note = _generated_not_null_cdc_note([code], ["id", "code"])
+    assert "can only be migrated with Full load only" in note and "drop the NOT NULL" not in note
+    assert "every insert and update" in _generated_not_null_cdc_note([code], ["id"])

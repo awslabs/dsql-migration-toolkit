@@ -992,14 +992,17 @@ class PartitionedTableRule(Rule):
                             "change the source -- this tool only reads it). What needs a "
                             "decision is whatever depended on the partitions, as described "
                             "above. If you replicate with CDC, pause partition maintenance "
-                            "until cut over, or plan to delete those rows on the target: "
+                            "until cut over, or plan to repair the table on the target: "
                             + (
-                                "dropping or detaching a partition"
+                                "dropping, detaching or truncating a partition (a TRUNCATE "
+                                "on a partition is not replicated at all) removes rows, and "
+                                "attaching one that already holds rows adds them, with no "
+                                "row-level change CDC can carry -- so Aurora DSQL keeps the "
+                                "removed rows and lacks the attached ones."
                                 if self._is_postgres
-                                else "DROP or TRUNCATE PARTITION"
+                                else "DROP or TRUNCATE PARTITION removes rows without a "
+                                "row-level delete CDC can carry, so they stay on Aurora DSQL."
                             )
-                            + " removes rows without a row-level delete CDC can carry, so "
-                            "they stay on Aurora DSQL."
                         ),
                         effort=EffortLevel.MEDIUM,
                         # Advisory, matching the converter's own grading of the same fact:

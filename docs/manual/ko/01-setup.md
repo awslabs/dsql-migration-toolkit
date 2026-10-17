@@ -78,7 +78,7 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 
 - **MySQL 소스 — 바이너리 로깅이 ROW 포맷·full row image로 켜져 있어야 합니다** — `log_bin=ON`,
   `binlog_format=ROW`, `binlog_row_image=FULL`, 그리고 MySQL 8.0 이상에서는 `binlog_row_value_options`를
-  비워 둡니다(`PARTIAL_JSON`은 JSON 업데이트를 CDC가 적용할 수 없는 diff로 기록합니다). CDC의 **필수 요건**입니다(충족 안 되면 게이트가 CDC를
+  비워 둡니다(`PARTIAL_JSON`은 JSON 업데이트를 CDC가 적용할 수 없는 diff로 기록합니다. 비운 뒤에는 소스를 재부팅하거나 애플리케이션의 커넥션 풀을 재활용하세요. 변경 전에 열린 커넥션은 계속 diff를 기록합니다). CDC의 **필수 요건**입니다(충족 안 되면 게이트가 CDC를
   실패 처리). 관리형 MySQL에서 설정하는 방법:
   - **RDS for MySQL:** `log_bin`을 **직접 켤 수 없고** `my.cnf`도 **편집할 수 없습니다.** 대신
     **자동 백업**을 켜면(백업 보존 기간 > 0) 바이너리 로깅이 켜지고, 그다음 인스턴스에 연결된 **커스텀

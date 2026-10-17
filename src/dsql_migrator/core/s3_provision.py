@@ -803,7 +803,13 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   * a PostgreSQL date infinity read by a Debezium SNAPSHOT (JDBC) is mapped too: pgjdbc's
 #     infinity Date, whose epoch day Debezium wraps to int (-622191234 / -625821272, a day
 #     apart by the worker's time zone) -- the streaming sentinels alone left those rows
-#     dead-lettered as dates far below PostgreSQL's range.
+#     dead-lettered as dates far below PostgreSQL's range;
+#   * a duration bound as an interval into a time column is refused at bind time (22008,
+#     naming the column) when the value-fit guard could not read the column types: PostgreSQL's
+#     assignment cast interval -> time kept only the time of day (30:00:00 landed as 06:00:00);
+#   * float8out's shortest digits at a power of two (2^-24 is 5.960464477539063e-08): the
+#     half-ulp interval is asymmetric there, and only the nearest candidate was tried, so a
+#     CDC-written point (or float8[]) differed from Full Load's text.
 PLUGIN_VERSION = "v54"
 
 

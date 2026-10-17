@@ -239,6 +239,12 @@ def stale_numeric_render_scales(
     return stale
 
 
+# Target kinds a MySQL TIME duration lands in (the exporter writes it there as text).
+_DURATION_TARGET_KINDS = frozenset(
+    {"interval", "text", "varchar", "character varying", "char", "character", "bpchar"}
+)
+
+
 def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str:
     """Classify ``column`` into the render family used by the checksum builders.
 
@@ -280,6 +286,16 @@ def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str
     # vocabulary map_mysql_type produces, so the branches below apply unchanged; falls
     # back to the source-derived default mapping when no applied type is known.
     applied = column.target_type
+    # A MySQL TIME remapped to interval or text holds durations (outside 0..24h): compared
+    # as a count of microseconds on both ends, so the spelling a write path chose (Full
+    # Load's and the sink's [-]HH:MM:SS[.f], or an older '1 day 06:00:00') cannot matter,
+    # and a TIME(6)'s fixed fraction ('05:00:00.000000') is no mismatch.
+    if (
+        not source_is_postgres
+        and base == "time"
+        and (applied or "").split("(", 1)[0].strip().lower() in _DURATION_TARGET_KINDS
+    ):
+        return "duration"
     # PostgreSQL timetz must be detected on the FULL type string BEFORE the "(" split
     # below: format_type spells a precision inline as "time(6) with time zone", which
     # the split collapses to bare "time" (losing the zone). A timetz is rendered
@@ -417,6 +433,14 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         return f"DATE_FORMAT({ident}, '%Y-%m-%d %H:%i:%s.%f')"
     if kind == "time":
         return f"DATE_FORMAT({ident}, '%H:%i:%s.%f')"
+    if kind == "duration":
+        # Signed microseconds; HOUR/MINUTE/SECOND/MICROSECOND of a negative TIME are the
+        # magnitude's parts, so the sign is applied once.
+        return (
+            f"CAST(IF({ident} < TIME'00:00:00', -1, 1) * ((HOUR({ident}) * 3600 + "
+            f"MINUTE({ident}) * 60 + SECOND({ident})) * 1000000 + MICROSECOND({ident})) "
+            "AS CHAR)"
+        )
     if kind == "numeric":
         # Pin the canonical scale so a stored-scale/trailing-zero difference cannot
         # diverge. CAST(... AS DECIMAL(65, s)) prints a plain fixed-scale decimal
@@ -479,6 +503,11 @@ def _pg_checksum_expr(
         ).format(col=ident)
     if kind == "time":
         return sql.SQL("to_char({col}, 'HH24:MI:SS.US')").format(col=ident)
+    if kind == "duration":
+        # The same signed microseconds from the interval (or its text, read as one).
+        return sql.SQL(
+            "(round(extract(epoch from ({col})::interval) * 1000000))::bigint::text"
+        ).format(col=ident)
     if kind == "timetz":
         # timetz stores its offset. The CDC sink writes it UTC-normalized (Debezium's
         # ZonedTime is always GMT) while Full Load preserves the SOURCE offset -- the same

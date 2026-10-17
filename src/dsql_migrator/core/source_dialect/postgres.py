@@ -359,7 +359,9 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
     # The element's modifier: on the ATTRIBUTE for a plain column, on the DOMAIN for a
     # domain column. numeric(p,s)[] vs numeric[] is the only place it decides anything.
     "CASE WHEN a.atttypmod <> -1 THEN a.atttypmod "
-    "     WHEN t.typtype = 'd' THEN t.typtypmod ELSE -1 END AS element_typmod "
+    "     WHEN t.typtype = 'd' THEN t.typtypmod ELSE -1 END AS element_typmod, "
+    # NOT NULL: a column left out of the event then has every write refused (23502).
+    "a.attnotnull AS not_null "
     "FROM pg_catalog.pg_attribute a "
     "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
@@ -1837,6 +1839,7 @@ class PostgresSourceDialect(SourceDialect):
                             column=str(r[1]),
                             declared_type=str(r[2]),
                             reason=reason,
+                            nullable=(not bool(r[6])) if len(r) > 6 else None,
                         )
                     )
                 uncarryable = {k: tuple(v) for k, v in found.items()}

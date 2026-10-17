@@ -800,6 +800,16 @@ final class DebeziumTypeConverter {
       if (candidate.compareTo(low) > 0 && candidate.compareTo(high) < 0) {
         return candidate;
       }
+      // At a power of two the half-ulp interval is asymmetric (the gap below is half the gap
+      // above), so the nearest candidate can fall outside it while the one on the other side
+      // is inside: float8out (Ryu) takes that one at this length (2^-24 is
+      // 5.960464477539063e-08, not 5.9604644775390625e-08).
+      for (RoundingMode mode : new RoundingMode[] {RoundingMode.FLOOR, RoundingMode.CEILING}) {
+        BigDecimal other = exact.round(new MathContext(digits, mode));
+        if (other.compareTo(low) > 0 && other.compareTo(high) < 0) {
+          return other;
+        }
+      }
     }
     return exact;
   }

@@ -534,9 +534,11 @@ _MYSQL_IDENTITY_INTEGERS = frozenset(
 MYSQL_TIME_NOTE = (
     "MySQL TIME is a duration (-838:59:59..838:59:59); Aurora DSQL 'time' is "
     "a time-of-day (00:00:00..24:00:00). In-range values convert cleanly, but "
-    "any value outside that range has no 'time' representation and fails per "
-    "row during Full Load. If this column stores durations, remap it to "
-    "interval or text (the converted DDL is editable) before loading."
+    "a value outside that range has no 'time' representation and fails the "
+    "table's Full Load. If this column stores durations, remap it to "
+    "interval or text (the converted DDL is editable) before loading: Full Load and "
+    "CDC then both write [-]HH:MM:SS[.f] with the hours not capped at 24, and "
+    "Validation compares the durations."
 )
 
 
@@ -3584,8 +3586,8 @@ def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
         if required:
             parts.append(
                 f"{', '.join(required)} {'is' if len(required) == 1 else 'are'} NOT NULL, "
-                "so such a row is refused instead (SQLSTATE 23502, shown on the CDC step "
-                "as a column the source dropped): choose Full load only for this table, or "
+                "so such a row -- an insert or an update -- is refused instead (SQLSTATE "
+                "23502, shown on the CDC step): choose Full load only for this table, or "
                 "drop the NOT NULL from the target DDL before applying (Aurora DSQL cannot "
                 "add it back afterwards)."
             )

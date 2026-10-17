@@ -268,20 +268,33 @@ class UnsupportedRelationRule(Rule):
         return findings
 
 
-def _generated_not_null_cdc_note(columns) -> str:
-    """What CDC does to a NOT NULL generated column it never carries: every insert it
-    writes leaves the column out, so the target refuses it (23502, which the CDC step
-    reports as a dropped column)."""
+def _generated_not_null_cdc_note(columns, primary_key=()) -> str:
+    """What CDC does to a NOT NULL generated column it never carries: every insert and
+    update it writes leaves the column out, so the target refuses it (23502). A key column
+    cannot drop its NOT NULL -- nor stream at all, the change event's key lacking it -- so
+    that table can only move with Full load only."""
     if not columns:
         return ""
-    names = ", ".join(c.name for c in columns)
-    return (
-        f" {names} {'is' if len(columns) == 1 else 'are'} NOT NULL: if you replicate with "
-        "CDC, every insert CDC writes leaves the column out, so Aurora DSQL refuses it "
-        "(SQLSTATE 23502, shown on the CDC step as a column the source dropped) -- choose "
-        "Full load only for this table, or drop the NOT NULL from the target DDL in Schema "
-        "Conversion before applying (Aurora DSQL cannot add it back afterwards)."
-    )
+    keyed = [c.name for c in columns if c.name in set(primary_key or ())]
+    other = [c.name for c in columns if c.name not in set(keyed)]
+    note = ""
+    if other:
+        names = ", ".join(other)
+        note += (
+            f" {names} {'is' if len(other) == 1 else 'are'} NOT NULL: if you replicate with "
+            "CDC, every insert and update CDC writes leaves the column out, so Aurora DSQL "
+            "refuses it (SQLSTATE 23502, shown on the CDC step) -- choose Full load only for "
+            "this table, or drop the NOT NULL from the target DDL in Schema Conversion "
+            "before applying (Aurora DSQL cannot add it back afterwards)."
+        )
+    if keyed:
+        names = ", ".join(keyed)
+        note += (
+            f" {names} {'is' if len(keyed) == 1 else 'are'} in the primary key, which CDC "
+            "cannot write without (a key column keeps its NOT NULL): this table can only be "
+            "migrated with Full load only."
+        )
+    return note
 
 
 class PgGeneratedColumnRule(Rule):
@@ -372,7 +385,8 @@ class PgGeneratedColumnRule(Rule):
                             "and the CDC stream does not carry it either, so any write that "
                             "does not supply the value drifts."
                             + _generated_not_null_cdc_note(
-                                [by_name[name] for name in lost if not by_name[name].nullable]
+                                [by_name[name] for name in lost if not by_name[name].nullable],
+                                table.primary_key,
                             )
                         ),
                         recommendation=(

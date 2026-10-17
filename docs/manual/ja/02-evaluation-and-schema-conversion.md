@@ -493,7 +493,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | `DATETIME` | `timestamp` (タイムゾーンなし) | `timestamp` (UTC wall-clock) | AUTO | **UTC** として扱われ/正規化されます。 |
 | `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 小数秒はマイクロ秒まで保持されます。 |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 絶対的な UTC 時点として格納されます。 |
-| `TIME` | `time` (タイムゾーンなし) | `time` | MANUAL | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。Evaluation もこれを示します (`TIME_TYPE`)。CDC (シンクプラグイン v54 以降) ではこのような値を interval として書き込みます: `interval` にリマップした列には格納され、`time` 列ではその理由とともにデッドレターになります。 |
+| `TIME` | `time` (タイムゾーンなし) | `time` | MANUAL | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。Evaluation もこれを示します (`TIME_TYPE`)。CDC (シンクプラグイン v54 以降) ではこのような値を interval として書き込みます: `interval` にリマップした列には格納され、`time` 列ではその理由とともにデッドレターになります。`interval` またはテキストにリマップすると、Full Load と CDC はどちらも `[-]HH:MM:SS[.f]` (時間は 24 で打ち切らない) で書き込み、Validation は期間の値を比較します。 |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL には `YEAR` 型がありません。`1901–2155` は `smallint` に収まり、整数の年として格納されます (`YEAR` の表示セマンティクスは保持されません)。 |
 
 #### 文字列、バイナリ、構造化

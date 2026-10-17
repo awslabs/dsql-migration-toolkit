@@ -262,9 +262,11 @@ target may already match; the CHECKSUM re-check then clears the hold with no rel
 table your workload truncates routinely (a staging or queue table) raises this on every
 `TRUNCATE`; leave it out of the migration if you don't need its data on Aurora DSQL. Not
 covered: on MySQL, `ALTER TABLE … TRUNCATE PARTITION` and `ALTER TABLE … DROP PARTITION`
-— and on PostgreSQL, dropping or detaching a partition — remove rows without any change
-event, so CDC reports nothing and only Validation shows the extra rows; repair such a
-table the same way, or pause partition maintenance until cut over. A MySQL pipeline that was already
+— and on PostgreSQL, dropping, detaching or truncating a partition (a `TRUNCATE` on a
+partition is not replicated at all) — remove rows without any change event, and attaching a
+partition that already holds rows adds them the same way, so CDC reports nothing and only
+Validation shows the extra (or missing) rows; repair such a table the same way, or pause
+partition maintenance until cut over. A MySQL pipeline that was already
 streaming when you upgraded from an earlier version of the tool starts reporting
 `TRUNCATE` after one Stop CDC → Start CDC.
 

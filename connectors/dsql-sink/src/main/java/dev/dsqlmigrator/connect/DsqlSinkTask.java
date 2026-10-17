@@ -2447,7 +2447,33 @@ public class DsqlSinkTask extends SinkTask {
           value instanceof Number && meta != null && isBooleanParam(meta, i + 1);
       boolean integerParam =
           value instanceof Boolean && meta != null && isIntegerParam(meta, i + 1);
+      // A MySQL TIME duration (bound as an interval) into a time column: PostgreSQL's
+      // assignment cast interval -> time keeps only the time of day (30:00:00 would land as
+      // 06:00:00), so when the value-fit guard could not read the column types this refuses
+      // it here, by name, rather than store a different value.
+      if (meta != null && isDurationIntoTime(value, meta, i + 1)) {
+        List<String> columns = event.isDelete() ? event.pkColumns() : event.columns();
+        String column = i < columns.size() ? columns.get(i) : ("parameter " + (i + 1));
+        throw new SQLException(
+            "Column " + column + ": a MySQL TIME outside 00:00:00..24:00:00 is a duration,"
+                + " which a time-of-day column cannot hold (remap the column to interval at"
+                + " Schema Conversion, as for Full Load)",
+            "22008");
+      }
       ps.setObject(i + 1, bindValue(value, booleanParam, integerParam));
+    }
+  }
+
+  /** An interval (a TIME duration) bound to a time / timetz parameter. */
+  static boolean isDurationIntoTime(Object value, java.sql.ParameterMetaData meta, int idx) {
+    if (!(value instanceof org.postgresql.util.PGobject pg) || !"interval".equals(pg.getType())) {
+      return false;
+    }
+    try {
+      int type = meta.getParameterType(idx);
+      return type == java.sql.Types.TIME || type == java.sql.Types.TIME_WITH_TIMEZONE;
+    } catch (SQLException ignored) {
+      return false;
     }
   }
 

@@ -204,8 +204,9 @@ TRUNCATE가 Full Load 시작 후 그 테이블을 복사하기 전에 실행됐�
 CHECKSUM 재확인으로 리로드 없이 보류가 풀립니다. 워크로드가 주기적으로 TRUNCATE하는 테이블(스테이징·큐
 테이블 등)은 TRUNCATE할 때마다 이 상황이 생기므로, Aurora DSQL에 그 데이터가 필요 없다면 마이그레이션에서
 제외하세요. 다루지 않는 경우: MySQL의 `ALTER TABLE … TRUNCATE PARTITION`과 `ALTER TABLE … DROP PARTITION`
-— 그리고 PostgreSQL에서 파티션을 drop하거나 detach하는 것 — 은 변경 이벤트 없이 행을 지우므로 CDC는 아무것도
-보고하지 않고 extra 행은 Validation에서만 보입니다. 이런 테이블도 같은 방법으로 복구하거나, 컷오버까지 파티션
+— 그리고 PostgreSQL에서 파티션을 drop·detach·truncate하는 것(파티션에 대한 `TRUNCATE`는 아예 복제되지 않음) — 은
+변경 이벤트 없이 행을 지우고, 이미 행이 든 파티션을 attach하면 같은 방식으로 행이 더해지므로 CDC는 아무것도
+보고하지 않고 extra(또는 누락된) 행은 Validation에서만 보입니다. 이런 테이블도 같은 방법으로 복구하거나, 컷오버까지 파티션
 관리를 멈추세요. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL
 파이프라인은 Stop CDC → Start CDC를 한 번 거친 뒤부터 TRUNCATE를 보고합니다.
 

@@ -265,6 +265,26 @@ def value_fit_rule(
     return None
 
 
+# Target kinds a MySQL TIME duration is written to as text (see ValueConverter).
+_DURATION_TARGET_KINDS = frozenset(
+    {"interval", "text", "varchar", "character varying", "char", "character", "bpchar"}
+)
+
+
+def duration_text(value: timedelta) -> str:
+    """``[-]HH:MM:SS[.f]`` of a MySQL TIME duration: hours not capped at 24, the fraction
+    without trailing zeros -- the text PostgreSQL prints for the interval the CDC sink binds
+    (IntervalStyle postgres), so both write paths store the same text. Pure."""
+    micros = value.days * 86_400_000_000 + value.seconds * 1_000_000 + value.microseconds
+    sign = "-" if micros < 0 else ""
+    micros = abs(micros)
+    hours, rest = divmod(micros, 3_600_000_000)
+    minutes, rest = divmod(rest, 60_000_000)
+    seconds, fraction = divmod(rest, 1_000_000)
+    text = f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return text + (f".{fraction:06d}".rstrip("0") if fraction else "")
+
+
 class ValueConverter:
     """Converts MySQL cell values to canonical values for the DSQL target type.
 
@@ -315,6 +335,16 @@ class ValueConverter:
             for column in table.columns
             if column.mysql_type.strip().lower().split("(", 1)[0] == "bit"
         )
+        # Source MySQL TIME columns remapped to interval or a text type (durations): the
+        # driver's timedelta is written as the CDC sink writes it, [-]HH:MM:SS[.f] with the
+        # hours not capped at 24 -- psycopg's own interval text ('1 day 6:00:00') stored
+        # another value in a text column, and another spelling in an interval one.
+        self._duration_columns: frozenset[str] = frozenset(
+            column.name
+            for column in table.columns
+            if column.mysql_type.strip().lower().split("(", 1)[0] == "time"
+            and self._kinds.get(column.name) in _DURATION_TARGET_KINDS
+        )
         # Fast-path: columns whose target kind needs no conversion (int, varchar,
         # numeric, text, etc.). For a typical OLTP table 80-90% of columns fall
         # here. convert_row skips convert_value entirely for these, replacing 7+
@@ -325,7 +355,9 @@ class ValueConverter:
         self._passthrough_columns: frozenset[str] = frozenset(
             name
             for name, kind in self._kinds.items()
-            if kind not in _NEEDS_CONVERSION_KINDS and name not in self._bit_columns
+            if kind not in _NEEDS_CONVERSION_KINDS
+            and name not in self._bit_columns
+            and name not in self._duration_columns
         )
 
     def convert_value(self, column_name: str, value: object) -> object:
@@ -339,6 +371,8 @@ class ValueConverter:
             if isinstance(value, (bytes, bytearray, memoryview)):
                 return int.from_bytes(bytes(value), byteorder="big")
             return value
+        if column_name in self._duration_columns and isinstance(value, timedelta):
+            return duration_text(value)
         kind = self._kinds.get(column_name)
         if kind == "boolean":
             if isinstance(value, bool):
@@ -396,6 +430,10 @@ class ValueConverter:
             # guard.
             if isinstance(value, timedelta):
                 total = value.total_seconds()
+                if value == timedelta(hours=24):
+                    # PostgreSQL's time holds 24:00:00 exactly (datetime.time cannot), as
+                    # the CDC sink writes it.
+                    return "24:00:00"
                 if 0 <= total < 86400:
                     secs = int(total)
                     micros = value.microseconds

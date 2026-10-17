@@ -826,7 +826,10 @@ def check_binlog_row_format(variables: dict[str, str]) -> PrerequisiteResult:
         )
         remediation = (
             "Clear binlog_row_value_options (set it to an empty value) in the source's "
-            "parameter group."
+            "parameter group, then reboot the source or recycle the applications' "
+            "connection pools before Full Load and Start CDC: the change reaches new "
+            "connections only, and one opened before it keeps logging partial JSON "
+            "updates, which CDC drops without a sign (this check reads the global value)."
         )
     else:
         detail = "Binary logging is not ROW/FULL or is disabled."
@@ -835,7 +838,8 @@ def check_binlog_row_format(variables: dict[str, str]) -> PrerequisiteResult:
             "(RDS parameter group)."
             + (
                 " Also clear binlog_row_value_options (PARTIAL_JSON): CDC cannot apply "
-                "partial JSON updates."
+                "partial JSON updates. A binlog setting reaches new connections only, so "
+                "reboot the source or recycle the applications' connection pools afterwards."
                 if partial_json
                 else ""
             )

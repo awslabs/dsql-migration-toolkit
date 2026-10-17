@@ -363,6 +363,13 @@ class DebeziumTypeConverterTest {
     assertEquals("-0", DebeziumTypeConverter.pgFloat8Text(-0.0));
     assertEquals("NaN", DebeziumTypeConverter.pgFloat8Text(Double.NaN));
     assertEquals("-Infinity", DebeziumTypeConverter.pgFloat8Text(Double.NEGATIVE_INFINITY));
+    // At a power of two the half-ulp interval is asymmetric: float8out (Ryu) finds the
+    // shorter candidate on the far side (2^-24, 2^-44, 2^89), where only the nearest was tried.
+    assertEquals("5.960464477539063e-08", DebeziumTypeConverter.pgFloat8Text(Math.pow(2, -24)));
+    assertEquals("5.684341886080802e-14", DebeziumTypeConverter.pgFloat8Text(Math.pow(2, -44)));
+    assertEquals("6.189700196426902e+26", DebeziumTypeConverter.pgFloat8Text(Math.pow(2, 89)));
+    assertEquals("0.5", DebeziumTypeConverter.pgFloat8Text(0.5));
+    assertEquals("1024", DebeziumTypeConverter.pgFloat8Text(1024.0));
     assertEquals("1.7976931348623157e+308", DebeziumTypeConverter.pgFloat8Text(Double.MAX_VALUE));
   }
 

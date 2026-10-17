@@ -1877,6 +1877,29 @@ _DRIFT_LABELS: dict[str, tuple[str, str]] = {
 
 # The same "why" for a PostgreSQL source, which has no TINYINT(1): there a boolean target only
 # meets other numbers after a source boolean column was changed to an integer type.
+# A MySQL TIME duration (outside 00:00:00..24:00:00) the sink refuses for a time column.
+_VALUE_FIT_TIME_WHY = (
+    "the sink set these rows aside instead of writing a value this column would change: a "
+    "MySQL TIME outside 00:00:00..24:00:00 is a duration, which an Aurora DSQL time column "
+    "(a time of day) cannot hold -- give the column the interval type instead. Values that "
+    "fit keep flowing"
+)
+
+
+def _value_fit_times_only(group) -> bool:
+    """Whether every column a value-fit group names is a time column (a TIME duration)."""
+
+    def _is_time(name: str) -> bool:
+        lowered = name.lower()
+        if lowered.endswith((" time", " time without time zone", " time with time zone")):
+            return True
+        head, sep, tail = lowered.rpartition(" time(")
+        return bool(head and sep) and tail.endswith(")") and tail[:-1].isdigit()
+
+    columns = [str(c) for c in (getattr(group, "columns", None) or ())]
+    return bool(columns) and all(_is_time(c) for c in columns)
+
+
 _VALUE_FIT_WHY_PG = (
     "the sink set these rows aside instead of writing a value this column would change: a "
     "number other than 0 or 1 for a boolean column would be stored as true or false (after a "
@@ -1912,7 +1935,8 @@ _SINK_VALUE_FIT_CODE = "VALUE_DOES_NOT_FIT"
 _DROP_COLUMN_NOT_SENT_WHY = (
     "the change records do not carry this column, which the Aurora DSQL table requires (NOT "
     "NULL, no DEFAULT), so DSQL rejected the rows (SQLSTATE 23502): usually the source "
-    "dropped it"
+    "dropped it, or CDC never carries it (a generated column, or a PostgreSQL type Debezium "
+    "has no converter for)"
 )
 _DROP_COLUMN_TOAST_PG = (
     ", or an update left its large (TOASTed) value unchanged, which PostgreSQL does not resend"
@@ -1955,6 +1979,10 @@ def _drift_why(group, *, is_pg: bool, cdc_only: bool = False) -> str:
         server = codes - {_SINK_VALUE_FIT_CODE}
         if server and _SINK_VALUE_FIT_CODE not in codes:
             return _VALUE_FIT_SERVER_WHY.format(pg=_VALUE_FIT_SERVER_PG if is_pg else "")
+        # A MySQL TIME duration refused for a time-of-day column: its own reason, not the
+        # boolean / fraction / decimal-places one (and no TINYINT(1) advice).
+        if not is_pg and _value_fit_times_only(group):
+            return _VALUE_FIT_TIME_WHY + (_VALUE_FIT_SERVER_ALSO if server else "")
         why = _VALUE_FIT_WHY_PG if is_pg else why
         return why + (_VALUE_FIT_SERVER_ALSO if server else "")
     if kind == "drop-column" and getattr(group, "columns", None):
@@ -2407,7 +2435,7 @@ def _value_fit_remap(drift) -> bool:
     return any(
         not getattr(g, "codes", None) or _SINK_VALUE_FIT_CODE in g.codes
         for g in drift
-        if getattr(g, "kind", "") == "value-does-not-fit"
+        if getattr(g, "kind", "") == "value-does-not-fit" and not _value_fit_times_only(g)
     )
 
 

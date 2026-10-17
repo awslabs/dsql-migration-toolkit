@@ -93,7 +93,8 @@ what's missing, but setting them up is a source-side task you do once.
 - **MySQL source — binary logging must be on, in ROW format with a full row image**
   — `log_bin=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, and on MySQL 8.0+
   `binlog_row_value_options` left empty (`PARTIAL_JSON` logs a JSON update as a diff CDC
-  cannot apply). This is a **hard requirement** for CDC (the gate fails CDC if it isn't
+  cannot apply; after clearing it, reboot the source or recycle the applications' connection
+  pools, since a connection opened before the change keeps logging diffs). This is a **hard requirement** for CDC (the gate fails CDC if it isn't
   met). How to set it on managed MySQL:
   - **RDS for MySQL:** you **can't turn `log_bin` on directly** and you **can't edit
     `my.cnf`**. Instead, enable **automated backups** (set the backup retention

@@ -477,7 +477,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | `DATETIME` | `timestamp`(시간대 없음) | `timestamp` (UTC wall-clock) | AUTO | **UTC**로 취급/정규화. |
 | `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 소수 초를 마이크로초까지 보존. |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 절대 UTC 시각으로 저장. |
-| `TIME` | `time`(시간대 없음) | `time` | MANUAL | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). Evaluation도 이를 표시합니다(`TIME_TYPE`). CDC(싱크 플러그인 v54 이상)에서는 이런 값을 interval로 씁니다: `interval`로 리매핑한 컬럼에는 저장되고, `time` 컬럼에서는 그 이유와 함께 dead-letter 처리됩니다. |
+| `TIME` | `time`(시간대 없음) | `time` | MANUAL | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). Evaluation도 이를 표시합니다(`TIME_TYPE`). CDC(싱크 플러그인 v54 이상)에서는 이런 값을 interval로 씁니다: `interval`로 리매핑한 컬럼에는 저장되고, `time` 컬럼에서는 그 이유와 함께 dead-letter 처리됩니다. `interval`이나 텍스트로 리매핑하면 Full Load와 CDC가 모두 `[-]HH:MM:SS[.f]`(시간은 24에서 끊지 않음)로 쓰고 Validation은 기간 값을 비교합니다. |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL에 `YEAR` 타입 없음; `1901–2155`가 `smallint`에 들어가며 정수 연도로 저장(`YEAR` 표시 의미는 보존 안 됨). |
 
 #### 문자열, 바이너리, 구조화

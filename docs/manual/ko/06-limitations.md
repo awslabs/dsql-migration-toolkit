@@ -198,8 +198,8 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   데드레터로 보내고 CDC 단계에 테이블 이름을 표시합니다. 남은 행을 지우고(Full Load + CDC는 Drop & reload,
   CDC only는 직접 삭제) 그 테이블이 CHECKSUM으로 일치할 때까지 Cut over가 보류됩니다
   ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조). MySQL의
-  `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` — 그리고 PostgreSQL에서 파티션 drop·detach —
-  은 변경 이벤트를 전혀 만들지 않으며, 남은 행은 Validation에서만 보입니다. 컷오버까지 파티션 관리를 멈추세요. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL 파이프라인은
+  `ALTER TABLE … TRUNCATE PARTITION` / `DROP PARTITION` — 그리고 PostgreSQL에서 파티션 drop·detach·truncate나
+  이미 행이 든 파티션의 attach — 은 변경 이벤트를 전혀 만들지 않으며, 남은(또는 누락된) 행은 Validation에서만 보입니다. 컷오버까지 파티션 관리를 멈추세요. 이전 버전의 도구에서 업그레이드할 때 이미 스트리밍 중이던 MySQL 파이프라인은
   Stop CDC → Start CDC를 한 번 거친 뒤부터 `TRUNCATE`를 감지합니다.
 - **MySQL: CDC 시작 지점과 그 지점을 쓰는 Start 사이의 스키마 변경.** 새 시작 위치를 시드하는 MySQL
   Start는 Debezium을 `snapshot.mode=recovery`로 실행합니다: Full Load 워터마크나 Manual binlog 시작

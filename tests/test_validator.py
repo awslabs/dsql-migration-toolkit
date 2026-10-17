@@ -3651,3 +3651,36 @@ def test_a_refused_postgres_table_read_cannot_fail_the_tables_after_it(monkeypat
         _SOURCE_CONFIG, _TARGET_CONFIG, [_table("items")], ValidationMode.ROW_COUNT
     )
     assert not any("SAVEPOINT" in s for s in mysql.executed)
+
+
+def test_a_mysql_time_remapped_to_interval_or_text_is_compared_as_a_duration() -> None:
+    """Full Load wrote '1 day 06:00:00' and the sink '30:00:00' for the same duration, and
+    Validation compared CAST(t AS CHAR) with ::text: every row outside a day, and every row
+    of a TIME(6) ('05:00:00.000000' vs '05:00:00'), mismatched -- following the tool's own
+    remap advice ended in a permanent MISMATCH."""
+    from datetime import timedelta
+
+    from dsql_migrator.core.exporter import ValueConverter
+    from dsql_migrator.core.models import ColumnDef, TableDef
+    from dsql_migrator.core.validation_sql import (
+        _checksum_kind,
+        _mysql_checksum_expr,
+        _pg_checksum_expr,
+    )
+
+    for target in ("interval", "text"):
+        column = ColumnDef(name="worked", mysql_type="time(6)", target_type=target)
+        assert _checksum_kind(column) == "duration"
+        assert "MICROSECOND(`worked`)" in _mysql_checksum_expr(column)
+        assert "extract(epoch from" in _pg_checksum_expr(column).as_string(None)
+    assert _checksum_kind(ColumnDef(name="t", mysql_type="time", target_type="time")) == "time"
+
+    table = TableDef(name="shop.shifts", columns=[ColumnDef(name="id", mysql_type="int"),
+                                                  ColumnDef(name="worked", mysql_type="time"),
+                                                  ColumnDef(name="at", mysql_type="time")],
+                     primary_key=["id"])
+    convert = ValueConverter(table, target_types={"worked": "interval"}).convert_value
+    assert convert("worked", timedelta(hours=30)) == "30:00:00"  # as the sink writes it
+    assert convert("worked", timedelta(seconds=-1.5)) == "-00:00:01.5"
+    # A time column holds exactly 24:00:00, as the CDC sink and the conversion note say.
+    assert ValueConverter(table).convert_value("at", timedelta(hours=24)) == "24:00:00"

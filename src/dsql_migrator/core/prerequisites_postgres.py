@@ -232,7 +232,10 @@ def uncarryable_columns_of(table: TableDef) -> "list[UncarryableCdcColumn]":
         if reason is not None:
             found.append(
                 UncarryableCdcColumn(
-                    column=column.name, declared_type=column.mysql_type, reason=reason
+                    column=column.name,
+                    declared_type=column.mysql_type,
+                    reason=reason,
+                    nullable=column.nullable,
                 )
             )
     return found
@@ -286,6 +289,9 @@ class UncarryableCdcColumn:
     column: str
     declared_type: str
     reason: str
+    # NOT NULL on the source (and so on the target): a column left out of the change event
+    # then has every insert and update refused (23502), not landed NULL. None: not read.
+    nullable: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -1293,7 +1299,11 @@ def uncarryable_column_texts(
     wording, which Evaluation's ``CDC_UNCARRYABLE_COLUMN`` finding repeats, so both steps
     describe the same columns the same way. Pure."""
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
-    nulled = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
+    # Left out of the event: NULL on a nullable column, but a NOT NULL one has every insert
+    # and update refused -- Aurora DSQL checks NOT NULL before ON CONFLICT.
+    dropped = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
+    refused = [c for c in dropped if c.nullable is False]
+    nulled = [c for c in dropped if c.nullable is not False]
     wrong = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
 
     sentences: list[str] = []
@@ -1307,9 +1317,16 @@ def uncarryable_column_texts(
             "reached for a non-NULL value, live-verified -- so this is not necessarily the "
             "whole table."
         )
+    if refused:
+        sentences.append(
+            f"{_describe_columns(refused)} {_is_are(refused)} dropped from the change event "
+            "but NOT NULL on the target, so Aurora DSQL refuses EVERY insert and update CDC "
+            "writes for this table (SQLSTATE 23502): they are dead-lettered (counted on the "
+            "CDC step's dead-letter panel) and do not reach the target."
+        )
     # "Separately" because when the table already dead-letters, a column-level loss is a
     # SECOND finding about the same table rather than a milder description of the first.
-    lead = "Separately, " if fatal else ""
+    lead = "Separately, " if fatal or refused else ""
     if nulled:
         sentences.append(
             f"{lead}{_describe_columns(nulled)} {_is_are(nulled)} dropped from the change "
@@ -1341,9 +1358,16 @@ def uncarryable_column_texts(
         if any(c.declared_type.startswith("numeric[") for c in fatal)
         else ""
     )
+    not_null_route = (
+        "drop the NOT NULL from the target DDL in Schema Conversion before applying (the "
+        "column then lands NULL, as on a nullable one), "
+        if refused
+        else ""
+    )
     remediation = (
         "Decide before the CDC infrastructure is created: "
         + numeric_route
+        + not_null_route
         + "exclude the column in Exclude tables & columns (under the table list; it "
         "then migrates as NULL and CDC never captures it), "
         "remodel the column on the source to a type CDC does carry (text / text[] "

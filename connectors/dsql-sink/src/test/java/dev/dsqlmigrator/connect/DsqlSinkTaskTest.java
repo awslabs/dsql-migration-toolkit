@@ -368,6 +368,27 @@ class DsqlSinkTaskTest {
   // --- The pre-write value-fit guard (ValueFit) and its bind backstop ----------
 
   @Test
+  void aDurationBoundIntoATimeColumnIsRefusedNotWrapped() throws Exception {
+    // With the value-fit check off, an interval '30:00:00' bound to a time column went
+    // through PostgreSQL's assignment cast and landed as 06:00:00.
+    org.postgresql.util.PGobject duration = new org.postgresql.util.PGobject();
+    duration.setType("interval");
+    duration.setValue("30:00:00");
+    java.sql.ParameterMetaData meta =
+        (java.sql.ParameterMetaData)
+            Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[] {java.sql.ParameterMetaData.class},
+                (proxy, method, args) ->
+                    "getParameterType".equals(method.getName())
+                        ? ((Integer) args[0] == 1 ? java.sql.Types.TIME : java.sql.Types.OTHER)
+                        : null);
+    assertTrue(DsqlSinkTask.isDurationIntoTime(duration, meta, 1));
+    assertFalse(DsqlSinkTask.isDurationIntoTime(duration, meta, 2)); // an interval column
+    assertFalse(DsqlSinkTask.isDurationIntoTime("30:00:00", meta, 1));
+  }
+
+  @Test
   void bindValueCoercesOnlyAnExactZeroOrOne() {
     // The old bind turned ANY number bound to a boolean parameter into `longValue() != 0`, so
     // a MySQL TINYINT(1) holding 2 was written as true and 0.5 as false -- silently. Now only
