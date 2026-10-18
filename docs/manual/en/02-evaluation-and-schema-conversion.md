@@ -55,7 +55,8 @@ For a PostgreSQL source, Evaluation also reads two things the inventory does not
   `CACHE 65536` when the source already caches (Aurora DSQL accepts only those), and the
   source's own bounds when they are not bigint's. Create it before cut over, and once source
   writes stop move it past the source's final value with `setval`: the tool neither creates
-  nor syncs it.
+  nor syncs it, and the Cut over step lists each one with the statements to run
+  ([§10.3](10-conclusion.md#103-the-cut-over-switching-your-application-to-dsql)).
 
 If either read fails, the report says so (`PG_CATALOG_UNREAD`) rather than reading as if
 there were none.

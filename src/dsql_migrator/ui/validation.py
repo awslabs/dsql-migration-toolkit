@@ -535,6 +535,7 @@ def resync_identity_sequences(
     aws_profile: Optional[str] = None,
     sync: "Optional[Callable[..., dict]]" = None,
     extras: "Optional[Mapping[str, object]]" = None,
+    heartbeat: "Optional[Callable[[], None]]" = None,
 ) -> dict[str, int]:
     """Advance target identity sequences past the CURRENT ``MAX(pk)``. Best-effort.
 
@@ -560,7 +561,7 @@ def resync_identity_sequences(
     a silent post-cut-over duplicate-key outage, audit finding D2), which the separate
     ``failed`` map makes possible. ``sync`` is an
     injectable seam (tests pass a fake; production uses the introspector over a DSQL
-    connection).
+    connection). ``heartbeat`` (the job's liveness reporter) is called per table.
     """
     if not table_names:
         return {}, {}
@@ -576,7 +577,10 @@ def resync_identity_sequences(
 
         # ``extras``: the source counters and the tables the conversion makes an identity
         # (see identity_sync_extras); only keys that carry something are passed.
-        result = sync(list(table_names), connection_factory=_factory, **dict(extras or {})) or {}
+        kwargs = dict(extras or {})
+        if heartbeat is not None:
+            kwargs["heartbeat"] = heartbeat
+        result = sync(list(table_names), connection_factory=_factory, **kwargs) or {}
     except Exception as exc:  # noqa: BLE001 - never fail a completed validation on this
         # A setup/connection failure is NOT a no-op. Collapsing it into an empty
         # (advanced, failed) pair is indistinguishable from a genuine "nothing to
@@ -2165,6 +2169,9 @@ class ValidationState:
         # instead of being painted as "nothing to advance" (audit finding D2). None
         # until the button runs; then a dict (empty == every table advanced/no-op'd).
         self._cutover_identity_sync_failed: Optional[dict[str, str]] = None
+        # The tables that sync was given (None: not recorded), so a migrated identity table
+        # it did not reach is named instead of read as synced.
+        self._cutover_identity_sync_covered: Optional[tuple[str, ...]] = None
         # Cut-over foreign-key apply outcome (applied, skipped, failed) counts, or None
         # until the operator clicks "Apply foreign keys". For a CDC migration the FK
         # ADD CONSTRAINTs are deferred to cut over (they must not exist while the sink
@@ -2375,11 +2382,16 @@ class ValidationState:
         self,
         advanced: "Optional[dict[str, int]]",
         failed: "Optional[dict[str, str]]" = None,
+        covered: "Optional[Sequence[str]]" = None,
     ) -> None:
-        """Record the cut-over identity-sync button's outcome (advanced + any failures)."""
+        """Record the cut-over identity-sync button's outcome (advanced + any failures) and
+        the tables it was given."""
         with self._lock:
             self._cutover_identity_sync = advanced
             self._cutover_identity_sync_failed = failed
+            self._cutover_identity_sync_covered = (
+                tuple(covered) if covered is not None else None
+            )
 
     @property
     def cutover_identity_sync(self) -> "Optional[dict[str, int]]":
@@ -2396,6 +2408,12 @@ class ValidationState:
         """Tables whose RESTART WITH failed on the last cut-over sync (empty if none)."""
         with self._lock:
             return dict(self._cutover_identity_sync_failed or {})
+
+    @property
+    def cutover_identity_sync_covered(self) -> "Optional[tuple[str, ...]]":
+        """The tables the last cut-over sync was given, or ``None`` if not recorded."""
+        with self._lock:
+            return self._cutover_identity_sync_covered
 
     def mark_run_started(self) -> None:
         """Stamp the start of a run (clears any prior elapsed time)."""
@@ -2547,6 +2565,7 @@ class ValidationState:
             # do not belong to (FIX 5 / FIX 4).
             self._cutover_identity_sync = None
             self._cutover_identity_sync_failed = None
+            self._cutover_identity_sync_covered = None
             self._cutover_fk_apply = None
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
@@ -2707,6 +2726,7 @@ class ValidationState:
             self._identity_sync_failed = None
             self._cutover_identity_sync = None
             self._cutover_identity_sync_failed = None
+            self._cutover_identity_sync_covered = None
             self._cutover_fk_apply = None
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
@@ -3429,7 +3449,15 @@ def build_validation_screen(
                 )
                 advanced, failed = {}, {}
             else:
-                _names = [table.name for table in scoped_tables]
+                # Every migrated identity table, not only the ones this run compared (see
+                # _cutover_identity_tables): a table whose chip is off took CDC's ids too.
+                _names = _with_identity_tables(
+                    [table.name for table in scoped_tables],
+                    lambda: _cutover_identity_tables(
+                        session, eval_store, conversion_store, session_id,
+                        migration_state=migration_state,
+                    ),
+                )
                 advanced, failed = resync_identity_sequences(
                     target_config,
                     _names,
@@ -3439,6 +3467,8 @@ def build_validation_screen(
                         session, eval_store, conversion_store, session_id, _names,
                         migration_state=migration_state,
                     ),
+                    # The job's tail: one beat per table keeps the stall watchdog off it.
+                    heartbeat=getattr(handle, "heartbeat", None),
                 )
                 validation_state.set_identity_sync(advanced, failed)
             if advanced:
@@ -4237,24 +4267,27 @@ def _run_cutover_identity_sync(
     sync: "Optional[Callable[..., dict]]" = None,
     refresh: "Optional[Callable[[], None]]" = None,
     extras: "Optional[Callable[[Sequence[str]], Mapping[str, object]]]" = None,
+    identity_tables: "Optional[Callable[[], Sequence[str]]]" = None,
 ) -> None:
     """Advance identity sequences past the current target ``MAX(pk)`` (operator action).
 
     Invoked by the explicit "Sync identity sequences" button in the cut-over runbook --
     NOT on render, so viewing the screen never writes to the target. Keyed off the
-    CURRENT ``MAX(pk)`` over the validated tables, so any rows CDC delivered after the
-    last Validation are covered before the operator repoints the app (the app's first
-    insert would otherwise collide, 23505). Runs in the background (a target write) so
-    the click never blocks the UI; the outcome is stored on ``validation_state`` and the
+    CURRENT ``MAX(pk)`` over the validated tables and every migrated identity table
+    (``identity_tables``, read in the job: a table left out of the last Validation is
+    synced too), so any rows CDC delivered after the last Validation are covered before
+    the operator repoints the app (the app's first insert would otherwise collide,
+    23505). Runs in the background (a target write) so the click never blocks the UI;
+    the outcome and the tables it covered are stored on ``validation_state`` and the
     screen refreshes to show it. Best-effort -- ``resync_identity_sequences`` never
     raises; the ``is_identity`` catalog filter skips non-identity tables.
     """
     target_config = getattr(session, "target_config", None)
-    table_names = [item.table for item in report.items] if report is not None else []
-    if target_config is None or not table_names:
+    report_names = [item.table for item in report.items] if report is not None else []
+    if target_config is None or (not report_names and identity_tables is None):
         # Nothing to sync (no target / no tables): record an empty result so the button
         # reflects "ran, nothing to do" rather than staying in the un-run state.
-        validation_state.set_cutover_identity_sync({})
+        validation_state.set_cutover_identity_sync({}, covered=())
         if refresh is not None:
             refresh()
         return
@@ -4262,12 +4295,14 @@ def _run_cutover_identity_sync(
 
     def _work(_handle: object = None) -> None:
         # Read in the background job, like the sync: it reads the source.
+        table_names = _with_identity_tables(report_names, identity_tables)
         advanced, failed = resync_identity_sequences(
             target_config,
             table_names,
             aws_profile=aws_profile,
             sync=sync,
             extras=extras(table_names) if extras is not None else None,
+            heartbeat=getattr(_handle, "heartbeat", None),
         )
         if advanced:
             detail = ", ".join(
@@ -4312,7 +4347,7 @@ def _run_cutover_identity_sync(
                     status=ActivityStatus.FAILURE,
                     detail=not_identity_detail(not_identity),
                 )
-        validation_state.set_cutover_identity_sync(advanced, failed)
+        validation_state.set_cutover_identity_sync(advanced, failed, covered=table_names)
         if refresh is not None:
             refresh()
 
@@ -4737,6 +4772,8 @@ def _cutover_integrity_detail(
     *,
     inputs_missing: bool = False,
     fks_stripped: bool = False,
+    identity_missed: "Sequence[str]" = (),
+    standalone_sequences: int = 0,
 ) -> str:
     """One clause stating whether the target went live with its foreign keys enforced.
 
@@ -4753,6 +4790,11 @@ def _cutover_integrity_detail(
     "none in scope"; the render already distinguishes them with
     :func:`_cutover_gate_inputs_missing`, so the log now takes the same two predicates
     rather than collapsing a deliberate integrity trade-off into "nothing to do".
+
+    ``identity_missed`` names the migrated identity tables the sync did not reach
+    (:func:`_identity_sync_missed`): the clause then never reads "synced".
+    ``standalone_sequences`` counts the source sequences no column owns, which the tool
+    neither creates nor syncs (Evaluation's ``PG_STANDALONE_SEQUENCE``).
 
     Pure: reads the already-recorded outcomes, no DB. Counts and states only, never a row
     value (Property 7).
@@ -4785,9 +4827,10 @@ def _cutover_integrity_detail(
     # built from the counts, so a failure never reads "synced (nothing to advance), 1 FAILED".
     failed = dict(getattr(validation_state, "cutover_identity_sync_failed", None) or {})
     real, not_identity = _split_not_identity(failed) if synced is not None else ({}, [])
+    missed = list(identity_missed) if synced is not None else []
     if synced is None:
         identity = "identity sequences not synced"
-    elif not real and not not_identity:
+    elif not real and not not_identity and not missed:
         identity = (
             f"identity sequences synced ({len(synced)} advanced)"
             if synced
@@ -4799,7 +4842,11 @@ def _cutover_integrity_detail(
             counts.append(f"{len(real)} FAILED")
         if not_identity:
             counts.append(f"{len(not_identity)} with no identity on the target")
+        if missed:
+            counts.append(f"{len(missed)} NOT synced ({_bounded_names(missed)})")
         identity = "identity sequences: " + ", ".join(counts)
+    if standalone_sequences:
+        identity += f"; standalone sequences left to the operator: {standalone_sequences}"
     return f"{fk}; {identity}"
 
 
@@ -4852,20 +4899,97 @@ def _cutover_pending_identity_tables(
     the same tables ``sync_identity_sequences`` reaches via ``is_identity`` in the
     catalog. Pure and side-effect-free (no DB); cut over is not a hot path.
     """
+    return len(
+        _cutover_identity_tables(
+            session, eval_store, conversion_store, session_id, migration_state=migration_state
+        )
+    )
+
+
+def _cutover_identity_tables(
+    session: object,
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+    *,
+    migration_state: object = None,
+) -> "list[str]":
+    """The migrated tables whose applied conversion makes the key an identity (what
+    :func:`_cutover_pending_identity_tables` counts), ``[]`` without the schema inputs.
+
+    Both identity syncs take these beside the tables a Validation compared: a table left
+    out of the run (its chip off) still took CDC's explicit ids, and its sequence was
+    never moved past them. Syncing it is safe without a comparison: a restart is
+    ``max(MAX + 1, the source's counter)`` and never moves a sequence backwards. Only the
+    selected tables: the foreign-key scope also keeps an unselected table whose keys point
+    into the set, which was never loaded and has no sequence to move. Pure.
+    """
     context = _identity_sync_context(
         session, eval_store, conversion_store, session_id, migration_state=migration_state
     )
     if context is None:
-        return 0
+        return []
     from dsql_migrator.ui.schema_conversion_apply import identity_from_ddl
 
     tables, applied = context
     by_name = {table.name: table for table in tables}
-    return sum(
-        1
+    selected = set(_migrated_tables(migration_state) or by_name)
+    return [
+        name
         for name, conv in applied.items()
-        if name in by_name and identity_from_ddl(by_name[name], conv.target_ddl)
+        if name in by_name
+        and name in selected
+        and identity_from_ddl(by_name[name], conv.target_ddl)
+    ]
+
+
+def _with_identity_tables(
+    names: "Sequence[str]", identity_tables: "Optional[Callable[[], Sequence[str]]]"
+) -> "list[str]":
+    """``names``, then each of ``identity_tables()`` not among them. A failed read keeps
+    ``names`` alone: the screen then names the identity tables the sync did not reach."""
+    out = list(names)
+    if identity_tables is None:
+        return out
+    try:
+        extra = list(identity_tables())
+    except Exception:  # noqa: BLE001 - the compared tables are still synced
+        return out
+    seen = set(out)
+    return out + [name for name in extra if name not in seen]
+
+
+def _cutover_standalone_sequences(
+    eval_store: "Optional[EvaluationStore]", session_id: str
+) -> "list[str]":
+    """The source sequences no column owns (Evaluation's ``PG_STANDALONE_SEQUENCE``
+    items), ``[]`` without an Evaluation report. No sync reaches them -- an identity sync
+    moves a column's own sequence only -- so the runbook names each one for the operator,
+    who moves it past the source's final value before repointing. Pure, no DB."""
+    if eval_store is None:
+        return []
+    from dsql_migrator.core.assessor import PG_STANDALONE_SEQUENCE_RULE_ID
+
+    result = eval_store.get_or_create(session_id).result
+    assessment = getattr(result, "assessment", None) if result is not None else None
+    return sorted(
+        {
+            item.object_name
+            for item in getattr(assessment, "items", None) or ()
+            if item.rule_id == PG_STANDALONE_SEQUENCE_RULE_ID
+        }
     )
+
+
+def _identity_sync_missed(
+    validation_state: "ValidationState", identity_tables: "Sequence[str]"
+) -> "list[str]":
+    """The migrated identity tables the last cut-over sync was not given (``[]`` before it
+    ran): neither its result line nor the acknowledgement may read "synced" over them."""
+    covered = validation_state.cutover_identity_sync_covered
+    if validation_state.cutover_identity_sync is None or covered is None:
+        return []
+    return sorted(set(identity_tables) - set(covered))
 
 
 def _identity_sync_context(
@@ -5300,6 +5424,16 @@ def build_cutover_screen(
                     fks_stripped=_cutover_foreign_keys_stripped(
                         conversion_store, session_id
                     ),
+                    identity_missed=_identity_sync_missed(
+                        validation_state,
+                        _cutover_identity_tables(
+                            session, eval_store, conversion_store, session_id,
+                            migration_state=migration_state,
+                        ),
+                    ),
+                    standalone_sequences=len(
+                        _cutover_standalone_sequences(eval_store, session_id)
+                    ),
                 )
                 # The go-live line must carry the same disclosure as the verdict it
                 # signs off; an auditor who reads only the closing line would otherwise
@@ -5394,6 +5528,10 @@ def build_cutover_screen(
                     session, eval_store, conversion_store, session_id, names,
                     migration_state=migration_state,
                 ),
+                identity_tables=lambda: _cutover_identity_tables(
+                    session, eval_store, conversion_store, session_id,
+                    migration_state=migration_state,
+                ),
             )
 
         # For a CDC migration, foreign keys were deferred during the stream; the runbook's
@@ -5424,10 +5562,11 @@ def build_cutover_screen(
             session, eval_store, conversion_store, session_id,
             migration_state=migration_state,
         )
-        _identity_pending = _cutover_pending_identity_tables(
+        _identity_tables = _cutover_identity_tables(
             session, eval_store, conversion_store, session_id,
             migration_state=migration_state,
         )
+        _identity_pending = len(_identity_tables)
         # Both counts above are 0 when their schema inputs are missing, and 0 hides the
         # action. Distinguish "nothing to apply" from "can't tell" so a session without
         # those inputs is told so instead of shown a silently complete runbook.
@@ -5883,6 +6022,8 @@ def build_cutover_screen(
             identity_sync_provider=_identity_sync_provider,
             identity_sync_result=validation_state.cutover_identity_sync,
             identity_sync_failed=validation_state.cutover_identity_sync_failed,
+            identity_sync_missed=_identity_sync_missed(validation_state, _identity_tables),
+            standalone_sequences=_cutover_standalone_sequences(eval_store, session_id),
             fk_apply_provider=_fk_apply_provider,
             fk_apply_result=validation_state.cutover_fk_apply,
             fk_pending_count=_fk_pending,
@@ -7918,6 +8059,8 @@ def _render_cutover_section(
     identity_sync_provider: "Optional[Callable[[], None]]" = None,
     identity_sync_result: "Optional[dict[str, int]]" = None,
     identity_sync_failed: "Optional[dict[str, str]]" = None,
+    identity_sync_missed: "Sequence[str]" = (),
+    standalone_sequences: "Sequence[str]" = (),
     fk_apply_provider: "Optional[Callable[[], None]]" = None,
     fk_apply_result: "Optional[tuple[int, int, int]]" = None,
     fk_pending_count: int = 0,
@@ -7954,7 +8097,12 @@ def _render_cutover_section(
     nothing to advance; a dict names the advanced sequences; None == not run yet). The
     sync block is shown only when ``identity_pending_count > 0`` (>=1 table converted to a
     server-generated IDENTITY key), symmetric with the FK-apply block's ``fk_pending_count``
-    gate — a schema with no identity key has nothing to sync.
+    gate — a schema with no identity key has nothing to sync. ``identity_sync_missed``
+    names the migrated identity tables the last sync was not given: an error, never "done".
+
+    ``standalone_sequences`` (Evaluation's ``PG_STANDALONE_SEQUENCE`` items) adds "Before
+    you repoint: move standalone sequences past the source": no sync reaches a sequence no
+    column owns, so each is named with the source read and the Aurora DSQL statement.
 
     The FK-apply block is shown whenever ``fk_pending_count > 0`` (regardless of CDC): a
     CDC migration applies the deferred FKs here, and a Full-Load-only migration re-offers
@@ -7999,14 +8147,14 @@ def _render_cutover_section(
                  "same rows."),
                 ("4", "Re-run validation here for the final go/no-go — do this AFTER "
                  "the drain (step 3). Cut over only on a clean MATCH (or differences "
-                 "you can fully explain). This final run also advances any "
-                 "auto-generated / identity key sequence past the rows CDC delivered, "
-                 "so the app's first insert after cut-over cannot collide with a "
-                 "migrated id. Tables with dead-lettered CDC changes are compared by "
-                 "CHECKSUM automatically, and Cut over re-reads the CDC dead-letter "
-                 "queue before this runbook opens; a dead letter found by a later read "
-                 "(each time you reopen this step, at most once a minute) locks it "
-                 "again until that table is re-checked."),
+                 "you can fully explain). This final run also advances the sequence "
+                 "of each identity key (only sequences a column owns) past the rows "
+                 "CDC delivered, so the app's first insert after cut-over cannot "
+                 "collide with a migrated id. Tables with dead-lettered CDC changes "
+                 "are compared by CHECKSUM automatically, and Cut over re-reads the "
+                 "CDC dead-letter queue before this runbook opens; a dead letter found "
+                 "by a later read (each time you reopen this step, at most once a "
+                 "minute) locks it again until that table is re-checked."),
                 ("5", "Repoint your application to the Aurora DSQL endpoint "
                  "(PostgreSQL wire, IAM-token auth — no password) and smoke-test "
                  "the critical read/write paths."),
@@ -8267,10 +8415,10 @@ def _render_cutover_section(
                                 f"{advanced}.",
                                 tone="success",
                             )
-                        elif not identity_sync_failed:
+                        elif not identity_sync_failed and not identity_sync_missed:
                             # Genuinely nothing to advance (no server-generated keys, or
-                            # all already correct) AND nothing failed -> the reassuring
-                            # success line. Only reachable when the sync had no failures.
+                            # all already correct) AND nothing failed or left out -> the
+                            # reassuring success line.
                             inline_hint(
                                 ui,
                                 "Done — no server-generated key needed advancing.",
@@ -8301,6 +8449,30 @@ def _render_cutover_section(
                             f"repointing. Affected: {failed_detail}."
                         ),
                     )
+                # A migrated identity table the last sync was not given (the schema it is
+                # scoped from changed since, or could not be read in the job) is no "done"
+                # either: its sequence may still be behind the rows CDC delivered.
+                if identity_sync_missed:
+                    render_notice(
+                        ui,
+                        tone="error",
+                        header="Identity sequences not synced — do not cut over yet",
+                        body=(
+                            f"The last sync did not reach {len(identity_sync_missed)} "
+                            "table(s) this migration gives an identity key "
+                            f"({bounded_table_names(list(identity_sync_missed))}), so "
+                            "their sequences may still be behind the migrated rows and "
+                            "your application's first insert after cut-over may hit a "
+                            "duplicate key. Run Sync identity sequences again: it covers "
+                            "every migrated identity table and never moves a sequence "
+                            "backwards."
+                        ),
+                    )
+
+        if standalone_sequences:
+            _render_standalone_sequences_block(
+                ui, standalone_sequences, source_engine=source_engine
+            )
 
         # Rollback caveat: once the app writes to DSQL, those rows exist only there
         # (this tool does not replicate DSQL -> MySQL), so keep the source as a
@@ -8318,6 +8490,54 @@ def _render_cutover_section(
                 "so rolling back then means reconciling them yourself first."
             ),
         )
+
+
+def _render_standalone_sequences_block(
+    ui: object, sequences: "Sequence[str]", *, source_engine: str
+) -> None:
+    """The "Before you repoint: move standalone sequences past the source" block (no I/O).
+
+    Evaluation lists each source sequence no column owns (``PG_STANDALONE_SEQUENCE``) and
+    leaves moving it at cut over to the operator: no sync reaches it, so the application's
+    nextval() after the repoint would hand out values the source already used (23505 on a
+    key, or a number issued twice). Each one gets the source read and the Aurora DSQL
+    statement: ``setval`` with both values read sets exactly the source's next value.
+    """
+    from dsql_migrator.core.source_dialect import dialect_for
+    from dsql_migrator.ui.design import CODE_SURFACE_CLASSES
+
+    pg = dialect_for(SourceType.POSTGRES)
+    one = len(sequences) == 1
+    with ui.column().classes(  # type: ignore[attr-defined]
+        "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
+    ):
+        ui.label(  # type: ignore[attr-defined]
+            "Before you repoint: move standalone sequences past the source"
+        ).classes("text-sm font-semibold text-gray-900")
+        ui.label(  # type: ignore[attr-defined]
+            f"{len(sequences)} {source_engine} "
+            f"{'sequence is' if one else 'sequences are'} owned by no column, so no sync "
+            f"here moves {'it' if one else 'them'}: after cut over, the application's "
+            "nextval() would hand out values the source already used. After the final "
+            "drain/reload and before repointing, run the first line of each on "
+            f"{source_engine} and the second on Aurora DSQL with the two values it returns "
+            "(is_called as true or false). Create "
+            f"{'it' if one else 'them'} first if you have not: each one's Evaluation item "
+            "(PG_STANDALONE_SEQUENCE) gives the CREATE SEQUENCE."
+        ).classes("text-xs text-gray-600 leading-snug")
+        with ui.column().classes(  # type: ignore[attr-defined]
+            f"w-full gap-0 p-2 {CODE_SURFACE_CLASSES}"
+        ):
+            for name in sequences:
+                quoted = pg.quote_table(name)
+                literal = "'" + quoted.replace("'", "''") + "'"
+                for statement in (
+                    f"SELECT last_value, is_called FROM {quoted};",
+                    f"SELECT setval({literal}, <last_value>, <is_called>);",
+                ):
+                    ui.label(statement).classes(  # type: ignore[attr-defined]
+                        "text-xs font-mono wrap-anywhere text-gray-800"
+                    )
 
 
 def _restore_hint(

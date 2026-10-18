@@ -162,6 +162,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     new_start_point_block,
     new_start_point_refusal,
     run_full_load,
+    identity_sync_extras,
     sync_identity_sequences_for_tables,
     _seed_retry_chunks,
     run_full_load_retry,
@@ -495,6 +496,33 @@ def build_data_migration_screen(
         result = eval_state.result
         return result.inventory if result is not None else None
 
+    def _post_load_sync_extras(names: "Sequence[str]") -> "dict[str, object]":
+        """The source counters (a floor) and expected identities for a post-load identity
+        sync over ``names`` (:func:`identity_sync_extras`), as the load's own sync takes
+        them. Converts the inventory and reads the source: call it on the sync's job
+        thread. ``{}`` when it cannot be told."""
+        try:
+            inventory_now = _inventory()
+            if inventory_now is None:
+                return {}
+            conv_now = conv_store.get_or_create(session_id)
+            applied = applied_table_conversions(
+                SchemaConverter(source_type=session_source_type(session)).convert(
+                    inventory_now
+                ),
+                dict(conv_now.edited_target_ddls or {}),
+                preserve_foreign_keys=conv_now.preserve_foreign_keys,
+            )
+            return identity_sync_extras(
+                source_config=session.source_config,
+                source_password=session.source_password,
+                tables=inventory_now.tables,
+                table_conversions=applied,
+                table_names=names,
+            )
+        except Exception:  # noqa: BLE001 - the extras refine the sync; never block it
+            return {}
+
     def _catalog_baseline():
         # What the source-schema re-check (ui/cdc_catalog_drift_gate.py) compares the live
         # source with: the Step 1 inventory and the tables CDC captures, resolved by Start
@@ -700,7 +728,9 @@ def build_data_migration_screen(
                 # A failed / cancelled run's finalize skipped the identity sync (the run
                 # was incomplete), as an accepted quarantine gap does: submit it now, over
                 # the current set's loaded tables (once per flip: this writes on a change).
-                submit_scope_identity_sync(job_manager, session, view)
+                submit_scope_identity_sync(
+                    job_manager, session, view, extras=_post_load_sync_extras
+                )
         elif record.status != "DONE":
             migration_state.set_error(
                 job_manager.get_error(migration_state.job_id) or "Data migration failed."
@@ -2640,8 +2670,12 @@ def build_data_migration_screen(
                     _sync_profile = session.aws_profile
 
                     def _sync_after_accept(_handle: JobHandle) -> None:
+                        # The source floor too, as every post-load sync (read here, in the
+                        # job: it reads the source), and one beat per table.
                         sync_identity_sequences_for_tables(
-                            target_config, _sync_names, aws_profile=_sync_profile
+                            target_config, _sync_names, aws_profile=_sync_profile,
+                            extras=_post_load_sync_extras(_sync_names),
+                            heartbeat=getattr(_handle, "heartbeat", None),
                         )
 
                     job_manager.submit(_sync_after_accept)
@@ -3072,6 +3106,9 @@ def build_data_migration_screen(
                             # reloaded, and which ALTERs run, before the operator starts.
                             overlay_ledger_read=_overlay_providers[0],
                             exclusion_overlay_view=_overlay_providers[1],
+                            # The source floor for the identity sync a narrowed set's DONE
+                            # submits (read on that job's thread).
+                            identity_extras=_post_load_sync_extras,
                         )
                         with ui.row().classes(
                             "!flex w-full justify-between items-center"

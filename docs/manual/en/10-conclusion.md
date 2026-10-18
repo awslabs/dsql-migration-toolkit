@@ -100,7 +100,13 @@ freeze lasts the length of the load + validation.
 2. **Re-run Full Load choosing "Drop & reload"** if the source took writes since the
    snapshot (the default *Append* only adds missing rows and applies no update or delete
    made since), then validate with CHECKSUM.
-3. **Validation** — confirm a clean **MATCH** (the go/no-go gate).
+3. **Validation** — confirm a clean **MATCH** (the go/no-go gate). On a PostgreSQL
+   source, a sequence no column owns (Evaluation's `PG_STANDALONE_SEQUENCE`) is then
+   yours to move past the source's final value: the Cut over step lists each one under
+   *Before you repoint: move standalone sequences past the source*, with the read to run
+   on the source (`SELECT last_value, is_called FROM <seq>`) and the statement to run on
+   Aurora DSQL with the two values it returns
+   (`SELECT setval('<seq>', <last_value>, <is_called>)`).
 4. **Repoint the application** to the DSQL endpoint (PostgreSQL wire, IAM-token
    auth — no password). Smoke-test the critical read/write paths.
 5. **Lift the freeze** — the application is now live on DSQL.
@@ -117,13 +123,21 @@ freeze shrinks to just the final drain + smoke test.
    waiting on a unique index is held that long before it is applied or dead-lettered,
    and its lag can take a minute or two to show. MySQL and DSQL now hold the same rows.
 4. **Re-run Validation** for the final go/no-go; cut over only on a clean MATCH.
-   The final validation also **advances any identity / `AUTO_INCREMENT` sequence**
-   past the rows CDC delivered (a *Sync identity sequences* action), so the
-   application's first insert after cut-over can't collide with a migrated id
-   (`23505`). A PostgreSQL sequence no column owns is not among them: Evaluation lists each
-   one (`PG_STANDALONE_SEQUENCE`), and you move it past the source's final value yourself
-   (`SELECT setval(...)` on Aurora DSQL) before repointing. Tables with dead-lettered CDC changes are compared by CHECKSUM
-   automatically, and Cut over re-reads the dead-letter queue before it opens (see
+   The final validation also **advances the sequence of every identity /
+   `AUTO_INCREMENT` key** the migration loaded past the rows CDC delivered — a table
+   left out of the run (its chip off under **Objects to validate**) included — and so
+   does the *Sync identity sequences* action on Cut over, so the application's first
+   insert after cut-over can't collide with a migrated id (`23505`). A migrated identity
+   table the action did not reach is named in a red notice (run it again), never shown
+   as done. A PostgreSQL sequence no column owns is not among them: Evaluation lists each
+   one (`PG_STANDALONE_SEQUENCE`), and the Cut over step names it under *Before you
+   repoint: move standalone sequences past the source*, with the read to run on the
+   source (`SELECT last_value, is_called FROM <seq>`) and the statement to run on Aurora
+   DSQL with the two values it returns
+   (`SELECT setval('<seq>', <last_value>, <is_called>)`), before repointing. The
+   acknowledgement line in the activity log records how many were left to you. Tables
+   with dead-lettered CDC changes are compared by CHECKSUM automatically, and Cut over
+   re-reads the dead-letter queue before it opens (see
    [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). On a PostgreSQL source
    with re-keyed tables, Cut over also re-reads their REPLICA IDENTITY before it opens
    (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). Cut over

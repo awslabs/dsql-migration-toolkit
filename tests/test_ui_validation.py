@@ -1501,7 +1501,7 @@ def test_background_run_cancel_maps_to_cancelled_and_no_result() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _no_identity_columns(table_names, *, connection_factory):
+def _no_identity_columns(table_names, *, connection_factory, **_extras):
     """The identity-sequence sync of a target without identity columns. Never connects.
 
     A completed run ends with this sync, and the production one calls
@@ -1663,7 +1663,7 @@ def test_validation_run_resyncs_identity_sequences_and_records_outcome() -> None
     # the per-table RESTART WITH values on the state (so the UI can surface them).
     seen = {}
 
-    def _fake_sync(table_names, *, connection_factory):
+    def _fake_sync(table_names, *, connection_factory, **_kw):
         seen["tables"] = list(table_names)
         # Simulate two identity tables advanced; a non-identity table yields None.
         return {"orders": 1501, "order_items": 1502, "reference": None}
@@ -2504,8 +2504,9 @@ def test_cutover_section_renders_error_when_a_sync_failed() -> None:
     from dsql_migrator.ui import validation as val
 
     src = inspect.getsource(val._render_cutover_section)
-    # The success "no key needed advancing" line is now gated on there being NO failures.
-    assert "elif not identity_sync_failed:" in src
+    # The success "no key needed advancing" line is now gated on there being NO failures
+    # (nor a migrated identity table the sync was not given, G127).
+    assert "elif not identity_sync_failed and not identity_sync_missed:" in src
     # And a failed sync renders an error notice with a do-not-cut-over header.
     assert "do not cut over yet" in src
     assert 'tone="error"' in src
@@ -2558,7 +2559,7 @@ def test_run_cutover_identity_sync_submits_to_job_manager_when_present() -> None
 
     calls: list = []
 
-    def _sync(table_names, *, connection_factory):
+    def _sync(table_names, *, connection_factory, **_kw):
         calls.append(list(table_names))
         return {}
 
@@ -5366,7 +5367,7 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
         session, eval_store, identity_store, "s"
     ) == 1
     # Scoped to the migrated selection like the FK count: an identity table the
-    # migration never loaded is not "pending" (the sync only reaches validated tables).
+    # migration never loaded is not "pending" (the syncs reach the migrated tables, G127).
     from dsql_migrator.core.models import TableSelection
 
     def _ms(tables):
@@ -6964,7 +6965,7 @@ def _g1_screen(monkeypatch, validator, *, ledger_tables=("orders",), ui=None, cd
     content, runner = build_validation_screen(
         store, "g1", job_manager=manager, eval_store=eval_store, migration_store=mstore,
         validation_store=vstore, validator_factory=lambda _i: validator,
-        sync_sequences=lambda names, *, connection_factory: {},
+        sync_sequences=lambda names, *, connection_factory, **_kw: {},
     )
     vstate = vstore.get_or_create("g1")
 

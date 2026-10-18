@@ -33,7 +33,7 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 PostgreSQL 소스에서는 Evaluation이 인벤토리에 없는 두 가지도 읽습니다.
 
 - **행 수준 보안(row-level security).** Aurora DSQL에는 이 기능이 없으므로, 행 수준 보안이 켜진 테이블은 **UNSUPPORTED**(`PG_ROW_LEVEL_SECURITY`)로 분류되며, 애플리케이션에서 규칙을 다시 만들 수 있도록 각 정책의 `USING`/`WITH CHECK` 식을 함께 보여 줍니다. 이 항목은 소스 사용자가 모든 행을 읽는지도 알려 줍니다: 슈퍼유저, `BYPASSRLS` 역할, 또는 테이블이 `FORCE ROW LEVEL SECURITY`가 아닐 때의 테이블 소유자입니다. 모든 PostgreSQL 소스 세션은 `pg_dump`처럼 `row_security = off`로 실행되므로, 그 밖의 사용자라면 Full Load와 Validation이 정책이 보여 주는 행만 복사·비교하는 대신 해당 테이블에서 오류로 멈춥니다. Data Migration 사전 점검이 로드 전에 이를 표시합니다(`ROW_SECURITY`).
-- **독립 시퀀스**(어떤 컬럼도 소유하지 않는 시퀀스). Schema Conversion은 이를 만들지 않으므로, 각 시퀀스는 소스의 현재 값 다음부터 이어지는 Aurora DSQL `CREATE SEQUENCE` 문을 담은 **MANUAL** 항목(`PG_STANDALONE_SEQUENCE`)이 됩니다: `CACHE 1`, 또는 소스가 이미 캐시를 쓰면 `CACHE 65536`(Aurora DSQL은 이 둘만 허용)이며, 소스의 범위가 bigint 기본값과 다르면 그 범위를 유지합니다. 컷오버 전에 만들고, 소스 쓰기가 멈추면 `setval`로 소스의 최종 값 다음으로 옮기세요: 도구는 이를 만들지도 동기화하지도 않습니다.
+- **독립 시퀀스**(어떤 컬럼도 소유하지 않는 시퀀스). Schema Conversion은 이를 만들지 않으므로, 각 시퀀스는 소스의 현재 값 다음부터 이어지는 Aurora DSQL `CREATE SEQUENCE` 문을 담은 **MANUAL** 항목(`PG_STANDALONE_SEQUENCE`)이 됩니다: `CACHE 1`, 또는 소스가 이미 캐시를 쓰면 `CACHE 65536`(Aurora DSQL은 이 둘만 허용)이며, 소스의 범위가 bigint 기본값과 다르면 그 범위를 유지합니다. 컷오버 전에 만들고, 소스 쓰기가 멈추면 `setval`로 소스의 최종 값 다음으로 옮기세요: 도구는 이를 만들지도 동기화하지도 않으며, Cut over 단계가 각각을 실행할 문장과 함께 나열합니다([§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환)).
 
 어느 쪽이든 읽기에 실패하면, 리포트는 없는 것처럼 보이지 않도록 그 사실을 알려 줍니다(`PG_CATALOG_UNREAD`).
 

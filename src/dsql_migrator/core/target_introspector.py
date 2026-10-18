@@ -1607,6 +1607,7 @@ def sync_identity_sequences(
     connection_factory: Callable[[], Any],
     source_next_values: "Optional[Mapping[str, int]]" = None,
     expected_identity: "Collection[str]" = (),
+    heartbeat: "Optional[Callable[[], None]]" = None,
 ) -> dict[str, "Union[int, str, None]"]:
     """Advance each target identity sequence past the loaded rows.
 
@@ -1617,7 +1618,10 @@ def sync_identity_sequences(
     and anything still holding such an id -- an audit row, an outside system -- silently
     pointed at the new row. ``expected_identity`` names the tables whose conversion makes
     the key an identity: one whose target key is NOT an identity is reported as a FAILED
-    sync (:data:`NOT_AN_IDENTITY_REASON`) instead of a quiet no-op.
+    sync (:data:`NOT_AN_IDENTITY_REASON`) instead of a quiet no-op. ``heartbeat`` (a job's
+    liveness reporter) is called once per table: the pass is the tail of a job, four
+    statements and a DDL per table, and hundreds of tables were one silence the job
+    manager's stall watchdog reaps.
 
     Per-table result value:
     - ``int`` -- the ``RESTART WITH`` value actually applied (the sequence advanced);
@@ -1671,6 +1675,8 @@ def sync_identity_sequences(
     connection = None
     try:
         for name in table_names:
+            if heartbeat is not None:
+                heartbeat()
             out[name] = None
             if connection is None:
                 try:

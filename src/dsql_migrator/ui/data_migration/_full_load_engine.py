@@ -407,6 +407,7 @@ def _sync_identity_sequences_after_load(
     table_names: "Sequence[str]",
     *,
     sync: "Optional[Callable[..., dict]]" = None,
+    heartbeat: "Optional[Callable[[], None]]" = None,
 ) -> dict:
     """Advance target identity sequences past the rows just loaded. Best-effort.
 
@@ -428,7 +429,8 @@ def _sync_identity_sequences_after_load(
     logs the outcome so an unrepaired sequence is never silent.
 
     ``sync`` is an injectable seam (tests pass a fake; production uses the real
-    introspector over a DSQL connection).
+    introspector over a DSQL connection). ``heartbeat`` (the load job's liveness reporter)
+    is called per table: the sync is the job's tail.
     """
     if not table_names:
         return {}
@@ -454,6 +456,8 @@ def _sync_identity_sequences_after_load(
             )
         except Exception:  # noqa: BLE001 - the extras refine the sync; never block it
             extras = {}
+        if heartbeat is not None:
+            extras["heartbeat"] = heartbeat
         return sync(list(table_names), connection_factory=_factory, **extras) or {}
     except Exception as exc:  # noqa: BLE001 - never fail a completed load on this
         log_activity(
@@ -3377,6 +3381,7 @@ def _log_identity_sequence_sync(
     table_names: "Sequence[str]",
     *,
     sync: "Optional[Callable[..., dict]]" = None,
+    heartbeat: "Optional[Callable[[], None]]" = None,
 ) -> dict:
     """Sync target identity sequences and RECORD the outcome in the activity log.
 
@@ -3387,7 +3392,9 @@ def _log_identity_sequence_sync(
     """
     if inputs is None:
         return {}
-    synced = _sync_identity_sequences_after_load(inputs, table_names, sync=sync)
+    synced = _sync_identity_sequences_after_load(
+        inputs, table_names, sync=sync, heartbeat=heartbeat
+    )
     _log_identity_sequence_sync_outcome(synced)
     return synced
 
@@ -3449,6 +3456,8 @@ def sync_identity_sequences_for_tables(
     *,
     aws_profile: "Optional[str]" = None,
     sync: "Optional[Callable[..., dict]]" = None,
+    extras: "Optional[Mapping[str, object]]" = None,
+    heartbeat: "Optional[Callable[[], None]]" = None,
 ) -> dict:
     """Sync target identity sequences off the CURRENT ``MAX(pk)`` and log the outcome.
 
@@ -3460,6 +3469,10 @@ def sync_identity_sequences_for_tables(
     start (``nextval`` = 1) and the app's first insert after cut-over collided with a
     migrated id (23505). Quarantined rows are permanently dropped, so ``MAX(pk)`` is
     final and syncing off it is correct. Never raises (best-effort follow-up).
+
+    ``extras`` are :func:`identity_sync_extras` for ``table_names`` -- the source's own
+    counters as a floor, as every post-load sync takes them -- and ``heartbeat`` the job's
+    liveness reporter, called per table.
     """
     if not table_names:
         return {}
@@ -3472,7 +3485,10 @@ def sync_identity_sequences_for_tables(
         def _factory():
             return DsqlConnector(target_config, aws_profile=aws_profile).connect()
 
-        synced = sync(list(table_names), connection_factory=_factory) or {}
+        kwargs = dict(extras or {})
+        if heartbeat is not None:
+            kwargs["heartbeat"] = heartbeat
+        synced = sync(list(table_names), connection_factory=_factory, **kwargs) or {}
     except Exception as exc:  # noqa: BLE001 - never fail the accept on this follow-up
         log_activity(
             ActivityCategory.FULL_LOAD,
@@ -3558,7 +3574,8 @@ def _finalize_run(
             # branch below is ALSO a completed load and syncs too -- quarantined rows are
             # permanently dropped, so MAX(pk) is final there as well.)
             _log_identity_sequence_sync(
-                inputs, _sync_names, sync=sync_sequences
+                inputs, _sync_names, sync=sync_sequences,
+                heartbeat=getattr(handle, "heartbeat", None),
             )
         else:
             # A run the OPERATOR stopped returned here silently, so the audit log held a
@@ -3612,7 +3629,10 @@ def _finalize_run(
         # (nextval=1) after an accepted-gap load, so the app's first insert after
         # cut-over collided with a migrated id (duplicate key 23505) -- and only if the
         # operator happened to run Validation (v0.1.266 re-sync) was it repaired.
-        _log_identity_sequence_sync(inputs, _sync_names, sync=sync_sequences)
+        _log_identity_sequence_sync(
+            inputs, _sync_names, sync=sync_sequences,
+            heartbeat=getattr(handle, "heartbeat", None),
+        )
         return
     # Name the affected tables and their reasons. "1 of 8 table(s) did not fully load"
     # is a count, not a diagnosis: reading it later tells you a run failed but not which

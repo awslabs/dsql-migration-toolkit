@@ -34,7 +34,7 @@ Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration →
 PostgreSQL ソースでは、Evaluation はインベントリにない 2 つのものも読み取ります。
 
 - **行レベルセキュリティ (row-level security)。** Aurora DSQL にはこの機能がないため、行レベルセキュリティが有効なテーブルは **UNSUPPORTED** (`PG_ROW_LEVEL_SECURITY`) と判定され、アプリケーションでルールを作り直せるよう各ポリシーの `USING` / `WITH CHECK` の式が示されます。この検出結果は、ソースユーザーがすべての行を読めるかどうかも示します: スーパーユーザー、`BYPASSRLS` を持つロール、またはテーブルが `FORCE ROW LEVEL SECURITY` でない場合のテーブル所有者です。すべての PostgreSQL ソースのセッションは `pg_dump` と同様に `row_security = off` で実行されるため、それ以外のユーザーでは、Full Load と Validation はポリシーが見せる行だけをコピー・比較するのではなく、そのテーブルでエラーとして停止します。Data Migration の前提条件チェックがロード前にこれを示します (`ROW_SECURITY`)。
-- **スタンドアロンのシーケンス** (どの列にも所有されていないシーケンス)。Schema Conversion はこれを作成しないため、各シーケンスは、ソースの現在の値の次から続く Aurora DSQL の `CREATE SEQUENCE` 文を持つ **MANUAL** 項目 (`PG_STANDALONE_SEQUENCE`) になります: `CACHE 1`、またはソースがすでにキャッシュしている場合は `CACHE 65536` (Aurora DSQL が受け付けるのはこの 2 つだけ) で、ソースの範囲が bigint の既定値と異なる場合はその範囲を保ちます。カットオーバー前に作成し、ソースへの書き込みが止まったら `setval` でソースの最終値の次へ進めてください: ツールはこれを作成も同期もしません。
+- **スタンドアロンのシーケンス** (どの列にも所有されていないシーケンス)。Schema Conversion はこれを作成しないため、各シーケンスは、ソースの現在の値の次から続く Aurora DSQL の `CREATE SEQUENCE` 文を持つ **MANUAL** 項目 (`PG_STANDALONE_SEQUENCE`) になります: `CACHE 1`、またはソースがすでにキャッシュしている場合は `CACHE 65536` (Aurora DSQL が受け付けるのはこの 2 つだけ) で、ソースの範囲が bigint の既定値と異なる場合はその範囲を保ちます。カットオーバー前に作成し、ソースへの書き込みが止まったら `setval` でソースの最終値の次へ進めてください: ツールはこれを作成も同期もせず、Cut over ステップがそれぞれを実行する文とともに一覧します ([§10.3](10-conclusion.md#103-カットオーバー-アプリケーションを-dsql-へ切り替える))。
 
 どちらかの読み取りに失敗した場合、レポートは存在しないかのように見せず、そのことを示します (`PG_CATALOG_UNREAD`)。
 

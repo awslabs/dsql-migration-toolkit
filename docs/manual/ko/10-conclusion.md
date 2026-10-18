@@ -80,7 +80,11 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 1. **소스 쓰기 동결** — 애플리케이션을 점검/읽기 전용 모드로 두어 MySQL에 새 행이 쓰이지 않게 합니다.
    (도구는 소스를 읽기 전용으로 유지하며, 쓰기를 멈춰야 하는 건 *애플리케이션*입니다.)
 2. **스냅샷 이후 소스에 쓰기가 있었다면 "Drop & reload"로 Full Load 재실행** — 기본값 *Append*는 빠진 행만 채우고 그 뒤의 UPDATE/DELETE는 적용하지 않습니다 — 그다음 CHECKSUM으로 검증.
-3. **Validation** — 깨끗한 **MATCH** 확인(go/no-go 게이트).
+3. **Validation** — 깨끗한 **MATCH** 확인(go/no-go 게이트). PostgreSQL 소스라면 어떤 컬럼도 소유하지
+   않는 시퀀스(Evaluation의 `PG_STANDALONE_SEQUENCE`)는 이제 직접 소스의 최종 값 다음으로 옮겨야 합니다:
+   Cut over 단계가 *Before you repoint: move standalone sequences past the source* 아래에 각각을, 소스에서
+   실행할 읽기(`SELECT last_value, is_called FROM <seq>`)와 그 읽기가 돌려준 두 값으로 Aurora DSQL에서
+   실행할 문장(`SELECT setval('<seq>', <last_value>, <is_called>)`)과 함께 나열합니다.
 4. **애플리케이션을 DSQL 엔드포인트로 전환**(PostgreSQL 와이어, IAM 토큰 인증 — 비밀번호 없음).
    핵심 읽기/쓰기 경로 스모크 테스트.
 5. **동결 해제** — 애플리케이션이 DSQL에서 라이브.
@@ -97,11 +101,16 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
    dead-letter 처리되기 전까지 그만큼 보류되고, 그 지연이 나타나기까지 1~2분 걸릴 수 있습니다. 이제 MySQL과
    DSQL이 같은 행을 가집니다.
 4. **Validation 재실행**으로 최종 go/no-go 판단을 하고, 깨끗한 MATCH일 때만 전환합니다. 최종 검증은
-   CDC가 전달한 행들 이후로 **identity / `AUTO_INCREMENT` 시퀀스를 전진**시키기도 하므로(*Sync identity
-   sequences* 동작), 전환 후 앱의 첫 insert가 마이그레이션된 id와 충돌(`23505`)하지 않습니다.
-   어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스는 여기에 포함되지 않습니다: Evaluation이 각각을
-   나열하므로(`PG_STANDALONE_SEQUENCE`), 애플리케이션을 전환하기 전에 직접 소스의 최종 값 다음으로
-   옮기세요(Aurora DSQL에서 `SELECT setval(...)`).
+   마이그레이션이 적재한 모든 identity / `AUTO_INCREMENT` 키의 **시퀀스를 CDC가 전달한 행들 이후로
+   전진**시키며 — 실행에서 빠진 테이블(**Objects to validate**에서 칩을 끈 테이블)도 포함됩니다 — Cut
+   over의 *Sync identity sequences* 동작도 마찬가지이므로, 전환 후 앱의 첫 insert가 마이그레이션된 id와
+   충돌(`23505`)하지 않습니다. 이 동작이 닿지 못한 마이그레이션 identity 테이블은 빨간 알림에 이름이
+   표시되며(다시 실행하세요), 완료로 표시되지 않습니다. 어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스는
+   여기에 포함되지 않습니다: Evaluation이 각각을 나열하고(`PG_STANDALONE_SEQUENCE`), Cut over 단계가
+   *Before you repoint: move standalone sequences past the source* 아래에 각각을, 소스에서 실행할
+   읽기(`SELECT last_value, is_called FROM <seq>`)와 그 읽기가 돌려준 두 값으로 Aurora DSQL에서 실행할
+   문장(`SELECT setval('<seq>', <last_value>, <is_called>)`)과 함께 보여 주므로, 애플리케이션을 전환하기
+   전에 실행하세요. 활동 로그의 승인 줄은 직접 처리하도록 남겨진 시퀀스 수를 기록합니다.
    dead-letter 처리된 CDC 변경이 있는 테이블은 자동으로 CHECKSUM으로 비교되며, Cut over는 열리기 전에
    dead-letter queue를 다시 읽습니다([§5.5](05-validation.md#55-cdc-dead-letter와-컷오버) 참고). 재키잉된
    테이블이 있는 PostgreSQL 소스에서는 Cut over가 열리기 전에 그 테이블들의 REPLICA IDENTITY도 다시

@@ -279,7 +279,7 @@ def test_a_retry_loads_a_new_table_under_the_original_watermark(monkeypatch, run
         seen["fk"] = list(tables or [])
         return 0
 
-    def _sync(_inputs, table_names, *, sync=None):
+    def _sync(_inputs, table_names, *, sync=None, **_kw):
         seen["sync"] = list(table_names)
         return {}
 

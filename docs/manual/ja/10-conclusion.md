@@ -43,7 +43,7 @@ CDC は実際に動く構成要素（MSK、MSK Connect、シンクコネクタ�
 
 1. **ソースの書き込みを凍結する** — アプリケーションをメンテナンス／読み取り専用モードにして、MySQL に新しい行が書き込まれないようにします。（ツールはソースを読み取り専用に保ちますが、書き込みを止めなければならないのは *あなたのアプリケーション* です。）
 2. スナップショット以降にソースへの書き込みがあった場合は **「Drop & reload」で Full Load を再実行** します (既定の *Append* は欠けている行を追加するだけで、その後の UPDATE や DELETE は適用しません)。その後 CHECKSUM で検証します。
-3. **Validation** — クリーンな **MATCH** を確認します（go/no-go のゲート）。
+3. **Validation** — クリーンな **MATCH** を確認します（go/no-go のゲート）。PostgreSQL ソースでは、どの列にも所有されていないシーケンス (Evaluation の `PG_STANDALONE_SEQUENCE`) を、ここで自分でソースの最終値の先へ進めます: Cut over ステップが *Before you repoint: move standalone sequences past the source* の下にそれぞれを、ソースで実行する読み取り (`SELECT last_value, is_called FROM <seq>`) と、その読み取りが返した 2 つの値で Aurora DSQL で実行する文 (`SELECT setval('<seq>', <last_value>, <is_called>)`) とともに一覧します。
 4. **アプリケーションを再ポイント** して DSQL エンドポイントへ向けます（PostgreSQL ワイヤ、IAM トークン認証 — パスワードなし）。重要な読み取り／書き込みパスをスモークテストします。
 5. **凍結を解除する** — アプリケーションはこれで DSQL 上でライブになります。
 
@@ -54,7 +54,7 @@ CDC は実際に動く構成要素（MSK、MSK Connect、シンクコネクタ�
 1. **CDC が追いつくまで待つ** — レプリケーションラグがゼロに近づく（または達する）まで。
 2. **ソースの書き込みを凍結する**（短時間の読み取り専用／メンテナンスモード）。
 3. **最後のドレインを待つ** — CDC が処理中(in-flight)の最後の変更まで適用してラグが再びゼロになり、ソースの最後の書き込みから少なくとも 5 分経つようにします: 一意インデックスを待つ変更は、適用されるかデッドレターになるまでそれだけ保留され、そのラグが表れるまでに 1〜2 分かかることがあります。これで MySQL と DSQL は同じ行を保持します。
-4. 最終の go/no-go のために **Validation を再実行** し、クリーンな MATCH のときにのみカットオーバーします。最終検証は、CDC が届けた行の先まで **identity / `AUTO_INCREMENT` シーケンスを前進**させます(*Sync identity sequences* 操作)。これにより、カットオーバー後のアプリの最初の insert が移行済み id と衝突(`23505`)することを防ぎます。どの列にも所有されていない PostgreSQL のシーケンスはこれに含まれません: Evaluation がそれぞれを一覧するので(`PG_STANDALONE_SEQUENCE`)、アプリケーションを切り替える前に、ソースの最終値の次へ自分で進めてください(Aurora DSQL で `SELECT setval(...)`)。デッドレターされた CDC 変更があるテーブルは自動的に CHECKSUM で比較され、Cut over は開く前にデッドレターキューを読み直します（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー) 参照）。リキーされたテーブルがある PostgreSQL ソースでは、Cut over は開く前にそれらの REPLICA IDENTITY も読み直します（[§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー) 参照）。Cut over は開く前に、ソース上のキャプチャ対象テーブルの定義も読み直します（[§5.7](05-validation.md#57-ソーススキーマの変更とカットオーバー) 参照）。
+4. 最終の go/no-go のために **Validation を再実行** し、クリーンな MATCH のときにのみカットオーバーします。最終検証は、移行がロードしたすべての identity / `AUTO_INCREMENT` キーの**シーケンスを CDC が届けた行の先まで前進**させます (実行から外したテーブル、つまり **Objects to validate** でチップをオフにしたテーブルも含みます)。Cut over の *Sync identity sequences* 操作も同じです。これにより、カットオーバー後のアプリの最初の insert が移行済み id と衝突(`23505`)することを防ぎます。この操作が届かなかった移行対象の identity テーブルは赤い通知に名前が示され (もう一度実行してください)、完了とは表示されません。どの列にも所有されていない PostgreSQL のシーケンスはこれに含まれません: Evaluation がそれぞれを一覧し(`PG_STANDALONE_SEQUENCE`)、Cut over ステップが *Before you repoint: move standalone sequences past the source* の下にそれぞれを、ソースで実行する読み取り (`SELECT last_value, is_called FROM <seq>`) と、その読み取りが返した 2 つの値で Aurora DSQL で実行する文 (`SELECT setval('<seq>', <last_value>, <is_called>)`) とともに示すので、アプリケーションを切り替える前に実行してください。アクティビティログの承認行には、あなたに任されたシーケンスの数が記録されます。デッドレターされた CDC 変更があるテーブルは自動的に CHECKSUM で比較され、Cut over は開く前にデッドレターキューを読み直します（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー) 参照）。リキーされたテーブルがある PostgreSQL ソースでは、Cut over は開く前にそれらの REPLICA IDENTITY も読み直します（[§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー) 参照）。Cut over は開く前に、ソース上のキャプチャ対象テーブルの定義も読み直します（[§5.7](05-validation.md#57-ソーススキーマの変更とカットオーバー) 参照）。
 5. **アプリケーションを再ポイント** して DSQL エンドポイントへ向け、スモークテストします。
 6. **CDC パイプラインは最後に撤去する** — **Start over(右上)** → *Delete all CDC infrastructure* をクリックします。これはレプリケーションを終了し、MSK / MSK Connect / NAT のコストを止め、古いスタックをクリアします（将来、新しい Full Load や CDC を実行するには、デプロイする前にそれが削除されている必要があります）。
 
