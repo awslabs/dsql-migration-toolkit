@@ -23815,7 +23815,7 @@ def test_finished_load_offers_a_scoped_reload(monkeypatch) -> None:
     tick[order.index("ecommerce.orders")](SimpleNamespace(value=True))
     _CONFIRM_LABELS = {
         "Confirm and start", "Append and load", "Drop, recreate and load",
-        "Recreate and load", "Re-run anyway (CDC is live)",
+        "Recreate and load",
     }
     confirm = [h for (label, h) in ui.handlers if label in _CONFIRM_LABELS]
     assert confirm, ui.buttons

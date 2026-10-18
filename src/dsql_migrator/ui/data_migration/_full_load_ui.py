@@ -115,12 +115,27 @@ _CDC_LIVE_START_HINT = (
     "CDC is live, so Full Load is disabled. Stop CDC first (CDC step → Stop CDC), then Delete "
     "CDC infrastructure and deploy it again before a new Full Load."
 )
-# The confirm dialog's "CDC is currently streaming" notice: the collision, then the way on --
-# by the action, since a Retry or a Reload keeps the original start point and converges.
+# The confirm dialog's "CDC is currently streaming" notice: why no Full Load runs then, then
+# the way on -- by the action, since a Retry or a Reload keeps the original start point and
+# converges once CDC is stopped. G129: a load while the sink streams inserts the rows missing
+# on the target, so a row the source deletes while its table is copied, deleted by the sink
+# before the copy wrote it (a delete that found nothing), is written back and stays.
 _CDC_LIVE_COLLISION = (
-    "Re-running Full Load now will collide with the live pipeline -- the snapshot (and any "
-    "DROP+recreate) writes to tables the CDC sink is actively applying changes to, which can "
-    "drop streamed rows or create a gap/overlap."
+    "A Full Load cannot run while CDC is streaming: the CDC sink applies changes to the same "
+    "tables, and a row the source deletes while the load is copying its table can reach Aurora "
+    "DSQL after CDC has applied that delete, and then stays there."
+)
+# G129: Retry unfinished tables, Reload specific tables and a per-table Reload keep the original
+# start point, but they load rows too, so while CDC is live they are disabled with this reason.
+_CDC_LIVE_RELOAD_TOOLTIP = (
+    "CDC is streaming -- reloading now could write back rows CDC deletes meanwhile. Stop CDC "
+    "first (CDC step → Stop CDC), reload, then Start CDC again."
+)
+_CDC_LIVE_RETRY_HINT = (
+    "CDC is live, so Retry unfinished tables is disabled. Stop CDC first (CDC step → Stop CDC), "
+    "retry, then Start CDC again: the retry keeps the original start point, so CDC continues "
+    "from where it stopped, gapless only while the CDC topics still retain what the sink had "
+    "not applied (their retention period on MSK)."
 )
 _CDC_LIVE_NEW_START_POINT = (
     "Stop CDC first (CDC step → Stop CDC). A new start point then needs new CDC topics: Delete "
@@ -732,6 +747,17 @@ def _render_full_load_step(
         ui.notify(block[2], type="warning", position="top", multi_line=True)
         return True
 
+    def _refuse_cdc_live(keeps_watermark: bool) -> bool:
+        """At a confirm: refuse (with a toast) any Full Load while CDC is live (G129) -- CDC can
+        start while the dialog is open. A Retry or a Reload is refused too."""
+        if not cdc_streaming_started(migration_state, job_manager):
+            return False
+        ui.notify(
+            _CDC_LIVE_RELOAD_TOOLTIP if keeps_watermark else _CDC_LIVE_START_TOOLTIP,
+            type="warning", position="top", multi_line=True,
+        )
+        return True
+
     def _open_confirm_dialog_now(
         *, action_tables, on_confirm, title, keeps_watermark, table_reasons=None,
         preselect=True, checklist_hint=None, overlay=None, on_retry=None,
@@ -1067,9 +1093,14 @@ def _render_full_load_step(
                         return  # guard: nothing selected (button is also disabled)
                     if ledger_error:
                         return  # guard: the record could not be read (button disabled)
-                    if _refuse_new_start_point(keeps_watermark):
+                    if cdc_live_now:
+                        return  # guard: CDC is streaming (button disabled; G129)
+                    if _refuse_new_start_point(keeps_watermark) or _refuse_cdc_live(
+                        keeps_watermark
+                    ):
                         # G25: the CDC state changed while the dialog was open (a probe read
-                        # a stack that has streamed): closed as a Cancel, nothing runs.
+                        # a stack that has streamed; G129: or CDC started): closed as a
+                        # Cancel, nothing runs.
                         confirm_dialog.close()
                         return
                     confirmed["v"] = True
@@ -1089,7 +1120,9 @@ def _render_full_load_step(
                     def _label_and_color(mode: str) -> "tuple[str, str]":
                         drop_chosen = mode == "drop"
                         if cdc_live_now:
-                            return "Re-run anyway (CDC is live)", "negative"
+                            # G129: nothing runs while CDC streams (disabled; the notice
+                            # above says why) -- no "Re-run anyway" past it.
+                            return "Confirm and start", "primary"
                         forced_now = set(forced) & checked if selectable else set(forced)
                         if forced_now:
                             # The NULL contract drops these whatever the radio says, so
@@ -1144,9 +1177,10 @@ def _render_full_load_step(
                                         len(_ticked(radio_tables)), ticked_scope=True
                                     )
                                 )
-                        # Disabled when the retry checklist has nothing ticked, or the
-                        # record of excluded-column changes could not be read.
-                        if (selectable and not checked) or ledger_error:
+                        # Disabled when the retry checklist has nothing ticked, the
+                        # record of excluded-column changes could not be read, or CDC is
+                        # streaming (G129).
+                        if (selectable and not checked) or ledger_error or cdc_live_now:
                             start_btn.disable()
                         else:
                             start_btn.enable()
@@ -1509,6 +1543,12 @@ def _render_full_load_step(
             rows,
             reload_table=reload_table,
             reload_confirm=_open_reload_confirm,
+            # G129: no reload while CDC streams (the sink's deletes would be written back).
+            reload_block=(
+                _CDC_LIVE_RELOAD_TOOLTIP
+                if cdc_streaming_started(migration_state, job_manager)
+                else None
+            ),
             lob_candidates_for=lob_candidates_for,
             exclusion_route=exclusion_route,
             exclusion_route_block=exclusion_route_block,
@@ -1951,6 +1991,11 @@ def _render_full_load_step(
                             else _start_point_block[2]
                         )
                         _rerun_gated = True
+                    elif cdc_streaming_started(migration_state, job_manager):
+                        # G129: a Start in flight on a stack that has not streamed yet passes
+                        # the gate above; Stop CDC still comes first, as on the Start button.
+                        rerun_btn.disable()
+                        rerun_btn.tooltip(_CDC_LIVE_START_TOOLTIP)
                     else:
                         rerun_btn.tooltip(
                             "Re-runs ALL selected tables from a fresh snapshot (new "
@@ -2033,9 +2078,15 @@ def _render_full_load_step(
                     # Full load + CDC tables a guarded Retry cannot add (G17): only Re-run
                     # all tables (a fresh start point) loads them.
                     _only_added = bool(_added) and set(failed) <= set(_added)
+                    _cdc_live = cdc_streaming_started(migration_state, job_manager)
                     if connections_missing:
                         retry_btn.disable()
                         retry_btn.tooltip(reconnect_tip)
+                    elif _cdc_live:
+                        # G129: a retry while the sink streams would write back the rows it
+                        # deletes during the copy; the hint below the row names the route.
+                        retry_btn.disable()
+                        retry_btn.tooltip(_CDC_LIVE_RELOAD_TOOLTIP)
                     elif _not_addable and set(failed) <= set(_not_addable):
                         retry_btn.disable()
                         retry_btn.tooltip(cdc_not_addable_refusal(_not_addable))
@@ -2060,6 +2111,8 @@ def _render_full_load_step(
                             "succeeded table(s) are kept as-is (no re-load, no new "
                             "snapshot)."
                         )
+                if _cdc_live:
+                    inline_hint(ui, _CDC_LIVE_RETRY_HINT, tone="warning")
                 if _rerun_gated:
                     render_notice(
                         ui, tone="info", header=_start_point_block[0],
@@ -2142,14 +2195,10 @@ def _render_full_load_step(
                             _reload_btn.disable()
                             _reload_btn.tooltip(guard_reason)
                         elif cdc_streaming_started(migration_state, job_manager):
-                            # Same rule as Re-run: reloading under a live sink can drop
-                            # streamed rows, and CDC would resume from the ORIGINAL
-                            # watermark rather than this run.
+                            # Same rule as Retry (G129): a reload under a live sink writes
+                            # back the rows the sink deletes while the table is copied.
                             _reload_btn.disable()
-                            _reload_btn.tooltip(
-                                "CDC is streaming -- reloading would collide with the "
-                                "live pipeline. Stop CDC first (CDC step → Stop CDC)."
-                            )
+                            _reload_btn.tooltip(_CDC_LIVE_RELOAD_TOOLTIP)
                         else:
                             _reload_btn.tooltip(
                                 "Re-load only the tables you pick (e.g. after "
@@ -2600,6 +2649,9 @@ def _render_full_load_progress(
     reload_table=None,
     reload_confirm=None,
     connections_ready: bool = True,
+    # Why the per-table Reload cannot run now (G129: CDC is streaming), or None. The button is
+    # then disabled with this tooltip, never hidden.
+    reload_block: Optional[str] = None,
     # The accept-the-gap action moved OUT of this function: it now renders after the
     # completeness banner (see _render_accept_quarantine_action), so the button that
     # carries out the banner's remedy sits directly beneath the verdict rather than
@@ -2993,6 +3045,14 @@ def _render_full_load_progress(
                     "Reconnect first: re-verify the source and target on the Connect "
                     "step (credentials are not restored after a restart), then Reload."
                 )
+                return
+            if reload_block and terminal and (
+                reload_confirm is not None or reload_table is not None
+            ):
+                # G129: CDC is streaming -- disabled with the reason, never hidden.
+                ui.button("Reload").props(
+                    "flat dense no-caps size=sm color=primary icon=replay disable"
+                ).tooltip(reload_block)
                 return
             if reload_confirm is not None and terminal:
                 ui.button(

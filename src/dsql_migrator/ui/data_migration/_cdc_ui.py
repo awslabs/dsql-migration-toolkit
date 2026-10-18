@@ -3231,11 +3231,26 @@ START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT = (
     "since."
 )
 START_UNCOVERED_HEADER = "Load the tables selected after the Full Load first"
+# G129: Start CDC waits while a Full Load runs (a Retry or a Reload too). The load inserts only
+# the rows missing on the target, so a row the source deletes while its table is copied --
+# deleted by the sink before the copy wrote it -- would be written back.
+START_LOAD_RUNNING_HEADER = "Start CDC waits for the Full Load to finish"
+START_LOAD_RUNNING_BODY = (
+    "A Full Load is running. Start CDC once it has finished: until then the CDC sink would "
+    "apply changes to tables the load is still copying, and a row the source deletes while its "
+    "table is copied could reach Aurora DSQL after CDC applied that delete, and then stay there."
+)
 DEPLOY_PENDING_EMPTY = (
     "Load the tables selected after the Full Load before deploying the CDC infrastructure: "
     "none of the selected tables is loaded under the Full Load's start point yet, and the "
     "infrastructure is sized for the tables CDC captures when it is created."
 )
+
+
+def full_load_running(job) -> bool:
+    """Is this migration's Full Load job -- a Start, a Re-run, a Retry or a Reload -- still
+    pending or running? (G129: Start CDC waits for it.) Pure."""
+    return getattr(job, "status", None) in ("PENDING", "RUNNING")
 
 
 def _them(names) -> "tuple[str, bool]":
@@ -3497,12 +3512,19 @@ def _render_cdc_start_button(
     # once CDC starts the set is fixed.
     _uncovered = cdc_start_uncovered(migration_state, job_manager, job)
     _migration_type = getattr(migration_state, "migration_type", None)
+    # G129: a Full Load (a Retry or a Reload too) is still copying: Start waits for it.
+    _load_running = full_load_running(job)
     # A restart is a materially different operation from a first start -- it resumes an
     # existing position rather than establishing one -- so it must not be described with
     # the first-start copy. Saying only "begins streaming" left the operator to guess
     # whether stopping had cost them their place (and the answer, "no", is the one thing
     # they need before pressing this).
-    if _empty_capture:
+    if _load_running:
+        # A normal state, not a failure: Start becomes available when the load ends.
+        render_notice(
+            ui, tone="info", header=START_LOAD_RUNNING_HEADER, body=START_LOAD_RUNNING_BODY
+        )
+    elif _empty_capture:
         # Nothing would stream (G16; G17: or only tables still to load are selected): the
         # source config card above says why, once -- the Will stream line below and the
         # disabled Start say it here.
@@ -3876,6 +3898,10 @@ def _render_cdc_start_button(
     if prereq_block:
         start_btn.props("disable")
         start_btn.tooltip(prereq_block)
+    elif _load_running:
+        # G129: the notice above says why; Start comes back when the load ends.
+        start_btn.props("disable")
+        start_btn.tooltip(START_LOAD_RUNNING_BODY)
     elif _capture_error:
         start_btn.props("disable")
         start_btn.tooltip(_capture_error)
@@ -8400,6 +8426,13 @@ def _start_cdc_deploy(
     # Settle a restored pre-overlay session's exclusions before any set is read.
     classify_restored_exclusions(migration_state, job_manager)
     job = _current_job(job_manager, migration_state.job_id)
+    # G129 backstop (the Start button says it first; Retry CDC comes here directly): a Full
+    # Load still copying is refused before any parameter is built or job submitted.
+    if full_load_running(job):
+        render_notice(
+            ui, tone="error", header=START_LOAD_RUNNING_HEADER, body=START_LOAD_RUNNING_BODY
+        )
+        return
     # G17 backstop (the Start button and its dialog say it first; Retry CDC comes here
     # directly): a selected table not loaded under the Full Load's start point yet. Refused
     # before any parameter is built or job submitted -- CDC would not capture it, and once

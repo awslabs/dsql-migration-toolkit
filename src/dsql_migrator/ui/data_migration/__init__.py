@@ -815,6 +815,14 @@ def build_data_migration_screen(
         if _start_point_block is not None:
             ui.notify(_start_point_block[2], type="warning", position="top", multi_line=True)
             return
+        # G129: no Full Load while CDC is live (a Start in flight on a stack that has not
+        # streamed yet passes the gate above, and the page header's Run has no disabled
+        # button). It would insert only the rows missing on the target, so a row the source
+        # deletes during the copy -- deleted by the sink before the copy wrote it -- would be
+        # written back.
+        if cdc_streaming_started(migration_state, job_manager):
+            ui.notify(_CDC_LIVE_START_TOOLTIP, type="warning", position="top", multi_line=True)
+            return
         if not session.has_source():
             migration_state.set_error(
                 "Configure and test the source connection first, then start the "
@@ -859,7 +867,8 @@ def build_data_migration_screen(
             # target (a DROP would race the live sink). Before CDC starts -- even in
             # the Full load + CDC pattern -- a re-run still drops+recreates the
             # confirmed tables for a clean reload (no leftover rows). Once CDC is
-            # live the load falls back to idempotent SKIP_EXISTING (no DROP).
+            # live the load is refused above (G129); this keeps any other path from
+            # DROPping under a live sink.
             cdc_coexisting=cdc_streaming_started(migration_state, job_manager),
             # PostgreSQL Full Load + CDC: name the CDC stack so the watermark capture
             # creates the logical replication slot + publication on the source at the
@@ -2036,6 +2045,17 @@ def build_data_migration_screen(
                 if _restore_block:
                     ui.notify(_restore_block, type="warning", position="top")
                     return
+                # G129: no reload while CDC is live -- the step disables Retry and Reload then;
+                # this also covers a stale button and the exclusion popup's Change & reload. A
+                # load beside the sink inserts only the rows missing on the target, so a row the
+                # source deletes during the copy, deleted by the sink before the copy wrote it,
+                # would be written back. Stop CDC first, reload, then Start CDC again.
+                if cdc_streaming_started(migration_state, job_manager):
+                    ui.notify(
+                        _CDC_LIVE_RELOAD_TOOLTIP, type="warning", position="top",
+                        multi_line=True,
+                    )
+                    return
                 current = _current_job(job_manager, migration_state.job_id)
                 if current is None:
                     ui.notify(
@@ -2155,7 +2175,7 @@ def build_data_migration_screen(
                 # dependent view). ``replace_targets`` already encodes the choice
                 # (drop set when mode=="drop", empty for append); scope it to the
                 # tables being retried and suppress when CDC is live (DROP races the
-                # sink).
+                # sink; G129: a retry is refused above then, so this is the backstop).
                 # Plus every table the tool recreated in this lineage that did not finish:
                 # it is empty (or partly loaded) and must be recreated -- and overlaid --
                 # again, not appended to.
@@ -6460,6 +6480,8 @@ from dsql_migrator.ui.data_migration._full_load_ui import (  # noqa: E402,F401
     full_load_step_for_scope,
     submit_scope_identity_sync,
     _view_tables,
+    _CDC_LIVE_RELOAD_TOOLTIP,
+    _CDC_LIVE_START_TOOLTIP,
     _LOAD_STATE_COLORS,
     _LOAD_STATE_LABELS,
     _QUARANTINE_PK_CHIP_LIMIT,

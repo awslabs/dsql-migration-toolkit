@@ -155,8 +155,11 @@ class DataMigrationInputs:
     # sink) and must be idempotent against rows the sink already wrote. The load
     # then uses ``SKIP_EXISTING`` (insert only missing primary keys, never
     # overwrite a newer CDC row, never use the DSQL-unsafe ON CONFLICT) and skips
-    # all DROP/replace. Set for the Full load + CDC flow where connectors start
-    # before the Full Load (gapless, no offset seeding needed).
+    # all DROP/replace. It is NOT gapless for deletes (G129): a row the source deletes
+    # while its table is copied is deleted by the sink before the copy writes it (a
+    # delete that finds nothing), and the insert-only-missing load then writes it back.
+    # So the UI runs no Full Load while CDC streams (Stop CDC first) and Start CDC waits
+    # for a running one; this stays False there unless that rule is bypassed.
     cdc_coexisting: bool = False
     # The CDC stack this Full Load will hand off to, for a PostgreSQL Full Load + CDC
     # run. When set (PostgreSQL source only), the watermark capture creates a logical
@@ -1052,7 +1055,9 @@ def _sharding_is_consistent(*, cdc_coexisting: bool, shared_snapshot: bool) -> b
     is therefore only sound when one of two things holds:
 
     * ``cdc_coexisting`` -- a CDC stream will reconcile every post-snapshot write, so a
-      torn read is repaired by the stream (and the load is idempotent), or
+      torn read is repaired by the stream (and the load is idempotent) -- though not a
+      delete the sink applies before the copy writes the row (G129: the UI therefore
+      never runs such a load), or
     * ``shared_snapshot`` -- the source dialect can give EVERY shard one shared
       point-in-time snapshot (PostgreSQL exported snapshots), so there is nothing to tear.
 

@@ -299,6 +299,8 @@ over를 보류합니다). 기본값·주석·콜레이션·인덱스는 비교�
    Full Load 후 테이블의 체크를 해제하면(Full load + CDC, CDC를 시작하기 전; [§13.7](13-excluding-tables-and-columns.md)), CDC는 아직 선택된 테이블만 캡처하고 같은 워터마크 또는 슬롯에서 재개하므로, 그 테이블들의 핸드오프는 계속 gapless입니다. PostgreSQL에서 CDC가 그 슬롯에서 재개하면 publication에 체크를 해제한 테이블이 계속 남아 있고(도구는 소스에서 그 테이블을 빼지 않습니다) 커넥터가 그 테이블의 변경을 버립니다. 대신 다시 스냅샷하는 Start에서는 커넥터가 publication을 캡처 대상 테이블로 맞춥니다. 줄어든 집합으로 Re-run Full Load를 실행하면 기존 publication을 재사용합니다.
 
    Full Load 후 체크한 테이블(Full load + CDC, CDC를 시작하기 전)은 먼저 [§13.7](13-excluding-tables-and-columns.md)의 점검을 거쳐 Retry unfinished tables가 로드하고, 그 뒤 CDC가 같은 워터마크 또는 슬롯에서 그 테이블을 캡처합니다(MySQL에서 Full Load가 시작 지점 정의를 기록하지 않은 테이블은 대신 **Drop & reload**로 Re-run all tables가 필요합니다). 그 테이블이 로드될 때까지 Start CDC는 기다립니다. MySQL에서는 CDC가 워터마크 이후 그 테이블에 일어난 모든 변경을 더 새로운 복사본 위에 재생합니다. PostgreSQL에서는 그 테이블이 복사를 시작하기 직전에 CDC의 publication에 들어가고, CDC는 그때부터 그 테이블에 일어난 모든 변경을 그 복사본 위에 스트리밍합니다. 어느 쪽이든 결과는 수렴합니다. 고유 인덱스에서 잠깐 충돌하는 변경은 데드레터가 될 수 있으며, 그러면 Cut over는 CHECKSUM 검증을 기다립니다.
+
+   **Start CDC는 실행 중인 Full Load를 기다립니다.** 이 마이그레이션에서 Full Load가 실행되는 동안 — Start, Re-run, Retry unfinished tables 또는 Reload — CDC 단계는 *Ready to start CDC* 대신 *Start CDC waits for the Full Load to finish*를 보여 주고 Start CDC는 비활성화됩니다(Retry CDC도 거부됩니다). 적재는 타깃에 없는 행만 insert하므로, 싱크가 이미 스트리밍 중이면 테이블을 복사하는 동안 소스가 삭제한 행이 CDC가 그 삭제를 적용한 뒤에 Aurora DSQL에 도착해 그대로 남을 수 있습니다. 반대로 CDC가 스트리밍하는 동안에는 Full Load 단계가 아무것도 실행하지 않습니다: 먼저 Stop CDC를 하세요([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
 3. **MySQL 소스**에서는 **새 시작 지점**에서의 Start — 첫 Start(Full Load 워터마크 또는 Manual 지점에서),
    Delete CDC infrastructure 후의 첫 Start — 가 소스 커넥터를 **`snapshot.mode=recovery`**로
    실행합니다: 오프셋이 이미 시드돼 있으므로 Debezium은 내부 **스키마 히스토리**를 **현재 소스 테이블**로부터

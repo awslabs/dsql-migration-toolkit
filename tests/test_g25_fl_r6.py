@@ -403,11 +403,14 @@ def test_re_run_all_tables_on_a_running_stack_is_held_with_stop_cdc_first(monkey
 
 
 @pytest.mark.parametrize("engine", [MY, PG])
-@pytest.mark.parametrize("stack", list(ALL_STACKS), ids=list(ALL_STACKS))
+@pytest.mark.parametrize("stack", ["never started", "stopped", "rolled back"])
 def test_retry_unfinished_keeps_the_original_start_point_on_every_stack(
     monkeypatch, engine, stack
 ) -> None:
     # Guard: Retry unfinished tables runs under the original watermark and converges.
+    # DELIBERATE G129 UPDATE: a running stack is no longer one of them -- while CDC streams a
+    # retry would write back the rows the sink deletes during the copy, so it is disabled
+    # (tests/test_g129_coexisting_reload.py); after Stop CDC it runs, as here.
     state = _state(monkeypatch, ALL_STACKS[stack])
     ui, rec = _render(monkeypatch, state=state, job=_failed_b(), engine=engine,
                       status=StepStatus.FAILED)

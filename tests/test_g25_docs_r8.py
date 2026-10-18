@@ -685,23 +685,27 @@ def test_validations_recovery_card_is_described_as_round_8_renders_it(lang: str)
 
 # -- rule D: the CDC-live Retry / Reload confirm dialog --------------------------------------
 
+# G129: those actions are disabled while CDC is live (a dialog already open cannot be
+# confirmed), and they name the same route.
 _CDC_LIVE = {
     _P03: {
         "keeps-start-point": {
-            "en": "The confirm dialog of **Retry unfinished tables**, **Reload specific tables** "
-            "or a per-table **Reload**, which keep the original start point, says instead to Stop "
-            "CDC first, run it, then Start CDC again: CDC then continues from where it stopped, "
-            "gapless only while the CDC topics still retain what the sink had not applied (their "
-            "retention period on MSK).",
+            "en": "**Retry unfinished tables**, **Reload specific tables** and a per-table "
+            "**Reload**, which keep the original start point, are disabled too, and a confirm "
+            "dialog already open for one cannot be confirmed. They say instead to Stop CDC first, "
+            "run it, then Start CDC again: CDC then continues from where it stopped, gapless only "
+            "while the CDC topics still retain what the sink had not applied (their retention "
+            "period on MSK).",
             "ko": "원래 시작 지점을 유지하는 **Retry unfinished tables**, **Reload specific tables**, "
-            "테이블별 **Reload**의 확인 대화 상자는 대신 먼저 Stop CDC를 하고 그 작업을 실행한 뒤 Start "
-            "CDC를 다시 하라고 알려 줍니다: 그러면 CDC는 멈춘 곳에서 이어 가며, 싱크가 적용하지 않은 변경을 "
-            "CDC 토픽이 아직 보존하는 동안(MSK에서의 보존 기간)만 빈틈이 없습니다.",
+            "테이블별 **Reload**도 비활성화되며, 그중 하나를 위해 이미 열려 있는 확인 대화 상자는 확인할 수 "
+            "없습니다. 이들은 대신 먼저 Stop CDC를 하고 그 작업을 실행한 뒤 Start CDC를 다시 하라고 알려 "
+            "줍니다: 그러면 CDC는 멈춘 곳에서 이어 가며, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 "
+            "보존하는 동안(MSK에서의 보존 기간)만 빈틈이 없습니다.",
             "ja": "元の開始位置を維持する **Retry unfinished tables**、**Reload specific tables**、"
-            "テーブルごとの **Reload** の確認ダイアログは、代わりに、先に Stop CDC してからその操作を実行"
-            "し、もう一度 Start CDC するよう示します: CDC はその後、停止した位置から続き、ギャップがない"
-            "のは sink が適用していなかった変更を CDC トピックがまだ保持している間 (MSK での保持期間) "
-            "だけです。",
+            "テーブルごとの **Reload** も無効になり、そのいずれかのためにすでに開いている確認ダイアログは"
+            "確定できません。これらは代わりに、先に Stop CDC してからその操作を実行し、もう一度 Start CDC "
+            "するよう示します: CDC はその後、停止した位置から続き、ギャップがないのは sink が適用していなかった"
+            "変更を CDC トピックがまだ保持している間 (MSK での保持期間) だけです。",
         },
     },
 }
