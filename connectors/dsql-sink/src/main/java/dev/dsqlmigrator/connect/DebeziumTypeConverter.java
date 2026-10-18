@@ -151,8 +151,8 @@ final class DebeziumTypeConverter {
    *     or {@code null} for a plain primitive
    * @param value the raw value from {@code struct.get(field)}
    * @return a JDBC-ready value ({@link LocalDateTime}, {@link OffsetDateTime},
-   *     {@link BigDecimal}, {@link PGobject}, byte[], primitive, …); {@code null} passes
-   *     through
+   *     {@link LocalDate}, {@link BigDecimal}, {@link PGobject}, byte[], primitive, …);
+   *     {@code null} passes through
    */
   static Object convert(String schemaName, Object value) {
     if (value == null || schemaName == null) {
@@ -185,7 +185,7 @@ final class DebeziumTypeConverter {
         } else if (infinity == null && Math.abs(days - PG_SNAPSHOT_NEGATIVE_INFINITY_DAYS) <= 1) {
           infinity = pgObject("date", "-infinity");
         }
-        return infinity != null ? infinity : java.sql.Date.valueOf(LocalDate.ofEpochDay(days));
+        return infinity != null ? infinity : prolepticDate(days);
       }
       case JSON_TYPE:
         return jsonObject(value.toString());
@@ -461,6 +461,33 @@ final class DebeziumTypeConverter {
         Math.floorDiv(units, perSecond),
         (int) (Math.floorMod(units, perSecond) * (NANOS_PER_SECOND / perSecond)),
         ZoneOffset.UTC);
+  }
+
+  /** pgjdbc sends a LocalDate before this, 4713-01-01 BC (its MIN_LOCAL_DATE), as -infinity. */
+  private static final LocalDate PGJDBC_MIN_LOCAL_DATE = LocalDate.of(-4712, 1, 1);
+
+  /**
+   * The date {@code epochDay} (Debezium's {@code io.debezium.time.Date}) is in the proleptic
+   * Gregorian calendar -- the calendar of Debezium, PostgreSQL and Full Load (Python's date).
+   *
+   * <p><b>A {@link LocalDate}, not a {@code java.sql.Date}.</b> pgjdbc renders a
+   * {@code java.sql.Date} through a {@code GregorianCalendar}, whose switch from the Julian
+   * calendar skips 1582-10-05 .. 1582-10-14, so a MySQL {@code DATE} or PostgreSQL {@code date}
+   * in those ten days -- valid in both -- was written ten days later ({@code 1582-10-10} as
+   * {@code 1582-10-20}) while Full Load wrote it as it is; on a key column the update inserted a
+   * second row and the delete matched nothing. pgjdbc renders a {@code LocalDate} in the
+   * proleptic calendar and binds it as a {@code date}, independent of the worker JVM's time zone.
+   * It sends one before 4713-01-01 BC as {@code -infinity}, though, while PostgreSQL's dates start
+   * at 4714-11-24 BC, so an earlier date is bound as its own text -- the text Full Load writes (a
+   * PostgreSQL source's date is read as text).
+   */
+  private static Object prolepticDate(long epochDay) {
+    LocalDate date = LocalDate.ofEpochDay(epochDay);
+    if (date.isBefore(PGJDBC_MIN_LOCAL_DATE)) {
+      return pgObject("date", String.format(java.util.Locale.ROOT, "%04d-%02d-%02d BC",
+          1 - date.getYear(), date.getMonthValue(), date.getDayOfMonth()));
+    }
+    return date;
   }
 
   /** Wrap a JSON string in a {@code PGobject(type=json)} so it binds to a json column. */

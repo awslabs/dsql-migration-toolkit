@@ -833,7 +833,13 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #     connections (53300), the connection rate (53400), a token the AWS SDK could not sign
 #     (08001) -- is transient, and the next connect signs a new token: classified like a
 #     statement's failure, it dead-lettered every row while it lasted, and a token that could
-#     not be signed killed the task.
+#     not be signed killed the task;
+#   * (G133) a date is bound as a java.time LocalDate, not a java.sql.Date, which pgjdbc renders
+#     through a GregorianCalendar whose switch from the Julian calendar skips 1582-10-05 ..
+#     1582-10-14: a MySQL DATE or PostgreSQL date in those ten days landed ten days later
+#     (1582-10-10 as 1582-10-20), and on a key column the update inserted a second row and the
+#     delete matched nothing. pgjdbc sends a LocalDate before 4713-01-01 BC as -infinity, so a
+#     PostgreSQL date before then (its dates start at 4714-11-24 BC) is bound as its own text.
 PLUGIN_VERSION = "v54"
 
 

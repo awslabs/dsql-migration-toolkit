@@ -16,7 +16,7 @@ rather than silently corrupting boundary rows at cutover.
 from __future__ import annotations
 
 import json
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -116,6 +116,11 @@ _GOLDEN: tuple[tuple[str, object, object], ...] = (
     ("DATETIME", datetime(1000, 1, 1), datetime(1000, 1, 1)),
     ("DATETIME(6)", datetime(1582, 10, 4, 23, 59, 59, 123456),
      datetime(1582, 10, 4, 23, 59, 59, 123456)),
+    # DATE -> date: the datetime.date passes through, in the same proleptic calendar -- the
+    # ten days the Gregorian reform skipped included (G133: the CDC sink sent those ten days
+    # later).
+    ("DATE", date(1582, 10, 10), date(1582, 10, 10)),
+    ("DATE", date(1000, 1, 1), date(1000, 1, 1)),
     # TIMESTAMP -> timestamptz: an aware value is normalized to UTC (stays tz-aware,
     # the instant is correct regardless of session TimeZone).
     ("TIMESTAMP", datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
@@ -191,6 +196,42 @@ def test_fixture_timestamps_are_one_text_on_both_paths() -> None:
         assert out == wall and out.isoformat(sep=" ") == text, case["name"]
         checked.append(case["name"])
     assert {"datetime_year_0001", "datetime6_year_1000", "datetime6_1582_10_04"} <= set(checked)
+
+
+def test_fixture_dates_are_one_text_on_both_paths() -> None:
+    # G133: each fixture date case pins the TEXT both paths send for one Debezium epoch day.
+    # Here: the day is the proleptic epoch day of that text, and the bulk loader keeps the
+    # date (psycopg sends its ISO text). DebeziumTypeConverterTest asserts the sink's LocalDate
+    # renders to the same text through pgjdbc -- before G133 a java.sql.Date, rendered through a
+    # GregorianCalendar that skips 1582-10-05 .. 1582-10-14, sent 1582-10-10 as 1582-10-20.
+    data = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    checked = []
+    for case in data["cases"]:
+        text = case.get("expected_dsql_text")
+        if text is None or case["dsql_kind"] != "date":
+            continue
+        day = date.fromisoformat(text)
+        assert (day - date(1970, 1, 1)).days == case["debezium_encoded_int"], case["name"]
+        out = _convert(case["mysql_type"], day)
+        assert out == day and out.isoformat() == text, case["name"]
+        checked.append(case["name"])
+    assert {
+        "date_1582_10_05",
+        "date_1582_10_10",
+        "date_1582_10_14",
+        "date_year_0001",
+        "date_year_1000",
+    } <= set(checked)
+
+
+def test_the_manual_names_the_date_shift_of_an_earlier_sink() -> None:
+    # G133, en / ko / ja alike: chapter 6's note on CDC infrastructure deployed by an earlier
+    # version names the skipped days and the DATE example beside the pre-1582 timestamps.
+    manual = Path(__file__).parent.parent / "docs" / "manual"
+    for lang in ("en", "ko", "ja"):
+        text = (manual / lang / "06-limitations.md").read_text(encoding="utf-8")
+        for phrase in ("1582-10-05", "1582-10-14", "`1582-10-10`", "`1582-10-20`", "`0999-12-27`"):
+            assert phrase in text, (lang, phrase)
 
 
 def test_none_passes_through_for_every_kind() -> None:

@@ -2937,12 +2937,22 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
         "timestamp as java.time": (
             "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"utcDateTime"
         ),
+        # ...and (G133) a date as a java.time LocalDate in the proleptic calendar, one before
+        # pgjdbc's 4713-01-01 BC floor (which it sends as -infinity) as its own text.
+        "date as java.time": (
+            "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"prolepticDate"
+        ),
     }
     # What the ZIP must no longer carry: pgjdbc renders a java.sql.Timestamp in the Julian
-    # calendar before 1582-10-15, so binding one wrote every earlier timestamp days off.
+    # calendar before 1582-10-15, so binding one wrote every earlier timestamp days off; and a
+    # java.sql.Date through the same calendar, whose switch skips 1582-10-05 .. 1582-10-14, so
+    # a date in those ten days was written ten days later (G133).
     class_absent = {
         "pre-1582 timestamp shift": (
             "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"java/sql/Timestamp"
+        ),
+        "skipped-days date shift": (
+            "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"java/sql/Date"
         ),
     }
     missing = (

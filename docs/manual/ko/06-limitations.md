@@ -437,14 +437,16 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   PostgreSQL의 제약 없는 `numeric`을 여전히 소수 6자리로 반올림합니다. 검사하지 않는 경우: `numeric` 컬럼에
   들어가는 `FLOAT`/`DOUBLE` 값.
 - **이전 버전이 배포한 CDC 인프라의 1582-10-15 이전 날짜·시각과 MySQL의 0–99년.** Full Load는 `DATETIME`,
-  `timestamp`, `timestamptz`를 그대로 저장합니다. MySQL이 문서화한 최솟값 `1000-01-01`과, .NET의
+  `timestamp`, `timestamptz`, `DATE`, `date`를 그대로 저장합니다. MySQL이 문서화한 최솟값 `1000-01-01`과, .NET의
   `DateTime.MinValue`나 Go의 영값 `time.Time`이 쓰는 `0001-01-01`도 마찬가지이며, CDC도 싱크 플러그인 v54부터
-  그렇게 합니다. 이전 싱크는 1582-10-15 이전 값을 율리우스력으로 며칠 어긋나게 썼고(`1000-01-01`을
-  `0999-12-27`로, `0001-01-01`을 `0001-01-03`으로), 이전 MySQL 소스는 `DATETIME`·`DATE`의 0–99년을 2000–2069년
-  또는 1970–1999년으로 읽었습니다(`0001-01-01`을 `2001-01-01`로). dead-letter도 없고 ROW_COUNT도 그대로
-  일치하므로 CHECKSUM에서만 드러납니다. 키 컬럼이면 update가 두 번째 행을 넣었고 delete는 아무 행도 지우지
-  못했습니다. **Delete CDC infrastructure** 후 다시 배포하고, 그런 테이블을 다시 적재(Drop & reload)한 뒤
-  CHECKSUM으로 검증하세요.
+  그렇게 합니다. 이전 싱크는 1582-10-15 이전의 `DATETIME`·`timestamp`·`timestamptz` 값을 율리우스력으로 며칠
+  어긋나게 썼고(`1000-01-01`을 `0999-12-27`로, `0001-01-01`을 `0001-01-03`으로), 그레고리력 개력으로 건너뛴
+  열흘(1582-10-05~1582-10-14)의 `DATE`·`date` 값은 열흘 뒤의 날짜로 썼습니다(`1582-10-10`을
+  `1582-10-20`으로). 이전 MySQL 소스는 `DATETIME`·`DATE`의 0–99년을 2000–2069년 또는 1970–1999년으로
+  읽었습니다(`0001-01-01`을 `2001-01-01`로). dead-letter도 없고 ROW_COUNT도 그대로 일치하므로 CHECKSUM에서만
+  드러납니다. 키 컬럼이면 update가 두 번째 행을 넣었고 delete는 아무 행도 지우지 못했습니다.
+  **Delete CDC infrastructure** 후 다시 배포하고, 그런 테이블을 다시 적재(Drop & reload)한 뒤 CHECKSUM으로
+  검증하세요.
 - **PostgreSQL 17/18 소스 — 버전별 엣지 3가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
   지원하며, 17·18에서 유의할 점이 3가지 있습니다:
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그

@@ -2256,7 +2256,9 @@ DSQL_WRITE_CONTRACT_CASES: tuple[tuple[str, str, Optional[str], str], ...] = (
      "BIT(64) needs the full unsigned 64-bit range -> numeric(20,0)"),
     # --- Temporal (no-tz timestamp covered above; here the date/time/year kinds) --
     ("DATE", "date", "io.debezium.time.Date",
-     "epoch-day INT32 -> date (sink) / datetime.date (loader)"),
+     "epoch-day INT32 -> java.time.LocalDate (sink; proleptic calendar, so a date in the ten "
+     "days the Gregorian reform skipped, 1582-10-05 .. 1582-10-14, lands as it is; a "
+     "java.sql.Date was sent ten days later) / datetime.date (loader)"),
     ("TIME", "time", "io.debezium.time.MicroTime",
      "micros-since-midnight -> time; loader timedelta->time, sink Long->java.sql.Time"),
     ("YEAR", "smallint", "io.debezium.time.Year",

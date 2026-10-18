@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -447,21 +448,14 @@ class DebeziumTypeConverterTest {
   // --- Tier-3 regression guards ------------------------------------------------
 
   @Test
-  void dateEpochDayToSqlDateIsTimezoneIndependent() {
-    // io.debezium.time.Date is days-since-epoch. Converting via LocalDate.ofEpochDay is
-    // calendar-based (TZ-independent); a `new java.sql.Date(epochDay*86400000L)` would shift
-    // the day under a non-UTC JVM zone. Compare the LocalDate, not millis.
+  void dateEpochDayToLocalDateIsTimezoneIndependent() {
+    // io.debezium.time.Date is days-since-epoch. LocalDate.ofEpochDay is calendar-based
+    // (TZ-independent); a `new java.sql.Date(epochDay*86400000L)` would shift the day under a
+    // non-UTC JVM zone.
     Object r0 = DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, 0L);
-    assertInstanceOf(java.sql.Date.class, r0);
-    assertEquals(java.time.LocalDate.of(1970, 1, 1), ((java.sql.Date) r0).toLocalDate());
-    long ed2024 = java.time.LocalDate.of(2024, 1, 1).toEpochDay();
-    assertEquals(
-        java.time.LocalDate.of(2024, 1, 1),
-        ((java.sql.Date) DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, ed2024)).toLocalDate());
-    long ed1900 = java.time.LocalDate.of(1900, 1, 1).toEpochDay(); // pre-epoch (negative)
-    assertEquals(
-        java.time.LocalDate.of(1900, 1, 1),
-        ((java.sql.Date) DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, ed1900)).toLocalDate());
+    assertEquals(LocalDate.of(1970, 1, 1), assertInstanceOf(LocalDate.class, r0));
+    assertDateSentAsItIs("2024-01-01", LocalDate.of(2024, 1, 1));
+    assertDateSentAsItIs("1900-01-01", LocalDate.of(1900, 1, 1)); // pre-epoch (negative)
   }
 
   @Test
@@ -522,13 +516,15 @@ class DebeziumTypeConverterTest {
   @Test
   void theSharedWriteContractFixtureHoldsForTheSink() throws Exception {
     // The fixture both write paths are held to (tests/fixtures/dsql_write_contract.json, copied
-    // here as a test resource): the class the sink binds for each case and, for a timestamp,
-    // the text pgjdbc sends -- the text test_dsql_write_contract.py asserts Full Load writes.
+    // here as a test resource): the class the sink binds for each case and, for a timestamp or
+    // a date, the text pgjdbc sends -- the text test_dsql_write_contract.py asserts Full Load
+    // writes.
     software.amazon.awssdk.protocols.jsoncore.JsonNode root;
     try (java.io.InputStream in = getClass().getResourceAsStream("/dsql_write_contract.json")) {
       root = software.amazon.awssdk.protocols.jsoncore.JsonNode.parser().parse(in);
     }
     int timestamps = 0;
+    int dates = 0;
     for (var node : root.field("cases").orElseThrow().asArray()) {
       var c = node.asObject();
       String name = c.get("name").asString();
@@ -551,13 +547,20 @@ class DebeziumTypeConverterTest {
           "boolean".equals(c.get("dsql_kind").asString()), false);
       assertEquals(c.get("expected_dsql_java_class").asString(), bound.getClass().getName(), name);
       if (c.containsKey("expected_dsql_text")) {
-        String sent = bound instanceof OffsetDateTime zoned
-            ? PGJDBC.toString(zoned) : PGJDBC.toString((LocalDateTime) bound);
+        String sent;
+        if (bound instanceof LocalDate date) {
+          sent = PGJDBC.toString(date);
+          dates++;
+        } else {
+          sent = bound instanceof OffsetDateTime zoned
+              ? PGJDBC.toString(zoned) : PGJDBC.toString((LocalDateTime) bound);
+          timestamps++;
+        }
         assertEquals(c.get("expected_dsql_text").asString(), sent, name);
-        timestamps++;
       }
     }
     assertTrue(timestamps >= 6, "timestamp cases: " + timestamps);
+    assertTrue(dates >= 5, "date cases: " + dates);
   }
 
   @Test
@@ -610,6 +613,110 @@ class DebeziumTypeConverterTest {
     assertEquals(java.util.List.of(slot), delete.deleteBindValues());
     assertEquals(
         "1000-01-01 00:00:00", PGJDBC.toString((LocalDateTime) delete.deleteBindValues().get(0)));
+  }
+
+  // --- G133: a date in the ten days the Gregorian reform skipped is written as itself ----------
+
+  @Test
+  void aDateInTheTenDaysGregorianSkippedIsSentAsItself() {
+    // pgjdbc renders a java.sql.Date through a GregorianCalendar, whose switch from the Julian
+    // calendar skips 1582-10-05 .. 1582-10-14, so a MySQL DATE or PostgreSQL date in those days
+    // was sent ten days later (1582-10-10 as 1582-10-20) while Full Load wrote it as it is.
+    // FAILS WITHOUT G133 (a java.sql.Date came back). Debezium's epoch days are proleptic.
+    for (int day = 5; day <= 14; day++) {
+      assertDateSentAsItIs(String.format("1582-10-%02d", day), LocalDate.of(1582, 10, day));
+    }
+    assertDateSentAsItIs("1582-10-04", LocalDate.of(1582, 10, 4)); // the last Julian day
+    assertDateSentAsItIs("1582-10-15", LocalDate.of(1582, 10, 15)); // the first Gregorian day
+    assertDateSentAsItIs("0001-01-01", LocalDate.of(1, 1, 1)); // .NET / Go zero
+    assertDateSentAsItIs("1000-01-01", LocalDate.of(1000, 1, 1)); // MySQL's documented minimum
+    assertDateSentAsItIs("1500-03-01", LocalDate.of(1500, 3, 1)); // after a Julian-only leap day
+    assertDateSentAsItIs("2024-02-29", LocalDate.of(2024, 2, 29)); // control
+    assertDateSentAsItIs("9999-12-31", LocalDate.of(9999, 12, 31)); // MySQL's maximum
+    // PostgreSQL's BC dates and its maximum (5874897 AD).
+    assertDateSentAsItIs("0001-06-01 BC", LocalDate.of(0, 6, 1));
+    assertDateSentAsItIs("0044-03-15 BC", LocalDate.of(-43, 3, 15));
+    assertDateSentAsItIs("4713-01-01 BC", LocalDate.of(-4712, 1, 1)); // pgjdbc's floor
+    assertDateSentAsItIs("5874897-12-31", LocalDate.of(5_874_897, 12, 31));
+  }
+
+  @Test
+  void aPostgresDateBeforePgjdbcsFloorIsSentAsItsText() {
+    // PostgreSQL's dates start at 4714-11-24 BC, but pgjdbc sends a LocalDate before 4713-01-01
+    // BC as '-infinity' -- so such a date is bound as its own text, the text Full Load writes
+    // (the java.sql.Date sent these as they are). Below PostgreSQL's minimum that text is refused
+    // as out of range, never stored as -infinity.
+    LocalDate minimum = LocalDate.of(-4713, 11, 24);
+    assertEquals("-infinity", PGJDBC.toString(minimum)); // why that LocalDate is not bound
+    assertDateText("4714-11-24 BC", minimum);
+    assertDateText("4714-12-31 BC", LocalDate.of(-4713, 12, 31));
+    assertDateText("4715-01-01 BC", LocalDate.of(-4714, 1, 1)); // below PostgreSQL's range
+  }
+
+  /** {@code date}'s epoch day as the sink converts it and as pgjdbc then sends it. */
+  private static void assertDateSentAsItIs(String text, LocalDate date) {
+    Object converted = DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, date.toEpochDay());
+    assertEquals(date, converted, text);
+    assertEquals(text, PGJDBC.toString((LocalDate) converted));
+  }
+
+  /** {@code date}'s epoch day converts to a {@code date} PGobject holding {@code text}. */
+  private static void assertDateText(String text, LocalDate date) {
+    Object converted = DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, date.toEpochDay());
+    PGobject pg = assertInstanceOf(PGobject.class, converted, text);
+    assertEquals("date", pg.getType());
+    assertEquals(text, pg.getValue());
+  }
+
+  @Test
+  void aDateKeyInTheSkippedDaysKeysTheUpdateAndTheDeleteOnTheFullLoadRow() {
+    // A MySQL table keyed on a DATE holding 1582-10-10: Full Load wrote the key '1582-10-10'.
+    // The CDC upsert's ON CONFLICT key and the delete's WHERE key must be sent as that text.
+    // FAILS WITHOUT G133: sent as 1582-10-20, the update inserted a second row and the delete
+    // matched nothing.
+    LocalDate day = LocalDate.of(1582, 10, 10);
+    int epochDay = (int) day.toEpochDay();
+    Schema date = SchemaBuilder.int32().name(DebeziumTypeConverter.DATE).build();
+    Schema key = SchemaBuilder.struct().name("Key").field("day", date).build();
+    Schema row =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("day", date)
+            .field("note", Schema.OPTIONAL_STRING_SCHEMA)
+            .optional()
+            .build();
+    Schema source =
+        SchemaBuilder.struct()
+            .name("Source")
+            .field("db", Schema.STRING_SCHEMA)
+            .field("table", Schema.STRING_SCHEMA)
+            .optional()
+            .build();
+    Schema envelope =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", row)
+            .field("after", row)
+            .field("source", source)
+            .build();
+    Struct image = new Struct(row).put("day", epochDay).put("note", "cdc-update");
+    Struct src = new Struct(source).put("db", "app").put("table", "days");
+
+    ChangeEvent update = DebeziumEvents.parse(new SinkRecord("dsqlcdc.app.days", 0, key,
+        new Struct(key).put("day", epochDay), envelope,
+        new Struct(envelope).put("op", "u").put("before", image).put("after", image)
+            .put("source", src), 0L));
+    assertEquals(java.util.List.of(day), update.pkValues());
+    assertEquals(day, update.values().get(update.columns().indexOf("day")));
+    assertEquals("1582-10-10", PGJDBC.toString((LocalDate) update.pkValues().get(0)));
+
+    ChangeEvent delete = DebeziumEvents.parse(new SinkRecord("dsqlcdc.app.days", 0, key,
+        new Struct(key).put("day", epochDay), envelope,
+        new Struct(envelope).put("op", "d").put("before", image).put("source", src), 1L));
+    assertTrue(delete.isDelete());
+    assertEquals(java.util.List.of(day), delete.deleteBindValues());
+    assertEquals("1582-10-10", PGJDBC.toString((LocalDate) delete.deleteBindValues().get(0)));
   }
 
   // --- PostgreSQL bit/varbit -> bit-string (live-test finding: CDC must match Full Load) ---

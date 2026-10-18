@@ -66,6 +66,56 @@
       "note": "The last day before the Gregorian reform. Bound as a java.sql.Timestamp it was sent as 1582-09-24; from 1582-10-15 on it was always exact."
     },
     {
+      "name": "date_1582_10_05",
+      "mysql_type": "DATE",
+      "dsql_kind": "date",
+      "debezium_schema_name": "io.debezium.time.Date",
+      "debezium_encoded_int": -141437,
+      "expected_dsql_java_class": "java.time.LocalDate",
+      "expected_dsql_text": "1582-10-05",
+      "note": "Epoch day -> java.time.LocalDate, bound as date in the proleptic calendar. 1582-10-05 .. 1582-10-14 are the ten days the Gregorian reform skipped: bound as a java.sql.Date, which pgjdbc renders through a GregorianCalendar, each was sent ten days later (this one as 1582-10-15); on a key the upsert inserted a second row and the delete matched nothing."
+    },
+    {
+      "name": "date_1582_10_10",
+      "mysql_type": "DATE",
+      "dsql_kind": "date",
+      "debezium_schema_name": "io.debezium.time.Date",
+      "debezium_encoded_int": -141432,
+      "expected_dsql_java_class": "java.time.LocalDate",
+      "expected_dsql_text": "1582-10-10",
+      "note": "A skipped day; as a java.sql.Date it was sent as 1582-10-20."
+    },
+    {
+      "name": "date_1582_10_14",
+      "mysql_type": "DATE",
+      "dsql_kind": "date",
+      "debezium_schema_name": "io.debezium.time.Date",
+      "debezium_encoded_int": -141428,
+      "expected_dsql_java_class": "java.time.LocalDate",
+      "expected_dsql_text": "1582-10-14",
+      "note": "The last skipped day; as a java.sql.Date it was sent as 1582-10-24. Before 1582-10-05 and from 1582-10-15 on, the java.sql.Date was exact."
+    },
+    {
+      "name": "date_year_0001",
+      "mysql_type": "DATE",
+      "dsql_kind": "date",
+      "debezium_schema_name": "io.debezium.time.Date",
+      "debezium_encoded_int": -719162,
+      "expected_dsql_java_class": "java.time.LocalDate",
+      "expected_dsql_text": "0001-01-01",
+      "note": ".NET DateTime.MinValue / Go zero time as a DATE. Arrives as the year 1 only with Debezium enable.time.adjuster=false (set on the cdc-stack MySQL source)."
+    },
+    {
+      "name": "date_year_1000",
+      "mysql_type": "DATE",
+      "dsql_kind": "date",
+      "debezium_schema_name": "io.debezium.time.Date",
+      "debezium_encoded_int": -354285,
+      "expected_dsql_java_class": "java.time.LocalDate",
+      "expected_dsql_text": "1000-01-01",
+      "note": "MySQL's documented DATE minimum, a common 'no date' value."
+    },
+    {
       "name": "bigint_unsigned",
       "mysql_type": "BIGINT UNSIGNED",
       "dsql_kind": "decimal",
