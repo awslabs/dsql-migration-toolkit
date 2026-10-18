@@ -15,6 +15,7 @@ module imports only stdlib + ``core.*`` + ``ui.ai_assist`` (never back from
 
 from __future__ import annotations
 
+import bisect
 import logging
 import re
 from dataclasses import dataclass
@@ -803,9 +804,10 @@ def merge_object_ddl(
     Of two statements that create the same, the named one stands, and the current one when
     both are: a foreign key is paired with its metadata by its constraint name (the orphan
     check, a reload's pre-drop), which an unnamed or refolded restatement would lose. Only a
-    second copy under the same name goes: one of another name that creates the same -- MySQL
-    keeps two indexes or foreign keys of one definition -- is kept, and said, where it was
-    dropped without a word and no apply path created it.
+    second copy under the same name, or under none, goes: one of another name that creates
+    the same -- MySQL keeps two indexes or foreign keys of one definition -- is kept, and
+    said, where it was dropped without a word and no apply path created it; an unnamed one
+    (a hand edit's, an earlier adoption's) kept beside it was a second index or constraint.
 
     Returns the script and what was kept that the reply did not give (an index, a foreign
     key, another statement of the script; never its schema ensure) or gave under another
@@ -857,9 +859,10 @@ def merge_object_ddl(
             elif (kind, definition) in incoming:
                 key = (kind, definition)
                 stands = bool(name) or not incoming[key][0]
-                if key in placed and (kind, name) not in placed:
+                if key in placed and name and (kind, name) not in placed:
                     # What an earlier statement stands for, under another name (MySQL keeps
-                    # two indexes or foreign keys of one definition): kept as written.
+                    # two indexes or foreign keys of one definition): kept as written. An
+                    # unnamed one is a second copy, which goes.
                     key = None
         if key is None:
             merged.append(piece)
@@ -1863,7 +1866,10 @@ def split_sql_statements(text: str) -> list[str]:
 # never ``WITH (fillfactor = 70)`` or ``WITH CHECK OPTION``; an ALTER / DROP / CREATE only of
 # an object kind, never the ``ALTER COLUMN`` / ``DROP CONSTRAINT`` action of an ALTER TABLE;
 # a psql meta-command (``\d``); and the statements no other one goes on with at a line's
-# start (ANALYZE, COMMIT, START TRANSACTION, ...).
+# start (ANALYZE, COMMIT, START TRANSACTION, ...). The list is closed: a statement of a kind
+# it leaves out (ALTER DEFAULT PRIVILEGES, RESET, COPY, LOCK, ALTER MATERIALIZED VIEW, ...)
+# glued after one that lost its ';' is still taken with it, and Schema Apply refuses the
+# whole (42601) -- each word added is also a column name a line of a view may start with.
 _KIND_WORDS = (
     r"(?:TABLE|VIEW|INDEX|SCHEMA|SEQUENCE|FUNCTION|PROCEDURE|TRIGGER|TYPE|DOMAIN|EXTENSION"
     r"|ROLE|USER|POLICY|RULE|DATABASE)"
@@ -1883,7 +1889,7 @@ _STATEMENT_START_RE = re.compile(
 # TABLE), an UPDATE (SET), an INSERT (VALUES, ON CONFLICT ... DO) or a rule (DO INSTEAD), so
 # they are cut only after the object's own CREATE TABLE, VIEW or INDEX or foreign key, which
 # takes none of them -- but the SET of a foreign key's ON DELETE / ON UPDATE, or of an ALTER
-# COLUMN in its ALTER TABLE. END also ends a CASE: it is cut once every CASE has its END.
+# COLUMN in its ALTER TABLE. END also ends a CASE: it is cut only where no CASE is open.
 _CLAUSE_START_RE = re.compile(r"(?:END|BEGIN|SET|VALUES|TABLE|DO)(?![\w$])", re.IGNORECASE)
 _OWN_STATEMENT_HEAD_RE = re.compile(
     rf"CREATE\s+{_CREATE_MODIFIERS}(?:TABLE|VIEW|INDEX)(?![\w$])", re.IGNORECASE
@@ -1891,19 +1897,33 @@ _OWN_STATEMENT_HEAD_RE = re.compile(
 _TAKES_SET_RE = re.compile(
     rf"(?:ON\s+(?:DELETE|UPDATE)|ALTER\s+(?:COLUMN\s+)?{_ANY_NAME_PART})$", re.IGNORECASE
 )
-_CASE_OR_END_RE = re.compile(r"(?<![\w$])(CASE|END)(?![\w$])", re.IGNORECASE)
+# A quoted name, blanked before CASE and END are read: a column named "end" ends no CASE.
+_QUOTED_NAME_RE = re.compile(r'"(?:[^"]|"")*"?')
+# CASE or END as the keyword. One after '.' or AS is a name (``e.end``, ``AS end``): it is
+# read with what precedes it (group 1) and left out.
+_CASE_OR_END_RE = re.compile(
+    r"(\.\s*|(?<![\w$])AS\s+)?(?<![\w$])(CASE|END)(?![\w$])", re.IGNORECASE
+)
 # The last word or sign of a statement that goes on with the next line's SELECT, INSERT, ...:
 # a view's AS, a set operator, a rule's DO [INSTEAD], a MERGE's THEN, a trigger's BEFORE /
 # OR events, FOR UPDATE, ON UPDATE of a foreign key, a list's comma, a GRANT's or REVOKE's
 # privilege, a clause still without what it takes -- ``AS SELECT`` then a column named update
-# on the next line, which was cut off and left a view of no columns.
+# on the next line, which was cut off and left a view of no columns; a foreign key's
+# REFERENCES before the table it names.
 _GOES_ON_RE = re.compile(
     r"(?:(?<![\w$])(?:AS|UNION|INTERSECT|EXCEPT|ALL|DISTINCT|DO|INSTEAD|ALSO|THEN|ELSE|BEFORE"
     r"|AFTER|OF|OR|AND|NOT|FOR|ON|IN|IS|BY|BEGIN|ATOMIC|EXPLAIN|ANALYZE|VERBOSE|GRANT|REVOKE"
-    r"|SELECT|FROM|WHERE|JOIN|HAVING|SET|RETURNING|INTO|USING|WHEN|CASE)"
+    r"|SELECT|FROM|WHERE|JOIN|HAVING|SET|RETURNING|INTO|USING|WHEN|CASE|REFERENCES)"
     r"|[,(=<>+\-*/|:])$",
     re.IGNORECASE,
 )
+# A SELECT's DISTINCT ON list, which its columns follow: ``SELECT DISTINCT ON (c.id)`` then
+# a column named call on the next line was cut off, and the view adopted had no columns.
+_DISTINCT_ON_RE = re.compile(r"(?<![\w$])DISTINCT\s+ON\s*\(\s*\)$", re.IGNORECASE)
+# One word of a statement's level text as its last words are read (a SET's ALTER COLUMN
+# name, a DISTINCT ON list): a run of anything but space, a quoted name whole.
+_WORD_RE = re.compile(r'(?:"(?:[^"]|"")*"?|[^\s"])+')
+_NON_SPACE_RE = re.compile(r"\S")
 # A head still waiting for what the next line starts: an ALTER's action (``ALTER TABLE t`` /
 # ``ALTER type SET NOT NULL``, COLUMN left out), an INSERT's query, what an EXPLAIN explains,
 # the GRANT or REVOKE of an ALTER DEFAULT PRIVILEGES.
@@ -1958,16 +1978,73 @@ def _statement_level(statement: str) -> "tuple[str, list[int]]":
     return "".join(out), starts
 
 
-def _takes_clause(word: str, before: str) -> bool:
-    """Whether ``before``, a statement's text so far, goes on with a line that starts with
-    ``word`` (:data:`_CLAUSE_START_RE`)."""
-    word = word.upper()
-    if word == "END":
-        ends = [found.upper() for found in _CASE_OR_END_RE.findall(before)]
-        return ends.count("CASE") > ends.count("END")
-    if word == "SET" and _TAKES_SET_RE.search(before):
-        return True
-    return not (_OWN_STATEMENT_HEAD_RE.match(before.lstrip()) or _is_foreign_key_ddl(before))
+def _case_keywords(level: str) -> "list[tuple[int, bool]]":
+    """The CASE (``True``) and END (``False``) keywords of a statement's level text
+    (:func:`_statement_level`), in order by offset -- never a name spelled so: ``"e"."end"``,
+    ``e.end``, ``AS end`` or ``"end date"``, a column MySQL lets a table have. Read as an
+    END, it cut the view whose CASE ends on a line of its own at that line."""
+    blank = _QUOTED_NAME_RE.sub(lambda name: " " * len(name.group(0)), level)
+    return [
+        (keyword.start(2), keyword.group(2).upper() == "CASE")
+        for keyword in _CASE_OR_END_RE.finditer(blank)
+        if keyword.group(1) is None
+    ]
+
+
+class _GluedPiece:
+    """The statement :func:`split_glued_statements` is reading, each fact about it read once
+    as its lines go by: reading the text so far again at every line that starts with END,
+    SET, VALUES, ... made a reply of many CASE columns (an END line each) quadratic, on the
+    UI's event loop."""
+
+    def __init__(self, level: str, begin: int) -> None:
+        self.level = level
+        self.begin = begin
+        first = _NON_SPACE_RE.search(level, begin)
+        self.first = first.start() if first is not None else len(level)
+        own = _OWN_STATEMENT_HEAD_RE.match(level, self.first)
+        self._own_end = own.end() if own is not None else None
+        self._cases = 0  # its CASEs still without their END
+        self._foreign_key: Optional[bool] = None  # known once its first bracket is read
+        self._bracket_read_to = begin
+        self._query: Optional[bool] = None  # whether its last CTE list has its query
+        self._cte_read_to = self._query_read_to = begin
+
+    def read_keyword(self, opens: bool) -> None:
+        """One of its CASE (``opens``) and END keywords, in order: an END closes the CASE
+        last opened, and one with none open closes nothing."""
+        self._cases = self._cases + 1 if opens else max(self._cases - 1, 0)
+
+    def takes(self, word: str, end: int, tail: str) -> bool:
+        """Whether its text up to ``end`` -- ``tail`` its last words -- goes on with a line
+        that starts with ``word`` (:data:`_CLAUSE_START_RE`)."""
+        if word == "END":
+            return self._cases > 0
+        if word == "SET" and _TAKES_SET_RE.search(tail):
+            return True
+        own = self._own_end is not None and self._own_end <= end
+        return not (own or self._is_foreign_key(end))
+
+    def _is_foreign_key(self, end: int) -> bool:
+        # By its head up to its first bracket, where FOREIGN KEY's columns open.
+        if self._foreign_key is None:
+            bracket = self.level.find("(", self._bracket_read_to, end)
+            self._bracket_read_to = end
+            if bracket < 0:
+                return False
+            self._foreign_key = _is_foreign_key_ddl(self.level[self.begin : bracket])
+        return self._foreign_key
+
+    def awaits_query(self, end: int) -> bool:
+        """Whether its text up to ``end`` is a CTE list still without the query it goes on
+        to (:data:`_CTE_STATEMENT_RE`)."""
+        for cte in _CTE_HEAD_RE.finditer(self.level, self._cte_read_to, end):
+            self._query, self._query_read_to = False, cte.end()
+        self._cte_read_to = end
+        if self._query is False:
+            query = _CTE_STATEMENT_RE.search(self.level, self._query_read_to, end)
+            self._query, self._query_read_to = query is not None, end
+        return self._query is False
 
 
 def split_glued_statements(statement: str) -> list[str]:
@@ -1980,34 +2057,44 @@ def split_glued_statements(statement: str) -> list[str]:
     comments), and only when what comes before it is whole: not a view's ``AS``, a set
     operator, the CTE list of the query that follows, an ALTER still without its action, a
     SELECT still without its columns, and the like. A comment just above the line goes with
-    it."""
+    it. The text is read once, in linear time (:class:`_GluedPiece`)."""
     level, starts = _statement_level(statement)
+    keywords = _case_keywords(level)
+    words = [word.start() for word in _WORD_RE.finditer(level)]
     cuts: list[int] = []
-    begin = 0
+    piece = _GluedPiece(level, 0)
+    read = 0  # the CASE and END keywords read
     for start in starts:
         head = _INDENT_RE.match(level, start).end()
         clause = _CLAUSE_START_RE.match(level, head)
         if clause is None and not _STATEMENT_START_RE.match(level, head):
             continue
-        before = level[begin:head].rstrip()
+        while read < len(keywords) and keywords[read][0] < head:
+            piece.read_keyword(keywords[read][1])
+            read += 1
+        end = head  # where the statement so far ends, the space before the line left out
+        while end > piece.begin and level[end - 1].isspace():
+            end -= 1
+        if end == piece.begin:
+            continue
+        # Its last four words: what takes a SET, a DISTINCT ON list.
+        tail = level[max(piece.begin, words[max(bisect.bisect_left(words, end) - 4, 0)]) : end]
         if (
-            not before.strip()
-            or (clause is not None and _takes_clause(clause.group(0), before))
-            or _GOES_ON_RE.search(before[-16:])
-            or _OPEN_HEAD_RE.fullmatch(before.strip())
+            (clause is not None and piece.takes(clause.group(0).upper(), end, tail))
+            or _GOES_ON_RE.search(level[max(piece.begin, end - 16) : end])
+            or _DISTINCT_ON_RE.search(tail)
+            or _OPEN_HEAD_RE.fullmatch(level, piece.first, end)
+            or piece.awaits_query(end)  # the query of a CTE list
         ):
             continue
-        ctes = list(_CTE_HEAD_RE.finditer(before))
-        if ctes and not _CTE_STATEMENT_RE.search(before, ctes[-1].end()):
-            continue  # the query of a CTE list
         cut = start
-        while cut > begin:
-            above = max(level.rfind("\n", begin, cut - 1) + 1, begin)
+        while cut > piece.begin:
+            above = max(level.rfind("\n", piece.begin, cut - 1) + 1, piece.begin)
             if level[above:cut].strip():
                 break
             cut = above
         cuts.append(cut)
-        begin = cut
+        piece = _GluedPiece(level, cut)
     bounds = [0, *cuts, len(statement)]
     return [statement[a:b].strip() for a, b in zip(bounds, bounds[1:]) if statement[a:b].strip()]
 
