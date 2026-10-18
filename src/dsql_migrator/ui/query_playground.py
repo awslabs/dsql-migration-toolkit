@@ -53,6 +53,7 @@ from dsql_migrator.core.query_converter import (
     QueryConversionResult,
     QueryConverter,
     StatementKind,
+    table_column_names,
 )
 from dsql_migrator.core.query_playground import (
     ExecutionProbe,
@@ -572,6 +573,7 @@ def build_query_playground_screen(
         """
         if converter is not None:
             return converter
+        column_types, column_names = _inventory_columns()
         return QueryConverter(
             source_type=getattr(
                 getattr(session, "source_config", None),
@@ -579,23 +581,26 @@ def build_query_playground_screen(
                 SourceType.MYSQL,
             )
             or SourceType.MYSQL,
-            column_types=_inventory_column_types(),
+            column_types=column_types,
+            column_names=column_names,
         )
 
-    def _inventory_column_types() -> tuple:
+    def _inventory_columns() -> "tuple[tuple, tuple]":
         """The Evaluation inventory's column types, when Step 1 ran: a MySQL expression
         is then written by what its columns hold, as a view's is (a BLOB's LENGTH its own
-        bytes, CONVERT(blob USING ...) its decoded text)."""
+        bytes, CONVERT(blob USING ...) its decoded text) -- and its columns as the source
+        spells them, which a NATURAL JOIN's labels are matched to."""
         if eval_store is None:
-            return ()
+            return (), ()
         try:
             from dsql_migrator.core.converter import table_type_index
 
             result = eval_store.get_or_create(session_id).result  # type: ignore[attr-defined]
             inventory = getattr(result, "inventory", None) if result is not None else None
-            return tuple(table_type_index(getattr(inventory, "tables", None) or ()).values())
+            tables = getattr(inventory, "tables", None) or ()
+            return tuple(table_type_index(tables).values()), table_column_names(tables)
         except Exception:  # noqa: BLE001 - no inventory: the columns are untyped
-            return ()
+            return (), ()
 
     def _inferred_source_schema() -> Optional[str]:
         """The schema inferred from the connection: a MySQL DB maps to a same-named

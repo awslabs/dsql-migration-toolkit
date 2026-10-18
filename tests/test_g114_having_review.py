@@ -81,25 +81,17 @@ def test_an_alias_reading_no_column_of_its_query_is_the_from_column(sql: str, ha
 @pytest.mark.parametrize(
     ("sql", "having"),
     [
-        # items has no amount: MySQL groups and filters by the alias ([1, 2]); kept bare,
-        # Aurora DSQL's HAVING read the enclosing o2.amount ([2]).
+        # items has no amount: MySQL groups and filters by the alias ([1, 2]).
         ("SELECT o2.id FROM orders o2 WHERE EXISTS (SELECT (SELECT MAX(p.amount) FROM payments p "
-         "WHERE p.order_id = i.order_id) AS amount FROM items i WHERE i.order_id = o2.id "
-         "GROUP BY amount HAVING amount > 7)",
+         "WHERE p.order_id = i.order_id) AS amt FROM items i WHERE i.order_id = o2.id "
+         "GROUP BY amt HAVING amt > 7)",
          "HAVING (SELECT MAX(p.amount) FROM payments AS p WHERE p.order_id = i.order_id) > 7)"),
-        # orders has no label: MySQL []; kept bare, the enclosing s0.label ([paid Paid]).
-        ("SELECT s0.code, s0.label FROM statuses s0 WHERE EXISTS (SELECT (SELECT s.label "
-         "FROM statuses s WHERE s.code = o.status) AS label FROM orders o WHERE o.customer_id = 12 "
-         "GROUP BY label HAVING label = 'Paid')",
-         "HAVING (SELECT s.label FROM statuses AS s WHERE s.code = o.status) = 'Paid')"),
-        ("SELECT c.id FROM customers c WHERE EXISTS (SELECT (SELECT c2.name FROM customers c2 "
-         "WHERE c2.id = o.customer_id) AS name, COUNT(*) AS n FROM orders o WHERE o.id = c.id - 8 "
-         "GROUP BY name HAVING name <> 'a')",
-         "HAVING (SELECT c2.name FROM customers AS c2 WHERE c2.id = o.customer_id) <> 'a')"),
-        # At the top level the bare name failed ('column "amount" does not exist').
-        ("SELECT (SELECT MAX(p.amount) FROM payments p WHERE p.order_id = i.order_id) AS amount, "
-         "COUNT(*) AS n FROM items i GROUP BY amount HAVING amount > 10",
+        ("SELECT (SELECT MAX(p.amount) FROM payments p WHERE p.order_id = i.order_id) AS amt, "
+         "COUNT(*) AS n FROM items i GROUP BY amt HAVING amt > 10",
          "HAVING (SELECT MAX(p.amount) FROM payments AS p WHERE p.order_id = i.order_id) > 10"),
+        # (An alias that also names a column of its name -- AS amount over p.amount -- may be a
+        # key's name, which MySQL reads: kept the column and reported, tests/test_g120_having_
+        # query_review.py.)
     ],
 )
 def test_an_alias_reading_another_column_of_its_query_is_the_group(sql: str, having: str) -> None:
@@ -110,19 +102,19 @@ def test_an_alias_reading_another_column_of_its_query_is_the_group(sql: str, hav
     assert result.classification.value == "AUTO"
 
 
-def test_a_view_the_inventory_lacks_tells_nothing_but_the_alias_still_does() -> None:
-    """v_orders is a view (the inventory holds tables): MySQL [11, 13, 14]; kept bare, Aurora
-    DSQL read the enclosing c.name ([12, 13, 14, 15])."""
+def test_a_view_the_inventory_lacks_tells_nothing() -> None:
+    """v_orders is a view (the inventory holds tables): MySQL [11, 13, 14] -- grouped by the
+    alias, unless v_orders has name as a key o.customer_id depends on, which nothing tells
+    (G120): kept the column, as 5d955cc had it, and both readings named."""
     converted, result = _convert(
         "SELECT c.id FROM customers c WHERE EXISTS (SELECT (SELECT c2.name FROM customers c2 "
         "WHERE c2.id = o.customer_id) AS name, COUNT(*) AS n FROM v_orders o "
         "WHERE o.id = c.id - 8 GROUP BY name HAVING name <> 'a')",
         _inventory(),
     )
-    assert converted.endswith(
-        "HAVING (SELECT c2.name FROM customers AS c2 WHERE c2.id = o.customer_id) <> 'a')"
-    ), converted
-    assert result.classification.value == "AUTO"
+    assert converted.endswith("GROUP BY name HAVING name <> 'a')"), converted
+    assert [w.code for w in result.warnings] == ["MYSQL_SEMANTICS"]
+    assert "else by the select-list alias name" in result.warnings[0].message
 
 
 @pytest.mark.parametrize(

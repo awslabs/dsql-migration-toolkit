@@ -691,8 +691,12 @@ class _Scopes:
         self,
         tree: exp.Expression,
         table_columns: "Optional[Callable[[exp.Table], Optional[frozenset]]]" = None,
+        table_spellings: "Optional[Callable[[exp.Table], Optional[frozenset]]]" = None,
     ) -> None:
         self.aliases = {_key(n) for n in tree.find_all(exp.TableAlias) if n.name}
+        # A real table's columns as the source spells them (Schema Conversion keeps each so,
+        # quoted), when the Query Converter has them.
+        self._table_spellings = table_spellings
         self._ctes: dict = {}
         self._outputs: dict[int, Optional[set]] = {}
         self._labels: dict[int, set] = {}
@@ -969,6 +973,18 @@ class _Scopes:
         known = self.columns(item)
         return known is not None and column.lower() not in known
 
+    def spelled(self, item: exp.Expression) -> "Optional[frozenset]":
+        """A real table's columns as the source spells them -- Aurora DSQL's names for them --
+        from the Evaluation inventory; ``None`` when they are not known (a derived table, a
+        CTE, a table the inventory lacks)."""
+        if (
+            self._table_spellings is None
+            or not isinstance(item, exp.Table)
+            or self.source_outputs(item) is not None
+        ):
+            return None
+        return self._table_spellings(item)
+
     def columns(self, item: Optional[exp.Expression]) -> "Optional[frozenset]":
         """The columns ``item`` puts out, lower-cased, when they are known: a derived table's
         or CTE's outputs -- a ``*`` among them read as the columns of what it stars, when
@@ -1243,18 +1259,24 @@ def _mixed_case_names(
             # MySQL's NATURAL JOIN matches common columns whatever their case, Aurora DSQL only
             # those spelled alike once folded: a label the statement writes (an unquoted one
             # folds) beside a table's column, which stays as the source spells it (quoted), may
-            # be no common column there, and the join multiplies the rows. Only a label the
-            # table may hold, in some case -- which one the inventory does not tell: it keeps
-            # the names lower-cased.
+            # be no common column there, and the join multiplies the rows. A label a table's
+            # column matches only by case, where the inventory spells its columns; else one
+            # the table may hold, in some case (a * over it, a table the inventory lacks).
             left, right = scopes.operands(join)
             for side, other in ((left, right), (right, left)):
                 for partner in other:
                     outputs = scopes.source_outputs(partner)
                     if outputs is not None and not isinstance(outputs, _OpenOutputs):
                         continue  # labels the statement writes: they fold alike on both sides
+                    spelled = scopes.spelled(partner)
+                    by_case = (
+                        {column.lower(): column for column in spelled} if spelled is not None else None
+                    )
                     for item in side:
                         if any(
                             not scopes.lacks(partner, _key(label))
+                            if by_case is None
+                            else by_case.get(_key(label).lower(), _key(label)) != _key(label)
                             for label in _star_labels(item, scopes)
                         ):
                             first, second = (item, partner) if side is left else (partner, item)
@@ -1476,10 +1498,10 @@ def _quote_mismatch_warning(names: "Sequence[str]") -> "Optional[QueryWarning]":
 
 def _natural_join_warning(joins: "Sequence[str]") -> "Optional[QueryWarning]":
     """MANUAL for a NATURAL JOIN (``joins``, from :func:`_mixed_case_names`) of a source the
-    statement defines and a table that may hold one of its labels in another case: MySQL
-    joins on every column the two have in common whatever its case, Aurora DSQL only on
-    names spelled alike -- the rows multiply there, with no error. Which case the table's
-    column is in cannot be told here (the inventory's names are lower-cased)."""
+    statement defines and a table whose column one of its labels matches only by case -- or
+    may, where the table's columns are not known as the source spells them: MySQL joins on
+    every column the two have in common whatever its case, Aurora DSQL only on names spelled
+    alike -- the rows multiply there, with no error."""
     if not joins:
         return None
     return QueryWarning(
@@ -1493,8 +1515,9 @@ def _natural_join_warning(joins: "Sequence[str]") -> "Optional[QueryWarning]":
             "label that differs from the table's column only by case (customerid beside "
             "CustomerId) is then no common column, so the join matches on fewer columns (on "
             "none left, it pairs every row with every other) and returns more rows, with no "
-            "error. Unless each label is spelled exactly as the schema spells the column it "
-            "joins, write the join with ON, naming each column as the schema spells it."
+            "error: write the join with ON, naming each column as the schema spells it -- or "
+            "label each column the join should match exactly as the schema spells it, quoted "
+            "(AS \"CustomerId\"; unquoted, CustomerId folds to customerid)."
         ),
     )
 
@@ -1684,11 +1707,12 @@ def _verb_index(tokens: "Sequence") -> "Optional[int]":
     return None
 
 
-def _select_modifiers(tokens: "Sequence", start: int) -> list:
+def _select_modifiers(tokens: "Sequence", start: int, *, mysql57: bool = False) -> list:
     """The modifier tokens among the options of the SELECT whose options begin at ``start``:
     in any order, among its ALL / DISTINCT / DISTINCTROW and an optimizer hint, as MySQL
     takes them -- unquoted, and not a column's name. A SQL_CACHE ends them, and is among
-    them: MySQL 5.7's modifier, and from MySQL 8.0 on the first name of the select list."""
+    them: MySQL 5.7's modifier, and from MySQL 8.0 on the first name of the select list --
+    ``mysql57``: a statement only MySQL 5.7 reads, where it is one modifier among them."""
     found: list = []
     for position in range(start, len(tokens)):
         token = tokens[position]
@@ -1703,12 +1727,14 @@ def _select_modifiers(tokens: "Sequence", start: int) -> list:
         if following is None or following.token_type in _COLUMN_FOLLOWERS:
             break
         found.append(token)
-        if word == "SQL_CACHE":
+        if word == "SQL_CACHE" and not mysql57:
             break
     return found
 
 
-def _without_dml_modifiers(sql: str) -> "tuple[str, list[tuple[int, str, str]]]":
+def _without_dml_modifiers(
+    sql: str, *, mysql57: bool = False
+) -> "tuple[str, list[tuple[int, str, str]]]":
     """``sql`` without MySQL's DML and SELECT modifiers, and the modifiers found: ``(statement,
     verb, modifier)``, by the statement's place in the input, upper-case. sqlglot refuses
     DELETE / UPDATE IGNORE and INSERT LOW_PRIORITY, and reads UPDATE LOW_PRIORITY t as a
@@ -1717,7 +1743,8 @@ def _without_dml_modifiers(sql: str) -> "tuple[str, list[tuple[int, str, str]]]"
     and after every SELECT. Unquoted there, each is always a modifier: MySQL reserves most,
     and reads QUICK after DELETE as one even before a table's name. INSERT IGNORE stays:
     sqlglot reads it -- and so does SQL_CACHE, found but left in: MySQL 8.0 reads a column
-    of that name there. The text is rebuilt once, from the slices between the modifiers."""
+    of that name there; ``mysql57`` (the input is MySQL 5.7's) takes it out with the rest.
+    The text is rebuilt once, from the slices between the modifiers."""
     if not _MODIFIER_WORD.search(sql):
         return sql, []
     try:
@@ -1741,12 +1768,12 @@ def _without_dml_modifiers(sql: str) -> "tuple[str, list[tuple[int, str, str]]]"
             if token.token_type is TokenType.SELECT:
                 found.extend(
                     (statement, "SELECT", modifier)
-                    for modifier in _select_modifiers(part, position + 1)
+                    for modifier in _select_modifiers(part, position + 1, mysql57=mysql57)
                 )
     kept: list = []
     last = 0
     for token in sorted(
-        (token for _s, _v, token in found if token.text.upper() != "SQL_CACHE"),
+        (token for _s, _v, token in found if mysql57 or token.text.upper() != "SQL_CACHE"),
         key=lambda token: token.start,
     ):
         kept.append(sql[last : token.start])
@@ -1790,19 +1817,28 @@ def _found_rows_warning() -> QueryWarning:
     )
 
 
-def _sql_cache_warning() -> QueryWarning:
+def _sql_cache_warning(*, mysql57: bool = False) -> QueryWarning:
     """MANUAL for SQL_CACHE where MySQL 5.7 reads its query-cache modifier, left as written:
     MySQL 8.0 dropped the modifier and reads a column of that name there (SELECT sql_cache + 1
-    adds 1 to it), and which of the two wrote the statement is not known here."""
-    return QueryWarning(
-        code=CODE_MYSQL_ONLY_SELECT,
-        classification=Classification.MANUAL,
-        message=(
+    adds 1 to it), and which of the two wrote the statement is not known here -- ``mysql57``:
+    one MySQL 8.0 cannot read with a column there (SELECT SQL_CACHE * ...), so MySQL 5.7's,
+    written without it."""
+    if mysql57:
+        message = (
+            "SQL_CACHE right after SELECT is MySQL 5.7's query-cache modifier here: MySQL 8.0 and "
+            "later (which dropped the modifier) cannot read the statement with a column of that "
+            "name there, so it comes from MySQL 5.7. It is left out -- Aurora DSQL has no query "
+            "cache, and the query returns the same rows."
+        )
+    else:
+        message = (
             "SQL_CACHE right after SELECT is MySQL 5.7's query-cache modifier, and a column name "
             "on MySQL 8.0 and later (which dropped the modifier), so it is left as written. If "
             "the statement comes from MySQL 5.7, remove it: Aurora DSQL has no query cache, and "
             "reads a column sql_cache there. From MySQL 8.0 or later it is that column already."
-        ),
+        )
+    return QueryWarning(
+        code=CODE_MYSQL_ONLY_SELECT, classification=Classification.MANUAL, message=message
     )
 
 
@@ -2065,6 +2101,52 @@ def _mysql_only_dml_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
     )
 
 
+def _set_order_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
+    """MANUAL for a single-table UPDATE whose SET value reads a column an earlier assignment of
+    the same SET changes: MySQL assigns a single-table UPDATE's SET left to right, so the value
+    reads the new one (SET a = a + 1, b = a sets b to the new a); Aurora DSQL, as standard SQL,
+    reads every column's old value. A multi-table UPDATE is MySQL-only DML already."""
+    found: list[tuple[str, str]] = []
+    for update in tree.find_all(exp.Update):
+        target = update.this
+        if not isinstance(target, exp.Table) or target.args.get("joins"):
+            continue
+        names = {_item_key(target), _key(target.args.get("this"))}
+        assigned: set = set()
+        for assignment in update.expressions:
+            if not isinstance(assignment, exp.EQ) or not isinstance(assignment.this, exp.Column):
+                continue
+            value = assignment.expression
+            for column in value.find_all(exp.Column) if isinstance(value, exp.Expression) else ():
+                # The target's column: unqualified at the UPDATE's own level (a subquery's FROM
+                # reads its own), else qualified with the target's name.
+                qualifier = column.args.get("table")
+                reads_target = (
+                    column.find_ancestor(exp.Select, exp.Update) is update
+                    if qualifier is None
+                    else _key(qualifier) in names and not column.args.get("db")
+                )
+                pair = (assignment.this.name, column.name)
+                if reads_target and column.name.lower() in assigned and pair not in found:
+                    found.append(pair)
+            assigned.add(assignment.this.name.lower())
+    if not found:
+        return None
+    shown = ", ".join(f"{target} = ... {read}" for target, read in found[:5])
+    return QueryWarning(
+        code=CODE_MYSQL_SEMANTICS,
+        classification=Classification.MANUAL,
+        message=(
+            f"SET {shown}{' ...' if len(found) > 5 else ''}: the value reads a column an earlier "
+            "assignment of the same SET changes. MySQL assigns a single-table UPDATE's SET left "
+            f"to right, so it reads the new {found[0][1]} there; Aurora DSQL reads every column's "
+            "old value, so the statement writes other values, with no error. It is left as "
+            "written: write the earlier assignment's expression in place of the column (SET a = "
+            "a + 1, b = a + 1), or set the columns in two UPDATEs."
+        ),
+    )
+
+
 def _rewrite_with_rollup(tree: exp.Expression) -> "Optional[QueryWarning]":
     """MySQL's GROUP BY a, b WITH ROLLUP written GROUP BY ROLLUP (a, b), in place -- the same
     rows on PostgreSQL (each group's, then each subtotal with NULL in what it rolls up) --
@@ -2141,12 +2223,23 @@ def _explain_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
     )
 
 
+def table_column_names(tables: "Sequence") -> "tuple[tuple[str, tuple[str, ...]], ...]":
+    """``((table, (column, ...)), ...)``: the Evaluation inventory's tables' columns as the
+    source spells them -- Schema Conversion keeps each so, quoted, so they are Aurora DSQL's
+    names -- where :func:`~dsql_migrator.core.converter.table_type_index` lower-cases them."""
+    return tuple(
+        (table.name, tuple(column.name for column in table.columns)) for table in tables or ()
+    )
+
+
 def _inventory_columns(
-    column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]",
+    column_types: "Sequence[tuple[str, Sequence]]", *, spelled: bool = False
 ) -> "Optional[Callable[[exp.Table], Optional[frozenset]]]":
     """A real table's columns (lower-cased) from the Evaluation inventory's column types: the
     table named as written (with its schema, else without), else in another case, when only
-    one table can be meant; ``None`` when the inventory has no such table."""
+    one table can be meant; ``None`` when the inventory has no such table. ``spelled``:
+    ``column_types`` lists each table's column names as the source spells them
+    (:func:`table_column_names`), returned so."""
     if not column_types:
         return None
     index: dict = {}
@@ -2154,7 +2247,7 @@ def _inventory_columns(
     def columns(table: exp.Table) -> "Optional[frozenset]":
         if not index:
             for name, typed in column_types:
-                known = frozenset(column for column, _type in typed)
+                known = frozenset(typed if spelled else (column for column, _type in typed))
                 short = name.rsplit(".", 1)[-1]
                 for kind, key in (("exact", name), ("folded", name.lower()), ("bare", short),
                                   ("bare folded", short.lower())):
@@ -2196,12 +2289,16 @@ class QueryConverter:
         *,
         source_type: SourceType = SourceType.MYSQL,
         column_types: "Sequence[tuple[str, Sequence[tuple[str, str]]]]" = (),
+        column_names: "Sequence[tuple[str, Sequence[str]]]" = (),
     ) -> None:
         self._source_type = source_type
         # The Evaluation inventory's column types (table_type_index entries), so a MySQL
         # expression is written by what its columns hold -- a BLOB's LENGTH its own bytes,
         # CONVERT(blob USING ...) its decoded text -- as a view's is.
         self._column_types = tuple(column_types)
+        # Its columns as the source spells them (table_column_names), so a NATURAL JOIN's
+        # label is matched to a table's column as Aurora DSQL matches it.
+        self._column_names = tuple(column_names)
 
     @property
     def _is_postgres(self) -> bool:
@@ -2251,18 +2348,28 @@ class QueryConverter:
         # SQL_NO_CACHE ... after a SELECT, which sqlglot refuses or reads as a table or a
         # column: the parse is of the statement without them.
         parsed, modifiers = (sql, []) if self._is_postgres else _without_dml_modifiers(sql)
-        ignored = [statement for statement, _verb, word in modifiers if word == "IGNORE"]
+        read = _POSTGRES if self._is_postgres else MYSQL_EXPRESSION_DIALECT
+        mysql57 = False
         try:
-            tree = sqlglot.parse_one(
-                parsed, read=_POSTGRES if self._is_postgres else MYSQL_EXPRESSION_DIALECT
-            )
+            tree = sqlglot.parse_one(parsed, read=read)
         except (sqlglot.errors.ParseError, sqlglot.errors.TokenError) as exc:
             # A TokenError (an unterminated string or quote) used to escape to the caller.
-            return self._manual_review(
+            failed = self._manual_review(
                 sql,
                 CODE_PARSE_ERROR,
                 f"Unable to parse the SQL as {engine}; flag for manual review: {exc}",
             )
+            if not any(word == "SQL_CACHE" for _s, _verb, word in modifiers):
+                return failed
+            # A SQL_CACHE MySQL 8.0 cannot read as a column there (SELECT SQL_CACHE * ...): the
+            # statement is MySQL 5.7's, read as 5.7 reads it -- its query-cache modifier.
+            parsed, modifiers = _without_dml_modifiers(sql, mysql57=True)
+            try:
+                tree = sqlglot.parse_one(parsed, read=read)
+            except (sqlglot.errors.ParseError, sqlglot.errors.TokenError):
+                return failed
+            mysql57 = True
+        ignored = [statement for statement, _verb, word in modifiers if word == "IGNORE"]
 
         if tree is None:
             return self._manual_review(
@@ -2280,7 +2387,11 @@ class QueryConverter:
             # Before anything reads a hint's content as calls or names.
             settings = _drop_optimizer_hints(tree)
             # On the SOURCE's names, before a rewrite adds its own (EXCLUDED.col).
-            scopes = _Scopes(tree, _inventory_columns(self._column_types))
+            scopes = _Scopes(
+                tree,
+                _inventory_columns(self._column_types),
+                _inventory_columns(self._column_names, spelled=True),
+            )
             mismatched: list[str] = []
             natural: list[str] = []
             shadowed: list[tuple[str, str]] = []
@@ -2293,6 +2404,7 @@ class QueryConverter:
                 _case_only_alias_warning(tree, scopes, shadowed),
                 _shadowed_alias_warning(shadowed),
                 _mysql_only_dml_warning(tree),
+                _set_order_warning(tree),
                 _explain_warning(tree),
                 _set_var_warning(settings),
             ):
@@ -2303,7 +2415,7 @@ class QueryConverter:
             if any(word == "SQL_CALC_FOUND_ROWS" for _s, _verb, word in modifiers):
                 warnings.append(_found_rows_warning())
             if any(word == "SQL_CACHE" for _s, _verb, word in modifiers):
-                warnings.append(_sql_cache_warning())
+                warnings.append(_sql_cache_warning(mysql57=mysql57))
             warnings.extend(_mysql_only_clause_warnings(tree))
             on_duplicate_warning = _rewrite_on_duplicate_key_update(tree)
             if on_duplicate_warning is not None:
@@ -2383,6 +2495,7 @@ __all__ = [
     "StatementKind",
     "classify_statement",
     "classify_sql",
+    "table_column_names",
     "CODE_PARSE_ERROR",
     "CODE_RENDER_ERROR",
     "CODE_ON_DUPLICATE_KEY_UPDATE",

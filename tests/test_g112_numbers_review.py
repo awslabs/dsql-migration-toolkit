@@ -119,7 +119,10 @@ def test_an_assignment_target_is_never_cast() -> None:
     a boolean assigned to a number as its integer."""
     sql, result = _query("UPDATE t SET flag = 1, i = flag, n = (i > 0) WHERE id = 2")
     assert sql == "UPDATE t SET flag = TRUE, i = CAST(flag AS INT), n = (CAST(i > 0 AS INT)) WHERE id = 2"
-    assert result.classification is Classification.AUTO
+    # (G120) i = flag and n = (i > 0) read what the SET assigned before them: MySQL assigns
+    # left to right (the new flag, the new i), Aurora DSQL reads the old values -- reported.
+    assert [w.code for w in result.warnings] == ["MYSQL_SEMANTICS"]
+    assert "left to right" in result.warnings[0].message
     sql, _ = _query("UPDATE t SET flag = 1 - flag, flag = IF(i > 0, 1, 0) WHERE id = 2")
     assert "SET flag = (1 - CAST(flag AS INT)) <> 0, flag = CASE WHEN i > 0 THEN 1 ELSE 0 END <> 0" in sql
     sql, _ = _query("INSERT INTO t (id, flag) VALUES (1, TRUE) ON DUPLICATE KEY UPDATE flag = 0")
