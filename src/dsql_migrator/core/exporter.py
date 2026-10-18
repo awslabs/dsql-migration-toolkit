@@ -741,6 +741,15 @@ def _primary_key_columns(table: TableDef) -> list[str]:
     return primary_key
 
 
+def _told_apart(value: object) -> object:
+    """A key value as the source tells keys apart: a time with a zone by its offset too --
+    PostgreSQL orders 10:00+01 and 09:00+00 as two keys, where Python's == compares them
+    in UTC."""
+    if isinstance(value, time) and value.tzinfo is not None:
+        return (value, value.utcoffset())
+    return value
+
+
 def _walk_stopped(column: str, why: str, remedy: str) -> ExportError:
     """A walked key's read (:func:`keyset_stream`) cannot place every row of ``column``."""
     return ExportError(
@@ -1212,7 +1221,7 @@ def keyset_stream(
         for row in result.mappings():  # type: ignore[attr-defined]
             page_count += 1
             key = _key_of(row)
-            if key == cursor:
+            if cursor is not None and tuple(map(_told_apart, key)) == tuple(map(_told_apart, cursor)):
                 # A cursor's own row never sorts after it: the source compares the key
                 # differently from the cursor (ENUM members equal under the column's
                 # collation), so this page re-reads rows -- a full one that ends here

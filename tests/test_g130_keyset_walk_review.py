@@ -409,3 +409,32 @@ def test_the_manual_describes_the_member_walk_and_the_live_members(language: str
     assert "information_schema.COLUMNS" in section  # the members, read live
     assert "NUL" in section  # and the loud stops
     assert "collation" in section or "照合順序" in section
+
+
+def test_a_postgres_timetz_key_told_apart_by_its_offset_is_not_its_cursor_row() -> None:
+    """PostgreSQL orders (1, 10:00+01) and (1, 09:00+00) as two keys; Python's == compares
+    the times in UTC, so the cursor-row guard read the next row as the cursor's own and
+    stopped a table the row-value cursor reads correctly."""
+    from datetime import time, timedelta, timezone
+
+    from dsql_migrator.core.source_dialect import PostgresSourceDialect
+
+    rows = [
+        {"n": 1, "t": time(11, 0, tzinfo=timezone(timedelta(hours=2)))},
+        {"n": 1, "t": time(10, 0, tzinfo=timezone(timedelta(hours=1)))},
+        {"n": 1, "t": time(9, 0, tzinfo=timezone.utc)},
+        {"n": 2, "t": time(12, 0, tzinfo=timezone.utc)},
+    ]
+
+    class _Pages:
+        def __init__(self) -> None:
+            self.offset = 0
+
+        def execute(self, statement: object, parameters: Optional[dict] = None) -> _Result:
+            page = rows[self.offset:self.offset + parameters["batch_size"]]
+            self.offset += len(page)
+            return _Result(page)
+
+    table = _table("public.t", [("n", "integer"), ("t", "time with time zone")], ["n", "t"])
+    read = list(keyset_stream(_Pages(), table, batch_size=1, dialect=PostgresSourceDialect()))
+    assert read == rows
