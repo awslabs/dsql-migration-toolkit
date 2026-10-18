@@ -9999,7 +9999,17 @@ def _rewrite_mysql_calls(
             scale = decimal_scale(node)
             if scale is None:
                 return None
-            return (_QuotientType if carries_quotient(node) else str)(f"decimal(65,{scale})")
+            # A body MySQL materializes stores the column at that scale -- and so does the
+            # conversion (its outputs are shown): no digit is left to show or to key on.
+            body = node.find_ancestor(exp.Select)
+            while body is not None and isinstance(body.parent, exp.SetOperation):
+                body = body.parent
+            holder = body.parent if body is not None else None
+            stored = body is not None and (
+                isinstance(holder, exp.CTE)
+                or (isinstance(holder, exp.Subquery) and holder.args.get("alias") is not None)
+            ) and _mysql_materializes(body)
+            return (_QuotientType if carries_quotient(node) and not stored else str)(f"decimal(65,{scale})")
         if kind in ("datetime", "timestamp", "time"):
             precision = fraction_digits(node)
             return f"{kind}({precision})" if precision else kind
@@ -10853,31 +10863,52 @@ def _rewrite_mysql_calls(
                 return False
         return True
 
+    # Each query's ORDER BY expressions as written, read before the choices below are
+    # rewritten (innermost first, an ORDER BY copy of a choice may be texted before the
+    # select item it repeats): MySQL stores a view's ORDER BY 1 as the expression.
+    ordered_as_written: dict = {}
+    for query in nodes(exp.Select):
+        order = query.args.get("order")
+        if order is not None:
+            ordered_as_written[id(query)] = (query, {o.this.unnest().sql() for o in order.expressions})
+
     def listed_unordered(held: exp.Expression, parent: Optional[exp.Expression]) -> bool:
         """Whether a value is an item of its query's select list -- what a derived table, a
         CTE, a view or an INSERT ... SELECT hands on -- that the query does not order by (nor
-        a UNION branch, whose column PostgreSQL types by every branch), or a GROUP BY key:
-        an item its query groups by is written as the key is, which PostgreSQL matches."""
+        a UNION branch, whose column PostgreSQL types by every branch), or a GROUP BY key of
+        such an item: one decision per item, so the select list, the key and an ORDER BY
+        copy of it are written alike (PostgreSQL matches them by expression)."""
         item = parent if isinstance(parent, (exp.Alias, exp.Group)) else held
         query = item.parent
-        if isinstance(parent, exp.Group):
-            return isinstance(query, exp.Select) and not isinstance(query.parent, exp.SetOperation)
         if not isinstance(query, exp.Select) or isinstance(query.parent, exp.SetOperation):
             return False
+        written = held.unnest().sql()
+        known = ordered_as_written.get(id(query))
+        ordered_exprs = known[1] if known is not None and known[0] is query else set()
+        if isinstance(parent, exp.Group):
+            # A key takes the decision of the select item it repeats.
+            for position, projection in enumerate(query.expressions):
+                if projection.unalias().unnest().sql() == written:
+                    return not ordered(query, position, projection, ordered_exprs, written)
+            return written not in ordered_exprs
         position = next((i for i, p in enumerate(query.expressions) if p is item), None)
         if position is None:
             return False
-        group = query.args.get("group")
-        if group is not None and any(key.unnest() == held.unnest() for key in group.expressions):
-            return True
+        return not ordered(query, position, item, ordered_exprs, written)
+
+    def ordered(query: exp.Select, position: int, item: exp.Expression, ordered_exprs: set, written: str) -> bool:
+        """Whether ``query`` orders by its select item ``item`` at ``position``: by its
+        position or its alias -- or, grouped or DISTINCT, by the expression it holds, which
+        PostgreSQL then matches to the item (elsewhere an ORDER BY copy is MySQL's string
+        on its own, and the item stays the number readers compute with)."""
         alias = item.alias.lower() if isinstance(item, exp.Alias) else ""
         order = query.args.get("order")
-        return not any(
-            _integer_literal(ordered.this) == position + 1 or (
-                isinstance(ordered.this, exp.Column) and not ordered.this.table and alias
-                and ordered.this.name.lower() == alias
+        matched = query.args.get("group") is not None or bool(query.args.get("distinct"))
+        return (matched and written in ordered_exprs) or any(
+            _integer_literal(o.this) == position + 1 or (
+                isinstance(o.this, exp.Column) and not o.this.table and alias and o.this.name.lower() == alias
             )
-            for ordered in (order.expressions if order is not None else ())
+            for o in (order.expressions if order is not None else ())
         )
 
     # A choice MySQL makes a STRING -- a COALESCE / CASE / IF of a date or a time beside a
@@ -11343,12 +11374,13 @@ def _rewrite_mysql_calls(
     # MySQL makes a number, a date ... text where it wants a string (textual): PostgreSQL
     # has no integer || integer, lpad(integer, ...), btrim(integer), md5(integer) or
     # integer LIKE / ~, and writes a boolean, a comparison, a DATETIME(6) or a TIMESTAMP as
-    # text of its own. A column whose type cannot be told stays as it is -- text, the
-    # common case, needs nothing and keeps its index for LIKE 'prefix%' or UPPER(x) = ...,
-    # and a number there fails loudly on Aurora DSQL -- but where a number is as common as
-    # text and PostgreSQL has no form for it (untyped_text): in LPAD / RPAD and in a CONCAT
-    # with no text in it. Bytes beside text in a CONCAT are decoded: as text Aurora DSQL
-    # writes their hex.
+    # text of its own. A column whose type cannot be told (another view's, or a Query
+    # Converter statement's before Step 1) is as often a date or a number as text there:
+    # inside a string function, where it gets no index use anyway, it is x || ''
+    # (untyped_text: text for every type, bytes kept bytes -- LEFT(created_at, 7) is the
+    # month); under LIKE / REGEXP CAST(x AS TEXT), which a text column's index still serves
+    # for LIKE 'prefix%'; under UPPER / LOWER it stays as written. Bytes beside text in a
+    # CONCAT are decoded: as text Aurora DSQL writes their hex.
     def untyped_text(node: exp.Expression) -> exp.Expression:
         """A bare column whose type cannot be told, padded or joined only with values like it:
         x || '', text for every type (bytes kept bytes) -- LPAD(id, 6, '0'), CONCAT(a, b)
@@ -11388,7 +11420,12 @@ def _rewrite_mysql_calls(
         for key in keys:
             if node.args.get(key) is not None:
                 value = textual(node.args[key])
-                node.set(key, untyped_text(value) if isinstance(node, exp.Pad) and key == "this" else value)
+                if key == "this" and isinstance(node, (exp.Like, exp.RegexpLike)):
+                    if isinstance(value, exp.Column) and kind_of(value) is None:
+                        value = exp.Cast(this=value, to=exp.DataType.build("TEXT"))
+                elif key == "this" and not isinstance(node, (exp.Upper, exp.Lower)):
+                    value = untyped_text(value)
+                node.set(key, value)
     # GREATEST / LEAST are NULL when an argument is NULL in MySQL; Aurora DSQL's skip a NULL
     # argument. One NULL test per nest, at its outermost call, over the nest's leaves --
     # through every node NULL exactly when an operand is (_null_strict: arithmetic, ABS,

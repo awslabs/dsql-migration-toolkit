@@ -409,9 +409,10 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   뷰의 컬럼, 파생 테이블이나 CTE가 계산하는 컬럼, 1단계 전 Query Converter의 컬럼 — 의 `LENGTH`와 `BINARY`는
   표시됩니다: `LENGTH`는 `x || ''`의 텍스트를 세어 텍스트·바이트·정수·decimal·날짜에는
   MySQL과 같은 수가 되고(`TINYINT(1)`, `FLOAT`, `TIMESTAMP`, 소수부가 있는 `DATETIME`은 다름), `BINARY`는
-  `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 문자열 함수, `LIKE`, `BINARY` 비교에서는 그대로 둡니다 — 텍스트에는
-  맞고 그 인덱스는 `LIKE 'prefix%'`에도 쓰이며, 숫자라면 대상에서의 테스트에서 실패합니다 — 다만 숫자에도 흔히 쓰는
-  `LPAD`/`RPAD`와 텍스트가 없는 `CONCAT`에서는 `x || ''`로 씁니다. 몫은 MySQL이 보여 주는 곳에서
+  `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 문자열 함수 안에서는 `x || ''`로 써서 텍스트·숫자·날짜의 MySQL
+  텍스트가 되고(`LEFT(created_at, 7)`은 그 달), `LIKE`/`REGEXP`에서는 `CAST(x AS TEXT)`로 써서 텍스트 컬럼의 인덱스가
+  `LIKE 'prefix%'`에 계속 쓰이며(다른 뷰를 거쳐 읽는 바이너리 컬럼은 거기서 16진 텍스트로 비교됩니다), `UPPER`/`LOWER`와
+  `BINARY` 비교에서는 그대로 둡니다. 몫은 MySQL이 보여 주는 곳에서
   그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE —
   `ALGORITHM=TEMPTABLE`로 선언한 뷰, 또는 집계, 윈도우, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나
   테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는 것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의

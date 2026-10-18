@@ -400,16 +400,15 @@ def test_a_float_made_text_is_noted() -> None:
 
 def test_a_column_of_unknown_type_where_mysql_wants_a_string_is_made_text_and_noted() -> None:
     """S13: lpad(integer, ...), integer || integer through another view were refused while
-    AUTO; LENGTH(IFNULL(blob, '')) counted CAST(bytea AS TEXT)'s hex. G119: in LIKE (and
-    UPPER, TRIM ...) a column of unknown type stays as 5d955cc wrote it -- right for text,
-    its index serving LIKE 'prefix%'; a number there fails loudly -- and only LENGTH is
-    noted (every untyped LIKE, LPAD or CONCAT made the statement MANUAL)."""
+    AUTO; LENGTH(IFNULL(blob, '')) counted CAST(bytea AS TEXT)'s hex. Under LIKE a column of
+    unknown type is CAST(x AS TEXT) (a text column's index still serves LIKE 'prefix%'), and
+    only LENGTH is noted (every untyped LIKE, LPAD or CONCAT made the statement MANUAL)."""
     ddl, notes = _view(
         "select lpad(`v`.`n`,3,'0') AS `a`,concat(`v`.`n`,`v`.`n`) AS `b`,length(ifnull(`v`.`b`,'')) AS `c`,"
         "concat(`v`.`n`,'-') AS `e` from `shop`.`v_base` `v` where (`v`.`n` like '1%')"
     )
     assert "LPAD(\"v\".\"n\" || '', 3, '0')" in ddl and "\"v\".\"n\" || '' || \"v\".\"n\" || ''" in ddl
-    assert "OCTET_LENGTH(COALESCE(\"v\".\"b\", '') || '')" in ddl and "(\"v\".\"n\" LIKE '1%')" in ddl
+    assert "OCTET_LENGTH(COALESCE(\"v\".\"b\", '') || '')" in ddl and "(CAST(\"v\".\"n\" AS TEXT) LIKE '1%')" in ddl
     assert "\"v\".\"n\" || '-' AS \"e\"" in ddl  # beside text, int || text has an operator
     assert len([n for n in notes if "cannot be told" in n and "TINYINT(1)" in n]) == 1
 

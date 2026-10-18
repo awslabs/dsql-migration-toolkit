@@ -522,9 +522,10 @@ MySQL→PostgreSQL transpile:
   type cannot be told — another view's column, a derived table's or CTE's that it computes, or one in the Query
   Converter before Step 1 — are flagged: `LENGTH` counts the text of `x || ''`, MySQL's count for text, bytes, integers,
   decimals and dates (not a `TINYINT(1)`, a `FLOAT`, a `TIMESTAMP` or a fractional `DATETIME`), and `BINARY` is
-  `CAST(x AS BYTEA)`, right for a binary column only; in a string function, `LIKE` or a `BINARY` comparison it is left
-  as it is — right for text, whose index still serves `LIKE 'prefix%'`; a number there fails on Test on target — but in
-  `LPAD`/`RPAD` and a `CONCAT` with no text in it, as common over numbers, it is `x || ''`. A quotient is shown at its scale
+  `CAST(x AS BYTEA)`, right for a binary column only; in a string function it is `x || ''`, MySQL's text of text, a
+  number or a date (`LEFT(created_at, 7)` is the month), under `LIKE`/`REGEXP` `CAST(x AS TEXT)`, which a text column's
+  index still serves for `LIKE 'prefix%'` (a binary column read through another view is matched as its hex text
+  there), and under `UPPER`/`LOWER` or in a `BINARY` comparison it is left as it is. A quotient is shown at its scale
   where MySQL shows it: a statement's output and a text, and the rows of a view, derived table or CTE that MySQL
   materializes — a view declared `ALGORITHM=TEMPTABLE`, or one with an aggregate, a window, `DISTINCT`, `GROUP BY`,
   `HAVING`, `LIMIT`, a `UNION`, no table, or an output holding a subquery that reads its row — each stored at its

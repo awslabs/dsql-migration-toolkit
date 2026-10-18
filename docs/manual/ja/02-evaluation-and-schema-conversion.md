@@ -424,9 +424,9 @@ MySQL→PostgreSQL トランスパイルではありません。
   ステップ 1 の前の Query Converter の列 — の `LENGTH` と `BINARY` には
   フラグが付きます: `LENGTH` は `x || ''` のテキストを数え、テキスト・バイト・整数・decimal・日付には MySQL と同じ数になります
   (`TINYINT(1)`、`FLOAT`、`TIMESTAMP`、小数部のある `DATETIME` は別)。`BINARY` は `CAST(x AS BYTEA)` で、バイナリの列にだけ
-  正しい形です。文字列関数、`LIKE`、`BINARY` の比較ではそのままにします — テキストには正しく、そのインデックスは `LIKE 'prefix%'` にも
-  使われます。数値ならターゲットでのテストで失敗します — ただし数値にもよく使う `LPAD`/`RPAD` とテキストを含まない `CONCAT` では
-  `x || ''` にします。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
+  正しい形です。文字列関数の中では `x || ''` にし、テキスト・数値・日付の MySQL のテキストになります(`LEFT(created_at, 7)` は
+  その月)。`LIKE`/`REGEXP` では `CAST(x AS TEXT)` にし、テキストの列のインデックスは `LIKE 'prefix%'` にも使われます(別のビューを
+  通して読むバイナリの列はそこで 16 進のテキストとして比較されます)。`UPPER`/`LOWER` と `BINARY` の比較ではそのままにします。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
   テキスト、そして MySQL が実体化(materialize)するビュー・派生テーブル・CTE — `ALGORITHM=TEMPTABLE` で宣言したビュー、
   または集計、ウィンドウ、`DISTINCT`、`GROUP BY`、`HAVING`、`LIMIT`、`UNION` を持つもの、テーブルのないもの、自身の行を読む
   サブクエリを含む出力を持つもの — の行で、それぞれその列のスケールで保存されます(ウィンドウの値も、クエリがそれでグループ化

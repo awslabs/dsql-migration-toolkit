@@ -211,9 +211,20 @@ def test_a_number_beside_number_strings_is_a_number_where_it_is_shown() -> None:
     assert "COALESCE(CAST(\"t\".\"n\" AS TEXT), '0') AS \"k\"" in ddl
     assert "COALESCE(CAST(\"t\".\"n\" AS TEXT), 'N/A') AS \"m\"" in ddl
     assert "COALESCE(CAST(\"t\".\"n\" AS TEXT), '007') AS \"z\"" in ddl  # PostgreSQL's 7 is not '007'
-    # Grouped by, the key is written as the select list's item (PostgreSQL matches them).
-    ddl, _ = _select("ifnull(`t`.`n`,'0') AS `k`,count(0) AS `c`", tail=" group by ifnull(`t`.`n`,'0') order by `k`")
+    # Grouped by, the key is written as the select list's item (PostgreSQL matches them):
+    # a number where nothing orders by it, MySQL's string when the query orders by it --
+    # by its alias, its position or (grouped or DISTINCT) the expression, as a view stores
+    # ORDER BY 1 (the final round's verifiers: the key stayed a number beside a texted
+    # ORDER BY copy, refused at CREATE VIEW, and ORDER BY k ordered 10 before 9).
+    ddl, _ = _select("ifnull(`t`.`n`,'0') AS `k`,count(0) AS `c`", tail=" group by ifnull(`t`.`n`,'0')")
     assert "SELECT COALESCE(\"t\".\"n\", '0') AS \"k\"" in ddl and "GROUP BY COALESCE(\"t\".\"n\", '0')" in ddl
+    for tail in (" group by ifnull(`t`.`n`,'0') order by `k`",
+                 " group by ifnull(`t`.`n`,'0') order by ifnull(`t`.`n`,'0')"):
+        ddl, _ = _select("ifnull(`t`.`n`,'0') AS `k`,count(0) AS `c`", tail=tail)
+        texted = "COALESCE(CAST(\"t\".\"n\" AS TEXT), '0')"
+        assert f"SELECT {texted} AS \"k\"" in ddl and f"GROUP BY {texted}" in ddl, ddl
+    ddl, _ = _select("ifnull(`t`.`n`,'0') AS `k`", tail=" order by ifnull(`t`.`n`,'0')")
+    assert "SELECT COALESCE(\"t\".\"n\", '0') AS \"k\"" in ddl  # ungrouped: its ORDER BY copy is the string
     # A quotient's string is MySQL's at its scale (3.3333), not PostgreSQL's kept digits.
     ddl, _ = _select("ifnull((`t`.`n` / 3),'0') AS `q`")
     assert "COALESCE(CAST(ROUND(" in ddl and "AS TEXT), '0') AS \"q\"" in ddl
@@ -275,18 +286,22 @@ def test_binary_compared_with_a_value_of_unknown_type_is_the_value_itself() -> N
     assert sql == "SELECT id FROM t WHERE CAST(n AS TEXT) = '010'"  # a number known: its text
 
 
-def test_a_column_of_unknown_type_in_like_or_a_string_function_stays_as_it_is() -> None:
+def test_a_column_of_unknown_type_in_like_or_a_string_function_is_read_as_text_unnoted() -> None:
     """RG12 / ES-15: x || '' LIKE 'al%' made every untyped LIKE / UPPER / TRIM MANUAL and kept
-    an index on x (or on UPPER(x)) from serving it; 5d955cc was AUTO and right for text. LPAD
-    and a CONCAT with no text, as common over numbers, stay x || '' -- now not noted, as
-    CONCAT(x, 'text') never was. LENGTH is still noted."""
+    a text column's index from serving it. Not noted any more; under LIKE / REGEXP the column
+    is CAST(x AS TEXT), which that index still serves, and inside a string function x || ''
+    -- the final round's verifiers: left bare, LEFT(created_at, 7) and d LIKE '2024-01%' over
+    another view's date failed on Aurora DSQL. UPPER / LOWER keep it as written. LENGTH is
+    still noted."""
     ddl, notes = _view("select `v`.`id` AS `id` from `shop`.`v_base` `v` where (`v`.`s` like 'al%')")
-    assert "WHERE (\"v\".\"s\" LIKE 'al%')" in ddl and notes == []
+    assert "WHERE (CAST(\"v\".\"s\" AS TEXT) LIKE 'al%')" in ddl and notes == []
     sql, result = _query(
-        "SELECT id, UPPER(s), TRIM(s), CONCAT(a, b), LPAD(id, 6, '0') FROM t WHERE s LIKE 'al%'", typed=False
+        "SELECT id, UPPER(s), TRIM(s), LEFT(d, 7), CONCAT(a, b), LPAD(id, 6, '0') FROM t WHERE s LIKE 'al%'",
+        typed=False,
     )
     assert sql == (
-        "SELECT id, UPPER(s), TRIM(s), a || '' || b || '', LPAD(id || '', 6, '0') FROM t WHERE s LIKE 'al%'"
+        "SELECT id, UPPER(s), TRIM(s || ''), LEFT(d || '', 7), a || '' || b || '', LPAD(id || '', 6, '0') "
+        "FROM t WHERE CAST(s AS TEXT) LIKE 'al%'"
     ) and result.classification.value == "AUTO"
     sql, result = _query("SELECT LENGTH(s) FROM t", typed=False)
     assert sql == "SELECT OCTET_LENGTH(s || '') FROM t" and result.classification.value == "MANUAL"
