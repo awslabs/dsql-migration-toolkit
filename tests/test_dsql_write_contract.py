@@ -234,6 +234,46 @@ def test_the_manual_names_the_date_shift_of_an_earlier_sink() -> None:
             assert phrase in text, (lang, phrase)
 
 
+# G135: beside "so does CDC from sink plugin v54", the PostgreSQL rows a Debezium snapshot copies
+# are read through JDBC before the sink sees them -- the skipped days ten days later, a BC value
+# without its era -- whatever the sink; Full load + CDC takes no snapshot.
+_PG_SNAPSHOT_DATES = {
+    "en": "On a PostgreSQL source, though, the rows a Debezium snapshot copies (every CDC only "
+    "Start, a re-snapshot or a Manual start point; [§4.3](04-cdc-and-dsql-constraints.md)) are "
+    "read through JDBC before they reach the sink, so with any sink plugin a `date` or `timestamp` "
+    "from 1582-10-05 to 1582-10-14 lands ten days later and a BC one loses its era "
+    "(`0044-03-15 BC` as `0044-03-15`), and a `timestamptz` before 1582-10-15 lands days off, read "
+    "in the Julian calendar (`1000-01-01` five days later, `0001-01-01` two days earlier). Migrate "
+    "such tables with **Full load + CDC** (its slot hand-off takes no snapshot) and validate them "
+    "with CHECKSUM.",
+    "ko": "다만 PostgreSQL 소스에서 Debezium 스냅샷이 복사하는 행(모든 CDC only Start, 다시 스냅샷, "
+    "Manual 시작 지점; [§4.3](04-cdc-and-dsql-constraints.md))은 싱크에 닿기 전에 JDBC로 읽히므로, "
+    "싱크 플러그인과 관계없이 1582-10-05~1582-10-14의 `date`나 `timestamp`는 열흘 뒤의 값으로 저장되고 "
+    "BC 값은 기원전(BC) 표시를 잃으며(`0044-03-15 BC`가 `0044-03-15`로), 1582-10-15 이전의 "
+    "`timestamptz`는 율리우스력으로 읽혀 며칠 어긋납니다(`1000-01-01`은 닷새 뒤, `0001-01-01`은 이틀 "
+    "앞). 그런 테이블은 "
+    "**Full load + CDC**로 마이그레이션하고(슬롯 핸드오프는 스냅샷을 하지 않음) CHECKSUM으로 "
+    "검증하세요.",
+    "ja": "ただし PostgreSQL ソースでは、Debezium のスナップショットがコピーする行(すべての CDC only の "
+    "Start、再スナップショット、Manual の開始点。[§4.3](04-cdc-and-dsql-constraints.md))はシンクに届く前に "
+    "JDBC で読み取られるため、シンクプラグインに関係なく、1582-10-05〜1582-10-14 の `date` や "
+    "`timestamp` は 10 日後の値になり、BC の値は紀元前(BC)の表示を失います(`0044-03-15 BC` が "
+    "`0044-03-15` に)。1582-10-15 より前の `timestamptz` はユリウス暦で読まれて数日ずれます"
+    "(`1000-01-01` は 5 日後、`0001-01-01` は 2 日前)。そのようなテーブルは **Full load + CDC** で移行し"
+    "(スロットの引き継ぎは"
+    "スナップショットを取りません)、CHECKSUM で検証してください。",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_manual_names_the_postgresql_snapshot_date_shift(lang) -> None:
+    # FAILS WITHOUT THE FIX: chapter 6 said CDC from sink plugin v54 stores a date as it is, with
+    # no word of the rows a PostgreSQL snapshot reads -- for them a redeploy changes nothing.
+    from tests.test_g25_docs import _has, _page
+
+    assert _has(lang, _page(lang, "06-limitations.md"), _PG_SNAPSHOT_DATES[lang]), lang
+
+
 def test_none_passes_through_for_every_kind() -> None:
     for mysql_type, _kind, _schema, _note in DSQL_WRITE_CONTRACT_CASES:
         assert _convert(mysql_type, None) is None

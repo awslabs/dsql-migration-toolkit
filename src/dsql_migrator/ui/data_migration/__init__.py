@@ -818,8 +818,10 @@ def build_data_migration_screen(
         # streamed yet passes the gate above, and the page header's Run has no disabled
         # button). It would insert only the rows missing on the target, so a row the source
         # deletes during the copy -- deleted by the sink before the copy wrote it -- would be
-        # written back. G132: while a Start CDC, Stop CDC or Delete runs, the toast says to
-        # wait for it.
+        # written back. G132: while a Start CDC, Stop CDC or Delete runs, the toast here says
+        # to wait for it -- reached only on a stack that has not streamed (a first Start, or a
+        # Delete of a stack that never streamed): on one that has (always during a Stop), the
+        # G25 gate above refuses first, naming its delete-and-redeploy route.
         _cdc_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=False)
         if _cdc_hold is not None:
             ui.notify(_cdc_hold[0], type="warning", position="top", multi_line=True)
@@ -3939,10 +3941,12 @@ def data_migration_exclusion_block(
     return capture_error_with_remedy(migration_state, job_manager, capture)
 
 
-def pre_load_table_list_warning(migration_state, job_manager, session, inventory) -> Optional[str]:
-    """Full load + CDC, before any load: the body of the Full Load card's warning that one CDC
-    pipeline cannot capture every selected table (:func:`cdc_pre_load_table_list_warning`),
-    or ``None``.
+def pre_load_table_list_warning(
+    migration_state, job_manager, session, inventory
+) -> Optional[tuple[str, str]]:
+    """Full load + CDC, before any load: ``(header, body)`` of the Full Load card's warning
+    that one CDC pipeline cannot capture every selected table
+    (:func:`cdc_pre_load_table_list_warning`), or ``None``.
 
     Not a hold (:func:`data_migration_exclusion_block` does not read it): the load may take
     every table and, until CDC starts, the tables CDC does not need are unticked (G16); the

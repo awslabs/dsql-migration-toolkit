@@ -1845,6 +1845,8 @@ class CdcStackParams(BaseModel):
 # CloudFormation caps one parameter VALUE at 4,096 bytes, and ColumnExcludeList is one
 # parameter (then Debezium column.exclude.list), so the whole capture exclusion must fit.
 CDC_PARAMETER_BYTE_LIMIT = 4096
+# The remedy a CDC table-list refusal ends with (:func:`list_parameter_size_refusal`).
+CDC_TABLE_LIST_REMEDY = "Capture fewer tables in this CDC pipeline, or use Full load only."
 
 # What Debezium would interpret inside a column.exclude.list name part: the regex
 # metacharacters, and ',' -- the list separator, which its splitter (RegExSplitter) reads
@@ -2474,7 +2476,7 @@ def list_parameter_size_refusal(
     return (
         f"The captured tables need {size:,} bytes in the CDC configuration ({key}), "
         f"over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one parameter. "
-        "Capture fewer tables in this CDC pipeline, or use Full load only."
+        + CDC_TABLE_LIST_REMEDY
     )
 
 

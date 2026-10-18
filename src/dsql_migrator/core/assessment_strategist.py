@@ -814,6 +814,7 @@ def _cdc_capture_phrase(source_engine: str) -> str:
 # point the re-run is a Drop & reload (rule E): an Append keeps the rows already on the target
 # without the updates and deletes made before that point. The idempotent append is named only
 # for missing rows under the ORIGINAL start point, and for Full load only (no CDC step, rule F).
+# G135: its Retry and Reload carry the CDC-live caveat of _FULL_LOAD_RECOVERY_CONTEXT below.
 def _validation_recovery_context(source_engine: str = "MySQL") -> str:
     watermark = "an LSN" if source_engine == "PostgreSQL" else "a binlog"
     return (
@@ -860,10 +861,14 @@ def _validation_recovery_context(source_engine: str = "MySQL") -> str:
     "not catch; a deleted one stays as an extra row). So never recommend a plain re-run "
     "there. The idempotent append (INSERT ... ON CONFLICT, no duplicates) is the fix only "
     "for missing rows under the ORIGINAL start point: Retry unfinished tables (for what a "
-    "Full Load left unfinished) or, for a few tables, Reload specific tables (with CDC "
-    "stopped, its 'Drop & reload' also rebuilds stale rows); either keeps the original start "
-    "point and needs no redeploy (with CDC only, switch the migration type to Full load + "
-    "CDC first: both are on the Full Load step).\n"
+    "Full Load left unfinished) or, for a few tables, Reload specific tables, both only with "
+    "CDC stopped -- while CDC streams, or a Start CDC, Stop CDC or Delete CDC infrastructure "
+    "is still in progress, the Full Load step runs no load at all, so the route is: Stop CDC "
+    "(Data Migration step), retry or reload, then Start CDC again (while a CDC operation is "
+    "in progress, wait for it to finish first); with CDC stopped, Reload's 'Drop & reload' "
+    "also rebuilds stale rows. Either keeps the original start point and needs no redeploy "
+    "(with CDC only, switch the migration type to Full load + CDC first: both are on the Full "
+    "Load step).\n"
     "- For a DEFINITIVE zero-loss cut-over check, source writes should be quiesced "
     "(or CDC confirmed caught up) first, because a live stream makes the target a "
     "moving target. Stopping CDC is done from the previous (Data Migration) step.\n"

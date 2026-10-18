@@ -3815,10 +3815,11 @@ def table_picker_remedy(table_lock: "Optional[str]") -> str:
 
 
 # The notice header of a table-list refusal (cdc_table_list_refusal), and of the warning
-# before a Full load + CDC load (cdc_pre_load_table_list_warning).
+# before a Full load + CDC load when a list every deploy sends does not fit
+# (cdc_pre_load_table_list_warning).
 CDC_TABLE_LIST_HEADER = "Too many tables for one CDC pipeline"
 # The notice header of a warning that only the deploy's largest partition plan would not
-# fit (cdc_partition_map_worst_case).
+# fit (cdc_partition_map_worst_case): on the Deploy form, and before a Full load + CDC load.
 CDC_TABLE_LIST_WORST_CASE_HEADER = "Possibly too many tables for one CDC pipeline"
 
 
@@ -3860,7 +3861,8 @@ def cdc_table_list_refusal(
     for a skewed capture, none for an even or absent size signal (the uniform plan) -- exactly
     as the builders do (a Start keeps the deployed ones). Where the row estimates the deploy
     will plan from are not known yet, :func:`cdc_partition_map_worst_case` says what its
-    largest plan needs. Each caller appends :func:`table_picker_remedy`.
+    largest plan needs. Each caller appends :func:`table_picker_remedy` (a deploy before a
+    Full load + CDC load, :func:`cdc_pre_load_table_list_routes`).
     """
     from dsql_migrator.core.cdc import list_parameter_size_refusal
 
@@ -3920,18 +3922,34 @@ def cdc_partition_map_worst_case(table_names: "Sequence[str]") -> "Optional[str]
     )
 
 
+def cdc_pre_load_table_list_routes(table_lock: "Optional[str]") -> str:
+    """The routes for a Full load + CDC selection one CDC pipeline cannot capture, before its
+    load and with CDC never started: load every table and, until CDC starts, untick the ones
+    CDC does not need (G16), or use Full load only, or capture fewer now
+    (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason). Pure."""
+    return (
+        "The Full Load can still load every selected table: after it, until CDC starts, untick "
+        "in the table list the tables CDC does not need to capture (they stay on Aurora DSQL as "
+        "loaded; CDC and Validation skip them), or use Full load only. Or capture fewer before "
+        "the load: " + table_picker_remedy(table_lock)
+    )
+
+
 def cdc_pre_load_table_list_warning(
     table_names: "Sequence[str]", *, planned: bool, table_lock: "Optional[str]"
-) -> "Optional[str]":
-    """What Full load + CDC says before its load when one CDC pipeline cannot capture all of
-    ``table_names`` (the load's selection), or ``None``. Pure.
+) -> "Optional[tuple[str, str]]":
+    """``(header, body)`` of what Full load + CDC says before its load when one CDC pipeline
+    cannot capture all of ``table_names`` (the load's selection), or ``None``. Pure.
 
     A warning, never a hold: the load may take every table and, until CDC starts, the tables
     CDC does not need are unticked (G16); Deploy CDC infrastructure and Start CDC then judge
     the real capture. ``planned``: a cdc-stack already owns the partition plan, so only Start
     CDC's two lists count; otherwise the deploy's, whose plan this load's row estimates size
-    -- so its worst case is said too (:func:`cdc_partition_map_worst_case`). ``table_lock``
-    is the table picker's lock reason (:func:`table_picker_remedy`).
+    -- so its worst case is said too (:func:`cdc_partition_map_worst_case`). The header says
+    a list every deploy sends that does not fit as certain (:data:`CDC_TABLE_LIST_HEADER`),
+    and that worst case as possible (:data:`CDC_TABLE_LIST_WORST_CASE_HEADER`, the Deploy
+    form's header for it). ``table_lock`` is the table picker's lock reason
+    (:func:`cdc_pre_load_table_list_routes`).
     """
     from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT, oversized_table_list
 
@@ -3959,17 +3977,14 @@ def cdc_pre_load_table_list_warning(
             f"({key}), over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one "
             f"parameter: one CDC pipeline captures {fit_text}, so {refusing} this set."
         )
+        header = CDC_TABLE_LIST_HEADER
     else:
         worst = None if planned else cdc_partition_map_worst_case(names)
         if worst is None:
             return None
         fact = f"{worst} Deploy CDC infrastructure would then refuse this set."
-    return (
-        f"{fact} The Full Load can still load every selected table: after it, until CDC "
-        "starts, untick in the table list the tables CDC does not need to capture (they stay "
-        "on Aurora DSQL as loaded; CDC and Validation skip them), or use Full load only. Or "
-        "capture fewer before the load: " + table_picker_remedy(table_lock)
-    )
+        header = CDC_TABLE_LIST_WORST_CASE_HEADER
+    return header, f"{fact} " + cdc_pre_load_table_list_routes(table_lock)
 
 
 # DSQL caps a single value at 1 MiB. Used for display.

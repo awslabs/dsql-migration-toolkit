@@ -47,7 +47,6 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     sync_identity_sequences_for_tables,
 )
 from dsql_migrator.ui.data_migration._models import (
-    CDC_TABLE_LIST_HEADER,
     MigrationType,
     session_source_type,
     SCOPE_ADDED_REASON,
@@ -701,9 +700,10 @@ def _render_full_load_step(
     # The source floor for the identity sync a scoped set's DONE submits (see
     # submit_scope_identity_sync); called on that job's thread. None: no floor.
     identity_extras: Optional[Callable[[Sequence[str]], Mapping[str, object]]] = None,
-    # Full load + CDC before any load: one CDC pipeline cannot capture every selected table
-    # (pre_load_table_list_warning). A warning above Start Full Load, never a hold.
-    pre_load_warning: Optional[str] = None,
+    # Full load + CDC before any load: one CDC pipeline cannot capture every selected table, or
+    # may not (pre_load_table_list_warning: its header and body). A warning above Start Full
+    # Load, never a hold.
+    pre_load_warning: Optional[tuple[str, str]] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -1846,10 +1846,13 @@ def _render_full_load_step(
     )
     if _notice is not None and status is not StepStatus.IN_PROGRESS:
         render_notice(ui, tone=_notice[0], header=_notice[1], body=_notice[2])
-    # Before the load: the selection is more than one CDC pipeline captures. Not a hold --
-    # the load may take it all and the set be narrowed before CDC starts.
+    # Before the load: the selection is more than one CDC pipeline captures, or may be (its
+    # header says which). Not a hold -- the load may take it all and the set be narrowed
+    # before CDC starts.
     if pre_load_warning and job is None and status is not StepStatus.IN_PROGRESS:
-        render_notice(ui, tone="warning", header=CDC_TABLE_LIST_HEADER, body=pre_load_warning)
+        render_notice(
+            ui, tone="warning", header=pre_load_warning[0], body=pre_load_warning[1]
+        )
 
     if status is StepStatus.IN_PROGRESS:
         stopping = False

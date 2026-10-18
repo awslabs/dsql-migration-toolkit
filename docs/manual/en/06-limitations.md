@@ -526,11 +526,13 @@ fails **loudly** where it can't.
     the map would need at worst, as a warning (*Possibly too many tables for one CDC
     pipeline*). Start CDC on a deployed stack judges only the two lists it sends.
   - **With Full load + CDC, the Full Load is not held.** Before the load, the Full Load step
-    warns (*Too many tables for one CDC pipeline*) and says about how many of the selected
-    tables one pipeline captures. You can still load every table and then, before CDC
-    starts, untick the tables CDC does not need to capture (see "Changing the table set
-    after a Full Load (Full load + CDC)" in [Chapter 13](13-excluding-tables-and-columns.md)):
-    they stay on Aurora DSQL as loaded, and CDC and Validation skip them.
+    warns (*Too many tables for one CDC pipeline*, or *Possibly too many tables for one CDC
+    pipeline* when only the partition map at its worst would not fit, as on the deploy form)
+    and says about how many of the selected tables one pipeline captures. You can still load
+    every table and then, before CDC starts, untick the tables CDC does not need to capture
+    (see "Changing the table set after a Full Load (Full load + CDC)" in
+    [Chapter 13](13-excluding-tables-and-columns.md)): they stay on Aurora DSQL as loaded, and
+    CDC and Validation skip them.
   - Otherwise capture fewer tables in this CDC pipeline (deselect them in the table
     picker), or use Full load only.
 - **CDC is billable while deployed.** The streaming pipeline (MSK Serverless +
@@ -566,7 +568,14 @@ fails **loudly** where it can't.
   dead-lettered and ROW_COUNT still matches, so only a CHECKSUM shows it; on a key column
   the update inserted a second row and the delete matched nothing.
   **Delete CDC infrastructure**, deploy it again, then reload such tables (Drop & reload)
-  and validate with CHECKSUM.
+  and validate with CHECKSUM. On a PostgreSQL source, though, the rows a Debezium snapshot
+  copies (every CDC only Start, a re-snapshot or a Manual start point;
+  [§4.3](04-cdc-and-dsql-constraints.md)) are read through JDBC before they reach the sink, so
+  with any sink plugin a `date` or `timestamp` from 1582-10-05 to 1582-10-14 lands ten days
+  later and a BC one loses its era (`0044-03-15 BC` as `0044-03-15`), and a `timestamptz`
+  before 1582-10-15 lands days off, read in the Julian calendar (`1000-01-01` five days later,
+  `0001-01-01` two days earlier). Migrate such tables with **Full load + CDC** (its slot
+  hand-off takes no snapshot) and validate them with CHECKSUM.
 - **PostgreSQL 17/18 sources — three version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is

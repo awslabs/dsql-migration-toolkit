@@ -45,6 +45,7 @@ from dsql_migrator.core.table_selection import TableSelection
 from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType
 from dsql_migrator.ui.data_migration._models import (
     CDC_TABLE_LIST_HEADER,
+    CDC_TABLE_LIST_WORST_CASE_HEADER,
     cdc_table_list_refusal,
 )
 
@@ -380,8 +381,10 @@ def test_start_full_load_is_warned_not_held_before_the_load_for_full_load_and_cd
     names = _band()
     jobs = _StubJobManager({})
     assert data_migration_exclusion_block(_state(names), jobs, None, _inventory(names)) is None
-    warning = pre_load_table_list_warning(_state(names), jobs, None, _inventory(names))
-    assert warning and "(SinkTopicPartitions)" in warning
+    # (header, body): only the deploy's worst case does not fit, so it is said as possible.
+    header, warning = pre_load_table_list_warning(_state(names), jobs, None, _inventory(names))
+    assert header == CDC_TABLE_LIST_WORST_CASE_HEADER
+    assert "(SinkTopicPartitions)" in warning
     assert warning.endswith("Deselect tables in the table picker.")
     # Full load only captures nothing.
     assert pre_load_table_list_warning(
@@ -399,7 +402,7 @@ def test_start_full_load_is_warned_not_held_before_the_load_for_full_load_and_cd
     warned = pre_load_table_list_warning(
         _state(many, phase="infra"), jobs, None, _inventory(many)
     )
-    assert warned and "(SinkTopics)" in warned
+    assert warned[0] == CDC_TABLE_LIST_HEADER and "(SinkTopics)" in warned[1]
 
 
 # ---------------------------------------------------------------------------

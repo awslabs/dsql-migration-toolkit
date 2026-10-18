@@ -414,7 +414,8 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     보여 줍니다(*Possibly too many tables for one CDC pipeline*). 배포된 스택의 Start CDC는 자신이 보내는 두
     목록만 판단합니다.
   - **Full load + CDC에서는 Full Load를 막지 않습니다.** 적재 전에 Full Load 단계가 경고하고(*Too many tables
-    for one CDC pipeline*) 선택한 테이블 중 약 몇 개를 파이프라인 하나가 캡처하는지 알려 줍니다. 그래도 모든
+    for one CDC pipeline*, 최악의 경우의 파티션 맵만 맞지 않으면 배포 양식처럼 *Possibly too many tables for
+    one CDC pipeline*) 선택한 테이블 중 약 몇 개를 파이프라인 하나가 캡처하는지 알려 줍니다. 그래도 모든
     테이블을 적재한 뒤, CDC를 시작하기 전에 CDC가 캡처할 필요가 없는 테이블의 선택을 해제할 수 있습니다
     ([13장](13-excluding-tables-and-columns.md)의 "Full Load 후 테이블 집합 바꾸기 (Full load + CDC)"
     참고): 그 테이블은 적재된 그대로 Aurora DSQL에 남고, CDC와 Validation은 그 테이블을 건너뜁니다.
@@ -446,7 +447,12 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   읽었습니다(`0001-01-01`을 `2001-01-01`로). dead-letter도 없고 ROW_COUNT도 그대로 일치하므로 CHECKSUM에서만
   드러납니다. 키 컬럼이면 update가 두 번째 행을 넣었고 delete는 아무 행도 지우지 못했습니다.
   **Delete CDC infrastructure** 후 다시 배포하고, 그런 테이블을 다시 적재(Drop & reload)한 뒤 CHECKSUM으로
-  검증하세요.
+  검증하세요. 다만 PostgreSQL 소스에서 Debezium 스냅샷이 복사하는 행(모든 CDC only Start, 다시 스냅샷,
+  Manual 시작 지점; [§4.3](04-cdc-and-dsql-constraints.md))은 싱크에 닿기 전에 JDBC로 읽히므로, 싱크
+  플러그인과 관계없이 1582-10-05~1582-10-14의 `date`나 `timestamp`는 열흘 뒤의 값으로 저장되고 BC 값은
+  기원전(BC) 표시를 잃으며(`0044-03-15 BC`가 `0044-03-15`로), 1582-10-15 이전의 `timestamptz`는
+  율리우스력으로 읽혀 며칠 어긋납니다(`1000-01-01`은 닷새 뒤, `0001-01-01`은 이틀 앞). 그런 테이블은
+  **Full load + CDC**로 마이그레이션하고(슬롯 핸드오프는 스냅샷을 하지 않음) CHECKSUM으로 검증하세요.
 - **PostgreSQL 17/18 소스 — 버전별 엣지 3가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
   지원하며, 17·18에서 유의할 점이 3가지 있습니다:
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그

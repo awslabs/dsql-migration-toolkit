@@ -275,11 +275,12 @@ replication slot again at its own snapshot point), then **Start CDC**.
   same reason the page header's **Run** starts nothing while a Start CDC is still in flight,
   and Start CDC waits while a Full Load runs
   ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)). While a
-  **Start CDC**, **Stop CDC** or **Delete CDC infrastructure** is still in progress, these
-  actions stay disabled and the page header's **Run** starts nothing, but the reason they give
-  is to wait for it to finish (the CDC step shows its progress), not to Stop CDC first. Once a
-  Stop or a Delete has finished, a Retry or a Reload runs; once a Start has CDC streaming,
-  Stop CDC comes first again.
+  **Start CDC**, **Stop CDC** or **Delete CDC infrastructure** is still in progress, the Full
+  Load step's actions stay disabled, but the reason they give is to wait for it to finish (the
+  CDC step shows its progress), not to Stop CDC first. The page header's **Run** starts
+  nothing then either; on a stack that has streamed it names the delete-and-redeploy route
+  above instead of the wait. Once a Stop or a Delete has finished, a Retry or a Reload runs;
+  once a Start has CDC streaming, Stop CDC comes first again.
 - **Until the CDC state has been read** in this session — just after the screen opens, or
   after an app restart — or when it could not be read, a new start point **waits** rather
   than guessing: the notice says so and points at **Re-check CDC state** on the CDC step

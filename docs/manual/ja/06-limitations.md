@@ -450,11 +450,12 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
     many tables for one CDC pipeline*)。デプロイ済みのスタックに対する Start CDC は、自身が送る 2 つの
     リストだけを判断します。
   - **Full load + CDC では Full Load を止めません。** ロードの前に Full Load ステップが警告し(*Too many
-    tables for one CDC pipeline*)、選択したテーブルのうち約何個を 1 つのパイプラインがキャプチャするかを
-    示します。それでもすべてのテーブルをロードし、CDC を開始する前に、CDC がキャプチャする必要のない
-    テーブルの選択を外せます([第 13 章](13-excluding-tables-and-columns.md)の「Full Load 後にテーブル集合を
-    変更する (Full load + CDC)」を参照): それらのテーブルはロードされたまま Aurora DSQL に残り、CDC と
-    Validation はそれらをスキップします。
+    tables for one CDC pipeline*。最悪の場合のパーティションマップだけが収まらないときは、デプロイの
+    フォームと同じく *Possibly too many tables for one CDC pipeline*)、選択したテーブルのうち約何個を
+    1 つのパイプラインがキャプチャするかを示します。それでもすべてのテーブルをロードし、CDC を開始する
+    前に、CDC がキャプチャする必要のないテーブルの選択を外せます([第 13 章](13-excluding-tables-and-columns.md)の
+    「Full Load 後にテーブル集合を変更する (Full load + CDC)」を参照): それらのテーブルはロードされたまま
+    Aurora DSQL に残り、CDC と Validation はそれらをスキップします。
   - それ以外の場合は、この CDC パイプラインでキャプチャするテーブルを減らす(テーブル一覧で選択を外す)か、
     Full load only を使用してください。
 - **CDC はデプロイされている間は課金対象です。** ストリーミングパイプライン
@@ -485,7 +486,13 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   2000–2069 年または 1970–1999 年として読みました(`0001-01-01` を `2001-01-01` に)。デッドレターにはならず
   ROW_COUNT も一致したままなので、CHECKSUM でしか分かりません。キー列では、update が 2 つ目の行を挿入し、delete
   はどの行にも一致しませんでした。**Delete CDC infrastructure** して再デプロイし、そのようなテーブルを再ロード
-  (Drop & reload)してから CHECKSUM で検証してください。
+  (Drop & reload)してから CHECKSUM で検証してください。ただし PostgreSQL ソースでは、Debezium のスナップショット
+  がコピーする行(すべての CDC only の Start、再スナップショット、Manual の開始点。
+  [§4.3](04-cdc-and-dsql-constraints.md))はシンクに届く前に JDBC で読み取られるため、シンクプラグインに関係なく、
+  1582-10-05〜1582-10-14 の `date` や `timestamp` は 10 日後の値になり、BC の値は紀元前(BC)の表示を失います
+  (`0044-03-15 BC` が `0044-03-15` に)。1582-10-15 より前の `timestamptz` はユリウス暦で読まれて数日ずれます
+  (`1000-01-01` は 5 日後、`0001-01-01` は 2 日前)。そのようなテーブルは **Full load + CDC** で移行し
+  (スロットの引き継ぎはスナップショットを取りません)、CHECKSUM で検証してください。
 - **PostgreSQL 17/18 ソース — バージョン固有のエッジ 3 点（いずれも移行を止めません）。** PG 13–18
   をサポートします。17・18 では次の 3 点に注意してください:
   - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で

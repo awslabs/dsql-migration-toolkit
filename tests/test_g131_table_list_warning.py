@@ -42,6 +42,7 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_partition_map_worst_case,
     cdc_pre_load_table_list_warning,
     cdc_table_list_refusal,
+    table_picker_remedy,
 )
 
 from tests.test_g12_table_set_after_load import _Jobs
@@ -145,11 +146,12 @@ def test_the_pre_load_warning_names_the_ceiling_and_the_routes(monkeypatch) -> N
     monkeypatch.delenv("DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS", raising=False)
     many = _band(300)
     assert cdc_pre_load_table_list_warning(many, planned=False, table_lock=None) == (
+        CDC_TABLE_LIST_HEADER,
         "The 300 selected tables need 7,199 bytes in the CDC configuration (SinkTopics), over "
         "CloudFormation's 4,096-byte limit for one parameter: one CDC pipeline captures about "
         "157 of them (170 if none holds twice their average row count), so Deploy CDC "
         "infrastructure and Start CDC refuse this set. " + _ROUTES
-        + "Deselect tables in the table picker."
+        + "Deselect tables in the table picker.",
     )
     # The two figures are what the builders carry: 157 skewed, 170 even (or with the map
     # already deployed, Start's two lists).
@@ -158,12 +160,15 @@ def test_the_pre_load_warning_names_the_ceiling_and_the_routes(monkeypatch) -> N
         refusal = list_parameter_size_refusal(_infra("mysql", many[:n], counts(many[:n])).filled)
         assert (refusal is None) is fits, (n, counts)
     # A stack that already owns its plan: only Start's two lists count.
-    planned = cdc_pre_load_table_list_warning(many, planned=True, table_lock="Locked — X.")
+    header, planned = cdc_pre_load_table_list_warning(many, planned=True, table_lock="Locked — X.")
+    assert header == CDC_TABLE_LIST_HEADER
     assert "captures about 170 of them, so Start CDC refuses this set." in planned
     assert planned.endswith("Or capture fewer before the load: The table picker is locked. "
                             "Locked — X.")
-    # The band: only the worst case of the deploy's plan can be said before the load.
-    band = cdc_pre_load_table_list_warning(_band(), planned=False, table_lock=None)
+    # The band: only the worst case of the deploy's plan can be said before the load, and the
+    # header says it as possible (G135), as the Deploy form does.
+    header, band = cdc_pre_load_table_list_warning(_band(), planned=False, table_lock=None)
+    assert header == CDC_TABLE_LIST_WORST_CASE_HEADER
     assert band.startswith(cdc_partition_map_worst_case(_band()) + " Deploy CDC "
                            "infrastructure would then refuse this set. " + _ROUTES)
     assert cdc_pre_load_table_list_warning(_band(), planned=True, table_lock=None) is None
@@ -187,7 +192,8 @@ def test_start_full_load_is_not_held_for_a_selection_one_pipeline_cannot_capture
     assert full_load_run_guard_reason(
         state, _inventory(names), has_run=True, exclusion_block=None) is None
     # It is said instead, as a warning with the ceiling and the routes.
-    warning = pre_load_table_list_warning(state, jobs, None, _inventory(names))
+    header, warning = pre_load_table_list_warning(state, jobs, None, _inventory(names))
+    assert header == CDC_TABLE_LIST_HEADER
     assert warning.startswith("The 300 selected tables need 7,199 bytes")
     assert warning.endswith(_ROUTES + "Deselect tables in the table picker.")
 
@@ -197,7 +203,8 @@ def test_the_pre_load_warning_follows_the_state() -> None:
     jobs = _Jobs({})
     inv = _inventory(names)
     # A stack deployed before the load owns the plan: Start's lists; the picker is locked.
-    deployed = pre_load_table_list_warning(_state(names, phase="infra"), jobs, None, inv)
+    header, deployed = pre_load_table_list_warning(_state(names, phase="infra"), jobs, None, inv)
+    assert header == CDC_TABLE_LIST_HEADER
     assert "so Start CDC refuses this set." in deployed
     assert "Or capture fewer before the load: The table picker is locked. Locked — CDC " \
            "infrastructure is deployed" in deployed
@@ -275,14 +282,37 @@ def _render_full_load_card(monkeypatch, *, job, warning):
 
 
 def test_the_full_load_card_warns_above_start_full_load(monkeypatch) -> None:
-    ui, notices = _render_full_load_card(monkeypatch, job=None, warning="W")
-    assert ("warning", CDC_TABLE_LIST_HEADER, "W") in notices
+    ui, notices = _render_full_load_card(monkeypatch, job=None, warning=("H", "W"))
+    assert ("warning", "H", "W") in notices
     assert "Start Full Load" in ui.buttons
     # Once a load ran the CDC step's holds speak instead.
     names = _band(300)
     _ui, after = _render_full_load_card(
-        monkeypatch, job=_loaded(names, _skewed(names)), warning="W")
-    assert not [n for n in after if n[1] == CDC_TABLE_LIST_HEADER]
+        monkeypatch, job=_loaded(names, _skewed(names)), warning=("H", "W"))
+    assert not [n for n in after if n[1] == "H"]
+
+
+def test_a_possible_overflow_is_called_possible_on_the_full_load_card_too(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX (G135): the Full Load card always said "Too many tables for one CDC
+    # pipeline", also over the band, where only the deploy's worst case does not fit and the
+    # Deploy form says "Possibly too many tables" for the same selection.
+    monkeypatch.delenv("DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS", raising=False)
+    names = _band()
+    jobs = _Jobs({})
+    warning = pre_load_table_list_warning(_state(names), jobs, None, _inventory(names))
+    assert warning[0] == CDC_TABLE_LIST_WORST_CASE_HEADER
+    _ui, notices = _render_full_load_card(monkeypatch, job=None, warning=warning)
+    assert ("warning", CDC_TABLE_LIST_WORST_CASE_HEADER, warning[1]) in notices
+    assert not [n for n in notices if n[1] == CDC_TABLE_LIST_HEADER]
+    # The Deploy form names the same selection the same way.
+    _ui, deploy = _render_deploy(monkeypatch, _deploy_ready(names, FLC), jobs, _inventory(names))
+    assert [n[1] for n in deploy if n[1] in (CDC_TABLE_LIST_HEADER,
+                                             CDC_TABLE_LIST_WORST_CASE_HEADER)] == [
+        CDC_TABLE_LIST_WORST_CASE_HEADER]
+    # A certain overflow keeps the definite header on both.
+    many = _band(300)
+    assert pre_load_table_list_warning(_state(many), jobs, None, _inventory(many))[0] == (
+        CDC_TABLE_LIST_HEADER)
 
 
 def test_the_screen_hands_the_warning_to_the_full_load_card() -> None:
@@ -384,6 +414,61 @@ def test_recorded_estimates_are_judged_exactly_and_a_certain_overflow_is_held(mo
     many = _band(300)
     held = _deploy_block_notice(_deploy_ready(many), _Jobs({}), _inventory(many), None)
     assert held[0] == CDC_TABLE_LIST_HEADER and "(SinkTopics)" in held[1]
+
+
+def test_the_early_deploy_names_the_load_then_untick_route(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX (G135): before a Full load + CDC load, the Prerequisites card's early
+    # Deploy refused a selection one pipeline cannot capture with only "deselect / Full load
+    # only" -- the two remedies that cost the load its tables or the migration its CDC -- and
+    # not the route of the Full Load card's warning: load every table, untick after it.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice, _table_lock
+
+    from tests.test_ui_data_migration import _GateUi
+
+    many = _band(300)
+    inv = _inventory(many)
+    state = _deploy_ready(many, FLC)
+    refusal = cdc_table_list_refusal(many, deploy=True)
+    routes = _ROUTES + "Deselect tables in the table picker."
+    # The routes replace the refusal's own "capture fewer / Full load only" remedy (G135).
+    from dsql_migrator.core.cdc import CDC_TABLE_LIST_REMEDY
+
+    assert refusal.endswith(CDC_TABLE_LIST_REMEDY)
+    fact = refusal.removesuffix(CDC_TABLE_LIST_REMEDY).rstrip()
+    assert _deploy_block_notice(state, _Jobs({}), inv, None) == (
+        CDC_TABLE_LIST_HEADER, f"{fact} {routes}")
+    # The Prerequisites card: the route under the same refusal, the button still disabled.
+    notices: list = []
+    real = _cdc_ui.render_notice
+    monkeypatch.setattr(
+        _cdc_ui, "render_notice",
+        lambda ui, **kw: notices.append((kw.get("tone"), kw.get("header"), kw.get("body")))
+        or real(ui, **kw),
+    )
+    ui = _GateUi()
+    _cdc_ui._render_cdc_infra_prep_section(
+        ui, state, _Jobs({}), lambda: None, inventory=inv, session=None)
+    assert ("error", CDC_TABLE_LIST_HEADER, f"{fact} {routes}") in notices
+    assert ui.deploy_button().enabled is False
+    # The click refuses with the same words, before any read.
+    calls = _fake_nicegui(monkeypatch, None)
+    assert _click_deploy(state, inv) == [(f"{fact} {routes}", "negative")]
+    assert calls == []
+    # Where that route is not open, the table picker's remedy alone: CDC only, after the load,
+    # and once CDC started for this migration.
+    loaded = _deploy_ready(many, FLC, job_id="job-1")
+    started = _deploy_ready(many, FLC)
+    started.set_cdc_ops_window_start(datetime(2026, 10, 1, tzinfo=timezone.utc))
+    for other, jobs in ((_deploy_ready(many), _Jobs({})),
+                        (loaded, _Jobs({"job-1": _loaded(many, _skewed(many))})),
+                        (started, _Jobs({}))):
+        header, body = _deploy_block_notice(other, jobs, inv, None)
+        assert header == CDC_TABLE_LIST_HEADER and _ROUTES not in body, other.migration_type
+        assert body.endswith(" Capture fewer tables in this CDC pipeline, or use Full load only. "
+                             + table_picker_remedy(_table_lock(other, jobs, None)))
 
 
 # ---------------------------------------------------------------------------
@@ -500,3 +585,32 @@ def test_the_deploy_sends_the_counts_it_was_judged_on(monkeypatch, estimates) ->
     assert notes == []
     assert reads == [names]  # read once, at the top of the click
     assert sent["row_counts_by_table"] == counts
+
+
+# ---------------------------------------------------------------------------
+# 5. The manual names both headers of the Full Load card's warning (G135)
+# ---------------------------------------------------------------------------
+
+_FULL_LOAD_WARNING_HEADERS = {
+    "en": "Before the load, the Full Load step warns (*Too many tables for one CDC pipeline*, or "
+    "*Possibly too many tables for one CDC pipeline* when only the partition map at its worst "
+    "would not fit, as on the deploy form) and says about how many of the selected tables one "
+    "pipeline captures.",
+    "ko": "적재 전에 Full Load 단계가 경고하고(*Too many tables for one CDC pipeline*, 최악의 경우의 "
+    "파티션 맵만 맞지 않으면 배포 양식처럼 *Possibly too many tables for one CDC pipeline*) 선택한 "
+    "테이블 중 약 몇 개를 파이프라인 하나가 캡처하는지 알려 줍니다.",
+    "ja": "ロードの前に Full Load ステップが警告し(*Too many tables for one CDC pipeline*。最悪の場合の"
+    "パーティションマップだけが収まらないときは、デプロイのフォームと同じく *Possibly too many tables "
+    "for one CDC pipeline*)、選択したテーブルのうち約何個を 1 つのパイプラインがキャプチャするかを"
+    "示します。",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_manual_names_both_headers_of_the_full_load_warning(lang) -> None:
+    # FAILS WITHOUT THE FIX: chapter 6 named only the definite header for the Full Load step.
+    from tests.test_g25_docs import _has, _page
+
+    for header in (CDC_TABLE_LIST_HEADER, CDC_TABLE_LIST_WORST_CASE_HEADER):
+        assert f"*{header}*" in _FULL_LOAD_WARNING_HEADERS[lang], (lang, header)
+    assert _has(lang, _page(lang, "06-limitations.md"), _FULL_LOAD_WARNING_HEADERS[lang]), lang

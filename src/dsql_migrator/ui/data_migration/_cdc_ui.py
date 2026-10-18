@@ -37,6 +37,7 @@ from typing import (
 )
 
 from dsql_migrator.core.cdc import (
+    CDC_TABLE_LIST_REMEDY,
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_STACK_NAME,
     CDC_DEFAULT_TOPIC_PREFIX,
@@ -115,6 +116,7 @@ from dsql_migrator.ui.data_migration._models import (
     CDC_TABLE_LIST_WORST_CASE_HEADER,
     capture_ambiguity_warning,
     cdc_partition_map_worst_case,
+    cdc_pre_load_table_list_routes,
     cdc_table_list_refusal,
     table_picker_remedy,
     stored_exclusion_block_reason,
@@ -4516,7 +4518,8 @@ def _deploy_block_notice(
       list the deploy sends over that limit (:func:`cdc_table_list_refusal`), its partition
       plan judged on the row estimates the Full Load recorded. With none recorded the deploy
       reads the source's at the click, so only the two lists every deploy sends are held
-      here; the plan's worst case is a warning (:func:`_deploy_partition_map_warning`).
+      here; the plan's worst case is a warning (:func:`_deploy_partition_map_warning`). Its
+      remedy: :func:`_deploy_table_list_refused`.
 
     Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
     and changes no DDL; it only locks the card, so only the saved-entry check applies.
@@ -4554,8 +4557,7 @@ def _deploy_block_notice(
     if refusal:
         return (
             CDC_TABLE_LIST_HEADER,
-            f"{refusal} "
-            + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
+            _deploy_table_list_refused(refusal, migration_state, job_manager, session),
         )
     return None
 
@@ -4607,6 +4609,26 @@ def _table_lock(migration_state, job_manager, session):
     from dsql_migrator.ui.data_migration import table_set_lock_reason
 
     return table_set_lock_reason(migration_state, job_manager, session)
+
+
+def _deploy_table_list_refused(refusal: str, migration_state, job_manager, session) -> str:
+    """A Deploy CDC infrastructure table-list refusal with its remedy. Before a Full load + CDC
+    load, with CDC never started for this migration (the early deploy on Prerequisites), the
+    routes of the Full Load card's warning (:func:`cdc_pre_load_table_list_routes`) in place of
+    the refusal's own remedy, which they repeat: the load may still take every table, and the
+    tables CDC does not need be unticked after it, before CDC starts (G16) -- the deploy itself
+    stays refused. Otherwise the table picker's (:func:`table_picker_remedy`) after it."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
+
+    lock = _table_lock(migration_state, job_manager, session)
+    if (
+        getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC
+        and getattr(migration_state, "job_id", None) is None
+        and not _cdc_started_for_migration(migration_state, job_manager)
+    ):
+        fact = refusal.removesuffix(CDC_TABLE_LIST_REMEDY).rstrip()
+        return f"{fact} " + cdc_pre_load_table_list_routes(lock)
+    return f"{refusal} " + table_picker_remedy(lock)
 
 
 def _table_set_open(migration_state, job_manager, session) -> bool:
@@ -9386,8 +9408,7 @@ async def _start_cdc_infra_deploy(
         )
     if _tables_refusal:
         ui.notify(  # type: ignore[attr-defined]
-            f"{_tables_refusal} "
-            + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
+            _deploy_table_list_refused(_tables_refusal, migration_state, job_manager, session),
             type="negative",
             position="top",
         )

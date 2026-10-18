@@ -359,6 +359,30 @@ def test_the_ai_full_load_grounding_names_the_cdc_live_caveat_and_route() -> Non
     assert "re-runs Full Load for just that table (with CDC stopped, as above)" in flat
 
 
+@pytest.mark.parametrize("engine", ["MySQL", "PostgreSQL"])
+def test_the_validation_ai_grounding_offers_retry_and_reload_only_with_cdc_stopped(engine) -> None:
+    # FAILS WITHOUT THE FIX (G135): Validation's grounding offered Retry unfinished tables, and
+    # Reload specific tables with its default Append, for missing rows with no word of CDC --
+    # "with CDC stopped" qualified only the Drop & reload -- while the Full Load step disables
+    # both as long as CDC streams or a CDC operation runs (G129, G132).
+    from dsql_migrator.core.assessment_strategist import (
+        _validation_recovery_context,
+        build_validation_chat_system,
+    )
+
+    (line,) = [ln for ln in _validation_recovery_context(engine).splitlines()
+               if "ORIGINAL start point" in ln]
+    assert ("Retry unfinished tables (for what a Full Load left unfinished) or, for a few "
+            "tables, Reload specific tables, both only with CDC stopped -- while CDC streams, "
+            "or a Start CDC, Stop CDC or Delete CDC infrastructure is still in progress, the "
+            "Full Load step runs no load at all, so the route is: Stop CDC (Data Migration "
+            "step), retry or reload, then Start CDC again (while a CDC operation is in "
+            "progress, wait for it to finish first); with CDC stopped, Reload's 'Drop & "
+            "reload' also rebuilds stale rows.") in line
+    assert "(with CDC stopped, its 'Drop & reload' also rebuilds stale rows)" not in line
+    assert line in build_validation_chat_system("Matched: 7; mismatched: 1", source_engine=engine)
+
+
 def test_the_ai_migration_context_says_the_full_load_step_runs_no_load_while_cdc_is_live():
     from dsql_migrator.ui.data_migration import (
         DataMigrationState,
@@ -431,22 +455,28 @@ _P13 = "13-excluding-tables-and-columns.md"
 
 _PINS = {
     _P03: {
+        # G135: the wait is the Full Load step's; the page header's Run meets the G25 gate first
+        # on a stack that has streamed (test_the_header_run_is_refused_with_the_wait).
         "operation-wait": {
             "en": "While a **Start CDC**, **Stop CDC** or **Delete CDC infrastructure** is still "
-            "in progress, these actions stay disabled and the page header's **Run** starts "
-            "nothing, but the reason they give is to wait for it to finish (the CDC step shows "
-            "its progress), not to Stop CDC first. Once a Stop or a Delete has finished, a Retry "
-            "or a Reload runs; once a Start has CDC streaming, Stop CDC comes first again.",
+            "in progress, the Full Load step's actions stay disabled, but the reason they give "
+            "is to wait for it to finish (the CDC step shows its progress), not to Stop CDC "
+            "first. The page header's **Run** starts nothing then either; on a stack that has "
+            "streamed it names the delete-and-redeploy route above instead of the wait. Once a "
+            "Stop or a Delete has finished, a Retry or a Reload runs; once a Start has CDC "
+            "streaming, Stop CDC comes first again.",
             "ko": "**Start CDC**, **Stop CDC** 또는 **Delete CDC infrastructure**가 아직 진행 중인 "
-            "동안에도 이 작업들은 비활성화된 채로 있고 페이지 헤더의 **Run**은 아무것도 시작하지 않지만, "
-            "이때 알려 주는 이유는 먼저 Stop CDC를 하라는 것이 아니라 그 작업이 끝나기를 기다리라는 "
-            "것입니다(CDC 단계에 진행 상황이 표시됨). Stop이나 Delete가 끝나면 Retry나 Reload가 실행되고, "
-            "Start로 CDC가 스트리밍을 시작하면 다시 Stop CDC가 먼저입니다.",
+            "동안에도 Full Load 단계의 작업들은 비활성화된 채로 있지만, 이때 알려 주는 이유는 먼저 "
+            "Stop CDC를 하라는 것이 아니라 그 작업이 끝나기를 기다리라는 것입니다(CDC 단계에 진행 "
+            "상황이 표시됨). 그동안 페이지 헤더의 **Run**도 아무것도 시작하지 않으며, 스트리밍한 적 있는 "
+            "스택에서는 기다리라는 대신 위의 삭제 후 재배포 경로를 알려 줍니다. Stop이나 Delete가 끝나면 "
+            "Retry나 Reload가 실행되고, Start로 CDC가 스트리밍을 시작하면 다시 Stop CDC가 먼저입니다.",
             "ja": "**Start CDC**、**Stop CDC**、**Delete CDC infrastructure** がまだ進行中の間も、"
-            "これらの操作は無効のままで、ページヘッダーの **Run** も何も開始しませんが、示される理由は、"
-            "先に Stop CDC することではなく、その操作が終わるまで待つことです (CDC ステップに進行状況が"
-            "表示されます)。Stop または Delete が終わると Retry や Reload が実行でき、Start で CDC が"
-            "ストリーミングを始めると、再び Stop CDC が先になります。",
+            "Full Load ステップの操作は無効のままですが、示される理由は、先に Stop CDC することではなく、"
+            "その操作が終わるまで待つことです (CDC ステップに進行状況が表示されます)。このときページ"
+            "ヘッダーの **Run** も何も開始せず、ストリーミングしたことのあるスタックでは、待つ代わりに"
+            "上記の削除と再デプロイの方法を示します。Stop または Delete が終わると Retry や Reload が"
+            "実行でき、Start で CDC がストリーミングを始めると、再び Stop CDC が先になります。",
         },
         "sharding": {
             "en": "it only engages on this multi-process path (`TABLE_PARALLELISM` above 1) where "
@@ -478,20 +508,25 @@ _PINS = {
         },
     },
 }
-# What the manual said before, a load beside a live sink: gone from every page.
+# What the manual said before, a load beside a live sink: gone from every page. Last in each
+# (G135): the page header's Run giving the wait during any CDC operation.
 _STALE = {
     "en": ("**Not gated:** **Retry unfinished tables**",
            "keep the original start point and are not affected",
            "while CDC streams, nothing is forced, and the table is appended with a WARNING",
-           "fix the oversized source value and **Reload** that table before cutting over"),
+           "fix the oversized source value and **Reload** that table before cutting over",
+           "these actions stay disabled and the page header's **Run** starts nothing, but the "
+           "reason they give is to wait"),
     "ko": ("**막히지 않는 것:** **Retry unfinished tables**",
            "원래 시작 지점을 유지하므로 영향을 받지 않습니다",
            "CDC가 스트리밍하는 동안에는 아무것도 강제되지 않으며, 테이블은 WARNING과 함께 append됩니다",
-           "초대형 소스 값을 고쳐 해당 테이블을 **Reload**하거나"),
+           "초대형 소스 값을 고쳐 해당 테이블을 **Reload**하거나",
+           "페이지 헤더의 **Run**은 아무것도 시작하지 않지만, 이때 알려 주는 이유는"),
     "ja": ("**制限されないもの:** **Retry unfinished tables**",
            "元の開始位置を維持するため、影響を受けません",
            "CDC のストリーミング中は何も強制されず、テーブルは WARNING とともに append されます",
-           "特大サイズのソース値を修正してそのテーブルを **Reload** するか"),
+           "特大サイズのソース値を修正してそのテーブルを **Reload** するか",
+           "ページヘッダーの **Run** も何も開始しませんが、示される理由は"),
 }
 
 
