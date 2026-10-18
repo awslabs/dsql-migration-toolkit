@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime  # noqa: F401 - referenced by string annotations
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from sqlalchemy import text
 
@@ -1392,7 +1392,10 @@ class PostgresSourceDialect(SourceDialect):
         return quoted
 
     def keyset_after_sql(
-        self, table: object, last_key: "Sequence[object]"
+        self,
+        table: object,
+        last_key: "Sequence[object]",
+        members: "Mapping[str, tuple[str, tuple[str, ...]]]",
     ) -> "tuple[str, dict[str, object]]":
         # A composite key is the ROW-VALUE comparison ("k0", "k1", ...) > (:last_0, ...):
         # the btree's index condition on the primary key (and on each partition's), in the
@@ -1403,7 +1406,8 @@ class PostgresSourceDialect(SourceDialect):
         # shard's leading-column band nor an added ``k0 >= :last_0`` would do: each page
         # would still re-read every row of the cursor's leading value. Bare columns, as in
         # every WHERE here: they are the native ones, and a text-read key's cursor text
-        # binds back to its type.
+        # binds back to its type. ``members`` is always empty: a PostgreSQL enum key
+        # compares by its declared order natively.
         primary_key = [self.quote_identifier(c) for c in table.primary_key]  # type: ignore[attr-defined]
         names = keyset_param_names(len(primary_key))
         params: dict[str, object] = dict(zip(names, last_key))

@@ -947,21 +947,24 @@ def build_pg_count_sql(
 
 def _mysql_keyset_key(table: TableDef, pk_column: str) -> str:
     """What a MySQL keyset page compares and advances ``pk_column`` by: the column itself,
-    or for an ENUM / SET its stored number, ``col + 0``.
+    or for an ENUM / SET its stored number, ``CAST(col AS UNSIGNED)``.
 
     MySQL sorts an ENUM by its member index and a SET by its bitmask, but MAX() and ``>``
     over the label compare STRINGS: a page's MAX(page_pk) was not its last key and ``pk >
     :last`` skipped and re-read rows past it whenever the members are not declared in
-    alphabetical order. By the number, MAX, ``>`` and the ORDER BY agree. No index serves
-    ``col + 0 > :last`` (every page reads the key from its start), which a one-column ENUM
-    key bounds anyway: at most 65,535 members, one row each. (The Full Load reader pages an
-    ENUM by an IN list of the members after the cursor, which its leading-ENUM composite
-    keys of any size need -- see source_dialect/mysql.py.)
+    alphabetical order. By the number, MAX, ``>`` and the ORDER BY agree. ``CAST(col AS
+    UNSIGNED)`` is that number exactly (a BIGINT UNSIGNED); ``col + 0`` is a DOUBLE, which
+    rounds a SET's bitmask past bit 53 and turns bit 63 negative, so a SET of 54+ members
+    skipped rows (a false MISMATCH). No index serves ``CAST(col AS UNSIGNED) > :last``
+    (every page reads the key from its start), which a one-column ENUM key bounds anyway:
+    at most 65,535 members, one row each. (The Full Load reader reads a key led by an ENUM
+    member by member, which its composite keys of any size need -- see
+    source_dialect/mysql.py.)
     """
     pk_sql = _quote_mysql_identifier(pk_column)
     column = next((c for c in table.columns if c.name == pk_column), None)
     if column is not None and mysql_enum_set_members(column.mysql_type) is not None:
-        return f"{pk_sql} + 0"
+        return f"CAST({pk_sql} AS UNSIGNED)"
     return pk_sql
 
 

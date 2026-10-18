@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 from dsql_migrator.core.models import SourceType
 
@@ -313,7 +313,10 @@ class SourceDialect(ABC):
 
     @abstractmethod
     def keyset_after_sql(
-        self, table: object, last_key: "Sequence[object]"
+        self,
+        table: object,
+        last_key: "Sequence[object]",
+        members: "Mapping[str, tuple[str, tuple[str, ...]]]",
     ) -> "tuple[str, dict[str, object]]":
         """The keyset cursor of a next page, and its bind parameters.
 
@@ -322,9 +325,39 @@ class SourceDialect(ABC):
         per key column in key order -- in the ORDER BY the read uses (each key column,
         native), written in the form the engine's primary-key index serves as a range:
         a predicate the index only FILTERS re-reads the key from its start on every page,
-        O(n^2) over a large table. The parameters carry ``last_key`` in
-        :func:`keyset_param_names` (plus any a dialect derives from it). Built per page.
+        O(n^2) over a large table. For a key the read walks (:meth:`keyset_walk`), the
+        rows after ``last_key`` that share its leading value. ``members`` is what
+        :meth:`keyset_key_members` read when the stream started. The parameters carry
+        ``last_key`` in :func:`keyset_param_names` (plus any a dialect derives from it).
+        Built per page.
         """
+
+    def keyset_key_members(
+        self, connection: object, table: object
+    ) -> "dict[str, tuple[str, tuple[str, ...]]]":
+        """The values of ``table``'s enumerated key columns as the source holds them NOW.
+
+        ``{column: (kind, values in key order)}`` for each key column whose order the
+        keyset cursor has to spell out value by value (a MySQL ``ENUM`` / ``SET``), read
+        once when a table's keyset stream starts -- one catalog read, never a scan -- and
+        handed to :meth:`keyset_after_sql` / :meth:`keyset_walk` for each of its pages.
+        Raises when they cannot be read. The base: ``{}`` (every key column compares
+        natively), with no read.
+        """
+        return {}
+
+    def keyset_walk(
+        self, table: object, members: "Mapping[str, tuple[str, tuple[str, ...]]]"
+    ) -> "Optional[tuple[str, ...]]":
+        """The leading key column's values in key order when the read takes them one at a
+        time, else ``None`` (the base).
+
+        Such a key is read value by value: each page is ``<leading column> = <value>``
+        (its first) or :meth:`keyset_after_sql` (the rest of that value's rows), the next
+        value once a page comes back short, and the read ends after the last one -- for a
+        leading column whose "every value after this one" no index serves as a range.
+        """
+        return None
 
     @property
     @abstractmethod

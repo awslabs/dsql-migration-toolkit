@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from dsql_migrator.core.introspector import (
     MYSQL_DRIVER,
@@ -39,43 +39,71 @@ _MYSQL_INTEGER_PK_TYPES = frozenset(
 )
 
 
+# The live definitions of a table's key columns, read once when a keyset stream of a table
+# whose key has an ENUM / SET column starts (G130): the cursor names such a column's
+# members, and Step 1 (Evaluation)'s record of them goes stale when a member is added or
+# reordered (the read would then leave whole members' rows unread, silently). Catalog only,
+# keyed on schema + table: no scan, no lock. An unqualified name is the current database's,
+# as the read's own FROM resolves it.
+_KEY_COLUMN_TYPES_SQL = (
+    "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS "
+    "WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = :name"
+)
+
+_ENUM_OR_SET = re.compile(r"\s*(?:enum|set)\s*\(", re.IGNORECASE)
+
+
+def _column_type_sql(kind: str, members: Sequence[str]) -> str:
+    """``COLUMN_TYPE`` as MySQL writes it for these members (``Field_enum::sql_type``: each
+    member quoted with ``\\``, ``''``, ``\\0``, ``\\n``, ``\\r`` escaped). A decode that does not
+    write back to the catalog's text exactly has misread a member."""
+    quoted = (
+        "'"
+        + member.replace("\\", "\\\\").replace("'", "''").replace("\0", "\\0")
+        .replace("\n", "\\n").replace("\r", "\\r")
+        + "'"
+        for member in members
+    )
+    return f"{kind}({','.join(quoted)})"
+
+
 def _key_after_sql(
-    quoted: str, column: str, mysql_type: str, name: str, value: object, params: dict
+    quoted: str,
+    column: str,
+    member: "Optional[tuple[str, tuple[str, ...]]]",
+    name: str,
+    value: object,
+    params: dict,
 ) -> Optional[str]:
     """One key column's strict keyset term: its values that sort after ``value`` (the
     cursor, bound as ``:name``), or ``None`` when none does. Adds what it binds to ``params``.
 
-    ``col > :name`` -- except for an ENUM or a SET. ORDER BY sorts those by the number MySQL
-    stores (an ENUM's member index, a SET's bitmask) while a comparison with the label
-    compares STRINGS, so ``> 'label'`` skipped or re-read rows at every page boundary of a
-    member order that is not alphabetical, silently: PK (status ENUM('new','active',
-    'closed'), id) read its 'new' rows only. An ENUM's term is the members declared after the
-    cursor's, ``col IN (...)``, which the PK index serves as a range (by the index, ``col >
-    2`` is only a Filter: every page re-reads the key from its start). A SET's is its
-    bitmask, ``col + 0 > :name_bits``, which no index serves: a LEADING SET column re-reads
-    the key from its start per page, a later one only the rows of its equal prefix. The
-    equality terms keep the label (``col = :name``), which the index serves and which names
-    one member. The members are the ones Step 1 (Evaluation) recorded.
+    ``col > :name`` -- except for an ENUM or a SET (``member``: its kind and values, as
+    :meth:`MySQLSourceDialect.keyset_key_members` read them). ORDER BY sorts those by the
+    number MySQL stores (an ENUM's member index, a SET's bitmask) while a comparison with the
+    label compares STRINGS, so ``> 'label'`` skipped or re-read rows at every page boundary
+    of a member order that is not alphabetical, silently. An ENUM's term is the members
+    declared after the cursor's, ``col IN (...)``, which the PK index serves as a range (by
+    the index, ``col > 2`` is only a Filter); a key LED by an ENUM is read member by member
+    instead (:meth:`MySQLSourceDialect.keyset_walk`). A SET's is its bitmask, ``CAST(col AS
+    UNSIGNED) > :name_bits`` -- exact over all 64 bits, where ``col + 0`` is a DOUBLE that
+    rounds past bit 53 and turns bit 63 negative -- which no index serves: a LEADING SET
+    column re-reads the key from its start per page, a later one only the rows of its equal
+    prefix. The equality terms keep the label (``col = :name``), which the index serves and
+    which names one member.
     """
-    from dsql_migrator.core.converter import mysql_enum_set_members
-
-    members = mysql_enum_set_members(mysql_type)
-    if members is None:
+    if member is None:
         return f"{quoted} > :{name}"
-    kind, labels = members
+    kind, labels = member
     if kind == "set":
         parts = str(value).split(",") if value != "" else []
         if not all(part in labels for part in parts):
-            raise _unrecorded_member(column, kind)
+            raise _unknown_member(column, kind)
         params[f"{name}_bits"] = sum(1 << labels.index(part) for part in set(parts))
-        return f"{quoted} + 0 > :{name}_bits"
-    if value in labels:
-        position = labels.index(value) + 1
-    elif value == "":
-        position = 0  # MySQL's invalid-value sentinel: index 0, sorted before every member
-    else:
-        raise _unrecorded_member(column, kind)
-    after = labels[position:]
+        return f"CAST({quoted} AS UNSIGNED) > :{name}_bits"
+    if value not in labels:
+        raise _unknown_member(column, kind)
+    after = labels[labels.index(value) + 1 :]
     if not after:
         return None
     in_names = [f"{name}_in_{j}" for j in range(len(after))]
@@ -83,15 +111,26 @@ def _key_after_sql(
     return f"{quoted} IN ({', '.join(':' + n for n in in_names)})"
 
 
-def _unrecorded_member(column: str, kind: str) -> Exception:
-    """The read cannot place a key value its column's recorded members do not hold."""
+def _unknown_member(column: str, kind: str) -> Exception:
+    """The read cannot place a key value its column's members (read live) do not hold."""
     from dsql_migrator.core.exporter import ExportError
 
     return ExportError(
         f"key column '{column}' holds {'an ENUM' if kind == 'enum' else 'a SET'} value that "
-        "is not one of the members Step 1 (Evaluation) recorded for it, so the read cannot "
-        "place it in the key order: the column's definition changed after Evaluation. "
-        "Re-run Step 1 (Evaluation) and Schema Conversion, then retry this table."
+        "is not one of the members the source lists for it (information_schema.COLUMNS), so "
+        "the read cannot place it in the key order and stops instead of loading the table "
+        "with rows missing. Retry this table; if it stops again, check the column's "
+        "definition and character set on the source."
+    )
+
+
+def _unreadable_members(column: str, why: str, remedy: str) -> Exception:
+    """The read cannot write a cursor that keeps this key column's order."""
+    from dsql_migrator.core.exporter import ExportError
+
+    return ExportError(
+        f"key column '{column}' {why}, so the read cannot write a cursor that keeps the key "
+        f"order and stops instead of loading the table with rows missing. {remedy}"
     )
 
 
@@ -181,8 +220,85 @@ class MySQLSourceDialect(SourceDialect):
             return f"ST_AsBinary({quoted}) AS {quoted}"
         return quoted
 
+    def keyset_key_members(
+        self, connection: object, table: object
+    ) -> "dict[str, tuple[str, tuple[str, ...]]]":
+        # Only a key Step 1 (Evaluation) saw an ENUM / SET in costs the read (every other
+        # table's cursor is the plain one, as before); then each key column is taken as the
+        # catalog defines it NOW. An ENUM's values are in key order: '' (the invalid-value
+        # index 0, sorted first) unless it is a declared member, then the members as
+        # declared; a SET's are its members, bit i the i-th.
+        from sqlalchemy import text
+
+        from dsql_migrator.core.converter import mysql_enum_set_members
+
+        primary_key = list(table.primary_key)  # type: ignore[attr-defined]
+        recorded = {c.name: c.mysql_type for c in table.columns}  # type: ignore[attr-defined]
+        if not any(_ENUM_OR_SET.match(recorded.get(c, "")) for c in primary_key):
+            return {}
+        schema, separator, name = table.name.partition(".")  # type: ignore[attr-defined]
+        params = {"schema": schema, "name": name}
+        sql = _KEY_COLUMN_TYPES_SQL.format(schema=":schema")
+        if not (separator and schema and name):
+            params = {"name": table.name}  # type: ignore[attr-defined]
+            sql = _KEY_COLUMN_TYPES_SQL.format(schema="DATABASE()")
+        rows = connection.execute(text(sql), params).fetchall()  # type: ignore[attr-defined]
+        # MySQL column names are case-insensitive on every platform.
+        live = {str(row[0]).lower(): str(row[1]) for row in rows}
+        members: dict[str, tuple[str, tuple[str, ...]]] = {}
+        for column in primary_key:
+            column_type = live.get(column.lower())
+            if column_type is None:
+                raise _unreadable_members(
+                    column,
+                    "is not in information_schema.COLUMNS for the table",
+                    "Check that the migration user can read the table's columns and that the "
+                    "column still exists, then retry this table.",
+                )
+            if not _ENUM_OR_SET.match(column_type):
+                continue
+            try:
+                kind, values = mysql_enum_set_members(column_type) or ("", ())
+            except ValueError:
+                kind, values = "", ()
+            if _column_type_sql(kind, values) != kind + column_type[len(kind) :]:
+                raise _unreadable_members(
+                    column,
+                    "has members that could not be read exactly from "
+                    "information_schema.COLUMNS.COLUMN_TYPE (a member holds a character such as "
+                    "NUL)",
+                    "Rename that member on the source, then retry this table.",
+                )
+            if len(set(values)) != len(values):
+                raise _unreadable_members(
+                    column,
+                    "names the same member twice (MySQL accepts that outside strict mode)",
+                    "Make the members distinct on the source, then retry this table.",
+                )
+            if kind == "enum" and "" not in values:
+                values = ("", *values)
+            members[column] = (kind, values)
+        return members
+
+    def keyset_walk(
+        self, table: object, members: "Mapping[str, tuple[str, tuple[str, ...]]]"
+    ) -> "Optional[tuple[str, ...]]":
+        # A key LED by an ENUM is read member by member. As one predicate -- the members
+        # after the cursor's, OR the cursor's member and the rest of the key after it -- its
+        # cursor is a range MySQL 8.4 / 9.4 do not take when the PK holds every column of
+        # the table: (status ENUM, id) is then a covering index scan plus a filter that
+        # re-reads every row before the cursor on each page, quadratic in the first
+        # member's rows (300k rows: one page touched 100,000 rows for 5,000). A page of
+        # ``status = :member [AND <the rest of the key after the cursor>]`` is a ref / range.
+        primary_key = list(table.primary_key)  # type: ignore[attr-defined]
+        lead = members.get(primary_key[0]) if primary_key else None
+        return lead[1] if lead is not None and lead[0] == "enum" else None
+
     def keyset_after_sql(
-        self, table: object, last_key: "Sequence[object]"
+        self,
+        table: object,
+        last_key: "Sequence[object]",
+        members: "Mapping[str, tuple[str, tuple[str, ...]]]",
     ) -> "tuple[str, dict[str, object]]":
         # A composite key is the EXPLICIT lexicographic disjunction
         #   (k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR ...
@@ -192,25 +308,31 @@ class MySQLSourceDialect(SourceDialect):
         # MySQL 2 -- both supported) it degrades to a FULL TABLE SCAN per page, making the
         # whole keyset export O(n^2). The disjunction uses the PK index on every version. The
         # named params (:last_i) are REUSED across terms (one value per key column). A
-        # one-column key is its strict term alone.
+        # one-column key is its strict term alone. A walked key (keyset_walk) is the
+        # cursor's member AND the disjunction over the rest of the key.
         primary_key = list(table.primary_key)  # type: ignore[attr-defined]
-        types = {c.name: c.mysql_type for c in table.columns}  # type: ignore[attr-defined]
         names = keyset_param_names(len(primary_key))
         params: dict[str, object] = dict(zip(names, last_key))
+        walked = self.keyset_walk(table, members) is not None
         equal: list[str] = []
         terms: list[str] = []
-        for column, name, value in zip(primary_key, names, last_key):
+        for position, (column, name, value) in enumerate(zip(primary_key, names, last_key)):
             quoted = self.quote_identifier(column)
-            after = _key_after_sql(quoted, column, types.get(column, ""), name, value, params)
-            if after is not None:
-                terms.append(" AND ".join([*equal, after]))
-            equal.append(f"{quoted} = :{name}")
+            if not (walked and position == 0):
+                after = _key_after_sql(quoted, column, members.get(column), name, value, params)
+                if after is not None:
+                    terms.append(" AND ".join([*equal, after]))
+                equal.append(f"{quoted} = :{name}")
         if not terms:
-            # Only when every key column is an ENUM on its last member: nothing follows.
+            # Every key column (after a walked key's member) is an ENUM on its last member:
+            # nothing follows.
             return "1 = 0", params
         if len(primary_key) == 1:
             return terms[0], params
-        return "(" + " OR ".join(f"({term})" for term in terms) + ")", params
+        cursor = "(" + " OR ".join(f"({term})" for term in terms) + ")"
+        if walked:
+            cursor = f"{self.quote_identifier(primary_key[0])} = :{names[0]} AND {cursor}"
+        return cursor, params
 
     @property
     def snapshot_start_sql(self) -> str:

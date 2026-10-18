@@ -8,6 +8,8 @@ ENUM / SET key column's cursor LABEL as a string, so Full Load silently skipped 
 rows at page boundaries (PK (status ENUM('new','active','closed'), id) read only its 'new'
 rows). The reader now pages an ENUM by an IN list of the members declared after the
 cursor's and a SET by its bitmask; Validation's MySQL checksum pages by the stored number.
+(G130, test_g130_keyset_walk_review: a key LED by an ENUM is read member by member, the
+members come from the source's catalog, a SET compares ``CAST(col AS UNSIGNED)``.)
 
 FL-2: on PostgreSQL the composite-key disjunction is no index condition (each page re-read
 the key from its start, O(n^2)); a PostgreSQL composite key now pages by the row-value
@@ -33,14 +35,20 @@ from dsql_migrator.core.source_dialect import MySQLSourceDialect, PostgresSource
 # A source that evaluates the reader's WHERE with MySQL's ENUM / SET rules
 # ---------------------------------------------------------------------------
 
-_TOKEN = re.compile(r"\s*(`(?:[^`]|``)+`|:\w+|\d+|\bIN\b|\bAND\b|\bOR\b|>=|<=|[()=<>+,])")
+_TOKEN = re.compile(
+    r"\s*(`(?:[^`]|``)+`|:\w+|\d+|\bIN\b|\bAND\b|\bOR\b|\bCAST\b|\bAS\b|\bUNSIGNED\b"
+    r"|>=|<=|[()=<>+,])"
+)
 
 
 class _Result:
-    def __init__(self, rows: list[dict]) -> None:
+    def __init__(self, rows: list) -> None:
         self._rows = rows
 
-    def mappings(self) -> list[dict]:
+    def mappings(self) -> list:
+        return self._rows
+
+    def fetchall(self) -> list:
         return self._rows
 
 
@@ -48,18 +56,31 @@ class _MySqlModel:
     """Serves keyset pages as MySQL evaluates them.
 
     ORDER BY sorts an ENUM by its member index and a SET by its bitmask; ``col > 'label'``
-    and ``col = 'label'`` compare the LABEL (a string); ``col + 0`` is the stored number, and
-    an integer compared with an ENUM / SET compares that number. Records every statement.
+    compares the LABEL (a string), ``col = 'label'`` / ``IN`` the member the label names;
+    ``CAST(col AS UNSIGNED)`` is the stored number, ``col + 0`` its DOUBLE (read as a signed
+    64-bit value, as MySQL does), and an integer compared with an ENUM / SET compares the
+    number. ``live`` is the source's definition of a column NOW (default: the table's),
+    which the catalog read (information_schema.COLUMNS) returns and the rows sort by.
+    ``ci``: a label bound against an ENUM resolves, as MySQL's index lookup does, to the
+    first member equal to it ignoring case. Records every statement.
     """
 
-    def __init__(self, table: TableDef, rows: list[dict]) -> None:
+    def __init__(
+        self,
+        table: TableDef,
+        rows: list[dict],
+        live: Optional[dict[str, str]] = None,
+        ci: bool = False,
+    ) -> None:
+        self._types = {c.name: c.mysql_type for c in table.columns} | dict(live or {})
         self._members: dict[str, tuple[str, tuple[str, ...]]] = {}
-        for column in table.columns:
-            kind = column.mysql_type.split("(", 1)[0].strip().lower()
+        for column, column_type in self._types.items():
+            kind = column_type.split("(", 1)[0].strip().lower()
             if kind in ("enum", "set"):
-                inner = column.mysql_type[column.mysql_type.index("(") + 1 : -1]
+                inner = column_type[column_type.index("(") + 1 : -1]
                 labels = tuple(m.replace("''", "'") for m in re.findall(r"'((?:[^']|'')*)'", inner))
-                self._members[column.name] = (kind, labels)
+                self._members[column] = (kind, labels)
+        self._ci = ci
         self._pk = list(table.primary_key)
         self._rows = sorted(rows, key=lambda r: tuple(self._order(c, r[c]) for c in self._pk))
         self.executed: list[tuple[str, dict]] = []
@@ -67,16 +88,36 @@ class _MySqlModel:
     def _number(self, column: str, label: str) -> int:
         kind, labels = self._members[column]
         if kind == "enum":
-            return labels.index(label) + 1 if label else 0
+            return labels.index(label) + 1 if label in labels else 0
         return sum(1 << labels.index(part) for part in label.split(",") if part)
+
+    def _double(self, column: str, label: str) -> float:
+        """``col + 0``: MySQL's DOUBLE of the stored number read as a SIGNED 64-bit value."""
+        number = self._number(column, label)
+        return float(number - (1 << 64) if number >= 1 << 63 else number)
+
+    def _resolved(self, column: str, label: str) -> int:
+        """The member index an ENUM label bound in a predicate names (0: no member)."""
+        _kind, labels = self._members[column]
+        if label in labels and not self._ci:
+            return labels.index(label) + 1
+        folded = [m.lower() for m in labels]
+        return folded.index(label.lower()) + 1 if label.lower() in folded else 0
 
     def _order(self, column: str, value: object) -> object:
         return self._number(column, value) if column in self._members else value  # type: ignore[arg-type]
+
+    @property
+    def pages(self) -> list[tuple[str, dict]]:
+        """The keyset pages read (every statement but the catalog read)."""
+        return [(s, p) for s, p in self.executed if " LIMIT " in s]
 
     def execute(self, statement: object, parameters: Optional[dict] = None) -> _Result:
         sql = str(statement)
         params = dict(parameters or {})
         self.executed.append((sql, params))
+        if "information_schema.COLUMNS" in sql:
+            return _Result([(name, column_type) for name, column_type in self._types.items()])
         if " WHERE " in sql:
             where = sql.split(" WHERE ", 1)[1].split(" ORDER BY ", 1)[0]
             rows = [row for row in self._rows if self._eval(where, row, params)]
@@ -101,12 +142,19 @@ class _MySqlModel:
 
         def operand() -> tuple:
             token = take()
+            if token == "CAST":
+                take("(")
+                column = take()[1:-1].replace("``", "`")
+                take("AS")
+                take("UNSIGNED")
+                take(")")
+                return ("number", self._number(column, row[column]))
             if token.startswith("`"):
                 column = token[1:-1].replace("``", "`")
                 if peek() == "+":
                     take("+")
                     take("0")
-                    return ("number", self._number(column, row[column]))
+                    return ("number", self._double(column, row[column]))
                 return ("column", column, row[column])
             if token.startswith(":"):
                 return ("value", params[token[1:]])
@@ -121,6 +169,15 @@ class _MySqlModel:
 
             return one(left, right), one(right, left)
 
+        def equal(left: tuple, right: tuple) -> bool:
+            # ``enum_col = 'label'`` / ``IN ('label')`` is an index lookup of the member the
+            # label resolves to; any other ``=`` compares values.
+            if left[0] == "column" and self._members.get(left[1], ("",))[0] == "enum":
+                if isinstance(right[-1], str):
+                    return self._number(left[1], left[2]) == self._resolved(left[1], right[-1])
+            a, b = values(left, right)
+            return a == b
+
         def predicate() -> bool:
             left = operand()
             op = take()
@@ -131,9 +188,12 @@ class _MySqlModel:
                     take(",")
                     items.append(operand())
                 take(")")
-                return any(a == b for a, b in (values(left, item) for item in items))
-            a, b = values(left, operand())
-            return {"=": a == b, ">": a > b, ">=": a >= b, "<": a < b}[op]  # type: ignore[operator]
+                return any(equal(left, item) for item in items)
+            right = operand()
+            if op == "=":
+                return equal(left, right)
+            a, b = values(left, right)
+            return {">": a > b, ">=": a >= b, "<": a < b}[op]  # type: ignore[operator]
 
         def atom() -> bool:
             if peek() == "(":
@@ -173,9 +233,15 @@ def _table(name: str, columns: list[tuple[str, str]], pk: list[str]) -> TableDef
 
 
 def _read(
-    table: TableDef, rows: list[dict], batch_size: int = 2, **kwargs
+    table: TableDef,
+    rows: list[dict],
+    batch_size: int = 2,
+    *,
+    live: Optional[dict[str, str]] = None,
+    ci: bool = False,
+    **kwargs,
 ) -> tuple[list[tuple], _MySqlModel]:
-    source = _MySqlModel(table, rows)
+    source = _MySqlModel(table, rows, live=live, ci=ci)
     stream = keyset_stream(source, table, batch_size=batch_size, **kwargs)
     return [tuple(r[c] for c in table.primary_key) for r in stream], source
 
@@ -208,23 +274,16 @@ def test_the_model_reproduces_the_string_compared_cursor_losing_rows() -> None:
     assert [r["status"] for r in source._rows] == ["new", "active", "closed"]  # index order
 
 
-def test_a_leading_enum_key_reads_every_row_once_by_an_in_list_of_later_members() -> None:
+def test_a_leading_enum_key_reads_every_row_once_in_member_order() -> None:
     rows = [{"status": s, "id": i} for s in ("new", "active", "closed") for i in range(1, 6)]
     keys, source = _read(_TICKETS, rows)
     _assert_every_row_once(_TICKETS, rows, keys)
     assert [k[0] for k in keys] == ["new"] * 5 + ["active"] * 5 + ["closed"] * 5
-    sql, params = next((s, p) for s, p in source.executed if p.get("last_0") == "new")
-    # Range-friendly: the members after 'new' as an IN list (MySQL serves it from the PK
-    # index; ``status > 1`` it only filters), the equal prefix by its label.
-    assert (
-        "((`status` IN (:last_0_in_0, :last_0_in_1)) OR (`status` = :last_0 AND `id` > :last_1))"
-        in sql
+    # The ORDER BY stays native; how the pages walk the members: test_g130_keyset_walk_review.
+    assert all(
+        "ORDER BY `shop`.`tickets`.`status`, `shop`.`tickets`.`id`" in sql
+        for sql, _params in source.pages
     )
-    assert (params["last_0_in_0"], params["last_0_in_1"]) == ("active", "closed")
-    assert "ORDER BY `shop`.`tickets`.`status`, `shop`.`tickets`.`id`" in sql  # native order
-    # On the last member no member follows: only the equal-prefix term is left.
-    last = next(s for s, p in source.executed if p.get("last_0") == "closed")
-    assert "IN (" not in last and "(`status` = :last_0 AND `id` > :last_1)" in last
 
 
 def test_a_trailing_enum_key_binds_the_members_after_the_cursor_not_its_label() -> None:
@@ -242,7 +301,9 @@ def test_a_set_key_pages_by_its_bitmask() -> None:
     keys, source = _read(_GRANTS, rows, batch_size=3)
     _assert_every_row_once(_GRANTS, rows, keys)
     sql, params = next((s, p) for s, p in source.executed if p.get("last_1") == "write")
-    assert "(`id` = :last_0 AND `f` + 0 > :last_1_bits)" in sql and params["last_1_bits"] == 2
+    # By the exact BIGINT UNSIGNED bitmask (G130: ``f + 0`` is a DOUBLE).
+    assert "(`id` = :last_0 AND CAST(`f` AS UNSIGNED) > :last_1_bits)" in sql
+    assert params["last_1_bits"] == 2
     _, params = next((s, p) for s, p in source.executed if p.get("last_1") == "read,admin")
     assert params["last_1_bits"] == 5
 
@@ -256,7 +317,8 @@ def test_alphabetical_enum_and_varchar_keys_are_unchanged_controls() -> None:
         keys, _source = _read(table, rows)
         _assert_every_row_once(table, rows, keys)
     _keys, source = _read(text, rows)
-    assert "((`user_id` > :last_0) OR (`user_id` = :last_0 AND `channel` > :last_1))" in source.executed[1][0]
+    assert source.executed == source.pages  # no ENUM / SET in the key: no catalog read
+    assert "((`user_id` > :last_0) OR (`user_id` = :last_0 AND `channel` > :last_1))" in source.pages[1][0]
 
 
 def test_a_one_column_enum_key_reads_every_row_and_stops_after_its_last_member() -> None:
@@ -264,9 +326,9 @@ def test_a_one_column_enum_key_reads_every_row_and_stops_after_its_last_member()
     rows = [{"lvl": m} for m in ("low", "mid", "high", "max")]
     keys, source = _read(table, rows)
     _assert_every_row_once(table, rows, keys)
-    assert source.executed[1][0].count("`lvl` IN (:last_in_0, :last_in_1)") == 1
-    # A full page ending on the last member: nothing can follow, and the read says so.
-    assert "WHERE 1 = 0 ORDER BY" in source.executed[-1][0]
+    # After the first page, member by member (one row each), and none after the last.
+    assert [p.get("last") for _s, p in source.pages[1:]] == ["high", "max"]
+    assert all(" WHERE `lvl` = :last ORDER BY" in s for s, _p in source.pages[1:])
 
 
 def test_reader_shards_of_an_int_enum_key_cover_every_row_once() -> None:
@@ -276,7 +338,7 @@ def test_reader_shards_of_an_int_enum_key_cover_every_row_once() -> None:
         got, source = _read(_PREFS, rows, pk_lower=lower, pk_upper=upper)
         keys += got
     _assert_every_row_once(_PREFS, rows, keys)
-    assert "`channel` IN (" in source.executed[1][0] and "`user_id` >= :pk_lower" in source.executed[1][0]
+    assert "`channel` IN (" in source.pages[1][0] and "`user_id` >= :pk_lower" in source.pages[1][0]
 
 
 def test_mysql_invalid_value_sentinel_sorts_first_and_every_member_follows_it() -> None:
@@ -284,20 +346,24 @@ def test_mysql_invalid_value_sentinel_sorts_first_and_every_member_follows_it() 
     rows = [{"status": s, "id": 1} for s in ("", "new", "active", "closed")]
     keys, source = _read(_TICKETS, rows, batch_size=1)
     _assert_every_row_once(_TICKETS, rows, keys)
-    _, params = next((s, p) for s, p in source.executed if p.get("last_0") == "")
-    assert [params[f"last_0_in_{j}"] for j in range(3)] == ["new", "active", "closed"]
+    # The rest of the '' group first, then each member from its first row on.
+    assert [p["last_0"] for _s, p in source.pages[1:]] == [
+        "", "new", "new", "active", "active", "closed", "closed",
+    ]
 
 
-def test_a_key_value_outside_the_recorded_members_fails_the_table_loudly() -> None:
-    """The members are the ones Evaluation recorded; a value the read cannot place in the
-    key order is refused, naming the column (never the value)."""
-    stale = _table("tickets", [("status", "enum('new','active')"), ("id", "int")], ["status", "id"])
+def test_a_key_value_outside_the_members_fails_the_table_loudly() -> None:
+    """A value the read cannot place in the key order is refused, naming the column (never
+    the value). The members are the source's own, read when the stream starts (G130)."""
     dialect = MySQLSourceDialect()
-    with pytest.raises(ExportError, match="key column 'status' holds an ENUM value") as raised:
-        dialect.keyset_after_sql(stale, ("archived", 7))
-    assert "archived" not in str(raised.value) and "Re-run Step 1" in str(raised.value)
+    members = {"channel": ("enum", ("", "email", "sms", "push"))}
+    with pytest.raises(ExportError, match="key column 'channel' holds an ENUM value") as raised:
+        dialect.keyset_after_sql(_PREFS, (7, "fax"), members)
+    assert "fax" not in str(raised.value) and "information_schema.COLUMNS" in str(raised.value)
     with pytest.raises(ExportError, match="key column 'f' holds a SET value"):
-        dialect.keyset_after_sql(_GRANTS, (1, "read,audit"))
+        dialect.keyset_after_sql(
+            _GRANTS, (1, "read,audit"), {"f": ("set", ("read", "write", "admin"))}
+        )
 
 
 def test_enum_and_set_members_are_read_as_schema_conversion_reads_them() -> None:
@@ -329,8 +395,9 @@ def test_validation_checksum_pages_an_enum_or_set_key_by_its_stored_number() -> 
         first = build_mysql_page_checksum_first_sql(table, "lvl")
         nxt = build_mysql_page_checksum_next_sql(table, "lvl")
         # MAX() over the label would be the alphabetical last ('mid'), not the page's last.
-        assert "SELECT `lvl` + 0 AS page_pk," in first and "ORDER BY `lvl` LIMIT :page" in first
-        assert "WHERE `lvl` + 0 > :last ORDER BY `lvl` LIMIT :page" in nxt
+        assert "SELECT CAST(`lvl` AS UNSIGNED) AS page_pk," in first
+        assert "ORDER BY `lvl` LIMIT :page" in first
+        assert "WHERE CAST(`lvl` AS UNSIGNED) > :last ORDER BY `lvl` LIMIT :page" in nxt
     plain = _table("lvl", [("lvl", "varchar(5)")], ["lvl"])
     assert "WHERE `lvl` > :last ORDER BY `lvl`" in build_mysql_page_checksum_next_sql(plain, "lvl")
 
@@ -398,9 +465,9 @@ def test_a_postgres_composite_key_pages_by_the_row_value_comparison(bounds: dict
 
 def test_a_postgres_one_column_key_and_mysql_composite_keys_keep_their_cursor() -> None:
     pg = TableDef(name="public.t", columns=[ColumnDef(name="id", mysql_type="bigint")], primary_key=["id"])
-    assert PostgresSourceDialect().keyset_after_sql(pg, (7,)) == ('"id" > :last', {"last": 7})
+    assert PostgresSourceDialect().keyset_after_sql(pg, (7,), {}) == ('"id" > :last', {"last": 7})
     composite = _table("events", [("tenant_id", "int"), ("id", "bigint")], ["tenant_id", "id"])
-    sql, params = MySQLSourceDialect().keyset_after_sql(composite, (3, 9))
+    sql, params = MySQLSourceDialect().keyset_after_sql(composite, (3, 9), {})
     # MySQL 5.7's range optimizer serves the disjunction, not the row-value form.
     assert sql == "((`tenant_id` > :last_0) OR (`tenant_id` = :last_0 AND `id` > :last_1))"
     assert params == {"last_0": 3, "last_1": 9}

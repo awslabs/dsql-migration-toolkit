@@ -16,10 +16,10 @@ Pipeline for one table:
    explicit lexicographic disjunction ``(k0 > :last_0) OR (k0 = :last_0 AND k1 >
    :last_1) OR ...`` (5.7 serves no row-value form), PostgreSQL the row-value comparison
    ``(k0, k1, ...) > (:last_0, :last_1, ...)`` -- carrying the last-seen primary key
-   forward. This avoids large ``OFFSET`` scans and yields a stable, resumable read
-   order. Single- and composite-column primary keys are supported; only a missing
-   primary key raises :class:`UnsupportedPrimaryKeyError` rather than being silently
-   mishandled.
+   forward; a MySQL key led by an ENUM is read member by member. This avoids large
+   ``OFFSET`` scans and yields a stable, resumable read order. Single- and
+   composite-column primary keys are supported; only a missing primary key raises
+   :class:`UnsupportedPrimaryKeyError` rather than being silently mishandled.
 2. Read-only consistent snapshot (Property 1 / Requirement 5.1): the stream runs
    inside ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` (InnoDB, REPEATABLE
    READ) -- the same snapshot semantics used by watermark capture (task 8.1) --
@@ -70,6 +70,7 @@ from dsql_migrator.core.source_dialect import (
     SourceDialect,
     dialect_for,
 )
+from dsql_migrator.core.source_dialect.base import keyset_param_names
 from dsql_migrator.core.watermark import (
     COMMIT,
     estimate_source_rows,
@@ -740,6 +741,14 @@ def _primary_key_columns(table: TableDef) -> list[str]:
     return primary_key
 
 
+def _walk_stopped(column: str, why: str, remedy: str) -> ExportError:
+    """A walked key's read (:func:`keyset_stream`) cannot place every row of ``column``."""
+    return ExportError(
+        f"key column '{column}' {why}, so the read cannot place every row in the key order "
+        f"and stops instead of loading the table with rows missing. {remedy}"
+    )
+
+
 class ExportCancelled(ExportError):
     """Raised when a keyset stream is stopped early via its ``should_cancel`` hook.
 
@@ -1041,10 +1050,16 @@ def keyset_stream(
     Issues ``SELECT <cols> FROM <table> [WHERE pk > :last] ORDER BY pk LIMIT
     :batch_size`` repeatedly, advancing ``:last`` to the last row's primary key,
     until a short page signals exhaustion; the cursor predicate is the dialect's
-    (:meth:`~dsql_migrator.core.source_dialect.SourceDialect.keyset_after_sql`). Rows are
+    (:meth:`~dsql_migrator.core.source_dialect.SourceDialect.keyset_after_sql`). A key
+    the dialect walks (a MySQL key led by an ENUM,
+    :meth:`~dsql_migrator.core.source_dialect.SourceDialect.keyset_walk`) is read one
+    leading value at a time instead, and ends after its last value. Rows are
     yielded lazily one page at a time, so the whole table is never materialized
     (Requirement 5.1). Every statement is a ``SELECT`` (read-only, Property 1). Raises
-    :class:`UnsupportedPrimaryKeyError` for a missing primary key.
+    :class:`UnsupportedPrimaryKeyError` for a missing primary key, and
+    :class:`ExportError` -- rather than re-reading or skipping rows -- for a page that
+    returns the row its cursor is (a full one would be read again forever), and for a
+    walked key whose page returns another value's rows.
 
     ``should_cancel`` (optional) is polled before each page is fetched; when it
     returns ``True`` the stream raises :class:`ExportCancelled` instead of issuing
@@ -1127,7 +1142,17 @@ def keyset_stream(
     # its PK index serves as a range (MySQL: the lexicographic disjunction, which 5.7's
     # range optimizer needs; PostgreSQL: the row-value comparison, its btree index
     # condition), and is built per page: a MySQL ENUM key column's term names the members
-    # declared after the cursor's (see the dialects).
+    # declared after the cursor's, as the source defines them when the stream starts
+    # (``members``: one catalog read, none for a key without an ENUM / SET).
+    members = dialect.keyset_key_members(connection, table)
+    # A key the dialect walks (a MySQL key led by an ENUM) is read one leading value at a
+    # time, in key order: after the first page, each page is that value's first
+    # (``<lead> = :value``) or the rest of its rows after the cursor (the dialect's cursor
+    # within the value), the next value once a page comes back short -- a one-column key
+    # holds one row per value -- and the table ends after the last value.
+    walk = dialect.keyset_walk(table, members)
+    lead_sql = dialect.quote_identifier(pk_columns[0])
+    lead_name = keyset_param_names(len(pk_columns))[0]
     first_where = " AND ".join(range_clauses)
     # ONLY changes the rows read, not the FROM item's name: ORDER BY still qualifies by it.
     from_sql = f"ONLY {table_sql}" if from_only else table_sql
@@ -1148,6 +1173,10 @@ def keyset_stream(
         return tuple(row[c] for c in pk_columns)
 
     last_key: Optional[tuple] = None
+    # Walk only: the position in ``walk`` of the value being read (from the first page's
+    # last row on), and whether the next page is its first.
+    member: Optional[int] = None
+    member_start = False
     page_index = 0
     while True:
         # Poll the cooperative stop before fetching each page so a Stop interrupts
@@ -1162,11 +1191,15 @@ def keyset_stream(
             governor.throttle(should_cancel)
             if should_cancel is not None and should_cancel():
                 raise ExportCancelled(table.name)
+        cursor = last_key
         if last_key is None:
             statement = text(first_page_sql)
             params: dict[str, object] = {"batch_size": batch_size, **range_params}
+        elif member_start:
+            statement = text(_next_page_sql(f"{lead_sql} = :{lead_name}"))
+            params = {lead_name: walk[member], "batch_size": batch_size, **range_params}
         else:
-            after_sql, params = dialect.keyset_after_sql(table, last_key)
+            after_sql, params = dialect.keyset_after_sql(table, last_key, members)
             statement = text(_next_page_sql(after_sql))
             params.update({"batch_size": batch_size, **range_params})
 
@@ -1179,6 +1212,28 @@ def keyset_stream(
         for row in result.mappings():  # type: ignore[attr-defined]
             page_count += 1
             key = _key_of(row)
+            if key == cursor:
+                # A cursor's own row never sorts after it: the source compares the key
+                # differently from the cursor (ENUM members equal under the column's
+                # collation), so this page re-reads rows -- a full one that ends here
+                # would be read again forever -- and may pass others by. Stop instead.
+                raise ExportError(
+                    f"table '{table.name}': a page of its keyset read returned the row the "
+                    "page was read after, so the read would read rows again and could miss "
+                    "others: the source compares the key differently from the read's cursor "
+                    "(for example ENUM members equal under the column's collation). Make the "
+                    "key's values distinct as the source compares them, then retry this table."
+                )
+            if member is not None and key[0] != walk[member]:
+                # The source matched another value's rows for this one: two of its values
+                # compare equal there (ENUM members equal under the column's collation).
+                raise _walk_stopped(
+                    pk_columns[0],
+                    "has members the source compares as equal (for example two that differ "
+                    "only in letter case or accents under the column's collation), and the "
+                    "rows read for one of them hold another",
+                    "Make the members distinct on the source, then retry this table.",
+                )
             if first_key is None:
                 first_key = key
             last_key = key
@@ -1203,8 +1258,30 @@ def keyset_stream(
                 table.name, page_index, pk_repr, lo, hi, page_count,
             )
 
-        if page_count < batch_size:
-            return
+        exhausted = page_count < batch_size
+        if walk is None:
+            if exhausted:
+                return
+            continue
+        if member is None:
+            # The first page: it read the table up to the value its last row holds.
+            if exhausted:
+                return
+            if last_key[0] not in walk:
+                raise _walk_stopped(
+                    pk_columns[0],
+                    "holds a value that is not one of the members the source lists for it",
+                    "Retry this table; if it stops again, check the column's definition "
+                    "and character set on the source.",
+                )
+            member = walk.index(last_key[0])
+        if exhausted or len(pk_columns) == 1:
+            member += 1
+            if member == len(walk):
+                return
+            member_start = True
+        else:
+            member_start = False
 
 
 # ---------------------------------------------------------------------------

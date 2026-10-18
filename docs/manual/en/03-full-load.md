@@ -96,14 +96,30 @@ lexicographic OR-expansion `(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR
 (MySQL 5.7 serves no row-value comparison from an index); on PostgreSQL it uses the
 row-value comparison `(k0, k1, …) > (:last_0, :last_1, …)`, an index condition on the
 primary key and on each partition's (there the OR-expansion is only a filter: every
-page would re-read the key from its start). A MySQL `ENUM` or `SET` key column is
-paged by the number MySQL sorts it by — its member index or bitmask — not by its
-label: an `ENUM` by the members declared after the cursor's (`col IN (…)`, which the
-index serves), a `SET` by its bitmask (`col + 0 > n`, which no index serves, so a key
-that starts with a `SET` column re-reads the key from its start on every page). The
-members are the ones Evaluation recorded: if the column's definition changes on the
-source, re-run Evaluation and Schema Conversion first — a key value the read cannot
-place stops the table and says so.
+page would re-read the key from its start).
+
+A MySQL `ENUM` or `SET` key column is paged in the order MySQL sorts it — by member
+index or bitmask, not by label:
+
+- A key that **starts with an `ENUM`** column is read one member at a time, in
+  declaration order: each page is `col = <member>`, or that member and the rest of
+  the key after the cursor, and the read moves on to the next member when a page
+  comes back short — only a short page on the last member ends the table. Every
+  page is an index lookup or range, even when the primary key holds every column of
+  the table.
+- A later `ENUM` key column is paged by the members declared after the cursor's
+  (`col IN (…)`), and a `SET` key column by its bitmask (`CAST(col AS UNSIGNED) > n`,
+  exact for all 64 members). No index serves the bitmask, so a key that starts with
+  a `SET` column re-reads the key from its start on every page.
+- The members are read from the source's catalog (`information_schema.COLUMNS`) when
+  each table's read starts, so a member added or reordered after Evaluation is read
+  in the right order. The target's `CHECK` still lists the members Evaluation saw:
+  re-run Evaluation and Schema Conversion after you add a member.
+- The read stops the table instead of loading it with rows missing when the members
+  cannot be read exactly (for example a member holding NUL, or one declared twice),
+  when a key value is not one of them, or when the source compares two members as
+  equal (for example under a case-insensitive collation), so that a page returns rows
+  the read has already passed.
 
 **A primary key is required.** A table with no PK cannot be keyset-paginated and
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL
