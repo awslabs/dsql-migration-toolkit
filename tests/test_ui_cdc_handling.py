@@ -1570,14 +1570,15 @@ def test_the_dlq_panel_points_at_validation_and_names_the_blind_spot() -> None:
     # The extra-row case must say a reload cannot fix it -- that is the whole distinction.
     assert "reload cannot" in body
     # It must name the PRECONDITION for both repairs. This card is only on screen while the
-    # sink streams, and in that state _full_load_ui does NOT create the DROP+recreate radio
-    # and warns that re-running Full Load collides with the live pipeline -- so prescribing
-    # "drop and reload" without "Stop CDC first" sent the operator after a button the tool
-    # deliberately withholds, with the two screens contradicting each other.
+    # sink streams, and in that state the Full Load step runs no reload at all (G129: Retry and
+    # Reload are disabled, their dialog cannot be confirmed) -- so prescribing "drop and
+    # reload" without "Stop CDC first" sent the operator after a button the tool deliberately
+    # withholds, with the two screens contradicting each other. G132: the card says so, rather
+    # than that only the drop-and-recreate option is withheld.
     assert "Stop CDC first" in body
-    assert "drop-and-recreate option is not offered" in body
-    # And it must not promise an unconditional repair: even the append-mode reload has to be
-    # confirmed past that collision warning.
+    assert "the Full Load step runs no reload" in body
+    assert "drop-and-recreate option is not offered" not in body
+    # And it must not promise an unconditional repair: a reload runs only with CDC stopped.
     assert "a reload fixes them" not in body
     # The blind spot, including that the DEFAULT mode is the one that misses it.
     assert "CHECKSUM" in body

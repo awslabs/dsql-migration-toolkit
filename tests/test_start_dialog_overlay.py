@@ -409,11 +409,18 @@ def test_cancel_or_a_backdrop_close_drops_the_forced_set_and_confirm_consumes_it
     assert ctx.state.exclusion_forced_replace == {}
 
 
-def test_under_cdc_the_dialog_forces_nothing_and_warns(monkeypatch):
+def test_under_cdc_the_dialog_forces_nothing_and_describes_no_append(monkeypatch):
+    # DELIBERATE G132 UPDATE: the dialog used to warn "Existing rows keep their values while CDC
+    # streams" -- an append beside the sink that it cannot start: no Full Load runs while CDC is
+    # live (G129), so its confirm is disabled and its notice says why, and nothing else may
+    # describe that load as happening.
     ctx = _open(monkeypatch, view=_view(), ledger=LedgerRead("absent"), cdc=True,
                 facts={PAGES: _facts(summary=SUMMARY)})
     assert ctx.state.exclusion_forced_replace == {}
-    assert "Existing rows keep their values while CDC streams" in _body(ctx.ui)
+    body = _body(ctx.ui)
+    assert "Existing rows keep their values while CDC streams" not in body
+    assert "cannot be dropped while CDC streams" not in body
+    assert "CDC is currently streaming" in body and ctx.ui.start().enabled is False
 
 
 # ---------------------------------------------------------------------------

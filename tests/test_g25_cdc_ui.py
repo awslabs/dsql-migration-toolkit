@@ -1282,14 +1282,17 @@ def test_the_foreign_key_refusal_keeps_its_fix_for_the_cdc_card(
 # --- CDC only: the dead-letter card repairs like the banner above it, never by a reload ------
 
 # The card's "Confirm the effect of these drops in Validation" body on Full load + CDC: round 3
-# changed CDC only alone, so this stays byte for byte what it was.
+# changed CDC only alone, so this stays byte for byte what it was -- except for G132's Stop CDC
+# sentence: since G129 the Full Load step runs no reload at all while the sink streams (it used
+# to say only the drop-and-recreate option was withheld).
 _DLQ_CARD_FULL_LOAD = (
     "A dead-lettered record is a row the stream did NOT apply, and it is never retried; "
     "Validation is what shows the consequence on the target. Rows MISSING on the target are a "
     "dropped insert (reload that table to backfill it); rows EXTRA on the target are a dropped "
     "delete (a reload cannot remove it — the table must be dropped and reloaded, or the row "
-    "deleted by hand). Both repairs need Stop CDC first: while the sink is streaming, Full "
-    "Load collides with it and the drop-and-recreate option is not offered at all. A dropped "
+    "deleted by hand). Both repairs need Stop CDC first: while the sink is streaming, the Full "
+    "Load step runs no reload, because a reload beside it could write back rows the sink "
+    "deletes meanwhile. A dropped "
     "UPDATE changes no row count, so the default row-count mode cannot see it: Validation "
     "therefore also compares these tables by CHECKSUM, and Cut over stays locked until each "
     "has matched in a CHECKSUM comparison that started after its last dead-lettered record. "

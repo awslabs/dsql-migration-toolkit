@@ -982,7 +982,9 @@ def build_validation_chat_system(
 
 # The buttons it names are the Full Load step's own (G26): a failed table's row draws only AI
 # Assist, so it is re-run through Retry unfinished tables (a checklist), and the per-table
-# Reload is on a quarantined table's card.
+# Reload is on a quarantined table's card. Both are disabled while CDC is live (G129) -- also
+# while a Start CDC, Stop CDC or Delete runs (G132) -- so the grounding names that route too,
+# naming the per-table 'Reload' on the quarantined-row line alone, as before.
 _FULL_LOAD_RECOVERY_CONTEXT = (
     "How this tool's Full Load works and how to recover a failed table:\n"
     "- Full Load is the tool's OWN Python bulk loader (not a Debezium snapshot): it "
@@ -993,6 +995,17 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
     "safe: use 'Retry unfinished tables' (its checklist starts with every unfinished "
     "table ticked; untick the others to re-run Full Load for just this one) -- no "
     "duplicates are created.\n"
+    "- EXCEPT while CDC is live (Full Load + CDC): while CDC streams, or a Start CDC, Stop "
+    "CDC or Delete CDC infrastructure is still in progress, the Full Load step runs no "
+    "load at all -- 'Retry unfinished tables' is disabled, and so is every reload (a "
+    "quarantined table's included). A load beside the streaming sink inserts only the rows "
+    "missing on the target, so a row the source deletes while its table is copied could reach "
+    "Aurora DSQL after CDC applied that delete, and stay there. The route is: Stop CDC "
+    "(CDC step), retry or reload, then Start CDC again -- the retry keeps the original "
+    "start point, so CDC continues from where it stopped, gapless only while the CDC "
+    "topics still retain what the sink had not applied; while a CDC operation is in "
+    "progress, wait for it to finish first. Never present a retry or a reload as "
+    "available while CDC is live.\n"
     "- A table may also fail during the SCHEMA step (creating/replacing the target "
     "table's DDL) rather than the row copy. A 'DependentObjectsStillExist ... "
     "cannot drop table ... because ... view ... depends on it ... Use DROP ... "
@@ -1004,12 +1017,12 @@ _FULL_LOAD_RECOVERY_CONTEXT = (
     "those tables.\n"
     "- A transient error like 'InternalError_: server unavailable', a timeout, or a "
     "connection reset is usually not a data problem: just retry that table with "
-    "'Retry unfinished tables'. If it persists, check target reachability / IAM token "
-    "expiry and source read headroom.\n"
+    "'Retry unfinished tables' (with CDC stopped, as above). If it persists, check target "
+    "reachability / IAM token expiry and source read headroom.\n"
     "- 'quarantined row' entries are NOT failures: the table loaded and specific "
     "rows were skipped (e.g. a value over DSQL's ~1 MiB per-value limit); that "
     "table's card has its own 'Reload' button, which re-runs Full Load for just that "
-    "table.\n"
+    "table (with CDC stopped, as above).\n"
     "- STANDING-GAP TRAP (critical before CDC): CDC carries only the changes going "
     "forward from the Full Load watermark -- it does NOT backfill history. So a table "
     "that FAILED in Full Load, or that has quarantined/dropped rows, is a STANDING gap "

@@ -68,7 +68,8 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   収束します。そうでなければ Debezium が先に選択したすべてのテーブルをスナップショットするため、再ロードの
   後、そのスナップショットの前にソースで削除された行はターゲットに残り、Validation が EXTRA の行として
   報告します。**Reload specific tables** と
-  **Retry unfinished tables** は元の開始位置を維持するため、影響を受けません。Manual の位置は新しい開始
+  **Retry unfinished tables** は元の開始位置を維持するため、この拒否は適用されません (CDC のストリーミング中は、
+  すべての Full Load と同じく Stop CDC を待ちます)。Manual の位置は新しい開始
   位置です: CDC が停止した位置とその位置の間の変更は新しいスタックでも複製されないため、以下の各対処方法が
   述べるとおり、それらのテーブルを再ロードまたは修正し、CHECKSUM で検証してください。
 - **単一リージョン — クロスリージョン移行はできません。** ツールは DSQL が

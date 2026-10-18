@@ -150,6 +150,68 @@ _CDC_LIVE_KEEPS_START_POINT = (
     "original start point, so CDC continues from where it stopped, gapless only while the CDC "
     "topics still retain what the sink had not applied (their retention period on MSK)."
 )
+# G132: the gate above also holds while this session's Start CDC, Stop CDC or Delete CDC
+# infrastructure runs (cdc_streaming_started counts each, and the CDC step then shows only that
+# job's progress), but "CDC is streaming -- Stop CDC first" is not what is happening then: the
+# operation ends by itself. So the reason is a wait for it, worded per operation (as the type
+# and table-set locks word theirs), and the action stays disabled. Keyed by
+# cdc_operation_in_flight; a Retry or a Reload (the original start point) and a run that takes
+# a new start point go on differently once it has finished.
+_CDC_OP_WAIT_RELOAD = {
+    "start": (
+        "Start CDC is in progress -- wait for it to finish (its progress is on the CDC step). "
+        "Once CDC streams, a reload needs Stop CDC first (Stop CDC, reload, then Start CDC "
+        "again): beside the live sink it could write back rows CDC deletes meanwhile."
+    ),
+    "stop": (
+        "Stop CDC is in progress -- wait for it to finish (its progress is on the CDC step), "
+        "reload, then Start CDC again."
+    ),
+    "delete": (
+        "Delete CDC infrastructure is in progress -- wait for it to finish (its progress is on "
+        "the CDC step), then reload."
+    ),
+}
+_CDC_OP_WAIT_START = {
+    "start": (
+        "Start CDC is in progress -- wait for it to finish (its progress is on the CDC step). "
+        "Once CDC streams, a new Full Load needs Stop CDC first, then Delete CDC "
+        "infrastructure and deploy it again."
+    ),
+    "stop": (
+        "Stop CDC is in progress -- wait for it to finish (its progress is on the CDC step), "
+        "then Delete CDC infrastructure and deploy it again before a new Full Load."
+    ),
+    "delete": (
+        "Delete CDC infrastructure is in progress -- wait for it to finish (its progress is on "
+        "the CDC step) before a new Full Load."
+    ),
+}
+# The confirm dialog's notice header while one runs (its body is the wait above).
+_CDC_OP_WAIT_HEADER = "Full Load waits for the CDC operation to finish"
+
+
+def cdc_load_hold(
+    migration_state, job_manager, *, keeps_watermark: bool
+) -> "Optional[tuple[str, Optional[str]]]":
+    """``(reason, operation)`` while CDC holds every Full Load (G129), else ``None``.
+
+    ``reason`` is the one line a disabled action's tooltip, a refused click's toast and the
+    screen's backstops give -- for a Retry or a Reload (``keeps_watermark``) or for a run that
+    takes a new start point. ``operation`` is this session's CDC lifecycle job still running
+    ("start", "stop" or "delete"), whose wait the reason then names (G132), or ``None`` while
+    CDC streams (Stop CDC first). Pure apart from the job reads."""
+    if not cdc_streaming_started(migration_state, job_manager):
+        return None
+    from dsql_migrator.ui.data_migration._cdc_monitoring import cdc_operation_in_flight
+
+    operation = cdc_operation_in_flight(migration_state, job_manager)
+    if operation is not None:
+        waits = _CDC_OP_WAIT_RELOAD if keeps_watermark else _CDC_OP_WAIT_START
+        return waits[operation], operation
+    return (_CDC_LIVE_RELOAD_TOOLTIP if keeps_watermark else _CDC_LIVE_START_TOOLTIP), None
+
+
 # G27 (rule E): in a CDC migration type, a run that takes a new start point (Start, Re-run Full
 # Load, Re-run all tables) gives CDC its new watermark. Under the Append / Drop & reload choice,
 # Append is then not called "recommended" and this line names Drop & reload. Append stays the
@@ -471,9 +533,10 @@ def _render_overlay_blocks(
     """The Start dialog's column-exclusion blocks (only what applies is drawn):
     the unreadable-record error with [Retry], the could-not-read-the-target warning, and --
     re-rendered with the reload choice and, in a checklist, with the ticked tables -- the
-    NULL line, the exact ALTERs and the forced tables with their reasons; then the CDC-live
-    append warnings. With no overlay (``ov`` empty) only a G17 addition can be forced, so
-    only that notice is drawn."""
+    NULL line, the exact ALTERs and the forced tables with their reasons. With no overlay
+    (``ov`` empty) only a G17 addition can be forced, so only that notice is drawn. While CDC
+    is live nothing is forced and nothing runs (G129: the dialog cannot be confirmed then), so
+    the appends a load beside the sink would make are not described either (G132)."""
     view = ov.get("view")
     outcome = ov.get("outcome")
     facts = ov.get("facts")
@@ -585,14 +648,6 @@ def _render_overlay_blocks(
     refreshable = ui.refreshable(_blocks)
     refreshable()
     on_refreshable(lambda mode: refreshable.refresh(mode))
-    warnings = dict(getattr(outcome, "appended_warnings", {}) or {}) if outcome else {}
-    if cdc_live_now and warnings:
-        render_notice(
-            ui,
-            tone="warning",
-            header="Existing rows keep their values while CDC streams",
-            body=" ".join(warnings.values()),
-        )
 
 
 def _render_full_load_step(
@@ -753,13 +808,12 @@ def _render_full_load_step(
 
     def _refuse_cdc_live(keeps_watermark: bool) -> bool:
         """At a confirm: refuse (with a toast) any Full Load while CDC is live (G129) -- CDC can
-        start while the dialog is open. A Retry or a Reload is refused too."""
-        if not cdc_streaming_started(migration_state, job_manager):
+        start while the dialog is open. A Retry or a Reload is refused too; while a CDC
+        operation runs, the toast says to wait for it (G132)."""
+        hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=keeps_watermark)
+        if hold is None:
             return False
-        ui.notify(
-            _CDC_LIVE_RELOAD_TOOLTIP if keeps_watermark else _CDC_LIVE_START_TOOLTIP,
-            type="warning", position="top", multi_line=True,
-        )
+        ui.notify(hold[0], type="warning", position="top", multi_line=True)
         return True
 
     def _open_confirm_dialog_now(
@@ -811,7 +865,11 @@ def _render_full_load_step(
 
         client = _ctx.client
         tables_with_data_now = sorted(migration_state.tables_with_data)
-        cdc_live_now = cdc_streaming_started(migration_state, job_manager)
+        # Why CDC holds this run (G129; G132: a CDC operation in progress is a wait), or None.
+        cdc_hold_now = cdc_load_hold(
+            migration_state, job_manager, keeps_watermark=keeps_watermark
+        )
+        cdc_live_now = cdc_hold_now is not None
         # Empty targets whose primary key the load will RECREATE from the applied DDL.
         # A changed key is a schema change, so appending cannot deliver it; recreating an
         # empty table destroys nothing, which is why the load does it without asking --
@@ -944,7 +1002,13 @@ def _render_full_load_step(
                                else " (on the Schema Conversion step), then retry.")
                         ),
                     )
-                if cdc_live_now:
+                if cdc_hold_now is not None and cdc_hold_now[1] is not None:
+                    # G132: a Start CDC, Stop CDC or Delete CDC infrastructure in progress is
+                    # an expected wait (it ends by itself), not "CDC is streaming".
+                    render_notice(
+                        ui, tone="info", header=_CDC_OP_WAIT_HEADER, body=cdc_hold_now[0]
+                    )
+                elif cdc_live_now:
                     render_notice(
                         ui,
                         tone="error",
@@ -1124,8 +1188,8 @@ def _render_full_load_step(
                     def _label_and_color(mode: str) -> "tuple[str, str]":
                         drop_chosen = mode == "drop"
                         if cdc_live_now:
-                            # G129: nothing runs while CDC streams (disabled; the notice
-                            # above says why) -- no "Re-run anyway" past it.
+                            # G129: nothing runs while CDC is live (disabled; the notice
+                            # above says why), so no label offers a way past it.
                             return "Confirm and start", "primary"
                         forced_now = set(forced) & checked if selectable else set(forced)
                         if forced_now:
@@ -1195,11 +1259,12 @@ def _render_full_load_step(
                     _sync_label()
                     # Guard must MATCH the radio's creation condition above
                     # (`tables_with_data_now and not cdc_live_now`). With CDC live the
-                    # radio is never created -- replace is disabled while a sink streams --
+                    # radio is never created -- nothing runs while a sink streams (G129) --
                     # so the looser `if tables_with_data_now` raised UnboundLocalError and
-                    # the whole confirm dialog failed to open. Reachable today from the
-                    # per-table Reload and "Retry unfinished tables" whenever CDC is
-                    # streaming and the probed table already holds target rows.
+                    # the whole confirm dialog failed to open. Still reachable from a stale
+                    # per-table Reload or "Retry unfinished tables" (rendered before CDC
+                    # started; both are disabled while it is live) when the probed table
+                    # already holds target rows.
                     if radio_tables and not cdc_live_now:
                         reload_choice.on_value_change(_sync_label)
             # Open on the NEXT tick, not this one. The dialog element was just
@@ -1541,18 +1606,16 @@ def _render_full_load_step(
             summary,
             full_load_latest_messages_for(migration_state.error_log, current),
         )
+        # G129: no reload while CDC streams (the sink's deletes would be written back);
+        # G132: while a CDC operation runs, the reason is the wait for it.
+        _reload_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=True)
         _render_full_load_progress(
             ui,
             current,
             rows,
             reload_table=reload_table,
             reload_confirm=_open_reload_confirm,
-            # G129: no reload while CDC streams (the sink's deletes would be written back).
-            reload_block=(
-                _CDC_LIVE_RELOAD_TOOLTIP
-                if cdc_streaming_started(migration_state, job_manager)
-                else None
-            ),
+            reload_block=_reload_hold[0] if _reload_hold is not None else None,
             lob_candidates_for=lob_candidates_for,
             exclusion_route=exclusion_route,
             exclusion_route_block=exclusion_route_block,
@@ -1845,6 +1908,7 @@ def _render_full_load_step(
             start_btn = ui.button(
                 start_label, on_click=_open_full_load_confirm, icon="play_arrow"
             ).props("color=primary")
+            _start_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=False)
             if not selected_names:
                 start_btn.disable()
                 start_btn.tooltip(
@@ -1853,14 +1917,19 @@ def _render_full_load_step(
             elif guard_reason:
                 start_btn.disable()
                 start_btn.tooltip(guard_reason)
-            elif cdc_streaming_started(migration_state, job_manager):
+            elif _start_hold is not None:
                 # CDC is live: starting/re-running Full Load would collide with the
                 # running stream, so DISABLE (grey out) the button rather than let it
                 # look clickable. The tooltip + hint name the way on (Stop CDC, then new
-                # CDC topics -- G25), so it is a clear "not now", not a dead end.
+                # CDC topics -- G25), so it is a clear "not now", not a dead end. G132:
+                # while a Start CDC, Stop CDC or Delete runs, they say to wait for it (info:
+                # an expected wait).
                 start_btn.disable()
-                start_btn.tooltip(_CDC_LIVE_START_TOOLTIP)
-                inline_hint(ui, _CDC_LIVE_START_HINT, tone="warning")
+                start_btn.tooltip(_start_hold[0])
+                if _start_hold[1] is None:
+                    inline_hint(ui, _CDC_LIVE_START_HINT, tone="warning")
+                else:
+                    inline_hint(ui, _start_hold[0], tone="info")
             elif _start_point_block is not None:
                 # G25: a new start point on a cdc-stack that has streamed (or not read yet).
                 # An info notice: the stack's state is normal, the route is the operator's.
@@ -1971,6 +2040,10 @@ def _render_full_load_step(
                     "(Connect step), then retry."
                 )
                 _rerun_gated = False  # G25: disabled by the new-start-point gate
+                # G129: why CDC holds a run that takes a new start point, and a Retry
+                # (G132: worded as a wait while a CDC operation runs), or None.
+                _rerun_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=False)
+                _retry_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=True)
                 with ui.row().classes("items-center gap-2 w-full"):
                     rerun_btn = ui.button(
                         "Re-run all tables",
@@ -1994,16 +2067,16 @@ def _render_full_load_step(
                         # is live, Stop CDC comes first, as on the Start button.
                         rerun_btn.disable()
                         rerun_btn.tooltip(
-                            _CDC_LIVE_START_TOOLTIP
-                            if cdc_streaming_started(migration_state, job_manager)
+                            _rerun_hold[0] if _rerun_hold is not None
                             else _start_point_block[2]
                         )
                         _rerun_gated = True
-                    elif cdc_streaming_started(migration_state, job_manager):
+                    elif _rerun_hold is not None:
                         # G129: a Start in flight on a stack that has not streamed yet passes
-                        # the gate above; Stop CDC still comes first, as on the Start button.
+                        # the gate above; the CDC hold still comes first, as on the Start
+                        # button.
                         rerun_btn.disable()
-                        rerun_btn.tooltip(_CDC_LIVE_START_TOOLTIP)
+                        rerun_btn.tooltip(_rerun_hold[0])
                     else:
                         rerun_btn.tooltip(
                             "Re-runs ALL selected tables from a fresh snapshot (new "
@@ -2086,15 +2159,15 @@ def _render_full_load_step(
                     # Full load + CDC tables a guarded Retry cannot add (G17): only Re-run
                     # all tables (a fresh start point) loads them.
                     _only_added = bool(_added) and set(failed) <= set(_added)
-                    _cdc_live = cdc_streaming_started(migration_state, job_manager)
                     if connections_missing:
                         retry_btn.disable()
                         retry_btn.tooltip(reconnect_tip)
-                    elif _cdc_live:
+                    elif _retry_hold is not None:
                         # G129: a retry while the sink streams would write back the rows it
-                        # deletes during the copy; the hint below the row names the route.
+                        # deletes during the copy; the hint below the row names the route
+                        # (G132: or the wait for the CDC operation in progress).
                         retry_btn.disable()
-                        retry_btn.tooltip(_CDC_LIVE_RELOAD_TOOLTIP)
+                        retry_btn.tooltip(_retry_hold[0])
                     elif _not_addable and set(failed) <= set(_not_addable):
                         retry_btn.disable()
                         retry_btn.tooltip(cdc_not_addable_refusal(_not_addable))
@@ -2119,8 +2192,11 @@ def _render_full_load_step(
                             "succeeded table(s) are kept as-is (no re-load, no new "
                             "snapshot)."
                         )
-                if _cdc_live:
+                if _retry_hold is not None and _retry_hold[1] is None:
                     inline_hint(ui, _CDC_LIVE_RETRY_HINT, tone="warning")
+                elif _retry_hold is not None:
+                    # G132: a Start CDC, Stop CDC or Delete in progress: an expected wait.
+                    inline_hint(ui, _retry_hold[0], tone="info")
                 if _rerun_gated:
                     render_notice(
                         ui, tone="info", header=_start_point_block[0],
@@ -2186,6 +2262,9 @@ def _render_full_load_step(
                             keeps_watermark=True,  # retry_tables, original watermark
                         )
 
+                    _reload_hold = cdc_load_hold(
+                        migration_state, job_manager, keeps_watermark=True
+                    )
                     with ui.row().classes("items-center gap-2 w-full"):
                         _reload_btn = ui.button(
                             "Reload specific tables…",
@@ -2202,11 +2281,12 @@ def _render_full_load_step(
                         elif guard_reason:
                             _reload_btn.disable()
                             _reload_btn.tooltip(guard_reason)
-                        elif cdc_streaming_started(migration_state, job_manager):
+                        elif _reload_hold is not None:
                             # Same rule as Retry (G129): a reload under a live sink writes
-                            # back the rows the sink deletes while the table is copied.
+                            # back the rows the sink deletes while the table is copied (G132:
+                            # while a CDC operation runs, the wait for it).
                             _reload_btn.disable()
-                            _reload_btn.tooltip(_CDC_LIVE_RELOAD_TOOLTIP)
+                            _reload_btn.tooltip(_reload_hold[0])
                         else:
                             _reload_btn.tooltip(
                                 "Re-load only the tables you pick (e.g. after "

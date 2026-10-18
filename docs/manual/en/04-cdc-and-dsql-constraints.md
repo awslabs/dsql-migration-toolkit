@@ -715,8 +715,11 @@ Two consequences worth planning around:
   gap accounting belongs to Validation, not to the delete path.
 
 The practical guidance is unchanged: fix the oversized source value and **Reload**
-that table before cutting over, or exclude the oversized LOB column at capture
-(§4.5) so it never enters the pipeline.
+that table with CDC stopped (Stop CDC, Reload, then Start CDC again: the Full Load step
+runs no reload while CDC streams,
+[Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)) before cutting
+over, or exclude the oversized LOB column at capture (§4.5) so it never enters the
+pipeline.
 
 ---
 

@@ -452,8 +452,11 @@ such a table by another route, the table fails with "needs Drop & reload: ..." i
 Exceptions:
 
 - an unreadable target leaves the table undecided, with a warning; it is never forced;
-- while CDC streams, nothing is forced, and the table is appended with a WARNING;
 - a resume or a retry under the same set is never forced.
+
+While CDC streams, no Full Load runs at all
+([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)): the dialog cannot
+be confirmed, so it forces nothing.
 
 ### Start CDC applies the same overlay
 

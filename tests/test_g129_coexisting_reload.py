@@ -291,7 +291,9 @@ def test_a_header_run_during_a_start_in_flight_is_refused(monkeypatch, engine) -
     runs = _record_new_start_point_runs(monkeypatch)
     s.header_run()
     assert runs == [] and s.built == [] and s.jobs.submitted == []
-    assert _toasts(s.ui) == [fl._CDC_LIVE_START_TOOLTIP]
+    # DELIBERATE G132 UPDATE: the refusal says to wait for the Start, not "CDC is streaming --
+    # Stop CDC first" (tests/test_g132_cdc_operation_waits.py).
+    assert _toasts(s.ui) == [fl._CDC_OP_WAIT_START["start"]]
 
 
 # ---------------------------------------------------------------------------

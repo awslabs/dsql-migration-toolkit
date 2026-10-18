@@ -227,10 +227,16 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
   행입니다. 같은 이유로 Start CDC가 아직 진행 중인 동안에는 페이지 헤더의 **Run**도 아무것도 시작하지 않고,
   Full Load가 실행되는 동안에는 Start CDC가 기다립니다
   ([§4.3](04-cdc-and-dsql-constraints.md#43-무손실-full-load--cdc-핸드오프)).
+  **Start CDC**, **Stop CDC** 또는 **Delete CDC infrastructure**가 아직 진행 중인 동안에도 이 작업들은
+  비활성화된 채로 있고 페이지 헤더의 **Run**은 아무것도 시작하지 않지만, 이때 알려 주는 이유는 먼저
+  Stop CDC를 하라는 것이 아니라 그 작업이 끝나기를 기다리라는 것입니다(CDC 단계에 진행 상황이 표시됨).
+  Stop이나 Delete가 끝나면 Retry나 Reload가 실행되고, Start로 CDC가 스트리밍을 시작하면 다시 Stop CDC가
+  먼저입니다.
 - **이 세션에서 CDC 상태를 아직 읽지 못했으면**(화면을 막 열었거나 앱을 재시작한 직후), 또는 읽을 수
   없었으면 새 시작 지점은 추측하지 않고 **기다립니다**: 알림이 그렇게 말하고 CDC 단계의
   **Re-check CDC state**를 알려 줍니다(읽기에 실패했다면 먼저 AWS 접근 권한을 고치세요).
-- **막히지 않는 것:** **Retry unfinished tables**, **Reload specific tables**, 테이블별 **Reload**,
+- **새 시작 지점으로 막히지 않는 것**(CDC가 살아 있는 동안에는 위와 같이 이들도 비활성화됨):
+  **Retry unfinished tables**, **Reload specific tables**, 테이블별 **Reload**,
   **Change & reload**는 모두 **원래** 시작 지점을 유지하므로 CDC가 멈춘 곳에서 이어 가고 — Stop CDC 후의
   모든 재시작처럼, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안만 빈틈이 없음
   ([§4.3](04-cdc-and-dsql-constraints.md#43-무손실-full-load--cdc-핸드오프)) — 다시 적재한 테이블은
@@ -370,8 +376,9 @@ v0.1.68부터 로더는 **`ProcessPoolExecutor`**를 사용합니다 — 각 테
 - **대형 테이블** (선행 PK 컬럼이 정수인 경우 — 단일 정수 PK, 또는 `(tenant_id, id)`처럼
   선행 컬럼이 정수인 복합 PK): K개 PK range shard로 분할해 각각 별도 worker 프로세스에서
   소스의 겹치지 않는 구간을 로드. 이 reader-range 샤딩은 **기본적으로 꺼져 있으며**
-  (`full_load_reader_shards=1`), `FULL_LOAD_READER_SHARDS` > 1로 켭니다. 또한 모든 shard가
-  하나의 공유 스냅샷을 읽는 경우 — PostgreSQL 소스 — 에서만 동작합니다. MySQL 테이블은 항상
+  (`full_load_reader_shards=1`), `FULL_LOAD_READER_SHARDS` > 1로 켭니다. 또한 이 멀티프로세스
+  경로(`TABLE_PARALLELISM`이 1보다 클 때)에서 모든 shard가 하나의 공유 스냅샷을 읽는 경우 —
+  PostgreSQL 소스 — 에서만 동작합니다. MySQL 테이블은 항상
   리더 하나를 사용합니다: 그 shard들은 각자 자신의 스냅샷을 읽게 되는데, 이를 맞출 수 있는 것은
   스트리밍 중인 CDC 싱크 옆에서의 실행뿐이고, CDC가 스트리밍하는 동안에는 Full Load가 실행되지
   않습니다([§3.5](#35-워터마크--cdc로의-다리)).

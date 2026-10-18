@@ -3790,8 +3790,8 @@ def _render_cdc_schema_drift_banner(
         # banner gets its OWN line: there is no DDL to apply and no set-aside row to backfill --
         # the target has too MANY rows, and an append (upsert-only) reload cannot remove a row
         # the source no longer has, so the remedy must name Drop & reload specifically. It says
-        # Stop CDC FIRST because the Full Load step offers Drop & reload only while CDC is not
-        # live (_full_load_ui's `not cdc_live_now`). CDC only has no Full Load step at all, so
+        # Stop CDC FIRST because the Full Load step runs no reload while CDC is live (G129;
+        # nor does it offer Drop & reload then). CDC only has no Full Load step at all, so
         # its remedy is a manual delete on the target -- also with CDC stopped, which freezes
         # the target so the delete cannot race a newly replicated insert; the replay after
         # Start is idempotent (upserts and no-op deletes). Mixed with a DDL or target-side kind,
@@ -4242,17 +4242,16 @@ def _render_cdc_dlq_breakdown(
     # point only from a MySQL source), which the result names per table.
     #
     # "Stop CDC first" is part of the RECOVERY, not a footnote. This card is only on screen
-    # while the sink is streaming (that is what fills the DLQ), and in exactly that state
-    # _full_load_ui refuses the repair this text used to prescribe: the DROP+recreate radio is
-    # NOT CREATED while CDC is live (its condition is `tables_with_data_now and not
-    # cdc_live_now`), and Full Load itself renders an error notice -- "Re-running Full Load now
-    # will collide with the live pipeline ... Stop CDC first" -- leaving only a negative
-    # "Re-run anyway (CDC is live)". So the old wording sent the operator to look for a button
-    # the tool deliberately withholds: two screens of the same app contradicting each other,
-    # one saying "drop and reload that table" and the other "do not do this while CDC runs".
-    # Stating the precondition here is the fix; "a reload fixes them" is also softened to
-    # "reload that table to backfill it" because even the append-mode reload has to be
-    # confirmed past that collision warning.
+    # while the sink is streaming (that is what fills the DLQ), and in exactly that state the
+    # Full Load step runs no reload at all (G129): Retry unfinished tables, Reload specific
+    # tables and the per-table Reload are disabled, and their confirm dialog cannot be
+    # confirmed, because a load beside the sink inserts only the rows missing on the target, so
+    # a row the source deletes while its table is copied could be written back after the sink
+    # applied that delete. So the old wording ("drop and reload that table") sent the operator
+    # to look for an action the tool deliberately withholds: two screens of the same app
+    # contradicting each other. Stating the precondition here is the fix; "a reload fixes
+    # them" is also softened to "reload that table to backfill it", a repair made with CDC
+    # stopped.
     #
     # CDC only has no Full Load step at all (G25), so there the repair is the drift banner's
     # own: by hand on Aurora DSQL with CDC stopped, or Start over -- never a reload.
@@ -4271,8 +4270,8 @@ def _render_cdc_dlq_breakdown(
             "on the target are a dropped insert (reload that table to backfill it); rows "
             "EXTRA on the target are a dropped delete (a reload cannot remove it — the table "
             "must be dropped and reloaded, or the row deleted by hand). Both repairs need "
-            "Stop CDC first: while the sink is streaming, Full Load collides with it and the "
-            "drop-and-recreate option is not offered at all."
+            "Stop CDC first: while the sink is streaming, the Full Load step runs no reload, "
+            "because a reload beside it could write back rows the sink deletes meanwhile."
         )
     render_notice(
         ui,
@@ -4536,6 +4535,23 @@ def cdc_stop_in_flight(migration_state, job_manager) -> bool:
         return False
     job = _current_job(job_manager, getattr(migration_state, "cdc_deploy_job_id", None))
     return job is not None and job.status in ("PENDING", "RUNNING")
+
+
+def cdc_operation_in_flight(migration_state, job_manager) -> "Optional[str]":
+    """This session's CDC lifecycle operation still running -- ``"delete"`` (a stack the probe
+    reads as being deleted counts too), ``"stop"`` or ``"start"`` -- else ``None`` (G132).
+
+    Each makes :func:`cdc_streaming_started` True, so a gate keyed on it holds while one runs;
+    this names the operation, so the gate can say to wait for it rather than to Stop CDC
+    first. Pure apart from the job reads."""
+    if cdc_stack_being_deleted(migration_state, job_manager):
+        return "delete"
+    if cdc_stop_in_flight(migration_state, job_manager):
+        return "stop"
+    if getattr(migration_state, "cdc_action_kind", None) != "start":
+        return None
+    job = _current_job(job_manager, getattr(migration_state, "cdc_deploy_job_id", None))
+    return "start" if job is not None and job.status in ("PENDING", "RUNNING") else None
 
 
 def _stop_then(migration_state, job_manager) -> str:

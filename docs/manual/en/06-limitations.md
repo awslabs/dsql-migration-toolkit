@@ -70,8 +70,9 @@ fails **loudly** where it can't.
   still retain what the sink had not applied, and the reloaded tables converge. Otherwise
   Debezium snapshots every selected table first, and a row deleted on the source between
   the reload and that snapshot stays on the target: Validation reports it as an EXTRA row.
-  **Reload specific tables** and **Retry unfinished tables** keep the original start point
-  and are not affected. A Manual point is a new start point: the changes between where CDC
+  **Reload specific tables** and **Retry unfinished tables** keep the original start point,
+  so this refusal does not apply to them (while CDC streams they wait for Stop CDC, like
+  every Full Load). A Manual point is a new start point: the changes between where CDC
   stopped and it are not replicated, on the new stack too, so reload or correct those
   tables and validate with CHECKSUM, as each remedy below says.
 - **Single region — no cross-region migration.** The tool works in any region

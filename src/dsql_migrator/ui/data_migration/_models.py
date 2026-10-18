@@ -2550,7 +2550,8 @@ class ForcedReplaceView:
 
     ``forced``: table -> why it is dropped and reloaded (the NULL contract needs it);
     ``appended_warnings``: table -> why a table that would be forced is appended anyway
-    (CDC is streaming into it); ``undecided``: tables whose target could not be read (never
+    (CDC is streaming into it: the engine's exemption, which the UI does not reach since
+    G129); ``undecided``: tables whose target could not be read (never
     forced -- the engine then refuses them if needed); ``null_columns``: table -> the
     columns that load as NULL.
     """
@@ -2580,8 +2581,10 @@ def exclusion_forced_replace(
     (``core.overlay_ledger.append_verdict``, the engine's own check) decides whether an
     append would break the NULL contract; a table the tool recreated and did not finish
     (``recreated_unfinished``) is reloaded so its indexes are built. While CDC streams
-    nothing is forced: each such table is appended with a warning. Live computed columns
-    are omit-only and never force.
+    nothing is forced: each such table would be appended with a warning, as the engine
+    exempts a load beside a streaming sink -- a load the UI no longer runs (G129: the
+    dialog cannot be confirmed then, and it shows no such warning, G132). Live computed
+    columns are omit-only and never force.
     """
     from dsql_migrator.core.overlay_ledger import append_verdict
 

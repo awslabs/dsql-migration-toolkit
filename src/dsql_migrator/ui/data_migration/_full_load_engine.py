@@ -174,7 +174,8 @@ class DataMigrationInputs:
     # True when this run belongs to a Full Load + CDC migration (ANY source), so the
     # post-load foreign-key pass MUST be deferred to cut over. cdc_coexisting and
     # cdc_stack_name only cover two of the three CDC sub-flows -- connectors-first
-    # (MySQL SKIP_EXISTING, cdc_coexisting) and the PostgreSQL slot handoff
+    # (MySQL SKIP_EXISTING, cdc_coexisting; G129: the UI no longer runs a load beside a
+    # streaming sink, so only a bypass of that rule sets it) and the PostgreSQL slot handoff
     # (cdc_stack_name). A MySQL Full-Load-FIRST -> binlog-watermark handoff (CDC started
     # AFTER the load, the "Automatic" start point) has NEITHER set at load end, so
     # without this flag the FK pass would run at load end and the later out-of-order sink
@@ -4287,12 +4288,15 @@ def new_start_point_block(migration_state, engine) -> "Optional[tuple[str, str, 
             route = pg_cdc_route(None, started=True, cdc_only=False)
         else:
             route = _MYSQL_NEW_TOPICS_ROUTE
+        # G132: "not affected" sat under the step's own "CDC is live, so Retry unfinished
+        # tables is disabled" hint while CDC streamed: they need no new topics, but they wait
+        # for Stop CDC like every Full Load (G129).
         body = (
             "Start Full Load and Re-run all tables take a new start point, and this "
             "migration's CDC stack has streamed, or rolled back a Start. "
             f"{_NEW_START_POINT_WHY} {route[:1].upper()}{route[1:]}. Retry unfinished tables "
-            "and Reload specific tables keep the original start point, so they are not "
-            "affected."
+            "and Reload specific tables keep the original start point, so they need no new "
+            "CDC topics; while CDC streams they wait for Stop CDC, like every Full Load."
         )
         return NEW_START_POINT_HEADER, body, _NEW_START_POINT_LINE
     if not getattr(migration_state, "cdc_stack_phase_checked", False):
@@ -7183,7 +7187,8 @@ class BatchedTableMigrator:
           * ``cdc_coexisting`` -- MySQL's connectors-first model, where connectors stream
             DURING the load (SKIP_EXISTING). CDC is already live, so this is True mid-load.
             It is False for a MySQL Full-Load-FIRST -> binlog-watermark handoff (CDC started
-            after the load), which is the common flow.
+            after the load), which is the flow the UI runs (G129: no Full Load runs while CDC
+            streams, so only a bypass of that rule sets this).
           * ``cdc_stack_name`` -- PostgreSQL's Full-Load-FIRST gapless handoff. Set only for
             a PostgreSQL Full Load + CDC run (None for a load-only run and always for
             MySQL). Without ``is_cdc_migration``, a MySQL Full-Load-first->CDC run had

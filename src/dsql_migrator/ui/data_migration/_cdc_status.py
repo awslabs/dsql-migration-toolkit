@@ -2375,14 +2375,15 @@ def cdc_error_log_key(migration_state) -> str:
     lines, and the download all agree on one key whether or not a Full Load ran.
     """
     # PINNED for the life of the migration state. ``migration_state.job_id`` is REPLACED
-    # by a Full Load retry ("Retry unfinished tables" / per-table "Reload", both of which
-    # are supported while CDC streams), so returning it live re-keyed every CDC surface
-    # mid-stream: the DLQ card fell to a grey "0 quarantined / No records quarantined",
-    # its download and Ask-AI-DBA buttons disappeared, the per-table consistency badges
-    # flipped to "consistent", and the drift banner cleared -- for records that were still
-    # there, under the previous job id. Pinning the FIRST key the session resolves keeps
-    # the fold, depth, record list, activity lines and download on one key for the whole
-    # run. Start over builds fresh state, so the pin does not outlive a migration.
+    # by a Full Load retry ("Retry unfinished tables" / per-table "Reload"; G129: run with
+    # CDC stopped, between a Stop CDC and the next Start CDC), so returning it live re-keyed
+    # every CDC surface of the migration: the DLQ card fell to a grey "0 quarantined / No
+    # records quarantined", its download and Ask-AI-DBA buttons disappeared, the per-table
+    # consistency badges flipped to "consistent", and the drift banner cleared -- for
+    # records that were still there, under the previous job id. Pinning the FIRST key the
+    # session resolves keeps the fold, depth, record list, activity lines and download on
+    # one key for the whole run. Start over builds fresh state, so the pin does not outlive
+    # a migration.
     pinned = getattr(migration_state, "cdc_log_key", None)
     if pinned:
         return pinned

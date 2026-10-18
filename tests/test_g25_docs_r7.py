@@ -348,17 +348,22 @@ def test_a_later_cdc_start_after_full_load_only_is_scoped_to_the_stack_it_meets(
 
 # -- chapter 6's lead: a Manual point is a new start point ---------------------------------
 
+# G132 moved this pin with the text: "not affected" read as "available whatever CDC does", but
+# while CDC streams they wait for Stop CDC like every Full Load (G129).
 _MANUAL_IS_NEW = {
     "en": "**Reload specific tables** and **Retry unfinished tables** keep the original start "
-    "point and are not affected. A Manual point is a new start point: the changes between "
+    "point, so this refusal does not apply to them (while CDC streams they wait for Stop CDC, "
+    "like every Full Load). A Manual point is a new start point: the changes between "
     "where CDC stopped and it are not replicated, on the new stack too, so reload or correct "
     "those tables and validate with CHECKSUM, as each remedy below says.",
-    "ko": "**Reload specific tables**와 **Retry unfinished tables**는 원래 시작 지점을 유지하므로 영향을 "
-    "받지 않습니다. Manual 지점은 새 시작 지점입니다: CDC가 멈춘 곳과 그 지점 사이의 변경은 새 스택에서도 "
+    "ko": "**Reload specific tables**와 **Retry unfinished tables**는 원래 시작 지점을 유지하므로 이 "
+    "거부는 적용되지 않습니다(CDC가 스트리밍하는 동안에는 모든 Full Load처럼 Stop CDC를 기다립니다). "
+    "Manual 지점은 새 시작 지점입니다: CDC가 멈춘 곳과 그 지점 사이의 변경은 새 스택에서도 "
     "복제되지 않으므로, 아래 각 해결 방법이 말하는 대로 그 테이블을 다시 적재하거나 바로잡고 CHECKSUM으로 "
     "검증하세요.",
-    "ja": "**Reload specific tables** と **Retry unfinished tables** は元の開始位置を維持するため、影響を"
-    "受けません。Manual の位置は新しい開始位置です: CDC が停止した位置とその位置の間の変更は新しい"
+    "ja": "**Reload specific tables** と **Retry unfinished tables** は元の開始位置を維持するため、この"
+    "拒否は適用されません (CDC のストリーミング中は、すべての Full Load と同じく Stop CDC を待ちます)。"
+    "Manual の位置は新しい開始位置です: CDC が停止した位置とその位置の間の変更は新しい"
     "スタックでも複製されないため、以下の各対処方法が述べるとおり、それらのテーブルを再ロードまたは"
     "修正し、CHECKSUM で検証してください。",
 }

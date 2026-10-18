@@ -143,19 +143,24 @@ _GATE = {
     # G25 round 7 moved this pin with the text: a restart after Stop CDC is gapless only while
     # the CDC topics retain the sink's unapplied changes (rule D), and switching to Full load
     # only or CDC only is no way around the gate (Start CDC's own refusal, test_g25_docs_r7).
+    # G132 moved it again: they are not gated by the NEW START POINT, but while CDC is live they
+    # are disabled like every Full Load (G129), as the entry above says -- a bare "Not gated:"
+    # right under that entry contradicted it.
     "not-gated": {
-        "en": "**Not gated:** **Retry unfinished tables**, **Reload specific tables**, a "
-        "per-table **Reload** and **Change & reload** all keep the **original** start point, so "
-        "CDC continues from where it stopped — like any restart after Stop CDC, gapless only "
-        "while the CDC topics still retain the changes the sink had not applied",
-        "ko": "**막히지 않는 것:** **Retry unfinished tables**, **Reload specific tables**, 테이블별 "
-        "**Reload**, **Change & reload**는 모두 **원래** 시작 지점을 유지하므로 CDC가 멈춘 곳에서 이어 "
-        "가고 — Stop CDC 후의 모든 재시작처럼, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안만 "
-        "빈틈이 없음",
-        "ja": "**制限されないもの:** **Retry unfinished tables**、**Reload specific tables**、テーブル"
-        "ごとの **Reload**、**Change & reload** はいずれも **元の** 開始位置を維持するため、CDC は止まった"
-        "ところから続き — Stop CDC 後のあらゆる再起動と同じく、sink が適用していなかった変更を CDC "
-        "トピックがまだ保持している間だけギャップがありません",
+        "en": "**Not gated by the new start point** (while CDC is live they are disabled too, as "
+        "above): **Retry unfinished tables**, **Reload specific tables**, a per-table **Reload** "
+        "and **Change & reload** all keep the **original** start point, so CDC continues from "
+        "where it stopped — like any restart after Stop CDC, gapless only while the CDC topics "
+        "still retain the changes the sink had not applied",
+        "ko": "**새 시작 지점으로 막히지 않는 것**(CDC가 살아 있는 동안에는 위와 같이 이들도 비활성화됨): "
+        "**Retry unfinished tables**, **Reload specific tables**, 테이블별 **Reload**, **Change & "
+        "reload**는 모두 **원래** 시작 지점을 유지하므로 CDC가 멈춘 곳에서 이어 가고 — Stop CDC 후의 모든 "
+        "재시작처럼, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안만 빈틈이 없음",
+        "ja": "**新しい開始位置では制限されないもの** (CDC が動いている間は、上のとおりこれらも無効になり"
+        "ます): **Retry unfinished tables**、**Reload specific tables**、テーブルごとの **Reload**、"
+        "**Change & reload** はいずれも **元の** 開始位置を維持するため、CDC は止まったところから続き — "
+        "Stop CDC 後のあらゆる再起動と同じく、sink が適用していなかった変更を CDC トピックがまだ保持して"
+        "いる間だけギャップがありません",
     },
     "no-detour": {
         "en": "and the reloaded tables converge. The Full Load step does not gate a **Full load "

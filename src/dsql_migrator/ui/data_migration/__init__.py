@@ -818,9 +818,11 @@ def build_data_migration_screen(
         # streamed yet passes the gate above, and the page header's Run has no disabled
         # button). It would insert only the rows missing on the target, so a row the source
         # deletes during the copy -- deleted by the sink before the copy wrote it -- would be
-        # written back.
-        if cdc_streaming_started(migration_state, job_manager):
-            ui.notify(_CDC_LIVE_START_TOOLTIP, type="warning", position="top", multi_line=True)
+        # written back. G132: while a Start CDC, Stop CDC or Delete runs, the toast says to
+        # wait for it.
+        _cdc_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=False)
+        if _cdc_hold is not None:
+            ui.notify(_cdc_hold[0], type="warning", position="top", multi_line=True)
             return
         if not session.has_source():
             migration_state.set_error(
@@ -2054,12 +2056,11 @@ def build_data_migration_screen(
                 # this also covers a stale button and the exclusion popup's Change & reload. A
                 # load beside the sink inserts only the rows missing on the target, so a row the
                 # source deletes during the copy, deleted by the sink before the copy wrote it,
-                # would be written back. Stop CDC first, reload, then Start CDC again.
-                if cdc_streaming_started(migration_state, job_manager):
-                    ui.notify(
-                        _CDC_LIVE_RELOAD_TOOLTIP, type="warning", position="top",
-                        multi_line=True,
-                    )
+                # would be written back. Stop CDC first, reload, then Start CDC again (G132:
+                # while a Start CDC, Stop CDC or Delete runs, wait for it to finish).
+                _cdc_hold = cdc_load_hold(migration_state, job_manager, keeps_watermark=True)
+                if _cdc_hold is not None:
+                    ui.notify(_cdc_hold[0], type="warning", position="top", multi_line=True)
                     return
                 current = _current_job(job_manager, migration_state.job_id)
                 if current is None:
@@ -3542,9 +3543,15 @@ def full_load_error_migration_context(
         ),
     ]
     if "cdc" in str(mt_value):
+        # G129 / G132: ``cdc_live`` is cdc_streaming_started -- streaming, or a Start CDC,
+        # Stop CDC or Delete CDC infrastructure in progress -- and the Full Load step then
+        # runs no load at all, a Retry or a Reload included.
         lines.append(
-            "CDC is currently streaming (a re-run of Full Load can collide with "
-            "the live sink)."
+            "CDC is currently streaming (or a Start CDC, Stop CDC or Delete CDC "
+            "infrastructure is in progress), so the Full Load step runs no load now: Retry "
+            "unfinished tables is disabled, and so is every reload, because a load beside the "
+            "live sink could write back rows CDC deletes meanwhile. The way on is Stop CDC (or "
+            "wait for that operation to finish), then retry or reload, then Start CDC again."
             if cdc_live
             else "CDC has not started streaming yet."
         )
@@ -6496,11 +6503,10 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
 # since _full_load_ui imports cdc_streaming_started from _cdc_ui -- so dm.<name> and every
 # consumer/test import resolve unchanged; content()'s calls resolve as module globals.
 from dsql_migrator.ui.data_migration._full_load_ui import (  # noqa: E402,F401
+    cdc_load_hold,
     full_load_step_for_scope,
     submit_scope_identity_sync,
     _view_tables,
-    _CDC_LIVE_RELOAD_TOOLTIP,
-    _CDC_LIVE_START_TOOLTIP,
     _LOAD_STATE_COLORS,
     _LOAD_STATE_LABELS,
     _QUARANTINE_PK_CHIP_LIMIT,

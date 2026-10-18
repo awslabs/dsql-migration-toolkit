@@ -274,13 +274,19 @@ replication slot again at its own snapshot point), then **Start CDC**.
   delete and stay there, an extra row that only a COUNT or CHECKSUM validation shows. For the
   same reason the page header's **Run** starts nothing while a Start CDC is still in flight,
   and Start CDC waits while a Full Load runs
-  ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)).
+  ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)). While a
+  **Start CDC**, **Stop CDC** or **Delete CDC infrastructure** is still in progress, these
+  actions stay disabled and the page header's **Run** starts nothing, but the reason they give
+  is to wait for it to finish (the CDC step shows its progress), not to Stop CDC first. Once a
+  Stop or a Delete has finished, a Retry or a Reload runs; once a Start has CDC streaming,
+  Stop CDC comes first again.
 - **Until the CDC state has been read** in this session — just after the screen opens, or
   after an app restart — or when it could not be read, a new start point **waits** rather
   than guessing: the notice says so and points at **Re-check CDC state** on the CDC step
   (fix the AWS access first if the read failed).
-- **Not gated:** **Retry unfinished tables**, **Reload specific tables**, a per-table
-  **Reload** and **Change & reload** all keep the **original** start point, so CDC continues
+- **Not gated by the new start point** (while CDC is live they are disabled too, as above):
+  **Retry unfinished tables**, **Reload specific tables**, a per-table **Reload** and
+  **Change & reload** all keep the **original** start point, so CDC continues
   from where it stopped — like any restart after Stop CDC, gapless only while the CDC topics
   still retain the changes the sink had not applied
   ([§4.3](04-cdc-and-dsql-constraints.md#43-the-gapless-full-load--cdc-handoff)) — and the
@@ -449,8 +455,9 @@ table shard) loads in its own OS process with its own GIL and its own CPU core.
   composite PK with an integer leading column such as `(tenant_id, id)`): split into K
   PK-range shards, each loaded by its own worker process from a disjoint slice of
   the source. This reader-range sharding is **off by default** (`full_load_reader_shards=1`);
-  enable it with `FULL_LOAD_READER_SHARDS` > 1, and it only engages where every shard reads
-  one shared snapshot — a PostgreSQL source. A MySQL table always uses one reader: its shards
+  enable it with `FULL_LOAD_READER_SHARDS` > 1, and it only engages on this multi-process
+  path (`TABLE_PARALLELISM` above 1) where every shard reads one shared snapshot — a
+  PostgreSQL source. A MySQL table always uses one reader: its shards
   would each read their own snapshot, which only a run beside a streaming CDC sink could
   reconcile, and no Full Load runs while CDC streams
   ([§3.5](#35-the-watermark--the-bridge-to-cdc)).
