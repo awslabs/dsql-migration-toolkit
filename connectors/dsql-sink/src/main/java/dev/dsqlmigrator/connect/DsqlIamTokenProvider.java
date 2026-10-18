@@ -81,4 +81,13 @@ public class DsqlIamTokenProvider {
     this.refreshAt = now.plus(TOKEN_TTL).minus(REFRESH_MARGIN);
     return token;
   }
+
+  /**
+   * Drop the cached token, so the next {@link #currentToken} signs a new one: a connect that
+   * failed may have failed on it (temporary credentials can expire before the token's cache
+   * window ends).
+   */
+  public synchronized void invalidate() {
+    this.cachedToken = null;
+  }
 }

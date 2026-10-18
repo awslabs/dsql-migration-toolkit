@@ -1211,6 +1211,18 @@ def test_both_source_connectors_emit_source_truncates_parsed(cdc_template: dict)
         assert isinstance(value, str) and value == "none", (name, value)
 
 
+def test_mysql_source_connector_keeps_a_year_0_to_99_as_it_is(cdc_template: dict) -> None:
+    # G126: Debezium's `enable.time.adjuster` defaults to true, and debezium-connector-binlog
+    # 2.7.4 (BinlogValueConverters.adjustTemporal) then reads a DATETIME / DATE year 0-69 as
+    # 2000-2069 and 70-99 as 1970-1999 -- a 2-digit year MySQL already resolved when the row
+    # was written. A .NET DateTime.MinValue (0001-01-01) streamed as 2001-01-01 while Full Load
+    # wrote it as it is. MySQL only: the PostgreSQL connector has no such key.
+    cfg = cdc_template["Resources"]["DebeziumSourceConnector"]["Properties"][
+        "ConnectorConfiguration"
+    ]
+    assert cfg["enable.time.adjuster"] == "false"  # a string, as every connector value
+
+
 def test_cdc_stack_alarms_on_connector_errored_tasks(cdc_template: dict) -> None:
     # Each connector gets a CloudWatch alarm on AWS/KafkaConnect ErroredTaskCount
     # (dimension ConnectorName) so a FAILED task is surfaced automatically. The alarm
@@ -2801,6 +2813,10 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # One marker per behaviour the ZIP must carry. Each is a literal this repo's Java source
     # owns, so it can only be present if that source was compiled into the committed ZIP.
     markers = {
+        # v54 (G126, rebuilt in place): a failure to OPEN the connection (the IAM token refused,
+        # too many connections, the connection rate) is transient instead of a poison row that
+        # dead-lettered every record while it lasted.
+        "refused connect is transient": b"Could not open a connection to Aurora DSQL",
         # v54: a PostgreSQL infinity / -infinity date or timestamp is mapped, and any
         # RuntimeException a value's conversion throws is a DataException naming the column
         # (dead-letters one record instead of killing the task).
@@ -2912,12 +2928,36 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
         "whole decimal key bound as a long": (
             "dev/dsqlmigrator/connect/DsqlSinkTask.class", b"longValueExact"
         ),
+        # v54 (G126, rebuilt in place): a JSON value (any PGobject) counts its text against the
+        # 8 MiB chunk budget -- as a 16-byte scalar, a fetch of large documents became one
+        # statement past Aurora DSQL's 10 MiB message limit, redelivered forever.
+        "json sized by its text": ("dev/dsqlmigrator/connect/DsqlSinkTask.class", b"utf8Bytes"),
+        # ...and a timestamp is bound as a java.time value, which pgjdbc renders in the
+        # proleptic calendar (utcDateTime).
+        "timestamp as java.time": (
+            "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"utcDateTime"
+        ),
     }
-    missing = [name for name, marker in markers.items() if marker not in blob] + [
-        name
-        for name, (entry, marker) in class_markers.items()
-        if marker not in classes.get(entry, b"")
-    ]
+    # What the ZIP must no longer carry: pgjdbc renders a java.sql.Timestamp in the Julian
+    # calendar before 1582-10-15, so binding one wrote every earlier timestamp days off.
+    class_absent = {
+        "pre-1582 timestamp shift": (
+            "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"java/sql/Timestamp"
+        ),
+    }
+    missing = (
+        [name for name, marker in markers.items() if marker not in blob]
+        + [
+            name
+            for name, (entry, marker) in class_markers.items()
+            if marker not in classes.get(entry, b"")
+        ]
+        + [
+            name
+            for name, (entry, marker) in class_absent.items()
+            if entry not in classes or marker in classes[entry]
+        ]
+    )
     assert not missing, (
         "connectors/plugins/dsql-sink-plugin.zip is STALE for: "
         + ", ".join(missing)

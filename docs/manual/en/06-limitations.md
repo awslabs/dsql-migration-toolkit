@@ -525,6 +525,17 @@ fails **loudly** where it can't.
   (Aurora DSQL's default `numeric(18,6)`, warned in Schema Conversion) still rounds a
   PostgreSQL unconstrained `numeric` to 6 decimal places, by design. Not checked:
   `FLOAT`/`DOUBLE` values in a `numeric` column.
+- **Dates and times before 1582-10-15, and MySQL years 0–99, on CDC infrastructure
+  deployed by an earlier version.** Full Load stores a `DATETIME`, `timestamp` or
+  `timestamptz` as it is, including MySQL's documented minimum `1000-01-01` and the
+  `0001-01-01` that .NET's `DateTime.MinValue` and Go's zero `time.Time` write; so does
+  CDC from sink plugin v54. An earlier sink wrote a value before 1582-10-15 days off, in
+  the Julian calendar (`1000-01-01` as `0999-12-27`, `0001-01-01` as `0001-01-03`), and an
+  earlier MySQL source read a year 0–99 of a `DATETIME` or `DATE` as 2000–2069 or
+  1970–1999 (`0001-01-01` as `2001-01-01`). Nothing was dead-lettered and ROW_COUNT still
+  matches, so only a CHECKSUM shows it; on a key column the update inserted a second row
+  and the delete matched nothing. **Delete CDC infrastructure**, deploy it again, then
+  reload such tables (Drop & reload) and validate with CHECKSUM.
 - **PostgreSQL 17/18 sources — three version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is

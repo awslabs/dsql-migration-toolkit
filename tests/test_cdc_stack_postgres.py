@@ -155,6 +155,7 @@ def test_postgres_source_connector_omits_mysql_only_keys() -> None:
         "schema.history.internal.kafka.topic",
         "schema.history.internal.kafka.bootstrap.servers",
         "bigint.unsigned.handling.mode",
+        "enable.time.adjuster",
     ):
         assert bad not in cfg, ("MySQL-only key leaked into PG connector", bad)
 

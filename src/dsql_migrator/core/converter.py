@@ -2214,11 +2214,15 @@ def map_mysql_type(mysql_type: str) -> tuple[str, Optional[ConversionWarning]]:
 # (None = a plain primitive), which the sink uses to drive its conversion.
 DSQL_WRITE_CONTRACT_CASES: tuple[tuple[str, str, Optional[str], str], ...] = (
     ("DATETIME", "timestamp", "io.debezium.time.Timestamp",
-     "naive wall-clock; bulk loader attaches UTC, sink converts Long ms -> timestamp"),
+     "naive wall-clock; bulk loader writes the UTC datetime, sink converts Long ms -> "
+     "java.time.LocalDateTime (proleptic calendar, so a value before 1582-10-15 lands as it "
+     "is; a java.sql.Timestamp was sent in the Julian calendar)"),
     ("DATETIME(6)", "timestamp", "io.debezium.time.MicroTimestamp",
-     "microsecond precision; sink converts Long micros -> timestamp (was the H5 DLQ bug)"),
+     "microsecond precision; sink converts Long micros -> java.time.LocalDateTime (was the "
+     "H5 DLQ bug)"),
     ("TIMESTAMP", "timestamptz", "io.debezium.time.ZonedTimestamp",
-     "tz-aware; bulk loader -> UTC, sink parses ISO-8601 string -> timestamp"),
+     "tz-aware; bulk loader -> UTC, sink parses ISO-8601 string -> java.time.OffsetDateTime "
+     "at UTC"),
     ("BIGINT UNSIGNED", "decimal", "org.apache.kafka.connect.data.Decimal",
      "widened to numeric(20,0) (kind 'decimal'); needs bigint.unsigned.handling.mode=precise so Debezium sends BigDecimal not an overflowing Long"),
     ("DECIMAL(10,4)", "decimal", "org.apache.kafka.connect.data.Decimal",

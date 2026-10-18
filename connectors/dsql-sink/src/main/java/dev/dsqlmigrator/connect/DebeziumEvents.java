@@ -502,7 +502,7 @@ final class DebeziumEvents {
     for (Field field : struct.schema().fields()) {
       names.add(field.name());
       // Convert the Debezium-encoded value to its canonical DSQL-target form
-      // (e.g. MicroTimestamp Long -> java.sql.Timestamp) so it matches the Full
+      // (e.g. MicroTimestamp Long -> java.time.LocalDateTime) so it matches the Full
       // Load bulk loader's encoding before it is bound.
       values.add(convertField(field, rawFieldValue(struct, field), pgSource));
     }

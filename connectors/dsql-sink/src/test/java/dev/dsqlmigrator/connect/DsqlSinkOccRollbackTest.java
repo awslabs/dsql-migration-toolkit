@@ -503,7 +503,7 @@ class DsqlSinkOccRollbackTest {
     Dlq dlq = new Dlq();
     Task task = task(dsql, dlq);
     AtomicInteger reconnects = offline(task);
-    assertThrows(IllegalStateException.class, () -> task.put(List.of(insert("orders", 1))));
+    assertThrows(RetriableException.class, () -> task.put(List.of(insert("orders", 1))));
     assertEquals(List.of("prepare", "update!40001", "rollback!XX000", "close"), dsql.calls);
     assertEquals(1, reconnects.get()); // the retry opened a new session
     assertEquals(List.of(), dlq.states());
@@ -524,7 +524,7 @@ class DsqlSinkOccRollbackTest {
     Task task = task(dsql, dlq);
     AtomicInteger reconnects = offline(task);
     assertThrows(
-        IllegalStateException.class,
+        RetriableException.class,
         () -> task.put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3))));
     assertEquals(
         List.of("prepare", "batch!23514", "rollback",
@@ -714,7 +714,7 @@ class DsqlSinkOccRollbackTest {
     Task task = task(dsql, dlq);
     AtomicInteger reconnects = offline(task);
     assertThrows(
-        IllegalStateException.class,
+        RetriableException.class,
         () -> task.put(List.of(insert("orders", 1), insert("orders", 2), insert("orders", 3))));
     assertEquals(
         List.of("prepare", "batch!23514", "rollback!" + failure.getSQLState(), "close"),
@@ -725,7 +725,9 @@ class DsqlSinkOccRollbackTest {
 
   /**
    * Give the task a token provider whose token source counts its calls and throws, so a
-   * reconnect (connection() asks for a token before DriverManager) is observed offline.
+   * reconnect (connection() asks for a token before DriverManager) is observed offline. A
+   * connect that fails is transient (G126): the put throws a RetriableException, so Connect
+   * redelivers the batch and nothing is dead-lettered.
    */
   private static AtomicInteger offline(DsqlSinkTask task) throws Exception {
     AtomicInteger reconnects = new AtomicInteger();

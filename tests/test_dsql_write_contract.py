@@ -109,6 +109,13 @@ _GOLDEN: tuple[tuple[str, object, object], ...] = (
      datetime(2024, 1, 1, 0, 0, 0)),
     ("DATETIME(6)", datetime(2024, 1, 1, 0, 0, 0, 123),
      datetime(2024, 1, 1, 0, 0, 0, 123)),
+    # Before the Gregorian reform (1582-10-15) the value is kept as it is: Python's datetime
+    # is proleptic, so psycopg sends '1000-01-01 00:00:00' (G126: the CDC sink now sends the
+    # same text; it used to send these days off).
+    ("DATETIME", datetime(1, 1, 1), datetime(1, 1, 1)),
+    ("DATETIME", datetime(1000, 1, 1), datetime(1000, 1, 1)),
+    ("DATETIME(6)", datetime(1582, 10, 4, 23, 59, 59, 123456),
+     datetime(1582, 10, 4, 23, 59, 59, 123456)),
     # TIMESTAMP -> timestamptz: an aware value is normalized to UTC (stays tz-aware,
     # the instant is correct regardless of session TimeZone).
     ("TIMESTAMP", datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
@@ -158,6 +165,32 @@ def test_datetime6_microseconds_preserved() -> None:
     assert out == datetime(2024, 1, 1, 0, 0, 0, 123456)
     assert out.tzinfo is None
     assert out.microsecond == 123456
+
+
+def test_fixture_timestamps_are_one_text_on_both_paths() -> None:
+    # G126: each fixture timestamp case pins the TEXT both paths send for one Debezium number.
+    # Here: the number is the proleptic epoch of that text, and the bulk loader keeps the
+    # datetime (psycopg sends its ISO text). DebeziumTypeConverterTest asserts the sink's value
+    # renders to the same text through pgjdbc -- before G126 a java.sql.Timestamp, rendered in
+    # the Julian calendar before 1582-10-15, sent 1000-01-01 as 0999-12-27.
+    data = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    epoch = datetime(1970, 1, 1)
+    checked = []
+    for case in data["cases"]:
+        text = case.get("expected_dsql_text")
+        if text is None or case["dsql_kind"] != "timestamp":
+            continue
+        wall = datetime.fromisoformat(text)
+        unit = (
+            timedelta(milliseconds=1)
+            if case["debezium_schema_name"] == "io.debezium.time.Timestamp"
+            else timedelta(microseconds=1)
+        )
+        assert (wall - epoch) // unit == case["debezium_encoded_long"], case["name"]
+        out = _convert(case["mysql_type"], wall)
+        assert out == wall and out.isoformat(sep=" ") == text, case["name"]
+        checked.append(case["name"])
+    assert {"datetime_year_0001", "datetime6_year_1000", "datetime6_1582_10_04"} <= set(checked)
 
 
 def test_none_passes_through_for_every_kind() -> None:

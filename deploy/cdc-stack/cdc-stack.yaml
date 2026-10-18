@@ -2002,6 +2002,14 @@ Resources:
         # handling.mode stays at its default 'precise', so DECIMAL is a BigDecimal
         # too -- the custom sink relies on these precise encodings.)
         bigint.unsigned.handling.mode: precise
+        # Keep a DATETIME / DATE year 0-99 as it is. Debezium's `enable.time.adjuster`
+        # defaults to true: the shipped debezium-connector-binlog 2.7.4
+        # (BinlogValueConverters.adjustTemporal) turns a year 0-69 into 2000-2069 and 70-99
+        # into 1970-1999, for a client that typed a 2-digit year. MySQL already resolves a
+        # 2-digit year when the row is written, so the binlog holds the real year: a .NET
+        # DateTime.MinValue (0001-01-01) streamed as 2001-01-01 while Full Load wrote
+        # 0001-01-01. `false` leaves the conversion to the database, as Debezium documents.
+        enable.time.adjuster: "false"
         # Source-reboot resilience. When the source RDS/Aurora instance reboots
         # (routine maintenance patch, failover, instance-class change), the binlog
         # stream is cut mid-event: Debezium raises a RETRIABLE error and restarts

@@ -1562,9 +1562,11 @@ def _render_cdc_pipeline_health(
 # Quotes the sink's own log prefix (DsqlSinkTask.transientRetryException) and splits the
 # guidance by the SQLSTATE it carries: only XX000 is Aurora DSQL's own temporary condition
 # (G22); 08xxx / 57xxx / null is the sink's path to the cluster (a security group, NAT or
-# VPC endpoint change, or a deleted cluster: pgjdbc reports a failed connect as 08001), and
-# a lasting 40001 is another writer on the same rows -- never the sink's own tasks, which
-# never write the same row (each row's changes travel on one partition).
+# VPC endpoint change, or a deleted cluster: pgjdbc reports a failed connect as 08001);
+# 28xxx / 53300 / 53400 is a connection Aurora DSQL refused to open, retried since sink
+# plugin v54 (G126; dead-lettered row by row before); and a lasting 40001 is another writer
+# on the same rows -- never the sink's own tasks, which never write the same row (each row's
+# changes travel on one partition).
 SINK_STALL_NOTICE_BODY = (
     "The source is producing changes but the sink has applied none, so the target is "
     "falling behind. The connector can still report RUNNING and no errored task while this "
@@ -1579,7 +1581,11 @@ SINK_STALL_NOTICE_BODY = (
     "cluster or keeps losing its connection: check that the cluster still exists, that the "
     "connector subnets still reach its endpoint on port 5432 (security group, NAT gateway "
     "or Aurora DSQL VPC endpoint and its DNS), and that the connector's IAM role is still "
-    "allowed to connect; the sink resumes once it can connect. 40001 means write conflicts "
+    "allowed to connect; the sink resumes once it can connect. 28xxx, 53300 or 53400 means "
+    "Aurora DSQL refused to open the sink's connection: 28xxx its IAM token (check that the "
+    "connector's IAM role is still allowed to connect), 53300 the cluster's limit of open "
+    "connections (close idle connections elsewhere, or raise the quota), 53400 its rate of "
+    "new connections; the sink resumes once a connection opens. 40001 means write conflicts "
     "outlast the sink's retries: something else is writing the same rows on Aurora DSQL — "
     "stop it until cut over, and the sink resumes. In every case, do NOT cut over until the "
     "sink send rate recovers."

@@ -35,6 +35,21 @@ class DsqlIamTokenProviderTest {
   }
 
   @Test
+  void invalidateMakesTheNextCallSignANewToken() {
+    // G126: a connect that failed drops the cached token, which Aurora DSQL may have refused
+    // (signed with credentials that expired within its 13 minutes), so the retry signs anew.
+    AtomicInteger calls = new AtomicInteger();
+    DsqlIamTokenProvider provider =
+        new DsqlIamTokenProvider(
+            "host", "us-east-1", "admin", (h, r, u) -> "token-" + calls.incrementAndGet(),
+            () -> Instant.parse("2025-01-01T00:00:00Z"));
+    assertEquals("token-1", provider.currentToken());
+    provider.invalidate();
+    assertEquals("token-2", provider.currentToken());
+    assertEquals("token-2", provider.currentToken()); // cached again
+  }
+
+  @Test
   void passesHostRegionUsernameToSource() {
     AtomicReference<String> seen = new AtomicReference<>();
     DsqlIamTokenProvider.TokenSource source =

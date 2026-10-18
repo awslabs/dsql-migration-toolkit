@@ -91,7 +91,8 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  *       {@link #holdOrReport}). A hold is released only when the put returns normally, so
  *       Connect's redelivery of a failed put's batch never writes a partition past its tail.</li>
  *   <li><b>Connectivity</b> — closed/expired connection (1h DSQL timeout, token
- *       expiry): reconnect and retry.</li>
+ *       expiry), or one Aurora DSQL refuses to open (its token, too many connections, the
+ *       connection rate): reconnect and retry.</li>
  *   <li><b>Permanent</b> — any other SQLSTATE: do NOT retry; report the offending
  *       record to the DLQ and continue.</li>
  * </ul>
@@ -451,6 +452,8 @@ public class DsqlSinkTask extends SinkTask {
    * Open (or reopen) the JDBC connection using a fresh IAM token. DSQL closes
    * connections after 1 hour; a closed/expired connection is transparently
    * reopened so the task survives long runs (spike H1).
+   *
+   * <p>A failure to OPEN it is transient ({@link #connectFailure}), whatever its SQLSTATE.
    */
   private Connection connection() throws SQLException {
     if (connection != null && !connection.isClosed() && connection.isValid(2)) {
@@ -469,11 +472,48 @@ public class DsqlSinkTask extends SinkTask {
             config.clusterEndpoint(), config.database());
     Properties props = new Properties();
     props.setProperty("user", config.username());
-    props.setProperty("password", tokenProvider.currentToken()); // short-lived IAM token
-    Connection conn = DriverManager.getConnection(url, props);
+    String token;
+    try {
+      token = tokenProvider.currentToken(); // short-lived IAM token
+    } catch (RuntimeException e) {
+      throw connectFailure(e); // the AWS SDK could not sign one (credentials unavailable)
+    }
+    props.setProperty("password", token);
+    Connection conn;
+    try {
+      conn = openConnection(url, props);
+    } catch (SQLException e) {
+      // The next connect signs a new token: Aurora DSQL may have refused this one (signed with
+      // credentials that expired within the 13 minutes it is cached).
+      tokenProvider.invalidate();
+      throw connectFailure(e);
+    }
     conn.setAutoCommit(false); // batch within a transaction (<=3000 rows)
     this.connection = conn;
     return conn;
+  }
+
+  /**
+   * {@code e}, raised while a connection was being OPENED (the IAM token, or
+   * {@code DriverManager.getConnection}), as a transient failure ({@link #isTransient}) that
+   * keeps its SQLSTATE: Aurora DSQL refusing the token (28xxx), too many open connections
+   * (53300) or the connection rate exceeded (53400) says nothing about the rows. Classified as
+   * a statement's failure, it dead-lettered every row of every chunk while it lasted. A token
+   * that could not be signed gets 08001, pgjdbc's own state for a connect that failed.
+   * Package-private for tests.
+   */
+  static java.sql.SQLTransientConnectionException connectFailure(Exception e) {
+    SQLException sql = e instanceof SQLException s ? s : null;
+    return new java.sql.SQLTransientConnectionException(
+        "Could not open a connection to Aurora DSQL",
+        sql == null ? "08001" : sql.getSQLState(),
+        sql == null ? 0 : sql.getErrorCode(),
+        e);
+  }
+
+  /** {@code DriverManager.getConnection}. Package-private and overridable: the test seam. */
+  Connection openConnection(String url, Properties props) throws SQLException {
+    return DriverManager.getConnection(url, props);
   }
 
   /**
@@ -668,11 +708,14 @@ public class DsqlSinkTask extends SinkTask {
    * Cheaply estimate the bytes an event MODIFIES in DSQL, for the per-transaction byte
    * budget ({@link #MAX_BATCH_BYTES}). An upsert modifies its after-image (all column
    * values); a delete modifies only the PK it matches on. Mirrors
-   * {@code _estimate_row_bytes} in core/batched_import.py: a string counts its UTF-8
-   * encoded byte length (DSQL's cap is on WIRE bytes, and CJK/emoji are multi-byte), a
-   * {@code byte[]} its length, and any other scalar a small fixed estimate. It need not be
-   * exact -- only keep a chunk comfortably under the 10 MiB limit. Package-private + static
-   * so a unit test can assert the split without a live pipeline.
+   * {@code _estimate_row_bytes} in core/batched_import.py: a string -- and the text of a
+   * {@link org.postgresql.util.PGobject} (json, jsonb, an array rendered as jsonb, interval) --
+   * counts its UTF-8 encoded byte length (DSQL's cap is on WIRE bytes, and CJK/emoji are
+   * multi-byte), a {@code byte[]} its length, and any other scalar a small fixed estimate. It
+   * need not be exact -- only keep a chunk comfortably under the 10 MiB limit, which also
+   * bounds the multi-row statement pgjdbc rewrites a run into (one statement never spans two
+   * chunks) under Aurora DSQL's 10 MiB message limit. Package-private + static so a unit test
+   * can assert the split without a live pipeline.
    */
   static long estimateModifiedBytes(ChangeEvent event) {
     List<Object> values = event.isDelete() ? event.pkValues() : event.values();
@@ -689,18 +732,31 @@ public class DsqlSinkTask extends SinkTask {
     return total;
   }
 
-  /** Estimated wire bytes of one value (UTF-8 for strings, length for bytea, else fixed). */
+  /**
+   * Estimated wire bytes of one value: UTF-8 for text and for a PGobject's text, length for
+   * bytea, else fixed. A PGobject used to count as a fixed scalar, so a chunk of 100 KiB JSON
+   * documents looked 32 bytes a row: one rewritten statement of 128 of them passed 10 MiB, Aurora
+   * DSQL refused the message (08P01, a connection error) and Connect redelivered the same batch
+   * forever.
+   */
   private static long estimateValueBytes(Object v) {
     if (v == null) {
       return 1L;
     }
-    if (v instanceof String s) {
-      return s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    if (v instanceof CharSequence s) {
+      return utf8Bytes(s.toString());
+    }
+    if (v instanceof org.postgresql.util.PGobject pg) {
+      return pg.getValue() == null ? 1L : utf8Bytes(pg.getValue());
     }
     if (v instanceof byte[] b) {
       return b.length;
     }
     return SCALAR_VALUE_BYTES;
+  }
+
+  private static long utf8Bytes(String text) {
+    return text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
   }
 
   /** The clock (monotonic nanoseconds). Package-private and overridable: the test seam. */
@@ -2384,7 +2440,9 @@ public class DsqlSinkTask extends SinkTask {
    * {@link #quarantine} during a worker bounce, advancing the offset past rows
    * that were never applied (a contiguous gap, no DLQ). They are connectivity
    * failures, so they are transient: rethrow so Connect replays the same offsets
-   * after a reconnect (apply is idempotent, so a replay is safe).
+   * after a reconnect (apply is idempotent, so a replay is safe). So is any failure to OPEN
+   * a connection, whatever its SQLSTATE: {@link #connection()} raises it as a
+   * {@link java.sql.SQLTransientConnectionException} ({@link #connectFailure}).
    */
   // Package-private for unit testing (DsqlSinkTaskTest); semantically internal.
   boolean isTransient(SQLException e) {

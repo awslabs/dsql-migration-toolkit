@@ -12,8 +12,6 @@ package dev.dsqlmigrator.connect;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
-import java.sql.Timestamp;
-import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -138,6 +136,8 @@ final class DebeziumTypeConverter {
   private static final long MICROS_PER_MILLI = 1_000L;
   private static final int NANOS_PER_MICRO = 1_000;
   private static final long MICROS_PER_SECOND = 1_000_000L;
+  private static final long MILLIS_PER_SECOND = 1_000L;
+  private static final long NANOS_PER_SECOND = 1_000_000_000L;
   /** Half-ulp bound divisor for {@link #appendPgFloat}; exact (dividing by 2 always terminates). */
   private static final BigDecimal TWO = BigDecimal.valueOf(2);
 
@@ -150,8 +150,9 @@ final class DebeziumTypeConverter {
    * @param schemaName the Connect field schema name ({@code field.schema().name()}),
    *     or {@code null} for a plain primitive
    * @param value the raw value from {@code struct.get(field)}
-   * @return a JDBC-ready value ({@link Timestamp}, {@link BigDecimal},
-   *     {@link PGobject}, byte[], primitive, …); {@code null} passes through
+   * @return a JDBC-ready value ({@link LocalDateTime}, {@link OffsetDateTime},
+   *     {@link BigDecimal}, {@link PGobject}, byte[], primitive, …); {@code null} passes
+   *     through
    */
   static Object convert(String schemaName, Object value) {
     if (value == null || schemaName == null) {
@@ -161,19 +162,20 @@ final class DebeziumTypeConverter {
       case MICRO_TIMESTAMP: {
         long micros = ((Number) value).longValue();
         Object infinity = infinity("timestamp", micros, PG_INFINITY_MICROS, PG_NEGATIVE_INFINITY_MICROS);
-        return infinity != null ? infinity : microsToTimestamp(micros);
+        return infinity != null ? infinity : utcDateTime(micros, MICROS_PER_SECOND);
       }
       case TIMESTAMP_MS: {
         long millis = ((Number) value).longValue();
         Object infinity = infinity("timestamp", millis, PG_INFINITY_MILLIS, PG_NEGATIVE_INFINITY_MILLIS);
-        return infinity != null ? infinity : Timestamp.from(Instant.ofEpochMilli(millis));
+        return infinity != null ? infinity : utcDateTime(millis, MILLIS_PER_SECOND);
       }
       case ZONED_TIMESTAMP: {
         String text = value.toString();
         if ("infinity".equals(text) || "-infinity".equals(text)) {
           return pgObject("timestamptz", text);
         }
-        return Timestamp.from(OffsetDateTime.parse(text).toInstant());
+        // An OffsetDateTime, not a java.sql.Timestamp: see utcDateTime.
+        return OffsetDateTime.parse(text).withOffsetSameInstant(ZoneOffset.UTC);
       }
       case DATE: {
         long days = ((Number) value).longValue();
@@ -423,12 +425,6 @@ final class DebeziumTypeConverter {
   }
 
   /**
-   * Convert microseconds-since-epoch to a UTC {@link Timestamp}, preserving the
-   * sub-millisecond microseconds in the nanos field. Negative (pre-epoch) values
-   * are handled by flooring toward negative infinity so the fractional part stays
-   * in {@code [0, 1_000_000)} micros.
-   */
-  /**
    * Extract the raw WKB bytes from a Debezium geometry value (a {@link Struct}
    * with a {@code wkb} byte[] and an {@code srid}). DSQL has no geometry type, so
    * the column is {@code bytea} and stores the WKB -- identical to Full Load's
@@ -446,12 +442,25 @@ final class DebeziumTypeConverter {
     return value;
   }
 
-  private static Timestamp microsToTimestamp(long micros) {
-    long seconds = Math.floorDiv(micros, MICROS_PER_SECOND);
-    long fractionMicros = Math.floorMod(micros, MICROS_PER_SECOND);
-    Timestamp ts = new Timestamp(seconds * 1000L);
-    ts.setNanos((int) (fractionMicros * NANOS_PER_MICRO));
-    return ts;
+  /**
+   * {@code units} since the epoch ({@code perSecond} of them a second: micros or millis) as the
+   * UTC wall clock, the fraction floored so a pre-epoch value keeps it in {@code [0, 1 s)}.
+   *
+   * <p><b>A {@link LocalDateTime}, not a {@code java.sql.Timestamp}.</b> pgjdbc renders a
+   * {@code Timestamp} through a {@code GregorianCalendar}, which is the Julian calendar before
+   * 1582-10-15, so every value before that day was written days off -- MySQL's {@code 1000-01-01}
+   * minimum as {@code 0999-12-27}, the {@code 0001-01-01} of .NET's {@code DateTime.MinValue}
+   * or Go's zero {@code time.Time} as {@code 0001-01-03} -- while Full Load (Python's proleptic
+   * datetime) wrote it as it is; on a key column the upsert missed the row and inserted a second
+   * one, and the delete matched nothing. Debezium's epoch numbers are proleptic ISO, and pgjdbc
+   * renders a {@code LocalDateTime} / {@code OffsetDateTime} in that calendar and binds it as a
+   * {@code timestamp} / {@code timestamptz}, independent of the worker JVM's time zone.
+   */
+  private static LocalDateTime utcDateTime(long units, long perSecond) {
+    return LocalDateTime.ofEpochSecond(
+        Math.floorDiv(units, perSecond),
+        (int) (Math.floorMod(units, perSecond) * (NANOS_PER_SECOND / perSecond)),
+        ZoneOffset.UTC);
   }
 
   /** Wrap a JSON string in a {@code PGobject(type=json)} so it binds to a json column. */
@@ -633,11 +642,7 @@ final class DebeziumTypeConverter {
    * independent of {@code DateStyle}. Measured on PostgreSQL 17.11.
    */
   private static void appendPgTimestamp(StringBuilder out, long micros) {
-    LocalDateTime ts =
-        LocalDateTime.ofEpochSecond(
-            Math.floorDiv(micros, MICROS_PER_SECOND),
-            (int) (Math.floorMod(micros, MICROS_PER_SECOND) * NANOS_PER_MICRO),
-            ZoneOffset.UTC);
+    LocalDateTime ts = utcDateTime(micros, MICROS_PER_SECOND);
     out.append('"');
     appendPgDateParts(out, ts.toLocalDate());
     out.append('T');

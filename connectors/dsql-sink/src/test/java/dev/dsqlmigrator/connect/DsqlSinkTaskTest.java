@@ -102,6 +102,134 @@ class DsqlSinkTaskTest {
   }
 
   @Test
+  void aFailureToOpenTheConnectionIsTransientWhateverItsSqlState() {
+    // G126: Aurora DSQL refusing the IAM token (28xxx), too many open connections (53300) or the
+    // connection rate exceeded (53400) arrive while the connection is OPENED, and say nothing
+    // about the rows. connection() raises them through connectFailure, keeping the SQLSTATE
+    // for the log. FAILS WITHOUT G126: classified like a statement's failure, permanent.
+    for (String state : new String[] {"28000", "28P01", "53300", "53400", "3D000"}) {
+      SQLException refused = new SQLException("refused", state);
+      SQLException opening = DsqlSinkTask.connectFailure(refused);
+      assertTrue(task.isTransient(opening), state);
+      assertEquals(state, opening.getSQLState());
+      assertSame(refused, opening.getCause());
+      assertFalse(task.isTransient(refused), state); // from a statement it is not transient
+    }
+    // A token the AWS SDK could not sign (its credentials unavailable): pgjdbc's 08001.
+    SQLException unsigned =
+        DsqlSinkTask.connectFailure(new IllegalStateException("Unable to load credentials"));
+    assertTrue(task.isTransient(unsigned));
+    assertEquals("08001", unsigned.getSQLState());
+  }
+
+  @Test
+  void aConnectionAuroraDsqlRefusesIsRedeliveredAndNoRowIsDeadLettered() throws Exception {
+    // The cluster refuses the next four connects. Each put meets one at the column-type read,
+    // throws a RetriableException (Connect redelivers the batch) and dead-letters nothing; the
+    // fifth applies the batch. Every refused connect drops its token, so each try signs a new
+    // one. FAILS WITHOUT G126: the column-type read failed open, the chunk fell back to one
+    // row per transaction, and rows 1 and 2 were dead-lettered with 28P01 / 28000.
+    Deque<SQLException> refusals =
+        new ArrayDeque<>(
+            List.of(
+                serverError("53300", "Unable to accept connection, too many open connections."),
+                serverError("53400", "Unable to accept connection, rate exceeded."),
+                serverError("28P01", "password authentication failed for user \"admin\""),
+                serverError("28000", "invalid authorization specification")));
+    FakeJdbc jdbc = new FakeJdbc();
+    RefusingTask task = new RefusingTask(refusals, jdbc);
+    List<SinkRecord> deadLettered = new ArrayList<>();
+    setField(task, "dlqReporter",
+        (org.apache.kafka.connect.sink.ErrantRecordReporter) (record, error) -> {
+          deadLettered.add(record);
+          return java.util.concurrent.CompletableFuture.completedFuture(null);
+        });
+    List<SinkRecord> batch = List.of(order(1), order(2), order(3));
+
+    for (String state : new String[] {"53300", "53400", "28P01", "28000"}) {
+      RetriableException e = assertThrows(RetriableException.class, () -> task.put(batch));
+      assertTrue(e.getMessage().contains("transient sqlstate=" + state), e.getMessage());
+    }
+    task.put(batch); // Connect's redelivery, once a connection opens
+
+    assertEquals(List.of(), deadLettered);
+    assertEquals(List.of("prepareCatalog", "commit", "prepareWrite", "commit"), jdbc.calls);
+    assertEquals(5, task.tokens); // a new token for every try
+  }
+
+  @Test
+  void aTokenTheAwsSdkCannotSignIsRedeliveredNotATaskFailure() throws Exception {
+    // A token the AWS SDK could not sign (the connector role's credentials unavailable) used to
+    // escape put() as the SDK's own RuntimeException, which Connect treats as unrecoverable:
+    // the task was killed until a manual restart. It is a transient connect failure now.
+    RefusingTask task = new RefusingTask(new ArrayDeque<>(), new FakeJdbc());
+    task.unsignable = 1;
+    RetriableException e =
+        assertThrows(RetriableException.class, () -> task.put(List.of(order(1))));
+    assertTrue(e.getMessage().contains("transient sqlstate=08001"), e.getMessage());
+    task.put(List.of(order(1)));
+    assertEquals(2, task.tokens);
+  }
+
+  private static PSQLException serverError(String state, String message) {
+    return new PSQLException(
+        new ServerErrorMessage("SFATAL\u0000C" + state + "\u0000M" + message + "\u0000"));
+  }
+
+  /**
+   * A task whose connects are refused with each of {@code refusals} in turn, then open
+   * {@code jdbc}; its token source counts the tokens signed, failing the first
+   * {@link #unsignable} of them.
+   */
+  private static final class RefusingTask extends DsqlSinkTask {
+    private final Deque<SQLException> refusals;
+    private final FakeJdbc jdbc;
+    int tokens;
+    int unsignable;
+
+    RefusingTask(Deque<SQLException> refusals, FakeJdbc jdbc) throws Exception {
+      this.refusals = refusals;
+      this.jdbc = jdbc;
+      startMetrics(sinkProps());
+      setField(this, "tokenProvider", new DsqlIamTokenProvider("h", "us-east-1", "admin",
+          (h, r, u) -> {
+            tokens++;
+            if (tokens <= unsignable) {
+              throw new IllegalStateException("Unable to load credentials from any provider");
+            }
+            return "token-" + tokens;
+          },
+          java.time.Instant::now));
+    }
+
+    @Override
+    Connection openConnection(String url, java.util.Properties props) throws SQLException {
+      SQLException refused = refusals.poll();
+      if (refused != null) {
+        throw refused;
+      }
+      return jdbc.connection();
+    }
+  }
+
+  private static SinkRecord order(long id) {
+    Struct envelope =
+        new Struct(ORDER_ENVELOPE)
+            .put("op", "c")
+            .put("after", new Struct(ORDER_ROW).put("id", id).put("flag", (short) 1))
+            .put("source", new Struct(ORDER_SOURCE).put("db", "shop").put("table", "orders"));
+    return new SinkRecord(
+        "dsqlcdc.shop.orders", 0, ORDER_KEY, new Struct(ORDER_KEY).put("id", id),
+        ORDER_ENVELOPE, envelope, id);
+  }
+
+  private static void setField(DsqlSinkTask task, String name, Object value) throws Exception {
+    java.lang.reflect.Field field = DsqlSinkTask.class.getDeclaredField(name);
+    field.setAccessible(true);
+    field.set(task, value);
+  }
+
+  @Test
   void genuinePermanentErrorIsNotTransient() {
     // A real poison row (type mismatch, missing column, etc.) must stay permanent
     // so it is quarantined to the DLQ rather than retried forever.
@@ -502,7 +630,7 @@ class DsqlSinkTaskTest {
 
     // No DLQ reporter is wired, so the refusal fails loudly rather than skipping. It must be
     // the QUARANTINE that throws: had the row reached applyBatch, connection() would have hit
-    // the missing token provider (a NullPointerException, not a ConnectException).
+    // the missing token provider (a RetriableException that names no column).
     ConnectException e = assertThrows(ConnectException.class, () -> task.put(List.of(record)));
     String message = e.getMessage();
     assertTrue(
@@ -791,6 +919,7 @@ class DsqlSinkTaskTest {
               switch (m.getName()) {
                 case "isClosed" -> false;
                 case "isValid" -> true;
+                case "setAutoCommit" -> null; // connection() on a freshly opened one
                 case "prepareStatement" -> {
                   boolean catalog = ValueFit.CATALOG_SQL.equals(a[0]);
                   calls.add(catalog ? "prepareCatalog" : "prepareWrite");

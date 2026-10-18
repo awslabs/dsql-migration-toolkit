@@ -8,8 +8,9 @@
       "debezium_schema_name": "io.debezium.time.Timestamp",
       "debezium_encoded_long": 1704067200000,
       "expected_utc_epoch_ms": 1704067200000,
-      "expected_dsql_java_class": "java.sql.Timestamp",
-      "note": "Long millis-since-epoch -> java.sql.Timestamp (UTC). Python bulk loader attaches UTC to the naive datetime(2024-01-01 00:00:00)."
+      "expected_dsql_java_class": "java.time.LocalDateTime",
+      "expected_dsql_text": "2024-01-01 00:00:00",
+      "note": "Long millis-since-epoch -> java.time.LocalDateTime (the UTC wall clock), bound as timestamp. Python bulk loader writes the naive datetime(2024-01-01 00:00:00)."
     },
     {
       "name": "datetime6",
@@ -19,8 +20,9 @@
       "debezium_encoded_long": 1704067200000123,
       "expected_utc_epoch_ms": 1704067200000,
       "expected_sub_milli_micros": 123,
-      "expected_dsql_java_class": "java.sql.Timestamp",
-      "note": "Long micros-since-epoch -> java.sql.Timestamp (UTC), microseconds preserved as nanos. This is the H5 bug: setObject(Long) to a TIMESTAMP column was rejected with SQLSTATE 42804."
+      "expected_dsql_java_class": "java.time.LocalDateTime",
+      "expected_dsql_text": "2024-01-01 00:00:00.000123",
+      "note": "Long micros-since-epoch -> java.time.LocalDateTime (the UTC wall clock), microseconds preserved. This is the H5 bug: setObject(Long) to a TIMESTAMP column was rejected with SQLSTATE 42804."
     },
     {
       "name": "timestamp_tz",
@@ -29,8 +31,39 @@
       "debezium_schema_name": "io.debezium.time.ZonedTimestamp",
       "debezium_encoded_string": "2024-01-01T00:00:00Z",
       "expected_utc_epoch_ms": 1704067200000,
-      "expected_dsql_java_class": "java.sql.Timestamp",
-      "note": "ISO-8601 string -> java.sql.Timestamp (UTC)."
+      "expected_dsql_java_class": "java.time.OffsetDateTime",
+      "expected_dsql_text": "2024-01-01 00:00:00+00",
+      "note": "ISO-8601 string -> java.time.OffsetDateTime at UTC, bound as timestamptz."
+    },
+    {
+      "name": "datetime_year_0001",
+      "mysql_type": "DATETIME",
+      "dsql_kind": "timestamp",
+      "debezium_schema_name": "io.debezium.time.Timestamp",
+      "debezium_encoded_long": -62135596800000,
+      "expected_dsql_java_class": "java.time.LocalDateTime",
+      "expected_dsql_text": "0001-01-01 00:00:00",
+      "note": ".NET DateTime.MinValue / Go zero time. Arrives as the year 1 only with Debezium enable.time.adjuster=false (set on the cdc-stack MySQL source; the default reads a year 0-99 as 2000-2069 / 1970-1999). Bound as a java.sql.Timestamp it was rendered by pgjdbc in the Julian calendar before 1582-10-15 and sent as 0001-01-03."
+    },
+    {
+      "name": "datetime6_year_1000",
+      "mysql_type": "DATETIME(6)",
+      "dsql_kind": "timestamp",
+      "debezium_schema_name": "io.debezium.time.MicroTimestamp",
+      "debezium_encoded_long": -30610224000000000,
+      "expected_dsql_java_class": "java.time.LocalDateTime",
+      "expected_dsql_text": "1000-01-01 00:00:00",
+      "note": "MySQL's documented DATETIME minimum, a common 'no date' value. Bound as a java.sql.Timestamp it was sent as 0999-12-27; on a key the upsert inserted a second row and the delete matched nothing."
+    },
+    {
+      "name": "datetime6_1582_10_04",
+      "mysql_type": "DATETIME(6)",
+      "dsql_kind": "timestamp",
+      "debezium_schema_name": "io.debezium.time.MicroTimestamp",
+      "debezium_encoded_long": -12220156800876544,
+      "expected_dsql_java_class": "java.time.LocalDateTime",
+      "expected_dsql_text": "1582-10-04 23:59:59.123456",
+      "note": "The last day before the Gregorian reform. Bound as a java.sql.Timestamp it was sent as 1582-09-24; from 1582-10-15 on it was always exact."
     },
     {
       "name": "bigint_unsigned",

@@ -232,6 +232,69 @@ class DsqlSinkBatchGroupingTest {
     }
   }
 
+  /** An insert of one JSON document of {@code docBytes} ASCII bytes, as the sink binds it. */
+  private static DsqlSinkTask.Applicable jsonUpsert(int pk, int docBytes) {
+    String doc = "{\"k\": \"" + "x".repeat(Math.max(0, docBytes - 9)) + "\"}";
+    Object payload =
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.JSON_TYPE, doc); // PGobject(json)
+    return new DsqlSinkTask.Applicable(
+        null,
+        ChangeEvent.upsert(
+            "events", List.of("id", "payload"), List.of(pk, payload), List.of("id"),
+            List.of(pk), 0L));
+  }
+
+  @Test
+  void estimateModifiedBytesCountsAJsonValueByItsText() throws Exception {
+    // G126: a PGobject -- MySQL JSON, PostgreSQL json/jsonb, an array rendered as jsonb, an
+    // interval -- is sized by its text like a string. FAILS WITHOUT G126: a 100 KiB document
+    // counted as a 16-byte scalar (32 bytes for the row).
+    long jsonBytes = DsqlSinkTask.estimateModifiedBytes(jsonUpsert(1, 100 * 1024).event());
+    assertTrue(jsonBytes >= 100 * 1024 && jsonBytes < 100 * 1024 + 64, "json: " + jsonBytes);
+    // Multi-byte text counts its UTF-8 bytes, any CharSequence like a String, and a PGobject
+    // with no value like a NULL.
+    org.postgresql.util.PGobject jsonb = new org.postgresql.util.PGobject();
+    jsonb.setType("jsonb");
+    jsonb.setValue("[\"" + "한".repeat(1000) + "\"]"); // 3 bytes a character
+    org.postgresql.util.PGobject empty = new org.postgresql.util.PGobject();
+    empty.setType("interval");
+    StringBuilder text = new StringBuilder("y".repeat(5000));
+    ChangeEvent mixed =
+        ChangeEvent.upsert(
+            "events", List.of("id", "tags", "gap", "note"), List.of(1, jsonb, empty, text),
+            List.of("id"), List.of(1), 0L);
+    long mixedBytes = DsqlSinkTask.estimateModifiedBytes(mixed);
+    assertTrue(mixedBytes >= 3004 + 5000 && mixedBytes < 3004 + 5000 + 64, "mixed: " + mixedBytes);
+  }
+
+  @Test
+  void largeJsonDocumentsSplitUnderTheByteBudget() {
+    // The repro's fetch: 158 inserts of ~100 KiB JSON documents, 15.4 MiB in all. Every chunk
+    // stays within the 8 MiB budget, and so does every statement pgjdbc rewrites a run into
+    // (one statement never spans two chunks), under Aurora DSQL's 10 MiB message limit. FAILS
+    // WITHOUT G126: one chunk of all 158.
+    List<DsqlSinkTask.Applicable> batch = new ArrayList<>();
+    for (int i = 0; i < 158; i++) {
+      batch.add(jsonUpsert(i, 100 * 1024));
+    }
+    List<List<DsqlSinkTask.Applicable>> chunks =
+        Batches.partition(
+            batch, 3000, DsqlSinkTask.MAX_BATCH_BYTES,
+            a -> DsqlSinkTask.estimateModifiedBytes(a.event()));
+    assertTrue(chunks.size() >= 2, "chunks: " + chunks.size());
+    int rows = 0;
+    for (List<DsqlSinkTask.Applicable> chunk : chunks) {
+      long documentBytes = 0;
+      for (DsqlSinkTask.Applicable a : chunk) {
+        documentBytes +=
+            ((org.postgresql.util.PGobject) a.event().values().get(1)).getValue().length();
+      }
+      assertTrue(documentBytes <= DsqlSinkTask.MAX_BATCH_BYTES, "chunk: " + documentBytes);
+      rows += chunk.size();
+    }
+    assertEquals(158, rows);
+  }
+
   @Test
   void tinyRowsStillChunkByRowCount() {
     // Narrow rows never approach the byte budget, so a small row cap still governs: 5 rows,

@@ -447,6 +447,15 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   ソースデータをクリーンアップしてください。精度なしの `numeric` ターゲット(Schema Conversion が警告する
   Aurora DSQL の既定値 `numeric(18,6)`)は、設計どおり PostgreSQL の制約なし `numeric` を引き続き小数 6 桁に
   丸めます。確認しない対象: `numeric` 列に入る `FLOAT`/`DOUBLE` の値。
+- **以前のバージョンがデプロイした CDC インフラでの 1582-10-15 より前の日時と MySQL の 0–99 年。** Full Load は
+  `DATETIME`、`timestamp`、`timestamptz` をそのまま保存します。MySQL が文書化している最小値 `1000-01-01` や、
+  .NET の `DateTime.MinValue` と Go のゼロ値 `time.Time` が書き込む `0001-01-01` も同じで、CDC もシンクプラグイン
+  v54 からはそうします。以前のシンクは 1582-10-15 より前の値をユリウス暦で数日ずらして書き込み(`1000-01-01` を
+  `0999-12-27` に、`0001-01-01` を `0001-01-03` に)、以前の MySQL ソースは `DATETIME`・`DATE` の 0–99 年を
+  2000–2069 年または 1970–1999 年として読みました(`0001-01-01` を `2001-01-01` に)。デッドレターにはならず
+  ROW_COUNT も一致したままなので、CHECKSUM でしか分かりません。キー列では、update が 2 つ目の行を挿入し、delete
+  はどの行にも一致しませんでした。**Delete CDC infrastructure** して再デプロイし、そのようなテーブルを再ロード
+  (Drop & reload)してから CHECKSUM で検証してください。
 - **PostgreSQL 17/18 ソース — バージョン固有のエッジ 3 点（いずれも移行を止めません）。** PG 13–18
   をサポートします。17・18 では次の 3 点に注意してください:
   - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で

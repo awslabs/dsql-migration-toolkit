@@ -10,8 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
-import java.sql.Timestamp;
-import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
@@ -33,38 +34,43 @@ class DebeziumTypeConverterTest {
   // 2024-01-01T00:00:00Z, matching the shared fixture's datetime cases.
   private static final long EPOCH_MS = 1_704_067_200_000L;
 
+  // The UTC wall clock of EPOCH_MS.
+  private static final LocalDateTime Y2024 = LocalDateTime.of(2024, 1, 1, 0, 0);
+
   @Test
-  void datetimeMillisToTimestamp() {
+  void datetimeMillisToLocalDateTime() {
     Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.TIMESTAMP_MS, EPOCH_MS);
-    assertInstanceOf(Timestamp.class, r);
-    assertEquals(Instant.ofEpochMilli(EPOCH_MS), ((Timestamp) r).toInstant());
+    assertEquals(Y2024, assertInstanceOf(LocalDateTime.class, r));
+    // Millis keep their fraction, and a pre-epoch value floors (never a negative fraction).
+    assertEquals(Y2024.plusNanos(456_000_000L),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.TIMESTAMP_MS, EPOCH_MS + 456));
+    assertEquals(LocalDateTime.of(1969, 12, 31, 23, 59, 59, 500_000_000),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.TIMESTAMP_MS, -500L));
   }
 
   @Test
-  void datetime6MicrosToTimestamp() {
-    // DATETIME(6): micros since epoch -> Timestamp with the fractional micros in nanos.
+  void datetime6MicrosToLocalDateTime() {
+    // DATETIME(6): micros since epoch -> the UTC wall clock with the fractional micros in nanos.
     long micros = EPOCH_MS * 1000L + 123; // 123 micros past the second boundary
     Object r = DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIMESTAMP, micros);
-    assertInstanceOf(Timestamp.class, r);
-    Timestamp ts = (Timestamp) r;
-    assertEquals(EPOCH_MS, ts.getTime()); // whole-millis part
-    assertEquals(123 * 1000, ts.getNanos() % 1_000_000); // sub-milli micros -> nanos
+    assertEquals(Y2024.plusNanos(123_000L), assertInstanceOf(LocalDateTime.class, r));
   }
 
   @Test
   void datetime6FullMicrosecondPrecisionPreserved() {
     long micros = EPOCH_MS * 1000L + 123456; // 123456 micros = 0.123456 s
-    Timestamp ts = (Timestamp) DebeziumTypeConverter.convert(
+    LocalDateTime ts = (LocalDateTime) DebeziumTypeConverter.convert(
         DebeziumTypeConverter.MICRO_TIMESTAMP, micros);
-    assertEquals(123_456_000, ts.getNanos()); // 123456 micros -> 123456000 nanos
+    assertEquals(123_456_000, ts.getNano()); // 123456 micros -> 123456000 nanos
+    assertEquals(LocalDateTime.of(1969, 12, 31, 23, 59, 59, 999_999_000),
+        DebeziumTypeConverter.convert(DebeziumTypeConverter.MICRO_TIMESTAMP, -1L));
   }
 
   @Test
-  void zonedTimestampStringToTimestamp() {
+  void zonedTimestampStringToOffsetDateTime() {
     Object r = DebeziumTypeConverter.convert(
         DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T00:00:00Z");
-    assertInstanceOf(Timestamp.class, r);
-    assertEquals(Instant.ofEpochMilli(EPOCH_MS), ((Timestamp) r).toInstant());
+    assertEquals(Y2024.atOffset(ZoneOffset.UTC), assertInstanceOf(OffsetDateTime.class, r));
   }
 
   @Test
@@ -98,7 +104,7 @@ class DebeziumTypeConverterTest {
           DebeziumTypeConverter.convert(DebeziumTypeConverter.DATE, days));
     }
     // A neighbour of a sentinel is an ordinary value.
-    assertInstanceOf(Timestamp.class, DebeziumTypeConverter.convert(
+    assertInstanceOf(LocalDateTime.class, DebeziumTypeConverter.convert(
         DebeziumTypeConverter.MICRO_TIMESTAMP, 9_223_372_036_825_199_999L));
   }
 
@@ -398,7 +404,7 @@ class DebeziumTypeConverterTest {
   @Test
   void extractStructConvertsTemporalFieldsInUpsert() {
     // Build a Debezium envelope whose after-image has a MicroTimestamp column, and
-    // assert the parsed ChangeEvent carries a Timestamp (not the raw Long).
+    // assert the parsed ChangeEvent carries a LocalDateTime (not the raw Long).
     Schema microTs =
         SchemaBuilder.int64().name(DebeziumTypeConverter.MICRO_TIMESTAMP).optional().build();
     Schema key = SchemaBuilder.struct().name("Key").field("id", Schema.INT64_SCHEMA).build();
@@ -435,8 +441,7 @@ class DebeziumTypeConverterTest {
     int idx = event.columns().indexOf("created_at");
     assertTrue(idx >= 0, "created_at column present");
     Object stored = event.values().get(idx);
-    assertInstanceOf(Timestamp.class, stored);
-    assertEquals(Instant.ofEpochMilli(EPOCH_MS), ((Timestamp) stored).toInstant());
+    assertEquals(Y2024, assertInstanceOf(LocalDateTime.class, stored));
   }
 
   // --- Tier-3 regression guards ------------------------------------------------
@@ -462,13 +467,149 @@ class DebeziumTypeConverterTest {
   @Test
   void zonedTimestampKeepsMicroseconds() {
     // io.debezium.time.ZonedTimestamp with sub-millisecond micros must not truncate to millis.
-    Timestamp ts = (Timestamp) DebeziumTypeConverter.convert(
+    OffsetDateTime ts = (OffsetDateTime) DebeziumTypeConverter.convert(
         DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T00:00:00.123456Z");
-    assertEquals(123_456_000, ts.getNanos());
-    // A non-UTC offset resolves to the same instant AND keeps the micros.
-    Timestamp ts2 = (Timestamp) DebeziumTypeConverter.convert(
+    assertEquals(123_456_000, ts.getNano());
+    // A non-UTC offset resolves to the same instant, at UTC, AND keeps the micros.
+    Object ts2 = DebeziumTypeConverter.convert(
         DebeziumTypeConverter.ZONED_TIMESTAMP, "2024-01-01T05:00:00.123456+05:00");
-    assertEquals(Instant.parse("2024-01-01T00:00:00.123456Z"), ts2.toInstant());
+    assertEquals(OffsetDateTime.parse("2024-01-01T00:00:00.123456Z"), ts2);
+  }
+
+  // --- G126: a timestamp before 1582-10-15 is written as it is ---------------------------------
+
+  /** pgjdbc's own renderer of a bound timestamp: the text the sink sends to Aurora DSQL. */
+  static final org.postgresql.jdbc.TimestampUtils PGJDBC =
+      new org.postgresql.jdbc.TimestampUtils(false, () -> java.util.TimeZone.getTimeZone("UTC"));
+
+  @Test
+  void aTimestampBefore1582IsSentAsItIs() {
+    // pgjdbc renders a java.sql.Timestamp through a GregorianCalendar -- the Julian calendar
+    // before 1582-10-15 -- so a MySQL DATETIME or a PostgreSQL timestamp / timestamptz before it
+    // was sent days off: 0001-01-01 as 0001-01-03, 1000-01-01 as 0999-12-27, 1582-10-04 as
+    // 1582-09-24, while Full Load (Python's proleptic datetime) wrote it as it is. FAILS WITHOUT
+    // G126 (a Timestamp came back). Debezium's epoch numbers are proleptic ISO, like java.time.
+    assertSentAsItIs("0001-01-01 00:00:00", LocalDateTime.of(1, 1, 1, 0, 0)); // .NET / Go zero
+    assertSentAsItIs("1000-01-01 00:00:00", LocalDateTime.of(1000, 1, 1, 0, 0)); // MySQL minimum
+    assertSentAsItIs(
+        "1582-10-04 23:59:59.123456", LocalDateTime.of(1582, 10, 4, 23, 59, 59, 123_456_000));
+    assertSentAsItIs("1582-10-15 00:00:00", LocalDateTime.of(1582, 10, 15, 0, 0)); // control
+    assertSentAsItIs("2024-01-01 00:00:00", Y2024); // control
+  }
+
+  /**
+   * {@code wall} as each Debezium encoding of it converts and as pgjdbc then sends it: micros
+   * (a MySQL DATETIME(4-6), a PostgreSQL timestamp(4-6)), millis (precision 0-3, the micros
+   * dropped as that precision drops them) and the ISO-8601 text at UTC (a PostgreSQL timestamptz).
+   */
+  private static void assertSentAsItIs(String text, LocalDateTime wall) {
+    long second = wall.toEpochSecond(ZoneOffset.UTC);
+    Object micros = DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.MICRO_TIMESTAMP, second * 1_000_000L + wall.getNano() / 1_000);
+    assertEquals(wall, micros);
+    assertEquals(text, PGJDBC.toString((LocalDateTime) micros));
+    Object millis = DebeziumTypeConverter.convert(
+        DebeziumTypeConverter.TIMESTAMP_MS, second * 1_000L + wall.getNano() / 1_000_000);
+    assertEquals(wall.withNano(wall.getNano() / 1_000_000 * 1_000_000), millis);
+    assertEquals(
+        text.substring(0, Math.min(text.length(), 23)), PGJDBC.toString((LocalDateTime) millis));
+    String iso = wall.toLocalDate() + "T" + text.substring(11) + "Z"; // Debezium's spelling
+    Object zoned = DebeziumTypeConverter.convert(DebeziumTypeConverter.ZONED_TIMESTAMP, iso);
+    assertEquals(wall.atOffset(ZoneOffset.UTC), zoned);
+    assertEquals(text + "+00", PGJDBC.toString((OffsetDateTime) zoned));
+  }
+
+  @Test
+  void theSharedWriteContractFixtureHoldsForTheSink() throws Exception {
+    // The fixture both write paths are held to (tests/fixtures/dsql_write_contract.json, copied
+    // here as a test resource): the class the sink binds for each case and, for a timestamp,
+    // the text pgjdbc sends -- the text test_dsql_write_contract.py asserts Full Load writes.
+    software.amazon.awssdk.protocols.jsoncore.JsonNode root;
+    try (java.io.InputStream in = getClass().getResourceAsStream("/dsql_write_contract.json")) {
+      root = software.amazon.awssdk.protocols.jsoncore.JsonNode.parser().parse(in);
+    }
+    int timestamps = 0;
+    for (var node : root.field("cases").orElseThrow().asArray()) {
+      var c = node.asObject();
+      String name = c.get("name").asString();
+      String schema =
+          c.get("debezium_schema_name").isNull() ? null : c.get("debezium_schema_name").asString();
+      Object encoded;
+      if (c.containsKey("debezium_encoded_long")) {
+        encoded = Long.parseLong(c.get("debezium_encoded_long").asNumber());
+      } else if (c.containsKey("debezium_encoded_int")) {
+        encoded = Integer.parseInt(c.get("debezium_encoded_int").asNumber());
+      } else if (c.containsKey("debezium_encoded_base64")) {
+        encoded = java.util.Base64.getDecoder().decode(c.get("debezium_encoded_base64").asString());
+      } else {
+        String text = c.get("debezium_encoded_string").asString();
+        encoded = DebeziumTypeConverter.DECIMAL_TYPE.equals(schema) ? new BigDecimal(text) : text;
+      }
+      // What bind() sends: a number into a boolean parameter is bound as a Boolean.
+      Object bound = DsqlSinkTask.bindValue(
+          DebeziumTypeConverter.convert(schema, encoded),
+          "boolean".equals(c.get("dsql_kind").asString()), false);
+      assertEquals(c.get("expected_dsql_java_class").asString(), bound.getClass().getName(), name);
+      if (c.containsKey("expected_dsql_text")) {
+        String sent = bound instanceof OffsetDateTime zoned
+            ? PGJDBC.toString(zoned) : PGJDBC.toString((LocalDateTime) bound);
+        assertEquals(c.get("expected_dsql_text").asString(), sent, name);
+        timestamps++;
+      }
+    }
+    assertTrue(timestamps >= 6, "timestamp cases: " + timestamps);
+  }
+
+  @Test
+  void aDatetimeKeyBefore1582KeysTheUpdateAndTheDeleteOnTheFullLoadRow() {
+    // A MySQL table keyed on a DATETIME(6) holding its documented minimum, 1000-01-01: Full
+    // Load wrote the key '1000-01-01 00:00:00'. The CDC upsert's ON CONFLICT key and the
+    // delete's WHERE key must be sent as that same text. FAILS WITHOUT G126: sent as
+    // 0999-12-27, the update inserted a second row and the delete matched nothing.
+    LocalDateTime slot = LocalDateTime.of(1000, 1, 1, 0, 0);
+    long micros = slot.toEpochSecond(ZoneOffset.UTC) * 1_000_000L;
+    Schema microTs = SchemaBuilder.int64().name(DebeziumTypeConverter.MICRO_TIMESTAMP).build();
+    Schema key = SchemaBuilder.struct().name("Key").field("slot", microTs).build();
+    Schema row =
+        SchemaBuilder.struct()
+            .name("Row")
+            .field("slot", microTs)
+            .field("note", Schema.OPTIONAL_STRING_SCHEMA)
+            .optional()
+            .build();
+    Schema source =
+        SchemaBuilder.struct()
+            .name("Source")
+            .field("db", Schema.STRING_SCHEMA)
+            .field("table", Schema.STRING_SCHEMA)
+            .optional()
+            .build();
+    Schema envelope =
+        SchemaBuilder.struct()
+            .name("Envelope")
+            .field("op", Schema.STRING_SCHEMA)
+            .field("before", row)
+            .field("after", row)
+            .field("source", source)
+            .build();
+    Struct image = new Struct(row).put("slot", micros).put("note", "cdc-update");
+    Struct src = new Struct(source).put("db", "app").put("table", "slots");
+
+    ChangeEvent update = DebeziumEvents.parse(new SinkRecord("dsqlcdc.app.slots", 0, key,
+        new Struct(key).put("slot", micros), envelope,
+        new Struct(envelope).put("op", "u").put("before", image).put("after", image)
+            .put("source", src), 0L));
+    assertEquals(java.util.List.of(slot), update.pkValues());
+    assertEquals(slot, update.values().get(update.columns().indexOf("slot")));
+    assertEquals("1000-01-01 00:00:00", PGJDBC.toString((LocalDateTime) update.pkValues().get(0)));
+
+    ChangeEvent delete = DebeziumEvents.parse(new SinkRecord("dsqlcdc.app.slots", 0, key,
+        new Struct(key).put("slot", micros), envelope,
+        new Struct(envelope).put("op", "d").put("before", image).put("source", src), 1L));
+    assertTrue(delete.isDelete());
+    assertEquals(java.util.List.of(slot), delete.deleteBindValues());
+    assertEquals(
+        "1000-01-01 00:00:00", PGJDBC.toString((LocalDateTime) delete.deleteBindValues().get(0)));
   }
 
   // --- PostgreSQL bit/varbit -> bit-string (live-test finding: CDC must match Full Load) ---

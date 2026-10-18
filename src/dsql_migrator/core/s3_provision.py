@@ -813,7 +813,27 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   * a whole decimal bound into an integer parameter is bound as a long: the key of a numeric
 #     column made a bigint identity (a PostgreSQL numeric(12,0) serial) arrives as a decimal,
 #     and as NUMERIC `"id" = ?` became `"id"::numeric = $1`, which the primary key cannot
-#     serve -- every DELETE (and move) scanned the table.
+#     serve -- every DELETE (and move) scanned the table;
+#   * (G126) a JSON value -- MySQL JSON, PostgreSQL json/jsonb, an array rendered as jsonb; any
+#     PGobject, and any CharSequence -- counts its UTF-8 text against the 8 MiB chunk budget. It
+#     counted as a 16-byte scalar, so one fetch of ~100 KiB documents formed one chunk and one
+#     rewritten statement past Aurora DSQL's 10 MiB message limit (08P01, a connection error),
+#     and Connect redelivered that batch forever; smaller documents could push a 3000-row chunk
+#     past the 10 MiB transaction limit (54000, replayed one row per transaction). The 1 MiB
+#     per-value guard (oversizedColumn) is unchanged: for text and JSON that limit is on the
+#     compressed size;
+#   * (G126) a timestamp is bound as a java.time LocalDateTime / OffsetDateTime at UTC, not a
+#     java.sql.Timestamp, which pgjdbc renders in the Julian calendar before 1582-10-15: every
+#     MySQL DATETIME or PostgreSQL timestamp / timestamptz before that day landed days off
+#     (1000-01-01 as 0999-12-27, 0001-01-01 as 0001-01-03), and on a key column the update
+#     inserted a second row and the delete matched nothing. The template's MySQL source now
+#     sets enable.time.adjuster=false too (Debezium read a year 0-99 as 2000-2069 / 1970-1999),
+#     which the next Start CDC applies (it recreates the source connector);
+#   * (G126) a failure to OPEN the connection -- the IAM token refused (28xxx), too many open
+#     connections (53300), the connection rate (53400), a token the AWS SDK could not sign
+#     (08001) -- is transient, and the next connect signs a new token: classified like a
+#     statement's failure, it dead-lettered every row while it lasted, and a token that could
+#     not be signed killed the task.
 PLUGIN_VERSION = "v54"
 
 

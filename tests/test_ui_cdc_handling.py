@@ -2446,6 +2446,30 @@ def test_g22_the_sink_stall_notice_tells_a_transient_target_from_an_ejected_cons
     assert "body=SINK_STALL_NOTICE_BODY" in inspect.getsource(cm._render_change_flow_status)
 
 
+def test_g126_the_sink_stall_notice_explains_a_connection_aurora_dsql_refused_to_open() -> None:
+    # G126: since sink plugin v54 a connection Aurora DSQL refuses to OPEN -- its IAM token
+    # (28xxx), too many open connections (53300), the connection rate (53400) -- is retried
+    # and redelivered (it used to dead-letter every row), so it now shows as a stall whose log
+    # line carries that SQLSTATE. The notice the operator reads must say what each one means.
+    from pathlib import Path
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    body = cm.SINK_STALL_NOTICE_BODY
+    _network, refused = body.split("28xxx, 53300 or 53400 means", 1)
+    refused = refused.split("40001 means", 1)[0]
+    for needle in ("refused to open", "IAM token", "IAM role", "53300", "open connections",
+                   "raise the quota", "53400", "resumes once a connection opens"):
+        assert needle in refused, needle
+    assert "AWS Support" not in refused
+    # The SQLSTATE the notice reads is the one the sink logs for a refused connect.
+    sink = (
+        Path(__file__).resolve().parents[1]
+        / "connectors/dsql-sink/src/main/java/dev/dsqlmigrator/connect/DsqlSinkTask.java"
+    ).read_text(encoding="utf-8")
+    assert "sql == null ? \"08001\" : sql.getSQLState()" in sink
+
+
 def test_a_postgres_restart_names_the_slot_not_the_full_load_lsn() -> None:
     """Live PG E2E (2026-10-09): the resumed Start's audit line said "start point WAL LSN
     0/41204A0 (gapless from the Full Load watermark)" while Debezium resumed from the slot at
