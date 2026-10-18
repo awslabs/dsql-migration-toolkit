@@ -249,9 +249,12 @@ def extract_sql_from_reply(markdown: str) -> Optional[str]:
     accompanying DDL (e.g. a suggested ``CREATE INDEX``, which the read-only
     playground can't run) and inline comments (a leading ``--`` would otherwise
     comment out the EXPLAIN and cause a syntax error). Returns ``None`` when no
-    fenced block or no testable statement is present. Pure/testable.
+    fenced block or no testable statement is present, and for a reply cut inside its last
+    fence: that block is the proposal, and an earlier one is often the 'before'. Pure/testable.
     """
-    if not markdown:
+    from dsql_migrator.ui.ai_chat_drawer import ends_in_open_fence
+
+    if not markdown or ends_in_open_fence(markdown):
         return None
     blocks = _SQL_FENCE_RE.findall(markdown)
     for block in reversed(blocks):

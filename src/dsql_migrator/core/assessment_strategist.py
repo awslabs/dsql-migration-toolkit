@@ -131,9 +131,16 @@ _MAX_TOOL_ROUNDS = 6
 # "What's next?" briefing). Telling such a punt from an answer that promises a later check by
 # the reply's wording never settled: each round of tuning missed new punts and nudged complete
 # answers (lost when the nudged round then failed). So every round asks for a tool call
-# (tool_choice "any") -- a look-up, or this one, whose Markdown is the reply: a turn cannot end
-# with an announcement, and the last round can only answer (tool_choice "tool"), so a turn
-# always ends with one.
+# (tool_choice "any") -- a look-up, or this one, whose Markdown is the reply -- and the last
+# round can only answer (tool_choice "tool").
+#
+# What that guarantees is that a turn cannot END IN TEXT, and only where the endpoint honours
+# tool_choice: under "any" / "tool" the API prefills the assistant turn with a tool call, as
+# Bedrock does for every model in SUPPORTED_BEDROCK_MODELS. A model or proxy that ignores it can
+# still end a turn in text, which tool_chat shows as it stands -- an announcement included, as
+# nothing reads a reply's wording. Nor is the answer's own Markdown read: an announcement
+# written INTO the answer tool is shown too, with only the tool's description and
+# _TOOL_CHAT_STYLE against it.
 #
 # Forced tool use needs thinking off (_THINKING_OFF: the API refuses tool_choice "any" / "tool"
 # beside extended thinking). The models that refuse forced tool use (Claude Sonnet 5.5, Opus 5.5,
@@ -167,8 +174,14 @@ _TOOL_CHAT_STYLE = (
 # A reply cut short -- at the model's output limit, or at the cap on what the panel shows --
 # says so, rather than ending mid-sentence as if it were whole. A code fence it cut stays open:
 # closed, the cut statement would be a complete block that "Use as target DDL" or "Test
-# rewrite on target" takes.
+# rewrite on target" takes (and open, neither takes the block before it: ends_in_open_fence).
 _CUT_NOTE = "\n\n_(The reply was cut at its length limit: ask for one part at a time.)_"
+# An answer called beside look-ups waits for their results (tool_chat), but it was received:
+# when the turn would end without a reply after all, it is the reply, saying what it lacks.
+_HELD_NOTE = (
+    "\n\n_(Written before the results of the look-ups it asked for; the answer from those "
+    "results did not come through, so ask again for it.)_"
+)
 
 
 def _answer_markdown(block: Mapping[str, Any]) -> str:
@@ -2004,10 +2017,13 @@ class AssessmentStrategist:
         read-only, credential-free callable the shell supplies over its own state) and
         the result fed back, in a bounded agentic loop. The reply comes through one more
         tool, the answer tool (:data:`_ANSWER_TOOL_SCHEMA`), and every round asks for a
-        tool call, so a turn is a look-up or the answer -- never only "let me check ...".
-        The answer's Markdown is delivered through ``on_delta`` and returned as
+        tool call, so where the endpoint honours ``tool_choice`` (Bedrock) a turn is a
+        look-up or the answer, never text that only says "let me check ...". The answer's
+        Markdown is delivered through ``on_delta`` and returned as
         :class:`ObjectGuidanceOutcome`; a turn of plain text (from a model or proxy that
-        ignored ``tool_choice``) is the reply as it stands.
+        ignored ``tool_choice``) is the reply as it stands, whatever it says. An answer cut
+        at the output limit before any of it arrived is asked for once more, shorter; an
+        answer held back beside look-ups is the reply if the turn would end without one.
 
         Non-streaming per round (tool-use and token streaming do not compose cleanly),
         so the final answer arrives at once; ``on_delta`` still receives it so the
@@ -2023,6 +2039,29 @@ class AssessmentStrategist:
             for m in _trim_chat_messages(messages, _MAX_CHAT_TRANSCRIPT_CHARS)
         ]
         rounds = max(1, max_rounds)
+        held = ""  # the latest answer called beside look-ups, held back while they run
+        asked_shorter = False
+
+        def reply(final: str, *, cut: bool = False, note: str = "") -> "ObjectGuidanceOutcome":
+            """``final`` as the turn's reply, within the panel's cap and saying when cut."""
+            markdown = final[:_MAX_NARRATIVE_CHARS]
+            if cut or len(final) > _MAX_NARRATIVE_CHARS:
+                markdown += _CUT_NOTE
+            markdown += note
+            on_delta(markdown)
+            return ObjectGuidanceOutcome(
+                available=True,
+                reason="OK",
+                detail="",
+                markdown=markdown,
+                model_id=self._config.model_id,
+            )
+
+        def ended(failure: "ObjectGuidanceOutcome") -> "ObjectGuidanceOutcome":
+            """The turn ends without an answer: ``failure`` -- unless one was held back beside
+            look-ups. It was received, so it is the reply rather than lost."""
+            return reply(held, note=_HELD_NOTE) if held else failure
+
         try:
             for round_number in range(rounds):
                 last = round_number == rounds - 1
@@ -2066,7 +2105,8 @@ class AssessmentStrategist:
                     # Record the assistant's tool-call turn verbatim, then answer each call.
                     # An answer called beside look-ups was written before their results came
                     # back, so it is not the reply: the model answers again from them -- but
-                    # on the last round, with no round left to read them, the answer is.
+                    # on the last round, with no round left to read them, the answer is. It
+                    # is held, too: if the rounds after it fail, it is the reply (ended).
                     convo.append({"role": "assistant", "content": content})
                     results: list[dict] = []
                     for block in tool_uses:
@@ -2106,6 +2146,7 @@ class AssessmentStrategist:
                             }
                         )
                     convo.append({"role": "user", "content": results})
+                    held = "\n\n".join(md for md in map(_answer_markdown, answers) if md) or held
                     continue
                 # The reply: the answer's Markdown -- or, from a turn that called no tool at
                 # all, its text.
@@ -2119,38 +2160,74 @@ class AssessmentStrategist:
                         and b.get("type") == "text"
                         and isinstance(b.get("text"), str)
                     ).strip()
+                if answers and not look_ups and not final and stop == "max_tokens":
+                    # The answer's Markdown is one tool parameter, and the API hands a
+                    # parameter back only once it is complete: cut at the output limit, none
+                    # of it arrived. Ask for a shorter one while a round is left -- once, as a
+                    # cut round spends the whole output budget -- else say why there is none.
+                    if last or asked_shorter:
+                        return ended(
+                            ObjectGuidanceOutcome(
+                                available=False,
+                                reason="INVALID_OUTPUT",
+                                detail=(
+                                    "The reply was longer than the assistant can write in "
+                                    "one turn. Ask for one part at a time."
+                                ),
+                            )
+                        )
+                    asked_shorter = True
+                    convo.append({"role": "assistant", "content": content})
+                    convo.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": block.get("id"),
+                                    "content": (
+                                        "Not shown: the reply was cut at the output limit "
+                                        "before any of it arrived. Call answer again with a "
+                                        "shorter reply -- the operator sees at most "
+                                        f"{_MAX_NARRATIVE_CHARS:,} characters: give the first "
+                                        "part and say how to ask for the rest."
+                                    ),
+                                }
+                                for block in answers
+                            ],
+                        }
+                    )
+                    continue
                 if not final:
                     err = AiAssistUnavailableError("INVALID_OUTPUT")
-                    return ObjectGuidanceOutcome(
-                        available=False, reason=err.reason, detail=err.detail
+                    return ended(
+                        ObjectGuidanceOutcome(
+                            available=False, reason=err.reason, detail=err.detail
+                        )
                     )
-                markdown = final[:_MAX_NARRATIVE_CHARS]
-                if stop == "max_tokens" or len(final) > _MAX_NARRATIVE_CHARS:
-                    markdown += _CUT_NOTE
-                on_delta(markdown)
-                return ObjectGuidanceOutcome(
-                    available=True,
-                    reason="OK",
-                    detail="",
-                    markdown=markdown,
-                    model_id=self._config.model_id,
+                return reply(final, cut=stop == "max_tokens")
+            return ended(
+                ObjectGuidanceOutcome(
+                    available=False,
+                    reason="UNAVAILABLE",
+                    detail=(
+                        "The assistant kept looking things up without answering. "
+                        "Try rephrasing the question."
+                    ),
                 )
-            return ObjectGuidanceOutcome(
-                available=False,
-                reason="UNAVAILABLE",
-                detail=(
-                    "The assistant kept looking things up without answering. "
-                    "Try rephrasing the question."
-                ),
             )
         except AiAssistUnavailableError as error:
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
+            return ended(
+                ObjectGuidanceOutcome(
+                    available=False, reason=error.reason, detail=error.detail
+                )
             )
         except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
             error = AiAssistUnavailableError(_classify_bedrock_error(exc))
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
+            return ended(
+                ObjectGuidanceOutcome(
+                    available=False, reason=error.reason, detail=error.detail
+                )
             )
 
 

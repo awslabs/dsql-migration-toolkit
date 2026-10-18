@@ -73,6 +73,19 @@ def markdown_has_code_block(md: str) -> bool:
     return _FENCE_RE.search(md or "") is not None
 
 
+# A line that opens a fence, as Markdown reads one (at the start of a line, a list item's indent
+# allowed) -- not three backticks inside a sentence.
+_FENCE_LINE_RE = re.compile(r"^[ \t]*```", re.MULTILINE)
+
+
+def ends_in_open_fence(md: str) -> bool:
+    """True when ``md`` ends inside a code fence it never closed -- a reply cut there, at the
+    model's output limit or at the panel's cap. Its last block is the cut one, so no complete
+    block before it stands for "the reply's last block" (what a footer takes). Pure."""
+    kind, body, _lang = split_markdown_segments(md)[-1]
+    return kind == "text" and _FENCE_LINE_RE.search(body) is not None
+
+
 def chat_turns_remaining(
     messages: "list[dict[str, str]]", *, max_turns: int = MAX_CHAT_TURNS
 ) -> int:

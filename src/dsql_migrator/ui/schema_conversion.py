@@ -4691,9 +4691,19 @@ def adopt_ddl_from_reply(
     not taken. Untrusted model SQL, so each taken statement passes the denylist first. The
     footer is shown exactly when this yields a script, so a click never refuses what it was
     offered for."""
+    from dsql_migrator.ui.ai_chat_drawer import ends_in_open_fence
+
     blocker = adoption_blocker(object_name, deterministic)
     if blocker is not None:
         return DdlAdoption(None, blocker)
+    if ends_in_open_fence(markdown):
+        # Cut inside its last block: that block is the DDL it meant, and it is incomplete. A
+        # complete one before it is often the current DDL, shown first for comparison.
+        return DdlAdoption(
+            None,
+            "This reply was cut inside its last code block, so the DDL it ends with is "
+            f"incomplete: ask for {object_name}'s DDL again.",
+        )
     found = _reply_object_ddl(
         markdown, object_name, object_create_kind(deterministic, object_name)
     )
