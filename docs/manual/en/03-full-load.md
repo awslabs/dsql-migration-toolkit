@@ -77,7 +77,7 @@ The loader reads with **keyset pagination on the primary key**, not `OFFSET`:
 
 ```sql
 SELECT <cols> FROM <table>
-WHERE pk > :last           -- composite PKs: explicit lexicographic OR-expansion (PK-index-friendly on MySQL 5.7+ and on PostgreSQL)
+WHERE pk > :last           -- composite PKs: the cursor the source's PK index serves (below)
 ORDER BY pk
 LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
@@ -89,6 +89,21 @@ SNAPSHOT` on InnoDB; PostgreSQL: a `REPEATABLE READ` transaction), so:
 
 - a whole table is **never loaded into RAM** — memory stays bounded by one page;
 - the read is a **single consistent snapshot** even as the live source changes.
+
+**How the cursor is written.** It follows the order the primary-key index keeps, in
+the form that index serves as a range. A composite key on MySQL uses the explicit
+lexicographic OR-expansion `(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`
+(MySQL 5.7 serves no row-value comparison from an index); on PostgreSQL it uses the
+row-value comparison `(k0, k1, …) > (:last_0, :last_1, …)`, an index condition on the
+primary key and on each partition's (there the OR-expansion is only a filter: every
+page would re-read the key from its start). A MySQL `ENUM` or `SET` key column is
+paged by the number MySQL sorts it by — its member index or bitmask — not by its
+label: an `ENUM` by the members declared after the cursor's (`col IN (…)`, which the
+index serves), a `SET` by its bitmask (`col + 0 > n`, which no index serves, so a key
+that starts with a `SET` column re-reads the key from its start on every page). The
+members are the ones Evaluation recorded: if the column's definition changes on the
+source, re-run Evaluation and Schema Conversion first — a key value the read cannot
+place stops the table and says so.
 
 **A primary key is required.** A table with no PK cannot be keyset-paginated and
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL

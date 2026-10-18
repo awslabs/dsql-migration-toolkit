@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 
-from typing import Optional
+from typing import Optional, Sequence
 
 from dsql_migrator.core.introspector import (
     MYSQL_DRIVER,
@@ -26,6 +26,7 @@ from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
     estimate_row_counts_query,
+    keyset_param_names,
     probe_scalar,
 )
 
@@ -36,6 +37,62 @@ from dsql_migrator.core.source_dialect.base import (
 _MYSQL_INTEGER_PK_TYPES = frozenset(
     {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
 )
+
+
+def _key_after_sql(
+    quoted: str, column: str, mysql_type: str, name: str, value: object, params: dict
+) -> Optional[str]:
+    """One key column's strict keyset term: its values that sort after ``value`` (the
+    cursor, bound as ``:name``), or ``None`` when none does. Adds what it binds to ``params``.
+
+    ``col > :name`` -- except for an ENUM or a SET. ORDER BY sorts those by the number MySQL
+    stores (an ENUM's member index, a SET's bitmask) while a comparison with the label
+    compares STRINGS, so ``> 'label'`` skipped or re-read rows at every page boundary of a
+    member order that is not alphabetical, silently: PK (status ENUM('new','active',
+    'closed'), id) read its 'new' rows only. An ENUM's term is the members declared after the
+    cursor's, ``col IN (...)``, which the PK index serves as a range (by the index, ``col >
+    2`` is only a Filter: every page re-reads the key from its start). A SET's is its
+    bitmask, ``col + 0 > :name_bits``, which no index serves: a LEADING SET column re-reads
+    the key from its start per page, a later one only the rows of its equal prefix. The
+    equality terms keep the label (``col = :name``), which the index serves and which names
+    one member. The members are the ones Step 1 (Evaluation) recorded.
+    """
+    from dsql_migrator.core.converter import mysql_enum_set_members
+
+    members = mysql_enum_set_members(mysql_type)
+    if members is None:
+        return f"{quoted} > :{name}"
+    kind, labels = members
+    if kind == "set":
+        parts = str(value).split(",") if value != "" else []
+        if not all(part in labels for part in parts):
+            raise _unrecorded_member(column, kind)
+        params[f"{name}_bits"] = sum(1 << labels.index(part) for part in set(parts))
+        return f"{quoted} + 0 > :{name}_bits"
+    if value in labels:
+        position = labels.index(value) + 1
+    elif value == "":
+        position = 0  # MySQL's invalid-value sentinel: index 0, sorted before every member
+    else:
+        raise _unrecorded_member(column, kind)
+    after = labels[position:]
+    if not after:
+        return None
+    in_names = [f"{name}_in_{j}" for j in range(len(after))]
+    params.update(zip(in_names, after))
+    return f"{quoted} IN ({', '.join(':' + n for n in in_names)})"
+
+
+def _unrecorded_member(column: str, kind: str) -> Exception:
+    """The read cannot place a key value its column's recorded members do not hold."""
+    from dsql_migrator.core.exporter import ExportError
+
+    return ExportError(
+        f"key column '{column}' holds {'an ENUM' if kind == 'enum' else 'a SET'} value that "
+        "is not one of the members Step 1 (Evaluation) recorded for it, so the read cannot "
+        "place it in the key order: the column's definition changed after Evaluation. "
+        "Re-run Step 1 (Evaluation) and Schema Conversion, then retry this table."
+    )
 
 
 class MySQLSourceDialect(SourceDialect):
@@ -123,6 +180,37 @@ class MySQLSourceDialect(SourceDialect):
         if is_spatial_mysql_type(column.mysql_type):  # type: ignore[attr-defined]
             return f"ST_AsBinary({quoted}) AS {quoted}"
         return quoted
+
+    def keyset_after_sql(
+        self, table: object, last_key: "Sequence[object]"
+    ) -> "tuple[str, dict[str, object]]":
+        # A composite key is the EXPLICIT lexicographic disjunction
+        #   (k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR ...
+        # rather than the row-value form ``(k0, k1, ...) > (:last_0, ...)``. Both are
+        # lexicographically equivalent, but the row-value comparison only gets a PK index
+        # range scan on MySQL 8.0.14+; on a 5.7-compatible source (RDS MySQL 5.7 / Aurora
+        # MySQL 2 -- both supported) it degrades to a FULL TABLE SCAN per page, making the
+        # whole keyset export O(n^2). The disjunction uses the PK index on every version. The
+        # named params (:last_i) are REUSED across terms (one value per key column). A
+        # one-column key is its strict term alone.
+        primary_key = list(table.primary_key)  # type: ignore[attr-defined]
+        types = {c.name: c.mysql_type for c in table.columns}  # type: ignore[attr-defined]
+        names = keyset_param_names(len(primary_key))
+        params: dict[str, object] = dict(zip(names, last_key))
+        equal: list[str] = []
+        terms: list[str] = []
+        for column, name, value in zip(primary_key, names, last_key):
+            quoted = self.quote_identifier(column)
+            after = _key_after_sql(quoted, column, types.get(column, ""), name, value, params)
+            if after is not None:
+                terms.append(" AND ".join([*equal, after]))
+            equal.append(f"{quoted} = :{name}")
+        if not terms:
+            # Only when every key column is an ENUM on its last member: nothing follows.
+            return "1 = 0", params
+        if len(primary_key) == 1:
+            return terms[0], params
+        return "(" + " OR ".join(f"({term})" for term in terms) + ")", params
 
     @property
     def snapshot_start_sql(self) -> str:

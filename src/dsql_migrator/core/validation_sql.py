@@ -22,7 +22,11 @@ from typing import Mapping, Optional, Sequence
 
 from psycopg import sql
 
-from dsql_migrator.core.converter import is_spatial_mysql_type, map_mysql_type
+from dsql_migrator.core.converter import (
+    is_spatial_mysql_type,
+    map_mysql_type,
+    mysql_enum_set_members,
+)
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
 
 # A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
@@ -941,13 +945,34 @@ def build_pg_count_sql(
 # engine); a composite/missing PK keeps the whole-table single-scan fallback.
 
 
+def _mysql_keyset_key(table: TableDef, pk_column: str) -> str:
+    """What a MySQL keyset page compares and advances ``pk_column`` by: the column itself,
+    or for an ENUM / SET its stored number, ``col + 0``.
+
+    MySQL sorts an ENUM by its member index and a SET by its bitmask, but MAX() and ``>``
+    over the label compare STRINGS: a page's MAX(page_pk) was not its last key and ``pk >
+    :last`` skipped and re-read rows past it whenever the members are not declared in
+    alphabetical order. By the number, MAX, ``>`` and the ORDER BY agree. No index serves
+    ``col + 0 > :last`` (every page reads the key from its start), which a one-column ENUM
+    key bounds anyway: at most 65,535 members, one row each. (The Full Load reader pages an
+    ENUM by an IN list of the members after the cursor, which its leading-ENUM composite
+    keys of any size need -- see source_dialect/mysql.py.)
+    """
+    pk_sql = _quote_mysql_identifier(pk_column)
+    column = next((c for c in table.columns if c.name == pk_column), None)
+    if column is not None and mysql_enum_set_members(column.mysql_type) is not None:
+        return f"{pk_sql} + 0"
+    return pk_sql
+
+
 def build_mysql_page_checksum_first_sql(table: TableDef, pk_column: str) -> str:
     """First keyset page of the MySQL checksum: ``(sub_sum, last_pk, row_count)``."""
     pk_sql = _quote_mysql_identifier(pk_column)
     table_sql = _quote_mysql_table(table.name)
     return (
         "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
-        f"SELECT {pk_sql} AS page_pk, {_mysql_row_token(table)} AS page_tok "
+        f"SELECT {_mysql_keyset_key(table, pk_column)} AS page_pk, "
+        f"{_mysql_row_token(table)} AS page_tok "
         f"FROM {table_sql} ORDER BY {pk_sql} LIMIT :page) ckpage"
     )
 
@@ -955,11 +980,12 @@ def build_mysql_page_checksum_first_sql(table: TableDef, pk_column: str) -> str:
 def build_mysql_page_checksum_next_sql(table: TableDef, pk_column: str) -> str:
     """Subsequent keyset page of the MySQL checksum after ``:last`` (ascending)."""
     pk_sql = _quote_mysql_identifier(pk_column)
+    key_sql = _mysql_keyset_key(table, pk_column)
     table_sql = _quote_mysql_table(table.name)
     return (
         "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
-        f"SELECT {pk_sql} AS page_pk, {_mysql_row_token(table)} AS page_tok "
-        f"FROM {table_sql} WHERE {pk_sql} > :last ORDER BY {pk_sql} LIMIT :page) ckpage"
+        f"SELECT {key_sql} AS page_pk, {_mysql_row_token(table)} AS page_tok "
+        f"FROM {table_sql} WHERE {key_sql} > :last ORDER BY {pk_sql} LIMIT :page) ckpage"
     )
 
 

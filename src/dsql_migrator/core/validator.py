@@ -232,7 +232,8 @@ def _source_checksum_keyset(
     """Accumulate the source checksum over bounded keyset pages (single-column PK).
 
     Each page sums the SAME per-row token as :func:`build_mysql_checksum_sql` over
-    only ``page_size`` rows (``WHERE pk > :last ORDER BY pk LIMIT N``); the per-page
+    only ``page_size`` rows (``WHERE pk > :last ORDER BY pk LIMIT N``; an ENUM / SET key
+    by its stored number, the order MySQL sorts it in); the per-page
     sub-sums are folded into a Python integer. Because the token is per-row and SUM is
     order-independent, the accumulated total equals the whole-table checksum exactly,
     with every statement bounded and memory at one row. Reads only the PK + token.

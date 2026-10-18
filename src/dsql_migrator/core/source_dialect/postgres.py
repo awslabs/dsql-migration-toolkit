@@ -33,6 +33,7 @@ from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
     estimate_row_counts_query,
+    keyset_param_names,
     probe_scalar,
 )
 
@@ -1389,6 +1390,27 @@ class PostgresSourceDialect(SourceDialect):
         if _reads_as_text(declared) or _reads_as_text(storage):
             return f"CAST({quoted} AS text) AS {quoted}"
         return quoted
+
+    def keyset_after_sql(
+        self, table: object, last_key: "Sequence[object]"
+    ) -> "tuple[str, dict[str, object]]":
+        # A composite key is the ROW-VALUE comparison ("k0", "k1", ...) > (:last_0, ...):
+        # the btree's index condition on the primary key (and on each partition's), in the
+        # ORDER BY's column-by-column order and collations. MySQL's lexicographic
+        # disjunction is only a Filter here -- each page re-read the key from its start,
+        # O(n^2) over the read (2M rows on PostgreSQL 16: 32.8 s, each 250k rows slower than
+        # the last, against 5.9 s by the row value and 4.8 s for a one-column key). Neither a
+        # shard's leading-column band nor an added ``k0 >= :last_0`` would do: each page
+        # would still re-read every row of the cursor's leading value. Bare columns, as in
+        # every WHERE here: they are the native ones, and a text-read key's cursor text
+        # binds back to its type.
+        primary_key = [self.quote_identifier(c) for c in table.primary_key]  # type: ignore[attr-defined]
+        names = keyset_param_names(len(primary_key))
+        params: dict[str, object] = dict(zip(names, last_key))
+        if len(primary_key) == 1:
+            return f"{primary_key[0]} > :{names[0]}", params
+        bound = ", ".join(f":{name}" for name in names)
+        return f"({', '.join(primary_key)}) > ({bound})", params
 
     @property
     def snapshot_start_sql(self) -> str:

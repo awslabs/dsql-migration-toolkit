@@ -11,13 +11,15 @@ keeps other formats orthogonal) while guaranteeing the source is only ever read.
 Pipeline for one table:
 
 1. PK keyset streaming (not OFFSET): rows are read in ascending primary-key
-   order with ``WHERE pk > :last ORDER BY pk LIMIT :batch_size`` (single key) or an
+   order with ``WHERE pk > :last ORDER BY pk LIMIT :batch_size`` (single key) or, for a
+   composite key, the predicate the source's PK index serves as a range -- MySQL the
    explicit lexicographic disjunction ``(k0 > :last_0) OR (k0 = :last_0 AND k1 >
-   :last_1) OR ...`` (composite key, PK-index-friendly on MySQL 5.7+, unlike the
-   row-value tuple form), carrying the last-seen primary key forward. This avoids large
-   ``OFFSET`` scans and yields a stable, resumable read order. Single- and
-   composite-column primary keys are supported; only a missing primary key raises
-   :class:`UnsupportedPrimaryKeyError` rather than being silently mishandled.
+   :last_1) OR ...`` (5.7 serves no row-value form), PostgreSQL the row-value comparison
+   ``(k0, k1, ...) > (:last_0, :last_1, ...)`` -- carrying the last-seen primary key
+   forward. This avoids large ``OFFSET`` scans and yields a stable, resumable read
+   order. Single- and composite-column primary keys are supported; only a missing
+   primary key raises :class:`UnsupportedPrimaryKeyError` rather than being silently
+   mishandled.
 2. Read-only consistent snapshot (Property 1 / Requirement 5.1): the stream runs
    inside ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` (InnoDB, REPEATABLE
    READ) -- the same snapshot semantics used by watermark capture (task 8.1) --
@@ -724,10 +726,9 @@ def _primary_key_columns(table: TableDef) -> list[str]:
     """Return the primary-key columns (one or more), or raise for a missing key.
 
     Keyset export streams in ascending primary-key order. A single-column key uses
-    ``pk > :last``; a composite key uses the explicit lexicographic disjunction
-    ``(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR ...`` which uses the
-    primary-key index on MySQL 5.7+ (the row-value tuple form does not), giving the
-    same stable, resumable read order. Only a
+    ``pk > :last``; a composite key the dialect's cursor
+    (:meth:`~dsql_migrator.core.source_dialect.SourceDialect.keyset_after_sql`), giving
+    the same stable, resumable read order. Only a
     MISSING primary key is unsupported (no deterministic read order exists).
     """
     primary_key = list(table.primary_key)
@@ -1039,10 +1040,11 @@ def keyset_stream(
 
     Issues ``SELECT <cols> FROM <table> [WHERE pk > :last] ORDER BY pk LIMIT
     :batch_size`` repeatedly, advancing ``:last`` to the last row's primary key,
-    until a short page signals exhaustion. Rows are yielded lazily one page at a
-    time, so the whole table is never materialized (Requirement 5.1). Every
-    statement is a ``SELECT`` (read-only, Property 1). Raises
-    :class:`UnsupportedPrimaryKeyError` for missing/composite primary keys.
+    until a short page signals exhaustion; the cursor predicate is the dialect's
+    (:meth:`~dsql_migrator.core.source_dialect.SourceDialect.keyset_after_sql`). Rows are
+    yielded lazily one page at a time, so the whole table is never materialized
+    (Requirement 5.1). Every statement is a ``SELECT`` (read-only, Property 1). Raises
+    :class:`UnsupportedPrimaryKeyError` for a missing primary key.
 
     ``should_cancel`` (optional) is polled before each page is fetched; when it
     returns ``True`` the stream raises :class:`ExportCancelled` instead of issuing
@@ -1054,7 +1056,7 @@ def keyset_stream(
     reader range sharding, where K readers each stream a disjoint slice of a large
     table concurrently. It applies to a single OR composite key (sharding sets it
     only for an INTEGER leading column): for a composite key the leading-column band
-    ANDs with the disjunction cursor below, so every row sharing a leading value
+    ANDs with the keyset cursor, so every row sharing a leading value
     stays in one slice (a composite key is never split). The bound uses the PK index
     (leading column is the index prefix) and preserves ascending-PK order within the
     slice. ``pk_upper=None`` means "to the end" (the last shard); ``pk_lower=None``
@@ -1104,7 +1106,7 @@ def keyset_stream(
 
     # Optional range bound on the LEADING PK column (reader sharding). Applies to a
     # single OR composite key: for a composite key it bands the leading (index-prefix)
-    # column and ANDs with the disjunction cursor below, so every row sharing a leading
+    # column and ANDs with the keyset cursor below, so every row sharing a leading
     # value stays in ONE shard (a composite key is never split across shards). Sharding
     # only sets these for an INTEGER leading column (shardable_leading_int_pk), whose
     # numeric-order boundaries keep the K ranges disjoint + covering.
@@ -1119,36 +1121,14 @@ def keyset_stream(
             range_clauses.append(f"{pk_sql_bound} < :pk_upper")
             range_params["pk_upper"] = pk_upper
 
-    if len(pk_columns) == 1:
-        # Single-column key: scalar ``pk > :last`` (one bind param ``last``).
-        pk_sql = dialect.quote_identifier(pk_columns[0])
-        where_sql = f"{pk_sql} > :last"
-        last_param_names = ["last"]
-    else:
-        # Composite key: the EXPLICIT lexicographic keyset expansion
-        #   (k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR ...
-        # rather than the row-value form ``(k0, k1, ...) > (:last_0, ...)``. Both are
-        # lexicographically equivalent, but the row-value comparison only gets a PK index
-        # range scan on MySQL 8.0.14+; on a 5.7-compatible source (RDS MySQL 5.7 / Aurora
-        # MySQL 2 -- both supported) it degrades to a FULL TABLE SCAN per page, making the
-        # whole keyset export O(n^2). The disjunction uses the PK index on every version. The
-        # named params (:last_i) are REUSED across terms, so the bind set is unchanged (one
-        # value per key column) and the param binding below is untouched.
-        key_sql_cols = [dialect.quote_identifier(c) for c in pk_columns]
-        last_param_names = [f"last_{i}" for i in range(len(pk_columns))]
-        terms: list[str] = []
-        for i in range(len(pk_columns)):
-            prefix_eq = [
-                f"{key_sql_cols[j]} = :{last_param_names[j]}" for j in range(i)
-            ]
-            strict_gt = f"{key_sql_cols[i]} > :{last_param_names[i]}"
-            terms.append(" AND ".join([*prefix_eq, strict_gt]))
-        where_sql = "(" + " OR ".join(f"({term})" for term in terms) + ")"
-
     # The first page has no keyset cursor yet, so its WHERE is only the range
-    # bound (if any); later pages AND the cursor with the range bound.
+    # bound (if any); later pages AND the cursor with the range bound. The cursor --
+    # "the key sorts after the previous page's last key" -- is the dialect's, in the form
+    # its PK index serves as a range (MySQL: the lexicographic disjunction, which 5.7's
+    # range optimizer needs; PostgreSQL: the row-value comparison, its btree index
+    # condition), and is built per page: a MySQL ENUM key column's term names the members
+    # declared after the cursor's (see the dialects).
     first_where = " AND ".join(range_clauses)
-    next_where = " AND ".join([where_sql, *range_clauses])
     # ONLY changes the rows read, not the FROM item's name: ORDER BY still qualifies by it.
     from_sql = f"ONLY {table_sql}" if from_only else table_sql
     first_page_sql = (
@@ -1156,10 +1136,13 @@ def keyset_stream(
         f"{(' WHERE ' + first_where) if first_where else ''} "
         f"ORDER BY {order_by_sql} LIMIT :batch_size"
     )
-    next_page_sql = (
-        f"SELECT {columns_sql} FROM {from_sql} WHERE {next_where} "
-        f"ORDER BY {order_by_sql} LIMIT :batch_size"
-    )
+
+    def _next_page_sql(after_sql: str) -> str:
+        next_where = " AND ".join([after_sql, *range_clauses])
+        return (
+            f"SELECT {columns_sql} FROM {from_sql} WHERE {next_where} "
+            f"ORDER BY {order_by_sql} LIMIT :batch_size"
+        )
 
     def _key_of(row: Mapping[str, object]) -> tuple:
         return tuple(row[c] for c in pk_columns)
@@ -1183,10 +1166,9 @@ def keyset_stream(
             statement = text(first_page_sql)
             params: dict[str, object] = {"batch_size": batch_size, **range_params}
         else:
-            statement = text(next_page_sql)
-            params = {"batch_size": batch_size, **range_params}
-            for name, value in zip(last_param_names, last_key):
-                params[name] = value
+            after_sql, params = dialect.keyset_after_sql(table, last_key)
+            statement = text(_next_page_sql(after_sql))
+            params.update({"batch_size": batch_size, **range_params})
 
         result = connection.execute(statement, params)
         if on_description is not None and page_index == 0:

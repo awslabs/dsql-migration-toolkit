@@ -144,6 +144,13 @@ def estimate_row_counts_query(
     return out
 
 
+def keyset_param_names(key_columns: int) -> list[str]:
+    """The bind parameters a keyset cursor carries the previous page's last key in, one
+    per key column in key order: ``last`` for a one-column key, else ``last_0``,
+    ``last_1``, ... Shared by every dialect's :meth:`SourceDialect.keyset_after_sql`."""
+    return ["last"] if key_columns == 1 else [f"last_{i}" for i in range(key_columns)]
+
+
 class SourceDialect(ABC):
     """Source-engine-specific behavior for reading a migration source (read-only)."""
 
@@ -302,6 +309,21 @@ class SourceDialect(ABC):
         MySQL wraps a spatial column as ``ST_AsBinary(col) AS col`` (WKB bytes,
         matching what Debezium delivers) so it can migrate to ``bytea``; an ordinary
         column is just the quoted name.
+        """
+
+    @abstractmethod
+    def keyset_after_sql(
+        self, table: object, last_key: "Sequence[object]"
+    ) -> "tuple[str, dict[str, object]]":
+        """The keyset cursor of a next page, and its bind parameters.
+
+        A predicate true for exactly the rows of ``table`` whose primary key sorts after
+        ``last_key`` -- the previous page's last key as the driver returned it, one value
+        per key column in key order -- in the ORDER BY the read uses (each key column,
+        native), written in the form the engine's primary-key index serves as a range:
+        a predicate the index only FILTERS re-reads the key from its start on every page,
+        O(n^2) over a large table. The parameters carry ``last_key`` in
+        :func:`keyset_param_names` (plus any a dialect derives from it). Built per page.
         """
 
     @property
@@ -559,4 +581,5 @@ __all__ = [
     "SourceVersions",
     "probe_scalar",
     "estimate_row_counts_query",
+    "keyset_param_names",
 ]

@@ -67,7 +67,7 @@ PostgreSQL 18에서는 재키잉된 테이블에 생성 컬럼이 없는지 — 
 
 ```sql
 SELECT <cols> FROM <table>
-WHERE pk > :last           -- 복합 PK: 명시적 사전식 OR 확장(MySQL 5.7+ 및 PostgreSQL에서 PK 인덱스 친화)
+WHERE pk > :last           -- 복합 PK: 소스의 PK 인덱스가 처리하는 커서(아래 참조)
 ORDER BY pk
 LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
@@ -78,6 +78,17 @@ PostgreSQL: `REPEATABLE READ` 트랜잭션) 안에서 **server-side/스트리밍
 
 - 테이블 전체가 **RAM에 올라오지 않음** — 메모리가 한 페이지로 한정;
 - 실행 중인 소스가 계속 바뀌어도 읽기는 **단일 일관 스냅샷**으로 유지됨.
+
+**커서를 쓰는 방식.** 커서는 기본 키 인덱스의 순서를 따르며, 그 인덱스가 범위로 처리하는 형태로
+작성됩니다. MySQL의 복합 키는 명시적 사전식 OR 확장 `(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`을
+씁니다(MySQL 5.7은 행 값 비교를 인덱스로 처리하지 못함). PostgreSQL은 행 값 비교
+`(k0, k1, …) > (:last_0, :last_1, …)`을 쓰며, 이는 기본 키와 각 파티션의 기본 키에 대한 인덱스 조건이
+됩니다(PostgreSQL에서 OR 확장은 필터일 뿐이라 페이지마다 키를 처음부터 다시 읽게 됨). MySQL `ENUM`·`SET`
+키 컬럼은 레이블이 아니라 MySQL이 정렬에 쓰는 숫자 — 멤버 인덱스 또는 비트마스크 — 로 페이지를 넘깁니다:
+`ENUM`은 커서의 멤버 뒤에 선언된 멤버들로(`col IN (…)`, 인덱스가 처리), `SET`은 비트마스크로
+(`col + 0 > n`, 인덱스가 처리하지 못하므로 `SET` 컬럼으로 시작하는 키는 페이지마다 키를 처음부터 다시 읽음).
+멤버는 Evaluation이 기록한 것이므로, 소스에서 컬럼 정의가 바뀌면 먼저 Evaluation과 Schema Conversion을
+다시 실행하세요 — 읽기가 키 순서에 놓을 수 없는 키 값을 만나면 테이블을 멈추고 그렇게 알립니다.
 
 **기본 키가 필요합니다.** PK 없는 테이블은 keyset 페이지네이션이 불가능해 거부됩니다(Evaluation에서도
 `UNSUPPORTED`로 플래그됨 — DSQL도 PK를 요구). 단일·복합 PK 모두 지원합니다 — 복합 키는 단순히 허용되는 수준을 넘어, 단조 증가 키에서 발생하는 쓰기 핫 파티션에 대한 이 도구의 권장 해결책입니다([7장 §7.1](07-performance-and-tuning.md#기본-키-전략--핫-파티션-회피) 참조).

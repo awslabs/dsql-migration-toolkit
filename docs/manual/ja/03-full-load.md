@@ -69,7 +69,7 @@ Full Load の後に選択したテーブルも、追加する前に同じ確認�
 
 ```sql
 SELECT <cols> FROM <table>
-WHERE pk > :last           -- composite PKs: explicit lexicographic OR-expansion (PK-index-friendly on MySQL 5.7+ and on PostgreSQL)
+WHERE pk > :last           -- composite PKs: the cursor the source's PK index serves (below)
 ORDER BY pk
 LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 ```
@@ -81,6 +81,19 @@ CONSISTENT SNAPSHOT`、PostgreSQL: `REPEATABLE READ` トランザクション)�
 
 - テーブル全体が**RAM にロードされることは決してなく** — メモリは 1 ページ分に一定に保たれます。
 - 稼働中のソースが変化し続けても、読み取りは**単一の一貫したスナップショット**になります。
+
+**カーソルの書き方。** カーソルは主キーインデックスの順序に従い、そのインデックスが範囲として処理できる形で
+書かれます。MySQL の複合キーでは明示的な辞書式 OR 展開
+`(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …` を使います(MySQL 5.7 は行値比較を
+インデックスで処理できません)。PostgreSQL では行値比較 `(k0, k1, …) > (:last_0, :last_1, …)` を使い、
+これは主キーと各パーティションの主キーに対するインデックス条件になります(PostgreSQL では OR 展開は
+フィルターにすぎず、ページごとにキーを先頭から読み直すことになります)。MySQL の `ENUM` / `SET` の
+キー列は、ラベルではなく MySQL がソートに使う数値 — メンバーのインデックスまたはビットマスク — で
+ページを進めます。`ENUM` はカーソルのメンバーの後に宣言されたメンバー(`col IN (…)`、インデックスが
+処理)で、`SET` はビットマスク(`col + 0 > n`、インデックスでは処理できないため、`SET` 列で始まる
+キーはページごとにキーを先頭から読み直します)で進めます。メンバーは Evaluation が記録したものです。
+ソースで列の定義が変わった場合は、先に Evaluation と Schema Conversion を再実行してください —
+読み取りがキーの順序に置けないキー値に出会うと、テーブルを停止してその旨を伝えます。
 
 **主キーが必須です。** PK を持たないテーブルは keyset ページネーションできないため拒否されます(DSQL も
 PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付けされます)。単一列 PK と複合 PK の

@@ -3029,6 +3029,29 @@ def is_spatial_mysql_type(mysql_type: str) -> bool:
     return base in _SPATIAL_TYPES
 
 
+@functools.lru_cache(maxsize=1024)
+def mysql_enum_set_members(mysql_type: str) -> Optional[tuple[str, tuple[str, ...]]]:
+    """``("enum" | "set", members in declaration order)`` for a MySQL ENUM / SET type.
+
+    ``None`` for any other type. Decoded by the same sqlglot parse Schema Conversion builds
+    the ENUM's ``CHECK`` from, so the members are exactly the labels the target accepts.
+    Shared with the Full Load exporter and Validation, whose keyset pages order such a key
+    column by its stored number -- an ENUM's member index, a SET's bitmask -- and so need its
+    members. Raises ``ValueError`` for an ENUM / SET whose members cannot be read.
+    """
+    tokens = mysql_type.strip().lower().replace("(", " ").split()
+    kind = tokens[0] if tokens else ""
+    if kind not in ("enum", "set"):
+        return None
+    try:
+        data_type = sqlglot.parse_one(
+            _normalize_mysql_type(mysql_type), into=exp.DataType, read=_MYSQL
+        )
+    except sqlglot.errors.SqlglotError as exc:
+        raise ValueError(f"unable to parse MySQL type {mysql_type!r}: {exc}") from exc
+    return kind, _enum_values(data_type)
+
+
 # MySQL binary/blob families whose DSQL target is ``bytea``. Aurora DSQL cannot use a
 # ``bytea`` column in a KEY (primary key or secondary index): "datatype bytea is not
 # supported in a key" (verified live). Spatial types also land in bytea (see
