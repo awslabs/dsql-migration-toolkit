@@ -528,9 +528,14 @@ burst cliff that most often bites full scans.
 ### Large tables on a write-heavy source
 
 Each table's read runs in a `REPEATABLE READ` snapshot held open **for that table's
-entire read**. On a write-heavy source that keeps InnoDB's undo history (**History
-List Length**) from being purged — undo/disk growth and slower reads — and with 16
-tables in flight the **oldest** open read view sets the purge horizon. Mitigations:
+entire read**. That holds on a MySQL source configured `READ-COMMITTED` too: the tool
+sets its own sessions to `REPEATABLE READ`
+([§3.2](03-full-load.md#32-streaming-export--bounded-memory-at-any-table-size)), so such
+a source, whose reads otherwise hold a read view only while a statement runs, holds one
+for each table the Full Load reads and each table Validation compares. On a write-heavy
+source that keeps InnoDB's undo history (**History List Length**) from being purged —
+undo/disk growth and slower reads — and with 16 tables in flight the **oldest** open
+read view sets the purge horizon. Mitigations:
 lower parallelism (fewer open read views); **shard the biggest tables by PK range**
 into separate, shorter runs (there's no page-size knob, so shortening any one
 snapshot means splitting the table set); and monitor History List Length, provisioning

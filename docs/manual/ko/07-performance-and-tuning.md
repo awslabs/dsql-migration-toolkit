@@ -397,9 +397,12 @@ Full Load는 프로덕션 소스를 읽으므로 자연스러운 걱정이 생�
 
 ### 쓰기 많은 소스의 대형 테이블
 
-각 테이블 읽기는 `REPEATABLE READ` 스냅샷 안에서 실행되며 **그 테이블 읽기 내내** 열려 있습니다. 쓰기 많은
-소스에서는 이것이 InnoDB undo 히스토리(**History List Length**)의 purge를 막아 — undo/디스크 증가와
-읽기 지연 — 16개 테이블이 in-flight면 **가장 오래된** read view가 purge 지평을 정합니다. 완화책: 병렬수
+각 테이블 읽기는 `REPEATABLE READ` 스냅샷 안에서 실행되며 **그 테이블 읽기 내내** 열려 있습니다.
+`READ-COMMITTED`로 설정된 MySQL 소스도 마찬가지입니다. 도구가 자기 세션을 `REPEATABLE READ`로 설정하므로
+([§3.2](03-full-load.md#32-스트리밍-export--어떤-크기든-한정된-메모리)), 평소에는 문장이 실행되는 동안만
+read view를 두는 그런 소스도 Full Load가 읽는 테이블마다, Validation이 비교하는 테이블마다 read view 하나를
+붙잡습니다. 쓰기 많은 소스에서는 이것이 InnoDB undo 히스토리(**History List Length**)의 purge를 막아 —
+undo/디스크 증가와 읽기 지연 — 16개 테이블이 in-flight면 **가장 오래된** read view가 purge 지평을 정합니다. 완화책: 병렬수
 낮추기(열린 read view 감소); **가장 큰 테이블을 PK 범위로 쪼개** 별도의 짧은 런으로(페이지 크기 노브가 없으니
 개별 스냅샷을 짧게 하려면 테이블 셋을 쪼갬); History List Length 모니터링, 시작 전 여유 공간 확보로 undo 증가가
 storage-full을 유발하지 않게.

@@ -82,6 +82,17 @@ CONSISTENT SNAPSHOT`、PostgreSQL: `REPEATABLE READ` トランザクション)�
 - テーブル全体が**RAM にロードされることは決してなく** — メモリは 1 ページ分に一定に保たれます。
 - 稼働中のソースが変化し続けても、読み取りは**単一の一貫したスナップショット**になります。
 
+**MySQL はソース自体の設定にかかわらず `REPEATABLE READ` で読み取ります。** ツールが開くすべての MySQL
+ソースセッションは、最初に `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ` を実行します。セッションの
+設定なので、サーバーの `transaction_isolation` はそのままで、権限も必要ありません。MySQL は `REPEATABLE READ`
+未満では `WITH CONSISTENT SNAPSHOT` を無視する(warning 138)ため、これがなければ `READ-COMMITTED` に設定された
+ソースでは各ページが実行時点でコミット済みの行を読み、読み取り中にキーが変わった行が 2 回コピーされたり、
+まったくコピーされなかったりすることがあります。ウォーターマークの取得と Validation のテーブルごとの
+読み取りも同じ種類のスナップショットを開きます。そのため、そのようなソースでも各テーブルの読み取りは終わるまで
+InnoDB の read view を 1 つ保持します — `REPEATABLE READ` のソースと同じです。書き込みの多いソースでは、
+大きなテーブルを読み取る間 History List Length が増えます
+([§7.3](07-performance-and-tuning.md#書き込みの多いソースでの大きなテーブル))。
+
 **カーソルの書き方。** カーソルは主キーインデックスの順序に従い、そのインデックスが範囲として処理できる形で
 書かれます。MySQL の複合キーでは明示的な辞書式 OR 展開
 `(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …` を使います(MySQL 5.7 は行値比較を

@@ -332,7 +332,10 @@ def test_the_rls_refusal_is_recognised_by_sqlstate_and_message() -> None:
 def test_postgres_sessions_turn_row_security_off_with_a_set_not_a_startup_option() -> None:
     pg = dialect_for(SourceType.POSTGRES)
     assert pg.session_setup_sql == ("SET row_security = off",)
-    assert dialect_for(SourceType.MYSQL).session_setup_sql == ()
+    # MySQL sets its own, the isolation level (G136, tests/test_g136_mysql_repeatable_read.py).
+    assert dialect_for(SourceType.MYSQL).session_setup_sql == (
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    )
     # Not a libpq ``options`` startup parameter, which RDS Proxy rejects.
     for timeout in (None, 300):
         options = pg.engine_kwargs(read_timeout_seconds=timeout)["connect_args"]["options"]
@@ -399,7 +402,9 @@ def test_every_source_engine_factory_installs_the_session_setup(factory_name: st
             engine.dispose()
 
     assert _installed(SourceType.POSTGRES) == [("SET row_security = off",)]
-    assert _installed(SourceType.MYSQL) == []
+    assert _installed(SourceType.MYSQL) == [
+        ("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",)
+    ]
 
 
 # ---------------------------------------------------------------------------

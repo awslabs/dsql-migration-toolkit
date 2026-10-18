@@ -422,7 +422,8 @@ def install_session_setup(engine: Engine, statements: "Sequence[str]") -> None:
     """Run ``statements`` on every new DBAPI connection of ``engine``, before it is used.
 
     The source dialect's :attr:`~dsql_migrator.core.source_dialect.base.SourceDialect.
-    session_setup_sql` (PostgreSQL: ``SET row_security = off``). A ``connect`` listener, so
+    session_setup_sql` (PostgreSQL: ``SET row_security = off``; MySQL: ``SET SESSION
+    TRANSACTION ISOLATION LEVEL REPEATABLE READ``). A ``connect`` listener, so
     it covers every connection the pool ever opens -- each shard reader, and the fresh one
     ``pool_pre_ping`` makes after a dropped connection -- not just the first. The
     statements are COMMITTED: the driver opens a transaction around them, and a SET made
@@ -446,7 +447,10 @@ def install_session_setup(engine: Engine, statements: "Sequence[str]") -> None:
     # Recorded on the listener so a test can see what a built engine will send.
     _set_up.session_setup_sql = pending  # type: ignore[attr-defined]
     # insert=True: before SQLAlchemy's own first-connect initialisation, as the SQLAlchemy
-    # recipe for per-connection session settings does.
+    # recipe for per-connection session settings does. The MySQL pin depends on it: that
+    # initialisation reads the session's isolation level as the dialect's default, which the
+    # pool sets again on a connection given back after an AUTOCOMMIT use -- read before the
+    # pin, it would be the source's READ COMMITTED and undo the pin on the next checkout.
     event.listen(engine, "connect", _set_up, insert=True)
 
 

@@ -27,7 +27,8 @@ value is as-of one point):
   which a Full load + CDC table added after the load is compared with (G17).
 
 Global consistency is obtained with ``START TRANSACTION WITH CONSISTENT
-SNAPSHOT`` (InnoDB, REPEATABLE READ): a single reader sees all tables at one
+SNAPSHOT`` (InnoDB, REPEATABLE READ, which every MySQL source session is set to,
+whatever the source's default): a single reader sees all tables at one
 coordinate. This is the accurate, slightly slower default described in the
 design.
 

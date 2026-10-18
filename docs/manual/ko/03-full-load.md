@@ -79,6 +79,16 @@ PostgreSQL: `REPEATABLE READ` 트랜잭션) 안에서 **server-side/스트리밍
 - 테이블 전체가 **RAM에 올라오지 않음** — 메모리가 한 페이지로 한정;
 - 실행 중인 소스가 계속 바뀌어도 읽기는 **단일 일관 스냅샷**으로 유지됨.
 
+**MySQL은 소스 자체 설정과 관계없이 `REPEATABLE READ`로 읽습니다.** 도구가 여는 모든 MySQL 소스 세션은
+먼저 `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ`를 실행합니다. 세션 설정이라 서버의
+`transaction_isolation`은 그대로이고, 권한도 필요 없습니다. MySQL은 `REPEATABLE READ` 미만에서
+`WITH CONSISTENT SNAPSHOT`을 무시하므로(warning 138), 그렇지 않으면 `READ-COMMITTED`로 설정된 소스에서는
+각 페이지가 실행 시점에 커밋된 행을 읽어, 읽는 도중 키가 바뀐 행이 두 번 복사되거나 아예 복사되지 않을 수
+있습니다. 워터마크 캡처와 Validation의 테이블별 읽기도 같은 종류의 스냅샷을 엽니다. 따라서 그런 소스에서도
+각 테이블 읽기는 끝날 때까지 InnoDB read view 하나를 붙잡습니다 — `REPEATABLE READ` 소스와 같습니다. 쓰기
+많은 소스에서는 큰 테이블을 읽는 동안 History List Length가 늘어납니다
+([§7.3](07-performance-and-tuning.md#쓰기-많은-소스의-대형-테이블)).
+
 **커서를 쓰는 방식.** 커서는 기본 키 인덱스의 순서를 따르며, 그 인덱스가 범위로 처리하는 형태로
 작성됩니다. MySQL의 복합 키는 명시적 사전식 OR 확장 `(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`을
 씁니다(MySQL 5.7은 행 값 비교를 인덱스로 처리하지 못함). PostgreSQL은 행 값 비교

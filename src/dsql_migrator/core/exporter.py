@@ -22,7 +22,9 @@ Pipeline for one table:
    :class:`UnsupportedPrimaryKeyError` rather than being silently mishandled.
 2. Read-only consistent snapshot (Property 1 / Requirement 5.1): the stream runs
    inside ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` (InnoDB, REPEATABLE
-   READ) -- the same snapshot semantics used by watermark capture (task 8.1) --
+   READ, which every MySQL source session is set to:
+   :attr:`~dsql_migrator.core.source_dialect.mysql.MySQLSourceDialect.session_setup_sql`)
+   -- the same snapshot semantics used by watermark capture (task 8.1) --
    and the read-only guard from :mod:`dsql_migrator.core.introspector` is
    installed on the default engine so any accidental write/DDL is refused before
    reaching the database. A server-side / streaming cursor (``stream_results``)

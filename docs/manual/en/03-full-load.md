@@ -90,6 +90,18 @@ SNAPSHOT` on InnoDB; PostgreSQL: a `REPEATABLE READ` transaction), so:
 - a whole table is **never loaded into RAM** — memory stays bounded by one page;
 - the read is a **single consistent snapshot** even as the live source changes.
 
+**MySQL reads at `REPEATABLE READ`, whatever the source's own setting.** Every MySQL
+source session the tool opens first runs `SET SESSION TRANSACTION ISOLATION LEVEL
+REPEATABLE READ`. It is a session setting: the server's `transaction_isolation` is left as
+it is, and no privilege is needed. MySQL ignores `WITH CONSISTENT SNAPSHOT` below
+`REPEATABLE READ` (warning 138), so on a source configured `READ-COMMITTED` each page
+would otherwise read the rows committed when it runs, and a row whose key changed during
+the read could be copied twice or not at all. The watermark capture and Validation's
+per-table reads open the same kind of snapshot. On such a source each table read therefore
+holds one InnoDB read view until it ends, as on a `REPEATABLE READ` source: on a
+write-heavy source the History List Length grows while a large table is read
+([§7.3](07-performance-and-tuning.md#large-tables-on-a-write-heavy-source)).
+
 **How the cursor is written.** It follows the order the primary-key index keeps, in
 the form that index serves as a range. A composite key on MySQL uses the explicit
 lexicographic OR-expansion `(k0 > :last_0) OR (k0 = :last_0 AND k1 > :last_1) OR …`

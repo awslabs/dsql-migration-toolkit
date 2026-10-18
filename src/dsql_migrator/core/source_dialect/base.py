@@ -470,8 +470,13 @@ class SourceDialect(ABC):
         Sent as statements after connect, never as startup parameters, so a proxy that
         rejects those (RDS Proxy refuses the libpq ``options`` parameter) still connects.
         Installed on every source engine by
-        :func:`~dsql_migrator.core.introspector.install_session_setup`. Default: none
-        (MySQL pins its session time zone through the driver's ``init_command``).
+        :func:`~dsql_migrator.core.introspector.install_session_setup`, on the DBAPI
+        connection, below the read-only guard: each must be one the guard lets through
+        (:func:`~dsql_migrator.core.introspector.is_write_or_ddl` false). Default: none.
+        PostgreSQL turns ``row_security`` off; MySQL sets the session to REPEATABLE READ,
+        without which ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` opens no snapshot on a
+        source configured READ-COMMITTED (its session time zone is pinned through the
+        driver's ``init_command`` instead).
         """
         return ()
 

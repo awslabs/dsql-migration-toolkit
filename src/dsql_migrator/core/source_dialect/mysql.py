@@ -38,6 +38,19 @@ _MYSQL_INTEGER_PK_TYPES = frozenset(
     {"tinyint", "smallint", "mediumint", "int", "integer", "bigint"}
 )
 
+# Sent on every new source connection (see ``MySQLSourceDialect.session_setup_sql``):
+# ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` opens a snapshot only at REPEATABLE READ.
+# Below it MySQL ignores the clause (warning 138) and each statement reads what is committed
+# when it runs, so on a source configured READ-COMMITTED (``transaction_isolation``) the Full
+# Load read (each keyset page from a later point), the watermark capture and Validation's
+# per-table snapshot were not snapshots, and a row whose key moved during a table's read was
+# read twice or missed (G136: reproduced with the real single reader). A session SET: the
+# server's setting is left alone, no privilege is needed, and it is not a write (the
+# read-only guard lets a SET through). The cost is the one a REPEATABLE READ source always
+# had: each table read holds one InnoDB read view, which holds back purge (History List
+# Length) on a write-heavy source.
+_MYSQL_REPEATABLE_READ = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+
 
 # The live definitions of a table's key columns, read once when a keyset stream of a table
 # whose key has an ENUM / SET column starts (G130): the cursor names such a column's
@@ -336,10 +349,19 @@ class MySQLSourceDialect(SourceDialect):
 
     @property
     def snapshot_start_sql(self) -> str:
-        # MySQL: InnoDB REPEATABLE READ consistent snapshot (same as watermark capture).
+        # MySQL: InnoDB REPEATABLE READ consistent snapshot (same as watermark capture). A
+        # snapshot whatever the source's default isolation: see session_setup_sql.
         from dsql_migrator.core.watermark import START_CONSISTENT_SNAPSHOT
 
         return START_CONSISTENT_SNAPSHOT
+
+    @property
+    def session_setup_sql(self) -> tuple[str, ...]:
+        # Every source session, not only the Full Load stream: the watermark capture and
+        # Validation's per-table reads open the same consistent snapshot, and every other
+        # read then runs as it does on a source left at MySQL's default isolation. The
+        # session time zone stays in the driver's init_command. See _MYSQL_REPEATABLE_READ.
+        return (_MYSQL_REPEATABLE_READ,)
 
     def value_converter(self, table: object, *, target_types: object = None) -> object:
         from dsql_migrator.core.exporter import ValueConverter
