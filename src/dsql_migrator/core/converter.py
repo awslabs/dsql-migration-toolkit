@@ -65,6 +65,7 @@ data migrator, keeping the DDL/DML separation rule intact (Property 2).
 
 from __future__ import annotations
 
+import datetime
 import decimal
 import functools
 import hashlib
@@ -7379,7 +7380,7 @@ class SchemaConverter:
         if table_index is None:
             table_index = table_type_index(tables)
         converted = _converted_mysql_view(
-            view.name, definition, view_column_types(definition, table_index)
+            view.name, definition, view_column_types(definition, table_index, schema=schema_name)
         )
         if converted is None:
             return _manual_view_conversion(view.name, schema_ddls)
@@ -7508,16 +7509,19 @@ _SHOWN = "mysql_shown"
 # The meta key marking the ROUND that shows a COALESCE's value at the scale of its widest
 # value (MySQL's IFNULL(price, 0) is 0.00): JSON writes the value itself, as MySQL does.
 _WIDENED = "mysql_widened"
-# The note for a value of a type that cannot be told made text as x || ''.
+# The note for LENGTH of a value of a type that cannot be told, counted as x || ''.
 _UNTYPED_TEXT_NOTE = (
-    "LENGTH, a string function, LIKE or CONCAT reads a value whose type cannot be told here -- "
-    "a column of another view, of a derived table or CTE that computes it, or (in the Query "
-    "Converter) of a table Step 1 has not read: it is made text as x || '' (text for every "
-    "type, bytes kept bytes), MySQL's text for text, bytes, integers, decimals and dates, but "
-    "not for a TINYINT(1) (a boolean on Aurora DSQL: 'true' / 'false'), a FLOAT (MySQL writes "
-    "6 significant digits), a TIMESTAMP (its text there carries the zone) or a DATETIME / "
-    "TIME with fractional digits (trailing zeros dropped)."
+    "LENGTH / CHAR_LENGTH reads a value whose type cannot be told here -- a column of another "
+    "view, of a derived table or CTE that computes it, or (in the Query Converter) of a table "
+    "Step 1 has not read: it counts the text of x || '' (text for every type, bytes kept "
+    "bytes), MySQL's count for text, bytes, integers, decimals and dates, but not for a "
+    "TINYINT(1) (a boolean on Aurora DSQL: 'true' / 'false'), a FLOAT (MySQL writes 6 "
+    "significant digits), a TIMESTAMP (its text there carries the zone) or a DATETIME / TIME "
+    "with fractional digits (trailing zeros dropped)."
 )
+# The meta key holding how many [0] steps a followed JSON path's value holds, its
+# document's included (each step holds its value three times: _MAX_ZERO_STEPS).
+_ZERO_STEPS = "mysql_zero_steps"
 # The meta key holding ``(shown scale, digits kept)`` of a quotient (an AVG) written as
 # MySQL's exact division.
 _QUOTIENT_SCALE = "mysql_scale"
@@ -8076,20 +8080,6 @@ def _scalar_projection(subquery: exp.Subquery) -> Optional[exp.Expression]:
     if isinstance(query, exp.Select) and len(query.expressions) == 1:
         return query.expressions[0].unalias()
     return None
-
-
-def _reads_derived(column: exp.Column) -> bool:
-    """Whether a qualified column is read from a derived table or a CTE of its statement,
-    not from a table or a view."""
-    if not column.table:
-        return False
-    scope = _type_scope(column)
-    while scope is not None:
-        bound = next((item for item in _scope_sources(scope) if _binds(item, column)), None)
-        if bound is not None:
-            return isinstance(bound, exp.Subquery) or (isinstance(bound, exp.Table) and _cte_named(bound) is not None)
-        scope = _type_scope(scope)
-    return False
 
 
 def _unshown(node: exp.Expression) -> exp.Expression:
@@ -9185,11 +9175,12 @@ def _rewrite_mysql_calls(
     inventory's tables, a Query Converter statement over the Evaluation inventory), else
     what the expression computes (a cast, a date function, date arithmetic, an aggregate,
     a JSON call, a CASE / COALESCE of them) -- a derived table's or CTE's column by what its
-    body selects. Unknown, a value is made text as ``x || ''`` where MySQL wants a string
-    (LENGTH, a string function, LIKE, a CONCAT with no text in it -- right for any type but
-    a few, noted), a column's BINARY is ``CAST(x AS BYTEA)`` (noted: right for bytes only),
-    ordered by the bytes of its text, grouped as itself. Rewritten, faithfully (each checked
-    against MySQL 8.4 and PostgreSQL 17):
+    body selects. Unknown, a value's LENGTH counts the text of ``x || ''`` (right for any
+    type but a few, noted), a column in a string function, LIKE or compared as BINARY is
+    left as it is (right for text; PostgreSQL refuses a number there) -- in LPAD / RPAD
+    and a CONCAT with no text it is ``x || ''`` -- a column's BINARY is ``CAST(x AS
+    BYTEA)`` (noted: right for bytes only), ordered by the bytes of its text, grouped as
+    itself. Rewritten, faithfully (each checked against MySQL 8.4 and PostgreSQL 17):
 
     * YEAR/MONTH/DAY/DAYOFMONTH/DAYOFYEAR/QUARTER/HOUR/MINUTE/WEEKOFYEAR / WEEK(x, 3)(x) ->
       EXTRACT as an integer, SECOND(x) its whole seconds, DAYOFWEEK(x) EXTRACT(DOW) + 1,
@@ -9217,7 +9208,8 @@ def _rewrite_mysql_calls(
       integer the integer; a TINYINT(1) or a comparison read as a number as its integer, a
       number assigned to a TINYINT(1) as a boolean; INTERVAL x unit + d as d + INTERVAL x
       unit;
-    * GROUP_CONCAT(x) -> STRING_AGG over text, and with DISTINCT x ORDER BY x ->
+    * GROUP_CONCAT(x) -> STRING_AGG over text (a TINYINT(1) or a comparison as its digit),
+      and with DISTINCT x ORDER BY x ->
       ARRAY_TO_STRING(ARRAY_AGG(DISTINCT x ORDER BY x) FILTER (WHERE x IS NOT NULL));
     * CONCAT_WS skipping NULLs as MySQL does, GREATEST/LEAST returning NULL for a NULL
       argument as MySQL does (once per nest, through every NULL-strict node in it), LENGTH
@@ -9225,7 +9217,8 @@ def _rewrite_mysql_calls(
       boolean or a comparison made MySQL's text of it where MySQL wants a string (CONCAT /
       CONCAT_WS -- bytes beside text decoded -- LPAD / RPAD, LEFT / RIGHT, SUBSTRING,
       REPLACE, UPPER / LOWER, TRIM, REVERSE, REPEAT, MD5, ASCII, LOCATE, LIKE, REGEXP,
-      GREATEST / LEAST beside a string, a UNION column beside strings), a COALESCE / CASE /
+      GREATEST / LEAST beside a string but a number string below 2, a UNION column beside a
+      text or a string PostgreSQL would not read as its values), a COALESCE / CASE /
       IF MySQL makes a string as MySQL reads it where it stands (chosen_as_mysql), a CHAR(n)
       column's padding left out where MySQL leaves it out, a DATE plus days/months a DATE
       (an amount in whole units, as MySQL counts it -- a string by its leading integer, a
@@ -9234,8 +9227,9 @@ def _rewrite_mysql_calls(
       time;
     * JSON_ARRAY / JSON_ARRAYAGG -> JSON_BUILD_ARRAY / JSON_AGG, which keep NULLs, and
       every JSON value written as MySQL writes it (a DATETIME 'YYYY-MM-DD HH:MM:SS.ffffff',
-      a TIME with microseconds, a TINYINT(1) as its number, a CHAR(n) without padding, a
-      date beside a date string MySQL's string of them); JSON_EXTRACT / -> and
+      a TIME with microseconds, a TINYINT(1) as its number, a comparison as true / false, a
+      CHAR(n) without padding, a date beside a date string MySQL's string of them);
+      JSON_EXTRACT / -> and
       JSON_UNQUOTE(JSON_EXTRACT(...)) -- MySQL's ->> -- over a path of member names and
       indexes -> the value MySQL's path finds (a member in an object, an index in an array,
       [0] of a value that is no array the value itself), ->> a JSON null as 'null' (NULL
@@ -9624,7 +9618,8 @@ def _rewrite_mysql_calls(
     def carries_quotient(node: Optional[exp.Expression]) -> bool:
         """Whether an exact value holds more digits than MySQL shows: a quotient or an AVG
         not rounded since -- also one read out of a derived table or a CTE, typed as such
-        (:class:`_QuotientType`), which MySQL merges into the query that reads it."""
+        (:class:`_QuotientType`, which only their columns are given -- a name written bare
+        too), which MySQL merges into the query that reads it."""
         while isinstance(node, exp.Paren):
             node = node.this
         if node is None:
@@ -9635,7 +9630,7 @@ def _rewrite_mysql_calls(
             # An unqualified one is the one source of its query that has it, as the resolver
             # bound it: a _QuotientType is only ever a derived table's or a CTE's column.
             mysql_type = column_type(node) if column_type is not None else None
-            return isinstance(mysql_type, _QuotientType) and (not node.table or _reads_derived(node))
+            return isinstance(mysql_type, _QuotientType)
         if isinstance(node, _ARGUMENT_SCALED):
             return carries_quotient(_aggregated(node))
         if isinstance(node, exp.Subquery):
@@ -9822,6 +9817,11 @@ def _rewrite_mysql_calls(
             return f"{kind}({precision})" if precision else kind
         return _KIND_TYPES.get(kind or "")
 
+    def zero_steps(document: exp.Expression) -> int:
+        """How many [0] steps of a nest of followed JSON paths ``document`` holds (each type
+        test written for one is marked with the count so far)."""
+        return max((node.meta.get(_ZERO_STEPS, 0) for node in document.walk()), default=0)
+
     def json_at(document: exp.Expression, steps: "list") -> exp.Expression:
         """The JSON value at ``steps`` (:func:`_json_path_steps`) of ``document``, as MySQL's
         path finds it: a member name only in an object, an index only in an array -- and [0]
@@ -9831,6 +9831,7 @@ def _rewrite_mysql_calls(
         # The operators: JSON_EXTRACT_PATH reads a name that is a number as an index too.
         value = document
         run: list = []
+        zeros = zero_steps(document)
         for step in [*steps, None]:
             if step is not None and not (type(step) is int and step == 0):
                 run.append(step)
@@ -9840,9 +9841,12 @@ def _rewrite_mysql_calls(
                 run = []
             if step is not None:
                 bare = value.this if isinstance(value, exp.Paren) else value
+                zeros += 1
+                typed = pg_call("JSON_TYPEOF", bare.copy())
+                typed.meta[_ZERO_STEPS] = zeros
                 value = exp.Case(
                     ifs=[exp.If(
-                        this=exp.EQ(this=pg_call("JSON_TYPEOF", bare.copy()), expression=exp.Literal.string("array")),
+                        this=exp.EQ(this=typed, expression=exp.Literal.string("array")),
                         true=exp.JSONExtract(this=value.copy(), expression=_json_path([0]), only_json_types=True),
                     )],
                     default=bare,
@@ -9910,6 +9914,8 @@ def _rewrite_mysql_calls(
         whose type cannot be told (PostgreSQL compares text with text, and reads a
         placeholder's type from it)."""
         held, parent = standing(node)
+        if isinstance(parent, exp.Distinct) and isinstance(parent.parent, (exp.Sum, exp.Avg)):
+            held, parent = parent, parent.parent  # SUM(DISTINCT x) reads x as SUM(x) does
         if isinstance(parent, exp.Interval) or (
             isinstance(parent, (exp.Add, exp.Sub, exp.DateAdd, exp.DateSub)) and interval_of(parent) is not None
         ):
@@ -10487,7 +10493,12 @@ def _rewrite_mysql_calls(
     as_written = {id(n): (n, n.sql()) for n in select.find_all(exp.JSONExtractScalar)} if grouped else {}
     for node in nodes(exp.JSONExtract, exp.JSONExtractScalar, innermost=True):
         steps = _json_path_steps(node.expression)
-        if steps is None or node.expressions:
+        # A [0] step holds its value three times, and a nested call's document is the inner
+        # call's value: the steps are counted through the nest (27 copies a level, else).
+        zeros = sum(1 for step in steps or () if type(step) is int and step == 0)
+        if zeros:
+            zeros += zero_steps(node.this)
+        if steps is None or node.expressions or zeros > _MAX_ZERO_STEPS:
             # Left as MySQL's own call, which Aurora DSQL refuses -- JSON_EXTRACT_PATH would
             # read such a path as a key, NULL on every row (and sqlglot writes no wildcard) --
             # and reported below, not as a call left untranslated.
@@ -10563,20 +10574,13 @@ def _rewrite_mysql_calls(
         issue(
             f"MySQL's {', '.join(dict.fromkeys(unfollowed))} (JSON_EXTRACT, -> or ->>) reads "
             "the whole document ('$'), a wildcard (* / **), last, a range (m to n), a negative "
-            "index, a path computed at run time or more than three [0] steps (each one tests "
-            "the value's type, which MySQL reads as an array of one when it is none) -- or "
-            "several paths, whose values MySQL returns as an array: Aurora DSQL's JSON "
-            "functions follow one fixed path of member names and array indexes, and the call "
-            "is left as MySQL's (which Aurora DSQL refuses). Rewrite it."
+            "index, a path computed at run time or more than three [0] steps, counted through "
+            "the calls nested in its document (each one tests the value's type, which MySQL "
+            "reads as an array of one when it is none) -- or several paths, whose values MySQL "
+            "returns as an array: Aurora DSQL's JSON functions follow one fixed path of member "
+            "names and array indexes, and the call is left as MySQL's (which Aurora DSQL "
+            "refuses). Rewrite it."
         )
-
-    def untyped_text(node: exp.Expression) -> exp.Expression:
-        """A bare column whose type cannot be told where MySQL wants a string: x || '' --
-        text for every type, bytes kept bytes -- noted (a few types' text differs)."""
-        if not (isinstance(node, exp.Column) and kind_of(node) is None):
-            return node
-        issue(_UNTYPED_TEXT_NOTE)
-        return _any_text(node)
 
     def textual(node: exp.Expression) -> exp.Expression:
         """``node`` as MySQL makes it text where it wants a string (as_text) -- text, bytes
@@ -10628,28 +10632,98 @@ def _rewrite_mysql_calls(
             for o in others if o is not None
         )
 
+    def read_alike(literals: "list[exp.Expression]", values: "list[exp.Expression]") -> bool:
+        """Whether PostgreSQL reads every string literal beside ``values`` as their type
+        with the literal's own text, so that MySQL's string of each value is Aurora DSQL's
+        text of it: a number literal beside numbers ('0' beside an INT, '2.50' beside a
+        DECIMAL, an integer beside a FLOAT / DOUBLE), an ISO date beside DATEs, an ISO date
+        and time beside DATETIMEs without fractional digits, each a real date (MySQL's
+        '0000-00-00' is none to PostgreSQL). (A TINYINT(1)'s text differs, as do a
+        TIMESTAMP's -- its zone -- a fraction's and a quotient's, shown at its scale.)"""
+        kinds = {kind_of(value) for value in values}
+        if not literals or not kinds or None in kinds:
+            return False
+        if kinds <= _NUMERIC_KINDS:
+            if any(carries_quotient(value) for value in values):
+                return False
+            # A fraction beside a DECIMAL; beside a FLOAT / DOUBLE an integer of at most 15
+            # digits (a double's text of a longer one has an exponent).
+            fraction = r"(?:\.[0-9]+)?" if kinds <= _EXACT_KINDS and "decimal" in kinds else ""
+            digits = r"[0-9]*" if kinds <= _EXACT_KINDS else r"[0-9]{0,14}"
+            pattern = rf"-?(?:0|[1-9]{digits}){fraction}"
+            return all(re.fullmatch(pattern, s.name) and not re.fullmatch(r"-0(?:\.0+)?", s.name) for s in literals)
+        timed = kinds == {"datetime"} and not any(fraction_digits(value) for value in values)
+        if kinds != {"date"} and not timed:
+            return False
+        pattern = r"[0-9]{4}-[0-9]{2}-[0-9]{2}" + (" [0-9]{2}:[0-9]{2}:[0-9]{2}" if timed else "")
+        for literal in literals:
+            try:
+                (datetime.datetime if timed else datetime.date).fromisoformat(literal.name)
+            except ValueError:
+                return False
+            if not re.fullmatch(pattern, literal.name):
+                return False
+        return True
+
+    def listed_unordered(held: exp.Expression, parent: Optional[exp.Expression]) -> bool:
+        """Whether a value is an item of its query's select list -- what a derived table, a
+        CTE, a view or an INSERT ... SELECT hands on -- that the query does not order by (nor
+        a UNION branch, whose column PostgreSQL types by every branch), or a GROUP BY key:
+        an item its query groups by is written as the key is, which PostgreSQL matches."""
+        item = parent if isinstance(parent, (exp.Alias, exp.Group)) else held
+        query = item.parent
+        if isinstance(parent, exp.Group):
+            return isinstance(query, exp.Select) and not isinstance(query.parent, exp.SetOperation)
+        if not isinstance(query, exp.Select) or isinstance(query.parent, exp.SetOperation):
+            return False
+        position = next((i for i, p in enumerate(query.expressions) if p is item), None)
+        if position is None:
+            return False
+        group = query.args.get("group")
+        if group is not None and any(key.unnest() == held.unnest() for key in group.expressions):
+            return True
+        alias = item.alias.lower() if isinstance(item, exp.Alias) else ""
+        order = query.args.get("order")
+        return not any(
+            _integer_literal(ordered.this) == position + 1 or (
+                isinstance(ordered.this, exp.Column) and not ordered.this.table and alias
+                and ordered.this.name.lower() == alias
+            )
+            for ordered in (order.expressions if order is not None else ())
+        )
+
     # A choice MySQL makes a STRING -- a COALESCE / CASE / IF of a date or a time beside a
     # string (a literal or a text column), of a number beside a string or a date, of a JSON
     # value beside either -- which PostgreSQL types by its other values (IFNULL(d, '') fails
-    # there: '' read as a date). It is written as MySQL reads that string where it stands:
-    # read as a date (a date function, date arithmetic, compared with a date) it stays one
-    # when its strings are dates or times of its sort -- a DATE beside one with a time a
-    # timestamp, which keeps it; a string with no digit, which MySQL reads as no date, NULL;
+    # there: '' read as a date). Beside strings PostgreSQL reads as its own values with their
+    # text (read_alike: IFNULL(end_date, '9999-12-31'), IFNULL(qty, '0')) a date stays a date
+    # and a number a number where the choice is shown -- what reads a derived table's, a
+    # CTE's, a view's or an INSERT ... SELECT's output then computes with it as MySQL
+    # computes with the string. Otherwise it is written as MySQL reads that string where it
+    # stands: read as a date (a date function, date arithmetic, compared with a date) it
+    # stays one when its strings are dates or times of its sort -- a DATE beside one with a
+    # time a timestamp, which keeps it; a string with no digit, which MySQL reads as no date,
+    # NULL in a date function and the zero date, below every date, compared ('-infinity');
     # read as a number (arithmetic, SUM / AVG, a numeric function, compared with a number)
     # it is the double MySQL reads from it (as_number). Anywhere else -- shown, made text,
     # in JSON, ordered, compared with text -- it is text: each value as MySQL's text of it,
     # a literal as written. A TIME beside a date is MySQL's DATETIME (the time on the current
     # date), and a COALESCE of exact numbers is shown at its widest scale. GREATEST / LEAST
     # compare a date and a string as dates in MySQL, a number and a string as strings
-    # (GREATEST(10, '5') is '5').
+    # (GREATEST(10, '5') is '5') -- left as PostgreSQL's numbers beside a number string below
+    # 2, whose string order is the numbers' (the clamp GREATEST(x, '0')).
     def chosen_as_mysql(node: exp.Expression) -> None:
         values = [v for v in choices(node) if v is not None and not isinstance(v, exp.Null)]
         literals = [v for v in values if isinstance(v, exp.Literal) and v.is_string]
         kinds = {kind_of(v) for v in values if not (isinstance(v, exp.Literal) and v.is_string)}
         dated, numbers = kinds & _TEMPORAL_KINDS, kinds & (_NUMERIC_KINDS | {"boolean"})
         strings = bool(literals or kinds & {"text", "char"})
+        alike = read_alike(literals, [v for v in values if not (isinstance(v, exp.Literal) and v.is_string)])
         if isinstance(node, (exp.Greatest, exp.Least)):
-            if numbers and strings and not dated:
+            # Compared as strings, a number and a number string below 2 ('0', '1', '0.5') order
+            # as the numbers do (checked on 8.4): PostgreSQL's numbers are MySQL's choice there.
+            clamped = alike and all(re.fullmatch(r"[01](?:\.[0-9]+)?", s.name) for s in literals)
+            if numbers and strings and not dated and not clamped:
                 each_choice(node, textual)
             return
         if "time" in dated and len(dated) > 1 and not (strings or numbers):
@@ -10663,6 +10737,8 @@ def _rewrite_mysql_calls(
         json = "json" in kinds
         if not ((strings and (dated or numbers or json)) or (numbers and (dated or json))):
             return
+        if dated and alike and text_context(node) not in ("number", "remainder"):
+            return  # a date beside dates of its sort: its text is MySQL's string, and a date wherever MySQL reads one
         held, parent = standing(node)
         if dated and not (numbers or json) and (read_as_date(held, parent) or compared_with_date(held, parent)):
             dates = [literal for literal in literals if re.search(r"\d", literal.name)]
@@ -10684,10 +10760,15 @@ def _rewrite_mysql_calls(
                         "format the result where its text matters."
                     )
                 stamped = dated == {"date"} and not all(_is_date_literal(s) for s in dates)
+                # A string with no digit is MySQL's zero date compared with a date -- below
+                # every date ('' < NOW() holds) -- and no date (NULL) in a date function.
+                zero = exp.Cast(this=exp.Literal.string("-infinity"), to=exp.DataType.build(
+                    "DATE" if dated == {"date"} and not stamped else "TIMESTAMP"
+                )) if dated != {"time"} and compared_with_date(held, parent) else exp.Null()
 
                 def as_date(value: exp.Expression) -> exp.Expression:
                     if any(value is s for s in literals):
-                        return value if any(value is s for s in dates) else exp.Null()
+                        return value if any(value is s for s in dates) else zero.copy()
                     if stamped and kind_of(value) == "date":
                         return exp.Cast(this=value, to=exp.DataType.build("TIMESTAMP"))
                     return value
@@ -10699,6 +10780,8 @@ def _rewrite_mysql_calls(
             to = "NUMERIC" if context == "remainder" else "DOUBLE PRECISION"
             each_choice(node, lambda value: as_number(value, to))
             return
+        if alike and listed_unordered(held, parent):
+            return  # shown, as PostgreSQL's numbers: MySQL's text, and numbers to what reads them
         each_choice(node, textual)
 
     for node in nodes(exp.Coalesce, exp.Case, exp.If, exp.Greatest, exp.Least, innermost=True):
@@ -10708,8 +10791,11 @@ def _rewrite_mysql_calls(
 
     # A UNION column whose branches mix numbers, dates or booleans with strings is MySQL's
     # string, which PostgreSQL types by its branches (integer beside varchar refused, 'N/A'
-    # read as a date): each branch's value is MySQL's text of it. (A recursive CTE's column
-    # is its first SELECT's type, below.)
+    # read as a date): each branch's value is MySQL's text of it -- unless every string
+    # branch is a literal PostgreSQL reads as the others' type with its own text ('5' beside
+    # integers, '2024-01-01' beside DATEs: read_alike), where the column is PostgreSQL's,
+    # which what reads it computes with as MySQL computes with the string. (A recursive
+    # CTE's column is its first SELECT's type, below.)
     for union in nodes(exp.SetOperation):
         if isinstance(union.parent, exp.SetOperation) or (
             isinstance(union.parent, exp.CTE) and isinstance(union.parent.parent, exp.With)
@@ -10725,6 +10811,11 @@ def _rewrite_mysql_calls(
         for position in range(min((len(b.expressions) for b in branches), default=0)):
             kinds = {kind_of(b.expressions[position].unalias()) for b in branches}
             if not (kinds & {"text", "char"} and kinds & (_NUMERIC_KINDS | _TEMPORAL_KINDS | {"boolean"})):
+                continue
+            values = [b.expressions[position].unalias() for b in branches]
+            values = [value for value in values if not isinstance(value.unnest(), exp.Null)]
+            literals = [value for value in values if isinstance(value, exp.Literal) and value.is_string]
+            if read_alike(literals, [value for value in values if not any(value is s for s in literals)]):
                 continue
             for branch in branches:
                 projection = branch.expressions[position]
@@ -10745,7 +10836,6 @@ def _rewrite_mysql_calls(
     # refuses it otherwise): a BINARY key is written as the select list writes it -- as the
     # list's BINARY x, or as the x the list holds (reported where x's bytes order otherwise).
     listed_binary: set = set()
-    listed_operand: set = set()
     for query in nodes(exp.Select) if exp.Distinct in present else ():
         order = query.args.get("order")
         if not query.args.get("distinct") or order is None:
@@ -10757,8 +10847,6 @@ def _rewrite_mysql_calls(
                 key = key.this
             if isinstance(key, exp.Cast) and key in listed:
                 listed_binary.add(id(key))
-            elif isinstance(key, exp.Cast) and key.this in listed:
-                listed_operand.add(id(key))
 
     def ordered_by_bytes(
         node: exp.Expression, operand: exp.Expression, kind: Optional[str], ordered: exp.Ordered
@@ -10766,14 +10854,23 @@ def _rewrite_mysql_calls(
         """MySQL's ORDER BY BINARY x: by the bytes of x's text. A text, a date, bytes order as
         themselves on Aurora DSQL (C collation); a number's digits do not (12 before 3) --
         ordered by CONVERT_TO(CAST(x AS TEXT), 'UTF8'), an output name by the expression it
-        names (PostgreSQL reads a name there only bare). A UNION's, or a SELECT DISTINCT's
-        that selects x, can be ordered only by what it selects: there x itself, reported."""
+        names (PostgreSQL reads a name there only bare). In a statement MySQL reads a name
+        inside BINARY as a column of the query's FROM first -- one the resolver types -- and
+        as an output name only when no column has it: a column an output name shadows is
+        ordered by the expression, which PostgreSQL reads as the column too (a view stores
+        such a column qualified). A UNION's, or a SELECT DISTINCT's that selects x, can be
+        ordered only by what it selects: there x itself, reported."""
         owner = ordered.parent.parent if isinstance(ordered.parent, exp.Order) else None
         named = operand.name.lower() if isinstance(operand, exp.Column) and not operand.table else None
         aliased = next((
             p.this for p in (owner.expressions if isinstance(owner, exp.Select) and named else ())
             if isinstance(p, exp.Alias) and p.alias.lower() == named
         ), None)
+        shadowed = aliased is not None and kind is not None and not view and not (
+            isinstance(aliased, exp.Column) and aliased.name.lower() == named  # s AS s: the column itself
+        )
+        if shadowed:
+            aliased = None
         if isinstance(owner, exp.SetOperation):
             branches = _output_queries(owner)
             names = [p.alias_or_name.lower() for p in branches[0].expressions] if branches else []
@@ -10784,7 +10881,7 @@ def _rewrite_mysql_calls(
             } if position is not None else {None}
         else:
             kinds = {kind_of(aliased) if aliased is not None else kind}
-        if kinds <= _BYTE_ORDERED_KINDS:
+        if kinds <= _BYTE_ORDERED_KINDS and not shadowed:
             node.replace(operand)
             return
         if isinstance(owner, exp.SetOperation) or (isinstance(owner, exp.Select) and owner.args.get("distinct")):
@@ -10837,14 +10934,14 @@ def _rewrite_mysql_calls(
                 if other_kind != "binary":
                     # MySQL's BINARY x compared: x's text, byte-wise -- which every comparison
                     # on Aurora DSQL already is (C collation): a text as itself, a number, a
-                    # date or a boolean as MySQL's text of it ('010' is not 10), a value of a
-                    # type that cannot be told as x || '' (bytes kept bytes); beside a number,
-                    # as numbers, as MySQL compares a string with one. A BINARY(n)'s length,
-                    # noted, is lost either way.
-                    if kind in ("text", "char", "binary") or other_kind in _NUMERIC_KINDS:
+                    # date or a boolean as MySQL's text of it ('010' is not 10); beside a
+                    # number, as numbers, as MySQL compares a string with one. A value of a
+                    # type that cannot be told is compared as itself -- right for text, a
+                    # date, a boolean, beside a number, and its index serves the comparison
+                    # (x || '' would refuse x = number and read a boolean as 'true'). A
+                    # BINARY(n)'s length, noted, is lost either way.
+                    if kind in (None, "text", "char", "binary") or other_kind in _NUMERIC_KINDS:
                         node.replace(operand)
-                    elif kind is None:
-                        node.replace(_any_text(operand))
                     else:
                         node.replace(as_text(operand))
                     continue
@@ -11012,6 +11109,11 @@ def _rewrite_mysql_calls(
                         outputs = list(branch.expressions)
                         outputs[position] = exp.Cast(this=projection, to=declared[0].copy())
                         branch.set("expressions", outputs)
+    def concatenated(value: exp.Expression) -> exp.Expression:
+        """A GROUP_CONCAT value as text: a TINYINT(1) or a comparison as MySQL's digit
+        (as_text) -- Aurora DSQL's text of a boolean is 'true' -- else as written."""
+        return as_text(value) if kind_of(value) == "boolean" else _texted(shown(value))
+
     for node in nodes(exp.GroupConcat):
         separator = node.args.get("separator") or exp.Literal.string(",")
         holder, key, value = node, "this", node.this
@@ -11021,10 +11123,12 @@ def _rewrite_mysql_calls(
         if isinstance(value, exp.Distinct) and ordered:
             # A DISTINCT aggregate's ORDER BY must be its argument: as an array, sorted
             # by the value itself and without NULLs, it is the same list for any type (a
-            # CHAR(n) column without its padding, as MySQL reads it).
+            # CHAR(n) column without its padding, as MySQL reads it; a TINYINT(1) as its
+            # integer, which orders as the boolean does).
             orders = [o.this for o in holder.expressions]
             if len(value.expressions) == 1 and len(orders) == 1 and orders[0] == value.expressions[0]:
-                item = unpadded(value.expressions[0]).copy()  # typed while still in the tree
+                first = value.expressions[0]  # typed while still in the tree
+                item = _as_integer(first.copy()) if kind_of(first) == "boolean" else unpadded(first).copy()
                 ordered_by = holder.expressions[0].copy()
                 ordered_by.set("this", item.copy())
                 aggregated = exp.ArrayAgg(
@@ -11045,15 +11149,25 @@ def _rewrite_mysql_calls(
                     "a DISTINCT subquery ordered by MIN(y)."
                 )
         elif isinstance(value, exp.Distinct):
-            value.set("expressions", [_texted(shown(e)) for e in value.expressions])
+            value.set("expressions", [concatenated(e) for e in value.expressions])
         elif value is not None:
-            holder.set(key, _texted(shown(value)))
+            holder.set(key, concatenated(value))
     # MySQL makes a number, a date ... text where it wants a string (textual): PostgreSQL
     # has no integer || integer, lpad(integer, ...), btrim(integer), md5(integer) or
     # integer LIKE / ~, and writes a boolean, a comparison, a DATETIME(6) or a TIMESTAMP as
-    # text of its own. A column whose type cannot be told is x || '' there (noted); in a
-    # CONCAT only when nothing else in it is text (int || text has an operator). Bytes
-    # beside text in a CONCAT are decoded: as text Aurora DSQL writes their hex.
+    # text of its own. A column whose type cannot be told stays as it is -- text, the
+    # common case, needs nothing and keeps its index for LIKE 'prefix%' or UPPER(x) = ...,
+    # and a number there fails loudly on Aurora DSQL -- but where a number is as common as
+    # text and PostgreSQL has no form for it (untyped_text): in LPAD / RPAD and in a CONCAT
+    # with no text in it. Bytes beside text in a CONCAT are decoded: as text Aurora DSQL
+    # writes their hex.
+    def untyped_text(node: exp.Expression) -> exp.Expression:
+        """A bare column whose type cannot be told, padded or joined only with values like it:
+        x || '', text for every type (bytes kept bytes) -- LPAD(id, 6, '0'), CONCAT(a, b)
+        are as often over numbers as over text (a boolean's text, PostgreSQL's 'true', is
+        what x || text gave already)."""
+        return _any_text(node) if isinstance(node, exp.Column) and kind_of(node) is None else node
+
     def joined(parts: "list[exp.Expression]") -> "list[exp.Expression]":
         parts = [textual(part) for part in parts]
         if not any(kind_of(part) in ("text", "char") for part in parts):
@@ -11085,7 +11199,8 @@ def _rewrite_mysql_calls(
                 exp.StrPosition: ("this", "substr"), exp.RegexpLike: ("this", "expression")}.get(type(node), ("this",))
         for key in keys:
             if node.args.get(key) is not None:
-                node.set(key, untyped_text(textual(node.args[key])))
+                value = textual(node.args[key])
+                node.set(key, untyped_text(value) if isinstance(node, exp.Pad) and key == "this" else value)
     # GREATEST / LEAST are NULL when an argument is NULL in MySQL; Aurora DSQL's skip a NULL
     # argument. One NULL test per nest, at its outermost call, over the nest's leaves --
     # through every node NULL exactly when an operand is (_null_strict: arithmetic, ABS,
@@ -11401,17 +11516,34 @@ def _rewrite_mysql_calls(
 
     def json_value(node: exp.Expression) -> exp.Expression:
         """A value as MySQL writes it in JSON: a DATETIME as 'YYYY-MM-DD HH:MM:SS.ffffff', a
-        TIME with its microseconds, a TINYINT(1) (a boolean on Aurora DSQL) or a comparison
-        as its number, a CHAR(n) without its padding, each value of a COALESCE of exact
-        numbers as itself (not at the widest scale it is shown at). A GREATEST / LEAST of a
-        date and a date string is a STRING in MySQL: the text of the date it compares as (a
-        COALESCE / CASE / IF beside a string is text already: chosen_as_mysql)."""
+        TIME with its microseconds, a TINYINT(1) (a boolean on Aurora DSQL) or a choice of
+        comparisons as its number -- a comparison standing in the JSON itself as true /
+        false, as both write it -- a CHAR(n) without its padding, each value of a COALESCE
+        of exact numbers as itself (not at the widest scale it is shown at), through the
+        COALESCE / IF / CASE it is chosen by -- but one its query groups by, which must be
+        written as its GROUP BY key. A GREATEST / LEAST of a date and a date string is a
+        STRING in MySQL: the text of the date it compares as -- and a COALESCE / CASE / IF
+        kept a date beside dates of its sort each value's own text (one beside other
+        strings is text already: chosen_as_mysql)."""
         kind = kind_of(node)
         float_text(kind)
         if kind in _TEMPORAL_KINDS and string_typed(node):
-            return as_text(node)
-        if isinstance(node, exp.Coalesce):
-            each_choice(node, lambda value: value.this if value.meta.get(_WIDENED) else value)
+            chosen = null_checked(node)
+            if isinstance(chosen, (exp.Greatest, exp.Least)):
+                return as_text(node)
+            each_choice(chosen, lambda value: as_text(value) if kind_of(value) in _TEMPORAL_KINDS else value)
+            return node
+        query = node.find_ancestor(exp.Select)
+        group = query.args.get("group") if query is not None else None
+        keys = [key.unnest() for key in group.expressions] if group is not None else []
+        pending = [node]
+        while pending:
+            value = pending.pop().unnest()
+            if not isinstance(value, (exp.Coalesce, exp.If, exp.Case)):
+                continue
+            if isinstance(value, exp.Coalesce) and not any(value == key for key in keys):
+                each_choice(value, lambda chosen: chosen.this if chosen.meta.get(_WIDENED) else chosen)
+            pending.extend(chosen for chosen in choices(value) if chosen is not None)
         if kind in ("datetime", "timestamp"):
             return pg_call("TO_CHAR", node, exp.Literal.string("YYYY-MM-DD HH24:MI:SS.US"))
         if kind == "time":
@@ -11424,6 +11556,11 @@ def _rewrite_mysql_calls(
                 exp.Literal.string("HH24:MI:SS.US"),
             )
         if kind == "boolean":
+            # MySQL writes a comparison or a condition standing in the JSON as true / false,
+            # as Aurora DSQL writes a boolean; a TINYINT(1) -- a column, a derived table's
+            # comparison column, an IF / CASE / COALESCE of comparisons -- as 1 / 0.
+            if isinstance(node.unnest(), _PREDICATES):
+                return node
             return exp.Cast(this=node, to=exp.DataType.build("INT"))
         return unpadded(node)
 
@@ -11793,16 +11930,24 @@ def _mysql_select_options(select: exp.Expression) -> "list[str]":
     return notes
 
 
-def view_column_types(definition: str, type_index: "Mapping[str, tuple]") -> "tuple":
+def view_column_types(
+    definition: str, type_index: "Mapping[str, tuple]", *, schema: Optional[str] = None
+) -> "tuple":
     """The column types of the tables a MySQL view body names (MySQL writes each as
-    `db`.`table`): the :func:`table_type_index` entries themselves, shared by every view
-    that reads the table -- the key a conversion of the view is cached by, beside its
-    body."""
+    `db`.`table`, and SHOW CREATE VIEW one of the session's database -- the view's own
+    ``schema`` in single-database mode -- as `table`): the :func:`table_type_index` entries
+    themselves, shared by every view that reads the table -- the key a conversion of the
+    view is cached by, beside its body."""
     found: dict[str, tuple] = {}
     for db, name in re.findall(r"`((?:[^`]|``)+)`\s*\.\s*`((?:[^`]|``)+)`", definition or ""):
         entry = type_index.get(f"{db.replace('``', '`')}.{name.replace('``', '`')}")
         if entry is not None:
             found[entry[0]] = entry
+    if schema is not None:
+        for name in re.findall(r"`((?:[^`]|``)+)`", definition or ""):
+            entry = type_index.get(f"{schema}.{name.replace('``', '`')}")
+            if entry is not None:
+                found[entry[0]] = entry
     return tuple(found[key] for key in sorted(found))
 
 
@@ -11826,6 +11971,15 @@ def _converted_mysql_view(
             isinstance(prop, exp.AlgorithmProperty) and prop.name.upper() == "TEMPTABLE"
             for prop in (properties.expressions if properties is not None else ())
         )
+        # SHOW CREATE VIEW writes a table of the session's database bare (`from `t``) -- in
+        # single-database mode the view's own, where MySQL resolves it: qualified with it, the
+        # body is typed by the inventory and reads that schema's table on Aurora DSQL (bare,
+        # the search path's). A CTE's name is no table.
+        view_schema, view_name = _split_qualified(name)
+        if view_schema:
+            for table in list(select.find_all(exp.Table)):
+                if table.args.get("db") is None and table.name and _cte_named(table) is None:
+                    table.set("db", exp.to_identifier(view_schema, quoted=True))
         untranslated, misformatted, issues = _rewrite_mysql_calls(
             select, _column_type_resolver(column_types), view=True, materialized=temptable
         )
@@ -11837,7 +11991,6 @@ def _converted_mysql_view(
         # unquoted, Aurora DSQL folded it (``V_Orders`` became ``v_orders``, and a
         # view in schema ``MyApp`` landed in a different schema, ``myapp``), so it
         # could collide with a relation whose name differs only in case.
-        view_schema, view_name = _split_qualified(name)
         create = exp.Create(
             this=exp.Table(
                 this=exp.to_identifier(view_name, quoted=True),

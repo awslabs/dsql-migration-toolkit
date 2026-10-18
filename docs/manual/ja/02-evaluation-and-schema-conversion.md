@@ -361,8 +361,9 @@ MySQL→PostgreSQL トランスパイルではありません。
   MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
   あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
   そのバイトに(比較では x のテキストを、Aurora DSQL がすでにするとおりバイト単位で — 数値や日付は MySQL のそのテキストで、
-  `'010'` は `10` ではない — `GROUP BY`・`PARTITION BY`・`COUNT(DISTINCT ...)` のキーは値そのものに、`ORDER BY` のキーは
-  テキスト・日付・バイトならそのまま、数値や型がわからない値はそのテキストのバイト順に — 出力名はそれが指す式で — 選ぶもの
+  `'010'` は `10` ではない、型がわからない値は値そのもので、数値ならそのとき数値として比較 — `GROUP BY`・`PARTITION BY`・`COUNT(DISTINCT ...)` のキーは値そのものに、`ORDER BY` のキーは
+  テキスト・日付・バイトならそのまま、数値や型がわからない値はそのテキストのバイト順に — 出力名はそれが指す式で、`FROM` の列にも
+  ある名前は MySQL が読むとおりその列で — 選ぶもの
   でしか並べられない `UNION` と `SELECT DISTINCT` のキーは x そのままにしてフラグを付け)、`CAST(x AS UNSIGNED)` は
   MySQL と同じく先に丸めてから(文字列は先頭の整数として読んで)負の数を循環させて、整数と decimal の `/` は MySQL の正確な
   除算として(MySQL が保つ小数桁で切り捨てて計算し — 整数なら 9 桁で、`2 / 3 * 1000000` は `666666.6660` — 被除数のスケールに
@@ -372,25 +373,31 @@ MySQL→PostgreSQL トランスパイルではありません。
   `TINYINT(1)`(Aurora DSQL では boolean)と比較式 — 算術、ビット演算子、`ROUND`/`SIGN`/`POWER` や数値へのキャスト、集計
   (`SUM(qty > 2)` は行を数えます)、または数値の隣(`= 1`、`<=> 1`、`IN`、単純 `CASE`)— はその整数として、`TINYINT(1)` に
   入れる数値(`SET paid = 1`、`INSERT ... VALUES (..., 1)` や `INSERT ... SELECT` — 埋める列で判断)は boolean として、
-  `SET col = a = b` は MySQL が読むとおり(`col = (a = b)`)、`GROUP_CONCAT` は text 上の集計に、
+  `SET col = a = b` は MySQL が読むとおり(`col = (a = b)`)、`GROUP_CONCAT` は MySQL のテキスト上の集計に(`TINYINT(1)` や
+  比較はその数字で)、
   `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はテキストのバイト数に、
   `CHAR_LENGTH` はその文字数に(`CHAR(n)` 列は埋め草の空白なしで、JSON 値はそのテキストで)、MySQL が文字列を求める
   ところ(`CONCAT`/`CONCAT_WS` — テキストと並ぶバイトはデコードしてフラグ付き — `LPAD`/`RPAD`、`LEFT`/`RIGHT`、
   `SUBSTRING`、`REPLACE`、`UPPER`/`LOWER`、`TRIM`、`REVERSE`、`REPEAT`、`MD5`、`ASCII`、`LOCATE`/`INSTR`、`LIKE`、
-  `REGEXP`、文字列と並ぶ `GREATEST`/`LEAST`、数値や日付と文字列からなる `UNION` の列)の数値・日付・`TINYINT(1)`・比較は
+  `REGEXP`、文字列と並ぶ `GREATEST`/`LEAST` — ただし文字列の順序が数値の順序と一致する 2 未満の数値の文字列(下限を 0 にする
+  `GREATEST(x, '0')`)は別 — 数値や日付とテキスト列や別の種類の文字列 `'N/A'` からなる `UNION` の列)の数値・日付・`TINYINT(1)`・比較は
   MySQL のテキストに(`DATETIME(6)` は小数 6 桁すべて)、MySQL が文字列にする `COALESCE`/`CASE`/`IF` — 文字列やテキスト列と
-  並ぶ日付・時刻、文字列や日付と並ぶ数値、そのどちらかと並ぶ JSON 値 — はその場所で MySQL がその文字列を読むとおりに(数値
+  並ぶ日付・時刻、文字列や日付と並ぶ数値、そのどちらかと並ぶ JSON 値 — はその場所で MySQL がその文字列を読むとおりに(PostgreSQL
+  がその値として同じテキストで読む文字列 — `DATE` と並ぶ `IFNULL(end_date, '9999-12-31')`、`IFNULL(qty, '0')` — と並ぶなら
+  日付は日付のまま、表示される数値は数値のままにし、派生テーブル・CTE・ビューの列を読むクエリや `INSERT ... SELECT` は MySQL と
+  同じくそれで計算します。数値
   として読む場所 — 算術、`SUM`/`AVG`、数値関数、数値との比較 — では MySQL が読む倍精度に。`IFNULL(qty, '0') + 1` は
   足し算になり `''` は 0。日付として読む場所 — 日付関数、日付の算術、日付との比較 — では、文字列がその種類の日付なら日付の
-  まま、時刻付きの文字列と並ぶ `DATE` はタイムスタンプに、数字のない文字列は NULL に。それ以外 — 表示、テキスト化、JSON、
+  まま、時刻付きの文字列と並ぶ `DATE` はタイムスタンプに、数字のない文字列は日付関数では NULL に、日付との比較では MySQL の
+  ゼロ日付(すべての日付より前の `'-infinity'`)に。それ以外 — 表示、テキスト化、JSON、
   並べ替え — では MySQL の文字列: 各値のテキストとリテラルは書かれたとおり)、日付と並ぶ `TIME` は MySQL の `DATETIME` に、
   正確な数値の `COALESCE` は最も広いスケールに(`IFNULL(price, 0)` は `0.00`)、`DATE` に日・月を足しても `DATE`
   のままに(列や式から読む量や小数は MySQL と同じく整数単位で数え — 文字列は先頭の整数として — `'1 2' DAY_HOUR` のような
   複合単位はその各部分として、2 桁の年や `yyyymmdd` の日付文字列は MySQL と同じく解釈)、`INTERVAL x unit + d` は `d + INTERVAL x unit` として、`TIMESTAMP '...'`
   リテラルはそれが表す `DATETIME` として、`+hh:mm` オフセットの `CONVERT_TZ`
-  (リテラルでも列から読む値でも)、NULL を保ち `DATETIME` と `TINYINT(1)` を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、
+  (リテラルでも列から読む値でも)、NULL を保ち `DATETIME`、`TINYINT(1)`(`1`/`0`)、比較(`true`/`false`)を MySQL と同じく書く `JSON_ARRAY`/`JSON_ARRAYAGG`、
   メンバー名と配列の添字からなるパスの `JSON_EXTRACT`/`->` と MySQL の `->>`(MySQL はビューに
-  `json_unquote(json_extract(...))` として保存します)は MySQL と同じくパスをたどって(配列でない値の `[0]` はその値自体、`[0]` は 3 つまで。型がわからない
+  `json_unquote(json_extract(...))` として保存します)は MySQL と同じくパスをたどって(配列でない値の `[0]` はその値自体、`[0]` はドキュメントの中で入れ子になった呼び出しも合わせて 3 つまで。型がわからない
   ドキュメントは `json` にキャスト)— `->>` の JSON null はテキスト `'null'` に(日付関数が読む場所では MySQL と同じく
   NULL に。グループ化した `->>` はクエリが読むどこでもその `GROUP BY` キーの形に)、数値と比較・算術・`SUM`/`AVG`・`ROUND`・
   数値関数で使うそのテキストや JSON 値は MySQL と同じく倍精度に(フラグ付き: 数値でないテキストはそこで失敗します)— MySQL と
@@ -412,11 +419,14 @@ MySQL→PostgreSQL トランスパイルではありません。
   結合を経ても、MySQL が束縛するとおりに — `db`.`table`.`col` はそのデータベースのテーブルに、その列を持たないテーブルの
   別名は越えて、派生テーブルや CTE には決して束縛せず)、派生テーブルや CTE の列はその本体が選ぶもので(読むテーブルと同じ名前の CTE も)、式はその計算結果で — そして
   Query Converter も同じ MySQL の式を同じように書き(`UPDATE`、`DELETE`、`ON DUPLICATE KEY UPDATE` でも)、ステップ 1 を
-  実行していれば Evaluation のインベントリの型を使います。型がわからない値 — 別のビューの列、派生テーブルや CTE が計算する列、
-  ステップ 1 の前の Query Converter の列 — の `LENGTH`、文字列関数、`LIKE`、テキストを含まない `CONCAT`、そして `BINARY` には
-  フラグが付きます: 前者は `x || ''` でテキストにし、テキスト・バイト・整数・decimal・日付には MySQL と同じテキストになります
+  実行していれば Evaluation のインベントリの型を使います(シングルデータベースモードで読んだビューは、保存されたテキストが自身の
+  データベースのテーブルを修飾なしで書くため、自身のスキーマで読みます)。型がわからない値 — 別のビューの列、派生テーブルや CTE が計算する列、
+  ステップ 1 の前の Query Converter の列 — の `LENGTH` と `BINARY` には
+  フラグが付きます: `LENGTH` は `x || ''` のテキストを数え、テキスト・バイト・整数・decimal・日付には MySQL と同じ数になります
   (`TINYINT(1)`、`FLOAT`、`TIMESTAMP`、小数部のある `DATETIME` は別)。`BINARY` は `CAST(x AS BYTEA)` で、バイナリの列にだけ
-  正しい形です。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
+  正しい形です。文字列関数、`LIKE`、`BINARY` の比較ではそのままにします — テキストには正しく、そのインデックスは `LIKE 'prefix%'` にも
+  使われます。数値ならターゲットでのテストで失敗します — ただし数値にもよく使う `LPAD`/`RPAD` とテキストを含まない `CONCAT` では
+  `x || ''` にします。商は MySQL が表示する箇所でそのスケールで表示します: 文の出力と
   テキスト、そして MySQL が実体化(materialize)するビュー・派生テーブル・CTE — `ALGORITHM=TEMPTABLE` で宣言したビュー、
   または集計、ウィンドウ、`DISTINCT`、`GROUP BY`、`HAVING`、`LIMIT`、`UNION` を持つもの、テーブルのないもの、自身の行を読む
   サブクエリを含む出力を持つもの — の行で、それぞれその列のスケールで保存されます(ウィンドウの値も、クエリがそれでグループ化
@@ -444,6 +454,11 @@ MySQL→PostgreSQL トランスパイルではありません。
   (変換が型を読む範囲の外)には MANUAL のフラグが付きます。 フラグ付きでまだ異なるもの: `FLOAT` のテキスト(MySQL は
   有効数字 6 桁で `1234.57`)と JSON の中の `FLOAT`、もう一方の種類の日付文字列と並ぶ日付の算術
   (`IFNULL(d, '2024-06-01 10:00:00') + INTERVAL 1 DAY`: MySQL の結果は行ごとに形が変わる文字列で、日付の行は `2024-03-06`)。
+  フラグなしでまだ異なるもの: 数値の文字列と並ぶ数値 — 表示される `COALESCE`/`CASE`/`IF`、`UNION` の列 — は、それを読む
+  場所で数値として並べ替え(またはテキストと比較)られます(MySQL は文字列として並べ、`'10'` が `'9'` より前)。数値の文字列と並ぶ `DECIMAL` を別の
+  ビューが算術で読むとそのスケールを保ちます(MySQL の倍精度が `20` を表示するところで `20.00`)。クエリがグループ化する
+  `COALESCE` の JSON(`ONLY_FULL_GROUP_BY` のない `sql_mode`)は最も広いスケールで書かれます(`[0.00]`、MySQL は `[0]`)。
+  `DECIMAL` と整数の `UNION` は、整数の分岐の行を列のスケールなしで表示します(MySQL が `5.00` を表示するところで `5`)。
   **PostgreSQL** のビュー定義(`pg_get_viewdef`)はすでに PostgreSQL なので、引用符付きのビュー名の下に
   **そのまま** 移され、ソース側のペインにも同じテキストが表示されます。再レンダリングするとビューが返す結果が
   変わります — たとえば jsonb キーに付いた `::text` キャストが `->` 全体にかかり、jsonb 列が text になります。

@@ -110,15 +110,17 @@ def test_a_number_beside_a_string_in_mod_a_simple_case_and_in_is_read_as_a_numbe
     assert 'ABS(COALESCE(CAST("t"."n" AS DOUBLE PRECISION), -3))' in ddl
 
 
-def test_a_number_beside_a_string_shown_ordered_or_in_json_stays_mysqls_string() -> None:
+def test_a_number_beside_a_string_ordered_or_in_json_stays_mysqls_string() -> None:
     """MySQL orders IFNULL(n, '0') as strings (12 before 3), takes their MAX as a string and
-    writes it in JSON as a string: 5d955cc's text was right there."""
+    writes it in JSON as a string: 5d955cc's text was right there. (G119: shown, beside a
+    number string, it is PostgreSQL's number -- MySQL's text, and a number to the query
+    that reads a derived table's or a view's column: test_g119_typing_review.)"""
     ddl, _ = _select(
         "json_array(ifnull(`t`.`n`,'0')) AS `j`,ifnull(`t`.`n`,'0') AS `k`",
         tail=" order by ifnull(`t`.`n`,'0')",
     )
     assert "JSON_BUILD_ARRAY(COALESCE(CAST(\"t\".\"n\" AS TEXT), '0'))" in ddl
-    assert "COALESCE(CAST(\"t\".\"n\" AS TEXT), '0') AS \"k\"" in ddl
+    assert "COALESCE(\"t\".\"n\", '0') AS \"k\"" in ddl
     assert "ORDER BY COALESCE(CAST(\"t\".\"n\" AS TEXT), '0')" in ddl
 
 
@@ -355,7 +357,9 @@ def test_binary_compared_compares_the_values_text() -> None:
     ddl, _ = _view(
         "select `v`.`id` AS `id` from `shop`.`v_base` `v` where (cast(`v`.`n` as char charset binary) = '010')"
     )
-    assert "WHERE (\"v\".\"n\" || '' = '010')" in ddl
+    # G119: a value of a type that cannot be told is compared as itself, as 5d955cc wrote it
+    # (x || '' read a TIMESTAMP with its zone and a boolean as 'true', and lost the index).
+    assert "WHERE (\"v\".\"n\" = '010')" in ddl
 
 
 # --- Text where MySQL wants a string -------------------------------------------------------
@@ -395,14 +399,17 @@ def test_a_float_made_text_is_noted() -> None:
 
 
 def test_a_column_of_unknown_type_where_mysql_wants_a_string_is_made_text_and_noted() -> None:
-    """S13: lpad(integer, ...), integer ~~ ..., integer || integer through another view were
-    refused while AUTO; LENGTH(IFNULL(blob, '')) counted CAST(bytea AS TEXT)'s hex."""
+    """S13: lpad(integer, ...), integer || integer through another view were refused while
+    AUTO; LENGTH(IFNULL(blob, '')) counted CAST(bytea AS TEXT)'s hex. G119: in LIKE (and
+    UPPER, TRIM ...) a column of unknown type stays as 5d955cc wrote it -- right for text,
+    its index serving LIKE 'prefix%'; a number there fails loudly -- and only LENGTH is
+    noted (every untyped LIKE, LPAD or CONCAT made the statement MANUAL)."""
     ddl, notes = _view(
         "select lpad(`v`.`n`,3,'0') AS `a`,concat(`v`.`n`,`v`.`n`) AS `b`,length(ifnull(`v`.`b`,'')) AS `c`,"
         "concat(`v`.`n`,'-') AS `e` from `shop`.`v_base` `v` where (`v`.`n` like '1%')"
     )
     assert "LPAD(\"v\".\"n\" || '', 3, '0')" in ddl and "\"v\".\"n\" || '' || \"v\".\"n\" || ''" in ddl
-    assert "OCTET_LENGTH(COALESCE(\"v\".\"b\", '') || '')" in ddl and "(\"v\".\"n\" || '' LIKE '1%')" in ddl
+    assert "OCTET_LENGTH(COALESCE(\"v\".\"b\", '') || '')" in ddl and "(\"v\".\"n\" LIKE '1%')" in ddl
     assert "\"v\".\"n\" || '-' AS \"e\"" in ddl  # beside text, int || text has an operator
     assert len([n for n in notes if "cannot be told" in n and "TINYINT(1)" in n]) == 1
 

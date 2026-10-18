@@ -344,9 +344,11 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   UTC 벽시계로(MySQL처럼 정밀도에 맞춰 반올림이 아니라 잘라서), `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로,
   `VAR_SAMP`/`STDDEV_SAMP`는 표본 형태로, `CAST(x AS CHAR [CHARSET ...])`는 text로 — 길이가 있으면 자르기만 하고 채우지
   않는 `varchar(n)`으로 — 바이너리 컬럼은 그 바이트를 디코딩해서(`CONVERT_FROM`), `BINARY x`는 그 바이트로(비교에서는
-  x의 텍스트를 Aurora DSQL이 이미 하듯 바이트 단위로 — 숫자나 날짜는 MySQL의 그 텍스트로, `'010'`은 `10`이 아님 —
+  x의 텍스트를 Aurora DSQL이 이미 하듯 바이트 단위로 — 숫자나 날짜는 MySQL의 그 텍스트로, `'010'`은 `10`이 아님, 타입을
+  알 수 없는 값은 값 그 자체로, 숫자라면 그때 숫자로 비교 —
   `GROUP BY`·`PARTITION BY`·`COUNT(DISTINCT ...)`의 키는 값 그 자체로, `ORDER BY`의 키는 텍스트·날짜·바이트면 그대로, 숫자나
-  타입을 알 수 없는 값은 그 텍스트의 바이트 순으로 — 출력 이름은 그것이 가리키는 식으로 — 고르는 것으로만 정렬할 수 있는
+  타입을 알 수 없는 값은 그 텍스트의 바이트 순으로 — 출력 이름은 그것이 가리키는 식으로, `FROM` 컬럼에도 있는 이름은 MySQL이
+  읽는 대로 그 컬럼으로 — 고르는 것으로만 정렬할 수 있는
   `UNION`과 `SELECT DISTINCT`의 키는 x 그대로 두고 표시), `CAST(x AS UNSIGNED)`는 MySQL처럼 먼저
   반올림한 뒤(문자열은 앞쪽 정수로 읽어) 음수를 순환시켜, 정수와 decimal의 `/`는 MySQL의 정확한 나눗셈으로(MySQL이
   유지하는 소수 자릿수로 잘라서 계산하고 — 정수는 9자리라 `2 / 3 * 1000000`은 `666666.6660` — 피제수의 scale에 4를 더한
@@ -356,25 +358,31 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   `TINYINT(1)`(Aurora DSQL에서는 boolean)과 비교식 — 산술, 비트 연산자, `ROUND`/`SIGN`/`POWER`나 숫자 캐스트, 집계
   (`SUM(qty > 2)`는 행을 셉니다), 또는 숫자 옆(`= 1`, `<=> 1`, `IN`, 단순 `CASE`) — 은 그 정수로, `TINYINT(1)`에 넣는
   숫자(`SET paid = 1`, `INSERT ... VALUES (..., 1)`이나 `INSERT ... SELECT` — 채우는 컬럼으로 판단)는 boolean으로,
-  `SET col = a = b`는 MySQL이 읽는 대로(`col = (a = b)`), `GROUP_CONCAT`은 text 위의 집계로, `CONCAT_WS`는 NULL을 건너뛰고
+  `SET col = a = b`는 MySQL이 읽는 대로(`col = (a = b)`), `GROUP_CONCAT`은 MySQL의 텍스트 위의 집계로(`TINYINT(1)`이나 비교는
+  그 숫자로), `CONCAT_WS`는 NULL을 건너뛰고
   `GREATEST`/`LEAST`는 MySQL처럼 NULL을 반환하게, `LENGTH`는 텍스트의 바이트 수로, `CHAR_LENGTH`는 그 문자 수로
   (`CHAR(n)` 컬럼은 채움 공백 없이, JSON 값은 그 텍스트로), MySQL이 문자열을 원하는 곳(`CONCAT`/`CONCAT_WS` —
   텍스트와 나란한 바이트는 디코딩하고 표시 — `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`, `REPLACE`, `UPPER`/`LOWER`, `TRIM`,
-  `REVERSE`, `REPEAT`, `MD5`, `ASCII`, `LOCATE`/`INSTR`, `LIKE`, `REGEXP`, 문자열과 나란한 `GREATEST`/`LEAST`, 숫자나 날짜와
-  문자열로 된 `UNION`의 컬럼)의 숫자·날짜·`TINYINT(1)`·비교는 MySQL의 텍스트로(`DATETIME(6)`은 소수 6자리 모두), MySQL이
+  `REVERSE`, `REPEAT`, `MD5`, `ASCII`, `LOCATE`/`INSTR`, `LIKE`, `REGEXP`, 문자열과 나란한 `GREATEST`/`LEAST` — 다만 문자열
+  순서가 숫자 순서와 같은 2 미만의 숫자 문자열(하한을 0으로 두는 `GREATEST(x, '0')`)은 제외 — 숫자나 날짜와
+  텍스트 컬럼이나 다른 종류의 문자열 `'N/A'`로 된 `UNION`의 컬럼)의 숫자·날짜·`TINYINT(1)`·비교는 MySQL의 텍스트로(`DATETIME(6)`은 소수 6자리 모두), MySQL이
   문자열로 만드는 `COALESCE`/`CASE`/`IF` — 문자열이나 텍스트 컬럼과 나란한 날짜·시각, 문자열이나 날짜와 나란한 숫자, 그
-  어느 쪽과 나란한 JSON 값 — 는 그 자리에서 MySQL이 그 문자열을 읽는 대로(숫자로 읽는 자리 — 산술, `SUM`/`AVG`, 숫자 함수,
+  어느 쪽과 나란한 JSON 값 — 는 그 자리에서 MySQL이 그 문자열을 읽는 대로(PostgreSQL이 그 값으로 같은 텍스트로 읽는
+  문자열 — `DATE`와 나란한 `IFNULL(end_date, '9999-12-31')`, `IFNULL(qty, '0')` — 과 나란하면 날짜는 날짜 그대로, 표시되는
+  숫자는 숫자 그대로 두어, 파생 테이블·CTE·뷰의 컬럼을 읽는 쿼리나 `INSERT ... SELECT`가 MySQL처럼 그것으로 계산합니다;
+  숫자로 읽는 자리 — 산술, `SUM`/`AVG`, 숫자 함수,
   숫자와의 비교 — 에서는 MySQL이 읽는 배정밀도로, 그래서 `IFNULL(qty, '0') + 1`은 덧셈이 되고 `''`은 0; 날짜로 읽는 자리 —
   날짜 함수, 날짜 산술, 날짜와의 비교 — 에서는 문자열이 그 종류의 날짜면 날짜 그대로, 시각이 있는 문자열과 나란한 `DATE`는
-  타임스탬프로, 숫자가 없는 문자열은 NULL로; 그 밖의 자리 — 표시, 텍스트화, JSON, 정렬 — 에서는 MySQL의 문자열: 각 값의
+  타임스탬프로, 숫자가 없는 문자열은 날짜 함수에서는 NULL로, 날짜와의 비교에서는 MySQL의 0 날짜(모든 날짜보다 앞선
+  `'-infinity'`)로; 그 밖의 자리 — 표시, 텍스트화, JSON, 정렬 — 에서는 MySQL의 문자열: 각 값의
   텍스트, 리터럴은 쓰인 그대로), 날짜와 나란한 `TIME`은 MySQL의 `DATETIME`으로, 정확한 숫자의 `COALESCE`는 가장 넓은
   scale로(`IFNULL(price, 0)`은 `0.00`), `DATE`에 일/월을 더해도 `DATE`로(컬럼이나 식에서 읽는 양, 또는 소수는
   MySQL처럼 정수 단위로 세고 — 문자열은 앞쪽 정수로 — `'1 2' DAY_HOUR` 같은 복합 단위는 그 부분들로, 두 자리 연도나
   `yyyymmdd`의 날짜 문자열은 MySQL처럼 해석), `INTERVAL x unit + d`는 `d + INTERVAL x unit`으로, `TIMESTAMP '...'`
   리터럴은 그것이 뜻하는 `DATETIME`으로, `+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든), NULL을 유지하고
-  `DATETIME`과 `TINYINT(1)`을 MySQL처럼 쓰는 `JSON_ARRAY`/`JSON_ARRAYAGG`, 멤버 이름과 배열 첨자로 된 경로의
+  `DATETIME`, `TINYINT(1)`(`1`/`0`), 비교(`true`/`false`)를 MySQL처럼 쓰는 `JSON_ARRAY`/`JSON_ARRAYAGG`, 멤버 이름과 배열 첨자로 된 경로의
   `JSON_EXTRACT`/`->`와 MySQL의 `->>`(MySQL은 뷰에 `json_unquote(json_extract(...))`로 저장합니다)는 MySQL처럼 경로를
-  따라가고(배열이 아닌 값의 `[0]`은 그 값 자체, `[0]`은 세 개까지; 타입을 알 수 없는 문서는 `json`으로 캐스트) —
+  따라가고(배열이 아닌 값의 `[0]`은 그 값 자체, `[0]`은 문서 안에 중첩된 호출까지 합쳐 세 개까지; 타입을 알 수 없는 문서는 `json`으로 캐스트) —
   `->>`의 JSON null은 텍스트 `'null'`로(날짜 함수가 읽는 자리에서는 MySQL처럼 NULL로; 그룹화한 `->>`는 쿼리가 읽는 어디서나
   그 `GROUP BY` 키의 형태로), 숫자와의 비교·산술·`SUM`/`AVG`·`ROUND`·숫자 함수에 쓰이는 그 텍스트나 JSON 값은 MySQL처럼
   배정밀도로(표시됨: 숫자가 아닌 텍스트는 거기서 실패합니다) — MySQL처럼 형식에 따라 `TIME`/`DATE`/`DATETIME`을
@@ -396,11 +404,14 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   씁니다 — 컬럼은 그 타입으로(MySQL이 저장한 조인을 거쳐서도, MySQL이 바인딩하는 대로 — `db`.`table`.`col`은 그 데이터베이스의
   테이블로, 그 컬럼이 없는 테이블의 별칭은 건너서, 파생 테이블이나 CTE에는 결코 바인딩하지 않고), 파생 테이블이나 CTE의 컬럼은 그 본문이 고르는 것으로(읽는 테이블과
   같은 이름의 CTE도), 식은 그 계산 결과로 — 그리고 Query Converter도 같은 MySQL 식을 같은 방식으로 쓰며(`UPDATE`, `DELETE`,
-  `ON DUPLICATE KEY UPDATE`에서도), 1단계를 실행했다면 Evaluation 인벤토리의 타입을 씁니다. 타입을 알 수 없는 값 — 다른
-  뷰의 컬럼, 파생 테이블이나 CTE가 계산하는 컬럼, 1단계 전 Query Converter의 컬럼 — 의 `LENGTH`, 문자열 함수, `LIKE`, 텍스트가
-  없는 `CONCAT`, 그리고 `BINARY`는 표시됩니다: 앞의 것들은 `x || ''`로 텍스트로 만들어 텍스트·바이트·정수·decimal·날짜에는
-  MySQL과 같은 텍스트가 되고(`TINYINT(1)`, `FLOAT`, `TIMESTAMP`, 소수부가 있는 `DATETIME`은 다름), `BINARY`는
-  `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 몫은 MySQL이 보여 주는 곳에서
+  `ON DUPLICATE KEY UPDATE`에서도), 1단계를 실행했다면 Evaluation 인벤토리의 타입을 씁니다(단일 데이터베이스 모드로 읽은 뷰는
+  저장된 텍스트가 자기 데이터베이스의 테이블을 한정자 없이 쓰므로 자기 스키마에서 읽습니다). 타입을 알 수 없는 값 — 다른
+  뷰의 컬럼, 파생 테이블이나 CTE가 계산하는 컬럼, 1단계 전 Query Converter의 컬럼 — 의 `LENGTH`와 `BINARY`는
+  표시됩니다: `LENGTH`는 `x || ''`의 텍스트를 세어 텍스트·바이트·정수·decimal·날짜에는
+  MySQL과 같은 수가 되고(`TINYINT(1)`, `FLOAT`, `TIMESTAMP`, 소수부가 있는 `DATETIME`은 다름), `BINARY`는
+  `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 문자열 함수, `LIKE`, `BINARY` 비교에서는 그대로 둡니다 — 텍스트에는
+  맞고 그 인덱스는 `LIKE 'prefix%'`에도 쓰이며, 숫자라면 대상에서의 테스트에서 실패합니다 — 다만 숫자에도 흔히 쓰는
+  `LPAD`/`RPAD`와 텍스트가 없는 `CONCAT`에서는 `x || ''`로 씁니다. 몫은 MySQL이 보여 주는 곳에서
   그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE —
   `ALGORITHM=TEMPTABLE`로 선언한 뷰, 또는 집계, 윈도우, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나
   테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는 것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의
@@ -428,7 +439,12 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   중첩된 식(변환이 타입을 읽는 범위 밖)은 MANUAL로 표시됩니다. 표시되며 아직 다른 것: `FLOAT`의
   텍스트(MySQL은 유효 숫자 6자리로 `1234.57`)와 JSON 안의 `FLOAT`, 다른 종류의 날짜 문자열과 나란한 날짜의 산술
   (`IFNULL(d, '2024-06-01 10:00:00') + INTERVAL 1 DAY`: MySQL의 결과는 행마다 형태가 달라지는 문자열로, 날짜 행은
-  `2024-03-06`). **PostgreSQL** 뷰의 정의
+  `2024-03-06`). 표시 없이 아직 다른 것: 숫자 문자열과 나란한 숫자 — 표시되는 `COALESCE`/`CASE`/`IF`, `UNION`의 컬럼 — 는
+  그것을 읽는 자리에서 숫자로 정렬(또는 텍스트와 비교)됩니다(MySQL은 문자열로 정렬해 `'10'`이 `'9'`보다 앞). 숫자 문자열과 나란한
+  `DECIMAL`을 다른 뷰가 산술로 읽으면 그 scale을 유지합니다(MySQL의 배정밀도가 `20`을 보여 주는 곳에서 `20.00`). 쿼리가
+  그룹화하는 `COALESCE`의 JSON(`ONLY_FULL_GROUP_BY`가 없는 `sql_mode`)은 가장 넓은 scale로 씁니다(`[0.00]`, MySQL은 `[0]`).
+  `DECIMAL`과 정수의 `UNION`은 정수 브랜치의 행을 컬럼의 scale 없이 보여 줍니다(MySQL이 `5.00`을 보여 주는 곳에서 `5`).
+  **PostgreSQL** 뷰의 정의
   (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
   같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
   `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum

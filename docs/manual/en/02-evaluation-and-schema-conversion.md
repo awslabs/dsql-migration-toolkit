@@ -442,9 +442,11 @@ MySQL→PostgreSQL transpile:
   `STDDEV`/`VARIANCE` as the population forms MySQL computes and `VAR_SAMP`/`STDDEV_SAMP` as the sample ones,
   `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
   a binary column's bytes decoded (`CONVERT_FROM`), `BINARY x` as its bytes (in a comparison x's text, byte-wise as
-  Aurora DSQL compares already — a number's or a date's as MySQL's text of it, `'010'` is not `10`; a `GROUP BY`,
+  Aurora DSQL compares already — a number's or a date's as MySQL's text of it, `'010'` is not `10`, a value whose type
+  cannot be told the value itself, a number then compared as a number; a `GROUP BY`,
   `PARTITION BY` or `COUNT(DISTINCT ...)` key the value itself; an `ORDER BY` key a text, a date or bytes itself, a number
-  or a value whose type cannot be told by the bytes of its text — an output name by the expression it names — and a
+  or a value whose type cannot be told by the bytes of its text — an output name by the expression it names, a name a
+  `FROM` column also has by that column, as MySQL reads it — and a
   `UNION`'s or a `SELECT DISTINCT`'s, which can be ordered only by what it selects, x itself, flagged), `CAST(x AS UNSIGNED)`
   rounding first (a string read by its leading integer) and wrapping a negative number as MySQL does, `/` of
   integers and decimals as MySQL's exact division (computed with the fraction digits MySQL keeps, truncated — 9 for
@@ -456,18 +458,25 @@ MySQL→PostgreSQL transpile:
   number — in arithmetic, a bitwise operator, `ROUND`/`SIGN`/`POWER` or a numeric cast, an aggregate (`SUM(qty > 2)`
   counts rows) or beside a number (`= 1`, `<=> 1`, `IN`, a simple `CASE`) — as its integer, a number stored in a
   `TINYINT(1)` (`SET paid = 1`, `INSERT ... VALUES (..., 1)` or `INSERT ... SELECT`, by the column it fills) as a
-  boolean, `SET col = a = b` as MySQL reads it (`col = (a = b)`), `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and
+  boolean, `SET col = a = b` as MySQL reads it (`col = (a = b)`), `GROUP_CONCAT` over MySQL's text (a `TINYINT(1)` or a
+  comparison as its digit), `CONCAT_WS` skipping NULLs and
   `GREATEST`/`LEAST` returning NULL as MySQL does, `LENGTH` as the bytes of its text and `CHAR_LENGTH` as its characters (a `CHAR(n)` column without its
   padding, a JSON value as its text), a number, a date, a `TINYINT(1)` or a comparison as MySQL's text of it where MySQL
   wants a string (`CONCAT`/`CONCAT_WS` — bytes beside text decoded, flagged — `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`,
   `REPLACE`, `UPPER`/`LOWER`, `TRIM`, `REVERSE`, `REPEAT`, `MD5`, `ASCII`, `LOCATE`/`INSTR`, `LIKE`, `REGEXP`,
-  `GREATEST`/`LEAST` beside a string, a `UNION` column of numbers or dates and strings; a `DATETIME(6)` with all six
+  `GREATEST`/`LEAST` beside a string — but a number string below 2, whose string order is the numbers' (the clamp
+  `GREATEST(x, '0')`) — a `UNION` column of numbers or dates beside a text column or a
+  string of another sort, `'N/A'`; a `DATETIME(6)` with all six
   fractional digits), a `COALESCE`/`CASE`/`IF` MySQL makes a string — a date or a time beside a string or a text column, a
-  number beside a string or a date, a JSON value beside either — as MySQL reads that string where it stands (read as a
+  number beside a string or a date, a JSON value beside either — as MySQL reads that string where it stands (beside
+  strings PostgreSQL reads as its values with the same text — `IFNULL(end_date, '9999-12-31')` beside a `DATE`,
+  `IFNULL(qty, '0')` — a date stays a date, and a number shown a number, so a query reading a derived table's, a CTE's or
+  a view's column, or an `INSERT ... SELECT`, computes with it as MySQL does; read as a
   number — arithmetic, `SUM`/`AVG`, a numeric function, compared with a number — the double MySQL reads from it, so
   `IFNULL(qty, '0') + 1` adds and `''` is 0; read as a date — a date function, date arithmetic, compared with a date — the
   date, when its strings are dates of its sort, a `DATE` beside one with a time a timestamp and a string with no digit
-  NULL; anywhere else — shown, made text, in JSON, ordered — MySQL's string: each value's text, the literal as written),
+  NULL in a date function and MySQL's zero date compared with a date (`'-infinity'`, below every date); anywhere else —
+  shown, made text, in JSON, ordered — MySQL's string: each value's text, the literal as written),
   a `TIME` beside a date as MySQL's `DATETIME`, a `COALESCE` of exact numbers at its widest scale (`IFNULL(price, 0)` is
   `0.00`), a
   `DATE` plus days/months staying a `DATE` (an amount read from a column or an expression, or a fraction,
@@ -475,9 +484,11 @@ MySQL→PostgreSQL transpile:
   `'1 2' DAY_HOUR` by its parts; a date string with a two-digit year, or as `yyyymmdd`, read as MySQL reads it),
   `INTERVAL x unit + d` as `d + INTERVAL x unit`, a `TIMESTAMP '...'` literal as the `DATETIME` it is,
   `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column), `JSON_ARRAY`/`JSON_ARRAYAGG`
-  keeping NULLs and writing a `DATETIME` and a `TINYINT(1)` as MySQL does, `JSON_EXTRACT`/`->` and MySQL's `->>`
+  keeping NULLs and writing a `DATETIME`, a `TINYINT(1)` (`1`/`0`) and a comparison (`true`/`false`) as MySQL does,
+  `JSON_EXTRACT`/`->` and MySQL's `->>`
   (which MySQL stores in a view as `json_unquote(json_extract(...))`) over a path of member names and array indexes
-  following it as MySQL does (`[0]` of a value that is no array is the value itself, up to three `[0]` steps; a
+  following it as MySQL does (`[0]` of a value that is no array is the value itself, up to three `[0]` steps, counted
+  through the calls nested in its document; a
   document whose type cannot be told cast to `json`) — `->>` of a JSON null is the text `'null'` (NULL where a date
   function reads it, as MySQL reads it; a grouped `->>` written as its `GROUP BY` key wherever the query reads it), and
   its text, or a JSON value, compared with a number, in arithmetic, `SUM`/`AVG`, `ROUND` or a numeric function is read
@@ -506,11 +517,14 @@ MySQL→PostgreSQL transpile:
   column by what its body selects
   (a CTE named like the table it reads too), an expression by what it computes — and the Query Converter writes the same MySQL expressions the same
   way (in an `UPDATE`, a `DELETE` and an `ON DUPLICATE KEY UPDATE` too), typed by the Evaluation inventory once
-  Step 1 has run. `LENGTH`, a string function, `LIKE` and a `CONCAT` with no text in it, and `BINARY`, of a value whose
+  Step 1 has run (a view read in single-database mode, whose stored text names its own database's tables bare, is
+  read in its own schema). `LENGTH` and `BINARY` of a value whose
   type cannot be told — another view's column, a derived table's or CTE's that it computes, or one in the Query
-  Converter before Step 1 — are flagged: the first make it text as `x || ''`, MySQL's text for text, bytes, integers,
+  Converter before Step 1 — are flagged: `LENGTH` counts the text of `x || ''`, MySQL's count for text, bytes, integers,
   decimals and dates (not a `TINYINT(1)`, a `FLOAT`, a `TIMESTAMP` or a fractional `DATETIME`), and `BINARY` is
-  `CAST(x AS BYTEA)`, right for a binary column only. A quotient is shown at its scale
+  `CAST(x AS BYTEA)`, right for a binary column only; in a string function, `LIKE` or a `BINARY` comparison it is left
+  as it is — right for text, whose index still serves `LIKE 'prefix%'`; a number there fails on Test on target — but in
+  `LPAD`/`RPAD` and a `CONCAT` with no text in it, as common over numbers, it is `x || ''`. A quotient is shown at its scale
   where MySQL shows it: a statement's output and a text, and the rows of a view, derived table or CTE that MySQL
   materializes — a view declared `ALGORITHM=TEMPTABLE`, or one with an aggregate, a window, `DISTINCT`, `GROUP BY`,
   `HAVING`, `LIMIT`, a `UNION`, no table, or an output holding a subquery that reads its row — each stored at its
@@ -543,7 +557,12 @@ MySQL→PostgreSQL transpile:
   MANUAL. Flagged as still
   different: a `FLOAT`'s text (MySQL writes 6 significant digits, `1234.57`) and a `FLOAT` in JSON, and date arithmetic
   over a date beside a date string of the other sort (`IFNULL(d, '2024-06-01 10:00:00') + INTERVAL 1 DAY`: MySQL's
-  result is a string whose form follows each row, `2024-03-06` for a date). A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
+  result is a string whose form follows each row, `2024-03-06` for a date). Still different, not flagged: a number
+  beside number strings — a shown `COALESCE`/`CASE`/`IF`, a `UNION` column — is ordered (or compared with text) as a
+  number where it is read (MySQL orders the strings, `'10'` before `'9'`); a `DECIMAL` beside a number string, read by another view in arithmetic,
+  keeps its scale (`20.00` where MySQL's double shows `20`); JSON of a `COALESCE` its query groups by (a `sql_mode`
+  without `ONLY_FULL_GROUP_BY`) is written at its widest scale (`[0.00]`, MySQL `[0]`); and a `UNION` of a `DECIMAL` and
+  an integer shows the integer branch's rows without the column's scale (`5` where MySQL shows `5.00`). A **PostgreSQL** view's definition (`pg_get_viewdef`) is PostgreSQL
   already, so it is carried **verbatim** under the quoted view name, and the source pane
   shows that same text. Re-rendering it would change what the view returns — for example
   a `::text` cast on a jsonb key would apply to the whole `->` and turn a jsonb column
