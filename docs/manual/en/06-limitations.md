@@ -532,9 +532,28 @@ fails **loudly** where it can't.
     every table and then, before CDC starts, untick the tables CDC does not need to capture
     (see "Changing the table set after a Full Load (Full load + CDC)" in
     [Chapter 13](13-excluding-tables-and-columns.md)): they stay on Aurora DSQL as loaded, and
-    CDC and Validation skip them.
+    CDC and Validation skip them. A MySQL table the load reads in parts (*Reader shards per
+    large table* above 1, [§3.8](03-full-load.md#38-multi-process-parallelism-gil-bypass)) is
+    the exception: it cannot be unticked until it is reloaded with one reader (Drop &
+    reload).
   - Otherwise capture fewer tables in this CDC pipeline (deselect them in the table
     picker), or use Full load only.
+- **MySQL: a table read in parts is consistent only once CDC replays it.** With *Reader
+  shards per large table* above 1, a Full load + CDC load splits a large MySQL table's read
+  into primary-key ranges, each from its own snapshot
+  ([§3.8](03-full-load.md#38-multi-process-parallelism-gil-bypass)). Until CDC, started from
+  the Full Load's start point, has replayed the table, a row whose key changed during the read
+  can be on Aurora DSQL twice or not at all, and a transaction across two ranges half applied,
+  with equal row counts: a ROW_COUNT validation does not see it, a CHECKSUM does. So every
+  route that would leave such a table without that replay (unticking it, Full load only, a
+  Start CDC from a later start point) is refused until the table is reloaded with one reader
+  (Drop & reload: an Append keeps those rows); Full load only and the later start point are
+  also allowed once a Validation in CHECKSUM mode matches it. Unticking needs the reload
+  before CDC starts: from CDC's first Start the table set is fixed. A Start CDC, even one
+  that streamed, does not end the refusals; after one that never streamed, start CDC again
+  from Automatic.
+  A table whose unique key does not include the leading key column, and every table of a Full
+  load only run, keeps one reader.
 - **CDC is billable while deployed.** The streaming pipeline (MSK Serverless +
   MSK Connect, plus a NAT gateway if created) costs money for as long as it runs.
   Tear down the cdc-stack after cut-over. Full Load alone provisions no streaming

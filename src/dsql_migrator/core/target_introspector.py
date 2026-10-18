@@ -792,6 +792,67 @@ def target_primary_key_columns(
         _safe_close(connection)
 
 
+def target_unique_keys(
+    table_name: str,
+    *,
+    connection_factory: Callable[[], Any],
+) -> "Optional[list[list[str]]]":
+    """Every unique index of the LIVE target table, as its key columns (read-only), or None.
+
+    One ``pg_index`` read (G137): the Full Load's reader-shard guard needs the unique keys
+    an APPEND target really enforces, which the applied DDL cannot be trusted to describe
+    (an index added by hand, an edit applied since). The primary key's index is one of
+    them; a partial, an invalid or a still-building unique index counts too -- each checks
+    new writes. ``None`` (UNKNOWN, which the caller treats as a refusal) when the catalog
+    cannot be read, the table has no unique index (it is missing: Aurora DSQL requires a
+    primary key) or an index holds an expression (fewer named key columns than
+    ``indnkeyatts``).
+    """
+    parts = table_name.split(".", 1)
+    if len(parts) == 2:
+        where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
+        params: dict[str, object] = {"schema": parts[0], "table": parts[1]}
+    else:
+        where_relation = (
+            "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
+        )
+        params = {"table": parts[0]}
+    statement = (
+        "SELECT ix.indnkeyatts, "
+        "  ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute a "
+        "        JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          ON a.attnum = k.attnum "
+        "        WHERE a.attrelid = c.oid AND k.ord <= ix.indnkeyatts "
+        "        ORDER BY k.ord) AS key_columns "
+        "FROM pg_catalog.pg_class c "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid AND ix.indisunique "
+        f"WHERE {where_relation}"
+    )
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> unknown
+        return None
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(statement, params)
+        rows = cursor.fetchall()
+    except Exception:  # noqa: BLE001 - unreadable catalog -> unknown, never a guess
+        return None
+    finally:
+        if cursor is not None:
+            _safe_close(cursor)
+        _safe_close(connection)
+    keys: list[list[str]] = []
+    for row in rows or ():
+        columns = [str(c) for c in (row[1] or ()) if c]
+        if not columns or len(columns) != int(row[0] or 0):
+            return None  # an expression key column (attnum 0) names no attribute
+        keys.append(columns)
+    return keys or None
+
+
 def target_generated_columns(
     table_name: str,
     *,
@@ -1909,6 +1970,7 @@ __all__ = [
     "tables_with_rows",
     "target_primary_key_columns",
     "target_primary_keys",
+    "target_unique_keys",
     "target_foreign_keys",
     "unique_index_state",
     "SYSTEM_SCHEMAS",

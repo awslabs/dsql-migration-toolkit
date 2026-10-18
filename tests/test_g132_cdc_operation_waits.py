@@ -432,16 +432,29 @@ def test_the_dlq_card_says_the_full_load_step_runs_no_reload_while_cdc_streams()
     assert "Full Load collides with it" not in body
 
 
-def test_the_reader_shards_help_says_a_mysql_source_reads_with_one_reader() -> None:
-    # G129's side effect: MySQL reader-range sharding engaged only beside a streaming sink.
+def test_the_reader_shards_help_says_when_a_mysql_source_splits_a_table() -> None:
+    # G129 left MySQL reader-range sharding engaged only beside a streaming sink; G137 splits
+    # a MySQL table in Full load + CDC, where CDC replays the load from its start point.
     from dsql_migrator.config import TUNABLE_KNOBS
 
     (knob,) = [k for k in TUNABLE_KNOBS if k.field == "full_load_reader_shards"]
     help_text = " ".join(knob.help_text.split())
-    assert "A MySQL source always reads a table with one reader" in help_text
-    assert "no Full Load runs while CDC streams" in help_text
-    assert "PostgreSQL source, whose shards share one snapshot, with 'Tables in parallel' " \
-           "above 1" in help_text
+    assert "A MySQL source always reads a table with one reader" not in help_text
+    assert "A PostgreSQL source splits in any run, its ranges sharing one snapshot" in help_text
+    assert ("A MySQL source splits only in Full load + CDC with a binlog start point, and only "
+            "a table whose every unique key on Aurora DSQL includes that leading column") in help_text
+    assert "Full load only reads every MySQL table with one reader" in help_text
+    assert "It applies only with 'Tables in parallel' above 1" in help_text
+    # The trade-off, said where the knob is set (no more "Shard minimum rows" field).
+    assert "rise up to Tables in parallel ×" in help_text
+    assert "pair it with the source-load throttle" in help_text
+    assert "DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS" in help_text
+    assert "'Shard minimum rows'" not in help_text
+    # The Settings row's visible helper says the same in one line.
+    assert knob.description == (
+        "Split a large table's read by its integer leading key (1 = off; MySQL: Full load "
+        "+ CDC only)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -478,13 +491,16 @@ _PINS = {
             "上記の削除と再デプロイの方法を示します。Stop または Delete が終わると Retry や Reload が"
             "実行でき、Start で CDC がストリーミングを始めると、再び Stop CDC が先になります。",
         },
+        # G137: a MySQL table splits in Full load + CDC (CDC replays the load from its start
+        # point), PostgreSQL in any run (one shared snapshot).
         "sharding": {
-            "en": "it only engages on this multi-process path (`TABLE_PARALLELISM` above 1) where "
-            "every shard reads one shared snapshot — a PostgreSQL source.",
-            "ko": "또한 이 멀티프로세스 경로(`TABLE_PARALLELISM`이 1보다 클 때)에서 모든 shard가 하나의 "
-            "공유 스냅샷을 읽는 경우 — PostgreSQL 소스 — 에서만 동작합니다.",
-            "ja": "またこのマルチプロセスの経路（`TABLE_PARALLELISM` が 1 より大きい場合）で、すべての"
-            "シャードが 1 つの共有スナップショットを読む場合 — PostgreSQL ソース — でのみ動作します。",
+            "en": "**MySQL**: only in **Full load + CDC** whose start point has a binlog file and "
+            "position, and only a table whose every unique key on Aurora DSQL includes the "
+            "leading key column",
+            "ko": "**MySQL**: 시작 지점에 binlog 파일과 위치가 있는 **Full load + CDC**에서만, 그리고 "
+            "Aurora DSQL에서 모든 unique 키가 선행 키 컬럼을 포함하는 테이블만",
+            "ja": "**MySQL**: 開始位置に binlog ファイルと位置がある **Full load + CDC** でのみ、そして "
+            "Aurora DSQL 上のすべてのユニークキーが先頭のキー列を含むテーブルだけ",
         },
     },
     _P04: {

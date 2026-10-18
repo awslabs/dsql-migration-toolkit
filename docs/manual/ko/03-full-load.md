@@ -77,7 +77,8 @@ LIMIT :batch_size          -- DEFAULT_BATCH_SIZE = 5000
 PostgreSQL: `REPEATABLE READ` 트랜잭션) 안에서 **server-side/스트리밍 커서**로 실행되므로:
 
 - 테이블 전체가 **RAM에 올라오지 않음** — 메모리가 한 페이지로 한정;
-- 실행 중인 소스가 계속 바뀌어도 읽기는 **단일 일관 스냅샷**으로 유지됨.
+- 실행 중인 소스가 계속 바뀌어도 읽기는 **단일 일관 스냅샷**으로 유지됨(나누어 읽는 MySQL
+  테이블은 부분마다 스냅샷 하나, [§3.8](#38-멀티프로세스-병렬화-gil-우회)).
 
 **MySQL은 소스 자체 설정과 관계없이 `REPEATABLE READ`로 읽습니다.** 도구가 여는 모든 MySQL 소스 세션은
 먼저 `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ`를 실행합니다. 세션 설정이라 서버의
@@ -385,30 +386,99 @@ v0.1.68부터 로더는 **`ProcessPoolExecutor`**를 사용합니다 — 각 테
 
 - **소형 테이블** (shard 불가 또는 행 수 미달): 테이블당 1 worker 프로세스.
 - **대형 테이블** (선행 PK 컬럼이 정수인 경우 — 단일 정수 PK, 또는 `(tenant_id, id)`처럼
-  선행 컬럼이 정수인 복합 PK): K개 PK range shard로 분할해 각각 별도 worker 프로세스에서
-  소스의 겹치지 않는 구간을 로드. 이 reader-range 샤딩은 **기본적으로 꺼져 있으며**
-  (`full_load_reader_shards=1`), `FULL_LOAD_READER_SHARDS` > 1로 켭니다. 또한 이 멀티프로세스
-  경로(`TABLE_PARALLELISM`이 1보다 클 때)에서 모든 shard가 하나의 공유 스냅샷을 읽는 경우 —
-  PostgreSQL 소스 — 에서만 동작합니다. MySQL 테이블은 항상
-  리더 하나를 사용합니다: 그 shard들은 각자 자신의 스냅샷을 읽게 되는데, 이를 맞출 수 있는 것은
-  스트리밍 중인 CDC 싱크 옆에서의 실행뿐이고, CDC가 스트리밍하는 동안에는 Full Load가 실행되지
-  않습니다([§3.5](#35-워터마크--cdc로의-다리)).
-- **모든 work unit이 하나의 bounded pool 공유** — `table_parallelism`이 동시 worker 수를 제어.
+  선행 컬럼이 정수인 복합 PK): 읽기를 K개의 기본 키 구간으로 나누어, 각 구간을 별도 worker
+  프로세스가 소스의 겹치지 않는 구간에서 로드할 수 있습니다. 이 reader-range 샤딩은 **기본적으로
+  꺼져 있으며**(`full_load_reader_shards=1`, **Settings → Full Load**의 *Reader shards per
+  large table*), 이 멀티프로세스 경로(`TABLE_PARALLELISM`이 1보다 클 때)에서 예상 행 수가
+  `SHARD_MIN_ROWS` 이상인 테이블에만 동작합니다. K는 설정값이며 최대 32 ÷
+  `TABLE_PARALLELISM`입니다.
+  - **PostgreSQL**: 모든 실행에서. 모든 구간이 하나의 공유 스냅샷을 가져오므로, 리더 하나일 때와
+    마찬가지로 복사본은 한 시점의 것입니다.
+  - **MySQL**: 시작 지점에 binlog 파일과 위치가 있는 **Full load + CDC**에서만, 그리고 Aurora
+    DSQL에서 모든 unique 키가 선행 키 컬럼을 포함하는 테이블만(기본 키, 적용된 DDL의 각 UNIQUE
+    제약과 UNIQUE 인덱스, 그리고 append라면 실제 테이블의 각 unique 인덱스). MySQL은 스냅샷을
+    공유할 수 없어 구간마다 자신의 스냅샷을 읽으므로, 읽는 동안 키가 바뀐 행은 두 번 복사되거나
+    전혀 복사되지 않을 수 있고, 두 구간에 걸친 트랜잭션은 절반만 반영될 수 있습니다 — 행 수는
+    같은 채로. 적재 후 모든 읽기보다 먼저 잡은 시작 지점([§3.5](#35-워터마크--cdc로의-다리))에서
+    시작한 CDC가 그 이후의 모든 변경을 재생해, 서로 다른 시점에 읽은 테이블을 바로잡듯 이를
+    바로잡습니다. 선행 컬럼이 없는 unique 키(`UNIQUE (email)` 등)는 한 행의 두 복사본을 보게
+    되므로, 그런 테이블은 리더 하나를 유지합니다. **Full load only**는 모든 MySQL 테이블을 리더
+    하나로 읽습니다: 나누어 읽은 복사본을 바로잡을 것이 없기 때문입니다.
+  - 적용된 기본 키가 소스와 다른 append 테이블은 실제 테이블의 키가 적용된 키와 같을 때만
+    나뉩니다. 그렇지 않으면 리더 하나일 때처럼 하나의 단위로 적재되어, 적용된 키로 빈 테이블을
+    다시 만들거나 적재를 거부합니다.
+  - MySQL 구간은 소스 연결이 끊긴 뒤 그 자리에서 다시 읽지 않습니다: 한 구간 안의 두 번째
+    스냅샷은 선행 컬럼을 포함하는 unique 키(`(tenant_id, email)` 등)도 깨뜨릴 수 있기 때문입니다.
+    그 구간이 실패하고, 테이블은 그 이유(*range 2 of 4*)와 함께 *Failed*가 되며, **Retry
+    unfinished tables**가 다시 적재합니다. PostgreSQL 구간은 공유 스냅샷을 다시 읽습니다.
+  - Reader shards와 `TABLE_PARALLELISM`이 모두 1보다 크면, 활동 로그가 나눌 만큼 큰 테이블(정수
+    선행 키 컬럼과 예상 행 수 `SHARD_MIN_ROWS` 이상)마다 *read in K primary-key ranges* 또는
+    *read with one reader*와 그 이유를 기록하고, Full Load 표는 나누어 읽은 테이블 이름 아래에
+    *read in K parts*를 표시합니다.
+- **모든 work unit이 하나의 bounded pool 공유** — `table_parallelism`이 동시 worker 수를 제어하며,
+  각 구간이 slot 하나를 차지.
 
 ```
-ProcessPoolExecutor(max_workers=table_parallelism)
-  ├─ customers (소형)           → 1 worker
-  ├─ orders (9M, int PK)       → 2 shard workers
-  ├─ payments (9M, int PK)     → 2 shard workers
-  └─ order_items (33.6M, int PK) → 3 shard workers
-                                    ───────────────
-                                    8 workers = 8 cores
+ProcessPoolExecutor(max_workers=table_parallelism)     예: 8
+  ├─ customers (소형)              → work unit 1개
+  ├─ orders (9M, int PK)           → K = 4 구간 unit
+  └─ order_items (33.6M, int PK)   → K = 4 구간 unit
+                                     동시에 최대 8개 unit 실행,
+                                     unit마다 소스 리더 하나
 ```
+
+### 나누어 읽은 테이블에는 CDC의 재생이 필요합니다(MySQL)
+
+CDC가 재생하기 전까지 나누어 읽은 MySQL 테이블은 어긋난(torn) 상태이므로, 그 재생에서 테이블을
+빼내는 경로는 모두 테이블 이름과 함께 거부되며, 거부를 끝내는 방법을 안내합니다. Settings에서
+*Reader shards per large table*을 1로 설정하고 Full Load 단계가 그 테이블에 보여 주는 컨트롤로 다시
+적재한 뒤(리더 하나, 스냅샷 하나 — 테이블이 끝나지 않았으면 **Retry unfinished tables**, 모든
+테이블이 적재된 뒤에는 **Reload specific tables**) 작업을 수행합니다. Full load only와 더 나중의
+시작 지점에는 두 번째 방법이 있습니다: CDC가 테이블을 재생한 뒤 *Fast sweep*을 끄고 **CHECKSUM**
+모드로 Validation을 실행합니다: 일치하면 사본이 증명되어 거부가 끝납니다. 테이블의 체크 해제에는
+CDC를 시작하기 전에 다시 적재하는 방법만 있습니다: 재생에는 CDC가 시작되어야 하고, CDC의 첫
+Start부터 테이블 집합이 고정되기 때문입니다(Start over로만 바꿀 수 있음,
+[§13.7](13-excluding-tables-and-columns.md)). 컨트롤은 단계가 지금 나열하는 테이블을 따릅니다: 적재
+후 체크해 아직 적재할 테이블은 끝나지 않은 것으로 치고, 적재 후 체크 해제한 테이블은 세지 않습니다.
+
+- 적재 후 테이블 목록에서 **체크 해제**하거나, *Exclude tables & columns*의 테이블 규칙으로
+  선택 해제하기: 체크박스가 잠기며, 잠금 아이콘에 이유가 표시됩니다.
+- 적재 후 **마이그레이션 유형을 Full load only로 바꾸기**(CDC only에서도: 그때 경로는 Full Load
+  단계가 테이블을 다시 적재하는 Full load + CDC를 거칩니다).
+- **더 나중의 시작 지점에서 Start CDC**: Full Load 워터마크보다 나중인 Manual 위치(직접 입력하거나
+  *Fetch current position*으로 채운 것) — 삭제된 binlog에 대한 해결책의 manual 경로도 포함하며,
+  *Fetch current position*을 권하는 시작 지점·GTID 해결책도 이를 함께 안내합니다. Automatic, 또는
+  워터마크와 같거나 그보다 이른 Manual 지점은 모든 읽기를 재생하므로 거부되지 않으며, 멈춘 스트림을
+  재개하는 Start도 거부되지 않습니다. 거부 메시지는 이 방법을 먼저 안내합니다.
+- 적재 전, *Too many tables for one CDC pipeline* 경로(모든 테이블을 적재한 뒤 CDC에 필요 없는
+  테이블을 체크 해제)는 Reader shards와 `TABLE_PARALLELISM`이 모두 1보다 클 때 이를 함께 안내합니다.
+  적재 후 Deploy CDC infrastructure, Start CDC, Retry CDC의 같은 보류는 그런 테이블을 선택 해제할
+  수 없는 테이블로 명시하고 Full load only를 제시하지 않습니다.
+
+테이블의 표시는 두 가지 중 하나로 지워집니다: 그 테이블을 다시 만드는 적재(**Drop & reload**), 또는
+그 테이블의 마지막 적재가 끝난 뒤 시작된 Validation의 **CHECKSUM** 비교가 일치하는 경우입니다 —
+ROW_COUNT 실행이나, 행 수가 같아 *Fast sweep*이 건너뛴 CHECKSUM으로는 지워지지 않습니다. Append,
+실패하거나 멈춘 재시도, 또는 테이블을 하나의 단위로 읽는 적재는 나누어 읽은 행을 Aurora DSQL에 그대로
+두므로 표시도 유지됩니다. 나눈 부분이 한 행도 쓰지 않았음이 확실한 테이블(어느 부분도 실행되지
+않았거나, 멈추거나 실패하기 전에 어느 부분도 행을 읽지 않은 경우)은 표시되지 않습니다. 그래서 리더
+하나로 읽는 Retry나 Reload는 그런 테이블을, 행이 있든 비어 있든, Append / Drop & reload 선택과
+관계없이 삭제 후 다시 적재합니다(대화 상자가 이유를 표시). Reader shards가 아직 1보다 크면 다시 적재할
+때 다시 나누어 읽으므로 Append가 유지됩니다. 모든 테이블의 재실행(**Re-run Full Load** 또는
+**Re-run all tables**)도 선택이나 Reader shards 설정과 관계없이 그런 테이블을 삭제 후 다시 적재합니다:
+재실행은 새 시작 지점을 잡고, 그 지점부터의 CDC는 그 전에 일어난 변경을 재생하지 않으므로, Append는
+나누어 읽은 행을 그대로 두게 되기 때문입니다.
+
+Start CDC는 스트리밍했더라도 거부를 끝내지 않습니다: 도구는 그것만으로 CDC가 테이블을 재생했는지 알 수
+없습니다. 스트리밍하지 못한 Start(워커가 거부했거나 커넥터가 실패한 경우) 뒤에는 **Automatic**(또는
+Full Load 워터마크와 같거나 그보다 이른 Manual 지점)에서 CDC를 다시 시작하세요: 그것이 재생이며
+거부되지 않습니다. CDC가 따라잡은 뒤에는 CHECKSUM 일치가 Full load only와 더 나중의 시작 지점에 대한
+거부를 끝냅니다. 첫 Start부터 테이블 집합은 어차피 고정됩니다([§13.7](13-excluding-tables-and-columns.md)).
 
 ### 튜닝
 
-대규모 마이그레이션에서는 worker 수를 태스크의 vCPU 수에 맞추세요 — pool slot을
-whole-table worker와 shard worker에 배분하는 일은 로더가 알아서 합니다. 관련 설정
+대규모 마이그레이션에서는 worker 수를 태스크의 vCPU 수에 맞추세요 — whole-table unit과 구간
+unit이 같은 slot을 기다립니다. Reader shards는 몇몇 대형 테이블 때문에 slot이 놀게 될 때 도움이
+되며, 그 대가는 같은 테이블에 대한 동시 읽기입니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)). 관련 설정
 (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`)과 각각의 한도, 그리고 소스
 부하와의 관계는 [7장 §7.2 — 병렬도 튜닝](07-performance-and-tuning.md#72-병렬수-튜닝)에
 모여 있습니다. 이 설계가 실제로 낸 처리량(그리고 이것이 대체한 ThreadPool 기준선)은

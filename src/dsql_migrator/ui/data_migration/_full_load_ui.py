@@ -72,6 +72,10 @@ from dsql_migrator.ui.data_migration._models import (
     format_watermark,
     full_load_completeness,
     exclusion_forced_replace,
+    mysql_reads_may_split,
+    SPLIT_SET_FIXED,
+    split_read_tables,
+    split_reload_route,
     summarize_table_states,
     unsettled_table_names,
 )
@@ -100,6 +104,20 @@ _ADDITION_FORCED_REASON = (
     "selected after the Full Load, and Aurora DSQL already holds rows in it that may predate "
     "the changes CDC captures for it (an append keeps every row already there), so it is "
     "dropped and reloaded"
+)
+# G137: why a run drops and reloads a table the Full Load read in parts, while its copy still
+# waits for CDC's replay -- whether or not it holds rows (an empty table loses nothing) -- when
+# it is a re-run of every table (a new start point: CDC from there never replays the changes
+# before it, so an append would keep the rows read in parts as they are for good, split again
+# or not, and a new record read with one reader would not even mark them), or a Retry or
+# Reload that reads with one reader (an append keeps those rows and the record's mark, with
+# every refusal that keeps the table in CDC's replay; only the recreate clears it).
+_SPLIT_FORCED_REASON = (
+    "read in parts by the Full Load, each part from its own snapshot, so its copy waits for "
+    "CDC's replay from the Full Load's start point: an append would keep any rows read in "
+    "parts as they are (CDC from a re-run's new start point never replays the changes before "
+    "it, and after a reload with one reader the table stays marked), so it is dropped and "
+    "reloaded"
 )
 
 # G25 (decision A): while CDC is live the step keeps its "Stop CDC first" gate. A Full Load
@@ -533,7 +551,8 @@ def _render_overlay_blocks(
     the unreadable-record error with [Retry], the could-not-read-the-target warning, and --
     re-rendered with the reload choice and, in a checklist, with the ticked tables -- the
     NULL line, the exact ALTERs and the forced tables with their reasons. With no overlay
-    (``ov`` empty) only a G17 addition can be forced, so only that notice is drawn. While CDC
+    (``ov`` empty) only a G17 addition or (G137) a table read in parts can be forced, so only
+    that notice is drawn. While CDC
     is live nothing is forced and nothing runs (G129: the dialog cannot be confirmed then), so
     the appends a load beside the sink would make are not described either (G132)."""
     view = ov.get("view")
@@ -849,7 +868,9 @@ def _render_full_load_step(
         selected after the Full Load that the probe found holding rows: they are dropped and
         reloaded whatever the Append / Drop choice says (the rows may predate the changes
         CDC captures for the table, and an append keeps them), exactly like the overlay's
-        forced tables.
+        forced tables -- and (G137) the tables the Full Load read in parts, with rows or
+        empty, while their copy waits for CDC's replay, that a re-run of every table reloads
+        (``keeps_watermark`` False) or a Retry or Reload with one reader.
 
         ``keeps_watermark`` (G25) is the action kind the summary's source-write sentence
         follows: False for Start / Re-run all tables (a new snapshot, which on PostgreSQL
@@ -1024,9 +1045,10 @@ def _render_full_load_step(
 
                 for _tone, _note in start_dialog_exclusion_notes(migration_state):
                     inline_hint(ui, _note, tone=_tone)
-                # Without an overlay too when a G17 addition is forced: the overlay blocks then
-                # draw only the forced-table notice -- the same one, re-rendered with the
-                # checklist ticks, so an unticked table is never announced as dropped.
+                # Without an overlay too when a G17 addition (or a G137 table read in parts) is
+                # forced: the overlay blocks then draw only the forced-table notice -- the same
+                # one, re-rendered with the checklist ticks, so an unticked table is never
+                # announced as dropped.
                 if overlay is not None or _addition_forced:
                     _render_overlay_blocks(
                         ui, _ov, action_tables=action_tables, forced=forced,
@@ -1478,6 +1500,23 @@ def _render_full_load_step(
                 for t in action_tables
                 if t in (cdc_additions or ()) and t in migration_state.tables_with_data
             }
+            # G137: a run drops and reloads a table the Full Load read in parts, while its
+            # copy waits for CDC's replay (the record's mark, until a CHECKSUM match or a
+            # recreate), empty or not -- an empty one loses nothing. A re-run of every table
+            # (a new start point) always: CDC from it never replays the changes before it, so
+            # an append would keep the rows read in parts as they are for good, whether it
+            # splits again or not. A Retry or Reload (the original start point) with one
+            # reader: an append would keep those rows and the mark, and with them every
+            # refusal of the routes out of the replay (only the recreate clears it); with
+            # parts again, an append keeps the replay correct: no force.
+            if not keeps_watermark or not mysql_reads_may_split(_engine):
+                _split_waiting = set(split_read_tables(
+                    _current_job(job_manager, getattr(migration_state, "job_id", None))
+                ))
+                addition_forced = {
+                    **{t: _SPLIT_FORCED_REASON for t in action_tables if t in _split_waiting},
+                    **addition_forced,
+                }
             if overlay_active:
                 outcome = None
                 if not ledger_error:
@@ -2561,6 +2600,46 @@ def _rows_breakdown_tooltip(row: "FullLoadTableRow") -> str:
     return " · ".join(parts)
 
 
+def _reader_shards_caption(row: "FullLoadTableRow") -> str:
+    """The table cell's caption for a table the latest load read in parts (G137), else ""."""
+    parts = row.reader_shards or 0
+    return f"read in {parts} parts" if parts > 1 else ""
+
+
+def _reader_shards_tooltip(
+    row: "FullLoadTableRow", *, own_snapshots: bool, others_open: bool = False
+) -> str:
+    """Hover text for :func:`_reader_shards_caption`: what reading in parts means for this
+    table's copy -- on MySQL (``own_snapshots``: each part its own snapshot) the routes that
+    wait for CDC's replay, proven by a CHECKSUM match (Full load only, a later start point;
+    an untick only by the reload, before CDC starts: ``_models.SPLIT_SET_FIXED``), or for a
+    reload with one reader through the control the step shows for the row
+    (``_models.split_reload_route``: Retry unfinished tables while it is unfinished, else
+    Reload specific tables -- once no other table is unfinished, ``others_open``). "" for a
+    table read whole."""
+    parts = row.reader_shards or 0
+    if parts <= 1:
+        return ""
+    if not own_snapshots:
+        return (
+            f"The Full Load read this table in {parts} primary-key ranges sharing one "
+            "snapshot (Reader shards per large table in Settings)."
+        )
+    route = split_reload_route(
+        [row.table],
+        states=(frozenset({row.table}) if row.state != "DONE" else frozenset(), others_open),
+    )
+    return (
+        f"The Full Load read this table in {parts} primary-key ranges, each from its own "
+        "snapshot (Reader shards per large table in Settings). Its copy is consistent once "
+        "CDC, started after the load from the start point taken before it, replays the "
+        "table. Until a match in Validation in CHECKSUM mode (Fast sweep off) proves that "
+        "replay, switching to Full load only and starting CDC from a later start point are "
+        f"refused. Unticking it is refused until it is reloaded. {SPLIT_SET_FIXED} To do one of "
+        f"them now, {route} first."
+    )
+
+
 def _format_attempts_cell(row: "FullLoadTableRow") -> str:
     """Attempts, with a plain-language error marker so no Errors column is needed.
 
@@ -2809,9 +2888,19 @@ def _render_full_load_progress(
         {"name": "attempts", "label": "Attempts", "field": "attempts", "align": "left"},
     ]
     now = datetime.now(timezone.utc)
+    # G137: a MySQL table read in parts (each from its own snapshot) -- the rest share one.
+    _own_snapshots = set(split_read_tables(job))
+    # Which tables did not finish: the route names the control the step shows for a row.
+    _open = {row.table for row in rows if row.state != "DONE"}
     table_rows = [
         {
             "table": row.table,
+            # "read in K parts" under the name when the latest load split its read.
+            "parts": _reader_shards_caption(row),
+            "parts_tooltip": _reader_shards_tooltip(
+                row, own_snapshots=row.table in _own_snapshots,
+                others_open=len(_open) > (row.table in _open),
+            ),
             "state": row.state,
             "state_label": _LOAD_STATE_LABELS.get(row.state, row.state),
             "state_color": _LOAD_STATE_COLORS.get(row.state, "grey"),
@@ -2871,6 +2960,22 @@ def _render_full_load_progress(
         pagination={"rowsPerPage": _rows_per_page, "page": _saved_page},
         on_pagination_change=_on_pagination_change,
     ).props("wrap-cells dense").classes("w-full")
+    # The table name, with a grey "read in K parts" caption when the latest load split the
+    # table's read (G137); the tooltip says what that means for its copy.
+    table.add_slot(
+        "body-cell-table",
+        r"""
+        <q-td :props="props">
+          <div>{{ props.value }}</div>
+          <div v-if="props.row.parts" class="row items-center no-wrap text-xs text-gray-500"
+               style="gap:2px">
+            <q-icon name="call_split" size="12px" />
+            {{ props.row.parts }}
+            <q-tooltip>{{ props.row.parts_tooltip }}</q-tooltip>
+          </div>
+        </q-td>
+        """,
+    )
     # Colored status badge per row (visualizes each table's load state), plus an amber
     # "N dropped" badge when rows were permanently quarantined. A quarantining table
     # finishes DONE, so without this it is indistinguishable from a clean one in the

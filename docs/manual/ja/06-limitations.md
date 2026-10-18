@@ -455,9 +455,25 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
     1 つのパイプラインがキャプチャするかを示します。それでもすべてのテーブルをロードし、CDC を開始する
     前に、CDC がキャプチャする必要のないテーブルの選択を外せます([第 13 章](13-excluding-tables-and-columns.md)の
     「Full Load 後にテーブル集合を変更する (Full load + CDC)」を参照): それらのテーブルはロードされたまま
-    Aurora DSQL に残り、CDC と Validation はそれらをスキップします。
+    Aurora DSQL に残り、CDC と Validation はそれらをスキップします。ロードが分割して読む MySQL テーブル
+    (*Reader shards per large table* が 1 より大きい、[§3.8](03-full-load.md#38-マルチプロセス並列化gil-バイパス))
+    は例外です: リーダー 1 つでロードし直す(Drop & reload)まで選択を外せません。
   - それ以外の場合は、この CDC パイプラインでキャプチャするテーブルを減らす(テーブル一覧で選択を外す)か、
     Full load only を使用してください。
+- **MySQL: 分割して読んだテーブルは CDC が再生して初めて一貫します。** *Reader shards per large table* が
+  1 より大きいと、Full load + CDC のロードは大きな MySQL テーブルの読み取りを主キー区間に分け、区間ごとに
+  自身のスナップショットで読みます([§3.8](03-full-load.md#38-マルチプロセス並列化gil-バイパス))。Full Load の
+  開始位置から開始した CDC がそのテーブルを再生するまでは、読み取り中にキーが変わった行が Aurora DSQL に
+  2 つあるか 1 つもないことがあり、2 つの区間にまたがるトランザクションは半分だけ反映されていることが
+  あります — 行数は等しいまま: ROW_COUNT の検証はこれに気づかず、CHECKSUM は気づきます。そのため、
+  そのようなテーブルをその再生なしに残す経路(選択を外す、Full load only、より後の開始位置からの
+  Start CDC)は、テーブルをリーダー 1 つでロードし直す(Drop & reload: Append はそれらの行をそのまま残します)
+  まですべて拒否されます。Full load only とより後の開始位置は、CHECKSUM モードの Validation がそのテーブルの
+  一致を確かめた場合にも許可されます。選択を外すには CDC を開始する前のロードし直しが必要です: CDC の
+  最初の Start からテーブルの集合は固定されます。Start CDC は、
+  ストリーミングした場合でも拒否を終わらせません: ストリーミングしなかった Start の後は、Automatic から
+  CDC をもう一度開始してください。先頭のキー列を含まない
+  ユニークキーを持つテーブルと、Full load only の実行のすべてのテーブルはリーダー 1 つのままです。
 - **CDC はデプロイされている間は課金対象です。** ストリーミングパイプライン
   (MSK Serverless + MSK Connect、および作成した場合は NAT ゲートウェイ)は、
   実行されている間ずっとコストが発生します。Cut over 後は cdc-stack を削除して

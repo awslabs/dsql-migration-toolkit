@@ -1693,6 +1693,62 @@ def full_load_covered_tables(
     return frozenset(counts) if counts else None
 
 
+def clear_proven_split_tables(
+    migration_state: object,
+    job_manager: object,
+    validation_state: "ValidationState",
+    items: "Iterable[TableValidationResult]",
+) -> "list[str]":
+    """G137: end the wait for CDC's replay of each table a MySQL Full Load read in parts (each
+    part from its own snapshot) that ``items`` -- a run's or a re-check's results, already in
+    ``validation_state`` -- matched by CHECKSUM (:func:`value_verified`). A CHECKSUM match
+    proves the copy equals the source, so the tear is repaired, and the routes that waited
+    for the replay (Full load only, a CDC start point later than the Full Load's) open again;
+    an untick opens only while CDC never started (its first Start fixes the table set, so the
+    log line does not offer it). A row-count match, a skipped deep check, a mismatch or a table
+    not compared leaves the mark. Cleared on the Full Load job the way the engine writes the
+    mark (``JobManager.apply_update``, persisted), and only for a comparison that started
+    after the table's last load ended (``_models.clear_proven_split_records``); logged.
+    Returns the tables cleared. Never raises: an unreadable record keeps every mark."""
+    from dsql_migrator.ui.data_migration._cdc_status import _current_job
+    from dsql_migrator.ui.data_migration._models import (
+        clear_proven_split_records,
+        split_read_tables,
+    )
+
+    job_id = getattr(migration_state, "job_id", None)
+    if job_id is None or job_manager is None:
+        return []
+    split = set(split_read_tables(_current_job(job_manager, job_id)))
+    proven = {
+        item.table: validation_state.compared_from(item.table)
+        for item in items or ()
+        if item.table in split and value_verified(item)
+    }
+    proven = {name: at for name, at in proven.items() if at is not None}
+    if not proven:
+        return []
+    cleared: list[str] = []
+    try:
+        job_manager.apply_update(
+            job_id, lambda job: cleared.extend(clear_proven_split_records(job, proven))
+        )
+    except Exception:  # noqa: BLE001 - the marks stay (the safe side); the report stands
+        return []
+    if cleared:
+        log_activity(
+            ActivityCategory.VALIDATION,
+            "tables read in parts proven",
+            status=ActivityStatus.SUCCESS,
+            detail=(
+                f"{bounded_table_names(cleared)} matched by CHECKSUM: the copy the Full Load "
+                "read in parts equals the source, so Full load only and a CDC start point "
+                "later than the Full Load's are no longer refused"
+            ),
+        )
+    return cleared
+
+
 @dataclass(frozen=True)
 class ValidationScope:
     """Human-facing description of WHAT a validation run covers (for the UI).
@@ -3391,6 +3447,11 @@ def build_validation_screen(
                     )
                 ),
             )
+            # G137: a CHECKSUM match ends a table read in parts' wait for CDC's replay (logged
+            # after the verdict it follows from).
+            clear_proven_split_tables(
+                migration_state, job_manager, validation_state, result.items
+            )
             if ai_post_event is not None:
                 ai_post_event(
                     text=(
@@ -3649,10 +3710,14 @@ def build_validation_screen(
                 return  # cancelled: the report is simply left as it was
             # Merge under the state lock; a False return means a full re-run cleared
             # the report while this was in flight, so there is nothing to update.
-            validation_state.merge_recheck_result(
+            if validation_state.merge_recheck_result(
                 items,
                 orphan_findings=(orphans if options.check_orphans else None),
-            )
+            ):
+                # G137: as after a run, a CHECKSUM match ends a split table's wait.
+                clear_proven_split_tables(
+                    migration_state, job_manager, validation_state, items
+                )
 
         validation_state.job_id = job_manager.submit(work, durable=False)
 

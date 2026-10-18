@@ -1035,6 +1035,7 @@ def resolve_exclusion_rules(
     stored_columns: "Optional[Mapping[str, Collection[str]]]" = None,
     capture: "Optional[Callable[[Mapping[str, frozenset[str]], Sequence[str]], object]]" = None,
     reselect_lock: "Optional[Callable[[Sequence[str]], Optional[tuple[Sequence[str], str]]]]" = None,
+    unselect_lock: "Optional[Callable[[Sequence[str]], Optional[tuple[Sequence[str], str]]]]" = None,
 ) -> RuleResolution:
     """Resolve rule ``text`` against the ``migratable`` tables (the tree's universe, in its
     order). Include wins and line order never matters: per domain (tables; columns),
@@ -1065,8 +1066,10 @@ def resolve_exclusion_rules(
     by Retry unfinished tables before CDC captures it, G17) -- returns ``(blocked, reason)``
     for the re-selected ``names`` it refuses, else ``None``. An include table line
     re-selecting a blocked table is a line E3, and a blocked re-selection no line causes (a
-    deleted rule) is a global E3, both carrying ``reason``; unselecting stays free. ``None``
-    (the default) changes nothing.
+    deleted rule) is a global E3, both carrying ``reason``. ``None`` (the default) changes
+    nothing. ``unselect_lock(names)`` is its twin for UNSELECTED ``names`` (G137: a table the
+    Full Load read in parts, whose copy CDC must replay): an exclude table line unselecting a
+    blocked table is a line E3 carrying ``reason``; any other unselect stays free.
 
     Eligibility: ``context_factory(selected', candidate tables)`` builds the ONE context
     (called once, so B3 is judged against the selection AFTER this Save); a BLOCKED
@@ -1314,6 +1317,14 @@ def resolve_exclusion_rules(
                     errors.setdefault(line, []).append(RuleError(
                         "E3", line,
                         f"This rule would select {_names(list(refused[0]))} again. "
+                        f"{refused[1]}",
+                    ))
+            elif unselect_lock is not None and rule.action == "exclude" and touched:
+                refused = unselect_lock(touched)
+                if refused:
+                    errors.setdefault(line, []).append(RuleError(
+                        "E3", line,
+                        f"This rule would unselect {_names(list(refused[0]))}. "
                         f"{refused[1]}",
                     ))
         else:

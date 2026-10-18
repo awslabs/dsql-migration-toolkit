@@ -339,8 +339,8 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블당 in-flight `INSERT … ON CONFLICT` 배치 수. 높을수록 처리량↑, OCC(40001) 충돌↑. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (켜짐) | 읽기 선행 prefetch 큐(리더 스레드가 bounded 큐를 채우는 동안 쓰기 진행). 켜 두세요. A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (꺼짐, ≤8) | 큰 단일 정수 PK 테이블의 읽기를 K개 동시 리더로 분할. 대개 이득이 드묾(리더가 GIL 바운드) — 매뉴얼 §7.2 참고. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 이 추정 행수 이상인 테이블만 리더 샤딩; 더 작은 테이블은 항상 단일 리더. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (꺼짐, ≤8) | 큰 테이블의 읽기를 정수 선행 기본 키 컬럼으로 K개 구간으로 나눠, 구간마다 별도 worker 프로세스가 읽음(구간마다 `FULL_LOAD_TABLE_PARALLELISM`의 slot 하나). PostgreSQL: 모든 실행. MySQL: Full load + CDC에서만, unique 키가 모두 그 컬럼을 포함하는 테이블만. 매뉴얼 §3.8 / §7.2 참고. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 이 추정 행수 이상인 테이블만 리더 샤딩; 더 작은 테이블은 단일 리더. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Validation에서 동시에 비교하는 테이블 수. `1` = 순차. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 시작 로그 레벨. `DEBUG`는 실패 이벤트에 stacktrace(콜 스택만) 추가. 런타임에 **Diagnostics**에서도 변경 가능. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch). 런타임에 **Diagnostics**에서 토글 가능. |

@@ -71,6 +71,7 @@ from dsql_migrator.ui.cdc_start_point_gate import (
     RELOAD_RESETS_MANUAL,
     point_coord,
     point_label,
+    with_split_qualifier,
 )
 
 PROBLEM_CHECK_FAILED = "check-failed"
@@ -738,6 +739,7 @@ def gtid_start_notice(
     origin: str,
     migration_type: object,
     rolled_back: bool = False,
+    split_qualifier: str = "",
 ) -> Optional[tuple[str, str, str, str]]:
     """``(tone, icon, header, body)`` for a refusal (the Start dialog, the job), or None.
 
@@ -746,8 +748,28 @@ def gtid_start_notice(
     :func:`~dsql_migrator.ui.cdc_start_point_gate.point_coord`); ``origin`` is the seed's
     (``"full_load"`` / ``"manual"``). ``rolled_back``: CloudFormation rolled back this stack's
     last Start (G25), so a remedy that takes a new start point runs on a new stack -- as on
-    every resume, the stack's connectors were started before. Pure.
+    every resume, the stack's connectors were started before. ``split_qualifier`` (G137): said
+    after a remedy that names Fetch current position while CDC captures a table the Full Load
+    read in parts (:func:`~dsql_migrator.ui.cdc_start_point_gate.with_split_qualifier`). Pure.
     """
+    return with_split_qualifier(
+        _gtid_start_notice(
+            verdict, point_label=point_label, coord=coord, origin=origin,
+            migration_type=migration_type, rolled_back=rolled_back,
+        ),
+        split_qualifier,
+    )
+
+
+def _gtid_start_notice(
+    verdict: Optional[GtidStartVerdict],
+    *,
+    point_label: str,
+    coord: str,
+    origin: str,
+    migration_type: object,
+    rolled_back: bool = False,
+) -> Optional[tuple[str, str, str, str]]:
     if verdict is None or not verdict.blocks:
         return None
     header, icon = _header_icon(verdict)

@@ -129,10 +129,14 @@ affected table is **re-read automatically** (3 attempts by default, with a 15s �
 
 The retry deliberately **re-reads that table from a fresh consistent snapshot**
 instead of resuming the dead read where it stopped: resuming would splice two
-different source snapshots into one table, and the gapless Full Load → CDC handoff
-depends on each table being consistent as of a single point in time. Because the load
-is idempotent, the rows already written are skipped — the retry costs re-read I/O, not
-duplicate rows.
+different source snapshots into one table at an arbitrary key. The fresh snapshot opens
+after the run's start point, so with Full load + CDC the stream replayed from that point
+corrects every row that changed between the two reads; with Full load only an append
+re-read keeps the first attempt's rows, so if the source took writes, re-run with
+**Drop & reload**. Because the load is idempotent, the rows already written are skipped —
+the retry costs re-read I/O, not duplicate rows. A MySQL table read in parts (*Reader
+shards per large table*, [§3.8](03-full-load.md#38-multi-process-parallelism-gil-bypass))
+is not re-read: the table fails, and **Retry unfinished tables** loads it again.
 
 Only **connection-level** failures retry; a data or schema error fails immediately
 (retrying it would just add delay before the same failure). If the retries are

@@ -13,7 +13,7 @@ surface is unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
@@ -168,6 +168,9 @@ class FullLoadTableRow:
     # used to show an ETA while loading and the total elapsed once finished.
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    # G137: the primary-key ranges the latest load read this table in (Reader shards per
+    # large table); None for one reader. The table row is captioned "read in K parts".
+    reader_shards: Optional[int] = None
 
     @property
     def rows_present(self) -> int:
@@ -278,6 +281,7 @@ def build_full_load_table_rows(
             error_message=messages.get(chunk.chunk_id),
             started_at=chunk.started_at,
             finished_at=chunk.finished_at,
+            reader_shards=getattr(chunk, "reader_shards", None),
         )
         for chunk in job.chunks
     ]
@@ -336,6 +340,249 @@ def untick_can_settle(job, names: "Optional[Sequence[str]]") -> bool:
         chunk.status != "DONE" or (getattr(chunk, "rows_quarantined", 0) or 0) > 0
         for chunk in getattr(job, "chunks", None) or ()
         if wanted is None or chunk.chunk_id in wanted
+    )
+
+
+def split_read_tables(job: Optional[MigrationJob]) -> list[str]:
+    """The tables ``job`` holds rows of that a MySQL Full Load read in parts, each part from
+    its own snapshot, whose copy still awaits CDC's replay (G137).
+
+    A MySQL table split into reader shards: its copy holds rows from several snapshots, so
+    it is consistent only once CDC replays it from the start point taken before the load,
+    and the routes that would take it out of that replay refuse it. Read off each chunk's
+    ``reader_shards``: the engine records a split when its parts write rows and keeps it
+    through every later load that does not recreate the table (an append, a one-unit load,
+    a failed or stopped one). Two things clear it: a load that recreates the table (Drop &
+    reload), and a Validation whose CHECKSUM comparison matched it
+    (:func:`clear_proven_split_records`: the copy equals the source, so the tear is
+    repaired). A Start CDC submitted, or CDC streaming, does not: the record cannot tell
+    whether that stream replayed the table. A PostgreSQL job -- its watermark has no binlog
+    start point, and its shards share one snapshot -- has none. In chunk order. Pure.
+    """
+    watermark = getattr(job, "watermark", None) if job is not None else None
+    if watermark is None or not getattr(watermark, "binlog_file", None):
+        return []
+    return [
+        chunk.chunk_id
+        for chunk in getattr(job, "chunks", None) or ()
+        if (getattr(chunk, "reader_shards", None) or 0) > 1
+    ]
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def clear_proven_split_records(job, proven: "Mapping[str, datetime]") -> "list[str]":
+    """Clear the record of each table ``proven`` names that the Full Load record ``job`` read
+    in parts (G137, :func:`split_read_tables`), and return those tables in record order.
+    Mutates ``job`` (a ``JobManager.apply_update`` mutator); pure otherwise.
+
+    ``proven`` maps a table to the start of a CHECKSUM comparison that matched it: the copy
+    equals the source then, so its tear is repaired. That holds only for a comparison that
+    started after the table's last load ended, so a table is cleared only when no load runs
+    (the record is not PENDING or RUNNING) and its chunk finished (``finished_at``) at or
+    before that start -- a load still running, or one that ended at an unknown time (a stop
+    stamps none), keeps the record."""
+    if job is None or getattr(job, "status", None) in ("PENDING", "RUNNING"):
+        return []
+    split = set(split_read_tables(job))
+    cleared: list[str] = []
+    for chunk in job.chunks:
+        started = proven.get(chunk.chunk_id)
+        ended = getattr(chunk, "finished_at", None)
+        if chunk.chunk_id not in split or started is None or ended is None:
+            continue
+        if _utc(ended) <= _utc(started):
+            chunk.reader_shards = None
+            cleared.append(chunk.chunk_id)
+    return cleared
+
+
+# G137: the header of every refusal of a route that would take a table read in parts out of
+# CDC's replay from the Full Load's start point (render_notice tone "error").
+SPLIT_READ_HEADER = "Tables read in parts need CDC from the Full Load's start point"
+# The Full Load step's control that reloads each (G137): Retry unfinished tables while a table
+# is unfinished, Reload specific tables once every table has loaded. With one reader either
+# drops and recreates a table read in parts, whatever its Append / Drop & reload choice says
+# (the dialog forces it): the one load that clears the record.
+SPLIT_RETRY = "Retry unfinished tables"
+SPLIT_RELOAD = "Reload specific tables"
+# What an untick, a table rule's unselect or a deselect of a table read in parts is told in
+# place of the CHECKSUM end (split_checksum_route), G137: the replay that match waits for
+# needs CDC started, and CDC's first Start fixes the table set for good (G16), so only the
+# reload before CDC starts lets the table be unselected.
+SPLIT_SET_FIXED = "Once CDC starts, the table set is fixed (Start over to change it)."
+
+
+def split_route_states(
+    names: "Sequence[str]", job: Optional[MigrationJob]
+) -> "tuple[frozenset, bool]":
+    """``(the names whose chunk in job is not DONE, whether another table of it is not
+    DONE)`` -- what :func:`split_reload_route` names a control by. ``job`` is the view the
+    Full Load step renders (:func:`split_route_view`), which decides its buttons. Pure,
+    O(tables)."""
+    wanted = set(names)
+    unfinished: set = set()
+    others_open = False
+    for chunk in getattr(job, "chunks", None) or ():
+        if chunk.status == "DONE":
+            continue
+        if chunk.chunk_id in wanted:
+            unfinished.add(chunk.chunk_id)
+        else:
+            others_open = True
+    return frozenset(unfinished), others_open
+
+
+def split_route_view(migration_state, job_manager, job):
+    """The Full Load record ``job`` as the Full Load step renders it, for the routes of its
+    tables read in parts (G137, :func:`split_route_states`): the scoped view over the
+    resolved selection (:func:`scoped_full_load_view` -- a table unticked since is gone, and
+    one selected since that the watermark does not cover yet is unfinished), whose unfinished
+    tables make the step offer Retry unfinished tables, not Reload specific tables. ``job``
+    itself when no selection was resolved yet. Which tables were read in parts is still read
+    off the record (:func:`split_read_tables`). Pure apart from CDC-state job reads."""
+    resolved = getattr(migration_state, "resolved_selection", None)
+    selected = resolved() if callable(resolved) else None
+    if job is None or selected is None:
+        return job
+    return scoped_full_load_view(migration_state, job_manager, selected, job=job)
+
+
+def split_reload_route(
+    names: "Sequence[str]",
+    job: Optional[MigrationJob] = None,
+    *,
+    cdc_only: bool = False,
+    states: "Optional[tuple[frozenset, bool]]" = None,
+) -> str:
+    """How to reload ``names`` -- tables a MySQL Full Load read in parts (G137) -- with one
+    reader, as a clause ("set Reader shards ... and reload it (...)"). Pure.
+
+    It names the control the Full Load step shows for each table of ``job`` -- the view the
+    step renders (:func:`split_route_view`) -- or of the ``states`` :func:`split_route_states`
+    gives: :data:`SPLIT_RETRY` for one that did not finish, else :data:`SPLIT_RELOAD` -- "once
+    no table is left unfinished" while another table is, since the step offers Reload
+    specific tables only then. Several of both: the retry first, then the reload. With one
+    reader that control drops and recreates each of them whatever the Append / Drop & reload
+    choice says (the dialog forces it), as the clause says. ``cdc_only``: CDC only has no Full
+    Load step, so the route goes through Full load + CDC (Full load only refuses these
+    tables).
+    """
+    names = list(names)
+    it = "it" if len(names) == 1 else "them"
+    unfinished_set, others_open = (
+        states if states is not None else split_route_states(names, job)
+    )
+    unfinished = [n for n in names if n in unfinished_set]
+    finished = [n for n in names if n not in unfinished_set]
+    reload = SPLIT_RELOAD if not others_open else (
+        f"once no table is left unfinished: {SPLIT_RELOAD}"
+    )
+    if unfinished and finished:
+        control = (
+            f"{SPLIT_RETRY} for {_names_text(unfinished)}, then {SPLIT_RELOAD} for "
+            f"{_names_text(finished)}, which drop and recreate {it}"
+        )
+    else:
+        control = f"{SPLIT_RETRY if unfinished else reload}, which drops and recreates {it}"
+    if cdc_only:
+        return (
+            "switch the migration type to Full load + CDC, set Reader shards per large table "
+            f"to 1 in Settings and reload {it} on its Full Load step ({control})"
+        )
+    return f"set Reader shards per large table to 1 in Settings and reload {it} ({control})"
+
+
+def split_checksum_route(names: "Sequence[str]") -> str:
+    """The other end of a refusal for ``names``, tables a MySQL Full Load read in parts
+    (G137): a CHECKSUM match proves the copy (:func:`clear_proven_split_records`). Said for
+    Full load only and a later CDC start point, never for an untick (:data:`SPLIT_SET_FIXED`).
+    Pure."""
+    it = "it" if len(list(names)) == 1 else "them"
+    return (
+        f"Or, once CDC has replayed {it}, run Validation in CHECKSUM mode (Fast sweep off): "
+        "a match proves the copy and ends this refusal."
+    )
+
+
+def split_read_refusal(
+    names: "Sequence[str]",
+    *,
+    operation: str,
+    then: str,
+    job: Optional[MigrationJob] = None,
+    cdc_only: bool = False,
+    alternative: str = "",
+    states: "Optional[tuple[frozenset, bool]]" = None,
+    checksum_way_out: bool = True,
+) -> str:
+    """The refusal of ``operation`` for tables a MySQL Full Load read in parts (G137). Pure.
+
+    Names the tables, why their copy needs CDC's replay from the start point taken before
+    the load, and the route (:func:`split_reload_route` over ``job`` -- the view the Full
+    Load step renders -- or its ``states``, through Full load + CDC with ``cdc_only``):
+    Reader shards per large table set to 1 in Settings, a reload that drops and recreates
+    them (one reader, one snapshot each), then ``then`` (the operation, as an imperative:
+    "untick them"); and the other end of the refusal, a CHECKSUM match once CDC has replayed
+    them (:func:`split_checksum_route`). ``operation`` is the refused step as a gerund phrase
+    ("Unticking them"). ``alternative``: a way that needs no reload, said first (the route
+    then follows it with "Or"). ``checksum_way_out=False`` -- an untick or a table rule's
+    unselect -- says :data:`SPLIT_SET_FIXED` in place of that end: the replay it waits for
+    needs CDC started, which fixes the table set for good, so it never lets them be
+    unselected.
+    """
+    names = list(names)
+    one = len(names) == 1
+    it = "it" if one else "them"
+    route = split_reload_route(names, job, cdc_only=cdc_only, states=states)
+    return (
+        f"The Full Load read {_names_text(names)} in parts, each part from its own snapshot "
+        f"(Reader shards per large table), so {'its' if one else 'their'} copy on Aurora "
+        f"DSQL is consistent only once CDC replays {it} from the start point taken before "
+        f"the load. {operation} would leave {it} as loaded: a row whose key changed during "
+        "the read copied twice or not at all, a transaction across two parts half applied. "
+        + (f"{alternative} Or {route}" if alternative else route[:1].upper() + route[1:])
+        + f", then {then}. "
+        + (split_checksum_route(names) if checksum_way_out else SPLIT_SET_FIXED)
+    )
+
+
+def split_table_list_remedy(
+    names: "Sequence[str]", job: Optional[MigrationJob] = None, *, cdc_only: bool = False
+) -> str:
+    """What a CDC table-list hold after the load says of ``names`` -- tables the Full Load read
+    in parts whose copy still waits for CDC's replay (G137): they are not among the tables
+    to deselect until a reload recreates them (:func:`split_reload_route` over ``job``, the
+    view the Full Load step renders), before CDC starts (:data:`SPLIT_SET_FIXED`: no CHECKSUM
+    match after CDC's replay can open a deselect), and they keep Full load only unavailable
+    until that reload or a CHECKSUM match proves the replay. Pure."""
+    names = list(names)
+    one = len(names) == 1
+    it = "it" if one else "them"
+    return (
+        f"The Full Load read {_names_text(names)} in parts, so {it} cannot be deselected: to "
+        f"deselect {it}, {split_reload_route(names, job, cdc_only=cdc_only)} first. "
+        f"{SPLIT_SET_FIXED} Nor can the migration switch to Full load only until that reload, "
+        f"or until a match in Validation in CHECKSUM mode proves CDC's replay of {it}."
+    )
+
+
+def split_later_point_qualifier(
+    names: "Sequence[str]", job: Optional[MigrationJob] = None, *, cdc_only: bool = False
+) -> str:
+    """Said after a remedy that names Fetch current position while CDC captures ``names``,
+    tables the Full Load read in parts (G137): Start CDC refuses a start point later than the
+    Full Load's, so the reload comes first (:func:`split_reload_route` over ``job``, the view
+    the Full Load step renders). "" for none. Pure."""
+    names = list(names)
+    if not names:
+        return ""
+    return (
+        f"While CDC captures {_names_text(names)}, which the Full Load read in parts, Start "
+        "CDC refuses a start point later than the Full Load's (Fetch current position gives "
+        f"one): first {split_reload_route(names, job, cdc_only=cdc_only)}."
     )
 
 
@@ -2837,8 +3084,8 @@ def popup_resolution(
 
     ``add_lock`` (Full load + CDC after its Full Load, before CDC starts, G16: the table
     picker's per-table add-lock, ``_cdc_monitoring.TableSetAddLock``) turns a table line
-    that would select a table the lock refuses into a per-table E3; ``None`` changes
-    nothing.
+    that would select a table the lock refuses -- or unselect one the Full Load read in parts
+    (G137) -- into a per-table E3; ``None`` changes nothing.
 
     Memoized on the state (transient) by the text's digest and every input, the inventory,
     applied set and live columns held by IDENTITY (a reused ``id`` never serves a stale
@@ -2901,10 +3148,18 @@ def popup_resolution(
                 applied=inputs.applied)
 
     reselect_lock = None
+    unselect_lock = None
     if add_lock is not None:
         def reselect_lock(names):
             blocked = add_lock.blocked(names, tree=False)
             return (blocked, add_lock.refusal(blocked, tree=False)) if blocked else None
+
+        # G137: a table the Full Load read in parts stays selected (CDC must replay it).
+        def unselect_lock(names):
+            blocked = add_lock.removal_blocked(names)
+            return (
+                (blocked, add_lock.removal_refusal(blocked, tree=False)) if blocked else None
+            )
 
     resolution = resolve_exclusion_rules(
         text,
@@ -2921,6 +3176,7 @@ def popup_resolution(
         stored_columns=stored,
         capture=capture,
         reselect_lock=reselect_lock,
+        unselect_lock=unselect_lock,
     )
     memos[memo_slot] = (key, held, resolution)
     return resolution
@@ -3814,6 +4070,37 @@ def table_picker_remedy(table_lock: "Optional[str]") -> str:
     )
 
 
+# G137: the table-list refusal's remedy (core.cdc CDC_TABLE_LIST_REMEDY) without its Full load
+# only route, for a capture holding a table read in parts that still waits for CDC's replay.
+CDC_TABLE_LIST_CAPTURE_FEWER = "Capture fewer tables in this CDC pipeline."
+
+
+def table_list_hold_remedy(
+    refusal: str,
+    table_lock: "Optional[str]",
+    split: "Sequence[str]" = (),
+    job: Optional[MigrationJob] = None,
+    *,
+    cdc_only: bool = False,
+) -> str:
+    """A CDC table-list refusal (:func:`cdc_table_list_refusal`, which ends with core.cdc
+    ``CDC_TABLE_LIST_REMEDY``) followed by the table picker's remedy, as Deploy CDC
+    infrastructure, Start CDC and Retry CDC say it after the load. ``split`` (G137): captured
+    tables the Full Load read in parts whose copy still waits for CDC's replay -- they can be
+    neither deselected nor taken to Full load only, so the refusal's "or use Full load only"
+    goes and they are named (:func:`split_table_list_remedy`, over the record ``job``). Pure.
+    """
+    if not split:
+        return f"{refusal} " + table_picker_remedy(table_lock)
+    from dsql_migrator.core.cdc import CDC_TABLE_LIST_REMEDY
+
+    fact = refusal.removesuffix(CDC_TABLE_LIST_REMEDY).rstrip()
+    return (
+        f"{fact} {CDC_TABLE_LIST_CAPTURE_FEWER} {table_picker_remedy(table_lock)} "
+        + split_table_list_remedy(split, job, cdc_only=cdc_only)
+    )
+
+
 # The notice header of a table-list refusal (cdc_table_list_refusal), and of the warning
 # before a Full load + CDC load when a list every deploy sends does not fit
 # (cdc_pre_load_table_list_warning).
@@ -3922,21 +4209,54 @@ def cdc_partition_map_worst_case(table_names: "Sequence[str]") -> "Optional[str]
     )
 
 
-def cdc_pre_load_table_list_routes(table_lock: "Optional[str]") -> str:
+# G137: carved out of the load-then-untick route while the Full Load may read a large MySQL
+# table in parts (mysql_reads_may_split): such a table leaves CDC's replay by neither route.
+# Only the reload lets it be unticked (CDC's first Start fixes the table set, so a CHECKSUM
+# match after the replay never does); Full load only opens with either.
+PRE_LOAD_SPLIT_CARVE_OUT = (
+    " With Reader shards per large table above 1 in Settings, the load may read a large "
+    "table in parts, and such a table cannot be unticked until it is reloaded with one "
+    "reader (Reader shards set to 1, then Drop & reload: Retry unfinished tables while it is "
+    "unfinished, else Reload specific tables). Nor can it be taken to Full load only until "
+    "that reload, or a match in Validation in CHECKSUM mode once CDC has replayed it. Set "
+    "Reader shards to 1 before the load to keep both routes open."
+)
+
+
+def mysql_reads_may_split(source_type: "Optional[SourceType]") -> bool:
+    """Could a Full load + CDC load read a large MySQL table in parts with the current settings
+    (G137): a MySQL source, Reader shards per large table above 1 and Tables in parallel above
+    1 (each part takes a pool slot; one slot never splits)? Reads the app config."""
+    if source_type is not SourceType.MYSQL:
+        return False
+    from dsql_migrator.config import load_config
+
+    config = load_config()
+    return config.full_load_reader_shards > 1 and config.full_load_table_parallelism > 1
+
+
+def cdc_pre_load_table_list_routes(table_lock: "Optional[str]", *, split: bool = False) -> str:
     """The routes for a Full load + CDC selection one CDC pipeline cannot capture, before its
     load and with CDC never started: load every table and, until CDC starts, untick the ones
     CDC does not need (G16), or use Full load only, or capture fewer now
-    (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason). Pure."""
+    (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason). ``split``
+    (:func:`mysql_reads_may_split`) carves a table the load reads in parts out of the first
+    two (G137). Pure."""
     return (
         "The Full Load can still load every selected table: after it, until CDC starts, untick "
         "in the table list the tables CDC does not need to capture (they stay on Aurora DSQL as "
-        "loaded; CDC and Validation skip them), or use Full load only. Or capture fewer before "
-        "the load: " + table_picker_remedy(table_lock)
+        "loaded; CDC and Validation skip them), or use Full load only."
+        + (PRE_LOAD_SPLIT_CARVE_OUT if split else "")
+        + " Or capture fewer before the load: " + table_picker_remedy(table_lock)
     )
 
 
 def cdc_pre_load_table_list_warning(
-    table_names: "Sequence[str]", *, planned: bool, table_lock: "Optional[str]"
+    table_names: "Sequence[str]",
+    *,
+    planned: bool,
+    table_lock: "Optional[str]",
+    split: bool = False,
 ) -> "Optional[tuple[str, str]]":
     """``(header, body)`` of what Full load + CDC says before its load when one CDC pipeline
     cannot capture all of ``table_names`` (the load's selection), or ``None``. Pure.
@@ -3948,8 +4268,8 @@ def cdc_pre_load_table_list_warning(
     -- so its worst case is said too (:func:`cdc_partition_map_worst_case`). The header says
     a list every deploy sends that does not fit as certain (:data:`CDC_TABLE_LIST_HEADER`),
     and that worst case as possible (:data:`CDC_TABLE_LIST_WORST_CASE_HEADER`, the Deploy
-    form's header for it). ``table_lock`` is the table picker's lock reason
-    (:func:`cdc_pre_load_table_list_routes`).
+    form's header for it). ``table_lock`` is the table picker's lock reason and ``split``
+    whether the load may read a table in parts (:func:`cdc_pre_load_table_list_routes`).
     """
     from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT, oversized_table_list
 
@@ -3984,7 +4304,7 @@ def cdc_pre_load_table_list_warning(
             return None
         fact = f"{worst} Deploy CDC infrastructure would then refuse this set."
         header = CDC_TABLE_LIST_WORST_CASE_HEADER
-    return header, f"{fact} " + cdc_pre_load_table_list_routes(table_lock)
+    return header, f"{fact} " + cdc_pre_load_table_list_routes(table_lock, split=split)
 
 
 # DSQL caps a single value at 1 MiB. Used for display.

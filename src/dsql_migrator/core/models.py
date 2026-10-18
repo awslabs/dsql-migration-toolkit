@@ -892,6 +892,18 @@ class ChunkState(BaseModel):
     # finished). Set when the chunk starts and reaches a terminal state.
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    # G137: how many primary-key ranges a load read this table in (Reader shards per large
+    # table) since the table was last recreated; None when one reader read it. A MySQL table
+    # read in parts holds rows from several snapshots, so its copy is consistent only once
+    # CDC replays it from the start point taken before the load. Set from a load's plan when
+    # its parts write rows, kept by every later load that does not recreate the table (an
+    # append, a one-unit load, a failed or stopped one) and cleared by one that does, or by a
+    # Validation whose CHECKSUM comparison matched the table after its last load (the copy
+    # then equals the source). Left OUT of the payload while None, so a job snapshot still
+    # loads on an older build (extra="forbid").
+    reader_shards: Optional[int] = Field(
+        default=None, ge=1, exclude_if=lambda v: not v
+    )
 
 
 class Watermark(BaseModel):

@@ -234,17 +234,28 @@ RELOAD_CONDITION_TOOLTIP = (
 RERUN_FULL_LOAD_DROP_AND_RELOAD = "re-run the Full Load choosing 'Drop & reload'"
 
 
-def drop_and_reload_rerun(migration_type: object, *, postgres: bool = False) -> "tuple[str, str]":
+def drop_and_reload_rerun(
+    migration_type: object, *, postgres: bool = False, split: bool = False
+) -> "tuple[str, str]":
     """``(rerun, note)``: the re-run that takes a NEW copy of the Full Load, which names 'Drop &
     reload' (rule E), and what CDC only needs for it -- said after the clause ``rerun`` leads
     (empty otherwise). With CDC only the re-run needs a type switch: to Full load only on MySQL
     (as in :data:`RELOAD_FIRST`), to Full load + CDC on PostgreSQL (``postgres``), whose Full
-    Load there creates the replication slot again. Pure."""
+    Load there creates the replication slot again -- and to Full load + CDC on MySQL too while
+    a table the Full Load read in parts waits for CDC's replay (``split``, G137: Full load only
+    refuses the switch then). Pure."""
     if _cdc_only(migration_type) and postgres:
         return (
             "switch the migration type to Full load + CDC and Re-run Full Load there choosing "
             "'Drop & reload'",
             " (it creates the slot again at its own snapshot point)",
+        )
+    if _cdc_only(migration_type) and split:
+        return (
+            "run it again choosing 'Drop & reload'",
+            " (CDC only has no Full Load step: switch the migration type to Full load + CDC for "
+            "that run; Full load only is refused while a table the Full Load read in parts "
+            "waits for CDC's replay)",
         )
     if _cdc_only(migration_type):
         return (
@@ -256,16 +267,17 @@ def drop_and_reload_rerun(migration_type: object, *, postgres: bool = False) -> 
 
 
 def reload_condition(
-    migration_type: object, *, postgres: bool = False, started: bool = False
+    migration_type: object, *, postgres: bool = False, started: bool = False, split: bool = False
 ) -> str:
     """The body of the :data:`RELOAD_CONDITION_HEADER` notice: why it is shown, then
     :data:`RELOAD_FIRST`'s condition said before Start CDC, with the re-run
-    :func:`drop_and_reload_rerun` names. ``started`` (``_cdc_status.cdc_started_before_load``):
+    :func:`drop_and_reload_rerun` names (``split``: through Full load + CDC from CDC only, G137).
+    ``started`` (``_cdc_status.cdc_started_before_load``):
     Start CDC was submitted in this migration from an earlier start point before this Full Load
     ran, which the body then says first; without it (G27 repair: an Append re-run before any
     Start, or a Start from this watermark that did not stream) it says only what the Full Load
     found, which holds whichever sign showed the condition. Pure."""
-    rerun, note = drop_and_reload_rerun(migration_type, postgres=postgres)
+    rerun, note = drop_and_reload_rerun(migration_type, postgres=postgres, split=split)
     why = (
         "This migration started CDC from an earlier start point before this Full Load ran, and "
         "the Full Load found rows already on the target."
@@ -475,6 +487,7 @@ def start_point_notice(
     migration_type: object,
     resumes: bool = False,
     streamed: bool = False,
+    split_qualifier: str = "",
 ) -> Optional[tuple[str, str, str, str]]:
     """``(tone, icon, header, body)`` for the Start dialog / the job's refusal, or None. Pure.
 
@@ -484,7 +497,38 @@ def start_point_notice(
     ``streamed``: the stack has streamed (a resume, or a retry after a Start CloudFormation
     rolled back), so a start point after the change needs new CDC topics first (G25): the
     Full Load step refuses a new start point there, and Start CDC refuses a newer one.
+    ``split_qualifier`` (G137, ``_models.split_later_point_qualifier``): said after a remedy
+    that names Fetch current position while CDC captures a table the Full Load read in parts
+    -- Start CDC refuses that later point until the table is reloaded or matches in a
+    CHECKSUM Validation.
     """
+    notice = _start_point_notice(
+        verdict, point_label=point_label, coord=coord, migration_type=migration_type,
+        resumes=resumes, streamed=streamed,
+    )
+    return with_split_qualifier(notice, split_qualifier)
+
+
+def with_split_qualifier(
+    notice: Optional[tuple[str, str, str, str]], qualifier: str
+) -> Optional[tuple[str, str, str, str]]:
+    """``notice`` with ``qualifier`` after its body when the body names Fetch current position
+    (G137: a fetched point is later than the Full Load's), else as it is. Pure."""
+    if notice is None or not qualifier or "Fetch current position" not in notice[3]:
+        return notice
+    tone, icon, header, body = notice
+    return tone, icon, header, f"{body} {qualifier}"
+
+
+def _start_point_notice(
+    verdict: Optional[StartPointVerdict],
+    *,
+    point_label: str,
+    coord: str,
+    migration_type: object,
+    resumes: bool = False,
+    streamed: bool = False,
+) -> Optional[tuple[str, str, str, str]]:
     if verdict is None or verdict.kind == KIND_OK:
         return None
     point = point_label
@@ -622,4 +666,5 @@ __all__ = [
     "start_point_notice",
     "start_point_tooltip",
     "verdict_from_check",
+    "with_split_qualifier",
 ]

@@ -150,17 +150,22 @@ CloudFormation 파라미터로.
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | 테이블당 동시 진행 `INSERT … ON CONFLICT` 배치 수. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | 배치 쓰기당 행 수(DSQL 3000행 하드 상한). |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`(켜짐) | 켜짐/꺼짐 | 읽기 선행 prefetch 큐(§7.1). **켜 두세요** — A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`(꺼짐) | ≤ 8 | 리더 범위 샤딩: **큰 단일 정수 PK** 테이블의 읽기를 K개 동시 리더로 분할(§7.1). **기본 꺼짐이며 켤 가치가 드묾** — 아래 주의 참고. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | 이 추정 행수 이상인 테이블만 샤딩; 더 작은 테이블은 항상 단일 리더. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`(꺼짐) | ≤ 8 | 리더 범위 샤딩: **큰** 테이블의 읽기를 정수 선행 기본 키 컬럼으로 K개 구간으로 나눠, 구간마다 별도 worker 프로세스가 읽음([§3.8](03-full-load.md#38-멀티프로세스-병렬화-gil-우회)). PostgreSQL: 모든 실행. MySQL: Full load + CDC에서만, unique 키가 모두 그 컬럼을 포함하는 테이블만. **Settings → Full Load**의 *Reader shards per large table*로도 설정. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | 이 추정 행수 이상인 테이블만 나눔; 더 작은 테이블은 단일 리더. |
 
-> **리더 샤딩은 언제 효과가 있나? 드묾 — in-VPC 테스트에서 ~0%였음.** 행별 타입
-> 변환이 순수 Python이라 GIL을 점유 → K개 리더 *스레드*를 띄워도 변환 처리량이 ~1코어를
-> 못 넘습니다. 스레드 샤딩은 리더의 I/O 대기만 겹칠 뿐(그건 prefetch가 이미 함) 변환에
-> 두 번째 코어를 더하지 못합니다. in-VPC 4vCPU 실측에서 `reader_shards=4`는 단일 리더 대비
-> **~0%**였고 CPU가 ~1코어에 고정됐는데, 그 로드가 리더가 아니라 **DSQL 쓰기 왕복 지연**에
-> 묶여 있었기 때문입니다. run이 read/convert-starved(리더가 쓰기 풀을 못 채움)라는 *증거*가
-> 있을 때만 올리세요. 벽이 쓰기 측이면 대신 **`BATCH_PARALLELISM`**을 올리세요. 총 소스
-> 리더 = `table_parallelism × reader_shards`이며 소스 커넥션 한도 보호를 위해 상한이 걸립니다.
+> **리더 샤딩이 도움이 될 때와 그 대가.** 몇몇 대형 테이블이 적재를 지배해 pool slot이 놀게 될 때
+> 도움이 됩니다: keyset 리더 하나는 한 코어에서 행을 변환하지만, 각 구간은 자신의 프로세스에서 자신의
+> 코어로 실행됩니다 — 8M 행 PostgreSQL 적재에서 **K = 4일 때 약 3.8배**로 측정. (예전에 여기서 잰
+> ~0%는 GIL 하나를 공유하는 리더 *스레드*로 잰 것이며, 멀티프로세스 경로가 이를 대체했습니다.) 각
+> 구간이 `TABLE_PARALLELISM` slot 하나를 차지하므로, K와 무관하게 동시 소스 리더는
+> `TABLE_PARALLELISM` 이하(+ PostgreSQL anchor 연결 1개), DSQL 연결은 약 `TABLE_PARALLELISM ×
+> BATCH_PARALLELISM`에 머물며, K의 상한은 32 ÷ `TABLE_PARALLELISM`입니다. **트레이드오프:**
+> K > 1은 놀던 slot을 같은 테이블에 대한 동시 읽기로 바꾸며, 그 테이블을 다 읽을 때까지 이어지므로,
+> 그동안 소스 읽기 속도·DSQL 연결·메모리가 최대 `TABLE_PARALLELISM`배까지 늘어납니다. 여전히
+> 프로덕션 트래픽을 처리하는 소스라면 `Threads_running` 스로틀(`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`,
+> §7.3)과 함께 쓰세요. 벽이 쓰기 측이면 대신 **`BATCH_PARALLELISM`**을 올리세요. MySQL 테이블은
+> Full load + CDC에서만 나뉘며, 나누어 읽은 테이블을 CDC의 재생 없이 남기는 경로는 거부됩니다
+> ([§3.8](03-full-load.md#38-멀티프로세스-병렬화-gil-우회)).
 
 > **연결 쿼터 가드레일.** 총 동시 DSQL 연결 ≈ `table_parallelism × batch_parallelism`(기본 4 × 8 = 32).
 > DSQL은 **클러스터당 최대 10,000 연결**을 허용하지만 **초당 신규 100 연결**만 가능하므로, 곱을 쿼터 내에
@@ -324,8 +329,8 @@ environment(또는 자체 태스크 정의)에 추가하고 재배포하세요. 
 GIL 점유) 변환하므로 처리량이 CPU에 비례합니다: payments+orders 로드 실측에서 **동일 데이터의
 0.5 vCPU(512) 기본값보다 4 vCPU에서 약 3.8배 빨랐습니다**. **평가용은 0.5–1 vCPU**, **실제 대용량
 Full Load에는 2–4 vCPU**를 쓰세요. 단일 큰 테이블은 ~4 vCPU를 넘으면 수확체감입니다 — 리더가
-한 스레드라 한 코어 근처에서 한계에 이르므로, 다음 레버는 vCPU가 아니라 PK 범위로 읽기를 샤딩하는
-것(향후 개선)입니다.
+한 스레드라 한 코어 근처에서 한계에 이르므로, 다음 레버는 vCPU가 아니라 그 읽기를 기본 키 구간으로
+나누는 것(*Reader shards per large table*, §7.2; MySQL은 Full load + CDC에서만)입니다.
 
 **메모리**(`ContainerMemory`)는 Fargate **hard limit**입니다 — 초과하면 커널이 태스크를 OOM-kill하며
 *앱 종료 로그가 없습니다*(CloudWatch 급등 + ELB 타임아웃만). 테이블 크기가 아니라 버퍼링된 파이프라인으로
@@ -404,8 +409,10 @@ read view를 두는 그런 소스도 Full Load가 읽는 테이블마다, Valida
 붙잡습니다. 쓰기 많은 소스에서는 이것이 InnoDB undo 히스토리(**History List Length**)의 purge를 막아 —
 undo/디스크 증가와 읽기 지연 — 16개 테이블이 in-flight면 **가장 오래된** read view가 purge 지평을 정합니다. 완화책: 병렬수
 낮추기(열린 read view 감소); **가장 큰 테이블을 PK 범위로 쪼개** 별도의 짧은 런으로(페이지 크기 노브가 없으니
-개별 스냅샷을 짧게 하려면 테이블 셋을 쪼갬); History List Length 모니터링, 시작 전 여유 공간 확보로 undo 증가가
-storage-full을 유발하지 않게.
+개별 스냅샷을 짧게 하려면 테이블 셋을 쪼갬) — Full load + CDC에서는 *Reader shards per large table*이 큰 테이블의
+읽기를 구간으로 나눠 각 read view가 자기 구간을 읽는 동안만 유지되며, 그 대가는 그 테이블에 대한 동시
+읽기입니다(§7.2); History List Length 모니터링, 시작 전 여유 공간 확보로 undo 증가가 storage-full을 유발하지
+않게.
 
 ### read replica에서 읽으면 어떨까?
 

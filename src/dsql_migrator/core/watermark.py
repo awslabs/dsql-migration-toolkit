@@ -483,6 +483,8 @@ def binlog_resume_gap_reason(
     retained: Optional[list[str]],
     *,
     manual: bool = False,
+    split_tables: "Sequence[str]" = (),
+    split_route: str = "",
 ) -> Optional[str]:
     """Why a gapless CDC resume from ``watermark_file`` is impossible, or ``None``.
 
@@ -503,12 +505,35 @@ def binlog_resume_gap_reason(
     ``retained`` is ``None`` when the check could not run (statement unavailable /
     privilege missing) -- treated as "unknown", which never blocks. ``manual`` means
     ``watermark_file`` is an operator's Manual start point, not a Full Load
-    watermark, so the reason names that point and its remedy instead. Pure.
+    watermark, so the reason names that point and its remedy instead. ``split_tables``
+    (G137): captured tables the Full Load read in parts, each from its own snapshot -- a
+    manual position later than the Full Load's is no route for them (Start CDC refuses one
+    while CDC captures them), so the remedy says what comes first: ``split_route``, their
+    reload with one reader as a clause (the UI's ``_models.split_reload_route``, which names
+    the control the Full Load step shows), else a generic one. Pure.
     """
     if not watermark_file or retained is None or not retained:
         return None
     if watermark_file in retained:
         return None
+    split = list(split_tables or ())
+    one = len(split) == 1
+    shown = ", ".join(split[:5]) + (f" (+{len(split) - 5} more)" if len(split) > 5 else "")
+    route = split_route or (
+        f"set Reader shards per large table to 1 in Settings and reload {'it' if one else 'them'}"
+        " with Drop & reload"
+    )
+    if split and not manual:
+        manual_route = (
+            "A manual position is no way forward for "
+            f"{shown}: the Full Load read {'it' if one else 'them'} in parts, "
+            "each from its own snapshot, and only CDC from its watermark makes that copy "
+            "consistent, so Start CDC refuses a later start point while "
+            f"{'it is' if one else 'they are'} captured. To start from a manual "
+            f"position and accept the gap, first {route}."
+        )
+    else:
+        manual_route = "Or start CDC from a manual position and accept the gap."
     if manual:
         return (
             f"The Manual start point is in binary log '{watermark_file}', which the "
@@ -516,6 +541,16 @@ def binlog_resume_gap_reason(
             "start from it — the source connector fails to find that log. Enter a "
             "position in a log the source still retains (Fetch current position fills "
             "the current one); changes before that position are not replicated."
+            + (
+                # G137: a fetched (later) point is refused while a table read in parts is
+                # captured: the ways that remain.
+                f" While CDC captures {shown}, which the Full Load read in parts, Start CDC "
+                "refuses a point later than the Full Load's start point, as a fetched one "
+                "is: choose Automatic (the Full Load's start point) or a retained position "
+                f"no later than it, or first {route}."
+                if split
+                else ""
+            )
         )
     return (
         f"The Full Load watermark points at binary log '{watermark_file}', which the "
@@ -525,8 +560,7 @@ def binlog_resume_gap_reason(
         "fresh snapshot (and raise the source's binlog retention first, e.g. "
         "CALL mysql.rds_set_configuration('binlog retention hours', 168)): an Append "
         "keeps the rows already on the target as they were, and CDC from the new "
-        "watermark never replays the changes made before it. Or start CDC from a manual "
-        "position and accept the gap."
+        f"watermark never replays the changes made before it. {manual_route}"
     )
 
 

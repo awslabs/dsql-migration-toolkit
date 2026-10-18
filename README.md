@@ -362,8 +362,8 @@ parallelism knobs can also be retuned **at runtime** from the sidebar's
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table. Higher = more throughput but more OCC (40001) collisions. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Rows per batched write, capped at DSQL's 3000-row per-transaction limit. |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | Read-ahead prefetch queue (reader thread fills a bounded queue while writes drain). Keep on; set `0` only to reproduce the pre-prefetch path in an A/B benchmark. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off, ≤8) | Split one large single-integer-PK table's read across K concurrent readers. Rarely worth it (the reader is GIL-bound) — see manual §7.2. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be reader-sharded; smaller tables always use one reader. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off, ≤8) | Split a large table's read by its integer leading primary-key column into K ranges, each read by its own worker process (one `FULL_LOAD_TABLE_PARALLELISM` slot each). PostgreSQL: any run. MySQL: Full load + CDC only, for a table whose unique keys all include that column. See manual §3.8 / §7.2. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be reader-sharded; smaller tables use one reader. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Settings → Diagnostics**. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Settings → Diagnostics**. |

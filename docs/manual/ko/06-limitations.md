@@ -419,8 +419,24 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     테이블을 적재한 뒤, CDC를 시작하기 전에 CDC가 캡처할 필요가 없는 테이블의 선택을 해제할 수 있습니다
     ([13장](13-excluding-tables-and-columns.md)의 "Full Load 후 테이블 집합 바꾸기 (Full load + CDC)"
     참고): 그 테이블은 적재된 그대로 Aurora DSQL에 남고, CDC와 Validation은 그 테이블을 건너뜁니다.
+    적재가 나누어 읽는 MySQL 테이블(*Reader shards per large table*이 1보다 큼,
+    [§3.8](03-full-load.md#38-멀티프로세스-병렬화-gil-우회))은 예외입니다: 리더 하나로 다시
+    적재하기(Drop & reload) 전에는 선택을 해제할 수 없습니다.
   - 그 밖에는 이 CDC 파이프라인에서 캡처하는 테이블을 줄이거나(테이블 목록에서 선택 해제), Full load
     only를 사용하세요.
+- **MySQL: 나누어 읽은 테이블은 CDC가 재생해야 일관됨.** *Reader shards per large table*이 1보다 크면,
+  Full load + CDC 적재는 큰 MySQL 테이블의 읽기를 기본 키 구간으로 나누어 구간마다 자신의 스냅샷으로
+  읽습니다([§3.8](03-full-load.md#38-멀티프로세스-병렬화-gil-우회)). Full Load의 시작 지점에서 시작한 CDC가
+  그 테이블을 재생하기 전까지는, 읽는 동안 키가 바뀐 행이 Aurora DSQL에 두 번 있거나 아예 없을 수 있고,
+  두 구간에 걸친 트랜잭션은 절반만 반영될 수 있습니다 — 행 수는 같은 채로: ROW_COUNT 검증은 이를 보지
+  못하고, CHECKSUM은 봅니다. 그래서 그런 테이블을 그 재생 없이 남기는 경로(선택 해제, Full load only,
+  더 나중의 시작 지점에서 Start CDC)는 테이블을 리더 하나로 다시 적재할 때까지(Drop & reload: Append는
+  그 행을 그대로 둡니다) 모두 거부됩니다. Full load only와 더 나중의 시작 지점은 CHECKSUM 모드의
+  Validation이 그 테이블의 일치를 확인해도 허용됩니다. 선택 해제에는 CDC를 시작하기 전의 다시 적재가
+  필요합니다: CDC의 첫 Start부터 테이블 집합은 고정됩니다. Start CDC는 스트리밍했더라도 거부를 끝내지
+  않습니다: 스트리밍하지 못한 Start 뒤에는 Automatic에서 CDC를 다시 시작하세요. 선행 키
+  컬럼을 포함하지 않는 unique 키가 있는 테이블과 Full load only 실행의 모든 테이블은 리더 하나를
+  유지합니다.
 - **CDC는 배포되어 있는 동안 과금됨.** 스트리밍 파이프라인(MSK Serverless + MSK Connect, NAT 게이트웨이를
   만들었다면 그것까지)은 실행되는 내내 비용이 발생합니다. Cut over 후에는 cdc-stack을 내리세요. Full Load만
   수행하면 스트리밍 인프라가 프로비저닝되지 않습니다.

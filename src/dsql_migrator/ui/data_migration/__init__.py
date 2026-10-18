@@ -219,6 +219,10 @@ from dsql_migrator.ui.data_migration._models import (
     failed_table_names,
     quarantined_rows_by_table,
     recreated_unfinished,
+    split_read_tables,
+    split_read_refusal,
+    split_route_view,
+    SPLIT_READ_HEADER,
     unsettled_table_names,
     full_load_scope_names,
     whole_record_selected,
@@ -283,6 +287,7 @@ from dsql_migrator.ui.data_migration._models import (
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     capture_ambiguity_warning,
     cdc_pre_load_table_list_warning,
+    mysql_reads_may_split,
     make_lob_candidates_for,
     cutover_restore_block_reason,
     effective_target_ddls,
@@ -1469,6 +1474,9 @@ def build_data_migration_screen(
             _type_lock_reason = migration_type_lock_reason(
                 migration_state, status=status, job_manager=job_manager
             )
+            _fl_only_refusal = full_load_only_switch_refusal(
+                migration_state, job_manager, _current
+            )
             _render_migration_type_selector(
                 ui,
                 migration_state,
@@ -1490,6 +1498,12 @@ def build_data_migration_screen(
                 # entirely. That helper exists for exactly this class of bug and is what
                 # every other PostgreSQL-aware surface uses.
                 source_type=session_source_type(session),
+                # G137: Full load only would leave a table read in parts torn.
+                type_refusals=(
+                    {MigrationType.FULL_LOAD_ONLY: _fl_only_refusal}
+                    if _fl_only_refusal
+                    else None
+                ),
             )
             # Plan-level CDC discovery surfacing: the moment the plan includes CDC,
             # the discovery (armed below on has_cdc) populates cdc_other_stacks. Show
@@ -3190,6 +3204,11 @@ def build_data_migration_screen(
                                                     ),
                                                     None,
                                                 )
+                                                # G137: not while an unfinished table was
+                                                # read in parts -- its untick is refused.
+                                                and not untick_can_settle(
+                                                    job, split_read_tables(job)
+                                                )
                                                 else ""
                                             ),
                                             tone="warning",
@@ -3699,11 +3718,12 @@ def _table_tree_hint(
     a tick or an untick does (G12); Full load + CDC that an untick drops a table, a tick of
     a table the Full Load did not load has it loaded on the Full Load step (by Retry, or by
     Re-run all tables where Retry cannot add it) before CDC captures it, and a lock marks a
-    rule-held table (G16, G17)."""
+    rule-held table (G16, G17) -- or a table the Full Load read in parts (G137), when there is
+    one."""
     if job is None or locked or not table_set_editable_after_load(migration_state, job_manager):
         return None
     if migration_type is MigrationType.FULL_LOAD_AND_CDC:
-        return TREE_HINT_FL_CDC
+        return TREE_HINT_FL_CDC + (TREE_HINT_SPLIT if split_read_tables(job) else "")
     return (
         "A Full Load has run. A table you untick is left as is on Aurora "
         "DSQL (not dropped); a table you tick that is not loaded yet is "
@@ -3973,6 +3993,8 @@ def pre_load_table_list_warning(
         [t.name for t in inventory.tables if wanted is None or t.name in wanted],
         planned=planned,
         table_lock=table_set_lock_reason(migration_state, job_manager, session),
+        # G137: a table the load reads in parts is carved out of the untick route.
+        split=mysql_reads_may_split(session_source_type(session)),
     )
 
 
@@ -4427,6 +4449,37 @@ def migration_type_lock_reason(
     return None
 
 
+def full_load_only_switch_refusal(migration_state, job_manager, job) -> Optional[str]:
+    """Why the migration type may not switch to Full load only now (G137), or ``None``.
+
+    A table the MySQL Full Load read in parts holds rows from several snapshots, and only
+    CDC replaying it from the start point taken before the load makes its copy consistent;
+    Full load only replays nothing. So while the Full Load record ``job`` (the one the render
+    holds; ``None`` = none) marks such a table -- until a CHECKSUM match proves its copy or a
+    reload recreates it (``_models.split_read_tables``), whether or not a Start CDC was
+    submitted or CDC streamed since -- the switch is refused with the routes: one reader and
+    a reload that recreates those tables, through the control the Full Load step shows for
+    each over the view it renders (from CDC only, through Full load + CDC), then the switch;
+    or the CHECKSUM match. While a CDC lock holds the type, its own reason applies (the tile
+    shows no route then). Pure apart from the CDC-state job reads.
+    """
+    if job is None or job_manager is None:
+        return None
+    current = getattr(migration_state, "migration_type", None)
+    if current is MigrationType.FULL_LOAD_ONLY:
+        return None
+    names = split_read_tables(job)
+    if not names:
+        return None
+    return split_read_refusal(
+        names,
+        operation="Switching to Full load only",
+        then="switch the migration type",
+        job=split_route_view(migration_state, job_manager, job),
+        cdc_only=current is MigrationType.CDC_ONLY,
+    )
+
+
 def _cdc_started_type_lock(migration_state, job_manager) -> str:
     """The type lock once :func:`cdc_streaming_started` holds, worded for the CDC state it
     rests on (G27). That predicate covers a live pipeline AND a Start / Stop / Delete job in
@@ -4813,6 +4866,7 @@ def _render_migration_type_selector(
     locked: Optional[bool] = None,
     lock_reason: Optional[str] = None,
     source_type: SourceType = SourceType.MYSQL,
+    type_refusals: Optional[Mapping[MigrationType, str]] = None,
 ) -> None:
     """Render the migration type as AWS-console-style radio tiles.
 
@@ -4830,10 +4884,18 @@ def _render_migration_type_selector(
     future source engine without CDC renders its CDC tiles disabled (with a note)
     rather than offering a non-functional deploy. Full load only is always
     available. Defaults to MySQL so existing callers keep all three tiles.
+
+    ``type_refusals`` (G137, :func:`full_load_only_switch_refusal`) maps a type the
+    migration may not switch to now to its refusal: that tile carries a lock line in the
+    error tone and stays clickable, and a click on it changes nothing and shows the refusal
+    (an error notify: the switch would leave a table's copy torn). While the selector is
+    locked (``locked``) no tile shows it: every tile is muted then, and the lock's reason is
+    the one that applies.
     """
     running = locked if locked is not None else (status is StepStatus.IN_PROGRESS)
     selected = migration_state.migration_type
     cdc_available = source_supports_cdc(source_type)
+    refusals = dict(type_refusals or {})
 
     def _gated(mt: MigrationType) -> bool:
         # A CDC-bearing type on a source whose CDC is not yet supported: disabled.
@@ -4845,6 +4907,13 @@ def _render_migration_type_selector(
         if _gated(new_type):
             # CDC is not available for this source engine yet; ignore the click so
             # the type cannot become a non-functional CDC selection.
+            return
+        if new_type is not selected and refusals.get(new_type):
+            ui.notify(  # type: ignore[attr-defined]
+                f"{refusals[new_type]} The migration type was not changed.",
+                type="negative",
+                multi_line=True,
+            )
             return
         # Re-selecting the SAME tile still has to record the choice: the type has a
         # default (Full load only), so clicking that tile is how a user confirms it --
@@ -4898,6 +4967,11 @@ def _render_migration_type_selector(
             meta = _MIGRATION_TYPE_META[mt]
             is_selected = mt is selected
             gated = _gated(mt)
+            # G137: a type this migration may not switch to now (tables read in parts). Its
+            # tile stays clickable -- the click is what shows the route -- and is marked by
+            # its lock line instead. Not while the whole selector is locked: every tile is
+            # muted and ignores a click then, and the selector's own lock reason applies.
+            refused = None if is_selected or running else refusals.get(mt)
             # Non-interactive while a job runs (whole group locked) OR when this is a
             # CDC tile the source engine cannot yet use (PostgreSQL CDC not shipped).
             disabled = running or gated
@@ -4987,6 +5061,19 @@ def _render_migration_type_selector(
                             "text-amber-600 text-xs mt-0.5"
                         )
                         ui.label(tradeoff).classes("text-xs text-amber-700")  # type: ignore[attr-defined]
+                if refused and not gated:
+                    # G137: the switch is refused, so the line carries the click's tone (error,
+                    # as its notify); the click shows the refusal and the route.
+                    with ui.row().classes("items-start gap-1 no-wrap mt-1"):  # type: ignore[attr-defined]
+                        ui.icon("lock").classes(  # type: ignore[attr-defined]
+                            f"{NOTICE_STYLE['error'][2]} text-xs mt-0.5"
+                        )
+                        inline_hint(
+                            ui,
+                            "Not available now: tables the Full Load read in parts need "
+                            "CDC (click for the route).",
+                            tone="error",
+                        ).tooltip(refused)
     if running:
         ui.label(  # type: ignore[attr-defined]
             "Migration type is locked once the migration has started."
@@ -5085,10 +5172,11 @@ def build_migration_table_tree(
     primary key, so a missing one is worth flagging in the picker.
 
     ``add_locked`` (``{table: code}``, Full load + CDC after its Full Load, G16 --
-    :meth:`TableSetAddLock.node_flags`) marks the leaves that cannot be ticked now:
-    ``tickable: False`` (its checkbox disabled; NOT ``disabled``, which would also kill the
-    lock icon's tooltip) and ``add_locked`` (the code the slot shows a lock icon for).
-    ``None`` builds exactly today's nodes.
+    :meth:`TableSetAddLock.node_flags`) marks the leaves whose checkbox cannot change now
+    (an unticked one that cannot be ticked; G137: a ticked one read in parts, ``"split"``,
+    that cannot be unticked): ``tickable: False`` (its checkbox disabled; NOT ``disabled``,
+    which would also kill the lock icon's tooltip) and ``add_locked`` (the code the slot
+    shows a lock icon for). ``None`` builds exactly today's nodes.
     """
     migratable_set = set(migratable)
     locked_codes = add_locked or {}
@@ -5141,8 +5229,8 @@ def build_migration_table_tree(
 def _header_table_slot_with_locks() -> str:
     """The table leaf slot with the G16 lock icon (Full load + CDC after its Full Load): a
     grey lock on a leaf an exclude table rule holds (the only per-table reason since G17),
-    its reason on hover. Static text, so the whole slot stays a client-side template (no
-    per-node Python work)."""
+    or (G137) on a ticked leaf the Full Load read in parts, its reason on hover. Static text,
+    so the whole slot stays a client-side template (no per-node Python work)."""
     return (
         r"""
             <div class="row items-center no-wrap">
@@ -5158,6 +5246,12 @@ def _header_table_slot_with_locks() -> str:
                       color="grey-6" size="16px" class="q-ml-xs">
                 <q-tooltip>"""
         + LOCK_TIP_RULE
+        + r"""</q-tooltip>
+              </q-icon>
+              <q-icon v-if="props.node.add_locked === 'split'" name="lock"
+                      color="grey-6" size="16px" class="q-ml-xs">
+                <q-tooltip>"""
+        + LOCK_TIP_SPLIT
         + r"""</q-tooltip>
               </q-icon>
             </div>
@@ -5376,6 +5470,22 @@ def _render_table_selection(
                 if on_locked is not None:
                     on_locked()
                 return
+            # G137: an untick of a table read in parts is refused whole too (an error: it
+            # would leave its copy torn).
+            chosen_set = set(chosen)
+            kept_split = lock.removal_refusal(
+                [n for n in migratable_order if n in current and n not in chosen_set],
+                tree=True,
+            )
+            if kept_split:
+                ui.notify(
+                    f"{kept_split} This change was not applied.",
+                    type="negative",
+                    multi_line=True,
+                )
+                if on_locked is not None:
+                    on_locked()
+                return
         migration_state.set_selection(
             TableSelection(selected_tables=chosen + _kept(lock))
         )
@@ -5444,11 +5554,41 @@ def _render_table_selection(
                 if _refused():
                     return
                 lock = add_lock_fn() if add_lock_fn is not None else None
-                tree.untick()
-                migration_state.set_selection(TableSelection(selected_tables=_kept(lock)))
-                count_label.text = f"0 of {total_leaves} selected"
+                # G137: a table read in parts stays selected (CDC must replay it); the rest
+                # are unselected, as Select all selects only what may be selected.
+                current = _current_effective() if lock is not None else set()
+                held = (
+                    lock.removal_blocked([n for n in migratable_order if n in current])
+                    if lock is not None
+                    else []
+                )
+                if not held:
+                    tree.untick()
+                    migration_state.set_selection(
+                        TableSelection(selected_tables=_kept(lock))
+                    )
+                    count_label.text = f"0 of {total_leaves} selected"
+                    if on_selection_change is not None:
+                        on_selection_change([])
+                    return
+                held_set = set(held)
+                tree.untick(
+                    [f"{TABLE_PREFIX}{n}" for n in migratable_order if n not in held_set]
+                )
+                migration_state.set_selection(
+                    TableSelection(selected_tables=list(held) + _kept(lock))
+                )
+                count_label.text = f"{len(held)} of {total_leaves} selected"
+                one = len(held) == 1
+                ui.notify(
+                    f"{lock.removal_refusal(held, tree=True)} "
+                    f"{'It stays' if one else 'They stay'} selected; every other table was "
+                    "unselected.",
+                    type="negative",
+                    multi_line=True,
+                )
                 if on_selection_change is not None:
-                    on_selection_change([])
+                    on_selection_change(list(held))
 
             ui.button("Select all", on_click=_dm_select_all).props(
                 "flat dense no-caps size=sm color=primary icon=done_all"
@@ -6300,6 +6440,7 @@ __all__ = [
     "failed_table_names",
     "quarantined_rows_by_table",
     "recreated_unfinished",
+    "split_read_tables",
     "unsettled_table_names",
     "RestoredExclusionFacts",
     "classify_restored_exclusions",
@@ -6446,7 +6587,9 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     fl_cdc_pending_additions,
     cdc_addition_block_reason,
     LOCK_TIP_RULE,
+    LOCK_TIP_SPLIT,
     TREE_HINT_FL_CDC,
+    TREE_HINT_SPLIT,
     CDC_ONLY_NARROWING_SENTENCE,
     R4_FL_CDC_NARROWING,
     R1_FL_CDC_SENTENCE,

@@ -72,6 +72,7 @@ from dsql_migrator.core.converter import (
     parse_target_generated_columns,
     pg_preserved_generated_columns,
     parse_target_primary_key,
+    parse_target_unique_keys,
 )
 from dsql_migrator.core.cdc_coords import gtid_mode_is_on
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
@@ -934,7 +935,8 @@ class _ShardWorkerArgs:
     shard_index: int
     # A dialect-exported snapshot id all shards import so they share ONE point-in-time cut
     # (consistent sharded read of a REPLACE load without CDC). None => each shard uses its
-    # own snapshot (MySQL, or the CDC-handoff path).
+    # own snapshot (MySQL: a Full load + CDC run whose CDC replays the load from its start
+    # point, G137, or the CDC-coexisting path) and is never re-read in place.
     shared_snapshot_id: Optional[str] = None
     # This shard's SHARE of the table's single permanently-dropped-row budget. A shard runs
     # in its own process with its own importer, so the module-level cap alone let K shards
@@ -942,6 +944,9 @@ class _ShardWorkerArgs:
     # shared counter would need IPC; dividing the one budget keeps the guarantee without it.
     # None => the whole budget (a non-sharded load).
     max_quarantine_records: Optional[int] = None
+    # How many ranges the table was split into (G137): it words a failed range's reason
+    # ("range 2 of 4"). None => unknown (the reason names the range alone).
+    shard_count: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -950,6 +955,9 @@ class _TableWorkerResult:
 
     table_name: str
     status: str  # "DONE" | "FAILED" | "STOPPED"
+    # A shard's count is the rows its committed batches wrote, also when it STOPPED or
+    # FAILED. It can undercount a FAILED one: a batch that commits split halves and then
+    # fails counts none of them.
     rows_loaded: int = 0
     rows_skipped: int = 0
     error_message: Optional[str] = None
@@ -960,6 +968,10 @@ class _TableWorkerResult:
     # either swallowing them or failing the table over an access path.
     index_failures: tuple = ()
     shard_index: int = -1
+    # G137: True only when this part provably wrote no row -- no source row ever reached its
+    # importer -- so the parent knows a split table's parts left nothing on Aurora DSQL.
+    # False (unknown) by default: the parent then keeps the table's record.
+    wrote_nothing: bool = False
 
 
 def _slim_worker_inputs(
@@ -1047,20 +1059,28 @@ def _report_progress(
         pass
 
 
-def _sharding_is_consistent(*, cdc_coexisting: bool, shared_snapshot: bool) -> bool:
+def _sharding_is_consistent(
+    *, cdc_coexisting: bool, shared_snapshot: bool, cdc_replays_load: bool = False
+) -> bool:
     """Whether a table's read may be split across several shard readers.
 
     Each shard opens its own CONSISTENT SNAPSHOT, so a source written to DURING the load
     can produce a cross-shard TORN READ: one row of a multi-row source transaction lands
-    in shard A's snapshot while its sibling has not yet appeared in shard B's. Splitting
-    is therefore only sound when one of two things holds:
+    in shard A's snapshot while its sibling has not yet appeared in shard B's, and a row
+    whose key moves between two ranges is copied twice or not at all. Splitting is
+    therefore only sound when one of three things holds:
 
     * ``cdc_coexisting`` -- a CDC stream will reconcile every post-snapshot write, so a
       torn read is repaired by the stream (and the load is idempotent) -- though not a
       delete the sink applies before the copy writes the row (G129: the UI therefore
       never runs such a load), or
     * ``shared_snapshot`` -- the source dialect can give EVERY shard one shared
-      point-in-time snapshot (PostgreSQL exported snapshots), so there is nothing to tear.
+      point-in-time snapshot (PostgreSQL exported snapshots), so there is nothing to tear,
+      or
+    * ``cdc_replays_load`` (G137, :func:`_cdc_replays_load`) -- CDC will replay, after the
+      load, every change since a start point taken before any of its reads, and the sink's
+      full-row upsert and delete by key leave each key at its last change: a torn copy
+      converges exactly as tables read at different times do.
 
     The second lifts the older "a REPLACE must be read by a single reader" restriction,
     which is why that rule no longer appears here: a PostgreSQL non-CDC REPLACE does shard,
@@ -1068,20 +1088,57 @@ def _sharding_is_consistent(*, cdc_coexisting: bool, shared_snapshot: bool) -> b
     previous guard asserted a source-text substring that stayed a PREFIX of the widened
     condition, so it kept passing while no longer guarding anything.
     """
-    return bool(cdc_coexisting) or bool(shared_snapshot)
+    return bool(cdc_coexisting) or bool(shared_snapshot) or bool(cdc_replays_load)
 
 
 def _table_may_shard(
-    *, cdc_coexisting: bool, shared_snapshot: bool, table_is_replace: bool
+    *,
+    cdc_coexisting: bool,
+    shared_snapshot: bool,
+    table_is_replace: bool,
+    cdc_replays_load: bool = False,
 ) -> bool:
     """Whether THIS table may be sharded, given the run-level consistency rule."""
     if not _sharding_is_consistent(
-        cdc_coexisting=cdc_coexisting, shared_snapshot=shared_snapshot
+        cdc_coexisting=cdc_coexisting,
+        shared_snapshot=shared_snapshot,
+        cdc_replays_load=cdc_replays_load,
     ):
         return False
-    # A REPLACE is a clean plain-INSERT load with nothing to reconcile it, so it may only
-    # be split when every shard reads ONE shared snapshot.
-    return (not table_is_replace) or bool(shared_snapshot)
+    # A REPLACE is a clean plain-INSERT load with no stream beside it, so it may only be
+    # split when every shard reads ONE shared snapshot, or when CDC replays the load from a
+    # start point before it (the stream that repairs it then follows the load).
+    return (not table_is_replace) or bool(shared_snapshot) or bool(cdc_replays_load)
+
+
+def _cdc_replays_load(inputs: "DataMigrationInputs", watermark: "Optional[Watermark]") -> bool:
+    """Will CDC replay this MySQL run's reads from a start point taken before all of them?
+
+    True for a Full load + CDC run (``is_cdc_migration``) on a MySQL source whose watermark
+    carries a binlog file and position. That watermark is captured before any table is read,
+    and Retry unfinished tables, Reload specific tables and a G17 addition reuse it, so every
+    snapshot of the run opens after it. What makes the replay start no later than it:
+
+    * G129 -- no Full Load runs while CDC streams, and Start CDC waits for a running load;
+    * a stopped connector resumes from its stopped offset, which precedes any later
+      reload's reads;
+    * G25 -- a new start point after CDC has streamed needs new topics.
+
+    The routes that would take a table out of that replay (unticking it, Full load only, a
+    Manual or later start point) refuse a table read in parts until a CHECKSUM match or a
+    recreate clears its record (``_models.split_read_tables``) -- a Start CDC does not,
+    since it may never have streamed. Never for PostgreSQL (its shards share one snapshot)
+    nor a run without a binlog start point (Debezium would have nothing to replay from).
+    Pure.
+    """
+    return bool(
+        getattr(inputs, "is_cdc_migration", False)
+        and getattr(getattr(inputs, "source_config", None), "source_type", None)
+        is SourceType.MYSQL
+        and watermark is not None
+        and getattr(watermark, "binlog_file", None)
+        and getattr(watermark, "binlog_position", None) is not None
+    )
 
 
 def _abandon_pool_workers(pool) -> None:
@@ -1150,6 +1207,30 @@ def _discard_ordinal_resume_state(job) -> None:
         pass
 
 
+class _SplitRangeNotReread(FullLoadIncompleteError):
+    """A MySQL shard lost its source connection: its range is not re-read in place (G137).
+
+    Its message is the whole reason (the parent records it as the shard's), so the worker
+    adds no connection-lost hint to it: that hint promises a re-read."""
+
+
+# G137: why a MySQL shard (one read in parts, each from its own snapshot) fails on a lost
+# source connection instead of re-reading its range. {part}: the range, counted from 1 ("2 of
+# 4", :func:`_range_label`); {cause}: the value-free driver line.
+_SPLIT_RANGE_NOT_REREAD = (
+    "The source connection was lost while primary-key range {part} of this table was read "
+    "({cause}). A MySQL table read in parts is not re-read in place: each part reads its own "
+    "snapshot, and a second snapshot in one range could copy a row twice under one of its "
+    "unique keys. So the table did not finish: Retry unfinished tables loads it again."
+)
+
+
+def _range_label(shard_index: Optional[int], shard_count: Optional[int]) -> str:
+    """A shard's range as the operator counts it: from 1, of the table's total when known."""
+    part = (shard_index or 0) + 1
+    return f"{part} of {shard_count}" if shard_count else str(part)
+
+
 def _retry_source_drops_in_process(
     work,
     *,
@@ -1160,6 +1241,8 @@ def _retry_source_drops_in_process(
     before_reread=None,
     shard_index: Optional[int] = None,
     shared_snapshot: bool = False,
+    reread: bool = True,
+    shard_count: Optional[int] = None,
 ):
     """Run ``work()`` in a child process, retrying a dropped SOURCE connection.
 
@@ -1172,6 +1255,14 @@ def _retry_source_drops_in_process(
     shared cancel event. ``shard_index`` / ``shared_snapshot`` only word the re-read
     notice: a shard re-reads its own PK range, from the run's shared snapshot when it
     imported one.
+
+    ``reread=False`` (G137: a MySQL shard, which reads its range from its own snapshot)
+    re-reads nothing: a dropped source connection raises :class:`_SplitRangeNotReread`, so
+    the shard and its table fail and Retry unfinished tables loads the table again. A second
+    snapshot within one range could hold one logical row under two keys of a unique key the
+    reader-shard guard let through (a ``(tenant_id, email)`` whose email moved), which one
+    snapshot per range never does. ``shard_count`` (the table's ranges) only words that
+    reason: "range 2 of 4".
 
     ``release`` (optional) closes the failed attempt's source row stream before the
     retry waits, so the dead connection is not pinned for the whole backoff
@@ -1196,7 +1287,15 @@ def _retry_source_drops_in_process(
         except OverlayRunError:
             raise  # a target-side overlay failure, never a source drop
         except Exception as exc:  # noqa: BLE001 - classify transient vs permanent
-            if attempt >= attempts or not is_source_transient_error(exc, source_type):
+            transient = is_source_transient_error(exc, source_type)
+            if transient and not reread and not cancelled():
+                raise _SplitRangeNotReread(
+                    _SPLIT_RANGE_NOT_REREAD.format(
+                        part=_range_label(shard_index, shard_count),
+                        cause=safe_error_message(exc),
+                    )
+                ) from exc
+            if attempt >= attempts or not transient:
                 raise
             if cancelled():
                 raise
@@ -1440,11 +1539,25 @@ def _worker_error_message(exc: BaseException, inputs: "DataMigrationInputs") -> 
     target-side one). The parent records it as given, so without the hint here the default
     multi-process load showed only the driver text."""
     message = safe_error_message(exc)
+    if isinstance(exc, _SplitRangeNotReread):
+        return str(exc)
     if isinstance(exc, OverlayRunError):
         return message
     source_type = getattr(getattr(inputs, "source_config", None), "source_type", SourceType.MYSQL)
     hint = source_error_hint(exc, source_type) or target_error_hint(exc)
     return f"{message} — {hint}" if hint else message
+
+
+def _note_first_row(rows: Iterable, handed: list) -> Iterator:
+    """``rows`` as they are, setting ``handed[0]`` once the first one is handed on (G137:
+    until then, the importer had nothing it could write). The rest pass through ``yield
+    from``, so the per-row cost stays out of the hot path."""
+    iterator = iter(rows)
+    for row in iterator:
+        handed[0] = True
+        yield row
+        break
+    yield from iterator
 
 
 def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
@@ -1475,6 +1588,13 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     # Signal that this worker actually began the table, so the parent marks the chunk
     # IN_PROGRESS now (a bounded pool runs only a few at once) rather than at submission.
     _report_progress(progress_queue, (_CHUNK_STARTED, name))
+    # Every row this shard's committed batches wrote (the importer reports each committed
+    # batch, also while a failure unwinds), returned on every outcome. Whether this range
+    # wrote anything at all is ``handed`` (G137): a row handed to the importer may be written
+    # even when no batch is reported (a batch that commits split halves and then fails), so
+    # only a range that never handed one on provably wrote nothing.
+    written = [0]
+    handed = [False]
     try:
         migrator = BatchedTableMigrator(args.inputs)
         pending_loaded = 0
@@ -1484,6 +1604,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
 
         def _on_rows(loaded: int, skipped: int = 0) -> None:
             nonlocal pending_loaded, pending_skipped
+            written[0] += loaded
             pending_loaded += loaded
             pending_skipped += skipped
             now = _time.monotonic()
@@ -1574,7 +1695,9 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         # its target (the parent pre-recreated it once, before submitting shards), so committed
         # rows persist across a retry -- skipping them is safe on both the NONE (first attempt)
         # and SKIP_EXISTING (retry) modes. In-process only: a full "Retry failed tables"
-        # recreates the target and restarts the shard from the beginning.
+        # recreates a Drop & reload target and restarts the shard from the beginning. Only a
+        # shard that imported the run's shared snapshot (PostgreSQL) re-reads at all: a MySQL
+        # shard fails instead (G137, _retry_source_drops_in_process ``reread``).
         _resume_job = MigrationJob(
             job_id=f"fullload-resume:{name}#shard{args.shard_index}"
         )
@@ -1589,9 +1712,11 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             _report_progress(progress_queue, _HEARTBEAT)   # see _on_pause_slice above
 
         def _load_shard():
-            # Stream + import together so a retry re-opens the SHARD's own snapshot
-            # from its pk_lower: the generator is single-use, and re-reading the
-            # shard's whole PK range keeps it consistent as of one point in time.
+            # Stream + import together so a retry re-opens the shard's snapshot from its
+            # pk_lower: the generator is single-use. Re-reading the shard's whole PK range
+            # keeps it consistent as of one point in time only because the retry imports
+            # the run's SHARED snapshot again (PostgreSQL); a MySQL shard, whose re-read
+            # would open a fresh snapshot later than its first, is never re-read (G137).
             rows = migrator._exporter.stream_converted_rows(
                 args.inputs.source_config,
                 table,
@@ -1606,7 +1731,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             )
             _live_rows[0] = rows
             return importer.import_rows(
-                rows,
+                _note_first_row(rows, handed),
                 table,
                 job=_resume_job,
                 on_batch_loaded=_on_rows,
@@ -1641,18 +1766,24 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             ),
             shard_index=args.shard_index,
             shared_snapshot=bool(args.shared_snapshot_id),
+            # G137: a shard reading its own snapshot (MySQL) fails on a dropped source
+            # connection rather than splice a second snapshot into its range.
+            reread=bool(args.shared_snapshot_id),
+            shard_count=args.shard_count,
         )
         if (pending_loaded or pending_skipped) and progress_queue is not None:
             _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
         if result.cancelled:
             return _TableWorkerResult(
-                table_name=name, status="STOPPED", shard_index=args.shard_index
+                table_name=name, status="STOPPED", shard_index=args.shard_index,
+                rows_loaded=written[0], wrote_nothing=not handed[0],
             )
         if result.failures:
             return _TableWorkerResult(
                 table_name=name, status="FAILED", shard_index=args.shard_index,
                 error_message=f"{result.failures} batch(es) failed",
                 rows_loaded=result.rows_loaded, rows_skipped=result.conflicts,
+                wrote_nothing=not handed[0],
             )
         quarantine_recs = tuple(
             {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
@@ -1663,11 +1794,13 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             rows_loaded=result.rows_loaded, rows_skipped=result.conflicts,
             quarantine_records=quarantine_recs,
             index_failures=tuple(getattr(result, "index_failures", ()) or ()),
+            wrote_nothing=not handed[0],
         )
-    except _FullLoadStopped:
-        return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
-    except ExportCancelled:
-        return _TableWorkerResult(table_name=name, status="STOPPED", shard_index=args.shard_index)
+    except (_FullLoadStopped, ExportCancelled):
+        return _TableWorkerResult(
+            table_name=name, status="STOPPED", shard_index=args.shard_index,
+            rows_loaded=written[0], wrote_nothing=not handed[0],
+        )
     except Exception as exc:  # noqa: BLE001
         return _TableWorkerResult(
             table_name=name, status="FAILED", shard_index=args.shard_index,
@@ -1676,6 +1809,8 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             # result and, via list_failed_full_load_tables, the AI DBA (Property 7).
             error_message=_worker_error_message(exc, args.inputs),
             error_code=_error_code(exc),
+            rows_loaded=written[0],
+            wrote_nothing=not handed[0],
         )
 
 
@@ -2156,14 +2291,17 @@ def _migrate_table_with_source_retry(
 
     The retry deliberately re-reads the table FROM THE START on a new connection
     instead of resuming the dead read at its last primary key. Resuming would splice
-    two different MySQL snapshots into one table (the pre-failover rows plus rows as
-    of a minute later), leaving it consistent as of no single point in time -- and
-    the gapless Full Load -> CDC handoff depends on each table being consistent as
-    of the run's watermark, so a spliced table could leave a change the stream
-    replays against rows that already moved past it. Re-reading keeps that
-    guarantee; the idempotent load skips the rows already written, so the only cost
-    is re-read I/O (and reader sharding shrinks even that, since each shard already
-    holds its own snapshot).
+    two different MySQL snapshots into one table at an arbitrary key (the pre-failover
+    rows plus rows as of a minute later), and the batch-ordinal resume state would no
+    longer map to the same PK ranges. What the gapless Full Load -> CDC handoff needs is
+    weaker than one point in time per table: every read opens after the run's watermark,
+    so CDC replaying from it corrects any row that changed between two reads -- which a
+    re-read from a fresh snapshot (later than the watermark too) keeps. An append re-read
+    keeps the rows the first attempt wrote, so in Full load only, where nothing replays
+    the table, a source that took writes needs a Drop & reload re-run. The idempotent load
+    skips the rows already written, so the only cost is re-read I/O. (A MySQL table read in
+    reader shards is not re-read at all: its shard fails, see
+    :func:`_retry_source_drops_in_process`.)
 
     Only CONNECTION-level failures retry (:func:`is_source_transient_error`); a data
     or schema error would fail identically forever, so it propagates at once. A
@@ -2819,12 +2957,157 @@ def _planned_shard_ranges(
         return []
 
 
+def _split_refusal(
+    migrator: "DataMigrator",
+    table: TableDef,
+    lead: str,
+    *,
+    table_is_replace: bool,
+    shared_snapshot: bool,
+) -> Optional[str]:
+    """Why ``table`` must load as one whole-table unit although planning split its read (G137),
+    or ``None`` when its parts may load.
+
+    * **Changed key, APPEND** (both engines): a shard keys its load on the APPLIED primary
+      key and skips ``migrate_table``'s checks, so an append table whose applied key differs
+      from the source's splits only while the LIVE target's key equals the applied one. Else
+      the whole-table load promotes the table (an empty target) or refuses it, as for one
+      reader.
+    * **Unique keys** (unless every shard reads one shared snapshot): two shard snapshots can
+      hold one logical row under two keys. A key that includes the column the parts are split
+      on (``lead``) never sees both copies -- every row with one value of it is read from one
+      snapshot -- but any other unique key would (a UNIQUE ``email``), failing an append
+      batch or the post-load index. So every key Aurora DSQL enforces as unique must include
+      ``lead``: the applied primary key, the CREATE TABLE's UNIQUE constraints and the
+      CREATE UNIQUE INDEX statements (:func:`parse_target_unique_keys`), and for an APPEND
+      table every unique index of the live target too (one ``pg_index`` read). Anything
+      unreadable refuses the split.
+    """
+    inputs = migrator._inputs  # type: ignore[attr-defined]
+    if not table_is_replace:
+        applied = inputs.table_conversions.get(table.name)
+        applied_key = (
+            parse_target_primary_key(applied.target_ddl) if applied is not None else []
+        ) or None
+        if applied_key and applied_key != list(table.primary_key):
+            live_key = migrator._target_pk_reader(table)  # type: ignore[attr-defined]
+            if live_key != applied_key:
+                return (
+                    f"its applied primary key ({', '.join(applied_key)}) differs from the "
+                    "source's, and the Aurora DSQL table's key "
+                    + (
+                        "could not be read"
+                        if live_key is None
+                        else f"is ({', '.join(live_key)})"
+                    )
+                    + ", so it loads as one unit, which recreates an empty table with the "
+                    "applied key or refuses the load"
+                )
+    if shared_snapshot:
+        return None
+    conversion = _effective_conversion(inputs, table)
+    keys = parse_target_unique_keys(conversion.target_ddl, conversion.index_ddls)
+    if keys is None:
+        return "its unique keys could not be read from its converted DDL"
+    if not table_is_replace:
+        live_keys = migrator._target_unique_keys_reader(table)  # type: ignore[attr-defined]
+        if live_keys is None:
+            return "its unique indexes on Aurora DSQL could not be read"
+        keys = keys + list(live_keys)
+    wanted = lead.lower()
+    for key in keys:
+        if wanted not in {column.lower() for column in key}:
+            return (
+                f"its unique key ({', '.join(key)}) does not include {lead}, the column its "
+                "parts would be split on, so a row whose key changes during the read could "
+                "be copied twice and break that key"
+            )
+    return None
+
+
+# The activity details of the reader-shard plan (G137), logged only with Reader shards per
+# large table above 1, so a default run logs nothing new.
+_SPLIT_OWN_SNAPSHOTS = (
+    "read in {k} primary-key ranges, each from its own snapshot; CDC, from the start point "
+    "taken before any read, corrects rows that changed between them"
+)
+_SPLIT_SHARED_SNAPSHOT = "read in {k} primary-key ranges sharing one snapshot"
+_ONE_READER = "read with one reader: {reason}"
+_KEYS_UNREADABLE = "its keys could not be read"
+_RUN_FULL_LOAD_ONLY = (
+    "every MySQL table is read with one reader: this run is not Full load + CDC, and a table "
+    "read in parts holds rows from several snapshots, which only CDC from the start point "
+    "taken before the load corrects"
+)
+_RUN_NO_BINLOG_POINT = (
+    "every MySQL table is read with one reader: the run's start point has no binlog file and "
+    "position, so CDC could not replay a table read in parts from before its reads"
+)
+
+
+def _record_reader_shards(
+    job: MigrationJob,
+    names: "Iterable[str]",
+    parts: "Mapping[str, int]",
+    recreated: "Iterable[str]" = (),
+) -> "dict[str, Optional[int]]":
+    """Record this run's plan on its tables' ``reader_shards`` (G137) and return, per table,
+    the count it had without this plan.
+
+    A table this run recreated (``recreated``: emptied, the earlier copy gone) takes its plan
+    -- its part count, else ``None``. Any other keeps the larger of its earlier count and its
+    plan: a load that did not recreate it (an append, a one-unit load, one that failed or
+    stopped) keeps the rows read in parts on Aurora DSQL, and only CDC's replay corrects
+    them. The returned count (``None`` for a recreated table, else the earlier one) is what
+    :func:`_restore_unwritten_parts` puts back when the planned parts provably wrote no
+    row."""
+    run = set(names)
+    gone = set(recreated)
+    without_plan: "dict[str, Optional[int]]" = {}
+    for chunk in job.chunks:
+        if chunk.chunk_id not in run:
+            continue
+        earlier = None if chunk.chunk_id in gone else chunk.reader_shards
+        without_plan[chunk.chunk_id] = earlier
+        chunk.reader_shards = max(earlier or 0, parts.get(chunk.chunk_id) or 0) or None
+    return without_plan
+
+
+def _restore_unwritten_parts(
+    job: MigrationJob, without_plan: "Mapping[str, Optional[int]]"
+) -> None:
+    """Put back the count each of these tables had without this run's plan (G137): its planned
+    parts provably wrote no row -- none ran, or none handed its importer a row -- so nothing
+    of this run's read in parts is on Aurora DSQL to claim."""
+    for chunk in job.chunks:
+        if chunk.chunk_id in without_plan:
+            chunk.reader_shards = without_plan[chunk.chunk_id]
+
+
+def _thread_load_recreated(
+    migrator: "DataMigrator", name: str, outcome: "_TableLoadOutcome"
+) -> bool:
+    """Did a thread-path load recreate ``name``? A replace table is recreated before its first
+    row (``migrate_table``), so one that finished was (G137: its earlier copy is gone). A
+    failed or stopped one may not have been, so it keeps its record."""
+    inputs = getattr(migrator, "_inputs", None)
+    return (
+        outcome in (_TableLoadOutcome.LOADED, _TableLoadOutcome.QUARANTINED)
+        and inputs is not None
+        and not getattr(inputs, "cdc_coexisting", False)
+        and name in (getattr(inputs, "replace_tables", None) or ())
+    )
+
+
 def _migrate_tables_in_parallel(
     handle: JobHandle,
     job_id: str,
     tables: Sequence[TableDef],
     migrator: "DataMigrator",
     error_log: ErrorLogStore,
+    *,
+    watermark: "Optional[Watermark]" = None,
+    fresh_watermark: bool = False,
 ) -> _RunCounts:
     """Migrate ``tables`` concurrently (bounded), isolating per-table failures.
 
@@ -2840,6 +3123,11 @@ def _migrate_tables_in_parallel(
     retryable failure yet offer an accept-and-continue override for a
     quarantine-only incompleteness (a cooperative stop counts as neither -- it is
     surfaced as ``CANCELLED``).
+
+    ``watermark`` is the run's start point (G137: a MySQL Full load + CDC run with a binlog
+    one may split a table's read, :func:`_cdc_replays_load`); ``fresh_watermark`` says this
+    run captured it, so its row estimates may spare the planning read of a table well below
+    the shard minimum (a retry's may be days old).
     """
     if not tables:
         return _RunCounts(0, 0)
@@ -2883,24 +3171,33 @@ def _migrate_tables_in_parallel(
     use_processes = isinstance(migrator, BatchedTableMigrator) and table_parallelism > 1
 
     if not use_processes:
-        # Thread fallback (test doubles, or table_parallelism<=1).
+        # Thread fallback (test doubles, or table_parallelism<=1). Every table has one reader
+        # here: one it recreated drops the record of an earlier read in parts (G137), any
+        # other keeps it, since its rows from that read stay on Aurora DSQL.
         tables = [table for table in tables if table.name not in withheld]
         workers = min(table_parallelism, len(tables))
+        recreated: list[str] = []
+
+        def _load(table: TableDef) -> _TableLoadOutcome:
+            outcome = _migrate_one_table(handle, job_id, table, migrator, error_log)
+            if _thread_load_recreated(migrator, table.name, outcome):
+                recreated.append(table.name)
+            return outcome
+
         if workers <= 1:
             for table in tables:
-                _tally(_migrate_one_table(handle, job_id, table, migrator, error_log))
+                _tally(_load(table))
         else:
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="fullload-table"
             ) as pool:
-                futures = [
-                    pool.submit(
-                        _migrate_one_table, handle, job_id, table, migrator, error_log
-                    )
-                    for table in tables
-                ]
+                futures = [pool.submit(_load, table) for table in tables]
                 for future in as_completed(futures):
                     _tally(future.result())
+        if recreated:
+            handle.update(
+                lambda job, names=list(recreated): _record_reader_shards(job, names, {}, names)
+            )
     else:
         # Unified process-parallel path: small tables get 1 worker each, large
         # shardable tables get multiple shard workers. All submitted to ONE pool.
@@ -2916,10 +3213,8 @@ def _migrate_tables_in_parallel(
         # ran under the module-default MySQL dialect.
         _shard_dialect = dialect_for(migrator._inputs.source_config.source_type)
         _shared_snapshot = _shard_dialect.supports_shared_snapshot
-        _shardable_ok = _sharding_is_consistent(
-            cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
-            shared_snapshot=_shared_snapshot,
-        )
+        # G137: CDC replays this MySQL run from a start point taken before its reads.
+        _replays = _cdc_replays_load(migrator._inputs, watermark)
 
         # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
         # clamped so table_parallelism x shards stays under the source max_connections
@@ -2937,6 +3232,30 @@ def _migrate_tables_in_parallel(
         if prepass is not None:
             prepass.before_planning()
 
+        # G137: with Reader shards above 1, say why a MySQL run splits nothing.
+        if (
+            effective_reader_shards > 1
+            and _shard_dialect.source_type is SourceType.MYSQL
+            and not _replays
+            and not migrator._inputs.cdc_coexisting
+        ):
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "reader shards",
+                status=ActivityStatus.INFO,
+                detail=(
+                    _RUN_FULL_LOAD_ONLY
+                    if not migrator._inputs.is_cdc_migration
+                    else _RUN_NO_BINLOG_POINT
+                ),
+            )
+        # The run's own row estimates spare the planning read of a table well below the
+        # shard minimum: a positive one only (the MySQL watermark stores an unknown as 0),
+        # and only in the run that captured them (a retry's may be days old).
+        _estimates = (
+            dict(getattr(watermark, "table_row_counts", None) or {}) if fresh_watermark else {}
+        )
+        planned_parts: dict[str, int] = {}
         work_units: list[tuple] = []  # ("table", table) or ("shard", table, lo, hi, idx)
         for table in tables:
             if table.name in withheld:
@@ -2946,26 +3265,65 @@ def _migrate_tables_in_parallel(
                 not migrator._inputs.cdc_coexisting
                 and table.name in migrator._inputs.replace_tables
             )
+            lead = shardable_leading_int_pk(table, _shard_dialect)
             shardable = (
                 _table_may_shard(
                     cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
                     shared_snapshot=_shared_snapshot,
                     table_is_replace=table_is_replace,
+                    cdc_replays_load=_replays,
                 )
-                and shardable_leading_int_pk(table, _shard_dialect) is not None
+                and lead is not None
                 and effective_reader_shards > 1
             )
             if not shardable:
                 work_units.append(("table", table))
                 continue
+            _estimate = _estimates.get(table.name)
+            if isinstance(_estimate, int) and 0 < _estimate < cfg.full_load_shard_min_rows:
+                work_units.append(("table", table))
+                continue
             shard_ranges = _planned_shard_ranges(
                 migrator, table, effective_reader_shards, cfg.full_load_shard_min_rows
             )
-            if len(shard_ranges) > 1:
+            try:
+                refusal = (
+                    _split_refusal(
+                        migrator, table, lead,
+                        table_is_replace=table_is_replace, shared_snapshot=_shared_snapshot,
+                    )
+                    if len(shard_ranges) > 1
+                    else None
+                )
+            except Exception:  # noqa: BLE001 - unreadable: one reader, never a failed run
+                _LOGGER.warning("Reader-shard guard failed for %s", table.name, exc_info=True)
+                refusal = _KEYS_UNREADABLE
+            # A planned candidate is a source connect (and maybe a catalog read) before the
+            # drain thread that owns liveness starts: stamp it, as the recreate loop does.
+            handle.heartbeat()
+            if len(shard_ranges) > 1 and refusal is None:
                 for i, (lo, hi) in enumerate(shard_ranges):
                     work_units.append(("shard", table, lo, hi, i))
+                planned_parts[table.name] = len(shard_ranges)
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "reader shards",
+                    status=ActivityStatus.INFO,
+                    target=table.name,
+                    detail=(
+                        _SPLIT_SHARED_SNAPSHOT if _shared_snapshot else _SPLIT_OWN_SNAPSHOTS
+                    ).format(k=len(shard_ranges)),
+                )
             else:
                 work_units.append(("table", table))
+                if refusal is not None:
+                    log_activity(
+                        ActivityCategory.FULL_LOAD,
+                        "reader shards",
+                        status=ActivityStatus.INFO,
+                        target=table.name,
+                        detail=_ONE_READER.format(reason=refusal),
+                    )
 
         total_workers = min(table_parallelism, len(work_units))
 
@@ -3008,6 +3366,14 @@ def _migrate_tables_in_parallel(
                     # A run with the overlay pre-pass fails only this table; any other run
                     # keeps the previous behaviour (a recreate failure aborts the run).
                     if prepass is None:
+                        # The tables already recreated are empty: their record of an
+                        # earlier read in parts goes with their rows (G137).
+                        if recreated_names:
+                            handle.update(
+                                lambda job, names=sorted(recreated_names): (
+                                    _record_reader_shards(job, names, {}, names)
+                                )
+                            )
                         raise
                     _fail_prepass_table(tbl.name, exc=exc)
                     continue
@@ -3023,6 +3389,28 @@ def _migrate_tables_in_parallel(
                     prepass.recreated(tbl.name)
         if prepass is not None:
             prepass.after_recreate(recreated_names)
+
+        # The plan on the job (G137), written after the recreates and before any part runs: a
+        # table this run recreated takes its plan, any other keeps an earlier read in parts
+        # (_record_reader_shards) -- a MySQL table read in parts is consistent only once CDC
+        # replays it, which the routes out of that replay check. A split table whose parts
+        # then wrote no row gets back the count it had without this plan (after the pool).
+        planned_parts = {n: k for n, k in planned_parts.items() if n not in withheld}
+        without_plan: "dict[str, Optional[int]]" = {}
+        if planned_parts or recreated_names:
+
+            def _record(
+                job,
+                names=sorted(set(planned_parts) | recreated_names),
+                parts=dict(planned_parts),
+                gone=set(recreated_names),
+            ) -> None:
+                without_plan.update(_record_reader_shards(job, names, parts, gone))
+
+            handle.update(_record)
+        # Per split table: its parts submitted, and those cancelled before they ran.
+        submitted_parts: dict[str, int] = {}
+        unrun_parts: dict[str, int] = {}
 
         ctx = multiprocessing.get_context("spawn")
         progress_queue: multiprocessing.Queue = ctx.Queue()
@@ -3090,6 +3478,10 @@ def _migrate_tables_in_parallel(
                             shard_results[table.name] = []
                             # Started when the first shard worker signals it began (see
                             # _CHUNK_STARTED), not here at submission.
+                        _table_shards = sum(
+                            1 for _wu in work_units
+                            if _wu[0] == "shard" and _wu[1].name == table.name
+                        )
                         shard_args = _ShardWorkerArgs(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
@@ -3097,19 +3489,13 @@ def _migrate_tables_in_parallel(
                             shared_snapshot_id=shared_snapshot_id,
                             # Divide the one table-level budget among this table's shards.
                             max_quarantine_records=max(
-                                1,
-                                MAX_QUARANTINE_RECORDS
-                                // max(
-                                    1,
-                                    sum(
-                                        1 for _wu in work_units
-                                        if _wu[0] == "shard" and _wu[1].name == table.name
-                                    ),
-                                ),
+                                1, MAX_QUARANTINE_RECORDS // max(1, _table_shards)
                             ),
+                            shard_count=_table_shards,
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
                         futures[f] = ("shard", table.name, shard_idx)
+                        submitted_parts[table.name] = submitted_parts.get(table.name, 0) + 1
 
                 # Process results as they complete.
                 # Bounded wait so Stop Full Load can never hang. Cancellation is
@@ -3178,7 +3564,10 @@ def _migrate_tables_in_parallel(
                                 len(_pending), _CANCEL_GRACE_SECONDS,
                             )
                             for _f in _pending:
-                                _f.cancel()
+                                # A part cancelled before it ran wrote nothing (G137).
+                                if _f.cancel() and futures[_f][0] == "shard":
+                                    _unrun = futures[_f][1]
+                                    unrun_parts[_unrun] = unrun_parts.get(_unrun, 0) + 1
                             _abandon_pool_workers(pool)
                             break
                         continue
@@ -3242,9 +3631,12 @@ def _migrate_tables_in_parallel(
                                         table=name,
                                         chunk_id=f"{name} shard {r.shard_index}",
                                         error_code=r.error_code,
+                                        # Counted from 1, of the table's ranges, as the
+                                        # G137 reason it may carry counts them.
                                         message=(
-                                            f"shard {r.shard_index} FAILED "
-                                            f"(rows_loaded={r.rows_loaded}): "
+                                            "range "
+                                            f"{_range_label(r.shard_index, expected_shards)} "
+                                            f"FAILED (rows_loaded={r.rows_loaded}): "
                                             f"{r.error_message or '(no error message)'}"
                                         ),
                                         occurred_at=datetime.now(timezone.utc),
@@ -3376,6 +3768,27 @@ def _migrate_tables_in_parallel(
             # drain's 0.3 s poll interval.
             _report_progress(progress_queue, _PROGRESS_SENTINEL)
             drain.join(timeout=5)
+            # G137: a split table whose parts provably wrote no row -- none ran, or each
+            # stopped or failed before its source read handed its importer one (the
+            # result's ``wrote_nothing``; its row count is not proof: a batch that commits
+            # split halves and then fails counts none of them) -- holds nothing of this read
+            # in parts, so it gets back the count it had without this plan. A part with no
+            # result (an abandoned pool, a broken one) may have written: its table keeps the
+            # plan.
+            _unwritten = {
+                n: without_plan.get(n)
+                for n in planned_parts
+                if len(shard_results.get(n, ())) + unrun_parts.get(n, 0)
+                >= submitted_parts.get(n, 0)
+                and all(r.wrote_nothing for r in shard_results.get(n, ()))
+            }
+            if _unwritten:
+                try:
+                    handle.update(
+                        lambda job, back=dict(_unwritten): _restore_unwritten_parts(job, back)
+                    )
+                except Exception:  # noqa: BLE001 - cleanup never replaces the run's outcome
+                    _LOGGER.warning("Could not restore the reader-shard record", exc_info=True)
 
     if handle.cancelled:
         handle.update(_fail_unfinished_chunks)
@@ -4450,7 +4863,10 @@ def run_full_load(
     # lines plus _finalize_run's "run incomplete" already tell the story, and a second
     # run-level line would be the duplicate-reporting this log has been cleaned of before.
     try:
-        counts = _migrate_tables_in_parallel(handle, job_id, tables, migrator, error_log)
+        counts = _migrate_tables_in_parallel(
+            handle, job_id, tables, migrator, error_log,
+            watermark=watermark, fresh_watermark=True,
+        )
     except Exception as exc:  # noqa: BLE001 - logged, then re-raised unchanged
         _done = 0
         try:
@@ -4518,6 +4934,10 @@ def _seed_retry_chunks(
     lets the set change, G12) -- gets a fresh ``PENDING`` chunk appended (sorted), so its
     load is tracked like any other: without one, ``_find_chunk`` returned None and every
     start/complete/fail update silently did nothing (an untracked load).
+
+    A retried table keeps its ``reader_shards`` (G137): its rows read in parts stay on Aurora
+    DSQL until a load recreates it, the one load that clears the record
+    (:func:`_record_reader_shards`; a CHECKSUM match in Validation clears it too).
     """
     chunks: list[ChunkState] = []
     for prior in prior_chunks:
@@ -4528,6 +4948,7 @@ def _seed_retry_chunks(
                     status="PENDING",
                     rows_loaded=0,
                     attempts=prior.attempts,
+                    reader_shards=prior.reader_shards,
                 )
             )
         else:
@@ -5103,6 +5524,8 @@ def run_full_load_retry(
         [t for t in tables_to_retry if t.name not in excluded] if excluded
         else tables_to_retry,
         migrator, error_log,
+        # The ORIGINAL start point (G137): every snapshot this retry opens is later than it.
+        watermark=watermark,
     )
     _recreate_dependent_views(migrator)
     # G17: the guarded additions that loaded completely join the watermark's coverage --
@@ -5861,6 +6284,9 @@ class BatchedTableMigrator:
         ] = None,
         overlay_facts_reader: Optional[Callable[..., Any]] = None,
         overlay_applier: Optional[Callable[..., Any]] = None,
+        target_unique_keys_reader: Optional[
+            Callable[[TableDef], Optional[list[list[str]]]]
+        ] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
         if inputs.inventory.tables:
@@ -5932,6 +6358,11 @@ class BatchedTableMigrator:
         # append path, where the applied DDL cannot be trusted to describe the live target.
         self._target_generated_reader = (
             target_generated_reader or self._default_target_generated
+        )
+        # Reads the live target's unique indexes (injectable for tests). Used only by the
+        # process planner's reader-shard guard on an append table (G137, _split_refusal).
+        self._target_unique_keys_reader = (
+            target_unique_keys_reader or self._default_target_unique_keys
         )
 
     @property
@@ -6657,11 +7088,12 @@ class BatchedTableMigrator:
         ):
             is_replace = True
 
-        # Reader range sharding: for a LARGE single-integer-PK table, split the read
-        # into K disjoint PK ranges streamed concurrently (each its own snapshot), so
-        # the CPU-bound single keyset reader isn't the ceiling. plan_pk_shard_ranges
-        # returns one (None, None) range -- i.e. the original single reader -- for
-        # small tables, composite/non-integer PKs, or when sharding is off (K<=1).
+        # Reader range sharding: for a LARGE table whose leading PK column is an integer,
+        # split the read into K disjoint PK ranges streamed concurrently (each its own
+        # snapshot), so the CPU-bound single keyset reader isn't the ceiling.
+        # plan_pk_shard_ranges returns one (None, None) range -- i.e. the original single
+        # reader -- for small tables, a non-integer leading column, or when sharding is off
+        # (K<=1).
         #
         # Sharded ONLY on the CDC-coexisting path. The K shards each open an
         # independently-timed CONSISTENT SNAPSHOT, so a source written to DURING the
@@ -6670,10 +7102,14 @@ class BatchedTableMigrator:
         # provably safe when a CDC stream will reconcile any post-snapshot write:
         # SKIP_EXISTING makes the re-load idempotent (disjoint ranges never
         # double-load) and CDC backfills the torn sibling. Neither a REPLACE (plain
-        # INSERT, no CDC) NOR a NON-CDC append has anything to reconcile it, so both
-        # must use a SINGLE reader (one snapshot = one point-in-time cut). Requiring
+        # INSERT, no CDC) NOR a NON-CDC append has anything to reconcile it here, so
+        # both use a SINGLE reader (one snapshot = one point-in-time cut). Requiring
         # cdc_coexisting -- not merely "not is_replace" -- is what closes the non-CDC
-        # append torn-read hole; it matches the multiprocess planner's _shardable_ok.
+        # append torn-read hole. This in-process path (Tables in parallel 1, or a
+        # process worker's whole-table unit) is deliberately left at that rule: a MySQL
+        # Full load + CDC run splits a table only on the multi-process planner, which
+        # applies the reader-shard guards (_table_may_shard, _split_refusal, G137), and a
+        # PostgreSQL table shares one snapshot only there too.
         cfg = load_config()
         shard_ranges: list = [(None, None)]
         if not is_replace and self._inputs.cdc_coexisting:
@@ -7003,6 +7439,18 @@ class BatchedTableMigrator:
             return target_primary_key_columns(
                 table.name, connection_factory=connector.connect
             )
+        except Exception:  # noqa: BLE001 - unknown, decided by the caller
+            return None
+
+    def _default_target_unique_keys(self, table: TableDef) -> "Optional[list[list[str]]]":
+        """Return the live target table's unique indexes as key columns (None if unreadable)."""
+        from dsql_migrator.core.target_introspector import target_unique_keys
+
+        try:
+            connector = DsqlConnector(
+                self._inputs.target_config, aws_profile=self._inputs.aws_profile
+            )
+            return target_unique_keys(table.name, connection_factory=connector.connect)
         except Exception:  # noqa: BLE001 - unknown, decided by the caller
             return None
 

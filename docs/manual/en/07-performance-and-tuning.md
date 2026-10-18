@@ -221,20 +221,25 @@ variables, CDC via CloudFormation parameters.
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | In-flight `INSERT … ON CONFLICT` batches per table. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | Rows per batched write (hard-capped at DSQL's 3000-row limit). |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | on/off | Read-ahead prefetch queue (§7.1). **Leave on** — set `0` only to reproduce the pre-prefetch path for A/B benchmarking. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off) | ≤ 8 | Reader range sharding: split a **large single-integer-PK** table's read into K concurrent readers (§7.1). **Off by default and rarely worth turning on** — see the caveat below. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | A table must have at least this many (estimated) rows to be sharded; smaller tables always use one reader. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off) | ≤ 8 | Reader range sharding: split a **large** table's read by its integer leading primary-key column into K ranges, each read by its own worker process ([§3.8](03-full-load.md#38-multi-process-parallelism-gil-bypass)). PostgreSQL: any run. MySQL: Full load + CDC only, for a table whose unique keys all include that column. Also *Reader shards per large table* in **Settings → Full Load**. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | A table must have at least this many (estimated) rows to be split; smaller tables use one reader. |
 
-> **When does reader sharding actually help? Rarely — and it was ~0% in our
-> in-VPC test.** The per-row type conversion is pure Python and holds the GIL, so K
-> reader *threads* still can't exceed ~one core of conversion throughput — thread
-> sharding overlaps the readers' I/O waits (which the prefetch queue already does)
-> but cannot add a second core of convert. In a measured in-VPC 4-vCPU run,
-> `reader_shards=4` gave **~0% over one reader** and CPU stayed pinned at ~1 core,
-> because that load was bounded by **DSQL write round-trip latency**, not by the
-> reader. Turn it up only if you have *evidence* a run is read/convert-starved (the
-> reader can't keep the write pool busy); when the wall is the write side, raise
-> **`BATCH_PARALLELISM`** instead. Total source readers = `table_parallelism ×
-> reader_shards`, clamped to a safe ceiling to protect the source's connection limit.
+> **When reader sharding helps, and what it costs.** It helps when a few large tables
+> dominate a load and pool slots would otherwise idle: one keyset reader converts rows on
+> one core, while each range runs in its own process on its own core — measured about
+> **3.8× at K = 4** on an 8M-row PostgreSQL load. (The ~0% once measured here was with
+> reader *threads*, which share one GIL; the multi-process path replaced them.) Each range
+> takes one `TABLE_PARALLELISM` slot, so concurrent source readers stay at or below
+> `TABLE_PARALLELISM` (+1 PostgreSQL anchor connection) and DSQL connections at about
+> `TABLE_PARALLELISM × BATCH_PARALLELISM`, whatever K is; K is capped at 32 ÷
+> `TABLE_PARALLELISM`. **The trade-off:** K > 1 turns idle slots into concurrent reads of
+> the same table for its whole read, so the source read rate, the DSQL connections and the
+> memory rise up to `TABLE_PARALLELISM`-fold for that stretch. On a source still serving
+> production traffic, pair it with the `Threads_running` throttle
+> (`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`, §7.3). When the wall is the write side, raise
+> **`BATCH_PARALLELISM`** instead. On MySQL a table is split only in Full load + CDC, and
+> the routes that would leave a split table without CDC's replay are refused
+> ([§3.8](03-full-load.md#38-multi-process-parallelism-gil-bypass)).
 
 > **Connection-quota guardrail.** Total concurrent DSQL connections ≈
 > `table_parallelism × batch_parallelism` (the default 4 × 8 = 32). DSQL allows up
@@ -436,7 +441,8 @@ in a measured payments+orders load, **4 vCPU ran ~3.8× faster than the 0.5 vCPU
 (512) default** on the same data. Use **0.5–1 vCPU for evaluation**, but **2–4 vCPU
 for a real large-scale Full Load**. Beyond ~4 vCPU returns diminish for a single large
 table — the reader is one thread and tops out near one core, so the next lever is
-sharding the read across PK ranges (a future enhancement), not more vCPU.
+splitting its read across primary-key ranges (*Reader shards per large table*, §7.2;
+MySQL in Full load + CDC only), not more vCPU.
 
 **Memory** (`ContainerMemory`) is a Fargate **hard limit** — exceed it and the kernel
 OOM-kills the task with *no app shutdown* (only a CloudWatch spike + an ELB timeout).
@@ -538,8 +544,11 @@ undo/disk growth and slower reads — and with 16 tables in flight the **oldest*
 read view sets the purge horizon. Mitigations:
 lower parallelism (fewer open read views); **shard the biggest tables by PK range**
 into separate, shorter runs (there's no page-size knob, so shortening any one
-snapshot means splitting the table set); and monitor History List Length, provisioning
-free-space headroom before starting so undo growth can't trip a storage-full condition.
+snapshot means splitting the table set) — in Full load + CDC, *Reader shards per large
+table* splits a large table's read into ranges whose read views each last only while
+their own range is read, at the cost of concurrent reads of that table (§7.2); and
+monitor History List Length, provisioning free-space headroom before starting so undo
+growth can't trip a storage-full condition.
 
 ### What about reading from a read replica?
 

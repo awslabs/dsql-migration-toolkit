@@ -358,8 +358,8 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブルあたりの処理中の `INSERT … ON CONFLICT` バッチ数。大きいほどスループット↑、OCC（40001）衝突↑。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000`（≤3000） | バッチ書き込みあたりの行数。DSQL のトランザクションごとの 3000 行制限で上限。 |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（オン） | 先読み prefetch キュー（リーダースレッドが bounded キューを満たす間に書き込みが進行）。オンのままに。A/B ベンチで pre-prefetch 経路を再現する場合のみ `0`。 |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（オフ、≤8） | 大きな単一整数 PK テーブルの読み取りを K 個の並行リーダーに分割。効果があることは稀（リーダーが GIL バウンド）— マニュアル §7.2 参照。 |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | この推定行数以上のテーブルのみリーダーシャーディング対象；小さいテーブルは常に単一リーダー。 |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（オフ、≤8） | 大きなテーブルの読み取りを整数の先頭主キー列で K 個の区間に分け、区間ごとに別のワーカープロセスが読む（区間ごとに `FULL_LOAD_TABLE_PARALLELISM` の slot を 1 つ）。PostgreSQL: すべての実行。MySQL: Full load + CDC でのみ、ユニークキーがすべてその列を含むテーブルだけ。マニュアル §3.8 / §7.2 参照。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | この推定行数以上のテーブルのみリーダーシャーディング対象；小さいテーブルは単一リーダー。 |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |

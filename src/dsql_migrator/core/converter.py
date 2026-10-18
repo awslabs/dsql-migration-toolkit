@@ -2143,6 +2143,87 @@ def parse_target_primary_key(create_ddl: str, *, for_exclusion: bool = False) ->
     return []
 
 
+# ``CREATE [UNIQUE] INDEX ASYNC``: sqlglot reads the statement only without ASYNC.
+_INDEX_ASYNC_RE = re.compile(r"\bINDEX\s+ASYNC\b", re.IGNORECASE)
+_UNIQUE_WORD_RE = re.compile(r"\bUNIQUE\b", re.IGNORECASE)
+
+
+def _plain_key_columns(nodes) -> "Optional[list[str]]":
+    """The column names of a key's elements as PostgreSQL stores them, or ``None`` when one
+    is an expression (or the list is empty): such a key cannot be judged by its columns."""
+    names: list[str] = []
+    for node in nodes or ():
+        node = node.this if isinstance(node, exp.Ordered) else node
+        if not isinstance(node, (exp.Column, exp.Identifier)) or not node.name:
+            return None
+        names.append(_folded_name(node))
+    return names or None
+
+
+def parse_target_unique_keys(
+    target_ddl: str, index_ddls: "Sequence[str]" = ()
+) -> "Optional[list[list[str]]]":
+    """Every key Aurora DSQL enforces as unique on a table, per its APPLIED DDL (G137).
+
+    The primary key (a named ``CONSTRAINT ... PRIMARY KEY`` too), each ``UNIQUE``
+    constraint of the ``CREATE TABLE`` (column-level and table-level, named or not) and each
+    ``CREATE UNIQUE INDEX [ASYNC]`` of ``index_ddls`` -- a partial one too: it is unique
+    within its predicate -- as column lists, names as PostgreSQL stores them. A plain
+    ``CREATE INDEX`` is no key. ``None`` when any of it cannot be read: the DDL does not
+    parse, declares no primary key, or a unique key holds an expression, or a statement
+    names UNIQUE but does not parse as a unique index. The Full Load's reader-shard guard
+    refuses to split a table then. Pure.
+    """
+    primary = parse_target_primary_key(target_ddl, for_exclusion=True)
+    if not primary:
+        return None
+    keys: list[list[str]] = [primary]
+    stripped = _strip_identity_clauses(target_ddl)
+    if _UNIQUE_WORD_RE.search(stripped):
+        try:
+            parsed = sqlglot.parse_one(stripped, read="postgres")
+        except Exception:  # noqa: BLE001 - unreadable -> unknown
+            return None
+        for node in parsed.find_all(exp.UniqueColumnConstraint):
+            owner = node.parent
+            if isinstance(owner, exp.ColumnConstraint) and isinstance(
+                owner.parent, exp.ColumnDef
+            ):
+                keys.append([_folded_name(owner.parent.this)])
+                continue
+            columns = (
+                _plain_key_columns(node.this.expressions)
+                if isinstance(node.this, exp.Schema)
+                else None
+            )
+            if columns is None:
+                return None
+            keys.append(columns)
+    for statement in index_ddls or ():
+        if not _UNIQUE_WORD_RE.search(statement or ""):
+            continue
+        try:
+            parsed = sqlglot.parse_one(
+                _INDEX_ASYNC_RE.sub("INDEX", statement, count=1), read="postgres"
+            )
+        except Exception:  # noqa: BLE001 - unreadable -> unknown
+            return None
+        if not (
+            isinstance(parsed, exp.Create)
+            and str(parsed.args.get("kind") or "").upper() == "INDEX"
+        ):
+            return None
+        if not parsed.args.get("unique"):
+            continue  # a plain index whose text names UNIQUE elsewhere (a literal)
+        index = parsed.this
+        params = index.args.get("params") if isinstance(index, exp.Index) else None
+        columns = _plain_key_columns(params.args.get("columns") if params else None)
+        if columns is None:
+            return None
+        keys.append(columns)
+    return keys
+
+
 def map_mysql_type(mysql_type: str) -> tuple[str, Optional[ConversionWarning]]:
     """Map a MySQL type string to a DSQL type string and optional warning.
 
@@ -12637,6 +12718,7 @@ __all__ = [
     "parse_target_column_types",
     "parse_target_identity_columns",
     "parse_target_primary_key",
+    "parse_target_unique_keys",
     "CompositeKeyError",
     "validate_composite_leading_column",
     "unkeyable_columns",

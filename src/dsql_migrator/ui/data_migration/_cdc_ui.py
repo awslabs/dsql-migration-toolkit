@@ -118,13 +118,20 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_partition_map_worst_case,
     cdc_pre_load_table_list_routes,
     cdc_table_list_refusal,
-    table_picker_remedy,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     format_column_exclude_list,
     format_duration,
     lob_exclusion_candidates,
     per_table_counts_notice_body,
+    SPLIT_READ_HEADER,
+    mysql_reads_may_split,
+    split_later_point_qualifier,
+    split_read_refusal,
+    split_read_tables,
+    split_reload_route,
+    split_route_view,
+    table_list_hold_remedy,
 )
 from dsql_migrator.core.cdc_stack_deployer import is_stable_stack_status
 from dsql_migrator.ui.data_migration._cdc_status import (
@@ -757,6 +764,11 @@ def _render_cdc_source_config_card(
         # an earlier start point preceded it, which its notice then says first.
         recopied=drop_reload_condition_due(migration_state, job),
         recopied_after_start=cdc_started_before_load(migration_state, job),
+        split_refusal=split_start_point_refusal(
+            migration_state, job, seed, source_type, origin=_seed_origin,
+            resumes=resumes_from_offset, job_manager=job_manager,
+        ),
+        split_waiting=bool(_captured_split_tables(migration_state, job)),
     )
 
     # On a restart the connector config below is not what decides the start position (the
@@ -1374,6 +1386,12 @@ def _render_cdc_start_point_card(
     # (:func:`~dsql_migrator.ui.data_migration._cdc_status.cdc_started_before_load`), which
     # the notice then says first (``reload_condition``'s ``started``).
     recopied_after_start: bool = False,
+    # G137 (:func:`split_start_point_refusal`): Start CDC refuses the Manual point this card
+    # resolves -- later than the Full Load's, while CDC captures a table read in parts.
+    split_refusal: Optional[str] = None,
+    # ...and such a table is captured (:func:`_captured_split_tables`): CDC only's re-run goes
+    # through Full load + CDC, since Full load only refuses the switch then.
+    split_waiting: bool = False,
 ) -> None:
     """Render the PRIMARY 'CDC start point' card with an Automatic/Manual choice.
 
@@ -1450,7 +1468,7 @@ def _render_cdc_start_point_card(
     reload_notice = (
         (RELOAD_CONDITION_HEADER, reload_condition(
             getattr(migration_state, "migration_type", None), postgres=is_pg,
-            started=recopied_after_start,
+            started=recopied_after_start, split=split_waiting,
         ))
         if recopied and wm_usable
         else None
@@ -1802,6 +1820,10 @@ def _render_cdc_start_point_card(
         if mode == "manual" and not is_pg:
             if manual_point is not None and not manual_seedable and not locked:
                 _render_gtid_only_notice()
+            elif split_refusal and not locked and newer is None:
+                # G137: Start CDC refuses this later point while it captures a table the Full
+                # Load read in parts -- an error, not the gap warning below.
+                render_notice(ui, tone="error", header=SPLIT_READ_HEADER, body=split_refusal)
             elif (
                 manual_seedable
                 and not locked
@@ -1850,7 +1872,7 @@ def _render_cdc_start_point_card(
                 with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                     ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
                     ui.label(pg_confirm).classes("text-xs text-gray-700 font-mono")  # type: ignore[attr-defined]
-        elif effective_resume is not None and newer is None:
+        elif effective_resume is not None and newer is None and not split_refusal:
             with ui.row().classes("items-center gap-2 no-wrap mt-1"):  # type: ignore[attr-defined]
                 ui.icon("check_circle", color="positive").classes("text-base")  # type: ignore[attr-defined]
                 # The binlog coordinate is what the offset is keyed on, so the confirmation
@@ -3447,6 +3469,12 @@ def _render_cdc_start_button(
         migration_state, _seed, _cdc_source_type(session), origin=_seed_origin,
         job_watermark=watermark,
     )
+    # G137: a Manual point later than the Full Load's, while CDC captures a table it read in
+    # parts -- refused.
+    _split_refusal = split_start_point_refusal(
+        migration_state, job, _seed, _cdc_source_type(session), origin=_seed_origin,
+        resumes=resumes_from_offset, job_manager=job_manager,
+    )
     # Why the last run's connector stopped, kept across Stop CDC (the runbook's first step)
     # until the next Start: "Ready to resume" alone would invite the Start that stops the
     # same way. A past event the operator can act on, not a block -> warning.
@@ -3547,6 +3575,9 @@ def _render_cdc_start_button(
         render_notice(
             ui, tone=_newer[0][0], icon=_newer[0][1], header=_newer[0][2], body=_newer[0][3]
         )
+    elif _split_refusal:
+        # G137: the same for a start that would leave a table read in parts torn.
+        render_notice(ui, tone="error", header=SPLIT_READ_HEADER, body=_split_refusal)
     elif is_pg and (resumes_from_offset or _pg_start_rolled_back(migration_state)):
         # PostgreSQL: worded like the start line (G25) -- the stack records that its
         # connectors were started, not that its source connector streamed. A Start whose
@@ -3850,8 +3881,9 @@ def _render_cdc_start_button(
     # parameter too -- also said before the click.
     _tables_refusal = cdc_table_list_refusal([t.name for t in _captured_now], deploy=False)
     if _tables_refusal:
-        _tables_refusal = f"{_tables_refusal} " + table_picker_remedy(
-            _table_lock(migration_state, job_manager, session)
+        _tables_refusal = _table_list_hold_remedy(
+            _tables_refusal, migration_state, job_manager,
+            _table_lock(migration_state, job_manager, session),
         )
     # A source column the target certainly lacks: the sink would dead-letter every change
     # to it (42703). Checked HERE as well as at Deploy, because Attach (which moves no data)
@@ -3928,6 +3960,10 @@ def _render_cdc_start_button(
         # G25 (A2): the notice above says why, and the route.
         start_btn.props("disable")
         start_btn.tooltip(_newer[1])
+    elif _split_refusal:
+        # G137: the notice above says why, and the route.
+        start_btn.props("disable")
+        start_btn.tooltip(_split_refusal)
     elif not ready:
         start_btn.props("disable")
         ui.label(  # type: ignore[attr-defined]
@@ -4617,7 +4653,7 @@ def _deploy_table_list_refused(refusal: str, migration_state, job_manager, sessi
     routes of the Full Load card's warning (:func:`cdc_pre_load_table_list_routes`) in place of
     the refusal's own remedy, which they repeat: the load may still take every table, and the
     tables CDC does not need be unticked after it, before CDC starts (G16) -- the deploy itself
-    stays refused. Otherwise the table picker's (:func:`table_picker_remedy`) after it."""
+    stays refused. Otherwise the table picker's after it (:func:`_table_list_hold_remedy`)."""
     from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
 
     lock = _table_lock(migration_state, job_manager, session)
@@ -4627,8 +4663,27 @@ def _deploy_table_list_refused(refusal: str, migration_state, job_manager, sessi
         and not _cdc_started_for_migration(migration_state, job_manager)
     ):
         fact = refusal.removesuffix(CDC_TABLE_LIST_REMEDY).rstrip()
-        return f"{fact} " + cdc_pre_load_table_list_routes(lock)
-    return f"{refusal} " + table_picker_remedy(lock)
+        from dsql_migrator.ui.data_migration._models import session_source_type
+
+        return f"{fact} " + cdc_pre_load_table_list_routes(
+            lock, split=mysql_reads_may_split(session_source_type(session))
+        )
+    return _table_list_hold_remedy(refusal, migration_state, job_manager, lock)
+
+
+def _table_list_hold_remedy(refusal: str, migration_state, job_manager, lock) -> str:
+    """A table-list refusal after the load with the table picker's remedy (``lock`` is its
+    lock reason), as Deploy, Start CDC and Retry CDC say it. While CDC captures a table the
+    Full Load read in parts that still waits for CDC's replay (G137), that table is named as
+    one that cannot be deselected and Full load only is not offered
+    (:func:`~dsql_migrator.ui.data_migration._models.table_list_hold_remedy`)."""
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    _split = _captured_split_tables(migration_state, job)
+    return table_list_hold_remedy(
+        refusal, lock, _split,
+        split_route_view(migration_state, job_manager, job) if _split else job,
+        cdc_only=_split_cdc_only(migration_state),
+    )
 
 
 def _table_set_open(migration_state, job_manager, session) -> bool:
@@ -5547,6 +5602,103 @@ def _diagnose_for_dialog(migration_state, session):
         return "", "", ""
     return diagnosis.reason, diagnosis.mode, (diagnosis.routed_cidr_warning or "")
 
+
+def _captured_split_tables(migration_state, job) -> "list[str]":
+    """The tables CDC captures (the watermark's covered tables still selected) that the Full
+    Load record ``job`` marks as read in parts, each from its own snapshot, while their copy
+    still waits for CDC's replay (G137, ``_models.split_read_tables``: until a CHECKSUM match
+    or a recreate clears the mark -- a submitted Start CDC, or a stream, does not), in record
+    order. Pure."""
+    names = split_read_tables(job)
+    if not names:
+        return []
+    captured = cdc_capture_names(migration_state, _cdc_watermark(job, migration_state))
+    return [n for n in names if captured is None or n in captured]
+
+
+def _split_cdc_only(migration_state) -> bool:
+    """Is this CDC only, whose route to a reload goes through Full load + CDC (G137)?"""
+    return getattr(migration_state, "migration_type", None) is MigrationType.CDC_ONLY
+
+
+def _split_later_qualifier(migration_state, job_manager, job) -> str:
+    """What a start-point or GTID remedy naming Fetch current position says after it while CDC
+    captures a table the Full Load read in parts (G137,
+    :func:`~dsql_migrator.ui.data_migration._models.split_later_point_qualifier`, its route
+    over the view the Full Load step renders), else "". Pure apart from the CDC-state job
+    reads."""
+    names = _captured_split_tables(migration_state, job)
+    if not names:
+        return ""
+    return split_later_point_qualifier(
+        names, split_route_view(migration_state, job_manager, job),
+        cdc_only=_split_cdc_only(migration_state),
+    )
+
+
+def split_start_point_refusal(
+    migration_state,
+    job,
+    seed,
+    source_type,
+    *,
+    origin: str,
+    resumes: bool = False,
+    job_manager=None,
+) -> Optional[str]:
+    """Why Start CDC must refuse ``seed`` (G137), or ``None``.
+
+    A MySQL Manual start point -- one entered, or Fetch current position's -- later than the
+    Full Load's start point, while CDC captures a table that load marks as read in parts
+    (:func:`_captured_split_tables`: until a CHECKSUM match or a recreate clears the mark;
+    a Start CDC submitted before, which may never have streamed, does not): only a replay
+    from a point no later than every read makes that copy consistent. Automatic, or a Manual
+    point at or before the Full Load's start point, is that replay and is never refused, and
+    a start that resumes a committed offset (a stopped stream) seeds nothing (``resumes``).
+    The refusal names the tables, the no-cost way (Automatic, or a point at or before the
+    Full Load's) and the reload route over the view the Full Load step renders
+    (:func:`~dsql_migrator.ui.data_migration._models.split_read_refusal`). Pure apart from
+    the CDC-state job reads.
+    """
+    if source_type is SourceType.POSTGRES or origin != "manual" or resumes:
+        return None
+    names = _captured_split_tables(migration_state, job)
+    if not names:
+        return None
+    wm = getattr(job, "watermark", None)
+    point_file = getattr(seed, "binlog_file", None)
+    point_pos = getattr(seed, "binlog_position", None)
+    wm_file, wm_pos = getattr(wm, "binlog_file", None), getattr(wm, "binlog_position", None)
+    if (
+        point_file
+        and point_pos is not None
+        and wm_file
+        and wm_pos is not None
+        and offset_already_at_or_past(
+            {"file": wm_file, "pos": int(wm_pos)}, {"file": point_file, "pos": int(point_pos)}
+        )
+    ):
+        return None
+    point = (
+        f"{point_file}:{point_pos}" if point_file and point_pos is not None else "this point"
+    )
+    return split_read_refusal(
+        names,
+        operation=(
+            f"Starting CDC from {point}, later than the Full Load's start point "
+            f"({wm_file}:{wm_pos}),"
+        ),
+        then="start CDC from that point",
+        job=split_route_view(migration_state, job_manager, job),
+        cdc_only=_split_cdc_only(migration_state),
+        alternative=(
+            "Set the CDC start point back to Automatic (the Full Load's start point), or "
+            f"enter a Manual point at or before {wm_file}:{wm_pos}: CDC then replays every "
+            "read, with no reload."
+        ),
+    )
+
+
 def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[str]:
     """Read-only: is the start point's binary log still on the source? (blocking)
 
@@ -5589,15 +5741,30 @@ def _probe_binlog_resume_gap(migration_state, job_manager, session) -> Optional[
             engine.dispose()
     except Exception:  # noqa: BLE001 - advisory pre-flight; unknown never blocks
         return None
+    # G137: the captured tables the Full Load read in parts -- no manual route for them before
+    # their reload, which the reason names by the control the Full Load step shows.
+    _split = _captured_split_tables(migration_state, job)
     reason = binlog_resume_gap_reason(
-        watermark_file, retained, manual=(origin == "manual")
+        watermark_file, retained, manual=(origin == "manual"),
+        split_tables=_split,
+        split_route=(
+            split_reload_route(
+                _split, split_route_view(migration_state, job_manager, job),
+                cdc_only=_split_cdc_only(migration_state),
+            )
+            if _split
+            else ""
+        ),
     )
     if reason and origin != "manual":
         # CDC only has no Full Load step: the remedy's re-run needs the type switch the other
-        # Drop & reload routes name (G27; empty for Full load + CDC).
+        # Drop & reload routes name (G27; empty for Full load + CDC) -- to Full load + CDC
+        # while a table read in parts waits for CDC's replay (G137).
         from dsql_migrator.ui.cdc_start_point_gate import drop_and_reload_rerun
 
-        _note = drop_and_reload_rerun(getattr(migration_state, "migration_type", None))[1]
+        _note = drop_and_reload_rerun(
+            getattr(migration_state, "migration_type", None), split=bool(_split)
+        )[1]
         if _note:
             reason = f"{reason}{_note.rstrip()}."
     if reason and cdc_start_rolled_back(migration_state):
@@ -5908,7 +6075,9 @@ def _reload_condition_notice(migration_state, job, session) -> Optional[tuple]:
     the Full Load's watermark -- MySQL: it seeds that watermark and resumes no committed offset;
     PostgreSQL: it streams from that Full Load's slot on a stack never started -- when that Full
     Load is not this migration's first copy (:func:`drop_reload_condition_due`); else None. The
-    start-point card states it from its own state; the Start CDC dialog uses this. Pure."""
+    start-point card states it from its own state; the Start CDC dialog uses this. Its CDC only
+    re-run goes through Full load + CDC while a captured table read in parts waits for CDC's
+    replay (G137). Pure apart from the CDC-state job reads."""
     if not drop_reload_condition_due(migration_state, job):
         return None
     source_type = _cdc_source_type(session)
@@ -5936,6 +6105,7 @@ def _reload_condition_notice(migration_state, job, session) -> Optional[tuple]:
         getattr(migration_state, "migration_type", None),
         postgres=source_type is SourceType.POSTGRES,
         started=cdc_started_before_load(migration_state, job),
+        split=bool(_captured_split_tables(migration_state, job)),
     )
 
 
@@ -6955,6 +7125,12 @@ async def _open_cdc_start_dialog(
                         origin=_g_origin,
                         migration_type=getattr(migration_state, "migration_type", None),
                         rolled_back=_rolled_back,
+                        # G137: a fetched point is refused while a table read in parts is
+                        # captured.
+                        split_qualifier=_split_later_qualifier(
+                            migration_state, job_manager,
+                            _current_job(job_manager, migration_state.job_id),
+                        ),
                     )
                 try:
                     _sp_seed, _sp_origin, _sp_facts, _sp_mode, _sp_tables = (
@@ -6993,6 +7169,10 @@ async def _open_cdc_start_dialog(
                         # G25: a start point after the change needs new CDC topics on a
                         # stack whose connectors were started.
                         streamed=_rolled_back or cdc_stack_has_streamed(migration_state),
+                        split_qualifier=_split_later_qualifier(
+                            migration_state, job_manager,
+                            _current_job(job_manager, migration_state.job_id),
+                        ),
                     )
             # CDC only: list the overlay ALTERs Start CDC runs before any connector (one
             # live read). Full load + CDC reads nothing here: after the load they are
@@ -8530,6 +8710,20 @@ def _start_cdc_deploy(
             ui, tone="error", icon=_newer[0][1], header=_newer[0][2], body=_newer[0][3]
         )
         return
+    # G137 backstop (the card and the Start button say it first; Retry CDC comes here
+    # directly): a Manual point later than the Full Load's while a table read in parts is
+    # captured.
+    _split_refusal = split_start_point_refusal(
+        migration_state, job, seed, _cdc_source_type(session), origin=seed_origin,
+        resumes=cdc_start_resumes(migration_state, seed, _cdc_source_type(session)),
+        job_manager=job_manager,
+    )
+    if _split_refusal:
+        render_notice(ui, tone="error", header=SPLIT_READ_HEADER, body=_split_refusal)
+        return
+    # ...and what the worker's GTID / start-point refusals add after a Fetch current position
+    # remedy while such a table is captured.
+    _split_qualifier = _split_later_qualifier(migration_state, job_manager, job)
     tables_for_config = _cdc_tables_for_config(migration_state, inventory, watermark)
     # ONE computation for the preview, Start and Deploy (cdc_capture_exclusions): the
     # EFFECTIVE set (key columns dropped) plus the STORED generated columns of the captured
@@ -8598,8 +8792,10 @@ def _start_cdc_deploy(
             ui,
             tone="error",
             header=CDC_TABLE_LIST_HEADER,
-            body=f"{_tables_refusal} "
-            + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
+            body=_table_list_hold_remedy(
+                _tables_refusal, migration_state, job_manager,
+                _table_lock(migration_state, job_manager, session),
+            ),
         )
         return
     _missing = missing_column_block_reason(
@@ -8956,6 +9152,7 @@ def _start_cdc_deploy(
                     origin=seed_origin,
                     migration_type=getattr(migration_state, "migration_type", None),
                     rolled_back=_rolled_back,
+                    split_qualifier=_split_qualifier,
                 )
                 if _gtid_activity is not None:
                     _log_cdc_event(
@@ -8986,6 +9183,7 @@ def _start_cdc_deploy(
                 # G25: a start point after the change needs new CDC topics on a stack whose
                 # connectors were started (a resume, or a retry after a rolled-back Start).
                 streamed=_rolled_back or cdc_stack_has_streamed(migration_state),
+                split_qualifier=_split_qualifier,
             )
             if _activity is not None:
                 _log_cdc_event(_activity[0], status=_activity[1], detail=_activity[2])
@@ -10182,7 +10380,9 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
     fl_cdc_pending_additions,
     cdc_addition_block_reason,
     LOCK_TIP_RULE,
+    LOCK_TIP_SPLIT,
     TREE_HINT_FL_CDC,
+    TREE_HINT_SPLIT,
     CDC_ONLY_NARROWING_SENTENCE,
     R4_FL_CDC_NARROWING,
     R1_FL_CDC_SENTENCE,

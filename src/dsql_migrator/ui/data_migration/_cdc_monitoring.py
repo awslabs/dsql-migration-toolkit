@@ -33,6 +33,7 @@ from dsql_migrator.ui.data_migration._cdc_state import (
     cdc_streaming_started,
 )
 from dsql_migrator.ui.data_migration._models import (
+    SPLIT_SET_FIXED,
     assess_dlq_health,
     build_lag_chart_option,
     build_migration_table_status,
@@ -5129,6 +5130,18 @@ LOCK_TIP_RULE = (
     "Unselected by an exclude table rule — delete the rule in Change & reload to select it "
     "again."
 )
+# G137: the lock-icon tooltip on a TICKED leaf that cannot be unticked now -- a table the Full
+# Load read in parts (MySQL), whose copy is consistent only once CDC replays it: only a reload
+# with one reader that recreates it lets it be unticked (a CHECKSUM match proves the replay,
+# but CDC's first Start fixes the table set for good: SPLIT_SET_FIXED).
+LOCK_TIP_SPLIT = (
+    "Read in parts by the Full Load (Reader shards per large table), each part from its own "
+    "snapshot: its copy is consistent only once CDC replays it from the Full Load's start "
+    "point, so it stays selected until it is reloaded with one reader. To untick it, set "
+    "Reader shards per large table to 1 in Settings and reload it first (Retry unfinished "
+    "tables while it is unfinished, else Reload specific tables: with one reader either drops "
+    "and recreates it). " + SPLIT_SET_FIXED
+)
 # How a table added after the Full Load gets loaded (G17). Retry unfinished tables loads it
 # under the Full Load's start point -- except a MySQL table that Full Load recorded no
 # start-point definition for (a Full Load from an earlier version, a table converted after
@@ -5142,6 +5155,12 @@ TREE_HINT_FL_CDC = (
     f"load is loaded on the Full Load step first ({ADDED_TABLE_LOAD_ROUTE}), and CDC then "
     "captures it with the other tables. A lock marks a table an exclude table rule "
     "unselected."
+)
+# Appended while the Full Load read a table in parts (G137, LOCK_TIP_SPLIT).
+TREE_HINT_SPLIT = (
+    " A lock on a ticked table marks one the Full Load read in parts: it stays selected "
+    "until it is reloaded with one reader (Reader shards per large table set to 1, then Drop "
+    "& reload). " + SPLIT_SET_FIXED
 )
 # Appended to CDC only's table-set lock while Full load + CDC could still change the set
 # (CDC never started for this migration and the type may change): the non-destructive
@@ -5245,11 +5264,21 @@ class TableSetAddLock:
     CDC stream columns its loaded rows hold as NULL, or load and stream an uncovered one
     with every column (deleting the rule in Change & reload applies the column rules, so the
     popup is not refused for it). ``covered`` also keeps the stored tables a write cannot
-    list, and splits the rule refusal. Hashable (a popup memo key).
+    list, and splits the rule refusal. ``split_held`` (G137) -- tables the Full Load read in
+    parts, each from its own snapshot (MySQL, ``_models.split_read_tables``: until a CHECKSUM
+    match or a recreate clears the record): their copy is consistent only once CDC replays
+    them, so neither the tree nor a table rule may UNSELECT one. ``split_unfinished`` (the
+    held tables that did not finish) and ``others_open`` (another table did not finish), both
+    over the view the Full Load step renders (``_models.split_route_view``), word the
+    refusal's route by the control that step shows (``_models.split_reload_route``).
+    Hashable (a popup memo key).
     """
 
     covered: frozenset
     rule_held: frozenset = frozenset()
+    split_held: frozenset = frozenset()
+    split_unfinished: frozenset = frozenset()
+    others_open: bool = False
 
     def code(self, name: str, *, tree: bool) -> "Optional[str]":
         """Why ``name`` cannot be ticked now -- ``"rule"`` (tree only) -- or ``None`` when
@@ -5257,6 +5286,34 @@ class TableSetAddLock:
         if tree and name in self.rule_held:
             return "rule"
         return None
+
+    def removal_blocked(self, names: "Iterable[str]") -> "list[str]":
+        """The ``names`` this lock keeps from being unselected (G137: read in parts), in
+        input order (once each)."""
+        return [n for n in dict.fromkeys(names or ()) if n in self.split_held]
+
+    def removal_refusal(self, names: "Iterable[str]", *, tree: bool) -> "Optional[str]":
+        """The refusal of unselecting the refused ``names`` (``tree``: an untick, else a table
+        rule's unselect), or ``None`` when none is refused. Only the reload route: a CHECKSUM
+        match waits for CDC's replay, and CDC's first Start fixes the table set for good
+        (``checksum_way_out=False``, ``_models.SPLIT_SET_FIXED``)."""
+        from dsql_migrator.ui.data_migration._models import split_read_refusal
+
+        blocked = self.removal_blocked(names)
+        if not blocked:
+            return None
+        it = "it" if len(blocked) == 1 else "them"
+        verb = "untick" if tree else "unselect"
+        mine = frozenset(blocked)
+        return split_read_refusal(
+            blocked, operation=f"{verb.capitalize()}ing {it}", then=f"{verb} {it}",
+            # Another table unfinished: a held one outside this refusal, or any other.
+            states=(
+                self.split_unfinished & mine,
+                self.others_open or bool(self.split_unfinished - mine),
+            ),
+            checksum_way_out=False,
+        )
 
     def blocked(self, names: "Iterable[str]", *, tree: bool) -> "list[str]":
         """The ``names`` this lock refuses, in input order (once each)."""
@@ -5285,12 +5342,15 @@ class TableSetAddLock:
         return " ".join(parts)
 
     def node_flags(self, listed: "Iterable[str]", ticked: "Iterable[str]") -> "dict[str, str]":
-        """``{table: code}`` for the UNTICKED ``listed`` tables that cannot be ticked now --
-        a ticked table is never flagged, so an untick is always possible."""
+        """``{table: code}`` for the ``listed`` tables whose checkbox cannot change now: an
+        UNTICKED one that cannot be ticked (its add-lock code), and a TICKED one read in
+        parts (``"split"``, G137), which cannot be unticked -- any other ticked table can."""
         ticked_set = set(ticked or ())
         flags: "dict[str, str]" = {}
         for name in listed or ():
             if name in ticked_set:
+                if name in self.split_held:
+                    flags[name] = "split"
                 continue
             code = self.code(name, tree=True)
             if code is not None:
@@ -5307,7 +5367,13 @@ def table_set_add_lock(
     covered set (:func:`~dsql_migrator.ui.data_migration._models.cdc_covered_names`) the
     lock keeps and splits by. ``job`` -- see :func:`_fl_cdc_narrowing_job`. Pure apart from
     one job read; no AWS I/O."""
-    from dsql_migrator.ui.data_migration._models import MigrationType, cdc_covered_names
+    from dsql_migrator.ui.data_migration._models import (
+        MigrationType,
+        cdc_covered_names,
+        split_read_tables,
+        split_route_states,
+        split_route_view,
+    )
 
     if getattr(migration_state, "migration_type", None) is not MigrationType.FULL_LOAD_AND_CDC:
         return None
@@ -5317,7 +5383,21 @@ def table_set_add_lock(
         return None
     getter = getattr(migration_state, "rule_excluded_tables", None)
     rule_held = frozenset(getter()) if callable(getter) else frozenset()
-    return TableSetAddLock(covered=covered, rule_held=rule_held)
+    # G137: the tables read in parts off the record; their route by the view the Full Load
+    # step renders (its buttons).
+    split = split_read_tables(record)
+    unfinished, others_open = (
+        split_route_states(split, split_route_view(migration_state, job_manager, record))
+        if split
+        else (frozenset(), False)
+    )
+    return TableSetAddLock(
+        covered=covered,
+        rule_held=rule_held,
+        split_held=frozenset(split),
+        split_unfinished=unfinished,
+        others_open=others_open,
+    )
 
 
 # --- G17: the tables a Full load + CDC set gained after its Full Load ---------------------

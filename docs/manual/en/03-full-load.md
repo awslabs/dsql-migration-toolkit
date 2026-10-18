@@ -88,7 +88,8 @@ repeatable-read snapshot transaction (MySQL: `START TRANSACTION WITH CONSISTENT
 SNAPSHOT` on InnoDB; PostgreSQL: a `REPEATABLE READ` transaction), so:
 
 - a whole table is **never loaded into RAM** — memory stays bounded by one page;
-- the read is a **single consistent snapshot** even as the live source changes.
+- the read is a **single consistent snapshot** even as the live source changes (a MySQL
+  table read in parts: one snapshot per part, [§3.8](#38-multi-process-parallelism-gil-bypass)).
 
 **MySQL reads at `REPEATABLE READ`, whatever the source's own setting.** Every MySQL
 source session the tool opens first runs `SET SESSION TRANSACTION ISOLATION LEVEL
@@ -465,32 +466,108 @@ table shard) loads in its own OS process with its own GIL and its own CPU core.
 - **Small tables** (non-shardable or below the row threshold): 1 worker process
   each — same as before, just in a separate process instead of a thread.
 - **Large tables** whose leading PK column is an integer (a single integer PK, or a
-  composite PK with an integer leading column such as `(tenant_id, id)`): split into K
-  PK-range shards, each loaded by its own worker process from a disjoint slice of
-  the source. This reader-range sharding is **off by default** (`full_load_reader_shards=1`);
-  enable it with `FULL_LOAD_READER_SHARDS` > 1, and it only engages on this multi-process
-  path (`TABLE_PARALLELISM` above 1) where every shard reads one shared snapshot — a
-  PostgreSQL source. A MySQL table always uses one reader: its shards
-  would each read their own snapshot, which only a run beside a streaming CDC sink could
-  reconcile, and no Full Load runs while CDC streams
-  ([§3.5](#35-the-watermark--the-bridge-to-cdc)).
+  composite PK with an integer leading column such as `(tenant_id, id)`): their read can be
+  split into K primary-key ranges, each loaded by its own worker process from a disjoint
+  slice of the source. This reader-range sharding is **off by default**
+  (`full_load_reader_shards=1`; *Reader shards per large table* in **Settings → Full Load**),
+  and it only engages on this multi-process path (`TABLE_PARALLELISM` above 1), for a table
+  of at least `SHARD_MIN_ROWS` estimated rows. K is the setting, at most 32 ÷
+  `TABLE_PARALLELISM`.
+  - **PostgreSQL**: in any run. Every range imports one shared snapshot, so the copy is one
+    point in time, as with one reader.
+  - **MySQL**: only in **Full load + CDC** whose start point has a binlog file and position,
+    and only a table whose every unique key on Aurora DSQL includes the leading key column
+    (the primary key, each UNIQUE constraint and UNIQUE index of the applied DDL and, for an
+    append, each unique index of the live table). MySQL cannot share a snapshot, so each range
+    reads its own: a row whose key changes during the read can be copied twice or not at all,
+    and a transaction across two ranges half applied, with equal row counts. CDC, started
+    after the load from the start point taken before any read
+    ([§3.5](#35-the-watermark--the-bridge-to-cdc)), replays every change since then and
+    corrects them, as it corrects tables read at different times. A unique key without the
+    leading column (a `UNIQUE (email)`) would see a row's two copies, so such a table keeps
+    one reader. **Full load only** reads every MySQL table with one reader: nothing would
+    correct a split copy.
+  - An append table whose applied primary key differs from the source's is split only while
+    the live table's key equals the applied one; otherwise it loads as one unit, which
+    recreates an empty table with the applied key or refuses the load, as with one reader.
+  - A MySQL range is never re-read in place after a lost source connection: a second
+    snapshot in one range could break a unique key that includes the leading column (a
+    `(tenant_id, email)`). The range fails, the table is *Failed* with that reason (*range 2
+    of 4*), and **Retry unfinished tables** loads it again. A PostgreSQL range re-reads its
+    shared snapshot.
+  - With Reader shards and `TABLE_PARALLELISM` both above 1, the activity log says, for each
+    table large enough to split (an integer leading key column and at least `SHARD_MIN_ROWS`
+    estimated rows), *read in K primary-key ranges* or *read with one reader* and why, and
+    the Full Load table shows *read in K parts* under a split table's name.
 - **All work units share one bounded pool** — `table_parallelism` controls the
-  total number of concurrent worker processes.
+  total number of concurrent worker processes; each range takes one slot.
 
 ```
-ProcessPoolExecutor(max_workers=table_parallelism)
-  ├─ customers (small)        → 1 worker
-  ├─ orders (9M, int PK)      → 2 shard workers
-  ├─ payments (9M, int PK)    → 2 shard workers
-  └─ order_items (33.6M, int PK) → 3 shard workers
-                                    ───────────────
-                                    8 workers = 8 cores
+ProcessPoolExecutor(max_workers=table_parallelism)     e.g. 8
+  ├─ customers (small)             → 1 work unit
+  ├─ orders (9M, int PK)           → K = 4 range units
+  └─ order_items (33.6M, int PK)   → K = 4 range units
+                                     at most 8 units run at once,
+                                     one source reader each
 ```
+
+### A table read in parts needs CDC's replay (MySQL)
+
+Until CDC has replayed it, a MySQL table read in parts is torn, so every route that would take
+it out of that replay is refused with the table's name and the way that ends the refusal.
+Set *Reader shards per large table* to 1 in Settings and reload the table (one reader, one
+snapshot) through the control the Full Load step shows for it — **Retry unfinished tables**
+while it is unfinished, **Reload specific tables** once every table has loaded — then do the
+operation. Full load only and a later start point have a second way: once CDC has replayed
+the table, run Validation in **CHECKSUM** mode with *Fast sweep* off: a match proves the copy
+and ends the refusal. Unticking the table has only the reload, before CDC starts: the replay
+needs CDC started, and from CDC's first Start the table set is fixed (only Start over changes
+it, [§13.7](13-excluding-tables-and-columns.md)). The control follows the tables the step
+lists now: a table ticked since the load and still to load counts as unfinished, one unticked
+since does not count.
+
+- **Unticking it** in the table list after the load, or a table rule in *Exclude tables &
+  columns* that unselects it: its checkbox is locked, with the reason on the lock icon.
+- **Switching the migration type to Full load only** after the load (from CDC only too: there
+  the route goes through Full load + CDC, whose Full Load step reloads it).
+- **Start CDC from a later start point**: a Manual position, typed or from *Fetch current
+  position*, later than the Full Load's watermark — the purged-binlog remedy's manual route
+  too, and the start-point and GTID remedies that suggest *Fetch current position* say so.
+  Automatic, or a Manual point at or before the watermark, replays every read and is never
+  refused, nor is a Start that resumes a stopped stream; the refusal names that way first.
+- Before the load, the *Too many tables for one CDC pipeline* route (load every table, then
+  untick the ones CDC does not need) says so when Reader shards and `TABLE_PARALLELISM` are
+  both above 1. After the load, the same hold on Deploy CDC infrastructure, Start CDC and
+  Retry CDC names such a table as one that cannot be deselected and does not offer Full
+  load only.
+
+The table stays marked until one of two things clears the mark: a load that recreates it (a
+**Drop & reload**), or a Validation whose **CHECKSUM** comparison matches it and started after
+the table's last load ended — a ROW_COUNT run, or a CHECKSUM that *Fast sweep* skipped because
+the counts agreed, does not. An Append, a retry that fails or stops, or a load that reads it
+as one unit keeps its rows from the parts on Aurora DSQL, so it keeps the mark; a table whose
+parts provably wrote no row (none ran, or none read a row before it stopped or failed) is not
+marked. So a Retry or Reload that reads with one reader drops and reloads such a table, with
+rows or empty, whatever the Append / Drop & reload choice says (the dialog says why); with
+Reader shards still above 1, the reload reads it in parts again and an Append is kept. A
+re-run of every table (**Re-run Full Load**, or **Re-run all tables**) drops and reloads such
+a table too, whatever the choice and the Reader shards setting: it takes a new start point,
+and CDC from that point never replays the changes made before it, so an Append would keep the
+rows read in parts as they are.
+
+A Start CDC, even one that streamed, does not end the refusals: the tool cannot tell from it
+whether CDC replayed the table. After a Start that never streamed (the worker refused it, or a
+connector failed), start CDC again from **Automatic** (or a Manual point at or before the Full
+Load's watermark): that is the replay, and it is never refused. Once CDC has caught up, the
+CHECKSUM match ends the Full load only and later-start-point refusals; from the first Start
+on, the table set is fixed anyway ([§13.7](13-excluding-tables-and-columns.md)).
 
 ### Tuning it
 
-For a large migration, set the worker count to the task's vCPU count — the loader
-distributes the pool slots between whole-table workers and shard workers itself. The
+For a large migration, set the worker count to the task's vCPU count — whole-table units and
+range units queue for the same slots. Reader shards help when a few large tables would leave
+slots idle, at the cost of concurrent reads of the same table
+([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)). The
 knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`), their limits, and how
 they interact with source load live together in
 [Chapter 7 §7.2 — Tuning parallelism](07-performance-and-tuning.md#72-tuning-parallelism);

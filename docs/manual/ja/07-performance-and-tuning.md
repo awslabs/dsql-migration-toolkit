@@ -156,19 +156,23 @@ Full Load と Validation はアプリの環境変数で、CDC は CloudFormation
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | テーブルごとに進行中の `INSERT … ON CONFLICT` バッチ数。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | バッチ書き込みごとの行数 (DSQL の 3000 行上限でハードキャップ)。 |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（有効） | 有効/無効 | 先読み prefetch キュー（§7.1）。**有効のままに** — A/B ベンチマークで pre-prefetch 経路を再現する場合のみ `0`。 |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（無効） | ≤ 8 | リーダー範囲シャーディング: **大きな単一整数 PK** テーブルの読み込みを K 個の並行リーダーに分割（§7.1）。**既定で無効、有効化する価値はまれ** — 下記の注意参照。 |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | この推定行数以上のテーブルのみシャーディング。小さいテーブルは常に単一リーダー。 |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（無効） | ≤ 8 | リーダー範囲シャーディング: **大きな**テーブルの読み取りを整数の先頭主キー列で K 個の区間に分け、区間ごとに別のワーカープロセスが読む（[§3.8](03-full-load.md#38-マルチプロセス並列化gil-バイパス)）。PostgreSQL: すべての実行。MySQL: Full load + CDC でのみ、ユニークキーがすべてその列を含むテーブルだけ。**Settings → Full Load** の *Reader shards per large table* でも設定可。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | この推定行数以上のテーブルのみ分割。小さいテーブルは単一リーダー。 |
 
-> **リーダーシャーディングはいつ効くか? まれ — in-VPC テストでは ~0% だった。** 行ごとの
-> 型変換は純粋 Python で GIL を保持するため、K 個のリーダー*スレッド*でも変換スループットは
-> ~1 コアを超えられません。スレッドシャーディングはリーダーの I/O 待ちを重ねるだけ（それは
-> prefetch が既に行う）で、変換に 2 つ目のコアを追加できません。in-VPC 4vCPU の実測で
-> `reader_shards=4` は単一リーダー比 **~0%** で CPU は ~1 コアに張り付きました。その負荷が
-> リーダーではなく **DSQL 書き込みラウンドトリップ遅延**に律速されていたためです。run が
-> read/convert 飢餓（リーダーが書き込みプールを満たせない）だという*証拠*があるときだけ
-> 上げてください。壁が書き込み側なら代わりに **`BATCH_PARALLELISM`** を上げます。ソース
-> リーダー総数 = `table_parallelism × reader_shards` で、ソース接続上限保護のため上限が
-> かかります。
+> **リーダーシャーディングが役立つときと、その代償。** いくつかの大規模テーブルがロードを占め、
+> pool slot が空いてしまう場合に役立ちます: keyset リーダー 1 つは 1 コアで行を変換しますが、各区間は
+> 自身のプロセスで自身のコアを使って動きます — 8M 行の PostgreSQL ロードで **K = 4 で約 3.8 倍**と
+> 実測。（以前ここで測った ~0% は 1 つの GIL を共有するリーダー*スレッド*によるもので、マルチプロセスの
+> 経路がそれを置き換えました。）各区間が `TABLE_PARALLELISM` の slot を 1 つ使うので、K にかかわらず
+> 同時ソースリーダーは `TABLE_PARALLELISM` 以下（+ PostgreSQL の anchor 接続 1 つ）、DSQL 接続は約
+> `TABLE_PARALLELISM × BATCH_PARALLELISM` に収まり、K の上限は 32 ÷ `TABLE_PARALLELISM` です。
+> **トレードオフ:** K > 1 は空いていた slot を同じテーブルへの同時読み取りに変え、そのテーブルを
+> 読み終えるまで続くので、その間ソースの読み取り速度・DSQL 接続・メモリが最大 `TABLE_PARALLELISM`
+> 倍まで増えます。まだ本番トラフィックを処理しているソースでは、`Threads_running` スロットル
+> （`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`、§7.3）と組み合わせてください。壁が書き込み側なら代わりに
+> **`BATCH_PARALLELISM`** を上げます。MySQL のテーブルは Full load + CDC でのみ分割され、分割して
+> 読んだテーブルを CDC の再生なしに残す経路は拒否されます
+> （[§3.8](03-full-load.md#38-マルチプロセス並列化gil-バイパス)）。
 
 > **接続クォータのガードレール。** DSQL への同時接続数の合計は
 > `table_parallelism × batch_parallelism` におよそ等しくなります (デフォルトは 4 × 8 = 32)。DSQL は
@@ -343,7 +347,8 @@ Fargate デプロイでは、これらは **ECS タスク定義のコンテナ `
 **同一データの 0.5 vCPU (512) デフォルトより 4 vCPU で約 3.8 倍高速** でした。**評価用途は 0.5–1 vCPU**、
 **実際の TB 級 Full Load には 2–4 vCPU** を使ってください。単一の大きなテーブルでは ~4 vCPU を超えると
 効果が逓減します — リーダーは 1 スレッドで 1 コア付近が上限になるため、次のレバーは vCPU 増ではなく
-PK 範囲での読み込みシャーディング（将来の拡張）です。
+その読み取りを主キー区間に分けること（*Reader shards per large table*、§7.2。MySQL は Full load + CDC
+でのみ）です。
 
 **メモリ** (`ContainerMemory`) は Fargate の**ハード制限**です — 超えるとカーネルがタスクを OOM-kill し、
 *アプリの終了ログはありません*（CloudWatch のスパイクと ELB タイムアウトのみ）。テーブルサイズではなく
@@ -428,8 +433,10 @@ Full Load は本番ソースを読み取るため、自然な懸念が生まれ�
 (**History List Length**)のパージを妨げ —
 undo/ディスクの増加と読み取りの遅延 — 16 テーブルが in-flight の場合、**最も古い** read view がパージの地平を
 決めます。緩和策: 並列度を下げる(開いた read view を減らす);**最大のテーブルを PK 範囲で分割** し、別々の短い
-実行にする(ページサイズのノブがないため、個々のスナップショットを短くするにはテーブルセットを分割);History List
-Length を監視し、開始前に空き容量の余裕を確保して undo の増加が storage-full を引き起こさないようにする。
+実行にする(ページサイズのノブがないため、個々のスナップショットを短くするにはテーブルセットを分割) — Full load +
+CDC では *Reader shards per large table* が大きなテーブルの読み取りを区間に分け、各 read view は自身の区間を
+読む間だけ保たれます。その代わりにそのテーブルへの同時読み取りが発生します(§7.2);History List Length を監視し、
+開始前に空き容量の余裕を確保して undo の増加が storage-full を引き起こさないようにする。
 
 ### リードレプリカから読むのはどうか?
 

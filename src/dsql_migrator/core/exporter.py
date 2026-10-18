@@ -1372,14 +1372,14 @@ class TableExporter:
     ) -> list[tuple[Optional[int], Optional[int]]]:
         """Compute up to ``shards`` half-open PK ranges for ``table`` (read-only).
 
-        Opens a short read-only connection and, for a single integer PK, delegates
-        to :func:`compute_pk_shard_ranges` (one ``MIN/MAX`` query). Returns
-        ``[(None, None)]`` — one reader over the whole table, i.e. the current
-        behavior — whenever the table can't or shouldn't be sharded: ``shards <=
-        1``, a composite/non-integer PK, an empty table, or (when ``min_rows`` > 0)
-        a scan-free ``information_schema`` row estimate BELOW ``min_rows`` (small
-        tables don't justify the extra connections/snapshots). Called once per
-        table before the shard readers open their own snapshots.
+        Opens a short read-only connection and, for a PK whose leading column is an
+        integer (single or composite), delegates to :func:`compute_pk_shard_ranges`
+        (one ``MIN/MAX`` query). Returns ``[(None, None)]`` — one reader over the whole
+        table, i.e. the current behavior — whenever the table can't or shouldn't be
+        sharded: ``shards <= 1``, a non-integer leading PK column, an empty table, or
+        (when ``min_rows`` > 0) a scan-free ``information_schema`` row estimate BELOW
+        ``min_rows`` (small tables don't justify the extra connections/snapshots).
+        Called once per table before the shard readers open their own snapshots.
         """
         dialect = dialect_for(conn.source_type)
         if shards <= 1 or shardable_leading_int_pk(table, dialect) is None:
