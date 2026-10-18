@@ -504,6 +504,18 @@ def test_max_pk_target_returns_high_water_and_skips_no_pk() -> None:
     assert connection.closed is True
 
 
+def test_max_pk_target_reads_a_numeric_20_0_key_as_its_integer() -> None:
+    """A MySQL BIGINT UNSIGNED key is numeric(20,0) on Aurora DSQL and reads back as a
+    Decimal: the live E2E's CDC monitor saw its high-water mark as unknown."""
+    from decimal import Decimal
+
+    from dsql_migrator.core.target_introspector import max_pk_target
+
+    connection = _CountConnection(counts={"app.orders": Decimal("300020"), "app.rates": Decimal("2.5")})
+    out = max_pk_target({"app.orders": "id", "app.rates": "id"}, connection_factory=lambda: connection)
+    assert out == {"app.orders": 300020, "app.rates": None}
+
+
 def test_max_pk_target_missing_table_is_none() -> None:
     from dsql_migrator.core.target_introspector import max_pk_target
 

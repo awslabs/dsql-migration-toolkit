@@ -31,6 +31,7 @@ from __future__ import annotations
 import re
 import time as _time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Callable, Collection, Mapping, Optional, Protocol, Sequence, Union
 
 from dsql_migrator.core.models import (
@@ -1535,9 +1536,10 @@ def max_pk_target(
     ``pk_by_table`` maps a qualified ``schema.table`` to its single PK column name.
     Used by the CDC consistency view to compare the target's high-water PK against
     the source's: an equal max means the stream's leading edge has caught up (no
-    lag) even if the row COUNTs differ (a mid-stream gap). Returns ``None`` for a
-    table whose PK is not a single integer column, is missing/empty, or errors.
-    All reads run over one connection.
+    lag) even if the row COUNTs differ (a mid-stream gap). A numeric(20,0) key -- a
+    MySQL BIGINT UNSIGNED the conversion keeps whole -- reads back as a Decimal and is
+    that integer. Returns ``None`` for a table whose PK is not a single integer
+    column, is missing/empty, or errors. All reads run over one connection.
     """
     from psycopg import sql
 
@@ -1558,6 +1560,8 @@ def max_pk_target(
                 cursor.execute(statement)
                 row = cursor.fetchone()
                 val = row[0] if row is not None else None
+                if isinstance(val, Decimal) and val == val.to_integral_value():
+                    val = int(val)
                 out[name] = int(val) if isinstance(val, int) else None
             except Exception:  # noqa: BLE001 - missing/non-integer/error -> unknown
                 out[name] = None
