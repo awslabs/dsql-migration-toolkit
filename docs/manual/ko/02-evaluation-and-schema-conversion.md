@@ -354,8 +354,9 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   `COUNT`로 나누는 같은 나눗셈으로, `FLOAT`은 MySQL처럼 배정밀도로 계산해서(그 `SUM`, `f * f`), `FLOAT`/`DOUBLE`의
   `ROUND`/`TRUNCATE(x, d)`는 MySQL처럼 배정밀도로 계산해서(실행 시점에 읽는 자릿수도, 정수는 그 정수로), 숫자로 읽히는
   `TINYINT(1)`(Aurora DSQL에서는 boolean)과 비교식 — 산술, 비트 연산자, `ROUND`/`SIGN`/`POWER`나 숫자 캐스트, 집계
-  (`SUM(qty > 2)`는 행을 셉니다), 또는 숫자 옆(`= 1`, `<=> 1`, `IN`, 단순 `CASE`) — 은 그 정수로, `TINYINT(1)`에 대입하는
-  숫자(`SET paid = 1`)는 boolean으로, `GROUP_CONCAT`은 text 위의 집계로, `CONCAT_WS`는 NULL을 건너뛰고
+  (`SUM(qty > 2)`는 행을 셉니다), 또는 숫자 옆(`= 1`, `<=> 1`, `IN`, 단순 `CASE`) — 은 그 정수로, `TINYINT(1)`에 넣는
+  숫자(`SET paid = 1`, `INSERT ... VALUES (..., 1)`이나 `INSERT ... SELECT` — 채우는 컬럼으로 판단)는 boolean으로,
+  `SET col = a = b`는 MySQL이 읽는 대로(`col = (a = b)`), `GROUP_CONCAT`은 text 위의 집계로, `CONCAT_WS`는 NULL을 건너뛰고
   `GREATEST`/`LEAST`는 MySQL처럼 NULL을 반환하게, `LENGTH`는 텍스트의 바이트 수로, `CHAR_LENGTH`는 그 문자 수로
   (`CHAR(n)` 컬럼은 채움 공백 없이, JSON 값은 그 텍스트로), MySQL이 문자열을 원하는 곳(`CONCAT`/`CONCAT_WS` —
   텍스트와 나란한 바이트는 디코딩하고 표시 — `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`, `REPLACE`, `UPPER`/`LOWER`, `TRIM`,
@@ -403,8 +404,11 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE —
   `ALGORITHM=TEMPTABLE`로 선언한 뷰, 또는 집계, 윈도우, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나
   테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는 것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의
-  값도, 쿼리가 그것으로 그룹화하는 `CASE`/`IF`도: `0.0000`). `FLOAT`/`DOUBLE` 브랜치가 있는 `UNION` 컬럼은 MySQL이 정하는
-  대로 `DOUBLE`입니다(그 몫은 모든 자릿수를 유지). MySQL이 읽는 쿼리에 병합(merge)하는 뷰는 거기서 몫이 유지하는 모든
+  값도, 쿼리가 그것으로 그룹화하는 `CASE`/`IF`도: `0.0000` — MySQL이 정렬로 그룹화하는 `WITH ROLLUP`에서는 각 행의 값
+  그대로). `FLOAT`/`DOUBLE` 브랜치가 있는 `UNION` 컬럼의 몫은 모든 자릿수를 유지하고, `FLOAT` 브랜치가 있는 컬럼은 MySQL이
+  정하는 타입이 됩니다: `DOUBLE`, `DECIMAL`(몫, 정확한 수의 `SUM`)이나 `INT` 컬럼과 나란하거나 다른 정수(리터럴, `BIGINT`, `COUNT(*)`)가
+  `FLOAT` 앞에 있으면 `DOUBLE`, `TINYINT`/`SMALLINT`/`MEDIUMINT`/`YEAR` 컬럼과 나란하거나 그런 정수가 뒤에 있으면 `FLOAT`
+  (`SELECT f ... UNION ALL SELECT 0`은 `FLOAT`의 `0.1`을 보여 줍니다). MySQL이 읽는 쿼리에 병합(merge)하는 뷰는 거기서 몫이 유지하는 모든
   자릿수로 계산되므로 뷰는 반올림하지 않고 두며, 읽는 쿼리는 MySQL과 같은 결과를 돌려줍니다. 그 대가: 그 뷰를 직접 조회하면
   몫 컬럼은 MySQL이 계산에 쓰는 자릿수를 보여 줍니다 — MySQL이 `0.3333`을 보여 주는 곳에서 `0.333333333`을, `10.0000`을
   보여 주는 `(x / 3) * 3`은 `9.999999999`를 — 이것은 AUTO로 평가되고 뷰마다의 안내는 없습니다. 또 그 뷰를 읽는 뷰는 그
@@ -414,7 +418,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   `PARTITION BY` / `ORDER BY`, `COUNT(DISTINCT ...)`의 키를 보여 주는 scale로 만들지만(`1 / 3`과 `3333 / 10000`은 같은 키)
   변환은 유지한 자릿수로 키를 만듭니다 — MANUAL로 표시됩니다(`GROUP BY 1`이나 `GROUP BY` 별칭은 두 엔진 모두 보여 주는
   출력으로 키를 만듭니다). 임시 테이블로 그룹화할 때(그룹화 컬럼에 인덱스가 없을 때) MySQL은 몫의 `SUM`, `MAX`, `MIN`,
-  `AVG`도 그 scale로 저장하며, 이는 실행 계획에 따라 달라집니다 — 그것이 중요하면 `ROUND(q, 4)`로 그룹화하고 집계하세요.
+  `AVG`도, 키가 아닌 `CASE`/`IF` 출력도(`0.0000`, 여기서는 `0`) 그 scale로 저장하며, 이는 실행 계획에 따라 달라집니다 —
+  그것이 중요하면 `ROUND(q, 4)`로 그룹화하고 집계하세요.
   MySQL 8.0.22 이상(Aurora MySQL 3)은 구체화하는 뷰나 파생 테이블의 몫에 대한 필터(`WHERE v.q = 0.3333`)를 그 안으로 밀어
   넣어 모든 자릿수로 비교하지만, 돌려주는 행은 저장된 scale을 가집니다. Aurora DSQL은 저장된 값으로 비교하므로, 그것이
   중요하면 `ROUND(q, s)`나 범위로 비교하세요. 인자에 윈도우 함수가 있는 `JSON_ARRAY`/`JSON_OBJECT`는 윈도우 다음에 계산되어

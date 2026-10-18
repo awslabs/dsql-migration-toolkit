@@ -7572,6 +7572,24 @@ def _from_unixtime(args: list) -> exp.Expression:
     return exp.UnixToTime(this=seq_get(args, 0))
 
 
+def _mysql_assignments(holder: exp.Expression) -> None:
+    """An UPDATE's or an upsert's SET items as MySQL reads them, in place: SET col = a = b is
+    col = (a = b) (col = a = 1 = 0 is col = ((a = 1) = 0)) -- sqlglot reads every equality
+    (=, <>, <=>) left to right, ((col = a) = b), the target an operand there."""
+    for item in list(holder.expressions or ()):
+        spine: list = []
+        target = item
+        while isinstance(target, _EQUALITIES) and not (
+            isinstance(target, exp.EQ) and isinstance(target.this, exp.Column)
+        ):
+            spine.append(target)
+            target = target.this
+        if spine and isinstance(target, exp.EQ) and isinstance(target.this, exp.Column):
+            spine[-1].set("this", target.expression)  # (a = b), the value
+            item.replace(target)
+            target.set("expression", item)
+
+
 class _MySqlViewDialect(_SqlglotMySQL):
     """MySQL as the tool reads a view body or a query.
 
@@ -7595,6 +7613,9 @@ class _MySqlViewDialect(_SqlglotMySQL):
     * ``j -> '$.a'`` is JSON_EXTRACT in a function's arguments too: MySQL has no lambdas,
       and sqlglot read it there as one -- written back as PostgreSQL's ``->``, a lookup
       of the key '$.a' (NULL on every row).
+    * An UPDATE's or an upsert's ``SET col = a = b`` assigns ``(a = b)`` (``<>`` and ``<=>``
+      too): sqlglot reads the equalities left to right, ``((col = a) = b)``, the target an
+      operand there.
     Written back as MySQL (the Schema Conversion source pane), each reads as it did."""
 
     class Parser(_SqlglotMySQL.Parser):
@@ -7654,6 +7675,17 @@ class _MySqlViewDialect(_SqlglotMySQL):
             if comma and join is not None:
                 join.meta[_COMMA_JOIN] = True
             return join
+
+        def _parse_update(self) -> Any:
+            update = super()._parse_update()
+            _mysql_assignments(update)
+            return update
+
+        def _parse_on_conflict(self) -> Any:
+            conflict = super()._parse_on_conflict()  # ON DUPLICATE KEY UPDATE's SET items
+            if conflict is not None:
+                _mysql_assignments(conflict)
+            return conflict
 
         def _parse_convert(self, strict: bool, safe: Any = None) -> Any:
             # CONVERT(x USING cs) reads no type of its own: a CHAR(n) read earlier (a
@@ -7909,6 +7941,8 @@ _NUMERIC_OPERATIONS = (
 # What a left-deep chain of thousands of operators (a + b + c is ((a + b) + c)) is made of:
 # the typing reads walk one in a loop, not a Python frame per operator.
 _CHAINED = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
+# The equality operators, which sqlglot reads left to right as MySQL does ((a = b) = c).
+_EQUALITIES = (exp.EQ, exp.NEQ, exp.NullSafeEQ, exp.NullSafeNEQ)
 # MySQL's window functions that return a row's value of their argument.
 _VALUE_WINDOW_FUNCTIONS = (exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.NthValue)
 # The nodes whose value has their argument's scale, and carries its quotient: -x, SUM, MIN /
@@ -8028,11 +8062,12 @@ class _QuotientType(str):
 
 def _aggregated(node: exp.Expression) -> Optional[exp.Expression]:
     """The value an aggregate reads (a DISTINCT one's single value); any other node's own
-    ``this``."""
+    ``this`` -- None where that is no expression (an Anonymous call's name: JSON_ARRAYAGG(x)
+    OVER (...))."""
     value = node.this
     if isinstance(value, exp.Distinct):
         return value.expressions[0] if len(value.expressions) == 1 else None
-    return value
+    return value if isinstance(value, exp.Expression) else None
 
 
 def _scalar_projection(subquery: exp.Subquery) -> Optional[exp.Expression]:
@@ -8119,15 +8154,15 @@ def _mysql_decimal_scale(mysql_type: Optional[str]) -> Optional[int]:
 @functools.lru_cache(maxsize=1024)
 def _mysql_kind(mysql_type: Optional[str]) -> Optional[str]:
     """What a MySQL column type holds, as the rewrites tell values apart: binary, boolean
-    (TINYINT(1), a boolean on Aurora DSQL), integer, decimal, float4 / float8 (REAL / DOUBLE
-    PRECISION on Aurora DSQL), char (CHAR(n): blank-padded there), date, datetime,
-    timestamp, time, json, else text."""
+    (TINYINT(1), a boolean on Aurora DSQL -- an unsigned one is a smallint there, an
+    integer), integer, decimal, float4 / float8 (REAL / DOUBLE PRECISION on Aurora DSQL),
+    char (CHAR(n): blank-padded there), date, datetime, timestamp, time, json, else text."""
     if not mysql_type:
         return None
     kind = mysql_type.lower().strip()
     if re.match(r"^(?:tiny|medium|long)?blob\b|^(?:var)?binary\b", kind):
         return "binary"
-    if re.match(r"^tinyint\s*\(\s*1\s*\)", kind):
+    if re.match(r"^tinyint\s*\(\s*1\s*\)(?!.*\b(?:unsigned|zerofill)\b)", kind):
         return "boolean"
     if re.match(r"^(?:tiny|small|medium|big)?int\b|^integer\b|^bit\b|^year\b|^serial\b", kind):
         return "integer"
@@ -9597,8 +9632,10 @@ def _rewrite_mysql_calls(
         if _QUOTIENT_SCALE in node.meta or isinstance(node, (exp.Div, exp.Avg)):
             return True
         if isinstance(node, exp.Column):
+            # An unqualified one is the one source of its query that has it, as the resolver
+            # bound it: a _QuotientType is only ever a derived table's or a CTE's column.
             mysql_type = column_type(node) if column_type is not None else None
-            return isinstance(mysql_type, _QuotientType) and _reads_derived(node)
+            return isinstance(mysql_type, _QuotientType) and (not node.table or _reads_derived(node))
         if isinstance(node, _ARGUMENT_SCALED):
             return carries_quotient(_aggregated(node))
         if isinstance(node, exp.Subquery):
@@ -9980,10 +10017,15 @@ def _rewrite_mysql_calls(
             beside = [parent.this, parent.args.get("low"), parent.args.get("high")]
         elif isinstance(parent, exp.Case) and held.arg_key == "this":
             beside = [branch.this for branch in parent.args.get("ifs") or ()]  # CASE x WHEN 1
-        elif isinstance(parent, exp.If) and held.arg_key == "this" and isinstance(parent.parent, exp.Case):
+        # A CASE's WHEN branch is an If in its ifs; MySQL's IF() -- an If too -- that is the
+        # CASE's ELSE or operand chooses by its own condition, a boolean.
+        elif isinstance(parent, exp.If) and held.arg_key == "this" and parent.arg_key == "ifs" and isinstance(
+            parent.parent, exp.Case
+        ):
             beside = [parent.parent.this]  # a simple CASE's WHEN value, beside its operand
         elif isinstance(parent, (exp.If, exp.Case)) and held.arg_key in ("true", "false", "default"):
-            case = parent.parent if isinstance(parent.parent, exp.Case) and held.arg_key == "true" else parent
+            branch = isinstance(parent.parent, exp.Case) and parent.arg_key == "ifs" and held.arg_key == "true"
+            case = parent.parent if branch else parent
             beside = (
                 [case.args.get("true"), case.args.get("false")] if isinstance(case, exp.If)
                 else [b.args.get("true") for b in case.args.get("ifs") or ()] + [case.args.get("default")]
@@ -10001,26 +10043,63 @@ def _rewrite_mysql_calls(
         exp.Column, exp.If, exp.Case, exp.Coalesce, exp.Nullif, exp.Greatest, exp.Least, exp.Subquery, exp.Window,
     )
     for node in reversed(walked):
-        predicate = isinstance(node, (exp.Predicate, exp.Connector, exp.Not, exp.Boolean))
+        # ANY / SOME / ALL quantify a comparison over a subquery's rows -- no value of their
+        # own -- and an IN's subquery is the set it reads (EXISTS (...) is a value: + 0 adds).
+        predicate = isinstance(node, (exp.Predicate, exp.Connector, exp.Not, exp.Boolean)) and not isinstance(
+            node, (exp.Any, exp.All)
+        )
         if not predicate and not (isinstance(node, holders) and kind_of(node) == "boolean"):
             continue
         held = node
         while isinstance(held.parent, exp.Paren):
             held = held.parent
-        if assigned(held.parent) and held is held.parent.this:
+        if (assigned(held.parent) and held is held.parent.this) or (
+            isinstance(held.parent, exp.In) and held.arg_key == "query"
+        ):
             continue
         if read_as_number(held):
             cast = _as_integer(exp.Null())
             node.replace(cast)
             cast.set("this", node)
+
+    def as_flag(value: exp.Expression) -> None:
+        """A number stored in a TINYINT(1) -- a boolean on Aurora DSQL, which has no cast from
+        an integer to one -- written where it stands: TRUE / FALSE for a literal, else (v <>
+        0)."""
+        literal = _integer_literal(value)
+        if literal is not None:
+            value.replace(exp.Boolean(this=literal != 0))
+            return
+        flag = exp.NEQ(this=exp.Null(), expression=exp.Literal.number(0))
+        value.replace(flag)
+        flag.set("this", exp.Paren(this=value) if isinstance(value, exp.Binary) else value)
+
     for node in [n for n in walked if assigned(n)]:
-        value = node.expression
-        if kind_of(node.this) == "boolean" and kind_of(value) == "integer":
-            literal = _integer_literal(value)
-            node.set("expression", exp.Boolean(this=literal != 0) if literal is not None else exp.NEQ(
-                this=exp.Paren(this=value) if isinstance(value, exp.Binary) else value,
-                expression=exp.Literal.number(0),
-            ))
+        if kind_of(node.this) == "boolean" and kind_of(node.expression) == "integer":
+            as_flag(node.expression)
+    # An INSERT's values the same way, by the columns it names -- else the table's own, in
+    # the inventory's order; a table it cannot type is left as written: each VALUES row, and
+    # each output of its SELECT (of each UNION branch).
+    for insert in nodes(exp.Insert):
+        target = insert.this
+        table = target.this if isinstance(target, exp.Schema) else target
+        columns = (resolver.base_columns(table) if resolver is not None else None) or {}
+        names = [c.name.lower() for c in target.expressions] if isinstance(target, exp.Schema) else list(columns)
+        flags = [position for position, name in enumerate(names) if _mysql_kind(columns.get(name)) == "boolean"]
+        source = insert.expression
+        if not flags or not isinstance(source, exp.Expression):
+            continue
+        rows = (
+            [row for row in source.expressions if isinstance(row, exp.Tuple)] if isinstance(source, exp.Values)
+            else _output_queries(source)
+        )
+        for row in rows:
+            items = row.expressions
+            if len(items) != len(names):
+                continue
+            # Each typed while all are still in the tree.
+            for item in [items[p].unalias() for p in flags if kind_of(items[p].unalias()) == "integer"]:
+                as_flag(item)
 
     # MySQL computes a FLOAT in double precision: PostgreSQL computes real op real in real
     # (with any other operand in double precision) -- and its sum(real) adds in real, losing
@@ -10056,7 +10135,11 @@ def _rewrite_mysql_calls(
     for node in [n for n in walked if isinstance(n, exp.Sum)]:
         value = _aggregated(node)
         if value is not None and kind_of(value) == "float4":
-            value.replace(exp.Cast(this=value.copy(), to=exp.DataType.build("DOUBLE PRECISION")))
+            # Wrapped where it stands, not copied: the passes below read the nodes as walked
+            # (a % b in it divides by NULLIF(b, 0) too).
+            cast = exp.Cast(this=exp.Null(), to=exp.DataType.build("DOUBLE PRECISION"))
+            value.replace(cast)
+            cast.set("this", value)
 
     # MySQL's a % b, MOD(a, b) and a DIV b are NULL for a 0 divisor, as its division is;
     # Aurora DSQL raises division by zero.
@@ -10166,6 +10249,8 @@ def _rewrite_mysql_calls(
         function = window.this
         while isinstance(function, (exp.Filter, exp.RespectNulls, exp.IgnoreNulls)):
             function = function.this
+        if not isinstance(function, exp.Func):
+            continue  # a WINDOW clause's own definition (WINDOW w AS (...)): a name, no function
         if not isinstance(function, exp.Avg):  # an AVG's argument is kept above
             stored_argument(function)
         if carries_quotient(window):
@@ -11386,20 +11471,53 @@ def _rewrite_mysql_calls(
         """Whether the select list's item at ``position`` is a key of its query's GROUP BY --
         by its position, its alias (a name no FROM column has) or as the same expression:
         MySQL keeps it in the grouping's temporary table, at its column's scale, and Aurora
-        DSQL matches the GROUP BY expression only with the whole item."""
+        DSQL matches the GROUP BY expression only with the whole item. WITH ROLLUP groups by
+        sorting, each row's value shown as itself: there only the same expression is one,
+        which Aurora DSQL must still match whole."""
         group = query.args.get("group")
         if group is None:
             return False
+        rolled_up = bool(group.args.get("rollup"))
         projection = query.expressions[position]
         alias = projection.alias.lower() if isinstance(projection, exp.Alias) else ""
         value = projection.unalias().unnest()
         for key in group.expressions:
+            if key.unnest() == value:
+                return True
+            if rolled_up:
+                continue
             if isinstance(key, exp.Literal) and _integer_literal(key) == position + 1:
                 return True
             if (
                 isinstance(key, exp.Column) and not key.table and alias and key.name.lower() == alias
                 and (column_type is None or column_type(key) is None)
-            ) or key.unnest() == value:
+            ):
+                return True
+        return False
+
+    def union_doubles(values: "list[exp.Expression]") -> bool:
+        """Whether MySQL types a UNION column with a FLOAT branch a DOUBLE -- Aurora DSQL types
+        it real -- by its branches in order: beside a DOUBLE, a DECIMAL (a quotient, an exact
+        SUM) or an INT (or BIT) column -- its MIN / MAX too -- wherever they stand; after any
+        other integer (a literal, a BIGINT, COUNT(*), arithmetic: a BIGINT in MySQL) that comes
+        before the first FLOAT. A TINYINT / SMALLINT / MEDIUMINT / YEAR column, and a BIGINT
+        after the FLOAT, keep it a FLOAT."""
+        float_seen = False
+        for value in values:
+            kind = kind_of(value)
+            if kind == "float4":
+                float_seen = True
+                continue
+            bare = value.unnest()
+            while isinstance(bare, (exp.Window, exp.Min, exp.Max, exp.AnyValue)):
+                bare = _aggregated(bare)  # MIN / MAX are their argument's type
+            if kind in ("float8", "decimal") or isinstance(bare, exp.Sum):
+                return True
+            declared = column_type(bare) if column_type is not None and isinstance(bare, exp.Column) else None
+            declared = (declared or "").strip().lower()
+            if re.match(r"^(?:int|integer|bit)\b", declared) or (
+                not float_seen and not re.match(r"^(?:tiny|small|medium)int\b|^year\b", declared)
+            ):
                 return True
         return False
 
@@ -11427,10 +11545,10 @@ def _rewrite_mysql_calls(
             continue
         # A UNION column has one type, its branches' largest scale: each branch is stored at
         # it, an integer one too (SELECT 1 / 3 UNION SELECT 1 is 0.3333 and 1.0000) -- a NULL
-        # branch has none. With a FLOAT / DOUBLE branch the column is a DOUBLE, a quotient
-        # in it every digit it keeps -- a REAL branch beside another number one too (Aurora
-        # DSQL types the column real otherwise); with a string one it is a string (written
-        # by the typing of choices), its quotient left unrounded.
+        # branch has none. With a FLOAT / DOUBLE branch its quotients keep every digit -- a
+        # REAL branch is cast to double precision where MySQL types the column a DOUBLE
+        # (union_doubles; Aurora DSQL types it real); with a string one it is a string
+        # (written by the typing of choices), its quotient left unrounded.
         targets: "dict[int, int]" = {}
         unrounded: set = set()
         doubled: set = set()
@@ -11440,7 +11558,7 @@ def _rewrite_mysql_calls(
             kinds = {kind_of(value) for value in values}
             if kinds & (_FLOAT_KINDS | {"text", "char"}):
                 unrounded.add(position)
-                if "float4" in kinds and kinds <= _NUMERIC_KINDS and kinds != {"float4"}:
+                if "float4" in kinds and kinds <= _NUMERIC_KINDS and union_doubles(values):
                     doubled.add(position)
                 continue
             found_scales = [decimal_scale(value) for value in values]

@@ -2210,7 +2210,8 @@ class QueryConverter:
     def convert(self, sql: str, *, pretty: bool = False) -> QueryConversionResult:
         """:meth:`_convert`, which never raises: a statement nested deeper than the
         conversion walks (a generated expression of thousands of operators or parentheses)
-        is flagged for manual review, as a view is."""
+        is flagged for manual review, as a view is -- and so is one the conversion fails on
+        for any other reason (the Query Playground's Convert would show a raw error)."""
         try:
             return self._convert(sql, pretty=pretty)
         except RecursionError:
@@ -2219,6 +2220,14 @@ class QueryConverter:
                 CODE_RENDER_ERROR,
                 "The statement is nested too deeply to convert (an expression of thousands of "
                 "operators or parentheses); flag for manual review, or split the expression.",
+            )
+        except Exception as exc:  # noqa: BLE001 - any conversion failure -> manual, as a view's
+            return self._manual_review(
+                sql,
+                CODE_RENDER_ERROR,
+                "The statement could not be converted automatically (the conversion failed: "
+                f"{type(exc).__name__}); flag for manual review, and rewrite it for Aurora DSQL "
+                "by hand.",
             )
 
     def _convert(self, sql: str, *, pretty: bool = False) -> QueryConversionResult:

@@ -454,8 +454,9 @@ MySQL→PostgreSQL transpile:
   `ROUND`/`TRUNCATE(x, d)` of a `FLOAT`/`DOUBLE` in double precision as MySQL computes them (to places read at
   run time too; of an integer, the integer), a `TINYINT(1)` (a boolean on Aurora DSQL) and a comparison read as a
   number — in arithmetic, a bitwise operator, `ROUND`/`SIGN`/`POWER` or a numeric cast, an aggregate (`SUM(qty > 2)`
-  counts rows) or beside a number (`= 1`, `<=> 1`, `IN`, a simple `CASE`) — as its integer, a number assigned to a
-  `TINYINT(1)` (`SET paid = 1`) as a boolean, `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and
+  counts rows) or beside a number (`= 1`, `<=> 1`, `IN`, a simple `CASE`) — as its integer, a number stored in a
+  `TINYINT(1)` (`SET paid = 1`, `INSERT ... VALUES (..., 1)` or `INSERT ... SELECT`, by the column it fills) as a
+  boolean, `SET col = a = b` as MySQL reads it (`col = (a = b)`), `GROUP_CONCAT` over text, `CONCAT_WS` skipping NULLs and
   `GREATEST`/`LEAST` returning NULL as MySQL does, `LENGTH` as the bytes of its text and `CHAR_LENGTH` as its characters (a `CHAR(n)` column without its
   padding, a JSON value as its text), a number, a date, a `TINYINT(1)` or a comparison as MySQL's text of it where MySQL
   wants a string (`CONCAT`/`CONCAT_WS` — bytes beside text decoded, flagged — `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`,
@@ -513,8 +514,12 @@ MySQL→PostgreSQL transpile:
   where MySQL shows it: a statement's output and a text, and the rows of a view, derived table or CTE that MySQL
   materializes — a view declared `ALGORITHM=TEMPTABLE`, or one with an aggregate, a window, `DISTINCT`, `GROUP BY`,
   `HAVING`, `LIMIT`, a `UNION`, no table, or an output holding a subquery that reads its row — each stored at its
-  column's scale (a window's values too, and a `CASE`/`IF` its query groups by: `0.0000`). A `UNION` column with a
-  `FLOAT`/`DOUBLE` branch is a `DOUBLE`, as MySQL types it (its quotients keep every digit). A view MySQL merges
+  column's scale (a window's values too, and a `CASE`/`IF` its query groups by: `0.0000` — under `WITH ROLLUP`, which
+  MySQL groups by sorting, each row's own value). A `UNION` column with a `FLOAT`/`DOUBLE` branch keeps every digit
+  of its quotients, and one with a `FLOAT` branch is typed as MySQL types it: a `DOUBLE` beside a `DOUBLE`, a
+  `DECIMAL` (a quotient, an exact `SUM`) or an `INT` column, or after another integer (a literal, a `BIGINT`, `COUNT(*)`) placed
+  before the `FLOAT`; a `FLOAT` beside a `TINYINT`/`SMALLINT`/`MEDIUMINT`/`YEAR` column or such an integer after it
+  (`SELECT f ... UNION ALL SELECT 0` shows the `FLOAT`'s `0.1`). A view MySQL merges
   into the query that reads it is computed there, with every digit the quotient keeps, so the view is left
   unrounded and its readers return MySQL's results. The trade-off: selected directly, its quotient column shows the
   digits MySQL computes with — `0.333333333` where MySQL shows `0.3333`, `(x / 3) * 3` as `9.999999999` where MySQL
@@ -526,7 +531,8 @@ MySQL→PostgreSQL transpile:
   quotient at its shown scale (`1 / 3` and `3333 / 10000` are one key) where the conversion keys on the digits
   kept — flagged MANUAL (a `GROUP BY 1` or a `GROUP BY` alias keys on the shown output on both); grouping through a
   temporary table (no index on the grouping columns) MySQL also stores a quotient's `SUM`, `MAX`, `MIN` and `AVG`
-  at that scale, which depends on its plan — group by and aggregate `ROUND(q, 4)` where that matters. MySQL 8.0.22+
+  at that scale, and a `CASE`/`IF` output that is no key (`0.0000`, shown here as `0`), which depends on its plan —
+  group by and aggregate `ROUND(q, 4)` where that matters. MySQL 8.0.22+
   (Aurora MySQL 3) pushes a filter on a materialized view's or derived table's quotient into it (`WHERE v.q =
   0.3333`) and compares every digit there, while the rows it returns carry the stored scale; Aurora DSQL compares
   the stored value — compare `ROUND(q, s)` or a range where that matters. A `JSON_ARRAY`/`JSON_OBJECT` with a

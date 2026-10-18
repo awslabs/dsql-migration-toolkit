@@ -371,7 +371,8 @@ MySQL→PostgreSQL トランスパイルではありません。
   `ROUND`/`TRUNCATE(x, d)` は MySQL と同じく倍精度で計算して(実行時に読む桁数でも。整数はその整数のまま)、数値として読まれる
   `TINYINT(1)`(Aurora DSQL では boolean)と比較式 — 算術、ビット演算子、`ROUND`/`SIGN`/`POWER` や数値へのキャスト、集計
   (`SUM(qty > 2)` は行を数えます)、または数値の隣(`= 1`、`<=> 1`、`IN`、単純 `CASE`)— はその整数として、`TINYINT(1)` に
-  代入する数値(`SET paid = 1`)は boolean として、`GROUP_CONCAT` は text 上の集計に、
+  入れる数値(`SET paid = 1`、`INSERT ... VALUES (..., 1)` や `INSERT ... SELECT` — 埋める列で判断)は boolean として、
+  `SET col = a = b` は MySQL が読むとおり(`col = (a = b)`)、`GROUP_CONCAT` は text 上の集計に、
   `CONCAT_WS` は NULL を飛ばし `GREATEST`/`LEAST` は MySQL と同じく NULL を返すように、`LENGTH` はテキストのバイト数に、
   `CHAR_LENGTH` はその文字数に(`CHAR(n)` 列は埋め草の空白なしで、JSON 値はそのテキストで)、MySQL が文字列を求める
   ところ(`CONCAT`/`CONCAT_WS` — テキストと並ぶバイトはデコードしてフラグ付き — `LPAD`/`RPAD`、`LEFT`/`RIGHT`、
@@ -419,8 +420,11 @@ MySQL→PostgreSQL トランスパイルではありません。
   テキスト、そして MySQL が実体化(materialize)するビュー・派生テーブル・CTE — `ALGORITHM=TEMPTABLE` で宣言したビュー、
   または集計、ウィンドウ、`DISTINCT`、`GROUP BY`、`HAVING`、`LIMIT`、`UNION` を持つもの、テーブルのないもの、自身の行を読む
   サブクエリを含む出力を持つもの — の行で、それぞれその列のスケールで保存されます(ウィンドウの値も、クエリがそれでグループ化
-  する `CASE`/`IF` も: `0.0000`)。`FLOAT`/`DOUBLE` の分岐を持つ `UNION` の列は MySQL が型付けるとおり `DOUBLE` です(その商は
-  すべての桁を保ちます)。MySQL が読み手のクエリにマージするビューはそこで商が保つすべての桁で計算されるため、ビューは丸めずに
+  する `CASE`/`IF` も: `0.0000` — MySQL がソートでグループ化する `WITH ROLLUP` では各行の値そのまま)。`FLOAT`/`DOUBLE` の
+  分岐を持つ `UNION` の列の商はすべての桁を保ち、`FLOAT` の分岐を持つ列は MySQL が型付けるとおりになります: `DOUBLE`、
+  `DECIMAL`(商、正確な数の `SUM`)または `INT` 列と並ぶとき、あるいは別の整数(リテラル、`BIGINT`、`COUNT(*)`)が `FLOAT` より前にあるときは
+  `DOUBLE`、`TINYINT`/`SMALLINT`/`MEDIUMINT`/`YEAR` 列と並ぶとき、またはそうした整数が後にあるときは `FLOAT`(`SELECT f ...
+  UNION ALL SELECT 0` は `FLOAT` の `0.1` を表示します)。MySQL が読み手のクエリにマージするビューはそこで商が保つすべての桁で計算されるため、ビューは丸めずに
   残し、読み手のクエリは MySQL と同じ結果を返します。その代償: そのビューを直接選択すると、商の列は MySQL が計算に使う桁を
   表示します — MySQL が `0.3333` を表示するところで `0.333333333` を、`10.0000` を表示する `(x / 3) * 3` は `9.999999999` を
   — これは AUTO と評価され、ビューごとの注記はありません。またそのビューを読むビューはその列が商だと知り得ないため(PostgreSQL
@@ -429,8 +433,9 @@ MySQL→PostgreSQL トランスパイルではありません。
   読んでください。再現しないもの: MySQL は商の `GROUP BY`、ウィンドウの `PARTITION BY` / `ORDER BY`、`COUNT(DISTINCT ...)` を
   表示スケールでキーにしますが(`1 / 3` と `3333 / 10000` は同じキー)、変換は保った桁でキーにします — MANUAL のフラグが付き
   ます(`GROUP BY 1` や `GROUP BY` の別名は、両エンジンとも表示される出力でキーにします)。一時テーブルでグループ化するとき
-  (グループ化列にインデックスがないとき)、MySQL は商の `SUM`、`MAX`、`MIN`、`AVG` もそのスケールで保存し、これは実行計画に
-  よって変わります — それが重要なら `ROUND(q, 4)` でグループ化・集計してください。MySQL 8.0.22 以降(Aurora MySQL 3)は、
+  (グループ化列にインデックスがないとき)、MySQL は商の `SUM`、`MAX`、`MIN`、`AVG` も、キーでない `CASE`/`IF` の出力も
+  (`0.0000`、ここでは `0`)そのスケールで保存し、これは実行計画によって変わります — それが重要なら `ROUND(q, 4)` で
+  グループ化・集計してください。MySQL 8.0.22 以降(Aurora MySQL 3)は、
   実体化するビューや派生テーブルの商に対するフィルタ(`WHERE v.q = 0.3333`)をその中へ押し込んですべての桁で比較しますが、
   返す行は保存されたスケールを持ちます。Aurora DSQL は保存された値で比較するため、それが重要なら `ROUND(q, s)` や範囲で比較
   してください。引数にウィンドウ関数を含む `JSON_ARRAY`/`JSON_OBJECT` はウィンドウの後で計算され、その商の引数をスケール
