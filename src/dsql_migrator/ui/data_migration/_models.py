@@ -3801,6 +3801,54 @@ CAPTURE_SIZE_REMEDY_UNLOCKED = (
 )
 
 
+def table_picker_remedy(table_lock: "Optional[str]") -> str:
+    """How to capture fewer tables: the table picker's own lock reason (``table_lock``, its
+    remedy included) while it is locked, else deselect tables in it."""
+    return (
+        f"The table picker is locked. {table_lock}"
+        if table_lock
+        else "Deselect tables in the table picker."
+    )
+
+
+# The notice header of a table-list refusal (cdc_table_list_refusal).
+CDC_TABLE_LIST_HEADER = "Too many tables for one CDC pipeline"
+
+
+def cdc_table_list_refusal(
+    table_names: "Sequence[str]",
+    *,
+    deploy: bool,
+    row_counts_by_table: "Optional[Mapping[str, int]]" = None,
+) -> "Optional[str]":
+    """Why one CDC pipeline cannot capture these tables, or ``None``. Pure.
+
+    The per-table lists the cdc-stack parameter builders send for ``table_names``, judged by
+    ``core.cdc.list_parameter_size_refusal``: TableIncludeList and SinkTopics (Deploy CDC
+    infrastructure and Start CDC) and, with ``deploy``, the size plan's SinkTopicPartitions /
+    TopicGroupInclude2 / TopicGroupInclude4 (a Start keeps the deployed ones).
+    ``row_counts_by_table`` is what the deploy plans from; without it (no Full Load has
+    recorded it yet) the largest plan is judged -- a partition count for every topic, as
+    any skewed capture gets. Each caller appends :func:`table_picker_remedy`.
+    """
+    from dsql_migrator.core.cdc import (
+        CDC_DEFAULT_TOPIC_PREFIX,
+        cdc_scaling_params,
+        list_parameter_size_refusal,
+    )
+
+    names = list(table_names)
+    filled = [
+        ("TableIncludeList", ",".join(names)),
+        ("SinkTopics", ",".join(f"{CDC_DEFAULT_TOPIC_PREFIX}.{name}" for name in names)),
+    ]
+    if deploy:
+        # One table holding every row is elevated, and an elevated plan lists every topic.
+        counts = row_counts_by_table or {name: int(i == 0) for i, name in enumerate(names)}
+        filled += cdc_scaling_params(names, CDC_DEFAULT_TOPIC_PREFIX, row_counts_by_table=counts)
+    return list_parameter_size_refusal(filled)
+
+
 # DSQL caps a single value at 1 MiB. Used for display.
 _DSQL_VALUE_LIMIT_MIB = 1
 

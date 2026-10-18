@@ -396,6 +396,20 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   남기지 않은 채 실행). 이 orphan은 조용히 어긋나 버리는 대신 **cut over
   시점의 외래 키 적용(`ADD CONSTRAINT`)을 차단**하며(Validation의 **고아 검사**가 먼저 잡아냄), 그래서
   cut over 전에 정리하게 됩니다. Evaluation이 해당 테이블을 표시합니다.
+- **CDC 파이프라인 하나가 캡처하는 테이블 수에는 한도가 있음: 일반적인 이름이면 약 80–160개.** CDC 스택은 캡처할 테이블을
+  CloudFormation 파라미터 하나씩에 담아 받습니다: 테이블 목록(`TableIncludeList`), 싱크의 토픽 목록
+  (`SinkTopics`, 테이블마다 `dsqlcdc.<table>` 하나), 그리고 배포가 테이블 크기에 따라 파티션을 정할 때(큰
+  테이블이 몇 개 있는 캡처라면 언제나) 토픽별 파티션 맵(`SinkTopicPartitions`, 테이블마다
+  `dsqlcdc.<table>:<개수>` 하나)과 파티션을 더 받는 테이블의 목록입니다. CloudFormation은 파라미터 값 하나를
+  4,096바이트로 제한하므로, 파이프라인 하나는 최대 약 4,097 ÷ (L + 11)개의 테이블을 캡처합니다. L은 정규화된
+  테이블 이름(MySQL은 `database.table`, PostgreSQL은 `schema.table`)의 평균 바이트 길이입니다: 15바이트
+  이름이면 약 155개, 20이면 130개, 30이면 100개, 40이면 80개입니다. Evaluation은 1,000개 테이블까지
+  허용하고, Full load only에는 이런 한도가 없습니다. Deploy CDC infrastructure와 Start CDC는 이보다 큰
+  캡처를 무엇이든 업로드하거나 만들기 전에 거부하고, Full load + CDC에서는 Start Full Load도 적재 전에
+  거부합니다(*Too many tables for one CDC pipeline*, 파라미터와 그 크기를 명시). Full Load가 파티션 맵의
+  기준이 되는 행 추정치를 기록하기 전까지는 모든 테이블에 항목이 있는 맵으로 판단하고, 배포된 스택의
+  Start CDC는 자신이 보내는 두 목록만 판단합니다. 이 CDC 파이프라인에서 캡처하는 테이블을 줄이거나(테이블
+  목록에서 선택 해제), Full load only를 사용하세요.
 - **CDC는 배포되어 있는 동안 과금됨.** 스트리밍 파이프라인(MSK Serverless + MSK Connect, NAT 게이트웨이를
   만들었다면 그것까지)은 실행되는 내내 비용이 발생합니다. Cut over 후에는 cdc-stack을 내리세요. Full Load만
   수행하면 스트리밍 인프라가 프로비저닝되지 않습니다.

@@ -4559,7 +4559,10 @@ def capture_error_with_remedy(
     columns there; once it is locked, the lock's own cause-and-remedy text.
     """
     from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
-    from dsql_migrator.ui.data_migration._models import CAPTURE_SIZE_REMEDY_UNLOCKED
+    from dsql_migrator.ui.data_migration._models import (
+        CAPTURE_SIZE_REMEDY_UNLOCKED,
+        table_picker_remedy,
+    )
 
     if capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
         return (
@@ -4567,11 +4570,7 @@ def capture_error_with_remedy(
             f"must not stream -- alone need {capture.generated_bytes:,} bytes, so "
             "excluding fewer columns cannot fix it: capture fewer tables in this CDC "
             "pipeline, or use Full load only. "
-            + (
-                f"The table picker is locked. {table_lock}"
-                if table_lock
-                else "Deselect tables in the table picker."
-            )
+            + table_picker_remedy(table_lock)
         )
     lock = exclusion_lock_state(migration_state, job_manager)
     return f"{capture.error} {lock.reason if lock.locked else CAPTURE_SIZE_REMEDY_UNLOCKED}"

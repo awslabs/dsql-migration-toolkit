@@ -111,7 +111,10 @@ from dsql_migrator.ui.data_migration._models import (
     capture_exclusion_mismatch,
     cdc_capture_exclusions,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
+    CDC_TABLE_LIST_HEADER,
     capture_ambiguity_warning,
+    cdc_table_list_refusal,
+    table_picker_remedy,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     format_column_exclude_list,
@@ -2988,6 +2991,11 @@ def _render_cdc_start_action(
                     inventory=inventory, session=session,
                 )
 
+        # A stable stack only: an unstable one (rolling back, being deleted) has its own
+        # guidance above.
+        if phase in ("provisioning", "running", "partial", "infra"):
+            _render_cdc_plugin_advisory(ui, migration_state)
+
         # Full teardown (guarded) once a stack might exist. When a connector is up
         # (running OR partial) the inline primary action is Stop CDC (connectors
         # only, keeps MSK/VPC) -- a full Delete would tear down the whole pipeline,
@@ -3041,6 +3049,34 @@ def _render_cdc_start_action(
                 )
         elif phase in ("infra", "unstable"):
             _render_cdc_delete_action(ui, migration_state, job_manager, refresh, session=session)
+
+
+def _render_cdc_plugin_advisory(ui, migration_state) -> None:
+    """Warn while the deployed cdc-stack runs an older sink plugin than this version bundles.
+
+    Start CDC never re-registers the plugins, so such a stack keeps its sink -- and every
+    defect fixed since -- until Delete + Deploy CDC infrastructure. The version is the one
+    the stack-phase probe read (no AWS call here); unknown says nothing.
+    """
+    from dsql_migrator.core.cdc import plugin_version_is_older
+    from dsql_migrator.core.s3_provision import PLUGIN_VERSION
+
+    deployed = getattr(migration_state, "cdc_deployed_plugin_version", None)
+    if not plugin_version_is_older(deployed, PLUGIN_VERSION):
+        return
+    render_notice(
+        ui,
+        tone="warning",
+        header="This CDC infrastructure runs an older sink plugin",
+        body=(
+            f"It was deployed with sink plugin {deployed}, and this version of the tool "
+            f"bundles {PLUGIN_VERSION}. Start CDC keeps the plugin a stack was deployed "
+            f"with, so the sink fixes made since {deployed} do not reach this pipeline "
+            "until you Delete CDC infrastructure and deploy it again, which registers "
+            f"{PLUGIN_VERSION}. The Delete confirmation says what deleting also removes."
+        ),
+    )
+
 
 def _render_cdc_partial_actions(
     ui, migration_state, job_manager, refresh, *, names, expected,
@@ -3784,6 +3820,13 @@ def _render_cdc_start_button(
         if _capture.error
         else capture_exclusion_mismatch(migration_state, inventory, _capture, _captured_now)
     )
+    # The table lists Start sends (TableIncludeList, SinkTopics) must each fit one stack
+    # parameter too -- also said before the click.
+    _tables_refusal = cdc_table_list_refusal([t.name for t in _captured_now], deploy=False)
+    if _tables_refusal:
+        _tables_refusal = f"{_tables_refusal} " + table_picker_remedy(
+            _table_lock(migration_state, job_manager, session)
+        )
     # A source column the target certainly lacks: the sink would dead-letter every change
     # to it (42703). Checked HERE as well as at Deploy, because Attach (which moves no data)
     # does not check it and the DDL can change between Deploy and Start. Not tied to any
@@ -3791,7 +3834,7 @@ def _render_cdc_start_button(
     _missing = missing_column_block_reason(
         migration_state, inventory, job_manager=job_manager
     )
-    if _missing and not prereq_block and not _capture_error:
+    if _missing and not prereq_block and not _capture_error and not _tables_refusal:
         render_notice(
             ui,
             tone="error",
@@ -3805,6 +3848,8 @@ def _render_cdc_start_button(
             header="The excluded columns cannot be sent to CDC",
             body=_capture_error,
         )
+    elif _tables_refusal and not prereq_block:
+        render_notice(ui, tone="error", header=CDC_TABLE_LIST_HEADER, body=_tables_refusal)
     _ambiguity = capture_ambiguity_warning(_capture)
     if _ambiguity:
         render_notice(ui, tone="warning", header="CDC capture needs attention", body=_ambiguity)
@@ -3834,6 +3879,9 @@ def _render_cdc_start_button(
     elif _capture_error:
         start_btn.props("disable")
         start_btn.tooltip(_capture_error)
+    elif _tables_refusal:
+        start_btn.props("disable")
+        start_btn.tooltip(_tables_refusal)
     elif _missing:
         start_btn.props("disable")
         start_btn.tooltip(_missing)
@@ -4352,7 +4400,8 @@ def _render_cdc_infra_deploy_action(
         )
         return
     # A saved column exclusion that no longer applies would be baked into the stack's
-    # ColumnExcludeList and lock the card, so this is its last chance to be removed.
+    # ColumnExcludeList and lock the card, so this is its last chance to be removed. (Also
+    # held here: a capture list or a per-table list too long for one stack parameter.)
     _deploy_capture_now = _deploy_capture(migration_state, job_manager, inventory)
     _exclusion_notice = _deploy_block_notice(
         migration_state, job_manager, inventory, session, capture=_deploy_capture_now
@@ -4428,7 +4477,8 @@ def _deploy_block_notice(
     * unless ``include_missing`` is False, a source column the target certainly lacks
       (42703) -- not tied to the lock, its remedy is Schema Conversion;
     * unless ``include_capture`` is False, capture exclusions over CloudFormation's
-      parameter limit, with the remedy true for the cause and the state.
+      parameter limit, with the remedy true for the cause and the state, then a per-table
+      list the deploy sends over that limit (:func:`cdc_table_list_refusal`).
 
     Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
     and changes no DDL; it only locks the card, so only the saved-entry check applies.
@@ -4460,6 +4510,20 @@ def _deploy_block_notice(
                 migration_state, job_manager, capture,
                 table_lock=_table_lock(migration_state, job_manager, session),
             ),
+        )
+    _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    _wm = _cdc_watermark(_job, migration_state)
+    captured = _cdc_tables_for_config(migration_state, inventory, _wm)
+    refusal = cdc_table_list_refusal(
+        [t.name for t in captured],
+        deploy=True,
+        row_counts_by_table=_cdc_row_counts_from_watermark(_wm, captured),
+    )
+    if refusal:
+        return (
+            CDC_TABLE_LIST_HEADER,
+            f"{refusal} "
+            + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
         )
     return None
 
@@ -8433,6 +8497,20 @@ def _start_cdc_deploy(
             ),
         )
         return
+    # Retry CDC skips the dialog and the Start button: the table lists this Start sends
+    # must each fit one stack parameter, refused before any parameter is built.
+    _tables_refusal = cdc_table_list_refusal(
+        [t.name for t in tables_for_config], deploy=False
+    )
+    if _tables_refusal:
+        render_notice(
+            ui,
+            tone="error",
+            header=CDC_TABLE_LIST_HEADER,
+            body=f"{_tables_refusal} "
+            + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
+        )
+        return
     _missing = missing_column_block_reason(
         migration_state, inventory, job_manager=job_manager
     )
@@ -9211,14 +9289,29 @@ async def _start_cdc_infra_deploy(
     # the pre-load deploy with no watermark is unchanged). G17: the same when only tables
     # still to load under the Full Load's start point are selected.
     _deploy_job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    if cdc_capture_names(
-        migration_state, _cdc_watermark(_deploy_job, migration_state)
-    ) == frozenset():
+    _deploy_wm = _cdc_watermark(_deploy_job, migration_state)
+    if cdc_capture_names(migration_state, _deploy_wm) == frozenset():
         ui.notify(  # type: ignore[attr-defined]
             DEPLOY_PENDING_EMPTY
             if cdc_deploy_pending(migration_state, job_manager, _deploy_job)
             else DEPLOY_EMPTY_CAPTURE,
             type="warning",
+            position="top",
+        )
+        return
+    # A per-table list too long for one stack parameter (the deploy button says so first):
+    # refused before any AWS call, so nothing is created or uploaded.
+    _captured = _cdc_tables_for_config(migration_state, inventory, _deploy_wm)
+    _tables_refusal = cdc_table_list_refusal(
+        [t.name for t in _captured],
+        deploy=True,
+        row_counts_by_table=_cdc_row_counts_from_watermark(_deploy_wm, _captured),
+    )
+    if _tables_refusal:
+        ui.notify(  # type: ignore[attr-defined]
+            f"{_tables_refusal} "
+            + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
+            type="negative",
             position="top",
         )
         return

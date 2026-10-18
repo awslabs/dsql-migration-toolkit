@@ -35,7 +35,10 @@ CDC가 필요한 경우는 **대규모 또는 지속적** 마이그레이션뿐�
 - **커스텀 DSQL 싱크 커넥터**(이 프로젝트가 소유한 Java Kafka Connect 플러그인)가 변경을 DSQL에
   적용합니다. 두 커넥터 모두 **관리형 MSK Connect**에서 실행되며, 도구는 **자체 싱크 컴퓨트를 돌리지
   않고** 컨트롤 플레인 역할만 합니다(구성 작성, 재개 지점 확립 — MySQL은 Kafka 시작 오프셋을 시드하고,
-  PostgreSQL은 논리 복제 슬롯과 publication을 생성 — 모니터링).
+  PostgreSQL은 논리 복제 슬롯과 publication을 생성 — 모니터링). CDC 스택은 배포될 때의 플러그인을 그대로
+  씁니다. Start CDC는 새 플러그인을 등록하지 않으므로, 스택이 이 버전의 도구에 들어 있는 것보다 오래된 싱크
+  플러그인을 실행하는 동안 CDC 단계가 그렇게 알려 주며(*This CDC infrastructure runs an older sink
+  plugin*), **Delete CDC infrastructure** 후 다시 배포하면 들어 있는 플러그인이 등록됩니다.
 
 **왜 표준 JDBC 싱크가 아니라 *커스텀* 싱크일까요?**
 

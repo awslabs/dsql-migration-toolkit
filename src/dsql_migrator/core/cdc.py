@@ -50,6 +50,7 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Iterable,
     Literal,
     Mapping,
     NamedTuple,
@@ -2270,6 +2271,17 @@ def plugin_supports_sink_keys(plugin_version: object) -> bool:
     return bool(match) and int(match.group(1)) >= int(SINK_KEYS_MIN_PLUGIN_VERSION[1:])
 
 
+def plugin_version_is_older(deployed: object, bundled: object) -> bool:
+    """Is a stack's ``PluginVersion`` ``deployed`` older than ``bundled`` (both ``v<N>``)?
+
+    ``None``, ``""`` and any other shape are ``False``: an unknown plugin is not called
+    older. Pure.
+    """
+    found = _PLUGIN_VERSION_RE.fullmatch(str(deployed or "").strip())
+    ours = _PLUGIN_VERSION_RE.fullmatch(str(bundled or "").strip())
+    return bool(found and ours) and int(found.group(1)) < int(ours.group(1))
+
+
 def _replace_filled(
     filled: "Sequence[tuple[str, str]]", values: "Mapping[str, str]", after: str
 ) -> list[tuple[str, str]]:
@@ -2413,6 +2425,45 @@ def rekey_parameter_size_refusal(params: "CdcStackParams") -> "Optional[str]":
                 "be recreated with that key), then Start CDC."
             )
     return None
+
+
+# The cdc-stack parameters that carry an entry per captured table: its name, its topic, its
+# topic's partition count, or (TopicGroupInclude2 / 4) its topic when the size plan elevates
+# it. Each is ONE parameter, so these lists are what bounds the tables one pipeline captures.
+CDC_TABLE_LIST_PARAMS: tuple[str, ...] = (
+    "TableIncludeList",
+    "SinkTopics",
+    "SinkTopicPartitions",
+    "TopicGroupInclude2",
+    "TopicGroupInclude4",
+)
+
+
+def list_parameter_size_refusal(
+    filled: "Iterable[tuple[str, object]]",
+) -> "Optional[str]":
+    """Why these cdc-stack parameters must not be sent, or ``None``. Pure.
+
+    CloudFormation caps one parameter value at :data:`CDC_PARAMETER_BYTE_LIMIT` bytes, and
+    each of :data:`CDC_TABLE_LIST_PARAMS` grows with the captured tables. An oversized one
+    fails CreateStack / UpdateStack with a bare ValidationError -- after the plugins were
+    uploaded, and on Full load + CDC possibly after the whole load -- so this refuses it
+    first, naming the largest one, its size and the remedy.
+    """
+    sizes = {
+        key: len(str(value or "").encode("utf-8"))
+        for key, value in filled
+        if key in CDC_TABLE_LIST_PARAMS
+    }
+    over = [key for key, size in sizes.items() if size > CDC_PARAMETER_BYTE_LIMIT]
+    if not over:
+        return None
+    key = max(over, key=sizes.__getitem__)
+    return (
+        f"The captured tables need {sizes[key]:,} bytes in the CDC configuration ({key}), "
+        f"over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one parameter. "
+        "Capture fewer tables in this CDC pipeline, or use Full load only."
+    )
 
 
 def deployed_rekey_map(

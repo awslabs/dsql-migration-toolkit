@@ -724,7 +724,7 @@ aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
   --s3-bucket "$TEMPLATE_BUCKET" \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (re-supply the other parameters, or rely on previous values)
   # $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above
@@ -745,7 +745,11 @@ aws cloudformation deploy \
 > [!WARNING]
 > The control plane runs as a **single task**, so expect a brief interruption
 > during replacement. Your migrated data, the DSQL cluster, and a deployed
-> cdc-stack are unaffected and recovered on reconnect. In-flight session state
+> cdc-stack are unaffected and recovered on reconnect. A deployed cdc-stack keeps
+> the connector plugins it was deployed with: Start CDC never registers new ones, so
+> when the new image bundles a newer sink plugin, the CDC step says so (*This CDC
+> infrastructure runs an older sink plugin*), and only **Delete CDC infrastructure**
+> and a new deploy register it. In-flight session state
 > (workflow progress, an in-progress Full Load) lives on the task's ephemeral disk
 > and does **not** survive — **finish or quiesce in-flight jobs before updating**,
 > then reconnect and re-run the read-only Evaluation (minutes).

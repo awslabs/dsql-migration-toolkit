@@ -72,6 +72,7 @@ from dsql_migrator.core.cdc import (
     build_watermark_params,
     legacy_column_exclude_key_conflicts,
     cdc_expected_connector_names,
+    list_parameter_size_refusal,
     rekey_parameter_size_refusal,
     rekey_routing_log_lines,
 )
@@ -1639,6 +1640,11 @@ def run_cdc_infra_deploy(
         handle, stages=CDC_INFRA_STAGES, on_log=on_log, sleep=sleep
     )
     try:
+        # CloudFormation refuses a parameter value over 4,096 bytes, and the per-table lists
+        # grow with the capture: refuse an oversized one before anything is uploaded.
+        _list_refusal = list_parameter_size_refusal(params.filled)
+        if _list_refusal:
+            raise CdcDeployError(_list_refusal)
         # 0a. ensure plugin bucket + 0b. upload plugins (background — ~32-43 MiB,
         #     depending on the source engine).
         driver.stage("ensure_bucket", "IN_PROGRESS")
@@ -2144,6 +2150,10 @@ def run_cdc_start(
         _rekey_refusal = rekey_parameter_size_refusal(params)
         if _rekey_refusal:
             raise CdcDeployError(_rekey_refusal)
+        # ...and so do the table lists, which grow with the capture.
+        _list_refusal = list_parameter_size_refusal(params.filled)
+        if _list_refusal:
+            raise CdcDeployError(_list_refusal)
         # Backstop for the chooser: a KEPT 0.1.561 ColumnExcludeList may still exclude a
         # composite key column, which 0.1.561 refused to start with (Debezium cannot build
         # the record key). Covers Retry CDC and a UI that judged a stale deployed value.

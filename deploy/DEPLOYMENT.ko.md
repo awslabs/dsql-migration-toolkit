@@ -676,7 +676,7 @@ aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
   --s3-bucket "$TEMPLATE_BUCKET" \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (나머지 파라미터를 다시 제공하거나 이전 값에 의존)
   # $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷
@@ -695,7 +695,11 @@ aws cloudformation deploy \
 
 > [!WARNING]
 > 컨트롤 플레인은 **단일 태스크**로 실행되므로 교체 중 짧은 중단이 있습니다. 마이그레이션된 데이터,
-> DSQL 클러스터, 배포된 cdc-stack은 영향받지 않고 재연결 시 자동 복구됩니다. 진행 중 세션 상태
+> DSQL 클러스터, 배포된 cdc-stack은 영향받지 않고 재연결 시 자동 복구됩니다. 배포된 cdc-stack은
+> 배포될 때의 커넥터 플러그인을 그대로 씁니다. Start CDC는 새 플러그인을 등록하지 않으므로, 새
+> 이미지에 더 새로운 싱크 플러그인이 들어 있으면 CDC 단계가 그렇게 알려 주고(*This CDC
+> infrastructure runs an older sink plugin*), **Delete CDC infrastructure** 후 다시 배포해야만
+> 그 플러그인이 등록됩니다. 진행 중 세션 상태
 > (워크플로 진행, 진행 중인 Full Load)는 태스크 임시 디스크에 있어 **살아남지 않습니다** —
 > **업데이트 전에 진행 중 작업을 끝내거나 정지**한 뒤, 재연결해 읽기 전용 Evaluation을 다시
 > 실행(몇 분)하세요.

@@ -721,7 +721,7 @@ aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
   --s3-bucket "$TEMPLATE_BUCKET" \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (他のパラメータを再度指定するか、以前の値に依存する)
   # $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット
@@ -742,7 +742,12 @@ aws cloudformation deploy \
 > [!WARNING]
 > コントロールプレーンは**単一タスク**として実行されるため、置き換え中は短い中断が
 > 予想されます。移行済みのデータ、DSQL クラスター、デプロイ済みの cdc-stack は影響を
-> 受けず、再接続時に復旧します。進行中のセッション状態（ワークフローの進捗、進行中の
+> 受けず、再接続時に復旧します。デプロイ済みの cdc-stack は、デプロイ時のコネクタ
+> プラグインをそのまま使い続けます。Start CDC は新しいプラグインを登録しないため、新しい
+> イメージにより新しいシンクプラグインが同梱されている場合は CDC ステップがその旨を
+> 表示し（*This CDC infrastructure runs an older sink plugin*）、**Delete CDC
+> infrastructure** の後に再デプロイした場合にのみ、そのプラグインが登録されます。
+> 進行中のセッション状態（ワークフローの進捗、進行中の
 > Full Load）はタスクの一時ディスク上に存在し、**残りません** — **更新前に進行中の
 > ジョブを完了または静止させて**から、再接続して読み取り専用の Evaluation を再実行
 > してください（数分）。

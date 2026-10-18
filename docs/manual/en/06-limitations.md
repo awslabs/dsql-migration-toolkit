@@ -505,6 +505,23 @@ fails **loudly** where it can't.
   automatic action with explicit child-row statements in the application, and
   **quiesce source writes before the final cut-over comparison** so the divergence
   is caught.
+- **One CDC pipeline captures a bounded number of tables: about 80–160 with typical names.**
+  The CDC stack receives the captured tables in single CloudFormation parameters: the table
+  list (`TableIncludeList`), the sink's topic list (`SinkTopics`, one `dsqlcdc.<table>` per
+  table) and, when the deploy sizes partitions by table size (any capture with a few large
+  tables), the per-topic partition map (`SinkTopicPartitions`, one `dsqlcdc.<table>:<count>`
+  per table) and the lists of the tables given more partitions. CloudFormation limits a
+  parameter value to 4,096 bytes, so one pipeline captures at most about
+  4,097 ÷ (L + 11) tables, where L is the average length in bytes of a qualified table name
+  (`database.table` on MySQL, `schema.table` on PostgreSQL): about 155 tables with 15-byte
+  names, 130 with 20, 100 with 30 and 80 with 40. Evaluation allows 1,000 tables, and Full
+  load only has no such limit. Deploy CDC infrastructure and Start CDC refuse a larger
+  capture before anything is uploaded or created, and with Full load + CDC so does Start
+  Full Load, before any load (*Too many tables for one CDC pipeline*, naming the parameter
+  and its size). Until the Full Load has recorded the row estimates the partition map is
+  sized from, the map is judged with an entry for every table; Start CDC on a deployed
+  stack judges only the two lists it sends. Capture fewer tables in this CDC pipeline
+  (deselect them in the table picker), or use Full load only.
 - **CDC is billable while deployed.** The streaming pipeline (MSK Serverless +
   MSK Connect, plus a NAT gateway if created) costs money for as long as it runs.
   Tear down the cdc-stack after cut-over. Full Load alone provisions no streaming

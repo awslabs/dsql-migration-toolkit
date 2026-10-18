@@ -282,6 +282,8 @@ from dsql_migrator.ui.data_migration._models import (
     live_target_columns_of,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     capture_ambiguity_warning,
+    cdc_table_list_refusal,
+    table_picker_remedy,
     make_lob_candidates_for,
     cutover_restore_block_reason,
     effective_target_ddls,
@@ -3857,8 +3859,11 @@ def data_migration_exclusion_block(
     The in-content guard, the page header's Run (``app.data_migration_run_guard``) and
     ``runner()`` itself all read this, so none can start a load the others hold. Before the
     card locks: a saved exclusion that no longer applies, then a source column the applied
-    target DDL lacks (42703). ``None`` for CDC only, whose card sits inside the CDC sub-step
-    that Continue leads to -- its Deploy/Attach buttons carry the same gate there.
+    target DDL lacks (42703). Full load + CDC, before any load, also holds what CDC could
+    not carry afterwards: the capture list, and the per-table lists
+    (:func:`_pre_load_table_list_block`). ``None`` for CDC only, whose card sits inside the
+    CDC sub-step that Continue leads to -- its Deploy/Attach buttons carry the same gate
+    there.
     """
     # The first gate: settle a restored pre-overlay session's exclusions before any set
     # is read (a safety net for callers that restored without the app).
@@ -3884,19 +3889,42 @@ def data_migration_exclusion_block(
         capture = _pre_load_capture(migration_state, inventory)
     if capture is None:
         return None
+    scope = exclusion_scope(migration_state)
+    wanted = None if scope is None else set(scope)
+    tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
     if not capture.error:
         # An attached stack that streamed with another set: the load would write under
         # this session's set, then Start CDC refuses it (capture_exclusion_mismatch) --
         # refuse here, before the load, where the same remedy still applies.
-        scope = exclusion_scope(migration_state)
-        wanted = None if scope is None else set(scope)
-        tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
-        return capture_exclusion_mismatch(migration_state, inventory, capture, tables)
+        return capture_exclusion_mismatch(migration_state, inventory, capture, tables) or (
+            _pre_load_table_list_block(migration_state, job_manager, session, tables)
+        )
     # When the generated columns alone exceed the limit, no exclusion change fixes it and
-    # 0.1.561 let this load run: warn on the card (capture_pre_load_notices), do not hold.
+    # 0.1.561 let this load run: warn on the card (capture_pre_load_notices), do not hold
+    # for them.
     if capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
-        return None
+        return _pre_load_table_list_block(migration_state, job_manager, session, tables)
     return capture_error_with_remedy(migration_state, job_manager, capture)
+
+
+def _pre_load_table_list_block(migration_state, job_manager, session, tables) -> Optional[str]:
+    """The per-table CDC lists after this Full load + CDC load would not fit one stack
+    parameter each (:func:`cdc_table_list_refusal`): the hold with its remedy, or ``None``.
+
+    Judged as the next CDC operation sends them: Start CDC's lists when a cdc-stack already
+    owns the partition plan (deployed, or deploying), else the deploy's, whose plan is sized
+    from row estimates only this load records -- so judged at its largest.
+    """
+    planned = cdc_infra_prep_state(migration_state, job_manager) in (
+        "ready",
+        "deploying",
+    ) and not cdc_stack_being_deleted(migration_state, job_manager)
+    refusal = cdc_table_list_refusal([t.name for t in tables], deploy=not planned)
+    if refusal is None:
+        return None
+    return f"{refusal} " + table_picker_remedy(
+        table_set_lock_reason(migration_state, job_manager, session)
+    )
 
 
 def _pre_load_capture(migration_state, inventory):

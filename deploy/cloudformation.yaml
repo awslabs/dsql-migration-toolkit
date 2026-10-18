@@ -1897,9 +1897,11 @@ Resources:
         # (brief downtime). The cdc-stack (MSK/connectors) and the migrated DSQL
         # data are independent of this task, so a replacement never touches them; and
         # because the job/session snapshots persist in the durable S3 stores above, the
-        # replacement RESUMES -- the Full Load continues from its last checkpoint
-        # (unfinished PK ranges re-run, idempotent) and a reconnecting browser restores
-        # its workbench rather than re-running Evaluation.
+        # replacement keeps the recorded progress -- an interrupted Full Load is marked
+        # failed with its finished tables kept, and "Retry unfinished tables" reloads each
+        # interrupted table from its start (idempotent; the resume unit is a table, not a
+        # PK range) -- and a reconnecting browser restores its workbench rather than
+        # re-running Evaluation.
         MinimumHealthyPercent: 0
         MaximumPercent: 100
       TaskDefinition:

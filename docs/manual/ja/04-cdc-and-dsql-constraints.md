@@ -20,7 +20,7 @@ CDC が必要になるのは、**大規模または継続的な** マイグレ�
 
 - **Debezium source connector（MySQL または PostgreSQL）** は、ソースの変更ログ — MySQL はバイナリログ、PostgreSQL は論理レプリケーションスロット経由の write-ahead log (WAL) — を読み込み、変更イベントを出力します。ソースは読み取り専用のままで、唯一認められた例外として、PostgreSQL ソースではツールがマイグレーション対象テーブルだけにスコープした論理スロットと publication を作成（し、解体時に削除）します。
 - **Amazon MSK (Kafka)** は耐久性のあるバックボーンです。**テーブルごとに 1 トピック** を持ち、主キーでキーイングし (ある行のすべての変更が 1 つのパーティションで順序を保つ)、加えてデッドレター (DLQ) トピック、Debezium の **スキーマ履歴** トピック (新しい開始位置で `recovery` が構築し、再起動時に再生される対象 — **MySQL ソース専用** であり、PostgreSQL/pgoutput コネクタにはスキーマ履歴トピックがありません)、およびアイドル区間でもコミット済みソース位置を前進させ、再起動時のソース位置がアイドル区間のせいで取り残されないようにする **ハートビート** トピック — MySQL は binlog オフセット、PostgreSQL はスロットの確定 LSN (これは WAL の蓄積も止めます) — を備えます (再起動にギャップがないのは、sink が適用していなかった変更を CDC トピックがまだ保持している間だけです: §4.3)。
-- **カスタム DSQL sink connector** — このプロジェクトが所有する Java Kafka Connect プラグイン — が変更を DSQL に適用します。両方の connector は **マネージドの MSK Connect** 上で実行され、ツール自身は **sink 用のコンピュートを一切持たず**、コントロールプレーンとして機能します (構成の作成、再開ポイントの確立 — MySQL では Kafka 開始オフセットをシードし、PostgreSQL では論理レプリケーションスロットと publication を作成 — 監視を行います)。
+- **カスタム DSQL sink connector** — このプロジェクトが所有する Java Kafka Connect プラグイン — が変更を DSQL に適用します。両方の connector は **マネージドの MSK Connect** 上で実行され、ツール自身は **sink 用のコンピュートを一切持たず**、コントロールプレーンとして機能します (構成の作成、再開ポイントの確立 — MySQL では Kafka 開始オフセットをシードし、PostgreSQL では論理レプリケーションスロットと publication を作成 — 監視を行います)。CDC スタックはデプロイ時のプラグインをそのまま使い続けます。Start CDC は新しいプラグインを登録しないため、このバージョンのツールに同梱されているものより古い sink プラグインをスタックが実行している間は CDC ステップがその旨を表示し (*This CDC infrastructure runs an older sink plugin*)、**Delete CDC infrastructure** の後に再デプロイすると同梱のプラグインが登録されます。
 
 **なぜ標準的な JDBC sink ではなく *カスタム* sink なのでしょうか。**
 

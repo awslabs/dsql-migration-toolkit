@@ -43,7 +43,11 @@ cut-over where a short freeze is acceptable, Full Load alone is enough.
   Connect**; the tool runs **no sink compute of its own**, it is the control
   plane (it builds the configs, establishes the resume point — for MySQL it seeds
   the Kafka start offset, for PostgreSQL it creates the logical replication slot
-  and publication — and monitors).
+  and publication — and monitors). A CDC stack keeps the plugins it was deployed
+  with: Start CDC never registers new ones, so while the stack runs an older sink
+  plugin than this version of the tool bundles, the CDC step says so (*This CDC
+  infrastructure runs an older sink plugin*), and **Delete CDC infrastructure** and a
+  new deploy register the bundled one.
 
 **Why a *custom* sink and not a stock JDBC sink?**
 

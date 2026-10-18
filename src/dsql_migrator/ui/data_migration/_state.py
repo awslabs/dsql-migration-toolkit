@@ -463,6 +463,11 @@ class DataMigrationState:
         # preview show what Start CDC will send: a stack deployed with the 0.1.561 form
         # keeps it (core.cdc.choose_column_exclude_value). Transient/session-only.
         self.cdc_deployed_column_exclude_list: Optional[str] = None
+        # The DEPLOYED stack's PluginVersion, from the same phase probe. Start CDC never
+        # re-registers the plugins, so the CDC step warns while it is older than the one this
+        # version bundles (core.s3_provision.PLUGIN_VERSION). None: no stack, or not read.
+        # Transient/session-only.
+        self.cdc_deployed_plugin_version: Optional[str] = None
         # The binlog (file, pos) the stack's LAST Start offered the offset seeder, from the
         # same phase probe (Stop carries Watermark* forward). None: no stack / no seed.
         self.cdc_deployed_watermark: Optional[tuple[str, str]] = None
@@ -1407,9 +1412,10 @@ class DataMigrationState:
                 # about target tables, whichever stack produced the loss.
                 self.cdc_deployed_message_key_columns = None
                 # The snapshot-mode facts describe the previously-targeted stack too, and
-                # so does its gtid_mode record (G20).
+                # so does its gtid_mode record (G20), and its plugin version.
                 self.cdc_deployed_snapshot_mode = None
                 self.cdc_deployed_gtid_mode = None
+                self.cdc_deployed_plugin_version = None
                 self.cdc_history_missing = False
                 # ...and so does the start offset a Start offered its seeder (G26 repair): that
                 # stack's offset must not refuse a seed on this one (Start's earlier-offer
@@ -1433,9 +1439,10 @@ class DataMigrationState:
             if phase == "absent":
                 self.cdc_offered_seed = None  # a new stack gets a new offsets topic
                 # ...and a new schema history, and no connectors (nor why they stopped),
-                # and no gtid_mode record (G20).
+                # no gtid_mode record (G20), and the plugins its deploy registers.
                 self.cdc_deployed_snapshot_mode = None
                 self.cdc_deployed_gtid_mode = None
+                self.cdc_deployed_plugin_version = None
                 self.cdc_history_missing = False
                 self._clear_cdc_connector_diagnoses_locked(None)
 
@@ -1505,6 +1512,7 @@ class DataMigrationState:
             # ...and so is its re-key map (REPLICA IDENTITY findings are kept, see above).
             self.cdc_deployed_message_key_columns = None
             self.cdc_deployed_column_exclude_list = None
+            self.cdc_deployed_plugin_version = None
             self.cdc_deployed_watermark = None
             self.cdc_deployed_watermark_gtids = None
             self.cdc_deployed_gtid_mode = None
@@ -1769,6 +1777,12 @@ class DataMigrationState:
         """Record the DEPLOYED stack's ColumnExcludeList (``None``: no stack/param)."""
         with self._lock:
             self.cdc_deployed_column_exclude_list = None if value is None else str(value)
+
+    def set_cdc_deployed_plugin_version(self, value: Optional[str]) -> None:
+        """Record the DEPLOYED stack's PluginVersion (blank or ``None``: no stack/param)."""
+        text = str(value or "").strip()
+        with self._lock:
+            self.cdc_deployed_plugin_version = text or None
 
     def note_cdc_offered_seed(self, seed) -> None:
         """Record a seed a Start offers the seeder, keeping the LATEST one (binlog order)."""

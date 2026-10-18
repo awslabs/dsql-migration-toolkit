@@ -1490,6 +1490,11 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
         if _deployed_params and "ColumnExcludeList" in _deployed_params
         else None
     )
+    # ...and its PluginVersion: Start CDC never re-registers the plugins, so the CDC step
+    # says when this version bundles a newer sink plugin than the stack runs.
+    _set_plugin = getattr(migration_state, "set_cdc_deployed_plugin_version", None)
+    if callable(_set_plugin):
+        _set_plugin((_deployed_params or {}).get("PluginVersion"))
     # The DEPLOYED re-key map, from the SAME describe: every table CDC re-keys, whether its
     # records are keyed on the composite key (MessageKeyColumns) or on the source primary key
     # with the sink writing the composite key (SinkKeyColumns, G15) -- the runtime REPLICA
