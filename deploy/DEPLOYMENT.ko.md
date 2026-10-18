@@ -699,10 +699,15 @@ aws cloudformation deploy \
 > 배포될 때의 커넥터 플러그인을 그대로 씁니다. Start CDC는 새 플러그인을 등록하지 않으므로, 새
 > 이미지에 더 새로운 싱크 플러그인이 들어 있으면 CDC 단계가 그렇게 알려 주고(*This CDC
 > infrastructure runs an older sink plugin*), **Delete CDC infrastructure** 후 다시 배포해야만
-> 그 플러그인이 등록됩니다. 진행 중 세션 상태
-> (워크플로 진행, 진행 중인 Full Load)는 태스크 임시 디스크에 있어 **살아남지 않습니다** —
-> **업데이트 전에 진행 중 작업을 끝내거나 정지**한 뒤, 재연결해 읽기 전용 Evaluation을 다시
-> 실행(몇 분)하세요.
+> 그 플러그인이 등록됩니다. 세션 상태와 Full Load 기록은 도구가 관리하는 S3 버킷(`sessions/`와
+> `jobs/` 접두사, 템플릿이 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`과 `DSQL_MIGRATOR_JOB_STATE_BUCKET`을
+> 설정)에 보관되므로, 같은 브라우저로 재연결하면 Evaluation을 다시 실행하지 않고도 같은 단계로 돌아가
+> Evaluation 결과, 스키마 선택, 테이블 선택, 제외 규칙, CDC 시작 지점을 그대로 씁니다. **살아남지
+> 않는 것**: 연결 자격 증명(메모리에만 보관되므로 Connect 단계에서 소스와 타깃 연결을 다시 테스트)과 그
+> 순간 실행 중이던 작업입니다. 진행 중인 Full Load는 중단되어 끝난 테이블은 유지된 채 실패로 표시되고,
+> **Retry unfinished tables**가 중단된 테이블마다 처음부터 다시 적재하므로 큰 테이블도 처음부터 다시
+> 읽습니다. CDC 단계가 이미 시작한 CloudFormation 작업은 AWS에서 계속 진행되고, 재연결하면 CDC 단계가
+> 스택을 다시 읽습니다. **업데이트 전에 진행 중 작업을 끝내거나 정지하세요.**
 
 ### AI 보조 변환 활성화 (Optional)
 

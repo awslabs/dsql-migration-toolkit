@@ -111,11 +111,13 @@ tables. See [Chapter 3 — Full Load](03-full-load.md).
 
 **Q8. Is Full Load idempotent? What if it's interrupted?**
 
-Yes. Rows load in bounded-parallel, idempotent batches, each mapped to a stable PK
-range. If a load is **interrupted** (crash, stop, task replacement), re-running it
-**re-runs only the unfinished PK ranges** and converges to exactly the uninterrupted
-state — **no duplicates, no loss**. Per-table failures are isolated: one bad table
-doesn't abort the others.
+Yes. Rows load in bounded-parallel, idempotent batches, so writing a row again never
+duplicates it. If a load is **interrupted** (crash, stop, task replacement), the tables
+it finished are kept, and **Retry unfinished tables** reloads each unfinished table
+**from its start**, skipping the rows it had already written (with **Drop & reload**,
+the table is recreated first). It converges to exactly the uninterrupted state — **no
+duplicates, no loss** — but a very large table interrupted near its end is read again in
+full. Per-table failures are isolated: one bad table doesn't abort the others.
 
 
 **Q8a. What if the source Aurora cluster fails over mid-load?**
@@ -545,10 +547,12 @@ identity must hold them**):
 
 **Q30. Can I run more than one migration / scale the tool horizontally?**
 
-The AWS-hosted form is a **single ECS Fargate task** whose job/session state is local
-SQLite on ephemeral storage — a task replacement loses in-flight job state (you
-reconnect and re-run the read-only steps). Don't run more than one task without
-moving that state to a shared store (e.g. the managed S3 bucket for zero-loss resume). See
+The AWS-hosted form is a **single ECS Fargate task**; don't run more than one. Its
+job and session state are already kept in the tool's managed S3 bucket, so a task
+replacement keeps the workbench and the Full Load record (a job running at that moment
+is interrupted, and Retry unfinished tables reloads each table it did not finish from its
+start). The one-task limit is about **single-writer orchestration**: CDC deploys are
+coordinated, and each session's live state is held, inside that one task. See
 [Chapter 6 §6.3](06-limitations.md#63-deployment-limits-the-aws-hosted-form).
 
 

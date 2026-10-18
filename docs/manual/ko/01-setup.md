@@ -225,7 +225,7 @@ CloudFormation 파라미터에 대응합니다:
 | 태스크 egress | **VPC 엔드포인트** (가능하면 권장) | DSQL / Secrets Manager / ECR / Logs (/ Bedrock)에 공용 경로 없이 프라이빗으로 도달. 아니면 NAT 게이트웨이. |
 | 이미지 참조 | **immutable 태그 또는 digest** (권장) | 재현 가능한 배포 — 움직이는 `:latest` 피하기. |
 | 활동 로그 CloudWatch 미러 | **켜기** (권장) | 영속 감사 추적 — 태스크의 `/tmp` 사본은 태스크 교체 시 사라짐. |
-| 작업/세션 상태 | **S3 백업** — 관리형 버킷 (무손실 재개 권장) | 태스크 교체 후에도 살아남아 진행 중 Full Load가 재개됨. 기본 `/tmp`는 태스크별·휘발성. |
+| 작업/세션 상태 | **S3 백업** — 관리형 버킷 (템플릿이 설정) | 태스크 교체 후에도 살아남음: 작업 화면 상태와 Full Load 기록이 유지됨. 그 순간 실행 중이던 적재는 중단되고, Retry unfinished tables가 끝나지 않은 테이블마다 처음부터 다시 적재. `/tmp` SQLite 경로는 버킷이 설정되지 않았을 때(로컬 실행)의 대체 경로일 뿐임. |
 
 > *동작을 가장 빨리 보는* 길은 **Dev/Test 프로파일**(`internal` ALB,
 > `EnableCognitoAuth=false`, 자체 서명 인증서) — 여전히 실제 Fargate이며 구성 요소만 더 적습니다.

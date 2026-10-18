@@ -50,7 +50,7 @@ PostgreSQL-16 와이어) 타입 이질성 상황은 해당되지 않지만, 분�
 | **벌크 로드에서 CDC로 넘어가는 지점** (거의 무중단 전환) | 벌크 로드에서 CDC로 넘어갈 때 사이 구간을 놓치면 **행 누락**, 겹치면 **중복** | 벌크 로드가 잡아 둔 **워터마크**부터 CDC를 시작. **MySQL:** binlog `file:position`(또는 GTID) 워터마크를 in-VPC 오프셋 시더 Lambda가 Kafka `connect-offsets`에 심고 Debezium이 `snapshot.mode=recovery`로 재개. **PostgreSQL:** WAL LSN 워터마크를 미리 만든 `pgoutput` 논리 복제 슬롯(그리고 마이그레이션 대상 테이블만 담은 publication)이 고정하고, Debezium이 `snapshot.mode=never`로 슬롯에서 재개 — 오프셋 시더 Lambda나 `connect-offsets` 시드 없음(`seed_mode='external'`). 어느 쪽이든 PK 기준 **멱등 적용**이라 겹쳐도 중복이 생기지 않음 | Validation **대조** (누락 0 / 잉여 0) |
 | **외래 키가 많은 스키마** | FK를 켠 채 적재·CDC를 돌리면 순서가 뒤섞인 행(부모보다 먼저 온 자식)이 FK 위반으로 실패하고, 소스가 캐스케이드한 삭제는 CDC로 넘어오지 않아 고아 행이 생김 | FK를 DDL에서 떼지 않고 **보존**해 데이터 적재를 마친 뒤(CDC는 cut over 시점) `ADD CONSTRAINT`로 다시 생성. 적용 직전 **고아 검사**가 부모 없는 자식 행을 잡아내며(강제 FK는 고아가 있으면 적용 실패), FK를 떼기로 한 경우엔 앱 측 무결성 안전망 | Validation **고아 검사** |
 | **마이그레이션 중에도 계속 바뀌는 라이브 소스** | 옮기는 사이 소스가 전진하면 행 수 차이가 생기는데, 이게 버그인지 정상인지 헷갈림 | 스냅샷 이후의 행 수 차이는 버그가 아니라 *신규 소스 활동*으로 귀속. **MySQL:** 워터마크의 binlog/GTID 위치로 **드리프트를 감지·보고**. **PostgreSQL:** 워터마크에 WAL LSN(`Watermark.wal_lsn`)을 기록하지만 Validation이 LSN 기반 드리프트를 재계산하지는 않으므로(`drifted = 판정 불가`) 대신 CDC 수렴을 지켜봄 | Validation 리포트의 **drifted** 플래그 |
-| **중간에 멈추거나 다시 시작** | 순진한 로더는 처음부터 다시 하거나 중복을 만듦 | `INSERT … ON CONFLICT`로 **다시 적용해도 안전**하고, 재개 때는 **미완료 PK 범위만** 다시 실행 | 재개 후 Full Load 진행률 |
+| **중간에 멈추거나 다시 시작** | 순진한 로더는 처음부터 다시 하거나 중복을 만듦 | `INSERT … ON CONFLICT`로 **다시 적용해도 안전**하고, 재개 때는 **끝난 테이블은 그대로 두고** 끝나지 않은 테이블만 처음부터 다시 적재(Retry unfinished tables) | 재개 후 Full Load 진행률 |
 
 > 표의 "확인하는 곳"은 모두 **당신이 UI에서 직접 보는 화면**입니다. 특히 마지막 **Validation**
 > 단계는 정확한 행 수·체크섬·전체 PK 대조로 판정을 내리므로, "잘 됐겠지"가 아니라 **증거로** 전환을

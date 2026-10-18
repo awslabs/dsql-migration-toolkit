@@ -3811,8 +3811,35 @@ def table_picker_remedy(table_lock: "Optional[str]") -> str:
     )
 
 
-# The notice header of a table-list refusal (cdc_table_list_refusal).
+# The notice header of a table-list refusal (cdc_table_list_refusal), and of the warning
+# before a Full load + CDC load (cdc_pre_load_table_list_warning).
 CDC_TABLE_LIST_HEADER = "Too many tables for one CDC pipeline"
+# The notice header of a warning that only the deploy's largest partition plan would not
+# fit (cdc_partition_map_worst_case).
+CDC_TABLE_LIST_WORST_CASE_HEADER = "Possibly too many tables for one CDC pipeline"
+
+
+def _cdc_table_lists(names: "Sequence[str]") -> "list[tuple[str, str]]":
+    """TableIncludeList and SinkTopics as the parameter builders send them: the two lists
+    every Deploy CDC infrastructure and every Start CDC sends."""
+    from dsql_migrator.core.cdc import CDC_DEFAULT_TOPIC_PREFIX
+
+    return [
+        ("TableIncludeList", ",".join(names)),
+        ("SinkTopics", ",".join(f"{CDC_DEFAULT_TOPIC_PREFIX}.{name}" for name in names)),
+    ]
+
+
+def _cdc_deploy_lists(
+    names: "Sequence[str]", row_counts_by_table: "Optional[Mapping[str, int]]"
+) -> "list[tuple[str, str]]":
+    """The deploy's per-table lists: the two above plus the size plan the deploy computes
+    from ``row_counts_by_table`` (``core.cdc.cdc_scaling_params``)."""
+    from dsql_migrator.core.cdc import CDC_DEFAULT_TOPIC_PREFIX, cdc_scaling_params
+
+    return _cdc_table_lists(names) + cdc_scaling_params(
+        names, CDC_DEFAULT_TOPIC_PREFIX, row_counts_by_table=row_counts_by_table
+    )
 
 
 def cdc_table_list_refusal(
@@ -3825,28 +3852,121 @@ def cdc_table_list_refusal(
 
     The per-table lists the cdc-stack parameter builders send for ``table_names``, judged by
     ``core.cdc.list_parameter_size_refusal``: TableIncludeList and SinkTopics (Deploy CDC
-    infrastructure and Start CDC) and, with ``deploy``, the size plan's SinkTopicPartitions /
-    TopicGroupInclude2 / TopicGroupInclude4 (a Start keeps the deployed ones).
-    ``row_counts_by_table`` is what the deploy plans from; without it (no Full Load has
-    recorded it yet) the largest plan is judged -- a partition count for every topic, as
-    any skewed capture gets. Each caller appends :func:`table_picker_remedy`.
+    infrastructure and Start CDC) and, with ``deploy``, the size plan the deploy computes from
+    ``row_counts_by_table`` -- SinkTopicPartitions / TopicGroupInclude2 / TopicGroupInclude4
+    for a skewed capture, none for an even or absent size signal (the uniform plan) -- exactly
+    as the builders do (a Start keeps the deployed ones). Where the row estimates the deploy
+    will plan from are not known yet, :func:`cdc_partition_map_worst_case` says what its
+    largest plan needs. Each caller appends :func:`table_picker_remedy`.
     """
-    from dsql_migrator.core.cdc import (
-        CDC_DEFAULT_TOPIC_PREFIX,
-        cdc_scaling_params,
-        list_parameter_size_refusal,
-    )
+    from dsql_migrator.core.cdc import list_parameter_size_refusal
 
     names = list(table_names)
-    filled = [
-        ("TableIncludeList", ",".join(names)),
-        ("SinkTopics", ",".join(f"{CDC_DEFAULT_TOPIC_PREFIX}.{name}" for name in names)),
-    ]
-    if deploy:
-        # One table holding every row is elevated, and an elevated plan lists every topic.
-        counts = row_counts_by_table or {name: int(i == 0) for i, name in enumerate(names)}
-        filled += cdc_scaling_params(names, CDC_DEFAULT_TOPIC_PREFIX, row_counts_by_table=counts)
-    return list_parameter_size_refusal(filled)
+    return list_parameter_size_refusal(
+        _cdc_deploy_lists(names, row_counts_by_table) if deploy else _cdc_table_lists(names)
+    )
+
+
+def cdc_tables_per_pipeline(table_count: int, list_bytes: int) -> int:
+    """About how many tables like these one CDC pipeline captures, from one of their lists:
+    ``table_count`` comma-joined entries in ``list_bytes`` bytes, scaled to CloudFormation's
+    per-parameter limit. Pure."""
+    from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT
+
+    return (CDC_PARAMETER_BYTE_LIMIT + 1) * table_count // (list_bytes + 1)
+
+
+def _largest_partition_map_bytes(names: "Sequence[str]") -> int:
+    """The size of SinkTopicPartitions at the deploy's largest plan -- a count for every
+    topic, which any capture gets once one table holds at least twice the average row count
+    -- or 0 where the deploy never sends one (fewer tables than the sink's parallelism, or a
+    fixed DSQL_MIGRATOR_CDC_TOPIC_PARTITIONS)."""
+    # One table holding every row is elevated, and an elevated plan lists every topic.
+    largest = {name: int(i == 0) for i, name in enumerate(names)}
+    return len(
+        (dict(_cdc_deploy_lists(names, largest)).get("SinkTopicPartitions") or "").encode(
+            "utf-8"
+        )
+    )
+
+
+def cdc_partition_map_worst_case(table_names: "Sequence[str]") -> "Optional[str]":
+    """The sentence saying the deploy's largest partition plan would not fit one stack
+    parameter while the lists every deploy sends do, or ``None``. Pure.
+
+    For a deploy whose row estimates are not known yet (recorded by a Full Load, else read
+    from the source when Deploy CDC infrastructure is clicked): once one table holds at
+    least twice the average row count, the deploy sends a partition count for every topic
+    (SinkTopicPartitions, the longest list); for evenly sized tables it sends none. So only
+    this worst case can be said before the estimates are read.
+    """
+    from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT, oversized_table_list
+
+    names = list(table_names)
+    if oversized_table_list(_cdc_table_lists(names)) is not None:
+        return None  # refused whatever the plan: cdc_table_list_refusal says so
+    size = _largest_partition_map_bytes(names)
+    if size <= CDC_PARAMETER_BYTE_LIMIT:
+        return None
+    return (
+        "If one of these tables holds at least twice their average row count, the deploy "
+        "gives it more partitions and sends a partition count for every table: "
+        f"{size:,} bytes in the CDC configuration (SinkTopicPartitions), over CloudFormation's "
+        f"{CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one parameter (about "
+        f"{cdc_tables_per_pipeline(len(names), size):,} of these tables fit)."
+    )
+
+
+def cdc_pre_load_table_list_warning(
+    table_names: "Sequence[str]", *, planned: bool, table_lock: "Optional[str]"
+) -> "Optional[str]":
+    """What Full load + CDC says before its load when one CDC pipeline cannot capture all of
+    ``table_names`` (the load's selection), or ``None``. Pure.
+
+    A warning, never a hold: the load may take every table and, until CDC starts, the tables
+    CDC does not need are unticked (G16); Deploy CDC infrastructure and Start CDC then judge
+    the real capture. ``planned``: a cdc-stack already owns the partition plan, so only Start
+    CDC's two lists count; otherwise the deploy's, whose plan this load's row estimates size
+    -- so its worst case is said too (:func:`cdc_partition_map_worst_case`). ``table_lock``
+    is the table picker's lock reason (:func:`table_picker_remedy`).
+    """
+    from dsql_migrator.core.cdc import CDC_PARAMETER_BYTE_LIMIT, oversized_table_list
+
+    names = list(table_names)
+    found = oversized_table_list(_cdc_table_lists(names))
+    if found is not None:
+        key, size = found
+        fit = cdc_tables_per_pipeline(len(names), size)
+        worst_fit = (
+            fit if planned else cdc_tables_per_pipeline(
+                len(names), max(size, _largest_partition_map_bytes(names))
+            )
+        )
+        fit_text = (
+            f"about {fit:,} of them"
+            if worst_fit >= fit
+            else f"about {worst_fit:,} of them ({fit:,} if none holds twice their average "
+            "row count)"
+        )
+        refusing = "Start CDC refuses" if planned else (
+            "Deploy CDC infrastructure and Start CDC refuse"
+        )
+        fact = (
+            f"The {len(names):,} selected tables need {size:,} bytes in the CDC configuration "
+            f"({key}), over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one "
+            f"parameter: one CDC pipeline captures {fit_text}, so {refusing} this set."
+        )
+    else:
+        worst = None if planned else cdc_partition_map_worst_case(names)
+        if worst is None:
+            return None
+        fact = f"{worst} Deploy CDC infrastructure would then refuse this set."
+    return (
+        f"{fact} The Full Load can still load every selected table: after it, until CDC "
+        "starts, untick in the table list the tables CDC does not need to capture (they stay "
+        "on Aurora DSQL as loaded; CDC and Validation skip them), or use Full load only. Or "
+        "capture fewer before the load: " + table_picker_remedy(table_lock)
+    )
 
 
 # DSQL caps a single value at 1 MiB. Used for display.

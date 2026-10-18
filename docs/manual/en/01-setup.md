@@ -261,7 +261,7 @@ CloudFormation parameter in [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.
 | Task egress | **VPC endpoints** (Recommended where practical) | Reach DSQL / Secrets Manager / ECR / Logs (/ Bedrock) privately, with no public path; otherwise a NAT gateway. |
 | Image reference | **immutable tag or digest** (Recommended) | Reproducible deploys; avoid a moving `:latest`. |
 | Activity-log CloudWatch mirror | **on** (Recommended) | A durable audit trail — the on-task `/tmp` copy is lost on task replacement. |
-| Job/session state | **S3-backed** — the managed bucket (Recommended for zero-loss resume) | Survives a task replacement so an in-flight Full Load resumes; the default `/tmp` is per-task and ephemeral. |
+| Job/session state | **S3-backed** — the managed bucket (the templates set it) | Survives a task replacement: the workbench and the Full Load record are kept. A load running at that moment is interrupted, and Retry unfinished tables reloads each table it did not finish from its start. The `/tmp` SQLite paths are only the fallback when no bucket is set (a local run). |
 
 > The fastest path to *see it run* is the **Dev/Test profile** (`internal` ALB,
 > `EnableCognitoAuth=false`, self-signed cert) — still real Fargate, just fewer

@@ -749,10 +749,18 @@ aws cloudformation deploy \
 > the connector plugins it was deployed with: Start CDC never registers new ones, so
 > when the new image bundles a newer sink plugin, the CDC step says so (*This CDC
 > infrastructure runs an older sink plugin*), and only **Delete CDC infrastructure**
-> and a new deploy register it. In-flight session state
-> (workflow progress, an in-progress Full Load) lives on the task's ephemeral disk
-> and does **not** survive — **finish or quiesce in-flight jobs before updating**,
-> then reconnect and re-run the read-only Evaluation (minutes).
+> and a new deploy register it. The session state and the Full Load record are kept
+> in the tool's managed S3 bucket (`sessions/` and `jobs/` prefixes; the template sets
+> `DSQL_MIGRATOR_SESSION_STATE_BUCKET` and `DSQL_MIGRATOR_JOB_STATE_BUCKET`), so the
+> same browser reconnects to the same step with its Evaluation result, schema choices,
+> table selection, exclusion rules and CDC start point, without re-running Evaluation.
+> What does **not** survive: the connection credentials (kept in memory only: re-test
+> the source and target connections on the Connect step), and any job running at that
+> moment. An in-progress Full Load is interrupted and marked failed with its finished
+> tables kept, and **Retry unfinished tables** reloads each interrupted table from its
+> start, so a large table is read again in full. A CloudFormation operation the CDC
+> step had already started keeps running in AWS, and the CDC step reads the stack
+> again when you reconnect. **Finish or stop in-flight jobs before updating.**
 
 ### Enable AI-assisted conversion (optional)
 

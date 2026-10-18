@@ -108,7 +108,7 @@ Full Load, key-based CDC).
 
 | DSQL characteristic | Scenario tested | How it's exercised |
 |---|---|---|
-| Idempotent re-apply | Re-run a batch / resume an interrupted load | `INSERT … ON CONFLICT` never duplicates; resume re-runs only unfinished PK ranges and converges to the uninterrupted state (`test_reapplying_batches_does_not_duplicate_rows`, `test_resume_skips_done_batches_and_converges_to_uninterrupted_state`) |
+| Idempotent re-apply | Re-run a batch / resume an interrupted load | `INSERT … ON CONFLICT` never duplicates (`test_reapplying_batches_does_not_duplicate_rows`). An interrupted load keeps its finished tables and leaves the interrupted ones to **Retry unfinished tables**, which reloads each from its start (`test_job_manager_restore_reconciles_interrupted_run`); only a re-read of the same snapshot inside a running load skips the batches it already committed, and converges to the uninterrupted state (`test_resume_skips_done_batches_and_converges_to_uninterrupted_state`) |
 
 **Run the suites:** `\.venv/bin/python -m pytest -q` and
 `cd connectors/dsql-sink && mvn -q test`.

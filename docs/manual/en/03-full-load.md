@@ -396,17 +396,17 @@ which PKs were quarantined and why.
 
 ## 3.7 Resumability
 
-Because rows stream in **keyset (PK) order**, batch *i* always maps to the same
-PK range on every run. That makes batches **stable, deterministic resumable
-units**:
+The unit an interrupted Full Load resumes from is the **table**, not a PK range:
 
-- a completed batch is recorded as `DONE`;
-- a stop / retry re-runs only the unfinished ranges;
+- a finished table is recorded as `DONE` and kept;
+- a stop, a crash or a task replacement leaves each unfinished table to be **reloaded
+  from its start**, in the "skip existing" mode (§3.4) or, with **Drop & reload**,
+  recreated first, so a very large table interrupted near its end is read again in full;
 - `INSERT ... ON CONFLICT` makes re-running a batch idempotent (no duplicates).
 
 The **Retry unfinished tables** path resets only the unfinished tables to pending,
-**reuses the original watermark**, and keeps the completed tables — so you never redo
-work or lose the CDC handoff point.
+**reuses the original watermark**, and keeps the completed tables — so you never reload
+a finished table or lose the CDC handoff point.
 
 A table selected after the load (Full load only lets the table set change; see
 [13.7](13-excluding-tables-and-columns.md)) is loaded by the same retry, but the

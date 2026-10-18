@@ -562,9 +562,9 @@ Resources:
   # -- this lets a reconnecting browser resume its persisted workbench state
   # (workflow progress, Evaluation result, Full Load linkage) instead of
   # re-running Step 1. It only signs the session cookie; no DB/user credentials
-  # are stored here. Note: per-session SQLite state still lives on the task's
-  # ephemeral storage, so restoration across a full task *replacement* also needs
-  # durable storage (out of scope for this stack).
+  # are stored here. The state itself survives a task *replacement* because the
+  # task points its session and job stores at the durable S3 bucket
+  # (DSQL_MIGRATOR_SESSION_STATE_BUCKET / DSQL_MIGRATOR_JOB_STATE_BUCKET below).
   # No KmsKeyId, deliberately (CKV_AWS_149 / SECRETSMANAGER_USING_CMK): this stays on
   # the AWS-managed aws/secretsmanager key. What is being declined is a customer-
   # managed key, which is possible but not free here -- it costs ~$1/month, the

@@ -233,17 +233,16 @@ def test_the_ui_judges_exactly_what_the_builders_send(engine) -> None:
     assert cdc_table_list_refusal(small, deploy=False) is None
 
 
-def test_without_row_estimates_the_deploy_is_judged_at_its_largest_plan() -> None:
+def test_without_row_estimates_the_deploy_is_judged_as_the_builders_send_it() -> None:
     names = _band()
     # Start sends only TableIncludeList and SinkTopics, and they fit.
     assert cdc_table_list_refusal(names, deploy=False) is None
-    # The deploy's partition map, before any Full Load recorded the estimates it is sized
-    # from: an entry for every table, as any skewed capture gets.
-    largest = cdc_table_list_refusal(names, deploy=True)
+    # G131: no estimates is the uniform plan, which sends no partition map -- as the builders
+    # do. The largest plan is the worst case a warning names (cdc_partition_map_worst_case),
+    # and the Deploy click reads the estimates before it judges.
+    assert cdc_table_list_refusal(names, deploy=True) is None
+    largest = cdc_table_list_refusal(names, deploy=True, row_counts_by_table=_skewed(names))
     assert "need 4,289 bytes in the CDC configuration (SinkTopicPartitions)" in largest
-    assert cdc_table_list_refusal(names, deploy=True, row_counts_by_table=_skewed(names)) == (
-        largest
-    )
     # Even estimates: the uniform plan sends no partition map, so nothing is refused.
     even = {name: 1000 for name in names}
     assert cdc_table_list_refusal(names, deploy=True, row_counts_by_table=even) is None
@@ -274,11 +273,13 @@ def _state(names, mtype=MigrationType.FULL_LOAD_AND_CDC, phase="absent"):
 def test_the_deploy_button_is_held_with_the_parameter_and_the_picker_remedy() -> None:
     from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
 
-    names = _band()
+    # G131: without recorded estimates the button holds only the lists every deploy sends
+    # (the band of _band() is a warning there now -- test_g131_table_list_warning).
+    names = _names(300)
     state = _state(names)
     notice = _deploy_block_notice(state, _StubJobManager({}), _inventory(names), None)
     assert notice is not None and notice[0] == CDC_TABLE_LIST_HEADER
-    assert "(SinkTopicPartitions)" in notice[1]
+    assert "(SinkTopics)" in notice[1]
     assert notice[1].endswith("Deselect tables in the table picker.")
     # Attach sends no parameter: not held.
     assert _deploy_block_notice(
@@ -294,7 +295,9 @@ def test_the_deploy_button_is_held_with_the_parameter_and_the_picker_remedy() ->
 def test_the_deploy_click_refuses_before_any_aws_call(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _cdc_ui
 
-    names = _band()
+    # G131: lists every deploy sends over the limit are refused before even the source's
+    # row estimates are read (a plan judged on read estimates: test_g131_table_list_warning).
+    names = _names(300)
     io_calls: list = []
 
     class _Run:
@@ -316,7 +319,7 @@ def test_the_deploy_click_refuses_before_any_aws_call(monkeypatch) -> None:
         session=SimpleNamespace(target_config=SimpleNamespace(region="us-east-1")),
     ))
     ((text, tone),) = notes
-    assert tone == "negative" and "(SinkTopicPartitions)" in text
+    assert tone == "negative" and "(SinkTopics)" in text
     assert text.endswith("Deselect tables in the table picker.")
     assert io_calls == [] and submitted == []
 
@@ -365,29 +368,38 @@ def test_start_cdc_and_retry_cdc_refuse_before_any_parameter_or_job(monkeypatch)
     assert submitted == []
 
 
-def test_start_full_load_is_held_before_the_load_for_full_load_and_cdc() -> None:
-    # FAILS WITHOUT THE FIX: the whole Full Load ran, then Deploy CDC infrastructure failed.
-    from dsql_migrator.ui.data_migration import data_migration_exclusion_block
+def test_start_full_load_is_warned_not_held_before_the_load_for_full_load_and_cdc() -> None:
+    # G131: the load may take every table and the set be narrowed before CDC starts (G16),
+    # so before the load this is a warning on the Full Load card, never a hold; Deploy and
+    # Start CDC hold the capture they send (test_g131_table_list_warning).
+    from dsql_migrator.ui.data_migration import (
+        data_migration_exclusion_block,
+        pre_load_table_list_warning,
+    )
 
     names = _band()
     jobs = _StubJobManager({})
-    block = data_migration_exclusion_block(_state(names), jobs, None, _inventory(names))
-    assert block and "(SinkTopicPartitions)" in block
-    assert block.endswith("Deselect tables in the table picker.")
+    assert data_migration_exclusion_block(_state(names), jobs, None, _inventory(names)) is None
+    warning = pre_load_table_list_warning(_state(names), jobs, None, _inventory(names))
+    assert warning and "(SinkTopicPartitions)" in warning
+    assert warning.endswith("Deselect tables in the table picker.")
     # Full load only captures nothing.
-    assert data_migration_exclusion_block(
+    assert pre_load_table_list_warning(
         _state(names, MigrationType.FULL_LOAD_ONLY), jobs, None, _inventory(names)
     ) is None
     # A stack deployed before the load already owns its partition plan: only the two lists
     # Start CDC sends are judged, and they fit.
-    assert data_migration_exclusion_block(
+    assert pre_load_table_list_warning(
         _state(names, phase="infra"), jobs, None, _inventory(names)
     ) is None
     many = _names(300)
-    held = data_migration_exclusion_block(
+    assert data_migration_exclusion_block(
+        _state(many, phase="infra"), jobs, None, _inventory(many)
+    ) is None
+    warned = pre_load_table_list_warning(
         _state(many, phase="infra"), jobs, None, _inventory(many)
     )
-    assert held and "(SinkTopics)" in held
+    assert warned and "(SinkTopics)" in warned
 
 
 # ---------------------------------------------------------------------------

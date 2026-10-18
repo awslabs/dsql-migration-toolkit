@@ -518,15 +518,17 @@ def test_an_earlier_point_is_refused_by_the_job_when_this_session_had_not_read_i
 _RETRY_PATH = {
     _P03: {
         "retry-path": {
+            # G131: "never redo work" said too much -- an unfinished table reloads from its
+            # start; a finished one is what the retry never reloads.
             "en": "The **Retry unfinished tables** path resets only the unfinished tables to "
             "pending, **reuses the original watermark**, and keeps the completed tables — so you "
-            "never redo work or lose the CDC handoff point.",
+            "never reload a finished table or lose the CDC handoff point.",
             "ko": "**Retry unfinished tables** 경로는 미완료 테이블만 대기 상태로 리셋하고, **원래 "
-            "워터마크를 재사용**하며, 완료된 테이블은 유지합니다 — 작업을 다시 하거나 CDC 핸드오프 지점을 "
-            "잃지 않습니다.",
+            "워터마크를 재사용**하며, 완료된 테이블은 유지합니다 — 끝난 테이블을 다시 적재하거나 CDC "
+            "핸드오프 지점을 잃지 않습니다.",
             "ja": "**Retry unfinished tables** の経路は、未完了のテーブルのみを保留(pending)状態にリセット"
             "し、**元のウォーターマークを再利用**し、完了したテーブルはそのまま保持します — したがって、"
-            "作業をやり直したり CDC の引き継ぎ地点を失ったりすることはありません。",
+            "完了したテーブルをロードし直したり、CDC の引き継ぎ地点を失ったりすることはありません。",
         },
     },
 }

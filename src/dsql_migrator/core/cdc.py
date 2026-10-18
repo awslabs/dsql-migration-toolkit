@@ -2439,17 +2439,11 @@ CDC_TABLE_LIST_PARAMS: tuple[str, ...] = (
 )
 
 
-def list_parameter_size_refusal(
+def oversized_table_list(
     filled: "Iterable[tuple[str, object]]",
-) -> "Optional[str]":
-    """Why these cdc-stack parameters must not be sent, or ``None``. Pure.
-
-    CloudFormation caps one parameter value at :data:`CDC_PARAMETER_BYTE_LIMIT` bytes, and
-    each of :data:`CDC_TABLE_LIST_PARAMS` grows with the captured tables. An oversized one
-    fails CreateStack / UpdateStack with a bare ValidationError -- after the plugins were
-    uploaded, and on Full load + CDC possibly after the whole load -- so this refuses it
-    first, naming the largest one, its size and the remedy.
-    """
+) -> "Optional[tuple[str, int]]":
+    """The largest of :data:`CDC_TABLE_LIST_PARAMS` in ``filled`` over
+    :data:`CDC_PARAMETER_BYTE_LIMIT` bytes, with its size in bytes, or ``None``. Pure."""
     sizes = {
         key: len(str(value or "").encode("utf-8"))
         for key, value in filled
@@ -2459,8 +2453,26 @@ def list_parameter_size_refusal(
     if not over:
         return None
     key = max(over, key=sizes.__getitem__)
+    return key, sizes[key]
+
+
+def list_parameter_size_refusal(
+    filled: "Iterable[tuple[str, object]]",
+) -> "Optional[str]":
+    """Why these cdc-stack parameters must not be sent, or ``None``. Pure.
+
+    CloudFormation caps one parameter value at :data:`CDC_PARAMETER_BYTE_LIMIT` bytes, and
+    each of :data:`CDC_TABLE_LIST_PARAMS` grows with the captured tables. An oversized one
+    fails CreateStack / UpdateStack with a bare ValidationError -- after the plugins were
+    uploaded, and on Full load + CDC possibly after the whole load -- so this refuses it
+    first, naming the largest one (:func:`oversized_table_list`), its size and the remedy.
+    """
+    found = oversized_table_list(filled)
+    if found is None:
+        return None
+    key, size = found
     return (
-        f"The captured tables need {sizes[key]:,} bytes in the CDC configuration ({key}), "
+        f"The captured tables need {size:,} bytes in the CDC configuration ({key}), "
         f"over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one parameter. "
         "Capture fewer tables in this CDC pipeline, or use Full load only."
     )

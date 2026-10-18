@@ -112,7 +112,9 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_capture_exclusions,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     CDC_TABLE_LIST_HEADER,
+    CDC_TABLE_LIST_WORST_CASE_HEADER,
     capture_ambiguity_warning,
+    cdc_partition_map_worst_case,
     cdc_table_list_refusal,
     table_picker_remedy,
     stored_exclusion_block_reason,
@@ -4461,6 +4463,13 @@ def _render_cdc_infra_deploy_action(
     _ambiguity = capture_ambiguity_warning(_deploy_capture_now)
     if _ambiguity:
         render_notice(ui, tone="warning", header="CDC capture needs attention", body=_ambiguity)
+    # Not blocking: with no row estimates recorded, only the click knows the partition plan
+    # (it reads the source's first, and refuses before anything is created).
+    _plan_warning = _deploy_partition_map_warning(migration_state, job_manager, inventory)
+    if _plan_warning:
+        render_notice(
+            ui, tone="warning", header=CDC_TABLE_LIST_WORST_CASE_HEADER, body=_plan_warning
+        )
 
     # VpcId is the one input the operator may still have to CHOOSE (subnets/NAT, the plugin
     # bucket, the DSQL cluster ARN, the source host and its secret are all resolved at deploy
@@ -4504,7 +4513,10 @@ def _deploy_block_notice(
       (42703) -- not tied to the lock, its remedy is Schema Conversion;
     * unless ``include_capture`` is False, capture exclusions over CloudFormation's
       parameter limit, with the remedy true for the cause and the state, then a per-table
-      list the deploy sends over that limit (:func:`cdc_table_list_refusal`).
+      list the deploy sends over that limit (:func:`cdc_table_list_refusal`), its partition
+      plan judged on the row estimates the Full Load recorded. With none recorded the deploy
+      reads the source's at the click, so only the two lists every deploy sends are held
+      here; the plan's worst case is a warning (:func:`_deploy_partition_map_warning`).
 
     Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
     and changes no DDL; it only locks the card, so only the saved-entry check applies.
@@ -4537,14 +4549,8 @@ def _deploy_block_notice(
                 table_lock=_table_lock(migration_state, job_manager, session),
             ),
         )
-    _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    _wm = _cdc_watermark(_job, migration_state)
-    captured = _cdc_tables_for_config(migration_state, inventory, _wm)
-    refusal = cdc_table_list_refusal(
-        [t.name for t in captured],
-        deploy=True,
-        row_counts_by_table=_cdc_row_counts_from_watermark(_wm, captured),
-    )
+    names, counts = _deploy_table_names_and_counts(migration_state, job_manager, inventory)
+    refusal = cdc_table_list_refusal(names, deploy=True, row_counts_by_table=counts)
     if refusal:
         return (
             CDC_TABLE_LIST_HEADER,
@@ -4552,6 +4558,36 @@ def _deploy_block_notice(
             + table_picker_remedy(_table_lock(migration_state, job_manager, session)),
         )
     return None
+
+
+def _deploy_table_names_and_counts(migration_state, job_manager, inventory):
+    """The tables a deploy captures now, and the row estimates its partition plan is sized
+    from when the Full Load recorded them (``None`` when it did not: the deploy then reads
+    the source's at the click)."""
+    _job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    _wm = _cdc_watermark(_job, migration_state)
+    captured = _cdc_tables_for_config(migration_state, inventory, _wm)
+    return [t.name for t in captured], _cdc_row_counts_from_watermark(_wm, captured)
+
+
+def _deploy_partition_map_warning(migration_state, job_manager, inventory):
+    """The body of a warning that the deploy's partition plan may not fit, or ``None``.
+
+    Only while no row estimates are recorded (:func:`_deploy_table_names_and_counts`): the
+    plan then depends on the source's estimates, which the click reads before anything is
+    created, judging the plan exactly -- so the button is not held, and the worst case is
+    said here (:func:`cdc_partition_map_worst_case`). Recorded estimates are judged exactly
+    by :func:`_deploy_block_notice`.
+    """
+    names, counts = _deploy_table_names_and_counts(migration_state, job_manager, inventory)
+    worst = None if counts else cdc_partition_map_worst_case(names)
+    if worst is None:
+        return None
+    return (
+        f"{worst} No row estimates are recorded for them yet, so Deploy CDC infrastructure "
+        "reads the source's when you click it, and refuses before it creates anything if "
+        "its plan does not fit."
+    )
 
 
 def _deploy_capture(migration_state, job_manager, inventory):
@@ -9333,13 +9369,21 @@ async def _start_cdc_infra_deploy(
         )
         return
     # A per-table list too long for one stack parameter (the deploy button says so first):
-    # refused before any AWS call, so nothing is created or uploaded.
+    # refused before any AWS call, so nothing is created or uploaded. The partition plan is
+    # sized from the Full Load watermark's row estimates, else from the source's, read HERE
+    # (read-only, scan-free) instead of after the AWS calls below, so the plan is judged
+    # exactly as it is sent -- the same counts go to the parameter builder.
     _captured = _cdc_tables_for_config(migration_state, inventory, _deploy_wm)
-    _tables_refusal = cdc_table_list_refusal(
-        [t.name for t in _captured],
-        deploy=True,
-        row_counts_by_table=_cdc_row_counts_from_watermark(_deploy_wm, _captured),
-    )
+    _captured_names = [t.name for t in _captured]
+    _deploy_row_counts = None
+    _tables_refusal = cdc_table_list_refusal(_captured_names, deploy=False)
+    if not _tables_refusal:
+        _deploy_row_counts = _cdc_row_counts_from_watermark(_deploy_wm, _captured) or (
+            await run.io_bound(_estimate_cdc_table_rows, session, _captured_names)
+        )
+        _tables_refusal = cdc_table_list_refusal(
+            _captured_names, deploy=True, row_counts_by_table=_deploy_row_counts
+        )
     if _tables_refusal:
         ui.notify(  # type: ignore[attr-defined]
             f"{_tables_refusal} "
@@ -9554,13 +9598,10 @@ async def _start_cdc_infra_deploy(
     # single sink task. Partition counts are fixed at topic-creation (which happens
     # at Start CDC, but the source connector reads these persisted params), so they
     # must be decided here at create. Prefer the Full Load watermark's scan-free
-    # estimates; if absent (infra deployed before Full Load), fetch fresh
-    # information_schema estimates off the loop. Best-effort -> None -> uniform.
-    row_counts_by_table = _cdc_row_counts_from_watermark(watermark, tables_for_config)
-    if not row_counts_by_table:
-        row_counts_by_table = await run.io_bound(
-            _estimate_cdc_table_rows, session, [t.name for t in tables_for_config]
-        )
+    # estimates; if absent (infra deployed before Full Load), fresh information_schema
+    # estimates, read off the loop. Best-effort -> None -> uniform. Both were read at the
+    # top of this click, where the table lists they size were judged: the same counts here.
+    row_counts_by_table = _deploy_row_counts
     # (c) source-DB security group. Scope the connector's egress-to-source rule to
     #     the source DB's own SG so the stack does NOT fall back to an open
     #     0.0.0.0/0 egress on the source port. Best effort + off the loop: if the

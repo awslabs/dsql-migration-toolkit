@@ -432,20 +432,30 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
 - **1 つの CDC パイプラインがキャプチャできるテーブルの数には上限があります: 一般的な名前なら約 80〜160 個です。** CDC
   スタックは、キャプチャするテーブルを CloudFormation のパラメータ 1 つずつで受け取ります: テーブルの
   リスト(`TableIncludeList`)、シンクのトピックのリスト(`SinkTopics`、テーブルごとに `dsqlcdc.<table>` を
-  1 つ)、そしてデプロイがテーブルのサイズに応じてパーティションを決める場合(大きなテーブルがいくつか
-  あるキャプチャでは常に)はトピックごとのパーティションマップ(`SinkTopicPartitions`、テーブルごとに
+  1 つ)、そしてデプロイがテーブルのサイズに応じてパーティションを決める場合(1 つでも平均行数の 2 倍
+  以上を持つテーブルがあれば)はトピックごとのパーティションマップ(`SinkTopicPartitions`、テーブルごとに
   `dsqlcdc.<table>:<数>` を 1 つ)と、より多くのパーティションを割り当てるテーブルのリストです。
   CloudFormation はパラメータの値 1 つを 4,096 バイトに制限するため、1 つのパイプラインがキャプチャ
   できるのは最大で約 4,097 ÷ (L + 11) 個のテーブルです。L は修飾されたテーブル名(MySQL では
   `database.table`、PostgreSQL では `schema.table`)の平均バイト長です: 15 バイトの名前なら約 155 個、
-  20 なら 130 個、30 なら 100 個、40 なら 80 個です。Evaluation は 1,000 個のテーブルまで許可し、
-  Full load only にはこのような上限はありません。Deploy CDC infrastructure と Start CDC は、これより
-  大きなキャプチャを何かをアップロードまたは作成する前に拒否し、Full load + CDC では Start Full Load も
-  ロードの前に拒否します(*Too many tables for one CDC pipeline*。パラメータとそのサイズを示します)。
-  パーティションマップの基準となる行数の推定値を Full Load が記録するまでは、すべてのテーブルに
-  エントリがあるマップとして判断し、デプロイ済みのスタックに対する Start CDC は自身が送る 2 つの
-  リストだけを判断します。この CDC パイプラインでキャプチャするテーブルを減らす(テーブル一覧で選択を
-  外す)か、Full load only を使用してください。
+  20 なら 130 個、30 なら 100 個、40 なら 80 個です(平均行数の 2 倍以上のテーブルがなければ、デプロイは
+  パーティションマップを送らないため約 4,097 ÷ (L + 9) 個)。Evaluation は 1,000 個のテーブルまで許可し、
+  Full load only にはこのような上限はありません。
+  - **Deploy CDC infrastructure と Start CDC は、これより大きなキャプチャを拒否します。** 何かを
+    アップロードまたは作成する前に拒否します(*Too many tables for one CDC pipeline*。パラメータとその
+    サイズを示します)。デプロイはパーティションマップを、Full Load が記録した行数の推定値で判断し、それが
+    なければ(CDC only、または Full Load の前のデプロイ)クリック時に読み取るソース自身の推定値で判断します。
+    それまでデプロイのフォームは、マップに最悪の場合に必要なサイズを警告として表示します(*Possibly too
+    many tables for one CDC pipeline*)。デプロイ済みのスタックに対する Start CDC は、自身が送る 2 つの
+    リストだけを判断します。
+  - **Full load + CDC では Full Load を止めません。** ロードの前に Full Load ステップが警告し(*Too many
+    tables for one CDC pipeline*)、選択したテーブルのうち約何個を 1 つのパイプラインがキャプチャするかを
+    示します。それでもすべてのテーブルをロードし、CDC を開始する前に、CDC がキャプチャする必要のない
+    テーブルの選択を外せます([第 13 章](13-excluding-tables-and-columns.md)の「Full Load 後にテーブル集合を
+    変更する (Full load + CDC)」を参照): それらのテーブルはロードされたまま Aurora DSQL に残り、CDC と
+    Validation はそれらをスキップします。
+  - それ以外の場合は、この CDC パイプラインでキャプチャするテーブルを減らす(テーブル一覧で選択を外す)か、
+    Full load only を使用してください。
 - **CDC はデプロイされている間は課金対象です。** ストリーミングパイプライン
   (MSK Serverless + MSK Connect、および作成した場合は NAT ゲートウェイ)は、
   実行されている間ずっとコストが発生します。Cut over 後は cdc-stack を削除して

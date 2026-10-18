@@ -88,7 +88,7 @@ Aurora DSQL は外部キーを強制し、トリガー、ストアドプロシ�
 
 | DSQL 特性 | テストするシナリオ | どう検証するか |
 |---|---|---|
-| 冪等な再適用 | バッチを再実行する / 中断されたロードを再開する | `INSERT … ON CONFLICT` は決して重複を生じさせない。再開は未完了の PK 範囲のみを再実行し、中断されなかった状態へ収束する(`test_reapplying_batches_does_not_duplicate_rows`、`test_resume_skips_done_batches_and_converges_to_uninterrupted_state`) |
+| 冪等な再適用 | バッチを再実行する / 中断されたロードを再開する | `INSERT … ON CONFLICT` は決して重複を生じさせない(`test_reapplying_batches_does_not_duplicate_rows`)。中断されたロードは完了したテーブルを保持し、中断されたテーブルを **Retry unfinished tables** に残す。Retry unfinished tables はそれぞれを最初からロードし直す(`test_job_manager_restore_reconciles_interrupted_run`)。実行中のロードの中で同じスナップショットを読み直す場合に限り、すでにコミットしたバッチをスキップし、中断されなかった状態へ収束する(`test_resume_skips_done_batches_and_converges_to_uninterrupted_state`) |
 
 **スイートの実行:** `\.venv/bin/python -m pytest -q` と
 `cd connectors/dsql-sink && mvn -q test`。

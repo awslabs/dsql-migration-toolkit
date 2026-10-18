@@ -282,8 +282,7 @@ from dsql_migrator.ui.data_migration._models import (
     live_target_columns_of,
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     capture_ambiguity_warning,
-    cdc_table_list_refusal,
-    table_picker_remedy,
+    cdc_pre_load_table_list_warning,
     make_lob_candidates_for,
     cutover_restore_block_reason,
     effective_target_ddls,
@@ -1904,6 +1903,12 @@ def build_data_migration_screen(
                 migration_state, job_manager, session, inventory,
                 capture=_pre_load_capture_now,
             )
+            # Not a hold: a Full load + CDC selection too large for one CDC pipeline may still
+            # be loaded and narrowed before CDC starts (G16). The Full Load card warns; Deploy
+            # CDC infrastructure and Start CDC hold on the capture they really send.
+            _table_list_warning = pre_load_table_list_warning(
+                migration_state, job_manager, session, inventory
+            )
             # After a set change (Full load only, G12): the tables selected since the load are
             # not vouched for by its prerequisite pass. Full load + CDC (G17): the tables its
             # watermark does not cover yet, whatever the record holds for them -- the same
@@ -3052,6 +3057,7 @@ def build_data_migration_screen(
                             status=status,
                             selected_names=selected_names,
                             guard_reason=guard_reason,
+                            pre_load_warning=_table_list_warning,
                             start_full_load=start_full_load,
                             retry_failed_load=retry_failed_load,
                             retry_tables=retry_tables,
@@ -3879,11 +3885,13 @@ def data_migration_exclusion_block(
     The in-content guard, the page header's Run (``app.data_migration_run_guard``) and
     ``runner()`` itself all read this, so none can start a load the others hold. Before the
     card locks: a saved exclusion that no longer applies, then a source column the applied
-    target DDL lacks (42703). Full load + CDC, before any load, also holds what CDC could
-    not carry afterwards: the capture list, and the per-table lists
-    (:func:`_pre_load_table_list_block`). ``None`` for CDC only, whose card sits inside the
-    CDC sub-step that Continue leads to -- its Deploy/Attach buttons carry the same gate
-    there.
+    target DDL lacks (42703). Full load + CDC, before any load, also holds a capture list
+    CDC could not carry afterwards -- but not a table set too large for one CDC pipeline:
+    the load may take every table and the ones CDC does not need are unticked before CDC
+    starts, so that is a warning on the Full Load card (:func:`pre_load_table_list_warning`)
+    and a hold only at Deploy CDC infrastructure and Start CDC. ``None`` for CDC only, whose
+    card sits inside the CDC sub-step that Continue leads to -- its Deploy/Attach buttons
+    carry the same gate there.
     """
     # The first gate: settle a restored pre-overlay session's exclusions before any set
     # is read (a safety net for callers that restored without the app).
@@ -3909,41 +3917,51 @@ def data_migration_exclusion_block(
         capture = _pre_load_capture(migration_state, inventory)
     if capture is None:
         return None
-    scope = exclusion_scope(migration_state)
-    wanted = None if scope is None else set(scope)
-    tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
     if not capture.error:
         # An attached stack that streamed with another set: the load would write under
         # this session's set, then Start CDC refuses it (capture_exclusion_mismatch) --
         # refuse here, before the load, where the same remedy still applies.
-        return capture_exclusion_mismatch(migration_state, inventory, capture, tables) or (
-            _pre_load_table_list_block(migration_state, job_manager, session, tables)
-        )
+        scope = exclusion_scope(migration_state)
+        wanted = None if scope is None else set(scope)
+        tables = [t for t in inventory.tables if wanted is None or t.name in wanted]
+        return capture_exclusion_mismatch(migration_state, inventory, capture, tables)
     # When the generated columns alone exceed the limit, no exclusion change fixes it and
-    # 0.1.561 let this load run: warn on the card (capture_pre_load_notices), do not hold
-    # for them.
+    # 0.1.561 let this load run: warn on the card (capture_pre_load_notices), do not hold.
     if capture.generated_bytes > CDC_PARAMETER_BYTE_LIMIT:
-        return _pre_load_table_list_block(migration_state, job_manager, session, tables)
+        return None
     return capture_error_with_remedy(migration_state, job_manager, capture)
 
 
-def _pre_load_table_list_block(migration_state, job_manager, session, tables) -> Optional[str]:
-    """The per-table CDC lists after this Full load + CDC load would not fit one stack
-    parameter each (:func:`cdc_table_list_refusal`): the hold with its remedy, or ``None``.
+def pre_load_table_list_warning(migration_state, job_manager, session, inventory) -> Optional[str]:
+    """Full load + CDC, before any load: the body of the Full Load card's warning that one CDC
+    pipeline cannot capture every selected table (:func:`cdc_pre_load_table_list_warning`),
+    or ``None``.
 
-    Judged as the next CDC operation sends them: Start CDC's lists when a cdc-stack already
-    owns the partition plan (deployed, or deploying), else the deploy's, whose plan is sized
-    from row estimates only this load records -- so judged at its largest.
+    Not a hold (:func:`data_migration_exclusion_block` does not read it): the load may take
+    every table and, until CDC starts, the tables CDC does not need are unticked (G16); the
+    Deploy CDC infrastructure and Start CDC holds judge that real capture. Judged as the next
+    CDC operation sends the lists: Start CDC's when a cdc-stack already owns the partition
+    plan (deployed, or deploying), else the deploy's. ``None`` too once CDC has started for
+    this migration: its set is fixed then, and the CDC step's holds say so.
     """
+    if (
+        migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC
+        or getattr(migration_state, "job_id", None) is not None
+        or inventory is None
+        or not getattr(inventory, "tables", None)
+        or _cdc_started_for_migration(migration_state, job_manager)
+    ):
+        return None
+    scope = exclusion_scope(migration_state)
+    wanted = None if scope is None else set(scope)
     planned = cdc_infra_prep_state(migration_state, job_manager) in (
         "ready",
         "deploying",
     ) and not cdc_stack_being_deleted(migration_state, job_manager)
-    refusal = cdc_table_list_refusal([t.name for t in tables], deploy=not planned)
-    if refusal is None:
-        return None
-    return f"{refusal} " + table_picker_remedy(
-        table_set_lock_reason(migration_state, job_manager, session)
+    return cdc_pre_load_table_list_warning(
+        [t.name for t in inventory.tables if wanted is None or t.name in wanted],
+        planned=planned,
+        table_lock=table_set_lock_reason(migration_state, job_manager, session),
     )
 
 
@@ -6295,6 +6313,7 @@ __all__ = [
     "make_overlay_dialog_providers",
     "overlay_in_play",
     "data_migration_exclusion_block",
+    "pre_load_table_list_warning",
     "exclusion_card_locked",
     "table_set_lock_reason",
     "make_exclusion_inputs_resolver",
