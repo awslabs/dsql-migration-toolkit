@@ -1088,7 +1088,7 @@ def test_pg_page_checksum_sql_is_keyset_bounded_and_qualified() -> None:
     # in PostgreSQL/DSQL -- still keyset-advances (see build_pg_page_checksum_first_sql).
     for part in (
         "SUM(page_tok)",
-        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]",
+        "(array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)]",
         "COUNT(*)",
         "LIMIT 500",
     ):
@@ -1525,7 +1525,7 @@ def test_orphan_page_sql_pages_the_window_unconditionally() -> None:
     assert 'p."id" IS NULL' in first
     # The keyset boundary still comes from the FULL window via array_agg (max() has no
     # uuid overload -- verified live).
-    assert '(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]' in first
+    assert '(array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)]' in first
     # The next page carries the keyset bound; the first page does not.
     assert '"id" > %(last)s' in nxt
     assert '"id" > ' not in first

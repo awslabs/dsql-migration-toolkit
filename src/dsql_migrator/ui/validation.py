@@ -769,6 +769,15 @@ class ValidationSummary:
     # Tables that failed ONLY because an excluded column holds values (every other check
     # passed): the reload runbook's "backfill" cannot fix them.
     excluded_values_only_tables: tuple[str, ...] = ()
+    # Tables whose orphan check could not run (``orphan_check_error``, G140), and of those
+    # the ones not matched ONLY because of it (G141, ``TableValidationResult.
+    # orphan_check_only``): their data matched, so they are no data mismatch, and no reload
+    # backfills them -- Orphan records says what to fix.
+    orphan_check_failed_tables: tuple[str, ...] = ()
+    orphan_check_only_tables: tuple[str, ...] = ()
+    # Whether every one of those had its CHECKSUM compared (and matched): a fast sweep skips
+    # it for a table whose row counts agree, so the recovery notice names only what ran.
+    orphan_check_only_checksummed: bool = False
 
     @property
     def reconcile_inapplicable_for_all(self) -> bool:
@@ -940,6 +949,7 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
         for item in report.items
         if item.deficit_explained_by_quarantine
     )
+    orphan_only = [item for item in report.items if item.orphan_check_only]
     return ValidationSummary(
         total_tables=len(report.items),
         matched_tables=matched,
@@ -973,6 +983,12 @@ def summarize_validation(report: ValidationReport) -> ValidationSummary:
         },
         reconcile_requested=_reconcile_was_requested(report),
         reconcile_inapplicable_tables=reconcile_skipped_tables(report),
+        orphan_check_failed_tables=tuple(
+            item.table for item in report.items if item.orphan_check_error
+        ),
+        orphan_check_only_tables=tuple(item.table for item in orphan_only),
+        orphan_check_only_checksummed=bool(orphan_only)
+        and all(item.checksum_match for item in orphan_only),
         **_proof_summary(report),
     )
 
@@ -7683,14 +7699,18 @@ def _render_recovery_section(
     _title = "Acknowledge the known gap" if fully_explained else "How to recover"
     _icon = "fact_check" if fully_explained else "build"
     # Values in an excluded column cannot be "backfilled": the reload below is an
-    # idempotent append, which keeps a stored value. Their own branch, and when they are
-    # the ONLY finding, the only one.
-    # The branch below is chosen by the OTHER failing tables: a values-only table must
-    # not make rows already known to be dropped read as an unexplained gap.
-    rest = set(summary.failed_tables) - set(summary.excluded_values_only_tables)
-    values_only = bool(summary.excluded_values_only_tables) and not rest
+    # idempotent append, which keeps a stored value. Nor can a table that is not matched
+    # only because its orphan check could not run (G141): its data matched, and no reload
+    # runs the check. Their own notices, and when they are the ONLY findings, the only ones.
+    # The branch below is chosen by the OTHER failing tables: such a table must not make
+    # rows already known to be dropped read as an unexplained gap.
+    no_backfill = set(summary.excluded_values_only_tables) | set(
+        summary.orphan_check_only_tables
+    )
+    rest = set(summary.failed_tables) - no_backfill
+    nothing_to_backfill = bool(no_backfill) and not rest
     rest_explained = (
-        bool(summary.excluded_values_only_tables)
+        bool(no_backfill)
         and bool(rest)
         and rest <= set(summary.quarantine_explained_tables)
         and not summary.errored_tables
@@ -7712,8 +7732,10 @@ def _render_recovery_section(
     with _section(ui, icon=_icon, title=_title):  # type: ignore[misc]
         if summary.excluded_values:
             _render_excluded_values_recovery(ui, summary, excluded_values_remedy)
-        if values_only:
-            pass  # the reload runbooks below cannot clear a stored value
+        if summary.orphan_check_only_tables:
+            _render_orphan_check_recovery(ui, summary)
+        if nothing_to_backfill:
+            pass  # the reload runbooks below cannot clear a stored value or run a check
         elif fully_explained or rest_explained:
             render_notice(
                 ui,
@@ -7959,6 +7981,31 @@ def _render_excluded_values_recovery(
                 f"Found: {detail}.",
             )
             if part
+        ),
+    )
+
+
+def _render_orphan_check_recovery(ui: object, summary: ValidationSummary) -> None:
+    """The recovery for tables not matched ONLY because their orphan check could not run
+    (G141): their data matched, so there is nothing to backfill -- Orphan records names
+    what to fix (never the reload runbook). Its wording names the checks that ran: the
+    checksums only when each such table's was compared, which a fast sweep skips."""
+    tables = list(summary.orphan_check_only_tables)
+    one = len(tables) == 1
+    compared = (
+        "row counts and checksums" if summary.orphan_check_only_checksummed else "row counts"
+    )
+    render_notice(
+        ui,
+        tone="info",
+        header="The orphan check could not run — there is nothing to backfill",
+        body=(
+            f"{bounded_table_names(tables)}: {'its' if one else 'their'} {compared} match, "
+            f"and {'it is' if one else 'they are'} not matched only because the orphan check "
+            "could not run (see Orphan records), so re-running the Full Load would not change "
+            "that. Fix what Orphan records names on Aurora DSQL and re-check "
+            f"{'the table' if one else 'those tables'}, or turn off Check for orphan records "
+            "and re-run Validation."
         ),
     )
 
@@ -8853,6 +8900,8 @@ def _render_readiness_checks(
     """Render the pre-cut-over checks as a compact, uniform pass/fail panel.
 
     1. Data identical -- per-table row counts (and, in checksum mode, checksums).
+       Only when the orphan check could not run for some table (G141): Orphan check ran,
+       which names them -- a table whose data matched counts as matched data in 1.
     2. No mismatched records -- full PK reconciliation (missing / extra rows).
     3. No table errors -- every table could be compared.
     4. No source drift -- the source has not advanced since the snapshot.
@@ -8931,17 +8980,30 @@ def _render_readiness_checks(
         if _is_checksum_mode
         else ""
     )
+    # A table not matched ONLY because its orphan check could not run is no data mismatch
+    # (G141): this check counts it with the data that matched, and the Orphan check row
+    # below is the one that fails for it.
+    orphan_only = len(summary.orphan_check_only_tables)
+    data_mismatched = summary.mismatched_tables - orphan_only
     _check(
-        passed=summary.is_match,
+        passed=summary.is_match
+        or (orphan_only > 0 and data_mismatched == 0 and summary.orphan_count == 0),
         label=_match_label,
         detail=(
             f"{summary.matched_tables}/{summary.total_tables} tables matched"
+            + (f", {data_mismatched} mismatched" if data_mismatched else "")
+            + f" (mode: {summary.mode})."
             + (
-                f", {summary.mismatched_tables} mismatched"
-                if summary.mismatched_tables
+                f" The comparison of {orphan_only} more "
+                + (
+                    "table matched too: it is"
+                    if orphan_only == 1
+                    else "tables matched too: they are"
+                )
+                + " not matched only because the orphan check could not run (below)."
+                if orphan_only
                 else ""
             )
-            + f" (mode: {summary.mode})."
             + (
                 f" ({len(summary.excluded_values_only_tables)} only because an excluded "
                 "column holds values.)"
@@ -8953,6 +9015,19 @@ def _render_readiness_checks(
         ),
         warn_on_fail=fully_explained,
     )
+    if summary.orphan_check_failed_tables:
+        _failed = list(summary.orphan_check_failed_tables)
+        _check(
+            passed=False,
+            label="Orphan check ran",
+            detail=(
+                f"The orphan check could not run for {len(_failed)} table(s): "
+                f"{bounded_table_names(_failed)}. "
+                + ("It is" if len(_failed) == 1 else "They are")
+                + " not matched until it runs: fix what Orphan records names and re-check, "
+                "or turn off Check for orphan records and re-run Validation."
+            ),
+        )
 
     # Check 2: no mismatched records. Four distinct states:
     #   * reconciliation RAN (>=1 table) -> the real missing/extra verdict;
@@ -9499,6 +9574,13 @@ def _validation_run_facts(summary: ValidationSummary, drift: DriftDisplay) -> st
         shown = ", ".join(summary.failed_tables[:10])
         more = "" if len(summary.failed_tables) <= 10 else " …(more)"
         lines.append(f"Failing tables: {shown}{more}")
+    if summary.orphan_check_only_tables:
+        # G141: so the diagnosis never prescribes a reload for them.
+        lines.append(
+            "Not matched only because their orphan check could not run (their comparison "
+            "matched; nothing to backfill): "
+            f"{', '.join(summary.orphan_check_only_tables[:10])}"
+        )
     if summary.migration_excluded_columns:
         lines.append(f"Excluded columns: {_proof_clause(summary)}")
     if drift.available:
@@ -9828,7 +9910,11 @@ def _table_row(item: TableValidationResult) -> dict[str, object]:
         "missing": _reconcile_cell(item, "missing"),
         "extra": _reconcile_cell(item, "extra"),
         "result": _cell(
-            "match" if item.matched else "mismatch",
+            # G141: beside a row count and a checksum that match, "mismatch" would claim a
+            # data difference the comparison did not find.
+            "match" if item.matched
+            else "orphan check could not run" if item.orphan_check_only
+            else "mismatch",
             "ok" if item.matched else "bad",
         ),
         "result_sort": 1 if item.matched else 0,

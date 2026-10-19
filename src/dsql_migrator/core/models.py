@@ -2132,6 +2132,23 @@ class TableValidationResult(BaseModel):
             and not self.orphan_check_error
         )
 
+    @property
+    def orphan_check_only(self) -> bool:
+        """True when this table is not matched ONLY because its orphan check could not run
+        (G141): the comparison finished and every check of its data passed -- the row
+        counts, the CHECKSUM and the record reconciliation when they ran, the excluded
+        columns' proof. That is no data mismatch, and no reload clears it: the Orphan
+        records section names what to fix."""
+        return (
+            not self.matched
+            and bool(self.orphan_check_error)
+            and self.error is None
+            and self.row_count_match
+            and self.checksum_match is not False
+            and (self.reconcile is None or self.reconcile.consistent)
+            and not self.excluded_values_block
+        )
+
 
 class OrphanFinding(BaseModel):
     """An orphan-record finding on the target for a preserved referential rule.

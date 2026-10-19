@@ -8444,7 +8444,8 @@ def _count_orphans(
     An interrupted count RESUMES; it does not start over (G139). It runs on its own
     connection from ``connection_factory`` behind Validation's reconnecting proxy
     (:class:`~dsql_migrator.core.validator._ReconnectingTargetConnection`): a connection
-    Aurora DSQL closes (its 60-minute connection limit, or a dropped network) is replaced
+    Aurora DSQL closes (its 60-minute connection limit, a dropped network, or a session the
+    server ends with 57P01 / 57P02 / 57P03, G141) is replaced
     and only the statement it cut off runs again, and an XX000 runs it again on the same
     connection. Each page is its own statement with its own cursor (``WHERE pk > :last``,
     or the composite key's row value), so that replay re-reads one page. A 40001 (on
@@ -8571,7 +8572,8 @@ def _count_orphans_keyset(
 
     Each page reports ``(orphan_sub_count, last_pk, row_count)`` over an UNFILTERED PK
     window (the orphan predicate is a ``COUNT(*) FILTER``), so ``last_pk`` advances the
-    keyset over non-orphan rows too and no PK range is skipped. Sub-counts fold into a
+    keyset over non-orphan rows too and no PK range is skipped; it comes back as text and
+    is bound back untyped, in the column's own type (G141). Sub-counts fold into a
     Python integer; the loop stops when a page returns fewer than ``page_size`` rows.
     Each page runs through :func:`_orphan_page_row`, so a conflict replays that page from
     its own bound, never the pages already counted.

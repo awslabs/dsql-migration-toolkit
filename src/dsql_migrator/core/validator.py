@@ -128,6 +128,7 @@ from dsql_migrator.core.target_introspector import (
 from dsql_migrator.core.source_dialect import SourceDialect, dialect_for
 from dsql_migrator.core.source_dialect.base import keyset_param_names
 from dsql_migrator.core.source_dialect.mysql import (  # noqa: F401
+    _cursor_value,
     is_single_precision_float,
     mysql_base_type,
 )
@@ -232,8 +233,9 @@ class PagedReadError(RuntimeError):
     snapshot -- raised as soon as they read more (G140), so a cursor that goes back and
     forth ends in bounded time. Raised, so the table is graded "not compared" (its error),
     never a match -- except on a MySQL source, whose checksum is then read in one exact
-    statement instead (:func:`_source_checksum_composite_mysql`); ``reason`` (what went
-    wrong, without the advice for a failed table) says why in the log."""
+    statement instead (:func:`_source_checksum`, a one-column key too since G141);
+    ``reason`` (what went wrong, without the advice for a failed table) says why in the
+    log."""
 
     def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
         super().__init__(message)
@@ -300,44 +302,78 @@ def _source_checksum(
     :func:`_source_checksum_keyset`, a composite one by
     :func:`_source_checksum_composite_mysql` -- so a billion-row source is never summed in
     one statement and the liveness heartbeat beats per page. A table with no primary key,
-    or one with a key part whose cursor value the driver does not bind back as it read it
+    or one with a single-precision FLOAT key part, whose cursor value names no row
     (:func:`_mysql_key_binds_exactly`), keeps the single whole-table statement (MySQL has
     no per-statement transaction limit, and the statement is exact whatever the key).
-    ``expected_rows`` is the live ``COUNT(*)`` of the same snapshot that a composite key's
-    pages must add up to (``None``: counted here).
+    ``expected_rows`` is the live ``COUNT(*)`` of the same snapshot that the pages must
+    add up to: a composite key's (``None``: counted here) and, when the caller read it, a
+    one-column key's (G141). Pages that cannot be trusted fall back to the one statement.
     """
     key = pk_paging_columns(table)
     if not key or not _mysql_key_binds_exactly(table, key):
-        return _mysql_whole_table_checksum(connection, table)
+        return _mysql_whole_table_checksum(connection, table, on_page)
     if len(key) == 1:
-        return _source_checksum_keyset(
-            connection, table, key[0], page_size, on_page=on_page
-        )
+        try:
+            return _source_checksum_keyset(
+                connection, table, key[0], page_size, on_page=on_page,
+                expected_rows=expected_rows,
+            )
+        except PagedReadError as exc:
+            return _mysql_checksum_fallback(connection, table, exc, on_page)
     return _source_checksum_composite_mysql(
         connection, table, page_size, dialect or dialect_for(SourceType.MYSQL),
         on_page=on_page, expected_rows=expected_rows,
     )
 
 
-def _mysql_whole_table_checksum(connection: _SourceConnection, table: TableDef) -> str:
-    """The whole-table MySQL checksum in ONE statement (:func:`build_mysql_checksum_sql`)."""
+def _mysql_whole_table_checksum(
+    connection: _SourceConnection, table: TableDef,
+    on_page: Optional[Callable[[], None]] = None,
+) -> str:
+    """The whole-table MySQL checksum in ONE statement (:func:`build_mysql_checksum_sql`).
+
+    The statement is one unit of work, so it beats ``on_page`` right before and right after
+    it (G141): the liveness heartbeat is stamped as it starts and as it ends, and a Stop
+    pressed before it, or while it runs, takes effect as it returns. Nothing beats while it
+    runs -- a beat from a timer would vouch for a wedged statement too -- so a table whose
+    one statement outlasts the job's stall window is still reaped.
+    """
+    if on_page is not None:
+        on_page()
     value = connection.execute(text(build_mysql_checksum_sql(table))).scalar()  # type: ignore[attr-defined]
+    if on_page is not None:
+        on_page()
     return "0" if value is None else str(value)
 
 
-# MySQL key column types whose cursor value does not name its row as the driver returns it
-# (G140): a single-precision FLOAT comes back rounded to 6 significant digits, a TIME as a
-# ``timedelta`` PyMySQL writes an hour early when it is negative and not whole hours, and a
-# BIT as bytes bound as a character string, which MySQL compares with the column as a
-# number. Paged on such a key, a page started before its cursor and read rows again (one
-# that loops forever measured, on a TIME key) -- so Validation checksums such a table in one
-# statement on the source, which is exact.
-_MYSQL_UNPAGED_KEY_TYPES = frozenset({"float", "time", "bit"})
+def _mysql_checksum_fallback(
+    connection: _SourceConnection, table: TableDef, exc: PagedReadError,
+    on_page: Optional[Callable[[], None]] = None,
+) -> str:
+    """The one exact whole-table statement in place of keyset pages that cannot be trusted
+    (MySQL has no transaction limit), with why in the log."""
+    _LOGGER.warning(
+        "Validation: the source's keyset pages of %s cannot be trusted (%s); its "
+        "checksum is read in one statement instead.",
+        table.name, exc.reason,
+    )
+    return _mysql_whole_table_checksum(connection, table, on_page)
+
+
+# MySQL key column types whose cursor value does not name its row (G140): a single-precision
+# FLOAT comes back rounded to 6 significant digits, which no binding turns back into the
+# stored float (``CAST(:last AS FLOAT)`` names only a value of 6 digits or fewer, and MySQL
+# 5.7 has no such CAST). Paged on such a key, a page started before its cursor and read rows
+# again -- so Validation checksums such a table in one statement on the source, which is
+# exact. A TIME or a BIT key part is paged (G141): the cursor binds it as MySQL compares it
+# (``source_dialect.mysql._cursor_value``: the duration text, the integer its bits hold),
+# exactly, in a one-column key as in a composite one.
+_MYSQL_UNPAGED_KEY_TYPES = frozenset({"float"})
 
 
 def _mysql_key_binds_exactly(table: TableDef, key: "Sequence[str]") -> bool:
-    """Is no part of ``key`` one of :data:`_MYSQL_UNPAGED_KEY_TYPES`, as Step 1 recorded
-    ``table``'s column types? Pure."""
+    """Is no part of ``key`` one of :data:`_MYSQL_UNPAGED_KEY_TYPES` (a single-precision
+    FLOAT), as Step 1 recorded ``table``'s column types? Pure."""
     recorded = {column.name.lower(): column.mysql_type for column in table.columns}
     return not any(
         mysql_base_type(recorded.get(column.lower())) in _MYSQL_UNPAGED_KEY_TYPES
@@ -365,8 +401,8 @@ def _mysql_key_pages_in_order(connection: _SourceConnection, table: TableDef) ->
     True only when the live PRIMARY index is the key Step 1 recorded, every part ascending
     and whole. Otherwise the checksum keeps the single whole-table statement: MySQL has no
     transaction limit, and the statement is exact whatever the key. (A key part whose
-    cursor value does not name its row -- FLOAT, TIME, BIT -- never reaches here, see
-    :func:`_mysql_key_binds_exactly`.)
+    cursor value does not name its row -- a single-precision FLOAT -- never reaches here,
+    see :func:`_mysql_key_binds_exactly`.)
     """
     key = [column.lower() for column in table.primary_key]
     schema, separator, name = table.name.partition(".")
@@ -408,7 +444,7 @@ def _source_checksum_composite_mysql(
     (:func:`_mysql_key_pages_in_order`) or that the dialect cannot write a cursor for.
     """
     if not _mysql_key_pages_in_order(connection, table):
-        return _mysql_whole_table_checksum(connection, table)
+        return _mysql_whole_table_checksum(connection, table, on_page)
     try:
         members = dialect.keyset_key_members(connection, table)
         if expected_rows is None:
@@ -421,14 +457,9 @@ def _source_checksum_composite_mysql(
         # The dialect cannot write a cursor that keeps this key's order (an ENUM member it
         # cannot place, members it cannot read exactly, two members the source compares as
         # equal). The source has no transaction limit: one exact statement instead.
-        return _mysql_whole_table_checksum(connection, table)
+        return _mysql_whole_table_checksum(connection, table, on_page)
     except PagedReadError as exc:
-        _LOGGER.warning(
-            "Validation: the source's keyset pages of %s cannot be trusted (%s); its "
-            "checksum is read in one statement instead.",
-            table.name, exc.reason,
-        )
-        return _mysql_whole_table_checksum(connection, table)
+        return _mysql_checksum_fallback(connection, table, exc, on_page)
     return str(total)
 
 
@@ -528,6 +559,8 @@ def _mysql_composite_pages(
 def _source_checksum_keyset(
     connection: _SourceConnection, table: TableDef, pk_column: str, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    expected_rows: Optional[int] = None,
 ) -> str:
     """Accumulate the source checksum over bounded keyset pages (single-column PK).
 
@@ -537,10 +570,23 @@ def _source_checksum_keyset(
     sub-sums are folded into a Python integer. Because the token is per-row and SUM is
     order-independent, the accumulated total equals the whole-table checksum exactly,
     with every statement bounded and memory at one row. Reads only the PK + token.
+
+    ``:last`` -- the page's ``MAX(page_pk)`` -- is bound as MySQL compares it (G141,
+    ``source_dialect.mysql._cursor_value``, the Full Load reader's binding): a TIME as its
+    duration text, which PyMySQL writes an hour early when it is negative and not whole
+    hours, and a BIT as the integer its bits hold, where PyMySQL's bytes compare as a
+    character string. A full page that does not move past its cursor raises
+    :class:`PagedReadError`, and so do pages that read more rows than ``expected_rows``
+    (the snapshot's live ``COUNT(*)``, when the caller read it) -- as soon as they do -- or,
+    at the end, a different number; :func:`_source_checksum` then reads the checksum in one
+    statement.
     """
     first_sql = text(build_mysql_page_checksum_first_sql(table, pk_column))
     next_sql = text(build_mysql_page_checksum_next_sql(table, pk_column))
-    total = 0
+    column_type = next(
+        (c.mysql_type for c in table.columns if c.name.lower() == pk_column.lower()), None
+    )
+    total = rows = 0
     last: object = None
     while True:
         if on_page is not None:
@@ -548,18 +594,28 @@ def _source_checksum_keyset(
         if last is None:
             result = connection.execute(first_sql, {"page": page_size})  # type: ignore[attr-defined]
         else:
-            result = connection.execute(next_sql, {"last": last, "page": page_size})  # type: ignore[attr-defined]
+            result = connection.execute(  # type: ignore[attr-defined]
+                next_sql, {"last": _cursor_value(column_type, last), "page": page_size}
+            )
         row = None
         for candidate in result:  # single (sub_sum, last_pk, count) row
             row = candidate
             break
         if row is None:
-            return str(total)
+            break
         sub_sum, last_pk, count = row[0], row[1], row[2]
         total += int(sub_sum) if sub_sum is not None else 0
+        rows += int(count or 0)
+        if expected_rows is not None and rows > expected_rows:
+            raise _rows_overrun("source", rows, expected_rows)
         if count is None or int(count) < page_size:
-            return str(total)
+            break
+        if last_pk == last:
+            raise _stalled("source")
         last = last_pk
+    if expected_rows is not None and rows != expected_rows:
+        raise _rows_disagree("source", rows, expected_rows)
+    return str(total)
 
 
 def _source_pk_tokens(
@@ -793,6 +849,24 @@ def _source_binlog_position(
 _TARGET_RECONNECT_MAX_ATTEMPTS = 4
 _TARGET_RECONNECT_BASE_DELAY_SECONDS = 0.5
 
+# A session the server ended (G141): 57P01 admin_shutdown (``pg_terminate_backend``, a
+# shutdown), 57P02 crash_shutdown and 57P03 cannot_connect_now (a server not accepting
+# connections yet). The connection is gone, as after a class-08 / no-SQLSTATE drop, so the
+# read path replaces it and replays the statement -- as the CDC sink already treats class 57
+# (DsqlSinkTask.isTransient, which names Aurora DSQL's idle close among closes that can
+# surface that way).
+_SERVER_ENDED_SESSION_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
+
+
+def _is_dropped_connection(exc: BaseException) -> bool:
+    """Is ``exc`` a lost target connection -- :func:`is_transient_connection_error` (class
+    ``08`` or no SQLSTATE), or a session the server ended (57P01 / 57P02 / 57P03)?"""
+    return (
+        is_transient_connection_error(exc)
+        or getattr(exc, "sqlstate", None) in _SERVER_ENDED_SESSION_SQLSTATES
+    )
+
+
 _EXECUTE_SENTINEL = object()
 
 
@@ -842,7 +916,8 @@ class _ReconnectingTargetConnection:
     Transparent: it quacks like a psycopg connection (``cursor()`` / ``close()``), so
     every ``_target_*`` read helper is unchanged. Only a connection-level transient
     error (SQLSTATE class ``08`` / no-SQLSTATE, via
-    :func:`is_transient_connection_error`) triggers a reconnect; Aurora DSQL's XX000
+    :func:`is_transient_connection_error`) or a session the server ended (57P01 / 57P02 /
+    57P03, G141: :func:`_is_dropped_connection`) triggers a reconnect; Aurora DSQL's XX000
     (server unavailable) re-runs the statement on the same connection, which Aurora DSQL
     keeps; any real query / constraint error propagates unchanged. The underlying
     connection is opened EAGERLY so the open cost / an immediate connect failure surfaces
@@ -928,7 +1003,7 @@ class _ReconnectingCursor:
             except Exception as exc:  # noqa: BLE001 - reconnect on a transient drop
                 _safe_close(cursor)
                 attempt += 1
-                transient = is_transient_connection_error(exc)
+                transient = _is_dropped_connection(exc)
                 if (
                     transient or is_server_unavailable(exc)
                 ) and attempt < self._owner._max_attempts:
@@ -1140,8 +1215,11 @@ def _target_count_keyset(
     stream reconciliation uses) and sums the per-page row counts, so every statement
     stays well under the limit and memory stays at one page. Reads only the PK column
     (Property 7); works for any orderable single-column PK (int/uuid/varchar/binary).
-    With ``proof`` each page also carries one ``(c IS NOT NULL)`` flag per excluded
-    column (never a value), summed into the proof.
+    The keys come back as text and the page's last one is bound back untyped, so the
+    server parses it into the column's own type (G141): bound as psycopg's float, a
+    ``real`` key re-read a boundary row, which an equal number of missing rows hid -- a
+    false MATCH. With ``proof`` each page also carries one ``(c IS NOT NULL)`` flag per
+    excluded column (never a value), summed into the proof.
     """
     columns = proof.columns if proof is not None else ()
     first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size, columns)
@@ -1226,6 +1304,8 @@ def _target_checksum(
     on_page: Optional[Callable[[], None]] = None,
     *,
     key: "Optional[Sequence[str]]" = None,
+    expected_rows: Optional[int] = None,
+    side: str = "target",
 ) -> str:
     """Return the target checksum for ``table`` as a string (read-only).
 
@@ -1239,13 +1319,17 @@ def _target_checksum(
     ``source_is_postgres`` is forwarded to the PG checksum builders for the numeric-scale
     rule; it is ``True`` both when rendering the DSQL target of a PostgreSQL-source
     migration AND when this same function renders a PostgreSQL SOURCE (via
-    :func:`_source_checksum_for`), so both ends of a PG migration agree.
+    :func:`_source_checksum_for`), so both ends of a PG migration agree. ``expected_rows``
+    (a PostgreSQL source's count of the same snapshot, G141) bounds a one-column key's
+    pages and ``side`` names the side in their errors; Aurora DSQL has no count to hold its
+    pages to (a PostgreSQL source's composite key is held to its own in
+    :func:`_source_checksum_for`).
     """
     key = pk_paging_columns(table) if key is None else tuple(key)
     if len(key) == 1:
         return _target_checksum_keyset(
             connection, table, key[0], page_size, source_is_postgres,
-            on_page=on_page,
+            on_page=on_page, expected_rows=expected_rows, side=side,
         )
     if key:
         return str(_composite_pages_pg(
@@ -1285,6 +1369,9 @@ def _target_checksum_keyset(
     page_size: int,
     source_is_postgres: bool = False,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    expected_rows: Optional[int] = None,
+    side: str = "target",
 ) -> str:
     """Accumulate the target checksum over bounded keyset pages (single-column PK).
 
@@ -1295,6 +1382,13 @@ def _target_checksum_keyset(
     Every statement stays well under DSQL's 300s limit; memory stays at one row. A
     connection force-closed at DSQL's ~1h limit is handled by the reconnecting proxy
     that wraps ``connection`` -- the failing page replays from its ``WHERE pk > :last``.
+
+    The page's last key comes back as text and is bound back untyped, so the server parses
+    it into the column's own type and a ``real`` key's boundary row is not read twice
+    (G141, :func:`build_pg_page_checksum_next_sql`). A full page whose last key equals its
+    cursor raises :class:`PagedReadError` (``side`` names the side), and so do pages that
+    read more rows than ``expected_rows`` -- a PostgreSQL source's count of the same
+    snapshot, when given -- as soon as they do, or at the end a different number.
     """
     first_sql = build_pg_page_checksum_first_sql(
         table, pk_column, page_size, source_is_postgres
@@ -1302,7 +1396,7 @@ def _target_checksum_keyset(
     next_sql = build_pg_page_checksum_next_sql(
         table, pk_column, page_size, source_is_postgres
     )
-    total = 0
+    total = rows = 0
     last: object = None
     while True:
         if on_page is not None:
@@ -1317,12 +1411,20 @@ def _target_checksum_keyset(
         finally:
             _safe_close(cursor)
         if row is None:
-            return str(total)
+            break
         sub_sum, last_pk, count = row[0], row[1], row[2]
         total += int(sub_sum) if sub_sum is not None else 0
+        rows += int(count or 0)
+        if expected_rows is not None and rows > expected_rows:
+            raise _rows_overrun(side, rows, expected_rows)
         if count is None or int(count) < page_size:
-            return str(total)
+            break
+        if last_pk == last:
+            raise _stalled(side)
         last = last_pk
+    if expected_rows is not None and rows != expected_rows:
+        raise _rows_disagree(side, rows, expected_rows)
+    return str(total)
 
 
 def _target_pk_tokens(
@@ -1461,6 +1563,20 @@ def _iter_source_pks(
             return
 
 
+# A boolean key's text, as the integer the source holds. A MySQL TINYINT(1) key is a boolean
+# on Aurora DSQL, whose text (``pk::text``) is exactly 'false' / 'true' -- MySQL's 0 / 1, in
+# the order both sides sort it (Full Load refuses any other TINYINT(1) value for a boolean).
+# No integer type's text is either word.
+_BOOLEAN_KEY_INTEGERS = {"false": 0, "true": 1}
+
+
+def _pk_integer(key_text: str) -> int:
+    """A one-column key read as text (G141) as the integer reconciliation merges: an
+    integer key's digits, a boolean key's 'false' / 'true' as 0 / 1."""
+    integer = _BOOLEAN_KEY_INTEGERS.get(key_text)
+    return int(key_text) if integer is None else integer
+
+
 def _iter_target_pks(
     connection: Any, table: TableDef, pk_column: str, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
@@ -1469,8 +1585,10 @@ def _iter_target_pks(
     """Yield every target PK in ascending order via bounded keyset pagination.
 
     Mirrors :func:`_iter_source_pks` on the psycopg target: one bounded page per
-    round-trip, keyset-advanced, so a billion-row table never lands in RAM. ``proof``
-    (TARGET ONLY) is completed only when the consumer exhausts the stream.
+    round-trip, keyset-advanced, so a billion-row table never lands in RAM. The keys come
+    back as text (G141), the cursor as it came, each yielded as :func:`_pk_integer`: a
+    boolean key (a MySQL TINYINT(1) on Aurora DSQL) as 0 / 1. ``proof`` (TARGET ONLY) is
+    completed only when the consumer exhausts the stream.
     """
     columns = proof.columns if proof is not None else ()
     first_sql = build_pg_pk_first_page_sql(table, pk_column, page_size, columns)
@@ -1496,7 +1614,7 @@ def _iter_target_pks(
             proof.add_page(rows)
         for row in rows:
             last = row[0]
-            yield int(row[0])
+            yield _pk_integer(row[0])
         if len(rows) < page_size:
             if proof is not None:
                 proof.complete = True
@@ -1637,9 +1755,10 @@ def _source_checksum_for(
     A composite key is paged too, in the source's own key order (G138), and its pages must
     add up to the source's ``COUNT(*)`` in the same snapshot: ``expected_rows`` when the
     caller read it live, else counted here before the first page (one statement); the
-    pages stop as soon as they read more (G140). A PostgreSQL source's table is then an
-    error (:class:`PagedReadError`); a MySQL source falls back to one exact statement
-    (:func:`_source_checksum_composite_mysql`).
+    pages stop as soon as they read more (G140). A one-column key's pages are held to
+    ``expected_rows`` too, when the caller read it live (G141). A PostgreSQL source's table
+    is then an error (:class:`PagedReadError`); a MySQL source falls back to one exact
+    statement (:func:`_source_checksum`).
     """
     if _source_is_postgres(dialect):
         source = _pg_source(connection, table, from_only)
@@ -1657,6 +1776,7 @@ def _source_checksum_for(
             return str(totals.checksum)
         return _target_checksum(
             source, table, page_size, source_is_postgres=True, on_page=on_page, key=key,
+            expected_rows=expected_rows, side="source",
         )
     return _source_checksum(
         connection, table, page_size, on_page=on_page, dialect=dialect,
@@ -1885,6 +2005,7 @@ def _target_orphan_count_keyset(
     the loop stops when a page returns fewer than ``page_size`` rows. Bounded per page, so
     it stays well under DSQL's 300s limit; a connection aged out at ~1h is handled by the
     reconnecting proxy wrapping ``connection`` (the page replays from ``WHERE pk > :last``).
+    ``last_pk`` comes back as text, bound back untyped (G141).
     """
     first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
     next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
@@ -2563,7 +2684,8 @@ class Validator:
             except Exception as exc:  # noqa: BLE001 - classified below
                 if proof.failed is None:
                     raise
-                transient = is_transient_connection_error(exc) or is_server_unavailable(exc)
+                # A session the server ended is a lost connection too (G141).
+                transient = _is_dropped_connection(exc) or is_server_unavailable(exc)
                 if (is_occ_conflict(exc) or transient) and not proof.retried:
                     proof.retried = True
                     proof.reset()
@@ -2727,7 +2849,8 @@ class Validator:
         checksum_match: Optional[bool] = None
         checksum_excluded_columns: list[str] = []
         if mode is ValidationMode.CHECKSUM and run_deep:
-            # A composite source key's pages are held to the live COUNT(*) of this snapshot.
+            # The source key's pages are held to the live count of this snapshot (a
+            # composite key's, G140; a one-column key's, G141).
             source_checksum = _source_checksum_for(
                 source_dialect, source_connection, table, self._reconcile_page_size,
                 on_page=page, from_only=from_only,
@@ -3275,7 +3398,13 @@ def _render_table_line(item: TableValidationResult) -> str:
     if item.error is not None:
         return f"- {item.table}: ERROR -- {item.error} [ERROR]"
 
-    verdict = "MATCH" if item.matched else "MISMATCH"
+    # G141: a table not matched only because its orphan check could not run is no data
+    # MISMATCH (its counts and checksum say so beside it).
+    verdict = (
+        "MATCH" if item.matched
+        else "NOT MATCHED" if item.orphan_check_only
+        else "MISMATCH"
+    )
     parts = [
         f"- {item.table}: source={item.source_row_count} "
         f"target={item.target_row_count} "
@@ -3486,9 +3615,26 @@ def render_text_report(report: ValidationReport) -> str:
     # used to print "Data identical" unconditionally.)
     is_checksum = report.mode is ValidationMode.CHECKSUM
     match_label = "Data identical" if is_checksum else "Row counts match"
+    # G141: a table not matched only because its orphan check could not run counts with the
+    # data that matched (the Orphan check line below says why it is not matched), as on the
+    # Validation step's readiness panel.
+    matched_count = sum(1 for i in report.items if i.matched)
+    orphan_only = sum(1 for i in report.items if i.orphan_check_only)
+    data_ok = report.is_match or (
+        orphan_only > 0
+        and matched_count + orphan_only == len(report.items)
+        and not report.orphan_findings
+    )
     lines.append(
-        f"- {match_label}: {'yes' if report.is_match else 'NO'} "
-        f"({sum(1 for i in report.items if i.matched)}/{len(report.items)} tables matched)"
+        f"- {match_label}: {'yes' if data_ok else 'NO'} "
+        f"({matched_count}/{len(report.items)} tables matched"
+        + (
+            f"; the comparison of {orphan_only} more matched, but the orphan check could not "
+            "run"
+            if orphan_only
+            else ""
+        )
+        + ")"
     )
     # Honesty caveat (Property 9): some columns have no byte-identical cross-engine form,
     # so the CHECKSUM omits them -- a difference confined to such a NON-KEY column is

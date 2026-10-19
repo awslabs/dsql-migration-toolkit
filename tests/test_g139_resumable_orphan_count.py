@@ -53,6 +53,12 @@ class _Unavailable(Exception):
     sqlstate = "XX000"
 
 
+class AdminShutdown(Exception):
+    """A session the server ended, as psycopg reports PostgreSQL's FATAL (G141)."""
+
+    sqlstate = "57P01"
+
+
 class _Child:
     """An in-memory child table (``(key, fk value)`` rows) and parent keys, plus one fault
     plan shared by every connection opened on it.
@@ -63,14 +69,16 @@ class _Child:
     then drops on the next one, as Aurora DSQL closes a connection at its 60-minute limit.
     ``drop_at`` / ``conflict_at`` / ``unavailable_at`` are global attempt numbers (1-based;
     every execute counts, the key read first) that drop the connection / raise a 40001 /
-    raise an XX000; every attempt of the page whose keyset bound is ``always_conflict``
-    raises a 40001.
+    raise an XX000; ``terminate_at`` ends the session as the server does (``sqlstate``, by
+    default 57P01, G141); every attempt of the page whose keyset bound is
+    ``always_conflict`` raises a 40001.
     """
 
     _NEVER = object()
 
     def __init__(self, rows, parents, *, key=("id",), lifetime=None, drop_at=(),
-                 conflict_at=(), unavailable_at=(), always_conflict=_NEVER):
+                 conflict_at=(), unavailable_at=(), always_conflict=_NEVER,
+                 terminate_at=(), terminate_sqlstate="57P01"):
         self.rows = sorted(rows)
         self.parents = set(parents)
         self.key = tuple(key)
@@ -79,6 +87,8 @@ class _Child:
         self.conflict_at = set(conflict_at)
         self.unavailable_at = set(unavailable_at)
         self.always_conflict = always_conflict
+        self.terminate_at = set(terminate_at)
+        self.terminate_sqlstate = terminate_sqlstate
         self.attempts: list = []      # (connection index, page bound / "key" / "scan", outcome)
         self.connections: list = []
 
@@ -182,6 +192,12 @@ class _Cur:
             conn.closed = True
             record("dropped")
             raise OperationalError("the connection is closed")
+        if attempt in child.terminate_at:
+            conn.closed = True
+            record("terminated")
+            error = AdminShutdown("terminating connection due to administrator command")
+            error.sqlstate = child.terminate_sqlstate
+            raise error
         conn.served += 1
         if attempt in child.conflict_at or (
             bound not in ("key", "scan") and bound == child.always_conflict
@@ -276,27 +292,70 @@ def test_the_count_survives_more_connection_closes_than_the_old_three_attempts(k
 
 
 @_KEYS
-def test_a_conflict_replays_only_its_page_on_the_same_connection(key, rows) -> None:
-    child = _Child(rows(), _PARENTS, key=key, conflict_at={5, 6})  # page 4, twice in a row
+@pytest.mark.parametrize(
+    ("conflict_at", "page"),
+    # Page 4, twice in a row; page 1, right after the key read (G141: the first page goes
+    # through the same replay, so a conflict there replays it alone too).
+    [({5, 6}, 3), ({2}, 0), ({2, 3}, 0)],
+    ids=["page4", "page1", "page1-twice"],
+)
+def test_a_conflict_replays_only_its_page_on_the_same_connection(
+    key, rows, conflict_at, page
+) -> None:
+    child = _Child(rows(), _PARENTS, key=key, conflict_at=conflict_at)
     assert _count(child) == 7
     assert child.attempted_in_order() == child.bounds()
-    fourth = child.bounds()[3]
-    assert child.outcomes("40001") == [fourth, fourth]
+    bound = child.bounds()[page]
+    assert child.outcomes("40001") == [bound] * len(conflict_at)
     assert child.key_reads() == ["ok"]
     assert len(child.connections) == 1
-    assert child.connections[0].rollbacks == 2
+    assert child.connections[0].rollbacks == len(conflict_at)
 
 
-def test_an_xx000_the_proxy_did_not_absorb_replays_the_same_page() -> None:
+@_KEYS
+@pytest.mark.parametrize(
+    ("unavailable_at", "page"),
+    [({4, 5, 6, 7}, 2), ({2, 3, 4, 5}, 0)],  # page 3; page 1, right after the key read
+    ids=["page3", "page1"],
+)
+def test_an_xx000_the_proxy_did_not_absorb_replays_the_same_page(
+    key, rows, unavailable_at, page
+) -> None:
     # On an XX000 the proxy tries a statement up to 4 times on the same connection; when all
     # 4 fail, the page replay rolls back and runs the same page again (it succeeds here).
-    child = _Child(_orders(), _PARENTS, unavailable_at={4, 5, 6, 7})
+    child = _Child(rows(), _PARENTS, key=key, unavailable_at=unavailable_at)
     assert _count(child) == 7
-    third = child.bounds()[2]
-    assert child.outcomes("XX000") == [third] * 4
+    bound = child.bounds()[page]
+    assert child.outcomes("XX000") == [bound] * 4
     assert child.attempted_in_order() == child.bounds()
     assert len(child.connections) == 1
     assert child.connections[0].rollbacks == 1
+
+
+@_KEYS
+@pytest.mark.parametrize("sqlstate", ["57P01", "57P02", "57P03"])
+@pytest.mark.parametrize("attempt", [2, 6], ids=["page1", "page5"])
+def test_a_session_the_server_ends_is_replaced_and_its_page_runs_again(
+    key, rows, sqlstate, attempt
+) -> None:
+    # G141: a FATAL 57P01 (pg_terminate_backend, an admin shutdown), 57P02 or 57P03 is a
+    # lost connection, as the sink treats it: the proxy opens a new one and replays only the
+    # page it cut off. It used to fail the count at once ("orphan pre-check failed").
+    child = _Child(rows(), _PARENTS, key=key, terminate_at={attempt},
+                   terminate_sqlstate=sqlstate)
+    assert _count(child) == 7
+    assert child.outcomes("terminated") == [child.bounds()[attempt - 2]]
+    assert child.outcomes("ok") == child.bounds() == child.attempted_in_order()
+    assert child.key_reads() == ["ok"]
+    assert len(child.connections) == 2 and child.connections[0].closed
+
+
+def test_a_query_cancel_is_not_a_lost_connection() -> None:
+    # 57014 (a statement timeout or a cancel) is no ended session: it is not replayed.
+    child = _Child(_orders(), _PARENTS, terminate_at={3}, terminate_sqlstate="57014")
+    with pytest.raises(AdminShutdown):
+        _count(child)
+    assert len(child.connections) == 1
 
 
 @_KEYS

@@ -39,27 +39,37 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 
 > **Reconcile applies to single-column integer PKs.** Those have a well-defined
 > ordering across both engines. Composite or non-integer PKs are skipped for the
-> reconcile pass (count/checksum still apply).
+> reconcile pass (count/checksum still apply). A `TINYINT(1)` key, a boolean on Aurora
+> DSQL, is reconciled too: its `false` / `true` are compared as MySQL's 0 / 1.
 
 > **Every table with a primary key is counted and checksummed in bounded pages, a
 > composite key too.** Each side reads its own rows in its own primary-key order — a
-> MySQL source with the cursor the Full Load reader uses (`ENUM` / `SET` keys included),
-> a PostgreSQL source and Aurora DSQL with a row-value cursor — at most 5,000 rows per
-> statement on Aurora DSQL, and the two totals are compared. Pages are never compared
-> with each other (the engines sort text differently), so a mismatch is reported for the
-> table as a whole. Aurora DSQL is paged by the primary key it holds, read for each
-> table, so a table re-keyed in Schema Conversion is counted by its new key, never by a
-> key Aurora DSQL does not keep unique. On the source a composite key's row count stays
-> one `COUNT(*)` (a source has no transaction limit), read before the pages, and the
-> checksum's pages must add up to it: they stop as soon as they read more. Pages that
+> MySQL source with the cursor the Full Load reader uses (`ENUM` / `SET` keys included,
+> and a `TIME` or `BIT` key part bound as the duration text and the integer MySQL
+> compares exactly, a one-column key too), a PostgreSQL source and Aurora DSQL with a
+> row-value cursor — at most 5,000 rows per statement on Aurora DSQL, and the two totals
+> are compared. On PostgreSQL and Aurora DSQL each page's last key comes back as text and
+> is read back in the column's own type, so a `real` key (a MySQL `FLOAT` on Aurora DSQL)
+> never reads a row at a page boundary twice. Pages are never compared with each other
+> (the engines sort text differently), so a mismatch is reported for the table as a
+> whole. Aurora DSQL is paged by the primary key it holds, read for each table, so a
+> table re-keyed in Schema Conversion is counted by its new key, never by a key Aurora
+> DSQL does not keep unique. On the source a composite key's row count stays one
+> `COUNT(*)` (a source has no transaction limit), read before the pages, and the
+> checksum's pages must add up to it: they stop as soon as they read more. A one-column
+> key's checksum pages are held to the source's row count the same way. Pages that
 > cannot be trusted that way, or that do not move past their cursor, make a PostgreSQL
 > source's table an error, never a match; on a MySQL source the checksum is read in one
 > statement instead (the log says why). A MySQL key with a descending or prefix part is
 > checksummed on the source in one statement, and so is one with a single-precision
-> `FLOAT`, `TIME` or `BIT` part, a one-column key too. Only a table with no primary key
-> on Aurora DSQL (which the tool does not migrate) is still counted and checksummed
-> there in one statement; on a very large one Aurora DSQL's 300-second transaction limit
-> stops it, and it is reported as an error that says what to do, never as a match.
+> `FLOAT` part, a one-column key too: MySQL returns such a value rounded to 6
+> significant digits, which no cursor can name exactly. Such a statement reports no
+> progress while it runs: a Stop takes effect when it returns, and on a very large table
+> the job's 15-minute no-progress limit can end the run. Only a table with
+> no primary key on Aurora DSQL (which the tool does not migrate) is still counted and
+> checksummed there in one statement; on a very large one Aurora DSQL's 300-second
+> transaction limit stops it, and it is reported as an error that says what to do, never
+> as a match.
 
 > **Checksum excludes floating-point and JSON columns from a MySQL source.** MySQL
 > `FLOAT`/`DOUBLE` and `JSON` have no exact text form that renders identically on both
@@ -125,7 +135,10 @@ verdict. An orphan check that fails (for example on a foreign-key column whose t
 longer matches its parent key) marks only its own table not matched: its row counts and
 its row-count / CHECKSUM verdicts stay shown, so a real mismatch is still seen, and
 **Orphan records** lists the foreign key and the error. Fix the cause and re-check the
-table, or turn off **Check for orphan records** and re-run.
+table, or turn off **Check for orphan records** and re-run. When its comparison matched,
+it is not called a mismatch: its Result reads *orphan check could not run*, **Cut-over
+readiness** shows it in an **Orphan check ran** row of its own, and **How to recover**
+gives no reload steps — there is nothing to backfill — but points to **Orphan records**.
 
 For a table that mismatches, an optional bounded **row-diff sample** lists a few
 differing PKs (and checksum tokens) — **never the row values** — so you can
@@ -201,7 +214,9 @@ The report is **exportable** so you can attach it to a cut-over decision.
 > Full Load start point instead: Stop CDC if it is running and **Delete CDC
 > infrastructure** and deploy it again (on a stack that has streamed, or whose CDC state is
 > not read yet), then switch the migration type to Full load + CDC, run its Full Load
-> choosing **Drop & reload**, and **Start CDC**.
+> choosing **Drop & reload**, and **Start CDC**. A table not matched only because its
+> orphan check could not run gets none of these steps: its comparison matched, so the card
+> says there is nothing to backfill and points to **Orphan records** (5.3).
 
 Once Validation reports a clean **MATCH** (or every difference is explained) — and,
 for a CDC migration, the dead-letter check in 5.5 clears — the

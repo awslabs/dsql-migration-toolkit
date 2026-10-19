@@ -293,7 +293,7 @@ def test_a_last_or_only_float_key_column_loads_again(key, rows) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Validation: a TIME / BIT / FLOAT key part keeps one exact statement on the source
+# Validation: a TIME / BIT key part is paged exactly (G141); a FLOAT one keeps one statement
 # ---------------------------------------------------------------------------
 
 
@@ -304,7 +304,7 @@ def _whole_table_sums(double: MySqlDouble) -> int:
 
 @pytest.mark.parametrize("make", [_times, _bits, lambda: _one_column("time"),
                                   lambda: _one_column("bit"), lambda: _one_column("float")])
-def test_a_time_bit_or_float_key_part_is_checksummed_in_one_statement(make) -> None:
+def test_a_time_or_bit_key_part_is_paged_and_a_float_one_keeps_one_statement(make) -> None:
     table = make()
     double = _DriverDouble(table)
     stop = _poll_limit(table)
@@ -315,9 +315,10 @@ def test_a_time_bit_or_float_key_part_is_checksummed_in_one_statement(make) -> N
     total = v._source_checksum(double, table.tabledef(), 3, _beat, dialect=_MY,
                                expected_rows=len(table.rows))
     assert total == str(sum(_tok(r) for r in table.rows))
-    assert _whole_table_sums(double) == 1
-    assert not any("ck_tok" in sql or "page_tok" in sql or "STATISTICS" in sql
-                   for sql, _ in double.executed)
+    single_precision = table.types[table.key[0]] == "float"
+    assert _whole_table_sums(double) == (1 if single_precision else 0)
+    paged = any("ck_tok" in sql or "page_tok" in sql for sql, _ in double.executed)
+    assert paged is not single_precision
 
 
 @pytest.mark.parametrize("mode", [ValidationMode.ROW_COUNT, ValidationMode.CHECKSUM])

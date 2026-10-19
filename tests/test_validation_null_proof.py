@@ -128,18 +128,20 @@ def _target_pages(target, table="orders"):
 
 def test_the_page_and_count_sql_are_byte_identical_without_proof_columns():
     table = _table("orders")
+    # The keys come back as text, the ORDER BY qualified by the table (G141).
     assert build_pg_pk_first_page_sql(table, "id", 7).as_string(None) == (
-        'SELECT "id" AS pk FROM "orders" ORDER BY "id" LIMIT 7')
+        'SELECT "id"::text AS pk FROM "orders" ORDER BY "orders"."id" LIMIT 7')
     assert build_pg_pk_next_page_sql(table, "id", 7).as_string(None) == (
-        'SELECT "id" AS pk FROM "orders" WHERE "id" > %(last)s ORDER BY "id" LIMIT 7')
+        'SELECT "id"::text AS pk FROM "orders" WHERE "id" > %(last)s '
+        'ORDER BY "orders"."id" LIMIT 7')
     assert build_pg_count_sql("app.orders").as_string(None) == 'SELECT COUNT(*) FROM "app"."orders"'
 
 
 def test_the_proof_columns_are_quoted_identifiers():
     table = _table("orders")
     text = build_pg_pk_first_page_sql(table, "id", 7, ["summary", 'we"ird.x']).as_string(None)
-    assert text == ('SELECT "id" AS pk, ("summary" IS NOT NULL), ("we""ird.x" IS NOT NULL) '
-                    'FROM "orders" ORDER BY "id" LIMIT 7')
+    assert text == ('SELECT "id"::text AS pk, ("summary" IS NOT NULL), ("we""ird.x" IS NOT NULL) '
+                    'FROM "orders" ORDER BY "orders"."id" LIMIT 7')
     assert build_pg_count_sql("orders", ["a"]).as_string(None) == 'SELECT COUNT(*), COUNT("a") FROM "orders"'
 
 

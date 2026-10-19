@@ -847,6 +847,15 @@ def build_pg_pk_first_page_sql(
 ) -> sql.Composed:
     """First keyset page of target primary keys (ascending, bounded by ``page_size``).
 
+    Each key comes back as TEXT (``pk::text``), and the caller binds the page's last one
+    back as ``%(last)s`` (:func:`build_pg_pk_next_page_sql`): an untyped parameter the
+    server parses into the column's own type, so the cursor names exactly the key it read,
+    as :func:`build_pg_composite_page_sql`'s does (G141). Bound natively, a ``real`` key
+    went back as psycopg's float of its shortest decimal -- a float8 below the stored
+    float4 for some values -- and the next page read that row again. The ORDER BY is
+    qualified by the table, so a key column named ``pk`` still sorts as itself, not as the
+    text it is returned as.
+
     Identifiers compose with :class:`psycopg.sql.Identifier` and the bound is a
     :class:`psycopg.sql.Literal` so nothing can break out of the SQL (Req 9.4).
 
@@ -855,22 +864,7 @@ def build_pg_pk_first_page_sql(
     that counts the rows also proves the excluded columns NULL. Empty: the statement is
     byte-identical to the one without the proof.
     """
-    if not nonnull_columns:
-        return sql.SQL(
-            "SELECT {pk} AS pk FROM {table} ORDER BY {pk} LIMIT {limit}"
-        ).format(
-            pk=sql.Identifier(pk_column),
-            table=_pg_table_identifier(table.name),
-            limit=sql.Literal(page_size),
-        )
-    return sql.SQL(
-        "SELECT {pk} AS pk{flags} FROM {table} ORDER BY {pk} LIMIT {limit}"
-    ).format(
-        pk=sql.Identifier(pk_column),
-        flags=_nonnull_flags(nonnull_columns),
-        table=_pg_table_identifier(table.name),
-        limit=sql.Literal(page_size),
-    )
+    return _pg_pk_page_sql(table, pk_column, page_size, nonnull_columns, first=True)
 
 
 def build_pg_pk_next_page_sql(
@@ -879,28 +873,35 @@ def build_pg_pk_next_page_sql(
 ) -> sql.Composed:
     """Subsequent keyset page of target primary keys after the ``last`` placeholder.
 
-    The keyset value is bound as a query parameter (``%(last)s``) at execute time,
-    so a billion-row table reuses one prepared statement across all pages.
-    ``nonnull_columns``: as :func:`build_pg_pk_first_page_sql` (TARGET ONLY).
+    The keyset value -- the previous page's last key, as the text it came back as -- is
+    bound as a query parameter (``%(last)s``) at execute time, so a billion-row table
+    reuses one prepared statement across all pages. ``nonnull_columns``: as
+    :func:`build_pg_pk_first_page_sql` (TARGET ONLY).
     """
-    if not nonnull_columns:
-        return sql.SQL(
-            "SELECT {pk} AS pk FROM {table} WHERE {pk} > {last} "
-            "ORDER BY {pk} LIMIT {limit}"
-        ).format(
-            pk=sql.Identifier(pk_column),
-            table=_pg_table_identifier(table.name),
-            last=sql.Placeholder("last"),
-            limit=sql.Literal(page_size),
+    return _pg_pk_page_sql(table, pk_column, page_size, nonnull_columns, first=False)
+
+
+def _pg_pk_page_sql(
+    table: TableDef, pk_column: str, page_size: int,
+    nonnull_columns: Sequence[str], *, first: bool,
+) -> sql.Composed:
+    """``SELECT pk::text AS pk[, flags] FROM t [WHERE pk > %(last)s] ORDER BY t.pk LIMIT n``."""
+    table_sql = _pg_table_identifier(table.name)
+    cursor = (
+        sql.SQL("")
+        if first
+        else sql.SQL(" WHERE {} > {}").format(
+            sql.Identifier(pk_column), sql.Placeholder("last")
         )
+    )
     return sql.SQL(
-        "SELECT {pk} AS pk{flags} FROM {table} WHERE {pk} > {last} "
-        "ORDER BY {pk} LIMIT {limit}"
+        "SELECT {pk}::text AS pk{flags} FROM {table}{cursor} ORDER BY {order} LIMIT {limit}"
     ).format(
         pk=sql.Identifier(pk_column),
         flags=_nonnull_flags(nonnull_columns),
-        table=_pg_table_identifier(table.name),
-        last=sql.Placeholder("last"),
+        table=table_sql,
+        cursor=cursor,
+        order=_pg_qualified_order(table_sql, (pk_column,)),
         limit=sql.Literal(page_size),
     )
 
@@ -943,8 +944,12 @@ def build_pg_count_sql(
 # while every statement stays bounded (one page) and memory stays at one row. Each
 # page returns ``(sub_sum, last_pk, row_count)``: ``sub_sum`` folds into the running
 # total, ``MAX(page_pk)`` is the next keyset boundary, and ``COUNT(*) < N`` signals the
-# last page. These serve a single-column key; a composite key has its own builders below
-# (G138), and only a side with no primary key keeps the whole-table single statement.
+# last page. That boundary is bound back so it names exactly the key it read (G141): on
+# PostgreSQL / Aurora DSQL it comes back as text and is bound untyped, on MySQL the
+# validator binds it as MySQL compares it (``source_dialect.mysql._cursor_value``: a TIME
+# as its duration text, a BIT as the integer its bits hold). These serve a single-column
+# key; a composite key has its own builders below (G138), and only a side with no primary
+# key keeps the whole-table single statement.
 
 
 def _mysql_keyset_key(table: TableDef, pk_column: str) -> str:
@@ -1000,18 +1005,20 @@ def build_pg_page_checksum_first_sql(
     """First keyset page of the PostgreSQL/DSQL checksum: ``(sub_sum, last_pk, count)``.
 
     The last (max) PK of the ascending page is taken as
-    ``(array_agg(page_pk ORDER BY page_pk))[COUNT(*)]`` rather than ``MAX(page_pk)``:
+    ``(array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)]`` rather than ``MAX(page_pk)``:
     a ``uuid`` PK is orderable but has NO ``max()`` aggregate in PostgreSQL/DSQL
     (``function max(uuid) does not exist``), which would abort the keyset checksum for
     a uuid single-PK. array_agg + ORDER BY works for any orderable PK type (int / uuid /
-    text / timestamp) and equals ``MAX`` for the common integer case.
+    text / timestamp) and equals ``MAX`` for the common integer case. It comes back as
+    TEXT, which the caller binds back untyped, so the server parses it into the column's
+    own type (G141; see :func:`build_pg_pk_first_page_sql`).
 
     Identifiers compose with :class:`psycopg.sql.Identifier` and the bound is a
     :class:`psycopg.sql.Literal` so nothing can break out of the SQL (Req 9.4).
     """
     return sql.SQL(
         "SELECT COALESCE(SUM(page_tok), 0), "
-        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
+        "(array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} "
         "ORDER BY {pk} LIMIT {limit}) ckpage"
     ).format(
@@ -1027,12 +1034,12 @@ def build_pg_page_checksum_next_sql(
 ) -> sql.Composed:
     """Subsequent keyset page of the PostgreSQL/DSQL checksum after the ``last`` param.
 
-    The keyset value is bound as ``%(last)s`` at execute time, so a billion-row table
-    reuses one prepared statement across all pages.
+    The keyset value -- the previous page's last key, as text -- is bound as ``%(last)s``
+    at execute time, so a billion-row table reuses one prepared statement across all pages.
     """
     return sql.SQL(
         "SELECT COALESCE(SUM(page_tok), 0), "
-        "(array_agg(page_pk ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
+        "(array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} WHERE {pk} > {last} "
         "ORDER BY {pk} LIMIT {limit}) ckpage"
     ).format(
@@ -1309,8 +1316,10 @@ def _build_pg_orphan_page_sql(
     PK range and under-count; selecting every row in the window and FILTERing the count
     keeps the boundary exact. The caller accumulates ``orphan_sub_count`` in Python,
     advances ``:last`` from ``array_agg`` (the last/max PK of the ascending window, which
-    works for any orderable PK type -- ``uuid`` has no ``max()`` aggregate), and stops when
-    ``count < page_size``. Identifiers/bounds compose safely (Requirement 9.4).
+    works for any orderable PK type -- ``uuid`` has no ``max()`` aggregate), returned as
+    text and bound back untyped, so the server parses it into the column's own type (G141;
+    see :func:`build_pg_pk_first_page_sql`), and stops when ``count < page_size``.
+    Identifiers/bounds compose safely (Requirement 9.4).
     """
     child = _pg_table_identifier(child_table)
     parent = _pg_table_identifier(fk.referenced_table)
@@ -1346,14 +1355,15 @@ def _build_pg_orphan_page_sql(
     # runs at CUT OVER, after the source is already frozen. Now ~6 min.
     #
     # array_agg stays for the boundary: max() has no uuid overload (verified live --
-    # "function max(uuid) does not exist"), and it costs 0.21s per page.
+    # "function max(uuid) does not exist"), and it costs 0.21s per page. The boundary comes
+    # back as text, bound back untyped (G141).
     return sql.SQL(
         "WITH pg AS MATERIALIZED ("
         "SELECT {pk} AS page_pk, {fk_cols} FROM {child} {where}"
         "ORDER BY {pk} LIMIT {limit}) "
         "SELECT (SELECT COUNT(*) FROM pg LEFT JOIN {parent} AS p ON {join_predicate} "
         "WHERE {not_null} AND {parent_null}), "
-        "(SELECT (array_agg(page_pk ORDER BY page_pk))[COUNT(*)] FROM pg), "
+        "(SELECT (array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)] FROM pg), "
         "(SELECT COUNT(*) FROM pg)"
     ).format(
         not_null=not_null,

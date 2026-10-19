@@ -290,13 +290,18 @@ class PgDouble:
         integer = re.match(r"(tiny|small|medium|big)?int", table.types.get(column, "int"))
         return int(text) if integer else text  # the server parses the text into its type
 
+    def _out(self, table: _Table, column: str, value: object, as_text: bool) -> object:
+        """A key value as the server returns it: its text for ``::text`` (G141), else as is."""
+        return str(value) if as_text else value
+
     def _page(self, table: _Table, key: list[str], params: dict, limit: int) -> list[dict]:
         rows = sorted(table.rows, key=lambda r: tuple(r[c] for c in key))
         if "last_0" in params:
             cursor = tuple(self._parse(table, c, params[f"last_{i}"]) for i, c in enumerate(key))
             rows = [r for r in rows if tuple(r[c] for c in key) > cursor]
-        elif "last" in params:
-            rows = [r for r in rows if r[key[0]] > params["last"]]
+        elif "last" in params:  # a one-column key's last key, bound back as text (G141)
+            last = self._parse(table, key[0], params["last"])
+            rows = [r for r in rows if r[key[0]] > last]
         return rows[:limit]
 
     def resolve(self, statement: Any, params: Optional[dict]) -> Any:
@@ -337,15 +342,29 @@ class PgDouble:
             total = sum(_tok(r) for r in page) if "ck_tok" in sql else 0
             self.page_sums.append(total)
             return (total, len(page), *last, *(sum(r[c] is not None for r in page) for c in flags))
-        if "page_tok" in sql:  # a single-column key's checksum page
+        if "page_pk" in sql:  # a single-column key's checksum or orphan page
             key = [re.search(r'SELECT "([^"]+)" AS page_pk', sql)[1]]
             page = self._page(table, key, params, limit)
-            return (sum(_tok(r) for r in page), page[-1][key[0]] if page else None, len(page))
+            last = None if not page else self._out(
+                table, key[0], page[-1][key[0]], "array_agg(page_pk::text" in sql)
+            if "page_tok" in sql:
+                return (sum(_tok(r) for r in page), last, len(page))
+            parent = self.tables[self._name(sql, r"LEFT JOIN ")]
+            pairs = re.findall(r'p\."([^"]+)" = pg\."([^"]+)"', sql)
+            refs = {tuple(r[ref] for ref, _ in pairs) for r in parent.rows}
+            orphans = sum(
+                1 for r in page
+                if all(r[col] is not None for _, col in pairs)
+                and tuple(r[col] for _, col in pairs) not in refs
+            )
+            return (orphans, last, len(page))
         if " AS pk" in sql:  # a single-column key's count / reconcile page
-            key = [re.search(r'SELECT "([^"]+)" AS pk', sql)[1]]
+            match = re.search(r'SELECT "([^"]+)"(::text)? AS pk', sql)
+            key = [match[1]]
             flags = re.findall(r'\("([^"]+)" IS NOT NULL\)', sql)
             return [
-                (r[key[0]], *(r[c] is not None for c in flags))
+                (self._out(table, key[0], r[key[0]], match[2] is not None),
+                 *(r[c] is not None for c in flags))
                 for r in self._page(table, key, params, limit)
             ]
         if "NOT EXISTS" in sql:  # the single-scan orphan count of a child with no key
