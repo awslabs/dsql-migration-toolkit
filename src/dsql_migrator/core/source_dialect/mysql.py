@@ -137,6 +137,15 @@ def _unknown_member(column: str, kind: str) -> Exception:
     )
 
 
+def is_single_precision_float(column_type: Optional[str]) -> bool:
+    """Is ``column_type`` (as Step 1 recorded ``COLUMN_TYPE``) a MySQL single-precision
+    ``FLOAT`` -- ``float``, ``float(M,D)``, with or without ``unsigned``? ``DOUBLE`` /
+    ``REAL`` are not: MySQL writes ``FLOAT(p)`` as one of the two when it is created."""
+    if not column_type or not column_type.strip():
+        return False
+    return column_type.strip().lower().split("(")[0].split()[0] == "float"
+
+
 def _unreadable_members(column: str, why: str, remedy: str) -> Exception:
     """The read cannot write a cursor that keeps this key column's order."""
     from dsql_migrator.core.exporter import ExportError
@@ -324,6 +333,23 @@ class MySQLSourceDialect(SourceDialect):
         # one-column key is its strict term alone. A walked key (keyset_walk) is the
         # cursor's member AND the disjunction over the rest of the key.
         primary_key = list(table.primary_key)  # type: ignore[attr-defined]
+        # A single-precision FLOAT key column has no cursor value that names its row: the
+        # source returns the shortest decimal that rounds to the stored float (0.7 for
+        # 0.699999988), the driver binds that decimal, and the comparison runs in double
+        # precision. When the decimal lies above the stored value, ``f = :last`` matches
+        # nothing and ``f > :last`` skips the cursor's value, so the rest of its rows were
+        # never read, silently (measured: 10 of 20 rows read for (f FLOAT, n INT), no
+        # error). Refused for every such key column, before any page after the first.
+        recorded = {c.name.lower(): c.mysql_type for c in getattr(table, "columns", ())}
+        for column in primary_key:
+            if is_single_precision_float(recorded.get(column.lower())):
+                raise _unreadable_members(
+                    column,
+                    "is a single-precision FLOAT, which the source returns rounded to its "
+                    "shortest decimal: that value does not compare equal to the stored one",
+                    "Change the column to DOUBLE or DECIMAL on the source, or give the table "
+                    "another primary key, then retry this table.",
+                )
         names = keyset_param_names(len(primary_key))
         params: dict[str, object] = dict(zip(names, last_key))
         walked = self.keyset_walk(table, members) is not None
@@ -522,7 +548,7 @@ class MySQLSourceDialect(SourceDialect):
         return None
 
 
-__all__ = ["MySQLSourceDialect"]
+__all__ = ["MySQLSourceDialect", "is_single_precision_float"]
 
 
 # One scope part: a backtick-quoted name (spaces, dots and doubled backticks allowed)

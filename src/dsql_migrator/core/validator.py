@@ -82,12 +82,13 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence
 
 from psycopg import sql
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from dsql_migrator.core.exporter import ExportError
 from dsql_migrator.core.introspector import (
     SOURCE_ROW_SECURITY_HINT,
     _default_engine_factory,
@@ -106,17 +107,26 @@ from dsql_migrator.core.models import (
     SourceType,
     TableDef,
     TargetConnectionConfig,
+    UncheckedForeignKey,
     ValidationMode,
     ValidationReport,
     Watermark,
     TableValidationResult,
 )
 from dsql_migrator.core.target_connection import (
+    TRANSACTION_AGE_LIMIT_SQLSTATE,
     DsqlConnector,
+    is_dsql_statement_limit,
     is_server_unavailable,
     is_transient_connection_error,
 )
+from dsql_migrator.core.target_introspector import (
+    read_overlay_column_facts,
+    read_target_primary_key,
+)
 from dsql_migrator.core.source_dialect import SourceDialect, dialect_for
+from dsql_migrator.core.source_dialect.base import keyset_param_names
+from dsql_migrator.core.source_dialect.mysql import is_single_precision_float
 from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
 from dsql_migrator.core.validator_postgres import PgSourceConnection
 from dsql_migrator.core.watermark import COMMIT, read_binlog_status_row
@@ -140,6 +150,8 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     _quote_mysql_identifier,
     _quote_mysql_table,
     build_mysql_checksum_sql,
+    build_mysql_composite_boundary_sql,
+    build_mysql_composite_page_sql,
     build_mysql_page_checksum_first_sql,
     build_mysql_page_checksum_next_sql,
     build_mysql_pk_first_page_sql,
@@ -147,6 +159,8 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     build_mysql_pk_token_sql,
     build_orphan_count_sql,
     build_pg_checksum_sql,
+    build_pg_composite_orphan_page_sql,
+    build_pg_composite_page_sql,
     build_pg_count_sql,
     build_pg_orphan_page_first_sql,
     build_pg_orphan_page_next_sql,
@@ -157,6 +171,7 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     build_pg_pk_token_sql,
     has_numeric_checksum_column,
     integer_pk_column,
+    pk_paging_columns,
     single_pk_column,
     stale_numeric_render_scales,
 )
@@ -205,24 +220,241 @@ def _source_count(connection: _SourceConnection, table_name: str) -> int:
     return int(value) if value is not None else 0
 
 
+class PagedReadError(RuntimeError):
+    """A keyset-paged read that cannot be trusted (G138): a page did not move past its
+    cursor, or a side's pages did not read the rows ``COUNT(*)`` counts in the same
+    snapshot. Raised, so the table is graded "not compared" (its error), never a match."""
+
+
+def _stalled(side: str) -> PagedReadError:
+    return PagedReadError(
+        f"A keyset page of the {side} did not move past the key it was read after, so "
+        "the read would repeat that page forever: the database compares the primary key "
+        "differently from the read's cursor. The table is not compared."
+    )
+
+
+def _rows_disagree(side: str, paged: int, counted: int) -> PagedReadError:
+    return PagedReadError(
+        f"The {side}'s keyset pages read {paged:,} rows, but COUNT(*) in the same "
+        f"snapshot counts {counted:,}, so the {side} checksum cannot be trusted and the "
+        "table is not compared. Re-run Validation once writes to this table have stopped; "
+        "if it repeats, the source compares the primary key differently from the read's "
+        "cursor."
+    )
+
+
+# Appended to Aurora DSQL's 54000 on a table it holds with no primary key, which Validation
+# can only read in one statement per side (G138): the error alone does not say what to do.
+KEYLESS_TABLE_LIMIT_HINT = (
+    "Aurora DSQL holds this table with no primary key, so Validation counts and checksums "
+    "it in one statement, which Aurora DSQL stops after 300 seconds. Re-create the table "
+    "with a primary key (Schema Conversion) and reload it, or turn its chip off under "
+    "Objects to validate."
+)
+
+
+def _first_row(result: object) -> Optional[tuple]:
+    """The first row of a source result (as a tuple), or ``None`` for an empty one."""
+    for row in result:  # type: ignore[attr-defined]
+        return tuple(row)
+    return None
+
+
 def _source_checksum(
     connection: _SourceConnection, table: TableDef, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    dialect: Optional[SourceDialect] = None,
+    expected_rows: Optional[int] = None,
 ) -> str:
-    """Return the source checksum for ``table`` as a string (read-only).
+    """Return the MySQL source checksum for ``table`` as a string (read-only).
 
-    For a single-column PK the checksum is accumulated over bounded keyset pages
-    (:func:`_source_checksum_keyset`) so a billion-row source is never summed in one
-    long-held read view; a composite/missing PK keeps the single whole-table scan
-    (MySQL has no per-statement transaction limit, so the fallback is safe).
+    Accumulated over bounded keyset pages -- a single-column PK by
+    :func:`_source_checksum_keyset`, a composite one by
+    :func:`_source_checksum_composite_mysql` -- so a billion-row source is never summed in
+    one statement and the liveness heartbeat beats per page. A table with no primary key
+    keeps the single whole-table statement (MySQL has no per-statement transaction limit).
+    ``expected_rows`` is the live ``COUNT(*)`` of the same snapshot that a composite key's
+    pages must add up to (``None``: counted here).
     """
-    pk_column = single_pk_column(table)
-    if pk_column is not None:
+    key = pk_paging_columns(table)
+    if len(key) == 1:
         return _source_checksum_keyset(
-            connection, table, pk_column, page_size, on_page=on_page
+            connection, table, key[0], page_size, on_page=on_page
         )
+    if key:
+        return _source_checksum_composite_mysql(
+            connection, table, page_size, dialect or dialect_for(SourceType.MYSQL),
+            on_page=on_page, expected_rows=expected_rows,
+        )
+    return _mysql_whole_table_checksum(connection, table)
+
+
+def _mysql_whole_table_checksum(connection: _SourceConnection, table: TableDef) -> str:
+    """The whole-table MySQL checksum in ONE statement (:func:`build_mysql_checksum_sql`)."""
     value = connection.execute(text(build_mysql_checksum_sql(table))).scalar()  # type: ignore[attr-defined]
     return "0" if value is None else str(value)
+
+
+# The source's own PRIMARY index, read once before a composite key's paged checksum (G138):
+# the pages ask for the key in ascending, whole-column order, which the index serves only
+# when every part of it is ascending and whole. A DESC part (MySQL 8.0+) or a prefix part
+# (``name(4)``, required for a TEXT / BLOB key column) turns every page into a scan of
+# everything after its cursor plus a filesort -- measured 29x one whole-table statement at
+# 1M rows, quadratic in the table -- and an index MySQL does not keep sorted (HASH) has no
+# order at all. Catalog only, keyed on schema + table: no scan, no lock.
+_MYSQL_PRIMARY_INDEX_SQL = (
+    "SELECT COLUMN_NAME, COLLATION, SUB_PART FROM information_schema.STATISTICS "
+    "WHERE TABLE_SCHEMA = {schema} AND TABLE_NAME = :name AND INDEX_NAME = 'PRIMARY' "
+    "ORDER BY SEQ_IN_INDEX"
+)
+
+
+def _mysql_key_pages_in_order(connection: _SourceConnection, table: TableDef) -> bool:
+    """Can a MySQL source's composite key be paged in its own order? One catalog read.
+
+    True only when the live PRIMARY index is the key Step 1 recorded, every part ascending
+    and whole, and no key column is a single-precision FLOAT (whose cursor value does not
+    name its row, see ``MySQLSourceDialect.keyset_after_sql``). Otherwise the checksum
+    keeps the single whole-table statement: MySQL has no transaction limit, and the
+    statement is exact whatever the key.
+    """
+    key = [column.lower() for column in table.primary_key]
+    recorded = {column.name.lower(): column.mysql_type for column in table.columns}
+    if any(is_single_precision_float(recorded.get(column)) for column in key):
+        return False
+    schema, separator, name = table.name.partition(".")
+    if separator and schema and name:
+        statement = _MYSQL_PRIMARY_INDEX_SQL.format(schema=":schema")
+        params: dict[str, object] = {"schema": schema, "name": name}
+    else:
+        statement = _MYSQL_PRIMARY_INDEX_SQL.format(schema="DATABASE()")
+        params = {"name": table.name}
+    parts = [tuple(row) for row in connection.execute(text(statement), params)]  # type: ignore[attr-defined]
+    return [str(part[0]).lower() for part in parts] == key and all(
+        str(part[1] or "").upper() == "A" and part[2] is None for part in parts
+    )
+
+
+def _source_checksum_composite_mysql(
+    connection: _SourceConnection,
+    table: TableDef,
+    page_size: int,
+    dialect: SourceDialect,
+    on_page: Optional[Callable[[], None]] = None,
+    expected_rows: Optional[int] = None,
+) -> str:
+    """Accumulate a MySQL source's checksum over bounded keyset pages of its composite key.
+
+    The pages are read with the Full Load reader's OWN cursor
+    (``keyset_key_members`` / ``keyset_walk`` / ``keyset_after_sql``), so an ENUM or SET key
+    column, a key led by an ENUM and MySQL 5.7 are paged exactly as the load read them, in
+    MySQL's own key order and collation (:func:`_mysql_composite_pages`). Only the total
+    is compared with the target's, which pages in ITS order: the per-row token is order-
+    independent, so both add up to their whole-table checksums.
+
+    Fail closed: the pages must have read exactly the ``COUNT(*)`` of the same snapshot
+    (``expected_rows``, or counted here), else :class:`PagedReadError`; a stalled cursor
+    raises the same. A key that cannot be paged in its order (:func:`_mysql_key_pages_in_order`,
+    or the dialect cannot write a cursor for it) keeps the single whole-table statement.
+    """
+    if not _mysql_key_pages_in_order(connection, table):
+        return _mysql_whole_table_checksum(connection, table)
+    try:
+        members = dialect.keyset_key_members(connection, table)
+        total, rows = _mysql_composite_pages(
+            connection, table, page_size, dialect, members, on_page=on_page
+        )
+    except ExportError:
+        # The dialect cannot write a cursor that keeps this key's order (an ENUM member it
+        # cannot place, members it cannot read exactly, two members the source compares as
+        # equal). The source has no transaction limit: one exact statement instead.
+        return _mysql_whole_table_checksum(connection, table)
+    if expected_rows is None:
+        expected_rows = _source_count(connection, table.name)
+    if rows != expected_rows:
+        raise _rows_disagree("source", rows, expected_rows)
+    return str(total)
+
+
+def _mysql_composite_pages(
+    connection: _SourceConnection,
+    table: TableDef,
+    page_size: int,
+    dialect: SourceDialect,
+    members: "Mapping[str, tuple[str, tuple[str, ...]]]",
+    on_page: Optional[Callable[[], None]] = None,
+) -> tuple[int, int]:
+    """``(checksum, rows)`` of a MySQL table over its composite key, one page at a time.
+
+    The order and the state machine are :func:`~dsql_migrator.core.exporter.keyset_stream`'s
+    (a parity test pins them together): the first page has no cursor; a key the dialect
+    walks (led by an ENUM) is read one member at a time -- ``<lead> = :member`` for a
+    member's first page, the dialect's cursor within it -- and moves to the next member
+    after a short page, ending after the last. Per page: the aggregate
+    (:func:`build_mysql_composite_page_sql`), and only for a FULL page its last key
+    (:func:`build_mysql_composite_boundary_sql`), both in the snapshot.
+    """
+    key = list(table.primary_key)
+    walk = dialect.keyset_walk(table, members)
+    lead_sql = dialect.quote_identifier(key[0])
+    lead_name = keyset_param_names(len(key))[0]
+    total = rows = 0
+    last: Optional[tuple] = None
+    member: Optional[int] = None
+    member_start = False
+    while True:
+        if on_page is not None:
+            on_page()
+        if member_start:
+            where_sql, params = f"{lead_sql} = :{lead_name}", {lead_name: walk[member]}  # type: ignore[index]
+        elif last is None:
+            where_sql, params = "", {}
+        else:
+            where_sql, params = dialect.keyset_after_sql(table, last, members)
+        page = _first_row(connection.execute(  # type: ignore[attr-defined]
+            text(build_mysql_composite_page_sql(table, where_sql)),
+            {**params, "page": page_size},
+        ))
+        count = int(page[1] or 0) if page is not None else 0
+        total += int(page[0] or 0) if page is not None else 0
+        rows += count
+        exhausted = count < page_size
+        boundary: Optional[tuple] = None
+        if not exhausted:
+            boundary = _first_row(connection.execute(  # type: ignore[attr-defined]
+                text(build_mysql_composite_boundary_sql(table, where_sql)),
+                {**params, "off": page_size - 1},
+            ))
+            if boundary is None:
+                raise PagedReadError(
+                    "The last key of a full keyset page of the source could not be read, "
+                    "so the read cannot go on. The table is not compared."
+                )
+            if boundary == last:
+                raise _stalled("source")
+            if member is not None and boundary[0] != walk[member]:  # type: ignore[index]
+                raise ExportError("a member's page holds another member's rows")
+        if walk is None:
+            if exhausted:
+                return total, rows
+            last = boundary
+            continue
+        if member is None:
+            if exhausted:
+                return total, rows
+            if boundary[0] not in walk:  # type: ignore[index]
+                raise ExportError("a key value is not one of the members")
+            member = walk.index(boundary[0])  # type: ignore[index]
+        if exhausted:
+            member += 1
+            if member == len(walk):
+                return total, rows
+            member_start = True
+        else:
+            member_start = False
+            last = boundary
 
 
 def _source_checksum_keyset(
@@ -690,6 +922,90 @@ class _NullProofAccumulator:
         for index in range(len(self.columns)):
             self.counts[index] += sum(1 for row in rows if row[index + 1])
 
+    def add_counts(self, counts: "Sequence[int]") -> None:
+        """Add one pass's per-column counts (a composite key's pages sum them in SQL)."""
+        for index, count in enumerate(counts):
+            self.counts[index] += int(count)
+
+
+@dataclass
+class _PagedTotals:
+    """What the pages of one composite-key pass added up to."""
+
+    rows: int = 0
+    checksum: int = 0
+    flags: list[int] = field(default_factory=list)
+
+
+def _composite_pages_pg(
+    connection: Any,
+    table: TableDef,
+    key: "Sequence[str]",
+    page_size: int,
+    *,
+    checksum: bool,
+    source_is_postgres: bool = False,
+    nonnull_columns: "Sequence[str]" = (),
+    on_page: Optional[Callable[[], None]] = None,
+    proof: Optional[_NullProofAccumulator] = None,
+    side: str = "target",
+) -> _PagedTotals:
+    """Page a PostgreSQL / Aurora DSQL table by the composite ``key`` and add the pages up.
+
+    One statement per page (:func:`build_pg_composite_page_sql`): the row-value cursor
+    ``(k0, ...) > (%(last_0)s, ...)``, which the primary key's index serves as a range, at
+    most ``page_size`` rows, the page's last key back as text and bound back untyped. Serves
+    the Aurora DSQL target and, through the shim (``FROM ONLY`` for an inheritance parent),
+    a PostgreSQL source. Stops on a short page; a full page whose last key equals its
+    cursor raises :class:`PagedReadError` instead of reading it forever (``side`` names the
+    side in its message). ``nonnull_columns`` are summed per page (the NULL proof); with
+    ``proof`` a failed statement is recorded on it and the counts land there at the natural
+    end only.
+    """
+    first_sql = build_pg_composite_page_sql(
+        table, key, page_size, source_is_postgres,
+        checksum=checksum, nonnull_columns=nonnull_columns, first=True,
+    )
+    next_sql = build_pg_composite_page_sql(
+        table, key, page_size, source_is_postgres,
+        checksum=checksum, nonnull_columns=nonnull_columns, first=False,
+    )
+    totals = _PagedTotals(flags=[0] * len(nonnull_columns))
+    last: Optional[tuple] = None
+    while True:
+        if on_page is not None:
+            on_page()
+        cursor = connection.cursor()
+        try:
+            if last is None:
+                cursor.execute(first_sql)
+            else:
+                cursor.execute(
+                    next_sql, {f"last_{i}": value for i, value in enumerate(last)}
+                )
+            row = cursor.fetchone()
+        except Exception as exc:
+            if proof is not None:
+                proof.failed = exc
+            raise
+        finally:
+            _safe_close(cursor)
+        count = int(row[1] or 0) if row is not None else 0
+        if row is not None:
+            totals.checksum += int(row[0] or 0)
+            totals.rows += count
+            for index, value in enumerate(row[2 + len(key):2 + len(key) + len(nonnull_columns)]):
+                totals.flags[index] += int(value or 0)
+        if count < page_size:
+            if proof is not None:
+                proof.add_counts(totals.flags)
+                proof.complete = True
+            return totals
+        boundary = tuple(row[2:2 + len(key)])  # type: ignore[index]
+        if boundary == last:
+            raise _stalled(side)
+        last = boundary
+
 
 def _target_count(
     connection: Any, table_name: str,
@@ -697,10 +1013,12 @@ def _target_count(
 ) -> int:
     """Return ``COUNT(*)`` for a target table (read-only ``SELECT``).
 
-    A single unbounded scan: used ONLY as the fallback for a composite/missing PK
-    (see :func:`_bounded_target_count`); on a very large such table it can still hit
-    Aurora DSQL's 300s transaction limit -- a documented residual gap. With ``proof``
-    the same scan also counts ``COUNT(c)`` per excluded column.
+    A single unbounded scan: used ONLY for a table with no primary key on the side read
+    (see :func:`_bounded_target_count`) -- on a very large one it can still hit Aurora
+    DSQL's 300s transaction limit, and the table is then an error, never a match -- and
+    for a PostgreSQL SOURCE's count of a composite key (no limit there; the paged checksum
+    is held to it). With ``proof`` the same scan also counts ``COUNT(c)`` per excluded
+    column.
     """
     if proof is None:
         statement = sql.SQL("SELECT COUNT(*) FROM {table}").format(
@@ -777,49 +1095,104 @@ def _bounded_target_count(
     connection: Any, table: TableDef, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
     proof: Optional[_NullProofAccumulator] = None,
+    *,
+    key: "Optional[Sequence[str]]" = None,
 ) -> int:
-    """Target row count, bounded (keyset) for a single-column PK; ``COUNT(*)`` else.
+    """Target row count over bounded keyset pages of ``key``; ``COUNT(*)`` without one.
 
-    A composite/missing PK has no single keyset column, so it falls back to the
-    unbounded ``COUNT(*)`` (which can still time out on a very large composite-PK
-    table -- a residual gap not covered here). ``proof`` rides on either branch.
+    ``key`` is the key the side read enforces as unique -- for the Aurora DSQL target the
+    live primary key Validation reads per table (G138); ``None`` pages by ``table``'s own
+    primary key. A single column is paged ``pk > :last`` (:func:`_target_count_keyset`), a
+    composite key by the row-value cursor (:func:`_target_count_composite`). Only a table
+    with no primary key keeps the unbounded ``COUNT(*)``, which can still exceed Aurora
+    DSQL's 300 s limit on a very large table (then an error, never a match). ``proof``
+    rides on every branch.
     """
-    pk_column = single_pk_column(table)
-    if pk_column is not None:
+    key = pk_paging_columns(table) if key is None else tuple(key)
+    if len(key) == 1:
         return _target_count_keyset(
-            connection, table, pk_column, page_size, on_page=on_page, proof=proof
+            connection, table, key[0], page_size, on_page=on_page, proof=proof
+        )
+    if key:
+        return _target_count_composite(
+            connection, table, key, page_size, on_page=on_page, proof=proof
         )
     return _target_count(connection, table.name, proof=proof)
+
+
+def _target_count_composite(
+    connection: Any, table: TableDef, key: "Sequence[str]", page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
+    proof: Optional[_NullProofAccumulator] = None,
+) -> int:
+    """Exact target row count over bounded keyset pages of a composite ``key`` (G138).
+
+    The composite counterpart of :func:`_target_count_keyset`: the pages read the key
+    columns only, and with ``proof`` one ``(c IS NOT NULL)`` count per excluded column,
+    summed into the proof (complete only at the natural end).
+    """
+    return _composite_pages_pg(
+        connection, table, key, page_size, checksum=False,
+        nonnull_columns=proof.columns if proof is not None else (),
+        on_page=on_page, proof=proof,
+    ).rows
 
 
 def _target_checksum(
     connection: Any, table: TableDef, page_size: int, source_is_postgres: bool = False,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    key: "Optional[Sequence[str]]" = None,
 ) -> str:
     """Return the target checksum for ``table`` as a string (read-only).
 
-    For a single-column PK the checksum is accumulated over BOUNDED keyset pages
-    (:func:`_target_checksum_keyset`) so a large DSQL table never sums in one
-    transaction -- a single ``SELECT SUM(...)`` scan would exceed DSQL's hard 300s
-    transaction limit and the table could never produce a checksum. A composite/missing
-    PK falls back to the single-scan ``build_pg_checksum_sql`` (a documented residual,
-    like :func:`_target_count`).
+    Accumulated over BOUNDED keyset pages of ``key`` (the key the side read enforces;
+    ``None``: ``table``'s own primary key) -- a single column by
+    :func:`_target_checksum_keyset`, a composite key by :func:`_composite_pages_pg` -- so a
+    large DSQL table never sums in one transaction: a single ``SELECT SUM(...)`` scan would
+    exceed DSQL's hard 300s transaction limit and the table could never produce a checksum.
+    Only a table with no primary key keeps the single-scan ``build_pg_checksum_sql``.
 
     ``source_is_postgres`` is forwarded to the PG checksum builders for the numeric-scale
     rule; it is ``True`` both when rendering the DSQL target of a PostgreSQL-source
     migration AND when this same function renders a PostgreSQL SOURCE (via
     :func:`_source_checksum_for`), so both ends of a PG migration agree.
     """
-    pk_column = single_pk_column(table)
-    if pk_column is not None:
+    key = pk_paging_columns(table) if key is None else tuple(key)
+    if len(key) == 1:
         return _target_checksum_keyset(
-            connection, table, pk_column, page_size, source_is_postgres,
+            connection, table, key[0], page_size, source_is_postgres,
             on_page=on_page,
         )
+    if key:
+        return str(_composite_pages_pg(
+            connection, table, key, page_size, checksum=True,
+            source_is_postgres=source_is_postgres, on_page=on_page,
+        ).checksum)
     value = _target_scalar(
         connection, build_pg_checksum_sql(table, source_is_postgres)
     )
     return "0" if value is None else str(value)
+
+
+def _target_checksum_and_count(
+    connection: Any, table: TableDef, key: "Sequence[str]", page_size: int,
+    source_is_postgres: bool = False,
+    on_page: Optional[Callable[[], None]] = None,
+    proof: Optional[_NullProofAccumulator] = None,
+) -> tuple[str, int]:
+    """``(checksum, row count)`` of a target table in ONE pass over its composite ``key``.
+
+    In CHECKSUM mode the checksum pages already count their rows, so the composite key's
+    row count and NULL proof come from them (G138): one paged read of the table, not two.
+    """
+    totals = _composite_pages_pg(
+        connection, table, key, page_size, checksum=True,
+        source_is_postgres=source_is_postgres,
+        nonnull_columns=proof.columns if proof is not None else (),
+        on_page=on_page, proof=proof,
+    )
+    return str(totals.checksum), totals.rows
 
 
 def _target_checksum_keyset(
@@ -1148,13 +1521,16 @@ def _source_row_count_live(
     from_only: bool = False,
 ) -> int:
     """Exact live source count: PG keyset-bounds it (single PK) like the target; MySQL
-    (no per-txn limit) uses a plain ``COUNT(*)`` as before. ``from_only``: a PostgreSQL
+    (no per-txn limit) uses a plain ``COUNT(*)`` as before, and so does a PostgreSQL
+    composite key: the source has no 300 s limit, and that ONE independent statement is what
+    the composite key's paged checksum is held to (G138). ``from_only``: a PostgreSQL
     inheritance parent's own rows (:func:`_pg_source`), as on every PG source read here."""
     if _source_is_postgres(dialect):
         # Never a NULL proof here: the proof columns are TARGET ONLY.
-        return _bounded_target_count(
-            _pg_source(connection, table, from_only), table, page_size, on_page=on_page
-        )
+        source = _pg_source(connection, table, from_only)
+        if len(pk_paging_columns(table)) > 1:
+            return _target_count(source, table.name)
+        return _bounded_target_count(source, table, page_size, on_page=on_page)
     return _source_count(connection, table.name)
 
 
@@ -1166,6 +1542,7 @@ def _source_checksum_for(
     on_page: Optional[Callable[[], None]] = None,
     *,
     from_only: bool = False,
+    expected_rows: Optional[int] = None,
 ) -> str:
     """Source checksum for either engine, beating ``on_page`` once per keyset page.
 
@@ -1173,13 +1550,31 @@ def _source_checksum_for(
     page after page with no other statement in between, so without it the liveness
     heartbeat falls silent for the whole scan and the watchdog can reap a healthy run
     (see :meth:`Validator.set_page_hook`).
+
+    A composite key is paged too, in the source's own key order (G138), and its pages must
+    add up to the source's ``COUNT(*)`` in the same snapshot: ``expected_rows`` when the
+    caller read it live, else counted here (one statement), else :class:`PagedReadError`.
     """
     if _source_is_postgres(dialect):
+        source = _pg_source(connection, table, from_only)
+        key = pk_paging_columns(table)
+        if len(key) > 1:
+            totals = _composite_pages_pg(
+                source, table, key, page_size, checksum=True,
+                source_is_postgres=True, on_page=on_page, side="source",
+            )
+            if expected_rows is None:
+                expected_rows = _target_count(source, table.name)
+            if totals.rows != expected_rows:
+                raise _rows_disagree("source", totals.rows, expected_rows)
+            return str(totals.checksum)
         return _target_checksum(
-            _pg_source(connection, table, from_only), table, page_size,
-            source_is_postgres=True, on_page=on_page,
+            source, table, page_size, source_is_postgres=True, on_page=on_page, key=key,
         )
-    return _source_checksum(connection, table, page_size, on_page=on_page)
+    return _source_checksum(
+        connection, table, page_size, on_page=on_page, dialect=dialect,
+        expected_rows=expected_rows,
+    )
 
 
 def _iter_source_pks_for(
@@ -1303,23 +1698,75 @@ def reconcile_pk_streams(
 def _target_orphan_count(
     connection: Any, table: TableDef, fk: ForeignKeyDef, page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    key: "Optional[Sequence[str]]" = None,
 ) -> int:
     """Return the number of orphan child rows for ``fk`` on the target.
 
-    For a single-column-PK child the count is accumulated over BOUNDED keyset pages
-    (:func:`_target_orphan_count_keyset`) so a billion-row child never runs the orphan
-    scan in one transaction -- a single unbounded ``COUNT(*) ... NOT EXISTS`` would exceed
-    Aurora DSQL's hard 300s transaction limit, exactly the failure mode the count/checksum
-    keyset pagers already avoid. A composite/missing PK falls back to the single scan
-    (:func:`build_orphan_count_sql`), a documented residual like :func:`_target_count`.
+    Accumulated over BOUNDED keyset pages of the child's ``key`` (the key the target
+    enforces; ``None``: ``table``'s own primary key) -- :func:`_target_orphan_count_keyset`
+    for a single column, :func:`target_orphan_count_composite` for a composite key -- so a
+    billion-row child never runs the orphan scan in one transaction: a single unbounded
+    ``COUNT(*) ... NOT EXISTS`` would exceed Aurora DSQL's hard 300s transaction limit,
+    exactly the failure mode the count/checksum keyset pagers already avoid. Only a child
+    with no primary key keeps the single scan (:func:`build_orphan_count_sql`).
     """
-    pk_column = single_pk_column(table)
-    if pk_column is not None:
+    key = pk_paging_columns(table) if key is None else tuple(key)
+    if len(key) == 1:
         return _target_orphan_count_keyset(
-            connection, table.name, fk, pk_column, page_size, on_page=on_page
+            connection, table.name, fk, key[0], page_size, on_page=on_page
+        )
+    if key:
+        return target_orphan_count_composite(
+            connection, table.name, fk, key, page_size, on_page=on_page
         )
     value = _target_scalar(connection, build_orphan_count_sql(table.name, fk))
     return int(value) if value is not None else 0
+
+
+def target_orphan_count_composite(
+    connection: Any,
+    child_table: str,
+    fk: ForeignKeyDef,
+    key: "Sequence[str]",
+    page_size: int,
+    on_page: Optional[Callable[[], None]] = None,
+) -> int:
+    """Accumulate the orphan count over bounded keyset pages of a composite ``key`` (G138).
+
+    Each page (:func:`build_pg_composite_orphan_page_sql`) reports ``(orphan_sub_count,
+    row_count, last key as text...)`` over a window filtered by the cursor only, so the
+    boundary advances over non-orphan rows too and no key range is skipped. Shared by
+    Validation's orphan check and the cut-over foreign-key pre-check (heartbeat per page);
+    a full page whose last key equals its cursor raises :class:`PagedReadError`.
+    """
+    first_sql = build_pg_composite_orphan_page_sql(child_table, fk, key, page_size, first=True)
+    next_sql = build_pg_composite_orphan_page_sql(child_table, fk, key, page_size, first=False)
+    total = 0
+    last: Optional[tuple] = None
+    while True:
+        if on_page is not None:
+            on_page()
+        cursor = connection.cursor()
+        try:
+            if last is None:
+                cursor.execute(first_sql)
+            else:
+                cursor.execute(
+                    next_sql, {f"last_{i}": value for i, value in enumerate(last)}
+                )
+            row = cursor.fetchone()
+        finally:
+            _safe_close(cursor)
+        if row is None:
+            return total
+        total += int(row[0] or 0)
+        if int(row[1] or 0) < page_size:
+            return total
+        boundary = tuple(row[2:2 + len(key)])
+        if boundary == last:
+            raise _stalled("target")
+        last = boundary
 
 
 def _target_orphan_count_keyset(
@@ -1380,8 +1827,9 @@ def _default_target_connection_factory(target: TargetConnectionConfig) -> Any:
     return DsqlConnector(target).connect()
 
 
-# A cancel check polled between tables: returns True once a cooperative stop has
-# been requested (e.g. the JobManager handle's ``cancelled`` flag).
+# A cancel check polled between tables and once per page of a table's scans: returns True
+# once a cooperative stop has been requested (e.g. the JobManager handle's ``cancelled``
+# flag).
 CancelCheck = Callable[[], bool]
 
 # A progress callback invoked BEFORE each table is compared, with the table name,
@@ -1394,11 +1842,11 @@ ProgressCallback = Callable[[str, int, int], None]
 class ValidationCancelled(RuntimeError):
     """Raised when a validation run is cooperatively cancelled mid-way.
 
-    Validation stops at the next table boundary (its consistent-snapshot
-    transaction is still closed cleanly) and raises this instead of returning a
-    partial :class:`~dsql_migrator.core.models.ValidationReport`, so a cancelled
-    run is never mistaken for a completed comparison. The caller maps it to a
-    CANCELLED job state, not a failure.
+    Validation stops at the next page of a table's scans or the next table boundary
+    (its consistent-snapshot transaction is still closed cleanly) and raises this
+    instead of returning a partial :class:`~dsql_migrator.core.models.ValidationReport`,
+    so a cancelled run is never mistaken for a completed comparison. The caller maps it
+    to a CANCELLED job state, not a failure.
     """
 
 
@@ -1499,6 +1947,20 @@ class Validator:
         except Exception:  # noqa: BLE001 - advisory; never break a scan
             pass
 
+    def _page_or_stop(self, should_cancel: CancelCheck) -> Callable[[], None]:
+        """The per-page beat of one table's scans: the page hook, then the run's cancel
+        check, so a Stop takes effect within one page of a large table (G138) -- every
+        pager, single-column key included -- instead of at the next table boundary."""
+
+        def _beat() -> None:
+            self._page()
+            if should_cancel():
+                raise ValidationCancelled(
+                    "Validation cancelled while a table was being read."
+                )
+
+        return _beat
+
     def validate(
         self,
         source: SourceConnectionConfig,
@@ -1536,8 +1998,9 @@ class Validator:
         every other table and the bad table is shown as a failed check ("table
         errors") instead of crashing Validation.
 
-        ``should_cancel`` (when given) is polled BEFORE each table; once it returns
-        ``True`` the run stops at that table boundary and raises
+        ``should_cancel`` (when given) is polled BEFORE each table and once per page of
+        each table's scans (G138); once it returns ``True`` the run stops there -- within
+        one page of a large table -- and raises
         :class:`ValidationCancelled` (the consistent-snapshot transaction and
         connections are still closed cleanly via ``finally``), so a cancelled run
         never returns a partial report mistaken for a completed comparison.
@@ -1590,6 +2053,10 @@ class Validator:
         source_engine = self._source_engine_factory(source)
         items: list[TableValidationResult] = []
         orphan_findings: list[OrphanFinding] = []
+        orphan_unchecked: list[UncheckedForeignKey] = []
+        # Each table's live target key, read once by its comparison and reused by its
+        # orphan check (G138).
+        live_keys: dict[str, tuple[str, ...]] = {}
         current_gtid: Optional[str] = None
         try:
             with source_engine.connect() as raw_connection:
@@ -1643,27 +2110,29 @@ class Validator:
                             in_savepoint = savepoints and _open_table_savepoint(
                                 source_connection
                             )
-                            items.append(
-                                self._validate_table(
-                                    source_connection,
-                                    target_connection,
-                                    table,
-                                    mode,
-                                    watermark,
-                                    reconcile,
-                                    cancel,
-                                    source_dialect,
-                                    deep_only_on_count_mismatch=(
-                                        deep_only_on_count_mismatch
-                                    ),
-                                )
+                            item = self._validate_table(
+                                source_connection,
+                                target_connection,
+                                table,
+                                mode,
+                                watermark,
+                                reconcile,
+                                cancel,
+                                source_dialect,
+                                deep_only_on_count_mismatch=(
+                                    deep_only_on_count_mismatch
+                                ),
+                                live_keys=live_keys,
                             )
                             if in_savepoint:
                                 _rollback_to_table_savepoint(source_connection)
                             if check_orphans:
-                                orphan_findings.extend(
-                                    self._check_orphans(target_connection, table)
+                                found, unchecked, item = self._check_orphans(
+                                    target_connection, table, item, cancel, live_keys
                                 )
+                                orphan_findings.extend(found)
+                                orphan_unchecked.extend(unchecked)
+                            items.append(item)
                     finally:
                         _safe_close(target_connection)
                 finally:
@@ -1692,6 +2161,7 @@ class Validator:
                 drift=drift,
                 snapshot_timestamp=snapshot_timestamp,
                 reconcile_requested=reconcile,
+                orphan_unchecked=orphan_unchecked,
             ),
             quarantined_by_table,
         )
@@ -1727,6 +2197,7 @@ class Validator:
         # Slot results by original index so completion order never reorders the report.
         results: list[Optional[TableValidationResult]] = [None] * total
         orphans_by_index: list[list[OrphanFinding]] = [[] for _ in range(total)]
+        unchecked_by_index: list[list[UncheckedForeignKey]] = [[] for _ in range(total)]
         # Progress is reported as tables COMPLETE (not start) under concurrency, so the
         # count rises monotonically; guard the shared counter + callback with a lock.
         progress_lock = threading.Lock()
@@ -1736,12 +2207,13 @@ class Validator:
             nonlocal done_count
             if cancel():
                 return
-            item, orphans = self._validate_one_table_isolated(
+            item, orphans, unchecked = self._validate_one_table_isolated(
                 source, target, table, mode, watermark, reconcile, check_orphans,
                 cancel, deep_only_on_count_mismatch=deep_only_on_count_mismatch,
             )
             results[index] = item
             orphans_by_index[index] = orphans
+            unchecked_by_index[index] = unchecked
             if on_progress is not None:
                 with progress_lock:
                     done_count += 1
@@ -1767,6 +2239,7 @@ class Validator:
         orphan_findings: list[OrphanFinding] = []
         for found in orphans_by_index:
             orphan_findings.extend(found)
+        orphan_unchecked = [fk for found in unchecked_by_index for fk in found]
 
         current_gtid, current_binlog_file, current_binlog_position = (
             self._read_source_position(source)
@@ -1786,6 +2259,7 @@ class Validator:
             drift=drift,
             snapshot_timestamp=snapshot_timestamp,
             reconcile_requested=reconcile,
+            orphan_unchecked=orphan_unchecked,
         )
 
     def _validate_one_table_isolated(
@@ -1799,7 +2273,7 @@ class Validator:
         check_orphans: bool,
         cancel: CancelCheck,
         deep_only_on_count_mismatch: bool = False,
-    ) -> "tuple[TableValidationResult, list[OrphanFinding]]":
+    ) -> "tuple[TableValidationResult, list[OrphanFinding], list[UncheckedForeignKey]]":
         """Compare ONE table on its own source snapshot + target connection.
 
         The self-contained unit the parallel path runs per worker: open a fresh
@@ -1807,11 +2281,13 @@ class Validator:
         worker is internally consistent and read-only -- Property 1), open a fresh
         target connection, compare the one table, and -- when requested -- its
         orphans, then close everything cleanly via ``finally``. A per-table failure
-        is already isolated inside :meth:`_validate_table`.
+        is already isolated inside :meth:`_validate_table` and :meth:`_check_orphans`.
         """
         source_dialect = dialect_for(source.source_type)
         source_engine = self._source_engine_factory(source)
         orphans: list[OrphanFinding] = []
+        unchecked: list[UncheckedForeignKey] = []
+        live_keys: dict[str, tuple[str, ...]] = {}
         try:
             with source_engine.connect() as raw_connection:
                 source_connection = raw_connection.execution_options(
@@ -1827,10 +2303,11 @@ class Validator:
                             source_connection, target_connection, table,
                             mode, watermark, reconcile, cancel, source_dialect,
                             deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+                            live_keys=live_keys,
                         )
                         if check_orphans:
-                            orphans = list(
-                                self._check_orphans(target_connection, table)
+                            orphans, unchecked, item = self._check_orphans(
+                                target_connection, table, item, cancel, live_keys
                             )
                     finally:
                         _safe_close(target_connection)
@@ -1843,7 +2320,7 @@ class Validator:
                         source_connection.execute(text(COMMIT))
         finally:
             source_engine.dispose()
-        return item, orphans
+        return item, orphans, unchecked
 
     def _read_source_position(
         self, source: SourceConnectionConfig
@@ -1889,6 +2366,8 @@ class Validator:
         should_cancel: CancelCheck,
         source_dialect: SourceDialect,
         deep_only_on_count_mismatch: bool = False,
+        *,
+        live_keys: "Optional[dict[str, tuple[str, ...]]]" = None,
     ) -> TableValidationResult:
         """Compare one table, isolating any failure to this table's result.
 
@@ -1899,6 +2378,7 @@ class Validator:
         message is rendered log-safe (no row values / credentials, Property 7).
         A :class:`ValidationCancelled` is NOT a per-table failure -- it is a
         cooperative stop, so it propagates to abort the whole run cleanly.
+        ``live_keys`` collects the table's live target key (see :meth:`_compare_table`).
         """
         try:
             return self._compare_table(
@@ -1911,6 +2391,7 @@ class Validator:
                 should_cancel,
                 source_dialect,
                 deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+                live_keys=live_keys,
             )
         except ValidationCancelled:
             raise  # cooperative stop: abort the run, not a per-table error
@@ -1922,6 +2403,14 @@ class Validator:
             refusal = getattr(source_dialect, "is_row_security_refusal", None)
             if callable(refusal) and refusal(exc):
                 error = f"{error} — {SOURCE_ROW_SECURITY_HINT}"
+            elif (
+                getattr(exc, "sqlstate", None) == TRANSACTION_AGE_LIMIT_SQLSTATE
+                and live_keys is not None
+                and live_keys.get(table.name) == ()
+            ):
+                # Read in one statement because Aurora DSQL holds it with no primary key:
+                # the 300 s limit will stop it again; say how to get it compared.
+                error = f"{error} — {KEYLESS_TABLE_LIMIT_HINT}"
             return TableValidationResult(
                 table=table.name,
                 source_row_count=0,
@@ -1962,7 +2451,9 @@ class Validator:
         not cause propagates unchanged: the source side, a cancel, and a lost target
         connection or Aurora DSQL's XX000 (the proof is not its cause, so dropping the
         proof would only lose it) -- which gets the same one retry WITH the proof, then
-        errors the table as it does without exclusions.
+        errors the table as it does without exclusions -- and Aurora DSQL's statement
+        limits (54000 at 300 s, 53200), which a re-run without the proof would only meet
+        again after the same wait.
         """
         if proof is None:
             return run(None)
@@ -1979,7 +2470,9 @@ class Validator:
                     proof.retried = True
                     proof.reset()
                     continue
-                if transient:
+                if transient or is_dsql_statement_limit(exc):
+                    # An Aurora DSQL statement limit (54000 / 53200) is no proof failure:
+                    # the same scan without the proof meets the same limit (G138).
                     raise
                 proof.reset()
                 proof.reason = "query_error"
@@ -2018,6 +2511,8 @@ class Validator:
         should_cancel: CancelCheck,
         source_dialect: SourceDialect,
         deep_only_on_count_mismatch: bool = False,
+        *,
+        live_keys: "Optional[dict[str, tuple[str, ...]]]" = None,
     ) -> TableValidationResult:
         """Compare one table's row count (and, in CHECKSUM mode, its checksum).
 
@@ -2026,6 +2521,12 @@ class Validator:
         live. ``matched`` is computed soundly: equal counts, (in CHECKSUM mode)
         equal checksums, AND -- when reconciliation ran -- no missing/extra
         records (Property 9).
+
+        Each side is read in bounded keyset pages of a key THAT side enforces as unique
+        (G138): the source by its primary key, Aurora DSQL by its live primary key, read
+        once here and recorded in ``live_keys`` (when given) for the orphan check. A
+        composite key is paged too, and only per-side totals are compared; only a side with
+        no primary key is read in one statement.
 
         When ``deep_only_on_count_mismatch`` is set, the expensive checksum and PK
         reconciliation are skipped for a table whose counts already AGREE (they
@@ -2067,26 +2568,42 @@ class Validator:
         from_only = _source_is_postgres(source_dialect) and pg_reads_own_rows_only(
             source_connection, table.name
         )
+        # Every scan of this table beats the page hook and polls the stop once per page.
+        page = self._page_or_stop(should_cancel)
+        # G138: a side is paged only by a key that SIDE enforces as unique -- a page boundary
+        # inside a run of duplicates of a key the side does not enforce skips one of them, a
+        # false MATCH when it is the extra row (measured: 10 target rows counted as 9). So the
+        # target is paged by its LIVE primary key, read here once per table on the open
+        # connection: the source's key unless the target was re-keyed (Schema Conversion's
+        # Composite key, an edited key, a target made by hand). A read that fails raises
+        # (the table errors) instead of assuming the source's key; a table Aurora DSQL holds
+        # without a primary key is read in one statement. The source always pages by its own
+        # primary key.
+        target_key = read_target_primary_key(target_connection, table.name)
+        if live_keys is not None:
+            live_keys[table.name] = target_key
 
+        source_count_live = _exact_watermark_count(watermark, table.name) is None
         source_row_count = self._source_row_count(
             source_connection, table, watermark, source_dialect,
             self._reconcile_page_size,
-            on_page=self._page,
+            on_page=page,
             from_only=from_only,
         )
         # The TARGET count must be BOUNDED on Aurora DSQL: a single COUNT(*) scans the
         # whole table in one transaction and, at scale, exceeds DSQL's hard 300s limit,
         # so a large table could never report MATCH. We prefer the exact count that
-        # reconciliation ALREADY streams (keyset-paged) for an integer PK; otherwise we
-        # keyset-page the count ourselves for any single-column PK; COUNT(*) is used only
-        # for a composite/missing PK. In deep-only mode the count is needed UP FRONT to
-        # decide whether to run the deep checks; otherwise it is deferred to after
-        # reconcile so reconcile's count is reused with no second scan.
+        # reconciliation ALREADY streams (keyset-paged) for an integer PK the target
+        # enforces; in CHECKSUM mode a composite target key takes it from its checksum
+        # pages; otherwise we keyset-page the count ourselves by the target's key; COUNT(*)
+        # is used only for a target table with no primary key. In deep-only mode the count
+        # is needed UP FRONT to decide whether to run the deep checks; otherwise it is
+        # deferred so an already-streamed count is reused with no second scan.
         #
         # The column-exclusion NULL proof rides on EXACTLY the one pass that produces
-        # ``target_row_count`` (the up-front count in deep-only mode, else reconcile's
-        # target stream, else the deferred count) -- never on the checksum -- so it adds
-        # no target pass.
+        # ``target_row_count`` (the up-front count in deep-only mode, else the composite
+        # checksum pages, else reconcile's target stream, else the deferred count), so it
+        # adds no target pass.
         proof = self._proof_for(table)
         target_row_count: Optional[int] = None
         row_count_match: Optional[bool] = None
@@ -2094,7 +2611,7 @@ class Validator:
             target_row_count = self._with_proof_fallback(
                 lambda acc: _bounded_target_count(
                     target_connection, table, self._reconcile_page_size,
-                    on_page=self._page, proof=acc,
+                    on_page=page, proof=acc, key=target_key,
                 ),
                 proof,
             )
@@ -2106,20 +2623,36 @@ class Validator:
         # means "verified by row count" -- exactly the ROW_COUNT contract.
         run_deep = not (deep_only_on_count_mismatch and row_count_match)
 
+        source_is_postgres = _source_is_postgres(source_dialect)
         source_checksum: Optional[str] = None
         target_checksum: Optional[str] = None
         checksum_match: Optional[bool] = None
         checksum_excluded_columns: list[str] = []
         if mode is ValidationMode.CHECKSUM and run_deep:
+            # A composite source key's pages are held to the live COUNT(*) of this snapshot.
             source_checksum = _source_checksum_for(
                 source_dialect, source_connection, table, self._reconcile_page_size,
-                on_page=self._page, from_only=from_only,
+                on_page=page, from_only=from_only,
+                expected_rows=source_row_count if source_count_live else None,
             )
-            target_checksum = _target_checksum(
-                target_connection, table, self._reconcile_page_size,
-                source_is_postgres=_source_is_postgres(source_dialect),
-                on_page=self._page,
-            )
+            if len(target_key) > 1 and target_row_count is None:
+                # The composite target key's checksum pages count their rows and carry
+                # the NULL proof: one paged read of the target, not two.
+                target_checksum, target_row_count = self._with_proof_fallback(
+                    lambda acc: _target_checksum_and_count(
+                        target_connection, table, target_key,
+                        self._reconcile_page_size, source_is_postgres,
+                        on_page=page, proof=acc,
+                    ),
+                    proof,
+                )
+                row_count_match = source_row_count == target_row_count
+            else:
+                target_checksum = _target_checksum(
+                    target_connection, table, self._reconcile_page_size,
+                    source_is_postgres=source_is_postgres,
+                    on_page=page, key=target_key,
+                )
             checksum_match = source_checksum == target_checksum
             # Columns the checksum could not value-compare (no byte-identical
             # cross-engine text form): JSON always, and FLOAT/DOUBLE only for a MySQL
@@ -2132,51 +2665,56 @@ class Validator:
             checksum_excluded_columns = [
                 column.name
                 for column in table.columns
-                if _checksum_omits_column(
-                    column, _source_is_postgres(source_dialect)
-                )
+                if _checksum_omits_column(column, source_is_postgres)
             ]
 
         # Full PK-set reconciliation (the "no mismatched records" check): stream
         # every PK from both sides and merge. Only for single-column integer PKs
         # (well-defined cross-engine order); other tables fall back to
         # count/checksum (reconcile stays None). Bounded keyset paging -- never a
-        # full materialization (Property 7: PK values only).
+        # full materialization (Property 7: PK values only). Its target stream is the
+        # table's row count only when the target enforces that same key (G138); a
+        # re-keyed target is counted by its own key below.
         reconcile_result: Optional[ReconcileResult] = None
-        if reconcile and run_deep:
-            pk_column = integer_pk_column(table)
-            if pk_column is not None:
-                # A proof failure re-creates BOTH streams: the source re-reads the same
-                # consistent snapshot (buffered pages), the target without the proof.
-                reconcile_result = self._with_proof_fallback(
-                    lambda acc: reconcile_pk_streams(
-                        pk_column,
-                        _iter_source_pks_for(
-                            source_dialect, source_connection, table, pk_column,
-                            self._reconcile_page_size, on_page=self._page,
-                            from_only=from_only,
-                        ),
-                        _iter_target_pks(
-                            target_connection, table, pk_column,
-                            self._reconcile_page_size, on_page=self._page, proof=acc,
-                        ),
-                        should_cancel=should_cancel,
+        pk_column = integer_pk_column(table)
+        reuse_reconcile_count = (
+            pk_column is not None
+            and target_key == (pk_column,)
+            and target_row_count is None
+        )
+        if reconcile and run_deep and pk_column is not None:
+            # A proof failure re-creates BOTH streams: the source re-reads the same
+            # consistent snapshot (buffered pages), the target without the proof.
+            reconcile_result = self._with_proof_fallback(
+                lambda acc: reconcile_pk_streams(
+                    pk_column,
+                    _iter_source_pks_for(
+                        source_dialect, source_connection, table, pk_column,
+                        self._reconcile_page_size, on_page=page,
+                        from_only=from_only,
                     ),
-                    None if deep_only_on_count_mismatch else proof,
-                )
+                    _iter_target_pks(
+                        target_connection, table, pk_column,
+                        self._reconcile_page_size, on_page=page, proof=acc,
+                    ),
+                    should_cancel=should_cancel,
+                ),
+                proof if reuse_reconcile_count else None,
+            )
 
         # Default path: the target count was deferred so it could reuse reconcile's
         # exact keyset-streamed count (no second scan); when reconcile did not run
-        # (non-integer PK, reconcile off, or CHECKSUM-only), keyset-page it directly --
-        # a single unbounded COUNT(*) is used only for a composite/missing PK.
+        # (non-integer PK, reconcile off, CHECKSUM-only) or the target is re-keyed,
+        # keyset-page it directly by the target's key -- a single unbounded COUNT(*) is
+        # used only for a target table with no primary key.
         if target_row_count is None:
             target_row_count = (
                 reconcile_result.target_count
-                if reconcile_result is not None
+                if reconcile_result is not None and reuse_reconcile_count
                 else self._with_proof_fallback(
                     lambda acc: _bounded_target_count(
                         target_connection, table, self._reconcile_page_size,
-                        on_page=self._page, proof=acc,
+                        on_page=page, proof=acc, key=target_key,
                     ),
                     proof,
                 )
@@ -2217,7 +2755,7 @@ class Validator:
             # single integer PK), independent of whether it actually did. When
             # reconciliation was requested but this is False for every table, a
             # row-count match must not be released as a clean, record-verified pass.
-            reconcile_applicable=integer_pk_column(table) is not None,
+            reconcile_applicable=pk_column is not None,
             deep_checks_skipped=not run_deep,
             **proof_fields,
         )
@@ -2241,37 +2779,79 @@ class Validator:
         time, never during the migration itself, and is dispatched per source engine
         (MySQL ``COUNT(*)``; PostgreSQL keyset-bounded like the target).
         """
-        # ``is not None``, not merely present: an entry can be None for "unknown" (a
-        # never-analyzed PostgreSQL table). Such a watermark is always approximate, so
-        # this branch is unreachable for it today -- but returning None here would make
-        # the row-count comparison silently compare against nothing.
-        if (
-            watermark is not None
-            and not watermark.row_counts_approximate
-            and watermark.table_row_counts.get(table.name) is not None
-        ):
-            return watermark.table_row_counts[table.name]
+        exact = _exact_watermark_count(watermark, table.name)
+        if exact is not None:
+            return exact
         return _source_row_count_live(
             source_dialect, source_connection, table, page_size, on_page=on_page,
             from_only=from_only,
         )
 
     def _check_orphans(
-        self, target_connection: Any, table: TableDef
-    ) -> list[OrphanFinding]:
+        self,
+        target_connection: Any,
+        table: TableDef,
+        item: TableValidationResult,
+        should_cancel: CancelCheck,
+        live_keys: "Mapping[str, tuple[str, ...]]",
+    ) -> "tuple[list[OrphanFinding], list[UncheckedForeignKey], TableValidationResult]":
         """Check each preserved foreign key on ``table`` for orphan child rows.
 
-        Returns one :class:`OrphanFinding` per foreign key that has at least one
-        orphan on the target (clean keys produce no finding). Each FK is counted over
-        the SAME bounded keyset paging the count/checksum use (single-column-PK child),
-        so a large child never runs the orphan scan past DSQL's 300s transaction limit.
+        Returns ``(findings, unchecked, item)``: one :class:`OrphanFinding` per foreign key
+        that has at least one orphan on the target (clean keys produce no finding). Each FK
+        is counted over the SAME bounded keyset paging the count/checksum use, by the
+        child's live target key (the comparison's read, G138), so a large child never runs
+        the orphan scan past DSQL's 300s transaction limit.
+
+        Isolated per foreign key (G138): an FK whose parent table is not on Aurora DSQL
+        (outside the migrated tables, or missing) cannot be counted and is reported as
+        UNCHECKED, which leaves the data verdict alone; any other failure marks only this
+        table not matched with its error (``item`` comes back updated, its counts kept),
+        and the remaining keys -- and the run -- go on. A stop still stops the run.
         """
         findings: list[OrphanFinding] = []
-        for fk in table.foreign_keys:
-            orphan_count = _target_orphan_count(
-                target_connection, table, fk, self._reconcile_page_size,
-                on_page=self._page,
+        unchecked: list[UncheckedForeignKey] = []
+        if not table.foreign_keys:
+            return findings, unchecked, item
+        page = self._page_or_stop(should_cancel)
+        failure: Optional[str] = None
+        try:
+            key = (
+                live_keys[table.name]
+                if table.name in live_keys
+                else read_target_primary_key(target_connection, table.name)
             )
+        except ValidationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - this table's orphan check only
+            return findings, unchecked, _with_orphan_failure(
+                item,
+                "The orphan check could not read the table's primary key on Aurora "
+                f"DSQL: {_safe_error_message(exc)}",
+            )
+        for fk in table.foreign_keys:
+            try:
+                orphan_count = _target_orphan_count(
+                    target_connection, table, fk, self._reconcile_page_size,
+                    on_page=page, key=key,
+                )
+            except ValidationCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolated per foreign key
+                if not _target_table_present(target_connection, fk.referenced_table):
+                    unchecked.append(
+                        UncheckedForeignKey(
+                            table=table.name,
+                            foreign_key=fk.name,
+                            referenced_table=fk.referenced_table,
+                        )
+                    )
+                elif failure is None:
+                    failure = (
+                        f"The orphan check of foreign key {fk.name} -> "
+                        f"{fk.referenced_table} could not run: {_safe_error_message(exc)}"
+                    )
+                continue
             if orphan_count > 0:
                 findings.append(
                     OrphanFinding(
@@ -2281,7 +2861,45 @@ class Validator:
                         orphan_count=orphan_count,
                     )
                 )
-        return findings
+        if failure is not None:
+            item = _with_orphan_failure(item, failure)
+        return findings, unchecked, item
+
+
+def _exact_watermark_count(watermark: Optional[Watermark], table_name: str) -> Optional[int]:
+    """The watermark's recorded count of ``table_name`` when it is EXACT, else ``None``.
+
+    ``is not None``, not merely present: an entry can be None for "unknown" (a
+    never-analyzed PostgreSQL table). Such a watermark is always approximate, so this is
+    unreachable for it today -- but returning None as a count would make the row-count
+    comparison silently compare against nothing.
+    """
+    if (
+        watermark is not None
+        and not watermark.row_counts_approximate
+        and watermark.table_row_counts.get(table_name) is not None
+    ):
+        return watermark.table_row_counts[table_name]
+    return None
+
+
+def _target_table_present(connection: Any, table_name: str) -> bool:
+    """Is ``table_name`` on the target? One catalog read; ``True`` when it cannot be told."""
+    try:
+        exists, _facts = read_overlay_column_facts(connection, table_name, [])
+    except Exception:  # noqa: BLE001 - unknown: the orphan check's own failure stands
+        return True
+    return bool(exists)
+
+
+def _with_orphan_failure(
+    item: TableValidationResult, message: str
+) -> TableValidationResult:
+    """``item`` marked not matched by its orphan check's failure (its counts kept); an
+    item that already errored keeps its own error."""
+    if item.error is not None:
+        return item
+    return item.model_copy(update={"matched": False, "error": message})
 
 
 def format_binlog_coordinate(
@@ -2863,8 +3481,19 @@ def render_text_report(report: ValidationReport) -> str:
         lines.append("- (no tables compared)")
     lines.append("")
 
+    unchecked = report.orphan_unchecked if report.orphan_check_performed else []
     lines.append(
         f"Orphan check: {'performed' if report.orphan_check_performed else 'skipped'}"
+        + (
+            f" ({len(unchecked)} foreign key(s) not checked: their parent table is not "
+            "on Aurora DSQL)"
+            if unchecked
+            else ""
+        )
+    )
+    lines.extend(
+        f"- not checked: {fk.table}.{fk.foreign_key} -> {fk.referenced_table}"
+        for fk in unchecked
     )
     if report.orphan_findings:
         lines.append(f"Orphan findings ({len(report.orphan_findings)}):")
@@ -2898,6 +3527,9 @@ def export_report(report: ValidationReport, fmt: str = "json") -> str:
 __all__ = [
     "Validator",
     "ValidationCancelled",
+    "PagedReadError",
+    "KEYLESS_TABLE_LIMIT_HINT",
+    "target_orphan_count_composite",
     "CancelCheck",
     "SourceEngineFactory",
     "TargetConnectionFactory",

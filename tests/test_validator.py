@@ -263,10 +263,14 @@ class _FakeTargetConnection:
         pk_tokens: Optional[dict[str, list[tuple]]] = None,
         pk_sets: Optional[dict[str, list[int]]] = None,
         missing_tables: Optional[set[str]] = None,
+        primary_keys: Optional[dict[str, tuple[str, ...]]] = None,
     ) -> None:
         self._counts = counts or {}
         self._checksums = checksums or {}
         self._orphans = orphans or {}
+        # {table: its LIVE primary key} answered for the catalog read Validation pages the
+        # target by (G138); a table not named holds ``id``, the key _table() gives.
+        self._primary_keys = primary_keys or {}
         # {table: [(pk, token), ...]} for the row-diff pk-token SELECT.
         self._pk_tokens = pk_tokens or {}
         # {table: [pk, ...]} (ascending) for the full reconciliation keyset stream.
@@ -288,6 +292,9 @@ class _FakeTargetConnection:
         text = statement if isinstance(statement, str) else statement.as_string(None)
         self.executed.append(text)
         params = parameters or {}
+        if "ix.indisprimary" in text:  # the live primary-key read (read_target_primary_key)
+            name = ".".join(str(params[k]) for k in ("schema", "table") if k in params)
+            return [(column,) for column in self._primary_keys.get(name, ("id",))]
         table = _last_double_quoted_table(text)
         if table in self._missing_tables:
             raise RuntimeError(f'relation "{table}" does not exist')
@@ -304,17 +311,38 @@ class _FakeTargetConnection:
             # now the FIRST quoted table (inside the CTE) and the parent the second, so the
             # child can no longer be read off the LAST one.
             child = _first_double_quoted_table(text)
+            composite = '"ck_k0"' in text  # a composite child (G138): pk_set as above
             window = _keyset_page(
                 self._pk_sets.get(child, []),
-                last=params.get("last"),
+                last=params.get("last_0" if composite else "last"),
                 page=_limit_in(text),
             )
             last_pk = window[-1][0] if window else None
-            sub_count = self._orphans.get(child, 0) if params.get("last") is None else 0
+            first = params.get("last_0" if composite else "last") is None
+            sub_count = self._orphans.get(child, 0) if first else 0
+            if composite:
+                width = text.count("::text ORDER BY")
+                last = [str(last_pk)] + ["0"] * (width - 1) if window else [None] * width
+                return (sub_count, len(window), *last)
             return (sub_count, last_pk, len(window))
         if "NOT EXISTS" in text:
             child = _orphan_child_table(text)
             return self._orphans.get(child, 0)
+        # A composite key's page (G138): ``(sub_sum, rows, last key as text...)``. The
+        # table's pk_set holds the key's FIRST column (the rest is "0"), its last key comes
+        # back as text and is bound back as ``last_0``; the whole checksum on page one.
+        if "ckpage" in text and '"ck_k0"' in text:
+            window = _keyset_page(
+                self._pk_sets.get(table, []), last=params.get("last_0"), page=_limit_in(text)
+            )
+            width = text.count("::text ORDER BY")
+            last = [str(window[-1][0])] + ["0"] * (width - 1) if window else [None] * width
+            sub_sum = (
+                int(self._checksums.get(table, 0))
+                if "ck_tok" in text and params.get("last_0") is None
+                else 0
+            )
+            return (sub_sum, len(window), *last)
         # The paged checksum: returns ONE (sub_sum, last_pk, count) ROW (via
         # fetchone). Matched FIRST because it also contains md5(/AS page_tok/COUNT(*),
         # which would otherwise misroute it. Whole checksum on the first page (later
@@ -1155,16 +1183,18 @@ def test_page_checksum_empty_table_is_zero() -> None:
     assert _source_checksum_keyset(_PagedSourceConn([(0, None, 0)]), _table("t"), "id", 3) == "0"
 
 
-def test_checksum_composite_pk_falls_back_to_single_scan() -> None:
-    # A composite/missing PK has no single keyset column, so both sides keep the
-    # whole-table single scan (never a paged SUM(page_tok) statement).
+def test_checksum_composite_pk_is_keyset_paged() -> None:
+    # G138: a composite PK is paged on the target too (the row-value cursor, last key as
+    # text), never one whole-table SUM; only a table with no primary key keeps that.
     composite = _table("t", columns=("a", "b"), primary_key=("a", "b"))
-    target = _FakeTargetConnection(counts={"t": 1}, checksums={"t": "42"})
-    source = _FakeSourceConnection(counts={"t": 1}, checksums={"t": "42"})
+    target = _FakeTargetConnection(counts={"t": 7}, checksums={"t": "42"})
     assert _target_checksum(target, composite, 3) == "42"
-    assert _source_checksum(source, composite, 3) == "42"
-    assert not any("SUM(page_tok)" in s for s in target.executed)
-    assert not any("SUM(PAGE_TOK)" in s.upper() for s in source.executed)
+    pages = [s for s in target.executed if "ckpage" in s]
+    assert len(pages) == 3 and all("LIMIT 3" in s for s in pages)
+    assert '("a", "b") > (%(last_0)s, %(last_1)s)' in pages[1]
+    keyless = _table("t", columns=("a", "b"), primary_key=())
+    assert _target_checksum(target, keyless, 3) == "42"  # the one-statement fallback
+    assert target.executed[-1] == build_pg_checksum_sql(keyless).as_string(None)
 
 
 def test_checksum_is_paged_end_to_end_over_multiple_pages() -> None:
@@ -1431,9 +1461,9 @@ def test_orphan_count_single_int_pk_child_is_keyset_paged() -> None:
     assert len(orphan_sql) >= 2
 
 
-def test_orphan_count_composite_pk_child_uses_single_scan() -> None:
-    # FIX 2: a composite-PK child has no single keyset column, so the orphan pre-gate
-    # falls back to the single unbounded scan (exactly as count/checksum do).
+def test_orphan_count_composite_pk_child_is_keyset_paged() -> None:
+    # G138: a composite-PK child is orphan-counted over keyset pages of its live target key
+    # (exactly as count/checksum are), never by the single unbounded scan.
     child = _table(
         "order_items",
         columns=("order_id", "line_no", "sku_id"),
@@ -1448,16 +1478,17 @@ def test_orphan_count_composite_pk_child_uses_single_scan() -> None:
         ],
     )
     source = _FakeSourceConnection(counts={"order_items": 4})
-    target = _FakeTargetConnection(counts={"order_items": 4}, orphans={"order_items": 1})
+    target = _FakeTargetConnection(
+        counts={"order_items": 4}, orphans={"order_items": 1},
+        primary_keys={"order_items": ("order_id", "line_no")},
+    )
     report = _validator(source, target).validate(
         _SOURCE_CONFIG, _TARGET_CONFIG, [child], check_orphans=True
     )
     assert report.orphan_findings[0].orphan_count == 1
-    orphan_sql = [t for t in target.executed if "NOT EXISTS" in t]
-    assert orphan_sql, "no orphan query ran"
-    # The single-scan form: "... AS c WHERE ...", NOT the paged FILTER/array_agg.
-    assert all("array_agg" not in t and "FILTER" not in t for t in orphan_sql)
-    assert all(" AS c WHERE" in t for t in orphan_sql)
+    assert not any("NOT EXISTS" in t for t in target.executed)
+    orphan_sql = [t for t in target.executed if "WITH pg AS MATERIALIZED" in t]
+    assert orphan_sql and all('"ck_k0"' in t and "array_agg" in t for t in orphan_sql)
 
 
 def test_orphan_page_sql_pages_the_window_unconditionally() -> None:
@@ -2396,16 +2427,21 @@ def test_reconcile_reuses_streamed_count_no_count_star() -> None:
     assert not any("COUNT(*)" in s for s in target.executed)
 
 
-def test_composite_pk_target_count_falls_back_to_count_star() -> None:
-    """A composite/missing PK has no single keyset column, so the target count still
-    uses COUNT(*) (a documented residual gap: it can time out on a huge composite-PK
-    table). Single-column PKs -- the common shape -- are always keyset-bounded."""
+def test_composite_pk_target_count_is_keyset_paged() -> None:
+    """G138: a composite PK's target count is keyset-paged by the live target key, so a
+    huge composite-PK table no longer times out at Aurora DSQL's 300 s limit; only a target
+    table with no primary key keeps the single COUNT(*)."""
     source = _FakeSourceConnection(counts={"t": 2})
-    target = _FakeTargetConnection(counts={"t": 2})
+    target = _FakeTargetConnection(counts={"t": 2}, primary_keys={"t": ("a", "b")})
     ct = _table("t", columns=("a", "b"), primary_key=("a", "b"))
     report = _validator(source, target).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [ct])
     assert report.items[0].target_row_count == 2
-    assert any("COUNT(*)" in s for s in target.executed)
+    assert not any(s.startswith("SELECT COUNT(*)") for s in target.executed)
+    assert any(s.startswith("SELECT 0, COUNT(*)") and "LIMIT" in s for s in target.executed)
+    keyless = _FakeTargetConnection(counts={"t": 2}, primary_keys={"t": ()})
+    report = _validator(source, keyless).validate(_SOURCE_CONFIG, _TARGET_CONFIG, [ct])
+    assert report.items[0].target_row_count == 2
+    assert 'SELECT COUNT(*) FROM "t"' in keyless.executed
 
 
 def test_reconcile_pk_pages_are_read_only() -> None:
@@ -2471,16 +2507,22 @@ def test_validate_raises_cancelled_before_any_table() -> None:
 
 def test_validate_cancels_after_first_table_and_stops_early() -> None:
     # Cancel becomes true after the first table is compared -> the second table is
-    # never compared (its COUNT is not issued).
+    # never compared (its COUNT is not issued). The stop is polled per page too (G138),
+    # so it is flipped by the first table's LAST target page, the end of that table.
     source = _FakeSourceConnection(counts={"orders": 5, "customers": 3})
-    target = _FakeTargetConnection(counts={"orders": 5, "customers": 3})
-    calls = {"n": 0}
+    state = {"stop": False}
+
+    class _StopAfterOrders(_FakeTargetConnection):
+        def resolve(self, statement: Any, parameters: Any = None) -> object:
+            result = super().resolve(statement, parameters)
+            if '"orders"' in self.executed[-1] and "AS pk" in self.executed[-1]:
+                state["stop"] = True
+            return result
+
+    target = _StopAfterOrders(counts={"orders": 5, "customers": 3})
 
     def should_cancel() -> bool:
-        # False for the first table boundary, True for the second.
-        used = calls["n"]
-        calls["n"] += 1
-        return used >= 1
+        return state["stop"]
 
     with pytest.raises(ValidationCancelled):
         _validator(source, target).validate(

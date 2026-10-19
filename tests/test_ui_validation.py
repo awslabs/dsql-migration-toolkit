@@ -7219,6 +7219,9 @@ def test_a_dead_lettered_table_whose_checksum_cannot_finish_is_shown_its_exit(mo
     body = _g1_render(report, gate, recheck_provider=lambda _t: None).body()
     assert "Validation could not finish comparing 1 table(s) with dead-lettered CDC changes" in body
     assert "turn its chip off under Objects to validate and re-run Validation" in body
+    # G138: a composite key is paged now; the notice points at the table's own error.
+    assert "(each table's error says why)" in body
+    assert "composite" not in body and "one statement" not in body
     # ...and that exit really is waivable on Cut over.
     s.vstate.table_exclude = {"orders"}
     s.run()

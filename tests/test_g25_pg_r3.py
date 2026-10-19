@@ -205,6 +205,8 @@ def _pg_validator_conn(statements):
             statements.append(sql)
             if "SUM(page_tok)" in sql:
                 return _Res([(42, 2, 2)])
+            if "SUM(ck_tok)" in sql:  # a composite key's page (G138): 2 rows, last key
+                return _Res([(7, 2, "2", "b")])
             if sql.startswith("SELECT COALESCE(SUM("):  # the whole-table checksum
                 return _Res([(7,)])
             if " AS tok " in sql:
@@ -234,7 +236,8 @@ def test_validation_reads_an_inheritance_parents_own_rows_on_every_source_read()
     assert list(v._iter_source_pks_for(pg, conn, _par(), "id", 5000, from_only=True)) == [1, 2]
     assert v._source_pk_tokens_for(pg, conn, _par(), "id", 5, from_only=True) == {
         "1": "t1", "2": "t2"}
-    assert len(statements) == 6
+    # The composite checksum is paged and held to one COUNT(*): two statements (G138).
+    assert len(statements) == 7
     for sql in statements:
         assert 'FROM ONLY "app"."par"' in sql, sql
         assert 'FROM "app"."par"' not in sql, sql
@@ -270,6 +273,7 @@ def test_the_compare_decides_from_only_live_for_each_postgresql_table(monkeypatc
     monkeypatch.setattr(v, "_source_checksum_for", _capture("checksum", "42"))
     monkeypatch.setattr(v, "_bounded_target_count", lambda *_a, **_k: 2)
     monkeypatch.setattr(v, "_target_checksum", lambda *_a, **_k: "42")
+    monkeypatch.setattr(v, "read_target_primary_key", lambda *_a: ("id",))  # G138
 
     class _Source:
         def __init__(self, parent):

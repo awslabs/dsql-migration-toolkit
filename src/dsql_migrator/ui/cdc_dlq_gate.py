@@ -28,10 +28,9 @@ Way forward, never a dead end: a table that can be re-checked must be (a CHECKSU
 always be started); a table Validation cannot prove (not in the report, or inside an
 accepted gap) and a read problem can be waived -- logged, persisted, and scoped to the
 counts seen, so a newer dead letter re-opens the check once the queue can be read. One
-residual: a CHECKSUM that cannot FINISH (a very large table with a composite or missing
-primary key is hashed in one statement, which can exceed Aurora DSQL's transaction limit)
-leaves the table "not matched"; its exit is to leave it out on the Validation step, which
-makes it waivable here (the Validation result says so). A waiver never overrides a
+residual: a CHECKSUM that cannot FINISH (the table's error persists on re-check; the error
+says why) leaves the table "not matched"; its exit is to leave it out on the Validation
+step, which makes it waivable here (the Validation result says so). A waiver never overrides a
 Validation mismatch: this gate is evaluated only after ``cutover_release_state`` released.
 
 Inert -- no section, no timer, no log clause -- when no CDC evidence exists in the session,

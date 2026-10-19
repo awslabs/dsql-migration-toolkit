@@ -710,6 +710,55 @@ def count_target_rows(
     return counts
 
 
+# The live primary key of one table, its columns in key order. Resolved through
+# :func:`_relation_predicate` (``{where}``), so both halves of ``schema.table`` are BOUND
+# PARAMETERS (never interpolated) and a bare name is matched against the current search
+# path via pg_table_is_visible, mirroring how an unqualified INSERT would resolve.
+#
+# ``indkey`` is ordered by key position, so unnesting WITH ORDINALITY and ordering by it
+# preserves the real key order -- (user_id, id) must not come back as (id, user_id), since
+# the leading column is the whole point of the composite-key strategy.
+#
+# ``k.ord <= ix.indnkeyatts`` is REQUIRED, not a refinement. ``indkey`` lists the index's
+# KEY columns followed by its non-key "included"/stored columns, and only the first
+# ``indnkeyatts`` of them form the constraint. Aurora DSQL's primary indexes routinely carry
+# the remaining columns as stored payload (verified on a live cluster: a 2-column table
+# reported indnatts=2 with indnkeyatts=1, and an 11-table schema reported EVERY column for
+# EVERY table). Without this bound the full column list came back, which then never equals
+# the applied composite key -- so every append with a changed key would be refused with a
+# message naming an absurd "actual" key. Cross-checked against
+# information_schema.key_column_usage on the same cluster: 11/11 tables now agree.
+_PRIMARY_KEY_COLUMNS_SQL = (
+    "SELECT a.attname "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid AND ix.indisprimary "
+    "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+    "JOIN pg_catalog.pg_attribute a "
+    "  ON a.attrelid = c.oid AND a.attnum = k.attnum "
+    "WHERE {where} AND k.ord <= ix.indnkeyatts "
+    "ORDER BY k.ord"
+)
+
+
+def read_target_primary_key(connection: Any, table_name: str) -> "tuple[str, ...]":
+    """The LIVE table's primary-key columns in key order, on an open connection. RAISES.
+
+    ``()`` when the catalog shows no primary key: the table has none, or there is no such
+    table (whose own reads then fail loudly). Validation pages a target table only by the
+    key it enforces as unique, so it reads this once per table (G138); a read that fails
+    raises, so the caller fails closed instead of assuming the source's key.
+    """
+    where, params = _relation_predicate(table_name)
+    cursor = connection.cursor()
+    try:
+        cursor.execute(_PRIMARY_KEY_COLUMNS_SQL.format(where=where), params)
+        rows = cursor.fetchall()
+    finally:
+        _safe_close(cursor)
+    return tuple(str(row[0]) for row in rows or () if row and row[0])
+
+
 def target_primary_key_columns(
     table_name: str,
     *,
@@ -726,69 +775,21 @@ def target_primary_key_columns(
     blocks a correctly-migrated table, and assuming it has the new key could
     skip-wrong.
 
-    ``table_name`` is ``schema.table`` (or bare, resolved against the search path) and
-    is quoted via :class:`psycopg.sql.Identifier` -- never interpolated. Returns
-    ``None`` when the key cannot be determined (table missing, no primary key, or any
-    error), which callers MUST treat as "unknown" and not as "no key": an inability to
-    read the catalog must never be mistaken for a definite answer.
+    ``table_name`` is ``schema.table`` (or bare, resolved against the search path); see
+    :func:`read_target_primary_key`. Returns ``None`` when the key cannot be determined
+    (table missing, no primary key, or any error), which callers MUST treat as "unknown"
+    and not as "no key": an inability to read the catalog must never be mistaken for a
+    definite answer.
     """
-    # Resolve schema.table into the catalog's own terms. Both halves are passed as
-    # BOUND PARAMETERS (never interpolated), so no identifier quoting is needed and
-    # the query stays injection-safe (Requirement 9.4). A bare name is matched
-    # against the current search path via pg_table_is_visible, mirroring how an
-    # unqualified INSERT would resolve.
-    #
-    # ``indkey`` is ordered by key position, so unnesting WITH ORDINALITY and ordering
-    # by it preserves the real key order -- (user_id, id) must not come back as
-    # (id, user_id), since the leading column is the whole point of the composite-key
-    # strategy.
-    #
-    # ``k.ord <= ix.indnkeyatts`` is REQUIRED, not a refinement. ``indkey`` lists the
-    # index's KEY columns followed by its non-key "included"/stored columns, and only
-    # the first ``indnkeyatts`` of them form the constraint. Aurora DSQL's primary
-    # indexes routinely carry the remaining columns as stored payload (verified on a
-    # live cluster: a 2-column table reported indnatts=2 with indnkeyatts=1, and an
-    # 11-table schema reported EVERY column for EVERY table). Without this bound the
-    # function returned the full column list, which then never equals the applied
-    # composite key -- so every append with a changed key would be refused with a
-    # message naming an absurd "actual" key. Cross-checked against
-    # information_schema.key_column_usage on the same cluster: 11/11 tables now agree.
-    parts = table_name.split(".", 1)
-    if len(parts) == 2:
-        schema, relname = parts
-        where_relation = "n.nspname = %(schema)s AND c.relname = %(table)s"
-        params: dict[str, object] = {"schema": schema, "table": relname}
-    else:
-        where_relation = (
-            "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)"
-        )
-        params = {"table": parts[0]}
-    statement = (
-        "SELECT a.attname "
-        "FROM pg_catalog.pg_class c "
-        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-        "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid AND ix.indisprimary "
-        "JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
-        "JOIN pg_catalog.pg_attribute a "
-        "  ON a.attrelid = c.oid AND a.attnum = k.attnum "
-        f"WHERE {where_relation} AND k.ord <= ix.indnkeyatts "
-        "ORDER BY k.ord"
-    )
     try:
         connection = connection_factory()
     except Exception:  # noqa: BLE001 - cannot connect -> unknown
         return None
-    cursor = None
     try:
-        cursor = connection.cursor()
-        cursor.execute(statement, params)
-        columns = [str(row[0]) for row in cursor.fetchall() if row and row[0]]
-        return columns or None
+        return list(read_target_primary_key(connection, table_name)) or None
     except Exception:  # noqa: BLE001 - unreadable catalog -> unknown, never a guess
         return None
     finally:
-        if cursor is not None:
-            _safe_close(cursor)
         _safe_close(connection)
 
 

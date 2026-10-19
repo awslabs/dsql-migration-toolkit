@@ -70,6 +70,7 @@ from dsql_migrator.core.models import (
     TableSelection,
     TableValidationResult,
     TargetConnectionConfig,
+    UncheckedForeignKey,
     ValidationMode,
     ValidationReport,
     Watermark,
@@ -433,8 +434,8 @@ def run_validation(
     watermark is supplied the comparison is as-of the snapshot and drift since
     the snapshot is reported (Requirement 6.5 / Property 11). The validator is
     injectable so this orchestration can be unit tested without a database.
-    ``should_cancel`` (polled between tables) lets a caller cooperatively stop a
-    long run; the validator raises
+    ``should_cancel`` (polled between tables and once per page of a table's scans) lets
+    a caller cooperatively stop a long run; the validator raises
     :class:`~dsql_migrator.core.validator.ValidationCancelled` rather than
     returning a partial report. ``on_progress(table, index, total)`` (when given)
     is invoked before each table so a caller can surface live progress.
@@ -1374,6 +1375,7 @@ def merge_revalidated(
     new_items: "Sequence[TableValidationResult]",
     *,
     orphan_findings: "Optional[Sequence[OrphanFinding]]" = None,
+    orphan_unchecked: "Optional[Sequence[UncheckedForeignKey]]" = None,
 ) -> ValidationReport:
     """Return ``report`` with the re-checked tables' results replaced.
 
@@ -1407,7 +1409,8 @@ def merge_revalidated(
       tables only: findings for those tables are dropped and the new ones added,
       so a table whose orphans were fixed correctly loses its finding, while every
       other table's findings survive. Passing ``None`` leaves the findings alone
-      (the re-check did not re-run the orphan check).
+      (the re-check did not re-run the orphan check). ``orphan_unchecked`` (the foreign
+      keys the orphan check could not count) is replaced the same way.
 
     Pure: builds a new report and leaves ``report`` untouched, so it is unit
     testable without NiceGUI or a database.
@@ -1427,6 +1430,10 @@ def merge_revalidated(
         # table whose orphans are gone correctly ends up with no finding).
         findings = [f for f in findings if f.table not in rechecked]
         findings.extend(f for f in orphan_findings if f.table in rechecked)
+    unchecked = list(report.orphan_unchecked)
+    if orphan_unchecked is not None:
+        unchecked = [f for f in unchecked if f.table not in rechecked]
+        unchecked.extend(f for f in orphan_unchecked if f.table in rechecked)
 
     return ValidationReport.build(
         mode=report.mode,
@@ -1438,6 +1445,7 @@ def merge_revalidated(
         # Carry the run's reconcile-requested state so the merged report keeps
         # distinguishing "requested but no eligible table" from "turned off".
         reconcile_requested=report.reconcile_requested,
+        orphan_unchecked=unchecked,
     )
 
 
@@ -2687,6 +2695,7 @@ class ValidationState:
         new_items: "Sequence[TableValidationResult]",
         *,
         orphan_findings: "Optional[Sequence[OrphanFinding]]" = None,
+        orphan_unchecked: "Optional[Sequence[UncheckedForeignKey]]" = None,
         completed_at: Optional[datetime] = None,
     ) -> bool:
         """Splice a re-check's per-table results into the existing report.
@@ -2705,7 +2714,8 @@ class ValidationState:
             if self._result is None:
                 return False
             merged = merge_revalidated(
-                self._result, new_items, orphan_findings=orphan_findings
+                self._result, new_items, orphan_findings=orphan_findings,
+                orphan_unchecked=orphan_unchecked,
             )
             self._result = merged
             names = {item.table for item in new_items} & {
@@ -3689,6 +3699,7 @@ def build_validation_screen(
         def work(handle: object) -> None:
             items: list = []
             orphans: list = []
+            unchecked: list = []
             try:
                 for inputs, proof_overlay, proof_legacy in runs:
                     fresh = run_validation(
@@ -3706,6 +3717,7 @@ def build_validation_screen(
                     )
                     items.extend(fresh.items)
                     orphans.extend(fresh.orphan_findings or ())
+                    unchecked.extend(getattr(fresh, "orphan_unchecked", None) or ())
             except ValidationCancelled:
                 return  # cancelled: the report is simply left as it was
             # Merge under the state lock; a False return means a full re-run cleared
@@ -3713,6 +3725,7 @@ def build_validation_screen(
             if validation_state.merge_recheck_result(
                 items,
                 orphan_findings=(orphans if options.check_orphans else None),
+                orphan_unchecked=(unchecked if options.check_orphans else None),
             ):
                 # G137: as after a run, a CHECKSUM match ends a split table's wait.
                 clear_proven_split_tables(
@@ -5170,7 +5183,6 @@ def _run_cutover_foreign_keys(
         from dsql_migrator.core.target_connection import DsqlConnector
         from dsql_migrator.ui.data_migration._full_load_engine import (
             apply_preserved_foreign_keys,
-            child_pk_columns_for,
         )
         from dsql_migrator.ui.schema_conversion import applied_table_conversions
 
@@ -5192,7 +5204,7 @@ def _run_cutover_foreign_keys(
         applied = foreign_keys_in_scope(applied, scope)
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
         result = apply_preserved_foreign_keys(
-            applied, connect, child_pk_columns=child_pk_columns_for(inventory),
+            applied, connect,
             skip_if_absent=foreign_keys_pointing_in(applied, scope),
             # Publish per-FK progress so a render during the pass reports how far it has
             # got. The pass can run for minutes and said nothing at all before.
@@ -7198,9 +7210,9 @@ def _render_result(
             ).props("no-caps color=primary")
     # A dead-lettered table whose comparison could not FINISH is held by the cut-over gate
     # (its values are unproven) and every re-check is forced back to CHECKSUM -- which, for
-    # a very large table hashed in one statement, can fail the same way every time. Name
-    # the exit instead of leaving a loop: leave the table out, then acknowledge it on Cut
-    # over. The re-check stays offered (a transient error can clear on retry).
+    # a table whose error persists (the error says why), fails the same way every time.
+    # Name the exit instead of leaving a loop: leave the table out, then acknowledge it on
+    # Cut over. The re-check stays offered (a transient error can clear on retry).
     if cdc_gate is not None:
         _by_name = {item.table: item for item in report.items}
         _unfinished = [
@@ -7220,12 +7232,10 @@ def _render_result(
                 body=(
                     f"{bounded_table_names(_unfinished)}: cut over needs each to match in "
                     "a CHECKSUM comparison, because CDC dead-lettered changes for them. If "
-                    "re-checking keeps failing — a very large table with a composite or "
-                    "missing primary key is hashed in one statement, which can exceed "
-                    "Aurora DSQL's 300-second transaction limit — turn its chip off under "
-                    "Objects to validate and re-run Validation. Cut over then lets you "
-                    "continue without its CHECKSUM proof, and that decision is recorded in "
-                    "the activity log."
+                    "re-checking keeps failing (each table's error says why), turn its chip "
+                    "off under Objects to validate and re-run Validation. Cut over then "
+                    "lets you continue without its CHECKSUM proof, and that decision is "
+                    "recorded in the activity log."
                 ),
             )
     # Mixed as-of honesty: when part of this report came from a later per-table
@@ -9857,10 +9867,31 @@ def _render_orphans(ui: object, report: ValidationReport) -> None:
     if not report.orphan_check_performed:
         return
     with _section(ui, icon="link_off", title="Orphan records"):
-        if not report.orphan_findings:
-            ui.label("No orphan records found.").classes(  # type: ignore[attr-defined]
-                "text-sm text-gray-500"
+        unchecked = list(report.orphan_unchecked)
+        if unchecked:
+            # Not a verdict (it changes no match): there is no parent to count against.
+            render_notice(
+                ui,
+                tone="warning",
+                header=f"{len(unchecked)} foreign key(s) not checked",
+                body=(
+                    "; ".join(
+                        f"{fk.table}.{fk.foreign_key} -> {fk.referenced_table}"
+                        for fk in unchecked[:5]
+                    )
+                    + (f" and {len(unchecked) - 5} more" if len(unchecked) > 5 else "")
+                    + ": the parent table is not on Aurora DSQL, so their orphan rows "
+                    "could not be counted, and the keys cannot be applied there either. "
+                    "Migrate the parent table, or leave the foreign key out in Schema "
+                    "Conversion."
+                ),
             )
+        if not report.orphan_findings:
+            ui.label(  # type: ignore[attr-defined]
+                "No orphan records found in the foreign keys that were checked."
+                if unchecked
+                else "No orphan records found."
+            ).classes("text-sm text-gray-500")
             return
         columns = [
             {"name": "table", "label": "Table", "field": "table", "align": "left"},

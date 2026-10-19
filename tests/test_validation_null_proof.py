@@ -79,6 +79,15 @@ class _ProofTarget(_FakeTargetConnection):
             self.executed.append(text)
             raise RuntimeError(f'relation "{table}" does not exist')
         values = self._values.get(table, {})
+        if flags and "ckpage" in text:  # a composite key's count page (G138): SQL sums
+            self.executed.append(text)
+            params = parameters or {}
+            page = _keyset_page(self._pk_sets.get(table, []), last=params.get("last_0"),
+                                page=_limit_in(text))
+            width = text.count("::text ORDER BY")
+            last = [str(page[-1][0])] + ["0"] * (width - 1) if page else [None] * width
+            return (0, len(page), *last,
+                    *(sum(pk in values.get(c, ()) for pk, in page) for c in flags))
         if flags:
             self.executed.append(text)
             params = parameters or {}
@@ -145,8 +154,10 @@ def test_the_proof_counts_on_every_count_path(path):
     table = _table("orders", columns=("id", "k"), primary_key=("id", "k") if path == "composite" else ("id",))
     source = _FakeSourceConnection(counts={"orders": 5}, pk_sets={"orders": pks})
     target_pks = pks if path != "deep_only_diff" else pks[:4]
+    # The composite path: the live target key is (id, k) too, so its own pages count (G138).
+    keys = {"orders": ("id", "k")} if path == "composite" else None
     target = _ProofTarget(counts={"orders": len(target_pks)}, pk_sets={"orders": target_pks},
-                          values={"orders": {"c": {2, 4}, "d": set()}})
+                          values={"orders": {"c": {2, 4}, "d": set()}}, primary_keys=keys)
     report = _validator(source, target, overlay={"orders": ["c", "d"]}).validate(
         _SOURCE_CONFIG, _TARGET_CONFIG, [table],
         reconcile=path in ("reconcile", "deep_only_diff"),
@@ -161,6 +172,8 @@ def test_the_proof_counts_on_every_count_path(path):
         first = [s for s in target.executed if "IS NOT NULL" in s]
         assert first and all("AS pk, (" in s for s in first)
         assert any("AS pk FROM" in s for s in target.executed)  # reconcile's plain pages
+    if path == "composite":
+        assert all("ckpage" in s for s in _proof_statements(target))  # paged, no COUNT(c)
 
 
 def test_the_proof_adds_no_target_pass():
@@ -232,7 +245,8 @@ def test_a_proof_query_error_reruns_without_the_proof_and_keeps_the_verdict(path
     def run(overlay, fail):
         source = _FakeSourceConnection(counts={"orders": 5})
         target = _ProofTarget(counts={"orders": 4}, pk_sets={"orders": [1, 2, 3, 5]},
-                              values={"orders": {"c": {1}}}, fail=fail, fail_times=99)
+                              values={"orders": {"c": {1}}}, fail=fail, fail_times=99,
+                              primary_keys={"orders": ("id", "k")} if path == "composite" else None)
         report = _validator(source, target, overlay=overlay).validate(
             _SOURCE_CONFIG, _TARGET_CONFIG, [table], reconcile=path == "reconcile")
         return report.items[0], target
@@ -294,7 +308,8 @@ def test_a_column_given_as_both_overlay_and_legacy_is_overlay():
     item = _validator(source, target, overlay={"orders": ["c"]}, legacy={"orders": ["c"]}).validate(
         _SOURCE_CONFIG, _TARGET_CONFIG, [_table("orders")]).items[0]
     assert item.excluded_values_block is True and item.legacy_nonnull_counts == {}
-    assert sum(s.count("IS NOT NULL") for s in target.executed[:1]) == 1
+    pages = [s for s in target.executed if "ix.indisprimary" not in s]  # after the key read
+    assert sum(s.count("IS NOT NULL") for s in pages[:1]) == 1
 
 
 def test_a_missing_target_table_still_errors_the_table():

@@ -163,6 +163,22 @@ def is_server_unavailable(exc: BaseException) -> bool:
     return getattr(exc, "sqlstate", None) == SERVER_UNAVAILABLE_SQLSTATE
 
 
+# Aurora DSQL's per-transaction limits on a READ (quotas page): ``54000`` "transaction age
+# limit of 300s exceeded" and ``53200`` past the 128 MiB of query memory per transaction.
+TRANSACTION_AGE_LIMIT_SQLSTATE = "54000"
+_STATEMENT_LIMIT_SQLSTATES = frozenset({TRANSACTION_AGE_LIMIT_SQLSTATE, "53200"})
+
+
+def is_dsql_statement_limit(exc: BaseException) -> bool:
+    """True when Aurora DSQL stopped a statement at one of its per-transaction limits.
+
+    ``SQLSTATE 54000`` (300 s) or ``53200`` (query memory). Neither is transient: the same
+    statement fails the same way again, so a retry, or a second run of the same scan without
+    one of its columns, only repeats the wait (G138).
+    """
+    return getattr(exc, "sqlstate", None) in _STATEMENT_LIMIT_SQLSTATES
+
+
 # A token generator takes (hostname, region, expires_in_seconds) and returns the
 # token string. It is injectable so tests can supply a fake (no real AWS calls).
 TokenGenerator = Callable[[str, str, int], str]
@@ -666,6 +682,8 @@ __all__ = [
     "target_error_hint",
     "SERVER_UNAVAILABLE_SQLSTATE",
     "is_server_unavailable",
+    "TRANSACTION_AGE_LIMIT_SQLSTATE",
+    "is_dsql_statement_limit",
     "ADMIN_USERNAME",
     "DEFAULT_TOKEN_EXPIRY_SECONDS",
     "DEFAULT_REFRESH_MARGIN_SECONDS",

@@ -2144,6 +2144,19 @@ class OrphanFinding(BaseModel):
     orphan_count: int = Field(ge=1)
 
 
+class UncheckedForeignKey(BaseModel):
+    """A preserved foreign key the orphan check could not count (G138): its parent table
+    is not on Aurora DSQL (outside the migrated tables, or missing), so there is no parent
+    to look orphans up in -- and the key cannot be applied there either. Reported, never a
+    verdict: it does not change the table's match or the report's ``is_match``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str = Field(min_length=1)
+    foreign_key: str = Field(min_length=1)
+    referenced_table: str = Field(min_length=1)
+
+
 class DriftReport(BaseModel):
     """Source change since the export watermark (Req 6.5).
 
@@ -2200,6 +2213,12 @@ class ValidationReport(BaseModel):
     items: list[TableValidationResult] = Field(default_factory=list)
     orphan_findings: list[OrphanFinding] = Field(default_factory=list)
     orphan_check_performed: bool = False
+    # Foreign keys the orphan check could not count (their parent is not on Aurora DSQL).
+    # Left OUT of the payload while empty, so a report still loads on an older build: this
+    # model is extra="forbid".
+    orphan_unchecked: list[UncheckedForeignKey] = Field(
+        default_factory=list, exclude_if=lambda v: not v
+    )
     drift: Optional[DriftReport] = None
     snapshot_timestamp: Optional[datetime] = None
     is_match: bool = False
@@ -2222,6 +2241,7 @@ class ValidationReport(BaseModel):
         drift: Optional["DriftReport"] = None,
         snapshot_timestamp: Optional[datetime] = None,
         reconcile_requested: bool = False,
+        orphan_unchecked: Optional[list["UncheckedForeignKey"]] = None,
     ) -> "ValidationReport":
         """Build a report and compute the sound overall ``is_match`` verdict.
 
@@ -2232,6 +2252,7 @@ class ValidationReport(BaseModel):
         ``reconcile_requested`` records whether the run asked for record-level
         reconciliation (carried as-is), so the report can tell "requested but no table
         was eligible" apart from "turned off" without inspecting per-table results.
+        ``orphan_unchecked`` (carried as-is) never enters the verdict.
         """
         findings = list(orphan_findings or [])
         items = list(items)
@@ -2241,6 +2262,7 @@ class ValidationReport(BaseModel):
             items=items,
             orphan_findings=findings,
             orphan_check_performed=orphan_check_performed,
+            orphan_unchecked=list(orphan_unchecked or []),
             drift=drift,
             snapshot_timestamp=snapshot_timestamp,
             is_match=is_match,
@@ -2309,6 +2331,7 @@ __all__ = [
     "ReconcileResult",
     "TableValidationResult",
     "OrphanFinding",
+    "UncheckedForeignKey",
     "DriftReport",
     "ValidationReport",
 ]

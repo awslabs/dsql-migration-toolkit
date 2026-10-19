@@ -134,6 +134,12 @@ index or bitmask, not by label:
   equal (for example under a case-insensitive collation), so that a page returns rows
   the read has already passed.
 
+A single-precision MySQL `FLOAT` key column stops the read of a table that needs more
+than one page: MySQL returns its value rounded to the shortest decimal, which does not
+compare equal to the stored float, so a cursor on it would pass the rest of that value's
+rows by, silently. Change the column to `DOUBLE` or `DECIMAL` on the source, or give the
+table another primary key, then retry the table.
+
 **A primary key is required.** A table with no PK cannot be keyset-paginated and
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL
 requires a PK too). Single-column and composite PKs are both supported — and a

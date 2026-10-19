@@ -908,11 +908,13 @@ def build_pg_pk_next_page_sql(
 def build_pg_count_sql(
     table_name: str, nonnull_columns: Sequence[str] = ()
 ) -> sql.Composed:
-    """``SELECT COUNT(*)[, COUNT(c1), ...] FROM table`` (TARGET ONLY).
+    """``SELECT COUNT(*)[, COUNT(c1), ...] FROM table``.
 
-    The composite/missing-PK count fallback. Each ``COUNT(c)`` counts the rows holding a
-    value in an excluded column (the NULL proof) in the same scan as the row count.
-    Empty: byte-identical to the plain row count.
+    One statement: the count of a table with no primary key on the side read (and a
+    PostgreSQL source's count of a composite key, which a source has no 300 s limit for).
+    Each ``COUNT(c)`` (TARGET ONLY) counts the rows holding a value in an excluded column
+    (the NULL proof) in the same scan as the row count. Empty: byte-identical to the plain
+    row count.
     """
     if not nonnull_columns:
         return sql.SQL("SELECT COUNT(*) FROM {table}").format(
@@ -941,8 +943,8 @@ def build_pg_count_sql(
 # while every statement stays bounded (one page) and memory stays at one row. Each
 # page returns ``(sub_sum, last_pk, row_count)``: ``sub_sum`` folds into the running
 # total, ``MAX(page_pk)`` is the next keyset boundary, and ``COUNT(*) < N`` signals the
-# last page. Limited to a single-column PK (a self-consistent ascending order per
-# engine); a composite/missing PK keeps the whole-table single-scan fallback.
+# last page. These serve a single-column key; a composite key has its own builders below
+# (G138), and only a side with no primary key keeps the whole-table single statement.
 
 
 def _mysql_keyset_key(table: TableDef, pk_column: str) -> str:
@@ -1042,6 +1044,157 @@ def build_pg_page_checksum_next_sql(
     )
 
 
+# ---------------------------------------------------------------------------
+# Bounded keyset pages over a COMPOSITE key (G138)
+# ---------------------------------------------------------------------------
+#
+# Each side reads its own rows in its own key order -- Aurora DSQL and a PostgreSQL source
+# by the row-value cursor ``(k0, k1, ...) > (:last_0, :last_1, ...)``, a MySQL source by
+# the Full Load reader's own cursor (``MySQLSourceDialect.keyset_after_sql``) -- and only
+# the two TOTALS are compared, exactly as for a single-column key. Pages never line up
+# across the engines (they sort text differently), and need not: the per-row token is the
+# one :func:`_mysql_row_token` / :func:`_pg_row_token` define and SUM is order-independent,
+# so the pages of one side add up to that side's whole-table checksum. Every statement
+# reads at most one page, so none reaches Aurora DSQL's 300 s transaction limit.
+
+
+def pk_paging_columns(table: TableDef) -> tuple[str, ...]:
+    """The key ``table`` is paged by on its own side: its primary key, in key order, when
+    every key column is one of ``table.columns``; else ``()`` (read in one statement)."""
+    names = {column.name for column in table.columns}
+    key = tuple(table.primary_key)
+    return key if key and all(column in names for column in key) else ()
+
+
+def build_pg_composite_page_sql(
+    table: TableDef,
+    key: Sequence[str],
+    page_size: int,
+    source_is_postgres: bool = False,
+    *,
+    checksum: bool,
+    nonnull_columns: Sequence[str] = (),
+    first: bool,
+) -> sql.Composed:
+    """One keyset page of a PostgreSQL / Aurora DSQL table over the composite ``key``.
+
+    Returns ONE row: ``(sub_sum, row_count, last_k0, ..., last_kN, nonnull_0, ...)``.
+    ``sub_sum`` is the page's :func:`_pg_row_token` sum (``0`` with ``checksum=False``,
+    which reads the key columns only); ``last_ki`` is the page's last key, each column as
+    TEXT, which the caller binds back as ``%(last_i)s``: an untyped parameter the server
+    parses into the column's own type, so the cursor names exactly the key it read (a
+    native binding lost rows of an interval key); ``nonnull_j`` counts the rows holding a
+    value in ``nonnull_columns[j]`` (the NULL proof, TARGET ONLY).
+
+    The window's columns are generated aliases (``ck_k{i}``, ``ck_tok``, ``ck_nn{j}``), so
+    no column of the table is shadowed, and its ORDER BY is qualified by the table so it
+    sorts the native columns, in their collations, as the cursor compares them. There is
+    exactly one ``FROM {table}``, which :func:`~dsql_migrator.core.validator._from_only`
+    rewrites for a PostgreSQL inheritance parent.
+    """
+    table_sql = _pg_table_identifier(table.name)
+    aliases = [sql.Identifier(f"ck_k{i}") for i in range(len(key))]
+    window = [
+        sql.SQL("{} AS {}").format(sql.Identifier(column), alias)
+        for column, alias in zip(key, aliases)
+    ]
+    if checksum:
+        window.append(
+            sql.SQL("{} AS ck_tok").format(_pg_row_token(table, source_is_postgres))
+        )
+    window.extend(
+        sql.SQL("({} IS NOT NULL) AS {}").format(
+            sql.Identifier(column), sql.Identifier(f"ck_nn{j}")
+        )
+        for j, column in enumerate(nonnull_columns)
+    )
+    in_order = sql.SQL(", ").join(aliases)
+    totals = [
+        sql.SQL("COALESCE(SUM(ck_tok), 0)") if checksum else sql.SQL("0"),
+        sql.SQL("COUNT(*)"),
+    ]
+    totals.extend(
+        sql.SQL("(array_agg({}::text ORDER BY {}))[COUNT(*)]").format(alias, in_order)
+        for alias in aliases
+    )
+    totals.extend(
+        sql.SQL("COUNT(*) FILTER (WHERE {})").format(sql.Identifier(f"ck_nn{j}"))
+        for j in range(len(nonnull_columns))
+    )
+    return sql.SQL(
+        "SELECT {totals} FROM (SELECT {window} FROM {table}{cursor} "
+        "ORDER BY {order} LIMIT {limit}) ckpage"
+    ).format(
+        totals=sql.SQL(", ").join(totals),
+        window=sql.SQL(", ").join(window),
+        table=table_sql,
+        cursor=_pg_row_value_cursor(key, first),
+        order=_pg_qualified_order(table_sql, key),
+        limit=sql.Literal(page_size),
+    )
+
+
+def _pg_row_value_cursor(key: Sequence[str], first: bool) -> sql.Composable:
+    """`` WHERE ("k0", "k1") > (%(last_0)s, %(last_1)s)`` -- or nothing for the first page."""
+    if first:
+        return sql.SQL("")
+    return sql.SQL(" WHERE ({}) > ({})").format(
+        sql.SQL(", ").join(sql.Identifier(column) for column in key),
+        sql.SQL(", ").join(sql.Placeholder(f"last_{i}") for i in range(len(key))),
+    )
+
+
+def _pg_qualified_order(table_sql: sql.Composable, key: Sequence[str]) -> sql.Composed:
+    """``"s"."t"."k0", "s"."t"."k1"``: each key column qualified by its table."""
+    return sql.SQL(", ").join(
+        sql.SQL("{}.{}").format(table_sql, sql.Identifier(column)) for column in key
+    )
+
+
+def _mysql_key_order(table: TableDef) -> str:
+    """```db`.`t`.`k0`, `db`.`t`.`k1```: the primary key, each column table-qualified."""
+    table_sql = _quote_mysql_table(table.name)
+    return ", ".join(
+        f"{table_sql}.{_quote_mysql_identifier(column)}" for column in table.primary_key
+    )
+
+
+def build_mysql_composite_page_sql(table: TableDef, where_sql: str = "") -> str:
+    """One keyset page of a MySQL source's checksum over a composite key: one
+    ``(sub_sum, row_count)`` row over the next ``:page`` rows in key order.
+
+    ``where_sql`` is the cursor the dialect wrote for the page
+    (:meth:`~dsql_migrator.core.source_dialect.mysql.MySQLSourceDialect.keyset_after_sql`,
+    or ``<lead> = :last_0`` for the first page of a walked ENUM member), embedded
+    verbatim; empty for the first page. The token is :func:`_mysql_row_token`.
+    """
+    table_sql = _quote_mysql_table(table.name)
+    where = f" WHERE {where_sql}" if where_sql else ""
+    return (
+        "SELECT COALESCE(SUM(ck_tok), 0), COUNT(*) FROM ("
+        f"SELECT {_mysql_row_token(table)} AS ck_tok FROM {table_sql}{where} "
+        f"ORDER BY {_mysql_key_order(table)} LIMIT :page) ckpage"
+    )
+
+
+def build_mysql_composite_boundary_sql(table: TableDef, where_sql: str = "") -> str:
+    """The last key of a FULL page of :func:`build_mysql_composite_page_sql` (same
+    ``where_sql``): ``... ORDER BY <key> LIMIT 1 OFFSET :off`` with ``:off`` = page - 1.
+
+    MySQL has no ``array_agg``, so the page's last key is a second statement in the same
+    snapshot -- a range over the primary key, like the page -- run only for a full page.
+    The key columns come back as the driver returns them, as the Full Load reader binds
+    them to its next cursor.
+    """
+    table_sql = _quote_mysql_table(table.name)
+    where = f" WHERE {where_sql}" if where_sql else ""
+    keys = ", ".join(_quote_mysql_identifier(column) for column in table.primary_key)
+    return (
+        f"SELECT {keys} FROM {table_sql}{where} "
+        f"ORDER BY {_mysql_key_order(table)} LIMIT 1 OFFSET :off"
+    )
+
+
 # Base MySQL integer types eligible for reconciliation: a single-column,
 # integer-like PK gives a well-defined ascending merge order on both engines.
 _INTEGER_BASE_TYPES = frozenset(
@@ -1077,8 +1230,8 @@ def single_pk_column(table: TableDef) -> Optional[str]:
     ascending merge order is well defined), this accepts any single-column PK
     (uuid/varchar/binary/...), because COUNTING the target by bounded keyset paging
     needs only a self-consistent order ON THE TARGET, not a cross-engine one. A
-    composite or missing PK returns ``None`` (the target count then falls back to a
-    single ``COUNT(*)``).
+    composite or missing PK returns ``None`` (a composite key is paged by its own
+    builders, :func:`pk_paging_columns`; only a missing one is read in one statement).
     """
     if len(table.primary_key) != 1:
         return None
@@ -1121,10 +1274,11 @@ def build_orphan_count_sql(child_table: str, fk: ForeignKeyDef) -> sql.Composed:
     :class:`psycopg.sql.Identifier` (Requirement 9.4) and the statement is a
     single read-only ``SELECT``.
 
-    A single unbounded scan: used ONLY for a composite/missing-PK child; a
-    single-column-PK child is orphan-counted over BOUNDED keyset pages
-    (:func:`build_pg_orphan_page_first_sql`) so a billion-row child never runs one
-    transaction past DSQL's ~300s limit -- exactly as count/checksum do.
+    A single unbounded scan: used ONLY for a child with no primary key on Aurora DSQL; a
+    keyed child is orphan-counted over BOUNDED keyset pages
+    (:func:`build_pg_orphan_page_first_sql`, :func:`build_pg_composite_orphan_page_sql`)
+    so a billion-row child never runs one transaction past DSQL's ~300s limit -- exactly
+    as count/checksum do.
     """
     # Split a schema-qualified name into "schema"."table" (NOT one quoted
     # "schema.table" identifier, which would reference a table that doesn't exist):
@@ -1234,4 +1388,60 @@ def build_pg_orphan_page_next_sql(
     """Subsequent keyset page of the orphan count after the ``last`` placeholder."""
     return _build_pg_orphan_page_sql(
         child_table, fk, pk_column, page_size, first=False
+    )
+
+
+def build_pg_composite_orphan_page_sql(
+    child_table: str,
+    fk: ForeignKeyDef,
+    key: Sequence[str],
+    page_size: int,
+    *,
+    first: bool,
+) -> sql.Composed:
+    """One keyset page of the orphan count for ``fk`` over the child's composite ``key``.
+
+    Returns ONE row: ``(orphan_sub_count, row_count, last_k0, ..., last_kN)``. The window
+    is :func:`_build_pg_orphan_page_sql`'s MATERIALIZED CTE (the anti-join measured 27x
+    faster live than a FILTER over NOT EXISTS), filtered by the row-value cursor only, so
+    its boundary also moves past rows that are not orphans; each boundary column comes
+    back as text and is bound back as ``%(last_i)s``, as :func:`build_pg_composite_page_sql`
+    does. A foreign-key column that is also a key column is selected under its own name
+    too, for the anti-join.
+    """
+    child = _pg_table_identifier(child_table)
+    parent = _pg_table_identifier(fk.referenced_table)
+    not_null, join_predicate = _orphan_predicates(fk, "pg")
+    aliases = [sql.Identifier(f"ck_k{i}") for i in range(len(key))]
+    window = [
+        sql.SQL("{} AS {}").format(sql.Identifier(column), alias)
+        for column, alias in zip(key, aliases)
+    ]
+    window.extend(sql.Identifier(column) for column in fk.columns)
+    in_order = sql.SQL(", ").join(aliases)
+    boundaries = sql.SQL(", ").join(
+        sql.SQL("(SELECT (array_agg({}::text ORDER BY {}))[COUNT(*)] FROM pg)").format(
+            alias, in_order
+        )
+        for alias in aliases
+    )
+    return sql.SQL(
+        "WITH pg AS MATERIALIZED ("
+        "SELECT {window} FROM {child}{cursor} ORDER BY {order} LIMIT {limit}) "
+        "SELECT (SELECT COUNT(*) FROM pg LEFT JOIN {parent} AS p ON {join_predicate} "
+        "WHERE {not_null} AND {parent_null}), "
+        "(SELECT COUNT(*) FROM pg), {boundaries}"
+    ).format(
+        window=sql.SQL(", ").join(window),
+        child=child,
+        cursor=_pg_row_value_cursor(key, first),
+        order=_pg_qualified_order(child, key),
+        limit=sql.Literal(page_size),
+        parent=parent,
+        join_predicate=join_predicate,
+        not_null=not_null,
+        parent_null=sql.SQL("p.{ref} IS NULL").format(
+            ref=sql.Identifier(fk.referenced_columns[0])
+        ),
+        boundaries=boundaries,
     )

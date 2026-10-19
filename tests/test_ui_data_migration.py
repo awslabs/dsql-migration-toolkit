@@ -2706,6 +2706,12 @@ class _FkProbeCursor:
             return (self.orphans, None, 0)
         return (self.orphans,)
 
+    def fetchall(self):
+        # The live primary-key read the pre-gate pages the child by (G138): an ``id`` key.
+        if isinstance(self._statement, str) and "indisprimary" in self._statement:
+            return [("id",)]
+        return []
+
     def close(self) -> None:
         pass
 
@@ -2956,6 +2962,9 @@ def test_count_orphans_retries_on_occ_conflict() -> None:
         def fetchone(self):
             return (0,)
 
+        def fetchall(self):
+            return []  # the live primary-key read (G138): no key, so the single scan
+
         def close(self):
             pass
 
@@ -2973,7 +2982,9 @@ def test_count_orphans_retries_on_occ_conflict() -> None:
     conn = _Conn()
     fk = ForeignKeyDef(name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"])
     assert _count_orphans(conn, "child", fk) == 0
-    assert conn.attempts == 2  # first raised OC001, retried, then succeeded
+    # The first statement (the live key read) raised OC001; the retry re-read the key and
+    # counted: 3 statements.
+    assert conn.attempts == 3
     assert conn.rollbacks >= 1  # cleared the aborted transaction before the retry
 
 
@@ -2999,6 +3010,9 @@ def test_g22_count_orphans_retries_on_server_unavailable() -> None:
         def fetchone(self):
             return (0,)
 
+        def fetchall(self):
+            return []  # the live primary-key read (G138): no key, so the single scan
+
         def close(self):
             pass
 
@@ -3015,7 +3029,7 @@ def test_g22_count_orphans_retries_on_server_unavailable() -> None:
     conn = _Conn()
     fk = ForeignKeyDef(name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"])
     assert _count_orphans(conn, "child", fk) == 0
-    assert conn.attempts == 2
+    assert conn.attempts == 3  # the key read raised; the retry re-read it and counted
 
 
 def test_constraint_name_from_ddl_parses_quoted_and_bare() -> None:
@@ -3039,11 +3053,14 @@ class _CapturingCursor:
         self._sink = sink
         self._orphans = orphans
 
-    def execute(self, statement) -> None:  # noqa: ANN001 - fake
+    def execute(self, statement, parameters=None) -> None:  # noqa: ANN001 - fake
         self._sink.append(str(statement))
 
     def fetchone(self):
         return (self._orphans,)
+
+    def fetchall(self):
+        return []  # the live primary-key read (G138): no key, so the single scan
 
     def close(self) -> None:
         pass
@@ -22215,7 +22232,7 @@ def test_the_orphan_pre_gates_run_concurrently_not_one_after_another() -> None:
         conns.append(c)
         return c
 
-    def slow_count(_conn, _table, _fk, _pk, on_page=None):  # noqa: ANN001
+    def slow_count(_conn, _table, _fk, on_page=None):  # noqa: ANN001
         with lock:
             live["now"] += 1
             live["peak"] = max(live["peak"], live["now"])
@@ -22234,7 +22251,7 @@ def test_the_orphan_pre_gates_run_concurrently_not_one_after_another() -> None:
     try:
         t0 = time.monotonic()
         out = _engine._pregate_orphans(
-            pending, factory, {}, beat=lambda: beats.append(1), stopped=lambda: False
+            pending, factory, beat=lambda: beats.append(1), stopped=lambda: False
         )
         elapsed = time.monotonic() - t0
     finally:
@@ -22276,7 +22293,7 @@ def test_a_failing_pre_gate_falls_back_to_the_serial_check() -> None:
     _engine._count_orphans = boom
     try:
         out = _engine._pregate_orphans(
-            pending, lambda: _Conn(), {}, beat=lambda: None, stopped=lambda: False
+            pending, lambda: _Conn(), beat=lambda: None, stopped=lambda: False
         )
     finally:
         _engine._count_orphans = real
@@ -22303,7 +22320,7 @@ def test_the_pre_gate_fan_out_honours_a_stop() -> None:
     _engine._count_orphans = counted
     try:
         out = _engine._pregate_orphans(
-            pending, lambda: type("C", (), {"close": lambda s: None})(), {},
+            pending, lambda: type("C", (), {"close": lambda s: None})(),
             beat=lambda: None, stopped=lambda: True,
         )
     finally:
