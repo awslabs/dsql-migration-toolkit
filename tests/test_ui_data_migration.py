@@ -2940,96 +2940,117 @@ def test_apply_foreign_keys_no_activity_when_nothing_applied(monkeypatch) -> Non
     assert events == []
 
 
-def test_count_orphans_retries_on_occ_conflict() -> None:
+class _PagedOrphanConn:
+    """A target connection serving three keyset orphan pages of 2 rows (the last short).
+
+    The live primary-key read (G138) answers an ``id`` key; ``key_reads`` counts it.
+    ``fail`` is raised once, by the FIRST attempt of the page whose keyset bound is
+    ``fail_at`` (``"key"``: of the key read); ``bounds`` records every page statement's
+    bound (``None`` = page 1).
+    """
+
+    # page bound -> (orphan_sub_count, last_pk, row_count)
+    PAGES = {None: (1, 2, 2), 2: (0, 4, 2), 4: (1, 5, 1)}
+
+    def __init__(self, fail: Exception, fail_at: object) -> None:
+        self.fail = fail
+        self.fail_at = fail_at
+        self.bounds: list = []
+        self.key_reads = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        conn = self
+
+        class _Cur:
+            row = None
+
+            def execute(self, statement, parameters=None):
+                if isinstance(statement, str) and "indisprimary" in statement:
+                    conn.key_reads += 1
+                    if conn.fail_at == "key" and conn.key_reads == 1:
+                        raise conn.fail
+                    return
+                bound = (parameters or {}).get("last")
+                conn.bounds.append(bound)
+                if bound == conn.fail_at and conn.bounds.count(bound) == 1:
+                    raise conn.fail
+                self.row = conn.PAGES[bound]
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return [("id",)]
+
+            def close(self):
+                pass
+
+        return _Cur()
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "bounds", "key_reads"),
+    [(2, [None, 2, 2, 4], 1), ("key", [None, 2, 4], 2)],
+)
+def test_count_orphans_retries_on_occ_conflict(fail_at, bounds, key_reads) -> None:
     # On Aurora DSQL a read can raise OC001/40001 when the target is written
     # concurrently (a live CDC sink at cut over); the orphan pre-gate must retry it,
     # not treat the transient conflict as "orphan pre-check failed" and skip the FK.
+    # G139: only the statement the conflict hit runs again, after a rollback -- a page, or
+    # the live key read (G138) -- where the count used to start over from the key read and
+    # the first page, which no child above ~25-33M rows survived.
     from dsql_migrator.core.models import ForeignKeyDef
     from dsql_migrator.ui.data_migration._full_load_engine import _count_orphans
 
     class _Oc(Exception):
         sqlstate = "40001"
 
-    class _Cur:
-        def __init__(self, conn):
-            self._conn = conn
-
-        def execute(self, *_a):
-            self._conn.attempts += 1
-            if self._conn.attempts == 1:
-                raise _Oc()  # first attempt: transient serialization failure
-
-        def fetchone(self):
-            return (0,)
-
-        def fetchall(self):
-            return []  # the live primary-key read (G138): no key, so the single scan
-
-        def close(self):
-            pass
-
-    class _Conn:
-        def __init__(self):
-            self.attempts = 0
-            self.rollbacks = 0
-
-        def cursor(self):
-            return _Cur(self)
-
-        def rollback(self):
-            self.rollbacks += 1
-
-    conn = _Conn()
+    conn = _PagedOrphanConn(_Oc(), fail_at=fail_at)
     fk = ForeignKeyDef(name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"])
-    assert _count_orphans(conn, "child", fk) == 0
-    # The first statement (the live key read) raised OC001; the retry re-read the key and
-    # counted: 3 statements.
-    assert conn.attempts == 3
-    assert conn.rollbacks >= 1  # cleared the aborted transaction before the retry
+    total = _count_orphans(lambda: conn, "child", fk, page_size=2, sleep=lambda _s: None)
+    assert total == 2
+    # Page 2 ran twice (the conflict, then its replay), pages 1 and 3 once each; a conflict
+    # on the key read re-read only the key.
+    assert conn.bounds == bounds, conn.bounds
+    assert conn.key_reads == key_reads
+    assert conn.rollbacks == 1  # cleared the aborted transaction before the replay
 
 
-def test_g22_count_orphans_retries_on_server_unavailable() -> None:
+@pytest.mark.parametrize(
+    ("fail_at", "bounds", "key_reads"),
+    [(2, [None, 2, 2, 4], 1), ("key", [None, 2, 4], 2)],
+)
+def test_g22_count_orphans_retries_on_server_unavailable(fail_at, bounds, key_reads) -> None:
     # Aurora DSQL's temporary XX000 "server unavailable" on the read-only orphan count is
-    # retried like a 40001 (the count re-runs from the first page). FAILS WITHOUT G22: the
-    # pre-gate reported "orphan pre-check failed; apply this foreign key manually".
+    # retried like a 40001. FAILS WITHOUT G22: the pre-gate reported "orphan pre-check
+    # failed; apply this foreign key manually". G139: only the statement it interrupted
+    # runs again, on the same connection (Aurora DSQL keeps the session open across an
+    # XX000).
     from dsql_migrator.core.models import ForeignKeyDef
     from dsql_migrator.ui.data_migration._full_load_engine import _count_orphans
 
     class _Unavailable(Exception):
         sqlstate = "XX000"
 
-    class _Cur:
-        def __init__(self, conn):
-            self._conn = conn
+    conn = _PagedOrphanConn(_Unavailable("server unavailable"), fail_at=fail_at)
+    made: list = []
 
-        def execute(self, *_a):
-            self._conn.attempts += 1
-            if self._conn.attempts == 1:
-                raise _Unavailable("server unavailable")
+    def factory():
+        made.append(conn)
+        return conn
 
-        def fetchone(self):
-            return (0,)
-
-        def fetchall(self):
-            return []  # the live primary-key read (G138): no key, so the single scan
-
-        def close(self):
-            pass
-
-    class _Conn:
-        def __init__(self):
-            self.attempts = 0
-
-        def cursor(self):
-            return _Cur(self)
-
-        def rollback(self):
-            pass
-
-    conn = _Conn()
     fk = ForeignKeyDef(name="fk", columns=["a"], referenced_table="p", referenced_columns=["id"])
-    assert _count_orphans(conn, "child", fk) == 0
-    assert conn.attempts == 3  # the key read raised; the retry re-read it and counted
+    assert _count_orphans(factory, "child", fk, page_size=2, sleep=lambda _s: None) == 2
+    assert conn.bounds == bounds, conn.bounds
+    assert conn.key_reads == key_reads
+    assert len(made) == 1  # no reconnect
 
 
 def test_constraint_name_from_ddl_parses_quoted_and_bare() -> None:
@@ -3186,10 +3207,14 @@ def test_apply_preserved_fk_counts_precheck_failure(monkeypatch) -> None:
     assert applied == []   # never applied a FK we could not pre-verify
 
 
-def test_apply_preserved_fk_reconnects_probe_on_transient_drop(monkeypatch) -> None:
-    # The shared probe dying mid-pass (class 08) must not cascade into false failures:
-    # the pre-gate reopens the probe once and the FK still applies.
+def test_apply_preserved_fk_reconnects_on_transient_drop(monkeypatch) -> None:
+    # A connection dying mid-pass (class 08) must not cascade into false failures: the
+    # count replaces it and replays the statement (G139: its own reconnecting connection,
+    # not a shared probe reopened once), and the FK still applies.
+    import dsql_migrator.core.validator as validator_mod
     import dsql_migrator.ui.data_migration._full_load_engine as engine
+
+    monkeypatch.setattr(validator_mod.time, "sleep", lambda _s: None)
 
     class _Class08(Exception):
         sqlstate = "08006"
@@ -3223,7 +3248,7 @@ def test_apply_preserved_fk_reconnects_probe_on_transient_drop(monkeypatch) -> N
     )
     assert result == (1, 0, 0)   # reconnected and applied, not a false "apply manually"
     assert applied == [_FK_DDL]
-    assert conns == []           # both the dead probe and its replacement were taken
+    assert conns == []           # both the dead connection and its replacement were taken
 
 
 def test_apply_preserved_fk_validate_failure_still_counts_applied(monkeypatch) -> None:
@@ -22223,39 +22248,52 @@ def test_the_orphan_pre_gates_run_concurrently_not_one_after_another() -> None:
     lock = threading.Lock()
     conns: list = []
 
-    class _Conn:
+    class _SlowCursor:
+        """The live key read finds no primary key (G138), so each orphan count is one slow
+        single-scan statement."""
+
+        def execute(self, statement, *_a):
+            if isinstance(statement, str) and "indisprimary" in statement:
+                return
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            try:
+                time.sleep(0.25)
+            finally:
+                with lock:
+                    live["now"] -= 1
+
+        def fetchone(self):
+            return (0,)
+
+        def fetchall(self):
+            return []
+
         def close(self):
             return None
+
+    class _Conn:
+        closed = False
+
+        def cursor(self):
+            return _SlowCursor()
+
+        def close(self):
+            self.closed = True
 
     def factory():
         c = _Conn()
         conns.append(c)
         return c
 
-    def slow_count(_conn, _table, _fk, on_page=None):  # noqa: ANN001
-        with lock:
-            live["now"] += 1
-            live["peak"] = max(live["peak"], live["now"])
-        try:
-            if on_page is not None:
-                on_page()
-            time.sleep(0.25)
-            return 0
-        finally:
-            with lock:
-                live["now"] -= 1
-
-    real = _engine._count_orphans
-    _engine._count_orphans = slow_count
+    # The REAL count (G139: it takes the factory and opens its own connection).
     beats: list[int] = []
-    try:
-        t0 = time.monotonic()
-        out = _engine._pregate_orphans(
-            pending, factory, beat=lambda: beats.append(1), stopped=lambda: False
-        )
-        elapsed = time.monotonic() - t0
-    finally:
-        _engine._count_orphans = real
+    t0 = time.monotonic()
+    out = _engine._pregate_orphans(
+        pending, factory, beat=lambda: beats.append(1), stopped=lambda: False
+    )
+    elapsed = time.monotonic() - t0
 
     assert len(out) == 8 and all(v == 0 for v in out.values()), out
     # Serial would be 8 x 0.25s = 2.0s; concurrent must be far less.
@@ -22268,6 +22306,7 @@ def test_the_orphan_pre_gates_run_concurrently_not_one_after_another() -> None:
     # Each worker gets its OWN connection: one psycopg connection cannot serve concurrent
     # queries, and they are closed again.
     assert len(conns) == 8, conns
+    assert all(c.closed for c in conns), "a pre-gate connection was left open"
     assert beats, "the pre-gate reported no liveness"
 
 

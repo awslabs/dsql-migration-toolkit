@@ -1137,22 +1137,29 @@ def test_the_cut_over_pre_check_pages_a_composite_child_by_its_live_key() -> Non
     expected = sum(r["order_id"] == 1001 for r in child.rows)
     beats: list[int] = []
     paged = PgDouble(child, orders)
-    assert _count_orphans(paged, "app.order_items", fk, 4, on_page=lambda: beats.append(1)) == expected
+    assert _count_orphans(
+        lambda: paged, "app.order_items", fk, 4, on_page=lambda: beats.append(1)
+    ) == expected
     pages = [sql for sql, _ in paged.executed if "WITH pg AS MATERIALIZED" in sql]
     assert len(pages) == 6 == len(beats)
+    assert sum("ix.indisprimary" in sql for sql, _ in paged.executed) == 1
+    assert paged.closed is True  # the count closes the connection it opened (G139)
     keyless = PgDouble(child, orders, primary_keys={"app.order_items": ()})
-    assert _count_orphans(keyless, "app.order_items", fk, 4) == expected
+    assert _count_orphans(lambda: keyless, "app.order_items", fk, 4) == expected
     assert any("NOT EXISTS" in sql for sql, _ in keyless.executed)
     unreadable = PgDouble(child, orders, fail={"ix.indisprimary": _SqlState("42501", "denied")})
     with pytest.raises(_SqlState):
-        _count_orphans(unreadable, "app.order_items", fk, 4)
+        _count_orphans(lambda: unreadable, "app.order_items", fk, 4)
 
 
-def test_the_cut_over_pre_check_retries_a_conflict_from_the_first_page() -> None:
+def test_the_cut_over_pre_check_replays_only_the_page_a_conflict_hit() -> None:
+    # G139: a conflict on the third composite page replays that page alone, so neither the
+    # live key read nor the pages before it run again (G138 re-ran the count from page 1),
+    # and the orphans on the replayed page are counted once.
     from dsql_migrator.ui.data_migration._full_load_engine import _count_orphans
 
     child = _order_items(23)
-    orders = _Table("app.orders", ("id",), [{"id": i} for i in range(1000, 1006)])
+    orders = _Table("app.orders", ("id",), [{"id": i} for i in range(1000, 1006) if i != 1002])
     calls = {"pages": 0}
 
     class _OneConflict(PgDouble):
@@ -1167,9 +1174,17 @@ def test_the_cut_over_pre_check_retries_a_conflict_from_the_first_page() -> None
     double = _OneConflict(child, orders)
     fk = ForeignKeyDef(name="fk_order", columns=["order_id"], referenced_table="app.orders",
                        referenced_columns=["id"])
-    assert _count_orphans(double, "app.order_items", fk, 4) == 0
-    firsts = [params for sql, params in double.executed if "WITH pg" in sql and not params]
-    assert len(firsts) == 2  # the re-run began again from the first page
+    expected = sum(r["order_id"] == 1002 for r in child.rows)
+    assert expected == 4  # all on the third page of 4 rows
+    assert _count_orphans(
+        lambda: double, "app.order_items", fk, 4, sleep=lambda _s: None
+    ) == expected
+    pages = [params for sql, params in double.executed if "WITH pg" in sql]
+    assert len(pages) == 7  # 6 pages, the third of them twice
+    assert pages[2] == pages[3] and pages.count({}) == 1
+    walk = pages[:3] + pages[4:]
+    assert len({tuple(sorted(p.items())) for p in walk}) == 6  # no other page re-read
+    assert sum("ix.indisprimary" in sql for sql, _ in double.executed) == 1
 
 
 # ---------------------------------------------------------------------------

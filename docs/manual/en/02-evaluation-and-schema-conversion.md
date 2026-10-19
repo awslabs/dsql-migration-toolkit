@@ -612,7 +612,12 @@ immediately**; the already-loaded rows are then checked by a background
 **Orphan pre-gate.** Before adding each FK the tool counts child rows whose parent is
 missing. If any exist, that FK is **skipped with an actionable note** (table / foreign
 key / row count) instead of failing with an opaque error — resolve the orphans (often
-an un-replicated source cascade) and click **Apply foreign keys** again.
+an un-replicated source cascade) and click **Apply foreign keys** again. A child table
+with a primary key, a composite key too, is counted in keyset pages of the key Aurora
+DSQL holds: a dropped connection, a conflict (`40001`) or Aurora DSQL's 60-minute
+connection limit re-runs only the page it interrupted, so a table of any size is
+counted. A table with no primary key is counted in one query, which has to finish
+within DSQL's ~300 s per-transaction limit.
 
 **In the preview.** Because the FKs run later and separately, the generated target
 script shows them in their own read-only **"Foreign keys — applied after Full Load"**

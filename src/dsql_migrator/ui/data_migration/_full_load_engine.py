@@ -57,7 +57,6 @@ from dsql_migrator.core.batched_import import (
 )
 from dsql_migrator.core.target_connection import (
     DsqlConnector,
-    is_transient_connection_error,
     target_error_hint,
 )
 from dsql_migrator.core.converter import (
@@ -7671,13 +7670,13 @@ def apply_preserved_foreign_keys(
     table_conversions: Mapping[str, TableConversion],
     connection_factory: Callable[[], Any],
     *,
-    # Liveness reporter, called at each real unit boundary (per FK, and per poll of a
-    # still-building parent index). This pass runs entirely AFTER the Full Load progress
-    # drain has been joined, so without it the whole pass is one silence gap measured
-    # against the 900 s stall window -- and it is unbounded: up to 300 s per distinct
-    # still-building parent index plus an O(rows) orphan pre-gate per FK. A fully
+    # Liveness reporter, called at each real unit boundary (per FK, per orphan-count page,
+    # and per poll of a still-building parent index). This pass runs entirely AFTER the Full
+    # Load progress drain has been joined, so without it the whole pass is one silence gap
+    # measured against the 900 s stall window -- and it is unbounded: up to 300 s per
+    # distinct still-building parent index plus an O(rows) orphan pre-gate per FK. A fully
     # successful load was therefore reaped as "an unresponsive source/target connection",
-    # which _mark_done cannot undo. Also called by the cut-over action, which passes none.
+    # which _mark_done cannot undo. The cut-over action passes its job's heartbeat too.
     heartbeat: Optional[Callable[[], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     # Progress reporter, called ``(settled, total)`` once per FK that finishes (applied,
@@ -7714,7 +7713,8 @@ def apply_preserved_foreign_keys(
     (:func:`_count_orphans`, G138), so a large child is counted over BOUNDED keyset pages
     rather than one unbounded scan that could exceed DSQL's ~300s transaction limit -- a
     composite key too -- and never by a key the target does not hold unique, whose page
-    boundaries could skip a duplicate and undercount.
+    boundaries could skip a duplicate and undercount. A dropped connection or a conflict
+    replays only the page it interrupted (G139), so a child of any size is counted.
 
     Returns ``(applied, skipped, failed)`` counts.
     """
@@ -7767,8 +7767,15 @@ def apply_preserved_foreign_keys(
     # to the audit trail while the target had already gained enforced constraints. Cheap:
     # the `if not pending` return above means a run with no foreign keys still logs nothing.
     _cutover_origin = origin == "cut-over"
+    # The category of EVERY line of the pass, the per-FK ones included: at cut over they
+    # were filed under FULL_LOAD while the pass's own lines sat under VALIDATION, so a
+    # reader filtering the Validation step saw "1 skipped" with no line naming which
+    # constraint or why.
+    _category = (
+        ActivityCategory.VALIDATION if _cutover_origin else ActivityCategory.FULL_LOAD
+    )
     log_activity(
-        ActivityCategory.VALIDATION if _cutover_origin else ActivityCategory.FULL_LOAD,
+        _category,
         "apply foreign keys (cut-over)" if _cutover_origin else "apply foreign keys",
         status=ActivityStatus.STARTED,
         detail=f"Foreign-key pass starting: {_total} constraint(s) to add.",
@@ -7779,13 +7786,12 @@ def apply_preserved_foreign_keys(
     _pregated = _pregate_orphans(
         pending, connection_factory, beat=_beat, stopped=_stopped
     )
-    probe = connection_factory()  # one read-only connection for the orphan pre-gate
     applied = skipped = failed = 0
     try:
         for _fk_index, (table_name, constraint_name, fk, add_ddl) in enumerate(pending):
             # One FK is a real unit of work: report liveness so a long pass is not reaped,
-            # and honour a stop so Stop is not held for the rest of the pass. Both are
-            # no-ops for the cut-over caller, which supplies neither.
+            # and honour a stop so Stop is not held for the rest of the pass. The stop is a
+            # no-op for the cut-over caller, which supplies no ``should_cancel``.
             _beat()
             # Exactly ``_fk_index`` FKs have finished by the time iteration ``_fk_index``
             # starts, so reporting here is accurate, not lagging -- and it needs no
@@ -7815,57 +7821,33 @@ def apply_preserved_foreign_keys(
                     if isinstance(_pre, int):
                         orphans = _pre
                     else:
-                        orphans = _count_orphans(probe, table_name, fk, on_page=_beat)
+                        orphans = _count_orphans(
+                            connection_factory, table_name, fk, on_page=_beat
+                        )
             except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk a bad ADD
-                if is_transient_connection_error(exc):
-                    # The shared probe died mid-pass (class 08 / expired IAM token /
-                    # DSQL session-max-duration). Reopen it once so a single drop does
-                    # not cascade into a wall of false "apply manually" entries for the
-                    # remaining FKs, then retry this FK's pre-check.
-                    try:
-                        probe.close()
-                    except Exception:  # noqa: BLE001 - best-effort close of the dead probe
-                        pass
-                    try:
-                        probe = connection_factory()
-                        orphans = _count_orphans(probe, table_name, fk, on_page=_beat)
-                    except Exception:  # noqa: BLE001 - reconnect/re-check still failing
-                        failed += 1
-                        _LOGGER.warning(
-                            "Orphan pre-check failed for FK %s (after reconnect)",
-                            target, exc_info=True,
-                        )
-                        log_activity(
-                            ActivityCategory.FULL_LOAD,
-                            "foreign key not applied",
-                            status=ActivityStatus.FAILURE,
-                            target=target,
-                            detail=(
-                                "orphan pre-check failed; verify referential integrity "
-                                "and apply this foreign key manually"
-                            ),
-                            exc=exc,
-                        )
-                        continue
-                else:
-                    failed += 1
-                    _LOGGER.warning("Orphan pre-check failed for FK %s", target, exc_info=True)
-                    log_activity(
-                        ActivityCategory.FULL_LOAD,
-                        "foreign key not applied",
-                        status=ActivityStatus.FAILURE,
-                        target=target,
-                        detail=(
-                            "orphan pre-check failed; verify referential integrity and "
-                            "apply this foreign key manually"
-                        ),
-                        exc=exc,
-                    )
-                    continue
+                # The count replaced its connection after every drop and replayed the page
+                # a 40001 / XX000 interrupted (it used to run on one shared probe, reopened
+                # once, counting again from the first page), so what reaches here is a
+                # connection that could not be opened, a key read or page that outlasted
+                # its retries, or a real query error.
+                failed += 1
+                _LOGGER.warning("Orphan pre-check failed for FK %s", target, exc_info=True)
+                log_activity(
+                    _category,
+                    "foreign key not applied",
+                    status=ActivityStatus.FAILURE,
+                    target=target,
+                    detail=(
+                        "orphan pre-check failed; verify referential integrity and "
+                        "apply this foreign key manually"
+                    ),
+                    exc=exc,
+                )
+                continue
             if orphans:
                 skipped += 1
                 log_activity(
-                    ActivityCategory.FULL_LOAD,
+                    _category,
                     "foreign key not applied",
                     status=ActivityStatus.FAILURE,
                     target=target,
@@ -7896,7 +7878,7 @@ def apply_preserved_foreign_keys(
                     # the index-build race was handled rather than merely won. Silent when
                     # the index was already valid (the normal case) -- no noise.
                     log_activity(
-                        ActivityCategory.FULL_LOAD,
+                        _category,
                         "waited for referenced unique index",
                         status=ActivityStatus.INFO,
                         target=target,
@@ -7930,7 +7912,7 @@ def apply_preserved_foreign_keys(
                 failed += 1
                 _LOGGER.warning("Could not apply FK %s", target, exc_info=True)
                 log_activity(
-                    ActivityCategory.FULL_LOAD,
+                    _category,
                     "foreign key not applied",
                     status=ActivityStatus.FAILURE,
                     target=target,
@@ -7944,10 +7926,6 @@ def apply_preserved_foreign_keys(
         # of applied/skipped/failed, so this is right both for a completed pass (== total)
         # and for one cut short by Stop (fewer, which is what the card should then show).
         _report(applied + skipped + failed)
-        try:
-            probe.close()
-        except Exception:  # noqa: BLE001 - best-effort close
-            pass
     # THE single audit event for a foreign-key pass, emitted HERE because every caller
     # shares this function -- the Full Load post-pass, the Data Migration action, and the
     # CUT-OVER action, which logs nothing of its own (so moving this to the caller, as the
@@ -7978,7 +7956,7 @@ def apply_preserved_foreign_keys(
     log_activity(
         # Cut over is the Validation step's screen, and the sync beside it logs there too,
         # so a reader filtering that step sees the whole hand-off in one place.
-        ActivityCategory.VALIDATION if _at_cutover else ActivityCategory.FULL_LOAD,
+        _category,
         "apply foreign keys (cut-over)" if _at_cutover else "apply foreign keys",
         status=_status,
         detail=(
@@ -8370,8 +8348,8 @@ def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:
 _ORPHAN_PAGE_SIZE = 5000
 
 
-# How many orphan pre-gates run at once. The pre-gate is READ-ONLY, and each worker opens
-# its own short-lived connection, so they are independent -- but the target is a live cluster
+# How many orphan pre-gates run at once. The pre-gate is READ-ONLY, and each worker counts
+# on its own connection, so they are independent -- but the target is a live cluster
 # and the pass may run at CUT OVER alongside a draining CDC sink, so the fan-out stays small
 # and bounded rather than one connection per foreign key.
 #
@@ -8397,10 +8375,11 @@ def _pregate_orphans(
 ) -> dict:
     """Count orphans for every pending FK CONCURRENTLY. Returns ``{index: count | Exception}``.
 
-    Read-only and independent per FK, each on its own short-lived connection (one psycopg
-    connection cannot serve concurrent queries). Best-effort: an entry that fails or is
-    missing simply falls back to the caller's existing serial pre-check, so this can only
-    make the pass faster, never change its verdict.
+    Read-only and independent per FK, each on its own connection, which the count opens
+    from ``connection_factory`` and closes (one psycopg connection cannot serve concurrent
+    queries). Best-effort: an entry that fails or is missing simply falls back to the
+    caller's existing serial pre-check, so this can only make the pass faster, never change
+    its verdict.
     """
     out: dict = {}
     if not pending:
@@ -8409,18 +8388,10 @@ def _pregate_orphans(
     def one(index: int, table_name: str, fk) -> None:
         if stopped():
             return
-        conn = None
         try:
-            conn = connection_factory()
-            out[index] = _count_orphans(conn, table_name, fk, on_page=beat)
+            out[index] = _count_orphans(connection_factory, table_name, fk, on_page=beat)
         except Exception as exc:  # noqa: BLE001 - recorded; the caller retries serially
             out[index] = exc
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:  # noqa: BLE001 - best-effort
-                    pass
         beat()
 
     jobs = [
@@ -8442,11 +8413,14 @@ def _pregate_orphans(
 
 
 def _count_orphans(
-    connection: Any,
+    connection_factory: Callable[[], Any],
     child_table: str,
     fk: ForeignKeyDef,
     page_size: int = _ORPHAN_PAGE_SIZE,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    # The reconnect wait and the replay backoff (``time.sleep``); injectable for tests.
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> int:
     """Count child rows whose foreign key points to a missing parent (target).
 
@@ -8455,59 +8429,132 @@ def _count_orphans(
     into an actionable per-FK count. Reuses the Validation orphan queries
     (:mod:`~dsql_migrator.core.validation_sql`).
 
-    The child is paged by the primary key the LIVE target enforces, read first on the
-    same connection (G138): a single column by bounded keyset pages, a composite key by
-    the row-value cursor (:func:`~dsql_migrator.core.validator.target_orphan_count_composite`),
-    so a very large child never runs the orphan scan in one transaction (a single
-    ``COUNT(*) ... NOT EXISTS`` would exceed DSQL's ~300s transaction limit) -- exactly as
-    the count/checksum keyset pagers do -- and never by a key the target does not hold
-    unique (the source's, after a re-key), whose page boundaries could skip a duplicate
-    and undercount. Only a child with no primary key keeps the single scan
+    The child is paged by the primary key the LIVE target enforces, read once first on
+    the count's own connection (G138): a single column by bounded keyset pages, a
+    composite key by the row-value cursor
+    (:func:`~dsql_migrator.core.validator.target_orphan_count_composite`), so a very large
+    child never runs the orphan scan in one transaction (a single ``COUNT(*) ... NOT
+    EXISTS`` would exceed DSQL's ~300s transaction limit) -- exactly as the count/checksum
+    keyset pagers do -- and never by a key the target does not hold unique (the source's,
+    after a re-key), whose page boundaries could skip a duplicate and undercount. Only a
+    child with no primary key keeps the single scan
     (:func:`~dsql_migrator.core.validation_sql.build_orphan_count_sql`); a key that cannot
     be read raises, which leaves the foreign key to be applied by hand.
 
-    The count is wrapped in OCC retry: on Aurora DSQL even a read can raise a
-    serialization failure (OC001/40001) when the target is being written concurrently
-    (e.g. a live CDC sink at cut over), and a transient conflict must not be mistaken
-    for "orphan pre-check failed" and skip an otherwise-applicable foreign key. On a
-    conflict, or Aurora DSQL's temporary XX000, the whole (idempotent, read-only) count
-    re-runs from the first page.
+    An interrupted count RESUMES; it does not start over (G139). It runs on its own
+    connection from ``connection_factory`` behind Validation's reconnecting proxy
+    (:class:`~dsql_migrator.core.validator._ReconnectingTargetConnection`): a connection
+    Aurora DSQL closes (its 60-minute connection limit, or a dropped network) is replaced
+    and only the statement it cut off runs again, and an XX000 runs it again on the same
+    connection. Each page is its own statement with its own cursor (``WHERE pk > :last``,
+    or the composite key's row value), so that replay re-reads one page. A 40001 (on
+    Aurora DSQL even a read can raise OC001/40001 while the target is written
+    concurrently), or an XX000 that outlasted the proxy's budget, replays the same
+    statement -- the key read, one page or the single scan -- through
+    :func:`_orphan_replay`. Every budget is per statement and starts again after each one
+    that succeeds, so any number of drops and conflicts over an hours-long count is
+    survivable, while a page that keeps failing still fails the count (the caller then
+    reports the pre-check failed, never zero orphans). Before, a conflict re-ran the whole
+    count from the key read and the first page, and a drop failed it, so a child too large
+    to count within one connection's 60 minutes (about 25-33M rows at the measured 7-9k
+    rows/s) failed every attempt.
     """
-    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
-    from dsql_migrator.core.target_connection import is_server_unavailable
     from dsql_migrator.core.target_introspector import read_target_primary_key
-    from dsql_migrator.core.validator import target_orphan_count_composite
+    from dsql_migrator.core.validator import (
+        _ReconnectingTargetConnection,
+        target_orphan_count_composite,
+    )
 
-    def _run() -> int:
-        # A prior OC001 leaves the connection's transaction aborted; clear it before the
-        # retry so the re-run starts clean (a no-op / harmless on an autocommit conn).
-        try:
-            connection.rollback()
-        except Exception:  # noqa: BLE001 - best-effort
-            pass
-        key = read_target_primary_key(connection, child_table)
+    connection = _ReconnectingTargetConnection(connection_factory, sleep=sleep)
+    try:
+        key = _orphan_replay(
+            connection, lambda: read_target_primary_key(connection, child_table), sleep=sleep
+        )
         if len(key) == 1:
             return _count_orphans_keyset(
-                connection, child_table, fk, key[0], page_size, on_page=on_page
+                connection, child_table, fk, key[0], page_size,
+                on_page=on_page, sleep=sleep,
             )
         if key:
             return target_orphan_count_composite(
-                connection, child_table, fk, key, page_size, on_page=on_page
+                connection, child_table, fk, key, page_size, on_page=on_page,
+                page_row=lambda statement, parameters: _orphan_page_row(
+                    connection, statement, parameters, sleep=sleep
+                ),
             )
+        # The single scan is one statement: its only page, so one liveness report.
+        if on_page is not None:
+            on_page()
+        row = _orphan_page_row(
+            connection, build_orphan_count_sql(child_table, fk), sleep=sleep
+        )
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        connection.close()
+
+
+def _orphan_replay(
+    connection: Any,
+    read: Callable[[], Any],
+    *,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> Any:
+    """Run ONE read of the orphan count -- the key read, a page, the single scan -- and
+    return its result, replaying only it.
+
+    A 40001 conflict or an XX000 rolls back (a conflict can leave the transaction aborted;
+    a no-op on an autocommit connection) and runs the SAME read again, with the OCC
+    backoff and jitter, up to :data:`~dsql_migrator.core.occ.DEFAULT_MAX_ATTEMPTS` times;
+    the last error is then raised. A dropped connection is the reconnecting proxy's: it
+    replaces the connection and replays the statement itself. Any other error is raised at
+    once.
+    """
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.target_connection import is_server_unavailable
+
+    replay = False
+
+    def _attempt() -> Any:
+        nonlocal replay
+        if replay:
+            try:
+                connection.rollback()
+            except Exception:  # noqa: BLE001 - best-effort; the replay reports the state
+                pass
+        replay = True
+        return read()
+
+    return with_occ_retry(
+        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc),
+        sleep=sleep or _time.sleep,
+    )(_attempt)()
+
+
+def _orphan_page_row(
+    connection: Any,
+    statement: Any,
+    parameters: Optional[Mapping[str, Any]] = None,
+    *,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> Any:
+    """Run ONE orphan-count statement (a page) on its own cursor and return its row,
+    replaying only it (:func:`_orphan_replay`)."""
+
+    def _read() -> Any:
         cursor = connection.cursor()
         try:
-            cursor.execute(build_orphan_count_sql(child_table, fk))
-            row = cursor.fetchone()
+            if parameters is None:
+                cursor.execute(statement)
+            else:
+                cursor.execute(statement, parameters)
+            return cursor.fetchone()
         finally:
             try:
                 cursor.close()
             except Exception:  # noqa: BLE001 - best-effort close
                 pass
-        return int(row[0]) if row and row[0] is not None else 0
 
-    return with_occ_retry(
-        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc)
-    )(_run)()
+    return _orphan_replay(connection, _read, sleep=sleep)
 
 
 def _count_orphans_keyset(
@@ -8517,6 +8564,8 @@ def _count_orphans_keyset(
     pk_column: str,
     page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    sleep: Optional[Callable[[float], None]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages (single-column-PK child).
 
@@ -8524,6 +8573,8 @@ def _count_orphans_keyset(
     window (the orphan predicate is a ``COUNT(*) FILTER``), so ``last_pk`` advances the
     keyset over non-orphan rows too and no PK range is skipped. Sub-counts fold into a
     Python integer; the loop stops when a page returns fewer than ``page_size`` rows.
+    Each page runs through :func:`_orphan_page_row`, so a conflict replays that page from
+    its own bound, never the pages already counted.
     """
     first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
     next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
@@ -8536,18 +8587,10 @@ def _count_orphans_keyset(
         # minutes, so a live run under an armed watchdog was reaped mid-pass.
         if on_page is not None:
             on_page()
-        cursor = connection.cursor()
-        try:
-            if last is None:
-                cursor.execute(first_sql)
-            else:
-                cursor.execute(next_sql, {"last": last})
-            row = cursor.fetchone()
-        finally:
-            try:
-                cursor.close()
-            except Exception:  # noqa: BLE001 - best-effort close
-                pass
+        if last is None:
+            row = _orphan_page_row(connection, first_sql, sleep=sleep)
+        else:
+            row = _orphan_page_row(connection, next_sql, {"last": last}, sleep=sleep)
         if row is None:
             return total
         sub_count, last_pk, count = row[0], row[1], row[2]

@@ -809,6 +809,16 @@ class _ReconnectingTargetConnection:
     def cursor(self) -> "_ReconnectingCursor":
         return _ReconnectingCursor(self)
 
+    def rollback(self) -> None:
+        """Roll back the live connection; nothing to do once a drop discarded it.
+
+        Every target connection is autocommit, so this is normally a no-op. A caller that
+        replays a read after a 40001 (the foreign-key pass's orphan count) calls it first,
+        as it would on a plain connection.
+        """
+        if self._connection is not None:
+            self._connection.rollback()
+
     def close(self) -> None:
         self._discard()
 
@@ -1731,6 +1741,8 @@ def target_orphan_count_composite(
     key: "Sequence[str]",
     page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    page_row: Optional[Callable[[Any, Optional[dict]], Any]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages of a composite ``key`` (G138).
 
@@ -1739,25 +1751,34 @@ def target_orphan_count_composite(
     boundary advances over non-orphan rows too and no key range is skipped. Shared by
     Validation's orphan check and the cut-over foreign-key pre-check (heartbeat per page);
     a full page whose last key equals its cursor raises :class:`PagedReadError`.
+    ``page_row(statement, parameters)`` runs one page and returns its row in place of a
+    cursor of ``connection``: the pre-check passes its replay, so a conflict re-reads
+    that page alone (G139).
     """
     first_sql = build_pg_composite_orphan_page_sql(child_table, fk, key, page_size, first=True)
     next_sql = build_pg_composite_orphan_page_sql(child_table, fk, key, page_size, first=False)
+
+    def _cursor_row(statement: Any, parameters: Optional[dict]) -> Any:
+        cursor = connection.cursor()
+        try:
+            if parameters is None:
+                cursor.execute(statement)
+            else:
+                cursor.execute(statement, parameters)
+            return cursor.fetchone()
+        finally:
+            _safe_close(cursor)
+
+    run_page = page_row if page_row is not None else _cursor_row
     total = 0
     last: Optional[tuple] = None
     while True:
         if on_page is not None:
             on_page()
-        cursor = connection.cursor()
-        try:
-            if last is None:
-                cursor.execute(first_sql)
-            else:
-                cursor.execute(
-                    next_sql, {f"last_{i}": value for i, value in enumerate(last)}
-                )
-            row = cursor.fetchone()
-        finally:
-            _safe_close(cursor)
+        if last is None:
+            row = run_page(first_sql, None)
+        else:
+            row = run_page(next_sql, {f"last_{i}": value for i, value in enumerate(last)})
         if row is None:
             return total
         total += int(row[0] or 0)
