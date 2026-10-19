@@ -712,7 +712,11 @@ def build_ai_tool_executor(
                          "row_count_match": getattr(_it, "row_count_match", None),
                          "checksum_match": getattr(_it, "checksum_match", None),
                          "rows_quarantined": getattr(_it, "rows_quarantined", None),
-                         "error": (str(getattr(_it, "error", "") or "")[:300]) or None}
+                         "error": (str(getattr(_it, "error", "") or "")[:300]) or None,
+                         # G140: why a table whose data may match is still not matched.
+                         "orphan_check_error": (
+                             str(getattr(_it, "orphan_check_error", "") or "")[:300]
+                         ) or None}
                     )
                 return _json.dumps(
                     {"status": "ok", "mismatched_count": len(_bad),

@@ -50,13 +50,16 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 > table as a whole. Aurora DSQL is paged by the primary key it holds, read for each
 > table, so a table re-keyed in Schema Conversion is counted by its new key, never by a
 > key Aurora DSQL does not keep unique. On the source a composite key's row count stays
-> one `COUNT(*)` (a source has no transaction limit), and the checksum's pages must add
-> up to it, else the table is an error, never a match; a MySQL key with a descending or
-> prefix part, or a single-precision `FLOAT` part, is checksummed on the source in one
-> statement. Only a table with no primary key on Aurora DSQL (which the tool does not
-> migrate) is still counted and checksummed there in one statement; on a very large one
-> Aurora DSQL's 300-second transaction limit stops it, and it is reported as an error
-> that says what to do, never as a match.
+> one `COUNT(*)` (a source has no transaction limit), read before the pages, and the
+> checksum's pages must add up to it: they stop as soon as they read more. Pages that
+> cannot be trusted that way, or that do not move past their cursor, make a PostgreSQL
+> source's table an error, never a match; on a MySQL source the checksum is read in one
+> statement instead (the log says why). A MySQL key with a descending or prefix part is
+> checksummed on the source in one statement, and so is one with a single-precision
+> `FLOAT`, `TIME` or `BIT` part, a one-column key too. Only a table with no primary key
+> on Aurora DSQL (which the tool does not migrate) is still counted and checksummed
+> there in one statement; on a very large one Aurora DSQL's 300-second transaction limit
+> stops it, and it is reported as an error that says what to do, never as a match.
 
 > **Checksum excludes floating-point and JSON columns from a MySQL source.** MySQL
 > `FLOAT`/`DOUBLE` and `JSON` have no exact text form that renders identically on both
@@ -118,8 +121,11 @@ orphaned, so the tool skips that constraint with an actionable message rather th
 failing the run — and it is the referential-integrity safety net when you chose to
 **strip** the foreign keys instead. A foreign key whose parent table is not on Aurora
 DSQL cannot be counted: the report lists it as **not checked**, which changes no
-verdict. An orphan check that fails marks only its own table, as a failed comparison
-does.
+verdict. An orphan check that fails (for example on a foreign-key column whose type no
+longer matches its parent key) marks only its own table not matched: its row counts and
+its row-count / CHECKSUM verdicts stay shown, so a real mismatch is still seen, and
+**Orphan records** lists the foreign key and the error. Fix the cause and re-check the
+table, or turn off **Check for orphan records** and re-run.
 
 For a table that mismatches, an optional bounded **row-diff sample** lists a few
 differing PKs (and checksum tokens) — **never the row values** — so you can
@@ -281,7 +287,9 @@ cannot be read: the tool cannot see a newer record then, so check the stream ano
 way before you repoint the application. A new validation run clears it, and it never
 overrides a Validation mismatch. A dead-lettered table whose CHECKSUM keeps failing on
 re-check (the table's error says why) is the one case a re-check cannot clear: turn it
-off under **Objects to validate**, re-run, and then acknowledge it on Cut over.
+off under **Objects to validate**, re-run, and then acknowledge it on Cut over. A table
+whose orphan check failed is not that case: its CHECKSUM finished and its verdict stands,
+and **Orphan records** says what to fix (5.3).
 
 CHECKSUM names the columns it cannot value-compare (5.1); for a dead-lettered table
 Cut over repeats them as a non-blocking warning.

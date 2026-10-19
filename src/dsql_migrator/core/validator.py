@@ -79,6 +79,7 @@ means the two computed checksums were equal over the compared columns).
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -126,7 +127,10 @@ from dsql_migrator.core.target_introspector import (
 )
 from dsql_migrator.core.source_dialect import SourceDialect, dialect_for
 from dsql_migrator.core.source_dialect.base import keyset_param_names
-from dsql_migrator.core.source_dialect.mysql import is_single_precision_float
+from dsql_migrator.core.source_dialect.mysql import (  # noqa: F401
+    is_single_precision_float,
+    mysql_base_type,
+)
 from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
 from dsql_migrator.core.validator_postgres import PgSourceConnection
 from dsql_migrator.core.watermark import COMMIT, read_binlog_status_row
@@ -176,6 +180,8 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     stale_numeric_render_scales,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class _SourceConnection(Protocol):
     """Minimal SQLAlchemy-style source connection used by the read helpers."""
@@ -223,14 +229,23 @@ def _source_count(connection: _SourceConnection, table_name: str) -> int:
 class PagedReadError(RuntimeError):
     """A keyset-paged read that cannot be trusted (G138): a page did not move past its
     cursor, or a side's pages did not read the rows ``COUNT(*)`` counts in the same
-    snapshot. Raised, so the table is graded "not compared" (its error), never a match."""
+    snapshot -- raised as soon as they read more (G140), so a cursor that goes back and
+    forth ends in bounded time. Raised, so the table is graded "not compared" (its error),
+    never a match -- except on a MySQL source, whose checksum is then read in one exact
+    statement instead (:func:`_source_checksum_composite_mysql`); ``reason`` (what went
+    wrong, without the advice for a failed table) says why in the log."""
+
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.reason = reason or message
 
 
 def _stalled(side: str) -> PagedReadError:
     return PagedReadError(
         f"A keyset page of the {side} did not move past the key it was read after, so "
         "the read would repeat that page forever: the database compares the primary key "
-        "differently from the read's cursor. The table is not compared."
+        "differently from the read's cursor. The table is not compared.",
+        reason="a full page did not move past the key it was read after",
     )
 
 
@@ -240,7 +255,18 @@ def _rows_disagree(side: str, paged: int, counted: int) -> PagedReadError:
         f"snapshot counts {counted:,}, so the {side} checksum cannot be trusted and the "
         "table is not compared. Re-run Validation once writes to this table have stopped; "
         "if it repeats, the source compares the primary key differently from the read's "
-        "cursor."
+        "cursor.",
+        reason=f"the pages read {paged:,} rows, COUNT(*) counts {counted:,}",
+    )
+
+
+def _rows_overrun(side: str, paged: int, counted: int) -> PagedReadError:
+    return PagedReadError(
+        f"The {side}'s keyset pages had read {paged:,} rows, more than the {counted:,} "
+        f"COUNT(*) counts in the same snapshot, so the read was stopped: the {side} compares "
+        "the primary key differently from the read's cursor, which read rows again. The "
+        "table is not compared.",
+        reason=f"the pages had read {paged:,} rows, more than the {counted:,} COUNT(*) counts",
     )
 
 
@@ -273,28 +299,50 @@ def _source_checksum(
     Accumulated over bounded keyset pages -- a single-column PK by
     :func:`_source_checksum_keyset`, a composite one by
     :func:`_source_checksum_composite_mysql` -- so a billion-row source is never summed in
-    one statement and the liveness heartbeat beats per page. A table with no primary key
-    keeps the single whole-table statement (MySQL has no per-statement transaction limit).
+    one statement and the liveness heartbeat beats per page. A table with no primary key,
+    or one with a key part whose cursor value the driver does not bind back as it read it
+    (:func:`_mysql_key_binds_exactly`), keeps the single whole-table statement (MySQL has
+    no per-statement transaction limit, and the statement is exact whatever the key).
     ``expected_rows`` is the live ``COUNT(*)`` of the same snapshot that a composite key's
     pages must add up to (``None``: counted here).
     """
     key = pk_paging_columns(table)
+    if not key or not _mysql_key_binds_exactly(table, key):
+        return _mysql_whole_table_checksum(connection, table)
     if len(key) == 1:
         return _source_checksum_keyset(
             connection, table, key[0], page_size, on_page=on_page
         )
-    if key:
-        return _source_checksum_composite_mysql(
-            connection, table, page_size, dialect or dialect_for(SourceType.MYSQL),
-            on_page=on_page, expected_rows=expected_rows,
-        )
-    return _mysql_whole_table_checksum(connection, table)
+    return _source_checksum_composite_mysql(
+        connection, table, page_size, dialect or dialect_for(SourceType.MYSQL),
+        on_page=on_page, expected_rows=expected_rows,
+    )
 
 
 def _mysql_whole_table_checksum(connection: _SourceConnection, table: TableDef) -> str:
     """The whole-table MySQL checksum in ONE statement (:func:`build_mysql_checksum_sql`)."""
     value = connection.execute(text(build_mysql_checksum_sql(table))).scalar()  # type: ignore[attr-defined]
     return "0" if value is None else str(value)
+
+
+# MySQL key column types whose cursor value does not name its row as the driver returns it
+# (G140): a single-precision FLOAT comes back rounded to 6 significant digits, a TIME as a
+# ``timedelta`` PyMySQL writes an hour early when it is negative and not whole hours, and a
+# BIT as bytes bound as a character string, which MySQL compares with the column as a
+# number. Paged on such a key, a page started before its cursor and read rows again (one
+# that loops forever measured, on a TIME key) -- so Validation checksums such a table in one
+# statement on the source, which is exact.
+_MYSQL_UNPAGED_KEY_TYPES = frozenset({"float", "time", "bit"})
+
+
+def _mysql_key_binds_exactly(table: TableDef, key: "Sequence[str]") -> bool:
+    """Is no part of ``key`` one of :data:`_MYSQL_UNPAGED_KEY_TYPES`, as Step 1 recorded
+    ``table``'s column types? Pure."""
+    recorded = {column.name.lower(): column.mysql_type for column in table.columns}
+    return not any(
+        mysql_base_type(recorded.get(column.lower())) in _MYSQL_UNPAGED_KEY_TYPES
+        for column in key
+    )
 
 
 # The source's own PRIMARY index, read once before a composite key's paged checksum (G138):
@@ -315,15 +363,12 @@ def _mysql_key_pages_in_order(connection: _SourceConnection, table: TableDef) ->
     """Can a MySQL source's composite key be paged in its own order? One catalog read.
 
     True only when the live PRIMARY index is the key Step 1 recorded, every part ascending
-    and whole, and no key column is a single-precision FLOAT (whose cursor value does not
-    name its row, see ``MySQLSourceDialect.keyset_after_sql``). Otherwise the checksum
-    keeps the single whole-table statement: MySQL has no transaction limit, and the
-    statement is exact whatever the key.
+    and whole. Otherwise the checksum keeps the single whole-table statement: MySQL has no
+    transaction limit, and the statement is exact whatever the key. (A key part whose
+    cursor value does not name its row -- FLOAT, TIME, BIT -- never reaches here, see
+    :func:`_mysql_key_binds_exactly`.)
     """
     key = [column.lower() for column in table.primary_key]
-    recorded = {column.name.lower(): column.mysql_type for column in table.columns}
-    if any(is_single_precision_float(recorded.get(column)) for column in key):
-        return False
     schema, separator, name = table.name.partition(".")
     if separator and schema and name:
         statement = _MYSQL_PRIMARY_INDEX_SQL.format(schema=":schema")
@@ -354,27 +399,36 @@ def _source_checksum_composite_mysql(
     is compared with the target's, which pages in ITS order: the per-row token is order-
     independent, so both add up to their whole-table checksums.
 
-    Fail closed: the pages must have read exactly the ``COUNT(*)`` of the same snapshot
-    (``expected_rows``, or counted here), else :class:`PagedReadError`; a stalled cursor
-    raises the same. A key that cannot be paged in its order (:func:`_mysql_key_pages_in_order`,
-    or the dialect cannot write a cursor for it) keeps the single whole-table statement.
+    The pages must read exactly the ``COUNT(*)`` of the same snapshot (``expected_rows``, or
+    counted here BEFORE the first page), and they stop as soon as they read more (G140), so
+    a cursor that goes back and forth ends in bounded time. A read that cannot be trusted
+    -- a stalled cursor, more or fewer rows than counted (:class:`PagedReadError`) -- falls
+    back to the single whole-table statement, which is exact (MySQL has no transaction
+    limit), and says so in the log. So does a key that cannot be paged in its order
+    (:func:`_mysql_key_pages_in_order`) or that the dialect cannot write a cursor for.
     """
     if not _mysql_key_pages_in_order(connection, table):
         return _mysql_whole_table_checksum(connection, table)
     try:
         members = dialect.keyset_key_members(connection, table)
-        total, rows = _mysql_composite_pages(
-            connection, table, page_size, dialect, members, on_page=on_page
+        if expected_rows is None:
+            expected_rows = _source_count(connection, table.name)
+        total = _mysql_composite_pages(
+            connection, table, page_size, dialect, members, on_page=on_page,
+            expected_rows=expected_rows,
         )
     except ExportError:
         # The dialect cannot write a cursor that keeps this key's order (an ENUM member it
         # cannot place, members it cannot read exactly, two members the source compares as
         # equal). The source has no transaction limit: one exact statement instead.
         return _mysql_whole_table_checksum(connection, table)
-    if expected_rows is None:
-        expected_rows = _source_count(connection, table.name)
-    if rows != expected_rows:
-        raise _rows_disagree("source", rows, expected_rows)
+    except PagedReadError as exc:
+        _LOGGER.warning(
+            "Validation: the source's keyset pages of %s cannot be trusted (%s); its "
+            "checksum is read in one statement instead.",
+            table.name, exc.reason,
+        )
+        return _mysql_whole_table_checksum(connection, table)
     return str(total)
 
 
@@ -385,8 +439,10 @@ def _mysql_composite_pages(
     dialect: SourceDialect,
     members: "Mapping[str, tuple[str, tuple[str, ...]]]",
     on_page: Optional[Callable[[], None]] = None,
-) -> tuple[int, int]:
-    """``(checksum, rows)`` of a MySQL table over its composite key, one page at a time.
+    *,
+    expected_rows: int,
+) -> int:
+    """The checksum of a MySQL table over its composite key, one page at a time.
 
     The order and the state machine are :func:`~dsql_migrator.core.exporter.keyset_stream`'s
     (a parity test pins them together): the first page has no cursor; a key the dialect
@@ -395,6 +451,12 @@ def _mysql_composite_pages(
     after a short page, ending after the last. Per page: the aggregate
     (:func:`build_mysql_composite_page_sql`), and only for a FULL page its last key
     (:func:`build_mysql_composite_boundary_sql`), both in the snapshot.
+
+    The pages must read exactly ``expected_rows`` (the snapshot's ``COUNT(*)``): a page that
+    takes them past it raises :class:`PagedReadError` at once (G140), so a cursor that
+    re-reads rows -- a cycle of pages longer than one, which the stall check cannot see --
+    ends after at most ``expected_rows / page_size + 1`` full pages; fewer at the end
+    raises too.
     """
     key = list(table.primary_key)
     walk = dialect.keyset_walk(table, members)
@@ -420,6 +482,8 @@ def _mysql_composite_pages(
         count = int(page[1] or 0) if page is not None else 0
         total += int(page[0] or 0) if page is not None else 0
         rows += count
+        if rows > expected_rows:
+            raise _rows_overrun("source", rows, expected_rows)
         exhausted = count < page_size
         boundary: Optional[tuple] = None
         if not exhausted:
@@ -430,7 +494,8 @@ def _mysql_composite_pages(
             if boundary is None:
                 raise PagedReadError(
                     "The last key of a full keyset page of the source could not be read, "
-                    "so the read cannot go on. The table is not compared."
+                    "so the read cannot go on. The table is not compared.",
+                    reason="the last key of a full page could not be read",
                 )
             if boundary == last:
                 raise _stalled("source")
@@ -438,23 +503,26 @@ def _mysql_composite_pages(
                 raise ExportError("a member's page holds another member's rows")
         if walk is None:
             if exhausted:
-                return total, rows
+                break
             last = boundary
             continue
         if member is None:
             if exhausted:
-                return total, rows
+                break
             if boundary[0] not in walk:  # type: ignore[index]
                 raise ExportError("a key value is not one of the members")
             member = walk.index(boundary[0])  # type: ignore[index]
         if exhausted:
             member += 1
             if member == len(walk):
-                return total, rows
+                break
             member_start = True
         else:
             member_start = False
             last = boundary
+    if rows != expected_rows:
+        raise _rows_disagree("source", rows, expected_rows)
+    return total
 
 
 def _source_checksum_keyset(
@@ -959,6 +1027,7 @@ def _composite_pages_pg(
     on_page: Optional[Callable[[], None]] = None,
     proof: Optional[_NullProofAccumulator] = None,
     side: str = "target",
+    expected_rows: Optional[int] = None,
 ) -> _PagedTotals:
     """Page a PostgreSQL / Aurora DSQL table by the composite ``key`` and add the pages up.
 
@@ -968,9 +1037,11 @@ def _composite_pages_pg(
     the Aurora DSQL target and, through the shim (``FROM ONLY`` for an inheritance parent),
     a PostgreSQL source. Stops on a short page; a full page whose last key equals its
     cursor raises :class:`PagedReadError` instead of reading it forever (``side`` names the
-    side in its message). ``nonnull_columns`` are summed per page (the NULL proof); with
-    ``proof`` a failed statement is recorded on it and the counts land there at the natural
-    end only.
+    side in its message), and so does a page that takes the rows read past
+    ``expected_rows`` (the source's ``COUNT(*)`` in the same snapshot, when given -- G140),
+    so a cursor that re-reads rows ends in bounded time. ``nonnull_columns`` are summed per
+    page (the NULL proof); with ``proof`` a failed statement is recorded on it and the
+    counts land there at the natural end only.
     """
     first_sql = build_pg_composite_page_sql(
         table, key, page_size, source_is_postgres,
@@ -1006,6 +1077,8 @@ def _composite_pages_pg(
             totals.rows += count
             for index, value in enumerate(row[2 + len(key):2 + len(key) + len(nonnull_columns)]):
                 totals.flags[index] += int(value or 0)
+        if expected_rows is not None and totals.rows > expected_rows:
+            raise _rows_overrun(side, totals.rows, expected_rows)
         if count < page_size:
             if proof is not None:
                 proof.add_counts(totals.flags)
@@ -1563,18 +1636,22 @@ def _source_checksum_for(
 
     A composite key is paged too, in the source's own key order (G138), and its pages must
     add up to the source's ``COUNT(*)`` in the same snapshot: ``expected_rows`` when the
-    caller read it live, else counted here (one statement), else :class:`PagedReadError`.
+    caller read it live, else counted here before the first page (one statement); the
+    pages stop as soon as they read more (G140). A PostgreSQL source's table is then an
+    error (:class:`PagedReadError`); a MySQL source falls back to one exact statement
+    (:func:`_source_checksum_composite_mysql`).
     """
     if _source_is_postgres(dialect):
         source = _pg_source(connection, table, from_only)
         key = pk_paging_columns(table)
         if len(key) > 1:
+            if expected_rows is None:
+                expected_rows = _target_count(source, table.name)
             totals = _composite_pages_pg(
                 source, table, key, page_size, checksum=True,
                 source_is_postgres=True, on_page=on_page, side="source",
+                expected_rows=expected_rows,
             )
-            if expected_rows is None:
-                expected_rows = _target_count(source, table.name)
             if totals.rows != expected_rows:
                 raise _rows_disagree("source", totals.rows, expected_rows)
             return str(totals.checksum)
@@ -2827,15 +2904,17 @@ class Validator:
         Isolated per foreign key (G138): an FK whose parent table is not on Aurora DSQL
         (outside the migrated tables, or missing) cannot be counted and is reported as
         UNCHECKED, which leaves the data verdict alone; any other failure marks only this
-        table not matched with its error (``item`` comes back updated, its counts kept),
-        and the remaining keys -- and the run -- go on. A stop still stops the run.
+        table not matched, with every failed key in its ``orphan_check_error`` (``item``
+        comes back updated) -- kept apart from the comparison's ``error`` (G140), so its
+        counts and data verdicts stay visible -- and the remaining keys, and the run, go
+        on. A stop still stops the run.
         """
         findings: list[OrphanFinding] = []
         unchecked: list[UncheckedForeignKey] = []
         if not table.foreign_keys:
             return findings, unchecked, item
         page = self._page_or_stop(should_cancel)
-        failure: Optional[str] = None
+        failures: list[str] = []
         try:
             key = (
                 live_keys[table.name]
@@ -2847,8 +2926,8 @@ class Validator:
         except Exception as exc:  # noqa: BLE001 - this table's orphan check only
             return findings, unchecked, _with_orphan_failure(
                 item,
-                "The orphan check could not read the table's primary key on Aurora "
-                f"DSQL: {_safe_error_message(exc)}",
+                "the table's primary key on Aurora DSQL could not be read "
+                f"({_safe_error_message(exc)})",
             )
         for fk in table.foreign_keys:
             try:
@@ -2867,10 +2946,10 @@ class Validator:
                             referenced_table=fk.referenced_table,
                         )
                     )
-                elif failure is None:
-                    failure = (
-                        f"The orphan check of foreign key {fk.name} -> "
-                        f"{fk.referenced_table} could not run: {_safe_error_message(exc)}"
+                else:
+                    failures.append(
+                        f"foreign key {fk.name} -> {fk.referenced_table} "
+                        f"({_safe_error_message(exc)})"
                     )
                 continue
             if orphan_count > 0:
@@ -2882,8 +2961,8 @@ class Validator:
                         orphan_count=orphan_count,
                     )
                 )
-        if failure is not None:
-            item = _with_orphan_failure(item, failure)
+        if failures:
+            item = _with_orphan_failure(item, "; ".join(failures))
         return findings, unchecked, item
 
 
@@ -2916,11 +2995,12 @@ def _target_table_present(connection: Any, table_name: str) -> bool:
 def _with_orphan_failure(
     item: TableValidationResult, message: str
 ) -> TableValidationResult:
-    """``item`` marked not matched by its orphan check's failure (its counts kept); an
-    item that already errored keeps its own error."""
-    if item.error is not None:
-        return item
-    return item.model_copy(update={"matched": False, "error": message})
+    """``item`` marked not matched by its orphan check's failure, which is recorded in
+    ``orphan_check_error`` -- never in ``error`` (G140): the comparison finished, so its
+    counts, its row-count / CHECKSUM verdicts and its own error (if any) stay as they were,
+    and a real mismatch is still shown as one. ``message`` names what could not be counted
+    ("foreign key <fk> -> <parent> (<why>)", one per key, or the unreadable primary key)."""
+    return item.model_copy(update={"matched": False, "orphan_check_error": message})
 
 
 def format_binlog_coordinate(
@@ -3214,6 +3294,10 @@ def _render_table_line(item: TableValidationResult) -> str:
     proof = _proof_line(item)
     if proof:
         parts.append(proof)
+    if item.orphan_check_error:
+        # G140: the reason this table is not matched although its data may be (listed
+        # under the orphan check below).
+        parts.append("orphan check could not run")
     parts.append(f"[{verdict}]")
     line = ", ".join(parts)
 
@@ -3503,14 +3587,25 @@ def render_text_report(report: ValidationReport) -> str:
     lines.append("")
 
     unchecked = report.orphan_unchecked if report.orphan_check_performed else []
+    failed = (
+        [item for item in report.items if item.orphan_check_error]
+        if report.orphan_check_performed
+        else []
+    )
+    notes = []
+    if failed:
+        notes.append(f"could not run for {len(failed)} table(s), so they are not matched")
+    if unchecked:
+        notes.append(
+            f"{len(unchecked)} foreign key(s) not checked: their parent table is not "
+            "on Aurora DSQL"
+        )
     lines.append(
         f"Orphan check: {'performed' if report.orphan_check_performed else 'skipped'}"
-        + (
-            f" ({len(unchecked)} foreign key(s) not checked: their parent table is not "
-            "on Aurora DSQL)"
-            if unchecked
-            else ""
-        )
+        + (f" ({'; '.join(notes)})" if notes else "")
+    )
+    lines.extend(
+        f"- could not run: {item.table}: {item.orphan_check_error}" for item in failed
     )
     lines.extend(
         f"- not checked: {fk.table}.{fk.foreign_key} -> {fk.referenced_table}"

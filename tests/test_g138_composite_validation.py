@@ -726,18 +726,26 @@ def test_the_pager_and_the_full_load_reader_take_the_same_cursors(make, page) ->
     assert _my_pages(pager) == cursors
 
 
-def test_mysql_paged_rows_must_equal_the_live_count() -> None:
+def test_mysql_paged_rows_must_equal_the_live_count(caplog) -> None:
     table = _order_items(12)
+    whole = str(sum(_tok(r) for r in table.rows))
     double = MySqlDouble(table)
-    with pytest.raises(PagedReadError, match="read 12 rows, but COUNT\\(\\*\\) .* counts 13"):
-        v._source_checksum(double, table.tabledef(), 5, dialect=_MY, expected_rows=13)
+    # G140: pages that miss the live count are not trusted; on MySQL the checksum falls
+    # back to the one exact statement, and the log says why.
+    with caplog.at_level("WARNING", logger="dsql_migrator.core.validator"):
+        assert v._source_checksum(double, table.tabledef(), 5, dialect=_MY,
+                                  expected_rows=13) == whole
+    assert _whole_table_sums(double) == 1
+    assert "the pages read 12 rows, COUNT(*) counts 13" in caplog.text
     assert v._source_checksum(double, table.tabledef(), 5, dialect=_MY, expected_rows=12)
     counted = MySqlDouble(table)  # no live count from the caller: the pager counts itself
     v._source_checksum(counted, table.tabledef(), 5, dialect=_MY)
-    assert any(sql.startswith("SELECT COUNT(*)") for sql, _ in counted.executed)
+    statements = [sql for sql, _ in counted.executed]
+    first_page = next(i for i, sql in enumerate(statements) if "SUM(ck_tok)" in sql)
+    assert any(sql.startswith("SELECT COUNT(*)") for sql in statements[:first_page])
 
 
-def test_a_disagreeing_source_count_grades_the_table_not_compared() -> None:
+def test_a_disagreeing_source_count_falls_back_and_keeps_the_count_verdict() -> None:
     table = _order_items(12)
 
     class _Overcounts(MySqlDouble):
@@ -751,8 +759,9 @@ def test_a_disagreeing_source_count_grades_the_table_not_compared() -> None:
         _SOURCE, _TARGET, [table.tabledef()], ValidationMode.CHECKSUM
     )
     item = report.items[0]
-    assert item.matched is False
-    assert "keyset pages read 12 rows, but COUNT(*) in the same snapshot counts 13" in item.error
+    # G140: the whole-table checksum stands in for the pages; the count stays COUNT(*)'s.
+    assert item.error is None and item.checksum_match is True
+    assert (item.source_row_count, item.target_row_count, item.matched) == (13, 12, False)
 
 
 @pytest.mark.parametrize(
@@ -1083,8 +1092,10 @@ def test_a_failing_orphan_check_marks_only_its_table(workers) -> None:
     items = {i.table: i for i in report.items}
     marked = items["app.order_items"]
     assert marked.matched is False and marked.source_row_count == 23 == marked.target_row_count
-    assert marked.error == ("The orphan check of foreign key fk_order -> app.orders could not "
-                            "run: _SqlState: data corrupted")
+    # G140: kept apart from the comparison's error, whose verdicts stay as they were.
+    assert marked.error is None and marked.row_count_match is True
+    assert marked.orphan_check_error == (
+        "foreign key fk_order -> app.orders (_SqlState: data corrupted)")
     assert items["app.tickets"].matched is True and report.is_match is False
 
 

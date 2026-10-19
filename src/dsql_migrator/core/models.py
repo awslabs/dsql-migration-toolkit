@@ -2010,10 +2010,10 @@ class TableValidationResult(BaseModel):
 
     ``matched`` is the table-level verdict and is ``True`` only when the row
     counts are equal, (in :attr:`ValidationMode.CHECKSUM` mode) the checksums are
-    equal, the full PK reconciliation (when run) found no missing/extra rows, and
-    the table did not error. This makes a reported match sound: a ``True`` here
-    never hides an unequal row count/checksum, a divergent record, or a table
-    that could not be compared (Property 9).
+    equal, the full PK reconciliation (when run) found no missing/extra rows, the
+    table did not error, and its orphan check (when requested) could run. This makes
+    a reported match sound: a ``True`` here never hides an unequal row count/checksum,
+    a divergent record, or a table that could not be compared (Property 9).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -2063,6 +2063,12 @@ class TableValidationResult(BaseModel):
     # absent on the target, or a query errored), so one bad table is isolated and
     # reported instead of aborting the whole validation run. None on success.
     error: Optional[str] = None
+    # Why the orphan check of this table's foreign key(s) could not run (G140): the table is
+    # not matched while it is set, but the comparison itself finished, so this is kept apart
+    # from ``error`` -- the counts and the row-count / CHECKSUM verdicts above stay true and
+    # visible. Left OUT of the payload while unset, so a report still loads on an older
+    # build: this model is extra="forbid".
+    orphan_check_error: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
     # True when the fast sweep (deep-check only on count mismatch) verified this
     # table by ROW COUNT alone and skipped the checksum/reconciliation because the
     # counts agreed. Lets the UI label it "verified by count" honestly -- distinct
@@ -2121,6 +2127,9 @@ class TableValidationResult(BaseModel):
             and self.deficit == self.rows_quarantined
             # Values in an excluded column are not explained by dropped rows.
             and not self.excluded_values_block
+            # Nor is an orphan check that could not run (G140): accepting the gap must not
+            # release a table whose orphans nobody counted.
+            and not self.orphan_check_error
         )
 
 

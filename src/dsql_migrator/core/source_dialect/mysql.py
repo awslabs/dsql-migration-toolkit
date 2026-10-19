@@ -137,13 +137,43 @@ def _unknown_member(column: str, kind: str) -> Exception:
     )
 
 
+def mysql_base_type(column_type: Optional[str]) -> str:
+    """The base type of ``column_type`` (as Step 1 recorded ``COLUMN_TYPE``), lower case:
+    ``"time"`` for ``time(6)``, ``"bit"`` for ``bit(1)``, ``"float"`` for ``float unsigned``;
+    ``""`` when there is none."""
+    if not column_type or not column_type.strip():
+        return ""
+    return column_type.strip().lower().split("(")[0].split()[0]
+
+
 def is_single_precision_float(column_type: Optional[str]) -> bool:
     """Is ``column_type`` (as Step 1 recorded ``COLUMN_TYPE``) a MySQL single-precision
     ``FLOAT`` -- ``float``, ``float(M,D)``, with or without ``unsigned``? ``DOUBLE`` /
     ``REAL`` are not: MySQL writes ``FLOAT(p)`` as one of the two when it is created."""
-    if not column_type or not column_type.strip():
-        return False
-    return column_type.strip().lower().split("(")[0].split()[0] == "float"
+    return mysql_base_type(column_type) == "float"
+
+
+def _cursor_value(column_type: Optional[str], value: object) -> object:
+    """A key value as the cursor binds it, so MySQL compares it with the stored one exactly.
+
+    The driver returns a TIME as a ``timedelta`` and a BIT as big-endian bytes, and binds
+    neither back as the value it read (G140): a negative TIME that is not whole hours went
+    out an hour early (PyMySQL writes ``timedelta(minutes=-30)`` as ``'-1:30:00'``), and a
+    BIT went out as a character string, which MySQL compares with the column as a number
+    (``'\\x01'`` is 0). Either way the next page started before the cursor, re-reading
+    rows, and could go back and forth forever. A TIME is bound as its ``[-]HH:MM:SS[.f]``
+    text, a BIT as the unsigned integer its bits hold; both compare exactly and keep the
+    primary key's range. Every other value is bound as the driver returned it.
+    """
+    from datetime import timedelta
+
+    if isinstance(value, timedelta):
+        from dsql_migrator.core.exporter import duration_text
+
+        return duration_text(value)
+    if mysql_base_type(column_type) == "bit" and isinstance(value, (bytes, bytearray)):
+        return int.from_bytes(bytes(value), byteorder="big")
+    return value
 
 
 def _unreadable_members(column: str, why: str, remedy: str) -> Exception:
@@ -334,24 +364,35 @@ class MySQLSourceDialect(SourceDialect):
         # cursor's member AND the disjunction over the rest of the key.
         primary_key = list(table.primary_key)  # type: ignore[attr-defined]
         # A single-precision FLOAT key column has no cursor value that names its row: the
-        # source returns the shortest decimal that rounds to the stored float (0.7 for
-        # 0.699999988), the driver binds that decimal, and the comparison runs in double
-        # precision. When the decimal lies above the stored value, ``f = :last`` matches
-        # nothing and ``f > :last`` skips the cursor's value, so the rest of its rows were
-        # never read, silently (measured: 10 of 20 rows read for (f FLOAT, n INT), no
-        # error). Refused for every such key column, before any page after the first.
+        # source returns it rounded to 6 significant digits (0.7 for 0.699999988), the
+        # driver binds that decimal, and the comparison runs in double precision. When the
+        # decimal lies above the stored value, ``f = :last`` matches nothing and ``f > :last``
+        # skips the cursor's value, so when ANOTHER key column follows, the rest of that
+        # value's rows were never read, silently (measured: 10 of 20 rows read for (f FLOAT,
+        # n INT), no error). Refused there, before any page after the first. As the last
+        # (or only) key column it reads as it did before G138 (G140): ``f > :last`` passes
+        # over no row but the floats that read back as the same decimal, which the target
+        # cannot hold apart anyway, and a cursor below the stored value re-reads its own
+        # row, which the reader refuses loudly. ``CAST(:last AS FLOAT)`` is no way out: it
+        # names only a value of 6 significant digits or fewer (MySQL 8.4: after
+        # (123.456787, 1) it matched none of the 3 rows that follow), and MySQL 5.7 and 8.0
+        # before 8.0.17 have no such CAST.
         recorded = {c.name.lower(): c.mysql_type for c in getattr(table, "columns", ())}
-        for column in primary_key:
+        for column in primary_key[:-1]:
             if is_single_precision_float(recorded.get(column.lower())):
                 raise _unreadable_members(
                     column,
-                    "is a single-precision FLOAT, which the source returns rounded to its "
-                    "shortest decimal: that value does not compare equal to the stored one",
+                    "is a single-precision FLOAT followed by another key column, which the "
+                    "source returns rounded to 6 significant digits: that value does not "
+                    "compare equal to the stored one",
                     "Change the column to DOUBLE or DECIMAL on the source, or give the table "
                     "another primary key, then retry this table.",
                 )
         names = keyset_param_names(len(primary_key))
-        params: dict[str, object] = dict(zip(names, last_key))
+        params: dict[str, object] = {
+            name: _cursor_value(recorded.get(column.lower()), value)
+            for name, column, value in zip(names, primary_key, last_key)
+        }
         walked = self.keyset_walk(table, members) is not None
         equal: list[str] = []
         terms: list[str] = []
@@ -548,7 +589,7 @@ class MySQLSourceDialect(SourceDialect):
         return None
 
 
-__all__ = ["MySQLSourceDialect", "is_single_precision_float"]
+__all__ = ["MySQLSourceDialect", "is_single_precision_float", "mysql_base_type"]
 
 
 # One scope part: a backtick-quoted name (spaces, dots and doubled backticks allowed)

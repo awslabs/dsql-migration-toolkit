@@ -134,11 +134,18 @@ index or bitmask, not by label:
   equal (for example under a case-insensitive collation), so that a page returns rows
   the read has already passed.
 
-A single-precision MySQL `FLOAT` key column stops the read of a table that needs more
-than one page: MySQL returns its value rounded to the shortest decimal, which does not
-compare equal to the stored float, so a cursor on it would pass the rest of that value's
-rows by, silently. Change the column to `DOUBLE` or `DECIMAL` on the source, or give the
-table another primary key, then retry the table.
+A single-precision MySQL `FLOAT` key column **followed by another key column** stops the
+read of a table that needs more than one page: MySQL returns its value rounded to 6
+significant digits, which does not compare equal to the stored float, so a cursor on it
+would pass the rest of that value's rows by, silently. Change the column to `DOUBLE` or
+`DECIMAL` on the source, or give the table another primary key, then retry the table. As
+the last (or only) key column it is read as usual: two keys that differ only past their
+6th significant digit read back as the same value and cannot both be stored on Aurora
+DSQL (Validation shows the row-count difference), and when a page ends on a value MySQL
+returns below the stored one, the next page would read that row again, so the read stops
+the table instead. A `TIME` key column (negative values included) and a `BIT` key column
+are read in key order like any other: the cursor binds them as the duration text and the
+integer that MySQL compares exactly.
 
 **A primary key is required.** A table with no PK cannot be keyset-paginated and
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL

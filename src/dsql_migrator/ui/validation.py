@@ -1000,6 +1000,7 @@ def _proof_summary(report: ValidationReport) -> dict:
             blocking[item.table] = values
             if (
                 item.error is None
+                and not item.orphan_check_error
                 and item.row_count_match
                 and item.checksum_match is not False
                 and (item.reconcile is None or item.reconcile.consistent)
@@ -7212,7 +7213,9 @@ def _render_result(
     # (its values are unproven) and every re-check is forced back to CHECKSUM -- which, for
     # a table whose error persists (the error says why), fails the same way every time.
     # Name the exit instead of leaving a loop: leave the table out, then acknowledge it on
-    # Cut over. The re-check stays offered (a transient error can clear on retry).
+    # Cut over. The re-check stays offered (a transient error can clear on retry). A failed
+    # orphan check is not this case (G140): its comparison finished, so its CHECKSUM verdict
+    # stands, and Orphan records says what to fix.
     if cdc_gate is not None:
         _by_name = {item.table: item for item in report.items}
         _unfinished = [
@@ -9439,6 +9442,11 @@ def _validation_table_facts(item: TableValidationResult) -> str:
         lines.append(f"Could not be compared (error): {item.error}")
     if item.checksum_match is not None:
         lines.append(f"Checksum match: {item.checksum_match}")
+    if item.orphan_check_error:
+        lines.append(
+            f"Orphan check could not run (so the table is not matched): "
+            f"{item.orphan_check_error}"
+        )
     if item.deep_checks_skipped:
         lines.append(
             "Deep checks (checksum / reconciliation) were skipped (fast sweep, "
@@ -9558,6 +9566,12 @@ def _failure_reasons(item: TableValidationResult) -> list[str]:
         reasons.append(
             f"{reconcile.missing_on_target:,} record(s) missing on target, "
             f"{reconcile.extra_on_target:,} extra on target."
+        )
+    if item.orphan_check_error:
+        # G140: beside the comparison's own reasons above, never instead of them.
+        reasons.append(
+            f"The orphan check could not run: {item.orphan_check_error}. Its orphan rows "
+            "were not counted, so the table is not matched (see Orphan records)."
         )
     if not reasons:
         reasons.append("Did not match.")
@@ -9867,6 +9881,23 @@ def _render_orphans(ui: object, report: ValidationReport) -> None:
     if not report.orphan_check_performed:
         return
     with _section(ui, icon="link_off", title="Orphan records"):
+        failed = [item for item in report.items if item.orphan_check_error]
+        if failed:
+            # G140: the check itself failed, so these tables are not matched (blocking);
+            # their comparison's counts and verdicts stay in the per-table results.
+            render_notice(
+                ui,
+                tone="error",
+                header=f"The orphan check could not run for {len(failed)} table(s)",
+                body=(
+                    "; ".join(f"{item.table}: {item.orphan_check_error}" for item in failed[:5])
+                    + (f" and {len(failed) - 5} more" if len(failed) > 5 else "")
+                    + ". Their orphan rows were not counted, so those tables are not matched "
+                    "until the check runs: fix what the error names on Aurora DSQL and "
+                    "re-check the table, or turn off Check for orphan records and re-run "
+                    "Validation. Each table's own comparison is in Per-table results."
+                ),
+            )
         unchecked = list(report.orphan_unchecked)
         if unchecked:
             # Not a verdict (it changes no match): there is no parent to count against.
@@ -9889,7 +9920,7 @@ def _render_orphans(ui: object, report: ValidationReport) -> None:
         if not report.orphan_findings:
             ui.label(  # type: ignore[attr-defined]
                 "No orphan records found in the foreign keys that were checked."
-                if unchecked
+                if unchecked or failed
                 else "No orphan records found."
             ).classes("text-sm text-gray-500")
             return
