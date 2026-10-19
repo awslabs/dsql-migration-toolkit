@@ -19,6 +19,7 @@ layer (``connect.py``) maps each browser session to one
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from dsql_migrator.config import SecretValue
@@ -62,6 +63,7 @@ class SessionConnectionState:
         "ai_conversation",
         "aws_profile",
         "active_view",
+        "active_view_since",
         "_migration_type",
         "_migration_type_chosen",
         "_cdc_infra_inputs",
@@ -145,6 +147,9 @@ class SessionConnectionState:
         # WorkflowStep value), so a browser refresh restores the same location
         # instead of resetting to the Connect screen. In-memory per session.
         self.active_view: Optional[str] = None
+        # When the user moved to that view (UTC; None before any move): Cut over takes a
+        # fresh read of the foreign keys each time it is opened (G142). Never persisted.
+        self.active_view_since: Optional[datetime] = None
         # The migration pattern the user chose on the Data Migration step
         # (Full load / CDC / Full+CDC). Promoted to the session (was previously
         # only on DataMigrationState) so it is chosen ONCE, early, right after
@@ -311,7 +316,10 @@ class SessionConnectionState:
         self.workflow = workflow
 
     def set_active_view(self, view: Optional[str]) -> None:
-        """Record the workflow view the user is on (for refresh restoration)."""
+        """Record the workflow view the user is on (for refresh restoration), and when
+        they moved to it (re-selecting the same view keeps the time)."""
+        if view != self.active_view:
+            self.active_view_since = datetime.now(timezone.utc)
         self.active_view = view
 
     @property
@@ -464,6 +472,7 @@ class SessionConnectionState:
         self.ai_conversation.reset()
         self.aws_profile = None
         self.active_view = None
+        self.active_view_since = None
         self._migration_type = "full_load_only"
         self._migration_type_chosen = False
         self._cdc_infra_inputs = {}

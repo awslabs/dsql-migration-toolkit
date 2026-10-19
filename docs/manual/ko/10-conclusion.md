@@ -46,7 +46,8 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
    점검할 초대형 LOB·JSON 컬럼 등)을 결정하세요. *건너뛰지 마세요* — "적재가 영문도 모른 채 실패했다"를 "그 객체는 변경이 필요하다는 걸
    알고 있었다"로 바꿔 주는 단계입니다. 또한 캐스케이딩 외래 키가 CDC에 어떤 영향을 주는지도 여기서 알게
    됩니다: 캐스케이딩 외래 키는 바이너리 로그에 남지 않아 CDC가 복제하지 못하므로, 소스가 캐스케이드한
-   행이 타깃에 고아로 남아 cut over 시점의 외래 키 적용을 차단할 수 있습니다(Validation의 고아 검사가 잡아냄).
+   행이 타깃에 고아로 남으면 cut over 시점에 그 외래 키에 대한 Aurora DSQL의 검증이 실패하고, 고칠 때까지
+   cut over를 붙잡습니다(Validation의 고아 검사도 이를 보고함).
 3. **Schema Conversion** — 소스 vs 변환 DDL을 검토하고 DSQL에 적용.
 4. **Data Migration** — 리포트로 상황을 파악한 뒤 마이그레이션 타입(**Full Load만**, **CDC only**, 또는 **Full Load + CDC**)을
    선택합니다. 사전 점검을 실행하고 나면 **Full Load**가 행을 벌크 복사하고 워터마크를
@@ -79,7 +80,7 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
 
 1. **소스 쓰기 동결** — 애플리케이션을 점검/읽기 전용 모드로 두어 MySQL에 새 행이 쓰이지 않게 합니다.
    (도구는 소스를 읽기 전용으로 유지하며, 쓰기를 멈춰야 하는 건 *애플리케이션*입니다.)
-2. **스냅샷 이후 소스에 쓰기가 있었다면 "Drop & reload"로 Full Load 재실행** — 기본값 *Append*는 빠진 행만 채우고 그 뒤의 UPDATE/DELETE는 적용하지 않습니다 — 그다음 CHECKSUM으로 검증.
+2. **스냅샷 이후 소스에 쓰기가 있었다면 "Drop & reload"로 Full Load 재실행** — 기본값 *Append*는 빠진 행만 채우고 그 뒤의 UPDATE/DELETE는 적용하지 않습니다 — 그다음 CHECKSUM으로 검증. 다시 적재하면 테이블의 외래 키도 함께 사라지므로, Data Migration 단계(또는 Cut over)에서 **Apply foreign keys**를 다시 클릭하세요 — 각 키가 바로 추가되어 모든 신규 쓰기를 강제하고, 이미 적재된 행은 Aurora DSQL이 백그라운드에서 검증합니다.
 3. **Validation** — 깨끗한 **MATCH** 확인(go/no-go 게이트). PostgreSQL 소스라면 어떤 컬럼도 소유하지
    않는 시퀀스(Evaluation의 `PG_STANDALONE_SEQUENCE`)는 이제 직접 소스의 최종 값 다음으로 옮겨야 합니다:
    Cut over 단계가 *Before you repoint: move standalone sequences past the source* 아래에 각각을, 소스에서
@@ -117,7 +118,21 @@ CDC는 실제로 움직이는 구성 요소(MSK, MSK Connect, 싱크 커넥터)�
    읽습니다([§5.6](05-validation.md#56-재키잉된-postgresql-테이블과-컷오버) 참고). Cut over는 열리기 전에
    소스에서 캡처 중인 테이블의 정의도 다시 읽습니다([§5.7](05-validation.md#57-소스-스키마-변경과-컷오버)
    참고).
-5. **애플리케이션을 DSQL 엔드포인트로 전환** + 스모크 테스트.
+5. **외래 키를 적용한 뒤 애플리케이션을 DSQL 엔드포인트로 전환** + 스모크 테스트. Cut over에서 드레인
+   확인 체크박스를 선택하고 **Apply foreign keys**를 클릭합니다: 각 키가 바로(`NOT VALID`, 몇 초) 추가되어
+   그때부터 모든 신규 쓰기를 강제하고, 이미 적재된 행은 Aurora DSQL이 백그라운드에서 검증하며, 이 단계는
+   검증된 키 수와 실패한 키의 상세·키를 깨는 행·**Validate again**을 보여 줍니다. **I've cut over**는
+   그 검사가 아니라 키가 자리를 잡을 때까지만 기다립니다 — 다만 MySQL 소스에서 `ON DELETE` / `ON UPDATE`
+   동작이 있는 키나 MySQL이 더 느슨하게 맞추는 텍스트 컬럼의 키(대소문자를 구분하지 않는 collation, 또는
+   `VARCHAR`의 `utf8mb4_bin` 같은 PAD SPACE collation)처럼 CDC가 고아를 남길 수 있는 키는, 검증될
+   때까지 또는 그 검사 없이 cut over하기로 선택할 때까지 Finish가 기다립니다. Finish는 **Apply foreign
+   keys**가 추가하는 키만 정확히 기다립니다: 마이그레이션에 포함되지 않은 테이블이 Aurora DSQL에 없으면 그
+   테이블의 키는 추가할 것이 없으므로 기다리지 않습니다. Finish는 마지막 검증 이후에 읽은 키 상태만 믿고,
+   CDC를 시작하거나 다시 시작하면 마지막 적용 결과가 지워지며(스트림에는 키가 없어야 함) Start CDC의
+   **Remove foreign keys**도 그 뒤 CDC를 시작하지 않더라도 마찬가지이므로, 최종 드레인 뒤에 다시
+   적용하세요. 자리를 잡지 않은 키와 검증되지 않은 키는 서로 다른 두 보류이고 각각 따로 선택합니다: 강제되는
+   외래 키 없이 cut over하기로 한 선택이 자리를 잡은 키의 검증 검사까지 면제하지는 않습니다(그 반대도
+   마찬가지입니다).
 6. **CDC 파이프라인은 맨 마지막에 제거** — **Start over(우상단)** → *Delete all CDC
    infrastructure* 를 클릭합니다. 복제를 끝내고 MSK / MSK Connect / NAT 비용을 중단하며, 기존 스택을
    정리합니다(나중에 새 Full Load나 CDC를 배포하려면 먼저 제거되어 있어야 하기 때문입니다).

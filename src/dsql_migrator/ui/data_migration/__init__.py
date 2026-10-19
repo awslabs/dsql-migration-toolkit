@@ -173,6 +173,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     run_data_migration,
     job_status_to_step_status,
     data_migration_step_after_cdc,
+    foreign_keys_counted_before_add,
     foreign_keys_in_scope,
     foreign_keys_pointing_in,
     full_load_phase_status,
@@ -974,9 +975,10 @@ def build_data_migration_screen(
         # table, and DSQL drops its foreign keys with it). Clearing makes the step fall back
         # to "N foreign key(s) not yet applied" with the action offered -- true and
         # actionable. NOT done inside clear_outputs(): its other caller is the read-only
-        # prerequisite check, which must not touch foreign-key state.
-        migration_state.set_fk_apply_result(None)
-        migration_state.set_fk_apply_progress(0, 0)
+        # prerequisite check, which must not touch foreign-key state. G142: Aurora DSQL's
+        # validation record of those keys and Cut over's own result go too, so an old
+        # settled read can never open Finish over keys this run drops.
+        migration_state.forget_applied_foreign_keys()
         # A NEW run is a NEW decision, so the previous run's accepted gap does not carry
         # into it. It used to: the flag was read at run time, so an operator who accepted a
         # 3-row gap and then pressed "Re-run Full Load" got a run that finished green with
@@ -1553,8 +1555,9 @@ def build_data_migration_screen(
                             "but not the cascaded child change, leaving orphaned rows "
                             "on the target during replication. The tool re-creates "
                             "these foreign keys on Aurora DSQL only at cut over (never "
-                            "during replication), so any such orphan will then BLOCK "
-                            "the ADD CONSTRAINT and be reported by the Validation "
+                            "during replication), so any such orphan then fails Aurora "
+                            "DSQL's validation of that key, which holds the cut over "
+                            "until it is fixed, and is reported by the Validation "
                             "orphan-record check. Replace the automatic actions with "
                             "explicit child-row statements in your application before "
                             "starting CDC, and quiesce source writes before the final "
@@ -2215,8 +2218,8 @@ def build_data_migration_screen(
                     # the card went on claiming referential integrity was in place. An
                     # append-only retry does NOT invalidate it (the constraints survive and
                     # would reject a violating row), so this is scoped to replacements.
-                    migration_state.set_fk_apply_result(None)
-                    migration_state.set_fk_apply_progress(0, 0)
+                    # G142: with Aurora DSQL's validation record and Cut over's result.
+                    migration_state.forget_applied_foreign_keys()
                 _retry_conversion = SchemaConverter(
                     source_type=source_config.source_type
                 ).convert(inventory)
@@ -2519,7 +2522,7 @@ def build_data_migration_screen(
                 # target inventory must not hide pending keys.
                 _fk_tables = getattr(migration_state.selection, "selected_tables", None)
                 _fk_scoped = foreign_keys_in_scope(_applied_conv, _fk_tables)
-                return DataMigrationInputs(
+                _fk_inputs = DataMigrationInputs(
                     source_config=_src,
                     source_password=session.source_password,
                     target_config=_tgt,
@@ -2543,6 +2546,14 @@ def build_data_migration_screen(
                         preserve_foreign_keys=conv_state.preserve_foreign_keys,
                     ),
                 )
+                # G142: the keys whose parent side is incomplete by design keep the orphan
+                # count before their ADD; every other key is added at once.
+                return dataclasses.replace(
+                    _fk_inputs,
+                    fk_counted_before_add=foreign_keys_counted_before_add(
+                        _fk_scoped, _fk_tables, _fk_inputs.excluded_lob_columns
+                    ),
+                )
 
             def fk_pending_count() -> int:
                 """This run's TOTAL preserved-foreign-key count (static; no DB access).
@@ -2557,18 +2568,25 @@ def build_data_migration_screen(
                 """
                 # Recomputed only when what it is derived from changes (the inventory is
                 # compared by identity: a re-read is a new object).
+                _absent = migration_state.fk_absent_children()
                 _key = (
                     session_source_type(session),
                     conv_state.preserve_foreign_keys,
                     tuple(sorted((conv_state.edited_target_ddls or {}).items())),
                     tuple(getattr(migration_state.selection, "selected_tables", None) or ()),
                     migration_state.migration_type,
+                    # The children the last pass left out as absent: the pass's and Cut
+                    # over's own key set (foreign_keys_to_apply), so a clean pass leaves
+                    # nothing "NOT reached".
+                    tuple(sorted(_absent)),
                 )
                 _inv = _inventory()
                 if _fk_count_memo.get("inventory") is _inv and _fk_count_memo.get("key") == _key:
                     return _fk_count_memo["count"]
                 try:
-                    count = pending_foreign_key_count(migrator_factory(_fk_apply_inputs()))
+                    count = pending_foreign_key_count(
+                        migrator_factory(_fk_apply_inputs()), absent=_absent
+                    )
                 except Exception:  # noqa: BLE001 - advisory count; never break the panel
                     return 0
                 _fk_count_memo.update(inventory=_inv, key=_key, count=count)
@@ -2586,23 +2604,74 @@ def build_data_migration_screen(
                     job_manager.request_cancel(jid)
                 refresh()
 
+            def _fk_target_connect():
+                """A fresh-DSQL-connection factory for the FK validation watch, or None."""
+                if getattr(session, "target_config", None) is None:
+                    return None
+                return DsqlConnector(
+                    session.target_config, aws_profile=session.aws_profile
+                ).connect
+
+            def _fk_defs():
+                """The FK metadata the watch explains a failure with (resolved in its job)."""
+                from dsql_migrator.ui.data_migration._fk_validation import foreign_key_defs
+
+                return foreign_key_defs(_fk_apply_inputs().table_conversions)
+
+            def watch_foreign_key_validation(force: bool = False) -> None:
+                """Start the background read of Aurora DSQL's verdict when one is due (a
+                render: something is still unread or being validated) or right after a pass
+                (``force``). Single flight; no I/O here."""
+                from dsql_migrator.ui.data_migration._fk_validation import (
+                    fk_watch_due,
+                    start_fk_validation_watch,
+                )
+
+                if not force and not fk_watch_due(
+                    migration_state, migration_state.fk_validation_view(), job_manager
+                ):
+                    return
+                start_fk_validation_watch(
+                    migration_state, job_manager, connection_factory=_fk_target_connect(),
+                    fk_defs=_fk_defs, category=ActivityCategory.FULL_LOAD, refresh=refresh,
+                )
+
+            def _fk_revalidating() -> bool:
+                """Is a "Validate again" submission still running?"""
+                from dsql_migrator.ui.data_migration._fk_validation import _job_live
+
+                return _job_live(job_manager, migration_state.fk_revalidation_job_id)
+
+            def validate_foreign_keys_again(keys) -> None:
+                """"Validate again": Aurora DSQL checks the keys' rows anew (no DDL, no
+                drained attestation: every key in place already enforces new writes)."""
+                from dsql_migrator.ui.data_migration._fk_validation import (
+                    submit_fk_revalidation,
+                )
+
+                submit_fk_revalidation(
+                    migration_state, job_manager, connection_factory=_fk_target_connect(),
+                    keys=list(keys), fk_defs=_fk_defs,
+                    category=ActivityCategory.FULL_LOAD, refresh=refresh,
+                )
+                refresh()
+
             def apply_foreign_keys_now() -> None:
                 """Apply the preserved foreign keys -- an explicit operator action.
 
-                Foreign keys are no longer applied as part of the load: the orphan
-                pre-check is O(child rows) and measured 28.0 min (serial) / 7.9 min
-                (8-way) for 15 FKs over 15.5M child rows, all of it AFTER every row was
-                already written. Running it behind a button reports the load as finished
-                when it is finished, and makes the Full-Load-only path use the same flow
-                a CDC migration already uses at cut over.
-
-                The orphan pre-check itself is unchanged -- it cannot be skipped, because a
-                failed `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` is unobservable on DSQL.
+                Foreign keys are not applied as part of the load: this is the same flow a
+                CDC migration uses at cut over. G142: each key is added ``NOT VALID`` at
+                once (seconds; it enforces every new write from then on) and Aurora DSQL
+                validates the rows already loaded as an async job, whose id is recorded on
+                the session and read back by the background watch -- a failed validation
+                IS observable (sys.jobs, convalidated), and only then are its rows counted.
                 """
                 fk_inputs = _fk_apply_inputs()
                 fk_migrator = migrator_factory(fk_inputs)
 
-                total = pending_foreign_key_count(fk_migrator)
+                total = pending_foreign_key_count(
+                    fk_migrator, absent=migration_state.fk_absent_children()
+                )
                 # CLEAR THE PREVIOUS RESULT, and do it BEFORE submitting. _fk_apply_running()
                 # returns False while a result exists, so a RESUMED pass (now reachable: the
                 # card keeps the action when a stopped pass left foreign keys unreached) would
@@ -2631,8 +2700,17 @@ def build_data_migration_screen(
                     result = _apply_foreign_keys_for(
                         fk_migrator, handle,
                         on_progress=migration_state.set_fk_apply_progress,
+                        # G142: the recorded VALIDATE jobs in (a running one is kept), the
+                        # submitted ones out, then the watch reads Aurora DSQL's verdict.
+                        validation_jobs={
+                            key: rec.job_id
+                            for key, rec in migration_state.fk_validation_records().items()
+                            if rec.job_id
+                        },
+                        on_validation=migration_state.record_fk_validation,
                     )
                     migration_state.set_fk_apply_result(result)
+                    watch_foreign_key_validation(force=True)
 
                 # Its OWN slot. Writing `migration_state.job_id` here (copied from the
                 # retry path, where the new job IS the load) made the Full Load panel read
@@ -2642,8 +2720,9 @@ def build_data_migration_screen(
                 # the operator to run.
                 migration_state.set_fk_apply_job(job_manager.submit(work))
                 ui.notify(
-                    f"Applying {total} foreign key(s) — progress below. Each one is "
-                    "orphan-checked first, which reads the whole child table.",
+                    f"Adding {total} foreign key(s) — progress below. Each one is added at "
+                    "once and enforces every new write; Aurora DSQL then validates the rows "
+                    "already loaded in the background.",
                     type="positive", position="top",
                 )
                 refresh()
@@ -3087,10 +3166,8 @@ def build_data_migration_screen(
                             exclusion_route=exclusion_route,
                             exclusion_route_block=quarantine_route_block(_exclusion_ctx),
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
-                            # Foreign keys are an explicit action now, not part of the
-                            # load: the orphan pre-check is O(child rows) and was holding
-                            # the END of the load for minutes. Same flow a CDC migration
-                            # already uses at cut over.
+                            # Foreign keys are an explicit action, not part of the load --
+                            # the same flow a CDC migration uses at cut over.
                             apply_foreign_keys=apply_foreign_keys_now,
                             # PROVIDERS, not values. The FK card is rendered inside the
                             # step's @ui.refreshable live region, so a value evaluated here
@@ -3106,6 +3183,12 @@ def build_data_migration_screen(
                             foreign_keys_running=_fk_apply_running,
                             foreign_keys_progress=lambda: migration_state.fk_apply_progress,
                             cancel_foreign_keys=cancel_foreign_keys,
+                            # G142: Aurora DSQL's verdict on the keys in place, read back
+                            # from the target by the recorded job ids.
+                            foreign_keys_validation=migration_state.fk_validation_view,
+                            validate_foreign_keys_again=validate_foreign_keys_again,
+                            foreign_keys_revalidating=_fk_revalidating,
+                            watch_foreign_keys=watch_foreign_key_validation,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
                             ai_error_opener=ai_error_opener,

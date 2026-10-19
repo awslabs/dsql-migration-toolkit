@@ -1516,16 +1516,26 @@ def validate_foreign_key(
     occ_base_delay: float = DEFAULT_BASE_DELAY_SECONDS,
     sleep: SleepFunc = time.sleep,
     jitter: JitterFunc = random.random,
-) -> None:
-    """Validate a ``NOT VALID`` foreign key against existing rows (async DDL).
+) -> Optional[str]:
+    """Submit Aurora DSQL's validation of a ``NOT VALID`` foreign key; return its job id.
 
     The counterpart to :func:`apply_foreign_key`: on Aurora DSQL an ``ADD CONSTRAINT``
     must be ``NOT VALID`` (enforces new writes without scanning existing data), so
-    ``ALTER TABLE ASYNC <t> VALIDATE CONSTRAINT <name>`` then marks the constraint
-    validated for the already-loaded rows. It runs as an async DDL job (returns
-    immediately). Callers run it best-effort after their orphan pre-gate is clean, so
-    it is expected to succeed; if it does not, the constraint still enforces every new
-    write. Identifiers are composed injection-safely.
+    ``ALTER TABLE ASYNC <t> VALIDATE CONSTRAINT <name>`` then checks the rows already in
+    the table, as an asynchronous job. The statement returns at once with ONE row, the
+    job's ``job_id`` (live-verified, G142), which is returned here: the verdict is Aurora
+    DSQL's, read back by that id from ``sys.jobs`` (``VALIDATE_CONSTRAINT``,
+    ``submitted`` / ``processing`` / ``completed`` / ``failed`` with its ``details``),
+    and ``pg_constraint.convalidated`` turns true only once the job succeeded. A job that
+    fails is not an error here: the statement still returns its id, and the constraint
+    stays ``NOT VALID`` and keeps enforcing every new write.
+
+    ``None`` when the statement returns no row: the constraint is already validated
+    (Aurora DSQL creates no job then), or the server validated it synchronously
+    (PostgreSQL). A 40001 runs it again (nothing was submitted); a dropped connection or
+    an XX000 runs it again on a new connection, which can submit a second job for the
+    same constraint (Aurora DSQL does not de-duplicate them; both reach the same
+    verdict). Identifiers are composed injection-safely.
     """
     from dsql_migrator.core.validation_sql import _pg_table_identifier
 
@@ -1533,14 +1543,33 @@ def validate_foreign_key(
         tbl=_pg_table_identifier(table_name),
         name=sql.Identifier(constraint_name),
     )
-    _run_ddls_reconnecting(
+
+    def _body(_connection, _run_one, retry_read) -> Optional[str]:
+        return retry_read(lambda connection: _submit_returning_job_id(connection, ddl))
+
+    return _run_unit_reconnecting(
         connection_factory,
-        [ddl],
+        _body,
         occ_max_attempts=occ_max_attempts,
         occ_base_delay=occ_base_delay,
         sleep=sleep,
         jitter=jitter,
     )
+
+
+def _submit_returning_job_id(connection: Any, statement: object) -> Optional[str]:
+    """Run one async DDL on its own cursor and return the job id it answers with, if any."""
+    cursor = connection.cursor()
+    try:
+        cursor.execute(statement)
+        if getattr(cursor, "description", None) is None:
+            return None
+        row = cursor.fetchone()
+    finally:
+        _safe_close(cursor)
+    if not row or row[0] is None:
+        return None
+    return str(row[0])
 
 
 def drop_foreign_key(

@@ -17,11 +17,11 @@ and produces a :class:`~dsql_migrator.core.models.ValidationReport`
   them in ``checksum_excluded_columns`` so a match is not read as "every column verified".
 - Optional orphan-record check (Requirement 6.3): Aurora DSQL now enforces foreign
   keys, and the tool re-creates them through the explicit "Apply foreign keys" action
-  after the load (at cut over for a CDC migration) -- not automatically. This check is
-  the PRE-APPLY GATE for that step -- an enforced
-  ``ADD CONSTRAINT`` fails if any child row has no matching parent -- and the
-  integrity safety net when the user chose to strip foreign keys instead. It counts,
-  for each preserved foreign-key rule
+  after the load (at cut over for a CDC migration) -- not automatically. Each key is
+  added ``NOT VALID`` and Aurora DSQL then validates the rows already loaded (G142), so
+  this check is the EARLY WARNING for that validation -- a child row with no matching
+  parent fails it -- and the integrity safety net when the user chose to strip foreign
+  keys instead. It counts, for each preserved foreign-key rule
   (:class:`~dsql_migrator.core.models.ForeignKeyDef`), the child rows on the target
   whose (non-null) key has no matching parent row.
 - Validation report including mismatches (Requirement 6.4).
@@ -1940,6 +1940,7 @@ def target_orphan_count_composite(
     on_page: Optional[Callable[[], None]] = None,
     *,
     page_row: Optional[Callable[[Any, Optional[dict]], Any]] = None,
+    on_orphans: Optional[Callable[[Optional[tuple]], None]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages of a composite ``key`` (G138).
 
@@ -1950,7 +1951,8 @@ def target_orphan_count_composite(
     a full page whose last key equals its cursor raises :class:`PagedReadError`.
     ``page_row(statement, parameters)`` runs one page and returns its row in place of a
     cursor of ``connection``: the pre-check passes its replay, so a conflict re-reads
-    that page alone (G139).
+    that page alone (G139). ``on_orphans`` hears the cursor of the first page holding an
+    orphan (the key tuple as text, or ``None`` for the first page), once (G142).
     """
     first_sql = build_pg_composite_orphan_page_sql(child_table, fk, key, page_size, first=True)
     next_sql = build_pg_composite_orphan_page_sql(child_table, fk, key, page_size, first=False)
@@ -1969,6 +1971,7 @@ def target_orphan_count_composite(
     run_page = page_row if page_row is not None else _cursor_row
     total = 0
     last: Optional[tuple] = None
+    told = False
     while True:
         if on_page is not None:
             on_page()
@@ -1978,7 +1981,11 @@ def target_orphan_count_composite(
             row = run_page(next_sql, {f"last_{i}": value for i, value in enumerate(last)})
         if row is None:
             return total
-        total += int(row[0] or 0)
+        found = int(row[0] or 0)
+        total += found
+        if found and not told and on_orphans is not None:
+            told = True
+            on_orphans(last)
         if int(row[1] or 0) < page_size:
             return total
         boundary = tuple(row[2:2 + len(key)])

@@ -370,9 +370,10 @@ reference in [Chapter 2 §2.3](02-evaluation-and-schema-conversion.md#23-mysql--
 
 **Foreign keys are supported** — Aurora DSQL enforces them. The tool **preserves**
 each source FK and re-creates it on DSQL as a post-load `ALTER TABLE … ADD
-CONSTRAINT … FOREIGN KEY` (Full Load applies it after the data lands; for a **CDC**
-migration it is deferred to **cut over**, since the constraints must not exist while
-the sink streams rows out of order). You can instead **opt to strip** them and
+CONSTRAINT … FOREIGN KEY … NOT VALID` — added at once, then validated by Aurora DSQL
+against the rows already loaded, in the background (the **Apply foreign keys** action
+after a Full Load; for a **CDC** migration it is deferred to **cut over**, since the
+constraints must not exist while the sink streams rows out of order). You can instead **opt to strip** them and
 enforce referential integrity in the application layer. Runtime caveats to weigh:
 DML on related tables incurs **extra reads**, a concurrent conflict is a retryable
 `40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward DSQL's

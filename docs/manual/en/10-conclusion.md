@@ -53,8 +53,9 @@ replication; otherwise Full Load alone is simpler and cheaper.
    *Don't skip this* — it's what turns "the load failed mysteriously" into "I knew
    that object needed changing." It is also where you learn whether CDC is viable
    at all: a source cascade (`ON DELETE/UPDATE CASCADE`) never reaches the binary
-   log, so CDC can't replicate it — the orphaned child rows it leaves then block
-   the cut-over foreign-key apply (caught by the Validation orphan check).
+   log, so CDC can't replicate it — the orphaned child rows it leaves then fail
+   Aurora DSQL's validation of that foreign key at cut over, which holds the cut over
+   until they are fixed (and the Validation orphan check reports them).
 3. **Schema Conversion** — review the source-vs-converted DDL and apply it to DSQL.
 4. **Data Migration** — choose the migration type (**Full Load only**, **CDC only**, or
    **Full Load + CDC**) now that the report tells you what you are dealing with. Run the
@@ -99,7 +100,10 @@ freeze lasts the length of the load + validation.
    *your application* is what must stop writing.)
 2. **Re-run Full Load choosing "Drop & reload"** if the source took writes since the
    snapshot (the default *Append* only adds missing rows and applies no update or delete
-   made since), then validate with CHECKSUM.
+   made since), then validate with CHECKSUM. A reload drops a table's foreign keys with
+   it: click **Apply foreign keys** again on the Data Migration step (or on Cut over) —
+   each key is added at once and enforces every new write, and Aurora DSQL validates the
+   rows already loaded in the background.
 3. **Validation** — confirm a clean **MATCH** (the go/no-go gate). On a PostgreSQL
    source, a sequence no column owns (Evaluation's `PG_STANDALONE_SEQUENCE`) is then
    yours to move past the source's final value: the Cut over step lists each one under
@@ -143,7 +147,24 @@ freeze shrinks to just the final drain + smoke test.
    (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). Cut over
    also re-reads the captured tables' definitions on the source before it opens (see
    [§5.7](05-validation.md#57-source-schema-changes-and-cut-over)).
-5. **Repoint the application** to the DSQL endpoint and smoke-test.
+5. **Apply foreign keys, then repoint the application** to the DSQL endpoint and
+   smoke-test. Tick the drained attestation on Cut over and click **Apply foreign keys**:
+   each key is added at once (`NOT VALID`, seconds) and enforces every new write from
+   then on; Aurora DSQL then validates the rows already loaded in the background, and the
+   step shows how many keys it validated, with any failure's details, the rows that break
+   it and **Validate again**. **I've cut over** waits for the keys to be in place, not for
+   that check — except, for a MySQL source, a key with an `ON DELETE` / `ON UPDATE` action
+   or on a text column MySQL matches more loosely (a case-insensitive collation, or a PAD
+   SPACE one such as `utf8mb4_bin` on a `VARCHAR`), which CDC can leave orphans behind for:
+   Finish waits until those have validated, or until you choose to cut over without that
+   check. Finish waits for exactly the keys **Apply foreign keys** adds: a key of a table
+   outside the migration that is not on Aurora DSQL has nothing to add, so it is not waited
+   for. Finish trusts only a read of the keys taken after the latest validation, and a CDC
+   start or restart clears the last apply (the stream needs the keys gone), as does Start
+   CDC's **Remove foreign keys** even when CDC is then not started, so apply them again
+   after the final drain. Keys not in place and keys not validated are two holds, each
+   with its own choice: choosing to cut over without enforced keys does not also waive the
+   validation check of the keys in place, nor the other way round.
 6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** →
    *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK
    Connect / NAT cost, and clears the old stack (a future fresh Full Load or CDC

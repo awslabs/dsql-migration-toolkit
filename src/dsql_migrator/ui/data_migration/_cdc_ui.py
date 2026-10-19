@@ -7482,7 +7482,8 @@ async def _open_cdc_start_dialog(
                         remove_btn.disable()
                         remove_btn.set_text("Removing…")
                         dropped, failed = await run.io_bound(
-                            _drop_cdc_blocking_foreign_keys, fk_block.ours, session
+                            _drop_cdc_blocking_foreign_keys, fk_block.ours, session,
+                            migration_state,
                         )
                         if failed:
                             # Still blocked: an enforced FK that survived would make the
@@ -8482,14 +8483,19 @@ def _probe_cdc_blocking_foreign_keys(migration_state, session, inventory, waterm
     )
 
 
-def _drop_cdc_blocking_foreign_keys(pairs, session) -> tuple[int, int]:
+def _drop_cdc_blocking_foreign_keys(pairs, session, migration_state=None) -> tuple[int, int]:
     """Drop the given ``(table, constraint)`` FKs so CDC can stream. BLOCKING I/O.
 
     Only ever called with the ``ours`` half of :func:`cdc_blocking_foreign_keys` -- the
     constraints THIS migration's conversion renders, which cut over re-creates with the
     shared idempotent apply pass. Each drop is its own single autocommit DDL with OCC
     retry (DSQL allows one DDL per transaction) and is logged individually under the CDC
-    category, so the audit trail names every constraint removed.
+    category, so the audit trail names every constraint removed. Each key dropped also
+    leaves ``migration_state``'s record of Aurora DSQL's validation (G142): no read of it
+    may say it is in place, and Cut over does not report the tool's own removal as a key
+    something else dropped. Cut over's own result and its waivers go with them
+    (``forget_fk_validation_keys``) even when CDC is then not started -- a Cancel, a
+    blocked dialog, an early refusal -- so Finish asks for the keys to be applied again.
 
     Returns ``(dropped, failed)``.
     """
@@ -8499,11 +8505,13 @@ def _drop_cdc_blocking_foreign_keys(pairs, session) -> tuple[int, int]:
     if connect is None:
         return (0, len(list(pairs)))
     dropped = failed = 0
+    removed: list = []
     for table_name, constraint_name in pairs:
         target = f"{table_name}.{constraint_name}"
         try:
             drop_foreign_key(table_name, constraint_name, connection_factory=connect)
             dropped += 1
+            removed.append((table_name, constraint_name))
             _log_cdc_event(
                 "foreign key removed for CDC",
                 status=ActivityStatus.SUCCESS,
@@ -8522,6 +8530,14 @@ def _drop_cdc_blocking_foreign_keys(pairs, session) -> tuple[int, int]:
                     f"{target} could not be dropped; remove it manually before "
                     "starting CDC or the stream will dead-letter child rows (23503)"
                 ),
+            )
+    forget = getattr(migration_state, "forget_fk_validation_keys", None)
+    if removed and callable(forget):
+        try:
+            forget(removed)
+        except Exception:  # noqa: BLE001 - the drops stand; the record is advisory
+            logging.getLogger(__name__).warning(
+                "Could not update the foreign-key validation record", exc_info=True
             )
     return (dropped, failed)
 

@@ -45,6 +45,7 @@ import threading
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Collection, Iterable, Mapping, Optional, Protocol, Sequence
 
 from dsql_migrator.config import SecretValue, load_config
@@ -885,17 +886,27 @@ def cutover_finish_fk_gate(
     fk_apply_result: "Optional[tuple[int, int, int]]",
     proceed_without_fks: bool,
     inputs_unknown: bool = False,
+    fks_in_place: "Optional[bool]" = None,
+    fks_reading: bool = False,
 ) -> "Optional[str]":
-    """Whether "I've cut over" is soft-blocked on preserved foreign keys, and why. Pure.
+    """Whether "I've cut over" is soft-blocked on preserved foreign keys NOT IN PLACE, and
+    why. Pure.
 
     For a CDC migration the deferred FK ``ADD CONSTRAINT``s are created ONLY by the
     cut-over "Apply foreign keys" button -- Full Load's post-load pass is a no-op for a
     CDC run -- so acknowledging cut over with them never applied would silently mark the
-    target live with ZERO enforced foreign keys. Returns:
+    target live with ZERO enforced foreign keys. Since G142 this hold waits only for the
+    keys to be IN PLACE (added ``NOT VALID``, seconds; each enforces every new write), not
+    for Aurora DSQL's validation of the rows already loaded. The keys a MySQL CDC stream can
+    break are a second, independent hold on the keys that ARE in place
+    (:func:`cutover_fk_held`), with its own waiver. Returns:
 
-    * ``None``        -- not gated (Full-Load-only, no preserved FKs, every FK applied
-      cleanly, or the operator explicitly opted to proceed without them).
-    * ``"pending"``   -- preserved FKs exist but the cut-over apply has NOT been run.
+    * ``None``        -- not gated (Full-Load-only, no preserved FKs, every FK in place,
+      or the operator explicitly opted to proceed without them).
+    * ``"pending"``   -- preserved FKs exist but the cut-over apply has NOT been run (or a
+      catalog read shows a key missing since).
+    * ``"checking"``  -- the apply has not run in this session, and the catalog read that
+      would show the keys in place is still being taken (``fks_reading``).
     * ``"incomplete"`` -- the apply ran but some FKs were skipped (orphans) or failed,
       so referential integrity is not fully enforced.
     * ``"unknown"``    -- the schema inputs the FK count is derived from are not loaded
@@ -904,11 +915,18 @@ def cutover_finish_fk_gate(
       that count is itself 0 in exactly this case: an indeterminate denominator must not
       paint the finish button green (the same rule Full Load applies to a 0 denominator).
 
-    ``proceed_without_fks`` is the operator's explicit "cut over without enforced FKs"
-    opt-out; when set the gate clears -- including for ``"unknown"``, so this is a
-    soft-block with a stated escape hatch, never a trap. Full-Load-only runs are never
-    gated here (their FKs are applied automatically at load end, and FIX 9 re-offers any
-    that were skipped/failed on the runbook itself).
+    ``fk_pending_count`` counts the keys the cut-over pass adds (:func:`_cutover_fk_targets`:
+    never a key it leaves out by design). ``fks_in_place`` is a catalog read taken after the
+    latest Validation verdict (the validation watch's): ``True`` when it shows EVERY pending
+    key on the target (so the keys are in place whatever this session's apply result says
+    -- after a Validation re-run or a restart cleared it), ``False`` when it shows one
+    missing (dropped since, or never added), ``None`` when there is no such read. It never
+    masks this session's own apply result: skipped or failed keys are ``"incomplete"``
+    whatever a read says. ``proceed_without_fks`` is the operator's explicit opt-out of
+    this hold; when set the gate clears, so this is a soft-block with a stated escape
+    hatch, never a trap. Full-Load-only runs are never gated here (their FKs are an
+    explicit action on the Data Migration step, and the runbook re-offers the action itself
+    for any not in place).
     """
     if not cdc_in_use:
         return None
@@ -918,12 +936,13 @@ def cutover_finish_fk_gate(
         return "unknown"
     if fk_pending_count <= 0:
         return None
-    if fk_apply_result is None:
+    if fk_apply_result is not None and (fk_apply_result[1] or fk_apply_result[2]):
+        return "incomplete"
+    if fks_in_place is False:
         return "pending"
-    _applied, skipped, failed = fk_apply_result
-    if skipped == 0 and failed == 0:
-        return None
-    return "incomplete"
+    if fks_in_place is None and fk_apply_result is None:
+        return "checking" if fks_reading else "pending"
+    return None
 
 
 def summarize_validation(report: ValidationReport) -> ValidationSummary:
@@ -2135,6 +2154,12 @@ class ValidationState:
         # the deliberate "I'll enforce integrity in the app" decision that unblocks the
         # acknowledgement. Set on the UI thread; a fresh verdict resets it.
         self.proceed_without_foreign_keys: bool = False
+        # The keys in place whose Aurora DSQL validation the operator chose to cut over
+        # without ("Cut over without this check", G142): the second Finish hold's own waiver,
+        # covering it only while every key it holds on is among them. Going live without
+        # the keys not in place is not that decision, nor the other way round. Cleared with
+        # the flag above.
+        self.proceed_without_fk_validation: frozenset = frozenset()
         # The operator's attestation that source writes are frozen and CDC has drained to
         # zero lag -- the gate on the cut-over "Apply foreign keys" button for a CDC
         # migration (the ADD CONSTRAINT pass must not run while the sink still streams
@@ -2260,9 +2285,9 @@ class ValidationState:
         self._cutover_fk_apply: Optional[tuple[int, int, int]] = None
         # The submitted apply job, so a second click cannot start a second CONCURRENT pass.
         # Cut over gave no feedback while the pass ran -- no spinner, no count -- so on a
-        # real schema (minutes per pass) an operator reasonably concluded nothing had
-        # happened and clicked again, each click costing another full O(child rows) orphan
-        # pre-gate over EVERY foreign key.
+        # real schema (minutes per pass, while it still counted every key's orphans
+        # before the ADD) an operator reasonably concluded nothing had happened and
+        # clicked again, each click costing another full pass over EVERY foreign key.
         self._cutover_fk_apply_job_id: Optional[str] = None
         # (settled, total) published by the pass itself, so a render during the pass says
         # how far it has got instead of looking un-run.
@@ -2298,6 +2323,7 @@ class ValidationState:
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
+            self.proceed_without_fk_validation = frozenset()
             # The target's tables were just dropped and recreated, so whatever the
             # operator attested about a drained stream belongs to the previous schema.
             self.cutover_cdc_drained_confirmed = False
@@ -2320,11 +2346,20 @@ class ValidationState:
         """CDC starts (or tried to): an attestation that it had drained is stale, and the
         DEFAULT status is re-read (a Start CDC re-drops a restored DEFAULT).
 
+        The cut-over foreign-key outcome goes too (G142): CDC streams only once the
+        migration's keys are off the target (Start CDC refuses otherwise, and its "Remove
+        foreign keys" drops them), so an earlier "Applied N" no longer describes it -- kept,
+        it would open Finish with no key in place. The waivers it was given go with it.
+
         Called from the Start CDC job (submit and its ``finally``), on any thread.
         """
         with self._lock:
             self.cutover_cdc_drained_confirmed = False
             self._invalidate_cutover_defaults_locked()
+            self._cutover_fk_apply = None
+            self._cutover_fk_apply_progress = None
+            self.proceed_without_foreign_keys = False
+            self.proceed_without_fk_validation = frozenset()
 
     # -- cut-over DEFAULT restore -------------------------------------------------
 
@@ -2452,6 +2487,20 @@ class ValidationState:
         """Record the cut-over foreign-key apply outcome (applied, skipped, failed)."""
         with self._lock:
             self._cutover_fk_apply = result
+
+    def waive_foreign_keys(self) -> None:
+        """The operator's "Cut over without enforced foreign keys": lifts the hold on keys
+        not in place, never the one on keys in place that Aurora DSQL has not validated."""
+        with self._lock:
+            self.proceed_without_foreign_keys = True
+
+    def waive_fk_validation(self, keys: "Iterable[tuple[str, str]]") -> None:
+        """The operator's "Cut over without this check" for ``keys``: lifts the hold on keys
+        in place that Aurora DSQL has not validated while it holds on no other key."""
+        with self._lock:
+            self.proceed_without_fk_validation = frozenset(
+                (str(t), str(c)) for t, c in keys or ()
+            )
 
     @property
     def cutover_fk_apply(self) -> "Optional[tuple[int, int, int]]":
@@ -2651,6 +2700,7 @@ class ValidationState:
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
+            self.proceed_without_fk_validation = frozenset()
             # A new comparison means the source was read again, so a freeze/drain
             # attestation made before it no longer describes the current state.
             self.cutover_cdc_drained_confirmed = False
@@ -2814,6 +2864,7 @@ class ValidationState:
             self._cutover_fk_apply_job_id = None
             self._cutover_fk_apply_progress = None
             self.proceed_without_foreign_keys = False
+            self.proceed_without_fk_validation = frozenset()
             self.cutover_cdc_drained_confirmed = False
             self.interrupted_by_restart = False
             self._cutover_default_restore_outcome = None
@@ -2874,6 +2925,13 @@ class ValidationStore:
 
 # How often the screen polls the background validation job (seconds).
 _POLL_INTERVAL_SECONDS = 0.5
+
+# How often the Cut over screen comes back while Aurora DSQL still validates a foreign key
+# and no background watch reads it (G142); the watch itself refreshes on a change.
+_FK_VALIDATION_REFRESH_SECONDS = 30.0
+# How often the Cut over screen comes back while its foreign-key pass runs, so the
+# "Adding foreign keys: X of N" count moves and the result shows (as the Full load card).
+_FK_APPLY_POLL_SECONDS = 1.5
 
 
 def session_exclusion_split(
@@ -4764,7 +4822,8 @@ def _cutover_pending_foreign_keys(
     shows the "Apply foreign keys" action.
 
     Counts the SAME rendered ``foreign_key_ddls`` that ``apply_preserved_foreign_keys``
-    will iterate at cut over -- rebuilding the applied conversions exactly as
+    will iterate at cut over (:func:`_cutover_fk_targets`, the pass's own selection: no
+    key it leaves out by design) -- rebuilding the applied conversions exactly as
     :func:`_run_cutover_foreign_keys` does (a pure, side-effect-free schema
     re-conversion + Schema-Conversion edits/toggle; no DB). This excludes FKs on a
     table that converts UNSUPPORTED (its ``foreign_key_ddls`` is empty even though the
@@ -4772,31 +4831,223 @@ def _cutover_pending_foreign_keys(
     over-states what apply actually does. The rebuild is heavier than a raw metadata
     tally, but cut over is not a hot path.
     """
-    if conversion_store is None or eval_store is None:
-        return 0
-    conv_state = conversion_store.get(session_id)
+    conv_state = conversion_store.get(session_id) if conversion_store is not None else None
     if conv_state is None or not conv_state.preserve_foreign_keys:
         return 0
-    result = eval_store.get_or_create(session_id).result
-    inventory = result.inventory if result is not None else None
-    if inventory is None:
+    targets = _cutover_fk_targets(
+        session, eval_store, conversion_store, session_id, migration_state=migration_state
+    )
+    if targets is None:
         return 0
-    from dsql_migrator.core.converter import SchemaConverter
-    from dsql_migrator.ui.schema_conversion import applied_table_conversions
+    return sum(len(conv.foreign_key_ddls) for conv in targets[1].values())
 
-    stype = (
-        session.source_config.source_type  # type: ignore[attr-defined]
-        if getattr(session, "source_config", None) is not None
-        else SourceType.MYSQL
+
+def _cutover_fk_targets(
+    session: object,
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+    *,
+    migration_state: object = None,
+) -> "Optional[tuple[list, dict]]":
+    """``(inventory tables, the conversions whose foreign keys the cut-over pass adds)``,
+    ``None`` without the schema inputs. Pure, no DB.
+
+    The pass's own selection (``foreign_keys_to_apply``): the migration's scope less each
+    unselected child pointing in that the last pass found absent from the target and left
+    out (the record's ``fk_absent_children``) -- so Finish never waits for a key the pass
+    leaves out by design, and waits for every key it adds (one the operator added or
+    renamed in Schema Conversion too)."""
+    context = _identity_sync_context(
+        session, eval_store, conversion_store, session_id, migration_state=migration_state
     )
-    applied = applied_table_conversions(
-        SchemaConverter(source_type=stype).convert(inventory),
-        conv_state.edited_target_ddls,
-        preserve_foreign_keys=conv_state.preserve_foreign_keys,
+    if context is None:
+        return None
+    from dsql_migrator.ui.data_migration._full_load_engine import (
+        foreign_keys_pointing_in,
+        foreign_keys_to_apply,
     )
-    # Only the migrated tables' keys (the apply below is scoped the same way).
-    applied = _in_migration_scope(applied, migration_state)
-    return sum(len(conv.foreign_key_ddls) for conv in applied.values())
+
+    tables, scoped = context
+    absent = getattr(migration_state, "fk_absent_children", None)
+    return tables, foreign_keys_to_apply(
+        scoped,
+        foreign_keys_pointing_in(scoped, _migrated_tables(migration_state)),
+        absent() if callable(absent) else (),
+    )
+
+
+def _cutover_fk_keys(
+    session: object,
+    eval_store: "Optional[EvaluationStore]",
+    conversion_store: "Optional[Any]",
+    session_id: str,
+    *,
+    migration_state: object = None,
+    cdc_in_use: bool = False,
+) -> "tuple[list[tuple[str, str]], frozenset, dict]":
+    """``(pending keys, keys a MySQL CDC stream can break, key -> ForeignKeyDef)`` of the
+    foreign keys the cut-over pass adds (G142, :func:`_cutover_fk_targets`). Pure, no DB;
+    empty without the schema inputs.
+
+    The pending keys are EVERY rendered foreign-key DDL's ``(child, constraint)`` -- the
+    same DDLs :func:`_cutover_pending_foreign_keys` counts, so a key the operator added or
+    renamed in Schema Conversion counts too, and a DDL whose name cannot be read stays as
+    ``(child, None)`` (no catalog read can confirm it). The definitions are the keys with
+    source metadata only (they explain a failed validation). The second set is MySQL +
+    CDC only (``_fk_validation.foreign_keys_cdc_can_break``: a cascade action InnoDB never
+    logs, or a text key MySQL matches more loosely): Finish waits for Aurora DSQL to
+    validate those.
+    """
+    context = _cutover_fk_targets(
+        session, eval_store, conversion_store, session_id, migration_state=migration_state
+    )
+    if context is None:
+        return [], frozenset(), {}
+    from dsql_migrator.ui.data_migration._fk_validation import (
+        foreign_key_defs,
+        foreign_keys_cdc_can_break,
+        pending_foreign_keys,
+    )
+
+    tables, applied = context
+    conv_state = conversion_store.get(session_id) if conversion_store is not None else None
+    if conv_state is None or not getattr(conv_state, "preserve_foreign_keys", True):
+        return [], frozenset(), {}
+    defs = foreign_key_defs(applied)
+    source = getattr(getattr(session, "source_config", None), "source_type", SourceType.MYSQL)
+    breakable = (
+        foreign_keys_cdc_can_break(applied, tables)
+        if cdc_in_use and source is SourceType.MYSQL
+        else frozenset()
+    )
+    return pending_foreign_keys(applied), breakable, defs
+
+
+def _fk_validation_view_of(migration_state: object) -> object:
+    """The session's foreign-key validation view (``_fk_validation.FkValidationView``):
+    the persisted job ids under the last read of Aurora DSQL, or ``None``."""
+    view = getattr(migration_state, "fk_validation_view", None)
+    if not callable(view):
+        return None
+    try:
+        return view()
+    except Exception:  # noqa: BLE001 - a report; never break the screen
+        return None
+
+
+def cutover_fk_in_place(
+    keys: "Sequence[tuple[str, Optional[str]]]", pending_count: int, view: object
+) -> "tuple[Optional[bool], bool, list[str]]":
+    """``(fks_in_place, fks_reading, missing keys)`` for the Finish gate (G142). Pure.
+
+    ``keys`` are EVERY pending foreign-key DDL's ``(child, constraint)``
+    (:func:`_cutover_fk_keys`), ``view`` the session's ``FkValidationView`` -- read after the
+    latest Validation verdict: Cut over drops an older read before it asks. ``True`` only
+    when that read finds every pending key in place, the keys being exactly the pending
+    set; ``False`` when it finds a named key missing (gone from the target, or not in the
+    record of the pass that last ran: never added); ``None`` when it cannot tell -- no
+    record, a key whose name cannot be read, or a read still to come (``fks_reading``).
+    """
+    if not keys or view is None or not getattr(view, "items", ()):
+        return None, False, []
+    if getattr(view, "checking", True):
+        return None, True, []
+    named = [key for key in keys if key[1]]
+    states = {key: view.state_of(key) for key in named}  # type: ignore[attr-defined]
+    missing = [f"{t}.{c}" for (t, c), state in states.items() if state in (None, "absent")]
+    if missing:
+        return False, False, missing
+    if any(state == "unknown" for state in states.values()):
+        return None, True, []
+    if len(named) == len(keys) == int(pending_count):
+        return True, False, []
+    return None, False, []
+
+
+def cutover_fk_held(
+    breakable: "Iterable[tuple[str, str]]", view: object
+) -> "dict[tuple[str, str], str]":
+    """The keys a MySQL CDC stream can break that are IN PLACE and that Finish still waits
+    for Aurora DSQL to validate, each with its state (``_fk_validation``'s: failed,
+    not-validated, validating, unknown). Pure.
+
+    Finish's second hold, independent of the first (:func:`cutover_finish_fk_gate`, keys
+    not in place) and with its own waiver: a key the record does not hold, or one a read
+    found gone, is not in place -- the first hold's -- and never held here. Only a
+    validated key is released, by a read taken after the latest Validation verdict (Cut
+    over drops older ones): before that read every recorded key is ``unknown``, being read.
+    """
+    held: "dict[tuple[str, str], str]" = {}
+    if view is None:
+        return held
+    for key in sorted(breakable or ()):
+        state = view.state_of(key)  # type: ignore[attr-defined]
+        if state not in (None, "absent", "validated"):
+            held[key] = state
+    return held
+
+
+def _fk_keys_phrase(count: int, *, preserved: bool = False) -> str:
+    """``"1 foreign key"`` / ``"3 preserved foreign keys"``."""
+    return f"{count} {'preserved ' if preserved else ''}foreign key" + ("" if count == 1 else "s")
+
+
+def _cutover_orphans_hold_copy(held: "Mapping[tuple[str, str], str]") -> "tuple[str, str]":
+    """The validation hold's header and body, from each held key's state (G142): what will
+    release it -- nothing to do while Aurora DSQL's check runs or is being read, fixing the
+    rows and "Validate again" after a failure, "Validate again" when no job runs. Every
+    held key is in place (:func:`cutover_fk_held`). Pure."""
+    by_state: "dict[str, list[str]]" = {}
+    for (table, constraint), state in held.items():
+        by_state.setdefault(state, []).append(f"{table}.{constraint}")
+    names = [f"{table}.{constraint}" for table, constraint in held]
+    failed = by_state.get("failed", [])
+    no_job = by_state.get("not-validated", [])
+    validating = by_state.get("validating", [])
+    reading = by_state.get("unknown", [])
+    if failed:
+        header = "Foreign keys CDC can break failed Aurora DSQL's validation"
+    elif no_job:
+        header = "Foreign keys CDC can break are not validated"
+    elif validating:
+        header = "Waiting for Aurora DSQL to validate the foreign keys CDC can break"
+    else:
+        header = "Reading Aurora DSQL's validation of the foreign keys CDC can break"
+    clauses = [
+        f"Aurora DSQL's validation failed for {bounded_table_names(failed)}: fix the rows "
+        "(see the details above), then click Validate again."
+        if failed
+        else "",
+        f"No validation job runs for {bounded_table_names(no_job)} "
+        + (
+            "(it could not be submitted, or Aurora DSQL no longer reports it)"
+            if len(no_job) == 1
+            else "(they could not be submitted, or Aurora DSQL no longer reports them)"
+        )
+        + ": click Validate again."
+        if no_job
+        else "",
+        f"Aurora DSQL's check of {bounded_table_names(validating)} is still running."
+        if validating
+        else "",
+        f"Aurora DSQL's verdict on {bounded_table_names(reading)} is being read now."
+        if reading
+        else "",
+    ]
+    body = (
+        f"{_fk_keys_phrase(len(names))} ({bounded_table_names(names)}) can be left with "
+        "orphan rows by a MySQL CDC stream: an ON DELETE / ON UPDATE action runs inside "
+        "MySQL and never reaches the binary log, and a key MySQL matches more loosely "
+        "(ignoring case or trailing spaces) can match no parent on Aurora DSQL. The final "
+        "Validation's row counts do not see such rows, so Finish waits for Aurora DSQL's own "
+        "check of the rows already loaded. "
+        + " ".join(clause for clause in clauses if clause)
+        + (" It is" if len(names) == 1 else " Each is")
+        + " in place and refuses every new write that would break it. Or explicitly choose "
+        "to cut over without this check below."
+    )
+    return header, body
 
 
 def _migrated_tables(migration_state: object) -> "Optional[list[str]]":
@@ -4869,6 +5120,8 @@ def _cutover_integrity_detail(
     fks_stripped: bool = False,
     identity_missed: "Sequence[str]" = (),
     standalone_sequences: int = 0,
+    fk_view: object = None,
+    fk_validation_waived: "Optional[bool]" = None,
 ) -> str:
     """One clause stating whether the target went live with its foreign keys enforced.
 
@@ -4891,11 +5144,63 @@ def _cutover_integrity_detail(
     ``standalone_sequences`` counts the source sequences no column owns, which the tool
     neither creates nor syncs (Evaluation's ``PG_STANDALONE_SEQUENCE``).
 
+    ``fk_view`` (``_fk_validation.FkValidationView``, the last read of Aurora DSQL) adds
+    how many keys in place Aurora DSQL VALIDATED and names each one it has NOT (G142): a
+    key in place enforces every new write, but only a validated one proves the rows
+    already loaded; that read, not the pass's count, says how many are in place. The two
+    waivers are said apart: "WAIVED (N not applied)" for keys not in place, "validation
+    check WAIVED" for keys in place Aurora DSQL has not validated.
+    ``fk_validation_waived``: whether the second waiver covers the keys held now (``None``
+    reads whether it was given).
+
     Pure: reads the already-recorded outcomes, no DB. Counts and states only, never a row
     value (Property 7).
     """
-    if validation_state.proceed_without_foreign_keys:
-        fk = f"foreign keys WAIVED ({pending} not applied)"
+    waived = validation_state.proceed_without_foreign_keys
+    validation_waived = (
+        bool(validation_state.proceed_without_fk_validation)
+        if fk_validation_waived is None
+        else bool(fk_validation_waived)
+    )
+    result = validation_state.cutover_fk_apply
+    read = fk_view is not None and not getattr(fk_view, "checking", True)
+    # After a read: the recorded keys it did not find gone (one it could not read counts --
+    # the pass put it in place); a key dropped since the pass is not in place.
+    in_place = (
+        int(getattr(fk_view, "in_place", 0) or 0)
+        if read
+        else int(result[0] or 0)
+        if result is not None
+        else 0
+    )
+    not_validated = (
+        []
+        if fk_view is None or getattr(fk_view, "checking", True)
+        else [
+            item.label
+            for item in getattr(fk_view, "items", ())
+            if item.state not in ("validated", "absent")
+        ]
+    )
+    validated_clause = (
+        ""
+        if fk_view is None
+        or not getattr(fk_view, "items", ())
+        or (not getattr(fk_view, "checking", True) and not getattr(fk_view, "in_place", 0))
+        else (
+            "; validated by Aurora DSQL: NOT KNOWN (not read back from Aurora DSQL yet)"
+            if getattr(fk_view, "checking", True)
+            else f"; validated by Aurora DSQL: {fk_view.validated} of {fk_view.in_place}"
+            + (
+                f" ({len(not_validated)} NOT validated: {_bounded_names(not_validated)})"
+                if not_validated
+                else ""
+            )
+        )
+    )
+    counted = pending > 0
+    if waived and not (counted and in_place >= pending):
+        fk = f"foreign keys WAIVED ({max(0, pending - in_place)} not applied)"
     elif fks_stripped:
         fk = (
             "foreign keys STRIPPED by the schema conversion -- the target is live "
@@ -4909,14 +5214,17 @@ def _cutover_integrity_detail(
     elif pending <= 0:
         fk = "foreign keys: none in scope"
     else:
-        result = validation_state.cutover_fk_apply
-        if result is None:
-            fk = f"foreign keys NOT applied ({pending} outstanding)"
+        if result is None and in_place < pending:
+            fk = f"foreign keys NOT applied ({pending - in_place} outstanding)"
+        elif result is None:
+            fk = f"foreign keys {in_place}/{pending} in place"
         else:
             applied, skipped, failed = result
             fk = f"foreign keys {applied}/{pending} applied"
             if skipped or failed:
                 fk += f" ({skipped} skipped on orphan rows, {failed} failed)"
+    if counted and not fks_stripped and not inputs_missing:
+        fk += (", validation check WAIVED" if validation_waived else "") + validated_clause
     synced = validation_state.cutover_identity_sync
     # A failed or impossible sync is said, never folded into "synced" -- the clause is
     # built from the counts, so a failure never reads "synced (nothing to advance), 1 FAILED".
@@ -4960,8 +5268,8 @@ def _cutover_gate_inputs_missing(
     stop rendering identically (an empty runbook that reads as done).
 
     Pure: no DB, no target-catalog read. The cut-over screen re-renders on every
-    refresh, so it must never scan the target -- the O(rows) orphan pre-gate is behind a
-    button for the same reason.
+    refresh, so it must never scan the target -- the foreign-key pass is behind a button,
+    and Aurora DSQL's verdict on it is read by a background watch, for the same reason.
     """
     if conversion_store is None or eval_store is None:
         return True
@@ -5170,9 +5478,12 @@ def _run_cutover_foreign_keys(
     For a CDC migration the FK ``ADD CONSTRAINT``s are deferred (they must not exist
     while the sink streams out-of-order rows -- it dead-letters an FK violation). This
     runs them once, AFTER the final drain and BEFORE repointing: it rebuilds the applied
-    conversions from the source inventory + Schema-Conversion edits/toggle, then applies
-    each FK with the orphan pre-gate (via ``apply_preserved_foreign_keys``). Runs in the
-    background so the click never blocks the UI; the ``(applied, skipped, failed)``
+    conversions from the source inventory + Schema-Conversion edits/toggle, then adds each
+    FK via ``apply_preserved_foreign_keys`` -- G142: ``NOT VALID`` at once, seconds inside
+    the write freeze (a key whose parent side is incomplete by design is counted first),
+    and an async VALIDATE per key whose job id is recorded on ``migration_state`` (the
+    persisted record) for the background watch that reads Aurora DSQL's verdict. Runs in
+    the background so the click never blocks the UI; the ``(applied, skipped, failed)``
     result is stored on ``validation_state`` and the screen refreshes. Best-effort.
     """
     target_config = getattr(session, "target_config", None)
@@ -5214,23 +5525,51 @@ def _run_cutover_foreign_keys(
             preserve_foreign_keys=conv_state.preserve_foreign_keys,
         )
         from dsql_migrator.ui.data_migration._full_load_engine import (
+            foreign_keys_counted_before_add,
             foreign_keys_in_scope,
             foreign_keys_pointing_in,
         )
 
+        _unscoped = applied
         applied = foreign_keys_in_scope(applied, scope)
         connect = DsqlConnector(target_config, aws_profile=aws_profile).connect
+        # The keys whose parent side is incomplete by design keep the count before their
+        # ADD (G142): an excluded referenced column, a parent or child outside the set.
+        _excluded: dict = {}
+        if callable(getattr(migration_state, "lob_exclusions", None)):
+            try:
+                _excluded = effective_lob_exclusions(
+                    migration_state, inventory,
+                    applied_conversions=_unscoped,
+                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                )
+            except Exception:  # noqa: BLE001 - refines which keys are counted first
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Could not read the column exclusions", exc_info=True
+                )
+        _record = getattr(migration_state, "fk_validation_records", None)
         result = apply_preserved_foreign_keys(
             applied, connect,
             skip_if_absent=foreign_keys_pointing_in(applied, scope),
+            check_before_add=foreign_keys_counted_before_add(applied, scope, _excluded),
+            # The recorded VALIDATE jobs in (a running one is kept, never submitted twice)
+            # and the submitted ones out, onto the persisted record the watch reads.
+            validation_jobs=(
+                {key: rec.job_id for key, rec in _record().items() if rec.job_id}
+                if callable(_record)
+                else None
+            ),
+            on_validation=getattr(migration_state, "record_fk_validation", None),
             # Publish per-FK progress so a render during the pass reports how far it has
-            # got. The pass can run for minutes and said nothing at all before.
+            # got. The pass said nothing at all before.
             on_progress=validation_state.set_cutover_fk_apply_progress,
-            # Per FK and per poll of a still-building parent index. This pass is an
-            # O(rows) orphan pre-gate per FK plus up to 300 s per distinct parent index,
-            # so at scale it ran well past the watchdog's window with nothing reported and
-            # left a spurious FAILED job record behind (the id is not polled, so the reap
-            # was invisible while still being persisted).
+            # Per FK and per poll of a still-building parent index (up to 300 s per
+            # distinct parent index), and per page of a key counted before its ADD; at
+            # scale a silent pass ran past the watchdog's window and left a spurious
+            # FAILED job record behind (the id is not polled, so the reap was invisible
+            # while still being persisted).
             heartbeat=getattr(_handle, "heartbeat", None),
             # Audit only: the pass is identical, but it must not read as something that
             # happened during the load -- for a CDC migration this is the ONLY pass that
@@ -5241,12 +5580,24 @@ def _run_cutover_foreign_keys(
         validation_state.set_cutover_fk_apply(result)
         if refresh is not None:
             refresh()
+        # Aurora DSQL's verdict on the rows already loaded is read back in the background
+        # (its own job and slot), so this job -- and the second-click guard -- ends now.
+        if migration_state is not None and job_manager is not None:
+            from dsql_migrator.ui.data_migration._fk_validation import (
+                foreign_key_defs,
+                start_fk_validation_watch,
+            )
+
+            start_fk_validation_watch(
+                migration_state, job_manager, connection_factory=connect,
+                fk_defs=lambda: foreign_key_defs(applied),
+                category=ActivityCategory.VALIDATION, refresh=refresh,
+            )
 
     if job_manager is not None:
         # RE-ENTRANCY GUARD: refuse to start a second pass while one is live. Without it a
-        # second click submitted a second CONCURRENT pass -- both re-running the orphan
-        # pre-gate over every foreign key -- and the newer job id displaced the older, so
-        # the first could no longer be tracked at all.
+        # second click submitted a second CONCURRENT pass over every foreign key, and the
+        # newer job id displaced the older, so the first could no longer be tracked at all.
         running = validation_state.cutover_fk_apply_job_id
         if running:
             try:
@@ -5257,7 +5608,16 @@ def _run_cutover_foreign_keys(
                 if refresh is not None:
                     refresh()
                 return
+        # The screen reads the pass as running while its job is live and no result is
+        # recorded, so the previous result goes BEFORE the submit: the pass's own last
+        # refresh runs inside its job and must already show its result, never "Adding
+        # foreign keys" next to it with Apply disabled.
+        validation_state.set_cutover_fk_apply(None)
+        validation_state.set_cutover_fk_apply_progress(0, 0)
         validation_state.set_cutover_fk_apply_job(job_manager.submit(_work))
+        # Show the pass running at once (the click handler does not re-render).
+        if refresh is not None:
+            refresh()
     else:
         _work()
 
@@ -5303,6 +5663,98 @@ def build_cutover_screen(
     migration_state = (
         migration_store.get_or_create(session_id) if migration_store is not None else None
     )
+    # The migration's foreign keys for the FK block and the Finish gate (G142), derived
+    # again only when what they come from changes: the screen re-renders while Aurora DSQL
+    # validates, and each derivation converts the schema again.
+    _fk_keys_memo: dict = {}
+
+    def _fk_keys_now(cdc_in_use: bool) -> "tuple[list, frozenset, dict]":
+        conv_state = conversion_store.get(session_id) if conversion_store is not None else None
+        eval_result = (
+            eval_store.get_or_create(session_id).result if eval_store is not None else None
+        )
+        inventory = getattr(eval_result, "inventory", None)
+        absent = getattr(migration_state, "fk_absent_children", None)
+        key = (
+            tuple(sorted((getattr(conv_state, "edited_target_ddls", None) or {}).items())),
+            getattr(conv_state, "preserve_foreign_keys", None),
+            tuple(_migrated_tables(migration_state) or ()),
+            getattr(getattr(session, "source_config", None), "source_type", None),
+            bool(cdc_in_use),
+            # The children the last pass left out as absent: not waited for.
+            absent() if callable(absent) else frozenset(),
+        )
+        if _fk_keys_memo.get("inventory") is not inventory or _fk_keys_memo.get("key") != key:
+            _fk_keys_memo.update(
+                inventory=inventory,
+                key=key,
+                value=_cutover_fk_keys(
+                    session, eval_store, conversion_store, session_id,
+                    migration_state=migration_state, cdc_in_use=cdc_in_use,
+                ),
+            )
+        return _fk_keys_memo["value"]
+
+    def _fk_gate_now(pending: int, *, drop_stale_reads: bool = False) -> SimpleNamespace:
+        """The Finish gate's foreign-key inputs and verdict from the CURRENT state (no I/O;
+        G142), for the render, the acknowledgement and its line.
+
+        Two independent holds, each with its own waiver: ``gate``, keys not in place
+        (:func:`cutover_finish_fk_gate`; lifted by "Cut over without enforced foreign
+        keys"), and ``validation``, the keys in place a MySQL CDC stream can break that
+        Aurora DSQL has not validated (:func:`cutover_fk_held`; lifted by "Cut over without
+        this check" while it names every key held). Going live without the keys not in
+        place is not the decision to go live with keys not validated, nor the reverse.
+
+        ``drop_stale_reads`` (the render): a catalog read that started before the latest
+        Validation verdict, or before this screen was opened (unless a watch is reading the
+        keys right now), is dropped first, so an old settled read -- taken before a CDC
+        start removed the keys, say -- never opens Finish; the screen then says it is
+        reading, and ``reread`` asks it to start a watch at once.
+        """
+        cdc = _cdc_in_use(session)
+        keys, breakable, _defs = _fk_keys_now(cdc)
+        reread = False
+        invalidate = getattr(migration_state, "invalidate_fk_validation_reads", None)
+        if drop_stale_reads and callable(invalidate):
+            evidence = validation_evidence_at(validation_state)
+            if evidence is not None:
+                reread = bool(invalidate(before=evidence))
+            opened = (
+                getattr(session, "active_view_since", None)
+                if getattr(session, "active_view", None) == WorkflowStep.CUT_OVER.value
+                else None
+            )
+            if opened is not None and not migration_state.fk_validation_watch_active():
+                reread = bool(invalidate(before=opened)) or reread
+        view = _fk_validation_view_of(migration_state)
+        in_place, reading, missing = cutover_fk_in_place(keys, pending, view)
+        # A read can only come when a watch can run (a job manager, the session's record
+        # and a target to read): otherwise "reading" would never end.
+        reading = reading and (
+            job_manager is not None
+            and migration_state is not None
+            and getattr(session, "target_config", None) is not None
+        )
+        gate = cutover_finish_fk_gate(
+            cdc_in_use=cdc,
+            fk_pending_count=pending,
+            fk_apply_result=validation_state.cutover_fk_apply,
+            proceed_without_fks=validation_state.proceed_without_foreign_keys,
+            inputs_unknown=_cutover_gate_inputs_missing(eval_store, conversion_store, session_id),
+            fks_in_place=in_place,
+            fks_reading=reading,
+        )
+        held = cutover_fk_held(breakable, view)
+        held_waived = bool(held) and set(held) <= set(
+            validation_state.proceed_without_fk_validation
+        )
+        return SimpleNamespace(
+            keys=keys, view=view, in_place=in_place, missing=missing, held=held,
+            gate=gate, validation=bool(held) and not held_waived, held_waived=held_waived,
+            blocked=gate is not None or (bool(held) and not held_waived),
+            reread=reread,
+        )
 
     def _schedule_cutover_defaults_fill(refresh: Callable[[], None]) -> None:
         """Refill the DEFAULT status in the background when its inputs changed (or it
@@ -5487,6 +5939,11 @@ def build_cutover_screen(
             _summary, gap_accepted=validation_state.accept_explained_gap
         )
         _accepted_gap = _release == "accepted"
+        _ack_fk_pending = _cutover_pending_foreign_keys(
+            session, eval_store, conversion_store, session_id,
+            migration_state=migration_state,
+        )
+        _ack_fk = _fk_gate_now(_ack_fk_pending)
         log_activity(
             ActivityCategory.VALIDATION,
             "cut over acknowledged",
@@ -5508,10 +5965,7 @@ def build_cutover_screen(
                 + "; "
                 + _cutover_integrity_detail(
                     validation_state,
-                    _cutover_pending_foreign_keys(
-                        session, eval_store, conversion_store, session_id,
-                        migration_state=migration_state,
-                    ),
+                    _ack_fk_pending,
                     inputs_missing=_cutover_gate_inputs_missing(
                         eval_store, conversion_store, session_id
                     ),
@@ -5528,6 +5982,11 @@ def build_cutover_screen(
                     standalone_sequences=len(
                         _cutover_standalone_sequences(eval_store, session_id)
                     ),
+                    # G142: which keys Aurora DSQL validated, by the last catalog read
+                    # (taken after the latest verdict), and whether the waiver of that check
+                    # covers the keys it holds on.
+                    fk_view=_ack_fk.view,
+                    fk_validation_waived=_ack_fk.held_waived,
                 )
                 # The go-live line must carry the same disclosure as the verdict it
                 # signs off; an auditor who reads only the closing line would otherwise
@@ -6104,6 +6563,70 @@ def build_cutover_screen(
             validation_state.invalidate_cutover_defaults()
             refresh()
 
+        # G142: Aurora DSQL's verdict on the foreign keys in place -- the persisted VALIDATE
+        # job ids under the last catalog read, which a background watch takes (never this
+        # render, and never from session memory alone: the record outlives a re-render, a
+        # Validation re-run and a restart). Only a read taken after the latest Validation
+        # verdict counts here: an older one is dropped now and read again. The Finish gate
+        # waits only for the keys to be in place, except the keys a MySQL CDC stream can
+        # break.
+        from dsql_migrator.ui.data_migration._fk_validation import (
+            _job_live as _fk_job_live,
+            fk_watch_due,
+            start_fk_validation_watch,
+            submit_fk_revalidation,
+        )
+
+        _fk_now = _fk_gate_now(_fk_pending, drop_stale_reads=True)
+        _fk_view = _fk_now.view
+
+        def _fk_connect():
+            target = getattr(session, "target_config", None)
+            if target is None:
+                return None
+            from dsql_migrator.core.target_connection import DsqlConnector
+
+            return DsqlConnector(target, aws_profile=getattr(session, "aws_profile", None)).connect
+
+        def _fk_defs_now() -> dict:
+            return _fk_keys_now(_cdc_in_use(session))[2]
+
+        def _fk_validate_again(keys: "Sequence[tuple[str, str]]") -> None:
+            # No drained attestation: VALIDATE only reads, on Aurora DSQL, and every key in
+            # place already enforces each new write.
+            submit_fk_revalidation(
+                migration_state, job_manager, connection_factory=_fk_connect(),
+                keys=list(keys), fk_defs=_fk_defs_now,
+                category=ActivityCategory.VALIDATION, refresh=refresh,
+            )
+            refresh()
+
+        # A read just dropped as older than the latest verdict or this screen's opening is
+        # taken again at once (the watch's rest after its last run does not apply: the
+        # next read is newer, so this cannot repeat).
+        if _fk_now.reread or fk_watch_due(migration_state, _fk_view, job_manager):
+            start_fk_validation_watch(
+                migration_state, job_manager, connection_factory=_fk_connect(),
+                fk_defs=_fk_defs_now, category=ActivityCategory.VALIDATION, refresh=refresh,
+            )
+        # The cut-over pass is running when its job is live and it has not recorded its
+        # result yet: its own last refresh runs inside the job, and must show the result.
+        _fk_apply_running = validation_state.cutover_fk_apply is None and _fk_job_live(
+            job_manager, validation_state.cutover_fk_apply_job_id
+        )
+        if _fk_apply_running:
+            # Come back while it runs, so "Adding foreign keys: X of N" moves and the result
+            # shows even when the pass's own refresh is lost (as the Full load card does).
+            ui.timer(_FK_APPLY_POLL_SECONDS, refresh, once=True)  # type: ignore[attr-defined]
+        elif (
+            _fk_view is not None
+            and not _fk_view.settled
+            and not migration_state.fk_validation_watch_active()
+        ):
+            # Nothing is reading it right now (the last watch ran out of time, or a read is
+            # due): come back, so a watch starts again and the result shows when it lands.
+            ui.timer(_FK_VALIDATION_REFRESH_SECONDS, refresh, once=True)  # type: ignore[attr-defined]
+
         # Go path: the verdict is clean — show the tailored runbook + an explicit
         # acknowledgement that marks the step (and the whole journey) Done. The runbook
         # includes an explicit "Sync identity sequences" action (an operator step, not a
@@ -6121,6 +6644,26 @@ def build_cutover_screen(
             fk_apply_provider=_fk_apply_provider,
             fk_apply_result=validation_state.cutover_fk_apply,
             fk_pending_count=_fk_pending,
+            fk_apply_running=_fk_apply_running,
+            fk_apply_progress=validation_state.cutover_fk_apply_progress,
+            fk_validation=_fk_view,
+            # The keys Finish waits for (MySQL CDC, breakable, in place, not validated): the
+            # block says so for each instead of "does not hold the next step" -- not once
+            # that hold's own waiver lifted it or the cut over is done.
+            fk_holding=(
+                frozenset()
+                if _fk_now.held_waived
+                or get_status(session.workflow, WorkflowStep.CUT_OVER) is StepStatus.DONE
+                else frozenset(_fk_now.held)
+            ),
+            on_validate_again=(
+                _fk_validate_again
+                if migration_state is not None and getattr(session, "target_config", None)
+                else None
+            ),
+            fk_revalidating=_fk_job_live(
+                job_manager, getattr(migration_state, "fk_revalidation_job_id", None)
+            ),
             identity_pending_count=_identity_pending,
             cdc_drained_confirmed=validation_state.cutover_cdc_drained_confirmed,
             on_cdc_drained_change=validation_state.set_cutover_cdc_drained_confirmed,
@@ -6152,18 +6695,18 @@ def build_cutover_screen(
                 # For a CDC migration the deferred foreign keys are created ONLY by the
                 # "Apply foreign keys" button above (Full Load's post-pass is a no-op for
                 # CDC), so acknowledging cut over with them never applied would silently
-                # leave the target with zero (or partial) enforced FKs. Soft-block the
-                # acknowledgement until every FK applied cleanly, or the operator opts to
-                # proceed without them (FIX 4).
-                _fk_gate = cutover_finish_fk_gate(
-                    cdc_in_use=_cdc_in_use(session),
-                    fk_pending_count=_fk_pending,
-                    fk_apply_result=validation_state.cutover_fk_apply,
-                    proceed_without_fks=validation_state.proceed_without_foreign_keys,
-                    inputs_unknown=_gate_inputs_unknown,
-                )
+                # leave the target with zero (or partial) enforced FKs. Two soft-blocks,
+                # each with its own explicit opt-out (FIX 4, G142): the keys not in place,
+                # and the keys in place a MySQL CDC stream can break that Aurora DSQL has
+                # not validated -- shown side by side, so lifting one never hides the other.
+                _fk_gate = _fk_now.gate
                 if _fk_gate is not None:
-                    _fk_noun = "foreign key" if _fk_pending == 1 else "foreign keys"
+                    _fk_result = validation_state.cutover_fk_apply
+                    _fk_not_in_place = (
+                        max(0, _fk_pending - int(_fk_result[0]))
+                        if _fk_gate == "incomplete" and _fk_result is not None
+                        else len(_fk_now.missing) or _fk_pending
+                    )
                     if _fk_gate == "unknown":
                         _gate_header = "Can't confirm whether foreign keys are applied"
                         _gate_body = (
@@ -6175,13 +6718,40 @@ def build_cutover_screen(
                             "or explicitly choose to cut over without enforced foreign "
                             "keys below."
                         )
+                    elif _fk_gate == "checking":
+                        _gate_header = "Confirming the foreign keys are in place"
+                        _gate_body = (
+                            f"This schema has {_fk_keys_phrase(_fk_pending)} to be in place "
+                            "before you finish. Aurora DSQL's catalog is being read now (a "
+                            "read taken after the latest validation); this updates when it "
+                            "lands. You can also apply them again above (keys already in "
+                            "place are left as they are), or explicitly choose to cut over "
+                            "without them below."
+                        )
+                    elif _fk_gate == "pending" and _fk_now.missing:
+                        _gate_header = "Foreign keys are not applied yet"
+                        _one = len(_fk_now.missing) == 1
+                        _gate_body = (
+                            f"{_fk_keys_phrase(len(_fk_now.missing))} of this schema's "
+                            f"{_fk_pending} {'is' if _one else 'are'} not on Aurora DSQL "
+                            f"({bounded_table_names(_fk_now.missing)}). Use \"Apply foreign "
+                            "keys\" above before finishing (keys already in place are left "
+                            "as they are), or explicitly choose to cut over without them "
+                            "below."
+                        )
                     elif _fk_gate == "pending":
+                        # Never applied, or removed since (Start CDC's "Remove foreign keys",
+                        # a reload): the record holds none of them.
+                        _it = "it" if _fk_pending == 1 else "them"
                         _gate_header = "Foreign keys are not applied yet"
                         _gate_body = (
-                            f"This schema's {_fk_pending} preserved {_fk_noun} were "
-                            "deferred during CDC and have NOT been applied to the target "
-                            "yet. Use \"Apply foreign keys\" above before finishing, or "
-                            "explicitly choose to cut over without them below."
+                            f"This schema's {_fk_keys_phrase(_fk_pending, preserved=True)} "
+                            f"{'is' if _fk_pending == 1 else 'are'} not in place on the "
+                            f"target. CDC streams without {_it}, so only \"Apply foreign "
+                            f"keys\" above adds {_it}: after the final drain, and again "
+                            f"whenever Start CDC or a reload removed {_it}. Apply {_it} "
+                            "before finishing, or explicitly choose to cut over without "
+                            f"{_it} below."
                         )
                     else:
                         _gate_header = "Foreign keys are not applied yet"
@@ -6201,27 +6771,62 @@ def build_cutover_screen(
                     def _proceed_without_fks() -> None:
                         # The one decision on this screen that CANNOT be reconstructed
                         # afterwards: nothing else records that the operator chose to go
-                        # live with referential integrity unenforced, and the absence of
-                        # an "apply foreign keys" line is ambiguous between "no FKs in
-                        # the schema", "applied", "never run" and "waived".
+                        # live with referential integrity unenforced (or unproven), and the
+                        # absence of an "apply foreign keys" line is ambiguous between "no
+                        # FKs in the schema", "applied", "never run" and "waived".
                         log_activity(
                             ActivityCategory.VALIDATION,
                             "foreign keys waived at cut over",
                             status=ActivityStatus.WARNING,
                             detail=(
-                                f"operator chose to cut over WITHOUT applying "
-                                f"{_fk_pending} preserved foreign key(s) — referential "
-                                "integrity is the application's responsibility on the "
-                                "target"
+                                "operator chose to cut over before the tool confirmed "
+                                f"that the {_fk_pending} preserved foreign key(s) are in "
+                                "place — referential integrity is the application's "
+                                "responsibility on the target"
+                                if _fk_gate == "checking"
+                                else "operator chose to cut over WITHOUT applying "
+                                f"{_fk_not_in_place} preserved foreign key(s) — referential "
+                                "integrity is the application's responsibility on the target"
                             ),
                         )
-                        validation_state.proceed_without_foreign_keys = True
+                        # This hold only: never the validation hold beside it.
+                        validation_state.waive_foreign_keys()
                         refresh()
 
                     ui.button(  # type: ignore[attr-defined]
                         "Cut over without enforced foreign keys",
                         icon="link_off",
                         on_click=_proceed_without_fks,
+                    ).props("no-caps color=warning outline")
+                if _fk_now.validation:
+                    # G142: these keys are in place, but a MySQL CDC stream can break them
+                    # without a trace the final Validation sees.
+                    _fk_held = dict(_fk_now.held)
+                    _fk_held_names = [f"{table}.{constraint}" for table, constraint in _fk_held]
+                    _check_header, _check_body = _cutover_orphans_hold_copy(_fk_held)
+                    render_notice(ui, tone="warning", header=_check_header, body=_check_body)
+
+                    def _proceed_without_validation() -> None:
+                        log_activity(
+                            ActivityCategory.VALIDATION,
+                            "foreign keys waived at cut over",
+                            status=ActivityStatus.WARNING,
+                            detail=(
+                                f"operator chose to cut over with {len(_fk_held_names)} "
+                                "foreign key(s) Aurora DSQL has NOT validated "
+                                f"({_bounded_names(_fk_held_names)}) — they are in place "
+                                "and refuse every new orphan write, but the rows already "
+                                "on the target are not proven to satisfy them"
+                            ),
+                        )
+                        # These keys only: a key held later holds Finish again.
+                        validation_state.waive_fk_validation(_fk_held)
+                        refresh()
+
+                    ui.button(  # type: ignore[attr-defined]
+                        "Cut over without this check",
+                        icon="link_off",
+                        on_click=_proceed_without_validation,
                     ).props("no-caps color=warning outline")
                 # DEFAULTs still owed: a warning with the action, never a block (the
                 # acknowledgement logs it). Applications inserting without the column
@@ -6284,8 +6889,13 @@ def build_cutover_screen(
                 ).classes("text-sm text-gray-600")
                 with ui.row().classes("w-full justify-end"):  # type: ignore[attr-defined]
                     def _acknowledge() -> None:
-                        if _fk_gate is not None:
-                            return  # gated: FKs not applied and no opt-out
+                        if _fk_now.blocked:
+                            return  # gated: a foreign-key hold stands without its opt-out
+                        if _fk_gate_now(_fk_pending).blocked:
+                            # Re-read from state at the click (no I/O): a read or a CDC
+                            # start since this page was drawn moved the foreign keys.
+                            refresh()
+                            return
                         # Re-evaluated from state at the click (no I/O): a dead letter folded
                         # after this page was drawn must not be signed off unseen.
                         _now = _current_dlq_gate()
@@ -6351,10 +6961,10 @@ def build_cutover_screen(
                         icon="check_circle",
                         on_click=_acknowledge,
                     ).props("color=primary")
-                    # Disabled (not hidden) while the FK gate is active, so the operator
-                    # sees the path forward is "apply the FKs or opt out", not a missing
-                    # button. The handler is a no-op belt-and-suspenders if reached.
-                    if _fk_gate is not None:
+                    # Disabled (not hidden) while a foreign-key hold stands, so the operator
+                    # sees the path forward is "apply / validate the FKs or opt out", not a
+                    # missing button. The handler is a no-op belt-and-suspenders if reached.
+                    if _fk_now.blocked:
                         _ack_btn.props("disable")
 
     return content, runner
@@ -8189,6 +8799,12 @@ def _render_cutover_section(
     fk_apply_provider: "Optional[Callable[[], None]]" = None,
     fk_apply_result: "Optional[tuple[int, int, int]]" = None,
     fk_pending_count: int = 0,
+    fk_apply_running: bool = False,
+    fk_apply_progress: "Optional[tuple[int, int]]" = None,
+    fk_validation: object = None,
+    on_validate_again: "Optional[Callable[[Sequence[tuple[str, str]]], None]]" = None,
+    fk_revalidating: bool = False,
+    fk_holding: "Collection[tuple[str, str]]" = (),
     identity_pending_count: int = 0,
     cdc_drained_confirmed: bool = False,
     on_cdc_drained_change: "Optional[Callable[[bool], None]]" = None,
@@ -8231,9 +8847,15 @@ def _render_cutover_section(
 
     The FK-apply block is shown whenever ``fk_pending_count > 0`` (regardless of CDC): a
     CDC migration applies the deferred FKs here, and a Full-Load-only migration re-offers
-    the idempotent apply to complete any FK skipped/failed at load end (FIX 9). For a CDC
-    migration the Apply button is gated behind an explicit "CDC has drained" confirmation
-    checkbox (FIX 2) — applying mid-stream would dead-letter 23503 violations.
+    the idempotent apply to complete any FK not in place (FIX 9). For a CDC migration the
+    Apply button is gated behind an explicit "CDC has drained" confirmation checkbox
+    (FIX 2) — applying mid-stream would dead-letter 23503 violations. G142: the block says
+    what happens before (each key added at once, then validated by Aurora DSQL in the
+    background), during (``fk_apply_running``: "Adding foreign keys: X of N" from
+    ``fk_apply_progress``, the button disabled) and after: the keys in place, then
+    ``fk_validation`` (``_fk_validation.render_fk_validation``: N of M validated, failed
+    keys with Aurora DSQL's details, the orphan count, the listing query and
+    ``on_validate_again``; ``fk_holding`` names the keys Finish waits for).
 
     That checkbox is ONE for the whole section: it renders under CDC whenever the FK
     block renders or DEFAULT restores are pending, and its toggle enables every
@@ -8388,11 +9010,13 @@ def _render_cutover_section(
         # DEFERRED during the stream (they must not exist while the sink applies rows out
         # of parent-before-child order — an FK violation would be dead-lettered), so this
         # is the ONLY path that creates them; apply here, AFTER the final drain and BEFORE
-        # repointing. For a Full-Load-only migration they were already applied at load
-        # end, but any that were skipped (orphans) or failed are NOT enforced, so the same
+        # repointing. For a Full-Load-only migration they are the explicit action on the
+        # Data Migration step, and any key not in place is NOT enforced, so the same
         # (idempotent) action is re-offered to complete them and surface the result
-        # (FIX 9). Orphan-gated + best effort, idempotent (safe to re-click). Shown
-        # whenever the schema has foreign keys to (re)apply.
+        # (FIX 9). G142: each key is added NOT VALID at once (seconds), and Aurora DSQL
+        # validates the rows already loaded in the background -- its verdict is read back
+        # from the target and shown under the button. Shown whenever the schema has foreign
+        # keys to (re)apply.
         if _fk_block:
             with ui.column().classes(  # type: ignore[attr-defined]
                 "w-full gap-1 mt-1 pt-2 border-t border-gray-100"
@@ -8407,9 +9031,11 @@ def _render_cutover_section(
                         f"{fk_pending_count} {_fk_noun} were not created during CDC (they "
                         "must not exist while the stream applies rows out of "
                         "parent-before-child order). Apply them now — after the final "
-                        "drain and before repointing. Each is checked for orphan rows "
-                        "first and skipped with a note if any exist. Safe to run more "
-                        "than once."
+                        "drain and before repointing. Each key is added at once, NOT "
+                        "VALID, so this takes seconds: from then on Aurora DSQL refuses "
+                        "every new write that would break it. Aurora DSQL then validates "
+                        "the rows already loaded, in the background. Safe to run more than "
+                        "once."
                     ).classes("text-xs text-gray-600 leading-snug")
                 else:
                     ui.label(  # type: ignore[attr-defined]
@@ -8425,11 +9051,11 @@ def _render_cutover_section(
                         f"{fk_pending_count} preserved {_fk_noun}. They are applied by the "
                         "explicit \"Apply foreign keys\" action — on the Data Migration "
                         "step, or here — not automatically at the end of the load. If that "
-                        "action was never run, was stopped part-way, or skipped some "
-                        "(orphan rows) / failed, referential integrity is NOT fully "
-                        "enforced. Apply here to complete them and see the result; "
-                        "already-applied foreign keys are left as-is (safe to run more "
-                        "than once)."
+                        "action was never run, was stopped part-way, or some keys could not "
+                        "be added, referential integrity is NOT fully enforced. Apply here "
+                        "to complete them and see the result: keys already in place are "
+                        "left as they are, and each missing one is added at once (safe to "
+                        "run more than once)."
                     ).classes("text-xs text-gray-600 leading-snug")
 
                 # The ADD CONSTRAINT pass must run ONLY after CDC has drained: applying it
@@ -8441,14 +9067,35 @@ def _render_cutover_section(
                 def _fk_apply_clicked() -> None:
                     if cdc_in_use and not _drained["ok"]:
                         return  # gated: CDC has not been confirmed drained
+                    if fk_apply_running:
+                        return  # the pass already runs (its job guard refuses a second)
                     fk_apply_provider()
 
+                if fk_apply_running:
+                    _done, _total = (tuple(fk_apply_progress or ()) + (0, 0))[:2]
+                    render_notice(
+                        ui,
+                        tone="info",
+                        busy=True,
+                        header=(
+                            f"Adding foreign keys: {_done} of {_total}"
+                            if _total
+                            else "Adding foreign keys"
+                        ),
+                        body=(
+                            "Each key is added at once and enforces every new write from "
+                            "then on; only a key whose parent table or referenced column "
+                            "is outside this migration reads its child table first."
+                        ),
+                    )
                 with ui.row().classes("items-center gap-3 mt-1"):  # type: ignore[attr-defined]
                     _fk_apply_btn = ui.button(  # type: ignore[attr-defined]
                         "Apply foreign keys",
                         icon="link",
                         on_click=_fk_apply_clicked,
                     ).props("color=primary outline no-caps")
+                    if fk_apply_running:
+                        _fk_apply_btn.props("disable")
                     if cdc_in_use:
                         # Enabled only once the operator confirms CDC has drained -- but a
                         # latched confirmation must not be re-disabled on re-render, or the
@@ -8456,13 +9103,14 @@ def _render_cutover_section(
                         # way so a LATER un-tick still disables it.
                         if not _drained["ok"]:
                             _fk_apply_btn.props("disable")
-                        _gated.append((_fk_apply_btn, False))
-                    if fk_apply_result is not None:
+                        _gated.append((_fk_apply_btn, bool(fk_apply_running)))
+                    if fk_apply_result is not None and not fk_apply_running:
                         _applied, _skipped, _failed = fk_apply_result
                         if _failed == 0 and _skipped == 0:
                             inline_hint(
                                 ui,
-                                f"Applied {_applied} foreign key(s).",
+                                f"Applied {_applied} foreign key(s): in place, enforcing "
+                                "every new write.",
                                 tone="success",
                             )
                         else:
@@ -8472,9 +9120,11 @@ def _render_cutover_section(
                                 f"failed {_failed}.",
                                 tone="warning",
                             )
-                # Skipped (orphans) / failed FKs must not read as done: surface a warning
-                # so the operator resolves them before repointing onto a schema whose
-                # referential integrity is not fully enforced.
+                # Skipped / failed FKs must not read as done: surface a warning so the
+                # operator resolves them before repointing onto a schema whose referential
+                # integrity is not fully enforced. Since G142 a key is skipped only when its
+                # parent side is incomplete on Aurora DSQL by design and its count found a
+                # child row naming a missing parent.
                 if fk_apply_result is not None and (
                     fk_apply_result[1] or fk_apply_result[2]
                 ):
@@ -8484,13 +9134,25 @@ def _render_cutover_section(
                         tone="warning",
                         header="Some foreign keys were not applied",
                         body=(
-                            f"{_s} skipped (orphan child rows reference a missing parent) "
-                            f"and {_f} failed. The activity log names each table / foreign "
-                            "key. Resolve the orphan rows (often an un-replicated source "
-                            "cascade), then click Apply foreign keys again — it is "
-                            "idempotent. Referential integrity is not fully enforced on "
-                            "the target until every foreign key is applied."
+                            f"{_s} skipped (child rows reference a parent row that is not "
+                            "on Aurora DSQL, and the key's parent table or referenced "
+                            f"column is outside this migration) and {_f} failed. The "
+                            "activity log names each table / foreign key and why. Resolve "
+                            "it, then click Apply foreign keys again — it is idempotent. "
+                            "Referential integrity is not fully enforced on the target "
+                            "until every foreign key is applied."
                         ),
+                    )
+                if not fk_apply_running and fk_validation is not None:
+                    from dsql_migrator.ui.data_migration._fk_validation import (
+                        render_fk_validation,
+                    )
+
+                    render_fk_validation(
+                        ui, fk_validation,
+                        on_validate_again=on_validate_again,
+                        revalidating=fk_revalidating,
+                        holding=fk_holding,
                     )
 
         if default_restore is not None or defaults_checking:

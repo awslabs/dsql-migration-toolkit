@@ -1304,6 +1304,91 @@ def build_orphan_count_sql(child_table: str, fk: ForeignKeyDef) -> sql.Composed:
     )
 
 
+def build_orphan_listing_sql(
+    child_table: str,
+    fk: ForeignKeyDef,
+    pk_columns: Sequence[str] = (),
+    limit: int = 100,
+    *,
+    page_size: Optional[int] = None,
+    after: "Optional[Sequence[sql.Composable]]" = None,
+) -> sql.Composed:
+    """A query that LISTS the child rows of ``fk`` whose parent row is not on the target.
+
+    Shown to the operator when Aurora DSQL's validation of a foreign key fails (G142), next
+    to the orphan count: it selects the child's primary-key columns (in key order) and the
+    foreign-key columns of each orphan, ``limit`` at a time, so the rows can be found and
+    fixed. The orphan rule is the count's (:func:`_orphan_predicates`): a row with a NULL
+    in a foreign-key column is no orphan (MATCH SIMPLE). A child with no primary key lists
+    its foreign-key columns only.
+
+    With ``page_size`` and a primary key it reads ONE keyset window of the child, the way
+    the orphan count pages it: the ``page_size`` rows after ``after`` (the window's start,
+    exclusive, one composable per key column -- placeholders, or literals for a query to
+    run; ``None`` from the first row), pinned in a MATERIALIZED CTE before the anti-join.
+    Given the window where the count found the first orphan, it reads that page only, so a
+    very large child is never scanned in one statement (Aurora DSQL ends a transaction at
+    300 s). Without it, it is one scan of the whole child. Tables and columns are
+    identifiers; the only literals are ``limit``, ``page_size`` and the caller's ``after``.
+    """
+    child = _pg_table_identifier(child_table)
+    parent = _pg_table_identifier(fk.referenced_table)
+    columns = list(dict.fromkeys([*pk_columns, *fk.columns]))
+    ref = sql.Identifier(fk.referenced_columns[0])
+    if page_size and pk_columns:
+        not_null, join_predicate = _orphan_predicates(fk, "pg")
+        cursor = (
+            sql.SQL(" WHERE ({}) > ({})").format(
+                sql.SQL(", ").join(sql.Identifier(column) for column in pk_columns),
+                sql.SQL(", ").join(after),
+            )
+            if after
+            else sql.SQL("")
+        )
+        return sql.SQL(
+            "WITH pg AS MATERIALIZED (SELECT {columns} FROM {child}{cursor} ORDER BY {order} "
+            "LIMIT {page_size}) SELECT {listed} FROM pg LEFT JOIN {parent} AS p ON "
+            "{join_predicate} WHERE {not_null} AND p.{ref} IS NULL ORDER BY {listed_order} "
+            "LIMIT {limit}"
+        ).format(
+            columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+            child=child,
+            cursor=cursor,
+            order=_pg_qualified_order(child, pk_columns),
+            page_size=sql.Literal(int(page_size)),
+            listed=sql.SQL(", ").join(
+                sql.SQL("pg.{}").format(sql.Identifier(column)) for column in columns
+            ),
+            parent=parent,
+            join_predicate=join_predicate,
+            not_null=not_null,
+            ref=ref,
+            listed_order=sql.SQL(", ").join(
+                sql.SQL("pg.{}").format(sql.Identifier(column)) for column in pk_columns
+            ),
+            limit=sql.Literal(int(limit)),
+        )
+    not_null, join_predicate = _orphan_predicates(fk, "c")
+    order = list(pk_columns) or list(fk.columns)
+    return sql.SQL(
+        "SELECT {columns} FROM {child} AS c LEFT JOIN {parent} AS p ON {join_predicate} "
+        "WHERE {not_null} AND p.{ref} IS NULL ORDER BY {order} LIMIT {limit}"
+    ).format(
+        columns=sql.SQL(", ").join(
+            sql.SQL("c.{}").format(sql.Identifier(column)) for column in columns
+        ),
+        child=child,
+        parent=parent,
+        join_predicate=join_predicate,
+        not_null=not_null,
+        ref=ref,
+        order=sql.SQL(", ").join(
+            sql.SQL("c.{}").format(sql.Identifier(column)) for column in order
+        ),
+        limit=sql.Literal(int(limit)),
+    )
+
+
 def _build_pg_orphan_page_sql(
     child_table: str, fk: ForeignKeyDef, pk_column: str, page_size: int, *, first: bool
 ) -> sql.Composed:

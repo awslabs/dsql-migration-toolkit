@@ -2756,11 +2756,25 @@ def test_apply_foreign_keys_adds_constraint_after_load(monkeypatch) -> None:
     assert applied == [_FK_DDL]
 
 
-def test_apply_foreign_keys_skips_when_orphans_exist(monkeypatch) -> None:
+def test_apply_foreign_keys_adds_the_key_first_even_when_orphans_exist(monkeypatch) -> None:
+    # G142: ADD ... NOT VALID reads no row and succeeds over orphans, so no count runs
+    # before it: the key is added (Aurora DSQL's validation then reports the orphans).
     migrator = _view_migrator(table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])})
     applied = _patch_fk_apply(monkeypatch, orphans=3)
     migrator.apply_foreign_keys()
-    # An enforced ADD CONSTRAINT would fail on orphan rows, so the FK is NOT applied.
+    assert applied == [_FK_DDL]
+
+
+def test_apply_foreign_keys_skips_a_counted_first_key_when_orphans_exist(monkeypatch) -> None:
+    # The exception (G142): a key whose parent side is incomplete on Aurora DSQL by design
+    # is still counted before its ADD and left out while a child row names a missing parent.
+    migrator = _view_migrator(
+        table_conversions={"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])},
+        fk_counted_before_add={("orders", "fk_user"): "its parent table users is not part "
+                               "of this migration"},
+    )
+    applied = _patch_fk_apply(monkeypatch, orphans=3)
+    migrator.apply_foreign_keys()
     assert applied == []
 
 
@@ -2887,7 +2901,9 @@ def test_the_foreign_key_pass_emits_one_named_audit_line_with_its_outcome(monkey
         engine, "log_activity",
         lambda category, action, **kw: events.append((category, action, kw)),
     )
-    engine.apply_preserved_foreign_keys({"child": conv}, lambda: _FkProbeConnection(0))
+    engine.apply_preserved_foreign_keys(
+        {"child": conv}, lambda: _FkProbeConnection(0), check_before_add=_THREE_COUNTED,
+    )
 
     # A STARTED line + exactly ONE outcome line. The pinned invariant is the OUTCOME
     # count -- this pass once emitted two contradictory outcome lines 0.3 ms apart -- not
@@ -3148,12 +3164,14 @@ def test_apply_preserved_fk_matches_ddl_to_metadata_by_name(monkeypatch) -> None
         lambda tbl, name, *, connection_factory: validated.append((tbl, name)),
     )
     result = engine.apply_preserved_foreign_keys(
-        {"child": conv}, lambda: _CapturingConn(executed)
+        {"child": conv}, lambda: _CapturingConn(executed),
+        # Counted before its ADD (G142), so the count's pairing is exercised too.
+        check_before_add={("child", "fk_b"): "its parent table pb is not migrated"},
     )
     assert result == (1, 0, 0)
     assert applied == [ddl_b]                      # the surviving fk_b DDL was applied
     assert validated == [("child", "fk_b")]        # VALIDATE targets fk_b, not fk_a
-    # The orphan pre-gate keyed on fk_b's column ("b_id"), NOT fk_a's ("a_id").
+    # The orphan count keyed on fk_b's column ("b_id"), NOT fk_a's ("a_id").
     assert any("b_id" in stmt for stmt in executed)
     assert not any("a_id" in stmt for stmt in executed)
 
@@ -3167,10 +3185,16 @@ def test_apply_preserved_fk_counts_orphan_skip(monkeypatch) -> None:
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
     result = engine.apply_preserved_foreign_keys(
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(3),
+        check_before_add=_ORDERS_COUNTED,
+    )
+    assert result == (0, 1, 0)   # a counted-first key with orphan rows -> skipped
+    assert applied == []
+    # Any other key is added first (G142): the same orphans do not hold its ADD.
+    result = engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(3)
     )
-    assert result == (0, 1, 0)   # orphan rows -> skipped, not applied
-    assert applied == []
+    assert result == (1, 0, 0) and applied == [_FK_DDL]
 
 
 def test_apply_preserved_fk_counts_precheck_failure(monkeypatch) -> None:
@@ -3201,10 +3225,11 @@ def test_apply_preserved_fk_counts_precheck_failure(monkeypatch) -> None:
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
     result = engine.apply_preserved_foreign_keys(
-        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _BoomConn()
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _BoomConn(),
+        check_before_add=_ORDERS_COUNTED,
     )
     assert result == (0, 0, 1)
-    assert applied == []   # never applied a FK we could not pre-verify
+    assert applied == []   # never applied a counted-first FK we could not pre-verify
 
 
 def test_apply_preserved_fk_reconnects_on_transient_drop(monkeypatch) -> None:
@@ -3244,7 +3269,8 @@ def test_apply_preserved_fk_reconnects_on_transient_drop(monkeypatch) -> None:
     )
     monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
     result = engine.apply_preserved_foreign_keys(
-        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: conns.pop(0)
+        {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: conns.pop(0),
+        check_before_add=_ORDERS_COUNTED,
     )
     assert result == (1, 0, 0)   # reconnected and applied, not a false "apply manually"
     assert applied == [_FK_DDL]
@@ -15709,7 +15735,7 @@ def test_starting_a_new_full_load_clears_a_previous_accepted_gap() -> None:
             fn
             for fn in ast.walk(tree)
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and "set_fk_apply_result" in _calls(fn)
+            and "forget_applied_foreign_keys" in _calls(fn)
             and "set_prereq_gated_mode" in _calls(fn)
         ]
     )
@@ -22702,6 +22728,15 @@ def _three_fk_conv():
     )
 
 
+# G142: every key is added first unless its parent side is incomplete by design; the tests
+# that exercise the count before the ADD name their keys as counted first.
+_THREE_COUNTED = {
+    ("child", f"fk_{n}"): f"its parent table p{n} is not part of this migration"
+    for n in ("a", "b", "c")
+}
+_ORDERS_COUNTED = {("orders", "fk_user"): "its parent table users is not part of this migration"}
+
+
 def test_fk_pass_reports_progress_for_every_settled_fk(monkeypatch) -> None:
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
@@ -22721,7 +22756,8 @@ def test_fk_pass_reports_progress_for_every_settled_fk(monkeypatch) -> None:
 
     seen: list[tuple[int, int]] = []
     result = engine.apply_preserved_foreign_keys(
-        {"child": conv}, lambda: _FkProbeConnection(0), on_progress=lambda d, t: seen.append((d, t))
+        {"child": conv}, lambda: _FkProbeConnection(0), on_progress=lambda d, t: seen.append((d, t)),
+        check_before_add=_THREE_COUNTED,
     )
     assert result == (1, 1, 1), result
     # The denominator is the real number of FKs the pass works through, published up front
@@ -22943,13 +22979,14 @@ class _FkCardUi:
         return lambda *_a, **_k: _FkCardUi._El(self)
 
 
-def _render_fk_card(*, pending, applied, terminal=True, connections_ready=True):
+def _render_fk_card(*, pending, applied, terminal=True, connections_ready=True, validation=None):
     from dsql_migrator.ui.data_migration._full_load_ui import _render_foreign_key_action
 
     ui = _FkCardUi()
     _render_foreign_key_action(
         ui, terminal=terminal, pending=pending, applied=applied,
         apply_foreign_keys=lambda: None, connections_ready=connections_ready,
+        validation=validation,
     )
     return ui, " ".join(ui.notices)
 
@@ -23003,7 +23040,10 @@ def test_a_complete_fk_pass_still_reads_as_a_clean_success() -> None:
         flu.render_notice = real
     assert "success" in captured, captured
     assert "6 applied" in text and "of 6 applied" not in text, text
-    assert "Referential integrity is in place" in text, text
+    # G142: in place and enforcing, but "referential integrity is in place" is claimed only
+    # once Aurora DSQL validated the rows already loaded (see the validated-view test).
+    assert "Every key is in place and enforces each new write" in text, text
+    assert "Referential integrity is in place" not in text, text
     assert not _has_apply_button(ui), "nothing is outstanding, so offer no action"
 
 
@@ -23115,11 +23155,12 @@ def test_the_card_does_not_promise_an_action_it_will_not_render() -> None:
 
 
 def test_resuming_says_what_it_costs() -> None:
-    # The outstanding-state notice (which carries the "reads the whole child table" warning)
-    # is suppressed under the applied summary, so this render is the only place the cost of
-    # resuming can be stated -- and resume re-checks EVERY foreign key, not just the rest.
+    # The outstanding-state notice is suppressed under the applied summary, so this render
+    # is the only place the cost of resuming can be stated. Since G142 it is cheap: a key
+    # already in place is a no-op and each missing one is added at once (no row read).
     ui, text = _render_fk_card(pending=6, applied=(2, 0, 0))
-    assert "EVERY foreign key" in text and "whole child table" in text, text
+    assert "re-applying one is a no-op" in text and "added at once" in text, text
+    assert "whole child table" not in text and "EVERY foreign key" not in text, text
 
 
 def test_cutover_does_not_claim_foreign_keys_were_applied_automatically() -> None:
@@ -23158,7 +23199,9 @@ def test_a_reload_that_replaces_a_table_clears_the_stale_fk_result() -> None:
     # 1. a fresh load supersedes any earlier application outright.
     fresh = src[src.index("migration_state.clear_outputs()"):]
     fresh = fresh[:fresh.index("set_prereq_gated_mode")]
-    assert "set_fk_apply_result(None)" in fresh, (
+    # (G142: forget_applied_foreign_keys clears the result with Aurora DSQL's validation
+    # record and Cut over's own outcome.)
+    assert "forget_applied_foreign_keys()" in fresh, (
         "a new load must clear the previous foreign-key result:\n" + fresh
     )
 
@@ -23169,8 +23212,8 @@ def test_a_reload_that_replaces_a_table_clears_the_stale_fk_result() -> None:
     assert "if retry_replace:" in retry, (
         "the retry's clear must be scoped to replacements:\n" + retry
     )
-    assert "set_fk_apply_result(None)" in retry, retry
-    assert retry.index("if retry_replace:") < retry.index("set_fk_apply_result(None)")
+    assert "forget_applied_foreign_keys()" in retry, retry
+    assert retry.index("if retry_replace:") < retry.index("forget_applied_foreign_keys()")
 
 
 def test_a_confirmed_schema_replace_forgets_the_applied_foreign_keys() -> None:
@@ -28863,7 +28906,7 @@ def test_orphan_skipped_constraints_make_the_pass_a_warning(monkeypatch) -> None
         lambda category, action, **kw: events.append((category, action, kw)),
     )
     applied, skipped, failed = engine.apply_preserved_foreign_keys(
-        {"child": conv}, lambda: _FkProbeConnection(0)
+        {"child": conv}, lambda: _FkProbeConnection(0), check_before_add=_THREE_COUNTED,
     )
     assert (applied, skipped, failed) == (2, 1, 0)
     outcome = [
@@ -30389,15 +30432,18 @@ def test_the_apply_skips_an_absent_pointing_in_child_silently_but_not_a_migrated
     seen = []
     monkeypatch.setattr(engine, "_pregate_orphans",
                         lambda *a, **k: (seen.append(a), 0)[1], raising=False)
-    kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
-    assert set(kept) == {"shop.customers"}  # the absent pointing-in child: nothing to re-create
+    optional = frozenset({"shop.addresses"})
+
+    def _kept():
+        absent = engine._absent_optional_children(conv, lambda: object(), optional)
+        return engine.foreign_keys_to_apply(conv, optional, absent)
+
+    assert set(_kept()) == {"shop.customers"}  # the absent pointing-in child: nothing to re-create
     present["shop.addresses"] = True
-    kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
-    assert set(kept) == {"shop.customers", "shop.addresses"}
+    assert set(_kept()) == {"shop.customers", "shop.addresses"}
     # a MIGRATED child is never dropped by this (it must fail loudly if absent)
     present["shop.customers"] = False
-    kept = engine._drop_absent_optional_children(conv, lambda: object(), frozenset({"shop.addresses"}))
-    assert "shop.customers" in kept
+    assert "shop.customers" in _kept()
 
 
 # --- review of c7a75f9: a shard's re-read names the shard and its real snapshot ------

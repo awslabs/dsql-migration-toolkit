@@ -120,6 +120,8 @@ def _forget_applied_foreign_keys(session_id: str) -> None:
         _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
         _dm.set_fk_apply_result(None)
         _dm.set_fk_apply_progress(0, 0)
+        # ...and Aurora DSQL's validation of them (G142): the keys go with the tables.
+        _dm.clear_fk_validation()
     except Exception:  # noqa: BLE001 - advisory; the apply must still run
         logging.getLogger(__name__).warning(
             "Could not clear the Full Load foreign-key result", exc_info=True

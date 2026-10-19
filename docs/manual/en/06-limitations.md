@@ -16,7 +16,7 @@ fails **loudly** where it can't.
 
 | Limit | Consequence | Tool behavior |
 |---|---|---|
-| **Foreign keys (enforced, with runtime caveats)** | DSQL supports **enforced** foreign keys, but DML on referenced/referencing tables incurs **extra reads**, a concurrent conflict is a retryable `40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward the **3000-row/txn** limit (a cascade touching > 3000 rows fails). | Preserved and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT` (Full Load applies it after the data lands; a CDC migration defers it to cut over). Prefer `NO ACTION`/`RESTRICT` for unbounded child cardinality, or strip them (`preserve_foreign_keys=False`) and enforce integrity in the app. |
+| **Foreign keys (enforced, with runtime caveats)** | DSQL supports **enforced** foreign keys, but DML on referenced/referencing tables incurs **extra reads**, a concurrent conflict is a retryable `40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward the **3000-row/txn** limit (a cascade touching > 3000 rows fails). | Preserved and re-created as a post-load `ALTER TABLE … ADD CONSTRAINT … NOT VALID`: added at once, then validated by Aurora DSQL against the rows already loaded, in the background (the **Apply foreign keys** action after a Full Load; at cut over for a CDC migration). Prefer `NO ACTION`/`RESTRICT` for unbounded child cardinality, or strip them (`preserve_foreign_keys=False`) and enforce integrity in the app. |
 | **Source `CHECK` constraints** | A source `CHECK` constraint is not translated to the target (e.g. a MySQL `CHECK`, 8.0.16+). | Dropped from the DDL and flagged **MANUAL** — re-add a DSQL-compatible `CHECK` by hand or enforce it in the app. (The `CHECK … IN (...)` the tool generates for a MySQL `ENUM` or a PostgreSQL enum, both converted to `text`, is unaffected. A value added to the source type later is dead-lettered with `23514` until you replace that `CHECK`; see [§4.2](04-cdc-and-dsql-constraints.md#detecting-and-handling-source-schema-drift).) |
 | **Primary key required** | A PK-less table can't be migrated. | Flagged **UNSUPPORTED**; also blocks Full Load (keyset export needs a PK). |
 | **No triggers / stored procedures / functions / scheduled events** | Server-side logic doesn't move. | Flagged **UNSUPPORTED** — reimplement in the application (events → EventBridge/Lambda). |
@@ -498,14 +498,25 @@ fails **loudly** where it can't.
   CASCADE` (and `SET NULL`/`SET DEFAULT`) actions fire *inside* the source engine
   and may not be captured by the change stream, so CDC can't apply them — the child
   rows the source cascaded are left behind on the target (for a MySQL source, InnoDB
-  fires them without ever writing them to the binlog). Because the tool re-creates
-  the foreign key on DSQL **at
-  cut over** (never during replication), those orphaned rows then **block the
-  `ADD CONSTRAINT`** and are reported by the **Validation orphan check**, rather
-  than silently diverging. Evaluation flags such tables **MANUAL**; replace the
-  automatic action with explicit child-row statements in the application, and
-  **quiesce source writes before the final cut-over comparison** so the divergence
-  is caught.
+  fires them without ever writing them to the binlog). The tool re-creates the
+  foreign key on DSQL **at cut over** (never during replication): it is still added at
+  once (`NOT VALID`), but Aurora DSQL's **validation of the loaded rows fails** on those
+  orphaned rows — the cut-over screen names the key, counts the rows and lists them,
+  and for a MySQL source **I've cut over** waits until the key validates or you choose
+  to cut over without that check — and the **Validation orphan check** reports them
+  too, rather than letting them silently diverge. Evaluation flags such tables
+  **MANUAL**; replace the automatic action with explicit child-row statements in the
+  application, and **quiesce source writes before the final cut-over comparison** so the
+  divergence is caught.
+- **A foreign key Aurora DSQL could not validate stays `NOT VALID`.** It is in place and
+  enforced for every new write: an insert, or an update that changes the key, naming a
+  missing parent is refused (`23503`), and so is deleting or re-keying a parent row that
+  is still referenced (`NO ACTION` / `RESTRICT`; `CASCADE` and `SET NULL` act as usual).
+  The rows already there are not checked again: updating a non-key column of such a row,
+  deleting it, or pointing it at an existing parent works — re-saving it as a delete plus
+  a re-insert does not, like any new orphan. The key is not proven until the rows are
+  fixed (in batches of at most 3,000 rows per transaction) and **Validate again**
+  succeeds.
 - **One CDC pipeline captures a bounded number of tables: about 80–160 with typical names.**
   The CDC stack receives the captured tables in single CloudFormation parameters: the table
   list (`TableIncludeList`), the sink's topic list (`SinkTopics`, one `dsqlcdc.<table>` per

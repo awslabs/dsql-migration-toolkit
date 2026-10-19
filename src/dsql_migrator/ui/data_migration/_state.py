@@ -43,6 +43,11 @@ from dsql_migrator.ui.data_migration._cdc_status import CdcActivitySummary
 _LOGGER = logging.getLogger(__name__)
 
 
+def _utc(moment: datetime) -> datetime:
+    """``moment`` as an aware UTC time (a naive one is taken as UTC)."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
 class DataMigrationState:
     """Per-session Data Migration sub-flow state (selection, prereqs, job, errors).
 
@@ -433,6 +438,39 @@ class DataMigrationState:
         # (Full load only, G12): the keys it applied are still in place, so the card asks to
         # apply again for the changed set instead of saying they were never applied.
         self.fk_result_scope_changed: bool = False
+        # G142: Aurora DSQL's validation of each key the last FK pass put in place -- the
+        # Data Migration action's for Full load only, the cut-over one for CDC -- keyed by
+        # (child table, constraint): the VALIDATE job id, the status / details last seen and
+        # the orphan count explaining a failure (core.models.ForeignKeyValidationJob).
+        # PERSISTED (SessionSnapshot.foreign_key_validation): the verdict is read back from
+        # the target by these ids after a re-render, a Validation re-run or a restart.
+        self._fk_validation: dict = {}
+        # The unselected children pointing in that the same pass found absent from the
+        # target and left out (foreign_keys_to_apply): Cut over's Finish waits for none of
+        # their keys. PERSISTED with the record (SessionSnapshot.foreign_key_absent_children).
+        self._fk_absent_children: frozenset = frozenset()
+        # The last catalog read of those keys ({key: ForeignKeyValidationRead or None}) and
+        # when it was taken (None: not read in this process -- the screens say "reading").
+        # Session-only: never trusted from a snapshot; the watch reads it again.
+        self._fk_validation_reads: dict = {}
+        self._fk_validation_read_at: Optional[datetime] = None
+        # A read that STARTED before this moment is not stored: the record changed since
+        # (a pass, Validate again, keys dropped) or the screens stopped trusting older reads
+        # (a migration-type change, Cut over after a newer Validation verdict).
+        self._fk_reads_floor: Optional[datetime] = None
+        # Why a failed key's explaining count could not run ({key: (job id, reason)}).
+        self._fk_explain_errors: dict = {}
+        # The listing query with its window's start filled in ({key: (job id, text)}): it
+        # holds key values, so it is never persisted or logged -- the screen shows it.
+        self._fk_listing_runnable: dict = {}
+        # The background watch (polls sys.jobs / convalidated, explains a failure) and the
+        # "Validate again" job: their own slots, single flight each, never fk_apply_job_id
+        # (which the table-set lock and the Apply button read).
+        self.fk_validation_job_id: Optional[str] = None
+        self.fk_revalidation_job_id: Optional[str] = None
+        self._fk_watch_claimed: frozenset = frozenset()
+        self._fk_watch_active = False
+        self._fk_watch_ended_at: Optional[float] = None
         self.cdc_connector_names: list[str] = []
         # Subset of cdc_connector_names whose MSK connectorState is RUNNING (vs
         # still CREATING/UPDATING). Lets the lifecycle card distinguish "deployed
@@ -1566,6 +1604,366 @@ class DataMigrationState:
             self.fk_apply_result = result
             self.fk_result_scope_changed = False
 
+    def forget_applied_foreign_keys(self) -> None:
+        """A new load or a Drop & reload retry is about to drop and recreate target tables,
+        and Aurora DSQL drops a table's foreign keys with it: every "foreign keys applied"
+        verdict goes -- this step's result and progress, Aurora DSQL's validation record of
+        the keys (G142), and Cut over's own outcome (through ``validation_state_provider``,
+        as a schema replace does), so no old result or settled read opens Finish over keys
+        that are gone. Fail-closed: the worst case is a prompt to re-apply keys still in
+        place, and re-applying one is a no-op (42710)."""
+        self.set_fk_apply_result(None)
+        self.set_fk_apply_progress(0, 0)
+        self.clear_fk_validation()
+        self._forget_cutover_fk_outcome()
+
+    def _forget_cutover_fk_outcome(self) -> None:
+        """Cut over's own foreign-key result and its waivers go (through
+        ``validation_state_provider``, as a schema replace does): every path that drops the
+        keys calls it, so an earlier "Applied N" never opens Finish over keys that are gone.
+        Best effort."""
+        provider = getattr(self, "validation_state_provider", None)
+        if not callable(provider):
+            return
+        try:
+            clear = getattr(provider(), "clear_cutover_outcomes", None)
+            if callable(clear):
+                clear()
+        except Exception:  # noqa: BLE001 - advisory; the load / the drop must still run
+            _LOGGER.warning("Could not clear the cut-over foreign-key result", exc_info=True)
+
+    # -- G142: Aurora DSQL's validation of the foreign keys in place --------------------
+
+    def record_fk_validation(self, submission, *, now: Optional[datetime] = None) -> None:
+        """Record what a foreign-key pass handed Aurora DSQL to validate (a
+        ``ForeignKeyValidationSubmission``). The pass's keys REPLACE the record: a key it
+        did not put in place is not on the target as this pass knows it. A key whose
+        recorded job still runs keeps its record; every other key starts clean. The
+        children it left out as absent replace the last pass's too."""
+        from dsql_migrator.core.models import ForeignKeyValidationJob
+
+        stamp = now or datetime.now(timezone.utc)
+        jobs = dict(getattr(submission, "jobs", None) or {})
+        already = set(getattr(submission, "already_valid", None) or ())
+        with self._lock:
+            self._fk_absent_children = frozenset(
+                str(name) for name in getattr(submission, "absent_children", None) or ()
+            )
+            previous = self._fk_validation
+            record: dict = {}
+            for key in getattr(submission, "in_place", None) or ():
+                key = (str(key[0]), str(key[1]))
+                job = jobs.get(key)
+                kept = previous.get(key)
+                if job and kept is not None and kept.job_id == job:
+                    record[key] = kept
+                    continue
+                record[key] = ForeignKeyValidationJob(
+                    table=key[0],
+                    constraint=key[1],
+                    job_id=job or None,
+                    status="submitted" if job else "completed" if key in already else None,
+                    submitted_at=stamp if (job or key in already) else None,
+                )
+                self._fk_validation_reads.pop(key, None)
+                self._fk_explain_errors.pop(key, None)
+                self._fk_listing_runnable.pop(key, None)
+            self._fk_validation = record
+            # Not read since: the screens say they are reading until the watch's first read,
+            # and a read that started before this pass describes the target before it.
+            self._fk_validation_read_at = None
+            self._raise_reads_floor_locked(stamp)
+
+    def record_fk_revalidation(
+        self, submitted: "Mapping[tuple[str, str], Optional[str]]", *, now: Optional[datetime] = None
+    ) -> None:
+        """Record "Validate again": each key's NEW job id (``None``: already valid). Its
+        last read and explanation belong to the old job, so they are dropped."""
+        from dsql_migrator.core.models import ForeignKeyValidationJob
+
+        stamp = now or datetime.now(timezone.utc)
+        with self._lock:
+            for key, job in (submitted or {}).items():
+                if key not in self._fk_validation:
+                    continue
+                self._fk_validation[key] = ForeignKeyValidationJob(
+                    table=key[0],
+                    constraint=key[1],
+                    job_id=job or None,
+                    status="submitted" if job else "completed",
+                    submitted_at=stamp,
+                )
+                self._fk_validation_reads.pop(key, None)
+                self._fk_explain_errors.pop(key, None)
+                self._fk_listing_runnable.pop(key, None)
+                self._fk_validation_read_at = None
+                self._raise_reads_floor_locked(stamp)
+
+    def _raise_reads_floor_locked(self, moment: datetime) -> None:
+        moment = _utc(moment)
+        if self._fk_reads_floor is None or self._fk_reads_floor < moment:
+            self._fk_reads_floor = moment
+
+    def invalidate_fk_validation_reads(self, *, before: Optional[datetime] = None) -> bool:
+        """Stop trusting the catalog reads that started at or before ``before`` (now, when
+        ``None``): the screens say they are reading until a newer read lands, and a read
+        still in flight from before is not stored. The record (the job ids) stays.
+
+        A migration-type change calls it, and Cut over with its latest Validation verdict:
+        the keys may have been dropped since an older read saw them in place, and an old
+        settled read must never open Finish. Returns whether a read was dropped (False when
+        the last one is newer than ``before``)."""
+        now = datetime.now(timezone.utc)
+        # Never later than now: a verdict time from a clock ahead of this one (a restored
+        # session) must not refuse every read until the clock catches up.
+        cutoff = min(_utc(before), now) if before is not None else now
+        with self._lock:
+            self._raise_reads_floor_locked(cutoff)
+            read_at = self._fk_validation_read_at
+            if read_at is not None and _utc(read_at) > cutoff:
+                return False
+            dropped = read_at is not None or bool(self._fk_validation_reads)
+            self._fk_validation_reads = {}
+            self._fk_validation_read_at = None
+            return dropped
+
+    def forget_fk_validation_keys(self, keys: "Iterable[tuple[str, str]]") -> int:
+        """Drop ``keys`` from the record: the tool removed them from the target (Start CDC's
+        "Remove foreign keys"), so no read of them may say they are in place. Cut over's own
+        result and its waivers go too, whether or not CDC then starts: Finish then asks for
+        the keys to be applied again. Returns how many were recorded."""
+        wanted = {(str(key[0]), str(key[1])) for key in keys or ()}
+        with self._lock:
+            gone = [key for key in self._fk_validation if key in wanted]
+            for key in gone:
+                self._fk_validation.pop(key, None)
+                self._fk_validation_reads.pop(key, None)
+                self._fk_explain_errors.pop(key, None)
+                self._fk_listing_runnable.pop(key, None)
+            if gone:
+                self._raise_reads_floor_locked(datetime.now(timezone.utc))
+        if wanted:
+            self._forget_cutover_fk_outcome()
+        return len(gone)
+
+    def fk_validation_records(self) -> dict:
+        """``{(child, constraint): ForeignKeyValidationJob}`` (a copy; records are frozen)."""
+        with self._lock:
+            return dict(self._fk_validation)
+
+    def fk_absent_children(self) -> frozenset:
+        """The unselected children pointing in that the last pass found absent and left out."""
+        with self._lock:
+            return self._fk_absent_children
+
+    def fk_validation_record(self, key) -> object:
+        with self._lock:
+            return self._fk_validation.get(tuple(key))
+
+    def set_fk_validation_reads(
+        self,
+        reads: Mapping,
+        jobs: "Optional[Mapping[tuple[str, str], str]]" = None,
+        *,
+        now: Optional[datetime] = None,
+    ) -> "tuple[list, bool, bool, Optional[dict]]":
+        """Store a catalog read of the recorded keys and fold what it saw into the record
+        (the job status last seen, a failure's details, ``completed`` once convalidated).
+        ``jobs`` are the job ids the read asked ``sys.jobs`` for: a key whose job changed
+        meanwhile ("Validate again") keeps its new record and drops the stale read.
+        ``now`` is when the read STARTED (the watch's): one that started no later than the
+        record last changed or the reads were invalidated is not stored at all -- the same
+        instant counts as before, so the race is read again. Without it the read counts as
+        taken now.
+
+        Returns ``(keys newly validated, every key validated, the screen's view changed,
+        the reads stored)``: the watch logs the first transition, refreshes the screen only
+        on a change, and judges its keys by the stored reads (``None``: none was stored).
+        """
+        from dsql_migrator.ui.data_migration._fk_validation import (
+            fk_validation_state,
+            sanitize_job_details,
+        )
+
+        stamp = _utc(now) if now is not None else datetime.now(timezone.utc)
+        asked = dict(jobs or {})
+        newly: list = []
+        with self._lock:
+            if now is not None and self._fk_reads_floor is not None and (
+                stamp <= self._fk_reads_floor
+            ):
+                return [], False, False, None
+            before = {
+                key: fk_validation_state(self._fk_validation_reads.get(key), rec)
+                for key, rec in self._fk_validation.items()
+            } if self._fk_validation_read_at is not None else None
+            self._fk_validation_reads = {
+                key: read
+                for key, read in (reads or {}).items()
+                if key in self._fk_validation
+                and (jobs is None or self._fk_validation[key].job_id == asked.get(key))
+            }
+            self._fk_validation_read_at = stamp
+            for key, read in self._fk_validation_reads.items():
+                rec = self._fk_validation[key]
+                if read is None or not getattr(read, "present", False):
+                    continue
+                if getattr(read, "validated", False):
+                    if rec.status != "completed":
+                        newly.append(key)
+                        self._fk_validation[key] = rec.model_copy(
+                            update={"status": "completed", "details": None}
+                        )
+                    continue
+                status = getattr(read, "job_status", None)
+                if status in ("submitted", "processing", "failed") and status != rec.status:
+                    update: dict = {"status": status}
+                    if status == "failed":
+                        update["details"] = sanitize_job_details(
+                            getattr(read, "job_details", None)
+                        )
+                    self._fk_validation[key] = rec.model_copy(update=update)
+            after = {
+                key: fk_validation_state(self._fk_validation_reads.get(key), rec)
+                for key, rec in self._fk_validation.items()
+            }
+            every = bool(after) and all(state == "validated" for state in after.values())
+            stored = dict(self._fk_validation_reads)
+        return newly, every, after != before, stored
+
+    def fk_validation_view(self):
+        """The screens' view of the record under the last read (``_fk_validation``)."""
+        from dsql_migrator.ui.data_migration._fk_validation import fk_validation_view
+
+        with self._lock:
+            records = dict(self._fk_validation)
+            reads = dict(self._fk_validation_reads)
+            read_at = self._fk_validation_read_at
+            errors = {
+                key: reason
+                for key, (job, reason) in self._fk_explain_errors.items()
+                if key in records and records[key].job_id == job
+            }
+            runnable = {
+                key: text
+                for key, (job, text) in self._fk_listing_runnable.items()
+                if key in records and records[key].job_id == job
+            }
+        return fk_validation_view(records, reads, read_at, errors, runnable)
+
+    def note_fk_explanation(
+        self, key, job_id: Optional[str], count: Optional[int], listing_sql: Optional[str],
+        *, error: Optional[str] = None, listing_runnable: Optional[str] = None,
+    ) -> None:
+        """Record the orphan count / listing query explaining ``key``'s failed job, or why
+        it could not be counted. Dropped when the key's job changed meanwhile.
+        ``listing_runnable`` (the listing with its window's start filled in) stays in this
+        process only: it holds key values."""
+        key = tuple(key)
+        with self._lock:
+            rec = self._fk_validation.get(key)
+            if rec is None or rec.job_id != job_id:
+                return
+            if listing_runnable:
+                self._fk_listing_runnable[key] = (job_id, str(listing_runnable))
+            if listing_sql:
+                rec = rec.model_copy(update={"listing_sql": listing_sql})
+            if count is not None:
+                rec = rec.model_copy(update={"orphan_count": int(count)})
+                self._fk_explain_errors.pop(key, None)
+            elif error:
+                self._fk_explain_errors[key] = (job_id, str(error))
+            self._fk_validation[key] = rec
+
+    def fk_explain_error(self, key, job_id: Optional[str]) -> Optional[str]:
+        """Why ``key``'s failed job ``job_id`` could not be counted in this process, if so."""
+        with self._lock:
+            entry = self._fk_explain_errors.get(tuple(key))
+        if entry is None or entry[0] != job_id:
+            return None
+        return entry[1]
+
+    def restore_fk_validation(self, records: Iterable, absent_children: Iterable = ()) -> None:
+        """Restore the persisted record (a snapshot's ``foreign_key_validation`` and
+        ``foreign_key_absent_children``)."""
+        with self._lock:
+            self._fk_validation = {
+                (rec.table, rec.constraint): rec for rec in (records or ())
+            }
+            self._fk_absent_children = frozenset(str(name) for name in absent_children or ())
+            self._fk_validation_reads = {}
+            self._fk_validation_read_at = None
+            self._fk_explain_errors = {}
+            self._fk_listing_runnable = {}
+            self._raise_reads_floor_locked(datetime.now(timezone.utc))
+
+    def clear_fk_validation(self) -> None:
+        """Forget the record: the target's tables were replaced (a schema replace, a new
+        load, a Drop & reload retry), and their keys went with them."""
+        with self._lock:
+            self._fk_validation = {}
+            self._fk_absent_children = frozenset()
+            self._fk_validation_reads = {}
+            self._fk_validation_read_at = None
+            self._fk_explain_errors = {}
+            self._fk_listing_runnable = {}
+            self._raise_reads_floor_locked(datetime.now(timezone.utc))
+
+    def _start_single(self, slot: str, submit: Callable[[], str], is_live) -> Optional[str]:
+        """Submit into ``slot`` unless its job is live or a submission for it is in progress
+        (two renders at once must not start two watches)."""
+        with self._lock:
+            if slot in self._fk_watch_claimed or is_live(getattr(self, slot)):
+                return None
+            self._fk_watch_claimed = self._fk_watch_claimed | {slot}
+        job_id: Optional[str] = None
+        try:
+            job_id = submit()
+            return job_id
+        finally:
+            with self._lock:
+                self._fk_watch_claimed = self._fk_watch_claimed - {slot}
+                if job_id is not None:
+                    setattr(self, slot, job_id)
+
+    def start_fk_validation_watch(self, submit: Callable[[], str], is_live) -> Optional[str]:
+        """Start the validation watch (single flight); its job id, or ``None``."""
+        return self._start_single("fk_validation_job_id", submit, is_live)
+
+    def start_fk_revalidation(self, submit: Callable[[], str], is_live) -> Optional[str]:
+        """Start "Validate again" (single flight); its job id, or ``None``."""
+        return self._start_single("fk_revalidation_job_id", submit, is_live)
+
+    def mark_fk_validation_watch_active(self) -> None:
+        """A watch's work started (it reads the record until it ends)."""
+        with self._lock:
+            self._fk_watch_active = True
+
+    def fk_validation_watch_active(self) -> bool:
+        """Whether a watch's work runs now -- False already in its last refresh, so that
+        render arms the screen's return instead of trusting a job about to end."""
+        with self._lock:
+            return self._fk_watch_active
+
+    def note_fk_validation_watch_ended(self, now: Optional[float] = None) -> None:
+        import time as _time
+
+        with self._lock:
+            self._fk_watch_active = False
+            self._fk_watch_ended_at = _time.monotonic() if now is None else now
+
+    def fk_validation_watch_rest_over(
+        self, now: Optional[float] = None, rest_seconds: float = 30.0
+    ) -> bool:
+        """Whether a screen may start a watch again: none ended in the last ``rest_seconds``."""
+        import time as _time
+
+        with self._lock:
+            ended = self._fk_watch_ended_at
+        if ended is None:
+            return True
+        return (_time.monotonic() if now is None else now) - ended >= rest_seconds
+
     def set_cdc_controller(
         self, controller: object, identity: Optional[tuple] = None
     ) -> None:
@@ -2400,9 +2798,15 @@ class DataMigrationState:
 
     def set_migration_type(self, migration_type: "MigrationType") -> None:
         """Record the user's Data Migration type selection (UI thread)."""
+        changed = migration_type is not self.migration_type
         self.migration_type = migration_type  # routes through the property setter
         # Its sub-steps differ, so a review of the previous type's checks is over.
         self.prereq_review_open = False
+        if changed:
+            # G142: the keys' catalog reads describe the previous type's journey (a CDC
+            # start removes the keys a Full load only pass added), so they are read again
+            # before any screen says the keys are in place.
+            self.invalidate_fk_validation_reads()
 
     def open_prereq_review(self) -> None:
         """A prerequisite run just ended: keep its results open (UI thread)."""

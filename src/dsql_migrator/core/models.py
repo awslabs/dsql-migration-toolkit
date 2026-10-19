@@ -350,9 +350,11 @@ class ForeignKeyDef(BaseModel):
     # replicate them; and the tool applies foreign keys only at cut over (never while
     # the sink streams), so there is no target-side FK to re-perform the cascade in
     # flight. The child rows the source cascade removed/nulled are therefore left as
-    # orphans on the target, which then BLOCK the post-load / cut-over ADD CONSTRAINT
-    # (the orphan pre-gate) -- an actionable error, not silent divergence. The assessor
-    # uses these to flag the affected tables up front.
+    # orphans on the target: the key is still added at cut over (NOT VALID, it refuses
+    # every new orphan), but Aurora DSQL's validation of the loaded rows fails on them,
+    # and Cut over holds Finish on such a key until it validates (G142) -- an actionable
+    # per-key report, not silent divergence. The assessor uses these to flag the
+    # affected tables up front.
     on_delete: Optional[str] = None
     on_update: Optional[str] = None
 
@@ -2155,9 +2157,9 @@ class OrphanFinding(BaseModel):
 
     Records child rows whose foreign-key value has no matching parent row on the
     target (Requirement 6.3). Aurora DSQL enforces foreign keys, but the tool applies
-    them only after the load / at cut over, so this doubles as the PRE-APPLY GATE: an
-    enforced ``ADD CONSTRAINT`` cannot be created while orphans exist, so a count > 0
-    blocks that FK with an actionable message (and is also the safety net when the user
+    them only after the load / at cut over, as ``NOT VALID`` keys Aurora DSQL then
+    validates against the loaded rows (G142) -- a validation these orphans would fail --
+    so this is the early warning to run before that (and the safety net when the user
     strips FKs to enforce integrity in the application). Only actual orphans (count > 0)
     are reported.
     """
@@ -2181,6 +2183,37 @@ class UncheckedForeignKey(BaseModel):
     table: str = Field(min_length=1)
     foreign_key: str = Field(min_length=1)
     referenced_table: str = Field(min_length=1)
+
+
+class ForeignKeyValidationJob(BaseModel):
+    """Aurora DSQL's validation of one foreign key the tool put in place (G142), kept across
+    app restarts.
+
+    "Apply foreign keys" adds each key ``NOT VALID`` (seconds: no row is read, and every new
+    write is enforced from then on), then submits ``ALTER TABLE ASYNC ... VALIDATE
+    CONSTRAINT``, which checks the rows already loaded as a server-side job. The verdict is
+    read back from Aurora DSQL by ``job_id`` (``sys.jobs``) and ``convalidated``; this keeps
+    what the screens need when that read is not possible any more: the id itself (``None``
+    when the statement returned no job -- the key was already valid -- or could not be
+    submitted), the job ``status`` last seen there (``"submitted"`` / ``"processing"`` /
+    ``"completed"`` / ``"failed"``; Aurora DSQL drops a finished job after about 30
+    minutes), a failed job's ``details`` (the error text, no key value), and the orphan
+    count and the literal-free listing query that explain a failure. Value-free (Property
+    7). Frozen, replaced on every change; fields are left out of the payload while unset.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    table: str = Field(min_length=1)
+    constraint: str = Field(min_length=1)
+    job_id: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
+    status: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
+    details: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
+    # ``is None``, not falsy: an explaining count of 0 ("no such row is found now") is a
+    # result, and dropping it would rerun the O(child rows) count after every restart.
+    orphan_count: Optional[int] = Field(default=None, ge=0, exclude_if=lambda v: v is None)
+    listing_sql: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
+    submitted_at: Optional[datetime] = Field(default=None, exclude_if=lambda v: not v)
 
 
 class DriftReport(BaseModel):
@@ -2358,6 +2391,7 @@ __all__ = [
     "TableValidationResult",
     "OrphanFinding",
     "UncheckedForeignKey",
+    "ForeignKeyValidationJob",
     "DriftReport",
     "ValidationReport",
 ]

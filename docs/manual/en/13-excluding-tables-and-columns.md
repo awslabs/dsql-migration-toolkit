@@ -623,8 +623,8 @@ No Start over is needed.
   rules to it again.
 - **Foreign keys.** Unticking tables after a complete **Apply foreign keys** pass keeps
   its result: the keys stay in place. After you tick a table (or untick one after a
-  stopped pass), the card asks you to apply again: keys already in place are kept, but
-  the pass re-checks every key.
+  stopped pass), the card asks you to apply again: keys already in place are kept (a
+  no-op), and each missing one is added at once.
 - **Validation.** Once a newly selected table is loaded, re-run Validation: Cut over
   holds until the result covers every table selected since the Full Load (or you turn
   its chip off under Objects to validate). While such a table is not loaded yet, Cut over

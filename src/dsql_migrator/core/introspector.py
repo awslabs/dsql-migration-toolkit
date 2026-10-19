@@ -1044,7 +1044,7 @@ def _qualify(schema: str, *object_lists: list) -> None:
     A table's ``foreign_keys[].referenced_table`` MUST be qualified together with the
     table's own name. Qualifying only ``name`` leaves a child ``ecommerce.orders`` whose
     FK still points at a bare ``customers``, and every consumer then resolves that parent
-    through the target's default search_path (``"$user", public``): the orphan pre-gate
+    through the target's default search_path (``"$user", public``): the FK pass
     raises 42P01 so the FK is skipped entirely, or -- worse, on a cluster still holding
     tables from an earlier bare-name run -- it silently resolves to a STALE
     ``public.customers`` and installs an FK enforcing integrity against dead data.

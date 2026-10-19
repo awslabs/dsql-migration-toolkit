@@ -3793,7 +3793,8 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
     unsupported statement): DSQL adds the constraint without scanning existing data,
     and it **enforces all new inserts/updates immediately**. Existing (just-loaded)
     rows are validated separately by ``ALTER TABLE ASYNC ... VALIDATE CONSTRAINT``
-    (fired by the Full Load / cut-over apply pass once the orphan pre-gate is clean).
+    (submitted by the Full Load / cut-over apply pass right after the keys are added;
+    Aurora DSQL reports the verdict, G142).
 
     Returns an empty list when ``preserve`` is False (the user chose to strip FKs
     and enforce referential integrity in the application layer).

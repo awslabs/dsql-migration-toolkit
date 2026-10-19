@@ -15,7 +15,7 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 
 | 한계 | 결과 | 도구 동작 |
 |---|---|---|
-| **외래 키(지원·강제됨)** | DSQL은 강제되는 외래 키를 지원합니다. 다만 참조/피참조 테이블에 대한 DML에는 추가 읽기 비용이 있고, `CASCADE`/`SET NULL`/`SET DEFAULT` 동작은 트랜잭션당 3,000행 한도에 포함됩니다. | FK를 제거하지 않고 **보존** — 적재 후 실행할 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`로 렌더링(`CREATE TABLE` 밖)해 데이터 적재 뒤 다시 생성하며, CDC 마이그레이션은 cut over 시점에 적용. Evaluation은 이를 **권고(RECOMMENDED, 필수 작업 아님)**로 분류하고, 원하면 떼어 낼 수도 있음(`preserve_foreign_keys=False`). |
+| **외래 키(지원·강제됨)** | DSQL은 강제되는 외래 키를 지원합니다. 다만 참조/피참조 테이블에 대한 DML에는 추가 읽기 비용이 있고, `CASCADE`/`SET NULL`/`SET DEFAULT` 동작은 트랜잭션당 3,000행 한도에 포함됩니다. | FK를 제거하지 않고 **보존** — 적재 후 실행할 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY … NOT VALID`로 렌더링(`CREATE TABLE` 밖)해 데이터 적재 뒤 다시 생성하며(Full Load 후 **Apply foreign keys** 동작, CDC 마이그레이션은 cut over 시점), 각 키를 바로 추가한 뒤 이미 적재된 행은 Aurora DSQL이 백그라운드에서 검증. Evaluation은 이를 **권고(RECOMMENDED, 필수 작업 아님)**로 분류하고, 원하면 떼어 낼 수도 있음(`preserve_foreign_keys=False`). |
 | **소스 `CHECK` 제약** | 소스의 `CHECK` 제약은 타깃으로 변환되지 않음(예: MySQL `CHECK`, 8.0.16+). | DDL에서 드롭되고 **MANUAL** 플래그 — DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제. (도구가 MySQL `ENUM`이나 PostgreSQL enum(둘 다 `text`로 변환됨)용으로 생성하는 `CHECK … IN (...)`은 영향 없음. 나중에 소스 타입에 추가된 값은 그 `CHECK`를 바꿀 때까지 `23514`로 데드레터됨; [§4.2](04-cdc-and-dsql-constraints.md#cdc-중-소스-스키마-드리프트-감지처리) 참고.) |
 | **기본 키 필수** | PK 없는 테이블은 마이그레이션 불가. | **UNSUPPORTED** 플래그; Full Load도 차단(keyset export에 PK 필요). |
 | **트리거/저장 프로시저/함수/스케줄 이벤트 없음** | 서버 측 로직은 옮겨지지 않음. | **UNSUPPORTED** — 애플리케이션으로 재구현(이벤트 → EventBridge/Lambda). |
@@ -394,9 +394,18 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **캐스케이드 FK 동작은 CDC로 복제되지 않음.** 서버 측 `ON DELETE/UPDATE CASCADE`(및 `SET NULL`/
   `SET DEFAULT`) 동작은 소스 엔진 *내부*에서 발생해 변경 스트림에 잡히지 않을 수 있으므로 CDC가 적용할 수
   없습니다 — 소스가 캐스케이드한 자식 행이 타깃에 orphan으로 남습니다(MySQL 소스의 경우 InnoDB가 binlog에
-  남기지 않은 채 실행). 이 orphan은 조용히 어긋나 버리는 대신 **cut over
-  시점의 외래 키 적용(`ADD CONSTRAINT`)을 차단**하며(Validation의 **고아 검사**가 먼저 잡아냄), 그래서
-  cut over 전에 정리하게 됩니다. Evaluation이 해당 테이블을 표시합니다.
+  남기지 않은 채 실행). 도구는 **cut over 시점**에 외래 키를 다시 생성합니다(복제 중에는 하지 않음): 키는
+  여전히 바로 추가되지만(`NOT VALID`) 이 orphan 행들에서 Aurora DSQL의 **적재된 행 검증이 실패**합니다 —
+  cut-over 화면이 그 키를 알리고 행 수를 세어 나열하며, MySQL 소스라면 **I've cut over**는 키가 검증될
+  때까지, 또는 그 검사 없이 cut over하기로 선택할 때까지 기다립니다 — 그리고 Validation의 **고아
+  검사**도 이를 보고하므로 조용히 어긋나지 않습니다. Evaluation이 해당 테이블을 표시합니다.
+- **Aurora DSQL이 검증하지 못한 외래 키는 `NOT VALID`로 남음.** 키는 자리를 잡고 모든 신규 쓰기에
+  강제됩니다: 없는 부모를 가리키는 삽입이나 키를 바꾸는 갱신은 거부되고(`23503`), 아직 참조되는 부모
+  행의 삭제나 키 변경도 거부됩니다(`NO ACTION` / `RESTRICT`; `CASCADE`와 `SET NULL`은 평소대로
+  동작). 이미 있는 행은 다시 검사하지 않습니다: 그런 행의 키가 아닌 컬럼을 갱신하거나, 삭제하거나, 있는
+  부모를 가리키게 하는 것은 되지만, 삭제 후 다시 삽입하는 식으로 저장하는 것은 새 orphan과 마찬가지로
+  거부됩니다. 행을 고치고(트랜잭션당 최대 3,000행씩) **Validate again**이 성공할 때까지 키는 증명되지
+  않습니다.
 - **CDC 파이프라인 하나가 캡처하는 테이블 수에는 한도가 있음: 일반적인 이름이면 약 80–160개.** CDC 스택은 캡처할 테이블을
   CloudFormation 파라미터 하나씩에 담아 받습니다: 테이블 목록(`TableIncludeList`), 싱크의 토픽 목록
   (`SinkTopics`, 테이블마다 `dsqlcdc.<table>` 하나), 그리고 배포가 테이블 크기에 따라 파티션을 정할 때(한

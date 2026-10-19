@@ -323,7 +323,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   생성됩니다.
 - **외래 키 보존** — FK는 제거되지 않고 **보존**됩니다: 각 소스 FK를 적재 후 실행할
   `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 문으로 렌더링하고(`CREATE TABLE` 밖에 둠), 데이터
-  적재가 끝난 **뒤** DSQL에 다시 생성합니다 — CDC 마이그레이션에서는 **cut over 시점**에 적용합니다(CDC
+  적재가 끝난 **뒤** **Apply foreign keys** 동작으로 DSQL에 다시 생성합니다(각 키를 바로 추가한 뒤
+  Aurora DSQL이 검증) — CDC 마이그레이션에서는 **cut over 시점**에 적용합니다(CDC
   싱크가 순서가 뒤섞인 행을 스트리밍하는 동안에는 외래 키가 있으면 안 됩니다 — FK 위반이 dead-letter로
   빠지기 때문, SQLSTATE 23503). 원하면 FK를 떼어 내고(`preserve_foreign_keys=False`) 참조 무결성을
   애플리케이션에서 강제하도록 선택할 수도 있습니다. 런타임 주의점: 참조/피참조 테이블에 대한 DML은
@@ -473,36 +474,68 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
 
 **언제 적용되는가:**
 
-- **Full Load 전용** — **적재 종료 시점**에 런-레벨 패스로 자동 적용됩니다. 활동 로그에
+- **Full Load 전용** — 적재가 끝난 뒤 Data Migration 단계의 명시적 **Apply foreign keys**
+  동작으로 적용합니다(적재 종료 시 자동으로 적용되지 않습니다). 활동 로그에
   `apply foreign keys` 단계(`N applied, S skipped, F failed`)가 기록됩니다.
 - **CDC** — **cut over로 지연**됩니다. 최종 드레인 후 애플리케이션을 재지정(repoint)하기
   **전에**, cut-over 런북(Step 4)에서 **Apply foreign keys**를 클릭하세요. 멱등이므로 다시
   실행해도 안전합니다.
 
-`NOT VALID`를 쓰는 이유는 DSQL이 받아들이는 유일한 `ADD CONSTRAINT` 형태이기 때문입니다:
-기존 행을 **스캔하지 않고** 제약을 추가하면서 **모든 신규 쓰기를 즉시 강제**합니다. 이미 적재된
-행은 이후 백그라운드 `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`로 검증됩니다.
+**먼저 추가하고, 나중에 검증합니다.** `NOT VALID`는 DSQL이 받아들이는 유일한 `ADD CONSTRAINT`
+형태이며, 이 단계를 빠르게 만드는 것도 이것입니다: Aurora DSQL은 **행을 하나도 읽지 않고**
+제약을 추가하고 — 자식 테이블 크기와 상관없이, 고아 행이 있어도 1초도 걸리지 않습니다 — 그
+순간부터 **모든 신규 쓰기를 강제**합니다: 없는 부모를 가리키는 삽입이나 키를 바꾸는 갱신은
+거부되고(`23503`), 아직 참조되는 부모 행의 삭제나 키 변경도 거부됩니다. 그래서 키는 쓰기 동결
+안에서 몇 초 만에 자리를 잡고, 너무 커서 안 되는 자식 테이블은 없습니다. 바로 이어서 도구는 각
+키에 `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`를 제출합니다: 이미 적재된 행을 백그라운드에서
+검사하는 Aurora DSQL 작업입니다. 판정은 Aurora DSQL 자신의 것입니다 — 그 문이 돌려준 작업 ID로
+읽는 `sys.jobs`의 작업 상태(`submitted`, `processing`, `completed`, `failed`와 그 상세)와,
+검사가 성공했을 때에만 true가 되는 `pg_constraint.convalidated`이며, 키는 그때에만
+**검증됨(validated)**입니다. 도구는 각 작업 ID를 세션에 보관하고 상태를 백그라운드에서 Aurora
+DSQL로부터 다시 읽으므로, 화면 다시 그리기, Validation 재실행, 앱 재시작에도 잃지 않습니다(Aurora
+DSQL은 끝난 작업을 약 30분 보관하며, 도구는 마지막으로 본 것을 보관합니다).
 
-**Orphan(고아) 사전 게이트.** 각 FK를 추가하기 전에 도구는 부모가 없는 자식 행 수를 셉니다.
-있으면 그 FK는 불투명한 오류로 실패하는 대신 **실행 가능한 안내(테이블 / 외래 키 / 행 수)와 함께
-건너뜁니다** — 고아 행을 해결(대개 복제되지 않은 소스 cascade가 원인)한 뒤 **Apply foreign
-keys**를 다시 클릭하세요. 기본 키가 있는 자식 테이블은 복합 키도 포함해 Aurora DSQL이 가진 키의
-keyset 페이지로 셉니다: 연결이 끊기거나, 서버가 세션을 끝내거나(`57P01`–`57P03`), 충돌(`40001`)이
-나거나, Aurora DSQL의 60분 연결 한도에 걸려도 중단된 그 페이지만 다시 실행하므로 크기와 상관없이
-끝까지 셉니다. 기본 키가 없는 테이블은 쿼리 하나로 세며, 이 쿼리는 DSQL의 ~300초 트랜잭션 한도 안에
-끝나야 합니다.
+**검증이 실패하면.** 키는 `NOT VALID` 상태로 그대로 남아 이를 깨는 신규 쓰기를 계속 거부하지만,
+이미 적재된 행 중 일부가 Aurora DSQL에 없는 부모 행을 가리킵니다. 화면과 활동 로그는 Aurora
+DSQL의 오류와 — 이때에만 세는 — 키를 깨는 행 수, 그리고 그 행을 나열하는 쿼리를 보여 줍니다.
+이 쿼리는 셈이 첫 번째 그런 행을 찾은 키 구간(셈이 읽은 바로 그 페이지)만 읽으므로 자식 테이블
+전체를 한 번에 스캔하지 않습니다. 화면에는 바로 실행할 수 있는 형태로 나오고, 활동 로그와 세션에는
+구간의 시작이 값이 아닌 자리표시자(`%(after_0)s`…)로 남습니다. Aurora DSQL에서 트랜잭션당
+최대 3,000행씩 나눠 고치세요: 없는 부모 행을 추가하거나, 각 행이 있는 부모나 NULL을 가리키게 하거나, 삭제한 뒤
+**Validate again**을 클릭합니다. 기본 키가 있는 자식 테이블은 복합 키도 포함해 Aurora DSQL이
+가진 키의 keyset 페이지로 셉니다: 연결이 끊기거나, 서버가 세션을 끝내거나(`57P01`–`57P03`),
+충돌(`40001`)이 나거나, Aurora DSQL의 60분 연결 한도에 걸려도 중단된 그 페이지만 다시 실행하므로 크기와 상관없이 끝까지 셉니다. 기본 키가
+없는 테이블은 쿼리 하나로 세며, 이 쿼리는 DSQL의 ~300초 트랜잭션 한도 안에 끝나야 합니다.
+
+**추가하기 전에 세는 키.** 부모 쪽이 설계상 Aurora DSQL에 다 있지 않은 키 — 참조 컬럼이
+마이그레이션에서 제외되었거나, 부모 또는 자식 테이블이 마이그레이션에 포함되지 않은 키 — 는
+먼저 셉니다. 자식 행이 Aurora DSQL에 없는 부모 행을 가리키면 그 키는 **실행 가능한 안내(테이블 /
+외래 키 / 행 수 / 이유)와 함께 건너뜁니다**: 추가하면 그런 부모를 가리키는 애플리케이션의 쓰기를
+거부하게 되기 때문입니다.
+
+**직접 추가하거나 이름을 바꾼 키.** 대상 스크립트에서 추가하거나 이름을 바꾼 외래 키도 다른 키와
+똑같이 적용·검증되고 기다립니다. 이름은 Aurora DSQL이 저장하는 대로 읽습니다: 따옴표 없는 이름은
+소문자로(`FK_Orders_Cust`는 `fk_orders_cust`), 따옴표 친 이름은 쓴 그대로입니다. 이름 없이 쓴
+키(`ADD FOREIGN KEY`)는 PostgreSQL이 그런 키에 붙이는 이름 `<table>_<columns>_fkey`(예:
+`orders_cid_fkey`, 같은 컬럼의 두 번째 키는 `orders_cid_fkey1`)로 추가하므로, 다시 적용해도 두 번째
+사본이 생기지 않습니다.
 
 **미리보기에서.** FK는 나중에 별도로 실행되므로, 생성된 대상 스크립트는 이를 편집 가능한
 `CREATE` 박스가 아니라 별도의 읽기 전용 **"Foreign keys — applied after Full Load"** 섹션에
 보여주며, Apply 결과도 외래 키가 지연되었음을 알립니다. **Schema Apply 직후 대상에 외래 키가
-없는 것은 정상이며 실패가 아닙니다** — 적재 종료 시(Full Load) 또는 cut over 시(CDC) 나타납니다.
+없는 것은 정상이며 실패가 아닙니다** — 적용할 때(Full Load 전용) 또는 cut over 시(CDC) 나타납니다.
 
-**Cascade 동작은 CDC의 공백입니다.** MySQL은 `ON DELETE`/`ON UPDATE CASCADE`(및 `SET NULL`)를
-*엔진 내부에서* 수행하고, 그 cascade된 자식 변경은 바이너리 로그에 남지 않습니다 — 그래서 CDC는
-부모 변경만 복제하고 **cascade는 복제하지 않아** 고아/낡은 자식 행이 남을 수 있습니다. 이런
-FK는 Evaluation에서 **MANUAL**로 표시됩니다. 자동 동작을 명시적 자식-행 문으로 바꾸거나, 최종
-비교 전에 소스 쓰기를 정지(quiesce)하세요(자세히는
-[4장](04-cdc-and-dsql-constraints.md) 참고).
+**Cascade 동작은 CDC의 공백입니다.** MySQL은 `ON DELETE`/`ON UPDATE CASCADE`(및 `SET NULL`/
+`SET DEFAULT`)를 *엔진 내부에서* 수행하고, 그 cascade된 자식 변경은 바이너리 로그에 남지
+않습니다 — 그래서 CDC는 부모 변경만 복제하고 **cascade는 복제하지 않아** 고아/낡은 자식 행이 남을
+수 있습니다(부모의 키가 바뀌어도 모든 행 수는 그대로입니다). 이런 FK는 Evaluation에서
+**MANUAL**로 표시됩니다. 자동 동작을 명시적 자식-행 문으로 바꾸거나, 최종 비교 전에 소스 쓰기를
+정지(quiesce)하세요(자세히는 [4장](04-cdc-and-dsql-constraints.md) 참고). cut over에서 이런 키도
+바로 추가되지만 그 행들에서 Aurora DSQL의 검증이 실패합니다: MySQL 소스라면 **I've cut over**는
+이런 키 — 그리고 MySQL이 Aurora DSQL의 바이트 비교보다 느슨하게 맞추는 텍스트 컬럼의 키, 즉
+대소문자를 구분하지 않는(case-insensitive) collation이나 `VARCHAR`에서 끝 공백을 무시하는 PAD SPACE
+collation(`utf8mb4_bin` 등)의 키 — 가 검증될 때까지, 또는 그 검사 없이
+cut over하기로 선택할 때까지 기다립니다.
 
 **무결성을 애플리케이션에서 강제하고 싶다면?** **Preserve foreign keys**를 끄세요. 그러면
 도구가 모든 경로에서 FK DDL을 떼어 냅니다(관계는 Validation의 orphan 검사를 위해 메타데이터로는

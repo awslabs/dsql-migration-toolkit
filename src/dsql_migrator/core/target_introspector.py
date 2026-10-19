@@ -1429,6 +1429,159 @@ def target_foreign_keys(
     return result
 
 
+@dataclass(frozen=True)
+class ForeignKeyValidationRead:
+    """One preserved foreign key as Aurora DSQL reports it (G142).
+
+    ``present``: ``pg_constraint`` holds the constraint on its child table; ``validated``:
+    its ``convalidated`` -- true only once an ``ALTER TABLE ASYNC ... VALIDATE CONSTRAINT``
+    succeeded (``ADD ... NOT VALID`` leaves it false). ``job_status`` / ``job_details``:
+    the ``sys.jobs`` row of the validation job id the tool recorded for it, ``None`` when
+    there is no id or Aurora DSQL has no such row (it drops a finished job after about 30
+    minutes). ``jobs_read`` is False when ``sys.jobs`` could not be read at all.
+    """
+
+    present: bool
+    validated: bool
+    job_status: Optional[str] = None
+    job_details: Optional[str] = None
+    jobs_read: bool = True
+
+
+def _fk_relation_where(table_name: str) -> "tuple[str, dict[str, object]]":
+    """The child-table predicate of :func:`target_foreign_keys`: a ``schema.table`` names
+    that relation, a bare name is looked up across every USER schema (never through the
+    connection's search_path)."""
+    parts = table_name.split(".", 1)
+    if len(parts) == 2:
+        return "n.nspname = %(schema)s AND c.relname = %(table)s", {
+            "schema": parts[0],
+            "table": parts[1],
+        }
+    return "c.relname = %(table)s AND n.nspname <> ALL(%(system)s)", {
+        "table": parts[0],
+        "system": list(SYSTEM_SCHEMAS),
+    }
+
+
+def foreign_key_validation_states(
+    keys: "Sequence[tuple[str, str]]",
+    job_ids: "Optional[Mapping[tuple[str, str], str]]" = None,
+    *,
+    connection_factory: Callable[[], Any],
+    sleep: Callable[[float], None] = _time.sleep,
+) -> "dict[tuple[str, str], Optional[ForeignKeyValidationRead]]":
+    """Each ``(child table, constraint)`` key's validation state on Aurora DSQL, over ONE
+    connection; ``None`` = unknown (G142).
+
+    The verdict on the rows already in a child table is Aurora DSQL's own: the async
+    ``VALIDATE CONSTRAINT`` job either succeeds -- ``pg_constraint.convalidated`` turns
+    true -- or fails, which ``sys.jobs`` shows with its ``details`` (live-verified; the
+    statement itself never raises for it). So this reads, per child table, its foreign
+    keys and their ``convalidated`` (names matched as the catalog stores them,
+    :func:`pg_stored_name`; a bare table name across every user schema, and one found in
+    several is unknown), and ``sys.jobs`` BY the job ids the tool recorded -- never by
+    name, and never through ``sys.wait_for_job``, which blocks for as long as an id it
+    does not know stays unknown. Read-only. A 40001 or an XX000 is read again on the same
+    connection; a table whose read still fails is unknown, and ``sys.jobs`` that cannot be
+    read leaves each key's job fields empty (``jobs_read`` False) rather than unknown.
+    """
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.target_connection import is_server_unavailable
+
+    ordered = list(dict.fromkeys(keys))
+    result: "dict[tuple[str, str], Optional[ForeignKeyValidationRead]]" = {
+        key: None for key in ordered
+    }
+    if not ordered:
+        return result
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> every key unknown
+        return result
+
+    def _rows(conn: Any, statement: str, params: Mapping[str, object]) -> list:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(statement, params)
+            return list(cursor.fetchall() or ())
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+            raise
+        finally:
+            _safe_close(cursor)
+
+    read = with_occ_retry(
+        max_attempts=_FACTS_OCC_ATTEMPTS,
+        base_delay=0.05,
+        sleep=sleep,
+        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc),
+    )(_rows)
+    # Per key READ: None = no such constraint on the child, else its convalidated. A key
+    # missing here could not be read (unknown).
+    found: "dict[tuple[str, str], Optional[bool]]" = {}
+    try:
+        constraints: "dict[str, list[str]]" = {}
+        for table_name, constraint in ordered:
+            constraints.setdefault(table_name, []).append(constraint)
+        for table_name, names in constraints.items():
+            where, params = _fk_relation_where(table_name)
+            try:
+                rows = read(
+                    connection,
+                    "SELECT n.nspname, con.conname, con.convalidated "
+                    "FROM pg_catalog.pg_constraint con "
+                    "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    f"WHERE con.contype = 'f' AND {where}",
+                    params,
+                )
+            except Exception:  # noqa: BLE001 - unreadable -> this table's keys unknown
+                continue
+            if len({str(row[0]) for row in rows if row}) > 1:
+                continue  # an ambiguous bare name: unknown, never a guess
+            stored = {str(row[1]): bool(row[2]) for row in rows if row and row[1]}
+            for constraint in names:
+                found[(table_name, constraint)] = stored.get(pg_stored_name(constraint))
+        recorded = {
+            key: str(job)
+            for key, job in (job_ids or {}).items()
+            if key in found and job
+        }
+        jobs: "dict[str, tuple[Optional[str], Optional[str]]]" = {}
+        jobs_read = True
+        if recorded:
+            try:
+                for row in read(
+                    connection,
+                    "SELECT job_id, status, details FROM sys.jobs "
+                    "WHERE job_id = ANY(%(ids)s)",
+                    {"ids": sorted(set(recorded.values()))},
+                ):
+                    if row and row[0] is not None:
+                        jobs[str(row[0])] = (
+                            str(row[1]).lower() if row[1] is not None else None,
+                            str(row[2]) if row[2] else None,
+                        )
+            except Exception:  # noqa: BLE001 - the catalog still answers convalidated
+                jobs_read = False
+        for key, validated in found.items():
+            status, details = jobs.get(recorded.get(key, ""), (None, None))
+            result[key] = ForeignKeyValidationRead(
+                present=validated is not None,
+                validated=bool(validated),
+                job_status=status,
+                job_details=details,
+                jobs_read=jobs_read,
+            )
+    finally:
+        _safe_close(connection)
+    return result
+
+
 def unique_index_state(
     table_name: str,
     columns: Sequence[str],

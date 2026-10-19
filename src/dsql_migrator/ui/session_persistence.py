@@ -285,6 +285,10 @@ def capture_session_snapshot(
         full_load_accepted_quarantine_rows=getattr(
             migration_state, "accepted_quarantine_rows", None
         ),
+        # Aurora DSQL's validation of each foreign key in place (G142): the job ids it is
+        # read back by, and what the watch last saw (see SessionSnapshot).
+        foreign_key_validation=_fk_validation_records(migration_state),
+        foreign_key_absent_children=_fk_absent_children(migration_state),
         cdc_dlq_cursor_ms={
             str(group): int(value)
             for group, value in (
@@ -408,6 +412,21 @@ def capture_session_snapshot(
                 validation_state, "cutover_catalog_drift_waiver", None
             )
     return snapshot
+
+
+def _fk_validation_records(migration_state: object) -> list:
+    """The persisted foreign-key validation record, in key order (``[]`` without one)."""
+    records = getattr(migration_state, "fk_validation_records", None)
+    if not callable(records):
+        return []
+    found = records()
+    return [found[key] for key in sorted(found)]
+
+
+def _fk_absent_children(migration_state: object) -> list:
+    """The children the last foreign-key pass left out as absent, sorted (``[]``)."""
+    absent = getattr(migration_state, "fk_absent_children", None)
+    return sorted(absent()) if callable(absent) else []
 
 
 def _target_added(migration_state: object) -> "dict[str, dict[str, str]]":
@@ -841,6 +860,13 @@ def apply_session_snapshot(
         migration_state.set_accept_quarantined_rows(  # type: ignore[attr-defined]
             True, gap=snapshot.full_load_accepted_quarantine_rows
         )
+    # The foreign-key validation record (G142): the screens read each key's verdict back from
+    # Aurora DSQL by these job ids, so a restart does not forget a validation in flight or a
+    # failure Aurora DSQL no longer reports.
+    _fk_records = getattr(snapshot, "foreign_key_validation", None) or ()
+    _fk_absent = getattr(snapshot, "foreign_key_absent_children", None) or ()
+    if (_fk_records or _fk_absent) and hasattr(migration_state, "restore_fk_validation"):
+        migration_state.restore_fk_validation(_fk_records, _fk_absent)  # type: ignore[attr-defined]
     # Restore the DLQ read position BEFORE any poll rebuilds the controller: without it a
     # restarted task re-reads only its blind look-back window and the quarantine count
     # silently loses everything older (see SessionSnapshot.cdc_dlq_cursor_ms).
@@ -1157,6 +1183,9 @@ def session_signature(
         # The source-schema findings, digests and Fix-added columns, so an opened / resolved
         # finding, a re-baselined table or a recorded Fix column is saved.
         _cdc_catalog_drift_sig(migration_state),
+        # The foreign-key validation record (G142), so a submitted job id, a status the watch
+        # saw or a failure's orphan count is saved.
+        _fk_validation_sig(migration_state),
         # Schema-Conversion edits (edited DDLs, the preserve-FK toggle, ticked nodes).
         # Without this the snapshot was never written for an edit-only change, so a PK
         # strategy chosen in Step 2 -- and with it the cut-over "Sync identity sequences"
@@ -1266,6 +1295,23 @@ def _cdc_catalog_drift_sig(migration_state: object) -> tuple:
             )
         ),
     )
+
+
+def _fk_validation_sig(migration_state: object) -> tuple:
+    """Cheap signature of the foreign-key validation record (ids, statuses, counts, the
+    children left out as absent)."""
+    return tuple(
+        (
+            rec.table,
+            rec.constraint,
+            rec.job_id,
+            rec.status,
+            rec.orphan_count,
+            bool(rec.details),
+            bool(rec.listing_sql),
+        )
+        for rec in _fk_validation_records(migration_state)
+    ) + tuple(_fk_absent_children(migration_state))
 
 
 def _iso(value: object) -> Optional[str]:

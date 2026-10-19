@@ -729,7 +729,9 @@ def table_exclusion_findings(
     # Not a promise that the key is skipped: the orphan check reads the rows this table HAS
     # on Aurora DSQL -- e.g. rows an earlier Full Load left there (Full load only can
     # unselect a loaded table, G12) satisfy it, and a table absent from the target fails
-    # the check (the key is not applied).
+    # the check (the key is not applied). G142 adds every other key first (NOT VALID) and
+    # lets Aurora DSQL validate it afterwards; a key to an unselected parent is one of the
+    # few still counted BEFORE its ADD (foreign_keys_counted_before_add), so this holds.
     found.extend(ExclusionFinding(T2, (
         f"{label} references it. When foreign keys are applied (Data Migration for Full "
         "load only; Cut over for CDC), that key is checked against the rows this table has "

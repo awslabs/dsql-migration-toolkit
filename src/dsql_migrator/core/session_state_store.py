@@ -42,6 +42,7 @@ from dsql_migrator.core.models import (
     CdcDlqWaiver,
     CdcReplicaIdentityFinding,
     CdcReplicaIdentityWaiver,
+    ForeignKeyValidationJob,
     SourceInventory,
     TableSelection,
     TargetInventory,
@@ -243,6 +244,21 @@ class SessionSnapshot(BaseModel):
     # sync the accepted path performs.
     full_load_quarantine_accepted: bool = False
     full_load_accepted_quarantine_rows: Optional[int] = None
+    # Aurora DSQL's validation of each foreign key "Apply foreign keys" put in place (G142):
+    # the VALIDATE job id, the job status and failure details last seen, and the orphan count
+    # explaining a failure. The verdict is read back from the target by these ids, so it
+    # survives a re-render, a Validation re-run and an app restart; Aurora DSQL forgets a
+    # finished job after about 30 minutes. Left OUT of the payload while empty, so a snapshot
+    # without it still loads on an older build (this model is extra="forbid").
+    foreign_key_validation: list[ForeignKeyValidationJob] = Field(
+        default_factory=list, exclude_if=lambda v: not v
+    )
+    # The unselected tables with a key into the migration that the same pass found absent
+    # from Aurora DSQL and left out (nothing to re-create there), so Cut over's Finish still
+    # waits for none of their keys after a restart. Left out of the payload while empty.
+    foreign_key_absent_children: list[str] = Field(
+        default_factory=list, exclude_if=lambda v: not v
+    )
     # Non-secret target (Aurora DSQL) connection so a reconnecting session can
     # re-probe the cdc-stack phase WITHOUT the user re-entering the target first
     # (DSQL auth is IAM-token based, so endpoint + region are enough to describe).

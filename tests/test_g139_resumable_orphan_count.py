@@ -15,9 +15,14 @@ The count now opens its own connection from the factory behind Validation's reco
 proxy and reads the child's live primary key once on it: a dropped connection is replaced
 and only the statement it cut off runs again, a 40001 (or an XX000 the proxy did not absorb)
 rolls back and replays the same statement -- the key read or one page, of a single-column
-key or a composite one -- and every retry budget is per statement. The order of the pass
-(count, ADD ... NOT VALID, VALIDATE) is unchanged. Its per-FK activity lines now take the
-origin's category (Validation at cut over, Full Load after the load), like its own two lines.
+key or a composite one -- and every retry budget is per statement. Its per-FK activity lines
+now take the origin's category (Validation at cut over, Full Load after the load), like its
+own two lines.
+
+G142: the pass adds every key NOT VALID first; the count runs before the ADD only for a key
+whose parent side is incomplete on Aurora DSQL by design (``check_before_add``), and after a
+failed Aurora DSQL validation to explain it -- so the through-the-pass tests below name the
+key as counted first.
 
 Doubles only: no Aurora DSQL, no AWS.
 """
@@ -464,6 +469,13 @@ def _conv() -> TableConversion:
     )
 
 
+# The key is one whose parent side is incomplete by design, so the pass counts it first.
+_COUNTED_FIRST = {
+    ("shop.orders", "fk_orders_customer"): "its parent table shop.customers is not part "
+    "of this migration",
+}
+
+
 def _pass(monkeypatch, child: _Child, origin: str = "cut-over"):
     added: list = []
     validated: list = []
@@ -482,7 +494,7 @@ def _pass(monkeypatch, child: _Child, origin: str = "cut-over"):
     beats: list = []
     result = engine.apply_preserved_foreign_keys(
         {"shop.orders": _conv()}, child.connect, origin=origin,
-        heartbeat=lambda: beats.append(1),
+        heartbeat=lambda: beats.append(1), check_before_add=_COUNTED_FIRST,
     )
     return result, added, validated, events, beats
 
@@ -508,8 +520,8 @@ def test_a_large_clean_child_is_counted_across_closes_and_its_key_added(
 
 
 def test_orphans_counted_across_closes_still_keep_the_key_off(monkeypatch) -> None:
-    # The verdict is unchanged: a count above 0 skips the ADD (NO semantic change to the
-    # cut-over order yet) -- only the count now reaches its end.
+    # For a key counted before its ADD (G142) the verdict is unchanged: a count above 0
+    # skips the ADD -- only the count now reaches its end.
     child = _Child(_orders(), _PARENTS, lifetime=4)
     result, added, validated, events, _beats = _pass(monkeypatch, child)
     assert result == (0, 1, 0)
@@ -540,6 +552,7 @@ def test_every_per_fk_line_takes_the_origin_category(monkeypatch, origin, catego
     from tests.test_ui_data_migration import _three_fk_conv
 
     _ddls, conv = _three_fk_conv()
+    # All three counted before their ADD (G142: their parent side is incomplete by design).
     # fk_a: orphans (skipped); fk_b: the pre-check fails (concurrent and serial);
     # fk_c: its parent's index had to be waited for, then the ADD is refused.
     monkeypatch.setattr(engine, "_pregate_orphans",
@@ -565,7 +578,8 @@ def test_every_per_fk_line_takes_the_origin_category(monkeypatch, origin, catego
                         lambda cat, action, **kw: events.append((cat, action, kw)))
 
     result = engine.apply_preserved_foreign_keys(
-        {"child": conv}, lambda: _Child([], ()).connect(), origin=origin
+        {"child": conv}, lambda: _Child([], ()).connect(), origin=origin,
+        check_before_add={("child", f"fk_{n}"): "its parent is outside" for n in "abc"},
     )
     assert result == (0, 1, 2)
     per_fk = [e for e in events if not e[1].startswith("apply foreign keys")]
@@ -585,14 +599,16 @@ def test_every_per_fk_line_takes_the_origin_category(monkeypatch, origin, catego
 
 
 def test_the_manual_says_the_count_resumes_in_three_languages() -> None:
+    # G142: the count explains a failed Aurora DSQL validation (and still runs first for a
+    # key whose parent side is incomplete), so the resume is described there.
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual"
     needles = {
-        "en": ("**Orphan pre-gate.**", "re-runs only the page it interrupted",
+        "en": ("**When a validation fails.**", "re-runs only the page it interrupted",
                "60-minute connection limit", "~300 s per-transaction limit",
                "a composite key too", "no primary key"),
-        "ko": ("**Orphan(고아) 사전 게이트.**", "중단된 그 페이지만 다시 실행",
+        "ko": ("**검증이 실패하면.**", "중단된 그 페이지만 다시 실행",
                "60분 연결 한도", "~300초 트랜잭션 한도", "복합 키도", "기본 키가 없는"),
-        "ja": ("**孤児(orphan)事前ゲート。**", "中断されたそのページだけを再実行",
+        "ja": ("**検証が失敗したとき。**", "中断されたそのページだけを再実行",
                "60 分の接続上限", "~300 秒トランザクション上限", "複合キーも", "主キーのない"),
     }
     for lang, (heading, *phrases) in needles.items():

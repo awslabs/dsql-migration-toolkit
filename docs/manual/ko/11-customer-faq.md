@@ -357,8 +357,9 @@ DSQL에 대응이 없는 PostgreSQL 타입은 값을 보존하는 대체 타입�
 처리됩니다.
 
 - **외래 키**: 변환된 DDL에서 **제거하지 않고 보존**됩니다. 각 FK를 적재 후 실행할
-  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 문으로 렌더링(`CREATE TABLE` 밖)해 데이터 적재가 끝난 뒤
-  DSQL에 다시 생성하며, CDC 마이그레이션에서는 **cut over 시점**에 적용합니다(순서가 뒤섞인 CDC 스트림
+  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY … NOT VALID` 문으로 렌더링(`CREATE TABLE` 밖)해 데이터
+  적재가 끝난 뒤 **Apply foreign keys** 동작으로 DSQL에 바로 다시 생성하고 이미 적재된 행은 Aurora DSQL이
+  백그라운드에서 검증하며, CDC 마이그레이션에서는 **cut over 시점**에 적용합니다(순서가 뒤섞인 CDC 스트림
   중에는 FK가 있으면 위반이 dead-letter로 빠지기 때문, SQLSTATE 23503). 원하면 FK를 떼어 내고
   (`preserve_foreign_keys=False`) 참조 무결성을 애플리케이션에서 강제할 수도 있습니다. 런타임 주의점:
   참조/피참조 테이블 DML의 추가 읽기 비용, 충돌 시 재시도 가능한 `40001`, 그리고

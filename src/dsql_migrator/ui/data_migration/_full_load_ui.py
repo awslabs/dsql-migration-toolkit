@@ -94,6 +94,9 @@ _LOGGER = logging.getLogger(__name__)
 
 # How often the live Full Load progress region polls the background job (seconds).
 _POLL_INTERVAL_SECONDS = 1.5
+# How often the foreign-key card re-renders while Aurora DSQL is still validating a key
+# (G142); the background watch itself polls with backoff and refreshes on a change.
+_FK_VALIDATION_POLL_SECONDS = 30.0
 
 # G17: why a Full load + CDC table selected after its Full Load is forced to Drop & reload
 # (rendered as "{table}: {reason}."). True on both engines: the tool cannot tell how old the
@@ -694,11 +697,9 @@ def _render_full_load_step(
     lob_candidates_for: Optional[Callable[[str], Sequence[tuple[str, str]]]] = None,
     exclusion_route: Optional[Callable[[str, str], None]] = None,
     exclusion_route_block: Optional[str] = None,
-    # Foreign keys are applied by an EXPLICIT action now, not as part of the load. The
-    # orphan pre-check is O(child rows) (measured 28.0 min serial / 7.9 min at 8-way for 15
-    # FKs over 15.5M child rows) and it ran AFTER every row was already written, so it held
-    # the end of the load for minutes. A CDC migration already applies them at cut over;
-    # this makes the Full-Load-only path the same flow.
+    # Foreign keys are applied by an EXPLICIT action, not as part of the load -- the same
+    # flow a CDC migration uses at cut over. Since G142 each key is added at once (NOT
+    # VALID, seconds) and Aurora DSQL validates the loaded rows in the background.
     apply_foreign_keys: Optional[Callable[[], None]] = None,
     # PROVIDERS, deliberately not values: the FK card renders inside the @ui.refreshable
     # live region below, so anything evaluated at page-render time is frozen for the life of
@@ -711,6 +712,13 @@ def _render_full_load_step(
     foreign_keys_running: Optional[Callable[[], bool]] = None,
     foreign_keys_progress: Optional[Callable[[], Optional[tuple]]] = None,
     cancel_foreign_keys: Optional[Callable[[], None]] = None,
+    # G142, also providers: Aurora DSQL's validation of the keys in place (an
+    # FkValidationView or None), a "Validate again" handler (keys -> None), whether one
+    # runs, and the start of the background read of the verdict when one is due.
+    foreign_keys_validation: Optional[Callable[[], object]] = None,
+    validate_foreign_keys_again: Optional[Callable[[Sequence], None]] = None,
+    foreign_keys_revalidating: Optional[Callable[[], bool]] = None,
+    watch_foreign_keys: Optional[Callable[[], None]] = None,
     # The column-exclusion overlay (see make_overlay_dialog_providers): a BLOCKING ledger
     # read of the connected target, and a cheap view of the overlay / excluded sets and the
     # applied DDL. None (library callers, test doubles) keeps the previous dialog.
@@ -1717,18 +1725,40 @@ def _render_full_load_step(
         # Resolved HERE, per refresh, so the card tracks the FK job instead of replaying the
         # state the page was first built with.
         fk_running = bool(_call_or(foreign_keys_running, False))
+        fk_applied = _call_or(foreign_keys_applied, None)
+        # G142: Aurora DSQL's verdict on the keys this session's pass put in place, read back
+        # from the target (the background watch), never from this session's memory alone.
+        # Shown under that pass's result only: a reload or a new load voids the result, and
+        # the card then offers Apply again (Cut over shows the verdict after a restart). The
+        # result's own notice takes its tone and wording from it too.
+        _fk_view = (
+            None
+            if fk_running or fk_applied is None
+            else _call_or(foreign_keys_validation, None)
+        )
         _render_foreign_key_action(
             ui,
             terminal=current.status in ("DONE", "FAILED", "CANCELLED"),
             pending=int(_call_or(foreign_keys_pending, 0) or 0),
-            applied=_call_or(foreign_keys_applied, None),
+            applied=fk_applied,
             apply_foreign_keys=apply_foreign_keys,
             connections_ready=session.connection_ready(),
             running=fk_running,
             progress=_call_or(foreign_keys_progress, None),
             cancel_foreign_keys=cancel_foreign_keys,
             scope_changed=bool(getattr(migration_state, "fk_result_scope_changed", False)),
+            validation=_fk_view,
         )
+        if _fk_view is not None:
+            from dsql_migrator.ui.data_migration._fk_validation import render_fk_validation
+
+            render_fk_validation(
+                ui, _fk_view,
+                on_validate_again=validate_foreign_keys_again,
+                revalidating=bool(_call_or(foreign_keys_revalidating, False)),
+            )
+            if not _fk_view.settled and watch_foreign_keys is not None:
+                watch_foreign_keys()
         # The FK pass is its OWN job and runs entirely AFTER the load is terminal, so gating
         # the poll on the load alone left nothing to re-arm it: the card could not advance
         # its counter and could not replace the spinner with the result. Poll while EITHER is
@@ -1739,6 +1769,10 @@ def _render_full_load_step(
             # once=True avoids the "parent slot deleted" crash a repeating timer
             # hits when its slot is rebuilt.
             ui.timer(_POLL_INTERVAL_SECONDS, _poll_live, once=True)
+        elif _fk_view is not None and not _fk_view.settled:
+            # A key is still being validated: re-render this region now and then, so a watch
+            # that ran out of time is started again and the result shows when it lands.
+            ui.timer(_FK_VALIDATION_POLL_SECONDS, _live_detail.refresh, once=True)
 
     def _poll_scoped(current) -> bool:
         """The terminal poll for a set changed after the load (Full load only, G12; Full
@@ -3480,6 +3514,7 @@ def _render_foreign_key_action(
     progress: Optional[tuple] = None,
     cancel_foreign_keys=None,
     scope_changed: bool = False,
+    validation: object = None,
 ) -> None:
     """Render the explicit "Apply foreign keys" action, and its outstanding state.
 
@@ -3487,16 +3522,23 @@ def _render_foreign_key_action(
     table-set change (Full load only, G12), so the outstanding notice says to apply again
     for the changed set rather than that the keys were never applied.
 
-    Foreign keys used to be applied as the last act of the load. The orphan pre-check that
-    gates each one is O(child rows) -- measured 28.0 min serial / 7.9 min at 8-way for 15
-    foreign keys over 15.5M child rows -- and it ran AFTER every row was already written, so
-    it held the load's completion for minutes with nothing left to load. It is an operator
-    action now, which is also how a CDC migration has always applied them (at cut over), so
-    both migration types follow one flow.
+    ``validation`` (``_fk_validation.FkValidationView``, G142): Aurora DSQL's verdict on
+    the keys the pass put in place. A complete pass says referential integrity is in place
+    only once every key validated; while Aurora DSQL still checks the rows already loaded
+    it says the keys are in place and being validated, and when a key failed, has no job or
+    is gone it is a warning pointing at the block below.
 
-    The risk that buys is a FORGOTTEN click: an unapplied constraint is invisible, and DSQL
-    cannot tell us later (a failed async VALIDATE is unobservable -- live-verified). So the
-    outstanding state is a prominent notice naming the count, not a quiet button.
+    Foreign keys used to be applied as the last act of the load, when every key's orphan
+    count ran before its ADD and held the load's completion for minutes (measured: 28.0 min
+    serial / 7.9 min at 8-way for 15 foreign keys over 15.5M child rows). It is an operator
+    action, which is also how a CDC migration applies them (at cut over), so both migration
+    types follow one flow. Since G142 each key is added ``NOT VALID`` at once (seconds) and
+    Aurora DSQL validates the loaded rows in the background; that verdict is read back from
+    the target and shown under this card (``_fk_validation.render_fk_validation``).
+
+    The risk the explicit action buys is a FORGOTTEN click: an unapplied constraint is
+    invisible. So the outstanding state is a prominent notice naming the count, not a quiet
+    button.
 
     WARNING, not error: this sits directly under a GREEN "Full Load complete", and a red card
     there reads as "my load failed" -- a workshop participant read it exactly that way. The
@@ -3513,9 +3555,11 @@ def _render_foreign_key_action(
                 if total else "Applying foreign keys…"
             ),
             body=(
-                "Each one is orphan-checked first, which reads the whole child table, so "
-                "this can take several minutes on a large schema. You can leave this page; "
-                "it keeps running."
+                "Each key is added at once and enforces every new write from then on, so "
+                "this takes seconds; only a key whose parent table or referenced column is "
+                "outside this migration reads its child table first. Aurora DSQL then "
+                "validates the rows already loaded in the background. You can leave this "
+                "page; it keeps running."
             ),
         )
         with ui.row().classes("items-center gap-2 w-full"):
@@ -3564,18 +3608,20 @@ def _render_foreign_key_action(
                 "ended early, so referential integrity is NOT in place for them."
             )
             detail.append(
-                # Say what resuming costs: the pass re-checks every FK, so it is not a cheap
-                # "finish the last few" -- and this render is the only place that warning can
-                # appear, because the outstanding-state notice is suppressed here.
-                "Apply them below to finish; re-applying one that already exists is a harmless "
-                "no-op, but the pass re-checks EVERY foreign key and each check reads the whole "
-                "child table, so resuming costs about as much as the first run."
+                # Say what resuming costs -- this render is the only place it can appear,
+                # because the outstanding-state notice is suppressed here. Since G142 it is
+                # cheap: a key already in place is a no-op and each missing one is added at
+                # once (no row read before the ADD).
+                "Apply them below to finish: a key already in place is left as it is "
+                "(re-applying one is a no-op), and each missing one is added at once."
                 if can_apply else
                 "Apply them from this step once the load is settled and both connections are "
                 "verified."
             )
         if not detail:
-            detail.append("Referential integrity is in place on the target.")
+            detail.append(_foreign_keys_in_place_copy(validation))
+            if _validation_problems(validation):
+                tone = "warning"
         render_notice(
             ui, tone=tone,
             header=(
@@ -3599,8 +3645,7 @@ def _render_foreign_key_action(
             body=(
                 "The table set changed after foreign keys were applied. Apply again to "
                 "cover the current set: keys already in place are kept (re-applying one is "
-                "a no-op), but the pass re-checks every key, and each check reads the whole "
-                "child table."
+                "a no-op), and each missing one is added at once."
             ),
         )
     elif applied is None:
@@ -3609,10 +3654,9 @@ def _render_foreign_key_action(
             header=f"{pending} foreign key(s) not yet applied",
             body=(
                 "The load itself succeeded. Referential integrity is the next required step "
-                "and is NOT in place until you apply them. Each one is orphan-checked "
-                "first, which "
-                "reads the whole child table, so this can take several minutes on a large "
-                "schema — it is a separate step so it no longer holds up the load."
+                "and is NOT in place until you apply them. Each key is added at once "
+                "(seconds) and enforces every new write from then on; Aurora DSQL then "
+                "validates the rows already loaded in the background."
             ),
         )
     with ui.row().classes("items-center gap-2 w-full"):
@@ -3623,9 +3667,43 @@ def _render_foreign_key_action(
         if not connections_ready:
             btn.props("disable")
             btn.tooltip(
-                "Verify the source and target connections first — applying a foreign key "
-                "reads the child table and issues DDL on the target."
+                "Verify the source and target connections first — applying foreign keys "
+                "issues DDL on the target."
             )
+
+
+def _validation_problems(validation: object) -> int:
+    """How many keys of an ``FkValidationView`` failed, have no job or are gone (0: none,
+    or no view)."""
+    if validation is None or getattr(validation, "checking", True):
+        return 0
+    problems = validation.to_revalidate()  # type: ignore[attr-defined]
+    return len(problems) + int(getattr(validation, "absent", 0) or 0)
+
+
+def _foreign_keys_in_place_copy(validation: object) -> str:
+    """A complete pass's sentence, from Aurora DSQL's verdict on its keys (G142)."""
+    problems = _validation_problems(validation)
+    if problems:
+        return (
+            "Every key was put in place and refuses each new write that would break it, but "
+            f"Aurora DSQL has not validated the rows already loaded for {problems} of them "
+            "(see below): referential integrity is not proven there yet."
+        )
+    if (
+        validation is not None
+        and not getattr(validation, "checking", True)
+        and getattr(validation, "items", ())
+        and validation.validated == validation.in_place  # type: ignore[attr-defined]
+    ):
+        return (
+            "Referential integrity is in place on the target: every key enforces each new "
+            "write, and Aurora DSQL validated the rows already loaded."
+        )
+    return (
+        "Every key is in place and enforces each new write; Aurora DSQL validates the rows "
+        "already loaded in the background" + (" (below)." if validation is not None else ".")
+    )
 
 
 def _render_accept_quarantine_action(

@@ -613,9 +613,11 @@ class CascadeForeignKeyRule(Rule):
     fire triggers). Debezium reads the binary log, so a CDC stream simply never sees
     them; and the tool applies foreign keys only at cut over (never while the sink
     streams), so no target-side FK re-performs the cascade in flight. The child rows
-    the source cascade removed/nulled are therefore left as ORPHANS on the target,
-    which then **block the cut-over ADD CONSTRAINT** (the orphan pre-gate) -- an
-    actionable per-FK error, not silent divergence.
+    the source cascade removed/nulled are therefore left as ORPHANS on the target: the
+    key is still added at cut over (``NOT VALID``, it refuses every new orphan), but
+    **Aurora DSQL's validation of the loaded rows fails on them**, and Cut over holds
+    Finish on such a key until it validates (G142) -- an actionable per-FK report (the
+    orphan count and a query that lists the rows), not silent divergence.
 
     This is a limitation of every binlog-based CDC tool (Debezium, DMS, Maxwell),
     not of this migrator, but it is invisible unless it is called out BEFORE the
@@ -665,8 +667,9 @@ class CascadeForeignKeyRule(Rule):
                         "logged and replicated. The tool re-creates the foreign key "
                         "on Aurora DSQL only at cut over -- never during replication, "
                         "so the sink is not tripped by out-of-order rows -- and any "
-                        "orphaned child rows left by an un-replicated cascade will "
-                        "then BLOCK the ADD CONSTRAINT and be reported by the "
+                        "orphaned child rows left by an un-replicated cascade then "
+                        "fail Aurora DSQL's validation of that key, which holds the "
+                        "cut over until they are fixed, and are reported by the "
                         "Validation orphan check. Quiesce source writes before the "
                         "final cut-over comparison so the divergence is caught."
                     ),

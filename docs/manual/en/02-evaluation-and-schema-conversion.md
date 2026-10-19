@@ -411,8 +411,9 @@ MySQL→PostgreSQL transpile:
   no DSQL equivalent and is created ordinary.
 - **Foreign-key preservation** — Aurora DSQL **enforces** foreign keys, so each
   source FK is kept **out of the `CREATE TABLE`** and rendered as a separate
-  post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statement. Full Load
-  re-creates them as a run-level pass **after** the data has loaded; for a **CDC**
+  post-load `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statement. Full Load only
+  applies them with the **Apply foreign keys** action **after** the data has loaded (each
+  added at once, then validated by Aurora DSQL); for a **CDC**
   migration the apply is **deferred to cut over** (the constraints must not exist
   while the sink streams rows out of parent-before-child order — an FK violation
   would be dead-lettered, `SQLSTATE 23503`), and the rendered DDL is shown here so
@@ -597,41 +598,79 @@ is in a consistent state.
 
 **When they are applied:**
 
-- **Full Load only** — automatically, as a run-level pass **at the end of the load**.
+- **Full Load only** — with the explicit **Apply foreign keys** action on the Data
+  Migration step, once the load has finished (not automatically at the end of the load).
   The activity log records an `apply foreign keys` step (`N applied, S skipped,
   F failed`).
 - **CDC** — **deferred to cut over**. After the final drain and **before** you repoint
   the application, click **Apply foreign keys** in the cut-over runbook (Step 4). It is
   idempotent — safe to re-run.
 
-`NOT VALID` is used because it is the only `ADD CONSTRAINT` form DSQL accepts: it adds
-the constraint **without scanning existing rows** and **enforces every new write
-immediately**; the already-loaded rows are then checked by a background
-`ALTER TABLE ASYNC … VALIDATE CONSTRAINT`.
+**Added first, validated after.** `NOT VALID` is the only `ADD CONSTRAINT` form DSQL
+accepts, and it is what makes the step fast: Aurora DSQL adds the constraint **without
+reading a row** — in well under a second whatever the size of the child table, with orphan
+rows present too — and **enforces every new write from then on**: an insert, or an update
+that changes the key, naming a missing parent is refused (`23503`), and so is deleting or
+re-keying a parent row that is still referenced. So the keys are in place within seconds,
+inside the write freeze, and no child table is too large for it. Right after, the tool
+submits `ALTER TABLE ASYNC … VALIDATE CONSTRAINT` for each key: an Aurora DSQL job that
+checks the rows already loaded, in the background. The verdict is Aurora DSQL's own — the
+job's status in `sys.jobs` (`submitted`, `processing`, `completed` or `failed`, with its
+details), read by the job id the statement returned, and `pg_constraint.convalidated`,
+which turns true only when the check succeeded; a key is **validated** only then. The tool
+keeps each job id with the session and reads the state back from Aurora DSQL in the
+background, so a re-render, a Validation re-run or an app restart does not lose it (Aurora
+DSQL keeps a finished job about 30 minutes; the tool keeps what it last saw).
 
-**Orphan pre-gate.** Before adding each FK the tool counts child rows whose parent is
-missing. If any exist, that FK is **skipped with an actionable note** (table / foreign
-key / row count) instead of failing with an opaque error — resolve the orphans (often
-an un-replicated source cascade) and click **Apply foreign keys** again. A child table
-with a primary key, a composite key too, is counted in keyset pages of the key Aurora
-DSQL holds: a dropped connection, a session the server ends (`57P01`–`57P03`), a
-conflict (`40001`) or Aurora DSQL's 60-minute connection limit re-runs only the page it
-interrupted, so a table of any size is counted. A table with no primary key is counted
-in one query, which has to finish within DSQL's ~300 s per-transaction limit.
+**When a validation fails.** The key stays in place, `NOT VALID`: it still refuses every
+new write that would break it, but some rows already loaded reference a parent row that is
+not on Aurora DSQL. The screen and the activity log show Aurora DSQL's error and — counted
+only now — how many rows break the key, with a query that lists them. That query reads only
+the key window where the count found the first such row (the page the count read), so it
+never scans the whole child table at once; the screen shows it ready to run, and the
+activity log and the session keep it with the window's start as a placeholder
+(`%(after_0)s`…), never a value. Fix them on Aurora DSQL in batches of at most 3,000 rows per
+transaction: add the missing parent rows, point each row at an existing parent or NULL, or
+delete it; then click **Validate again**. A child table with a primary key, a composite key
+too, is counted in keyset pages of the key Aurora DSQL holds: a dropped connection, a
+session the server ends (`57P01`–`57P03`), a conflict (`40001`) or Aurora DSQL's 60-minute
+connection limit re-runs only the page it interrupted, so a table of any size is counted. A table with no primary key is counted in
+one query, which has to finish within DSQL's ~300 s per-transaction limit.
+
+**Keys counted before they are added.** A key whose parent side is not fully on Aurora
+DSQL by design — its referenced column is excluded from the migration, or its parent or
+child table is not part of the migration — is counted first. If a child row references a
+parent row Aurora DSQL does not hold, that key is **skipped with an actionable note**
+(table / foreign key / row count / why): added, it would refuse the application's writes
+that name such parents.
+
+**A key you add or rename.** A foreign key you add or rename in the target script is
+applied, validated and waited for like the others. Its name is read as Aurora DSQL stores
+it: an unquoted name in lower case (`FK_Orders_Cust` is `fk_orders_cust`), a quoted one as
+written. A key written without a name (`ADD FOREIGN KEY`) is added under the name
+PostgreSQL gives such a key, `<table>_<columns>_fkey` (for example `orders_cid_fkey`, then
+`orders_cid_fkey1` for a second one on the same columns), so applying it again does not add
+a second copy.
 
 **In the preview.** Because the FKs run later and separately, the generated target
 script shows them in their own read-only **"Foreign keys — applied after Full Load"**
 section (not in the editable `CREATE` box), and the Apply results say the foreign keys
 were deferred. **A target with no foreign keys immediately after Schema Apply is
-expected, not a failure** — they appear at load end (Full Load) or at cut over (CDC).
+expected, not a failure** — they appear when you apply them (Full Load only) or at cut
+over (CDC).
 
 **Cascading actions are a CDC gap.** MySQL performs `ON DELETE`/`ON UPDATE CASCADE`
-(and `SET NULL`) *inside the engine*, and those cascaded child changes never reach the
-binary log — so CDC replicates the parent change but **not** the cascade, which can
-leave orphaned or stale child rows. Such FKs are flagged **MANUAL** at Evaluation;
-replace the automatic action with explicit child-row statements, or quiesce source
-writes before the final comparison (see
-[Chapter 4](04-cdc-and-dsql-constraints.md)).
+(and `SET NULL`/`SET DEFAULT`) *inside the engine*, and those cascaded child changes never
+reach the binary log — so CDC replicates the parent change but **not** the cascade, which
+can leave orphaned or stale child rows (a re-keyed parent leaves every row count as it
+was). Such FKs are flagged **MANUAL** at Evaluation; replace the automatic action with
+explicit child-row statements, or quiesce source writes before the final comparison (see
+[Chapter 4](04-cdc-and-dsql-constraints.md)). At cut over such a key is still added at
+once, but Aurora DSQL's validation fails on those rows: for a MySQL source **I've cut
+over** waits until such a key — and one on a text column MySQL matches more loosely than
+Aurora DSQL's byte comparison: a case-insensitive collation, or on a `VARCHAR` a PAD SPACE
+one such as `utf8mb4_bin`, which ignores trailing spaces — has validated, or until you
+choose to cut over without that check.
 
 **Prefer to enforce integrity in the application?** Turn **Preserve foreign keys**
 off. The tool then strips the FK DDL from every path (the relationship is still kept as

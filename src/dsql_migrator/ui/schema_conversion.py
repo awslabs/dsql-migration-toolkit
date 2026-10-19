@@ -3141,10 +3141,10 @@ def build_schema_conversion_screen(
                                 "apply. You apply them YOURSELF with the "
                                 "\"Apply foreign keys\" button — on Data Migration once "
                                 "the load finishes, or at cut over for a CDC migration. "
-                                "They are not created automatically: the orphan pre-check "
-                                "reads every child table, so it is a step you start when "
-                                "you are ready. A target with no foreign keys immediately "
-                                "after Schema Apply is expected, not a failure."
+                                "Each key is then added at once and enforces every new "
+                                "write, and Aurora DSQL validates the rows already loaded "
+                                "in the background. A target with no foreign keys "
+                                "immediately after Schema Apply is expected, not a failure."
                             ),
                         )
 
@@ -3804,9 +3804,10 @@ def _render_browser_and_preview(
                 "They are NOT created at Schema Apply, and NOT automatically at the end of "
                 "the load: you click \"Apply foreign keys\" on Data Migration once the "
                 "load finishes (at cut over for a CDC migration). Deferring them is by "
-                "design — the concurrent bulk load has no parent-before-child ordering — "
-                "and the step is explicit because each constraint is orphan-checked first, "
-                "which reads the whole child table."
+                "design — the concurrent bulk load has no parent-before-child ordering. "
+                "Applying takes seconds: each key is added at once and enforces every new "
+                "write, and Aurora DSQL then validates the rows already loaded in the "
+                "background."
             ),
         )
 

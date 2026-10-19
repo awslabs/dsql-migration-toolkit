@@ -6410,9 +6410,8 @@ def test_the_ack_and_waiver_are_wired_to_the_log() -> None:
     # The waiver line must be emitted BEFORE the flag flips, or the detail would read
     # the post-decision state and the count would already be irrelevant.
     waiver = src[src.index("def _proceed_without_fks"):]
-    assert waiver.index("log_activity") < waiver.index(
-        "proceed_without_foreign_keys = True"
-    )
+    # (G142: the flag flips with its scope, through waive_foreign_keys.)
+    assert waiver.index("log_activity") < waiver.index("waive_foreign_keys(")
 
 
 def test_cancelling_validation_is_recorded_once_from_the_click() -> None:

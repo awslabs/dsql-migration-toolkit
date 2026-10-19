@@ -334,8 +334,9 @@ DSQL に相当のない PostgreSQL 型は、値を保つ代替型がある場合
 **Q20. 外部キー、トリガー、ストアドプロシージャはどうなりますか？**
 
 **外部キーはサポートされます** — Aurora DSQL が強制します。ツールは各ソースの FK を **保持** し、
-post-load の `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` として DSQL 上に再作成します（Full Load は
-データ着地後に適用し、**CDC** マイグレーションでは、sink が行を out-of-order でストリームしている間は
+post-load の `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY … NOT VALID` として DSQL 上に再作成します — すぐに
+追加され、その後 Aurora DSQL がロード済みの行をバックグラウンドで検証します（Full Load の後は **Apply foreign
+keys** 操作で適用し、**CDC** マイグレーションでは、sink が行を out-of-order でストリームしている間は
 制約が存在してはならないため、**カットオーバー** まで延期されます）。代わりにこれらを **取り除くことを選び**、
 参照整合性をアプリケーション層で強制することもできます。検討すべきランタイム上の注意点: 関連するテーブル
 への DML は **追加の読み取り** を発生させ、並行する競合は再試行可能な `40001` になり、

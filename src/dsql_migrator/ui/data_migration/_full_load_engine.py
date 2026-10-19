@@ -28,8 +28,9 @@ from concurrent.futures import (
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import (
-    Any, Callable, Iterable, Iterator, Mapping, NamedTuple, Optional, Protocol,
+    Any, Callable, Collection, Iterable, Iterator, Mapping, NamedTuple, Optional, Protocol,
     Sequence, Union,
 )
 
@@ -111,6 +112,7 @@ from dsql_migrator.core.models import (
     apply_lob_exclusions,
 )
 from dsql_migrator.core.source_dialect import dialect_for
+from dsql_migrator.core.target_introspector import pg_fold_unquoted, pg_stored_name
 from dsql_migrator.core.watermark import WatermarkCapturer, estimate_source_rows
 from dsql_migrator.ui.connect import make_source_engine_factory
 
@@ -223,6 +225,10 @@ class DataMigrationInputs:
     # The FK action only: unselected children kept for a key into the migration
     # (foreign_keys_pointing_in) -- skipped when absent on the target.
     fk_optional_tables: frozenset[str] = frozenset()
+    # The FK action only: ``(child, constraint) -> why`` for the keys whose parent side is
+    # incomplete on Aurora DSQL by design (foreign_keys_counted_before_add), which keep the
+    # orphan count BEFORE their ADD (G142).
+    fk_counted_before_add: Mapping[tuple[str, str], str] = field(default_factory=dict)
     # --- Column-exclusion overlay (the excluded columns land NULL) -----------------
     # The operator (non-legacy) exclusions to OVERLAY: each column is made nullable with
     # no DEFAULT on the target before the table's first write. Always read as the
@@ -4276,6 +4282,9 @@ def _apply_foreign_keys(
     migrator: DataMigrator,
     handle: "Optional[JobHandle]" = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    *,
+    validation_jobs: "Optional[Mapping[tuple[str, str], str]]" = None,
+    on_validation: "Optional[Callable[[ForeignKeyValidationSubmission], None]]" = None,
 ) -> tuple[int, int, int]:
     """Call the migrator's foreign-key apply; return ``(applied, skipped, failed)``.
 
@@ -4290,9 +4299,10 @@ def _apply_foreign_keys(
     Aurora DSQL enforces foreign keys, but they must be added AFTER the concurrent
     bulk load (which has no parent-before-child ordering). The data is already
     loaded, so a failure here is logged and swallowed rather than failing an
-    otherwise-successful run; a foreign key that cannot be created (an orphan
-    pre-gate hit, or an ALTER failure) is reported in the activity log for manual
-    application, not treated as data loss.
+    otherwise-successful run; a foreign key that cannot be created (counted first and
+    found orphans, or an ALTER failure) is reported in the activity log for manual
+    application, not treated as data loss. ``validation_jobs`` / ``on_validation``: the
+    recorded VALIDATE jobs in, the submitted ones out (G142).
     """
     hook = getattr(migrator, "apply_foreign_keys", None)
     if not callable(hook):
@@ -4305,8 +4315,17 @@ def _apply_foreign_keys(
     def _call():
         # Simpler migrator doubles accept fewer arguments; liveness/stop/progress reporting
         # is best-effort, so degrade one step at a time rather than fail the pass. The
-        # progress reporter is tried FIRST and dropped first, so a double that predates it
-        # still gets heartbeat/should_cancel instead of losing both to one TypeError.
+        # validation record and the progress reporter are tried FIRST and dropped first, so
+        # a double that predates them still gets heartbeat/should_cancel instead of losing
+        # both to one TypeError.
+        if validation_jobs is not None or on_validation is not None:
+            try:
+                return hook(
+                    heartbeat=_beat, should_cancel=_stopped, on_progress=on_progress,
+                    validation_jobs=validation_jobs, on_validation=on_validation,
+                )
+            except TypeError:
+                pass
         try:
             return hook(
                 heartbeat=_beat, should_cancel=_stopped, on_progress=on_progress
@@ -4887,16 +4906,14 @@ def run_full_load(
         raise
     _recreate_dependent_views(migrator)
     # Foreign keys are NOT applied here any more -- they are an explicit operator action on
-    # the Data Migration step, exactly as they already are at cut over for a CDC migration.
-    # WHY: the pass is the pre-cut-over gate and its orphan pre-check is O(child rows), so on
-    # a real schema it held the END of the load for many minutes (measured: 28.0 min serial /
-    # 7.9 min at 8-way for 15 FKs over 15.5M child rows) -- after every row was already
-    # loaded. Moving it behind a button reports the load as finished when it is finished, and
-    # makes BOTH migration types use one flow (product principle: one consistent journey).
-    # The pre-check itself is unchanged: it cannot be skipped, because a failed
-    # `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` is unobservable on DSQL (live-verified --
-    # convalidated stays false, no sys.jobs row, and a synchronous VALIDATE is
-    # FeatureNotSupported).
+    # the Data Migration step, exactly as they already are at cut over for a CDC migration
+    # (product principle: one consistent journey). It was moved behind a button when the
+    # pass still counted every child's orphans before each ADD (measured: 28.0 min serial /
+    # 7.9 min at 8-way for 15 FKs over 15.5M child rows, after every row was loaded). Since
+    # G142 the pass adds every key NOT VALID first (seconds) and Aurora DSQL validates the
+    # loaded rows itself, as an async job whose outcome -- success or failure -- is read back
+    # by its job id from sys.jobs and from pg_constraint.convalidated (live-verified; an
+    # earlier probe that saw "no sys.jobs row" never fetched the job id).
     _fk_pending = pending_foreign_key_count(migrator, table_names)
     _finalize_run(
         handle,
@@ -7607,6 +7624,8 @@ class BatchedTableMigrator:
         heartbeat: Optional[Callable[[], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
+        validation_jobs: "Optional[Mapping[tuple[str, str], str]]" = None,
+        on_validation: "Optional[Callable[[ForeignKeyValidationSubmission], None]]" = None,
     ) -> tuple[int, int, int]:
         """Run-level POST-PASS: re-create preserved foreign keys after the data load.
 
@@ -7617,12 +7636,14 @@ class BatchedTableMigrator:
         Aurora DSQL enforces foreign keys, but they must NOT exist during the load
         (the concurrent, sharded, multi-table bulk load has no parent-before-child
         ordering, so a child row can commit before its parent), so each preserved FK
-        is applied HERE as its own single-DDL ``ADD CONSTRAINT`` (OC001 retry +
-        reconnect, idempotent). Before adding a constraint an ORPHAN PRE-GATE counts
-        child rows with no matching parent: an enforced ``ADD CONSTRAINT`` would fail
-        on any orphan, so the FK is skipped with an actionable activity-log entry
-        (table / FK / count) instead of an opaque ALTER error. A per-FK apply failure
-        is logged and skipped, never failing the completed load.
+        is applied HERE as its own single-DDL ``ADD CONSTRAINT ... NOT VALID`` (OC001
+        retry + reconnect, idempotent; G142: added first, in seconds, then validated by
+        Aurora DSQL in the background -- see :func:`apply_preserved_foreign_keys`). The
+        keys whose parent side is incomplete on Aurora DSQL by design
+        (``fk_counted_before_add``) are counted first and left out while a child row
+        references a missing parent. A per-FK apply failure is logged and skipped, never
+        failing the completed load. ``validation_jobs`` / ``on_validation`` pass the
+        recorded VALIDATE jobs in and the submitted ones out.
 
         No-op for ANY CDC migration -- foreign keys are applied at cut over, after the
         stream drains, never while the sink streams out-of-order rows (it would
@@ -7656,6 +7677,9 @@ class BatchedTableMigrator:
             should_cancel=should_cancel,
             on_progress=on_progress,
             skip_if_absent=frozenset(getattr(self._inputs, "fk_optional_tables", ()) or ()),
+            check_before_add=dict(getattr(self._inputs, "fk_counted_before_add", None) or {}),
+            validation_jobs=validation_jobs,
+            on_validation=on_validation,
         )
 
     def _view_connection_factory(self):
@@ -7666,17 +7690,44 @@ class BatchedTableMigrator:
         return connector.connect
 
 
+# No key is counted before its ADD unless the caller names it (read-only default).
+_NO_COUNTED_KEYS: "Mapping[tuple[str, str], str]" = MappingProxyType({})
+
+
+@dataclass(frozen=True)
+class ForeignKeyValidationSubmission:
+    """What one foreign-key pass handed Aurora DSQL to validate (G142), for the caller to
+    record (``DataMigrationState.record_fk_validation``) and watch.
+
+    ``in_place``: each ``(child table, constraint)`` the pass found or put in place, in pass
+    order. ``jobs``: the validation job id of each key that has one running -- submitted by
+    this pass, or the recorded one still running (a key is never validated twice at once:
+    Aurora DSQL does not de-duplicate VALIDATE jobs). ``already_valid``: the keys whose
+    VALIDATE returned no job (the constraint was valid already). ``unsubmitted``: each key
+    whose VALIDATE could not be submitted, with the reason (value-free). ``absent_children``:
+    the unselected children pointing in that the pass found absent from the target and left
+    out (:func:`foreign_keys_to_apply`), so Cut over's Finish never waits for their keys.
+    """
+
+    in_place: "tuple[tuple[str, str], ...]" = ()
+    jobs: "Mapping[tuple[str, str], str]" = field(default_factory=dict)
+    already_valid: frozenset = frozenset()
+    unsubmitted: "Mapping[tuple[str, str], str]" = field(default_factory=dict)
+    absent_children: frozenset = frozenset()
+
+
 def apply_preserved_foreign_keys(
     table_conversions: Mapping[str, TableConversion],
     connection_factory: Callable[[], Any],
     *,
     # Liveness reporter, called at each real unit boundary (per FK, per orphan-count page,
-    # and per poll of a still-building parent index). This pass runs entirely AFTER the Full
-    # Load progress drain has been joined, so without it the whole pass is one silence gap
-    # measured against the 900 s stall window -- and it is unbounded: up to 300 s per
-    # distinct still-building parent index plus an O(rows) orphan pre-gate per FK. A fully
-    # successful load was therefore reaped as "an unresponsive source/target connection",
-    # which _mark_done cannot undo. The cut-over action passes its job's heartbeat too.
+    # per poll of a still-building parent index, per VALIDATE submitted). This pass runs
+    # entirely AFTER the Full Load progress drain has been joined, so without it the whole
+    # pass is one silence gap measured against the 900 s stall window: up to 300 s per
+    # distinct still-building parent index, plus an O(rows) orphan count for each key that
+    # is counted before its ADD. A fully successful load was once reaped as "an
+    # unresponsive source/target connection", which _mark_done cannot undo. The cut-over
+    # action passes its job's heartbeat too.
     heartbeat: Optional[Callable[[], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     # Progress reporter, called ``(settled, total)`` once per FK that finishes (applied,
@@ -7695,28 +7746,47 @@ def apply_preserved_foreign_keys(
     origin: str = "post-load",
     # Unselected children kept for a key INTO the migration (foreign_keys_pointing_in):
     # when one is not on the target there is nothing to re-create, so it is left out
-    # instead of failing its orphan pre-check.
+    # (foreign_keys_to_apply, the selection Cut over's Finish gate shares) instead of
+    # failing its orphan count.
     skip_if_absent: "frozenset[str]" = frozenset(),
+    # ``(child, constraint) -> why`` for the keys whose parent side is incomplete on Aurora
+    # DSQL by design (foreign_keys_counted_before_add: the referenced column is excluded,
+    # the parent table is not migrated, or the child is not): those keep the orphan count
+    # BEFORE their ADD and are left out while it finds a row, so a key the migration cannot
+    # satisfy never starts refusing the application's writes (G142).
+    check_before_add: "Mapping[tuple[str, str], str]" = _NO_COUNTED_KEYS,
+    # The VALIDATE job each key already has (the persisted record), so a key whose job is
+    # still running is not submitted a second time.
+    validation_jobs: "Optional[Mapping[tuple[str, str], str]]" = None,
+    # Called once, after the keys are added and their validation submitted.
+    on_validation: "Optional[Callable[[ForeignKeyValidationSubmission], None]]" = None,
 ) -> tuple[int, int, int]:
-    """Re-create preserved foreign keys as post-load ``ADD CONSTRAINT``, orphan-gated.
+    """Re-create preserved foreign keys: add every key first, have Aurora DSQL check after.
 
     Shared by the Full Load run-level post-pass
     (:meth:`BatchedTableMigrator.apply_foreign_keys`) and the CDC **cut-over** action
-    (which runs it once the stream has drained). Each preserved FK is applied as its
-    own single-DDL ``ALTER TABLE ... ADD CONSTRAINT`` (OCC 40001 retry + reconnect,
-    idempotent). An ORPHAN PRE-GATE counts child rows with no matching parent first:
-    an enforced ``ADD CONSTRAINT`` would fail on any orphan, so that FK is skipped with
-    an actionable activity-log entry (table / FK / count) instead of an opaque ALTER
-    failure. Best-effort per FK: a failure is logged and skipped, never raised.
+    (which runs it once the stream has drained). G142 -- live-verified on Aurora DSQL:
 
-    The orphan pre-gate pages each child by the primary key the LIVE target enforces
-    (:func:`_count_orphans`, G138), so a large child is counted over BOUNDED keyset pages
-    rather than one unbounded scan that could exceed DSQL's ~300s transaction limit -- a
-    composite key too -- and never by a key the target does not hold unique, whose page
-    boundaries could skip a duplicate and undercount. A dropped connection or a conflict
-    replays only the page it interrupted (G139), so a child of any size is counted.
+    * **Add first.** Each preserved FK is added as its own single-DDL ``ALTER TABLE ... ADD
+      CONSTRAINT ... NOT VALID`` (OCC 40001 retry + reconnect; 42710 means it is already
+      there, which is success), after its parent's unique index is valid. ``NOT VALID``
+      reads no row -- it succeeds in well under a second with orphans present -- and from
+      its commit on Aurora DSQL refuses every write that would add an orphan (child and
+      parent side alike), so the whole step takes seconds inside the write freeze and no
+      child table is too large for it. No orphan count runs before the ADD -- except for
+      the keys in ``check_before_add``, whose parent side is incomplete on Aurora DSQL by
+      design: those are counted first (concurrently, page by page, :func:`_count_orphans`)
+      and left out with an actionable note while a child row references a missing parent.
+    * **Check after.** Right after the adds, every key in place gets ``ALTER TABLE ASYNC
+      ... VALIDATE CONSTRAINT`` (:func:`validate_foreign_key`), a server-side job that
+      checks the rows already loaded; its id is handed to ``on_validation`` for the caller
+      to record and watch (``_fk_validation``). The verdict is Aurora DSQL's: ``sys.jobs``
+      by job id and ``pg_constraint.convalidated``. A key whose recorded job is still
+      running keeps it. A failed submission is reported, never raised.
 
-    Returns ``(applied, skipped, failed)`` counts.
+    Best-effort per FK: a failure is logged and skipped, never raised. Returns
+    ``(applied, skipped, failed)``: keys in place, keys left out by their count, keys that
+    could not be added.
     """
     # Pair each rendered ADD-CONSTRAINT DDL with its FK metadata by CONSTRAINT NAME,
     # not by list position. The deterministic conversion builds both lists in
@@ -7724,26 +7794,32 @@ def apply_preserved_foreign_keys(
     # re-parses foreign_key_ddls from only the FK lines the user kept -- in their
     # edited order -- while preserved_foreign_keys stays the full deterministic list.
     # A positional zip would then pair a DDL with the WRONG FK's metadata, so the
-    # orphan pre-gate would check the wrong columns and VALIDATE the wrong constraint.
-    # Matching on the constraint name (the DDL's own key) keeps the pre-gate and the
+    # orphan count would check the wrong columns and VALIDATE the wrong constraint.
+    # Matching on the constraint name (the DDL's own key) keeps the count and the
     # VALIDATE target aligned to the constraint actually being added.
     pending: list[tuple[str, Optional[str], Optional[ForeignKeyDef], str]] = []
     # One memo per PASS: the same parent index is commonly referenced by several FKs.
     index_state_cache: dict = {}
     _beat = heartbeat if callable(heartbeat) else (lambda: None)
     _stopped = should_cancel if callable(should_cancel) else (lambda: False)
-    if skip_if_absent:
-        table_conversions = _drop_absent_optional_children(
-            table_conversions, connection_factory, skip_if_absent
-        )
+
+    def _record(submission: ForeignKeyValidationSubmission) -> None:
+        if not callable(on_validation):
+            return
+        try:
+            on_validation(submission)
+        except Exception:  # noqa: BLE001 - the caller's record must not undo the pass
+            _LOGGER.warning("Recording the foreign-key validation failed", exc_info=True)
+
+    absent = _absent_optional_children(table_conversions, connection_factory, skip_if_absent)
+    table_conversions = foreign_keys_to_apply(table_conversions, skip_if_absent, absent)
     for table_name, conv in table_conversions.items():
         by_name = {fk.name: fk for fk in conv.preserved_foreign_keys}
-        for add_ddl in conv.foreign_key_ddls:
-            constraint_name = _constraint_name_from_ddl(add_ddl)
+        # A key added without a name is added under the name PostgreSQL would give it,
+        # written into its statement: validated like every key, and 42710 on a re-apply.
+        for constraint_name, add_ddl in _named_foreign_key_ddls(conv.foreign_key_ddls):
             fk = by_name.get(constraint_name) if constraint_name is not None else None
             pending.append((table_name, constraint_name, fk, add_ddl))
-    if not pending:
-        return (0, 0, 0)
 
     _total = len(pending)
 
@@ -7758,8 +7834,13 @@ def apply_preserved_foreign_keys(
 
     # Publish the real total up front. The caller's own pre-count (pending_foreign_key_count)
     # is computed separately, so this is what keeps the card's denominator equal to the number
-    # of FKs the pass will actually work through.
+    # of FKs the pass will actually work through -- none, when every key was left out.
     _report(0)
+    if not pending:
+        # Nothing to add; the record still learns what was left out (Finish waits for none
+        # of those keys) and that no key is in place as this pass knows it.
+        _record(ForeignKeyValidationSubmission(absent_children=absent))
+        return (0, 0, 0)
 
     # A STARTED line, so an INTERRUPTED pass leaves evidence. The roll-up below is emitted
     # after the loop, so a pass killed part-way -- the Fargate task replaced, or the
@@ -7781,12 +7862,32 @@ def apply_preserved_foreign_keys(
         detail=f"Foreign-key pass starting: {_total} constraint(s) to add.",
     )
 
-    # Pre-count orphans for every FK CONCURRENTLY. The DDL below stays SERIAL (one DDL per
-    # transaction on DSQL, and it costs 0.18s per FK), so only the expensive read fans out.
-    _pregated = _pregate_orphans(
-        pending, connection_factory, beat=_beat, stopped=_stopped
+    # Only the keys whose parent side is incomplete by design are counted before their ADD,
+    # concurrently (the DDL stays SERIAL: one DDL per transaction on DSQL, 0.06-0.2 s per FK).
+    _counted_first = {
+        index
+        for index, (table_name, constraint_name, fk, _ddl) in enumerate(pending)
+        if fk is not None
+        and constraint_name is not None
+        and (table_name, constraint_name) in check_before_add
+    }
+    _counted_order = sorted(_counted_first)
+    _by_position = (
+        _pregate_orphans(
+            [pending[index] for index in _counted_order],
+            connection_factory, beat=_beat, stopped=_stopped,
+        )
+        if _counted_order
+        else {}
     )
+    # _pregate_orphans keys its answers by position in the list it was given.
+    _pregated = {
+        index: _by_position[position]
+        for position, index in enumerate(_counted_order)
+        if position in _by_position
+    }
     applied = skipped = failed = 0
+    in_place: "list[tuple[str, Optional[str]]]" = []
     try:
         for _fk_index, (table_name, constraint_name, fk, add_ddl) in enumerate(pending):
             # One FK is a real unit of work: report liveness so a long pass is not reaped,
@@ -7805,59 +7906,54 @@ def apply_preserved_foreign_keys(
                 )
                 break
             target = f"{table_name}.{constraint_name or '?'}"
-            try:
-                if fk is None:
-                    # No metadata to key the orphan query on (an edited/renamed FK the
-                    # re-parser could not match). Skip the pre-gate and let the ADD run:
-                    # a NOT VALID add succeeds without scanning, and the best-effort
-                    # VALIDATE below surfaces any pre-existing violation.
-                    orphans = 0
-                    _LOGGER.debug("No FK metadata for %s; skipping orphan pre-gate", target)
-                else:
-                    # Use the concurrent pre-count when it produced a number; anything else
-                    # (missing, or an exception) falls through to the serial count so the
-                    # verdict and its error handling are unchanged.
+            if _fk_index in _counted_first:
+                try:
+                    # The concurrent count when it produced a number; anything else (missing,
+                    # or an exception) falls through to one serial count on its own
+                    # connection, so the verdict and its error handling are unchanged.
                     _pre = _pregated.get(_fk_index)
-                    if isinstance(_pre, int):
-                        orphans = _pre
-                    else:
-                        orphans = _count_orphans(
-                            connection_factory, table_name, fk, on_page=_beat
-                        )
-            except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk a bad ADD
-                # The count replaced its connection after every drop and replayed the page
-                # a 40001 / XX000 interrupted (it used to run on one shared probe, reopened
-                # once, counting again from the first page), so what reaches here is a
-                # connection that could not be opened, a key read or page that outlasted
-                # its retries, or a real query error.
-                failed += 1
-                _LOGGER.warning("Orphan pre-check failed for FK %s", target, exc_info=True)
-                log_activity(
-                    _category,
-                    "foreign key not applied",
-                    status=ActivityStatus.FAILURE,
-                    target=target,
-                    detail=(
-                        "orphan pre-check failed; verify referential integrity and "
-                        "apply this foreign key manually"
-                    ),
-                    exc=exc,
-                )
-                continue
-            if orphans:
-                skipped += 1
-                log_activity(
-                    _category,
-                    "foreign key not applied",
-                    status=ActivityStatus.FAILURE,
-                    target=target,
-                    detail=(
-                        f"{orphans} child row(s) reference a missing parent, so Aurora "
-                        "DSQL cannot enforce this foreign key. Resolve the orphan rows "
-                        "(often an un-replicated source cascade) and re-apply."
-                    ),
-                )
-                continue
+                    orphans = (
+                        _pre
+                        if isinstance(_pre, int)
+                        else _count_orphans(connection_factory, table_name, fk, on_page=_beat)
+                    )
+                except Exception as exc:  # noqa: BLE001 - cannot verify -> do not risk an ADD
+                    # The count replaced its connection after every drop and replayed the
+                    # page a 40001 / XX000 interrupted (G139), so what reaches here is a
+                    # connection that could not be opened, a key read or page that outlasted
+                    # its retries, or a real query error.
+                    failed += 1
+                    _LOGGER.warning("Orphan pre-check failed for FK %s", target, exc_info=True)
+                    log_activity(
+                        _category,
+                        "foreign key not applied",
+                        status=ActivityStatus.FAILURE,
+                        target=target,
+                        detail=(
+                            "orphan pre-check failed; verify referential integrity and "
+                            "apply this foreign key manually"
+                        ),
+                        exc=exc,
+                    )
+                    continue
+                if orphans:
+                    skipped += 1
+                    log_activity(
+                        _category,
+                        "foreign key not applied",
+                        status=ActivityStatus.FAILURE,
+                        target=target,
+                        detail=(
+                            f"{orphans} child row(s) reference a missing parent, so Aurora "
+                            "DSQL cannot enforce this foreign key. Resolve the orphan rows "
+                            "(often an un-replicated source cascade) and re-apply. It was "
+                            "counted before it was added because "
+                            f"{_counted_first_reason(check_before_add, table_name, constraint_name)}"
+                            ": added, it would refuse the application's writes that name a "
+                            "parent row Aurora DSQL does not hold."
+                        ),
+                    )
+                    continue
             index_state: Optional[str] = None
             index_waited = 0.0
             try:
@@ -7888,26 +7984,12 @@ def apply_preserved_foreign_keys(
                             f"was {_index_state_phrase(index_state)}"
                         ),
                     )
-                # DSQL only accepts ADD CONSTRAINT ... NOT VALID (renders that way);
-                # it enforces every NEW write immediately.
+                # DSQL only accepts ADD CONSTRAINT ... NOT VALID (renders that way); it
+                # reads no row and enforces every NEW write immediately. 42710 (already
+                # there) is success, so a re-run is a no-op.
                 apply_foreign_key(add_ddl, connection_factory=connection_factory)
-                # Existing rows are consistent (the orphan pre-gate above was clean), so
-                # mark the constraint validated via the async VALIDATE job. Uses the
-                # DDL's own constraint name (not the metadata's) so it targets exactly
-                # the constraint just added. Best-effort: if it fails the FK still
-                # enforces all new writes.
-                if constraint_name is not None:
-                    try:
-                        validate_foreign_key(
-                            table_name, constraint_name,
-                            connection_factory=connection_factory,
-                        )
-                    except Exception:  # noqa: BLE001 - async VALIDATE is best-effort
-                        _LOGGER.warning(
-                            "VALIDATE CONSTRAINT deferred for %s (FK still enforces new writes)",
-                            target, exc_info=True,
-                        )
                 applied += 1
+                in_place.append((table_name, constraint_name))
             except Exception as exc:  # noqa: BLE001 - non-blocking: data is already loaded
                 failed += 1
                 _LOGGER.warning("Could not apply FK %s", target, exc_info=True)
@@ -7926,6 +8008,25 @@ def apply_preserved_foreign_keys(
         # of applied/skipped/failed, so this is right both for a completed pass (== total)
         # and for one cut short by Stop (fewer, which is what the card should then show).
         _report(applied + skipped + failed)
+    # Check after: one async VALIDATE per key now in place, so Aurora DSQL checks the rows
+    # already loaded while the keys enforce every new write. A stopped pass still submits
+    # them for the keys it added (a server-side job, nothing to wait for here).
+    submission = _submit_foreign_key_validation(
+        in_place, connection_factory, validation_jobs, beat=_beat
+    )
+    for (table_name, constraint_name), reason in submission.unsubmitted.items():
+        log_activity(
+            _category,
+            "foreign key validation not submitted",
+            status=ActivityStatus.WARNING,
+            target=f"{table_name}.{constraint_name}",
+            detail=(
+                "the key is in place and refuses every new write that would break it, but "
+                f"Aurora DSQL's check of the rows already loaded could not be started "
+                f"({reason}); use Validate again"
+            ),
+        )
+    _record(replace(submission, absent_children=absent))
     # THE single audit event for a foreign-key pass, emitted HERE because every caller
     # shares this function -- the Full Load post-pass, the Data Migration action, and the
     # CUT-OVER action, which logs nothing of its own (so moving this to the caller, as the
@@ -7950,9 +8051,10 @@ def apply_preserved_foreign_keys(
         ActivityStatus.FAILURE
         if failed
         else ActivityStatus.WARNING
-        if (skipped or _unattempted)
+        if (skipped or _unattempted or submission.unsubmitted)
         else ActivityStatus.SUCCESS
     )
+    _submitted = len(submission.jobs)
     log_activity(
         # Cut over is the Validation step's screen, and the sync beside it logs there too,
         # so a reader filtering that step sees the whole hand-off in one place.
@@ -7977,6 +8079,19 @@ def apply_preserved_foreign_keys(
                 else ""
             )
             + (
+                f" The {applied} applied enforce every new write now; Aurora DSQL validates "
+                f"the rows already loaded in the background ({_submitted} validation "
+                f"job(s) running, {len(submission.already_valid)} already valid"
+                + (
+                    f", {len(submission.unsubmitted)} not submitted"
+                    if submission.unsubmitted
+                    else ""
+                )
+                + ")."
+                if applied
+                else ""
+            )
+            + (
                 " Run at cut over, before repointing — for a CDC migration this is the "
                 "only pass that creates the deferred constraints."
                 if _at_cutover
@@ -7985,6 +8100,97 @@ def apply_preserved_foreign_keys(
         ),
     )
     return (applied, skipped, failed)
+
+
+def _counted_first_reason(check_before_add, table_name: str, constraint_name) -> str:
+    """Why a key was counted before its ADD (``check_before_add`` maps it to a reason)."""
+    getter = getattr(check_before_add, "get", None)
+    reason = getter((table_name, constraint_name)) if callable(getter) else None
+    return reason or "its parent side is not fully on Aurora DSQL by design"
+
+
+def _submit_foreign_key_validation(
+    in_place: "Sequence[tuple[str, Optional[str]]]",
+    connection_factory: Callable[[], Any],
+    recorded: "Optional[Mapping[tuple[str, str], str]]",
+    *,
+    beat: Callable[[], None],
+) -> ForeignKeyValidationSubmission:
+    """Submit ``ALTER TABLE ASYNC ... VALIDATE CONSTRAINT`` for each key in place that is
+    not validated yet (G142).
+
+    One catalog read first (:func:`foreign_key_validation_states`): a key already
+    ``convalidated`` needs no job, and a key whose recorded job is still ``submitted`` /
+    ``processing`` (read BY that job id from ``sys.jobs``) keeps it -- Aurora DSQL does not
+    de-duplicate VALIDATE jobs, so a second click would queue another full read of the
+    child. A key the read cannot answer is submitted (a VALIDATE of a valid key returns no
+    job: success). A key without a parsed constraint name cannot be validated and is left
+    out.
+    """
+    from dsql_migrator.core.target_introspector import foreign_key_validation_states
+
+    keys = [
+        (table_name, constraint_name)
+        for table_name, constraint_name in in_place
+        if constraint_name is not None
+    ]
+    known = {key: str(job) for key, job in (recorded or {}).items() if key in keys and job}
+    try:
+        reads = (
+            foreign_key_validation_states(keys, known, connection_factory=connection_factory)
+            if keys
+            else {}
+        )
+    except Exception:  # noqa: BLE001 - unknown: submit, never skip on a guess
+        reads = {}
+    valid = {
+        key for key, read in reads.items() if read is not None and read.present and read.validated
+    }
+    running = {
+        key: known[key]
+        for key, read in reads.items()
+        if key in known
+        and read is not None
+        and read.present
+        and not read.validated
+        and read.job_status in ("submitted", "processing")
+    }
+    jobs: "dict[tuple[str, str], str]" = {}
+    already_valid: "set[tuple[str, str]]" = set()
+    unsubmitted: "dict[tuple[str, str], str]" = {}
+    for key in keys:
+        beat()
+        if key in valid:
+            already_valid.add(key)
+            continue
+        if key in running:
+            jobs[key] = running[key]
+            continue
+        table_name, constraint_name = key
+        try:
+            job_id = validate_foreign_key(
+                table_name, constraint_name, connection_factory=connection_factory
+            )
+        except Exception as exc:  # noqa: BLE001 - reported per key; the key still enforces
+            _LOGGER.warning(
+                "VALIDATE CONSTRAINT not submitted for %s.%s", table_name, constraint_name,
+                exc_info=True,
+            )
+            sqlstate = _error_code(exc)
+            unsubmitted[key] = (
+                f"{type(exc).__name__}, SQLSTATE {sqlstate}" if sqlstate else type(exc).__name__
+            )
+            continue
+        if job_id:
+            jobs[key] = job_id
+        else:
+            already_valid.add(key)
+    return ForeignKeyValidationSubmission(
+        in_place=tuple(keys),
+        jobs=jobs,
+        already_valid=frozenset(already_valid),
+        unsubmitted=unsubmitted,
+    )
 
 
 def foreign_keys_blocking_replace(
@@ -8070,6 +8276,68 @@ def foreign_keys_pointing_in(scoped_conversions, tables) -> frozenset:
     return frozenset(n for n in (scoped_conversions or {}) if n not in keep)
 
 
+def foreign_keys_to_apply(scoped_conversions, optional, absent=frozenset()) -> dict:
+    """The conversions whose foreign keys a pass adds: ``scoped_conversions``
+    (:func:`foreign_keys_in_scope`) less each ``optional`` child
+    (:func:`foreign_keys_pointing_in`) that is ``absent`` from the target, where there is
+    nothing to re-create. Pure.
+
+    The ONE selection :func:`apply_preserved_foreign_keys` and Cut over's Finish gate share
+    (G142): the pass with the children it found absent, the gate with those the last pass
+    recorded -- so Finish never waits for a key the pass leaves out by design."""
+    gone = set(optional or ()) & set(absent or ())
+    return {name: conv for name, conv in (scoped_conversions or {}).items() if name not in gone}
+
+
+def foreign_keys_counted_before_add(
+    scoped_conversions, tables, excluded_columns=None
+) -> "dict[tuple[str, str], str]":
+    """``(child, constraint) -> why`` for the keys whose parent side is incomplete on Aurora
+    DSQL BY DESIGN, so the pass keeps counting their orphans before it adds them (G142). Pure.
+
+    Every other key is added first (``NOT VALID``, seconds) and validated by Aurora DSQL
+    afterwards: its rows came over with their parents, so a failed validation is the
+    exception to explain. These three are different -- the migration itself leaves parent
+    rows off Aurora DSQL, so adding the key would start refusing the application's writes
+    that name them:
+
+    * the referenced column is EXCLUDED on the parent (a B3 entry kept once the exclusion
+      set was baked in): it is NULL there, so every child row with a value is an orphan;
+    * the parent table is not one of the migration's ``tables`` (an unticked parent): its
+      rows on Aurora DSQL are whatever an earlier load left, if any;
+    * the child table is not one of them (an unselected child kept for a key into the
+      migration, :func:`foreign_keys_pointing_in`): a table the migration does not load.
+
+    ``tables`` empty or ``None`` (no selection recorded) migrates every table, so only the
+    first applies. ``excluded_columns`` is the EFFECTIVE exclusion set (table -> columns).
+    """
+    keep = set(tables or ())
+    excluded = {
+        str(table): set(columns or ()) for table, columns in (excluded_columns or {}).items()
+    }
+    counted: "dict[tuple[str, str], str]" = {}
+    for child, conv in (scoped_conversions or {}).items():
+        by_name = {fk.name: fk for fk in getattr(conv, "preserved_foreign_keys", ()) or ()}
+        for ddl in getattr(conv, "foreign_key_ddls", ()) or ():
+            name = _constraint_name_from_ddl(ddl)
+            fk = by_name.get(name) if name else None
+            if fk is None:
+                continue
+            gone = sorted(set(fk.referenced_columns) & excluded.get(fk.referenced_table, set()))
+            if gone:
+                counted[(child, name)] = (
+                    f"its referenced column {fk.referenced_table}.{gone[0]} is excluded from "
+                    "this migration (NULL on Aurora DSQL)"
+                )
+            elif keep and fk.referenced_table not in keep:
+                counted[(child, name)] = (
+                    f"its parent table {fk.referenced_table} is not part of this migration"
+                )
+            elif keep and child not in keep:
+                counted[(child, name)] = f"its table {child} is not part of this migration"
+    return counted
+
+
 def _target_table_present(connection_factory, table_name: str) -> bool:
     """Whether ``table_name`` exists on the target (one catalog read); True when unknown."""
     from dsql_migrator.core.target_introspector import read_overlay_column_facts
@@ -8090,28 +8358,29 @@ def _target_table_present(connection_factory, table_name: str) -> bool:
             pass
 
 
-def _drop_absent_optional_children(table_conversions, connection_factory, optional):
-    """``table_conversions`` without the OPTIONAL children (keys into the migration from an
-    unselected table) that are not on the target: nothing to re-create there. A migrated
-    table is never dropped here -- an absent one still fails loudly in the pass."""
-    if not optional:
-        return dict(table_conversions)
-    return {
-        name: conv
-        for name, conv in table_conversions.items()
-        if name not in optional or _target_table_present(connection_factory, name)
-    }
+def _absent_optional_children(table_conversions, connection_factory, optional) -> frozenset:
+    """The OPTIONAL children of ``table_conversions`` (keys into the migration from an
+    unselected table) that are not on the target, one catalog read each. A migrated table
+    is never among them -- an absent one still fails loudly in the pass."""
+    wanted = set(optional or ())
+    return frozenset(
+        name
+        for name in (table_conversions or {})
+        if name in wanted and not _target_table_present(connection_factory, name)
+    )
 
 
-def pending_foreign_key_count(migrator: DataMigrator, tables=None) -> int:
+def pending_foreign_key_count(migrator: DataMigrator, tables=None, absent=()) -> int:
     """How many preserved foreign keys this run still has to apply (no DB access).
 
     Counts the SAME rendered ``foreign_key_ddls`` :func:`apply_preserved_foreign_keys`
     would iterate, so the Data Migration step's "Apply foreign keys" action shows the same
     number the action will work through -- over the run's ``tables``
-    (:func:`foreign_keys_in_scope`; ``None``: every table). Zero when FK preservation is
-    off, when the source has none, or for a CDC migration (those are applied at cut over
-    instead).
+    (:func:`foreign_keys_in_scope`; ``None``: every table), less each optional child
+    (``fk_optional_tables``) the last pass found ``absent``: the pass's and Cut over's own
+    selection (:func:`foreign_keys_to_apply`), so a clean pass leaves none outstanding.
+    Zero when FK preservation is off, when the source has none, or for a CDC migration
+    (those are applied at cut over instead).
     """
     inputs = getattr(migrator, "_inputs", None)
     if inputs is None:
@@ -8124,8 +8393,10 @@ def pending_foreign_key_count(migrator: DataMigrator, tables=None) -> int:
         return 0
     return sum(
         len(conv.foreign_key_ddls or ())
-        for conv in foreign_keys_in_scope(
-            getattr(inputs, "table_conversions", None) or {}, tables
+        for conv in foreign_keys_to_apply(
+            foreign_keys_in_scope(getattr(inputs, "table_conversions", None) or {}, tables),
+            getattr(inputs, "fk_optional_tables", None) or (),
+            absent,
         ).values()
     )
 
@@ -8136,11 +8407,11 @@ def preserved_foreign_key_names(
     """Return table -> the FK constraint names THIS migration renders. Pure.
 
     Derived from the very same ``foreign_key_ddls`` that
-    :func:`apply_preserved_foreign_keys` applies (parsed with
-    :func:`_constraint_name_from_ddl`), so the two can never disagree about which
-    constraints belong to this migration. That matters because it is the ONLY safe
-    ownership test for the CDC precondition: an enforced FK on the target has to be
-    removed before streaming (the sink dead-letters 23503 permanently), but the tool
+    :func:`apply_preserved_foreign_keys` applies (named with
+    :func:`_named_foreign_key_ddls`, as the pass names them), so the two can never
+    disagree about which constraints belong to this migration. That matters because it is
+    the ONLY safe ownership test for the CDC precondition: an enforced FK on the target has
+    to be removed before streaming (the sink dead-letters 23503 permanently), but the tool
     must never drop a constraint the user created and it cannot put back -- and
     ``pg_constraint.convalidated`` cannot tell them apart.
 
@@ -8148,8 +8419,7 @@ def preserved_foreign_key_names(
     """
     names: dict[str, list[str]] = {}
     for table_name, conv in table_conversions.items():
-        for add_ddl in conv.foreign_key_ddls:
-            constraint_name = _constraint_name_from_ddl(add_ddl)
+        for constraint_name, _ddl in _named_foreign_key_ddls(conv.foreign_key_ddls):
             if constraint_name:
                 names.setdefault(table_name, []).append(constraint_name)
     return names
@@ -8325,14 +8595,17 @@ def _fk_failure_detail(
 
 
 def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:
-    """Return the (unquoted) constraint name from an ``ADD CONSTRAINT ... FOREIGN KEY`` DDL.
+    """Return the constraint name from an ``ADD CONSTRAINT ... FOREIGN KEY`` DDL, as
+    PostgreSQL / Aurora DSQL stores it: a quoted name as written, an unquoted one folded to
+    lower case (``FK_Orders_Cust`` is stored, read and validated as ``fk_orders_cust``).
 
     The constraint name is the reliable key that pairs a rendered FK DDL with its
-    metadata (for the orphan pre-gate) and with the ``VALIDATE CONSTRAINT`` target --
+    metadata (for the orphan count) and with the ``VALIDATE CONSTRAINT`` target --
     more robust than positional pairing, which breaks when a user deletes/reorders FK
     lines in the edited Schema-Conversion script. Returns ``None`` if the statement is
     not a recognizable ADD-CONSTRAINT-FOREIGN-KEY (the caller then applies it without a
-    pre-gate rather than mis-keying another FK's metadata).
+    count rather than mis-keying another FK's metadata); a key added without a name is
+    named by :func:`_named_foreign_key_ddls`.
     """
     match = _FK_CONSTRAINT_NAME_RE.search(str(add_ddl))
     if not match:
@@ -8340,26 +8613,108 @@ def _constraint_name_from_ddl(add_ddl: object) -> Optional[str]:
     token = match.group(1)
     if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
         return token[1:-1].replace('""', '"')
-    return token
+    return pg_fold_unquoted(token)
 
 
-# Rows scanned per keyset page in the orphan pre-gate's paged path. Bounded so a
+# ``ALTER TABLE [IF EXISTS] [ONLY] [<schema>.]<table> ADD FOREIGN KEY (<columns>)``: a key
+# added without a name (typed in Schema Conversion). Captures the table, the ``ADD`` and the
+# column list.
+_FK_IDENT = r'"(?:[^"]|"")+"|[^\s(),."]+'
+_UNNAMED_FK_RE = re.compile(
+    rf"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:(?:{_FK_IDENT})\s*\.\s*)?"
+    rf"({_FK_IDENT})\s+(ADD\s+)FOREIGN\s+KEY\s*"
+    rf"\(\s*((?:{_FK_IDENT})(?:\s*,\s*(?:{_FK_IDENT}))*)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _stored_identifier(token: str) -> str:
+    """One identifier as PostgreSQL stores it: quoted as written, unquoted folded to lower
+    case, cut to 63 bytes."""
+    token = token.strip()
+    if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        return pg_stored_name(token[1:-1].replace('""', '"'))
+    return pg_stored_name(pg_fold_unquoted(token))
+
+
+def _pg_foreign_key_name(table: str, columns: "Sequence[str]", taken: "Collection[str]") -> str:
+    """The name PostgreSQL gives a foreign key added without one (ChooseConstraintName):
+    ``<table>_<col1>[_<col2>...]_fkey``, the longer of the table name and the column part
+    cut first so the whole fits in 63 bytes (each on a character boundary), and ``fkey1``,
+    ``fkey2``, ... in place of ``fkey`` while the name is ``taken``."""
+    first = table.encode("utf-8")
+    second = "_".join(columns).encode("utf-8")
+    number = 0
+    while True:
+        label = f"fkey{number or ''}"
+        keep_first, keep_second = len(first), len(second)
+        while keep_first + keep_second > 63 - 2 - len(label):  # two underscores
+            if keep_first > keep_second:
+                keep_first -= 1
+            else:
+                keep_second -= 1
+        name = "_".join((
+            first[:keep_first].decode("utf-8", errors="ignore"),
+            second[:keep_second].decode("utf-8", errors="ignore"),
+            label,
+        ))
+        if name not in taken:
+            return name
+        number += 1
+
+
+def _named_foreign_key_ddls(ddls) -> "list[tuple[Optional[str], object]]":
+    """``(constraint, statement)`` for each of ONE table's foreign-key DDLs, in order, as the
+    pass runs them. Pure.
+
+    A key the DDL names keeps that name (:func:`_constraint_name_from_ddl`). One added
+    without a name (``ALTER TABLE ... ADD FOREIGN KEY``, typed in Schema Conversion) gets
+    the name PostgreSQL would give it (:func:`_pg_foreign_key_name`, past the names the
+    table's other keys hold), written into its statement as ``ADD CONSTRAINT "<name>"`` --
+    so it is validated and held like every key, and a re-apply meets 42710 instead of
+    adding a second copy. ``None``: a statement whose key cannot be read (run as written).
+    The pass, Cut over's Finish, the keys CDC can break and the CDC ownership test read a
+    key's name here, so they name the same key.
+    """
+    statements = list(ddls or ())
+    names = [_constraint_name_from_ddl(statement) for statement in statements]
+    taken = {pg_stored_name(name) for name in names if name}
+    named: "list[tuple[Optional[str], object]]" = []
+    for statement, name in zip(statements, names):
+        text = str(statement)
+        unnamed = None if name is not None else _UNNAMED_FK_RE.search(text)
+        if unnamed is not None:
+            name = _pg_foreign_key_name(
+                _stored_identifier(unnamed.group(1)),
+                [_stored_identifier(column) for column in re.findall(_FK_IDENT, unnamed.group(3))],
+                taken,
+            )
+            taken.add(name)
+            quoted = '"' + name.replace('"', '""') + '"'
+            statement = (
+                f"{text[:unnamed.start(2)]}ADD CONSTRAINT {quoted} {text[unnamed.end(2):]}"
+            )
+        named.append((name, statement))
+    return named
+
+
+# Rows scanned per keyset page in the orphan count's paged path. Bounded so a
 # billion-row child never runs one orphan scan past DSQL's ~300s transaction limit.
 _ORPHAN_PAGE_SIZE = 5000
 
 
-# How many orphan pre-gates run at once. The pre-gate is READ-ONLY, and each worker counts
-# on its own connection, so they are independent -- but the target is a live cluster
-# and the pass may run at CUT OVER alongside a draining CDC sink, so the fan-out stays small
-# and bounded rather than one connection per foreign key.
+# How many orphan counts run at once. A count is READ-ONLY, and each worker counts on its
+# own connection, so they are independent -- but the target is a live cluster and the pass
+# may run at CUT OVER alongside a draining CDC sink, so the fan-out stays small and bounded
+# rather than one connection per foreign key.
 #
-# WHY THIS EXISTS: the pass is otherwise serial over every FK, and the pre-gate is the whole
-# cost. Removing the pre-gate is NOT an option -- a failed `ALTER TABLE ASYNC ... VALIDATE
-# CONSTRAINT` is unobservable on DSQL (convalidated stays false, indistinguishable from
-# "still running"; no sys.jobs row appears; a synchronous VALIDATE is FeatureNotSupported),
-# so the tool's own count is the only reliable verdict. Concurrency is what is left.
+# Since G142 only the keys whose parent side is incomplete by design are counted BEFORE their
+# ADD (foreign_keys_counted_before_add); every other key is added NOT VALID at once and
+# Aurora DSQL validates the loaded rows itself -- a failed validation is observable by its
+# job id (sys.jobs) and from pg_constraint.convalidated, live-verified -- and its rows are
+# counted only to explain a failure (_fk_validation).
 #
-# 16 IS MEASURED, not chosen: a live sweep over this schema's 15 FKs / 15.5M child rows gave
+# 16 IS MEASURED, not chosen: a live sweep over a schema's 15 FKs / 15.5M child rows gave
 #   serial 1680.5s | 8-way 461.2s (3.64x) | 16-way 414.0s (4.06x) | 24-way 415.7s (4.04x)
 # so it saturates at 16 and 24 is fractionally worse -- the cluster doing the anti-join is
 # the limit, not client concurrency. Every arm applied all 15 with zero failures.
@@ -8373,7 +8728,8 @@ def _pregate_orphans(
     beat: Callable[[], None],
     stopped: Callable[[], bool],
 ) -> dict:
-    """Count orphans for every pending FK CONCURRENTLY. Returns ``{index: count | Exception}``.
+    """Count orphans for every FK in ``pending`` CONCURRENTLY (the keys counted before their
+    ADD, G142). Returns ``{index in pending: count | Exception}``.
 
     Read-only and independent per FK, each on its own connection, which the count opens
     from ``connection_factory`` and closes (one psycopg connection cannot serve concurrent
@@ -8421,13 +8777,18 @@ def _count_orphans(
     *,
     # The reconnect wait and the replay backoff (``time.sleep``); injectable for tests.
     sleep: Optional[Callable[[float], None]] = None,
+    # Told once where the first orphan is: the cursor of the first page holding one (a
+    # tuple of key values, ``None`` for the first page), so a listing query can read that
+    # one window (G142). Not called when the count finds none or the child has no key.
+    on_orphans: Optional[Callable[[Optional[tuple]], None]] = None,
 ) -> int:
     """Count child rows whose foreign key points to a missing parent (target).
 
-    Read-only pre-gate for the post-load ``ADD CONSTRAINT``: an enforced foreign key
-    cannot be created while orphan rows exist, so this turns an opaque ALTER failure
-    into an actionable per-FK count. Reuses the Validation orphan queries
-    (:mod:`~dsql_migrator.core.validation_sql`).
+    Read-only. Run before the ``ADD CONSTRAINT`` only for a key whose parent side is
+    incomplete on Aurora DSQL by design (G142: every other key is added ``NOT VALID``
+    first), and after a failed Aurora DSQL validation, to explain it with a per-FK count
+    (:mod:`~dsql_migrator.ui.data_migration._fk_validation`). Reuses the Validation
+    orphan queries (:mod:`~dsql_migrator.core.validation_sql`).
 
     The child is paged by the primary key the LIVE target enforces, read once first on
     the count's own connection (G138): a single column by bounded keyset pages, a
@@ -8474,7 +8835,7 @@ def _count_orphans(
         if len(key) == 1:
             return _count_orphans_keyset(
                 connection, child_table, fk, key[0], page_size,
-                on_page=on_page, sleep=sleep,
+                on_page=on_page, sleep=sleep, on_orphans=on_orphans,
             )
         if key:
             return target_orphan_count_composite(
@@ -8482,6 +8843,7 @@ def _count_orphans(
                 page_row=lambda statement, parameters: _orphan_page_row(
                     connection, statement, parameters, sleep=sleep
                 ),
+                on_orphans=on_orphans,
             )
         # The single scan is one statement: its only page, so one liveness report.
         if on_page is not None:
@@ -8567,6 +8929,7 @@ def _count_orphans_keyset(
     on_page: Optional[Callable[[], None]] = None,
     *,
     sleep: Optional[Callable[[float], None]] = None,
+    on_orphans: Optional[Callable[[Optional[tuple]], None]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages (single-column-PK child).
 
@@ -8576,16 +8939,18 @@ def _count_orphans_keyset(
     is bound back untyped, in the column's own type (G141). Sub-counts fold into a
     Python integer; the loop stops when a page returns fewer than ``page_size`` rows.
     Each page runs through :func:`_orphan_page_row`, so a conflict replays that page from
-    its own bound, never the pages already counted.
+    its own bound, never the pages already counted. ``on_orphans`` hears the cursor of the
+    first page holding an orphan (``(last,)``, or ``None`` for the first page), once.
     """
     first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
     next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
     total = 0
     last: object = None
+    told = False
     while True:
         # A page is a real unit of work, and this loop is where the pass actually spends
         # its time: a 3M-row child is ~600 round trips for ONE foreign key. Reporting
-        # liveness only per FK (v0.1.456) still left a single FK's pre-gate silent for
+        # liveness only per FK (v0.1.456) still left a single FK's count silent for
         # minutes, so a live run under an armed watchdog was reaped mid-pass.
         if on_page is not None:
             on_page()
@@ -8596,7 +8961,11 @@ def _count_orphans_keyset(
         if row is None:
             return total
         sub_count, last_pk, count = row[0], row[1], row[2]
-        total += int(sub_count) if sub_count is not None else 0
+        found = int(sub_count) if sub_count is not None else 0
+        total += found
+        if found and not told and on_orphans is not None:
+            told = True
+            on_orphans(None if last is None else (last,))
         if count is None or int(count) < page_size:
             return total
         last = last_pk
