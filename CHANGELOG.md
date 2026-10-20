@@ -5,6 +5,28 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.572
+
+### Security
+
+- **Upgraded the transitive `aiohttp` dependency to 3.14.5** (and `yarl` to 1.25.1, which it
+  requires), closing three advisories Dependabot raised against the shipped lockfile right after
+  v0.1.571:
+  - `GHSA-2g87-pp6c-29x5` — **high**. Crafted requests could make aiohttp use excessive or
+    unbounded memory or CPU.
+  - `GHSA-5wr8-gcqf-gqf3` (CVE-2026-111064) — **high**. The aiohttp server applied no timeout
+    before a request's first bytes, so an idle connection could be held open indefinitely.
+  - `GHSA-494j-54xm-rwp3` (CVE-2026-111063) — low. The client's shared cookie jar did not
+    enforce the `Secure` attribute, so such a cookie could go out over an unencrypted request.
+- **Practical exposure here was low, and the patch is applied anyway.** `aiohttp` reaches this
+  project only through NiceGUI and `python-socketio`'s asyncio client. The web UI is served by
+  uvicorn, not by aiohttp's server, and the tool opens no Socket.IO client connection. A high
+  advisory against a library inside the published image is worth shipping a patch for
+  regardless of reachability.
+- Lockfile only — no first-party code changed. The sink plugin is unchanged (v54), and the app
+  stack takes an image-only update. The full suite passes, and the UI was booted on 3.14.5 to
+  confirm the web stack is unaffected.
+
 ## v0.1.571
 
 MySQL `AUTO_INCREMENT` keys now become identity columns by default, Cut over adds foreign keys in seconds and lets Aurora DSQL validate them, and sink plugin v54 fixes CDC values that an earlier sink wrote wrong, many of them silently. A migration already under way needs the steps in the upgrade notes at the end of this entry.
