@@ -52,6 +52,25 @@ fi
 
 IMAGE_URI="${REPO_URI}:${IMAGE_TAG}"
 
+# --- A published tag is never moved ------------------------------------------
+# Workshops and deployed stacks pull ECR Public images by tag, so publishing an
+# existing tag again would silently swap the image under them (ECR Public tags are
+# mutable). Refuse it before anything is built: publish a new version tag instead.
+if [ -n "${PUBLIC_IMAGE_URI:-}" ]; then
+  PUBLIC_REPO="${PUBLIC_IMAGE_URI##*/}"
+  if PUBLISHED="$(aws ecr-public describe-images --repository-name "${PUBLIC_REPO}" \
+        --image-ids imageTag="${IMAGE_TAG}" --region us-east-1 \
+        --query 'imageDetails[0].imageDigest' --output text 2>&1)"; then
+    echo "error: ${PUBLIC_IMAGE_URI}:${IMAGE_TAG} is already published (${PUBLISHED})." >&2
+    echo "       A published tag is never overwritten: publish a new version tag." >&2
+    exit 1
+  elif ! printf '%s' "${PUBLISHED}" | grep -q "ImageNotFoundException"; then
+    echo "error: could not check whether ${PUBLIC_IMAGE_URI}:${IMAGE_TAG} is already published:" >&2
+    echo "       ${PUBLISHED}" >&2
+    exit 1
+  fi
+fi
+
 # --- Release gate (fail-closed) ----------------------------------------------
 # Run the LIVE pre-publish smoke (scripts/release_gate.py) BEFORE building/pushing an
 # image, so a connect-option / checksum regression the fake-DSQL unit suite CANNOT see
