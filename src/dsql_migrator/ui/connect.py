@@ -606,9 +606,12 @@ def build_connect_page(
     # the fallback on MySQL's 3306 left a restored PostgreSQL session showing 3306 even
     # though the PostgreSQL tile was selected -- and because the port field then reads
     # `src_port or <engine default>` (src_port=3306 is truthy), the engine-aware default
-    # at the field never took over. This is the SAME resolution `_engine["type"]` uses.
+    # at the field never took over. This is the SAME resolution `_engine["type"]` uses,
+    # the operator's current pick first: without it, picking PostgreSQL and reloading (or
+    # opening a second tab) kept the PostgreSQL tile but put the Port back to 3306 (G146).
     _resolved_source_type = (
-        getattr(_sc, "source_type", None)
+        getattr(state, "source_engine_choice", None)
+        or getattr(_sc, "source_type", None)
         or getattr(state, "restored_source_type", None)
         or SourceType.MYSQL
     )
