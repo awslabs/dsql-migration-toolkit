@@ -142,10 +142,13 @@ would pass the rest of that value's rows by, silently. Change the column to `DOU
 the last (or only) key column it is read as usual: two keys that differ only past their
 6th significant digit read back as the same value and cannot both be stored on Aurora
 DSQL (Validation shows the row-count difference), and when a page ends on a value MySQL
-returns below the stored one, the next page would read that row again, so the read stops
-the table instead. A `TIME` key column (negative values included) and a `BIT` key column
+returns below the stored one, the next page starts at the rows that read back as that
+value — rows already loaded, or ones Aurora DSQL would hold as the same key — and the
+read skips them (with an `ENUM` or `SET` key column too, it stops the table instead, as for
+members the collation calls equal). A `TIME` key column (negative values included) and a `BIT` key column
 are read in key order like any other: the cursor binds them as the duration text and the
-integer that MySQL compares exactly.
+integer that MySQL compares exactly. A PostgreSQL `real` key column is too: the cursor
+binds its value as text, which PostgreSQL reads as the stored `real`.
 
 **A primary key is required.** A table with no PK cannot be keyset-paginated and
 is rejected (it's also flagged `UNSUPPORTED` back in Evaluation, because DSQL

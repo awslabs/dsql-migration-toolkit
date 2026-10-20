@@ -372,11 +372,13 @@ class MySQLSourceDialect(SourceDialect):
         # n INT), no error). Refused there, before any page after the first. As the last
         # (or only) key column it reads as it did before G138 (G140): ``f > :last`` passes
         # over no row but the floats that read back as the same decimal, which the target
-        # cannot hold apart anyway, and a cursor below the stored value re-reads its own
-        # row, which the reader refuses loudly. ``CAST(:last AS FLOAT)`` is no way out: it
-        # names only a value of 6 significant digits or fewer (MySQL 8.4: after
-        # (123.456787, 1) it matched none of the 3 rows that follow), and MySQL 5.7 and 8.0
-        # before 8.0.17 have no such CAST.
+        # cannot hold apart anyway (unless an earlier key part differs only in what the
+        # source's collation ignores, letter case say), and a cursor below the stored value
+        # re-reads its own row (and the rows after it that read back as the same decimal),
+        # which the reader skips (G144, keyset_rereads_cursor). ``CAST(:last AS FLOAT)`` is
+        # no way out: it names only a value of 6 significant digits or fewer (MySQL 8.4:
+        # after (123.456787, 1) it matched none of the 3 rows that follow), and MySQL 5.7
+        # and 8.0 before 8.0.17 have no such CAST.
         recorded = {c.name.lower(): c.mysql_type for c in getattr(table, "columns", ())}
         for column in primary_key[:-1]:
             if is_single_precision_float(recorded.get(column.lower())):
@@ -413,6 +415,19 @@ class MySQLSourceDialect(SourceDialect):
         if walked:
             cursor = f"{self.quote_identifier(primary_key[0])} = :{names[0]} AND {cursor}"
         return cursor, params
+
+    def keyset_rereads_cursor(self, table: object) -> bool:
+        # A last (or only) single-precision FLOAT key column: its cursor is the value as
+        # MySQL returns it, rounded, so a cursor below the stored value matches the rows
+        # that read back as it again (see keyset_after_sql). Those are the rows the read
+        # already passed or ones the target holds as the same key (G144). Not with an ENUM
+        # or SET key column too: two of its members the collation calls equal re-read the
+        # cursor's row as well, and only a stop tells that apart from the FLOAT (G130).
+        primary_key = list(table.primary_key)  # type: ignore[attr-defined]
+        recorded = {c.name.lower(): c.mysql_type for c in getattr(table, "columns", ())}
+        if not primary_key or any(_ENUM_OR_SET.match(recorded.get(c.lower(), "")) for c in primary_key):
+            return False
+        return is_single_precision_float(recorded.get(primary_key[-1].lower()))
 
     @property
     def snapshot_start_sql(self) -> str:

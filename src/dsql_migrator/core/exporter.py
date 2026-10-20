@@ -1070,7 +1070,9 @@ def keyset_stream(
     :class:`UnsupportedPrimaryKeyError` for a missing primary key, and
     :class:`ExportError` -- rather than re-reading or skipping rows -- for a page that
     returns the row its cursor is (a full one would be read again forever), and for a
-    walked key whose page returns another value's rows.
+    walked key whose page returns another value's rows. Only a key whose cursor the source
+    cannot name exactly (:meth:`~dsql_migrator.core.source_dialect.SourceDialect.keyset_rereads_cursor`)
+    skips the rows that read back as its cursor instead, and stops on a full page of them.
 
     ``should_cancel`` (optional) is polled before each page is fetched; when it
     returns ``True`` the stream raises :class:`ExportCancelled` instead of issuing
@@ -1162,6 +1164,9 @@ def keyset_stream(
     # within the value), the next value once a page comes back short -- a one-column key
     # holds one row per value -- and the table ends after the last value.
     walk = dialect.keyset_walk(table, members)
+    # A key whose cursor can match the rows that read back as it again (a MySQL key whose
+    # last column is a single-precision FLOAT): those rows are skipped, not a stop (G144).
+    rereads = dialect.keyset_rereads_cursor(table)
     lead_sql = dialect.quote_identifier(pk_columns[0])
     lead_name = keyset_param_names(len(pk_columns))[0]
     first_where = " AND ".join(range_clauses)
@@ -1219,11 +1224,19 @@ def keyset_stream(
             on_description(getattr(getattr(result, "cursor", None), "description", None))
         page_index += 1
         page_count = 0
+        skipped = 0
         first_key: Optional[tuple] = None
         for row in result.mappings():  # type: ignore[attr-defined]
             page_count += 1
             key = _key_of(row)
             if cursor is not None and tuple(map(_told_apart, key)) == tuple(map(_told_apart, cursor)):
+                if rereads and first_key is None:
+                    # The cursor names its value only as the source rounds it, so the page
+                    # starts at the rows that read back as it: ones already read, or ones the
+                    # target holds as the same key. Neither is loaded again. Only where the
+                    # page starts: such a row after another one is no rounding.
+                    skipped += 1
+                    continue
                 # A cursor's own row never sorts after it: the source compares the key
                 # differently from the cursor (ENUM members equal under the column's
                 # collation), so this page re-reads rows -- a full one that ends here
@@ -1270,6 +1283,16 @@ def keyset_stream(
             )
 
         exhausted = page_count < batch_size
+        if skipped == page_count and not exhausted:
+            # A full page of rows that read back as the cursor: the next one would be it again.
+            raise ExportError(
+                f"table '{table.name}': a page of its keyset read held only rows whose key "
+                f"reads back as the page's cursor ({page_count} of them), so the read would "
+                "not move on: the source returns more of the key's values as the same value "
+                "than a page holds (a single-precision FLOAT key column, which MySQL returns "
+                "rounded). Change the column to DOUBLE or DECIMAL on the source, then retry "
+                "this table."
+            )
         if walk is None:
             if exhausted:
                 return

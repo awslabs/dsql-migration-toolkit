@@ -359,6 +359,14 @@ class SourceDialect(ABC):
         """
         return None
 
+    def keyset_rereads_cursor(self, table: object) -> bool:
+        """Whether a next page can return rows whose key reads back as its cursor -- rows
+        the read has already passed, as far as the target can tell them apart -- which the
+        read then skips rather than stopping. The base: ``False`` (each key column is
+        bound so the source compares it with the stored value exactly).
+        """
+        return False
+
     @property
     @abstractmethod
     def snapshot_start_sql(self) -> str:

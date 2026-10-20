@@ -1407,10 +1407,25 @@ class PostgresSourceDialect(SourceDialect):
         # would still re-read every row of the cursor's leading value. Bare columns, as in
         # every WHERE here: they are the native ones, and a text-read key's cursor text
         # binds back to its type. ``members`` is always empty: a PostgreSQL enum key
-        # compares by its declared order natively.
+        # compares by its declared order natively. A ``real`` key's value goes back as text
+        # too (G144): psycopg reads it as the float of its shortest decimal ('0.3' for
+        # 0.300000012) and binds that float as a float8, which is not the stored float4.
+        # Below it (about half the values), the next page returned the cursor's own row and
+        # the read stopped (PostgreSQL 16 and 17: 10,000 of 20,000 rows); above it, a
+        # ``real`` followed by another key column passed the rest of that value's rows by,
+        # silently. Untyped, the server parses the text as a float4, which is the stored
+        # value.
         primary_key = [self.quote_identifier(c) for c in table.primary_key]  # type: ignore[attr-defined]
         names = keyset_param_names(len(primary_key))
-        params: dict[str, object] = dict(zip(names, last_key))
+        reals = {
+            c.name
+            for c in getattr(table, "columns", ())
+            if _base_type_name(getattr(c, "base_type", None) or c.mysql_type) in ("real", "float4")
+        }
+        params: dict[str, object] = {
+            name: repr(value) if column in reals and isinstance(value, float) else value
+            for name, column, value in zip(names, table.primary_key, last_key)  # type: ignore[attr-defined]
+        }
         if len(primary_key) == 1:
             return f"{primary_key[0]} > :{names[0]}", params
         bound = ", ".join(f":{name}" for name in names)
