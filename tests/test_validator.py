@@ -1184,14 +1184,16 @@ def test_page_checksum_empty_table_is_zero() -> None:
 
 
 def test_checksum_composite_pk_is_keyset_paged() -> None:
-    # G138: a composite PK is paged on the target too (the row-value cursor, last key as
-    # text), never one whole-table SUM; only a table with no primary key keeps that.
+    # G138: a composite PK is paged on the target too (one range per key prefix since G143,
+    # last key as text), never one whole-table SUM; only a table with no primary key keeps
+    # that.
     composite = _table("t", columns=("a", "b"), primary_key=("a", "b"))
     target = _FakeTargetConnection(counts={"t": 7}, checksums={"t": "42"})
     assert _target_checksum(target, composite, 3) == "42"
     pages = [s for s in target.executed if "ckpage" in s]
     assert len(pages) == 3 and all("LIMIT 3" in s for s in pages)
-    assert '("a", "b") > (%(last_0)s, %(last_1)s)' in pages[1]
+    assert 'WHERE "a" = %(last_0)s AND "b" > %(last_1)s' in pages[1]
+    assert 'WHERE "a" > %(last_0)s' in pages[1]
     keyless = _table("t", columns=("a", "b"), primary_key=())
     assert _target_checksum(target, keyless, 3) == "42"  # the one-statement fallback
     assert target.executed[-1] == build_pg_checksum_sql(keyless).as_string(None)

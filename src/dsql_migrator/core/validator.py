@@ -1106,11 +1106,13 @@ def _composite_pages_pg(
 ) -> _PagedTotals:
     """Page a PostgreSQL / Aurora DSQL table by the composite ``key`` and add the pages up.
 
-    One statement per page (:func:`build_pg_composite_page_sql`): the row-value cursor
-    ``(k0, ...) > (%(last_0)s, ...)``, which the primary key's index serves as a range, at
-    most ``page_size`` rows, the page's last key back as text and bound back untyped. Serves
-    the Aurora DSQL target and, through the shim (``FROM ONLY`` for an inheritance parent),
-    a PostgreSQL source. Stops on a short page; a full page whose last key equals its
+    One statement per page (:func:`build_pg_composite_page_sql`): at most ``page_size``
+    rows after the cursor, read by the primary key's index, the page's last key back as
+    text and bound back untyped. Serves the Aurora DSQL target -- one range per key prefix,
+    since Aurora DSQL reads a row value only as a filter over the key from its first row
+    (G143) -- and, through the shim (``FROM ONLY`` for an inheritance parent), a PostgreSQL
+    source: ``side="source"``, the row-value cursor ``(k0, ...) > (%(last_0)s, ...)``, one
+    range there. Stops on a short page; a full page whose last key equals its
     cursor raises :class:`PagedReadError` instead of reading it forever (``side`` names the
     side in its message), and so does a page that takes the rows read past
     ``expected_rows`` (the source's ``COUNT(*)`` in the same snapshot, when given -- G140),
@@ -1125,6 +1127,7 @@ def _composite_pages_pg(
     next_sql = build_pg_composite_page_sql(
         table, key, page_size, source_is_postgres,
         checksum=checksum, nonnull_columns=nonnull_columns, first=False,
+        row_value=side == "source",
     )
     totals = _PagedTotals(flags=[0] * len(nonnull_columns))
     last: Optional[tuple] = None
@@ -1264,10 +1267,10 @@ def _bounded_target_count(
     ``key`` is the key the side read enforces as unique -- for the Aurora DSQL target the
     live primary key Validation reads per table (G138); ``None`` pages by ``table``'s own
     primary key. A single column is paged ``pk > :last`` (:func:`_target_count_keyset`), a
-    composite key by the row-value cursor (:func:`_target_count_composite`). Only a table
-    with no primary key keeps the unbounded ``COUNT(*)``, which can still exceed Aurora
-    DSQL's 300 s limit on a very large table (then an error, never a match). ``proof``
-    rides on every branch.
+    composite key by one range of the key per key prefix (:func:`_target_count_composite`,
+    G143). Only a table with no primary key keeps the unbounded ``COUNT(*)``, which can
+    still exceed Aurora DSQL's 300 s limit on a very large table (then an error, never a
+    match). ``proof`` rides on every branch.
     """
     key = pk_paging_columns(table) if key is None else tuple(key)
     if len(key) == 1:

@@ -1055,14 +1055,16 @@ def build_pg_page_checksum_next_sql(
 # Bounded keyset pages over a COMPOSITE key (G138)
 # ---------------------------------------------------------------------------
 #
-# Each side reads its own rows in its own key order -- Aurora DSQL and a PostgreSQL source
-# by the row-value cursor ``(k0, k1, ...) > (:last_0, :last_1, ...)``, a MySQL source by
-# the Full Load reader's own cursor (``MySQLSourceDialect.keyset_after_sql``) -- and only
-# the two TOTALS are compared, exactly as for a single-column key. Pages never line up
-# across the engines (they sort text differently), and need not: the per-row token is the
-# one :func:`_mysql_row_token` / :func:`_pg_row_token` define and SUM is order-independent,
+# Each side reads its own rows in its own key order -- Aurora DSQL by one range of its
+# primary key per key prefix (:func:`_pg_keyset_window`, G143), a PostgreSQL source by the
+# row-value cursor ``(k0, k1, ...) > (:last_0, :last_1, ...)``, a MySQL source by the Full
+# Load reader's own cursor (``MySQLSourceDialect.keyset_after_sql``) -- and only the two
+# TOTALS are compared, exactly as for a single-column key. Pages never line up across the
+# engines (they sort text differently), and need not: the per-row token is the one
+# :func:`_mysql_row_token` / :func:`_pg_row_token` define and SUM is order-independent,
 # so the pages of one side add up to that side's whole-table checksum. Every statement
-# reads at most one page, so none reaches Aurora DSQL's 300 s transaction limit.
+# reads a bounded window wherever it starts, so none reaches Aurora DSQL's 300 s
+# transaction limit.
 
 
 def pk_paging_columns(table: TableDef) -> tuple[str, ...]:
@@ -1082,6 +1084,7 @@ def build_pg_composite_page_sql(
     checksum: bool,
     nonnull_columns: Sequence[str] = (),
     first: bool,
+    row_value: bool = False,
 ) -> sql.Composed:
     """One keyset page of a PostgreSQL / Aurora DSQL table over the composite ``key``.
 
@@ -1094,10 +1097,12 @@ def build_pg_composite_page_sql(
     value in ``nonnull_columns[j]`` (the NULL proof, TARGET ONLY).
 
     The window's columns are generated aliases (``ck_k{i}``, ``ck_tok``, ``ck_nn{j}``), so
-    no column of the table is shadowed, and its ORDER BY is qualified by the table so it
-    sorts the native columns, in their collations, as the cursor compares them. There is
-    exactly one ``FROM {table}``, which :func:`~dsql_migrator.core.validator._from_only`
-    rewrites for a PostgreSQL inheritance parent.
+    no column of the table is shadowed. A page after the cursor reads one range of the
+    primary key per key prefix on Aurora DSQL (:func:`_pg_keyset_window`, G143); with
+    ``row_value`` -- a PostgreSQL source -- it reads after the row-value cursor ``(k0, ...)
+    > (%(last_0)s, ...)``, one index range there, in exactly one ``FROM {table}``, which
+    :func:`~dsql_migrator.core.validator._from_only` rewrites for a PostgreSQL inheritance
+    parent. The first page is the same on both.
     """
     table_sql = _pg_table_identifier(table.name)
     aliases = [sql.Identifier(f"ck_k{i}") for i in range(len(key))]
@@ -1128,26 +1133,90 @@ def build_pg_composite_page_sql(
         sql.SQL("COUNT(*) FILTER (WHERE {})").format(sql.Identifier(f"ck_nn{j}"))
         for j in range(len(nonnull_columns))
     )
-    return sql.SQL(
-        "SELECT {totals} FROM (SELECT {window} FROM {table}{cursor} "
-        "ORDER BY {order} LIMIT {limit}) ckpage"
-    ).format(
+    return sql.SQL("SELECT {totals} FROM ({window}) ckpage").format(
         totals=sql.SQL(", ").join(totals),
-        window=sql.SQL(", ").join(window),
-        table=table_sql,
-        cursor=_pg_row_value_cursor(key, first),
-        order=_pg_qualified_order(table_sql, key),
-        limit=sql.Literal(page_size),
+        window=_pg_keyset_window(
+            sql.SQL(", ").join(window), table_sql, key, aliases, page_size,
+            None if first else _pg_last_key(key), row_value=row_value,
+        ),
     )
 
 
-def _pg_row_value_cursor(key: Sequence[str], first: bool) -> sql.Composable:
-    """`` WHERE ("k0", "k1") > (%(last_0)s, %(last_1)s)`` -- or nothing for the first page."""
-    if first:
-        return sql.SQL("")
-    return sql.SQL(" WHERE ({}) > ({})").format(
-        sql.SQL(", ").join(sql.Identifier(column) for column in key),
-        sql.SQL(", ").join(sql.Placeholder(f"last_{i}") for i in range(len(key))),
+def _pg_last_key(key: Sequence[str]) -> list[sql.Placeholder]:
+    """``%(last_0)s, %(last_1)s, ...``: the cursor, one placeholder per key column."""
+    return [sql.Placeholder(f"last_{i}") for i in range(len(key))]
+
+
+def _pg_keyset_window(
+    select: sql.Composable,
+    table_sql: sql.Composable,
+    key: Sequence[str],
+    names: Sequence[sql.Composable],
+    limit: int,
+    after: "Optional[Sequence[sql.Composable]]" = None,
+    *,
+    row_value: bool = False,
+) -> sql.Composed:
+    """The first ``limit`` rows of ``table_sql`` after the key ``after``, in key order, each
+    read as ``select`` -- from the first row when there is no ``after``.
+
+    ``after`` holds one composable per key column (placeholders, or literals for a query to
+    run) and ``names`` are the window's names for the key columns. Each read is ordered by
+    the key columns qualified by the table, so it sorts the native columns, in their
+    collations, as its bounds compare them.
+
+    After a composite cursor, Aurora DSQL reads one range of its primary key per key prefix,
+    deepest first, each cut at ``limit``, and keeps the first ``limit`` of their rows in key
+    order (G143). For ``(k0, k1)``::
+
+        (SELECT ... WHERE k0 = :0 AND k1 > :1 ORDER BY k0, k1 LIMIT n)
+        UNION ALL (SELECT ... WHERE k0 > :0 ORDER BY k0, k1 LIMIT n)
+        ORDER BY k0, k1 LIMIT n
+
+    A key is after the cursor exactly when it shares the cursor's first ``j`` values and is
+    greater in the next one, for one ``j``, so these are the rows the row value ``(k0, k1) >
+    (:0, :1)`` names, in the same order. Aurora DSQL serves an equality prefix with one
+    strict range as a start key on its primary key, but the row value only as a filter over
+    the whole key from its first row (measured live, in every binding): each page also read
+    every row before it, so the pages of a large table read O(rows²) rows and a late page
+    could run past the 300 s transaction age. Each range reads at most ``limit`` rows
+    wherever the page starts (one before the last is sorted again), so a page reads about
+    ``limit`` rows and never more than one page per key column. A bound appears in several
+    ranges and stays untyped, never cast to ``text``: an integer part then has no operator
+    (``bigint > text``) and a ``char(n)`` part no start key. ``row_value`` keeps the row
+    value, which PostgreSQL serves as one index range, for a PostgreSQL source; a one-column
+    key is one range either way.
+    """
+    order = _pg_qualified_order(table_sql, key)
+
+    def _read(where: sql.Composable) -> sql.Composed:
+        return sql.SQL("SELECT {} FROM {}{} ORDER BY {} LIMIT {}").format(
+            select, table_sql, where, order, sql.Literal(limit)
+        )
+
+    if not after:
+        return _read(sql.SQL(""))
+    if row_value or len(key) == 1:
+        return _read(
+            sql.SQL(" WHERE ({}) > ({})").format(
+                sql.SQL(", ").join(sql.Identifier(column) for column in key),
+                sql.SQL(", ").join(after),
+            )
+        )
+    ranges = []
+    for depth in reversed(range(len(key))):
+        bounds = [
+            sql.SQL("{} = {}").format(sql.Identifier(column), value)
+            for column, value in zip(key[:depth], after)
+        ]
+        bounds.append(sql.SQL("{} > {}").format(sql.Identifier(key[depth]), after[depth]))
+        ranges.append(
+            sql.SQL("({})").format(
+                _read(sql.SQL(" WHERE {}").format(sql.SQL(" AND ").join(bounds)))
+            )
+        )
+    return sql.SQL("{} ORDER BY {} LIMIT {}").format(
+        sql.SQL(" UNION ALL ").join(ranges), sql.SQL(", ").join(names), sql.Literal(limit)
     )
 
 
@@ -1323,7 +1392,8 @@ def build_orphan_listing_sql(
     its foreign-key columns only.
 
     With ``page_size`` and a primary key it reads ONE keyset window of the child, the way
-    the orphan count pages it: the ``page_size`` rows after ``after`` (the window's start,
+    the orphan count pages it (:func:`_pg_keyset_window`: one range per key prefix on a
+    composite key, G143): the ``page_size`` rows after ``after`` (the window's start,
     exclusive, one composable per key column -- placeholders, or literals for a query to
     run; ``None`` from the first row), pinned in a MATERIALIZED CTE before the anti-join.
     Given the window where the count found the first orphan, it reads that page only, so a
@@ -1337,25 +1407,16 @@ def build_orphan_listing_sql(
     ref = sql.Identifier(fk.referenced_columns[0])
     if page_size and pk_columns:
         not_null, join_predicate = _orphan_predicates(fk, "pg")
-        cursor = (
-            sql.SQL(" WHERE ({}) > ({})").format(
-                sql.SQL(", ").join(sql.Identifier(column) for column in pk_columns),
-                sql.SQL(", ").join(after),
-            )
-            if after
-            else sql.SQL("")
-        )
         return sql.SQL(
-            "WITH pg AS MATERIALIZED (SELECT {columns} FROM {child}{cursor} ORDER BY {order} "
-            "LIMIT {page_size}) SELECT {listed} FROM pg LEFT JOIN {parent} AS p ON "
-            "{join_predicate} WHERE {not_null} AND p.{ref} IS NULL ORDER BY {listed_order} "
-            "LIMIT {limit}"
+            "WITH pg AS MATERIALIZED ({window}) SELECT {listed} FROM pg LEFT JOIN {parent} "
+            "AS p ON {join_predicate} WHERE {not_null} AND p.{ref} IS NULL "
+            "ORDER BY {listed_order} LIMIT {limit}"
         ).format(
-            columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
-            child=child,
-            cursor=cursor,
-            order=_pg_qualified_order(child, pk_columns),
-            page_size=sql.Literal(int(page_size)),
+            window=_pg_keyset_window(
+                sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+                child, pk_columns, [sql.Identifier(column) for column in pk_columns],
+                int(page_size), after,
+            ),
             listed=sql.SQL(", ").join(
                 sql.SQL("pg.{}").format(sql.Identifier(column)) for column in columns
             ),
@@ -1498,11 +1559,12 @@ def build_pg_composite_orphan_page_sql(
 
     Returns ONE row: ``(orphan_sub_count, row_count, last_k0, ..., last_kN)``. The window
     is :func:`_build_pg_orphan_page_sql`'s MATERIALIZED CTE (the anti-join measured 27x
-    faster live than a FILTER over NOT EXISTS), filtered by the row-value cursor only, so
-    its boundary also moves past rows that are not orphans; each boundary column comes
-    back as text and is bound back as ``%(last_i)s``, as :func:`build_pg_composite_page_sql`
-    does. A foreign-key column that is also a key column is selected under its own name
-    too, for the anti-join.
+    faster live than a FILTER over NOT EXISTS) over the rows after the cursor only -- one
+    range of the primary key per key prefix (:func:`_pg_keyset_window`, G143) -- so its
+    boundary also moves past rows that are not orphans; each boundary column comes back as
+    text and is bound back as ``%(last_i)s``, as :func:`build_pg_composite_page_sql` does.
+    A foreign-key column that is also a key column is selected under its own name too, for
+    the anti-join.
     """
     child = _pg_table_identifier(child_table)
     parent = _pg_table_identifier(fk.referenced_table)
@@ -1521,17 +1583,15 @@ def build_pg_composite_orphan_page_sql(
         for alias in aliases
     )
     return sql.SQL(
-        "WITH pg AS MATERIALIZED ("
-        "SELECT {window} FROM {child}{cursor} ORDER BY {order} LIMIT {limit}) "
+        "WITH pg AS MATERIALIZED ({window}) "
         "SELECT (SELECT COUNT(*) FROM pg LEFT JOIN {parent} AS p ON {join_predicate} "
         "WHERE {not_null} AND {parent_null}), "
         "(SELECT COUNT(*) FROM pg), {boundaries}"
     ).format(
-        window=sql.SQL(", ").join(window),
-        child=child,
-        cursor=_pg_row_value_cursor(key, first),
-        order=_pg_qualified_order(child, key),
-        limit=sql.Literal(page_size),
+        window=_pg_keyset_window(
+            sql.SQL(", ").join(window), child, key, aliases, page_size,
+            None if first else _pg_last_key(key),
+        ),
         parent=parent,
         join_predicate=join_predicate,
         not_null=not_null,

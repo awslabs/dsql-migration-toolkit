@@ -8792,8 +8792,8 @@ def _count_orphans(
 
     The child is paged by the primary key the LIVE target enforces, read once first on
     the count's own connection (G138): a single column by bounded keyset pages, a
-    composite key by the row-value cursor
-    (:func:`~dsql_migrator.core.validator.target_orphan_count_composite`), so a very large
+    composite key by one range of the key per key prefix (G143,
+    :func:`~dsql_migrator.core.validator.target_orphan_count_composite`), so a very large
     child never runs the orphan scan in one transaction (a single ``COUNT(*) ... NOT
     EXISTS`` would exceed DSQL's ~300s transaction limit) -- exactly as the count/checksum
     keyset pagers do -- and never by a key the target does not hold unique (the source's,
@@ -8809,7 +8809,7 @@ def _count_orphans(
     server ends with 57P01 / 57P02 / 57P03, G141) is replaced
     and only the statement it cut off runs again, and an XX000 runs it again on the same
     connection. Each page is its own statement with its own cursor (``WHERE pk > :last``,
-    or the composite key's row value), so that replay re-reads one page. A 40001 (on
+    or the composite key's prefix ranges), so that replay re-reads one page. A 40001 (on
     Aurora DSQL even a read can raise OC001/40001 while the target is written
     concurrently), or an XX000 that outlasted the proxy's budget, replays the same
     statement -- the key read, one page or the single scan -- through

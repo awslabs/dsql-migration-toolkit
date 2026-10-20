@@ -46,9 +46,13 @@ count-matched tables are reported as "not deeply checked" (not as a false match)
 > composite key too.** Each side reads its own rows in its own primary-key order — a
 > MySQL source with the cursor the Full Load reader uses (`ENUM` / `SET` keys included,
 > and a `TIME` or `BIT` key part bound as the duration text and the integer MySQL
-> compares exactly, a one-column key too), a PostgreSQL source and Aurora DSQL with a
-> row-value cursor — at most 5,000 rows per statement on Aurora DSQL, and the two totals
-> are compared. On PostgreSQL and Aurora DSQL each page's last key comes back as text and
+> compares exactly, a one-column key too), a PostgreSQL source with a row-value cursor,
+> and Aurora DSQL with one range of its primary key per key prefix — at most 5,000 rows
+> per statement on Aurora DSQL, and the two totals are compared. Aurora DSQL reads a
+> row-value comparison such as `(k0, k1) > (…)` only as a filter, from the first row of
+> the key, so its pages are read as `k0 = … AND k1 > …` and then `k0 > …`: each page
+> reads only its own rows wherever it starts, a late page of a large table too.
+> On PostgreSQL and Aurora DSQL each page's last key comes back as text and
 > is read back in the column's own type, so a `real` key (a MySQL `FLOAT` on Aurora DSQL)
 > never reads a row at a page boundary twice. Pages are never compared with each other
 > (the engines sort text differently), so a mismatch is reported for the table as a

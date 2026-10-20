@@ -5,10 +5,11 @@
 side, so a large one no longer exceeds Aurora DSQL's 300 s transaction age.
 
 Each side reads its own rows in its own key order (MySQL with the Full Load reader's
-cursor, PostgreSQL / Aurora DSQL with a row-value cursor whose last key comes back as text)
-and only the per-side totals are compared. A side is paged only by a key it enforces as
-unique (Aurora DSQL by its LIVE primary key). The doubles below evaluate the SQL shapes the
-pagers emit over Python rows -- no database is reached.
+cursor, a PostgreSQL source with a row-value cursor and Aurora DSQL with one range per key
+prefix since G143, each last key coming back as text) and only the per-side totals are
+compared. A side is paged only by a key it enforces as unique (Aurora DSQL by its LIVE
+primary key). The doubles below evaluate the SQL shapes the pagers emit over Python rows --
+no database is reached.
 """
 
 from __future__ import annotations
@@ -254,10 +255,20 @@ class MySqlDouble:
         raise AssertionError(f"MySqlDouble: unexpected statement {sql[:120]}")
 
 
+# A composite window's SQL, as the doubles read it: the key order qualified by the table,
+# a PostgreSQL source's row-value cursor, and Aurora DSQL's ranges per key prefix (G143).
+_TABLE_ORDER = re.compile(r'ORDER BY ((?:(?:"[^"]+"\.)+"[^"]+"(?:, )?)+) LIMIT \d+')
+_ROW_VALUE = re.compile(r' WHERE \(((?:"[^"]+"(?:, )?)+)\) > \(((?:%\(\w+\)s(?:, )?)+)\)')
+_PREFIX_RANGE = re.compile(r' WHERE ((?:"[^"]+" [=>] %\(\w+\)s(?: AND )?)+) ORDER BY ')
+_BOUND = re.compile(r'"([^"]+)" ([=>]) %\((\w+)\)s')
+_UNION_TAIL = re.compile(r'LIMIT \d+\) ORDER BY ((?:"[^"]+"(?:, )?)+?)(?: LIMIT (\d+))?\)')
+
+
 class PgDouble:
     """A PostgreSQL / Aurora DSQL side: a psycopg-style connection whose pages honor the
-    row-value cursor, its text-bound last key and C order. ``primary_keys`` is what the
-    live catalog says (default: each table's own key; ``()`` for none)."""
+    cursor their SQL writes (a PostgreSQL source's row value, Aurora DSQL's ranges per key
+    prefix), its text-bound last key and C order. ``primary_keys`` is what the live catalog
+    says (default: each table's own key; ``()`` for none)."""
 
     def __init__(
         self,
@@ -296,13 +307,45 @@ class PgDouble:
 
     def _page(self, table: _Table, key: list[str], params: dict, limit: int) -> list[dict]:
         rows = sorted(table.rows, key=lambda r: tuple(r[c] for c in key))
-        if "last_0" in params:
-            cursor = tuple(self._parse(table, c, params[f"last_{i}"]) for i, c in enumerate(key))
-            rows = [r for r in rows if tuple(r[c] for c in key) > cursor]
-        elif "last" in params:  # a one-column key's last key, bound back as text (G141)
+        if "last" in params:  # a one-column key's last key, bound back as text (G141)
             last = self._parse(table, key[0], params["last"])
             rows = [r for r in rows if r[key[0]] > last]
         return rows[:limit]
+
+    def _window(self, table: _Table, key: list[str], sql: str, params: dict,
+                limit: int) -> list[dict]:
+        """A composite page's rows as its SQL reads them: the first page, a PostgreSQL
+        source's row-value cursor, or Aurora DSQL's ranges per key prefix (G143), each
+        range filtered by its own bounds, sorted and cut at ``limit`` before the union is."""
+
+        def in_order(rows: list[dict]) -> list[dict]:
+            return sorted(rows, key=lambda r: tuple(r[c] for c in key))
+
+        row_value = _ROW_VALUE.search(sql)
+        ranges = _PREFIX_RANGE.findall(sql)
+        if not row_value and not ranges:  # the first page
+            return in_order(table.rows)[:limit]
+        if row_value:
+            columns = re.findall(r'"([^"]+)"', row_value[1])
+            names = re.findall(r"%\((\w+)\)s", row_value[2])
+            cursor = tuple(self._parse(table, c, params[n]) for c, n in zip(columns, names))
+            return [r for r in in_order(table.rows)
+                    if tuple(r[c] for c in columns) > cursor][:limit]
+        assert " UNION ALL " in sql and len(ranges) == len(key), sql[:160]
+        picked: list[dict] = []
+        for where in ranges:
+            bounds = [(c, op, self._parse(table, c, params[n]))
+                      for c, op, n in _BOUND.findall(where)]
+            picked += in_order([
+                r for r in table.rows
+                if all(r[c] == val if op == "=" else r[c] > val for c, op, val in bounds)
+            ])[:limit]
+        # The union's own ORDER BY (the window's names for the key, in key order) and LIMIT.
+        union = _UNION_TAIL.search(sql[sql.rindex(" UNION ALL "):])
+        assert union, sql[-160:]
+        names = re.findall(r'"([^"]+)"', union[1])
+        assert names in ([f"ck_k{i}" for i in range(len(key))], key), names
+        return in_order(picked)[:int(union[2])] if union[2] else in_order(picked)
 
     def resolve(self, statement: Any, params: Optional[dict]) -> Any:
         sql = statement if isinstance(statement, str) else statement.as_string(None)
@@ -324,10 +367,10 @@ class PgDouble:
         limit_match = re.search(r"LIMIT (\d+)", sql)
         limit = int(limit_match[1]) if limit_match else 0
         if "ck_k0" in sql:
-            order = sql.rsplit(" LIMIT ", 1)[0].rsplit("ORDER BY ", 1)[1]  # the window's
+            order = _TABLE_ORDER.search(sql)[1]  # the window's (each range's) key order
             key = [re.findall(r'"([^"]+)"', part)[-1] for part in order.split(", ")]
-            page = self._page(table, key, params, limit)
-            last = [None if not page else str(page[-1][c]) for c in key]
+            page = self._window(table, key, sql, params, limit)
+            last = [None if not page else self._out(table, c, page[-1][c], True) for c in key]
             if "WITH pg AS MATERIALIZED" in sql:
                 parent = self.tables[self._name(sql, r"LEFT JOIN ")]
                 pairs = re.findall(r'p\."([^"]+)" = pg\."([^"]+)"', sql)
@@ -505,9 +548,16 @@ def test_pg_composite_page_sql_first_and_next() -> None:
                                         first=True).as_string(None)
     nxt = build_pg_composite_page_sql(table, ("order_id", "line_no"), 5000, checksum=True,
                                       first=False).as_string(None)
+    source = build_pg_composite_page_sql(table, ("order_id", "line_no"), 5000, checksum=True,
+                                         first=False, row_value=True).as_string(None)
     assert "WHERE" not in first
-    assert 'WHERE ("order_id", "line_no") > (%(last_0)s, %(last_1)s)' in nxt
-    for text in (first, nxt):
+    # G143: Aurora DSQL reads one range per key prefix; a PostgreSQL source the row value.
+    assert 'WHERE "order_id" = %(last_0)s AND "line_no" > %(last_1)s ORDER BY' in nxt
+    assert ') UNION ALL (SELECT "order_id" AS "ck_k0"' in nxt
+    assert 'WHERE "order_id" > %(last_0)s ORDER BY' in nxt
+    assert 'WHERE ("order_id", "line_no") > (%(last_0)s, %(last_1)s)' in source
+    assert "UNION" not in source and "UNION" not in first
+    for text in (first, nxt, source):
         assert 'ORDER BY "app"."order_items"."order_id", "app"."order_items"."line_no" LIMIT 5000' in text
         assert '(array_agg("ck_k0"::text ORDER BY "ck_k0", "ck_k1"))[COUNT(*)]' in text
         assert '(array_agg("ck_k1"::text ORDER BY "ck_k0", "ck_k1"))[COUNT(*)]' in text
@@ -527,8 +577,9 @@ def test_pg_composite_count_page_reads_key_columns_and_proof_flags_only() -> Non
 
 def test_from_only_rewrites_exactly_one_from_of_a_composite_page() -> None:
     table = _order_items().tabledef()
+    # A PostgreSQL source's page (the row-value cursor, G143): the one the shim reads.
     statement = build_pg_composite_page_sql(table, ("order_id", "line_no"), 9, checksum=True,
-                                            first=False)
+                                            first=False, row_value=True)
     text = _from_only(statement, _pg_table_identifier(table.name)).as_string(None)
     assert text.count('FROM ONLY "app"."order_items"') == 1
     assert 'ORDER BY "app"."order_items"."order_id"' in text  # the ORDER BY keeps its name
@@ -541,8 +592,12 @@ def test_composite_builders_quote_hostile_identifiers() -> None:
         primary_key=['k"1', "k`2"],
     )
     pg = build_pg_composite_page_sql(table, ('k"1', "k`2"), 3, checksum=False, first=False).as_string(None)
-    assert '("k""1", "k`2") > (%(last_0)s, %(last_1)s)' in pg
+    assert 'WHERE "k""1" = %(last_0)s AND "k`2" > %(last_1)s' in pg
+    assert 'WHERE "k""1" > %(last_0)s' in pg and 'ORDER BY "ck_k0", "ck_k1" LIMIT 3' in pg
     assert 'FROM "s""x"."t`y"' in pg
+    source = build_pg_composite_page_sql(table, ('k"1', "k`2"), 3, checksum=False, first=False,
+                                         row_value=True).as_string(None)
+    assert '("k""1", "k`2") > (%(last_0)s, %(last_1)s)' in source
     my = build_mysql_composite_page_sql(table, "")
     assert 'FROM `s"x`.`t``y`' in my and "`k\"1`" in my and "`k``2`" in my
     fk = ForeignKeyDef(name="f", columns=['k"1'], referenced_table='p"q.r', referenced_columns=["i d"])
@@ -571,7 +626,9 @@ def test_composite_orphan_page_filters_its_window_by_the_cursor_only() -> None:
     text = build_pg_composite_orphan_page_sql("app.order_items", fk, ("order_id", "line_no"),
                                               50, first=False).as_string(None)
     window = text.split(") SELECT ")[0]
-    assert 'WHERE ("order_id", "line_no") > (%(last_0)s, %(last_1)s)' in window
+    # The rows after the cursor, one range per key prefix on Aurora DSQL (G143).
+    assert 'WHERE "order_id" = %(last_0)s AND "line_no" > %(last_1)s ORDER BY' in window
+    assert 'WHERE "order_id" > %(last_0)s ORDER BY' in window
     assert "IS NULL" not in window and "IS NOT NULL" not in window  # no orphan predicate
     # The FK column that is also a key column is selected under its own name too.
     assert '"order_id" AS "ck_k0", "line_no" AS "ck_k1", "order_id" FROM' in window
@@ -1012,7 +1069,7 @@ def test_a_rekeyed_target_is_paged_by_its_live_key(page) -> None:
     item = report.items[0]
     assert (item.source_row_count, item.target_row_count) == (9, 10)
     assert item.matched is False
-    assert any('("lead", "id") > (%(last_0)s, %(last_1)s)' in sql
+    assert any('"lead" = %(last_0)s AND "id" > %(last_1)s' in sql
                for sql in _target_statements(target))
 
 
