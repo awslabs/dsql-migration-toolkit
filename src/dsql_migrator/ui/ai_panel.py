@@ -286,8 +286,12 @@ def build_ai_panel(
 
     ui.on("ai_dba_drawer_width", _on_viewport, throttle=0.2)  # type: ignore[attr-defined]
     ui.on("ai_dba_drawer_resize", _on_drag_resize, throttle=0.05)  # type: ignore[attr-defined]
-    ui.add_body_html(  # type: ignore[attr-defined]
-        "<script>(function(){"
+    # Run, not injected as a <script> element: the page is built once the browser is
+    # connected (G145), when add_body_html inserts the element with insertAdjacentHTML,
+    # which a browser never executes -- the drawer kept its build-time width and the drag
+    # strip did nothing. ('load' has fired by then; the setTimeout sends the first width.)
+    ui.run_javascript(  # type: ignore[attr-defined]
+        "(function(){"
         # Report the viewport width (drives the AUTO drawer width) on load + resize.
         "var vp=function(){if(window.emitEvent){"
         "emitEvent('ai_dba_drawer_width', window.innerWidth);}};"
@@ -309,7 +313,7 @@ def build_ai_panel(
         "document.addEventListener('mouseup', function(e){"
         "if(!dragging)return;dragging=false;send(window.innerWidth-e.clientX);"
         "document.body.style.userSelect='';document.body.style.cursor='';});"
-        "})();</script>"
+        "})();"
     )
 
     with drawer:  # type: ignore[attr-defined]

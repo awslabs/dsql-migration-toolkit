@@ -147,8 +147,11 @@ class _Ui:
     def add_css(self, *_a, **_k) -> None:
         pass
 
-    def add_body_html(self, *_a, **_k) -> None:
-        pass
+    def add_body_html(self, code="", *_a, **_k) -> None:  # noqa: ANN001
+        self.body_html = [*getattr(self, "body_html", []), code]
+
+    def run_javascript(self, code, *_a, **_k) -> None:  # noqa: ANN001
+        self.scripts = [*getattr(self, "scripts", []), code]
 
     def on(self, name=None, handler=None, *_a, **_k) -> None:  # noqa: ANN001
         # ui.on(event_name, handler, *, throttle=...) -- record so tests can invoke
@@ -283,6 +286,18 @@ def test_visibility_persists_to_session() -> None:
     assert state.ai_conversation.visible is True and ui.drawer_visible is True
     panel.toggle()
     assert state.ai_conversation.visible is False and ui.drawer_visible is False
+
+
+def test_the_drawer_script_is_run_not_injected_as_an_element() -> None:
+    # G145: the page is built once the browser is connected, when a <script> added with
+    # add_body_html is inserted by insertAdjacentHTML and never executed (the drawer kept
+    # its build-time width and could not be dragged). The code is run instead.
+    ui = _Ui()
+    build_ai_panel(ui, state=_enabled_state())
+    scripts = getattr(ui, "scripts", [])
+    assert any("ai_dba_drawer_width" in code and "ai_dba_drawer_resize" in code for code in scripts)
+    assert not any("<script" in code for code in scripts)
+    assert not any("<script" in code for code in getattr(ui, "body_html", []))
 
 
 class _Evt:

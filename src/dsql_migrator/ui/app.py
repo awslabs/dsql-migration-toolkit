@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from dsql_migrator import __version__
@@ -188,6 +189,56 @@ OVERLAY_LEDGER: object | None = None
 # never pruned. Pruning runs once at startup.
 _KEEP_DONE_JOBS = 100
 _KEEP_SESSIONS = 200
+
+
+async def build_when_connected(client: object, build: Callable[[], None]) -> bool:
+    """Run ``build`` once ``client``'s websocket is connected; ``False`` if it never was.
+
+    A request that never opens the websocket -- the load balancer's health check, a GET
+    of ``/`` every 15 s from each node, with no cookie -- came with a new browser id each
+    time, so building the page made a new session: its state in every per-session store,
+    kept there for resume. The task grew ~225 MB a day with no user (300 checks: 300 of
+    every state object), and a 1 GiB task was OOM-killed every few days. NiceGUI sends
+    the page shell while this waits, so the check still gets its 200; a client NiceGUI
+    prunes without a connection ends the wait deleted, and nothing is built for it.
+
+    A build that raises is logged and shown in the page (``False``): it runs after the
+    response, where NiceGUI's 500 page can no longer be sent, so it was a blank page.
+    """
+    await client.connected()  # type: ignore[attr-defined]
+    if client.is_deleted:  # type: ignore[attr-defined]
+        return False
+    try:
+        build()
+    except Exception:  # noqa: BLE001 - a blank page says nothing; show what happened
+        logging.getLogger(__name__).exception("The page could not be built")
+        _show_build_failure(client)
+        return False
+    return True
+
+
+def _show_build_failure(client: object) -> None:
+    """Replace a page that failed to build with an error notice (see build_when_connected)."""
+    from nicegui import ui
+
+    from dsql_migrator.ui.design import render_notice
+
+    # What the build drew before it raised: the header and drawers sit beside the page
+    # container in the layout, the screens inside its content.
+    for child in list(client.layout):  # type: ignore[attr-defined]
+        if child is not client.page_container:  # type: ignore[attr-defined]
+            child.delete()
+    client.content.clear()  # type: ignore[attr-defined]
+    with client.content:  # type: ignore[attr-defined]
+        render_notice(
+            ui,
+            tone="error",
+            header="The page could not be built",
+            body=(
+                "Reload the page. If it fails again, the app's log has the error "
+                "(search for 'The page could not be built')."
+            ),
+        )
 
 
 def build_page(
@@ -1845,7 +1896,7 @@ def main() -> None:
     """Configure and launch the NiceGUI application."""
     import secrets as _secrets
 
-    from nicegui import app, ui
+    from nicegui import Client, app, ui
 
     # AWS Console / Cloudscape uses sentence-case button labels, but Quasar (the
     # NiceGUI button backend) defaults to ALL-CAPS. Set the default once here so
@@ -2008,13 +2059,15 @@ def main() -> None:
     )
 
     @ui.page("/")
-    def _index() -> None:
+    async def _index(client: Client) -> None:
         # Identify the session by the stable, cookie-backed browser id rather
         # than the per-connection client id, so reloading the page continues the
         # same session (workflow progress, verified connections, results) instead
         # of starting over.
         session_id = app.storage.browser["id"]
-        build_page(config, session_id, connect_defaults)
+        await build_when_connected(
+            client, lambda: build_page(config, session_id, connect_defaults)
+        )
 
     ui.run(
         host=config.app_host,

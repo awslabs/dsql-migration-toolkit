@@ -1689,6 +1689,9 @@ Resources:
         Ref: AppPort
       Protocol: HTTP
       TargetType: ip
+      # The check gets only the page shell: the page is built once a browser's websocket
+      # connects, so a check creates no session (G145) -- and a healthy target does not
+      # show that the page builds; open the app in a browser after an update.
       HealthCheckPath: /
       HealthCheckProtocol: HTTP
       # Reach first-healthy quickly and well inside HealthCheckGracePeriodSeconds

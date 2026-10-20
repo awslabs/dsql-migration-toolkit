@@ -1,5 +1,6 @@
 # Keep the build context small and reproducible.
 .venv/
+**/.DS_Store
 **/__pycache__/
 **/*.pyc
 .pytest_cache/
