@@ -5,6 +5,20 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.573
+
+### Fixed
+
+- **The deployed app no longer grows by about 225 MB a day, and a 1 GiB task no longer runs out of memory every few days.** The app stack's load balancer checks `/` every 15 seconds from each of its nodes, with no cookie, so each check arrived as a new browser and the app built a whole session for it, kept in memory for resume and never released. With nobody using it, a deployment grew by about 225 MB a day: a task with the default 1 GiB (`ContainerMemory=1024`) ran out of memory and ECS replaced it every few days, with nothing in the app's log (about six minutes unreachable each time, and a Full Load running then was interrupted); at 8 GiB it took about a month. The log also showed a `The parent slot of the element has been deleted` traceback several times a minute. The page is now built only when a browser's websocket connects: the health check still gets its `200` and leaves nothing behind, and a browser gets the same page as before. A page that fails to build now shows an error notice instead of a blank page.
+- **Connect: the Port follows the source engine you picked.** After choosing PostgreSQL and reloading the page (or opening a second tab), the PostgreSQL tile stayed selected but Port went back to MySQL's 3306.
+- **The image no longer includes macOS folder metadata:** the 0.1.572 images carried three `.DS_Store` files.
+
+### Upgrade notes
+
+- **App stack: an image-only update is enough.** Since 0.1.572 the template changed only a comment (and its default image); there is no IAM change, and the sink plugin is unchanged (v54), so no CDC infrastructure redeploy is needed. Finish or stop running jobs first: the task replacement ends them.
+- **An app on 0.1.572 or earlier keeps growing until it is updated.** The growth is process memory only and none of it is saved, so any restart or task replacement clears it; until you can update, restarting the task at a quiet moment keeps a 1 GiB task away from its limit.
+- **A healthy target now shows only that the app answers.** The health check no longer builds the page, so a page that fails to build no longer fails it: after an update, open the app in a browser to confirm it loads.
+
 ## v0.1.572
 
 ### Security
