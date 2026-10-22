@@ -254,21 +254,22 @@ _CONDITION = {
             "the refused point is that watermark (Automatic), the refusal adds that route's "
             "condition: if that Full Load appended to rows already on the target, run it again "
             "choosing **Drop & reload** before that Start — CDC only has no Full Load step, so "
-            "switch the migration type to Full load only for that run, then back to CDC only (an "
-            "append keeps those rows as they were, and CDC from a watermark carries only the "
-            "changes after it).",
+            "switch the migration type to Full load + CDC for that run, whose Full Load makes the "
+            "CDC start point exact (an append keeps those rows as they were, and CDC from a "
+            "watermark carries only the changes after it).",
             "ko": "CDC only 경로는 새 스택을 Full Load의 워터마크에서 시작하므로, 거부된 지점이 그 "
             "워터마크(Automatic)이면 거부가 그 경로의 조건을 덧붙입니다: 그 Full Load가 타깃에 이미 있던 "
             "행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요. CDC only에는 Full Load "
-            "단계가 없으므로 그 실행 동안 마이그레이션 유형을 Full load only로 바꾼 뒤 다시 CDC only로 "
-            "돌아옵니다(append는 그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 변경만 "
-            "가져옵니다).",
+            "단계가 없으므로 그 실행 동안 마이그레이션 유형을 Full load + CDC로 바꿉니다. 그 실행의 "
+            "Full Load가 CDC 시작 지점을 정확하게 맞춥니다(append는 그 행을 그대로 두고, 워터마크에서 "
+            "시작한 CDC는 그 뒤의 변경만 가져옵니다).",
             "ja": "CDC only の方法は新しいスタックを Full Load のウォーターマークから開始するため、拒否された"
             "位置がそのウォーターマーク (Automatic) の場合は、拒否がその方法の条件を付け加えます: その "
             "Full Load がターゲットに既にあった行に append した場合は、その Start の前に **Drop & reload** "
             "でもう一度実行してください。CDC only には Full Load ステップがないため、その実行の間は"
-            "マイグレーションの種類を Full load only に切り替え、その後 CDC only に戻します (append は"
-            "それらの行をそのまま残し、ウォーターマークからの CDC はその後の変更しか運びません)。",
+            "マイグレーションの種類を Full load + CDC に切り替えます。その実行の Full Load が CDC の"
+            "開始位置を正確にします (append はそれらの行をそのまま残し、ウォーターマークからの CDC は"
+            "その後の変更しか運びません)。",
         },
         "line": {
             "en": "In the disabled Start's tooltip and the job's error, the route reads",
@@ -308,7 +309,8 @@ def test_the_cdc_only_refusal_names_its_routes_drop_and_reload_condition(lang: s
     assert not gate.reloads_first(flc, "full_load")
     assert (
         "run it again choosing 'Drop & reload' before that Start (CDC only has no Full Load step: "
-        "switch the migration type to Full load only for that run, then back to CDC only)"
+        "switch the migration type to Full load + CDC for that run, whose Full Load makes the CDC "
+        "start point exact)"
         in gate.RELOAD_FIRST
     )
     # Both refusals: the newer start point (on a stopped stack or a rolled-back Start) and the

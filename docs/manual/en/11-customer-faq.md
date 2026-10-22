@@ -32,7 +32,10 @@ dropping) a logical replication slot and a publication scoped to exactly the mig
 tables, setting `REPLICA IDENTITY FULL` on a re-keyed table, and adding a table
 selected after the Full Load to that publication (Full load + CDC, before CDC
 starts) — each an autocommit, allowlisted, audited operation. A MySQL source (and a
-PostgreSQL Full-Load-only migration) is never written.
+PostgreSQL Full-Load-only migration) is never written; a MySQL Full load + CDC run on a
+source not running `gtid_mode=ON` issues one `FLUSH BINARY LOGS` right after recording
+CDC's start point (it needs `RELOAD`, writes no data, locks no table, and moves the binlog
+to a new file).
 
 
 **Q2. Is Aurora DSQL a drop-in replacement for my source engine (Aurora MySQL / PostgreSQL)?**
@@ -504,7 +507,9 @@ so rolling back then means reconciling them yourself. Decide your rollback rule
 
 The source uses an ordinary read-only connection to **MySQL or PostgreSQL** (a
 password, or an AWS Secrets Manager username/password — **never IAM**; IAM-token auth
-is target-DSQL only); the target uses DSQL's **IAM-token auth (no DB password)**. All
+is target-DSQL only); CDC adds replication privileges, and a MySQL Full load + CDC run
+`RELOAD` unless the source runs `gtid_mode=ON` ([§1.1](01-setup.md#11-prerequisites)).
+The target uses DSQL's **IAM-token auth (no DB password)**. All
 connections use **TLS**. Credentials live
 in **per-session memory only** — never written to disk, logs, reports, or job state.
 Logs and reports record primary keys and counts, **never row values**. Optional
@@ -538,7 +543,7 @@ identity must hold them**):
 | For | IAM actions (minimum) |
 |---|---|
 | **Target DSQL (always)** | `dsql:DbConnect`, `dsql:DbConnectAdmin` (mint the IAM token), `dsql:GetCluster` |
-| **Source (always)** | none in IAM — an ordinary read-only MySQL or PostgreSQL user/password (or the Secrets Manager secret below) |
+| **Source (always)** | none in IAM — an ordinary read-only MySQL or PostgreSQL user/password (or the Secrets Manager secret below); CDC adds replication privileges, and a MySQL Full load + CDC run `RELOAD` unless the source runs `gtid_mode=ON` |
 | **Source secret (optional)** | `secretsmanager:GetSecretValue` — only if the source credentials come from a Secrets Manager secret |
 | **AI assist (optional)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — on the Fargate stack any Anthropic model unless `BedrockModelArns` narrows it (the EC2 stack scopes it to the chosen model); only when AI is enabled |
 | **CDC — deploy/tear down the pipeline** | the broad infra-creation set the cdc-stack needs: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; a wide `ec2:*` set (VPC subnets, NAT, EIP, route tables, security groups, VPC endpoints, network interfaces); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/… (the connector roles); `kafka:*` / `kafkaconnect:*` (MSK Serverless + MSK Connect); `logs:*`; `s3:*` on the plugin bucket. Full-Load-only migrations need **none** of this. |

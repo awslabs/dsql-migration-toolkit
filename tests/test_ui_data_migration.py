@@ -17273,6 +17273,7 @@ def test_start_cdc_shows_the_table_set_plainly_with_the_why_on_hover() -> None:
             binlog_position=120,
             snapshot_timestamp=datetime(2026, 8, 1, tzinfo=timezone.utc),
             table_row_counts={f"ecommerce.t{i}": 100 for i in range(8)},
+            start_point_fence="flush",  # a Full load + CDC run's (G147)
         )
 
     # --- Full Load + CDC, load finished, CDC started before -> Start over is the only
@@ -24788,6 +24789,7 @@ def test_start_cdc_logs_the_resume_point_through_the_real_ui_path(monkeypatch) -
                     binlog_position=76653880,
                     gtid_executed=None,
                     snapshot_timestamp=datetime(2026, 9, 21, 7, 34, tzinfo=timezone.utc),
+                    start_point_fence="flush",  # a Full load + CDC run's (G147)
                 ),
                 chunks=[],
             )
@@ -30638,7 +30640,8 @@ def test_a_not_checked_group_does_not_read_not_applicable() -> None:
     report = _unreachable_source_report(MigrationMode.CDC, SourceType.MYSQL)
     groups = {g.category: g for g in group_prereq_results(report.results)}
     source_config = groups[PrereqCategory.SOURCE_CONFIG]
-    assert source_config.summary == "4 not checked"
+    # G147 added START_POINT_FENCE to the group: five rows, none of them read.
+    assert source_config.summary == "5 not checked"
     assert groups[PrereqCategory.CONNECTIVITY].status is PrerequisiteStatus.FAIL
 
 
@@ -35128,10 +35131,20 @@ def test_the_confirm_summary_names_the_pg_cdc_source_writes() -> None:
     assert "read only" not in pg
     for engine, mtype in (
         (SourceType.POSTGRES, MigrationType.FULL_LOAD_ONLY),
-        (SourceType.MYSQL, MigrationType.FULL_LOAD_AND_CDC),
+        (SourceType.MYSQL, MigrationType.FULL_LOAD_ONLY),
     ):
         assert full_load_confirm_summary(
             ["t"], engine, mtype, keeps_watermark=False
+        ).endswith("the source is accessed read only.")
+    # G147: a MySQL Full load + CDC run that records a start point names its FLUSH BINARY
+    # LOGS; a Retry / Reload (the original start point) and a run while CDC streams do not.
+    mysql = full_load_confirm_summary(
+        ["t"], SourceType.MYSQL, MigrationType.FULL_LOAD_AND_CDC, keeps_watermark=False
+    )
+    assert "FLUSH BINARY LOGS" in mysql and "RELOAD" in mysql
+    for kw in ({"keeps_watermark": True}, {"keeps_watermark": False, "cdc_live": True}):
+        assert full_load_confirm_summary(
+            ["t"], SourceType.MYSQL, MigrationType.FULL_LOAD_AND_CDC, **kw
         ).endswith("the source is accessed read only.")
     assert with_data_choice_text(1, ticked_scope=True).startswith("1 ticked table already contains")
     assert with_data_choice_text(4, ticked_scope=False).startswith("4 selected table(s)")

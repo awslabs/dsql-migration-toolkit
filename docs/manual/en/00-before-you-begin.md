@@ -29,7 +29,11 @@ plus a pointer to the chapter that covers it in depth.
 
 - [ ] **Your source is read-only in almost every path.** For MySQL, and for a
       PostgreSQL Full-Load-only migration, the tool never writes to the source and
-      a read-capable user is enough. The single exception is **PostgreSQL CDC**: at
+      a read-capable user is enough — except that a MySQL **Full load + CDC** run on a
+      source not running `gtid_mode=ON` issues one `FLUSH BINARY LOGS` right after
+      recording CDC's start point, so its user needs `RELOAD` (no data is written and
+      no table locked; the binlog moves to a new file; audited). The single exception
+      that writes is **PostgreSQL CDC**: at
       the Full Load consistency point the tool creates — and at teardown drops — a
       logical replication slot and a publication scoped to exactly the migrated
       tables. It also sets `REPLICA IDENTITY FULL` on a re-keyed table and, in Full

@@ -348,6 +348,13 @@ _WRITE_OR_DDL_KEYWORDS = frozenset(
         "DO",
         "LOCK",
         "UNLOCK",
+        # Server administration the tool never runs on a source. The one exception,
+        # FLUSH BINARY LOGS for the CDC start-point fence (G147), goes through
+        # core/mysql_start_point_fence.py's own engine, never through a guarded one.
+        "FLUSH",
+        "PURGE",
+        "RESET",
+        "KILL",
     }
 )
 

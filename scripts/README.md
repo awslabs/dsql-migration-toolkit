@@ -4,7 +4,9 @@ _Language: **English** | [한국어](README.ko.md)_
 
 These helper scripts let you drive a **Full Load** and independently **verify**
 the result from the command line — using the tool's own engine, without opening
-the web UI. The source MySQL is always accessed **read-only**.
+the web UI. The source MySQL is accessed **read-only** — except that `run_full_load.py
+--watermark-out` runs a Full load + CDC one, which issues `FLUSH BINARY LOGS` right after the
+watermark unless the source runs `gtid_mode=ON` (see below).
 
 | Script | What it does | Writes to DSQL? |
 |---|---|---|
@@ -35,7 +37,7 @@ otherwise) — so you can gate a shell script on them.
 
   | Variable | For | Notes |
   |---|---|---|
-  | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | source **MySQL** | read-only connection |
+  | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | source **MySQL** | read-only connection (plus `RELOAD` for `--watermark-out` unless the source runs `gtid_mode=ON`) |
   | `TARGET_ENDPOINT` | target **Aurora DSQL** | e.g. `your-cluster-id.dsql.<region>.on.aws` |
   | `TARGET_REGION` | DSQL | optional — auto-derived from the endpoint |
   | `TARGET_DATABASE`, `TARGET_USERNAME` | DSQL | default `postgres` / `admin` |
@@ -79,7 +81,13 @@ Loads your source tables into Aurora DSQL using the tool's own bulk loader.
   loading (DSQL has no TRUNCATE). **⚠️ DESTRUCTIVE** — discards existing target
   data for those tables; use for a fresh load.
 - `--watermark-out <file>`: save the captured binlog/GTID watermark, so CDC can
-  later start gaplessly from exactly that point.
+  later start gaplessly from exactly that point. This makes the run a **Full load + CDC**
+  one: unless the source runs `gtid_mode=ON` it issues `FLUSH BINARY LOGS` right after
+  recording the watermark (needs `RELOAD`; the binlog moves to a new file), so the
+  position covers no transaction still committing; it stops before reading any table on
+  Aurora MySQL with enhanced binlog without `gtid_mode=ON`, or while an XA transaction
+  stays prepared; and a large table may be read by several reader shards, which only
+  CDC's replay from the watermark makes consistent (manual §3.5).
 
 Memory stays bounded to one page per table regardless of table size (keyset
 streaming), so it is safe for very large tables. Exit `0` when every

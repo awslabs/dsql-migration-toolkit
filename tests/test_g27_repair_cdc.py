@@ -90,9 +90,9 @@ _FOUND_FL_CDC = (
 _FOUND_CDC_ONLY = (
     "This Full Load found rows already on the target. Start CDC begins at its watermark, so if the "
     "Full Load appended to them, run it again choosing 'Drop & reload' before Start CDC (CDC only "
-    "has no Full Load step: switch the migration type to Full load only for that run, then back to "
-    "CDC only). An append keeps those rows as they were, and CDC from a watermark carries only the "
-    "changes after it."
+    "has no Full Load step: switch the migration type to Full load + CDC for that run, whose Full "
+    "Load makes the CDC start point exact). An append keeps those rows as they were, and CDC from "
+    "a watermark carries only the changes after it."
 )
 _FOUND_PG_CDC_ONLY = (
     "This Full Load found rows already on the target. Start CDC begins at its watermark, so if the "
@@ -610,8 +610,8 @@ def test_the_gtid_only_notice_names_drop_and_reload(monkeypatch) -> None:
     # CDC only has no Full Load step.
     assert (
         "re-run the Full Load choosing 'Drop & reload' for a gapless handoff (CDC only has no Full "
-        "Load step: switch the migration type to Full load only for that run, then back to CDC "
-        "only), or enter a binlog position manually"
+        "Load step: switch the migration type to Full load + CDC for that run, whose Full Load "
+        "makes the CDC start point exact), or enter a binlog position manually"
     ) in _gtid_only_notice(_mysql_never_started(CDC_ONLY))
     # After a Start CloudFormation rolled back: new CDC topics first, then the same re-run.
     assert (
@@ -721,9 +721,13 @@ def test_the_narrowing_tooltip_tail_follows_the_condition() -> None:
     from dsql_migrator.ui.data_migration import _cdc_ui
 
     src = " ".join(inspect.getsource(_cdc_ui._render_cdc_start_button).split())
+    # G147: nor from a binlog position no commit fence made exact (``_gapless``).
     assert (
-        "START_TOOLTIP_NARROWING_TAIL if not _resnapshots and not "
-        "drop_reload_condition_due(migration_state, job) else "
+        "_gapless = not drop_reload_condition_due(migration_state, job) and not ( "
+        "start_point_unfenced(_cdc_watermark(job, migration_state)) )"
+    ) in src
+    assert (
+        "START_TOOLTIP_NARROWING_TAIL if not _resnapshots and _gapless else "
         "START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT"
     ) in src
     assert "gapless" in _cdc_ui.START_TOOLTIP_NARROWING_TAIL

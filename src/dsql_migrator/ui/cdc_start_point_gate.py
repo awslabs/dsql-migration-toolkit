@@ -188,13 +188,15 @@ def new_topics_route(migration_type: object) -> str:
 # can still match). The job record keeps no load mode: only the run's activity line names it, and
 # a chunk's rows "already there" also count a source-drop re-read's or a Retry's own rows. So the
 # route states the condition (rule E). RELOAD_FIRST follows its "then Start CDC on the new
-# stack."; _RELOAD_FIRST_ROUTE is the one-line form of the route.
+# stack."; _RELOAD_FIRST_ROUTE is the one-line form of the route. G147: the re-run goes through
+# Full load + CDC, whose Full Load makes the start point exact (a Full load only run's binlog
+# position can cover a transaction still committing, mysql_start_point_fence).
 RELOAD_FIRST = (
     "That Start begins at the Full Load's watermark, so if that Full Load appended to rows already "
     "on the target, run it again choosing 'Drop & reload' before that Start (CDC only has no Full "
-    "Load step: switch the migration type to Full load only for that run, then back to CDC only). "
-    "An append keeps those rows as they were, and CDC from a watermark carries only the changes "
-    "after it."
+    "Load step: switch the migration type to Full load + CDC for that run, whose Full Load makes "
+    "the CDC start point exact). An append keeps those rows as they were, and CDC from a "
+    "watermark carries only the changes after it."
 )
 _RELOAD_FIRST_ROUTE = (
     "Delete CDC infrastructure and deploy it again, then Start CDC (if the Full Load appended to "
@@ -239,29 +241,23 @@ def drop_and_reload_rerun(
 ) -> "tuple[str, str]":
     """``(rerun, note)``: the re-run that takes a NEW copy of the Full Load, which names 'Drop &
     reload' (rule E), and what CDC only needs for it -- said after the clause ``rerun`` leads
-    (empty otherwise). With CDC only the re-run needs a type switch: to Full load only on MySQL
-    (as in :data:`RELOAD_FIRST`), to Full load + CDC on PostgreSQL (``postgres``), whose Full
-    Load there creates the replication slot again -- and to Full load + CDC on MySQL too while
-    a table the Full Load read in parts waits for CDC's replay (``split``, G137: Full load only
-    refuses the switch then). Pure."""
+    (empty otherwise). With CDC only the re-run needs a type switch to Full load + CDC: on
+    PostgreSQL (``postgres``) its Full Load creates the replication slot again; on MySQL it makes
+    the CDC start point exact (G147; as in :data:`RELOAD_FIRST`) -- a Full load only run records
+    a binlog position no commit fence made exact, and refuses the switch anyway while a table the
+    Full Load read in parts waits for CDC's replay (``split``, G137), so ``split`` no longer
+    changes MySQL's route. Pure."""
     if _cdc_only(migration_type) and postgres:
         return (
             "switch the migration type to Full load + CDC and Re-run Full Load there choosing "
             "'Drop & reload'",
             " (it creates the slot again at its own snapshot point)",
         )
-    if _cdc_only(migration_type) and split:
-        return (
-            "run it again choosing 'Drop & reload'",
-            " (CDC only has no Full Load step: switch the migration type to Full load + CDC for "
-            "that run; Full load only is refused while a table the Full Load read in parts "
-            "waits for CDC's replay)",
-        )
     if _cdc_only(migration_type):
         return (
             "run it again choosing 'Drop & reload'",
-            " (CDC only has no Full Load step: switch the migration type to Full load only for "
-            "that run, then back to CDC only)",
+            " (CDC only has no Full Load step: switch the migration type to Full load + CDC for "
+            "that run, whose Full Load makes the CDC start point exact)",
         )
     return "Re-run Full Load on the Full Load step choosing 'Drop & reload'", ""
 

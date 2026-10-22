@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from dsql_migrator.core.catalog_postgres import RowSecurityFacts
     from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
+from dsql_migrator.core.cdc_coords import gtid_mode_is_on
 from dsql_migrator.core.models import (
     ConnectionResult,
     MigrationMode,
@@ -862,8 +863,10 @@ def check_gtid_mode(variables: dict[str, str]) -> PrerequisiteResult:
     watermark, or Fetch current position for a Manual point) and resumes after the set it
     last committed, which also survives a failover to a replica whose binary log files
     differ. With any other mode (``OFF`` / ``OFF_PERMISSIVE`` / ``ON_PERMISSIVE``) it
-    starts from the binlog ``file:position`` of its start point, so the gapless Full Load
-    -> CDC handoff works there too. The mode must stay as it was from the start point to
+    starts from the binlog ``file:position`` of its start point, which the Full Load makes
+    exact with FLUSH BINARY LOGS (G147, :func:`check_start_point_fence`: RELOAD, and not on
+    Aurora enhanced binlog), so the gapless Full Load -> CDC handoff works there too. The
+    mode must stay as it was from the start point to
     cut over: Start CDC refuses a start point recorded while ``gtid_mode`` was not ON once
     the source is ON. GTID's absence is therefore reported as ``INFO`` (an optional
     recommendation, ``required=False``) -- NOT a ``WARN`` (which implies something is
@@ -889,8 +892,133 @@ def check_gtid_mode(variables: dict[str, str]) -> PrerequisiteResult:
             "which also survives a failover to a replica whose binary log files differ. If "
             "you change gtid_mode, do it before the Full Load (or Fetch current position) "
             "and keep it until cut over: Start CDC refuses a start point recorded while "
-            "gtid_mode was not ON once the source is ON."
+            "gtid_mode was not ON once the source is ON. Without it, a Full load + CDC run "
+            "needs what 'CDC start point can be made exact' checks."
         ),
+    )
+
+
+def _holds_global(grants: list[str], privilege: str) -> bool:
+    """True when ``privilege`` (or ALL) is granted on ``*.*`` in the visible grants."""
+    for line in grants:
+        parsed = _parse_privilege_grant(line)
+        if parsed is None:
+            continue
+        privs_upper, scope = parsed
+        if scope != "*.*":
+            continue
+        if privilege in privs_upper or "ALL PRIVILEGES" in privs_upper or privs_upper.strip() == "ALL":
+            return True
+    return False
+
+
+def check_start_point_fence(
+    variables: dict[str, str], grants: list[str], *, records_start_point: bool = True
+) -> PrerequisiteResult:
+    """Can the CDC start point be made exact before the Full Load reads? (MySQL CDC, G147)
+
+    A Full load + CDC run's Full Load records CDC's start point before any table is read,
+    and CDC replays from it. A ``gtid_mode=ON`` start point is exact by itself: the GTID
+    set covers only committed transactions. A binlog file:position can cover a transaction
+    that is still committing, which then neither the load nor CDC copies; ``FLUSH BINARY
+    LOGS`` (run by the Full Load right after the point is recorded) waits for those
+    commits, and needs RELOAD. On Aurora with enhanced binlog the tool does not rely on it,
+    so there only ``gtid_mode=ON`` makes the point exact. Required (a blocking FAIL)
+    because the loss is silent; a WARN when RELOAD may come through a role that plain
+    ``SHOW GRANTS`` does not expand. Its FAIL holds the Full Load runs that record a start
+    point, not the CDC actions (``_models._CDC_NON_BLOCKING_FAILURES``): a Start CDC from a
+    point already recorded runs no fence. ``records_start_point`` False (CDC only:
+    :attr:`PrerequisiteCheckRequest.records_start_point`) SKIPs it: CDC only runs no Full
+    Load, so no fence.
+    """
+    title = "CDC start point can be made exact"
+    if not records_start_point:
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.START_POINT_FENCE,
+            title=title,
+            status=PrerequisiteStatus.SKIP,
+            required=True,
+            detail=(
+                "Checked for Full load + CDC, whose Full Load records CDC's start point; CDC "
+                "only runs no Full Load."
+            ),
+        )
+    if gtid_mode_is_on(variables.get("gtid_mode")):
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.START_POINT_FENCE,
+            title=title,
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            detail=(
+                "gtid_mode=ON: CDC starts after the GTID set recorded with the start point, "
+                "which covers only committed transactions."
+            ),
+            remediation="",
+        )
+    gtid_remedy = (
+        "set gtid_mode=ON and enforce_gtid_consistency=ON on the source (its DB cluster or "
+        "DB parameter group)"
+    )
+    if (variables.get("aurora_enhanced_binlog_status") or "").strip().upper() == "ACTIVE":
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.START_POINT_FENCE,
+            title=title,
+            status=PrerequisiteStatus.FAIL,
+            required=True,
+            detail=(
+                "This Aurora MySQL cluster writes its binlog with enhanced binlog and "
+                "gtid_mode is not ON. A binlog position can then cover a transaction before "
+                "it is visible to the Full Load, and the tool does not rely on FLUSH BINARY "
+                "LOGS to wait for it there, so a change made at the start point could be "
+                "lost."
+            ),
+            remediation=(
+                f"For Full load + CDC, {gtid_remedy}; or turn enhanced binlog off "
+                "(aurora_enhanced_binlog=0). Both need a reboot of the writer."
+            ),
+        )
+    if _holds_global(grants, "RELOAD"):
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.START_POINT_FENCE,
+            title=title,
+            status=PrerequisiteStatus.PASS,
+            required=True,
+            detail=(
+                "gtid_mode is not ON, and the source user holds RELOAD: right after "
+                "recording the binlog position the Full Load runs FLUSH BINARY LOGS, which "
+                "waits for transactions still committing (a few milliseconds; the binlog "
+                "moves to a new file)."
+            ),
+            remediation="",
+        )
+    if any(_is_role_grant(line) for line in grants):
+        return PrerequisiteResult(
+            check_id=PrerequisiteCheckId.START_POINT_FENCE,
+            title=title,
+            status=PrerequisiteStatus.WARN,
+            required=False,
+            detail=(
+                "gtid_mode is not ON, and RELOAD was not found in the source user's direct "
+                "grants; the user holds roles, whose privileges plain SHOW GRANTS does not "
+                "show. Without RELOAD the Full Load stops before reading any table."
+            ),
+            remediation=(
+                "Confirm a role grants RELOAD (SHOW GRANTS FOR CURRENT_USER() USING <role>), "
+                f"grant RELOAD to the source user, or {gtid_remedy}."
+            ),
+        )
+    return PrerequisiteResult(
+        check_id=PrerequisiteCheckId.START_POINT_FENCE,
+        title=title,
+        status=PrerequisiteStatus.FAIL,
+        required=True,
+        detail=(
+            "gtid_mode is not ON, and the source user lacks RELOAD. The binlog position the "
+            "Full Load records can cover a transaction that is still committing, which "
+            "neither the load nor CDC would copy; FLUSH BINARY LOGS waits for it but needs "
+            "RELOAD."
+        ),
+        remediation=f"Grant RELOAD to the source user (GRANT RELOAD ON *.* TO ...), or {gtid_remedy}.",
     )
 
 
@@ -1495,9 +1623,14 @@ class PrerequisiteChecker:
                 results.append(check_binlog_row_format(variables))
                 results.append(check_binlog_retention(variables))
                 results.append(check_gtid_mode(variables))
+                results.append(
+                    check_start_point_fence(
+                        variables, grants, records_start_point=request.records_start_point
+                    )
+                )
             else:
-                # The three rows one variables() read would have graded, built from an
-                # empty read so each keeps its own title and required flag.
+                # The rows one variables() read would have graded, built from an empty
+                # read so each keeps its own title and required flag.
                 results.extend(
                     _not_checked(row)
                     for row in (
@@ -1505,6 +1638,13 @@ class PrerequisiteChecker:
                         check_binlog_retention({}),
                         check_gtid_mode({}),
                     )
+                )
+                # Its SKIP for a run that records no start point reads no fact: it stays.
+                _fence_row = check_start_point_fence(
+                    {}, [], records_start_point=request.records_start_point
+                )
+                results.append(
+                    _not_checked(_fence_row) if request.records_start_point else _fence_row
                 )
             results.append(
                 check_msk_available(
@@ -1562,6 +1702,12 @@ class PrerequisiteChecker:
                 )
                 results.append(
                     _skipped(PrerequisiteCheckId.GTID_MODE, "GTID mode is enabled")
+                )
+                results.append(
+                    _skipped(
+                        PrerequisiteCheckId.START_POINT_FENCE,
+                        "CDC start point can be made exact",
+                    )
                 )
             results.append(
                 _skipped(PrerequisiteCheckId.MSK_AVAILABLE, "MSK cluster is available")

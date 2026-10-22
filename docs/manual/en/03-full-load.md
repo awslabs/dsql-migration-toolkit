@@ -36,7 +36,11 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 
 The source is read **read-only** inside a consistent snapshot; the loader never
 modifies it. A MySQL source — and a PostgreSQL Full-Load-only migration — is never
-written. The single exception is **PostgreSQL CDC**: at the watermark point (§3.5)
+written. A MySQL **Full load + CDC** run on a source not running `gtid_mode=ON` issues one
+statement beyond reads, **`FLUSH BINARY LOGS`**, right after recording CDC's start point and
+before any table is read: it needs `RELOAD`, writes no data, locks no table and moves the
+binlog to a new file (§3.5). The single exception that writes is **PostgreSQL CDC**: at the
+watermark point (§3.5)
 the tool creates, and at teardown drops, a logical replication slot and a
 publication scoped to exactly the migrated tables (`FOR TABLE ONLY`: a table's
 inheritance children are not added with it, just as the Full Load reads only the table's
@@ -237,8 +241,8 @@ names both.
 
 ## 3.5 The watermark — the bridge to CDC
 
-Before loading, the tool captures a **watermark**: a consistent point in the
-source's change stream, recorded inside the same consistent-snapshot transaction.
+Before loading, the tool captures a **watermark**: the point in the source's change
+stream that CDC starts from, recorded before any table is read.
 Every watermark carries a **UTC snapshot timestamp** and **approximate** per-table
 row counts (scan-free `information_schema` estimates, so the source isn't
 full-scanned just to count). The engine-specific coordinate differs:
@@ -260,13 +264,46 @@ full-scanned just to count). The engine-specific coordinate differs:
   concept on PostgreSQL, and no `SHOW BINARY LOG STATUS` — the LSN comes from the
   created slot.
 
-The watermark is what makes a later **gapless handoff to CDC** possible: CDC starts
-streaming changes from exactly the point the snapshot ended — no gap, no overlap
-(see [Chapter 4](04-cdc-and-dsql-constraints.md)). If the CDC prerequisites aren't
+The watermark is what makes a later **gapless handoff to CDC** possible. Every table
+is read from its own consistent snapshot, opened after the watermark, and CDC replays
+every change after the watermark; a change both the snapshot and CDC carry is applied
+twice, which the idempotent upsert / delete by primary key makes harmless (see
+[Chapter 4](04-cdc-and-dsql-constraints.md)). So the watermark must never cover a
+transaction the snapshots cannot see:
+
+- On a `gtid_mode=ON` MySQL source it does not: a GTID enters `gtid_executed` only after
+  the transaction's InnoDB commit.
+- A binlog file + position can: MySQL writes a transaction to the binlog before it commits
+  it in InnoDB, so a position read in between covers a transaction no snapshot sees yet,
+  and CDC starts after it. On a **Full load + CDC** run the tool therefore runs **`FLUSH
+  BINARY LOGS`** right after recording the position, before any table is read: before MySQL
+  switches to a new binlog file it waits until every transaction already in the binlog has
+  committed (normally milliseconds, during which new commits wait too). It needs the
+  **RELOAD** privilege, locks no table, and moves the binlog to a new file; the activity log
+  records it. On Aurora MySQL with **enhanced binlog** the tool does not rely on that wait,
+  so a Full load + CDC run there needs `gtid_mode=ON` (or enhanced binlog turned off). The
+  prerequisite **CDC start point can be made exact** checks both before each Full load + CDC
+  run.
+- A transaction prepared with `XA PREPARE` before the watermark and committed after the
+  tables are read is copied by neither, so the run waits up to 30 s for the prepared XA
+  transactions it finds (`XA RECOVER`) and stops if one is still prepared. On MySQL 8.0.19
+  and later `XA RECOVER` needs `XA_RECOVER_ADMIN`; without it the run logs a warning and
+  goes on.
+
+A **Full load only** run issues no `FLUSH`: it copies the snapshots and nothing after
+them, so stop writes to the source first if the copy must include every change. On a
+source not running `gtid_mode=ON` its watermark (like one recorded by an earlier version
+of the tool) is therefore not made exact, so a later Start CDC from it shows *This start
+point was recorded without waiting for in-flight commits*; CDC only re-runs the Full Load
+through Full load + CDC for this reason. If the CDC prerequisites aren't
 met — on MySQL, binary logging disabled or the privilege restricted; on PostgreSQL,
 `wal_level` not `logical`, or the slot / publication can't be created (missing
 replication privilege, or a standby endpoint) — the coordinate degrades gracefully
-and you simply don't get the CDC handoff (Full Load still works).
+and you simply don't get the CDC handoff (Full Load still works). The exception is a MySQL
+**Full load + CDC** run whose binlog position cannot be made exact (no `RELOAD`, enhanced
+binlog without `gtid_mode=ON`, or an XA transaction still prepared): it stops before
+reading any table, names the remedy, and keeps no table to retry, so fix the cause and
+start it again.
 
 > The watermark's row counts are **approximate on purpose** (to spare the
 > source). Exact `COUNT(*)` and checksums are the job of **Validation**
@@ -354,8 +391,9 @@ replication slot again at its own snapshot point), then **Start CDC**.
   watermark, so when the refused point is that watermark (Automatic), the refusal adds that
   route's condition: if that Full Load appended to rows already on the target, run it again
   choosing **Drop & reload** before that Start — CDC only has no Full Load step, so switch
-  the migration type to Full load only for that run, then back to CDC only (an append keeps
-  those rows as they were, and CDC from a watermark carries only the changes after it). In
+  the migration type to Full load + CDC for that run, whose Full Load makes the CDC start
+  point exact (an append keeps those rows as they were, and CDC from a watermark carries
+  only the changes after it). In
   the disabled Start's tooltip and the job's error, the route reads *Delete CDC infrastructure and
   deploy it again, then Start CDC (if the Full Load appended to rows already on the target,
   re-run it choosing 'Drop & reload' first)*. On the new stack that Start is not refused,
@@ -461,9 +499,10 @@ In Full load + CDC you can also tick a table after the load, until CDC starts. R
 > available as a CLI script — `scripts/run_full_load.py` (plan first, then `--yes`;
 > optional `--clean` and `--watermark-out` to capture the CDC watermark) — for
 > automation or a large-scale run without the web UI. See
-> [`scripts/README.md`](../../../scripts/README.md); the source is read-only (the
-> sole exception is the PostgreSQL-CDC slot and publication noted in §3.1) and the
-> load is idempotent, exactly as in the UI.
+> [`scripts/README.md`](../../../scripts/README.md); the source is read-only (with
+> `--watermark-out` the run is a Full load + CDC one, so unless the source runs
+> `gtid_mode=ON` it issues `FLUSH BINARY LOGS` right after the watermark, which needs
+> `RELOAD`, §3.5) and the load is idempotent, exactly as in the UI.
 
 ---
 

@@ -26,11 +26,15 @@ value is as-of one point):
   NOT load (``baseline_tables``): the only proof of their definition at this start point,
   which a Full load + CDC table added after the load is compared with (G17).
 
-Global consistency is obtained with ``START TRANSACTION WITH CONSISTENT
-SNAPSHOT`` (InnoDB, REPEATABLE READ, which every MySQL source session is set to,
-whatever the source's default): a single reader sees all tables at one
-coordinate. This is the accurate, slightly slower default described in the
-design.
+The capture runs inside ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` (InnoDB,
+REPEATABLE READ, which every MySQL source session is set to, whatever the source's
+default), but that snapshot does NOT pin the binlog coordinates: ``SHOW ... STATUS`` and
+``gtid_executed`` are read live. What makes the point usable is order and replay -- it is
+recorded before any table is read, every Full Load reader opens its own snapshot after
+it, and CDC replays everything after it, idempotently. A GTID set covers only committed
+transactions; a binlog file:position can also cover one that is still committing, which
+the Full load + CDC run then waits out with ``FLUSH BINARY LOGS`` before its readers open
+(G147, :mod:`dsql_migrator.core.mysql_start_point_fence`).
 
 Two guarantees from the design are preserved:
 
@@ -339,8 +343,10 @@ def capture_watermark(
     """Capture a :class:`Watermark` on an open connection (read-only).
 
     All reads happen inside one ``START TRANSACTION WITH CONSISTENT SNAPSHOT``
-    transaction so the binlog/GTID coordinates and the per-table row counts are
-    all as-of a single point. The transaction is committed before returning.
+    transaction, committed before returning. The snapshot pins the catalog reads, not the
+    binlog/GTID coordinates (those are read live): the point is exact for CDC because it
+    is taken before any table is read and, for a binlog file:position, fenced afterwards
+    with FLUSH BINARY LOGS by a Full load + CDC run (G147).
 
     The start-point fingerprints are read immediately BEFORE the binlog position, so a
     schema change racing the capture can only make Start CDC refuse a start point it
@@ -414,16 +420,56 @@ class WatermarkCapturer:
         self,
         engine_factory: Optional[Callable[[SourceConnectionConfig], Engine]] = None,
         now: Optional[Callable[[], datetime]] = None,
+        fence_engine_factory: Optional[Callable[[SourceConnectionConfig], Engine]] = None,
     ) -> None:
         """Create a capturer.
 
         ``engine_factory`` builds a read-only-guarded SQLAlchemy engine for a
         connection config (the default reuses the introspector's MySQL factory,
         which installs the read-only guard). ``now`` overrides the clock used for
-        the snapshot timestamp; both are injectable for testing.
+        the snapshot timestamp. ``fence_engine_factory`` builds the start-point fence's
+        own engine (:meth:`fence_start_point`; default
+        :func:`~dsql_migrator.core.mysql_start_point_fence.build_fence_engine`). All are
+        injectable for testing.
         """
         self._engine_factory = engine_factory or _default_engine_factory
         self._now = now or _utc_now
+        self._fence_engine_factory = fence_engine_factory
+
+    def fence_start_point(
+        self,
+        conn: SourceConnectionConfig,
+        watermark: Watermark,
+        *,
+        password: object = None,
+        on_log: Callable[..., None] = lambda _message, **_kw: None,
+    ) -> Watermark:
+        """Make ``watermark``'s CDC start point exact before any reader opens (G147).
+
+        For a Full load + CDC run, right after :meth:`capture`: see
+        :mod:`dsql_migrator.core.mysql_start_point_fence` (``on_log`` as there). Returns the
+        watermark with
+        ``start_point_fence`` recorded; unchanged when it holds no binlog coordinate (Start
+        CDC refuses such a point). Raises
+        :class:`~dsql_migrator.core.mysql_start_point_fence.StartPointFenceError` with the
+        remedy when the point cannot be made exact.
+        """
+        from dsql_migrator.core import mysql_start_point_fence as fence
+
+        if not watermark.binlog_file and not watermark.gtid_executed:
+            return watermark
+        factory = self._fence_engine_factory or (
+            lambda config: fence.build_fence_engine(config, password)  # type: ignore[arg-type]
+        )
+        engine = factory(conn)
+        try:
+            with engine.connect() as connection:
+                result = fence.fence_start_point(
+                    connection, gtid_mode=watermark.gtid_mode, on_log=on_log
+                )
+        finally:
+            engine.dispose()
+        return watermark.model_copy(update={"start_point_fence": result.method})
 
     def capture(
         self,

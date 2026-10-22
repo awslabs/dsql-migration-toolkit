@@ -168,6 +168,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     is_cdc_error_record,
     should_replace_teardown_marker,
 )
+from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
 from dsql_migrator.ui.design import (
     EXPANSION_PANEL_CLASSES,
     NOTICE_STYLE,
@@ -747,6 +748,8 @@ def _render_cdc_source_config_card(
         ),
         auto_refused=newer_start_point_refusal(migration_state, watermark, source_type)
         is not None,
+        # G147: a binlog position no commit fence made exact (Full load only, or older).
+        unfenced_start_point=start_point_unfenced(watermark),
         # The CAUSE of a re-snapshot, derived from the RAW job (the card only sees the
         # watermark, whose slot has already been suppressed for an unfinished load, so it
         # cannot tell "never provisioned" from "not honoured yet" on its own).
@@ -1173,14 +1176,16 @@ def _mysql_rolled_back_continues(fallback: str) -> str:
 
 
 def _render_manual_vs_watermark_notice(
-    ui, manual_point, wm_resume, *, rolled_back: bool = False, recopied: bool = False
+    ui, manual_point, wm_resume, *, rolled_back: bool = False, recopied: bool = False,
+    unfenced: bool = False,
 ) -> None:
     """A Manual binlog point REPLACES the gapless Full Load watermark as the start offset:
     say which changes that loses (after it) or re-applies (before it). Nothing when equal.
     ``rolled_back``: this stack's last Start CloudFormation rolled back, so Automatic is
     gapless only while the CDC topics retain what that Start streamed (G25). ``recopied``:
     the Full Load is not this migration's first copy, so Automatic is gapless only if it did
-    not append to rows already on the target (G27)."""
+    not append to rows already on the target (G27). ``unfenced``: the watermark is a binlog
+    position no commit fence made exact (G147), so Automatic is not called gapless either."""
     m = {"file": manual_point.binlog_file, "pos": int(manual_point.binlog_position)}
     w = {"file": wm_resume.binlog_file, "pos": int(wm_resume.binlog_position)}
     if m == w:
@@ -1193,6 +1198,9 @@ def _render_manual_vs_watermark_notice(
         else "Automatic starts at the snapshot's end, which is gapless only if that Full Load "
         "did not append to rows already on the target."
         if recopied
+        else "Automatic starts at the Full Load's recorded binlog position, which was recorded "
+        "without waiting for in-flight commits."
+        if unfenced
         else None
     )
     if offset_already_at_or_past(m, w):
@@ -1355,6 +1363,8 @@ def _render_cdc_start_point_card(
     locked: bool = False,
     session: object = None,
     source_type: SourceType = SourceType.MYSQL,
+    # G147: the Automatic point is a binlog file:position that no commit fence made exact.
+    unfenced_start_point: bool = False,
     # A watermark that HAS a GTID set but no binlog file:position -- present, yet unable
     # to seed the CDC start offset. Distinguished from "no watermark" so the card can name
     # the actual cause and its fix (the REPLICATION CLIENT grant) instead of implying the
@@ -1494,7 +1504,10 @@ def _render_cdc_start_point_card(
                 + ("." if locked else " (see the notice below).")
                 if streamed
                 else RELOAD_CONDITION_TOOLTIP
+                + (f" {UNFENCED_START_POINT_TAIL}" if unfenced_start_point else "")
                 if reload_notice is not None
+                else UNFENCED_START_POINT_TOOLTIP
+                if unfenced_start_point and wm_usable
                 else "Where change streaming begins. Automatic resumes exactly where the "
                 "Full Load snapshot ended (no gap, no overlap)."
                 if wm_usable or not is_pg
@@ -1652,10 +1665,13 @@ def _render_cdc_start_point_card(
                 # G25 (A2): this stack has streamed, and the watermark is past where it last
                 # started -- Start CDC refuses it (the notice below says why and the route).
                 auto_label = "Automatic — from the Full Load watermark"
-            elif wm_usable and (mysql_rolled_back or reload_notice is not None):
+            elif wm_usable and (
+                mysql_rolled_back or reload_notice is not None or unfenced_start_point
+            ):
                 # G25: gapless only while the CDC topics retain what the rolled-back Start
                 # streamed (the notice below). G27: or only if a Full Load that is not this
-                # migration's first copy did not append (the notice below).
+                # migration's first copy did not append (the notice below). G147: or a binlog
+                # position no commit fence made exact (the notice below).
                 auto_label = "Automatic — from the Full Load watermark (recommended)"
             elif wm_usable:
                 auto_label = "Automatic — gapless from Full Load (recommended)"
@@ -1836,7 +1852,7 @@ def _render_cdc_start_point_card(
             ):
                 _render_manual_vs_watermark_notice(
                     ui, manual_point, wm_resume, rolled_back=mysql_rolled_back,
-                    recopied=reload_notice is not None,
+                    recopied=reload_notice is not None, unfenced=unfenced_start_point,
                 )
             _render_cdc_manual_inputs(
                 ui, migration_state, refresh, locked=locked, session=session,
@@ -1850,6 +1866,14 @@ def _render_cdc_start_point_card(
                     ui, wm_resume.gtid_executed, wm_resume.binlog_file,
                     wm_resume.binlog_position,
                 )
+                if unfenced_start_point and not locked and newer is None:
+                    render_notice(
+                        ui, tone="warning", header=UNFENCED_START_POINT_HEADER,
+                        body=unfenced_start_point_body(
+                            getattr(migration_state, "migration_type", None),
+                            streamed=streamed,
+                        ),
+                    )
 
         # Resolved start-point confirmation (the single source of truth).
         if is_pg:
@@ -2559,9 +2583,19 @@ def _cdc_start_detail(
                 # G27: a Full Load that is not this migration's first copy.
                 else RELOAD_CONDITION_LINE
                 if recopied
+                # G147: a binlog position no commit fence made exact.
+                else UNFENCED_START_POINT_LINE
+                if start_point_unfenced(watermark)
                 else "(gapless from the Full Load watermark)"
             )
         )
+        if (
+            source_type is not SourceType.POSTGRES
+            and (rolled_back or recopied)
+            and start_point_unfenced(watermark)
+        ):
+            # G147 after the G25 / G27 condition, which took the line's place above.
+            parts.append(UNFENCED_START_POINT_PART)
     else:
         parts.append(
             "start point: the source's CURRENT position — there is no Full Load "
@@ -3256,6 +3290,49 @@ START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT = (
     "It is drawn from the Full Load snapshot and the tables loaded under its start point "
     "since."
 )
+# G147: the Automatic start point is a binlog position recorded without the commit fence
+# (mysql_start_point_fence.start_point_unfenced) -- the card, the Start CDC dialog and the
+# Start's activity line say so.
+UNFENCED_START_POINT_HEADER = "This start point was recorded without waiting for in-flight commits"
+# The start-point card's hover text for Automatic, and its sentence after the G27 one.
+UNFENCED_START_POINT_TAIL = (
+    "That binlog position was recorded without waiting for in-flight commits."
+)
+UNFENCED_START_POINT_TOOLTIP = (
+    "Where change streaming begins. Automatic starts at the binlog position the Full Load "
+    f"recorded. {UNFENCED_START_POINT_TAIL}"
+)
+# The Start's activity line, in place of "(gapless from the Full Load watermark)" -- and as a
+# part of its own after the G25 / G27 conditions, which take that place first.
+UNFENCED_START_POINT_LINE = (
+    "(from the Full Load watermark, a binlog position recorded without FLUSH BINARY LOGS: a "
+    "transaction still committing when it was read can be missing from both the Full Load and "
+    "CDC)"
+)
+UNFENCED_START_POINT_PART = (
+    "the Full Load watermark is a binlog position recorded without FLUSH BINARY LOGS: a "
+    "transaction still committing when it was read can be missing from both the Full Load and "
+    "CDC"
+)
+
+
+def unfenced_start_point_body(migration_type: object, *, streamed: bool = False) -> str:
+    """The :data:`UNFENCED_START_POINT_HEADER` notice's body: why the point may not be exact,
+    then the re-run that records an exact one -- a Full load + CDC Full Load, reached from CDC
+    only by a type switch (``cdc_start_point_gate.drop_and_reload_rerun``), after new CDC
+    topics on a stack that has streamed or rolled back a Start (``streamed``, G25: such a
+    re-run waits for them) -- or the check that rules the loss out. Pure."""
+    from dsql_migrator.ui.cdc_start_point_gate import NEW_TOPICS, drop_and_reload_rerun
+
+    rerun, note = drop_and_reload_rerun(migration_type)
+    first = f"{NEW_TOPICS}, then " if streamed else ""
+    return (
+        "A Full load only run or an earlier version recorded this binlog position without "
+        "FLUSH BINARY LOGS, so a transaction that was still committing at that instant can be "
+        f"missing from both the Full Load and CDC. To rule it out, {first}{rerun} before Start "
+        f"CDC{note or ' (the Full load + CDC run makes its start point exact)'}, or validate in "
+        "CHECKSUM mode once CDC has caught up."
+    )
 START_UNCOVERED_HEADER = "Load the tables selected after the Full Load first"
 # G129: Start CDC waits while a Full Load runs (a Retry or a Reload too). The load inserts only
 # the rows missing on the target, so a row the source deletes while its table is copied --
@@ -3781,6 +3858,10 @@ def _render_cdc_start_button(
         # accounting. So: the table set is plain text (the verifiable fact, kept visible
         # -- it must not become hover-only), and the immutability rationale moves to an
         # info glyph beside it, since it is background the operator needs at most once.
+        # G147: nor from a binlog position no commit fence made exact.
+        _gapless = not drop_reload_condition_due(migration_state, job) and not (
+            start_point_unfenced(_cdc_watermark(job, migration_state))
+        )
         with ui.row().classes("items-center gap-1.5 no-wrap w-full"):  # type: ignore[attr-defined]
             ui.icon("playlist_add_check", color="primary").classes("text-base")  # type: ignore[attr-defined]
             ui.label(selection_line).classes("text-sm text-gray-700")  # type: ignore[attr-defined]
@@ -3794,8 +3875,7 @@ def _render_cdc_start_button(
                         # re-snapshot, and not (G27) after a Full Load that may not be this
                         # migration's first copy -- the card states the condition there.
                         START_TOOLTIP_NARROWING_TAIL
-                        if not _resnapshots
-                        and not drop_reload_condition_due(migration_state, job)
+                        if not _resnapshots and _gapless
                         else START_TOOLTIP_NARROWING_TAIL_RESNAPSHOT
                     )
                 )
@@ -3813,7 +3893,7 @@ def _render_cdc_start_button(
                     "via 'Start over' (top right)."
                     if full_load_ran
                     and not _resnapshots
-                    and not drop_reload_condition_due(migration_state, job)
+                    and _gapless
                     else "It is drawn from the Full Load snapshot — streaming a different "
                     "set means a fresh migration, via 'Start over' (top right)."
                     if full_load_ran
@@ -6069,6 +6149,32 @@ def cdc_start_resumes(migration_state, watermark, source_type) -> bool:
     )
 
 
+def _unfenced_start_point_notice(migration_state, job, session) -> Optional[tuple]:
+    """``(header, body)`` of the unfenced start-point notice (G147) for a MySQL Start CDC that
+    seeds the Full Load's watermark -- it resumes no committed offset -- when that watermark
+    is a binlog position no commit fence made exact
+    (:func:`~dsql_migrator.core.mysql_start_point_fence.start_point_unfenced`); else None.
+    The start-point card states it from its own state; the Start CDC dialog uses this. Pure
+    apart from the CDC-state job reads."""
+    source_type = _cdc_source_type(session)
+    if source_type is SourceType.POSTGRES:
+        return None
+    watermark = _cdc_watermark(job, migration_state)
+    if not start_point_unfenced(watermark):
+        return None
+    seed, origin = _cdc_start_seed(migration_state, watermark, source_type)
+    if (
+        origin != "full_load"
+        or not _seed_can_seed(seed)
+        or cdc_start_resumes(migration_state, seed, source_type)
+    ):
+        return None
+    return UNFENCED_START_POINT_HEADER, unfenced_start_point_body(
+        getattr(migration_state, "migration_type", None),
+        streamed=cdc_stack_has_streamed(migration_state),
+    )
+
+
 def _reload_condition_notice(migration_state, job, session) -> Optional[tuple]:
     """``(header, body)`` of the reload condition (G27,
     :func:`~dsql_migrator.ui.cdc_start_point_gate.reload_condition`) for a Start CDC that begins at
@@ -7045,6 +7151,15 @@ async def _open_cdc_start_dialog(
             )
         except Exception:  # noqa: BLE001 - advisory copy; never block the dialog
             reload_notice = None
+    # G147: this Start seeds a binlog position no commit fence made exact (no I/O).
+    unfenced_notice: Optional[tuple] = None
+    if job_manager is not None and not _uncovered and newer is None:
+        try:
+            unfenced_notice = _unfenced_start_point_notice(
+                migration_state, _current_job(job_manager, migration_state.job_id), session
+            )
+        except Exception:  # noqa: BLE001 - advisory copy; never block the dialog
+            unfenced_notice = None
     if job_manager is not None and not _uncovered:
         from nicegui import run
 
@@ -7291,6 +7406,12 @@ async def _open_cdc_start_dialog(
         elif reload_notice is not None:
             # G27: not a block -- the tool cannot tell whether that Full Load appended.
             _render_notice(ui, tone="warning", header=reload_notice[0], body=reload_notice[1])
+        if newer is None and unfenced_notice is not None:
+            # G147: not a block either -- a transaction committing at that instant may or may
+            # not have existed.
+            _render_notice(
+                ui, tone="warning", header=unfenced_notice[0], body=unfenced_notice[1]
+            )
         _gtid_blocks = bool(getattr(gtid_verdict, "blocks", False))
         if gtid_notice is not None:
             _render_notice(

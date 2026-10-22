@@ -14,7 +14,9 @@ Aurora DSQL은 PostgreSQL 16 호환 *분산* 데이터베이스입니다. **MySQ
 
 목표는 완전 자동화된 무중단 마이그레이션이 아닙니다. **마이그레이션 가능성을 평가하고,
 결정론적으로 변환 가능한 것(`sqlglot`)은 자동화하며, 사람의 작업이 필요한 지점을 명확히
-드러내는 것**입니다. 소스 데이터베이스는 항상 읽기 전용으로만 접근합니다.
+드러내는 것**입니다. 소스 데이터베이스는 읽기 전용으로 접근하며, 감사 기록되는 몇 가지 CDC
+구문만 예외입니다: PostgreSQL CDC 실행의 복제 슬롯과 publication, 그리고 MySQL Full load + CDC
+실행의 `FLUSH BINARY LOGS`([§3.1](docs/manual/ko/03-full-load.md#31-큰-그림)).
 
 > **여기서 시작하세요:** [**고객 FAQ**](docs/manual/ko/11-customer-faq.md)(무엇을 계획해야
 > 하는지 — Full Load vs CDC, DSQL 제약, 검증, 컷오버, 비용)를 먼저 읽고,
@@ -64,7 +66,7 @@ Load만** 실행한 뒤에는 그 선택지가 사라지고, 나중에 CDC를 �
 **❌ 하지 않는 것 / 범위 밖**
 
 - **완전 자동·무중단이 아님** — 어려운 변환과 최종 **Cut over**는 사용자의 판단과 실행 몫.
-- **소스에 절대 쓰지 않음** — 소스는 전 과정 읽기 전용이며 롤백 앵커로 보존.
+- **소스의 데이터를 절대 바꾸지 않음** — 소스의 행과 스키마는 그대로 유지되어 롤백 앵커로 보존(CDC가 소스에 실행하는 감사 기록되는 몇 가지 구문은 [§3.1](docs/manual/ko/03-full-load.md#31-큰-그림)에 정리).
 - **CDC로 DDL을 복제하지 않음** — 소스 스키마 변경은 Aurora DSQL에 직접 반영. CDC 단계가 대부분을 감지하고, 추가되거나 이름이 바뀐 컬럼에는 **Fix target schema…**를 제공.
 - **단일 리전만 지원** — 소스와 타깃은 동일한 AWS 리전에 있어야 함.
 - **DSQL의 제약을 그대로 상속** — 트리거·저장 프로시저 없음, 트랜잭션당 행 한도,
@@ -244,7 +246,9 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 ## 사전 요구사항
 
-- 스키마·데이터를 읽을 수 있는 사용자를 가진 소스 **RDS / Aurora MySQL** 또는 **PostgreSQL**.
+- 스키마·데이터를 읽을 수 있는 사용자를 가진 소스 **RDS / Aurora MySQL** 또는 **PostgreSQL**(CDC에는
+  복제 권한이, MySQL Full load + CDC 실행에는 소스가 `gtid_mode=ON`이 아니면 `RELOAD`가 필요:
+  [§1.1](docs/manual/ko/01-setup.md#11-사전-요구사항)).
   **지원 엔진/버전**(end-to-end 검증됨): **RDS for MySQL** / **Aurora MySQL** 5.7 / 8.0 / 8.4
   (5.7은 Extended Support이지만 소스로 완전 지원), 그리고 **RDS for PostgreSQL** / **Aurora
   PostgreSQL** 13–16 (CDC는 `pgoutput` 논리 복제 필요).

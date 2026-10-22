@@ -15,7 +15,9 @@ constraints.
 
 The goal is not fully automated zero-downtime migration. It is to **assess
 migratability, automate what converts deterministically (`sqlglot`), and clearly
-surface what needs human work.** The source database is always accessed read-only.
+surface what needs human work.** The source database is accessed read-only, apart from a
+few audited CDC statements: a PostgreSQL CDC run's replication slot and publication, and a
+MySQL Full load + CDC run's `FLUSH BINARY LOGS` ([§3.1](docs/manual/en/03-full-load.md#31-the-big-picture)).
 
 > **Start here:** read the [**Customer FAQ**](docs/manual/en/11-customer-faq.md)
 > (what to plan for — Full Load vs CDC, DSQL limits, validation, cut-over, cost),
@@ -73,8 +75,9 @@ source again).
 
 - **Not fully automated or zero-downtime** — the hard conversions and the final **Cut
   over** remain your decision and action.
-- **Never writes to the source** — the source stays read-only throughout, preserved as a
-  rollback anchor.
+- **Never changes the source's data** — its rows and schema stay as they were, preserved
+  as a rollback anchor (CDC's few audited statements on it are listed in
+  [§3.1](docs/manual/en/03-full-load.md#31-the-big-picture)).
 - **Doesn't replicate DDL over CDC** — you make a source schema change on Aurora DSQL
   yourself; the CDC step detects most of them and offers **Fix target schema…** for an
   added or renamed column.
@@ -263,7 +266,9 @@ to both stacks. Debezium is open-source software running *on* MSK Connect.
 
 ## Prerequisites
 
-- A source **RDS / Aurora MySQL** *or* **PostgreSQL** with a read-only schema/data user.
+- A source **RDS / Aurora MySQL** *or* **PostgreSQL** with a read-only schema/data user (CDC
+  needs replication privileges, and a MySQL Full load + CDC run `RELOAD` unless the source
+  runs `gtid_mode=ON`: [§1.1](docs/manual/en/01-setup.md#11-prerequisites)).
   **Supported engines/versions** (validated end-to-end): **RDS for MySQL** / **Aurora MySQL**
   5.7 / 8.0 / 8.4 (5.7 is on Extended Support but fully supported as a source), and **RDS for
   PostgreSQL** / **Aurora PostgreSQL** 13–16 (CDC requires logical replication via `pgoutput`).

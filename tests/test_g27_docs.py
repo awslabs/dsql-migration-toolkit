@@ -107,22 +107,25 @@ _RELOAD_CONDITION = {
             "en": "The start-point card then shows *Gapless only if this Full Load did not "
             "append*: if that Full Load appended to them, Re-run Full Load choosing **Drop & "
             "reload** before Start CDC (CDC only has no Full Load step: on MySQL switch the "
-            "migration type to Full load only for that run, then back to CDC only; on PostgreSQL "
+            "migration type to Full load + CDC for that run, whose Full Load makes the CDC start "
+            "point exact; on PostgreSQL "
             "switch it to Full load + CDC and re-run it there, which creates the slot again at "
             "its own snapshot point), because an append keeps those rows as they were and CDC "
             "from a watermark carries only the changes after it.",
             "ko": "그러면 시작 지점 카드가 *Gapless only if this Full Load did not append*를 보여 "
             "줍니다: 그 Full Load가 그 행에 append했다면 Start CDC 전에 **Drop & reload**로 Re-run "
             "Full Load 하세요(CDC only에는 Full Load 단계가 없습니다: MySQL에서는 그 실행 동안 "
-            "마이그레이션 유형을 Full load only로 바꾼 뒤 다시 CDC only로 돌아오고, PostgreSQL에서는 "
+            "마이그레이션 유형을 Full load + CDC로 바꾸며 그 Full Load가 CDC 시작 지점을 정확하게 "
+            "맞추고, PostgreSQL에서는 "
             "유형을 Full load + CDC로 바꿔 그곳에서 다시 실행하며, 그 실행이 슬롯을 자신의 스냅샷 "
             "지점에 다시 만듭니다). append는 그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 "
             "변경만 가져오기 때문입니다.",
             "ja": "そのとき開始位置のカードが *Gapless only if this Full Load did not append* を"
             "示します: その Full Load がそれらの行に append した場合は、Start CDC の前に **Drop & "
             "reload** で Re-run Full Load してください (CDC only には Full Load ステップがありません: "
-            "MySQL ではその実行の間はマイグレーションの種類を Full load only に切り替え、その後 CDC "
-            "only に戻します。PostgreSQL では種類を Full load + CDC に切り替えてそこで再実行し、その"
+            "MySQL ではその実行の間はマイグレーションの種類を Full load + CDC に切り替え、その Full "
+            "Load が CDC の開始位置を正確にします。PostgreSQL では種類を Full load + CDC に切り替えて"
+            "そこで再実行し、その"
             "実行がスロットを自身のスナップショット位置に作り直します)。append はそれらの行をそのまま"
             "残し、ウォーターマークからの CDC はその後の変更しか運ばないためです。",
         },
@@ -315,8 +318,8 @@ def test_a_start_after_a_full_load_that_may_have_appended_states_the_drop_and_re
             "This Full Load found rows already on the target."
         )
     assert (
-        "(CDC only has no Full Load step: switch the migration type to Full load only for that "
-        "run, then back to CDC only)" in reload_condition(cdc_only)
+        "(CDC only has no Full Load step: switch the migration type to Full load + CDC for that "
+        "run, whose Full Load makes the CDC start point exact)" in reload_condition(cdc_only)
     )
     pg_only = reload_condition(cdc_only, postgres=True)
     assert (

@@ -375,6 +375,20 @@ class SessionSourceProbe:
                 )
         except Exception:  # noqa: BLE001 - not RDS / no access -> key absent
             pass
+        # Aurora MySQL enhanced binlog (a STATUS variable; absent elsewhere), folded in
+        # under the synthetic key ``aurora_enhanced_binlog_status`` for the start-point
+        # fence check (G147). Best-effort and separate, like the RDS retention read.
+        try:
+            engine = self._engine_factory(self._config)
+            with engine.connect() as connection:
+                erows = connection.execute(
+                    text("SHOW GLOBAL STATUS LIKE 'aurora_enhanced_binlog'")
+                ).fetchall()
+            for erow in erows:
+                if len(erow) >= 2 and str(erow[0]).strip().lower() == "aurora_enhanced_binlog":
+                    result["aurora_enhanced_binlog_status"] = str(erow[1]).strip()
+        except Exception:  # noqa: BLE001 - not Aurora / no access -> key absent
+            pass
         return result
 
     def cdc_prerequisites(self, table_names, *, publication_name="", slot_name=""):

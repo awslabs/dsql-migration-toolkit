@@ -55,9 +55,12 @@ CDC_ONLY = MigrationType.CDC_ONLY
 
 T1 = datetime(2026, 10, 14, 1, 0, tzinfo=timezone.utc)
 T2 = T1 + timedelta(hours=2)
-# The Full Load the first stack streamed from (W1), and the Full load only Append re-run (W2).
-W1 = Watermark(snapshot_timestamp=T1, binlog_file="mysql-bin.000090", binlog_position=4)
-W2 = Watermark(snapshot_timestamp=T2, binlog_file="mysql-bin.000100", binlog_position=4)
+# The Full Load the first stack streamed from (W1), and the Append re-run (W2). Fenced binlog
+# positions, as a Full load + CDC run records them (G147).
+W1 = Watermark(snapshot_timestamp=T1, binlog_file="mysql-bin.000090", binlog_position=4,
+               start_point_fence="flush")
+W2 = Watermark(snapshot_timestamp=T2, binlog_file="mysql-bin.000100", binlog_position=4,
+               start_point_fence="flush")
 # PostgreSQL: a Full load + CDC re-run creates its slot again at its own snapshot point.
 PG_W2 = Watermark(
     snapshot_timestamp=T2, wal_lsn="0/5A000060", slot_name="dsqlmig_dsql_cdc_e2e26pg_a1b2",
@@ -349,9 +352,9 @@ def test_cdc_only_names_the_type_switch_for_the_re_run(monkeypatch) -> None:
         "This migration started CDC from an earlier start point before this Full Load ran, and "
         "the Full Load found rows already on the target. Start CDC begins at its watermark, so if "
         "the Full Load appended to them, run it again choosing 'Drop & reload' before Start CDC "
-        "(CDC only has no Full Load step: switch the migration type to Full load only for that "
-        "run, then back to CDC only). An append keeps those rows as they were, and CDC from a "
-        "watermark carries only the changes after it."
+        "(CDC only has no Full Load step: switch the migration type to Full load + CDC for that "
+        "run, whose Full Load makes the CDC start point exact). An append keeps those rows as "
+        "they were, and CDC from a watermark carries only the changes after it."
     )
     texts = " ".join(_card(state, _job(W2)).texts)
     assert _CONDITION_LABEL in texts and body in texts

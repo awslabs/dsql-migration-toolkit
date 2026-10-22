@@ -80,7 +80,9 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   満たされるまで **CDC をブロック**します。**Full Load のみの場合はこれらは一切不要です。**
   - **MySQL ソース:** バイナリログが **ROW 形式かつ完全な行イメージ**(full row image)で
     有効になっており(`binlog_format=ROW`、`binlog_row_image=FULL`)、**レプリケーション権限**
-    を持つユーザーが必要です。また、Full Load のウォーターマーク(watermark)時点のログが
+    を持つユーザーが必要です。さらに、ソースが `gtid_mode=ON` でない限り Full load + CDC の実行には
+    `RELOAD` も必要で、enhanced binlog を使う Aurora MySQL では、そのような実行に `gtid_mode=ON` が
+    必要です。また、Full Load のウォーターマーク(watermark)時点のログが
     CDC 開始時まで残るように、**binlog の保持期間を延長**する必要があります(Aurora MySQL は
     デフォルトで 24 時間しか binlog を保持しません)。RDS/Aurora ではこれらは `my.cnf` ではなく、
     パラメータグループと `mysql.rds_set_configuration` で設定します —

@@ -31,10 +31,13 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 - 네트워크로 접근 가능한 소스 데이터베이스 — **Amazon RDS 또는 Aurora MySQL**, 혹은 **Amazon
   RDS 또는 Aurora PostgreSQL**. 스키마와 데이터를 읽을 수 있는 사용자면 됩니다. Evaluation,
   Schema Conversion, Full Load, Validation에는 읽기 전용으로 충분하며, MySQL 소스(그리고 Full
-  Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다. 유일한 예외는 **PostgreSQL CDC**
-  입니다. Full Load 일관성 지점에서 도구가 마이그레이션 대상 테이블에 정확히 한정된 논리 복제
-  슬롯과 publication을 생성하고(AUTOCOMMIT, 소규모 허용 목록으로 제한, 감사 기록), 정리(teardown)
-  시 삭제합니다. 이것이 도구가 어떤 소스에든 하는 유일한 쓰기입니다.
+  Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다. `gtid_mode=ON`이 아닌 소스에서
+  MySQL **Full load + CDC** 실행은 CDC 시작 지점을 기록한 직후 `FLUSH BINARY LOGS`도 한 번
+  실행하므로, 그 실행에 쓰는 사용자에게는 `RELOAD`가 필요합니다(데이터를 쓰지 않고 테이블도 잠그지
+  않으며, binlog가 새 파일로 넘어갑니다. [§3.5](03-full-load.md#35-워터마크--cdc로의-다리) 참조). 쓰기를
+  하는 유일한 예외는 **PostgreSQL CDC**입니다. Full Load 일관성 지점에서 도구가 마이그레이션 대상
+  테이블에 정확히 한정된 논리 복제 슬롯과 publication을 생성하고(AUTOCOMMIT, 소규모 허용 목록으로
+  제한, 감사 기록), 정리(teardown) 시 삭제합니다. 이것이 도구가 어떤 소스에든 하는 유일한 쓰기입니다.
   - **지원 소스 엔진 및 버전** — 두 소스 경로(Schema Conversion + Full Load + CDC + cut over)
     모두 실제 인프라에서 end-to-end로 검증됨:
     - **RDS for MySQL** 5.7 / 8.0 / 8.4, **Aurora MySQL** 5.7(v2) / 8.0(v3) / 8.4.
@@ -98,7 +101,11 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
   `wal_level=logical`을 설정하고 재시작합니다. (PostgreSQL에는 `binlog_format`/`binlog_row_image`에
   해당하는 것이 없습니다.)
 - **복제 권한을 가진 소스 사용자.** **MySQL:** `SELECT`, `REPLICATION CLIENT`, `REPLICATION SLAVE`
-  (그리고 초기 스냅샷 정리에 쓰이는 `RELOAD`, `LOCK TABLES`). **PostgreSQL:** CDC 사용자는 논리
+  (그리고 초기 스냅샷 정리에 쓰이는 `RELOAD`, `LOCK TABLES`). `RELOAD`는 Full load + CDC 실행이
+  `FLUSH BINARY LOGS`를 실행하는 데에도 쓰입니다. 소스가 `gtid_mode=ON`이 아닐 때 이 명령이 CDC 시작
+  지점을 정확하게 맞춥니다([3장 §3.5](03-full-load.md#35-워터마크--cdc로의-다리)). enhanced binlog를
+  쓰는 Aurora MySQL에서는 그런 실행에 대신 `gtid_mode=ON`이 필요합니다. MySQL 8.0.19 이상에서는
+  애플리케이션이 XA 트랜잭션을 쓰면 `XA_RECOVER_ADMIN`도 부여하세요. **PostgreSQL:** CDC 사용자는 논리
   복제 슬롯을 생성·읽을 수 있어야 합니다 — **superuser**이거나, **REPLICATION 역할 속성**
   (`pg_roles.rolreplication`)을 갖거나, **`rds_replication`** 멤버(RDS/Aurora에서는 REPLICATION
   속성을 직접 부여할 수 없음)이면 통과합니다. 스냅샷을 위해 마이그레이션 대상 테이블에 대한
@@ -135,8 +142,13 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
   `OFF_PERMISSIVE`, `ON_PERMISSIVE`이면 binlog `file:position`을 쓰며, 한 소스에서는 똑같이
   동작합니다. Full Load부터 cut over까지 모드를 바꾸지 마세요: `gtid_mode`가 `ON`이 아닐 때 기록된
   시작 지점으로는 — 또는 `gtid_mode`가 `ON`이 아닐 때 마지막으로 시작한 CDC 스택으로는 — `ON`이 된
-  뒤 CDC를 시작할 수 없습니다([6장](06-limitations.md)). 게이트는 GTID 부재를 차단이 아니라
-  정보성으로 보고합니다. (PostgreSQL에는 GTID / `file:position` 개념이 없습니다.)
+  뒤 CDC를 시작할 수 없습니다([6장](06-limitations.md)). 게이트는 GTID 부재를 정보성으로 보고합니다.
+  다만 GTID가 없으면 Full load + CDC 실행은 `FLUSH BINARY LOGS`로 그 `file:position` 시작 지점을
+  정확하게 맞추며, 여기에는 `RELOAD`가 필요합니다. enhanced binlog를 쓰는 Aurora MySQL에서는 도구가
+  이에 의존하지 않으므로, 그런 소스의 Full load + CDC 실행에는 `gtid_mode=ON`이 필요하고(또는
+  enhanced binlog를 꺼야 합니다 — 어느 쪽이든 라이터 재부팅이 필요합니다), 그때까지 **CDC start point
+  can be made exact**가 실행을 차단합니다([§3.5](03-full-load.md#35-워터마크--cdc로의-다리)).
+  (PostgreSQL에는 GTID / `file:position` 개념이 없습니다.)
 - **PostgreSQL 소스 — CDC는 클러스터 라이터에서 실행해야 합니다.** 소스는 **스탠바이가 아니라
   라이터**여야 합니다(`pg_is_in_recovery()`가 false여야 함) — 스탠바이는 복제 슬롯을 호스팅할 수
   없으므로 CDC를 라이터 엔드포인트로 향하게 하세요.

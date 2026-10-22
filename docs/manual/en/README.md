@@ -30,7 +30,10 @@ migration**, and the path depends on the source engine: **MySQL sources** take t
 sources** skip the dialect step and take a **near-identity** PostgreSQL-16 → DSQL
 path (value pass-through, same wire, reduced only to DSQL's constraints and
 unsupported types). A **MySQL source (and a PostgreSQL Full-Load-only migration)
-is never written**; the single exception is **PostgreSQL CDC**, where at the Full
+is never written** — a MySQL Full load + CDC run on a source not running
+`gtid_mode=ON` only issues one `FLUSH BINARY LOGS` right after recording CDC's start
+point (it needs `RELOAD`; no data is written); the single exception that writes is
+**PostgreSQL CDC**, where at the Full
 Load consistency point the tool creates — and at teardown drops — a pgoutput
 logical replication slot and a publication scoped to exactly the migrated tables;
 it also sets `REPLICA IDENTITY FULL` on a re-keyed table and adds a table selected

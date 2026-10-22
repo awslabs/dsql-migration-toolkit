@@ -83,7 +83,9 @@ fails **loudly** where it can't.
   **blocks CDC** until they are met; **Full Load alone needs none of this.**
   - **MySQL source:** binary logging on in **ROW format with a full row image**
     (`binlog_format=ROW`, `binlog_row_image=FULL`) and a user with **replication
-    privileges**. You must also **raise binlog retention** so the log at the Full
+    privileges** — plus `RELOAD` for a Full load + CDC run unless the source runs
+    `gtid_mode=ON`, which Aurora MySQL with enhanced binlog requires for such a run. You
+    must also **raise binlog retention** so the log at the Full
     Load watermark survives until CDC starts (Aurora MySQL keeps binlogs only 24 h
     by default). On RDS/Aurora these are set via parameter groups and
     `mysql.rds_set_configuration`, not `my.cnf` — see

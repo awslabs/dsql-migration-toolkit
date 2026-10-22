@@ -77,13 +77,14 @@ CDC_ONLY = MigrationType.CDC_ONLY
 FL_CDC = MigrationType.FULL_LOAD_AND_CDC
 
 # The condition, in the notice (card, dialog, click) right after the route's "then Start CDC on the
-# new stack." -- the manual's words, with the type switch CDC only needs for a Full Load re-run.
+# new stack." -- the manual's words, with the type switch CDC only needs for a Full Load re-run
+# (G147: to Full load + CDC, whose Full Load makes the start point exact).
 _RELOAD_FIRST = (
     "That Start begins at the Full Load's watermark, so if that Full Load appended to rows already "
     "on the target, run it again choosing 'Drop & reload' before that Start (CDC only has no Full "
-    "Load step: switch the migration type to Full load only for that run, then back to CDC only). "
-    "An append keeps those rows as they were, and CDC from a watermark carries only the changes "
-    "after it."
+    "Load step: switch the migration type to Full load + CDC for that run, whose Full Load makes "
+    "the CDC start point exact). An append keeps those rows as they were, and CDC from a "
+    "watermark carries only the changes after it."
 )
 # The one-line forms: the disabled Start's tooltip, and the job's first line after the prefix.
 _ROUTE_LINE = (

@@ -37,10 +37,14 @@ from dsql_migrator.ui.data_migration import DataMigrationState, MigrationType, _
 from dsql_migrator.ui.data_migration import _cdc_status as st
 
 _NOW = datetime(2026, 10, 12, 1, 0, tzinfo=timezone.utc)
-# The Full Load the stack was started from (W1), and the detour's newer one (W2).
-_W1 = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000090", binlog_position=4)
-_W2 = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000100", binlog_position=4)
-_W0 = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000080", binlog_position=4)
+# The Full Load the stack was started from (W1), and the detour's newer one (W2). Fenced
+# binlog positions, as a Full load + CDC run records them (G147).
+_W1 = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000090", binlog_position=4,
+                start_point_fence="flush")
+_W2 = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000100", binlog_position=4,
+                start_point_fence="flush")
+_W0 = Watermark(snapshot_timestamp=_NOW, binlog_file="mysql-bin.000080", binlog_position=4,
+                start_point_fence="flush")
 _DEPLOYED = ("mysql-bin.000090", "4")
 _ROUTE_FL = (
     "To start from a new start point, use Delete CDC infrastructure and deploy it again (the "

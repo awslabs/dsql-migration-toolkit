@@ -949,6 +949,20 @@ class Watermark(BaseModel):
             "version."
         ),
     )
+    # Left OUT of the payload while empty, like gtid_mode above (extra="forbid").
+    start_point_fence: Optional[str] = Field(
+        default=None,
+        exclude_if=lambda v: not v,
+        description=(
+            "How a MySQL Full load + CDC run made this CDC start point exact before its "
+            "Full Load read (G147): 'gtid' (gtid_mode=ON -- the GTID set covers only "
+            "committed transactions) or 'flush' (FLUSH BINARY LOGS waited for every "
+            "transaction before the point to commit). None when no fence ran: a Full load "
+            "only run, a PostgreSQL source, or a watermark from an earlier version -- such a "
+            "binlog file:position can cover a transaction that was still committing when it "
+            "was read, which neither the load nor CDC then copies."
+        ),
+    )
     wal_lsn: Optional[str] = Field(
         default=None,
         description=(
@@ -1178,6 +1192,10 @@ class PrerequisiteCheckId(str, Enum):
     BINLOG_ROW_FORMAT = "BINLOG_ROW_FORMAT"
     BINLOG_RETENTION = "BINLOG_RETENTION"
     GTID_MODE = "GTID_MODE"
+    # MySQL Full load + CDC: can the CDC start point be made exact before the Full Load
+    # reads (G147)? gtid_mode=ON, or RELOAD for FLUSH BINARY LOGS -- not on Aurora with
+    # enhanced binlog unless gtid_mode=ON. Not persisted (reports are not saved).
+    START_POINT_FENCE = "START_POINT_FENCE"
     MSK_AVAILABLE = "MSK_AVAILABLE"
     MSK_CONNECT_AVAILABLE = "MSK_CONNECT_AVAILABLE"
     # CDC-only, PostgreSQL source: logical-replication readiness (pgoutput + a slot).
@@ -1312,6 +1330,11 @@ class PrerequisiteCheckRequest(BaseModel):
     # supply every key column, and the checker cannot derive this map -- it comes from the
     # APPLIED target DDL. Empty means no table was re-keyed.
     message_key_columns: dict[str, list[str]] = Field(default_factory=dict)
+    # G147 (MySQL CDC): this migration's Full Load records CDC's start point and makes it
+    # exact (Full load + CDC: its first run and every Re-run Full Load / Re-run all tables), so
+    # START_POINT_FENCE is graded; False (CDC only, which runs no Full Load) SKIPs it.
+    # Defaults True so every existing caller keeps the graded row.
+    records_start_point: bool = True
     # G17 (PostgreSQL, Full load + CDC after its Full Load, before CDC starts): selected
     # tables the Full Load did not load and CDC does not capture yet. Their guarded load
     # (Retry unfinished tables) adds them to CDC's publication before their copy starts, so

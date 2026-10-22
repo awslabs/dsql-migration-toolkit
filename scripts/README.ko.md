@@ -3,8 +3,9 @@
 _언어: [English](README.md) | **한국어**_
 
 이 헬퍼 스크립트들은 웹 UI를 열지 않고도 명령줄에서 **Full Load를 실행**하고 그 결과를 독립적으로
-**검증**할 수 있게 해 줍니다 — 도구 자체 엔진을 사용합니다. 소스 MySQL은 항상 **읽기 전용**으로만
-접근합니다.
+**검증**할 수 있게 해 줍니다 — 도구 자체 엔진을 사용합니다. 소스 MySQL은 **읽기 전용**으로
+접근합니다. 단, `run_full_load.py --watermark-out`은 Full load + CDC 실행이라, 소스가
+`gtid_mode=ON`이 아니면 워터마크 직후 `FLUSH BINARY LOGS`를 실행합니다(아래 참조).
 
 | 스크립트 | 하는 일 | DSQL에 쓰나? |
 |---|---|---|
@@ -31,7 +32,7 @@ _언어: [English](README.md) | **한국어**_
 
   | 변수 | 대상 | 비고 |
   |---|---|---|
-  | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | 소스 **MySQL** | 읽기 전용 연결 |
+  | `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` | 소스 **MySQL** | 읽기 전용 연결(소스가 `gtid_mode=ON`이 아니면 `--watermark-out`에는 `RELOAD`도 필요) |
   | `TARGET_ENDPOINT` | 타깃 **Aurora DSQL** | 예: `your-cluster-id.dsql.<region>.on.aws` |
   | `TARGET_REGION` | DSQL | 선택 — 엔드포인트에서 자동 도출 |
   | `TARGET_DATABASE`, `TARGET_USERNAME` | DSQL | 기본값 `postgres` / `admin` |
@@ -74,7 +75,11 @@ set -a; source .env; set +a
 - `--clean`: 적재 전 각 타깃 테이블을 변환된 DDL로 DROP + 재생성(DSQL에는 TRUNCATE 없음).
   **⚠️ 파괴적** — 해당 테이블의 기존 타깃 데이터를 버립니다; 새로 적재할 때 사용.
 - `--watermark-out <파일>`: 캡처한 binlog/GTID 워터마크를 저장해, 이후 CDC를 바로 그 지점부터 누락 없이
-  시작할 수 있게 합니다.
+  시작할 수 있게 합니다. 이 옵션을 쓰면 **Full load + CDC** 실행이 됩니다. 소스가 `gtid_mode=ON`이
+  아니면 워터마크를 기록한 직후 `FLUSH BINARY LOGS`를 실행해(`RELOAD` 필요, binlog가 새 파일로 넘어감)
+  아직 commit 중인 트랜잭션이 그 위치에 들어가지 않게 합니다. `gtid_mode=ON` 없이 enhanced binlog를 쓰는
+  Aurora MySQL이거나 XA 트랜잭션이 준비 상태로 남아 있으면 어떤 테이블도 읽기 전에 멈춥니다. 큰 테이블은
+  여러 reader shard로 읽힐 수 있으며, 그 결과는 워터마크부터 CDC가 다시 적용해야 일관됩니다(매뉴얼 §3.5).
 
 테이블 크기와 무관하게 메모리는 테이블당 한 페이지로 제한(keyset 스트리밍)되므로, 매우 큰
 테이블에도 안전합니다. 모든 테이블이 적재되면 `0`으로 종료; 한 테이블이라도 실패하거나 행이

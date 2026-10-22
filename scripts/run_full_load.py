@@ -17,7 +17,10 @@ What it does, faithfully reusing the shipped engine:
      ``INSERT ... ON CONFLICT`` batches with OCC retry (memory stays bounded to
      one page per table regardless of size; large-scale safe).
   4. Captures the binlog/GTID watermark and (optionally) writes it to a file, so
-     you can start CDC gaplessly from exactly that point afterwards.
+     you can start CDC gaplessly from exactly that point afterwards. With
+     ``--watermark-out`` the run is a Full load + CDC one: unless the source runs
+     ``gtid_mode=ON``, it issues ``FLUSH BINARY LOGS`` right after recording the binlog
+     position (needs RELOAD), so the position covers no transaction still committing.
 
 Two load modes:
   * default (idempotent): inserts only the rows not already on the target
@@ -28,11 +31,14 @@ Two load modes:
     before loading (DSQL has no TRUNCATE). ⚠️ DESTRUCTIVE — it discards existing
     target data for those tables. Use for a fresh load.
 
-The source is only ever READ. Nothing runs until you pass ``--yes``; without it
-the script prints the plan and exits.
+The source is only ever READ (apart from that one ``FLUSH BINARY LOGS`` with
+``--watermark-out``). Nothing runs until you pass ``--yes``; without it the script prints
+the plan and exits.
 
 Connection settings come from the environment / ``.env`` (copy ``.env.example``):
-  DB_HOST, DB_PORT, DB_USER, DB_PASSWORD                 (source MySQL, read-only)
+  DB_HOST, DB_PORT, DB_USER, DB_PASSWORD                 (source MySQL, read-only;
+                                                          RELOAD too for --watermark-out
+                                                          unless gtid_mode=ON)
   TARGET_ENDPOINT, TARGET_REGION, TARGET_DATABASE, TARGET_USERNAME  (Aurora DSQL)
 The DSQL side authenticates with a short-lived IAM token (no password); your AWS
 credentials must be able to connect to the cluster.
@@ -95,7 +101,9 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true",
                     help="actually run (without it, prints the plan and exits)")
     ap.add_argument("--watermark-out", default="",
-                    help="write the captured binlog/GTID watermark to this JSON file")
+                    help="write the captured binlog/GTID watermark to this JSON file; makes "
+                         "the run a Full load + CDC one (FLUSH BINARY LOGS right after the "
+                         "watermark unless gtid_mode=ON; needs RELOAD)")
     ap.add_argument("--timeout", type=float, default=7200.0,
                     help="max seconds to wait for the load (default 7200)")
     args = ap.parse_args()
@@ -179,6 +187,8 @@ def main() -> int:
     log(f"  clean (DROP+recreate target before load): {args.clean}")
     if args.watermark_out:
         log(f"  watermark -> {args.watermark_out}")
+        log("  Full load + CDC: unless the source runs gtid_mode=ON, FLUSH BINARY LOGS "
+            "right after the watermark (needs RELOAD; the binlog moves to a new file)")
     if not args.yes:
         log("[plan only] re-run with --yes to execute"
             + (" (DESTRUCTIVE: --clean DROPs+recreates the target tables)."
@@ -189,6 +199,8 @@ def main() -> int:
         source_config=source, source_password=password, target_config=target,
         inventory=inventory, aws_profile=os.environ.get("AWS_PROFILE"),
         replace_tables=frozenset(wanted) if args.clean else frozenset(),
+        # A watermark written out is for CDC: make its start point exact (G147).
+        is_cdc_migration=bool(args.watermark_out),
     )
     migrator = default_migrator_factory(inputs)
     error_log = ErrorLogStore()
@@ -227,6 +239,8 @@ def main() -> int:
             "gtid_executed": wm.gtid_executed,
             "server_uuid": wm.server_uuid,
             "snapshot_timestamp": wm.snapshot_timestamp.isoformat(),
+            "gtid_mode": wm.gtid_mode,
+            "start_point_fence": wm.start_point_fence,
         }
         json.dump(out, open(args.watermark_out, "w", encoding="utf-8"), indent=2)
         log(f"Watermark written to {args.watermark_out} "

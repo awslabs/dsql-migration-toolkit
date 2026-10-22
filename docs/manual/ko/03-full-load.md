@@ -34,7 +34,10 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 5. 이후 보조 **인덱스** 빌드.
 
 소스는 일관된 스냅샷 안에서 **읽기 전용**으로 읽히며, 로더는 절대 수정하지 않습니다. MySQL 소스는 —
-그리고 PostgreSQL의 Full Load 전용 마이그레이션도 — 절대 쓰이지 않습니다. 유일한 예외는 **PostgreSQL
+그리고 PostgreSQL의 Full Load 전용 마이그레이션도 — 절대 쓰이지 않습니다. `gtid_mode=ON`이 아닌
+소스에서 MySQL **Full load + CDC** 실행은 읽기 외의 구문 하나(**`FLUSH BINARY LOGS`**)를 CDC 시작
+지점을 기록한 직후, 어떤 테이블도 읽기 전에 실행합니다: `RELOAD`가 필요하고, 데이터를 쓰지 않으며,
+테이블을 잠그지 않고, binlog가 새 파일로 넘어갑니다(§3.5). 쓰기를 하는 유일한 예외는 **PostgreSQL
 CDC**입니다: 워터마크 시점(§3.5)에 도구가 논리 복제 슬롯과, 정확히 마이그레이션 대상 테이블로만 한정된
 publication(`FOR TABLE ONLY`: 테이블의 상속 자식 테이블은 함께 추가되지 않고 — Full Load도 그 테이블 자신의
 행만 읽음(`FROM ONLY`, [§6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함) 참고) —
@@ -195,8 +198,8 @@ PostgreSQL-16 wire(양쪽 모두 psycopg)이므로 DSQL이 지원하는 값은 �
 
 ## 3.5 워터마크 — CDC로의 다리
 
-적재 전 도구는 **워터마크**를 캡처합니다: 같은 일관 스냅샷 트랜잭션 안에서 기록되는 소스 변경
-스트림의 일관된 지점입니다. 모든 워터마크는 **UTC 스냅샷 타임스탬프**와 테이블별 **근사** 행 수(스캔
+적재 전 도구는 **워터마크**를 캡처합니다: CDC가 시작할 소스 변경 스트림의 지점으로, 어떤 테이블도
+읽기 전에 기록됩니다. 모든 워터마크는 **UTC 스냅샷 타임스탬프**와 테이블별 **근사** 행 수(스캔
 없는 `information_schema` 추정 — 단순 카운트를 위해 소스를 풀스캔하지 않음)를 담습니다. 엔진별 좌표는
 다릅니다:
 
@@ -213,11 +216,39 @@ PostgreSQL-16 wire(양쪽 모두 psycopg)이므로 DSQL이 지원하는 값은 �
   PostgreSQL에는 GTID / `server_uuid` 개념이 없고 `SHOW BINARY LOG STATUS`도 없습니다 — LSN은 생성된
   슬롯에서 옵니다.
 
-워터마크는 이후 **무손실 CDC 핸드오프**를 가능하게 합니다: CDC가 스냅샷이 끝난 바로 그 지점부터 변경을
-스트리밍 — 갭도 중복도 없음([4장](04-cdc-and-dsql-constraints.md) 참조). CDC 사전 조건이 충족되지 않으면 —
+워터마크는 이후 **무손실 CDC 핸드오프**를 가능하게 합니다. 테이블마다 워터마크 이후에 연 자신의 일관
+스냅샷으로 읽고, CDC는 워터마크 이후의 모든 변경을 다시 적용합니다. 스냅샷과 CDC 양쪽에 있는 변경은 두 번
+적용되지만 기본 키 기준의 멱등 upsert / delete라 무해합니다([4장](04-cdc-and-dsql-constraints.md) 참조).
+그래서 워터마크는 스냅샷이 볼 수 없는 트랜잭션을 포함하면 안 됩니다:
+
+- `gtid_mode=ON`인 MySQL 소스에서는 그럴 일이 없습니다. GTID는 트랜잭션의 InnoDB commit이 끝난 뒤에야
+  `gtid_executed`에 들어갑니다.
+- binlog 파일 + 위치는 그럴 수 있습니다. MySQL은 트랜잭션을 InnoDB에 commit하기 전에 binlog에 먼저
+  기록하므로, 그 사이에 읽은 위치는 아직 어떤 스냅샷도 볼 수 없는 트랜잭션을 포함하고, CDC는 그 뒤부터
+  시작합니다. 그래서 **Full load + CDC** 실행은 위치를 기록한 직후, 어떤 테이블도 읽기 전에
+  **`FLUSH BINARY LOGS`** 구문을 실행합니다. MySQL은 새 binlog 파일로 바꾸기 전에 이미 binlog에 들어간
+  트랜잭션이 모두 commit될 때까지 기다립니다(보통 수 밀리초, 그동안 새 commit도 기다림). **RELOAD** 권한이
+  필요하고, 테이블은 잠그지 않으며, binlog가 새 파일로 넘어갑니다. 활동 로그에 기록됩니다. **enhanced
+  binlog**를 쓰는 Aurora MySQL에서는 도구가 이 대기에 의존하지 않으므로, 그런 소스의 Full load + CDC
+  실행에는 `gtid_mode=ON`이 필요합니다(또는 enhanced binlog를 꺼야 합니다). 사전 조건
+  **CDC start point can be made exact**가 각 Full load + CDC 실행 전에 둘 다 확인합니다.
+- 워터마크 이전에 `XA PREPARE`되고 테이블을 읽은 뒤 commit된 트랜잭션은 어느 쪽에도 복사되지 않으므로,
+  실행은 발견한 준비 상태의 XA 트랜잭션(`XA RECOVER`)을 최대 30초 기다리고, 그래도 남아 있으면 멈춥니다.
+  MySQL 8.0.19 이상에서는 `XA RECOVER`에 `XA_RECOVER_ADMIN`이 필요하며, 이 권한이 없으면 실행은 경고를
+  기록하고 계속합니다.
+
+**Full load only** 실행은 `FLUSH`를 실행하지 않습니다. 스냅샷만 복사하고 그 이후는 복사하지 않으므로,
+모든 변경이 들어가야 한다면 먼저 소스 쓰기를 멈추세요. 따라서 `gtid_mode=ON`이 아닌 소스에서 그
+워터마크는 이전 버전의 도구가 기록한 워터마크와 마찬가지로 정확하게 맞춰지지 않으므로, 나중에 그
+워터마크에서 Start CDC를 하면 *This start point was recorded without waiting for in-flight commits*가
+표시됩니다. 이 때문에 CDC only에서는 Full Load를 Full load + CDC로 다시
+실행합니다. CDC 사전 조건이 충족되지 않으면 —
 MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경우, PostgreSQL에서는 `wal_level`이 `logical`이
 아니거나 슬롯/publication을 만들 수 없는 경우(복제 권한 누락 또는 standby 엔드포인트) — 좌표가 우아하게
-비워지고 그 경우 CDC 핸드오프만 못 받을 뿐 Full Load는 정상 동작합니다.
+비워지고 그 경우 CDC 핸드오프만 못 받을 뿐 Full Load는 정상 동작합니다. 예외는 binlog 위치를 정확하게
+맞출 수 없는 MySQL **Full load + CDC** 실행입니다(`RELOAD` 없음, `gtid_mode=ON` 없이 enhanced binlog 사용,
+또는 아직 준비 상태인 XA 트랜잭션). 이 실행은 어떤 테이블도 읽기 전에 멈추고 해결 방법을 알려 주며, 다시
+시도할 테이블을 남기지 않으므로 원인을 고친 뒤 다시 시작하세요.
 
 > 워터마크의 행 수는 **의도적으로 근사**입니다(소스 부담 최소화). 정확한 `COUNT(*)`와 체크섬은
 > **Validation**([5장](05-validation.md))의 역할이지 Full Load가 아닙니다.
@@ -292,9 +323,9 @@ MySQL에서는 바이너리 로깅이 꺼져 있거나 권한이 제한된 경�
   the start offset that Start offered is no longer known …*). CDC only 경로는 새 스택을 Full Load의
   워터마크에서 시작하므로, 거부된 지점이 그 워터마크(Automatic)이면 거부가 그 경로의 조건을 덧붙입니다:
   그 Full Load가 타깃에 이미 있던 행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요.
-  CDC only에는 Full Load 단계가 없으므로 그 실행 동안 마이그레이션 유형을 Full load only로 바꾼 뒤 다시
-  CDC only로 돌아옵니다(append는 그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 변경만
-  가져옵니다). 비활성화된 Start의 툴팁과 작업의 오류에서는 그 경로가 *Delete CDC infrastructure and deploy it
+  CDC only에는 Full Load 단계가 없으므로 그 실행 동안 마이그레이션 유형을 Full load + CDC로 바꿉니다.
+  그 실행의 Full Load가 CDC 시작 지점을 정확하게 맞춥니다(append는 그 행을 그대로 두고, 워터마크에서
+  시작한 CDC는 그 뒤의 변경만 가져옵니다). 비활성화된 Start의 툴팁과 작업의 오류에서는 그 경로가 *Delete CDC infrastructure and deploy it
   again, then Start CDC (if the Full Load appended to rows already on the target, re-run it choosing
   'Drop & reload' first)*로 표시됩니다. 새 스택에서는 그 Start가 거부되지 않으며, 이 세션이 그
   Full Load가 앞선 복사본 위에 append했을 수 있음을 보여 주면 CDC 단계가 그 Start
@@ -380,8 +411,9 @@ Full load + CDC에서는 CDC를 시작하기 전까지 로드 후에 테이블�
 > **명령줄에서 Full Load 실행 (선택).** 동일한 벌크 로더를 CLI 스크립트로도 쓸 수 있습니다 —
 > `scripts/run_full_load.py`(먼저 계획 출력, 그다음 `--yes`; 선택적으로 `--clean`,
 > CDC 워터마크 캡처용 `--watermark-out`) — 웹 UI 없이 자동화나 대용량 실행에 유용합니다. 자세한 내용은
-> [`scripts/README.md`](../../../scripts/README.md) 참고. 소스는 읽기 전용(유일한 예외는 §3.1에서 설명한
-> PostgreSQL-CDC 슬롯과 publication)이며, 로드는 UI와 똑같이 멱등입니다.
+> [`scripts/README.md`](../../../scripts/README.md) 참고. 소스는 읽기 전용(`--watermark-out`을 쓰면
+> Full load + CDC 실행이 되므로, 소스가 `gtid_mode=ON`이 아니면 워터마크 직후 `FLUSH BINARY LOGS`를
+> 실행하며 여기에는 `RELOAD`가 필요함, §3.5)이며, 로드는 UI와 똑같이 멱등입니다.
 
 ---
 

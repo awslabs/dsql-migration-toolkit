@@ -23,8 +23,11 @@ PostgreSQL)을 그대로 대체하는 드롭인 대체재가 **아니라** 고�
       [§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)
 
 - [ ] **소스는 거의 모든 경로에서 읽기 전용입니다.** MySQL, 그리고 PostgreSQL Full Load 전용
-      마이그레이션에서는 도구가 소스에 절대 쓰지 않으며 읽기 가능한 사용자면 충분합니다. 유일한 예외는
-      **PostgreSQL CDC**입니다: Full Load 일관성 지점에서 도구가 논리 복제 슬롯과 마이그레이션 대상
+      마이그레이션에서는 도구가 소스에 절대 쓰지 않으며 읽기 가능한 사용자면 충분합니다 — 단,
+      `gtid_mode=ON`이 아닌 소스에서 MySQL **Full load + CDC** 실행은 CDC 시작 지점을 기록한 직후
+      `FLUSH BINARY LOGS`를 한 번 실행하므로, 그 실행에 쓰는 사용자에게는 `RELOAD`가 필요합니다(데이터를
+      쓰지 않고 테이블도 잠그지 않으며, binlog가 새 파일로 넘어가고, 감사 기록됨). 쓰기를 하는 유일한
+      예외는 **PostgreSQL CDC**입니다: Full Load 일관성 지점에서 도구가 논리 복제 슬롯과 마이그레이션 대상
       테이블에만 한정된 퍼블리케이션을 생성하고 — teardown 시점에 다시 삭제합니다. 또한 재키잉된
       테이블에 `REPLICA IDENTITY FULL`을 설정하고, Full load + CDC에서 CDC를 시작하기 전에는 Full Load
       이후 선택한 테이블을 그 퍼블리케이션에 추가합니다(자동 커밋, 소규모 allowlist로 제한, 감사 기록).

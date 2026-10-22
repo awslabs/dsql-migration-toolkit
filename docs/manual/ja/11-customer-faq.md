@@ -29,6 +29,9 @@ PostgreSQL ソース** の場合で、Full Load の一貫性地点で、移行�
 レプリケーションスロットと publication を作成（そして teardown 時に削除）し、再キー化したテーブルに
 `REPLICA IDENTITY FULL` を設定し、Full Load の後に選択したテーブルをその publication に追加します（Full
 load + CDC、CDC を開始する前）— いずれも autocommit で、allowlist に限定され、監査される操作です。MySQL ソース（および Full Load のみの PostgreSQL 移行）には一切書き込みません。
+`gtid_mode=ON` でないソースでの MySQL の Full load + CDC 実行は、CDC の開始位置を記録した直後に
+`FLUSH BINARY LOGS` を 1 回実行します（`RELOAD` が必要で、データは書き込まず、テーブルはロックせず、
+binlog は新しいファイルに移ります）。
 
 
 **Q2. Aurora DSQL は私のソースエンジン（Aurora MySQL / PostgreSQL）のドロップイン代替になりますか？**
@@ -453,6 +456,8 @@ DSQL に書き込んだ **後** は、それらの新しい行は DSQL に **の
 
 ソースは **MySQL または PostgreSQL** への通常の読み取り専用接続を使用します（パスワード、または AWS Secrets
 Manager のユーザー名/パスワード — **IAM ではありません**。IAM トークン認証はターゲット DSQL 専用です）。
+CDC ではこれにレプリケーション権限が加わり、MySQL の Full load + CDC 実行では、ソースが `gtid_mode=ON`
+でない限り `RELOAD` も加わります（[§1.1](01-setup.md#11-前提条件)）。
 ターゲットは DSQL の **IAM トークン認証（DB パスワードなし）** を使用します。すべての接続は **TLS** を使用します。認証情報は **セッションごとのメモリ内にのみ** 存在し —
 ディスク、ログ、レポート、ジョブの状態に書き込まれることは決してありません。ログとレポートは主キーと件数を
 記録し、**行の値は決して記録しません**。オプションの AI アシスト（Amazon Bedrock、デフォルトではオフ）は
@@ -482,7 +487,7 @@ Manager のユーザー名/パスワード — **IAM ではありません**。I
 | 対象 | IAM アクション（最小） |
 |---|---|
 | **ターゲット DSQL（常時）** | `dsql:DbConnect`、`dsql:DbConnectAdmin`（IAM トークン発行）、`dsql:GetCluster` |
-| **ソース（常時）** | IAM アクションなし — 読み取り専用の MySQL または PostgreSQL ユーザー/パスワード（または下記の Secrets Manager シークレット） |
+| **ソース（常時）** | IAM アクションなし — 読み取り専用の MySQL または PostgreSQL ユーザー/パスワード（または下記の Secrets Manager シークレット）。CDC ではこれにレプリケーション権限が加わり、MySQL の Full load + CDC 実行では、ソースが `gtid_mode=ON` でない限り `RELOAD` も加わる |
 | **ソースシークレット（任意）** | `secretsmanager:GetSecretValue` — ソース認証情報が Secrets Manager シークレットにある場合のみ |
 | **AI アシスト（任意）** | `bedrock:InvokeModel`、`bedrock:InvokeModelWithResponseStream` — Fargate スタックでは `BedrockModelArns` で絞らない限りすべての Anthropic モデル(EC2 スタックは選択したモデルにスコープ)。AI を有効にした場合のみ |
 | **CDC — パイプラインのデプロイ/削除** | cdc-stack が必要とする広範なインフラ作成権限: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`、広範な `ec2:*`（VPC サブネット・NAT・EIP・ルートテーブル・セキュリティグループ・VPC エンドポイント・ネットワークインターフェイス）、`iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…（コネクタロール）、`kafka:*` / `kafkaconnect:*`（MSK Serverless + MSK Connect）、`logs:*`、プラグインバケットへの `s3:*`。Full Load のみの移行では **一切不要**。 |

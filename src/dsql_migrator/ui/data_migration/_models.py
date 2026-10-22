@@ -1953,6 +1953,7 @@ _PREREQ_CATEGORY_BY_CHECK: dict[PrerequisiteCheckId, PrereqCategory] = {
     PrerequisiteCheckId.BINLOG_ROW_FORMAT: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.BINLOG_RETENTION: PrereqCategory.SOURCE_CONFIG,
     PrerequisiteCheckId.GTID_MODE: PrereqCategory.SOURCE_CONFIG,
+    PrerequisiteCheckId.START_POINT_FENCE: PrereqCategory.SOURCE_CONFIG,
     # PostgreSQL logical-replication readiness: server settings and server privileges,
     # the same nature as the MySQL binlog/GTID rows above.
     PrerequisiteCheckId.WAL_LEVEL_LOGICAL: PrereqCategory.SOURCE_CONFIG,
@@ -5094,9 +5095,11 @@ def migration_type_tradeoff(
     Stated on the tile because that is where the decision is made. "Full load + CDC"
     carries the mirror-image note ("the CDC phase can be started later"), but an
     operator who reads only THIS tile -- the cheap, no-infrastructure one -- had no way
-    to know it was the one choice that forfeits a gapless handoff for good. MySQL is
-    unaffected: a CDC-only start seeds the connector from the watermark's binlog
-    coordinates, so the handoff stays gapless as long as the binlogs are retained.
+    to know it was the one choice that forfeits a gapless handoff for good. MySQL keeps
+    the handoff: a CDC-only start seeds the connector from the watermark's binlog
+    coordinates while the binlogs are retained -- though on a source not running
+    gtid_mode=ON that position was recorded without the commit fence (G147), which the
+    Full Load step's completion notice and the CDC step's start-point card say.
 
     Returns "" when there is nothing extra to say. Pure.
     """
@@ -5173,7 +5176,7 @@ def cdc_prerequisite_block_header(
 # Required FAILs that must NOT block the CDC actions. Everything not listed blocks -- see the
 # denylist rationale in cdc_prerequisite_block_reason.
 #
-# EXACTLY ONE entry, and the shortness is the point: an audit of all 23 check ids found that
+# Two entries, and the shortness is the point: an audit of all 23 check ids found that
 # every state which legitimately should not stop CDC is ALREADY graded required=False
 # (BINLOG_RETENTION, GTID_MODE, MSK_AVAILABLE, MSK_CONNECT_AVAILABLE, SELECT_GRANT_SCOPE, the
 # REPLICATION_GRANTS role downgrade, SLOT_WAL_RETENTION, the REPLICATION_SLOTS full-pool
@@ -5181,7 +5184,7 @@ def cdc_prerequisite_block_header(
 # REPLICA_IDENTITY_COVERS_KEY's unreadable-identity INFO). So the denylist cannot over-block
 # by accident -- the required flag already carries that distinction.
 #
-# TARGET_SCHEMA_READY is the one exception, and it is deliberate on two grounds. Its
+# TARGET_SCHEMA_READY is the first exception, and it is deliberate on two grounds. Its
 # remediation points OFF this screen ("Apply converted DDL for X in Step 2"), and the Deploy
 # card sits at the bottom of Prerequisites precisely so the MSK create can overlap the Full
 # Load -- which is what applies that DDL. Blocking here would forfeit the overlap to report a
@@ -5193,8 +5196,14 @@ def cdc_prerequisite_block_header(
 # and dead-letters every record for that table, and the app's own phase taxonomy already tags
 # it "Full Load + CDC" -- so the panel was rendering "CDC: Blocked" for it while both buttons
 # stayed enabled.
+#
+# START_POINT_FENCE (G147) is the second exception, on the same ground: it is the Full Load's
+# requirement (the fence runs inside a Full load + CDC run's watermark capture), whose run guard
+# holds the runs that record a start point. A Start CDC from a point already recorded runs no fence --
+# the start-point card says whether that point was made exact -- and holding the Deploy would
+# forfeit the overlap with the Full Load the recommended flow relies on.
 _CDC_NON_BLOCKING_FAILURES: frozenset = frozenset(
-    {PrerequisiteCheckId.TARGET_SCHEMA_READY}
+    {PrerequisiteCheckId.TARGET_SCHEMA_READY, PrerequisiteCheckId.START_POINT_FENCE}
 )
 
 

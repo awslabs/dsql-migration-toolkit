@@ -27,7 +27,11 @@ _言語: [English](../en/00-before-you-begin.md) | [한국어](../ko/00-before-y
 
 - [ ] **ソースはほぼすべての経路で読み取り専用です。** MySQL、および PostgreSQL の Full Load 専用
       マイグレーションでは、ツールがソースに書き込むことは決してなく、読み取り可能なユーザーで十分です。
-      唯一の例外は **PostgreSQL CDC** です: Full Load の一貫性ポイントで、ツールは論理レプリケーション
+      ただし、`gtid_mode=ON` でないソースでの MySQL の **Full load + CDC** 実行は、CDC の開始位置を
+      記録した直後に `FLUSH BINARY LOGS` を 1 回実行するため、そのユーザーには `RELOAD` が必要です
+      （データは書き込まれず、テーブルもロックされません。binlog は新しいファイルに移ります。監査
+      記録あり）。書き込みを伴う唯一の例外は **PostgreSQL CDC** です:
+      Full Load の一貫性ポイントで、ツールは論理レプリケーション
       スロットと、マイグレーション対象テーブルだけに限定したパブリケーションを作成し — teardown 時に
       再び削除します。また、再キー化したテーブルに `REPLICA IDENTITY FULL` を設定し、Full load + CDC で
       CDC を開始する前には、Full Load の後に選択したテーブルをそのパブリケーションに追加します（自動

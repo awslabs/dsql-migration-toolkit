@@ -1755,19 +1755,19 @@ def test_the_post_load_table_list_hold_carves_out_a_split_table(monkeypatch) -> 
 def test_the_cdc_only_remedies_go_through_full_load_and_cdc_for_a_split_table(
         monkeypatch) -> None:
     # FAILS WITHOUT THE FIX: CDC only's "switch the migration type to Full load only for that
-    # run" -- a switch refused while a table read in parts waits for CDC's replay.
+    # run" -- a switch refused while a table read in parts waits for CDC's replay. Since G147
+    # every MySQL CDC only re-run goes through Full load + CDC (its Full Load makes the start
+    # point exact), so the split table needs no route of its own.
     from dsql_migrator.ui.cdc_start_point_gate import drop_and_reload_rerun, reload_condition
     from dsql_migrator.ui.data_migration._cdc_ui import _reload_condition_notice
 
     from tests.test_g12_table_set_after_load import _Jobs
 
     plain_rerun, plain_note = drop_and_reload_rerun(MigrationType.CDC_ONLY)
-    assert "Full load only for that run" in plain_note
     rerun, note = drop_and_reload_rerun(MigrationType.CDC_ONLY, split=True)
-    assert rerun == plain_rerun
+    assert (rerun, note) == (plain_rerun, plain_note)
     assert note == (" (CDC only has no Full Load step: switch the migration type to Full load + "
-                    "CDC for that run; Full load only is refused while a table the Full Load "
-                    "read in parts waits for CDC's replay)")
+                    "CDC for that run, whose Full Load makes the CDC start point exact)")
     assert drop_and_reload_rerun(FLC, split=True) == drop_and_reload_rerun(FLC)
     assert note in reload_condition(MigrationType.CDC_ONLY, split=True)
     assert "Full load only for that run" not in reload_condition(MigrationType.CDC_ONLY,

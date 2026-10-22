@@ -352,7 +352,8 @@ def test_the_gtid_check_says_how_cdc_positions_on_each_mode() -> None:
             "which also survives a failover to a replica whose binary log files differ. If "
             "you change gtid_mode, do it before the Full Load (or Fetch current position) "
             "and keep it until cut over: Start CDC refuses a start point recorded while "
-            "gtid_mode was not ON once the source is ON."
+            "gtid_mode was not ON once the source is ON. Without it, a Full load + CDC run "
+            "needs what 'CDC start point can be made exact' checks."
         )
 
 

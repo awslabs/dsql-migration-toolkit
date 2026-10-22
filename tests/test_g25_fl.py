@@ -170,12 +170,21 @@ def test_a_new_snapshot_while_cdc_streams_provisions_nothing() -> None:
     ).endswith(_READ_ONLY)
 
 
-@pytest.mark.parametrize("engine,mtype", [(MY, FLC), (PG, FLO), (MY, FLO)])
-@pytest.mark.parametrize("keeps", [False, True])
+@pytest.mark.parametrize("engine,mtype,keeps", [
+    (MY, FLC, True), (PG, FLO, False), (PG, FLO, True), (MY, FLO, False), (MY, FLO, True),
+])
 def test_every_other_engine_and_type_only_reads_the_source(engine, mtype, keeps) -> None:
     assert full_load_confirm_summary(
         ["app.c"], engine, mtype, keeps_watermark=keeps, publication_additions={"app.c"}
     ).endswith(_READ_ONLY)
+
+
+def test_a_mysql_full_load_and_cdc_new_snapshot_names_its_flush() -> None:
+    # G147: the run that records CDC's start point runs FLUSH BINARY LOGS unless the source
+    # runs gtid_mode=ON; the dialog names it, as it names PostgreSQL's catalog writes.
+    summary = full_load_confirm_summary(["app.a"], MY, FLC, keeps_watermark=False)
+    assert "unless the source runs gtid_mode=ON the tool runs FLUSH BINARY LOGS" in summary
+    assert not summary.endswith(_READ_ONLY)
 
 
 def test_the_action_kind_is_required() -> None:
@@ -510,12 +519,18 @@ def test_the_reload_after_a_guarded_attempt_joined_claims_no_add_it_will_not_mak
     assert second.job.watermark.cdc_added_tables == {"app.c": 4}
 
 
-@pytest.mark.parametrize("label", ["Re-run all tables", "Retry unfinished tables (1)"])
-def test_mysql_full_load_and_cdc_only_reads_the_source_for_every_action(monkeypatch, label):
+@pytest.mark.parametrize("label, flush", [
+    ("Re-run all tables", True), ("Retry unfinished tables (1)", False),
+])
+def test_mysql_full_load_and_cdc_names_the_flush_only_for_a_new_start_point(
+        monkeypatch, label, flush):
+    # G147: Re-run all tables records (and fences) a new start point; a Retry keeps the
+    # original one and only reads the source.
     ui = _render_step(monkeypatch, state=_fc(["app.a", "app.b"]), job=_failed_b(),
                       session=_G17Session(), tables=["app.a", "app.b"])
     _click(ui, label)
-    assert _summaries(ui)[-1].endswith(_READ_ONLY)
+    assert ("FLUSH BINARY LOGS" in _summaries(ui)[-1]) is flush
+    assert _summaries(ui)[-1].endswith(_READ_ONLY) is not flush
 
 
 def test_the_ledger_retry_reopens_the_dialog_with_the_same_action_kind(monkeypatch) -> None:

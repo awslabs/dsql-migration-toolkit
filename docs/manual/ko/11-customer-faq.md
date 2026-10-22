@@ -28,6 +28,9 @@ Amazon **RDS / Aurora MySQL 또는 PostgreSQL → Amazon Aurora DSQL**, 단방�
 슬롯과 publication을 생성(그리고 teardown 시 삭제)하고, 재키잉된 테이블에 `REPLICA IDENTITY FULL`을
 설정하며, Full Load 이후 선택한 테이블을 그 publication에 추가합니다(Full load + CDC, CDC를 시작하기 전) —
 각각 autocommit, allowlist 제한, 감사(audit)되는 작업입니다. MySQL 소스(및 Full Load만 하는 PostgreSQL 마이그레이션)에는 절대 쓰지 않습니다.
+다만 `gtid_mode=ON`이 아닌 소스에서 MySQL Full load + CDC 실행은 CDC 시작 지점을 기록한 직후
+`FLUSH BINARY LOGS`를 한 번 실행합니다(`RELOAD`가 필요하고, 데이터를 쓰지 않으며, 테이블을 잠그지 않고,
+binlog가 새 파일로 넘어갑니다).
 
 
 **Q2. Aurora DSQL을 내 소스 엔진(Aurora MySQL / PostgreSQL)의 드롭인 대체로 그대로 쓸 수 있나요?**
@@ -514,8 +517,10 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 필요한 접근 권한은 최소한이고, 데이터는 여러 겹으로 보호됩니다.
 
 - **접속**: 소스는 **MySQL 또는 PostgreSQL**에 대한 일반 **읽기 전용 연결**(비밀번호, 또는 AWS Secrets
-  Manager 사용자명/비밀번호 — **IAM은 아님**; IAM 토큰 인증은 타깃 DSQL 전용), 타깃은 DSQL의 **IAM 토큰
-  인증**(DB 비밀번호 없음)을 사용하며, 모든 연결은 **TLS**로 암호화됩니다.
+  Manager 사용자명/비밀번호 — **IAM은 아님**; IAM 토큰 인증은 타깃 DSQL 전용)을 사용하며, CDC에는 복제
+  권한이 더 필요하고, MySQL Full load + CDC 실행에는 소스가 `gtid_mode=ON`이 아니면 `RELOAD`도
+  필요합니다([§1.1](01-setup.md#11-사전-요구사항)). 타깃은 DSQL의 **IAM 토큰 인증**(DB 비밀번호 없음)을
+  사용하며, 모든 연결은 **TLS**로 암호화됩니다.
 - **자격증명**: 세션이 유지되는 동안 **메모리에만** 존재하고, 디스크·로그·리포트·작업 기록 어디에도
   저장되지 않습니다. 그래서 재시작하면 접속 정보를 다시 입력해야 합니다.
 - **데이터 값 노출 방지**: 로그와 리포트에는 기본 키와 건수만 남고, **실제 행 값은 절대 기록하지
@@ -545,7 +550,7 @@ Full Load만 쓰는 경우를 포함한 전체 컷오버 절차는
 | 대상 | IAM 액션 (최소) |
 |---|---|
 | **타깃 DSQL (항상)** | `dsql:DbConnect`, `dsql:DbConnectAdmin`(IAM 토큰 발급), `dsql:GetCluster` |
-| **소스 (항상)** | IAM 액션 없음 — 읽기 전용 MySQL 또는 PostgreSQL 사용자/비밀번호(또는 아래 Secrets Manager 시크릿) |
+| **소스 (항상)** | IAM 액션 없음 — 읽기 전용 MySQL 또는 PostgreSQL 사용자/비밀번호(또는 아래 Secrets Manager 시크릿); CDC에는 복제 권한이 더 필요하고, MySQL Full load + CDC 실행에는 소스가 `gtid_mode=ON`이 아니면 `RELOAD`도 필요 |
 | **소스 시크릿 (선택)** | `secretsmanager:GetSecretValue` — 소스 자격증명이 Secrets Manager 시크릿에 있을 때만 |
 | **AI 어시스트 (선택)** | `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` — Fargate 스택은 `BedrockModelArns`로 좁히지 않으면 모든 Anthropic 모델(EC2 스택은 선택 모델로 스코핑); AI 켤 때만 |
 | **CDC — 파이프라인 배포/철거** | cdc-stack이 요구하는 넓은 인프라 생성 권한: `cloudformation:CreateStack`/`UpdateStack`/`DeleteStack`/`Describe*`/`GetTemplate`; 광범위한 `ec2:*`(VPC 서브넷·NAT·EIP·라우트 테이블·보안 그룹·VPC 엔드포인트·네트워크 인터페이스); `iam:CreateRole`/`AttachRolePolicy`/`PassRole`/…(커넥터 역할); `kafka:*` / `kafkaconnect:*`(MSK Serverless + MSK Connect); `logs:*`; 플러그인 버킷에 대한 `s3:*`. Full Load만 하는 경우 **전혀 필요 없음**. |

@@ -34,7 +34,11 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 - ネットワーク経由で到達できるソースデータベース — **Amazon RDS または Aurora MySQL**、あるいは
   **Amazon RDS または Aurora PostgreSQL**。スキーマとデータを読み取れるユーザーがあれば十分です。
   Evaluation、Schema Conversion、Full Load、Validation には読み取り専用で十分で、MySQL ソース
-  (および Full Load のみの PostgreSQL マイグレーション)には一切書き込みません。唯一の例外は
+  (および Full Load のみの PostgreSQL マイグレーション)には一切書き込みません。
+  `gtid_mode=ON` でないソースでの MySQL の **Full load + CDC** 実行は、CDC の開始位置を記録した直後に
+  `FLUSH BINARY LOGS` も 1 回実行するため、そのユーザーには `RELOAD` が必要です(データは書き込まれず、
+  テーブルもロックされません。binlog は新しいファイルに移ります。
+  [§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。書き込みを伴う唯一の例外は
   **PostgreSQL CDC** です。Full Load の整合点でツールが、移行対象テーブルだけに厳密に限定した論理
   レプリケーションスロットと publication を作成し(AUTOCOMMIT、小さな許可リストに限定、監査記録
   あり)、teardown(撤去)時に削除します。これがツールがいずれのソースに対しても行う唯一の書き込み
@@ -108,7 +112,12 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
   を設定して再起動します。(PostgreSQL には `binlog_format`/`binlog_row_image` に相当するものは
   ありません。)
 - **レプリケーション権限を持つソースユーザー。** **MySQL:** `SELECT`、`REPLICATION CLIENT`、
-  `REPLICATION SLAVE`(加えて初期スナップショットの記録管理に使う `RELOAD` と `LOCK TABLES`)。
+  `REPLICATION SLAVE`(加えて初期スナップショットの記録管理に使う `RELOAD` と `LOCK TABLES`)。`RELOAD` は、
+  Full load + CDC の実行が `FLUSH BINARY LOGS` を実行するのにも使われます。ソースが `gtid_mode=ON` でない
+  とき、このコマンドが CDC の開始位置を正確にします
+  ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。enhanced binlog を
+  使う Aurora MySQL では、そのような実行には代わりに `gtid_mode=ON` が必要です。MySQL 8.0.19 以降
+  では、アプリケーションが XA トランザクションを使う場合は `XA_RECOVER_ADMIN` も付与してください。
   **PostgreSQL:** CDC ユーザーは論理レプリケーションスロットを作成・読み取りできる必要があります —
   **superuser** であるか、**REPLICATION ロール属性**(`pg_roles.rolreplication`)を持つか、
   **`rds_replication`** のメンバー(RDS/Aurora では REPLICATION 属性を直接付与できない)であれば
@@ -150,7 +159,12 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
   binlog の `file:position` を使い、1 つのソース上では同じように動作します。Full Load からカットオーバー
   まではモードを変えないでください: `gtid_mode` が `ON` でないときに記録された開始位置では — また
   `gtid_mode` が `ON` でないときに最後に開始した CDC スタックでも — `ON` になった後に CDC を開始できませ
-  ん([第 6 章](06-limitations.md))。ゲートは GTID の欠如をブロッカーとしてではなく、情報として報告します。
+  ん([第 6 章](06-limitations.md))。ゲートは GTID の欠如を情報として報告します。ただし GTID がない場合、
+  Full load + CDC の実行は `file:position` の開始位置を `FLUSH BINARY LOGS` で正確にし、これには
+  `RELOAD` が必要です。enhanced binlog を使う Aurora MySQL ではツールはこれに依存しないため、そこでの
+  Full load + CDC の実行には `gtid_mode=ON` が必要です(または enhanced binlog を無効にします。どちらも
+  ライターの再起動が必要です)。それまでは **CDC start point can be made exact** がその実行をブロック
+  します([§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
   (PostgreSQL には GTID / `file:position` の概念はありません。)
 - **PostgreSQL ソース — CDC はクラスターのライターに対して実行する必要があります。** ソースは
   **スタンバイではなくライター** でなければなりません(`pg_is_in_recovery()` が false であること)—

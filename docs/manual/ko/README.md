@@ -26,7 +26,9 @@ PostgreSQL —** 을 지원하며, 이는 **Connect** 화면에서 선택합니�
 PostgreSQL 방언 → DSQL 제약을 거치고, **PostgreSQL 소스**는 방언 단계를 건너뛰어 **거의 동일한
 (near-identity)** PostgreSQL-16 → DSQL 경로(값 그대로 전달, 동일한 와이어, DSQL 제약과 미지원
 타입만 반영)를 거칩니다. **MySQL 소스(및 PostgreSQL을 Full Load 전용으로만 쓰는 마이그레이션)에는
-절대 쓰기를 하지 않습니다.** 유일한 예외는 **PostgreSQL CDC**로, Full Load 일관성 지점에서 도구가
+절대 쓰기를 하지 않습니다.** `gtid_mode=ON`이 아닌 소스에서 MySQL Full load + CDC 실행은 CDC 시작
+지점을 기록한 직후 `FLUSH BINARY LOGS`를 한 번 실행할 뿐입니다(`RELOAD`가 필요하며, 데이터는 쓰지
+않습니다). 쓰기를 하는 유일한 예외는 **PostgreSQL CDC**로, Full Load 일관성 지점에서 도구가
 정확히 마이그레이션 대상 테이블로 한정된 pgoutput 논리 복제 슬롯과 publication을 생성했다가 정리
 (teardown) 시 삭제하고, 재키잉된 테이블에 `REPLICA IDENTITY FULL`을 설정하며, Full Load 이후 선택한
 테이블을 그 publication에 추가합니다(Full load + CDC, CDC를 시작하기 전. autocommit, 허용 목록 한정,

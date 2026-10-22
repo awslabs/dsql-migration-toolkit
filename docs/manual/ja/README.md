@@ -36,7 +36,9 @@ PostgreSQL-16 ワイヤを話すため）**ほぼ同一（near-identity）** の
 ソース** は方言ステップを省いて **ほぼ同一（near-identity）** の PostgreSQL-16 → DSQL 経路
 （値をそのまま引き渡し、同じワイヤ、DSQL の制約と非対応の型のみを反映）をたどります。**MySQL
 ソース（および PostgreSQL を Full Load 専用でのみ使う移行）には決して書き込みを行いません。**
-唯一の例外は **PostgreSQL CDC** で、Full Load の整合性ポイントにおいて、ツールが移行対象テーブル
+`gtid_mode=ON` でないソースでの MySQL の Full load + CDC 実行は、CDC の開始位置を記録した直後に
+`FLUSH BINARY LOGS` を 1 回実行するだけです（`RELOAD` が必要で、データは書き込まれません）。書き込みを
+伴う唯一の例外は **PostgreSQL CDC** で、Full Load の整合性ポイントにおいて、ツールが移行対象テーブル
 だけに限定した pgoutput 論理レプリケーションスロットと publication を作成し、後片付け（teardown）
 時に削除します。また、再キー化したテーブルに `REPLICA IDENTITY FULL` を設定し、Full Load の後に
 選択したテーブルをその publication に追加します（Full load + CDC、CDC を開始する前。autocommit、

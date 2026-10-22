@@ -38,6 +38,9 @@ from dsql_migrator.core.models import (
 )
 
 from dsql_migrator.ui.data_migration._models import MigrationType
+
+# The types whose prerequisite checks run in MigrationMode.CDC (prereq_mode_for_type).
+_CDC_TYPES = frozenset({MigrationType.CDC_ONLY, MigrationType.FULL_LOAD_AND_CDC})
 from dsql_migrator.ui.data_migration._cdc_status import CdcActivitySummary
 
 _LOGGER = logging.getLogger(__name__)
@@ -127,6 +130,8 @@ class DataMigrationState:
         # can block a load whose exclusion changed after the checks (the exclusion
         # analogue of a late table add caught by prereq_scope_gap). Keyed by mode.
         self._prereq_report_checked_at: dict[MigrationMode, datetime] = {}
+        # The migration type each report was graded for (see get_prereq_report).
+        self._prereq_report_types: dict[MigrationMode, object] = {}
         self._prereq_report_lob_exclusions: dict[
             MigrationMode, dict[str, frozenset[str]]
         ] = {}
@@ -2817,9 +2822,13 @@ class DataMigrationState:
         self.prereq_review_open = False
 
     def set_prereq_report(
-        self, mode: MigrationMode, report: PrerequisiteReport
+        self, mode: MigrationMode, report: PrerequisiteReport, *, migration_type=None
     ) -> None:
         """Record the latest prerequisite report for ``mode``.
+
+        ``migration_type`` is the type the checks were graded for (default: the current
+        one); :meth:`get_prereq_report` treats a CDC-mode report graded for the other CDC
+        type as not run.
 
         Also snapshots the LOB exclusion the checks ran against, so the run guard
         can detect a column excluded AFTER the checks (which could turn a passed
@@ -2827,8 +2836,10 @@ class DataMigrationState:
         ``prereq_scope_gap`` for a late table add. The snapshot is a plain
         ``{table: frozenset(cols)}`` copy so a later toggle cannot mutate it.
         """
+        graded_for = migration_type if migration_type is not None else self.migration_type
         with self._lock:
             self._prereq_reports[mode] = report
+            self._prereq_report_types[mode] = graded_for
             self._prereq_report_checked_at[mode] = datetime.now(timezone.utc)
             # The value-size answers refresh the exclusion popup's size labels.
             for result in getattr(report, "results", None) or ():
@@ -2919,9 +2930,26 @@ class DataMigrationState:
             return self._size_check_cancel
 
     def get_prereq_report(self, mode: MigrationMode) -> Optional[PrerequisiteReport]:
-        """Return the last prerequisite report for ``mode``, if any."""
+        """Return the last prerequisite report for ``mode``, if any.
+
+        CDC only and Full load + CDC share the CDC-mode report, but some of its rows are
+        graded per type (G147's "CDC start point can be made exact" SKIPs in CDC only;
+        PostgreSQL's replication objects are created by a Full load + CDC run), so one
+        graded for the other CDC type is not returned: the checks run again for this one.
+        """
+        current = self.migration_type  # read-through to the session: outside the lock
         with self._lock:
-            return self._prereq_reports.get(mode)
+            report = self._prereq_reports.get(mode)
+            graded_for = self._prereq_report_types.get(mode)
+        if (
+            report is not None
+            and mode is MigrationMode.CDC
+            and graded_for in _CDC_TYPES
+            and current in _CDC_TYPES
+            and graded_for is not current
+        ):
+            return None
+        return report
 
     def prereq_report_checked_at(self, mode: MigrationMode) -> Optional[datetime]:
         """When the last ``mode`` report was recorded (UTC), or ``None``."""

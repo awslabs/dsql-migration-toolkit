@@ -12,10 +12,12 @@ from dsql_migrator.ui.data_migration import _cdc_status as _status
 from tests.test_ui_data_migration import _RecordingUi
 
 _NOW = datetime.now(timezone.utc)
+# A Full load + CDC run's watermark: its binlog position was fenced (G147).
 _WM = Watermark(
     snapshot_timestamp=_NOW,
     binlog_file="mysql-bin-changelog.000007",
     binlog_position=108063011,
+    start_point_fence="flush",
 )
 
 

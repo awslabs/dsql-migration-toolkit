@@ -41,6 +41,7 @@ from dsql_migrator.core.target_introspector import (
 from dsql_migrator.ui.design import inline_hint, render_notice
 from dsql_migrator.ui.workflow import WorkflowStep, with_status
 from dsql_migrator.ui.data_migration._full_load_engine import (
+    NO_START_POINT_RETRY_REFUSAL,
     full_load_progress_caption,
     job_status_to_step_status,
     new_start_point_block,
@@ -482,12 +483,16 @@ def full_load_confirm_summary(
     leave it pending (the wait after the join timed out, or the copy failed or
     quarantined), and the guard writes nothing for a member. Each catalog write an action
     can make on the source is named, as the dialog is where the operator learns of them.
-    Every other engine and type only reads the source.
+    A MySQL Full load + CDC run that takes a new snapshot runs FLUSH BINARY LOGS right after
+    recording CDC's start point unless the source runs gtid_mode=ON (G147,
+    mysql_start_point_fence), so it says so too. Every other engine and type only reads the
+    source.
     """
     if not names:
         # A tick-to-choose dialog before the first tick (its confirm stays disabled).
         return "No tables ticked yet: tick the tables to load below."
     pg_cdc = engine is SourceType.POSTGRES and migration_type is MigrationType.FULL_LOAD_AND_CDC
+    mysql_cdc = engine is SourceType.MYSQL and migration_type is MigrationType.FULL_LOAD_AND_CDC
     additions = set(publication_additions or ())
     joining = [n for n in names if n in additions]
     if pg_cdc and not keeps_watermark and not cdc_live:
@@ -508,6 +513,12 @@ def full_load_confirm_summary(
             f"{'joins' if one else 'join'} CDC's publication on the source if "
             f"{'it is not a member' if one else 'they are not members'} yet, and the "
             "publication's publish_via_partition_root is set to true if it is false"
+        )
+    elif mysql_cdc and not keeps_watermark and not cdc_live:
+        source = (
+            "the source's tables are only read, but unless the source runs gtid_mode=ON the "
+            "tool runs FLUSH BINARY LOGS right after recording the CDC start point (it needs "
+            "RELOAD, and the binlog moves to a new file)"
         )
     else:
         source = "the source is accessed read only"
@@ -2238,6 +2249,13 @@ def _render_full_load_step(
                     if connections_missing:
                         retry_btn.disable()
                         retry_btn.tooltip(reconnect_tip)
+                    elif job.watermark is None and (
+                        getattr(migration_state, "migration_type", None)
+                        is MigrationType.FULL_LOAD_AND_CDC
+                    ):
+                        # G147: no start point to load under (the engine refuses it too).
+                        retry_btn.disable()
+                        retry_btn.tooltip(NO_START_POINT_RETRY_REFUSAL)
                     elif _retry_hold is not None:
                         # G129: a retry while the sink streams would write back the rows it
                         # deletes during the copy; the hint below the row names the route

@@ -36,7 +36,11 @@ You connect to the **same** source and target in every case; only where the tool
   PostgreSQL** — you can reach over the network, with a user that can read the
   schema and data. Read-only is enough for Evaluation, Schema Conversion, Full
   Load and Validation; a MySQL source (and a PostgreSQL Full-Load-only migration)
-  is never written. The single exception is **PostgreSQL CDC**: at the Full Load
+  is never written. A MySQL **Full load + CDC** run on a source not running
+  `gtid_mode=ON` also issues one `FLUSH BINARY LOGS` right after recording CDC's
+  start point, so its user needs `RELOAD` (no data is written and no table locked;
+  the binlog moves to a new file; [§3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). The single exception that
+  writes is **PostgreSQL CDC**: at the Full Load
   consistency point the tool creates — and at teardown drops — a logical
   replication slot and a publication scoped to exactly the migrated tables
   (AUTOCOMMIT, restricted to a small allowlist, audited). These are the only
@@ -118,7 +122,12 @@ what's missing, but setting them up is a source-side task you do once.
   `binlog_format`/`binlog_row_image` analog exists for PostgreSQL.)
 - **A source user with replication privileges.** **MySQL:** `SELECT`,
   `REPLICATION CLIENT`, and `REPLICATION SLAVE` (plus `RELOAD` and `LOCK TABLES`,
-  used for the initial snapshot bookkeeping). **PostgreSQL:** the CDC user must be
+  used for the initial snapshot bookkeeping). `RELOAD` also lets a Full load + CDC run
+  issue `FLUSH BINARY LOGS`, which makes its CDC start point exact when the source does
+  not run `gtid_mode=ON` ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc));
+  on Aurora MySQL with enhanced binlog such a run needs `gtid_mode=ON` instead. On MySQL
+  8.0.19 and later, add `XA_RECOVER_ADMIN` if the application uses XA transactions.
+  **PostgreSQL:** the CDC user must be
   able to create and read a logical replication slot — it passes if it is a
   **superuser**, has the **REPLICATION role attribute** (`pg_roles.rolreplication`),
   or is a member of **`rds_replication`** (on RDS/Aurora, where the REPLICATION
@@ -164,8 +173,12 @@ what's missing, but setting them up is a source-side task you do once.
   same on one source. Keep the mode unchanged from the Full Load to cut over: a start
   point recorded while `gtid_mode` was not `ON` — or a CDC stack that last started while
   it was not `ON` — cannot start CDC once it is `ON` ([Chapter 6](06-limitations.md)).
-  The gate reports a missing GTID as informational, never as a blocker. (PostgreSQL has
-  no GTID / `file:position` concept.)
+  The gate reports a missing GTID as informational. Without it, though, a Full load + CDC
+  run makes its `file:position` start point exact with `FLUSH BINARY LOGS`, which needs
+  `RELOAD`; on Aurora MySQL with enhanced binlog the tool does not rely on that, so there
+  a Full load + CDC run needs `gtid_mode=ON` (or enhanced binlog turned off — either is a
+  writer reboot), and **CDC start point can be made exact** blocks it until then
+  ([§3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). (PostgreSQL has no GTID / `file:position` concept.)
 - **PostgreSQL source — CDC must run against the cluster writer.** The source must
   be the **writer, not a standby** (`pg_is_in_recovery()` must be false) — a standby
   can't host a replication slot, so point CDC at the writer endpoint.

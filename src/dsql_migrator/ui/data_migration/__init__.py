@@ -110,6 +110,7 @@ from dsql_migrator.core.models import (
     TargetInventory,
     Watermark,
 )
+from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
 from dsql_migrator.core.table_selection import TableSelector
 from dsql_migrator.core.watermark import WatermarkCapturer
 from dsql_migrator.ui.ai_assist import ai_is_usable
@@ -1251,6 +1252,7 @@ def build_data_migration_screen(
                 job_manager, getattr(migration_state, "job_id", None)
             )
             _wm_for_gate = _cdc_watermark(_record_for_gate, migration_state)
+            request_type = migration_state.migration_type
             request = PrerequisiteCheckRequest(
                 mode=mode,
                 tables=[table.name for table in tables],
@@ -1276,6 +1278,12 @@ def build_data_migration_screen(
                 # tool itself recommends (the v0.1.509/510 regression).
                 provisions_replication=(
                     _handoff_stack is not None and _wm_for_gate is None
+                ),
+                # G147 (MySQL): a Full load + CDC Full Load fences CDC's start point -- its
+                # first run and every Re-run, watermark or not -- so "CDC start point can be
+                # made exact" is graded there; CDC only runs no Full Load (SKIP).
+                records_start_point=(
+                    migration_state.migration_type is MigrationType.FULL_LOAD_AND_CDC
                 ),
                 # Will this start re-snapshot? Read off the EFFECTIVE snapshot mode --
                 # the same pure rule the connector config and the Deploy/Start gates use --
@@ -1414,7 +1422,9 @@ def build_data_migration_screen(
                 refresh()
                 return
             migration_state.clear_prereq_running(mode)
-            migration_state.set_prereq_report(mode, report)
+            # Recorded with the type it was graded for: CDC only and Full load + CDC share
+            # the CDC-mode report, and some rows are graded per type (G147).
+            migration_state.set_prereq_report(mode, report, migration_type=request_type)
             # Keep the results open until the operator moves on -- also where a later
             # sub-step is pinned active (CDC only with its infrastructure ready, or an
             # infrastructure create / delete in flight), which the active sub-step set at
@@ -3376,6 +3386,18 @@ def build_data_migration_screen(
                                 _read = bool(
                                     getattr(migration_state, "cdc_stack_phase_checked", False)
                                 )
+                                # G147: CDC from this run's watermark (a Full load only run
+                                # never fences it) is exact only on a GTID point.
+                                _fl_unfenced = not _is_pg and start_point_unfenced(
+                                    getattr(
+                                        _current_job(
+                                            job_manager,
+                                            getattr(migration_state, "job_id", None),
+                                        ),
+                                        "watermark",
+                                        None,
+                                    )
+                                )
                                 if _coverage_gap is not None:
                                     _started = _cdc_started_for_migration(
                                         migration_state, job_manager
@@ -3398,6 +3420,7 @@ def build_data_migration_screen(
                                         _CDC_NEXT_UNREAD_PG
                                         if _is_pg
                                         else _CDC_NEXT_UNREAD_MYSQL
+                                        + (FULL_LOAD_ONLY_UNFENCED_NOTE if _fl_unfenced else "")
                                     )
                                 elif _is_pg and _streamed:
                                     from dsql_migrator.core.cdc_pg_slot import pg_cdc_route
@@ -3474,7 +3497,7 @@ def build_data_migration_screen(
                                             "infrastructure and deploy it again, then Start "
                                             "CDC: the new stack streams from the Full Load's "
                                             "watermark onto the loaded target."
-                                        )
+                                        ) + (FULL_LOAD_ONLY_UNFENCED_NOTE if _fl_unfenced else "")
                                 elif _is_pg:
                                     body = (
                                         "This run created no replication slot, so there "
@@ -3503,7 +3526,7 @@ def build_data_migration_screen(
                                         "keeps those rows as they were, and CDC from a "
                                         "watermark carries only the changes after it. Use "
                                         "the link below to jump to that setting."
-                                    )
+                                    ) + (FULL_LOAD_ONLY_UNFENCED_NOTE if _fl_unfenced else "")
                                 if _read and not infra_ready:
                                     body += (
                                         " CDC streaming infrastructure isn't deployed "
@@ -4392,6 +4415,16 @@ _CDC_NEXT_UNREAD_MYSQL = (
     "to rows an earlier load left on the target, first Re-run Full Load choosing 'Drop & "
     "reload': an append keeps those rows as they were, and CDC from a watermark carries only "
     "the changes after it. Use the link below to jump to that setting."
+)
+# G147: a Full load only run records its binlog position without the commit fence, so a CDC
+# start from it can miss a transaction still committing then (start_point_unfenced) -- said
+# after each route this notice gives from that watermark, with the check and the exact route.
+FULL_LOAD_ONLY_UNFENCED_NOTE = (
+    " This Full Load recorded its binlog position without waiting for in-flight commits, so a "
+    "transaction still committing at that instant can be missing from both the copy and CDC: "
+    "validate in CHECKSUM mode once CDC has caught up, or, for an exact start point, switch "
+    "the migration type to Full load + CDC instead and Re-run Full Load there choosing 'Drop "
+    "& reload'."
 )
 _CDC_NEXT_UNREAD_PG = (
     "This run created no replication slot (a Full load only run never does). "

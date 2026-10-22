@@ -35,7 +35,10 @@ infrastructure and deploy it again before Start CDC (Full load only has no CDC s
 [Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Either way CDC
 starts from the watermark and carries only the changes after it, so if that Full load
 only run appended to rows an earlier load left on the target, first Re-run Full Load
-choosing **Drop & reload**.
+choosing **Drop & reload**. On a source not running `gtid_mode=ON` that watermark is a
+binlog position recorded without waiting for in-flight commits: validate in CHECKSUM mode
+once CDC has caught up, or, for an exact start point, re-run the Full Load through
+Full load + CDC ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
 
 CDC adds real moving parts (MSK, MSK Connect, the sink connector) and **ongoing
 cost while deployed**. Reach for it only when you genuinely need continuous
@@ -183,7 +186,9 @@ reconciling them yourself first.
 
 ## 10.4 Principles the tool follows (so you can trust the verdicts)
 
-- **Source is always read-only.** The tool never writes to your MySQL source.
+- **Source is read-only.** The tool never writes your MySQL source's data; its one
+  statement beyond reads is the `FLUSH BINARY LOGS` a Full load + CDC run issues when the
+  source does not run `gtid_mode=ON` (Chapter 3 §3.5).
 - **Loud over silent.** It refuses to corrupt data quietly — a value it can't
   represent stops the table visibly; an incomplete load is never reported as
   success.

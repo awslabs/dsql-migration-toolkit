@@ -35,7 +35,10 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 
 ソースは一貫したスナップショットの中で**読み取り専用**として読み取られ、ローダーがそれを変更することは
 決してありません。MySQL ソース — そして PostgreSQL の Full Load のみのマイグレーション — に書き込むことは
-決してありません。唯一の例外は **PostgreSQL CDC** です。ウォーターマークの地点(§3.5)で、ツールは論理
+決してありません。`gtid_mode=ON` でないソースでの MySQL の **Full load + CDC** 実行は、CDC の開始位置を
+記録した直後、どのテーブルも読む前に、読み取り以外の文として **`FLUSH BINARY LOGS`** を 1 つだけ実行します。
+`RELOAD` が必要で、データは書き込まず、テーブルはロックせず、binlog は新しいファイルに移ります(§3.5)。
+書き込みを伴う唯一の例外は **PostgreSQL CDC** です。ウォーターマークの地点(§3.5)で、ツールは論理
 レプリケーションスロットと、移行対象テーブルだけに厳密にスコープされた publication(`FOR TABLE ONLY`: テー
 ブルの継承の子テーブルは一緒に追加されず — Full Load もそのテーブル自身の行だけを読みます(`FROM ONLY`。
 [§6.1](06-limitations.md#61-aurora-dsql-の機能制限スキーマがこれらに適合している必要があります) を参照) —
@@ -211,8 +214,8 @@ CDC は実行中の Full Load を待ちます ([§3.5](#35-ウォーターマー
 
 ## 3.5 ウォーターマーク — CDC への橋渡し
 
-ロードの前に、ツールは**ウォーターマーク**をキャプチャします。これはソースの変更ストリームにおける一貫
-した地点で、同じ一貫スナップショットのトランザクションの中で記録されます。どのウォーターマークも
+ロードの前に、ツールは**ウォーターマーク**をキャプチャします。これは CDC が開始するソースの変更
+ストリーム上の地点で、どのテーブルも読む前に記録されます。どのウォーターマークも
 **UTC のスナップショットタイムスタンプ**と、テーブルごとの**概算**行数(スキャンを伴わない
 `information_schema` の推定値。単に数えるだけのためにソースをフルスキャンしません)を保持します。エンジン
 固有の座標は次のように異なります。
@@ -231,13 +234,40 @@ CDC は実行中の Full Load を待ちます ([§3.5](#35-ウォーターマー
   CDC 引き継ぎを可能にします。PostgreSQL には GTID / `server_uuid` の概念はなく、`SHOW BINARY LOG STATUS`
   もありません — LSN は作成されたスロットから得られます。
 
-このウォーターマークによって、後続の **CDC へのギャップのない引き継ぎ**が可能になります。CDC は
-スナップショットが終了したまさにその地点から変更のストリーミングを開始します — ギャップも重複も
-ありません([第 4 章](04-cdc-and-dsql-constraints.md)を参照)。CDC の前提条件が満たされない場合 —
+このウォーターマークによって、後続の **CDC へのギャップのない引き継ぎ**が可能になります。各テーブルは
+ウォーターマークの後に開いた自身の一貫スナップショットから読み取られ、CDC はウォーターマーク以降のすべての
+変更を再適用します。スナップショットと CDC の両方にある変更は 2 回適用されますが、主キーによる冪等な
+upsert / delete のため無害です([第 4 章](04-cdc-and-dsql-constraints.md)を参照)。そのため、
+ウォーターマークはスナップショットから見えないトランザクションを含んではいけません。
+
+- `gtid_mode=ON` の MySQL ソースではそうなりません。GTID はトランザクションの InnoDB コミットが終わった
+  後にだけ `gtid_executed` に入ります。
+- binlog ファイル + 位置ではそうなり得ます。MySQL はトランザクションを InnoDB にコミットする前に binlog に
+  書き込むため、その間に読んだ位置は、まだどのスナップショットにも見えないトランザクションを含み、CDC は
+  その後から開始します。そこで **Full load + CDC** の実行は、位置を記録した直後、どのテーブルも読む前に
+  **`FLUSH BINARY LOGS`** を実行します。MySQL は新しい binlog ファイルに切り替える前に、すでに binlog に
+  入ったトランザクションがすべてコミットされるまで待ちます(通常は数ミリ秒で、その間は新しいコミットも
+  待ちます)。**RELOAD** 権限が必要で、テーブルはロックせず、binlog は新しいファイルに移ります。
+  アクティビティログに記録されます。**enhanced binlog** を使う Aurora MySQL ではツールはこの待機に依存しない
+  ため、そのソースでの Full load + CDC の実行には `gtid_mode=ON` が必要です(または enhanced binlog を無効に
+  します)。前提条件 **CDC start point can be made exact** が Full load + CDC の各実行の前に両方を確認します。
+- ウォーターマークより前に `XA PREPARE` され、テーブルを読んだ後にコミットされたトランザクションはどちらにも
+  コピーされないため、実行は見つけた準備状態の XA トランザクション(`XA RECOVER`)を最大 30 秒待ち、それでも
+  残っていれば停止します。MySQL 8.0.19 以降では `XA RECOVER` には `XA_RECOVER_ADMIN` が必要で、この権限が
+  なければ実行は警告を記録して続行します。
+
+**Full load only** の実行は `FLUSH` を実行しません。スナップショットだけをコピーし、それ以降はコピーしない
+ため、すべての変更を含める必要があるなら先にソースへの書き込みを止めてください。`FLUSH` を実行しないため、
+`gtid_mode=ON` でないソースでは、そのウォーターマークは(以前のバージョンのツールが記録したものと同じく)正確にされず、
+後でそこから Start CDC すると *This start point was recorded without waiting for in-flight commits* が表示
+されます。CDC only が Full Load の再実行を Full load + CDC で行うのはこのためです。CDC の前提条件が満たされない場合 —
 MySQL ではバイナリロギングが無効か権限が制限されている場合、PostgreSQL では `wal_level` が `logical` で
 ないか、スロット / publication を作成できない場合(レプリケーション権限の不足、または standby エンドポイント)
 — 座標は穏当に劣化し、その場合は単に CDC の引き継ぎが受けられなくなるだけです(Full Load は引き続き
-動作します)。
+動作します)。例外は、binlog の位置を正確にできない MySQL の **Full load + CDC** 実行です(`RELOAD` がない、
+`gtid_mode=ON` なしで enhanced binlog を使っている、またはまだ準備状態の XA トランザクションがある)。この
+実行はどのテーブルも読む前に停止して解決方法を示し、再試行するテーブルを残さないため、原因を直してから
+もう一度開始してください。
 
 > ウォーターマークの行数は**意図的に概算**です(ソースへの負担を抑えるため)。正確な `COUNT(*)` と
 > チェックサムは **Validation**([第 5 章](05-validation.md))の役割であり、Full Load の役割では
@@ -251,7 +281,7 @@ MySQL ではバイナリロギングが無効か権限が制限されている�
 - **CDC が動いている間** は、Full Load の操作に自身のゲートが先にかかります: *Stop CDC first (CDC step → Stop CDC), then Delete CDC infrastructure and deploy it again before a new Full Load.* 元の開始位置を維持する **Retry unfinished tables**、**Reload specific tables**、テーブルごとの **Reload** も無効になり、そのいずれかのためにすでに開いている確認ダイアログは確定できません。これらは代わりに、先に Stop CDC してからその操作を実行し、もう一度 Start CDC するよう示します: CDC はその後、停止した位置から続き、ギャップがないのは sink が適用していなかった変更を CDC トピックがまだ保持している間 (MSK での保持期間) だけです。ストリーミング中の sink のそばでのロードはターゲットにない行だけを insert するため、テーブルのコピー中にソースが削除した行が、CDC がその削除を適用した後に Aurora DSQL に届き、そのまま残ることがあります。COUNT か CHECKSUM の検証だけが示す余分な行です。同じ理由で、Start CDC がまだ進行中の間はページヘッダーの **Run** も何も開始せず、Full Load の実行中は Start CDC が待ちます ([§4.3](04-cdc-and-dsql-constraints.md#43-ギャップのない-full-load--cdc-ハンドオフ))。**Start CDC**、**Stop CDC**、**Delete CDC infrastructure** がまだ進行中の間も、Full Load ステップの操作は無効のままですが、示される理由は、先に Stop CDC することではなく、その操作が終わるまで待つことです (CDC ステップに進行状況が表示されます)。このときページヘッダーの **Run** も何も開始せず、ストリーミングしたことのあるスタックでは、待つ代わりに上記の削除と再デプロイの方法を示します。Stop または Delete が終わると Retry や Reload が実行でき、Start で CDC がストリーミングを始めると、再び Stop CDC が先になります。
 - **このセッションで CDC の状態をまだ読み取っていない間** (画面を開いた直後やアプリの再起動の直後)、または読み取れなかった場合、新しい開始位置は推測せずに **待ちます**: 通知がそう述べ、CDC ステップの **Re-check CDC state** を示します (読み取りに失敗した場合は、先に AWS のアクセス権を直してください)。
 - **新しい開始位置では制限されないもの** (CDC が動いている間は、上のとおりこれらも無効になります): **Retry unfinished tables**、**Reload specific tables**、テーブルごとの **Reload**、**Change & reload** はいずれも **元の** 開始位置を維持するため、CDC は止まったところから続き — Stop CDC 後のあらゆる再起動と同じく、sink が適用していなかった変更を CDC トピックがまだ保持している間だけギャップがありません ([§4.3](04-cdc-and-dsql-constraints.md#43-ギャップのない-full-load--cdc-ハンドオフ)) — 再ロードしたテーブルは収束します。Full Load ステップは **Full load only** と **CDC only** のマイグレーションを制限しませんが、それらに切り替えてもこのゲートは回避できません (次の項目)。
-- **Start CDC もより新しい開始位置を拒否します (MySQL)。** MySQL ソースでは、Start CDC は、ストリーミングしたことのある CDC スタックを、マイグレーションの種類にかかわらず、スタックが最後に開始した位置より新しい開始位置へ (または、停止したスタックの最後の Start が開始位置を渡さなかった場合は、どの開始位置へも) 進めることを拒否します: たとえば Full load + CDC から **Full load only** に切り替えた後の Re-run Full Load が取ったウォーターマークや、より後の **Manual** の位置です。開始位置カードと Start CDC カードが *This CDC stack cannot start from a newer start point* とともに方法 — 上記の方法、CDC only では **Delete CDC infrastructure** して再デプロイしてから新しいスタックで **Start CDC** — を示し、Start CDC は無効になります。Start CDC のダイアログ、Start または Retry CDC のクリック、そして何かを変更する前にその時点で読み取ったスタックで判断する Start CDC のジョブ (*Start CDC blocked: This CDC stack has streamed, so Start CDC does not move it forward to a newer start point …*) も拒否します。拒否された Manual の位置は、開始位置を **Automatic** に戻せばストリームが続く場合、そのことも示します。その位置と同じかそれより前の開始位置、または開始位置のない Start はストリームを続け、拒否されません。CloudFormation がロールバックした初回の Start の後は、ロールバックがスタックのパラメータを元に戻すため、パラメータにはその Start が渡した開始位置がもう残っていませんが、スタックの CloudFormation イベントにはまだ残っています (オフセットシーダーのプロパティ): アプリは次の Start を、自分が記録したその位置と比較し、アプリの再起動後 (または別のセッションで行った Start の場合) はそのイベントから読み取ったその位置と比較します。それより後の開始位置は拒否され、同じ開始位置からの再試行は拒否されず、それより前の開始位置は Start CDC をクリックした時点で、またはこのセッションがその位置をまだ読み取っていなかった場合は Start CDC のジョブで拒否されます (*This start point cannot be applied*: そのオフセットはシードされたまま残り、シーダーは巻き戻さないためです)。イベントからもその位置が得られない場合 — たとえばイベントを読み取れない場合や、その Start がオフセットシーダーの Lambda ではなくアプリの中で Kafka をシードした場合 (単一 EC2 ホストはそうします。[§1.4](01-setup.md#14-単一-ec2-ホストで実行する-ソースから)) — は、どの開始位置もその位置と比較できないため、そのスタックでは同じ開始位置も含めてすべての開始位置が同じ方法とともに拒否されます (*This CDC stack's last start point is not known*: *CloudFormation rolled back this stack's last Start, and the start offset that Start offered is no longer known …*)。CDC only の方法は新しいスタックを Full Load のウォーターマークから開始するため、拒否された位置がそのウォーターマーク (Automatic) の場合は、拒否がその方法の条件を付け加えます: その Full Load がターゲットに既にあった行に append した場合は、その Start の前に **Drop & reload** でもう一度実行してください。CDC only には Full Load ステップがないため、その実行の間はマイグレーションの種類を Full load only に切り替え、その後 CDC only に戻します (append はそれらの行をそのまま残し、ウォーターマークからの CDC はその後の変更しか運びません)。無効になった Start のツールチップとジョブのエラーでは、その方法は *Delete CDC infrastructure and deploy it again, then Start CDC (if the Full Load appended to rows already on the target, re-run it choosing 'Drop & reload' first)* と表示されます。新しいスタックではその Start は拒否されず、このセッションが、その Full Load が以前のコピーに append した可能性があることを示していれば、CDC ステップがその Start の前にその条件を示します ([§4.3](04-cdc-and-dsql-constraints.md#43-ギャップのない-full-load--cdc-ハンドオフ))。PostgreSQL にはこの拒否はありません: Start CDC は Full Load のウォーターマークにかかわらずスタック自身のレプリケーションスロットから続け、Full load only の実行はそのスロットに触れないため、スタックの source connector がストリーミングしていれば、CDC は Stop CDC 後のあらゆる再起動と同じく (上記) 停止したところから続きます (そうでなければ Debezium が先に選択したすべてのテーブルをスナップショットします)。
+- **Start CDC もより新しい開始位置を拒否します (MySQL)。** MySQL ソースでは、Start CDC は、ストリーミングしたことのある CDC スタックを、マイグレーションの種類にかかわらず、スタックが最後に開始した位置より新しい開始位置へ (または、停止したスタックの最後の Start が開始位置を渡さなかった場合は、どの開始位置へも) 進めることを拒否します: たとえば Full load + CDC から **Full load only** に切り替えた後の Re-run Full Load が取ったウォーターマークや、より後の **Manual** の位置です。開始位置カードと Start CDC カードが *This CDC stack cannot start from a newer start point* とともに方法 — 上記の方法、CDC only では **Delete CDC infrastructure** して再デプロイしてから新しいスタックで **Start CDC** — を示し、Start CDC は無効になります。Start CDC のダイアログ、Start または Retry CDC のクリック、そして何かを変更する前にその時点で読み取ったスタックで判断する Start CDC のジョブ (*Start CDC blocked: This CDC stack has streamed, so Start CDC does not move it forward to a newer start point …*) も拒否します。拒否された Manual の位置は、開始位置を **Automatic** に戻せばストリームが続く場合、そのことも示します。その位置と同じかそれより前の開始位置、または開始位置のない Start はストリームを続け、拒否されません。CloudFormation がロールバックした初回の Start の後は、ロールバックがスタックのパラメータを元に戻すため、パラメータにはその Start が渡した開始位置がもう残っていませんが、スタックの CloudFormation イベントにはまだ残っています (オフセットシーダーのプロパティ): アプリは次の Start を、自分が記録したその位置と比較し、アプリの再起動後 (または別のセッションで行った Start の場合) はそのイベントから読み取ったその位置と比較します。それより後の開始位置は拒否され、同じ開始位置からの再試行は拒否されず、それより前の開始位置は Start CDC をクリックした時点で、またはこのセッションがその位置をまだ読み取っていなかった場合は Start CDC のジョブで拒否されます (*This start point cannot be applied*: そのオフセットはシードされたまま残り、シーダーは巻き戻さないためです)。イベントからもその位置が得られない場合 — たとえばイベントを読み取れない場合や、その Start がオフセットシーダーの Lambda ではなくアプリの中で Kafka をシードした場合 (単一 EC2 ホストはそうします。[§1.4](01-setup.md#14-単一-ec2-ホストで実行する-ソースから)) — は、どの開始位置もその位置と比較できないため、そのスタックでは同じ開始位置も含めてすべての開始位置が同じ方法とともに拒否されます (*This CDC stack's last start point is not known*: *CloudFormation rolled back this stack's last Start, and the start offset that Start offered is no longer known …*)。CDC only の方法は新しいスタックを Full Load のウォーターマークから開始するため、拒否された位置がそのウォーターマーク (Automatic) の場合は、拒否がその方法の条件を付け加えます: その Full Load がターゲットに既にあった行に append した場合は、その Start の前に **Drop & reload** でもう一度実行してください。CDC only には Full Load ステップがないため、その実行の間はマイグレーションの種類を Full load + CDC に切り替えます。その実行の Full Load が CDC の開始位置を正確にします (append はそれらの行をそのまま残し、ウォーターマークからの CDC はその後の変更しか運びません)。無効になった Start のツールチップとジョブのエラーでは、その方法は *Delete CDC infrastructure and deploy it again, then Start CDC (if the Full Load appended to rows already on the target, re-run it choosing 'Drop & reload' first)* と表示されます。新しいスタックではその Start は拒否されず、このセッションが、その Full Load が以前のコピーに append した可能性があることを示していれば、CDC ステップがその Start の前にその条件を示します ([§4.3](04-cdc-and-dsql-constraints.md#43-ギャップのない-full-load--cdc-ハンドオフ))。PostgreSQL にはこの拒否はありません: Start CDC は Full Load のウォーターマークにかかわらずスタック自身のレプリケーションスロットから続け、Full load only の実行はそのスロットに触れないため、スタックの source connector がストリーミングしていれば、CDC は Stop CDC 後のあらゆる再起動と同じく (上記) 停止したところから続きます (そうでなければ Debezium が先に選択したすべてのテーブルをスナップショットします)。
 - クリックとジョブの開始の間にスタックがストリーミングを始めた場合は、エンジンがジョブスレッドで何も読み書きする前に拒否します: その実行は *FullLoadRefusedError* と同じ 1 行の理由で失敗として記録されます。
 
 ---
@@ -332,8 +362,9 @@ Full load + CDC では、CDC を開始するまで、ロード後にテーブル
 > **コマンドラインから Full Load を実行(任意)。** 同じバルクローダーは CLI スクリプトとしても
 > 利用できます — `scripts/run_full_load.py`(まずプランを表示し、次に `--yes`。任意で `--clean`、
 > CDC ウォーターマークを取得する `--watermark-out`)— Web UI なしでの自動化や TB 規模の実行に便利です。
-> 詳細は [`scripts/README.md`](../../../scripts/README.md) を参照。ソースは読み取り専用で(唯一の例外は
-> §3.1 で述べた PostgreSQL-CDC のスロットと publication)、ロードは UI と同様に冪等です。
+> 詳細は [`scripts/README.md`](../../../scripts/README.md) を参照。ソースは読み取り専用で(`--watermark-out`
+> を指定した実行は Full load + CDC の実行なので、ソースが `gtid_mode=ON` でない限りウォーターマークの直後に
+> `FLUSH BINARY LOGS` を実行し、これには `RELOAD` が必要です。§3.5)、ロードは UI と同様に冪等です。
 
 ---
 

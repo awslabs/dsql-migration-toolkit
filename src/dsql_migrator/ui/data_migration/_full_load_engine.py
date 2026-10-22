@@ -76,6 +76,7 @@ from dsql_migrator.core.converter import (
 )
 from dsql_migrator.core.cdc_coords import gtid_mode_is_on
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
+from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
 from dsql_migrator.core.column_exclusion import names_in as _names_in  # noqa: F401
 from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
 from dsql_migrator.core.schema_applier import (
@@ -493,6 +494,13 @@ def _sync_identity_sequences_after_load(
 # ---------------------------------------------------------------------------
 
 
+def _drop_chunks_without_start_point(job: MigrationJob) -> None:
+    """Clear the seeded chunks of a run that recorded no watermark (G147, run_full_load)."""
+    if job.watermark is None:
+        job.chunks = []
+        _recompute_progress(job)
+
+
 def _seed_chunks(job: MigrationJob, table_names: Sequence[str]) -> None:
     """Initialize one ``PENDING`` chunk per table on ``job`` (start of a run)."""
     job.chunks = [
@@ -758,6 +766,16 @@ class FullLoadIncompleteError(RuntimeError):
     cooperative stop (:class:`_FullLoadStopped`), which the manager records as
     ``CANCELLED``.
     """
+
+
+# G147: a Full load + CDC record with no watermark -- its run ended before recording CDC's start
+# point (a restart during the capture or the fence; a failure there keeps no table, see
+# run_full_load) -- has no start point for a Retry to load under. The step disables Retry with
+# this; run_full_load_retry refuses it.
+NO_START_POINT_RETRY_REFUSAL = (
+    "This Full Load ended before recording CDC's start point, so a retry would load its "
+    "tables under none: use Re-run all tables, which records one."
+)
 
 
 class FullLoadRefusedError(RuntimeError):
@@ -4513,12 +4531,20 @@ def _log_captured_watermark(
     coord = watermark_coordinate(watermark, source_type)
     ts = watermark.snapshot_timestamp.isoformat().replace("+00:00", "Z")
     approx = " (row counts are approximate estimates)" if watermark.row_counts_approximate else ""
+    # G147: a MySQL binlog position no commit fence made exact (a Full load only run) is not
+    # the gapless handoff point the CDC step would otherwise be told it is.
+    what = (
+        "consistency point, recorded without waiting for in-flight commits (a CDC start from "
+        "it can miss a transaction still committing then)"
+        if source_type is not SourceType.POSTGRES and start_point_unfenced(watermark)
+        else "consistency point for the gapless CDC handoff"
+    )
     log_activity(
         ActivityCategory.FULL_LOAD,
         "watermark captured",
         status=ActivityStatus.INFO,
         detail=(
-            f"consistency point for the gapless CDC handoff: {coord}; "
+            f"{what}: {coord}; "
             f"snapshot={ts}; {len(watermark.table_row_counts)} table(s) counted{approx}"
         ),
     )
@@ -4857,6 +4883,12 @@ def run_full_load(
         _predrop_blocking_foreign_keys(migrator)
         _predrop_dependent_views(migrator)
     except Exception as exc:  # noqa: BLE001 - logged, then re-raised unchanged
+        # G147: a Full load + CDC run that ended before recording its start point (its
+        # capture, or the fence that makes it exact, failed) keeps no PENDING table: "Retry
+        # unfinished tables" would load them under no start point at all, as the G25
+        # refusal above seeds none. Nothing was read; Start runs the load afresh.
+        if getattr(inputs or getattr(migrator, "_inputs", None), "is_cdc_migration", False):
+            handle.update(_drop_chunks_without_start_point)
         log_activity(
             ActivityCategory.FULL_LOAD,
             "run failed",
@@ -5450,6 +5482,18 @@ def run_full_load_retry(
     """
     job_id = handle.job_id
     retry_names = {table.name for table in tables_to_retry}
+    if watermark is None and getattr(
+        inputs or getattr(migrator, "_inputs", None), "is_cdc_migration", False
+    ):
+        # G147: refused before anything is seeded, read or written (the step disables the
+        # button too).
+        log_activity(
+            ActivityCategory.FULL_LOAD,
+            "retry refused",
+            status=ActivityStatus.FAILURE,
+            detail=f"nothing was read or written: {NO_START_POINT_RETRY_REFUSAL}",
+        )
+        raise FullLoadRefusedError(NO_START_POINT_RETRY_REFUSAL)
     error_job_ids = _retry_error_lineage(
         prior_chunks, retry_names, job_id,
         prior_job_id=prior_job_id,
@@ -6446,10 +6490,30 @@ class BatchedTableMigrator:
         # double) is called exactly as before.
         baseline = tuple(getattr(self._inputs, "cdc_baseline_tables", None) or ())
         if baseline:
-            return self._watermark_capturer.capture(
+            watermark = self._watermark_capturer.capture(
                 source, table_names, baseline_tables=baseline
             )
-        return self._watermark_capturer.capture(source, table_names)
+        else:
+            watermark = self._watermark_capturer.capture(source, table_names)
+        # A Full load + CDC run's CDC replays from this point, so it must be exact before any
+        # reader opens its snapshot (G147): the real capturer fences it. A Full load only run
+        # copies the snapshots and nothing else: no fence, no administrative statement on its
+        # source. A capturer without the method (a test double) records the point unfenced.
+        fence = getattr(self._watermark_capturer, "fence_start_point", None)
+        if fence is not None and self._inputs.is_cdc_migration:
+
+            def _audit(message: str, *, warning: bool = False) -> None:
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "CDC start point",
+                    status=ActivityStatus.WARNING if warning else ActivityStatus.INFO,
+                    detail=f"source: {message}",
+                )
+
+            watermark = fence(
+                source, watermark, password=self._inputs.source_password, on_log=_audit
+            )
+        return watermark
 
     def _capture_postgres_watermark(
         self, source: SourceConnectionConfig, table_names: Sequence[str]

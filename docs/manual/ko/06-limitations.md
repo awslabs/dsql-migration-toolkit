@@ -75,7 +75,9 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
 - **CDC는 소스 측 사전 요건이 있음(엔진별).** 사전 점검 게이트가 이 조건이 충족될 때까지 **CDC를
   차단**합니다. **Full Load만 한다면 이 중 아무것도 필요 없습니다.**
   - **MySQL 소스:** 바이너리 로깅이 **ROW 포맷, 전체 행 이미지**(full row image)로 켜져 있고
-    (`binlog_format=ROW`, `binlog_row_image=FULL`) **복제 권한**을 가진 사용자가 있어야 합니다.
+    (`binlog_format=ROW`, `binlog_row_image=FULL`) **복제 권한**을 가진 사용자가 있어야 합니다 — 소스가
+    `gtid_mode=ON`이 아니면 Full load + CDC 실행에는 `RELOAD`도 필요하며, enhanced binlog를 쓰는 Aurora
+    MySQL에서는 그런 실행에 `gtid_mode=ON`이 필요합니다.
     또한 Full Load 워터마크 시점의 로그가 CDC가 시작될 때까지 남아 있도록 **binlog 보존 기간을 늘려야**
     합니다(Aurora MySQL은 기본적으로 24시간만 보존). RDS/Aurora에서는 `my.cnf`가 아니라 파라미터 그룹과
     `mysql.rds_set_configuration`으로 설정합니다 — [§1.1](01-setup.md#11-사전-요구사항) 참조.
