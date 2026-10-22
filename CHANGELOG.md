@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.574
+
+### Fixed
+
+- **A MySQL Full load + CDC migration no longer loses a transaction that was still committing at the CDC start point.** The Full Load records CDC's start point before it reads any table; every table is then read from its own snapshot, and CDC replays every change after the point. On a source not running `gtid_mode=ON` that point is a binlog file and position, and MySQL writes a transaction to the binlog before it commits it: a position read in between already covered a transaction no snapshot could see yet, so neither the Full Load nor CDC copied it, silently (reproduced on MySQL 8.0, 8.4 and Aurora MySQL 3). A Full load + CDC run now issues `FLUSH BINARY LOGS` right after recording the position and before any table is read: MySQL waits for every transaction already in the binlog to commit before it switches to a new file (normally milliseconds, during which new commits wait too). It locks no table and writes no data; the binlog moves to a new file, and the activity log records it. A `gtid_mode=ON` start point was exact already and runs no FLUSH. Every Full load + CDC run, `gtid_mode=ON` included, also waits up to 30 s for the XA transactions prepared at that moment (`XA RECOVER`), as one committed after the reads begin is copied by neither, and stops if one is still prepared; without `XA_RECOVER_ADMIN` (MySQL 8.0.19 and later) it logs a warning and goes on. A Full load only run does neither.
+- **New prerequisite: "CDC start point can be made exact".** It is checked for every MySQL Full load + CDC run: it passes with `gtid_mode=ON` or the `RELOAD` privilege, and fails without either, or on Aurora MySQL with enhanced binlog without `gtid_mode=ON` (the tool does not rely on the flush there); when `RELOAD` may come through a role, which plain `SHOW GRANTS` does not show, it only warns. Its failure holds the Full Load runs that record a start point (and *Reload specific tables*), not Deploy or Start CDC.
+- **Start CDC says when its Automatic start point was recorded without that wait** — one recorded by a Full load only run, or by an earlier version, on a source not running `gtid_mode=ON`. The start-point card and the Start CDC dialog warn *This start point was recorded without waiting for in-flight commits* and name the remedy: re-run the Full Load through Full load + CDC choosing Drop & reload, or validate in CHECKSUM mode once CDC has caught up. The card and the activity log no longer call such a point gapless, the Full load only completion notice warns too, and the Full Load confirm dialog names the FLUSH.
+- **A Full load + CDC run that ends before recording its start point keeps no table pending**, so *Retry unfinished tables* can no longer load those tables under no start point.
+- **CDC only's re-run of the Full Load now goes through Full load + CDC (MySQL)**, whose Full Load makes the start point exact, instead of Full load only.
+
+### Upgrade notes
+
+- **MySQL Full load + CDC on a source not running `gtid_mode=ON` now needs the `RELOAD` privilege** (the admin user that RDS and Aurora create with the database holds it). Without it the prerequisite fails and the run stops before reading any table: grant `RELOAD`, or set `gtid_mode=ON`.
+- **Aurora MySQL with enhanced binlog needs `gtid_mode=ON` for a Full load + CDC run**, or enhanced binlog turned off; either is a writer reboot.
+- **A start point recorded by 0.1.573 or earlier on a source not running `gtid_mode=ON` now shows the new warning at Start CDC.** A stack that already streams continues as before and shows no warning: if it started from such a point, validate in CHECKSUM mode once CDC has caught up to rule out a transaction lost there.
+- **`scripts/run_full_load.py --watermark-out` now runs as Full load + CDC:** the same FLUSH, `RELOAD` requirement and refusals, and with reader shards above 1 (`DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS`) a large table can be read in parts, which only CDC's replay from that watermark makes consistent.
+- **After a run that issued `FLUSH BINARY LOGS`, Validation's *No source drift since snapshot* check can warn even on an idle source:** the flush moved the binlog to a new file. The check is advisory and holds nothing.
+- **App stack: an image-only update is enough.** The template changed only its default image; there is no IAM change, and the sink plugin is unchanged (v54), so no CDC infrastructure redeploy is needed. Finish or stop running jobs first: the task replacement ends them.
+
 ## v0.1.573
 
 ### Fixed

@@ -18,8 +18,8 @@ waits until every transaction written to the current one has finished its InnoDB
 (it holds the binlog lock meanwhile, so new commits wait too -- normally for one group
 commit). Run after the start point is read and before any reader opens, it guarantees that
 every transaction before the start point is visible to every snapshot of the load. It
-locks no table and needs only the RELOAD privilege, which the RDS and Aurora master users
-hold; it rotates the binlog to a new file.
+locks no table and needs only the RELOAD privilege, which the admin user RDS and Aurora
+create with the database holds; it rotates the binlog to a new file.
 
 On Aurora MySQL with enhanced binlog the tool does not rely on the flush (a position there
 was seen covering a transaction its snapshot could not see yet, and the flush cannot be

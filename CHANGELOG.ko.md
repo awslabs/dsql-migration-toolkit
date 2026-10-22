@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.574
+
+### 수정
+
+- **MySQL Full load + CDC 마이그레이션이 CDC 시작점에서 아직 커밋 중이던 트랜잭션을 더 이상 잃지 않습니다.** Full Load는 어떤 테이블도 읽기 전에 CDC 시작점을 기록하고, 그다음 테이블마다 자신의 스냅샷에서 읽으며, CDC는 그 지점 이후의 모든 변경을 다시 적용합니다. `gtid_mode=ON`이 아닌 소스에서 그 지점은 binlog 파일과 위치인데, MySQL은 트랜잭션을 커밋하기 전에 binlog에 먼저 기록합니다. 그 사이에 읽은 위치는 아직 어떤 스냅샷도 볼 수 없던 트랜잭션을 이미 포함했고, 그래서 Full Load도 CDC도 그 트랜잭션을 아무 표시 없이 빠뜨렸습니다(MySQL 8.0, 8.4, Aurora MySQL 3에서 재현). 이제 Full load + CDC 실행은 위치를 기록한 직후, 어떤 테이블도 읽기 전에 `FLUSH BINARY LOGS`를 실행합니다. MySQL은 새 파일로 바꾸기 전에 이미 binlog에 들어간 트랜잭션이 모두 커밋될 때까지 기다립니다(보통 수 밀리초이며, 그동안 새 커밋도 기다립니다). 테이블을 잠그지 않고 데이터를 쓰지 않으며, binlog는 새 파일로 넘어가고 활동 로그가 이를 기록합니다. `gtid_mode=ON` 시작점은 원래 정확하므로 FLUSH를 실행하지 않습니다. `gtid_mode=ON`을 포함한 모든 Full load + CDC 실행은 그 순간 준비 상태인 XA 트랜잭션(`XA RECOVER`)도 최대 30초 기다리고(읽기가 시작된 뒤 커밋되는 트랜잭션은 어느 쪽에도 복사되지 않기 때문입니다), 그래도 남아 있으면 멈춥니다. `XA_RECOVER_ADMIN`이 없으면(MySQL 8.0.19 이상) 경고를 기록하고 계속합니다. Full load only 실행은 둘 다 하지 않습니다.
+- **새 사전 점검 항목: "CDC start point can be made exact".** MySQL Full load + CDC 실행마다 확인합니다. `gtid_mode=ON`이거나 `RELOAD` 권한이 있으면 통과하고, 둘 다 없거나, `gtid_mode=ON` 없이 enhanced binlog를 쓰는 Aurora MySQL이면 실패합니다(도구는 그런 소스에서 FLUSH에 의존하지 않습니다). `RELOAD`가 role을 통해 부여되었을 수 있어 일반 `SHOW GRANTS`로 보이지 않으면 경고만 합니다. 이 항목이 실패하면 시작점을 기록하는 Full Load 실행(그리고 *Reload specific tables*)을 보류하며, Deploy나 Start CDC는 보류하지 않습니다.
+- **Start CDC는 Automatic 시작점이 그 대기 없이 기록된 경우 이를 알려 줍니다.** `gtid_mode=ON`이 아닌 소스에서 Full load only 실행이나 이전 버전이 기록한 시작점입니다. 시작점 카드와 Start CDC 다이얼로그는 *This start point was recorded without waiting for in-flight commits* 경고와 함께 해결 방법을 알려 줍니다: Full load + CDC에서 Drop & reload를 선택해 Full Load를 다시 실행하거나, CDC가 따라잡은 뒤 CHECKSUM 모드로 검증하는 것입니다. 카드와 활동 로그는 그런 시작점을 더 이상 gapless라고 부르지 않고, Full load only 완료 안내도 경고하며, Full Load 확인 다이얼로그는 FLUSH를 밝힙니다.
+- **시작점을 기록하기 전에 끝난 Full load + CDC 실행은 대기 중인 테이블을 남기지 않습니다.** 그래서 *Retry unfinished tables*가 더 이상 그 테이블을 시작점 없이 적재할 수 없습니다.
+- **CDC only의 Full Load 재실행은 이제 Full load only가 아니라 Full load + CDC를 거칩니다(MySQL).** 그 Full Load가 시작점을 정확하게 맞춥니다.
+
+### 업그레이드 참고
+
+- **`gtid_mode=ON`이 아닌 소스의 MySQL Full load + CDC에는 이제 `RELOAD` 권한이 필요합니다**(RDS와 Aurora가 데이터베이스를 만들 때 생성하는 관리자 사용자는 갖고 있습니다). 없으면 사전 점검이 실패하고 실행은 어떤 테이블도 읽기 전에 멈춥니다. `RELOAD`를 부여하거나 `gtid_mode=ON`으로 설정하세요.
+- **enhanced binlog를 쓰는 Aurora MySQL의 Full load + CDC 실행에는 `gtid_mode=ON`이 필요합니다.** 또는 enhanced binlog를 꺼야 하며, 어느 쪽이든 writer 재부팅이 필요합니다.
+- **0.1.573 이하 버전이 `gtid_mode=ON`이 아닌 소스에서 기록한 시작점에는 이제 Start CDC에서 새 경고가 표시됩니다.** 이미 스트리밍 중인 스택은 그대로 계속되고 경고도 표시하지 않습니다. 그런 시작점에서 시작했다면 CDC가 따라잡은 뒤 CHECKSUM 모드로 검증해 그곳에서 잃은 트랜잭션이 없는지 확인하세요.
+- **`scripts/run_full_load.py --watermark-out`은 이제 Full load + CDC로 실행됩니다.** 같은 FLUSH, `RELOAD` 요구, 거부 조건이 적용되고, reader shard가 1보다 크면(`DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS`) 큰 테이블을 여러 부분으로 나눠 읽을 수 있으며, 그 결과는 그 워터마크부터 CDC가 다시 적용해야 일관됩니다.
+- **`FLUSH BINARY LOGS`를 실행한 실행 뒤에는 쓰기가 없는 소스에서도 Validation의 *No source drift since snapshot* 점검이 경고할 수 있습니다.** FLUSH가 binlog를 새 파일로 넘겼기 때문입니다. 이 점검은 참고용이며 아무것도 보류하지 않습니다.
+- **앱 스택: 이미지만 업데이트하면 됩니다.** 템플릿은 기본 이미지만 바뀌었고 IAM 변경은 없으며, 싱크 플러그인도 그대로(v54)라 CDC 인프라 재배포가 필요 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+
 ## v0.1.573
 
 ### 수정
