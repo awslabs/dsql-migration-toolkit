@@ -626,6 +626,13 @@ def _reflect_tables(
                         prefix_lengths=prefix_lengths,
                         where=str(pg_where) if pg_where else None,
                         method=str(pg_using) if pg_using else None,
+                        # PostgreSQL 15+ UNIQUE ... NULLS NOT DISTINCT, an index or the
+                        # one backing a UNIQUE constraint. SQLAlchemy reads it from
+                        # pg_index.indnullsnotdistinct only on 15+ (PostgreSQL 13 and 14
+                        # have no such column) and sets the key only when it is true.
+                        nulls_not_distinct=bool(
+                            dialect_options.get("postgresql_nulls_not_distinct")
+                        ),
                     )
                 )
 

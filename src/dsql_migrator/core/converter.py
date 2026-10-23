@@ -87,11 +87,13 @@ from dsql_migrator.core.models import (
     Classification,
     ColumnDef,
     ConversionNoteKind,
+    ExclusionConstraintDef,
     ForeignKeyDef,
     IndexDef,
     SourceInventory,
     SourceType,
     TableDef,
+    TemporalKeyDef,
     ViewDef,
 )
 from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
@@ -2148,6 +2150,20 @@ def parse_target_primary_key(create_ddl: str, *, for_exclusion: bool = False) ->
 # ``CREATE [UNIQUE] INDEX ASYNC``: sqlglot reads the statement only without ASYNC.
 _INDEX_ASYNC_RE = re.compile(r"\bINDEX\s+ASYNC\b", re.IGNORECASE)
 _UNIQUE_WORD_RE = re.compile(r"\bUNIQUE\b", re.IGNORECASE)
+# ``NULLS [NOT] DISTINCT`` after an index's key list (PostgreSQL 15+, G151): sqlglot 30 reads
+# a CREATE INDEX that has it only as an unparsed Command, and it decides how NULL keys
+# compare, never which columns are the key.
+_NULLS_DISTINCT_RE = re.compile(r"\)(\s*NULLS\s+(?:NOT\s+)?DISTINCT\b)", re.IGNORECASE)
+
+
+def _without_nulls_distinct(statement: str) -> str:
+    """``statement`` without the ``NULLS [NOT] DISTINCT`` clause that follows its key list
+    (matched outside string literals and comments). Pure."""
+    masked = _mask_sql_literals(statement)
+    spans = [match.span(1) for match in _NULLS_DISTINCT_RE.finditer(masked)]
+    for start, end in reversed(spans):
+        statement = statement[:start] + statement[end:]
+    return statement
 
 
 def _plain_key_columns(nodes) -> "Optional[list[str]]":
@@ -2170,11 +2186,11 @@ def parse_target_unique_keys(
     The primary key (a named ``CONSTRAINT ... PRIMARY KEY`` too), each ``UNIQUE``
     constraint of the ``CREATE TABLE`` (column-level and table-level, named or not) and each
     ``CREATE UNIQUE INDEX [ASYNC]`` of ``index_ddls`` -- a partial one too: it is unique
-    within its predicate -- as column lists, names as PostgreSQL stores them. A plain
-    ``CREATE INDEX`` is no key. ``None`` when any of it cannot be read: the DDL does not
-    parse, declares no primary key, or a unique key holds an expression, or a statement
-    names UNIQUE but does not parse as a unique index. The Full Load's reader-shard guard
-    refuses to split a table then. Pure.
+    within its predicate; and one with ``NULLS NOT DISTINCT`` -- as column lists, names as
+    PostgreSQL stores them. A plain ``CREATE INDEX`` is no key. ``None`` when any of it
+    cannot be read: the DDL does not parse, declares no primary key, or a unique key holds
+    an expression, or a statement names UNIQUE but does not parse as a unique index. The
+    Full Load's reader-shard guard refuses to split a table then. Pure.
     """
     primary = parse_target_primary_key(target_ddl, for_exclusion=True)
     if not primary:
@@ -2206,7 +2222,8 @@ def parse_target_unique_keys(
             continue
         try:
             parsed = sqlglot.parse_one(
-                _INDEX_ASYNC_RE.sub("INDEX", statement, count=1), read="postgres"
+                _without_nulls_distinct(_INDEX_ASYNC_RE.sub("INDEX", statement, count=1)),
+                read="postgres",
             )
         except Exception:  # noqa: BLE001 - unreadable -> unknown
             return None
@@ -3851,6 +3868,10 @@ def _build_index_ddls(
         statements.append(
             f"CREATE {unique}INDEX ASYNC {_quote_pg_identifier(name)} "
             f"ON {table_identifier} ({columns})"
+            # A PostgreSQL 15+ UNIQUE ... NULLS NOT DISTINCT keeps it (G151; Aurora DSQL
+            # accepts it, live-verified): without it the target took any number of rows
+            # with a NULL key the source refused. Before WHERE, as PostgreSQL's grammar has it.
+            + (" NULLS NOT DISTINCT" if index.unique and index.nulls_not_distinct else "")
             + (f" WHERE {predicate}" if predicate else "")
         )
     return statements
@@ -5699,12 +5720,16 @@ def _pg_partial_or_nonbtree_index_warning(
     ]
     full = [index.name for index in uncarried if not index.unique and index.name in emitted]
     left_out = [index.name for index in uncarried if index.unique]
+    # A WITHOUT OVERLAPS key's index is GiST because the key needs it, not for a search:
+    # its own note (_pg_temporal_key_warning) says what the btree key keeps and loses.
+    temporal = {key.index for key in table.temporal_keys if key.index}
     nonbtree = [
         (index.name, index.method)
         for index in table.indexes
         if index.method
         and index.method.strip().lower() not in ("", "btree")
         and index.name in emitted
+        and index.name not in temporal
     ]
     # A hash or BRIN index served only what a btree serves (=, <, <=, >=, >), so its btree
     # is advice, like a non-UNIQUE partial index made FULL (a bigger index, the same
@@ -6677,6 +6702,130 @@ def _check_constraint_warning(
     )
 
 
+# How many exclusion constraints / WITHOUT OVERLAPS keys one note spells out before it names
+# the rest (the note renders into a UI card and two report formats, like the CHECK finding).
+_MAX_KEY_RULES_SHOWN = 6
+
+
+def _listed_key_rules(rules: "Sequence[ExclusionConstraintDef | TemporalKeyDef]") -> str:
+    """``name: definition`` for the first :data:`_MAX_KEY_RULES_SHOWN`, the rest by name."""
+    shown = "; ".join(
+        f"{rule.name}: {rule.definition}" if rule.definition else rule.name
+        for rule in rules[:_MAX_KEY_RULES_SHOWN]
+    )
+    rest = rules[_MAX_KEY_RULES_SHOWN:]
+    if rest:
+        shown += f"; and {len(rest)} more ({', '.join(rule.name for rule in rest)})"
+    return shown
+
+
+def _pg_exclusion_constraint_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL EXCLUDE constraints, which Aurora DSQL rejects (G151).
+
+    Neither the constraint nor the index that enforced it is created: SQLAlchemy reflects
+    that index as an ordinary one, and creating it as a plain btree index enforced nothing
+    while it read like the source's. Introspection keeps it out of ``indexes``
+    (``source_dialect.postgres._pg_read_exclusion_rules``). Concurrent writers must conflict
+    on a row both write, or each passes the application's check and both commit."""
+    rules = list(table.exclusion_constraints)
+    if not rules:
+        return None
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"Exclusion constraint(s) are NOT created — {_listed_key_rules(rules)}. Aurora "
+            "DSQL does not support EXCLUDE constraints, so after cut over the target accepts "
+            "rows that break such a rule; the index that enforced each one on the source is "
+            "not created either (it existed for the rule: add an ordinary index if queries "
+            "look rows up by its columns). Enforce the rule in the application, with "
+            "concurrent writers made to conflict on a row they both update (otherwise each "
+            "passes its check and both commit), or change the design."
+        ),
+    )
+
+
+def _pg_temporal_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL 18 PRIMARY KEY / UNIQUE keys declared WITHOUT OVERLAPS (G151).
+
+    Aurora DSQL has no WITHOUT OVERLAPS, so each key is created as an ordinary key on the
+    same columns (the primary key in the CREATE TABLE, a UNIQUE one as its CREATE UNIQUE
+    INDEX ASYNC): it refuses only an exact duplicate, so rows whose periods overlap are
+    accepted after cut over. The period column stays in the key: without it the key is not
+    unique (the source holds a row per period). A temporal PRIMARY KEY also slows the reads:
+    Full Load and Validation page the table in key order, which the source's GiST index for
+    it cannot return, so each page scans and sorts the rest of the table (verified on
+    PostgreSQL 18.6; a btree index on the same columns makes it an index scan, so that
+    advice is left out when the source has one)."""
+    keys = list(table.temporal_keys)
+    if not keys:
+        return None
+    by_index = {index.name: index for index in table.indexes}
+    emitted = {index.name for index in _emittable_secondary_indexes(table, is_postgres=True)}
+    left_out = [
+        key.name
+        for key in keys
+        if not key.primary and key.index in by_index and key.index not in emitted
+    ]
+    columns_of = {
+        key.name: (
+            list(table.primary_key)
+            if key.primary
+            else list(by_index[key.index].columns) if key.index in by_index else []
+        )
+        for key in keys
+    }
+    example = next((columns_of[key.name] for key in keys if len(columns_of[key.name]) > 1), [])
+    if example:
+        others = ", ".join(example[:-1])
+        overlap = (
+            f"accepts two rows with the same {others} whose {example[-1]} periods overlap"
+        )
+    else:
+        overlap = "accepts rows whose periods overlap"
+    message = (
+        f"WITHOUT OVERLAPS key(s) are created as ordinary keys on the same columns — "
+        f"{_listed_key_rules(keys)}. Aurora DSQL has no WITHOUT OVERLAPS, so after cut over "
+        f"such a key refuses only a row equal to another in every key column and {overlap}; "
+        "the period column stays in the key because the key without it is not unique. "
+        "Enforce the no-overlap rule in the application, with concurrent writers made to "
+        "conflict on a row they both update, or change the design."
+    )
+    if left_out:
+        message += (
+            f" {', '.join(left_out)} {'is' if len(left_out) == 1 else 'are'} not created at "
+            "all: see the note on its columns."
+        )
+    primary = next((key for key in keys if key.primary), None)
+    # Unless the source already has the index this sentence asks for -- a plain btree one
+    # led by the key's columns, in key order -- which the reads then use: after the
+    # operator adds it and re-runs Evaluation, the advice must not ask for it again.
+    key_columns = list(table.primary_key)
+    expression = set(table.expression_indexes)
+    served = any(
+        list(index.columns[: len(key_columns)]) == key_columns
+        and (index.method or "btree").strip().lower() == "btree"
+        and not (index.where or "").strip()
+        and index.name not in expression
+        for index in table.indexes
+    )
+    if primary is not None and key_columns and not served:
+        listed = ", ".join(table.primary_key)
+        message += (
+            f" Full Load and Validation read the table in primary-key order, which the "
+            "source's index for a WITHOUT OVERLAPS key (GiST) cannot return, so on a large "
+            "table each page scans and sorts the rest of it: add a btree index on "
+            f"({listed}) on the source before the load."
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=message,
+    )
+
+
 # The one fix for column names that truncate to the same 63 bytes, shown by both steps.
 IDENTIFIER_COLLISION_REMEDY = (
     "Shorten the colliding column names on the source so they differ within their first "
@@ -7441,6 +7590,10 @@ class SchemaConverter:
             ),
             _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
             _check_constraint_warning(table, is_postgres=is_postgres),
+            # PostgreSQL rules Aurora DSQL cannot enforce: EXCLUDE constraints (not created,
+            # nor their indexes) and WITHOUT OVERLAPS keys (kept as ordinary keys).
+            (_pg_exclusion_constraint_warning(table) if is_postgres else None),
+            (_pg_temporal_key_warning(table) if is_postgres else None),
             _identifier_length_warning(
                 table,
                 generated_index_names=generated_index_names,

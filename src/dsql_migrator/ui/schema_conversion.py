@@ -776,9 +776,23 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
                 else "  /* GENERATED column - expression not captured */"
             )
         clauses.append(clause)
-    if table.primary_key:
+    # A WITHOUT OVERLAPS key and an EXCLUDE constraint (G151) are shown as the source
+    # defines them (pg_get_constraintdef): the clause is exactly what the target loses.
+    temporal_primary = next((key for key in table.temporal_keys if key.primary), None)
+    temporal_unique = {
+        key.index: key for key in table.temporal_keys if not key.primary and key.index
+    }
+    if temporal_primary is not None and temporal_primary.definition:
+        clauses.append(
+            f"  CONSTRAINT {_quote_pg_ident(temporal_primary.name)} "
+            f"{temporal_primary.definition}"
+        )
+    elif table.primary_key:
         pk_columns = ", ".join(_quote_pg_ident(name) for name in table.primary_key)
         clauses.append(f"  PRIMARY KEY ({pk_columns})")
+    for key in temporal_unique.values():
+        if key.definition:
+            clauses.append(f"  CONSTRAINT {_quote_pg_ident(key.name)} {key.definition}")
     for foreign_key in table.foreign_keys:
         columns = ", ".join(_quote_pg_ident(name) for name in foreign_key.columns)
         ref_columns = ", ".join(
@@ -788,19 +802,28 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
             f"  CONSTRAINT {_quote_pg_ident(foreign_key.name)} FOREIGN KEY ({columns}) "
             f"REFERENCES {_quote_pg_table(foreign_key.referenced_table)} ({ref_columns})"
         )
+    for constraint in table.exclusion_constraints:
+        clauses.append(
+            f"  CONSTRAINT {_quote_pg_ident(constraint.name)} "
+            + (constraint.definition or "EXCLUDE (...) /* definition not captured */")
+        )
     body = ",\n".join(clauses)
     rendered = f"CREATE TABLE {_quote_pg_table(table.name)} (\n{body}\n)"
     for index in table.indexes:
+        known = temporal_unique.get(index.name)
+        if known is not None and known.definition:
+            continue  # the UNIQUE ... WITHOUT OVERLAPS clause above
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_ident(name) for name in index.columns)
         method = (index.method or "").strip()
         # The access method and predicate as the source has them: without them a partial
         # UNIQUE read as a full one beside its carried predicate on the target side.
         using = f" USING {method}" if method and method.lower() != "btree" else ""
+        nulls = " NULLS NOT DISTINCT" if index.unique and index.nulls_not_distinct else ""
         where = f" WHERE {index.where.strip()}" if (index.where or "").strip() else ""
         rendered += (
             f";\nCREATE {unique}INDEX {_quote_pg_ident(index.name)} "
-            f"ON {_quote_pg_table(table.name)}{using} ({columns}){where}"
+            f"ON {_quote_pg_table(table.name)}{using} ({columns}){nulls}{where}"
         )
     if table.partitioned:
         rendered += "\n/* PARTITION BY ... - partitioned source table; clause not captured */"

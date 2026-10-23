@@ -329,6 +329,20 @@ class IndexDef(BaseModel):
             "when unknown and for every MySQL index."
         ),
     )
+    nulls_not_distinct: bool = Field(
+        default=False,
+        exclude_if=lambda v: not v,
+        description=(
+            "True for a PostgreSQL 15+ UNIQUE index or constraint declared NULLS NOT "
+            "DISTINCT (the reflected ``postgresql_nulls_not_distinct``, which SQLAlchemy "
+            "reads from pg_index.indnullsnotdistinct, and reports False on PostgreSQL 13 "
+            "and 14, which have no such column): one NULL key then excludes another, where "
+            "a plain UNIQUE accepts any number of them. Emitted as ``CREATE UNIQUE INDEX "
+            "ASYNC ... NULLS NOT DISTINCT``, which Aurora DSQL accepts. Left out of the "
+            "payload while False (IndexDef is extra='forbid'), so an inventory with no such "
+            "index still loads on an older build, and one from an older build loads here."
+        ),
+    )
 
 
 class ForeignKeyDef(BaseModel):
@@ -398,6 +412,49 @@ class CheckConstraintDef(BaseModel):
     not_valid: bool = False
 
 
+class ExclusionConstraintDef(BaseModel):
+    """A PostgreSQL ``EXCLUDE`` constraint (``pg_constraint.contype = 'x'``).
+
+    Aurora DSQL rejects EXCLUDE constraints (in ``CREATE TABLE`` and in ``ALTER TABLE ...
+    ADD CONSTRAINT``, live-verified), so the rule is not enforced on the target after cut
+    over. SQLAlchemy reflects the index that enforces it as an ordinary, non-unique index;
+    introspection moves it here instead, because that index existed only to enforce the
+    rule: Schema Conversion does not create it, and it counts toward nothing (the index
+    budget, the index renames).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    # ``pg_get_constraintdef`` text, e.g. ``EXCLUDE USING gist (room WITH =, during WITH
+    # &&)``: what the operator has to enforce in the application. Schema DDL, never row data.
+    definition: str = ""
+    # The name of the index that enforced it on the source (usually the constraint's own).
+    index: Optional[str] = None
+
+
+class TemporalKeyDef(BaseModel):
+    """A PostgreSQL 18 ``PRIMARY KEY`` / ``UNIQUE`` key declared ``WITHOUT OVERLAPS``.
+
+    PostgreSQL enforces it like an exclusion constraint (``=`` on the other columns, ``&&``
+    on the period column). Aurora DSQL has no WITHOUT OVERLAPS, so the key is created as an
+    ordinary key on the same columns: it refuses only an exact duplicate, and rows of one
+    key whose periods overlap are accepted after cut over. Read from
+    ``pg_constraint.conperiod``, a column PostgreSQL 13-17 do not have.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    # ``pg_get_constraintdef`` text, e.g. ``PRIMARY KEY (id, valid_at WITHOUT OVERLAPS)``.
+    definition: str = ""
+    # True for the table's PRIMARY KEY, False for a UNIQUE constraint.
+    primary: bool = False
+    # The name of the index that enforced it on the source (the UNIQUE one's is the
+    # secondary index Schema Conversion creates as an ordinary UNIQUE index).
+    index: Optional[str] = None
+
+
 class TableDef(BaseModel):
     """A source table definition."""
 
@@ -425,6 +482,25 @@ class TableDef(BaseModel):
     comment: Optional[str] = Field(
         default=None,
         description="MySQL table COMMENT, if any. Not carried to Aurora DSQL (dropped).",
+    )
+    # PostgreSQL rules Aurora DSQL cannot enforce (G151). Left out of the payload while
+    # empty, like SourceInventory.server_settings: this model is extra="forbid", so an
+    # inventory or saved session that never read them still loads on an older build.
+    exclusion_constraints: list[ExclusionConstraintDef] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description=(
+            "PostgreSQL EXCLUDE constraints. Not created on Aurora DSQL, which rejects "
+            "them, and their indexes are not in ``indexes``."
+        ),
+    )
+    temporal_keys: list[TemporalKeyDef] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description=(
+            "PostgreSQL 18 PRIMARY KEY / UNIQUE keys declared WITHOUT OVERLAPS. Created "
+            "as ordinary keys on the same columns, without the no-overlap rule."
+        ),
     )
 
 
@@ -2370,6 +2446,8 @@ __all__ = [
     "IndexDef",
     "ForeignKeyDef",
     "CheckConstraintDef",
+    "ExclusionConstraintDef",
+    "TemporalKeyDef",
     "TableDef",
     "apply_lob_exclusions",
     "ViewDef",

@@ -43,6 +43,10 @@ _EXPECTED_PG_RULE_IDS = {
     "VIEW_REMODELLED_COLUMN",
     "FK_PRESERVED",
     "CHECK_CONSTRAINT_DROPPED",
+    # PG-specific (G151): EXCLUDE constraints and PostgreSQL 18 WITHOUT OVERLAPS keys,
+    # which Aurora DSQL cannot enforce (the converter's own notes).
+    "PG_EXCLUSION_CONSTRAINT",
+    "PG_TEMPORAL_KEY",
     "TRIGGER_UNSUPPORTED",
     "PROC_PLPGSQL",
     "EVENT_UNSUPPORTED",

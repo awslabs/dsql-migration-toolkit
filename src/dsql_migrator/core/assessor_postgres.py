@@ -1594,7 +1594,9 @@ def default_rules() -> "list[Rule]":
         pg_collation_rule,
         default_dropped_rule,
         expression_index_rule,
+        pg_exclusion_constraint_rule,
         pg_index_not_preserved_rule,
+        pg_temporal_key_rule,
         pg_unindexable_column_rule,
     )
 
@@ -1614,6 +1616,10 @@ def default_rules() -> "list[Rule]":
         PgNonKeySequenceRule(),
         ForeignKeyRule(),
         CheckConstraintRule(),
+        # Rules Aurora DSQL cannot enforce (G151): EXCLUDE constraints and PostgreSQL 18
+        # WITHOUT OVERLAPS keys -- the conversion's own notes, word for word.
+        pg_exclusion_constraint_rule(),
+        pg_temporal_key_rule(),
         TriggerRule(),
         ProcedureRule(),
         EventRule(),

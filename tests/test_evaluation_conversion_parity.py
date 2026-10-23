@@ -31,10 +31,12 @@ from dsql_migrator.core.models import (
     Classification,
     ColumnDef,
     ConversionNoteKind,
+    ExclusionConstraintDef,
     IndexDef,
     SourceInventory,
     SourceType,
     TableDef,
+    TemporalKeyDef,
 )
 
 _PK = ColumnDef(name="id", mysql_type="bigint", nullable=False)
@@ -208,6 +210,40 @@ _PG_CORPUS = [
             )
         ],
     ),
+    # G151: a btree EXCLUDE (a uniqueness rule) read AUTO while its index was created as a
+    # plain one; a WITHOUT OVERLAPS key on otherwise-clean columns; NULLS NOT DISTINCT kept.
+    _t(
+        "exclude_btree",
+        [ColumnDef(name="code", mysql_type="text")],
+        exclusion_constraints=[
+            ExclusionConstraintDef(
+                name="exclude_btree_code", definition="EXCLUDE USING btree (code WITH =)",
+                index="exclude_btree_code",
+            )
+        ],
+    ),
+    TableDef(
+        name="app.temporal_pk",
+        columns=[
+            ColumnDef(name="k", mysql_type="bigint", nullable=False),
+            ColumnDef(name="n", mysql_type="bigint", nullable=False),
+        ],
+        primary_key=["k", "n"],
+        temporal_keys=[
+            TemporalKeyDef(
+                name="temporal_pk_pkey", definition="PRIMARY KEY (k, n WITHOUT OVERLAPS)",
+                primary=True, index="temporal_pk_pkey",
+            )
+        ],
+    ),
+    _t(
+        "nulls_not_distinct",
+        [ColumnDef(name="n", mysql_type="integer")],
+        indexes=[
+            IndexDef(name="ux_nulls_not_distinct_n", columns=["n"], unique=True,
+                     nulls_not_distinct=True)
+        ],
+    ),
 ]
 
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
@@ -291,3 +327,6 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
     assert pg["app.formatted_key"] == "DEFAULT_DROPPED"
     assert "DEFAULT_DROPPED" in concerns["app.formatted_nonkey"]
     assert "NON_KEY_SEQUENCE" not in concerns["app.formatted_nonkey"]  # no identity advice
+    assert pg["app.exclude_btree"] == "PG_EXCLUSION_CONSTRAINT"
+    assert pg["app.temporal_pk"] == "PG_TEMPORAL_KEY"
+    assert pg["app.nulls_not_distinct"] == "COMPATIBLE"  # carried as it is

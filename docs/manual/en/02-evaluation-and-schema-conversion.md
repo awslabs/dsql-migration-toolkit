@@ -139,7 +139,7 @@ body with double-quoted identifiers, which the conversion would read as strings.
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below); a multi-database MySQL source (each database becomes its own schema, flagged `RECOMMENDED`); an index name another table, view or index of the schema also uses (the index is renamed automatically, flagged `RECOMMENDED`). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, FULLTEXT/SPATIAL indexes (not emitted: the search they served moves outside the database), oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns, or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, which Aurora DSQL cannot index (they are not emitted; a UNIQUE one stops enforcing uniqueness), PostgreSQL non-btree indexes (built as btree) and partial indexes whose predicate reads a re-typed column (other partial indexes keep their `WHERE`), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, FULLTEXT/SPATIAL indexes (not emitted: the search they served moves outside the database), oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns, or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, which Aurora DSQL cannot index (they are not emitted; a UNIQUE one stops enforcing uniqueness), PostgreSQL non-btree indexes (built as btree) and partial indexes whose predicate reads a re-typed column (other partial indexes keep their `WHERE`), PostgreSQL `EXCLUDE` constraints (not created, nor the index that enforced each: `PG_EXCLUSION_CONSTRAINT`) and PostgreSQL 18 keys declared `WITHOUT OVERLAPS` (created as ordinary keys: `PG_TEMPORAL_KEY`), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`) or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), row-level security on a PostgreSQL table (`PG_ROW_LEVEL_SECURITY`). |
 
 The examples above are mostly drawn from a MySQL source. For a **PostgreSQL source** the same
@@ -808,6 +808,23 @@ shared "write contract" keeps them identical).
 > governs identity). A `STORED` generated column's expression **is** re-emitted
 > (`GENERATED ALWAYS AS (expr) STORED`), because Aurora DSQL supports and maintains those;
 > a `VIRTUAL` one becomes an ordinary column.
+>
+> **Constraints Aurora DSQL cannot enforce.** A PostgreSQL `EXCLUDE` constraint is not
+> created (Aurora DSQL rejects it), and neither is the index that enforced it on the
+> source, so after cut over a row that breaks the rule (an overlapping booking of one room)
+> is accepted: Evaluation and Schema Conversion flag the table **MANUAL**
+> (`PG_EXCLUSION_CONSTRAINT`) with each definition. A PostgreSQL 18 `PRIMARY KEY` or
+> `UNIQUE` key declared `WITHOUT OVERLAPS` is created as an ordinary key on the same
+> columns, which refuses only a row equal to another in every key column, so rows of one
+> key whose periods overlap are accepted (`PG_TEMPORAL_KEY`, **MANUAL**). Enforce such a
+> rule in the application (the transaction that writes checks for a conflicting row, and
+> concurrent writers of the same scope also update one shared row, so Aurora DSQL's
+> optimistic concurrency fails one of them with `40001`) or change the design. The
+> source's index for a `WITHOUT OVERLAPS` primary key (GiST) cannot return rows in key
+> order, the order Full Load and Validation read a table in, so before loading a large
+> such table add a btree index on its key columns on the source. A
+> `UNIQUE ... NULLS NOT DISTINCT` index or constraint (PostgreSQL 15+) keeps
+> `NULLS NOT DISTINCT`, which Aurora DSQL accepts.
 >
 > A **MySQL** generated column is created as an ordinary column (the tool reads its MySQL
 > expression and shows it in the finding and the source DDL, but does not translate it): Full

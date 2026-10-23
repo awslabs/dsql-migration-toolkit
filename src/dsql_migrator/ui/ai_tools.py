@@ -659,6 +659,16 @@ def build_ai_tool_executor(
                          {"name": ck.name, "expression": ck.expression}
                          for ck in _t.check_constraints
                      ],
+                     # PostgreSQL rules Aurora DSQL cannot enforce (G151); an exclusion
+                     # constraint's index is not under "indexes".
+                     "exclusion_constraints": [
+                         {"name": x.name, "definition": x.definition}
+                         for x in _t.exclusion_constraints
+                     ],
+                     "temporal_keys": [
+                         {"name": k.name, "definition": k.definition, "primary": k.primary}
+                         for k in _t.temporal_keys
+                     ],
                      "expression_indexes": list(_t.expression_indexes)}
                 )
             if name == "list_unsupported_objects":

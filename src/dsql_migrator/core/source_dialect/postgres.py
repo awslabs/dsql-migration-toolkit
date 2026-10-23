@@ -28,7 +28,14 @@ from dsql_migrator.core.catalog_postgres import (
     StandaloneSequence,
 )
 from dsql_migrator.core.introspector import SOURCE_CONNECT_TIMEOUT_SECONDS
-from dsql_migrator.core.models import ObjectRef, ObjectType, SourceType, ViewDef
+from dsql_migrator.core.models import (
+    ExclusionConstraintDef,
+    ObjectRef,
+    ObjectType,
+    SourceType,
+    TemporalKeyDef,
+    ViewDef,
+)
 from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
@@ -647,6 +654,88 @@ def _pg_correct_fk_schemas(connection: object, nsp: str, tables: list) -> None:
                 fk.referenced_table = resolved
 
 
+# The EXCLUDE constraints of the tables read and, on PostgreSQL 18+, their PRIMARY KEY /
+# UNIQUE keys declared WITHOUT OVERLAPS (G151): ONE catalog round trip per schema
+# (pg_constraint / pg_class / pg_namespace), no table scanned. ``pg_get_constraintdef`` gives
+# each definition as pg_dump prints it. ``conperiod``, the WITHOUT OVERLAPS flag, exists only
+# from PostgreSQL 18, and naming it on 13-17 fails the whole statement ("column con.conperiod
+# does not exist", verified on 17.11), so it is named only for a server SQLAlchemy reports as
+# 18 or later -- the gate its own reflection uses for pg_index.indnullsnotdistinct (15+). A
+# temporal key is ``contype`` 'p' / 'u' with ``conperiod``; a FOREIGN KEY ... PERIOD (also
+# ``conperiod``, contype 'f') is not read here.
+_PG_EXCLUSION_RULES_SQL = (
+    "SELECT c.relname AS rel, con.conname AS conname, con.contype AS contype, "
+    "pg_catalog.pg_get_constraintdef(con.oid) AS definition, ic.relname AS index_name "
+    "FROM pg_catalog.pg_constraint con "
+    "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "LEFT JOIN pg_catalog.pg_class ic ON ic.oid = con.conindid "
+    "WHERE n.nspname = :nsp AND c.relname = ANY(:names) AND ({kinds}) "
+    "ORDER BY c.relname, con.conname"
+)
+_PG_EXCLUDE_KIND = "con.contype = 'x'"
+_PG_TEMPORAL_KEY_KIND = "con.contype IN ('p', 'u') AND con.conperiod"
+
+
+def pg_exclusion_rules_sql(server_version: "Optional[Sequence[int]]") -> str:
+    """The statement :func:`_pg_read_exclusion_rules` runs for a server of
+    ``server_version`` (SQLAlchemy's ``server_version_info``; ``None`` when unknown, read
+    as earlier than 18). Pure."""
+    kinds = _PG_EXCLUDE_KIND
+    if server_version and tuple(server_version) >= (18,):
+        kinds += f" OR ({_PG_TEMPORAL_KEY_KIND})"
+    return _PG_EXCLUSION_RULES_SQL.format(kinds=kinds)
+
+
+def _pg_read_exclusion_rules(connection: object, nsp: str, tables: list) -> None:
+    """Record each table's EXCLUDE constraints and WITHOUT OVERLAPS keys, in place (G151).
+
+    An exclusion constraint goes to ``exclusion_constraints`` and its index leaves
+    ``indexes`` and ``expression_indexes``. SQLAlchemy reflects that index as an ordinary
+    non-unique one (one over an expression by name alone), so Schema Conversion created it
+    as a plain btree ``CREATE INDEX ASYNC`` that enforced nothing, and graded a btree one --
+    ``EXCLUDE USING btree (code WITH =)``, a uniqueness rule -- AUTO. The index existed only
+    to enforce the rule, which Aurora DSQL rejects, so it is gone from every count too (the
+    index budget, the index renames). A WITHOUT OVERLAPS key goes to ``temporal_keys``; a
+    UNIQUE one's index stays, created as an ordinary UNIQUE index on the same columns, as the
+    primary key is. Rows of an unexpected shape are skipped.
+    """
+    if not tables:
+        return
+    version = getattr(getattr(connection, "dialect", None), "server_version_info", None)
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(pg_exclusion_rules_sql(version)),
+        {"nsp": nsp, "names": [table.name for table in tables]},
+    ).mappings()
+    found: dict[str, list[tuple[str, str, str, Optional[str]]]] = {}
+    for row in rows:
+        contype = str(row.get("contype") or "")
+        relation, name = row.get("rel"), row.get("conname")
+        if not relation or not name or contype not in ("x", "p", "u"):
+            continue
+        index = row.get("index_name")
+        found.setdefault(str(relation), []).append(
+            (contype, str(name), str(row.get("definition") or ""), str(index) if index else None)
+        )
+    for table in tables:
+        for contype, name, definition, index in found.get(table.name, ()):
+            if contype == "x":
+                table.exclusion_constraints.append(
+                    ExclusionConstraintDef(name=name, definition=definition, index=index)
+                )
+                if index:
+                    table.indexes[:] = [i for i in table.indexes if i.name != index]
+                    table.expression_indexes[:] = [
+                        n for n in table.expression_indexes if n != index
+                    ]
+            else:
+                table.temporal_keys.append(
+                    TemporalKeyDef(
+                        name=name, definition=definition, primary=contype == "p", index=index
+                    )
+                )
+
+
 def _pg_collect_triggers(connection: object, nsp: str) -> list:
     """Read user trigger names for the schema (mirrors MySQL ``collect_triggers`` shape).
 
@@ -1223,6 +1312,10 @@ class PostgresSourceDialect(SourceDialect):
         # SQLAlchemy reports referred_schema=None when the parent is search_path-visible
         # (commonly public), which _reflect_tables then mis-qualifies to the CHILD's schema.
         _pg_correct_fk_schemas(connection, enrich_db, tables)
+
+        # (3b) EXCLUDE constraints and (PG18+) WITHOUT OVERLAPS keys, which Aurora DSQL
+        # cannot enforce: an exclusion constraint's index leaves ``indexes`` (G151).
+        _pg_read_exclusion_rules(connection, enrich_db, tables)
 
         # (4) Stored triggers + routines (functions/procedures) for the schema, returned as
         # the ObjectRef shape the MySQL path uses so TriggerRule/ProcedureRule flag them
@@ -2204,6 +2297,7 @@ class PostgresSourceDialect(SourceDialect):
 __all__ = [
     "PostgresSourceDialect",
     "pg_default_timezone",
+    "pg_exclusion_rules_sql",
     "pg_reads_own_rows_only",
     "pg_timezone_defaults",
 ]

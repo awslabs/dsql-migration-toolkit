@@ -1913,6 +1913,35 @@ def pg_unindexable_column_rule() -> ConversionWarningRule:
     )
 
 
+def pg_exclusion_constraint_rule() -> ConversionWarningRule:
+    """PostgreSQL EXCLUDE constraints, which Aurora DSQL rejects, so the rule is not
+    enforced after cut over (PG_EXCLUSION_CONSTRAINT, G151)."""
+    return ConversionWarningRule(
+        "PG_EXCLUSION_CONSTRAINT",
+        "_pg_exclusion_constraint_warning",
+        "Before cut over, enforce each rule above in the application -- the transaction "
+        "that writes a row checks for a conflicting one, and concurrent writers of the same "
+        "scope also update one shared row, so Aurora DSQL's optimistic concurrency fails one "
+        "of them (40001) instead of letting both pass the check -- or change the design so "
+        "the rule becomes a unique key.",
+        EffortLevel.MEDIUM,
+    )
+
+
+def pg_temporal_key_rule() -> ConversionWarningRule:
+    """PostgreSQL 18 keys declared WITHOUT OVERLAPS, created as ordinary keys, so their
+    no-overlap rule is not enforced after cut over (PG_TEMPORAL_KEY, G151)."""
+    return ConversionWarningRule(
+        "PG_TEMPORAL_KEY",
+        "_pg_temporal_key_warning",
+        "Before cut over, enforce the no-overlap rule in the application -- the transaction "
+        "that writes a period checks for an overlapping one of the same key, and concurrent "
+        "writers of that key also update one shared row, so Aurora DSQL's optimistic "
+        "concurrency fails one of them (40001) -- or change the design.",
+        EffortLevel.MEDIUM,
+    )
+
+
 def pg_collation_rule() -> ConversionWarningRule:
     """PostgreSQL non-default column collations, which the target does not keep
     (PG_COLLATION_DROPPED)."""
@@ -4622,6 +4651,8 @@ __all__ = [
     "check_postgres_time_zone",
     "SOURCE_TIME_ZONE_RULE_ID",
     "pg_unindexable_column_rule",
+    "pg_exclusion_constraint_rule",
+    "pg_temporal_key_rule",
     "default_dropped_rule",
     "importance_order",
     "default_rules",

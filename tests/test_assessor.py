@@ -616,6 +616,10 @@ def test_default_rules_source_type_seam() -> None:
         "PG_UNINDEXABLE_COLUMN",
         # A PostgreSQL view over enum / array / range columns the conversion re-types.
         "VIEW_REMODELLED_COLUMN",
+        # EXCLUDE constraints and PostgreSQL 18 WITHOUT OVERLAPS keys (G151): MySQL has
+        # neither.
+        "PG_EXCLUSION_CONSTRAINT",
+        "PG_TEMPORAL_KEY",
     }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}
