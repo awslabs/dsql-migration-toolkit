@@ -535,6 +535,16 @@ class SourceInventory(BaseModel):
     # confident evaluation of nothing. Aurora always provides an empty ``postgres``
     # database next to the real one, which is exactly what gets connected by mistake.
     sibling_databases: list[str] = Field(default_factory=list)
+    # The source server's settings an application session gets by default, read once per
+    # introspection (G148): MySQL's GLOBAL values -- the tool's own sessions pin time_zone
+    # and sql_mode, so their session values say nothing about the application's -- and
+    # PostgreSQL's default TimeZone with its ALTER DATABASE / ALTER ROLE overrides. Values
+    # only, never a credential. Left OUT of the payload while empty, like the job state's
+    # optional fields: this model is extra="forbid", so an inventory or saved session that
+    # never read them still loads on an older build, and one from an older build loads here.
+    server_settings: dict[str, str] = Field(
+        default_factory=dict, exclude_if=lambda v: not v
+    )
 
 
 # ---------------------------------------------------------------------------

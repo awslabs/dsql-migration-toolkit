@@ -81,6 +81,8 @@ from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.ai_chat_drawer import chat_turns_remaining
 from dsql_migrator.ui.design import (
+    EXPANSION_PANEL_CLASSES,
+    definition_row,
     filter_bar,
     filter_input,
     filter_select,
@@ -2383,6 +2385,8 @@ def _render_result(
                 ):
                     ui.label(f"{count:,}").classes("text-base font-semibold")  # type: ignore[attr-defined]
                     ui.label(label).classes("text-sm text-gray-600")  # type: ignore[attr-defined]
+        # Under the counts, the source's server settings the read captured (G148).
+        _render_source_settings(ui, inventory, result.source_type)
         _render_assessment(
             ui,
             result.assessment,
@@ -2495,6 +2499,56 @@ def _render_empty_inventory_notice(ui: object, result: EvaluationResult) -> None
         header="No tables found — check the Database on the Connect step",
         body=body,
     )
+
+
+def source_settings_rows(inventory: Optional[SourceInventory]) -> list[tuple[str, str]]:
+    """The source server settings Evaluation read (G148) as ``(name, value)`` rows, in the
+    order they were read, an empty value spelled ``(empty)``; ``[]`` when none were read (a
+    failed read, or a report from before they were). Pure."""
+    settings = getattr(inventory, "server_settings", None) or {}
+    return [(name, value if value != "" else "(empty)") for name, value in settings.items()]
+
+
+def source_settings_caption(source_type: Optional[SourceType]) -> str:
+    """What the settings list is, per engine: whose values they are, and what the tool's own
+    sessions run with instead."""
+    if source_type is SourceType.POSTGRES:
+        return (
+            "The TimeZone a new session of the migration user gets in this database, and each "
+            "TimeZone default ALTER DATABASE or ALTER ROLE sets for it (the role an application "
+            "connects as may have its own). An application's own SET TIME ZONE, or a zone its "
+            "driver or connection string sends, is not visible here. The tool's own source "
+            "sessions run with TimeZone UTC."
+        )
+    return (
+        "The server's GLOBAL values, which an application session starts from. The tool's own "
+        "source sessions read with time_zone '+00:00' and an empty sql_mode: a session "
+        "setting, nothing is written to the source."
+    )
+
+
+def _render_source_settings(
+    ui: object, inventory: SourceInventory, source_type: Optional[SourceType]
+) -> None:
+    """The source's server settings, collapsed under the source counts: reference for the
+    findings that grade them (SQL_MODE, EXPLICIT_DEFAULTS_FOR_TIMESTAMP,
+    AUTO_INCREMENT_STEP) and for what is only recorded. Nothing when none were read."""
+    rows = source_settings_rows(inventory)
+    if not rows:
+        return
+    with ui.expansion("Source server settings", icon="tune").classes(  # type: ignore[attr-defined]
+        f"w-full {EXPANSION_PANEL_CLASSES}"
+    ):
+        with ui.column().classes("w-full gap-1"):  # type: ignore[attr-defined]
+            ui.label(source_settings_caption(source_type)).classes(  # type: ignore[attr-defined]
+                "text-xs text-gray-500"
+            )
+            for name, value in rows:
+                # A sql_mode value is one long comma-joined word: let it break anywhere.
+                with definition_row(ui, name, term_width="min-w-[16rem]"):
+                    ui.label(value).classes(  # type: ignore[attr-defined]
+                        "text-xs text-gray-600 font-mono break-all"
+                    )
 
 
 def _guidance_question(item: "AssessmentItem") -> str:
@@ -3466,6 +3520,7 @@ __all__ = [
     "OBJECTS_PER_PAGE",
     "sort_assessment_items",
     "source_inventory_tallies",
+    "source_settings_rows",
     "group_assessment_items_by_kind",
     "assessment_kind_summary",
     "assessment_concern_counts",

@@ -61,6 +61,49 @@ For a PostgreSQL source, Evaluation also reads two things the inventory does not
 If either read fails, the report says so (`PG_CATALOG_UNREAD`) rather than reading as if
 there were none.
 
+Evaluation also reads the source's **server settings** once — settings only, no table is
+scanned — and lists them on the report under the source object counts (**Source server
+settings**, collapsed). They say what the application runs under, which no table definition
+shows:
+
+- **MySQL:** the GLOBAL values of `sql_mode`, `time_zone`, `system_time_zone`,
+  `explicit_defaults_for_timestamp`, `auto_increment_increment`, `auto_increment_offset`,
+  `lower_case_table_names`, `character_set_server`, `collation_server`,
+  `default_collation_for_utf8mb4`, `div_precision_increment` and `group_concat_max_len` —
+  the global ones, because an application session starts from them while the tool's own
+  sessions set their own (below). Three are graded, each a database-level **MANUAL** item.
+  `SQL_MODE`: the mode lacks `ONLY_FULL_GROUP_BY` (a view or query may then select a column
+  its `GROUP BY` does not determine, which Aurora DSQL rejects with `42803`, a view when
+  Schema Conversion applies it), lets the source store zero or invalid dates while a table
+  has a date column (no `NO_ZERO_DATE` or `NO_ZERO_IN_DATE`, no strict mode, or
+  `ALLOW_INVALID_DATES`: Aurora DSQL has no such value, so a row holding one cannot be
+  loaded as it is), or has `ANSI_QUOTES` / `PIPES_AS_CONCAT` (application SQL you paste into
+  the Query Converter is written for that mode, and the converter reads SQL the way MySQL's
+  default mode does). `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: the setting is `OFF`, so MySQL
+  stores the current time when NULL is written to a `TIMESTAMP` column declared `NOT NULL`,
+  a write Aurora DSQL rejects; the item lists those columns. `AUTO_INCREMENT_STEP`:
+  `auto_increment_increment` is above 1 and a table has an `AUTO_INCREMENT` key, whose
+  identity on Aurora DSQL steps by 1. The others — the time zone, the case folding of
+  names, the character set and collation defaults, `div_precision_increment` and
+  `group_concat_max_len` — are recorded, not graded.
+- **PostgreSQL:** the `TimeZone` a new session of the migration user gets in the connected
+  database (the DB or DB cluster parameter group's value, unless an `ALTER DATABASE` or
+  `ALTER ROLE` default replaces it), read over a short connection of its own because the
+  tool's sessions pin UTC, and each `TimeZone` default `ALTER DATABASE` or `ALTER ROLE` sets
+  for that database (the role your application connects as may have its own). Recorded,
+  not graded.
+
+Neither read sees a value the application sets for itself: a session `SET`
+(`SET sql_mode`, `SET time_zone`, `SET TIME ZONE`), or an option its driver or connection
+string sends when it connects. A read that fails leaves the list empty; it never fails
+Evaluation.
+
+The tool's own MySQL source sessions read with a neutral `sql_mode`: each one runs
+`SET time_zone = '+00:00', sql_mode = ''` when it connects. It is a session setting —
+nothing is written to the source — and it keeps a parameter group's `sql_mode` from
+changing what the tool reads: under `ANSI_QUOTES`, for one, `SHOW CREATE` prints a view's
+body with double-quoted identifiers, which the conversion would read as strings.
+
 ### Every object gets one classification
 
 | Class | Meaning | Examples |

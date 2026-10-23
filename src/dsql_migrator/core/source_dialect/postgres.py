@@ -742,6 +742,93 @@ _PG_ROW_SECURITY_OFF = "SET row_security = off"
 _PG_ROW_SECURITY_REFUSAL = "row-level security"
 
 
+# The source server settings Step 1 (Evaluation) reads (G148): the TimeZone an application
+# session gets by default. The tool's own sessions cannot show it: they send ``timezone=UTC``
+# as a libpq startup option (see ``PostgresSourceDialect.engine_kwargs``), which outranks the
+# configuration file (the DB / DB cluster parameter group) and every ALTER DATABASE / ALTER
+# ROLE default, so their TimeZone -- pg_settings' ``setting`` and ``reset_val`` alike -- is
+# always UTC. So it is read over a short connection of its own that sends no startup option:
+# what a new session of the migration login gets in this database. ``source`` says where the
+# value came from; ``client`` would be this process's own PGTZ / PGOPTIONS, not the server's.
+_PG_SESSION_TIMEZONE_SQL = "SELECT setting, source FROM pg_settings WHERE name = 'TimeZone'"
+# That connection: the source's own URL (credentials stay in memory), no pool, a bounded
+# connect, no startup options -- and the read-only guard, like every source engine.
+_SETTINGS_PROBE_KWARGS: "dict[str, object]" = {
+    "connect_args": {"connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS},
+}
+# The TimeZone defaults ALTER DATABASE / ALTER ROLE set for the connected database: the role
+# an application connects as may have its own, which the probe (made as the migration
+# login) does not apply. pg_db_role_setting is readable by every role; only the TimeZone
+# entries leave the server (a role's other settings can hold anything).
+_PG_TIMEZONE_DEFAULTS_SQL = (
+    "SELECT COALESCE(r.rolname, '') AS role, s.setdatabase <> 0 AS in_database, "
+    "substr(c.entry, strpos(c.entry, '=') + 1) AS value "
+    "FROM pg_db_role_setting s "
+    "CROSS JOIN LATERAL unnest(s.setconfig) AS c(entry) "
+    "LEFT JOIN pg_roles r ON r.oid = s.setrole "
+    "WHERE lower(split_part(c.entry, '=', 1)) = 'timezone' "
+    "AND s.setdatabase IN (0, (SELECT oid FROM pg_database WHERE datname = current_database())) "
+    "ORDER BY s.setrole <> 0, r.rolname, s.setdatabase <> 0"
+)
+
+
+def _settings_probe_engine(url: object) -> object:
+    """The one-connection engine :func:`pg_default_timezone` reads with (see
+    :data:`_SETTINGS_PROBE_KWARGS`)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    from dsql_migrator.core.introspector import install_read_only_guard
+
+    engine = create_engine(url, poolclass=NullPool, **_SETTINGS_PROBE_KWARGS)
+    install_read_only_guard(engine)
+    return engine
+
+
+def pg_default_timezone(connection: object) -> Optional[str]:
+    """The TimeZone a new session of ``connection``'s login gets in its database when the
+    client sets none, or ``None`` when it cannot be read. Reads over a probe connection of
+    its own (:data:`_PG_SESSION_TIMEZONE_SQL`), since the tool's sessions pin UTC."""
+    url = getattr(getattr(connection, "engine", None), "url", None)
+    if url is None:
+        return None
+    try:
+        probe = _settings_probe_engine(url)
+    except Exception:  # noqa: BLE001 - best effort
+        return None
+    try:
+        with probe.connect() as probe_connection:  # type: ignore[attr-defined]
+            row = probe_connection.execute(text(_PG_SESSION_TIMEZONE_SQL)).first()
+    except Exception:  # noqa: BLE001 - best effort; never fail Evaluation over a report line
+        return None
+    finally:
+        probe.dispose()  # type: ignore[attr-defined]
+    if row is None or not row[0] or str(row[1] or "").strip().lower() == "client":
+        return None
+    return str(row[0])
+
+
+def pg_timezone_defaults(connection: object) -> "dict[str, str]":
+    """The TimeZone defaults ALTER DATABASE / ALTER ROLE set for ``connection``'s database,
+    keyed as the statement that set each (``TimeZone (ALTER ROLE app)``). Empty when there
+    are none or they cannot be read."""
+    try:
+        rows = connection.execute(  # type: ignore[attr-defined]
+            text(_PG_TIMEZONE_DEFAULTS_SQL)
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - best effort
+        return {}
+    out: dict[str, str] = {}
+    for role, in_database, value in rows:
+        if not role:
+            # setrole 0: every role -- ALTER DATABASE (this database), ALTER ROLE ALL (any).
+            scope = "ALTER DATABASE" if in_database else "ALTER ROLE ALL"
+        else:
+            scope = f"ALTER ROLE {role}" + (" IN DATABASE" if in_database else "")
+        out[f"TimeZone ({scope})"] = "" if value is None else str(value)
+    return out
+
+
 def pg_read_row_security(connection: object, schemas: "list[str]") -> RowSecurityFacts:
     """Read the tables of ``schemas`` that have row-level security ENABLED, their policies,
     and whether the login is exempt from them. Read-only catalog statements; raises on a
@@ -1245,6 +1332,22 @@ class PostgresSourceDialect(SourceDialect):
             return str(row[0]) if row and row[0] else None
         except Exception:  # noqa: BLE001 - best-effort; never break introspection
             return None
+
+    def server_settings(self, connection: object) -> "dict[str, str]":
+        # G148: the TimeZone an application session gets by default -- what a new session
+        # of the migration login gets in this database (``TimeZone``, past the tool's own
+        # UTC pin) and the ALTER DATABASE / ALTER ROLE defaults another role would get. Not
+        # an application's own SET TIME ZONE, nor a zone its driver or connection string
+        # sends. Only on a genuine PostgreSQL connection (the probe opens one of its own),
+        # each part best effort.
+        if getattr(getattr(connection, "dialect", None), "name", None) != "postgresql":
+            return {}
+        settings: dict[str, str] = {}
+        zone = pg_default_timezone(connection)
+        if zone is not None:
+            settings["TimeZone"] = zone
+        settings.update(pg_timezone_defaults(connection))
+        return settings
 
     def sibling_databases(self, connection: object) -> "list[str]":
         # The other connectable, non-template databases on this server. Read from the same
@@ -2098,4 +2201,9 @@ class PostgresSourceDialect(SourceDialect):
         )
 
 
-__all__ = ["PostgresSourceDialect", "pg_reads_own_rows_only"]
+__all__ = [
+    "PostgresSourceDialect",
+    "pg_default_timezone",
+    "pg_reads_own_rows_only",
+    "pg_timezone_defaults",
+]

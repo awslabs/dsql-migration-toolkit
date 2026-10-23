@@ -38,6 +38,15 @@ PostgreSQL ソースでは、Evaluation はインベントリにない 2 つの�
 
 どちらかの読み取りに失敗した場合、レポートは存在しないかのように見せず、そのことを示します (`PG_CATALOG_UNREAD`)。
 
+Evaluation はソースの **サーバー設定** も 1 回だけ読み取ります (設定のみで、テーブルはスキャンしません)。読み取った設定は、レポートのソースオブジェクト数の下 (**Source server settings**、折りたたみ表示) に一覧されます。これらは、テーブル定義には現れない、アプリケーションが動作する条件を示します。
+
+- **MySQL:** `sql_mode`、`time_zone`、`system_time_zone`、`explicit_defaults_for_timestamp`、`auto_increment_increment`、`auto_increment_offset`、`lower_case_table_names`、`character_set_server`、`collation_server`、`default_collation_for_utf8mb4`、`div_precision_increment`、`group_concat_max_len` の GLOBAL 値です。アプリケーションのセッションはこのグローバル値から始まり、ツール自身のセッションは独自の値を設定するためです (下記)。3 つはそれぞれデータベースレベルの **MANUAL** 項目として判定されます。`SQL_MODE`: モードに `ONLY_FULL_GROUP_BY` がない (ビューやクエリが `GROUP BY` で決まらない列を選択でき、Aurora DSQL はこれを `42803` で拒否します。ビューの場合は Schema Conversion が適用するときです)、日付列を持つテーブルがあるのにゼロや不正な日付を保存できる (`NO_ZERO_DATE` または `NO_ZERO_IN_DATE` がない、strict モードがない、または `ALLOW_INVALID_DATES`: Aurora DSQL にはそのような値がないため、それを持つ行はそのままではロードできません)、または `ANSI_QUOTES` / `PIPES_AS_CONCAT` がある (Query Converter に貼り付けるアプリケーションの SQL はそのモード向けに書かれていますが、変換は SQL を MySQL の既定のモードと同じように読み取ります) 場合です。`EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 設定が `OFF` の場合、MySQL は `NOT NULL` と宣言された `TIMESTAMP` 列に NULL が書き込まれると現在時刻を保存しますが、Aurora DSQL はその書き込みを拒否します。項目はそれらの列を一覧します。`AUTO_INCREMENT_STEP`: `auto_increment_increment` が 1 より大きく、`AUTO_INCREMENT` キーを持つテーブルがある場合です。Aurora DSQL ではそのキーの identity は 1 ずつ増えます。その他の設定 (タイムゾーン、名前の大文字小文字の扱い、文字セットと照合順序の既定値、`div_precision_increment`、`group_concat_max_len`) は記録のみで、判定しません。
+- **PostgreSQL:** 移行ユーザーの新しいセッションが接続先データベースで受け取る `TimeZone` です (DB または DB クラスターパラメータグループの値。`ALTER DATABASE` や `ALTER ROLE` の既定値があればその値)。ツールのセッションは UTC に固定されるため、専用の短い接続で読み取ります。あわせて、`ALTER DATABASE` や `ALTER ROLE` がそのデータベースに設定した各 `TimeZone` の既定値も読み取ります (アプリケーションが接続するロールは独自の値を持つことがあります)。記録のみで、判定しません。
+
+どちらの読み取りも、アプリケーションが自分で設定する値は見えません: セッションの `SET` (`SET sql_mode`、`SET time_zone`、`SET TIME ZONE`)、またはドライバーや接続文字列が接続時に送るオプションです。読み取りに失敗した場合は一覧が空になるだけで、Evaluation は失敗しません。
+
+ツール自身の MySQL ソースのセッションは中立的な `sql_mode` で読み取ります: 各セッションは接続時に `SET time_zone = '+00:00', sql_mode = ''` を実行します。これはセッションの設定であり、ソースには何も書き込みません。これにより、パラメータグループの `sql_mode` がツールの読み取る内容を変えることはありません: たとえば `ANSI_QUOTES` では、`SHOW CREATE` がビュー本体の識別子を二重引用符で出力し、変換はそれを文字列として読んでしまいます。
+
 ### すべてのオブジェクトが 1 つの分類を受け取る
 
 | 分類 | 意味 | 例 |

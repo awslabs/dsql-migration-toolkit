@@ -51,6 +51,28 @@ _MYSQL_INTEGER_PK_TYPES = frozenset(
 # Length) on a write-heavy source.
 _MYSQL_REPEATABLE_READ = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 
+# The server settings Step 1 (Evaluation) reads once (G148), in the order the Evaluation
+# screen lists them. Their GLOBAL values: an application session starts from those, while
+# the tool's own sessions pin time_zone and sql_mode (introspector's init_command), so a
+# session value would describe the tool. Evaluation grades sql_mode,
+# explicit_defaults_for_timestamp and the auto_increment step; the others (the time zone, the
+# case folding of names, the character set / collation defaults, div_precision_increment and
+# group_concat_max_len) are recorded.
+MYSQL_SERVER_SETTINGS = (
+    "sql_mode",
+    "time_zone",
+    "system_time_zone",
+    "explicit_defaults_for_timestamp",
+    "auto_increment_increment",
+    "auto_increment_offset",
+    "lower_case_table_names",
+    "character_set_server",
+    "collation_server",
+    "default_collation_for_utf8mb4",
+    "div_precision_increment",
+    "group_concat_max_len",
+)
+
 
 # The live definitions of a table's key columns, read once when a keyset stream of a table
 # whose key has an ENUM / SET column starts (G130): the cursor names such a column's
@@ -492,6 +514,34 @@ class MySQLSourceDialect(SourceDialect):
             aurora_version=probe_scalar(connection, "SELECT @@aurora_version"),
         )
 
+    def server_settings(self, connection: object) -> "dict[str, str]":
+        # One read of the GLOBAL values (see MYSQL_SERVER_SETTINGS). SHOW GLOBAL VARIABLES
+        # returns the ones this version has -- MySQL 5.7 has no default_collation_for_utf8mb4
+        # -- where one SELECT @@GLOBAL.x of a missing variable fails the whole statement. The
+        # names are bound, as in the CDC variable read. Only on a genuine MySQL connection
+        # (the SQLite double used in tests has none), and best effort: a failed read is no
+        # setting, never a failed Evaluation.
+        dialect_name = getattr(getattr(connection, "dialect", None), "name", None)
+        if dialect_name != "mysql":
+            return {}
+        from sqlalchemy import text
+
+        params = {f"v{index}": name for index, name in enumerate(MYSQL_SERVER_SETTINGS)}
+        placeholders = ", ".join(f":v{index}" for index in range(len(MYSQL_SERVER_SETTINGS)))
+        try:
+            rows = connection.execute(  # type: ignore[attr-defined]
+                text(f"SHOW GLOBAL VARIABLES WHERE Variable_name IN ({placeholders})"),
+                params,
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - best effort; never fail Evaluation over a report line
+            return {}
+        found = {
+            str(row[0]).lower(): "" if row[1] is None else str(row[1])
+            for row in rows
+            if len(row) >= 2 and row[0] is not None
+        }
+        return {name: found[name] for name in MYSQL_SERVER_SETTINGS if name in found}
+
     def probe_grants(self, connection: object) -> list[str]:
         # MySQL exposes the current user's privileges as raw ACL lines via SHOW GRANTS.
         # Best effort: any error is treated as "no grants visible" (empty), so the
@@ -604,7 +654,12 @@ class MySQLSourceDialect(SourceDialect):
         return None
 
 
-__all__ = ["MySQLSourceDialect", "is_single_precision_float", "mysql_base_type"]
+__all__ = [
+    "MYSQL_SERVER_SETTINGS",
+    "MySQLSourceDialect",
+    "is_single_precision_float",
+    "mysql_base_type",
+]
 
 
 # One scope part: a backtick-quoted name (spaces, dots and doubled backticks allowed)

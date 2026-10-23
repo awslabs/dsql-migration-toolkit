@@ -3135,14 +3135,15 @@ def test_validation_state_run_timing_roundtrip() -> None:
 def test_source_engine_kwargs_pins_session_time_zone_to_utc() -> None:
     # Hardening: every source MySQL engine pins the session to UTC so TIMESTAMP
     # columns (stored UTC, displayed in the session tz) can't drift vs the target's
-    # UTC rendering in the checksum. DATETIME is a wall-clock and unaffected.
+    # UTC rendering in the checksum. DATETIME is a wall-clock and unaffected. The same
+    # SET pins a neutral sql_mode (G148, tests/test_g148_source_server_settings.py).
     from dsql_migrator.core.introspector import source_engine_kwargs
 
     ca = source_engine_kwargs()["connect_args"]
-    assert ca["init_command"] == "SET time_zone = '+00:00'"
+    assert ca["init_command"] == "SET time_zone = '+00:00', sql_mode = ''"
     # Still present when the Full Load stream opts into per-socket timeouts.
     ca2 = source_engine_kwargs(read_timeout_seconds=30)["connect_args"]
-    assert ca2["init_command"] == "SET time_zone = '+00:00'"
+    assert ca2["init_command"] == "SET time_zone = '+00:00', sql_mode = ''"
 
 
 # ---------------------------------------------------------------------------

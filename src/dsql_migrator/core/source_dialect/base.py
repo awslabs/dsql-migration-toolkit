@@ -248,6 +248,19 @@ class SourceDialect(ABC):
         """
         return []
 
+    def server_settings(self, connection: object) -> "dict[str, str]":
+        """The source server's settings an APPLICATION session gets by default, as
+        ``{name: value}`` (G148). Empty by default, and on any failed read: best effort,
+        never a failed Evaluation.
+
+        Server-scoped, so read ONCE per introspection, catalog/settings only. Not the tool's
+        own session values, which the engine kwargs pin (MySQL ``time_zone`` / ``sql_mode``
+        through the driver's ``init_command``, PostgreSQL ``timezone`` through the libpq
+        startup options): each dialect reads past its own pin. What none can see is a value
+        the application sets itself (a ``SET``, or a driver or connection-string option).
+        """
+        return {}
+
     def list_extensions(self, connection: object) -> "list[str]":
         """Installed EXTENSIONs as ``"name (schema)"``; empty when the engine has none.
 
@@ -483,8 +496,8 @@ class SourceDialect(ABC):
         (:func:`~dsql_migrator.core.introspector.is_write_or_ddl` false). Default: none.
         PostgreSQL turns ``row_security`` off; MySQL sets the session to REPEATABLE READ,
         without which ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` opens no snapshot on a
-        source configured READ-COMMITTED (its session time zone is pinned through the
-        driver's ``init_command`` instead).
+        source configured READ-COMMITTED (its session time zone and neutral ``sql_mode`` are
+        pinned through the driver's ``init_command`` instead).
         """
         return ()
 

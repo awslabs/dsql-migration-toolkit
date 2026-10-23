@@ -2982,6 +2982,296 @@ def check_mixed_case_identifiers(
     return [item.model_copy(update={"concerns": _single_concern(item)})]
 
 
+# ---------------------------------------------------------------------------
+# Source server settings (G148): what MySQL does for the application under them
+# ---------------------------------------------------------------------------
+
+SQL_MODE_RULE_ID = "SQL_MODE"
+IMPLICIT_TIMESTAMP_RULE_ID = "EXPLICIT_DEFAULTS_FOR_TIMESTAMP"
+AUTO_INCREMENT_STEP_RULE_ID = "AUTO_INCREMENT_STEP"
+
+# MySQL's composite modes as the flags they stand for. A GLOBAL value lists the flags as well,
+# but one that names only the composite reads the same.
+_SQL_MODE_COMPOSITES: dict[str, tuple[str, ...]] = {
+    "ANSI": (
+        "REAL_AS_FLOAT", "PIPES_AS_CONCAT", "ANSI_QUOTES", "IGNORE_SPACE", "ONLY_FULL_GROUP_BY",
+    ),
+    "TRADITIONAL": (
+        "STRICT_TRANS_TABLES", "STRICT_ALL_TABLES", "NO_ZERO_IN_DATE", "NO_ZERO_DATE",
+        "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION",
+    ),
+}
+_MYSQL_TEMPORAL_BASES = frozenset({"date", "datetime", "timestamp"})
+# Where the setting is changed on RDS / Aurora. Aurora MySQL's auto_increment_increment and
+# auto_increment_offset are cluster-level parameters (DB cluster parameter group only), while
+# sql_mode and explicit_defaults_for_timestamp are instance-level: the DB cluster parameter
+# group holds their default, and an instance's DB parameter group that sets one wins there.
+_SETTINGS_PARAMETER_GROUP = (
+    "the source's DB parameter group (Aurora MySQL: its DB cluster parameter group)"
+)
+_INSTANCE_SETTINGS_PARAMETER_GROUP = (
+    "the source's DB parameter group (Aurora MySQL: its DB cluster parameter group, or the "
+    "DB parameter group of an instance that overrides it)"
+)
+
+
+def _sql_mode_flags(value: str) -> set[str]:
+    """The flags of a MySQL ``sql_mode`` value, upper case, composites expanded."""
+    flags = {part.strip().upper() for part in value.split(",") if part.strip()}
+    for composite, parts in _SQL_MODE_COMPOSITES.items():
+        if composite in flags:
+            flags.update(parts)
+    return flags
+
+
+def _first_names(names: "Sequence[str]", limit: int = 10) -> str:
+    """``a, b, c and N more``: the first ``limit`` names, then how many are left."""
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit:,} more" if len(names) > limit else "")
+
+
+def _database_item(
+    *, object_name: str, rule_id: str, risk: str, recommendation: str, effort: EffortLevel
+) -> AssessmentItem:
+    """One MANUAL database-level item with its single concern (a gap)."""
+    item = AssessmentItem(
+        object_name=object_name,
+        rule_id=rule_id,
+        classification=Classification.MANUAL,
+        risk=risk,
+        recommendation=recommendation,
+        effort=effort,
+        kind=KIND_DATABASE.upper(),
+    )
+    return item.model_copy(update={"concerns": _single_concern(item)})
+
+
+def check_mysql_sql_mode(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """The flags of the source's GLOBAL ``sql_mode`` that matter after the move, in one item.
+
+    Every application session starts from that mode (the tool's own sessions read with an
+    empty one), so it says what the application and the source's data were allowed to do:
+    without ONLY_FULL_GROUP_BY a view or query may select a column it neither groups nor
+    aggregates, which Aurora DSQL rejects (42803); without the zero-date and strict flags, or
+    with ALLOW_INVALID_DATES, the date columns may hold values Aurora DSQL has no value for;
+    under ANSI_QUOTES or PIPES_AS_CONCAT the application's SQL means something else in
+    MySQL's default mode, which the Query Converter reads. None of these is a fault of the
+    conversion, so the item names what to check, not a fix it made. Nothing when the mode was
+    not read, is numeric (an old server's form), or none of the flags matter -- the date part
+    only when a table has a DATE, DATETIME or TIMESTAMP column."""
+    value = inventory.server_settings.get("sql_mode")
+    if value is None or value.strip().isdigit():
+        return []
+    flags = _sql_mode_flags(value)
+    risks: list[str] = []
+    advice: list[str] = []
+    if "ONLY_FULL_GROUP_BY" not in flags:
+        risks.append(
+            "Without ONLY_FULL_GROUP_BY, a view or an application query may select a column "
+            "that is neither grouped, aggregated, nor fixed by a grouped primary key, and "
+            "MySQL returns a value from one of the group's rows. Aurora DSQL rejects such a "
+            "query (SQLSTATE 42803: the column must appear in the GROUP BY clause or be used "
+            "in an aggregate function) -- a view when Schema Conversion applies it, an "
+            "application query when it runs after cut over."
+        )
+        advice.append(
+            "Group or aggregate every selected column of a view the apply rejects (MIN() or "
+            "MAX() keeps one value where MySQL picked one), and test the application's GROUP "
+            "BY queries on Aurora DSQL before cut over -- the Query Converter can probe them."
+        )
+    strict = bool(flags & {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"})
+    reasons = [
+        reason
+        for reason, applies in (
+            ("no NO_ZERO_DATE", "NO_ZERO_DATE" not in flags),
+            ("no NO_ZERO_IN_DATE", "NO_ZERO_IN_DATE" not in flags),
+            ("no strict mode (STRICT_TRANS_TABLES or STRICT_ALL_TABLES)", not strict),
+            ("ALLOW_INVALID_DATES", "ALLOW_INVALID_DATES" in flags),
+        )
+        if applies
+    ]
+    has_dates = any(
+        _base_type(column.mysql_type) in _MYSQL_TEMPORAL_BASES
+        for table in inventory.tables
+        for column in table.columns
+    )
+    if reasons and has_dates:
+        # Only what these flags let in: a zero date unless strict mode and NO_ZERO_DATE refuse
+        # it (without strict mode NO_ZERO_DATE only warns), a zero month or day unless
+        # NO_ZERO_IN_DATE is set (without strict mode it becomes a zero date), and a day the
+        # month does not have only under ALLOW_INVALID_DATES.
+        examples = [
+            example
+            for example, applies in (
+                ("a zero date ('0000-00-00')", "NO_ZERO_DATE" not in flags or not strict),
+                ("a zero month or day ('2024-00-15')", "NO_ZERO_IN_DATE" not in flags),
+                (
+                    "a day the month does not have ('2024-02-31')",
+                    "ALLOW_INVALID_DATES" in flags,
+                ),
+            )
+            if applies
+        ]
+        listed = (
+            ", ".join(examples[:-1]) + " or " + examples[-1] if len(examples) > 1 else examples[0]
+        )
+        lenient = (
+            " Without strict mode MySQL also stores an invalid date it is given as a zero "
+            "date, with only a warning."
+            if not strict
+            else ""
+        )
+        risks.append(
+            f"The mode lets the source store dates Aurora DSQL has no value for "
+            f"({'; '.join(reasons)}): {listed}.{lenient} The DATE, DATETIME and TIMESTAMP "
+            "columns may hold such values, and a row that holds one cannot be loaded as it "
+            "is: Aurora DSQL rejects the value (SQLSTATE 22008), as it rejects an application "
+            "write MySQL accepts today."
+        )
+        advice.append(
+            "Before the Full Load, find the rows that hold such dates and decide what each "
+            "becomes (NULL, or a real date), and change the application code that writes them."
+        )
+    special = [flag for flag in ("ANSI_QUOTES", "PIPES_AS_CONCAT") if flag in flags]
+    if special:
+        meanings = []
+        if "ANSI_QUOTES" in flags:
+            meanings.append('"name" is an identifier, not a string')
+        if "PIPES_AS_CONCAT" in flags:
+            meanings.append("a || b concatenates instead of meaning OR")
+        risks.append(
+            f"With {' and '.join(special)}, application SQL written for that mode "
+            f"({'; '.join(meanings)}) means something else in MySQL's default mode, which is "
+            "how the Query Converter reads SQL: it converts such a statement into a different "
+            "one. The tool's own reads are not affected: its source sessions run with an empty "
+            "sql_mode."
+        )
+        advice.append(
+            "Rewrite application SQL for MySQL's default mode before pasting it into the Query "
+            "Converter (backticks around names, CONCAT() for ||)."
+        )
+    if not risks:
+        return []
+    advice.append(
+        f"To change what the source accepts from now on, set sql_mode in "
+        f"{_INSTANCE_SETTINGS_PARAMETER_GROUP}; it reaches new connections without a reboot. "
+        "Test the application first: a stricter mode rejects writes it makes today."
+    )
+    return [
+        _database_item(
+            object_name="sql_mode",
+            rule_id=SQL_MODE_RULE_ID,
+            risk=f"The source's global sql_mode is '{value}'. " + " ".join(risks),
+            recommendation=" ".join(advice),
+            effort=EffortLevel.MEDIUM,
+        )
+    ]
+
+
+def check_mysql_explicit_defaults_for_timestamp(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """``explicit_defaults_for_timestamp=OFF``: MySQL's implicit TIMESTAMP behaviours.
+
+    Under it, writing NULL to a TIMESTAMP column not declared NULL stores the current time
+    (decided by the session's value when the row is written, so every such column of the
+    selected tables is affected), and a table created under it gets implicit DEFAULT / ON
+    UPDATE attributes -- which are in the definitions Schema Conversion reads, with findings
+    of their own. The NULL write is what nothing carries: the target column keeps its NOT
+    NULL. Nothing when the setting is ON or unread, or no table has such a column."""
+    value = (inventory.server_settings.get("explicit_defaults_for_timestamp") or "").strip()
+    if value.upper() not in ("OFF", "0"):
+        return []
+    columns = [
+        f"{table.name}.{column.name}"
+        for table in inventory.tables
+        for column in table.columns
+        if _base_type(column.mysql_type) == "timestamp" and not column.nullable
+    ]
+    if not columns:
+        return []
+    return [
+        _database_item(
+            object_name="explicit_defaults_for_timestamp",
+            rule_id=IMPLICIT_TIMESTAMP_RULE_ID,
+            risk=(
+                "The source runs explicit_defaults_for_timestamp=OFF. Under it, MySQL "
+                "stores the current date and time when NULL is written to a TIMESTAMP column "
+                "that is not declared NULL, and gives a table created under it implicit "
+                "TIMESTAMP attributes (the first such column DEFAULT CURRENT_TIMESTAMP ON "
+                "UPDATE CURRENT_TIMESTAMP, the others a zero default). The attributes are in "
+                "the column definitions Schema Conversion reads, and their ON UPDATE and "
+                "zero-default parts have findings of their own (ON_UPDATE_TIMESTAMP, "
+                "DEFAULT_DROPPED). The NULL write is not reproduced: on Aurora DSQL the "
+                "converted column keeps NOT NULL, so an INSERT or UPDATE that writes NULL to "
+                "it fails (SQLSTATE 23502). TIMESTAMP columns declared NOT NULL "
+                f"({len(columns):,}): {_first_names(columns)}."
+            ),
+            recommendation=(
+                "Before cut over, make the application write the time itself wherever it "
+                "writes NULL to these columns -- or leave the column out of the INSERT, so "
+                "its default applies. To find such writes while the source still serves the "
+                "application, run it against explicit_defaults_for_timestamp=ON, under which "
+                "MySQL no longer turns them into the current time: set it in "
+                f"{_INSTANCE_SETTINGS_PARAMETER_GROUP}, and reboot where the parameter is static."
+            ),
+            effort=EffortLevel.SIMPLE,
+        )
+    ]
+
+
+def check_mysql_auto_increment_step(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """``auto_increment_increment`` above 1: MySQL issues AUTO_INCREMENT values that far
+    apart (``auto_increment_offset`` + N x ``auto_increment_increment``), usually so that
+    several writers never issue the same key, while the target's identity steps by 1 from
+    where the migration moves it. An increment of 1 issues consecutive values whatever the
+    offset (MySQL ignores an offset larger than the increment), so there is nothing to tell.
+    Nothing either when no table has an AUTO_INCREMENT key, or the setting was not read."""
+    def _number(name: str) -> Optional[int]:
+        try:
+            return int(str(inventory.server_settings.get(name, "")).strip())
+        except ValueError:
+            return None
+
+    increment = _number("auto_increment_increment")
+    if increment is None or increment <= 1:
+        return []
+    tables = [table.name for table in inventory.tables if table.auto_increment_column]
+    if not tables:
+        return []
+    offset = _number("auto_increment_offset")
+    offset_text = f", auto_increment_offset {offset}" if offset is not None else ""
+    return [
+        _database_item(
+            object_name="auto_increment_increment",
+            rule_id=AUTO_INCREMENT_STEP_RULE_ID,
+            risk=(
+                f"The source's auto_increment_increment is {increment}{offset_text}: MySQL "
+                f"issues each table's AUTO_INCREMENT values {increment} apart "
+                "(auto_increment_offset + N x auto_increment_increment), usually so that "
+                "several servers that each take writes never issue the same key. On Aurora "
+                "DSQL a key the conversion keeps generating is an identity that steps by 1 "
+                "from where the migration moves it (past the loaded rows and the source's own "
+                "counter), so new keys no longer follow that pattern: they take the values in "
+                "between and interleave differently with keys issued anywhere else. Tables "
+                f"with an AUTO_INCREMENT key ({len(tables):,}): {_first_names(tables)}."
+            ),
+            recommendation=(
+                "The migration needs no change on the source. Before cut over, check whether "
+                "anything relies on the step or the offset -- another writer issuing the keys "
+                "in between, a key read to tell which server wrote the row, ranges reserved "
+                "per server -- and move that logic to the application. The values come from "
+                f"{_SETTINGS_PARAMETER_GROUP}."
+            ),
+            effort=EffortLevel.SIMPLE,
+        )
+    ]
+
+
 def default_inventory_rules(
     source_type: SourceType = SourceType.MYSQL,
 ) -> list[InventoryRule]:
@@ -2992,7 +3282,9 @@ def default_inventory_rules(
     within one database, which Aurora DSQL supports and this tool migrates
     schema-qualified automatically -- so the "spans N databases" note is meaningless
     for a PG source. The database-level limits (tables, schemas, views per database)
-    apply to every engine.
+    apply to every engine. The server-setting checks (sql_mode,
+    explicit_defaults_for_timestamp, the auto_increment step) read MySQL settings; a
+    PostgreSQL source's TimeZone is recorded, not graded.
     """
     if source_type is SourceType.POSTGRES:
         return [
@@ -3008,6 +3300,9 @@ def default_inventory_rules(
         check_schema_count,
         check_view_count,
         check_mixed_case_identifiers,
+        check_mysql_sql_mode,
+        check_mysql_explicit_defaults_for_timestamp,
+        check_mysql_auto_increment_step,
     ]
 
 

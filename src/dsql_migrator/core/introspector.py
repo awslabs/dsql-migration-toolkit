@@ -280,16 +280,49 @@ def source_error_hint(
     return None
 
 
+# Run by the driver on every new MySQL source session, before anything else (PyMySQL's
+# ``init_command``): one SET, two session pins. Applied to every source engine (connection
+# test, introspection, validation, Full Load stream, CDC reads, prerequisite probes) since
+# they share :func:`source_engine_kwargs`. Session values only: nothing on the source is
+# written, and no privilege is needed.
+#
+# ``time_zone = '+00:00'``: MySQL TIMESTAMP is stored in UTC but read/rendered in the
+# session's time_zone, so a non-UTC server/client default would make TIMESTAMP columns drift
+# versus the target's UTC rendering -- both in the Full Load loader's reads and the
+# validation checksum (which renders TIMESTAMP via DATE_FORMAT while the PG side uses AT
+# TIME ZONE 'UTC'). DATETIME is a wall-clock and unaffected; this makes TIMESTAMP
+# deterministic regardless of the server/client zone.
+#
+# ``sql_mode = ''`` (G148): a session otherwise inherits the parameter group's sql_mode, and
+# some of its flags change what the tool READS. Under ANSI_QUOTES, SHOW CREATE re-prints a
+# view's body with double-quoted identifiers (MySQL prints it again from the parsed view in
+# the session's mode), which the converter -- like MySQL's default mode -- reads as string
+# literals: ``"orders"."id"`` came out as ``'orders'.'id'``, a view returning constants, with
+# no warning. SHOW GRANTS quotes database names the same way, which the listing-privilege
+# check does not parse. PAD_CHAR_TO_FULL_LENGTH pads every CHAR value read (Full Load wrote
+# the padding; Validation's CAST(col AS CHAR) rendered it against the target's unpadded
+# text), PIPES_AS_CONCAT and NO_BACKSLASH_ESCAPES change how SQL text parses. Every
+# statement the tool runs on a MySQL source -- the catalog reads and SHOW CREATE, keyset
+# pages, checksums, CDC start-point and drift reads, the probes -- is written for MySQL's
+# default parsing (backtick identifiers, single-quoted literals without a backslash, no
+# ``||``, no GROUP BY), and its strict-mode and zero-date flags govern writes, which the
+# tool never makes. The empty mode keeps that parsing, so every read means what it was
+# written to mean whatever the parameter group says. SQLAlchemy's MySQL dialect reads the
+# session's sql_mode after this runs, so its own identifier quoting follows it too.
+_MYSQL_SESSION_INIT_COMMAND = "SET time_zone = '+00:00', sql_mode = ''"
+
+
 def source_engine_kwargs(
     *, read_timeout_seconds: Optional[int] = None
 ) -> dict[str, object]:
     """Return the ``create_engine`` kwargs shared by every source MySQL engine.
 
     Centralizes the engine settings so the connection test, introspection, and
-    validation all build the source engine identically: ``pool_pre_ping`` plus a
+    validation all build the source engine identically: ``pool_pre_ping``, a
     bounded ``connect_timeout`` (so an unreachable host fails fast instead of
-    hanging). Exposed (and pure) so it can be asserted in a unit test without
-    opening a connection.
+    hanging) and the session pins of :data:`_MYSQL_SESSION_INIT_COMMAND` (UTC and a
+    neutral ``sql_mode``). Exposed (and pure) so it can be asserted in a unit test
+    without opening a connection.
 
     ``read_timeout_seconds`` (opt-in) additionally bounds each socket read/write
     so a connected-but-stalled stream raises instead of blocking forever. It is
@@ -299,15 +332,7 @@ def source_engine_kwargs(
     """
     connect_args: dict[str, object] = {
         "connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS,
-        # Pin the session to UTC. MySQL TIMESTAMP is stored in UTC but read/rendered
-        # in the session's time_zone, so a non-UTC server/client default would make
-        # TIMESTAMP columns drift versus the target's UTC rendering -- both in the
-        # Full Load loader's reads and the validation checksum (which renders
-        # TIMESTAMP via DATE_FORMAT while the PG side uses AT TIME ZONE 'UTC').
-        # DATETIME is a wall-clock and unaffected; this makes TIMESTAMP deterministic
-        # regardless of the server/client zone. Applied to every source engine (test,
-        # introspection, validation, Full Load stream) since they share these kwargs.
-        "init_command": "SET time_zone = '+00:00'",
+        "init_command": _MYSQL_SESSION_INIT_COMMAND,
     }
     if read_timeout_seconds is not None:
         # PyMySQL applies these per socket operation, not to the whole query.
@@ -1211,6 +1236,9 @@ def _assemble_inventory(
         extensions=dialect.list_extensions(connection),
         database_collation=dialect.database_collation(connection),
         sibling_databases=dialect.sibling_databases(connection),
+        # Server-scoped too (G148): what an application session gets by default, which
+        # Evaluation grades and the Evaluation screen shows. Best effort (empty on failure).
+        server_settings=dialect.server_settings(connection),
     )
 
 

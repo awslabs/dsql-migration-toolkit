@@ -37,6 +37,15 @@ PostgreSQL 소스에서는 Evaluation이 인벤토리에 없는 두 가지도 �
 
 어느 쪽이든 읽기에 실패하면, 리포트는 없는 것처럼 보이지 않도록 그 사실을 알려 줍니다(`PG_CATALOG_UNREAD`).
 
+Evaluation은 소스의 **서버 설정**도 한 번 읽습니다(설정만 읽으며 테이블은 스캔하지 않습니다). 읽은 설정은 리포트의 소스 객체 수 아래(**Source server settings**, 접힌 상태)에 보여 줍니다. 이 설정은 테이블 정의에는 드러나지 않는, 애플리케이션이 실행되는 조건을 알려 줍니다.
+
+- **MySQL:** `sql_mode`, `time_zone`, `system_time_zone`, `explicit_defaults_for_timestamp`, `auto_increment_increment`, `auto_increment_offset`, `lower_case_table_names`, `character_set_server`, `collation_server`, `default_collation_for_utf8mb4`, `div_precision_increment`, `group_concat_max_len`의 GLOBAL 값입니다. 애플리케이션 세션은 이 전역 값에서 시작하고, 도구 자신의 세션은 자기 값을 따로 설정하기 때문입니다(아래 참고). 세 가지는 각각 데이터베이스 수준의 **MANUAL** 항목으로 평가됩니다. `SQL_MODE`: 모드에 `ONLY_FULL_GROUP_BY`가 없거나(그러면 뷰나 쿼리가 `GROUP BY`로 정해지지 않는 컬럼을 선택할 수 있고, Aurora DSQL은 이를 `42803`으로 거부합니다. 뷰라면 Schema Conversion이 적용할 때입니다), 날짜 컬럼을 가진 테이블이 있는데 0이거나 잘못된 날짜를 저장할 수 있거나(`NO_ZERO_DATE` 또는 `NO_ZERO_IN_DATE` 없음, strict 모드 없음, 또는 `ALLOW_INVALID_DATES`: Aurora DSQL에는 그런 값이 없으므로 그런 값을 가진 행은 그대로 로드할 수 없습니다), `ANSI_QUOTES` / `PIPES_AS_CONCAT`이 있을 때입니다(Query Converter에 붙여 넣는 애플리케이션 SQL은 그 모드로 작성되어 있지만, 변환기는 SQL을 MySQL 기본 모드처럼 읽습니다). `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 설정이 `OFF`이면 MySQL은 `NOT NULL`로 선언된 `TIMESTAMP` 컬럼에 NULL을 쓸 때 현재 시각을 저장하는데, Aurora DSQL은 그 쓰기를 거부합니다. 항목이 해당 컬럼을 나열합니다. `AUTO_INCREMENT_STEP`: `auto_increment_increment`가 1보다 크고 `AUTO_INCREMENT` 키를 가진 테이블이 있을 때입니다. Aurora DSQL에서 그 키의 identity는 1씩 증가합니다. 나머지 설정(시간대, 이름의 대소문자 처리, 문자 집합과 collation 기본값, `div_precision_increment`, `group_concat_max_len`)은 기록만 하고 평가하지 않습니다.
+- **PostgreSQL:** 마이그레이션 사용자의 새 세션이 연결된 데이터베이스에서 받는 `TimeZone`입니다(DB 또는 DB 클러스터 파라미터 그룹의 값이며, `ALTER DATABASE`나 `ALTER ROLE` 기본값이 있으면 그 값). 도구의 세션은 UTC로 고정되므로 별도의 짧은 연결로 읽습니다. 또한 `ALTER DATABASE`나 `ALTER ROLE`이 그 데이터베이스에 설정한 각 `TimeZone` 기본값도 읽습니다(애플리케이션이 연결하는 역할은 자기 값을 가질 수 있습니다). 기록만 하고 평가하지 않습니다.
+
+어느 쪽의 읽기도 애플리케이션이 스스로 설정하는 값은 볼 수 없습니다: 세션의 `SET`(`SET sql_mode`, `SET time_zone`, `SET TIME ZONE`), 또는 드라이버나 연결 문자열이 연결할 때 보내는 옵션입니다. 읽기에 실패하면 목록이 비어 있을 뿐이며, Evaluation이 실패하지는 않습니다.
+
+도구 자신의 MySQL 소스 세션은 중립적인 `sql_mode`로 읽습니다: 각 세션은 연결할 때 `SET time_zone = '+00:00', sql_mode = ''`를 실행합니다. 이는 세션 설정이며 소스에는 아무것도 쓰지 않습니다. 이 설정 덕분에 파라미터 그룹의 `sql_mode`가 도구가 읽는 내용을 바꾸지 못합니다: 예를 들어 `ANSI_QUOTES`에서는 `SHOW CREATE`가 뷰 본문의 식별자를 큰따옴표로 출력하는데, 변환은 이를 문자열로 읽게 됩니다.
+
 ### 모든 객체가 하나의 분류를 받음
 
 | 분류 | 의미 | 예시 |
