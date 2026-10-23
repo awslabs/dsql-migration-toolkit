@@ -453,8 +453,11 @@ class _FakeExporter:
         on_pause_slice=None,
         shared_snapshot_id=None,
         target_specs=None,
+        on_zero_dates=None,
     ) -> list[dict]:
         self.on_pause_slice = on_pause_slice
+        # G150: the zero / invalid MySQL dates the real reader reports at the stream's end.
+        self.on_zero_dates = on_zero_dates
         # The applied DDL's precision/scale specs the reader's value-fit check receives.
         self.target_specs_by_table = getattr(self, "target_specs_by_table", {})
         self.target_specs_by_table[table.name] = target_specs

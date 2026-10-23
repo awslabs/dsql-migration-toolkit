@@ -178,6 +178,12 @@ examples a **MySQL source** produces:
 - `DATETIME` → `timestamp`, its wall clock copied as it is (no time zone is applied or
   shifted; a source in another zone keeps that zone's wall clock, `SOURCE_TIME_ZONE` in
   Chapter 2); `TIMESTAMP` → `timestamptz`, the instant.
+- A zero or invalid `DATE` / `DATETIME` / `TIMESTAMP` (`0000-00-00`, `2024-00-15`, and
+  `2024-02-31` under `ALLOW_INVALID_DATES`), which Aurora DSQL has no value for → the value
+  the CDC connector writes for a zero date: NULL, the column's `DEFAULT` or `1970-01-01`
+  (`1970-01-01` too for a day the month does not have, at which CDC stops instead), as
+  [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits) details. The table then
+  gets one WARNING line in the activity log with how many, per column (never the values).
 - `BLOB`/`BINARY`/`VARBINARY` family → `bytea`.
 
 For a **PostgreSQL source** there is **no** MySQL-style value translation during

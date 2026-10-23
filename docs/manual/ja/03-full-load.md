@@ -158,6 +158,11 @@ PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付
 - `BIT(n)` → 整数(ソースのバイト列からデコード)。
 - `DATETIME` → `timestamp`、壁時計をそのままコピー(タイムゾーンを適用したりずらしたりしないため、別のタイムゾーンの
   ソースはそのタイムゾーンの壁時計を保ちます: 第 2 章の `SOURCE_TIME_ZONE`)、`TIMESTAMP` → `timestamptz`、その時点。
+- Aurora DSQL にない値であるゼロや不正な `DATE`/`DATETIME`/`TIMESTAMP`(`0000-00-00`、`2024-00-15`、
+  `ALLOW_INVALID_DATES` での `2024-02-31`)→ CDC コネクタがゼロの日付に書き込む値: NULL、列の `DEFAULT` または
+  `1970-01-01`(その月にない日も `1970-01-01` になり、CDC はその代わりにそうした値で停止します。詳細は
+  [第 6 章 §6.2](06-limitations.md#62-移行プロセスの制限))。そのテーブルには、列ごとの件数を
+  記した WARNING 行がアクティビティログに 1 行残ります(値は残しません)。
 - `BLOB`/`BINARY`/`VARBINARY` 系 → `bytea`。
 
 **PostgreSQL ソース**では、Full Load 中に MySQL 方式の値変換は**行われません**。両端がともに

@@ -78,6 +78,7 @@ from dsql_migrator.core.cdc_coords import gtid_mode_is_on
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
 from dsql_migrator.core.source_time_zone import resolve_source_zone
 from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
+from dsql_migrator.core.mysql_zero_dates import INVALID as INVALID_DATE, ZERO as ZERO_DATE
 from dsql_migrator.core.column_exclusion import names_in as _names_in  # noqa: F401
 from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
 from dsql_migrator.core.schema_applier import (
@@ -290,6 +291,33 @@ class TableLoadResult:
     # the operator can add the index later (the common cause, DSQL's 24-index limit,
     # is flagged before loading by the TOO_MANY_INDEXES assessment rule).
     index_failures: tuple = ()
+    # G150: the zero / invalid MySQL dates the load wrote as CDC writes them, as
+    # ``(column, kind, replacement, count)`` -- names and counts only. One WARNING
+    # activity line per table (_record_zero_dates).
+    zero_dates: tuple = ()
+
+
+class _ZeroDateTally:
+    """The zero / invalid MySQL dates one table's load wrote as CDC writes them (G150),
+    summed over its row streams -- several reader shards in threads, or several shard
+    processes' results in the parent. Entries are ``(column, kind, replacement, count)``."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[tuple[str, str, str], int] = {}
+
+    def add(self, entries: "Sequence[tuple]") -> None:
+        with self._lock:
+            for column, rule, replacement, count in entries or ():
+                key = (str(column), str(rule), str(replacement))
+                self._counts[key] = self._counts.get(key, 0) + int(count)
+
+    def entries(self) -> tuple:
+        with self._lock:
+            return tuple(
+                (column, rule, replacement, count)
+                for (column, rule, replacement), count in sorted(self._counts.items())
+            )
 
 
 def _as_load_result(value: "Union[int, TableLoadResult]") -> TableLoadResult:
@@ -995,6 +1023,8 @@ class _TableWorkerResult:
     # importer -- so the parent knows a split table's parts left nothing on Aurora DSQL.
     # False (unknown) by default: the parent then keeps the table's record.
     wrote_nothing: bool = False
+    # G150: TableLoadResult.zero_dates of this table or shard (a DONE result only).
+    zero_dates: tuple = ()
 
 
 def _slim_worker_inputs(
@@ -1540,6 +1570,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             rows_skipped=outcome.rows_skipped,
             quarantine_records=quarantine_recs,
             index_failures=tuple(getattr(outcome, "index_failures", ()) or ()),
+            zero_dates=tuple(getattr(outcome, "zero_dates", ()) or ()),
         )
     except _FullLoadStopped:
         return _TableWorkerResult(table_name=name, status="STOPPED")
@@ -1713,6 +1744,8 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         # dead source connection) before waiting out the failover.
         _shard_conflict_mode = [conflict_mode]
         _live_rows: list = [None]
+        # The CURRENT attempt's zero / invalid dates (G150): a re-read counts its rows anew.
+        _zero_dates: list = [_ZeroDateTally()]
         # One resume job for this shard, reused across the in-process source-drop retries so a
         # retry skips the keyset ranges this shard already committed. A shard NEVER recreates
         # its target (the parent pre-recreated it once, before submitting shards), so committed
@@ -1740,6 +1773,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             # keeps it consistent as of one point in time only because the retry imports
             # the run's SHARED snapshot again (PostgreSQL); a MySQL shard, whose re-read
             # would open a fresh snapshot later than its first, is never re-read (G137).
+            _zero_dates[0] = _ZeroDateTally()
             rows = migrator._exporter.stream_converted_rows(
                 args.inputs.source_config,
                 table,
@@ -1751,6 +1785,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 on_pause_slice=_on_pause_slice,
                 shared_snapshot_id=args.shared_snapshot_id,
                 target_specs=target_specs,
+                on_zero_dates=_zero_dates[0].add,
             )
             _live_rows[0] = rows
             return importer.import_rows(
@@ -1818,6 +1853,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             quarantine_records=quarantine_recs,
             index_failures=tuple(getattr(result, "index_failures", ()) or ()),
             wrote_nothing=not handed[0],
+            zero_dates=_zero_dates[0].entries(),
         )
     except (_FullLoadStopped, ExportCancelled):
         return _TableWorkerResult(
@@ -2298,6 +2334,48 @@ def _record_index_failures(
     )
 
 
+_ZERO_DATE_KINDS = {ZERO_DATE: "zero date(s)", INVALID_DATE: "invalid date(s)"}
+
+
+def _record_zero_dates(table_name: str, entries) -> None:
+    """ONE activity-log line for a loaded table whose zero / invalid MySQL dates were written
+    as CDC writes them (G150): how many, per column, and what they became -- never a value
+    (Property 7). WARNING, not FAILURE: every row loaded, but such a value is not stored as
+    the source holds it. Shared by every load path; shard results are summed first. A day
+    the month does not have is the exception CDC does not share -- its source connector
+    stops at one -- so the line then says what to do before Start CDC."""
+    tally = _ZeroDateTally()
+    tally.add(tuple(entries or ()))
+    merged = tally.entries()
+    if not merged:
+        return
+    total = sum(count for *_rest, count in merged)
+    parts = "; ".join(
+        f"{column}: {count:,} {_ZERO_DATE_KINDS.get(rule, rule)} as {replacement}"
+        for column, rule, replacement, count in merged
+    )
+    invalid = any(rule == INVALID_DATE for _column, rule, _replacement, _count in merged)
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "load table",
+        status=ActivityStatus.WARNING,
+        target=table_name,
+        detail=(
+            f"{total:,} zero or invalid date value(s) Aurora DSQL has no date for were "
+            f"written as CDC writes them: {parts}. Validation compares the source the same "
+            "way (see Limitations, zero and invalid MySQL dates)."
+            + (
+                " An invalid date (a day the month does not have) is written as Debezium's "
+                "substitute for it, but CDC itself stops at the first change to a row that "
+                "holds one: in a Full load + CDC migration, correct those rows on the source "
+                "before Start CDC."
+                if invalid
+                else ""
+            )
+        ),
+    )
+
+
 def _migrate_table_with_source_retry(
     migrator: "DataMigrator",
     table: TableDef,
@@ -2543,6 +2621,7 @@ def _migrate_one_table(
         _record_index_failures(
             error_log, job_id, name, getattr(outcome, "index_failures", ())
         )
+        _record_zero_dates(name, getattr(outcome, "zero_dates", ()))
         quarantined = getattr(outcome, "rows_quarantined", 0) or 0
         # Quarantined rows are permanently DROPPED from the target (e.g. a value
         # over DSQL's ~1 MiB per-value limit, or another non-retryable row error),
@@ -3691,6 +3770,12 @@ def _migrate_tables_in_parallel(
                                 _tally(_TableLoadOutcome.STOPPED)
                         else:
                             had_q = len(all_quarantine) > 0
+                            # Every shard is DONE: their zero / invalid dates, summed, on
+                            # the table's one line (G150).
+                            _record_zero_dates(name, [
+                                entry for r in shard_results[name]
+                                for entry in (r.zero_dates or ())
+                            ])
                             log_activity(ActivityCategory.FULL_LOAD, "load table",
                                 status=ActivityStatus.FAILURE if had_q else ActivityStatus.SUCCESS,
                                 target=name,
@@ -3740,6 +3825,7 @@ def _migrate_tables_in_parallel(
                             _record_index_failures(
                                 error_log, job_id, name, result.index_failures
                             )
+                            _record_zero_dates(name, result.zero_dates)
                             # Same detail as the in-process path: a FAILURE whose text says
                             # only "N rows newly loaded" is an unexplained failure, and it
                             # reads as contradicting the screen (which shows the table DONE
@@ -7226,6 +7312,10 @@ class BatchedTableMigrator:
                 min_rows=cfg.full_load_shard_min_rows,
             )
 
+        # The zero / invalid MySQL dates this call's streams write as CDC writes them (G150),
+        # summed over its reader shards (each completes in its own importer thread).
+        zero_dates = _ZeroDateTally()
+
         def _shard_stream(
             lo: "Optional[int]", hi: "Optional[int]"
         ) -> "Iterator[Mapping[str, object]]":
@@ -7239,6 +7329,7 @@ class BatchedTableMigrator:
                 on_throttle=on_throttle,
                 on_pause_slice=on_pause_slice,
                 target_specs=target_specs,
+                on_zero_dates=zero_dates.add,
             )
 
         sharded = len(shard_ranges) > 1
@@ -7423,6 +7514,7 @@ class BatchedTableMigrator:
             rows_quarantined=getattr(result, "quarantined", 0) or 0,
             quarantine_records=tuple(getattr(result, "quarantine_records", ()) or ()),
             index_failures=tuple(getattr(result, "index_failures", ()) or ()),
+            zero_dates=zero_dates.entries(),
         )
 
     def _default_count_target_rows(self, table: TableDef) -> Optional[int]:

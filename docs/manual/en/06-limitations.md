@@ -608,6 +608,43 @@ fails **loudly** where it can't.
   before 1582-10-15 lands days off, read in the Julian calendar (`1000-01-01` five days later,
   `0001-01-01` two days earlier). Migrate such tables with **Full load + CDC** (its slot
   hand-off takes no snapshot) and validate them with CHECKSUM.
+- **Zero and invalid MySQL dates.** MySQL can store dates Aurora DSQL has no value for: the
+  zero date `0000-00-00`, a date with a zero month or day (`2024-00-15`), the zero
+  `TIMESTAMP`, and, under `ALLOW_INVALID_DATES`, a day the month does not have
+  (`2024-02-31`). They get in where `sql_mode` lacks strict mode, `NO_ZERO_DATE` or
+  `NO_ZERO_IN_DATE`, or a column's `DEFAULT` is the zero date; Evaluation's `ZERO_DATES` item
+  ([Chapter 2 §2.1](02-evaluation-and-schema-conversion.md)) lists the date columns and a
+  query per table that counts the rows holding one. Full Load writes each such value as the
+  bundled CDC connector (Debezium) writes it from the binary log, so a row is the same
+  whichever path wrote it:
+  - a zero date, or a zero year, month or day, in a `DATE` or `DATETIME` column becomes
+    NULL where the column allows NULL; in a `NOT NULL` column it becomes the column's
+    `DEFAULT` when that is a date (not `CURRENT_TIMESTAMP` or another expression), or else
+    `1970-01-01` (`1970-01-01 00:00:00` in a `DATETIME`);
+  - the zero `TIMESTAMP` becomes `1970-01-01 00:00:00` UTC, whether or not the column
+    allows NULL;
+  - a day the month does not have becomes `1970-01-01` (`1970-01-01 00:00:00`), the value
+    Debezium substitutes for a date it cannot read (the bundled connector stops at one
+    instead, below).
+
+  A table that held any gets one WARNING line in the activity log with how many, per
+  column, and what they became (never the values). Validation renders the source's values
+  the same way before it checksums them, so a table whose only differences are such values
+  matches, and any other difference still shows. What does not carry over:
+  - **CDC stops at a day the month does not have.** The source connector cannot read a
+    binary-log change to a row that holds one — in any table the binary log records, not
+    only the migrated ones — so it stops at that change, and at the same change again after
+    every restart. Correct such rows on the source before **Start CDC**; once CDC has
+    stopped at one, it continues only from a newer start point (the first item of this
+    section).
+  - **A primary key that holds such a date.** Such a key is written as a fixed date
+    (`1970-01-01`, or the column's `DEFAULT`), so rows whose keys hold one collide on Aurora
+    DSQL — with each other, or with the row whose key is that date — and only one of them is
+    kept; Validation reports the difference. A key holding a day the month does not have can
+    also make the table's read fail with MySQL error `1525`. Correct those keys on the
+    source first.
+  - **The application's writes.** Aurora DSQL rejects such a date in an `INSERT` or
+    `UPDATE` (`22008`): change the code that writes them before cut over.
 - **PostgreSQL 17/18 sources — three version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is

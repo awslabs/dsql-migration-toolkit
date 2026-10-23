@@ -71,17 +71,21 @@ shows:
   `lower_case_table_names`, `character_set_server`, `collation_server`,
   `default_collation_for_utf8mb4`, `div_precision_increment` and `group_concat_max_len` —
   the global ones, because an application session starts from them while the tool's own
-  sessions set their own (below). Three are graded, each a database-level **MANUAL** item.
+  sessions set their own (below). Four are graded, each a database-level **MANUAL** item.
   `SQL_MODE`: the mode lacks `ONLY_FULL_GROUP_BY` (a view or query may then select a column
   its `GROUP BY` does not determine, which Aurora DSQL rejects with `42803`, a view when
-  Schema Conversion applies it), lets the source store zero or invalid dates while a table
-  has a date column (no `NO_ZERO_DATE` or `NO_ZERO_IN_DATE`, no strict mode, or
-  `ALLOW_INVALID_DATES`: Aurora DSQL has no such value, so a row holding one cannot be
-  loaded as it is), or has `ANSI_QUOTES` / `PIPES_AS_CONCAT` (application SQL you paste into
-  the Query Converter is written for that mode, and the converter reads SQL the way MySQL's
-  default mode does). `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: the setting is `OFF`, so MySQL
-  stores the current time when NULL is written to a `TIMESTAMP` column declared `NOT NULL`,
-  a write Aurora DSQL rejects; the item lists those columns. `AUTO_INCREMENT_STEP`:
+  Schema Conversion applies it), or has `ANSI_QUOTES` / `PIPES_AS_CONCAT` (application SQL
+  you paste into the Query Converter is written for that mode, and the converter reads SQL
+  the way MySQL's default mode does). `ZERO_DATES`: the mode lets the source store zero or
+  invalid dates while a table has a date column (no `NO_ZERO_DATE` or `NO_ZERO_IN_DATE`, no
+  strict mode, or `ALLOW_INVALID_DATES`), or a column's `DEFAULT` is the zero date. Aurora
+  DSQL has no such value, so the item lists the `DATE`, `DATETIME` and `TIMESTAMP` columns,
+  says what Full Load and CDC write for such a value
+  ([§6.2](06-limitations.md#62-migration-process-limits)), and gives for each table a query
+  that counts the rows holding one: Evaluation reads no rows.
+  `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: the setting is `OFF`, so MySQL stores the current time
+  when NULL is written to a `TIMESTAMP` column declared `NOT NULL`, a write Aurora DSQL
+  rejects; the item lists those columns. `AUTO_INCREMENT_STEP`:
   `auto_increment_increment` is above 1 and a table has an `AUTO_INCREMENT` key, whose
   identity on Aurora DSQL steps by 1. The time zone is graded too, as for PostgreSQL
   (below). The others — the case folding of names, the character set and collation

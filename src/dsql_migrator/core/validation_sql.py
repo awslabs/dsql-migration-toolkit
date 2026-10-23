@@ -28,6 +28,7 @@ from dsql_migrator.core.converter import (
     mysql_enum_set_members,
 )
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
+from dsql_migrator.core.mysql_zero_dates import zero_date_mapping
 
 # A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
 # reduce a format_type spelling to its base for a timetz classification (e.g.
@@ -414,9 +415,17 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
     the CDC sink's compact serialization). This renderer is used ONLY for a MySQL
     source, so the float omission is MySQL-only -- a PostgreSQL source's floats ARE
     value-compared (see :func:`_pg_checksum_expr`).
+
+    A DATE / DATETIME / TIMESTAMP column is rendered through
+    :meth:`~dsql_migrator.core.mysql_zero_dates.ZeroDateMapping.sql` (G150): a zero or
+    invalid date becomes the value Full Load and CDC write for it before it is rendered, so
+    a table whose only differences are such values matches, and any other value is
+    rendered exactly as before.
     """
     ident = _quote_mysql_identifier(column.name)
     kind = _checksum_kind(column)
+    mapping = zero_date_mapping(column)
+    value = mapping.sql(ident) if mapping is not None else ident
     if kind == "binary":
         # Spatial -> ST_AsBinary (matches the loader's stored WKB); then lower-hex
         # to match PG encode(bytea,'hex'). MySQL HEX() is UPPERCASE -> LOWER().
@@ -436,13 +445,13 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         return f"CASE WHEN {ident} IS NULL THEN NULL WHEN {ident} = 0 THEN 'false' ELSE 'true' END"
     if kind in ("timestamp", "timestamptz"):
         # Fixed 6-digit fraction, no zone -> matches PG to_char(... 'YYYY-MM-DD HH24:MI:SS.US').
-        return f"DATE_FORMAT({ident}, '%Y-%m-%d %H:%i:%s.%f')"
+        return f"DATE_FORMAT({value}, '%Y-%m-%d %H:%i:%s.%f')"
     if kind == "time":
         # TIME_FORMAT, not DATE_FORMAT: DATE_FORMAT reads a TIME as a DATETIME (today plus
         # the time), so 24:00:00 -- which Aurora DSQL's time holds and Full Load writes --
         # printed as the next day's 00:00:00 and could never match. Identical for
         # 00:00:00..23:59:59.999999.
-        return f"TIME_FORMAT({ident}, '%H:%i:%s.%f')"
+        return f"TIME_FORMAT({value}, '%H:%i:%s.%f')"
     if kind == "duration":
         # Signed microseconds; HOUR/MINUTE/SECOND/MICROSECOND of a negative TIME are the
         # magnitude's parts, so the sign is applied once.
@@ -469,7 +478,7 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
         # false checksum mismatch against the target's "42". Arithmetic (col + 0)
         # produces a plain numeric result that has no ZEROFILL padding, so it matches.
         return f"CAST({ident} + 0 AS CHAR)"
-    return f"CAST({ident} AS CHAR)"
+    return f"CAST({value} AS CHAR)"
 
 
 def _pg_checksum_expr(
@@ -775,12 +784,23 @@ def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
     and bounded by ``:sample_size`` (``ORDER BY pk LIMIT N``). No ``COUNT(*)`` and
     no full materialization: the engine streams in PK order and stops at the LIMIT,
     reading only the first N rows via the primary-key index. Read-only.
+
+    A DATE / DATETIME / TIMESTAMP key is selected as the value Full Load and CDC wrote for a
+    zero or invalid date (G150), so the sample names the key the target holds.
     """
     pk_sql = _quote_mysql_identifier(pk_column)
     table_sql = _quote_mysql_table(table.name)
+    mapping = zero_date_mapping(
+        next((column for column in table.columns if column.name == pk_column), None)
+    )
+    key_sql, order_sql = pk_sql, pk_sql
+    if mapping is not None:
+        # Ordered by the column, table-qualified: MySQL reads a bare ORDER BY name as the
+        # select list's alias first, and a key named pk would then sort by the CASE.
+        key_sql, order_sql = mapping.sql(pk_sql), f"{table_sql}.{pk_sql}"
     return (
-        f"SELECT {pk_sql} AS pk, {_mysql_row_token(table)} AS tok FROM {table_sql} "
-        f"ORDER BY {pk_sql} LIMIT :sample_size"
+        f"SELECT {key_sql} AS pk, {_mysql_row_token(table)} AS tok FROM {table_sql} "
+        f"ORDER BY {order_sql} LIMIT :sample_size"
     )
 
 

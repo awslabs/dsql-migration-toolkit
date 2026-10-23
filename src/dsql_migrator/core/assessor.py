@@ -2996,6 +2996,7 @@ def check_mixed_case_identifiers(
 # ---------------------------------------------------------------------------
 
 SQL_MODE_RULE_ID = "SQL_MODE"
+ZERO_DATES_RULE_ID = "ZERO_DATES"
 IMPLICIT_TIMESTAMP_RULE_ID = "EXPLICIT_DEFAULTS_FOR_TIMESTAMP"
 AUTO_INCREMENT_STEP_RULE_ID = "AUTO_INCREMENT_STEP"
 
@@ -3010,7 +3011,6 @@ _SQL_MODE_COMPOSITES: dict[str, tuple[str, ...]] = {
         "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION",
     ),
 }
-_MYSQL_TEMPORAL_BASES = frozenset({"date", "datetime", "timestamp"})
 # Where the setting is changed on RDS / Aurora. Aurora MySQL's auto_increment_increment and
 # auto_increment_offset are cluster-level parameters (DB cluster parameter group only), while
 # sql_mode and explicit_defaults_for_timestamp are instance-level: the DB cluster parameter
@@ -3071,13 +3071,12 @@ def check_mysql_sql_mode(
     Every application session starts from that mode (the tool's own sessions read with an
     empty one), so it says what the application and the source's data were allowed to do:
     without ONLY_FULL_GROUP_BY a view or query may select a column it neither groups nor
-    aggregates, which Aurora DSQL rejects (42803); without the zero-date and strict flags, or
-    with ALLOW_INVALID_DATES, the date columns may hold values Aurora DSQL has no value for;
-    under ANSI_QUOTES or PIPES_AS_CONCAT the application's SQL means something else in
-    MySQL's default mode, which the Query Converter reads. None of these is a fault of the
-    conversion, so the item names what to check, not a fix it made. Nothing when the mode was
-    not read, is numeric (an old server's form), or none of the flags matter -- the date part
-    only when a table has a DATE, DATETIME or TIMESTAMP column."""
+    aggregates, which Aurora DSQL rejects (42803); under ANSI_QUOTES or PIPES_AS_CONCAT the
+    application's SQL means something else in MySQL's default mode, which the Query
+    Converter reads. None of these is a fault of the conversion, so the item names what to
+    check, not a fix it made. What the zero-date and strict flags let the source store is
+    its own item, ZERO_DATES (:func:`check_mysql_zero_dates`). Nothing when the mode was not
+    read, is numeric (an old server's form), or none of the flags matter."""
     value = inventory.server_settings.get("sql_mode")
     if value is None or value.strip().isdigit():
         return []
@@ -3097,59 +3096,6 @@ def check_mysql_sql_mode(
             "Group or aggregate every selected column of a view the apply rejects (MIN() or "
             "MAX() keeps one value where MySQL picked one), and test the application's GROUP "
             "BY queries on Aurora DSQL before cut over -- the Query Converter can probe them."
-        )
-    strict = bool(flags & {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"})
-    reasons = [
-        reason
-        for reason, applies in (
-            ("no NO_ZERO_DATE", "NO_ZERO_DATE" not in flags),
-            ("no NO_ZERO_IN_DATE", "NO_ZERO_IN_DATE" not in flags),
-            ("no strict mode (STRICT_TRANS_TABLES or STRICT_ALL_TABLES)", not strict),
-            ("ALLOW_INVALID_DATES", "ALLOW_INVALID_DATES" in flags),
-        )
-        if applies
-    ]
-    has_dates = any(
-        _base_type(column.mysql_type) in _MYSQL_TEMPORAL_BASES
-        for table in inventory.tables
-        for column in table.columns
-    )
-    if reasons and has_dates:
-        # Only what these flags let in: a zero date unless strict mode and NO_ZERO_DATE refuse
-        # it (without strict mode NO_ZERO_DATE only warns), a zero month or day unless
-        # NO_ZERO_IN_DATE is set (without strict mode it becomes a zero date), and a day the
-        # month does not have only under ALLOW_INVALID_DATES.
-        examples = [
-            example
-            for example, applies in (
-                ("a zero date ('0000-00-00')", "NO_ZERO_DATE" not in flags or not strict),
-                ("a zero month or day ('2024-00-15')", "NO_ZERO_IN_DATE" not in flags),
-                (
-                    "a day the month does not have ('2024-02-31')",
-                    "ALLOW_INVALID_DATES" in flags,
-                ),
-            )
-            if applies
-        ]
-        listed = (
-            ", ".join(examples[:-1]) + " or " + examples[-1] if len(examples) > 1 else examples[0]
-        )
-        lenient = (
-            " Without strict mode MySQL also stores an invalid date it is given as a zero "
-            "date, with only a warning."
-            if not strict
-            else ""
-        )
-        risks.append(
-            f"The mode lets the source store dates Aurora DSQL has no value for "
-            f"({'; '.join(reasons)}): {listed}.{lenient} The DATE, DATETIME and TIMESTAMP "
-            "columns may hold such values, and a row that holds one cannot be loaded as it "
-            "is: Aurora DSQL rejects the value (SQLSTATE 22008), as it rejects an application "
-            "write MySQL accepts today."
-        )
-        advice.append(
-            "Before the Full Load, find the rows that hold such dates and decide what each "
-            "becomes (NULL, or a real date), and change the application code that writes them."
         )
     special = [flag for flag in ("ANSI_QUOTES", "PIPES_AS_CONCAT") if flag in flags]
     if special:
@@ -3181,6 +3127,176 @@ def check_mysql_sql_mode(
             object_name="sql_mode",
             rule_id=SQL_MODE_RULE_ID,
             risk=f"The source's global sql_mode is '{value}'. " + " ".join(risks),
+            recommendation=" ".join(advice),
+            effort=EffortLevel.MEDIUM,
+        )
+    ]
+
+
+# How many tables' check queries the ZERO_DATES item spells out; the rest are counted.
+_ZERO_DATE_QUERIES_SHOWN = 5
+
+
+def check_mysql_zero_dates(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """Zero and invalid dates (G150): the source's GLOBAL ``sql_mode`` lets it store dates
+    Aurora DSQL has no value for (no NO_ZERO_DATE or no NO_ZERO_IN_DATE, no strict mode, or
+    ALLOW_INVALID_DATES), or a column's DEFAULT writes a zero date, so the selected tables'
+    DATE / DATETIME / TIMESTAMP columns may hold one. Evaluation reads no rows: the item
+    lists those columns, says what Full Load and CDC write for such a value
+    (:mod:`dsql_migrator.core.mysql_zero_dates` -- and that a day the month does not have
+    stops CDC), and gives the query per table that counts the rows holding one. Nothing when
+    no table has such a column, or neither the mode (unread counts as nothing let in, like
+    the other setting checks) nor a DEFAULT lets one in."""
+    from dsql_migrator.core.converter import _is_zero_temporal_literal
+    from dsql_migrator.core.mysql_zero_dates import check_query, temporal_base
+
+    columns = [
+        f"{table.name}.{column.name}"
+        for table in inventory.tables
+        for column in table.columns
+        if temporal_base(column) is not None
+    ]
+    if not columns:
+        return []
+    zero_defaults = [
+        f"{table.name}.{column.name}"
+        for table in inventory.tables
+        for column in table.columns
+        if temporal_base(column) is not None
+        and column.default is not None
+        and not column.default_is_expression
+        and _is_zero_temporal_literal(column.default)
+    ]
+    value = inventory.server_settings.get("sql_mode")
+    read = value is not None and not value.strip().isdigit()
+    flags = _sql_mode_flags(value) if read else set()
+    strict = bool(flags & {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"})
+    reasons = [
+        reason
+        for reason, applies in (
+            ("no NO_ZERO_DATE", "NO_ZERO_DATE" not in flags),
+            ("no NO_ZERO_IN_DATE", "NO_ZERO_IN_DATE" not in flags),
+            ("no strict mode (STRICT_TRANS_TABLES or STRICT_ALL_TABLES)", not strict),
+            ("ALLOW_INVALID_DATES", "ALLOW_INVALID_DATES" in flags),
+        )
+        if applies and read
+    ]
+    if not reasons and not zero_defaults:
+        return []
+    # Only what these flags let in: a zero date unless strict mode and NO_ZERO_DATE refuse it
+    # (without strict mode NO_ZERO_DATE only warns) -- or a DEFAULT writes one --, a zero month
+    # or day unless NO_ZERO_IN_DATE is set (without strict mode it becomes a zero date), and a
+    # day the month does not have only under ALLOW_INVALID_DATES.
+    zero_date = bool(zero_defaults) or (read and ("NO_ZERO_DATE" not in flags or not strict))
+    zero_part = read and "NO_ZERO_IN_DATE" not in flags
+    invalid_day = "ALLOW_INVALID_DATES" in flags
+    risks: list[str] = []
+    if reasons:
+        examples = [
+            example
+            for example, applies in (
+                ("a zero date ('0000-00-00')", "NO_ZERO_DATE" not in flags or not strict),
+                ("a zero month or day ('2024-00-15')", zero_part),
+                ("a day the month does not have ('2024-02-31')", invalid_day),
+            )
+            if applies
+        ]
+        listed = (
+            ", ".join(examples[:-1]) + " or " + examples[-1] if len(examples) > 1 else examples[0]
+        )
+        lenient = (
+            " Without strict mode MySQL also stores an invalid date it is given as a zero "
+            "date, with only a warning."
+            if not strict
+            else ""
+        )
+        risks.append(
+            f"The source's global sql_mode is '{value}', which lets it store dates Aurora DSQL "
+            f"has no value for ({'; '.join(reasons)}): {listed}.{lenient}"
+        )
+    if zero_defaults:
+        risks.append(
+            "A column whose DEFAULT is the zero date holds one in every row written without "
+            f"a value for it ({_counted(zero_defaults, 'column')}); Schema Conversion drops "
+            "that DEFAULT (DEFAULT_DROPPED)."
+        )
+    risks.append(
+        "The DATE, DATETIME and TIMESTAMP columns of the selected tables may hold such "
+        f"values ({_counted(columns, 'column')})."
+    )
+    zero_kinds = [
+        kind
+        for kind, applies in (("a zero date", zero_date), ("a zero month or day", zero_part))
+        if applies
+    ]
+    mapped = []
+    if zero_kinds:
+        subject = (
+            "a zero date, or a zero month or day," if len(zero_kinds) > 1 else zero_kinds[0]
+        )
+        mapped.append(
+            f"{subject} becomes NULL where the column allows NULL, and otherwise the "
+            "column's DEFAULT when that is a date, or else 1970-01-01 (1970-01-01 00:00:00 in "
+            "a DATETIME); the zero TIMESTAMP becomes 1970-01-01 00:00:00 UTC"
+        )
+    if invalid_day:
+        mapped.append(
+            "a day the month does not have becomes 1970-01-01 (1970-01-01 00:00:00 in a "
+            "DATETIME), Debezium's substitute for a date it cannot read"
+        )
+    risks.append(
+        "Full Load writes each such value as the CDC connector (Debezium) writes it from the "
+        f"binary log, and Validation compares the source the same way: {'; '.join(mapped)}."
+        + (
+            " CDC cannot carry a day the month does not have: the source connector stops at "
+            "the first change to a row that holds one, in any table the binary log records, "
+            "and stops there again each time it is restarted."
+            if invalid_day
+            else ""
+        )
+    )
+    queries = [
+        query
+        for table in inventory.tables
+        if (query := check_query(table)) is not None
+    ]
+    shown = " ".join(queries[:_ZERO_DATE_QUERIES_SHOWN])
+    more = len(queries) - _ZERO_DATE_QUERIES_SHOWN
+    advice = [
+        "Evaluation reads no rows. To count the rows that hold such a date, run on the source, "
+        f"for each table (each reads its table once): {shown}"
+        + (
+            f" -- and {more:,} more table{'' if more == 1 else 's'}, the same test over "
+            "their DATE, DATETIME and TIMESTAMP columns."
+            if more > 0
+            else ""
+        ),
+        "Where the value Full Load writes is not what the row should hold, correct the row "
+        "on the source before the Full Load"
+        + (
+            ", and every day the month does not have before CDC starts: a CDC that stopped "
+            "at one starts again only from a newer start point."
+            if invalid_day
+            else "."
+        ),
+        "Make the application stop writing such dates before cut over: Aurora DSQL rejects "
+        "them (SQLSTATE 22008).",
+    ]
+    if reasons:
+        advice.append(
+            f"To make the source refuse them from now on, set sql_mode in "
+            f"{_INSTANCE_SETTINGS_PARAMETER_GROUP} with strict mode, NO_ZERO_DATE and "
+            "NO_ZERO_IN_DATE, and without ALLOW_INVALID_DATES; it reaches new connections "
+            "without a reboot. Test the application first: a stricter mode rejects writes it "
+            "makes today."
+        )
+    return [
+        _database_item(
+            object_name="zero and invalid dates",
+            rule_id=ZERO_DATES_RULE_ID,
+            risk=" ".join(risks),
             recommendation=" ".join(advice),
             effort=EffortLevel.MEDIUM,
         )
@@ -3546,7 +3662,8 @@ def default_inventory_rules(
     within one database, which Aurora DSQL supports and this tool migrates
     schema-qualified automatically -- so the "spans N databases" note is meaningless
     for a PG source. The database-level limits (tables, schemas, views per database)
-    apply to every engine. The server-setting checks (sql_mode,
+    apply to every engine. The server-setting checks (sql_mode and the zero / invalid dates
+    it lets in -- G150, which also reads the columns' DEFAULTs --,
     explicit_defaults_for_timestamp, the auto_increment step) read MySQL settings; the
     time zone check reads each engine's (G149).
     """
@@ -3566,6 +3683,7 @@ def default_inventory_rules(
         check_view_count,
         check_mixed_case_identifiers,
         check_mysql_sql_mode,
+        check_mysql_zero_dates,
         check_mysql_explicit_defaults_for_timestamp,
         check_mysql_auto_increment_step,
         check_mysql_time_zone,

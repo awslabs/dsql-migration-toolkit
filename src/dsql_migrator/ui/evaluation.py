@@ -2531,7 +2531,7 @@ def _render_source_settings(
     ui: object, inventory: SourceInventory, source_type: Optional[SourceType]
 ) -> None:
     """The source's server settings, collapsed under the source counts: reference for the
-    findings that grade them (SQL_MODE, EXPLICIT_DEFAULTS_FOR_TIMESTAMP,
+    findings that grade them (SQL_MODE, ZERO_DATES, EXPLICIT_DEFAULTS_FOR_TIMESTAMP,
     AUTO_INCREMENT_STEP, SOURCE_TIME_ZONE) and for what is only recorded. Nothing when none
     were read."""
     rows = source_settings_rows(inventory)

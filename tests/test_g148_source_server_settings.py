@@ -42,6 +42,7 @@ from dsql_migrator.core.assessor import (
     AUTO_INCREMENT_STEP_RULE_ID,
     IMPLICIT_TIMESTAMP_RULE_ID,
     SQL_MODE_RULE_ID,
+    ZERO_DATES_RULE_ID,
     CompatibilityAssessor,
 )
 from dsql_migrator.core.converter import SchemaConverter
@@ -648,7 +649,10 @@ def _database_items(inventory: SourceInventory, source_type: SourceType = Source
     return {
         item.rule_id: item
         for item in report.items
-        if item.rule_id in (SQL_MODE_RULE_ID, IMPLICIT_TIMESTAMP_RULE_ID, AUTO_INCREMENT_STEP_RULE_ID)
+        if item.rule_id in (
+            SQL_MODE_RULE_ID, ZERO_DATES_RULE_ID, IMPLICIT_TIMESTAMP_RULE_ID,
+            AUTO_INCREMENT_STEP_RULE_ID,
+        )
     }
 
 
@@ -672,34 +676,43 @@ def test_a_default_sql_mode_has_nothing_to_report() -> None:
 
 def test_an_empty_sql_mode_lists_the_group_by_and_date_flags() -> None:
     inventory = SourceInventory(tables=[_DATED], server_settings={"sql_mode": ""})
-    item = _database_items(inventory)[SQL_MODE_RULE_ID]
+    items = _database_items(inventory)
+    item = items[SQL_MODE_RULE_ID]
     _assert_database_gap(item, object_name="sql_mode", effort="MEDIUM")
     assert item.risk.startswith("The source's global sql_mode is ''.")
     assert "Without ONLY_FULL_GROUP_BY" in item.risk and "SQLSTATE 42803" in item.risk
-    for reason in ("no NO_ZERO_DATE", "no NO_ZERO_IN_DATE", "no strict mode"):
-        assert reason in item.risk
-    assert "'0000-00-00'" in item.risk and "SQLSTATE 22008" in item.risk
-    assert "Without strict mode MySQL also stores an invalid date" in item.risk
-    assert "'2024-02-31'" not in item.risk  # no ALLOW_INVALID_DATES
     assert "ANSI_QUOTES" not in item.risk
     assert "reaches new connections without a reboot" in item.recommendation
+    # G150: what the zero-date and strict flags let in is its own item, ZERO_DATES
+    # (tests/test_g150_zero_dates.py), and such a row now loads -- written as CDC writes it --
+    # so no item says Aurora DSQL rejects it on the way in.
+    assert "0000-00-00" not in item.risk
+    dates = items[ZERO_DATES_RULE_ID]
+    for reason in ("no NO_ZERO_DATE", "no NO_ZERO_IN_DATE", "no strict mode"):
+        assert reason in dates.risk
+    assert "'0000-00-00'" in dates.risk and "SQLSTATE 22008" not in dates.risk
+    assert "Without strict mode MySQL also stores an invalid date" in dates.risk
+    assert "'2024-02-31'" not in dates.risk  # no ALLOW_INVALID_DATES
 
 
 def test_the_date_flags_matter_only_where_a_table_holds_dates() -> None:
     undated = SourceInventory(tables=[_table()], server_settings={"sql_mode": ""})
-    item = _database_items(undated)[SQL_MODE_RULE_ID]
-    assert "ONLY_FULL_GROUP_BY" in item.risk and "0000-00-00" not in item.risk
+    items = _database_items(undated)
+    assert "ONLY_FULL_GROUP_BY" in items[SQL_MODE_RULE_ID].risk
+    assert ZERO_DATES_RULE_ID not in items
     # Strict, but ALLOW_INVALID_DATES: the invalid day is named, the lenient write is not.
     invalid = SourceInventory(
         tables=[_table("app.events", ColumnDef(name="at", mysql_type="datetime(6)"))],
         server_settings={"sql_mode": MYSQL_80_DEFAULT + ",ALLOW_INVALID_DATES"},
     )
-    item = _database_items(invalid)[SQL_MODE_RULE_ID]
+    items = _database_items(invalid)
+    item = items[ZERO_DATES_RULE_ID]
     assert "(ALLOW_INVALID_DATES)" in item.risk and "'2024-02-31'" in item.risk
     # Strict mode with both zero-date flags still refuses zero dates: not claimed.
     assert "'0000-00-00'" not in item.risk and "'2024-00-15'" not in item.risk
     assert "Without strict mode" not in item.risk
-    assert "Without ONLY_FULL_GROUP_BY" not in item.risk
+    # The rest of the mode has nothing to report (ONLY_FULL_GROUP_BY is set).
+    assert SQL_MODE_RULE_ID not in items
 
 
 @pytest.mark.parametrize(
@@ -730,7 +743,7 @@ def test_the_date_part_names_only_the_values_the_flags_let_in(
     mode: str, named: list, not_named: list
 ) -> None:
     inventory = SourceInventory(tables=[_DATED], server_settings={"sql_mode": mode})
-    risk = _database_items(inventory)[SQL_MODE_RULE_ID].risk
+    risk = _database_items(inventory)[ZERO_DATES_RULE_ID].risk  # G150: its own item
     for text_ in named:
         assert text_ in risk, text_
     for text_ in not_named:
@@ -909,7 +922,10 @@ def test_run_evaluation_grades_the_settings_the_read_captured() -> None:
     target, _ = _target_factory(_empty_target())
     result = run_evaluation(_inputs(), introspector_factory=source, target_browser_factory=target)
     assert result.inventory.server_settings == {"sql_mode": "NO_ENGINE_SUBSTITUTION"}
-    assert [i.rule_id for i in result.assessment.items if i.kind == "DATABASE"] == [SQL_MODE_RULE_ID]
+    # The mode lacks ONLY_FULL_GROUP_BY and lets zero dates in, and the table has a DATE.
+    assert [i.rule_id for i in result.assessment.items if i.kind == "DATABASE"] == [
+        SQL_MODE_RULE_ID, ZERO_DATES_RULE_ID,
+    ]
     # A read that captured nothing grades nothing, and the run completes as before.
     source, _ = _source_factory(SourceInventory(tables=[_DATED]))
     plain = run_evaluation(_inputs(), introspector_factory=source, target_browser_factory=target)

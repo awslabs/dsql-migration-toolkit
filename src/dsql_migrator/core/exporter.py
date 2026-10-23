@@ -67,6 +67,7 @@ from sqlalchemy.engine import Engine
 from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
 from dsql_migrator.core.models import SourceConnectionConfig, SourceType, TableDef
+from dsql_migrator.core.mysql_zero_dates import ZeroDateMapping, zero_date_mapping
 from dsql_migrator.core.source_dialect import (
     MySQLSourceDialect,
     SourceDialect,
@@ -355,6 +356,21 @@ class ValueConverter:
                 or (self._kinds.get(column.name) or "").startswith("interval")
             )
         )
+        # Source MySQL DATE / DATETIME / TIMESTAMP columns (G150): PyMySQL returns a zero
+        # date ('0000-00-00', '2020-00-15'), a day the month does not have ('2020-02-31')
+        # and the zero TIMESTAMP as a str, which Aurora DSQL rejects (22008). Each is
+        # written as the bundled CDC writes it (core.mysql_zero_dates: NULL or the
+        # column's DEFAULT / the epoch), whatever the target type, and counted per column
+        # for the table's one activity-log line. These columns leave the pass-through fast
+        # path below (a DATE column took it before): a real value costs one convert_value
+        # call, O(1), and only a str is parsed.
+        self._zero_dates: dict[str, ZeroDateMapping] = {
+            column.name: mapping
+            for column in table.columns
+            if (mapping := zero_date_mapping(column)) is not None
+        }
+        # (column, ZERO | INVALID) -> how many values this converter mapped.
+        self.zero_dates: dict[tuple[str, str], int] = {}
         # Fast-path: columns whose target kind needs no conversion (int, varchar,
         # numeric, text, etc.). For a typical OLTP table 80-90% of columns fall
         # here. convert_row skips convert_value entirely for these, replacing 7+
@@ -368,12 +384,29 @@ class ValueConverter:
             if kind not in _NEEDS_CONVERSION_KINDS
             and name not in self._bit_columns
             and name not in self._duration_columns
+            and name not in self._zero_dates
+        )
+
+    def zero_date_entries(self) -> "tuple[tuple[str, str, str, int], ...]":
+        """The zero / invalid dates this converter mapped, as ``(column, ZERO | INVALID,
+        what it was written as, count)`` -- names and counts only, never a value."""
+        return tuple(
+            (column, rule, self._zero_dates[column].replacement_text(rule), count)
+            for (column, rule), count in sorted(self.zero_dates.items())
         )
 
     def convert_value(self, column_name: str, value: object) -> object:
         """Convert a single cell value for ``column_name`` (``None`` passes through)."""
         if value is None:
             return None
+        if column_name in self._zero_dates and isinstance(value, str):
+            mapped = self._zero_dates[column_name].value(value)
+            if mapped is not None:
+                rule, value = mapped
+                key = (column_name, rule)
+                self.zero_dates[key] = self.zero_dates.get(key, 0) + 1
+                if value is None:
+                    return None
         if column_name in self._bit_columns:
             # MySQL BIT(n) -> integer target. The driver returns big-endian bytes
             # (e.g. b'\xdb'); decode to the unsigned integer the bit pattern holds.
@@ -1452,6 +1485,7 @@ class TableExporter:
         on_pause_slice: Optional[Callable[[], None]] = None,
         shared_snapshot_id: Optional[str] = None,
         target_specs: "Optional[Mapping[str, TargetValueSpec]]" = None,
+        on_zero_dates: "Optional[Callable[[tuple[tuple[str, str, str, int], ...]], None]]" = None,
     ) -> "Iterator[Mapping[str, object]]":
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
@@ -1484,6 +1518,11 @@ class TableExporter:
         the table (table-fatal ``ValueConversionError``) instead of loading changed. It checks
         rows only for columns whose live source type can exceed the target, so a table whose
         types match pays one attribute read per row.
+
+        ``on_zero_dates`` (optional) is called once, after the stream has read and committed
+        every row, with the zero / invalid MySQL dates the converter wrote as CDC writes them
+        (:meth:`ValueConverter.zero_date_entries`: column, kind, replacement, count -- never
+        a value) when there were any. A stream that stops early or fails reports nothing.
         """
         dialect = dialect_for(conn.source_type)
         converter = dialect.value_converter(table, target_types=target_types)
@@ -1545,6 +1584,11 @@ class TableExporter:
                 snapshot.execute(
                     text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
                 )
+                entries = getattr(converter, "zero_date_entries", None)
+                if on_zero_dates is not None and callable(entries):
+                    found = entries()
+                    if found:
+                        on_zero_dates(found)
         finally:
             engine.dispose()
 

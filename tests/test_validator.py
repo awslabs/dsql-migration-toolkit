@@ -1864,8 +1864,10 @@ def test_checksum_zerofill_int_renders_plain_numeric() -> None:
 
 def test_checksum_temporal_columns_fixed_fraction_no_zone() -> None:
     mysql_sql, pg_sql, _mysql_tok, _pg_tok = _all_four_rendered(_typed_table())
-    # MySQL: fixed 6-digit fraction, no zone.
-    assert "DATE_FORMAT(`created_at`, '%Y-%m-%d %H:%i:%s.%f')" in mysql_sql
+    # MySQL: fixed 6-digit fraction, no zone -- over the value with a zero or invalid date
+    # replaced as Full Load and CDC write it (G150, tests/test_g150_zero_dates.py).
+    assert "DATE_FORMAT(CASE WHEN (YEAR(`created_at`) = 0" in mysql_sql
+    assert "ELSE `created_at` END, '%Y-%m-%d %H:%i:%s.%f')" in mysql_sql
     assert "TIME_FORMAT(`t_of_day`, '%H:%i:%s.%f')" in mysql_sql
     # PG: a plain timestamp (DATETIME -> created_at) renders DIRECTLY -- AT TIME ZONE
     # 'UTC' is NOT a no-op on `timestamp without time zone` (it converts through the
@@ -1962,7 +1964,7 @@ def test_pk_token_matches_checksum_per_column_terms() -> None:
         "LOWER(HEX(ST_AsBinary(`geo`)))",
         "CAST(`flags` AS UNSIGNED)",
         "WHEN `active` = 0 THEN 'false' ELSE 'true' END",
-        "DATE_FORMAT(`created_at`, '%Y-%m-%d %H:%i:%s.%f')",
+        "ELSE `created_at` END, '%Y-%m-%d %H:%i:%s.%f')",
         "CAST(`amount` AS DECIMAL(65, 4))",
     ):
         assert term in mysql_sql and term in mysql_tok
