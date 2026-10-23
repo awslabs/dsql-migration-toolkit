@@ -508,6 +508,20 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     있습니다. 먼저 소스에서 그런 키를 고치세요.
   - **애플리케이션의 쓰기.** Aurora DSQL은 `INSERT`나 `UPDATE`에 들어온 그런 날짜를 거부합니다(`22008`).
     컷오버 전에 그런 값을 쓰는 코드를 바꾸세요.
+- **PostgreSQL: CDC는 대부분의 확장 타입을 옮기지 못함.** 번들 CDC 커넥터(Debezium)는 확장(extension)이 정의한
+  타입을 이름으로만 알아보며, 아는 것은 여섯 가지입니다: `citext`, `hstore`, `ltree`, `isbn`, 그리고 PostGIS
+  `geometry`와 `geography`(및 그 배열). 그 밖의 확장 타입 컬럼은 Aurora DSQL에서 어떤 타입이든 모든 변경 이벤트에서
+  빠집니다. 예: pgvector의 `vector`, `halfvec`, `sparsevec`, `cube`, `seg`, `lquery`, `isbn`이 아닌 `isn` 타입.
+  그러면 CDC가 삽입한 행은 그 컬럼에 NULL(또는 그 `DEFAULT`)을 받고 업데이트는 그 컬럼을 그대로 두며, 데드레터는
+  생기지 않습니다. 그 컬럼이 Aurora DSQL에서 `DEFAULT` 없는 `NOT NULL`이면 대신 Aurora DSQL이 CDC가 그 테이블에
+  쓰는 모든 삽입과 업데이트를 거부합니다(`23502`, 데드레터 처리). Full Load는 그 컬럼을 옮기므로 CDC로 도착한
+  행만 달라지고(CDC only에서는 스냅샷의 행도), Validation CHECKSUM이 그것을 보여 줍니다. Evaluation
+  (`CDC_UNCARRYABLE_COLUMN`)은 흔히 쓰는 확장의 그런 컬럼을 짚어 주고, CDC 사전 요구사항 검사
+  (*Every column's type can be carried by CDC*)는 소스 카탈로그를 읽어 그 모두를 찾습니다. CDC가 옮기지 못하는
+  내장 타입과 같습니다([§4.2](04-cdc-and-dsql-constraints.md#cdc-중-소스-스키마-드리프트-감지처리)). CDC를
+  배포하기 전에 정하세요: 컬럼을 제외하거나([13장](13-excluding-tables-and-columns.md)), 소스에서 CDC가 옮기는
+  타입(`text`)으로 바꾸거나, 테이블을 빼고 Full load only로 마이그레이션하거나, 그 차이를 받아들이고 컷오버 전에
+  그 테이블의 쓰기를 멈춘 채 **Drop & reload**로 다시 로드하세요.
 - **PostgreSQL 17/18 소스 — 버전별 엣지 3가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
   지원하며, 17·18에서 유의할 점이 3가지 있습니다:
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그

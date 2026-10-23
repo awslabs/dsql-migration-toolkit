@@ -353,6 +353,17 @@ _PG_TYPE_KINDS = {
 # domain over a domain resolves to a user-schema type, fails the pg_catalog filter and is
 # simply not flagged -- a miss, never a false alarm.
 #
+# A type defined OUTSIDE pg_catalog -- an extension's, such as pgvector's ``vector`` -- is
+# returned by a third branch with no candidate list (G153): every BASE type
+# (``typtype = 'b'``; an array's element type, through one domain) outside pg_catalog whose
+# name the bundled connector does not know (``:carried_extension_types``, see
+# ``prerequisites_postgres._CDC_CARRIED_EXTENSION_TYPES``), flagged ``outside_catalog``. An
+# enum, a composite, a range or a domain over a domain is not a base type, so it is not
+# returned. Verified on PostgreSQL 17.11 (pgvector 0.8.7) and 13.23: vector, halfvec,
+# sparsevec, vector[], cube, seg, ean13, lquery, earth (a domain over cube) and a domain
+# over vector are returned; citext, hstore, ltree, isbn (and their arrays), a base type
+# named geometry, an enum, an enum[] and a composite are not.
+#
 # ``attndims`` is deliberately NOT read. It is only the DECLARED dimensionality and
 # PostgreSQL enforces it in NEITHER direction -- live-verified on 17.11: a column declared
 # ``int[]`` (attndims=1) accepted and stored ``{{1,2},{3,4}}`` (array_ndims 2), while one
@@ -372,7 +383,9 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
     # NOT NULL: a column left out of the event then has every write refused (23502). A
     # domain's own NOT NULL counts too, one level deep, as pgjdbc's getColumns (which
     # Debezium marks the field optional or required by) and cdc_catalog_drift read it.
-    "(a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS not_null "
+    "(a.attnotnull OR (t.typtype = 'd' AND t.typnotnull)) AS not_null, "
+    "(COALESCE(ebt.typnamespace, bt.typnamespace) "
+    "   <> 'pg_catalog'::regnamespace) AS outside_catalog "
     "FROM pg_catalog.pg_attribute a "
     "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid "
     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
@@ -385,15 +398,20 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
     "  ON ebt.oid = CASE WHEN et.typtype = 'd' THEN et.typbasetype ELSE et.oid END "
     "WHERE a.attnum > 0 AND NOT a.attisdropped "
     "  AND n.nspname || '.' || c.relname = ANY(:names) "
-    # Built-in types ONLY (so a user enum named ``money`` is never matched), and the array
-    # and scalar candidate lists stay APART: scalar money/xml/point/interval/bit/varbit
-    # replicate fine, it is money[]/xml[]/... that do not.
+    # The candidate lists name built-in types ONLY (so a user enum named ``money`` is never
+    # matched), and the array and scalar lists stay APART: scalar money/xml/point/interval/
+    # bit/varbit replicate fine, it is money[]/xml[]/... that do not.
     "  AND ((ebt.oid IS NOT NULL "
     "        AND ebt.typnamespace = 'pg_catalog'::regnamespace "
     "        AND ebt.typname = ANY(:array_elements)) "
     "    OR (ebt.oid IS NULL "
     "        AND bt.typnamespace = 'pg_catalog'::regnamespace "
-    "        AND bt.typname = ANY(:scalars))) "
+    "        AND bt.typname = ANY(:scalars)) "
+    # An extension's type the connector does not know, scalar or array (see above).
+    "    OR (COALESCE(ebt.typtype, bt.typtype) = 'b' "
+    "        AND COALESCE(ebt.typnamespace, bt.typnamespace) "
+    "            <> 'pg_catalog'::regnamespace "
+    "        AND COALESCE(ebt.typname, bt.typname) <> ALL(:carried_extension_types))) "
     "ORDER BY qname, a.attnum"
 )
 
@@ -1987,6 +2005,7 @@ class PostgresSourceDialect(SourceDialect):
         # source degrades to "unknown" rather than erroring the gate). All plain SHOW /
         # SELECT on system catalogs, so it passes the read-only guard.
         from dsql_migrator.core.prerequisites_postgres import (
+            CDC_CARRIED_EXTENSION_TYPES,
             CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS,
             CDC_UNCARRYABLE_CANDIDATE_SCALARS,
             PostgresCdcFacts,
@@ -2194,15 +2213,20 @@ class PostgresSourceDialect(SourceDialect):
                     "names": names,
                     "array_elements": list(CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS),
                     "scalars": list(CDC_UNCARRYABLE_CANDIDATE_SCALARS),
+                    "carried_extension_types": list(CDC_CARRIED_EXTENSION_TYPES),
                 },
             )
             if carry_rows is not None:
                 found: dict[str, list] = {}
                 for r in carry_rows:
+                    # A type defined outside pg_catalog (an extension's): the query's third
+                    # branch, graded by name alone.
+                    extension = bool(r[7]) if len(r) > 7 else False
                     reason = classify_uncarryable_cdc_column(
                         is_array=bool(r[3]),
                         base_type_name=str(r[4]) if r[4] is not None else None,
                         element_typmod=int(r[5]),
+                        extension=extension,
                     )
                     # None = a candidate type that carries fine after all, today only
                     # numeric(p,s)[]. Filtering server-side on the type NAME keeps the
@@ -2215,7 +2239,7 @@ class PostgresSourceDialect(SourceDialect):
                             declared_type=str(r[2]),
                             reason=reason,
                             nullable=(not bool(r[6])) if len(r) > 6 else None,
-                            in_event=bool(r[3]) and str(r[4]) == "bit",
+                            in_event=bool(r[3]) and str(r[4]) == "bit" and not extension,
                         )
                     )
                 uncarryable = {k: tuple(v) for k, v in found.items()}

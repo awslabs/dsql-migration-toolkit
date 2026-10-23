@@ -130,6 +130,22 @@ def _render_remodel_guidance(bad: "list[tuple[str, object, str, object]]") -> st
     return " ".join(lines)
 
 
+def _cdc_drops_too(names: "list[str]") -> str:
+    """The sentence that says CDC cannot carry these extension-typed columns either, or
+    ``""``. A remodel is advised on the TARGET, and the bundled CDC connector decides by the
+    SOURCE type (G153), so the remodel the finding recommends does not reach CDC. Pure."""
+    if not names:
+        return ""
+    one = len(names) == 1
+    listed = ", ".join(f'"{name}"' for name in names)
+    return (
+        f" CDC cannot carry {listed} either, whatever {'its' if one else 'their'} type on "
+        "Aurora DSQL: the bundled CDC connector does not know "
+        f"{'its extension type' if one else 'their extension types'} and leaves "
+        f"{'it' if one else 'them'} out of every change event."
+    )
+
+
 class UnsupportedPostgresTypeRule(Rule):
     """Flag columns whose PostgreSQL type Aurora DSQL does not support as a column type.
 
@@ -138,7 +154,10 @@ class UnsupportedPostgresTypeRule(Rule):
     network, xml, money, bit, range, tsvector, enum/composite, pgvector). Without it a
     table using such a type reads AUTO at Evaluation and the problem only appears at
     Schema Conversion. Reuses that single source of truth so the two steps never drift.
-    PostgreSQL-source only.
+    PostgreSQL-source only. For a column of an extension type CDC does not carry (pgvector's
+    ``vector``, ...; ``cdc_drops_extension_type``) the finding also says CDC cannot carry it,
+    since the remodel advised here is on the target and does not reach CDC;
+    ``CDC_UNCARRYABLE_COLUMN`` says what that does to the table.
     """
 
     rule_id = "PG_UNSUPPORTED_TYPE"
@@ -148,12 +167,14 @@ class UnsupportedPostgresTypeRule(Rule):
             substitute_pg_unsupported_type,
             unsupported_dsql_reason,
         )
+        from dsql_migrator.core.prerequisites_postgres import cdc_drops_extension_type
 
         findings: list[Finding] = []
         for table in inventory.tables:
             bad = []
             retyped = []
             guidance = []  # every such column's own remodel line, in table order
+            uncarried = []  # those CDC cannot carry whatever their target type (G153)
             for col in table.columns:
                 reason = unsupported_dsql_reason(
                     col.mysql_type,
@@ -177,6 +198,8 @@ class UnsupportedPostgresTypeRule(Rule):
                 else:
                     bad.append((col.name, col.mysql_type, reason, col.type_kind))
                     guidance.append((col.name, col.mysql_type, reason, col.type_kind))
+                if cdc_drops_extension_type(col):
+                    uncarried.append(col.name)
             if retyped and not bad:
                 listed = ", ".join(f'"{name}" ({old} -> {new})' for name, old, new in retyped)
                 # A key column re-typed to one Aurora DSQL cannot index (an array key, now
@@ -205,6 +228,7 @@ class UnsupportedPostgresTypeRule(Rule):
                             "application code that relies on the old type's operators or "
                             "functions (array subscripts, range or network operators, enum "
                             "ordering) must change."
+                            + _cdc_drops_too(uncarried)
                         ),
                         recommendation=_render_remodel_guidance(guidance),
                         effort=EffortLevel.MEDIUM,
@@ -241,6 +265,7 @@ class UnsupportedPostgresTypeRule(Rule):
                             if any(kind for *_rest, kind in bad)
                             else ""
                         )
+                        + _cdc_drops_too(uncarried)
                     ),
                     # The per-type reason, not a catalogue to match against. Each reason
                     # names the faithful remodel target for THAT type, and it was already
@@ -1536,7 +1561,9 @@ class PgCdcUncarryableColumnRule(Rule):
     as ``timetz[]`` (every change dead-letters) or ``interval[]`` (arrives NULL). Judged from
     the inventory's column types with the same classifier, and worded with the same
     sentences, prefixed by the condition: none of it applies to a Full load only migration,
-    which carries every one of these columns."""
+    which carries every one of these columns. An extension's type the bundled connector
+    does not know (pgvector's ``vector``, ...) arrives NULL too (G153); Evaluation knows the
+    common ones by name, Step 3 reads the catalog for every one."""
 
     rule_id = "CDC_UNCARRYABLE_COLUMN"
 

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.models import (
+    ColumnDef,
     PrerequisiteCheckId,
     PrerequisiteResult,
     PrerequisiteStatus,
@@ -73,7 +74,8 @@ UNCARRYABLE_COLUMN_ARRIVES_WRONG = "column_arrives_wrong"
 # user-defined type spelled ``money`` is never matched -- verified on PostgreSQL 17.11, a
 # ``cdcprobe.money[]`` enum column is not returned while a ``pg_catalog.money[]`` one is.
 # An array of a user-defined ENUM must NOT be listed here: enums arrive as plain strings
-# and replicate correctly.
+# and replicate correctly. A type an EXTENSION defines is graded apart, by the rule at
+# :data:`_CDC_CARRIED_EXTENSION_TYPES`.
 _CDC_UNCARRYABLE_ARRAY_ELEMENTS = {
     # (A) the whole ROW dead-letters -- no row reaches the target at all, for EVERY change
     # to that table, because the sink throws on the first unrenderable column.
@@ -150,9 +152,52 @@ CDC_UNCARRYABLE_CANDIDATE_SCALARS = tuple(
     sorted(set(_CDC_UNCARRYABLE_SCALARS) | {"bit", "varbit"})
 )
 
+# --- Types defined outside pg_catalog: an extension's -----------------------------------
+# A type an extension creates (pgvector's vector, cube, seg, ...), or any other base type
+# created outside pg_catalog, gets its OID when it is created, so the bundled Debezium 2.7.4
+# connector can recognise it only by NAME. Its TypeRegistry knows six such names, in whatever
+# schema the type lives (it compares pg_type.typname), and PostgresValueConverter gives each a
+# schema: PostGIS geometry and geography (a WKB + SRID struct), citext, hstore (a JSON string:
+# cdc-stack.yaml leaves hstore.handling.mode at its default, json), ltree and isbn -- and an
+# array of any of them. Every OTHER base type outside pg_catalog is java.sql.Types.OTHER to
+# it: PostgresValueConverter.schemaBuilder and JdbcValueConverters return no schema, the
+# connector logs "No converter found for column ... The column will not be part of change
+# events for that table", and the column is left OUT of every change event, as tsvector is.
+# include.unknown.datatypes would send it as raw bytes instead, and cdc-stack.yaml does not
+# set it (its default, false, "omits the fields"). Established from the shipped jars with
+# javap (G153); a test pins the six names against the bundled connector.
+_CDC_CARRIED_EXTENSION_TYPES = frozenset(
+    {"citext", "geography", "geometry", "hstore", "isbn", "ltree"}
+)
+# What the probe binds: it returns every base type outside pg_catalog EXCEPT these.
+CDC_CARRIED_EXTENSION_TYPES = tuple(sorted(_CDC_CARRIED_EXTENSION_TYPES))
+
+# The extension types Evaluation recognises, by NAME: it reads no catalog for this check, and
+# an inventory type string does not say which schema a type lives in. Each one is a base type
+# outside pg_catalog that the connector does not know (verified on PostgreSQL 17.11 with
+# pgvector 0.8.7, and 13.23). Step 3's probe needs no list -- it reads the catalog and flags
+# EVERY base type outside pg_catalog but the six above -- so a type missing here is a miss at
+# Evaluation, never a false alarm, as a domain is.
+_CDC_DROPPED_EXTENSION_TYPES = frozenset(
+    {
+        "vector", "halfvec", "sparsevec",  # pgvector
+        "cube",
+        "seg",
+        "ean13", "isbn13", "ismn", "ismn13", "issn", "issn13", "upc",  # isn, but isbn
+        "lquery", "ltxtquery",  # ltree's query types; ltree itself is carried
+    }
+)
+# The user-defined KINDS of ColumnDef.type_kind. An extension's type is a BASE type, so a
+# column of one of these kinds is never one, whatever it is named (an enum called ``cube``).
+_USER_DEFINED_TYPE_KINDS = frozenset({"enum", "composite", "domain", "range", "multirange"})
+
 
 def classify_uncarryable_cdc_column(
-    *, is_array: bool, base_type_name: Optional[str], element_typmod: int
+    *,
+    is_array: bool,
+    base_type_name: Optional[str],
+    element_typmod: int,
+    extension: bool = False,
 ) -> Optional[str]:
     """Why CDC cannot carry this column, or ``None`` when it can.
 
@@ -160,6 +205,12 @@ def classify_uncarryable_cdc_column(
     catalog discriminators the probe reads -- whether the column's effective type is an
     array, the pg_catalog name of its element (or of the scalar itself), and the element's
     ``atttypmod`` -- and applies the tables above.
+
+    ``extension`` says that type is defined OUTSIDE pg_catalog, which the probe reads from
+    the catalog: the connector then carries it only when it knows its name
+    (:data:`_CDC_CARRIED_EXTENSION_TYPES`), scalar or array, whatever its modifier, and leaves
+    any other out of every change event, so the column arrives NULL. The pg_catalog tables
+    are not consulted for it: an extension's type that shares a built-in's name is not one.
 
     ``numeric`` is the one type whose MODIFIER decides: ``numeric(p,s)[]`` carries fine
     (Debezium sends a fixed-scale Decimal), while an UNCONSTRAINED ``numeric[]`` becomes a
@@ -177,6 +228,10 @@ def classify_uncarryable_cdc_column(
     """
     if not base_type_name:
         return None
+    if extension:
+        if base_type_name in _CDC_CARRIED_EXTENSION_TYPES:
+            return None
+        return UNCARRYABLE_COLUMN_ARRIVES_NULL
     if not is_array:
         if base_type_name in ("bit", "varbit"):
             return _classify_scalar_bit_width(base_type_name, element_typmod)
@@ -218,16 +273,35 @@ def _catalog_discriminators(declared: str) -> "tuple[bool, str, int]":
     return is_array, base, typmod
 
 
+def cdc_drops_extension_type(column: ColumnDef) -> bool:
+    """Whether CDC leaves ``column`` out of every change event because its type (an array's
+    element type) is an extension's the bundled connector does not know -- judged by NAME
+    from the inventory (:data:`_CDC_DROPPED_EXTENSION_TYPES`), as Evaluation must.
+    ``format_type`` qualifies a type whose schema is not on the search path
+    (``ext.vector(3)``), so the schema is ignored. An ARRAY of a user-defined type that
+    shares such a name is not told apart (the inventory records no element kind); the
+    probe, which reads the element's ``typtype``, does. Pure."""
+    if column.type_kind in _USER_DEFINED_TYPE_KINDS:
+        return False
+    base = _catalog_discriminators(column.mysql_type)[1]
+    return base.rpartition(".")[2] in _CDC_DROPPED_EXTENSION_TYPES
+
+
 def uncarryable_columns_of(table: TableDef) -> "list[UncarryableCdcColumn]":
     """The columns of ``table`` CDC cannot carry, judged from the inventory's own column
     types -- the same verdict the Step 3 probe reaches from the catalog, for Evaluation,
     which reads no catalog for it. A DOMAIN over such a type is not seen here (the inventory
-    names the domain); the probe still sees it. Pure."""
+    names the domain); the probe still sees it, as it sees an extension's type that
+    :func:`cdc_drops_extension_type` does not name. Pure."""
     found: list[UncarryableCdcColumn] = []
     for column in table.columns:
         is_array, base, typmod = _catalog_discriminators(column.mysql_type)
+        extension = cdc_drops_extension_type(column)
         reason = classify_uncarryable_cdc_column(
-            is_array=is_array, base_type_name=base, element_typmod=typmod
+            is_array=is_array,
+            base_type_name=base.rpartition(".")[2] if extension else base,
+            element_typmod=typmod,
+            extension=extension,
         )
         if reason is not None:
             found.append(
@@ -2171,6 +2245,8 @@ __all__ = [
     "PostgresCdcFacts",
     "UncarryableCdcColumn",
     "classify_uncarryable_cdc_column",
+    "cdc_drops_extension_type",
+    "CDC_CARRIED_EXTENSION_TYPES",
     "CDC_UNCARRYABLE_CANDIDATE_ARRAY_ELEMENTS",
     "CDC_UNCARRYABLE_CANDIDATE_SCALARS",
     "UNCARRYABLE_ROW_DEAD_LETTERS",

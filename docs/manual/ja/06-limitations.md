@@ -549,6 +549,22 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
     `1525` で失敗させることもあります。先にソースでそうしたキーを修正してください。
   - **アプリケーションの書き込み。** Aurora DSQL は `INSERT` や `UPDATE` のそうした日付を拒否します(`22008`)。
     カットオーバーの前に、それを書き込むコードを変更してください。
+- **PostgreSQL: CDC はほとんどの拡張機能の型を運びません。** 同梱の CDC コネクタ(Debezium)は、
+  拡張機能(extension)が定義する型を名前だけで識別し、知っているのは 6 つです: `citext`、`hstore`、`ltree`、
+  `isbn`、PostGIS の `geometry` と `geography`(およびそれらの配列)。それ以外の拡張機能の型の列は、Aurora DSQL
+  での型にかかわらず、すべての変更イベントから除かれます。たとえば pgvector の `vector`、`halfvec`、`sparsevec`、
+  `cube`、`seg`、`lquery`、`isbn` 以外の `isn` の型です。CDC が挿入した行はその列に NULL(またはその `DEFAULT`)
+  を受け取り、更新はその列をそのまま残し、デッドレターは生じません。その列が Aurora DSQL で `DEFAULT` のない
+  `NOT NULL` なら、代わりに Aurora DSQL は CDC がそのテーブルに書き込むすべての挿入と更新を拒否します(`23502`、
+  デッドレター化)。Full Load はその列を運ぶため、CDC で届いた行だけが異なり
+  (CDC only ではスナップショットの行も)、Validation の CHECKSUM がそれを示します。Evaluation
+  (`CDC_UNCARRYABLE_COLUMN`)はよく使われる拡張機能のそうした列を示し、CDC の前提条件チェック
+  (*Every column's type can be carried by CDC*)はソースのカタログを読んでそのすべてを見つけます。
+  CDC が運べない組み込み型と同じです
+  ([§4.2](04-cdc-and-dsql-constraints.md#cdc-中のソーススキーマドリフトの検出と対処))。CDC をデプロイする前に
+  決めてください: 列を除外する([第 13 章](13-excluding-tables-and-columns.md))、ソースで CDC が運ぶ型(`text`)
+  に変える、テーブルを外して Full load only で移行する、または差異を受け入れ、カットオーバーの前にそのテーブル
+  への書き込みを止めて **Drop & reload** で再ロードする、のいずれかです。
 - **PostgreSQL 17/18 ソース — バージョン固有のエッジ 3 点（いずれも移行を止めません）。** PG 13–18
   をサポートします。17・18 では次の 3 点に注意してください:
   - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で

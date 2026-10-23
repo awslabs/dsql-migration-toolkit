@@ -647,6 +647,25 @@ fails **loudly** where it can't.
     source first.
   - **The application's writes.** Aurora DSQL rejects such a date in an `INSERT` or
     `UPDATE` (`22008`): change the code that writes them before cut over.
+- **PostgreSQL: CDC does not carry most extension types.** The bundled CDC connector
+  (Debezium) recognises a type an extension defines by its name alone, and it knows six:
+  `citext`, `hstore`, `ltree`, `isbn`, and PostGIS `geometry` and `geography` (and arrays of
+  them). It leaves a column of any other extension type out of every change event, whatever
+  type the column has on Aurora DSQL: for example pgvector's `vector`, `halfvec` and
+  `sparsevec`, `cube`, `seg`, `lquery`, or an `isn` type other than `isbn`. A row CDC inserts
+  then gets NULL in that column (or its `DEFAULT`) and an update leaves the column as it was,
+  with nothing dead-lettered. If the column is `NOT NULL` on Aurora DSQL with no `DEFAULT`,
+  Aurora DSQL refuses every insert and update CDC writes to the table instead (`23502`,
+  dead-lettered). Full Load carries the column, so only the rows that arrive through CDC
+  differ (with CDC only, the snapshot's rows too), and a Validation CHECKSUM shows it.
+  Evaluation (`CDC_UNCARRYABLE_COLUMN`) names such columns of the common extensions, and the
+  CDC prerequisite check (*Every column's type can be carried by CDC*) reads the source
+  catalog for all of them, as for the built-in types CDC cannot carry
+  ([§4.2](04-cdc-and-dsql-constraints.md#detecting-and-handling-source-schema-drift)).
+  Decide before you deploy CDC: exclude the column
+  ([Chapter 13](13-excluding-tables-and-columns.md)), give it a type CDC carries on the
+  source (`text`), leave the table out and migrate it with Full load only, or accept the gap
+  and reload the table with **Drop & reload**, its writes stopped, before Cut over.
 - **PostgreSQL 17/18 sources — three version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is

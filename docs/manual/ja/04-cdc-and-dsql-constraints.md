@@ -84,7 +84,7 @@ DSQL のターゲットスキーマは **Schema Conversion** ステップの実�
 - そのほかの SQLSTATE による拒否 (たとえば `22P02`、`22007`/`22008`、`22021`、`23503`、`54000`)。その SQLSTATE
   とともに表示されます。
 - Aurora DSQL には大きすぎる値 ([§4.5](#45-値ごとの-1-mib-上限および-dlq))。
-- sink が変換できない値。たとえば PostgreSQL の `timetz[]`、`bytea[]`、または制約のない `numeric[]` 列 (Evaluation はこのような列を事前に示します、`CDC_UNCARRYABLE_COLUMN`。代わりに NULL で届く列も併せて: `interval[]`、`money[]`、`tsvector`、`tsquery`、幾何型 `box`、`circle`、`line`、`lseg`、`path`、`polygon`)。スカラーの `point` はシンクプラグイン v54 以降、自身のテキスト `(x,y)` として書き込まれます。
+- sink が変換できない値。たとえば PostgreSQL の `timetz[]`、`bytea[]`、または制約のない `numeric[]` 列 (Evaluation はこのような列を事前に示します、`CDC_UNCARRYABLE_COLUMN`。代わりに NULL で届く列も併せて: `interval[]`、`money[]`、`tsvector`、`tsquery`、幾何型 `box`、`circle`、`line`、`lseg`、`path`、`polygon`、そしてほとんどの拡張機能の型、たとえば pgvector の `vector`([§6.2](06-limitations.md#62-移行プロセスの制限)))。スカラーの `point` はシンクプラグイン v54 以降、自身のテキスト `(x,y)` として書き込まれます。
 - ソースの主キーが削除された後のキーのない変更レコード (MySQL または PostgreSQL)。レコード自体は分類されませんが、
   ソーススキーマの再確認が削除されたキーを "primary key changed at the source" として報告します。
 
