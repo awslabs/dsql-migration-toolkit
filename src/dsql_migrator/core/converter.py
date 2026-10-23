@@ -97,6 +97,7 @@ from dsql_migrator.core.models import (
     TemporalKeyDef,
     ViewDef,
 )
+from dsql_migrator.core.mysql_zero_dates import dateless_kind
 from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
 
 # Cache size applied to an identity primary key under the IDENTITY_WITH_CACHE
@@ -11593,6 +11594,23 @@ def _rewrite_mysql_calls(
         chosen_as_mysql(node)
         known_kinds[id(node)] = (node, kind_of(node))  # read again by the choice it nests in
     known_kinds.clear()
+
+    # A date MySQL stores and Aurora DSQL has no value for -- the zero date, a zero month or
+    # day, a day the month does not have -- compared with a date (the soft-delete idiom
+    # deleted_at = '0000-00-00 00:00:00', G156): Aurora DSQL refuses the literal (22008),
+    # and the rows it meant hold what Full Load wrote for such a date.
+    for literal in nodes(exp.Literal):
+        if not literal.is_string or dateless_kind(literal.name) is None:
+            continue
+        if compared_with_date(*standing(literal)):
+            issue(
+                f"A date is compared with '{literal.name}', a date MySQL stores and Aurora DSQL "
+                "has no value for (a zero date, a zero month or day, or a day the month does not "
+                "have): Aurora DSQL rejects that literal (SQLSTATE 22008), and the rows it meant "
+                "hold what Full Load wrote for such a date -- NULL, the column's DEFAULT or "
+                "1970-01-01 (see Limitations, zero and invalid MySQL dates). Compare with IS NULL "
+                "or that value instead."
+            )
 
     # A UNION column whose branches mix numbers, dates or booleans with strings is MySQL's
     # string, which PostgreSQL types by its branches (integer beside varchar refused, 'N/A'

@@ -3393,15 +3393,23 @@ def check_mysql_zero_dates(
         "Where the value Full Load writes is not what the row should hold"
         + (", and in every primary or unique key that holds such a date"
            if key_columns or unique_columns else "")
-        + ", correct the row on the source before the Full Load"
+        + ", correct the row on the source before the Full Load."
         + (
-            ", and every day the month does not have before CDC starts: a CDC that stopped "
-            "at one starts again only from a newer start point."
+            # G156: a correction is itself a change CDC replays from its start point.
+            " Correct every day the month does not have before CDC's start point is "
+            "recorded -- the Full Load in Full load + CDC, Start CDC in CDC only: CDC stops at "
+            "the first binary-log change to a row that holds one, and a correction made "
+            "after that point is such a change. Corrected after it, take a newer start point "
+            "(Re-run Full Load choosing Drop & reload) before Start CDC; a CDC that already "
+            "stopped at one starts again only from a newer start point."
             if invalid_day
-            else "."
+            else ""
         ),
-        "Make the application stop writing such dates before cut over: Aurora DSQL rejects "
-        "them (SQLSTATE 22008).",
+        "Before cut over, change the application SQL that writes or compares with such a "
+        "date: Aurora DSQL rejects one in an INSERT, an UPDATE or a WHERE (SQLSTATE 22008), "
+        "and the rows a comparison with it found (deleted_at = '0000-00-00 00:00:00') now "
+        "hold NULL, the column's DEFAULT or 1970-01-01, as above -- compare with IS NULL or "
+        "that value instead.",
     ]
     if reasons:
         advice.append(

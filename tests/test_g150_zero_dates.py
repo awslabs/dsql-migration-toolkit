@@ -382,9 +382,12 @@ def test_one_warning_line_names_the_counts_and_what_they_became(monkeypatch) -> 
     assert "due: 3 invalid date(s) as 1970-01-01; placed: 1,234 zero date(s) as NULL" in detail
     assert "Validation compares the source the same way" in detail
     # CDC does not write an invalid day as Full Load does -- its source connector stops at
-    # one -- so the line says what to do before Start CDC; only zero dates need no such word.
-    assert ("CDC itself stops at the first change to a row that holds one: in a Full load + "
-            "CDC migration, correct those rows on the source before Start CDC.") in detail
+    # one, and at the correction made now (G156) -- so the line says how to correct them
+    # before Start CDC; only zero dates need no such word.
+    assert ("CDC itself stops at the first change to a row that holds one, and correcting such "
+            "a row now is such a change: in a Full load + CDC migration, correct those rows on "
+            "the source, then Re-run Full Load choosing Drop & reload (a newer start point) "
+            "before Start CDC.") in detail
     _record_zero_dates("app.orders", ())
     _record_zero_dates("app.orders", None)
     assert len(lines) == 1
@@ -690,8 +693,10 @@ def test_allow_invalid_dates_names_the_cdc_stop_and_the_way_out() -> None:
         in item.risk
     # Strict mode with both zero flags refuses zero dates: only the invalid day is mapped.
     assert "a zero date" not in item.risk
-    assert "before CDC starts: a CDC that stopped at one starts again only from a newer start " \
-           "point" in item.recommendation
+    assert ("Correct every day the month does not have before CDC's start point is recorded -- "
+            "the Full Load in Full load + CDC, Start CDC in CDC only") in item.recommendation
+    assert "a CDC that already stopped at one starts again only from a newer start point" in \
+        item.recommendation
 
 
 def test_a_zero_default_is_reported_without_a_lenient_mode_or_a_read_mode() -> None:

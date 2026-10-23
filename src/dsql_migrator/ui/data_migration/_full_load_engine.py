@@ -2343,7 +2343,8 @@ def _record_zero_dates(table_name: str, entries) -> None:
     (Property 7). WARNING, not FAILURE: every row loaded, but such a value is not stored as
     the source holds it. Shared by every load path; shard results are summed first. A day
     the month does not have is the exception CDC does not share -- its source connector
-    stops at one -- so the line then says what to do before Start CDC."""
+    stops at one, and at the change that corrects one after its start point (G156) -- so the
+    line then says how to correct them before Start CDC."""
     tally = _ZeroDateTally()
     tally.add(tuple(entries or ()))
     merged = tally.entries()
@@ -2367,8 +2368,9 @@ def _record_zero_dates(table_name: str, entries) -> None:
             + (
                 " An invalid date (a day the month does not have) is written as Debezium's "
                 "substitute for it, but CDC itself stops at the first change to a row that "
-                "holds one: in a Full load + CDC migration, correct those rows on the source "
-                "before Start CDC."
+                "holds one, and correcting such a row now is such a change: in a Full load + "
+                "CDC migration, correct those rows on the source, then Re-run Full Load "
+                "choosing Drop & reload (a newer start point) before Start CDC."
                 if invalid
                 else ""
             )

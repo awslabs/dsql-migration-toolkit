@@ -83,6 +83,26 @@ _DEFAULT_LITERAL_RE = re.compile(
 )
 
 
+def dateless_kind(text: str, *, timestamp: bool = False) -> Optional[str]:
+    """``ZERO`` / ``INVALID`` when ``text`` -- MySQL's text of a date, 'YYYY-MM-DD' and an
+    optional time -- names a date Aurora DSQL has no value for: a zero year, month or day,
+    or (not in a TIMESTAMP, which cannot hold one) a day the month does not have; else
+    None. Pure."""
+    match = _STORED_DATE_RE.match(text.strip())
+    if match is None:
+        return None
+    year, month, day = (int(part) for part in match.groups())
+    if year == 0 or month == 0 or day == 0:
+        return ZERO
+    if timestamp:
+        return None
+    try:
+        date(year, month, day)
+    except ValueError:
+        return INVALID
+    return None
+
+
 def temporal_base(column: Optional[ColumnDef]) -> Optional[str]:
     """``"date"`` / ``"datetime"`` / ``"timestamp"`` for such a MySQL column, else None."""
     if column is None or not column.mysql_type:
@@ -140,19 +160,10 @@ class ZeroDateMapping:
     def value(self, text: str) -> "Optional[tuple[str, Optional[Temporal]]]":
         """``(ZERO | INVALID, replacement)`` for a stored value the driver returned as
         ``text``; None when ``text`` is a date after all (passed on as it is) or not one."""
-        match = _STORED_DATE_RE.match(text)
-        if match is None:
+        rule = dateless_kind(text, timestamp=self.base == "timestamp")
+        if rule is None:
             return None
-        year, month, day = (int(part) for part in match.groups())
-        if year == 0 or month == 0 or day == 0:
-            return ZERO, self.zero
-        if self.base == "timestamp":
-            return None
-        try:
-            date(year, month, day)
-        except ValueError:
-            return INVALID, self.invalid
-        return None
+        return rule, self.zero if rule == ZERO else self.invalid
 
     def replacement_text(self, rule: str) -> str:
         """The replacement as a log line or a finding names it (never a row's value)."""
@@ -266,6 +277,7 @@ __all__ = [
     "ZERO",
     "ZeroDateMapping",
     "check_query",
+    "dateless_kind",
     "invalid_sql",
     "temporal_base",
     "zero_date_mapping",

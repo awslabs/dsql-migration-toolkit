@@ -636,9 +636,11 @@ fails **loudly** where it can't.
   - **CDC stops at a day the month does not have.** The source connector cannot read a
     binary-log change to a row that holds one — in any table the binary log records, not
     only the migrated ones — so it stops at that change, and at the same change again after
-    every restart. Correct such rows on the source before **Start CDC**; once CDC has
-    stopped at one, it continues only from a newer start point (the first item of this
-    section).
+    every restart. Correcting such a row is itself such a change, so correct them before
+    CDC's start point is recorded: before the Full Load in **Full load + CDC**, before
+    **Start CDC** in **CDC only**. Corrected after that point, give CDC a newer start point
+    (**Re-run Full Load** with "Drop & reload") before **Start CDC**; once CDC has stopped
+    at one, it continues only from a newer start point (the first item of this section).
   - **A primary key that holds such a date.** Full Load leaves a key column's value as
     stored: written as a fixed date (`1970-01-01`, or the column's `DEFAULT`), rows whose
     keys hold one would fall onto one key — each other's, or the key of the row that holds
@@ -650,8 +652,12 @@ fails **loudly** where it can't.
     one value, or as the value another row holds, so a unique index over such a column can
     meet duplicates on Aurora DSQL: it fails to build after the load, and CDC dead-letters
     the row that collides (`23505`). Correct those values on the source first.
-  - **The application's writes.** Aurora DSQL rejects such a date in an `INSERT` or
-    `UPDATE` (`22008`): change the code that writes them before cut over.
+  - **The application's SQL.** Aurora DSQL rejects such a date in an `INSERT`, an
+    `UPDATE` or a `WHERE` (`22008`), and the rows a comparison with one found — the
+    soft-delete idiom `deleted_at = '0000-00-00 00:00:00'` — now hold NULL, the column's
+    `DEFAULT` or `1970-01-01`, as above. Before cut over, change the code that writes such
+    dates, and compare with `IS NULL` or that value instead. Schema Conversion reports a view
+    that compares with one (its `CREATE VIEW` would fail).
 - **PostgreSQL: CDC does not carry most extension types.** The bundled CDC connector
   (Debezium) recognises a type an extension defines by its name alone, and it knows six:
   `citext`, `hstore`, `ltree`, `isbn`, and PostGIS `geometry` and `geography` (and arrays of
