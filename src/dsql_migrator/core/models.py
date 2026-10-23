@@ -371,6 +371,52 @@ class ForeignKeyDef(BaseModel):
     # affected tables up front.
     on_delete: Optional[str] = None
     on_update: Optional[str] = None
+    # PostgreSQL only (G152): a MySQL foreign key is never deferrable, InnoDB ignores MATCH
+    # and MySQL has no NOT ENFORCED, so a MySQL key keeps every default. Each is left out of
+    # the payload while it has its default (this model is extra="forbid"), so an inventory
+    # or saved session without such a key still loads on an older build, and one from an
+    # older build loads here.
+    deferrable: bool = Field(
+        default=False,
+        exclude_if=lambda v: not v,
+        description=(
+            "True for a PostgreSQL foreign key declared DEFERRABLE (SQLAlchemy's reflected "
+            "``deferrable`` option): re-created DEFERRABLE on Aurora DSQL, which accepts it."
+        ),
+    )
+    initially_deferred: bool = Field(
+        default=False,
+        exclude_if=lambda v: not v,
+        description=(
+            "True for one declared INITIALLY DEFERRED (the reflected ``initially`` option): "
+            "checked at commit instead of after each statement. Implies DEFERRABLE, as in "
+            "PostgreSQL."
+        ),
+    )
+    match_full: bool = Field(
+        default=False,
+        exclude_if=lambda v: not v,
+        description=(
+            "True for MATCH FULL (the reflected ``match`` option): a row whose key columns "
+            "are all NULL is exempt, one with some of them NULL is refused. False is "
+            "PostgreSQL's default MATCH SIMPLE, under which a NULL in any key column "
+            "exempts the row."
+        ),
+    )
+    enforced: bool = Field(
+        default=True,
+        exclude_if=lambda v: v,
+        description=(
+            "False for a PostgreSQL 18 foreign key declared NOT ENFORCED "
+            "(``pg_constraint.conenforced``): the source never checks it. Not created on "
+            "Aurora DSQL, which has no NOT ENFORCED and would enforce it."
+        ),
+    )
+
+    @property
+    def is_deferrable(self) -> bool:
+        """True when the key is DEFERRABLE (INITIALLY DEFERRED implies it, as in PostgreSQL)."""
+        return self.deferrable or self.initially_deferred
 
     @property
     def has_cascade_action(self) -> bool:
@@ -455,6 +501,31 @@ class TemporalKeyDef(BaseModel):
     index: Optional[str] = None
 
 
+class DeferrableKeyDef(BaseModel):
+    """A PostgreSQL ``PRIMARY KEY`` / ``UNIQUE`` constraint declared ``DEFERRABLE`` (G152).
+
+    PostgreSQL checks such a key at the end of each statement (``INITIALLY IMMEDIATE``) or
+    at commit (``INITIALLY DEFERRED``), so a transaction can hold two rows with one key
+    value until then -- swapping two rows' values, renumbering. Aurora DSQL rejects
+    DEFERRABLE on a unique key (live-verified: unique keys are indexes there), so the key is
+    created as an ordinary one, which the target checks immediately. Read from
+    ``pg_constraint.condeferrable``: SQLAlchemy reflects a key's columns, not this.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    # ``pg_get_constraintdef`` text, e.g. ``UNIQUE (code) DEFERRABLE INITIALLY DEFERRED``.
+    definition: str = ""
+    # True for the table's PRIMARY KEY, False for a UNIQUE constraint.
+    primary: bool = False
+    # True when the source checks it at commit (``condeferred``), not after each statement.
+    initially_deferred: bool = False
+    # The name of the index that enforces it on the source (the UNIQUE one's is the
+    # secondary index Schema Conversion creates as an ordinary UNIQUE index).
+    index: Optional[str] = None
+
+
 class TableDef(BaseModel):
     """A source table definition."""
 
@@ -500,6 +571,15 @@ class TableDef(BaseModel):
         description=(
             "PostgreSQL 18 PRIMARY KEY / UNIQUE keys declared WITHOUT OVERLAPS. Created "
             "as ordinary keys on the same columns, without the no-overlap rule."
+        ),
+    )
+    # G152, left out of the payload while empty like the two above.
+    deferrable_keys: list[DeferrableKeyDef] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description=(
+            "PostgreSQL PRIMARY KEY / UNIQUE constraints declared DEFERRABLE. Created as "
+            "ordinary keys, which Aurora DSQL checks immediately."
         ),
     )
 
@@ -2448,6 +2528,7 @@ __all__ = [
     "CheckConstraintDef",
     "ExclusionConstraintDef",
     "TemporalKeyDef",
+    "DeferrableKeyDef",
     "TableDef",
     "apply_lob_exclusions",
     "ViewDef",

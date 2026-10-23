@@ -54,7 +54,7 @@ Evaluation はソースの **サーバー設定** も 1 回だけ読み取りま
 | 分類 | 意味 | 例 |
 |---|---|---|
 | **AUTO** | 自動変換され、人手の作業は不要。 | マッピング可能な型と PK を持つ通常のテーブル/カラム。**外部キー**(自動変換され、`RECOMMENDED` としてフラグ付け — 下記参照)。複数データベースの MySQL ソース(各データベースが独自のスキーマになり、`RECOMMENDED` としてフラグ付け)。同じスキーマの別のテーブル・ビュー・インデックスも使うインデックス名(インデックスは自動的に名前が変更され、`RECOMMENDED` としてフラグ付け)。 |
-| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、FULLTEXT/SPATIAL インデックス(出力されない: その検索はデータベースの外へ)、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム、または Aurora DSQL がインデックスを作れない PostgreSQL の `json`/`jsonb`/`interval`/`time with time zone` カラム上のセカンダリインデックス(出力されず、UNIQUE インデックスは一意性を失います)、PostgreSQL の btree 以外のインデックス(btree として作成)と、述語が型の変わるカラムを読む部分インデックス(それ以外の部分インデックスは `WHERE` を保持)、PostgreSQL の `EXCLUDE` 制約(作成されず、それを強制していたインデックスも作成されません: `PG_EXCLUSION_CONSTRAINT`)と、`WITHOUT OVERLAPS` で宣言された PostgreSQL 18 のキー(通常のキーとして作成: `PG_TEMPORAL_KEY`)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)、ソースが定義を返さなかったビュー、ソースユーザーが一覧できないオブジェクト(`SOURCE_VISIBILITY`)、どの列にも所有されていない PostgreSQL のシーケンス(`PG_STANDALONE_SEQUENCE`)。 |
+| **MANUAL** | 変換はされるが、判断またはアプリ側の変更が必要。 | 大文字小文字を区別しない collation、FULLTEXT/SPATIAL インデックス(出力されない: その検索はデータベースの外へ)、過大な LOB/JSON カラム、`ENUM`/`SET`、生成カラム、`ON UPDATE` タイムスタンプ、空間/geometry 型、`CASCADE`/`SET NULL` アクションを持つ外部キー(CDC が複製できません)、`bytea` カラム、または Aurora DSQL がインデックスを作れない PostgreSQL の `json`/`jsonb`/`interval`/`time with time zone` カラム上のセカンダリインデックス(出力されず、UNIQUE インデックスは一意性を失います)、PostgreSQL の btree 以外のインデックス(btree として作成)と、述語が型の変わるカラムを読む部分インデックス(それ以外の部分インデックスは `WHERE` を保持)、PostgreSQL の `EXCLUDE` 制約(作成されず、それを強制していたインデックスも作成されません: `PG_EXCLUSION_CONSTRAINT`)と、`WITHOUT OVERLAPS` で宣言された PostgreSQL 18 のキー(通常のキーとして作成: `PG_TEMPORAL_KEY`)、`DEFERRABLE` で宣言された PostgreSQL の主キーまたは `UNIQUE` 制約(Aurora DSQL が即時に検査する通常のキーとして作成: `PG_DEFERRABLE_KEY`)、精度を宣言していない PostgreSQL の `numeric`(`numeric(18,6)` として格納)、ソースが定義を返さなかったビュー、ソースユーザーが一覧できないオブジェクト(`SOURCE_VISIBILITY`)、どの列にも所有されていない PostgreSQL のシーケンス(`PG_STANDALONE_SEQUENCE`)。 |
 | **UNSUPPORTED** | 自動変換不可 — 再設計が必要。 | トリガー、ストアドプロシージャ/関数、スケジュールイベント、PK のないテーブル、`bytea` カラム(`BINARY`/`VARBINARY`/`BLOB`、PostgreSQL の `bytea`)または PostgreSQL の `json`/`jsonb`/`interval`/`time with time zone` カラムの主キー、63 バイトに切り詰めると衝突する名前(1 つのテーブルの 2 つのカラム、または 1 つのスキーマの 2 つのテーブル/ビュー)、`DECIMAL` 精度 > 1000、テーブルあたりカラム > 255、ターゲットデータベースのテーブル 1,000 個・スキーマ 10 個・ビュー 5,000 個超(クラスターに既にあるものを含む)、PostgreSQL テーブルの行レベルセキュリティ(`PG_ROW_LEVEL_SECURITY`)。 |
 
 上記の例は主に MySQL ソースを基準にしています。**PostgreSQL ソース** でも同じ尺度が適用されます: サポートされ
@@ -104,6 +104,16 @@ DML は **追加の読み取り** を発生させます(AWS は追加前にベ�
 `NO ACTION`/`RESTRICT` を優先してください。カスケードアクションは CDC を越えて存続することもできません
 ([第 6 章 §6.2](06-limitations.md#62-移行プロセスの制限) を参照)。これが Evaluation が今なお **MANUAL** として
 フラグを立てる唯一のケースです。
+
+PostgreSQL の外部キーは `MATCH FULL` と `DEFERRABLE` / `INITIALLY DEFERRED` を保持します(Aurora DSQL は
+どちらも受け付け、遅延されたキーをソースと同じくコミット時に検査します)。検出結果には、それを宣言している
+キーが 1 つずつ示されます。`NOT ENFORCED` で宣言された PostgreSQL 18 のキーは作成されません: ソースはその
+キーを検査しませんが、`NOT ENFORCED` を持たない Aurora DSQL はソースが受け付ける書き込みを拒否してしまう
+ためです。これも推奨事項です(`PG_FK_NOT_ENFORCED`、`RECOMMENDED`)。そのようなキーを Aurora DSQL に強制
+させるには、そのキーの `ALTER TABLE … ADD CONSTRAINT … NOT VALID` をテーブルのターゲットスクリプトに追加
+してください。一方、`DEFERRABLE` で宣言された主キーまたは `UNIQUE` 制約はギャップです
+(`PG_DEFERRABLE_KEY`、**MANUAL**): Aurora DSQL は遅延可能な一意キーをサポートしないため、即時に検査される
+通常のキーとして作成されます([§2.3](#23-mysql--dsql-の型と制約の処理-リファレンス) を参照)。
 
 推奨事項は任意であるため、**オブジェクトの推定工数(effort)には算入されません** — そうしないと、
 値を生成し続けるキーを持つほぼすべてのテーブルが、そのキーだけを理由に `MEDIUM` に膨らんでしまいます。
@@ -497,6 +507,13 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
   FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;
 ```
 
+PostgreSQL のキーは `REFERENCES` の後に宣言した内容を、PostgreSQL の順序で `NOT VALID` の前に保持します:
+`MATCH FULL`、`ON DELETE` / `ON UPDATE` のアクション、そして `DEFERRABLE INITIALLY DEFERRED`(または
+`DEFERRABLE INITIALLY IMMEDIATE`)です。Aurora DSQL はそれぞれを `NOT VALID` とともに受け付け、遅延された
+キーをコミット時に検査します。遅延可能なキーは `ON DELETE` / `ON UPDATE` の `RESTRICT` も保持します。
+PostgreSQL は、キーが遅延されている間もこれを即時に検査するためです。`NOT ENFORCED` で宣言された
+PostgreSQL 18 のキーはそもそも作成されません。
+
 **なぜ遅延するのか。** バルク適載は親テーブルと子テーブルを **並行して、テーブルごとの主キー順で、
 親→子の順序保証なしに** 書き込むため、子の行が親より先に書き込まれることがあります。外部キーが
 すでに強制されていれば、その書き込みは失敗し(`SQLSTATE 23503`)、**CDC** マイグレーションでは
@@ -622,6 +639,8 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 > カラムになります。
 >
 > **Aurora DSQL が強制できない制約。** PostgreSQL の `EXCLUDE` 制約は作成されず (Aurora DSQL が拒否します)、ソースでそれを強制していたインデックスも作成されないため、カットオーバー後は規則に反する行 (1 つの部屋の重なる予約など) が受け付けられます: Evaluation と Schema Conversion は各定義とともにテーブルを **MANUAL** としてフラグ付けします (`PG_EXCLUSION_CONSTRAINT`)。`WITHOUT OVERLAPS` で宣言された PostgreSQL 18 の `PRIMARY KEY` または `UNIQUE` キーは同じカラムの通常のキーとして作成され、このキーはすべてのキーカラムが他の行と等しい行だけを拒否するため、1 つのキーで期間が重なる行は受け付けられます (`PG_TEMPORAL_KEY`、**MANUAL**)。このような規則はアプリケーションで強制する (書き込むトランザクションが競合する行を確認し、同じ範囲を書く同時の書き込みが共有の行 1 つも更新するようにして、Aurora DSQL の楽観的同時実行制御がそのうち 1 つを `40001` で失敗させる) か、設計を変更してください。ソースでの `WITHOUT OVERLAPS` 主キーのインデックス (GiST) はキーの順に行を返せず、Full Load と Validation はその順にテーブルを読むため、そのような大きなテーブルをロードする前にソースでそのキーカラムに btree インデックスを追加してください。`UNIQUE ... NULLS NOT DISTINCT` のインデックスまたは制約 (PostgreSQL 15+) は `NULLS NOT DISTINCT` を保持し、Aurora DSQL はそれを受け付けます。
+>
+> `DEFERRABLE` で宣言された PostgreSQL の `PRIMARY KEY` または `UNIQUE` 制約は通常のキーとして作成されます: Aurora DSQL は遅延可能な一意キーをサポートしないため、ソースが各文の終わりに (`INITIALLY DEFERRED` で宣言されたキーはコミット時に) 検査するキーを即時に検査します。カットオーバー後は、2 つの行に一時的に同じキー値を持たせる文やトランザクション (2 行の値の入れ替え、番号の振り直し) が失敗することがあります: Evaluation と Schema Conversion はテーブルを **MANUAL** としてフラグ付けします (`PG_DEFERRABLE_KEY`)。外部キーは `DEFERRABLE` と `MATCH FULL` を保持します (§2.2)。
 >
 > **MySQL** の生成カラムは通常のカラムとして作成されます (ツールは MySQL の式を読み取って指摘とソース DDL に表示しますが、変換はしません)。Full Load は計算済みの値をコピーし、CDC は `STORED` カラムの値を運びます。式 (`GENERATED ALWAYS AS (...) STORED`) は、移行タイプにかかわらず適用前に Schema Conversion で再追加できます。そうすると Full Load と CDC は、適用 DDL が `GENERATED` にしたカラムをすべての書き込みから外し (Aurora DSQL はそのようなカラムへの値を拒否します、SQLSTATE `428C9`)、Aurora DSQL が値を計算します。主キーに含まれる生成カラムは通常のカラムのままにします。Full Load と CDC はすべてのキーカラムを書き込むため、`GENERATED` のキーカラムではすべての書き込みが拒否されます。
 

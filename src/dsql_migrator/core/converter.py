@@ -87,6 +87,7 @@ from dsql_migrator.core.models import (
     Classification,
     ColumnDef,
     ConversionNoteKind,
+    DeferrableKeyDef,
     ExclusionConstraintDef,
     ForeignKeyDef,
     IndexDef,
@@ -3881,7 +3882,7 @@ def _build_index_ddls(
 _FK_ACTIONS = frozenset({"NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"})
 
 
-def _normalize_fk_action(action: Optional[str]) -> Optional[str]:
+def _normalize_fk_action(action: Optional[str], *, deferrable: bool = False) -> Optional[str]:
     """Normalise a reflected ``ON DELETE``/``ON UPDATE`` action to DSQL SQL.
 
     Reflected actions are upper-cased MySQL keywords, occasionally underscored
@@ -3899,7 +3900,11 @@ def _normalize_fk_action(action: Optional[str]) -> Optional[str]:
     - ``RESTRICT`` is mapped to ``NO ACTION`` for BOTH engines so the emitted DDL is
       source-identical: a MySQL source can never recover ``RESTRICT`` (``SHOW CREATE``
       omits it, so it already looks like ``NO ACTION``), and the two are functionally
-      equivalent on the ``NOT VALID`` DSQL target (immediate vs deferred check).
+      equivalent on the ``NOT VALID`` DSQL target (immediate vs deferred check) -- for a
+      key that is not ``deferrable``. A DEFERRABLE key keeps ``RESTRICT`` (G152, a
+      PostgreSQL key: no MySQL key is deferrable): PostgreSQL never defers a RESTRICT
+      check, so as NO ACTION a deferred key would let a transaction delete or re-key a
+      referenced parent row the source refuses at once.
     """
     if not action:
         return None
@@ -3909,7 +3914,7 @@ def _normalize_fk_action(action: Optional[str]) -> Optional[str]:
     if paren != -1:
         normalized = normalized[:paren].strip()
     if normalized == "RESTRICT":
-        return "NO ACTION"
+        return "RESTRICT" if deferrable else "NO ACTION"
     return normalized if normalized in _FK_ACTIONS else None
 
 
@@ -3934,6 +3939,18 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
     (submitted by the Full Load / cut-over apply pass right after the keys are added;
     Aurora DSQL reports the verdict, G142).
 
+    A PostgreSQL key keeps its MATCH FULL and its DEFERRABLE / INITIALLY DEFERRED (G152),
+    in PostgreSQL's grammar order: ``REFERENCES ... [MATCH FULL] [ON DELETE ...] [ON UPDATE
+    ...] [DEFERRABLE INITIALLY DEFERRED | DEFERRABLE INITIALLY IMMEDIATE] NOT VALID`` --
+    Aurora DSQL accepts each of them with NOT VALID, and defers a deferred key's check to
+    commit (live-verified one by one; PostgreSQL's grammar takes them together in this
+    order). A deferrable key's INITIALLY is always spelled out. A PostgreSQL
+    18 key the source declares NOT ENFORCED is not created at all: the source never checks
+    it, and Aurora DSQL, which has no NOT ENFORCED, would refuse writes the source accepts
+    (:func:`_pg_not_enforced_foreign_key_warning` says so). Every path that adds a preserved
+    key -- the Full Load pass, Cut over, a reload's re-create after its pre-drop -- runs these
+    statements (``TableConversion.foreign_key_ddls``), so no path can lose a clause.
+
     Returns an empty list when ``preserve`` is False (the user chose to strip FKs
     and enforce referential integrity in the application layer).
     """
@@ -3942,6 +3959,8 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
     table_identifier = _quote_pg_qualified(table.name)
     statements: list[str] = []
     for fk in table.foreign_keys:
+        if not fk.enforced:
+            continue
         columns = ", ".join(_quote_pg_identifier(column) for column in fk.columns)
         ref_columns = ", ".join(
             _quote_pg_identifier(column) for column in fk.referenced_columns
@@ -3951,12 +3970,18 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
             f"{_quote_pg_identifier(fk.name)} FOREIGN KEY ({columns}) "
             f"REFERENCES {_quote_pg_qualified(fk.referenced_table)} ({ref_columns})"
         )
-        on_delete = _normalize_fk_action(fk.on_delete)
+        if fk.match_full:
+            clause += " MATCH FULL"
+        on_delete = _normalize_fk_action(fk.on_delete, deferrable=fk.is_deferrable)
         if on_delete is not None and on_delete != "NO ACTION":
             clause += f" ON DELETE {on_delete}"
-        on_update = _normalize_fk_action(fk.on_update)
+        on_update = _normalize_fk_action(fk.on_update, deferrable=fk.is_deferrable)
         if on_update is not None and on_update != "NO ACTION":
             clause += f" ON UPDATE {on_update}"
+        if fk.is_deferrable:
+            clause += " DEFERRABLE INITIALLY " + (
+                "DEFERRED" if fk.initially_deferred else "IMMEDIATE"
+            )
         # NOT VALID: the only ADD-CONSTRAINT form DSQL accepts; enforces new writes at once.
         clause += " NOT VALID"
         statements.append(clause)
@@ -4624,10 +4649,15 @@ def _foreign_key_warning(
     is a RECOMMENDATION (not a LOSS): the conversion is complete, but the operator
     should know the runtime caveats. When the user chose to strip them it is a LOSS
     note that referential integrity moved to the application layer (Requirement 3.3).
+
+    Only the keys the source enforces: a PostgreSQL 18 NOT ENFORCED one is never created
+    (:func:`_pg_not_enforced_foreign_key_warning`). A preserved key's DEFERRABLE /
+    INITIALLY DEFERRED and MATCH FULL are kept, which the note names (G152).
     """
-    if not table.foreign_keys:
+    enforced = [fk for fk in table.foreign_keys if fk.enforced]
+    if not enforced:
         return None
-    names = ", ".join(fk.name for fk in table.foreign_keys)
+    names = ", ".join(fk.name for fk in enforced)
     if not preserve:
         return ConversionWarning(
             object_name=table.name,
@@ -4646,8 +4676,9 @@ def _foreign_key_warning(
         kind=ConversionNoteKind.RECOMMENDATION,
         message=(
             f"Foreign key constraints ({names}) are preserved and re-created on "
-            "Aurora DSQL after the data load (at cut over for a CDC migration). "
-            "Note: DML on referenced/referencing tables incurs extra reads "
+            "Aurora DSQL after the data load (at cut over for a CDC migration)."
+            + foreign_key_clauses_kept(enforced)
+            + " Note: DML on referenced/referencing tables incurs extra reads "
             "(benchmark write-heavy tables); a concurrent conflict raises a "
             "retryable serialization error (SQLSTATE 40001); and CASCADE / SET NULL "
             "/ SET DEFAULT actions count toward DSQL's 3000-row transaction limit "
@@ -4666,6 +4697,7 @@ from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate liter
     _OVERSIZED_LOB_BASES,
     _UNSUPPORTED_INDEX_TYPES,
     _base_type,
+    foreign_key_clauses_kept,
     is_pg_oversized_lob_type,
     pg_lob_is_deliberately_large,
     pg_oversized_lob_column_names,
@@ -6702,12 +6734,15 @@ def _check_constraint_warning(
     )
 
 
-# How many exclusion constraints / WITHOUT OVERLAPS keys one note spells out before it names
-# the rest (the note renders into a UI card and two report formats, like the CHECK finding).
+# How many exclusion constraints / WITHOUT OVERLAPS / DEFERRABLE keys one note spells out
+# before it names the rest (the note renders into a UI card and two report formats, like
+# the CHECK finding).
 _MAX_KEY_RULES_SHOWN = 6
 
 
-def _listed_key_rules(rules: "Sequence[ExclusionConstraintDef | TemporalKeyDef]") -> str:
+def _listed_key_rules(
+    rules: "Sequence[ExclusionConstraintDef | TemporalKeyDef | DeferrableKeyDef]",
+) -> str:
     """``name: definition`` for the first :data:`_MAX_KEY_RULES_SHOWN`, the rest by name."""
     shown = "; ".join(
         f"{rule.name}: {rule.definition}" if rule.definition else rule.name
@@ -6823,6 +6858,76 @@ def _pg_temporal_key_warning(table: TableDef) -> Optional[ConversionWarning]:
         classification=Classification.MANUAL,
         kind=ConversionNoteKind.LOSS,
         message=message,
+    )
+
+
+def _pg_deferrable_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL PRIMARY KEY / UNIQUE constraints declared DEFERRABLE (G152).
+
+    Aurora DSQL rejects DEFERRABLE on a unique key (``ALTER TABLE ... ADD CONSTRAINT ...
+    UNIQUE ... DEFERRABLE`` is FeatureNotSupported, live-verified: unique keys are indexes
+    there), so each is created as an ordinary key -- the primary key in the CREATE TABLE, a
+    UNIQUE one as its CREATE UNIQUE INDEX ASYNC -- which the target checks immediately. The
+    source checks it at the end of the statement, or at commit when INITIALLY DEFERRED, so a
+    transaction that holds two rows with one key value until then is accepted there and
+    refused on the target. A UNIQUE one whose index is not created at all (a column Aurora
+    DSQL cannot index) is said so, as its own note explains."""
+    keys = list(table.deferrable_keys)
+    if not keys:
+        return None
+    by_index = {index.name: index for index in table.indexes}
+    emitted = {index.name for index in _emittable_secondary_indexes(table, is_postgres=True)}
+    left_out = [
+        key.name
+        for key in keys
+        if not key.primary and key.index in by_index and key.index not in emitted
+    ]
+    deferred = any(key.initially_deferred for key in keys)
+    message = (
+        f"DEFERRABLE key(s) are created as ordinary keys — {_listed_key_rules(keys)}. Aurora "
+        "DSQL does not support deferrable unique keys, so the target checks such a key "
+        "immediately, where the source checks it at the end of each statement"
+        + (" or, INITIALLY DEFERRED, at commit" if deferred else "")
+        + ": after cut over a statement or transaction that briefly gives two rows the same "
+        "key value (swapping two rows' values, renumbering them) can fail where the source "
+        "accepted it. Change such writes so no two rows share a key value at any point, for "
+        "example by moving one row to a free value first."
+    )
+    if left_out:
+        message += (
+            f" {', '.join(left_out)} {'is' if len(left_out) == 1 else 'are'} not created at "
+            "all: see the note on its columns."
+        )
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=message,
+    )
+
+
+def _pg_not_enforced_foreign_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL 18 foreign keys declared NOT ENFORCED (G152), which are not created.
+
+    The source never checks such a key, and Aurora DSQL has no NOT ENFORCED: created, it
+    would refuse every write that breaks it, rows the source accepts (and its validation of
+    the loaded rows would fail on the ones already there). So the target, like the source,
+    does not check it -- advice, not a loss of what the source enforces. Validation's orphan
+    check leaves it out too (``validator._check_orphans``)."""
+    keys = [fk for fk in table.foreign_keys if not fk.enforced]
+    if not keys:
+        return None
+    names = ", ".join(fk.name for fk in keys)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.RECOMMENDATION,
+        message=(
+            f"Foreign key constraints ({names}) are NOT ENFORCED on the source, so they are "
+            "not created on Aurora DSQL, which has no NOT ENFORCED and would check every "
+            "write against them, refusing rows the source accepts. The target, like the "
+            "source, does not check them, and Validation's orphan check leaves them out."
+        ),
     )
 
 
@@ -7594,6 +7699,10 @@ class SchemaConverter:
             # nor their indexes) and WITHOUT OVERLAPS keys (kept as ordinary keys).
             (_pg_exclusion_constraint_warning(table) if is_postgres else None),
             (_pg_temporal_key_warning(table) if is_postgres else None),
+            # ... DEFERRABLE primary / unique keys (kept as ordinary keys) and NOT ENFORCED
+            # foreign keys (not created), G152.
+            (_pg_deferrable_key_warning(table) if is_postgres else None),
+            (_pg_not_enforced_foreign_key_warning(table) if is_postgres else None),
             _identifier_length_warning(
                 table,
                 generated_index_names=generated_index_names,

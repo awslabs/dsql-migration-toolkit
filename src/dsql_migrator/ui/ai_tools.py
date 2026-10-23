@@ -652,7 +652,13 @@ def build_ai_tool_executor(
                          {"name": f.name, "columns": list(f.columns),
                           "referenced_table": f.referenced_table,
                           "referenced_columns": list(f.referenced_columns),
-                          "on_delete": f.on_delete, "on_update": f.on_update}
+                          "on_delete": f.on_delete, "on_update": f.on_update,
+                          # PostgreSQL only, named when set (G152): kept on the target,
+                          # except NOT ENFORCED, which is not created.
+                          **({"deferrable": True} if f.is_deferrable else {}),
+                          **({"initially_deferred": True} if f.initially_deferred else {}),
+                          **({"match_full": True} if f.match_full else {}),
+                          **({"enforced": False} if not f.enforced else {})}
                          for f in _t.foreign_keys
                      ],
                      "check_constraints": [
@@ -668,6 +674,11 @@ def build_ai_tool_executor(
                      "temporal_keys": [
                          {"name": k.name, "definition": k.definition, "primary": k.primary}
                          for k in _t.temporal_keys
+                     ],
+                     # DEFERRABLE keys (G152): created as ordinary, immediate ones.
+                     "deferrable_keys": [
+                         {"name": k.name, "definition": k.definition, "primary": k.primary}
+                         for k in _t.deferrable_keys
                      ],
                      "expression_indexes": list(_t.expression_indexes)}
                 )

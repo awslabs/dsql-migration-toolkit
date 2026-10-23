@@ -1345,13 +1345,20 @@ def _orphan_predicates(
     AND ...`` matching parent to child. Shared by the single-scan and keyset-paged orphan
     builders so their orphan semantics can never drift. Identifiers are composed with
     :class:`psycopg.sql.Identifier` (Requirement 9.4).
+
+    For a MATCH FULL key (G152) only an all-NULL key is exempt: ``not_null`` is then ``(<col>
+    IS NOT NULL OR ...)``, so a row with some key columns NULL -- which matches no parent row
+    (``=`` against NULL is never true) -- counts as an orphan, the row PostgreSQL refuses
+    for such a key. For one column the two rules are the same.
     """
-    not_null = sql.SQL(" AND ").join(
+    not_null = sql.SQL(" OR " if fk.match_full else " AND ").join(
         sql.SQL("{alias}.{column} IS NOT NULL").format(
             alias=sql.SQL(child_alias), column=sql.Identifier(column)
         )
         for column in fk.columns
     )
+    if fk.match_full and len(fk.columns) > 1:
+        not_null = sql.SQL("({})").format(not_null)
     join_predicate = sql.SQL(" AND ").join(
         sql.SQL("p.{ref} = {alias}.{col}").format(
             ref=sql.Identifier(ref), alias=sql.SQL(child_alias), col=sql.Identifier(col)
@@ -1365,7 +1372,8 @@ def build_orphan_count_sql(child_table: str, fk: ForeignKeyDef) -> sql.Composed:
     """Build a target query counting orphan child rows for one foreign key.
 
     A row is an orphan when all of its foreign-key columns are non-null (a null
-    key is not a referential violation) yet no parent row matches on the
+    key is not a referential violation; for a MATCH FULL key only an all-null one,
+    :func:`_orphan_predicates`) yet no parent row matches on the
     referenced columns. Identifiers are composed with
     :class:`psycopg.sql.Identifier` (Requirement 9.4) and the statement is a
     single read-only ``SELECT``.
@@ -1408,8 +1416,8 @@ def build_orphan_listing_sql(
     to the orphan count: it selects the child's primary-key columns (in key order) and the
     foreign-key columns of each orphan, ``limit`` at a time, so the rows can be found and
     fixed. The orphan rule is the count's (:func:`_orphan_predicates`): a row with a NULL
-    in a foreign-key column is no orphan (MATCH SIMPLE). A child with no primary key lists
-    its foreign-key columns only.
+    in a foreign-key column is no orphan (MATCH SIMPLE; under MATCH FULL only an all-NULL
+    key). A child with no primary key lists its foreign-key columns only.
 
     With ``page_size`` and a primary key it reads ONE keyset window of the child, the way
     the orphan count pages it (:func:`_pg_keyset_window`: one range per key prefix on a

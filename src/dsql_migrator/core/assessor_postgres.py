@@ -1594,8 +1594,10 @@ def default_rules() -> "list[Rule]":
         pg_collation_rule,
         default_dropped_rule,
         expression_index_rule,
+        pg_deferrable_key_rule,
         pg_exclusion_constraint_rule,
         pg_index_not_preserved_rule,
+        pg_not_enforced_foreign_key_rule,
         pg_temporal_key_rule,
         pg_unindexable_column_rule,
     )
@@ -1620,6 +1622,10 @@ def default_rules() -> "list[Rule]":
         # WITHOUT OVERLAPS keys -- the conversion's own notes, word for word.
         pg_exclusion_constraint_rule(),
         pg_temporal_key_rule(),
+        # ... and DEFERRABLE primary / unique keys, which it checks immediately, and
+        # PostgreSQL 18 NOT ENFORCED foreign keys, which are not created (G152).
+        pg_deferrable_key_rule(),
+        pg_not_enforced_foreign_key_rule(),
         TriggerRule(),
         ProcedureRule(),
         EventRule(),

@@ -233,8 +233,12 @@ def test_enrich_on_a_catalog_without_conperiod(version) -> None:  # noqa: ANN001
     by_name = _by_name(tables)
     assert [x.name for x in by_name["booking"].exclusion_constraints] == ["booking_no_overlap"]
     assert all(not table.temporal_keys for table in tables)
-    # The read is ONE statement for the schema, scoped to the tables read.
-    reads = [(sql, p) for sql, p in connection.statements if "pg_get_constraintdef" in sql]
+    # The read is ONE statement for the schema, scoped to the tables read (G152's read of
+    # DEFERRABLE / NOT ENFORCED keys is a statement of its own).
+    reads = [
+        (sql, p) for sql, p in connection.statements
+        if "pg_get_constraintdef" in sql and "contype = 'x'" in sql
+    ]
     assert len(reads) == 1
     assert reads[0][1]["nsp"] == "app"
     assert sorted(reads[0][1]["names"]) == sorted(t.name for t in tables)

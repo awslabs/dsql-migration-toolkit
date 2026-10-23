@@ -53,7 +53,7 @@ Evaluation은 소스의 **서버 설정**도 한 번 읽습니다(설정만 읽�
 | 분류 | 의미 | 예시 |
 |---|---|---|
 | **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고); 다중 데이터베이스 MySQL 소스(각 데이터베이스가 자체 스키마가 되며 `RECOMMENDED`로 표시); 같은 스키마의 다른 테이블·뷰·인덱스도 쓰는 인덱스 이름(인덱스가 자동으로 이름이 바뀌며 `RECOMMENDED`로 표시). |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, FULLTEXT/SPATIAL 인덱스(생성하지 않음: 그 검색은 데이터베이스 밖으로), 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼이나 Aurora DSQL이 인덱싱할 수 없는 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 보조 인덱스(생성되지 않으며 UNIQUE 인덱스는 유일성 보장을 잃음), PostgreSQL의 btree가 아닌 인덱스(btree로 생성)와 조건식이 타입이 바뀌는 컬럼을 읽는 부분 인덱스(다른 부분 인덱스는 `WHERE`를 유지), PostgreSQL `EXCLUDE` 제약(생성하지 않으며, 그것을 강제하던 인덱스도 생성하지 않음: `PG_EXCLUSION_CONSTRAINT`)과 `WITHOUT OVERLAPS`로 선언한 PostgreSQL 18 키(일반 키로 생성: `PG_TEMPORAL_KEY`), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장), 소스가 정의를 돌려주지 않은 뷰, 소스 사용자가 나열할 수 없는 객체(`SOURCE_VISIBILITY`), 어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스(`PG_STANDALONE_SEQUENCE`). |
+| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, FULLTEXT/SPATIAL 인덱스(생성하지 않음: 그 검색은 데이터베이스 밖으로), 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼이나 Aurora DSQL이 인덱싱할 수 없는 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 보조 인덱스(생성되지 않으며 UNIQUE 인덱스는 유일성 보장을 잃음), PostgreSQL의 btree가 아닌 인덱스(btree로 생성)와 조건식이 타입이 바뀌는 컬럼을 읽는 부분 인덱스(다른 부분 인덱스는 `WHERE`를 유지), PostgreSQL `EXCLUDE` 제약(생성하지 않으며, 그것을 강제하던 인덱스도 생성하지 않음: `PG_EXCLUSION_CONSTRAINT`)과 `WITHOUT OVERLAPS`로 선언한 PostgreSQL 18 키(일반 키로 생성: `PG_TEMPORAL_KEY`), `DEFERRABLE`로 선언한 PostgreSQL 기본 키나 `UNIQUE` 제약(Aurora DSQL이 즉시 검사하는 일반 키로 생성: `PG_DEFERRABLE_KEY`), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장), 소스가 정의를 돌려주지 않은 뷰, 소스 사용자가 나열할 수 없는 객체(`SOURCE_VISIBILITY`), 어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스(`PG_STANDALONE_SEQUENCE`). |
 | **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `bytea` 컬럼(`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`)이나 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 기본 키, 63바이트로 잘리면 충돌하는 이름(한 테이블의 두 컬럼, 또는 한 스키마의 두 테이블/뷰), `DECIMAL` 정밀도 > 1000, 테이블당 컬럼 > 255, 타깃 데이터베이스의 테이블 1,000개·스키마 10개·뷰 5,000개 초과(클러스터에 이미 있는 것 포함), PostgreSQL 테이블의 행 수준 보안(`PG_ROW_LEVEL_SECURITY`). |
 
 위 예시는 대부분 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
@@ -99,6 +99,16 @@ UUID/랜덤 키는 **insert 처리량**을 얻기 위한 선택입니다 — DSQ
 건드리는 cascade는 실패) — 그러므로 자식 카디널리티가 무제한인 곳에서는 `NO ACTION`/`RESTRICT`를
 선호하세요. cascade 동작은 CDC로도 살아남지 못하며([6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)
 참고), 이것이 Evaluation이 여전히 **MANUAL**로 표시하는 유일한 경우입니다.
+
+PostgreSQL 외래 키는 `MATCH FULL`과 `DEFERRABLE` / `INITIALLY DEFERRED`를 유지하며(Aurora DSQL은
+둘 다 받아들이고, 지연된 키는 소스처럼 커밋 시점에 검사합니다), 결과에는 이를 선언한 키가 하나하나
+표시됩니다. `NOT ENFORCED`로 선언한 PostgreSQL 18 키는 생성하지 않습니다: 소스는 그 키를 검사하지
+않는데, `NOT ENFORCED`가 없는 Aurora DSQL은 소스가 받아들이는 쓰기를 거부하게 되기 때문입니다. 이것도
+권장사항입니다(`PG_FK_NOT_ENFORCED`, `RECOMMENDED`). Aurora DSQL이 그런 키를 강제하게 하려면 그 키의
+`ALTER TABLE … ADD CONSTRAINT … NOT VALID`를 테이블의 대상 스크립트에 추가하세요. 반면 `DEFERRABLE`로
+선언한 기본 키나 `UNIQUE` 제약은 갭입니다(`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL은 지연 가능한
+유니크 키를 지원하지 않으므로, 즉시 검사되는 일반 키로 생성됩니다
+([§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참고).
 
 권장사항은 선택이므로 **객체의 예상 작업량(effort)에 반영되지 않습니다** — 그러지 않으면 계속 값을 생성하는
 키를 가진 거의 모든 테이블이 그 키 하나 때문에 `MEDIUM`으로 부풀려집니다. 조언을 채택할 때의
@@ -483,6 +493,13 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
   FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;
 ```
 
+PostgreSQL 키는 `REFERENCES` 뒤에 선언한 내용을 PostgreSQL의 순서대로, `NOT VALID` 앞에 유지합니다:
+`MATCH FULL`, `ON DELETE` / `ON UPDATE` 동작, 그리고 `DEFERRABLE INITIALLY DEFERRED`(또는
+`DEFERRABLE INITIALLY IMMEDIATE`). Aurora DSQL은 각각을 `NOT VALID`와 함께 받아들이며, 지연된 키는
+커밋 시점에 검사합니다. 지연 가능한 키는 `ON DELETE` / `ON UPDATE`의 `RESTRICT`도 유지하는데,
+PostgreSQL은 키가 지연된 동안에도 이를 즉시 검사합니다. `NOT ENFORCED`로 선언한 PostgreSQL 18 키는
+아예 생성하지 않습니다.
+
 **왜 미루는가.** 벌크 적재는 부모·자식 테이블을 **동시에, 테이블별 기본키 순서로, 부모→자식
 순서 보장 없이** 씁니다. 그래서 자식 행이 부모보다 먼저 기록될 수 있습니다. 외래 키가 이미
 강제되고 있었다면 그 쓰기는 실패하고(`SQLSTATE 23503`), **CDC** 마이그레이션에서는 싱크가 행
@@ -602,6 +619,8 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 > 됩니다.
 >
 > **Aurora DSQL이 강제할 수 없는 제약.** PostgreSQL `EXCLUDE` 제약은 생성되지 않으며(Aurora DSQL이 거부함) 소스에서 그것을 강제하던 인덱스도 생성되지 않으므로, 컷오버 후에는 규칙에 어긋나는 행(한 회의실의 겹치는 예약 등)이 받아들여집니다: Evaluation과 Schema Conversion은 각 정의와 함께 테이블을 **MANUAL**로 표시합니다(`PG_EXCLUSION_CONSTRAINT`). `WITHOUT OVERLAPS`로 선언한 PostgreSQL 18의 `PRIMARY KEY`나 `UNIQUE` 키는 같은 컬럼의 일반 키로 생성되는데, 이 키는 모든 키 컬럼이 다른 행과 같은 행만 거부하므로 한 키의 기간이 겹치는 행들은 받아들여집니다(`PG_TEMPORAL_KEY`, **MANUAL**). 이런 규칙은 애플리케이션에서 강제하거나(쓰는 트랜잭션이 충돌하는 행을 확인하고, 같은 범위를 쓰는 동시 쓰기들이 공유 행 하나도 함께 갱신하게 해서 Aurora DSQL의 낙관적 동시성 제어가 그중 하나를 `40001`로 실패시키게 함) 설계를 바꾸세요. 소스에서 `WITHOUT OVERLAPS` 기본 키의 인덱스(GiST)는 키 순서로 행을 돌려줄 수 없는데 Full Load와 Validation은 그 순서로 테이블을 읽으므로, 그런 큰 테이블을 적재하기 전에 소스에서 그 키 컬럼들에 btree 인덱스를 추가하세요. `UNIQUE ... NULLS NOT DISTINCT` 인덱스나 제약(PostgreSQL 15+)은 `NULLS NOT DISTINCT`를 유지하며, Aurora DSQL은 이를 받아들입니다.
+>
+> `DEFERRABLE`로 선언한 PostgreSQL `PRIMARY KEY`나 `UNIQUE` 제약은 일반 키로 생성됩니다: Aurora DSQL은 지연 가능한 유니크 키를 지원하지 않으므로, 소스가 각 문장이 끝날 때(`INITIALLY DEFERRED`로 선언한 키는 커밋 시점에) 검사하는 키를 즉시 검사합니다. 컷오버 후에는 두 행이 잠시 같은 키 값을 갖게 하는 문장이나 트랜잭션(두 행의 값 맞바꾸기, 번호 다시 매기기)이 실패할 수 있습니다: Evaluation과 Schema Conversion은 테이블을 **MANUAL**로 표시합니다(`PG_DEFERRABLE_KEY`). 외래 키는 `DEFERRABLE`과 `MATCH FULL`을 유지합니다(§2.2).
 >
 > **MySQL** 생성 컬럼은 일반 컬럼으로 만들어집니다(도구는 MySQL 식을 읽어 결과와 소스 DDL에 보여 주지만 번역하지는 않음). Full Load는 계산된 값을 복사하고, CDC는 `STORED` 컬럼의 값을 전달합니다. 식(`GENERATED ALWAYS AS (...) STORED`)은 마이그레이션 유형과 상관없이 적용 전에 Schema Conversion에서 다시 추가할 수 있습니다. 그러면 Full Load와 CDC가 적용 DDL이 `GENERATED`로 만든 컬럼을 모든 쓰기에서 빼고(Aurora DSQL은 그런 컬럼에 대한 값을 거부합니다, SQLSTATE `428C9`) Aurora DSQL이 값을 계산합니다. 기본 키에 속한 생성 컬럼은 일반 컬럼으로 둡니다. Full Load와 CDC는 모든 키 컬럼을 쓰므로 `GENERATED` 키 컬럼이면 모든 쓰기가 거부됩니다.
 

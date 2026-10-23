@@ -47,6 +47,10 @@ _EXPECTED_PG_RULE_IDS = {
     # which Aurora DSQL cannot enforce (the converter's own notes).
     "PG_EXCLUSION_CONSTRAINT",
     "PG_TEMPORAL_KEY",
+    # PG-specific (G152): DEFERRABLE primary / unique keys (checked immediately on the
+    # target) and PostgreSQL 18 NOT ENFORCED foreign keys (not created).
+    "PG_DEFERRABLE_KEY",
+    "PG_FK_NOT_ENFORCED",
     "TRIGGER_UNSUPPORTED",
     "PROC_PLPGSQL",
     "EVENT_UNSUPPORTED",

@@ -90,6 +90,7 @@ from dsql_migrator.core.models import (
     AssessmentReport,
     Classification,
     ColumnDef,
+    ForeignKeyDef,
     ObjectType,
     SourceInventory,
     SourceType,
@@ -734,6 +735,29 @@ def _quote_pg_table(name: str) -> str:
     return _quote_pg_ident(name)
 
 
+def _pg_source_foreign_key_options(foreign_key: ForeignKeyDef) -> str:
+    """A PostgreSQL foreign key's clauses after REFERENCES, as ``pg_get_constraintdef``
+    prints them (MATCH FULL, ON UPDATE, ON DELETE, DEFERRABLE, INITIALLY DEFERRED, NOT
+    ENFORCED; the defaults left out), for the source panel. The target's key keeps its
+    MATCH FULL and DEFERRABLE / INITIALLY DEFERRED (G152), so the diff shows only what
+    really changes. Display only."""
+    parts = [" MATCH FULL"] if foreign_key.match_full else []
+    for keyword, action in (("UPDATE", foreign_key.on_update), ("DELETE", foreign_key.on_delete)):
+        # A PostgreSQL 15+ ``SET NULL (col, ...)`` keeps its column list as reflected: only
+        # the action's words are keywords, a column name keeps its case.
+        words, paren, column_list = str(action or "").partition("(")
+        spelled = " ".join(words.upper().replace("_", " ").split())
+        if spelled and spelled != "NO ACTION":
+            parts.append(f" ON {keyword} {spelled}" + (f" ({column_list}" if paren else ""))
+    if foreign_key.is_deferrable:
+        parts.append(" DEFERRABLE")
+    if foreign_key.initially_deferred:
+        parts.append(" INITIALLY DEFERRED")
+    if not foreign_key.enforced:
+        parts.append(" NOT ENFORCED")
+    return "".join(parts)
+
+
 def _render_source_table_ddl_postgres(table: TableDef) -> str:
     """Reconstruct a readable PostgreSQL ``CREATE TABLE`` for ``table`` (display only).
 
@@ -776,23 +800,25 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
                 else "  /* GENERATED column - expression not captured */"
             )
         clauses.append(clause)
-    # A WITHOUT OVERLAPS key and an EXCLUDE constraint (G151) are shown as the source
-    # defines them (pg_get_constraintdef): the clause is exactly what the target loses.
-    temporal_primary = next((key for key in table.temporal_keys if key.primary), None)
-    temporal_unique = {
-        key.index: key for key in table.temporal_keys if not key.primary and key.index
-    }
-    if temporal_primary is not None and temporal_primary.definition:
+    # A WITHOUT OVERLAPS key and an EXCLUDE constraint (G151), and a DEFERRABLE key (G152),
+    # are shown as the source defines them (pg_get_constraintdef): the clause is exactly what
+    # the target loses. A key that is both has one definition, shown once.
+    keys = [*table.temporal_keys, *table.deferrable_keys]
+    defined_primary = next((key for key in keys if key.primary and key.definition), None)
+    defined_unique: dict = {}
+    for key in keys:
+        if not key.primary and key.index and key.definition:
+            defined_unique.setdefault(key.index, key)
+    if defined_primary is not None:
         clauses.append(
-            f"  CONSTRAINT {_quote_pg_ident(temporal_primary.name)} "
-            f"{temporal_primary.definition}"
+            f"  CONSTRAINT {_quote_pg_ident(defined_primary.name)} "
+            f"{defined_primary.definition}"
         )
     elif table.primary_key:
         pk_columns = ", ".join(_quote_pg_ident(name) for name in table.primary_key)
         clauses.append(f"  PRIMARY KEY ({pk_columns})")
-    for key in temporal_unique.values():
-        if key.definition:
-            clauses.append(f"  CONSTRAINT {_quote_pg_ident(key.name)} {key.definition}")
+    for key in defined_unique.values():
+        clauses.append(f"  CONSTRAINT {_quote_pg_ident(key.name)} {key.definition}")
     for foreign_key in table.foreign_keys:
         columns = ", ".join(_quote_pg_ident(name) for name in foreign_key.columns)
         ref_columns = ", ".join(
@@ -801,6 +827,7 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
         clauses.append(
             f"  CONSTRAINT {_quote_pg_ident(foreign_key.name)} FOREIGN KEY ({columns}) "
             f"REFERENCES {_quote_pg_table(foreign_key.referenced_table)} ({ref_columns})"
+            + _pg_source_foreign_key_options(foreign_key)
         )
     for constraint in table.exclusion_constraints:
         clauses.append(
@@ -810,9 +837,8 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
     body = ",\n".join(clauses)
     rendered = f"CREATE TABLE {_quote_pg_table(table.name)} (\n{body}\n)"
     for index in table.indexes:
-        known = temporal_unique.get(index.name)
-        if known is not None and known.definition:
-            continue  # the UNIQUE ... WITHOUT OVERLAPS clause above
+        if index.name in defined_unique:
+            continue  # the UNIQUE ... WITHOUT OVERLAPS / DEFERRABLE clause above
         unique = "UNIQUE " if index.unique else ""
         columns = ", ".join(_quote_pg_ident(name) for name in index.columns)
         method = (index.method or "").strip()

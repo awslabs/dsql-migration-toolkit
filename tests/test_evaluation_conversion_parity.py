@@ -31,7 +31,9 @@ from dsql_migrator.core.models import (
     Classification,
     ColumnDef,
     ConversionNoteKind,
+    DeferrableKeyDef,
     ExclusionConstraintDef,
+    ForeignKeyDef,
     IndexDef,
     SourceInventory,
     SourceType,
@@ -244,6 +246,26 @@ _PG_CORPUS = [
                      nulls_not_distinct=True)
         ],
     ),
+    # G152: a DEFERRABLE unique key, created as an ordinary one (checked immediately), and a
+    # PostgreSQL 18 NOT ENFORCED foreign key, not created (advice: like the source, the
+    # target does not check it).
+    _t(
+        "deferrable_key",
+        [ColumnDef(name="code", mysql_type="integer")],
+        indexes=[IndexDef(name="deferrable_key_code_key", columns=["code"], unique=True)],
+        deferrable_keys=[
+            DeferrableKeyDef(name="deferrable_key_code_key", definition="UNIQUE (code) DEFERRABLE",
+                             index="deferrable_key_code_key")
+        ],
+    ),
+    _t(
+        "not_enforced_fk",
+        [ColumnDef(name="pid", mysql_type="bigint")],
+        foreign_keys=[
+            ForeignKeyDef(name="not_enforced_fk_pid", columns=["pid"], referenced_table="app.clean",
+                          referenced_columns=["id"], enforced=False)
+        ],
+    ),
 ]
 
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
@@ -330,3 +352,7 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
     assert pg["app.exclude_btree"] == "PG_EXCLUSION_CONSTRAINT"
     assert pg["app.temporal_pk"] == "PG_TEMPORAL_KEY"
     assert pg["app.nulls_not_distinct"] == "COMPATIBLE"  # carried as it is
+    assert pg["app.deferrable_key"] == "PG_DEFERRABLE_KEY"
+    # Advice only: the table converts automatically.
+    assert pg["app.not_enforced_fk"] == "PG_FK_NOT_ENFORCED"
+    assert concerns["app.not_enforced_fk"] == {"PG_FK_NOT_ENFORCED"}

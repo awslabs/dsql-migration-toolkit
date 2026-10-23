@@ -730,8 +730,9 @@ _SQL_TOKEN_RE = re.compile(
 
 # What PostgreSQL does when a statement leaves it out, as the unquoted words a restatement may
 # spell it with: an index's btree and a key's ASC; a foreign key's MATCH SIMPLE, NO ACTION --
-# and RESTRICT, which the converter writes as NO ACTION --, NOT DEFERRABLE and INITIALLY
-# IMMEDIATE. (A key's NULLS LAST, NULLS FIRST after DESC, is the other one.)
+# and RESTRICT, which the converter writes as NO ACTION unless the key is DEFERRABLE
+# (G152) --, NOT DEFERRABLE and INITIALLY IMMEDIATE. (A key's NULLS LAST, NULLS FIRST
+# after DESC, is the other one.)
 _KEY_DEFAULTS = (
     ("using", "btree"),
     ("asc",),

@@ -3044,7 +3044,10 @@ class Validator:
         """
         findings: list[OrphanFinding] = []
         unchecked: list[UncheckedForeignKey] = []
-        if not table.foreign_keys:
+        # A PostgreSQL 18 NOT ENFORCED key is not created on Aurora DSQL (G152): the source
+        # never checked it, so a row it would refuse is no divergence.
+        foreign_keys = [fk for fk in table.foreign_keys if fk.enforced]
+        if not foreign_keys:
             return findings, unchecked, item
         page = self._page_or_stop(should_cancel)
         failures: list[str] = []
@@ -3062,7 +3065,7 @@ class Validator:
                 "the table's primary key on Aurora DSQL could not be read "
                 f"({_safe_error_message(exc)})",
             )
-        for fk in table.foreign_keys:
+        for fk in foreign_keys:
             try:
                 orphan_count = _target_orphan_count(
                     target_connection, table, fk, self._reconcile_page_size,

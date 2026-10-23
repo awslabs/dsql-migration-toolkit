@@ -29,6 +29,7 @@ from dsql_migrator.core.catalog_postgres import (
 )
 from dsql_migrator.core.introspector import SOURCE_CONNECT_TIMEOUT_SECONDS
 from dsql_migrator.core.models import (
+    DeferrableKeyDef,
     ExclusionConstraintDef,
     ObjectRef,
     ObjectType,
@@ -736,6 +737,83 @@ def _pg_read_exclusion_rules(connection: object, nsp: str, tables: list) -> None
                 )
 
 
+# The PRIMARY KEY / UNIQUE constraints of the tables read declared DEFERRABLE and, on
+# PostgreSQL 18+, their FOREIGN KEYs declared NOT ENFORCED (G152): ONE catalog round trip per
+# schema, no table scanned. SQLAlchemy reflects neither -- it reads a key's columns, not
+# whether it is deferrable, and parses a foreign key's DEFERRABLE / INITIALLY / MATCH out of
+# pg_get_constraintdef, not its NOT ENFORCED. ``conenforced`` exists only from PostgreSQL 18
+# (as does NOT ENFORCED), and naming it on 13-17 fails the whole statement ("column
+# con.conenforced does not exist"), so it is named only for a server SQLAlchemy reports as 18
+# or later, as ``conperiod`` is above.
+_PG_KEY_TIMING_SQL = (
+    "SELECT c.relname AS rel, con.conname AS conname, con.contype AS contype, "
+    "con.condeferred AS deferred, "
+    "pg_catalog.pg_get_constraintdef(con.oid) AS definition, ic.relname AS index_name "
+    "FROM pg_catalog.pg_constraint con "
+    "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "LEFT JOIN pg_catalog.pg_class ic ON ic.oid = con.conindid "
+    "WHERE n.nspname = :nsp AND c.relname = ANY(:names) AND ({kinds}) "
+    "ORDER BY c.relname, con.conname"
+)
+_PG_DEFERRABLE_KEY_KIND = "con.contype IN ('p', 'u') AND con.condeferrable"
+_PG_NOT_ENFORCED_FK_KIND = "con.contype = 'f' AND NOT con.conenforced"
+
+
+def pg_key_timing_sql(server_version: "Optional[Sequence[int]]") -> str:
+    """The statement :func:`_pg_read_key_timing` runs for a server of ``server_version``
+    (SQLAlchemy's ``server_version_info``; ``None`` when unknown, read as earlier than 18).
+    Pure."""
+    kinds = f"({_PG_DEFERRABLE_KEY_KIND})"
+    if server_version and tuple(server_version) >= (18,):
+        kinds += f" OR ({_PG_NOT_ENFORCED_FK_KIND})"
+    return _PG_KEY_TIMING_SQL.format(kinds=kinds)
+
+
+def _pg_read_key_timing(connection: object, nsp: str, tables: list) -> None:
+    """Record each table's DEFERRABLE keys and NOT ENFORCED foreign keys, in place (G152).
+
+    A DEFERRABLE primary key or UNIQUE constraint goes to ``deferrable_keys``; it stays an
+    ordinary key (Aurora DSQL rejects DEFERRABLE on a unique key), so nothing else changes.
+    A NOT ENFORCED foreign key (PostgreSQL 18) is marked ``enforced=False``, so Schema
+    Conversion does not create it: the source never checks it, and Aurora DSQL would. Rows of
+    an unexpected shape are skipped, and so is a foreign key reflection did not read.
+    """
+    if not tables:
+        return
+    version = getattr(getattr(connection, "dialect", None), "server_version_info", None)
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(pg_key_timing_sql(version)),
+        {"nsp": nsp, "names": [table.name for table in tables]},
+    ).mappings()
+    keys: dict[str, list[DeferrableKeyDef]] = {}
+    not_enforced: dict[str, set[str]] = {}
+    for row in rows:
+        contype = str(row.get("contype") or "")
+        relation, name = row.get("rel"), row.get("conname")
+        if not relation or not name:
+            continue
+        if contype in ("p", "u"):
+            index = row.get("index_name")
+            keys.setdefault(str(relation), []).append(
+                DeferrableKeyDef(
+                    name=str(name),
+                    definition=str(row.get("definition") or ""),
+                    primary=contype == "p",
+                    initially_deferred=bool(row.get("deferred")),
+                    index=str(index) if index else None,
+                )
+            )
+        elif contype == "f":
+            not_enforced.setdefault(str(relation), set()).add(str(name))
+    for table in tables:
+        table.deferrable_keys.extend(keys.get(table.name, ()))
+        names = not_enforced.get(table.name, ())
+        for fk in table.foreign_keys:
+            if fk.name in names:
+                fk.enforced = False
+
+
 def _pg_collect_triggers(connection: object, nsp: str) -> list:
     """Read user trigger names for the schema (mirrors MySQL ``collect_triggers`` shape).
 
@@ -1316,6 +1394,11 @@ class PostgresSourceDialect(SourceDialect):
         # (3b) EXCLUDE constraints and (PG18+) WITHOUT OVERLAPS keys, which Aurora DSQL
         # cannot enforce: an exclusion constraint's index leaves ``indexes`` (G151).
         _pg_read_exclusion_rules(connection, enrich_db, tables)
+
+        # (3c) DEFERRABLE primary keys / UNIQUE constraints, which Aurora DSQL creates as
+        # ordinary keys, and (PG18+) NOT ENFORCED foreign keys, which it does not create
+        # (G152).
+        _pg_read_key_timing(connection, enrich_db, tables)
 
         # (4) Stored triggers + routines (functions/procedures) for the schema, returned as
         # the ObjectRef shape the MySQL path uses so TriggerRule/ProcedureRule flag them
@@ -2298,6 +2381,7 @@ __all__ = [
     "PostgresSourceDialect",
     "pg_default_timezone",
     "pg_exclusion_rules_sql",
+    "pg_key_timing_sql",
     "pg_reads_own_rows_only",
     "pg_timezone_defaults",
 ]

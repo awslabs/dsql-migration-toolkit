@@ -139,7 +139,7 @@ body with double-quoted identifiers, which the conversion would read as strings.
 | Class | Meaning | Examples |
 |---|---|---|
 | **AUTO** | Converts automatically, no human action. | Ordinary tables/columns with mappable types and a PK; **foreign keys** (converted automatically, flagged `RECOMMENDED` — see below); a multi-database MySQL source (each database becomes its own schema, flagged `RECOMMENDED`); an index name another table, view or index of the schema also uses (the index is renamed automatically, flagged `RECOMMENDED`). |
-| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, FULLTEXT/SPATIAL indexes (not emitted: the search they served moves outside the database), oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns, or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, which Aurora DSQL cannot index (they are not emitted; a UNIQUE one stops enforcing uniqueness), PostgreSQL non-btree indexes (built as btree) and partial indexes whose predicate reads a re-typed column (other partial indexes keep their `WHERE`), PostgreSQL `EXCLUDE` constraints (not created, nor the index that enforced each: `PG_EXCLUSION_CONSTRAINT`) and PostgreSQL 18 keys declared `WITHOUT OVERLAPS` (created as ordinary keys: `PG_TEMPORAL_KEY`), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
+| **MANUAL** | Converts, but needs a decision or an app-side change. | Case-insensitive collation, FULLTEXT/SPATIAL indexes (not emitted: the search they served moves outside the database), oversized LOB and JSON columns, `ENUM`/`SET`, generated columns, `ON UPDATE` timestamps, spatial/geometry types, foreign keys with `CASCADE`/`SET NULL` actions (which CDC can't replicate), secondary indexes on `bytea` columns, or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, which Aurora DSQL cannot index (they are not emitted; a UNIQUE one stops enforcing uniqueness), PostgreSQL non-btree indexes (built as btree) and partial indexes whose predicate reads a re-typed column (other partial indexes keep their `WHERE`), PostgreSQL `EXCLUDE` constraints (not created, nor the index that enforced each: `PG_EXCLUSION_CONSTRAINT`) and PostgreSQL 18 keys declared `WITHOUT OVERLAPS` (created as ordinary keys: `PG_TEMPORAL_KEY`), a PostgreSQL primary key or `UNIQUE` constraint declared `DEFERRABLE` (created as an ordinary key, which Aurora DSQL checks immediately: `PG_DEFERRABLE_KEY`), a PostgreSQL `numeric` with no declared precision (stored as `numeric(18,6)`), a view whose definition the source did not return, objects the source user cannot list (`SOURCE_VISIBILITY`), a PostgreSQL sequence no column owns (`PG_STANDALONE_SEQUENCE`). |
 | **UNSUPPORTED** | No automatic conversion — redesign needed. | Triggers, stored procedures/functions, scheduled events, tables with no PK, primary keys on `bytea` columns (`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`) or on PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` columns, names that collide when truncated to 63 bytes (two columns of a table, or two tables/views of a schema), `DECIMAL` precision > 1000, > 255 columns/table, more than 1,000 tables, 10 schemas or 5,000 views in the target database (counting what the cluster already holds), row-level security on a PostgreSQL table (`PG_ROW_LEVEL_SECURITY`). |
 
 The examples above are mostly drawn from a MySQL source. For a **PostgreSQL source** the same
@@ -195,6 +195,17 @@ and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward DSQL's
 `NO ACTION`/`RESTRICT` where child cardinality is unbounded. A cascade action also can't
 survive CDC (see [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits)), which
 is the one case Evaluation still flags **MANUAL**.
+
+A PostgreSQL foreign key keeps its `MATCH FULL` and its `DEFERRABLE` / `INITIALLY DEFERRED`
+(Aurora DSQL accepts both, and checks a deferred key at commit, as the source does), and the
+finding names each key that declares one. A PostgreSQL 18 key declared `NOT ENFORCED` is not
+created: the source never checks it, and Aurora DSQL, which has no `NOT ENFORCED`, would
+refuse writes the source accepts. That is advice too (`PG_FK_NOT_ENFORCED`, `RECOMMENDED`);
+to have Aurora DSQL enforce such a key, add its `ALTER TABLE … ADD CONSTRAINT … NOT VALID` to
+the table's target script. A primary key or `UNIQUE` constraint declared `DEFERRABLE` is a gap
+instead (`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL does not support deferrable unique
+keys, so it is created as an ordinary key, checked immediately (see
+[§2.3](#23-mysql--dsql-type-and-constraint-handling-reference)).
 
 Because a recommendation is optional, **it does not count toward an object's estimated
 effort** — otherwise nearly every table with a generated key that keeps generating would be
@@ -668,6 +679,13 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
   FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;
 ```
 
+A PostgreSQL key keeps what it declares after `REFERENCES`, in PostgreSQL's order and before
+`NOT VALID`: `MATCH FULL`, its `ON DELETE` / `ON UPDATE` action, and
+`DEFERRABLE INITIALLY DEFERRED` (or `DEFERRABLE INITIALLY IMMEDIATE`). Aurora DSQL accepts
+each with `NOT VALID`, and checks a deferred key at commit. A deferrable key also keeps an
+`ON DELETE` / `ON UPDATE` `RESTRICT`, which PostgreSQL checks at once even while the key is
+deferred. A PostgreSQL 18 key declared `NOT ENFORCED` is not created at all.
+
 **Why it is deferred.** The bulk load writes parent and child tables **concurrently,
 in per-table primary-key order, with no parent-before-child sequencing**, so a child
 row can be written before its parent exists. If the foreign key were already enforced
@@ -825,6 +843,14 @@ shared "write contract" keeps them identical).
 > such table add a btree index on its key columns on the source. A
 > `UNIQUE ... NULLS NOT DISTINCT` index or constraint (PostgreSQL 15+) keeps
 > `NULLS NOT DISTINCT`, which Aurora DSQL accepts.
+>
+> A PostgreSQL `PRIMARY KEY` or `UNIQUE` constraint declared `DEFERRABLE` is created as an
+> ordinary key: Aurora DSQL does not support deferrable unique keys, so it checks the key
+> immediately, where the source checks it at the end of each statement or, for one declared
+> `INITIALLY DEFERRED`, at commit. After cut over a statement or transaction that briefly
+> gives two rows the same key value (swapping two rows' values, renumbering them) can fail:
+> Evaluation and Schema Conversion flag the table **MANUAL** (`PG_DEFERRABLE_KEY`). A foreign
+> key keeps its `DEFERRABLE` and `MATCH FULL` (§2.2).
 >
 > A **MySQL** generated column is created as an ordinary column (the tool reads its MySQL
 > expression and shows it in the finding and the source DDL, but does not translate it): Full

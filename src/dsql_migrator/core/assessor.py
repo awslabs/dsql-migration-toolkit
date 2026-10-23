@@ -44,6 +44,7 @@ from dsql_migrator.core.models import (
     Classification,
     ConversionNoteKind,
     EffortLevel,
+    ForeignKeyDef,
     ObjectType,
     SourceInventory,
     SourceType,
@@ -488,6 +489,28 @@ class Rule(ABC):
         raise NotImplementedError
 
 
+def foreign_key_clauses_kept(foreign_keys: "Sequence[ForeignKeyDef]") -> str:
+    """The sentence naming each key's MATCH FULL and DEFERRABLE / INITIALLY clauses, which
+    the re-created key keeps (G152), or ``""`` when no key has one (every MySQL key). Shared
+    by FK_PRESERVED and the Schema Conversion note, so both steps say the same."""
+    entries = []
+    for fk in foreign_keys:
+        clauses = ["MATCH FULL"] if fk.match_full else []
+        if fk.is_deferrable:
+            clauses.append(
+                "DEFERRABLE INITIALLY " + ("DEFERRED" if fk.initially_deferred else "IMMEDIATE")
+            )
+        if clauses:
+            entries.append(f"{fk.name} ({', '.join(clauses)})")
+    if not entries:
+        return ""
+    return (
+        " Their deferral and matching are kept as the source declares them: "
+        + ", ".join(entries)
+        + "."
+    )
+
+
 class ForeignKeyRule(Rule):
     """Note tables that declare foreign keys (Aurora DSQL enforces them, as of 2026-08).
 
@@ -497,7 +520,9 @@ class ForeignKeyRule(Rule):
     ``AutoIncrementRule``) so it reads "RECOMMENDED", never inflates the effort
     estimate, and stays consistent with the Schema Conversion note for the same key.
     The wording leads with what is true ("converts cleanly") and carries the runtime
-    caveats DSQL documents so the operator sees them at planning time.
+    caveats DSQL documents so the operator sees them at planning time. A PostgreSQL key's
+    DEFERRABLE / INITIALLY DEFERRED and MATCH FULL are kept, and named (G152); a PostgreSQL
+    18 NOT ENFORCED key is not created, and has its own finding (PG_FK_NOT_ENFORCED).
     """
 
     rule_id = "FK_PRESERVED"
@@ -505,8 +530,9 @@ class ForeignKeyRule(Rule):
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         findings: list[Finding] = []
         for table in inventory.tables:
-            if table.foreign_keys:
-                names = ", ".join(fk.name for fk in table.foreign_keys)
+            enforced = [fk for fk in table.foreign_keys if fk.enforced]
+            if enforced:
+                names = ", ".join(fk.name for fk in enforced)
                 findings.append(
                     Finding(
                         object=ObjectKey(KIND_TABLE, table.name),
@@ -514,9 +540,11 @@ class ForeignKeyRule(Rule):
                         classification=Classification.MANUAL,
                         risk=(
                             f"Foreign key constraints ({names}) convert cleanly and "
-                            "are re-created on Aurora DSQL after the data load. DSQL "
-                            "enforces them with commit-time optimistic concurrency, so "
-                            "DML on referenced/referencing tables incurs extra reads."
+                            "are re-created on Aurora DSQL after the data load."
+                            + foreign_key_clauses_kept(enforced)
+                            + " DSQL enforces them with commit-time optimistic "
+                            "concurrency, so DML on referenced/referencing tables incurs "
+                            "extra reads."
                         ),
                         recommendation=(
                             "No action needed -- foreign keys are preserved "
@@ -1939,6 +1967,34 @@ def pg_temporal_key_rule() -> ConversionWarningRule:
         "writers of that key also update one shared row, so Aurora DSQL's optimistic "
         "concurrency fails one of them (40001) -- or change the design.",
         EffortLevel.MEDIUM,
+    )
+
+
+def pg_deferrable_key_rule() -> ConversionWarningRule:
+    """PostgreSQL PRIMARY KEY / UNIQUE constraints declared DEFERRABLE, created as ordinary
+    keys that Aurora DSQL checks immediately (PG_DEFERRABLE_KEY, G152)."""
+    return ConversionWarningRule(
+        "PG_DEFERRABLE_KEY",
+        "_pg_deferrable_key_warning",
+        "Before cut over, find the writes that rely on the deferred check -- a transaction "
+        "or a multi-row UPDATE that swaps or renumbers key values -- and change them so no "
+        "two rows hold the same key value at any point (move one row to a free value first), "
+        "or change the design.",
+        EffortLevel.SIMPLE,
+    )
+
+
+def pg_not_enforced_foreign_key_rule() -> ConversionWarningRule:
+    """PostgreSQL 18 foreign keys declared NOT ENFORCED, which Schema Conversion does not
+    create (PG_FK_NOT_ENFORCED, G152): advice, the target does not check them either."""
+    return ConversionWarningRule(
+        "PG_FK_NOT_ENFORCED",
+        "_pg_not_enforced_foreign_key_warning",
+        "No action needed: the target behaves as the source does. To have Aurora DSQL "
+        "enforce such a key after all, add its ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY "
+        "... NOT VALID to the table's target script in Schema Conversion: it is then added "
+        "and validated with the other foreign keys, and its rows must satisfy it.",
+        EffortLevel.SIMPLE,
     )
 
 
@@ -4653,6 +4709,9 @@ __all__ = [
     "pg_unindexable_column_rule",
     "pg_exclusion_constraint_rule",
     "pg_temporal_key_rule",
+    "pg_deferrable_key_rule",
+    "pg_not_enforced_foreign_key_rule",
+    "foreign_key_clauses_kept",
     "default_dropped_rule",
     "importance_order",
     "default_rules",

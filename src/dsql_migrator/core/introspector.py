@@ -555,6 +555,7 @@ def _reflect_tables(
     catalog round trips): progress and liveness for a long read, and where a stop lands.
     """
     tables: list[TableDef] = []
+    is_postgres = getattr(getattr(inspector, "dialect", None), "name", None) == "postgresql"
     listed = (
         names if names is not None else inspector.get_table_names(schema=schema)  # type: ignore[attr-defined]
     )
@@ -667,6 +668,12 @@ def _reflect_tables(
             # therefore absent from the binary log -- so CDC cannot replicate it
             # (see ForeignKeyDef.has_cascade_action).
             options = fk.get("options") or {}
+            # A PostgreSQL key's DEFERRABLE / INITIALLY DEFERRED / MATCH FULL (G152), which
+            # SQLAlchemy's PostgreSQL dialect parses out of pg_get_constraintdef into the
+            # same ``options`` (``deferrable`` True, ``initially`` "DEFERRED", ``match``
+            # "FULL"; absent for the defaults). Read for a PostgreSQL source only: a MySQL
+            # foreign key is never deferrable and InnoDB ignores MATCH.
+            timing = options if is_postgres else {}
             foreign_keys.append(
                 ForeignKeyDef(
                     name=fk_name,
@@ -675,6 +682,9 @@ def _reflect_tables(
                     referenced_columns=referred_columns,
                     on_delete=(options.get("ondelete") or None),
                     on_update=(options.get("onupdate") or None),
+                    deferrable=timing.get("deferrable") is True,
+                    initially_deferred=str(timing.get("initially") or "").upper() == "DEFERRED",
+                    match_full=str(timing.get("match") or "").upper() == "FULL",
                 )
             )
 
