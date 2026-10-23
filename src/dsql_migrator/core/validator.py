@@ -575,7 +575,9 @@ def _source_checksum_keyset(
     ``source_dialect.mysql._cursor_value``, the Full Load reader's binding): a TIME as its
     duration text, which PyMySQL writes an hour early when it is negative and not whole
     hours, and a BIT as the integer its bits hold, where PyMySQL's bytes compare as a
-    character string. A full page that does not move past its cursor raises
+    character string; a DATE / DATETIME / TIMESTAMP as the text MySQL prints for it (G155,
+    :func:`~dsql_migrator.core.validation_sql._mysql_page_boundary`). A full page that does
+    not move past its cursor, or whose last key comes back NULL, raises
     :class:`PagedReadError`, and so do pages that read more rows than ``expected_rows``
     (the snapshot's live ``COUNT(*)``, when the caller read it) -- as soon as they do -- or,
     at the end, a different number; :func:`_source_checksum` then reads the checksum in one
@@ -610,6 +612,14 @@ def _source_checksum_keyset(
             raise _rows_overrun("source", rows, expected_rows)
         if count is None or int(count) < page_size:
             break
+        if last_pk is None:
+            # A full page whose last key came back NULL (G155): bound as None, the next
+            # statement would read from the first page again.
+            raise PagedReadError(
+                "The last key of a full keyset page of the source could not be read, so the "
+                "read cannot go on. The table is not compared.",
+                reason="the last key of a full page could not be read",
+            )
         if last_pk == last:
             raise _stalled("source")
         last = last_pk

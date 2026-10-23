@@ -28,7 +28,7 @@ from dsql_migrator.core.converter import (
     mysql_enum_set_members,
 )
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
-from dsql_migrator.core.mysql_zero_dates import zero_date_mapping
+from dsql_migrator.core.mysql_zero_dates import temporal_base, zero_date_mapping
 
 # A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
 # reduce a format_type spelling to its base for a timetz classification (e.g.
@@ -990,12 +990,32 @@ def _mysql_keyset_key(table: TableDef, pk_column: str) -> str:
     return pk_sql
 
 
+def _mysql_page_boundary(table: TableDef, pk_column: str) -> str:
+    """The page's last key as a MySQL page checksum selects it: ``MAX(page_pk)``, or for a
+    DATE / DATETIME / TIMESTAMP key ``MAX(CAST(page_pk AS CHAR))`` (G155).
+
+    MAX() of a date holding a day the month does not have ('2020-02-31', which MySQL stores
+    under ALLOW_INVALID_DATES) is NULL, and under a strict mode a valid date before it: the
+    next page then started from the first row again, until the pages read more rows than
+    COUNT(*) and the checksum fell back to one whole-table statement. The text MySQL prints
+    for such a key -- 'YYYY-MM-DD[ HH:MM:SS[.f]]', of one width in a column, zero parts
+    included, a TIMESTAMP in the session's UTC -- sorts as the values do, so its MAX is the
+    page's last key exactly, and the cursor binds it back as stored (the source session
+    allows such a date: ``introspector._MYSQL_SESSION_INIT_COMMAND``).
+    """
+    column = next((c for c in table.columns if c.name == pk_column), None)
+    if temporal_base(column) is not None:
+        return "MAX(CAST(page_pk AS CHAR))"
+    return "MAX(page_pk)"
+
+
 def build_mysql_page_checksum_first_sql(table: TableDef, pk_column: str) -> str:
     """First keyset page of the MySQL checksum: ``(sub_sum, last_pk, row_count)``."""
     pk_sql = _quote_mysql_identifier(pk_column)
     table_sql = _quote_mysql_table(table.name)
     return (
-        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        f"SELECT COALESCE(SUM(page_tok), 0), {_mysql_page_boundary(table, pk_column)}, "
+        "COUNT(*) FROM ("
         f"SELECT {_mysql_keyset_key(table, pk_column)} AS page_pk, "
         f"{_mysql_row_token(table)} AS page_tok "
         f"FROM {table_sql} ORDER BY {pk_sql} LIMIT :page) ckpage"
@@ -1008,7 +1028,8 @@ def build_mysql_page_checksum_next_sql(table: TableDef, pk_column: str) -> str:
     key_sql = _mysql_keyset_key(table, pk_column)
     table_sql = _quote_mysql_table(table.name)
     return (
-        "SELECT COALESCE(SUM(page_tok), 0), MAX(page_pk), COUNT(*) FROM ("
+        f"SELECT COALESCE(SUM(page_tok), 0), {_mysql_page_boundary(table, pk_column)}, "
+        "COUNT(*) FROM ("
         f"SELECT {key_sql} AS page_pk, {_mysql_row_token(table)} AS page_tok "
         f"FROM {table_sql} WHERE {key_sql} > :last ORDER BY {pk_sql} LIMIT :page) ckpage"
     )
