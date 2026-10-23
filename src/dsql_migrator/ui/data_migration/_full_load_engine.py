@@ -76,6 +76,7 @@ from dsql_migrator.core.converter import (
 )
 from dsql_migrator.core.cdc_coords import gtid_mode_is_on
 from dsql_migrator.core.cdc_schema_evolve import read_target_columns
+from dsql_migrator.core.source_time_zone import resolve_source_zone
 from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
 from dsql_migrator.core.column_exclusion import names_in as _names_in  # noqa: F401
 from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
@@ -5792,12 +5793,17 @@ def _derived_table_conversion(
     "cannot adapt type 'dict'". Both sides now derive it here, which is what
     ``DataMigrationInputs.table_conversions`` already documents ("a table absent here
     falls back to the deterministic conversion / source-derived types"). Uses the SOURCE
-    engine's dialect, else a PostgreSQL-source table would be re-derived as MySQL DDL.
+    engine's dialect, else a PostgreSQL-source table would be re-derived as MySQL DDL, and
+    the source's time zone Evaluation read, as the whole conversion does (G149).
     """
-    return SchemaConverter(
-        source_type=inputs.source_config.source_type
-    ).convert_table(
-        table, SchemaConvertOptions(), index_names=(inputs.index_renames or {}).get(table.name)
+    source_type = inputs.source_config.source_type
+    return SchemaConverter(source_type=source_type).convert_table(
+        table,
+        SchemaConvertOptions(),
+        index_names=(inputs.index_renames or {}).get(table.name),
+        source_zone=resolve_source_zone(
+            getattr(inputs.inventory, "server_settings", None) or {}, source_type
+        ),
     )
 
 

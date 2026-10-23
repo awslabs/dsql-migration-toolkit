@@ -175,7 +175,9 @@ examples a **MySQL source** produces:
 
 - `TINYINT(1)` → DSQL **boolean** (`0/1` → `false/true`).
 - `BIT(n)` → integer (decoded from the source bytes).
-- `DATETIME` → `timestamp` normalized to UTC; `TIMESTAMP` → `timestamptz`.
+- `DATETIME` → `timestamp`, its wall clock copied as it is (no time zone is applied or
+  shifted; a source in another zone keeps that zone's wall clock, `SOURCE_TIME_ZONE` in
+  Chapter 2); `TIMESTAMP` → `timestamptz`, the instant.
 - `BLOB`/`BINARY`/`VARBINARY` family → `bytea`.
 
 For a **PostgreSQL source** there is **no** MySQL-style value translation during

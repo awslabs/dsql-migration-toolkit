@@ -40,8 +40,10 @@ PostgreSQL ソースでは、Evaluation はインベントリにない 2 つの�
 
 Evaluation はソースの **サーバー設定** も 1 回だけ読み取ります (設定のみで、テーブルはスキャンしません)。読み取った設定は、レポートのソースオブジェクト数の下 (**Source server settings**、折りたたみ表示) に一覧されます。これらは、テーブル定義には現れない、アプリケーションが動作する条件を示します。
 
-- **MySQL:** `sql_mode`、`time_zone`、`system_time_zone`、`explicit_defaults_for_timestamp`、`auto_increment_increment`、`auto_increment_offset`、`lower_case_table_names`、`character_set_server`、`collation_server`、`default_collation_for_utf8mb4`、`div_precision_increment`、`group_concat_max_len` の GLOBAL 値です。アプリケーションのセッションはこのグローバル値から始まり、ツール自身のセッションは独自の値を設定するためです (下記)。3 つはそれぞれデータベースレベルの **MANUAL** 項目として判定されます。`SQL_MODE`: モードに `ONLY_FULL_GROUP_BY` がない (ビューやクエリが `GROUP BY` で決まらない列を選択でき、Aurora DSQL はこれを `42803` で拒否します。ビューの場合は Schema Conversion が適用するときです)、日付列を持つテーブルがあるのにゼロや不正な日付を保存できる (`NO_ZERO_DATE` または `NO_ZERO_IN_DATE` がない、strict モードがない、または `ALLOW_INVALID_DATES`: Aurora DSQL にはそのような値がないため、それを持つ行はそのままではロードできません)、または `ANSI_QUOTES` / `PIPES_AS_CONCAT` がある (Query Converter に貼り付けるアプリケーションの SQL はそのモード向けに書かれていますが、変換は SQL を MySQL の既定のモードと同じように読み取ります) 場合です。`EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 設定が `OFF` の場合、MySQL は `NOT NULL` と宣言された `TIMESTAMP` 列に NULL が書き込まれると現在時刻を保存しますが、Aurora DSQL はその書き込みを拒否します。項目はそれらの列を一覧します。`AUTO_INCREMENT_STEP`: `auto_increment_increment` が 1 より大きく、`AUTO_INCREMENT` キーを持つテーブルがある場合です。Aurora DSQL ではそのキーの identity は 1 ずつ増えます。その他の設定 (タイムゾーン、名前の大文字小文字の扱い、文字セットと照合順序の既定値、`div_precision_increment`、`group_concat_max_len`) は記録のみで、判定しません。
-- **PostgreSQL:** 移行ユーザーの新しいセッションが接続先データベースで受け取る `TimeZone` です (DB または DB クラスターパラメータグループの値。`ALTER DATABASE` や `ALTER ROLE` の既定値があればその値)。ツールのセッションは UTC に固定されるため、専用の短い接続で読み取ります。あわせて、`ALTER DATABASE` や `ALTER ROLE` がそのデータベースに設定した各 `TimeZone` の既定値も読み取ります (アプリケーションが接続するロールは独自の値を持つことがあります)。記録のみで、判定しません。
+- **MySQL:** `sql_mode`、`time_zone`、`system_time_zone`、`explicit_defaults_for_timestamp`、`auto_increment_increment`、`auto_increment_offset`、`lower_case_table_names`、`character_set_server`、`collation_server`、`default_collation_for_utf8mb4`、`div_precision_increment`、`group_concat_max_len` の GLOBAL 値です。アプリケーションのセッションはこのグローバル値から始まり、ツール自身のセッションは独自の値を設定するためです (下記)。3 つはそれぞれデータベースレベルの **MANUAL** 項目として判定されます。`SQL_MODE`: モードに `ONLY_FULL_GROUP_BY` がない (ビューやクエリが `GROUP BY` で決まらない列を選択でき、Aurora DSQL はこれを `42803` で拒否します。ビューの場合は Schema Conversion が適用するときです)、日付列を持つテーブルがあるのにゼロや不正な日付を保存できる (`NO_ZERO_DATE` または `NO_ZERO_IN_DATE` がない、strict モードがない、または `ALLOW_INVALID_DATES`: Aurora DSQL にはそのような値がないため、それを持つ行はそのままではロードできません)、または `ANSI_QUOTES` / `PIPES_AS_CONCAT` がある (Query Converter に貼り付けるアプリケーションの SQL はそのモード向けに書かれていますが、変換は SQL を MySQL の既定のモードと同じように読み取ります) 場合です。`EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 設定が `OFF` の場合、MySQL は `NOT NULL` と宣言された `TIMESTAMP` 列に NULL が書き込まれると現在時刻を保存しますが、Aurora DSQL はその書き込みを拒否します。項目はそれらの列を一覧します。`AUTO_INCREMENT_STEP`: `auto_increment_increment` が 1 より大きく、`AUTO_INCREMENT` キーを持つテーブルがある場合です。Aurora DSQL ではそのキーの identity は 1 ずつ増えます。タイムゾーンも PostgreSQL と同様に判定されます (下記)。その他の設定 (名前の大文字小文字の扱い、文字セットと照合順序の既定値、`div_precision_increment`、`group_concat_max_len`) は記録のみで、判定しません。
+- **PostgreSQL:** 移行ユーザーの新しいセッションが接続先データベースで受け取る `TimeZone` です (DB または DB クラスターパラメータグループの値。`ALTER DATABASE` や `ALTER ROLE` の既定値があればその値)。ツールのセッションは UTC に固定されるため、専用の短い接続で読み取ります。あわせて、`ALTER DATABASE` や `ALTER ROLE` がそのデータベースに設定した各 `TimeZone` の既定値も読み取ります (アプリケーションが接続するロールは独自の値を持つことがあります)。タイムゾーンは判定されます (下記)。
+
+**ソースのタイムゾーン** (`SOURCE_TIME_ZONE`)。時計関数 — MySQL の `NOW()`、`CURRENT_TIMESTAMP`、`CURDATE()`、および `timestamp without time zone` や `date` 列に書き込まれる PostgreSQL の `now()`、`LOCALTIMESTAMP`、`CURRENT_DATE` — は セッションのタイムゾーンの壁時計を返し、`DATETIME` / `timestamp` 列はその壁時計をそのまま格納します。Full Load と CDC は、その値がどのタイムゾーンで書かれたものでも変えずにコピーします。Aurora DSQL のセッションは、別のタイムゾーンを設定しない限り UTC で動作します。そのため Evaluation が読み取ったタイムゾーン — MySQL の `time_zone` (`SYSTEM` はサーバー自身のタイムゾーンで `system_time_zone`)、PostgreSQL の `TimeZone` — が UTC でない場合、Schema Conversion は時計を読む箇所にそのタイムゾーンを書き込みます: `DATETIME` (`timestamp without time zone`) のデフォルトは `DEFAULT (now() AT TIME ZONE 'Asia/Seoul')` になり、`DATE` や `TIME` のデフォルトはその日付や時刻になり、MySQL ビューの `NOW()`、`SYSDATE()`、`CURDATE()`、`CURTIME()` はそのタイムゾーンの時計を読みます。`+09:00` のような固定オフセットは、UTC の時計にオフセットを足した `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'` として書きます: タイムゾーン名として書くと `'+09:00'` は POSIX の符号で読まれ、UTC より 9 時間西になります。`TIMESTAMP` (`timestamptz`) 列は時点 (instant) を保持するため `now()` のままで、`UTC_TIMESTAMP()` / `UTC_DATE()` は UTC のままです。PostgreSQL のビューは PostgreSQL が deparse したとおりに引き継ぐため、項目は時計を読むビューを確認できるよう一覧します。項目 (**MANUAL**) は該当する列とビュー、そしてアプリケーションがすべきことを示します: アプリケーションがセッションのタイムゾーンに依存している場合 — そのような列に `NOW()` や `CURRENT_DATE` を書き込む、またはそのような列と比較する場合 — Aurora DSQL への新しい接続ごとに `SET TIME ZONE 'Asia/Seoul'` を実行する (Aurora DSQL で許可されています) か、SQL にタイムゾーンを明示します。判別できないタイムゾーン — `KST` のような略称でしか報告されない `SYSTEM`、夏時間の規則を持つ PostgreSQL の `TimeZone`、`ALTER DATABASE` / `ALTER ROLE` の既定値は読み取れたものの短い接続では読み取れなかった `TimeZone` — はアドバイザリー項目でその旨を伝え、変換は UTC のソースと同じく UTC を前提とします。何も読み取れなかった場合は項目は表示されず、その場合も変換は UTC を前提とします。
 
 どちらの読み取りも、アプリケーションが自分で設定する値は見えません: セッションの `SET` (`SET sql_mode`、`SET time_zone`、`SET TIME ZONE`)、またはドライバーや接続文字列が接続時に送るオプションです。読み取りに失敗した場合は一覧が空になるだけで、Evaluation は失敗しません。
 
@@ -323,8 +325,12 @@ MySQL→PostgreSQL トランスパイルではありません。
 - **列のデフォルト値(MySQL ソース)** — ソースの `DEFAULT` を引き継ぎます(Aurora DSQL がサポートしており、
   `CURRENT_TIMESTAMP` **および小数秒付きの `CURRENT_TIMESTAMP(n)`**、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、
   `LOCALTIME`/`LOCALTIMESTAMP` を含みます)。2 つは自動的に変換されます: `TINYINT(1)` のデフォルトは
-  `boolean` ターゲット向けに `TRUE`/`FALSE` へ、`DATETIME` のデフォルトはローダーが書き込む naive
-  UTC の値と一致するよう UTC に固定されます。これが最も重要なのは **デフォルト値を持つ `NOT NULL`
+  `boolean` ターゲット向けに `TRUE`/`FALSE` へ、時計を読む `DATETIME` のデフォルトはソースのタイムゾーンを
+  明示します(UTC のソースなら `now() AT TIME ZONE 'UTC'`、そうでなければ Evaluation が読み取ったタイムゾーン:
+  `SOURCE_TIME_ZONE`、§2.1。`CURRENT_TIMESTAMP + INTERVAL 30 DAY` のような 1 つの単位の整数による時計の演算はその上に
+  そのまま残り、それ以外の時計の演算は下記のとおり破棄して報告されます)。
+  列はソースの壁時計を保持し、ローダーはその値をそのままコピーするためです。
+  これが最も重要なのは **デフォルト値を持つ `NOT NULL`
   列** です: MySQL はその列を省略した `INSERT` を受け付けますが、デフォルトがなければターゲットは
   同じ文を拒否します — カットオーバー後に初めて現れるアプリケーション障害です。DSQL に本当に対応が
   ないデフォルト(MySQL の `UUID()` は変換されますが、他の列を参照する式は不可)は、黙って失われる
@@ -333,7 +339,8 @@ MySQL→PostgreSQL トランスパイルではありません。
   **MANUAL** としてフラグ付けされます。**PostgreSQL ソース** では、列 DEFAULT を PostgreSQL が保存している
   テキスト(`pg_get_expr`)の **まま** 引き継ぎます。再レンダリングしないため、`CURRENT_TIME`、
   `CURRENT_TIMESTAMP(0)`、PostgreSQL 14 より前に保存された `date_part(...)`、3 引数の
-  `date_trunc(..., 'Asia/Seoul')` も変わらずに Aurora DSQL に届きます。主キーの `serial`/`IDENTITY` `nextval` は選択した主キー戦略が代わりに
+  `date_trunc(..., 'Asia/Seoul')` も変わらずに Aurora DSQL に届きます(ただしソースのタイムゾーンが UTC でなければ、
+  タイムゾーンのない列の時計のデフォルトはそのタイムゾーンを明示します: `SOURCE_TIME_ZONE`)。主キーの `serial`/`IDENTITY` `nextval` は選択した主キー戦略が代わりに
   決定し、キーでない列の `nextval`、パースできないデフォルト、DSQL にない型へキャストするデフォルト、
   DSQL にない関数(他の uuid-ossp 生成関数や `pg_catalog` 外のスキーマ修飾関数)を呼ぶデフォルトは
   注記付きで除外され Evaluation も報告します(`DEFAULT_DROPPED`)。uuid-ossp の `uuid_generate_v4()` は
@@ -366,7 +373,9 @@ MySQL→PostgreSQL トランスパイルではありません。
   トランスパイラが変換しない関数(`FIND_IN_SET`、`UNIX_TIMESTAMP`、ユーザー関数)を呼ぶビューは、両方のステップで
   MANUAL とされます(`VIEW_NOT_CONVERTED`): その関数が Aurora DSQL にない限り `CREATE VIEW` は失敗します。
   忠実な PostgreSQL の形がある MySQL の呼び出しはその形に書き換えます(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` は
-  `EXTRACT` に、`DATEDIFF`/`TO_DAYS`、`NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP` と `CURTIME()` はセッションの壁時計に、
+  `EXTRACT` に、`DATEDIFF`/`TO_DAYS`、`NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP` と `CURTIME()` はセッションの壁時計に
+  (Evaluation が読み取ったタイムゾーンが UTC でなければ、`SYSDATE()`、`CURDATE()` とともにソースのタイムゾーンの壁時計に:
+  `SOURCE_TIME_ZONE`)、
   `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` は UTC の壁時計に(MySQL と同じく精度に合わせて丸めずに切り捨てて)、`STDDEV`/`VARIANCE` は
   MySQL が計算する母集団の形に、`VAR_SAMP`/`STDDEV_SAMP` は標本の形に、`CAST(x AS CHAR [CHARSET ...])` は text に — 長さが
   あれば切り詰めるだけで埋めない `varchar(n)` に — バイナリ列はそのバイトをデコードして(`CONVERT_FROM`)、`BINARY x` は
@@ -651,8 +660,8 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | MySQL 型 | Aurora DSQL 型 | 格納される値の形式 | 分類 | 備考 |
 |---|---|---|---|---|
 | `DATE` | `date` | `date` | AUTO | |
-| `DATETIME` | `timestamp` (タイムゾーンなし) | `timestamp` (UTC wall-clock) | AUTO | **UTC** として扱われ/正規化されます。 |
-| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 小数秒はマイクロ秒まで保持されます。 |
+| `DATETIME` | `timestamp` (タイムゾーンなし) | `timestamp` (ソースの wall-clock) | AUTO | どのタイムゾーンで書かれた値でもそのままコピーされます: タイムゾーンを適用したりずらしたりしません。時計を読むデフォルトはソースのタイムゾーンを明示します(`SOURCE_TIME_ZONE`、§2.1)。 |
+| `DATETIME(6)` | `timestamp` | `timestamp` (wall-clock, microsecond precision) | AUTO | 小数秒はマイクロ秒まで保持されます。 |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 絶対的な UTC 時点として格納されます。 |
 | `TIME` | `time` (タイムゾーンなし) | `time` | MANUAL | 範囲内は `00:00:00..23:59:59`。**範囲外** の MySQL `TIME` (負の値または `> 24h`、MySQL の範囲は `-838:59:59..838:59:59`) は `time` として表現できないため **明示的に失敗** します (代わりに `interval` 列が必要です)。Evaluation もこれを示します (`TIME_TYPE`)。CDC (シンクプラグイン v54 以降) ではこのような値を interval として書き込みます: `interval` にリマップした列には格納され、`time` 列ではその理由とともにデッドレターになります。`interval` またはテキストにリマップすると、Full Load と CDC はどちらも `[-]HH:MM:SS[.f]` (時間は 24 で打ち切らない) で書き込み、Validation は期間の値を比較します。 |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL には `YEAR` 型がありません。`1901–2155` は `smallint` に収まり、整数の年として格納されます (`YEAR` の表示セマンティクスは保持されません)。 |
@@ -687,7 +696,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 | **トランザクションあたり 1 つの DDL** | Schema Conversion は実行単位ごとに正確に 1 つの DDL 文を出力します。 |
 | **`CREATE INDEX ASYNC`** | セカンダリインデックスはデータの後に非同期で作成されます。 |
 | **楽観的並行性制御** | すべてのバッチと DDL は `40001` リトライでラップされます。 |
-| **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、`DATETIME` のデフォルトはローダーが書き込む naive UTC の値と一致するよう UTC に固定され、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`CURTIME()`→`CURRENT_TIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** ソースの `DEFAULT` を PostgreSQL が保存しているテキストの **まま** 引き継ぎます(再レンダリングしません) — 除去されるのは `serial`/`IDENTITY` `nextval` と生成カラムの式だけで、identity はターゲット側で選択した PK 戦略が決定します。変換された enum 列はデフォルトをプレーンなテキストリテラルとして保持し、uuid-ossp の `uuid_generate_v4()` は `gen_random_uuid()` になります。DSQL にない別の型へキャストする、または DSQL にない関数を呼ぶデフォルトは注記付きで除外されます。 |
+| **列のデフォルト値はサポートされます** | **MySQL ソース:** ソースの `DEFAULT` を引き継ぎます(`CURRENT_TIMESTAMP[(n)]`、`NOW()`、`CURRENT_DATE`/`CURRENT_TIME`、`LOCALTIME`/`LOCALTIMESTAMP` を含む)。`TINYINT(1)` のデフォルトは `TRUE`/`FALSE` に変換され(`boolean` 列は `DEFAULT 1` を拒否します)、時計を読む `DATETIME` のデフォルトはソースのタイムゾーンを明示し(UTC のソースなら `now() AT TIME ZONE 'UTC'`。`SOURCE_TIME_ZONE`、ローダーが列の壁時計をそのままコピーするため)、関数デフォルトは変換されます(`UUID()`→`gen_random_uuid()`、`CURDATE()`→`CURRENT_DATE`、`TIME` 列の `CURTIME()`→`LOCALTIME`、`UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 式)。DSQL に対応がないデフォルト(例: 他の列を参照する式)は黙って失われるのではなく、破棄して **報告** します。デフォルトの保持が最も重要なのは `NOT NULL` 列です: MySQL はその列を省略した `INSERT` を受け付けますが、ターゲットは拒否します。 **PostgreSQL ソース:** ソースの `DEFAULT` を PostgreSQL が保存しているテキストの **まま** 引き継ぎます(再レンダリングしません。ソースのタイムゾーンが UTC でなければ、タイムゾーンのない列の時計のデフォルトはそのタイムゾーンを明示します) — 除去されるのは `serial`/`IDENTITY` `nextval` と生成カラムの式だけで、identity はターゲット側で選択した PK 戦略が決定します。変換された enum 列はデフォルトをプレーンなテキストリテラルとして保持し、uuid-ossp の `uuid_generate_v4()` は `gen_random_uuid()` になります。DSQL にない別の型へキャストする、または DSQL にない関数を呼ぶデフォルトは注記付きで除外されます。 |
 | **`ON UPDATE CURRENT_TIMESTAMP` なし** | 再現不可: DSQL には `ON UPDATE` 句も、(PostgreSQL で通常用いる回避策の)トリガーもありません。列は挿入時のデフォルトを保持し **MANUAL** としてフラグ付けされます — 更新時のタイムスタンプはアプリケーションで明示的に設定してください。 |
 | **トリガー / ストアドプロシージャ / イベントなし** | **UNSUPPORTED** としてフラグ付け — アプリケーションで再実装します (スケジュールイベントは EventBridge/Lambda で)。 |
 | **ネイティブパーティショニングなし** | DSQL が自動分散します。Schema Conversion はパーティショニングを削除し、パーティション化されたテーブルにはギャップではなく推奨事項 (パーティションに依存していたもの、CDC 中のパーティション保守の停止) が付きます。 |

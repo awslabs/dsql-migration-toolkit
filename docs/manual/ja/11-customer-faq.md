@@ -308,7 +308,7 @@ Evaluation は **すべてのオブジェクト** を、**AUTO**（自動的に�
 | `…INT UNSIGNED`（符号なし整数） | `smallint` / `integer` / `bigint` / `numeric(20,0)` | より広い型に **無損失で** 拡張。 |
 | `BIT(n)` | サイズ付き整数（`smallint`…`numeric(20,0)`） | DSQL に `BIT` 型はない。 |
 | `DECIMAL(p,s)` | `numeric(p,s)` | 精度とスケールを維持（Aurora DSQL は精度 1000 まで許可）。 |
-| `DATETIME` | `timestamp`（UTC） | UTC に正規化。 |
+| `DATETIME` | `timestamp` | 壁時計をそのままコピー(タイムゾーンのずれなし)。時計を読むデフォルトはソースのタイムゾーンを明示(`SOURCE_TIME_ZONE`)。 |
 | `ENUM` | `text` + `CHECK` | DSQL に `ENUM` はない。 |
 | `BLOB` / `BINARY` | `bytea` | 生バイトを保持。 |
 | `JSON` | `json` | |

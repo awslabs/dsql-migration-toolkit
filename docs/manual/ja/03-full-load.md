@@ -156,7 +156,8 @@ PK を要求するため、Evaluation でも `UNSUPPORTED` としてフラグ付
 
 - `TINYINT(1)` → DSQL の **boolean**(`0/1` → `false/true`)。
 - `BIT(n)` → 整数(ソースのバイト列からデコード)。
-- `DATETIME` → UTC に正規化された `timestamp`、`TIMESTAMP` → `timestamptz`。
+- `DATETIME` → `timestamp`、壁時計をそのままコピー(タイムゾーンを適用したりずらしたりしないため、別のタイムゾーンの
+  ソースはそのタイムゾーンの壁時計を保ちます: 第 2 章の `SOURCE_TIME_ZONE`)、`TIMESTAMP` → `timestamptz`、その時点。
 - `BLOB`/`BINARY`/`VARBINARY` 系 → `bytea`。
 
 **PostgreSQL ソース**では、Full Load 中に MySQL 方式の値変換は**行われません**。両端がともに

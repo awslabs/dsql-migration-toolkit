@@ -39,8 +39,10 @@ PostgreSQL 소스에서는 Evaluation이 인벤토리에 없는 두 가지도 �
 
 Evaluation은 소스의 **서버 설정**도 한 번 읽습니다(설정만 읽으며 테이블은 스캔하지 않습니다). 읽은 설정은 리포트의 소스 객체 수 아래(**Source server settings**, 접힌 상태)에 보여 줍니다. 이 설정은 테이블 정의에는 드러나지 않는, 애플리케이션이 실행되는 조건을 알려 줍니다.
 
-- **MySQL:** `sql_mode`, `time_zone`, `system_time_zone`, `explicit_defaults_for_timestamp`, `auto_increment_increment`, `auto_increment_offset`, `lower_case_table_names`, `character_set_server`, `collation_server`, `default_collation_for_utf8mb4`, `div_precision_increment`, `group_concat_max_len`의 GLOBAL 값입니다. 애플리케이션 세션은 이 전역 값에서 시작하고, 도구 자신의 세션은 자기 값을 따로 설정하기 때문입니다(아래 참고). 세 가지는 각각 데이터베이스 수준의 **MANUAL** 항목으로 평가됩니다. `SQL_MODE`: 모드에 `ONLY_FULL_GROUP_BY`가 없거나(그러면 뷰나 쿼리가 `GROUP BY`로 정해지지 않는 컬럼을 선택할 수 있고, Aurora DSQL은 이를 `42803`으로 거부합니다. 뷰라면 Schema Conversion이 적용할 때입니다), 날짜 컬럼을 가진 테이블이 있는데 0이거나 잘못된 날짜를 저장할 수 있거나(`NO_ZERO_DATE` 또는 `NO_ZERO_IN_DATE` 없음, strict 모드 없음, 또는 `ALLOW_INVALID_DATES`: Aurora DSQL에는 그런 값이 없으므로 그런 값을 가진 행은 그대로 로드할 수 없습니다), `ANSI_QUOTES` / `PIPES_AS_CONCAT`이 있을 때입니다(Query Converter에 붙여 넣는 애플리케이션 SQL은 그 모드로 작성되어 있지만, 변환기는 SQL을 MySQL 기본 모드처럼 읽습니다). `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 설정이 `OFF`이면 MySQL은 `NOT NULL`로 선언된 `TIMESTAMP` 컬럼에 NULL을 쓸 때 현재 시각을 저장하는데, Aurora DSQL은 그 쓰기를 거부합니다. 항목이 해당 컬럼을 나열합니다. `AUTO_INCREMENT_STEP`: `auto_increment_increment`가 1보다 크고 `AUTO_INCREMENT` 키를 가진 테이블이 있을 때입니다. Aurora DSQL에서 그 키의 identity는 1씩 증가합니다. 나머지 설정(시간대, 이름의 대소문자 처리, 문자 집합과 collation 기본값, `div_precision_increment`, `group_concat_max_len`)은 기록만 하고 평가하지 않습니다.
-- **PostgreSQL:** 마이그레이션 사용자의 새 세션이 연결된 데이터베이스에서 받는 `TimeZone`입니다(DB 또는 DB 클러스터 파라미터 그룹의 값이며, `ALTER DATABASE`나 `ALTER ROLE` 기본값이 있으면 그 값). 도구의 세션은 UTC로 고정되므로 별도의 짧은 연결로 읽습니다. 또한 `ALTER DATABASE`나 `ALTER ROLE`이 그 데이터베이스에 설정한 각 `TimeZone` 기본값도 읽습니다(애플리케이션이 연결하는 역할은 자기 값을 가질 수 있습니다). 기록만 하고 평가하지 않습니다.
+- **MySQL:** `sql_mode`, `time_zone`, `system_time_zone`, `explicit_defaults_for_timestamp`, `auto_increment_increment`, `auto_increment_offset`, `lower_case_table_names`, `character_set_server`, `collation_server`, `default_collation_for_utf8mb4`, `div_precision_increment`, `group_concat_max_len`의 GLOBAL 값입니다. 애플리케이션 세션은 이 전역 값에서 시작하고, 도구 자신의 세션은 자기 값을 따로 설정하기 때문입니다(아래 참고). 세 가지는 각각 데이터베이스 수준의 **MANUAL** 항목으로 평가됩니다. `SQL_MODE`: 모드에 `ONLY_FULL_GROUP_BY`가 없거나(그러면 뷰나 쿼리가 `GROUP BY`로 정해지지 않는 컬럼을 선택할 수 있고, Aurora DSQL은 이를 `42803`으로 거부합니다. 뷰라면 Schema Conversion이 적용할 때입니다), 날짜 컬럼을 가진 테이블이 있는데 0이거나 잘못된 날짜를 저장할 수 있거나(`NO_ZERO_DATE` 또는 `NO_ZERO_IN_DATE` 없음, strict 모드 없음, 또는 `ALLOW_INVALID_DATES`: Aurora DSQL에는 그런 값이 없으므로 그런 값을 가진 행은 그대로 로드할 수 없습니다), `ANSI_QUOTES` / `PIPES_AS_CONCAT`이 있을 때입니다(Query Converter에 붙여 넣는 애플리케이션 SQL은 그 모드로 작성되어 있지만, 변환기는 SQL을 MySQL 기본 모드처럼 읽습니다). `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 설정이 `OFF`이면 MySQL은 `NOT NULL`로 선언된 `TIMESTAMP` 컬럼에 NULL을 쓸 때 현재 시각을 저장하는데, Aurora DSQL은 그 쓰기를 거부합니다. 항목이 해당 컬럼을 나열합니다. `AUTO_INCREMENT_STEP`: `auto_increment_increment`가 1보다 크고 `AUTO_INCREMENT` 키를 가진 테이블이 있을 때입니다. Aurora DSQL에서 그 키의 identity는 1씩 증가합니다. 시간대도 PostgreSQL과 마찬가지로 평가됩니다(아래 참고). 나머지 설정(이름의 대소문자 처리, 문자 집합과 collation 기본값, `div_precision_increment`, `group_concat_max_len`)은 기록만 하고 평가하지 않습니다.
+- **PostgreSQL:** 마이그레이션 사용자의 새 세션이 연결된 데이터베이스에서 받는 `TimeZone`입니다(DB 또는 DB 클러스터 파라미터 그룹의 값이며, `ALTER DATABASE`나 `ALTER ROLE` 기본값이 있으면 그 값). 도구의 세션은 UTC로 고정되므로 별도의 짧은 연결로 읽습니다. 또한 `ALTER DATABASE`나 `ALTER ROLE`이 그 데이터베이스에 설정한 각 `TimeZone` 기본값도 읽습니다(애플리케이션이 연결하는 역할은 자기 값을 가질 수 있습니다). 시간대는 평가됩니다(아래 참고).
+
+**소스의 시간대** (`SOURCE_TIME_ZONE`). 시계 함수 — MySQL의 `NOW()`, `CURRENT_TIMESTAMP`, `CURDATE()`, 그리고 `timestamp without time zone`이나 `date` 컬럼에 쓰이는 PostgreSQL의 `now()`, `LOCALTIMESTAMP`, `CURRENT_DATE` — 는 세션 시간대의 벽시계를 돌려주고, `DATETIME` / `timestamp` 컬럼은 그 벽시계를 그대로 저장합니다. Full Load와 CDC는 그 값이 어느 시간대로 쓰였든 바꾸지 않고 복사합니다. Aurora DSQL 세션은 다른 시간대를 설정하지 않는 한 UTC로 실행됩니다. 그래서 Evaluation이 읽은 시간대 — MySQL의 `time_zone`(`SYSTEM`은 서버 자체의 시간대, `system_time_zone`), PostgreSQL의 `TimeZone` — 가 UTC가 아니면 Schema Conversion은 시계를 읽는 곳에 그 시간대를 써 넣습니다: `DATETIME`(`timestamp without time zone`) 기본값은 `DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`이 되고, `DATE`나 `TIME` 기본값은 그 날짜나 시각이 되며, MySQL 뷰의 `NOW()`, `SYSDATE()`, `CURDATE()`, `CURTIME()`은 그 시간대의 시계를 읽습니다. `+09:00` 같은 고정 오프셋은 UTC 시계에 오프셋을 더한 `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`으로 씁니다: 시간대 이름으로 쓰면 `'+09:00'`은 POSIX 부호로 읽혀 UTC보다 9시간 서쪽이 됩니다. `TIMESTAMP`(`timestamptz`) 컬럼은 시점(instant)을 담으므로 `now()`를 유지하고, `UTC_TIMESTAMP()` / `UTC_DATE()`는 UTC 그대로입니다. PostgreSQL 뷰는 PostgreSQL이 deparse한 그대로 가져오므로, 항목은 시계를 읽는 뷰를 검토할 수 있도록 나열합니다. 항목(**MANUAL**)은 해당 컬럼과 뷰, 그리고 애플리케이션이 할 일을 알려 줍니다: 애플리케이션이 세션 시간대에 의존한다면 — 그런 컬럼에 `NOW()`나 `CURRENT_DATE`를 쓰거나 그런 컬럼과 비교한다면 — 새 Aurora DSQL 연결마다 `SET TIME ZONE 'Asia/Seoul'`을 실행하거나(Aurora DSQL에서 허용됩니다) SQL에 시간대를 직접 씁니다. 판별할 수 없는 시간대 — `KST` 같은 약어로만 보고되는 `SYSTEM`, 서머타임 규칙이 있는 PostgreSQL `TimeZone`, `ALTER DATABASE` / `ALTER ROLE` 기본값은 읽었지만 짧은 연결로는 읽지 못한 `TimeZone` — 는 권고 항목으로 그렇다고 알리며, 변환은 UTC 소스와 마찬가지로 UTC를 가정합니다. 아무것도 읽지 못했다면 항목은 표시되지 않으며, 이때도 변환은 UTC를 가정합니다.
 
 어느 쪽의 읽기도 애플리케이션이 스스로 설정하는 값은 볼 수 없습니다: 세션의 `SET`(`SET sql_mode`, `SET time_zone`, `SET TIME ZONE`), 또는 드라이버나 연결 문자열이 연결할 때 보내는 옵션입니다. 읽기에 실패하면 목록이 비어 있을 뿐이며, Evaluation이 실패하지는 않습니다.
 
@@ -304,8 +306,12 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
 - **컬럼 기본값(MySQL 소스)** — 소스 `DEFAULT`를 그대로 가져옵니다(Aurora DSQL이 지원하며,
   `CURRENT_TIMESTAMP` **및 소수초 `CURRENT_TIMESTAMP(n)`**, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`,
   `LOCALTIME`/`LOCALTIMESTAMP` 포함). 두 가지는 자동 변환됩니다: `TINYINT(1)` 기본값은 `boolean`
-  타깃에 맞게 `TRUE`/`FALSE`로, `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 일치하도록 UTC로
-  고정됩니다. 이것이 가장 중요한 경우는 **기본값이 있는 `NOT NULL` 컬럼**입니다: MySQL은 그 컬럼을
+  타깃에 맞게 `TRUE`/`FALSE`로, 시계를 읽는 `DATETIME` 기본값은 소스의 시간대를 명시합니다(UTC
+  소스라면 `now() AT TIME ZONE 'UTC'`, 아니면 Evaluation이 읽은 시간대: `SOURCE_TIME_ZONE`, §2.1.
+  `CURRENT_TIMESTAMP + INTERVAL 30 DAY`처럼 한 단위의 정수로 된 시계 연산은 그 위에 그대로 유지하고, 그 밖의
+  시계 연산은 아래처럼 드롭 + 보고). 컬럼이 소스의 벽시계를
+  담고 로더가 그 값을 그대로 복사하기 때문입니다. 이것이 가장 중요한 경우는
+  **기본값이 있는 `NOT NULL` 컬럼**입니다: MySQL은 그 컬럼을
   생략한 `INSERT`를 받아주지만, 기본값이 없으면 타깃은 같은 문장을 거부합니다 — 컷오버 후에야
   드러나는 애플리케이션 장애입니다. DSQL에 대응이 정말 없는 기본값은(MySQL `UUID()`는 변환되지만
   다른 컬럼을 참조하는 표현식은 불가) 조용히 사라지지 않고 드롭 + **보고**됩니다.
@@ -313,7 +319,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   없습니다 — 따라서 애플리케이션이 처리하도록 **MANUAL**로 표시됩니다. **PostgreSQL 소스**에서는
   컬럼 DEFAULT를 PostgreSQL이 저장한 텍스트(`pg_get_expr`) **그대로** 가져옵니다. 다시 렌더링하지
   않으므로 `CURRENT_TIME`, `CURRENT_TIMESTAMP(0)`, PostgreSQL 14 이전에 저장된 `date_part(...)`, 인자가
-  3개인 `date_trunc(..., 'Asia/Seoul')`도 바뀌지 않고 Aurora DSQL에 도달합니다. 기본 키의 `serial`/`IDENTITY`
+  3개인 `date_trunc(..., 'Asia/Seoul')`도 바뀌지 않고 Aurora DSQL에 도달합니다(다만 소스의 시간대가 UTC가
+  아니면, 시간대 없는 컬럼의 시계 기본값은 그 시간대를 명시합니다: `SOURCE_TIME_ZONE`). 기본 키의 `serial`/`IDENTITY`
   `nextval`은 선택한 기본 키 전략이 대신 좌우하고, 키가 아닌 컬럼의 `nextval`, 파싱되지 않는 기본값,
   DSQL에 없는 타입으로 캐스팅하는 기본값, DSQL에 없는 함수(다른 uuid-ossp 생성 함수나 `pg_catalog` 밖의
   스키마 한정 함수)를 호출하는 기본값은 노트와 함께 제외되고 Evaluation도 보고하며(`DEFAULT_DROPPED`),
@@ -350,7 +357,8 @@ PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, 사용자 함수)를 호출하는 뷰는 두 단계 모두에서 MANUAL로 표시됩니다
   (`VIEW_NOT_CONVERTED`): 그 함수가 Aurora DSQL에 없으면 `CREATE VIEW`가 실패합니다. 충실한 PostgreSQL 형태가 있는
   MySQL 호출은 그것으로 다시 씁니다(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()`는 `EXTRACT`로, `DATEDIFF`/`TO_DAYS`,
-  `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP`와 `CURTIME()`은 세션의 벽시계로, `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()`은
+  `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP`와 `CURTIME()`은 세션의 벽시계로(Evaluation이 읽은 시간대가 UTC가 아니면
+  `SYSDATE()`, `CURDATE()`와 함께 소스 시간대의 벽시계로: `SOURCE_TIME_ZONE`), `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()`은
   UTC 벽시계로(MySQL처럼 정밀도에 맞춰 반올림이 아니라 잘라서), `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로,
   `VAR_SAMP`/`STDDEV_SAMP`는 표본 형태로, `CAST(x AS CHAR [CHARSET ...])`는 text로 — 길이가 있으면 자르기만 하고 채우지
   않는 `varchar(n)`으로 — 바이너리 컬럼은 그 바이트를 디코딩해서(`CONVERT_FROM`), `BINARY x`는 그 바이트로(비교에서는
@@ -636,8 +644,8 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
 |---|---|---|---|---|
 | `DATE` | `date` | `date` | AUTO | |
-| `DATETIME` | `timestamp`(시간대 없음) | `timestamp` (UTC wall-clock) | AUTO | **UTC**로 취급/정규화. |
-| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | 소수 초를 마이크로초까지 보존. |
+| `DATETIME` | `timestamp`(시간대 없음) | `timestamp` (소스의 wall-clock) | AUTO | 어느 시간대로 쓰였든 그대로 복사: 시간대를 적용하거나 옮기지 않습니다. 시계를 읽는 기본값은 소스의 시간대를 명시합니다(`SOURCE_TIME_ZONE`, §2.1). |
+| `DATETIME(6)` | `timestamp` | `timestamp` (wall-clock, microsecond precision) | AUTO | 소수 초를 마이크로초까지 보존. |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 절대 UTC 시각으로 저장. |
 | `TIME` | `time`(시간대 없음) | `time` | MANUAL | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). Evaluation도 이를 표시합니다(`TIME_TYPE`). CDC(싱크 플러그인 v54 이상)에서는 이런 값을 interval로 씁니다: `interval`로 리매핑한 컬럼에는 저장되고, `time` 컬럼에서는 그 이유와 함께 dead-letter 처리됩니다. `interval`이나 텍스트로 리매핑하면 Full Load와 CDC가 모두 `[-]HH:MM:SS[.f]`(시간은 24에서 끊지 않음)로 쓰고 Validation은 기간 값을 비교합니다. |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL에 `YEAR` 타입 없음; `1901–2155`가 `smallint`에 들어가며 정수 연도로 저장(`YEAR` 표시 의미는 보존 안 됨). |
@@ -672,7 +680,7 @@ CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract*
 | **트랜잭션당 한 개 DDL** | 스키마 변환은 실행 단위당 정확히 한 개 DDL 문을 내보냄. |
 | **`CREATE INDEX ASYNC`** | 보조 인덱스를 데이터 적재 후 비동기로 생성. |
 | **낙관적 동시성** | 모든 배치·DDL을 `40001` 재시도로 감쌈. |
-| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), `DATETIME` 기본값은 로더가 쓰는 naive UTC 값과 맞도록 UTC로 고정하며, 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 PostgreSQL이 저장한 텍스트 **그대로** 가져옵니다(다시 렌더링하지 않음) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고 uuid-ossp의 `uuid_generate_v4()`는 `gen_random_uuid()`가 되며, DSQL에 없는 다른 타입으로 캐스팅하거나 DSQL에 없는 함수를 호출하는 기본값은 노트와 함께 제외됩니다. |
+| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), 시계를 읽는 `DATETIME` 기본값은 소스의 시간대를 명시하며(UTC 소스라면 `now() AT TIME ZONE 'UTC'`; `SOURCE_TIME_ZONE`, 로더가 컬럼의 벽시계를 그대로 복사하므로), 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `TIME` 컬럼의 `CURTIME()`→`LOCALTIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 PostgreSQL이 저장한 텍스트 **그대로** 가져옵니다(다시 렌더링하지 않음. 소스의 시간대가 UTC가 아니면 시간대 없는 컬럼의 시계 기본값은 그 시간대를 명시) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고 uuid-ossp의 `uuid_generate_v4()`는 `gen_random_uuid()`가 되며, DSQL에 없는 다른 타입으로 캐스팅하거나 DSQL에 없는 함수를 호출하는 기본값은 노트와 함께 제외됩니다. |
 | **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
 | **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
 | **네이티브 파티셔닝 없음** | DSQL이 자동 분산; Schema Conversion이 파티셔닝을 제거하며, 파티션 테이블에는 갭이 아니라 권장사항(파티션에 의존하던 것, CDC 중 파티션 관리 중지)이 붙음. |

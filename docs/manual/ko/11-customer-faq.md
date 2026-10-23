@@ -328,7 +328,7 @@ Evaluation 단계가 **모든 객체**를 세 등급으로 분류해 알려 줍�
 | `…INT UNSIGNED` (unsigned 정수) | `smallint` / `integer` / `bigint` / `numeric(20,0)` | 더 넓은 타입으로 **무손실 확장**. |
 | `BIT(n)` | 크기별 정수(`smallint`~`numeric(20,0)`) | DSQL에 `BIT` 타입 없음. |
 | `DECIMAL(p,s)` | `numeric(p,s)` | 정밀도·스케일 유지(Aurora DSQL은 정밀도 1000까지 허용). |
-| `DATETIME` | `timestamp` (UTC) | UTC로 정규화. |
+| `DATETIME` | `timestamp` | 벽시계를 그대로 복사(시간대 이동 없음). 시계를 읽는 기본값은 소스의 시간대를 명시(`SOURCE_TIME_ZONE`). |
 | `ENUM` | `text` + `CHECK` | DSQL에 `ENUM` 없음. |
 | `BLOB` / `BINARY` | `bytea` | 원시 바이트 보존. |
 | `JSON` | `json` | |

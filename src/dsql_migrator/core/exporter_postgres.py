@@ -10,7 +10,7 @@ pass-through**: psycopg returns native Python types (``int``/``Decimal``/``float
 ``bool``/``bytes``/``uuid.UUID``/``date``/``time``/``datetime``/``timedelta``, and Python
 ``list`` for arrays) that bind straight back to the same PostgreSQL type on the DSQL
 target with psycopg's default dumpers -- no conversion needed (unlike MySQL, which must
-translate ``TINYINT(1)``->bool, ``BLOB``->bytea, ``DATETIME``->naive UTC, ``TIME``
+translate ``TINYINT(1)``->bool, ``BLOB``->bytea, ``DATETIME``->a naive wall clock, ``TIME``
 timedelta->time, ``BIT`` bytes->int). The session is pinned to UTC
 (``PostgresSourceDialect.engine_kwargs``) so ``timestamptz`` needs no normalization.
 

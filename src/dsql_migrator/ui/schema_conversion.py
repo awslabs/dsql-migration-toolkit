@@ -85,6 +85,7 @@ from dsql_migrator.core.converter import (
     without_composite_placeholder,
 )
 from dsql_migrator.core.assessor import kind_label
+from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
 from dsql_migrator.core.models import (
     AssessmentReport,
     Classification,
@@ -3943,8 +3944,12 @@ def _render_browser_and_preview(
                     refresh,
                     source_type=source_type,
                     # The re-conversion must emit the same (renamed) index names as the
-                    # whole-inventory conversion, or it would bring the collision back.
+                    # whole-inventory conversion, or it would bring the collision back --
+                    # and the same clock defaults, in the source's time zone (G149).
                     index_names=conversion_result.index_renames.get(source_table.name),
+                    source_zone=resolve_source_zone(
+                        getattr(inventory, "server_settings", None) or {}, source_type
+                    ),
                 )
             _render_preview(
                 ui,
@@ -4048,6 +4053,7 @@ def _render_pk_strategy_picker(
     *,
     source_type: SourceType = SourceType.MYSQL,
     index_names: "Optional[Mapping[str, str]]" = None,
+    source_zone: "Optional[SourceZone]" = None,
 ) -> None:
     """Per-table primary-key strategy picker (Keep / Server-generated / Composite).
 
@@ -4082,6 +4088,9 @@ def _render_pk_strategy_picker(
     source's integer ids (an int->uuid insert fails), so it would steer a data
     migration into a broken load. It remains reachable via manual DDL edit for a
     schema-only / greenfield case.
+
+    ``source_zone`` is the source's time zone the whole conversion wrote clock defaults in
+    (G149): the stored script is re-converted with it, so it keeps those defaults.
     """
     # Only tables with a primary key can have a monotonic-key hot partition to fix.
     if not table.primary_key:
@@ -4123,7 +4132,7 @@ def _render_pk_strategy_picker(
         # that contradicts the DDL beside it.
         identity_from_ddl(table, stored) if stored is not None else identity_by_default
     )
-    converter = SchemaConverter(source_type=source_type)
+    converter = SchemaConverter(source_type=source_type, source_zone=source_zone)
 
     def _store_composite(leading: str) -> bool:
         """Store the composite script for ``leading`` -- never the comment a refused key

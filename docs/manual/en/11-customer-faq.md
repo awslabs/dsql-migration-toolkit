@@ -339,7 +339,7 @@ For a **MySQL source**, here are the highlights:
 | `…INT UNSIGNED` (unsigned integers) | `smallint` / `integer` / `bigint` / `numeric(20,0)` | Widened **losslessly** to a wider type. |
 | `BIT(n)` | sized integer (`smallint`…`numeric(20,0)`) | DSQL has no `BIT` type. |
 | `DECIMAL(p,s)` | `numeric(p,s)` | Precision and scale kept (Aurora DSQL allows precision up to 1000). |
-| `DATETIME` | `timestamp` (UTC) | Normalized to UTC. |
+| `DATETIME` | `timestamp` | Wall clock copied as it is, no zone shift; a default that reads the clock names the source's time zone (`SOURCE_TIME_ZONE`). |
 | `ENUM` | `text` + `CHECK` | DSQL has no `ENUM`. |
 | `BLOB` / `BINARY` | `bytea` | Raw bytes preserved. |
 | `JSON` | `json` | |

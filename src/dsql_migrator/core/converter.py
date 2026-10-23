@@ -94,6 +94,7 @@ from dsql_migrator.core.models import (
     TableDef,
     ViewDef,
 )
+from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
 
 # Cache size applied to an identity primary key under the IDENTITY_WITH_CACHE
 # strategy. A per-node cache hands out blocks of values so concurrent inserts do
@@ -1513,7 +1514,8 @@ def map_data_type(data_type: exp.DataType) -> Optional[_Mapping]:
         return _Mapping(target=_build("numeric"))
 
     if kind is _DType.DATETIME:
-        # Lossless value mapping; values are treated as UTC.
+        # Lossless value mapping: the wall clock is copied as it is, in whatever zone the
+        # source wrote it (a clock default names that zone: _zoned_clock_default, G149).
         return _Mapping(target=_build("timestamp"))
 
     if kind is _DType.TIME:
@@ -2458,6 +2460,96 @@ _TRANSLATED_EXPRESSION_DEFAULTS: dict[str, str] = {
     "UTC_DATE()": "((now() AT TIME ZONE 'UTC')::date)",
 }
 
+# The clock defaults carried above, by what they read (G149): the date and time (NOW() and
+# its synonyms), the date (CURDATE()) or the time of day (CURTIME()) of the SESSION's zone.
+# Only defaults those maps carry, so the zone never decides whether one is dropped.
+_NOW_CLOCK_DEFAULTS = frozenset(
+    {"CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP()", "NOW()", "LOCALTIME", "LOCALTIMESTAMP"}
+)
+_DATE_CLOCK_DEFAULTS = frozenset({"CURRENT_DATE", "CURDATE()", "CURDATE"})
+_TIME_CLOCK_DEFAULTS = frozenset({"CURRENT_TIME", "CURTIME()", "CURTIME"})
+# CURRENT_TIMESTAMP(n) / NOW(n), fractional seconds (canonical: upper case, no spaces). The
+# WHOLE default: as a prefix it took ``now() + interval 30 day`` for a bare clock.
+_FSP_CLOCK_RE = re.compile(r"(?:CURRENT_TIMESTAMP|NOW)\(\d?\)")
+# A clock default with date arithmetic after it, as information_schema reports MySQL 8's
+# ``DEFAULT (CURRENT_TIMESTAMP + INTERVAL 30 DAY)``: ``now() + interval 30 day``. Each term
+# a whole number of one unit, which the transpile writes as PostgreSQL computes it
+# (INTERVAL '30 DAY'). Not a composite unit -- ``interval '1:30' hour_minute`` becomes
+# INTERVAL '1:30 HOUR_MINUTE', which fails the whole CREATE TABLE -- nor a fraction, which
+# MySQL rounds to a whole number of the unit (1.5 hour is 2 hours) and PostgreSQL keeps:
+# such a default is dropped with its note.
+_CLOCK_INTERVAL_TERM = (
+    r"\s*[-+]\s*interval\s+(?:\d+|'\d+')\s+"
+    r"(?:microsecond|second|minute|hour|day|week|month|quarter|year)\b"
+)
+_CLOCK_ARITHMETIC_RE = re.compile(
+    r"\s*(?:now\s*\(\s*\d?\s*\)|current_timestamp(?:\s*\(\s*\d?\s*\))?"
+    r"|localtimestamp(?:\s*\(\s*\d?\s*\))?|localtime(?:\s*\(\s*\d?\s*\))?)"
+    rf"(?P<rest>(?:{_CLOCK_INTERVAL_TERM})+)\s*",
+    re.IGNORECASE,
+)
+
+
+def _zoned_clock_default(
+    canonical: str, target: str, zone: "Optional[SourceZone]"
+) -> Optional[str]:
+    """The source zone's clock for a clock default on a target without a time zone (G149),
+    or ``None`` to leave the default to :func:`_column_default_sql`.
+
+    MySQL computes such a default in the session's ``time_zone`` -- the source's, Evaluation
+    read it -- and a DATETIME / DATE / TIME column stores the wall clock it returns, which
+    Full Load and CDC copy unchanged. An Aurora DSQL session's zone is UTC unless it sets
+    another, so under a source zone that is not UTC the default names that zone: a DATETIME
+    gets ``(now() AT TIME ZONE 'Asia/Seoul')`` (a fixed offset the INTERVAL form,
+    :meth:`SourceZone.clock_sql`), a DATE its date, a TIME its time of day. A TIMESTAMP
+    column (timestamptz) holds an instant and keeps ``now()``. Without a zone only a TIME
+    column's CURTIME() is written here, as ``LOCALTIME``: the transpile renders
+    CURRENT_TIME as ``CURRENT_TIME()``, which PostgreSQL rejects."""
+    if canonical in _NOW_CLOCK_DEFAULTS or _FSP_CLOCK_RE.fullmatch(canonical):
+        reads = "timestamp"
+    elif canonical in _DATE_CLOCK_DEFAULTS:
+        reads = "date"
+    elif canonical in _TIME_CLOCK_DEFAULTS:
+        reads = "time"
+    else:
+        return None
+    base = target.split("(", 1)[0].strip()
+    if base == "time" and reads != "date":
+        if zone is not None:
+            return zone.time_sql()
+        return "LOCALTIME" if reads == "time" else None
+    if zone is None:
+        return None
+    if base == "date" or (base == "timestamp" and reads == "date"):
+        return zone.date_sql()
+    if base == "timestamp" and reads == "timestamp":
+        return zone.clock_sql()
+    return None
+
+
+def _shifted_clock_default(
+    expression: str, target: str, zone: "Optional[SourceZone]"
+) -> Optional[str]:
+    """A clock default with date arithmetic -- ``now() + interval 30 day`` -- as the target
+    computes it, or ``None`` when ``expression`` is not one (:data:`_CLOCK_ARITHMETIC_RE`:
+    other arithmetic is dropped with its note, whatever the zone).
+
+    The arithmetic is carried as written (the transpile writes the interval), from the clock
+    a bare default of the column gets: on a DATETIME (``timestamp``) the source zone's wall
+    clock, the UTC one without a zone (:func:`_zoned_clock_default`); on a DATE the source
+    zone's, whose date the column keeps; on any other column -- a TIMESTAMP's instant --
+    the expression itself. A prefix match took such a default for its bare clock: a
+    DATETIME DEFAULT (CURRENT_TIMESTAMP + INTERVAL 30 DAY) became now() AT TIME ZONE 'UTC'."""
+    shifted = _CLOCK_ARITHMETIC_RE.fullmatch(expression)
+    if shifted is None:
+        return None
+    base = target.split("(", 1)[0].strip()
+    if base == "timestamp" or (base == "date" and zone is not None):
+        clock = zone.clock_sql() if zone is not None else "(now() AT TIME ZONE 'UTC')"
+        return f"({clock}{shifted.group('rest')})"
+    return expression
+
+
 def _strip_on_update(default: str) -> str:
     """Drop a trailing ``ON UPDATE <expr>`` from a reflected default.
 
@@ -2724,9 +2816,16 @@ def _binary_default_sql(column: ColumnDef) -> "Optional[tuple[Optional[str], Opt
 
 
 def _column_default_sql(
-    column: ColumnDef, target_type: str, enum_values: Optional[list[str]] = None
+    column: ColumnDef,
+    target_type: str,
+    enum_values: Optional[list[str]] = None,
+    *,
+    zone: "Optional[SourceZone]" = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Return ``(default_sql, warning)`` for a column's MySQL default.
+
+    ``zone`` is the source's time zone when it is known and not UTC (G149): a clock default
+    on a column without a time zone is then written in it (:func:`_zoned_clock_default`).
 
     ``default_sql`` is the text to place after ``DEFAULT`` in the generated MySQL DDL,
     which sqlglot then transpiles with the rest of the statement. ``None`` means emit no
@@ -2827,12 +2926,19 @@ def _column_default_sql(
     if column.default_is_expression:
         expression = _unwrap_expression_default(raw)
         canonical = expression.upper().replace(" ", "")
+        zoned = _zoned_clock_default(canonical, target, zone) or _shifted_clock_default(
+            expression, target, zone
+        )
+        if zoned is not None:
+            return zoned, None
         if canonical in {v.replace(" ", "") for v in _PASSTHROUGH_EXPRESSION_DEFAULTS} or (
-            canonical.startswith("CURRENT_TIMESTAMP(") or canonical.startswith("NOW(")
+            _FSP_CLOCK_RE.fullmatch(canonical)
         ):
             # A no-timezone target (MySQL DATETIME -> `timestamp`) must not inherit the
-            # session TimeZone: the loader normalizes migrated rows to naive UTC, so the
-            # default is the naive-UTC wall-clock `now() AT TIME ZONE 'UTC'`.
+            # session TimeZone: the loader copies a DATETIME's wall clock as it is, which
+            # for a source in UTC is the UTC wall clock, so the default is the naive-UTC
+            # wall-clock `now() AT TIME ZONE 'UTC'`. A source in another zone gets that
+            # zone's instead (_zoned_clock_default, above).
             #
             # A timestamptz target (MySQL TIMESTAMP) must NOT get that: `now() AT TIME
             # ZONE 'UTC'` is a naive value, which a timestamptz column re-interprets in
@@ -2968,6 +3074,7 @@ def _column_default_sql(
 
 def _resolve_column_default(
     column: ColumnDef,
+    zone: "Optional[SourceZone]" = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Resolve a column's emitted DEFAULT against its MAPPED target type.
 
@@ -2975,7 +3082,9 @@ def _resolve_column_default(
     boolean while ``tinyint(1) unsigned`` becomes smallint, ``bit`` becomes an integer and
     ``blob`` becomes bytea -- so the type mapping is run first and its result drives the
     translation. Used by both the DDL builder and the warning pass so the two can never
-    disagree about what was emitted.
+    disagree about what was emitted. ``zone`` is the source's time zone (G149), which only
+    the text of a clock default depends on -- never whether a default is carried, so the
+    warning pass needs none.
     """
     # A column with no default (or a generated column, whose value is computed) resolves to
     # nothing -- return before the type re-parse below. map_mysql_type parses the type via
@@ -2985,13 +3094,20 @@ def _resolve_column_default(
     if column.generated or column.default is None:
         return None, None
     return _resolved_mysql_default(
-        column.mysql_type, column.default, bool(column.default_is_expression)
+        column.mysql_type,
+        column.default,
+        bool(column.default_is_expression),
+        # UTC and an unknown zone write nothing: they share the zone-less entries.
+        zone if zone is not None and zone.shifts else None,
     )
 
 
 @functools.lru_cache(maxsize=16384)
 def _resolved_mysql_default(
-    mysql_type: str, default: str, default_is_expression: bool
+    mysql_type: str,
+    default: str,
+    default_is_expression: bool,
+    zone: "Optional[SourceZone]" = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """:func:`_resolve_column_default` by its inputs. Cached: Evaluation's DEFAULT_DROPPED
     and Schema Conversion resolve every default of every table, each with a sqlglot type
@@ -3017,10 +3133,10 @@ def _resolved_mysql_default(
                 enum_values = list(_enum_values(parsed))
         except Exception:  # noqa: BLE001 - enum detection is advisory
             enum_values = None
-    return _column_default_sql(column, target_type, enum_values)
+    return _column_default_sql(column, target_type, enum_values, zone=zone)
 
 
-def _build_source_ddl(table: TableDef) -> str:
+def _build_source_ddl(table: TableDef, *, zone: "Optional[SourceZone]" = None) -> str:
     """Build a MySQL ``CREATE TABLE`` string for ``table`` (columns + PK).
 
     Identifiers are quoted via ``sqlglot`` to avoid injection (Requirement 9.4).
@@ -3030,7 +3146,8 @@ def _build_source_ddl(table: TableDef) -> str:
     intentionally not emitted here: foreign keys are rendered separately as
     post-load ``ALTER TABLE ... ADD CONSTRAINT`` statements and indexes as
     ``CREATE INDEX ASYNC`` (by the caller). Raises ``ValueError`` if the table has
-    no columns.
+    no columns. ``zone`` is the source's time zone, which its clock defaults are written
+    in (G149; :func:`_zoned_clock_default`).
     """
     if not table.columns:
         raise ValueError(f"table {table.name!r} has no columns to convert")
@@ -3049,7 +3166,7 @@ def _build_source_ddl(table: TableDef) -> str:
         # AUTO_INCREMENT column, which becomes GENERATED BY DEFAULT AS IDENTITY -- an
         # identity column carrying a DEFAULT is rejected by PostgreSQL.
         if column.name != table.auto_increment_column:
-            default_sql, _warning = _resolve_column_default(column)
+            default_sql, _warning = _resolve_column_default(column, zone)
             if default_sql is not None:
                 clause += f" DEFAULT {default_sql}"
         column_clauses.append(clause)
@@ -4826,6 +4943,42 @@ def dropped_default_notes(
     return notes
 
 
+def zoned_default_columns(
+    table: TableDef, zone: "Optional[SourceZone]", *, is_postgres: bool
+) -> "list[str]":
+    """The columns of ``table`` whose DEFAULT the conversion writes in the source's time
+    ``zone`` (G149): a clock default on a column without a time zone -- what
+    :func:`_zoned_clock_default` (MySQL) or :func:`~dsql_migrator.core.converter_postgres.
+    pg_zoned_clock_default` (PostgreSQL) rewrites, nothing else. Empty when the zone is
+    UTC or unknown. Shared with Evaluation (SOURCE_TIME_ZONE), so it names what Schema
+    Conversion writes. Pure."""
+    if zone is None or not zone.shifts:
+        return []
+    names: list[str] = []
+    if is_postgres:
+        from dsql_migrator.core.converter_postgres import (
+            pg_column_default_sql,
+            pg_zoned_clock_default,
+        )
+
+        for column in table.columns:
+            if column.name == table.auto_increment_column:
+                continue
+            emitted, _reason = pg_column_default_sql(
+                column, is_key_column=column.name in table.primary_key
+            )
+            if emitted is not None and pg_zoned_clock_default(emitted, column.mysql_type, zone):
+                names.append(column.name)
+        return names
+    for column in table.columns:
+        if column.name == table.auto_increment_column or column.default is None:
+            continue
+        zoned = _resolve_column_default(column, zone)[0]
+        if zoned is not None and zoned != _resolve_column_default(column)[0]:
+            names.append(column.name)
+    return names
+
+
 def _dropped_default_warning(table: TableDef, *, is_postgres: bool) -> Optional[ConversionWarning]:
     """The table's dropped DEFAULTs as one note, for Evaluation (DEFAULT_DROPPED). A
     PostgreSQL serial / identity column is left to the rule that already reports it --
@@ -4866,8 +5019,13 @@ def _apply_pg_column_defaults(
     table: TableDef,
     fragments: "list[str]",
     column_defs: "Optional[dict[str, exp.ColumnDef]]" = None,
+    *,
+    zone: "Optional[SourceZone]" = None,
 ) -> None:
-    """Attach each carried PostgreSQL column DEFAULT, VERBATIM, in place.
+    """Attach each carried PostgreSQL column DEFAULT, VERBATIM, in place -- but for a clock
+    default on a column without a time zone under a source ``zone`` that is not UTC, which
+    is written in that zone (G149; :func:`~dsql_migrator.core.converter_postgres.
+    pg_zoned_clock_default`).
 
     The default text is ``pg_get_expr`` output -- PostgreSQL already -- so it is attached
     after the parse as a :func:`_raw_fragment`, exactly like a generated expression, and
@@ -4889,7 +5047,10 @@ def _apply_pg_column_defaults(
     ``nextval``, no cast to a type DSQL lacks, an enum default as its plain label); the
     identity primary key gets none, as before -- the primary-key strategy owns it.
     """
-    from dsql_migrator.core.converter_postgres import pg_column_default_sql
+    from dsql_migrator.core.converter_postgres import (
+        pg_column_default_sql,
+        pg_zoned_clock_default,
+    )
 
     primary_key = set(table.primary_key or [])
     if column_defs is None:
@@ -4902,6 +5063,10 @@ def _apply_pg_column_defaults(
         )
         if default_sql is None:
             continue
+        if zone is not None:
+            default_sql = (
+                pg_zoned_clock_default(default_sql, column.mysql_type, zone) or default_sql
+            )
         column_def = column_defs.get(column.name)
         if column_def is None:
             continue
@@ -6803,8 +6968,18 @@ class SchemaConverter:
     ``postgres`` (no MySQL->DSQL type remap), then the same DSQL-constraint phase runs.
     """
 
-    def __init__(self, *, source_type: SourceType = SourceType.MYSQL) -> None:
+    def __init__(
+        self,
+        *,
+        source_type: SourceType = SourceType.MYSQL,
+        source_zone: "Optional[SourceZone]" = None,
+    ) -> None:
         self._source_type = source_type
+        # The source's time zone (G149), which clock defaults and MySQL views are written
+        # in when it is known and not UTC. :meth:`convert` reads it from the inventory it
+        # converts when none is given here; a per-table re-conversion (the primary-key
+        # picker) passes the inventory's, so it writes what the whole conversion wrote.
+        self._source_zone = source_zone
 
     def convert_table(
         self,
@@ -6813,6 +6988,7 @@ class SchemaConverter:
         *,
         index_names: "Optional[Mapping[str, str]]" = None,
         composite_size_checked: bool = True,
+        source_zone: "Optional[SourceZone]" = None,
     ) -> TableConversion:
         """Convert a single table definition to DSQL-compatible DDL.
 
@@ -6827,9 +7003,15 @@ class SchemaConverter:
         visible across tables). :meth:`convert` passes it; a per-table re-conversion must
         pass the table's entry of :attr:`SchemaConversionResult.index_renames` too, or it
         would emit the colliding source names again.
+
+        ``source_zone`` (default: the converter's own) is the source's time zone, which a
+        clock default on a column without a time zone is written in (G149).
         """
         options = options or SchemaConvertOptions()
         is_postgres = self._source_type is SourceType.POSTGRES
+        zone = source_zone if source_zone is not None else self._source_zone
+        if zone is not None and not zone.shifts:
+            zone = None  # UTC, or a zone that could not be told: the session's clock
         source_types = {column.name: column.mysql_type for column in table.columns}
         warnings: list[ConversionWarning] = []
         # Columns retyped to bytea for a DSQL-unsupported source type (MySQL spatial).
@@ -6863,7 +7045,7 @@ class SchemaConverter:
             # wide table).
             column_defs = _column_defs(create)
             _apply_pg_generated_columns(create, table, raw_fragments, column_defs)
-            _apply_pg_column_defaults(create, table, raw_fragments, column_defs)
+            _apply_pg_column_defaults(create, table, raw_fragments, column_defs, zone=zone)
             # Re-add each converted ENUM's allowed values as a CHECK, so the value domain
             # survives the remodel to text (exactly what the MySQL ENUM path does).
             for column in table.columns:
@@ -6876,7 +7058,7 @@ class SchemaConverter:
             # bytea so the table still converts and the data is PRESERVED as raw bytes
             # (never silently dropped/NULLed); a MANUAL warning is added per column.
             table_for_ddl, bytea_fallback_columns = _substitute_unsupported_types(table)
-            source_ddl = _build_source_ddl(table_for_ddl)
+            source_ddl = _build_source_ddl(table_for_ddl, zone=zone)
             try:
                 create = sqlglot.parse_one(source_ddl, read=_MYSQL)
             except sqlglot.errors.SqlglotError as exc:
@@ -7329,9 +7511,17 @@ class SchemaConverter:
         Triggers and procedural routines are flagged for manual reimplementation
         rather than auto-converted (Requirement 3.7). Warnings from all tables
         and objects are aggregated into the result (Property 6).
+
+        Clock defaults and MySQL views are written in the source's time zone (G149): the
+        converter's own, else the one Evaluation read into ``inventory``.
         """
         options = options or SchemaConvertOptions()
         is_postgres = self._source_type is SourceType.POSTGRES
+        zone = (
+            self._source_zone
+            if self._source_zone is not None
+            else resolve_source_zone(inventory.server_settings, self._source_type)
+        )
         # Names collide ACROSS objects (Aurora DSQL keeps a schema's tables, views and
         # indexes in one namespace), which a per-object conversion cannot see: the colliding
         # indexes are renamed here and the notes attached here.
@@ -7339,7 +7529,9 @@ class SchemaConverter:
         namespaces = _relation_namespaces(inventory, is_postgres=is_postgres)
         renames = index_renames(inventory, is_postgres=is_postgres, namespaces=namespaces)
         conversions = [
-            self.convert_table(table, options, index_names=renames.get(table.name))
+            self.convert_table(
+                table, options, index_names=renames.get(table.name), source_zone=zone
+            )
             for table in inventory.tables
         ]
         # What the conversion changes under each PostgreSQL view, once for all of them.
@@ -7353,6 +7545,7 @@ class SchemaConverter:
                 tables=inventory.tables,
                 remodelling=remodellings.get(view.name),
                 table_index=table_index,
+                source_zone=zone,
             )
             for view in inventory.views
         ]
@@ -7397,6 +7590,7 @@ class SchemaConverter:
         tables: "Sequence[TableDef]" = (),
         remodelling: "Optional[PgViewRemodelling]" = None,
         table_index: "Optional[Mapping[str, tuple]]" = None,
+        source_zone: "Optional[SourceZone]" = None,
     ) -> ViewConversion:
         """Convert a single source view to a DSQL-compatible ``CREATE VIEW``.
 
@@ -7404,6 +7598,12 @@ class SchemaConverter:
         built once by a caller converting many views): a MySQL view's expressions are written by
         the types of the columns they read (a binary column's bytes, a CHAR(n) column's
         padding, a DATETIME in JSON).
+
+        ``source_zone`` (default: the converter's own) is the source's time zone (G149): a
+        MySQL view's clock -- NOW() and its synonyms, SYSDATE(), CURDATE(), CURTIME() -- is
+        written as that zone's when it is known and not UTC (:func:`_rewrite_mysql_calls`).
+        A PostgreSQL view is carried as PostgreSQL deparsed it, clock and all; Evaluation
+        lists the ones that read it (SOURCE_TIME_ZONE).
 
         Aurora DSQL is PostgreSQL-compatible and supports views. A MySQL view's
         captured definition is transpiled to PostgreSQL via sqlglot; a PostgreSQL
@@ -7490,8 +7690,12 @@ class SchemaConverter:
             )
         if table_index is None:
             table_index = table_type_index(tables)
+        zone = source_zone if source_zone is not None else self._source_zone
         converted = _converted_mysql_view(
-            view.name, definition, view_column_types(definition, table_index, schema=schema_name)
+            view.name,
+            definition,
+            view_column_types(definition, table_index, schema=schema_name),
+            zone if zone is not None and zone.shifts else None,
         )
         if converted is None:
             return _manual_view_conversion(view.name, schema_ddls)
@@ -9460,6 +9664,7 @@ def _rewrite_mysql_calls(
     *,
     view: bool = False,
     materialized: bool = False,
+    zone: "Optional[SourceZone]" = None,
 ) -> "tuple[list[str], list[str], list[str]]":
     """Rewrite in place the MySQL calls sqlglot writes wrongly for PostgreSQL, and return
     ``(untranslated, misformatted, issues)`` -- the calls left that fail on Aurora DSQL,
@@ -9467,7 +9672,12 @@ def _rewrite_mysql_calls(
     text), and what else cannot be written faithfully (one sentence each). ``view``: the
     body of a view, whose outputs MySQL shows at their scale only where it materializes
     the view -- else they are computed in the query that reads it; ``materialized``: one
-    MySQL materializes whatever its body (ALGORITHM=TEMPTABLE).
+    MySQL materializes whatever its body (ALGORITHM=TEMPTABLE); ``zone``: the source's time
+    zone, known and not UTC, which a view's clock is written in (G149) -- NOW() and its
+    synonyms and SYSDATE() its wall clock, CURDATE() its date, CURTIME() its time of day,
+    where the session's are written otherwise (Aurora DSQL's session zone is UTC unless the
+    session sets another). A Query Converter statement gets none: the application's own
+    session runs it.
 
     A rewrite that depends on what a value holds reads it from the value's static kind
     (:func:`_mysql_kind`): a column's type where ``column_type`` knows it (a view over the
@@ -10722,13 +10932,16 @@ def _rewrite_mysql_calls(
 
     # The session's / UTC wall clock, truncated to its fsp as MySQL does (NOW() and its
     # synonyms, CURTIME, UTC_*). Each built from a fresh LOCALTIMESTAMP / CURRENT_TIMESTAMP
-    # made after this pass, so no rewrite takes it again.
+    # made after this pass, so no rewrite takes it again. Under a source zone (G149) the
+    # session's clock becomes that zone's at the end, SYSDATE() with it: it is the time it
+    # runs, NOW() the time its statement began, one value in a view's query either way.
     clocks: list = []
     for node in nodes(exp.CurrentTimestamp, exp.CurrentTime, *_NOW_SYNONYMS, *_UTC_CLOCKS):
         clocks.append(node)
+    clock_names = ("now", "sysdate") if zone is not None else ("now",)
     clocks += [
         n for n in nodes(exp.Anonymous)
-        if (n.name or "").lower() == "now" and len(n.expressions) <= 1
+        if (n.name or "").lower() in clock_names and len(n.expressions) <= 1
     ]
     clocks += [n for n in nodes(exp.Column) if _utc_clock_kind(n) is not None]
     for node in clocks:
@@ -12048,6 +12261,15 @@ def _rewrite_mysql_calls(
         for branch in branches:
             show_outputs(branch, union_value)
 
+    if zone is not None:
+        # G149: the session's clock the passes above read -- the LOCALTIMESTAMP the clock
+        # pass wrote, and CURRENT_DATE (CURDATE(), and the date MySQL puts a TIME on) -- as
+        # the source zone's, last, so every pass above read the clock it always did.
+        for node in list(select.find_all(exp.Localtimestamp)):
+            node.replace(_zone_clock(zone))
+        for node in list(select.find_all(exp.CurrentDate)):
+            node.replace(exp.Cast(this=_zone_clock(zone), to=exp.DataType.build("DATE")))
+
     # A call sqlglot does not know stays an Anonymous function and is emitted as written:
     # a MySQL-only function (FIND_IN_SET, UNIX_TIMESTAMP) or a user one -- unless
     # PostgreSQL has it by that name, or this rewrite wrote it (by the node: a user
@@ -12159,6 +12381,23 @@ def _json_path(steps: "Sequence[Any]") -> exp.JSONPath:
         exp.JSONPathKey(this=step) if isinstance(step, str) else exp.JSONPathSubscript(this=step)
         for step in steps
     ])
+
+
+def _zone_clock(zone: SourceZone) -> exp.Expression:
+    """The source zone's wall clock as a node, :meth:`SourceZone.clock_sql`'s expression: the
+    current instant at the zone's name -- or, for a fixed offset, the UTC wall clock plus it
+    (a zone NAME '+09:00' reads with the POSIX sign, UTC-9). Parenthesized, so it stands
+    where a LOCALTIMESTAMP stood whatever binds around it."""
+    if zone.kind == "offset":
+        return exp.Paren(this=exp.Add(
+            this=exp.Paren(this=exp.AtTimeZone(
+                this=exp.CurrentTimestamp(), zone=exp.Literal.string("UTC")
+            )),
+            expression=exp.Interval(this=exp.Literal.string(zone.zone)),
+        ))
+    return exp.Paren(
+        this=exp.AtTimeZone(this=exp.CurrentTimestamp(), zone=exp.Literal.string(zone.zone))
+    )
 
 
 def _utc_clock_kind(node: exp.Expression) -> Optional[str]:
@@ -12289,12 +12528,16 @@ def view_column_types(
 
 @functools.lru_cache(maxsize=8192)
 def _converted_mysql_view(
-    name: str, definition: str, column_types: "tuple" = ()
+    name: str,
+    definition: str,
+    column_types: "tuple" = (),
+    zone: "Optional[SourceZone]" = None,
 ) -> "Optional[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]]":
     """``(target CREATE VIEW, calls left untranslated, date formats left with a MySQL
     token, what else is not faithful)`` for a MySQL view, or ``None`` when its body does
-    not parse or render. Cached by name, body and the column types of what it reads:
-    Schema Conversion and Evaluation (VIEW_NOT_CONVERTED) convert the same views."""
+    not parse or render. Cached by name, body, the column types of what it reads and the
+    source's time zone its clock is written in (``None``: the session's; G149): Schema
+    Conversion and Evaluation (VIEW_NOT_CONVERTED) convert the same views."""
     try:
         parsed = sqlglot.parse_one(definition, read=_MySqlViewDialect)
         select = parsed.expression if isinstance(parsed, exp.Create) else parsed
@@ -12317,7 +12560,11 @@ def _converted_mysql_view(
                 if table.args.get("db") is None and table.name and _cte_named(table) is None:
                     table.set("db", exp.to_identifier(view_schema, quoted=True))
         untranslated, misformatted, issues = _rewrite_mysql_calls(
-            select, _column_type_resolver(column_types), view=True, materialized=temptable
+            select,
+            _column_type_resolver(column_types),
+            view=True,
+            materialized=temptable,
+            zone=zone,
         )
         issues = [*issues, *_mysql_select_options(select)]
         # MySQL stores a HAVING name by its alias (having (`total` > 1000)), which Aurora
@@ -12716,6 +12963,7 @@ __all__ = [
     "pg_views_remodelling",
     "PgViewRemodelling",
     "dropped_default_notes",
+    "zoned_default_columns",
     "parse_target_column_types",
     "parse_target_identity_columns",
     "parse_target_primary_key",

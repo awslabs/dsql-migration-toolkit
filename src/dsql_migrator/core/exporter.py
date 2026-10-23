@@ -177,9 +177,11 @@ class _Connection(Protocol):
 def _utc(value: datetime) -> datetime:
     """Normalize a datetime to UTC (assume naive datetimes are already UTC).
 
-    MySQL ``DATETIME`` has no time zone, and the converter maps it to a DSQL
-    ``timestamp`` treated as UTC. A naive value therefore gets UTC attached; a
-    tz-aware value is converted to UTC.
+    MySQL ``DATETIME`` has no time zone: the driver returns its wall clock naive, and
+    the converter maps it to a DSQL ``timestamp``. A naive value therefore gets UTC
+    attached -- the same wall clock, which the ``timestamp`` caller strips again, so it
+    is bound unchanged in whatever zone the source wrote it (G149); a tz-aware value is
+    converted to UTC.
     """
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -415,8 +417,9 @@ class ValueConverter:
             # UTC, then drop the tzinfo: binding a tz-AWARE datetime to a no-tz
             # column makes PostgreSQL/psycopg convert it to the session TimeZone and
             # discard the offset, so a non-UTC session would silently shift the
-            # stored wall-clock by hours. A naive UTC value stores the intended
-            # wall-clock regardless of the session's TimeZone.
+            # stored wall-clock by hours. A naive value -- the source's own wall clock,
+            # in whatever zone it was written -- is stored as it is, regardless of the
+            # session's TimeZone.
             if isinstance(value, datetime):
                 return _utc(value).replace(tzinfo=None)
             return value

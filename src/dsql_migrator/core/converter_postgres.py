@@ -36,6 +36,7 @@ from dsql_migrator.core.source_dialect import PostgresSourceDialect
 
 if TYPE_CHECKING:
     from dsql_migrator.core.catalog_postgres import StandaloneSequence
+    from dsql_migrator.core.source_time_zone import SourceZone
 
 _PG = PostgresSourceDialect()
 
@@ -220,6 +221,84 @@ def pg_column_default_sql(
             f"remodelled type (e.g. {example}) in the DDL or with ALTER TABLE after apply."
         )
     return raw, None
+
+
+# A clock DEFAULT as pg_get_expr prints it (G149): an instant -- now() and its siblings,
+# CURRENT_TIMESTAMP[(p)] -- or the session's wall clock, date or time of day --
+# LOCALTIMESTAMP[(p)], CURRENT_DATE, CURRENT_TIME[(p)], LOCALTIME[(p)] -- bare, or cast to a
+# type without a time zone, ((now())::date).
+_PG_CLOCK_CAST_RE = re.compile(
+    r"\(\s*(?P<clock>[^()]*(?:\(\s*\d?\s*\))?)\s*\)\s*::\s*"
+    r"(?P<cast>date|time without time zone|timestamp without time zone)",
+    re.IGNORECASE,
+)
+_PG_CLOCK_RE = re.compile(
+    r"(?P<function>now|transaction_timestamp|statement_timestamp|clock_timestamp)\s*\(\s*\)"
+    r"|(?P<keyword>current_timestamp|localtimestamp|current_date|current_time|localtime)"
+    r"(?:\s*\(\s*(?P<precision>\d)\s*\))?",
+    re.IGNORECASE,
+)
+# What each clock (or cast) gives: a wall clock, a date or a time of day.
+_PG_CLOCK_KINDS = {
+    "current_date": "date",
+    "current_time": "time",
+    "localtime": "time",
+    "date": "date",
+    "time without time zone": "time",
+}
+# A column type without a time zone, by what it holds.
+_PG_ZONELESS_COLUMN_KINDS = {
+    "timestamp without time zone": "timestamp",
+    "timestamp": "timestamp",
+    "date": "date",
+    "time without time zone": "time",
+    "time": "time",
+}
+
+
+def pg_zoned_clock_default(
+    default_sql: str, pg_type: str, zone: "Optional[SourceZone]"
+) -> Optional[str]:
+    """``default_sql`` -- a carried DEFAULT -- written in the source's time ``zone`` (G149),
+    or ``None`` to carry it as it is.
+
+    On a column without a time zone (``timestamp``, ``date``, ``time``) a clock DEFAULT is
+    the SESSION's wall clock: ``now()`` / ``CURRENT_TIMESTAMP`` cast to the column in the
+    session's ``TimeZone``, ``LOCALTIMESTAMP`` / ``CURRENT_DATE`` / ``LOCALTIME`` read in it.
+    The source's sessions run in the zone Evaluation read; an Aurora DSQL session's is UTC
+    unless it sets another, so under a zone that is not UTC the clock is written as that
+    zone's -- ``(now() AT TIME ZONE 'Asia/Seoul')``, its date or its time of day -- keeping
+    the function (``clock_timestamp()`` stays the time of each row) and the precision
+    (``LOCALTIMESTAMP(0)`` is ``CURRENT_TIMESTAMP(0)``'s wall clock). A ``timestamp with time
+    zone`` / ``time with time zone`` column holds the instant and is left alone, as is any
+    other expression: only a bare clock, or one cast to a type without a zone, is
+    rewritten."""
+    if zone is None or not zone.shifts:
+        return None
+    column_kind = _PG_ZONELESS_COLUMN_KINDS.get(normalize_pg_base_type(pg_type or ""))
+    if column_kind is None:
+        return None
+    text = default_sql.strip()
+    cast = _PG_CLOCK_CAST_RE.fullmatch(text)
+    clock = _PG_CLOCK_RE.fullmatch(cast.group("clock").strip() if cast else text)
+    if clock is None:
+        return None
+    function, keyword = clock.group("function"), (clock.group("keyword") or "").lower()
+    if function is not None:
+        instant = f"{function}()"
+    elif keyword == "current_date":
+        instant = "now()"
+    else:
+        precision = clock.group("precision")
+        instant = f"CURRENT_TIMESTAMP({precision})" if precision else "now()"
+    reads = {_PG_CLOCK_KINDS.get(keyword, "timestamp")}
+    if cast is not None:
+        reads.add(_PG_CLOCK_KINDS.get(" ".join(cast.group("cast").lower().split()), "timestamp"))
+    kinds = reads | {column_kind}
+    if "time" in kinds:
+        # A time of day is stored only in a time column, from a clock or a time.
+        return zone.time_sql(instant) if column_kind == "time" and "date" not in kinds else None
+    return zone.date_sql(instant) if "date" in kinds else zone.clock_sql(instant)
 
 
 @functools.lru_cache(maxsize=16384)
@@ -1074,5 +1153,6 @@ __all__ = [
     "pg_column_default_sql",
     "pg_identity_fallback",
     "pg_sequence_next_value",
+    "pg_zoned_clock_default",
     "unsupported_dsql_reason",
 ]

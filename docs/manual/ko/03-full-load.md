@@ -144,7 +144,8 @@ MySQL은 그 값을 유효숫자 6자리로 반올림해 돌려주는데, 이 �
 
 - `TINYINT(1)` → DSQL **boolean** (`0/1` → `false/true`).
 - `BIT(n)` → 정수(소스 바이트에서 디코딩).
-- `DATETIME` → UTC로 정규화된 `timestamp`; `TIMESTAMP` → `timestamptz`.
+- `DATETIME` → `timestamp`, 벽시계를 그대로 복사(시간대를 적용하거나 옮기지 않으므로 다른 시간대의
+  소스는 그 시간대의 벽시계를 유지합니다: 2장의 `SOURCE_TIME_ZONE`); `TIMESTAMP` → `timestamptz`, 그 시점.
 - `BLOB`/`BINARY`/`VARBINARY` 계열 → `bytea`.
 
 **PostgreSQL 소스**에서는 Full Load 중 MySQL 방식의 값 변환이 **없습니다**: 양쪽 끝이 모두

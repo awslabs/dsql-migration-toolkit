@@ -19,7 +19,8 @@ with no warning.
   defaults; carried on SourceInventory.server_settings (left out of the payload while empty),
   best effort.
 * The findings: SQL_MODE, EXPLICIT_DEFAULTS_FOR_TIMESTAMP and AUTO_INCREMENT_STEP, database
-  level, MANUAL; the time zone, case folding and collation settings are recorded only.
+  level, MANUAL; the case folding and collation settings are recorded only (the time zone is
+  graded since G149: tests/test_g149_source_time_zone.py).
 * The Evaluation screen lists the settings under the source counts; the manual (en / ko /
   ja) says what is read and why, and that the tool's sessions read with a neutral sql_mode.
 
@@ -851,11 +852,13 @@ def test_no_auto_increment_step_finding(settings: dict, auto_increment: bool) ->
     assert _database_items(inventory) == {}
 
 
-def test_the_time_zone_case_folding_and_collation_settings_are_recorded_only() -> None:
+def test_the_case_folding_and_collation_settings_are_recorded_only() -> None:
+    # The time zone is UTC here: one that is not is graded since G149 (SOURCE_TIME_ZONE,
+    # tests/test_g149_source_time_zone.py).
     settings = {
         "sql_mode": MYSQL_80_DEFAULT,
-        "time_zone": "+09:00",
-        "system_time_zone": "KST",
+        "time_zone": "SYSTEM",
+        "system_time_zone": "UTC",
         "explicit_defaults_for_timestamp": "ON",
         "auto_increment_increment": "1",
         "auto_increment_offset": "1",
@@ -873,13 +876,15 @@ def test_the_time_zone_case_folding_and_collation_settings_are_recorded_only() -
     assert with_settings.items == without.items
 
 
-def test_a_postgresql_timezone_is_recorded_not_graded() -> None:
+def test_a_postgresql_utc_timezone_is_recorded_not_graded() -> None:
+    # A TimeZone other than UTC is graded since G149 (SOURCE_TIME_ZONE,
+    # tests/test_g149_source_time_zone.py).
     table = TableDef(
         name="public.t",
         columns=[ColumnDef(name="id", mysql_type="integer", nullable=False)],
         primary_key=["id"],
     )
-    settings = {"TimeZone": "Asia/Seoul", "TimeZone (ALTER ROLE app)": "UTC",
+    settings = {"TimeZone": "UTC", "TimeZone (ALTER ROLE app)": "UTC",
                 "sql_mode": ""}  # a MySQL name on a PostgreSQL report grades nothing either
     graded = CompatibilityAssessor(source_type=SourceType.POSTGRES)
     assert (

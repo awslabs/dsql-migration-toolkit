@@ -34,7 +34,7 @@ import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, ClassVar, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Sequence
 
 from dsql_migrator.core.models import (
     AiAssessmentReport,
@@ -50,6 +50,9 @@ from dsql_migrator.core.models import (
     TableDef,
     TargetInventory,
 )
+
+if TYPE_CHECKING:
+    from dsql_migrator.core.source_time_zone import SourceZone
 
 # Ordering used to pick the governing classification when several rules match
 # the same object. Higher value means more severe.
@@ -2134,8 +2137,14 @@ class MySqlViewConversionRule(Rule):
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         from dsql_migrator.core.converter import SchemaConverter
+        from dsql_migrator.core.source_time_zone import resolve_source_zone
 
-        converter = SchemaConverter(source_type=SourceType.MYSQL)
+        # In the source's time zone, as Schema Conversion converts each view (G149): under
+        # one that is not UTC its SYSDATE() is written, not left untranslated.
+        converter = SchemaConverter(
+            source_type=SourceType.MYSQL,
+            source_zone=resolve_source_zone(inventory.server_settings, SourceType.MYSQL),
+        )
         findings: list[Finding] = []
         # With the tables' column types, as Schema Conversion converts each view (a binary
         # column's bytes, a CHAR(n) column's padding): the two steps grade it alike.
@@ -3031,19 +3040,27 @@ def _first_names(names: "Sequence[str]", limit: int = 10) -> str:
 
 
 def _database_item(
-    *, object_name: str, rule_id: str, risk: str, recommendation: str, effort: EffortLevel
+    *,
+    object_name: str,
+    rule_id: str,
+    risk: str,
+    recommendation: str,
+    effort: Optional[EffortLevel],
+    advisory: bool = False,
 ) -> AssessmentItem:
-    """One MANUAL database-level item with its single concern (a gap)."""
+    """One database-level item with its single concern: a MANUAL gap, or -- ``advisory`` --
+    an AUTO note with no effort, shown as a recommendation."""
     item = AssessmentItem(
         object_name=object_name,
         rule_id=rule_id,
-        classification=Classification.MANUAL,
+        classification=Classification.AUTO if advisory else Classification.MANUAL,
         risk=risk,
         recommendation=recommendation,
-        effort=effort,
+        effort=None if advisory else effort,
         kind=KIND_DATABASE.upper(),
     )
-    return item.model_copy(update={"concerns": _single_concern(item)})
+    note_kind = ConversionNoteKind.RECOMMENDATION if advisory else ConversionNoteKind.LOSS
+    return item.model_copy(update={"concerns": _single_concern(item, note_kind)})
 
 
 def check_mysql_sql_mode(
@@ -3272,6 +3289,253 @@ def check_mysql_auto_increment_step(
     ]
 
 
+# ---------------------------------------------------------------------------
+# The source's time zone (G149): what Schema Conversion writes in it, and what it cannot
+# ---------------------------------------------------------------------------
+
+SOURCE_TIME_ZONE_RULE_ID = "SOURCE_TIME_ZONE"
+
+
+def _zone_set_statement(zone: "SourceZone") -> str:
+    """The statement that gives an Aurora DSQL session ``zone``. A fixed offset as an
+    INTERVAL: quoted, '+09:00' is read as a POSIX zone name, west of UTC."""
+    if zone.kind == "offset":
+        return f"SET TIME ZONE INTERVAL '{zone.zone}' HOUR TO MINUTE"
+    return f"SET TIME ZONE '{zone.zone}'"
+
+
+def _zone_clock_text(zone: "SourceZone") -> str:
+    """:meth:`SourceZone.clock_sql` as a sentence quotes it, without its outer parentheses."""
+    return zone.clock_sql()[1:-1]
+
+
+def _counted(names: "Sequence[str]", noun: str) -> str:
+    """``3 columns: a, b, c`` (the first ten, then how many more)."""
+    return f"{len(names):,} {noun}{'' if len(names) == 1 else 's'}: {_first_names(names)}"
+
+
+def _pg_role_zones(settings: "dict[str, str]") -> str:
+    """The TimeZone defaults ALTER ROLE gives single roles (G148 records them), as a sentence
+    -- an application that connects as such a role gets its zone, not the database's."""
+    entries = [
+        f"{key[len('TimeZone ('):-1]} '{value}'"
+        for key, value in settings.items()
+        if key.startswith("TimeZone (ALTER ROLE ") and not key.startswith("TimeZone (ALTER ROLE ALL")
+    ]
+    if not entries:
+        return ""
+    return (
+        f" Some roles have a TimeZone default of their own ({', '.join(entries)}): an "
+        "application that connects as one of them gets that zone instead."
+    )
+
+
+def _mysql_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> AssessmentItem:
+    from dsql_migrator.core.converter import zoned_default_columns
+    from dsql_migrator.core.source_time_zone import views_reading_the_clock
+
+    if not zone.shifts:
+        assumes = (
+            "Schema Conversion assumes UTC: a DATETIME column's clock default becomes DEFAULT "
+            "(now() AT TIME ZONE 'UTC'), and the views' NOW() and CURDATE() read the "
+            "session's clock (UTC on Aurora DSQL unless the session sets another zone). Full "
+            "Load and CDC copy DATETIME values unchanged."
+        )
+        if zone.setting.startswith("time_zone 'SYSTEM'"):
+            risk = (
+                f"The source runs in the server's own time zone ({zone.setting}), which MySQL "
+                "reports by its abbreviation: that names no single zone, and daylight saving "
+                "may change it, so " + assumes
+            )
+        else:
+            risk = (
+                f"The source's time zone ({zone.setting}) is not a zone name or a fixed offset "
+                "the conversion can write, so " + assumes
+            )
+        return _database_item(
+            object_name="time_zone",
+            rule_id=SOURCE_TIME_ZONE_RULE_ID,
+            risk=risk,
+            recommendation=(
+                "If the source runs in a zone other than UTC (SELECT @@GLOBAL.time_zone, "
+                "@@system_time_zone), edit those defaults and views in Schema Conversion to "
+                "name it (now() AT TIME ZONE 'Area/City'), and have the application run SET "
+                "TIME ZONE 'Area/City' on every new Aurora DSQL connection."
+            ),
+            effort=None,
+            advisory=True,
+        )
+    columns = [
+        f"{table.name}.{name}"
+        for table in inventory.tables
+        for name in zoned_default_columns(table, zone, is_postgres=False)
+    ]
+    views = views_reading_the_clock(inventory.views, SourceType.MYSQL)
+    written = (
+        f"a DATETIME column's clock default becomes DEFAULT {zone.clock_sql()}, a DATE or "
+        f"TIME column's its date or time of day ({_counted(columns, 'column')})"
+        if columns
+        else "no column default reads the clock"
+    )
+    if views:
+        written += (
+            ", and the views' NOW(), SYSDATE(), CURDATE() and CURTIME() read that zone's "
+            f"clock ({_counted(views, 'view')})"
+        )
+    offset_note = (
+        f"; written as the string '{zone.zone}', the offset would be read as a POSIX zone, "
+        "west of UTC"
+        if zone.kind == "offset"
+        else ""
+    )
+    return _database_item(
+        object_name="time_zone",
+        rule_id=SOURCE_TIME_ZONE_RULE_ID,
+        risk=(
+            f"The source runs in time zone {zone.label} ({zone.setting}). MySQL's NOW(), "
+            "CURRENT_TIMESTAMP, CURDATE() and CURTIME() return that zone's wall clock, and "
+            "DATETIME, DATE and TIME columns store it as it is; Full Load and CDC copy those "
+            "values unchanged. An Aurora DSQL session runs in UTC unless it sets another "
+            "zone, so Schema Conversion writes the source's zone where the schema reads the "
+            f"clock: {written}. TIMESTAMP columns hold instants and keep DEFAULT now(), and "
+            "UTC_TIMESTAMP() and UTC_DATE() stay UTC."
+        ),
+        recommendation=(
+            "An application that relies on the session's time zone -- NOW(), "
+            "CURRENT_TIMESTAMP or CURDATE() written into DATETIME or DATE columns, or "
+            "compared with them -- gets UTC on Aurora DSQL: have it run "
+            f"{_zone_set_statement(zone)} on every new connection (Aurora DSQL allows "
+            f"it{offset_note}), or write the zone explicitly ({_zone_clock_text(zone)}). Test "
+            "those statements on Aurora DSQL before cut over; the Query Converter writes them "
+            "for the session's zone."
+        ),
+        effort=EffortLevel.SIMPLE,
+    )
+
+
+def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> AssessmentItem:
+    from dsql_migrator.core.converter import zoned_default_columns
+    from dsql_migrator.core.source_time_zone import views_reading_the_clock
+
+    roles = _pg_role_zones(inventory.server_settings)
+    if not zone.shifts:
+        assumes = (
+            "Schema Conversion assumes UTC: a clock default on a timestamp without time "
+            "zone, date or time column is carried as written and computes in the session's "
+            "zone (UTC on Aurora DSQL unless the session sets another). Full Load and CDC "
+            "copy those values unchanged."
+        )
+        if not zone.setting:
+            risk = (
+                "The source's default TimeZone could not be read (the short connection "
+                "Evaluation opens to read it failed), so " + assumes
+            )
+        else:
+            risk = (
+                f"The source's default time zone ({zone.setting}) is not a zone name or a fixed "
+                "offset the conversion can write (a POSIX rule with daylight saving, the "
+                "server's local zone), so " + assumes
+            )
+        return _database_item(
+            object_name="TimeZone",
+            rule_id=SOURCE_TIME_ZONE_RULE_ID,
+            risk=risk + roles,
+            recommendation=(
+                ("Re-run Evaluation to read it. " if not zone.setting else "")
+                + "If the source runs in a zone other than UTC (SHOW TimeZone in a new "
+                "session of the application's role), edit those defaults in Schema Conversion "
+                "to name it (now() AT TIME ZONE 'Area/City'), and have the application run "
+                "SET TIME ZONE 'Area/City' on every new Aurora DSQL connection."
+            ),
+            effort=None,
+            advisory=True,
+        )
+    columns = [
+        f"{table.name}.{name}"
+        for table in inventory.tables
+        for name in zoned_default_columns(table, zone, is_postgres=True)
+    ]
+    views = views_reading_the_clock(inventory.views, SourceType.POSTGRES)
+    written = (
+        f"DEFAULT now() on a timestamp column becomes DEFAULT {zone.clock_sql()}, on a date "
+        f"or time column its date or time of day ({_counted(columns, 'column')})"
+        if columns
+        else "no column default reads the clock"
+    )
+    viewed = (
+        " Views are carried as PostgreSQL deparsed them, so a view that reads the clock "
+        f"computes in the session's zone ({_counted(views, 'view')})."
+        if views
+        else ""
+    )
+    offset_note = (
+        f"; written as the string '{zone.zone}', the offset would be read as a POSIX zone, "
+        "west of UTC"
+        if zone.kind == "offset"
+        else ""
+    )
+    return _database_item(
+        object_name="TimeZone",
+        rule_id=SOURCE_TIME_ZONE_RULE_ID,
+        risk=(
+            f"The source's default time zone is {zone.label} ({zone.setting}, what a new "
+            "session gets when the client sets none). now(), CURRENT_TIMESTAMP, "
+            "LOCALTIMESTAMP and CURRENT_DATE give that zone's wall clock where a timestamp "
+            "without time zone, date or time column stores them; Full Load and CDC copy those "
+            "values unchanged. An Aurora DSQL session runs in UTC unless it sets another "
+            "zone, so Schema Conversion writes the source's zone into those columns' clock "
+            f"defaults: {written}; timestamp with time zone columns hold instants and keep "
+            f"theirs.{viewed}{roles}"
+        ),
+        recommendation=(
+            "An application that relies on the session's time zone -- now() or CURRENT_DATE "
+            "written into such columns, or compared with them -- gets UTC on Aurora DSQL: "
+            f"have it run {_zone_set_statement(zone)} on every new connection (Aurora DSQL "
+            f"allows it{offset_note}), or write the zone explicitly ({_zone_clock_text(zone)})."
+            + (
+                " Review the views listed: where one depends on the zone, write it there in "
+                "the view's target DDL before applying, or rely on that SET TIME ZONE."
+                if views
+                else ""
+            )
+        ),
+        effort=EffortLevel.SIMPLE,
+    )
+
+
+def check_mysql_time_zone(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """The source's time zone (G149), from its GLOBAL ``time_zone``: in a zone other than UTC,
+    what Schema Conversion writes in it -- DATETIME / DATE / TIME clock defaults, the views'
+    NOW() / CURDATE() / CURTIME() -- and what the application has to do (MANUAL); a zone it
+    could not read or tell, that the conversion assumes UTC (an advisory note). Nothing for
+    UTC, nor when ``time_zone`` was not read (a failed read, or a report from before
+    Evaluation read the settings), like the other setting checks."""
+    from dsql_migrator.core.source_time_zone import resolve_source_zone
+
+    if "time_zone" not in inventory.server_settings:
+        return []
+    zone = resolve_source_zone(inventory.server_settings, SourceType.MYSQL)
+    return [] if zone.kind == "utc" else [_mysql_time_zone_item(inventory, zone)]
+
+
+def check_postgres_time_zone(
+    inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
+) -> list[AssessmentItem]:
+    """:func:`check_mysql_time_zone` for a PostgreSQL source's default ``TimeZone``: the clock
+    defaults of timestamp without time zone / date / time columns, the views that read the
+    clock (carried as deparsed, so listed for review), the roles with a zone of their own.
+    Its own connection reads the TimeZone, so a read that captured the ALTER DATABASE /
+    ALTER ROLE defaults but not it says so; one that captured nothing says nothing."""
+    from dsql_migrator.core.source_time_zone import resolve_source_zone
+
+    if not inventory.server_settings:
+        return []
+    zone = resolve_source_zone(inventory.server_settings, SourceType.POSTGRES)
+    return [] if zone.kind == "utc" else [_pg_time_zone_item(inventory, zone)]
+
+
 def default_inventory_rules(
     source_type: SourceType = SourceType.MYSQL,
 ) -> list[InventoryRule]:
@@ -3283,8 +3547,8 @@ def default_inventory_rules(
     schema-qualified automatically -- so the "spans N databases" note is meaningless
     for a PG source. The database-level limits (tables, schemas, views per database)
     apply to every engine. The server-setting checks (sql_mode,
-    explicit_defaults_for_timestamp, the auto_increment step) read MySQL settings; a
-    PostgreSQL source's TimeZone is recorded, not graded.
+    explicit_defaults_for_timestamp, the auto_increment step) read MySQL settings; the
+    time zone check reads each engine's (G149).
     """
     if source_type is SourceType.POSTGRES:
         return [
@@ -3293,6 +3557,7 @@ def default_inventory_rules(
             check_view_count,
             check_postgres_extensions,
             check_postgres_database_collation,
+            check_postgres_time_zone,
         ]
     return [
         check_multiple_source_databases,
@@ -3303,6 +3568,7 @@ def default_inventory_rules(
         check_mysql_sql_mode,
         check_mysql_explicit_defaults_for_timestamp,
         check_mysql_auto_increment_step,
+        check_mysql_time_zone,
     ]
 
 
@@ -4234,6 +4500,9 @@ __all__ = [
     "default_inventory_rules",
     "catalog_changed_items",
     "check_mixed_case_identifiers",
+    "check_mysql_time_zone",
+    "check_postgres_time_zone",
+    "SOURCE_TIME_ZONE_RULE_ID",
     "pg_unindexable_column_rule",
     "default_dropped_rule",
     "importance_order",

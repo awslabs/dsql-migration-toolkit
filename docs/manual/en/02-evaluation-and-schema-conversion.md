@@ -83,15 +83,41 @@ shows:
   stores the current time when NULL is written to a `TIMESTAMP` column declared `NOT NULL`,
   a write Aurora DSQL rejects; the item lists those columns. `AUTO_INCREMENT_STEP`:
   `auto_increment_increment` is above 1 and a table has an `AUTO_INCREMENT` key, whose
-  identity on Aurora DSQL steps by 1. The others — the time zone, the case folding of
-  names, the character set and collation defaults, `div_precision_increment` and
-  `group_concat_max_len` — are recorded, not graded.
+  identity on Aurora DSQL steps by 1. The time zone is graded too, as for PostgreSQL
+  (below). The others — the case folding of names, the character set and collation
+  defaults, `div_precision_increment` and `group_concat_max_len` — are recorded, not graded.
 - **PostgreSQL:** the `TimeZone` a new session of the migration user gets in the connected
   database (the DB or DB cluster parameter group's value, unless an `ALTER DATABASE` or
   `ALTER ROLE` default replaces it), read over a short connection of its own because the
   tool's sessions pin UTC, and each `TimeZone` default `ALTER DATABASE` or `ALTER ROLE` sets
-  for that database (the role your application connects as may have its own). Recorded,
-  not graded.
+  for that database (the role your application connects as may have its own). The time
+  zone is graded (below).
+
+**The source's time zone** (`SOURCE_TIME_ZONE`). A clock function — MySQL's `NOW()`,
+`CURRENT_TIMESTAMP` or `CURDATE()`, PostgreSQL's `now()`, `LOCALTIMESTAMP` or
+`CURRENT_DATE` written into a `timestamp without time zone` or `date` column — gives the
+wall clock of the session's time zone, and a `DATETIME` / `timestamp` column stores that
+wall clock as it is; Full Load and CDC copy it unchanged, in whatever zone it was written.
+An Aurora DSQL session runs in UTC unless it sets another zone. So when the zone Evaluation
+read is not UTC — MySQL's `time_zone` (`SYSTEM` is the server's own zone,
+`system_time_zone`), PostgreSQL's `TimeZone` — Schema Conversion writes it into what reads
+the clock: a `DATETIME` (`timestamp without time zone`) default becomes
+`DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`, a `DATE` or `TIME` one its date or time of
+day, and a MySQL view's `NOW()`, `SYSDATE()`, `CURDATE()` and `CURTIME()` read that zone's
+clock. A fixed offset such as `+09:00` is written as the UTC clock plus the offset,
+`(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`: as a zone name, `'+09:00'` would be read
+with the POSIX sign, as nine hours west of UTC. A `TIMESTAMP` (`timestamptz`) column holds
+an instant and keeps `now()`, and `UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL
+view is carried as PostgreSQL deparsed it, so the item lists the views that read the clock
+for you to review. The item (**MANUAL**) names those columns and views, and what the
+application must do: if it relies on the session's zone — `NOW()` or `CURRENT_DATE` written
+into such a column, or compared with one — it runs `SET TIME ZONE 'Asia/Seoul'` on every
+new Aurora DSQL connection (Aurora DSQL allows it) or writes the zone in its SQL. A zone
+that cannot be told — `SYSTEM` reported only by an abbreviation such as `KST`, a PostgreSQL
+`TimeZone` with daylight-saving rules, or one its short connection could not read while the
+`ALTER DATABASE` / `ALTER ROLE` defaults were read — is said so in an advisory item, and the
+conversion assumes UTC, as it does for a source in UTC. A read that captures nothing at all
+shows no item, and the conversion assumes UTC then too.
 
 Neither read sees a value the application sets for itself: a session `SET`
 (`SET sql_mode`, `SET time_zone`, `SET TIME ZONE`), or an option its driver or connection
@@ -421,8 +447,12 @@ MySQL→PostgreSQL transpile:
   `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. Two
   translations happen for you:
   a `TINYINT(1)` default becomes `TRUE`/`FALSE` for the `boolean` target, and a
-  `DATETIME` default is pinned to UTC so it matches the naive-UTC values the loader
-  writes. This matters most for a **`NOT NULL` column with a default**: MySQL accepts
+  `DATETIME` default that reads the clock names the source's time zone —
+  `now() AT TIME ZONE 'UTC'` for a source in UTC, the zone Evaluation read otherwise
+  (`SOURCE_TIME_ZONE`, §2.1), clock arithmetic in whole numbers of one unit, such as
+  `CURRENT_TIMESTAMP + INTERVAL 30 DAY`, kept on top of it (other clock arithmetic is dropped
+  and reported, as below) — because the column holds the source's wall clock, which the loader
+  copies as it is. This matters most for a **`NOT NULL` column with a default**: MySQL accepts
   an `INSERT` that omits it, and without the default the target would reject that same
   statement — an application break that would only show up after cut-over. Where a
   default genuinely has no DSQL equivalent (MySQL's `UUID()` translates, but an
@@ -432,7 +462,9 @@ MySQL→PostgreSQL transpile:
   application to handle. **For a PostgreSQL source** a column DEFAULT **is** carried
   across **verbatim** — the exact text PostgreSQL stores (`pg_get_expr`), never re-rendered,
   so `CURRENT_TIME`, `CURRENT_TIMESTAMP(0)`, a `date_part(...)` stored before PostgreSQL 14
-  and a 3-argument `date_trunc(..., 'Asia/Seoul')` reach Aurora DSQL unchanged; a primary-key
+  and a 3-argument `date_trunc(..., 'Asia/Seoul')` reach Aurora DSQL unchanged (but for a
+  source whose time zone is not UTC, where a clock default on a column without a time zone
+  names that zone, `SOURCE_TIME_ZONE`); a primary-key
   `serial`/`IDENTITY` `nextval` is governed by the chosen primary-key strategy instead, and a
   non-key `nextval`, a default that does not parse, one that casts to a type DSQL lacks, or one
   that calls a function DSQL lacks (another uuid-ossp generator, or a schema-qualified function
@@ -482,7 +514,8 @@ MySQL→PostgreSQL transpile:
   (`FIND_IN_SET`, `UNIX_TIMESTAMP`, a user function) is flagged MANUAL at both steps
   (`VIEW_NOT_CONVERTED`): its `CREATE VIEW` fails unless the function exists on Aurora DSQL. MySQL calls with a
   faithful PostgreSQL form are rewritten to it (`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()` as `EXTRACT`,
-  `DATEDIFF`/`TO_DAYS`, `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP` and `CURTIME()` as the session's wall clock and
+  `DATEDIFF`/`TO_DAYS`, `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP` and `CURTIME()` as the session's wall clock
+  (the source zone's, with `SYSDATE()` and `CURDATE()`, when the zone Evaluation read is not UTC: `SOURCE_TIME_ZONE`) and
   `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()` as the UTC one, truncated to their precision as MySQL does,
   `STDDEV`/`VARIANCE` as the population forms MySQL computes and `VAR_SAMP`/`STDDEV_SAMP` as the sample ones,
   `CAST(x AS CHAR [CHARSET ...])` as text — `varchar(n)` with a length, which truncates and never pads — and
@@ -825,8 +858,8 @@ conversion (redesign).
 | MySQL type | Aurora DSQL type | Stored value form | Class | Note |
 |---|---|---|---|---|
 | `DATE` | `date` | `date` | AUTO | |
-| `DATETIME` | `timestamp` (without time zone) | `timestamp` (UTC wall-clock) | AUTO | Treated/normalized as **UTC**. |
-| `DATETIME(6)` | `timestamp` | `timestamp` (UTC, microsecond precision) | AUTO | Fractional seconds preserved to microseconds. |
+| `DATETIME` | `timestamp` (without time zone) | `timestamp` (the source's wall clock) | AUTO | Copied as it is, in whatever zone it was written: no time zone is applied or shifted. A default that reads the clock names the source's zone (`SOURCE_TIME_ZONE`, §2.1). |
+| `DATETIME(6)` | `timestamp` | `timestamp` (wall clock, microsecond precision) | AUTO | Fractional seconds preserved to microseconds. |
 | `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | Stored as an absolute UTC instant. |
 | `TIME` | `time` (without time zone) | `time` | MANUAL | In-range `00:00:00..23:59:59`. An **out-of-range** MySQL `TIME` (negative or `> 24h`, MySQL range `-838:59:59..838:59:59`) has no `time` representation → **fails loudly** (needs an `interval` column instead). Evaluation flags it too (`TIME_TYPE`). Under CDC (sink plugin v54+) such a value is written as an interval: it lands in a column remapped to `interval` and is dead-lettered with that reason for a `time` column. Remapped to `interval` or text, Full Load and CDC both write `[-]HH:MM:SS[.f]` (hours not capped at 24) and Validation compares the durations. |
 | `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL has no `YEAR` type; `1901–2155` fits `smallint`, stored as the integer year (`YEAR` display semantics not preserved). |
@@ -862,7 +895,7 @@ conversion (redesign).
 | **One DDL per transaction** | Schema conversion emits exactly one DDL statement per execution unit. |
 | **`CREATE INDEX ASYNC`** | Secondary indexes are created asynchronously, after data. |
 | **Optimistic concurrency** | Every batch and DDL is wrapped in `40001` retry. |
-| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default is pinned to UTC to match the loader's naive-UTC values, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`CURRENT_TIME`, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across verbatim (the exact text PostgreSQL stores, never re-rendered) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. A converted enum column keeps its default as a plain text literal, and uuid-ossp's `uuid_generate_v4()` becomes `gen_random_uuid()`; a default that casts to another type DSQL lacks, or calls a function it lacks, is dropped with a note. |
+| **Column defaults ARE supported** | **MySQL source:** a source `DEFAULT` is carried across, including `CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, and `LOCALTIME`/`LOCALTIMESTAMP`. `TINYINT(1)` defaults become `TRUE`/`FALSE` (a `boolean` column rejects `DEFAULT 1`), a `DATETIME` default that reads the clock names the source's time zone (`now() AT TIME ZONE 'UTC'` for a source in UTC; `SOURCE_TIME_ZONE`), since the loader copies the column's wall clock as it is, and function defaults are translated (`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `CURTIME()`→`LOCALTIME` on a `TIME` column, `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC expressions). A default with no DSQL equivalent (e.g. one referencing another column) is dropped and **reported**, never silently lost. Keeping the default matters most on a `NOT NULL` column: MySQL accepts an `INSERT` that omits it, the target would not. **PostgreSQL source:** a source `DEFAULT` **is** carried across verbatim (the exact text PostgreSQL stores, never re-rendered; for a source whose time zone is not UTC a clock default on a column without a time zone names that zone) — only a `serial`/`IDENTITY` `nextval` and a generated-column expression are stripped, and identity is governed by the chosen PK strategy on the target instead. A converted enum column keeps its default as a plain text literal, and uuid-ossp's `uuid_generate_v4()` becomes `gen_random_uuid()`; a default that casts to another type DSQL lacks, or calls a function it lacks, is dropped with a note. |
 | **No `ON UPDATE CURRENT_TIMESTAMP`** | Unreproducible: DSQL has neither an `ON UPDATE` clause nor triggers (the usual PostgreSQL workaround). The column keeps its insert-time default and is flagged **MANUAL** — set the timestamp explicitly on update in your application. |
 | **No triggers / stored procedures / events** | Flagged **UNSUPPORTED** — reimplement in the application (or EventBridge/Lambda for scheduled events). |
 | **No native partitioning** | DSQL auto-distributes; Schema Conversion drops the partitioning, and a partitioned table gets a recommendation (what depended on its partitions, and pausing partition maintenance under CDC), not a gap. |
