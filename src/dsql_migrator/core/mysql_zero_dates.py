@@ -39,7 +39,9 @@ sink; the source connector sets neither ``event.processing.failure.handling.mode
 :class:`~dsql_migrator.core.models.ColumnDef` (type, nullability, ``DEFAULT``): the Full Load
 reader maps the driver's ``str`` with :meth:`ZeroDateMapping.value`, and Validation renders
 the source through :meth:`ZeroDateMapping.sql`, so a table whose only differences are such
-values compares equal and any other difference still differs. Pure: no database, no AWS.
+values compares equal and any other difference still differs. A primary-key column is not
+mapped (:func:`zero_date_mappings`): its rows would fall onto one key. Pure: no database, no
+AWS.
 """
 
 from __future__ import annotations
@@ -217,6 +219,25 @@ def zero_date_mapping(column: Optional[ColumnDef]) -> Optional[ZeroDateMapping]:
     return ZeroDateMapping(base, zero, epoch)
 
 
+def zero_date_mappings(table: TableDef) -> "dict[str, ZeroDateMapping]":
+    """The mapping of each of ``table``'s DATE / DATETIME / TIMESTAMP columns, by name --
+    except a primary-key column's (G154). Pure.
+
+    A key column's zero or invalid date stays as it is stored: mapped, distinct keys become
+    one -- every zero date the column's DEFAULT or 1970-01-01, every day the month does not
+    have 1970-01-01, and either one the key of the row that really holds that date -- and the
+    load kept one of the rows on such a key and counted the others as already on the target,
+    the valid row among them, or failed the batch that held two. As stored, Aurora DSQL
+    rejects the value (SQLSTATE 22008), so Full Load quarantines that row alone, as before
+    G150, and Validation, which renders a key column as stored too, reports it missing."""
+    key = set(table.primary_key)
+    return {
+        column.name: mapping
+        for column in table.columns
+        if column.name not in key and (mapping := zero_date_mapping(column)) is not None
+    }
+
+
 def check_query(table: TableDef) -> Optional[str]:
     """A query the operator can run on the source to count ``table``'s rows that hold a zero
     or invalid date, or None when it has no DATE / DATETIME / TIMESTAMP column. Evaluation
@@ -248,5 +269,6 @@ __all__ = [
     "invalid_sql",
     "temporal_base",
     "zero_date_mapping",
+    "zero_date_mappings",
     "zero_sql",
 ]

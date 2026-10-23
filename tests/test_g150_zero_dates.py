@@ -615,17 +615,19 @@ def test_every_mysql_pager_renders_the_mapping() -> None:
         build_mysql_pk_token_sql(table, "id"),                 # the row-diff sample
     ):
         assert mapped in sql and "ELSE `stamped` END" in sql
+    # A key column is rendered as stored (G154): Full Load does not map it.
+    assert "YEAR(`due`)" not in build_mysql_composite_page_sql(composite)
+    assert "YEAR(`due`) = 0" in build_mysql_checksum_sql(table)
 
 
 def test_the_row_diff_sample_selects_a_temporal_key_as_the_target_holds_it() -> None:
+    # G154: Full Load leaves a key column's zero or invalid date as stored (its row is
+    # quarantined), so the sample selects the key as stored, the key the target holds.
     table = TableDef(name="app.days", columns=[_col("pk", "date", nullable=False),
                                                 _col("v", "int")], primary_key=["pk"])
     sql = build_mysql_pk_token_sql(table, "pk")
-    assert sql.startswith(
-        "SELECT CASE WHEN (YEAR(`pk`) = 0 OR MONTH(`pk`) = 0 OR DAYOFMONTH(`pk`) = 0) "
-        "THEN DATE'1970-01-01'")
-    # Ordered by the column itself (table-qualified), not the CASE its alias names.
-    assert sql.endswith("ORDER BY `app`.`days`.`pk` LIMIT :sample_size")
+    assert sql.startswith("SELECT `pk` AS pk, ") and "YEAR(`pk`)" not in sql
+    assert sql.endswith("ORDER BY `pk` LIMIT :sample_size")
     # A key of another type is selected and ordered exactly as before.
     plain = build_mysql_pk_token_sql(_dated_table(), "id")
     assert plain.startswith("SELECT `id` AS pk, ") and plain.endswith(
@@ -768,7 +770,7 @@ def test_the_limitations_chapter_states_the_mapping_and_the_cdc_stop(language: s
     section = text.split("## 6.2", 1)[1].split("## 6.3", 1)[0]
     for spelled in ("`0000-00-00`", "`2024-00-15`", "`2024-02-31`", "`ALLOW_INVALID_DATES`",
                     "`ZERO_DATES`", "`1970-01-01`", "`1970-01-01 00:00:00`", "`DEFAULT`",
-                    "`TIMESTAMP`", "Validation", "WARNING", "**Start CDC**", "`1525`",
+                    "`TIMESTAMP`", "Validation", "WARNING", "**Start CDC**",
                     "`22008`", "Debezium"):
         assert spelled in section, (language, spelled)
 

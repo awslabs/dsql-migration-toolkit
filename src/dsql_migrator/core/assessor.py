@@ -3153,8 +3153,9 @@ def check_mysql_sql_mode(
 ) -> list[AssessmentItem]:
     """The flags of the source's GLOBAL ``sql_mode`` that matter after the move, in one item.
 
-    Every application session starts from that mode (the tool's own sessions read with an
-    empty one), so it says what the application and the source's data were allowed to do:
+    Every application session starts from that mode (the tool's own sessions read with their
+    own, ALLOW_INVALID_DATES alone), so it says what the application and the source's data
+    were allowed to do:
     without ONLY_FULL_GROUP_BY a view or query may select a column it neither groups nor
     aggregates, which Aurora DSQL rejects (42803); under ANSI_QUOTES or PIPES_AS_CONCAT the
     application's SQL means something else in MySQL's default mode, which the Query
@@ -3193,8 +3194,8 @@ def check_mysql_sql_mode(
             f"With {' and '.join(special)}, application SQL written for that mode "
             f"({'; '.join(meanings)}) means something else in MySQL's default mode, which is "
             "how the Query Converter reads SQL: it converts such a statement into a different "
-            "one. The tool's own reads are not affected: its source sessions run with an empty "
-            "sql_mode."
+            "one. The tool's own reads are not affected: its source sessions run with sql_mode "
+            "'ALLOW_INVALID_DATES', which has neither."
         )
         advice.append(
             "Rewrite application SQL for MySQL's default mode before pasting it into the Query "
@@ -3342,6 +3343,37 @@ def check_mysql_zero_dates(
             else ""
         )
     )
+    # A key column's value is not mapped (G154): mapped keys fall onto one.
+    key_columns = [
+        f"{table.name}.{column.name}"
+        for table in inventory.tables
+        for column in table.columns
+        if column.name in table.primary_key and temporal_base(column) is not None
+    ]
+    if key_columns:
+        risks.append(
+            f"A primary key column is the exception ({_counted(key_columns, 'column')}): "
+            "mapped, rows whose keys hold such dates would fall onto one key, so Full Load "
+            "leaves the value as stored, which Aurora DSQL rejects (SQLSTATE 22008) -- the row "
+            "is quarantined and Validation reports the difference -- while CDC writes a change "
+            "to such a row at the mapped key, where it can overwrite or delete the row whose "
+            "key that is."
+        )
+    unique_columns = [
+        f"{table.name}.{column.name}"
+        for table in inventory.tables
+        for column in table.columns
+        if column.name not in table.primary_key
+        and temporal_base(column) is not None
+        and any(index.unique and column.name in index.columns for index in table.indexes)
+    ]
+    if unique_columns:
+        risks.append(
+            f"In a unique key ({_counted(unique_columns, 'column')}), different such dates can "
+            "be written as one value, or as the value another row holds: its index then fails "
+            "to build after the load, and CDC dead-letters the row that collides (SQLSTATE "
+            "23505)."
+        )
     queries = [
         query
         for table in inventory.tables
@@ -3358,8 +3390,10 @@ def check_mysql_zero_dates(
             if more > 0
             else ""
         ),
-        "Where the value Full Load writes is not what the row should hold, correct the row "
-        "on the source before the Full Load"
+        "Where the value Full Load writes is not what the row should hold"
+        + (", and in every primary or unique key that holds such a date"
+           if key_columns or unique_columns else "")
+        + ", correct the row on the source before the Full Load"
         + (
             ", and every day the month does not have before CDC starts: a CDC that stopped "
             "at one starts again only from a newer start point."

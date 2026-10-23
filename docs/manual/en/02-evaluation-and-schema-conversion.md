@@ -128,11 +128,14 @@ Neither read sees a value the application sets for itself: a session `SET`
 string sends when it connects. A read that fails leaves the list empty; it never fails
 Evaluation.
 
-The tool's own MySQL source sessions read with a neutral `sql_mode`: each one runs
-`SET time_zone = '+00:00', sql_mode = ''` when it connects. It is a session setting —
-nothing is written to the source — and it keeps a parameter group's `sql_mode` from
-changing what the tool reads: under `ANSI_QUOTES`, for one, `SHOW CREATE` prints a view's
-body with double-quoted identifiers, which the conversion would read as strings.
+The tool's own MySQL source sessions read with a `sql_mode` of their own: each one runs
+`SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'` when it connects. It is a
+session setting — nothing is written to the source — and it keeps a parameter group's
+`sql_mode` from changing what the tool reads: under `ANSI_QUOTES`, for one, `SHOW CREATE`
+prints a view's body with double-quoted identifiers, which the conversion would read as
+strings. `ALLOW_INVALID_DATES` changes no parsing; it lets the tool's reads name a stored
+date the month does not have (`2024-02-31`), which MySQL 8.0 and later refuse otherwise
+(error `1525`), so a table whose primary key holds one can still be read page by page.
 
 ### Every object gets one classification
 

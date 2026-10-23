@@ -67,7 +67,7 @@ from sqlalchemy.engine import Engine
 from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory
 from dsql_migrator.core.models import SourceConnectionConfig, SourceType, TableDef
-from dsql_migrator.core.mysql_zero_dates import ZeroDateMapping, zero_date_mapping
+from dsql_migrator.core.mysql_zero_dates import ZeroDateMapping, zero_date_mappings
 from dsql_migrator.core.source_dialect import (
     MySQLSourceDialect,
     SourceDialect,
@@ -361,14 +361,12 @@ class ValueConverter:
         # and the zero TIMESTAMP as a str, which Aurora DSQL rejects (22008). Each is
         # written as the bundled CDC writes it (core.mysql_zero_dates: NULL or the
         # column's DEFAULT / the epoch), whatever the target type, and counted per column
-        # for the table's one activity-log line. These columns leave the pass-through fast
+        # for the table's one activity-log line -- except in a primary-key column (G154),
+        # where mapped keys fall onto one and the row's str is left for Aurora DSQL to
+        # reject, quarantining that row alone. These columns leave the pass-through fast
         # path below (a DATE column took it before): a real value costs one convert_value
         # call, O(1), and only a str is parsed.
-        self._zero_dates: dict[str, ZeroDateMapping] = {
-            column.name: mapping
-            for column in table.columns
-            if (mapping := zero_date_mapping(column)) is not None
-        }
+        self._zero_dates: dict[str, ZeroDateMapping] = zero_date_mappings(table)
         # (column, ZERO | INVALID) -> how many values this converter mapped.
         self.zero_dates: dict[tuple[str, str], int] = {}
         # Fast-path: columns whose target kind needs no conversion (int, varchar,

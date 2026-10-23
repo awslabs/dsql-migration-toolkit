@@ -2522,8 +2522,8 @@ def source_settings_caption(source_type: Optional[SourceType]) -> str:
         )
     return (
         "The server's GLOBAL values, which an application session starts from. The tool's own "
-        "source sessions read with time_zone '+00:00' and an empty sql_mode: a session "
-        "setting, nothing is written to the source."
+        "source sessions read with time_zone '+00:00' and sql_mode 'ALLOW_INVALID_DATES', which "
+        "changes no parsing: a session setting, nothing is written to the source."
     )
 
 

@@ -10,8 +10,9 @@ ANSI_QUOTES, SHOW CREATE re-printed a view's body with double-quoted identifiers
 converter (like MySQL's default mode) read as string literals -- a view returning constants,
 with no warning.
 
-* The pin: one SET in the shared init_command pins time_zone '+00:00' and sql_mode '' on
-  every MySQL source session, through every engine the tool builds; through the real
+* The pin: one SET in the shared init_command pins time_zone '+00:00' and sql_mode
+  'ALLOW_INVALID_DATES' (G154; '' until then) on every MySQL source session, through every
+  engine the tool builds; through the real
   SQLAlchemy MySQL dialect over a PyMySQL-like double whose parameter group sets ANSI_QUOTES,
   a view body is read backtick-quoted (and, as a control, double-quoted without the pin).
 * The capture: MySQL's GLOBAL values in one SHOW GLOBAL VARIABLES; PostgreSQL's TimeZone over
@@ -69,7 +70,9 @@ from dsql_migrator.core.source_dialect.mysql import MYSQL_SERVER_SETTINGS
 from dsql_migrator.ui import connect
 from dsql_migrator.ui.connect import make_source_engine_factory
 
-PIN = "SET time_zone = '+00:00', sql_mode = ''"
+PIN = "SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'"
+# The session sql_mode the pin leaves: no flag that changes how SQL parses (G154).
+SESSION_MODE = "ALLOW_INVALID_DATES"
 # What an RDS / Aurora parameter group might set: MySQL 8.0's default plus ANSI_QUOTES and
 # PIPES_AS_CONCAT.
 ANSI_PARAMETER_GROUP = (
@@ -290,10 +293,10 @@ def test_every_mysql_source_engine_runs_the_pin_on_connect(
         engine.dispose()
     assert server.connect_kwargs[0]["init_command"] == PIN
     # The first statement of the session is the pin, under the parameter group's mode, and
-    # everything after it runs under the empty one -- SQLAlchemy's own sql_mode read too.
+    # everything after it runs under the pinned one -- SQLAlchemy's own sql_mode read too.
     assert server.log[0] == (PIN, ANSI_PARAMETER_GROUP)
-    assert {mode for _sent, mode in server.log[1:]} == {""}
-    assert server.modes_at(r"^SELECT @@sql_mode$") == [""]
+    assert {mode for _sent, mode in server.log[1:]} == {SESSION_MODE}
+    assert server.modes_at(r"^SELECT @@sql_mode$") == [SESSION_MODE]
     assert engine.dialect._server_ansiquotes is False
 
 
@@ -301,7 +304,7 @@ def test_every_mysql_source_engine_runs_the_pin_on_connect(
 def test_a_view_body_is_never_read_under_the_parameter_groups_ansi_quotes(
     monkeypatch: pytest.MonkeyPatch, factory_name: str
 ) -> None:
-    """Through introspection itself: SHOW CREATE runs under the empty sql_mode, so the body
+    """Through introspection itself: SHOW CREATE runs under the pinned sql_mode, so the body
     is backtick-quoted, and the converter reads its identifiers as identifiers."""
     server = _MySqlServer()
     module = connect if factory_name == "ui" else introspector
@@ -313,7 +316,7 @@ def test_a_view_body_is_never_read_under_the_parameter_groups_ansi_quotes(
     assert view.name == "app.v_open"
     assert view.definition == _view_body("`")
     assert '"' not in view.definition
-    assert server.modes_at(r"^SHOW CREATE TABLE") == [""]
+    assert server.modes_at(r"^SHOW CREATE TABLE") == [SESSION_MODE]
     converted = SchemaConverter().convert_view(view)
     assert converted.auto_converted
     assert '"orders"."id" AS "id"' in converted.target_ddl
@@ -778,7 +781,7 @@ def test_ansi_quotes_and_pipes_as_concat_point_at_the_query_converter() -> None:
     )
     item = _database_items(inventory)[SQL_MODE_RULE_ID]
     assert "With ANSI_QUOTES and PIPES_AS_CONCAT" in item.risk
-    assert "Query Converter" in item.risk and "empty sql_mode" in item.risk
+    assert "Query Converter" in item.risk and "sql_mode 'ALLOW_INVALID_DATES'" in item.risk
     assert "ONLY_FULL_GROUP_BY" not in item.risk
     assert "CONCAT() for ||" in item.recommendation
 
@@ -980,7 +983,7 @@ def test_the_evaluation_screen_lists_the_settings_under_the_source_counts(
         index = shown.texts.index(name)
         assert shown.texts[index + 1] == (value or "(empty)")
     if source_type is SourceType.MYSQL:
-        assert "GLOBAL" in caption and "empty sql_mode" in caption
+        assert "GLOBAL" in caption and "sql_mode 'ALLOW_INVALID_DATES'" in caption
         assert "nothing is written to the source" in caption
     else:
         assert "ALTER ROLE" in caption and "SET TIME ZONE" in caption

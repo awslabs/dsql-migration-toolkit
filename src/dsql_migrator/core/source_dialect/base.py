@@ -496,8 +496,8 @@ class SourceDialect(ABC):
         (:func:`~dsql_migrator.core.introspector.is_write_or_ddl` false). Default: none.
         PostgreSQL turns ``row_security`` off; MySQL sets the session to REPEATABLE READ,
         without which ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` opens no snapshot on a
-        source configured READ-COMMITTED (its session time zone and neutral ``sql_mode`` are
-        pinned through the driver's ``init_command`` instead).
+        source configured READ-COMMITTED (its session time zone and ``sql_mode`` are pinned
+        through the driver's ``init_command`` instead).
         """
         return ()
 

@@ -639,12 +639,17 @@ fails **loudly** where it can't.
     every restart. Correct such rows on the source before **Start CDC**; once CDC has
     stopped at one, it continues only from a newer start point (the first item of this
     section).
-  - **A primary key that holds such a date.** Such a key is written as a fixed date
-    (`1970-01-01`, or the column's `DEFAULT`), so rows whose keys hold one collide on Aurora
-    DSQL — with each other, or with the row whose key is that date — and only one of them is
-    kept; Validation reports the difference. A key holding a day the month does not have can
-    also make the table's read fail with MySQL error `1525`. Correct those keys on the
-    source first.
+  - **A primary key that holds such a date.** Full Load leaves a key column's value as
+    stored: written as a fixed date (`1970-01-01`, or the column's `DEFAULT`), rows whose
+    keys hold one would fall onto one key — each other's, or the key of the row that holds
+    that date. Aurora DSQL rejects the stored value (`22008`), so such a row is quarantined
+    and Validation reports the difference. CDC writes a change to such a row at the fixed
+    date instead, where it can overwrite or delete the row whose key that is. Correct those
+    keys on the source before the Full Load.
+  - **A unique key over such a column.** Different zero or invalid dates can be written as
+    one value, or as the value another row holds, so a unique index over such a column can
+    meet duplicates on Aurora DSQL: it fails to build after the load, and CDC dead-letters
+    the row that collides (`23505`). Correct those values on the source first.
   - **The application's writes.** Aurora DSQL rejects such a date in an `INSERT` or
     `UPDATE` (`22008`): change the code that writes them before cut over.
 - **PostgreSQL: CDC does not carry most extension types.** The bundled CDC connector

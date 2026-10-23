@@ -293,23 +293,33 @@ def source_error_hint(
 # TIME ZONE 'UTC'). DATETIME is a wall-clock and unaffected; this makes TIMESTAMP
 # deterministic regardless of the server/client zone.
 #
-# ``sql_mode = ''`` (G148): a session otherwise inherits the parameter group's sql_mode, and
-# some of its flags change what the tool READS. Under ANSI_QUOTES, SHOW CREATE re-prints a
-# view's body with double-quoted identifiers (MySQL prints it again from the parsed view in
-# the session's mode), which the converter -- like MySQL's default mode -- reads as string
-# literals: ``"orders"."id"`` came out as ``'orders'.'id'``, a view returning constants, with
-# no warning. SHOW GRANTS quotes database names the same way, which the listing-privilege
-# check does not parse. PAD_CHAR_TO_FULL_LENGTH pads every CHAR value read (Full Load wrote
-# the padding; Validation's CAST(col AS CHAR) rendered it against the target's unpadded
-# text), PIPES_AS_CONCAT and NO_BACKSLASH_ESCAPES change how SQL text parses. Every
-# statement the tool runs on a MySQL source -- the catalog reads and SHOW CREATE, keyset
-# pages, checksums, CDC start-point and drift reads, the probes -- is written for MySQL's
-# default parsing (backtick identifiers, single-quoted literals without a backslash, no
-# ``||``, no GROUP BY), and its strict-mode and zero-date flags govern writes, which the
-# tool never makes. The empty mode keeps that parsing, so every read means what it was
-# written to mean whatever the parameter group says. SQLAlchemy's MySQL dialect reads the
-# session's sql_mode after this runs, so its own identifier quoting follows it too.
-_MYSQL_SESSION_INIT_COMMAND = "SET time_zone = '+00:00', sql_mode = ''"
+# ``sql_mode = 'ALLOW_INVALID_DATES'`` (G148, G154): a session otherwise inherits the
+# parameter group's sql_mode, and some of its flags change what the tool READS. Under
+# ANSI_QUOTES, SHOW CREATE re-prints a view's body with double-quoted identifiers (MySQL
+# prints it again from the parsed view in the session's mode), which the converter -- like
+# MySQL's default mode -- reads as string literals: ``"orders"."id"`` came out as
+# ``'orders'.'id'``, a view returning constants, with no warning. SHOW GRANTS quotes database
+# names the same way, which the listing-privilege check does not parse.
+# PAD_CHAR_TO_FULL_LENGTH pads every CHAR value read (Full Load wrote the padding;
+# Validation's CAST(col AS CHAR) rendered it against the target's unpadded text),
+# PIPES_AS_CONCAT and NO_BACKSLASH_ESCAPES change how SQL text parses. Every statement the
+# tool runs on a MySQL source -- the catalog reads and SHOW CREATE, keyset pages, checksums,
+# CDC start-point and drift reads, the probes -- is written for MySQL's default parsing
+# (backtick identifiers, single-quoted literals without a backslash, no ``||``, no GROUP BY);
+# this mode has no parsing flag, so every read means what it was written to mean whatever
+# the parameter group says. SQLAlchemy's MySQL dialect reads the session's sql_mode after
+# this runs, so its own identifier quoting and escaping follow it too.
+#
+# The date flags do govern one read: a date the statement names. A keyset cursor or a page
+# boundary is a stored key bound back, and MySQL 8.0+ refuses a date literal naming a day
+# the month does not have ('2020-02-31', stored under ALLOW_INVALID_DATES) with error 1525
+# unless the session allows it -- the empty mode G148 pinned failed every read of a table
+# whose page ended on one (G154). ALLOW_INVALID_DATES alone lets such a cursor and a zero
+# date ('0000-00-00', which NO_ZERO_DATE would refuse) bind, as stored; every other read --
+# the per-column renders, the checksums, the count queries, the catalog -- was measured
+# identical to the empty mode on MySQL 5.7.44, 8.0.46 and 8.4.11. It governs writes too,
+# which the tool never makes.
+_MYSQL_SESSION_INIT_COMMAND = "SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'"
 
 
 def source_engine_kwargs(
@@ -320,9 +330,9 @@ def source_engine_kwargs(
     Centralizes the engine settings so the connection test, introspection, and
     validation all build the source engine identically: ``pool_pre_ping``, a
     bounded ``connect_timeout`` (so an unreachable host fails fast instead of
-    hanging) and the session pins of :data:`_MYSQL_SESSION_INIT_COMMAND` (UTC and a
-    neutral ``sql_mode``). Exposed (and pure) so it can be asserted in a unit test
-    without opening a connection.
+    hanging) and the session pins of :data:`_MYSQL_SESSION_INIT_COMMAND` (UTC, and a
+    ``sql_mode`` with no parsing flag: ``ALLOW_INVALID_DATES`` only). Exposed (and pure)
+    so it can be asserted in a unit test without opening a connection.
 
     ``read_timeout_seconds`` (opt-in) additionally bounds each socket read/write
     so a connected-but-stalled stream raises instead of blocking forever. It is

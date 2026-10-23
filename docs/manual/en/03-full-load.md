@@ -184,6 +184,8 @@ examples a **MySQL source** produces:
   (`1970-01-01` too for a day the month does not have, at which CDC stops instead), as
   [Chapter 6 §6.2](06-limitations.md#62-migration-process-limits) details. The table then
   gets one WARNING line in the activity log with how many, per column (never the values).
+  A primary-key column's are left as stored, which Aurora DSQL rejects: that row is
+  quarantined.
 - `BLOB`/`BINARY`/`VARBINARY` family → `bytea`.
 
 For a **PostgreSQL source** there is **no** MySQL-style value translation during

@@ -404,7 +404,7 @@ def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str
     return "plain"
 
 
-def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
+def _mysql_checksum_expr(column: "ColumnDef", *, key: bool = False) -> Optional[str]:
     """Inner MySQL render expression for one column (``None`` = omit from checksum).
 
     Normalizes each divergent type to the SAME canonical text the PG side
@@ -420,11 +420,12 @@ def _mysql_checksum_expr(column: "ColumnDef") -> Optional[str]:
     :meth:`~dsql_migrator.core.mysql_zero_dates.ZeroDateMapping.sql` (G150): a zero or
     invalid date becomes the value Full Load and CDC write for it before it is rendered, so
     a table whose only differences are such values matches, and any other value is
-    rendered exactly as before.
+    rendered exactly as before. A primary-key column (``key``) is rendered as stored, as
+    Full Load leaves it (G154, :func:`~dsql_migrator.core.mysql_zero_dates.zero_date_mappings`).
     """
     ident = _quote_mysql_identifier(column.name)
     kind = _checksum_kind(column)
-    mapping = zero_date_mapping(column)
+    mapping = None if key else zero_date_mapping(column)
     value = mapping.sql(ident) if mapping is not None else ident
     if kind == "binary":
         # Spatial -> ST_AsBinary (matches the loader's stored WKB); then lower-hex
@@ -702,7 +703,8 @@ def _mysql_row_token(table: TableDef) -> str:
     Wide tables (>= _CONCAT_MAX_TERMS rendered columns) nest MD5s per group so the
     per-row hash stays under the PG/DSQL 100-argument limit (see :func:`_mysql_md5_concat`).
     """
-    rendered = [_mysql_checksum_expr(column) for column in table.columns]
+    key = set(table.primary_key)
+    rendered = [_mysql_checksum_expr(column, key=column.name in key) for column in table.columns]
     terms = [_mysql_concat_term(expr) for expr in rendered if expr is not None]
     if not terms:
         terms = [f"'{_NULL_SENTINEL}'"]
@@ -785,22 +787,15 @@ def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
     no full materialization: the engine streams in PK order and stops at the LIMIT,
     reading only the first N rows via the primary-key index. Read-only.
 
-    A DATE / DATETIME / TIMESTAMP key is selected as the value Full Load and CDC wrote for a
-    zero or invalid date (G150), so the sample names the key the target holds.
+    A DATE / DATETIME / TIMESTAMP key is selected as stored, the key Full Load wrote: a key
+    column's zero or invalid date is not mapped (G154,
+    :func:`~dsql_migrator.core.mysql_zero_dates.zero_date_mappings`).
     """
     pk_sql = _quote_mysql_identifier(pk_column)
     table_sql = _quote_mysql_table(table.name)
-    mapping = zero_date_mapping(
-        next((column for column in table.columns if column.name == pk_column), None)
-    )
-    key_sql, order_sql = pk_sql, pk_sql
-    if mapping is not None:
-        # Ordered by the column, table-qualified: MySQL reads a bare ORDER BY name as the
-        # select list's alias first, and a key named pk would then sort by the CASE.
-        key_sql, order_sql = mapping.sql(pk_sql), f"{table_sql}.{pk_sql}"
     return (
-        f"SELECT {key_sql} AS pk, {_mysql_row_token(table)} AS tok FROM {table_sql} "
-        f"ORDER BY {order_sql} LIMIT :sample_size"
+        f"SELECT {pk_sql} AS pk, {_mysql_row_token(table)} AS tok FROM {table_sql} "
+        f"ORDER BY {pk_sql} LIMIT :sample_size"
     )
 
 
