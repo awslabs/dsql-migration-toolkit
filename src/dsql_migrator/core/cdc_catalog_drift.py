@@ -196,7 +196,9 @@ def build_mysql_catalog_statement(names: Sequence[str]) -> tuple[str, dict]:
 # inventory's reflection folds it in (SQLAlchemy: ``nullable and not domain.not_null``; one
 # level only, and an array of a domain -- typtype 'b' -- is not folded). ``attnotnull`` alone
 # is false for such a column, so without the fold a NOT NULL domain column would read as a
-# permanent, false "NULL rule changed" finding that holds Cut over.
+# permanent, false "NULL rule changed" finding that holds Cut over. A PostgreSQL 18 NOT NULL
+# added NOT VALID reads NOT NULL here (attnotnull is set at once); the inventory has that
+# column nullable (G167), so diff_table does not compare its NULL rule.
 PG_CATALOG_SQL = (
     "SELECT n.nspname || '.' || c.relname AS qname, a.attname::text AS col, a.attnum, "
     "       pg_catalog.format_type(a.atttypid, a.atttypmod) AS typ, "
@@ -396,6 +398,9 @@ def diff_table(
     ``target_added`` (``{column: source type}``) are columns the operator added to Aurora
     DSQL through Fix target schema: they count as baseline columns (type only, no NULL rule,
     no position), so the live column is not new drift -- unless the source computes it.
+    A PostgreSQL 18 column whose NOT NULL was added NOT VALID (``not_null_not_valid``,
+    G167) has no NULL rule compared either: the read reports it NOT NULL while the
+    inventory, and the target column, have it nullable.
 
     A dropped and an added column at the same position with the same type pair as one
     rename (each column at most once), which also catches a case-only rename. The primary
@@ -419,7 +424,12 @@ def diff_table(
             continue
         base.append(
             _Base(
-                column.name, str(column.mysql_type), bool(column.nullable),
+                column.name, str(column.mysql_type),
+                # A PostgreSQL 18 NOT NULL added NOT VALID (G167): the inventory records the
+                # column nullable and the target column has no NOT NULL, while attnotnull
+                # (this read) is already true -- and stays true once the source VALIDATEs
+                # it. Neither changes what CDC writes, so its NULL rule is not compared.
+                None if getattr(column, "not_null_not_valid", False) else bool(column.nullable),
                 bool(getattr(column, "generated", False)), len(base), False,
             )
         )

@@ -20,7 +20,7 @@ import this lazily without a cycle. All strings are English, credential-free (Pr
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.models import (
@@ -354,8 +354,11 @@ def uncarryable_columns_of(table: TableDef) -> "list[UncarryableCdcColumn]":
                     column=column.name,
                     declared_type=column.mysql_type,
                     reason=reason,
-                    nullable=column.nullable,
+                    # A NOT NULL added NOT VALID is the source's NOT NULL, as the probe reads
+                    # it; the inventory has the column nullable for the target (G167).
+                    nullable=False if column.not_null_not_valid else column.nullable,
                     in_event=is_array and base == "bit",
+                    target_nullable=True if column.not_null_not_valid else None,
                 )
             )
     return found
@@ -416,6 +419,10 @@ class UncarryableCdcColumn:
     # bit(n)[], whatever its declared name -- a domain over one included). None: judged
     # from ``declared_type``.
     in_event: Optional[bool] = None
+    # The TARGET column's NULL rule where it differs from the source's: a PostgreSQL 18 NOT
+    # NULL added NOT VALID is NOT NULL on the source (Debezium marks the field required) but
+    # the column is created without NOT NULL on Aurora DSQL (G167). None: as ``nullable``.
+    target_nullable: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -1416,7 +1423,14 @@ def check_columns_replicable(
         )
     # Only columns this migration still writes: an excluded column is never captured.
     skip = set(excluded or ())
-    found = [c for c in (per_table.get(table.name) or ()) if c.column not in skip]
+    # The probe reads the SOURCE's NOT NULL; a NOT NULL added NOT VALID is created without
+    # it on the target (G167), so what an insert there does is judged by the target's.
+    unvalidated = {c.name for c in table.columns if c.not_null_not_valid}
+    found = [
+        replace(c, target_nullable=True) if c.column in unvalidated else c
+        for c in (per_table.get(table.name) or ())
+        if c.column not in skip
+    ]
     if not found:
         return None
     keys = change_key_columns(table, key_columns)
@@ -1473,6 +1487,12 @@ def target_defaulted_columns(table: TableDef) -> "set[str]":
         if pg_column_default_sql(column, is_key_column=column.name in table.primary_key)[0]
         is not None
     }
+
+
+def _target_not_null(column: UncarryableCdcColumn) -> bool:
+    """Whether the TARGET column is NOT NULL (``target_nullable``, else the source's rule)."""
+    nullable = column.nullable if column.target_nullable is None else column.target_nullable
+    return nullable is False
 
 
 def _stays_in_event(column: UncarryableCdcColumn) -> bool:
@@ -1594,11 +1614,11 @@ def uncarryable_column_texts(
     # The others are left OUT of the event, so the sink's upsert never names them: an
     # insert takes the column's DEFAULT (or NULL) and an update leaves it as it was -- but
     # a NOT NULL one with no DEFAULT has every insert and update refused, because Aurora
-    # DSQL checks NOT NULL before ON CONFLICT.
+    # DSQL checks NOT NULL before ON CONFLICT. That is the TARGET column's NOT NULL.
     dropped = [c for c in lost if c not in present]
-    refused = [c for c in dropped if c.nullable is False and c.column not in has_default]
+    refused = [c for c in dropped if _target_not_null(c) and c.column not in has_default]
     landed_default = [c for c in dropped if c.column in has_default]
-    nulled = [c for c in dropped if c.nullable is not False and c.column not in has_default]
+    nulled = [c for c in dropped if not _target_not_null(c) and c.column not in has_default]
     wrong = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
 
     sentences: list[str] = _uncarried_key_sentences(keyed, keys) if keyed else []
