@@ -226,10 +226,12 @@ def pg_column_default_sql(
 # A clock DEFAULT as pg_get_expr prints it (G149): an instant -- now() and its siblings,
 # CURRENT_TIMESTAMP[(p)] -- or the session's wall clock, date or time of day --
 # LOCALTIMESTAMP[(p)], CURRENT_DATE, CURRENT_TIME[(p)], LOCALTIME[(p)] -- bare, or cast to a
-# type without a time zone, ((now())::date).
+# type without a time zone, ((now())::date), with a precision or not -- now()::timestamp(0)
+# prints as (now())::timestamp(0) without time zone (G166).
 _PG_CLOCK_CAST_RE = re.compile(
     r"\(\s*(?P<clock>[^()]*(?:\(\s*\d?\s*\))?)\s*\)\s*::\s*"
-    r"(?P<cast>date|time without time zone|timestamp without time zone)",
+    r"(?P<cast>date|(?P<cast_base>time|timestamp)"
+    r"(?:\s*\(\s*(?P<cast_precision>\d)\s*\))?\s+without\s+time\s+zone)",
     re.IGNORECASE,
 )
 _PG_CLOCK_RE = re.compile(
@@ -292,13 +294,23 @@ def pg_zoned_clock_default(
         precision = clock.group("precision")
         instant = f"CURRENT_TIMESTAMP({precision})" if precision else "now()"
     reads = {_PG_CLOCK_KINDS.get(keyword, "timestamp")}
+    rounded = cast.group("cast_precision") if cast is not None else None
     if cast is not None:
-        reads.add(_PG_CLOCK_KINDS.get(" ".join(cast.group("cast").lower().split()), "timestamp"))
+        base = (cast.group("cast_base") or "").lower()
+        reads.add(
+            _PG_CLOCK_KINDS.get(f"{base} without time zone" if base else "date", "timestamp")
+        )
     kinds = reads | {column_kind}
     if "time" in kinds:
         # A time of day is stored only in a time column, from a clock or a time.
-        return zone.time_sql(instant) if column_kind == "time" and "date" not in kinds else None
-    return zone.date_sql(instant) if "date" in kinds else zone.clock_sql(instant)
+        if column_kind != "time" or "date" in kinds:
+            return None
+        # A cast's precision rounds the zone's time of day as the source's rounds its own.
+        return f"({zone.clock_sql(instant)}::time({rounded}))" if rounded else zone.time_sql(instant)
+    clock = f"({zone.clock_sql(instant)}::timestamp({rounded}))" if rounded else None
+    if "date" in kinds:
+        return f"({clock}::date)" if clock else zone.date_sql(instant)
+    return clock or zone.clock_sql(instant)
 
 
 @functools.lru_cache(maxsize=16384)
