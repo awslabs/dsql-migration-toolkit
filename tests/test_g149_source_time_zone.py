@@ -150,7 +150,9 @@ def test_the_resolved_zone_quotes_what_the_source_reported() -> None:
         ("<+10>-10<+11>,M10.1.0,M4.1.0/3", "unknown", ""),
         ("<+0530>-05:30:15", "unknown", ""),
         ("localtime", "unknown", ""),
-        ("9", "unknown", ""),  # a bare number is no POSIX string (SET TIME ZONE reads it ISO-signed)
+        # A bare number is no POSIX string: hours EAST of UTC, as SET TIME ZONE and an ALTER
+        # DATABASE default read it (G183; SHOW gives it as '<+09>-09').
+        ("9", "offset", "+09:00"),
     ],
 )
 def test_the_postgresql_zone_is_resolved_from_its_timezone(value: str, kind: str, zone: str) -> None:

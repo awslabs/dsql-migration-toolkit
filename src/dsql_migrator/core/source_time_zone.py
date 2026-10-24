@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 from dsql_migrator.core.models import SourceType, ViewDef
@@ -64,6 +65,14 @@ _MYSQL_OFFSET_RE = re.compile(r"^([+-])(\d{1,2}):(\d{2})$")
 # INTERVAL '+05:30' HOUR TO MINUTE; verified on 16 and 17), 'JST-9', 'UTC+9', '+09:00'.
 _POSIX_FIXED_RE = re.compile(
     r"^(<[A-Za-z0-9+\-:]*>|[A-Za-z]{3,})?([+-]?)(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$"
+)
+# A raw ALTER DATABASE / ALTER ROLE TimeZone (pg_db_role_setting) that check_timezone reads
+# as a number of hours east of UTC: all of it consumed by strtod ('-5', '+9', '9.5', '0').
+_ISO_HOURS_RE = re.compile(r"([+-]?)(\d+(?:\.\d*)?|\.\d+)")
+# ... or as an INTERVAL, in the text interval_out writes with the default IntervalStyle
+# ('postgres', and 'sql_standard' alike): INTERVAL '05:30:00', INTERVAL '-05:30:00'.
+_INTERVAL_ZONE_RE = re.compile(
+    r"interval\s+'\s*([+-]?)(\d{1,2}):(\d{2})(?::(\d{2})(?:\.0+)?)?\s*'", re.IGNORECASE
 )
 # The largest offset either engine takes, in minutes (MySQL's +14:00).
 _MAX_OFFSET_MINUTES = 14 * 60
@@ -187,12 +196,44 @@ def _mysql_zone_of(value: str, settings: Mapping[str, str], origin: str) -> Sour
     return _named(value, setting)
 
 
+def _iso_hours_zone(sign: str, minutes: Decimal, setting: str) -> SourceZone:
+    """A zone ``minutes`` east (``sign`` '+') or west ('-') of UTC; unknown when it is no
+    whole number of minutes or is out of range."""
+    if minutes != minutes.to_integral_value():
+        return SourceZone("unknown", "", setting)  # an offset with seconds
+    whole = int(minutes)
+    iso = _offset(sign, whole // 60, whole % 60)
+    if iso is None:
+        return SourceZone("unknown", "", setting)
+    if iso == "+00:00":
+        return SourceZone("utc", "UTC", setting)
+    return SourceZone("offset", iso, setting)
+
+
 def _postgres_zone(settings: Mapping[str, str]) -> SourceZone:
     value = settings.get("TimeZone")
     if not isinstance(value, str):
         return UNREAD_ZONE
     value = value.strip()
     setting = f"TimeZone '{value}'"
+    # What ALTER DATABASE / ALTER ROLE stored (pg_db_role_setting), read as PostgreSQL's
+    # check_timezone reads it (G183): a value that is wholly a number is hours EAST of UTC
+    # (ALTER DATABASE app SET timezone = -5 is UTC-05:00, which SHOW gives as '<-05>+05'), and
+    # 'INTERVAL ...' -- what SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE stores -- an
+    # interval east of UTC. SHOW never gives either form.
+    number = _ISO_HOURS_RE.fullmatch(value)
+    if number is not None:
+        hours = Decimal(number.group(2))
+        return _iso_hours_zone("-" if number.group(1) == "-" and hours else "+", hours * 60, setting)
+    interval = _INTERVAL_ZONE_RE.fullmatch(value)
+    if interval is not None:
+        sign, hours, minutes, seconds = interval.groups()
+        if int(seconds or 0):
+            return SourceZone("unknown", "", setting)  # an offset with seconds
+        total = Decimal(int(hours) * 60 + int(minutes))
+        return _iso_hours_zone("-" if sign == "-" and total else "+", total, setting)
+    if value.lower().startswith("interval"):
+        return SourceZone("unknown", "", setting)  # another IntervalStyle's text
     posix = _POSIX_FIXED_RE.match(value)
     # A bare number is no POSIX string (SET TIME ZONE reads it ISO-signed, and shows it as
     # '<+09>-09'), so only an abbreviation or a sign makes one.
@@ -253,8 +294,9 @@ def resolve_source_zone(settings: Mapping[str, str], source_type: SourceType) ->
     source's ``init_connect`` sets, which the application's sessions get (G161; an expression
     there names no zone that can be told). PostgreSQL: the
     ``TimeZone`` a new session gets -- a zone name, or a POSIX string with a fixed offset
-    ('<+09>-09' is UTC+09:00); a POSIX rule with a daylight-saving part is not written. Anything not
-    read, or not one of these, is ``unknown``."""
+    ('<+09>-09' is UTC+09:00); a POSIX rule with a daylight-saving part is not written -- or the
+    text an ALTER DATABASE / ALTER ROLE default stored, a number of hours or an INTERVAL east
+    of UTC ('-5' is UTC-05:00, G183). Anything not read, or not one of these, is ``unknown``."""
     if not isinstance(settings, Mapping):
         return UNREAD_ZONE
     if source_type is SourceType.POSTGRES:
