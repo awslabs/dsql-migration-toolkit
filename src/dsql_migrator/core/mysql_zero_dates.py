@@ -39,9 +39,9 @@ sink; the source connector sets neither ``event.processing.failure.handling.mode
 :class:`~dsql_migrator.core.models.ColumnDef` (type, nullability, ``DEFAULT``): the Full Load
 reader maps the driver's ``str`` with :meth:`ZeroDateMapping.value`, and Validation renders
 the source through :meth:`ZeroDateMapping.sql`, so a table whose only differences are such
-values compares equal and any other difference still differs. A primary-key column is not
-mapped (:func:`zero_date_mappings`): its rows would fall onto one key. Pure: no database, no
-AWS.
+values compares equal and any other difference still differs. A primary-key or unique-key
+column is not mapped (:func:`zero_date_mappings`): its rows would fall onto one key or one
+unique value. Pure: no database, no AWS.
 """
 
 from __future__ import annotations
@@ -230,18 +230,31 @@ def zero_date_mapping(column: Optional[ColumnDef]) -> Optional[ZeroDateMapping]:
     return ZeroDateMapping(base, zero, epoch)
 
 
+def unmapped_columns(table: TableDef) -> "set[str]":
+    """The columns of ``table`` whose zero and invalid dates stay as stored: the primary
+    key's (G154) and every UNIQUE index's (G187). Pure."""
+    columns = set(table.primary_key)
+    for index in table.indexes:
+        if index.unique:
+            columns.update(index.columns)
+    return columns
+
+
 def zero_date_mappings(table: TableDef) -> "dict[str, ZeroDateMapping]":
     """The mapping of each of ``table``'s DATE / DATETIME / TIMESTAMP columns, by name --
-    except a primary-key column's (G154). Pure.
+    except a primary-key or unique-key column's (:func:`unmapped_columns`). Pure.
 
     A key column's zero or invalid date stays as it is stored: mapped, distinct keys become
     one -- every zero date the column's DEFAULT or 1970-01-01, every day the month does not
     have 1970-01-01, and either one the key of the row that really holds that date -- and the
     load kept one of the rows on such a key and counted the others as already on the target,
-    the valid row among them, or failed the batch that held two. As stored, Aurora DSQL
-    rejects the value (SQLSTATE 22008), so Full Load quarantines that row alone, as before
-    G150, and Validation, which renders a key column as stored too, reports it missing."""
-    key = set(table.primary_key)
+    the valid row among them, or failed the batch that held two. In a UNIQUE index the same
+    collision failed the table's load (an append retried the batch's 23505 until it gave up
+    "due to concurrent unique violations", the valid rows unloaded) or, in a reload, the
+    index. As stored, Aurora DSQL rejects the value (SQLSTATE 22008), so Full Load
+    quarantines that row alone, as before G150, and Validation, which renders such a column
+    as stored too, reports it missing."""
+    key = unmapped_columns(table)
     return {
         column.name: mapping
         for column in table.columns
@@ -280,6 +293,7 @@ __all__ = [
     "dateless_kind",
     "invalid_sql",
     "temporal_base",
+    "unmapped_columns",
     "zero_date_mapping",
     "zero_date_mappings",
     "zero_sql",

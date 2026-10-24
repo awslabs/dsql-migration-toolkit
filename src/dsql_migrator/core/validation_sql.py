@@ -28,7 +28,11 @@ from dsql_migrator.core.converter import (
     mysql_enum_set_members,
 )
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
-from dsql_migrator.core.mysql_zero_dates import temporal_base, zero_date_mapping
+from dsql_migrator.core.mysql_zero_dates import (
+    temporal_base,
+    unmapped_columns,
+    zero_date_mapping,
+)
 
 # A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
 # reduce a format_type spelling to its base for a timetz classification (e.g.
@@ -432,8 +436,9 @@ def _mysql_checksum_expr(column: "ColumnDef", *, key: bool = False) -> Optional[
     :meth:`~dsql_migrator.core.mysql_zero_dates.ZeroDateMapping.sql` (G150): a zero or
     invalid date becomes the value Full Load and CDC write for it before it is rendered, so
     a table whose only differences are such values matches, and any other value is
-    rendered exactly as before. A primary-key column (``key``) is rendered as stored, as
-    Full Load leaves it (G154, :func:`~dsql_migrator.core.mysql_zero_dates.zero_date_mappings`).
+    rendered exactly as before. A primary-key or unique-key column (``key``) is rendered as
+    stored, as Full Load leaves it (G154, G187,
+    :func:`~dsql_migrator.core.mysql_zero_dates.zero_date_mappings`).
     """
     ident = _quote_mysql_identifier(column.name)
     kind = _checksum_kind(column)
@@ -719,7 +724,7 @@ def _mysql_row_token(table: TableDef) -> str:
     Wide tables (>= _CONCAT_MAX_TERMS rendered columns) nest MD5s per group so the
     per-row hash stays under the PG/DSQL 100-argument limit (see :func:`_mysql_md5_concat`).
     """
-    key = set(table.primary_key)
+    key = unmapped_columns(table)
     rendered = [_mysql_checksum_expr(column, key=column.name in key) for column in table.columns]
     terms = [_mysql_concat_term(expr) for expr in rendered if expr is not None]
     if not terms:

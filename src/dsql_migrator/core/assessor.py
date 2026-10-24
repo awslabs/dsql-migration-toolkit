@@ -3496,10 +3496,14 @@ def check_mysql_zero_dates(
         and any(index.unique and column.name in index.columns for index in table.indexes)
     ]
     if unique_columns:
+        # Not mapped either (G187): mapped, the duplicate failed the table's load.
         risks.append(
-            f"In a unique key ({_counted(unique_columns, 'column')}), different such dates can "
-            "be written as one value, or as the value another row holds: its index then fails "
-            "to build after the load, and CDC dead-letters the row that collides (SQLSTATE "
+            f"In a unique key ({_counted(unique_columns, 'column')}), Full Load leaves such a "
+            "date as stored too: mapped, different such dates could become one value, or the "
+            "value another row holds, and the load would fail on the duplicate. Aurora DSQL "
+            "rejects the stored value (SQLSTATE 22008), so the row is quarantined and "
+            "Validation reports the difference, while CDC writes a change to such a row with "
+            "the mapped value and dead-letters it when another row holds that value (SQLSTATE "
             "23505)."
         )
     queries = [

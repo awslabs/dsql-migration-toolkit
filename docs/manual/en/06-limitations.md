@@ -648,10 +648,13 @@ fails **loudly** where it can't.
     and Validation reports the difference. CDC writes a change to such a row at the fixed
     date instead, where it can overwrite or delete the row whose key that is. Correct those
     keys on the source before the Full Load.
-  - **A unique key over such a column.** Different zero or invalid dates can be written as
-    one value, or as the value another row holds, so a unique index over such a column can
-    meet duplicates on Aurora DSQL: it fails to build after the load, and CDC dead-letters
-    the row that collides (`23505`). Correct those values on the source first.
+  - **A unique key over such a column.** Full Load leaves the value of a unique key's column
+    as stored too: written as a fixed date, different zero or invalid dates could become one
+    value, or the value another row holds, and the load would fail on the duplicate. Aurora
+    DSQL rejects the stored value (`22008`), so such a row is quarantined and Validation
+    reports the difference. CDC writes a change to such a row with the fixed date instead,
+    and dead-letters it when another row holds that value (`23505`). Correct those values on
+    the source first.
   - **The application's SQL.** Aurora DSQL rejects such a date in an `INSERT`, an
     `UPDATE` or a `WHERE` (`22008`), and the rows a comparison with one found — the
     soft-delete idiom `deleted_at = '0000-00-00 00:00:00'`, or `deleted_at = 0`, since MySQL
