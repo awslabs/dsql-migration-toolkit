@@ -76,7 +76,11 @@ shows:
   recorded): `init_connect` runs at the start of every session of a user without
   `CONNECTION_ADMIN` or `SUPER` — the application's — so the time zone and `SQL_MODE` are
   graded with that value instead of the global one, and `ZERO_DATES` with what either mode
-  lets in. Four are graded, each a database-level **MANUAL** item.
+  lets in. A `sql_mode` it computes from the session's own
+  (`REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', '')`, `CONCAT(@@sql_mode, ',…')`, alone or in
+  `(SELECT …)`) is evaluated from the global one, as a session gets it; one the tool cannot
+  evaluate is named in `SQL_MODE` and `ZERO_DATES`, to check with `SELECT @@SESSION.sql_mode`
+  as the application's user. Four are graded, each a database-level **MANUAL** item.
   `SQL_MODE`: the mode lacks `ONLY_FULL_GROUP_BY` (a view or query may then select a column
   its `GROUP BY` does not determine, which Aurora DSQL rejects with `42803`, a view when
   Schema Conversion applies it), or has `ANSI_QUOTES` / `PIPES_AS_CONCAT` (application SQL

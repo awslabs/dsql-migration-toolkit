@@ -139,13 +139,90 @@ def _set_value(text: str) -> Optional[str]:
     return text
 
 
-def init_connect_settings(init_connect: str) -> "dict[str, str]":
+def evaluate_sql_mode(
+    expression: str, session_mode: Optional[str], global_mode: Optional[str]
+) -> Optional[str]:
+    """The ``sql_mode`` an init_connect ``SET sql_mode = <expression>`` gives a session whose
+    mode is ``session_mode`` -- at its start, the GLOBAL ``global_mode`` -- or ``None`` when
+    ``expression`` is no form read here (G182): a string, ``@@[session.|local.|global.]
+    sql_mode``, REPLACE(), CONCAT(), CONCAT_WS() and TRIM() of those, and ``(SELECT ...)``
+    around one -- the usual ways to relax the mode for an application, such as
+    ``(SELECT REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', ''))``. The flags come back as MySQL
+    keeps them: upper case, the empty ones dropped. Pure."""
+    import sqlglot
+    from sqlglot import exp
+
+    def value(node: object) -> Optional[str]:
+        while isinstance(node, (exp.Paren, exp.Subquery)):
+            node = node.this
+        if isinstance(node, exp.Select):
+            source = node.args.get("from_") or node.args.get("from")
+            plain = all(
+                not node.args.get(key)
+                for key in ("where", "group", "having", "order", "limit", "joins")
+            )
+            dual = source is None or (
+                isinstance(source.this, exp.Table) and source.this.name.lower() == "dual"
+            )
+            if len(node.expressions) != 1 or not plain or not dual:
+                return None
+            return value(node.expressions[0])
+        if isinstance(node, exp.Literal):
+            return node.this if node.is_string else None
+        if isinstance(node, exp.SessionParameter):
+            if node.name.lower() != "sql_mode":
+                return None
+            kind = str(node.args.get("kind") or "session").lower()
+            return global_mode if kind == "global" else session_mode
+        if isinstance(node, exp.Replace):
+            text, search, replacement = (
+                value(node.this), value(node.expression), value(node.args.get("replacement"))
+            )
+            if text is None or search is None or replacement is None:
+                return None
+            return text.replace(search, replacement) if search else text
+        if isinstance(node, exp.Concat):  # ConcatWs is one too
+            parts = [value(part) for part in node.expressions]
+            if not isinstance(node, exp.ConcatWs):
+                return None if None in parts else "".join(parts)  # type: ignore[arg-type]
+            if not parts or parts[0] is None:
+                return None
+            return parts[0].join(part for part in parts[1:] if part is not None)
+        if isinstance(node, exp.Trim):
+            text = value(node.this)
+            strip = value(node.expression) if node.expression is not None else " "
+            if text is None or not strip:
+                return None
+            position = str(node.args.get("position") or "BOTH").upper()
+            while position in ("BOTH", "LEADING") and text.startswith(strip):
+                text = text[len(strip):]
+            while position in ("BOTH", "TRAILING") and text.endswith(strip):
+                text = text[: -len(strip)]
+            return text
+        return None
+
+    try:
+        parsed = sqlglot.parse_one(f"SELECT {expression}", read="mysql")
+    except Exception:  # noqa: BLE001 - an expression this cannot parse is one it cannot read
+        return None
+    result = value(parsed)
+    if result is None:
+        return None
+    return ",".join(part.strip().upper() for part in result.split(",") if part.strip())
+
+
+def init_connect_settings(
+    init_connect: str, *, global_sql_mode: Optional[str] = None
+) -> "dict[str, str]":
     """The ``time_zone`` / ``sql_mode`` a session gets from ``init_connect`` -- ``SET
     time_zone = 'Asia/Seoul'``, ``SET SESSION sql_mode = '...'``, ``SET @@session.x = ...``,
     several in one SET or one statement after another, the last winning, ``DEFAULT`` the
     GLOBAL value again -- by name (:func:`_set_value`). A GLOBAL / PERSIST assignment sets no
-    session's. Pure."""
+    session's. A sql_mode set to an expression of the session's own mode (``REPLACE(
+    @@sql_mode, ...)``) is recorded as the mode it gives (:func:`evaluate_sql_mode`): a
+    session starts from ``global_sql_mode``, the GLOBAL value read with it. Pure."""
     found: dict[str, str] = {}
+    session_mode = global_sql_mode
     for statement in _split_sql(init_connect or "", ";"):
         body = re.match(r"\s*SET\s+(.*)\Z", statement, re.IGNORECASE | re.DOTALL)
         if body is None:
@@ -164,7 +241,16 @@ def init_connect_settings(init_connect: str) -> "dict[str, str]":
             name = match.group("name").lower()
             if this_scope not in ("SESSION", "LOCAL") or name not in _INIT_CONNECT_SETTINGS:
                 continue
-            value = _set_value(match.group("value"))
+            raw = match.group("value")
+            value = _set_value(raw)
+            if name == "sql_mode":
+                if value is None:
+                    session_mode = global_sql_mode
+                elif raw.lstrip()[:1] in ("'", '"') or re.fullmatch(r"[A-Za-z_]\w*", value):
+                    session_mode = value  # a string, or one bare flag
+                else:
+                    session_mode = evaluate_sql_mode(raw, session_mode, global_sql_mode)
+                    value = session_mode if session_mode is not None else value
             if value is None:
                 found.pop(name, None)
             else:
@@ -640,8 +726,11 @@ class MySQLSourceDialect(SourceDialect):
             if len(row) >= 2 and row[0] is not None
         }
         settings = {name: found[name] for name in MYSQL_SERVER_SETTINGS if name in found}
-        # What init_connect sets for the application's sessions, never its text (G161).
-        for name, value in init_connect_settings(found.get("init_connect", "")).items():
+        # What init_connect sets for the application's sessions, never its text (G161); a
+        # sql_mode it computes from the session's own is evaluated from the GLOBAL one (G182).
+        for name, value in init_connect_settings(
+            found.get("init_connect", ""), global_sql_mode=found.get("sql_mode")
+        ).items():
             settings[init_connect_key(name)] = value
         return settings
 
@@ -760,6 +849,7 @@ class MySQLSourceDialect(SourceDialect):
 __all__ = [
     "MYSQL_SERVER_SETTINGS",
     "MySQLSourceDialect",
+    "evaluate_sql_mode",
     "init_connect_settings",
     "is_single_precision_float",
     "mysql_base_type",

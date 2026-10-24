@@ -3274,6 +3274,27 @@ def check_mysql_sql_mode(
             "Rewrite application SQL for MySQL's default mode before pasting it into the Query "
             "Converter (backticks around names, CONCAT() for ||)."
         )
+    unread = assigned is not None and not _readable_sql_mode(assigned)
+    if unread and not risks:
+        # G182: the application's mode is not the global one graded above, and nothing tells
+        # what it is -- the very ways to relax a mode are expressions (REPLACE(@@sql_mode,
+        # 'ONLY_FULL_GROUP_BY', '')) -- so the flags it may lack or add are named to check.
+        risks.append(
+            "If that mode lacks ONLY_FULL_GROUP_BY, a view or an application query may select "
+            "a column that is neither grouped, aggregated, nor fixed by a grouped primary key, "
+            "which Aurora DSQL rejects (SQLSTATE 42803) -- a view when Schema Conversion "
+            "applies it, an application query when it runs after cut over; with ANSI_QUOTES or "
+            "PIPES_AS_CONCAT, application SQL written for that mode means something else in "
+            "MySQL's default mode, which is how the Query Converter reads SQL."
+        )
+        advice.append(
+            "Run SELECT @@SESSION.sql_mode as the application's user. Without "
+            "ONLY_FULL_GROUP_BY there, group or aggregate every selected column of a view the "
+            "apply rejects and test the application's GROUP BY queries on Aurora DSQL before "
+            "cut over (the Query Converter can probe them); with ANSI_QUOTES or "
+            "PIPES_AS_CONCAT, rewrite application SQL for MySQL's default mode before pasting "
+            "it into the Query Converter."
+        )
     if not risks:
         return []
     advice.append(
@@ -3351,23 +3372,39 @@ def check_mysql_zero_dates(
         )
         if applies and read
     ]
-    if not reasons and not zero_defaults:
+    # An init_connect mode the tool cannot read (G182) may let in any of them: it is how a
+    # mode is relaxed (CONCAT(@@sql_mode, ',ALLOW_INVALID_DATES')).
+    unread = assigned is not None and not _readable_sql_mode(assigned)
+    if not reasons and not zero_defaults and not unread:
         return []
     # Only what these flags let in: a zero date unless strict mode and NO_ZERO_DATE refuse it
     # (without strict mode NO_ZERO_DATE only warns) -- or a DEFAULT writes one --, a zero month
     # or day unless NO_ZERO_IN_DATE is set (without strict mode it becomes a zero date), and a
     # day the month does not have only under ALLOW_INVALID_DATES.
-    zero_date = bool(zero_defaults) or (read and ("NO_ZERO_DATE" not in flags or not strict))
-    zero_part = read and "NO_ZERO_IN_DATE" not in flags
-    invalid_day = "ALLOW_INVALID_DATES" in flags
+    zero_date = unread or bool(zero_defaults) or (read and ("NO_ZERO_DATE" not in flags or not strict))
+    zero_part_read = read and "NO_ZERO_IN_DATE" not in flags
+    invalid_day_read = "ALLOW_INVALID_DATES" in flags
+    zero_part = unread or zero_part_read
+    invalid_day = unread or invalid_day_read
     risks: list[str] = []
+    if unread and not reasons:
+        risks.append(
+            f"The source's init_connect sets the application's sessions' sql_mode to {assigned}, "
+            "which the tool cannot read"
+            + (f" (the global sql_mode is '{value}', which lets none in)" if read else "")
+            + ": check SELECT @@SESSION.sql_mode as the application's user. Without "
+            "NO_ZERO_DATE, NO_ZERO_IN_DATE or strict mode (STRICT_TRANS_TABLES or "
+            "STRICT_ALL_TABLES), or with ALLOW_INVALID_DATES, the application can store dates "
+            "Aurora DSQL has no value for: a zero date ('0000-00-00'), a zero month or day "
+            "('2024-00-15') or a day the month does not have ('2024-02-31')."
+        )
     if reasons:
         examples = [
             example
             for example, applies in (
                 ("a zero date ('0000-00-00')", "NO_ZERO_DATE" not in flags or not strict),
-                ("a zero month or day ('2024-00-15')", zero_part),
-                ("a day the month does not have ('2024-02-31')", invalid_day),
+                ("a zero month or day ('2024-00-15')", zero_part_read),
+                ("a day the month does not have ('2024-02-31')", invalid_day_read),
             )
             if applies
         ]
@@ -3504,7 +3541,7 @@ def check_mysql_zero_dates(
         "column's DEFAULT or 1970-01-01, as above -- compare with IS NULL or that value "
         "instead.",
     ]
-    if reasons:
+    if reasons or unread:
         advice.append(
             f"To make the source refuse them from now on, set sql_mode in "
             f"{_INSTANCE_SETTINGS_PARAMETER_GROUP}"
