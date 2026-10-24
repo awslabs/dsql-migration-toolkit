@@ -639,13 +639,17 @@ def build_ai_tool_executor(
                          {"name": c.name, "type": c.mysql_type, "nullable": c.nullable,
                           "default": c.default, "collation": c.collation,
                           "generated": c.generated,
-                          "auto_update_timestamp": c.auto_update_timestamp}
+                          "auto_update_timestamp": c.auto_update_timestamp,
+                          # PostgreSQL 18, named when set (G167): NOT NULL ... NOT VALID.
+                          **({"not_null_not_valid": True} if c.not_null_not_valid else {})}
                          for c in _t.columns
                      ],
                      "indexes": [
                          {"name": i.name, "columns": list(i.columns), "unique": i.unique,
                           "index_type": i.index_type,
-                          "prefix_lengths": dict(i.prefix_lengths)}
+                          "prefix_lengths": dict(i.prefix_lengths),
+                          # PostgreSQL 15+, named when set: kept on the target (G151).
+                          **({"nulls_not_distinct": True} if i.nulls_not_distinct else {})}
                          for i in _t.indexes
                      ],
                      "foreign_keys": [
