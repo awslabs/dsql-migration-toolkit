@@ -263,8 +263,9 @@ def _probe(rows):
 def test_the_probe_asks_for_every_base_type_outside_pg_catalog_but_the_carried_six() -> None:
     sql = " ".join(_PG_CDC_UNCARRYABLE_COLUMNS_SQL.split())
     assert "<> 'pg_catalog'::regnamespace) AS outside_catalog" in sql
+    # G171 widened the branch to the user's composite / range / multirange types as well.
     assert (
-        "OR (COALESCE(ebt.typtype, bt.typtype) = 'b' "
+        "OR (COALESCE(ebt.typtype, bt.typtype) IN ('b', 'c', 'r', 'm') "
         "AND COALESCE(ebt.typnamespace, bt.typnamespace) <> 'pg_catalog'::regnamespace "
         "AND COALESCE(ebt.typname, bt.typname) <> ALL(:carried_extension_types))"
     ) in sql
@@ -389,12 +390,13 @@ def test_evaluation_names_a_vector_column_as_step_3_does() -> None:
     )
     concern = _concerns(table)["CDC_UNCARRYABLE_COLUMN"]
     assert concern.classification is Classification.MANUAL
+    # A composite is left out of the event by its KIND (G171), whatever it is named.
     for flagged in ("`emb` (vector(1536))", "`emb_ext` (ext.vector(3))",
                     "`hv_arr` (halfvec(3)[])", "`sv` (sparsevec(5))", "`cb` (cube)",
-                    "`ean` (ean13)", "`lq` (lquery)"):
+                    "`ean` (ean13)", "`lq` (lquery)", "`pair` (cube)"):
         assert flagged in concern.risk, flagged
     for carried in ("`ct`", "`ct_arr`", "`hs`", "`lt`", "`isbn_col`", "`geom`", "`geog`",
-                    "`mood`", "`pair`"):
+                    "`mood`"):
         assert carried not in concern.risk, carried
     assert "dropped from the change event" in concern.risk
     detail, remediation = uncarryable_column_texts(uncarryable_columns_of(table))

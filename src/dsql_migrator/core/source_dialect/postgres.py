@@ -357,9 +357,10 @@ _PG_TYPE_KINDS = {
 # returned by a third branch with no candidate list (G153): every BASE type
 # (``typtype = 'b'``; an array's element type, through one domain) outside pg_catalog whose
 # name the bundled connector does not know (``:carried_extension_types``, see
-# ``prerequisites_postgres._CDC_CARRIED_EXTENSION_TYPES``), flagged ``outside_catalog``. An
-# enum, a composite, a range or a domain over a domain is not a base type, so it is not
-# returned. Verified on PostgreSQL 17.11 (pgvector 0.8.7) and 13.23: vector, halfvec,
+# ``prerequisites_postgres._CDC_CARRIED_EXTENSION_TYPES``), flagged ``outside_catalog``, and
+# every COMPOSITE, RANGE or MULTIRANGE type outside pg_catalog (G171: the connector leaves
+# them out too, verified with its own schema builder). An enum is carried and a domain over
+# a domain is not resolved, so neither is returned. Verified on PostgreSQL 17.11 (pgvector 0.8.7) and 13.23: vector, halfvec,
 # sparsevec, vector[], cube, seg, ean13, lquery, earth (a domain over cube) and a domain
 # over vector are returned; citext, hstore, ltree, isbn (and their arrays), a base type
 # named geometry, an enum, an enum[] and a composite are not.
@@ -407,8 +408,9 @@ _PG_CDC_UNCARRYABLE_COLUMNS_SQL = (
     "    OR (ebt.oid IS NULL "
     "        AND bt.typnamespace = 'pg_catalog'::regnamespace "
     "        AND bt.typname = ANY(:scalars)) "
-    # An extension's type the connector does not know, scalar or array (see above).
-    "    OR (COALESCE(ebt.typtype, bt.typtype) = 'b' "
+    # An extension's type the connector does not know, scalar or array (see above) -- or a
+    # composite, range or multirange type of the user's (G171).
+    "    OR (COALESCE(ebt.typtype, bt.typtype) IN ('b', 'c', 'r', 'm') "
     "        AND COALESCE(ebt.typnamespace, bt.typnamespace) "
     "            <> 'pg_catalog'::regnamespace "
     "        AND COALESCE(ebt.typname, bt.typname) <> ALL(:carried_extension_types))) "

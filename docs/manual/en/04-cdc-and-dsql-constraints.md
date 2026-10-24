@@ -160,9 +160,11 @@ shows up only in the dead-letter queue card:
   unconstrained `numeric[]` column (Evaluation names such columns in advance,
   `CDC_UNCARRYABLE_COLUMN`, with the columns that arrive NULL instead: `interval[]`,
   `money[]`, `tsvector`, `tsquery`, the geometric types `box`, `circle`, `line`, `lseg`,
-  `path`, `polygon`, and most extensions' types, such as pgvector's `vector`
-  ([§6.2](06-limitations.md#62-migration-process-limits))); a scalar `point` is written as its
-  own text `(x,y)` since sink plugin v54;
+  `path`, `polygon`, `pg_lsn`, `jsonpath`, `xid` / `xid8`, the `reg*` types such as
+  `regclass`, `txid_snapshot` / `pg_snapshot`, the multirange types, composite and range
+  types of your own (the built-in ranges are carried), and most extensions' types, such as
+  pgvector's `vector` ([§6.2](06-limitations.md#62-migration-process-limits))); a scalar
+  `point` is written as its own text `(x,y)` since sink plugin v54;
 - a change record with no key after the source primary key was dropped (MySQL or
   PostgreSQL). The record itself is not classified, but the source schema re-check
   reports the dropped key as "primary key changed at the source".

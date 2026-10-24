@@ -123,7 +123,7 @@ Aurora DSQL에서도 삭제) — 을 알려 줌), 싱크가 바인딩할 수 없
 - 그 밖의 SQLSTATE로 인한 거부(예: `22P02`, `22007`/`22008`, `22021`, `23503`, `54000`). 그 SQLSTATE와 함께
   표시됨;
 - Aurora DSQL에 비해 너무 큰 값([§4.5](#45-1-mib-값당-한도-그리고-dlq));
-- 싱크가 변환할 수 없는 값. 예: PostgreSQL의 `timetz[]`, `bytea[]` 또는 제약 없는 `numeric[]` 컬럼(Evaluation이 이런 컬럼을 미리 알려 줍니다, `CDC_UNCARRYABLE_COLUMN`. 대신 NULL로 도착하는 컬럼도 함께: `interval[]`, `money[]`, `tsvector`, `tsquery`, 기하 타입 `box`, `circle`, `line`, `lseg`, `path`, `polygon`, 그리고 대부분의 확장 타입, 예: pgvector의 `vector`([§6.2](06-limitations.md#62-마이그레이션-프로세스-한계))). 스칼라 `point`는 싱크 플러그인 v54부터 자신의 텍스트 `(x,y)`로 기록됩니다;
+- 싱크가 변환할 수 없는 값. 예: PostgreSQL의 `timetz[]`, `bytea[]` 또는 제약 없는 `numeric[]` 컬럼(Evaluation이 이런 컬럼을 미리 알려 줍니다, `CDC_UNCARRYABLE_COLUMN`. 대신 NULL로 도착하는 컬럼도 함께: `interval[]`, `money[]`, `tsvector`, `tsquery`, 기하 타입 `box`, `circle`, `line`, `lseg`, `path`, `polygon`, `pg_lsn`, `jsonpath`, `xid` / `xid8`, `regclass` 같은 `reg*` 타입, `txid_snapshot` / `pg_snapshot`, multirange 타입, 직접 만든 composite·range 타입(내장 range는 옮겨집니다), 그리고 대부분의 확장 타입, 예: pgvector의 `vector`([§6.2](06-limitations.md#62-마이그레이션-프로세스-한계))). 스칼라 `point`는 싱크 플러그인 v54부터 자신의 텍스트 `(x,y)`로 기록됩니다;
 - 소스 기본 키가 삭제된 뒤의 키 없는 변경 레코드(MySQL 또는 PostgreSQL). 레코드 자체는 분류되지 않지만, 소스
   스키마 재확인이 삭제된 키를 "primary key changed at the source"로 보고함.
 

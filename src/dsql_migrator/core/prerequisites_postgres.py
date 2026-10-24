@@ -69,6 +69,22 @@ UNCARRYABLE_ROW_DEAD_LETTERS = "row_dead_letters"
 UNCARRYABLE_COLUMN_ARRIVES_NULL = "column_arrives_null"
 UNCARRYABLE_COLUMN_ARRIVES_WRONG = "column_arrives_wrong"
 
+# The built-in types the shipped Debezium 2.7.4 PostgreSQL connector has no converter for at
+# all, scalar or array (G171, K28): it types each as java.sql.Types.OTHER (an array as ARRAY)
+# and leaves the column out of every change event, as it does tsvector. Established by
+# building the connector's OWN change-event schemas -- PostgresSchema.refresh through its
+# PostgresConnection and TypeRegistry, with cdc-stack.yaml's value settings -- from a live
+# PostgreSQL 17.11 catalog: each of these, and its array, is absent from the value schema,
+# while xml, interval, money, point, name, oid, the six built-in ranges and an enum are in it.
+_CDC_NO_CONVERTER_TYPES = (
+    "pg_lsn", "jsonpath", "xid", "xid8", "cid", "tid", "aclitem",
+    "regclass", "regtype", "regproc", "regprocedure", "regoper", "regoperator", "regconfig",
+    "regdictionary", "regnamespace", "regrole", "regcollation",
+    "txid_snapshot", "pg_snapshot",
+    "int4multirange", "int8multirange", "nummultirange", "datemultirange", "tsmultirange",
+    "tstzmultirange",
+)
+
 # Keyed by the pg_catalog name of an ARRAY column's ELEMENT type (``_timetz`` -> timetz).
 # Built-in only: the probe's query requires ``typnamespace = 'pg_catalog'``, so a
 # user-defined type spelled ``money`` is never matched -- verified on PostgreSQL 17.11, a
@@ -117,6 +133,8 @@ _CDC_UNCARRYABLE_ARRAY_ELEMENTS = {
     # (B) but WRONG rather than absent: to_jsonb writes ["42"] (a quoted string) while the
     # event carries an unnamed int64 array, so the target renders [42].
     "oid": UNCARRYABLE_COLUMN_ARRIVES_WRONG,
+    # (B), no converter at all (G171).
+    **{name: UNCARRYABLE_COLUMN_ARRIVES_NULL for name in _CDC_NO_CONVERTER_TYPES},
 }
 
 # SCALAR types with the same problem. Scalar timetz / interval / money / xml / point have
@@ -132,7 +150,10 @@ _CDC_UNCARRYABLE_ARRAY_ELEMENTS = {
 # for three of the four width bands (see that function).
 _CDC_UNCARRYABLE_SCALARS = {
     name: UNCARRYABLE_COLUMN_ARRIVES_NULL
-    for name in ("tsvector", "tsquery", "box", "circle", "line", "lseg", "path", "polygon")
+    for name in (
+        "tsvector", "tsquery", "box", "circle", "line", "lseg", "path", "polygon",
+        *_CDC_NO_CONVERTER_TYPES,
+    )
 }
 
 # The widest bit string the remodeled target column can hold. MUST stay equal to the sink's
@@ -190,6 +211,12 @@ _CDC_DROPPED_EXTENSION_TYPES = frozenset(
 # The user-defined KINDS of ColumnDef.type_kind. An extension's type is a BASE type, so a
 # column of one of these kinds is never one, whatever it is named (an enum called ``cube``).
 _USER_DEFINED_TYPE_KINDS = frozenset({"enum", "composite", "domain", "range", "multirange"})
+# The ranges the connector knows (by OID: built in), so a column of one is carried; every
+# other range -- one a user creates -- and every composite and multirange is left out of the
+# change event (G171, verified as _CDC_NO_CONVERTER_TYPES is). An enum is carried.
+_CDC_CARRIED_RANGES = frozenset(
+    {"int4range", "int8range", "numrange", "tsrange", "tstzrange", "daterange"}
+)
 
 
 def classify_uncarryable_cdc_column(
@@ -273,36 +300,54 @@ def _catalog_discriminators(declared: str) -> "tuple[bool, str, int]":
     return is_array, base, typmod
 
 
+def _judged_type(column: ColumnDef) -> "tuple[str, Optional[str]]":
+    """``(type, kind)`` CDC's verdict on ``column`` follows: a DOMAIN's base type, one level
+    deep as the probe resolves it (G171, PG-9; the inventory carries it), else the column's
+    own."""
+    if column.type_kind == "domain" and column.base_type:
+        return column.base_type, None
+    return column.mysql_type, column.type_kind
+
+
 def cdc_drops_extension_type(column: ColumnDef) -> bool:
     """Whether CDC leaves ``column`` out of every change event because its type (an array's
-    element type) is an extension's the bundled connector does not know -- judged by NAME
-    from the inventory (:data:`_CDC_DROPPED_EXTENSION_TYPES`), as Evaluation must.
-    ``format_type`` qualifies a type whose schema is not on the search path
+    element type, a domain's base type) is an extension's the bundled connector does not
+    know -- judged by NAME from the inventory (:data:`_CDC_DROPPED_EXTENSION_TYPES`), as
+    Evaluation must. ``format_type`` qualifies a type whose schema is not on the search path
     (``ext.vector(3)``), so the schema is ignored. An ARRAY of a user-defined type that
     shares such a name is not told apart (the inventory records no element kind); the
     probe, which reads the element's ``typtype``, does. Pure."""
-    if column.type_kind in _USER_DEFINED_TYPE_KINDS:
+    declared, kind = _judged_type(column)
+    if kind in _USER_DEFINED_TYPE_KINDS:
         return False
-    base = _catalog_discriminators(column.mysql_type)[1]
+    base = _catalog_discriminators(declared)[1]
     return base.rpartition(".")[2] in _CDC_DROPPED_EXTENSION_TYPES
 
 
 def uncarryable_columns_of(table: TableDef) -> "list[UncarryableCdcColumn]":
     """The columns of ``table`` CDC cannot carry, judged from the inventory's own column
     types -- the same verdict the Step 3 probe reaches from the catalog, for Evaluation,
-    which reads no catalog for it. A DOMAIN over such a type is not seen here (the inventory
-    names the domain); the probe still sees it, as it sees an extension's type that
-    :func:`cdc_drops_extension_type` does not name. Pure."""
+    which reads no catalog for it. A DOMAIN is judged by its base type, one level deep as
+    the probe does (G171); a composite, a multirange and a range other than the built-in six
+    by their kind. An ARRAY of a composite or range type of the user's is not seen here (the
+    inventory records no element kind), nor an extension's type
+    :func:`cdc_drops_extension_type` does not name; the probe still sees both. Pure."""
     found: list[UncarryableCdcColumn] = []
     for column in table.columns:
-        is_array, base, typmod = _catalog_discriminators(column.mysql_type)
+        declared, kind = _judged_type(column)
+        is_array, base, typmod = _catalog_discriminators(declared)
         extension = cdc_drops_extension_type(column)
-        reason = classify_uncarryable_cdc_column(
-            is_array=is_array,
-            base_type_name=base.rpartition(".")[2] if extension else base,
-            element_typmod=typmod,
-            extension=extension,
-        )
+        if kind in ("composite", "multirange") or (
+            kind == "range" and base.rpartition(".")[2] not in _CDC_CARRIED_RANGES
+        ):
+            reason: Optional[str] = UNCARRYABLE_COLUMN_ARRIVES_NULL
+        else:
+            reason = classify_uncarryable_cdc_column(
+                is_array=is_array,
+                base_type_name=base.rpartition(".")[2] if extension else base,
+                element_typmod=typmod,
+                extension=extension,
+            )
         if reason is not None:
             found.append(
                 UncarryableCdcColumn(
