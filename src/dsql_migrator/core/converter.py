@@ -8000,7 +8000,12 @@ class SchemaConverter:
         remodellings = (
             pg_views_remodelling(inventory.views, inventory.tables) if is_postgres else {}
         )
-        table_index = table_type_index(inventory.tables)
+        # A MySQL view over a view reads that view's column types (G188).
+        table_index = (
+            table_type_index(inventory.tables)
+            if is_postgres
+            else mysql_type_index(inventory.tables, inventory.views, zone)
+        )
         view_conversions = [
             self.convert_view(
                 view,
@@ -8987,6 +8992,79 @@ def table_type_index(tables: "Iterable[TableDef]") -> "dict[str, tuple]":
     )
 
 
+_MYSQL_QUALIFIED_NAME = re.compile(r"`((?:[^`]|``)+)`\s*\.\s*`((?:[^`]|``)+)`")
+_MYSQL_QUOTED_NAME = re.compile(r"`((?:[^`]|``)+)`")
+
+
+def _mysql_view_reads(name: str, definition: str, views: "Mapping[str, str]") -> "set[str]":
+    """The views of ``views`` (by name) a MySQL view's body names, as
+    :func:`view_column_types` finds the tables it reads: `db`.`name`, and a bare `name` of
+    the view's own schema. A column spelled like a view is a false read, which only orders."""
+    schema, _ = _split_qualified(name)
+    found = {
+        key
+        for db, bare in _MYSQL_QUALIFIED_NAME.findall(definition)
+        if (key := f"{db.replace('``', '`')}.{bare.replace('``', '`')}") in views
+    }
+    if schema is not None:
+        found.update(
+            key
+            for bare in _MYSQL_QUOTED_NAME.findall(definition)
+            if (key := f"{schema}.{bare.replace('``', '`')}") in views
+        )
+    found.discard(name)
+    return found
+
+
+def mysql_type_index(
+    tables: "Iterable[TableDef]",
+    views: "Iterable[ViewDef]" = (),
+    zone: "Optional[SourceZone]" = None,
+) -> "dict[str, tuple]":
+    """:func:`table_type_index`, plus an entry for each MySQL view another view reads (G188):
+    its columns typed as its own conversion types them -- one it passes on as the column it
+    reads, a computed one by what it computes -- so a view over a view reads a TIMESTAMP
+    column, and writes the clock it meets (``zone``: the source's, as convert_view is given
+    it), as a view over the table does. Each view is typed after the views it reads, by the
+    cached conversion :meth:`SchemaConverter.convert_view` then reuses; one whose body does
+    not convert, or whose columns cannot be told, gets no entry and is read untyped."""
+    index = table_type_index(tables)
+    bodies = {
+        view.name: (view.definition or "").strip()
+        for view in views or ()
+        if not getattr(view, "unsupported_kind", None) and (view.definition or "").strip()
+    }
+    reads = {name: _mysql_view_reads(name, body, bodies) for name, body in bodies.items()}
+    shifted = zone if zone is not None and zone.shifts else None
+    done: set[str] = set()
+    for start in sorted(set().union(*reads.values()) if reads else ()):
+        if start in done:
+            continue
+        # Depth first, each view after what it reads (MySQL refuses a cycle; a false read's
+        # is broken where it closes).
+        path, pending = [start], [iter(sorted(reads[start]))]
+        while path:
+            following = next(pending[-1], None)
+            if following is not None:
+                if following not in done and following not in path:
+                    path.append(following)
+                    pending.append(iter(sorted(reads[following])))
+                continue
+            name = path.pop()
+            pending.pop()
+            done.add(name)
+            body = bodies[name]
+            converted = _mysql_view_conversion(
+                name,
+                body,
+                view_column_types(body, index, schema=_split_qualified(name)[0]),
+                shifted,
+            )
+            if converted is not None and converted[4]:
+                index[name] = (name, converted[4])
+    return index
+
+
 def _type_source_items(entry: Optional[exp.Expression]) -> "list[exp.Expression]":
     """The sources one FROM entry brings into scope: a table and the tables it joins, a
     derived table, and a parenthesised join's own entries -- MySQL stores every JOIN as
@@ -9106,6 +9184,15 @@ _KIND_TYPES: "dict[str, str]" = {
     "binary": "blob", "boolean": "tinyint(1)", "integer": "bigint", "float4": "float",
     "float8": "double", "char": "char", "date": "date", "json": "json", "text": "text",
 }
+
+
+class _BodyHolder:
+    """What :meth:`_ColumnTypes.projected` reads of a derived table -- its body and alias --
+    for a view's body, which keeps its own parent (a Subquery around it would take it)."""
+
+    def __init__(self, body: exp.Expression, alias: "Optional[exp.TableAlias]") -> None:
+        self.this = body
+        self.args = {"alias": alias}
 
 
 class _ColumnTypes:
@@ -9275,6 +9362,22 @@ class _ColumnTypes:
             columns.setdefault(name, values[0] if agreed else None)
         self._projections[id(holder)] = (holder, columns)
         return columns
+
+    def outputs(
+        self, body: exp.Expression, names: "Sequence[str]" = ()
+    ) -> "Optional[tuple[tuple[str, str], ...]]":
+        """``((lower-cased column, MySQL type or ""), ...)`` of a view's ``body``, as
+        :meth:`projected` reads a derived table's -- named ``names`` when the view lists its
+        columns -- for a view that reads this one (G188). None when they cannot be told."""
+        alias = (
+            exp.TableAlias(this=exp.to_identifier("v"), columns=[exp.to_identifier(n) for n in names])
+            if names
+            else None
+        )
+        columns = self.projected(_BodyHolder(body, alias))
+        if not columns:
+            return None
+        return tuple((name, self._typed(value) or "") for name, value in columns.items())
 
     def _select_columns(self, select: exp.Select) -> "Optional[list[tuple[str, object]]]":
         out: list = []
@@ -10130,6 +10233,7 @@ def _rewrite_mysql_calls(
     view: bool = False,
     materialized: bool = False,
     zone: "Optional[SourceZone]" = None,
+    on_typed: "Optional[Callable[[], None]]" = None,
 ) -> "tuple[list[str], list[str], list[str]]":
     """Rewrite in place the MySQL calls sqlglot writes wrongly for PostgreSQL, and return
     ``(untranslated, misformatted, issues)`` -- the calls left that fail on Aurora DSQL,
@@ -10145,7 +10249,8 @@ def _rewrite_mysql_calls(
     (G157): FROM_UNIXTIME(), a TIMESTAMP read as a wall clock (its date, time, fields,
     text), and that zone's wall clock where it meets a TIMESTAMP (compared as the instant it
     names there). A Query Converter statement gets none: the application's own session runs
-    it.
+    it. ``on_typed`` is called once the statement's columns can be typed and before anything
+    is rewritten (a view's own column types are read there, G188).
 
     A rewrite that depends on what a value holds reads it from the value's static kind
     (:func:`_mysql_kind`): a column's type where ``column_type`` knows it (a view over the
@@ -10949,6 +11054,8 @@ def _rewrite_mysql_calls(
     if resolver is not None:
         resolver.typed_by = mysql_type
     _drop_alias_db(select, resolver.base_columns if resolver is not None else None)
+    if on_typed is not None:
+        on_typed()
     unquote_json_extracts(select)
     for join in nodes(exp.Join):
         # A JOIN without ON is MySQL's CROSS JOIN -- MySQL stores JOIN ... CROSS JOIN c as
@@ -13182,7 +13289,6 @@ def view_column_types(
     return tuple(found[key] for key in sorted(found))
 
 
-@functools.lru_cache(maxsize=8192)
 def _converted_mysql_view(
     name: str,
     definition: str,
@@ -13191,9 +13297,24 @@ def _converted_mysql_view(
 ) -> "Optional[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]]":
     """``(target CREATE VIEW, calls left untranslated, date formats left with a MySQL
     token, what else is not faithful)`` for a MySQL view, or ``None`` when its body does
-    not parse or render. Cached by name, body, the column types of what it reads and the
-    source's time zone its clock is written in (``None``: the session's; G149): Schema
-    Conversion and Evaluation (VIEW_NOT_CONVERTED) convert the same views."""
+    not parse or render. Cached (:func:`_mysql_view_conversion`) by name, body, the column
+    types of what it reads and the source's time zone its clock is written in (``None``: the
+    session's; G149): Schema Conversion and Evaluation (VIEW_NOT_CONVERTED) convert the same
+    views."""
+    converted = _mysql_view_conversion(name, definition, column_types, zone)
+    return None if converted is None else converted[:4]
+
+
+@functools.lru_cache(maxsize=8192)
+def _mysql_view_conversion(
+    name: str,
+    definition: str,
+    column_types: "tuple" = (),
+    zone: "Optional[SourceZone]" = None,
+) -> "Optional[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], Optional[tuple]]]":
+    """:func:`_converted_mysql_view`, and the view's columns' types: the
+    :meth:`_ColumnTypes.outputs` a view over this one is typed by (:func:`mysql_type_index`,
+    G188), None when they cannot be told."""
     try:
         parsed = sqlglot.parse_one(definition, read=_MySqlViewDialect)
         select = parsed.expression if isinstance(parsed, exp.Create) else parsed
@@ -13215,12 +13336,32 @@ def _converted_mysql_view(
             for table in list(select.find_all(exp.Table)):
                 if table.args.get("db") is None and table.name and _cte_named(table) is None:
                     table.set("db", exp.to_identifier(view_schema, quoted=True))
+        resolver = _column_type_resolver(column_types)
+        listed = (
+            [column.name for column in parsed.this.expressions]
+            if isinstance(parsed, exp.Create) and isinstance(parsed.this, exp.Schema)
+            else []
+        )
+        outputs: list = []
+
+        def read_outputs() -> None:
+            try:
+                typed = resolver.outputs(select, listed)
+                # A view MySQL materializes stores each output at its type's scale: what it
+                # holds is no longer a quotient where another view reads it.
+                if typed is not None and (temptable or _mysql_materializes(select)):
+                    typed = tuple((column, str(kind)) for column, kind in typed)
+                outputs.append(typed)
+            except Exception:  # noqa: BLE001 - the view is then read untyped, not unconverted
+                outputs.append(None)
+
         untranslated, misformatted, issues = _rewrite_mysql_calls(
             select,
-            _column_type_resolver(column_types),
+            resolver,
             view=True,
             materialized=temptable,
             zone=zone,
+            on_typed=read_outputs,
         )
         issues = [*issues, *_mysql_select_options(select)]
         # MySQL stores a HAVING name by its alias (having (`total` > 1000)), which Aurora
@@ -13243,6 +13384,7 @@ def _converted_mysql_view(
             tuple(untranslated),
             tuple(misformatted),
             tuple(issues),
+            outputs[0] if outputs else None,
         )
     except Exception:  # noqa: BLE001 - any parse/generation failure -> manual
         return None

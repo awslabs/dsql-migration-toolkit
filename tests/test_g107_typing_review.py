@@ -431,15 +431,21 @@ def test_a_view_names_its_table_in_the_case_mysql_keeps() -> None:
 
 
 def test_evaluation_grades_a_view_over_a_view_by_the_conversions_notes() -> None:
-    """P6: Evaluation reported nothing for LENGTH through another view (graded AUTO)."""
+    """P6: Evaluation reported nothing for LENGTH through another view (graded AUTO). Since
+    G188 a column the other view passes on from a table the inventory has is typed, in both
+    steps (no note); one it reads from a table the inventory lacks is still untyped, noted."""
     from dsql_migrator.core.assessor import MySqlViewConversionRule
 
-    inventory = SourceInventory(
-        tables=_TABLES,
-        views=[
-            ViewDef(name="shop.v_base", definition="select `t`.`id` AS `id`,`t`.`i` AS `i` from `shop`.`t` `t`"),
-            ViewDef(name="shop.v_len", definition="select length(`b`.`i`) AS `l` from `shop`.`v_base` `b`"),
-        ],
-    )
-    findings = MySqlViewConversionRule().evaluate(inventory)
+    def inventory(source: str) -> SourceInventory:
+        return SourceInventory(
+            tables=_TABLES,
+            views=[
+                ViewDef(name="shop.v_base",
+                        definition=f"select `t`.`id` AS `id`,`t`.`i` AS `i` from `shop`.`{source}` `t`"),
+                ViewDef(name="shop.v_len", definition="select length(`b`.`i`) AS `l` from `shop`.`v_base` `b`"),
+            ],
+        )
+
+    findings = MySqlViewConversionRule().evaluate(inventory("gone"))
     assert [f.object.name for f in findings] == ["shop.v_len"]
+    assert MySqlViewConversionRule().evaluate(inventory("t")) == []

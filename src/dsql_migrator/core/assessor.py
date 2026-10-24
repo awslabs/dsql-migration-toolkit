@@ -2257,16 +2257,15 @@ class MySqlViewConversionRule(Rule):
 
         # In the source's time zone, as Schema Conversion converts each view (G149): under
         # one that is not UTC its SYSDATE() is written, not left untranslated.
-        converter = SchemaConverter(
-            source_type=SourceType.MYSQL,
-            source_zone=resolve_source_zone(inventory.server_settings, SourceType.MYSQL),
-        )
+        zone = resolve_source_zone(inventory.server_settings, SourceType.MYSQL)
+        converter = SchemaConverter(source_type=SourceType.MYSQL, source_zone=zone)
         findings: list[Finding] = []
-        # With the tables' column types, as Schema Conversion converts each view (a binary
-        # column's bytes, a CHAR(n) column's padding): the two steps grade it alike.
-        from dsql_migrator.core.converter import table_type_index
+        # With the tables' column types, and those of the views a view reads (G188), as
+        # Schema Conversion converts each view (a binary column's bytes, a CHAR(n) column's
+        # padding): the two steps grade it alike.
+        from dsql_migrator.core.converter import mysql_type_index
 
-        table_index = table_type_index(inventory.tables)
+        table_index = mysql_type_index(inventory.tables, inventory.views, zone)
         for view in inventory.views:
             if getattr(view, "unsupported_kind", None) or not (view.definition or "").strip():
                 continue  # graded by VIEW_DEFINITION_UNREADABLE and the kind rules

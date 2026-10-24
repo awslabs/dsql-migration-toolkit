@@ -125,14 +125,15 @@ MySQL reads in the session's zone in that zone too — `FROM_UNIXTIME()`, and a 
 column's date, time and text (`DATE()`, `HOUR()`, `DATE_FORMAT()` ...) — and compares that
 zone's clock with a `TIMESTAMP` column as the instant it names there (a `UNION` column of
 both is that zone's wall clock, as MySQL's `DATETIME` is), so `ts > NOW() - INTERVAL 1 DAY`
-returns the rows it returned in MySQL whatever zone the Aurora DSQL session runs in; a
-`TIMESTAMP` compared with a `DATETIME` column or a date string is still compared in the
-session's zone. A fixed offset such as `+09:00` is written as the UTC clock plus the offset,
-`(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`: as a zone name, `'+09:00'` would be read
-with the POSIX sign, as nine hours west of UTC. A `TIMESTAMP` (`timestamptz`) column holds
-an instant and keeps `now()`, and `UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL
-view is carried as PostgreSQL deparsed it, so the item lists the views that read the clock
-for you to review. A PostgreSQL clock default is written in the zone when it is a clock, one
+returns the rows it returned in MySQL whatever zone the Aurora DSQL session runs in, also
+when `ts` is read through another view; a `TIMESTAMP` compared with a `DATETIME` column or a
+date string is still compared in the session's zone. A fixed offset such as `+09:00` is
+written as the UTC clock plus the offset, `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`:
+as a zone name, `'+09:00'` would be read with the POSIX sign, as nine hours west of UTC. A
+`TIMESTAMP` (`timestamptz`) column holds an instant and keeps `now()`, and
+`UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL view is carried as PostgreSQL
+deparsed it, so the item lists the views that read the clock for you to review. A
+PostgreSQL clock default is written in the zone when it is a clock, one
 cast to a date or time type, or `date_trunc` of one; a clock default it carries as written —
 clock arithmetic such as `now() + '1 day'::interval`, or `date_trunc(…, now(), zone)` — is
 listed the same way. The item (**MANUAL**) names those columns and views, and what the
@@ -643,17 +644,18 @@ MySQL→PostgreSQL transpile:
   type, read through MySQL's stored joins and bound as MySQL binds it (`db`.`table`.`col` to that database's
   table — past an alias whose table lacks the column, never to a derived table or a CTE), a derived table's or CTE's
   column by what its body selects
-  (a CTE named like the table it reads too), an expression by what it computes — and the Query Converter writes the same MySQL expressions the same
+  (a CTE named like the table it reads too), another view's column by what that view's body selects, an expression
+  by what it computes — and the Query Converter writes the same MySQL expressions the same
   way (in an `UPDATE`, a `DELETE` and an `ON DUPLICATE KEY UPDATE` too), typed by the Evaluation inventory once
   Step 1 has run (a view read in single-database mode, whose stored text names its own database's tables bare, is
   read in its own schema). `LENGTH` and `BINARY` of a value whose
-  type cannot be told — another view's column, a derived table's or CTE's that it computes, or one in the Query
-  Converter before Step 1 — are flagged: `LENGTH` counts the text of `x || ''`, MySQL's count for text, bytes, integers,
+  type cannot be told — a column another view, a derived table or a CTE computes from what cannot be typed, or one
+  in the Query Converter before Step 1 — are flagged: `LENGTH` counts the text of `x || ''`, MySQL's count for text, bytes, integers,
   decimals and dates (not a `TINYINT(1)`, a `FLOAT`, a `TIMESTAMP` or a fractional `DATETIME`), and `BINARY` is
   `CAST(x AS BYTEA)`, right for a binary column only; in a string function it is `x || ''`, MySQL's text of text, a
   number or a date (`LEFT(created_at, 7)` is the month), under `LIKE`/`REGEXP` `CAST(x AS TEXT)`, which a text column's
-  index still serves for `LIKE 'prefix%'` (a binary column read through another view is matched as its hex text
-  there), and under `UPPER`/`LOWER` or in a `BINARY` comparison it is left as it is. A quotient is shown at its scale
+  index still serves for `LIKE 'prefix%'` (a binary column read where its type cannot be told is matched as its hex
+  text there), and under `UPPER`/`LOWER` or in a `BINARY` comparison it is left as it is. A quotient is shown at its scale
   where MySQL shows it: a statement's output and a text, and the rows of a view, derived table or CTE that MySQL
   materializes — a view declared `ALGORITHM=TEMPTABLE`, or one with an aggregate, a window, `DISTINCT`, `GROUP BY`,
   `HAVING`, `LIMIT`, a `UNION`, no table, or an output holding a subquery that reads its row — each stored at its
