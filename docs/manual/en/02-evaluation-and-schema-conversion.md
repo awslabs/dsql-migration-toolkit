@@ -228,11 +228,12 @@ instead (`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL does not support deferrab
 keys, so it is created as an ordinary key, checked immediately (see
 [§2.3](#23-mysql--dsql-type-and-constraint-handling-reference)); with CDC, a `DEFERRABLE`
 primary key is also no `REPLICA IDENTITY`, so the CDC prerequisite check fails such a table
-until the source key is re-created `NOT DEFERRABLE` or the table is set `REPLICA IDENTITY
-FULL`. A PostgreSQL 18 key declared with `PERIOD` (`FOREIGN KEY (…, PERIOD p) REFERENCES …`) is not created, and that is a gap too
-(`PG_FK_PERIOD`, **MANUAL**): Aurora DSQL has no `PERIOD`, and a plain key on the same columns
-would demand an equal period, so after cut over nothing checks that the parent's periods cover
-each child row's.
+until the source key is re-created `NOT DEFERRABLE` or the table is set
+`REPLICA IDENTITY FULL`. A PostgreSQL 18 key declared with `PERIOD`
+(`FOREIGN KEY (…, PERIOD p) REFERENCES …`) is not created, and that is a gap too
+(`PG_FK_PERIOD`, **MANUAL**): Aurora DSQL has no `PERIOD`, and a plain key on the same
+columns would demand an equal period, so after cut over nothing checks that the parent's
+periods cover each child row's.
 
 Because a recommendation is optional, **it does not count toward an object's estimated
 effort** — otherwise nearly every table with a generated key that keeps generating would be
