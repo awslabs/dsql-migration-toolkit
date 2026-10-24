@@ -629,8 +629,9 @@ def test_foreign_key_ddl_renders_actions_composite_and_self_reference() -> None:
 def test_normalize_fk_action_strips_pg15_column_list_and_maps_restrict() -> None:
     from dsql_migrator.core.converter import _normalize_fk_action
 
-    # PG15+ column-list variant: strip the trailing "(...)" and keep the base action
-    # rather than silently dropping to NO ACTION (returning None).
+    # PG15+ column-list variant: the base action, rather than silently dropping to NO
+    # ACTION (returning None). The list itself is written back for a PostgreSQL source's
+    # ON DELETE by _foreign_key_on_delete (G193).
     assert _normalize_fk_action("SET NULL (a)") == "SET NULL"
     assert _normalize_fk_action("SET DEFAULT (a, b)") == "SET DEFAULT"
     assert _normalize_fk_action("SET_NULL (a)") == "SET NULL"  # underscored + list
@@ -644,7 +645,9 @@ def test_normalize_fk_action_strips_pg15_column_list_and_maps_restrict() -> None
 
 def test_foreign_key_ddl_pg15_column_list_action_not_downgraded() -> None:
     # A PG15+ "SET NULL (col)" action must render "ON DELETE SET NULL", not be
-    # silently omitted (which would downgrade the FK to NO ACTION).
+    # silently omitted (which would downgrade the FK to NO ACTION). This is a MySQL-source
+    # conversion (the default), as before: no MySQL key has a column list. A PostgreSQL
+    # source keeps it (G193, tests/test_g193_pg_fk_set_column_list.py).
     table = TableDef(
         name="t",
         columns=[

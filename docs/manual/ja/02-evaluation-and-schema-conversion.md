@@ -106,8 +106,10 @@ DML は **追加の読み取り** を発生させます(AWS は追加前にベ�
 フラグを立てる唯一のケースです。
 
 PostgreSQL の外部キーは `MATCH FULL` と `DEFERRABLE` / `INITIALLY DEFERRED` を保持します(Aurora DSQL は
-どちらも受け付け、遅延されたキーをソースと同じくコミット時に検査します)。検出結果には、それを宣言している
-キーが 1 つずつ示されます。`NOT ENFORCED` で宣言された PostgreSQL 18 のキーは作成されません: ソースはその
+どちらも受け付け、遅延されたキーをソースと同じくコミット時に検査します)。`ON DELETE SET NULL (…)` /
+`SET DEFAULT (…)` の列リスト(PostgreSQL 15+)も保持するため、親行を削除すると Aurora DSQL でもリストにある
+列だけが NULL(またはデフォルト値)に設定されます。検出結果には、それを宣言しているキーが 1 つずつ示されます。
+`NOT ENFORCED` で宣言された PostgreSQL 18 のキーは作成されません: ソースはその
 キーを検査しませんが、`NOT ENFORCED` を持たない Aurora DSQL はソースが受け付ける書き込みを拒否してしまう
 ためです。これも推奨事項です(`PG_FK_NOT_ENFORCED`、`RECOMMENDED`)。そのようなキーを Aurora DSQL に強制
 させるには(Aurora DSQL にその形がない `PERIOD` で宣言されたキーは除きます)、そのキーの
@@ -515,7 +517,8 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
 ```
 
 PostgreSQL のキーは `REFERENCES` の後に宣言した内容を、PostgreSQL の順序で `NOT VALID` の前に保持します:
-`MATCH FULL`、`ON DELETE` / `ON UPDATE` のアクション、そして `DEFERRABLE INITIALLY DEFERRED`(または
+`MATCH FULL`、`ON DELETE` / `ON UPDATE` のアクション(PostgreSQL 15+ の `ON DELETE SET NULL (…)` /
+`SET DEFAULT (…)` では、その列だけを設定する列リストも含めて)、そして `DEFERRABLE INITIALLY DEFERRED`(または
 `DEFERRABLE INITIALLY IMMEDIATE`)です。Aurora DSQL はそれぞれを `NOT VALID` とともに受け付け、遅延された
 キーをコミット時に検査します。遅延可能なキーは `ON DELETE` / `ON UPDATE` の `RESTRICT` も保持します。
 PostgreSQL は、キーが遅延されている間もこれを即時に検査するためです。`NOT ENFORCED` で宣言された

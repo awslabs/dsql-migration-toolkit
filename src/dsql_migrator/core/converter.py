@@ -3969,10 +3969,13 @@ def _normalize_fk_action(action: Optional[str], *, deferrable: bool = False) -> 
     Two source-fidelity normalisations:
 
     - A PostgreSQL 15+ column-list variant (``SET NULL (a)`` / ``SET DEFAULT (a, b)``)
-      has a trailing parenthesised column subset DSQL/PG16 cannot express. We strip
-      it and emit the base action (``SET NULL`` / ``SET DEFAULT``) rather than letting
-      the unrecognised string fall through to ``None`` and silently downgrade the FK
-      to ``NO ACTION``.
+      gives its base action (``SET NULL`` / ``SET DEFAULT``) rather than letting the
+      unrecognised string fall through to ``None`` and silently downgrade the FK to ``NO
+      ACTION``. The list is not lost: Aurora DSQL accepts it, as PostgreSQL 16 does
+      (live-verified 2026-10-25: ``ON DELETE SET NULL (b) NOT VALID`` nulled only ``b``), and
+      :func:`_foreign_key_on_delete` writes it back for a PostgreSQL source's ON DELETE
+      (G193). Stripped, the key nulled EVERY key column where the source nulls only the
+      listed ones. PostgreSQL takes a list on ON DELETE only, so an ON UPDATE keeps none.
     - ``RESTRICT`` is mapped to ``NO ACTION`` for BOTH engines so the emitted DDL is
       source-identical: a MySQL source can never recover ``RESTRICT`` (``SHOW CREATE``
       omits it, so it already looks like ``NO ACTION``), and the two are functionally
@@ -3985,7 +3988,8 @@ def _normalize_fk_action(action: Optional[str], *, deferrable: bool = False) -> 
     if not action:
         return None
     normalized = " ".join(action.upper().replace("_", " ").split())
-    # Strip a PG15+ trailing column list, e.g. "SET NULL (a)" -> "SET NULL".
+    # The base action of a PG15+ column list, e.g. "SET NULL (a)" -> "SET NULL" (the list
+    # is written back by _foreign_key_on_delete).
     paren = normalized.find("(")
     if paren != -1:
         normalized = normalized[:paren].strip()
@@ -3994,7 +3998,28 @@ def _normalize_fk_action(action: Optional[str], *, deferrable: bool = False) -> 
     return normalized if normalized in _FK_ACTIONS else None
 
 
-def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[str]:
+def _foreign_key_on_delete(fk: ForeignKeyDef, *, is_postgres: bool = False) -> Optional[str]:
+    """The ON DELETE action the re-created key declares, as its DDL writes it; ``None`` for
+    NO ACTION, which the DDL leaves out.
+
+    A PostgreSQL 15+ ``SET NULL (a, b)`` / ``SET DEFAULT (a)`` keeps its column list
+    (G193; :attr:`ForeignKeyDef.on_delete_set_columns`), each name quoted like the key's
+    own columns: Aurora DSQL accepts it with NOT VALID and sets only the listed columns, as
+    the source does (live-verified 2026-10-25 with ``SET NULL (b)``; PostgreSQL's grammar
+    takes ``SET DEFAULT (b)`` the same way). A MySQL key's action never has one.
+    """
+    action = _normalize_fk_action(fk.on_delete, deferrable=fk.is_deferrable)
+    if action is None or action == "NO ACTION":
+        return None
+    listed = fk.on_delete_set_columns if is_postgres else []
+    if listed:
+        action += " (" + ", ".join(_quote_pg_identifier(column) for column in listed) + ")"
+    return action
+
+
+def _build_foreign_key_ddls(
+    table: TableDef, *, preserve: bool = True, is_postgres: bool = False
+) -> list[str]:
     """Render the table's foreign keys as post-load ``ALTER TABLE ADD CONSTRAINT``.
 
     Aurora DSQL enforces foreign keys (as of 2026-08), but they must NOT exist
@@ -4020,7 +4045,9 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
     ...] [DEFERRABLE INITIALLY DEFERRED | DEFERRABLE INITIALLY IMMEDIATE] NOT VALID`` --
     Aurora DSQL accepts each of them with NOT VALID, and defers a deferred key's check to
     commit (live-verified one by one; PostgreSQL's grammar takes them together in this
-    order). A deferrable key's INITIALLY is always spelled out. A PostgreSQL
+    order). A deferrable key's INITIALLY is always spelled out. A PostgreSQL 15+ ON DELETE
+    SET NULL / SET DEFAULT keeps its column list, ``ON DELETE SET NULL ("b")``, when
+    ``is_postgres`` (G193; :func:`_foreign_key_on_delete`). A PostgreSQL
     18 key the source declares NOT ENFORCED is not created at all: the source never checks
     it, and Aurora DSQL, which has no NOT ENFORCED, would refuse writes the source accepts
     (:func:`_pg_not_enforced_foreign_key_warning` says so). Every path that adds a preserved
@@ -4049,8 +4076,8 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
         )
         if fk.match_full:
             clause += " MATCH FULL"
-        on_delete = _normalize_fk_action(fk.on_delete, deferrable=fk.is_deferrable)
-        if on_delete is not None and on_delete != "NO ACTION":
+        on_delete = _foreign_key_on_delete(fk, is_postgres=is_postgres)
+        if on_delete is not None:
             clause += f" ON DELETE {on_delete}"
         on_update = _normalize_fk_action(fk.on_update, deferrable=fk.is_deferrable)
         if on_update is not None and on_update != "NO ACTION":
@@ -4718,7 +4745,7 @@ def _decimal_narrowing(data_type: exp.DataType) -> "Optional[tuple[bool, bool]]"
 
 
 def _foreign_key_warning(
-    table: TableDef, *, preserve: bool = True
+    table: TableDef, *, preserve: bool = True, is_postgres: bool = False
 ) -> Optional[ConversionWarning]:
     """Return an advisory note about the table's foreign keys, if any.
 
@@ -4729,7 +4756,8 @@ def _foreign_key_warning(
 
     Only the keys the source enforces: a PostgreSQL 18 NOT ENFORCED one is never created
     (:func:`_pg_not_enforced_foreign_key_warning`). A preserved key's DEFERRABLE /
-    INITIALLY DEFERRED and MATCH FULL are kept, which the note names (G152).
+    INITIALLY DEFERRED and MATCH FULL are kept, which the note names (G152), and so is a
+    PostgreSQL ON DELETE column list (G193).
     """
     enforced = [fk for fk in table.foreign_keys if fk.created_on_target]
     if not enforced:
@@ -4754,7 +4782,7 @@ def _foreign_key_warning(
         message=(
             f"Foreign key constraints ({names}) are preserved and re-created on "
             "Aurora DSQL after the data load (at cut over for a CDC migration)."
-            + foreign_key_clauses_kept(enforced)
+            + foreign_key_clauses_kept(enforced, is_postgres=is_postgres)
             + " Note: DML on referenced/referencing tables incurs extra reads "
             "(benchmark write-heavy tables); a concurrent conflict raises a "
             "retryable serialization error (SQLSTATE 40001); and CASCADE / SET NULL "
@@ -7907,7 +7935,9 @@ class SchemaConverter:
                 if is_postgres
                 else None
             ),
-            _foreign_key_warning(table, preserve=options.preserve_foreign_keys),
+            _foreign_key_warning(
+                table, preserve=options.preserve_foreign_keys, is_postgres=is_postgres
+            ),
             _check_constraint_warning(table, is_postgres=is_postgres),
             # PostgreSQL rules Aurora DSQL cannot enforce: EXCLUDE constraints (not created,
             # nor their indexes) and WITHOUT OVERLAPS keys (kept as ordinary keys).
@@ -7977,7 +8007,7 @@ class SchemaConverter:
             )
             + extra_index_ddls,
             foreign_key_ddls=_build_foreign_key_ddls(
-                table, preserve=options.preserve_foreign_keys
+                table, preserve=options.preserve_foreign_keys, is_postgres=is_postgres
             ),
             preserved_foreign_keys=list(table.foreign_keys),
             warnings=warnings,

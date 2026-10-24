@@ -101,8 +101,10 @@ UUID/랜덤 키는 **insert 처리량**을 얻기 위한 선택입니다 — DSQ
 참고), 이것이 Evaluation이 여전히 **MANUAL**로 표시하는 유일한 경우입니다.
 
 PostgreSQL 외래 키는 `MATCH FULL`과 `DEFERRABLE` / `INITIALLY DEFERRED`를 유지하며(Aurora DSQL은
-둘 다 받아들이고, 지연된 키는 소스처럼 커밋 시점에 검사합니다), 결과에는 이를 선언한 키가 하나하나
-표시됩니다. `NOT ENFORCED`로 선언한 PostgreSQL 18 키는 생성하지 않습니다: 소스는 그 키를 검사하지
+둘 다 받아들이고, 지연된 키는 소스처럼 커밋 시점에 검사합니다), `ON DELETE SET NULL (…)` /
+`SET DEFAULT (…)`의 컬럼 목록(PostgreSQL 15+)도 유지하므로 부모 행을 삭제하면 Aurora DSQL에서도
+나열된 컬럼만 NULL(또는 기본값)로 설정됩니다. 결과에는 이를 선언한 키가 하나하나 표시됩니다.
+`NOT ENFORCED`로 선언한 PostgreSQL 18 키는 생성하지 않습니다: 소스는 그 키를 검사하지
 않는데, `NOT ENFORCED`가 없는 Aurora DSQL은 소스가 받아들이는 쓰기를 거부하게 되기 때문입니다. 이것도
 권장사항입니다(`PG_FK_NOT_ENFORCED`, `RECOMMENDED`). Aurora DSQL이 그런 키를 강제하게 하려면(Aurora
 DSQL에 그런 형태가 없는 `PERIOD`로 선언한 키는 제외) 그 키의 `ALTER TABLE … ADD CONSTRAINT … NOT VALID`를
@@ -501,7 +503,8 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
 ```
 
 PostgreSQL 키는 `REFERENCES` 뒤에 선언한 내용을 PostgreSQL의 순서대로, `NOT VALID` 앞에 유지합니다:
-`MATCH FULL`, `ON DELETE` / `ON UPDATE` 동작, 그리고 `DEFERRABLE INITIALLY DEFERRED`(또는
+`MATCH FULL`, `ON DELETE` / `ON UPDATE` 동작(PostgreSQL 15+ `ON DELETE SET NULL (…)` /
+`SET DEFAULT (…)`의 경우 그 컬럼만 설정하는 컬럼 목록까지), 그리고 `DEFERRABLE INITIALLY DEFERRED`(또는
 `DEFERRABLE INITIALLY IMMEDIATE`). Aurora DSQL은 각각을 `NOT VALID`와 함께 받아들이며, 지연된 키는
 커밋 시점에 검사합니다. 지연 가능한 키는 `ON DELETE` / `ON UPDATE`의 `RESTRICT`도 유지하는데,
 PostgreSQL은 키가 지연된 동안에도 이를 즉시 검사합니다. `NOT ENFORCED`로 선언한 PostgreSQL 18 키는

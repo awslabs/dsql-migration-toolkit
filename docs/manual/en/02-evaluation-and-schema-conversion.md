@@ -236,6 +236,8 @@ is the one case Evaluation still flags **MANUAL**.
 
 A PostgreSQL foreign key keeps its `MATCH FULL` and its `DEFERRABLE` / `INITIALLY DEFERRED`
 (Aurora DSQL accepts both, and checks a deferred key at commit, as the source does), and the
+column list of an `ON DELETE SET NULL (…)` / `SET DEFAULT (…)` (PostgreSQL 15+), so deleting a
+parent row sets only the listed columns to NULL (or to their default) on Aurora DSQL too; the
 finding names each key that declares one. A PostgreSQL 18 key declared `NOT ENFORCED` is not
 created: the source never checks it, and Aurora DSQL, which has no `NOT ENFORCED`, would
 refuse writes the source accepts. That is advice too (`PG_FK_NOT_ENFORCED`, `RECOMMENDED`);
@@ -728,8 +730,9 @@ ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
 ```
 
 A PostgreSQL key keeps what it declares after `REFERENCES`, in PostgreSQL's order and before
-`NOT VALID`: `MATCH FULL`, its `ON DELETE` / `ON UPDATE` action, and
-`DEFERRABLE INITIALLY DEFERRED` (or `DEFERRABLE INITIALLY IMMEDIATE`). Aurora DSQL accepts
+`NOT VALID`: `MATCH FULL`, its `ON DELETE` / `ON UPDATE` action (with the column list of a
+PostgreSQL 15+ `ON DELETE SET NULL (…)` / `SET DEFAULT (…)`, which sets only those columns),
+and `DEFERRABLE INITIALLY DEFERRED` (or `DEFERRABLE INITIALLY IMMEDIATE`). Aurora DSQL accepts
 each with `NOT VALID`, and checks a deferred key at commit. A deferrable key also keeps an
 `ON DELETE` / `ON UPDATE` `RESTRICT`, which PostgreSQL checks at once even while the key is
 deferred. A PostgreSQL 18 key declared `NOT ENFORCED` is not created at all.

@@ -16,6 +16,7 @@ the data contracts.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Iterable, Literal, Optional
@@ -358,6 +359,16 @@ class IndexDef(BaseModel):
     )
 
 
+# One column of a PostgreSQL 15+ ``SET NULL (a, "B c")`` / ``SET DEFAULT (a)`` list as
+# pg_get_constraintdef prints it (and SQLAlchemy and the catalog read keep it): quoted, or
+# bare -- a name PostgreSQL folds.
+_FK_SET_COLUMN = r'"(?:[^"]|"")+"|[^\s(),"]+'
+_FK_SET_COLUMNS_RE = re.compile(
+    rf"\(\s*((?:{_FK_SET_COLUMN})(?:\s*,\s*(?:{_FK_SET_COLUMN}))*)\s*\)\s*"
+)
+_FK_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
 class ForeignKeyDef(BaseModel):
     """A foreign key constraint (preserved and re-created on DSQL after load)."""
 
@@ -381,7 +392,8 @@ class ForeignKeyDef(BaseModel):
     # every new orphan), but Aurora DSQL's validation of the loaded rows fails on them,
     # and Cut over holds Finish on such a key until it validates (G142) -- an actionable
     # per-key report, not silent divergence. The assessor uses these to flag the
-    # affected tables up front.
+    # affected tables up front. A PostgreSQL 15+ ON DELETE SET NULL / SET DEFAULT keeps its
+    # column list as reflected (``SET NULL (b)``; see ``on_delete_set_columns``).
     on_delete: Optional[str] = None
     on_update: Optional[str] = None
     # PostgreSQL only (G152): a MySQL foreign key is never deferrable, InnoDB ignores MATCH
@@ -448,6 +460,25 @@ class ForeignKeyDef(BaseModel):
     def is_deferrable(self) -> bool:
         """True when the key is DEFERRABLE (INITIALLY DEFERRED implies it, as in PostgreSQL)."""
         return self.deferrable or self.initially_deferred
+
+    @property
+    def on_delete_set_columns(self) -> "list[str]":
+        """The columns a PostgreSQL 15+ ``ON DELETE SET NULL (a, b)`` / ``SET DEFAULT (a)``
+        lists, as PostgreSQL stores them (G193): a deleted parent row sets only these and
+        leaves the key's other columns as they are, where a plain SET NULL / SET DEFAULT
+        sets every key column. Empty for any other action and for a list that cannot be
+        read -- and for every MySQL key, whose actions never have one. PostgreSQL takes a
+        column list on ON DELETE only, never on ON UPDATE."""
+        words, paren, listed = (self.on_delete or "").partition("(")
+        action = " ".join(words.upper().replace("_", " ").split())
+        match = _FK_SET_COLUMNS_RE.fullmatch(paren + listed) if paren else None
+        if match is None or action not in ("SET NULL", "SET DEFAULT"):
+            return []
+        return [
+            token[1:-1].replace('""', '"') if token.startswith('"')
+            else token.translate(_FK_ASCII_FOLD)
+            for token in re.findall(_FK_SET_COLUMN, match.group(1))
+        ]
 
     @property
     def has_cascade_action(self) -> bool:

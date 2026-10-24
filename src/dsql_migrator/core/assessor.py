@@ -489,10 +489,16 @@ class Rule(ABC):
         raise NotImplementedError
 
 
-def foreign_key_clauses_kept(foreign_keys: "Sequence[ForeignKeyDef]") -> str:
+def foreign_key_clauses_kept(
+    foreign_keys: "Sequence[ForeignKeyDef]", *, is_postgres: bool = False
+) -> str:
     """The sentence naming each key's MATCH FULL and DEFERRABLE / INITIALLY clauses, which
-    the re-created key keeps (G152), or ``""`` when no key has one (every MySQL key). Shared
-    by FK_PRESERVED and the Schema Conversion note, so both steps say the same."""
+    the re-created key keeps (G152), and, for a PostgreSQL source, the one naming each ON
+    DELETE SET NULL / SET DEFAULT column list, which it keeps too (G193), as the DDL writes
+    them; ``""`` when no key has one (every MySQL key). Shared by FK_PRESERVED and the
+    Schema Conversion note, so both steps say the same."""
+    from dsql_migrator.core.converter import _foreign_key_on_delete
+
     entries = []
     for fk in foreign_keys:
         clauses = ["MATCH FULL"] if fk.match_full else []
@@ -502,13 +508,24 @@ def foreign_key_clauses_kept(foreign_keys: "Sequence[ForeignKeyDef]") -> str:
             )
         if clauses:
             entries.append(f"{fk.name} ({', '.join(clauses)})")
-    if not entries:
-        return ""
-    return (
-        " Their deferral and matching are kept as the source declares them: "
-        + ", ".join(entries)
-        + "."
-    )
+    listed = [
+        f"{fk.name} (ON DELETE {_foreign_key_on_delete(fk, is_postgres=True)})"
+        for fk in foreign_keys
+        if is_postgres and fk.on_delete_set_columns
+    ]
+    kept = ""
+    if entries:
+        kept += (
+            " Their deferral and matching are kept as the source declares them: "
+            + ", ".join(entries)
+            + "."
+        )
+    if listed:
+        kept += (
+            " Their ON DELETE column lists are kept, so a deleted parent row sets only the "
+            "listed key columns, as on the source: " + ", ".join(listed) + "."
+        )
+    return kept
 
 
 class ForeignKeyRule(Rule):
@@ -521,11 +538,17 @@ class ForeignKeyRule(Rule):
     estimate, and stays consistent with the Schema Conversion note for the same key.
     The wording leads with what is true ("converts cleanly") and carries the runtime
     caveats DSQL documents so the operator sees them at planning time. A PostgreSQL key's
-    DEFERRABLE / INITIALLY DEFERRED and MATCH FULL are kept, and named (G152); a PostgreSQL
-    18 NOT ENFORCED key is not created, and has its own finding (PG_FK_NOT_ENFORCED).
+    DEFERRABLE / INITIALLY DEFERRED and MATCH FULL are kept, and named (G152), as is its ON
+    DELETE column list (G193); a PostgreSQL 18 NOT ENFORCED key is not created, and has its
+    own finding (PG_FK_NOT_ENFORCED).
     """
 
     rule_id = "FK_PRESERVED"
+
+    def __init__(self, *, is_postgres: bool = False) -> None:
+        """``is_postgres``: a PostgreSQL source, whose ON DELETE column lists the keys keep
+        (G193)."""
+        self._is_postgres = is_postgres
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         findings: list[Finding] = []
@@ -541,7 +564,7 @@ class ForeignKeyRule(Rule):
                         risk=(
                             f"Foreign key constraints ({names}) convert cleanly and "
                             "are re-created on Aurora DSQL after the data load."
-                            + foreign_key_clauses_kept(enforced)
+                            + foreign_key_clauses_kept(enforced, is_postgres=self._is_postgres)
                             + " DSQL enforces them with commit-time optimistic "
                             "concurrency, so DML on referenced/referencing tables incurs "
                             "extra reads."

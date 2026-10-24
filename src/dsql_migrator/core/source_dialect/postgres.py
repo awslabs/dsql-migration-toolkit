@@ -745,10 +745,14 @@ def pg_foreign_keys_sql(server_version: "Optional[Sequence[int]]") -> str:
 
 def _pg_fk_action(code: object, keyword: str, definition: str) -> "Optional[str]":
     """SQLAlchemy's spelling of one referential action: ``None`` for NO ACTION, and a ``SET
-    NULL`` / ``SET DEFAULT`` with its column list as the definition prints it."""
+    NULL`` / ``SET DEFAULT`` with its column list as the definition prints it -- whole, a
+    quoted name in it holding a parenthesis too (``SET NULL ("x)y")``), which the key keeps
+    on Aurora DSQL (G193)."""
     action = _PG_FK_ACTIONS.get(str(code or ""))
     if action and action.startswith("SET "):
-        listed = re.search(rf"ON {keyword} ({action} \([^)]*\))", definition)
+        listed = re.search(
+            rf'ON {keyword} ({action} \((?:"(?:[^"]|"")*"|[^")])*\))', definition
+        )
         if listed:
             return listed.group(1)
     return action

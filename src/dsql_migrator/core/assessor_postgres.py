@@ -1651,7 +1651,7 @@ def default_rules() -> "list[Rule]":
         PgCharacterLengthRule(),
         PgIdentityKeyRule(),
         PgNonKeySequenceRule(),
-        ForeignKeyRule(),
+        ForeignKeyRule(is_postgres=True),
         CheckConstraintRule(),
         # Rules Aurora DSQL cannot enforce (G151): EXCLUDE constraints and PostgreSQL 18
         # WITHOUT OVERLAPS keys -- the conversion's own notes, word for word.

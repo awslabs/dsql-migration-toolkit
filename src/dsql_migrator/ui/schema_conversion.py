@@ -739,8 +739,8 @@ def _pg_source_foreign_key_options(foreign_key: ForeignKeyDef) -> str:
     """A PostgreSQL foreign key's clauses after REFERENCES, as ``pg_get_constraintdef``
     prints them (MATCH FULL, ON UPDATE, ON DELETE, DEFERRABLE, INITIALLY DEFERRED, NOT
     ENFORCED; the defaults left out), for the source panel. The target's key keeps its
-    MATCH FULL and DEFERRABLE / INITIALLY DEFERRED (G152), so the diff shows only what
-    really changes. Display only."""
+    MATCH FULL and DEFERRABLE / INITIALLY DEFERRED (G152) and an ON DELETE column list
+    (G193), so the diff shows only what really changes. Display only."""
     parts = [" MATCH FULL"] if foreign_key.match_full else []
     for keyword, action in (("UPDATE", foreign_key.on_update), ("DELETE", foreign_key.on_delete)):
         # A PostgreSQL 15+ ``SET NULL (col, ...)`` keeps its column list as reflected: only
