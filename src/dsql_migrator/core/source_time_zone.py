@@ -16,7 +16,8 @@ server's own, ``system_time_zone``), PostgreSQL's default ``TimeZone``.
 
 :func:`resolve_source_zone` classifies it, and :class:`SourceZone` writes the source's wall
 clock as a PostgreSQL expression. Only a zone the target reads the same way is written: a
-zone NAME (``now() AT TIME ZONE 'Asia/Seoul'``), or a fixed offset in the INTERVAL form
+zone NAME (``now() AT TIME ZONE 'Asia/Seoul'``; a name tzdata defines as a link, such as
+``US/Eastern``, as the zone it links to, G192), or a fixed offset in the INTERVAL form
 (``(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'``) -- never an offset as a zone name,
 which PostgreSQL reads as a POSIX zone, west of UTC (``AT TIME ZONE '+09:00'`` is UTC-9).
 UTC itself, and a zone that cannot be read or told (``SYSTEM`` reported by an abbreviation,
@@ -33,6 +34,7 @@ from decimal import Decimal
 from typing import Optional
 
 from dsql_migrator.core.models import SourceType, ViewDef
+from dsql_migrator.core.tz_links import TZ_LINKS
 
 # The names of UTC itself, case-insensitively, as MySQL's time zone tables and PostgreSQL's
 # TimeZone spell them.
@@ -47,16 +49,17 @@ _UTC_NAMES = frozenset(
 # 'Etc/GMT-9') or one of its single words ('Japan', 'EST5EDT'). The source accepted it, so
 # its shape is all that is checked; it is quoted when written, never interpolated raw.
 _ZONE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+)*$")
-# Names PostgreSQL reads in AT TIME ZONE as an ABBREVIATION -- it looks those up first --
-# with a fixed offset, while the zone of that name keeps daylight saving: AT TIME ZONE 'CET'
-# is +01:00 all year. Each is written as the zone whose rules it follows now (tzdata links
-# them so since 2024b), so a summer default is not an hour off.
-_ABBREVIATION_NAMED_ZONES = {
-    "cet": "Europe/Brussels",
-    "met": "Europe/Brussels",
-    "eet": "Europe/Athens",
-    "wet": "Europe/Lisbon",
-}
+# A name tzdata defines as a LINK is written as the zone it links to (TZ_LINKS, G192): the
+# same zone by definition, under the name every PostgreSQL build has. A build need not have
+# the link -- Debian ships tzdata's old names apart, so the postgres 16 and 17 images know no
+# 'US/Eastern' (nor 'Asia/Calcutta', 'Japan', ...), names the RDS and Aurora MySQL time_zone
+# parameter offers -- and a clock default or view naming a zone it does not know passes
+# CREATE TABLE / CREATE VIEW and fails (22023) only when a row takes the default or the view
+# is read: after cut over, in the application's writes. The names PostgreSQL reads in AT
+# TIME ZONE as an ABBREVIATION -- it looks those up first -- are links too since tzdata
+# 2024b: AT TIME ZONE 'CET' is the abbreviation's +01:00 all year, while the zone keeps
+# daylight saving, so CET and MET are written as Europe/Brussels, EET as Europe/Athens, WET
+# as Europe/Lisbon (G149), and a summer default is not an hour off.
 # MySQL's fixed offset: '+09:00', '-05:30' (its time_zone accepts -13:59 to +14:00).
 _MYSQL_OFFSET_RE = re.compile(r"^([+-])(\d{1,2}):(\d{2})$")
 # A POSIX TZ string with no daylight-saving part, as PostgreSQL's TimeZone shows a fixed
@@ -90,11 +93,15 @@ class SourceZone:
     * ``unknown`` -- not read, or not one of those: the conversion assumes UTC.
 
     ``setting`` is what the source reported (``time_zone 'Asia/Seoul'``), as the findings
-    quote it; empty when nothing was read. Frozen, so a conversion cache can key on it."""
+    quote it; empty when nothing was read. ``link`` is the source's name for a ``named``
+    zone when tzdata defines that name as a link ('US/Eastern'): ``zone`` is then the zone it
+    links to ('America/New_York'), which is what is written (G192); empty otherwise. Frozen,
+    so a conversion cache can key on it."""
 
     kind: str
     zone: str = ""
     setting: str = ""
+    link: str = ""
 
     @property
     def shifts(self) -> bool:
@@ -124,6 +131,29 @@ class SourceZone:
         """The time of day of :meth:`clock_sql` (``LOCALTIME`` in this zone)."""
         return f"({self.clock_sql(instant)}::time)"
 
+    def midnight_sql(self, instant: str = "now()") -> str:
+        """The instant :meth:`date_sql`'s date begins in this zone, a ``timestamptz`` (G192):
+        what MySQL stores for ``CURDATE()`` in a TIMESTAMP column -- the date at midnight in
+        the session's zone -- where ``CURRENT_DATE`` would be the session's, UTC on Aurora
+        DSQL. The zone's midnight wall clock read back at the zone; for a fixed offset, less
+        the offset, at UTC (as a zone name the offset would be read with the POSIX sign).
+        ``date_trunc``, not a cast to ``timestamp``: a MySQL default is transpiled from
+        MySQL's dialect, which reads TIMESTAMP as the type with a time zone.
+
+        A midnight a daylight-saving change repeats (Atlantic/Azores and America/Havana, the
+        day clocks go back to 00:00) PostgreSQL reads as the later of the two; the date begins
+        at the first, which is what MySQL stores. So the earlier of that and the hour before
+        midnight read at the zone, plus the hour -- the first 00:00. (A midnight the change
+        skips both read as the date's first instant; MySQL, in strict mode, refuses the row.)"""
+        midnight = f"date_trunc('day', {self.clock_sql(instant)})"
+        if self.kind == "offset":
+            return f"(({midnight} - INTERVAL {_sql_string(self.zone)}) AT TIME ZONE 'UTC')"
+        zone = _sql_string(self.zone)
+        return (
+            f"LEAST(({midnight} AT TIME ZONE {zone}), "
+            f"((({midnight} - INTERVAL '1 hour') AT TIME ZONE {zone}) + INTERVAL '1 hour'))"
+        )
+
 
 UNREAD_ZONE = SourceZone("unknown")
 
@@ -150,13 +180,31 @@ def _offset(sign: str, hours: int, minutes: int) -> Optional[str]:
 
 
 def _named(value: str, setting: str) -> SourceZone:
-    """A zone named ``value``: UTC, a name the target reads alike, or unknown."""
+    """A zone named ``value``: UTC, a name the target reads alike -- a tzdata link as the zone
+    it links to (G192) -- or unknown."""
     folded = value.lower()
     if folded in _UTC_NAMES:
         return SourceZone("utc", "UTC", setting)
     if folded == "localtime" or not _ZONE_NAME_RE.match(value):
         return SourceZone("unknown", "", setting)
-    return SourceZone("named", _ABBREVIATION_NAMED_ZONES.get(folded, value), setting)
+    linked = TZ_LINKS.get(folded)
+    if linked is None:
+        return SourceZone("named", value, setting)
+    if linked.lower() in _UTC_NAMES:
+        return SourceZone("utc", "UTC", setting)
+    return SourceZone("named", linked, setting, link=value)
+
+
+def written_zone_name(name: str) -> str:
+    """A zone name the source's own SQL gives -- a MySQL view's ``CONVERT_TZ(dt, 'UTC',
+    'US/Eastern')`` -- as the conversion writes it (G192): a tzdata link as the zone it links
+    to, as the source's zone is (``'America/New_York'``; the link found in any case); a name
+    of UTC, and any other, as written. A view naming a zone the build does not know is
+    created, and fails (22023) when it is read."""
+    folded = name.lower()
+    if folded in _UTC_NAMES:
+        return name
+    return TZ_LINKS.get(folded, name)
 
 
 def _mysql_zone(settings: Mapping[str, str]) -> SourceZone:
@@ -296,7 +344,9 @@ def resolve_source_zone(settings: Mapping[str, str], source_type: SourceType) ->
     ``TimeZone`` a new session gets -- a zone name, or a POSIX string with a fixed offset
     ('<+09>-09' is UTC+09:00); a POSIX rule with a daylight-saving part is not written -- or the
     text an ALTER DATABASE / ALTER ROLE default stored, a number of hours or an INTERVAL east
-    of UTC ('-5' is UTC-05:00, G183). Anything not read, or not one of these, is ``unknown``."""
+    of UTC ('-5' is UTC-05:00, G183). Either engine's zone name that tzdata defines as a link
+    is the zone it links to ('US/Eastern' is 'America/New_York', G192). Anything not read, or
+    not one of these, is ``unknown``."""
     if not isinstance(settings, Mapping):
         return UNREAD_ZONE
     if source_type is SourceType.POSTGRES:
@@ -306,4 +356,5 @@ def resolve_source_zone(settings: Mapping[str, str], source_type: SourceType) ->
 
 __all__ = [
     "SourceZone", "UNREAD_ZONE", "init_connect_key", "resolve_source_zone", "views_reading_the_clock",
+    "written_zone_name",
 ]

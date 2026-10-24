@@ -88,7 +88,8 @@ def _flat(sql: str) -> str:
     ("settings", "kind", "zone"),
     [
         ({"time_zone": "Asia/Seoul"}, "named", "Asia/Seoul"),
-        ({"time_zone": "US/Pacific"}, "named", "US/Pacific"),
+        # A name tzdata defines as a link is the zone it links to (G192).
+        ({"time_zone": "US/Pacific"}, "named", "America/Los_Angeles"),
         ({"time_zone": "America/Argentina/Buenos_Aires"}, "named", "America/Argentina/Buenos_Aires"),
         ({"time_zone": "Etc/GMT-9"}, "named", "Etc/GMT-9"),
         ({"time_zone": "+09:00"}, "offset", "+09:00"),
@@ -131,8 +132,10 @@ def test_the_resolved_zone_quotes_what_the_source_reported() -> None:
     ("value", "kind", "zone"),
     [
         ("Asia/Seoul", "named", "Asia/Seoul"),
-        ("EST5EDT", "named", "EST5EDT"),  # a zone file of that name, not a POSIX string
-        ("Japan", "named", "Japan"),
+        # A zone name, not a POSIX string -- a tzdata link (since 2024b), so the zone it links
+        # to (G192), as Japan is.
+        ("EST5EDT", "named", "America/New_York"),
+        ("Japan", "named", "Asia/Tokyo"),
         ("UTC", "utc", "UTC"),
         ("Etc/UCT", "utc", "UTC"),
         # A POSIX fixed offset is signed WEST of UTC: '<+09>-09' (what SET TIME ZONE 9

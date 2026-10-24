@@ -62,9 +62,10 @@ If either read fails, the report says so (`PG_CATALOG_UNREAD`) rather than readi
 there were none.
 
 Evaluation also reads the source's **server settings** once — settings only, no table is
-scanned — and lists them on the report under the source object counts (**Source server
-settings**, collapsed). They say what the application runs under, which no table definition
-shows:
+scanned — and lists them on the Evaluation screen under the source object counts (**Source
+server settings**, collapsed; the downloaded reports leave the list out, though each item
+that grades a setting quotes its value). They say what the application runs under, which no
+table definition shows:
 
 - **MySQL:** the GLOBAL values of `sql_mode`, `time_zone`, `system_time_zone`,
   `explicit_defaults_for_timestamp`, `auto_increment_increment`, `auto_increment_offset`,
@@ -119,7 +120,8 @@ read is not UTC — MySQL's `time_zone` (`SYSTEM` is the server's own zone,
 `system_time_zone`; the one `init_connect` sets, where it sets one), PostgreSQL's
 `TimeZone` — Schema Conversion writes it into what reads the clock: a `DATETIME`
 (`timestamp without time zone`) default becomes `DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`,
-a `DATE` or `TIME` one its date or time of day, and a MySQL view's `NOW()`, `SYSDATE()`,
+a `DATE` or `TIME` one its date or time of day, a MySQL `TIMESTAMP` one's `CURDATE()` the
+instant that zone's date begins (as MySQL stores it), and a MySQL view's `NOW()`, `SYSDATE()`,
 `CURDATE()` and `CURTIME()` read that zone's clock. A MySQL view reads the rest of what
 MySQL reads in the session's zone in that zone too — `FROM_UNIXTIME()`, and a `TIMESTAMP`
 column's date, time and text (`DATE()`, `HOUR()`, `DATE_FORMAT()` ...) — and compares that
@@ -130,6 +132,13 @@ when `ts` is read through another view; a `TIMESTAMP` compared with a `DATETIME`
 date string is still compared in the session's zone. A fixed offset such as `+09:00` is
 written as the UTC clock plus the offset, `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`:
 as a zone name, `'+09:00'` would be read with the POSIX sign, as nine hours west of UTC. A
+zone name that tzdata defines as a link — `US/Eastern` and `Asia/Calcutta`, among the names
+the RDS and Aurora MySQL `time_zone` parameter offers, or `Japan` — is written as the zone
+it links to (`America/New_York`, `Asia/Kolkata`, `Asia/Tokyo`), the same zone under the
+name every PostgreSQL build has: a build can leave such links out (the Debian-based
+PostgreSQL 16 and 17 images know no `US/Eastern`), and a default or view that names a zone
+the build does not know is created without an error and fails only when a row takes the
+default or the view is read. The item quotes the source's own name and says so. A
 `TIMESTAMP` (`timestamptz`) column holds an instant and keeps `now()`, and
 `UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL view is carried as PostgreSQL
 deparsed it, so the item lists the views that read the clock for you to review. A
@@ -613,7 +622,8 @@ MySQL→PostgreSQL transpile:
   counted in whole units as MySQL counts it — a string by its leading integer — and a composite unit such as
   `'1 2' DAY_HOUR` by its parts; a date string with a two-digit year, or as `yyyymmdd`, read as MySQL reads it),
   `INTERVAL x unit + d` as `d + INTERVAL x unit`, a `TIMESTAMP '...'` literal as the `DATETIME` it is,
-  `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column), `JSON_ARRAY`/`JSON_ARRAYAGG`
+  `CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column) or with a literal zone name that
+  tzdata defines as a link (`'US/Eastern'` written as `'America/New_York'`, the zone it links to), `JSON_ARRAY`/`JSON_ARRAYAGG`
   keeping NULLs and writing a `DATETIME`, a `TINYINT(1)` (`1`/`0`) and a comparison (`true`/`false`) as MySQL does,
   `JSON_EXTRACT`/`->` and MySQL's `->>`
   (which MySQL stores in a view as `json_unquote(json_extract(...))`) over a path of member names and array indexes

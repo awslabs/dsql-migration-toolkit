@@ -3688,6 +3688,19 @@ def _zone_clock_text(zone: "SourceZone") -> str:
     return zone.clock_sql()[1:-1]
 
 
+def _zone_link_note(zone: "SourceZone") -> str:
+    """For a zone the source names by a tzdata link (G192), that the conversion writes the
+    zone's own name, and why; empty otherwise."""
+    if not zone.link:
+        return ""
+    return (
+        f"; '{zone.link}' is a tzdata link to that zone, so Schema Conversion writes the "
+        "zone's own name, which every PostgreSQL build reads as that zone -- a build may "
+        "lack the link, and a default or view that names a zone the build does not know is "
+        "accepted and fails only when a row takes the default or the view is read"
+    )
+
+
 def _counted(names: "Sequence[str]", noun: str) -> str:
     """``3 columns: a, b, c`` (the first ten, then how many more)."""
     return f"{len(names):,} {noun}{'' if len(names) == 1 else 's'}: {_first_names(names)}"
@@ -3794,7 +3807,8 @@ def _mysql_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Ass
     views = views_reading_the_clock(inventory.views, SourceType.MYSQL)
     written = (
         f"a DATETIME column's clock default becomes DEFAULT {zone.clock_sql()}, a DATE or "
-        f"TIME column's its date or time of day ({_counted(columns, 'column')})"
+        "TIME column's its date or time of day, and a TIMESTAMP column's CURDATE() the "
+        f"instant that zone's date begins, as MySQL stores it ({_counted(columns, 'column')})"
         if columns
         else "no column default reads the clock"
     )
@@ -3820,8 +3834,9 @@ def _mysql_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Ass
         object_name="time_zone",
         rule_id=SOURCE_TIME_ZONE_RULE_ID,
         risk=(
-            f"The source runs in time zone {zone.label} ({zone.setting}). MySQL's NOW(), "
-            "CURRENT_TIMESTAMP, CURDATE() and CURTIME() return that zone's wall clock, and "
+            f"The source runs in time zone {zone.label} ({zone.setting}"
+            f"{_zone_link_note(zone)}). MySQL's NOW(), CURRENT_TIMESTAMP, CURDATE() and "
+            "CURTIME() return that zone's wall clock, and "
             "DATETIME, DATE and TIME columns store it as it is; Full Load and CDC copy those "
             "values unchanged. An Aurora DSQL session runs in UTC unless it sets another "
             "zone, so Schema Conversion writes the source's zone where the schema reads the "
@@ -3937,7 +3952,8 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
         rule_id=SOURCE_TIME_ZONE_RULE_ID,
         risk=(
             f"The source's default time zone is {zone.label} ({zone.setting}, what a new "
-            "session gets when neither its role nor the client sets one). now(), "
+            "session gets when neither its role nor the client sets one"
+            f"{_zone_link_note(zone)}). now(), "
             "CURRENT_TIMESTAMP, "
             "LOCALTIMESTAMP and CURRENT_DATE give that zone's wall clock where a timestamp "
             "without time zone, date or time column stores them; Full Load and CDC copy those "

@@ -98,7 +98,7 @@ from dsql_migrator.core.models import (
     ViewDef,
 )
 from dsql_migrator.core.mysql_zero_dates import dateless_kind
-from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
+from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone, written_zone_name
 
 # Cache size applied to an identity primary key under the IDENTITY_WITH_CACHE
 # strategy. A per-node cache hands out blocks of values so concurrent inserts do
@@ -2562,7 +2562,10 @@ def _zoned_clock_default(
     another, so under a source zone that is not UTC the default names that zone: a DATETIME
     gets ``(now() AT TIME ZONE 'Asia/Seoul')`` (a fixed offset the INTERVAL form,
     :meth:`SourceZone.clock_sql`), a DATE its date, a TIME its time of day. A TIMESTAMP
-    column (timestamptz) holds an instant and keeps ``now()``. Without a zone only a
+    column (timestamptz) holds an instant and keeps ``now()``; its CURDATE() -- the date at
+    midnight in the session's zone, MySQL stores the instant that is -- is the instant the
+    zone's date begins (G192, :meth:`SourceZone.midnight_sql`), where CURRENT_DATE gave the
+    session's midnight, UTC's on Aurora DSQL. Without a zone only a
     CURTIME() is written here: the transpile renders CURRENT_TIME as ``CURRENT_TIME()``,
     which PostgreSQL rejects (the whole CREATE TABLE failed). On a TIME column it is
     ``LOCALTIME``; on a column that holds a date MySQL puts the time on the session's current
@@ -2591,6 +2594,8 @@ def _zoned_clock_default(
         return None
     if base == "date" or (base == "timestamp" and reads == "date"):
         return zone.date_sql()
+    if base == "timestamptz" and reads == "date":
+        return zone.midnight_sql()
     if base == "timestamp" and reads == "timestamp":
         return zone.clock_sql()
     return None
@@ -5072,11 +5077,11 @@ def zoned_default_columns(
     table: TableDef, zone: "Optional[SourceZone]", *, is_postgres: bool
 ) -> "list[str]":
     """The columns of ``table`` whose DEFAULT the conversion writes in the source's time
-    ``zone`` (G149): a clock default on a column without a time zone -- what
-    :func:`_zoned_clock_default` (MySQL) or :func:`~dsql_migrator.core.converter_postgres.
-    pg_zoned_clock_default` (PostgreSQL) rewrites, nothing else. Empty when the zone is
-    UTC or unknown. Shared with Evaluation (SOURCE_TIME_ZONE), so it names what Schema
-    Conversion writes. Pure."""
+    ``zone`` (G149): a clock default on a column without a time zone, or a MySQL TIMESTAMP's
+    CURDATE() (G192) -- what :func:`_zoned_clock_default` (MySQL) or
+    :func:`~dsql_migrator.core.converter_postgres.pg_zoned_clock_default` (PostgreSQL)
+    rewrites, nothing else. Empty when the zone is UTC or unknown. Shared with Evaluation
+    (SOURCE_TIME_ZONE), so it names what Schema Conversion writes. Pure."""
     if zone is None or not zone.shifts:
         return []
     names: list[str] = []
@@ -10319,7 +10324,8 @@ def _rewrite_mysql_calls(
       (an amount in whole units, as MySQL counts it -- a string by its leading integer, a
       composite unit by its parts; a date string or a two-digit year as MySQL reads it),
       CONVERT_TZ with a UTC offset as an ISO offset -- a literal one, or one read at run
-      time;
+      time -- and a literal zone name tzdata defines as a link as the zone it links to
+      (G192, :func:`~dsql_migrator.core.source_time_zone.written_zone_name`);
     * JSON_ARRAY / JSON_ARRAYAGG -> JSON_BUILD_ARRAY / JSON_AGG, which keep NULLs, and
       every JSON value written as MySQL writes it (a DATETIME 'YYYY-MM-DD HH:MM:SS.ffffff',
       a TIME with microseconds, a TINYINT(1) as its number, a comparison as true / false, a
@@ -12692,6 +12698,10 @@ def _rewrite_mysql_calls(
             if isinstance(given, exp.Literal) and given.is_string:
                 if _UTC_OFFSET_RE.match(given.name):
                     node.set(part, exp.Interval(this=exp.Literal.string(given.name)))
+                elif written_zone_name(given.name) != given.name:
+                    # G192: a tzdata link ('US/Eastern') as the zone it links to, which a
+                    # build without the link still has.
+                    node.set(part, exp.Literal.string(written_zone_name(given.name)))
                 continue
             # Read at run time: an offset turned into the POSIX zone PostgreSQL reads (its
             # sign the other way round), a zone name kept.
