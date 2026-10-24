@@ -22,6 +22,7 @@ from dsql_migrator.core.introspector import (
     source_engine_kwargs,
 )
 from dsql_migrator.core.models import SourceType
+from dsql_migrator.core.source_time_zone import init_connect_key
 from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
@@ -72,6 +73,103 @@ MYSQL_SERVER_SETTINGS = (
     "div_precision_increment",
     "group_concat_max_len",
 )
+
+# init_connect (G161): the SQL MySQL runs at the start of every session of a user without
+# CONNECTION_ADMIN or SUPER -- the application's -- after the GLOBAL defaults; a parameter
+# group can set the application's time_zone and sql_mode there (a long-standing way to give
+# its sessions a zone). Read with the settings above, and only what it sets for these is
+# recorded (init_connect_key): its text is arbitrary SQL, never kept.
+_INIT_CONNECT_SETTINGS = ("time_zone", "sql_mode")
+# One assignment of a SET: an optional scope keyword (it holds for the assignments after it
+# too) or an @@scope. prefix, the variable, = or :=, the value. A user variable (@x), NAMES,
+# CHARACTER SET or TRANSACTION does not match.
+_SET_ASSIGNMENT_RE = re.compile(
+    r"\s*(?:(?P<keyword>GLOBAL|SESSION|LOCAL|PERSIST|PERSIST_ONLY)\s+)?"
+    r"(?P<at>@@(?:(?P<prefix>global|session|local|persist|persist_only)\.)?)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*(?P<value>.*?)\s*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_sql(text: str, separator: str) -> "list[str]":
+    """``text`` split at ``separator`` outside quotes and parentheses."""
+    parts: list[str] = []
+    current: list[str] = []
+    quote: Optional[str] = None
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        current.append(char)
+        if quote is not None:
+            if char == "\\" and quote != "`" and index + 1 < len(text):
+                current.append(text[index + 1])
+                index += 1
+            elif char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    current.append(quote)
+                    index += 1
+                else:
+                    quote = None
+        elif char in "'\"`":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == separator and depth == 0:
+            current.pop()
+            parts.append("".join(current))
+            current = []
+        index += 1
+    parts.append("".join(current))
+    return parts
+
+
+def _set_value(text: str) -> Optional[str]:
+    """A SET value as the session gets it: a string literal's text, a bare word itself,
+    ``None`` for DEFAULT (the GLOBAL value); anything else -- an expression, a variable -- as
+    written, which names no zone or mode the findings can read."""
+    quoted = re.fullmatch(r"'((?:[^'\\]|\\.|'')*)'|\"((?:[^\"\\]|\\.|\"\")*)\"", text, re.DOTALL)
+    if quoted is not None:
+        raw, quote = (quoted.group(1), "'") if quoted.group(1) is not None else (quoted.group(2), '"')
+        return re.sub(r"\\(.)", r"\1", raw.replace(quote * 2, quote), flags=re.DOTALL)
+    if text.upper() == "DEFAULT":
+        return None
+    return text
+
+
+def init_connect_settings(init_connect: str) -> "dict[str, str]":
+    """The ``time_zone`` / ``sql_mode`` a session gets from ``init_connect`` -- ``SET
+    time_zone = 'Asia/Seoul'``, ``SET SESSION sql_mode = '...'``, ``SET @@session.x = ...``,
+    several in one SET or one statement after another, the last winning, ``DEFAULT`` the
+    GLOBAL value again -- by name (:func:`_set_value`). A GLOBAL / PERSIST assignment sets no
+    session's. Pure."""
+    found: dict[str, str] = {}
+    for statement in _split_sql(init_connect or "", ";"):
+        body = re.match(r"\s*SET\s+(.*)\Z", statement, re.IGNORECASE | re.DOTALL)
+        if body is None:
+            continue
+        scope = "SESSION"
+        for assignment in _split_sql(body.group(1), ","):
+            match = _SET_ASSIGNMENT_RE.match(assignment)
+            if match is None:
+                continue
+            if match.group("keyword"):
+                scope = match.group("keyword").upper()
+            if match.group("at"):
+                this_scope = (match.group("prefix") or "session").upper()
+            else:
+                this_scope = scope
+            name = match.group("name").lower()
+            if this_scope not in ("SESSION", "LOCAL") or name not in _INIT_CONNECT_SETTINGS:
+                continue
+            value = _set_value(match.group("value"))
+            if value is None:
+                found.pop(name, None)
+            else:
+                found[name] = value
+    return found
 
 
 # The live definitions of a table's key columns, read once when a keyset stream of a table
@@ -526,8 +624,9 @@ class MySQLSourceDialect(SourceDialect):
             return {}
         from sqlalchemy import text
 
-        params = {f"v{index}": name for index, name in enumerate(MYSQL_SERVER_SETTINGS)}
-        placeholders = ", ".join(f":v{index}" for index in range(len(MYSQL_SERVER_SETTINGS)))
+        names = (*MYSQL_SERVER_SETTINGS, "init_connect")
+        params = {f"v{index}": name for index, name in enumerate(names)}
+        placeholders = ", ".join(f":v{index}" for index in range(len(names)))
         try:
             rows = connection.execute(  # type: ignore[attr-defined]
                 text(f"SHOW GLOBAL VARIABLES WHERE Variable_name IN ({placeholders})"),
@@ -540,7 +639,11 @@ class MySQLSourceDialect(SourceDialect):
             for row in rows
             if len(row) >= 2 and row[0] is not None
         }
-        return {name: found[name] for name in MYSQL_SERVER_SETTINGS if name in found}
+        settings = {name: found[name] for name in MYSQL_SERVER_SETTINGS if name in found}
+        # What init_connect sets for the application's sessions, never its text (G161).
+        for name, value in init_connect_settings(found.get("init_connect", "")).items():
+            settings[init_connect_key(name)] = value
+        return settings
 
     def probe_grants(self, connection: object) -> list[str]:
         # MySQL exposes the current user's privileges as raw ACL lines via SHOW GRANTS.
@@ -657,6 +760,7 @@ class MySQLSourceDialect(SourceDialect):
 __all__ = [
     "MYSQL_SERVER_SETTINGS",
     "MySQLSourceDialect",
+    "init_connect_settings",
     "is_single_precision_float",
     "mysql_base_type",
 ]

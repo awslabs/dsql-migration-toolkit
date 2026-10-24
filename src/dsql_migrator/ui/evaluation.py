@@ -2521,9 +2521,12 @@ def source_settings_caption(source_type: Optional[SourceType]) -> str:
             "sessions run with TimeZone UTC."
         )
     return (
-        "The server's GLOBAL values, which an application session starts from. The tool's own "
-        "source sessions read with time_zone '+00:00' and sql_mode 'ALLOW_INVALID_DATES', which "
-        "changes no parsing: a session setting, nothing is written to the source."
+        "The server's GLOBAL values, which an application session starts from, and what the "
+        "parameter group's init_connect sets for time_zone or sql_mode (marked init_connect): "
+        "it runs at the start of every session of a user without CONNECTION_ADMIN or SUPER, "
+        "the application's, which the findings grade instead. The tool's own source sessions "
+        "read with time_zone '+00:00' and sql_mode 'ALLOW_INVALID_DATES', which changes no "
+        "parsing: a session setting, nothing is written to the source."
     )
 
 

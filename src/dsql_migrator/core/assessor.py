@@ -3118,6 +3118,34 @@ def _sql_mode_flags(value: str) -> set[str]:
     return flags
 
 
+def _readable_sql_mode(value: Optional[str]) -> bool:
+    """A ``sql_mode`` whose flags can be read: names separated by commas -- not an old
+    server's number, nor an expression init_connect sets it to (CONCAT(@@sql_mode, ...))."""
+    return isinstance(value, str) and re.fullmatch(
+        r"\s*(?:[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)?\s*", value
+    ) is not None
+
+
+def _init_connect_sql_mode(settings: "dict[str, str]") -> Optional[str]:
+    """The sql_mode the source's init_connect sets for every session of a user without
+    CONNECTION_ADMIN or SUPER -- the application's -- after the GLOBAL value (G161), as the
+    MySQL dialect recorded it; None when it sets none."""
+    from dsql_migrator.core.source_time_zone import init_connect_key
+
+    value = settings.get(init_connect_key("sql_mode"))
+    return value if isinstance(value, str) else None
+
+
+def _unread_init_connect_mode(assigned: Optional[str]) -> str:
+    """The sentence for an init_connect sql_mode that is an expression, else ``''``."""
+    if assigned is None or _readable_sql_mode(assigned):
+        return ""
+    return (
+        f" Its init_connect sets the application's sessions' sql_mode to {assigned}, which the "
+        "tool cannot read: check SELECT @@SESSION.sql_mode as the application's user."
+    )
+
+
 def _first_names(names: "Sequence[str]", limit: int = 10) -> str:
     """``a, b, c and N more``: the first ``limit`` names, then how many are left."""
     shown = ", ".join(names[:limit])
@@ -3161,12 +3189,26 @@ def check_mysql_sql_mode(
     application's SQL means something else in MySQL's default mode, which the Query
     Converter reads. None of these is a fault of the conversion, so the item names what to
     check, not a fix it made. What the zero-date and strict flags let the source store is
-    its own item, ZERO_DATES (:func:`check_mysql_zero_dates`). Nothing when the mode was not
-    read, is numeric (an old server's form), or none of the flags matter."""
+    its own item, ZERO_DATES (:func:`check_mysql_zero_dates`). Where the source's
+    init_connect sets the mode (G161), the application's sessions run with that one, which
+    is graded instead. Nothing when the mode was not read, is numeric (an old server's
+    form), or none of the flags matter."""
     value = inventory.server_settings.get("sql_mode")
-    if value is None or value.strip().isdigit():
+    assigned = _init_connect_sql_mode(inventory.server_settings)
+    if assigned is not None and _readable_sql_mode(assigned):
+        graded = assigned
+        subject = (
+            f"The source's init_connect sets sql_mode '{assigned}' for every session of a "
+            "user without CONNECTION_ADMIN or SUPER -- the application's"
+            + (f" (the global sql_mode is '{value}')" if value is not None else "")
+            + ". "
+        )
+    else:
+        graded = value
+        subject = f"The source's global sql_mode is '{value}'.{_unread_init_connect_mode(assigned)} "
+    if graded is None or graded.strip().isdigit():
         return []
-    flags = _sql_mode_flags(value)
+    flags = _sql_mode_flags(graded)
     risks: list[str] = []
     advice: list[str] = []
     if "ONLY_FULL_GROUP_BY" not in flags:
@@ -3204,15 +3246,18 @@ def check_mysql_sql_mode(
     if not risks:
         return []
     advice.append(
-        f"To change what the source accepts from now on, set sql_mode in "
-        f"{_INSTANCE_SETTINGS_PARAMETER_GROUP}; it reaches new connections without a reboot. "
+        "To change what the source accepts from now on, set sql_mode in "
+        + ("the init_connect of " if assigned is not None else "")
+        + _INSTANCE_SETTINGS_PARAMETER_GROUP
+        + (", which sets it after the global value" if assigned is not None else "")
+        + "; it reaches new connections without a reboot. "
         "Test the application first: a stricter mode rejects writes it makes today."
     )
     return [
         _database_item(
             object_name="sql_mode",
             rule_id=SQL_MODE_RULE_ID,
-            risk=f"The source's global sql_mode is '{value}'. " + " ".join(risks),
+            risk=subject + " ".join(risks),
             recommendation=" ".join(advice),
             effort=EffortLevel.MEDIUM,
         )
@@ -3256,9 +3301,15 @@ def check_mysql_zero_dates(
         and _is_zero_temporal_literal(column.default)
     ]
     value = inventory.server_settings.get("sql_mode")
-    read = value is not None and not value.strip().isdigit()
-    flags = _sql_mode_flags(value) if read else set()
-    strict = bool(flags & {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"})
+    assigned = _init_connect_sql_mode(inventory.server_settings)
+    # The modes the source's sessions run with: the global one, and the one its init_connect
+    # sets for the application's (G161). What either lets in may be there, so each flag test
+    # below holds when it holds for either (the NO_ flags kept only where both have them).
+    modes = [mode for mode in (value, assigned) if mode is not None and _readable_sql_mode(mode)]
+    read = bool(modes)
+    each = [_sql_mode_flags(mode) for mode in modes]
+    flags = set.intersection(*each) | (set.union(*each) & {"ALLOW_INVALID_DATES"}) if each else set()
+    strict = read and all(mode & {"STRICT_TRANS_TABLES", "STRICT_ALL_TABLES"} for mode in each)
     reasons = [
         reason
         for reason, applies in (
@@ -3298,9 +3349,18 @@ def check_mysql_zero_dates(
             if not strict
             else ""
         )
+        if assigned is None or not _readable_sql_mode(assigned):
+            subject = f"The source's global sql_mode is '{value}', which lets"
+        elif len(modes) > 1:
+            subject = (
+                f"The source's global sql_mode is '{value}' and its init_connect sets "
+                f"'{assigned}' for the application's sessions, which between them let"
+            )
+        else:
+            subject = f"The source's init_connect sets sql_mode '{assigned}' for the application's sessions, which lets"
         risks.append(
-            f"The source's global sql_mode is '{value}', which lets it store dates Aurora DSQL "
-            f"has no value for ({'; '.join(reasons)}): {listed}.{lenient}"
+            f"{subject} it store dates Aurora DSQL has no value for ({'; '.join(reasons)}): "
+            f"{listed}.{lenient}{_unread_init_connect_mode(assigned)}"
         )
     if zero_defaults:
         risks.append(
@@ -3414,7 +3474,9 @@ def check_mysql_zero_dates(
     if reasons:
         advice.append(
             f"To make the source refuse them from now on, set sql_mode in "
-            f"{_INSTANCE_SETTINGS_PARAMETER_GROUP} with strict mode, NO_ZERO_DATE and "
+            f"{_INSTANCE_SETTINGS_PARAMETER_GROUP}"
+            + (" (and in its init_connect, which sets it after the global value)" if assigned is not None else "")
+            + " with strict mode, NO_ZERO_DATE and "
             "NO_ZERO_IN_DATE, and without ALLOW_INVALID_DATES; it reaches new connections "
             "without a reboot. Test the application first: a stricter mode rejects writes it "
             "makes today."
@@ -3600,8 +3662,13 @@ def _mysql_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Ass
             rule_id=SOURCE_TIME_ZONE_RULE_ID,
             risk=risk,
             recommendation=(
-                "If the source runs in a zone other than UTC (SELECT @@GLOBAL.time_zone, "
-                "@@system_time_zone), edit those defaults and views in Schema Conversion to "
+                "If the source runs in a zone other than UTC ("
+                + (
+                    "SELECT @@SESSION.time_zone, @@system_time_zone as the application's user"
+                    if "init_connect" in zone.setting
+                    else "SELECT @@GLOBAL.time_zone, @@system_time_zone"
+                )
+                + "), edit those defaults and views in Schema Conversion to "
                 "name it (now() AT TIME ZONE 'Area/City'), and have the application run SET "
                 "TIME ZONE 'Area/City' on every new Aurora DSQL connection."
             ),
@@ -3756,7 +3823,8 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
 def check_mysql_time_zone(
     inventory: SourceInventory, target_inventory: Optional[TargetInventory] = None
 ) -> list[AssessmentItem]:
-    """The source's time zone (G149), from its GLOBAL ``time_zone``: in a zone other than UTC,
+    """The source's time zone (G149), from its GLOBAL ``time_zone`` -- or the one its
+    init_connect sets for the application's sessions (G161): in a zone other than UTC,
     what Schema Conversion writes in it -- DATETIME / DATE / TIME clock defaults, the views'
     NOW() / CURDATE() / CURTIME() -- and what the application has to do (MANUAL); a zone it
     could not read or tell, that the conversion assumes UTC (an advisory note). Nothing for

@@ -118,6 +118,14 @@ class SourceZone:
 UNREAD_ZONE = SourceZone("unknown")
 
 
+def init_connect_key(name: str) -> str:
+    """The ``server_settings`` key of the value a MySQL source's ``init_connect`` sets for
+    ``name`` (``time_zone (init_connect)``, G161): the SQL MySQL runs at the start of every
+    session of a user without CONNECTION_ADMIN or SUPER -- the application's -- after the
+    GLOBAL defaults, so such a session gets that value instead."""
+    return f"{name} (init_connect)"
+
+
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -143,10 +151,20 @@ def _named(value: str, setting: str) -> SourceZone:
 
 def _mysql_zone(settings: Mapping[str, str]) -> SourceZone:
     value = settings.get("time_zone")
+    assigned = settings.get(init_connect_key("time_zone"))
+    if isinstance(assigned, str):
+        # The zone init_connect sets is the one the application's sessions run in (G161).
+        glob = f"; GLOBAL time_zone '{value.strip()}'" if isinstance(value, str) else ""
+        return _mysql_zone_of(assigned.strip(), settings, f" set by init_connect{glob}")
     if not isinstance(value, str):
         return UNREAD_ZONE
-    value = value.strip()
-    setting = f"time_zone '{value}'"
+    return _mysql_zone_of(value.strip(), settings, "")
+
+
+def _mysql_zone_of(value: str, settings: Mapping[str, str], origin: str) -> SourceZone:
+    """The zone of a MySQL ``time_zone`` value -- ``origin`` says where the session gets it,
+    as the findings quote it."""
+    setting = f"time_zone '{value}'{origin}"
     if value.upper() == "SYSTEM":
         # The server's own zone, which MySQL reports by its abbreviation at start-up
         # (system_time_zone 'KST', 'CEST', '+04'): only UTC can be told from that -- an
@@ -230,7 +248,9 @@ def resolve_source_zone(settings: Mapping[str, str], source_type: SourceType) ->
     read (``SourceInventory.server_settings``). Pure.
 
     MySQL: the GLOBAL ``time_zone`` -- a zone name, a fixed offset ('+09:00'), or ``SYSTEM``,
-    the server's own zone, known only when ``system_time_zone`` is UTC. PostgreSQL: the
+    the server's own zone, known only when ``system_time_zone`` is UTC -- or the one the
+    source's ``init_connect`` sets, which the application's sessions get (G161; an expression
+    there names no zone that can be told). PostgreSQL: the
     ``TimeZone`` a new session gets -- a zone name, or a POSIX string with a fixed offset
     ('<+09>-09' is UTC+09:00); one with daylight-saving rules is not written. Anything not
     read, or not one of these, is ``unknown``."""
@@ -241,4 +261,6 @@ def resolve_source_zone(settings: Mapping[str, str], source_type: SourceType) ->
     return _mysql_zone(settings)
 
 
-__all__ = ["SourceZone", "UNREAD_ZONE", "resolve_source_zone", "views_reading_the_clock"]
+__all__ = [
+    "SourceZone", "UNREAD_ZONE", "init_connect_key", "resolve_source_zone", "views_reading_the_clock",
+]

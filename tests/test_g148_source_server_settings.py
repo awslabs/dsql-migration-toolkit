@@ -411,7 +411,9 @@ def test_mysql_reads_the_global_values_once_with_the_names_bound() -> None:
     assert "max_connections" not in settings
     ((statement, params),) = connection.executed
     assert statement.startswith("SHOW GLOBAL VARIABLES WHERE Variable_name IN (")
-    assert sorted(params.values()) == sorted(MYSQL_SERVER_SETTINGS)
+    # init_connect is read with them (G161); only what it sets is recorded, never its text.
+    assert sorted(params.values()) == sorted((*MYSQL_SERVER_SETTINGS, "init_connect"))
+    assert "init_connect" not in settings
     assert not any(name in statement for name in MYSQL_SERVER_SETTINGS)  # bound, not formatted
     assert not is_write_or_ddl(statement)
 

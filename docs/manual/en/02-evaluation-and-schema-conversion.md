@@ -71,7 +71,12 @@ shows:
   `lower_case_table_names`, `character_set_server`, `collation_server`,
   `default_collation_for_utf8mb4`, `div_precision_increment` and `group_concat_max_len` —
   the global ones, because an application session starts from them while the tool's own
-  sessions set their own (below). Four are graded, each a database-level **MANUAL** item.
+  sessions set their own (below). A `time_zone` or `sql_mode` that the parameter group's
+  `init_connect` sets is listed as well, marked `init_connect` (the statement itself is not
+  recorded): `init_connect` runs at the start of every session of a user without
+  `CONNECTION_ADMIN` or `SUPER` — the application's — so the time zone and `SQL_MODE` are
+  graded with that value instead of the global one, and `ZERO_DATES` with what either mode
+  lets in. Four are graded, each a database-level **MANUAL** item.
   `SQL_MODE`: the mode lacks `ONLY_FULL_GROUP_BY` (a view or query may then select a column
   its `GROUP BY` does not determine, which Aurora DSQL rejects with `42803`, a view when
   Schema Conversion applies it), or has `ANSI_QUOTES` / `PIPES_AS_CONCAT` (application SQL
@@ -104,18 +109,18 @@ wall clock of the session's time zone, and a `DATETIME` / `timestamp` column sto
 wall clock as it is; Full Load and CDC copy it unchanged, in whatever zone it was written.
 An Aurora DSQL session runs in UTC unless it sets another zone. So when the zone Evaluation
 read is not UTC — MySQL's `time_zone` (`SYSTEM` is the server's own zone,
-`system_time_zone`), PostgreSQL's `TimeZone` — Schema Conversion writes it into what reads
-the clock: a `DATETIME` (`timestamp without time zone`) default becomes
-`DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`, a `DATE` or `TIME` one its date or time of
-day, and a MySQL view's `NOW()`, `SYSDATE()`, `CURDATE()` and `CURTIME()` read that zone's
-clock. A MySQL view reads the rest of what MySQL reads in the session's zone in that zone
-too — `FROM_UNIXTIME()`, and a `TIMESTAMP` column's date, time and text (`DATE()`,
-`HOUR()`, `DATE_FORMAT()` ...) — and compares that zone's clock with a `TIMESTAMP` column
-as the instant it names there (a `UNION` column of both is that zone's wall clock, as
-MySQL's `DATETIME` is), so `ts > NOW() - INTERVAL 1 DAY` returns the rows it returned in
-MySQL whatever zone the Aurora DSQL session runs in; a `TIMESTAMP` compared with a
-`DATETIME` column or a date string is still compared in the session's zone. A fixed offset
-such as `+09:00` is written as the UTC clock plus the offset,
+`system_time_zone`; the one `init_connect` sets, where it sets one), PostgreSQL's
+`TimeZone` — Schema Conversion writes it into what reads the clock: a `DATETIME`
+(`timestamp without time zone`) default becomes `DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`,
+a `DATE` or `TIME` one its date or time of day, and a MySQL view's `NOW()`, `SYSDATE()`,
+`CURDATE()` and `CURTIME()` read that zone's clock. A MySQL view reads the rest of what
+MySQL reads in the session's zone in that zone too — `FROM_UNIXTIME()`, and a `TIMESTAMP`
+column's date, time and text (`DATE()`, `HOUR()`, `DATE_FORMAT()` ...) — and compares that
+zone's clock with a `TIMESTAMP` column as the instant it names there (a `UNION` column of
+both is that zone's wall clock, as MySQL's `DATETIME` is), so `ts > NOW() - INTERVAL 1 DAY`
+returns the rows it returned in MySQL whatever zone the Aurora DSQL session runs in; a
+`TIMESTAMP` compared with a `DATETIME` column or a date string is still compared in the
+session's zone. A fixed offset such as `+09:00` is written as the UTC clock plus the offset,
 `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`: as a zone name, `'+09:00'` would be read
 with the POSIX sign, as nine hours west of UTC. A `TIMESTAMP` (`timestamptz`) column holds
 an instant and keeps `now()`, and `UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL
