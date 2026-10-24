@@ -1563,13 +1563,16 @@ class PgCdcUncarryableColumnRule(Rule):
     sentences, prefixed by the condition: none of it applies to a Full load only migration,
     which carries every one of these columns. An extension's type the bundled connector
     does not know (pgvector's ``vector``, ...) arrives NULL too (G153); Evaluation knows the
-    common ones by name, Step 3 reads the catalog for every one."""
+    common ones by name, Step 3 reads the catalog for every one. A primary-key column of such
+    a type is named as Step 3 names it (K27): CDC cannot replicate the table, and changing
+    the key's type on the source or a separate Full load only migration is MEDIUM effort."""
 
     rule_id = "CDC_UNCARRYABLE_COLUMN"
 
     def evaluate(self, inventory: "SourceInventory") -> "list[Finding]":
         from dsql_migrator.core.prerequisites_postgres import (
             target_defaulted_columns,
+            uncarried_key_columns,
             uncarryable_column_texts,
             uncarryable_columns_of,
         )
@@ -1580,8 +1583,11 @@ class PgCdcUncarryableColumnRule(Rule):
             if not found:
                 continue
             detail, remediation = uncarryable_column_texts(
-                found, defaulted=target_defaulted_columns(table)
+                found,
+                defaulted=target_defaulted_columns(table),
+                key_columns=table.primary_key,
             )
+            keyed = bool(uncarried_key_columns(found, table.primary_key))
             findings.append(
                 Finding(
                     object=ObjectKey(KIND_TABLE, table.name),
@@ -1589,7 +1595,7 @@ class PgCdcUncarryableColumnRule(Rule):
                     classification=Classification.MANUAL,
                     risk="If you replicate with CDC: " + detail,
                     recommendation=remediation,
-                    effort=EffortLevel.SIMPLE,
+                    effort=EffortLevel.MEDIUM if keyed else EffortLevel.SIMPLE,
                 )
             )
         return findings

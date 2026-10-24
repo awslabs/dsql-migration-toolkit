@@ -1291,7 +1291,11 @@ def _it_they(columns: "Sequence[UncarryableCdcColumn]") -> str:
 
 
 def check_columns_replicable(
-    table: TableDef, facts: PostgresCdcFacts, *, excluded: "Iterable[str]" = ()
+    table: TableDef,
+    facts: PostgresCdcFacts,
+    *,
+    excluded: "Iterable[str]" = (),
+    key_columns: "Iterable[str]" = (),
 ) -> Optional[PrerequisiteResult]:
     """WARN when a column's type cannot survive the CDC hop, NAMING each column and type.
 
@@ -1333,9 +1337,16 @@ def check_columns_replicable(
       append reload only inserts primary keys the target is missing and so cannot rewrite
       the NULL a row already carries -- and Validation reports it meanwhile.
 
-    The one exception is a NOT NULL bit(n)[] (:func:`connector_stopping_columns`): it stops
-    the source connector, so CDC halts for every captured table -- the TABLE_REPLICABLE
-    consequence, graded FAIL / required like it.
+    The exceptions are graded FAIL / required, like TABLE_REPLICABLE. A NOT NULL bit(n)[]
+    (:func:`connector_stopping_columns`) stops the source connector, so CDC halts for every
+    captured table. A KEY column (:func:`uncarried_key_columns`: of the source primary key,
+    or of ``key_columns``, the key a re-keyed table's records carry) breaks the key every
+    change is applied by, and none of the choices above is one: a key column cannot be
+    excluded, its NOT NULL cannot be dropped, and accepting it is not a gap a reload closes --
+    with a composite key, CDC applies a DELETE by the remaining key columns, removing every
+    target row that shares them, silently (K27; executed against the shipped Debezium 2.7.4
+    and sink jars). The table is CDC's to leave out (Full load only) or the key's type the
+    source's to change.
 
     The silent class is WARN rather than INFO for the opposite reason: ``INFO`` means
     expected / optional / no action needed, and a column that arrives NULL with no error is
@@ -1363,21 +1374,47 @@ def check_columns_replicable(
     found = [c for c in (per_table.get(table.name) or ()) if c.column not in skip]
     if not found:
         return None
+    keys = change_key_columns(table, key_columns)
     detail, remediation = uncarryable_column_texts(
-        found, defaulted=target_defaulted_columns(table)
+        found, defaulted=target_defaulted_columns(table), key_columns=keys
     )
     # A column that stops the source connector halts CDC for EVERY captured table, as an
-    # UNLOGGED table aborts the whole publication: graded like TABLE_REPLICABLE.
-    blocks_all = bool(connector_stopping_columns(found))
+    # UNLOGGED table aborts the whole publication, and a key column CDC cannot carry breaks
+    # every change to this one: both graded like TABLE_REPLICABLE.
+    blocks = bool(connector_stopping_columns(found)) or bool(
+        uncarried_key_columns(found, keys)
+    )
     return PrerequisiteResult(
         check_id=PrerequisiteCheckId.COLUMN_REPLICABLE,
         title=_COLUMN_REPLICABLE_TITLE,
-        status=PrerequisiteStatus.FAIL if blocks_all else PrerequisiteStatus.WARN,
-        required=blocks_all,
+        status=PrerequisiteStatus.FAIL if blocks else PrerequisiteStatus.WARN,
+        required=blocks,
         target=table.name,
         detail=detail,
         remediation=remediation,
     )
+
+
+def change_key_columns(table: TableDef, key_columns: "Iterable[str]" = ()) -> "list[str]":
+    """The columns a change to ``table`` is keyed and applied by: its source primary key,
+    then any column of ``key_columns`` (the target key a re-keyed table's records carry)
+    beyond it, in order. Pure."""
+    return list(dict.fromkeys([*(table.primary_key or ()), *(key_columns or ())]))
+
+
+def uncarried_key_columns(
+    found: "Sequence[UncarryableCdcColumn]", key_columns: "Iterable[str]"
+) -> "list[UncarryableCdcColumn]":
+    """The columns of ``found`` that are in ``key_columns``, whatever CDC does with them,
+    except one that stops the source connector (:func:`connector_stopping_columns`, which says
+    so on its own). Debezium builds a change record's key from the key columns it has a
+    schema for, and a key column it cannot carry breaks every change: left out of the event,
+    it is left out of the KEY too (TableSchemaBuilder skips it), so the sink applies each
+    change by the remaining key columns -- or finds no key at all; rendered differently, it
+    addresses a row that is not there; unrenderable, it dead-letters every change. Pure."""
+    key = set(key_columns or ())
+    stopping = connector_stopping_columns(found)
+    return [c for c in found if c.column in key and c not in stopping]
 
 
 def target_defaulted_columns(table: TableDef) -> "set[str]":
@@ -1418,15 +1455,91 @@ def connector_stopping_columns(
     ]
 
 
+def _names(columns: "Sequence[str]") -> str:
+    return ", ".join(f"`{c}`" for c in columns)
+
+
+def _uncarried_key_sentences(
+    keyed: "Sequence[UncarryableCdcColumn]", key_columns: "Sequence[str]"
+) -> "list[str]":
+    """What CDC does to a table whose KEY column it cannot carry
+    (:func:`uncarried_key_columns`), by what happens to that column. Executed against the
+    shipped Debezium 2.7.4 and sink jars (K27): TableSchemaBuilder leaves a column with no
+    schema out of the record key as well as the value, the sink takes the key columns from
+    the record key, and DsqlDialect builds a DELETE's WHERE from whichever arrive."""
+    keys = list(dict.fromkeys(key_columns))
+    dropped = [
+        c for c in keyed
+        if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL and not _stays_in_event(c)
+    ]
+    wrong = [c for c in keyed if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
+    unrendered = [c for c in keyed if c not in dropped and c not in wrong]
+    one = {True: "it", False: "them"}
+    sentences: list[str] = []
+    if dropped:
+        gone = {c.column for c in dropped}
+        remaining = [k for k in keys if k not in gone]
+        if remaining:
+            sentences.append(
+                f"{_describe_columns(dropped)} {_is_are(dropped)} part of the primary key, "
+                f"and CDC leaves {one[len(dropped) == 1]} out of every change event, and so "
+                "out of each change's key: CDC applies this table's changes by "
+                f"{_names(remaining)} alone. An insert or update is refused there (no unique "
+                f"key matches {_names(remaining)} alone) and dead-lettered, and a DELETE "
+                f"removes EVERY target row with the deleted row's {_names(remaining)}, with "
+                "nothing dead-lettered."
+            )
+        else:
+            sentences.append(
+                f"{_describe_columns(dropped)} {_is_are(dropped)} the whole primary key, and "
+                f"CDC leaves {one[len(dropped) == 1]} out of every change event, so the "
+                "changes carry no key: every insert and update is dead-lettered, and so is a "
+                "DELETE -- unless the table's REPLICA IDENTITY is FULL, when a DELETE is "
+                "applied by the deleted row's other columns and removes every target row "
+                "that holds the same values."
+            )
+    if wrong:
+        sentences.append(
+            f"{_describe_columns(wrong)} {_is_are(wrong)} part of the primary key and "
+            f"{'arrives' if len(wrong) == 1 else 'arrive'} with a different value than Full "
+            "Load writes for the same row, so a change CDC applies to a row Full Load copied "
+            "lands as a second row beside it, and a DELETE misses it."
+        )
+    if unrendered:
+        sentences.append(
+            f"{_describe_columns(unrendered)} {_is_are(unrendered)} part of the primary key, "
+            f"and CDC cannot render {one[len(unrendered) == 1]} for the target, so every "
+            "change to this table is dead-lettered and none reaches the target."
+        )
+    sentences.append("CDC cannot replicate this table as it is.")
+    return sentences
+
+
+_UNCARRIED_KEY_REMEDY = (
+    "The CDC prerequisite check \"Every column's type can be carried by CDC\" holds the "
+    "migration until this table is resolved -- in Full load + CDC, before its Full Load too. "
+    "Leave the table out of the selection and migrate it in a separate Full load only "
+    "migration, its writes stopped from that load to Cut over, or change the key column's "
+    "type on the source to one CDC carries (text), then re-run the checks. A key column "
+    "cannot be excluded."
+)
+
+
 def uncarryable_column_texts(
     found: "Sequence[UncarryableCdcColumn]",
     *,
     defaulted: "Iterable[str]" = (),
+    key_columns: "Iterable[str]" = (),
 ) -> "tuple[str, str]":
     """``(what happens, what to do)`` for ``found``: the Step 3 ``COLUMN_REPLICABLE`` row's
     wording, which Evaluation's ``CDC_UNCARRYABLE_COLUMN`` finding repeats, so both steps
     describe the same columns the same way. ``defaulted`` names the columns that have a
-    DEFAULT on the target. Pure."""
+    DEFAULT on the target. ``key_columns`` names the columns each change is keyed by
+    (:func:`change_key_columns`): a column of ``found`` among them leads the text, and the
+    only routes offered are then the ones that apply to a key (K27). Pure."""
+    keys = list(dict.fromkeys(key_columns or ()))
+    keyed = uncarried_key_columns(found, keys)
+    found = [c for c in found if c not in keyed]
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
     has_default = set(defaulted)
     lost = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
@@ -1443,7 +1556,7 @@ def uncarryable_column_texts(
     nulled = [c for c in dropped if c.nullable is not False and c.column not in has_default]
     wrong = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_WRONG]
 
-    sentences: list[str] = []
+    sentences: list[str] = _uncarried_key_sentences(keyed, keys) if keyed else []
     if fatal:
         sentences.append(
             f"CDC cannot render {_describe_columns(fatal)} for the remodeled target column, "
@@ -1470,7 +1583,7 @@ def uncarryable_column_texts(
         )
     # "Separately" because when the table already dead-letters, a column-level loss is a
     # SECOND finding about the same table rather than a milder description of the first.
-    lead = "Separately, " if fatal or refused or stopped else ""
+    lead = "Separately, " if fatal or refused or stopped or keyed else ""
     if nulled_always:
         sentences.append(
             f"{lead}{_describe_columns(nulled_always)} {_is_are(nulled_always)} sent "
@@ -1516,6 +1629,10 @@ def uncarryable_column_texts(
         if refused
         else ""
     )
+    if keyed:
+        # None of the routes below is one for a key column: it cannot be excluded, its NOT
+        # NULL cannot be dropped, and accepting it is not a gap a reload closes.
+        return " ".join(sentences), _UNCARRIED_KEY_REMEDY
     remediation = (
         "Decide before the CDC infrastructure is created: "
         + numeric_route
@@ -2139,7 +2256,8 @@ def check_postgres_cdc_prerequisites(
             results.append(_inheritance)
         results.append(check_replica_identity(table, facts))
         _columns = check_columns_replicable(
-            table, facts, excluded=(excluded_columns or {}).get(table.name, ()))
+            table, facts, excluded=(excluded_columns or {}).get(table.name, ()),
+            key_columns=_keys.get(table.name) or ())
         if _columns is not None:
             results.append(_columns)
         _covers = check_replica_identity_covers_key(
@@ -2264,6 +2382,8 @@ __all__ = [
     "check_inheritance_children",
     "check_row_security",
     "check_columns_replicable",
+    "change_key_columns",
+    "uncarried_key_columns",
     "check_publication_privilege",
     "check_cdc_replication_objects",
     "check_postgres_cdc_prerequisites",

@@ -676,7 +676,14 @@ fails **loudly** where it can't.
   Decide before you deploy CDC: exclude the column
   ([Chapter 13](13-excluding-tables-and-columns.md)), give it a type CDC carries on the
   source (`text`), leave the table out and migrate it with Full load only, or accept the gap
-  and reload the table with **Drop & reload**, its writes stopped, before Cut over.
+  and reload the table with **Drop & reload**, its writes stopped, before Cut over. A
+  primary-key column of such a type, or of any other type CDC cannot carry, is worse: CDC
+  leaves it out of each change's key too, so it applies the table's changes by the other
+  key columns alone, and a DELETE removes every target row that shares them (with a
+  one-column key, every insert and update is dead-lettered). A key column cannot be
+  excluded, so the CDC prerequisite check holds the migration for such a table (in **Full
+  load + CDC**, before the Full Load): leave the table out and migrate it with Full load
+  only, or give the key column a type CDC carries on the source.
 - **PostgreSQL 17/18 sources — three version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is
