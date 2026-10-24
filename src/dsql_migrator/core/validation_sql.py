@@ -345,6 +345,18 @@ def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str
     _applied_base = (applied or "").split("(", 1)[0].strip().lower()
     if _source_is_array and _applied_base in ("jsonb", ""):
         return "array_json"
+    # A pgvector vector / halfvec column remodelled to jsonb, one of the two targets
+    # PG_UNSUPPORTED_TYPE advises (G169, K32): the source prints '[1,2,3]', the jsonb target
+    # '[1, 2, 3]' -- the same array, which "plain" ::text false-MISMATCHED on every non-NULL
+    # row and held cut over. CAST(CAST(col AS text) AS jsonb) is the identity on the jsonb
+    # target, so ONE expression serves both ends, as array_json's to_jsonb does (live on
+    # PostgreSQL 17.11 + pgvector 0.8.7: equal for 1e-05, 3.4028235e+38, -0 and halfvec). The
+    # schema a type is qualified with is ignored; sparsevec's text ('{1:1,3:2}/5') is no JSON.
+    if source_is_postgres and _applied_base == "jsonb" and (
+        _TYPE_MODIFIER_RE.sub("", mysql_type).strip().lower().rpartition(".")[2].strip('"')
+        in ("vector", "halfvec")
+    ):
+        return "vector_json"
     if applied:
         kind = applied.split("(", 1)[0].strip().lower()
     elif source_is_postgres:
@@ -502,6 +514,10 @@ def _pg_checksum_expr(
         # ONE expression for both ends: the source's array becomes canonical jsonb text,
         # and on the jsonb target to_jsonb is the identity. See _checksum_kind.
         return sql.SQL("to_jsonb({col})::text").format(col=ident)
+    if kind == "vector_json":
+        # ONE expression for both ends too: a pgvector value's text is a JSON array, and on
+        # the jsonb target the casts are the identity. See _checksum_kind.
+        return sql.SQL("(CAST(CAST({col} AS text) AS jsonb))::text").format(col=ident)
     if kind == "bit":
         return sql.SQL("{col}::text").format(col=ident)
     if kind == "boolean":
