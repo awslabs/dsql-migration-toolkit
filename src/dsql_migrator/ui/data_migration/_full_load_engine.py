@@ -1033,11 +1033,14 @@ def _slim_worker_inputs(
     """Return per-table inputs for a worker: drop the all-tables inventory + conversions.
 
     A worker migrates ONE table (passed separately as ``args.table``) and reads only this
-    table's conversion via ``table_conversions.get(table.name)``; ``inventory`` is never read
-    in the worker/migrator path. Pickling the full ``SourceInventory`` + every table's DDL
-    into EACH of N worker submissions is O(tables^2) serialization/IPC (seconds-to-minutes of
-    parent-side pickling at a few thousand tables). Slim both to this one table so a many-
-    table migration is O(tables). The per-table exclusion maps are slimmed to this table
+    table's conversion via ``table_conversions.get(table.name)``; of ``inventory`` it reads
+    only the server settings, which a table with no applied conversion derives its DDL in
+    (the source's time zone, G149 -- without them a worker's retry recreate wrote UTC clock
+    defaults, G160), so those are kept and the tables dropped. Pickling the full
+    ``SourceInventory`` + every table's DDL into EACH of N worker submissions is
+    O(tables^2) serialization/IPC (seconds-to-minutes of parent-side pickling at a few
+    thousand tables). Slim both to this one table so a many-table migration is
+    O(tables). The per-table exclusion maps are slimmed to this table
     too, and the parent-only overlay fields (the ledger store, the run view, its status and
     the recreate callback) are dropped: they hold locks and clients that cannot be pickled,
     and a worker never writes the ledger. The small fields (connection configs, flags, view
@@ -1050,7 +1053,7 @@ def _slim_worker_inputs(
 
     return replace(
         inputs,
-        inventory=SourceInventory(),
+        inventory=SourceInventory(server_settings=dict(inputs.inventory.server_settings)),
         table_conversions=({table_name: conv} if conv is not None else {}),
         index_renames=_one(inputs.index_renames or {}),
         name_clash_tables=inputs.name_clash_tables & {table_name},
