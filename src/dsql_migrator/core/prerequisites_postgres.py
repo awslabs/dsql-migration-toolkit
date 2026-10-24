@@ -1391,9 +1391,10 @@ def check_columns_replicable(
 
     The exceptions are graded FAIL / required, like TABLE_REPLICABLE. A NOT NULL bit(n)[]
     (:func:`connector_stopping_columns`) stops the source connector, so CDC halts for every
-    captured table. A KEY column (:func:`uncarried_key_columns`: of the source primary key,
-    or of ``key_columns``, the key a re-keyed table's records carry) breaks the key every
-    change is applied by, and none of the choices above is one: a key column cannot be
+    captured table. A KEY column (:func:`uncarried_key_columns`: of the key each change is
+    keyed by, :func:`change_key_columns` -- the source primary key and ``key_columns``, the
+    key a re-keyed table's records carry) breaks the key every change is applied by, and
+    none of the choices above is one: a key column cannot be
     excluded, its NOT NULL cannot be dropped, and accepting it is not a gap a reload closes --
     with a composite key, CDC applies a DELETE by the remaining key columns, removing every
     target row that shares them, silently (K27; executed against the shipped Debezium 2.7.4
@@ -1435,7 +1436,10 @@ def check_columns_replicable(
         return None
     keys = change_key_columns(table, key_columns)
     detail, remediation = uncarryable_column_texts(
-        found, defaulted=target_defaulted_columns(table), key_columns=keys
+        found,
+        defaulted=target_defaulted_columns(table),
+        key_columns=keys,
+        primary_key=table.primary_key,
     )
     # A column that stops the source connector halts CDC for EVERY captured table, as an
     # UNLOGGED table aborts the whole publication, and a key column CDC cannot carry breaks
@@ -1457,8 +1461,14 @@ def check_columns_replicable(
 def change_key_columns(table: TableDef, key_columns: "Iterable[str]" = ()) -> "list[str]":
     """The columns a change to ``table`` is keyed and applied by: its source primary key,
     then any column of ``key_columns`` (the target key a re-keyed table's records carry)
-    beyond it, in order. Pure."""
-    return list(dict.fromkeys([*(table.primary_key or ()), *(key_columns or ())]))
+    beyond it, in order -- or ``key_columns`` alone when they leave out a source primary-key
+    column (an edited target key): Debezium then keys the records on them
+    (``message.key.columns``, see :func:`~dsql_migrator.core.cdc.sink_keyable_rekeys`), so the
+    column left out is a value column (G186). Pure."""
+    key = list(dict.fromkeys(key_columns or ()))
+    if key and not set(table.primary_key or ()) <= set(key):
+        return key
+    return list(dict.fromkeys([*(table.primary_key or ()), *key]))
 
 
 def uncarried_key_columns(
@@ -1595,16 +1605,20 @@ def uncarryable_column_texts(
     *,
     defaulted: "Iterable[str]" = (),
     key_columns: "Iterable[str]" = (),
+    primary_key: "Iterable[str]" = (),
 ) -> "tuple[str, str]":
     """``(what happens, what to do)`` for ``found``: the Step 3 ``COLUMN_REPLICABLE`` row's
     wording, which Evaluation's ``CDC_UNCARRYABLE_COLUMN`` finding repeats, so both steps
     describe the same columns the same way. ``defaulted`` names the columns that have a
     DEFAULT on the target. ``key_columns`` names the columns each change is keyed by
     (:func:`change_key_columns`): a column of ``found`` among them leads the text, and the
-    only routes offered are then the ones that apply to a key (K27). Pure."""
+    only routes offered are then the ones that apply to a key (K27). ``primary_key`` is the
+    source primary key: a column of it that a re-key leaves out is a value column (G186), but
+    Exclude tables & columns refuses it, so that route is not offered for it. Pure."""
     keys = list(dict.fromkeys(key_columns or ()))
     keyed = uncarried_key_columns(found, keys)
     found = [c for c in found if c not in keyed]
+    unexcludable = [c for c in found if c.column in set(primary_key or ())]
     fatal = [c for c in found if c.reason == UNCARRYABLE_ROW_DEAD_LETTERS]
     has_default = set(defaulted)
     lost = [c for c in found if c.reason == UNCARRYABLE_COLUMN_ARRIVES_NULL]
@@ -1698,13 +1712,18 @@ def uncarryable_column_texts(
         # None of the routes below is one for a key column: it cannot be excluded, its NOT
         # NULL cannot be dropped, and accepting it is not a gap a reload closes.
         return " ".join(sentences), _UNCARRIED_KEY_REMEDY
+    exclude_route = (
+        "exclude the column in Exclude tables & columns (under the table list; it "
+        "then migrates as NULL and CDC never captures it), "
+        if len(unexcludable) < len(found)
+        else ""
+    )
     remediation = (
         "Decide before the CDC infrastructure is created: "
         + numeric_route
         + not_null_route
-        + "exclude the column in Exclude tables & columns (under the table list; it "
-        "then migrates as NULL and CDC never captures it), "
-        "remodel the column on the source to a type CDC does carry (text / text[] "
+        + exclude_route
+        + "remodel the column on the source to a type CDC does carry (text / text[] "
         "carries every one of these), or leave this table out of the selection and "
         "migrate it with Full Load only -- the capture set follows the table "
         "selection, so there is no per-table \"load but do not stream\" switch. "
@@ -1719,6 +1738,11 @@ def uncarryable_column_texts(
             "every captured table."
         )
     )
+    if unexcludable and exclude_route:
+        remediation += (
+            f" {_describe_columns(unexcludable)} {_is_are(unexcludable)} part of the source "
+            "primary key, which cannot be excluded."
+        )
     return " ".join(sentences), remediation
 
 

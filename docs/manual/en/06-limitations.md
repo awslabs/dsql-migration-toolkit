@@ -686,7 +686,10 @@ fails **loudly** where it can't.
   one-column key, every insert and update is dead-lettered). A key column cannot be
   excluded, so the CDC prerequisite check holds the migration for such a table (in **Full
   load + CDC**, before the Full Load): leave the table out and migrate it with Full load
-  only, or give the key column a type CDC carries on the source.
+  only, or give the key column a type CDC carries on the source. A table whose primary key
+  you change in Schema Conversion to one that leaves the column out is not held: CDC keys
+  its changes by that key, and the column is treated like any other column of its type
+  (except that a source primary-key column cannot be excluded).
 - **PostgreSQL 17/18 sources — four version-specific edges (none block a
   migration).** PG 13–18 are supported; 17 and 18 add four things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is
