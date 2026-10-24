@@ -5,6 +5,14 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.576
+
+### Security
+
+- **Upgraded the transitive `certifi` CA bundle to 2026.10.23, closing `GHSA-6q48-6c7w-9gw2` (critical), which Dependabot raised against the shipped lockfile.** certifi before 2026.10.19 trusts the `emSign ECC Root CA - G3` root, under which eight intermediate CAs' private keys were compromised (and revoked): anyone holding one can issue a valid-looking certificate for any hostname, so an on-path attacker could read or alter TLS traffic from a client that trusts the bundle.
+- **Here that bundle verifies the app's own HTTPS calls:** the AWS SDK (`botocore`) uses certifi's bundle when it is installed, as do `httpx` / NiceGUI, so the AWS API calls the app makes (Secrets Manager, CloudFormation, MSK, S3, Bedrock, STS) trusted those roots. Exploiting it needs both a compromised key and a position on the network path, so practical exposure was low; a critical advisory against a library in the published image is worth a patch regardless.
+- **Lockfile only — no first-party code changed.** The sink plugin is unchanged (v54), and the app stack takes an image-only update. v0.1.575's changes all ship unchanged in this release; its upgrade notes still apply when coming from v0.1.574 or earlier.
+
 ## v0.1.575
 
 ### Added
