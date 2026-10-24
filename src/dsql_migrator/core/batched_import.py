@@ -85,6 +85,7 @@ and primary key. A structured :class:`BatchedImportResult` is returned.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
@@ -800,18 +801,23 @@ def _normalize_key(values: tuple, description: object) -> tuple:
     )
 
 
-def _quarantine_key(record: object) -> tuple:
-    """Identity of one quarantined row: ``(table, primary key)``.
+def _quarantined_row_identity(work: "_BatchWork", row: Mapping[str, object]) -> tuple:
+    """Identity of one quarantined row: ``(table, digest of its key values)`` -- of the whole
+    row when the table has no key -- held in memory only, never logged.
 
     Used both to carry a prior attempt's drops across a resumed ``import_rows`` and to
-    keep a re-read from recording the same drop twice. The PK is what the error log lists,
-    so it is the operator-visible identity; the message is deliberately excluded (the same
-    row can fail with slightly different driver text and is still the same lost row).
+    keep a re-read from recording the same drop twice; the message is deliberately excluded
+    (the same row can fail with slightly different driver text and is still the same lost
+    row). Not the record's logged primary key: that withholds a natural key's values
+    (:func:`format_key_values`), so every quarantined row of a table keyed by a string or a
+    date was one row -- the drop count read 1 whatever was dropped, and the quarantine cap
+    never fired for such a table. A digest, so a dropped row's values (an oversized one, as
+    often as not) are not held.
     """
-    return (
-        str(getattr(record, "table", "") or ""),
-        str(getattr(record, "primary_key", "") or ""),
-    )
+    names = work.key_columns or work.columns
+    values = tuple(_key_parameter(row.get(name)) for name in names)
+    digest = hashlib.sha256(repr(values).encode("utf-8", "backslashreplace")).digest()
+    return (work.table_name, digest)
 
 
 class BatchedImporter:
@@ -977,16 +983,16 @@ class BatchedImporter:
         # nothing incomplete, and the Validation gate that should have held never fired.
         # Only reachable where the watermark survives a re-read (a shard reopening one
         # SHARED PostgreSQL snapshot; every other path now discards it), but there the loss
-        # is total and silent. Deduped by primary key, so a re-read that re-quarantines the
-        # same row cannot double-count it.
+        # is total and silent. Deduped by the row's identity, so a re-read that re-quarantines
+        # the same row cannot double-count it.
         resuming = bool(job is not None and getattr(job, "resume_batch_watermark", None))
         with self._quarantine_lock:
             carried = list(self._quarantine) if resuming else []
             self._quarantine = carried
             self._quarantine_total = len(carried) if resuming else 0
-            self._quarantine_seen = {
-                _quarantine_key(record) for record in carried
-            }
+            # The dropped rows' identities carry with their records (_quarantined_row_identity).
+            seen = getattr(self, "_quarantine_seen", None)
+            self._quarantine_seen = set(seen or ()) if resuming else set()
         # OWN the resume high-water HERE (seeded from the prior attempt's watermark) rather
         # than inside _run_data_batches, so the completed contiguous prefix survives even
         # when the SOURCE READ raises mid-load: _run_data_batches records into THIS tracker,
@@ -1440,11 +1446,11 @@ class BatchedImporter:
             message=_safe_error(exc),
         )
         with self._quarantine_lock:
-            # Dedup by (table, primary key): a retry re-reads rows a previous attempt
+            # Dedup by the row's identity: a retry re-reads rows a previous attempt
             # already quarantined, and the cause is deterministic (a value over DSQL's
             # per-value cap fails identically every time), so counting it again would
             # inflate the drop total the operator has to reconcile.
-            key = _quarantine_key(record)
+            key = _quarantined_row_identity(work, row)
             seen = getattr(self, "_quarantine_seen", None)
             if seen is None:
                 seen = self._quarantine_seen = set()
