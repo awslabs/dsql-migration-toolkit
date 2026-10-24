@@ -8087,6 +8087,9 @@ _SHOWN = "mysql_shown"
 # The meta key marking the ROUND that shows a COALESCE's value at the scale of its widest
 # value (MySQL's IFNULL(price, 0) is 0.00): JSON writes the value itself, as MySQL does.
 _WIDENED = "mysql_widened"
+# The meta key marking a wall clock of the source's time zone the rewrite wrote (G149 /
+# G157, :func:`_zone_clock`): the clock, FROM_UNIXTIME(), a TIMESTAMP read as MySQL reads it.
+_ZONE_CLOCK = "zone_clock"
 # The note for LENGTH of a value of a type that cannot be told, counted as x || ''.
 _UNTYPED_TEXT_NOTE = (
     "LENGTH / CHAR_LENGTH reads a value whose type cannot be told here -- a column of another "
@@ -9939,8 +9942,11 @@ def _rewrite_mysql_calls(
     zone, known and not UTC, which a view's clock is written in (G149) -- NOW() and its
     synonyms and SYSDATE() its wall clock, CURDATE() its date, CURTIME() its time of day,
     where the session's are written otherwise (Aurora DSQL's session zone is UTC unless the
-    session sets another). A Query Converter statement gets none: the application's own
-    session runs it.
+    session sets another) -- and which the view reads the other session-zone values in
+    (G157): FROM_UNIXTIME(), a TIMESTAMP read as a wall clock (its date, time, fields,
+    text), and that zone's wall clock where it meets a TIMESTAMP (compared as the instant it
+    names there). A Query Converter statement gets none: the application's own session runs
+    it.
 
     A rewrite that depends on what a value holds reads it from the value's static kind
     (:func:`_mysql_kind`): a column's type where ``column_type`` knows it (a view over the
@@ -10143,9 +10149,14 @@ def _rewrite_mysql_calls(
         if clock is not None:
             return {"timestamp": "datetime"}.get(clock, clock)
         if isinstance(node, exp.AtTimeZone):
-            # PostgreSQL's: an instant (CURRENT_TIMESTAMP, a timestamptz) at a zone is that
-            # zone's wall clock, and a wall clock at a zone an instant.
-            inner = "timestamp" if isinstance(node.this, exp.CurrentTimestamp) else kind_of(node.this)
+            # PostgreSQL's: an instant (CURRENT_TIMESTAMP, TO_TIMESTAMP(x) -- MySQL's
+            # FROM_UNIXTIME, a DATETIME, read there as the instant it is -- a timestamptz) at a
+            # zone is that zone's wall clock, and a wall clock at a zone an instant.
+            inner = (
+                "timestamp"
+                if isinstance(node.this, (exp.CurrentTimestamp, exp.UnixToTime))
+                else kind_of(node.this)
+            )
             return {"timestamp": "datetime", "datetime": "timestamp"}.get(inner or "")
         if isinstance(node, exp.ConvertTimezone):
             return "datetime"
@@ -11099,7 +11110,12 @@ def _rewrite_mysql_calls(
         if name == "DATE_FORMAT":
             node.replace(pg_call("TO_CHAR", exp.TsOrDsToTimestamp(this=as_temporal(value)), fmt))
         elif name == "FROM_UNIXTIME":
-            node.replace(pg_call("TO_CHAR", exp.UnixToTime(this=value), fmt))
+            # Under a source zone (G157) the zone's wall clock of the instant, as MySQL
+            # formats it there; else the session's (TO_CHAR of a timestamptz).
+            instant = exp.UnixToTime(this=value)
+            node.replace(pg_call(
+                "TO_CHAR", _zone_clock(zone, instant) if zone is not None else instant, fmt
+            ))
         else:
             # Typed as MySQL types it: a format chosen at run time is a DATETIME(6). An
             # empty string is NULL to MySQL for a format with a date (TO_DATE reads it as
@@ -12301,27 +12317,36 @@ def _rewrite_mysql_calls(
         node.replace(pg_call("LENGTH" if characters else "OCTET_LENGTH", counted))
     for node in nodes(exp.ConvertTimezone):
         for part in ("source_tz", "target_tz"):
-            zone = node.args.get(part)
-            if zone is None:
+            # (Not ``zone``: that is the source's, which the passes below still read.)
+            given = node.args.get(part)
+            if given is None:
                 continue
-            if isinstance(zone, exp.Literal) and zone.is_string:
-                if _UTC_OFFSET_RE.match(zone.name):
-                    node.set(part, exp.Interval(this=exp.Literal.string(zone.name)))
+            if isinstance(given, exp.Literal) and given.is_string:
+                if _UTC_OFFSET_RE.match(given.name):
+                    node.set(part, exp.Interval(this=exp.Literal.string(given.name)))
                 continue
             # Read at run time: an offset turned into the POSIX zone PostgreSQL reads (its
             # sign the other way round), a zone name kept.
             node.set(part, exp.Case(
                 ifs=[exp.If(
                     this=exp.RegexpLike(
-                        this=zone.copy(), expression=exp.Literal.string(r"^[+-][0-9]{1,2}:[0-9]{2}$")
+                        this=given.copy(), expression=exp.Literal.string(r"^[+-][0-9]{1,2}:[0-9]{2}$")
                     ),
                     true=written(
-                        exp.func("TRANSLATE", zone.copy(), exp.Literal.string("+-"), exp.Literal.string("-+"))
+                        exp.func("TRANSLATE", given.copy(), exp.Literal.string("+-"), exp.Literal.string("-+"))
                     ),
                 )],
-                default=zone.copy(),
+                default=given.copy(),
             ))
     for node in nodes(exp.UnixToTime):
+        if zone is not None and node.args.get("format") is None:
+            # Under a source zone (G157) the zone's wall clock of the instant, as the clock
+            # beside it is (a DATETIME: compared with a TIMESTAMP as the instant again,
+            # below), formatted or cast as MySQL formats and casts it there -- once: the
+            # one FROM_UNIXTIME(x, fmt) became is at the zone already.
+            if not isinstance(node.parent, exp.AtTimeZone):
+                node.replace(_zone_clock(zone, node.copy()))
+            continue
         if isinstance(node.parent, exp.Anonymous) and (node.parent.name or "").upper() == "TO_CHAR":
             continue
         # FROM_UNIXTIME(x): the session's wall clock, as a DATETIME.
@@ -12549,6 +12574,91 @@ def _rewrite_mysql_calls(
             node.replace(_zone_clock(zone))
         for node in list(select.find_all(exp.CurrentDate)):
             node.replace(exp.Cast(this=_zone_clock(zone), to=exp.DataType.build("DATE")))
+        # G157: MySQL reads a TIMESTAMP in the session's zone wherever it reads it as a wall
+        # clock -- its date, time of day, fields or text -- and compares a wall clock with it
+        # there; PostgreSQL makes both conversions in the session's TimeZone (UTC on Aurora
+        # DSQL unless the session sets another). Beside the source zone's clock above, a
+        # TIMESTAMP compared with NOW() - INTERVAL 1 DAY (a timestamptz with a timestamp) was
+        # an offset off, and DATE(ts) = CURDATE() compared a UTC date with the zone's. So a
+        # TIMESTAMP read as a wall clock is read at the zone (and marked, as the clock is), and
+        # a wall clock of the zone this rewrite wrote that meets a TIMESTAMP -- compared,
+        # BETWEEN, IN, a COALESCE / GREATEST / LEAST / NULLIF / IF / CASE of both -- is the
+        # instant it names there (the column side untouched, so its index still serves the
+        # comparison); in a UNION column the TIMESTAMP is read at the zone instead (below).
+        # What the view computes no longer depends on the session's zone. A TIMESTAMP compared
+        # with a DATETIME column or a date string, which holds no clock, is compared in the
+        # session's zone as before.
+
+        def read_at_zone(value: Optional[exp.Expression]) -> None:
+            if value is not None and value.parent is not None and kind_of(value) == "timestamp":
+                value.replace(_zone_clock(zone, value.copy()))
+
+        for node in list(select.find_all(exp.Cast, exp.TryCast)):
+            if _pg_type_kind(node.args.get("to")) in ("date", "time", "datetime", "text"):
+                read_at_zone(node.this)
+        for node in list(select.find_all(exp.TsOrDsToDate, exp.TsOrDsToTimestamp, exp.TimeToStr, exp.LastDay)):
+            read_at_zone(node.this)
+        for node in list(select.find_all(exp.ConvertTimezone)):
+            read_at_zone(node.args.get("timestamp"))  # CONVERT_TZ converts the wall clock
+        for node in list(select.find_all(exp.Extract)):
+            if node.this.name.upper() not in ("EPOCH", "TIMEZONE", "TIMEZONE_HOUR", "TIMEZONE_MINUTE"):
+                read_at_zone(node.expression)
+        for node in list(select.find_all(exp.Anonymous)):
+            if not node.meta.get(_PG_WRITTEN):
+                continue
+            name = (node.name or "").upper()
+            if name == "TO_CHAR" and node.expressions:
+                read_at_zone(node.expressions[0])
+            elif name == "DATE_TRUNC" and len(node.expressions) == 2:
+                read_at_zone(node.expressions[1])
+
+        def met(node: exp.Expression) -> "list[list[Optional[exp.Expression]]]":
+            """The values ``node`` compares, or chooses between: each group one type."""
+            if isinstance(node, exp.Between):
+                return [[node.this, node.args.get("low"), node.args.get("high")]]
+            if isinstance(node, exp.In):
+                return [] if node.args.get("query") is not None else [[node.this, *node.expressions]]
+            if isinstance(node, (exp.Coalesce, exp.Greatest, exp.Least)):
+                return [[node.this, *node.expressions]]
+            if isinstance(node, exp.Nullif):
+                return [[node.this, node.expression]]
+            if isinstance(node, exp.If):
+                return [[node.args.get("true"), node.args.get("false")]]
+            if isinstance(node, exp.Case):
+                ifs = node.args.get("ifs") or ()
+                results = [*(branch.args.get("true") for branch in ifs), node.args.get("default")]
+                if node.this is not None:  # a simple CASE compares its operand with each WHEN
+                    return [[node.this, *(branch.this for branch in ifs)], results]
+                return [results]
+            return [[node.this, node.expression]]
+
+        def zone_wall_clock(value: exp.Expression) -> bool:
+            """A DATETIME / DATE value made of a wall clock of the zone this rewrite wrote."""
+            return kind_of(value) in ("datetime", "date") and any(n.meta.get(_ZONE_CLOCK) for n in value.walk())
+
+        # A UNION column is a DATETIME to MySQL where a TIMESTAMP meets a DATETIME there (the
+        # TIMESTAMP read as its wall clock), a timestamptz to PostgreSQL (the wall clock read
+        # in the session's zone): beside the zone's wall clock the TIMESTAMP is read at the
+        # zone, so the column is that wall clock, as in MySQL -- compared outside, too.
+        for node in _innermost_first(select, exp.SetOperation):
+            branches = _output_queries(node)
+            for position in range(min((len(branch.expressions) for branch in branches), default=0)):
+                values = [branch.expressions[position].unalias() for branch in branches]
+                if any(zone_wall_clock(value) for value in values):
+                    for value in values:
+                        read_at_zone(value)
+        for node in _innermost_first(
+            select, exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ,
+            exp.NullSafeNEQ, exp.Between, exp.In, exp.Coalesce, exp.Greatest, exp.Least,
+            exp.Nullif, exp.If, exp.Case,
+        ):
+            for group in met(node):
+                values = [value for value in group if value is not None]
+                if not any(kind_of(value) == "timestamp" for value in values):
+                    continue
+                for value in values:
+                    if zone_wall_clock(value):
+                        value.replace(_zone_instant(zone, value.copy(), kind_of(value)))
 
     # A call sqlglot does not know stays an Anonymous function and is emitted as written:
     # a MySQL-only function (FIND_IN_SET, UNIX_TIMESTAMP) or a user one -- unless
@@ -12663,21 +12773,39 @@ def _json_path(steps: "Sequence[Any]") -> exp.JSONPath:
     ])
 
 
-def _zone_clock(zone: SourceZone) -> exp.Expression:
-    """The source zone's wall clock as a node, :meth:`SourceZone.clock_sql`'s expression: the
-    current instant at the zone's name -- or, for a fixed offset, the UTC wall clock plus it
-    (a zone NAME '+09:00' reads with the POSIX sign, UTC-9). Parenthesized, so it stands
-    where a LOCALTIMESTAMP stood whatever binds around it."""
+def _zone_clock(zone: SourceZone, instant: Optional[exp.Expression] = None) -> exp.Expression:
+    """The source zone's wall clock as a node, :meth:`SourceZone.clock_sql`'s expression: an
+    instant (the current one, CURRENT_TIMESTAMP, by default) at the zone's name -- or, for a
+    fixed offset, its UTC wall clock plus the offset (a zone NAME '+09:00' reads with the
+    POSIX sign, UTC-9). Parenthesized, so it stands where a LOCALTIMESTAMP stood whatever
+    binds around it, and marked (:data:`_ZONE_CLOCK`)."""
+    instant = instant if instant is not None else exp.CurrentTimestamp()
     if zone.kind == "offset":
-        return exp.Paren(this=exp.Add(
-            this=exp.Paren(this=exp.AtTimeZone(
-                this=exp.CurrentTimestamp(), zone=exp.Literal.string("UTC")
-            )),
+        clock = exp.Paren(this=exp.Add(
+            this=exp.Paren(this=exp.AtTimeZone(this=instant, zone=exp.Literal.string("UTC"))),
             expression=exp.Interval(this=exp.Literal.string(zone.zone)),
         ))
-    return exp.Paren(
-        this=exp.AtTimeZone(this=exp.CurrentTimestamp(), zone=exp.Literal.string(zone.zone))
-    )
+    else:
+        clock = exp.Paren(this=exp.AtTimeZone(this=instant, zone=exp.Literal.string(zone.zone)))
+    clock.meta[_ZONE_CLOCK] = True
+    return clock
+
+
+def _zone_instant(zone: SourceZone, wall: exp.Expression, kind: str) -> exp.Expression:
+    """The instant a wall clock of the source zone names (G157), the inverse of
+    :func:`_zone_clock`: ``(wall) AT TIME ZONE 'zone'``, or for a fixed offset ``((wall) -
+    INTERVAL 'offset') AT TIME ZONE 'UTC'`` -- a date (``kind`` 'date') at its midnight.
+    PostgreSQL makes that conversion in the session's TimeZone where a timestamp meets a
+    timestamptz; this makes it in the zone MySQL compared them in, whatever the session's."""
+    if kind == "date":
+        wall = exp.Cast(this=wall, to=exp.DataType.build("TIMESTAMP"))
+    held = wall if isinstance(wall, exp.Paren) else exp.Paren(this=wall)
+    if zone.kind == "offset":
+        held = exp.Paren(this=exp.Sub(
+            this=held, expression=exp.Interval(this=exp.Literal.string(zone.zone))
+        ))
+        return exp.Paren(this=exp.AtTimeZone(this=held, zone=exp.Literal.string("UTC")))
+    return exp.Paren(this=exp.AtTimeZone(this=held, zone=exp.Literal.string(zone.zone)))
 
 
 def _utc_clock_kind(node: exp.Expression) -> Optional[str]:

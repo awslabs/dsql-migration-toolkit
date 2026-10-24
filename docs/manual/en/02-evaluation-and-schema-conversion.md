@@ -108,7 +108,14 @@ read is not UTC — MySQL's `time_zone` (`SYSTEM` is the server's own zone,
 the clock: a `DATETIME` (`timestamp without time zone`) default becomes
 `DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`, a `DATE` or `TIME` one its date or time of
 day, and a MySQL view's `NOW()`, `SYSDATE()`, `CURDATE()` and `CURTIME()` read that zone's
-clock. A fixed offset such as `+09:00` is written as the UTC clock plus the offset,
+clock. A MySQL view reads the rest of what MySQL reads in the session's zone in that zone
+too — `FROM_UNIXTIME()`, and a `TIMESTAMP` column's date, time and text (`DATE()`,
+`HOUR()`, `DATE_FORMAT()` ...) — and compares that zone's clock with a `TIMESTAMP` column
+as the instant it names there (a `UNION` column of both is that zone's wall clock, as
+MySQL's `DATETIME` is), so `ts > NOW() - INTERVAL 1 DAY` returns the rows it returned in
+MySQL whatever zone the Aurora DSQL session runs in; a `TIMESTAMP` compared with a
+`DATETIME` column or a date string is still compared in the session's zone. A fixed offset
+such as `+09:00` is written as the UTC clock plus the offset,
 `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`: as a zone name, `'+09:00'` would be read
 with the POSIX sign, as nine hours west of UTC. A `TIMESTAMP` (`timestamptz`) column holds
 an instant and keeps `now()`, and `UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL

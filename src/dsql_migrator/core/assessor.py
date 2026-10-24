@@ -3625,6 +3625,13 @@ def _mysql_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Ass
             ", and the views' NOW(), SYSDATE(), CURDATE() and CURTIME() read that zone's "
             f"clock ({_counted(views, 'view')})"
         )
+    if any(not view.unsupported_kind for view in inventory.views):
+        # G157: what a view reads in the session's zone in MySQL is read in the source's.
+        written += (
+            "; the views read FROM_UNIXTIME() and a TIMESTAMP column's date, time and text "
+            "(DATE(), HOUR(), DATE_FORMAT() ...) in that zone too, and compare that zone's "
+            "clock with a TIMESTAMP column as the instant it names there, as MySQL does"
+        )
     offset_note = (
         f"; written as the string '{zone.zone}', the offset would be read as a POSIX zone, "
         "west of UTC"
