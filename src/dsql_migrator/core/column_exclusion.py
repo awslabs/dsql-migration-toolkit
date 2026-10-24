@@ -127,7 +127,17 @@ class ExclusionContext:
     )
     # ``{child table: {column: (parent table, ...)}}`` for the preserved FKs the pass ADDs.
     fk_children: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
+    # ``{child table: {column: ((parent table, key columns), ...)}}``: the keys among those
+    # that are MATCH FULL over more than one column (G170), which refuse a partly NULL key.
+    fk_match_full: Mapping[str, Mapping[str, "tuple[tuple[str, tuple[str, ...]], ...]"]] = field(
+        default_factory=dict
+    )
     unique_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # ``{table: {column: ((index, other columns), ...)}}``: the unique indexes among those
+    # that are NULLS NOT DISTINCT (G170), which treat NULLs as equal.
+    nulls_not_distinct: Mapping[str, Mapping[str, "tuple[tuple[str, tuple[str, ...]], ...]"]] = (
+        field(default_factory=dict)
+    )
     view_ddls: Mapping[str, str] = field(default_factory=dict)
     # ``{table: {generated column: its expression}}`` from the applied DDL (else the source).
     generated_expressions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
@@ -176,6 +186,14 @@ _FK_REFERENCES_RE = re.compile(
 _FK_CHILD_COLUMNS_RE = re.compile(
     rf"FOREIGN\s+KEY\s*\(\s*((?:{_IDENT})(?:\s*,\s*(?:{_IDENT}))*)\s*\)", re.IGNORECASE
 )
+# A key's MATCH FULL, and a unique index's NULLS NOT DISTINCT, read outside string literals
+# (G170). The index's name, as its CREATE statement gives it.
+_FK_MATCH_FULL_RE = re.compile(r"\bMATCH\s+FULL\b", re.IGNORECASE)
+_NULLS_NOT_DISTINCT_RE = re.compile(r"\bNULLS\s+NOT\s+DISTINCT\b", re.IGNORECASE)
+_INDEX_NAME_RE = re.compile(
+    rf"CREATE\s+UNIQUE\s+INDEX\s+(?:ASYNC\s+)?(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})\s+ON\s",
+    re.IGNORECASE,
+)
 # An applied ``CREATE UNIQUE INDEX [ASYNC] [name] ON table (col [ASC|DESC], ...)``. An
 # expression or otherwise unreadable index makes no claim.
 _UNIQUE_INDEX_RE = re.compile(
@@ -198,9 +216,9 @@ def _unquote(identifier: str) -> str:
 
 def _applied_foreign_keys(
     child, conversion, known_tables: "Optional[Iterable[str]]" = None
-) -> "list[tuple[str, str, list[str], list[str]]]":
-    """``(constraint, referenced table, referenced columns, child columns)`` the FK pass
-    will ADD.
+) -> "list[tuple[str, str, list[str], list[str], bool]]":
+    """``(constraint, referenced table, referenced columns, child columns, MATCH FULL)`` the
+    FK pass will ADD.
 
     Read from the applied ``foreign_key_ddls`` -- the statements the pass actually runs,
     already empty when foreign keys are stripped -- so an FK deleted from an edited script
@@ -221,9 +239,14 @@ def _applied_foreign_keys(
             + list(getattr(conversion, "preserved_foreign_keys", None) or ())
         )
     }
+    from dsql_migrator.core.converter import _mask_sql_literals
+
     known = set(known_tables or ())
-    found: list[tuple[str, str, list[str], list[str]]] = []
+    found: list[tuple[str, str, list[str], list[str], bool]] = []
     for ddl in getattr(conversion, "foreign_key_ddls", None) or ():
+        # The statement decides, as for the columns: an edit that drops MATCH FULL is
+        # honoured (G170).
+        match_full = _FK_MATCH_FULL_RE.search(_mask_sql_literals(ddl)) is not None
         name_match = _FK_NAME_RE.search(ddl)
         name = _unquote(name_match.group(1)) if name_match else ""
         source_fk = by_name.get(name) if name else None
@@ -241,12 +264,12 @@ def _applied_foreign_keys(
                 if table not in known:
                     continue
             columns = [_unquote(c) for c in re.findall(_IDENT, ref.group(2))]
-            found.append((name or "unnamed", table, columns, child_columns))
+            found.append((name or "unnamed", table, columns, child_columns, match_full))
             continue
         if source_fk is not None:
             found.append((
                 name, source_fk.referenced_table, list(source_fk.referenced_columns),
-                child_columns,
+                child_columns, match_full,
             ))
     return found
 
@@ -294,6 +317,8 @@ def build_exclusion_context(
     unique_columns: dict[str, frozenset[str]] = {}
     generated_expressions: dict[str, dict[str, str]] = {}
     fk_children: dict[str, dict[str, list[str]]] = {}
+    fk_match_full: dict[str, dict[str, list[tuple[str, tuple[str, ...]]]]] = {}
+    nulls_not_distinct: dict[str, dict[str, tuple[tuple[str, tuple[str, ...]], ...]]] = {}
     focus = set(tables) if focus_tables is None else set(focus_tables) & set(tables)
     for name in focus:
         table = tables[name]
@@ -321,18 +346,25 @@ def build_exclusion_context(
                 column: (not_null, written.get(column, default) if default is not None else None)
                 for column, (not_null, default) in parse_target_column_constraints(ddl).items()
             }
-            unique = _unique_members(
-                ddl, tuple(getattr(conversions.get(name), "index_ddls", None) or ())
-            )
+            index_ddls = tuple(getattr(conversions.get(name), "index_ddls", None) or ())
+            unique = _unique_members(ddl, index_ddls)
+            nnd = _nulls_not_distinct_members(_applied_nnd_indexes(index_ddls))
         else:
             facts = {c.name: (not c.nullable, c.default) for c in table.columns}
             unique = frozenset(
                 c for index in table.indexes if index.unique for c in index.columns
             )
+            nnd = _nulls_not_distinct_members(
+                (index.name, tuple(index.columns))
+                for index in table.indexes
+                if index.unique and getattr(index, "nulls_not_distinct", False)
+            )
         if facts:
             target_constraints[name] = facts
         if unique:
             unique_columns[name] = unique
+        if nnd:
+            nulls_not_distinct[name] = nnd
         expressions = (
             dict(_ddl_generated_expressions(ddl)) if ddl
             else {c.name: c.generated_expression for c in pg_preserved_generated_columns(table)
@@ -355,13 +387,14 @@ def build_exclusion_context(
             # The keys the conversion would render: never a NOT ENFORCED (G152) or PERIOD
             # (G163) one.
             fks = [
-                (fk.name, fk.referenced_table, list(fk.referenced_columns), list(fk.columns))
+                (fk.name, fk.referenced_table, list(fk.referenced_columns), list(fk.columns),
+                 bool(getattr(fk, "match_full", False)))
                 for fk in getattr(child, "foreign_keys", None) or ()
                 if getattr(fk, "created_on_target", True)
             ]
         else:
             fks = []
-        for fk_name, referenced_table, referenced_columns, child_columns in fks:
+        for fk_name, referenced_table, referenced_columns, child_columns, full in fks:
             label = f"{child_name}.{fk_name}"
             for col in referenced_columns:
                 fk_ref.setdefault(referenced_table, {}).setdefault(col, []).append(label)
@@ -370,6 +403,10 @@ def build_exclusion_context(
                     parents = fk_children.setdefault(child_name, {}).setdefault(col, [])
                     if referenced_table not in parents:
                         parents.append(referenced_table)
+                    if full and len(child_columns) > 1:
+                        fk_match_full.setdefault(child_name, {}).setdefault(col, []).append(
+                            (referenced_table, tuple(child_columns))
+                        )
     return ExclusionContext(
         tables=tables,
         target_pk=target_pk,
@@ -384,7 +421,11 @@ def build_exclusion_context(
             t: {c: tuple(sorted(parents)) for c, parents in cols.items()}
             for t, cols in fk_children.items()
         },
+        fk_match_full={
+            t: {c: tuple(keys) for c, keys in cols.items()} for t, cols in fk_match_full.items()
+        },
         unique_columns=unique_columns,
+        nulls_not_distinct=nulls_not_distinct,
         view_ddls=dict(view_ddls or {}) if warnings else {},
         generated_expressions=generated_expressions,
     )
@@ -451,6 +492,40 @@ def _view_table_refs(ddl: str) -> "Optional[frozenset[str]]":
         schema = _name(table.args.get("db")) or "public"
         refs.add(f"{schema}.{name}")
     return frozenset(refs)
+
+
+@lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
+def _applied_nnd_indexes(index_ddls: "tuple[str, ...]") -> "tuple[tuple[str, tuple[str, ...]], ...]":
+    """``(index, columns)`` of each applied ``CREATE UNIQUE INDEX ... NULLS NOT DISTINCT``
+    (G170): the statement decides, so an edit that drops the clause is honoured. Cached by
+    the statements, as :func:`_unique_members` is."""
+    from dsql_migrator.core.converter import _mask_sql_literals
+
+    found = []
+    for index_ddl in index_ddls:
+        match = _UNIQUE_INDEX_RE.search(index_ddl)
+        if not match or not _NULLS_NOT_DISTINCT_RE.search(
+            _mask_sql_literals(index_ddl[match.end():])
+        ):
+            continue
+        name = _INDEX_NAME_RE.search(index_ddl)
+        columns = tuple(
+            _unquote(c) for c in re.findall(rf"({_IDENT})(?:\s+(?:ASC|DESC))?", match.group(1))
+        )
+        found.append((_unquote(name.group(1)) if name else "unnamed", columns))
+    return tuple(found)
+
+
+def _nulls_not_distinct_members(
+    indexes: "Iterable[tuple[str, tuple[str, ...]]]",
+) -> "dict[str, tuple[tuple[str, tuple[str, ...]], ...]]":
+    """``{column: ((index, the index's other columns), ...)}`` for those indexes."""
+    members: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
+    for name, columns in indexes:
+        for column in columns:
+            others = tuple(c for c in columns if c != column)
+            members.setdefault(column, []).append((name, others))
+    return {column: tuple(found) for column, found in members.items()}
 
 
 @lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
@@ -658,10 +733,33 @@ def column_exclusion_warnings(
         found.append(ExclusionFinding(W2, (
             f"DEFAULT {default_sql} is dropped for the migration and restored at Cut over "
             "(new rows only).")))
+    full = dict(ctx.fk_match_full.get(table_name, {}).get(column, ()))
     for parent in ctx.fk_children.get(table_name, {}).get(column, ()):
-        found.append(ExclusionFinding(W3, (
-            f"Its relationship to {parent} is not migrated (NULL passes the foreign key).")))
-    if column in ctx.unique_columns.get(table_name, ()):
+        if parent in full:
+            # G170: MATCH FULL refuses a key with some of its columns NULL.
+            found.append(ExclusionFinding(W3, (
+                f"Its foreign key to {parent} is MATCH FULL ({', '.join(full[parent])}), which "
+                "refuses a key that is partly NULL: unless every column of the key is "
+                "excluded, the key's validation fails on the migrated rows (Cut over holds "
+                "Finish on it), and a later write that leaves only this column NULL is "
+                "refused (23503). Exclude every column of the key, keep this one, or remove "
+                "MATCH FULL (or the key) from the table's target script.")))
+        else:
+            found.append(ExclusionFinding(W3, (
+                f"Its relationship to {parent} is not migrated (NULL passes the foreign key).")))
+    nnd = ctx.nulls_not_distinct.get(table_name, {}).get(column, ())
+    for index, others in nnd:
+        # G170: NULLS NOT DISTINCT treats the NULLs as equal.
+        collide = (
+            f"migrated rows that share {', '.join(others)} are rejected after the first"
+            if others else "every migrated row after the first is rejected"
+        )
+        found.append(ExclusionFinding(W4, (
+            f"Its unique index {index} is NULLS NOT DISTINCT, which treats NULLs as equal: "
+            f"{collide} (23505), or the index cannot be built after a Drop & reload. Keep "
+            "the column, or remove NULLS NOT DISTINCT from the index in the table's target "
+            "script.")))
+    if not nnd and column in ctx.unique_columns.get(table_name, ()):
         found.append(ExclusionFinding(
             W4, "Uniqueness is not enforced for migrated rows (all NULL)."))
     table = ctx.tables.get(table_name)
@@ -716,6 +814,14 @@ def legacy_exclusion_notes(
         code = WL_REJECT
     else:
         text += " Aurora DSQL stores NULL in it."
+        for index, others in ctx.nulls_not_distinct.get(table_name, {}).get(column, ()):
+            # G170: and a NULLS NOT DISTINCT unique index takes those NULLs as equal.
+            text += (
+                f" Its unique index {index} is NULLS NOT DISTINCT, so "
+                + (f"rows that share {', '.join(others)} are" if others else "every row is")
+                + " rejected after the first (23505)."
+            )
+            code = WL_REJECT
     return (ExclusionFinding(code, text),)
 
 

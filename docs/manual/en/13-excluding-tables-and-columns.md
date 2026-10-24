@@ -282,8 +282,8 @@ for the tables it reloads.
 |---|---|
 | is NOT NULL on Aurora DSQL | NOT NULL is dropped. **This is one-way:** Aurora DSQL cannot add NOT NULL back in place, and only a later Drop & reload of the table restores it. The column stays nullable after cut over. |
 | has a DEFAULT | The DEFAULT is dropped for the migration and restored at Cut over. The restored DEFAULT applies to new rows only (§13.9). |
-| is the child column of a preserved foreign key | Its relationship to the parent is not migrated (NULL passes the foreign key). |
-| is in a UNIQUE constraint or index | Uniqueness is not enforced for the migrated rows, because they are all NULL. |
+| is the child column of a preserved foreign key | Its relationship to the parent is not migrated (NULL passes the foreign key). If the key is `MATCH FULL` over more than one column, a partly NULL key is refused instead: unless every column of the key is excluded, the key's validation fails on the migrated rows (Cut over holds Finish on it), and a later write that leaves only this column NULL is refused (23503). Exclude every column of the key, keep this one, or remove `MATCH FULL` (or the key) from the table's target script. |
+| is in a UNIQUE constraint or index | Uniqueness is not enforced for the migrated rows, because they are all NULL — unless the index is `NULLS NOT DISTINCT` (PostgreSQL 15+), which treats NULLs as equal: migrated rows that share the index's other columns are rejected after the first (23505), or the index cannot be built after a Drop & reload. Keep the column, or remove `NULLS NOT DISTINCT` from the index in the table's target script. |
 | is used by a generated column that is kept | If the generated column is NOT NULL and its expression yields NULL when this column is NULL, every row is rejected (23502). If it is nullable, it is computed from NULL and differs from the source. |
 | is mentioned by a view (text match) | The view reads NULL. |
 
