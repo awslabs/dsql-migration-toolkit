@@ -2502,11 +2502,52 @@ _CLOCK_INTERVAL_TERM = (
     r"(?:microsecond|second|minute|hour|day|week|month|quarter|year)\b"
 )
 _CLOCK_ARITHMETIC_RE = re.compile(
-    r"\s*(?:now\s*\(\s*\d?\s*\)|current_timestamp(?:\s*\(\s*\d?\s*\))?"
+    r"\s*(?P<clock>now\s*\(\s*\d?\s*\)|current_timestamp(?:\s*\(\s*\d?\s*\))?"
     r"|localtimestamp(?:\s*\(\s*\d?\s*\))?|localtime(?:\s*\(\s*\d?\s*\))?)"
     rf"(?P<rest>(?:{_CLOCK_INTERVAL_TERM})+)\s*",
     re.IGNORECASE,
 )
+# The text MySQL stores for a clock default in a CHAR / VARCHAR / TEXT column, by what the
+# clock reads, as a TO_CHAR format (G181): '2026-10-24 13:43:37', '2026-10-24', '13:43:37'.
+_TEXT_CLOCK_FORMATS = {
+    "timestamp": "YYYY-MM-DD HH24:MI:SS",
+    "date": "YYYY-MM-DD",
+    "time": "HH24:MI:SS",
+}
+_UTC_WALL_CLOCK = "(now() AT TIME ZONE 'UTC')"
+
+
+def _text_clock_sql(clock: str, reads: str, digits: int = 0) -> str:
+    """``clock`` (a ``timestamp`` expression) as the text MySQL stores for a clock default
+    reading ``reads`` -- with ``digits`` fraction digits for NOW(n) -- in a textual column."""
+    fraction = f".FF{digits}" if reads == "timestamp" and digits else ""
+    return f"TO_CHAR({clock}, '{_TEXT_CLOCK_FORMATS[reads]}{fraction}')"
+
+
+def _textual_clock_default(canonical: str, zone: "Optional[SourceZone]") -> Optional[str]:
+    """A clock default on a CHAR / VARCHAR / TEXT column as the text MySQL stores (G181), or
+    ``None`` when ``canonical`` is no clock default the maps above carry.
+
+    MySQL stores the clock's text, in its format and the session's zone: NOW() as
+    '2026-10-24 13:43:37' (NOW(3) with three fraction digits), CURDATE() as '2026-10-24',
+    CURTIME() as '13:43:37', UTC_TIMESTAMP() / UTC_DATE() in UTC. Carried as the clock,
+    Aurora DSQL stored PostgreSQL's text of a timestamptz ('2026-10-24 04:43:37.171852+00',
+    UTC, too long for a VARCHAR(20)) and CURTIME() became CURRENT_TIME(), which PostgreSQL
+    rejects -- the table's CREATE TABLE failed. So it is TO_CHAR of the source zone's wall
+    clock (the UTC one without a zone), in MySQL's format."""
+    clock = zone.clock_sql() if zone is not None else _UTC_WALL_CLOCK
+    if canonical in _NOW_CLOCK_DEFAULTS or _FSP_CLOCK_RE.fullmatch(canonical):
+        digits = canonical[-2]
+        return _text_clock_sql(clock, "timestamp", int(digits) if digits.isdigit() else 0)
+    if canonical in _DATE_CLOCK_DEFAULTS:
+        return _text_clock_sql(clock, "date")
+    if canonical in _TIME_CLOCK_DEFAULTS:
+        return _text_clock_sql(clock, "time")
+    if canonical in ("UTC_TIMESTAMP()", "UTC_DATE()"):
+        return _text_clock_sql(
+            _UTC_WALL_CLOCK, "timestamp" if canonical == "UTC_TIMESTAMP()" else "date"
+        )
+    return None
 
 
 def _zoned_clock_default(
@@ -2566,18 +2607,26 @@ def _shifted_clock_default(
     a bare default of the column gets: on a DATETIME (``timestamp``) the source zone's wall
     clock, the UTC one without a zone (:func:`_zoned_clock_default`); on a DATE or a TIME
     the source zone's, whose date or time of day the column keeps (a TIME kept the
-    session's, UTC on Aurora DSQL, before G158); on any other column -- a TIMESTAMP's
-    instant -- the expression itself. A prefix match took such a default for its bare
-    clock: a DATETIME DEFAULT (CURRENT_TIMESTAMP + INTERVAL 30 DAY) became now() AT TIME
-    ZONE 'UTC'."""
+    session's, UTC on Aurora DSQL, before G158); on a CHAR / VARCHAR / TEXT column the text
+    MySQL stores (:func:`_textual_clock_default`, G181); on any other column -- a
+    TIMESTAMP's instant -- the expression itself, with a now(n) as CURRENT_TIMESTAMP:
+    information_schema reports DEFAULT (CURRENT_TIMESTAMP(6) + INTERVAL 1 DAY) as
+    ``now(6) + interval 1 day``, and PostgreSQL has no now(integer), so the table's CREATE
+    TABLE failed (G181). A prefix match took such a default for its bare clock: a DATETIME
+    DEFAULT (CURRENT_TIMESTAMP + INTERVAL 30 DAY) became now() AT TIME ZONE 'UTC'."""
     shifted = _CLOCK_ARITHMETIC_RE.fullmatch(expression)
     if shifted is None:
         return None
     base = target.split("(", 1)[0].strip()
+    rest = shifted.group("rest")
     if base == "timestamp" or (base in ("date", "time") and zone is not None):
-        clock = zone.clock_sql() if zone is not None else "(now() AT TIME ZONE 'UTC')"
-        return f"({clock}{shifted.group('rest')})"
-    return expression
+        clock = zone.clock_sql() if zone is not None else _UTC_WALL_CLOCK
+        return f"({clock}{rest})"
+    if target.startswith(_TEXTUAL_TARGET_PREFIXES):
+        clock = zone.clock_sql() if zone is not None else _UTC_WALL_CLOCK
+        digits = re.search(r"\d", shifted.group("clock"))
+        return _text_clock_sql(f"({clock}{rest})", "timestamp", int(digits.group()) if digits else 0)
+    return re.sub(r"^\s*now\s*\(\s*\d\s*\)", "CURRENT_TIMESTAMP", expression, flags=re.IGNORECASE)
 
 
 def _strip_on_update(default: str) -> str:
@@ -2956,9 +3005,11 @@ def _column_default_sql(
     if column.default_is_expression:
         expression = _unwrap_expression_default(raw)
         canonical = expression.upper().replace(" ", "")
-        zoned = _zoned_clock_default(canonical, target, zone) or _shifted_clock_default(
-            expression, target, zone
-        )
+        zoned = (
+            _textual_clock_default(canonical, zone)
+            if target.startswith(_TEXTUAL_TARGET_PREFIXES)
+            else _zoned_clock_default(canonical, target, zone)
+        ) or _shifted_clock_default(expression, target, zone)
         if zoned is not None:
             return zoned, None
         if canonical in {v.replace(" ", "") for v in _PASSTHROUGH_EXPRESSION_DEFAULTS} or (
@@ -2982,13 +3033,15 @@ def _column_default_sql(
             ) and "tz" not in target and "with time zone" not in target
             if is_naive_timestamp:
                 return "(now() AT TIME ZONE 'UTC')", None
-            if _FSP_CLOCK_RE.fullmatch(canonical):
+            if not _FSP_CLOCK_RE.fullmatch(canonical):
+                return expression, None
+            if target.startswith(_TEMPORAL_TARGET_PREFIXES):
                 # NOW(n) -- how MySQL reports DEFAULT (CURRENT_TIMESTAMP(6)) -- on a TIMESTAMP,
                 # DATE or TIME column: PostgreSQL has no now(integer), and the CREATE TABLE
                 # failed. CURRENT_TIMESTAMP, as the transpile writes CURRENT_TIMESTAMP(n); the
-                # column's type keeps the digits it holds.
+                # column's type keeps the digits it holds. (A textual column takes MySQL's
+                # text above; any other is left without a default, below.)
                 return "CURRENT_TIMESTAMP", None
-            return expression, None
         translated = _TRANSLATED_EXPRESSION_DEFAULTS.get(
             expression.upper() if expression.upper().endswith(")") else f"{expression.upper()}()"
         ) or _TRANSLATED_EXPRESSION_DEFAULTS.get(expression.upper())
