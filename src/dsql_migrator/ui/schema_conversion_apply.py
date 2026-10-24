@@ -756,7 +756,10 @@ def _key_definition(statement: str) -> "tuple[str, ...]":
     PostgreSQL's defaults are left out (:data:`_KEY_DEFAULTS`): an unnamed restatement that
     spelled out USING btree or ON DELETE NO ACTION matched nothing, and was added beside the
     statement it restates -- two indexes or constraints on one column. Never more: a changed
-    action or predicate is another definition."""
+    action or predicate is another definition -- and RESTRICT is one on a DEFERRABLE key
+    (G172), as the converter keeps it there: PostgreSQL never defers a RESTRICT check, so a
+    reply that changed only it to NO ACTION, or back, was taken for the same key and
+    dropped."""
     from dsql_migrator.core.converter import fold_identifier
 
     clean = sql_without_comments(statement).strip()
@@ -775,6 +778,17 @@ def _key_definition(statement: str) -> "tuple[str, ...]":
         else (token.group(0), False)
         for token in _SQL_TOKEN_RE.finditer(clean, match.end())
     ]
+    # A DEFERRABLE key -- INITIALLY DEFERRED implies it -- keeps RESTRICT apart from NO ACTION.
+    deferrable = any(
+        bare and (
+            (text == "deferrable" and tokens[at - 1 : at] != [("not", True)])
+            or (text == "initially" and tokens[at + 1 : at + 2] == [("deferred", True)])
+        )
+        for at, (text, bare) in enumerate(tokens)
+    )
+    defaults = tuple(
+        d for d in _KEY_DEFAULTS if not (deferrable and d[-1:] == ("restrict",))
+    )
     kept: "list[tuple[str, bool]]" = []
     at = 0
     while at < len(tokens):
@@ -783,7 +797,7 @@ def _key_definition(statement: str) -> "tuple[str, ...]":
             # The unquoted words from here: a quoted "asc" is a column.
             words = tuple(text if bare else None for text, bare in tokens[at : at + 4])
             nulls = ("nulls", "first" if kept[-1:] == [("desc", True)] else "last")
-            default = next((d for d in (*_KEY_DEFAULTS, nulls) if words[: len(d)] == d), ())
+            default = next((d for d in (*defaults, nulls) if words[: len(d)] == d), ())
         if not default:
             kept.append(tokens[at])
         at += len(default) or 1
