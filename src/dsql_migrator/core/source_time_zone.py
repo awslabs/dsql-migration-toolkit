@@ -60,9 +60,10 @@ _ABBREVIATION_NAMED_ZONES = {
 _MYSQL_OFFSET_RE = re.compile(r"^([+-])(\d{1,2}):(\d{2})$")
 # A POSIX TZ string with no daylight-saving part, as PostgreSQL's TimeZone shows a fixed
 # offset: an abbreviation (letters, or <...>) and/or a signed offset in hours WEST of UTC
-# -- '<+09>-09' (what SET TIME ZONE 9 shows), 'JST-9', 'UTC+9', '+09:00'.
+# -- '<+09>-09' (what SET TIME ZONE 9 shows), '<+05:30>-05:30' (SET TIME ZONE 5.5, or
+# INTERVAL '+05:30' HOUR TO MINUTE; verified on 16 and 17), 'JST-9', 'UTC+9', '+09:00'.
 _POSIX_FIXED_RE = re.compile(
-    r"^(<[A-Za-z0-9+\-]*>|[A-Za-z]{3,})?([+-]?)(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$"
+    r"^(<[A-Za-z0-9+\-:]*>|[A-Za-z]{3,})?([+-]?)(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?$"
 )
 # The largest offset either engine takes, in minutes (MySQL's +14:00).
 _MAX_OFFSET_MINUTES = 14 * 60
@@ -252,7 +253,7 @@ def resolve_source_zone(settings: Mapping[str, str], source_type: SourceType) ->
     source's ``init_connect`` sets, which the application's sessions get (G161; an expression
     there names no zone that can be told). PostgreSQL: the
     ``TimeZone`` a new session gets -- a zone name, or a POSIX string with a fixed offset
-    ('<+09>-09' is UTC+09:00); one with daylight-saving rules is not written. Anything not
+    ('<+09>-09' is UTC+09:00); a POSIX rule with a daylight-saving part is not written. Anything not
     read, or not one of these, is ``unknown``."""
     if not isinstance(settings, Mapping):
         return UNREAD_ZONE

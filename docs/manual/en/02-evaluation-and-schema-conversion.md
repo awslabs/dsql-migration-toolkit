@@ -133,7 +133,8 @@ application must do: if it relies on the session's zone — `NOW()` or `CURRENT_
 into such a column, or compared with one — it runs `SET TIME ZONE 'Asia/Seoul'` on every
 new Aurora DSQL connection (Aurora DSQL allows it) or writes the zone in its SQL. A zone
 that cannot be told — `SYSTEM` reported only by an abbreviation such as `KST`, a PostgreSQL
-`TimeZone` with daylight-saving rules, one its short connection could not read while the
+`TimeZone` given as a POSIX rule with a daylight-saving part (such as
+`EST5EDT,M3.2.0,M11.1.0`) or as `localtime`, one its short connection could not read while the
 `ALTER DATABASE` / `ALTER ROLE` defaults were read, or one the migration user's own `ALTER
 ROLE` default hides — is said so in an advisory item, and the conversion assumes UTC, as it
 does for a source in UTC. A PostgreSQL source in UTC whose roles include one with a

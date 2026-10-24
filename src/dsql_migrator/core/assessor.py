@@ -3813,8 +3813,8 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
         else:
             risk = (
                 f"The source's default time zone ({zone.setting}) is not a zone name or a fixed "
-                "offset the conversion can write (a POSIX rule with daylight saving, the "
-                "server's local zone), so " + assumes
+                "offset the conversion can write (such as a POSIX rule with a daylight-saving "
+                "part, or localtime, the server's local zone), so " + assumes
             )
         return _database_item(
             object_name="TimeZone",
