@@ -5104,6 +5104,32 @@ def zoned_default_columns(
     return names
 
 
+def unzoned_clock_default_columns(table: TableDef, zone: "Optional[SourceZone]") -> "list[str]":
+    """The columns of a PostgreSQL ``table`` without a time zone whose carried DEFAULT reads
+    the clock in the session's zone but is not written in the source's ``zone`` (G184:
+    clock arithmetic, the three-argument date_trunc ...; :func:`~dsql_migrator.core.
+    converter_postgres.pg_unzoned_clock_default`). Empty when the zone is UTC or unknown.
+    For SOURCE_TIME_ZONE, which names them beside :func:`zoned_default_columns`. (A MySQL
+    clock default is written in the zone or dropped with its note.) Pure."""
+    from dsql_migrator.core.converter_postgres import (
+        pg_column_default_sql,
+        pg_unzoned_clock_default,
+    )
+
+    if zone is None or not zone.shifts:
+        return []
+    names: list[str] = []
+    for column in table.columns:
+        if column.name == table.auto_increment_column:
+            continue
+        emitted, _reason = pg_column_default_sql(
+            column, is_key_column=column.name in table.primary_key
+        )
+        if emitted is not None and pg_unzoned_clock_default(emitted, column.mysql_type, zone):
+            names.append(column.name)
+    return names
+
+
 def _dropped_default_warning(table: TableDef, *, is_postgres: bool) -> Optional[ConversionWarning]:
     """The table's dropped DEFAULTs as one note, for Evaluation (DEFAULT_DROPPED). A
     PostgreSQL serial / identity column is left to the rule that already reports it --

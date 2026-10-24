@@ -453,6 +453,9 @@ def _pg_table(*columns: ColumnDef) -> TableDef:
         ("time without time zone", "CURRENT_TIME", "((now() AT TIME ZONE 'Asia/Seoul')::time)"),
         ("time(3) without time zone", "LOCALTIME(3)",
          "((CURRENT_TIMESTAMP(3) AT TIME ZONE 'Asia/Seoul')::time)"),
+        # G184: date_trunc of a clock.
+        ("timestamp without time zone", "date_trunc('day'::text, now())",
+         "date_trunc('day'::text, (now() AT TIME ZONE 'Asia/Seoul'))"),
     ],
 )
 def test_a_postgresql_clock_default_names_the_source_zone(
@@ -471,7 +474,9 @@ def test_a_postgresql_clock_default_names_the_source_zone(
         ("timestamp with time zone", "now()"),  # an instant needs no zone
         ("time with time zone", "CURRENT_TIME"),
         ("timestamp without time zone", "(now() AT TIME ZONE 'utc'::text)"),  # explicit already
-        ("timestamp without time zone", "date_trunc('day'::text, now())"),  # another expression
+        # date_trunc of a clock is written in the zone since G184 (test_g184_...); the
+        # three-argument form names its own.
+        ("timestamp without time zone", "date_trunc('day'::text, now(), 'Asia/Seoul'::text)"),
         ("timestamp without time zone", "(now() + '1 day'::interval)"),
         ("timestamp without time zone", "'2024-01-01 00:00:00'::timestamp without time zone"),
         ("timestamp without time zone", "CURRENT_TIME"),  # no such assignment

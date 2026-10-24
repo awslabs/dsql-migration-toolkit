@@ -226,12 +226,20 @@ def pg_column_default_sql(
 # A clock DEFAULT as pg_get_expr prints it (G149): an instant -- now() and its siblings,
 # CURRENT_TIMESTAMP[(p)] -- or the session's wall clock, date or time of day --
 # LOCALTIMESTAMP[(p)], CURRENT_DATE, CURRENT_TIME[(p)], LOCALTIME[(p)] -- bare, or cast to a
-# type without a time zone, ((now())::date), with a precision or not -- now()::timestamp(0)
-# prints as (now())::timestamp(0) without time zone (G166).
+# date or time type, ((now())::date), with a precision or not -- now()::timestamp(0) prints
+# as (now())::timestamp(0) without time zone (G166), now()::timestamptz(0) as
+# (now())::timestamp(0) with time zone (G184: rounded, then stored in the column's zone).
 _PG_CLOCK_CAST_RE = re.compile(
     r"\(\s*(?P<clock>[^()]*(?:\(\s*\d?\s*\))?)\s*\)\s*::\s*"
     r"(?P<cast>date|(?P<cast_base>time|timestamp)"
-    r"(?:\s*\(\s*(?P<cast_precision>\d)\s*\))?\s+without\s+time\s+zone)",
+    r"(?:\s*\(\s*(?P<cast_precision>\d)\s*\))?\s+with(?:out)?\s+time\s+zone)",
+    re.IGNORECASE,
+)
+# date_trunc of a clock (G184), as pg_get_expr prints date_trunc('second', now()):
+# date_trunc('second'::text, now()). The three-argument form names its zone and is left alone.
+_PG_DATE_TRUNC_RE = re.compile(
+    r"date_trunc\s*\(\s*(?P<unit>'[A-Za-z]+'(?:\s*::\s*text)?)\s*,\s*(?P<clock>[^(),]*"
+    r"(?:\(\s*\d?\s*\))?)\s*\)",
     re.IGNORECASE,
 )
 _PG_CLOCK_RE = re.compile(
@@ -273,14 +281,28 @@ def pg_zoned_clock_default(
     the function (``clock_timestamp()`` stays the time of each row) and the precision
     (``LOCALTIMESTAMP(0)`` is ``CURRENT_TIMESTAMP(0)``'s wall clock). A ``timestamp with time
     zone`` / ``time with time zone`` column holds the instant and is left alone, as is any
-    other expression: only a bare clock, or one cast to a type without a zone, is
-    rewritten."""
+    other expression: only a bare clock, one cast to a date or time type, or date_trunc of
+    one (G184: ``date_trunc('second', (now() AT TIME ZONE 'Asia/Seoul'))``, its date on a
+    date column) is rewritten -- :func:`pg_unzoned_clock_default` tells the rest."""
     if zone is None or not zone.shifts:
         return None
     column_kind = _PG_ZONELESS_COLUMN_KINDS.get(normalize_pg_base_type(pg_type or ""))
     if column_kind is None:
         return None
     text = default_sql.strip()
+    trunc = _PG_DATE_TRUNC_RE.fullmatch(text)
+    if trunc is not None:
+        truncated = _PG_CLOCK_RE.fullmatch(trunc.group("clock").strip())
+        keyword = ((truncated.group("keyword") if truncated else "") or "").lower()
+        if truncated is None or keyword in ("current_date", "current_time", "localtime"):
+            return None
+        precision = truncated.group("precision")
+        instant = (
+            f"{truncated.group('function')}()" if truncated.group("function")
+            else f"CURRENT_TIMESTAMP({precision})" if precision else "now()"
+        )
+        rewritten = f"date_trunc({trunc.group('unit')}, {zone.clock_sql(instant)})"
+        return rewritten if column_kind == "timestamp" else f"({rewritten}::{column_kind})"
     cast = _PG_CLOCK_CAST_RE.fullmatch(text)
     clock = _PG_CLOCK_RE.fullmatch(cast.group("clock").strip() if cast else text)
     if clock is None:
@@ -313,6 +335,29 @@ def pg_zoned_clock_default(
     if "date" in kinds:
         return f"({clock}::date)" if clock else zone.date_sql(instant)
     return clock or zone.clock_sql(instant)
+
+
+def pg_unzoned_clock_default(
+    default_sql: str, pg_type: str, zone: "Optional[SourceZone]"
+) -> bool:
+    """Whether ``default_sql`` -- a carried DEFAULT on a column without a time zone -- reads
+    the clock in the session's zone but is carried as written under a source ``zone`` that
+    is not UTC (G184): clock arithmetic (``now() + '1 day'::interval``, ``CURRENT_DATE +
+    1``), the three-argument date_trunc (its timestamptz is stored in the session's zone)
+    and any other form :func:`pg_zoned_clock_default` does not rewrite. One that names a zone
+    itself (AT TIME ZONE, timezone()) does not depend on the session's. Pure."""
+    from dsql_migrator.core.source_time_zone import _PG_QUOTED_RE, _PG_VIEW_CLOCK_RE
+
+    if zone is None or not zone.shifts:
+        return False
+    if _PG_ZONELESS_COLUMN_KINDS.get(normalize_pg_base_type(pg_type or "")) is None:
+        return False
+    masked = _PG_QUOTED_RE.sub(" ", default_sql or "")
+    if _PG_VIEW_CLOCK_RE.search(masked) is None:
+        return False
+    if re.search(r"\bat\s+time\s+zone\b|\btimezone\s*\(", masked, re.IGNORECASE):
+        return False
+    return pg_zoned_clock_default(default_sql, pg_type, zone) is None
 
 
 @functools.lru_cache(maxsize=16384)
@@ -1178,6 +1223,7 @@ __all__ = [
     "pg_column_default_sql",
     "pg_identity_fallback",
     "pg_sequence_next_value",
+    "pg_unzoned_clock_default",
     "pg_zoned_clock_default",
     "unsupported_dsql_reason",
 ]

@@ -132,7 +132,10 @@ session's zone. A fixed offset such as `+09:00` is written as the UTC clock plus
 with the POSIX sign, as nine hours west of UTC. A `TIMESTAMP` (`timestamptz`) column holds
 an instant and keeps `now()`, and `UTC_TIMESTAMP()` / `UTC_DATE()` stay UTC. A PostgreSQL
 view is carried as PostgreSQL deparsed it, so the item lists the views that read the clock
-for you to review. The item (**MANUAL**) names those columns and views, and what the
+for you to review. A PostgreSQL clock default is written in the zone when it is a clock, one
+cast to a date or time type, or `date_trunc` of one; a clock default it carries as written —
+clock arithmetic such as `now() + '1 day'::interval`, or `date_trunc(…, now(), zone)` — is
+listed the same way. The item (**MANUAL**) names those columns and views, and what the
 application must do: if it relies on the session's zone — `NOW()` or `CURRENT_DATE` written
 into such a column, or compared with one — it runs `SET TIME ZONE 'Asia/Seoul'` on every
 new Aurora DSQL connection (Aurora DSQL allows it) or writes the zone in its SQL. A zone

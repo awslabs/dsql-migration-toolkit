@@ -3887,17 +3887,34 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
             effort=None,
             advisory=True,
         )
+    from dsql_migrator.core.converter import unzoned_clock_default_columns
+
     columns = [
         f"{table.name}.{name}"
         for table in inventory.tables
         for name in zoned_default_columns(table, zone, is_postgres=True)
+    ]
+    # G184: the clock defaults it does not rewrite are named too, not taken for written.
+    carried = [
+        f"{table.name}.{name}"
+        for table in inventory.tables
+        for name in unzoned_clock_default_columns(table, zone)
     ]
     views = views_reading_the_clock(inventory.views, SourceType.POSTGRES)
     written = (
         f"DEFAULT now() on a timestamp column becomes DEFAULT {zone.clock_sql()}, on a date "
         f"or time column its date or time of day ({_counted(columns, 'column')})"
         if columns
-        else "no column default reads the clock"
+        else "no column default reads the clock" if not carried
+        else "none is one it rewrites"
+    )
+    as_written = (
+        " Other clock defaults on such columns -- clock arithmetic (now() + '1 day'::interval, "
+        "CURRENT_DATE + 1), date_trunc(..., now(), zone) and the like -- are carried as "
+        "written, so they compute in the session's zone, UTC on Aurora DSQL unless it sets "
+        f"another ({_counted(carried, 'column')})."
+        if carried
+        else ""
     )
     viewed = (
         " Views are carried as PostgreSQL deparsed them, so a view that reads the clock "
@@ -3923,13 +3940,20 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
             "values unchanged. An Aurora DSQL session runs in UTC unless it sets another "
             "zone, so Schema Conversion writes the source's zone into those columns' clock "
             f"defaults: {written}; timestamp with time zone columns hold instants and keep "
-            f"theirs.{viewed}{roles}"
+            f"theirs.{as_written}{viewed}{roles}"
         ),
         recommendation=(
             "An application that relies on the session's time zone -- now() or CURRENT_DATE "
             "written into such columns, or compared with them -- gets UTC on Aurora DSQL: "
             f"have it run {_zone_set_statement(zone)} on every new connection (Aurora DSQL "
             f"allows it{offset_note}), or write the zone explicitly ({_zone_clock_text(zone)})."
+            + (
+                " Edit the clock defaults carried as written in Schema Conversion to name the "
+                f"zone ({zone.clock_sql()} for now()) before applying, or rely on that SET "
+                "TIME ZONE."
+                if carried
+                else ""
+            )
             + (
                 " Review the views listed: where one depends on the zone, write it there in "
                 "the view's target DDL before applying, or rely on that SET TIME ZONE."
