@@ -1979,7 +1979,9 @@ def pg_deferrable_key_rule() -> ConversionWarningRule:
         "Before cut over, find the writes that rely on the deferred check -- a transaction "
         "or a multi-row UPDATE that swaps or renumbers key values -- and change them so no "
         "two rows hold the same key value at any point (move one row to a free value first), "
-        "or change the design.",
+        "or change the design. If the primary key is DEFERRABLE and you replicate with CDC, "
+        "re-create it NOT DEFERRABLE on the source, or set the table REPLICA IDENTITY FULL, "
+        "before the CDC prerequisite check runs.",
         EffortLevel.SIMPLE,
     )
 
