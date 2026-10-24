@@ -2521,9 +2521,12 @@ def _zoned_clock_default(
     another, so under a source zone that is not UTC the default names that zone: a DATETIME
     gets ``(now() AT TIME ZONE 'Asia/Seoul')`` (a fixed offset the INTERVAL form,
     :meth:`SourceZone.clock_sql`), a DATE its date, a TIME its time of day. A TIMESTAMP
-    column (timestamptz) holds an instant and keeps ``now()``. Without a zone only a TIME
-    column's CURTIME() is written here, as ``LOCALTIME``: the transpile renders
-    CURRENT_TIME as ``CURRENT_TIME()``, which PostgreSQL rejects."""
+    column (timestamptz) holds an instant and keeps ``now()``. Without a zone only a
+    CURTIME() is written here: the transpile renders CURRENT_TIME as ``CURRENT_TIME()``,
+    which PostgreSQL rejects (the whole CREATE TABLE failed). On a TIME column it is
+    ``LOCALTIME``; on a column that holds a date MySQL puts the time on the session's current
+    date (G158), so a DATETIME gets what its NOW() gets, a DATE the current date and a
+    TIMESTAMP its instant -- with a zone too."""
     if canonical in _NOW_CLOCK_DEFAULTS or _FSP_CLOCK_RE.fullmatch(canonical):
         reads = "timestamp"
     elif canonical in _DATE_CLOCK_DEFAULTS:
@@ -2537,6 +2540,12 @@ def _zoned_clock_default(
         if zone is not None:
             return zone.time_sql()
         return "LOCALTIME" if reads == "time" else None
+    if reads == "time":
+        if base == "timestamptz":
+            return "CURRENT_TIMESTAMP"
+        if zone is None:
+            return {"timestamp": "(now() AT TIME ZONE 'UTC')", "date": "CURRENT_DATE"}.get(base)
+        reads = "timestamp"
     if zone is None:
         return None
     if base == "date" or (base == "timestamp" and reads == "date"):
@@ -2555,15 +2564,17 @@ def _shifted_clock_default(
 
     The arithmetic is carried as written (the transpile writes the interval), from the clock
     a bare default of the column gets: on a DATETIME (``timestamp``) the source zone's wall
-    clock, the UTC one without a zone (:func:`_zoned_clock_default`); on a DATE the source
-    zone's, whose date the column keeps; on any other column -- a TIMESTAMP's instant --
-    the expression itself. A prefix match took such a default for its bare clock: a
-    DATETIME DEFAULT (CURRENT_TIMESTAMP + INTERVAL 30 DAY) became now() AT TIME ZONE 'UTC'."""
+    clock, the UTC one without a zone (:func:`_zoned_clock_default`); on a DATE or a TIME
+    the source zone's, whose date or time of day the column keeps (a TIME kept the
+    session's, UTC on Aurora DSQL, before G158); on any other column -- a TIMESTAMP's
+    instant -- the expression itself. A prefix match took such a default for its bare
+    clock: a DATETIME DEFAULT (CURRENT_TIMESTAMP + INTERVAL 30 DAY) became now() AT TIME
+    ZONE 'UTC'."""
     shifted = _CLOCK_ARITHMETIC_RE.fullmatch(expression)
     if shifted is None:
         return None
     base = target.split("(", 1)[0].strip()
-    if base == "timestamp" or (base == "date" and zone is not None):
+    if base == "timestamp" or (base in ("date", "time") and zone is not None):
         clock = zone.clock_sql() if zone is not None else "(now() AT TIME ZONE 'UTC')"
         return f"({clock}{shifted.group('rest')})"
     return expression
@@ -2971,6 +2982,12 @@ def _column_default_sql(
             ) and "tz" not in target and "with time zone" not in target
             if is_naive_timestamp:
                 return "(now() AT TIME ZONE 'UTC')", None
+            if _FSP_CLOCK_RE.fullmatch(canonical):
+                # NOW(n) -- how MySQL reports DEFAULT (CURRENT_TIMESTAMP(6)) -- on a TIMESTAMP,
+                # DATE or TIME column: PostgreSQL has no now(integer), and the CREATE TABLE
+                # failed. CURRENT_TIMESTAMP, as the transpile writes CURRENT_TIMESTAMP(n); the
+                # column's type keeps the digits it holds.
+                return "CURRENT_TIMESTAMP", None
             return expression, None
         translated = _TRANSLATED_EXPRESSION_DEFAULTS.get(
             expression.upper() if expression.upper().endswith(")") else f"{expression.upper()}()"
