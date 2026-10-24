@@ -95,12 +95,15 @@ shows:
   identity on Aurora DSQL steps by 1. The time zone is graded too, as for PostgreSQL
   (below). The others — the case folding of names, the character set and collation
   defaults, `div_precision_increment` and `group_concat_max_len` — are recorded, not graded.
-- **PostgreSQL:** the `TimeZone` a new session of the migration user gets in the connected
-  database (the DB or DB cluster parameter group's value, unless an `ALTER DATABASE` or
-  `ALTER ROLE` default replaces it), read over a short connection of its own because the
-  tool's sessions pin UTC, and each `TimeZone` default `ALTER DATABASE` or `ALTER ROLE` sets
-  for that database (the role your application connects as may have its own). The time
-  zone is graded (below).
+- **PostgreSQL:** the `TimeZone` a new session gets in the connected database when its role
+  has no `TimeZone` default of its own (the DB or DB cluster parameter group's value, unless
+  an `ALTER DATABASE` or `ALTER ROLE ALL` default replaces it), read over a short connection
+  of its own because the tool's sessions pin UTC, and each `TimeZone` default `ALTER
+  DATABASE` or `ALTER ROLE` sets for that database (the role your application connects as
+  may have its own). The migration user's own `ALTER ROLE` default is marked *the migration
+  user* in the list and is not taken for the source's default: it hides the parameter
+  group's value from the short connection, so the default is then the `ALTER DATABASE` or
+  `ALTER ROLE ALL` one, or else cannot be told. The time zone is graded (below).
 
 **The source's time zone** (`SOURCE_TIME_ZONE`). A clock function — MySQL's `NOW()`,
 `CURRENT_TIMESTAMP` or `CURDATE()`, PostgreSQL's `now()`, `LOCALTIMESTAMP` or
@@ -130,10 +133,12 @@ application must do: if it relies on the session's zone — `NOW()` or `CURRENT_
 into such a column, or compared with one — it runs `SET TIME ZONE 'Asia/Seoul'` on every
 new Aurora DSQL connection (Aurora DSQL allows it) or writes the zone in its SQL. A zone
 that cannot be told — `SYSTEM` reported only by an abbreviation such as `KST`, a PostgreSQL
-`TimeZone` with daylight-saving rules, or one its short connection could not read while the
-`ALTER DATABASE` / `ALTER ROLE` defaults were read — is said so in an advisory item, and the
-conversion assumes UTC, as it does for a source in UTC. A read that captures nothing at all
-shows no item, and the conversion assumes UTC then too.
+`TimeZone` with daylight-saving rules, one its short connection could not read while the
+`ALTER DATABASE` / `ALTER ROLE` defaults were read, or one the migration user's own `ALTER
+ROLE` default hides — is said so in an advisory item, and the conversion assumes UTC, as it
+does for a source in UTC. A PostgreSQL source in UTC whose roles include one with a
+`TimeZone` default of another zone gets an advisory item that names it. A read that captures
+nothing at all shows no item, and the conversion assumes UTC then too.
 
 Neither read sees a value the application sets for itself: a session `SET`
 (`SET sql_mode`, `SET time_zone`, `SET TIME ZONE`), or an option its driver or connection

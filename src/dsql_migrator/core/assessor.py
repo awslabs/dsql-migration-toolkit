@@ -3634,19 +3634,54 @@ def _counted(names: "Sequence[str]", noun: str) -> str:
     return f"{len(names):,} {noun}{'' if len(names) == 1 else 's'}: {_first_names(names)}"
 
 
-def _pg_role_zones(settings: "dict[str, str]") -> str:
-    """The TimeZone defaults ALTER ROLE gives single roles (G148 records them), as a sentence
-    -- an application that connects as such a role gets its zone, not the database's."""
-    entries = [
-        f"{key[len('TimeZone ('):-1]} '{value}'"
-        for key, value in settings.items()
-        if key.startswith("TimeZone (ALTER ROLE ") and not key.startswith("TimeZone (ALTER ROLE ALL")
+def _pg_single_role_zones(
+    settings: "dict[str, str]", *, login: bool
+) -> "list[tuple[str, str]]":
+    """``(statement, value)`` of each TimeZone default ALTER ROLE gives a single role (G148
+    records them): the migration user's own (G164 marks them) when ``login``, else the
+    others'."""
+    from dsql_migrator.core.source_dialect.postgres import PG_LOGIN_ZONE_MARK
+
+    found = []
+    for key, value in settings.items():
+        if not key.startswith("TimeZone (ALTER ROLE ") or key.startswith(
+            "TimeZone (ALTER ROLE ALL"
+        ):
+            continue
+        own = key.endswith(PG_LOGIN_ZONE_MARK)
+        if own is login:
+            found.append(
+                (key[len("TimeZone ("):-len(PG_LOGIN_ZONE_MARK) if own else -1], value)
+            )
+    return found
+
+
+def _pg_role_zones(settings: "dict[str, str]", *, login: bool = True) -> str:
+    """The TimeZone defaults ALTER ROLE gives single roles, as a sentence -- an application
+    that connects as such a role gets its zone, not the database's. The migration user's own
+    (left out unless ``login``) is said to be its own: it is not another role's, and an
+    application that connects as the migration user gets it."""
+    entries = [f"{scope} '{value}'" for scope, value in _pg_single_role_zones(settings, login=False)]
+    entries += [
+        f"the migration user's {scope} '{value}'"
+        for scope, value in (_pg_single_role_zones(settings, login=True) if login else ())
     ]
     if not entries:
         return ""
     return (
         f" Some roles have a TimeZone default of their own ({', '.join(entries)}): an "
         "application that connects as one of them gets that zone instead."
+    )
+
+
+def _pg_role_zones_shift(settings: "dict[str, str]") -> bool:
+    """Whether a role's own TimeZone default names a zone other than UTC."""
+    from dsql_migrator.core.source_time_zone import resolve_source_zone
+
+    return any(
+        resolve_source_zone({"TimeZone": value}, SourceType.POSTGRES).kind != "utc"
+        for login in (False, True)
+        for _scope, value in _pg_single_role_zones(settings, login=login)
     )
 
 
@@ -3757,7 +3792,20 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
             "zone (UTC on Aurora DSQL unless the session sets another). Full Load and CDC "
             "copy those values unchanged."
         )
-        if not zone.setting:
+        reread = ""
+        login = _pg_single_role_zones(inventory.server_settings, login=True)
+        if "TimeZone" not in inventory.server_settings and login:
+            # G164: the session Evaluation reads it with gets the migration user's own
+            # default, which outranks the database's and the parameter group's.
+            own = "; ".join(f"{scope} '{value}'" for scope, value in login)
+            risk = (
+                f"The migration user has a TimeZone default of its own ({own}), which is "
+                "what its own sessions get: it hides the source's default -- the zone an "
+                "application role without such a default gets -- so " + assumes
+            )
+            roles = _pg_role_zones(inventory.server_settings, login=False)
+        elif not zone.setting:
+            reread = "Re-run Evaluation to read it. "
             risk = (
                 "The source's default TimeZone could not be read (the short connection "
                 "Evaluation opens to read it failed), so " + assumes
@@ -3773,7 +3821,7 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
             rule_id=SOURCE_TIME_ZONE_RULE_ID,
             risk=risk + roles,
             recommendation=(
-                ("Re-run Evaluation to read it. " if not zone.setting else "")
+                reread
                 + "If the source runs in a zone other than UTC (SHOW TimeZone in a new "
                 "session of the application's role), edit those defaults in Schema Conversion "
                 "to name it (now() AT TIME ZONE 'Area/City'), and have the application run "
@@ -3811,7 +3859,8 @@ def _pg_time_zone_item(inventory: SourceInventory, zone: "SourceZone") -> Assess
         rule_id=SOURCE_TIME_ZONE_RULE_ID,
         risk=(
             f"The source's default time zone is {zone.label} ({zone.setting}, what a new "
-            "session gets when the client sets none). now(), CURRENT_TIMESTAMP, "
+            "session gets when neither its role nor the client sets one). now(), "
+            "CURRENT_TIMESTAMP, "
             "LOCALTIMESTAMP and CURRENT_DATE give that zone's wall clock where a timestamp "
             "without time zone, date or time column stores them; Full Load and CDC copy those "
             "values unchanged. An Aurora DSQL session runs in UTC unless it sets another "
@@ -3860,13 +3909,40 @@ def check_postgres_time_zone(
     defaults of timestamp without time zone / date / time columns, the views that read the
     clock (carried as deparsed, so listed for review), the roles with a zone of their own.
     Its own connection reads the TimeZone, so a read that captured the ALTER DATABASE /
-    ALTER ROLE defaults but not it says so; one that captured nothing says nothing."""
+    ALTER ROLE defaults but not it says so; one that captured nothing says nothing. The
+    migration user's own ALTER ROLE default is never taken for the source's (G164: it hides
+    the default, which is then unknown unless an ALTER DATABASE / ALTER ROLE ALL one names
+    it), and a UTC default with a role of another zone gets an advisory note naming it."""
     from dsql_migrator.core.source_time_zone import resolve_source_zone
 
     if not inventory.server_settings:
         return []
     zone = resolve_source_zone(inventory.server_settings, SourceType.POSTGRES)
-    return [] if zone.kind == "utc" else [_pg_time_zone_item(inventory, zone)]
+    if zone.kind != "utc":
+        return [_pg_time_zone_item(inventory, zone)]
+    if not _pg_role_zones_shift(inventory.server_settings):
+        return []
+    # UTC by default, but a role with a zone of its own (G164): an application that
+    # connects as it writes that zone's wall clock, which the UTC conversion does not.
+    return [
+        _database_item(
+            object_name="TimeZone",
+            rule_id=SOURCE_TIME_ZONE_RULE_ID,
+            risk=(
+                f"The source's default time zone is UTC ({zone.setting}), so Schema "
+                "Conversion writes clock defaults in UTC."
+                + _pg_role_zones(inventory.server_settings)
+            ),
+            recommendation=(
+                "If the application connects as one of those roles, edit the clock defaults "
+                "of timestamp without time zone, date and time columns in Schema Conversion "
+                "to name its zone (now() AT TIME ZONE 'Area/City'), and have the application "
+                "run SET TIME ZONE 'Area/City' on every new Aurora DSQL connection."
+            ),
+            effort=None,
+            advisory=True,
+        )
+    ]
 
 
 def default_inventory_rules(

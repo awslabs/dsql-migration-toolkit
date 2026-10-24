@@ -2514,11 +2514,12 @@ def source_settings_caption(source_type: Optional[SourceType]) -> str:
     sessions run with instead."""
     if source_type is SourceType.POSTGRES:
         return (
-            "The TimeZone a new session of the migration user gets in this database, and each "
-            "TimeZone default ALTER DATABASE or ALTER ROLE sets for it (the role an application "
-            "connects as may have its own). An application's own SET TIME ZONE, or a zone its "
-            "driver or connection string sends, is not visible here. The tool's own source "
-            "sessions run with TimeZone UTC."
+            "The TimeZone a new session gets in this database when its role has no TimeZone "
+            "default of its own, and each TimeZone default ALTER DATABASE or ALTER ROLE sets "
+            "for it (the role an application connects as may have its own; the migration "
+            "user's own is marked, and is not taken for the source's). An application's own "
+            "SET TIME ZONE, or a zone its driver or connection string sends, is not visible "
+            "here. The tool's own source sessions run with TimeZone UTC."
         )
     return (
         "The server's GLOBAL values, which an application session starts from, and what the "

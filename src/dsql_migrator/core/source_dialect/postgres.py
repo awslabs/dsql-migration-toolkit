@@ -1041,10 +1041,12 @@ _SETTINGS_PROBE_KWARGS: "dict[str, object]" = {
 # The TimeZone defaults ALTER DATABASE / ALTER ROLE set for the connected database: the role
 # an application connects as may have its own, which the probe (made as the migration
 # login) does not apply. pg_db_role_setting is readable by every role; only the TimeZone
-# entries leave the server (a role's other settings can hold anything).
+# entries leave the server (a role's other settings can hold anything). ``is_login`` marks
+# the migration user's own (``session_user``), whose sessions -- the probe's too -- get it.
 _PG_TIMEZONE_DEFAULTS_SQL = (
     "SELECT COALESCE(r.rolname, '') AS role, s.setdatabase <> 0 AS in_database, "
-    "substr(c.entry, strpos(c.entry, '=') + 1) AS value "
+    "substr(c.entry, strpos(c.entry, '=') + 1) AS value, "
+    "COALESCE(r.rolname = session_user, false) AS is_login "
     "FROM pg_db_role_setting s "
     "CROSS JOIN LATERAL unnest(s.setconfig) AS c(entry) "
     "LEFT JOIN pg_roles r ON r.oid = s.setrole "
@@ -1071,6 +1073,26 @@ def pg_default_timezone(connection: object) -> Optional[str]:
     """The TimeZone a new session of ``connection``'s login gets in its database when the
     client sets none, or ``None`` when it cannot be read. Reads over a probe connection of
     its own (:data:`_PG_SESSION_TIMEZONE_SQL`), since the tool's sessions pin UTC."""
+    read = pg_session_timezone(connection)
+    return None if read is None else read[0]
+
+
+# pg_settings.source values that mean the session's TimeZone is the LOGIN's own role default
+# (ALTER ROLE <login> [IN DATABASE] SET timezone), which outranks ALTER DATABASE, ALTER ROLE ALL
+# and the configuration file (live-verified on 16.15) -- what an application role without a
+# default of its own does not get.
+_PG_LOGIN_ROLE_SOURCES = frozenset({"user", "database user"})
+# How the migration user's own TimeZone defaults are keyed in ``server_settings`` (the
+# statement that set each, then this): read by ``assessor`` so the user's own is never
+# described as another role's, nor taken for the source's default.
+PG_LOGIN_ZONE_MARK = ", the migration user)"
+
+
+def pg_session_timezone(connection: object) -> "Optional[tuple[str, str]]":
+    """``(setting, source)`` of the TimeZone a new session of ``connection``'s login gets
+    in its database (pg_settings; ``source`` is where it came from, such as ``configuration
+    file`` or ``user``), or ``None`` when it cannot be read, or came from this process's own
+    environment (``client``)."""
     url = getattr(getattr(connection, "engine", None), "url", None)
     if url is None:
         return None
@@ -1085,9 +1107,10 @@ def pg_default_timezone(connection: object) -> Optional[str]:
         return None
     finally:
         probe.dispose()  # type: ignore[attr-defined]
-    if row is None or not row[0] or str(row[1] or "").strip().lower() == "client":
+    source = str(row[1] or "").strip().lower() if row is not None else ""
+    if row is None or not row[0] or source == "client":
         return None
-    return str(row[0])
+    return str(row[0]), source
 
 
 def pg_timezone_defaults(connection: object) -> "dict[str, str]":
@@ -1101,13 +1124,16 @@ def pg_timezone_defaults(connection: object) -> "dict[str, str]":
     except Exception:  # noqa: BLE001 - best effort
         return {}
     out: dict[str, str] = {}
-    for role, in_database, value in rows:
+    for role, in_database, value, *login in rows:
         if not role:
             # setrole 0: every role -- ALTER DATABASE (this database), ALTER ROLE ALL (any).
             scope = "ALTER DATABASE" if in_database else "ALTER ROLE ALL"
         else:
             scope = f"ALTER ROLE {role}" + (" IN DATABASE" if in_database else "")
-        out[f"TimeZone ({scope})"] = "" if value is None else str(value)
+        key = f"TimeZone ({scope})"
+        if role and login and login[0]:
+            key = key[:-1] + PG_LOGIN_ZONE_MARK
+        out[key] = "" if value is None else str(value)
     return out
 
 
@@ -1626,18 +1652,31 @@ class PostgresSourceDialect(SourceDialect):
 
     def server_settings(self, connection: object) -> "dict[str, str]":
         # G148: the TimeZone an application session gets by default -- what a new session
-        # of the migration login gets in this database (``TimeZone``, past the tool's own
-        # UTC pin) and the ALTER DATABASE / ALTER ROLE defaults another role would get. Not
-        # an application's own SET TIME ZONE, nor a zone its driver or connection string
-        # sends. Only on a genuine PostgreSQL connection (the probe opens one of its own),
-        # each part best effort.
+        # of a role without a TimeZone default of its own gets in this database
+        # (``TimeZone``, read past the tool's own UTC pin as the migration login) -- and the
+        # ALTER DATABASE / ALTER ROLE defaults another role would get, the migration user's
+        # own marked (G164). Not an application's own SET TIME ZONE, nor a zone its driver or
+        # connection string sends. Only on a genuine PostgreSQL connection (the probe opens
+        # one of its own), each part best effort.
         if getattr(getattr(connection, "dialect", None), "name", None) != "postgresql":
             return {}
         settings: dict[str, str] = {}
-        zone = pg_default_timezone(connection)
-        if zone is not None:
-            settings["TimeZone"] = zone
-        settings.update(pg_timezone_defaults(connection))
+        read = pg_session_timezone(connection)
+        defaults = pg_timezone_defaults(connection)
+        if read is not None:
+            zone, source = read
+            if source in _PG_LOGIN_ROLE_SOURCES:
+                # The migration user's own ALTER ROLE default, not what a role without one
+                # gets: that is the ALTER DATABASE default, else the ALTER ROLE ALL one, else
+                # the parameter group's, which no session of this login can show (PG-3).
+                zone = (
+                    defaults.get("TimeZone (ALTER DATABASE)")
+                    or defaults.get("TimeZone (ALTER ROLE ALL)")
+                    or None
+                )
+            if zone is not None:
+                settings["TimeZone"] = zone
+        settings.update(defaults)
         return settings
 
     def sibling_databases(self, connection: object) -> "list[str]":
@@ -2501,6 +2540,8 @@ class PostgresSourceDialect(SourceDialect):
 __all__ = [
     "PostgresSourceDialect",
     "pg_default_timezone",
+    "pg_session_timezone",
+    "PG_LOGIN_ZONE_MARK",
     "pg_exclusion_rules_sql",
     "pg_key_timing_sql",
     "pg_reads_own_rows_only",
