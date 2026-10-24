@@ -360,10 +360,12 @@ _PG_TYPE_KINDS = {
 # ``prerequisites_postgres._CDC_CARRIED_EXTENSION_TYPES``), flagged ``outside_catalog``, and
 # every COMPOSITE, RANGE or MULTIRANGE type outside pg_catalog (G171: the connector leaves
 # them out too, verified with its own schema builder). An enum is carried and a domain over
-# a domain is not resolved, so neither is returned. Verified on PostgreSQL 17.11 (pgvector 0.8.7) and 13.23: vector, halfvec,
-# sparsevec, vector[], cube, seg, ean13, lquery, earth (a domain over cube) and a domain
-# over vector are returned; citext, hstore, ltree, isbn (and their arrays), a base type
-# named geometry, an enum, an enum[] and a composite are not.
+# a domain is not resolved, so neither is returned. Verified on PostgreSQL 17.11 (pgvector
+# 0.8.7) and 13.23: vector, halfvec, sparsevec, vector[], cube, seg, ean13, lquery, earth (a
+# domain over cube) and a domain over vector are returned; citext, hstore, ltree, isbn (and
+# their arrays), a base type named geometry, an enum and an enum[] are not (G153); and on
+# 17.11 a composite, a range and a multirange of the user's, their arrays and a domain over a
+# composite are returned (G171).
 #
 # ``attndims`` is deliberately NOT read. It is only the DECLARED dimensionality and
 # PostgreSQL enforces it in NEITHER direction -- live-verified on 17.11: a column declared

@@ -495,7 +495,9 @@ def _view_table_refs(ddl: str) -> "Optional[frozenset[str]]":
 
 
 @lru_cache(maxsize=32768)  # = converter.DDL_CACHE_SIZE
-def _applied_nnd_indexes(index_ddls: "tuple[str, ...]") -> "tuple[tuple[str, tuple[str, ...]], ...]":
+def _applied_nnd_indexes(
+    index_ddls: "tuple[str, ...]",
+) -> "tuple[tuple[str, tuple[str, ...]], ...]":
     """``(index, columns)`` of each applied ``CREATE UNIQUE INDEX ... NULLS NOT DISTINCT``
     (G170): the statement decides, so an edit that drops the clause is honoured. Cached by
     the statements, as :func:`_unique_members` is."""

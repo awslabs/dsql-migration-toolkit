@@ -3677,7 +3677,9 @@ def _pg_role_zones(settings: "dict[str, str]", *, login: bool = True) -> str:
     that connects as such a role gets its zone, not the database's. The migration user's own
     (left out unless ``login``) is said to be its own: it is not another role's, and an
     application that connects as the migration user gets it."""
-    entries = [f"{scope} '{value}'" for scope, value in _pg_single_role_zones(settings, login=False)]
+    entries = [
+        f"{scope} '{value}'" for scope, value in _pg_single_role_zones(settings, login=False)
+    ]
     entries += [
         f"the migration user's {scope} '{value}'"
         for scope, value in (_pg_single_role_zones(settings, login=True) if login else ())

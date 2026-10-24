@@ -306,7 +306,9 @@ def pg_zoned_clock_default(
         if column_kind != "time" or "date" in kinds:
             return None
         # A cast's precision rounds the zone's time of day as the source's rounds its own.
-        return f"({zone.clock_sql(instant)}::time({rounded}))" if rounded else zone.time_sql(instant)
+        if rounded:
+            return f"({zone.clock_sql(instant)}::time({rounded}))"
+        return zone.time_sql(instant)
     clock = f"({zone.clock_sql(instant)}::timestamp({rounded}))" if rounded else None
     if "date" in kinds:
         return f"({clock}::date)" if clock else zone.date_sql(instant)
