@@ -762,6 +762,14 @@ aws cloudformation deploy \
 > step had already started keeps running in AWS, and the CDC step reads the stack
 > again when you reconnect. **Finish or stop in-flight jobs before updating.**
 
+> [!IMPORTANT]
+> **Rolling back to an older image can cost you saved sessions.** A later version
+> records things v0.1.574 and earlier do not know — a MySQL Evaluation records the
+> source's server settings, for one — and those versions cannot read a session that
+> holds any: they ignore it and start the session fresh, and their next save overwrites
+> it, so re-run Evaluation and Schema Conversion there. Versions after v0.1.574 keep a
+> session whose only difference is fields they do not know, and restore it without them.
+
 ### Enable AI-assisted conversion (optional)
 
 AI assist is opt-in and grants `bedrock:InvokeModel` and

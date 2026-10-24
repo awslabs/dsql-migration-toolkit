@@ -180,13 +180,14 @@ def test_sqlite_store_loads_a_snapshot_naming_the_retired_migration_plan_step(
 
 
 def test_sqlite_store_degrades_on_an_unreadable_snapshot(tmp_path) -> None:  # noqa: ANN001
-    # A payload that cannot validate (e.g. written by a newer build naming a field
-    # this one does not know, since the model is extra="forbid") must be IGNORED, not
-    # raise: the exception used to propagate out of build_page and break the page.
+    # A payload that cannot validate (e.g. a field holding a value this build cannot
+    # read) must be IGNORED, not raise: the exception used to propagate out of
+    # build_page and break the page. (One whose only problem is fields this build does
+    # not know is restored without them: test_g178_session_rollback.)
     store = SqliteSessionStateStore(str(tmp_path / "sessions.sqlite"))
     store._conn.execute(  # noqa: SLF001
         "INSERT INTO sessions (session_id, payload, updated_at) VALUES (?, ?, ?)",
-        ("bad", '{"session_id": "bad", "a_field_from_the_future": 1}', "2026-07-01Z"),
+        ("bad", '{"session_id": "bad", "preserve_foreign_keys": "maybe"}', "2026-07-01Z"),
     )
     store._conn.commit()  # noqa: SLF001
     assert store.load("bad") is None  # degraded, no exception

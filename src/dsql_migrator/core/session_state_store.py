@@ -31,7 +31,7 @@ from typing import Optional, Protocol
 
 _LOGGER = logging.getLogger(__name__)
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from dsql_migrator.core.models import (
     AiConversation,
@@ -375,6 +375,36 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _snapshot_from_payload(payload: str, session_id: str) -> SessionSnapshot:
+    """Validate a persisted snapshot, keeping it when its only problem is fields this build
+    does not know -- saved by a later version (an image rolled back), or one since removed.
+
+    The models are ``extra="forbid"``, so such a payload used to be discarded whole: a
+    rollback started every session fresh and its next save overwrote the snapshot, losing
+    the Evaluation result, the edited target DDL and the job, CDC and validation linkage.
+    It is restored without those fields instead (their names are logged, never their
+    values). Any other error is raised, and the caller ignores the snapshot as before.
+    """
+    try:
+        return SessionSnapshot.model_validate_json(payload)
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_url=False)
+        if any(error["type"] != "extra_forbidden" for error in errors):
+            raise
+    snapshot = SessionSnapshot.model_validate_json(payload, extra="ignore")
+    unknown = {
+        ".".join(str(part) for part in error["loc"] if not isinstance(part, int))
+        for error in errors
+    }
+    _LOGGER.warning(
+        "Session %s was saved by another version of the tool; restored it without the "
+        "fields this version does not know: %s",
+        session_id,
+        ", ".join(sorted(unknown)),
+    )
+    return snapshot
+
+
 class InMemorySessionStateStore:
     """A non-durable :class:`SessionStateStore` for tests (no disk)."""
 
@@ -436,12 +466,12 @@ class SqliteSessionStateStore:
     def load(self, session_id: str) -> Optional[SessionSnapshot]:
         """Return the persisted snapshot, or ``None`` when absent/unreadable.
 
-        A snapshot that no longer validates must DEGRADE, not crash. ``SessionSnapshot``
-        (and ``WorkflowState``) are ``extra="forbid"``, so a payload written by a newer
-        build -- or one naming a field that has since been removed -- raises here; with
-        the exception propagating, the whole page build failed and the user was locked
-        out of the tool rather than merely losing the restored progress. Mirrors the S3
-        store, which already warns and returns ``None``.
+        A snapshot that no longer validates must DEGRADE, not crash: with the exception
+        propagating, the whole page build failed and the user was locked out of the tool
+        rather than merely losing the restored progress. Mirrors the S3 store, which
+        already warns and returns ``None``. A payload whose only problem is fields this
+        build does not know (written by a newer build, or naming a field since removed)
+        is restored without them (:func:`_snapshot_from_payload`).
         """
         with self._lock:
             row = self._conn.execute(
@@ -450,7 +480,7 @@ class SqliteSessionStateStore:
         if not row:
             return None
         try:
-            return SessionSnapshot.model_validate_json(row[0])
+            return _snapshot_from_payload(row[0], session_id)
         except Exception:  # noqa: BLE001 - unreadable snapshot: start fresh, don't crash
             _LOGGER.warning(
                 "Could not parse persisted session %s; ignoring it", session_id,
@@ -696,7 +726,7 @@ class S3SessionStateStore:
                 )
             return None
         try:
-            return SessionSnapshot.model_validate_json(payload)
+            return _snapshot_from_payload(payload, session_id)
         except Exception:  # noqa: BLE001 - corrupt / incompatible snapshot
             _LOGGER.warning("Ignoring unreadable session snapshot %s", session_id)
             return None

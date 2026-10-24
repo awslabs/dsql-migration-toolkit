@@ -351,7 +351,9 @@ class IndexDef(BaseModel):
             "a plain UNIQUE accepts any number of them. Emitted as ``CREATE UNIQUE INDEX "
             "ASYNC ... NULLS NOT DISTINCT``, which Aurora DSQL accepts. Left out of the "
             "payload while False (IndexDef is extra='forbid'), so an inventory with no such "
-            "index still loads on an older build, and one from an older build loads here."
+            "index still loads on an older build, and one from an older build loads here. "
+            "One with such an index does not load on v0.1.574 or earlier (see "
+            "SourceInventory.server_settings)."
         ),
     )
 
@@ -386,7 +388,8 @@ class ForeignKeyDef(BaseModel):
     # and MySQL has no NOT ENFORCED, so a MySQL key keeps every default. Each is left out of
     # the payload while it has its default (this model is extra="forbid"), so an inventory
     # or saved session without such a key still loads on an older build, and one from an
-    # older build loads here.
+    # older build loads here. One with such a key does not load on v0.1.574 or earlier
+    # (see SourceInventory.server_settings).
     deferrable: bool = Field(
         default=False,
         exclude_if=lambda v: not v,
@@ -584,7 +587,8 @@ class TableDef(BaseModel):
     )
     # PostgreSQL rules Aurora DSQL cannot enforce (G151). Left out of the payload while
     # empty, like SourceInventory.server_settings: this model is extra="forbid", so an
-    # inventory or saved session that never read them still loads on an older build.
+    # inventory or saved session that never read them still loads on an older build. One
+    # that holds any does not load on v0.1.574 or earlier (see server_settings there).
     exclusion_constraints: list[ExclusionConstraintDef] = Field(
         default_factory=list,
         exclude_if=lambda v: not v,
@@ -726,6 +730,10 @@ class SourceInventory(BaseModel):
     # only, never a credential. Left OUT of the payload while empty, like the job state's
     # optional fields: this model is extra="forbid", so an inventory or saved session that
     # never read them still loads on an older build, and one from an older build loads here.
+    # One that holds any (a MySQL inventory Evaluation read does) does not: v0.1.574 and
+    # earlier ignore such a saved session and start it fresh, and their next save
+    # overwrites it. Later builds restore it without the fields they do not know
+    # (session_state_store._snapshot_from_payload).
     server_settings: dict[str, str] = Field(
         default_factory=dict, exclude_if=lambda v: not v
     )

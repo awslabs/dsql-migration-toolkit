@@ -709,6 +709,13 @@ aws cloudformation deploy \
 > 읽습니다. CDC 단계가 이미 시작한 CloudFormation 작업은 AWS에서 계속 진행되고, 재연결하면 CDC 단계가
 > 스택을 다시 읽습니다. **업데이트 전에 진행 중 작업을 끝내거나 정지하세요.**
 
+> [!IMPORTANT]
+> **이전 이미지로 롤백하면 저장된 세션을 잃을 수 있습니다.** 더 새로운 버전은 v0.1.574 이하 버전이
+> 모르는 것을 기록합니다 — 예컨대 MySQL Evaluation은 소스의 서버 설정을 기록합니다. 그런 것이
+> 하나라도 든 세션은 그 버전들이 읽지 못해 무시하고 새로 시작하며, 다음 저장이 그것을 덮어쓰므로
+> 거기서 Evaluation과 Schema Conversion을 다시 실행하세요. v0.1.574보다 새로운 버전은 모르는 필드만
+> 다른 세션을 버리지 않고, 그 필드를 뺀 채 복원합니다.
+
 ### AI 보조 변환 활성화 (Optional)
 
 AI 보조는 opt-in이며 `bedrock:InvokeModel`과 `bedrock:InvokeModelWithResponseStream`을 **`anthropic.` 공급자로
