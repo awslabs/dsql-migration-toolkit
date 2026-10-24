@@ -624,6 +624,8 @@ def test_default_rules_source_type_seam() -> None:
         # (G152): MySQL has neither.
         "PG_DEFERRABLE_KEY",
         "PG_FK_NOT_ENFORCED",
+        # PostgreSQL 18 PERIOD foreign keys (G163): MySQL has none.
+        "PG_FK_PERIOD",
     }
     pg_ids = {r.rule_id for r in default_rules(SourceType.POSTGRES)}
     mysql_ids = {r.rule_id for r in default_rules(SourceType.MYSQL)}

@@ -266,6 +266,17 @@ _PG_CORPUS = [
                           referenced_columns=["id"], enforced=False)
         ],
     ),
+    # G163: a PostgreSQL 18 PERIOD foreign key, not created (a loss: the source enforces it).
+    _t(
+        "period_fk",
+        [ColumnDef(name="pid", mysql_type="bigint"),
+         ColumnDef(name="during", mysql_type="tstzrange")],
+        foreign_keys=[
+            ForeignKeyDef(name="period_fk_pid", columns=["pid", "during"],
+                          referenced_table="app.temporal_pk", referenced_columns=["k", "n"],
+                          period=True)
+        ],
+    ),
 ]
 
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
@@ -356,3 +367,4 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
     # Advice only: the table converts automatically.
     assert pg["app.not_enforced_fk"] == "PG_FK_NOT_ENFORCED"
     assert concerns["app.not_enforced_fk"] == {"PG_FK_NOT_ENFORCED"}
+    assert "PG_FK_PERIOD" in concerns["app.period_fk"]  # the range column leads (re-typed)

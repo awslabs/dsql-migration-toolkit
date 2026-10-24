@@ -548,6 +548,29 @@ def _default_to_str(default: object) -> Optional[str]:
     return str(default)
 
 
+def _reflected_foreign_keys(
+    inspector: object, table_name: str, schema: Optional[str], is_postgres: bool
+) -> "list[dict]":
+    """``Inspector.get_foreign_keys`` for one table -- or, for a PostgreSQL table whose keys
+    SQLAlchemy cannot parse, the same keys read from the catalog (G163, K16).
+
+    SQLAlchemy 2.0's PostgreSQL dialect parses every key of the table out of
+    ``pg_get_constraintdef`` with a regular expression that cannot read a PostgreSQL 18
+    ``FOREIGN KEY (a, PERIOD p) REFERENCES t (id, PERIOD v)``; ``re.search`` returns None and
+    ``.groups()`` raises AttributeError, which failed the whole Evaluation of such a database
+    (no other table could be read either). A catalog error is not caught: only the parse."""
+    try:
+        return inspector.get_foreign_keys(table_name, schema=schema)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        if not is_postgres or schema is None:
+            raise
+        from dsql_migrator.core.source_dialect.postgres import pg_foreign_keys_from_catalog
+
+        return pg_foreign_keys_from_catalog(
+            inspector.bind, schema, table_name  # type: ignore[attr-defined]
+        )
+
+
 def _reflect_tables(
     inspector: object,
     schema: Optional[str] = None,
@@ -648,7 +671,7 @@ def _reflect_tables(
                 )
 
         foreign_keys: list[ForeignKeyDef] = []
-        for fk in inspector.get_foreign_keys(table_name, schema=schema):  # type: ignore[attr-defined]
+        for fk in _reflected_foreign_keys(inspector, table_name, schema, is_postgres):
             constrained = list(fk.get("constrained_columns") or [])
             referred_table = fk.get("referred_table")
             referred_columns = list(fk.get("referred_columns") or [])
@@ -695,6 +718,9 @@ def _reflect_tables(
                     deferrable=timing.get("deferrable") is True,
                     initially_deferred=str(timing.get("initially") or "").upper() == "DEFERRED",
                     match_full=str(timing.get("match") or "").upper() == "FULL",
+                    # A PostgreSQL 18 FOREIGN KEY ... PERIOD, read from the catalog when
+                    # SQLAlchemy cannot parse it (G163).
+                    period=bool(fk.get("period")) if is_postgres else False,
                 )
             )
 

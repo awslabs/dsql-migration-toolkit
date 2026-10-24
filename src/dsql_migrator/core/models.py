@@ -412,6 +412,23 @@ class ForeignKeyDef(BaseModel):
             "Aurora DSQL, which has no NOT ENFORCED and would enforce it."
         ),
     )
+    period: bool = Field(
+        default=False,
+        exclude_if=lambda v: not v,
+        description=(
+            "True for a PostgreSQL 18 FOREIGN KEY (..., PERIOD p) REFERENCES t (..., PERIOD "
+            "v) (``pg_constraint.conperiod``; G163): each child's period must be covered by "
+            "parent periods of the same key. ``columns`` / ``referenced_columns`` end with "
+            "the period columns. Not created on Aurora DSQL, which has no PERIOD: a plain key "
+            "on the same columns would demand an equal period instead."
+        ),
+    )
+
+    @property
+    def created_on_target(self) -> bool:
+        """True for a key Schema Conversion re-creates on Aurora DSQL: every one but a
+        PostgreSQL 18 NOT ENFORCED key (G152) and a PERIOD key (G163)."""
+        return self.enforced and not self.period
 
     @property
     def is_deferrable(self) -> bool:

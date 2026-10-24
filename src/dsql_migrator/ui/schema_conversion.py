@@ -820,10 +820,12 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
     for key in defined_unique.values():
         clauses.append(f"  CONSTRAINT {_quote_pg_ident(key.name)} {key.definition}")
     for foreign_key in table.foreign_keys:
-        columns = ", ".join(_quote_pg_ident(name) for name in foreign_key.columns)
-        ref_columns = ", ".join(
-            _quote_pg_ident(name) for name in foreign_key.referenced_columns
-        )
+        names = [_quote_pg_ident(name) for name in foreign_key.columns]
+        ref_names = [_quote_pg_ident(name) for name in foreign_key.referenced_columns]
+        if foreign_key.period and names and ref_names:
+            # A PostgreSQL 18 PERIOD key (G163): its last columns are the periods.
+            names[-1], ref_names[-1] = f"PERIOD {names[-1]}", f"PERIOD {ref_names[-1]}"
+        columns, ref_columns = ", ".join(names), ", ".join(ref_names)
         clauses.append(
             f"  CONSTRAINT {_quote_pg_ident(foreign_key.name)} FOREIGN KEY ({columns}) "
             f"REFERENCES {_quote_pg_table(foreign_key.referenced_table)} ({ref_columns})"

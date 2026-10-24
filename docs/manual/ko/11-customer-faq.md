@@ -363,7 +363,10 @@ DSQL에 대응이 없는 PostgreSQL 타입은 값을 보존하는 대체 타입�
   `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY … NOT VALID` 문으로 렌더링(`CREATE TABLE` 밖)해 데이터
   적재가 끝난 뒤 **Apply foreign keys** 동작으로 DSQL에 바로 다시 생성하고 이미 적재된 행은 Aurora DSQL이
   백그라운드에서 검증하며, CDC 마이그레이션에서는 **cut over 시점**에 적용합니다(순서가 뒤섞인 CDC 스트림
-  중에는 FK가 있으면 위반이 dead-letter로 빠지기 때문, SQLSTATE 23503). 원하면 FK를 떼어 내고
+  중에는 FK가 있으면 위반이 dead-letter로 빠지기 때문, SQLSTATE 23503). PostgreSQL 18의 두 가지는 생성하지
+  않습니다: 소스는 검사하지 않지만 Aurora DSQL이라면 검사할 `NOT ENFORCED` 키(`PG_FK_NOT_ENFORCED`)와,
+  Aurora DSQL에 해당하는 형태가 없는 `FOREIGN KEY … PERIOD`(`PG_FK_PERIOD`: 애플리케이션에서 강제하세요).
+  PostgreSQL 키의 `MATCH FULL`과 `DEFERRABLE` / `INITIALLY DEFERRED`는 유지됩니다. 원하면 FK를 떼어 내고
   (`preserve_foreign_keys=False`) 참조 무결성을 애플리케이션에서 강제할 수도 있습니다. 런타임 주의점:
   참조/피참조 테이블 DML의 추가 읽기 비용, 충돌 시 재시도 가능한 `40001`, 그리고
   `CASCADE`/`SET NULL`/`SET DEFAULT`는 트랜잭션당 3,000행 한도에 포함됩니다(무제한 캐스케이드는

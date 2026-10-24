@@ -130,8 +130,8 @@ evidence supports it:
 Aurora DSQL **enforces** foreign keys, and the tool re-creates them after the load
 (at cut over for a CDC migration): each is added `NOT VALID` at once, and Aurora DSQL
 then validates the rows already loaded — a check that orphan rows fail. An optional
-**orphan check** counts target child rows whose (non-null) foreign key has no matching
-parent: it is the **early warning** for that step — run it in a rehearsal, before you
+**orphan check** counts target child rows whose (non-null; for a `MATCH FULL` key, not
+all-NULL) foreign key has no matching parent: it is the **early warning** for that step — run it in a rehearsal, before you
 freeze writes, to find the rows a validation would fail on — and it is the
 referential-integrity safety net when you chose to **strip** the foreign keys instead. A foreign key whose parent table is not on Aurora
 DSQL cannot be counted: the report lists it as **not checked**, which changes no

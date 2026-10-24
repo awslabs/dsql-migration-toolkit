@@ -376,7 +376,11 @@ each source FK and re-creates it on DSQL as a post-load `ALTER TABLE … ADD
 CONSTRAINT … FOREIGN KEY … NOT VALID` — added at once, then validated by Aurora DSQL
 against the rows already loaded, in the background (the **Apply foreign keys** action
 after a Full Load; for a **CDC** migration it is deferred to **cut over**, since the
-constraints must not exist while the sink streams rows out of order). You can instead **opt to strip** them and
+constraints must not exist while the sink streams rows out of order). Two PostgreSQL 18 kinds
+are not created: a key declared `NOT ENFORCED`, which the source never checks and Aurora DSQL
+would (`PG_FK_NOT_ENFORCED`), and a `FOREIGN KEY … PERIOD`, which Aurora DSQL has no form of
+(`PG_FK_PERIOD`: enforce it in the application). A PostgreSQL key keeps its `MATCH FULL` and
+`DEFERRABLE` / `INITIALLY DEFERRED`. You can instead **opt to strip** them and
 enforce referential integrity in the application layer. Runtime caveats to weigh:
 DML on related tables incurs **extra reads**, a concurrent conflict is a retryable
 `40001`, and a `CASCADE`/`SET NULL`/`SET DEFAULT` action counts toward DSQL's

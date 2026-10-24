@@ -673,6 +673,103 @@ def _pg_correct_fk_schemas(connection: object, nsp: str, tables: list) -> None:
                 fk.referenced_table = resolved
 
 
+# One table's foreign keys straight from pg_constraint, in the shape SQLAlchemy's
+# ``Inspector.get_foreign_keys`` returns (K16). SQLAlchemy 2.0's PostgreSQL dialect reads
+# every key of a table at once and parses each one out of ``pg_get_constraintdef`` with a
+# regular expression that cannot read a PostgreSQL 18 ``FOREIGN KEY (a, PERIOD p) REFERENCES
+# t (id, PERIOD v)``: the match is None and ``.groups()`` raises AttributeError, which failed
+# the whole Evaluation (verified on 18.6). The columns come from ``conkey`` / ``confkey`` in
+# key order, the referenced schema from the catalog (so search_path never hides it), the
+# actions, MATCH and DEFERRABLE / INITIALLY from their codes -- a PostgreSQL 15+ ``SET NULL
+# (col, ...)`` keeps its column list as ``pg_get_constraintdef`` prints it, as SQLAlchemy
+# keeps it. ``conperiod`` exists only from PostgreSQL 18 and naming it on 13-17 fails the
+# statement, so it is named only for a server reported as 18 or later. Catalog-only, one
+# table: run only when reflection failed for that table. Verified on 13.23, 17.11 and 18.6.
+_PG_FOREIGN_KEYS_SQL = (
+    "SELECT con.conname AS conname, "
+    "ARRAY(SELECT a.attname::text FROM unnest(con.conkey) WITH ORDINALITY AS k(num, ord) "
+    "      JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num "
+    "      ORDER BY k.ord) AS columns, "
+    "rn.nspname AS ref_schema, rc.relname AS ref_table, "
+    "ARRAY(SELECT a.attname::text FROM unnest(con.confkey) WITH ORDINALITY AS k(num, ord) "
+    "      JOIN pg_catalog.pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.num "
+    "      ORDER BY k.ord) AS ref_columns, "
+    "con.confupdtype AS on_update, con.confdeltype AS on_delete, "
+    "con.confmatchtype AS match_type, con.condeferrable AS deferrable, "
+    "con.condeferred AS deferred, "
+    "pg_catalog.pg_get_constraintdef(con.oid, true) AS definition, "
+    "d.description AS comment{period} "
+    "FROM pg_catalog.pg_constraint con "
+    "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid "
+    "JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace "
+    "LEFT JOIN pg_catalog.pg_description d ON d.objoid = con.oid "
+    "WHERE con.contype = 'f' AND n.nspname = :nsp AND c.relname = :rel "
+    "ORDER BY con.conname"
+)
+_PG_FK_ACTIONS = {"r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
+
+
+def pg_foreign_keys_sql(server_version: "Optional[Sequence[int]]") -> str:
+    """The statement :func:`pg_foreign_keys_from_catalog` runs for a server of
+    ``server_version`` (``None`` when unknown, read as earlier than 18). Pure."""
+    period = (
+        ", con.conperiod AS period"
+        if server_version and tuple(server_version) >= (18,)
+        else ""
+    )
+    return _PG_FOREIGN_KEYS_SQL.format(period=period)
+
+
+def _pg_fk_action(code: object, keyword: str, definition: str) -> "Optional[str]":
+    """SQLAlchemy's spelling of one referential action: ``None`` for NO ACTION, and a ``SET
+    NULL`` / ``SET DEFAULT`` with its column list as the definition prints it."""
+    action = _PG_FK_ACTIONS.get(str(code or ""))
+    if action and action.startswith("SET "):
+        listed = re.search(rf"ON {keyword} ({action} \([^)]*\))", definition)
+        if listed:
+            return listed.group(1)
+    return action
+
+
+def pg_foreign_keys_from_catalog(connection: object, schema: str, table: str) -> "list[dict]":
+    """``table``'s foreign keys read from pg_constraint, as SQLAlchemy reflects them, plus
+    ``period`` -- True for a PostgreSQL 18 FOREIGN KEY ... PERIOD (see
+    ``_PG_FOREIGN_KEYS_SQL``). For a table SQLAlchemy's reflection cannot read."""
+    version = getattr(getattr(connection, "dialect", None), "server_version_info", None)
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(pg_foreign_keys_sql(version)), {"nsp": schema, "rel": table}
+    ).mappings()
+    keys: list[dict] = []
+    for row in rows:
+        definition = str(row.get("definition") or "")
+        options = {
+            name: value
+            for name, value in (
+                ("onupdate", _pg_fk_action(row.get("on_update"), "UPDATE", definition)),
+                ("ondelete", _pg_fk_action(row.get("on_delete"), "DELETE", definition)),
+                ("initially", "DEFERRED" if row.get("deferred") else None),
+                ("deferrable", True if row.get("deferrable") else None),
+                ("match", "FULL" if str(row.get("match_type") or "") == "f" else None),
+            )
+            if value is not None
+        }
+        keys.append(
+            {
+                "name": row.get("conname"),
+                "constrained_columns": list(row.get("columns") or ()),
+                "referred_schema": row.get("ref_schema"),
+                "referred_table": row.get("ref_table"),
+                "referred_columns": list(row.get("ref_columns") or ()),
+                "options": options,
+                "comment": row.get("comment"),
+                "period": bool(row.get("period")),
+            }
+        )
+    return keys
+
+
 # The EXCLUDE constraints of the tables read and, on PostgreSQL 18+, their PRIMARY KEY /
 # UNIQUE keys declared WITHOUT OVERLAPS (G151): ONE catalog round trip per schema
 # (pg_constraint / pg_class / pg_namespace), no table scanned. ``pg_get_constraintdef`` gives

@@ -658,7 +658,8 @@ def build_ai_tool_executor(
                           **({"deferrable": True} if f.is_deferrable else {}),
                           **({"initially_deferred": True} if f.initially_deferred else {}),
                           **({"match_full": True} if f.match_full else {}),
-                          **({"enforced": False} if not f.enforced else {})}
+                          **({"enforced": False} if not f.enforced else {}),
+                          **({"period": True} if f.period else {})}
                          for f in _t.foreign_keys
                      ],
                      "check_constraints": [

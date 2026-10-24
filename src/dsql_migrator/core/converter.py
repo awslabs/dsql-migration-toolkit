@@ -3977,7 +3977,8 @@ def _build_foreign_key_ddls(table: TableDef, *, preserve: bool = True) -> list[s
     table_identifier = _quote_pg_qualified(table.name)
     statements: list[str] = []
     for fk in table.foreign_keys:
-        if not fk.enforced:
+        # A NOT ENFORCED key (G152) and a PERIOD key (G163) are not created.
+        if not fk.created_on_target:
             continue
         columns = ", ".join(_quote_pg_identifier(column) for column in fk.columns)
         ref_columns = ", ".join(
@@ -4672,7 +4673,7 @@ def _foreign_key_warning(
     (:func:`_pg_not_enforced_foreign_key_warning`). A preserved key's DEFERRABLE /
     INITIALLY DEFERRED and MATCH FULL are kept, which the note names (G152).
     """
-    enforced = [fk for fk in table.foreign_keys if fk.enforced]
+    enforced = [fk for fk in table.foreign_keys if fk.created_on_target]
     if not enforced:
         return None
     names = ", ".join(fk.name for fk in enforced)
@@ -6949,6 +6950,49 @@ def _pg_not_enforced_foreign_key_warning(table: TableDef) -> Optional[Conversion
     )
 
 
+def _pg_period_listing(fk: ForeignKeyDef) -> str:
+    """``name: (a, PERIOD p) REFERENCES t (id, PERIOD v)`` -- how PostgreSQL spells it."""
+    def _cols(columns: "list[str]") -> str:
+        names = list(columns)
+        if names:
+            names[-1] = f"PERIOD {names[-1]}"
+        return ", ".join(names)
+
+    return (
+        f"{fk.name}: ({_cols(fk.columns)}) REFERENCES {fk.referenced_table} "
+        f"({_cols(fk.referenced_columns)})"
+    )
+
+
+def _pg_period_foreign_key_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL 18 foreign keys declared with PERIOD (G163, K16), which are not created.
+
+    Such a key requires each child row's period to be covered by the referenced key's
+    periods, together. Aurora DSQL has no PERIOD, and a plain key over the same columns would
+    check equality instead -- refusing child rows the source accepts, whose period one parent
+    period does not equal -- so the key is not created, and the rule is not checked after
+    cut over: a loss of a rule the source enforces, unlike NOT ENFORCED. Validation's orphan
+    check leaves it out too (``validator._check_orphans``)."""
+    keys = [fk for fk in table.foreign_keys if fk.period]
+    if not keys:
+        return None
+    listed = "; ".join(_pg_period_listing(fk) for fk in keys)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"PERIOD foreign key(s) are NOT created — {listed}. Such a key requires each "
+            "child row's period to be covered by the referenced key's periods, and Aurora "
+            "DSQL has no PERIOD: a plain foreign key on the same columns would demand an "
+            "equal period instead, refusing rows the source accepts. After cut over the "
+            "target does not check the rule, and Validation's orphan check leaves these keys "
+            "out. Enforce it in the application, with concurrent writers made to conflict on "
+            "a row they both update, or change the design."
+        ),
+    )
+
+
 # The one fix for column names that truncate to the same 63 bytes, shown by both steps.
 IDENTIFIER_COLLISION_REMEDY = (
     "Shorten the colliding column names on the source so they differ within their first "
@@ -7721,6 +7765,8 @@ class SchemaConverter:
             # foreign keys (not created), G152.
             (_pg_deferrable_key_warning(table) if is_postgres else None),
             (_pg_not_enforced_foreign_key_warning(table) if is_postgres else None),
+            # ... and PostgreSQL 18 PERIOD foreign keys (not created), G163.
+            (_pg_period_foreign_key_warning(table) if is_postgres else None),
             _identifier_length_warning(
                 table,
                 generated_index_names=generated_index_names,

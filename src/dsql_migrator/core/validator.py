@@ -3055,8 +3055,9 @@ class Validator:
         findings: list[OrphanFinding] = []
         unchecked: list[UncheckedForeignKey] = []
         # A PostgreSQL 18 NOT ENFORCED key is not created on Aurora DSQL (G152): the source
-        # never checked it, so a row it would refuse is no divergence.
-        foreign_keys = [fk for fk in table.foreign_keys if fk.enforced]
+        # never checked it, so a row it would refuse is no divergence. Nor is a PERIOD key
+        # (G163): its rule is range containment, which an equality count misreads.
+        foreign_keys = [fk for fk in table.foreign_keys if fk.created_on_target]
         if not foreign_keys:
             return findings, unchecked, item
         page = self._page_or_stop(should_cancel)

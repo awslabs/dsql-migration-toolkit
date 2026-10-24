@@ -51,6 +51,8 @@ _EXPECTED_PG_RULE_IDS = {
     # target) and PostgreSQL 18 NOT ENFORCED foreign keys (not created).
     "PG_DEFERRABLE_KEY",
     "PG_FK_NOT_ENFORCED",
+    # PostgreSQL 18 PERIOD foreign keys (not created; G163).
+    "PG_FK_PERIOD",
     "TRIGGER_UNSUPPORTED",
     "PROC_PLPGSQL",
     "EVENT_UNSUPPORTED",

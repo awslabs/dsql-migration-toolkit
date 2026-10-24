@@ -530,7 +530,7 @@ class ForeignKeyRule(Rule):
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
         findings: list[Finding] = []
         for table in inventory.tables:
-            enforced = [fk for fk in table.foreign_keys if fk.enforced]
+            enforced = [fk for fk in table.foreign_keys if fk.created_on_target]
             if enforced:
                 names = ", ".join(fk.name for fk in enforced)
                 findings.append(
@@ -1995,6 +1995,21 @@ def pg_not_enforced_foreign_key_rule() -> ConversionWarningRule:
         "... NOT VALID to the table's target script in Schema Conversion: it is then added "
         "and validated with the other foreign keys, and its rows must satisfy it.",
         EffortLevel.SIMPLE,
+    )
+
+
+def pg_period_foreign_key_rule() -> ConversionWarningRule:
+    """PostgreSQL 18 foreign keys declared with PERIOD, which Schema Conversion does not
+    create, so their rule is not enforced after cut over (PG_FK_PERIOD, G163)."""
+    return ConversionWarningRule(
+        "PG_FK_PERIOD",
+        "_pg_period_foreign_key_warning",
+        "Before cut over, enforce the rule in the application -- the transaction that writes "
+        "a child row checks that the referenced key's periods cover its period, one that "
+        "shortens or deletes a parent period checks the child rows, and concurrent writers "
+        "of the same key also update one shared row, so Aurora DSQL's optimistic "
+        "concurrency fails one of them (40001) -- or change the design.",
+        EffortLevel.MEDIUM,
     )
 
 

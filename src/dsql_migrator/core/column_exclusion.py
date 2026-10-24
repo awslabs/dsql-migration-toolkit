@@ -352,11 +352,12 @@ def build_exclusion_context(
             # What the FK pass will actually ADD (empty when foreign keys are stripped).
             fks = _applied_foreign_keys(child, conversion, tables)
         elif preserve_foreign_keys:
-            # The keys the conversion would render: never a NOT ENFORCED one (G152).
+            # The keys the conversion would render: never a NOT ENFORCED (G152) or PERIOD
+            # (G163) one.
             fks = [
                 (fk.name, fk.referenced_table, list(fk.referenced_columns), list(fk.columns))
                 for fk in getattr(child, "foreign_keys", None) or ()
-                if getattr(fk, "enforced", True)
+                if getattr(fk, "created_on_target", True)
             ]
         else:
             fks = []
