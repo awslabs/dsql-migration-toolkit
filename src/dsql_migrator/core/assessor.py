@@ -3498,9 +3498,11 @@ def check_mysql_zero_dates(
         ),
         "Before cut over, change the application SQL that writes or compares with such a "
         "date: Aurora DSQL rejects one in an INSERT, an UPDATE or a WHERE (SQLSTATE 22008), "
-        "and the rows a comparison with it found (deleted_at = '0000-00-00 00:00:00') now "
-        "hold NULL, the column's DEFAULT or 1970-01-01, as above -- compare with IS NULL or "
-        "that value instead.",
+        "and the rows a comparison with it found (deleted_at = '0000-00-00 00:00:00', or "
+        "deleted_at = 0: MySQL reads the number 0 compared with a date as the zero date, and "
+        "Aurora DSQL compares no date with a number, SQLSTATE 42883) now hold NULL, the "
+        "column's DEFAULT or 1970-01-01, as above -- compare with IS NULL or that value "
+        "instead.",
     ]
     if reasons:
         advice.append(

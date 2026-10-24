@@ -556,10 +556,13 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
     インデックスの作成が失敗し、CDC は衝突する行をデッドレターにします(`23505`)。先にソースでそうした値を修正して
     ください。
   - **アプリケーションの SQL。** Aurora DSQL は `INSERT`、`UPDATE`、`WHERE` のそうした日付を拒否し(`22008`)、
-    そうした日付との比較が見つけていた行 — 論理削除の慣用句 `deleted_at = '0000-00-00 00:00:00'` — は、上記の
-    とおり今は NULL、列の `DEFAULT` または `1970-01-01` を持ちます。カットオーバーの前に、そうした日付を書き込む
-    コードを変更し、代わりに `IS NULL` やその値と比較してください。そうした日付と比較するビューは Schema
-    Conversion が報告します(その `CREATE VIEW` は失敗します)。
+    そうした日付との比較が見つけていた行 — 論理削除の慣用句 `deleted_at = '0000-00-00 00:00:00'`、または
+    `deleted_at = 0`(MySQL は日付と比較される数値 0 をゼロ日付として読みます。Aurora DSQL は日付を数値と比較
+    しません、`42883`) — は、上記のとおり今は NULL、列の `DEFAULT` または `1970-01-01` を持ちます。
+    カットオーバーの前に、そうした日付を書き込むコードを変更し、代わりに `IS NULL` やその値と比較してください。
+    そうした日付と比較するビューは、`NULLIF`、`GREATEST` / `LEAST`、`CASE` や `DATE '…'` リテラルを通した
+    比較も Schema Conversion が報告し(その `CREATE VIEW` は失敗します)、そうした文は Query Converter が
+    報告します。
 - **PostgreSQL: CDC はほとんどの拡張機能の型を運びません。** 同梱の CDC コネクタ(Debezium)は、
   拡張機能(extension)が定義する型を名前だけで識別し、知っているのは 6 つです: `citext`、`hstore`、`ltree`、
   `isbn`、PostGIS の `geometry` と `geography`(およびそれらの配列)。それ以外の拡張機能の型の列は、Aurora DSQL

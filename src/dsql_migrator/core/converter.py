@@ -11731,14 +11731,55 @@ def _rewrite_mysql_calls(
         known_kinds[id(node)] = (node, kind_of(node))  # read again by the choice it nests in
     known_kinds.clear()
 
+    def compared_as_date(held: exp.Expression, parent: Optional[exp.Expression]) -> bool:
+        """:func:`compared_with_date`, and also a simple CASE's WHEN value (compared with the
+        CASE operand) and an argument of NULLIF, GREATEST or LEAST beside a date."""
+        if compared_with_date(held, parent):
+            return True
+        case = parent.parent if isinstance(parent, exp.If) else None
+        if isinstance(case, exp.Case) and parent.this is held and any(
+            parent is branch for branch in case.args.get("ifs") or ()
+        ):
+            others = [case.this]  # None for a searched CASE
+        elif isinstance(parent, exp.Nullif):
+            others = [parent.expression if parent.this is held else parent.this]
+        elif isinstance(parent, (exp.Greatest, exp.Least)):
+            others = [o for o in (parent.this, *parent.expressions) if o is not held]
+        else:
+            return False
+        return any(
+            kind_of(o) in ("date", "datetime", "timestamp") and not (isinstance(o, exp.Literal) and o.is_string)
+            for o in others if o is not None
+        )
+
     # A date MySQL stores and Aurora DSQL has no value for -- the zero date, a zero month or
     # day, a day the month does not have -- compared with a date (the soft-delete idiom
-    # deleted_at = '0000-00-00 00:00:00', G156): Aurora DSQL refuses the literal (22008),
+    # deleted_at = '0000-00-00 00:00:00', G156; NULLIF(d, '0000-00-00'), a simple CASE's WHEN
+    # value, GREATEST / LEAST, a DATE '...' or TIMESTAMP '...' literal, the number 0, G180):
+    # Aurora DSQL refuses the literal (22008) -- or a date compared with a number (42883) --
     # and the rows it meant hold what Full Load wrote for such a date.
     for literal in nodes(exp.Literal):
-        if not literal.is_string or dateless_kind(literal.name) is None:
+        if not literal.is_string:
+            # MySQL reads the number 0 compared with a date as the zero date.
+            if re.fullmatch(r"0+", literal.name) and compared_as_date(*standing(literal)):
+                issue(
+                    "A date is compared with 0, MySQL's number for the zero date: Aurora DSQL "
+                    "compares no date with a number (SQLSTATE 42883), and the rows it meant hold "
+                    "what Full Load wrote for a zero date -- NULL, the column's DEFAULT or "
+                    "1970-01-01 (see Limitations, zero and invalid MySQL dates). Compare with IS "
+                    "NULL or that value instead."
+                )
             continue
-        if compared_with_date(*standing(literal)):
+        if dateless_kind(literal.name) is None:
+            continue
+        held, parent = standing(literal)
+        # DATE '...' / TIMESTAMP '...' (or a CAST to one): Aurora DSQL rejects the cast itself.
+        typed = isinstance(parent, (exp.Cast, exp.TryCast)) and _pg_type_kind(
+            parent.args.get("to")
+        ) in ("date", "datetime", "timestamp")
+        if typed:
+            held, parent = standing(parent)
+        if compared_as_date(held, parent):
             issue(
                 f"A date is compared with '{literal.name}', a date MySQL stores and Aurora DSQL "
                 "has no value for (a zero date, a zero month or day, or a day the month does not "
@@ -11746,6 +11787,14 @@ def _rewrite_mysql_calls(
                 "hold what Full Load wrote for such a date -- NULL, the column's DEFAULT or "
                 "1970-01-01 (see Limitations, zero and invalid MySQL dates). Compare with IS NULL "
                 "or that value instead."
+            )
+        elif typed:
+            issue(
+                f"'{literal.name}' is read as a date, one MySQL stores and Aurora DSQL has no "
+                "value for (a zero date, a zero month or day, or a day the month does not have): "
+                "Aurora DSQL rejects it (SQLSTATE 22008), and the rows such a date meant hold "
+                "what Full Load wrote for it -- NULL, the column's DEFAULT or 1970-01-01 (see "
+                "Limitations, zero and invalid MySQL dates). Write NULL or that value instead."
             )
 
     # A UNION column whose branches mix numbers, dates or booleans with strings is MySQL's

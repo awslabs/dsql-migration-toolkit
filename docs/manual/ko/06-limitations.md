@@ -514,10 +514,12 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     쓰일 수 있으므로, 그런 컬럼의 유니크 인덱스는 Aurora DSQL에서 중복을 만날 수 있습니다: 로드 후 인덱스 생성이
     실패하고, CDC는 충돌하는 행을 dead-letter로 보냅니다(`23505`). 먼저 소스에서 그런 값을 고치세요.
   - **애플리케이션의 SQL.** Aurora DSQL은 `INSERT`, `UPDATE`나 `WHERE`에 들어온 그런 날짜를 거부하고
-    (`22008`), 그런 날짜와의 비교가 찾던 행 — soft delete 관용구 `deleted_at = '0000-00-00 00:00:00'` — 은
-    위와 같이 이제 NULL, 컬럼의 `DEFAULT` 또는 `1970-01-01`을 가집니다. 컷오버 전에 그런 날짜를 쓰는 코드를
-    바꾸고, 대신 `IS NULL`이나 그 값과 비교하세요. 그런 날짜와 비교하는 뷰는 Schema Conversion이 보고합니다
-    (그 `CREATE VIEW`는 실패합니다).
+    (`22008`), 그런 날짜와의 비교가 찾던 행 — soft delete 관용구 `deleted_at = '0000-00-00 00:00:00'`, 또는
+    `deleted_at = 0`(MySQL은 날짜와 비교되는 숫자 0을 제로 날짜로 읽습니다. Aurora DSQL은 날짜를 숫자와
+    비교하지 않습니다, `42883`) — 은 위와 같이 이제 NULL, 컬럼의 `DEFAULT` 또는 `1970-01-01`을 가집니다.
+    컷오버 전에 그런 날짜를 쓰는 코드를 바꾸고, 대신 `IS NULL`이나 그 값과 비교하세요. 그런 날짜와 비교하는
+    뷰는 `NULLIF`, `GREATEST` / `LEAST`, `CASE`나 `DATE '…'` 리터럴을 통한 비교도 Schema Conversion이
+    보고하고(그 `CREATE VIEW`는 실패합니다), 그런 문장은 Query Converter가 보고합니다.
 - **PostgreSQL: CDC는 대부분의 확장 타입을 옮기지 못함.** 번들 CDC 커넥터(Debezium)는 확장(extension)이 정의한
   타입을 이름으로만 알아보며, 아는 것은 여섯 가지입니다: `citext`, `hstore`, `ltree`, `isbn`, 그리고 PostGIS
   `geometry`와 `geography`(및 그 배열). 그 밖의 확장 타입 컬럼은 Aurora DSQL에서 어떤 타입이든 모든 변경 이벤트에서

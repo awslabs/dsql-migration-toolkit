@@ -654,10 +654,13 @@ fails **loudly** where it can't.
     the row that collides (`23505`). Correct those values on the source first.
   - **The application's SQL.** Aurora DSQL rejects such a date in an `INSERT`, an
     `UPDATE` or a `WHERE` (`22008`), and the rows a comparison with one found — the
-    soft-delete idiom `deleted_at = '0000-00-00 00:00:00'` — now hold NULL, the column's
-    `DEFAULT` or `1970-01-01`, as above. Before cut over, change the code that writes such
-    dates, and compare with `IS NULL` or that value instead. Schema Conversion reports a view
-    that compares with one (its `CREATE VIEW` would fail).
+    soft-delete idiom `deleted_at = '0000-00-00 00:00:00'`, or `deleted_at = 0`, since MySQL
+    reads the number 0 compared with a date as the zero date (Aurora DSQL compares no date
+    with a number, `42883`) — now hold NULL, the column's `DEFAULT` or `1970-01-01`, as
+    above. Before cut over, change the code that writes such dates, and compare with
+    `IS NULL` or that value instead. Schema Conversion reports a view that compares with
+    one, also through `NULLIF`, `GREATEST` / `LEAST`, a `CASE` or a `DATE '…'` literal (its
+    `CREATE VIEW` would fail), and the Query Converter a statement that does.
 - **PostgreSQL: CDC does not carry most extension types.** The bundled CDC connector
   (Debezium) recognises a type an extension defines by its name alone, and it knows six:
   `citext`, `hstore`, `ltree`, `isbn`, and PostGIS `geometry` and `geography` (and arrays of
