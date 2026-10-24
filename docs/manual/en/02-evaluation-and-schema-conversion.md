@@ -230,14 +230,15 @@ A PostgreSQL foreign key keeps its `MATCH FULL` and its `DEFERRABLE` / `INITIALL
 finding names each key that declares one. A PostgreSQL 18 key declared `NOT ENFORCED` is not
 created: the source never checks it, and Aurora DSQL, which has no `NOT ENFORCED`, would
 refuse writes the source accepts. That is advice too (`PG_FK_NOT_ENFORCED`, `RECOMMENDED`);
-to have Aurora DSQL enforce such a key (not one declared with `PERIOD`, which Aurora DSQL has no
-form of), add its `ALTER TABLE … ADD CONSTRAINT … NOT VALID` to the table's target script. A primary key or `UNIQUE` constraint declared `DEFERRABLE` is a gap
-instead (`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL does not support deferrable unique
-keys, so it is created as an ordinary key, checked immediately (see
+to have Aurora DSQL enforce such a key (not one declared with `PERIOD`, which Aurora DSQL has
+no form of), add its `ALTER TABLE … ADD CONSTRAINT … NOT VALID` to the table's target script.
+A primary key or `UNIQUE` constraint declared `DEFERRABLE` is a gap instead
+(`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL does not support deferrable unique keys, so it
+is created as an ordinary key, checked immediately (see
 [§2.3](#23-mysql--dsql-type-and-constraint-handling-reference)); with CDC, a `DEFERRABLE`
 primary key is also no `REPLICA IDENTITY`, so the CDC prerequisite check fails such a table
-until the source key is re-created `NOT DEFERRABLE` or the table is set
-`REPLICA IDENTITY FULL`. A PostgreSQL 18 key declared with `PERIOD`
+left at `REPLICA IDENTITY DEFAULT` until the source key is re-created `NOT DEFERRABLE` or the
+table is set `REPLICA IDENTITY FULL`. A PostgreSQL 18 key declared with `PERIOD`
 (`FOREIGN KEY (…, PERIOD p) REFERENCES …`) is not created, and that is a gap too
 (`PG_FK_PERIOD`, **MANUAL**): Aurora DSQL has no `PERIOD`, and a plain key on the same
 columns would demand an equal period, so after cut over nothing checks that the parent's
@@ -890,8 +891,9 @@ shared "write contract" keeps them identical).
 > `INITIALLY DEFERRED`, at commit. After cut over a statement or transaction that briefly
 > gives two rows the same key value (swapping two rows' values, renumbering them) can fail:
 > Evaluation and Schema Conversion flag the table **MANUAL** (`PG_DEFERRABLE_KEY`). With CDC,
-> a `DEFERRABLE` primary key is no `REPLICA IDENTITY` either: once the table is in CDC's
-> publication PostgreSQL refuses every `UPDATE` and `DELETE` on it, so the CDC prerequisite
+> a `DEFERRABLE` primary key is no `REPLICA IDENTITY` either: with the table left at
+> `REPLICA IDENTITY DEFAULT`, once it is in CDC's publication PostgreSQL refuses every
+> `UPDATE` and `DELETE` on it, so the CDC prerequisite
 > check fails it (in **Full load + CDC**, before the Full Load) until the key is re-created
 > `NOT DEFERRABLE` or the table is set `REPLICA IDENTITY FULL`. A foreign
 > key keeps its `DEFERRABLE` and `MATCH FULL` (§2.2).

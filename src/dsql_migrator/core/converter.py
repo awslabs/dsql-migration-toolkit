@@ -7016,14 +7016,16 @@ def _pg_deferrable_key_warning(table: TableDef) -> Optional[ConversionWarning]:
     if any(key.primary for key in keys):
         # G168 (K26): PostgreSQL does not use a DEFERRABLE key as a replica identity, so the
         # CDC prerequisite check (REPLICA_IDENTITY) fails such a table -- said here, where
-        # the migration is planned, not first at Step 3.
+        # the migration is planned, not first at Step 3. Only one left at REPLICA IDENTITY
+        # DEFAULT (G190): the inventory does not read the identity, which FULL or USING
+        # INDEX on another unique index already provides.
         message += (
             " With CDC (Full load + CDC or CDC only), a DEFERRABLE primary key is also no "
-            "REPLICA IDENTITY: once the table is in CDC's publication PostgreSQL refuses every "
-            "UPDATE and DELETE on it, so the CDC prerequisite check fails the table (in Full "
-            "load + CDC, before the Full Load) until the source key is re-created NOT "
-            "DEFERRABLE or the table is set REPLICA IDENTITY FULL (not on PostgreSQL 18 with "
-            "generated columns)."
+            "REPLICA IDENTITY: a table left at REPLICA IDENTITY DEFAULT has every UPDATE and "
+            "DELETE refused by PostgreSQL once it is in CDC's publication, so the CDC "
+            "prerequisite check fails the table (in Full load + CDC, before the Full Load) "
+            "until the source key is re-created NOT DEFERRABLE or the table is set REPLICA "
+            "IDENTITY FULL (not on PostgreSQL 18 with generated columns)."
         )
     return ConversionWarning(
         object_name=table.name,

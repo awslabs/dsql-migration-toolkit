@@ -110,8 +110,8 @@ DSQL에 그런 형태가 없는 `PERIOD`로 선언한 키는 제외) 그 키의 
 선언한 기본 키나 `UNIQUE` 제약은 갭입니다(`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL은 지연 가능한
 유니크 키를 지원하지 않으므로, 즉시 검사되는 일반 키로 생성됩니다
 ([§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참고). CDC를 쓰면 `DEFERRABLE` 기본 키는 `REPLICA IDENTITY`도
-되지 못하므로, 소스에서 그 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을 `REPLICA IDENTITY FULL`로 설정할
-때까지 CDC 사전 요구사항 검사가 그런 테이블을 실패로 판정합니다. `PERIOD`로 선언한 PostgreSQL 18 키(`FOREIGN KEY
+되지 못하므로, `REPLICA IDENTITY DEFAULT`인 테이블은 소스에서 그 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을
+`REPLICA IDENTITY FULL`로 설정할 때까지 CDC 사전 요구사항 검사가 실패로 판정합니다. `PERIOD`로 선언한 PostgreSQL 18 키(`FOREIGN KEY
 (…, PERIOD p) REFERENCES …`)는 생성하지 않으며 이것도 갭입니다(`PG_FK_PERIOD`, **MANUAL**): Aurora
 DSQL에는 `PERIOD`가 없고 같은 컬럼의 일반 키는 같은 기간을 요구하므로, 컷오버 후에는 부모의 기간이 각
 자식 행의 기간을 덮는지 아무것도 검사하지 않습니다.
@@ -626,7 +626,7 @@ Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 �
 >
 > **Aurora DSQL이 강제할 수 없는 제약.** PostgreSQL `EXCLUDE` 제약은 생성되지 않으며(Aurora DSQL이 거부함) 소스에서 그것을 강제하던 인덱스도 생성되지 않으므로, 컷오버 후에는 규칙에 어긋나는 행(한 회의실의 겹치는 예약 등)이 받아들여집니다: Evaluation과 Schema Conversion은 각 정의와 함께 테이블을 **MANUAL**로 표시합니다(`PG_EXCLUSION_CONSTRAINT`). `WITHOUT OVERLAPS`로 선언한 PostgreSQL 18의 `PRIMARY KEY`나 `UNIQUE` 키는 같은 컬럼의 일반 키로 생성되는데, 이 키는 모든 키 컬럼이 다른 행과 같은 행만 거부하므로 한 키의 기간이 겹치는 행들은 받아들여집니다(`PG_TEMPORAL_KEY`, **MANUAL**). PostgreSQL 18의 `FOREIGN KEY … PERIOD`는 생성하지 않습니다: Aurora DSQL에는 `PERIOD`가 없고 같은 컬럼의 일반 키는 같은 기간을 요구하므로, 어떤 부모 기간도 덮지 않는 기간의 자식 행이 받아들여집니다(`PG_FK_PERIOD`, **MANUAL**). 이런 규칙은 애플리케이션에서 강제하거나(쓰는 트랜잭션이 충돌하는 행을 확인하고, 같은 범위를 쓰는 동시 쓰기들이 공유 행 하나도 함께 갱신하게 해서 Aurora DSQL의 낙관적 동시성 제어가 그중 하나를 `40001`로 실패시키게 함) 설계를 바꾸세요. 소스에서 `WITHOUT OVERLAPS` 기본 키의 인덱스(GiST)는 키 순서로 행을 돌려줄 수 없는데 Full Load와 Validation은 그 순서로 테이블을 읽으므로, 그런 큰 테이블을 적재하기 전에 소스에서 그 키 컬럼들에 btree 인덱스를 추가하세요. `UNIQUE ... NULLS NOT DISTINCT` 인덱스나 제약(PostgreSQL 15+)은 `NULLS NOT DISTINCT`를 유지하며, Aurora DSQL은 이를 받아들입니다.
 >
-> `DEFERRABLE`로 선언한 PostgreSQL `PRIMARY KEY`나 `UNIQUE` 제약은 일반 키로 생성됩니다: Aurora DSQL은 지연 가능한 유니크 키를 지원하지 않으므로, 소스가 각 문장이 끝날 때(`INITIALLY DEFERRED`로 선언한 키는 커밋 시점에) 검사하는 키를 즉시 검사합니다. 컷오버 후에는 두 행이 잠시 같은 키 값을 갖게 하는 문장이나 트랜잭션(두 행의 값 맞바꾸기, 번호 다시 매기기)이 실패할 수 있습니다: Evaluation과 Schema Conversion은 테이블을 **MANUAL**로 표시합니다(`PG_DEFERRABLE_KEY`). CDC를 쓰면 `DEFERRABLE` 기본 키는 `REPLICA IDENTITY`도 되지 못합니다: 테이블이 CDC의 publication에 들어가면 PostgreSQL이 그 테이블의 모든 `UPDATE`와 `DELETE`를 거부하므로, 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을 `REPLICA IDENTITY FULL`로 설정할 때까지 CDC 사전 요구사항 검사가 그 테이블을 실패로 판정합니다(**Full load + CDC**에서는 Full Load 전에). 외래 키는 `DEFERRABLE`과 `MATCH FULL`을 유지합니다(§2.2).
+> `DEFERRABLE`로 선언한 PostgreSQL `PRIMARY KEY`나 `UNIQUE` 제약은 일반 키로 생성됩니다: Aurora DSQL은 지연 가능한 유니크 키를 지원하지 않으므로, 소스가 각 문장이 끝날 때(`INITIALLY DEFERRED`로 선언한 키는 커밋 시점에) 검사하는 키를 즉시 검사합니다. 컷오버 후에는 두 행이 잠시 같은 키 값을 갖게 하는 문장이나 트랜잭션(두 행의 값 맞바꾸기, 번호 다시 매기기)이 실패할 수 있습니다: Evaluation과 Schema Conversion은 테이블을 **MANUAL**로 표시합니다(`PG_DEFERRABLE_KEY`). CDC를 쓰면 `DEFERRABLE` 기본 키는 `REPLICA IDENTITY`도 되지 못합니다: 테이블이 `REPLICA IDENTITY DEFAULT`인 채로 CDC의 publication에 들어가면 PostgreSQL이 그 테이블의 모든 `UPDATE`와 `DELETE`를 거부하므로, 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을 `REPLICA IDENTITY FULL`로 설정할 때까지 CDC 사전 요구사항 검사가 그 테이블을 실패로 판정합니다(**Full load + CDC**에서는 Full Load 전에). 외래 키는 `DEFERRABLE`과 `MATCH FULL`을 유지합니다(§2.2).
 >
 > **MySQL** 생성 컬럼은 일반 컬럼으로 만들어집니다(도구는 MySQL 식을 읽어 결과와 소스 DDL에 보여 주지만 번역하지는 않음). Full Load는 계산된 값을 복사하고, CDC는 `STORED` 컬럼의 값을 전달합니다. 식(`GENERATED ALWAYS AS (...) STORED`)은 마이그레이션 유형과 상관없이 적용 전에 Schema Conversion에서 다시 추가할 수 있습니다. 그러면 Full Load와 CDC가 적용 DDL이 `GENERATED`로 만든 컬럼을 모든 쓰기에서 빼고(Aurora DSQL은 그런 컬럼에 대한 값을 거부합니다, SQLSTATE `428C9`) Aurora DSQL이 값을 계산합니다. 기본 키에 속한 생성 컬럼은 일반 컬럼으로 둡니다. Full Load와 CDC는 모든 키 컬럼을 쓰므로 `GENERATED` 키 컬럼이면 모든 쓰기가 거부됩니다.
 

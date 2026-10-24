@@ -114,9 +114,9 @@ PostgreSQL の外部キーは `MATCH FULL` と `DEFERRABLE` / `INITIALLY DEFERRE
 `ALTER TABLE … ADD CONSTRAINT … NOT VALID` をテーブルのターゲットスクリプトに追加してください。一方、`DEFERRABLE` で宣言された主キーまたは `UNIQUE` 制約はギャップです
 (`PG_DEFERRABLE_KEY`、**MANUAL**): Aurora DSQL は遅延可能な一意キーをサポートしないため、即時に検査される
 通常のキーとして作成されます([§2.3](#23-mysql--dsql-の型と制約の処理-リファレンス) を参照)。CDC を使う
-場合、`DEFERRABLE` の主キーは `REPLICA IDENTITY` にもならないため、ソースでそのキーを `NOT DEFERRABLE` で
-作り直すかテーブルを `REPLICA IDENTITY FULL` に設定するまで、CDC の前提条件チェックがそのテーブルを失敗と
-判定します。`PERIOD`
+場合、`DEFERRABLE` の主キーは `REPLICA IDENTITY` にもならないため、`REPLICA IDENTITY DEFAULT` のテーブルは、
+ソースでそのキーを `NOT DEFERRABLE` で作り直すかテーブルを `REPLICA IDENTITY FULL` に設定するまで、CDC の
+前提条件チェックが失敗と判定します。`PERIOD`
 で宣言された PostgreSQL 18 のキー(`FOREIGN KEY (…, PERIOD p) REFERENCES …`)は作成されず、これもギャップ
 です(`PG_FK_PERIOD`、**MANUAL**): Aurora DSQL には `PERIOD` がなく、同じカラムの通常のキーは等しい期間を
 要求するため、カットオーバー後は親の期間が各子行の期間をカバーしているかを何も検査しません。
@@ -646,7 +646,7 @@ Schema Conversion の後は、**DSQL ターゲットスキーマが確定** し�
 >
 > **Aurora DSQL が強制できない制約。** PostgreSQL の `EXCLUDE` 制約は作成されず (Aurora DSQL が拒否します)、ソースでそれを強制していたインデックスも作成されないため、カットオーバー後は規則に反する行 (1 つの部屋の重なる予約など) が受け付けられます: Evaluation と Schema Conversion は各定義とともにテーブルを **MANUAL** としてフラグ付けします (`PG_EXCLUSION_CONSTRAINT`)。`WITHOUT OVERLAPS` で宣言された PostgreSQL 18 の `PRIMARY KEY` または `UNIQUE` キーは同じカラムの通常のキーとして作成され、このキーはすべてのキーカラムが他の行と等しい行だけを拒否するため、1 つのキーで期間が重なる行は受け付けられます (`PG_TEMPORAL_KEY`、**MANUAL**)。PostgreSQL 18 の `FOREIGN KEY … PERIOD` は作成されません: Aurora DSQL には `PERIOD` がなく、同じカラムの通常のキーは等しい期間を要求するため、どの親の期間にもカバーされない期間の子行が受け付けられます (`PG_FK_PERIOD`、**MANUAL**)。このような規則はアプリケーションで強制する (書き込むトランザクションが競合する行を確認し、同じ範囲を書く同時の書き込みが共有の行 1 つも更新するようにして、Aurora DSQL の楽観的同時実行制御がそのうち 1 つを `40001` で失敗させる) か、設計を変更してください。ソースでの `WITHOUT OVERLAPS` 主キーのインデックス (GiST) はキーの順に行を返せず、Full Load と Validation はその順にテーブルを読むため、そのような大きなテーブルをロードする前にソースでそのキーカラムに btree インデックスを追加してください。`UNIQUE ... NULLS NOT DISTINCT` のインデックスまたは制約 (PostgreSQL 15+) は `NULLS NOT DISTINCT` を保持し、Aurora DSQL はそれを受け付けます。
 >
-> `DEFERRABLE` で宣言された PostgreSQL の `PRIMARY KEY` または `UNIQUE` 制約は通常のキーとして作成されます: Aurora DSQL は遅延可能な一意キーをサポートしないため、ソースが各文の終わりに (`INITIALLY DEFERRED` で宣言されたキーはコミット時に) 検査するキーを即時に検査します。カットオーバー後は、2 つの行に一時的に同じキー値を持たせる文やトランザクション (2 行の値の入れ替え、番号の振り直し) が失敗することがあります: Evaluation と Schema Conversion はテーブルを **MANUAL** としてフラグ付けします (`PG_DEFERRABLE_KEY`)。CDC を使う場合、`DEFERRABLE` の主キーは `REPLICA IDENTITY` にもなりません: テーブルが CDC の publication に入ると PostgreSQL はそのテーブルのすべての `UPDATE` と `DELETE` を拒否するため、キーを `NOT DEFERRABLE` で作り直すかテーブルを `REPLICA IDENTITY FULL` に設定するまで、CDC の前提条件チェックがそのテーブルを失敗と判定します (**Full load + CDC** では Full Load の前に)。外部キーは `DEFERRABLE` と `MATCH FULL` を保持します (§2.2)。
+> `DEFERRABLE` で宣言された PostgreSQL の `PRIMARY KEY` または `UNIQUE` 制約は通常のキーとして作成されます: Aurora DSQL は遅延可能な一意キーをサポートしないため、ソースが各文の終わりに (`INITIALLY DEFERRED` で宣言されたキーはコミット時に) 検査するキーを即時に検査します。カットオーバー後は、2 つの行に一時的に同じキー値を持たせる文やトランザクション (2 行の値の入れ替え、番号の振り直し) が失敗することがあります: Evaluation と Schema Conversion はテーブルを **MANUAL** としてフラグ付けします (`PG_DEFERRABLE_KEY`)。CDC を使う場合、`DEFERRABLE` の主キーは `REPLICA IDENTITY` にもなりません: `REPLICA IDENTITY DEFAULT` のままのテーブルが CDC の publication に入ると PostgreSQL はそのテーブルのすべての `UPDATE` と `DELETE` を拒否するため、キーを `NOT DEFERRABLE` で作り直すかテーブルを `REPLICA IDENTITY FULL` に設定するまで、CDC の前提条件チェックがそのテーブルを失敗と判定します (**Full load + CDC** では Full Load の前に)。外部キーは `DEFERRABLE` と `MATCH FULL` を保持します (§2.2)。
 >
 > **MySQL** の生成カラムは通常のカラムとして作成されます (ツールは MySQL の式を読み取って指摘とソース DDL に表示しますが、変換はしません)。Full Load は計算済みの値をコピーし、CDC は `STORED` カラムの値を運びます。式 (`GENERATED ALWAYS AS (...) STORED`) は、移行タイプにかかわらず適用前に Schema Conversion で再追加できます。そうすると Full Load と CDC は、適用 DDL が `GENERATED` にしたカラムをすべての書き込みから外し (Aurora DSQL はそのようなカラムへの値を拒否します、SQLSTATE `428C9`)、Aurora DSQL が値を計算します。主キーに含まれる生成カラムは通常のカラムのままにします。Full Load と CDC はすべてのキーカラムを書き込むため、`GENERATED` のキーカラムではすべての書き込みが拒否されます。
 
