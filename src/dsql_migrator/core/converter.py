@@ -6872,6 +6872,23 @@ def _pg_temporal_key_warning(table: TableDef) -> Optional[ConversionWarning]:
             "table each page scans and sorts the rest of it: add a btree index on "
             f"({listed}) on the source before the load."
         )
+    # G174: once the source has that index, the conversion creates it on Aurora DSQL as
+    # well, where the (btree) primary key over the same columns already serves those reads.
+    duplicates = [
+        index.name
+        for index in _emittable_secondary_indexes(table, is_postgres=True)
+        if primary is not None
+        and list(index.columns) == key_columns
+        and not index.unique
+        and (index.method or "btree").strip().lower() == "btree"
+        and not (index.where or "").strip()
+    ]
+    if duplicates:
+        message += (
+            f" {', '.join(duplicates)} {'repeats' if len(duplicates) == 1 else 'repeat'} the "
+            "primary key's columns: Aurora DSQL's primary key already serves those reads, so "
+            "remove it from the table's target script before applying to save an index."
+        )
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
