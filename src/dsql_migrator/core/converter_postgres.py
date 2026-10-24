@@ -984,7 +984,14 @@ _PG_UNSUPPORTED_REMODEL = {
     "polygon": "text",
     "circle": "text",
     "vector": "jsonb or text (pgvector is an extension Aurora DSQL does not provide)",
+    "halfvec": "jsonb or text (pgvector is an extension Aurora DSQL does not provide)",
+    # Its text ('{1:1,3:2}/5') is no JSON, so text only.
+    "sparsevec": "text (pgvector is an extension Aurora DSQL does not provide)",
 }
+# The types above an EXTENSION defines, advised by NAME whatever schema it was installed in:
+# format_type qualifies a type that is not on the search path ('ext.vector(3)'), which then
+# got the advice for a user-defined type (G173).
+_PG_EXTENSION_REMODEL_TYPES = frozenset({"vector", "halfvec", "sparsevec"})
 
 # Range / multirange types (int4range, tsrange, ... and the PG14+ multirange variants):
 # their canonical text form round-trips, or split into lower/upper bound columns.
@@ -1039,6 +1046,10 @@ def unsupported_dsql_reason(
         )
     else:
         target = _PG_UNSUPPORTED_REMODEL.get(base)
+        bare = base.rpartition(".")[2]
+        # An extension's type is a base type: an enum or composite so named is not one.
+        if target is None and type_kind is None and bare in _PG_EXTENSION_REMODEL_TYPES:
+            target = _PG_UNSUPPORTED_REMODEL[bare]
     if target is not None:
         return (
             f"Aurora DSQL does not support the PostgreSQL type '{pg_type}' as a column "
