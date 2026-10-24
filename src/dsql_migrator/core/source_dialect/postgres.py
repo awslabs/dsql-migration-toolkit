@@ -642,21 +642,29 @@ def _pg_enrich_columns(connection: object, enrich_db: str, tables: list) -> None
 
 
 def _pg_correct_fk_schemas(connection: object, nsp: str, tables: list) -> None:
-    """Fix each FK's referenced-table qualification using the catalog (confrelid).
+    """Fix each FK's referenced-table qualification using the catalog (confrelid), and drop
+    the copies PostgreSQL keeps of a foreign key that references a partitioned table.
 
     SQLAlchemy returns ``referred_schema=None`` when the parent is visible via the
     search_path (commonly ``public``), and ``_reflect_tables`` then defaults that to the
     CHILD's schema -- so a cross-schema FK points at the wrong (child) schema. Resolve the
     real referenced schema+table from ``pg_constraint`` (search_path-independent) and
-    rewrite ``referenced_table`` in place. Skipped entirely when no table has a foreign
-    key, so it adds no query to the common case.
+    rewrite ``referenced_table`` in place. A foreign key into a partitioned table also has
+    one derived copy per partition, on the same table (``conparentid`` <> 0, ``confrelid``
+    the partition: plain_part_id_fkey1 on PostgreSQL 13-17, plain_part_id_fkey_1 on 18),
+    which reflection returns as keys of their own. They are dropped (G185): the partitions
+    are folded into their parent and never created on Aurora DSQL, so each copy would be
+    added as a key to a table that does not exist there, and the declared key (conparentid
+    0) covers every partition. Skipped entirely when no table has a foreign key, so it adds
+    no query to the common case.
     """
     if not any(table.foreign_keys for table in tables):
         return
     rows = connection.execute(  # type: ignore[attr-defined]
         text(
             "SELECT c.relname AS child, con.conname AS conname, "
-            "refn.nspname AS ref_schema, refc.relname AS ref_table "
+            "refn.nspname AS ref_schema, refc.relname AS ref_table, "
+            "con.conparentid <> 0 AS derived "
             "FROM pg_constraint con "
             "JOIN pg_class c ON c.oid = con.conrelid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -667,10 +675,17 @@ def _pg_correct_fk_schemas(connection: object, nsp: str, tables: list) -> None:
         {"nsp": nsp},
     ).mappings()
     target: dict[tuple[str, str], str] = {}
+    derived: set[tuple[str, str]] = set()
     for row in rows:
         target[(row["child"], row["conname"])] = f"{row['ref_schema']}.{row['ref_table']}"
+        if row.get("derived"):
+            derived.add((row["child"], row["conname"]))
     for table in tables:
         _schema, bare = _enrich_name(table.name, nsp)
+        if derived:
+            table.foreign_keys = [
+                fk for fk in table.foreign_keys if (bare, fk.name) not in derived
+            ]
         for fk in table.foreign_keys:
             resolved = target.get((bare, fk.name))
             if resolved:
@@ -709,7 +724,9 @@ _PG_FOREIGN_KEYS_SQL = (
     "JOIN pg_catalog.pg_class rc ON rc.oid = con.confrelid "
     "JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace "
     "LEFT JOIN pg_catalog.pg_description d ON d.objoid = con.oid "
-    "WHERE con.contype = 'f' AND n.nspname = :nsp AND c.relname = :rel "
+    # Not the copies of a key into a partitioned table, one per partition (G185; see
+    # _pg_correct_fk_schemas).
+    "WHERE con.contype = 'f' AND con.conparentid = 0 AND n.nspname = :nsp AND c.relname = :rel "
     "ORDER BY con.conname"
 )
 _PG_FK_ACTIONS = {"r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"}
