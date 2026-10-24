@@ -929,6 +929,48 @@ def _pg_read_key_timing(connection: object, nsp: str, tables: list) -> None:
                 fk.enforced = False
 
 
+# The columns of the tables read whose NOT NULL constraint was added NOT VALID (PostgreSQL 18,
+# G167): ONE catalog round trip per schema. PostgreSQL 18 sets attnotnull for such a column as
+# soon as the constraint exists, so reflection reports it NOT NULL, although rows from before
+# it may hold NULL (verified on 18.6: pg_attribute.attnotnull t, the 'n' constraint not
+# convalidated, a row with NULL). PostgreSQL 13-17 have no 'n' rows in pg_constraint, so the
+# statement returns nothing there and needs no version gate (verified on 13.23 and 17.11).
+_PG_UNVALIDATED_NOT_NULL_SQL = (
+    "SELECT c.relname AS rel, a.attname AS col "
+    "FROM pg_catalog.pg_constraint con "
+    "JOIN pg_catalog.pg_class c ON c.oid = con.conrelid "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[1] "
+    "WHERE con.contype = 'n' AND NOT con.convalidated "
+    "AND n.nspname = :nsp AND c.relname = ANY(:names) "
+    "ORDER BY c.relname, a.attnum"
+)
+
+
+def _pg_read_unvalidated_not_null(connection: object, nsp: str, tables: list) -> None:
+    """Mark each column whose NOT NULL was added NOT VALID nullable, in place (G167), so the
+    target column is created without NOT NULL: created NOT NULL, Aurora DSQL would refuse the
+    rows that still hold NULL, and Full Load would quarantine them. Never a primary-key
+    column (its NOT NULL is the key's). The conversion notes each one."""
+    if not tables:
+        return
+    rows = connection.execute(  # type: ignore[attr-defined]
+        text(_PG_UNVALIDATED_NOT_NULL_SQL),
+        {"nsp": nsp, "names": [table.name for table in tables]},
+    ).mappings()
+    found: dict[str, set[str]] = {}
+    for row in rows:
+        relation, column = row.get("rel"), row.get("col")
+        if relation and column:
+            found.setdefault(str(relation), set()).add(str(column))
+    for table in tables:
+        names = found.get(table.name, set()) - set(table.primary_key or ())
+        for column in table.columns:
+            if column.name in names:
+                column.nullable = True
+                column.not_null_not_valid = True
+
+
 def _pg_collect_triggers(connection: object, nsp: str) -> list:
     """Read user trigger names for the schema (mirrors MySQL ``collect_triggers`` shape).
 
@@ -1540,6 +1582,10 @@ class PostgresSourceDialect(SourceDialect):
         # ordinary keys, and (PG18+) NOT ENFORCED foreign keys, which it does not create
         # (G152).
         _pg_read_key_timing(connection, enrich_db, tables)
+
+        # (3d) PostgreSQL 18 NOT NULL ... NOT VALID columns, which may still hold NULLs: the
+        # target column is created without NOT NULL (G167).
+        _pg_read_unvalidated_not_null(connection, enrich_db, tables)
 
         # (4) Stored triggers + routines (functions/procedures) for the schema, returned as
         # the ObjectRef shape the MySQL path uses so TriggerRule/ProcedureRule flag them

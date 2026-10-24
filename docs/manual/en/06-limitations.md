@@ -684,8 +684,8 @@ fails **loudly** where it can't.
   excluded, so the CDC prerequisite check holds the migration for such a table (in **Full
   load + CDC**, before the Full Load): leave the table out and migrate it with Full load
   only, or give the key column a type CDC carries on the source.
-- **PostgreSQL 17/18 sources — three version-specific edges (none block a
-  migration).** PG 13–18 are supported; 17 and 18 add three things to keep in mind:
+- **PostgreSQL 17/18 sources — four version-specific edges (none block a
+  migration).** PG 13–18 are supported; 17 and 18 add four things to keep in mind:
   - **`interval` `infinity`/`-infinity` (new in PG17).** Aurora DSQL is
     PostgreSQL-16-compatible and its `interval` input parser rejects these values, so
     a row carrying an *infinite* `interval` is **quarantined** during Full Load
@@ -711,6 +711,13 @@ fails **loudly** where it can't.
     VIRTUAL column cannot be logically replicated at all, so CDC does not carry it.
     Recompute it in the application before cut over. Decide before **apply** either way:
     DSQL can DROP an expression from a column but never ADD one.
+  - **`NOT NULL … NOT VALID` (new in PG18).** A column whose `NOT NULL` was added
+    `NOT VALID` may still hold NULLs from before it, which the source has not checked: it is
+    created without `NOT NULL` on Aurora DSQL, so Full Load loads those rows, and flagged
+    **MANUAL/LOSS** (`PG_NOT_NULL_NOT_VALID`): after cut over the target accepts a NULL
+    there, and Aurora DSQL cannot add `NOT NULL` to the column later. To keep the rule,
+    give those rows a value and run `ALTER TABLE … VALIDATE CONSTRAINT` on the source before
+    Schema Conversion applies the table, then re-run Evaluation.
   - **CDC connector coverage.** The bundled Debezium PostgreSQL connector's tested
     matrix tops out at PG16. `pgoutput` streaming still works on 17/18 (the logical
     replication protocol is unchanged and the driver connects over the stable wire

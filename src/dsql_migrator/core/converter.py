@@ -6950,6 +6950,32 @@ def _pg_not_enforced_foreign_key_warning(table: TableDef) -> Optional[Conversion
     )
 
 
+def _pg_not_null_not_valid_warning(table: TableDef) -> Optional[ConversionWarning]:
+    """PostgreSQL 18 columns whose NOT NULL was added NOT VALID (G167), created without it.
+
+    The source refuses a new NULL there, but has not checked the rows it held before, which
+    may be NULL; created NOT NULL, Aurora DSQL would refuse each such row (Full Load would
+    quarantine it, permanently), and Aurora DSQL cannot add a NOT NULL to a column later. So
+    the column is created nullable (introspection marks it), and after cut over the target
+    accepts a NULL the source would refuse."""
+    names = [column.name for column in table.columns if column.not_null_not_valid]
+    if not names:
+        return None
+    listed = ", ".join(names)
+    return ConversionWarning(
+        object_name=table.name,
+        classification=Classification.MANUAL,
+        kind=ConversionNoteKind.LOSS,
+        message=(
+            f"NOT NULL ... NOT VALID column(s) are created without NOT NULL — {listed}. The "
+            "source refuses a new NULL there but has not checked the rows it already holds, "
+            "which may be NULL: created NOT NULL, Aurora DSQL would refuse each such row (Full "
+            "Load would quarantine it), and it cannot add NOT NULL to a column later. After "
+            "cut over the target accepts a NULL in them."
+        ),
+    )
+
+
 def _pg_period_listing(fk: ForeignKeyDef) -> str:
     """``name: (a, PERIOD p) REFERENCES t (id, PERIOD v)`` -- how PostgreSQL spells it."""
     def _cols(columns: "list[str]") -> str:
@@ -7767,6 +7793,8 @@ class SchemaConverter:
             (_pg_not_enforced_foreign_key_warning(table) if is_postgres else None),
             # ... and PostgreSQL 18 PERIOD foreign keys (not created), G163.
             (_pg_period_foreign_key_warning(table) if is_postgres else None),
+            # ... and PostgreSQL 18 NOT NULL ... NOT VALID columns (created nullable), G167.
+            (_pg_not_null_not_valid_warning(table) if is_postgres else None),
             _identifier_length_warning(
                 table,
                 generated_index_names=generated_index_names,

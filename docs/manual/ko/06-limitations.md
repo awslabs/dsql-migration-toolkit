@@ -537,8 +537,8 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
   모든 삽입과 업데이트가 데드레터 처리됩니다). 키 컬럼은 제외할 수 없으므로 CDC 사전 요구사항 검사가
   그런 테이블의 마이그레이션을 막습니다(**Full load + CDC**에서는 Full Load 전부터): 테이블을 빼고
   Full load only로 마이그레이션하거나, 소스에서 키 컬럼을 CDC가 옮기는 타입으로 바꾸세요.
-- **PostgreSQL 17/18 소스 — 버전별 엣지 3가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
-  지원하며, 17·18에서 유의할 점이 3가지 있습니다:
+- **PostgreSQL 17/18 소스 — 버전별 엣지 4가지(어느 것도 마이그레이션을 막지 않음).** PG 13–18을
+  지원하며, 17·18에서 유의할 점이 4가지 있습니다:
   - **`interval`의 `infinity`/`-infinity`(PG17 신규).** Aurora DSQL은 PostgreSQL-16 호환이라 그
     `interval` 입력 파서가 이 값을 거부합니다. 따라서 *무한* `interval`을 담은 행은 Full Load 중
     **격리(quarantine)**되어(격리 카운트에 표시됨) Validation에서 count/checksum 불일치로 드러납니다.
@@ -559,6 +559,12 @@ _언어: [English](../en/06-limitations.md) | **한국어** | [日本語](../ja/
     이후엔 아무것도 유지하지 않고, VIRTUAL 컬럼은 논리 복제 자체가 불가해 CDC도 나르지 않습니다.
     컷오버 전에 애플리케이션에서 다시 계산하세요. 어느 쪽이든 **apply 전에** 결정해야 합니다: DSQL은
     컬럼에서 식을 DROP할 수는 있어도 추가(ADD)할 수는 없습니다.
+  - **`NOT NULL … NOT VALID`(PG18 신규).** `NOT NULL`을 `NOT VALID`로 추가한 컬럼에는 그 이전의 NULL이
+    남아 있을 수 있고, 소스는 그 행들을 검사하지 않았습니다: 그런 컬럼은 Aurora DSQL에서 `NOT NULL` 없이
+    생성되어 Full Load가 그 행들을 적재하며, **MANUAL/LOSS**(`PG_NOT_NULL_NOT_VALID`)로 표시됩니다: 컷오버
+    후에는 타깃이 그 컬럼의 NULL을 받아들이고, Aurora DSQL은 나중에 그 컬럼에 `NOT NULL`을 추가할 수
+    없습니다. 규칙을 유지하려면 Schema Conversion이 그 테이블을 적용하기 전에 소스에서 그 행들에 값을 넣고
+    `ALTER TABLE … VALIDATE CONSTRAINT`를 실행한 뒤 Evaluation을 다시 실행하세요.
   - **CDC 커넥터 커버리지.** 번들된 Debezium PostgreSQL 커넥터의 테스트 매트릭스는 PG16까지입니다.
     `pgoutput` 스트리밍은 17/18에서도 동작하지만(논리 복제 프로토콜은 그대로이고 드라이버는 안정적인
     와이어 프로토콜로 연결됨), 17/18 CDC는 **best-effort**로 취급하고 프로덕션에 의존하기 전에 종단 간

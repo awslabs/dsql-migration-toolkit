@@ -53,6 +53,8 @@ _EXPECTED_PG_RULE_IDS = {
     "PG_FK_NOT_ENFORCED",
     # PostgreSQL 18 PERIOD foreign keys (not created; G163).
     "PG_FK_PERIOD",
+    # PostgreSQL 18 NOT NULL ... NOT VALID columns (created nullable; G167).
+    "PG_NOT_NULL_NOT_VALID",
     "TRIGGER_UNSUPPORTED",
     "PROC_PLPGSQL",
     "EVENT_UNSUPPORTED",

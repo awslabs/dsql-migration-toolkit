@@ -581,8 +581,8 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
   すべての挿入と更新がデッドレター化されます)。キー列は除外できないため、CDC の前提条件チェックがそのような
   テーブルの移行を止めます(**Full load + CDC** では Full Load の前から): テーブルを外して Full load only
   で移行するか、ソースでキー列を CDC が運ぶ型に変えてください。
-- **PostgreSQL 17/18 ソース — バージョン固有のエッジ 3 点（いずれも移行を止めません）。** PG 13–18
-  をサポートします。17・18 では次の 3 点に注意してください:
+- **PostgreSQL 17/18 ソース — バージョン固有のエッジ 4 点（いずれも移行を止めません）。** PG 13–18
+  をサポートします。17・18 では次の 4 点に注意してください:
   - **`interval` の `infinity`/`-infinity`（PG17 で新規）。** Aurora DSQL は PostgreSQL-16 互換で
     あり、その `interval` 入力パーサはこれらの値を拒否します。そのため *無限* の `interval` を持つ行は
     Full Load 中に **隔離（quarantine）** され（隔離カウントに表示）、Validation で count/checksum の
@@ -603,6 +603,13 @@ _言語: [English](../en/06-limitations.md) | [한국어](../ko/06-limitations.m
     実体化するのでターゲットは最初は正しいものの、その後は何も維持せず、VIRTUAL 列は論理レプリケーション
     自体ができないため CDC も運びません。カットオーバー前にアプリケーションで再計算してください。
     どちらの場合も **apply の前に** 決めてください: DSQL は列から式を DROP できますが ADD はできません。
+  - **`NOT NULL … NOT VALID`（PG18 で新規）。** `NOT NULL` を `NOT VALID` で追加した列には、それより前の
+    NULL が残っていることがあり、ソースはそれらの行を検査していません: そのような列は Aurora DSQL では
+    `NOT NULL` なしで作成されるため Full Load はそれらの行をロードし、**MANUAL/LOSS**
+    (`PG_NOT_NULL_NOT_VALID`) としてフラグが立ちます: カットオーバー後はターゲットがその列の NULL を
+    受け付け、Aurora DSQL は後からその列に `NOT NULL` を追加できません。規則を保つには、Schema Conversion
+    がそのテーブルを適用する前に、ソースでそれらの行に値を入れて `ALTER TABLE … VALIDATE CONSTRAINT` を
+    実行し、Evaluation を再実行してください。
   - **CDC コネクタのカバレッジ。** 同梱の Debezium PostgreSQL コネクタのテスト対象は PG16 までです。
     `pgoutput` ストリーミングは 17/18 でも動作しますが（論理レプリケーションプロトコルは変わらず、
     ドライバは安定したワイヤプロトコルで接続）、17/18 の CDC は **ベストエフォート** として扱い、

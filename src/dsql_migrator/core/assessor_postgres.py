@@ -1631,6 +1631,7 @@ def default_rules() -> "list[Rule]":
         pg_exclusion_constraint_rule,
         pg_index_not_preserved_rule,
         pg_not_enforced_foreign_key_rule,
+        pg_not_null_not_valid_rule,
         pg_period_foreign_key_rule,
         pg_temporal_key_rule,
         pg_unindexable_column_rule,
@@ -1662,6 +1663,8 @@ def default_rules() -> "list[Rule]":
         pg_not_enforced_foreign_key_rule(),
         # ... and PostgreSQL 18 PERIOD foreign keys, which are not created either (G163).
         pg_period_foreign_key_rule(),
+        # ... and PostgreSQL 18 NOT NULL ... NOT VALID columns, created nullable (G167).
+        pg_not_null_not_valid_rule(),
         TriggerRule(),
         ProcedureRule(),
         EventRule(),

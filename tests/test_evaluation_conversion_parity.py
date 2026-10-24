@@ -277,6 +277,11 @@ _PG_CORPUS = [
                           period=True)
         ],
     ),
+    # G167: a PostgreSQL 18 NOT NULL ... NOT VALID column, created nullable (a loss).
+    _t(
+        "not_null_not_valid",
+        [ColumnDef(name="v", mysql_type="integer", nullable=True, not_null_not_valid=True)],
+    ),
 ]
 
 # Reverse-direction gaps that are known and not yet closed: (engine, table, what the
@@ -368,3 +373,4 @@ def test_the_corpus_exercises_the_rules_this_parity_was_added_for() -> None:
     assert pg["app.not_enforced_fk"] == "PG_FK_NOT_ENFORCED"
     assert concerns["app.not_enforced_fk"] == {"PG_FK_NOT_ENFORCED"}
     assert "PG_FK_PERIOD" in concerns["app.period_fk"]  # the range column leads (re-typed)
+    assert pg["app.not_null_not_valid"] == "PG_NOT_NULL_NOT_VALID"

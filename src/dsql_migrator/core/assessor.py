@@ -2013,6 +2013,20 @@ def pg_period_foreign_key_rule() -> ConversionWarningRule:
     )
 
 
+def pg_not_null_not_valid_rule() -> ConversionWarningRule:
+    """PostgreSQL 18 columns whose NOT NULL was added NOT VALID, created without NOT NULL
+    because rows may still hold NULL (PG_NOT_NULL_NOT_VALID, G167)."""
+    return ConversionWarningRule(
+        "PG_NOT_NULL_NOT_VALID",
+        "_pg_not_null_not_valid_warning",
+        "To keep the rule, give those rows a value and run ALTER TABLE ... VALIDATE "
+        "CONSTRAINT on the source before Schema Conversion applies the table, then re-run "
+        "Evaluation: the column is then created NOT NULL. Otherwise make sure the "
+        "application never writes NULL there after cut over.",
+        EffortLevel.SIMPLE,
+    )
+
+
 def pg_collation_rule() -> ConversionWarningRule:
     """PostgreSQL non-default column collations, which the target does not keep
     (PG_COLLATION_DROPPED)."""

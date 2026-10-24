@@ -272,6 +272,17 @@ class ColumnDef(BaseModel):
             "does not emit COMMENT ON); captured so the conversion can warn it is dropped."
         ),
     )
+    not_null_not_valid: bool = Field(
+        default=False,
+        exclude_if=lambda v: not v,
+        description=(
+            "True for a PostgreSQL 18 column whose NOT NULL constraint was added NOT VALID "
+            "(``pg_constraint`` contype 'n', not ``convalidated``; G167): the source refuses a "
+            "new NULL but has not checked the rows it already holds, which may be NULL. "
+            "``nullable`` is True for such a column, so the target column is created without "
+            "NOT NULL and Full Load can load those rows."
+        ),
+    )
     target_type: Optional[str] = Field(
         default=None,
         description=(

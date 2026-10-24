@@ -773,6 +773,9 @@ def _render_source_table_ddl_postgres(table: TableDef) -> str:
         clause = f"  {_quote_pg_ident(column.name)} {column.mysql_type}"
         if not column.nullable:
             clause += " NOT NULL"
+        elif column.not_null_not_valid:
+            # PostgreSQL 18 (G167): read as nullable, since old rows may hold NULL.
+            clause += " NOT NULL NOT VALID"
         if column.default is not None:
             clause += f" DEFAULT {column.default}"
         # The IDENTITY clause. Omitting it made this panel misrepresent the source on the
