@@ -104,8 +104,9 @@ PostgreSQL 외래 키는 `MATCH FULL`과 `DEFERRABLE` / `INITIALLY DEFERRED`를 
 둘 다 받아들이고, 지연된 키는 소스처럼 커밋 시점에 검사합니다), 결과에는 이를 선언한 키가 하나하나
 표시됩니다. `NOT ENFORCED`로 선언한 PostgreSQL 18 키는 생성하지 않습니다: 소스는 그 키를 검사하지
 않는데, `NOT ENFORCED`가 없는 Aurora DSQL은 소스가 받아들이는 쓰기를 거부하게 되기 때문입니다. 이것도
-권장사항입니다(`PG_FK_NOT_ENFORCED`, `RECOMMENDED`). Aurora DSQL이 그런 키를 강제하게 하려면 그 키의
-`ALTER TABLE … ADD CONSTRAINT … NOT VALID`를 테이블의 대상 스크립트에 추가하세요. 반면 `DEFERRABLE`로
+권장사항입니다(`PG_FK_NOT_ENFORCED`, `RECOMMENDED`). Aurora DSQL이 그런 키를 강제하게 하려면(Aurora
+DSQL에 그런 형태가 없는 `PERIOD`로 선언한 키는 제외) 그 키의 `ALTER TABLE … ADD CONSTRAINT … NOT VALID`를
+테이블의 대상 스크립트에 추가하세요. 반면 `DEFERRABLE`로
 선언한 기본 키나 `UNIQUE` 제약은 갭입니다(`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL은 지연 가능한
 유니크 키를 지원하지 않으므로, 즉시 검사되는 일반 키로 생성됩니다
 ([§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참고). CDC를 쓰면 `DEFERRABLE` 기본 키는 `REPLICA IDENTITY`도

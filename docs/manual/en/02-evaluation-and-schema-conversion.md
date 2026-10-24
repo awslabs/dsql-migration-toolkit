@@ -230,8 +230,8 @@ A PostgreSQL foreign key keeps its `MATCH FULL` and its `DEFERRABLE` / `INITIALL
 finding names each key that declares one. A PostgreSQL 18 key declared `NOT ENFORCED` is not
 created: the source never checks it, and Aurora DSQL, which has no `NOT ENFORCED`, would
 refuse writes the source accepts. That is advice too (`PG_FK_NOT_ENFORCED`, `RECOMMENDED`);
-to have Aurora DSQL enforce such a key, add its `ALTER TABLE … ADD CONSTRAINT … NOT VALID` to
-the table's target script. A primary key or `UNIQUE` constraint declared `DEFERRABLE` is a gap
+to have Aurora DSQL enforce such a key (not one declared with `PERIOD`, which Aurora DSQL has no
+form of), add its `ALTER TABLE … ADD CONSTRAINT … NOT VALID` to the table's target script. A primary key or `UNIQUE` constraint declared `DEFERRABLE` is a gap
 instead (`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL does not support deferrable unique
 keys, so it is created as an ordinary key, checked immediately (see
 [§2.3](#23-mysql--dsql-type-and-constraint-handling-reference)); with CDC, a `DEFERRABLE`

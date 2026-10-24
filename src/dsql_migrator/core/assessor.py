@@ -1993,9 +1993,10 @@ def pg_not_enforced_foreign_key_rule() -> ConversionWarningRule:
         "PG_FK_NOT_ENFORCED",
         "_pg_not_enforced_foreign_key_warning",
         "No action needed: the target behaves as the source does. To have Aurora DSQL "
-        "enforce such a key after all, add its ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY "
-        "... NOT VALID to the table's target script in Schema Conversion: it is then added "
-        "and validated with the other foreign keys, and its rows must satisfy it.",
+        "enforce such a key after all (not one declared with PERIOD, which Aurora DSQL has no "
+        "form of), add its ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID to the "
+        "table's target script in Schema Conversion: it is then added and validated with the "
+        "other foreign keys, and its rows must satisfy it.",
         EffortLevel.SIMPLE,
     )
 

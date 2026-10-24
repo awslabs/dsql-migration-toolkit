@@ -110,8 +110,8 @@ PostgreSQL の外部キーは `MATCH FULL` と `DEFERRABLE` / `INITIALLY DEFERRE
 キーが 1 つずつ示されます。`NOT ENFORCED` で宣言された PostgreSQL 18 のキーは作成されません: ソースはその
 キーを検査しませんが、`NOT ENFORCED` を持たない Aurora DSQL はソースが受け付ける書き込みを拒否してしまう
 ためです。これも推奨事項です(`PG_FK_NOT_ENFORCED`、`RECOMMENDED`)。そのようなキーを Aurora DSQL に強制
-させるには、そのキーの `ALTER TABLE … ADD CONSTRAINT … NOT VALID` をテーブルのターゲットスクリプトに追加
-してください。一方、`DEFERRABLE` で宣言された主キーまたは `UNIQUE` 制約はギャップです
+させるには(Aurora DSQL にその形がない `PERIOD` で宣言されたキーは除きます)、そのキーの
+`ALTER TABLE … ADD CONSTRAINT … NOT VALID` をテーブルのターゲットスクリプトに追加してください。一方、`DEFERRABLE` で宣言された主キーまたは `UNIQUE` 制約はギャップです
 (`PG_DEFERRABLE_KEY`、**MANUAL**): Aurora DSQL は遅延可能な一意キーをサポートしないため、即時に検査される
 通常のキーとして作成されます([§2.3](#23-mysql--dsql-の型と制約の処理-リファレンス) を参照)。CDC を使う
 場合、`DEFERRABLE` の主キーは `REPLICA IDENTITY` にもならないため、ソースでそのキーを `NOT DEFERRABLE` で

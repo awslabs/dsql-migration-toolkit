@@ -7045,6 +7045,8 @@ def _pg_not_enforced_foreign_key_warning(table: TableDef) -> Optional[Conversion
     if not keys:
         return None
     names = ", ".join(fk.name for fk in keys)
+    # One declared with PERIOD could not be created even to enforce it (G189).
+    periods = [fk.name for fk in keys if fk.period]
     return ConversionWarning(
         object_name=table.name,
         classification=Classification.MANUAL,
@@ -7054,6 +7056,13 @@ def _pg_not_enforced_foreign_key_warning(table: TableDef) -> Optional[Conversion
             "not created on Aurora DSQL, which has no NOT ENFORCED and would check every "
             "write against them, refusing rows the source accepts. The target, like the "
             "source, does not check them, and Validation's orphan check leaves them out."
+            + (
+                f" {', '.join(periods)} also {'declares' if len(periods) == 1 else 'declare'} "
+                "PERIOD, which Aurora DSQL has no form of, so it cannot be created there to be "
+                "enforced either."
+                if periods
+                else ""
+            )
         ),
     )
 
@@ -7106,8 +7115,10 @@ def _pg_period_foreign_key_warning(table: TableDef) -> Optional[ConversionWarnin
     check equality instead -- refusing child rows the source accepts, whose period one parent
     period does not equal -- so the key is not created, and the rule is not checked after
     cut over: a loss of a rule the source enforces, unlike NOT ENFORCED. Validation's orphan
-    check leaves it out too (``validator._check_orphans``)."""
-    keys = [fk for fk in table.foreign_keys if fk.period]
+    check leaves it out too (``validator._check_orphans``). A PERIOD key declared NOT ENFORCED
+    is no loss -- the source does not check it either -- and only the NOT ENFORCED note names
+    it (G189)."""
+    keys = [fk for fk in table.foreign_keys if fk.period and fk.enforced]
     if not keys:
         return None
     listed = "; ".join(_pg_period_listing(fk) for fk in keys)
