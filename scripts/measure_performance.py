@@ -12,15 +12,24 @@ reports numbers an adopter needs to size a large-scale migration.
 Two subcommands:
 
   full-load   Time the tool's Full Load over the selected schema and report
-              wall-time, total + per-table rows/sec, and -- the DSQL-specific
-              signal -- the OPTIMISTIC-CONCURRENCY retry rate. DSQL detects write
-              conflicts at commit (SQLSTATE 40001); a monotonic AUTO_INCREMENT PK
-              makes every insert target the same "rightmost" key range, so raising
-              parallelism raises the OCC collision rate (docs §7.1 "avoid hot
-              partitions"). This captures that: it enables the loader's per-batch
-              DEBUG trace, parses ``occ_retries=`` off every batch, and reports the
-              retry rate at the chosen parallelism -- so you can see the hot-PK
-              contention curve by re-running with higher --table/--batch-parallelism.
+              wall-time, total + per-table rows/sec, and the write path as the
+              table workers themselves count it (core.load_stats; counts and
+              timings only): per-batch and per-INSERT time (p50/p95), attempts,
+              retries by SQLSTATE with Aurora DSQL's OC000 (row conflict) and OC001
+              (schema change) told apart, 23505 recoveries, reconnects, how long
+              the reader waited on a full read-ahead queue vs the writers on an
+              empty one, and each worker process's CPU seconds and peak RSS. The
+              workers are spawned processes with no logging, so these come back
+              through the progress queue and the workers' results -- the parent's
+              logger never saw a batch, which is why earlier reports said "OCC 0".
+              Load, post-load index submission and the post-load COUNT(*) are timed
+              apart; the data phase and the run carry exact UTC timestamps, and the
+              progress windows end on wall-clock multiples of --progress-interval
+              (12:03:00, 12:03:30, ...) so they line up with CloudWatch minutes.
+              --wait-sys-jobs waits (bounded) for Aurora DSQL's async jobs to drain
+              before starting; --cdc-mode runs the load as a Full load + CDC run
+              (start point captured and fenced as the product does, no CDC stack
+              needed) so a MySQL table can be read in --reader-shards ranges.
 
   cdc-lag     Measure END-TO-END CDC replication lag (source commit -> visible on
               the DSQL target) under a SUSTAINED trickle and under BURSTS, reporting
@@ -46,6 +55,10 @@ Usage (from repo root):
     .venv/bin/python scripts/measure_performance.py full-load --yes
     .venv/bin/python scripts/measure_performance.py full-load --yes \
         --table-parallelism 8 --batch-parallelism 16     # hotter -> more OCC
+    # A benchmark arm: start only once sys.jobs is drained (wait up to 30 min), 60 s
+    # windows, and read big MySQL tables in 4 ranges (needs a binlog start point):
+    .venv/bin/python scripts/measure_performance.py full-load --yes --wait-sys-jobs \
+        --progress-interval 60 --cdc-mode --reader-shards 4
 
     # CDC lag (CDC must already stream cdc_perf.pulse):
     .venv/bin/python scripts/measure_performance.py cdc-lag --setup        # create table
@@ -61,10 +74,11 @@ This is an operational utility (NOT shipped in the app).
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
+import math
 import os
-import re
 import statistics
 import sys
 import threading
@@ -151,53 +165,123 @@ def _pct(values: list[float], q: float) -> float:
 
 
 # =========================================================================== #
-# full-load: throughput + OCC-retry rate (parsed from the loader's DEBUG trace)
+# full-load: throughput + the table workers' own write-path counters
 # =========================================================================== #
-class _OccTraceCounter(logging.Handler):
-    """Captures the batched importer's per-batch DEBUG trace and tallies OCC retries.
+# The counters come from the table workers themselves (core.load_stats), carried to the
+# parent over the progress queue and in each worker's result and merged per table and
+# per run by a LoadStatsBoard passed to run_full_load. Counts and timings only: no row
+# value, key or statement text is ever part of them.
 
-    The loader logs one DEBUG line per batch:
-    ``import batch chunk=... attempted=N inserted=M ... occ_retries=R`` (guarded by
-    ``isEnabledFor(DEBUG)``, so it only fires because we raise the level here). We
-    parse ``occ_retries`` + ``attempted`` off each line -- credential-free (PK
-    values are not in these fields we read) -- to report the retry rate.
+
+def _utc(epoch: "float | None") -> str:
+    """'HH:MM:SS' in UTC (CloudWatch's clock), or '?'."""
+    if epoch is None:
+        return "?"
+    return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).strftime(
+        "%H:%M:%S"
+    )
+
+
+def _iso(value) -> "str | None":
+    """An epoch float or an aware datetime as an ISO-8601 UTC string (ms), else None."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime.datetime):
+        value = datetime.datetime.fromtimestamp(float(value), tz=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _next_boundary(now: float, interval: float) -> float:
+    """The next wall-clock instant (epoch s) that is a whole multiple of ``interval``.
+
+    12:03:00, 12:03:30, 12:04:00, ... for 30 s, so the progress windows line up with
+    CloudWatch's minutes whenever ``interval`` divides 60 (or is a multiple of it). One
+    closer than half an interval (at most a second) is skipped, so no window is a sliver.
     """
+    boundary = (math.floor(now / interval) + 1) * interval
+    if boundary - now < min(1.0, interval / 2.0):
+        boundary += interval
+    return boundary
 
-    _RE_RETRIES = re.compile(r"occ_retries=(\d+)")
-    _RE_ATTEMPTED = re.compile(r"attempted=(\d+)")
-    _RE_ELAPSED = re.compile(r"elapsed_ms=([\d.]+)")
 
-    def __init__(self) -> None:
-        super().__init__(level=logging.DEBUG)
-        self.batches = 0
-        self.total_retries = 0
-        self.batches_with_retry = 0
-        self.rows_attempted = 0
-        # Per-batch write round-trip times (ms). The distribution answers the key
-        # question when a load is write-bound: is throughput capped by DSQL write
-        # RTT (high, tight per-batch ms) or by the client (low per-batch ms but few
-        # in flight)? Compared across batch_parallelism/batch_rows sweeps.
-        self.batch_ms: list[float] = []
+def _fmt_ms(ms: "float | None") -> str:
+    if ms is None:
+        return "?"
+    return f"{ms / 1000.0:.2f}s" if ms >= 1000 else f"{ms:.0f}ms"
 
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = record.getMessage()
-        except Exception:  # noqa: BLE001 - never let logging break the load
-            return
-        m = self._RE_RETRIES.search(msg)
-        if not m:
-            return
-        retries = int(m.group(1))
-        self.batches += 1
-        self.total_retries += retries
-        if retries:
-            self.batches_with_retry += 1
-        a = self._RE_ATTEMPTED.search(msg)
-        if a:
-            self.rows_attempted += int(a.group(1))
-        e = self._RE_ELAPSED.search(msg)
-        if e:
-            self.batch_ms.append(float(e.group(1)))
+
+def _window_counts(delta: dict, seconds: float) -> dict:
+    """The write-path counters of one window, from a ``diff_load_stats`` delta."""
+    from dsql_migrator.core.load_stats import histogram_percentile
+
+    retries = dict(delta.get("retries") or {})
+    oc000 = retries.pop("40001/OC000", 0)
+    oc001 = retries.pop("40001/OC001", 0)
+    oc_unparsed = retries.pop("40001", 0)
+    # The post-load CREATE INDEX ASYNC submissions' retries, kept apart from the data's.
+    index_retries = dict(delta.get("index_retries") or {})
+    index_occ = sum(n for code, n in index_retries.items() if str(code).startswith("40001"))
+    cpu = delta.get("cpu_s")
+    # Seconds the worker processes ran in the window, summed over them.
+    busy = float(delta.get("wall_s") or 0.0)
+    batch_ms = delta.get("batch_ms") or {}
+    execute_ms = delta.get("execute_ms") or {}
+    return {
+        "batches": int(delta.get("batches") or 0),
+        "batches_failed": int(delta.get("batches_failed") or 0),
+        "batch_ms_p50": histogram_percentile(batch_ms, 50),
+        "batch_ms_p95": histogram_percentile(batch_ms, 95),
+        "execute_ms_p50": histogram_percentile(execute_ms, 50),
+        "execute_ms_p95": histogram_percentile(execute_ms, 95),
+        "oc000": int(oc000),
+        "oc001": int(oc001),
+        "oc_unparsed": int(oc_unparsed),
+        # Every other retried code (XX000, a class-08 drop, "conn" for a socket that died
+        # with no SQLSTATE), summed.
+        "retries_other": int(sum(retries.values())),
+        "index_retries": int(sum(index_retries.values())),
+        # Every 40001 the workers met in the window, data writes and index submissions
+        # alike: the figure to hold against CloudWatch's OccConflicts for the same minute.
+        "occ_conflicts": int(oc000 + oc001 + oc_unparsed + index_occ),
+        "unique_recoveries": int(delta.get("unique_recoveries") or 0),
+        "reconnects": int(delta.get("reconnects") or 0),
+        "reader_blocked_s": round(float(delta.get("reader_blocked_s") or 0.0), 3),
+        "writer_wait_s": round(float(delta.get("writer_wait_s") or 0.0), 3),
+        "worker_cpu_s": round(float(cpu), 3) if cpu is not None else None,
+        # CPU cores the worker processes used across the window (all of them together).
+        "worker_cores": round(float(cpu) / seconds, 2) if cpu is not None and seconds > 0
+        else None,
+        # How many worker processes ran, on average, and the cores each used while it ran:
+        # the client-bound (about 1 core) vs target-bound reading.
+        "worker_processes": round(busy / seconds, 2) if busy and seconds > 0 else None,
+        "cores_per_worker": round(float(cpu) / busy, 2) if cpu is not None and busy else None,
+    }
+
+
+def _table_window(delta: dict, seconds: float, units: int) -> dict:
+    """One table's write-path figures in one window, from a ``diff_load_stats`` delta of
+    its merged units.
+
+    The per-worker figures divide by the seconds the table's worker processes ran in the
+    window (their ``wall_s``), so a shard that already finished, or has not started, does
+    not dilute them. A unit with no process clock (the in-process tp=1 path) counts the
+    whole window, once per unit.
+    """
+    from dsql_migrator.core.load_stats import histogram_percentile
+
+    cpu = delta.get("cpu_s")
+    busy = float(delta.get("wall_s") or 0.0) or seconds * max(1, int(units or 1))
+    return {
+        "workers": round(busy / seconds, 2) if seconds > 0 else None,
+        "cores": round(float(cpu) / seconds, 2) if cpu is not None and seconds > 0 else None,
+        "cores_per_worker": round(float(cpu) / busy, 2) if cpu is not None and busy else None,
+        "reader_blocked_pct": round(
+            100.0 * float(delta.get("reader_blocked_s") or 0.0) / busy, 1) if busy else None,
+        "writer_wait_pct": round(
+            100.0 * float(delta.get("writer_wait_s") or 0.0) / busy, 1) if busy else None,
+        "batch_ms_p50": histogram_percentile(delta.get("batch_ms"), 50),
+        "retries": int(sum((delta.get("retries") or {}).values())),
+    }
 
 
 def _abbrev(n: "int | None") -> str:
@@ -310,36 +394,57 @@ class _CpuSampler:
         return pct
 
 
-def _monitor_full_load(jm, job_id: str, tables, interval: float) -> dict:
-    """Block until the job leaves RUNNING, logging live per-table progress.
+def _monitor_full_load(jm, job_id: str, tables, interval: float, board=None) -> dict:
+    """Block until the job finishes, logging one progress window per poll.
 
     Reads the same thread-safe ``get_status`` snapshot the UI polls (never mutates
     the job), so it is safe and read-only. For each poll it logs, per table that is
-    IN_PROGRESS or newly DONE, the rows loaded vs the watermark's approximate target
-    (a %), the instantaneous rows/s since the previous poll, and an ETA from the
-    remaining rows at that instantaneous rate. The watermark row-counts are scan-free
-    estimates (``information_schema``), so % / ETA are approximate by design -- they
-    exist to show the run is alive and roughly how far along, not to be exact.
+    IN_PROGRESS, the rows loaded vs the watermark's approximate target (a %), the
+    instantaneous rows/s since the previous poll, and an ETA from the remaining rows at
+    that instantaneous rate. The watermark row-counts are scan-free estimates
+    (``information_schema``), so % / ETA are approximate by design -- they exist to show
+    the run is alive and roughly how far along, not to be exact.
+
+    The polls end on wall-clock multiples of ``interval`` (:func:`_next_boundary`), and
+    the last one the moment the job's thread ends (``jm.wait``), so neither a window nor
+    the run's wall time is rounded up to a poll. With ``board`` (the run's
+    LoadStatsBoard) a window also carries the workers' write-path counters that arrived
+    in it -- OC000 / OC001 per window, to hold against CloudWatch's OccConflicts (the
+    workers send them every couple of seconds) -- and, under ``tables``, each running
+    table's rows/s, worker cores and read-ahead queue waits (:func:`_table_window`).
 
     Also samples the container's cgroup CPU%/memory each poll (Linux/Fargate only;
-    "n/a" on macOS) and returns the PEAK ``{"cpu_pct", "mem_bytes"}`` for the report,
-    so an A/B run records whether Full Load was CPU-saturated.
+    "n/a" on macOS). Returns ``{"peak": {"cpu_pct", "mem_bytes"}, "windows": [...],
+    "finished_at": epoch}``.
     """
     from dsql_migrator.core.job_manager import JobNotFoundError
+    from dsql_migrator.core.load_stats import diff_load_stats
 
+    interval = max(1.0, float(interval))
+    if 60.0 % interval and interval % 60.0:
+        log(f"note: --progress-interval {interval:g}s does not divide a minute, so only "
+            "some windows end on a minute boundary")
     total_expected = len(tables)
-    # Per-table last-seen (rows_loaded, monotonic_ts) to derive instantaneous rows/s.
+    # Per-table last-seen (rows_loaded, epoch) to derive instantaneous rows/s.
     last: dict[str, tuple[int, float]] = {}
     cpu_sampler = _CpuSampler()  # cgroup CPU% between polls (None on macOS/no cgroup)
     peak = {"cpu_pct": None, "mem_bytes": None}  # returned for the report
-    start = time.monotonic()
+    windows: list[dict] = []
+    start = window_start = time.time()
+    prev_rows = 0
+    prev_run: dict = {}
+    prev_tables: dict[str, dict] = {}
     while True:
-        time.sleep(max(1.0, interval))
+        boundary = _next_boundary(time.time(), interval)
+        finished = jm.wait(job_id, timeout=max(0.0, boundary - time.time()))
+        if not finished and boundary > time.time():
+            time.sleep(boundary - time.time())  # a join can return a hair early
         try:
             job = jm.get_status(job_id)
         except JobNotFoundError:
-            return peak
-        now = time.monotonic()
+            return {"peak": peak, "windows": windows, "finished_at": time.time()}
+        now = time.time()
+        seconds = max(1e-6, now - window_start)
         wm_counts = {}
         wm = getattr(job, "watermark", None)
         if wm is not None:
@@ -350,6 +455,7 @@ def _monitor_full_load(jm, job_id: str, tables, interval: float) -> dict:
         active = [c for c in job.chunks if c.status == "IN_PROGRESS"]
         total_loaded = sum(int(c.rows_loaded or 0) for c in job.chunks)
         overall_rps = total_loaded / (now - start) if now > start else 0.0
+        window_rows = max(0, total_loaded - prev_rows)
 
         # Resource line: CPU% (100% = 1 core; a 4-vCPU task tops out ~400%) + memory.
         # Shows whether Full Load is CPU-saturated -- the bottleneck we tune CPU for.
@@ -372,32 +478,183 @@ def _monitor_full_load(jm, job_id: str, tables, interval: float) -> dict:
             ) if mem_cur is not None else "mem n/a"
             res = f" | {cpu_s} {mem_s}"
 
-        header = (
-            f"progress: {done}/{total_expected} done"
-            f"{(', ' + str(failed) + ' failed') if failed else ''}"
-            f" | {_abbrev(total_loaded)} rows | ~{overall_rps:,.0f} rows/s overall"
-            f"{res}"
+        run_stats = board.run() if board is not None else {}
+        table_stats = board.tables() if board is not None else {}
+        counts = (
+            _window_counts(diff_load_stats(run_stats, prev_run), seconds)
+            if run_stats else None
         )
-        log(header)
-        for c in active:
+        window = {
+            "start": _iso(window_start), "end": _iso(now), "seconds": round(seconds, 3),
+            "rows": window_rows, "rows_per_sec": round(window_rows / seconds, 1),
+            "tables_done": done, "tables_failed": failed, "tables_active": len(active),
+            "cpu_pct": round(cpu_pct, 1) if cpu_pct is not None else None,
+            "mem_bytes": mem_cur,
+        }
+        if counts is not None:
+            window.update(counts)
+        windows.append(window)
+
+        log(
+            f"progress [{_utc(window_start)}-{_utc(now)} UTC]: {done}/{total_expected} done"
+            f"{(', ' + str(failed) + ' failed') if failed else ''}"
+            f" | {_abbrev(total_loaded)} rows | window {window_rows / seconds:,.0f} rows/s, "
+            f"~{overall_rps:,.0f} rows/s overall{res}"
+        )
+        if counts is not None:
+            cores = counts["worker_cores"]
+            per_worker = counts["cores_per_worker"]
+            log(
+                f"  writes: {counts['batches']} batches (p50 {_fmt_ms(counts['batch_ms_p50'])},"
+                f" p95 {_fmt_ms(counts['batch_ms_p95'])}; INSERT p50 "
+                f"{_fmt_ms(counts['execute_ms_p50'])}) | OC000 {counts['oc000']}, OC001 "
+                f"{counts['oc001']}, 40001 unparsed {counts['oc_unparsed']}, other retries "
+                f"{counts['retries_other']}, index retries {counts['index_retries']} "
+                f"(all 40001: {counts['occ_conflicts']})"
+                f" | 23505 recovered {counts['unique_recoveries']}"
+                f" | reconnects {counts['reconnects']} | reader blocked "
+                f"{counts['reader_blocked_s']:.1f}s, writers waiting "
+                f"{counts['writer_wait_s']:.1f}s"
+                + (f" | workers {cores:.2f} cores" if cores is not None else "")
+                + (f" ({counts['worker_processes']:.1f} processes, {per_worker:.2f} each)"
+                   if per_worker is not None else "")
+            )
+        # Per table: every table running at this poll, plus one that ran at the previous
+        # poll and has ended since (its last, partial window). Into the window's JSON too.
+        per_table: dict[str, dict] = {}
+        for c in job.chunks:
+            running = c.status == "IN_PROGRESS"
+            prev = last.get(c.chunk_id)
+            if not running and prev is None:
+                continue  # not started yet, or its last window is already reported
             loaded = int(c.rows_loaded or 0)
             target = wm_counts.get(c.chunk_id)
-            prev = last.get(c.chunk_id)
             inst_rps = None
             if prev is not None and now > prev[1]:
                 inst_rps = (loaded - prev[0]) / (now - prev[1])
+            entry = {
+                "status": c.status,
+                "rows": loaded - (prev[0] if prev is not None else 0),
+                # None for the window it started in (it ran only part of it).
+                "rows_per_sec": round(inst_rps, 1) if inst_rps is not None else None,
+            }
+            mine = table_stats.get(c.chunk_id)
+            if mine:
+                entry.update(_table_window(
+                    diff_load_stats(mine, prev_tables.get(c.chunk_id)), seconds,
+                    int(mine.get("units") or 1),
+                ))
+            per_table[c.chunk_id] = entry
+            if not running:
+                last.pop(c.chunk_id, None)
+                continue
             last[c.chunk_id] = (loaded, now)
             pct = f"{100.0 * loaded / target:.1f}%" if target else "?"
             eta = None
             if target and inst_rps and inst_rps > 0:
                 eta = max(0, (target - loaded)) / inst_rps
-            log(f"    {c.chunk_id:<32} {_abbrev(loaded)}/{_abbrev(target)} "
+            line = (
+                f"    {c.chunk_id:<32} {_abbrev(loaded)}/{_abbrev(target)} "
                 f"({pct})  {(f'{inst_rps:,.0f}' if inst_rps is not None else '?'):>8} "
-                f"rows/s  ETA {_fmt_eta(eta)}")
+                f"rows/s  ETA {_fmt_eta(eta)}"
+            )
+            if mine:
+                line += (
+                    (f" | {entry['cores']:.2f} cores" if entry["cores"] is not None else "")
+                    # A table read in K ranges runs K worker processes.
+                    + (f" ({entry['cores_per_worker']:.2f}/worker)"
+                       if entry["cores_per_worker"] is not None
+                       and int(mine.get("units") or 1) > 1 else "")
+                    + f" | reader blocked {entry['reader_blocked_pct'] or 0:.0f}%"
+                    f", writers waiting {entry['writer_wait_pct'] or 0:.0f}%"
+                    f" | batch p50 {_fmt_ms(entry['batch_ms_p50'])}"
+                )
+            log(line)
+        if per_table:
+            window["tables"] = per_table
 
-        if job.status not in ("PENDING", "RUNNING"):
+        prev_rows, prev_run, prev_tables = total_loaded, run_stats, table_stats
+        window_start = now
+        if finished or job.status not in ("PENDING", "RUNNING"):
             log(f"job {job.status} after {now - start:.1f}s")
-            return peak
+            return {"peak": peak, "windows": windows, "finished_at": now}
+
+
+# Aurora DSQL's asynchronous jobs (CREATE INDEX ASYNC builds, VALIDATE CONSTRAINT, ...) still
+# running. An arm that starts while an earlier run's index builds still run shares the
+# cluster with them, so --wait-sys-jobs holds the start until none is left.
+_SYS_JOBS_RUNNING = ("submitted", "processing")
+
+
+def _sys_jobs_running(conn) -> dict:
+    """``{status: count}`` of the sys.jobs rows still submitted or processing (a read)."""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT status FROM sys.jobs")
+        rows = cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    counts: dict = {}
+    for row in rows or ():
+        status = str((row[0] if row else "") or "").strip().lower()
+        if status in _SYS_JOBS_RUNNING:
+            counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _wait_for_sys_jobs(connect, max_wait: float, *, poll: float = 15.0,
+                       sleep=time.sleep, clock=time.monotonic) -> dict:
+    """Wait until Aurora DSQL's sys.jobs has no submitted/processing job, at most
+    ``max_wait`` seconds.
+
+    Returns ``{"drained", "waited_seconds", "running", "read_errors"}``: ``running`` is the
+    last count read successfully (``{}`` once drained, or when no read ever succeeded). A
+    read that fails is retried on a fresh connection at the next poll; reads that keep
+    failing leave ``drained`` False once the bound runs out -- unknown is never "drained".
+    """
+    started = clock()
+    conn = None
+    running: "dict | None" = None
+    last_read: dict = {}
+    errors = 0
+    try:
+        while True:
+            try:
+                if conn is None:
+                    conn = connect()
+                running = last_read = _sys_jobs_running(conn)
+            except Exception as exc:  # noqa: BLE001 - a failed read is retried, never fatal
+                errors += 1
+                log(f"[sys.jobs] read failed ({type(exc).__name__}); retrying on a new "
+                    "connection")
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                conn = None
+            waited = clock() - started
+            if running == {}:
+                return {"drained": True, "waited_seconds": round(waited, 1),
+                        "running": {}, "read_errors": errors}
+            if waited >= max_wait:
+                return {"drained": False, "waited_seconds": round(waited, 1),
+                        "running": last_read, "read_errors": errors}
+            if running:
+                log(f"[sys.jobs] {sum(running.values())} async job(s) still running "
+                    f"({', '.join(f'{k} {v}' for k, v in sorted(running.items()))}); "
+                    f"waited {waited:.0f}s of {max_wait:.0f}s")
+            running = None
+            sleep(min(poll, max(0.0, max_wait - waited)))
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def cmd_full_load(args) -> int:
@@ -424,7 +681,8 @@ def cmd_full_load(args) -> int:
     if getattr(args, "no_prefetch", False):
         os.environ["DSQL_MIGRATOR_FULL_LOAD_PREFETCH"] = "0"
     # --reader-shards K sets reader range sharding (K concurrent readers per large
-    # single-integer-PK table); 1 = off. Same one-image A/B pattern as prefetch.
+    # single-integer-PK table); 1 = off. Same one-image A/B pattern as prefetch. A MySQL
+    # table is split only in a Full load + CDC run from a binlog start point (--cdc-mode).
     if getattr(args, "reader_shards", 0):
         os.environ["DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS"] = str(args.reader_shards)
 
@@ -433,6 +691,7 @@ def cmd_full_load(args) -> int:
     )
     from dsql_migrator.core.error_log import ErrorLogStore
     from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.core.load_stats import LoadStatsBoard
     from dsql_migrator.core.table_selection import TableSelection, TableSelector
     # These moved out of the (now-removed) _engine module into _full_load_engine and are
     # re-exported from the data_migration package -- import from the package so this keeps
@@ -465,20 +724,14 @@ def cmd_full_load(args) -> int:
             raise SystemExit(f"--tables not found in {schema}: {sorted(missing)}")
     tables = TableSelector().resolve(inventory, TableSelection(selected_tables=wanted))
 
-    # Turn on the per-batch DEBUG trace and attach our OCC counter to the loader's
-    # logger only (not the root), so we capture occ_retries without noisy output.
-    counter = _OccTraceCounter()
-    importer_logger = logging.getLogger("dsql_migrator.core.batched_import")
-    prev_level = importer_logger.level
-    importer_logger.setLevel(logging.DEBUG)
-    importer_logger.addHandler(counter)
     # Surface the retry-loop diagnostics (per-attempt DEBUG + give-up WARNING) to
     # stdout/CloudWatch via a dedicated handler on the occ logger: which error, its
     # SQLSTATE, attempt count, and total elapsed per failed batch -- direct evidence
     # of WHY a batch failed (budget too small vs a storm longer than the budget vs a
-    # non-transient error), instead of inferring from timing.
+    # non-transient error), instead of inferring from timing. It sees only the work
+    # that runs in THIS process (the replace pre-pass, a sharded table's index pass);
+    # the table workers' retries are in the write-path counters below.
     occ_logger = logging.getLogger("dsql_migrator.core.occ")
-    prev_occ_level = occ_logger.level
     occ_logger.setLevel(logging.DEBUG)
     _occ_handler = logging.StreamHandler(sys.stdout)
     _occ_handler.setFormatter(logging.Formatter("[occ] %(levelname)s %(message)s"))
@@ -518,21 +771,55 @@ def cmd_full_load(args) -> int:
         log(f"[composite] leading='{leading}' applied to "
             f"{len(table_conversions)}/{len(tables)} tables")
 
+    # --wait-sys-jobs: hold the start until Aurora DSQL's async jobs (an earlier run's
+    # index builds) have drained, at most the given seconds -- an arm that starts on a
+    # busy cluster measures that cluster, not this load. Read-only.
+    gate = None
+    if getattr(args, "wait_sys_jobs", None) is not None:
+        log(f"[sys.jobs] waiting for no submitted/processing job "
+            f"(at most {args.wait_sys_jobs:.0f}s) ...")
+        gate = _wait_for_sys_jobs(_target_conn, float(args.wait_sys_jobs))
+        gate["max_wait_seconds"] = float(args.wait_sys_jobs)
+        if not gate["drained"]:
+            if gate["running"]:
+                log(f"[sys.jobs] still {sum(gate['running'].values())} job(s) running after "
+                    f"{gate['waited_seconds']:.0f}s ({gate['read_errors']} failed read(s)); "
+                    "not starting. Wait longer (--wait-sys-jobs SECONDS) or check sys.jobs.")
+            else:
+                log(f"[sys.jobs] could not be read in {gate['waited_seconds']:.0f}s "
+                    f"({gate['read_errors']} failed read(s)); not starting. Check the "
+                    "target connection, then run again.")
+            return 3
+        log(f"[sys.jobs] drained after {gate['waited_seconds']:.0f}s")
+
+    # --cdc-mode: a Full load + CDC run (is_cdc_migration) -- the start point is captured
+    # and, on MySQL, fenced (G147) exactly as the product does before any read, which is
+    # what lets a MySQL table be read in --reader-shards ranges. No CDC stack is involved:
+    # the load itself needs none, and no PostgreSQL slot is created (no cdc_stack_name).
+    cdc_mode = bool(getattr(args, "cdc_mode", False))
     inputs = DataMigrationInputs(
         source_config=source, source_password=password, target_config=target,
         inventory=inventory, aws_profile=os.environ.get("AWS_PROFILE"),
         replace_tables=frozenset(wanted),  # clean slate: plain INSERT, real OCC surfaces
         table_conversions=table_conversions,
+        is_cdc_migration=cdc_mode,
     )
     migrator = default_migrator_factory(inputs)
     error_log = ErrorLogStore()
     jm = JobManager(stall_timeout_seconds=None)
+    # The table workers' write-path counters, live (beside each progress flush) and final
+    # (with each result), per table and per run.
+    board = LoadStatsBoard()
 
     def work(handle) -> None:
-        run_full_load(handle, tables, migrator=migrator, error_log=error_log)
+        run_full_load(
+            handle, tables, migrator=migrator, error_log=error_log, load_stats=board
+        )
 
     log(f"Full Load '{schema}' ({len(tables)} tables) at "
-        f"tp={args.table_parallelism} bp={args.batch_parallelism} ...")
+        f"tp={args.table_parallelism} bp={args.batch_parallelism}"
+        f"{' as Full load + CDC' if cdc_mode else ''} ...")
+    started_at = time.time()
     t0 = time.monotonic()
     job_id = jm.submit(work)
     # Instead of blocking silently on jm.wait(), poll the live job snapshot on a
@@ -541,96 +828,20 @@ def cmd_full_load(args) -> int:
     # PROGRESS_FLUSH_ROWS as batches land), so this turns a long, opaque load into a
     # monitorable one -- the whole point of a perf run. Read-only: it only reads the
     # same get_status() snapshot the UI polls; it never mutates the job.
-    peak_resources = _monitor_full_load(
-        jm, job_id, tables, interval=args.progress_interval
+    monitor = _monitor_full_load(
+        jm, job_id, tables, interval=args.progress_interval, board=board
     )
+    # Exact: the monitor returns the moment the job's thread ends, not at the next poll.
     elapsed = time.monotonic() - t0
-    importer_logger.removeHandler(counter)
-    importer_logger.setLevel(prev_level)
 
     job = jm.get_status(job_id)
-    total_rows = sum(int(c.rows_loaded or 0) for c in job.chunks)
-    per_table = []
-    for c in job.chunks:
-        secs = None
-        if c.started_at and c.finished_at:
-            secs = (c.finished_at - c.started_at).total_seconds()
-        rps = (c.rows_loaded / secs) if (secs and secs > 0) else None
-        per_table.append({
-            "table": c.chunk_id, "status": c.status,
-            "rows_loaded": c.rows_loaded, "seconds": round(secs, 2) if secs else None,
-            "rows_per_sec": round(rps, 1) if rps else None,
-        })
-
-    # DATA-PHASE throughput = total_rows / (last chunk finish - first chunk start).
-    # This excludes wall-time spent OUTSIDE the actual row loading -- job submit,
-    # DROP+recreate DDL, and the post-data tail where one table finished before the
-    # other so parallelism dropped. The adversarial perf review found that tail
-    # (~18.6s in the local prefetch run) dragged overall_rows_per_sec below the true
-    # loading rate and made a killed-at-95%% baseline (a mid-run cumulative) look
-    # falsely faster. data_phase_rows_per_sec is the apples-to-apples metric to
-    # compare variants on; overall_rows_per_sec is kept for continuity.
-    starts = [c.started_at for c in job.chunks if c.started_at]
-    finishes = [c.finished_at for c in job.chunks if c.finished_at]
-    data_phase_secs = None
-    if starts and finishes:
-        span = (max(finishes) - min(starts)).total_seconds()
-        data_phase_secs = span if span > 0 else None
-    data_phase_rps = (
-        round(total_rows / data_phase_secs, 1) if data_phase_secs else None
+    report = _full_load_report(
+        args, job, board, elapsed=elapsed, started_at=started_at,
+        finished_at=monitor["finished_at"], monitor=monitor, leading=leading,
+        composite_tables=len(table_conversions), gate=gate, cdc_mode=cdc_mode,
     )
 
-    retry_rate = (counter.total_retries / counter.batches) if counter.batches else 0.0
-    report = {
-        "subcommand": "full-load", "schema": schema,
-        "prefetch": not getattr(args, "no_prefetch", False),
-        # Composite-PK A/B: which variant this run measured. composite_leading is
-        # the prepended leading column (None = KEEP-integer baseline); composite is
-        # a convenience boolean, and composite_tables how many tables got the key.
-        "composite": bool(leading and table_conversions),
-        "composite_leading": leading or None,
-        "composite_tables": len(table_conversions),
-        # Short label consumed by perf_compare.py's comparison table.
-        "variant": {
-            "label": f"composite:{leading}" if (leading and table_conversions)
-            else "keep-integer",
-        },
-        "table_parallelism": args.table_parallelism,
-        "batch_parallelism": args.batch_parallelism,
-        "batch_rows": int(cfg("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "2000")),
-        "reader_shards": int(cfg("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")),
-        "status": job.status, "wall_seconds": round(elapsed, 2),
-        "total_rows": total_rows,
-        "overall_rows_per_sec": round(total_rows / elapsed, 1) if elapsed > 0 else None,
-        "data_phase_seconds": round(data_phase_secs, 2) if data_phase_secs else None,
-        "data_phase_rows_per_sec": data_phase_rps,
-        "peak_cpu_pct": peak_resources.get("cpu_pct"),
-        "peak_mem_bytes": peak_resources.get("mem_bytes"),
-        "occ": {
-            "batches": counter.batches,
-            "total_retries": counter.total_retries,
-            "batches_with_retry": counter.batches_with_retry,
-            "avg_retries_per_batch": round(retry_rate, 4),
-            "pct_batches_with_retry": round(
-                100.0 * counter.batches_with_retry / counter.batches, 2)
-            if counter.batches else 0.0,
-        },
-        # Per-batch write round-trip distribution (ms). Tells write-bound vs
-        # client-bound: high & tight = DSQL write RTT is the wall (raising
-        # batch_parallelism helps until the target saturates); low = the client
-        # isn't keeping enough batches in flight.
-        "write_rtt_ms": {
-            "samples": len(counter.batch_ms),
-            "p50": round(_pct(counter.batch_ms, 50), 1) if counter.batch_ms else None,
-            "p95": round(_pct(counter.batch_ms, 95), 1) if counter.batch_ms else None,
-            "max": round(max(counter.batch_ms), 1) if counter.batch_ms else None,
-            "mean": round(statistics.fmean(counter.batch_ms), 1)
-            if counter.batch_ms else None,
-        },
-        "per_table": per_table,
-    }
-
-    log(f"status={job.status} wall={elapsed:.1f}s rows={total_rows} "
+    log(f"status={job.status} wall={elapsed:.1f}s rows={report['total_rows']} "
         f"overall={report['overall_rows_per_sec']} rows/s")
     # Surface WHY the job failed. A failure that propagates out of run_full_load
     # (e.g. a pre-pass DROP+recreate error, before any table worker runs) is stored
@@ -656,23 +867,204 @@ def cmd_full_load(args) -> int:
             log(f"DATA ERRORS ({len(data_errors)}):")
             for e in data_errors[:20]:
                 log(f"  [{e.table}/{e.chunk_id}] {e.error_code or ''} {e.message}")
-    if counter.batch_ms:
-        w = report["write_rtt_ms"]
-        log(f"write RTT/batch: p50={w['p50']}ms p95={w['p95']}ms max={w['max']}ms "
-            f"mean={w['mean']}ms (n={w['samples']}) at bp={args.batch_parallelism} "
-            f"batch_rows={report['batch_rows']}")
-    log(f"OCC: {counter.batches} batches, {counter.total_retries} total 40001 retries, "
-        f"{report['occ']['pct_batches_with_retry']}% of batches retried "
-        f"(avg {retry_rate:.3f}/batch) at tp={args.table_parallelism} "
-        f"bp={args.batch_parallelism}")
-    log("  (re-run with higher --table/--batch-parallelism to see the hot-PK "
-        "contention curve; a monotonic AUTO_INCREMENT PK raises this.)")
-    for r in per_table:
-        log(f"  {r['table']:<28} {str(r['status']):<8} rows={r['rows_loaded']:<8} "
-            f"{r['seconds']}s  {r['rows_per_sec']} rows/s")
-
+    _log_full_load_summary(report)
     _maybe_write_report(args, report)
     return 0 if job.status == "DONE" else 1
+
+
+def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
+                      finished_at: float, monitor: dict, leading: str = "",
+                      composite_tables: int = 0, gate=None, cdc_mode: bool = False) -> dict:
+    """The JSON report of one full-load run: the job's tables plus the table workers' own
+    counters (``board``). Counts and timings only."""
+    from dsql_migrator.core.load_stats import summarize_load_stats
+
+    total_rows = sum(int(c.rows_loaded or 0) for c in job.chunks)
+    table_stats = board.tables() if board is not None else {}
+    per_table = []
+    for c in job.chunks:
+        secs = None
+        if c.started_at and c.finished_at:
+            secs = (c.finished_at - c.started_at).total_seconds()
+        rps = (c.rows_loaded / secs) if (secs and secs > 0) else None
+        stats = summarize_load_stats(table_stats.get(c.chunk_id))
+        window = stats.get("load_window_s") if stats else None
+        per_table.append({
+            "table": c.chunk_id, "status": c.status,
+            "rows_loaded": c.rows_loaded, "seconds": round(secs, 2) if secs else None,
+            "rows_per_sec": round(rps, 1) if rps else None,
+            # How many primary-key ranges the table was read in (None: one reader).
+            "reader_shards": getattr(c, "reader_shards", None),
+            # Rows over the table's own data pass only (no index submission, no COUNT).
+            "load_rows_per_sec": round(c.rows_loaded / window, 1) if window else None,
+            "load_stats": stats or None,
+        })
+
+    # DATA-PHASE throughput = total_rows / (last chunk finish - first chunk start).
+    # This excludes wall-time spent OUTSIDE the actual row loading -- job submit,
+    # DROP+recreate DDL, and the post-data tail where one table finished before the
+    # other so parallelism dropped. The adversarial perf review found that tail
+    # (~18.6s in the local prefetch run) dragged overall_rows_per_sec below the true
+    # loading rate and made a killed-at-95%% baseline (a mid-run cumulative) look
+    # falsely faster. data_phase_rows_per_sec is the apples-to-apples metric to
+    # compare variants on; overall_rows_per_sec is kept for continuity. A chunk starts
+    # when its worker begins and finishes when the parent records its result, so this
+    # span includes each table's index submission and post-load COUNT; ``load_window``
+    # below is the workers' data passes alone.
+    starts = [c.started_at for c in job.chunks if c.started_at]
+    finishes = [c.finished_at for c in job.chunks if c.finished_at]
+    data_phase_secs = None
+    if starts and finishes:
+        span = (max(finishes) - min(starts)).total_seconds()
+        data_phase_secs = span if span > 0 else None
+    data_phase_rps = (
+        round(total_rows / data_phase_secs, 1) if data_phase_secs else None
+    )
+
+    run = summarize_load_stats(board.run()) if board is not None else {}
+    window_secs = run.get("load_window_s")
+    statements = run.get("statements") or 0
+    wm = getattr(job, "watermark", None)
+    peak = monitor.get("peak") or {}
+    return {
+        "subcommand": "full-load", "schema": args.schema,
+        "prefetch": not getattr(args, "no_prefetch", False),
+        # Composite-PK A/B: which variant this run measured. composite_leading is
+        # the prepended leading column (None = KEEP-integer baseline); composite is
+        # a convenience boolean, and composite_tables how many tables got the key.
+        "composite": bool(leading and composite_tables),
+        "composite_leading": leading or None,
+        "composite_tables": composite_tables,
+        # Short label consumed by perf_compare.py's comparison table.
+        "variant": {
+            "label": f"composite:{leading}" if (leading and composite_tables)
+            else "keep-integer",
+        },
+        "table_parallelism": args.table_parallelism,
+        "batch_parallelism": args.batch_parallelism,
+        "batch_rows": int(cfg("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "2000")),
+        "reader_shards": int(cfg("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")),
+        # --cdc-mode: a Full load + CDC run. Whether its start point had a binlog
+        # coordinate / an LSN (MySQL splits a table only with a binlog one) and which
+        # fence made it exact -- never the coordinate itself.
+        "cdc_mode": cdc_mode,
+        "start_point": {
+            "binlog": bool(getattr(wm, "binlog_file", None)),
+            "gtid": bool(getattr(wm, "gtid_executed", None)),
+            "wal_lsn": bool(getattr(wm, "wal_lsn", None)),
+            "fence": getattr(wm, "start_point_fence", None),
+        } if wm is not None else None,
+        "sys_jobs_gate": gate,
+        "status": job.status,
+        "started_at": _iso(started_at), "finished_at": _iso(finished_at),
+        "wall_seconds": round(elapsed, 2),
+        "total_rows": total_rows,
+        "overall_rows_per_sec": round(total_rows / elapsed, 1) if elapsed > 0 else None,
+        "data_phase_started_at": _iso(min(starts)) if starts else None,
+        "data_phase_finished_at": _iso(max(finishes)) if finishes else None,
+        "data_phase_seconds": round(data_phase_secs, 2) if data_phase_secs else None,
+        "data_phase_rows_per_sec": data_phase_rps,
+        # The workers' data passes alone: the first batch of any table to the last of any.
+        "load_window": {
+            "started_at": run.get("load_started_at"),
+            "finished_at": run.get("load_finished_at"),
+            "seconds": window_secs,
+            "rows_per_sec": round(total_rows / window_secs, 1) if window_secs else None,
+        },
+        # Seconds summed over the tables (they overlap in wall time): writing rows,
+        # submitting the post-load CREATE INDEX ASYNC statements (the builds run on after),
+        # and the post-load COUNT(*) of each replace table.
+        "phases_seconds": {
+            "load": run.get("load_s"), "index": run.get("index_s"),
+            "count": run.get("count_s"),
+        },
+        "peak_cpu_pct": peak.get("cpu_pct"),
+        "peak_mem_bytes": peak.get("mem_bytes"),
+        # The workers' own retry counts (before R0 this read the parent's logger, which no
+        # worker writes to, so it was always 0). A "batch" here is a statement: one per
+        # batch unless a permanently failing row split it.
+        "occ": {
+            "source": "workers",
+            "batches": run.get("batches", 0),
+            "statements": statements,
+            "attempts": run.get("attempts", 0),
+            "total_retries": run.get("retries_total", 0),
+            "retries_by_sqlstate": run.get("retries", {}),
+            "oc000": run.get("oc000", 0),
+            "oc001": run.get("oc001", 0),
+            "oc_unparsed": run.get("oc_unparsed", 0),
+            "retries_exhausted": run.get("retries_exhausted", 0),
+            "index_retries_by_sqlstate": run.get("index_retries", {}),
+            "batches_with_retry": run.get("statements_retried", 0),
+            "avg_retries_per_batch": round(
+                (run.get("attempts", 0) - statements) / statements, 4
+            ) if statements else 0.0,
+            "pct_batches_with_retry": run.get("pct_statements_retried", 0.0),
+        },
+        # One INSERT execute (the driver's rendering + the round trip + the commit), every
+        # attempt. Tells write-bound vs client-bound: high & tight = DSQL write RTT is the
+        # wall; low = the client isn't keeping enough batches in flight.
+        "write_rtt_ms": run.get("execute_ms") or {
+            "samples": 0, "p50": None, "p95": None, "max": None, "mean": None,
+        },
+        # A batch from its first attempt to its outcome (retries and backoff included).
+        "batch_ms": run.get("batch_ms"),
+        "load_stats": run or None,
+        "windows": monitor.get("windows") or [],
+        "per_table": per_table,
+    }
+
+
+def _log_full_load_summary(report: dict) -> None:
+    """The end-of-run lines: the write path as the workers counted it, then per table."""
+    occ = report["occ"]
+    run = report.get("load_stats") or {}
+    w = report["write_rtt_ms"]
+    b = report.get("batch_ms") or {}
+    win = report["load_window"]
+    log(f"load window: {win['started_at']} -> {win['finished_at']} ({win['seconds']}s, "
+        f"{win['rows_per_sec']} rows/s) | data phase {report['data_phase_seconds']}s "
+        f"({report['data_phase_rows_per_sec']} rows/s)")
+    ph = report["phases_seconds"]
+    log(f"phases (summed over tables): load {ph['load']}s, index submission {ph['index']}s, "
+        f"post-load COUNT {ph['count']}s")
+    if report.get("cdc_mode"):
+        sp = report.get("start_point") or {}
+        split = {r["table"]: r["reader_shards"] for r in report["per_table"]
+                 if r.get("reader_shards")}
+        # A MySQL table is read in ranges only from a binlog start point (G137).
+        log(f"Full load + CDC: start point binlog={sp.get('binlog')} gtid={sp.get('gtid')} "
+            f"lsn={sp.get('wal_lsn')} fence={sp.get('fence')} | read in ranges: "
+            f"{split or 'none'}")
+    log(f"batches: {occ['batches']} (p50 {b.get('p50')}ms p95 {b.get('p95')}ms max "
+        f"{b.get('max')}ms) | INSERT execute p50={w['p50']}ms p95={w['p95']}ms "
+        f"max={w['max']}ms (n={w['samples']})")
+    log(f"OCC: {occ['statements']} statements, {occ['attempts']} attempts, "
+        f"{occ['total_retries']} retries {occ['retries_by_sqlstate']} -- OC000 "
+        f"{occ['oc000']}, OC001 {occ['oc001']}, 40001 unparsed {occ['oc_unparsed']}; "
+        f"{occ['pct_batches_with_retry']}% retried, {occ['retries_exhausted']} exhausted "
+        f"at tp={report['table_parallelism']} bp={report['batch_parallelism']}")
+    if run:
+        cores = run.get("worker_cores")
+        log(f"connections: {run.get('connects')} opened, {run.get('reconnects')} reconnects, "
+            f"{run.get('connect_failures')} failed | 23505 recovered "
+            f"{run.get('unique_recoveries')} | queue: reader blocked "
+            f"{run.get('reader_blocked_s')}s, writers waiting {run.get('writer_wait_s')}s"
+            + (f" | workers {run.get('cpu_s')} CPU-s over {run.get('wall_s')} unit-s "
+               f"= {cores} cores each" if cores is not None else "")
+            + (f", peak RSS {_fmt_gib(run.get('peak_rss_bytes'))}"
+               if run.get("peak_rss_bytes") else ""))
+    for r in report["per_table"]:
+        s = r.get("load_stats") or {}
+        extra = ""
+        if s:
+            extra = (f" | load {s.get('load_s')}s index {s.get('index_s')}s count "
+                     f"{s.get('count_s')}s | batch p50 {(s.get('batch_ms') or {}).get('p50')}ms"
+                     f" | retries {s.get('retries_total')}"
+                     + (f" | {s.get('worker_cores')} cores" if s.get("worker_cores") is not None
+                        else ""))
+        log(f"  {r['table']:<28} {str(r['status']):<8} rows={r['rows_loaded']:<8} "
+            f"{r['seconds']}s  {r['rows_per_sec']} rows/s{extra}")
 
 
 # =========================================================================== #
@@ -891,14 +1283,30 @@ def main() -> int:
     fl.add_argument("--batch-rows", type=int, default=0,
                     help="rows per write batch (0 = tool default 2000, max 3000)")
     fl.add_argument("--progress-interval", type=float, default=15.0,
-                    help="seconds between live progress logs during the load "
-                         "(default 15; min 1)")
+                    help="seconds per live progress window (default 15; min 1). Windows "
+                         "end on wall-clock multiples of it (UTC), so 15/20/30/60 line "
+                         "up with CloudWatch's minutes")
     fl.add_argument("--no-prefetch", action="store_true",
                     help="disable the read-ahead prefetch queue (measure the "
                          "pre-improvement baseline path); default keeps it ON")
     fl.add_argument("--reader-shards", type=int, default=0,
                     help="reader range sharding: concurrent readers per large "
-                         "single-int-PK table (0/1 = off = one reader; >1 shards)")
+                         "single-int-PK table (0/1 = off = one reader; >1 shards). "
+                         "A MySQL table is split only with --cdc-mode")
+    fl.add_argument("--cdc-mode", action="store_true",
+                    help="run the load as a Full load + CDC run: the start point "
+                         "(binlog position / LSN) is captured -- and on MySQL fenced "
+                         "with FLUSH BINARY LOGS when GTID is off, as the product does "
+                         "-- before any read, so MySQL tables can be read in "
+                         "--reader-shards ranges. No CDC stack is needed or started, "
+                         "and no PostgreSQL replication slot is created")
+    fl.add_argument("--wait-sys-jobs", type=float, nargs="?", const=1800.0, default=None,
+                    metavar="SECONDS",
+                    help="before starting, wait until Aurora DSQL's sys.jobs has no "
+                         "submitted/processing job (e.g. an earlier run's index "
+                         "builds), at most SECONDS (default 1800); exits 3 without "
+                         "loading if it does not drain. It runs before this run drops "
+                         "and recreates its tables, so it cannot wait out that drop")
     fl.add_argument("--composite-leading", default="",
                     help="measure the COMPOSITE-KEY variant: prepend this "
                          "high-cardinality column to each table's PK "

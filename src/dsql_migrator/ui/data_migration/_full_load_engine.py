@@ -13,6 +13,7 @@ module, so the public import surface is unchanged.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import multiprocessing
 import multiprocessing.queues
@@ -48,6 +49,7 @@ from dsql_migrator.core.introspector import (
     source_error_hint,
 )
 from dsql_migrator.core.job_manager import JobHandle
+from dsql_migrator.core.load_stats import LoadStats, LoadStatsBoard
 from dsql_migrator.core.batched_import import (
     MAX_QUARANTINE_RECORDS,
     BatchedImporter,
@@ -295,6 +297,9 @@ class TableLoadResult:
     # ``(column, kind, replacement, count)`` -- names and counts only. One WARNING
     # activity line per table (_record_zero_dates).
     zero_dates: tuple = ()
+    # The write path's counters for this table (core.load_stats snapshot): counts and
+    # timings only. Empty when the migrator kept none.
+    load_stats: dict = field(default_factory=dict)
 
 
 class _ZeroDateTally:
@@ -948,6 +953,19 @@ _HEARTBEAT = "\x00heartbeat"
 # cannot log_activity (no file handler there), so the parent's drain logs the thread path's
 # own line for it.
 _SOURCE_REREAD = "\x00source-reread"
+# A worker's write-path counters so far, sent every _LOAD_STATS_SECONDS while it loads as
+# ``(_LOAD_STATS, table_name, unit, snapshot)`` -- ``unit`` None for a whole table, the shard
+# index for a shard; ``snapshot`` a cumulative core.load_stats dict (counts and timings only).
+# The drain hands it to the run's LoadStatsBoard, if any: no job update, so it neither
+# persists the job nor stamps the stall watchdog's liveness clock.
+_LOAD_STATS = "\x00load-stats"
+# How often a running load unit sends those counters. On a clock, not with the progress
+# flush: a flush waits for a completed batch (and PROGRESS_FLUSH_ROWS rows or
+# PROGRESS_FLUSH_SECONDS), so an OCC storm that completes no batch sent no counter until it
+# ended, and its OC000 / OC001 and CPU landed in a later progress window than the one they
+# happened in -- the per-minute reading held against CloudWatch. Every 2 s keeps each
+# within 2 s of when it happened.
+_LOAD_STATS_SECONDS = 2.0
 
 # Ceiling for the source-retry backoff. ``base * 2**(attempt-1)`` is uncapped, so raising
 # the retry budget turned a 30 s wait into hours (attempt 10 = 256 x base). Capped like the
@@ -1025,6 +1043,9 @@ class _TableWorkerResult:
     wrote_nothing: bool = False
     # G150: TableLoadResult.zero_dates of this table or shard (a DONE result only).
     zero_dates: tuple = ()
+    # This unit's final write-path counters (core.load_stats snapshot, also its process's
+    # CPU seconds and peak RSS) on every outcome: counts and timings only (Property 7).
+    load_stats: dict = field(default_factory=dict)
 
 
 def _slim_worker_inputs(
@@ -1113,6 +1134,73 @@ def _report_progress(
         progress_queue.put_nowait(message)
     except Exception:  # noqa: BLE001 - queue.Full / closed pipe: telemetry only
         pass
+
+
+def _bind_load_stats(importer: object, stats: Optional[LoadStats]) -> None:
+    """Make ``importer`` count into the load unit's ``stats`` (core.load_stats).
+
+    Duck-typed: an injected importer without ``bind_load_stats`` (a test double) simply
+    reports no write-path counters."""
+    bind = getattr(importer, "bind_load_stats", None)
+    if stats is not None and callable(bind):
+        bind(stats)
+
+
+def _record_load_stats(
+    board: Optional[LoadStatsBoard], table_name: str, unit: object, snapshot: object,
+    *, final: bool = False,
+) -> None:
+    """Hand one unit's counters to the run's board, if the caller keeps one. Telemetry
+    only: nothing here may fail the load."""
+    if board is None or not isinstance(snapshot, dict) or not snapshot:
+        return
+    try:
+        board.record(table_name, unit, snapshot, final=final)
+    except Exception:  # noqa: BLE001 - counters must never break a run
+        _LOGGER.debug("Full Load counters could not be recorded", exc_info=True)
+
+
+def _start_load_stats_ticker(
+    stats: LoadStats, send: Optional[Callable[[dict], None]]
+) -> Callable[[], None]:
+    """Hand ``send`` a snapshot of ``stats`` every :data:`_LOAD_STATS_SECONDS` from a daemon
+    thread, until the returned function is called (it stops and joins the thread).
+
+    The unit's final snapshot travels with its result, so a unit shorter than one tick
+    sends nothing here. ``send`` None (nobody keeps the counters): no thread. Telemetry
+    only -- a failing ``send`` is ignored, never raised into the load."""
+    if send is None:
+        return lambda: None
+    stop = threading.Event()
+
+    def _tick() -> None:
+        while not stop.wait(_LOAD_STATS_SECONDS):
+            try:
+                send(stats.snapshot())
+            except Exception:  # noqa: BLE001 - counters must never break a load
+                pass
+
+    thread = threading.Thread(target=_tick, name="fullload-load-stats", daemon=True)
+    try:
+        thread.start()
+    except Exception:  # noqa: BLE001 - no thread to spare: the result still carries them
+        return lambda: None
+
+    def _stop() -> None:
+        stop.set()
+        thread.join(timeout=1.0)
+
+    return _stop
+
+
+def _takes_load_stats(migrator: object) -> bool:
+    """Whether ``migrator.migrate_table`` takes a ``load_stats`` collector: the real
+    :class:`BatchedTableMigrator` does, a double of the :class:`DataMigrator` protocol
+    need not (it then reports what its result carries, if anything)."""
+    try:
+        return "load_stats" in inspect.signature(migrator.migrate_table).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _sharding_is_consistent(
@@ -1483,9 +1571,17 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
     cancel_event = _worker_cancel_event
     table = args.table
     name = table.name
+    # This unit's write-path counters, across its source-drop retries; its process is its
+    # own, so it also measures the process's CPU seconds and peak RSS (core.load_stats).
+    stats = LoadStats(process_clock=True)
     # Signal that this worker actually began the table, so the parent marks the chunk
     # IN_PROGRESS now (a bounded pool runs only a few at once) rather than at submission.
     _report_progress(progress_queue, (_CHUNK_STARTED, name))
+    stop_ticker = _start_load_stats_ticker(
+        stats,
+        (lambda snapshot: _report_progress(progress_queue, (_LOAD_STATS, name, None, snapshot)))
+        if progress_queue is not None else None,
+    )
     try:
         migrator = BatchedTableMigrator(args.inputs)
         pending_loaded = 0
@@ -1545,6 +1641,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 resume_job=_resume_job,
                 on_throttle=_on_throttle,
                 on_pause_slice=_on_pause_slice,
+                load_stats=stats,
             )
 
         outcome = _as_load_result(
@@ -1574,9 +1671,12 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             quarantine_records=quarantine_recs,
             index_failures=tuple(getattr(outcome, "index_failures", ()) or ()),
             zero_dates=tuple(getattr(outcome, "zero_dates", ()) or ()),
+            load_stats=stats.snapshot(),
         )
     except _FullLoadStopped:
-        return _TableWorkerResult(table_name=name, status="STOPPED")
+        return _TableWorkerResult(
+            table_name=name, status="STOPPED", load_stats=stats.snapshot()
+        )
     except Exception as exc:  # noqa: BLE001
         return _TableWorkerResult(
             table_name=name,
@@ -1587,7 +1687,10 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             # list_failed_full_load_tables, so it must be value-free (Property 7).
             error_message=_worker_error_message(exc, args.inputs),
             error_code=_error_code(exc),
+            load_stats=stats.snapshot(),
         )
+    finally:
+        stop_ticker()
 
 
 def _worker_error_message(exc: BaseException, inputs: "DataMigrationInputs") -> str:
@@ -1652,6 +1755,14 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     # only a range that never handed one on provably wrote nothing.
     written = [0]
     handed = [False]
+    # This shard's write-path counters and its process's CPU / peak RSS (core.load_stats).
+    stats = LoadStats(process_clock=True)
+    stop_ticker = _start_load_stats_ticker(
+        stats,
+        (lambda snapshot: _report_progress(
+            progress_queue, (_LOAD_STATS, name, args.shard_index, snapshot)
+        )) if progress_queue is not None else None,
+    )
     try:
         migrator = BatchedTableMigrator(args.inputs)
         pending_loaded = 0
@@ -1732,6 +1843,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         if shard_key_columns == list(table.primary_key):
             shard_key_columns = None  # unchanged key: keep the existing fallback
         importer = migrator._importer_factory(args.inputs)
+        _bind_load_stats(importer, stats)
         # Apply THIS shard's share of the table's permanently-dropped-row budget (see
         # _ShardWorkerArgs.max_quarantine_records). Set on the built importer rather than
         # threaded through the factory so an INJECTED factory (tests) keeps working.
@@ -1838,6 +1950,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             return _TableWorkerResult(
                 table_name=name, status="STOPPED", shard_index=args.shard_index,
                 rows_loaded=written[0], wrote_nothing=not handed[0],
+                load_stats=stats.snapshot(),
             )
         if result.failures:
             return _TableWorkerResult(
@@ -1845,6 +1958,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 error_message=f"{result.failures} batch(es) failed",
                 rows_loaded=result.rows_loaded, rows_skipped=result.conflicts,
                 wrote_nothing=not handed[0],
+                load_stats=stats.snapshot(),
             )
         quarantine_recs = tuple(
             {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
@@ -1857,11 +1971,13 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             index_failures=tuple(getattr(result, "index_failures", ()) or ()),
             wrote_nothing=not handed[0],
             zero_dates=_zero_dates[0].entries(),
+            load_stats=stats.snapshot(),
         )
     except (_FullLoadStopped, ExportCancelled):
         return _TableWorkerResult(
             table_name=name, status="STOPPED", shard_index=args.shard_index,
             rows_loaded=written[0], wrote_nothing=not handed[0],
+            load_stats=stats.snapshot(),
         )
     except Exception as exc:  # noqa: BLE001
         return _TableWorkerResult(
@@ -1873,7 +1989,10 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             error_code=_error_code(exc),
             rows_loaded=written[0],
             wrote_nothing=not handed[0],
+            load_stats=stats.snapshot(),
         )
+    finally:
+        stop_ticker()
 
 
 # --- Container memory-pressure sampling (OOM diagnostics) -------------------
@@ -2077,12 +2196,15 @@ def _drain_progress_queue(
     handle: JobHandle,
     cancel_event: "multiprocessing.synchronize.Event",
     stop_event: threading.Event,
+    load_stats: Optional[LoadStatsBoard] = None,
 ) -> None:
     """Drain thread: reads progress from worker processes → handle.update().
 
     Also mirrors handle.cancelled → cancel_event so workers stop cooperatively, and
     samples the container's memory each wake so a run approaching the Fargate limit
     leaves a diagnostic trail before an OOM kill (which otherwise leaves no app log).
+    A worker's write-path counters (:data:`_LOAD_STATS`) go to ``load_stats`` (the run's
+    board, if the caller keeps one), never to the job.
     Runs until ``stop_event`` is set AND the queue is empty.
     """
     mem_logger = _MemoryPressureLogger(handle)
@@ -2112,6 +2234,12 @@ def _drain_progress_queue(
                 # "Still alive, deliberately waiting" (a source-retry backoff). Stamps the
                 # watchdog's liveness clock without changing any job state.
                 handle.update(lambda job: None)
+                continue
+            if isinstance(msg, tuple) and len(msg) == 4 and msg[0] == _LOAD_STATS:
+                # Counters only: no job update, so no persist and no liveness stamp. They
+                # are sent on a clock, so stamping would keep a worker that has stopped
+                # making progress looking alive to the stall watchdog.
+                _record_load_stats(load_stats, msg[1], msg[2], msg[3])
                 continue
             if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
                 _log_source_reread(*msg[1:])
@@ -2150,6 +2278,9 @@ def _drain_progress_queue(
         # exception would propagate out of the drain thread's target and be reported as a
         # run failure for work that had already finished.
         try:
+            if isinstance(msg, tuple) and len(msg) == 4 and msg[0] == _LOAD_STATS:
+                _record_load_stats(load_stats, msg[1], msg[2], msg[3])
+                continue
             if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
                 _log_source_reread(*msg[1:])
                 continue
@@ -2387,6 +2518,7 @@ def _migrate_table_with_source_retry(
     *,
     on_rows: Callable[..., None],
     handle: JobHandle,
+    load_stats: Optional[LoadStats] = None,
 ) -> object:
     """Load ``table``, RE-READING it from a fresh snapshot if the source drops.
 
@@ -2412,16 +2544,25 @@ def _migrate_table_with_source_retry(
     Only CONNECTION-level failures retry (:func:`is_source_transient_error`); a data
     or schema error would fail identically forever, so it propagates at once. A
     cooperative stop is honored between attempts and never retried.
+
+    ``load_stats`` (optional) is the table's write-path collector, handed to every attempt
+    so the counters add up across re-reads -- only to a ``migrate_table`` that takes one
+    (:func:`_takes_load_stats`).
     """
     config = load_config()
     attempts = max(1, int(config.full_load_source_retry_attempts))
     backoff = max(0.0, float(config.full_load_source_retry_backoff_seconds))
     name = table.name
+    counted = (
+        {"load_stats": load_stats}
+        if load_stats is not None and _takes_load_stats(migrator)
+        else {}
+    )
 
     for attempt in range(1, attempts + 1):
         try:
             return migrator.migrate_table(
-                table, on_rows=on_rows, should_cancel=lambda: handle.cancelled
+                table, on_rows=on_rows, should_cancel=lambda: handle.cancelled, **counted
             )
         except _FullLoadStopped:
             raise  # a user stop is not a failure to retry
@@ -2470,6 +2611,7 @@ def _migrate_one_table(
     table: TableDef,
     migrator: "DataMigrator",
     error_log: ErrorLogStore,
+    load_stats: Optional[LoadStatsBoard] = None,
 ) -> _TableLoadOutcome:
     """Migrate a single table, recording per-table progress/failure on the job.
 
@@ -2490,6 +2632,11 @@ def _migrate_one_table(
     cooperative stop (handled via cancellation, not as a data error). A
     quarantining table's chunk is still ``DONE`` with the rows that did load, so a
     re-run after fixing the source value idempotently reloads only the gap.
+
+    ``load_stats`` (optional) receives the table's write-path counters: every
+    :data:`_LOAD_STATS_SECONDS` while it loads, and finally on every outcome (loaded,
+    failed or stopped), added up across its source-drop re-reads. This path shares the
+    process with the rest of the run, so they carry no CPU seconds or RSS of their own.
     """
     name = table.name
     # Honor a stop requested before this table started: leave it PENDING so the
@@ -2527,12 +2674,29 @@ def _migrate_one_table(
                 )
             )
 
+    # The table's write-path collector, across its source-drop re-reads, and on the run's
+    # board while it loads; the final counters are recorded on every outcome.
+    stats = LoadStats()
+    stop_ticker = _start_load_stats_ticker(
+        stats,
+        (lambda snapshot: _record_load_stats(load_stats, name, None, snapshot))
+        if load_stats is not None else None,
+    )
+    final_stats: dict = {}
     try:
-        outcome = _as_load_result(
-            _migrate_table_with_source_retry(
-                migrator, table, on_rows=_on_rows, handle=handle
+        try:
+            outcome = _as_load_result(
+                _migrate_table_with_source_retry(
+                    migrator, table, on_rows=_on_rows, handle=handle, load_stats=stats
+                )
             )
-        )
+            # A double that takes no collector may still return counters of its own.
+            final_stats = getattr(outcome, "load_stats", None) or {}
+        finally:
+            stop_ticker()
+            _record_load_stats(
+                load_stats, name, None, final_stats or stats.snapshot(), final=True
+            )
     except _FullLoadStopped:
         # Stopped mid-table by the user: incomplete, so mark it FAILED for retry
         # (the re-load is idempotent). Not a data error -- nothing is logged.
@@ -3215,6 +3379,7 @@ def _migrate_tables_in_parallel(
     *,
     watermark: "Optional[Watermark]" = None,
     fresh_watermark: bool = False,
+    load_stats: Optional[LoadStatsBoard] = None,
 ) -> _RunCounts:
     """Migrate ``tables`` concurrently (bounded), isolating per-table failures.
 
@@ -3235,6 +3400,10 @@ def _migrate_tables_in_parallel(
     one may split a table's read, :func:`_cdc_replays_load`); ``fresh_watermark`` says this
     run captured it, so its row estimates may spare the planning read of a table well below
     the shard minimum (a retry's may be days old).
+
+    ``load_stats`` (optional) collects every load unit's write-path counters as they
+    arrive and their final values from the results, per table (shards merged) and per run
+    (:class:`~dsql_migrator.core.load_stats.LoadStatsBoard`). Counts and timings only.
     """
     if not tables:
         return _RunCounts(0, 0)
@@ -3286,7 +3455,9 @@ def _migrate_tables_in_parallel(
         recreated: list[str] = []
 
         def _load(table: TableDef) -> _TableLoadOutcome:
-            outcome = _migrate_one_table(handle, job_id, table, migrator, error_log)
+            outcome = _migrate_one_table(
+                handle, job_id, table, migrator, error_log, load_stats=load_stats
+            )
             if _thread_load_recreated(migrator, table.name, outcome):
                 recreated.append(table.name)
             return outcome
@@ -3525,7 +3696,7 @@ def _migrate_tables_in_parallel(
         stop_drain = threading.Event()
         drain = threading.Thread(
             target=_drain_progress_queue,
-            args=(progress_queue, handle, cancel_event, stop_drain),
+            args=(progress_queue, handle, cancel_event, stop_drain, load_stats),
             daemon=True, name="fullload-progress-drain",
         )
         drain.start()
@@ -3682,6 +3853,12 @@ def _migrate_tables_in_parallel(
                     tag = futures[future]
                     result: _TableWorkerResult = future.result()
                     name = result.table_name
+                    # The unit's final counters, on every outcome; they supersede any live
+                    # snapshot of it still in the progress queue.
+                    _record_load_stats(
+                        load_stats, name, tag[2] if tag[0] == "shard" else None,
+                        getattr(result, "load_stats", None), final=True,
+                    )
 
                     if tag[0] == "shard":
                         # Accumulate shard results; finalize when all shards done.
@@ -3805,8 +3982,16 @@ def _migrate_tables_in_parallel(
                             _shard_index_ddls = replace_index_ddls.get(name)
                             if _shard_index_ddls:
                                 _idx_importer = migrator._importer_factory(migrator._inputs)
+                                # The parent's own index pass: the table's "index" entry,
+                                # which loads no rows (no unit of its own).
+                                _idx_stats = LoadStats(units=0)
+                                _bind_load_stats(_idx_importer, _idx_stats)
                                 _idx_created, _idx_failures = _idx_importer.create_indexes(
                                     _shard_index_ddls
+                                )
+                                _record_load_stats(
+                                    load_stats, name, "index", _idx_stats.snapshot(),
+                                    final=True,
                                 )
                                 _record_index_failures(
                                     error_log, job_id, name, _idx_failures
@@ -4886,6 +5071,10 @@ def run_full_load(
     # writes or reads anything -- the refusal (new_start_point_refusal over the session's
     # state), or None. Defaulted: a caller that passes none is never refused.
     start_point_refusal: "Optional[Callable[[], Optional[str]]]" = None,
+    # Collects the write-path counters of every table and shard, live and final, per table
+    # and per run (core.load_stats) -- like error_log, a sink the caller reads. None (the
+    # default): the workers' counters are dropped on arrival.
+    load_stats: Optional[LoadStatsBoard] = None,
 ) -> None:
     """Drive the Full Load export/import pipeline for the selected ``tables``.
 
@@ -5006,7 +5195,7 @@ def run_full_load(
     try:
         counts = _migrate_tables_in_parallel(
             handle, job_id, tables, migrator, error_log,
-            watermark=watermark, fresh_watermark=True,
+            watermark=watermark, fresh_watermark=True, load_stats=load_stats,
         )
     except Exception as exc:  # noqa: BLE001 - logged, then re-raised unchanged
         _done = 0
@@ -7134,6 +7323,9 @@ class BatchedTableMigrator:
         # Per-wait-slice liveness while the source-load governor holds this reader paused
         # (on_throttle fires only on the transition, so a sustained pause went silent).
         on_pause_slice: Optional[Callable[[], None]] = None,
+        # The load unit's write-path counters (core.load_stats), kept by a caller across its
+        # attempts; None -> this call's own. Returned as TableLoadResult.load_stats.
+        load_stats: Optional[LoadStats] = None,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -7460,6 +7652,8 @@ class BatchedTableMigrator:
                 table.name, overlay, facts_reader=self.overlay_facts
             )
         importer = self._importer_factory(self._inputs)
+        stats = load_stats if load_stats is not None else LoadStats()
+        _bind_load_stats(importer, stats)
         try:
             result = importer.import_rows(
                 rows,
@@ -7502,7 +7696,11 @@ class BatchedTableMigrator:
         # importer/loader reported success but the rows did not persist) -- raise
         # so the table is marked FAILED and retried, never falsely reported DONE.
         if is_replace:
-            target_count = self._target_counter(table)
+            _count_started = _time.perf_counter()
+            try:
+                target_count = self._target_counter(table)
+            finally:
+                stats.add_phase("count", _time.perf_counter() - _count_started)
             if target_count is not None and target_count < result.rows_loaded:
                 raise RuntimeError(
                     f"Full Load incomplete for '{table.name}': target has "
@@ -7520,6 +7718,7 @@ class BatchedTableMigrator:
             quarantine_records=tuple(getattr(result, "quarantine_records", ()) or ()),
             index_failures=tuple(getattr(result, "index_failures", ()) or ()),
             zero_dates=zero_dates.entries(),
+            load_stats=stats.snapshot(),
         )
 
     def _default_count_target_rows(self, table: TableDef) -> Optional[int]:

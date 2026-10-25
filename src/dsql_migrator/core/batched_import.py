@@ -76,6 +76,12 @@ What it does, and the properties it satisfies:
    committed, a later "already exists" is reported with a note to check the
    target, never counted as created.
 
+8. **Write-path counters.** Every batch, attempt, retry (by SQLSTATE, with Aurora DSQL's
+   OC000 / OC001 told apart), 23505 recovery, connect and read-ahead queue wait is
+   counted into a :class:`~dsql_migrator.core.load_stats.LoadStats` collector -- the
+   importer's own, or the load unit's after :meth:`BatchedImporter.bind_load_stats` --
+   counts and timings only (Property 7), in bounded memory.
+
 The row input is decoupled from any specific file reader: :meth:`import_rows`
 accepts an iterable of already-converted rows (dict-like, keyed by column name --
 exactly what the exporter's :class:`~dsql_migrator.core.exporter.ValueConverter`
@@ -96,12 +102,13 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
-from queue import Queue
+from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 from psycopg import sql
 from pydantic import BaseModel, ConfigDict, Field
 
+from dsql_migrator.core.load_stats import LoadStats
 from dsql_migrator.core.models import (
     MigrationJob,
     TableDef,
@@ -192,6 +199,37 @@ def _prefetch_enabled() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _put_counted(q: "Queue[object]", item: object, stats: Optional[LoadStats]) -> None:
+    """``q.put(item)``, telling ``stats`` how long the READER waited on a full queue.
+
+    Only a put that had to wait is timed, so a reader that keeps up pays one
+    ``put_nowait``. Waiting here means the writes are the bottleneck.
+    """
+    try:
+        q.put_nowait(item)
+    except Full:
+        started = time.perf_counter()
+        q.put(item)  # blocks until a writer frees a slot (backpressure)
+        if stats is not None:
+            stats.add_reader_blocked(time.perf_counter() - started)
+
+
+def _get_counted(q: "Queue[object]", stats: Optional[LoadStats]) -> object:
+    """``q.get()``, telling ``stats`` how long the WRITERS waited on an empty queue.
+
+    The consumer only asks for a batch when a write slot is free, so waiting here means
+    the source read is the bottleneck.
+    """
+    try:
+        return q.get_nowait()
+    except Empty:
+        started = time.perf_counter()
+        item = q.get()
+        if stats is not None:
+            stats.add_writer_wait(time.perf_counter() - started)
+        return item
 
 
 # Connection-lost signatures for a drop that carries NO SQLSTATE. When the TLS
@@ -680,15 +718,24 @@ def _on_conflict_clause(
     return sql.SQL("ON CONFLICT DO NOTHING")
 
 
+# A pool slot whose connection was discarded after an error: its next lease opens a
+# REPLACEMENT, which the load's counters report as a reconnect (a never-used slot is None).
+_RECONNECT = object()
+
+
 class _ConnectionPool:
     """A bounded pool of lazily-created, reusable connections.
 
     At most ``size`` connections are ever created (Property 2 -- bounded
     parallelism). A leased connection is returned to the pool on context exit and
     reused by a later batch. :meth:`close_all` closes every connection created.
+    ``stats`` (optional) counts the connections opened, the reconnects among them and
+    the failed connects.
     """
 
-    def __init__(self, factory: ConnectionFactory, size: int) -> None:
+    def __init__(
+        self, factory: ConnectionFactory, size: int, stats: Optional[LoadStats] = None
+    ) -> None:
         """Seed ``size`` empty slots; connections are created on first lease."""
         self._factory = factory
         self._slots: "Queue[Optional[Any]]" = Queue()
@@ -696,6 +743,7 @@ class _ConnectionPool:
             self._slots.put(None)
         self._created: list[Any] = []
         self._lock = threading.Lock()
+        self._stats = stats
 
     @contextmanager
     def lease(self) -> Iterator[Any]:
@@ -703,13 +751,14 @@ class _ConnectionPool:
 
         If the leased connection raises while in use (a dropped connection, an
         expired IAM token, or any other error), it is closed and the slot is
-        refilled with ``None`` so the next lease creates a FRESH connection (which
-        re-mints a short-lived IAM token via the factory). This prevents one
+        refilled empty (:data:`_RECONNECT`) so the next lease creates a FRESH connection
+        (which re-mints a short-lived IAM token via the factory). This prevents one
         broken connection from cascading the same failure across every later
         batch that would otherwise reuse it, and lets a retry recover.
         """
         connection = self._slots.get()
-        if connection is None:
+        if connection is None or connection is _RECONNECT:
+            empty_slot = connection
             try:
                 connection = self._factory()
             except BaseException:
@@ -721,8 +770,12 @@ class _ConnectionPool:
                 # drain every slot until the next self._slots.get() blocks forever (no
                 # timeout) -- deadlocking the whole load. Refill the slot, then re-raise so the
                 # OCC retry can lease again and re-create a fresh connection.
-                self._slots.put(None)
+                if self._stats is not None:
+                    self._stats.record_connect_failure()
+                self._slots.put(empty_slot)
                 raise
+            if self._stats is not None:
+                self._stats.record_connect(reconnect=empty_slot is _RECONNECT)
             with self._lock:
                 self._created.append(connection)
         ok = False
@@ -740,7 +793,7 @@ class _ConnectionPool:
                 with self._lock:
                     if connection in self._created:
                         self._created.remove(connection)
-                self._slots.put(None)
+                self._slots.put(_RECONNECT)
 
     def close_all(self) -> None:
         """Close every connection this pool created (best-effort)."""
@@ -883,6 +936,24 @@ class BatchedImporter:
         # large-table load ~99.99% of batches have the same shape, eliminating
         # ~40,000 object allocations per batch (GIL-held).
         self._statement_cache: dict[tuple, object] = {}
+        # The write path's counters (core.load_stats): counts and timings only. Its own
+        # until a caller binds the collector of the unit it loads (bind_load_stats).
+        self._stats = LoadStats()
+
+    def bind_load_stats(self, stats: LoadStats) -> None:
+        """Count into ``stats`` from now on: the collector of the load unit (a table, or one
+        reader shard of it) this importer writes for, kept across the unit's attempts so a
+        re-read adds to it. Counts and timings only -- see :mod:`~dsql_migrator.core.load_stats`.
+        """
+        self._stats = stats
+
+    @property
+    def load_stats(self) -> LoadStats:
+        """The collector this importer counts into: its own, or the bound one."""
+        stats = getattr(self, "_stats", None)
+        if stats is None:  # an instance built without __init__ (a test's bare importer)
+            stats = self._stats = LoadStats()
+        return stats
 
     def import_rows(
         self,
@@ -974,7 +1045,9 @@ class BatchedImporter:
                 )
             ]
 
-        pool = _ConnectionPool(self._connection_factory, self._options.parallelism)
+        pool = _ConnectionPool(
+            self._connection_factory, self._options.parallelism, stats=self.load_stats
+        )
         # A RESUMED call keeps what the previous attempt quarantined. Clearing the sink
         # unconditionally lost it: a source-drop retry that SKIPS the already-committed
         # batches never re-reads their rows, so rows permanently dropped during attempt 1
@@ -1009,10 +1082,17 @@ class BatchedImporter:
             # tracked as a compact per-shard high-water -- no per-batch list is ever
             # retained, so a billion-row table's memory stays bounded whether or not a
             # (resume) job is present. The tracker is seeded from the prior watermark.
-            agg, stopped_early = self._run_data_batches(
-                work_iters, pool, on_batch_loaded, should_cancel,
-                resume_tracker=resume_tracker,
-            )
+            # The data pass is timed apart from the index pass below, also when it raises
+            # (a source drop): its time and window still count.
+            load_wall_start, load_start = time.time(), time.perf_counter()
+            try:
+                agg, stopped_early = self._run_data_batches(
+                    work_iters, pool, on_batch_loaded, should_cancel,
+                    resume_tracker=resume_tracker,
+                )
+            finally:
+                self.load_stats.add_phase("load", time.perf_counter() - load_start)
+                self.load_stats.mark_load(load_wall_start, time.time())
             failures = agg.failures
             # Skip post-load indexing when the table is incomplete (a stop) or
             # any batch failed -- indexing only makes sense for a full table.
@@ -1090,7 +1170,7 @@ class BatchedImporter:
 
     @staticmethod
     def _prefetch(
-        work_iter: Iterator[_BatchWork], depth: int
+        work_iter: Iterator[_BatchWork], depth: int, stats: Optional[LoadStats] = None
     ) -> Iterator[_BatchWork]:
         """Read ``work_iter`` on a background thread, buffering up to ``depth`` items.
 
@@ -1108,6 +1188,10 @@ class BatchedImporter:
         surface it promptly so the batch failure is reported the same as before).
         The producer thread is a daemon and is joined when the generator is closed
         (consumer stops early, e.g. on cancel), so no thread leaks.
+
+        ``stats`` (optional) is told how long the reader waited on the full queue (the
+        writes are the bottleneck) and how long the consumer waited on an empty one (the
+        read is).
         """
         # Sentinels distinguish clean end-of-stream from a producer error.
         _END = object()
@@ -1120,7 +1204,7 @@ class BatchedImporter:
                 for item in work_iter:
                     if stop.is_set():
                         break
-                    q.put(item)  # blocks when the buffer is full (backpressure)
+                    _put_counted(q, item, stats)  # blocks when the buffer is full
             except BaseException as exc:  # noqa: BLE001 - re-raised on the consumer
                 error.append(exc)
             finally:
@@ -1132,7 +1216,7 @@ class BatchedImporter:
         producer.start()
         try:
             while True:
-                item = q.get()
+                item = _get_counted(q, stats)
                 if item is _END:
                     break
                 yield item  # type: ignore[misc]
@@ -1151,7 +1235,9 @@ class BatchedImporter:
 
     @staticmethod
     def _prefetch_many(
-        work_iters: "list[Iterator[_BatchWork]]", depth: int
+        work_iters: "list[Iterator[_BatchWork]]",
+        depth: int,
+        stats: Optional[LoadStats] = None,
     ) -> Iterator[_BatchWork]:
         """Merge K shard readers into one bounded queue feeding a single write pool.
 
@@ -1168,6 +1254,8 @@ class BatchedImporter:
         index, so resume/idempotency is per-batch, not positional. The bound still
         caps in-flight memory. Any shard's exception is re-raised on the consumer;
         all producer threads are stopped and joined when the generator closes.
+        ``stats`` is told the queue waits, as in :meth:`_prefetch` (summed over the
+        readers).
         """
         if not work_iters:
             # No shards -> nothing to produce. Return an empty stream instead of
@@ -1187,7 +1275,7 @@ class BatchedImporter:
                 for item in it:
                     if stop.is_set():
                         break
-                    q.put(item)
+                    _put_counted(q, item, stats)
             except BaseException as exc:  # noqa: BLE001 - re-raised on the consumer
                 error.append(exc)
                 stop.set()  # a failed shard stops the others promptly
@@ -1210,7 +1298,7 @@ class BatchedImporter:
             p.start()
         try:
             while True:
-                item = q.get()
+                item = _get_counted(q, stats)
                 if item is _END:
                     break
                 yield item  # type: ignore[misc]
@@ -1327,10 +1415,12 @@ class BatchedImporter:
         # pre-sharding single-reader path, which by definition has one work-iter).
         if len(work_iters) > 1:
             prefetched: Iterator[_BatchWork] = self._prefetch_many(
-                work_iters, _prefetch_depth(parallelism)
+                work_iters, _prefetch_depth(parallelism), stats=self.load_stats
             )
         elif _prefetch_enabled():
-            prefetched = self._prefetch(work_iters[0], _prefetch_depth(parallelism))
+            prefetched = self._prefetch(
+                work_iters[0], _prefetch_depth(parallelism), stats=self.load_stats
+            )
         else:
             prefetched = work_iters[0]
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
@@ -1342,7 +1432,7 @@ class BatchedImporter:
                             # the table is reported incomplete (retryable, idempotent).
                             stopped_early = True
                             break
-                        future = executor.submit(self._load_batch, work, pool)
+                        future = executor.submit(self._load_batch_timed, work, pool)
                         in_flight[future] = (work.chunk_id, work.shard_id, work.batch_index)
                         if len(in_flight) >= parallelism:
                             drain_one()
@@ -1367,6 +1457,20 @@ class BatchedImporter:
                     except Exception:  # noqa: BLE001 - unwinding; keep the original error
                         break
         return agg, stopped_early
+
+    def _load_batch_timed(
+        self, work: _BatchWork, pool: _ConnectionPool
+    ) -> tuple[int, int]:
+        """:meth:`_load_batch`, counting the batch and its time from first attempt to
+        outcome (retries and their backoff included) for the load's counters."""
+        started = time.perf_counter()
+        failed = True
+        try:
+            outcome = self._load_batch(work, pool)
+            failed = False
+            return outcome
+        finally:
+            self.load_stats.record_batch(time.perf_counter() - started, failed=failed)
 
     def _load_batch(
         self, work: _BatchWork, pool: _ConnectionPool
@@ -1485,12 +1589,23 @@ class BatchedImporter:
         # per attempt (each ``40001`` retry re-invokes it), so attempts-1 == retries.
         attempts = 0
 
+        def _count_failure(exc: BaseException) -> None:
+            # A retryable failure aborted a transaction on the target; the wrapper retries it
+            # unless this was the budget's last attempt. A permanent error is no retry: it
+            # splits the batch (a poison row) or fails it.
+            if _is_retryable_load_error(exc):
+                self.load_stats.record_retry(exc, exhausted=attempts >= self._occ_max_attempts)
+
         if work.on_conflict is OnConflictMode.SKIP_EXISTING:
             # DSQL-safe idempotent path: SELECT existing PKs, plain-INSERT the rest.
             def _counted_skip(pool_):
                 nonlocal attempts
                 attempts += 1
-                return self._execute_skip_existing(pool_, work)
+                try:
+                    return self._execute_skip_existing(pool_, work)
+                except Exception as exc:  # noqa: BLE001 - counted, then re-raised
+                    _count_failure(exc)
+                    raise
 
             retried = with_occ_retry(
                 max_attempts=self._occ_max_attempts,
@@ -1499,7 +1614,10 @@ class BatchedImporter:
                 jitter=self._jitter,
                 retryable=_is_retryable_load_error,
             )(_counted_skip)
-            inserted, conflicts = retried(pool)
+            try:
+                inserted, conflicts = retried(pool)
+            finally:
+                self.load_stats.record_statement(attempts)
             if _LOGGER.isEnabledFor(logging.DEBUG):
                 first_pk, last_pk = _batch_pk_range(work)
                 _LOGGER.debug(
@@ -1548,7 +1666,13 @@ class BatchedImporter:
                     and work.key_columns
                     and getattr(exc, "sqlstate", None) == "23505"
                 ):
-                    return self._select_filter_insert(pool_, work)
+                    self.load_stats.record_unique_recovery()
+                    try:
+                        return self._select_filter_insert(pool_, work)
+                    except Exception as recovery_exc:  # noqa: BLE001 - counted, re-raised
+                        _count_failure(recovery_exc)
+                        raise
+                _count_failure(exc)
                 raise
 
         retried = with_occ_retry(
@@ -1558,7 +1682,10 @@ class BatchedImporter:
             jitter=self._jitter,
             retryable=_is_retryable_load_error,
         )(_counted_execute)
-        inserted, conflicts = retried(pool, statement, params, attempted)
+        try:
+            inserted, conflicts = retried(pool, statement, params, attempted)
+        finally:
+            self.load_stats.record_statement(attempts)
 
         # One DEBUG line PER BATCH (never per row): chunk id + PK range + counts +
         # OCC retries. Guarded so production (INFO) pays nothing; PK values from the
@@ -1572,6 +1699,15 @@ class BatchedImporter:
                 inserted, conflicts, work.on_conflict.value, max(0, attempts - 1),
             )
         return inserted, conflicts
+
+    def _timed_execute(self, cursor: Any, statement: Any, params: Any) -> None:
+        """``cursor.execute`` of a data INSERT, its wall time counted as one write round
+        trip (the driver's statement rendering included), failed or not."""
+        started = time.perf_counter()
+        try:
+            cursor.execute(statement, params)
+        finally:
+            self.load_stats.record_execute(time.perf_counter() - started)
 
     def _execute_insert(
         self,
@@ -1591,7 +1727,7 @@ class BatchedImporter:
         with pool.lease() as connection:
             cursor = connection.cursor()
             try:
-                cursor.execute(statement, params)
+                self._timed_execute(cursor, statement, params)
                 rowcount = getattr(cursor, "rowcount", -1)
             finally:
                 _safe_close(cursor)
@@ -1664,7 +1800,9 @@ class BatchedImporter:
         with pool.lease() as connection:
             cursor = connection.cursor()
             try:
-                cursor.execute(full_insert, _flatten_params(work.rows, work.columns))
+                self._timed_execute(
+                    cursor, full_insert, _flatten_params(work.rows, work.columns)
+                )
                 rowcount = getattr(cursor, "rowcount", -1)
                 inserted = (
                     rowcount if isinstance(rowcount, int) and rowcount >= 0 else total
@@ -1677,6 +1815,7 @@ class BatchedImporter:
             finally:
                 _safe_close(cursor)
 
+        self.load_stats.record_unique_recovery()
         return self._select_filter_insert(pool, work)
 
     def _select_filter_insert(
@@ -1739,13 +1878,14 @@ class BatchedImporter:
                         key_columns,
                     )
                     try:
-                        cursor.execute(
-                            insert_sql, _flatten_params(missing, work.columns)
+                        self._timed_execute(
+                            cursor, insert_sql, _flatten_params(missing, work.columns)
                         )
                     except Exception as exc:  # noqa: BLE001 - inspect sqlstate
                         if getattr(exc, "sqlstate", None) == unique_violation_sqlstate:
                             # A concurrent insert won the race for a missing key;
                             # re-derive existing and retry the remainder.
+                            self.load_stats.record_unique_recovery()
                             last_error = exc
                             continue
                         raise
@@ -1819,6 +1959,8 @@ class BatchedImporter:
                 try:
                     cursor.execute(ddl)
                 except Exception as exc:  # noqa: BLE001 - noted, then re-raised to the retry
+                    if _is_retryable_load_error(exc):
+                        self.load_stats.record_index_retry(exc)
                     if not unconfirmed[0]:
                         unconfirmed[0] = (
                             UNCONFIRMED_INDEX_NOTE
@@ -1840,6 +1982,7 @@ class BatchedImporter:
         )(_run_ddl)
         created = 0
         failures: list[str] = []
+        started = time.perf_counter()
         for ddl in index_ddls:
             unconfirmed = [""]
             try:
@@ -1862,6 +2005,8 @@ class BatchedImporter:
                 )
             else:
                 created += 1
+        # The submissions only: CREATE INDEX ASYNC returns before the index is built.
+        self.load_stats.add_phase("index", time.perf_counter() - started)
         return created, failures
 
     def create_indexes(self, index_ddls: list[str]) -> "tuple[int, list[str]]":
@@ -1879,7 +2024,9 @@ class BatchedImporter:
         """
         if not index_ddls:
             return 0, []
-        pool = _ConnectionPool(self._connection_factory, self._options.parallelism)
+        pool = _ConnectionPool(
+            self._connection_factory, self._options.parallelism, stats=self.load_stats
+        )
         try:
             return self._create_indexes(pool, index_ddls)
         finally:
