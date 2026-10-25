@@ -783,10 +783,14 @@ def test_import_binds_values_and_does_not_interpolate() -> None:
     importer.import_rows(_rows(3), _table())
 
     insert = store.executed_inserts[0]
-    # Values arrive as bound parameters, not embedded in the SQL text.
+    # Values arrive as bound parameters, not embedded in the SQL text: the statement is
+    # sent already rendered, its six values as the server's $1..$6 (R1).
     assert insert.params == [0, "name-0", 1, "name-1", 2, "name-2"]
     assert "name-0" not in insert.sql_text
-    assert insert.sql_text.count("%s") == 6
+    assert insert.sql_text == (
+        'INSERT INTO "customers" ("id", "name") VALUES ($1, $2), ($3, $4), ($5, $6) '
+        'ON CONFLICT ("id") DO NOTHING'
+    )
 
 
 def test_result_is_structured() -> None:

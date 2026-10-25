@@ -25,7 +25,11 @@ What it does, and the properties it satisfies:
 2. **Parameterized + safe SQL (Requirement 9.4).** Values are always bound via
    ``psycopg`` placeholders, never string-interpolated, and table/column
    identifiers are composed with ``psycopg.sql`` (``Identifier``/``SQL``), so a
-   row value or column name can never break out into SQL.
+   row value or column name can never break out into SQL. Each INSERT shape is
+   rendered ONCE to the exact bytes psycopg used to rebuild on every execute
+   (``$1..$n`` placeholders, :func:`render_insert_statement`) and sent through
+   psycopg's :class:`~psycopg.RawCursor`, so no batch -- and no retry -- renders it
+   again, and a ``%`` in a table or column name is just a character.
 
 3. **Idempotent loading (Property 3).** The on-conflict mode defaults to
    :attr:`OnConflictMode.DO_NOTHING`. Re-running a batch never creates duplicate
@@ -98,6 +102,7 @@ import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -105,6 +110,7 @@ from enum import Enum
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
+import psycopg
 from psycopg import sql
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -632,18 +638,36 @@ def batch_chunk_id(
     return f"{table_name}#s{shard_id:02d}-batch-{index:06d}"
 
 
-def _pg_table_identifier(name: str) -> sql.Identifier:
+def _pg_table_identifier(
+    name: str, identifier: "type[sql.Identifier]" = sql.Identifier
+) -> sql.Identifier:
     """Return a psycopg identifier for a possibly schema-qualified table name.
 
     Splits ``schema.table`` so it composes to ``"schema"."table"`` rather than a
     single quoted ``"schema.table"`` identifier. Cluster-wide introspection
     qualifies names as ``database.table``; the converter creates a matching
     PostgreSQL schema on the target, so the load target must be qualified too.
+    ``identifier`` is the class to build it with (:class:`_ParamSafeIdentifier` for a
+    statement a normal cursor runs with parameters).
     """
     schema, separator, obj = name.partition(".")
     if separator and schema and obj:
-        return sql.Identifier(schema, obj)
-    return sql.Identifier(name)
+        return identifier(schema, obj)
+    return identifier(name)
+
+
+class _ParamSafeIdentifier(sql.Identifier):
+    """:class:`psycopg.sql.Identifier` for a statement a NORMAL cursor runs WITH parameters.
+
+    Such a cursor scans the whole text for ``%s`` placeholders, quoted names included, and
+    turns ``%%`` back into ``%``, so the same quoting with each ``%`` doubled reaches the
+    server as the name itself. Without it a name such as ``pct%off`` failed the scan,
+    ``a%sb`` became a placeholder and ``x%%y`` arrived as ``x%y``. Only for a statement
+    executed with parameters: without them nothing is scanned and the doubling would stay.
+    """
+
+    def as_bytes(self, context: Any = None) -> bytes:
+        return super().as_bytes(context).replace(b"%", b"%%")
 
 
 def build_insert_statement(
@@ -667,6 +691,9 @@ def build_insert_statement(
     ``ON CONFLICT (keys) DO UPDATE SET <non-key> = EXCLUDED.<non-key>``; when
     every column is a key column (nothing to update) it degrades to
     ``DO NOTHING`` to stay idempotent.
+
+    The loader itself sends this statement as :func:`render_insert_statement` renders
+    it, once per shape.
     """
     if num_rows < 1:
         raise ValueError("num_rows must be a positive integer")
@@ -716,6 +743,154 @@ def _on_conflict_clause(
         target = sql.SQL(", ").join(sql.Identifier(name) for name in key_columns)
         return sql.SQL("ON CONFLICT ({target}) DO NOTHING").format(target=target)
     return sql.SQL("ON CONFLICT DO NOTHING")
+
+
+class _RenderedStatement(sql.Composable):
+    """A statement already rendered to the bytes the server receives (``$n`` placeholders).
+
+    A :class:`~psycopg.sql.Composable`, so ``cursor.execute`` takes it as it took the
+    ``Composed``, and :meth:`as_bytes` returns the same bytes object every time. Only a
+    cursor that sends a query as it is may run it (:func:`_insert_cursor`): a normal cursor
+    scans it for ``%s`` placeholders and refuses the parameters it finds no place for -- an
+    error, never a different statement.
+    """
+
+    def __init__(self, query: bytes) -> None:
+        super().__init__(query)
+
+    def as_bytes(self, context: Any = None) -> bytes:
+        return self._obj
+
+
+def render_insert_statement(
+    table_name: str,
+    columns: list[str],
+    num_rows: int,
+    on_conflict: OnConflictMode,
+    key_columns: list[str],
+) -> _RenderedStatement:
+    """:func:`build_insert_statement`'s statement, rendered once to the bytes the server receives.
+
+    Byte for byte the query psycopg made of that ``Composed`` on every execute -- every name
+    quoted by :class:`psycopg.sql.Identifier`, the same ``ON CONFLICT`` clause, each value's
+    ``%s`` numbered ``$1..$n`` in row-major order -- made once per shape instead. psycopg
+    caches no query over 4096 bytes or 50 parameters, so for a bulk INSERT it re-joined the
+    ``Composed`` and re-scanned it for placeholders on every execute and every retry: about
+    2 us per value, more than half of a table worker's CPU. The values are still adapted on
+    every execute, as before.
+
+    Rendered without a connection, where :class:`~psycopg.sql.Identifier` quotes as libpq's
+    ``PQescapeIdentifier`` does for a UTF-8 client (Aurora DSQL's): double quotes around,
+    each ``"`` doubled.
+
+    Run it on :func:`_insert_cursor`'s cursor, which sends it as it is: the text is never
+    scanned for ``%``, so ``pct%off`` and ``a%sb`` load instead of failing the scan, and
+    ``x%%y`` stays ``x%%y`` instead of arriving as ``x%y``.
+    """
+    if num_rows < 1:
+        raise ValueError("num_rows must be a positive integer")
+    if not columns:
+        raise ValueError("columns must not be empty")
+    width = len(columns)
+    head = sql.SQL("INSERT INTO {table} ({columns}) VALUES ").format(
+        table=_pg_table_identifier(table_name),
+        columns=sql.SQL(", ").join(sql.Identifier(name) for name in columns),
+    ).as_bytes(None)
+    marks = ["$%d" % number for number in range(1, num_rows * width + 1)]
+    rows = ", ".join(
+        "(" + ", ".join(marks[start : start + width]) + ")"
+        for start in range(0, len(marks), width)
+    ).encode("ascii")
+    conflict = _on_conflict_clause(on_conflict, key_columns, columns).as_bytes(None)
+    return _RenderedStatement(head + rows + b" " + conflict)
+
+
+def _insert_cursor(connection: Any) -> Any:
+    """The cursor a bulk INSERT runs on: psycopg's :class:`~psycopg.RawCursor` on a psycopg
+    connection -- it sends a :class:`_RenderedStatement` as it is and adapts the values
+    exactly as a normal cursor does -- and the connection's own ``cursor()`` on anything
+    else (a unit test's double)."""
+    if isinstance(connection, psycopg.Connection):
+        return psycopg.RawCursor(connection)
+    return connection.cursor()
+
+
+def _disable_prepared_statements(connection: Any) -> None:
+    """Switch off psycopg's automatic prepared statements on a connection the loader opened.
+
+    psycopg keeps the last 100 (query, parameter types) keys of a connection and prepares one
+    seen 5 times. A bulk INSERT's key is its whole text -- hundreds of KB -- and its types
+    change with each batch's NULLs and integer sizes, so the keys rarely recur and mostly
+    cost memory, 20-41 MiB per connection; ``prepare=False`` on ``execute`` still records
+    them, ``prepare_threshold=None`` does not. A table whose types do repeat was prepared on
+    each connection from its sixth batch on; it is now sent unprepared every time, with the
+    same bytes and values.
+
+    Set here, on the loader's own connections, not in
+    :class:`~dsql_migrator.core.target_connection.DsqlConnector`: Validation reads through
+    the same connector and relies on prepared statements for its keyset pages.
+    """
+    if isinstance(connection, psycopg.Connection):
+        connection.prepare_threshold = None
+
+
+# Shapes besides the full-size one that keep their rendered text: a reader's partial last
+# batch, a byte-capped batch of wide rows, the halves of a split batch, a select-filter
+# remainder. Small on purpose: an entry can be about 1 MB (65,535 parameters), and a miss
+# only renders that shape again.
+_RENDERED_INSERT_LRU_SIZE = 8
+
+
+class _RenderedInserts:
+    """Each bulk INSERT shape rendered once, in bounded memory.
+
+    A shape is (table, columns, rows, mode, conflict keys). Every batch but a reader's last
+    has the table's FULL-size shape (its effective batch size), which keeps a slot of its
+    own that the others never evict; the rest share a small LRU. The text is several times
+    the size of the ``Composed`` it replaces (which shared one row's placeholders across all
+    the rows), hence the bound. The importer's writer threads share it: one lock, and a
+    missing shape is rendered under it, so each is rendered once.
+    """
+
+    def __init__(self, batch_size: int, lru_size: int = _RENDERED_INSERT_LRU_SIZE) -> None:
+        self._batch_size = batch_size
+        self._lru_size = max(1, lru_size)
+        self._full: Optional[tuple[tuple, _RenderedStatement]] = None
+        self._lru: "OrderedDict[tuple, _RenderedStatement]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.rendered = 0  # shapes rendered so far
+
+    def statement(
+        self,
+        table_name: str,
+        columns: tuple[str, ...],
+        num_rows: int,
+        on_conflict: OnConflictMode,
+        key_columns: tuple[str, ...],
+    ) -> _RenderedStatement:
+        """The rendered INSERT of ``num_rows`` rows of this shape, rendered on a miss."""
+        key = (table_name, columns, num_rows, on_conflict, key_columns)
+        full = num_rows == _effective_batch_size(self._batch_size, len(columns))
+        with self._lock:
+            if full:
+                if self._full is not None and self._full[0] == key:
+                    return self._full[1]
+            else:
+                cached = self._lru.get(key)
+                if cached is not None:
+                    self._lru.move_to_end(key)
+                    return cached
+            statement = render_insert_statement(
+                table_name, list(columns), num_rows, on_conflict, list(key_columns)
+            )
+            self.rendered += 1
+            if full:
+                self._full = (key, statement)
+            else:
+                self._lru[key] = statement
+                if len(self._lru) > self._lru_size:
+                    self._lru.popitem(last=False)
+            return statement
 
 
 # A pool slot whose connection was discarded after an error: its next lease opens a
@@ -776,6 +951,9 @@ class _ConnectionPool:
                 raise
             if self._stats is not None:
                 self._stats.record_connect(reconnect=empty_slot is _RECONNECT)
+            # Every connection the loader opens, a reconnect included: Full Load passes the
+            # shared connector's connect, which keeps psycopg's default for Validation.
+            _disable_prepared_statements(connection)
             with self._lock:
                 self._created.append(connection)
         ok = False
@@ -931,11 +1109,10 @@ class BatchedImporter:
         # _MAX_QUARANTINE_RECORDS; this counts every one so the result reports the true total).
         self._quarantine_total = 0
         self._quarantine_lock = threading.Lock()
-        # Statement cache: identical (table, columns, num_rows, on_conflict,
-        # key_columns) tuples reuse the same sql.Composed object. For a typical
-        # large-table load ~99.99% of batches have the same shape, eliminating
-        # ~40,000 object allocations per batch (GIL-held).
-        self._statement_cache: dict[tuple, object] = {}
+        # Each bulk INSERT shape (table, columns, rows, mode, keys) rendered once to the
+        # bytes the server receives, in bounded memory (_RenderedInserts). For a typical
+        # large-table load ~99.99% of batches have the same shape.
+        self._inserts = _RenderedInserts(self._options.batch_size)
         # The write path's counters (core.load_stats): counts and timings only. Its own
         # until a caller binds the collector of the unit it loads (bind_load_stats).
         self._stats = LoadStats()
@@ -1597,12 +1774,18 @@ class BatchedImporter:
                 self.load_stats.record_retry(exc, exhausted=attempts >= self._occ_max_attempts)
 
         if work.on_conflict is OnConflictMode.SKIP_EXISTING:
-            # DSQL-safe idempotent path: SELECT existing PKs, plain-INSERT the rest.
+            # DSQL-safe idempotent path: SELECT existing PKs, plain-INSERT the rest. The
+            # optimistic plain INSERT is fetched once, so every attempt sends the same bytes.
+            optimistic_insert = self._inserts.statement(
+                work.table_name, work.columns, attempted, OnConflictMode.NONE,
+                work.key_columns,
+            )
+
             def _counted_skip(pool_):
                 nonlocal attempts
                 attempts += 1
                 try:
-                    return self._execute_skip_existing(pool_, work)
+                    return self._execute_skip_existing(pool_, work, optimistic_insert)
                 except Exception as exc:  # noqa: BLE001 - counted, then re-raised
                     _count_failure(exc)
                     raise
@@ -1628,20 +1811,10 @@ class BatchedImporter:
                 )
             return inserted, conflicts
 
-        cache_key = (
-            work.table_name, work.columns, len(work.rows),
-            work.on_conflict, work.key_columns,
+        # Fetched once for the batch: every attempt sends these same bytes.
+        statement = self._inserts.statement(
+            work.table_name, work.columns, attempted, work.on_conflict, work.key_columns
         )
-        statement = self._statement_cache.get(cache_key)
-        if statement is None:
-            statement = build_insert_statement(
-                work.table_name,
-                list(work.columns),
-                len(work.rows),
-                work.on_conflict,
-                list(work.key_columns),
-            )
-            self._statement_cache[cache_key] = statement
         params = _flatten_params(work.rows, work.columns)
 
         def _counted_execute(pool_, statement_, params_, attempted_):
@@ -1702,7 +1875,7 @@ class BatchedImporter:
 
     def _timed_execute(self, cursor: Any, statement: Any, params: Any) -> None:
         """``cursor.execute`` of a data INSERT, its wall time counted as one write round
-        trip (the driver's statement rendering included), failed or not."""
+        trip (the driver's adaptation of the values included), failed or not."""
         started = time.perf_counter()
         try:
             cursor.execute(statement, params)
@@ -1712,7 +1885,7 @@ class BatchedImporter:
     def _execute_insert(
         self,
         pool: _ConnectionPool,
-        statement: sql.Composed,
+        statement: sql.Composable,
         params: list[object],
         attempted: int,
         on_conflict: "OnConflictMode" = None,  # type: ignore[assignment]
@@ -1722,10 +1895,11 @@ class BatchedImporter:
         Each attempt leases its own connection from the bounded pool, so a retry
         never holds a connection while waiting. ``rows_inserted`` is taken from
         the cursor ``rowcount`` (rows actually inserted under ``ON CONFLICT``);
-        ``conflicts`` is the remainder that hit an existing row.
+        ``conflicts`` is the remainder that hit an existing row. ``statement`` is a
+        :func:`render_insert_statement` statement, run on :func:`_insert_cursor`'s cursor.
         """
         with pool.lease() as connection:
-            cursor = connection.cursor()
+            cursor = _insert_cursor(connection)
             try:
                 self._timed_execute(cursor, statement, params)
                 rowcount = getattr(cursor, "rowcount", -1)
@@ -1749,7 +1923,10 @@ class BatchedImporter:
         return inserted, attempted - inserted
 
     def _execute_skip_existing(
-        self, pool: _ConnectionPool, work: _BatchWork
+        self,
+        pool: _ConnectionPool,
+        work: _BatchWork,
+        optimistic_insert: sql.Composable,
     ) -> tuple[int, int]:
         """Idempotent DSQL-safe load: insert missing PKs, skip ones already there.
 
@@ -1762,6 +1939,9 @@ class BatchedImporter:
         never overwrites a newer row the CDC sink already wrote, avoids the DSQL
         multi-row ``ON CONFLICT`` silent row-drop entirely, and supports single- or
         composite-column keys. Returns ``(inserted, skipped)``.
+
+        ``optimistic_insert`` is the batch's rendered plain ``INSERT``, fetched once by the
+        caller so every attempt sends the same bytes.
 
         The SELECT-filter fallback retries on a 23505 in the gap between its SELECT
         and INSERT (re-deriving the existing set, which converges); exhausting the
@@ -1784,24 +1964,14 @@ class BatchedImporter:
         # when a key already exists (a concurrent CDC insert or a re-run) does DSQL
         # raise a unique violation (23505); we then fall through to the SELECT-
         # filter path, paying the extra read ONLY on real overlap, not every batch.
-        # The optimistic full-batch INSERT is cached (every full-size batch has the identical
-        # shape), exactly like the non-SKIP path. SKIP_EXISTING is the primary append / resume
-        # / CDC-coexist load path, so rebuilding a ~40k-placeholder Composed per batch was pure
-        # waste on the hot path.
-        cache_key = (
-            work.table_name, work.columns, total, OnConflictMode.NONE, work.key_columns,
-        )
-        full_insert = self._statement_cache.get(cache_key)
-        if full_insert is None:
-            full_insert = build_insert_statement(
-                work.table_name, list(work.columns), total, OnConflictMode.NONE, key_columns
-            )
-            self._statement_cache[cache_key] = full_insert
+        # The optimistic full-batch INSERT is rendered once per shape (every full-size batch
+        # has the identical shape), exactly like the non-SKIP path. SKIP_EXISTING is the
+        # primary append / resume / CDC-coexist load path.
         with pool.lease() as connection:
-            cursor = connection.cursor()
+            cursor = _insert_cursor(connection)
             try:
                 self._timed_execute(
-                    cursor, full_insert, _flatten_params(work.rows, work.columns)
+                    cursor, optimistic_insert, _flatten_params(work.rows, work.columns)
                 )
                 rowcount = getattr(cursor, "rowcount", -1)
                 inserted = (
@@ -1837,7 +2007,9 @@ class BatchedImporter:
         def _key_of(row: Mapping[str, object]) -> tuple:
             return tuple(row[name] for name in key_columns)
 
-        key_idents = sql.SQL(", ").join(sql.Identifier(name) for name in key_columns)
+        # The SELECT runs WITH parameters on a normal cursor, whose %s scan reads the quoted
+        # names too: hence _ParamSafeIdentifier (a key or table named ``pct%off`` failed it).
+        key_idents = sql.SQL(", ").join(_ParamSafeIdentifier(name) for name in key_columns)
         row_placeholder = sql.SQL("({})").format(
             sql.SQL(", ").join(sql.Placeholder() for _ in key_columns)
         )
@@ -1845,7 +2017,7 @@ class BatchedImporter:
             "SELECT {keys} FROM {table} WHERE ({keys}) IN ({tuples})"
         ).format(
             keys=key_idents,
-            table=_pg_table_identifier(work.table_name),
+            table=_pg_table_identifier(work.table_name, _ParamSafeIdentifier),
             tuples=sql.SQL(", ").join(row_placeholder for _ in work.rows),
         )
         select_params = [_key_parameter(row[name]) for row in work.rows for name in key_columns]
@@ -1854,6 +2026,7 @@ class BatchedImporter:
         for _attempt in range(max_attempts):
             with pool.lease() as connection:
                 cursor = connection.cursor()
+                insert_cursor = None
                 try:
                     cursor.execute(select_sql, select_params)
                     # getattr: a test double's cursor need not expose ``description``,
@@ -1870,16 +2043,14 @@ class BatchedImporter:
                     ]
                     if not missing:
                         return 0, total
-                    insert_sql = build_insert_statement(
-                        work.table_name,
-                        list(work.columns),
-                        len(missing),
-                        OnConflictMode.NONE,
-                        key_columns,
+                    insert_sql = self._inserts.statement(
+                        work.table_name, work.columns, len(missing), OnConflictMode.NONE,
+                        work.key_columns,
                     )
+                    insert_cursor = _insert_cursor(connection)
                     try:
                         self._timed_execute(
-                            cursor, insert_sql, _flatten_params(missing, work.columns)
+                            insert_cursor, insert_sql, _flatten_params(missing, work.columns)
                         )
                     except Exception as exc:  # noqa: BLE001 - inspect sqlstate
                         if getattr(exc, "sqlstate", None) == unique_violation_sqlstate:
@@ -1889,7 +2060,7 @@ class BatchedImporter:
                             last_error = exc
                             continue
                         raise
-                    rowcount = getattr(cursor, "rowcount", -1)
+                    rowcount = getattr(insert_cursor, "rowcount", -1)
                     inserted = (
                         rowcount
                         if isinstance(rowcount, int) and rowcount >= 0
@@ -1899,6 +2070,8 @@ class BatchedImporter:
                     return inserted, total - inserted
                 finally:
                     _safe_close(cursor)
+                    if insert_cursor is not None:
+                        _safe_close(insert_cursor)
         raise BatchedImportError(
             f"load for table '{work.table_name}' exhausted {max_attempts} attempts "
             "due to concurrent unique violations"
@@ -2323,6 +2496,7 @@ __all__ = [
     "batch_chunk_id",
     "build_insert_statement",
     "is_unconfirmed_index_failure",
+    "render_insert_statement",
     "safe_error_message",
 ]
 

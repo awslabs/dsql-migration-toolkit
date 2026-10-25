@@ -1001,8 +1001,10 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             ) if statements else 0.0,
             "pct_batches_with_retry": run.get("pct_statements_retried", 0.0),
         },
-        # One INSERT execute (the driver's rendering + the round trip + the commit), every
-        # attempt. Tells write-bound vs client-bound: high & tight = DSQL write RTT is the
+        # One INSERT execute (the driver's adaptation of the values + the round trip + the
+        # commit), every attempt. Since R1 the statement text is rendered once per shape, not
+        # per execute, so these times run lower than an R0 build's for the same server
+        # latency. Tells write-bound vs client-bound: high & tight = DSQL write RTT is the
         # wall; low = the client isn't keeping enough batches in flight.
         "write_rtt_ms": run.get("execute_ms") or {
             "samples": 0, "p50": None, "p95": None, "max": None, "mean": None,

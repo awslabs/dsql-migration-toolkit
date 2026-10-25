@@ -14,7 +14,7 @@ class of bug is caught BEFORE an image is published.
 Run it against a disposable migration-test target BEFORE building/deploying a release image:
 
     scripts/release_gate.py            # Tier 1: read-only connect smoke (~seconds)
-    scripts/release_gate.py --roundtrip  # + a DSQL scratch CREATE/INSERT/SELECT/DROP
+    scripts/release_gate.py --roundtrip  # + a DSQL scratch CREATE/INSERT/SELECT/DROP + load
     scripts/release_gate.py && deploy/build_in_codebuild.sh   # gate the build
 
 Exit code is 0 only when every check passes, non-zero otherwise, so it gates a script.
@@ -27,8 +27,12 @@ Also connects the source via the tool's own dialect engine when one is configure
 
 Tier 2 (``--roundtrip``): additionally CREATE a scratch table on DSQL with representative
 types (integer PK, numeric, text, timestamptz), INSERT + read a row back, then DROP it —
-proving DDL apply + typed round-trip work end-to-end on the live cluster. Uses its own
-scratch schema (``release_gate_smoke``); never touches migration data.
+proving DDL apply + typed round-trip work end-to-end on the live cluster. It also loads
+a few rows through Full Load's own write path (the real ``BatchedImporter``: multi-row
+INSERTs rendered once to ``$n`` text and sent through psycopg's ``RawCursor`` on loader
+connections with prepared statements off), into a table with a ``%`` in a column name,
+and reads them back value for value. Uses its own scratch schema
+(``release_gate_smoke``); never touches migration data.
 
 Config comes from .env / the environment (TARGET_* for DSQL; DB_* / SOURCE_TYPE for the
 source), the same source of truth the other scripts/ helpers use.
@@ -95,7 +99,8 @@ def check_dsql(roundtrip: bool) -> tuple[bool, str]:
     from dsql_migrator.core.target_connection import DsqlConnector
 
     try:
-        conn = DsqlConnector(_target_config(), aws_profile=_profile()).connect()
+        connector = DsqlConnector(_target_config(), aws_profile=_profile())
+        conn = connector.connect()
     except Exception as e:  # noqa: BLE001 — the connect-option regression class lands here
         return False, f"DSQL connect FAILED (the lc_numeric-class check): {str(e).splitlines()[0]}"
     try:
@@ -112,7 +117,7 @@ def check_dsql(roundtrip: bool) -> tuple[bool, str]:
             gucs[g] = cur.fetchone()[0]
         detail = f"SELECT 1 ok; GUCs {gucs}"
         if roundtrip:
-            detail += "; " + _dsql_roundtrip(cur)
+            detail += "; " + _dsql_roundtrip(cur, connector.connect)
         cur.close()
         return True, detail
     except Exception as e:  # noqa: BLE001
@@ -124,8 +129,10 @@ def check_dsql(roundtrip: bool) -> tuple[bool, str]:
             pass
 
 
-def _dsql_roundtrip(cur) -> str:
-    """CREATE/INSERT/SELECT/DROP a scratch table with representative types on live DSQL."""
+def _dsql_roundtrip(cur, connect) -> str:
+    """CREATE/INSERT/SELECT/DROP a scratch table with representative types on live DSQL,
+    plus a multi-row load through Full Load's own write path (:func:`_importer_roundtrip`)
+    on connections from ``connect``."""
     tbl = f'"{SCRATCH_SCHEMA}"."gate"'
     cur.execute(f'DROP SCHEMA IF EXISTS "{SCRATCH_SCHEMA}" CASCADE')
     cur.execute(f'CREATE SCHEMA "{SCRATCH_SCHEMA}"')
@@ -139,10 +146,88 @@ def _dsql_roundtrip(cur) -> str:
     )
     cur.execute(f"SELECT amount, note FROM {tbl} WHERE id = 1")
     amount, note = cur.fetchone()
+    loaded = _importer_roundtrip(cur, connect)
     cur.execute(f'DROP SCHEMA IF EXISTS "{SCRATCH_SCHEMA}" CASCADE')
     if str(amount) != "3.14" or note != "gate":
         raise RuntimeError(f"round-trip mismatch: amount={amount!r} note={note!r}")
-    return "scratch round-trip ok (numeric/text/ts)"
+    return f"scratch round-trip ok (numeric/text/ts); {loaded}"
+
+
+GATE_ROWS_COLUMNS = ("id", "amount", "note", "ts", "pct%off")
+
+
+def _gate_rows() -> list:
+    """The rows :func:`_importer_roundtrip` loads, two per batch: two full-size batches and a
+    partial one. NULLs, a negative and a 4-byte-limit integer, multi-byte text and text that
+    looks like placeholders (``%s``, ``$1``) -- bound, never interpolated."""
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    utc = timezone.utc
+    return [
+        {"id": 1, "amount": Decimal("3.14"), "note": "gate",
+         "ts": datetime(2020, 1, 2, 3, 4, 5, tzinfo=utc), "pct%off": 10},
+        {"id": 2, "amount": Decimal("-0.50"), "note": "100% off, %s and $1 'q'",
+         "ts": None, "pct%off": None},
+        {"id": 3, "amount": None, "note": "ünïcode 日本語",
+         "ts": datetime(2026, 10, 25, 0, 0, 0, 123456, tzinfo=utc), "pct%off": -7},
+        {"id": 4, "amount": Decimal("1234567890.12"), "note": "",
+         "ts": datetime(1999, 12, 31, 23, 59, 59, tzinfo=utc), "pct%off": 2147483647},
+        {"id": 5, "amount": Decimal("0.00"), "note": None,
+         "ts": datetime(2000, 2, 29, 12, 0, 0, tzinfo=utc), "pct%off": 0},
+    ]
+
+
+def _importer_roundtrip(cur, connect) -> str:
+    """Load rows through the tool's real ``BatchedImporter`` on live DSQL and read them back.
+
+    The exact Full Load write path: each INSERT shape rendered once to ``$n`` text and sent
+    through psycopg's ``RawCursor``, on connections the importer's pool opens from
+    ``connect`` (the real connector's) with prepared statements off. A clean load (plain
+    INSERT, no ON CONFLICT), two rows per batch, into a table whose column name has a
+    ``%`` -- which psycopg's own placeholder scan used to reject.
+    """
+    from dsql_migrator.core.batched_import import (
+        BatchedImporter,
+        BatchedImportOptions,
+        OnConflictMode,
+    )
+    from dsql_migrator.core.models import ColumnDef, TableDef
+
+    cur.execute(
+        f'CREATE TABLE "{SCRATCH_SCHEMA}"."gate_rows" (id bigint PRIMARY KEY, '
+        'amount numeric(12,2), note text, ts timestamptz, "pct%off" integer)'
+    )
+    rows = _gate_rows()
+    table = TableDef(
+        name=f"{SCRATCH_SCHEMA}.gate_rows",
+        columns=[ColumnDef(name=name, mysql_type="text") for name in GATE_ROWS_COLUMNS],
+        primary_key=["id"],
+    )
+    importer = BatchedImporter(
+        BatchedImportOptions(on_conflict=OnConflictMode.NONE, batch_size=2, parallelism=1),
+        connection_factory=connect,
+    )
+    result = importer.import_rows(iter(rows), table)
+    if result.failures or result.rows_loaded != len(rows):
+        raise RuntimeError(
+            f"importer round-trip loaded {result.rows_loaded} of {len(rows)} row(s), "
+            f"{result.failures} batch(es) failed: {result.first_error}"
+        )
+    cur.execute(
+        f'SELECT id, amount, note, ts, "pct%off" FROM "{SCRATCH_SCHEMA}"."gate_rows" '
+        "ORDER BY id"
+    )
+    back = [dict(zip(GATE_ROWS_COLUMNS, row)) for row in cur.fetchall()]
+    if back != rows:
+        sent = {row["id"]: row for row in rows}
+        read = {row["id"]: row for row in back}
+        differ = sorted(i for i in sent.keys() | read.keys() if sent.get(i) != read.get(i))
+        raise RuntimeError(f"importer round-trip mismatch on id(s) {differ}")
+    return (
+        f"importer round-trip ok ({result.rows_loaded} rows in "
+        f"{result.batches_completed} multi-row INSERTs)"
+    )
 
 
 def check_source() -> tuple[bool, str]:
@@ -181,7 +266,8 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--roundtrip", action="store_true",
-                    help="also run a DSQL scratch CREATE/INSERT/SELECT/DROP round-trip")
+                    help="also run a DSQL scratch CREATE/INSERT/SELECT/DROP round-trip, "
+                         "including a load through Full Load's write path")
     ap.add_argument("--skip-source", action="store_true",
                     help="skip the source connect check (DSQL check only)")
     args = ap.parse_args()

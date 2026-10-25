@@ -603,7 +603,7 @@ def test_converted_artifacts_execute_on_postgres16() -> None:
     table = _customers_table()
     conversion = SchemaConverter().convert_table(table)
     columns = [c.name for c in table.columns]
-    from dsql_migrator.core.batched_import import build_insert_statement
+    from dsql_migrator.core.batched_import import _insert_cursor, render_insert_statement
 
     try:
         with connection.cursor() as cursor:
@@ -614,8 +614,9 @@ def test_converted_artifacts_execute_on_postgres16() -> None:
             for index_ddl in conversion.index_ddls:
                 cursor.execute(index_ddl.replace(" ASYNC", ""))
 
-        # Load rows with the same parameterized INSERT the importer builds.
-        statement = build_insert_statement(
+        # Load rows with the same parameterized INSERT the importer sends: rendered once
+        # to $n text and run on the RawCursor _insert_cursor gives a psycopg connection.
+        statement = render_insert_statement(
             table.name, columns, 3, OnConflictMode.DO_NOTHING, ["id"]
         )
         params: list[object] = []
@@ -625,8 +626,9 @@ def test_converted_artifacts_execute_on_postgres16() -> None:
             {"id": 3, "name": "carol", "is_active": True},
         ]:
             params.extend(row[name] for name in columns)
-        with connection.cursor() as cursor:
+        with _insert_cursor(connection) as cursor:
             cursor.execute(statement, params)
+        with connection.cursor() as cursor:
             cursor.execute('SELECT COUNT(*) FROM "customers"')
             count = cursor.fetchone()[0]
         assert count == 3
