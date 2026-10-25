@@ -2065,6 +2065,45 @@ class PostgresSourceDialect(SourceDialect):
             only_found=True,
         )
 
+    def estimate_rows_from_size(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[int]]":
+        # For a table whose reltuples is -1 (never analysed or vacuumed: the normal state
+        # of a freshly bulk-loaded source, and of a small table autovacuum never reached),
+        # the planner's rule for such a table, simplified: its size now over a row width
+        # taken from its column types -- 28 bytes of tuple header and line pointer, each
+        # fixed-width column at its length, any other at 32 bytes (PostgreSQL's guess for a
+        # variable-width value without a declared length). Live-checked on PostgreSQL 16:
+        # within 7% of EXPLAIN's row estimate, which also floors a never-vacuumed table at
+        # 10 pages; this does not (an empty table is 0). pg_relation_size reads the size of
+        # the table's main data files and takes only the ACCESS SHARE lock a SELECT takes:
+        # no row is read. A partitioned PARENT has no storage of its own, so its LEAVES are
+        # summed (none: 0 rows), as estimate_row_counts sums their reltuples; the width is
+        # the parent's columns.
+        return estimate_row_counts_query(
+            connection,
+            tables,
+            current_schema_sql="SELECT current_schema()",
+            select_from="FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace",
+            schema_column="n.nspname",
+            table_column="c.relname",
+            estimate_column=(
+                "(CASE WHEN c.relkind = 'p' THEN ("
+                "  SELECT coalesce(sum(pg_catalog.pg_relation_size(t.relid)), 0)"
+                "  FROM pg_catalog.pg_partition_tree(c.oid) t WHERE t.isleaf"
+                ") ELSE pg_catalog.pg_relation_size(c.oid) END"
+                " / (28 + ("
+                "  SELECT coalesce(sum(CASE WHEN a.attlen > 0 THEN a.attlen ELSE 32 END), 0)"
+                "  FROM pg_catalog.pg_attribute a"
+                "  WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
+                ")))::bigint"
+            ),
+            extra_filter="c.relkind IN ('r', 'p')",
+            parse_estimate=lambda value: (
+                None if value is None or int(value) < 0 else int(value)
+            ),
+        )
+
     def probe_versions(self, connection: object) -> SourceVersions:
         # version() is the verbose banner ("PostgreSQL 16.4 ... on <arch>").
         # SHOW server_version is "<numeric>[ (<packaging>)]" -- "16.10 (Homebrew)",

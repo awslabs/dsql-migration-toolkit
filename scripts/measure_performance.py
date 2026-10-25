@@ -29,7 +29,9 @@ Two subcommands:
               --wait-sys-jobs waits (bounded) for Aurora DSQL's async jobs to drain
               before starting; --cdc-mode runs the load as a Full load + CDC run
               (start point captured and fenced as the product does, no CDC stack
-              needed) so a MySQL table can be read in --reader-shards ranges.
+              needed) so a MySQL table can be read in --reader-shards ranges;
+              --inventory-order starts the tables in inventory order instead of the
+              largest first, the other arm of the start-order A/B.
 
   cdc-lag     Measure END-TO-END CDC replication lag (source commit -> visible on
               the DSQL target) under a SUSTAINED trickle and under BURSTS, reporting
@@ -74,6 +76,7 @@ This is an operational utility (NOT shipped in the app).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import logging
@@ -657,6 +660,24 @@ def _wait_for_sys_jobs(connect, max_wait: float, *, poll: float = 15.0,
                 pass
 
 
+@contextlib.contextmanager
+def _start_order(inventory: bool):
+    """--inventory-order: while the run is on, the process pool starts its units in the
+    planner's own (inventory) order, as builds before R2 did, instead of the largest table
+    first -- so one image measures both arms of that A/B. Put back afterwards."""
+    if not inventory:
+        yield
+        return
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    largest_first = engine._largest_first
+    engine._largest_first = lambda work_units, estimates: list(work_units)
+    try:
+        yield
+    finally:
+        engine._largest_first = largest_first
+
+
 def cmd_full_load(args) -> int:
     from _e2e_tables import tables_for
 
@@ -810,15 +831,19 @@ def cmd_full_load(args) -> int:
     # The table workers' write-path counters, live (beside each progress flush) and final
     # (with each result), per table and per run.
     board = LoadStatsBoard()
+    # --inventory-order: the other arm of the start-order A/B (roadmap A7), on one image.
+    inventory_order = bool(getattr(args, "inventory_order", False))
 
     def work(handle) -> None:
-        run_full_load(
-            handle, tables, migrator=migrator, error_log=error_log, load_stats=board
-        )
+        with _start_order(inventory_order):
+            run_full_load(
+                handle, tables, migrator=migrator, error_log=error_log, load_stats=board
+            )
 
     log(f"Full Load '{schema}' ({len(tables)} tables) at "
         f"tp={args.table_parallelism} bp={args.batch_parallelism}"
-        f"{' as Full load + CDC' if cdc_mode else ''} ...")
+        f"{' as Full load + CDC' if cdc_mode else ''}"
+        f"{' in inventory order' if inventory_order else ''} ...")
     started_at = time.time()
     t0 = time.monotonic()
     job_id = jm.submit(work)
@@ -944,6 +969,11 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
         "batch_parallelism": args.batch_parallelism,
         "batch_rows": int(cfg("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "2000")),
         "reader_shards": int(cfg("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")),
+        # The order the pool started the tables in: the largest first (R2), or the
+        # inventory's with --inventory-order. Each table's start is its load_started_at.
+        "start_order": (
+            "inventory" if getattr(args, "inventory_order", False) else "largest-first"
+        ),
         # --cdc-mode: a Full load + CDC run. Whether its start point had a binlog
         # coordinate / an LSN (MySQL splits a table only with a binlog one) and which
         # fence made it exact -- never the coordinate itself.
@@ -1302,6 +1332,10 @@ def main() -> int:
                          "-- before any read, so MySQL tables can be read in "
                          "--reader-shards ranges. No CDC stack is needed or started, "
                          "and no PostgreSQL replication slot is created")
+    fl.add_argument("--inventory-order", action="store_true",
+                    help="start the tables in inventory order, as builds before R2 "
+                         "did, instead of the largest first: one image runs both arms "
+                         "of the start-order A/B")
     fl.add_argument("--wait-sys-jobs", type=float, nargs="?", const=1800.0, default=None,
                     metavar="SECONDS",
                     help="before starting, wait until Aurora DSQL's sys.jobs has no "

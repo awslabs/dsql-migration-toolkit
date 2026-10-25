@@ -65,7 +65,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
-from dsql_migrator.core.introspector import _default_engine_factory
+from dsql_migrator.core.introspector import _default_engine_factory, _limit_lock_waits
 from dsql_migrator.core.models import SourceConnectionConfig, SourceType, TableDef
 from dsql_migrator.core.mysql_zero_dates import ZeroDateMapping, zero_date_mappings
 from dsql_migrator.core.source_dialect import (
@@ -1453,6 +1453,37 @@ class TableExporter:
                     ro, table, shards, dialect,
                     from_only=_reads_own_rows_only(ro, table, dialect),
                 )
+        finally:
+            engine.dispose()
+
+    def estimate_rows_from_size(
+        self, conn: SourceConnectionConfig, tables: "list[str]"
+    ) -> "dict[str, Optional[int]]":
+        """Scan-free row estimates of ``tables`` from their size on disk (read-only).
+
+        The source dialect's :meth:`~dsql_migrator.core.source_dialect.base.SourceDialect.
+        estimate_rows_from_size` over one short connection: the estimate the multi-process
+        Full Load orders a table by when it has no row estimate (PostgreSQL ``reltuples``
+        -1). No table: no connection.
+
+        Its lock waits are bounded as the evaluation's catalog reads are
+        (:data:`~dsql_migrator.core.introspector.INTROSPECTION_LOCK_TIMEOUT_SECONDS`): reading
+        a table's size takes the ACCESS SHARE lock a SELECT takes, so one table another
+        session holds or waits to hold exclusively (an ALTER TABLE, a VACUUM FULL) would
+        otherwise hold the whole run's start for the Full Load read timeout (live: the full
+        timeout, then no estimate at all). Bounded, the read gives up within seconds and
+        those tables start first.
+        """
+        names = [str(name) for name in tables]
+        if not names:
+            return {}
+        dialect = dialect_for(conn.source_type)
+        engine = self._engine_factory(conn)
+        try:
+            with engine.connect() as connection:
+                ro = connection.execution_options(isolation_level="AUTOCOMMIT")
+                _limit_lock_waits(ro)
+                return dialect.estimate_rows_from_size(ro, names)
         finally:
             engine.dispose()
 

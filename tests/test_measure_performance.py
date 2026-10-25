@@ -11,7 +11,8 @@ emptied, and every source / target / job seam is a double. Pinned here:
 * the report carries the workers' counters -- OC000 / OC001 apart, the INSERT round trip
   in ``write_rtt_ms`` -- never the start point's coordinate;
 * ``--wait-sys-jobs`` waits a bounded time for Aurora DSQL's async jobs, and does not load
-  when they do not drain; ``--cdc-mode`` runs the load as a Full load + CDC run.
+  when they do not drain; ``--cdc-mode`` runs the load as a Full load + CDC run;
+  ``--inventory-order`` starts the tables in inventory order for that run only (R2's A/B).
 """
 
 from __future__ import annotations
@@ -583,3 +584,45 @@ def test_the_new_flags_parse(mp, monkeypatch, argv, expected) -> None:
     captured.clear()
     mp.main()
     assert captured["args"].cdc_mode is True
+
+
+def test_inventory_order_runs_the_other_arm_of_the_start_order_ab(mp, monkeypatch, tmp_path):
+    # R2: the product starts the largest table first; --inventory-order starts the units in
+    # the planner's own order for this run only, so one image measures both arms.
+    import dsql_migrator.ui.data_migration as data_migration
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    args, seen, report_path = _command_doubles(mp, monkeypatch, tmp_path)
+    inner = data_migration.run_full_load
+    units = [("table", SimpleNamespace(name="small")), ("table", SimpleNamespace(name="big"))]
+    orders: list = []
+
+    def _run(handle, tables, **kw):
+        orders.append([u[1].name for u in engine._largest_first(units, {"small": 1, "big": 9})])
+        return inner(handle, tables, **kw)
+
+    monkeypatch.setattr(data_migration, "run_full_load", _run)
+    product = engine._largest_first
+    args.inventory_order = True
+    assert mp.cmd_full_load(args) == 0
+    assert orders == [["small", "big"]]                   # the planner's order, during the run
+    assert engine._largest_first is product               # ... and the product's after it
+    assert json.loads(report_path.read_text())["start_order"] == "inventory"
+    assert any("in inventory order" in line for line in seen["log"])
+
+    args.inventory_order = False
+    assert mp.cmd_full_load(args) == 0
+    assert orders[-1] == ["big", "small"]
+    assert json.loads(report_path.read_text())["start_order"] == "largest-first"
+
+
+def test_the_inventory_order_flag_parses(mp, monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(mp, "cmd_full_load", lambda args: captured.setdefault("args", args) and 0)
+    monkeypatch.setenv("DB_HOST", "db.invalid")
+    monkeypatch.setenv("DB_PASSWORD", "unused-by-this-test")
+    for argv, expected in (([], False), (["--inventory-order"], True)):
+        captured.clear()
+        monkeypatch.setattr("sys.argv", ["measure_performance.py", "full-load", *argv])
+        mp.main()
+        assert captured["args"].inventory_order is expected

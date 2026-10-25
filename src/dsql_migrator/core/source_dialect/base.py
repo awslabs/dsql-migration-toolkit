@@ -461,6 +461,20 @@ class SourceDialect(ABC):
         """
         return {}
 
+    def estimate_rows_from_size(
+        self, connection: object, tables: list[str]
+    ) -> "dict[str, Optional[int]]":
+        """Scan-free row ESTIMATE from each table's size on disk (``None`` = unknown),
+        keyed as passed: the fallback for a table :meth:`estimate_row_counts` cannot
+        estimate.
+
+        Only the Full Load's start order reads it (the largest tables start first). The
+        default returns ``{}`` without touching ``connection``: a MySQL table always has
+        its ``information_schema`` estimate. PostgreSQL overrides it for a table whose
+        ``reltuples`` is -1 (never analysed or vacuumed).
+        """
+        return {}
+
     @abstractmethod
     def probe_versions(self, connection: object) -> SourceVersions:
         """Read source version metadata read-only for the overview diagram.

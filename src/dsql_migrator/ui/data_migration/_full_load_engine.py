@@ -3228,6 +3228,110 @@ def _planned_shard_ranges(
         return []
 
 
+def _is_row_estimate(value: object) -> bool:
+    """Is ``value`` a row estimate: an int, 0 included (never a bool, never negative)?"""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _row_estimates_from_size(
+    migrator: "DataMigrator",
+    names: Sequence[str],
+    *,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> "dict[str, int]":
+    """Row estimates of ``names`` from their size on disk, read through the exporter
+    (:meth:`~dsql_migrator.core.exporter.TableExporter.estimate_rows_from_size`: one short
+    connection, one catalog query, no row read), then ``heartbeat`` -- the read is a source
+    connect before the drain thread that owns liveness starts, stamped like the planning
+    reads. ``{}`` for an exporter without the method (a test double; nothing read, nothing
+    stamped) or a read that fails: those tables then start first, and the run goes on --
+    only the order the tables start in depends on it."""
+    read = getattr(getattr(migrator, "_exporter", None), "estimate_rows_from_size", None)
+    if read is None or not names:
+        return {}
+    try:
+        found = read(migrator._inputs.source_config, list(names))  # type: ignore[attr-defined]
+    except ReadOnlySourceError:
+        raise
+    except Exception:  # noqa: BLE001 - an order, never a failed run
+        _LOGGER.warning(
+            "Could not read the size of %d table(s) for the load order; they start first",
+            len(names), exc_info=True,
+        )
+        found = {}
+    if heartbeat is not None:
+        heartbeat()
+    wanted = set(names)
+    return {
+        name: value for name, value in (found or {}).items()
+        if name in wanted and _is_row_estimate(value)
+    }
+
+
+def _load_order_estimates(
+    migrator: "DataMigrator",
+    tables: Sequence[TableDef],
+    watermark: "Optional[Watermark]",
+    *,
+    skip: "Collection[str]" = (),
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> "dict[str, int]":
+    """Each table's scan-free row estimate, for the order the tables start in (R2).
+
+    The start point's own estimates (``Watermark.table_row_counts``: MySQL
+    ``information_schema.tables.table_rows``, PostgreSQL ``pg_class.reltuples``), also on a
+    retry, whose start point may be days old: an older estimate still tells a large table
+    from a small one, and nothing but the order depends on it. A 0 orders as 0 rows, last.
+    (The shard planner reads a MySQL 0 as unknown, so that it never skips a split on it;
+    here, starting every empty table first would hold the large ones back.) A PostgreSQL
+    table without an estimate -- never analysed (``reltuples`` -1) or not in the start point
+    (added after the load) -- is estimated from its size on disk, all of them in one read
+    (:func:`_row_estimates_from_size`, then ``heartbeat``). A table still without one is
+    left out, and ``skip`` (tables that never start) is never read.
+    """
+    counts = getattr(watermark, "table_row_counts", None) or {}
+    names = [table.name for table in tables if table.name not in skip]
+    estimates = {name: counts[name] for name in names if _is_row_estimate(counts.get(name))}
+    unknown = [name for name in names if name not in estimates]
+    source = getattr(getattr(migrator, "_inputs", None), "source_config", None)
+    if unknown and getattr(source, "source_type", None) is SourceType.POSTGRES:
+        estimates.update(_row_estimates_from_size(migrator, unknown, heartbeat=heartbeat))
+    return estimates
+
+
+def _largest_first(
+    work_units: "Sequence[tuple]", estimates: "Mapping[str, int]"
+) -> "list[tuple]":
+    """``work_units`` in the order the process pool starts them (R2): first every table
+    without a row estimate in ``estimates`` (it may be the largest), then the others by the
+    rows each of their units reads, largest first -- a table's estimate, or for a split
+    table its estimate shared equally by its reader shards; a tie keeps the order the
+    tables came in. A table's reader shards stay together, in range order.
+
+    The pool starts its units first in, first out, and a table that is not split loads on
+    one process, so a large table that started late ran alone at the end while the other
+    slots sat idle. A split table goes by its share per shard, not its whole size: its
+    shards run side by side, so its whole size would put all of them ahead of a table that
+    one process reads alone and that is larger than any shard -- which would then run alone
+    at the end. Only the start order changes: what each unit reads and writes (its
+    primary-key ranges, keyset pages and batches), the start point taken before any read,
+    the recreate pre-pass that runs before any unit and the foreign keys added after the
+    load do not depend on it.
+    """
+    parts: dict[str, int] = {}
+    for unit in work_units:
+        parts[unit[1].name] = parts.get(unit[1].name, 0) + 1
+
+    def _key(unit: tuple) -> tuple:
+        name = unit[1].name
+        estimate = estimates.get(name)
+        return (0, 0) if estimate is None else (1, -estimate / parts[name])
+
+    # sorted() is stable: units with one key -- a table's ranges, tables of one size -- keep
+    # the order they came in, and the planner lists a table's ranges together.
+    return sorted(work_units, key=_key)
+
+
 def _split_refusal(
     migrator: "DataMigrator",
     table: TableDef,
@@ -3399,7 +3503,8 @@ def _migrate_tables_in_parallel(
     ``watermark`` is the run's start point (G137: a MySQL Full load + CDC run with a binlog
     one may split a table's read, :func:`_cdc_replays_load`); ``fresh_watermark`` says this
     run captured it, so its row estimates may spare the planning read of a table well below
-    the shard minimum (a retry's may be days old).
+    the shard minimum (a retry's may be days old). On the process path its row estimates
+    also order the units: the largest start first (R2, :func:`_largest_first`).
 
     ``load_stats`` (optional) collects every load unit's write-path counters as they
     arrive and their final values from the results, per table (shards merged) and per run
@@ -3604,6 +3709,16 @@ def _migrate_tables_in_parallel(
                     )
 
         total_workers = min(table_parallelism, len(work_units))
+        # R2: the order the pool starts the units in -- the largest first (a split table by
+        # its share per shard), any table without a row estimate before them
+        # (_largest_first). A PostgreSQL table with no estimate is sized from its files here
+        # (one catalog read, stamped like the planning reads above).
+        start_order = _largest_first(
+            work_units,
+            _load_order_estimates(
+                migrator, tables, watermark, skip=withheld, heartbeat=handle.heartbeat
+            ),
+        )
 
         # Pre-pass: DROP+recreate EVERY replace table BEFORE spawning workers, and do
         # it SERIALLY. DSQL runs one DDL per transaction under optimistic concurrency;
@@ -3727,7 +3842,7 @@ def _migrate_tables_in_parallel(
             ) as pool:
                 futures: dict = {}  # future -> ("table", name) or ("shard", name, idx)
                 submission_idx = 0
-                for wu in work_units:
+                for wu in start_order:
                     if handle.cancelled:
                         break
                     if wu[1].name in withheld:
