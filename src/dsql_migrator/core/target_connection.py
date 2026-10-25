@@ -20,7 +20,9 @@ Guarantees implemented here:
 
 - IAM token auto-refresh (Requirement 5.4): the token is short-lived, so it is
   cached with its expiry and regenerated automatically when expired or within a
-  small safety margin before expiry.
+  small safety margin before expiry. The cache is per process and single flight
+  (:class:`_TokenSlot`): concurrent connects of one identity and cluster mint one
+  token between them.
 - AUTOCOMMIT + TLS (Requirement 5.4 / DSQL specifics): every connection is set
   to autocommit and connects with ``sslmode=require`` as the configured
   ``username``/``database``.
@@ -37,7 +39,9 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 import time
+from concurrent.futures import Future
 from typing import Any, Callable, Optional
 
 from dsql_migrator.config import SecretValue
@@ -229,6 +233,13 @@ def _default_token_generator(
     credential context (Requirements 9.5, 9.7). The admin token API is used for
     the ``admin`` role and the standard db-connect token API otherwise. ``boto3``
     is imported lazily inside ``build_session``.
+
+    Each mint builds its session and client, once per token: a process mints one token per
+    identity and cluster at a time (:class:`_TokenSlot`), so that is one client at a time,
+    not one per connect. A client kept for the life of the process would sign with the
+    credentials it resolved first, and a profile whose keys are rewritten on disk (a
+    credentials helper rotating them) would then fail every connect once the old keys
+    expire; a new session per mint reads them as they are now.
     """
 
     use_admin = username == ADMIN_USERNAME
@@ -245,14 +256,85 @@ def _default_token_generator(
     return generate
 
 
+# The wall clock a cached token is also checked against (a seam for tests). Aurora DSQL judges
+# a token by the wall-clock time it was signed at, while the connector's monotonic clock stops
+# while the host sleeps (macOS and Linux both): a token minted before a laptop suspend still
+# looked fresh after it, and every connector in the process was handed it.
+_wall_clock: Callable[[], float] = time.time
+
+
 class _CachedToken:
-    """A generated IAM token together with the clock value at which it expires."""
+    """A generated IAM token together with the clock values at which it is replaced: the
+    connector's clock (``refresh_at``) and the wall clock (``wall_refresh_at``), whichever
+    comes first."""
 
-    __slots__ = ("secret", "refresh_at")
+    __slots__ = ("secret", "refresh_at", "wall_refresh_at")
 
-    def __init__(self, secret: SecretValue, refresh_at: float) -> None:
+    def __init__(
+        self, secret: SecretValue, refresh_at: float, wall_refresh_at: float
+    ) -> None:
         self.secret = secret
         self.refresh_at = refresh_at
+        self.wall_refresh_at = wall_refresh_at
+
+    def fresh(self, now: float, wall_now: float) -> bool:
+        return now < self.refresh_at and wall_now < self.wall_refresh_at
+
+
+class _TokenSlot:
+    """A cached IAM token and the mint of its successor in flight (single flight).
+
+    Every connector of one identity and cluster in a process shares one slot
+    (:func:`_shared_token_slot`): concurrent connects -- a loader's writer threads opening
+    their connections together at a table's start, every short-lived connector a run builds
+    -- mint ONE token between them. The first caller mints; the others wait for its token,
+    or get its error, instead of minting their own. A connector with an injected token
+    generator or clock (a test's) keeps a slot of its own.
+    """
+
+    __slots__ = ("lock", "cached", "minting")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.cached: Optional[_CachedToken] = None
+        self.minting: Optional[Future] = None
+
+
+# The process's shared slots, by (profile, username, endpoint, region, expiry, margin).
+_SHARED_TOKEN_SLOTS: dict[tuple, _TokenSlot] = {}
+_SHARED_TOKEN_SLOTS_LOCK = threading.Lock()
+
+
+def _shared_token_slot(key: tuple) -> _TokenSlot:
+    """The process's slot for ``key``, created on first use."""
+    with _SHARED_TOKEN_SLOTS_LOCK:
+        slot = _SHARED_TOKEN_SLOTS.get(key)
+        if slot is None:
+            slot = _SHARED_TOKEN_SLOTS[key] = _TokenSlot()
+        return slot
+
+
+# Lowercase substrings of a connect failure in which Aurora DSQL refused the IAM token itself
+# (not the network or the cluster): that token is dropped from its slot, so the next connect
+# mints one from the credentials as they are now -- a token minted before the operator fixed
+# them is not handed out again for the rest of its life. A false match costs one mint.
+_TOKEN_REFUSED_SIGNATURES = (
+    "authentication failed",
+    "access denied",
+    "accessdenied",
+    "not authorized",
+    "token",
+    "signature",
+)
+
+
+def _token_refused(exc: BaseException) -> bool:
+    """Whether a failed connect says the token was refused (SQLSTATE class 28, or its text)."""
+    state = getattr(exc, "sqlstate", None)
+    if isinstance(state, str) and state.startswith("28"):
+        return True
+    message = str(exc).lower()
+    return any(signature in message for signature in _TOKEN_REFUSED_SIGNATURES)
 
 
 class DsqlConnector:
@@ -260,8 +342,10 @@ class DsqlConnector:
 
     The connector caches the generated IAM token and regenerates it automatically
     when it is expired or within ``refresh_margin_seconds`` of expiry, so callers
-    never have to manage token lifetime. The token value is wrapped in
-    :class:`SecretValue` and is never logged or persisted in plaintext.
+    never have to manage token lifetime. The cache is shared by every connector of the
+    same identity and cluster in the process, and one caller mints at a time
+    (:class:`_TokenSlot`). The token value is wrapped in :class:`SecretValue` and is never
+    logged or persisted in plaintext.
     """
 
     def __init__(
@@ -310,6 +394,17 @@ class DsqlConnector:
         # IPv4-only network never routes to an unreachable IPv6 address. Injectable
         # so unit tests do no real DNS.
         self._ipv4_resolver = ipv4_resolver or _resolve_ipv4
+        # The token store this connector shares with the process's other connectors of the
+        # same identity and cluster; an injected generator or clock keeps its own.
+        self._token_slot = (
+            _shared_token_slot((
+                aws_profile or None, config.username, config.cluster_endpoint,
+                config.region, token_expiry_seconds, refresh_margin_seconds,
+            ))
+            if token_generator is None and clock is time.monotonic
+            else _TokenSlot()
+        )
+        # The token this connector used last (redacted from its failure messages).
         self._cached: Optional[_CachedToken] = None
 
     def _current_token(self) -> SecretValue:
@@ -317,22 +412,55 @@ class DsqlConnector:
 
         The freshly generated token is cached with a refresh deadline of
         ``expiry - margin`` so it is replaced before it can actually expire
-        (Requirement 5.4).
+        (Requirement 5.4), by the connector's clock and by the wall clock, whichever comes
+        first (see :data:`_wall_clock`). Single flight (:class:`_TokenSlot`): while one
+        caller mints, every other caller waits for that token -- or that error -- instead
+        of minting its own.
         """
-        now = self._clock()
-        cached = self._cached
-        if cached is not None and now < cached.refresh_at:
+        now, wall_now = self._clock(), _wall_clock()
+        slot = self._token_slot
+        with slot.lock:
+            cached = slot.cached
+            if cached is not None and cached.fresh(now, wall_now):
+                self._cached = cached
+                return cached.secret
+            minting = slot.minting
+            leader = minting is None
+            if leader:
+                minting = slot.minting = Future()
+        if not leader:
+            cached = minting.result()  # the leader's token, or the leader's error raised
+            self._cached = cached
             return cached.secret
+        try:
+            raw_token = self._token_generator(
+                self._config.cluster_endpoint,
+                self._config.region,
+                self._token_expiry_seconds,
+            )
+            lifetime = self._token_expiry_seconds - self._refresh_margin_seconds
+            cached = _CachedToken(
+                secret=SecretValue(raw_token),
+                refresh_at=now + lifetime,
+                wall_refresh_at=wall_now + lifetime,
+            )
+        except BaseException as exc:
+            with slot.lock:
+                slot.minting = None
+            minting.set_exception(exc)
+            raise
+        with slot.lock:
+            slot.cached, slot.minting = cached, None
+        minting.set_result(cached)
+        self._cached = cached
+        return cached.secret
 
-        raw_token = self._token_generator(
-            self._config.cluster_endpoint,
-            self._config.region,
-            self._token_expiry_seconds,
-        )
-        secret = SecretValue(raw_token)
-        refresh_at = now + self._token_expiry_seconds - self._refresh_margin_seconds
-        self._cached = _CachedToken(secret=secret, refresh_at=refresh_at)
-        return secret
+    def _forget_token(self, token: SecretValue) -> None:
+        """Drop ``token`` from the slot unless a newer one has replaced it already."""
+        slot = self._token_slot
+        with slot.lock:
+            if slot.cached is not None and slot.cached.secret is token:
+                slot.cached = None
 
     def connect(self) -> Any:
         """Open an autocommit, TLS connection to DSQL using an IAM token.
@@ -423,7 +551,14 @@ class DsqlConnector:
         )
         if ipv4:
             connect_kwargs["hostaddr"] = ipv4
-        connection = self._connect_factory(**connect_kwargs)
+        try:
+            connection = self._connect_factory(**connect_kwargs)
+        except Exception as exc:
+            if _token_refused(exc):
+                # Shared by the process's other connectors: never hand a refused token out
+                # again (see _TOKEN_REFUSED_SIGNATURES).
+                self._forget_token(token)
+            raise
         # Defensively enforce autocommit even if the driver ignored the kwarg.
         try:
             if getattr(connection, "autocommit", True) is not True:

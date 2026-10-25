@@ -321,6 +321,19 @@ def source_error_hint(
 # which the tool never makes.
 _MYSQL_SESSION_INIT_COMMAND = "SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'"
 
+# How long the MySQL server waits to write more of a result to a session that has stopped
+# reading it before it drops the connection (``net_write_timeout``, 60 s by default). The
+# Full Load reader takes a keyset page row by row, and while Aurora DSQL is slow its batch
+# queue fills and it stops reading in mid-page: past 60 s the source dropped it, and the
+# table was read again from the start (a MySQL table read in parts failed). A session value
+# like the pins above, set in the same SET on the engines that opt into per-socket timeouts
+# (see :func:`source_engine_kwargs`); the pins themselves are unchanged.
+_MYSQL_STREAM_NET_WRITE_TIMEOUT_SECONDS = 600
+_MYSQL_STREAM_SESSION_INIT_COMMAND = (
+    f"{_MYSQL_SESSION_INIT_COMMAND}, "
+    f"net_write_timeout = {_MYSQL_STREAM_NET_WRITE_TIMEOUT_SECONDS}"
+)
+
 
 def source_engine_kwargs(
     *, read_timeout_seconds: Optional[int] = None
@@ -335,10 +348,12 @@ def source_engine_kwargs(
     so it can be asserted in a unit test without opening a connection.
 
     ``read_timeout_seconds`` (opt-in) additionally bounds each socket read/write
-    so a connected-but-stalled stream raises instead of blocking forever. It is
-    used only by the Full Load source stream (whose reads return a bounded keyset
-    page); the default ``None`` keeps introspection/validation free to run a
-    single long query (exact counts/checksums) without a per-read deadline.
+    so a connected-but-stalled stream raises instead of blocking forever, and lets the
+    server wait :data:`_MYSQL_STREAM_NET_WRITE_TIMEOUT_SECONDS` for a reader that pauses
+    in mid-result (:data:`_MYSQL_STREAM_SESSION_INIT_COMMAND`). It is used by the Full Load
+    source stream (whose reads return a bounded keyset page) and the short CDC catalog
+    reads; the default ``None`` keeps introspection/validation free to run a single long
+    query (exact counts/checksums) without a per-read deadline.
     """
     connect_args: dict[str, object] = {
         "connect_timeout": SOURCE_CONNECT_TIMEOUT_SECONDS,
@@ -348,6 +363,7 @@ def source_engine_kwargs(
         # PyMySQL applies these per socket operation, not to the whole query.
         connect_args["read_timeout"] = read_timeout_seconds
         connect_args["write_timeout"] = read_timeout_seconds
+        connect_args["init_command"] = _MYSQL_STREAM_SESSION_INIT_COMMAND
     return {
         "pool_pre_ping": True,
         "connect_args": connect_args,

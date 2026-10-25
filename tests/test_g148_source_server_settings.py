@@ -259,8 +259,11 @@ def _config() -> SourceConnectionConfig:
 
 
 def test_the_shared_init_command_pins_utc_and_a_neutral_sql_mode_in_one_set() -> None:
-    for kwargs in (source_engine_kwargs(), source_engine_kwargs(read_timeout_seconds=30)):
-        assert kwargs["connect_args"]["init_command"] == PIN
+    assert source_engine_kwargs()["connect_args"]["init_command"] == PIN
+    # A stream that opts into per-socket timeouts runs the same pins in the same SET, plus
+    # the server's wait for it (tests/test_full_load_scale_hygiene.py).
+    stream = source_engine_kwargs(read_timeout_seconds=30)["connect_args"]["init_command"]
+    assert stream == f"{PIN}, net_write_timeout = 600"
     assert PIN.count("SET") == 1  # one statement, both assignments
     assert not is_write_or_ddl(PIN)
     # The dialect hands every engine the same kwargs; PostgreSQL is untouched.

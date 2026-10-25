@@ -75,7 +75,10 @@ def _calendar(name: str = "app.cal") -> TableDef:
 def test_the_session_pin_lets_a_stored_invalid_day_bind_and_changes_no_parsing() -> None:
     for kwargs in (source_engine_kwargs(), source_engine_kwargs(read_timeout_seconds=30)):
         command = kwargs["connect_args"]["init_command"]
-        assert command == "SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'"
+        # A stream adds the server's wait for it after the pin (net_write_timeout).
+        assert command.removesuffix(", net_write_timeout = 600") == (
+            "SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'"
+        )
         mode = re.search(r"sql_mode = '([^']*)'", command).group(1)
         flags = set(mode.split(","))
         assert flags == {"ALLOW_INVALID_DATES"}

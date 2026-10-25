@@ -127,3 +127,18 @@ def no_real_aws(request: pytest.FixtureRequest):
             "its own.",
             pytrace=False,
         )
+
+
+@pytest.fixture(autouse=True)
+def no_shared_dsql_token():
+    """Start every test with no IAM token shared by the process's DSQL connectors.
+
+    ``DsqlConnector`` keeps one token per identity and cluster for the whole process
+    (``core/target_connection.py``, ``_TokenSlot``): a token one test's fake minted must never
+    reach a connector of another test. An own MonkeyPatch, as above.
+    """
+    from dsql_migrator.core import target_connection
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(target_connection, "_SHARED_TOKEN_SLOTS", {})
+        yield

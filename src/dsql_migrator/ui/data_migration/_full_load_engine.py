@@ -29,6 +29,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from functools import partial
 from types import MappingProxyType
 from typing import (
     Any, Callable, Collection, Iterable, Iterator, Mapping, NamedTuple, Optional, Protocol,
@@ -55,6 +56,7 @@ from dsql_migrator.core.batched_import import (
     BatchedImporter,
     BatchedImportOptions,
     OnConflictMode,
+    _disable_prepared_statements,
     is_unconfirmed_index_failure,
     safe_error_message,
 )
@@ -898,7 +900,11 @@ class _RunCounts(NamedTuple):
 # Multiprocess worker infrastructure (Phase 1 — true multi-core Full Load)
 # ---------------------------------------------------------------------------
 
-# Stagger delay between process submissions to avoid DSQL IAM token/connection burst.
+# Stagger delay between the submissions that start a worker process, to avoid a DSQL IAM
+# token/connection burst. The pool starts one process per submission until it has its
+# max_workers and queues the rest, which start only as earlier units finish: a delay before
+# one of those spaced nothing out, and 1000 tables spent 150 s in the submit loop before any
+# result was read.
 _PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
 
 # How long Stop Full Load waits for the worker processes to wind down cooperatively
@@ -3726,12 +3732,19 @@ def _migrate_tables_in_parallel(
         # contend on the shared schema catalog and raise OC001 (40001, "schema has
         # been updated by another transaction"), which can exhaust the DDL retry
         # budget and fail a table before a single row loads. The DROP+CREATE is
-        # metadata-only, so doing it here (sequential, ~one connect per table) removes
+        # metadata-only, so doing it here (sequential, on one connection) removes
         # that startup DDL storm at the source. Workers then load into the already-
         # empty target WITHOUT re-running the DDL (they derive the same post-load
         # secondary-index DDLs from the applied conversion) -- the same way sharded
         # tables have always been pre-recreated here.
         table_recreator = migrator._table_recreator
+        # The whole pass on ONE target connection, and so one token, when the recreator can
+        # take one (the default; _ReusedTargetConnection): it was two connections and two
+        # token mints per table.
+        _reused_connection = getattr(table_recreator, "reused_connection", None)
+        reused = _reused_connection() if callable(_reused_connection) else None
+        if reused is not None:
+            table_recreator = partial(table_recreator, connection_factory=reused)
         recreated_names: set[str] = set()
         # A REPLACE table recreated here is EMPTY with NO secondary indexes yet
         # (recreate_table builds only the base table; indexes are a post-load pass). The
@@ -3742,44 +3755,50 @@ def _migrate_tables_in_parallel(
         # all of that table's shards succeed (see the shard-success branch below). Without
         # this, a sharded REPLACE load silently created NO secondary indexes.
         replace_index_ddls: dict[str, list[str]] = {}
-        for wu in work_units:
-            tbl = wu[1]
-            if tbl.name in recreated_names or tbl.name in withheld:
-                continue
-            is_replace = (
-                not migrator._inputs.cdc_coexisting
-                and tbl.name in migrator._inputs.replace_tables
-            )
-            if is_replace:
-                if prepass is not None and handle.cancelled:
-                    break  # the rest stay PENDING and are settled as unfinished
-                try:
-                    replace_index_ddls[tbl.name] = table_recreator(tbl)
-                except Exception as exc:  # noqa: BLE001 - see below
-                    # A run with the overlay pre-pass fails only this table; any other run
-                    # keeps the previous behaviour (a recreate failure aborts the run).
-                    if prepass is None:
-                        # The tables already recreated are empty: their record of an
-                        # earlier read in parts goes with their rows (G137).
-                        if recreated_names:
-                            handle.update(
-                                lambda job, names=sorted(recreated_names): (
-                                    _record_reader_shards(job, names, {}, names)
-                                )
-                            )
-                        raise
-                    _fail_prepass_table(tbl.name, exc=exc)
+        try:
+            for wu in work_units:
+                tbl = wu[1]
+                if tbl.name in recreated_names or tbl.name in withheld:
                     continue
-                finally:
-                    # The drain thread that owns liveness has not started yet, and this
-                    # loop is one fresh DSQL connect + DDL per table -- a few hundred
-                    # REPLACE tables therefore crossed the 900 s stall window BEFORE a single
-                    # row loaded and the watchdog failed a healthy run. A recreated table is
-                    # a real unit of work, so stamping here cannot mask a wedged connect.
-                    handle.heartbeat()
-                recreated_names.add(tbl.name)
-                if prepass is not None:
-                    prepass.recreated(tbl.name)
+                is_replace = (
+                    not migrator._inputs.cdc_coexisting
+                    and tbl.name in migrator._inputs.replace_tables
+                )
+                if is_replace:
+                    if prepass is not None and handle.cancelled:
+                        break  # the rest stay PENDING and are settled as unfinished
+                    try:
+                        replace_index_ddls[tbl.name] = table_recreator(tbl)
+                    except Exception as exc:  # noqa: BLE001 - see below
+                        if reused is not None:
+                            reused.discard()  # the next table starts on a fresh connection
+                        # A run with the overlay pre-pass fails only this table; any other run
+                        # keeps the previous behaviour (a recreate failure aborts the run).
+                        if prepass is None:
+                            # The tables already recreated are empty: their record of an
+                            # earlier read in parts goes with their rows (G137).
+                            if recreated_names:
+                                handle.update(
+                                    lambda job, names=sorted(recreated_names): (
+                                        _record_reader_shards(job, names, {}, names)
+                                    )
+                                )
+                            raise
+                        _fail_prepass_table(tbl.name, exc=exc)
+                        continue
+                    finally:
+                        # The drain thread that owns liveness has not started yet, and this
+                        # loop is one DSQL read + DDL per table -- a few hundred
+                        # REPLACE tables therefore crossed the 900 s stall window BEFORE a single
+                        # row loaded and the watchdog failed a healthy run. A recreated table is
+                        # a real unit of work, so stamping here cannot mask a wedged connect.
+                        handle.heartbeat()
+                    recreated_names.add(tbl.name)
+                    if prepass is not None:
+                        prepass.recreated(tbl.name)
+        finally:
+            if reused is not None:
+                reused.close()
         if prepass is not None:
             prepass.after_recreate(recreated_names)
 
@@ -3847,7 +3866,9 @@ def _migrate_tables_in_parallel(
                         break
                     if wu[1].name in withheld:
                         continue  # failed in the overlay pre-pass; never submitted
-                    if submission_idx > 0:
+                    # Only before a submission that starts a process: the pool's first
+                    # total_workers (see _PROCESS_LAUNCH_STAGGER_SECONDS).
+                    if 0 < submission_idx < total_workers:
                         _time.sleep(_PROCESS_LAUNCH_STAGGER_SECONDS)
                     submission_idx += 1
 
@@ -6203,7 +6224,11 @@ def _derived_table_conversion(
 
 
 def _target_columns_the_conversion_would_drop(
-    inputs: "DataMigrationInputs", table_name: str, conversion: TableConversion
+    inputs: "DataMigrationInputs",
+    table_name: str,
+    conversion: TableConversion,
+    *,
+    connection_factory: Optional[Callable[[], Any]] = None,
 ) -> list[str]:
     """Target columns a DROP+recreate from ``conversion`` would DESTROY, if any.
 
@@ -6227,24 +6252,46 @@ def _target_columns_the_conversion_would_drop(
     compare against, and ``recreate_table`` fails on that DDL by itself, which is the
     clearer report.
 
-    Cost: ONE ``information_schema.columns`` read on ONE extra DSQL connection, per
-    REPLACED table only. Nothing scans a row; append loads pay nothing.
+    Cost: ONE ``information_schema.columns`` read, per REPLACED table only, on a connection
+    from ``connection_factory`` (the recreate's; the serial pre-pass passes its one
+    :class:`_ReusedTargetConnection`), else on one extra DSQL connection. Nothing scans a
+    row; append loads pay nothing.
+
+    The read runs again, on a connection opened again, after a dropped connection (as
+    Validation's reads classify one, G141), an XX000 or a 40001, as the DROP + CREATE after
+    it replays its unit; a host that does not resolve fails at once. On the pre-pass's reused
+    connection it is each table's FIRST statement, so a connection Aurora DSQL closed after
+    the table before fails here first; without the retry that aborted the whole run.
     """
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.schema_applier import _is_permanent_connect_error
+    from dsql_migrator.core.target_connection import is_server_unavailable
+    from dsql_migrator.core.validator import _is_dropped_connection
+
     expected = parse_target_column_types(conversion.target_ddl)
     if not expected:
         return []
-    connection = DsqlConnector(
+    connect = connection_factory or DsqlConnector(
         inputs.target_config, aws_profile=inputs.aws_profile
-    ).connect()
-    try:
-        current = read_target_columns(connection, table_name)
-    finally:
-        close = getattr(connection, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:  # noqa: BLE001 - best effort
-                pass
+    ).connect
+
+    def _read() -> list[str]:
+        connection = connect()
+        try:
+            return read_target_columns(connection, table_name)
+        finally:
+            close = getattr(connection, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+
+    current = with_occ_retry(
+        retryable=lambda exc: not _is_permanent_connect_error(exc)
+        and (_is_dropped_connection(exc) or is_server_unavailable(exc) or is_occ_conflict(exc)),
+        sleep=_time.sleep,
+    )(_read)()
     return [name for name in current if name not in expected]
 
 
@@ -6357,6 +6404,77 @@ def _needs_empty_target_promotion(
     return False
 
 
+# A reused pre-pass connection this old is replaced before its next use: Aurora DSQL ends a
+# connection at 60 minutes, and a pass over thousands of tables can run longer than that.
+_REUSED_CONNECTION_MAX_AGE_SECONDS = 30 * 60
+
+
+class _KeptOpen:
+    """The reused connection as one unit sees it: its ``close`` keeps it open for the next."""
+
+    __slots__ = ("_connection",)
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+    def close(self) -> None:
+        pass
+
+
+class _ReusedTargetConnection:
+    """ONE Aurora DSQL connection for the whole serial recreate pre-pass.
+
+    Each replace table's recreate -- its column read, then its DROP + CREATE -- opened two
+    connections of its own, each with an IAM token mint, before any table loaded: about half
+    a second a table. Called as the recreate's connection factory, this hands out one open
+    connection, behind a ``close`` that keeps it open (each unit closes what it was given),
+    and opens a new one first when that one is closed -- a unit that lost it reconnects and
+    replays as before -- or :data:`_REUSED_CONNECTION_MAX_AGE_SECONDS` old, with psycopg's
+    prepared statements off (as on the loader's connections). :meth:`discard`
+    drops it after a table's recreate failed, so the next table starts on a fresh one;
+    :meth:`close` closes it when the pass ends. Serial use only, like the pass: one table,
+    and one statement, at a time.
+    """
+
+    def __init__(
+        self, connect: Callable[[], Any], *, clock: Callable[[], float] = _time.monotonic
+    ) -> None:
+        self._connect = connect
+        self._clock = clock
+        self._connection: Any = None
+        self._opened_at = 0.0
+
+    def __call__(self) -> Any:
+        connection = self._connection
+        if connection is not None and (
+            getattr(connection, "closed", False)
+            or self._clock() - self._opened_at >= _REUSED_CONNECTION_MAX_AGE_SECONDS
+        ):
+            self.discard()
+        if self._connection is None:
+            self._connection = self._connect()
+            self._opened_at = self._clock()
+            # Every statement unprepared, as on the fresh connections each table had:
+            # psycopg prepares one it has run five times on a connection, and every table
+            # runs the same schema ensure, a DDL.
+            _disable_prepared_statements(self._connection)
+        return _KeptOpen(self._connection)
+
+    def discard(self) -> None:
+        """Close the connection (best effort); the next call opens a new one."""
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
+    close = discard
+
+
 def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
     """Build the default DROP+recreate function for a run's target.
 
@@ -6369,17 +6487,27 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
     with a deterministic re-derivation; a table not carried there falls back to the
     deterministic :class:`SchemaConverter`. Returns the table's secondary-index
     DDLs so the caller recreates them after loading.
+
+    ``connection_factory`` (optional) is where both steps get their connections: the
+    process path's serial pre-pass passes one :class:`_ReusedTargetConnection` for all its
+    tables, built by the recreator's ``reused_connection``. Without it, a recreate opens
+    its own.
     """
 
-    def recreate(table: TableDef) -> list[str]:
+    def recreate(
+        table: TableDef, *, connection_factory: Optional[Callable[[], Any]] = None
+    ) -> list[str]:
         conversion = _effective_conversion(inputs, table)
+        connect = connection_factory or DsqlConnector(
+            inputs.target_config, aws_profile=inputs.aws_profile
+        ).connect
         # REFUSE rather than silently destroy a column the conversion does not know
         # about (see _target_columns_the_conversion_would_drop). The reachable case is
         # the tool's own CDC drift recovery: the operator adds the source's new column to
         # the target by hand, then reloads -- and the recreate dropped it again, leaving
         # CDC dead-lettering and the table looking loaded.
         dropped = _target_columns_the_conversion_would_drop(
-            inputs, table.name, conversion
+            inputs, table.name, conversion, connection_factory=connect
         )
         if dropped:
             raise FullLoadIncompleteError(
@@ -6395,16 +6523,20 @@ def _default_table_recreator(inputs: "DataMigrationInputs") -> TableRecreator:
                 "AND the reload copies its data. To reload without the column instead, "
                 "drop it on the target first (ALTER TABLE ... DROP COLUMN)."
             )
-        connector = DsqlConnector(
-            inputs.target_config, aws_profile=inputs.aws_profile
-        )
         recreate_table(
             conversion.schema_ddls,
             conversion.target_ddl,
-            connection_factory=connector.connect,
+            connection_factory=connect,
         )
         return list(conversion.index_ddls)
 
+    def reused_connection() -> _ReusedTargetConnection:
+        return _ReusedTargetConnection(
+            DsqlConnector(inputs.target_config, aws_profile=inputs.aws_profile).connect
+        )
+
+    # What the serial pre-pass looks for: a recreator it can hand one connection.
+    recreate.reused_connection = reused_connection  # type: ignore[attr-defined]
     return recreate
 
 
