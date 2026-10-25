@@ -55,11 +55,14 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import threading
 from abc import ABC, abstractmethod
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from time import monotonic as _wall_monotonic, sleep as _wall_sleep
-from typing import Callable, Iterator, Mapping, Optional, Protocol, TextIO
+from typing import (
+    Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence, TextIO,
+)
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -1072,6 +1075,77 @@ class SourceLoadGovernor:
             fresh = True  # re-read the metric each slice while paused
 
 
+# P2: what a keyset page reader raises when the next page is asked for before the previous
+# one was read to its end. On one source connection that next statement would end the
+# previous result first -- PyMySQL drains an unread unbuffered result before it sends the
+# next command (Connection._execute_command: "Previous unbuffered result was left
+# incomplete") -- so the rows not read yet would be gone, with no error.
+_PAGE_NOT_DRAINED = (
+    "Full Load read: a keyset page was not read to its end before the next one was requested"
+)
+# P2: what closing a table's key-range pages from another thread raises while the thread that
+# reads them is asking for a page or holds one it has not read to its end (_RangePages).
+_PAGES_IN_USE = (
+    "Full Load read: another thread is reading this table's key-range pages, so their source "
+    "session is not ended from this one"
+)
+
+
+class _PageTurn:
+    """What :meth:`TableExporter.stream_converted_ranges` shares with the pages it yields (P2):
+    whether the page yielded last was read to its end (``drained``), the thread that asked for
+    it while it is open (``reader``: set when it is yielded, cleared once it ends), and the lock
+    its :class:`_RangePages` holds while that thread asks for a page."""
+
+    __slots__ = ("lock", "drained", "reader")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.drained = True
+        self.reader: Optional[int] = None
+
+
+class _RangePages:
+    """The ``(range index, page)`` pairs of :meth:`TableExporter.stream_converted_ranges`, with
+    a :meth:`close` that never touches the source session while another thread reads it.
+
+    A row stream's rows are read inside its generator, so a ``close()`` from another thread
+    while one is read raises ("generator already executing") and leaves the connection alone.
+    These pages are read outside the generator that yields them: its ``close()`` would end the
+    snapshot (a COMMIT, then the connection's close) on the socket the reading thread is still
+    reading -- two threads on one PyMySQL connection, which drains the unread rows on the
+    closing one. So :meth:`close` from any thread but the reader raises :class:`ValueError`
+    (:data:`_PAGES_IN_USE`) while the reader is asking for a page or holds one it has not read
+    to its end; the stream then ends when the last reference to it goes (the generator's own
+    cleanup, which no thread is reading by then). From the reader's own thread, or once its
+    page has ended, it closes as a generator does."""
+
+    __slots__ = ("_pages", "_turn")
+
+    def __init__(self, pages: "Iterator[tuple[int, Iterator[Mapping[str, object]]]]",
+                 turn: _PageTurn) -> None:
+        self._pages = pages
+        self._turn = turn
+
+    def __iter__(self) -> "_RangePages":
+        return self
+
+    def __next__(self) -> "tuple[int, Iterator[Mapping[str, object]]]":
+        with self._turn.lock:
+            return next(self._pages)
+
+    def close(self) -> None:
+        turn = self._turn
+        if not turn.lock.acquire(blocking=False):
+            raise ValueError(_PAGES_IN_USE)  # the reader is asking for a page right now
+        try:
+            if turn.reader is not None and turn.reader != threading.get_ident():
+                raise ValueError(_PAGES_IN_USE)
+            self._pages.close()
+        finally:
+            turn.lock.release()
+
+
 def keyset_stream(
     connection: _Connection,
     table: TableDef,
@@ -1087,6 +1161,9 @@ def keyset_stream(
     from_only: bool = False,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
+
+    The rows of :func:`keyset_pages`, page after page: the same statements, parameters,
+    checks and errors (the pages, flattened).
 
     ``from_only`` reads ``FROM ONLY <table>``: a PostgreSQL inheritance parent's own rows,
     the rows CDC captures for it (:func:`_reads_own_rows_only`, which callers ask once per
@@ -1133,6 +1210,53 @@ def keyset_stream(
     ``cursor.description`` (``None`` when the result exposes none), before any row is
     yielded -- the seam :class:`ValueFitGuard` arms from. The read holds one snapshot for
     every page, so the first page's column types hold for the rest.
+    """
+    pages = keyset_pages(
+        connection,
+        table,
+        batch_size=batch_size,
+        should_cancel=should_cancel,
+        pk_lower=pk_lower,
+        pk_upper=pk_upper,
+        governor=governor,
+        dialect=dialect,
+        target_types=target_types,
+        on_description=on_description,
+        from_only=from_only,
+    )
+    try:
+        for page in pages:
+            yield from page
+    finally:
+        pages.close()
+
+
+def keyset_pages(
+    connection: _Connection,
+    table: TableDef,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    pk_lower: Optional[int] = None,
+    pk_upper: Optional[int] = None,
+    governor: Optional["SourceLoadGovernor"] = None,
+    dialect: "SourceDialect" = _MYSQL_DIALECT,
+    target_types: Optional[Mapping[str, str]] = None,
+    on_description: Optional[Callable[[object], None]] = None,
+    from_only: bool = False,
+) -> Iterator[Iterator[Mapping[str, object]]]:
+    """Yield ``table``'s keyset pages in ascending primary-key order, one row iterator each.
+
+    :func:`keyset_stream` page by page (P2): the same statements and parameters, the same
+    cursor checks, ENUM walk and FLOAT re-read skip, the same errors and DEBUG line, and the
+    same end. A page's rows come lazily from its result, as the source sends them (a
+    server-side cursor, never the page in memory). What follows a page -- its DEBUG line,
+    whether it ended the read, the walk's next value -- is decided when the next page is
+    asked for, and that page's statement is sent only then. So a caller can read several
+    of these on ONE connection in turn (:meth:`TableExporter.stream_converted_ranges`), each
+    page read to its end before any other statement: asking for the next page while the
+    previous one still has rows to read raises :class:`RuntimeError` instead of letting the
+    driver drop them (:data:`_PAGE_NOT_DRAINED`).
     """
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -1222,6 +1346,55 @@ def keyset_stream(
     def _key_of(row: Mapping[str, object]) -> tuple:
         return tuple(row[c] for c in pk_columns)
 
+    def _page_rows(
+        result: object, cursor: Optional[tuple], member: Optional[int], read: list
+    ) -> Iterator[Mapping[str, object]]:
+        """One page's rows as the source sends them, checked against the page's ``cursor``
+        (and, walking, its ``member``). Once the last one has been read, ``read`` gets the
+        page's tally: (rows read, rows skipped, its first key, its last key -- ``cursor``
+        when it yielded none)."""
+        page_count = 0
+        skipped = 0
+        first_key: Optional[tuple] = None
+        last = cursor
+        for row in result.mappings():  # type: ignore[attr-defined]
+            page_count += 1
+            key = _key_of(row)
+            if cursor is not None and tuple(map(_told_apart, key)) == tuple(map(_told_apart, cursor)):
+                if rereads and first_key is None:
+                    # The cursor names its value only as the source rounds it, so the page
+                    # starts at the rows that read back as it: ones already read, or ones the
+                    # target holds as the same key. Neither is loaded again. Only where the
+                    # page starts: such a row after another one is no rounding.
+                    skipped += 1
+                    continue
+                # A cursor's own row never sorts after it: the source compares the key
+                # differently from the cursor (ENUM members equal under the column's
+                # collation), so this page re-reads rows -- a full one that ends here
+                # would be read again forever -- and may pass others by. Stop instead.
+                raise ExportError(
+                    f"table '{table.name}': a page of its keyset read returned the row the "
+                    "page was read after, so the read would read rows again and could miss "
+                    "others: the source compares the key differently from the read's cursor "
+                    "(for example ENUM members equal under the column's collation). Make the "
+                    "key's values distinct as the source compares them, then retry this table."
+                )
+            if member is not None and key[0] != walk[member]:
+                # The source matched another value's rows for this one: two of its values
+                # compare equal there (ENUM members equal under the column's collation).
+                raise _walk_stopped(
+                    pk_columns[0],
+                    "has members the source compares as equal (for example two that differ "
+                    "only in letter case or accents under the column's collation), and the "
+                    "rows read for one of them hold another",
+                    "Make the members distinct on the source, then retry this table.",
+                )
+            if first_key is None:
+                first_key = key
+            last = key
+            yield row
+        read.append((page_count, skipped, first_key, last))
+
     last_key: Optional[tuple] = None
     # Walk only: the position in ``walk`` of the value being read (from the first page's
     # last row on), and whether the next page is its first.
@@ -1257,45 +1430,13 @@ def keyset_stream(
         if on_description is not None and page_index == 0:
             on_description(getattr(getattr(result, "cursor", None), "description", None))
         page_index += 1
-        page_count = 0
-        skipped = 0
-        first_key: Optional[tuple] = None
-        for row in result.mappings():  # type: ignore[attr-defined]
-            page_count += 1
-            key = _key_of(row)
-            if cursor is not None and tuple(map(_told_apart, key)) == tuple(map(_told_apart, cursor)):
-                if rereads and first_key is None:
-                    # The cursor names its value only as the source rounds it, so the page
-                    # starts at the rows that read back as it: ones already read, or ones the
-                    # target holds as the same key. Neither is loaded again. Only where the
-                    # page starts: such a row after another one is no rounding.
-                    skipped += 1
-                    continue
-                # A cursor's own row never sorts after it: the source compares the key
-                # differently from the cursor (ENUM members equal under the column's
-                # collation), so this page re-reads rows -- a full one that ends here
-                # would be read again forever -- and may pass others by. Stop instead.
-                raise ExportError(
-                    f"table '{table.name}': a page of its keyset read returned the row the "
-                    "page was read after, so the read would read rows again and could miss "
-                    "others: the source compares the key differently from the read's cursor "
-                    "(for example ENUM members equal under the column's collation). Make the "
-                    "key's values distinct as the source compares them, then retry this table."
-                )
-            if member is not None and key[0] != walk[member]:
-                # The source matched another value's rows for this one: two of its values
-                # compare equal there (ENUM members equal under the column's collation).
-                raise _walk_stopped(
-                    pk_columns[0],
-                    "has members the source compares as equal (for example two that differ "
-                    "only in letter case or accents under the column's collation), and the "
-                    "rows read for one of them hold another",
-                    "Make the members distinct on the source, then retry this table.",
-                )
-            if first_key is None:
-                first_key = key
-            last_key = key
-            yield row
+        read: list = []
+        yield _page_rows(result, cursor, member, read)
+        # The next page was asked for: this one must have been read to its end (see
+        # _PAGE_NOT_DRAINED), and what follows it is decided only now.
+        if not read:
+            raise RuntimeError(_PAGE_NOT_DRAINED)
+        page_count, skipped, first_key, last_key = read[0]
 
         # One DEBUG line PER PAGE (never per row): PK range + count, so the read
         # order is observable at large scale without O(#rows) log volume. Guarded so
@@ -1621,6 +1762,200 @@ class TableExporter:
         finally:
             engine.dispose()
 
+    def stream_converted_ranges(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        ranges: "Sequence[tuple[Optional[int], Optional[int]]]",
+        *,
+        page_rows: int,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        target_types: Optional[Mapping[str, str]] = None,
+        on_throttle: Optional[Callable[[bool, Optional[int]], None]] = None,
+        on_pause_slice: Optional[Callable[[], None]] = None,
+        shared_snapshot_id: Optional[str] = None,
+        target_specs: "Optional[Mapping[str, TargetValueSpec]]" = None,
+        on_zero_dates: "Optional[Callable[[tuple[tuple[str, str, str, int], ...]], None]]" = None,
+    ) -> "Iterator[tuple[int, Iterator[Mapping[str, object]]]]":
+        """``(range index, converted rows of one page)`` pairs: ``table``'s primary-key
+        ``ranges`` read by ONE source session from ONE snapshot, a page of each in turn (P2).
+
+        One primary-key-ordered write stream into one Aurora DSQL table is capped (about 20K
+        rows/s live); reading a table's key ranges in turn alternates its batches, and so its
+        writes, across the ranges, while the table keeps one source connection, one snapshot
+        and one process. Each range is :func:`keyset_pages` over ``[lo, hi)`` on the leading
+        key column (:func:`compute_pk_shard_ranges`) with ``page_rows`` rows a page; a range
+        leaves the turn when its read ends, and the rows of each range come in key order.
+
+        What :meth:`stream_converted_rows` does once per table happens once here, on one
+        connection: ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` (then ``SET TRANSACTION
+        SNAPSHOT`` when ``shared_snapshot_id`` is given), one :class:`SourceLoadGovernor`
+        (asked before every page), one value converter (one zero-date tally,
+        ``on_zero_dates`` called once after the COMMIT that follows the last range, never
+        after a failure or a close), one :class:`ValueFitGuard` (armed from the first page's
+        description) and one ``FROM ONLY`` decision. Any error, or a close before the end,
+        ends the snapshot once (:func:`_end_snapshot_after_failure`) -- a page whose rows
+        raise ends it when its consumer closes this stream, as the engine does on the way out.
+
+        The pages are the source's lazy server-side results, and the driver ends an unread
+        one when the next statement is sent: PyMySQL drains it -- the rows not read yet are
+        gone, with no error. So every page yielded must be read to its end before the next
+        one is asked for, else :class:`RuntimeError` (:data:`_PAGE_NOT_DRAINED`). One
+        consumer thread reads them (it is one connection). A page's rows are read outside the
+        generator that yields them, so -- unlike a row stream, whose ``close()`` from another
+        thread is refused while that thread is inside it -- the returned :class:`_RangePages`
+        refuses (:class:`ValueError`) a ``close()`` from another thread while the reading
+        thread is asking for a page or holds one it has not read to its end: the engine's
+        cleanup after a failed load may run while the read-ahead thread is still in a page
+        (its join is bounded), and a COMMIT sent from there would drain that page under it.
+        The stream then ends with its last reference. Memory is the page being drained, as
+        for :meth:`stream_converted_rows`.
+        """
+        turn = _PageTurn()
+        return _RangePages(
+            self._ranges_in_turn(
+                conn,
+                table,
+                ranges,
+                turn,
+                page_rows=page_rows,
+                should_cancel=should_cancel,
+                target_types=target_types,
+                on_throttle=on_throttle,
+                on_pause_slice=on_pause_slice,
+                shared_snapshot_id=shared_snapshot_id,
+                target_specs=target_specs,
+                on_zero_dates=on_zero_dates,
+            ),
+            turn,
+        )
+
+    def _ranges_in_turn(
+        self,
+        conn: SourceConnectionConfig,
+        table: TableDef,
+        ranges: "Sequence[tuple[Optional[int], Optional[int]]]",
+        turn: _PageTurn,
+        *,
+        page_rows: int,
+        should_cancel: Optional[Callable[[], bool]],
+        target_types: Optional[Mapping[str, str]],
+        on_throttle: Optional[Callable[[bool, Optional[int]], None]],
+        on_pause_slice: Optional[Callable[[], None]],
+        shared_snapshot_id: Optional[str],
+        target_specs: "Optional[Mapping[str, TargetValueSpec]]",
+        on_zero_dates: "Optional[Callable[[tuple[tuple[str, str, str, int], ...]], None]]",
+    ) -> "Iterator[tuple[int, Iterator[Mapping[str, object]]]]":
+        """The generator behind :meth:`stream_converted_ranges` (see it); ``turn`` is what it
+        shares with its pages and its :class:`_RangePages`."""
+        dialect = dialect_for(conn.source_type)
+        converter = dialect.value_converter(table, target_types=target_types)
+        guard = ValueFitGuard(target_specs, dialect, table.name) if target_specs else None
+        on_description = guard.arm if guard is not None else None
+        bounds = [(lo, hi) for lo, hi in ranges]
+        engine = self._engine_factory(conn)
+        try:
+            with engine.connect() as connection:
+                snapshot = connection.execution_options(
+                    isolation_level="AUTOCOMMIT", stream_results=True
+                )
+                snapshot.execute(
+                    text(dialect.snapshot_start_sql),
+                    execution_options=_TXN_CONTROL_EXEC_OPTS,
+                )
+                if shared_snapshot_id is not None:
+                    snapshot.execute(
+                        text(dialect.set_transaction_snapshot_sql(shared_snapshot_id)),
+                        execution_options=_TXN_CONTROL_EXEC_OPTS,
+                    )
+                governor = (
+                    SourceLoadGovernor(
+                        snapshot,
+                        self._max_source_threads_running,
+                        on_state_change=on_throttle,
+                        on_pause_slice=on_pause_slice,
+                        metric_reader=dialect.read_active_query_count,
+                    )
+                    if self._max_source_threads_running
+                    else None
+                )
+                pagers: list = []
+                try:
+                    # Inside the snapshot: the reads below take exactly these rows.
+                    from_only = _reads_own_rows_only(snapshot, table, dialect)
+                    pagers = [
+                        keyset_pages(
+                            snapshot,
+                            table,
+                            batch_size=page_rows,
+                            should_cancel=should_cancel,
+                            pk_lower=lo,
+                            pk_upper=hi,
+                            governor=governor,
+                            dialect=dialect,
+                            target_types=target_types,
+                            on_description=on_description,
+                            from_only=from_only,
+                        )
+                        for lo, hi in bounds
+                    ]
+                    live = list(range(len(pagers)))
+                    while live:
+                        still: list[int] = []
+                        for index in live:
+                            # The page yielded last must have been read to its end (none yet:
+                            # drained).
+                            if not turn.drained:
+                                raise RuntimeError(_PAGE_NOT_DRAINED)
+                            page = next(pagers[index], None)
+                            if page is None:
+                                continue  # this range is read: it leaves the turn
+                            still.append(index)
+                            turn.drained = False
+                            # The thread asking for it reads it (_RangePages.close).
+                            turn.reader = threading.get_ident()
+                            yield index, _converted_page(page, converter, guard, turn)
+                        live = still
+                except BaseException:  # incl. GeneratorExit: the consumer stopped early
+                    _end_snapshot_after_failure(snapshot)
+                    raise
+                finally:
+                    for pager in pagers:
+                        pager.close()
+                snapshot.execute(
+                    text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+                )
+                entries = getattr(converter, "zero_date_entries", None)
+                if on_zero_dates is not None and callable(entries):
+                    found = entries()
+                    if found:
+                        on_zero_dates(found)
+        finally:
+            engine.dispose()
+
+
+def _converted_page(
+    page: "Iterable[Mapping[str, object]]",
+    converter: object,
+    guard: "Optional[ValueFitGuard]",
+    turn: _PageTurn,
+) -> "Iterator[Mapping[str, object]]":
+    """One keyset page's rows converted for the target and checked by ``guard`` once armed,
+    as :meth:`TableExporter.stream_converted_rows` converts and checks them. ``turn.drained``
+    turns True once its last row has been read (:meth:`TableExporter.stream_converted_ranges`
+    asks for no other page before), and ``turn.reader`` is cleared once it has ended in any
+    way: its reader no longer reads the session for it."""
+    convert_row = converter.convert_row  # type: ignore[attr-defined]
+    try:
+        for raw in page:
+            row = convert_row(raw)
+            if guard is not None and guard.armed:
+                guard.check(row)
+            yield row
+        turn.drained = True
+    finally:
+        turn.reader = None
+
 
 def export_rows(
     connection: _Connection,
@@ -1672,6 +2007,7 @@ __all__ = [
     "RowWriter",
     "CsvRowWriter",
     "keyset_stream",
+    "keyset_pages",
     "export_rows",
     "TableExporter",
     "SourceLoadGovernor",

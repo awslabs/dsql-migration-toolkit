@@ -34,7 +34,9 @@ Two subcommands:
               indexes were ready and the end-to-end time (run start to the last build
               finished, to the poll); --cdc-mode runs the load as a Full load + CDC run
               (start point captured and fenced as the product does, no CDC stack
-              needed) so a MySQL table can be read in --reader-shards ranges;
+              needed) so a MySQL table's --reader-shards ranges can be read as parts
+              from separate snapshots (without it, one reader session reads them in
+              turn from one snapshot);
               --inventory-order starts the tables in inventory order instead of the
               largest first, the other arm of the start-order A/B; --range-in-flight /
               --in-flight-budget set the INSERT batches in flight at most per key
@@ -798,9 +800,11 @@ def cmd_full_load(args) -> int:
     # env alone -- the whole point of the in-VPC A/B on a single deployed image.
     if getattr(args, "no_prefetch", False):
         os.environ["DSQL_MIGRATOR_FULL_LOAD_PREFETCH"] = "0"
-    # --reader-shards K sets reader range sharding (K concurrent readers per large
-    # single-integer-PK table); 1 = off. Same one-image A/B pattern as prefetch. A MySQL
-    # table is split only in a Full load + CDC run from a binlog start point (--cdc-mode).
+    # --reader-shards K sets reader range sharding (K primary-key ranges per large table
+    # with an integer leading key); 1 = off. Same one-image A/B pattern as prefetch. MySQL:
+    # Full load only reads the K ranges with one reader session from one snapshot (P2); a
+    # Full load + CDC run from a binlog start point (--cdc-mode) reads them as K parts, each
+    # from its own snapshot.
     if getattr(args, "reader_shards", 0):
         os.environ["DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS"] = str(args.reader_shards)
     # --range-in-flight R / --in-flight-budget B: the batches in flight per key range and
@@ -918,7 +922,8 @@ def cmd_full_load(args) -> int:
 
     # --cdc-mode: a Full load + CDC run (is_cdc_migration) -- the start point is captured
     # and, on MySQL, fenced (G147) exactly as the product does before any read, which is
-    # what lets a MySQL table be read in --reader-shards ranges. No CDC stack is involved:
+    # what lets a MySQL table's --reader-shards ranges be read as parts from separate
+    # snapshots (G137). No CDC stack is involved:
     # the load itself needs none, and no PostgreSQL slot is created (no cdc_stack_name).
     cdc_mode = bool(getattr(args, "cdc_mode", False))
     inputs = DataMigrationInputs(
@@ -1041,7 +1046,9 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             "table": c.chunk_id, "status": c.status,
             "rows_loaded": c.rows_loaded, "seconds": round(secs, 2) if secs else None,
             "rows_per_sec": round(rps, 1) if rps else None,
-            # How many primary-key ranges the table was read in (None: one reader).
+            # How many parts read from separate snapshots the table was read in, the G137
+            # record (None: one snapshot -- a table one reader session read in key ranges
+            # shows them in "ranges" below).
             "reader_shards": getattr(c, "reader_shards", None),
             # P3, from the workers' counters (None: no counters): the key ranges its units
             # read and the INSERT batches they could keep in flight at most, summed over
@@ -1212,7 +1219,8 @@ def _log_full_load_summary(report: dict) -> None:
         sp = report.get("start_point") or {}
         split = {r["table"]: r["reader_shards"] for r in report["per_table"]
                  if r.get("reader_shards")}
-        # A MySQL table is read in ranges only from a binlog start point (G137).
+        # A MySQL table is read in parts from separate snapshots only from a binlog start
+        # point (G137); a table one reader session read in ranges is not listed here.
         log(f"Full load + CDC: start point binlog={sp.get('binlog')} gtid={sp.get('gtid')} "
             f"lsn={sp.get('wal_lsn')} fence={sp.get('fence')} | read in ranges: "
             f"{split or 'none'}")
@@ -1478,9 +1486,11 @@ def main() -> int:
                     help="disable the read-ahead prefetch queue (measure the "
                          "pre-improvement baseline path); default keeps it ON")
     fl.add_argument("--reader-shards", type=int, default=0,
-                    help="reader range sharding: concurrent readers per large "
-                         "single-int-PK table (0/1 = off = one reader; >1 shards). "
-                         "A MySQL table is split only with --cdc-mode")
+                    help="reader range sharding: primary-key ranges per large table "
+                         "with an integer leading key (0/1 = off = one range). MySQL: "
+                         "Full load only reads the ranges with one reader session from "
+                         "one snapshot; --cdc-mode with a value >= 2 reads them as parts "
+                         "from separate snapshots")
     fl.add_argument("--range-in-flight", type=int, default=None, metavar="N",
                     help="INSERT batches in flight at most per key range of a table "
                          "(default: the loader's 4; still at most --batch-parallelism "
@@ -1492,8 +1502,9 @@ def main() -> int:
                     help="run the load as a Full load + CDC run: the start point "
                          "(binlog position / LSN) is captured -- and on MySQL fenced "
                          "with FLUSH BINARY LOGS when GTID is off, as the product does "
-                         "-- before any read, so MySQL tables can be read in "
-                         "--reader-shards ranges. No CDC stack is needed or started, "
+                         "-- before any read, so a MySQL table's --reader-shards ranges "
+                         "can be read as parts from separate snapshots. No CDC stack is "
+                         "needed or started, "
                          "and no PostgreSQL replication slot is created")
     fl.add_argument("--inventory-order", action="store_true",
                     help="start the tables in inventory order, as builds before R2 "

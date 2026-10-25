@@ -443,7 +443,11 @@ def test_the_reader_shards_help_says_when_a_mysql_source_splits_a_table() -> Non
     assert "A PostgreSQL source splits in any run, its ranges sharing one snapshot" in help_text
     assert ("A MySQL source splits only in Full load + CDC with a binlog start point, and only "
             "a table whose every unique key on Aurora DSQL includes that leading column") in help_text
-    assert "Full load only reads every MySQL table with one reader" in help_text
+    # P2: Full load only reads a MySQL table's ranges with one session, from one snapshot.
+    assert "Full load only reads every MySQL table with one reader" not in help_text
+    assert ("In Full load only, or without a binlog start point, a MySQL table's ranges are "
+            "read by one reader session from one snapshot: one source connection and one "
+            "process per table") in help_text
     assert "It applies only with 'Tables in parallel' above 1" in help_text
     # The trade-off, said where the knob is set (no more "Shard minimum rows" field).
     assert "rise up to Tables in parallel ×" in help_text
@@ -452,8 +456,8 @@ def test_the_reader_shards_help_says_when_a_mysql_source_splits_a_table() -> Non
     assert "'Shard minimum rows'" not in help_text
     # The Settings row's visible helper says the same in one line.
     assert knob.description == (
-        "Split a large table's read by its integer leading key (1 = off; MySQL: Full load "
-        "+ CDC only)."
+        "Split a large table's read by its integer leading key (1 = off; MySQL: separate "
+        "snapshots only in Full load + CDC)."
     )
 
 

@@ -45,7 +45,11 @@ from dsql_migrator.core.activity_log import (
     log_activity,
 )
 from dsql_migrator.core.error_log import ErrorLogStore
-from dsql_migrator.core.exporter import ExportCancelled, TableExporter
+from dsql_migrator.core.exporter import (
+    DEFAULT_BATCH_SIZE as _KEYSET_PAGE_ROWS,
+    ExportCancelled,
+    TableExporter,
+)
 from dsql_migrator.core.introspector import (
     ReadOnlySourceError,
     is_source_transient_error,
@@ -60,6 +64,7 @@ from dsql_migrator.core.batched_import import (
     IndexTargetUnreachable,
     OnConflictMode,
     _disable_prepared_statements,
+    _effective_batch_size,
     _index_name_of,
     is_unconfirmed_index_failure,
     safe_error_message,
@@ -1004,6 +1009,29 @@ def _unit_in_flight(batch_parallelism: int, ranges: int, share: Optional[int]) -
     )
 
 
+def _range_page_rows(
+    batch_rows: int, column_count: int, in_flight_per_range: Optional[int] = None
+) -> int:
+    """The keyset page of a table whose key ranges one reader session reads in turn (P2):
+    whole batches of the importer's effective size (Rows per batch, cut to the statement
+    parameter limit for the table's columns), as close to the reader's 5,000-row page as
+    whole batches go: batches of 2,000 rows -> a 4,000-row page, 3,000 -> 3,000, 655 (2,000
+    rows of 100 columns) -> 4,585. Each page is batched on its own, so a page that ended
+    mid-batch would send a short batch per page.
+
+    ``in_flight_per_range`` (the unit's batches in flight over its ranges) caps the batches
+    a page holds: the reader turns to the next range after each page, so the batches in
+    flight are the last pages' -- pages of more batches than a range's share put them all
+    on one or two ranges (a CPU-only model with 200-row batches, 8 in flight over 4 ranges:
+    25 batches a page loaded 1.4 times one range, 2 a page 3.9 times). At the defaults
+    (2,000-row batches, 8 in flight over 4 ranges) the page is the same 4,000 rows."""
+    batch = _effective_batch_size(int(batch_rows), int(column_count))
+    per_page = max(1, _KEYSET_PAGE_ROWS // batch)
+    if in_flight_per_range is not None:
+        per_page = max(1, min(per_page, int(in_flight_per_range)))
+    return batch * per_page
+
+
 def _cap_importer_parallelism(importer: object, n: int) -> None:
     """Keep at most ``n`` batches of ``importer`` in flight (P3).
 
@@ -1236,6 +1264,9 @@ class _TableWorkerArgs:
     # P3: at most this many INSERT batches in flight for this unit (_unit_in_flight, with
     # its share of the run's budget). None => the worker sizes it without a share.
     in_flight: Optional[int] = None
+    # P2: the primary-key ranges ONE reader session of this table reads in turn, from one
+    # snapshot (migrate_table's read_ranges, planned by the parent). () => one range.
+    read_ranges: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1749,7 +1780,7 @@ def _retry_source_drops_in_process(
     raise AssertionError("source retry loop exited without a result")
 
 
-def _close_row_streams(rows, shard_sources) -> None:
+def _close_row_streams(rows, shard_sources, range_pages=None) -> None:
     """Close source row generators so their source connections are freed now.
 
     ``TableExporter.stream_converted_rows`` yields from inside a
@@ -1757,12 +1788,18 @@ def _close_row_streams(rows, shard_sources) -> None:
     generator's own ``finally``, so that cleanup runs only when the generator is
     exhausted, explicitly closed, or collected. On the failure path neither of the
     first two happens and the traceback keeps it referenced, so closing it here is
-    what actually returns the connection. Best-effort and exception-safe: cleanup
-    must never replace the failure that triggered it.
+    what actually returns the connection. ``range_pages`` (P2: one reader session's
+    key-range pages, ``stream_converted_ranges``) is closed the same way -- unless the
+    importer's read-ahead thread is still in one of its pages (its join is bounded): that
+    close is refused, as a row stream's is while its reader is inside it, and the session
+    ends with the pages' last reference, once that thread has let them go. Best-effort and
+    exception-safe: cleanup must never replace the failure that triggered it.
     """
     candidates = list(shard_sources or ())
     if rows is not None:
         candidates.append(rows)
+    if range_pages is not None:
+        candidates.append(range_pages)
     for candidate in candidates:
         close = getattr(candidate, "close", None)
         if not callable(close):
@@ -1923,6 +1960,10 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 # P3: the parent sized this unit's batches in flight with its share of the
                 # run's budget.
                 in_flight_cap=args.in_flight,
+                # P2: a table read in key ranges by one reader session reads them on every
+                # attempt; a re-read after a lost source connection opens a fresh session
+                # and snapshot and reads every range again.
+                **({"read_ranges": args.read_ranges} if args.read_ranges else {}),
             )
 
         outcome = _as_load_result(
@@ -3610,6 +3651,23 @@ def _load_order_estimates(
     return estimates
 
 
+class _Unit(NamedTuple):
+    """One unit of the process pool's plan: a whole table (``kind`` "table") or one reader
+    shard of a split table ("shard": its range ``[lo, hi)`` and ``index``). Positionally the
+    tuples the planner built before -- ``("table", t)`` and ``("shard", t, lo, hi, i)`` -- so
+    ``unit[1]`` is still the table (:func:`_largest_first`, the perf harness).
+
+    ``ranges`` (P2): the primary-key ranges ONE reader session of a whole-table unit reads in
+    turn from one snapshot (``migrate_table(read_ranges=)``); empty: one range."""
+
+    kind: str
+    table: TableDef
+    lo: Optional[int] = None
+    hi: Optional[int] = None
+    index: int = 0
+    ranges: tuple = ()
+
+
 def _largest_first(
     work_units: "Sequence[tuple]", estimates: "Mapping[str, int]"
 ) -> "list[tuple]":
@@ -3718,17 +3776,12 @@ _SPLIT_OWN_SNAPSHOTS = (
     "taken before any read, corrects rows that changed between them"
 )
 _SPLIT_SHARED_SNAPSHOT = "read in {k} primary-key ranges sharing one snapshot"
+# P2: a table that may not take parts read from separate snapshots (MySQL Full load only, no
+# binlog start point, a split _split_refusal refuses) is read in its ranges by one session.
+_SPLIT_ONE_SNAPSHOT = "read in {k} primary-key ranges by one reader session (one snapshot)"
+# A load while CDC streams (cdc_coexisting) whose split is refused keeps one reader.
 _ONE_READER = "read with one reader: {reason}"
 _KEYS_UNREADABLE = "its keys could not be read"
-_RUN_FULL_LOAD_ONLY = (
-    "every MySQL table is read with one reader: this run is not Full load + CDC, and a table "
-    "read in parts holds rows from several snapshots, which only CDC from the start point "
-    "taken before the load corrects"
-)
-_RUN_NO_BINLOG_POINT = (
-    "every MySQL table is read with one reader: the run's start point has no binlog file and "
-    "position, so CDC could not replay a table read in parts from before its reads"
-)
 
 
 def _record_reader_shards(
@@ -4215,7 +4268,8 @@ def _migrate_tables_in_parallel(
 
         # Plan work units: for each table, decide if it should be sharded.
         # Small/non-shardable tables get 1 worker each; an eligible large table gets
-        # K shard workers.
+        # K shard workers, or (P2) one worker whose reader session reads its K ranges in
+        # turn from one snapshot.
         #
         # SHARDING SAFETY -- see _sharding_is_consistent for the whole rule. Resolve the
         # SOURCE dialect first so this pre-gate uses the right integer-PK set (the
@@ -4242,78 +4296,63 @@ def _migrate_tables_in_parallel(
         if prepass is not None:
             prepass.before_planning()
 
-        # G137: with Reader shards above 1, say why a MySQL run splits nothing.
-        if (
-            effective_reader_shards > 1
-            and _shard_dialect.source_type is SourceType.MYSQL
-            and not _replays
-            and not migrator._inputs.cdc_coexisting
-        ):
-            log_activity(
-                ActivityCategory.FULL_LOAD,
-                "reader shards",
-                status=ActivityStatus.INFO,
-                detail=(
-                    _RUN_FULL_LOAD_ONLY
-                    if not migrator._inputs.is_cdc_migration
-                    else _RUN_NO_BINLOG_POINT
-                ),
-            )
         # The run's own row estimates spare the planning read of a table well below the
         # shard minimum: a positive one only (the MySQL watermark stores an unknown as 0),
         # and only in the run that captured them (a retry's may be days old).
         _estimates = (
             dict(getattr(watermark, "table_row_counts", None) or {}) if fresh_watermark else {}
         )
+        # P2: outside a load while CDC streams, a table that may not take parts read from
+        # separate snapshots -- MySQL in Full load only or without a binlog start point
+        # (G137), or a split _split_refusal refuses -- is read in its ranges by ONE reader
+        # session from one snapshot instead: one whole-table unit (one process, one source
+        # connection) through migrate_table, and no reader_shards record (one snapshot).
+        _one_session = not migrator._inputs.cdc_coexisting
         planned_parts: dict[str, int] = {}
-        work_units: list[tuple] = []  # ("table", table) or ("shard", table, lo, hi, idx)
+        work_units: list[_Unit] = []
         for table in tables:
             if table.name in withheld:
-                work_units.append(("table", table))  # skipped at submission
+                work_units.append(_Unit("table", table))  # skipped at submission
                 continue
             table_is_replace = (
                 not migrator._inputs.cdc_coexisting
                 and table.name in migrator._inputs.replace_tables
             )
             lead = shardable_leading_int_pk(table, _shard_dialect)
-            shardable = (
-                _table_may_shard(
-                    cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
-                    shared_snapshot=_shared_snapshot,
-                    table_is_replace=table_is_replace,
-                    cdc_replays_load=_replays,
-                )
-                and lead is not None
-                and effective_reader_shards > 1
+            may_shard = _table_may_shard(
+                cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
+                shared_snapshot=_shared_snapshot,
+                table_is_replace=table_is_replace,
+                cdc_replays_load=_replays,
             )
-            if not shardable:
-                work_units.append(("table", table))
+            if lead is None or effective_reader_shards <= 1 or not (may_shard or _one_session):
+                work_units.append(_Unit("table", table))
                 continue
             _estimate = _estimates.get(table.name)
             if isinstance(_estimate, int) and 0 < _estimate < cfg.full_load_shard_min_rows:
-                work_units.append(("table", table))
+                work_units.append(_Unit("table", table))
                 continue
             shard_ranges = _planned_shard_ranges(
                 migrator, table, effective_reader_shards, cfg.full_load_shard_min_rows
             )
-            try:
-                refusal = (
-                    _split_refusal(
+            refusal: Optional[str] = None
+            if len(shard_ranges) > 1 and may_shard:
+                try:
+                    refusal = _split_refusal(
                         migrator, table, lead,
                         table_is_replace=table_is_replace, shared_snapshot=_shared_snapshot,
                     )
-                    if len(shard_ranges) > 1
-                    else None
-                )
-            except Exception:  # noqa: BLE001 - unreadable: one reader, never a failed run
-                _LOGGER.warning("Reader-shard guard failed for %s", table.name, exc_info=True)
-                refusal = _KEYS_UNREADABLE
+                except Exception:  # noqa: BLE001 - unreadable: no parts, never a failed run
+                    _LOGGER.warning(
+                        "Reader-shard guard failed for %s", table.name, exc_info=True
+                    )
+                    refusal = _KEYS_UNREADABLE
             # A planned candidate is a source connect (and maybe a catalog read) before the
             # drain thread that owns liveness starts: stamp it, as the recreate loop does.
             handle.heartbeat()
-            if len(shard_ranges) > 1 and refusal is None:
+            if len(shard_ranges) > 1 and may_shard and refusal is None:
                 for i, (lo, hi) in enumerate(shard_ranges):
-                    work_units.append(("shard", table, lo, hi, i))
+                    work_units.append(_Unit("shard", table, lo, hi, i))
                 planned_parts[table.name] = len(shard_ranges)
                 log_activity(
                     ActivityCategory.FULL_LOAD,
@@ -4324,8 +4363,17 @@ def _migrate_tables_in_parallel(
                         _SPLIT_SHARED_SNAPSHOT if _shared_snapshot else _SPLIT_OWN_SNAPSHOTS
                     ).format(k=len(shard_ranges)),
                 )
+            elif len(shard_ranges) > 1 and _one_session:
+                work_units.append(_Unit("table", table, ranges=tuple(shard_ranges)))
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "reader shards",
+                    status=ActivityStatus.INFO,
+                    target=table.name,
+                    detail=_SPLIT_ONE_SNAPSHOT.format(k=len(shard_ranges)),
+                )
             else:
-                work_units.append(("table", table))
+                work_units.append(_Unit("table", table))
                 if refusal is not None:
                     log_activity(
                         ActivityCategory.FULL_LOAD,
@@ -4338,10 +4386,10 @@ def _migrate_tables_in_parallel(
         total_workers = min(table_parallelism, len(work_units))
         # P3: the INSERT batches each unit keeps in flight. At most total_workers units run
         # at once, each with at most its share of the run's budget, so the run never has
-        # more than the budget in flight. Every unit reads one key range here.
-        unit_in_flight = _unit_in_flight(
-            cfg.full_load_batch_parallelism, 1, _in_flight_share(total_workers)
-        )
+        # more than the budget in flight. A unit reads one key range -- or, a table read by
+        # one reader session (P2), its ranges in turn: at most 4 per range of them.
+        _share = _in_flight_share(total_workers)
+        unit_in_flight = _unit_in_flight(cfg.full_load_batch_parallelism, 1, _share)
         # R2: the order the pool starts the units in -- the largest first (a split table by
         # its share per shard), any table without a row estimate before them
         # (_largest_first). A PostgreSQL table with no estimate is sized from its files here
@@ -4517,7 +4565,14 @@ def _migrate_tables_in_parallel(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pre_recreated=table.name in recreated_names,
-                            in_flight=unit_in_flight,
+                            in_flight=(
+                                _unit_in_flight(
+                                    cfg.full_load_batch_parallelism, len(wu.ranges), _share
+                                )
+                                if wu.ranges
+                                else unit_in_flight
+                            ),
+                            read_ranges=wu.ranges,
                         )
                         f = pool.submit(_migrate_one_table_in_process, args)
                         futures[f] = ("table", table.name)
@@ -8357,6 +8412,11 @@ class BatchedTableMigrator:
         # the parent with its share of the run's budget). None -> _unit_in_flight over the
         # row streams this call reads, with no share (one unit at a time).
         in_flight_cap: Optional[int] = None,
+        # P2: the primary-key ranges ``[lo, hi)`` (two or more) ONE reader session reads
+        # this table in, a page of each in turn, from one snapshot -- planned by the process
+        # parent for a table that may not take parts read from separate snapshots. () -> one
+        # range, the whole table (and the CDC-coexisting in-process readers decide their own).
+        read_ranges: Sequence[tuple] = (),
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -8372,6 +8432,14 @@ class BatchedTableMigrator:
         the caller marks the table for retry (the re-load is idempotent). Returns
         rows loaded; raises if any batch ultimately failed so the caller records
         a per-table failure with the underlying cause.
+
+        ``read_ranges`` (P2) reads the table in those key ranges through ONE source session
+        and snapshot (``TableExporter.stream_converted_ranges``), so its batches -- and its
+        writes -- alternate across the ranges, while every check here (exclusions,
+        generated columns, the empty-target promotion, the changed-key refusal, the
+        overlay, the conflict mode, the replace COUNT(*), the deferred indexes) is the
+        whole-table load's. A caller's re-read (a lost source connection) calls this again:
+        a fresh session reads every range from a new snapshot.
         """
         # Drop the user-excluded LOB columns up front so EVERY downstream use --
         # the keyset read, the INSERT column list, and shard planning -- sees the
@@ -8562,9 +8630,40 @@ class BatchedTableMigrator:
             )
 
         sharded = len(shard_ranges) > 1
+        # P2: the parent's key ranges, read by ONE source session from one snapshot, a page
+        # of each in turn -- never beside the CDC-coexisting readers above (they plan their
+        # own ranges, each with its own snapshot).
+        one_session = len(read_ranges) > 1 and not (
+            not is_replace and self._inputs.cdc_coexisting
+        )
+        # P3: at most 4 batches in flight per key range this call reads (a row stream, or a
+        # range of the one session's turn) and at most Batches per table -- or what the
+        # parent sized for this unit.
+        key_ranges = len(read_ranges) if one_session else len(shard_ranges)
+        in_flight = in_flight_cap or _unit_in_flight(
+            cfg.full_load_batch_parallelism, key_ranges, None
+        )
+        range_pages = None
         if sharded:
             shard_sources = [_shard_stream(lo, hi) for (lo, hi) in shard_ranges]
             rows: "Iterator[Mapping[str, object]]" = iter(())  # unused when sharded
+        elif one_session:
+            shard_sources = None
+            rows = iter(())  # unused: the range pages carry the rows
+            range_pages = self._exporter.stream_converted_ranges(
+                self._inputs.source_config,
+                table,
+                list(read_ranges),
+                page_rows=_range_page_rows(
+                    cfg.full_load_batch_rows, len(table.columns), in_flight // key_ranges
+                ),
+                should_cancel=should_cancel,
+                target_types=target_types,
+                on_throttle=on_throttle,
+                on_pause_slice=on_pause_slice,
+                target_specs=target_specs,
+                on_zero_dates=zero_dates.add,
+            )
         else:
             lo, hi = shard_ranges[0]
             shard_sources = None
@@ -8686,13 +8785,9 @@ class BatchedTableMigrator:
         importer = self._importer_factory(self._inputs)
         stats = load_stats if load_stats is not None else LoadStats()
         _bind_load_stats(importer, stats)
-        # P3: at most 4 batches in flight per row stream this call reads (a key range of the
-        # table) and at most Batches per table -- or what the parent sized for this unit.
-        in_flight = in_flight_cap or _unit_in_flight(
-            cfg.full_load_batch_parallelism, len(shard_ranges), None
-        )
+        # P3: the batches in flight sized above, for every importer.
         _cap_importer_parallelism(importer, in_flight)
-        stats.set_unit_shape(ranges=len(shard_ranges), in_flight_cap=in_flight)
+        stats.set_unit_shape(ranges=key_ranges, in_flight_cap=in_flight)
         try:
             result = importer.import_rows(
                 rows,
@@ -8704,12 +8799,13 @@ class BatchedTableMigrator:
                 on_conflict=load_on_conflict,
                 shard_sources=shard_sources,
                 key_columns=load_key_columns,
+                **({"range_pages": range_pages} if range_pages is not None else {}),
             )
         except ExportCancelled as exc:
             # A cooperative stop interrupted the source read between pages (the
             # importer was pulling rows). Treat it exactly like a batch-boundary
             # stop: incomplete + retryable, not a data error.
-            _close_row_streams(rows, shard_sources)
+            _close_row_streams(rows, shard_sources, range_pages)
             raise _FullLoadStopped(table.name) from exc
         except BaseException:
             # Any other failure (notably a dropped source connection) abandons these
@@ -8719,7 +8815,7 @@ class BatchedTableMigrator:
             # raising frame keeps it referenced. Close them here so the connection is
             # released as the exception leaves, instead of staying pinned while a
             # caller waits out a failover and opens ANOTHER connection to retry.
-            _close_row_streams(rows, shard_sources)
+            _close_row_streams(rows, shard_sources, range_pages)
             raise
         if result.cancelled:
             raise _FullLoadStopped(table.name)

@@ -1234,6 +1234,9 @@ class BatchedImporter:
             "list[Iterable[Mapping[str, object]]]"
         ] = None,
         key_columns: Optional[list[str]] = None,
+        range_pages: Optional[
+            "Iterable[tuple[int, Iterable[Mapping[str, object]]]]"
+        ] = None,
     ) -> BatchedImportResult:
         """Load ``rows`` into ``table`` in bounded-parallel idempotent batches.
 
@@ -1256,6 +1259,12 @@ class BatchedImporter:
         ``key_columns`` (optional) overrides the conflict/skip key with the TARGET
         table's actual primary key (e.g. a composite ``(leading, id)``); when
         omitted it falls back to ``options.key_columns`` then the source PK.
+        ``range_pages`` (optional, P2; ``rows`` is then unused and ``shard_sources`` must be
+        None) is ONE reader's pages of a table's key ranges in turn, ``(range index, the
+        page's rows)`` (:meth:`~dsql_migrator.core.exporter.TableExporter.
+        stream_converted_ranges`): each page is batched on its own and each range numbers its
+        own batches (:meth:`_iter_work_pages`), and one producer thread reads them -- they
+        come from one source connection.
         Returns a structured :class:`BatchedImportResult`.
         """
         columns = [column.name for column in table.columns]
@@ -1292,7 +1301,21 @@ class BatchedImporter:
         # one unsharded work iterator -- byte-for-byte the previous behavior
         # (``shard_id=None`` keeps the original chunk ids).
         work_iters: list[Iterator[_BatchWork]]
-        if shard_sources:
+        if range_pages is not None:
+            # P2: one reader session's pages of K key ranges -> ONE work iterator, so the
+            # single-producer prefetch reads them (never _prefetch_many: one connection).
+            if shard_sources:
+                raise BatchedImportError(
+                    "range_pages and shard_sources cannot be combined: the range pages are "
+                    "one reader's"
+                )
+            work_iters = [
+                self._iter_work_pages(
+                    range_pages, table, columns, key_columns, skip_watermark, skip_counter,
+                    effective_on_conflict,
+                )
+            ]
+        elif shard_sources:
             skipped_lock = threading.Lock()
             work_iters = [
                 self._iter_work(
@@ -1432,6 +1455,52 @@ class BatchedImporter:
                 shard_id=shard_id,
                 batch_index=index,
             )
+
+    def _iter_work_pages(
+        self,
+        range_pages: "Iterable[tuple[int, Iterable[Mapping[str, object]]]]",
+        table: TableDef,
+        columns: list[str],
+        key_columns: list[str],
+        skip_watermark: Mapping[str, int],
+        skip_counter: "_SkipCounter",
+        on_conflict: OnConflictMode,
+    ) -> Iterator[_BatchWork]:
+        """Yield a work item per non-skipped batch of ONE reader's key-range pages (P2).
+
+        ``range_pages`` yields ``(range index, the page's rows)`` in the order the reader
+        visits the ranges, a page of each in turn. Each page is batched on its own -- no batch
+        spans two pages, so none spans two ranges -- and each range numbers its batches from
+        0, as a reader shard does (:meth:`_iter_work`): batch *i* of range *r*
+        (``batch_chunk_id(table, i, r)``, resume key ``str(r)``) is the same primary-key
+        slice of one snapshot however the ranges' pages interleave, and a resume skips per
+        range. Pulled lazily, one batch at a time; the rows of a page are read to its end
+        before the next page is asked for. One producer, so the skip count takes no lock.
+        """
+        columns_tuple = tuple(columns)
+        key_tuple = tuple(key_columns)
+        batch_size = _effective_batch_size(self._options.batch_size, len(columns_tuple))
+        # range index -> the ordinal of its next batch
+        next_index: dict[int, int] = {}
+        for shard_id, page in range_pages:
+            high_water = skip_watermark.get(_shard_key(shard_id), -1)
+            index = next_index.get(shard_id, 0)
+            for batch in _iter_batches(page, batch_size, MAX_BATCH_BYTES):
+                if index <= high_water:
+                    skip_counter.add(locked=False)
+                else:
+                    yield _BatchWork(
+                        chunk_id=batch_chunk_id(table.name, index, shard_id),
+                        table_name=table.name,
+                        columns=columns_tuple,
+                        key_columns=key_tuple,
+                        on_conflict=on_conflict,
+                        rows=tuple(batch),
+                        shard_id=shard_id,
+                        batch_index=index,
+                    )
+                index += 1
+            next_index[shard_id] = index
 
     @staticmethod
     def _prefetch(

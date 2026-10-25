@@ -417,7 +417,10 @@ class AppConfig(BaseModel):
             "that leading column; its ranges read separate snapshots, so its copy is "
             "consistent only once CDC replays it from the start point taken before the "
             "load (see manual section 3.8 before unticking such a table or switching to "
-            "Full load only). Full load only reads every MySQL table with one reader. "
+            "Full load only). In Full load only, or without a binlog start point, a MySQL "
+            "table's ranges are read by one reader session from one snapshot: one source "
+            "connection and one process per table (and so are the ranges of a table whose "
+            "unique keys rule out separate snapshots). "
             "Source readers stay at or below full_load_table_parallelism (+1 "
             "PostgreSQL anchor), but K > 1 turns idle slots into concurrent reads of "
             "the same table for its whole read: source read rate, DSQL connections and "
@@ -682,8 +685,8 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "FULL_LOAD_READER_SHARDS",
         "Full Load",
         "Reader shards per large table",
-        "Split a large table's read by its integer leading key (1 = off; MySQL: Full load "
-        "+ CDC only).",
+        "Split a large table's read by its integer leading key (1 = off; MySQL: separate "
+        "snapshots only in Full load + CDC).",
         help_text=(
             "A big single table is otherwise read by ONE keyset reader that is CPU-bound "
             "(per-row type conversion) and tops out near one core, so a migration dominated "
@@ -704,7 +707,10 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
             "CDC from a later point is refused until a match in Validation in CHECKSUM mode "
             "proves that replay, or it is reloaded with this set to 1 and Drop & reload. "
             "Unticking it needs that reload, before CDC starts: once CDC starts, the table set "
-            "is fixed (manual §3.8). Full load only reads every MySQL table with one reader.\n\n"
+            "is fixed (manual §3.8). In Full load only, or without a binlog start point, a "
+            "MySQL table's ranges are read by one reader session from one snapshot: one source "
+            "connection and one process per table (and so are the ranges of a table whose "
+            "unique keys rule out separate snapshots).\n\n"
             "The trade-off: K turns idle slots into concurrent reads of the same table for "
             "its whole read, so the source read rate, the Aurora DSQL connections and the "
             "memory rise up to Tables in parallel ×. On a source still serving production "

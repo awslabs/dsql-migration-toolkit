@@ -449,18 +449,61 @@ def test_a_mysql_drop_and_reload_table_splits_and_builds_its_indexes_once(rig) -
     assert failed.status == {EVENTS: "FAILED"} and failed.created == []
 
 
-def test_full_load_only_reads_every_mysql_table_with_one_reader_and_says_so(rig) -> None:
+def _one_session(r, ranges=_FOUR):
+    """The run read EVENTS as ONE whole-table unit whose reader session reads its planned
+    ``ranges`` in turn from one snapshot (P2): no part, no record, one activity line."""
+    assert r.shards == [] and [a.table.name for a in r.wholes] == [EVENTS]
+    assert r.wholes[0].read_ranges == tuple(ranges)
+    assert r.parts == {EVENTS: None}            # one snapshot: nothing for CDC to replay
+    assert _split_lines(r) == [(EVENTS, engine._SPLIT_ONE_SNAPSHOT.format(k=len(ranges)))]
+
+
+def test_full_load_only_reads_a_mysql_table_in_its_ranges_by_one_reader_session(
+        rig, monkeypatch) -> None:
+    # P2 (was: every MySQL table with one reader, and a run-wide notice saying so): Full load
+    # only plans the table's ranges -- one index-only MIN/MAX read -- and ONE reader session
+    # reads them in turn from one snapshot, through migrate_table; no unique-key guard runs.
+    recorded: list = []
+    record = engine._record_reader_shards
+    monkeypatch.setattr(engine, "_record_reader_shards", lambda job, names, parts, *a: (
+        recorded.append(dict(parts)) or record(job, names, parts, *a)))
     r = rig([_table()], cdc=False)
-    assert r.planned == [] and r.shards == []
-    assert [a.table.name for a in r.wholes] == [EVENTS]
-    assert r.parts == {EVENTS: None}
-    assert _split_lines(r) == [(None, engine._RUN_FULL_LOAD_ONLY)]
+    assert recorded == []            # never recorded as read in parts, not even for a while
+    assert r.planned == [EVENTS]
+    _one_session(r)
+    assert r.unique_reads == [] and r.pk_reads == []
+    assert r.status == {EVENTS: "DONE"}
+    # Its batches in flight are those of 4 key ranges (P3), not of one.
+    assert r.wholes[0].in_flight == engine._unit_in_flight(8, 4, 128) == 8
+    assert not hasattr(engine, "_RUN_FULL_LOAD_ONLY")
+    assert not hasattr(engine, "_RUN_NO_BINLOG_POINT")
 
 
-def test_a_run_whose_start_point_has_no_binlog_position_reads_with_one_reader(rig) -> None:
+def test_a_run_whose_start_point_has_no_binlog_position_reads_by_one_reader_session(rig) -> None:
     r = rig([_table()], watermark=_wm(binlog=False))
-    assert r.planned == [] and r.shards == [] and len(r.wholes) == 1
-    assert _split_lines(r) == [(None, engine._RUN_NO_BINLOG_POINT)]
+    assert r.planned == [EVENTS]
+    _one_session(r)
+
+
+def test_a_one_session_candidate_too_small_or_unsplittable_is_one_plain_unit(
+        rig, monkeypatch) -> None:
+    # The gates the parts have: below the shard minimum (the fresh estimate spares the
+    # read), one range planned, a non-integer leading column, Reader shards 1 -- one range,
+    # no line, and the in-flight cap of one key range.
+    small = rig([_table()], cdc=False, watermark=_wm(counts={EVENTS: 10}))
+    assert small.planned == [] and small.wholes[0].read_ranges == ()
+    rig.reset()
+    one = rig([_table()], cdc=False, ranges={EVENTS: [(None, None)]})
+    assert one.planned == [EVENTS] and one.wholes[0].read_ranges == ()
+    assert _split_lines(one) == []
+    assert one.wholes[0].in_flight == engine._unit_in_flight(8, 1, 128) == 4
+    rig.reset()
+    text = rig([_table(lead="varchar(10)")], cdc=False)
+    assert text.planned == [] and text.wholes[0].read_ranges == ()
+    rig.reset()
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")
+    off = rig([_table()], cdc=False)
+    assert off.planned == [] and off.wholes[0].read_ranges == () and _split_lines(off) == []
 
 
 def test_reader_shards_one_says_nothing_new(rig, monkeypatch) -> None:
@@ -470,14 +513,12 @@ def test_reader_shards_one_says_nothing_new(rig, monkeypatch) -> None:
         assert r.shards == [] and _split_lines(r) == [] and r.parts == {EVENTS: None}
 
 
-def test_a_unique_key_without_the_leading_column_keeps_one_reader(rig) -> None:
+def test_a_unique_key_without_the_leading_column_is_read_by_one_reader_session(rig) -> None:
+    # Parts from separate snapshots could copy a row twice under the UNIQUE email (G137): the
+    # table is read in its ranges by one session from one snapshot instead (P2).
     r = rig([_table()], replace=[EVENTS],
             conversions={EVENTS: _conv(indexes=[_UQ_EMAIL])})
-    assert r.shards == [] and len(r.wholes) == 1 and r.parts == {EVENTS: None}
-    ((target, detail),) = _split_lines(r)
-    assert target == EVENTS and detail.startswith(
-        "read with one reader: its unique key (email) does not include id, the column its "
-        "parts would be split on")
+    _one_session(r)
     # A unique key that includes the leading column splits.
     rig.reset()
     with_id = 'CREATE UNIQUE INDEX ASYNC "uq" ON "app"."events" ("email", "id")'
@@ -487,35 +528,32 @@ def test_a_unique_key_without_the_leading_column_keeps_one_reader(rig) -> None:
     rig.reset()
     inline = _DDL.replace('"email" VARCHAR(64) NOT NULL', '"email" VARCHAR(64) NOT NULL UNIQUE')
     refused = rig([_table()], replace=[EVENTS], conversions={EVENTS: _conv(ddl=inline)})
-    assert refused.shards == [] and "unique key (email)" in _split_lines(refused)[0][1]
+    _one_session(refused)
 
 
 def test_an_unreadable_converted_ddl_refuses_the_split(rig) -> None:
     r = rig([_table()], replace=[EVENTS], conversions={EVENTS: _conv(
         indexes=['CREATE UNIQUE INDEX ASYNC u ON "app"."events" ((lower("email")))'])})
-    assert r.shards == []
-    assert _split_lines(r)[0][1] == (
-        "read with one reader: its unique keys could not be read from its converted DDL")
+    _one_session(r)
 
 
 def test_an_append_table_is_judged_on_the_live_tables_unique_indexes(rig) -> None:
     # The applied DDL has no unique index; the live table does (added by hand).
     r = rig([_table()], live_unique=lambda t: [["id"], ["email"]])
-    assert r.shards == [] and "unique key (email) does not include id" in _split_lines(r)[0][1]
+    _one_session(r)
+    assert r.unique_reads == [EVENTS]
     rig.reset()
     unknown = rig([_table()], live_unique=lambda t: None)
-    assert unknown.shards == []
-    assert _split_lines(unknown)[0][1] == (
-        "read with one reader: its unique indexes on Aurora DSQL could not be read")
+    _one_session(unknown)
 
 
-def test_a_guard_that_raises_keeps_one_reader_and_never_fails_the_run(rig) -> None:
+def test_a_guard_that_raises_reads_by_one_reader_session_and_never_fails_the_run(rig) -> None:
     def _boom(_table):
         raise RuntimeError("catalog down")
 
     r = rig([_table()], live_unique=_boom)
-    assert r.shards == [] and len(r.wholes) == 1 and r.status == {EVENTS: "DONE"}
-    assert _split_lines(r)[0][1] == "read with one reader: its keys could not be read"
+    _one_session(r)
+    assert r.status == {EVENTS: "DONE"}
 
 
 def _composite():
@@ -532,17 +570,16 @@ def test_a_changed_key_append_table_splits_only_on_the_applied_live_key(rig, sou
                live_unique=lambda t: [["tenant", "id"], ["id"]])
     assert len(same.shards) == 4 and same.pk_reads == [EVENTS]
     rig.reset()
+    # A shard keys its load on the applied key and skips migrate_table's checks, so the
+    # table loads as one unit -- which promotes an empty table to the applied key or refuses
+    # the load, as for one reader -- read by one reader session in its ranges (P2).
     old = rig([table], source=source, conversions={EVENTS: _composite()},
               live_pk=lambda t: ["id"])
-    assert old.shards == [] and len(old.wholes) == 1
-    assert _split_lines(old)[0][1] == (
-        "read with one reader: its applied primary key (tenant, id) differs from the source's, "
-        "and the Aurora DSQL table's key is (id), so it loads as one unit, which recreates an "
-        "empty table with the applied key or refuses the load")
+    _one_session(old)
     rig.reset()
     unread = rig([table], source=source, conversions={EVENTS: _composite()},
                  live_pk=lambda t: None)
-    assert unread.shards == [] and "key could not be read" in _split_lines(unread)[0][1]
+    _one_session(unread)
 
 
 def test_postgresql_splits_in_any_run_on_the_shared_snapshot_with_no_unique_guard(rig) -> None:
@@ -644,6 +681,22 @@ def test_only_a_load_that_recreates_the_table_clears_the_record(rig, monkeypatch
     again = rig([_table()], replace=[EVENTS], ranges={EVENTS: [(None, 500), (500, None)]},
                 handle=_marked())
     assert len(again.shards) == 2 and again.parts == {EVENTS: 2}
+
+
+def test_a_one_session_table_keeps_or_clears_the_record_as_one_reader_does(rig) -> None:
+    # P2: a table read by one reader session is never recorded as read in parts. A Drop &
+    # reload recreates it in the pre-pass (before any read), so an earlier record of rows
+    # read in parts goes with them; an append keeps it, since those rows stay.
+    drop = rig([_table()], cdc=False, replace=[EVENTS], handle=_marked())
+    assert drop.wholes[0].read_ranges == tuple(_FOUR) and drop.wholes[0].pre_recreated
+    assert drop.status == {EVENTS: "DONE"} and drop.parts == {EVENTS: None}
+    rig.reset()
+    unique = rig([_table()], replace=[EVENTS], handle=_marked(),
+                 conversions={EVENTS: _conv(indexes=[_UQ_EMAIL])})
+    assert unique.wholes[0].read_ranges == tuple(_FOUR) and unique.parts == {EVENTS: None}
+    rig.reset()
+    append = rig([_table()], cdc=False, handle=_marked())
+    assert append.wholes[0].read_ranges == tuple(_FOUR) and append.parts == {EVENTS: 4}
 
 
 def test_a_recreate_that_aborts_the_run_clears_only_the_tables_it_recreated(rig) -> None:
@@ -1897,6 +1950,13 @@ def test_the_settings_texts_state_the_g137_rule_and_the_trade_off() -> None:
            "every unique key on Aurora DSQL includes that leading column" in shards
     assert "PostgreSQL: any run, the ranges sharing one snapshot" in shards
     assert "rise up to full_load_table_parallelism-fold" in shards
+    # P2: outside the separate-snapshot split, a MySQL table's ranges are one session's.
+    one_session = ("In Full load only, or without a binlog start point, a MySQL table's ranges "
+                   "are read by one reader session from one snapshot: one source connection and "
+                   "one process per table (and so are the ranges of a table whose unique keys "
+                   "rule out separate snapshots)")
+    assert one_session in shards
+    assert "Full load only reads every MySQL table with one reader" not in shards
     retry = " ".join(fields["full_load_source_retry_attempts"].description.split())
     assert "single point in time" not in retry
     assert "A MySQL table read in reader shards is not re-read" in retry
@@ -1914,6 +1974,8 @@ def test_the_settings_texts_state_the_g137_rule_and_the_trade_off() -> None:
         help_text)
     assert ("Unticking it needs that reload, before CDC starts: once CDC starts, the table set "
             "is fixed (manual §3.8).") in help_text
+    assert one_session in help_text
+    assert "Full load only reads every MySQL table with one reader" not in help_text
 
 
 _RULE = {
