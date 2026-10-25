@@ -441,8 +441,13 @@ def test_the_reader_shards_help_says_when_a_mysql_source_splits_a_table() -> Non
     help_text = " ".join(knob.help_text.split())
     assert "A MySQL source always reads a table with one reader" not in help_text
     assert "A PostgreSQL source splits in any run, its ranges sharing one snapshot" in help_text
-    assert ("A MySQL source splits only in Full load + CDC with a binlog start point, and only "
-            "a table whose every unique key on Aurora DSQL includes that leading column") in help_text
+    # P1: only an explicit 2 or more reads a MySQL table in parts from separate snapshots;
+    # automatic ranges are one reader session's.
+    assert ("With 2 or more, a MySQL source reads a table in parts from separate snapshots "
+            "only in Full load + CDC with a binlog start point, and only a table whose every "
+            "unique key on Aurora DSQL includes that leading column") in help_text
+    assert ("A MySQL source reads a table's automatic ranges with one reader session from one "
+            "snapshot") in help_text
     # P2: Full load only reads a MySQL table's ranges with one session, from one snapshot.
     assert "Full load only reads every MySQL table with one reader" not in help_text
     assert ("In Full load only, or without a binlog start point, a MySQL table's ranges are "
@@ -454,10 +459,9 @@ def test_the_reader_shards_help_says_when_a_mysql_source_splits_a_table() -> Non
     assert "pair it with the source-load throttle" in help_text
     assert "DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS" in help_text
     assert "'Shard minimum rows'" not in help_text
-    # The Settings row's visible helper says the same in one line.
+    # The Settings row's visible helper says what each value does (P1: 0 = automatic).
     assert knob.description == (
-        "Split a large table's read by its integer leading key (1 = off; MySQL: separate "
-        "snapshots only in Full load + CDC)."
+        "0 = automatic by table size (default), 1 = off, 2-32 = exactly that many key ranges."
     )
 
 

@@ -943,8 +943,21 @@ PROGRESS_FLUSH_SECONDS = 30.0
 # Safety ceiling on concurrent SOURCE snapshot readers = table_parallelism x
 # reader_shards. Each holds a long-lived source connection; this caps the product
 # so a high table_parallelism x reader_shards can't exhaust the source's
-# max_connections. Reader sharding is clamped down (never up) to honor it.
+# max_connections. Reader sharding is clamped down (never up) to honor it. Only the
+# in-process readers of a load while CDC streams (migrate_table) multiply that way: on the
+# process path each running unit holds one source connection, so the pool bounds them (P1).
 _MAX_SOURCE_READERS = 32
+
+# P1: Reader shards per large table 0 (automatic, the default) splits a table by its
+# scan-free row estimate: not below _AUTO_SPLIT_MIN_ROWS rows (nor below the shard minimum),
+# else one key range per _AUTO_ROWS_PER_RANGE rows, at most _MAX_READER_RANGES (an explicit
+# value has the same ceiling). Measured (Seoul, 2026-10-25): one key range of an Aurora DSQL
+# table takes about 20,000 rows/s on a clean cluster, and a 10M-row table read in 4 ranges
+# reached 39.6K rows/s overall (54K at its peak), with nothing more measured beyond 4 ranges
+# at that size -- so a table of a few million rows stays whole.
+_AUTO_SPLIT_MIN_ROWS = 5_000_000
+_AUTO_ROWS_PER_RANGE = 2_500_000
+_MAX_READER_RANGES = 32
 
 # P3: how many INSERT batches a load unit (a table, or one part of a split table) keeps in
 # flight, each on its own Aurora DSQL connection. Measured (Seoul, 2026-10-25): one
@@ -1186,8 +1199,11 @@ _PROCESS_LAUNCH_STAGGER_SECONDS = 0.15
 # blocked queue put -- the observed deadlock) left the parent in ``as_completed``
 # forever while the UI insisted it was "finishing the current batch".
 # How often the parent pings the shared-snapshot anchor to keep its transaction from
-# being reaped while idle. Well under a typical idle_in_transaction_session_timeout.
+# being reaped while idle: at most this often, and a third of the source's
+# idle_in_transaction_session_timeout when that is set (P1, _anchor_keepalive_seconds), but
+# not more often than every _ANCHOR_KEEPALIVE_MIN_SECONDS.
 _ANCHOR_KEEPALIVE_SECONDS = 60.0
+_ANCHOR_KEEPALIVE_MIN_SECONDS = 5.0
 # The activity line for a table the anchor's loss stopped (see the keepalive loop).
 _ANCHOR_LOST_DETAIL = (
     "stopped: the shared-snapshot anchor connection was lost (a source failover closes "
@@ -1302,6 +1318,12 @@ class _ShardWorkerArgs:
     # P3: at most this many INSERT batches in flight for this shard (_unit_in_flight, with
     # its share of the run's budget). None => the worker sizes it without a share.
     in_flight: Optional[int] = None
+    # P1: the contiguous block of the table's key ranges this shard reads in turn, a page of
+    # each, from the run's shared snapshot (PostgreSQL), and the table-wide index of its first
+    # range (``range_base``), so each range numbers its batches and resume point under one id
+    # across the table's shards. () or one range => the one range [pk_lower, pk_upper).
+    ranges: tuple = ()
+    range_base: int = 0
 
 
 @dataclass(frozen=True)
@@ -2043,12 +2065,26 @@ def _note_first_row(rows: Iterable, handed: list) -> Iterator:
     yield from iterator
 
 
+def _table_wide_range_pages(pages: Iterable, base: int, handed: list) -> Iterator:
+    """One reader session's ``(range index, page)`` pairs with each index made table-wide --
+    ``base`` plus it (P1: a shard reading a block of its table's key ranges, whose first range
+    is the table's ``base``-th) -- so a range's batch ids and resume point are the same in
+    whichever shard reads it; ``handed[0]`` is set once a first row is handed on, as
+    :func:`_note_first_row` sets it. Once it is set, the pages pass as they are."""
+    for index, page in pages:
+        yield base + index, (page if handed[0] else _note_first_row(page, handed))
+
+
 def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     """Load one PK-range shard of a table in its own process (Phase 2).
 
     Same pattern as _migrate_one_table_in_process but reads only the
     [pk_lower, pk_upper) slice. Each shard builds its own source connection +
-    DSQL connection pool so they run on independent cores.
+    DSQL connection pool so they run on independent cores. A shard given a block of its
+    table's key ranges (``args.ranges``, P1: a PostgreSQL table read by fewer shards than
+    ranges) reads them in turn, a page of each, through one session that imports the run's
+    shared snapshot (``TableExporter.stream_converted_ranges``), as one reader session reads
+    a table's ranges (P2).
 
     The operator's oversized-LOB column exclusions are applied HERE: this worker does not
     go through :meth:`BatchedTableMigrator.migrate_table` (which filters), it drives the
@@ -2175,13 +2211,25 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 importer._max_quarantine = max(1, int(args.max_quarantine_records))
             except Exception:  # noqa: BLE001 - a double may not carry the field
                 pass
-        # P3: this shard reads one key range, so it keeps at most _range_in_flight batches
-        # in flight and at most its share of the run's budget (sized by the parent).
+        # P3: at most _range_in_flight batches in flight per key range this shard reads -- one,
+        # or (P1) its block of the table's ranges -- and at most its share of the run's
+        # budget (sized by the parent).
+        block = tuple(args.ranges) if len(args.ranges) > 1 else ()
+        key_ranges = len(block) or 1
         in_flight = args.in_flight or _unit_in_flight(
-            load_config().full_load_batch_parallelism, 1, None
+            load_config().full_load_batch_parallelism, key_ranges, None
         )
         _cap_importer_parallelism(importer, in_flight)
-        stats.set_unit_shape(ranges=1, in_flight_cap=in_flight)
+        stats.set_unit_shape(ranges=key_ranges, in_flight_cap=in_flight)
+        # P1: a block's keyset page holds whole batches and at most a range's share of the
+        # batches in flight, as migrate_table sizes a one-session table's (P2).
+        block_page_rows = (
+            _range_page_rows(
+                load_config().full_load_batch_rows, len(table.columns), in_flight // key_ranges
+            )
+            if block
+            else 0
+        )
 
         # First attempt uses the planned mode; any retry downgrades to SKIP_EXISTING
         # so re-reading a partially-written shard stays duplicate-free. ``_live_rows``
@@ -2219,6 +2267,35 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             # the run's SHARED snapshot again (PostgreSQL); a MySQL shard, whose re-read
             # would open a fresh snapshot later than its first, is never re-read (G137).
             _zero_dates[0] = _ZeroDateTally()
+            if block:
+                # P1: this shard's block of the table's ranges, a page of each in turn, read
+                # by one session from the run's shared snapshot; table-wide range ids keep
+                # each range's batch ids and resume point its own, and a re-read imports the
+                # same snapshot, so the resume point stays valid across it.
+                pages = migrator._exporter.stream_converted_ranges(
+                    args.inputs.source_config,
+                    table,
+                    list(block),
+                    page_rows=block_page_rows,
+                    should_cancel=_is_cancelled,
+                    target_types=target_types,
+                    on_throttle=_on_throttle,
+                    on_pause_slice=_on_pause_slice,
+                    shared_snapshot_id=args.shared_snapshot_id,
+                    target_specs=target_specs,
+                    on_zero_dates=_zero_dates[0].add,
+                )
+                _live_rows[0] = pages
+                return importer.import_rows(
+                    iter(()),
+                    table,
+                    range_pages=_table_wide_range_pages(pages, args.range_base, handed),
+                    job=_resume_job,
+                    on_batch_loaded=_on_rows,
+                    should_cancel=_is_cancelled,
+                    on_conflict=_shard_conflict_mode[0],
+                    key_columns=shard_key_columns,
+                )
             rows = migrator._exporter.stream_converted_rows(
                 args.inputs.source_config,
                 table,
@@ -3219,6 +3296,36 @@ def _open_shared_snapshot(migrator, dialect):
         raise
 
 
+# The anchor session's own idle-in-transaction limit, in milliseconds (0 = none): one catalog
+# view read, no table touched (Property 1).
+_ANCHOR_IDLE_TIMEOUT_SQL = (
+    "SELECT setting FROM pg_settings WHERE name = 'idle_in_transaction_session_timeout'"
+)
+
+
+def _anchor_keepalive_seconds(conn) -> float:
+    """How often the parent pings the shared-snapshot anchor ``conn`` (P1): a third of the
+    source's ``idle_in_transaction_session_timeout`` as that session sees it -- one read on
+    it, right after the export -- between :data:`_ANCHOR_KEEPALIVE_MIN_SECONDS` and
+    :data:`_ANCHOR_KEEPALIVE_SECONDS` (a 30 s limit: every 10 s), so a limit shorter than the
+    60 s ping no longer ends the anchor's transaction, and the snapshot with it, between two
+    pings. No limit (0), no connection or a read that fails: every
+    :data:`_ANCHOR_KEEPALIVE_SECONDS`."""
+    if conn is None:
+        return _ANCHOR_KEEPALIVE_SECONDS
+    try:
+        milliseconds = float(conn.exec_driver_sql(_ANCHOR_IDLE_TIMEOUT_SQL).scalar())
+    except Exception:  # noqa: BLE001 - the ping interval, never the run's outcome
+        _LOGGER.debug("Could not read the anchor's idle_in_transaction_session_timeout",
+                      exc_info=True)
+        return _ANCHOR_KEEPALIVE_SECONDS
+    if not milliseconds > 0:  # 0 (no limit), or NaN
+        return _ANCHOR_KEEPALIVE_SECONDS
+    return min(
+        _ANCHOR_KEEPALIVE_SECONDS, max(_ANCHOR_KEEPALIVE_MIN_SECONDS, milliseconds / 3000.0)
+    )
+
+
 def _close_shared_snapshot(engine, conn) -> None:
     """COMMIT + close the anchor snapshot transaction opened by :func:`_open_shared_snapshot`."""
     if conn is None:
@@ -3658,7 +3765,10 @@ class _Unit(NamedTuple):
     ``unit[1]`` is still the table (:func:`_largest_first`, the perf harness).
 
     ``ranges`` (P2): the primary-key ranges ONE reader session of a whole-table unit reads in
-    turn from one snapshot (``migrate_table(read_ranges=)``); empty: one range."""
+    turn from one snapshot (``migrate_table(read_ranges=)``); empty: one range. For a shard
+    (P1: a PostgreSQL table read by fewer shards than ranges), the contiguous block of the
+    table's ranges it reads in turn from the run's shared snapshot -- ``[lo, hi)`` spans them
+    -- and ``base``, the table-wide index of its first range."""
 
     kind: str
     table: TableDef
@@ -3666,6 +3776,54 @@ class _Unit(NamedTuple):
     hi: Optional[int] = None
     index: int = 0
     ranges: tuple = ()
+    base: int = 0
+
+
+def _auto_reader_ranges(estimate: Optional[int], shard_min_rows: int) -> int:
+    """The key ranges Reader shards per large table 0 (automatic, P1) reads a table in, from
+    its scan-free row ``estimate``: 1 (whole) without one or below the larger of
+    ``shard_min_rows`` and :data:`_AUTO_SPLIT_MIN_ROWS`, else one range per
+    :data:`_AUTO_ROWS_PER_RANGE` rows, at most :data:`_MAX_READER_RANGES` -- 5M rows: 2, 10M:
+    4, 20M: 8, 80M or more: 32. Pure."""
+    if not isinstance(estimate, int) or isinstance(estimate, bool):
+        return 1
+    if estimate < max(int(shard_min_rows), _AUTO_SPLIT_MIN_ROWS):
+        return 1
+    return min(_MAX_READER_RANGES, estimate // _AUTO_ROWS_PER_RANGE)
+
+
+def _unit_counts(
+    candidates: "Mapping[str, int]",
+    estimates: "Mapping[str, int]",
+    tp: int,
+    other_units: int,
+) -> "dict[str, int]":
+    """How many shards each PostgreSQL table sharing the run's snapshot is read by (P1), from
+    ``candidates`` (table -> its K planned key ranges): its share of the run's estimated rows
+    (``estimates``, every table of the run that may start) of the ``tp`` worker processes,
+    rounded, at least 1 and at most K and ``tp``. The slots the run leaves idle --
+    ``tp`` minus every candidate's shards and the ``other_units`` that are not candidates --
+    then go one at a time to the candidate furthest below its share (ties: by name) that may
+    take one more. No estimate in the run: one each. Spreading over tables first and over key
+    ranges second: sixteen tables of 20M rows at 16 processes load side by side, one shard
+    each, and one 100M-row table alone gets all 16. Pure."""
+    total = sum(v for v in estimates.values() if _is_row_estimate(v) and v > 0)
+    if total <= 0:
+        return {name: 1 for name in candidates}
+    slots = max(1, int(tp))
+    quota = {name: slots * (estimates.get(name) or 0) / total for name in candidates}
+    counts = {
+        name: max(1, min(int(k), slots, round(quota[name]))) for name, k in candidates.items()
+    }
+    spare = slots - (sum(counts.values()) + max(0, int(other_units)))
+    while spare > 0:
+        open_ = [name for name, k in candidates.items() if counts[name] < min(int(k), slots)]
+        if not open_:
+            break
+        best = min(open_, key=lambda name: (counts[name] - quota[name], name))
+        counts[best] += 1
+        spare -= 1
+    return counts
 
 
 def _largest_first(
@@ -3769,15 +3927,19 @@ def _split_refusal(
     return None
 
 
-# The activity details of the reader-shard plan (G137), logged only with Reader shards per
-# large table above 1, so a default run logs nothing new.
+# The activity details of the reader-shard plan (G137), logged for each table read in more
+# than one key range: with Reader shards per large table 0 (automatic, the default) only a
+# table of at least 5M estimated rows (P1), and nothing with 1.
 _SPLIT_OWN_SNAPSHOTS = (
     "read in {k} primary-key ranges, each from its own snapshot; CDC, from the start point "
     "taken before any read, corrects rows that changed between them"
 )
 _SPLIT_SHARED_SNAPSHOT = "read in {k} primary-key ranges sharing one snapshot"
+# P1: a PostgreSQL table read by fewer shards than ranges, each a contiguous block in turn.
+_SPLIT_SHARED_SNAPSHOT_BLOCKS = "read in {k} primary-key ranges by {g} readers sharing one snapshot"
 # P2: a table that may not take parts read from separate snapshots (MySQL Full load only, no
-# binlog start point, a split _split_refusal refuses) is read in its ranges by one session.
+# binlog start point, a split _split_refusal refuses, and -- P1 -- every automatic split) or a
+# PostgreSQL table read by one shard (P1) is read in its ranges by one session.
 _SPLIT_ONE_SNAPSHOT = "read in {k} primary-key ranges by one reader session (one snapshot)"
 # A load while CDC streams (cdc_coexisting) whose split is refused keeps one reader.
 _ONE_READER = "read with one reader: {reason}"
@@ -4155,7 +4317,9 @@ def _migrate_tables_in_parallel(
     one may split a table's read, :func:`_cdc_replays_load`); ``fresh_watermark`` says this
     run captured it, so its row estimates may spare the planning read of a table well below
     the shard minimum (a retry's may be days old). On the process path its row estimates
-    also order the units: the largest start first (R2, :func:`_largest_first`).
+    also order the units: the largest start first (R2, :func:`_largest_first`), and (P1) size
+    an automatic split (:func:`_auto_reader_ranges`) and the shards of a PostgreSQL table by
+    its share of the run (:func:`_unit_counts`).
 
     ``load_stats`` (optional) collects every load unit's write-path counters as they
     arrive and their final values from the results, per table (shards merged) and per run
@@ -4269,7 +4433,8 @@ def _migrate_tables_in_parallel(
         # Plan work units: for each table, decide if it should be sharded.
         # Small/non-shardable tables get 1 worker each; an eligible large table gets
         # K shard workers, or (P2) one worker whose reader session reads its K ranges in
-        # turn from one snapshot.
+        # turn from one snapshot, or (P1, PostgreSQL) as many shard workers as its share of
+        # the run, each reading a contiguous block of its K ranges in turn.
         #
         # SHARDING SAFETY -- see _sharding_is_consistent for the whole rule. Resolve the
         # SOURCE dialect first so this pre-gate uses the right integer-PK set (the
@@ -4280,14 +4445,17 @@ def _migrate_tables_in_parallel(
         # G137: CDC replays this MySQL run from a start point taken before its reads.
         _replays = _cdc_replays_load(migrator._inputs, watermark)
 
-        # Shard count is capped exactly like single-process: cfg.full_load_reader_shards
-        # clamped so table_parallelism x shards stays under the source max_connections
-        # ceiling. NOT the pool budget (remaining_slots) -- that ignored the off-switch
-        # (reader_shards=1) and the source-connection guardrail.
+        # P1: the key ranges a large table is read in. Reader shards per large table 0
+        # (automatic, the default) sizes them from the table's estimate
+        # (_auto_reader_ranges), 1 is off, 2-32 is exactly that many. No `32 // Tables in
+        # parallel` clamp: each running unit holds one source connection, so the pool
+        # bounds the source readers (+1 PostgreSQL anchor), and P3's caps bound the batches
+        # in flight. A load while CDC streams (cdc_coexisting) splits only with an explicit
+        # value, as before.
         tp = max(1, cfg.full_load_table_parallelism)
-        effective_reader_shards = max(
-            1, min(cfg.full_load_reader_shards, _MAX_SOURCE_READERS // tp)
-        )
+        _coexisting = bool(migrator._inputs.cdc_coexisting)
+        explicit_ranges = int(cfg.full_load_reader_shards)
+        automatic = explicit_ranges < 1 and not _coexisting
 
         # The overlay pre-pass (None for a run without exclusions or records).
         prepass = _OverlayPrepass.start(
@@ -4296,18 +4464,29 @@ def _migrate_tables_in_parallel(
         if prepass is not None:
             prepass.before_planning()
 
+        # R2 + P1: the run's scan-free row estimates, read once before the plan: they size an
+        # automatic split and a PostgreSQL table's share of the run (_unit_counts), order the
+        # units the pool starts -- the largest first (a split table by its share per shard),
+        # any table without one before them (_largest_first) -- and the index pass after the
+        # pool (P4a). A PostgreSQL table with no estimate is sized from its files here (one
+        # catalog read, stamped like the planning reads below).
+        _order_estimates = _load_order_estimates(
+            migrator, tables, watermark, skip=withheld, heartbeat=handle.heartbeat
+        )
         # The run's own row estimates spare the planning read of a table well below the
-        # shard minimum: a positive one only (the MySQL watermark stores an unknown as 0),
-        # and only in the run that captured them (a retry's may be days old).
+        # shard minimum when Reader shards is set: a positive one only (the MySQL watermark
+        # stores an unknown as 0), and only in the run that captured them (a retry's may be
+        # days old). Automatic plans only a table its estimate puts at 5M rows or more.
         _estimates = (
             dict(getattr(watermark, "table_row_counts", None) or {}) if fresh_watermark else {}
         )
         # P2: outside a load while CDC streams, a table that may not take parts read from
         # separate snapshots -- MySQL in Full load only or without a binlog start point
-        # (G137), or a split _split_refusal refuses -- is read in its ranges by ONE reader
-        # session from one snapshot instead: one whole-table unit (one process, one source
-        # connection) through migrate_table, and no reader_shards record (one snapshot).
-        _one_session = not migrator._inputs.cdc_coexisting
+        # (G137), a split _split_refusal refuses, and (P1) every automatic MySQL split -- is
+        # read in its ranges by ONE reader session from one snapshot instead: one whole-table
+        # unit (one process, one source connection) through migrate_table, and no
+        # reader_shards record (one snapshot).
+        _one_session = not _coexisting
         planned_parts: dict[str, int] = {}
         work_units: list[_Unit] = []
         for table in tables:
@@ -4315,28 +4494,45 @@ def _migrate_tables_in_parallel(
                 work_units.append(_Unit("table", table))  # skipped at submission
                 continue
             table_is_replace = (
-                not migrator._inputs.cdc_coexisting
+                not _coexisting
                 and table.name in migrator._inputs.replace_tables
             )
             lead = shardable_leading_int_pk(table, _shard_dialect)
             may_shard = _table_may_shard(
-                cdc_coexisting=bool(migrator._inputs.cdc_coexisting),
+                cdc_coexisting=_coexisting,
                 shared_snapshot=_shared_snapshot,
                 table_is_replace=table_is_replace,
                 cdc_replays_load=_replays,
             )
-            if lead is None or effective_reader_shards <= 1 or not (may_shard or _one_session):
+            if automatic:
+                ranges_wanted = _auto_reader_ranges(
+                    _order_estimates.get(table.name), cfg.full_load_shard_min_rows
+                )
+            elif _coexisting:
+                ranges_wanted = explicit_ranges if explicit_ranges >= 2 else 1
+            else:
+                ranges_wanted = explicit_ranges
+            if lead is None or ranges_wanted <= 1 or not (may_shard or _one_session):
                 work_units.append(_Unit("table", table))
                 continue
             _estimate = _estimates.get(table.name)
-            if isinstance(_estimate, int) and 0 < _estimate < cfg.full_load_shard_min_rows:
+            if (
+                not automatic
+                and isinstance(_estimate, int)
+                and 0 < _estimate < cfg.full_load_shard_min_rows
+            ):
                 work_units.append(_Unit("table", table))
                 continue
+            # Automatic: the leading key column's MIN and MAX only (its estimate decided).
             shard_ranges = _planned_shard_ranges(
-                migrator, table, effective_reader_shards, cfg.full_load_shard_min_rows
+                migrator, table, ranges_wanted,
+                0 if automatic else cfg.full_load_shard_min_rows,
             )
+            # Parts: from separate snapshots (MySQL, an explicit value only -- G137, so an
+            # automatic split never takes one) or from the run's shared one (PostgreSQL).
+            parts_allowed = may_shard and (_shared_snapshot or not automatic)
             refusal: Optional[str] = None
-            if len(shard_ranges) > 1 and may_shard:
+            if len(shard_ranges) > 1 and parts_allowed:
                 try:
                     refusal = _split_refusal(
                         migrator, table, lead,
@@ -4350,7 +4546,12 @@ def _migrate_tables_in_parallel(
             # A planned candidate is a source connect (and maybe a catalog read) before the
             # drain thread that owns liveness starts: stamp it, as the recreate loop does.
             handle.heartbeat()
-            if len(shard_ranges) > 1 and may_shard and refusal is None:
+            if len(shard_ranges) > 1 and parts_allowed and refusal is None:
+                if _shared_snapshot and _one_session:
+                    # P1: its shards and their blocks are planned with the run's other
+                    # such tables, by their shares of the run (below).
+                    work_units.append(_Unit("group", table, ranges=tuple(shard_ranges)))
+                    continue
                 for i, (lo, hi) in enumerate(shard_ranges):
                     work_units.append(_Unit("shard", table, lo, hi, i))
                 planned_parts[table.name] = len(shard_ranges)
@@ -4383,21 +4584,59 @@ def _migrate_tables_in_parallel(
                         detail=_ONE_READER.format(reason=refusal),
                     )
 
+        # P1: the PostgreSQL tables whose ranges share the run's snapshot get as many shards
+        # as their shares of the run's estimated rows (_unit_counts): many tables load side by
+        # side before one table's ranges do, and a table that is most of the run gets most of
+        # the pool. Shard g reads the contiguous block ranges[g*K//G:(g+1)*K//G] in turn (one
+        # range each when G == K, as before); one shard (G == 1) is one reader session with
+        # its own snapshot (P2), so it needs no anchor.
+        groups = {wu.table.name: len(wu.ranges) for wu in work_units if wu.kind == "group"}
+        if groups:
+            shards_of = _unit_counts(
+                groups, _order_estimates, tp,
+                other_units=sum(
+                    1 for wu in work_units
+                    if wu.kind != "group" and wu.table.name not in withheld
+                ),
+            )
+            planned: list[_Unit] = []
+            for wu in work_units:
+                if wu.kind != "group":
+                    planned.append(wu)
+                    continue
+                k, g_count = len(wu.ranges), shards_of[wu.table.name]
+                if g_count <= 1:
+                    planned.append(_Unit("table", wu.table, ranges=wu.ranges))
+                    detail = _SPLIT_ONE_SNAPSHOT.format(k=k)
+                else:
+                    for g in range(g_count):
+                        first, after = g * k // g_count, (g + 1) * k // g_count
+                        block = wu.ranges[first:after]
+                        planned.append(_Unit(
+                            "shard", wu.table, block[0][0], block[-1][1], g, block, first
+                        ))
+                    planned_parts[wu.table.name] = g_count
+                    detail = (
+                        _SPLIT_SHARED_SNAPSHOT.format(k=k)
+                        if g_count == k
+                        else _SPLIT_SHARED_SNAPSHOT_BLOCKS.format(k=k, g=g_count)
+                    )
+                log_activity(
+                    ActivityCategory.FULL_LOAD,
+                    "reader shards",
+                    status=ActivityStatus.INFO,
+                    target=wu.table.name,
+                    detail=detail,
+                )
+            work_units = planned
+
         total_workers = min(table_parallelism, len(work_units))
         # P3: the INSERT batches each unit keeps in flight. At most total_workers units run
         # at once, each with at most its share of the run's budget, so the run never has
-        # more than the budget in flight. A unit reads one key range -- or, a table read by
-        # one reader session (P2), its ranges in turn: at most 4 per range of them.
+        # more than the budget in flight. A unit reads one key range -- or its ranges in
+        # turn (P2: a table read by one reader session; P1: a shard's block): at most 4 per
+        # range of them (sized per unit at submission).
         _share = _in_flight_share(total_workers)
-        unit_in_flight = _unit_in_flight(cfg.full_load_batch_parallelism, 1, _share)
-        # R2: the order the pool starts the units in -- the largest first (a split table by
-        # its share per shard), any table without a row estimate before them
-        # (_largest_first). A PostgreSQL table with no estimate is sized from its files here
-        # (one catalog read, stamped like the planning reads above). The index pass after
-        # the pool goes largest first by the same estimates (P4a).
-        _order_estimates = _load_order_estimates(
-            migrator, tables, watermark, skip=withheld, heartbeat=handle.heartbeat
-        )
         start_order = _largest_first(work_units, _order_estimates)
 
         # Pre-pass: DROP+recreate EVERY replace table BEFORE spawning workers, and do
@@ -4528,6 +4767,12 @@ def _migrate_tables_in_parallel(
         # finally (drain-thread + queue teardown, _close_shared_snapshot).
         _anchor_engine = _anchor_conn = None
         shared_snapshot_id: Optional[str] = None
+        # P1: how often the keepalive pings the anchor (its session's idle-in-transaction
+        # limit), and the submitted shards that import its snapshot and have not returned:
+        # once none is left, the anchor is closed, so the source no longer keeps that snapshot
+        # (and the row versions it needs) while the run's other tables load.
+        _anchor_interval = _ANCHOR_KEEPALIVE_SECONDS
+        _anchor_readers = 0
 
         try:
             if _shared_snapshot and any(
@@ -4536,6 +4781,7 @@ def _migrate_tables_in_parallel(
                 _anchor_engine, _anchor_conn, shared_snapshot_id = _open_shared_snapshot(
                     migrator, _shard_dialect
                 )
+                _anchor_interval = _anchor_keepalive_seconds(_anchor_conn)
             with ProcessPoolExecutor(
                 max_workers=total_workers,
                 mp_context=ctx,
@@ -4565,12 +4811,8 @@ def _migrate_tables_in_parallel(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pre_recreated=table.name in recreated_names,
-                            in_flight=(
-                                _unit_in_flight(
-                                    cfg.full_load_batch_parallelism, len(wu.ranges), _share
-                                )
-                                if wu.ranges
-                                else unit_in_flight
+                            in_flight=_unit_in_flight(
+                                cfg.full_load_batch_parallelism, len(wu.ranges) or 1, _share
                             ),
                             read_ranges=wu.ranges,
                         )
@@ -4597,11 +4839,18 @@ def _migrate_tables_in_parallel(
                                 1, MAX_QUARANTINE_RECORDS // max(1, _table_shards)
                             ),
                             shard_count=_table_shards,
-                            in_flight=unit_in_flight,
+                            in_flight=_unit_in_flight(
+                                cfg.full_load_batch_parallelism, len(wu.ranges) or 1, _share
+                            ),
+                            # P1: a block of the table's ranges, read in turn (else one).
+                            ranges=wu.ranges,
+                            range_base=wu.base,
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
                         futures[f] = ("shard", table.name, shard_idx)
                         submitted_parts[table.name] = submitted_parts.get(table.name, 0) + 1
+                        if shared_snapshot_id is not None:
+                            _anchor_readers += 1
 
                 # Process results as they complete.
                 # Bounded wait so Stop Full Load can never hang. Cancellation is
@@ -4611,7 +4860,7 @@ def _migrate_tables_in_parallel(
                 # current batch". Waiting in slices lets us notice the grace period
                 # expiring and stop waiting instead.
                 _cancel_deadline: Optional[float] = None
-                _anchor_next_ping = _time.monotonic() + _ANCHOR_KEEPALIVE_SECONDS
+                _anchor_next_ping = _time.monotonic() + _anchor_interval
                 # Set when the anchor dies, so the run is reported as FAILED rather than as
                 # a user Stop -- the operator did not ask for this.
                 _anchor_lost = [False]
@@ -4628,9 +4877,7 @@ def _migrate_tables_in_parallel(
                     # their OWN snapshot, and the table is consistent as of no single point
                     # in time with nothing said. This loop already wakes every second.
                     if _anchor_conn is not None and _time.monotonic() >= _anchor_next_ping:
-                        _anchor_next_ping = (
-                            _time.monotonic() + _ANCHOR_KEEPALIVE_SECONDS
-                        )
+                        _anchor_next_ping = _time.monotonic() + _anchor_interval
                         try:
                             _anchor_conn.exec_driver_sql("SELECT 1")
                         except Exception:  # noqa: BLE001 - the snapshot is gone
@@ -4687,6 +4934,26 @@ def _migrate_tables_in_parallel(
                         load_stats, name, tag[2] if tag[0] == "shard" else None,
                         getattr(result, "load_stats", None), final=True,
                     )
+                    # P1: the last shard reading the shared snapshot has returned, so no
+                    # unit of this run imports it again: close the anchor now rather than at
+                    # the run's end (the finally still closes it if it is open).
+                    if tag[0] == "shard" and shared_snapshot_id is not None:
+                        _anchor_readers -= 1
+                        if _anchor_readers <= 0 and _anchor_conn is not None:
+                            _closing = (_anchor_engine, _anchor_conn)
+                            _anchor_engine = _anchor_conn = None
+                            try:
+                                _close_shared_snapshot(*_closing)
+                            except Exception:  # noqa: BLE001 - an early release, not an outcome
+                                _LOGGER.warning(
+                                    "Could not close the shared-snapshot anchor", exc_info=True
+                                )
+                            else:
+                                _LOGGER.info(
+                                    "Closed the shared-snapshot anchor: every shard reading "
+                                    "its snapshot has returned (%d unit(s) still loading)",
+                                    len(_pending),
+                                )
 
                     if tag[0] == "shard":
                         # Accumulate shard results; finalize when all shards done.
@@ -8584,8 +8851,8 @@ class BatchedTableMigrator:
             # Source-connection guardrail: total concurrent source snapshot readers
             # = table_parallelism x reader_shards. Clamp the effective shard count so
             # that product stays under a safe ceiling (each reader holds a long-lived
-            # source connection; unbounded, table_parallelism(<=16) x shards(<=8) =
-            # 128 could exhaust the source's max_connections). The write side is
+            # source connection; unbounded, table_parallelism(<=16) x shards(<=32) =
+            # 512 could exhaust the source's max_connections). The write side is
             # unaffected (one write pool per table). See config full_load_reader_shards.
             max_src_readers = _MAX_SOURCE_READERS
             tp = max(1, cfg.full_load_table_parallelism)

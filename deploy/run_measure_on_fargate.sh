@@ -44,9 +44,12 @@
 #   MEASURE_TABLES   space-separated table subset (default: all registered)
 #   VARIANTS         which variants to run, space-separated (default: "off on";
 #                    "off" = prefetch disabled/baseline, "on" = prefetch enabled,
-#                    "shardN" = prefetch + N reader shards, "keep" = composite-A/B
-#                    baseline (integer PK), "composite" = composite PK on
-#                    COMPOSITE_LEADING). For the composite A/B: VARIANTS="keep composite".
+#                    "shardN" = prefetch + Reader shards N (shard0 = automatic),
+#                    "auto" = prefetch + automatic reader shards (the loader's default),
+#                    "keep" = composite-A/B baseline (integer PK), "composite" =
+#                    composite PK on COMPOSITE_LEADING). off/on/keep/composite read
+#                    every table with one reader (Reader shards 1). For the composite
+#                    A/B: VARIANTS="keep composite".
 #   COMPOSITE_LEADING  high-cardinality column prepended to each table's PK for the
 #                    "composite" variant (e.g. customer_id; required by that variant).
 #   TABLE_PARALLELISM / BATCH_PARALLELISM  loader knobs (default 4 / 8)
@@ -115,7 +118,7 @@ mkdir -p "${OUT_DIR}"
 # containerOverrides has no entryPoint field). So the command override is a
 # SINGLE-element array holding the shell string that `sh -c` runs.
 build_cmd_json() {
-  local report_path="$1" no_prefetch="$2" reader_shards="${3:-0}" composite_leading="${4:-}"
+  local report_path="$1" no_prefetch="$2" reader_shards="${3:-}" composite_leading="${4:-}"
   python3 - "$MEASURE_SCHEMA" "$MEASURE_TABLES" "$TABLE_PARALLELISM" "$BATCH_PARALLELISM" \
             "$PROGRESS_INTERVAL" "$report_path" "$no_prefetch" "$reader_shards" "$composite_leading" <<'PY'
 import json, sys
@@ -127,9 +130,10 @@ if tables.strip():
     measure += ["--tables", *tables.split()]
 if no_prefetch == "1":
     measure += ["--no-prefetch"]
-if reader_shards and reader_shards not in ("0", "1"):
-    # reader range sharding on: also lower the size threshold so payments/orders
-    # (each ~9M) qualify regardless of the default 1M gate.
+if reader_shards.strip():
+    # Reader shards per large table for the run, whenever the variant sets one: 1 = off
+    # (the one-reader baselines), 0 = automatic (the loader's default), N = exactly N.
+    # Left out, the loader's default (automatic) would apply, so a baseline sets 1.
     measure += ["--reader-shards", reader_shards]
 if composite_leading.strip():
     # Composite-PK variant: prepend this high-cardinality column to each table's
@@ -183,16 +187,20 @@ PY
 }
 
 run_variant() {
-  local variant="$1"          # "off" | "on" | "shardN" | "keep" | "composite"
+  local variant="$1"          # "off" | "on" | "shardN" | "auto" | "keep" | "composite"
   # Map the variant name to (prefetch on/off, reader-shards, composite-leading).
   # "off" = pre-prefetch baseline; "on" = prefetch, single reader; "shardN" =
-  # prefetch + N shard readers; "keep" = prefetch on, integer PK (composite A/B
-  # baseline); "composite" = prefetch on + composite PK on COMPOSITE_LEADING.
-  local no_prefetch prefetch_env reader_shards=0 composite_leading=""
+  # prefetch + Reader shards N (0 = automatic); "auto" = prefetch + automatic reader
+  # shards (the loader's default); "keep" = prefetch on, integer PK (composite A/B
+  # baseline); "composite" = prefetch on + composite PK on COMPOSITE_LEADING. The
+  # single-reader variants pass Reader shards 1: left unset, the loader's default
+  # (automatic) would split their large tables.
+  local no_prefetch prefetch_env reader_shards=1 composite_leading=""
   case "${variant}" in
     off)        no_prefetch=1; prefetch_env=0 ;;
     on)         no_prefetch=0; prefetch_env=1 ;;
     shard*)     no_prefetch=0; prefetch_env=1; reader_shards="${variant#shard}" ;;
+    auto)       no_prefetch=0; prefetch_env=1; reader_shards=0 ;;
     keep)       no_prefetch=0; prefetch_env=1 ;;
     composite)  no_prefetch=0; prefetch_env=1; composite_leading="${COMPOSITE_LEADING:?set COMPOSITE_LEADING for the composite variant}" ;;
     *)          no_prefetch=0; prefetch_env=1 ;;

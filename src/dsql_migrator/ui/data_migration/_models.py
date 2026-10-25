@@ -4241,14 +4241,16 @@ PRE_LOAD_SPLIT_CARVE_OUT = (
     "reader (Reader shards set to 1, then Drop & reload: Retry unfinished tables while it is "
     "unfinished, else Reload specific tables). Nor can it be taken to Full load only until "
     "that reload, or a match in Validation in CHECKSUM mode once CDC has replayed it. Set "
-    "Reader shards to 1 before the load to keep both routes open."
+    "Reader shards to 1 (off) or 0 (automatic) before the load to keep both routes open."
 )
 
 
 def mysql_reads_may_split(source_type: "Optional[SourceType]") -> bool:
     """Could a Full load + CDC load read a large MySQL table in parts with the current settings
     (G137): a MySQL source, Reader shards per large table above 1 and Tables in parallel above
-    1 (each part takes a pool slot; one slot never splits)? Reads the app config."""
+    1 (each part takes a pool slot; one slot never splits)? 0 (automatic, the default) never
+    does: a MySQL table's automatic ranges are one reader session's (P1). Reads the app
+    config."""
     if source_type is not SourceType.MYSQL:
         return False
     from dsql_migrator.config import load_config

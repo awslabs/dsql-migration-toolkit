@@ -32,11 +32,14 @@ Two subcommands:
               after the run for the CREATE INDEX ASYNC builds it submitted -- read by
               their job ids, as the product's watch reads them -- and reports when the
               indexes were ready and the end-to-end time (run start to the last build
-              finished, to the poll); --cdc-mode runs the load as a Full load + CDC run
+              finished, to the poll); --reader-shards sets Reader shards per large
+              table for the run (0 = automatic, the loader's default; 1 = off; 2-32 =
+              exactly that many ranges; unset: the environment's, else automatic);
+              --cdc-mode runs the load as a Full load + CDC run
               (start point captured and fenced as the product does, no CDC stack
               needed) so a MySQL table's --reader-shards ranges can be read as parts
-              from separate snapshots (without it, one reader session reads them in
-              turn from one snapshot);
+              from separate snapshots (without it, and with automatic ranges, one
+              reader session reads them in turn from one snapshot);
               --inventory-order starts the tables in inventory order instead of the
               largest first, the other arm of the start-order A/B; --range-in-flight /
               --in-flight-budget set the INSERT batches in flight at most per key
@@ -68,9 +71,12 @@ Usage (from repo root):
     .venv/bin/python scripts/measure_performance.py full-load --yes \
         --table-parallelism 8 --batch-parallelism 16     # hotter -> more OCC
     # A benchmark arm: start only once sys.jobs is drained (wait up to 30 min), 60 s
-    # windows, and read big MySQL tables in 4 ranges (needs a binlog start point):
+    # windows, and read big MySQL tables in 4 parts, each from its own snapshot (needs a
+    # binlog start point):
     .venv/bin/python scripts/measure_performance.py full-load --yes --wait-sys-jobs \
         --progress-interval 60 --cdc-mode --reader-shards 4
+    # The one-reader baseline (the loader's default splits large tables automatically):
+    .venv/bin/python scripts/measure_performance.py full-load --yes --reader-shards 1
     # Report the load only, without waiting for the index builds it submitted:
     .venv/bin/python scripts/measure_performance.py full-load --yes --wait-index-builds 0
     # The in-flight A/B: 8 INSERT batches per key range instead of the loader's 4:
@@ -768,6 +774,20 @@ _IN_FLIGHT_SEAMS = (
 )
 
 
+def _reader_shards_setting() -> "int | str | None":
+    """Reader shards per large table as the loader reads it now (P1): "auto" for 0
+    (automatic, the default), else the number -- from the loader's own config after
+    --reader-shards set it, not from .env (which the loader does not read). A value the
+    config refuses (the run failed on it) is reported as it was set."""
+    from dsql_migrator.config import load_config
+
+    try:
+        value = int(load_config().full_load_reader_shards)
+    except Exception:  # noqa: BLE001 - the report says what was set
+        return os.environ.get("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS")
+    return "auto" if value == 0 else value
+
+
 def _in_flight_caps() -> dict:
     """The INSERT batches the loader keeps in flight at most per key range and per run
     (P3), as it reads them now: the product's 4 and 128 unless --range-in-flight /
@@ -800,12 +820,14 @@ def cmd_full_load(args) -> int:
     # env alone -- the whole point of the in-VPC A/B on a single deployed image.
     if getattr(args, "no_prefetch", False):
         os.environ["DSQL_MIGRATOR_FULL_LOAD_PREFETCH"] = "0"
-    # --reader-shards K sets reader range sharding (K primary-key ranges per large table
-    # with an integer leading key); 1 = off. Same one-image A/B pattern as prefetch. MySQL:
-    # Full load only reads the K ranges with one reader session from one snapshot (P2); a
-    # Full load + CDC run from a binlog start point (--cdc-mode) reads them as K parts, each
+    # --reader-shards sets Reader shards per large table (primary-key ranges per large table
+    # with an integer leading key) for this run: 0 = automatic (the loader's default, P1:
+    # from each table's estimate), 1 = off, K = exactly K. Unset: the environment's, else
+    # the default. Same one-image A/B pattern as prefetch. MySQL: automatic and Full load
+    # only read the ranges with one reader session from one snapshot (P2); a Full load + CDC
+    # run from a binlog start point (--cdc-mode) reads an explicit K >= 2 as K parts, each
     # from its own snapshot.
-    if getattr(args, "reader_shards", 0):
+    if getattr(args, "reader_shards", None) is not None:
         os.environ["DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS"] = str(args.reader_shards)
     # --range-in-flight R / --in-flight-budget B: the batches in flight per key range and
     # per run (P3) -- the loader's measurement seams, so one image measures every arm of
@@ -1052,8 +1074,9 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             "reader_shards": getattr(c, "reader_shards", None),
             # P3, from the workers' counters (None: no counters): the key ranges its units
             # read and the INSERT batches they could keep in flight at most, summed over
-            # its units.
+            # its units, and (P1) how many units read it.
             "ranges": stats.get("ranges") if stats else None,
+            "units": stats.get("units") if stats else None,
             "in_flight_cap": stats.get("in_flight_cap") if stats else None,
             # Rows over the table's own data pass only (no index submission, no COUNT).
             "load_rows_per_sec": round(c.rows_loaded / window, 1) if window else None,
@@ -1105,7 +1128,8 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
         "table_parallelism": args.table_parallelism,
         "batch_parallelism": args.batch_parallelism,
         "batch_rows": int(cfg("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "2000")),
-        "reader_shards": int(cfg("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")),
+        # P1: "auto" (0, the loader's default) or the number the loader read.
+        "reader_shards": _reader_shards_setting(),
         # P3: the INSERT batches in flight the loader allowed per key range and per run
         # (its effective values; batch_parallelism above is the per-unit ceiling).
         "in_flight": _in_flight_caps(),
@@ -1485,12 +1509,14 @@ def main() -> int:
     fl.add_argument("--no-prefetch", action="store_true",
                     help="disable the read-ahead prefetch queue (measure the "
                          "pre-improvement baseline path); default keeps it ON")
-    fl.add_argument("--reader-shards", type=int, default=0,
-                    help="reader range sharding: primary-key ranges per large table "
-                         "with an integer leading key (0/1 = off = one range). MySQL: "
-                         "Full load only reads the ranges with one reader session from "
-                         "one snapshot; --cdc-mode with a value >= 2 reads them as parts "
-                         "from separate snapshots")
+    fl.add_argument("--reader-shards", type=int, default=None, metavar="N",
+                    help="Reader shards per large table for this run: 0 = automatic (the "
+                         "loader's default: from each table's row estimate), 1 = off (one "
+                         "range), 2-32 = exactly N primary-key ranges per large table with "
+                         "an integer leading key; unset: the environment's, else automatic. "
+                         "MySQL: automatic and Full load only read the ranges with one "
+                         "reader session from one snapshot; --cdc-mode with an explicit "
+                         "value >= 2 reads them as parts from separate snapshots")
     fl.add_argument("--range-in-flight", type=int, default=None, metavar="N",
                     help="INSERT batches in flight at most per key range of a table "
                          "(default: the loader's 4; still at most --batch-parallelism "

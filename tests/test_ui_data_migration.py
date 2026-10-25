@@ -13614,23 +13614,69 @@ def test_the_multiprocess_sharding_rule_is_asserted_by_behaviour() -> None:
     )
 
 
-def test_the_shard_count_comes_from_the_clamped_reader_shard_budget() -> None:
-    # The other half of the old guard, kept: the shard count must come from
-    # full_load_reader_shards clamped by the source-connection ceiling, NOT the pool
-    # budget (which ignored the off-switch and the ceiling).
-    import inspect
+def test_the_shard_count_is_the_explicit_reader_shards_unclamped(monkeypatch) -> None:
+    # P1 (was a source-text check that the count came from Reader shards clamped by
+    # `_MAX_SOURCE_READERS // Tables in parallel`): on the process path an explicit Reader
+    # shards is the number of ranges planned at any Tables in parallel -- each running unit
+    # holds one source connection, so the pool bounds the source readers -- and 1 (off)
+    # plans nothing. Behaviour, on the inline process pool.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from tests.test_full_load_overlay import _InlineExecutor
+    from tests.test_g137_mysql_reader_shards import (
+        _Handle, _inputs as _shard_inputs, _table as _events_table, _wm,
+    )
 
-    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+    asked: list = []
+    seen: list = []
 
-    src = inspect.getsource(_engine._migrate_tables_in_parallel)
-    process_path = src[src.index("# Unified process-parallel path"):]
-    assert "effective_reader_shards" in process_path
-    assert "_MAX_SOURCE_READERS // tp" in process_path
-    # The old unsafe allocation must be gone from the CODE (the word may survive only in a
-    # comment explaining why): no assignment or arithmetic on remaining_slots.
-    assert "remaining_slots =" not in process_path
-    assert "remaining_slots //" not in process_path
-    assert "table_parallelism - non_shardable_count" not in process_path
+    class _Planner:
+        """The planning read: K equal ranges of [0, 1000), every call recorded."""
+
+        def plan_pk_shard_ranges(self, conn, table, shards, *, min_rows=0):
+            asked.append((table.name, shards, min_rows))
+            bounds = [None] + [i * 1000 // shards for i in range(1, shards)] + [None]
+            return list(zip(bounds, bounds[1:]))
+
+    def _unit(args):
+        seen.append(args)
+        return engine._TableWorkerResult(
+            table_name=args.table.name, status="DONE",
+            shard_index=getattr(args, "shard_index", -1),
+        )
+
+    monkeypatch.setattr(engine, "ProcessPoolExecutor", _InlineExecutor)
+    monkeypatch.setattr(engine, "_migrate_shard_in_process", _unit)
+    monkeypatch.setattr(engine, "_migrate_one_table_in_process", _unit)
+    monkeypatch.setattr(engine, "_PROCESS_LAUNCH_STAGGER_SECONDS", 0)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "16")
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS", "1000")
+
+    def _run(reader_shards: str):
+        monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", reader_shards)
+        asked.clear()
+        seen.clear()
+        table = _events_table()
+        migrator = BatchedTableMigrator(
+            _shard_inputs([table]), exporter=_Planner(), watermark_capturer=object(),
+            importer_factory=lambda _i: object(), table_recreator=lambda t: [],
+            target_counter=lambda t: None, target_pk_reader=lambda t: list(t.primary_key),
+            target_generated_reader=lambda t: set(),
+            target_unique_keys_reader=lambda t: [list(t.primary_key)],
+        )
+        engine._migrate_tables_in_parallel(
+            _Handle([table.name]), "j", [table], migrator, ErrorLogStore(),
+            watermark=_wm(), fresh_watermark=True,
+        )
+        return list(asked), list(seen)
+
+    # Tables in parallel 16 x Reader shards 8: eight ranges (the clamp made it 32 // 16 = 2),
+    # here a MySQL Full load + CDC table from a binlog start point: eight parts.
+    planned, units = _run("8")
+    assert planned == [("app.events", 8, 1000)]
+    assert [(u.shard_index, u.shard_count) for u in units] == [(i, 8) for i in range(8)]
+    # Reader shards 1: no planning read, one whole-table unit.
+    planned, units = _run("1")
+    assert planned == [] and len(units) == 1 and units[0].read_ranges == ()
 
 
 @pytest.mark.parametrize("third_shard", ["DONE", "FAILED", "STOPPED"])

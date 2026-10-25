@@ -116,8 +116,8 @@ def test_load_config_full_load_parallelism_defaults() -> None:
     assert config.full_load_table_parallelism == 4
     assert config.full_load_batch_parallelism == 8
     assert config.full_load_batch_rows == 2000
-    # Reader sharding is OFF by default (one reader, previous behavior).
-    assert config.full_load_reader_shards == 1
+    # Reader sharding is AUTOMATIC by default (P1: 0 -- a table is split by its estimate).
+    assert config.full_load_reader_shards == 0
     assert config.full_load_shard_min_rows == 1_000_000
     # The source-load governor is OFF by default (0 -> no throttle, zero overhead).
     assert config.full_load_max_source_threads_running == 0
@@ -144,9 +144,15 @@ def test_load_config_reads_full_load_parallelism() -> None:
 
 
 def test_load_config_reader_shards_rejects_over_cap() -> None:
-    # Bounded at 8 to keep source read concurrency (table_parallelism x shards) sane.
-    with pytest.raises(ValidationError):
-        load_config(env={f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS": "16"})
+    # P1: 0 = automatic, 1 = off, 2-32 = exactly that many ranges (the process pool bounds
+    # the source readers, so the ceiling is the planner's 32, not 8).
+    for good in (0, 1, 16, 32):
+        assert load_config(
+            env={f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS": str(good)}
+        ).full_load_reader_shards == good
+    for bad in ("33", "-1"):
+        with pytest.raises(ValidationError):
+            load_config(env={f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS": bad})
 
 
 def test_load_config_reads_source_load_governor_ceiling() -> None:
@@ -385,7 +391,7 @@ def test_tunable_knobs_bounds_match_appconfig_fields() -> None:
         "full_load_table_parallelism": (1, 16),
         "full_load_batch_parallelism": (1, 32),
         "full_load_batch_rows": (1, 3000),
-        "full_load_reader_shards": (1, 8),
+        "full_load_reader_shards": (0, 32),
         "full_load_max_source_threads_running": (0, 10000),
         "validate_max_workers": (1, 32),
         "cdc_sink_mcu_count": (1, 8),
@@ -406,7 +412,11 @@ def test_reader_shards_is_a_full_load_ui_knob() -> None:
     assert knob is not None, "full_load_reader_shards is missing from TUNABLE_KNOBS (UI)"
     assert knob.group == "Full Load"
     assert knob.env_key == f"{ENV_PREFIX}FULL_LOAD_READER_SHARDS"
-    assert (knob.minimum, knob.maximum) == (1, 8)
+    assert (knob.minimum, knob.maximum) == (0, 32)
+    # P1: its one-line helper says what 0, 1 and 2-32 do.
+    assert knob.description == (
+        "0 = automatic by table size (default), 1 = off, 2-32 = exactly that many key ranges."
+    )
 
 
 def test_tunable_knob_label_is_derived_from_group_and_short_label() -> None:
@@ -535,7 +545,7 @@ def test_current_tuning_values_reflect_defaults(monkeypatch: pytest.MonkeyPatch)
         "full_load_table_parallelism": 4,
         "full_load_batch_parallelism": 8,
         "full_load_batch_rows": 2000,
-        "full_load_reader_shards": 1,
+        "full_load_reader_shards": 0,
         "full_load_max_source_threads_running": 0,
         "validate_max_workers": 4,
         "cdc_sink_mcu_count": 4,

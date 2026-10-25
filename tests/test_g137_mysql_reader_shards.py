@@ -563,11 +563,16 @@ def _composite():
 
 
 @pytest.mark.parametrize("source", [SourceType.MYSQL, SourceType.POSTGRES])
-def test_a_changed_key_append_table_splits_only_on_the_applied_live_key(rig, source) -> None:
+def test_a_changed_key_append_table_splits_only_on_the_applied_live_key(
+        rig, source, monkeypatch) -> None:
     table = _table(extra=[ColumnDef(name="tenant", mysql_type="int", nullable=False)])
+    # P1: a PostgreSQL table gets as many shards as its share of the run's estimated rows
+    # (here all of it) of Tables in parallel: four, one range each.
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "4")
     same = rig([table], source=source, conversions={EVENTS: _composite()},
                live_pk=lambda t: ["tenant", "id"],
-               live_unique=lambda t: [["tenant", "id"], ["id"]])
+               live_unique=lambda t: [["tenant", "id"], ["id"]],
+               watermark=_wm(counts={EVENTS: 5000}))
     assert len(same.shards) == 4 and same.pk_reads == [EVENTS]
     rig.reset()
     # A shard keys its load on the applied key and skips migrate_table's checks, so the
@@ -582,9 +587,14 @@ def test_a_changed_key_append_table_splits_only_on_the_applied_live_key(rig, sou
     _one_session(unread)
 
 
-def test_postgresql_splits_in_any_run_on_the_shared_snapshot_with_no_unique_guard(rig) -> None:
+def test_postgresql_splits_in_any_run_on_the_shared_snapshot_with_no_unique_guard(
+        rig, monkeypatch) -> None:
+    # P1: as many shards as the table's share of the run's estimated rows (all of it) of
+    # Tables in parallel (4): one range each, as before.
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "4")
     for cdc in (True, False):
-        r = rig([_table()], cdc=cdc, source=SourceType.POSTGRES, watermark=_wm(binlog=False),
+        r = rig([_table()], cdc=cdc, source=SourceType.POSTGRES,
+                watermark=_wm(binlog=False, counts={EVENTS: 5000}),
                 replace=[EVENTS], conversions={EVENTS: _conv(indexes=[_UQ_EMAIL])})
         assert len(r.shards) == 4 and {a.shared_snapshot_id for a in r.shards} == {"snap-1"}
         assert _split_lines(r) == [(EVENTS, engine._SPLIT_SHARED_SNAPSHOT.format(k=4))]
@@ -718,7 +728,7 @@ def test_a_recreate_that_aborts_the_run_clears_only_the_tables_it_recreated(rig)
     assert {c.chunk_id: c.reader_shards for c in handle.job.chunks} == {EVENTS: None, other: 4}
 
 
-def test_a_split_whose_parts_wrote_no_row_is_not_recorded(rig) -> None:
+def test_a_split_whose_parts_wrote_no_row_is_not_recorded(rig, monkeypatch) -> None:
     # FAILS WITHOUT THE FIX: the plan was recorded before any part ran, so a table no part of
     # which wrote a row was refused with "copied twice or not at all" -- nothing was copied.
     rig.fail_shards.update({0, 1, 2, 3})       # each part failed before its first batch
@@ -743,8 +753,11 @@ def test_a_split_whose_parts_wrote_no_row_is_not_recorded(rig) -> None:
     assert sorted(e for e in some.errors if " FAILED (rows_loaded=" in e) == [
         f"range {i} of 4 FAILED (rows_loaded=0): (no error message)" for i in (1, 2, 3)]
     rig.reset()
-    # PostgreSQL records its shared-snapshot parts the same way.
-    pg = rig([_table()], source=SourceType.POSTGRES, watermark=_wm(binlog=False))
+    # PostgreSQL records its shared-snapshot parts the same way (P1: four shards, its share
+    # of the run's estimated rows at Tables in parallel 4).
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "4")
+    pg = rig([_table()], source=SourceType.POSTGRES,
+             watermark=_wm(binlog=False, counts={EVENTS: 5000}))
     assert pg.parts == {EVENTS: 4}
 
 
@@ -1946,8 +1959,12 @@ def test_the_settings_texts_state_the_g137_rule_and_the_trade_off() -> None:
     fields = AppConfig.model_fields
     shards = " ".join(fields["full_load_reader_shards"].description.split())
     assert "single-integer-PK" not in shards
-    assert "MySQL: Full Load + CDC with a binlog start point only, and only a table whose " \
-           "every unique key on Aurora DSQL includes that leading column" in shards
+    # P1: only an explicit value reads a MySQL table from separate snapshots.
+    assert ("An explicit value of 2 or more reads a table's ranges from separate snapshots "
+            "only in Full Load + CDC with a binlog start point, and only for a table whose "
+            "every unique key on Aurora DSQL includes that leading column") in shards
+    assert ("MySQL: a table's automatic ranges are read by one reader session from one "
+            "snapshot in every run") in shards
     assert "PostgreSQL: any run, the ranges sharing one snapshot" in shards
     assert "rise up to full_load_table_parallelism-fold" in shards
     # P2: outside the separate-snapshot split, a MySQL table's ranges are one session's.
@@ -1968,7 +1985,8 @@ def test_the_settings_texts_state_the_g137_rule_and_the_trade_off() -> None:
     # The reload that lifts the refusals is a Drop & reload, as every refusal says.
     (shards_knob,) = [k for k in TUNABLE_KNOBS if k.field == "full_load_reader_shards"]
     help_text = " ".join(shards_knob.help_text.split())
-    assert "it is reloaded with this set to 1 and Drop & reload" in help_text
+    assert "it is reloaded with this set to 1 (off) or 0 (automatic) and Drop & reload" in (
+        help_text)
     # ...and a CHECKSUM match ends them too -- not an untick (round 4).
     assert "refused until a match in Validation in CHECKSUM mode proves that replay" in (
         help_text)

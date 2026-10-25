@@ -501,6 +501,9 @@ def _command_doubles(mp, monkeypatch, tmp_path):
     # cmd_full_load exports the tunables into os.environ; restore them after the test.
     for key in ("TABLE_PARALLELISM", "BATCH_PARALLELISM"):
         monkeypatch.setenv(f"DSQL_MIGRATOR_FULL_LOAD_{key}", "1")
+    # ... and Reader shards (P1: set for any --reader-shards given, 0 and 1 included).
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "")
+    monkeypatch.delenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS")
     monkeypatch.setattr(mp, "log", lambda line: seen.setdefault("log", []).append(line))
     monkeypatch.setattr(mp, "_configs", lambda schema: (
         SourceConnectionConfig(host="db", database=schema),
@@ -532,7 +535,7 @@ def _command_doubles(mp, monkeypatch, tmp_path):
     report = tmp_path / "report.json"
     args = SimpleNamespace(
         schema="perf", yes=True, tables=None, table_parallelism=4, batch_parallelism=8,
-        batch_rows=0, progress_interval=1.0, no_prefetch=False, reader_shards=0,
+        batch_rows=0, progress_interval=1.0, no_prefetch=False, reader_shards=None,
         composite_leading="", report=str(report), cdc_mode=False, wait_sys_jobs=None,
     )
     return args, seen, report
