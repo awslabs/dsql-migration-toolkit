@@ -774,7 +774,7 @@ def target_error_hint(exc: BaseException) -> Optional[str]:
     if code == "40001" or "40001" in low or "oc001" in low or "concurrency" in low:
         return (
             "Aurora DSQL optimistic-concurrency retries were exhausted for this table. "
-            "Lower full_load_table_parallelism / batch size and re-run — the load is "
+            "Lower Tables in parallel or Batches per table and re-run — the load is "
             "idempotent (INSERT ... ON CONFLICT), so a re-run is safe"
         )
     # XX000 -- Aurora DSQL's temporary "server unavailable" outlasted the retries.

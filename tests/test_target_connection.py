@@ -571,10 +571,11 @@ def test_g22_target_error_hint_explains_server_unavailable() -> None:
         hint = target_error_hint(exc)
         assert hint is not None and "XX000" in hint and "Retry unfinished tables" in hint
         assert "AWS Support" in hint
-    # The 40001 hint is unchanged.
+    # The 40001 hint names the two Settings knobs that set the batches in flight (P3: the
+    # rows per batch do not change how many are in flight).
     assert target_error_hint(_TargetError("x", "40001")) == (
         "Aurora DSQL optimistic-concurrency retries were exhausted for this table. "
-        "Lower full_load_table_parallelism / batch size and re-run — the load is "
+        "Lower Tables in parallel or Batches per table and re-run — the load is "
         "idempotent (INSERT ... ON CONFLICT), so a re-run is safe"
     )
 

@@ -18,6 +18,7 @@ import inspect
 import logging
 import multiprocessing
 import multiprocessing.queues
+import os
 import re
 import threading
 import time as _time
@@ -905,9 +906,9 @@ def _set_table_throttled(job: MigrationJob, table_name: str, paused: bool) -> No
 
 
 # Default number of tables migrated concurrently during Full Load. Operator-tunable
-# via DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM (read at run time below). Combined
-# with each table's internal batch parallelism, this bounds the total concurrent
-# DSQL connections (table_parallelism x batch_parallelism), which must stay within
+# via DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM (read at run time below). Each running
+# table (or part of one) keeps a capped number of INSERT batches in flight, each on its
+# own DSQL connection (P3: _unit_in_flight), so the run's DSQL connections stay within
 # the cluster connection quota.
 FULL_LOAD_TABLE_PARALLELISM = 4
 
@@ -939,6 +940,79 @@ PROGRESS_FLUSH_SECONDS = 30.0
 # so a high table_parallelism x reader_shards can't exhaust the source's
 # max_connections. Reader sharding is clamped down (never up) to honor it.
 _MAX_SOURCE_READERS = 32
+
+# P3: how many INSERT batches a load unit (a table, or one part of a split table) keeps in
+# flight, each on its own Aurora DSQL connection. Measured (Seoul, 2026-10-25): one
+# primary-key-ordered stream into one key range of an Aurora DSQL table takes about 10
+# commits a second whatever is in flight -- more only queues there: CommitLatency 26 ms at
+# about 6 commits/s, 0.7 s with 8 in flight, 3 s with 32, and ComputeDPU four times as high
+# at the same rows/s -- and Tables in parallel 12 x Batches per table 32 (352 in flight)
+# loaded SLOWER, at ten times the commit latency. So a unit keeps at most _RANGE_IN_FLIGHT
+# per key range it reads (and at most Batches per table), and the process pool divides
+# _RUN_IN_FLIGHT_BUDGET among its workers (_in_flight_share): at most that many units run
+# at once, so the run never has more in flight than the budget. Static on purpose: no
+# token to leak when a worker is terminated, nothing for a Stop to wait on.
+_RANGE_IN_FLIGHT = 4
+_RUN_IN_FLIGHT_BUDGET = 128
+
+
+# Measurement seams ONLY, read per call like core.batched_import._prefetch_enabled: an
+# integer >= 1 in DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT (R) or in
+# DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET (B) replaces the constant above, anything else
+# keeps it. They exist so one deployed image can be A/B'd (scripts/measure_performance.py
+# --range-in-flight / --in-flight-budget, or an ECS RunTask env override); they are not
+# settings -- not in config.py, not on the Settings page -- and nothing in the app sets them.
+def _in_flight_seam(name: str, default: int) -> int:
+    """The integer >= 1 in the environment variable ``name``, else ``default``."""
+    raw = os.environ.get(name)
+    try:
+        value = int(str(raw).strip()) if raw is not None else default
+    except ValueError:
+        return default
+    return value if value >= 1 else default
+
+
+def _range_in_flight() -> int:
+    """At most this many INSERT batches in flight per key range a unit reads (P3)."""
+    return _in_flight_seam("DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT", _RANGE_IN_FLIGHT)
+
+
+def _run_in_flight_budget() -> int:
+    """At most this many INSERT batches in flight per run, over every unit (P3)."""
+    return _in_flight_seam("DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET", _RUN_IN_FLIGHT_BUDGET)
+
+
+def _in_flight_share(total_workers: int) -> int:
+    """Each of ``total_workers`` concurrently running units' share of the run's in-flight
+    budget: their caps add up to at most the budget (or to one each, a budget set below
+    the pool size)."""
+    return max(1, _run_in_flight_budget() // max(1, int(total_workers)))
+
+
+def _unit_in_flight(batch_parallelism: int, ranges: int, share: Optional[int]) -> int:
+    """The INSERT batches one load unit keeps in flight at most (P3): Batches per table
+    (``batch_parallelism``, the per-unit ceiling), at most :func:`_range_in_flight` per key
+    range it reads, and at most its ``share`` of the run's budget (``None``: no share, the
+    thread path's one unit at a time). Always at least 1."""
+    return max(
+        1,
+        min(
+            int(batch_parallelism),
+            _range_in_flight() * max(1, int(ranges)),
+            share if share else int(batch_parallelism),
+        ),
+    )
+
+
+def _cap_importer_parallelism(importer: object, n: int) -> None:
+    """Keep at most ``n`` batches of ``importer`` in flight (P3).
+
+    Duck-typed like :func:`_bind_load_stats`: an injected importer without
+    ``cap_parallelism`` (a test double) keeps its own."""
+    cap = getattr(importer, "cap_parallelism", None)
+    if callable(cap):
+        cap(n)
+
 
 # Guards the thread path's ``{table: index DDLs}`` for the run's index pass (P4a): with
 # Tables in parallel above 1 and a migrator double, tables finish on several threads.
@@ -1159,6 +1233,9 @@ class _TableWorkerArgs:
     # True when the parent already DROP+recreated this empty target in the serial
     # pre-pass; the worker then loads without re-running the DDL (no startup storm).
     pre_recreated: bool = False
+    # P3: at most this many INSERT batches in flight for this unit (_unit_in_flight, with
+    # its share of the run's budget). None => the worker sizes it without a share.
+    in_flight: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1268,9 @@ class _ShardWorkerArgs:
     # How many ranges the table was split into (G137): it words a failed range's reason
     # ("range 2 of 4"). None => unknown (the reason names the range alone).
     shard_count: Optional[int] = None
+    # P3: at most this many INSERT batches in flight for this shard (_unit_in_flight, with
+    # its share of the run's budget). None => the worker sizes it without a share.
+    in_flight: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1840,6 +1920,9 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 # P4a: the parent submits the table's secondary indexes after every unit
                 # of the run has returned, so no CREATE INDEX ASYNC runs while a table loads.
                 defer_indexes=True,
+                # P3: the parent sized this unit's batches in flight with its share of the
+                # run's budget.
+                in_flight_cap=args.in_flight,
             )
 
         outcome = _as_load_result(
@@ -2051,6 +2134,13 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 importer._max_quarantine = max(1, int(args.max_quarantine_records))
             except Exception:  # noqa: BLE001 - a double may not carry the field
                 pass
+        # P3: this shard reads one key range, so it keeps at most _range_in_flight batches
+        # in flight and at most its share of the run's budget (sized by the parent).
+        in_flight = args.in_flight or _unit_in_flight(
+            load_config().full_load_batch_parallelism, 1, None
+        )
+        _cap_importer_parallelism(importer, in_flight)
+        stats.set_unit_shape(ranges=1, in_flight_cap=in_flight)
 
         # First attempt uses the planned mode; any retry downgrades to SKIP_EXISTING
         # so re-reading a partially-written shard stays duplicate-free. ``_live_rows``
@@ -4246,6 +4336,12 @@ def _migrate_tables_in_parallel(
                     )
 
         total_workers = min(table_parallelism, len(work_units))
+        # P3: the INSERT batches each unit keeps in flight. At most total_workers units run
+        # at once, each with at most its share of the run's budget, so the run never has
+        # more than the budget in flight. Every unit reads one key range here.
+        unit_in_flight = _unit_in_flight(
+            cfg.full_load_batch_parallelism, 1, _in_flight_share(total_workers)
+        )
         # R2: the order the pool starts the units in -- the largest first (a split table by
         # its share per shard), any table without a row estimate before them
         # (_largest_first). A PostgreSQL table with no estimate is sized from its files here
@@ -4421,6 +4517,7 @@ def _migrate_tables_in_parallel(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pre_recreated=table.name in recreated_names,
+                            in_flight=unit_in_flight,
                         )
                         f = pool.submit(_migrate_one_table_in_process, args)
                         futures[f] = ("table", table.name)
@@ -4445,6 +4542,7 @@ def _migrate_tables_in_parallel(
                                 1, MAX_QUARANTINE_RECORDS // max(1, _table_shards)
                             ),
                             shard_count=_table_shards,
+                            in_flight=unit_in_flight,
                         )
                         f = pool.submit(_migrate_shard_in_process, shard_args)
                         futures[f] = ("shard", table.name, shard_idx)
@@ -8255,6 +8353,10 @@ class BatchedTableMigrator:
         # TableLoadResult.deferred_index_ddls, instead of submitting them after this table's
         # rows. False (a library caller) keeps the load's own post-load index pass.
         defer_indexes: bool = False,
+        # P3: at most this many INSERT batches in flight (a process worker's unit, sized by
+        # the parent with its share of the run's budget). None -> _unit_in_flight over the
+        # row streams this call reads, with no share (one unit at a time).
+        in_flight_cap: Optional[int] = None,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -8584,6 +8686,13 @@ class BatchedTableMigrator:
         importer = self._importer_factory(self._inputs)
         stats = load_stats if load_stats is not None else LoadStats()
         _bind_load_stats(importer, stats)
+        # P3: at most 4 batches in flight per row stream this call reads (a key range of the
+        # table) and at most Batches per table -- or what the parent sized for this unit.
+        in_flight = in_flight_cap or _unit_in_flight(
+            cfg.full_load_batch_parallelism, len(shard_ranges), None
+        )
+        _cap_importer_parallelism(importer, in_flight)
+        stats.set_unit_shape(ranges=len(shard_ranges), in_flight_cap=in_flight)
         try:
             result = importer.import_rows(
                 rows,

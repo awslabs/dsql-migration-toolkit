@@ -309,11 +309,13 @@ class AppConfig(BaseModel):
         ge=1,
         le=16,
         description=(
-            "Full Load (Step 3) table-level parallelism: how many tables load "
-            "concurrently. The total concurrent DSQL connections is roughly "
-            "full_load_table_parallelism x full_load_batch_parallelism, so raise "
-            "both together with care and keep the product within DSQL's per-cluster "
-            "connection quota. Bounded (<=16). Config key: "
+            "Full Load (Step 3) table-level parallelism: how many tables, or parts of a "
+            "large table, load concurrently. Each INSERT batch in flight holds one "
+            "pooled DSQL connection, and the tool caps them: at most 4 per key range of "
+            "a table, at most full_load_batch_parallelism per table or part, at most 128 "
+            "per run. A run's DSQL connections are therefore at most its batches in "
+            "flight (<= 128) plus one per running table or part (its short catalog reads "
+            "and row count). Bounded (<=16). Config key: "
             "DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM."
         ),
     )
@@ -322,13 +324,15 @@ class AppConfig(BaseModel):
         ge=1,
         le=32,
         description=(
-            "Full Load per-table batch parallelism: how many batched "
-            "INSERT ... ON CONFLICT statements are in flight at once for a single "
-            "table, each on its own pooled DSQL connection. Higher values raise "
-            "throughput but also the optimistic-concurrency (40001) collision rate "
-            "on hot key ranges; keep table x batch parallelism within the cluster "
-            "connection quota. Bounded (<=32). Config key: "
-            "DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM."
+            "Full Load per-table batch parallelism: at most this many batched "
+            "INSERT ... ON CONFLICT statements in flight per table, or part of a split "
+            "table (each key range keeps at most 4), each on its own pooled DSQL "
+            "connection. A key range of a "
+            "DSQL table takes about 10 commits a second, so more batches in flight only "
+            "wait there (higher commit latency and cost); the run keeps at most 128 in "
+            "flight over all its tables. More in flight also raises the "
+            "optimistic-concurrency (40001) collision rate on hot key ranges. Bounded "
+            "(<=32). Config key: DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM."
         ),
     )
     full_load_batch_rows: int = Field(
@@ -656,14 +660,15 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "FULL_LOAD_TABLE_PARALLELISM",
         "Full Load",
         "Tables in parallel",
-        "How many source tables are loaded at the same time.",
+        "How many source tables, or parts of a large table, are loaded at the same time.",
     ),
     TunableKnob(
         "full_load_batch_parallelism",
         "FULL_LOAD_BATCH_PARALLELISM",
         "Full Load",
         "Batches per table",
-        "Concurrent row batches loaded per table.",
+        "Row batches in flight: at most this many per table (each key range keeps at most "
+        "4), each on its own Aurora DSQL connection.",
     ),
     TunableKnob(
         "full_load_batch_rows",

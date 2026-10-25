@@ -63,6 +63,11 @@ _CODE_COUNTS = ("retries", "index_retries", "attempts_per_statement")
 _HISTOGRAMS = ("batch_ms", "execute_ms")
 # Present only for a unit that measured its own process (``process_clock=True``).
 _PROCESS_SUMS = ("cpu_s", "wall_s")
+# A unit's shape (P3), set -- never added up -- by the unit: how many primary-key ranges
+# it reads, and at most how many INSERT batches it keeps in flight. A merge sums them over
+# its units (a table: its ranges and its total cap; a run: the totals over every unit that
+# ran, not only those running at once); a window keeps the current values.
+_GAUGES = ("ranges", "in_flight_cap")
 
 
 def retry_code(exc: BaseException) -> str:
@@ -238,6 +243,7 @@ class LoadStats:
         self._lock = threading.Lock()
         self._counts = {name: 0 for name in _COUNTERS}
         self._counts["units"] = max(0, int(units))
+        self._gauges = {name: 0 for name in _GAUGES}
         self._seconds = {name: 0.0 for name in _SECONDS}
         self._codes: dict[str, dict] = {name: {} for name in _CODE_COUNTS}
         self._histograms = {name: _new_histogram() for name in _HISTOGRAMS}
@@ -318,6 +324,16 @@ class LoadStats:
         with self._lock:
             self._counts["connections_kept"] += 1
 
+    # -- shape ----------------------------------------------------------------------
+
+    def set_unit_shape(self, *, ranges: int, in_flight_cap: int) -> None:
+        """This unit reads ``ranges`` primary-key ranges and keeps at most ``in_flight_cap``
+        INSERT batches in flight (P3). Set, never added: a re-read attempt of the unit sets
+        its shape again, and a merge sums the units' shapes."""
+        with self._lock:
+            self._gauges["ranges"] = max(0, int(ranges))
+            self._gauges["in_flight_cap"] = max(0, int(in_flight_cap))
+
     # -- read-ahead queue ---------------------------------------------------------
 
     def add_reader_blocked(self, seconds: float) -> None:
@@ -353,6 +369,7 @@ class LoadStats:
         """A plain, picklable copy of every count so far (cumulative)."""
         with self._lock:
             out: dict[str, Any] = dict(self._counts)
+            out.update(self._gauges)
             out.update(self._seconds)
             for name in _CODE_COUNTS:
                 out[name] = dict(self._codes[name])
@@ -381,18 +398,21 @@ class LoadStats:
 
 def merge_load_stats(snapshots: Iterable[Optional[Mapping]]) -> dict:
     """One snapshot for several units: counts, seconds and buckets add up, the load
-    window spans them all, and the peak RSS is the largest. ``{}`` for none."""
+    window spans them all, and the peak RSS is the largest. The units' shapes (their
+    ranges and in-flight caps) add up too; a snapshot from before they existed adds 0.
+    ``{}`` for none."""
     merged: dict[str, Any] = {}
     for snapshot in snapshots:
         if not snapshot:
             continue
         if not merged:
             merged = {name: 0 for name in _COUNTERS}
+            merged.update({name: 0 for name in _GAUGES})
             merged.update({name: 0.0 for name in _SECONDS})
             merged.update({name: {} for name in _CODE_COUNTS})
             merged.update({name: _new_histogram() for name in _HISTOGRAMS})
             merged.update(load_started_at=None, load_finished_at=None)
-        for name in _COUNTERS:
+        for name in _COUNTERS + _GAUGES:
             merged[name] += int(snapshot.get(name) or 0)
         for name in _SECONDS:
             merged[name] += float(snapshot.get(name) or 0.0)
@@ -424,8 +444,9 @@ def merge_load_stats(snapshots: Iterable[Optional[Mapping]]) -> dict:
 def diff_load_stats(current: Optional[Mapping], previous: Optional[Mapping]) -> dict:
     """What happened between two cumulative snapshots (a progress window).
 
-    Counts, seconds and buckets are subtracted (never below zero); the load window and
-    the peak RSS are ``current``'s, since neither can be taken apart.
+    Counts, seconds and buckets are subtracted (never below zero); the load window, the
+    peak RSS and the units' shapes (ranges, in-flight caps) are ``current``'s, since none
+    of them can be taken apart.
     """
     current = merge_load_stats([current])
     if not current:
@@ -484,6 +505,10 @@ def summarize_load_stats(snapshot: Optional[Mapping]) -> dict:
     started, finished = stats["load_started_at"], stats["load_finished_at"]
     out: dict[str, Any] = {
         "units": stats["units"],
+        # The units' shapes, summed (P3): the primary-key ranges they read and the INSERT
+        # batches they could keep in flight at most.
+        "ranges": stats["ranges"],
+        "in_flight_cap": stats["in_flight_cap"],
         "batches": stats["batches"],
         "batches_failed": stats["batches_failed"],
         "statements": statements,

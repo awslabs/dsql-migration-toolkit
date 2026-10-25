@@ -1648,17 +1648,28 @@ def _render_tuning_group_controls(group: str) -> None:
         "text-xs text-gray-500 mb-2"
     )
 
-    # Full Load's two parallelism knobs MULTIPLY into the connection count, which is the
-    # one way to misconfigure this panel into a failing run. Scoped to that group: it is
-    # meaningless beside a single Validation or CDC field.
+    # Full Load's parallelism knobs decide how many INSERT batches are in flight, each on
+    # its own Aurora DSQL connection, and the tool caps them (P3) -- the numbers a reader of
+    # the two knobs would otherwise multiply. Scoped to that group: it is meaningless beside
+    # a single Validation or CDC field.
     if group == "Full Load":
+        from dsql_migrator.ui.data_migration._full_load_engine import (
+            _range_in_flight,
+            _run_in_flight_budget,
+        )
+
         render_notice(
             ui,
             tone="info",
-            header="Connections ≈ tables in parallel × batches per table",
+            header=(
+                f"In flight: at most {_range_in_flight()} batches per key range, "
+                f"Batches per table per table, {_run_in_flight_budget()} per run"
+            ),
             body=(
-                "Raise these together carefully: the product is how many DSQL "
-                "connections a run opens at once."
+                "Each batch in flight holds one Aurora DSQL connection. A key range of an "
+                "Aurora DSQL table takes about 10 commits a second, so more batches only "
+                "wait there (higher commit latency and cost); the tool caps them. Tables "
+                "in parallel is how many tables, or parts of a large table, load at once."
             ),
         )
 

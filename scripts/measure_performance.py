@@ -36,7 +36,10 @@ Two subcommands:
               (start point captured and fenced as the product does, no CDC stack
               needed) so a MySQL table can be read in --reader-shards ranges;
               --inventory-order starts the tables in inventory order instead of the
-              largest first, the other arm of the start-order A/B.
+              largest first, the other arm of the start-order A/B; --range-in-flight /
+              --in-flight-budget set the INSERT batches in flight at most per key
+              range (4) and per run (128) for the in-flight A/B, and the report says
+              which caps applied and each table's.
 
   cdc-lag     Measure END-TO-END CDC replication lag (source commit -> visible on
               the DSQL target) under a SUSTAINED trickle and under BURSTS, reporting
@@ -68,6 +71,8 @@ Usage (from repo root):
         --progress-interval 60 --cdc-mode --reader-shards 4
     # Report the load only, without waiting for the index builds it submitted:
     .venv/bin/python scripts/measure_performance.py full-load --yes --wait-index-builds 0
+    # The in-flight A/B: 8 INSERT batches per key range instead of the loader's 4:
+    .venv/bin/python scripts/measure_performance.py full-load --yes --range-in-flight 8
 
     # CDC lag (CDC must already stream cdc_perf.pulse):
     .venv/bin/python scripts/measure_performance.py cdc-lag --setup        # create table
@@ -754,6 +759,22 @@ def _start_order(inventory: bool):
         engine._largest_first = largest_first
 
 
+# --range-in-flight / --in-flight-budget: the loader's measurement seams they set (P3).
+_IN_FLIGHT_SEAMS = (
+    ("range_in_flight", "DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT"),
+    ("in_flight_budget", "DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET"),
+)
+
+
+def _in_flight_caps() -> dict:
+    """The INSERT batches the loader keeps in flight at most per key range and per run
+    (P3), as it reads them now: the product's 4 and 128 unless --range-in-flight /
+    --in-flight-budget set its seams to an integer >= 1."""
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    return {"per_range": engine._range_in_flight(), "run_budget": engine._run_in_flight_budget()}
+
+
 def cmd_full_load(args) -> int:
     from _e2e_tables import tables_for
 
@@ -782,6 +803,12 @@ def cmd_full_load(args) -> int:
     # table is split only in a Full load + CDC run from a binlog start point (--cdc-mode).
     if getattr(args, "reader_shards", 0):
         os.environ["DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS"] = str(args.reader_shards)
+    # --range-in-flight R / --in-flight-budget B: the batches in flight per key range and
+    # per run (P3) -- the loader's measurement seams, so one image measures every arm of
+    # the R A/B. Unset: the product's (4 and 128).
+    for flag, key in _IN_FLIGHT_SEAMS:
+        if getattr(args, flag, None) is not None:
+            os.environ[key] = str(getattr(args, flag))
 
     from dsql_migrator.core.converter import (
         PrimaryKeyStrategy, SchemaConvertOptions, SchemaConverter,
@@ -916,8 +943,10 @@ def cmd_full_load(args) -> int:
                 handle, tables, migrator=migrator, error_log=error_log, load_stats=board
             )
 
+    caps = _in_flight_caps()
     log(f"Full Load '{schema}' ({len(tables)} tables) at "
-        f"tp={args.table_parallelism} bp={args.batch_parallelism}"
+        f"tp={args.table_parallelism} bp={args.batch_parallelism} (in flight <= "
+        f"{caps['per_range']} per key range, {caps['run_budget']} per run)"
         f"{' as Full load + CDC' if cdc_mode else ''}"
         f"{' in inventory order' if inventory_order else ''} ...")
     started_at = time.time()
@@ -1014,6 +1043,11 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             "rows_per_sec": round(rps, 1) if rps else None,
             # How many primary-key ranges the table was read in (None: one reader).
             "reader_shards": getattr(c, "reader_shards", None),
+            # P3, from the workers' counters (None: no counters): the key ranges its units
+            # read and the INSERT batches they could keep in flight at most, summed over
+            # its units.
+            "ranges": stats.get("ranges") if stats else None,
+            "in_flight_cap": stats.get("in_flight_cap") if stats else None,
             # Rows over the table's own data pass only (no index submission, no COUNT).
             "load_rows_per_sec": round(c.rows_loaded / window, 1) if window else None,
             "load_stats": stats or None,
@@ -1065,6 +1099,9 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
         "batch_parallelism": args.batch_parallelism,
         "batch_rows": int(cfg("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "2000")),
         "reader_shards": int(cfg("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "1")),
+        # P3: the INSERT batches in flight the loader allowed per key range and per run
+        # (its effective values; batch_parallelism above is the per-unit ceiling).
+        "in_flight": _in_flight_caps(),
         # The order the pool started the tables in: the largest first (R2), or the
         # inventory's with --inventory-order. Each table's start is its load_started_at.
         "start_order": (
@@ -1187,6 +1224,11 @@ def _log_full_load_summary(report: dict) -> None:
         f"{occ['oc000']}, OC001 {occ['oc001']}, 40001 unparsed {occ['oc_unparsed']}; "
         f"{occ['pct_batches_with_retry']}% retried, {occ['retries_exhausted']} exhausted "
         f"at tp={report['table_parallelism']} bp={report['batch_parallelism']}")
+    ifl = report.get("in_flight") or {}
+    if ifl:
+        log(f"in flight: at most {ifl.get('per_range')} per key range, "
+            f"{report['batch_parallelism']} per table or part, {ifl.get('run_budget')} "
+            "per run")
     if run:
         cores = run.get("worker_cores")
         log(f"connections: {run.get('connects')} opened, {run.get('reconnects')} reconnects, "
@@ -1205,6 +1247,8 @@ def _log_full_load_summary(report: dict) -> None:
             extra = (f" | load {s.get('load_s')}s index {s.get('index_s')}s count "
                      f"{s.get('count_s')}s | batch p50 {(s.get('batch_ms') or {}).get('p50')}ms"
                      f" | retries {s.get('retries_total')}"
+                     + (f" | in flight <= {s.get('in_flight_cap')} over {s.get('ranges')} "
+                        "range(s)" if s.get("in_flight_cap") else "")
                      + (f" | {s.get('worker_cores')} cores" if s.get("worker_cores") is not None
                         else ""))
         log(f"  {r['table']:<28} {str(r['status']):<8} rows={r['rows_loaded']:<8} "
@@ -1437,6 +1481,13 @@ def main() -> int:
                     help="reader range sharding: concurrent readers per large "
                          "single-int-PK table (0/1 = off = one reader; >1 shards). "
                          "A MySQL table is split only with --cdc-mode")
+    fl.add_argument("--range-in-flight", type=int, default=None, metavar="N",
+                    help="INSERT batches in flight at most per key range of a table "
+                         "(default: the loader's 4; still at most --batch-parallelism "
+                         "per table or part): the R arm of the in-flight A/B")
+    fl.add_argument("--in-flight-budget", type=int, default=None, metavar="N",
+                    help="INSERT batches in flight at most per run, divided among the "
+                         "worker processes (default: the loader's 128)")
     fl.add_argument("--cdc-mode", action="store_true",
                     help="run the load as a Full load + CDC run: the start point "
                          "(binlog position / LSN) is captured -- and on MySQL fenced "

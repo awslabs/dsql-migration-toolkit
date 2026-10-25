@@ -1080,18 +1080,26 @@ def test_cdc_tab_shows_the_mcu_dropdown_and_its_own_timing() -> None:
     assert help_text.strip() != next(
         t for t in ui.texts if "CPU-bound" in t and not t.startswith("[tooltip]")
     ).strip()
-    # The connection-product notice belongs to Full Load only.
-    assert "Connections" not in blob
+    # The in-flight notice belongs to Full Load only.
+    assert "batches per key range" not in blob and "Connections" not in blob
 
 
-def test_full_load_tab_shows_ranges_and_the_connection_product_warning() -> None:
+def test_full_load_tab_shows_ranges_and_the_in_flight_notice(monkeypatch) -> None:
+    # The notice shows the caps the loader applies; its measurement seams stay unset here.
+    for seam in ("RANGE_IN_FLIGHT", "IN_FLIGHT_BUDGET"):
+        monkeypatch.delenv(f"DSQL_MIGRATOR_FULL_LOAD_{seam}", raising=False)
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
     blob = " ".join(ui.texts)
 
     assert "Changes apply to the next run." in blob
-    # The one way to misconfigure this panel into a failing run is called out here.
-    assert "Connections ≈ tables in parallel × batches per table" in blob
+    # How many batches (and so Aurora DSQL connections) a run keeps in flight: capped by the
+    # tool (P3), no longer the product of the two parallelism knobs.
+    assert ("In flight: at most 4 batches per key range, Batches per table per table, "
+            "128 per run") in blob
+    assert "Each batch in flight holds one Aurora DSQL connection." in blob
+    assert "Tables in parallel is how many tables, or parts of a large table" in blob
+    assert "Connections ≈" not in blob
     # Range-valued knobs stay numeric inputs, with their bounds shown as constraints.
     # Five Full Load knobs: tables-in-parallel, batches-per-table, rows-per-batch,
     # reader-shards-per-large-table, and the opt-in source-load throttle (all
@@ -1116,7 +1124,7 @@ def test_validation_tab_is_rendered_without_the_full_load_notice() -> None:
     assert "Tables in parallel" in blob
     assert len(ui.numbers) == 1
     # Scoped notice: meaningless beside a single field, so it must not appear.
-    assert "Connections" not in blob
+    assert "batches per key range" not in blob and "Connections" not in blob
 
 
 def test_activity_log_tab_uses_the_same_form_field_rows() -> None:
