@@ -91,13 +91,18 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     full_load_latest_messages_for,
 )
 from dsql_migrator.ui.data_migration._cdc_ui import cdc_streaming_started
+from dsql_migrator.ui.data_migration._index_builds import (
+    index_builds_pending,
+    render_index_builds,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 # How often the live Full Load progress region polls the background job (seconds).
 _POLL_INTERVAL_SECONDS = 1.5
 # How often the foreign-key card re-renders while Aurora DSQL is still validating a key
-# (G142); the background watch itself polls with backoff and refreshes on a change.
+# (G142) -- or still building a secondary index the run submitted (P4b); the background
+# watch itself polls with backoff and refreshes on a change.
 _FK_VALIDATION_POLL_SECONDS = 30.0
 
 # G17: why a Full load + CDC table selected after its Full Load is forced to Drop & reload
@@ -740,6 +745,9 @@ def _render_full_load_step(
     validate_foreign_keys_again: Optional[Callable[[Sequence], None]] = None,
     foreign_keys_revalidating: Optional[Callable[[], bool]] = None,
     watch_foreign_keys: Optional[Callable[[], None]] = None,
+    # P4b: start the background read of Aurora DSQL's builds of the secondary indexes the
+    # shown Full Load job submitted, when one is due (job -> None). None: no watch.
+    watch_index_builds: Optional[Callable[[MigrationJob], None]] = None,
     # The column-exclusion overlay (see make_overlay_dialog_providers): a BLOCKING ledger
     # read of the connected target, and a cheap view of the overlay / excluded sets and the
     # applied DDL. None (library callers, test doubles) keeps the previous dialog.
@@ -1812,6 +1820,18 @@ def _render_full_load_step(
             )
             if not _fk_view.settled and watch_foreign_keys is not None:
                 watch_foreign_keys()
+        # P4b: Aurora DSQL still builds secondary indexes the run submitted (the notice is in
+        # the progress section above): a background watch reads them by job id while this
+        # page is open -- and reads a failed one again now and then (created again by hand,
+        # it is built once valid). Offered on every render of a finished load that records
+        # builds; the watch's own due check decides (single flight per job, no I/O here).
+        _builds_pending = not running and index_builds_pending(record)
+        if (
+            not running
+            and getattr(record, "index_builds", None) is not None
+            and watch_index_builds is not None
+        ):
+            watch_index_builds(record)
         # The FK pass is its OWN job and runs entirely AFTER the load is terminal, so gating
         # the poll on the load alone left nothing to re-arm it: the card could not advance
         # its counter and could not replace the spinner with the result. Poll while EITHER is
@@ -1822,9 +1842,10 @@ def _render_full_load_step(
             # once=True avoids the "parent slot deleted" crash a repeating timer
             # hits when its slot is rebuilt.
             ui.timer(_POLL_INTERVAL_SECONDS, _poll_live, once=True)
-        elif _fk_view is not None and not _fk_view.settled:
-            # A key is still being validated: re-render this region now and then, so a watch
-            # that ran out of time is started again and the result shows when it lands.
+        elif (_fk_view is not None and not _fk_view.settled) or _builds_pending:
+            # A key is still being validated, or an index still being built: re-render this
+            # region now and then, so a watch that ran out of time is started again and the
+            # result shows when it lands.
             ui.timer(_FK_VALIDATION_POLL_SECONDS, _live_detail.refresh, once=True)
 
     def _poll_scoped(current) -> bool:
@@ -3577,6 +3598,10 @@ def _render_full_load_progress(
                     message=row.error_message,
                     tone="info",
                 )
+    # P4b: Aurora DSQL's builds of the indexes the run DID submit (above: the ones it could
+    # not), read from the persisted record the step's background watch keeps current.
+    if terminal and getattr(job, "index_builds", None) is not None:
+        render_index_builds(ui, job)
 
     # Prefer the FULL per-row records: one entry per dropped row. Falls back to the
     # per-table view when the caller passed none (an older call site, or a restored

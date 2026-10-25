@@ -2315,6 +2315,8 @@ def build_data_migration_screen(
                 )
                 watermark = current.watermark
                 prior_recreated = list(getattr(current, "recreated_tables", None) or ())
+                # P4b: the earlier runs' index builds stay watched on the retry's job.
+                prior_index_builds = getattr(current, "index_builds", None)
                 accept_quarantined = migration_state.accept_quarantined_rows
                 # The previous run's failure no longer describes this lineage, exactly as
                 # the first Start clears it: left in place, a reload that fixed the gap
@@ -2357,6 +2359,7 @@ def build_data_migration_screen(
                             else None
                         ),
                         index_only=sorted(_index_only),
+                        prior_index_builds=prior_index_builds,
                     )
 
                 reset_stale_manual_start_point(
@@ -2676,6 +2679,22 @@ def build_data_migration_screen(
                 start_fk_validation_watch(
                     migration_state, job_manager, connection_factory=_fk_target_connect(),
                     fk_defs=_fk_defs, category=ActivityCategory.FULL_LOAD, refresh=refresh,
+                )
+
+            def watch_index_builds(job) -> None:
+                """P4b: start the background read of Aurora DSQL's builds of the secondary
+                indexes the shown Full Load ``job`` submitted, when one is due (a render while
+                a build is pending, or with a failed one not read for a minute). Single
+                flight per job; no I/O here."""
+                from dsql_migrator.ui.data_migration._index_builds import (
+                    index_build_watch_due,
+                    start_index_build_watch,
+                )
+
+                if not index_build_watch_due(job, job_manager):
+                    return
+                start_index_build_watch(
+                    job_manager, job, connection_factory=_fk_target_connect(), refresh=refresh
                 )
 
             def _fk_revalidating() -> bool:
@@ -3231,6 +3250,9 @@ def build_data_migration_screen(
                             validate_foreign_keys_again=validate_foreign_keys_again,
                             foreign_keys_revalidating=_fk_revalidating,
                             watch_foreign_keys=watch_foreign_key_validation,
+                            # P4b: Aurora DSQL's builds of the secondary indexes the run
+                            # submitted, read back by job id while the page is open.
+                            watch_index_builds=watch_index_builds,
                             stop_full_load=stop_full_load,
                             refresh=refresh,
                             ai_error_opener=ai_error_opener,

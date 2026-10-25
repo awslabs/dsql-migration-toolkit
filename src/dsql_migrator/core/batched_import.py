@@ -2155,6 +2155,7 @@ class BatchedImporter:
         pool: _ConnectionPool,
         index_ddls: list[str],
         *,
+        on_job: "Optional[Callable[[str, Optional[str]], None]]" = None,
         unreachable_raises: bool = False,
     ) -> "tuple[int, list[str]]":
         """Issue post-load ``CREATE INDEX ASYNC`` statements, one per transaction.
@@ -2190,6 +2191,12 @@ class BatchedImporter:
         a long run) raises :class:`IndexTargetUnreachable` with what was submitted and
         recorded before it, instead of being recorded as a missing index: the caller leaves
         the table for a retry, which reads which of its indexes exist first.
+
+        ``on_job(ddl, job_id)`` (P4b) is called once per DDL that was submitted, with the job
+        id Aurora DSQL answered for its build (``CREATE INDEX ASYNC`` returns one row holding
+        it, as ``ALTER TABLE ASYNC`` does) or ``None`` when it answered none. Never for a DDL
+        that failed. A callback that raises is logged and never fails the DDL: the index was
+        submitted either way.
         """
         # Lease a FRESH connection INSIDE each retried unit -- mirroring the data
         # path (``_execute_insert``, which leases per attempt) -- and pass the wider
@@ -2211,7 +2218,7 @@ class BatchedImporter:
         # may have committed -- so the failure it may cause is reported with that note. Only
         # the statement counts: opening the connection, or a cursor on one the client
         # already knows is closed, ran no CREATE.
-        def _run_ddl(ddl: str, unconfirmed: list, sent: list) -> None:
+        def _run_ddl(ddl: str, unconfirmed: list, sent: list) -> Optional[str]:
             sent[0] = False
             with pool.lease() as connection:
                 cursor = connection.cursor()
@@ -2230,6 +2237,10 @@ class BatchedImporter:
                             else ""
                         )
                     raise
+                else:
+                    # P4b: the build's job id it answered with (never raises: the CREATE
+                    # ran, so nothing here may make the retry run it again).
+                    return _answered_job_id(cursor)
                 finally:
                     _safe_close(cursor)
 
@@ -2250,7 +2261,7 @@ class BatchedImporter:
                 # connect (its token, its handshake) or to open a cursor ran no CREATE.
                 sent = [False]
                 try:
-                    retried(ddl, unconfirmed, sent)
+                    job_id = retried(ddl, unconfirmed, sent)
                 except Exception as exc:  # noqa: BLE001 - isolate per-index failure
                     if unreachable_raises and (
                         _is_retryable_load_error(exc) or not sent[0]
@@ -2273,6 +2284,14 @@ class BatchedImporter:
                     )
                 else:
                     created += 1
+                    if on_job is not None:
+                        try:
+                            on_job(ddl, job_id)
+                        except Exception:  # noqa: BLE001 - a record of the build, not the build
+                            _LOGGER.warning(
+                                "Could not record the build of a submitted index (it was "
+                                "submitted): %s", _index_name_of(ddl), exc_info=True,
+                            )
         finally:
             # The submissions only: CREATE INDEX ASYNC returns before the index is built.
             self.load_stats.add_phase("index", time.perf_counter() - started)
@@ -2283,29 +2302,37 @@ class BatchedImporter:
         """The run-level index pass (P4a): every table's ``CREATE INDEX ASYNC`` statements
         on ONE Aurora DSQL connection, one statement at a time.
 
-        Yields ``create(ddls) -> (created, failures)``, :meth:`_create_indexes` over one
-        one-connection pool reused for every call (a connection the server only rejected a
-        statement on is kept, one that may have ended is replaced, as on the load path), so
-        the pass opens one connection -- one TLS handshake and one IAM token -- instead of
-        one per table. A DDL Aurora DSQL did not answer within its retry budget raises
-        :class:`IndexTargetUnreachable` rather than being recorded as a missing index. The
-        connection is closed when the pass ends. Its connects are not counted: each table's
-        submissions count into the collector bound at the call.
+        Yields ``create(ddls, on_job=None) -> (created, failures)``, :meth:`_create_indexes`
+        over one one-connection pool reused for every call (a connection the server only
+        rejected a statement on is kept, one that may have ended is replaced, as on the load
+        path), so the pass opens one connection -- one TLS handshake and one IAM token --
+        instead of one per table. A DDL Aurora DSQL did not answer within its retry budget
+        raises :class:`IndexTargetUnreachable` rather than being recorded as a missing index.
+        ``on_job`` is handed each submitted DDL's build job id (P4b). The connection is
+        closed when the pass ends. Its connects are not counted: each table's submissions
+        count into the collector bound at the call.
         """
         pool = _ConnectionPool(self._connection_factory, 1, stats=None)
 
-        def create(index_ddls: "Sequence[str]") -> "tuple[int, list[str]]":
+        def create(
+            index_ddls: "Sequence[str]",
+            on_job: "Optional[Callable[[str, Optional[str]], None]]" = None,
+        ) -> "tuple[int, list[str]]":
             ddls = list(index_ddls or ())
             if not ddls:
                 return 0, []
-            return self._create_indexes(pool, ddls, unreachable_raises=True)
+            return self._create_indexes(pool, ddls, on_job=on_job, unreachable_raises=True)
 
         try:
             yield create
         finally:
             pool.close_all()
 
-    def create_indexes(self, index_ddls: list[str]) -> "tuple[int, list[str]]":
+    def create_indexes(
+        self,
+        index_ddls: list[str],
+        on_job: "Optional[Callable[[str, Optional[str]], None]]" = None,
+    ) -> "tuple[int, list[str]]":
         """Public post-load index pass on a fresh bounded pool (``(created, failures)``).
 
         A regular :meth:`import_rows` given ``index_ddls`` runs the post-load ``CREATE
@@ -2315,7 +2342,7 @@ class BatchedImporter:
         :class:`_ConnectionPool` and delegates to :meth:`_create_indexes`, so the ``CREATE
         INDEX ASYNC`` / OCC-retry / per-DDL isolation behavior is IDENTICAL to the
         ``import_rows`` path. A no-op (and no connection opened) when there are no index
-        DDLs.
+        DDLs. ``on_job`` is handed each submitted DDL's build job id (P4b).
         """
         if not index_ddls:
             return 0, []
@@ -2323,7 +2350,7 @@ class BatchedImporter:
             self._connection_factory, self._options.parallelism, stats=self.load_stats
         )
         try:
-            return self._create_indexes(pool, index_ddls)
+            return self._create_indexes(pool, index_ddls, on_job=on_job)
         finally:
             pool.close_all()
 
@@ -2352,6 +2379,29 @@ def _index_name_of(ddl: str) -> str:
         re.IGNORECASE,
     )
     return match.group(1) if match else ddl[:60]
+
+
+def _answered_job_id(cursor: Any) -> Optional[str]:
+    """The job id an async DDL answered with, or ``None`` (P4b).
+
+    Aurora DSQL's ``CREATE [UNIQUE] INDEX ASYNC`` returns one row holding its build's
+    ``job_id``, as ``ALTER TABLE ASYNC`` does (the ``schema_applier._submit_returning_job_id``
+    pattern); a statement with no result set (PostgreSQL, a double), no row, or a ``NULL``
+    answers ``None``. Never raises: the statement has already run, so a cursor that cannot
+    say must not make the caller run it again.
+    """
+    try:
+        if getattr(cursor, "description", None) is None:
+            return None
+        row = cursor.fetchone()
+    except Exception:  # noqa: BLE001 - the CREATE ran; only its job id is unknown
+        return None
+    try:
+        if not row or row[0] is None:
+            return None
+        return str(row[0])
+    except Exception:  # noqa: BLE001 - an unreadable row: no job id
+        return None
 
 
 # Key-value types whose value is safe to show: a surrogate key. Everything else is a

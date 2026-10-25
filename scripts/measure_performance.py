@@ -28,7 +28,11 @@ Two subcommands:
               progress windows end on wall-clock multiples of --progress-interval
               (12:03:00, 12:03:30, ...) so they line up with CloudWatch minutes.
               --wait-sys-jobs waits (bounded) for Aurora DSQL's async jobs to drain
-              before starting; --cdc-mode runs the load as a Full load + CDC run
+              before starting; --wait-index-builds waits (bounded, 1800 s by default)
+              after the run for the CREATE INDEX ASYNC builds it submitted -- read by
+              their job ids, as the product's watch reads them -- and reports when the
+              indexes were ready and the end-to-end time (run start to the last build
+              finished, to the poll); --cdc-mode runs the load as a Full load + CDC run
               (start point captured and fenced as the product does, no CDC stack
               needed) so a MySQL table can be read in --reader-shards ranges;
               --inventory-order starts the tables in inventory order instead of the
@@ -62,6 +66,8 @@ Usage (from repo root):
     # windows, and read big MySQL tables in 4 ranges (needs a binlog start point):
     .venv/bin/python scripts/measure_performance.py full-load --yes --wait-sys-jobs \
         --progress-interval 60 --cdc-mode --reader-shards 4
+    # Report the load only, without waiting for the index builds it submitted:
+    .venv/bin/python scripts/measure_performance.py full-load --yes --wait-index-builds 0
 
     # CDC lag (CDC must already stream cdc_perf.pulse):
     .venv/bin/python scripts/measure_performance.py cdc-lag --setup        # create table
@@ -661,6 +667,75 @@ def _wait_for_sys_jobs(connect, max_wait: float, *, poll: float = 15.0,
                 pass
 
 
+# --wait-index-builds: the default bound, and how often the harness reads the builds.
+_WAIT_INDEX_BUILDS_SECONDS = 1800.0
+_INDEX_BUILD_POLL_SECONDS = 15.0
+
+
+def _wait_for_index_builds(connect, record, max_wait: float, *,
+                           poll: float = _INDEX_BUILD_POLL_SECONDS, sleep=time.sleep,
+                           clock=time.monotonic, now=None, read=None):
+    """Wait, at most ``max_wait`` seconds (0: not at all, no read), for Aurora DSQL to finish
+    the index builds the run submitted (P4b) -- the run itself never waits for them.
+
+    Every ``poll`` seconds one read through the product's own reader (``index_build_states``:
+    sys.jobs BY the recorded job ids, pg_index once a job is no longer listed -- never every
+    sys.jobs row, which also counts DROP and ANALYZE jobs), folded into a local copy of the
+    record exactly as the Data Migration step's watch folds it (``fold_index_build_reads``),
+    until nothing is building. Each read opens its own connection, so one that failed is
+    retried on a new connection at the next poll. Returns ``(record, waited_seconds,
+    failed_reads)``. Read-only.
+    """
+    from dsql_migrator.core.target_introspector import index_build_states
+    from dsql_migrator.ui.data_migration._index_builds import fold_index_build_reads
+
+    if record is None or not record.building or max_wait <= 0:
+        return record, 0.0, 0
+    reader = read or index_build_states
+    wall = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
+    started = clock()
+    failed_reads = 0
+    current = record
+    while True:
+        read_at = wall()
+        reads = reader(list(current.building), connection_factory=connect)
+        if not any(value is not None for value in reads.values()):
+            failed_reads += 1
+            log("[index builds] the read failed; retrying on a new connection")
+        current, _failed, _finished = fold_index_build_reads(current, reads, read_at)
+        waited = clock() - started
+        if not current.building or waited >= max_wait:
+            return current, round(waited, 1), failed_reads
+        log(f"[index builds] {len(current.building)} of {current.submitted} still building; "
+            f"waited {waited:.0f}s of {max_wait:.0f}s")
+        sleep(min(poll, max(0.0, max_wait - waited)))
+
+
+def _index_builds_report(record, *, waited: float, read_errors: int, started_at: float,
+                         elapsed: float) -> "tuple[dict | None, float | None]":
+    """``(index_builds, end_to_end_seconds)`` for the report: counts and times only. The end
+    to end runs from the run's start to the last build's finish (as seen by the poll that
+    saw it; ``None`` while any still builds), or is the run's own wall time when it
+    submitted no build (nothing to wait for)."""
+    if record is None or not record.submitted:
+        return None, round(elapsed, 2)
+    loaded, finished = record.data_loaded_at, record.finished_at
+    done = finished is not None and not record.building
+    return {
+        "submitted": record.submitted,
+        "completed": record.completed,
+        "failed": record.failed,
+        "still_building": len(record.building),
+        "data_loaded_at": _iso(loaded),
+        "submitted_at": _iso(record.submitted_at),
+        "finished_at": _iso(finished) if done else None,
+        "seconds_after_load": round((finished - loaded).total_seconds(), 1)
+        if done and loaded is not None else None,
+        "waited_seconds": waited,
+        "read_errors": read_errors,
+    }, (round(finished.timestamp() - started_at, 2) if done else None)
+
+
 @contextlib.contextmanager
 def _start_order(inventory: bool):
     """--inventory-order: while the run is on, the process pool starts its units in the
@@ -861,10 +936,19 @@ def cmd_full_load(args) -> int:
     elapsed = time.monotonic() - t0
 
     job = jm.get_status(job_id)
+    # --wait-index-builds: the run does not wait for the CREATE INDEX ASYNC builds it
+    # submitted (P4b), so the harness does -- bounded, by their job ids -- and reports when
+    # the indexes were ready and the end to end; an A/B must compare those, not the run.
+    wait_builds = float(getattr(args, "wait_index_builds", _WAIT_INDEX_BUILDS_SECONDS) or 0.0)
+    builds, builds_waited, builds_read_errors = _wait_for_index_builds(
+        _target_conn, getattr(job, "index_builds", None), wait_builds
+    )
     report = _full_load_report(
         args, job, board, elapsed=elapsed, started_at=started_at,
         finished_at=monitor["finished_at"], monitor=monitor, leading=leading,
         composite_tables=len(table_conversions), gate=gate, cdc_mode=cdc_mode,
+        index_builds=builds, index_waited=builds_waited,
+        index_read_errors=builds_read_errors,
     )
 
     log(f"status={job.status} wall={elapsed:.1f}s rows={report['total_rows']} "
@@ -900,10 +984,19 @@ def cmd_full_load(args) -> int:
 
 def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
                       finished_at: float, monitor: dict, leading: str = "",
-                      composite_tables: int = 0, gate=None, cdc_mode: bool = False) -> dict:
+                      composite_tables: int = 0, gate=None, cdc_mode: bool = False,
+                      index_builds=None, index_waited: float = 0.0,
+                      index_read_errors: int = 0) -> dict:
     """The JSON report of one full-load run: the job's tables plus the table workers' own
-    counters (``board``). Counts and timings only."""
+    counters (``board``). Counts and timings only. ``index_builds``: the job's record of
+    its index builds as --wait-index-builds left it (default: the job's own, unwaited)."""
     from dsql_migrator.core.load_stats import summarize_load_stats
+
+    builds_report, end_to_end = _index_builds_report(
+        index_builds if index_builds is not None else getattr(job, "index_builds", None),
+        waited=index_waited, read_errors=index_read_errors, started_at=started_at,
+        elapsed=elapsed,
+    )
 
     total_rows = sum(int(c.rows_loaded or 0) for c in job.chunks)
     table_stats = board.tables() if board is not None else {}
@@ -1012,6 +1105,12 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             "load": run.get("load_s"), "index": run.get("index_s"),
             "count": run.get("count_s"),
         },
+        # P4b: Aurora DSQL's builds of the indexes the run submitted, as --wait-index-builds
+        # left them (counts and times only; None: the run submitted none), and the time from
+        # the run's start until the last one finished -- None while one still builds, the
+        # run's wall time when there was none to wait for.
+        "index_builds": builds_report,
+        "end_to_end_seconds": end_to_end,
         "peak_cpu_pct": peak.get("cpu_pct"),
         "peak_mem_bytes": peak.get("mem_bytes"),
         # The workers' own retry counts (before R0 this read the parent's logger, which no
@@ -1064,6 +1163,14 @@ def _log_full_load_summary(report: dict) -> None:
     ph = report["phases_seconds"]
     log(f"phases (summed over tables): load {ph['load']}s, index submission {ph['index']}s, "
         f"post-load COUNT {ph['count']}s")
+    ib = report.get("index_builds")
+    if ib:
+        log(f"index builds: {ib['submitted']} submitted, {ib['completed']} built, "
+            f"{ib['failed']} failed, {ib['still_building']} still building"
+            + (f" | ready {ib['finished_at']}, {ib['seconds_after_load']}s after the data "
+               "loaded" if ib["finished_at"] else "")
+            + f" | end to end {report.get('end_to_end_seconds')}s | waited "
+            f"{ib['waited_seconds']}s ({ib['read_errors']} failed read(s))")
     if report.get("cdc_mode"):
         sp = report.get("start_point") or {}
         split = {r["table"]: r["reader_shards"] for r in report["per_table"]
@@ -1348,6 +1455,14 @@ def main() -> int:
                          "builds), at most SECONDS (default 1800); exits 3 without "
                          "loading if it does not drain. It runs before this run drops "
                          "and recreates its tables, so it cannot wait out that drop")
+    fl.add_argument("--wait-index-builds", type=float, default=_WAIT_INDEX_BUILDS_SECONDS,
+                    metavar="SECONDS",
+                    help="after the run, wait until Aurora DSQL finished the CREATE INDEX "
+                         "ASYNC builds the run submitted (read every 15 s by their job "
+                         "ids, never every sys.jobs row), at most SECONDS (default "
+                         "1800; 0 = do not wait), and report when the indexes were "
+                         "ready and the end-to-end time. The run itself never waits for "
+                         "them")
     fl.add_argument("--composite-leading", default="",
                     help="measure the COMPOSITE-KEY variant: prepend this "
                          "high-cardinality column to each table's PK "

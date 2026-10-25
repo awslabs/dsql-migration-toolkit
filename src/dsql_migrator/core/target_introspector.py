@@ -1726,6 +1726,159 @@ def target_index_names(
     return {str(row[1]) for row in rows if row and row[1]}
 
 
+# P4b: a sys.jobs status that ends an index build. Any other status still listed (submitted,
+# processing) is a build Aurora DSQL has not finished.
+_BUILD_COMPLETED = frozenset({"completed"})
+_BUILD_FAILED = frozenset({"failed", "cancelled", "canceled"})
+# The reason recorded for a build whose job Aurora DSQL no longer lists while its index is
+# not valid (or not there): the job ended, and not with a usable index.
+INDEX_BUILD_UNLISTED_DETAILS = "no longer listed by Aurora DSQL and the index is not valid"
+
+
+@dataclass(frozen=True)
+class IndexBuildRead:
+    """One secondary-index build as Aurora DSQL reports it (P4b).
+
+    ``status`` is ``"building"``, ``"completed"`` or ``"failed"``. ``details``: a failed
+    build's reason as ``sys.jobs`` holds it -- RAW, it may name a key value, so a caller
+    sanitizes it before it is kept or shown (Property 7). ``unlisted``: this "failed" is the
+    inference for a job id ``sys.jobs`` does not list while the index is not valid, which
+    holds only once the job can have aged out (about 30 minutes after it ended) -- the
+    caller weighs it against the submission time (``fold_index_build_reads``).
+    """
+
+    status: str
+    details: Optional[str] = None
+    unlisted: bool = False
+
+
+def index_build_states(
+    builds: Sequence[Any],
+    *,
+    connection_factory: Callable[[], Any],
+    sleep: Callable[[float], None] = _time.sleep,
+) -> "dict[tuple[str, str], Optional[IndexBuildRead]]":
+    """Each recorded build's state on Aurora DSQL over ONE connection, keyed ``(table,
+    index)``; ``None`` = unknown (read again at the next poll).
+
+    ``builds`` carry ``table``, ``index`` (the stored name) and ``job_id`` (``IndexBuild``).
+    First ``sys.jobs`` BY the job ids the tool recorded -- never by name or type (a drained
+    cluster also waits for DROP and ANALYZE jobs), and never through ``sys.wait_for_job``,
+    which blocks for as long as an id is unknown to it: ``submitted`` / ``processing`` (any
+    status still listed that did not end it) is building, ``completed`` completed,
+    ``failed`` / ``cancelled`` failed with its raw details. Then, for a build with no job id
+    or whose id ``sys.jobs`` no longer lists (Aurora DSQL drops a finished job about 30
+    minutes after it ends), one ``pg_index`` read per relation (``schema.table``, or a bare
+    name across the user schemas; one found in several is unknown): a valid index is built;
+    one that is not valid or not there did not build when it had a job id
+    (:data:`INDEX_BUILD_UNLISTED_DETAILS`, marked ``unlisted``: the caller decides it only
+    once the job can have aged out) and is still building when it had none.
+
+    Read-only. A 40001 or an XX000 is read again on the same connection. A relation that
+    still cannot be read, or no connection at all, leaves its builds unknown; so does a
+    ``sys.jobs`` that cannot be read, for a build with an id whose index is not valid yet.
+    """
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.target_connection import is_server_unavailable
+
+    result: "dict[tuple[str, str], Optional[IndexBuildRead]]" = {}
+    ids: "dict[tuple[str, str], str]" = {}
+    for build in builds or ():
+        key = (str(getattr(build, "table", "")), str(getattr(build, "index", "")))
+        result.setdefault(key, None)
+        job_id = getattr(build, "job_id", None)
+        if job_id and key not in ids:
+            ids[key] = str(job_id)
+    ordered = list(result)
+    if not ordered:
+        return result
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> every build unknown
+        return result
+
+    def _rows(conn: Any, statement: str, params: Mapping[str, object]) -> list:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(statement, params)
+            return list(cursor.fetchall() or ())
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+            raise
+        finally:
+            _safe_close(cursor)
+
+    read = with_occ_retry(
+        max_attempts=_FACTS_OCC_ATTEMPTS,
+        base_delay=0.05,
+        sleep=sleep,
+        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc),
+    )(_rows)
+    try:
+        listed: "dict[str, tuple[str, Optional[str]]]" = {}
+        jobs_read = True
+        if ids:
+            try:
+                for row in read(
+                    connection,
+                    "SELECT job_id, status, details FROM sys.jobs "
+                    "WHERE job_id = ANY(%(ids)s)",
+                    {"ids": sorted(set(ids.values()))},
+                ):
+                    if row and row[0] is not None:
+                        listed[str(row[0])] = (
+                            str(row[1] or "").strip().lower(),
+                            str(row[2]) if row[2] else None,
+                        )
+            except Exception:  # noqa: BLE001 - pg_index still says which ones are built
+                jobs_read = False
+        by_relation: "dict[str, list[tuple[str, str]]]" = {}
+        for key in ordered:
+            job = listed.get(ids.get(key, ""))
+            if job is None:
+                by_relation.setdefault(key[0], []).append(key)
+            elif job[0] in _BUILD_COMPLETED:
+                result[key] = IndexBuildRead("completed")
+            elif job[0] in _BUILD_FAILED:
+                result[key] = IndexBuildRead("failed", job[1])
+            else:
+                result[key] = IndexBuildRead("building")
+        for table_name, keys in by_relation.items():
+            where, params = _fk_relation_where(table_name)
+            try:
+                rows = read(
+                    connection,
+                    "SELECT n.nspname, i.relname, ix.indisvalid "
+                    "FROM pg_catalog.pg_index ix "
+                    "JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid "
+                    "JOIN pg_catalog.pg_class c ON c.oid = ix.indrelid "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    f"WHERE {where}",
+                    params,
+                )
+            except Exception:  # noqa: BLE001 - unreadable -> this relation's builds unknown
+                continue
+            if len({str(row[0]) for row in rows if row}) > 1:
+                continue  # an ambiguous bare name: unknown, never a guess
+            valid = {str(row[1]): bool(row[2]) for row in rows if row and row[1]}
+            for key in keys:
+                if valid.get(pg_stored_name(key[1])):
+                    result[key] = IndexBuildRead("completed")
+                elif key not in ids:
+                    result[key] = IndexBuildRead("building")
+                elif jobs_read:
+                    result[key] = IndexBuildRead(
+                        "failed", INDEX_BUILD_UNLISTED_DETAILS, unlisted=True
+                    )
+                # else: sys.jobs could not be read -- its job may still run: unknown
+    finally:
+        _safe_close(connection)
+    return result
+
+
 def target_required_columns_without_default(
     table_name: str,
     *,
@@ -2193,6 +2346,9 @@ __all__ = [
     "target_unique_keys",
     "target_foreign_keys",
     "target_index_names",
+    "INDEX_BUILD_UNLISTED_DETAILS",
+    "IndexBuildRead",
+    "index_build_states",
     "unique_index_state",
     "SYSTEM_SCHEMAS",
     "RELATIONS_QUERY",

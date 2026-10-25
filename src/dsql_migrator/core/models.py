@@ -1293,6 +1293,59 @@ class Watermark(BaseModel):
     )
 
 
+class IndexBuild(BaseModel):
+    """One secondary index the Full Load's index pass submitted (``CREATE [UNIQUE] INDEX
+    ASYNC``), while Aurora DSQL still builds it -- or once its build failed (P4b).
+
+    ``index`` is the name the catalog stores; ``job_id`` the build's id the statement
+    answered with (``None`` when it answered none), read back from ``sys.jobs`` by that id.
+    ``details`` (a failed build only) is Aurora DSQL's reason, first line, with any
+    ``Key (...)=(...)`` part removed: value-free (Property 7). A failed UNIQUE build is a
+    missing constraint. Frozen; fields are left out of the payload while unset.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    table: str = Field(min_length=1)
+    index: str = Field(min_length=1)
+    unique: bool = Field(default=False, exclude_if=lambda v: not v)
+    job_id: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
+    details: Optional[str] = Field(default=None, exclude_if=lambda v: not v)
+
+
+class IndexBuilds(BaseModel):
+    """Aurora DSQL's asynchronous builds of the secondary indexes a Full Load submitted (P4b).
+
+    The run does not wait for them: its index pass records each submission here, and the
+    Data Migration step's background watch reads them back by job id and folds what it
+    reads in. A completed build is counted, never kept, so the record is bounded by the
+    builds still running or failed (``submitted == completed + failed + len(building)``);
+    ``completed_by_table`` splits ``completed`` by table (one count per table), so a table
+    the lineage recreates takes its old relation's builds out of the counts.
+    ``data_loaded_at``: when every table of the run that submitted them had loaded its data
+    (the start of its index pass); ``submitted_at``: when the last one was submitted;
+    ``finished_at``: when the watch first saw none building (``None`` while any does);
+    ``checked_at``: its last read that answered. Left out of the payload while unset, like
+    the lists while empty, so a job snapshot still loads on an older build
+    (extra="forbid").
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    submitted: int = Field(default=0, ge=0)
+    completed: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    completed_by_table: dict[str, int] = Field(
+        default_factory=dict, exclude_if=lambda v: not v
+    )
+    data_loaded_at: Optional[datetime] = Field(default=None, exclude_if=lambda v: v is None)
+    submitted_at: Optional[datetime] = Field(default=None, exclude_if=lambda v: v is None)
+    finished_at: Optional[datetime] = Field(default=None, exclude_if=lambda v: v is None)
+    checked_at: Optional[datetime] = Field(default=None, exclude_if=lambda v: v is None)
+    building: list[IndexBuild] = Field(default_factory=list, exclude_if=lambda v: not v)
+    failures: list[IndexBuild] = Field(default_factory=list, exclude_if=lambda v: not v)
+
+
 class MigrationJob(BaseModel):
     """Aggregate state of a data migration job."""
 
@@ -1340,6 +1393,12 @@ class MigrationJob(BaseModel):
     # OUT of the payload while empty, so a job that recreated nothing still loads on an
     # older build (this model is extra="forbid").
     recreated_tables: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
+    # P4b: Aurora DSQL's async builds of the secondary indexes this job lineage submitted
+    # (IndexBuilds). None until a run's index pass submits one; left OUT of the payload
+    # while None, so a job snapshot still loads on an older build (extra="forbid").
+    index_builds: Optional[IndexBuilds] = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     watermark: Optional[Watermark] = Field(
         default=None,
         description=(
@@ -2628,6 +2687,8 @@ __all__ = [
     "ChunkSpec",
     "ChunkState",
     "Watermark",
+    "IndexBuild",
+    "IndexBuilds",
     "MigrationJob",
     "MigrationMode",
     "TableSelection",

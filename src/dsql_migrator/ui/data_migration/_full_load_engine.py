@@ -59,6 +59,7 @@ from dsql_migrator.core.batched_import import (
     IndexTargetUnreachable,
     OnConflictMode,
     _disable_prepared_statements,
+    _index_name_of,
     is_unconfirmed_index_failure,
     safe_error_message,
 )
@@ -110,6 +111,8 @@ from dsql_migrator.core.models import (
     ChunkState,
     DataErrorRecord,
     ForeignKeyDef,
+    IndexBuild,
+    IndexBuilds,
     MigrationJob,
     SourceConnectionConfig,
     SourceInventory,
@@ -610,6 +613,116 @@ def _mark_indexes_pending(job: MigrationJob, names: "Collection[str]") -> None:
     for chunk in job.chunks:
         if chunk.chunk_id in wanted:
             chunk.indexes_pending = True
+
+
+_UNIQUE_INDEX_DDL_RE = re.compile(r"\s*CREATE\s+UNIQUE\b", re.IGNORECASE)
+
+
+def _index_build_of(table: str, ddl: object, job_id: Optional[str]) -> IndexBuild:
+    """The record of one submitted ``CREATE [UNIQUE] INDEX ASYNC`` (P4b): the index by the
+    name the catalog stores (the DDL's own label when it names none that can be read),
+    whether it is UNIQUE, and the build's job id. Names only (Property 7)."""
+    text = str(ddl or "")
+    return IndexBuild(
+        table=table,
+        index=_stored_index_name(text) or _index_name_of(text),
+        unique=bool(_UNIQUE_INDEX_DDL_RE.match(text)),
+        job_id=str(job_id) if job_id else None,
+    )
+
+
+def _void_index_builds(job: MigrationJob, tables: "Collection[str]") -> None:
+    """P4b: this run DROP+recreated ``tables``, so every build an earlier run of the lineage
+    recorded for them -- building, failed or completed, on relations that are gone -- leaves
+    the record (``submitted == completed + failed + len(building)`` kept), whether or not
+    the run gets as far as submitting their indexes again: a stale failure would name a
+    missing constraint of a relation that no longer exists, a stale build would be read on
+    the new one, a stale completed build would be counted twice. One pass over the record;
+    nothing recorded for them: unchanged."""
+    record = job.index_builds
+    names = set(tables or ())
+    if record is None or not names:
+        return
+    building = [old for old in record.building if old.table not in names]
+    failures = [old for old in record.failures if old.table not in names]
+    voided_completed = sum(
+        count for name, count in record.completed_by_table.items() if name in names
+    )
+    voided_failures = len(record.failures) - len(failures)
+    voided = len(record.building) - len(building) + voided_failures + voided_completed
+    if not voided:
+        return
+    update: dict = {
+        "submitted": max(0, record.submitted - voided),
+        "completed": max(0, record.completed - voided_completed),
+        "failed": max(0, record.failed - voided_failures),
+        "completed_by_table": {
+            name: count
+            for name, count in record.completed_by_table.items()
+            if name not in names
+        },
+        "building": building,
+        "failures": failures,
+    }
+    if not building and record.finished_at is None:
+        update["finished_at"] = datetime.now(timezone.utc)  # what it still watched is void
+    job.index_builds = record.model_copy(update=update)
+
+
+def _void_recorded_index_builds(handle: JobHandle, tables: "Collection[str]") -> None:
+    """:func:`_void_index_builds` for ``tables`` on the handle's job, in one update (none
+    for no table). A report only: it never raises into the run."""
+    names = sorted(set(tables or ()))
+    if not names:
+        return
+    try:
+        handle.update(lambda job, n=names: _void_index_builds(job, n))
+    except Exception:  # noqa: BLE001 - the record of the builds, never the run's outcome
+        _LOGGER.warning("Could not update the record of the index builds", exc_info=True)
+
+
+def _merge_index_builds(
+    job: MigrationJob,
+    table: str,
+    builds: "Sequence[IndexBuild]",
+    *,
+    recreated: bool,
+    data_loaded_at: Optional[datetime] = None,
+) -> None:
+    """Record on ``job`` the index builds the run's index pass submitted for ``table`` (P4b).
+
+    They void the records they replace: every record of a table this run recreated (its old
+    relation went with its indexes, :func:`_void_index_builds`), else the building or
+    failed record of an index submitted again (an index-only retry submits only one not on
+    the table). The counts stay ``submitted == completed + failed + len(building)``. A new
+    build sets ``data_loaded_at`` -- the start of this run's index pass, when every table
+    of it had loaded its data -- and ``submitted_at`` (now), and reopens a finished record.
+    Nothing to add or void: unchanged (no record is created for nothing).
+    """
+    if recreated:
+        _void_index_builds(job, (table,))
+    if not builds:
+        return
+    record = job.index_builds or IndexBuilds()
+    again = {build.index for build in builds}
+
+    def _kept(old: IndexBuild) -> bool:
+        return old.table != table or old.index not in again
+
+    building = [old for old in record.building if _kept(old)]
+    failures = [old for old in record.failures if _kept(old)]
+    voided_failures = len(record.failures) - len(failures)
+    voided = len(record.building) - len(building) + voided_failures
+    now = datetime.now(timezone.utc)
+    job.index_builds = record.model_copy(update={
+        "submitted": max(0, record.submitted - voided) + len(builds),
+        "failed": max(0, record.failed - voided_failures),
+        "building": building + list(builds),
+        "failures": failures,
+        "data_loaded_at": data_loaded_at or now,
+        "submitted_at": now,
+        "finished_at": None,
+    })
 
 
 def _fail_chunk(job: MigrationJob, chunk_id: str) -> None:
@@ -1266,6 +1379,15 @@ def _takes_kwarg(migrator: object, name: str) -> bool:
     try:
         return name in inspect.signature(migrator.migrate_table).parameters
     except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _callable_takes_kwarg(function: object, name: str) -> bool:
+    """Whether ``function`` names the keyword ``name``: the real importer's index pass takes
+    ``on_job`` (P4b), a double of it need not (its submissions are then not recorded)."""
+    try:
+        return name in inspect.signature(function).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
         return False
 
 
@@ -3587,6 +3709,12 @@ _INDEX_PASS_UNREACHABLE = (
     "need them (their data is loaded); Retry unfinished tables submits them without "
     "reloading data (last attempt: {code})"
 )
+# P4b: the pass's last line once it submitted builds it recorded -- the run does not wait
+# for them.
+_INDEX_PASS_SUBMITTED = (
+    "submitted {n} secondary index(es) of {tables} table(s); Aurora DSQL builds them in the "
+    "background, and the Data Migration step shows when they finish"
+)
 
 
 def _watermark_estimates(watermark: "Optional[Watermark]") -> "dict[str, int]":
@@ -3656,7 +3784,17 @@ def _run_deferred_index_pass(
     Aurora DSQL did not answer (:class:`~dsql_migrator.core.batched_import.
     IndexTargetUnreachable`) stops the pass with that table and the rest flagged. Never
     raises: anything else leaves the table flagged and is logged.
+
+    P4b: the run does not wait for Aurora DSQL to build them. Each submitted DDL's build --
+    its table, index, whether it is UNIQUE and the job id the statement answered with -- is
+    recorded on the job (``MigrationJob.index_builds``, :func:`_merge_index_builds`) in the
+    update that clears its table's flag (one that stays flagged records what it submitted
+    too), ``data_loaded_at`` being this pass's start; the Data Migration step watches them
+    by id. The pass's last line then says so. An importer whose ``create`` takes no
+    ``on_job`` (a double) submits as before and records none.
     """
+    # Every unit of the run has returned: every table's data has loaded by now.
+    data_loaded_at = datetime.now(timezone.utc)
     snapshot = getattr(handle, "snapshot", None)
     if not callable(snapshot):
         return 0  # a handle double that keeps no job: nothing to read the flags from
@@ -3691,9 +3829,32 @@ def _run_deferred_index_pass(
         def _stop_requested() -> bool:
             return not stopped_before and bool(handle.cancelled)
 
-        def _clear(name: str) -> None:
-            handle.update(lambda job, n=name: _clear_indexes_pending(job, n))
+        def _merge(job: MigrationJob, name: str, builds: "Sequence[IndexBuild]") -> None:
+            _merge_index_builds(
+                job, name, builds, recreated=name in ddls_by_table,
+                data_loaded_at=data_loaded_at,
+            )
+
+        def _clear(name: str, builds: "Sequence[IndexBuild]" = ()) -> None:
+            # P4b: its builds are recorded in the update that clears its flag.
+            def _mutate(job: MigrationJob, n: str = name, b: tuple = tuple(builds)) -> None:
+                _clear_indexes_pending(job, n)
+                _merge(job, n, b)
+
+            handle.update(_mutate)
             remaining.remove(name)
+
+        def _keep(name: str, builds: "Sequence[IndexBuild]") -> None:
+            # A table that stays flagged: the builds it did submit run all the same.
+            if builds:
+                handle.update(lambda job, n=name, b=tuple(builds): _merge(job, n, b))
+
+        recorded = {"builds": 0, "tables": 0}
+
+        def _count(builds: "Sequence[IndexBuild]") -> None:
+            if builds:
+                recorded["builds"] += len(builds)
+                recorded["tables"] += 1
 
         def _order(name: str) -> tuple:
             estimate = estimates.get(name)
@@ -3741,6 +3902,7 @@ def _run_deferred_index_pass(
             with (
                 opener() if callable(opener) else contextlib.nullcontext(importer.create_indexes)
             ) as create:
+                records_builds = _callable_takes_kwarg(create, "on_job")
                 for name, ddls in plan:
                     if _stop_requested():
                         stopped = True
@@ -3749,15 +3911,27 @@ def _run_deferred_index_pass(
                     # The table's "index" entry on the run's board: it loads no rows.
                     stats = LoadStats(units=0)
                     _bind_load_stats(importer, stats)
+                    # P4b: each DDL submitted, with the build job id it answered with.
+                    builds: list[IndexBuild] = []
+
+                    def _on_job(
+                        ddl: str, build_job: Optional[str], n: str = name, into: list = builds
+                    ) -> None:
+                        into.append(_index_build_of(n, ddl, build_job))
+
                     try:
                         try:
-                            _created, failures = create(ddls)
+                            _created, failures = (
+                                create(ddls, on_job=_on_job) if records_builds else create(ddls)
+                            )
                         finally:
                             _record_load_stats(
                                 load_stats, name, "index", stats.snapshot(), final=True
                             )
                     except IndexTargetUnreachable as exc:
                         _record_failures(name, exc.failures)
+                        _keep(name, builds)
+                        _count(builds)
                         log_activity(
                             ActivityCategory.FULL_LOAD,
                             "index pass",
@@ -3777,15 +3951,27 @@ def _run_deferred_index_pass(
                             "Full Load index pass: the secondary indexes of %s could not be "
                             "submitted; it keeps them pending", name, exc_info=True,
                         )
+                        _keep(name, builds)
+                        _count(builds)
                         continue
                     _record_failures(name, failures)
-                    _clear(name)
+                    _clear(name, builds)
+                    _count(builds)
         if stopped:
             log_activity(
                 ActivityCategory.FULL_LOAD,
                 "index pass",
                 status=ActivityStatus.INFO,
                 detail=_INDEX_PASS_STOPPED.format(n=len(remaining)),
+            )
+        if recorded["builds"]:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "index pass",
+                status=ActivityStatus.INFO,
+                detail=_INDEX_PASS_SUBMITTED.format(
+                    n=recorded["builds"], tables=recorded["tables"]
+                ),
             )
     except Exception:  # noqa: BLE001 - the pass never fails or masks the run's outcome
         _LOGGER.warning(
@@ -3919,6 +4105,9 @@ def _migrate_tables_in_parallel(
                     for future in as_completed(futures):
                         _tally(future.result())
         finally:
+            # P4b: the builds an earlier run recorded for the old relations of the tables
+            # this one recreated leave the record before the pass records the new ones.
+            _void_recorded_index_builds(handle, recreated)
             # Every table has returned: their secondary indexes, one at a time (P4a).
             index_left = _run_deferred_index_pass(
                 handle, job_id, migrator, error_log, ddls_by_table=deferred_indexes,
@@ -4121,13 +4310,15 @@ def _migrate_tables_in_parallel(
                         # keeps the previous behaviour (a recreate failure aborts the run).
                         if prepass is None:
                             # The tables already recreated are empty: their record of an
-                            # earlier read in parts goes with their rows (G137).
+                            # earlier read in parts goes with their rows (G137), and so do
+                            # the index builds of their old relations (P4b).
                             if recreated_names:
                                 handle.update(
                                     lambda job, names=sorted(recreated_names): (
                                         _record_reader_shards(job, names, {}, names)
                                     )
                                 )
+                                _void_recorded_index_builds(handle, recreated_names)
                             raise
                         _fail_prepass_table(tbl.name, exc=exc)
                         continue
@@ -4165,6 +4356,9 @@ def _migrate_tables_in_parallel(
                 without_plan.update(_record_reader_shards(job, names, parts, gone))
 
             handle.update(_record)
+        # P4b: the index builds an earlier run recorded for a recreated table's old relation
+        # leave the record now, whether or not its load and index pass succeed this time.
+        _void_recorded_index_builds(handle, recreated_names)
         # Per split table: its parts submitted, and those cancelled before they ran.
         submitted_parts: dict[str, int] = {}
         unrun_parts: dict[str, int] = {}
@@ -6286,6 +6480,10 @@ def run_full_load_retry(
     # and the run's index pass submits the indexes not on them yet. A name that is not such
     # a table, or that CDC does not capture yet (G17), is reloaded as before.
     index_only: "Collection[str]" = (),
+    # P4b: the prior job's record of Aurora DSQL's index builds, so the builds an earlier run
+    # submitted stay watched (and a failed one shown) on the retry's job. Defaulted: an
+    # omitting caller starts the retry with no record.
+    prior_index_builds: "Optional[IndexBuilds]" = None,
 ) -> None:
     """Re-run Full Load for only the previously failed ``tables_to_retry``.
 
@@ -6361,14 +6559,20 @@ def run_full_load_retry(
         prior_job_id=prior_job_id,
         inherited=prior_table_error_job_ids,
     )
-    handle.update(
-        lambda job: _seed_retry_chunks(
+
+    def _seed(job: MigrationJob) -> None:
+        _seed_retry_chunks(
             job, prior_chunks, reload,
             prior_job_id=prior_job_id,
             prior_table_error_job_ids=prior_table_error_job_ids,
             prior_recreated_tables=prior_recreated_tables,
         )
-    )
+        if prior_index_builds is not None:
+            # P4b: the earlier runs' builds go on being watched on this job; this run's index
+            # pass records its own beside them (and voids those of a table it recreates).
+            job.index_builds = prior_index_builds.model_copy(deep=True)
+
+    handle.update(_seed)
     # A retry had NO run-level line at all, so the most common replace-one-table case --
     # the per-table Reload, and "Exclude column & reload", which FORCE a replace for that
     # table -- left nothing in the audit trail saying a table's rows had been dropped and
