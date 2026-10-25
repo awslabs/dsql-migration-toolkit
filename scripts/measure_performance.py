@@ -16,10 +16,11 @@ Two subcommands:
               table workers themselves count it (core.load_stats; counts and
               timings only): per-batch and per-INSERT time (p50/p95), attempts,
               retries by SQLSTATE with Aurora DSQL's OC000 (row conflict) and OC001
-              (schema change) told apart, 23505 recoveries, reconnects, how long
-              the reader waited on a full read-ahead queue vs the writers on an
-              empty one, and each worker process's CPU seconds and peak RSS. The
-              workers are spawned processes with no logging, so these come back
+              (schema change) told apart, 23505 recoveries, reconnects and the
+              connections kept after an error, how long the reader waited on a
+              full read-ahead queue vs the writers on an empty one, and each
+              worker process's CPU seconds and peak RSS. The workers are
+              spawned processes with no logging, so these come back
               through the progress queue and the workers' results -- the parent's
               logger never saw a batch, which is why earlier reports said "OCC 0".
               Load, post-load index submission and the post-load COUNT(*) are timed
@@ -1079,6 +1080,7 @@ def _log_full_load_summary(report: dict) -> None:
     if run:
         cores = run.get("worker_cores")
         log(f"connections: {run.get('connects')} opened, {run.get('reconnects')} reconnects, "
+            f"{run.get('connections_kept')} kept after an error, "
             f"{run.get('connect_failures')} failed | 23505 recovered "
             f"{run.get('unique_recoveries')} | queue: reader blocked "
             f"{run.get('reader_blocked_s')}s, writers waiting {run.get('writer_wait_s')}s"

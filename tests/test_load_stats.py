@@ -159,6 +159,7 @@ def test_a_collector_counts_every_kind_of_event() -> None:
     stats.record_connect(reconnect=False)
     stats.record_connect(reconnect=True)
     stats.record_connect_failure()
+    stats.record_connection_kept()
     stats.add_reader_blocked(1.5)
     stats.add_writer_wait(0.25)
     stats.add_phase("load", 10.0)
@@ -173,6 +174,7 @@ def test_a_collector_counts_every_kind_of_event() -> None:
     assert s["retries"] == {"40001/OC000": 1, "XX000": 1} and s["retries_exhausted"] == 1
     assert s["unique_recoveries"] == 1
     assert (s["connects"], s["reconnects"], s["connect_failures"]) == (2, 1, 1)
+    assert s["connections_kept"] == 1
     assert (s["reader_blocked_s"], s["writer_wait_s"]) == (1.5, 0.25)
     assert (s["load_s"], s["index_s"], s["count_s"]) == (10.0, 0.5, 0.25)
     assert (s["load_started_at"], s["load_finished_at"]) == (95.0, 110.0)
@@ -288,6 +290,27 @@ def test_a_summary_splits_the_occ_causes_and_dates_the_load_window() -> None:
     assert s["worker_cores"] == 0.5 and s["peak_rss_bytes"] == 2 ** 30
     assert summarize_load_stats(None) == {}
     json.dumps(s)  # report-ready
+
+
+def test_connections_kept_merge_diff_and_summarize() -> None:
+    # P4c: a connection kept after a statement-level error is counted next to reconnects.
+    def _kept(n: int) -> dict:
+        stats = LoadStats()
+        stats.record_connect(reconnect=False)
+        for _ in range(n):
+            stats.record_connection_kept()
+        return stats.snapshot()
+
+    older = _kept(0)
+    del older["connections_kept"]  # a snapshot from before the counter existed
+    merged = merge_load_stats([_kept(2), _kept(3), older])
+    assert merged["connections_kept"] == 5 and merged["connects"] == 3
+    assert merge_load_stats([older])["connections_kept"] == 0
+    assert diff_load_stats(_kept(7), _kept(4))["connections_kept"] == 3
+    assert diff_load_stats(_kept(4), older)["connections_kept"] == 4
+    summary = summarize_load_stats(merged)
+    assert (summary["connects"], summary["reconnects"], summary["connections_kept"]) == (3, 0, 5)
+    assert summarize_load_stats(older)["connections_kept"] == 0
 
 
 # --------------------------------------------------------------------------- the board

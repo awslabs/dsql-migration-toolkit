@@ -123,7 +123,9 @@ def test_the_importer_counts_attempts_and_retries_by_cause() -> None:
     assert s["retries_exhausted"] == 0
     # Every attempt is one INSERT round trip; every batch one sample.
     assert s["execute_ms"]["n"] == 6 and s["batch_ms"]["n"] == 3
-    # A failed attempt discards its connection, so each retry reconnected.
+    # This double reports no psycopg session state, so the pool discards it after each
+    # failed attempt and each retry reconnects (an idle session is kept after a 40001:
+    # test_p4c_keep_connection.py).
     assert (s["connects"], s["reconnects"], s["connect_failures"]) == (4, 3, 0)
     assert s["load_s"] > 0 and s["load_started_at"] <= s["load_finished_at"]
     assert s["index_s"] == 0.0 and s["count_s"] == 0.0
@@ -155,8 +157,9 @@ def test_a_23505_recovery_after_an_uncertain_commit_is_counted() -> None:
     s = importer.load_stats.snapshot()
     assert s["retries"] == {"XX000": 1}
     assert s["unique_recoveries"] == 1
-    # The pool discards a connection on ANY error raised while it is leased, so both the
-    # XX000 and the 23505 cost a reconnect -- what the counter is there to show.
+    # This double reports no psycopg session state, so the pool discards it after both the
+    # XX000 and the 23505 -- two reconnects, what the counter is there to show (an idle
+    # session keeps the connection after the 23505: test_p4c_keep_connection.py).
     assert s["reconnects"] == 2
 
 

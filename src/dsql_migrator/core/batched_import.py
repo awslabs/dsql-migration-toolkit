@@ -50,7 +50,9 @@ What it does, and the properties it satisfies:
 5. **Bounded parallel connections (Property 2 -- parallelism).** Batches are
    loaded concurrently across a small, bounded pool of DSQL connections (default
    :data:`DEFAULT_PARALLELISM`). Connections are created lazily, capped at the
-   configured parallelism, and reused across batches. The connection factory is
+   configured parallelism, and reused across batches -- also after the server rejected
+   only a statement (an OCC ``40001``, a data error), while one whose session may have
+   ended is replaced by a fresh one (``_ConnectionPool.lease``). The connection factory is
    injectable so unit tests never reach a real cluster; the default opens
    autocommit/TLS/IAM connections via
    :class:`~dsql_migrator.core.target_connection.DsqlConnector` (tokens stay
@@ -81,10 +83,11 @@ What it does, and the properties it satisfies:
    target, never counted as created.
 
 8. **Write-path counters.** Every batch, attempt, retry (by SQLSTATE, with Aurora DSQL's
-   OC000 / OC001 told apart), 23505 recovery, connect and read-ahead queue wait is
-   counted into a :class:`~dsql_migrator.core.load_stats.LoadStats` collector -- the
-   importer's own, or the load unit's after :meth:`BatchedImporter.bind_load_stats` --
-   counts and timings only (Property 7), in bounded memory.
+   OC000 / OC001 told apart), 23505 recovery, connect, connection kept after an error and
+   read-ahead queue wait is counted into a :class:`~dsql_migrator.core.load_stats.LoadStats`
+   collector -- the importer's own, or the load unit's after
+   :meth:`BatchedImporter.bind_load_stats` -- counts and timings only (Property 7), in
+   bounded memory.
 
 The row input is decoupled from any specific file reader: :meth:`import_rows`
 accepts an iterable of already-converted rows (dict-like, keyed by column name --
@@ -897,6 +900,46 @@ class _RenderedInserts:
 # REPLACEMENT, which the load's counters report as a reconnect (a never-used slot is None).
 _RECONNECT = object()
 
+# SQLSTATE classes after which a loader connection is discarded even when it still looks
+# usable: 08 connection exception, 53 insufficient resources, 57 operator intervention (an
+# admin shutdown, a cancelled statement), 58 system error, and XX internal error (Aurora
+# DSQL's XX000 "server unavailable" among them). Class 40 is kept for 40001 only.
+_SESSION_ENDING_CLASSES = frozenset({"08", "53", "57", "58", "XX"})
+
+
+def _session_survives(exc: BaseException, connection: Any) -> bool:
+    """Whether ``connection`` can serve the next lease after ``exc`` was raised while it
+    was in use: the server rejected only the statement, and the session is still idle.
+
+    Loader connections are autocommit, so a rejected statement aborts only its own implicit
+    transaction; R1 switched psycopg's prepared statements off on them, so no per-session
+    statement cache can go stale; and every retry resends identical bytes. Kept: an OCC
+    ``40001`` (Aurora DSQL's OC000 row conflict, OC001 schema change), a data or constraint
+    error (``22xxx`` / ``23xxx`` -- the poison-row binary split leases once per failing
+    half, so a bad row in a 2000-row batch cost 11-12 reconnects), ``54000``, ``42xxx``.
+    Discarded: an error with no SQLSTATE (a dropped socket, a client-side error), one of
+    :data:`_SESSION_ENDING_CLASSES`, any other class-40 code (``40003`` statement completion
+    unknown), anything that is not an :class:`Exception`, and a connection that does not
+    report itself open, unbroken and idle -- so a double without psycopg's ``closed`` /
+    ``broken`` / ``info.transaction_status`` is discarded as before. Pure; never raises.
+    """
+    try:
+        if not isinstance(exc, Exception):
+            return False
+        state = getattr(exc, "sqlstate", None)
+        if not isinstance(state, str) or not state:
+            return False
+        code = state.upper()
+        if code[:2] in _SESSION_ENDING_CLASSES or (code[:2] == "40" and code != "40001"):
+            return False
+        return bool(
+            not getattr(connection, "closed", True)
+            and not getattr(connection, "broken", False)
+            and connection.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        )
+    except Exception:  # noqa: BLE001 - a session it cannot read is not one to keep
+        return False
+
 
 class _ConnectionPool:
     """A bounded pool of lazily-created, reusable connections.
@@ -904,8 +947,8 @@ class _ConnectionPool:
     At most ``size`` connections are ever created (Property 2 -- bounded
     parallelism). A leased connection is returned to the pool on context exit and
     reused by a later batch. :meth:`close_all` closes every connection created.
-    ``stats`` (optional) counts the connections opened, the reconnects among them and
-    the failed connects.
+    ``stats`` (optional) counts the connections opened, the reconnects among them, the
+    failed connects and the connections kept after an error (:meth:`lease`).
     """
 
     def __init__(
@@ -924,12 +967,17 @@ class _ConnectionPool:
     def lease(self) -> Iterator[Any]:
         """Lease a connection, creating it on first use, returning it on exit.
 
-        If the leased connection raises while in use (a dropped connection, an
-        expired IAM token, or any other error), it is closed and the slot is
-        refilled empty (:data:`_RECONNECT`) so the next lease creates a FRESH connection
-        (which re-mints a short-lived IAM token via the factory). This prevents one
-        broken connection from cascading the same failure across every later
-        batch that would otherwise reuse it, and lets a retry recover.
+        If the leased connection raises while in use, it is KEPT when the server rejected
+        only the statement and the session is still idle (:func:`_session_survives`: an OCC
+        ``40001``, a data or constraint error), counted as a connection kept: a retry or the
+        next batch reuses it instead of opening a new one (a TLS handshake and an IAM token),
+        as every OCC retry and every failing half of a poison-row split used to. Anything
+        else (a dropped connection, an expired IAM token, an error that may have ended the
+        session, one with no SQLSTATE, a session that is not idle) closes it and refills the
+        slot empty (:data:`_RECONNECT`), so the next lease creates a FRESH connection (which
+        re-mints a short-lived IAM token via the factory). This prevents one broken
+        connection from cascading the same failure across every later batch that would
+        otherwise reuse it, and lets a retry recover. The error is re-raised either way.
         """
         connection = self._slots.get()
         if connection is None or connection is _RECONNECT:
@@ -939,7 +987,7 @@ class _ConnectionPool:
             except BaseException:
                 # Creating the connection failed (e.g. DSQL's new-connection rate limit under
                 # a burst, or an IAM-token mint blip). The slot token was already pulled from
-                # the queue above, and this is BEFORE the try/finally that would refill it, so
+                # the queue above, and this is BEFORE the try below that would refill it, so
                 # without putting an empty slot back the pool shrinks by one PERMANENTLY. A
                 # connect failure is classified transient and retried, so repeated blips would
                 # drain every slot until the next self._slots.get() blocks forever (no
@@ -956,13 +1004,13 @@ class _ConnectionPool:
             _disable_prepared_statements(connection)
             with self._lock:
                 self._created.append(connection)
-        ok = False
         try:
             yield connection
-            ok = True
-        finally:
-            if ok:
+        except BaseException as exc:
+            if _session_survives(exc, connection):
                 self._slots.put(connection)
+                if self._stats is not None:
+                    self._stats.record_connection_kept()
             else:
                 try:
                     connection.close()
@@ -972,6 +1020,9 @@ class _ConnectionPool:
                     if connection in self._created:
                         self._created.remove(connection)
                 self._slots.put(_RECONNECT)
+            raise
+        else:
+            self._slots.put(connection)
 
     def close_all(self) -> None:
         """Close every connection this pool created (best-effort)."""

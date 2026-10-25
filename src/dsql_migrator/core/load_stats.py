@@ -56,7 +56,7 @@ PHASES = ("load", "index", "count")
 
 _COUNTERS = (
     "units", "batches", "batches_failed", "statements", "attempts", "retries_exhausted",
-    "unique_recoveries", "connects", "reconnects", "connect_failures",
+    "unique_recoveries", "connects", "reconnects", "connect_failures", "connections_kept",
 )
 _SECONDS = ("reader_blocked_s", "writer_wait_s") + tuple(f"{p}_s" for p in PHASES)
 _CODE_COUNTS = ("retries", "index_retries", "attempts_per_statement")
@@ -311,6 +311,13 @@ class LoadStats:
         with self._lock:
             self._counts["connect_failures"] += 1
 
+    def record_connection_kept(self) -> None:
+        """A target connection that raised while in use was kept for the next lease: the
+        server rejected only the statement (an OCC 40001, a data error) and the session
+        stayed usable, so no reconnect followed."""
+        with self._lock:
+            self._counts["connections_kept"] += 1
+
     # -- read-ahead queue ---------------------------------------------------------
 
     def add_reader_blocked(self, seconds: float) -> None:
@@ -499,6 +506,7 @@ def summarize_load_stats(snapshot: Optional[Mapping]) -> dict:
         "connects": stats["connects"],
         "reconnects": stats["reconnects"],
         "connect_failures": stats["connect_failures"],
+        "connections_kept": stats["connections_kept"],
         "batch_ms": histogram_summary(stats["batch_ms"]),
         "execute_ms": histogram_summary(stats["execute_ms"]),
         "reader_blocked_s": round(stats["reader_blocked_s"], 3),

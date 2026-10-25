@@ -2252,8 +2252,10 @@ def test_a_client_side_psycopg_error_is_not_retried_as_transient() -> None:
 
 # ---------------------------------------------------------------------------
 # P0 F6 pins: a connection used BEFORE an overlay ALTER gets ONE OC001 on its next
-# statement. The loader absorbs it with no change: the lease discards the connection and
-# the batch's OCC retry leases a fresh one. A failing pin is a loader gap to report.
+# statement. The loader absorbs it with no change: this double reports no psycopg session
+# state, so the lease discards the connection and the batch's OCC retry leases a fresh one
+# (a session that reports itself idle is kept and serves the retry: P4c,
+# test_p4c_keep_connection.py). A failing pin is a loader gap to report.
 # ---------------------------------------------------------------------------
 
 

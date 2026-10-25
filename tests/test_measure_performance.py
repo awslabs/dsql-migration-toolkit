@@ -344,6 +344,27 @@ def test_the_report_without_counters_keeps_its_shape(mp) -> None:
     mp._log_full_load_summary(report)  # prints without counters
 
 
+def test_the_summary_prints_the_connections_kept_next_to_the_reconnects(mp) -> None:
+    # P4c: the pool keeps a connection whose session survived a statement-level error.
+    stats = LoadStats()
+    stats.record_connect(reconnect=False)
+    stats.record_connect(reconnect=True)
+    for _ in range(3):
+        stats.record_connection_kept()
+    board = LoadStatsBoard()
+    board.record("perf.a", None, stats.snapshot(), final=True)
+    report = mp._full_load_report(
+        _args(), _job(), board, elapsed=13.0, started_at=0.0, finished_at=13.0,
+        monitor={}, cdc_mode=False,
+    )
+    assert report["load_stats"]["connections_kept"] == 3
+    lines: list = []
+    mp.log = lines.append
+    mp._log_full_load_summary(report)
+    assert any("connections: 2 opened, 1 reconnects, 3 kept after an error, 0 failed" in line
+               for line in lines), lines
+
+
 # --------------------------------------------------------------------------- sys.jobs
 
 
