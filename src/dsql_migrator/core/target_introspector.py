@@ -1660,6 +1660,72 @@ def unique_index_state(
     return "building" if building else "absent"
 
 
+def target_index_names(
+    table_name: str,
+    *,
+    connection_factory: Callable[[], Any],
+    sleep: Callable[[float], None] = _time.sleep,
+) -> "Optional[set[str]]":
+    """The stored names of the indexes ON ``table_name`` on Aurora DSQL (read-only), or None.
+
+    P4a: a retry that submits a loaded table's secondary indexes without reloading it
+    skips each one that already exists -- the run that ended may have submitted it -- and
+    an index name is per schema, so the check is by the relation the index is on, never
+    by the name alone. ``table_name`` is ``schema.table``, or a bare name looked up across
+    every user schema (one found in several schemas is unknown). Its primary key's index is
+    among them; a still-building or invalid index counts too (it exists). One catalog read;
+    a 40001 or an XX000 is read again on the same connection. ``None`` (unknown: the caller
+    submits every DDL) when it still fails or Aurora DSQL cannot be reached; an empty set
+    when the relation has no index, or there is no such relation.
+    """
+    from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
+    from dsql_migrator.core.target_connection import is_server_unavailable
+
+    where, params = _fk_relation_where(table_name)
+    statement = (
+        "SELECT n.nspname, i.relname "
+        "FROM pg_catalog.pg_index ix "
+        "JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid "
+        "JOIN pg_catalog.pg_class c ON c.oid = ix.indrelid "
+        "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        f"WHERE {where}"
+    )
+    try:
+        connection = connection_factory()
+    except Exception:  # noqa: BLE001 - cannot connect -> unknown
+        return None
+
+    def _rows(conn: Any) -> list:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(statement, params)
+            return list(cursor.fetchall() or ())
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+            raise
+        finally:
+            _safe_close(cursor)
+
+    read = with_occ_retry(
+        max_attempts=_FACTS_OCC_ATTEMPTS,
+        base_delay=0.05,
+        sleep=sleep,
+        retryable=lambda exc: is_occ_conflict(exc) or is_server_unavailable(exc),
+    )(_rows)
+    try:
+        rows = read(connection)
+    except Exception:  # noqa: BLE001 - unreadable catalog -> unknown, never "none exist"
+        return None
+    finally:
+        _safe_close(connection)
+    if len({str(row[0]) for row in rows if row}) > 1:
+        return None  # an ambiguous bare name: unknown, never a guess
+    return {str(row[1]) for row in rows if row and row[1]}
+
+
 def target_required_columns_without_default(
     table_name: str,
     *,
@@ -2126,6 +2192,7 @@ __all__ = [
     "target_primary_keys",
     "target_unique_keys",
     "target_foreign_keys",
+    "target_index_names",
     "unique_index_state",
     "SYSTEM_SCHEMAS",
     "RELATIONS_QUERY",

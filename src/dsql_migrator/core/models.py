@@ -1139,6 +1139,14 @@ class ChunkState(BaseModel):
     reader_shards: Optional[int] = Field(
         default=None, ge=1, exclude_if=lambda v: not v
     )
+    # P4a: set when a DONE table's secondary indexes have not been submitted yet. A load that
+    # recreated the table leaves its CREATE INDEX ASYNC statements to the run's index pass,
+    # which submits them only after every table's data has loaded and clears this table by
+    # table; a run that ends first (a Stop during that pass, an app restart, Aurora DSQL not
+    # answering) keeps it, and so does a retry, which submits them without reloading the
+    # data. Left OUT of the payload while False, so a job snapshot still loads on an older
+    # build (extra="forbid").
+    indexes_pending: bool = Field(default=False, exclude_if=lambda v: not v)
 
 
 class Watermark(BaseModel):

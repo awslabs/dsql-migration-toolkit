@@ -13633,37 +13633,73 @@ def test_the_shard_count_comes_from_the_clamped_reader_shard_budget() -> None:
     assert "table_parallelism - non_shardable_count" not in process_path
 
 
-def test_multiprocess_sharded_replace_creates_indexes_only_on_success() -> None:
+@pytest.mark.parametrize("third_shard", ["DONE", "FAILED", "STOPPED"])
+def test_multiprocess_sharded_replace_creates_indexes_only_on_success(
+    monkeypatch, third_shard
+) -> None:
     # FIX 3: a sharded REPLACE table is recreated EMPTY (no secondary indexes) and its
     # shard workers load slices with NO index_ddls, so the parent must build the indexes
-    # itself. The serial pre-pass captures the recreator's index DDLs, and the parent
-    # creates them ONCE in the shard-SUCCESS branch (never on FAILED/STOPPED) via the
-    # public BatchedImporter.create_indexes -- identical CREATE INDEX ASYNC / OCC behavior.
-    import inspect
+    # itself: the serial pre-pass captures the recreator's index DDLs, and the parent
+    # submits them ONCE -- since P4a in the run's index pass, after every unit of the run
+    # has returned -- and only when every shard is DONE (never on FAILED/STOPPED), its
+    # failures through the shared _record_index_failures path. Behaviour, on the inline
+    # process pool: what ran, in which order.
+    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from tests.test_full_load_overlay import _InlineExecutor
+    from tests.test_g137_mysql_reader_shards import (
+        _FOUR, _Handle, _Planner, _inputs as _shard_inputs, _table as _events_table, _wm,
+    )
 
-    from dsql_migrator.ui.data_migration import _full_load_engine as _engine
+    events: list = []
+    ddl = 'CREATE INDEX ASYNC "ix_email" ON "app"."events" ("email")'
 
-    src = inspect.getsource(_engine._migrate_tables_in_parallel)
-    process_path = src[src.index("# Unified process-parallel path"):]
+    def _shard(args):
+        events.append(("shard", args.shard_index))
+        status = third_shard if args.shard_index == 2 else "DONE"
+        return engine._TableWorkerResult(
+            table_name=args.table.name, status=status, rows_loaded=10,
+            shard_index=args.shard_index,
+        )
 
-    # Pre-pass captures the recreator return (the table's index DDLs) instead of
-    # discarding it, using the migrator's (injectable) recreator.
-    assert "table_recreator = migrator._table_recreator" in process_path
-    assert "replace_index_ddls[tbl.name] = table_recreator(tbl)" in process_path
+    class _Importer:
+        def create_indexes(self, ddls):
+            events.append(("index", list(ddls)))
+            return len(ddls), []
 
-    # The indexes are built exactly once (one call site), guarded by the captured DDLs,
-    # and any failure is surfaced through the shared _record_index_failures path.
-    assert process_path.count(".create_indexes(") == 1
-    assert "replace_index_ddls.get(name)" in process_path
-    assert "_record_index_failures(" in process_path
+    def _recreate(table):
+        events.append(("recreate", table.name))
+        return [ddl]
 
-    # It sits in the SUCCESS branch: after the pre-pass capture, after the FAILED/STOPPED
-    # branches' _fail_chunk handling, and after the success _complete_chunk update.
-    i_prepass = process_path.index("replace_index_ddls[tbl.name] = table_recreator(tbl)")
-    i_fail = process_path.index("_fail_chunk(job, n)")  # the any_failed branch
-    i_complete = process_path.index("_complete_chunk(job, n, r, s, q)")
-    i_create = process_path.index(".create_indexes(")
-    assert i_prepass < i_fail < i_complete < i_create
+    monkeypatch.setattr(engine, "ProcessPoolExecutor", _InlineExecutor)
+    monkeypatch.setattr(engine, "_migrate_shard_in_process", _shard)
+    monkeypatch.setattr(engine, "_PROCESS_LAUNCH_STAGGER_SECONDS", 0)
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "2")
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "4")
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS", "1000")
+    table = _events_table()
+    migrator = BatchedTableMigrator(
+        _shard_inputs([table], replace=[table.name]),
+        exporter=_Planner({table.name: _FOUR}), watermark_capturer=object(),
+        importer_factory=lambda _i: _Importer(), table_recreator=_recreate,
+        target_counter=lambda t: None, target_pk_reader=lambda t: list(t.primary_key),
+        target_generated_reader=lambda t: set(),
+        target_unique_keys_reader=lambda t: [list(t.primary_key)],
+    )
+    handle = _Handle([table.name])
+    counts = engine._migrate_tables_in_parallel(
+        handle, "j", [table], migrator, ErrorLogStore(), watermark=_wm(), fresh_watermark=True,
+    )
+    shards = [("shard", i) for i in range(4)]
+    (chunk,) = handle.job.chunks
+    if third_shard == "DONE":
+        # Recreated first, the four ranges loaded, then its index DDLs once.
+        assert events == [("recreate", table.name), *shards, ("index", [ddl])]
+        assert chunk.status == "DONE" and not chunk.indexes_pending
+        assert counts == (0, 0, 0)
+    else:
+        assert events == [("recreate", table.name), *shards]
+        assert chunk.status == "FAILED" and not chunk.indexes_pending
+        assert counts.index_pending == 0
 
 
 def _passing_cdc_report():
@@ -23452,22 +23488,49 @@ def test_load_mode_detail_names_each_shape() -> None:
     assert "not.selected" not in stale, stale
 
 
-def test_both_run_paths_log_their_load_mode() -> None:
+def test_both_run_paths_log_their_load_mode(monkeypatch) -> None:
+    import dataclasses
     import inspect
 
     import dsql_migrator.ui.data_migration._full_load_engine as engine
+    from dsql_migrator.core.models import ChunkState
 
     fresh = inspect.getsource(engine.run_full_load)
     assert '"run started"' in fresh and "_load_mode_detail(inputs, table_names)" in fresh, fresh
 
-    retry = inspect.getsource(engine.run_full_load_retry)
-    assert '"retry started"' in retry, (
-        "a retry had no run-level line at all, so a per-table Reload -- which forces a "
-        "REPLACE for that table -- left no record that its rows were dropped"
+    # A retry had no run-level line at all, so a per-table Reload -- which forces a REPLACE
+    # for that table -- left no record that its rows were dropped. Its line names the load
+    # mode of the tables it re-runs, not the whole original selection (P4a: a table that only
+    # owes its secondary indexes is named apart, never as re-run).
+    lines: list = []
+    monkeypatch.setattr(
+        engine, "log_activity",
+        lambda _category, action, **kw: lines.append((action, kw.get("detail"))),
     )
-    assert "_load_mode_detail(inputs, sorted(retry_names))" in retry, retry
-    # Scoped to the retried tables, not the whole original selection.
-    assert "retry_names" in retry.split('"retry started"')[1][:400], retry
+    prior = [
+        ChunkState(chunk_id="orders", status="FAILED"),
+        ChunkState(chunk_id="customers", status="DONE", indexes_pending=True),
+    ]
+    inputs = dataclasses.replace(_inputs(), replace_tables=frozenset({"orders"}))
+    manager = JobManager()
+    job_id = manager.submit(lambda h: engine.run_full_load_retry(
+        h, prior, _tables(), migrator=_FakeMigrator(rows_by_table={"orders": 10}),
+        error_log=ErrorLogStore(), watermark=_watermark(), inputs=inputs,
+        index_only=["customers"],
+    ))
+    assert manager.wait(job_id, timeout=5.0)
+    (detail,) = [d for action, d in lines if action == "retry started"]
+    assert detail.startswith("1 table(s) re-run: orders; load mode: REPLACE"), detail
+    assert detail.endswith("; secondary indexes only: customers"), detail
+    lines.clear()
+    job_id = manager.submit(lambda h: engine.run_full_load_retry(
+        h, prior, _tables()[:1], migrator=_FakeMigrator(rows_by_table={"orders": 10}),
+        error_log=ErrorLogStore(), watermark=_watermark(), inputs=inputs,
+    ))
+    assert manager.wait(job_id, timeout=5.0)
+    (detail,) = [d for action, d in lines if action == "retry started"]
+    assert detail.startswith("1 table(s) re-run: orders; load mode: REPLACE"), detail
+    assert "secondary indexes only" not in detail
 
 
 # --------------------------------------------------------------------------- #

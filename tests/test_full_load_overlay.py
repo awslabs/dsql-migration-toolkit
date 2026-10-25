@@ -337,6 +337,12 @@ class _Importer:
         self.db.rows[table.name] = True
         return BatchedImportResult(rows_loaded=len(rows))
 
+    def create_indexes(self, ddls):
+        # P4a: the run's index pass, after every table has loaded.
+        self.created = getattr(self, "created", [])
+        self.created.append(list(ddls))
+        return len(ddls), []
+
 
 class _Rig:
     """A BatchedTableMigrator on the thread path over a fake DSQL catalog (FakeDb) with the
@@ -989,7 +995,10 @@ def test_the_parent_promotes_an_empty_overlay_table_whose_key_changed(monkeypatc
     assert "docs" in rig.migrator._inputs.replace_tables and rig.recreated == ["docs"]
     assert rig.alters() == ['"body" DROP NOT NULL', '"body" DROP DEFAULT']
     assert ("docs", OnConflictMode.NONE, ["id", "note"]) in rig.importer.calls
-    assert rig.importer.index_ddls["docs"] == ['CREATE UNIQUE INDEX ASYNC docs_u ON "docs" ("body")']
+    # P4a: the load submitted none; the run's index pass did, once every table had loaded.
+    assert rig.importer.index_ddls["docs"] is None
+    assert rig.importer.created == [['CREATE UNIQUE INDEX ASYNC docs_u ON "docs" ("body")']]
+    assert rig.job.status == "DONE" and not any(c.indexes_pending for c in rig.job.chunks)
     assert [e for e in events if e[2] == "docs" and "applied key differs" in e[3]]
 
 

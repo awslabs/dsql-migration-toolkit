@@ -565,7 +565,7 @@ def test_the_pre_pass_recreates_every_table_on_one_connection_then_starts_the_un
     assert r.log.index((1, "close")) < r.log.index(("submit", "app.t1"))
     starts = [entry for entry in r.log if entry[0] == "start"]
     assert starts == [("start", n) for n in NAMES]
-    assert set(r.status.values()) == {"DONE"} and r.counts == (0, 0)
+    assert set(r.status.values()) == {"DONE"} and r.counts == (0, 0, 0)
 
 
 def test_a_unit_that_lost_the_connection_replays_on_a_new_one_which_the_rest_reuse(

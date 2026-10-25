@@ -80,7 +80,10 @@ What it does, and the properties it satisfies:
    statement returns quickly and the index is built in the background. An
    ``XX000`` is retried the same way; because that attempt's CREATE may have
    committed, a later "already exists" is reported with a note to check the
-   target, never counted as created.
+   target, never counted as created. The Full Load engine passes none to
+   :meth:`BatchedImporter.import_rows`: it submits a whole run's after every table's
+   data has loaded, on one connection (:meth:`BatchedImporter.index_pass`), so no index
+   DDL changes the schema under another table's batches (OC001).
 
 8. **Write-path counters.** Every batch, attempt, retry (by SQLSTATE, with Aurora DSQL's
    OC000 / OC001 told apart), 23505 recovery, connect, connection kept after an error and
@@ -351,6 +354,25 @@ class BatchedImportError(RuntimeError):
     captured into :class:`BatchedImportResult` as ``failures`` so the rest of the
     load can proceed and be resumed.
     """
+
+
+class IndexTargetUnreachable(Exception):
+    """Aurora DSQL did not answer one of a table's index DDLs within its retry budget.
+
+    Raised only by the run-level index pass (:meth:`BatchedImporter.index_pass`), where a
+    target that stopped answering would otherwise be recorded as every later table's
+    missing index: the pass stops instead and leaves the table, and those after it, for
+    Retry unfinished tables. ``created`` counts this table's DDLs submitted before it and
+    ``failures`` holds the permanent failures recorded before it (index name and SQLSTATE
+    message only, as :meth:`BatchedImporter.create_indexes` reports them).
+    """
+
+    def __init__(self, created: int, failures: "Sequence[str]") -> None:
+        super().__init__(
+            f"Aurora DSQL did not answer an index DDL ({created} submitted before it)"
+        )
+        self.created = int(created)
+        self.failures = list(failures)
 
 
 @dataclass(frozen=True)
@@ -2129,7 +2151,11 @@ class BatchedImporter:
         ) from last_error
 
     def _create_indexes(
-        self, pool: _ConnectionPool, index_ddls: list[str]
+        self,
+        pool: _ConnectionPool,
+        index_ddls: list[str],
+        *,
+        unreachable_raises: bool = False,
     ) -> "tuple[int, list[str]]":
         """Issue post-load ``CREATE INDEX ASYNC`` statements, one per transaction.
 
@@ -2156,6 +2182,14 @@ class BatchedImporter:
         :data:`UNCONFIRMED_INDEX_NOTE` (or :data:`UNCONFIRMED_INDEX_DROP_NOTE`) and is never
         counted as created (the name could be another table's index). Never ``IF NOT
         EXISTS``: that would silently skip a genuine name collision.
+
+        ``unreachable_raises`` (the run-level index pass, :meth:`index_pass`): a DDL whose
+        last attempt still failed with a retryable error -- Aurora DSQL did not answer (a
+        dropped connection, ``XX000``) or stayed in conflict -- or never sent the statement
+        (the connect failed: e.g. the AWS credentials that mint its IAM token expired during
+        a long run) raises :class:`IndexTargetUnreachable` with what was submitted and
+        recorded before it, instead of being recorded as a missing index: the caller leaves
+        the table for a retry, which reads which of its indexes exist first.
         """
         # Lease a FRESH connection INSIDE each retried unit -- mirroring the data
         # path (``_execute_insert``, which leases per attempt) -- and pass the wider
@@ -2177,10 +2211,12 @@ class BatchedImporter:
         # may have committed -- so the failure it may cause is reported with that note. Only
         # the statement counts: opening the connection, or a cursor on one the client
         # already knows is closed, ran no CREATE.
-        def _run_ddl(ddl: str, unconfirmed: list) -> None:
+        def _run_ddl(ddl: str, unconfirmed: list, sent: list) -> None:
+            sent[0] = False
             with pool.lease() as connection:
                 cursor = connection.cursor()
                 try:
+                    sent[0] = True
                     cursor.execute(ddl)
                 except Exception as exc:  # noqa: BLE001 - noted, then re-raised to the retry
                     if _is_retryable_load_error(exc):
@@ -2207,44 +2243,79 @@ class BatchedImporter:
         created = 0
         failures: list[str] = []
         started = time.perf_counter()
-        for ddl in index_ddls:
-            unconfirmed = [""]
-            try:
-                retried(ddl, unconfirmed)
-            except Exception as exc:  # noqa: BLE001 - isolate per-index failure
-                # Log-safe: the DDL is tool-generated (no row values, no
-                # credentials) and the driver message is a schema-level error.
-                # Tag a UNIQUE index: it is not only a missing access path, it is a
-                # missing CONSTRAINT -- the target now accepts duplicates the source
-                # forbids. The reporting layer needs to tell the two apart, and the DDL
-                # (tool-generated, no row values) is the only place that knows.
-                _unique = bool(re.match(r"\s*CREATE\s+UNIQUE\b", ddl, re.IGNORECASE))
-                failures.append(
-                    f"{'UNIQUE ' if _unique else ''}{_index_name_of(ddl)}: "
-                    f"{_safe_error(exc)}{unconfirmed[0]}"
-                )
-                _LOGGER.warning(
-                    "Post-load index creation failed (data is unaffected): %s",
-                    failures[-1],
-                )
-            else:
-                created += 1
-        # The submissions only: CREATE INDEX ASYNC returns before the index is built.
-        self.load_stats.add_phase("index", time.perf_counter() - started)
+        try:
+            for ddl in index_ddls:
+                unconfirmed = [""]
+                # Whether the last attempt sent the statement at all: one that failed to
+                # connect (its token, its handshake) or to open a cursor ran no CREATE.
+                sent = [False]
+                try:
+                    retried(ddl, unconfirmed, sent)
+                except Exception as exc:  # noqa: BLE001 - isolate per-index failure
+                    if unreachable_raises and (
+                        _is_retryable_load_error(exc) or not sent[0]
+                    ):
+                        raise IndexTargetUnreachable(created, failures) from exc
+                    # Log-safe: the DDL is tool-generated (no row values, no
+                    # credentials) and the driver message is a schema-level error.
+                    # Tag a UNIQUE index: it is not only a missing access path, it is a
+                    # missing CONSTRAINT -- the target now accepts duplicates the source
+                    # forbids. The reporting layer needs to tell the two apart, and the DDL
+                    # (tool-generated, no row values) is the only place that knows.
+                    _unique = bool(re.match(r"\s*CREATE\s+UNIQUE\b", ddl, re.IGNORECASE))
+                    failures.append(
+                        f"{'UNIQUE ' if _unique else ''}{_index_name_of(ddl)}: "
+                        f"{_safe_error(exc)}{unconfirmed[0]}"
+                    )
+                    _LOGGER.warning(
+                        "Post-load index creation failed (data is unaffected): %s",
+                        failures[-1],
+                    )
+                else:
+                    created += 1
+        finally:
+            # The submissions only: CREATE INDEX ASYNC returns before the index is built.
+            self.load_stats.add_phase("index", time.perf_counter() - started)
         return created, failures
+
+    @contextmanager
+    def index_pass(self) -> "Iterator[Callable[[Sequence[str]], tuple[int, list[str]]]]":
+        """The run-level index pass (P4a): every table's ``CREATE INDEX ASYNC`` statements
+        on ONE Aurora DSQL connection, one statement at a time.
+
+        Yields ``create(ddls) -> (created, failures)``, :meth:`_create_indexes` over one
+        one-connection pool reused for every call (a connection the server only rejected a
+        statement on is kept, one that may have ended is replaced, as on the load path), so
+        the pass opens one connection -- one TLS handshake and one IAM token -- instead of
+        one per table. A DDL Aurora DSQL did not answer within its retry budget raises
+        :class:`IndexTargetUnreachable` rather than being recorded as a missing index. The
+        connection is closed when the pass ends. Its connects are not counted: each table's
+        submissions count into the collector bound at the call.
+        """
+        pool = _ConnectionPool(self._connection_factory, 1, stats=None)
+
+        def create(index_ddls: "Sequence[str]") -> "tuple[int, list[str]]":
+            ddls = list(index_ddls or ())
+            if not ddls:
+                return 0, []
+            return self._create_indexes(pool, ddls, unreachable_raises=True)
+
+        try:
+            yield create
+        finally:
+            pool.close_all()
 
     def create_indexes(self, index_ddls: list[str]) -> "tuple[int, list[str]]":
         """Public post-load index pass on a fresh bounded pool (``(created, failures)``).
 
-        A regular :meth:`import_rows` runs the post-load ``CREATE INDEX ASYNC`` pass
-        itself, so the ONLY caller is the MULTIPROCESS sharded-REPLACE path: there each
-        shard is a separate process that loads a PK slice with NO ``index_ddls``, so no
-        single ``import_rows`` owns the whole table to run the post-load pass. The parent
-        recreates the empty target once and, after every shard succeeds, calls this ONCE
-        to build the secondary indexes. It opens its own bounded :class:`_ConnectionPool`
-        and delegates to :meth:`_create_indexes`, so the ``CREATE INDEX ASYNC`` / OCC-retry
-        / per-DDL isolation behavior is IDENTICAL to the non-sharded path. A no-op (and no
-        connection opened) when there are no index DDLs.
+        A regular :meth:`import_rows` given ``index_ddls`` runs the post-load ``CREATE
+        INDEX ASYNC`` pass itself; the Full Load engine leaves a run's to its run-level
+        index pass instead, which uses :meth:`index_pass` (one connection for the whole
+        pass) and this method only for an importer without it. It opens its own bounded
+        :class:`_ConnectionPool` and delegates to :meth:`_create_indexes`, so the ``CREATE
+        INDEX ASYNC`` / OCC-retry / per-DDL isolation behavior is IDENTICAL to the
+        ``import_rows`` path. A no-op (and no connection opened) when there are no index
+        DDLs.
         """
         if not index_ddls:
             return 0, []
@@ -2542,6 +2613,7 @@ __all__ = [
     "BatchedImportOptions",
     "BatchedImportResult",
     "BatchedImporter",
+    "IndexTargetUnreachable",
     "UNCONFIRMED_INDEX_NOTE",
     "UNCONFIRMED_INDEX_DROP_NOTE",
     "batch_chunk_id",

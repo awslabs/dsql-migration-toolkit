@@ -177,7 +177,8 @@ _LINE = (
 )
 _RECREATES = (
     "Drop & reload recreates each table from your applied Schema Conversion (including any "
-    "edits you made there), then rebuilds its secondary indexes after loading."
+    "edits you made there), then rebuilds its secondary indexes once every table's data has "
+    "loaded."
 )
 
 # The actions that take a NEW start point: (job record, step status).

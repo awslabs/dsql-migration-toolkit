@@ -73,6 +73,7 @@ from dsql_migrator.ui.data_migration._models import (
     format_watermark,
     full_load_completeness,
     exclusion_forced_replace,
+    index_pending_tables,
     mysql_reads_may_split,
     SPLIT_SET_FIXED,
     split_read_tables,
@@ -122,6 +123,15 @@ _SPLIT_FORCED_REASON = (
     "parts as they are (CDC from a re-run's new start point never replays the changes before "
     "it, and after a reload with one reader the table stays marked), so it is dropped and "
     "reloaded"
+)
+# P4a: a loaded table whose secondary indexes the run did not submit (index_pending_tables):
+# its row in the Retry unfinished tables checklist, and the notice beside the index notice.
+INDEX_PENDING_REASON = "Data loaded; secondary indexes not created yet."
+INDEX_PENDING_BODY = (
+    "The data of these tables is loaded, but the run ended before it submitted their "
+    "secondary indexes (a stop during that step, an app restart, or Aurora DSQL not "
+    "answering). A UNIQUE index among them is a missing constraint until it exists. Retry "
+    "unfinished tables submits them without reloading any data."
 )
 
 # G25 (decision A): while CDC is live the step keeps its "Stop CDC first" gate. A Full Load
@@ -857,7 +867,7 @@ def _render_full_load_step(
     def _open_confirm_dialog_now(
         *, action_tables, on_confirm, title, keeps_watermark, table_reasons=None,
         preselect=True, checklist_hint=None, overlay=None, on_retry=None,
-        addition_forced=None, cdc_additions=frozenset(),
+        addition_forced=None, cdc_additions=frozenset(), index_only=frozenset(),
     ) -> None:
         """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
 
@@ -900,6 +910,11 @@ def _render_full_load_step(
         if it is false). In a CDC migration type it also words the Append / Drop & reload
         choice (G27): a new start point does not call Append recommended and names Drop &
         reload (:data:`_APPEND_NEW_CDC_START_POINT`); Append stays the default either way.
+
+        ``index_only`` (P4a, Retry unfinished tables) names checklist tables whose data is
+        loaded and that only get their secondary indexes: listed and tickable, but never
+        offered a reload choice, a recreate or an overlay, and the summary says no row is
+        read or written for them.
         """
         from nicegui import context as _ctx
 
@@ -936,8 +951,11 @@ def _render_full_load_step(
                 "built before any target primary key was read."
             )
         _candidates = schema_recreate_candidates() or ()
+        # The tables this action reads and writes rows of: an index-only one (P4a) neither.
+        _index_only = frozenset(index_only or ())
+        load_tables = [n for n in action_tables if n not in _index_only]
         recreate_now = (
-            [] if cdc_live_now else [n for n in _candidates if n in set(action_tables)]
+            [] if cdc_live_now else [n for n in _candidates if n in set(load_tables)]
         )
         # The column-exclusion overlay (None -> the previous dialog, unchanged).
         _ov = overlay or {}
@@ -962,12 +980,12 @@ def _render_full_load_step(
             missing_uncreated: list[str] = []
         else:
             _will_create = (
-                set(action_tables)
+                set(load_tables)
                 if (migration_state.reload_mode == "drop" and not cdc_live_now)
                 else set(recreate_now)
             ) | set(forced)
             missing_uncreated = [
-                n for n in action_tables
+                n for n in load_tables
                 if n not in _present and n not in _will_create
             ]
         selectable = table_reasons is not None
@@ -1004,11 +1022,27 @@ def _render_full_load_step(
                 def _summary() -> str:
                     # A G17 addition joins the publication only when the watermark has the
                     # load's slot (_pg_publication); without one Start CDC re-snapshots it.
-                    return full_load_confirm_summary(
-                        _ticked(action_tables), _engine, _migration_type,
-                        keeps_watermark=keeps_watermark, cdc_live=cdc_live_now,
-                        publication_additions=cdc_additions if _pg_publication else (),
+                    ticked = _ticked(action_tables)
+                    loads = [n for n in ticked if n not in _index_only]
+                    only = len(ticked) - len(loads)
+                    text = (
+                        full_load_confirm_summary(
+                            loads, _engine, _migration_type,
+                            keeps_watermark=keeps_watermark, cdc_live=cdc_live_now,
+                            publication_additions=cdc_additions if _pg_publication else (),
+                        )
+                        if loads or not only
+                        else ""
                     )
+                    if only:
+                        # P4a: their data is loaded; only their secondary indexes are owed.
+                        text = (
+                            f"{text} {only} loaded "
+                            f"{'table only gets its' if only == 1 else 'tables only get their'}"
+                            " secondary indexes: no row is read or written for "
+                            f"{'it' if only == 1 else 'them'}."
+                        ).strip()
+                    return text
 
                 summary_label = ui.label(_summary()).classes("text-sm")
                 # Missing target tables an append can't create -> warn BEFORE the load
@@ -1070,7 +1104,7 @@ def _render_full_load_step(
                 # announced as dropped.
                 if overlay is not None or _addition_forced:
                     _render_overlay_blocks(
-                        ui, _ov, action_tables=action_tables, forced=forced,
+                        ui, _ov, action_tables=load_tables, forced=forced,
                         recreate_now=recreate_now, radio_tables=radio_tables,
                         cdc_live_now=cdc_live_now, dialog=confirm_dialog,
                         on_retry=on_retry, reload_mode=migration_state.reload_mode,
@@ -1194,7 +1228,8 @@ def _render_full_load_step(
                         ui.label(
                             "Drop & reload recreates each table from your applied "
                             "Schema Conversion (including any edits you made there), "
-                            "then rebuilds its secondary indexes after loading."
+                            "then rebuilds its secondary indexes once every table's "
+                            "data has loaded."
                         ).classes("text-xs text-gray-500")
 
                 def _confirm() -> None:
@@ -1338,6 +1373,7 @@ def _render_full_load_step(
         checklist_hint=None,
         cdc_additions=frozenset(),
         keeps_watermark=False,
+        index_only=frozenset(),
     ) -> None:
         """Probe which target tables hold data, then open the confirm dialog.
 
@@ -1360,6 +1396,8 @@ def _render_full_load_step(
         under the original watermark (Retry unfinished tables, a per-table Reload, Reload
         specific tables). A new snapshot is refused here, before any probe, while the
         new-start-point gate holds (G25) -- the page header's Run reaches this dialog too.
+        ``index_only`` (P4a, Retry unfinished tables): checklist tables that only get their
+        secondary indexes -- never probed, forced, overlaid or offered Drop & reload.
         """
         if _confirm_busy["value"]:
             return  # a probe is already in flight -> ignore the extra click
@@ -1370,6 +1408,8 @@ def _render_full_load_step(
         action_tables = (
             list(probe_tables) if probe_tables is not None else list(selected_names)
         )
+        # The tables whose rows this action reads and writes (an index-only one: none).
+        load_tables = [t for t in action_tables if t not in set(index_only or ())]
         confirm_action = on_confirm if on_confirm is not None else start_full_load
         btn = getattr(event, "sender", None)
         original_text = getattr(btn, "text", None) if btn is not None else None
@@ -1404,14 +1444,14 @@ def _render_full_load_step(
             # target probe, so a record for this target marks the session as using the
             # ledger even when the probe then fails (the engine then checks it).
             view = (
-                exclusion_overlay_view(action_tables)
-                if exclusion_overlay_view is not None and action_tables
+                exclusion_overlay_view(load_tables)
+                if exclusion_overlay_view is not None and load_tables
                 else None
             )
             ledger_configured = False
             ledger_error = False
             ledger_tables: dict = {}
-            if target_config is not None and action_tables and overlay_ledger_read is not None:
+            if target_config is not None and load_tables and overlay_ledger_read is not None:
                 from nicegui import run
 
                 try:
@@ -1436,20 +1476,20 @@ def _render_full_load_step(
                 or (ledger_error and bool(getattr(migration_state, "overlay_ledger_in_use", False)))
             )
             read_tables = sorted(
-                t for t in action_tables
+                t for t in load_tables
                 if overlay_active and not ledger_error
                 and (t in view.overlay_by_table or t in ledger_tables)
             )
             facts: Optional[dict] = {}
             probe_failed = False
-            if target_config is not None and action_tables:
+            if target_config is not None and load_tables:
                 from nicegui import run
 
                 def _probe() -> tuple[frozenset[str], dict, frozenset[str], dict]:
                     connector = DsqlConnector(
                         target_config, aws_profile=session.aws_profile
                     )
-                    names = list(action_tables)
+                    names = list(load_tables)
                     found = frozenset(
                         tables_with_rows(names, connection_factory=connector.connect)
                     )
@@ -1516,7 +1556,7 @@ def _render_full_load_step(
             # re-checks before loading.
             addition_forced = {
                 t: _ADDITION_FORCED_REASON
-                for t in action_tables
+                for t in load_tables
                 if t in (cdc_additions or ()) and t in migration_state.tables_with_data
             }
             # G137: a run drops and reloads a table the Full Load read in parts, while its
@@ -1533,7 +1573,7 @@ def _render_full_load_step(
                     _current_job(job_manager, getattr(migration_state, "job_id", None))
                 ))
                 addition_forced = {
-                    **{t: _SPLIT_FORCED_REASON for t in action_tables if t in _split_waiting},
+                    **{t: _SPLIT_FORCED_REASON for t in load_tables if t in _split_waiting},
                     **addition_forced,
                 }
             if overlay_active:
@@ -1543,7 +1583,7 @@ def _render_full_load_step(
                     # but a table the tool recreated and did not finish is still forced
                     # (reloading it needs no facts).
                     outcome = exclusion_forced_replace(
-                        action_tables,
+                        load_tables,
                         overlay_by_table=view.overlay_by_table,
                         excluded_by_table=view.excluded_by_table,
                         source_columns_for=view.source_columns_for,
@@ -1568,7 +1608,7 @@ def _render_full_load_step(
                     None, probe_tables=action_tables, on_confirm=confirm_action,
                     title=title, table_reasons=table_reasons, preselect=preselect,
                     checklist_hint=checklist_hint, cdc_additions=cdc_additions,
-                    keeps_watermark=keeps_watermark,
+                    keeps_watermark=keeps_watermark, index_only=index_only,
                 )
 
             _open_confirm_dialog_now(
@@ -1583,6 +1623,7 @@ def _render_full_load_step(
                 on_retry=_retry,
                 addition_forced=addition_forced,
                 cdc_additions=cdc_additions,
+                index_only=frozenset(index_only or ()),
             )
         finally:
             _confirm_busy["value"] = False
@@ -1720,6 +1761,7 @@ def _render_full_load_step(
             full_load_completeness(rows),
             approximate=approximate,
             quarantine_accepted=migration_state.accept_quarantined_rows,
+            indexes_pending=len(index_pending_tables(current)),
         )
         # The action the banner just described, directly beneath its verdict.
         _render_accept_quarantine_action(
@@ -1981,14 +2023,14 @@ def _render_full_load_step(
         # main action. The standalone button is only for the pre-run Start and
         # for a clean finished run (DONE, no failures) where re-running all is the
         # natural single action.
-        # A terminated run with ANY unfinished table (FAILED or still PENDING)
-        # shows the recovery row (Retry unfinished / Re-run all) instead of a lone
-        # "Re-run Full Load" -- so a crash that left tables PENDING still offers a
-        # scoped retry, not just a full re-run.
+        # A terminated run with ANY unfinished table (FAILED or still PENDING), or a loaded
+        # one whose secondary indexes were not submitted yet (P4a), shows the recovery row
+        # (Retry unfinished / Re-run all) instead of a lone "Re-run Full Load" -- so a crash
+        # that left tables PENDING still offers a scoped retry, not just a full re-run.
         terminal_with_failures = (
             job is not None
             and status is not StepStatus.IN_PROGRESS
-            and bool(unsettled_table_names(job))
+            and bool(unsettled_table_names(job) or index_pending_tables(job))
         )
         if not terminal_with_failures:
             start_label = "Re-run Full Load" if job is not None else "Start Full Load"
@@ -2072,7 +2114,18 @@ def _render_full_load_step(
                 accepted=bool(getattr(migration_state, "accept_quarantined_rows", False)),
                 error_log=migration_state.error_log,
             ) is StepStatus.DONE
-            if job_error and not _quarantine_only_error and not _scope_clears_error:
+            # P4a: every table loaded and some only owe their secondary indexes -- the
+            # progress section's "Secondary indexes not created yet" notice states that and
+            # its remedy; a red "Load failed" would contradict "the data is loaded".
+            _indexes_only_error = not unsettled_table_names(job) and bool(
+                index_pending_tables(job)
+            )
+            if (
+                job_error
+                and not _quarantine_only_error
+                and not _scope_clears_error
+                and not _indexes_only_error
+            ):
                 render_notice(
                     ui,
                     tone="error",
@@ -2084,8 +2137,11 @@ def _render_full_load_step(
             # PENDING). A fatal/aborted run (e.g. a run-level crash before the big
             # tables were attempted) leaves them PENDING, not FAILED -- so keying
             # recovery off FAILED alone would strand them with only a full "Re-run"
-            # as escape. ``unsettled`` resumes exactly the unfinished tables.
-            failed = unsettled_table_names(job)
+            # as escape. ``unsettled`` resumes exactly the unfinished tables. P4a: plus
+            # every loaded table whose secondary indexes the run did not submit, which
+            # the retry completes without reloading it (``index_only``).
+            _index_pending = index_pending_tables(job)
+            failed = unsettled_table_names(job) + _index_pending
             if failed:
                 # Recovery needs a live, VERIFIED source AND target. After a session
                 # restore the connections (and the in-memory source password) are NOT
@@ -2191,8 +2247,13 @@ def _render_full_load_step(
                     _not_addable_set = set(_not_addable)
                     _pending_set = set(_pending)
                     _added_set = set(_added)
+                    _index_pending_set = frozenset(_index_pending)
 
                     def _reason_for(name: str) -> str:
+                        # P4a: loaded, only its secondary indexes are owed -- before any
+                        # older message (an index failure may be its latest record).
+                        if name in _index_pending_set:
+                            return INDEX_PENDING_REASON
                         # G17: a Full load + CDC table the watermark does not cover yet --
                         # one Retry cannot add, or one whose load quarantined rows, says so
                         # before any older failure message.
@@ -2225,6 +2286,12 @@ def _render_full_load_step(
                         # scoped to the CHECKED subset, so the user can retry only the
                         # tables they're ready for.
                         retry_fn = retry_tables or (lambda _names: retry_failed_load())
+                        if _index_pending_set and retry_tables is not None:
+                            # P4a: a ticked loaded table only gets its secondary indexes.
+                            def retry_fn(names, _owed=_index_pending_set):  # noqa: F811
+                                retry_tables(
+                                    names, index_only=[n for n in names if n in _owed]
+                                )
                         await _open_full_load_confirm(
                             event,
                             probe_tables=list(failed),
@@ -2233,6 +2300,7 @@ def _render_full_load_step(
                             table_reasons={n: _reason_for(n) for n in failed},
                             cdc_additions=frozenset(_pending),
                             keeps_watermark=True,  # the retry engine, original watermark
+                            index_only=_index_pending_set,
                         )
 
                     retry_btn = ui.button(
@@ -2278,6 +2346,20 @@ def _render_full_load_step(
                             "table(s) (failed, not reached, or selected after the last "
                             f"run); the {done_count} loaded table(s) are kept as-is (no "
                             "re-load, no new snapshot)."
+                        )
+                    elif _index_pending and len(_index_pending) == len(failed):
+                        retry_btn.tooltip(
+                            "Recommended: submit the secondary indexes of the "
+                            f"{len(failed)} loaded table(s) that do not have them yet, "
+                            "without reloading any data (no new snapshot)."
+                        )
+                    elif _index_pending:
+                        retry_btn.tooltip(
+                            f"Recommended: re-run Full Load for only the "
+                            f"{len(failed) - len(_index_pending)} failed table(s) and "
+                            f"submit the secondary indexes of {len(_index_pending)} loaded "
+                            "table(s) without reloading them; the other loaded tables are "
+                            "kept as-is (no re-load, no new snapshot)."
                         )
                     else:
                         retry_btn.tooltip(
@@ -2441,11 +2523,15 @@ def _incomplete_is_quarantine_only(
     so there are NO unfinished chunks; the run is incomplete only because rows were
     permanently dropped. That is the one case the accept-and-continue override may
     unblock -- any UNFINISHED table (a FAILED chunk, or one still PENDING because
-    the run ended before it loaded) is retryable work and must still block.
+    the run ended before it loaded) is retryable work and must still block, and so is a
+    loaded table whose secondary indexes are not submitted yet (P4a: a UNIQUE one among
+    them is a missing constraint until Retry unfinished tables submits it).
     """
     if job is None:
         return False
     if unsettled_table_names(job):  # retryable/unfinished work is present
+        return False
+    if index_pending_tables(job):  # secondary indexes still owed: retryable work
         return False
     return _quarantined_row_count(job, error_log, tables) > 0
 
@@ -2502,12 +2588,19 @@ def full_load_step_for_scope(
     or cancelled job is DONE only when its unfinished work lies entirely in tables no
     longer selected -- a run-level failure or a cancel with every chunk loaded stays
     FAILED. ``None`` while the job runs.
+
+    P4a: a selected table whose secondary indexes are not submitted yet
+    (:func:`index_pending_tables`) is unfinished work like an unsettled one -- FAILED, so
+    the step is never DONE with a UNIQUE index missing -- while one no longer selected does
+    not block, like an unsettled one.
     """
     if job is None or job.status in ("PENDING", "RUNNING"):
         return None
     mapped = job_status_to_step_status(job.status)
     if mapped is None:
         return None
+    if index_pending_tables(job if scoped is None else scoped):
+        return StepStatus.FAILED
     if (
         mapped is StepStatus.FAILED
         and accepted
@@ -2526,7 +2619,9 @@ def full_load_step_for_scope(
         return StepStatus.DONE
     view = {c.chunk_id for c in scoped.chunks}
     if any(
-        c.status != "DONE" or (getattr(c, "rows_quarantined", 0) or 0) > 0
+        c.status != "DONE"
+        or (getattr(c, "rows_quarantined", 0) or 0) > 0
+        or bool(getattr(c, "indexes_pending", False))
         for c in job.chunks
         if c.chunk_id not in view
     ):
@@ -3321,6 +3416,20 @@ def _render_full_load_progress(
                 )
         return _btn
 
+    # P4a: loaded tables whose secondary indexes the run ended before submitting. Beside
+    # the index notice below, which lists the indexes that were submitted and failed: these
+    # were never submitted, and Retry unfinished tables submits them without a reload.
+    pending_indexes = index_pending_tables(job) if terminal else []
+    if pending_indexes:
+        listed = ", ".join(pending_indexes[:8]) + (
+            f" and {len(pending_indexes) - 8} more" if len(pending_indexes) > 8 else ""
+        )
+        render_notice(
+            ui,
+            tone="warning",
+            header=f"Secondary indexes not created yet ({len(pending_indexes)} table(s))",
+            body=f"{INDEX_PENDING_BODY} Tables: {listed}.",
+        )
     if index_only:
         # Data-complete, index-missing. Deliberately its own INFO-toned block, apart
         # from failures and quarantine: nothing is missing from the target, so the
@@ -3773,6 +3882,7 @@ def _render_completeness_banner(
     *,
     approximate: bool = False,
     quarantine_accepted: bool = False,
+    indexes_pending: int = 0,
 ) -> None:
     """Render the source-vs-loaded completeness verdict once the load settles.
 
@@ -3784,9 +3894,25 @@ def _render_completeness_banner(
     verdict is shown as a calm INFO note pointing at Validation for an exact
     check, NOT a red "finished with issues" alert. A genuinely FAILED table is
     always surfaced as a warning regardless of the baseline's precision.
+
+    ``indexes_pending`` (P4a): loaded tables whose secondary indexes are not submitted yet.
+    Every row loaded then, but the load is not complete: the verdict says so instead of a
+    green "Full Load complete" beside a Failed step.
     """
     if completeness.total == 0 or completeness.settled != completeness.total:
         return  # still running -- the verdict is only meaningful when settled
+    if completeness.all_complete and indexes_pending:
+        _render_notice(
+            ui,
+            tone="info",
+            header="Every row loaded — secondary indexes not created yet",
+            body=(
+                f"All {completeness.total} tables loaded every source row (loaded rows "
+                "match the source snapshot count); the secondary indexes of "
+                f"{indexes_pending} of them are not created yet."
+            ),
+        )
+        return
     if completeness.all_complete:
         _render_notice(
             ui,

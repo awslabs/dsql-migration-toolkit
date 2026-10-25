@@ -328,16 +328,37 @@ def unsettled_table_names(job: MigrationJob) -> list[str]:
     return [chunk.chunk_id for chunk in job.chunks if chunk.status != "DONE"]
 
 
+def index_pending_tables(job: Optional[MigrationJob]) -> list[str]:
+    """The tables whose data a Full Load loaded but whose secondary indexes it has not
+    submitted yet (P4a): DONE chunks flagged ``indexes_pending``, in chunk order.
+
+    The run submits a recreated table's ``CREATE INDEX ASYNC`` statements only after every
+    table's data has loaded; one that ended first (a Stop during that pass, an app restart,
+    Aurora DSQL not answering) leaves these. Unfinished work for the step's verdict, but not
+    a table to reload: Retry unfinished tables submits their indexes without reading a row
+    (``run_full_load_retry(index_only=...)``). Pure."""
+    if job is None:
+        return []
+    return [
+        chunk.chunk_id
+        for chunk in getattr(job, "chunks", None) or ()
+        if chunk.status == "DONE" and getattr(chunk, "indexes_pending", False)
+    ]
+
+
 def untick_can_settle(job, names: "Optional[Sequence[str]]") -> bool:
     """Could unticking a selected table settle a FAILED Full Load step (G16)? True when a
-    table of the current view (``names``; ``None`` = the whole record) did not finish or
-    dropped rows. A run-level failure with every one of them loaded -- a post-load pass
-    raised, an app restart or a Stop after the last table -- stays Failed whatever is
-    unticked (:func:`~dsql_migrator.ui.data_migration._full_load_ui.full_load_step_for_scope`),
+    table of the current view (``names``; ``None`` = the whole record) did not finish,
+    dropped rows or still owes its secondary indexes (P4a). A run-level failure with every
+    one of them loaded -- a post-load pass raised, an app restart or a Stop after the last
+    table -- stays Failed whatever is unticked
+    (:func:`~dsql_migrator.ui.data_migration._full_load_ui.full_load_step_for_scope`),
     so offering the untick there would be a dead end. Pure, O(tables)."""
     wanted = None if names is None else set(names)
     return any(
-        chunk.status != "DONE" or (getattr(chunk, "rows_quarantined", 0) or 0) > 0
+        chunk.status != "DONE"
+        or (getattr(chunk, "rows_quarantined", 0) or 0) > 0
+        or bool(getattr(chunk, "indexes_pending", False))
         for chunk in getattr(job, "chunks", None) or ()
         if wanted is None or chunk.chunk_id in wanted
     )

@@ -314,7 +314,7 @@ def test_the_pool_starts_the_largest_table_first_and_nothing_else_moves(run) -> 
     # Only the start order changed: the job lists its tables as given, the serial recreate
     # pre-pass (before any unit starts) still walks them in that order, and every table loads.
     assert r.chunks == names and r.recreated == names
-    assert set(r.status.values()) == {"DONE"} and r.counts == (0, 0)
+    assert set(r.status.values()) == {"DONE"} and r.counts == (0, 0, 0)
     assert r.exporter.size_reads == []        # MySQL: the start point's estimates only
 
 

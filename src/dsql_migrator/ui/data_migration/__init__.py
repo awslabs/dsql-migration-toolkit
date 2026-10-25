@@ -226,6 +226,7 @@ from dsql_migrator.ui.data_migration._models import (
     split_route_view,
     SPLIT_READ_HEADER,
     unsettled_table_names,
+    index_pending_tables,
     full_load_scope_names,
     whole_record_selected,
     untick_can_settle,
@@ -1008,6 +1009,17 @@ def build_data_migration_screen(
             )
         )
 
+        # P4a: a table whose secondary indexes the previous Full Load ended before submitting
+        # owes them still -- an append does not recreate it, so this run's index pass submits
+        # the ones not on it yet. Every flagged chunk counts, whatever its status: a load that
+        # failed or stopped kept the flag.
+        _previous = _current_job(job_manager, migration_state.job_id)
+        carried_index_pending = {
+            c.chunk_id
+            for c in (getattr(_previous, "chunks", None) or ())
+            if getattr(c, "indexes_pending", False)
+        } & set(names)
+
         def work(handle: JobHandle) -> None:
             run_full_load(
                 handle,
@@ -1021,6 +1033,7 @@ def build_data_migration_screen(
                 # or captures its watermark -- the CDC state can change after the check
                 # above (its probe runs off the event loop).
                 start_point_refusal=lambda: new_start_point_refusal(migration_state, _engine),
+                carried_index_pending=carried_index_pending,
             )
 
         reset_stale_manual_start_point(
@@ -2071,12 +2084,16 @@ def build_data_migration_screen(
                     job_manager.request_cancel(job_id)
                 refresh()
 
-            def _run_retry_for(names_to_retry: Sequence[str]) -> None:
+            def _run_retry_for(
+                names_to_retry: Sequence[str], *, index_only: "Sequence[str]" = ()
+            ) -> None:
                 # Shared scoped re-run: carries succeeded tables forward and re-runs
                 # ONLY ``names_to_retry`` (the failed set, or a single table picked
                 # via per-table Reload), reusing the original watermark. Works for a
                 # DONE table too (e.g. reloading a quarantine table after fixing the
-                # source value), since it re-seeds exactly those chunks.
+                # source value), since it re-seeds exactly those chunks. ``index_only``
+                # (P4a, Retry unfinished tables): loaded tables among them that only get
+                # their secondary indexes -- never reloaded, never dropped.
                 _restore_block = cutover_restore_block_reason(migration_state)
                 if _restore_block:
                     ui.notify(_restore_block, type="warning", position="top")
@@ -2192,6 +2209,9 @@ def build_data_migration_screen(
                     )
                     refresh()
                     return
+                # P4a: index-only among the tables this retry runs, never a table CDC does not
+                # capture yet (it reloads under its guards); the engine checks the chunks too.
+                _index_only = (set(index_only or ()) & set(names)) - set(_cdc_additions)
                 source_config = session.source_config
                 target_config = session.target_config
                 assert source_config is not None and target_config is not None
@@ -2219,7 +2239,7 @@ def build_data_migration_screen(
                     if retry_cdc_coexisting
                     else frozenset(taken_replace | set(recreated_unfinished(current)))
                     & set(names)
-                )
+                ) - _index_only  # P4a: an index-only table is never dropped
                 if retry_replace:
                     # This retry will DROP+recreate these tables, and DSQL drops a table's
                     # foreign keys with it -- so a previously-applied result no longer
@@ -2262,12 +2282,17 @@ def build_data_migration_screen(
                         applied_conversions=_applied_retry_conversion,
                         preserve_foreign_keys=conv_state.preserve_foreign_keys,
                     ),
+                    # The tables whose rows it writes: an index-only one is not overlaid.
                     **_overlay_inputs(
                         migration_state, inventory, _applied_retry_conversion,
-                        conv_state.preserve_foreign_keys, tables=names,
+                        conv_state.preserve_foreign_keys,
+                        tables=[n for n in names if n not in _index_only],
                     ),
                 )
-                if _disclosed_differs(retry_disclosed, retry_inputs.overlay_columns, names):
+                if _disclosed_differs(
+                    retry_disclosed, retry_inputs.overlay_columns,
+                    [n for n in names if n not in _index_only],
+                ):
                     migration_state.set_error(
                         "The excluded-column changes were re-evaluated after the dialog "
                         "opened (a restored session's exclusions were classified); review "
@@ -2331,6 +2356,7 @@ def build_data_migration_screen(
                             if _cdc_additions
                             else None
                         ),
+                        index_only=sorted(_index_only),
                     )
 
                 reset_stale_manual_start_point(
@@ -2359,15 +2385,18 @@ def build_data_migration_screen(
                     return
                 # The CURRENT set's unfinished tables (G12): a table no longer selected is
                 # not retried; one selected since the load is -- in Full load + CDC, every one
-                # its watermark does not cover yet (G17, scoped_full_load_view).
-                _run_retry_for(unsettled_table_names(scoped_full_load_view(
+                # its watermark does not cover yet (G17, scoped_full_load_view). P4a: plus the
+                # loaded ones whose secondary indexes are still owed, which it does not reload.
+                _view = scoped_full_load_view(
                     migration_state,
                     job_manager,
                     resolve_migration_selection(
                         inventory, conv_state, migration_state, _target_inventory()
                     ),
                     job=current,
-                )))
+                )
+                _owed = index_pending_tables(_view)
+                _run_retry_for(unsettled_table_names(_view) + _owed, index_only=_owed)
 
             def reload_table(table_name: str) -> None:
                 # Per-table Reload: re-run Full Load for exactly one table (even a
@@ -2398,10 +2427,13 @@ def build_data_migration_screen(
                 open_exclusion_route(ui, _exclusion_ctx, table_name, reason_text,
                                      lob_candidates_for=lob_candidates_for)
 
-            def retry_tables(names: Sequence[str]) -> None:
+            def retry_tables(names: Sequence[str], *, index_only: Sequence[str] = ()) -> None:
                 # Retry an explicit SUBSET of tables (the failed-table checklist's
                 # ticked set). Same scoped retry path as Reload, for many tables.
-                _run_retry_for(list(names))
+                # ``index_only`` (P4a): the ticked loaded tables that only get their
+                # secondary indexes (Retry unfinished tables); Reload specific tables
+                # passes none, so a reload reloads.
+                _run_retry_for(list(names), index_only=index_only)
 
             # On-demand AI diagnosis of a FAILED Full Load table (opt-in: AI Assist
             # on). Reuses the shared chat drawer + a strategist (resolved per send) bound
@@ -6558,6 +6590,7 @@ __all__ = [
     "recreated_unfinished",
     "split_read_tables",
     "unsettled_table_names",
+    "index_pending_tables",
     "RestoredExclusionFacts",
     "classify_restored_exclusions",
     "legacy_lob_exclusions",

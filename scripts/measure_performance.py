@@ -751,7 +751,7 @@ def cmd_full_load(args) -> int:
     # SQLSTATE, attempt count, and total elapsed per failed batch -- direct evidence
     # of WHY a batch failed (budget too small vs a storm longer than the budget vs a
     # non-transient error), instead of inferring from timing. It sees only the work
-    # that runs in THIS process (the replace pre-pass, a sharded table's index pass);
+    # that runs in THIS process (the replace pre-pass, the run's index pass since P4a);
     # the table workers' retries are in the write-path counters below.
     occ_logger = logging.getLogger("dsql_migrator.core.occ")
     occ_logger.setLevel(logging.DEBUG)
@@ -935,8 +935,10 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
     # falsely faster. data_phase_rows_per_sec is the apples-to-apples metric to
     # compare variants on; overall_rows_per_sec is kept for continuity. A chunk starts
     # when its worker begins and finishes when the parent records its result, so this
-    # span includes each table's index submission and post-load COUNT; ``load_window``
-    # below is the workers' data passes alone.
+    # span includes each table's post-load COUNT; ``load_window`` below is the workers'
+    # data passes alone. Since P4a it no longer includes the index submissions: the run
+    # submits every table's after the last chunk finished (in wall_seconds, not here), so
+    # compare it across that change with care.
     starts = [c.started_at for c in job.chunks if c.started_at]
     finishes = [c.finished_at for c in job.chunks if c.finished_at]
     data_phase_secs = None
@@ -1002,9 +1004,10 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             "seconds": window_secs,
             "rows_per_sec": round(total_rows / window_secs, 1) if window_secs else None,
         },
-        # Seconds summed over the tables (they overlap in wall time): writing rows,
-        # submitting the post-load CREATE INDEX ASYNC statements (the builds run on after),
-        # and the post-load COUNT(*) of each replace table.
+        # Seconds summed over the tables (the loads overlap in wall time): writing rows,
+        # submitting the CREATE INDEX ASYNC statements (since P4a one at a time after every
+        # table's data, so that part does not overlap; the builds run on after), and the
+        # post-load COUNT(*) of each replace table.
         "phases_seconds": {
             "load": run.get("load_s"), "index": run.get("index_s"),
             "count": run.get("count_s"),

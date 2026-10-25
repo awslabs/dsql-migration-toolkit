@@ -13,6 +13,7 @@ module, so the public import surface is unchanged.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import multiprocessing
@@ -50,11 +51,12 @@ from dsql_migrator.core.introspector import (
     source_error_hint,
 )
 from dsql_migrator.core.job_manager import JobHandle
-from dsql_migrator.core.load_stats import LoadStats, LoadStatsBoard
+from dsql_migrator.core.load_stats import LoadStats, LoadStatsBoard, retry_code
 from dsql_migrator.core.batched_import import (
     MAX_QUARANTINE_RECORDS,
     BatchedImporter,
     BatchedImportOptions,
+    IndexTargetUnreachable,
     OnConflictMode,
     _disable_prepared_statements,
     is_unconfirmed_index_failure,
@@ -302,6 +304,10 @@ class TableLoadResult:
     # The write path's counters for this table (core.load_stats snapshot): counts and
     # timings only. Empty when the migrator kept none.
     load_stats: dict = field(default_factory=dict)
+    # P4a: the secondary-index DDLs of a table this load recreated, left to the run's index
+    # pass (``migrate_table(defer_indexes=True)``), which submits them after every table's
+    # data has loaded. Empty when the load submitted them itself or had none.
+    deferred_index_ddls: tuple = ()
 
 
 class _ZeroDateTally:
@@ -564,12 +570,19 @@ def _complete_chunk(
     rows_loaded: int,
     rows_skipped: int = 0,
     rows_quarantined: int = 0,
+    *,
+    indexes_pending: Optional[bool] = None,
 ) -> None:
     """Mark ``chunk_id`` ``DONE``; record loaded/skipped/quarantined rows and finish.
 
     ``rows_quarantined`` are rows permanently DROPPED (a non-retryable per-row error),
     recorded on the chunk so the run-level completeness verdict can see the gap instead
     of inferring completeness from a row count the estimate's tolerance absorbs.
+
+    ``indexes_pending`` True (P4a): the load left this table's secondary indexes to the
+    run's index pass, which clears the flag (:func:`_clear_indexes_pending`) once it has
+    submitted them. Anything else leaves the flag as it is -- an append keeps one carried
+    from an earlier run, so its indexes are still submitted -- and nothing here clears it.
     """
     chunk = _find_chunk(job, chunk_id)
     if chunk is not None:
@@ -578,7 +591,25 @@ def _complete_chunk(
         chunk.rows_skipped = rows_skipped
         chunk.rows_quarantined = rows_quarantined
         chunk.finished_at = datetime.now(timezone.utc)
+        if indexes_pending:
+            chunk.indexes_pending = True
     _recompute_progress(job)
+
+
+def _clear_indexes_pending(job: MigrationJob, chunk_id: str) -> None:
+    """The run's index pass submitted ``chunk_id``'s secondary indexes (P4a)."""
+    chunk = _find_chunk(job, chunk_id)
+    if chunk is not None:
+        chunk.indexes_pending = False
+
+
+def _mark_indexes_pending(job: MigrationJob, names: "Collection[str]") -> None:
+    """Flag the chunks of ``names`` as owing their secondary indexes (P4a): a fresh run
+    carries the tables an earlier Full Load ended before submitting them for."""
+    wanted = set(names or ())
+    for chunk in job.chunks:
+        if chunk.chunk_id in wanted:
+            chunk.indexes_pending = True
 
 
 def _fail_chunk(job: MigrationJob, chunk_id: str) -> None:
@@ -696,6 +727,22 @@ def full_load_progress_caption(job: Optional[MigrationJob]) -> str:
         return "Capturing export watermark (consistent snapshot)…"
     total = len(job.chunks)
     done = sum(1 for chunk in job.chunks if chunk.status in ("DONE", "FAILED"))
+    if done == total:
+        # Every table settled while the job still runs: the run's tail -- its index pass
+        # (P4a: every recreated table's secondary indexes are submitted only now), the
+        # views, the identity sync -- not a load in progress.
+        loaded = sum(1 for chunk in job.chunks if chunk.status == "DONE")
+        head = (
+            f"All {total} tables loaded"
+            if loaded == total
+            else f"All {total} tables settled ({loaded} loaded)"
+        )
+        if any(
+            chunk.status == "DONE" and getattr(chunk, "indexes_pending", False)
+            for chunk in job.chunks
+        ):
+            return f"{head} — submitting their secondary indexes and finishing up…"
+        return f"{head} — finishing up…"
     in_progress = {
         chunk.chunk_id for chunk in job.chunks if chunk.status == "IN_PROGRESS"
     }
@@ -779,6 +826,10 @@ PROGRESS_FLUSH_SECONDS = 30.0
 # so a high table_parallelism x reader_shards can't exhaust the source's
 # max_connections. Reader sharding is clamped down (never up) to honor it.
 _MAX_SOURCE_READERS = 32
+
+# Guards the thread path's ``{table: index DDLs}`` for the run's index pass (P4a): with
+# Tables in parallel above 1 and a migrator double, tables finish on several threads.
+_DEFERRED_INDEXES_LOCK = threading.Lock()
 
 
 class _FullLoadStopped(Exception):
@@ -890,10 +941,15 @@ class _TableLoadOutcome(Enum):
 
 
 class _RunCounts(NamedTuple):
-    """Fresh per-run tallies of tables that did not fully load (this run only)."""
+    """Fresh per-run tallies of tables that did not fully load (this run only).
+
+    ``index_pending`` (P4a): loaded tables whose secondary indexes the run's index pass left
+    unsubmitted (a Stop during it, Aurora DSQL not answering) -- no data is missing, but
+    the run is not complete until a retry submits them."""
 
     real_failed: int
     quarantined: int
+    index_pending: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1108,10 @@ class _TableWorkerResult:
     # This unit's final write-path counters (core.load_stats snapshot, also its process's
     # CPU seconds and peak RSS) on every outcome: counts and timings only (Property 7).
     load_stats: dict = field(default_factory=dict)
+    # P4a: a DONE whole-table unit's secondary-index DDLs (a table its load recreated), for
+    # the parent's index pass after every unit has returned. Tool-generated DDL text, no
+    # row value.
+    index_ddls: tuple = ()
 
 
 def _slim_worker_inputs(
@@ -1199,14 +1259,21 @@ def _start_load_stats_ticker(
     return _stop
 
 
+def _takes_kwarg(migrator: object, name: str) -> bool:
+    """Whether ``migrator.migrate_table`` names the keyword ``name``: the real
+    :class:`BatchedTableMigrator` takes every optional one the engine passes, a double of
+    the :class:`DataMigrator` protocol need not."""
+    try:
+        return name in inspect.signature(migrator.migrate_table).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _takes_load_stats(migrator: object) -> bool:
     """Whether ``migrator.migrate_table`` takes a ``load_stats`` collector: the real
     :class:`BatchedTableMigrator` does, a double of the :class:`DataMigrator` protocol
     need not (it then reports what its result carries, if anything)."""
-    try:
-        return "load_stats" in inspect.signature(migrator.migrate_table).parameters
-    except (AttributeError, TypeError, ValueError):
-        return False
+    return _takes_kwarg(migrator, "load_stats")
 
 
 def _sharding_is_consistent(
@@ -1648,6 +1715,9 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 on_throttle=_on_throttle,
                 on_pause_slice=_on_pause_slice,
                 load_stats=stats,
+                # P4a: the parent submits the table's secondary indexes after every unit
+                # of the run has returned, so no CREATE INDEX ASYNC runs while a table loads.
+                defer_indexes=True,
             )
 
         outcome = _as_load_result(
@@ -1678,6 +1748,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             index_failures=tuple(getattr(outcome, "index_failures", ()) or ()),
             zero_dates=tuple(getattr(outcome, "zero_dates", ()) or ()),
             load_stats=stats.snapshot(),
+            index_ddls=tuple(getattr(outcome, "deferred_index_ddls", ()) or ()),
         )
     except _FullLoadStopped:
         return _TableWorkerResult(
@@ -2525,6 +2596,7 @@ def _migrate_table_with_source_retry(
     on_rows: Callable[..., None],
     handle: JobHandle,
     load_stats: Optional[LoadStats] = None,
+    defer_indexes: bool = False,
 ) -> object:
     """Load ``table``, RE-READING it from a fresh snapshot if the source drops.
 
@@ -2554,6 +2626,11 @@ def _migrate_table_with_source_retry(
     ``load_stats`` (optional) is the table's write-path collector, handed to every attempt
     so the counters add up across re-reads -- only to a ``migrate_table`` that takes one
     (:func:`_takes_load_stats`).
+
+    ``defer_indexes`` (P4a, the run's thread path): a ``migrate_table`` that takes the
+    keyword leaves a recreated table's secondary indexes to the run's index pass and
+    returns their DDLs (``TableLoadResult.deferred_index_ddls``); one that does not keeps
+    its own.
     """
     config = load_config()
     attempts = max(1, int(config.full_load_source_retry_attempts))
@@ -2564,6 +2641,8 @@ def _migrate_table_with_source_retry(
         if load_stats is not None and _takes_load_stats(migrator)
         else {}
     )
+    if defer_indexes and _takes_kwarg(migrator, "defer_indexes"):
+        counted["defer_indexes"] = True
 
     for attempt in range(1, attempts + 1):
         try:
@@ -2618,6 +2697,7 @@ def _migrate_one_table(
     migrator: "DataMigrator",
     error_log: ErrorLogStore,
     load_stats: Optional[LoadStatsBoard] = None,
+    deferred_indexes: "Optional[dict[str, list[str]]]" = None,
 ) -> _TableLoadOutcome:
     """Migrate a single table, recording per-table progress/failure on the job.
 
@@ -2643,6 +2723,12 @@ def _migrate_one_table(
     :data:`_LOAD_STATS_SECONDS` while it loads, and finally on every outcome (loaded,
     failed or stopped), added up across its source-drop re-reads. This path shares the
     process with the rest of the run, so they carry no CPU seconds or RSS of their own.
+
+    ``deferred_indexes`` (P4a, the run's thread path): the run's ``{table: index DDLs}``
+    for its index pass. Given, a recreated table's secondary indexes are left to that pass
+    -- its DDLs go here and its DONE chunk is flagged ``indexes_pending`` -- so none is
+    submitted while another table loads. Omitted (a direct caller), the load submits them
+    itself, as before.
     """
     name = table.name
     # Honor a stop requested before this table started: leave it PENDING so the
@@ -2693,7 +2779,8 @@ def _migrate_one_table(
         try:
             outcome = _as_load_result(
                 _migrate_table_with_source_retry(
-                    migrator, table, on_rows=_on_rows, handle=handle, load_stats=stats
+                    migrator, table, on_rows=_on_rows, handle=handle, load_stats=stats,
+                    defer_indexes=deferred_indexes is not None,
                 )
             )
             # A double that takes no collector may still return counters of its own.
@@ -2819,10 +2906,16 @@ def _migrate_one_table(
                 skipped=outcome.rows_skipped,
             ),
         )
+        # P4a: the secondary indexes this load left to the run's index pass. The DDLs go to
+        # the pass first, then the chunk completes with its flag in the same update.
+        deferred = list(getattr(outcome, "deferred_index_ddls", ()) or ())
+        if deferred and deferred_indexes is not None:
+            with _DEFERRED_INDEXES_LOCK:
+                deferred_indexes[name] = deferred
         handle.update(
             lambda job, n=name, r=outcome.rows_loaded, s=outcome.rows_skipped,
-            q=quarantined: (
-                _complete_chunk(job, n, r, s, q)
+            q=quarantined, p=bool(deferred): (
+                _complete_chunk(job, n, r, s, q, indexes_pending=p)
             )
         )
         # A table that dropped rows is reported as an incomplete load even though
@@ -3480,6 +3573,228 @@ def _thread_load_recreated(
     )
 
 
+# The activity details of the run's index pass (P4a): counts and table counts only.
+_INDEX_PASS_STARTED = (
+    "every table's data has loaded: submitting {ddls} secondary index(es) of {tables} "
+    "table(s), one at a time"
+)
+_INDEX_PASS_STOPPED = (
+    "stopped by the operator before the secondary indexes of {n} table(s) were submitted "
+    "(their data is loaded): Retry unfinished tables submits them without reloading data"
+)
+_INDEX_PASS_UNREACHABLE = (
+    "Aurora DSQL did not answer while secondary indexes were submitted: {n} table(s) still "
+    "need them (their data is loaded); Retry unfinished tables submits them without "
+    "reloading data (last attempt: {code})"
+)
+
+
+def _watermark_estimates(watermark: "Optional[Watermark]") -> "dict[str, int]":
+    """The start point's scan-free row estimates (the order the index pass goes in)."""
+    counts = getattr(watermark, "table_row_counts", None) or {}
+    return {name: value for name, value in counts.items() if _is_row_estimate(value)}
+
+
+def _carried_index_ddls(migrator: "DataMigrator", name: str) -> "Optional[list[str]]":
+    """The secondary-index DDLs ``name`` still owes when an earlier run left them pending
+    (P4a): its conversion's -- the same deterministic derivation the run that loaded it
+    used -- minus each one whose index already exists ON that relation on Aurora DSQL (that
+    run may have submitted it before it ended), read once through the migrator's
+    ``_target_index_reader``; an unreadable catalog keeps every DDL. ``None`` when the table
+    is not in the run's inventory (its flag stays)."""
+    inputs = getattr(migrator, "_inputs", None)
+    tables = getattr(getattr(inputs, "inventory", None), "tables", None) or ()
+    table = next((t for t in tables if t.name == name), None)
+    if table is None:
+        return None
+    ddls = list(_effective_conversion(inputs, table).index_ddls)
+    if not ddls:
+        return []
+    reader = getattr(migrator, "_target_index_reader", None)
+    existing = reader(table) if callable(reader) else None
+    if existing is None:
+        return ddls
+    return [ddl for ddl in ddls if _stored_index_name(ddl) not in existing]
+
+
+def _run_deferred_index_pass(
+    handle: JobHandle,
+    job_id: str,
+    migrator: "DataMigrator",
+    error_log: ErrorLogStore,
+    *,
+    ddls_by_table: "Mapping[str, Sequence[str]]",
+    estimates: "Mapping[str, int]",
+    load_stats: Optional[LoadStatsBoard] = None,
+    scope: "Optional[Collection[str]]" = None,
+) -> int:
+    """Submit every loaded table's pending secondary indexes, once every unit of the run has
+    returned (P4a), and return how many tables still owe theirs.
+
+    A ``CREATE INDEX ASYNC`` changes the schema, so each one a finished table submitted
+    while others still loaded made their open transactions fail OC001 (40001, "schema has
+    been updated by another transaction"): 118-265 retries a run, live. So the loads leave
+    them here. The targets are the job's DONE chunks flagged ``indexes_pending`` -- a table
+    this run recreated (its DDLs in ``ddls_by_table``), or one an earlier run left flagged
+    (its conversion's DDLs minus the indexes already on it, :func:`_carried_index_ddls`) --
+    largest first by ``estimates`` (unknown last, then by name). One ``index pass`` line,
+    then one table at a time on one Aurora DSQL connection (``BatchedImporter.index_pass``
+    when the importer has it), a heartbeat per table, its failures recorded as today
+    (:func:`_record_index_failures`: a failed index never fails the table, a UNIQUE one
+    reads as a missing constraint) and its flag cleared.
+
+    ``scope`` (a retry after a table-set change, G12 / G16): only the chunks of the run's
+    CURRENT table set are targets and counted. A flagged table no longer selected is left as
+    is -- never written to -- and keeps its flag for the record; ``None``: every chunk of the
+    job (a fresh run's chunks are its tables). A table's failures are recorded under the job
+    id that owns its error records (``MigrationJob.table_error_job_ids``): a retry keeps the
+    earlier owner of a table it does not reload, and a record under the retry's own id would
+    be invisible next to that table (``full_load_error_records_for``).
+
+    A Stop requested before the pass does not skip it (a stopped run's loaded tables get
+    their indexes, as before); one requested during it stops before the next table. A DDL
+    Aurora DSQL did not answer (:class:`~dsql_migrator.core.batched_import.
+    IndexTargetUnreachable`) stops the pass with that table and the rest flagged. Never
+    raises: anything else leaves the table flagged and is logged.
+    """
+    snapshot = getattr(handle, "snapshot", None)
+    if not callable(snapshot):
+        return 0  # a handle double that keeps no job: nothing to read the flags from
+    remaining: list[str] = []
+    wanted = None if scope is None else set(scope)
+    try:
+        job_now = snapshot()
+        remaining = [
+            chunk.chunk_id
+            for chunk in getattr(job_now, "chunks", None) or ()
+            if chunk.status == "DONE"
+            and getattr(chunk, "indexes_pending", False)
+            and (wanted is None or chunk.chunk_id in wanted)
+        ]
+        if not remaining:
+            return 0
+        owners = dict(getattr(job_now, "table_error_job_ids", None) or {})
+
+        def _record_failures(name: str, failures) -> None:
+            _record_index_failures(error_log, owners.get(name) or job_id, name, failures)
+
+        factory = getattr(migrator, "_importer_factory", None)
+        if not callable(factory):
+            _LOGGER.warning(
+                "Full Load index pass: this migrator has no importer, so %d table(s) keep "
+                "their secondary indexes pending", len(remaining),
+            )
+            return len(remaining)
+        heartbeat = _heartbeat_of(handle)
+        stopped_before = bool(handle.cancelled)
+
+        def _stop_requested() -> bool:
+            return not stopped_before and bool(handle.cancelled)
+
+        def _clear(name: str) -> None:
+            handle.update(lambda job, n=name: _clear_indexes_pending(job, n))
+            remaining.remove(name)
+
+        def _order(name: str) -> tuple:
+            estimate = estimates.get(name)
+            return (0, -estimate, name) if _is_row_estimate(estimate) else (1, 0, name)
+
+        stopped = False
+        plan: list[tuple[str, list[str]]] = []
+        for name in sorted(remaining, key=_order):
+            if name in ddls_by_table:
+                plan.append((name, list(ddls_by_table[name] or ())))
+                continue
+            if _stop_requested():
+                stopped = True
+                break
+            try:
+                ddls = _carried_index_ddls(migrator, name)
+            except Exception:  # noqa: BLE001 - this table stays flagged
+                _LOGGER.warning(
+                    "Full Load index pass: the secondary indexes %s still needs could not "
+                    "be derived; it keeps them pending", name, exc_info=True,
+                )
+                continue
+            finally:
+                heartbeat()  # a target catalog read per carried table
+            if ddls is None:
+                _LOGGER.warning(
+                    "Full Load index pass: %s is not in this run's inventory, so its "
+                    "secondary indexes stay pending", name,
+                )
+            elif ddls:
+                plan.append((name, ddls))
+            else:
+                _clear(name)  # every one of them is on the table already
+        if not stopped and plan:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "index pass",
+                status=ActivityStatus.INFO,
+                detail=_INDEX_PASS_STARTED.format(
+                    ddls=sum(len(ddls) for _name, ddls in plan), tables=len(plan)
+                ),
+            )
+            importer = factory(migrator._inputs)  # type: ignore[attr-defined]
+            opener = getattr(importer, "index_pass", None)
+            with (
+                opener() if callable(opener) else contextlib.nullcontext(importer.create_indexes)
+            ) as create:
+                for name, ddls in plan:
+                    if _stop_requested():
+                        stopped = True
+                        break
+                    heartbeat()
+                    # The table's "index" entry on the run's board: it loads no rows.
+                    stats = LoadStats(units=0)
+                    _bind_load_stats(importer, stats)
+                    try:
+                        try:
+                            _created, failures = create(ddls)
+                        finally:
+                            _record_load_stats(
+                                load_stats, name, "index", stats.snapshot(), final=True
+                            )
+                    except IndexTargetUnreachable as exc:
+                        _record_failures(name, exc.failures)
+                        log_activity(
+                            ActivityCategory.FULL_LOAD,
+                            "index pass",
+                            status=ActivityStatus.WARNING,
+                            # The last attempt's code only (a dropped connection, XX000, or
+                            # a 40001 that outlasted its retries), never its message.
+                            detail=_INDEX_PASS_UNREACHABLE.format(
+                                n=len(remaining),
+                                code=retry_code(exc.__cause__)
+                                if exc.__cause__ is not None
+                                else "unknown",
+                            ),
+                        )
+                        break
+                    except Exception:  # noqa: BLE001 - this table stays flagged
+                        _LOGGER.warning(
+                            "Full Load index pass: the secondary indexes of %s could not be "
+                            "submitted; it keeps them pending", name, exc_info=True,
+                        )
+                        continue
+                    _record_failures(name, failures)
+                    _clear(name)
+        if stopped:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "index pass",
+                status=ActivityStatus.INFO,
+                detail=_INDEX_PASS_STOPPED.format(n=len(remaining)),
+            )
+    except Exception:  # noqa: BLE001 - the pass never fails or masks the run's outcome
+        _LOGGER.warning(
+            "Full Load index pass failed; %d table(s) keep their secondary indexes pending",
+            len(remaining), exc_info=True,
+        )
+    return len(remaining)
+
+
 def _migrate_tables_in_parallel(
     handle: JobHandle,
     job_id: str,
@@ -3490,6 +3805,7 @@ def _migrate_tables_in_parallel(
     watermark: "Optional[Watermark]" = None,
     fresh_watermark: bool = False,
     load_stats: Optional[LoadStatsBoard] = None,
+    index_scope: "Optional[Collection[str]]" = None,
 ) -> _RunCounts:
     """Migrate ``tables`` concurrently (bounded), isolating per-table failures.
 
@@ -3515,11 +3831,26 @@ def _migrate_tables_in_parallel(
     ``load_stats`` (optional) collects every load unit's write-path counters as they
     arrive and their final values from the results, per table (shards merged) and per run
     (:class:`~dsql_migrator.core.load_stats.LoadStatsBoard`). Counts and timings only.
+
+    P4a: no table's secondary indexes are submitted while another loads. Both paths leave a
+    recreated table's ``CREATE INDEX ASYNC`` statements to ONE serial pass after every unit
+    has returned (:func:`_run_deferred_index_pass`) -- also after a Stop, an abandoned or
+    broken pool or a lost anchor, and with no table to load (a retry that only completes
+    the indexes an earlier run left pending). ``index_pending`` counts the loaded tables it
+    left without theirs; ``index_scope`` (a retry after a table-set change) limits the pass
+    to the run's current table set (see :func:`_run_deferred_index_pass`).
     """
     if not tables:
-        return _RunCounts(0, 0)
+        # Nothing to load: a retry whose tables only owe their secondary indexes.
+        left = _run_deferred_index_pass(
+            handle, job_id, migrator, error_log, ddls_by_table={},
+            estimates=_watermark_estimates(watermark), load_stats=load_stats,
+            scope=index_scope,
+        )
+        return _RunCounts(0, 0, index_pending=left)
     real_failed = 0
     quarantined = 0
+    index_left = 0
 
     def _tally(outcome: _TableLoadOutcome) -> None:
         nonlocal real_failed, quarantined
@@ -3564,25 +3895,36 @@ def _migrate_tables_in_parallel(
         tables = [table for table in tables if table.name not in withheld]
         workers = min(table_parallelism, len(tables))
         recreated: list[str] = []
+        # P4a: {table: the secondary-index DDLs its load left to the index pass below}.
+        deferred_indexes: dict[str, list[str]] = {}
 
         def _load(table: TableDef) -> _TableLoadOutcome:
             outcome = _migrate_one_table(
-                handle, job_id, table, migrator, error_log, load_stats=load_stats
+                handle, job_id, table, migrator, error_log, load_stats=load_stats,
+                deferred_indexes=deferred_indexes,
             )
             if _thread_load_recreated(migrator, table.name, outcome):
                 recreated.append(table.name)
             return outcome
 
-        if workers <= 1:
-            for table in tables:
-                _tally(_load(table))
-        else:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="fullload-table"
-            ) as pool:
-                futures = [pool.submit(_load, table) for table in tables]
-                for future in as_completed(futures):
-                    _tally(future.result())
+        try:
+            if workers <= 1:
+                for table in tables:
+                    _tally(_load(table))
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="fullload-table"
+                ) as pool:
+                    futures = [pool.submit(_load, table) for table in tables]
+                    for future in as_completed(futures):
+                        _tally(future.result())
+        finally:
+            # Every table has returned: their secondary indexes, one at a time (P4a).
+            index_left = _run_deferred_index_pass(
+                handle, job_id, migrator, error_log, ddls_by_table=deferred_indexes,
+                estimates=_watermark_estimates(watermark), load_stats=load_stats,
+                scope=index_scope,
+            )
         if recreated:
             handle.update(
                 lambda job, names=list(recreated): _record_reader_shards(job, names, {}, names)
@@ -3718,13 +4060,12 @@ def _migrate_tables_in_parallel(
         # R2: the order the pool starts the units in -- the largest first (a split table by
         # its share per shard), any table without a row estimate before them
         # (_largest_first). A PostgreSQL table with no estimate is sized from its files here
-        # (one catalog read, stamped like the planning reads above).
-        start_order = _largest_first(
-            work_units,
-            _load_order_estimates(
-                migrator, tables, watermark, skip=withheld, heartbeat=handle.heartbeat
-            ),
+        # (one catalog read, stamped like the planning reads above). The index pass after
+        # the pool goes largest first by the same estimates (P4a).
+        _order_estimates = _load_order_estimates(
+            migrator, tables, watermark, skip=withheld, heartbeat=handle.heartbeat
         )
+        start_order = _largest_first(work_units, _order_estimates)
 
         # Pre-pass: DROP+recreate EVERY replace table BEFORE spawning workers, and do
         # it SERIALLY. DSQL runs one DDL per transaction under optimistic concurrency;
@@ -3748,13 +4089,17 @@ def _migrate_tables_in_parallel(
         recreated_names: set[str] = set()
         # A REPLACE table recreated here is EMPTY with NO secondary indexes yet
         # (recreate_table builds only the base table; indexes are a post-load pass). The
-        # single-process / unsharded paths run that pass inside import_rows, but the
         # multiprocess SHARDED path loads PK slices across separate processes with NO
         # index_ddls, so no import_rows call owns the whole table to index it. Capture each
-        # recreated table's secondary-index DDLs here and build them ONCE in the parent after
-        # all of that table's shards succeed (see the shard-success branch below). Without
-        # this, a sharded REPLACE load silently created NO secondary indexes.
+        # recreated table's secondary-index DDLs here: once all of that table's shards
+        # succeed they join the run's index pass (P4a, after the pool; see the shard-success
+        # branch below). Without this, a sharded REPLACE load silently created NO secondary
+        # indexes. A whole-table unit returns its own (its worker may recreate the table).
         replace_index_ddls: dict[str, list[str]] = {}
+        # P4a: {table: the secondary-index DDLs the run's index pass submits after the pool},
+        # one entry per DONE table this run recreated (a whole-table result's, or a sharded
+        # table's pre-pass DDLs).
+        pending_ddls: dict[str, list[str]] = {}
         try:
             for wu in work_units:
                 tbl = wu[1]
@@ -4106,32 +4451,16 @@ def _migrate_tables_in_parallel(
                                     quarantined=len(all_quarantine),
                                     skipped=total_skipped,
                                 ) + f" across {expected_shards} shards")
-                            handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
-                                q=len(all_quarantine):
-                                _complete_chunk(job, n, r, s, q))
-                            # SUCCESS branch ONLY (no shard FAILED/STOPPED): build the
-                            # recreated REPLACE table's secondary indexes ONCE now that every
-                            # shard finished. The shard workers loaded slices with no
-                            # index_ddls, so this is where a sharded REPLACE table gets its
-                            # indexes -- via BatchedImporter.create_indexes, IDENTICAL CREATE
-                            # INDEX ASYNC / OCC / isolation behavior to the non-sharded path.
-                            _shard_index_ddls = replace_index_ddls.get(name)
+                            # SUCCESS branch ONLY (no shard FAILED/STOPPED): the recreated
+                            # REPLACE table's secondary indexes join the run's index pass
+                            # (P4a), which submits them ONCE after every unit of the run has
+                            # returned -- the shard workers loaded slices with no index_ddls.
+                            _shard_index_ddls = list(replace_index_ddls.get(name) or ())
                             if _shard_index_ddls:
-                                _idx_importer = migrator._importer_factory(migrator._inputs)
-                                # The parent's own index pass: the table's "index" entry,
-                                # which loads no rows (no unit of its own).
-                                _idx_stats = LoadStats(units=0)
-                                _bind_load_stats(_idx_importer, _idx_stats)
-                                _idx_created, _idx_failures = _idx_importer.create_indexes(
-                                    _shard_index_ddls
-                                )
-                                _record_load_stats(
-                                    load_stats, name, "index", _idx_stats.snapshot(),
-                                    final=True,
-                                )
-                                _record_index_failures(
-                                    error_log, job_id, name, _idx_failures
-                                )
+                                pending_ddls[name] = _shard_index_ddls
+                            handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
+                                q=len(all_quarantine), p=bool(_shard_index_ddls):
+                                _complete_chunk(job, n, r, s, q, indexes_pending=p))
                             _tally(_TableLoadOutcome.QUARANTINED if had_q else _TableLoadOutcome.LOADED)
                     else:
                         # Single-table worker result (same as before).
@@ -4166,9 +4495,14 @@ def _migrate_tables_in_parallel(
                                     rows_loaded=result.rows_loaded,
                                     quarantined=len(result.quarantine_records),
                                 ))
+                            # P4a: the secondary indexes the worker left to the run's index
+                            # pass (a table its load recreated), flagged in the same update.
+                            _table_index_ddls = list(getattr(result, "index_ddls", ()) or ())
+                            if _table_index_ddls:
+                                pending_ddls[name] = _table_index_ddls
                             handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped,
-                                q=len(result.quarantine_records):
-                                _complete_chunk(job, n, r, s, q))
+                                q=len(result.quarantine_records), p=bool(_table_index_ddls):
+                                _complete_chunk(job, n, r, s, q, indexes_pending=p))
                             _tally(_TableLoadOutcome.QUARANTINED if had_quarantine else _TableLoadOutcome.LOADED)
                         elif result.status == "STOPPED":
                             _anchor_stop = _anchor_lost[0] and not handle.cancelled
@@ -4194,40 +4528,54 @@ def _migrate_tables_in_parallel(
                             handle.update(lambda job, n=name: _fail_chunk(job, n))
                             _tally(_TableLoadOutcome.FAILED)
         finally:
-            # Close the shared-snapshot anchor (if any) once all shard readers are done.
-            _close_shared_snapshot(_anchor_engine, _anchor_conn)
-            stop_drain.set()
-            # Non-blocking: this runs on the CLEANUP path, so a full queue must not
-            # be able to wedge it. ``stop_drain`` already tells the drain to exit, so
-            # the sentinel is only a fast-path wake-up -- losing it costs at most the
-            # drain's 0.3 s poll interval.
-            _report_progress(progress_queue, _PROGRESS_SENTINEL)
-            drain.join(timeout=5)
-            # G137: a split table whose parts provably wrote no row -- none ran, or each
-            # stopped or failed before its source read handed its importer one (the
-            # result's ``wrote_nothing``; its row count is not proof: a batch that commits
-            # split halves and then fails counts none of them) -- holds nothing of this read
-            # in parts, so it gets back the count it had without this plan. A part with no
-            # result (an abandoned pool, a broken one) may have written: its table keeps the
-            # plan.
-            _unwritten = {
-                n: without_plan.get(n)
-                for n in planned_parts
-                if len(shard_results.get(n, ())) + unrun_parts.get(n, 0)
-                >= submitted_parts.get(n, 0)
-                and all(r.wrote_nothing for r in shard_results.get(n, ()))
-            }
-            if _unwritten:
-                try:
-                    handle.update(
-                        lambda job, back=dict(_unwritten): _restore_unwritten_parts(job, back)
-                    )
-                except Exception:  # noqa: BLE001 - cleanup never replaces the run's outcome
-                    _LOGGER.warning("Could not restore the reader-shard record", exc_info=True)
+            try:
+                # Close the shared-snapshot anchor (if any) once all shard readers are done.
+                _close_shared_snapshot(_anchor_engine, _anchor_conn)
+                stop_drain.set()
+                # Non-blocking: this runs on the CLEANUP path, so a full queue must not
+                # be able to wedge it. ``stop_drain`` already tells the drain to exit, so
+                # the sentinel is only a fast-path wake-up -- losing it costs at most the
+                # drain's 0.3 s poll interval.
+                _report_progress(progress_queue, _PROGRESS_SENTINEL)
+                drain.join(timeout=5)
+                # G137: a split table whose parts provably wrote no row -- none ran, or each
+                # stopped or failed before its source read handed its importer one (the
+                # result's ``wrote_nothing``; its row count is not proof: a batch that
+                # commits split halves and then fails counts none of them) -- holds nothing
+                # of this read in parts, so it gets back the count it had without this plan.
+                # A part with no result (an abandoned pool, a broken one) may have written:
+                # its table keeps the plan.
+                _unwritten = {
+                    n: without_plan.get(n)
+                    for n in planned_parts
+                    if len(shard_results.get(n, ())) + unrun_parts.get(n, 0)
+                    >= submitted_parts.get(n, 0)
+                    and all(r.wrote_nothing for r in shard_results.get(n, ()))
+                }
+                if _unwritten:
+                    try:
+                        handle.update(
+                            lambda job, back=dict(_unwritten): _restore_unwritten_parts(
+                                job, back
+                            )
+                        )
+                    except Exception:  # noqa: BLE001 - cleanup never replaces the outcome
+                        _LOGGER.warning(
+                            "Could not restore the reader-shard record", exc_info=True
+                        )
+            finally:
+                # Every unit has returned, or never will (a Stop's abandoned pool, a lost
+                # anchor, a broken pool): the run's secondary indexes, one at a time, with no
+                # table loading (P4a). It never raises, so an exception in flight stays the
+                # run's outcome.
+                index_left = _run_deferred_index_pass(
+                    handle, job_id, migrator, error_log, ddls_by_table=pending_ddls,
+                    estimates=_order_estimates, load_stats=load_stats, scope=index_scope,
+                )
 
     if handle.cancelled:
         handle.update(_fail_unfinished_chunks)
-    return _RunCounts(real_failed, quarantined)
+    return _RunCounts(real_failed, quarantined, index_pending=index_left)
 
 
 def _log_identity_sequence_sync(
@@ -4397,10 +4745,18 @@ def _finalize_run(
     Validation), so CDC is no longer blocked. Any retryable real failure always
     raises, even with the flag set, so the override can never mask a recoverable
     failure.
+
+    P4a: a run whose index pass left loaded tables without their secondary indexes
+    (``counts.index_pending``, not after a Stop) is incomplete too, although no data is
+    missing: when nothing else is (no failed table, and no quarantine or an accepted one) it
+    raises :func:`index_pending_load_message`, so the step is never DONE with a UNIQUE
+    index unsubmitted; otherwise the failure's own message names Retry unfinished tables,
+    which submits them as well.
     """
     _sync_names = list(sync_table_names) if sync_table_names else list(table_names)
     incomplete = counts.real_failed + counts.quarantined
-    if not incomplete or handle.cancelled:
+    index_pending = int(getattr(counts, "index_pending", 0) or 0)
+    if (not incomplete and not index_pending) or handle.cancelled:
         if not handle.cancelled:
             log_activity(
                 ActivityCategory.FULL_LOAD,
@@ -4451,6 +4807,8 @@ def _finalize_run(
             )
         return
     total = len(table_names)
+    if not incomplete:
+        _raise_indexes_pending(index_pending)
     # Quarantine records are the error-log rows whose message marks an isolated
     # dropped row (PK + reason), distinct from a table-level load failure.
     quarantined_rows = _count_quarantined_rows(error_log, job_id, error_job_ids)
@@ -4463,6 +4821,9 @@ def _finalize_run(
         accepted_quarantine_rows is None or quarantined_rows <= accepted_quarantine_rows
     )
     if accept_quarantined_rows and quarantine_only and gap_within_acceptance:
+        if index_pending:
+            # The accepted gap no longer blocks; the missing secondary indexes still do.
+            _raise_indexes_pending(index_pending)
         log_activity(
             ActivityCategory.FULL_LOAD,
             "run completed (quarantine accepted)",
@@ -4496,6 +4857,11 @@ def _finalize_run(
     detail_parts = [
         f"{incomplete} of {total} table(s) did not fully load"
         + (f"; {quarantined_rows} row(s) quarantined" if quarantined_rows else "")
+        + (
+            f"; {index_pending} loaded table(s) still need their secondary indexes"
+            if index_pending
+            else ""
+        )
     ]
     reasons_by_table: dict[str, str] = {}
     # Full Load records only: CDC writes under this same job id (cdc_error_log_key), so
@@ -5020,6 +5386,33 @@ def incomplete_load_message(
     )
 
 
+def index_pending_load_message(*, pending: int) -> str:
+    """The ``FullLoadIncompleteError`` text of a run whose only gap is secondary indexes it
+    could not submit (P4a): the data is complete, and the recovery submits them without a
+    reload. Pure and public so its :data:`_PERSISTED_ERROR_CAP` budget can be asserted."""
+    return (
+        f"Full Load incomplete: {pending} loaded table(s) still need their secondary "
+        "indexes (they could not be submitted to Aurora DSQL). No data is missing: use "
+        "'Retry unfinished tables' to submit them without reloading."
+    )
+
+
+def _raise_indexes_pending(pending: int) -> None:
+    """One ``run incomplete`` line, then :class:`FullLoadIncompleteError`: the run's index
+    pass left ``pending`` loaded tables without their secondary indexes (P4a)."""
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "run incomplete",
+        status=ActivityStatus.FAILURE,
+        detail=(
+            f"{pending} loaded table(s) still need their secondary indexes: they could not "
+            "be submitted to Aurora DSQL (see the 'index pass' lines). No data is missing; "
+            "Retry unfinished tables submits them without reloading"
+        ),
+    )
+    raise FullLoadIncompleteError(index_pending_load_message(pending=pending))
+
+
 def _load_table_detail(
     migrator: "DataMigrator",
     table_name: str,
@@ -5211,6 +5604,10 @@ def run_full_load(
     # and per run (core.load_stats) -- like error_log, a sink the caller reads. None (the
     # default): the workers' counters are dropped on arrival.
     load_stats: Optional[LoadStatsBoard] = None,
+    # P4a: tables of this run whose secondary indexes the previous Full Load ended before
+    # submitting (its chunks flagged indexes_pending). Flagged again at seeding, so a table
+    # this run appends to still gets them in its index pass, minus the ones that exist.
+    carried_index_pending: "Collection[str]" = (),
 ) -> None:
     """Drive the Full Load export/import pipeline for the selected ``tables``.
 
@@ -5251,7 +5648,14 @@ def run_full_load(
             detail=f"nothing was read or written: {refusal}",
         )
         raise FullLoadRefusedError(refusal)
-    handle.update(lambda job: _seed_chunks(job, table_names))
+    _carried = set(carried_index_pending or ()) & set(table_names)
+
+    def _seed(job: MigrationJob) -> None:
+        _seed_chunks(job, table_names)
+        if _carried:
+            _mark_indexes_pending(job, _carried)
+
+    handle.update(_seed)
     log_activity(
         ActivityCategory.FULL_LOAD,
         "run started",
@@ -5402,6 +5806,10 @@ def _seed_retry_chunks(
     A retried table keeps its ``reader_shards`` (G137): its rows read in parts stay on Aurora
     DSQL until a load recreates it, the one load that clears the record
     (:func:`_record_reader_shards`; a CHECKSUM match in Validation clears it too).
+
+    Every chunk keeps ``indexes_pending`` (P4a): a carried DONE table still owes its
+    secondary indexes (the retry's index pass submits them), and so does a reloaded one --
+    an append does not recreate it, so the pass submits them once it is DONE again.
     """
     chunks: list[ChunkState] = []
     for prior in prior_chunks:
@@ -5413,6 +5821,7 @@ def _seed_retry_chunks(
                     rows_loaded=0,
                     attempts=prior.attempts,
                     reader_shards=prior.reader_shards,
+                    indexes_pending=bool(getattr(prior, "indexes_pending", False)),
                 )
             )
         else:
@@ -5872,6 +6281,11 @@ def run_full_load_retry(
     # Defaulted: every other caller (Full load only, CDC only) passes none.
     cdc_additions: "Sequence[str]" = (),
     cdc_coverage_open: "Optional[Callable[[], bool]]" = None,
+    # P4a: retry tables whose data is loaded and only their secondary indexes are owed (DONE
+    # prior chunks flagged indexes_pending). They are not reloaded: they keep their chunk
+    # and the run's index pass submits the indexes not on them yet. A name that is not such
+    # a table, or that CDC does not capture yet (G17), is reloaded as before.
+    index_only: "Collection[str]" = (),
 ) -> None:
     """Re-run Full Load for only the previously failed ``tables_to_retry``.
 
@@ -5896,9 +6310,38 @@ def run_full_load_retry(
     recorded FAILED (never dropped, never loaded) and makes the run incomplete; the other
     tables still load. ``run_table_names`` scopes the identity sync and the foreign-key
     count to the current set (a table left as is on Aurora DSQL is never written to).
+
+    ``index_only`` (P4a) names retry tables that only owe their secondary indexes: no row is
+    read or written for them -- their DONE chunks are carried with their flags, the run's
+    index pass submits what is not on them yet, and a table among them that dropped rows
+    counts as quarantined again (completing its indexes must not wave its unaccepted gap
+    through).
     """
     job_id = handle.job_id
     retry_names = {table.name for table in tables_to_retry}
+    # P4a: only a DONE table that owes its indexes is index-only, never a G17 addition (CDC
+    # does not capture it yet: it reloads under its guards, as before).
+    index_only = (
+        set(index_only or ())
+        & retry_names
+        & {
+            chunk.chunk_id for chunk in prior_chunks
+            if chunk.status == "DONE" and getattr(chunk, "indexes_pending", False)
+        }
+    ) - set(cdc_additions or ())
+    reload = retry_names - index_only
+    _base_inputs = getattr(migrator, "_inputs", None)
+    _bind_inputs = getattr(migrator, "bind_run_inputs", None)
+    if (
+        isinstance(_base_inputs, DataMigrationInputs)
+        and callable(_bind_inputs)
+        and _base_inputs.replace_tables & index_only
+    ):
+        # Never replaced either: a replace table's run-level pre-drops would DROP the
+        # foreign keys that reference it and the views over it, and no load recreates it.
+        _bind_inputs(replace(
+            _base_inputs, replace_tables=frozenset(_base_inputs.replace_tables - index_only)
+        ))
     if watermark is None and getattr(
         inputs or getattr(migrator, "_inputs", None), "is_cdc_migration", False
     ):
@@ -5911,14 +6354,16 @@ def run_full_load_retry(
             detail=f"nothing was read or written: {NO_START_POINT_RETRY_REFUSAL}",
         )
         raise FullLoadRefusedError(NO_START_POINT_RETRY_REFUSAL)
+    # An index-only table is not reloaded: it keeps its DONE chunk (with its flag) and the
+    # error-log lineage of the run that loaded it, like a table the retry leaves alone.
     error_job_ids = _retry_error_lineage(
-        prior_chunks, retry_names, job_id,
+        prior_chunks, reload, job_id,
         prior_job_id=prior_job_id,
         inherited=prior_table_error_job_ids,
     )
     handle.update(
         lambda job: _seed_retry_chunks(
-            job, prior_chunks, retry_names,
+            job, prior_chunks, reload,
             prior_job_id=prior_job_id,
             prior_table_error_job_ids=prior_table_error_job_ids,
             prior_recreated_tables=prior_recreated_tables,
@@ -5929,16 +6374,21 @@ def run_full_load_retry(
     # table -- left nothing in the audit trail saying a table's rows had been dropped and
     # reloaded rather than added to. Named distinctly from "run started" so a reader can tell
     # a scoped re-run from a fresh one.
+    _started_parts = []
+    if reload or not index_only:
+        _started_parts.append(
+            f"{len(reload)} table(s) re-run: {', '.join(sorted(reload))}; "
+            f"{_load_mode_detail(inputs, sorted(reload))}"
+        )
+    if index_only:
+        _started_parts.append(f"secondary indexes only: {', '.join(sorted(index_only))}")
     log_activity(
         ActivityCategory.FULL_LOAD,
         "retry started",
         status=ActivityStatus.STARTED,
-        detail=(
-            f"{len(retry_names)} table(s) re-run: {', '.join(sorted(retry_names))}; "
-            f"{_load_mode_detail(inputs, sorted(retry_names))}"
-        ),
+        detail="; ".join(_started_parts),
     )
-    _log_excluded_lob_columns(inputs, scope=retry_names)
+    _log_excluded_lob_columns(inputs, scope=reload)
     if watermark is not None:
         handle.update(lambda job: setattr(job, "watermark", watermark))
         # A retry reuses the ORIGINAL watermark (no new snapshot); record which
@@ -5955,10 +6405,12 @@ def run_full_load_retry(
     guarded: set[str] = set()
     excluded: set[str] = set()
     refused_count = 0
+    # The tables this retry reads and writes rows of (an index-only table: neither).
+    reload_tables = [t for t in tables_to_retry if t.name in reload]
     try:
         # Step 0, as in run_full_load: the one ledger read, before the pre-drops.
-        _require_overlay_ledger(migrator, tables_to_retry)
-        _open_run_ledger_view(migrator, tables_to_retry, handle=handle)
+        _require_overlay_ledger(migrator, reload_tables)
+        _open_run_ledger_view(migrator, reload_tables, handle=handle)
         # G17: the guards of the tables a Full load + CDC retry adds to CDC's capture run
         # HERE -- after the ledger read, before the pre-drops and before any snapshot
         # (every reader's, and the shared PostgreSQL anchor's, open inside
@@ -5997,12 +6449,26 @@ def run_full_load_retry(
         raise
     counts = _migrate_tables_in_parallel(
         handle, job_id,
-        [t for t in tables_to_retry if t.name not in excluded] if excluded
-        else tables_to_retry,
+        [t for t in reload_tables if t.name not in excluded],
         migrator, error_log,
         # The ORIGINAL start point (G137): every snapshot this retry opens is later than it.
         watermark=watermark,
+        # P4a: after a table-set change the index pass completes only the current set's
+        # owed indexes -- a table no longer selected is left as is (G12) and does not make
+        # this retry incomplete. An unchanged set: every chunk of the record.
+        index_scope=(
+            None if run_table_names is None else set(run_table_names) | retry_names
+        ),
     )
+    if index_only:
+        # P4a: an index-only table that dropped rows is still a quarantine-incomplete table:
+        # its earlier load's verdict stands (accept it, or reload it), as if reloaded.
+        _gaps = sum(
+            1 for chunk in prior_chunks
+            if chunk.chunk_id in index_only and (getattr(chunk, "rows_quarantined", 0) or 0)
+        )
+        if _gaps:
+            counts = counts._replace(quarantined=counts.quarantined + _gaps)
     _recreate_dependent_views(migrator)
     # G17: the guarded additions that loaded completely join the watermark's coverage --
     # BEFORE _finalize_run, so the save carrying the run's terminal status carries it too.
@@ -6879,6 +7345,9 @@ class BatchedTableMigrator:
         target_unique_keys_reader: Optional[
             Callable[[TableDef], Optional[list[list[str]]]]
         ] = None,
+        target_index_reader: Optional[
+            Callable[[TableDef], "Optional[set[str]]"]
+        ] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
         if inputs.inventory.tables:
@@ -6956,6 +7425,10 @@ class BatchedTableMigrator:
         self._target_unique_keys_reader = (
             target_unique_keys_reader or self._default_target_unique_keys
         )
+        # Reads the stored names of the indexes ON a live target table (injectable for
+        # tests). Used only by the run's index pass for a table whose indexes an earlier
+        # run left unsubmitted (P4a), so it submits only the ones that do not exist yet.
+        self._target_index_reader = target_index_reader or self._default_target_index_names
 
     @property
     def source_type(self) -> SourceType:
@@ -7573,6 +8046,11 @@ class BatchedTableMigrator:
         # The load unit's write-path counters (core.load_stats), kept by a caller across its
         # attempts; None -> this call's own. Returned as TableLoadResult.load_stats.
         load_stats: Optional[LoadStats] = None,
+        # P4a: leave a recreated table's secondary indexes to the run's index pass (which
+        # submits them after every table's data has loaded) and return their DDLs as
+        # TableLoadResult.deferred_index_ddls, instead of submitting them after this table's
+        # rows. False (a library caller) keeps the load's own post-load index pass.
+        defer_indexes: bool = False,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -7679,7 +8157,8 @@ class BatchedTableMigrator:
         ) or None
         # If the user confirmed loading this table fresh over existing data, DROP
         # and recreate its empty target first (DSQL has no TRUNCATE); the returned
-        # secondary-index DDLs are (re)created after the load.
+        # secondary-index DDLs are (re)created after the load -- by this call, or with
+        # ``defer_indexes`` by the run's index pass once every table has loaded (P4a).
         index_ddls: Optional[list[str]] = None
         # When CDC is streaming into the target, a DROP+recreate would race the
         # live sink, so replace/DROP is disabled regardless of replace_tables.
@@ -7905,7 +8384,7 @@ class BatchedTableMigrator:
             result = importer.import_rows(
                 rows,
                 table,
-                index_ddls=index_ddls,
+                index_ddls=None if defer_indexes else index_ddls,
                 job=load_job,
                 on_batch_loaded=on_rows,
                 should_cancel=should_cancel,
@@ -7966,6 +8445,9 @@ class BatchedTableMigrator:
             index_failures=tuple(getattr(result, "index_failures", ()) or ()),
             zero_dates=zero_dates.entries(),
             load_stats=stats.snapshot(),
+            # Only a table that loaded completely gets here: one whose batches failed, that
+            # was stopped or whose replace COUNT(*) fell short raised above, so it owes none.
+            deferred_index_ddls=tuple(index_ddls or ()) if defer_indexes else (),
         )
 
     def _default_count_target_rows(self, table: TableDef) -> Optional[int]:
@@ -8080,6 +8562,18 @@ class BatchedTableMigrator:
             )
             return target_unique_keys(table.name, connection_factory=connector.connect)
         except Exception:  # noqa: BLE001 - unknown, decided by the caller
+            return None
+
+    def _default_target_index_names(self, table: TableDef) -> "Optional[set[str]]":
+        """Return the stored names of the live target table's indexes (None if unreadable)."""
+        from dsql_migrator.core.target_introspector import target_index_names
+
+        try:
+            connector = DsqlConnector(
+                self._inputs.target_config, aws_profile=self._inputs.aws_profile
+            )
+            return target_index_names(table.name, connection_factory=connector.connect)
+        except Exception:  # noqa: BLE001 - unknown: the caller submits every DDL
             return None
 
     def _dependent_view_ddls_for_replace(self) -> list[str]:
@@ -9248,6 +9742,27 @@ def _stored_identifier(token: str) -> str:
     if len(token) >= 2 and token.startswith('"') and token.endswith('"'):
         return pg_stored_name(token[1:-1].replace('""', '"'))
     return pg_stored_name(pg_fold_unquoted(token))
+
+
+# ``CREATE [UNIQUE] INDEX [ASYNC] [IF NOT EXISTS] <name> ON ...``: the head, then the index
+# name token (matched apart, so ``CREATE INDEX ASYNC ON ...`` never reads ASYNC as a name).
+_INDEX_HEAD_RE = re.compile(
+    r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:ASYNC\s+)?(?:IF\s+NOT\s+EXISTS\s+)?",
+    re.IGNORECASE,
+)
+_INDEX_NAME_RE = re.compile(rf"({_FK_IDENT})\s+ON\b", re.IGNORECASE)
+
+
+def _stored_index_name(ddl: object) -> Optional[str]:
+    """The name a ``CREATE INDEX`` DDL gives its index, as the catalog stores it (a quoted
+    name as written, an unquoted one folded, cut to 63 bytes), or ``None`` when the
+    statement names none it can read (P4a: such a DDL is submitted, never skipped)."""
+    text = str(ddl or "")
+    head = _INDEX_HEAD_RE.match(text)
+    match = _INDEX_NAME_RE.match(text, head.end()) if head else None
+    if match is None or match.group(1).upper() == "ON":
+        return None
+    return _stored_identifier(match.group(1))
 
 
 def _pg_foreign_key_name(table: str, columns: "Sequence[str]", taken: "Collection[str]") -> str:
