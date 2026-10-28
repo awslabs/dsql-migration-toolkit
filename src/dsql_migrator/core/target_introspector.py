@@ -759,6 +759,38 @@ def read_target_primary_key(connection: Any, table_name: str) -> "tuple[str, ...
     return tuple(str(row[0]) for row in rows or () if row and row[0])
 
 
+# P4d: the stored name of the index that enforces a table's primary key -- the name a unique
+# violation OF THE KEY carries (a PRIMARY KEY constraint and its index share their name).
+_PRIMARY_KEY_INDEX_SQL = (
+    "SELECT i.relname "
+    "FROM pg_catalog.pg_class c "
+    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+    "JOIN pg_catalog.pg_index ix ON ix.indrelid = c.oid AND ix.indisprimary "
+    "JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid "
+    "WHERE {where}"
+)
+
+
+def read_primary_key_index_name(connection: Any, table_name: str) -> Optional[str]:
+    """The stored name of the LIVE table's primary-key index, on an open connection. RAISES.
+
+    P4d: the Full Load tells a duplicate of a row's KEY (another writer inserted it first)
+    from a duplicate under a secondary UNIQUE index (a data error) by the index a unique
+    violation names. ``table_name`` resolves as the loader's INSERT does
+    (:func:`_relation_predicate`). ``None`` when the catalog shows no primary key, or not
+    exactly one. One read-only catalog query; a read that fails raises.
+    """
+    where, params = _relation_predicate(table_name)
+    cursor = connection.cursor()
+    try:
+        cursor.execute(_PRIMARY_KEY_INDEX_SQL.format(where=where), params)
+        rows = cursor.fetchall()
+    finally:
+        _safe_close(cursor)
+    names = {str(row[0]) for row in rows or () if row and row[0]}
+    return next(iter(names)) if len(names) == 1 else None
+
+
 def target_primary_key_columns(
     table_name: str,
     *,
@@ -2341,6 +2373,7 @@ __all__ = [
     "relations_blocked_on_target",
     "relations_existing_on_target",
     "tables_with_rows",
+    "read_primary_key_index_name",
     "target_primary_key_columns",
     "target_primary_keys",
     "target_unique_keys",

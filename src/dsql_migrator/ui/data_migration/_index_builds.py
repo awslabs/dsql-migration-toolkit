@@ -3,12 +3,13 @@
 
 """When Aurora DSQL finished building the secondary indexes a Full Load submitted (P4b).
 
-The run's index pass submits every recreated table's ``CREATE INDEX ASYNC`` statements once
-every table's data has loaded (P4a) and records each build on the job
-(``MigrationJob.index_builds``): its table, its index, whether it is UNIQUE, and the job id
-Aurora DSQL answered with. The run does not wait for them -- Aurora DSQL builds them in the
-background (7-12 minutes after an 8.5M-row load, live) and Validation and Start CDC need
-none of them. This module says when they are done:
+A Drop & reload table's ``CREATE INDEX ASYNC`` statements go on the empty recreated table
+before its rows (P4d: the run waits, bounded, for those builds before its first row); a table
+recreated while others loaded gets them once every table's data has loaded (P4a). Each build
+is recorded on the job (``MigrationJob.index_builds``): its table, its index, whether it is
+UNIQUE, and the job id Aurora DSQL answered with. The run does not wait for the builds after
+the load -- Aurora DSQL builds them in the background (7-12 minutes after an 8.5M-row load,
+live) and Validation and Start CDC need none of them. This module says when they are done:
 
 * :func:`fold_index_build_reads` folds one read of Aurora DSQL
   (:func:`~dsql_migrator.core.target_introspector.index_build_states`: ``sys.jobs`` BY the
@@ -225,14 +226,18 @@ def _hhmm(moment: Optional[datetime]) -> str:
 
 
 def _after_load(record: IndexBuilds) -> str:
-    """How long after the data loaded the last build settled ("" when not known)."""
+    """How long after the data loaded the last build settled ("" when not known) -- or that it
+    settled before: P4d builds a Drop & reload table's indexes on the empty table, before its
+    rows."""
     start, end = record.data_loaded_at, record.finished_at
     if start is None or end is None:
         return ""
     try:
-        seconds = max(0.0, (end - start).total_seconds())
+        seconds = (end - start).total_seconds()
     except TypeError:
         return ""
+    if seconds <= 0:
+        return "before the data finished loading"
     if seconds < 60:
         return "less than a minute after the data loaded"
     return f"{round(seconds / 60)} min after the data loaded"
@@ -245,8 +250,8 @@ def _log_failed_build(build: IndexBuild) -> None:
         status=ActivityStatus.WARNING,
         target=f"{build.table}.{build.index}",
         detail=(
-            f"Aurora DSQL's build of the {'UNIQUE ' if build.unique else ''}index failed "
-            f"after the data loaded: {build.details or 'no details reported'}. "
+            f"Aurora DSQL's build of the {'UNIQUE ' if build.unique else ''}index failed: "
+            f"{build.details or 'no details reported'}. "
             + (_REMEDY_UNIQUE if build.unique else _REMEDY)
         ),
     )
@@ -560,7 +565,7 @@ def render_index_builds(ui, job: object, *, now: Optional[datetime] = None) -> N
             header=header,
             body=(
                 "The data loaded, but Aurora DSQL could not build "
-                f"{'this index' if len(failures) == 1 else 'these indexes'} afterwards. "
+                f"{'this index' if len(failures) == 1 else 'these indexes'}. "
                 f"{listed}. {_notice_remedy(unique, others)} {_RECHECK}"
                 + (f" {not_confirmed}" if not_confirmed else "")
             ),

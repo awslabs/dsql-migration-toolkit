@@ -756,11 +756,14 @@ def column_exclusion_warnings(
             f"migrated rows that share {', '.join(others)} are rejected after the first"
             if others else "every migrated row after the first is rejected"
         )
+        # P4d: a Drop & reload creates the index on the empty table before the rows, so
+        # they are rejected there too (each one dropped, as a data error), rather than the
+        # index failing to build after them.
         found.append(ExclusionFinding(W4, (
             f"Its unique index {index} is NULLS NOT DISTINCT, which treats NULLs as equal: "
-            f"{collide} (23505), or the index cannot be built after a Drop & reload. Keep "
-            "the column, or remove NULLS NOT DISTINCT from the index in the table's target "
-            "script.")))
+            f"{collide} (23505), on a Drop & reload too (the index is created before the "
+            "rows load). Keep the column, or remove NULLS NOT DISTINCT from the index in the "
+            "table's target script.")))
     if not nnd and column in ctx.unique_columns.get(table_name, ()):
         found.append(ExclusionFinding(
             W4, "Uniqueness is not enforced for migrated rows (all NULL)."))

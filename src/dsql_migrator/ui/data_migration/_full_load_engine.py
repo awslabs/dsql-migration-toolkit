@@ -694,6 +694,7 @@ def _merge_index_builds(
     *,
     recreated: bool,
     data_loaded_at: Optional[datetime] = None,
+    before_load: bool = False,
 ) -> None:
     """Record on ``job`` the index builds the run's index pass submitted for ``table`` (P4b).
 
@@ -704,6 +705,10 @@ def _merge_index_builds(
     build sets ``data_loaded_at`` -- the start of this run's index pass, when every table
     of it had loaded its data -- and ``submitted_at`` (now), and reopens a finished record.
     Nothing to add or void: unchanged (no record is created for nothing).
+
+    ``before_load`` (P4d: builds submitted on an empty recreated table before its rows):
+    ``data_loaded_at`` is cleared instead -- no data has loaded yet -- until the run's index
+    pass stamps it once every table's has (:func:`_stamp_data_loaded`).
     """
     if recreated:
         _void_index_builds(job, (table,))
@@ -725,10 +730,19 @@ def _merge_index_builds(
         "failed": max(0, record.failed - voided_failures),
         "building": building + list(builds),
         "failures": failures,
-        "data_loaded_at": data_loaded_at or now,
+        "data_loaded_at": None if before_load else (data_loaded_at or now),
         "submitted_at": now,
         "finished_at": None,
     })
+
+
+def _stamp_data_loaded(job: MigrationJob, when: datetime) -> None:
+    """P4d: every table of the run has loaded its data by ``when``: a record whose builds
+    went in before the rows (``data_loaded_at`` cleared, :func:`_merge_index_builds`) takes
+    it. Anything else: unchanged."""
+    record = job.index_builds
+    if record is not None and record.submitted and record.data_loaded_at is None:
+        job.index_builds = record.model_copy(update={"data_loaded_at": when})
 
 
 def _fail_chunk(job: MigrationJob, chunk_id: str) -> None:
@@ -848,8 +862,9 @@ def full_load_progress_caption(job: Optional[MigrationJob]) -> str:
     done = sum(1 for chunk in job.chunks if chunk.status in ("DONE", "FAILED"))
     if done == total:
         # Every table settled while the job still runs: the run's tail -- its index pass
-        # (P4a: every recreated table's secondary indexes are submitted only now), the
-        # views, the identity sync -- not a load in progress.
+        # (P4a: the secondary indexes a loaded table still owes are submitted now; since P4d
+        # a Drop & reload table's went on before its rows), the views, the identity sync --
+        # not a load in progress.
         loaded = sum(1 for chunk in job.chunks if chunk.status == "DONE")
         head = (
             f"All {total} tables loaded"
@@ -869,6 +884,20 @@ def full_load_progress_caption(job: Optional[MigrationJob]) -> str:
         (chunk.chunk_id for chunk in job.chunks if chunk.status == "IN_PROGRESS"),
         None,
     )
+    # P4d: before the first table starts, the run waits for Aurora DSQL to build the
+    # secondary indexes it put on the recreated, still-empty tables (data_loaded_at is unset
+    # until every table's data has loaded).
+    record = getattr(job, "index_builds", None)
+    if current is None and record is not None and record.data_loaded_at is None:
+        pending = {chunk.chunk_id for chunk in job.chunks if chunk.status == "PENDING"}
+        waiting = [build for build in record.building if build.table in pending]
+        if waiting:
+            tables = len({build.table for build in waiting})
+            return (
+                "Waiting for Aurora DSQL to build the secondary indexes of "
+                f"{tables} recreated table(s) before loading ({len(waiting)} still "
+                "building)…"
+            )
     if current is not None:
         base = f"Exporting and loading {current} ({done}/{total} tables done)…"
     else:
@@ -1277,6 +1306,10 @@ class _TableWorkerArgs:
     # True when the parent already DROP+recreated this empty target in the serial
     # pre-pass; the worker then loads without re-running the DDL (no startup storm).
     pre_recreated: bool = False
+    # P4d: True when the parent also submitted that table's secondary indexes before any
+    # unit, so the worker's first attempt owes none; a re-read that recreates the table owes
+    # them again (the run's index pass, P4a).
+    pre_indexed: bool = False
     # P3: at most this many INSERT batches in flight for this unit (_unit_in_flight, with
     # its share of the run's budget). None => the worker sizes it without a share.
     in_flight: Optional[int] = None
@@ -1972,6 +2005,9 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
                 on_rows=_on_rows,
                 should_cancel=_is_cancelled,
                 pre_recreated=pre,
+                # P4d: the parent put its secondary indexes on before any unit -- true only
+                # of the table it pre-recreated, so a re-read that recreates it owes them.
+                pre_indexed=pre and args.pre_indexed,
                 resume_job=_resume_job,
                 on_throttle=_on_throttle,
                 on_pause_slice=_on_pause_slice,
@@ -2749,6 +2785,17 @@ def _quarantine_recovery_advice(error_code: object) -> str:
             "target column's type, then reload this table -- or use \"Exclude "
             "column & reload\" to migrate the table without that column."
         )
+    if code == "23505":
+        # P4d: only a secondary UNIQUE index gets here -- a duplicate of the row's own key is
+        # skipped by the load's recovery, never quarantined.
+        return (
+            "The rest of the table loaded. A UNIQUE index on Aurora DSQL (the one the reason "
+            "names, not the primary key) rejected this row because another row already "
+            "holds its value there, which the source allowed: remove the duplicate at the "
+            "source, or drop or change that index in this table's Schema Conversion (Step "
+            "2), then reload this table -- or use \"Exclude column & reload\" to migrate "
+            "the table without that column."
+        )
     return (
         "The rest of the table loaded; the reason above is the target's own rejection "
         "of this row -- fix that at the source or in this table's Schema Conversion "
@@ -2927,6 +2974,7 @@ def _migrate_table_with_source_retry(
     handle: JobHandle,
     load_stats: Optional[LoadStats] = None,
     defer_indexes: bool = False,
+    before_load_indexes: "Optional[Callable[[str, Sequence[str]], tuple]]" = None,
 ) -> object:
     """Load ``table``, RE-READING it from a fresh snapshot if the source drops.
 
@@ -2960,7 +3008,9 @@ def _migrate_table_with_source_retry(
     ``defer_indexes`` (P4a, the run's thread path): a ``migrate_table`` that takes the
     keyword leaves a recreated table's secondary indexes to the run's index pass and
     returns their DDLs (``TableLoadResult.deferred_index_ddls``); one that does not keeps
-    its own.
+    its own. ``before_load_indexes`` (P4d): handed to a ``migrate_table`` that takes it,
+    which calls it right after each recreate of the table, before its first row -- a re-read
+    recreates the table again.
     """
     config = load_config()
     attempts = max(1, int(config.full_load_source_retry_attempts))
@@ -2973,6 +3023,8 @@ def _migrate_table_with_source_retry(
     )
     if defer_indexes and _takes_kwarg(migrator, "defer_indexes"):
         counted["defer_indexes"] = True
+    if before_load_indexes is not None and _takes_kwarg(migrator, "before_load_indexes"):
+        counted["before_load_indexes"] = before_load_indexes
 
     for attempt in range(1, attempts + 1):
         try:
@@ -3028,6 +3080,7 @@ def _migrate_one_table(
     error_log: ErrorLogStore,
     load_stats: Optional[LoadStatsBoard] = None,
     deferred_indexes: "Optional[dict[str, list[str]]]" = None,
+    before_load_indexes: "Optional[Callable[[str, Sequence[str]], tuple]]" = None,
 ) -> _TableLoadOutcome:
     """Migrate a single table, recording per-table progress/failure on the job.
 
@@ -3059,6 +3112,11 @@ def _migrate_one_table(
     -- its DDLs go here and its DONE chunk is flagged ``indexes_pending`` -- so none is
     submitted while another table loads. Omitted (a direct caller), the load submits them
     itself, as before.
+
+    ``before_load_indexes`` (P4d, the run's thread path when one table loads at a time): the
+    hook its ``migrate_table`` calls right after recreating the table, before its first row
+    (:func:`_indexes_before_load_hook`); only the DDLs it did not submit are deferred, and
+    the indexes it could not create are recorded with the table's other index failures.
     """
     name = table.name
     # Honor a stop requested before this table started: leave it PENDING so the
@@ -3111,6 +3169,9 @@ def _migrate_one_table(
                 _migrate_table_with_source_retry(
                     migrator, table, on_rows=_on_rows, handle=handle, load_stats=stats,
                     defer_indexes=deferred_indexes is not None,
+                    before_load_indexes=(
+                        before_load_indexes if deferred_indexes is not None else None
+                    ),
                 )
             )
             # A double that takes no collector may still return counters of its own.
@@ -4028,19 +4089,25 @@ def _watermark_estimates(watermark: "Optional[Watermark]") -> "dict[str, int]":
     return {name: value for name, value in counts.items() if _is_row_estimate(value)}
 
 
-def _carried_index_ddls(migrator: "DataMigrator", name: str) -> "Optional[list[str]]":
+def _carried_index_ddls(
+    migrator: "DataMigrator", name: str, ddls: "Optional[Sequence[str]]" = None
+) -> "Optional[list[str]]":
     """The secondary-index DDLs ``name`` still owes when an earlier run left them pending
     (P4a): its conversion's -- the same deterministic derivation the run that loaded it
     used -- minus each one whose index already exists ON that relation on Aurora DSQL (that
     run may have submitted it before it ended), read once through the migrator's
     ``_target_index_reader``; an unreadable catalog keeps every DDL. ``None`` when the table
-    is not in the run's inventory (its flag stays)."""
+    is not in the run's inventory (its flag stays).
+
+    ``ddls`` (P4d: the rest of a table whose submission before its rows stopped partway, the
+    first of which may have landed): those instead of the conversion's, kept as they are
+    when the table is not in the inventory."""
     inputs = getattr(migrator, "_inputs", None)
     tables = getattr(getattr(inputs, "inventory", None), "tables", None) or ()
     table = next((t for t in tables if t.name == name), None)
     if table is None:
-        return None
-    ddls = list(_effective_conversion(inputs, table).index_ddls)
+        return None if ddls is None else list(ddls)
+    ddls = list(_effective_conversion(inputs, table).index_ddls if ddls is None else ddls)
     if not ddls:
         return []
     reader = getattr(migrator, "_target_index_reader", None)
@@ -4048,6 +4115,481 @@ def _carried_index_ddls(migrator: "DataMigrator", name: str) -> "Optional[list[s
     if existing is None:
         return ddls
     return [ddl for ddl in ddls if _stored_index_name(ddl) not in existing]
+
+
+# P4d: a Drop & reload table's secondary indexes go on the EMPTY recreated table before any of
+# its rows, and the run waits -- bounded -- for Aurora DSQL to build them before its first
+# row. Measured (Seoul, 2026-10-26, MySQL perf_ecom: 8.5M rows, 11 tables, 25 secondary
+# indexes): built after every table's data (P4a), the 25 builds ran up to 680 s after the
+# load (order_items, 3M rows: about 4.4K rows/s per build); on the empty tables they took
+# 13-41 s, side by side, and the load into the indexed tables had no OC001 retry. A build
+# still running at the bound stays "building" for the Data Migration step's watch (P4b) and
+# the load starts anyway: an async build on a table that is loading stays correct -- the wait
+# only keeps the build's completion, a schema change, away from the loads.
+_INDEX_WAIT_BEFORE_LOAD_SECONDS = 600.0
+# The first read right after the submissions, then 1 s later, doubling to 5 s apart.
+_INDEX_WAIT_POLL_FIRST_SECONDS = 1.0
+_INDEX_WAIT_POLL_MAX_SECONDS = 5.0
+# This many reads in a row that answered nothing (Aurora DSQL could not be read): the load
+# starts, and the Data Migration step reads the builds afterwards.
+_INDEX_WAIT_UNANSWERED_READS = 3
+# A table's submissions before its rows on the run's board (P4d), apart from its "index"
+# unit after them (P4a), so neither one's final snapshot replaces the other's.
+_INDEX_BEFORE_LOAD_UNIT = "index before load"
+
+
+# Measurement seams ONLY, read per call like the P3 ones (_in_flight_seam): they exist so one
+# deployed image can be A/B'd (scripts/measure_performance.py --indexes-after-load, or an ECS
+# RunTask env override); they are not settings, and nothing in the app sets them.
+def _indexes_after_load() -> bool:
+    """``DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD`` 1 / true / yes / on: P4a's order --
+    every recreated table's secondary indexes after every table's data -- instead of P4d's
+    (on the empty table, before its rows). Unset or anything else: P4d."""
+    raw = os.environ.get("DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _index_wait_before_load_seconds() -> float:
+    """At most this long the run waits before its first row for the builds it submitted on
+    the empty tables (P4d): ``DSQL_MIGRATOR_FULL_LOAD_INDEX_WAIT_SECONDS`` when it is a number
+    >= 0 (0: no wait), else :data:`_INDEX_WAIT_BEFORE_LOAD_SECONDS`."""
+    raw = os.environ.get("DSQL_MIGRATOR_FULL_LOAD_INDEX_WAIT_SECONDS")
+    try:
+        value = float(str(raw).strip()) if raw is not None else _INDEX_WAIT_BEFORE_LOAD_SECONDS
+    except ValueError:
+        return _INDEX_WAIT_BEFORE_LOAD_SECONDS
+    return value if 0.0 <= value < float("inf") else _INDEX_WAIT_BEFORE_LOAD_SECONDS
+
+
+# The activity details of the submissions before any row loads (P4d): counts only.
+_INDEXES_BEFORE_LOAD_STARTED = (
+    "before any row loads: submitting {ddls} secondary index(es) of {tables} recreated "
+    "table(s) on the empty table(s), one at a time"
+)
+_INDEXES_BEFORE_LOAD_UNREACHABLE = (
+    "Aurora DSQL did not answer while secondary indexes were submitted before the load: "
+    "{n} table(s) get the rest of theirs once every table's data has loaded (last attempt: "
+    "{code})"
+)
+
+
+@dataclass
+class _IndexesBeforeLoad:
+    """What the run did with recreated tables' secondary indexes before their rows (P4d).
+
+    ``reached``: the tables whose DDLs it went through -- each one submitted, or failed -- so
+    their loads owe none, except ``owed``: the rest of a table it stopped partway (Aurora DSQL
+    did not answer, or an error), whose name is also in ``cut_off``: the run's index pass
+    submits them once the table's data has loaded, after reading which of them exist (the
+    first may have landed). ``failures``: per table, the indexes that could not be created --
+    a submission that failed, or a build Aurora DSQL reported failed -- as
+    ``"[UNIQUE ]name: reason"`` (the importer's form), recorded with the table's other index
+    failures once its data has loaded. ``builds``: the builds it submitted, with their job
+    ids (P4b); ``submitted_at``: when the last one was.
+    """
+
+    reached: set = field(default_factory=set)
+    cut_off: set = field(default_factory=set)
+    owed: dict = field(default_factory=dict)
+    failures: dict = field(default_factory=dict)
+    builds: list = field(default_factory=list)
+    submitted_at: Optional[datetime] = None
+
+
+def _submit_table_indexes(
+    create: Callable[..., "tuple[int, list[str]]"],
+    importer: object,
+    name: str,
+    ddls: "Sequence[str]",
+    builds: list,
+    *,
+    records_builds: bool,
+    load_stats: Optional[LoadStatsBoard],
+    unit: str = "index",
+) -> "tuple[int, list[str]]":
+    """One table's secondary-index DDLs through an index pass's ``create`` (P4a's after the
+    load; P4d's before its rows): ``(created, failures)``, or :class:`IndexTargetUnreachable`
+    raised. Each DDL submitted is appended to ``builds`` with the build job id it answered
+    with (P4b) -- also when ``create`` raises -- and the submissions count on the run's board
+    as the table's ``unit`` (it loads no rows)."""
+    stats = LoadStats(units=0)
+    _bind_load_stats(importer, stats)
+
+    def _on_job(ddl: str, build_job: Optional[str]) -> None:
+        builds.append(_index_build_of(name, ddl, build_job))
+
+    try:
+        return create(ddls, on_job=_on_job) if records_builds else create(ddls)
+    finally:
+        _record_load_stats(load_stats, name, unit, stats.snapshot(), final=True)
+
+
+def _before_load_index_ddls(
+    migrator: "DataMigrator",
+    tables: "Sequence[TableDef]",
+    work_units: "Sequence[tuple]",
+    replace_index_ddls: "Mapping[str, Sequence[str]]",
+    *,
+    recreated: "Collection[str]",
+) -> "dict[str, list[str]]":
+    """P4d: ``{table: its secondary-index DDLs}`` for the tables the process path's pre-pass
+    recreated, in that order: exactly what their loads would have left to the run's index
+    pass (P4a) -- a sharded table's the recreate returned, a whole table's its effective
+    conversion's (the derivation its worker made for a pre-recreated table). A table whose
+    conversion cannot be derived is left out: its worker derives them, as before."""
+    by_name = {table.name: table for table in tables}
+    sharded = {unit[1].name for unit in work_units if unit[0] == "shard"}
+    wanted = set(recreated or ())
+    plan: dict[str, list[str]] = {}
+    for name, ddls in replace_index_ddls.items():
+        if name not in wanted:
+            continue
+        if name in sharded or name not in by_name:
+            plan[name] = list(ddls or ())
+            continue
+        inputs = migrator._inputs  # type: ignore[attr-defined]
+        try:
+            plan[name] = list(_effective_conversion(inputs, by_name[name]).index_ddls)
+        except Exception:  # noqa: BLE001 - its worker derives them, as before P4d
+            _LOGGER.warning(
+                "Full Load: the secondary indexes of %s could not be derived before its "
+                "rows; its load derives them", name, exc_info=True,
+            )
+    return plan
+
+
+def _submit_indexes_before_load(
+    handle: JobHandle,
+    migrator: "DataMigrator",
+    ddls_by_table: "Mapping[str, Sequence[str]]",
+    *,
+    load_stats: Optional[LoadStatsBoard] = None,
+    target: Optional[str] = None,
+) -> _IndexesBeforeLoad:
+    """P4d: submit the secondary indexes of tables the run has just recreated -- still empty,
+    with nothing loading -- before any of their rows, and return what became of them.
+
+    One ``CREATE INDEX ASYNC`` at a time, in ``ddls_by_table``'s order, on one Aurora DSQL
+    connection (``BatchedImporter.index_pass``), through the same per-DDL OCC / XX000 /
+    unconfirmed / UNIQUE handling as the run's index pass after the load (P4a), a heartbeat
+    per table. Each table's builds are recorded on the job with their job ids (P4b:
+    :func:`_merge_index_builds` with ``before_load``; its dropped relation's records void). A
+    Stop stops before the next table -- one it did not reach keeps its DDLs for the pass after
+    the load -- and so does Aurora DSQL not answering (:class:`IndexTargetUnreachable`), with
+    that table ``cut_off``. An importer whose ``create`` takes no ``on_job`` (a double)
+    submits as before and records none. ``target`` names the table on the activity lines
+    (the thread path, one table at a time). Never raises.
+    """
+    outcome = _IndexesBeforeLoad()
+    plan: list[tuple[str, list[str]]] = []
+    for name, ddls in ddls_by_table.items():
+        if ddls:
+            plan.append((name, list(ddls)))
+        else:
+            outcome.reached.add(name)  # nothing to submit
+    factory = getattr(migrator, "_importer_factory", None)
+    inputs = getattr(migrator, "_inputs", None)
+    if not plan or not callable(factory) or inputs is None or handle.cancelled:
+        return outcome
+    heartbeat = _heartbeat_of(handle)
+
+    def _settle(
+        name: str, builds: "Sequence[IndexBuild]", failures, owed: "Optional[list]" = None
+    ) -> None:
+        outcome.reached.add(name)
+        if owed is not None:
+            outcome.cut_off.add(name)
+            outcome.owed[name] = list(owed)
+        if failures:
+            outcome.failures.setdefault(name, []).extend(failures)
+        outcome.builds.extend(builds)
+        # When its last build went in: a job id Aurora DSQL does not list yet is "still
+        # building" for 15 minutes from there (P4b), never a failure at once.
+        outcome.submitted_at = datetime.now(timezone.utc)
+        if builds:
+            handle.update(
+                lambda job, n=name, b=tuple(builds): _merge_index_builds(
+                    job, n, b, recreated=True, before_load=True
+                )
+            )
+
+    try:
+        importer = factory(inputs)
+        opener = getattr(importer, "index_pass", None)
+        with (
+            opener() if callable(opener) else contextlib.nullcontext(importer.create_indexes)
+        ) as create:
+            records_builds = _callable_takes_kwarg(create, "on_job")
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "index pass",
+                status=ActivityStatus.INFO,
+                target=target,
+                detail=_INDEXES_BEFORE_LOAD_STARTED.format(
+                    ddls=sum(len(ddls) for _name, ddls in plan), tables=len(plan)
+                ),
+            )
+            for position, (name, ddls) in enumerate(plan):
+                if handle.cancelled:
+                    break  # the rest keep their DDLs for the pass after the load
+                heartbeat()
+                builds: list[IndexBuild] = []
+                try:
+                    _created, failures = _submit_table_indexes(
+                        create, importer, name, ddls, builds,
+                        records_builds=records_builds, load_stats=load_stats,
+                        unit=_INDEX_BEFORE_LOAD_UNIT,
+                    )
+                except IndexTargetUnreachable as exc:
+                    # The DDLs go in order: the one Aurora DSQL did not answer, and those
+                    # after it, are the rest.
+                    _settle(
+                        name, builds, exc.failures,
+                        owed=ddls[exc.created + len(exc.failures):],
+                    )
+                    log_activity(
+                        ActivityCategory.FULL_LOAD,
+                        "index pass",
+                        status=ActivityStatus.WARNING,
+                        target=target,
+                        # The last attempt's code only, never its message.
+                        detail=_INDEXES_BEFORE_LOAD_UNREACHABLE.format(
+                            n=len(plan) - position,
+                            code=retry_code(exc.__cause__)
+                            if exc.__cause__ is not None
+                            else "unknown",
+                        ),
+                    )
+                    break
+                except Exception:  # noqa: BLE001 - this table's rest waits for its rows
+                    _LOGGER.warning(
+                        "Full Load: the secondary indexes of %s could not all be submitted "
+                        "before its rows; the rest are submitted once every table's data "
+                        "has loaded", name, exc_info=True,
+                    )
+                    _settle(name, builds, (), owed=ddls)
+                    continue
+                _settle(name, builds, failures)
+    except Exception:  # noqa: BLE001 - never fails the run: the pass after the load has them
+        _LOGGER.warning(
+            "Full Load: secondary indexes could not be submitted before the load; they are "
+            "submitted once every table's data has loaded", exc_info=True,
+        )
+    return outcome
+
+
+def _failed_build_failure(build: IndexBuild) -> str:
+    """A build Aurora DSQL reported failed before any row loaded, in the importer's failure
+    form (``"[UNIQUE ]name: reason"``, :func:`_record_index_failures`; value-free: the details
+    are sanitized by the fold)."""
+    return (
+        f"{'UNIQUE ' if build.unique else ''}{build.index}: Aurora DSQL's build of the index "
+        f"failed: {build.details or 'no details reported'}"
+    )
+
+
+def _fold_builds_before_load(
+    job: MigrationJob,
+    reads: "Mapping",
+    read_at: datetime,
+    failed: "Collection[tuple[str, str]]",
+) -> None:
+    """P4d: one read of the builds submitted before the load, folded into the job's record as
+    the Data Migration step's watch folds it (P4b: a completed build is counted) -- except
+    that the ``failed`` ones ``(table, index)`` leave the record: the run reports each as an
+    index it could not create, with its table's index failures. The counts stay
+    ``submitted == completed + failed + len(building)``."""
+    from dsql_migrator.ui.data_migration._index_builds import fold_index_build_reads
+
+    record = job.index_builds
+    if record is None:
+        return
+    folded, _failed, _finished = fold_index_build_reads(record, reads, read_at)
+    gone = set(failed or ())
+    if gone:
+        building = [b for b in folded.building if (b.table, b.index) not in gone]
+        failures = [f for f in folded.failures if (f.table, f.index) not in gone]
+        dropped_failures = len(folded.failures) - len(failures)
+        dropped = len(folded.building) - len(building) + dropped_failures
+        folded = folded.model_copy(update={
+            "submitted": max(0, folded.submitted - dropped),
+            "failed": max(0, folded.failed - dropped_failures),
+            "building": building,
+            "failures": failures,
+            "finished_at": folded.finished_at
+            or (read_at if record.building and not building else None),
+        })
+    job.index_builds = folded
+
+
+def _wait_for_index_builds_before_load(
+    handle: JobHandle,
+    migrator: "DataMigrator",
+    outcome: _IndexesBeforeLoad,
+    *,
+    target: Optional[str] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+) -> None:
+    """P4d: wait -- before the first row, with nothing loading -- for Aurora DSQL to build the
+    indexes ``outcome`` submitted, at most :func:`_index_wait_before_load_seconds`.
+
+    Each poll is ONE read of exactly those builds by their job ids (the migrator's
+    ``_index_build_reader``: ``index_build_states``, ``pg_index`` once Aurora DSQL no longer
+    lists a job; never another ``sys.jobs`` row, never ``sys.wait_for_job``): right after the
+    submissions, then 1 s later, doubling to 5 s apart. Each read is folded into the job's
+    record as the Data Migration step's watch folds it (P4b) -- a completed build is counted
+    -- except that a build Aurora DSQL reports failed leaves the record and joins its table's
+    ``failures``: an index the run could not create, reported with the table's other index
+    failures once its data has loaded (a failed UNIQUE build is a missing constraint). A
+    heartbeat per read: one slice of a deliberate wait. It ends when every build settled, on
+    a Stop, at the bound, or after :data:`_INDEX_WAIT_UNANSWERED_READS` reads in a row that
+    answered nothing; a build still running then stays "building" on the job for the step's
+    watch, and the load starts anyway. One activity line. Never raises.
+    """
+    from dsql_migrator.ui.data_migration._index_builds import fold_index_build_reads
+
+    reader = getattr(migrator, "_index_build_reader", None)
+    bound = _index_wait_before_load_seconds()
+    if not outcome.builds or not callable(reader) or bound <= 0:
+        return
+    nap = sleep or _time.sleep
+    clock = monotonic or _time.monotonic
+    heartbeat = _heartbeat_of(handle)
+    total = len(outcome.builds)
+    local = IndexBuilds(
+        submitted=total, building=list(outcome.builds), submitted_at=outcome.submitted_at
+    )
+    failed = 0
+    unanswered = 0
+    ending = "bound"
+    started = clock()
+    deadline = started + bound
+    delay = _INDEX_WAIT_POLL_FIRST_SECONDS
+    try:
+        while local.building:
+            if handle.cancelled:
+                ending = "stopped"
+                break
+            read_at = datetime.now(timezone.utc)
+            try:
+                reads = dict(reader(list(local.building)) or {})
+            except Exception:  # noqa: BLE001 - unknown: read again at the next poll
+                reads = {}
+            heartbeat()
+            if any(read is not None for read in reads.values()):
+                unanswered = 0
+                local, failed_now, _settled = fold_index_build_reads(local, reads, read_at)
+                for build in failed_now:
+                    outcome.failures.setdefault(build.table, []).append(
+                        _failed_build_failure(build)
+                    )
+                failed += len(failed_now)
+                gone = {(build.table, build.index) for build in failed_now}
+                handle.update(
+                    lambda job, r=reads, at=read_at, g=gone: _fold_builds_before_load(
+                        job, r, at, g
+                    )
+                )
+            else:
+                unanswered += 1
+                if unanswered >= _INDEX_WAIT_UNANSWERED_READS:
+                    ending = "unread"
+                    break
+            if not local.building:
+                ending = "settled"
+                break
+            pause = min(delay, deadline - clock())
+            if pause <= 0:
+                break
+            delay = min(_INDEX_WAIT_POLL_MAX_SECONDS, delay * 2)
+            while pause > 0 and not handle.cancelled:
+                step = min(1.0, pause)
+                nap(step)
+                pause -= step
+    except Exception:  # noqa: BLE001 - the wait never fails the run: the load starts
+        _LOGGER.warning("Full Load: the wait for the index builds failed", exc_info=True)
+        ending = "unread"
+    seconds = max(0.0, clock() - started)
+    building = len(local.building)
+    if ending == "settled":
+        detail = (
+            f"Aurora DSQL built the {total} secondary index(es) on the empty table(s) in "
+            f"{seconds:.0f} s; the load starts"
+            if not failed
+            else f"Aurora DSQL built {total - failed} of the {total} secondary index(es) on "
+            f"the empty table(s) in {seconds:.0f} s, and {failed} failed (each is listed "
+            "with its table's index failures once the table's data has loaded); the load "
+            "starts"
+        )
+    elif ending == "stopped":
+        detail = (
+            f"stopped by the operator after {seconds:.0f} s, with {building} of the {total} "
+            "secondary index(es) on the empty table(s) still building"
+        )
+    elif ending == "unread":
+        detail = (
+            f"the builds of {building} of the {total} secondary index(es) could not be read "
+            f"from Aurora DSQL after {seconds:.0f} s: the load starts, and the Data "
+            "Migration step reads them afterwards"
+        )
+    else:
+        detail = (
+            f"{building} of the {total} secondary index(es) still building after "
+            f"{seconds:.0f} s: the load starts anyway (Aurora DSQL keeps building them while "
+            "the rows load, and the Data Migration step shows when they finish)"
+            + (f"; {failed} failed" if failed else "")
+        )
+    log_activity(
+        ActivityCategory.FULL_LOAD,
+        "index pass",
+        status=ActivityStatus.WARNING if failed else ActivityStatus.INFO,
+        target=target,
+        detail=detail,
+    )
+
+
+def _indexes_before_load_hook(
+    handle: JobHandle,
+    migrator: "DataMigrator",
+    *,
+    load_stats: Optional[LoadStatsBoard],
+    voided: set,
+    cut_off: set,
+) -> Callable[[str, "Sequence[str]"], "tuple[list[str], list[str]]"]:
+    """P4d, the thread path, where one table loads at a time: ``migrate_table`` calls the
+    returned hook with a table it has just recreated, and the table's secondary-index DDLs,
+    before its first row.
+
+    The hook voids the builds recorded for the dropped relation (``voided`` collects the
+    table), submits the DDLs on the empty table and waits, bounded, for their builds --
+    nothing else loads meanwhile -- and returns ``(the DDLs its load still owes, the indexes
+    that could not be created)``: none owed once each one was submitted or failed; all of
+    them when it did not get to them (a Stop: the run's index pass submits them after every
+    table's data); the rest when it stopped partway (Aurora DSQL not answering), with the
+    table in ``cut_off``: the pass reads which of them exist first.
+    """
+
+    def _hook(name: str, ddls: "Sequence[str]") -> "tuple[list[str], list[str]]":
+        ddls = list(ddls or ())
+        _void_recorded_index_builds(handle, [name])
+        voided.add(name)
+        cut_off.discard(name)  # a recreate again (a re-read): a fresh table
+        if not ddls:
+            return [], []
+        outcome = _submit_indexes_before_load(
+            handle, migrator, {name: ddls}, load_stats=load_stats, target=name
+        )
+        _wait_for_index_builds_before_load(handle, migrator, outcome, target=name)
+        failures = list(outcome.failures.get(name, ()))
+        if name not in outcome.reached:
+            return ddls, []
+        if name in outcome.cut_off:
+            cut_off.add(name)
+            return list(outcome.owed.get(name, ())), failures
+        return [], failures
+
+    return _hook
 
 
 def _run_deferred_index_pass(
@@ -4060,9 +4602,18 @@ def _run_deferred_index_pass(
     estimates: "Mapping[str, int]",
     load_stats: Optional[LoadStatsBoard] = None,
     scope: "Optional[Collection[str]]" = None,
+    verify: "Collection[str]" = (),
 ) -> int:
     """Submit every loaded table's pending secondary indexes, once every unit of the run has
     returned (P4a), and return how many tables still owe theirs.
+
+    P4d: a Drop & reload table's indexes went on the empty table before its rows, so this pass
+    is the fallback for a table recreated while others loaded (a worker's empty-target
+    promotion or source-drop re-read), one the submissions before the load did not reach, the
+    rest of one they stopped partway (``verify``: of its DDLs in ``ddls_by_table``, only the
+    ones whose index is not on the table are submitted -- the first may have landed), and the
+    tables an earlier run left flagged. It also stamps ``data_loaded_at`` on a record whose
+    builds went in before the rows (:func:`_stamp_data_loaded`).
 
     A ``CREATE INDEX ASYNC`` changes the schema, so each one a finished table submitted
     while others still loaded made their open transactions fail OC001 (40001, "schema has
@@ -4107,6 +4658,9 @@ def _run_deferred_index_pass(
     wanted = None if scope is None else set(scope)
     try:
         job_now = snapshot()
+        _record = getattr(job_now, "index_builds", None)
+        if _record is not None and _record.submitted and _record.data_loaded_at is None:
+            handle.update(lambda job, at=data_loaded_at: _stamp_data_loaded(job, at))
         remaining = [
             chunk.chunk_id
             for chunk in getattr(job_now, "chunks", None) or ()
@@ -4134,9 +4688,13 @@ def _run_deferred_index_pass(
         def _stop_requested() -> bool:
             return not stopped_before and bool(handle.cancelled)
 
+        checked = set(verify or ())
+
         def _merge(job: MigrationJob, name: str, builds: "Sequence[IndexBuild]") -> None:
+            # A table whose submissions before its rows stopped partway (P4d) was not
+            # recreated since: the builds it got then are of this relation and stay.
             _merge_index_builds(
-                job, name, builds, recreated=name in ddls_by_table,
+                job, name, builds, recreated=name in ddls_by_table and name not in checked,
                 data_loaded_at=data_loaded_at,
             )
 
@@ -4168,14 +4726,17 @@ def _run_deferred_index_pass(
         stopped = False
         plan: list[tuple[str, list[str]]] = []
         for name in sorted(remaining, key=_order):
-            if name in ddls_by_table:
+            if name in ddls_by_table and name not in checked:
                 plan.append((name, list(ddls_by_table[name] or ())))
                 continue
             if _stop_requested():
                 stopped = True
                 break
             try:
-                ddls = _carried_index_ddls(migrator, name)
+                ddls = _carried_index_ddls(
+                    migrator, name,
+                    list(ddls_by_table[name] or ()) if name in ddls_by_table else None,
+                )
             except Exception:  # noqa: BLE001 - this table stays flagged
                 _LOGGER.warning(
                     "Full Load index pass: the secondary indexes %s still needs could not "
@@ -4213,26 +4774,14 @@ def _run_deferred_index_pass(
                         stopped = True
                         break
                     heartbeat()
-                    # The table's "index" entry on the run's board: it loads no rows.
-                    stats = LoadStats(units=0)
-                    _bind_load_stats(importer, stats)
-                    # P4b: each DDL submitted, with the build job id it answered with.
+                    # P4b: each DDL submitted, with the build job id it answered with; the
+                    # table's "index" entry on the run's board (it loads no rows).
                     builds: list[IndexBuild] = []
-
-                    def _on_job(
-                        ddl: str, build_job: Optional[str], n: str = name, into: list = builds
-                    ) -> None:
-                        into.append(_index_build_of(n, ddl, build_job))
-
                     try:
-                        try:
-                            _created, failures = (
-                                create(ddls, on_job=_on_job) if records_builds else create(ddls)
-                            )
-                        finally:
-                            _record_load_stats(
-                                load_stats, name, "index", stats.snapshot(), final=True
-                            )
+                        _created, failures = _submit_table_indexes(
+                            create, importer, name, ddls, builds,
+                            records_builds=records_builds, load_stats=load_stats,
+                        )
                     except IndexTargetUnreachable as exc:
                         _record_failures(name, exc.failures)
                         _keep(name, builds)
@@ -4325,13 +4874,20 @@ def _migrate_tables_in_parallel(
     arrive and their final values from the results, per table (shards merged) and per run
     (:class:`~dsql_migrator.core.load_stats.LoadStatsBoard`). Counts and timings only.
 
-    P4a: no table's secondary indexes are submitted while another loads. Both paths leave a
-    recreated table's ``CREATE INDEX ASYNC`` statements to ONE serial pass after every unit
-    has returned (:func:`_run_deferred_index_pass`) -- also after a Stop, an abandoned or
-    broken pool or a lost anchor, and with no table to load (a retry that only completes
-    the indexes an earlier run left pending). ``index_pending`` counts the loaded tables it
-    left without theirs; ``index_scope`` (a retry after a table-set change) limits the pass
-    to the run's current table set (see :func:`_run_deferred_index_pass`).
+    P4a: no table's secondary indexes are submitted while another loads. P4d: a Drop &
+    reload table's ``CREATE INDEX ASYNC`` statements go on the EMPTY recreated table before
+    any row loads -- the process path submits every recreated table's in one serial pass
+    after its recreate pre-pass and waits, bounded, for their builds before the first unit
+    (:func:`_submit_indexes_before_load`, :func:`_wait_for_index_builds_before_load`); the
+    thread path, one table at a time, does so right after each table's own recreate. What a
+    loaded table still owes -- a table recreated while others loaded, one those submissions
+    did not reach -- goes to ONE serial pass after every unit has returned
+    (:func:`_run_deferred_index_pass`), also after a Stop, an abandoned or broken pool or a
+    lost anchor, and with no table to load (a retry that only completes the indexes an
+    earlier run left pending). ``DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD=1`` (a measurement
+    seam) puts every one in that pass, as P4a did. ``index_pending`` counts the loaded tables
+    it left without theirs; ``index_scope`` (a retry after a table-set change) limits the
+    pass to the run's current table set (see :func:`_run_deferred_index_pass`).
     """
     if not tables:
         # Nothing to load: a retry whose tables only owe their secondary indexes.
@@ -4390,11 +4946,27 @@ def _migrate_tables_in_parallel(
         recreated: list[str] = []
         # P4a: {table: the secondary-index DDLs its load left to the index pass below}.
         deferred_indexes: dict[str, list[str]] = {}
+        # P4d: one table loads at a time here, so a table its load recreates gets its
+        # secondary indexes right after that recreate -- before its first row -- and their
+        # builds are waited for (bounded): nothing else loads meanwhile. With several
+        # threads (test doubles) they stay with the index pass below (P4a). ``voided``: the
+        # tables whose old builds the hook voided at their recreate; ``cut_off``: those whose
+        # submissions stopped partway (the pass checks the rest against the table first).
+        voided_before_load: set[str] = set()
+        cut_off_before_load: set[str] = set()
+        index_hook = (
+            _indexes_before_load_hook(
+                handle, migrator, load_stats=load_stats,
+                voided=voided_before_load, cut_off=cut_off_before_load,
+            )
+            if workers <= 1 and not _indexes_after_load()
+            else None
+        )
 
         def _load(table: TableDef) -> _TableLoadOutcome:
             outcome = _migrate_one_table(
                 handle, job_id, table, migrator, error_log, load_stats=load_stats,
-                deferred_indexes=deferred_indexes,
+                deferred_indexes=deferred_indexes, before_load_indexes=index_hook,
             )
             if _thread_load_recreated(migrator, table.name, outcome):
                 recreated.append(table.name)
@@ -4413,13 +4985,17 @@ def _migrate_tables_in_parallel(
                         _tally(future.result())
         finally:
             # P4b: the builds an earlier run recorded for the old relations of the tables
-            # this one recreated leave the record before the pass records the new ones.
-            _void_recorded_index_builds(handle, recreated)
-            # Every table has returned: their secondary indexes, one at a time (P4a).
+            # this one recreated leave the record before the pass records the new ones (a
+            # table whose recreate the P4d hook saw had them voided then).
+            _void_recorded_index_builds(
+                handle, [name for name in recreated if name not in voided_before_load]
+            )
+            # Every table has returned: the secondary indexes they still owe, one at a time
+            # (P4a).
             index_left = _run_deferred_index_pass(
                 handle, job_id, migrator, error_log, ddls_by_table=deferred_indexes,
                 estimates=_watermark_estimates(watermark), load_stats=load_stats,
-                scope=index_scope,
+                scope=index_scope, verify=cut_off_before_load,
             )
         if recreated:
             handle.update(
@@ -4647,9 +5223,9 @@ def _migrate_tables_in_parallel(
         # budget and fail a table before a single row loads. The DROP+CREATE is
         # metadata-only, so doing it here (sequential, on one connection) removes
         # that startup DDL storm at the source. Workers then load into the already-
-        # empty target WITHOUT re-running the DDL (they derive the same post-load
-        # secondary-index DDLs from the applied conversion) -- the same way sharded
-        # tables have always been pre-recreated here.
+        # empty target WITHOUT re-running the DDL -- the same way sharded tables have
+        # always been pre-recreated here -- and (P4d) with its secondary indexes already
+        # on it, submitted below before any unit.
         table_recreator = migrator._table_recreator
         # The whole pass on ONE target connection, and so one token, when the recreator can
         # take one (the default; _ReusedTargetConnection): it was two connections and two
@@ -4660,18 +5236,22 @@ def _migrate_tables_in_parallel(
             table_recreator = partial(table_recreator, connection_factory=reused)
         recreated_names: set[str] = set()
         # A REPLACE table recreated here is EMPTY with NO secondary indexes yet
-        # (recreate_table builds only the base table; indexes are a post-load pass). The
-        # multiprocess SHARDED path loads PK slices across separate processes with NO
-        # index_ddls, so no import_rows call owns the whole table to index it. Capture each
-        # recreated table's secondary-index DDLs here: once all of that table's shards
-        # succeed they join the run's index pass (P4a, after the pool; see the shard-success
-        # branch below). Without this, a sharded REPLACE load silently created NO secondary
-        # indexes. A whole-table unit returns its own (its worker may recreate the table).
+        # (recreate_table builds only the base table). The multiprocess SHARDED path loads
+        # PK slices across separate processes with NO index_ddls, so no import_rows call owns
+        # the whole table to index it. Capture each recreated table's secondary-index DDLs
+        # here: P4d submits them on the empty tables before any unit (below); a table those
+        # submissions did not reach gets them in the run's index pass once all of its shards
+        # succeed (P4a, after the pool; see the shard-success branch below). Without this, a
+        # sharded REPLACE load silently created NO secondary indexes. A whole-table unit
+        # returns its own when its worker recreated the table itself.
         replace_index_ddls: dict[str, list[str]] = {}
         # P4a: {table: the secondary-index DDLs the run's index pass submits after the pool},
-        # one entry per DONE table this run recreated (a whole-table result's, or a sharded
-        # table's pre-pass DDLs).
+        # one entry per DONE table that owes them: one a worker recreated, one the
+        # submissions before the load did not reach (a whole-table result's DDLs, or a
+        # sharded table's pre-pass ones), or the rest of one they stopped partway
+        # (``pending_checked``: the pass reads which of them exist first).
         pending_ddls: dict[str, list[str]] = {}
+        pending_checked: set[str] = set()
         try:
             for wu in work_units:
                 tbl = wu[1]
@@ -4742,6 +5322,24 @@ def _migrate_tables_in_parallel(
         # P4b: the index builds an earlier run recorded for a recreated table's old relation
         # leave the record now, whether or not its load and index pass succeed this time.
         _void_recorded_index_builds(handle, recreated_names)
+        # P4d: the recreated tables are empty and nothing loads yet: their secondary indexes
+        # go on now, one at a time, and the run waits (bounded) for Aurora DSQL to build them
+        # before its first unit, so neither a CREATE INDEX ASYNC nor a build's completion
+        # meets a loading table. A table a worker recreates itself later (an empty target
+        # promoted to a new key, a re-read after a lost source connection), and one these
+        # submissions did not reach (a Stop), leave theirs to the run's index pass after
+        # every table's data (P4a).
+        before_load = _IndexesBeforeLoad()
+        if recreated_names and not _indexes_after_load() and not handle.cancelled:
+            before_load = _submit_indexes_before_load(
+                handle, migrator,
+                _before_load_index_ddls(
+                    migrator, tables, work_units, replace_index_ddls,
+                    recreated=recreated_names - withheld,
+                ),
+                load_stats=load_stats,
+            )
+            _wait_for_index_builds_before_load(handle, migrator, before_load)
         # Per split table: its parts submitted, and those cancelled before they ran.
         submitted_parts: dict[str, int] = {}
         unrun_parts: dict[str, int] = {}
@@ -4811,6 +5409,8 @@ def _migrate_tables_in_parallel(
                             job_id=job_id, table=table,
                             inputs=_slim_worker_inputs(migrator._inputs, table.name),
                             pre_recreated=table.name in recreated_names,
+                            # P4d: its secondary indexes went on before any unit.
+                            pre_indexed=table.name in before_load.reached,
                             in_flight=_unit_in_flight(
                                 cfg.full_load_batch_parallelism, len(wu.ranges) or 1, _share
                             ),
@@ -4995,7 +5595,11 @@ def _migrate_tables_in_parallel(
                         _record_index_failures(
                             error_log, job_id, name,
                             [f for r in shard_results[name]
-                             for f in (r.index_failures or ())],
+                             for f in (r.index_failures or ())]
+                            # P4d: once every shard loaded, also the indexes the table could
+                            # not get before its rows.
+                            + ([] if any_failed or any_stopped
+                               else list(before_load.failures.get(name, ()))),
                         )
                         if any_failed:
                             # Record EVERY shard's outcome (status + rows + message),
@@ -5066,10 +5670,17 @@ def _migrate_tables_in_parallel(
                                     skipped=total_skipped,
                                 ) + f" across {expected_shards} shards")
                             # SUCCESS branch ONLY (no shard FAILED/STOPPED): the recreated
-                            # REPLACE table's secondary indexes join the run's index pass
-                            # (P4a), which submits them ONCE after every unit of the run has
-                            # returned -- the shard workers loaded slices with no index_ddls.
-                            _shard_index_ddls = list(replace_index_ddls.get(name) or ())
+                            # REPLACE table's secondary indexes went on before its rows (P4d);
+                            # if those submissions did not reach it, they join the run's index
+                            # pass (P4a), which submits them ONCE after every unit of the run
+                            # has returned -- the shard workers loaded slices with no
+                            # index_ddls -- and so does the rest of one they stopped partway.
+                            if name in before_load.reached:
+                                _shard_index_ddls = list(before_load.owed.get(name, ()))
+                                if _shard_index_ddls:
+                                    pending_checked.add(name)
+                            else:
+                                _shard_index_ddls = list(replace_index_ddls.get(name) or ())
                             if _shard_index_ddls:
                                 pending_ddls[name] = _shard_index_ddls
                             handle.update(lambda job, n=name, r=total_loaded, s=total_skipped,
@@ -5091,8 +5702,23 @@ def _migrate_tables_in_parallel(
                                     name, rec.get("primary_key"), rec.get("message"),
                                     rec.get("error_code"),
                                 )
+                            # P4a: the secondary indexes the worker left to the run's index
+                            # pass: a table it recreated itself, or (P4d) one the submissions
+                            # before the load did not reach. A table they reached owes none
+                            # -- unless they stopped partway: the rest, checked against the
+                            # table first -- and its indexes that could not be created then
+                            # are recorded now, unless its worker recreated it since (they
+                            # were the dropped copy's).
+                            _table_index_ddls = list(getattr(result, "index_ddls", ()) or ())
+                            _before_failures: list = []
+                            if not _table_index_ddls:
+                                _before_failures = list(before_load.failures.get(name, ()))
+                                _table_index_ddls = list(before_load.owed.get(name, ()))
+                                if _table_index_ddls:
+                                    pending_checked.add(name)
                             _record_index_failures(
-                                error_log, job_id, name, result.index_failures
+                                error_log, job_id, name,
+                                list(result.index_failures or ()) + _before_failures,
                             )
                             _record_zero_dates(name, result.zero_dates)
                             # Same detail as the in-process path: a FAILURE whose text says
@@ -5109,9 +5735,7 @@ def _migrate_tables_in_parallel(
                                     rows_loaded=result.rows_loaded,
                                     quarantined=len(result.quarantine_records),
                                 ))
-                            # P4a: the secondary indexes the worker left to the run's index
-                            # pass (a table its load recreated), flagged in the same update.
-                            _table_index_ddls = list(getattr(result, "index_ddls", ()) or ())
+                            # Flagged in the same update that completes the chunk.
                             if _table_index_ddls:
                                 pending_ddls[name] = _table_index_ddls
                             handle.update(lambda job, n=name, r=result.rows_loaded, s=result.rows_skipped,
@@ -5180,11 +5804,12 @@ def _migrate_tables_in_parallel(
             finally:
                 # Every unit has returned, or never will (a Stop's abandoned pool, a lost
                 # anchor, a broken pool): the run's secondary indexes, one at a time, with no
-                # table loading (P4a). It never raises, so an exception in flight stays the
-                # run's outcome.
+                # table loading (P4a) -- since P4d only those a loaded table still owes. It
+                # never raises, so an exception in flight stays the run's outcome.
                 index_left = _run_deferred_index_pass(
                     handle, job_id, migrator, error_log, ddls_by_table=pending_ddls,
                     estimates=_order_estimates, load_stats=load_stats, scope=index_scope,
+                    verify=pending_checked,
                 )
 
     if handle.cancelled:
@@ -7972,6 +8597,9 @@ class BatchedTableMigrator:
         target_index_reader: Optional[
             Callable[[TableDef], "Optional[set[str]]"]
         ] = None,
+        index_build_reader: Optional[
+            Callable[["Sequence[IndexBuild]"], "Mapping[tuple[str, str], Any]"]
+        ] = None,
     ) -> None:
         """Build a migrator bound to one run's ``inputs``."""
         if inputs.inventory.tables:
@@ -8053,6 +8681,10 @@ class BatchedTableMigrator:
         # tests). Used only by the run's index pass for a table whose indexes an earlier
         # run left unsubmitted (P4a), so it submits only the ones that do not exist yet.
         self._target_index_reader = target_index_reader or self._default_target_index_names
+        # Reads Aurora DSQL's state of index builds by the job ids recorded for them
+        # (injectable for tests). Used only by the run's wait, before its first row, for the
+        # builds it submitted on the empty recreated tables (P4d).
+        self._index_build_reader = index_build_reader or self._default_index_build_states
 
     @property
     def source_type(self) -> SourceType:
@@ -8684,6 +9316,15 @@ class BatchedTableMigrator:
         # parent for a table that may not take parts read from separate snapshots. () -> one
         # range, the whole table (and the CDC-coexisting in-process readers decide their own).
         read_ranges: Sequence[tuple] = (),
+        # P4d: with ``pre_recreated``, the parent also submitted this table's secondary
+        # indexes before any unit (on the empty table), so this load owes none.
+        pre_indexed: bool = False,
+        # P4d (the thread path, one table loading at a time): called as
+        # ``before_load_indexes(name, index_ddls) -> (still owed, could not be created)``
+        # right after this call recreates the table and before its first row; only what it
+        # did not submit stays for the index pass (or is deferred), and what could not be
+        # created joins TableLoadResult.index_failures. None: as before.
+        before_load_indexes: "Optional[Callable[[str, Sequence[str]], tuple]]" = None,
     ) -> TableLoadResult:
         """Stream ``table`` from the source and load it via batched INSERTs.
 
@@ -8936,8 +9577,14 @@ class BatchedTableMigrator:
             shard_sources = None
             rows = _shard_stream(lo, hi)
 
+        # P4d: the indexes ``before_load_indexes`` could not create on the recreated table.
+        before_load_failures: list[str] = []
         if is_replace:
-            if pre_recreated:
+            if pre_recreated and pre_indexed:
+                # P4d: the parent also submitted its secondary indexes on the empty table
+                # before any unit: this load owes none.
+                index_ddls = []
+            elif pre_recreated:
                 # The parent already DROP+recreated this empty target in the serial
                 # pre-pass (avoiding a concurrent-DDL catalog storm at startup). Don't
                 # re-run the DDL; derive the same secondary-index DDLs from the applied
@@ -8955,6 +9602,11 @@ class BatchedTableMigrator:
                 # deterministic conversion would otherwise omit a dropped column. The
                 # overlaying wrapper then makes the excluded columns NULL-only.
                 index_ddls = self._overlaying_recreator(original_table)
+                if before_load_indexes is not None:
+                    # P4d: on the empty table now, before its first row.
+                    owed, failed = before_load_indexes(table.name, list(index_ddls or ()))
+                    index_ddls = list(owed or ())
+                    before_load_failures = list(failed or ())
             # Clean load into a freshly-emptied target: plain INSERT (no ON
             # CONFLICT) -- DSQL never silently drops a non-conflicting row. The
             # target was just recreated from the applied DDL, so target_key_columns
@@ -9118,7 +9770,8 @@ class BatchedTableMigrator:
             rows_skipped=result.conflicts,
             rows_quarantined=getattr(result, "quarantined", 0) or 0,
             quarantine_records=tuple(getattr(result, "quarantine_records", ()) or ()),
-            index_failures=tuple(getattr(result, "index_failures", ()) or ()),
+            index_failures=tuple(getattr(result, "index_failures", ()) or ())
+            + tuple(before_load_failures),
             zero_dates=zero_dates.entries(),
             load_stats=stats.snapshot(),
             # Only a table that loaded completely gets here: one whose batches failed, that
@@ -9251,6 +9904,21 @@ class BatchedTableMigrator:
             return target_index_names(table.name, connection_factory=connector.connect)
         except Exception:  # noqa: BLE001 - unknown: the caller submits every DDL
             return None
+
+    def _default_index_build_states(
+        self, builds: "Sequence[IndexBuild]"
+    ) -> "Mapping[tuple[str, str], Any]":
+        """Aurora DSQL's state of ``builds`` by their recorded job ids (``sys.jobs``, else
+        ``pg_index``), over one fresh connection; every one unknown when it cannot be read."""
+        from dsql_migrator.core.target_introspector import index_build_states
+
+        try:
+            connector = DsqlConnector(
+                self._inputs.target_config, aws_profile=self._inputs.aws_profile
+            )
+            return index_build_states(builds, connection_factory=connector.connect)
+        except Exception:  # noqa: BLE001 - unknown: the wait reads again or lets the load start
+            return {}
 
     def _dependent_view_ddls_for_replace(self) -> list[str]:
         """Converted view DDLs that reference a table being DROP+recreated.

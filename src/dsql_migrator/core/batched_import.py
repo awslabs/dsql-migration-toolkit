@@ -81,9 +81,12 @@ What it does, and the properties it satisfies:
    ``XX000`` is retried the same way; because that attempt's CREATE may have
    committed, a later "already exists" is reported with a note to check the
    target, never counted as created. The Full Load engine passes none to
-   :meth:`BatchedImporter.import_rows`: it submits a whole run's after every table's
-   data has loaded, on one connection (:meth:`BatchedImporter.index_pass`), so no index
-   DDL changes the schema under another table's batches (OC001).
+   :meth:`BatchedImporter.import_rows`: a Drop & reload table's go on the empty table
+   before any row loads (P4d), the rest after every table's data (P4a), each pass on one
+   connection (:meth:`BatchedImporter.index_pass`), so no index DDL changes the schema
+   under another table's batches (OC001). With secondary indexes in place during a load, a
+   row a UNIQUE index other than the primary key rejects (23505) is a poison row, never a
+   key overlap (:meth:`BatchedImporter._violates_secondary_unique`).
 
 8. **Write-path counters.** Every batch, attempt, retry (by SQLSTATE, with Aurora DSQL's
    OC000 / OC001 told apart), 23505 recovery, connect, connection kept after an error and
@@ -140,6 +143,7 @@ from dsql_migrator.core.target_connection import (
     is_server_unavailable,
     is_transient_connection_error,
 )
+from dsql_migrator.core.target_introspector import read_primary_key_index_name
 
 # Dev row-trace logger (child of the ``dsql_migrator`` package logger, level set
 # from DSQL_MIGRATOR_LOG_LEVEL at app start). One DEBUG line PER BATCH (never per
@@ -1191,6 +1195,9 @@ class BatchedImporter:
         # The write path's counters (core.load_stats): counts and timings only. Its own
         # until a caller binds the collector of the unit it loads (bind_load_stats).
         self._stats = LoadStats()
+        # P4d: {table: the stored name of its primary-key index, or None if unknown}, read
+        # from the target catalog the first time a unique violation needs it.
+        self._primary_key_indexes: dict[str, Optional[str]] = {}
 
     def bind_load_stats(self, stats: LoadStats) -> None:
         """Count into ``stats`` from now on: the collector of the load unit (a table, or one
@@ -1874,14 +1881,22 @@ class BatchedImporter:
             primary_key = format_key_values(work.key_columns, row)
         else:
             primary_key = "(no primary key)"
+        # _safe_error, not str(exc): the raw driver text carries the failing row's column
+        # values in its DETAIL line (Property 7). The sqlstate is kept separately in
+        # error_code for triage.
+        message = _safe_error(exc)
+        # P4d: a row a secondary UNIQUE index rejected (23505) names that index -- an
+        # identifier, never a value -- when the primary message does not already.
+        constraint = (
+            violated_constraint_name(exc) if getattr(exc, "sqlstate", None) == "23505" else None
+        )
+        if constraint and f'"{constraint}"' not in message:
+            message = f"{message} [unique index: {constraint}]"
         record = QuarantineRecord(
             table=work.table_name,
             primary_key=primary_key,
             error_code=getattr(exc, "sqlstate", None),
-            # _safe_error, not str(exc): the raw driver text carries the failing
-            # row's column values in its DETAIL line (Property 7). The sqlstate is
-            # kept separately in error_code for triage.
-            message=_safe_error(exc),
+            message=message,
         )
         with self._quarantine_lock:
             # Dedup by the row's identity: a retry re-reads rows a previous attempt
@@ -2156,6 +2171,12 @@ class BatchedImporter:
         the SELECT and the INSERT (a concurrent insert won a missing key), re-deriving the
         existing set until it converges; exhausting the bounded retries surfaces an error --
         never a silent loss. Returns ``(inserted, skipped)``.
+
+        P4d: a 23505 on those rows that names a UNIQUE index other than the primary key
+        (:meth:`_violates_secondary_unique`) is a data error, not a race: it is raised at
+        once, and :meth:`_load_batch` isolates the row (binary split, quarantine). Every
+        23505 still comes here first, so a re-run of a batch that landed (its keys all
+        present) is skipped whichever index the server named.
         """
         unique_violation_sqlstate = "23505"
         key_columns = list(work.key_columns)
@@ -2211,6 +2232,12 @@ class BatchedImporter:
                         )
                     except Exception as exc:  # noqa: BLE001 - inspect sqlstate
                         if getattr(exc, "sqlstate", None) == unique_violation_sqlstate:
+                            # P4d: none of these rows' keys was there, so a UNIQUE index
+                            # other than the primary key rejected one of them: a DATA error
+                            # no re-read resolves. Raised, it reaches _load_batch, which
+                            # splits the batch down to that row and quarantines it.
+                            if self._violates_secondary_unique(connection, work, exc):
+                                raise
                             # A concurrent insert won the race for a missing key;
                             # re-derive existing and retry the remainder.
                             self.load_stats.record_unique_recovery()
@@ -2233,6 +2260,41 @@ class BatchedImporter:
             f"load for table '{work.table_name}' exhausted {max_attempts} attempts "
             "due to concurrent unique violations"
         ) from last_error
+
+    def _violates_secondary_unique(
+        self, connection: Any, work: _BatchWork, exc: BaseException
+    ) -> bool:
+        """Whether a unique violation of rows whose keys :meth:`_select_filter_insert` found
+        absent names a UNIQUE index other than the table's primary key (P4d).
+
+        Such a row collides with another row on a secondary unique index -- present since
+        Step 2 created the table with its indexes, and since P4d before a Drop & reload's
+        rows too -- which re-reading the keys never resolves: it is a data error. Decided by
+        name, both known: the index the violation names (:func:`violated_constraint_name`)
+        against the table's primary-key index, read once per table from the target catalog
+        on ``connection`` (its session is idle: the rejected INSERT ended its own autocommit
+        transaction). Either one unknown, or the key itself (a concurrent insert won it):
+        ``False``, and the select-filter retries as before.
+        """
+        name = violated_constraint_name(exc)
+        if not name:
+            return False
+        primary = self._primary_key_index(connection, work.table_name)
+        return primary is not None and name != primary
+
+    def _primary_key_index(self, connection: Any, table_name: str) -> Optional[str]:
+        """The stored name of ``table_name``'s primary-key index, read from the target catalog
+        the first time and kept (``None``: unknown -- also kept, so a catalog that cannot be
+        read costs one attempt per table, not one per unique violation)."""
+        cache = getattr(self, "_primary_key_indexes", None)
+        if cache is None:  # an instance built without __init__ (a test's bare importer)
+            cache = self._primary_key_indexes = {}
+        if table_name not in cache:
+            try:
+                cache[table_name] = read_primary_key_index_name(connection, table_name)
+            except Exception:  # noqa: BLE001 - unknown: the caller retries as before
+                cache[table_name] = None
+        return cache[table_name]
 
     def _create_indexes(
         self,
@@ -2463,6 +2525,29 @@ def _index_name_of(ddl: str) -> str:
         re.IGNORECASE,
     )
     return match.group(1) if match else ddl[:60]
+
+
+# The index a unique violation's primary message names: PostgreSQL and Aurora DSQL write
+# 'duplicate key value violates unique constraint "<name>"' (the values are in DETAIL).
+_UNIQUE_CONSTRAINT_RE = re.compile(r'violates unique constraint "(.+)"')
+
+
+def violated_constraint_name(exc: BaseException) -> Optional[str]:
+    """The UNIQUE index (constraint) a unique violation names, or ``None`` (P4d).
+
+    psycopg's diagnostic ``constraint_name`` when the server sent one, else the name the
+    primary message quotes. An identifier, never a value: the DETAIL line, which holds the
+    row's values, is never read. Never raises.
+    """
+    try:
+        name = getattr(getattr(exc, "diag", None), "constraint_name", None)
+    except Exception:  # noqa: BLE001 - a diagnostic that cannot be read names nothing
+        name = None
+    if name:
+        return str(name)
+    lines = str(exc).strip().splitlines()
+    match = _UNIQUE_CONSTRAINT_RE.search(lines[0]) if lines else None
+    return match.group(1) if match else None
 
 
 def _answered_job_id(cursor: Any) -> Optional[str]:
@@ -2755,6 +2840,7 @@ __all__ = [
     "is_unconfirmed_index_failure",
     "render_insert_statement",
     "safe_error_message",
+    "violated_constraint_name",
 ]
 
 

@@ -131,12 +131,16 @@ _SPLIT_FORCED_REASON = (
 )
 # P4a: a loaded table whose secondary indexes the run did not submit (index_pending_tables):
 # its row in the Retry unfinished tables checklist, and the notice beside the index notice.
+# Since P4d a Drop & reload table gets them before its rows; these are the ones left for after
+# every table's data (a table recreated during the run, or one Aurora DSQL did not take them
+# for before its rows).
 INDEX_PENDING_REASON = "Data loaded; secondary indexes not created yet."
 INDEX_PENDING_BODY = (
     "The data of these tables is loaded, but the run ended before it submitted their "
-    "secondary indexes (a stop during that step, an app restart, or Aurora DSQL not "
-    "answering). A UNIQUE index among them is a missing constraint until it exists. Retry "
-    "unfinished tables submits them without reloading any data."
+    "secondary indexes (a stop or an app restart while it submitted them after every "
+    "table's data, or Aurora DSQL not answering). A UNIQUE index among them is a missing "
+    "constraint until it exists. Retry unfinished tables submits them without reloading any "
+    "data."
 )
 
 # G25 (decision A): while CDC is live the step keeps its "Stop CDC first" gate. A Full Load
@@ -1232,12 +1236,12 @@ def _render_full_load_step(
                             inline_hint(ui, _APPEND_NEW_CDC_START_POINT, tone="warning")
                         # Reassure the user that a Drop & reload recreates the target
                         # from the APPLIED schema conversion -- including any edits
-                        # they made in Schema Conversion -- not a stale/original DDL.
+                        # they made in Schema Conversion -- not a stale/original DDL, and
+                        # (P4d) with its secondary indexes before its rows.
                         ui.label(
                             "Drop & reload recreates each table from your applied "
                             "Schema Conversion (including any edits you made there), "
-                            "then rebuilds its secondary indexes once every table's "
-                            "data has loaded."
+                            "with its secondary indexes, before any of its rows load."
                         ).classes("text-xs text-gray-500")
 
                 def _confirm() -> None:

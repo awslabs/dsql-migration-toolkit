@@ -100,6 +100,13 @@ def _no_watches():
     ib._WATCHES.clear()
 
 
+@pytest.fixture(autouse=True)
+def _indexes_after_load(monkeypatch):
+    """The builds of the pass after every table's data (P4a's order, under P4d's measurement
+    seam); the builds submitted before the rows: tests/test_p4d_indexes_before_load.py."""
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD", "1")
+
+
 def _build(index, *, table=A, job_id="j-1", unique=False, details=None) -> IndexBuild:
     return IndexBuild(table=table, index=index, job_id=job_id, unique=unique, details=details)
 
@@ -1004,8 +1011,10 @@ def test_the_watch_logs_one_line_per_failed_build_and_one_at_the_end(monkeypatch
         ("index build failed", "warning", f"{A}.ux_email"),
         ("index builds finished", "warning", None),
     ]
+    # P4d: no "after the data loaded" -- a build submitted before the rows can fail while
+    # they load.
     assert w.lines[0][3] == (
-        "Aurora DSQL's build of the UNIQUE index failed after the data loaded: could not "
+        "Aurora DSQL's build of the UNIQUE index failed: could not "
         'create unique index "ux_email". The loaded rows most likely hold a duplicate key '
         "for it, so the target does not enforce that constraint: remove the duplicates, "
         "drop the index if the table still lists it, and create it again before cutting "
@@ -1227,7 +1236,7 @@ def test_a_failed_unique_build_is_a_missing_constraint() -> None:
     assert _tone_of(ui) == "error" and NOTICE_STYLE["error"][3] in ui.icons
     assert ui.texts[0] == "UNIQUE index build failed: a constraint is missing (1 of 3 failed)"
     assert ui.texts[1] == (
-        "The data loaded, but Aurora DSQL could not build this index afterwards. "
+        "The data loaded, but Aurora DSQL could not build this index. "
         f'{A}.ux_email (UNIQUE): could not create unique index "ux_email". The loaded rows '
         "most likely hold a duplicate key for the UNIQUE index, so the target does not "
         "enforce that constraint: remove the duplicates, drop the index if the table still "

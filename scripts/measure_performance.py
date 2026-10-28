@@ -44,7 +44,10 @@ Two subcommands:
               largest first, the other arm of the start-order A/B; --range-in-flight /
               --in-flight-budget set the INSERT batches in flight at most per key
               range (4) and per run (128) for the in-flight A/B, and the report says
-              which caps applied and each table's.
+              which caps applied and each table's. The loader puts a recreated table's
+              secondary indexes on the empty table before its rows and waits (bounded)
+              for their builds (P4d); --indexes-after-load submits them after every
+              table's data instead, as builds before P4d did, the other arm of that A/B.
 
   cdc-lag     Measure END-TO-END CDC replication lag (source commit -> visible on
               the DSQL target) under a SUSTAINED trickle and under BURSTS, reporting
@@ -81,6 +84,8 @@ Usage (from repo root):
     .venv/bin/python scripts/measure_performance.py full-load --yes --wait-index-builds 0
     # The in-flight A/B: 8 INSERT batches per key range instead of the loader's 4:
     .venv/bin/python scripts/measure_performance.py full-load --yes --range-in-flight 8
+    # The index-order A/B: secondary indexes after every table's data (before P4d):
+    .venv/bin/python scripts/measure_performance.py full-load --yes --indexes-after-load
 
     # CDC lag (CDC must already stream cdc_perf.pulse):
     .venv/bin/python scripts/measure_performance.py cdc-lag --setup        # create table
@@ -727,9 +732,12 @@ def _wait_for_index_builds(connect, record, max_wait: float, *,
 def _index_builds_report(record, *, waited: float, read_errors: int, started_at: float,
                          elapsed: float) -> "tuple[dict | None, float | None]":
     """``(index_builds, end_to_end_seconds)`` for the report: counts and times only. The end
-    to end runs from the run's start to the last build's finish (as seen by the poll that
-    saw it; ``None`` while any still builds), or is the run's own wall time when it
-    submitted no build (nothing to wait for)."""
+    to end runs from the run's start to the later of its end and the last build's finish
+    (as seen by the poll that saw it; ``None`` while any still builds), or is the run's own
+    wall time when it submitted no build (nothing to wait for). Builds submitted on the empty
+    tables before the rows (P4d) can finish before the data does: their
+    ``seconds_after_load`` is 0 (ready when the data loaded) and the run's end bounds the
+    end to end."""
     if record is None or not record.submitted:
         return None, round(elapsed, 2)
     loaded, finished = record.data_loaded_at, record.finished_at
@@ -742,11 +750,11 @@ def _index_builds_report(record, *, waited: float, read_errors: int, started_at:
         "data_loaded_at": _iso(loaded),
         "submitted_at": _iso(record.submitted_at),
         "finished_at": _iso(finished) if done else None,
-        "seconds_after_load": round((finished - loaded).total_seconds(), 1)
+        "seconds_after_load": round(max(0.0, (finished - loaded).total_seconds()), 1)
         if done and loaded is not None else None,
         "waited_seconds": waited,
         "read_errors": read_errors,
-    }, (round(finished.timestamp() - started_at, 2) if done else None)
+    }, (round(max(finished.timestamp() - started_at, elapsed), 2) if done else None)
 
 
 @contextlib.contextmanager
@@ -786,6 +794,15 @@ def _reader_shards_setting() -> "int | str | None":
     except Exception:  # noqa: BLE001 - the report says what was set
         return os.environ.get("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS")
     return "auto" if value == 0 else value
+
+
+def _index_order() -> str:
+    """Where the loader puts a recreated table's secondary indexes, as it reads its seam now:
+    "before-load" (P4d, the default: on the empty table before its rows) or "after-load"
+    (--indexes-after-load: after every table's data, as before P4d)."""
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    return "after-load" if engine._indexes_after_load() else "before-load"
 
 
 def _in_flight_caps() -> dict:
@@ -835,6 +852,11 @@ def cmd_full_load(args) -> int:
     for flag, key in _IN_FLIGHT_SEAMS:
         if getattr(args, flag, None) is not None:
             os.environ[key] = str(getattr(args, flag))
+    # --indexes-after-load: the loader's measurement seam that submits a recreated table's
+    # secondary indexes after every table's data (P4a's order) instead of on the empty table
+    # before its rows (P4d), so one image measures both arms. Unset: the environment's.
+    if getattr(args, "indexes_after_load", False):
+        os.environ["DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD"] = "1"
 
     from dsql_migrator.core.converter import (
         PrimaryKeyStrategy, SchemaConvertOptions, SchemaConverter,
@@ -975,7 +997,9 @@ def cmd_full_load(args) -> int:
         f"tp={args.table_parallelism} bp={args.batch_parallelism} (in flight <= "
         f"{caps['per_range']} per key range, {caps['run_budget']} per run)"
         f"{' as Full load + CDC' if cdc_mode else ''}"
-        f"{' in inventory order' if inventory_order else ''} ...")
+        f"{' in inventory order' if inventory_order else ''}"
+        f"{' with the secondary indexes after the load' if _index_order() == 'after-load' else ''}"
+        " ...")
     started_at = time.time()
     t0 = time.monotonic()
     job_id = jm.submit(work)
@@ -1133,6 +1157,10 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
         # P3: the INSERT batches in flight the loader allowed per key range and per run
         # (its effective values; batch_parallelism above is the per-unit ceiling).
         "in_flight": _in_flight_caps(),
+        # P4d: where a recreated table's secondary indexes went: "before-load" (on the
+        # empty table, its builds waited for before the first row) or "after-load"
+        # (--indexes-after-load: after every table's data).
+        "index_order": _index_order(),
         # The order the pool started the tables in: the largest first (R2), or the
         # inventory's with --inventory-order. Each table's start is its load_started_at.
         "start_order": (
@@ -1166,9 +1194,10 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
             "rows_per_sec": round(total_rows / window_secs, 1) if window_secs else None,
         },
         # Seconds summed over the tables (the loads overlap in wall time): writing rows,
-        # submitting the CREATE INDEX ASYNC statements (since P4a one at a time after every
-        # table's data, so that part does not overlap; the builds run on after), and the
-        # post-load COUNT(*) of each replace table.
+        # submitting the CREATE INDEX ASYNC statements (one at a time, never beside a load:
+        # since P4d before the first row, the run then waiting for the builds -- the time
+        # between started_at and data_phase_started_at -- else after every table's data),
+        # and the post-load COUNT(*) of each replace table.
         "phases_seconds": {
             "load": run.get("load_s"), "index": run.get("index_s"),
             "count": run.get("count_s"),
@@ -1543,6 +1572,12 @@ def main() -> int:
                          "builds), at most SECONDS (default 1800); exits 3 without "
                          "loading if it does not drain. It runs before this run drops "
                          "and recreates its tables, so it cannot wait out that drop")
+    fl.add_argument("--indexes-after-load", action="store_true",
+                    help="submit each recreated table's secondary indexes after every "
+                         "table's data has loaded (builds before P4d) instead of on the "
+                         "empty table before its rows (the loader's default, which waits "
+                         "for those builds, bounded, before the first row): the other arm "
+                         "of the index-order A/B")
     fl.add_argument("--wait-index-builds", type=float, default=_WAIT_INDEX_BUILDS_SECONDS,
                     metavar="SECONDS",
                     help="after the run, wait until Aurora DSQL finished the CREATE INDEX "

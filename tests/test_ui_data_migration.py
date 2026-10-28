@@ -13679,16 +13679,18 @@ def test_the_shard_count_is_the_explicit_reader_shards_unclamped(monkeypatch) ->
     assert planned == [] and len(units) == 1 and units[0].read_ranges == ()
 
 
+@pytest.mark.parametrize("after_load", [False, True], ids=["before-load", "after-load"])
 @pytest.mark.parametrize("third_shard", ["DONE", "FAILED", "STOPPED"])
 def test_multiprocess_sharded_replace_creates_indexes_only_on_success(
-    monkeypatch, third_shard
+    monkeypatch, third_shard, after_load
 ) -> None:
     # FIX 3: a sharded REPLACE table is recreated EMPTY (no secondary indexes) and its
     # shard workers load slices with NO index_ddls, so the parent must build the indexes
     # itself: the serial pre-pass captures the recreator's index DDLs, and the parent
-    # submits them ONCE -- since P4a in the run's index pass, after every unit of the run
-    # has returned -- and only when every shard is DONE (never on FAILED/STOPPED), its
-    # failures through the shared _record_index_failures path. Behaviour, on the inline
+    # submits them ONCE. P4d: on the empty table, before any shard, whatever the shards then
+    # do. Under its measurement seam (P4a's order): in the run's index pass, after every unit
+    # of the run has returned, and only when every shard is DONE (never on FAILED/STOPPED),
+    # its failures through the shared _record_index_failures path. Behaviour, on the inline
     # process pool: what ran, in which order.
     import dsql_migrator.ui.data_migration._full_load_engine as engine
     from tests.test_full_load_overlay import _InlineExecutor
@@ -13722,6 +13724,8 @@ def test_multiprocess_sharded_replace_creates_indexes_only_on_success(
     monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "2")
     monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", "4")
     monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS", "1000")
+    if after_load:
+        monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD", "1")
     table = _events_table()
     migrator = BatchedTableMigrator(
         _shard_inputs([table], replace=[table.name]),
@@ -13737,7 +13741,13 @@ def test_multiprocess_sharded_replace_creates_indexes_only_on_success(
     )
     shards = [("shard", i) for i in range(4)]
     (chunk,) = handle.job.chunks
-    if third_shard == "DONE":
+    if not after_load:
+        # Recreated first, its index DDLs once on the empty table, then the four ranges;
+        # nothing is left for the pass after them, loaded or not.
+        assert events == [("recreate", table.name), ("index", [ddl]), *shards]
+        assert chunk.status == ("DONE" if third_shard == "DONE" else "FAILED")
+        assert not chunk.indexes_pending and counts.index_pending == 0
+    elif third_shard == "DONE":
         # Recreated first, the four ranges loaded, then its index DDLs once.
         assert events == [("recreate", table.name), *shards, ("index", [ddl])]
         assert chunk.status == "DONE" and not chunk.indexes_pending
@@ -14857,10 +14867,23 @@ def test_quarantine_advice_follows_the_sqlstate_not_a_size_guess(monkeypatch) ->
     assert "legitimately too large" in oversized, oversized
     assert "1048576" in oversized
 
+    # P4d: a 23505 quarantined is a secondary UNIQUE index (a duplicate of the row's key is
+    # recovered, never dropped): its remedy names the duplicate and the index, not a size.
+    captured.clear()
+    _engine._log_quarantined_row(
+        "app.t", "id=3", 'duplicate key value violates unique constraint "t_email_key"',
+        "23505",
+    )
+    (unique,) = captured
+    assert "too large" not in unique, unique
+    assert "A UNIQUE index on Aurora DSQL (the one the reason names, not the primary key)" in (
+        unique)
+    assert "remove the duplicate at the source" in unique
+
     # Anything else: point at the target's own reason rather than inventing a cause.
     captured.clear()
     _engine._log_quarantined_row(
-        "app.t", "id=3", "duplicate key value violates unique constraint", "23505",
+        "app.t", "id=4", 'new row violates check constraint "t_qty_check"', "23514",
     )
     (other,) = captured
     assert "too large" not in other, other

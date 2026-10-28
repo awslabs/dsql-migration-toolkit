@@ -82,6 +82,14 @@ class _Error(Exception):
         self.sqlstate = sqlstate
 
 
+@pytest.fixture(autouse=True)
+def _indexes_after_load(monkeypatch):
+    """P4d puts a Drop & reload table's secondary indexes on the EMPTY table before its rows
+    (tests/test_p4d_indexes_before_load.py); the pass after every table's data pinned here
+    stays as its fallback, and is P4a's whole order again under P4d's measurement seam."""
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_INDEXES_AFTER_LOAD", "1")
+
+
 def _ddl(name: str, table: str, *, unique: bool = False) -> str:
     return (
         f'CREATE {"UNIQUE " if unique else ""}INDEX ASYNC "{name}" ON "app"."{table}" '

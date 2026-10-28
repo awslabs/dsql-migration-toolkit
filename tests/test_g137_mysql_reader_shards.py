@@ -441,12 +441,18 @@ def test_a_mysql_full_load_and_cdc_append_table_is_split_in_four_own_snapshots(r
 def test_a_mysql_drop_and_reload_table_splits_and_builds_its_indexes_once(rig) -> None:
     r = rig([_table()], replace=[EVENTS])
     assert len(r.shards) == 4 and r.status == {EVENTS: "DONE"}
-    assert r.created == [[_UQ_EMAIL.replace("UNIQUE INDEX", "INDEX")]]  # once, after all four
+    # Once, for all four parts -- since P4d on the empty table before them.
+    assert r.created == [[_UQ_EMAIL.replace("UNIQUE INDEX", "INDEX")]]
     assert r.unique_reads == []          # recreated from the applied DDL: no live read
+    assert not any(c.indexes_pending for c in r.handle.job.chunks)
     rig.reset()
     rig.fail_shards.add(2)
     failed = rig([_table()], replace=[EVENTS])
-    assert failed.status == {EVENTS: "FAILED"} and failed.created == []
+    # They went on before the parts loaded; a failed part leaves nothing owed (a retry
+    # recreates the table, and its indexes with it).
+    assert failed.status == {EVENTS: "FAILED"}
+    assert failed.created == [[_UQ_EMAIL.replace("UNIQUE INDEX", "INDEX")]]
+    assert not any(c.indexes_pending for c in failed.handle.job.chunks)
 
 
 def _one_session(r, ranges=_FOUR):

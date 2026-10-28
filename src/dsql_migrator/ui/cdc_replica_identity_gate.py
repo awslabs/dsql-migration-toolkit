@@ -13,8 +13,9 @@ dead-lettered. Since G15, CDC infrastructure with sink plugin v51 or later keys 
 its SOURCE primary key (SinkKeyColumns) and the sink deletes by that key once Aurora DSQL's
 unique index on it is valid, so the delete lands -- and an UPDATE of the leading column, which
 arrives with no old image, replaces the row holding that key. The hold below stays for what that
-does not cover: the window before that index is valid (it is rebuilt after the load on a Drop &
-reload; such an UPDATE is then dead-lettered 23505, the old row kept), an UPDATE whose new image
+does not cover: the window before that index is valid (a Drop & reload builds it again -- since
+P4d on the empty table before its rows, so CDC meets it valid unless its build outlasted the load;
+such an UPDATE is then dead-lettered 23505, the old row kept), an UPDATE whose new image
 lacks an unchanged TOASTed value, ``USING INDEX`` (a placeholder in the source key itself) and
 infrastructure deployed by an earlier version. A lost DELETE is never replayed.
 

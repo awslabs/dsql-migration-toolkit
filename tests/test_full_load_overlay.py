@@ -995,7 +995,8 @@ def test_the_parent_promotes_an_empty_overlay_table_whose_key_changed(monkeypatc
     assert "docs" in rig.migrator._inputs.replace_tables and rig.recreated == ["docs"]
     assert rig.alters() == ['"body" DROP NOT NULL', '"body" DROP DEFAULT']
     assert ("docs", OnConflictMode.NONE, ["id", "note"]) in rig.importer.calls
-    # P4a: the load submitted none; the run's index pass did, once every table had loaded.
+    # P4d: the load submitted none; the parent did, on the empty recreated table before any
+    # unit (its effective conversion's DDLs, as its worker derived them before P4d).
     assert rig.importer.index_ddls["docs"] is None
     assert rig.importer.created == [['CREATE UNIQUE INDEX ASYNC docs_u ON "docs" ("body")']]
     assert rig.job.status == "DONE" and not any(c.indexes_pending for c in rig.job.chunks)
