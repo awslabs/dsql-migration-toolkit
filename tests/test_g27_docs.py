@@ -57,7 +57,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_g25_docs import LANGS, ROOT, _function, _has, _page
+from tests.test_g25_docs import _F43, LANGS, ROOT, _function, _has, _page
 from tests.test_g25_docs_r4 import _stale
 from tests.test_g25_docs_r7 import _joined
 from tests.test_g25_docs_r8 import _DROP_AND_RELOAD, _check
@@ -77,137 +77,17 @@ def _flat_source(path, name: str) -> str:
 # -- item [0]: a Start after a Full Load that may have appended states the condition ---------
 
 _RELOAD_CONDITION = {
+    # §4.3 (answer-first) keeps what a reader acts on in its "Did the Full Load append?" bullet:
+    # the sign (*already there*, e.g. a re-run with the default *Append*), the start-point card's
+    # notice, the Drop & reload re-run (with CDC only, the type switch for that run) and why, that
+    # the notice does not block Start, can show after a copy that did not append and goes away
+    # after a Drop & reload, and the Full Load dialog's advance warning. Which attempt counts,
+    # which retries clear it and how long each sign lasts are the notice's own bookkeeping.
     _P04: {
-        "signal": {
-            "en": "**After a Full Load that may have appended to an earlier copy**, the CDC step "
-            "states the Drop & reload condition before a Start that begins at that Full Load's "
-            "watermark and is not refused. It does so when this session shows that the Full Load "
-            "found rows already on the target (*already there* in its row counts on the Full "
-            "Load step) on a table's first attempt (*Attempts* 1), or that Start CDC was "
-            "submitted in this migration, from an earlier start point, before that Full Load ran "
-            "and the Full Load found any — for example a re-run with the default *Append*, made "
-            "before CDC was ever started or after it had streamed.",
-            "ko": "**앞선 복사본 위에 append했을 수 있는 Full Load 뒤에는**, 그 Full Load의 워터마크에서 "
-            "시작하고 거부되지 않는 Start 전에 CDC 단계가 Drop & reload 조건을 알려 줍니다. 이 세션이 "
-            "그 Full Load가 타깃에 이미 있던 행(Full Load 단계의 행 수에 *already there*로 표시)을 "
-            "어떤 테이블의 첫 시도(*Attempts* 1)에서 찾았음을, 또는 이 마이그레이션에서 그 Full Load가 "
-            "실행되기 전에 더 이른 시작 지점에서 Start CDC를 제출했고 그 Full Load가 그런 행을 하나라도 "
-            "찾았음을 보여 줄 때입니다 — 예를 들어 CDC를 한 번도 시작하기 전에 했든 CDC가 스트리밍한 "
-            "뒤에 했든, 기본값 *Append*로 한 재실행입니다.",
-            "ja": "**以前のコピーに append した可能性のある Full Load の後は**、その Full Load の"
-            "ウォーターマークから始まり、拒否されない Start の前に、CDC ステップが Drop & reload の"
-            "条件を示します。このセッションが、その Full Load がターゲットに既にあった行 (Full Load "
-            "ステップの行数に *already there* と表示されます) をあるテーブルの最初の試行 (*Attempts* "
-            "が 1) で見つけたこと、または、このマイグレーションでその Full Load が実行される前に、"
-            "より前の開始位置から Start CDC が送信されており、その Full Load がそのような行を一つでも"
-            "見つけたことを示す場合です — たとえば CDC を一度も開始する前でも CDC がストリーミングした"
-            "後でも、既定の *Append* で行った再実行です。",
-        },
-        "card": {
-            "en": "The start-point card then shows *Gapless only if this Full Load did not "
-            "append*: if that Full Load appended to them, Re-run Full Load choosing **Drop & "
-            "reload** before Start CDC (CDC only has no Full Load step: on MySQL switch the "
-            "migration type to Full load + CDC for that run, whose Full Load makes the CDC start "
-            "point exact; on PostgreSQL "
-            "switch it to Full load + CDC and re-run it there, which creates the slot again at "
-            "its own snapshot point), because an append keeps those rows as they were and CDC "
-            "from a watermark carries only the changes after it.",
-            "ko": "그러면 시작 지점 카드가 *Gapless only if this Full Load did not append*를 보여 "
-            "줍니다: 그 Full Load가 그 행에 append했다면 Start CDC 전에 **Drop & reload**로 Re-run "
-            "Full Load 하세요(CDC only에는 Full Load 단계가 없습니다: MySQL에서는 그 실행 동안 "
-            "마이그레이션 유형을 Full load + CDC로 바꾸며 그 Full Load가 CDC 시작 지점을 정확하게 "
-            "맞추고, PostgreSQL에서는 "
-            "유형을 Full load + CDC로 바꿔 그곳에서 다시 실행하며, 그 실행이 슬롯을 자신의 스냅샷 "
-            "지점에 다시 만듭니다). append는 그 행을 그대로 두고, 워터마크에서 시작한 CDC는 그 뒤의 "
-            "변경만 가져오기 때문입니다.",
-            "ja": "そのとき開始位置のカードが *Gapless only if this Full Load did not append* を"
-            "示します: その Full Load がそれらの行に append した場合は、Start CDC の前に **Drop & "
-            "reload** で Re-run Full Load してください (CDC only には Full Load ステップがありません: "
-            "MySQL ではその実行の間はマイグレーションの種類を Full load + CDC に切り替え、その Full "
-            "Load が CDC の開始位置を正確にします。PostgreSQL では種類を Full load + CDC に切り替えて"
-            "そこで再実行し、その"
-            "実行がスロットを自身のスナップショット位置に作り直します)。append はそれらの行をそのまま"
-            "残し、ウォーターマークからの CDC はその後の変更しか運ばないためです。",
-        },
-        "surfaces": {
-            "en": "The card no longer calls that start gapless, the Start CDC dialog shows the "
-            "same notice without blocking Start, and the Start's activity-log line adds *(from "
-            "the Full Load watermark; gapless only if that Full Load did not append to rows "
-            "already on the target)* after its start point.",
-            "ko": "카드는 그 시작을 더 이상 빈틈이 없다고 하지 않고, Start CDC 대화 상자는 Start를 막지 "
-            "않은 채 같은 알림을 보여 주며, 그 Start의 활동 로그 줄은 시작 지점 뒤에 *(from the Full "
-            "Load watermark; gapless only if that Full Load did not append to rows already on the "
-            "target)*를 붙입니다.",
-            "ja": "カードはその開始をもうギャップがないとは呼ばず、Start CDC のダイアログは Start を"
-            "ブロックせずに同じ通知を示し、その Start のアクティビティログの行は開始位置の後に *(from "
-            "the Full Load watermark; gapless only if that Full Load did not append to rows already "
-            "on the target)* を付けます。",
-        },
-        "first-copy": {
-            "en": "A first copy into empty tables finds no rows already there.",
-            "ko": "빈 테이블로의 첫 복사는 이미 있던 행을 찾지 않습니다.",
-            "ja": "空のテーブルへの最初のコピーは既にあった行を見つけません。",
-        },
-        "drop-and-reload": {
-            "en": "A Drop & reload re-run recreates each table it loads, so the only rows it finds "
-            "already there are ones it loaded itself (in a retry, or in a re-read after a dropped "
-            "source connection).",
-            "ko": "Drop & reload 재실행은 로드하는 각 테이블을 다시 만들므로, 그 실행이 타깃에 이미 있던 "
-            "행으로 찾는 것은 자신이 로드한 행뿐입니다(재시도, 또는 소스 연결이 끊긴 뒤의 다시 "
-            "읽기에서).",
-            "ja": "Drop & reload の再実行はロードする各テーブルを作り直すため、その実行がターゲットに"
-            "既にあった行として見つけるのは、自分でロードした行 (リトライ、またはソース接続が切れた後の"
-            "再読み込みで) だけです。",
-        },
-        "retry": {
-            "en": "Retry unfinished tables and Reload specific tables keep that Full Load's "
-            "watermark and continue each table's attempt count from the earlier run, so the rows "
-            "a table they load again finds give no first-attempt sign, and a table they leave as "
-            "it was keeps its own. So a Retry or Reload that loads again every table that showed "
-            "the sign ends the notice, even when that Full Load appended.",
-            "ko": "Retry unfinished tables와 Reload specific tables는 그 Full Load의 워터마크를 유지하고 "
-            "각 테이블의 시도 횟수를 앞선 실행에서 이어 세므로, 그 작업이 다시 로드하는 테이블이 찾은 "
-            "행은 첫 시도의 표시를 남기지 않으며, 그대로 둔 테이블은 자신의 표시를 유지합니다. 그래서 "
-            "표시를 남긴 모든 테이블을 다시 로드하는 Retry나 Reload는, 그 Full Load가 append했더라도 "
-            "알림을 없앱니다.",
-            "ja": "Retry unfinished tables と Reload specific tables はその Full Load のウォーター"
-            "マークを維持し、各テーブルの試行回数を以前の実行から引き継いで数えるため、それらが再び"
-            "ロードするテーブルが見つけた行は最初の試行の手がかりを残さず、そのまま残したテーブルは"
-            "自身の手がかりを保ちます。そのため、手がかりを残したすべてのテーブルを再びロードする "
-            "Retry や Reload は、その Full Load が append した場合でも通知を消します。",
-        },
-        "rare": {
-            "en": "The notice can also show after a copy that did not append (its wording is "
-            "conditional): when a table's first attempt re-read rows after a dropped source "
-            "connection, when Aurora DSQL answered a batch that had committed with a temporary "
-            "error (XX000) or the connection dropped after the commit, so that the batch's retry "
-            "found its own rows, or when a multi-process load did not count one of a retried "
-            "table's attempts.",
-            "ko": "append하지 않은 복사 뒤에도 알림이 보일 수 있습니다(알림은 조건으로만 말합니다): "
-            "테이블의 첫 시도가 소스 연결이 끊긴 뒤 행을 다시 읽었을 때, Aurora DSQL이 커밋된 배치에 "
-            "일시적 오류(XX000)로 응답했거나 커밋 뒤 연결이 끊겨 그 배치의 재시도가 자신의 행을 "
-            "찾았을 때, 또는 멀티프로세스 로드가 재시도한 테이블의 시도 하나를 세지 못했을 때입니다.",
-            "ja": "append しなかったコピーの後にも通知が表示されることがあります (通知は条件として"
-            "述べるだけです): テーブルの最初の試行がソース接続が切れた後に行を再読み込みした場合、"
-            "Aurora DSQL がコミット済みのバッチに一時的なエラー (XX000) で応答したか、コミットの後に"
-            "接続が切れたためにそのバッチのリトライが自身の行を見つけた場合、またはマルチプロセスの"
-            "ロードがリトライしたテーブルの試行の一つを数えなかった場合です。",
-        },
-        "limits": {
-            "en": "Rows found on a first attempt keep the notice for as long as that Full Load is "
-            "the latest one, also after a Start CDC that failed before it updated the stack and "
-            "after an Attach to an existing stack; otherwise the notice ends at the next Start "
-            "CDC submission, from any start point, and after an Attach. Start over ends it in both "
-            "cases.",
-            "ko": "첫 시도에서 찾은 행은 그 Full Load가 최신인 동안 알림을 유지하며, 스택을 업데이트하기 "
-            "전에 실패한 Start CDC 뒤에도, 기존 스택으로 Attach한 뒤에도 그렇습니다. 그렇지 않으면 "
-            "알림은 어떤 시작 지점에서든 다음 Start CDC를 제출하면, 그리고 Attach하면 사라집니다. "
-            "Start over는 두 경우 모두 알림을 없앱니다.",
-            "ja": "最初の試行で見つかった行は、その Full Load が最新である限り通知を保ち、スタックを"
-            "更新する前に失敗した Start CDC の後や、既存スタックへの Attach の後も同じです。そうでない"
-            "場合、通知は、どの開始位置からであれ次に Start CDC を送信したとき、そして Attach の後に"
-            "消えます。Start over はどちらの場合も通知を消します。",
-        },
+        "card": {lang: _F43["append-card"][lang] for lang in LANGS},
+        "fix": {lang: _F43["append-fix"][lang] for lang in LANGS},
+        "notice": {lang: _F43["append-notice"][lang] for lang in LANGS},
+        "dialog": {lang: _F43["append-dialog"][lang] for lang in LANGS},
     },
     _P03: {
         "new-stack": {
@@ -440,32 +320,22 @@ def test_a_start_after_a_full_load_that_may_have_appended_states_the_drop_and_re
     )
 
     _check(lang, _RELOAD_CONDITION)
-    page = _page(lang, _P04)
-    for quoted in (RELOAD_CONDITION_HEADER, RELOAD_CONDITION_LINE):
-        assert _has(lang, page, f"*{quoted}*"), (lang, quoted)
+    assert _has(lang, _page(lang, _P04), f"*{RELOAD_CONDITION_HEADER}*"), lang
+    # (the activity-log line, RELOAD_CONDITION_LINE, is shown by the Start itself)
     assert not _stale(lang, _RELOAD_CONDITION_STALE[lang]), lang
 
 
 # -- item [0], PostgreSQL: the re-snapshot notices' resume from the slot is conditional too ----
 
 _PG_RESNAPSHOT = {
+    # §4.3 (answer-first) names the start-point card's re-snapshot setting and the control that
+    # undoes it; what the notice says of the resume it offers as the way back, and its Drop & reload
+    # re-run, is the notice's own text (the "Did the Full Load append?" bullet gives the re-run).
     _P04: {
         "pg-resnapshot": {
-            "en": "On PostgreSQL, when the start point is set to re-snapshot (*Manual "
-            "re-snapshots instead of resuming from this load's slot*) or the Full Load did not "
-            "finish, the card's re-snapshot notice says the same of the resume from that Full "
-            "Load's slot it gives as the way back, and names the Drop & reload re-run for the case "
-            "where that Full Load appended.",
-            "ko": "PostgreSQL에서는 시작 지점이 다시 스냅샷하도록 설정되었을 때(*Manual re-snapshots "
-            "instead of resuming from this load's slot*)나 Full Load가 끝나지 않았을 때, 카드의 "
-            "재스냅샷 알림이 되돌아가는 방법으로 제시하는 그 Full Load 슬롯에서의 재개에 대해서도 같은 "
-            "조건을 말하고, 그 Full Load가 append했을 경우를 위해 Drop & reload 재실행을 알려 줍니다.",
-            "ja": "PostgreSQL では、開始位置がスナップショットを取り直す設定のとき (*Manual "
-            "re-snapshots instead of resuming from this load's slot*) や Full Load が完了していない"
-            "とき、カードの再スナップショットの通知が、戻る方法として挙げるその Full Load のスロット"
-            "からの再開についても同じ条件を述べ、その Full Load が append した場合のために Drop & "
-            "reload の再実行を示します。",
+            lang: "*Manual re-snapshots instead of resuming from this load's slot*" for lang in LANGS
         },
+        "resume-control": {lang: "**Resume from the Full Load's slot instead**" for lang in LANGS},
     },
 }
 
@@ -520,30 +390,9 @@ def test_chapter_4_says_the_postgresql_resnapshot_notices_state_the_condition_to
 # -- item [0], rule E: the Full Load confirm dialog names Drop & reload for CDC's new start ----
 
 _CONFIRM_DIALOG = {
-    _P04: {
-        "dialog": {
-            "en": "Before such a Full Load, its confirm dialog on the Full Load step names Drop & "
-            "reload too: in Full load + CDC, where selected tables already hold rows, the dialog "
-            "of Start Full Load, Re-run Full Load or Re-run all tables (each takes a new start "
-            "point) does not mark *Append* recommended, and a line under the choice reads *CDC "
-            "from this run's new start point needs 'Drop & reload' …*, while *Append* stays the "
-            "default. Retry unfinished tables and Reload specific tables keep the start point, and "
-            "their choice is unchanged.",
-            "ko": "그런 Full Load 전에는 Full Load 단계의 확인 대화 상자도 Drop & reload를 알려 줍니다: "
-            "Full load + CDC에서 선택한 테이블에 이미 행이 있으면, Start Full Load, Re-run Full Load, "
-            "Re-run all tables(모두 새 시작 지점을 잡습니다)의 대화 상자는 *Append*를 "
-            "권장(recommended)으로 표시하지 않고 선택지 아래에 *CDC from this run's new start point "
-            "needs 'Drop & reload' …* 줄을 보여 주며, 기본값은 여전히 *Append*입니다. Retry unfinished "
-            "tables와 Reload specific tables는 시작 지점을 유지하며, 그 선택지는 바뀌지 않습니다.",
-            "ja": "そのような Full Load の前には、Full Load ステップの確認ダイアログも Drop & reload "
-            "を示します: Full load + CDC で、選択したテーブルに既に行がある場合、Start Full Load、"
-            "Re-run Full Load、Re-run all tables (いずれも新しい開始位置を取ります) のダイアログは "
-            "*Append* を推奨 (recommended) と表示せず、選択肢の下に *CDC from this run's new start "
-            "point needs 'Drop & reload' …* という行を表示し、既定は引き続き *Append* です。Retry "
-            "unfinished tables と Reload specific tables は開始位置を維持し、その選択肢は変わりませ"
-            "ん。",
-        },
-    },
+    # §4.3 (answer-first) keeps the dialog's advance warning (the line, quoted) in the same bullet;
+    # which actions it appears under, and that Append stays the default, are the dialog's.
+    _P04: {"dialog": {lang: _F43["append-dialog"][lang] for lang in LANGS}},
 }
 _QUOTED_LINE = "CDC from this run's new start point needs 'Drop & reload'"
 
@@ -610,38 +459,40 @@ def test_chapter_4s_binlog_purged_route_names_drop_and_reload_as_the_start_cdc_w
 
 # -- item [5]: the PostgreSQL delete drops the slot and publication, as its dialog says -------
 
-_PG_DELETE = {
+_PG_DELETE = {  # 2026-10-26 (answer-first 13.7): the facts a user acts on; how the teardown releases the WAL is gone
     _P13: {
-        "dialog": {
-            "en": "On PostgreSQL, deleting the stack drops the replication slot and the "
-            "publication. The Delete CDC infrastructure dialog says so, naming the slot (and the "
-            "publication when this session knows its name): once the stack is deleted, the "
-            "teardown drops each of them that exists on the source, which releases the WAL the "
-            "slot retains, and if it cannot drop them, the teardown still completes and its log "
-            "gives the statements to run on the source. It then keeps the source-credentials "
-            "secret the tool created for CDC (with password authentication) instead of scheduling "
-            "it for deletion, because that secret holds the credentials needed to drop the slot: "
-            "delete it yourself once the slot is gone, as the dialog also says. When the slot it "
-            "drops is the Full Load's, Start CDC can no longer resume from it, so choose "
-            "**\"Re-snapshot every table instead\"** in the Start CDC dialog.",
-            "ko": "PostgreSQL에서는 스택을 삭제하면 복제 슬롯과 publication이 drop됩니다. Delete CDC "
-            "infrastructure 다이얼로그가 슬롯 이름(그리고 이 세션이 publication 이름을 알면 그 "
-            "이름도)과 함께 그렇게 알려 줍니다: 스택이 삭제되면 teardown이 소스에서 그 둘을 각각 존재할 "
-            "때만 drop하여 슬롯이 보관하던 WAL을 해제하며, drop하지 못해도 teardown은 그대로 끝나고 그 "
-            "로그가 소스에서 실행할 문을 알려 줍니다. 그때 teardown은 도구가 CDC용으로 만든 소스 "
-            "자격증명 시크릿(비밀번호 인증일 때)을 삭제 예약하지 않고 남겨 둡니다: 그 시크릿에 슬롯을 "
-            "drop하는 데 필요한 자격증명이 있기 때문이며, 다이얼로그도 알려 주듯 슬롯이 없어진 뒤 직접 "
-            "삭제하세요. drop하는 슬롯이 Full Load의 슬롯이면 Start CDC는 더 이상 그 슬롯에서 재개할 수 "
-            "없으므로, Start CDC 다이얼로그에서 **\"Re-snapshot every table instead\"**를 선택하세요.",
+        "drops": {
+            "en": "On PostgreSQL, deleting the stack drops the replication slot and the publication.",
+            "ko": "PostgreSQL에서는 스택을 삭제하면 복제 슬롯과 publication이 drop됩니다.",
             "ja": "PostgreSQL では、スタックを削除するとレプリケーションスロットと publication が"
-            "削除されます。Delete CDC infrastructure のダイアログは、スロットの名前 (このセッションが "
-            "publication の名前を知っていればその名前も) を挙げてそう示します: スタックが削除されると、"
-            "teardown はソースにあるそれぞれを存在する場合にだけ削除し、スロットが保持していた WAL を"
-            "解放します。削除できなかった場合も teardown はそのまま完了し、そのログがソースで実行する"
-            "文を示します。その場合 teardown は、ツールが CDC 用に作成したソース認証情報シークレット "
+            "削除されます。",
+        },
+        "cannot-drop": {
+            "en": "if the teardown cannot drop them it still completes, and its log gives the "
+            "statements to run on the source.",
+            "ko": "drop하지 못해도 teardown은 그대로 끝나고 그 로그가 소스에서 실행할 문을 알려 줍니다.",
+            "ja": "削除できなかった場合も teardown はそのまま完了し、そのログがソースで実行する文を"
+            "示します。",
+        },
+        "secret": {
+            "en": "In that case it keeps the source-credentials secret the tool created for CDC "
+            "(with password authentication) instead of scheduling it for deletion, because that "
+            "secret holds the credentials needed to drop the slot: delete it yourself once the "
+            "slot is gone, as the dialog also says.",
+            "ko": "그 경우 teardown은 도구가 CDC용으로 만든 소스 자격증명 시크릿(비밀번호 인증일 때)을 "
+            "삭제 예약하지 않고 남겨 둡니다: 그 시크릿에 슬롯을 drop하는 데 필요한 자격증명이 있기 "
+            "때문이며, 다이얼로그도 알려 주듯 슬롯이 없어진 뒤 직접 삭제하세요.",
+            "ja": "その場合 teardown は、ツールが CDC 用に作成したソース認証情報シークレット "
             "(パスワード認証の場合) を削除予定にせず残します: そのシークレットにスロットの削除に必要な"
             "認証情報があるためで、ダイアログも示すとおり、スロットがなくなった後に自分で削除して"
-            "ください。削除されるスロットが Full Load のスロットであれば、Start CDC はもうその"
+            "ください。",
+        },
+        "resnapshot": {
+            "en": "When the slot it drops is the Full Load's, Start CDC can no longer resume from "
+            "it, so choose **\"Re-snapshot every table instead\"** in the Start CDC dialog.",
+            "ko": "drop하는 슬롯이 Full Load의 슬롯이면 Start CDC는 더 이상 그 슬롯에서 재개할 수 "
+            "없으므로, Start CDC 다이얼로그에서 **\"Re-snapshot every table instead\"**를 선택하세요.",
+            "ja": "削除されるスロットが Full Load のスロットであれば、Start CDC はもうその"
             "スロットから再開できないため、Start CDC ダイアログで **「Re-snapshot every table "
             "instead」** を選んでください。",
         },

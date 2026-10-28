@@ -122,6 +122,284 @@ _PAGE = {
 }
 
 
+# -- chapter 4 §4.3 is written answer-first, so its tests pin FACTS --------------------------
+# §4.3 says each route once -- a row of one of its two tables, or a sentence of the closing
+# "route" paragraph. The G25 review rounds pinned the section sentence by sentence (card titles,
+# what each card promises, the list of CloudFormation rollback statuses); that detail is in the
+# UI itself, which the code assertions beside every manual check read. What the page still owes
+# the reader, and these pin: the UI strings to look for (English in every language), the ORDER
+# of a route's steps, and the condition a route applies under.
+
+
+def _h2_section(lang: str, page: str, number: str) -> str:
+    """One numbered ``## N.M`` section of a manual page, flattened (up to the next ``## ``)."""
+    raw = (MANUAL / lang / page).read_text(encoding="utf-8")
+    start = re.search(rf"(?m)^## {re.escape(number)} ", raw).start()
+    following = re.search(r"(?m)^## ", raw[start + 3 :])
+    return _flat(lang, raw[start : start + 3 + following.start()] if following else raw[start:])
+
+
+def _steps_in_order(lang: str, text: str, *steps: str) -> bool:
+    """Whether ``steps`` occur in ``text`` in that order (a route's steps, as the page lists them)."""
+    at = 0
+    for step in steps:
+        found = text.find(_flat(lang, step).strip(), at)
+        if found < 0:
+            return False
+        at = found + 1
+    return True
+
+
+def _section_43(lang: str) -> str:
+    return _h2_section(lang, _PAGE["04"], "4.3")
+
+
+# Facts of §4.3 that have no English UI string to pin them by. Each is a verbatim fragment of the
+# page in that language.
+_F43 = {
+    # where the closing route paragraph turns from one kind of stack to the other
+    "route-mark": {"en": "**The route.**", "ko": "**경로.**", "ja": "**手順。**"},
+    "never": {
+        "en": "**never started**",
+        "ko": "**한 번도 시작하지 않은**",
+        "ja": "**一度も開始していない**",
+    },
+    "started": {
+        "en": "**started before**",
+        "ko": "**전에 시작한**",
+        "ja": "**以前に開始した**",
+    },
+    "topics-hold": {
+        "en": "the CDC topics may still hold changes no sink applied",
+        "ko": "CDC 토픽에 어떤 싱크도 적용하지 않은 변경이 남아 있을 수 있고",
+        "ja": "CDC トピックにどの sink も適用していない変更が残っている可能性があり",
+    },
+    "no-resnapshot": {
+        "en": "so no re-snapshot is offered",
+        "ko": "재스냅샷은 제시되지 않고",
+        "ja": "再スナップショットは提示されず",
+    },
+    "cdc-only-new-stack": {
+        "en": "Start CDC on the new stack, which snapshots every selected table",
+        "ko": "새 스택에서 Start CDC 하면 선택한 모든 테이블을 스냅샷합니다",
+        "ja": "新しいスタックで Start CDC すると、選択したすべてのテーブルをスナップショットします",
+    },
+    "extra-row": {
+        "en": "Validation reports it as an EXTRA row",
+        "ko": "Validation이 EXTRA 행으로 보고합니다",
+        "ja": "Validation が EXTRA の行として報告します",
+    },
+    "offered-only-when": {
+        "en": "which the Start CDC dialog offers only when a Start that re-snapshots would "
+        "itself pass its checks",
+        "ko": "Start CDC 대화 상자는 재스냅샷하는 Start가 스스로 점검을 통과할 때만 이를 제시하며",
+        "ja": "Start CDC のダイアログは、再スナップショットする Start 自体がチェックを通る場合にのみこれを提示します",
+    },
+    "cdc-only-switch": {
+        "en": "with CDC only, which has no Full Load step, switch the migration type to Full "
+        "load + CDC first",
+        "ko": "Full Load 단계가 없는 CDC only에서는 먼저 마이그레이션 유형을 Full load + CDC로 바꿈",
+        "ja": "Full Load ステップのない CDC only では、先にマイグレーションの種類を Full load + CDC に"
+        "切り替えます",
+    },
+    "slot-name": {
+        "en": "The slot's name derives from the CDC stack name, so give each migration of one "
+        "source its own CDC stack name",
+        "ko": "슬롯 이름은 CDC 스택 이름에서 만들어지므로, 같은 소스의 마이그레이션마다 자신의 CDC 스택 "
+        "이름을 쓰세요",
+        "ja": "スロット名は CDC スタック名から決まるため、同じソースのマイグレーションごとに独自の CDC "
+        "スタック名を使ってください",
+    },
+    # the blocked-Start table
+    "unusable-cell": {
+        "en": "(another database's, or not a logical `pgoutput` slot)",
+        "ko": "(다른 데이터베이스의 슬롯이거나 논리 `pgoutput` 슬롯이 아님)",
+        "ja": "(別のデータベースのスロット、または論理 `pgoutput` スロットではない)",
+    },
+    "unusable-fix": {
+        "en": "Drop it, or give this migration its own CDC stack name",
+        "ko": "그 슬롯을 지우거나 이 마이그레이션에 자신의 CDC 스택 이름을 주고",
+        "ja": "そのスロットを削除するか、このマイグレーションに独自の CDC スタック名を与え",
+    },
+    "unusable-cdc-only": {
+        "en": "(with CDC only, Start CDC again)",
+        "ko": "(CDC only라면 Start CDC를 다시 실행)",
+        "ja": "(CDC only では Start CDC をもう一度実行します)",
+    },
+    "narrowed-not-back": {
+        "en": "changes committed while the publication was narrowed are not brought back",
+        "ko": "publication이 좁혀져 있는 동안 커밋된 변경은 돌아오지 않습니다",
+        "ja": "publication が絞られていた間にコミットされた変更は戻りません",
+    },
+    "coverage-cell": {
+        "en": "or a publication that misses a selected table",
+        "ko": "선택한 테이블이 빠진 publication",
+        "ja": "選択したテーブルが欠けた publication",
+    },
+    "inheritance-rerun": {
+        "en": "Re-run Full Load with **Drop & reload**",
+        "ko": "**Drop & reload**로 Re-run Full Load 하세요",
+        "ja": "**Drop & reload** で Re-run Full Load します",
+    },
+    "inheritance-started-first": {
+        "en": "on a stack whose connectors were started before, Delete CDC infrastructure and "
+        "deploy it again first",
+        "ko": "커넥터를 전에 시작한 스택에서는 먼저 Delete CDC infrastructure 후 다시 배포하고",
+        "ja": "コネクタを以前に開始したスタックでは先に Delete CDC infrastructure して再デプロイし",
+    },
+    "untick": {
+        "en": "or untick the parent while the table picker can still change the set",
+        "ko": "또는 테이블 선택을 아직 바꿀 수 있는 동안 부모의 선택을 해제하세요",
+        "ja": "または、テーブルの選択をまだ変更できる間に親の選択を外します",
+    },
+    "checks-not-run": {
+        "en": "so Start CDC is not blocked but these checks do not run",
+        "ko": "Start CDC는 막히지 않지만 이 점검은 실행되지 않습니다",
+        "ja": "Start CDC はブロックされませんが、これらのチェックは実行されません",
+    },
+    "test-connection": {
+        "en": "Test the source connection on the Connect step, then open Start CDC again so "
+        "they run",
+        "ko": "Connect 단계에서 소스 연결을 테스트한 뒤 Start CDC를 다시 열어 점검이 실행되게 하세요",
+        "ja": "Connect ステップでソース接続をテストしてから、Start CDC をもう一度開いてチェックが"
+        "実行されるようにしてください",
+    },
+    # "Starting again"
+    "gapless-while-retained": {
+        "en": "a restart is gapless only while the topics still retain them",
+        "ko": "재시작에 빈틈이 없는 것은 토픽이 그 변경을 아직 보존하는 동안뿐입니다",
+        "ja": "再起動にギャップがないのは、トピックがその変更をまだ保持している間だけです",
+    },
+    "restart-row": {
+        "en": "Restart after Stop CDC, or after a Start that CloudFormation rolled back",
+        "ko": "Stop CDC 후 재시작, 또는 CloudFormation이 롤백한 Start 뒤",
+        "ja": "Stop CDC 後の再起動、または CloudFormation がロールバックした Start の後",
+    },
+    "restart-cdc-only": {
+        "en": "(CDC only: Delete CDC infrastructure and deploy it again, then Start CDC, which "
+        "snapshots every selected table)",
+        "ko": "(CDC only: Delete CDC infrastructure 후 다시 배포하고 Start CDC 하면 선택한 모든 "
+        "테이블을 스냅샷합니다)",
+        "ja": "(CDC only: Delete CDC infrastructure して再デプロイし、Start CDC すると選択した"
+        "すべてのテーブルをスナップショットします)",
+    },
+    "pg-slot-position": {
+        "en": "(PostgreSQL: the slot's position)",
+        "ko": "(PostgreSQL: 슬롯의 위치)",
+        "ja": "(PostgreSQL: スロットの位置)",
+    },
+    "mid-snapshot": {
+        "en": "source connector that never completed its snapshot snapshots every selected "
+        "table again",
+        "ko": "스냅샷을 끝내지 못한 소스 커넥터는 선택한 모든 테이블을 다시 스냅샷합니다",
+        "ja": "スナップショットを完了しなかった source connector は、選択したすべてのテーブルを"
+        "もう一度スナップショットします",
+    },
+    "newer-refused": {
+        "en": "Refuses it (*This CDC stack cannot start from a newer start point*): its topics "
+        "may hold changes no sink applied",
+        "ko": "거부합니다(*This CDC stack cannot start from a newer start point*): 그 스택의 토픽에는 "
+        "어떤 싱크도 적용하지 않은 변경이 남아 있을 수 있습니다",
+        "ja": "拒否します (*This CDC stack cannot start from a newer start point*): そのスタックの"
+        "トピックにはどの sink も適用していない変更が残っている可能性があります",
+    },
+    "lost-slot": {
+        "en": "If the slot falls too far behind (`wal_status='lost'`), Start CDC blocks",
+        "ko": "슬롯이 너무 뒤처지면(`wal_status='lost'`) Start CDC가 차단됩니다",
+        "ja": "スロットが遅れすぎる (`wal_status='lost'`) と Start CDC がブロックされます",
+    },
+    # before you start CDC
+    "binlog-started": {
+        "en": "(on a stack that has streamed, after Delete CDC infrastructure and a new deploy)",
+        "ko": "(스트리밍한 적 있는 스택에서는 Delete CDC infrastructure 후 다시 배포한 뒤에)",
+        "ja": "(ストリーミングしたことのあるスタックでは、Delete CDC infrastructure して再デプロイした"
+        "後に)",
+    },
+    "binlog-purged": {
+        "en": "re-run Full Load with **Drop & reload** to capture a fresh watermark",
+        "ko": "**Drop & reload**로 Full Load를 다시 실행해 새 워터마크를 얻으세요",
+        "ja": "**Drop & reload** で Full Load を再実行して新しいウォーターマークを取得します",
+    },
+    "append-card": {
+        "en": "the start-point card shows *Gapless only if this Full Load did not append*",
+        "ko": "시작 지점 카드가 *Gapless only if this Full Load did not append*를 표시합니다",
+        "ja": "開始位置のカードが *Gapless only if this Full Load did not append* を示します",
+    },
+    "append-fix": {
+        "en": "Re-run Full Load choosing **Drop & reload** before Start CDC (with CDC only, "
+        "switch the migration type to Full load + CDC for that run)",
+        "ko": "Start CDC 전에 **Drop & reload**로 Re-run Full Load 하세요(CDC only라면 그 실행 동안 "
+        "마이그레이션 유형을 Full load + CDC로 바꾸세요)",
+        "ja": "Start CDC の前に **Drop & reload** で Re-run Full Load してください (CDC only では、"
+        "その実行の間はマイグレーションの種類を Full load + CDC に切り替えます)",
+    },
+    "append-notice": {
+        "en": "The notice does not block Start, can also show after a copy that did not append, "
+        "and goes away after a Drop & reload",
+        "ko": "이 알림은 Start를 막지 않으며, append하지 않은 복사 뒤에도 보일 수 있고, Drop & reload "
+        "뒤에는 사라집니다",
+        "ja": "この通知は Start をブロックせず、append しなかったコピーの後にも表示されることがあり、"
+        "Drop & reload の後に消えます",
+    },
+    "append-dialog": {
+        "en": "The Full Load dialog warns in advance (*CDC from this run's new start point "
+        "needs 'Drop & reload' …*)",
+        "ko": "Full Load 대화 상자가 미리 경고합니다(*CDC from this run's new start point needs "
+        "'Drop & reload' …*)",
+        "ja": "Full Load のダイアログが事前に警告します (*CDC from this run's new start point "
+        "needs 'Drop & reload' …*)",
+    },
+    # the Full load only note
+    "pg-after-full-load-only": {
+        "en": "so the source connector creates its own slot and **re-snapshots every selected "
+        "table first**",
+        "ko": "소스 커넥터가 자체 슬롯을 만들고 **선택된 모든 테이블을 먼저 재스냅샷**합니다",
+        "ja": "source connector が自前のスロットを作成し、**選択したすべてのテーブルを先に"
+        "再スナップショット** します",
+    },
+    "mysql-after-full-load-only": {
+        "en": "On **MySQL** the binary log keeps history, so CDC starts at the watermark with "
+        "no re-read — unless the stack has streamed: Start CDC then refuses the newer start "
+        "point",
+        "ko": "**MySQL**은 바이너리 로그가 히스토리를 보관하므로 재읽기 없이 워터마크에서 "
+        "시작합니다 — 다만 스트리밍한 적 있는 스택에서는 Start CDC가 더 새 시작 지점을 거부하므로",
+        "ja": "**MySQL** ではバイナリログが履歴を保持するため、再読み込みなしでウォーターマークから"
+        "開始します — ただしストリーミングしたことのあるスタックでは Start CDC がより新しい開始位置を"
+        "拒否するため",
+    },
+    "full-load-only-switch": {
+        "en": "so set the migration type to CDC only, then on its CDC step Delete CDC "
+        "infrastructure and deploy it again before Start CDC (Full load only has no CDC step",
+        "ko": "마이그레이션 유형을 CDC only로 바꾼 뒤 그 CDC 단계에서 Delete CDC infrastructure 후 다시 "
+        "배포하고 Start CDC 하세요(Full load only에는 CDC 단계가 없습니다",
+        "ja": "マイグレーションの種類を CDC only に切り替えてから、その CDC ステップで Delete CDC "
+        "infrastructure して再デプロイし、Start CDC してください (Full load only には CDC "
+        "ステップがありません",
+    },
+    "after-full-load-only": {
+        "en": "so if that Full load only run appended to rows an earlier load left on the "
+        "target, first Re-run Full Load choosing **Drop & reload**",
+        "ko": "그 Full load only 실행이 앞선 적재가 타깃에 남긴 행에 append했다면 먼저 "
+        "**Drop & reload**로 Re-run Full Load 하세요",
+        "ja": "その Full load only の実行が以前のロードがターゲットに残した行に append した場合は、"
+        "先に **Drop & reload** で Re-run Full Load してください",
+    },
+}
+
+
+def _route_halves(lang: str) -> tuple:
+    """§4.3's closing route paragraph, split where it turns from a stack whose connectors were
+    never started (first) to one started before (second)."""
+    section = _section_43(lang)
+    route = section[section.index(_flat(lang, _F43["route-mark"][lang]).strip()) :]
+    turn = route.index(_flat(lang, _F43["started"][lang]).strip())
+    return route[:turn], route[turn:]
+
+
+def _fact(lang: str, text: str, key: str) -> bool:
+    return _has(lang, text, _F43[key][lang])
+
+
 def _v53_history() -> str:
     """The v53 entries of the plugin-version history in s3_provision.py, comment marks removed."""
     source = (ROOT / "src" / "dsql_migrator" / "core" / "s3_provision.py").read_text(
@@ -209,7 +487,8 @@ def test_the_publication_is_only_the_migrated_tables_and_its_refusals_are_named(
     # children are never added with it), and the same-named slot of another pipeline refused
     # (never dropped).
     full_load = _page(lang, "03-full-load.md")
-    assert _has(lang, full_load, _ONLY[lang]), lang
+    # The FOR TABLE ONLY / FROM ONLY inheritance rule is chapter 6.1's and 13.7's (2026-10-25:
+    # chapter 3 no longer repeats it); the slot refusal is what a user meets.
     assert _has(lang, full_load, _SLOT_REFUSAL[lang]), lang
     assert _has(lang, full_load, "`ALTER PUBLICATION`"), lang  # the failed root repair
     assert _has(lang, _page(lang, "13-excluding-tables-and-columns.md"), _CHILD_ADD[lang]), lang
@@ -253,10 +532,11 @@ _NOT_REKEYED = {
     "ko": ("재키잉되지 않은 테이블에서", "재키잉(Composite key) 테이블에서는 아무것도 건너뛰지 않음"),
     "ja": ("リキーされていないテーブルで", "リキーされた (Composite key) テーブルでは何もスキップしません"),
 }
+# Chapter 4's row: the wait is longer when an outage interrupts it (the rule itself is in 6.2).
 _OUTAGE = {
-    "en": "so an Aurora DSQL outage that task sees does not use up the wait",
-    "ko": "그 태스크가 겪는 Aurora DSQL 장애는 대기를 다 써 버리지 않음",
-    "ja": "そのタスクが受ける Aurora DSQL の障害は待機を使い切りません",
+    "en": "longer if an Aurora DSQL outage interrupts the wait",
+    "ko": "Aurora DSQL 장애가 대기를 끊으면 더 길어질 수 있음",
+    "ja": "Aurora DSQL の障害で待機が中断された場合はそれより長くなります",
 }
 
 
@@ -271,7 +551,7 @@ def test_the_hold_budget_is_per_change_and_the_skip_is_scoped(lang: str) -> None
     assert _has(lang, row, _OUTAGE[lang]), lang
     for phrase in _NOT_REKEYED[lang]:
         assert _has(lang, row, phrase), (lang, phrase)
-    assert _has(lang, _page(lang, "06-limitations.md"), per_change), lang
+    # (6.2 no longer repeats that the 5 minutes apply to each held change: chapter 4's row says it)
     assert _has(lang, _page(lang, "07-performance-and-tuning.md"), per_change_ch7), lang
 
 
@@ -300,10 +580,10 @@ def test_the_verified_notice_is_quoted_as_the_ui_names_it(lang: str) -> None:
     assert _has(lang, pages["06-limitations.md"], "*Verified by CHECKSUM*"), lang
 
 
-_STALL = {
-    "en": "`08xxx`, `57xxx` or `null` means the sink cannot reach the cluster",
-    "ko": "`08xxx`, `57xxx` 또는 `null`은 싱크가 클러스터에 닿지 못한다는 뜻입니다",
-    "ja": "`08xxx`、`57xxx` または `null` は、シンクがクラスターに到達できないことを",
+_STALL = {  # §4.6's log-line table row: the SQLSTATE group, then what it means
+    "en": "with `08xxx`, `57xxx` or `null` | the sink cannot reach the cluster",
+    "ko": "`08xxx`, `57xxx` 또는 `null` | 싱크가 클러스터에 닿지 못함",
+    "ja": "`08xxx`、`57xxx` または `null` | シンクがクラスターに到達できない",
 }
 
 
@@ -315,8 +595,7 @@ def test_the_other_g25_ui_changes_are_described_where_the_manual_covers_them(lan
     assert _has(lang, cdc, _STALL[lang]), lang
     assert _has(lang, cdc, "*Stop CDC and repair these tables*"), lang
     assert _has(lang, _page(lang, "06-limitations.md"), "*Start CDC blocked: …*"), lang
-    for test in ("DsqlSinkHoldRedeliveryTest.java", "DsqlSinkSupersededSkipTest.java"):
-        assert test in _page(lang, "08-testing-and-verification.md"), (lang, test)
+    # (chapter 8 no longer cites the sink's Java test classes: a user guide does not name tests)
 
 
 def _v0_1_567(lang: str) -> str:
@@ -447,26 +726,14 @@ def test_faq_q31_teardown_names_the_default_cdc_stack_and_how_to_remove_the_buck
 
 _ROOT_REPAIR = {
     "en": (
-        "at the Full Load on a publication it reuses (before it creates the slot)",
-        "at each Start CDC (if there is no publication yet",
-        "it creates an empty one with that setting and the connector adds its tables",
-        "and before it adds a table selected after the Full Load",
         "at Start CDC a repair that fails, or cannot run because the session has no source "
         "password, does not stop the Start",
     ),
     "ko": (
-        "Full Load에서는 재사용하는 publication을(슬롯을 만들기 전에)",
-        "Start CDC 때마다(publication이 아직 없으면",
-        "그 설정으로 빈 publication을 만들고, 커넥터가 테이블을 추가합니다",
-        "그리고 Full Load 이후 선택한 테이블을 추가하기 전에 바로잡습니다",
         "Start CDC에서는 바로잡기가 실패하거나 세션에 소스 비밀번호가 없어 실행되지 못해도 Start가 "
         "멈추지 않으며",
     ),
     "ja": (
-        "Full Load では再利用する publication(スロットを作成する前に)",
-        "Start CDC のたび(publication がまだない場合",
-        "その設定で空の publication を作成し、コネクタがテーブルを追加します",
-        "そして Full Load の後に選択したテーブルを追加する前です",
         "Start CDC では、修正が失敗しても、セッションにソースのパスワードがなく修正を実行できなくても "
         "Start は止まらず",
     ),
@@ -484,12 +751,16 @@ _STALE_CONNECTOR_PUBLICATION = {
 
 
 @pytest.mark.parametrize("lang", LANGS)
-def test_3_1_names_every_place_the_partition_root_repair_writes(lang: str) -> None:
-    # §3.1 lists every source write ("the only writes the tool ever makes to any source"), but
-    # its G25 parenthetical put the publish_via_partition_root repair at the Full Load's reused
-    # publication alone. Every PostgreSQL Start CDC repairs it too (creating the publication,
-    # empty, when there is none yet), and so does the guard for a table added after the Full
-    # Load. The code is read first, so the docs claim fails if a site goes away.
+def test_3_1_names_the_partition_root_repair_and_that_a_failed_one_never_stops_a_start(
+    lang: str,
+) -> None:
+    # §3.1 lists every source write ("the only writes the tool ever makes to any source"), and
+    # the publish_via_partition_root repair is one. Every PostgreSQL Start CDC repairs it too
+    # (creating the publication, empty, when there is none yet), and so does the guard for a
+    # table added after the Full Load. The code is read first, so the claim fails if a site goes
+    # away. Chapter 3 is a user guide (2026-10-25): which of those sites runs it is CHANGELOG
+    # detail; the page keeps that the repair is a source write and that a failed one at Start
+    # CDC never stops the Start.
     deployer = ROOT / "src/dsql_migrator/core/cdc_deployer.py"
     assert "_repair_publication_via_partition_root(" in _function(deployer, "run_cdc_start")
     # ...never fatal: no source password in the session, or a failed write, is a warning
@@ -536,31 +807,13 @@ _STALE_RESTART = {
         "その 5 分は Aurora DSQL の障害の後に数え直され",
     ),
 }
-# The sink task whose own transient failure counts the 5 minutes again (ch. 4 row, ch. 6, ch. 8).
-_HOLDING_TASK = {
-    "en": dict.fromkeys(("04", "06", "08"), "of the sink task that holds it"),
-    "ko": dict.fromkeys(("04", "06", "08"), "그 변경을 보류한 싱크 태스크"),
-    "ja": {
-        "04": "その変更を保留している sink タスク",
-        "06": "その変更を保留しているシンクタスク",
-        "08": "その変更を保留しているシンクタスク",
-    },
-}
-# ...and what that leaves out: an outage only another sink task sees still uses the wait up.
-_OTHER_TASK = {
-    "en": {
-        "04": "one that only delays the freeing change on another sink task can",
-        "06": "one that only delays the other row's change on another sink task can",
-    },
-    "ko": {
-        "04": "다른 싱크 태스크에서 값을 비우는 변경만 늦추는 장애는 다 써 버릴 수 있음",
-        "06": "다른 싱크 태스크에서 다른 행의 변경만 늦추는 장애는 다 써 버릴 수 있음",
-    },
-    "ja": {
-        "04": "値を空ける変更を別の sink タスクで遅らせるだけの障害は、待機を使い切ることがあります",
-        "06": "もう一方の行の変更を別のシンクタスクで遅らせるだけの障害は使い切ることがあります",
-    },
-}
+# The sink task whose own transient failure counts the 5 minutes again (ch. 6). Chapters 4 and 8 only say
+# the wait is longer when an outage interrupts it (or that a stuck change is dead-lettered after 5
+# minutes) and point to 6.2: which sink task's failure restarts the wait is the sink's internals.
+# 2026-10-26: 6.2 no longer says WHICH sink task's transient failure restarts the wait, nor that an outage only
+# another task sees can use it up -- that is the sink's internals (the code assertions of the test below stay).
+_HOLDING_TASK = {"en": {}, "ko": {}, "ja": {}}
+_OTHER_TASK = {"en": {}, "ko": {}, "ja": {}}
 
 
 def _unique_texts(lang: str) -> dict:
@@ -666,34 +919,38 @@ _SKIP_ROW = {
         "the conflicting change is skipped instead (never dead-lettered)",
         "A skipped change leaves its row's values on the target as they were until its "
         "replacement applies",
-        "is dead-lettered after its 5 minutes when the replacement is queued behind it on its "
-        "partition, or itself waits for a value that change's row still holds (then both are "
-        "dead-lettered)",
+        # The cases still dead-lettered are listed once, in 6.2 (_STILL_DEAD_LETTERED below).
+        "can still be dead-lettered after its 5 minutes",
     ),
     "ko": (
         "충돌한 변경은 대신 건너뜀(dead-letter 처리하지 않음)",
         "건너뛴 변경의 행은 그 대체 변경이 적용될 때까지 타깃에서 값이 그대로임",
-        "그 대체 변경이 그 파티션에서 그 뒤에 줄 서 있거나, 그 변경의 행이 아직 가진 값을 대체 변경 "
-        "자신이 기다리면(이때는 둘 다 dead-letter 처리됨) 5분 뒤 dead-letter 처리됨",
+        "5분 뒤 dead-letter 처리될 수 있음",
     ),
     "ja": (
         "競合した変更は代わりにスキップされます (デッドレターにはなりません)",
         "スキップした変更の行は、その置き換えが適用されるまでターゲット上の値がそのまま残ります",
-        "その置き換えがそのパーティション上で後ろに並んでいる場合や、その変更の行がまだ持つ値を置き換え"
-        "自身が待つ場合 (このときは両方ともデッドレターになります) は、5 分後にデッドレターになります",
+        "5 分後にデッドレターになることがあります",
     ),
 }
-# Chapter 6's list of the cases still dead-lettered.
-_STRANDED = {
-    "en": "when the change needs a value that a skipped change of another row would have freed "
-    "and that row's replacing change is queued behind it on its partition, or itself waits for "
-    "a value the change's own row holds (then both are dead-lettered",
-    "ko": "다른 행의 건너뛴 변경이 비웠을 값이 그 변경에 필요한데 그 행의 대체 변경이 그 파티션에서 그 "
-    "뒤에 줄 서 있거나, 그 대체 변경 자신이 이 변경의 행이 가진 값을 기다리는 경우(이때는 둘 다 "
-    "dead-letter 처리됨",
-    "ja": "別の行のスキップした変更が空けるはずだった値をその変更が必要とし、その行の置き換えの変更が"
-    "そのパーティション上で後ろに並んでいるか、その置き換え自身がこの変更の行の持つ値を待つ場合(この"
-    "ときは両方ともデッドレターになります",
+# Chapter 6's list of the cases still dead-lettered (2026-10-26: the sink-internal cases -- a change queued behind a
+# skipped change, a unique value passed along several rows -- are gone; the cases a user can recognise stay).
+_STILL_DEAD_LETTERED = {
+    "en": (
+        "The change that frees the value is more than 5 minutes behind",
+        "the target already holds the value from outside the stream",
+        "two changes wait on each other",
+    ),
+    "ko": (
+        "값을 비우는 변경이 5분 넘게 뒤처진 경우",
+        "타깃이 스트림 밖에서 이미 그 값을 가진 경우",
+        "변경끼리 서로를 기다리는 경우",
+    ),
+    "ja": (
+        "値を空ける変更が 5 分以上遅れている場合",
+        "ターゲットがストリームの外ですでにその値を持っている場合",
+        "変更どうしが互いを待つ場合",
+    ),
 }
 # Chapter 8's 23505 row.
 _STRANDED_TEST = {
@@ -721,10 +978,11 @@ def test_the_manual_describes_the_skip_and_the_change_it_can_strand(lang: str) -
     row = _unique_row(lang)
     for phrase in _SKIP_ROW[lang]:
         assert _has(lang, row, phrase), (lang, phrase)
-    assert _has(lang, pages[_PAGE["06"]], _STRANDED[lang]), lang
-    ch8 = pages[_PAGE["08"]]
-    assert _has(lang, ch8, _STRANDED_TEST[lang]), lang
-    assert "`DsqlSinkHoldRedeliveryTest.java`" in ch8, lang
+    for fact in _STILL_DEAD_LETTERED[lang]:
+        assert _has(lang, pages[_PAGE["06"]], fact), (lang, fact)
+    # (chapter 8's 23505 row no longer carries the stranded-change sentence or names the sink's
+    # Java test classes -- it says a change stuck for 5 minutes is dead-lettered, never lost, and
+    # points to 4.4 and 6.2, where _STILL_DEAD_LETTERED above is pinned.)
 
 
 _CITED_TEST = re.compile(r"`([A-Z][A-Za-z0-9]*Test)(?:\.java)?`")
@@ -815,47 +1073,39 @@ def test_a_held_changes_failed_try_is_logged_as_the_docs_quote_it() -> None:
 
 # -- Round 3: the PostgreSQL and UI changes, where the manual covers them --------------------
 
-_FROM_ONLY_6 = {  # §6.1
-    "en": "The Full Load, Validation and the CDC monitor's `MAX(pk)` check read a parent's own "
-    "rows only (`FROM ONLY`), as CDC captures them, so a parent whose rows all live in its "
-    "children (inheritance used as partitioning) loads none",
-    "ko": "Full Load와 Validation, CDC 모니터의 `MAX(pk)` 확인은 부모 자신의 행만 읽으므로(`FROM ONLY`, "
-    "CDC가 캡처하는 것과 같음) 모든 행이 자식에 있는 부모(파티셔닝 용도의 상속)는 행을 하나도 로드하지 않고",
-    "ja": "Full Load と Validation、CDC モニターの `MAX(pk)` の確認は親テーブル自身の行だけを読むため "
-    "(`FROM ONLY`。CDC がキャプチャするものと同じ)、すべての行が子テーブルにある親 (パーティショニング目的"
-    "の継承) は 1 行もロードせず",
+_FROM_ONLY_6 = {  # §6.1 (the `MAX(pk)` check and `FROM ONLY` are no longer named: not something a user acts on)
+    "en": "The Full Load and Validation read a parent's own rows only, as CDC captures them, so a "
+    "parent whose rows all live in its children (inheritance used as partitioning) loads none",
+    "ko": "Full Load와 Validation은 CDC가 캡처하는 것과 같이 부모 자신의 행만 읽으므로 모든 행이 자식에 "
+    "있는 부모(파티셔닝 용도의 상속)는 행을 하나도 로드하지 않고",
+    "ja": "Full Load と Validation は CDC がキャプチャするものと同じく親テーブル自身の行だけを読むため、"
+    "すべての行が子テーブルにある親 (パーティショニング目的の継承) は 1 行もロードせず",
 }
-_FROM_ONLY_3 = {  # §3.1
-    "en": "just as the Full Load reads only the table's own rows, `FROM ONLY`",
-    "ko": "Full Load도 그 테이블 자신의 행만 읽음(`FROM ONLY`",
-    "ja": "Full Load もそのテーブル自身の行だけを読みます(`FROM ONLY`",
-}
+# (2026-10-28, §6.1 regrouped) The row keeps that Start CDC refuses the snapshot and the
+# refusal's header; which Start snapshots (every CDC only Start, a re-snapshot, a Manual start
+# point) and that Deploy CDC infrastructure refuses too are the notice's own words in §4.3.
 # §6.1: what the refusal means for each migration type. The prerequisite row says so first
 # (in every migration type since round 4, pinned in test_g25_docs_r4.py); Start CDC refuses
 # the snapshot, and with CDC only the Deploy dialog's own gate does too (the Deploy gate on
 # the prerequisites does not read per-table rows).
 _SNAPSHOT_REFUSED = {
     "en": (
-        "every CDC only Start, a re-snapshot or a Manual start point",
-        "and Start CDC refuses that snapshot, as does Deploy CDC infrastructure with CDC only "
-        "(*CDC cannot snapshot a table that has inheritance child tables*)",
+        "Start CDC refuses to snapshot it (*CDC cannot snapshot a table that has inheritance "
+        "child tables*",
         "With CDC only, untick the parent (each child still migrates as a table of its own); "
         "with Full load + CDC, CDC starts from the Full Load's snapshot point, with no snapshot",
         "a child needs a primary key of its own (PostgreSQL does not inherit one)",
     ),
     "ko": (
-        "모든 CDC only Start, 다시 스냅샷, Manual 시작 지점",
-        "실패로 판정하며, Start CDC는 그 스냅샷을 거부하고 CDC only에서는 Deploy CDC infrastructure도 "
-        "거부함(*CDC cannot snapshot a table that has inheritance child tables*)",
-        "CDC only에서는 부모의 선택을 해제하고(각 자식은 여전히 별개의 테이블로 마이그레이션됨), Full load "
-        "+ CDC에서는 CDC가 스냅샷 없이 Full Load의 스냅샷 지점에서 시작함",
-        "자식 테이블에는 자체 기본 키가 필요함(PostgreSQL은 기본 키를 상속하지 않음)",
+        "Start CDC는 그 스냅샷을 거부합니다(*CDC cannot snapshot a table that has inheritance "
+        "child tables*",
+        "CDC only에서는 부모의 선택을 해제하세요(각 자식은 여전히 별개의 테이블로 마이그레이션됩니다). "
+        "Full load + CDC에서는 CDC가 스냅샷 없이 Full Load의 스냅샷 지점에서 시작합니다",
+        "자식 테이블에는 자체 기본 키가 필요합니다(PostgreSQL은 기본 키를 상속하지 않음)",
     ),
     "ja": (
-        "すべての CDC only の Start、再スナップショット、Manual の開始点",
-        "失敗と判定し、Start CDC はそのスナップショットを拒否し、CDC only では Deploy CDC "
-        "infrastructure も拒否します (*CDC cannot snapshot a table that has inheritance child "
-        "tables*)",
+        "Start CDC はそのスナップショットを拒否します (*CDC cannot snapshot a table that has "
+        "inheritance child tables*",
         "CDC only では親テーブルの選択を外し (それぞれの子テーブルは引き続き別々のテーブルとして移行され"
         "ます)、Full load + CDC では CDC がスナップショットなしで Full Load のスナップショット地点から始まり"
         "ます",
@@ -956,10 +1206,11 @@ def test_an_inheritance_parent_is_read_as_its_own_rows_and_never_snapshotted(lan
     for phrase in _SNAPSHOT_REFUSED[lang]:
         assert _has(lang, limits, phrase), (lang, phrase)
     # The refusal is quoted as the UI names it (English in every manual), in ch. 6 and ch. 4.
+    # (§4.3, answer-first, quotes the refusal; the unreadable-children block, whose fix is to read
+    # again, is shown by the UI and is quoted in chapter 6 only.)
     cdc = _page(lang, _PAGE["04"])
     for text in (limits, cdc):
         assert _has(lang, text, f"*{pg.INHERITANCE_SNAPSHOT_HEADER}*"), lang
-    assert _has(lang, cdc, f"*{pg.INHERITANCE_UNREADABLE_HEADER}*"), lang
     pages = _all_pages(lang)
     stale = [
         (name, phrase)
@@ -968,7 +1219,6 @@ def test_an_inheritance_parent_is_read_as_its_own_rows_and_never_snapshotted(lan
         if _has(lang, text, phrase)
     ]
     assert not stale, (lang, stale)
-    assert _has(lang, _page(lang, "03-full-load.md"), _FROM_ONLY_3[lang]), lang
 
 
 # The slot-position block (remaining[5], [7]) is pinned in test_g25_docs_r4.py: round 4
@@ -976,14 +1226,9 @@ def test_an_inheritance_parent_is_read_as_its_own_rows_and_never_snapshotted(lan
 # went ahead exempts later ones) and its way out on a stack started before are gone.
 
 
-_MID_SNAPSHOT = {
-    "en": "with `initial`, though, a source connector that never completed its snapshot (its "
-    "task failed, or CDC was stopped, first) snapshots every selected table again",
-    "ko": "`initial`에서 초기 스냅샷을 끝내지 못한 소스 커넥터(그 전에 태스크가 실패했거나 CDC를 멈춘 "
-    "경우)는 선택한 모든 테이블을 다시 스냅샷합니다",
-    "ja": "ただし `initial` で初期スナップショットを完了しなかった source connector (その前にタスクが"
-    "失敗したか、CDC を停止した場合) は、選択したすべてのテーブルをもう一度スナップショットします",
-}
+# §4.3 (answer-first) says it in its restart row: a source connector that never completed its
+# snapshot snapshots every selected table again (why it did not -- a failed task, or a Stop CDC
+# first -- is on the card).
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -994,7 +1239,7 @@ def test_a_postgres_start_after_a_stop_mid_snapshot_snapshots_again(lang: str) -
     assert "completed its initial snapshot (its task failed, or CDC was stopped, before then)" in (
         continues
     )
-    assert _has(lang, _page(lang, _PAGE["04"]), _MID_SNAPSHOT[lang]), lang
+    assert _fact(lang, _section_43(lang), "mid-snapshot"), lang
 
 
 _KEEP_SOURCE_PK = {
@@ -1012,18 +1257,16 @@ _KEEP_SOURCE_PK = {
         "テーブルには、下記の CDC モニターの通知も FULL の代わりにその対処法を示します: その後テーブルを"
         "リロードするか、CDC only では **Start over** でもう一度移行します)",
     },
-    "04": {  # the red re-check notice: from the last successful read; after a restart, both
-        "en": "(on PostgreSQL 18, for a table with a generated column, it names **Keep source PK** "
-        "instead of FULL, and a failed re-read keeps that; after an app restart, until the tool "
-        "reads the source again, it names FULL and adds that such a table needs **Keep source "
-        "PK** instead; see [Chapter 6](06-limitations.md))",
-        "ko": "(PostgreSQL 18에서 생성 컬럼이 있는 테이블에는 FULL 대신 **Keep source PK**를 알려 주며, "
-        "다시 읽기가 실패해도 그대로임. 앱을 재시작한 뒤 도구가 소스를 다시 읽기 전까지는 FULL을 알려 주면서 "
-        "그런 테이블에는 대신 **Keep source PK**가 필요하다고 덧붙임, [6장](06-limitations.md) 참고)",
-        "ja": "(PostgreSQL 18 で生成列を持つテーブルには、FULL の代わりに **Keep source PK** を示し、"
-        "読み直しが失敗してもそのままです。アプリの再起動後、ツールがソースを読み直すまでは FULL を示し、"
-        "そのようなテーブルには代わりに **Keep source PK** が必要だと付け加えます。"
-        "[第 6 章](06-limitations.md) を参照)",
+    # §4.6 (answer-first) keeps the fact (the red notice names Keep source PK instead of FULL for
+    # such a table); that a failed re-read keeps it, and what the notice says after an app restart
+    # before the source is read again, are the notice's own bookkeeping (asserted above in code).
+    "04": {
+        "en": "On PostgreSQL 18, for a table with a generated column, the notice names **Keep "
+        "source PK** instead of FULL (see [Chapter 6](06-limitations.md))",
+        "ko": "PostgreSQL 18에서 생성 컬럼이 있는 테이블에는 알림이 FULL 대신 **Keep source PK**를 "
+        "알려 줍니다([6장](06-limitations.md) 참고)",
+        "ja": "PostgreSQL 18 で生成列を持つテーブルには、通知が FULL の代わりに **Keep source PK** を"
+        "示します([第 6 章](06-limitations.md) を参照)",
     },
     "13": {
         "en": "so a re-keyed table with one is refused and its row says to set it back to **Keep "
@@ -1072,13 +1315,10 @@ def test_a_postgresql_18_rekeyed_table_is_told_keep_source_pk_everywhere(lang: s
     assert not _has(lang, _page(lang, _PAGE["06"]), _STALE_KEEP_SOURCE_PK[lang]), lang
 
 
-_ACTIVITY_WHOLE = {
-    "en": "the activity log records it whole too, one longer than a log line as consecutive "
-    "`(1/2) …`, `(2/2) …` lines",
-    "ko": "활동 로그도 알림 전체를 기록하며, 로그 한 줄보다 긴 알림은 `(1/2) …`, `(2/2) …`처럼 이어지는 "
-    "줄로 기록함",
-    "ja": "アクティビティログも通知全体を記録し、ログの 1 行より長い通知は `(1/2) …`、`(2/2) …` のように"
-    "続く行に記録します",
+_ACTIVITY_WHOLE = {  # (the "(1/2) …" line splitting is UI plumbing and is no longer described)
+    "en": "the activity log records it whole too",
+    "ko": "활동 로그도 알림 전체를 기록",
+    "ja": "アクティビティログも通知全体を記録",
 }
 
 
@@ -1088,7 +1328,7 @@ def test_a_refused_start_is_recorded_whole_in_the_activity_log(lang: str) -> Non
     # whole, as consecutive (i/N) lines when it is longer than one log line.
     assert 'return [f"({i}/{len(lines)}) {line}"' in _function(_CDC_UI, "_activity_lines")
     assert "for line in _activity_lines(" in _function(_CDC_UI, "_start_refusal")
-    assert _has(lang, _page(lang, _PAGE["06"]), _ACTIVITY_WHOLE[lang]), lang
+    # (6.2 no longer repeats that the activity log records the notice whole: the CDC step shows it)
 
 
 _KEY_VALUES = {

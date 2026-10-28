@@ -41,7 +41,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_g25_docs import _CDC_UI, LANGS, ROOT, _function, _has, _page
+from tests.test_g25_docs import _CDC_UI, LANGS, ROOT, _fact, _function, _has, _page, _section_43
 from tests.test_g25_docs_r4 import _stale
 
 _P03 = "03-full-load.md"
@@ -92,17 +92,10 @@ _CH03_A2 = {
         "場合は、どの開始位置へも) 進めることを拒否します: たとえば Full load + CDC から **Full load only** "
         "に切り替えた後の Re-run Full Load が取ったウォーターマークや、より後の **Manual** の位置です。",
     },
-    "surfaces": {
-        "en": "(*Start CDC blocked: This CDC stack has streamed, so Start CDC does not move it "
-        "forward to a newer start point …*), refuse it too. A refused Manual point also says "
-        "when setting the start point back to **Automatic** would continue the stream.",
-        "ko": "(*Start CDC blocked: This CDC stack has streamed, so Start CDC does not move it "
-        "forward to a newer start point …*)도 거부합니다. 거부된 Manual 지점은 시작 지점을 "
-        "**Automatic**으로 되돌리면 스트림이 이어지는 경우 그렇다고도 알려 줍니다.",
-        "ja": "(*Start CDC blocked: This CDC stack has streamed, so Start CDC does not move it "
-        "forward to a newer start point …*) も拒否します。拒否された Manual の位置は、開始位置を "
-        "**Automatic** に戻せばストリームが続く場合、そのことも示します。",
-    },
+    # (2026-10-28, chapter 3 answer-first) The dialog, the click and the job that refuse the same
+    # points, and the Manual point's way back to Automatic, are what the screen says at the moment:
+    # the page keeps the rule, the header on both cards and the route (the code assertions above
+    # still pin the words themselves).
     # G25 round 8 moved the rolled-back Start's half of this pin to test_g25_docs_r8.py: after
     # an app restart every start point is refused there, not only a later one until it.
     "not-refused": {
@@ -262,6 +255,10 @@ def test_postgresql_refuses_no_newer_start_point_and_continues_from_its_slot(
 # the stack's source connector streamed, and MySQL's route switches the type before the CDC
 # step's Delete (rule F) with a Drop & reload copy after an append (rule E): those pins, and the
 # round-7 wording as stale, are in test_g25_docs_r8.py.
+# Chapter 10 keeps these sentences as written. §4.3 (answer-first) says the same in its note on a
+# later CDC start after Full load only: PostgreSQL's source connector creates its own slot and
+# re-snapshots every selected table first, MySQL starts at the watermark with no re-read unless
+# the stack has streamed -- and Start CDC then refuses the newer start point.
 _LATER_START = {
     "pg": {
         "en": "Start CDC instead continues from that stack's own slot",
@@ -285,22 +282,6 @@ _LATER_START_STALE = {
     "en": ("so a later CDC start resumes from the watermark with no re-read",),
     "ko": ("나중에 CDC를 시작해도 재읽기 없이 워터마크부터 재개합니다",),
     "ja": ("後から CDC を開始してもウォーターマークから再読み込みなしで再開できます",),
-}
-_RECOVERY_START = {
-    "en": "On a stack that has streamed, Start CDC refuses a newer Full Load or Manual point "
-    "(*This CDC stack cannot start from a newer start point*) until the infrastructure is "
-    "deployed again: its topics may hold changes no sink applied, which its sink would write "
-    "over anything loaded since, while the source would skip every change between where it "
-    "stopped and the new point",
-    "ko": "스트리밍한 적 있는 스택에서는 더 새 Full Load나 Manual 지점에서의 Start를 인프라를 다시 배포할 "
-    "때까지 Start CDC가 거부합니다(*This CDC stack cannot start from a newer start point*): 그 스택의 "
-    "토픽에는 어떤 싱크도 적용하지 않은 변경이 남아 있을 수 있고, 그 싱크는 그 변경을 그 뒤에 적재한 것 "
-    "위에 쓰는 한편 소스는 멈춘 곳과 새 지점 사이의 모든 변경을 건너뛰기 때문입니다",
-    "ja": "ストリーミングしたことのあるスタックでは、インフラを再デプロイするまで、Start CDC がより新しい "
-    "Full Load や Manual の位置を拒否します (*This CDC stack cannot start from a newer start "
-    "point*): そのスタックのトピックにはどの sink も適用していない変更が残っている可能性があり、その "
-    "sink はそれをその後にロードしたものの上に書き込み、その一方でソースは停止した位置と新しい位置の"
-    "間のすべての変更をスキップするためです",
 }
 _RECOVERY_STALE = {
     "en": (
@@ -338,11 +319,13 @@ def test_a_later_cdc_start_after_full_load_only_is_scoped_to_the_stack_it_meets(
         wm, has_committed_offset=False, deployed_watermark=None, **common
     ) is None
 
-    for page in (_P04, _P10):
-        text = _page(lang, page)
-        for key in ("pg", "mysql"):
-            assert _has(lang, text, _LATER_START[key][lang]), (lang, page, key)
-    assert _has(lang, _page(lang, _P04), _RECOVERY_START[lang]), lang
+    text = _page(lang, _P10)
+    for key in ("pg", "mysql"):
+        assert _has(lang, text, _LATER_START[key][lang]), (lang, _P10, key)
+    section = _section_43(lang)
+    assert _fact(lang, section, "pg-after-full-load-only"), lang
+    assert _fact(lang, section, "mysql-after-full-load-only"), lang
+    assert _fact(lang, section, "newer-refused"), lang
     assert not _stale(lang, _LATER_START_STALE[lang] + _RECOVERY_STALE[lang]), lang
 
 
@@ -350,22 +333,28 @@ def test_a_later_cdc_start_after_full_load_only_is_scoped_to_the_stack_it_meets(
 
 # G132 moved this pin with the text: "not affected" read as "available whatever CDC does", but
 # while CDC streams they wait for Stop CDC like every Full Load (G129).
-_MANUAL_IS_NEW = {
-    "en": "**Reload specific tables** and **Retry unfinished tables** keep the original start "
-    "point, so this refusal does not apply to them (while CDC streams they wait for Stop CDC, "
-    "like every Full Load). A Manual point is a new start point: the changes between "
-    "where CDC stopped and it are not replicated, on the new stack too, so reload or correct "
-    "those tables and validate with CHECKSUM, as each remedy below says.",
-    "ko": "**Reload specific tables**와 **Retry unfinished tables**는 원래 시작 지점을 유지하므로 이 "
-    "거부는 적용되지 않습니다(CDC가 스트리밍하는 동안에는 모든 Full Load처럼 Stop CDC를 기다립니다). "
-    "Manual 지점은 새 시작 지점입니다: CDC가 멈춘 곳과 그 지점 사이의 변경은 새 스택에서도 "
-    "복제되지 않으므로, 아래 각 해결 방법이 말하는 대로 그 테이블을 다시 적재하거나 바로잡고 CHECKSUM으로 "
-    "검증하세요.",
-    "ja": "**Reload specific tables** と **Retry unfinished tables** は元の開始位置を維持するため、この"
-    "拒否は適用されません (CDC のストリーミング中は、すべての Full Load と同じく Stop CDC を待ちます)。"
-    "Manual の位置は新しい開始位置です: CDC が停止した位置とその位置の間の変更は新しい"
-    "スタックでも複製されないため、以下の各対処方法が述べるとおり、それらのテーブルを再ロードまたは"
-    "修正し、CHECKSUM で検証してください。",
+_MANUAL_IS_NEW = {  # 2026-10-26: 6.2's start-point table says the first half in its Reload-specific-tables row
+    "en": (
+        "They keep the original start point, so this refusal does not apply to them (while CDC "
+        "streams they wait for Stop CDC, like every Full Load).",
+        "A Manual point is a new start point: the changes between where CDC stopped and it are not "
+        "replicated, on the new stack too, so reload or correct those tables and validate with "
+        "CHECKSUM, as each remedy below says.",
+    ),
+    "ko": (
+        "원래 시작 지점을 유지하므로 이 거부는 적용되지 않습니다(CDC가 스트리밍하는 동안에는 모든 Full "
+        "Load처럼 Stop CDC를 기다립니다).",
+        "Manual 지점은 새 시작 지점입니다: CDC가 멈춘 곳과 그 지점 사이의 변경은 새 스택에서도 "
+        "복제되지 않으므로, 아래 각 해결 방법이 말하는 대로 그 테이블을 다시 적재하거나 바로잡고 "
+        "CHECKSUM으로 검증하세요.",
+    ),
+    "ja": (
+        "元の開始位置を維持するため、この拒否は適用されません (CDC のストリーミング中は、すべての Full "
+        "Load と同じく Stop CDC を待ちます)。",
+        "Manual の位置は新しい開始位置です: CDC が停止した位置とその位置の間の変更は新しいスタックでも"
+        "複製されないため、以下の各対処方法が述べるとおり、それらのテーブルを再ロードまたは修正し、"
+        "CHECKSUM で検証してください。",
+    ),
 }
 _MANUAL_STALE = {
     "en": (
@@ -409,7 +398,8 @@ def test_chapter_6_lead_says_a_manual_point_is_a_new_start_point(lang: str) -> N
     assert refused is not None and refused[0][2] == NEWER_POINT_HEADER
     assert "set the CDC start point back to Automatic" in refused[0][3]
 
-    assert _has(lang, _page(lang, _P06), _MANUAL_IS_NEW[lang]), lang
+    for fact in _MANUAL_IS_NEW[lang]:
+        assert _has(lang, _page(lang, _P06), fact), (lang, fact)
     assert not _stale(lang, _MANUAL_STALE[lang]), lang
 
 
@@ -536,11 +526,10 @@ def test_chapter_6_remedies_put_new_topics_first_on_a_stack_that_has_streamed(
 
 _TOPICS_CONDITION = {
     _P04: {
-        "en": "so a restart's source position is not left behind by an idle window (the restart "
-        "is gapless only while the CDC topics still retain the changes the sink had not applied: "
-        "§4.3)",
-        "ko": "재시작 지점이 유휴 구간 때문에 뒤처지지 않게 하는 **하트비트** 토픽",
-        "ja": "再起動時のソース位置がアイドル区間のせいで取り残されないようにする **ハートビート** トピック",
+        "en": "A restart is gapless only while the CDC topics still retain the changes the sink "
+        "had not applied (§4.3)",
+        "ko": "재시작에 빈틈이 없는 것은 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안뿐입니다(§4.3)",
+        "ja": "再起動にギャップがないのは、sink が適用していなかった変更を CDC トピックがまだ保持している間だけです (§4.3)",
     },
     _P06: {
         "en": "which then continues from where it stopped: the changes the sink had not applied "
@@ -630,15 +619,16 @@ def test_no_restart_after_stop_cdc_is_called_gapless_without_the_topics_conditio
 
 # -- Validation's recovery card (05): unread, CDC only, never streamed, Full load only -----
 
+# Chapter 5's recovery table (answer-first): the unread state is part of the first row's condition,
+# CDC only's type switch is in that row, Full load only has its own row, and the never-streamed
+# row is "the same without Stop CDC and the redeploy".
 _RUNBOOK_R7 = {
     "unread": {
-        "en": "or whose CDC state has not been read yet (after an app restart, until the Data "
-        "Migration step reads it; the card says so, and shows the steps for the stack as it is "
-        "once it has been read)",
-        "ko": "또는 CDC 상태를 아직 읽지 못한(앱 재시작 후 Data Migration 단계가 읽기 전. 카드가 그렇다고 "
-        "말하며, 읽은 뒤에는 그 스택 상태에 맞는 단계를 보여 줍니다)",
-        "ja": "または CDC の状態をまだ読み取っていない (アプリの再起動後、Data Migration ステップが読み取る"
-        "まで。カードはそう述べ、読み取った後はそのスタックの状態に合った手順を示します)",
+        "en": "or its CDC state has not been read yet (after an app restart, until the Data "
+        "Migration step reads it)",
+        "ko": "CDC 상태를 아직 읽지 못함(앱 재시작 후 Data Migration 단계가 읽기 전)",
+        "ja": "CDC の状態をまだ読み取っていない（アプリの再起動後、Data Migration ステップが読み取る"
+        "まで）",
     },
     "cdc-only": {
         "en": "With CDC only, a step after the redeploy sets the migration type to Full load + "
@@ -649,19 +639,21 @@ _RUNBOOK_R7 = {
         "Full load + CDC に切り替えます。",
     },
     "full-load-only": {
-        "en": "In **Full load only** the card is *Re-run Full Load to backfill the gap*: the "
-        "re-run, then **Re-run validation**, with no CDC step.",
-        "ko": "**Full load only**에서는 카드가 *Re-run Full Load to backfill the gap*이며, 재실행 다음 "
-        "**Re-run validation**이고 CDC 단계는 없습니다.",
-        "ja": "**Full load only** ではカードは *Re-run Full Load to backfill the gap* で、再実行の次に "
-        "**Re-run validation** となり、CDC の手順はありません。",
+        "en": "*Re-run Full Load to backfill the gap*, then **Re-run validation**; there is no "
+        "CDC step",
+        "ko": "*Re-run Full Load to backfill the gap*, 그다음 **Re-run validation**; CDC 단계는 "
+        "없습니다",
+        "ja": "*Re-run Full Load to backfill the gap*、次に **Re-run validation**。CDC の手順は"
+        "ありません",
     },
-}
-# The never-streamed order, between its opening words and its closing parenthesis.
-_NEVER_STREAMED_ORDER = {
-    "en": ("On a stack that never streamed the order is shorter (", ")."),
-    "ko": ("스트리밍한 적 없는 스택에서는 순서가 더 짧습니다(", ")."),
-    "ja": ("ストリーミングしたことのないスタックでは手順はもっと短くなります(", ")。"),
+    "never-streamed": {
+        "en": "The same without Stop CDC and the redeploy (with CDC only, switch the migration "
+        "type to Full load + CDC first)",
+        "ko": "위 단계에서 Stop CDC와 재배포를 뺀 것입니다(CDC only에서는 먼저 마이그레이션 유형을 Full "
+        "load + CDC로 바꿈)",
+        "ja": "上記の手順から Stop CDC と再デプロイを除いたものです（CDC only では、先にマイグレー"
+        "ションの種類を Full load + CDC に切り替えます）",
+    },
 }
 
 
@@ -669,8 +661,6 @@ _NEVER_STREAMED_ORDER = {
 def test_validations_recovery_card_is_described_for_every_type_and_an_unread_state(
     lang: str,
 ) -> None:
-    from tests.test_g25_docs import _flat
-
     # The code first: an unread state takes the new-topics order (a CDC type only), CDC only
     # adds the type switch, Full load only has its own header and no CDC step, and the
     # never-streamed order has no Stop CDC step.
@@ -689,11 +679,6 @@ def test_validations_recovery_card_is_described_for_every_type_and_an_unread_sta
     page = _page(lang, _P05)
     for key, by_lang in _RUNBOOK_R7.items():
         assert _has(lang, page, by_lang[lang]), (lang, key)
-    head, tail = (_flat(lang, part).strip() for part in _NEVER_STREAMED_ORDER[lang])
-    order = page[page.index(head) :]
-    order = order[: order.index(tail)]
-    assert "Stop CDC" not in order.replace(" ", ""), (lang, order)
-    assert "Full load + CDC" in order or "Fullload+CDC" in order, (lang, order)
 
 
 # -- chapter 13: the type switch and a deleted CDC-only stack's re-copy ---------------------
@@ -719,11 +704,9 @@ _CH13 = {
         "(そのスタックがストリーミングした後では、新しい Full Load の開始位置にはもう一度 Delete と"
         "再デプロイが必要です)",
     },
-    "v54": {
-        "en": "Later releases changed the sink plugin (v51, v52, v53, v54)",
-        "ko": "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53, v54)",
-        "ja": "その後のリリースでシンクプラグインが変わったため(v51、v52、v53、v54)",
-    },
+    # (2026-10-28) Section 13.10 (Upgrading from 0.1.561) was deleted, and with it the sentence
+    # that named the sink plugin versions a stack deployed before them lacks: that is in the
+    # CHANGELOG and in chapter 4's note under the sink table (pinned in test_deployment_artifacts).
 }
 _CH13_STALE = {
     "en": ("changed the sink plugin (v51, v52),", "changed the sink plugin (v51, v52, v53),"),

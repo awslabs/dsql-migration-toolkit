@@ -8,22 +8,20 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 「ツールがブラウザで開いており、ソースと Aurora DSQL ターゲットの両方に接続できている」状態までを
 案内します。
 
-> **すでに AWS へデプロイ済みですか?** [`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md)
-> に従って UI がすでに `AppUrl` で開いている場合は、[§1.5 接続](#15-ソースとターゲットへの接続)まで
-> 読み飛ばしてください。この章では、デプロイガイドが扱わないローカル実行についても説明します。
+**最短ルート:** 評価だけなら、ツールをローカルで実行([§1.2](#12-ツールをローカルで実行する))して
+接続([§1.5](#15-ソースとターゲットへの接続))するだけです。
+[`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md) に従って UI がすでに `AppUrl` で開いている
+場合は、そのまま §1.5 へ進んでください。[§1.6](#16-cdc-のためのソース準備) は Full load + CDC を使う
+場合にのみ必要です。
 
-ツールを実行する方法は 3 つあります。
+ツールは次の 3 つの方法のいずれかで実行します。どの方法でも接続する先は **同じ** ソースとターゲットで、
+異なるのはツールの *プロセス* がどこで実行されるか、その 1 点だけです。
 
-- **ローカル** — 評価や比較的小規模なマイグレーションのために、ノートPC/ワークステーション上で
-  実行します。最も速く始められます。
-- **AWS 上 (ECS Fargate)** — 実際のマイグレーションで多くのチームが利用するデプロイ形態で、
-  Application Load Balancer の背後にある Web エンドポイント経由でアクセスします。
-- **AWS 上 (単一 EC2 ホスト、ソースから)** — コンテナ/ECR や AWS Lambda を使えないアカウント向け:
-  VPC 内の単一 EC2 ホスト上でソースから直接実行し(`git clone` + `uv sync` + **systemd** サービス)、
-  SSM ポートフォワード経由でアクセスします(ECS/ALB/イメージなし)。→ §1.4 を参照。
-
-どの方法でも接続する先は **同じ** ソースとターゲットです。異なるのはツールの *プロセス* が
-どこで実行されるか、その 1 点だけです。
+| 方式 | 向いている用途 | UI へのアクセス方法 | 状態の保存先 | 詳細 |
+|---|---|---|---|---|
+| **ローカル** | 評価、比較的小規模なマイグレーション。最も速く始められる | `http://127.0.0.1:8080` | ローカルファイル | [§1.2](#12-ツールをローカルで実行する) |
+| **ECS Fargate** | 実際のマイグレーション — 多くのチームが利用する形態 | Application Load Balancer のエンドポイント(`AppUrl`)。任意で Cognito の背後 | S3 — タスク置き換え後も残る | [§1.3](#13-ツールを-aws-上で実行する-ecs-fargate) |
+| **単一 EC2 ホスト**(ソースから) | コンテナ/ECR や AWS Lambda を使えないアカウント | SSM ポートフォワード — ALB・パブリック IP・インバウンドルールは不要 | 保持型 EBS ボリューム — インスタンス置換後も残る | [§1.4](#14-単一-ec2-ホストで実行する-ソースから) |
 
 ---
 
@@ -31,156 +29,46 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 
 **データベース**
 
-- ネットワーク経由で到達できるソースデータベース — **Amazon RDS または Aurora MySQL**、あるいは
+- ネットワーク経由で到達できる **ソースデータベース** — **Amazon RDS または Aurora MySQL**、あるいは
   **Amazon RDS または Aurora PostgreSQL**。スキーマとデータを読み取れるユーザーがあれば十分です。
   Evaluation、Schema Conversion、Full Load、Validation には読み取り専用で十分で、MySQL ソース
-  (および Full Load のみの PostgreSQL マイグレーション)には一切書き込みません。
-  `gtid_mode=ON` でないソースでの MySQL の **Full load + CDC** 実行は、CDC の開始位置を記録した直後に
-  `FLUSH BINARY LOGS` も 1 回実行するため、そのユーザーには `RELOAD` が必要です(データは書き込まれず、
-  テーブルもロックされません。binlog は新しいファイルに移ります。
-  [§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。書き込みを伴う唯一の例外は
-  **PostgreSQL CDC** です。Full Load の整合点でツールが、移行対象テーブルだけに厳密に限定した論理
-  レプリケーションスロットと publication を作成し(AUTOCOMMIT、小さな許可リストに限定、監査記録
-  あり)、teardown(撤去)時に削除します。これがツールがいずれのソースに対しても行う唯一の書き込み
-  です。
-  - **サポートされるソースエンジンとバージョン** — 両方のソース経路(Schema Conversion + Full
-    Load + CDC + カットオーバー)を実インフラ上でエンドツーエンドに検証済み:
-    - **RDS for MySQL** 5.7 / 8.0 / 8.4、**Aurora MySQL** 5.7(v2) / 8.0(v3) / 8.4。MySQL 5.7 は
-      標準サポートが終了しています(RDS/Aurora の Extended Support が適用される場合あり)が、
-      ツールは移行ソースとして 5.7 を完全にサポートします。
-    - **RDS for PostgreSQL / Aurora PostgreSQL**、PG **13–16**(エンドツーエンドでテスト済み)。
-      ツールに厳格なバージョンゲートはありません — サーバーバージョンは表示用に読むだけで、どの
-      メジャーバージョンも拒否しません。PG 13–16 が検証済みの範囲です。
-- ツールを実行するのと **同じ AWS リージョン** にあるターゲットの **Amazon Aurora DSQL**
-  クラスター。(DSQL は IAM トークン認証を使うため、管理すべきパスワードはありません。)
+  (および Full Load のみの PostgreSQL マイグレーション)には一切書き込みません。例外は CDC を使う
+  場合だけです: `gtid_mode=ON` でないソースでの MySQL の **Full load + CDC** 実行は
+  `FLUSH BINARY LOGS` を 1 回実行し(そのユーザーには `RELOAD` が必要です。データは書き込まれず、
+  テーブルもロックされません)、**PostgreSQL CDC** は Full Load の整合点で、移行対象テーブルだけに
+  厳密に限定した論理レプリケーションスロットと publication を作成し、CDC キーが変わったテーブルに
+  `REPLICA IDENTITY FULL` を設定し、Full Load の後に選択したテーブルをその publication に追加します
+  (AUTOCOMMIT、小さな許可リストに限定、監査記録あり)。スロットと publication は teardown(撤去)時に
+  削除します。
+- **サポートされるバージョン** — 両方のソース経路(Schema Conversion、Full Load、CDC、カットオーバー)を
+  実インフラ上でエンドツーエンドに検証済み:
+  - **RDS for MySQL** 5.7 / 8.0 / 8.4、**Aurora MySQL** 5.7(v2) / 8.0(v3) / 8.4。MySQL 5.7 は
+    標準サポートが終了しています(RDS/Aurora の Extended Support が適用される場合あり)が、
+    移行ソースとして完全にサポートします。
+  - **RDS for PostgreSQL / Aurora PostgreSQL**、PG **13–18**(エンドツーエンドでテスト済み)。
+    厳格なバージョンゲートはありません — サーバーバージョンは表示用に読むだけで、どのメジャー
+    バージョンも拒否しません。
+- ツールを実行するのと **同じ AWS リージョン** にあるターゲットの **Amazon Aurora DSQL** クラスター。
+  DSQL にパスワードはありません。ツールにクラスターの **エンドポイント** と AWS アイデンティティ(その
+  クラスターへの接続を許可されている必要があります)を渡すと、ツールが接続ごとに短命の IAM トークンを
+  発行します。
 
 **ローカル実行の場合**
 
-- Python 3.10+ (プロジェクトは `.python-version` で 3.12 に固定しています)。
-- 依存関係管理のための [`uv`](https://docs.astral.sh/uv/)。
-- 標準の認証情報チェーン(環境変数、`~/.aws`、または名前付きプロファイル)経由で到達でき、
-  **Aurora DSQL IAM トークンを生成** できる(`dsql:DbConnect` / `dsql:DbConnectAdmin`)AWS
-  認証情報。任意で `secretsmanager:GetSecretValue`(ソース認証情報が Secrets Manager にある場合)
-  および `bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream`(AI アシストを有効にする場合のみ。
-  チャットは応答をストリーミングするため、前者だけでは足りません)も必要です。
+- Python 3.10+ (`.python-version` で 3.12 に固定)と [`uv`](https://docs.astral.sh/uv/)。
+- 標準の認証情報チェーン(環境変数、`~/.aws`、または名前付きプロファイル)の AWS 認証情報で、
+  **Aurora DSQL IAM トークンを生成** できる(`dsql:DbConnect` / `dsql:DbConnectAdmin`)もの。任意:
+  ソース認証情報が Secrets Manager にある場合は `secretsmanager:GetSecretValue`、AI アシストを有効に
+  する場合は `bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream` の両方(チャットは応答を
+  ストリーミングするため、前者だけでは足りません)。
 
-**AWS へデプロイする場合** — 完全版は [`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md)
-を参照してください。要約は §1.3 にあります。
+**AWS へデプロイする場合** — [`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md) を
+参照してください。要約は [§1.3](#13-ツールを-aws-上で実行する-ecs-fargate) にあります。
 
-> **DSQL ターゲットに関する注意:** 設定ファイルにコピーして貼り付けるような DSQL の
-> 「エンドポイント + パスワード」はありません。ツールには DSQL の **クラスターエンドポイント** と
-> AWS アイデンティティを渡します。ツールは接続ごとに短命の IAM トークンを発行します。実行に使う
-> アイデンティティが、その DSQL クラスターへの接続を許可されていることを確認してください。
-
-**CDC (任意のストリーミングパイプライン) を使う場合** — ほぼ無停止のカットオーバーに CDC を
-使う場合にのみ該当します。**Full Load のみ** のマイグレーションでは、これらは一切不要です。
-以下は、CDC がソースの変更ストリーム — **MySQL のバイナリログ**、または PostgreSQL ソースの場合は
-レプリケーションスロット + publication 経由の **論理デコーディング WAL** — を読めるようにするための
-ソース側の要件です。ツールの前提条件ゲートは CDC 開始前に各項目を検査し、何が不足しているかを
-正確に知らせますが、設定自体は一度行っておくソース側の作業です。
-
-> **マネージド RDS/Aurora は自己管理型(community)サーバーとは設定方法が異なります。** 自己管理型
-> の MySQL や PostgreSQL サーバーであれば `my.cnf` / `postgresql.conf` を編集し `SET GLOBAL` を
-> 実行しますが、**Amazon RDS / Aurora ではそのどちらもできません** — サーバー変数は
-> **パラメータグループ** で設定し(MySQL: `binlog_format` など、**PostgreSQL:
-> `rds.logical_replication`**)、binlog 保持などの MySQL 運用設定は **RDS ストアドプロシージャ**
-> (`mysql.rds_*`)で変更します。PostgreSQL の有効化パラメータは **静的(static)なので再起動が
-> 必要です。** 以下の手順は、このツールが対象とするマネージド(RDS/Aurora)方式です。
-
-- **MySQL ソース — バイナリログが ROW 形式・完全な行イメージで有効になっている必要があります** —
-  `log_bin=ON`、`binlog_format=ROW`、`binlog_row_image=FULL`、そして MySQL 8.0 以降では
-  `binlog_row_value_options` を空のままにします (`PARTIAL_JSON` は JSON の更新を CDC が適用できない差分として
-  記録します。空にした後はソースを再起動するか、アプリケーションの接続プールをリサイクルしてください。変更前に開いた接続は差分を記録し続けます)。これは CDC の **必須要件** です
-  (満たされていないとゲートが CDC を失敗扱いにします)。マネージド MySQL での設定方法:
-  - **RDS for MySQL:** `log_bin` を **直接オンにすることはできず**、`my.cnf` も **編集できません**。
-    代わりに **自動バックアップ** を有効にすると(バックアップ保持期間を > 0 に設定)バイナリ
-    ロギングがオンになり、その後インスタンスにアタッチした **カスタム DB パラメータグループ** で
-    `binlog_format=ROW` と `binlog_row_image=FULL` を設定します。(`binlog_row_image` の既定値は
-    `FULL` ですが、確実にするため明示的に設定してください。)
-  - **Aurora MySQL:** `binlog_format` は **クラスターレベル** のパラメータです — **カスタム DB
-    *クラスター* パラメータグループ**(既定のグループは変更できません)で `ROW` に設定し、`OFF`
-    から変更した場合はクラスターを **再起動** してください。既定値は `OFF` なので、この作業を
-    行うまではバイナリログはオフです。
-  - **Community / 自己管理型 MySQL(対比のため):** その場合は
-    `log_bin`/`binlog_format`/`binlog_row_image` を `my.cnf`(またはランタイムで `SET GLOBAL`)に
-    設定して再起動しますが — **RDS/Aurora にはそのいずれも当てはまりません。**
-- **PostgreSQL ソース — 論理デコーディングが有効になっている必要があります** —
-  **`wal_level=logical`**(**必須要件**。満たされていないとゲートが CDC を失敗扱いにします)。
-  **RDS for PostgreSQL / Aurora PostgreSQL** では、カスタム DB(クラスター)パラメータグループで
-  静的パラメータ **`rds.logical_replication=1`** を設定し、その後 **再起動** してください
-  (Aurora: ライターを再起動)。自己管理型 PostgreSQL では `postgresql.conf` に `wal_level=logical`
-  を設定して再起動します。(PostgreSQL には `binlog_format`/`binlog_row_image` に相当するものは
-  ありません。)
-- **レプリケーション権限を持つソースユーザー。** **MySQL:** `SELECT`、`REPLICATION CLIENT`、
-  `REPLICATION SLAVE`(加えて初期スナップショットの記録管理に使う `RELOAD` と `LOCK TABLES`)。`RELOAD` は、
-  Full load + CDC の実行が `FLUSH BINARY LOGS` を実行するのにも使われます。ソースが `gtid_mode=ON` でない
-  とき、このコマンドが CDC の開始位置を正確にします
-  ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。enhanced binlog を
-  使う Aurora MySQL では、そのような実行には代わりに `gtid_mode=ON` が必要です。MySQL 8.0.19 以降
-  では、アプリケーションが XA トランザクションを使う場合は `XA_RECOVER_ADMIN` も付与してください。
-  **PostgreSQL:** CDC ユーザーは論理レプリケーションスロットを作成・読み取りできる必要があります —
-  **superuser** であるか、**REPLICATION ロール属性**(`pg_roles.rolreplication`)を持つか、
-  **`rds_replication`** のメンバー(RDS/Aurora では REPLICATION 属性を直接付与できない)であれば
-  通過します。スナップショットのために移行対象テーブルへの **SELECT** も必要です。(これは
-  community の `REPLICATION` オブジェクト権限ではありません。)admin アカウントではなく、専用の
-  最小権限 CDC ユーザーを使ってください。
-- **MySQL ソース — CDC が追いつく前にログが削除されないよう、binlog 保持期間を延ばしてください。**
-  RDS/Aurora は既定でバイナリログを積極的に削除します — **Aurora MySQL は 24 時間しか保持せず**、
-  RDS for MySQL ではバックアップ保持期間に従います。CDC は Full Load 中にキャプチャした
-  **ウォーターマーク(watermark)** から再開するため、その位置の binlog が **CDC 開始時点でまだ存在
-  している必要があります** — さらに、CDC スタック(MSK + MSK Connect)のデプロイだけでも
-  **約 15〜20 分** かかった後にようやくストリーミングが始まります。RDS ストアドプロシージャで余裕の
-  ある期間を設定してください(単位:時間、RDS for MySQL・Aurora MySQL の両方で動作します):
-
-  ```sql
-  CALL mysql.rds_set_configuration('binlog retention hours', 168);  -- 例: 7日
-  ```
-
-  Full Load と CDC 開始の間のギャップに、想定される追いつき時間を加えた分を余裕をもってカバー
-  できる期間を選んでください(7 日が安全な既定値です)。Aurora MySQL の最大値は **2160(90 日)**
-  で、カットオーバー後に再び短くしても構いません。ゲートは保持期間が短すぎる(24 時間未満)場合や
-  未設定の場合に **警告(WARN、非ブロッキング)** を出すので、binlog が削除される前に気づけます —
-  ただし Full Load にかかる時間はユーザーしか分からないため、ブロックはしません。
-- **PostgreSQL ソース — 変更すべき binlog 保持設定はありません。** 代わりに、ツールが Full Load の
-  整合点で作成する **論理レプリケーションスロット** が、その LSN から必要な WAL を **自動的に固定
-  (pin)** するため、設定するものはありません。スロットが開始位置を保持するので、約 15〜20 分の CDC
-  スタックのプロビジョニングも問題になりません。トレードオフは逆方向のリスクです:**非アクティブ/
-  未消費のスロットが WAL を固定し続け、ソースのディスクを満杯にする恐れがある** ため、WAL/スロットの
-  健全性を監視してください — ツールは `wal_status` を提示し、`wal_status='lost'` はスロットが無効化
-  されたことを意味します → gapless な再開が壊れる → Start CDC がブロックして解決方法を示します
-  ([§4.3](04-cdc-and-dsql-constraints.md)): Full load + CDC では **Drop & reload** で Full Load を
-  再実行します。スタックのコネクタを以前に開始していた場合は、その前に Delete CDC infrastructure して
-  再デプロイします。
-- **MySQL ソース — GTID は推奨ですが必須ではありません。Full Load の前に決めてください。**
-  `gtid_mode=ON` では Debezium が GTID で位置を決めます: CDC は開始位置とともに記録された GTID セット
-  (Full Load のウォーターマーク、または Manual の位置なら **Fetch current position**)の次から開始し、
-  最後にコミットした GTID セットの次から再開するため、バイナリログファイルの異なるレプリカへの
-  フェイルオーバー(failover)の後でも続けられます。`OFF`、`OFF_PERMISSIVE`、`ON_PERMISSIVE` では
-  binlog の `file:position` を使い、1 つのソース上では同じように動作します。Full Load からカットオーバー
-  まではモードを変えないでください: `gtid_mode` が `ON` でないときに記録された開始位置では — また
-  `gtid_mode` が `ON` でないときに最後に開始した CDC スタックでも — `ON` になった後に CDC を開始できませ
-  ん([第 6 章](06-limitations.md))。ゲートは GTID の欠如を情報として報告します。ただし GTID がない場合、
-  Full load + CDC の実行は `file:position` の開始位置を `FLUSH BINARY LOGS` で正確にし、これには
-  `RELOAD` が必要です。enhanced binlog を使う Aurora MySQL ではツールはこれに依存しないため、そこでの
-  Full load + CDC の実行には `gtid_mode=ON` が必要です(または enhanced binlog を無効にします。どちらも
-  ライターの再起動が必要です)。それまでは **CDC start point can be made exact** がその実行をブロック
-  します([§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
-  (PostgreSQL には GTID / `file:position` の概念はありません。)
-- **PostgreSQL ソース — CDC はクラスターのライターに対して実行する必要があります。** ソースは
-  **スタンバイではなくライター** でなければなりません(`pg_is_in_recovery()` が false であること)—
-  スタンバイはレプリケーションスロットをホストできないため、CDC はライターのエンドポイントに向けて
-  ください。
-- **PostgreSQL ソース — レプリケーション対象の各テーブルには使用可能な REPLICA IDENTITY が必要です。**
-  `DEFAULT` には `DEFERRABLE` でない有効な主キーが必要で(PostgreSQL はキーが削除された後も `DEFAULT` の
-  ままにするため、チェックはソースのカタログを読みます)、`USING INDEX` には有効な一意インデックスが必要
-  で、`FULL`(`ALTER TABLE … REPLICA IDENTITY FULL`)はどのテーブルでも動作しますが、PostgreSQL 18 で生成
-  列を持つテーブルは例外です(そこでは identity に生成列を含めてはならないため、キーにも含めてはなりませ
-  ん)。パーティション化されたテーブルでは、すべてのパーティションに必要です。ない場合、テーブルが publication
-  に含まれた後はそのテーブルのすべて
-  の UPDATE/DELETE がソースで失敗するため、CDC の前提条件チェックが失敗と判定し、Full Load はソースで何
-  も変更する前に停止します(publication もスロットも作成しません)。レプリケーションスロット /
-  `max_wal_senders`(walsender)の **余裕** は非ブロッキングの **警告(WARN)** として検査されます(スロット
-  のエントリに空きがあっても、walsender プールが満杯だと新しいスロットはブロックされます)。
+**CDC (任意) を使う場合** — Full load + CDC を使う場合にのみ該当し、**Full Load のみ** のマイグレー
+ションではこれらは一切不要です。ソースにいくつかの設定(バイナリログまたは論理デコーディング、
+レプリケーションユーザー、binlog 保持期間)が必要で、ツールの前提条件ゲートが CDC 開始前に検査します:
+[§1.6](#16-cdc-のためのソース準備)。
 
 ---
 
@@ -189,26 +77,22 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 クローンした直後の状態から:
 
 ```bash
-# ローカルの仮想環境に依存関係をインストール
-uv sync
-
-# Web UI を起動 (既定では 127.0.0.1:8080 にバインド)
-uv run mysql-dsql-migrator ui
+uv sync                          # ローカルの仮想環境に依存関係をインストール
+uv run mysql-dsql-migrator ui    # Web UI を起動 (既定では 127.0.0.1:8080 にバインド)
 ```
 
 その後、ブラウザで **http://127.0.0.1:8080** を開きます。
 
-任意の便利機能: `.env.example` を `.env` にコピーして接続項目を記入すると、**Connect** 画面が
-これらの値をフォームに事前入力するため、セッションごとに再入力する必要がなくなります。`.env` は
-git 管理から除外されており、ローカル開発専用です。
+任意: `.env.example` を `.env` にコピーして接続項目(ソース DB の host/port/user、ターゲット DSQL
+エンドポイント、リージョンなど)を記入すると、**Connect** 画面がこれらをフォームに事前入力します。
+`.env` は git 管理から除外されており、ローカル開発専用です。
 
 ```bash
 cp .env.example .env
-# .env を編集: ソース DB の host/port/user、ターゲット DSQL エンドポイント、リージョンなど
 ```
 
-> アプリは `reload=False` で実行されるため、コードの変更を **ホットリロードしません** — 編集を
-> 反映するには再起動してください。これはツール自体を変更している場合にのみ関係します。
+アプリは `reload=False` で実行されるため、コードの変更をホットリロードしません — 編集を反映するには
+再起動してください。これはツール自体を変更している場合にのみ関係します。
 
 ---
 
@@ -228,10 +112,10 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 #    正確な `aws cloudformation deploy` コマンドは deploy/DEPLOYMENT.ja.md を参照。
 ```
 
-**デプロイの利便性を重視した設計:** 新規の `git clone` から最小限のセットアップでデプロイできます —
-コネクタプラグインのアーティファクトはコミット済みで(Java/Maven ツールチェーンは不要)、ツールは
-自身の S3 バケットをプロビジョニングしてアーティファクトを自らアップロードし、任意の CDC
-インフラは自動検出されます(VpcId のように本当に推論できないものだけを入力します)。
+新規の `git clone` から最小限のセットアップでデプロイできます — コネクタプラグインのアーティファクトは
+コミット済みで(Java/Maven ツールチェーンは不要)、ツールは自身の S3 バケットをプロビジョニングして
+アーティファクトを自らアップロードし、任意の CDC インフラは自動検出されます。VpcId のように推論
+できないものだけを入力します。
 
 > **VPC とサブネットは、デプロイ先のアカウントが所有している必要があります。** RAM で共有
 > された (クロスアカウントの) サブネットはサポートしません — CDC デプロイロールの EC2 権限は
@@ -244,50 +128,42 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 > ブロックします。Cognito(`EnableCognitoAuth=true`)を有効にするか、`AllowedIngressCidr` を
 > 自分のネットワークに限定してください。
 
-### 顧客向けデプロイの推奨設定
+*動作を最も速く確認する* 近道は **Dev/Test プロファイル**(`internal` ALB、`EnableCognitoAuth=false`、
+自己署名証明書)です — これでも本物の Fargate であり、構成要素が少ないだけです。評価を超える用途には
+**Prod プロファイル**を使用してください。すべてのパラメータは
+[`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md) で説明しています。主な設定は次のとおりです。
 
-スタックはパラメータ化されているため、簡単なテストであれば近道を選ぶことも *できます* が、実際の
-デプロイでは以下がより安全で耐久性の高い選択です。各項目は
-[`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md) の CloudFormation パラメータに対応します。
+- Cognito を有効にする(`EnableCognitoAuth=true`。`CognitoDomainPrefix` と `CognitoAdminEmail` も併せて
+  設定 — テンプレートは 3 つをセットで要求します)。実際のドメイン/証明書も用意します。
+- `internal` ALB。`internet-facing` は `AllowedIngressCidr` を自分のネットワークに限定した場合のみ。
+- `AssignPublicIp=DISABLED` + NAT ゲートウェイまたは VPC エンドポイント。
+- イミュータブルなイメージタグまたは digest。
+- アクティビティログの CloudWatch ミラーをオンにする(**Settings → Diagnostics**)— 永続的な監査証跡に
+  なります。
 
-| 設定 | 推奨値 | 理由 |
-|---|---|---|
-| `AlbScheme` | **`internal`**(推奨) | ツールをパブリックインターネットから切り離す — VPN / Direct Connect / VPC ピアリング経由でアクセスします。`internet-facing` は `AllowedIngressCidr` を自分のネットワークに限定した場合のみ使用してください(`0.0.0.0/0` に開放した ALB は Cognito なしではブロックされます)。 |
-| `EnableCognitoAuth` | **`true`**(推奨。`AllowedIngressCidr=0.0.0.0/0` の場合のみ **必須**) | アプリは自身の認証を持たないため、Cognito が唯一のゲートです。`CognitoDomainPrefix` と **`CognitoAdminEmail`** を併せて設定してください — テンプレートは 3 つをセットで要求します。ユーザープールにセルフサインアップがなく、最初のユーザーがいないと誰もログインできないアプリになるためです。 |
-| `AllowedIngressCidr` | **自分のネットワークに限定**(推奨) | ALB に到達できる範囲を制限します。`0.0.0.0/0` のように全開放しないでください。 |
-| `AssignPublicIp` | **`DISABLED` + NAT ゲートウェイまたは VPC エンドポイント**(本番環境で推奨) | パブリックサブネットでの `ENABLED` は NAT を省くための **テスト専用** の近道です。 |
-| タスクの egress | **VPC エンドポイント**(現実的な場合は推奨) | DSQL / Secrets Manager / ECR / Logs (/ Bedrock) にパブリック経路なしでプライベートに到達します。そうでなければ NAT ゲートウェイを使用します。 |
-| イメージ参照 | **イミュータブルなタグまたは digest**(推奨) | 再現可能なデプロイ — 動く `:latest` は避けてください。 |
-| アクティビティログの CloudWatch ミラー | **オン**(推奨) | 永続的な監査証跡になります — タスク上の `/tmp` のコピーはタスク置き換え時に失われます。 |
-| ジョブ/セッションの状態 | **S3 バックエンド** — 管理対象バケット(テンプレートが設定) | タスク置き換え後も残ります: ワークベンチの状態と Full Load の記録は保持されます。その時点で実行中のロードは中断され、Retry unfinished tables が完了していない各テーブルを最初からロードし直します。`/tmp` の SQLite パスは、バケットが設定されていない場合(ローカル実行)のフォールバックにすぎません。 |
-
-> *動作を最も速く確認する* 近道は **Dev/Test プロファイル**(`internal` ALB、
-> `EnableCognitoAuth=false`、自己署名証明書)です — これでも本物の Fargate であり、構成要素が
-> 少ないだけです。評価を超える用途には **Prod プロファイル**(Cognito + 実際のドメイン/証明書)へ
-> 昇格させてください。どちらのプロファイルも `deploy/DEPLOYMENT.ja.md` にあります。
+状態は S3 に保存されるため、タスクが置き換えられてもワークベンチの状態と Full Load の記録は保持されます。
+その時点で実行中のロードは中断され、**Retry unfinished tables** が完了していない各テーブルを最初から
+ロードし直します
+([§6.3](06-limitations.md#63-デプロイの制限aws-ホスト形態))。
 
 ---
 
 ## 1.4 単一 EC2 ホストで実行する (ソースから)
 
-**コンテナ/ECR や AWS Lambda を使えないアカウント**では、同じツールを **VPC 内の単一 EC2 ホスト上で
-ソースのまま**実行します — ビルドや取得するイメージはありません。パラメータ化された完全な
-CloudFormation フロー(`deploy/cloudformation-ec2.yaml`)は
-[`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md#単一-ec2-ホストで実行-ソースからlambda-free)
-にあり、要点は次のとおりです。
+**コンテナ/ECR や AWS Lambda を使えないアカウント**では、ツールを **VPC 内の単一 EC2 ホスト上で
+ソースのまま**実行します — ビルドや取得するイメージはありません。パラメータ化された CloudFormation
+フロー(`deploy/cloudformation-ec2.yaml`)、パラメータ、SSM ポートフォワードのコマンドは
+[デプロイガイド](../../../deploy/DEPLOYMENT.ja.md#単一-ec2-ホストで実行-ソースからlambda-free)に
+あり、要点は次のとおりです。
 
 - ホストはソースからブートストラップします(`git clone` + `uv sync` + **systemd** サービス)—
   **Docker・ECR なし**。
-- UI には **SSM ポートフォワード**(Session Manager)で接続するため、**ALB・パブリック IP・インバウンド
-  ルールは不要**で、ACM 証明書や Cognito もありません。
-- アプリの状態は **保持型 EBS ボリューム**(S3 ではなく)にあり、インスタンス置換を越えて保持されます。
+- UI には SSM ポートフォワード(Session Manager)で接続するため、ACM 証明書や Cognito もありません。
 - CDC は Kafka を**インプロセスで**シードするため、**オフセットシーダー Lambda は作成されません**
   (CDC はコネクタアーティファクトのために S3 プラグインバケットは引き続き自動プロビジョニングします)。
 
-VPC 内のプライベートなデータ経路(ソース → EC2 → DSQL)は Fargate と同じで、構成要素はずっと少なく
-なります。パラメータと SSM ポートフォワードのコマンドは
-[デプロイガイド](../../../deploy/DEPLOYMENT.ja.md#単一-ec2-ホストで実行-ソースからlambda-free)を
-参照してください。
+データ経路(ソース → EC2 → DSQL)は Fargate と同様に VPC 内でプライベートに保たれ、構成要素はずっと
+少なくなります。
 
 ---
 
@@ -300,10 +176,8 @@ VPC 内のプライベートなデータ経路(ソース → EC2 → DSQL)は Fa
 | **Source** | **ソースエンジン**(MySQL または PostgreSQL)を選び、host、port、user、password — **または** それらを保持する Secrets Manager シークレットの ARN/名前 — を入力します。既定のポートはエンジンに従います(MySQL は **3306**、PostgreSQL は **5432**)。PostgreSQL では接続する単一の **データベース** も指定します。両エンジンとも認証は password または Secrets Manager です(IAM トークン認証はターゲット DSQL 専用)。 |
 | **Target** | Aurora DSQL の **クラスターエンドポイント**、リージョン、データベース(`postgres` に固定、読み取り専用で表示)、ユーザー名(既定は `admin`)。**パスワードなし** — ツールが IAM トークンを生成します。 |
 
-次に、各接続を **テスト** するためにクリックします。ツールは:
-
-- ソースを **読み取り専用** で読み、到達性と権限を確認し、
-- DSQL IAM トークンを生成してターゲットへ接続できることを確認します。
+次に、各接続を **テスト** します。ツールはソースを **読み取り専用** で読んで到達性と権限を確認し、
+DSQL IAM トークンを生成してターゲットへ接続できることを確認します。
 
 **認証情報はセッションごとのプロセスメモリ内にのみ存在します。** ディスク・ログ・レポート・
 ジョブ状態には一切書き込まれず、セッションが終了すると破棄されます(これは本ツールの厳格で妥協しない
@@ -313,11 +187,81 @@ VPC 内のプライベートなデータ経路(ソース → EC2 → DSQL)は Fa
 > **ソースとターゲットは同じリージョンになければなりません** — クロスリージョンのマイグレーションは
 > **サポートされていません**。ツールもそのリージョンで実行してください。
 
-両方の接続テストが緑色になったら、そのまま **Evaluation** へ進みます — ツールが
-両方のデータベースをイントロスペクトして互換性レポートを生成します。ここからガイド付きフローは
-Schema Conversion、Data Migration(ここで Full Load のみか CDC を追加するかを選んで実行)、
-Validation、そして最後に **Cut over**(アプリケーションを DSQL へ切り替えるためのランブック)へと
-続き、それぞれ以降の章で扱います。
+両方の接続テストが緑色になったら、**Evaluation** へ進みます — ツールが両方のデータベースを
+イントロスペクトして互換性レポートを生成します。ここからガイド付きフローは Schema Conversion、
+Data Migration(Full Load のみ、または CDC を追加)、Validation、そして最後に **Cut over**
+(アプリケーションを DSQL へ切り替えるためのランブック)へと続き、それぞれ以降の章で扱います。
+**Full load + CDC を計画している場合** は、先にソースを準備してください
+([§1.6](#16-cdc-のためのソース準備)): ソースのバイナリログ(MySQL)または論理デコーディング
+(PostgreSQL)の設定は、Full Load を開始する前に整っている必要があります。
+
+---
+
+## 1.6 CDC のためのソース準備
+
+*Full load + CDC(ほぼ無停止のカットオーバー)を使う場合にのみ該当します。Full Load のみの
+マイグレーションではこの節を飛ばして構いません。* CDC はソースの変更ストリーム — **MySQL のバイナリ
+ログ**、または PostgreSQL ではレプリケーションスロット + publication 経由の **論理デコーディング WAL**
+— を読むため、以下の設定を Full Load を開始する前に一度行っておいてください。ツールの前提条件ゲートは
+CDC 開始前に各項目を検査し、何が不足しているかを正確に知らせます。
+
+**RDS/Aurora では `my.cnf` / `postgresql.conf` の編集も `SET GLOBAL` の実行もできません。**
+サーバー変数は **パラメータグループ** で設定し(PostgreSQL の `rds.logical_replication` は静的
+(static)なので **再起動が必要です**)、binlog 保持などの MySQL 運用設定は **RDS ストアドプロシージャ**
+(`mysql.rds_*`)で変更します。以下の表はこのマネージド方式です。
+
+### MySQL ソース
+
+| 設定 | 値 | 設定方法 |
+|---|---|---|
+| バイナリログ(`log_bin`) | `ON` | **RDS for MySQL:** 直接オンにできません — **自動バックアップ** を有効にします(バックアップ保持期間 > 0)。**Aurora MySQL:** `binlog_format` を設定するまではオフです。 |
+| `binlog_format` | `ROW` | **RDS:** インスタンスにアタッチしたカスタム DB パラメータグループ。**Aurora:** **クラスターレベル** のパラメータ — カスタム DB *クラスター* パラメータグループ(既定のグループは変更できません)で設定し、`OFF`(既定値)だった場合はクラスターを **再起動** します。 |
+| `binlog_row_image` | `FULL` | 同じパラメータグループ。既定値ですが、明示的に設定してください。 |
+| `binlog_row_value_options`(MySQL 8.0 以降) | 空 | 同じパラメータグループ。`PARTIAL_JSON` は JSON の更新を CDC が適用できない差分として記録します。空にした後はソースを再起動するか、アプリケーションの接続プールをリサイクルしてください — 変更前に開いた接続は差分を記録し続けます。 |
+| binlog 保持期間 | 安全な既定値は **168 時間(7 日)** | RDS for MySQL・Aurora MySQL の両方で `CALL mysql.rds_set_configuration('binlog retention hours', 168);`。Aurora MySQL の最大値は **2160** 時間(90 日)で、カットオーバー後に再び短くしても構いません。 |
+| レプリケーションユーザー | `SELECT`、`REPLICATION CLIENT`、`REPLICATION SLAVE`、`RELOAD`、`LOCK TABLES`。MySQL 8.0.19 以降でアプリケーションが XA トランザクションを使う場合は `XA_RECOVER_ADMIN` も | admin アカウントではなく、専用の最小権限ユーザーを使ってください。`RELOAD` と `LOCK TABLES` は初期スナップショットの記録管理用です。 |
+| `gtid_mode` | `ON` — 推奨(必須ではありません) | パラメータグループ。Full Load の前に決め、カットオーバーまで変えないでください。 |
+
+最初の 4 行は **必須要件** です — 満たされていないとゲートが CDC を失敗扱いにします。
+
+- **binlog 保持期間。** RDS/Aurora はバイナリログを積極的に削除します — **Aurora MySQL は 24 時間しか
+  保持しません**。CDC は Full Load 中にキャプチャした **ウォーターマーク(watermark)** から再開する
+  ため、その位置の binlog が **CDC 開始時点でまだ存在している必要があり**、CDC スタック(MSK + MSK
+  Connect)のデプロイだけでも **約 15〜20 分** かかった後にようやくストリーミングが始まります。
+  Full Load と CDC 開始の間のギャップに追いつき時間を加えた分をカバーできる期間を選んでください。
+  ゲートは保持期間が未設定または 24 時間未満の場合に **警告(WARN)** を出すだけで、ブロックはしません。
+  Full Load にかかる時間はユーザーしか分からないためです。
+- **GTID。** `gtid_mode=ON` では CDC が GTID で位置を決めるため、バイナリログファイルの異なる
+  レプリカへのフェイルオーバー(failover)の後でも続けられます。`OFF`、`OFF_PERMISSIVE`、
+  `ON_PERMISSIVE` では binlog の `file:position` を使います。`gtid_mode` が `ON` でないときに記録された
+  開始位置では — また `ON` でないときに最後に開始した CDC スタックでも — `ON` になった後に CDC を
+  開始できません([§6.2](06-limitations.md#62-移行プロセスの制限))。
+- **GTID がない場合**、Full load + CDC の実行は `file:position` の開始位置を `FLUSH BINARY LOGS` で
+  正確にし、これには `RELOAD` が必要です(データは書き込まれず、テーブルもロックされません。binlog は
+  新しいファイルに移ります)。enhanced binlog を使う Aurora MySQL ではツールはこれに依存しないため、
+  そのような実行には `gtid_mode=ON` が必要です(または enhanced binlog を無効にします。どちらも
+  ライターの再起動が必要です)
+  ([§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
+
+### PostgreSQL ソース
+
+| 設定 | 値 | 設定方法 |
+|---|---|---|
+| 論理デコーディング(`wal_level`) | `logical` — **必須要件**(満たされていないとゲートが CDC を失敗扱いにします) | **RDS for PostgreSQL / Aurora PostgreSQL** では、カスタム DB(クラスター)パラメータグループで静的パラメータ **`rds.logical_replication=1`** を設定し、その後 **再起動** してください(Aurora: ライターを再起動)。 |
+| エンドポイント | スタンバイではなくクラスターの **ライター**(`pg_is_in_recovery()` が false であること) | スタンバイはレプリケーションスロットをホストできません。 |
+| レプリケーションユーザー | 論理レプリケーションスロットを作成・読み取りできること — **superuser**、**REPLICATION ロール属性**(`pg_roles.rolreplication`)を持つロール、または **`rds_replication`** のメンバー — に加え、スナップショットのために移行対象テーブルへの **SELECT** | admin アカウントではなく、専用の最小権限ユーザーを使ってください。RDS/Aurora では REPLICATION 属性を直接付与できません。(これは community の `REPLICATION` オブジェクト権限ではありません。) |
+| レプリケーション対象の各テーブルの `REPLICA IDENTITY`(パーティション化されたテーブルではすべてのパーティション) | `DEFAULT` は `DEFERRABLE` でない有効な主キー、`USING INDEX` は有効な一意インデックス、`FULL`(`ALTER TABLE … REPLICA IDENTITY FULL`)はどのテーブルでも動作しますが、PostgreSQL 18 で生成列を持つテーブルは例外 | ない場合、テーブルが publication に含まれた後はそのテーブルのすべての UPDATE/DELETE がソースで失敗するため、前提条件チェックが失敗と判定し、Full Load はソースで何も変更する前に停止します。 |
+| レプリケーションスロット / `max_wal_senders` の余裕 | 空きスロットと walsender | 非ブロッキングの **警告(WARN)**: スロットのエントリに空きがあっても、walsender プールが満杯だと新しいスロットはブロックされます。 |
+
+- **変更すべき保持設定はありません。** ツールが Full Load の整合点で作成する
+  **論理レプリケーションスロット** が、その LSN から必要な WAL を **固定(pin)** するため、約 15〜20 分
+  の CDC スタックのプロビジョニングも問題になりません。リスクは逆方向にあります:**非アクティブ/
+  未消費のスロットが WAL を固定し続け、ソースのディスクを満杯にする恐れがある** ため、WAL/スロットの
+  健全性を監視してください。ツールは `wal_status` を提示し、`wal_status='lost'` はスロットが無効化
+  されたことを意味します → gapless な再開が壊れる → Start CDC がブロックして解決方法を示します
+  ([§4.3](04-cdc-and-dsql-constraints.md)): Full load + CDC では **Drop & reload** で Full Load を
+  再実行します。スタックのコネクタを以前に開始していた場合は、その前に Delete CDC infrastructure して
+  再デプロイします。
 
 ---
 

@@ -56,19 +56,19 @@ application to DSQL once Validation passes.
 | # | Chapter | What you'll learn |
 |---|---|---|
 | 0 | [Before you begin](00-before-you-begin.md) | The pre-flight checklist — the must-know facts (same-region only, read-only source — apart from PostgreSQL CDC's audited slot/publication, DSQL's omitted features, CDC is optional/billable) that shape your plan from step one. **Start here.** |
-| 1 | [Set up](01-setup.md) | Prerequisites, how to run the tool (local or on AWS), and how to connect to your source and target. |
+| 1 | [Set up](01-setup.md) | Prerequisites, how to run the tool (local or on AWS), how to connect to your source and target, and the source-side setup for CDC. |
 | 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | How the tool assesses what will/won't move to DSQL (AUTO / MANUAL / UNSUPPORTED, effort estimates, name conflicts) and converts + applies the schema. Includes the complete **MySQL → DSQL and PostgreSQL → DSQL type and constraint reference** (the PostgreSQL reference is near-identity, with DSQL-unsupported PG types — arrays, geometric, network, xml, money, bit/varbit, range/multirange, enum, composite, tsvector/tsquery, pgvector — flagged at Evaluation and Schema Conversion: a stand-in that keeps the value is MANUAL, a type with none is UNSUPPORTED). |
 | 3 | [Full Load](03-full-load.md) | How the bulk snapshot load works: streaming export, batched idempotent load, the watermark, and how failures are isolated. |
 | 4 | [CDC and DSQL constraints](04-cdc-and-dsql-constraints.md) | How streaming CDC works, the gapless Full Load → CDC handoff, and how DSQL's constraints (1 MiB values, OCC, IAM auth, deferred foreign-key apply) are handled in the data path. |
 | 5 | [Validation](05-validation.md) | How the tool proves the target matches the source: row counts, checksums, full PK reconciliation, and live-source drift. |
 | 6 | [Limitations](06-limitations.md) | The real, enforced limits you must plan around (DSQL constraints, single-region CDC, single-task control plane). |
-| 7 | [Performance and tuning](07-performance-and-tuning.md) | Why the data path is built this way (AWS-grounded: OCC retry, hot-partition PKs, transaction envelope, async indexes, IAM tokens), how to tune Full Load / Validation / CDC parallelism — locally and on Fargate — and a reproducible measured example backing the rationale. |
-| 8 | [Testing — the DSQL-driven scenarios](08-testing-and-verification.md) | The migration scenarios each Aurora DSQL characteristic *forces* you to test (transaction caps, OCC, 1 MiB values, IAM tokens, async indexes, enforced FK, gapless handoff, drift) and how the tool exercises each — offline and on real AWS. |
+| 7 | [Performance and tuning](07-performance-and-tuning.md) | What the tool does for you on Aurora DSQL (OCC retry, hot-partition PKs, transaction envelope, async indexes, IAM tokens), how to tune Full Load / Validation / CDC parallelism — locally and on Fargate — and how to keep the load on your source in check. |
+| 8 | [Testing and verification](08-testing-and-verification.md) | For each situation in your data that can go wrong on Aurora DSQL (large tables, 1 MiB values, ambiguous types, OCC conflicts, long streams, the gapless hand-off, drift): what the tool does for you and where you check it — plus a 100% match from a real AWS run on deliberately tricky data. |
 | 9 | [The Query Converter and the AI DBA](09-query-validation.md) | The optional Query Converter: convert a single MySQL query to Aurora DSQL, test it read-only on the target (`EXPLAIN` / `EXPLAIN ANALYZE` + DPU cost), and have the **AI DBA** rewrite it for DSQL efficiency and prove the improvement by re-testing. |
 | 10 | [Conclusion](10-conclusion.md) | When to use which path, a recommended end-to-end flow, and where to go next. |
 | 11 | [Customer FAQ](11-customer-faq.md) | The questions customers ask most — Full Load, CDC, limitations, type mapping, validation, cut-over/rollback, and operations — each answered from the tool's actual behavior with links to the detail. |
-| 12 | [Appendix: Performance test results](12-performance-test-results.md) | The measured Full Load / Validation / CDC throughput example and methodology behind the tuning rationale. |
-| 13 | [Excluding tables and columns](13-excluding-tables-and-columns.md) | The **Exclude tables & columns** rules popup: rule language, what cannot be excluded, how an excluded column becomes NULL on Aurora DSQL, changing exclusions later (Change & reload), the CDC capture list, Validation and Cut over, and upgrading from 0.1.561. |
+| 12 | [Appendix: Performance test results](12-performance-test-results.md) | Measured Full Load and CDC throughput — what drives it, the ~1 TB runs from MySQL and PostgreSQL sources — and how to reproduce the measurements. |
+| 13 | [Excluding tables and columns](13-excluding-tables-and-columns.md) | The **Exclude tables & columns** rules popup: rule language, what cannot be excluded, how an excluded column becomes NULL on Aurora DSQL, changing exclusions later (Change & reload), the CDC capture list, Validation and Cut over. |
 
 ## A note for MySQL and PostgreSQL users about Aurora DSQL
 
@@ -80,8 +80,8 @@ stored procedures, a per-transaction row limit, and a 1 MiB per-value limit**
 (foreign keys, by contrast, **are supported and enforced**). And even though it
 speaks the PostgreSQL wire, it is **not a drop-in Aurora PostgreSQL replacement
 either**: it is a constrained, distributed PostgreSQL that adds IAM-token auth and
-those same per-transaction / per-value limits, and drops triggers, stored
-procedures, and generated-column / `DEFAULT` support — so PostgreSQL users can't
+those same per-transaction / per-value limits, and drops triggers and stored
+procedures — so PostgreSQL users can't
 treat it as vanilla Aurora PostgreSQL. (These DSQL differences apply regardless of
 the source engine.) This manual calls out each of these where it matters and shows
 what the tool does about it, so you don't have to learn DSQL's rules the hard way.

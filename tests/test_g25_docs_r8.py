@@ -47,7 +47,7 @@ import pytest
 
 from tests.test_g12_table_set_after_load import _c, _job, _loaded
 from tests.test_g12_table_set_after_load import _screen as _flo_screen
-from tests.test_g25_docs import LANGS, ROOT, _has, _page
+from tests.test_g25_docs import _F43, LANGS, ROOT, _has, _page
 from tests.test_g25_docs_r4 import _stale
 from tests.test_g25_docs_r7 import _joined
 from tests.test_g25_fl_r6 import NEVER_STARTED, ROLLED_BACK, STOPPED, _probe, _state
@@ -250,19 +250,14 @@ _TYPE_SWITCH_FIRST = {
             "only には CDC ステップがなく、ストリーミングしたことのあるスタックは停止した位置から続ける"
             "だけで、より新しい開始位置から開始することは決してありません",
         },
-        "legacy-null": {
-            "en": "1. If a CDC stack exists, delete the CDC infrastructure first (Stop CDC first "
-            "while it streams; Full load only has no CDC step, so switch to Full load + CDC to "
-            "delete it).",
-            "ko": "1. CDC 스택이 있으면 먼저 CDC 인프라를 삭제하세요(스트리밍 중이면 그 전에 Stop CDC. Full "
-            "load only에는 CDC 단계가 없으므로 Full load + CDC로 바꿔서 삭제).",
-            "ja": "1. CDC スタックが存在する場合は、まず CDC インフラを削除します(ストリーミング中は先に "
-            "Stop CDC。Full load only には CDC ステップがないため、Full load + CDC に切り替えてから削除"
-            "します)。",
-        },
+        # (2026-10-28) The omit-only conversion recipe (13.10, step 1: delete the CDC
+        # infrastructure first; Full load only has no CDC step) went with section 13.10.
     },
 }
 _TYPE_SWITCH_FIRST[_P10] = _TYPE_SWITCH_FIRST[_P04]
+# §4.3 (answer-first) keeps the route itself -- the switch to CDC only, then the CDC step's
+# Delete and deploy, then Start CDC -- in the note on a later CDC start after Full load only.
+_TYPE_SWITCH_FIRST[_P04] = {"route": _F43["full-load-only-switch"]}
 # The round-7 wording: a Delete CDC infrastructure the reader cannot reach from Full load only.
 _DELETE_FIRST_STALE = {
     "en": (
@@ -321,11 +316,6 @@ _DROP_AND_RELOAD = {
         },
     },
     _P03: {
-        "batch": {
-            "en": "`INSERT ... ON CONFLICT` makes re-running a batch idempotent (no duplicates).",
-            "ko": "`INSERT ... ON CONFLICT` 덕분에 배치를 다시 실행해도 중복이 생기지 않음.",
-            "ja": "`INSERT ... ON CONFLICT` により、バッチの再実行は冪等になります(重複なし)。",
-        },
         "coverage-lock": {
             "en": "Choose **Drop & reload** for that re-run: CDC then starts from its watermark, "
             "and an *Append* keeps the rows the earlier load wrote as they were, without the "
@@ -350,30 +340,10 @@ _DROP_AND_RELOAD = {
         # that route's Drop & reload condition, with the type switch CDC only needs.
     },
     _P04: {
-        "after-full-load-only": {
-            "en": "Either way CDC starts from the watermark and carries only the changes after "
-            "it, so if that Full load only run appended to rows an earlier load left on the "
-            "target, first Re-run Full Load choosing **Drop & reload**.",
-            "ko": "어느 쪽이든 CDC는 워터마크에서 시작해 그 뒤의 변경만 가져오므로, 그 Full load only "
-            "실행이 앞선 적재가 타깃에 남긴 행에 append했다면 먼저 **Drop & reload**로 Re-run Full Load "
-            "하세요.",
-            "ja": "どちらの場合も CDC はウォーターマークから開始してその後の変更しか運ばないため、その "
-            "Full load only の実行が以前のロードがターゲットに残した行に append した場合は、先に "
-            "**Drop & reload** で Re-run Full Load してください。",
-        },
-        "rerun-all": {
-            "en": "needs Re-run all tables, with **Drop & reload**, instead",
-            "ko": "대신 **Drop & reload**로 Re-run all tables가 필요합니다",
-            "ja": "代わりに **Drop & reload** での Re-run all tables が必要です",
-        },
-        "binlog-purged": {
-            "en": "you'd re-run Full Load with **Drop & reload** to capture a fresh watermark (an "
-            "append would keep the rows already loaded as they were)",
-            "ko": "새 워터마크를 얻기 위해 **Drop & reload**로 Full Load를 다시 실행해야 합니다(append는 "
-            "이미 로드된 행을 그대로 둡니다)",
-            "ja": "新しいウォーターマークを取得するために **Drop & reload** で Full Load を再実行する"
-            "ことになります (append はロード済みの行をそのまま残します)",
-        },
+        # §4.3 (answer-first): the Full load only note, and the binlog bullet of "Before you start
+        # CDC" (what an append would keep is in the "Did the Full Load append?" bullet).
+        "after-full-load-only": _F43["after-full-load-only"],
+        "binlog-purged": _F43["binlog-purged"],
     },
     _P10: {
         "principle": {
@@ -440,7 +410,17 @@ _DROP_AND_RELOAD = {
         },
     },
 }
-_DROP_AND_RELOAD[_P10]["after-full-load-only"] = _DROP_AND_RELOAD[_P04]["after-full-load-only"]
+_DROP_AND_RELOAD[_P10]["after-full-load-only"] = {
+    "en": "Either way CDC starts from the watermark and carries only the changes after "
+    "it, so if that Full load only run appended to rows an earlier load left on the "
+    "target, first Re-run Full Load choosing **Drop & reload**.",
+    "ko": "어느 쪽이든 CDC는 워터마크에서 시작해 그 뒤의 변경만 가져오므로, 그 Full load only "
+    "실행이 앞선 적재가 타깃에 남긴 행에 append했다면 먼저 **Drop & reload**로 Re-run Full Load "
+    "하세요.",
+    "ja": "どちらの場合も CDC はウォーターマークから開始してその後の変更しか運ばないため、その "
+    "Full load only の実行が以前のロードがターゲットに残した行に append した場合は、先に "
+    "**Drop & reload** で Re-run Full Load してください。",
+}
 # The wording rule E retires: an Append re-run called idempotent, and new-copy routes with no
 # Drop & reload.
 _APPEND_STALE = {
@@ -512,7 +492,11 @@ _PG_SLOT = {
         "再起動と同じく (上記) 停止したところから続きます (そうでなければ Debezium が先に選択したすべて"
         "のテーブルをスナップショットします)。",
     },
-    _P04: {
+    # Chapter 10 keeps this sentence as written. §4.3 (answer-first) says the PostgreSQL half of a
+    # later CDC start in its Full load only note (the source connector creates its own slot and
+    # re-snapshots) and the bound in its restart row, without the "continues from that stack's
+    # own slot" nuance.
+    _P10: {
         "en": "on a CDC stack whose connectors were started before, Start CDC instead continues "
         "from that stack's own slot if its source connector streamed (otherwise Debezium "
         "snapshots every selected table first): gapless only while the CDC topics still retain "
@@ -528,7 +512,6 @@ _PG_SLOT = {
     # G26 moved the chapter 6 pin to test_g26_docs.py: the reloaded tables converge only where
     # the stack's source connector streamed, not in the snapshot case.
 }
-_PG_SLOT[_P10] = _PG_SLOT[_P04]
 # The promise round 8 withdrew: a Start after a Full load only run records no slot, so it sends
 # snapshot.mode=initial, which snapshots first when the source connector never streamed.
 _PG_SLOT_STALE = {
@@ -581,58 +564,45 @@ def test_postgresql_continues_from_its_slot_only_if_its_source_connector_streame
 # -- Validation's recovery card (05) ---------------------------------------------------------
 
 _CARD = {
+    # Chapter 5 (answer-first) gives the card as a table: one row for a stack that never streamed,
+    # one for the extra rows (with its CDC only variant), and a pointer to the first row's steps
+    # for CDC only without a Full Load record.
     _P05: {
         "never-streamed": {
-            "en": "On a stack that never streamed the order is shorter (with CDC only, switch the "
-            "migration type to Full load + CDC first → **Re-run Full Load** (**Re-run all "
-            "tables** when some failed) choosing **Drop & reload** → **Start CDC**, which starts "
-            "from the new Full Load's start point → **Re-run validation**). These are the steps "
-            "above without Stop CDC and the redeploy, and the card shows them once that redeploy "
-            "is done: the re-run is a **Drop & reload** there too, because CDC starts from its "
-            "new start point and an append would keep rows older than it.",
-            "ko": "스트리밍한 적 없는 스택에서는 순서가 더 짧습니다(CDC only에서는 먼저 마이그레이션 유형을 "
-            "Full load + CDC로 바꿈 → **Re-run Full Load**(일부가 실패했다면 **Re-run all tables**)를 "
-            "**Drop & reload**로 → **Start CDC**(새 Full Load의 시작 지점에서 시작) → **Re-run "
-            "validation**). 위 단계에서 Stop CDC와 재배포를 뺀 것이며, 그 재배포를 마친 뒤에도 카드가 이 "
-            "단계를 보여 줍니다: CDC가 새 시작 지점에서 시작하고 append는 그보다 오래된 행을 그대로 두므로, "
-            "여기서도 재실행은 **Drop & reload**입니다.",
-            "ja": "ストリーミングしたことのないスタックでは手順はもっと短くなります (CDC only では、先に"
-            "マイグレーションの種類を Full load + CDC に切り替えます → **Drop & reload** で **Re-run Full "
-            "Load** (一部が失敗していれば **Re-run all tables**) → **Start CDC** (新しい Full Load の開始"
-            "位置から始まります) → **Re-run validation**)。上記の手順から Stop CDC と再デプロイを除いた"
-            "もので、その再デプロイを終えた後もカードはこの手順を示します: CDC は新しい開始位置から始まり、"
-            "append はそれより古い行をそのまま残すため、ここでも再実行は **Drop & reload** です。",
+            "en": "The same without Stop CDC and the redeploy (with CDC only, switch the "
+            "migration type to Full load + CDC first). The re-run is a **Drop & reload** here "
+            "too, because CDC starts from its new start point and an append would keep rows "
+            "older than it.",
+            "ko": "위 단계에서 Stop CDC와 재배포를 뺀 것입니다(CDC only에서는 먼저 마이그레이션 유형을 "
+            "Full load + CDC로 바꿈). 여기서도 재실행은 **Drop & reload**입니다: CDC가 새 시작 지점에서 "
+            "시작하고 append는 그보다 오래된 행을 그대로 두기 때문입니다.",
+            "ja": "上記の手順から Stop CDC と再デプロイを除いたものです（CDC only では、先にマイグレー"
+            "ションの種類を Full load + CDC に切り替えます）。ここでも再実行は **Drop & reload** です: "
+            "CDC は新しい開始位置から始まり、append はそれより古い行をそのまま残すためです。",
         },
         "extra-rows": {
-            "en": "When the target holds rows the source does not, the card says *The target "
-            "holds rows the source does not — a delete never landed*: a re-run only adds rows, "
-            "so it names that per-table reload (**Reload specific tables**, with CDC stopped, "
-            "choosing **Drop & reload**; with CDC only, after switching the migration type to "
-            "Full load + CDC).",
-            "ko": "타깃에 소스에 없는 행이 있으면 카드는 *The target holds rows the source does not — a "
-            "delete never landed*라고 말합니다: 재실행은 행을 채우기만 하므로, 카드는 그 테이블별 다시 "
-            "적재(CDC를 멈춘 채 **Reload specific tables**, **Drop & reload** 선택. CDC only에서는 "
-            "마이그레이션 유형을 Full load + CDC로 바꾼 뒤)를 알려 줍니다.",
-            "ja": "ターゲットにソースにない行がある場合、カードは *The target holds rows the source does "
-            "not — a delete never landed* と述べます: 再実行は行を埋めるだけなので、カードはそのテーブル"
-            "ごとの再ロード (CDC を停止して **Reload specific tables**、**Drop & reload** を選択。CDC "
-            "only では、マイグレーションの種類を Full load + CDC に切り替えてから) を示します。",
+            "en": "A re-run only adds rows, so the card names that per-table reload (**Reload "
+            "specific tables**, with CDC stopped, choosing **Drop & reload**; with CDC only, "
+            "after switching the migration type to Full load + CDC)",
+            "ko": "재실행은 행을 채우기만 하므로, 카드는 그 테이블별 다시 적재(CDC를 멈춘 채 **Reload "
+            "specific tables**, **Drop & reload** 선택. CDC only에서는 마이그레이션 유형을 Full load + "
+            "CDC로 바꾼 뒤)를 알려 줍니다",
+            "ja": "再実行は行を埋めるだけなので、カードはそのテーブルごとの再ロード（CDC を停止して "
+            "**Reload specific tables**、**Drop & reload** を選択。CDC only では、マイグレーションの種類を "
+            "Full load + CDC に切り替えてから）を示します",
+        },
+        "extra-rows-header": {
+            "en": "*The target holds rows the source does not — a delete never landed*",
+            "ko": "*The target holds rows the source does not — a delete never landed*",
+            "ja": "*The target holds rows the source does not — a delete never landed*",
         },
         "extra-rows-no-record": {
             "en": "With CDC only and no Full Load record in this session there is no table to "
-            "reload, so it names a new Full Load start point instead: Stop CDC if it is running "
-            "and **Delete CDC infrastructure** and deploy it again (on a stack that has streamed, "
-            "or whose CDC state is not read yet), then switch the migration type to Full load + "
-            "CDC, run its Full Load choosing **Drop & reload**, and **Start CDC**.",
-            "ko": "CDC only이고 이 세션에 Full Load 기록이 없으면 다시 적재할 테이블이 없으므로, 대신 새 Full "
-            "Load 시작 지점을 알려 줍니다: CDC가 실행 중이면 Stop CDC 후 **Delete CDC infrastructure** 하고 "
-            "다시 배포한 다음(스트리밍한 적 있거나 CDC 상태를 아직 읽지 못한 스택이면), 마이그레이션 유형을 "
-            "Full load + CDC로 바꿔 그 Full Load를 **Drop & reload**로 실행하고 **Start CDC** 합니다.",
-            "ja": "CDC only でこのセッションに Full Load の記録がない場合は再ロードするテーブルがないため、"
-            "代わりに新しい Full Load の開始位置を示します: CDC が動いていれば Stop CDC し、**Delete CDC "
-            "infrastructure** して再デプロイしてから (ストリーミングしたことのある、または CDC の状態を"
-            "まだ読み取っていないスタックの場合)、マイグレーションの種類を Full load + CDC に切り替え、"
-            "その Full Load を **Drop & reload** で実行して **Start CDC** します。",
+            "reload, so it names a new Full Load start point instead",
+            "ko": "CDC only이고 이 세션에 Full Load 기록이 없으면 다시 적재할 테이블이 없으므로, 대신 새 "
+            "Full Load 시작 지점을 알려 줍니다",
+            "ja": "CDC only でこのセッションに Full Load の記録がない場合は再ロードするテーブルがない"
+            "ため、代わりに新しい Full Load の開始位置を示します",
         },
     },
 }
@@ -689,23 +659,19 @@ def test_validations_recovery_card_is_described_as_round_8_renders_it(lang: str)
 # confirmed), and they name the same route.
 _CDC_LIVE = {
     _P03: {
+        # Chapter 3 (2026-10-25) shows the live row as one cell of the CDC-state table, so the
+        # pin is the way on. (2026-10-28) That an already-open confirm dialog cannot be
+        # confirmed is dialog behavior a tool user does not need; the code assertions pin it.
         "keeps-start-point": {
-            "en": "**Retry unfinished tables**, **Reload specific tables** and a per-table "
-            "**Reload**, which keep the original start point, are disabled too, and a confirm "
-            "dialog already open for one cannot be confirmed. They say instead to Stop CDC first, "
-            "run it, then Start CDC again: CDC then continues from where it stopped, gapless only "
-            "while the CDC topics still retain what the sink had not applied (their retention "
-            "period on MSK).",
-            "ko": "원래 시작 지점을 유지하는 **Retry unfinished tables**, **Reload specific tables**, "
-            "테이블별 **Reload**도 비활성화되며, 그중 하나를 위해 이미 열려 있는 확인 대화 상자는 확인할 수 "
-            "없습니다. 이들은 대신 먼저 Stop CDC를 하고 그 작업을 실행한 뒤 Start CDC를 다시 하라고 알려 "
-            "줍니다: 그러면 CDC는 멈춘 곳에서 이어 가며, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 "
-            "보존하는 동안(MSK에서의 보존 기간)만 빈틈이 없습니다.",
-            "ja": "元の開始位置を維持する **Retry unfinished tables**、**Reload specific tables**、"
-            "テーブルごとの **Reload** も無効になり、そのいずれかのためにすでに開いている確認ダイアログは"
-            "確定できません。これらは代わりに、先に Stop CDC してからその操作を実行し、もう一度 Start CDC "
-            "するよう示します: CDC はその後、停止した位置から続き、ギャップがないのは sink が適用していなかった"
-            "変更を CDC トピックがまだ保持している間 (MSK での保持期間) だけです。",
+            "en": "Stop CDC first, run it, then Start CDC again. CDC continues from where it "
+            "stopped, gapless only while the CDC topics still retain what the sink had not "
+            "applied (their retention period on MSK).",
+            "ko": "먼저 Stop CDC를 하고 그 작업을 실행한 뒤 Start CDC를 다시 하세요. CDC는 멈춘 곳에서 "
+            "이어 가며, 싱크가 적용하지 않은 변경을 CDC 토픽이 아직 보존하는 동안(MSK에서의 보존 "
+            "기간)만 빈틈이 없습니다.",
+            "ja": "先に Stop CDC してからその操作を実行し、もう一度 Start CDC してください。CDC は停止した"
+            "位置から続き、ギャップがないのは sink が適用していなかった変更を CDC トピックがまだ保持して"
+            "いる間 (MSK での保持期間) だけです。",
         },
     },
 }

@@ -1947,15 +1947,15 @@ _STALE = {
 
 
 # The review's fixes: the route by the control the step shows, the two ends of the mark (a
-# recreate, a CHECKSUM match), the activity-log scope, the failed range counted from 1, the
-# recovery after a Start that never streamed.
+# recreate, a CHECKSUM match), the failed range counted from 1, the recovery after a Start
+# that never streamed. (2026-10-28) The activity-log scope ("for each table large enough to
+# split ...") left the chapter: it is log/UI wording, and the code assertions pin it.
 _REVIEW = {
     "en": ("**Retry unfinished tables** while it is unfinished, **Reload specific tables** once "
            "every table has loaded",
            "The table stays marked until one of two things clears the mark: a load that "
            "recreates it (a **Drop & reload**), or a Validation whose **CHECKSUM** comparison "
            "matches it",
-           "for each table large enough to split",
            "with that reason (*range 2 of 4*)",
            "A Start CDC, even one that streamed, does not end the refusals",
            "Retry unfinished tables while it is unfinished, else Reload specific tables: with one "
@@ -1965,7 +1965,6 @@ _REVIEW = {
            "테이블의 표시는 두 가지 중 하나로 지워집니다: 그 테이블을 다시 만드는 적재(**Drop & "
            "reload**), 또는 그 테이블의 마지막 적재가 끝난 뒤 시작된 Validation의 **CHECKSUM** "
            "비교가 일치하는 경우입니다",
-           "나눌 만큼 큰 테이블",
            "그 이유(*range 2 of 4*)와 함께",
            "Start CDC는 스트리밍했더라도 거부를 끝내지 않습니다",
            "끝나지 않았으면 Retry unfinished tables, 그 밖에는 Reload specific tables"),
@@ -1974,7 +1973,6 @@ _REVIEW = {
            "テーブルの印は、次の 2 つのどちらかで消えます: そのテーブルを作り直すロード（**Drop & "
            "reload**）、またはそのテーブルの最後のロードが終わった後に始まった Validation の "
            "**CHECKSUM** 比較が一致した場合です",
-           "分割できる大きさのテーブル",
            "その理由（*range 2 of 4*）とともに",
            "Start CDC は、ストリーミングした場合でも拒否を終わらせません",
            "終わっていなければ Retry unfinished tables、それ以外は Reload specific tables"),
@@ -2041,9 +2039,9 @@ def test_the_manual_tells_the_review_fixes_in_every_language(lang) -> None:
     pages = _all_pages(lang)
     full_load = pages["03-full-load.md"]
     tables = pages["13-excluding-tables-and-columns.md"]
-    for phrase in _REVIEW[lang][:5]:
+    for phrase in _REVIEW[lang][:4]:
         assert _has(lang, full_load, phrase), (lang, phrase)
-    assert _has(lang, tables, _REVIEW[lang][5]), lang
+    assert _has(lang, tables, _REVIEW[lang][4]), lang
     for phrase in _REVIEW_STALE[lang]:
         assert not any(_has(lang, text, phrase) for text in pages.values()), (lang, phrase)
 

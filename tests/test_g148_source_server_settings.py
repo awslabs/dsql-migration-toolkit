@@ -1014,13 +1014,14 @@ def test_the_manual_says_which_settings_evaluation_reads_and_how_the_tool_reads(
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / language
     chapter = " ".join((manual / "02-evaluation-and-schema-conversion.md").read_text(
         encoding="utf-8").split())
-    section = chapter.split("## 2.1", 1)[1].split("### ", 1)[0]
-    for name in MYSQL_SERVER_SETTINGS:
-        assert f"`{name}`" in section, name
+    # Chapter 2 is a user guide (2026-10-25): it names the finding and what the user does;
+    # the implementation detail this test pinned lives in the CHANGELOG.
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    evaluation = chapter.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + chapter.split("## 2.4", 1)[1]
     for rule in (SQL_MODE_RULE_ID, IMPLICIT_TIMESTAMP_RULE_ID, AUTO_INCREMENT_STEP_RULE_ID):
-        assert f"`{rule}`" in section, rule
-    assert "`TimeZone`" in section and "`ALTER DATABASE`" in section and "`ALTER ROLE`" in section
-    assert "`SET TIME ZONE`" in section  # what the read cannot see
-    assert f"`{PIN}`" in section
-    assert "`ANSI_QUOTES`" in section
-    assert _NOTHING_WRITTEN[language] in section
+        assert f"`{rule}`" in evaluation, rule
+    assert "`TimeZone`" in evaluation and "`ALTER DATABASE`" in evaluation
+    assert "`ALTER ROLE`" in evaluation
+    assert "`SET TIME ZONE`" in evaluation  # what the read cannot see
+    assert "`ANSI_QUOTES`" in evaluation

@@ -47,7 +47,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_g25_docs import _PAGE, LANGS, _has, _inheritance_blocks, _page
+from tests.test_g25_docs import (
+    _PAGE,
+    LANGS,
+    _fact,
+    _has,
+    _inheritance_blocks,
+    _page,
+    _route_halves,
+    _section_43,
+    _steps_in_order,
+)
 from tests.test_g25_docs_r4 import _slot_objects, _stale
 
 ROLLED_BACK = "UPDATE_ROLLBACK_COMPLETE"
@@ -97,34 +107,10 @@ def _gate(monkeypatch, status: str, *, force_initial=None):
 # What a first Start is, which stacks count as started, how a retry continues after a rollback
 # and the unchecked case's wording changed in the last step: those pins are in
 # test_g25_docs_r4d.py (this step's wording is stale there). These still hold.
-_ROLLED_BACK_RULE = {
-    "en": (
-        "a refused Start, a Start that failed before it updated the stack, an app restart and "
-        "Start over all leave the next Start judged the same way",
-        "It cannot see another migration that uses the same CDC stack name and re-creates the "
-        "slot after this stack has streamed, or after this stack's first Start rolled back, so "
-        "give each migration its own CDC stack name",
-        "but if that connector streamed and the slot was dropped since, that Start skips every "
-        "change made in between",
-    ),
-    "ko": (
-        "거부된 Start, 스택을 업데이트하기 전에 실패한 Start, 앱 재시작, Start over 뒤에도 다음 Start는 "
-        "같은 방식으로 판단됩니다",
-        "이 스택이 스트리밍한 뒤, 또는 이 스택의 첫 Start가 롤백된 뒤 같은 CDC 스택 이름을 쓰는 다른 "
-        "마이그레이션이 슬롯을 다시 만드는 경우는 알아차리지 못하므로, 마이그레이션마다 고유한 CDC 스택 "
-        "이름을 쓰세요",
-        "그 커넥터가 스트리밍한 뒤 슬롯이 삭제되었다면 그 Start는 그 사이의 모든 변경을 건너뜁니다",
-    ),
-    "ja": (
-        "拒否された Start、スタックを更新する前に失敗した Start、アプリの再起動、Start over の後も、次の "
-        "Start は同じように判定されます",
-        "このスタックがストリーミングした後、またはこのスタックの最初の Start がロールバックされた後に、"
-        "同じ CDC スタック名を使う別のマイグレーションがスロットを作り直した場合は検出できないため、"
-        "マイグレーションごとに独自の CDC スタック名を使ってください",
-        "そのコネクタがストリーミングした後にスロットが削除されていた場合、その Start はその間のすべての"
-        "変更をスキップします",
-    ),
-}
+# §4.3 (answer-first) keeps the residual the reader acts on: the slot's name derives from the CDC
+# stack name, so a second migration of the same source needs its own CDC stack name. How a refused
+# Start, an app restart or Start over leave the next Start judged, and the rolled-back-then-dropped
+# slot case, are the code assertions below.
 # Round 4's wording: a first Start defined by the stack's parameters, which a rollback restores;
 # a Start that failed before its connectors existed as the one failure judged the same way; the
 # residual without the rollback; the routes on a stopped stack only.
@@ -184,9 +170,7 @@ def test_a_start_cloudformation_rolled_back_counts_as_started(monkeypatch, lang:
     assert "and _pg_stack_started(\n        migration_state\n    )" in dialog
     assert "not _pg_resumes and pg_objects_block[0] not in BLOCKS_WITH_THEIR_OWN_FIX" in dialog
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _ROLLED_BACK_RULE[lang]:
-        assert _has(lang, cdc, phrase), (lang, phrase)
+    assert _fact(lang, _section_43(lang), "slot-name"), lang
     assert not _stale(lang, _STALE_ROLLED_BACK_RULE[lang]), lang
 
 
@@ -196,18 +180,8 @@ def test_a_start_cloudformation_rolled_back_counts_as_started(monkeypatch, lang:
 # topics first, and the diagnosis names it too -- the manual says so in the started stack's own
 # paragraph (its route: test_g25_docs_r4d.py and test_g25_docs_r5.py). This step's wording, the
 # blocks naming "the gapless routes" by state, is stale.
-_ROUTES = {
-    "en": "The diagnosis of a source connector that fails with Debezium's *Publication "
-    "autocreation is disabled* (read only on a stack whose connectors were started) names the "
-    "same route for both migration types, after Stop CDC if the CDC step still shows the "
-    "connectors",
-    "ko": "소스 커넥터가 Debezium의 *Publication autocreation is disabled*로 실패했을 때의 진단(커넥터를 "
-    "시작한 스택에서만 나옴)도, CDC 단계에 커넥터가 아직 보이면 Stop CDC 한 뒤, 두 마이그레이션 유형 "
-    "모두에 같은 경로를 알려 줍니다",
-    "ja": "source connector が Debezium の *Publication autocreation is disabled* で失敗したときの診断 "
-    "(コネクタを開始したスタックでだけ出ます) も、CDC ステップにまだコネクタが表示されていれば Stop CDC "
-    "してから、両方のマイグレーションの種類について同じ方法を示します",
-}
+# (§4.3 does not describe the diagnosis itself -- it is the connector log's guidance in the UI --
+# but the two routes it names are the started half of the route paragraph, which the page keeps.)
 _STALE_ROUTES = {
     "en": "On a stack that was started and then stopped, or whose last Start rolled back, a block "
     "for a missing publication, a publication that misses a selected table, or a missing or "
@@ -248,47 +222,19 @@ def test_the_publication_diagnosis_routes_are_the_ones_the_manual_names(
                   "Delete CDC infrastructure and deploy it again"):
         assert route in guidance and route in _pg_block_route(state, _block[0]), route
 
-    assert _has(lang, _page(lang, _PAGE["04"]), _ROUTES[lang]), lang
+    started = _route_halves(lang)[1]
+    assert _steps_in_order(
+        lang, started, "Delete CDC infrastructure", "Re-run Full Load", "Start CDC"
+    ), lang
+    assert _fact(lang, started, "cdc-only-new-stack"), lang
     assert not _stale(lang, (_STALE_ROUTES[lang],)), lang
 
 
 # -- confirmed[1]: the re-snapshot remedy is offered only when its own Start passes -----------
 
-_RESNAPSHOT = {
-    "en": (
-        "Before a block offers **Re-snapshot every table instead**, the Start CDC dialog, as it "
-        "opens, runs the checks of the Start that remedy would unlock (`snapshot.mode=initial`) "
-        "and offers it only if they pass",
-        # G25 round 5: a refusal for the block's own reason ends the block with its route.
-        "If that Start would be refused for the block's own reason, the block is shown with no "
-        "second notice and ends with the route that works there; if for another — for example a "
-        "captured table has inheritance child tables, or a slot of that name exists but cannot "
-        "be used (an invalidated one, say) — the dialog shows that refusal too, introduced by "
-        "*{lead}*",
-        "If those checks cannot read the source, the remedy stays, and the dialog warns "
-        "*{header}*",
-    ),
-    "ko": (
-        "차단이 **Re-snapshot every table instead**를 제시하기 전에, Start CDC 대화 상자는 열릴 때 그 "
-        "방법이 풀어 줄 Start(`snapshot.mode=initial`)의 검사를 실행하고, 검사를 통과할 때만 그 방법을 "
-        "제시합니다",
-        "그 Start가 차단과 같은 이유로 거부되면 두 번째 알림 없이 차단을 보여 주며 그 차단이 그곳에서 통하는 "
-        "경로로 끝나고, 다른 이유로 거부되면 — 예컨대 캡처 대상 테이블에 상속 자식 테이블이 있거나, 그 "
-        "이름의 슬롯이 있지만 쓸 수 없는 경우(무효화된 슬롯 등) — 그 거부도 *{lead}*로 시작해 보여 줍니다",
-        "그 검사가 소스를 읽지 못하면 그 방법은 그대로 남고, 대화 상자가 *{header}* 경고를 보여 줍니다",
-    ),
-    "ja": (
-        "ブロックが **Re-snapshot every table instead** を提示する前に、Start CDC のダイアログは開く"
-        "ときに、その方法が解除する Start (`snapshot.mode=initial`) のチェックを実行し、それらを通過した"
-        "場合にだけ提示します",
-        "その Start がブロックと同じ理由で拒否される場合は、2 つ目の通知なしでブロックを表示してその末尾に"
-        "そこで使える方法を示し、別の理由で拒否される場合 — たとえば継承の子テーブルを持つキャプチャ対象"
-        "テーブルがある、またはその名前のスロットが存在するが使用できない (無効化されたスロットなど) — は、"
-        "その拒否も *{lead}* という前置きに続けて表示します",
-        "それらのチェックがソースを読めない場合、その方法は残り、ダイアログが *{header}* という警告を表示"
-        "します",
-    ),
-}
+# §4.3 keeps the offer's condition (the dialog offers the remedy only when the Start it unlocks
+# would itself pass its checks) and the lead the dialog shows when it is withheld. Which refusal
+# comes first, and the warning for a failed read of those checks, are in the dialog.
 # This step's wording: a block refused for its own reason "shown alone", with no route.
 _STALE_RESNAPSHOT = {
     "en": "If that Start would be refused for the block's own reason, the block is shown alone",
@@ -366,10 +312,10 @@ def test_the_re_snapshot_remedy_is_offered_only_when_its_own_start_passes(
     assert initial[0] == "A replication slot of that name is not usable for CDC"
     assert never[0] == "CDC's replication slot does not exist on the source"
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _RESNAPSHOT[lang]:
-        phrase = phrase.format(lead=lead, header=header)
-        assert _has(lang, cdc, phrase), (lang, phrase)
+    never_started = _route_halves(lang)[0]
+    assert _has(lang, never_started, "**Re-snapshot every table instead**"), lang
+    assert _fact(lang, never_started, "offered-only-when"), lang
+    assert _has(lang, never_started, f"*{lead}*"), lang
     for chapter, phrases in _OFFERED_WHEN.items():
         assert _has(lang, _page(lang, _PAGE[chapter]), phrases[lang]), (lang, chapter)
     assert not _stale(lang, (_STALE_OFFERED[lang], _STALE_RESNAPSHOT[lang])), lang

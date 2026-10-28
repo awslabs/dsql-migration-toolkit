@@ -742,17 +742,16 @@ def _flat(path) -> str:
 
 
 @pytest.mark.parametrize("lang, needles", [
-    ("en", ("never reads a row at a page boundary twice", "held to the source's row count",
-            "a single-precision `FLOAT` part, a one-column key too",
+    # The page-boundary and row-count-hold mechanics are no longer quoted (5.1 says only which
+    # keys fall back to one statement and what that costs).
+    ("en", ("single-precision `FLOAT` part",
             "15-minute no-progress limit", "*orphan check could not run*",
             "**Orphan check ran**", "says there is nothing to backfill",
             "A `TINYINT(1)` key, a boolean on Aurora DSQL, is reconciled too")),
-    ("ko", ("페이지 경계의 행을 두 번 읽지 않습니다", "소스의 행 수에 맞춥니다",
-            "단정밀도 `FLOAT` 부분이 있는 키도 단일 컬럼 키까지", "15분 무진행 한도",
+    ("ko", ("단정밀도 `FLOAT` 부분이 있는 키", "15분 무진행 한도",
             "*orphan check could not run*", "**Orphan check ran**", "채워 넣을 것이 없다고",
             "boolean이 되는 `TINYINT(1)` 키도 대조되며")),
-    ("ja", ("ページ境界の行を二度読むことはありません", "ソースの行数と照合します",
-            "単精度 `FLOAT` の部分を持つキーも", "15 分の無進捗上限",
+    ("ja", ("単精度 `FLOAT` の部分を持つキーも", "15 分の無進捗上限",
             "*orphan check could not run*", "**Orphan check ran**", "埋め戻すものがないと",
             "boolean になる `TINYINT(1)` キーも reconcile され")),
 ])
@@ -764,6 +763,8 @@ def test_the_manual_says_what_g141_changed(lang, needles) -> None:
     for stale in ("`FLOAT`, `TIME` or `BIT` part", "`FLOAT`·`TIME`·`BIT` 부분",
                   "`FLOAT`・`TIME`・`BIT` の部分"):
         assert stale not in validation, (lang, stale)
-    assert "`57P01`–`57P03`" in _flat(f"docs/manual/{lang}/02-evaluation-and-schema-conversion.md")
+    # Chapter 2 no longer quotes the retried SQLSTATEs of the validation count (a user guide
+    # since 2026-10-25); the CHANGELOG records them.
     testing = _flat(f"docs/manual/{lang}/08-testing-and-verification.md")
-    assert "`real`" in testing and "`FLOAT` / `TIME` / `BIT` part is checksummed" not in testing
+    # (chapter 8 is user-level and no longer explains the paging cursors, so `real` is not named)
+    assert "`FLOAT` / `TIME` / `BIT` part is checksummed" not in testing

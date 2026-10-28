@@ -268,10 +268,10 @@ to both stacks. Debezium is open-source software running *on* MSK Connect.
 
 - A source **RDS / Aurora MySQL** *or* **PostgreSQL** with a read-only schema/data user (CDC
   needs replication privileges, and a MySQL Full load + CDC run `RELOAD` unless the source
-  runs `gtid_mode=ON`: [§1.1](docs/manual/en/01-setup.md#11-prerequisites)).
+  runs `gtid_mode=ON`: [§1.6](docs/manual/en/01-setup.md#16-prepare-the-source-for-cdc)).
   **Supported engines/versions** (validated end-to-end): **RDS for MySQL** / **Aurora MySQL**
   5.7 / 8.0 / 8.4 (5.7 is on Extended Support but fully supported as a source), and **RDS for
-  PostgreSQL** / **Aurora PostgreSQL** 13–16 (CDC requires logical replication via `pgoutput`).
+  PostgreSQL** / **Aurora PostgreSQL** 13–18 (CDC requires logical replication via `pgoutput`).
 - A target **Aurora DSQL** cluster in the **same region** (IAM-token auth, no password).
 - **AWS credentials** via the standard chain (env / `~/.aws` / profile) with
   `dsql:DbConnect` (or `dsql:DbConnectAdmin` for the `admin` user). Optionally
@@ -279,8 +279,9 @@ to both stacks. Debezium is open-source software running *on* MSK Connect.
   `bedrock:InvokeModelWithResponseStream` (AI assist).
 - **Local run only:** Python 3.10+ (pinned 3.12) and [`uv`](https://docs.astral.sh/uv/).
 
-> Full checklist incl. source-DB / CDC setup (binlog / logical replication, etc.):
-> [User Manual §1.1](docs/manual/en/01-setup.md).
+> Full checklist: [User Manual §1.1](docs/manual/en/01-setup.md#11-prerequisites);
+> source-DB / CDC setup (binlog / logical replication, etc.):
+> [§1.6](docs/manual/en/01-setup.md#16-prepare-the-source-for-cdc).
 
 ---
 

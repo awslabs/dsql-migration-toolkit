@@ -1111,12 +1111,13 @@ def test_no_code_path_waits_on_a_job_or_claims_a_failure_is_unobservable() -> No
 
 
 def test_the_manual_says_add_first_validate_after_in_three_languages() -> None:
+    # Chapter 2 is a user guide (2026-10-25): the job and constraint columns Aurora DSQL
+    # reports (sys.jobs, convalidated) are in the CHANGELOG, not the manual.
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual"
     needles = {
         "en": {
             "02-evaluation-and-schema-conversion.md": (
-                "**Added first, validated after.**", "without reading a row", "sys.jobs",
-                "convalidated", "**When a validation fails.**", "at most 3,000 rows",
+                "**Added first, validated after.**", "without reading a row", "**When a validation fails.**", "at most 3,000 rows",
                 "**Validate again**", "**Keys counted before they are added.**",
                 "explicit **Apply foreign keys** action"),
             "06-limitations.md": ("stays `NOT VALID`", "**Validate again**"),
@@ -1128,8 +1129,7 @@ def test_the_manual_says_add_first_validate_after_in_three_languages() -> None:
         },
         "ko": {
             "02-evaluation-and-schema-conversion.md": (
-                "**먼저 추가하고, 나중에 검증합니다.**", "행을 하나도 읽지 않고", "sys.jobs",
-                "convalidated", "**검증이 실패하면.**", "최대 3,000행", "**Validate again**",
+                "**먼저 추가하고, 나중에 검증합니다.**", "행을 하나도 읽지 않고", "**검증이 실패하면.**", "최대 3,000행", "**Validate again**",
                 "**추가하기 전에 세는 키.**"),
             "06-limitations.md": ("`NOT VALID`로 남음", "**Validate again**"),
             "10-conclusion.md": ("**외래 키를 적용한 뒤 애플리케이션을 DSQL 엔드포인트로 전환**",),
@@ -1138,8 +1138,7 @@ def test_the_manual_says_add_first_validate_after_in_three_languages() -> None:
         },
         "ja": {
             "02-evaluation-and-schema-conversion.md": (
-                "**先に追加し、後で検証する。**", "行を 1 行も読まずに", "sys.jobs",
-                "convalidated", "**検証が失敗したとき。**", "最大 3,000 行",
+                "**先に追加し、後で検証する。**", "行を 1 行も読まずに", "**検証が失敗したとき。**", "最大 3,000 行",
                 "**Validate again**", "**追加する前に数えるキー。**"),
             "06-limitations.md": ("`NOT VALID` のまま残ります", "**Validate again**"),
             "10-conclusion.md": ("**外部キーを適用してから、アプリケーションを再ポイント**",),

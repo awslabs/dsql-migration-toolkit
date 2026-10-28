@@ -81,12 +81,13 @@ def test_the_unknown_zone_note_no_longer_asserts_daylight_saving() -> None:
 
 _MANUAL = Path(__file__).resolve().parents[1] / "docs" / "manual"
 _SAID = {
-    "en": ("given as a POSIX rule with a daylight-saving part (such as "
-           "`EST5EDT,M3.2.0,M11.1.0`) or as `localtime`", "`TimeZone` with daylight-saving rules"),
-    "ko": ("서머타임 부분이 있는 POSIX 규칙(`EST5EDT,M3.2.0,M11.1.0` 등)이나 `localtime`으로 지정된 "
-           "PostgreSQL `TimeZone`", "서머타임 규칙이 있는 PostgreSQL `TimeZone`"),
-    "ja": ("夏時間の部分を持つ POSIX の規則 (`EST5EDT,M3.2.0,M11.1.0` など) や `localtime` で指定された "
-           "PostgreSQL の `TimeZone`", "夏時間の規則を持つ PostgreSQL の `TimeZone`"),
+    # Chapter 2 is a user guide (2026-10-25): it states the unknown-zone behaviour only.
+    "en": ("When the zone cannot be told, an advisory item says so and the conversion assumes UTC",
+           "`TimeZone` with daylight-saving rules"),
+    "ko": ("시간대를 판별할 수 없으면 권고 항목이 그렇다고 알리며, 변환은 UTC를 가정합니다",
+           "서머타임 규칙이 있는 PostgreSQL `TimeZone`"),
+    "ja": ("タイムゾーンを判別できない場合は、アドバイザリー項目がその旨を伝え、変換は UTC を前提とします",
+           "夏時間の規則を持つ PostgreSQL の `TimeZone`"),
 }
 
 

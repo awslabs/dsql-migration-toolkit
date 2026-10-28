@@ -442,9 +442,9 @@ Column and table exclusion, rebuilt: an excluded column now migrates as **NULL**
 
 ### Upgrade notes
 
-- No CDC redeploy is needed. The next Start CDC removes the 9098 rule from a 0.1.561 stack, and such a stack keeps 0.1.561's capture-list matching until it is deployed again ([details](docs/manual/en/13-excluding-tables-and-columns.md#deployed-cdc-stacks)).
-- A 0.1.561 session's exclusions stay omit-only (target DEFAULT) when rows may already be written; convert them with Change & reload ([how](docs/manual/en/13-excluding-tables-and-columns.md#omit-only-legacy-entries-and-how-to-convert-them)).
-- Downgrading to 0.1.561 starts a fresh session; restore the dropped DEFAULTs at Cut over first ([details](docs/manual/en/13-excluding-tables-and-columns.md#downgrading-to-01561)).
+- No CDC redeploy is needed. The next Start CDC removes the 9098 rule from a 0.1.561 stack, and such a stack keeps 0.1.561's capture-list matching until it is deployed again.
+- A 0.1.561 session's exclusions stay omit-only (target DEFAULT) when rows may already be written; convert them with Change & reload.
+- Downgrading to 0.1.561 starts a fresh session; restore the dropped DEFAULTs at Cut over first.
 - Not exercised live: the compact capture-list form, most capture-list escapes, the PostgreSQL overlay and CDC half, and the S3-backed ledger.
 
 ## v0.1.561

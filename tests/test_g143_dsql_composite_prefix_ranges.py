@@ -460,7 +460,9 @@ def test_the_manual_says_aurora_dsql_pages_a_composite_key_by_prefix_ranges(
     root = Path(__file__).resolve().parents[1] / "docs" / "manual" / lang
     lines = (root / "05-validation.md").read_text(encoding="utf-8").splitlines()
     flat = " ".join(" ".join(line.removeprefix("> ") for line in lines).split())
-    assert named in flat and stale not in flat
-    assert "`k0 = … AND k1 > …`" in flat
+    # Chapter 5 is user-level now and no longer spells out how each side pages a composite key
+    # (`named`, the `k0 = … AND k1 > …` form); the stale row-value-cursor claim must stay out.
+    assert stale not in flat
+    # ...and chapter 8 (user-level in every language) cites no test files.
     catalog = (root / "08-testing-and-verification.md").read_text(encoding="utf-8")
-    assert ("test_g143_dsql_composite_prefix_ranges.py" in catalog) == (lang != "ko")
+    assert "test_g143_dsql_composite_prefix_ranges.py" not in catalog

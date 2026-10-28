@@ -399,11 +399,11 @@ _ORPHAN = {
 @pytest.mark.parametrize("language", ["en", "ko", "ja"])
 def test_the_manual_says_which_keys_are_not_created(language: str) -> None:
     conversion = _chapter(language, "02-evaluation-and-schema-conversion.md")
-    evaluation = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0]
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    evaluation = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + conversion.split("## 2.4", 1)[1]
     assert "`PG_FK_PERIOD`" in evaluation and "`PERIOD`" in evaluation, language
-    reference = conversion.split("## 2.3", 1)[1]
-    assert reference.count("`PG_FK_PERIOD`") >= 2, language  # the constraints note and FK row
-    assert "`PG_FK_NOT_ENFORCED`" in reference, language
+    assert "`PG_FK_NOT_ENFORCED`" in conversion, language
     limits = _chapter(language, "06-limitations.md").split("## 6.1", 1)[1].split("## 6.2", 1)[0]
     assert limits.count("`PG_FK_PERIOD`") >= 2, language
     faq = _chapter(language, "11-customer-faq.md").split(_FAQ_HEAD[language], 1)[1]

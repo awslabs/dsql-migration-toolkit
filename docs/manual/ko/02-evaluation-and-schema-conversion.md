@@ -11,724 +11,687 @@ _언어: [English](../en/02-evaluation-and-schema-conversion.md) | **한국어**
 Connect → [ 1. Evaluation → 2. Schema Conversion ] → 3. Data Migration → 4. Validation → 5. Cut over
 ```
 
-- **Evaluation**은 *"내 소스 데이터베이스(MySQL 또는 PostgreSQL)에서 무엇이 DSQL로 옮겨지고 무엇이 안
-  되며, 각각 작업량은 얼마인가?"* 에 답합니다.
-- **Schema Conversion**은 소스 DDL을 DSQL 호환 DDL로 바꿔 타깃에 적용합니다.
+- **Evaluation**은 *"내 소스 데이터베이스에서 무엇이 Aurora DSQL로 옮겨지고 무엇이 안 되며, 각각
+  작업량은 얼마인가?"* 에 답합니다.
+- **Schema Conversion**은 소스 스키마를 Aurora DSQL DDL로 바꾸고, 그 DDL을 검토·편집할 수 있게 한 뒤
+  타깃에 적용합니다.
 
-소스 엔진이 무엇이든(Aurora MySQL 또는 Aurora PostgreSQL), **이 단계는 DSQL이 받아들이지 않을 것을 —
-단 한 행도 옮기기 전에 — 알게 되는 지점**입니다. 건너뛰지 마세요.
+**가장 짧은 경로:** **Run evaluation** → 준비도 등급과 **Unsupported** 항목
+확인([§2.1](#21-evaluation--호환성-평가)) → 각 항목을 고치거나
+결정([§2.4](#24-evaluation-항목-참조)에 대처 방법) → **Generate DDL for selected** → 검토 후
+**Apply**([§2.2](#22-schema-conversion--dsql-ddl-생성적용)).
+
+두 단계 모두 소스를 읽기만 하며, Schema Conversion은 적용할 때에만 타깃에 씁니다. 소스 엔진이
+무엇이든(MySQL 또는 PostgreSQL), **이 단계는 Aurora DSQL이 받아들이지 않을 것을 단 한 행도 옮기기
+전에 알게 되는 지점입니다.** 건너뛰지 마세요.
+
+단계는 두 소스 엔진에서 같습니다. 서로 다른 곳은 이 장의 짧은 노트나 표가 어떻게 다른지 밝히며,
+[§2.3](#23-타입-매핑-참조)은 각 엔진의 모든 컬럼 타입을 매핑하고, [§2.4](#24-evaluation-항목-참조)는
+항목과 대처 방법을 정리합니다.
 
 ---
 
 ## 2.1 Evaluation — 호환성 평가
 
-**Evaluation**을 실행하면 도구가 **소스**(MySQL 소스의 경우: 테이블, 컬럼, 타입, 기본 키, 인덱스,
-외래 키, 뷰, 트리거, 루틴, `AUTO_INCREMENT`, charset/collation; PostgreSQL 소스의 경우: **모든 비시스템
-스키마**에 걸친 유사 객체 — 스키마로 한정된 테이블 이름, 생성/identity 컬럼과 시퀀스, `REPLICA IDENTITY`
-등이며, 시스템 스키마 `pg_catalog`/`information_schema`/`pg_toast`는 제외)와 **타깃**을
-살펴본(introspect) 뒤 **호환성 평가 리포트**를 만듭니다.
+**Run evaluation**을 클릭하세요. 도구가 소스 스키마(MySQL에서는 Connect에서 지정한 데이터베이스,
+비워 두었다면 모든 데이터베이스; PostgreSQL에서는 연결된 데이터베이스의 모든 비시스템 스키마)와
+타깃에 이미 있는 것을 읽은 뒤 호환성 리포트를 보여 줍니다. 어느 쪽에서도 아무것도 바꾸지 않습니다.
+실행 중에는 테이블마다 진행 상황을 보여 주고, **Cancel evaluation**은 읽고 있는 테이블을 마친 뒤
+실행을 멈추며, 다시 실행하면 성공할 때까지 이전 리포트가 화면에 남습니다. 마이그레이션 사용자에게
+필요한 권한은 [§1.1](01-setup.md#11-사전-요구사항)에 있습니다.
 
-읽기는 읽기 전용·autocommit으로 수행되며, 다른 세션이 잡은 잠금(실행 중인 `ALTER TABLE`)은 최대 5초만 기다리고, 테이블마다 진행 상황을 보고하며, **Cancel evaluation**으로 취소할 수 있습니다. 다시 실행하면 성공할 때까지 이전 리포트가 유지됩니다. MySQL 마이그레이션 사용자는 뷰 정의를 읽으려면 `SHOW VIEW`, 트리거·이벤트·루틴을 나열하려면 `TRIGGER`, `EVENT`, `SHOW_ROUTINE`(또는 `*.*`에 대한 `SELECT`)이 필요합니다. 권한이 없으면 리포트는 해당 객체를 빠뜨리지 않고 나열하지 못한 항목을 알려 줍니다(`SOURCE_VISIBILITY`).
-
-PostgreSQL 소스에서는 Evaluation이 인벤토리에 없는 두 가지도 읽습니다.
-
-- **행 수준 보안(row-level security).** Aurora DSQL에는 이 기능이 없으므로, 행 수준 보안이 켜진 테이블은 **UNSUPPORTED**(`PG_ROW_LEVEL_SECURITY`)로 분류되며, 애플리케이션에서 규칙을 다시 만들 수 있도록 각 정책의 `USING`/`WITH CHECK` 식을 함께 보여 줍니다. 이 항목은 소스 사용자가 모든 행을 읽는지도 알려 줍니다: 슈퍼유저, `BYPASSRLS` 역할, 또는 테이블이 `FORCE ROW LEVEL SECURITY`가 아닐 때의 테이블 소유자입니다. 모든 PostgreSQL 소스 세션은 `pg_dump`처럼 `row_security = off`로 실행되므로, 그 밖의 사용자라면 Full Load와 Validation이 정책이 보여 주는 행만 복사·비교하는 대신 해당 테이블에서 오류로 멈춥니다. Data Migration 사전 점검이 로드 전에 이를 표시합니다(`ROW_SECURITY`).
-- **독립 시퀀스**(어떤 컬럼도 소유하지 않는 시퀀스). Schema Conversion은 이를 만들지 않으므로, 각 시퀀스는 소스의 현재 값 다음부터 이어지는 Aurora DSQL `CREATE SEQUENCE` 문을 담은 **MANUAL** 항목(`PG_STANDALONE_SEQUENCE`)이 됩니다: `CACHE 1`, 또는 소스가 이미 캐시를 쓰면 `CACHE 65536`(Aurora DSQL은 이 둘만 허용)이며, 소스의 범위가 bigint 기본값과 다르면 그 범위를 유지합니다. 컷오버 전에 만들고, 소스 쓰기가 멈추면 `setval`로 소스의 최종 값 다음으로 옮기세요: 도구는 이를 만들지도 동기화하지도 않으며, Cut over 단계가 각각을 실행할 문장과 함께 나열합니다([§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환)).
-
-어느 쪽이든 읽기에 실패하면, 리포트는 없는 것처럼 보이지 않도록 그 사실을 알려 줍니다(`PG_CATALOG_UNREAD`).
-
-Evaluation은 소스의 **서버 설정**도 한 번 읽습니다(설정만 읽으며 테이블은 스캔하지 않습니다). 읽은 설정은 Evaluation 화면의 소스 객체 수 아래(**Source server settings**, 접힌 상태)에 보여 줍니다(내려받는 리포트에는 이 목록이 들어가지 않으며, 설정을 평가하는 각 항목이 그 값을 인용합니다). 이 설정은 테이블 정의에는 드러나지 않는, 애플리케이션이 실행되는 조건을 알려 줍니다.
-
-- **MySQL:** `sql_mode`, `time_zone`, `system_time_zone`, `explicit_defaults_for_timestamp`, `auto_increment_increment`, `auto_increment_offset`, `lower_case_table_names`, `character_set_server`, `collation_server`, `default_collation_for_utf8mb4`, `div_precision_increment`, `group_concat_max_len`의 GLOBAL 값입니다. 애플리케이션 세션은 이 전역 값에서 시작하고, 도구 자신의 세션은 자기 값을 따로 설정하기 때문입니다(아래 참고). 파라미터 그룹의 `init_connect`가 설정하는 `time_zone`이나 `sql_mode`도 `init_connect` 표시와 함께 나열합니다(그 문장 자체는 기록하지 않습니다): `init_connect`는 `CONNECTION_ADMIN`이나 `SUPER`가 없는 사용자 — 애플리케이션 — 의 모든 세션 시작 시 실행되므로, 시간대와 `SQL_MODE`는 전역 값 대신 그 값으로 평가하고, `ZERO_DATES`는 두 모드 중 어느 쪽이든 허용하는 값으로 평가합니다. 세션 자신의 값에서 계산하는 `sql_mode`(`REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', '')`, `CONCAT(@@sql_mode, ',…')`, 단독이거나 `(SELECT …)` 안)는 세션이 받는 대로 전역 값에서 계산하고, 도구가 계산할 수 없는 식은 `SQL_MODE`와 `ZERO_DATES`가 그 식을 밝혀 애플리케이션 사용자로 `SELECT @@SESSION.sql_mode`를 확인하게 합니다. 네 가지는 각각 데이터베이스 수준의 **MANUAL** 항목으로 평가됩니다. `SQL_MODE`: 모드에 `ONLY_FULL_GROUP_BY`가 없거나(그러면 뷰나 쿼리가 `GROUP BY`로 정해지지 않는 컬럼을 선택할 수 있고, Aurora DSQL은 이를 `42803`으로 거부합니다. 뷰라면 Schema Conversion이 적용할 때입니다), `ANSI_QUOTES` / `PIPES_AS_CONCAT`이 있을 때입니다(Query Converter에 붙여 넣는 애플리케이션 SQL은 그 모드로 작성되어 있지만, 변환기는 SQL을 MySQL 기본 모드처럼 읽습니다). `ZERO_DATES`: 날짜 컬럼을 가진 테이블이 있는데 모드가 0이거나 잘못된 날짜를 저장하게 하거나(`NO_ZERO_DATE` 또는 `NO_ZERO_IN_DATE` 없음, strict 모드 없음, 또는 `ALLOW_INVALID_DATES`), 컬럼의 `DEFAULT`가 0 날짜일 때입니다. Aurora DSQL에는 그런 값이 없으므로, 항목은 `DATE`·`DATETIME`·`TIMESTAMP` 컬럼을 나열하고, Full Load와 CDC가 그런 값을 무엇으로 쓰는지 밝히며([§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)), 그런 값을 가진 행을 세는 쿼리를 테이블마다 제시합니다. Evaluation은 행을 읽지 않습니다. `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`: 설정이 `OFF`이면 MySQL은 `NOT NULL`로 선언된 `TIMESTAMP` 컬럼에 NULL을 쓸 때 현재 시각을 저장하는데, Aurora DSQL은 그 쓰기를 거부합니다. 항목이 해당 컬럼을 나열합니다. `AUTO_INCREMENT_STEP`: `auto_increment_increment`가 1보다 크고 `AUTO_INCREMENT` 키를 가진 테이블이 있을 때입니다. Aurora DSQL에서 그 키의 identity는 1씩 증가합니다. 시간대도 PostgreSQL과 마찬가지로 평가됩니다(아래 참고). 나머지 설정(이름의 대소문자 처리, 문자 집합과 collation 기본값, `div_precision_increment`, `group_concat_max_len`)은 기록만 하고 평가하지 않습니다.
-- **PostgreSQL:** 역할에 자기 `TimeZone` 기본값이 없는 새 세션이 연결된 데이터베이스에서 받는 `TimeZone`입니다(DB 또는 DB 클러스터 파라미터 그룹의 값이며, `ALTER DATABASE`나 `ALTER ROLE ALL` 기본값이 있으면 그 값). 도구의 세션은 UTC로 고정되므로 별도의 짧은 연결로 읽습니다. 또한 `ALTER DATABASE`나 `ALTER ROLE`이 그 데이터베이스에 설정한 각 `TimeZone` 기본값도 읽습니다(애플리케이션이 연결하는 역할은 자기 값을 가질 수 있습니다). 마이그레이션 사용자 자신의 `ALTER ROLE` 기본값은 목록에 *the migration user*로 표시되며 소스의 기본값으로 쓰지 않습니다: 그 값이 짧은 연결에서 파라미터 그룹의 값을 가리므로, 그때의 기본값은 `ALTER DATABASE`나 `ALTER ROLE ALL`의 값이고, 둘 다 없으면 판별할 수 없습니다. 시간대는 평가됩니다(아래 참고).
-
-**소스의 시간대** (`SOURCE_TIME_ZONE`). 시계 함수 — MySQL의 `NOW()`, `CURRENT_TIMESTAMP`, `CURDATE()`, 그리고 `timestamp without time zone`이나 `date` 컬럼에 쓰이는 PostgreSQL의 `now()`, `LOCALTIMESTAMP`, `CURRENT_DATE` — 는 세션 시간대의 벽시계를 돌려주고, `DATETIME` / `timestamp` 컬럼은 그 벽시계를 그대로 저장합니다. Full Load와 CDC는 그 값이 어느 시간대로 쓰였든 바꾸지 않고 복사합니다. Aurora DSQL 세션은 다른 시간대를 설정하지 않는 한 UTC로 실행됩니다. 그래서 Evaluation이 읽은 시간대 — MySQL의 `time_zone`(`SYSTEM`은 서버 자체의 시간대, `system_time_zone`. `init_connect`가 설정하면 그 값), PostgreSQL의 `TimeZone` — 가 UTC가 아니면 Schema Conversion은 시계를 읽는 곳에 그 시간대를 써 넣습니다: `DATETIME`(`timestamp without time zone`) 기본값은 `DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`이 되고, `DATE`나 `TIME` 기본값은 그 날짜나 시각이 되고, MySQL `TIMESTAMP` 기본값의 `CURDATE()`는 그 시간대에서 그 날짜가 시작되는 시점(MySQL이 저장하는 값)이 되며, MySQL 뷰의 `NOW()`, `SYSDATE()`, `CURDATE()`, `CURTIME()`은 그 시간대의 시계를 읽습니다. MySQL이 세션 시간대로 읽는 나머지 값도 MySQL 뷰는 그 시간대로 읽으며 — `FROM_UNIXTIME()`, 그리고 `TIMESTAMP` 컬럼의 날짜·시각·텍스트(`DATE()`, `HOUR()`, `DATE_FORMAT()` ...) — 그 시간대의 시계를 `TIMESTAMP` 컬럼과 비교할 때는 그 시간대에서 가리키는 시점으로 비교하므로(둘을 함께 담는 `UNION` 컬럼은 MySQL의 `DATETIME`처럼 그 시간대의 벽시계입니다), `ts > NOW() - INTERVAL 1 DAY`는 Aurora DSQL 세션이 어느 시간대로 실행되든 MySQL에서와 같은 행을 돌려줍니다(`ts`를 다른 뷰를 거쳐 읽어도 마찬가지입니다). `TIMESTAMP`를 `DATETIME` 컬럼이나 날짜 문자열과 비교하는 경우는 여전히 세션의 시간대로 비교됩니다. `+09:00` 같은 고정 오프셋은 UTC 시계에 오프셋을 더한 `(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`으로 씁니다: 시간대 이름으로 쓰면 `'+09:00'`은 POSIX 부호로 읽혀 UTC보다 9시간 서쪽이 됩니다. tzdata가 링크로 정의한 시간대 이름 — RDS와 Aurora MySQL의 `time_zone` 파라미터가 제공하는 이름 중 `US/Eastern`, `Asia/Calcutta` 등, 또는 `Japan` — 은 링크가 가리키는 시간대(`America/New_York`, `Asia/Kolkata`, `Asia/Tokyo`)로 씁니다. 같은 시간대를 모든 PostgreSQL 빌드가 가진 이름으로 쓰는 것입니다: 빌드에 따라 그런 링크가 빠져 있을 수 있고(Debian 기반 PostgreSQL 16·17 이미지는 `US/Eastern`을 모릅니다), 빌드가 모르는 시간대 이름을 쓴 기본값이나 뷰는 오류 없이 만들어진 뒤 행이 그 기본값을 받거나 뷰를 읽을 때에야 실패합니다. 항목은 소스 자신의 이름을 인용하고 그렇게 쓴다고 알려 줍니다. `TIMESTAMP`(`timestamptz`) 컬럼은 시점(instant)을 담으므로 `now()`를 유지하고, `UTC_TIMESTAMP()` / `UTC_DATE()`는 UTC 그대로입니다. PostgreSQL 뷰는 PostgreSQL이 deparse한 그대로 가져오므로, 항목은 시계를 읽는 뷰를 검토할 수 있도록 나열합니다. PostgreSQL의 시계 기본값은 시계 자체이거나, 날짜·시각 타입으로 캐스팅한 시계이거나, 그런 시계의 `date_trunc`이면 그 시간대로 쓰이고, 그대로 가져오는 시계 기본값 — `now() + '1 day'::interval` 같은 시계 산술이나 `date_trunc(…, now(), zone)` — 은 같은 방식으로 나열합니다. 항목(**MANUAL**)은 해당 컬럼과 뷰, 그리고 애플리케이션이 할 일을 알려 줍니다: 애플리케이션이 세션 시간대에 의존한다면 — 그런 컬럼에 `NOW()`나 `CURRENT_DATE`를 쓰거나 그런 컬럼과 비교한다면 — 새 Aurora DSQL 연결마다 `SET TIME ZONE 'Asia/Seoul'`을 실행하거나(Aurora DSQL에서 허용됩니다) SQL에 시간대를 직접 씁니다. 판별할 수 없는 시간대 — `KST` 같은 약어로만 보고되는 `SYSTEM`, 서머타임 부분이 있는 POSIX 규칙(`EST5EDT,M3.2.0,M11.1.0` 등)이나 `localtime`으로 지정된 PostgreSQL `TimeZone`, `ALTER DATABASE` / `ALTER ROLE` 기본값은 읽었지만 짧은 연결로는 읽지 못한 `TimeZone`, 마이그레이션 사용자 자신의 `ALTER ROLE` 기본값이 가린 `TimeZone` — 는 권고 항목으로 그렇다고 알리며, 변환은 UTC 소스와 마찬가지로 UTC를 가정합니다. UTC인 PostgreSQL 소스라도 다른 시간대의 `TimeZone` 기본값을 가진 역할이 있으면 그 역할을 짚는 권고 항목이 나옵니다. 아무것도 읽지 못했다면 항목은 표시되지 않으며, 이때도 변환은 UTC를 가정합니다.
-
-어느 쪽의 읽기도 애플리케이션이 스스로 설정하는 값은 볼 수 없습니다: 세션의 `SET`(`SET sql_mode`, `SET time_zone`, `SET TIME ZONE`), 또는 드라이버나 연결 문자열이 연결할 때 보내는 옵션입니다. 읽기에 실패하면 목록이 비어 있을 뿐이며, Evaluation이 실패하지는 않습니다.
-
-도구 자신의 MySQL 소스 세션은 자체 `sql_mode`로 읽습니다: 각 세션은 연결할 때 `SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'`를 실행합니다. 이는 세션 설정이며 소스에는 아무것도 쓰지 않습니다. 이 설정 덕분에 파라미터 그룹의 `sql_mode`가 도구가 읽는 내용을 바꾸지 못합니다: 예를 들어 `ANSI_QUOTES`에서는 `SHOW CREATE`가 뷰 본문의 식별자를 큰따옴표로 출력하는데, 변환은 이를 문자열로 읽게 됩니다. `ALLOW_INVALID_DATES`는 SQL 해석을 바꾸지 않습니다. 도구의 읽기가 그 달에 없는 날로 저장된 날짜(`2024-02-31`)를 가리킬 수 있게 할 뿐인데, MySQL 8.0 이상은 이 설정이 없으면 그런 날짜를 거부하므로(오류 `1525`), 기본 키에 그런 날짜가 있는 테이블도 페이지 단위로 읽을 수 있습니다.
+Evaluation은 소스의 **서버 설정**도 한 번 읽습니다(설정만 읽으며 테이블은 스캔하지 않습니다). 읽은
+설정은 Evaluation 화면의 소스 객체 수 아래(**Source server settings**, 접힌 상태)에 보여
+줍니다(내려받는 리포트에는 이 목록이 들어가지 않으며, 설정을 평가하는 각 항목이 그 값을 인용합니다).
+이 설정은 테이블 정의에는 드러나지 않는, 애플리케이션이 실행되는 조건을 알려 줍니다: 시계 함수가
+읽는 시간대와, MySQL에서는 `sql_mode`입니다. 이를테면 이 모드는 Aurora DSQL에 해당하는 값이 없는 0
+날짜를 소스가 담을 수 있는지를 정합니다(`ZERO_DATES`,
+[§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)). 이 읽기로는 애플리케이션이 스스로 설정하는
+값, 즉 세션의 `SET`(`SET sql_mode`, `SET TIME ZONE`)이나 드라이버가 연결할 때 보내는 옵션을 볼 수
+없으므로 그런 값은 직접 확인하세요. 평가되는 설정이 여러분에게 무엇을 뜻하는지는 아래
+[소스 시간대와 서버 설정](#소스-시간대와-서버-설정)에서 설명합니다.
 
 ### 모든 객체가 하나의 분류를 받음
 
-| 분류 | 의미 | 예시 |
+Evaluation이 평가하는 각 객체는 세 가지 분류 중 하나를 받습니다. 화면에는 레이블이, 내보낸
+리포트에는 괄호 안의 값이 나옵니다.
+
+| 분류 | 의미 | 할 일 |
 |---|---|---|
-| **AUTO** | 자동 변환, 사람 개입 없음. | 매핑 가능한 타입과 PK를 가진 일반 테이블/컬럼; **외래 키**(자동 변환, `RECOMMENDED`로 표시 — 아래 참고); 다중 데이터베이스 MySQL 소스(각 데이터베이스가 자체 스키마가 되며 `RECOMMENDED`로 표시); 같은 스키마의 다른 테이블·뷰·인덱스도 쓰는 인덱스 이름(인덱스가 자동으로 이름이 바뀌며 `RECOMMENDED`로 표시). |
-| **MANUAL** | 변환되지만 결정이나 앱 측 변경 필요. | 대소문자 무시 collation, FULLTEXT/SPATIAL 인덱스(생성하지 않음: 그 검색은 데이터베이스 밖으로), 초대형 LOB·JSON 컬럼, `ENUM`/`SET`, 생성 컬럼, `ON UPDATE` 타임스탬프, 공간/geometry 타입, CDC가 복제할 수 없는 `CASCADE`/`SET NULL` 동작이 있는 외래 키, `bytea` 컬럼이나 Aurora DSQL이 인덱싱할 수 없는 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 보조 인덱스(생성되지 않으며 UNIQUE 인덱스는 유일성 보장을 잃음), PostgreSQL의 btree가 아닌 인덱스(btree로 생성)와 조건식이 타입이 바뀌는 컬럼을 읽는 부분 인덱스(다른 부분 인덱스는 `WHERE`를 유지), PostgreSQL `EXCLUDE` 제약(생성하지 않으며, 그것을 강제하던 인덱스도 생성하지 않음: `PG_EXCLUSION_CONSTRAINT`), `WITHOUT OVERLAPS`로 선언한 PostgreSQL 18 키(일반 키로 생성: `PG_TEMPORAL_KEY`)와 `PERIOD`로 선언한 PostgreSQL 18 외래 키(생성하지 않음: `PG_FK_PERIOD`), `DEFERRABLE`로 선언한 PostgreSQL 기본 키나 `UNIQUE` 제약(Aurora DSQL이 즉시 검사하는 일반 키로 생성: `PG_DEFERRABLE_KEY`), 정밀도를 선언하지 않은 PostgreSQL `numeric`(`numeric(18,6)`으로 저장), 소스가 정의를 돌려주지 않은 뷰, 소스 사용자가 나열할 수 없는 객체(`SOURCE_VISIBILITY`), 어떤 컬럼도 소유하지 않는 PostgreSQL 시퀀스(`PG_STANDALONE_SEQUENCE`). |
-| **UNSUPPORTED** | 자동 변환 불가 — 재설계 필요. | 트리거, 저장 프로시저/함수, 스케줄 이벤트, PK 없는 테이블, `bytea` 컬럼(`BINARY`/`VARBINARY`/`BLOB`, PostgreSQL `bytea`)이나 PostgreSQL `json`/`jsonb`/`interval`/`time with time zone` 컬럼의 기본 키, 63바이트로 잘리면 충돌하는 이름(한 테이블의 두 컬럼, 또는 한 스키마의 두 테이블/뷰), `DECIMAL` 정밀도 > 1000, 테이블당 컬럼 > 255, 타깃 데이터베이스의 테이블 1,000개·스키마 10개·뷰 5,000개 초과(클러스터에 이미 있는 것 포함), PostgreSQL 테이블의 행 수준 보안(`PG_ROW_LEVEL_SECURITY`). |
+| **Automatic** (`AUTO`) | 아무 조치 없이 변환됩니다. 기본 키가 있는 일반 테이블이 그렇습니다. | 없음. |
+| **Review needed** (`MANUAL`) | 변환되지만 무언가를 잃거나 다르게 동작합니다: 버려지는 대소문자 무시 collation, `ENUM`, 큰 LOB나 JSON 컬럼, `ON UPDATE` 타임스탬프. | 결정하세요: 그대로 받아들이거나, Schema Conversion에서 타깃 DDL을 바꾸거나, 컷오버 전에 애플리케이션을 바꿉니다. |
+| **Unsupported** (`UNSUPPORTED`) | 그대로는 옮길 수 없습니다: 기본 키가 없는 테이블, 트리거·루틴·이벤트, 바이너리 컬럼의 기본 키, Aurora DSQL 데이터베이스 하나가 담을 수 있는 것보다 많은 객체. | 마이그레이션하기 전에 소스를 바꾸거나, 그 객체를 데이터베이스 밖에서 다시 만드세요. |
 
-위 예시는 대부분 MySQL 소스를 기준으로 한 것입니다. **PostgreSQL 소스**에도 같은 척도가 적용됩니다: 미지원 PG
-컬럼 타입 — 배열(`[]`), geometric(`point`/`line`/`box`/…), network(`inet`/`cidr`/`macaddr`/`macaddr8`),
-`xml`, `money`, `bit`/`bit varying`/`varbit`, `tsvector`/`tsquery`, range + multirange, `pgvector`,
-`enum`, composite — 은 조용히 옮겨지지 않습니다: 값을 보존하는 대체 타입이 있으면(배열은 `jsonb`, range·network·
-`xml`·geometric·bit·텍스트 검색 타입은 `text`, `money`는 `numeric(23,4)`, enum은 `CHECK`가 붙은 `text`)
-Schema Conversion이 경고와 함께 생성하고 테이블은 **MANUAL**, 대체 타입이 없는 타입(composite, domain,
-`pgvector`)은 **UNSUPPORTED**입니다. 구조적
-게이트(PK 없음, `numeric` 정밀도 > 1000, 키 컬럼 > 8개 등)도 PostgreSQL 소스에 동일하게 적용됩니다.
+항목은 **Recommended** 노트일 수도 있습니다. 이때 변환은 완전하고 정확하며, 노트는 Aurora DSQL에서
+잘 돌리기 위한 조언입니다: 무시하면 성능을 잃지만 정확성은 잃지 않고, 객체의 작업량이나 준비도
+점수에도 아무것도 더하지 않습니다. 가장 자주 보게 되는 두 가지는 계속 값을 생성하는 생성
+키([기본 키 전략 선택](#기본-키-전략-선택))와 보존되는 외래 키([외래 키](#외래-키))입니다.
 
-분류되지 않는 객체는 없습니다 — 어떤 규칙에도 걸리지 않으면 기본 **AUTO**. 한 객체에 여러 규칙이
-걸리면 **가장 엄격한** 분류가 우선합니다(`UNSUPPORTED` > `MANUAL` > `AUTO`). 걸린 모든 규칙의
-사유·권장사항이 합쳐지므로 어떤 발견도 가려지지 않습니다.
+객체는 자기 항목 중 가장 엄격한 분류를 받으며(**Recommended** 노트는 세지 않습니다), 모든 항목이 그
+객체 아래에 나열됩니다. 어떤 규칙에도 걸리지 않는 객체는 **Automatic**입니다.
 
-### 갭(gap)과 권장사항(recommendation)
+### 리포트 읽기
 
-모든 발견이 문제인 것은 아닙니다. 발견은 다음 두 가지 중 하나이고, 리포트가 어느 쪽인지 표시합니다:
+리포트는 위에서 아래로 읽습니다:
 
-- **갭** — 옮기지 못했거나 의미가 바뀐 것(유실된 collation, 재현할 수 없는 `ON UPDATE` 타임스탬프 등).
-  어떻게 처리할지 결정해야 합니다.
-- **권장사항**(`RECOMMENDED`, info-blue) — 변환은 완전하고 정확합니다. DSQL에서 *잘 돌리기* 위한
-  조언이며, 무시하면 성능을 잃지만 정확성은 잃지 않습니다.
+- **Migration readiness**는 객체별 작업을 0~100으로 평가하고 등급을 매깁니다.
+- **Compatibility by object kind**는 종류마다 **Automatic**, **Review needed**, **Unsupported** 객체
+  수를 셉니다.
+- **Objects by importance (most critical first)** 목록은 모든 객체를 종류별로 묶어 나열합니다.
+  객체를 펼치면 항목마다 **Risk**(플래그된 이유. 조언이면 **Note**)와 **Recommendation**(할 일)이,
+  그리고 객체의 작업량(**Simple (< 2h)**, **Medium (2–6h)**, **Significant (> 6h)** 중 하나)이
+  보입니다. **Classification**·**Estimated manual effort** 필터로 목록을 좁힐 수 있고, 검색 상자는
+  객체 이름이나 규칙 id에 맞춰집니다.
+- **Target analysis (Aurora DSQL)** 섹션은 타깃에 이미 있는
+  객체(**Objects already exist on target**)와 그곳에서 다른 객체가 차지한
+  이름(**Names held on the target by another object**)을 나열하므로, 적용이 예기치 않은 충돌로
+  도중에 실패하지 않습니다. 각각을 건너뛸지 교체할지는 적용할 때
+  선택합니다([검토, 편집, 적용](#검토-편집-적용)).
+- **Export:** **HTML**, **JSON**, **Text** 리포트에는 모든 객체와 타깃 분석이 들어 있습니다. 이
+  리포트는 결정론적이며 AI 출력을 담지 않습니다.
 
-대표적인 권장사항은 생성되는 키 — MySQL `AUTO_INCREMENT`, 또는 PostgreSQL `serial`/`IDENTITY` 키 —
-이며, Schema Conversion은 기본적으로 이 키가 계속 값을 생성하게 합니다: 단일 컬럼 정수 키는 캐시된
-identity(`bigint GENERATED BY DEFAULT AS IDENTITY (CACHE 65536)`; Aurora DSQL은 identity를 `bigint`에만
-허용)가 됩니다. Full Load는 소스의 id를 그대로 쓰고, 시퀀스는 적재 후와 컷오버 때 그 값 다음으로
-옮겨집니다(뒤로 되돌리지 않음). 값에는 빈틈이 생기고 순서가 느슨해지며, identity가 재현하지 않는 MySQL
-insert 관용구가 세 가지 있습니다: 키에 명시적 `NULL`이나 `0` 넣기, `LAST_INSERT_ID()`(`RETURNING` 사용),
-애플리케이션이 직접 지정한 id(시퀀스를 진행시키지 않음). 타깃에서 아무것도 생성하지 않는 키는 권장사항이
-아니라 **갭**이며 작업량에 포함됩니다: MySQL `bigint unsigned` 키(`bigint`보다 넓어 기본값으로 유지), 복합
-기본 키에 속한 키 컬럼, 정수가 아닌 키는 일반 값으로 남아 애플리케이션이 insert마다 값을 지정해야 합니다. 그 밖에
-UUID/랜덤 키는 **insert 처리량**을 얻기 위한 선택입니다 — DSQL은 행을 기본 키 순서로 저장하므로 단조
-증가 키는 쓰기를 한 파티션에 집중시킵니다
-([7장 §7.1](07-performance-and-tuning.md#기본-키-전략--핫-파티션-회피) 참고).
-
-**외래 키**는 또 다른 권장사항입니다. Aurora DSQL은 외래 키를 **강제(enforce)**하므로 각 FK는 깨끗하게
-변환·보존되며 — 갭이 아니라 **필요 작업 없음(no required effort)**으로 `RECOMMENDED` 표시됩니다. 노트에는
-함께 따져볼 런타임 주의점이 담깁니다: 참조/피참조 테이블에 대한 DML은 **추가 읽기**를 유발하고(AWS는
-추가 전 벤치마크를 권장), 동시 충돌은 재시도 가능한 직렬화 오류(`SQLSTATE 40001`)이며,
-`CASCADE`/`SET NULL`/`SET DEFAULT` 동작은 DSQL의 트랜잭션당 3,000행 한도에 포함됩니다(3,000행을 넘겨
-건드리는 cascade는 실패) — 그러므로 자식 카디널리티가 무제한인 곳에서는 `NO ACTION`/`RESTRICT`를
-선호하세요. cascade 동작은 CDC로도 살아남지 못하며([6장 §6.2](06-limitations.md#62-마이그레이션-프로세스-한계)
-참고), 이것이 Evaluation이 여전히 **MANUAL**로 표시하는 유일한 경우입니다.
-
-PostgreSQL 외래 키는 `MATCH FULL`과 `DEFERRABLE` / `INITIALLY DEFERRED`를 유지하며(Aurora DSQL은
-둘 다 받아들이고, 지연된 키는 소스처럼 커밋 시점에 검사합니다), `ON DELETE SET NULL (…)` /
-`SET DEFAULT (…)`의 컬럼 목록(PostgreSQL 15+)도 유지하므로 부모 행을 삭제하면 Aurora DSQL에서도
-나열된 컬럼만 NULL(또는 기본값)로 설정됩니다. 결과에는 이를 선언한 키가 하나하나 표시됩니다.
-`NOT ENFORCED`로 선언한 PostgreSQL 18 키는 생성하지 않습니다: 소스는 그 키를 검사하지
-않는데, `NOT ENFORCED`가 없는 Aurora DSQL은 소스가 받아들이는 쓰기를 거부하게 되기 때문입니다. 이것도
-권장사항입니다(`PG_FK_NOT_ENFORCED`, `RECOMMENDED`). Aurora DSQL이 그런 키를 강제하게 하려면(Aurora
-DSQL에 그런 형태가 없는 `PERIOD`로 선언한 키는 제외) 그 키의 `ALTER TABLE … ADD CONSTRAINT … NOT VALID`를
-테이블의 대상 스크립트에 추가하세요. 반면 `DEFERRABLE`로
-선언한 기본 키나 `UNIQUE` 제약은 갭입니다(`PG_DEFERRABLE_KEY`, **MANUAL**): Aurora DSQL은 지연 가능한
-유니크 키를 지원하지 않으므로, 즉시 검사되는 일반 키로 생성됩니다
-([§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참고). CDC를 쓰면 `DEFERRABLE` 기본 키는 `REPLICA IDENTITY`도
-되지 못하므로, `REPLICA IDENTITY DEFAULT`인 테이블은 소스에서 그 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을
-`REPLICA IDENTITY FULL`로 설정할 때까지 CDC 사전 요구사항 검사가 실패로 판정합니다. `PERIOD`로 선언한 PostgreSQL 18 키(`FOREIGN KEY
-(…, PERIOD p) REFERENCES …`)는 생성하지 않으며 이것도 갭입니다(`PG_FK_PERIOD`, **MANUAL**): Aurora
-DSQL에는 `PERIOD`가 없고 같은 컬럼의 일반 키는 같은 기간을 요구하므로, 컷오버 후에는 부모의 기간이 각
-자식 행의 기간을 덮는지 아무것도 검사하지 않습니다.
-
-권장사항은 선택이므로 **객체의 예상 작업량(effort)에 반영되지 않습니다** — 그러지 않으면 계속 값을 생성하는
-키를 가진 거의 모든 테이블이 그 키 하나 때문에 `MEDIUM`으로 부풀려집니다. 조언을 채택할 때의
-비용은 항목에 그대로 표시되므로("effort if you take it") 판단에 필요한 정보는 유지됩니다.
-
-> **Identity 키와 적재된 행.** 키가 캐시된 identity(`GENERATED BY DEFAULT AS IDENTITY`)일 때마다 —
-> `bigint`가 담을 수 있는 MySQL `AUTO_INCREMENT` 또는 PostgreSQL `serial`/`IDENTITY` 키의
-> 기본값 — Full Load가 완료되면 툴이 그 시퀀스를 적재된
-> 행보다 앞으로 전진시키고 활동 로그에 기록합니다(`identity sequences synced … RESTART WITH
-> <max(pk)+1>`).
->
-> 이건 부수적인 처리가 아닙니다. `BY DEFAULT`는 적재가 소스의 원래 키 값을 쓸 수 있게 해 주는 것인데,
-> **명시적으로 지정된 값은 시퀀스를 전진시키지 않습니다.** 그래서 이 단계가 없으면 시퀀스는 시작점에 그대로
-> 남아 있고 그 값들은 이미 점유돼 있어서, **cut-over 후 애플리케이션의 첫 INSERT가** 중복 키로 실패합니다.
-> 그 상태에서도 행 수와 체크섬은 일치하므로 **Validation은 깨끗하게 통과하고**, 소스를 이미 정지시킨
-> 뒤에야 문제가 드러납니다.
->
-> **완전히 끝난** 적재 후에만 실행됩니다: `MAX(pk)`가 시퀀스가 넘어서야 할 값이므로, 부분 적재에서 동기화하면
-> 아직 들어올 행과 충돌이 남을 수 있습니다. 적재를 완료시키는 재시도는 동기화를 수행합니다. 일반 정수 키
-> (Keep source PK, 복합 키, `bigint unsigned` 키)를 쓰는 테이블은 시퀀스가 없으므로 건드리지 않습니다. 시퀀스는
-> 소스 자체의 카운터 너머로도 옮겨지므로, 소스가 발급했다가 삭제한 id가 다시 발급되지 않습니다.
-
-
-### 각 리포트 항목이 알려 주는 것
-
-평가된 객체마다 다음을 제공합니다:
-
-- **분류**(AUTO / MANUAL / UNSUPPORTED),
-- **위험 설명** — *왜* 플래그됐는지(예: "Aurora DSQL은 트리거를 지원하지 않음"),
-- **권장 조치** — *무엇을 해야 하는지*(예: "이 로직을 애플리케이션 계층에서 재구현"),
-- 자동이 아닌 항목의 경우 **작업량 추정**(SCT 스타일 등급 구간(bucket): simple / medium / significant 등).
-
-리포트는 이를 **요약**으로 집계합니다: 분류별·작업량별 개수 — 스키마의 마이그레이션 용이성을 한눈에
-보여 줍니다.
-
-화면의 목록은 객체를 종류별로, 가장 중요한 것부터 보여 줍니다. 처리할 작업이 있는 종류는 펼쳐진 채로
-열리고, 종류마다 객체를 한 번에 50개씩 페이지 컨트롤과 함께 보여 주며, 객체의 위험과 권장 조치는 그
-행을 펼칠 때 나타납니다. **Classification**·**Estimated manual effort** 필터와 검색 상자로 목록을 좁힐 수
-있습니다. 검색 상자는 객체 이름이나 결과의 규칙에 맞춰집니다(`BYTEA_KEY`를 입력하면 한 가지 수정이 적용되는
-모든 테이블이 나옵니다). HTML·JSON·Text 내보내기에는 항상 모든 객체가 들어 있고, 맨 앞에
-무엇을 담은 보고서인지가 나옵니다: 소스(엔진과 주소, 자격 증명은 절대 없음), 타깃 엔드포인트, 내보낸 시각(앱이
-마지막으로 시작된 뒤 실행한 평가라면 실행 시각도), 도구 버전, 준비도 등급과 그 개수, 작업량 등급의 의미. 타깃에 이미 있거나 다른 객체가 점유한
-이름도 함께 나옵니다. 파일 이름에는 데이터베이스(또는 호스트)와 내보낸 시각이 들어가므로 두 번 내보내도
-서로 덮어쓰지 않습니다.
-
-### 마이그레이션 준비도 점수
-
-리포트 맨 위 카드는 객체별 작업을 0~100으로 평가합니다. AUTO 객체는 비용이 0이고, 그 외 객체는 작업량
-가중치만큼 비용이 듭니다(simple 1, medium 3, significant 7; 추정치가 없는 UNSUPPORTED 객체는
-significant로 계산). 권장사항은 비용이 없습니다. 점수는 100에서 최악의 경우(모든 객체가 significant)
-대비 그 비용의 비율을 뺀 값이며, 작업이 필요한 객체가 하나라도 있으면 100이 되지 않습니다. 데이터베이스
-단위 한도 항목은 점수에 넣지 않고 등급을 정하는 데만 씁니다.
-
-등급은 blocker가 먼저 정하므로, 큰 소스라도 blocker가 평균에 묻히지 않습니다:
+**준비도 점수.** **Automatic** 객체는 비용이 0이고, 그 외 객체는 작업량 가중치만큼 비용이
+듭니다(Simple 1, Medium 3, Significant 7; 추정치가 없는 **Unsupported** 객체는 Significant로 계산).
+**Recommended** 노트는 비용이 없습니다. 점수는 100에서 최악의 경우 대비 그 비용의 비율을 뺀 값이며,
+작업이 필요한 객체가 하나라도 있으면 100이 되지 않습니다. 이 점수는 작업의 순위를 정하고 계획하는 데
+쓰고, 소요 시간 추정으로 쓰지는 마세요. 등급은 blocker가 먼저 정하므로, 큰 소스라도 blocker가 평균에
+묻히지 않습니다:
 
 | 등급 | 조건 |
 |---|---|
 | **Blocked** (빨강) | 마이그레이션이 Aurora DSQL 데이터베이스 한도를 넘음: 한 데이터베이스에 테이블 1,000개, 스키마 10개 또는 뷰 5,000개 초과(타깃 클러스터에 이미 있는 것 포함). 해결하기 전에는 다른 것이 의미가 없으므로 점수와 관계없이 이 등급이 됩니다. |
-| **Unsupported objects** (앰버) | UNSUPPORTED 객체가 하나 이상 있고, 점수만으로는 Ready 또는 Low effort인 경우. (점수가 더 낮으면 아래 작업량 등급이 그대로 유지됩니다.) |
-| **Ready** / **Low effort** (초록) | 점수 ≥ 90 / ≥ 70이고 UNSUPPORTED 객체가 없음. |
+| **Unsupported objects** (앰버) | **Unsupported** 객체가 하나 이상 있고, 점수만으로는 Ready 또는 Low effort인 경우. (점수가 더 낮으면 아래 작업량 등급이 그대로 유지됩니다.) |
+| **Ready** / **Low effort** (초록) | 점수 ≥ 90 / ≥ 70이고 **Unsupported** 객체가 없음. |
 | **Moderate effort** / **Significant effort** (앰버) | 점수 ≥ 45 / ≥ 1. |
 | **High effort** (빨강) | 점수 0. |
-
-### 타깃 이름 충돌 감지 (적용 전에)
-
-Evaluation은 **타깃**도 검사합니다: 만들려는 객체가 DSQL에 이미 존재하면 그 충돌을 **지금** 드러내,
-Schema Conversion의 적용 단계가 예기치 않은 충돌로 도중에 실패하지 않게 합니다. **SKIP**할지
-**REPLACE**할지 미리 결정합니다.
-
-### 선택적 AI 어시스트 (Amazon Bedrock) — 무엇이고, 무엇을 할 수 있고, 어떻게 켜나
-
-AI 어시스트는 **옵트인·기본 꺼짐** 보강 기능으로, **Amazon Bedrock**을 사용해 변환의 *사람 판단*
-부분을 돕습니다. 이 도구가 LLM을 호출하는 유일한 지점이므로, 무엇을 하고, 무엇이 허용되며, 무엇에는
-절대 닿지 않는지를 정확히 알아 둘 가치가 있습니다. 그래서 여기서 전부 다룹니다.
-
-**켰을 때 하는 일:**
-
-- **Evaluation**에서 **전략 서술**을 추가(스키마가 얼마나 마이그레이션 가능한지, 작업이 어디 있는지를
-  쉬운 말로 설명).
-- **Schema Conversion**에서 결정론적 변환기가 플래그한 어려운 `MANUAL` / `UNSUPPORTED` 항목에 대해
-  **변환 제안**을 제시(예: 미지원 구조를 어떻게 바꿀지).
-
-**절대 하지 않는 일 (안전 모델):**
-
-- **결정론적 경로를 대체하지 않음.** 결정론적 소스→DSQL 변환기가 항상 먼저 돌고(MySQL 소스는
-  `sqlglot`, PostgreSQL 소스는 PG→DSQL 변환기), AI는 그것을 *보강*만 합니다. AI를 끄면(기본값)
-  워크플로는 동일하게 동작합니다.
-- **모든 제안은 검토 전용입니다.** 제안이 타깃 스키마에 반영되는 것은 **명시적으로 승인한 뒤에만**
-  가능합니다. 대기 중이거나, 수정만 하고 승인하지 않았거나, 거부한 제안은 모두 적용 경로에서
-  제외됩니다(엄격한 사람 검토 게이트). 승인 전에 제안을 편집할 수도 있습니다.
-- **AI는 데이터 경로에 절대 없음.** 설계 시점의 스키마/전략만 돕고, Full Load·CDC의 **행 데이터**는
-  보지도 건드리지도 않습니다.
-- **소스/타깃 데이터를 보내지 않음.** 제안은 행 값이 아니라 스키마/DDL 메타데이터로 만들어집니다.
-
-**권한 / 배포 모델:**
-
-- **AI 백엔드는 Amazon Bedrock뿐이며, 직접 API 키 입력은 없습니다.** 이 도구에는
-  **Anthropic/OpenAI(또는 그 외) API 키 입력란이 없습니다.** AI는 *오직* Bedrock을 통해서만, AWS
-  자격증명으로 인증해 동작합니다. 덕분에 AI도 나머지 기능과 동일한 IAM/자격증명 모델을 그대로
-  따르며, 별도로 저장할 시크릿이 없습니다.
-- AI 어시스트는 **`bedrock:InvokeModel`** 과 **`bedrock:InvokeModelWithResponseStream`**(채팅이 답을 스트리밍)으로만
-  Bedrock을 호출합니다 — 그 외엔 없습니다.
-  **도구의 나머지와 동일한 자격증명**(Connect에서 선택한 AWS 프로필, 또는 환경/역할 자격증명 체인)을
-  사용합니다.
-- **로컬 실행:** 자격증명 체인이 선택 모델에 대해 두 동작을 모두 허용해야 하고, 그 모델이
-  **AWS 계정에서 활성화**되어 있어야 합니다(아래 *모델 액세스* 참조).
-- **Fargate 배포:** AI 어시스트는 **`EnableAiAssist=true`로 배포하지 않으면 꺼져 있습니다.** 이 값을
-  켜면 태스크 역할에 두 동작이 **`anthropic.` 공급자로 범위를 제한해** 부여됩니다: 계정의 모든 Anthropic 파운데이션
-  모델과 리전 간 추론 프로필이므로, 재배포 없이 Model ID를 Anthropic 모델 사이에서 바꿀 수 있습니다(`*` 전체나 다른
-  공급자는 절대 아님). `BedrockModelArns`는 **선택 사항**이며 그 범위를 특정 ARN으로 좁히거나 Anthropic이 아닌
-  모델을 허용할 때 사용합니다. `BedrockRegion`도 설정해야 하고, 태스크의 아웃바운드
-  트래픽(egress)이 Bedrock 런타임 엔드포인트에 도달할 수 있어야 합니다(NAT 또는 Bedrock VPC 엔드포인트).
-  [`deploy/DEPLOYMENT.md`: "Enable AI-assisted conversion (optional)"](../../../deploy/DEPLOYMENT.md) 참조.
-- **모델:** 기본은 `global.anthropic.claude-sonnet-5`(범용·비용 효율 선택). `BedrockModelId`(배포) 또는
-  Connect 화면의 Bedrock 설정에서 변경.
-- **모델 액세스(AWS 계정당 한 번):** Bedrock의 Anthropic 모델은 계정별로 AWS Marketplace 구독 — 즉
-  모델의 *약관(agreement)* — 을 통해 활성화됩니다. 계정에서 모델을 처음 호출하면 그 구독이
-  백그라운드에서 시작되며, 구독이 결국 실패하더라도 최대 약 15분 동안은 호출이 성공할 수 있습니다.
-  호출자에게 `aws-marketplace:Subscribe` / `aws-marketplace:Unsubscribe` /
-  `aws-marketplace:ViewSubscriptions` 권한이 없거나, 계정(또는 그 AWS Organization)에 대해 Anthropic의
-  1회성 최초 사용(first-time use) 양식이 제출되지 않았거나, 계정에 유효한 결제 수단이 없으면 구독이
-  실패합니다. Bedrock의 거부가 모델의 AWS Marketplace 구독에 관한 것이면 도구는 *the configured model
-  is not enabled for this AWS account yet* 이라고 알리고 아래 해결 방법을 안내합니다. 최초 사용 양식이
-  제출되지 않은 경우에는 대신 Verify AI access가 모델을 *not enabled or not available* 로 보고할 수
-  있습니다. 이때는 Amazon Bedrock 콘솔에서 양식을 한 번 제출한 뒤 다시 점검하세요. 도구가 사용하는
-  자격증명이 구독할 수 없다면(Fargate 태스크 역할은 의도적으로 구독할 수 없습니다), 구독할 수 있는
-  사람이 Amazon Bedrock 콘솔에서 또는 다음 명령으로 모델 약관을 **한 번** 수락합니다:
-
-  ```bash
-  aws bedrock list-foundation-model-agreement-offers --model-id <foundation-model-id>
-  aws bedrock create-foundation-model-agreement --model-id <foundation-model-id> --offer-token <offer-token>
-  ```
-
-  `<foundation-model-id>`는 모델 id에서 `global.` 접두사를 뺀 값이고
-  (`aws bedrock list-foundation-models --by-provider anthropic`으로 목록 확인), `<offer-token>`은 첫 번째
-  명령의 출력에서 얻습니다. 약 2분 기다린 뒤 **Verify AI access**를 다시 실행하세요. 그 뒤로는 어떤
-  호출자도 AWS Marketplace 권한이 필요 없고, 도구의 IAM을 바꿀 필요도 없습니다.
-
-**켜는 방법:**
-
-1. **Connect** 화면에서 **AI Assist**를 펼치고 **Enable AI Assist**를 토글(선택적으로 *Bedrock
-   settings*에서 모델 id / 리전 설정).
-2. **Verify AI access** 사전 점검(preflight)을 사용하세요. 이 자격증명으로 설정된 모델에 최소한의 호출을
-   보내는 비차단 점검입니다(유효한 AWS 프로필만으로는 `bedrock:InvokeModel`이 **보장되지 않음**).
-   권한 공백을 실행 도중이 아니라 지금 발견할 수 있습니다. Bedrock이 그 모델을 사용할 수 없다고 하거나
-   모델 약관 외의 이유로 거부하면 점검은 대체(fallback) 모델도 시도하고, 대체 모델이 응답하면 Model ID가
-   그 모델로 바뀌며 결과는 깨끗한 통과가 아니라 두 모델을 모두 밝히는 경고입니다(원래 모델로 돌아가려면
-   그 모델이 활성화된 뒤 다시 선택하고 점검하세요). 모델 약관(AWS Marketplace) 거부, 만료되었거나 잘못된
-   자격증명, 스로틀링, 네트워크 오류는 첫 호출에서 멈춥니다. 통과는 설정된 모델이 **방금 응답했다**는
-   뜻입니다. 새 AWS 계정에서는 통과가 일시적일 수 있습니다(위 *모델 액세스* 참조). 이후 AI 응답이
-   거부되면 AI DBA 패널과 Connect 화면의 AI Assist 상태가 *the configured model is not enabled for this
-   AWS account yet* 이라고 알리고 해결 방법 — 모델 약관을 한 번 수락하고 약 2분 기다린 뒤 다시 점검 —
-   을 안내합니다.
-
-> **비용·지연:** AI를 켜면 Bedrock을 호출하므로 **비용과 약간의 지연**이 추가됩니다. `MANUAL`/
-> `UNSUPPORTED` 잔여 항목을 위한 편의일 뿐 필수가 아닙니다 — 결정론적 경로가 가능한 모든 것을 스스로
-> 마이그레이션합니다.
 
 ### 리포트 활용법
 
 심각도 순으로 위에서부터 처리하세요:
 
-1. **모든 UNSUPPORTED 항목 해결.** 이 항목들은 깨끗한 마이그레이션을 가로막습니다. PK가 없으면 추가,
-   트리거/루틴/이벤트는 애플리케이션(또는 EventBridge/Lambda)으로 이전, `DECIMAL`
-   정밀도는 ≤ 1000으로 축소.
-2. **모든 MANUAL 항목 결정.** 기본 collation 수용, 대소문자 무시 collation 처리,
-   `ENUM`/`SET` 처리, 대체된 타입(`bytea`가 된 공간 컬럼, `jsonb`가 된 PostgreSQL 배열)에 맞추기 등. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전 점검(또는
-   **Check sizes**, [§13.5](13-excluding-tables-and-columns.md#135-초대형-lob-후보와-check-sizes))을
-   실행하세요. 값이 이미 한도를 넘는 경우에만 그 내용을 외부 스토리지(예: Amazon S3)로 옮기거나 컬럼을
-   제외합니다(제외한 컬럼은 NULL로 마이그레이션됩니다).
-3. **AUTO 항목**은 할 일 없음.
+1. **모든 Unsupported 항목을 해결하세요**(`UNSUPPORTED`). 이 항목들은 마이그레이션을 가로막습니다.
+   기본 키가 없으면 추가하고, 트리거·루틴·이벤트는 애플리케이션으로 옮기며(스케줄은 Amazon
+   EventBridge Scheduler로), Aurora DSQL이 인덱싱할 수 없는 기본 키를 가진 테이블은 키를 다시
+   잡으세요(re-key). 각각 무엇을 할지는 [§2.4](#24-evaluation-항목-참조)에 있습니다.
+2. **모든 Review needed 항목을 결정하세요**(`MANUAL`). 각 항목은 무엇을 잃거나 무엇이 바뀌는지와 할
+   일을 알려 줍니다: 그대로 받아들이거나, Schema Conversion에서 타깃 DDL을 바꾸거나, 컷오버 전에
+   애플리케이션을 바꿉니다. 초대형 LOB·JSON 컬럼(`OVERSIZED_LOB`)은 먼저 Data Migration 사전
+   점검(또는 **Check sizes**, [§13.5](13-excluding-tables-and-columns.md#135-초대형-lob-후보와-check-sizes))을
+   실행하고, 값이 이미 한도를 넘는 경우에만 조치하세요: 그 내용을 외부 스토리지(예: Amazon S3)로
+   옮기거나 컬럼을 제외합니다(그러면 도구가 그 컬럼에 NULL을 씁니다).
+3. **Automatic 항목**(`AUTO`)은 할 일이 없고, **Recommended** 노트는 선택적인 조언입니다.
 
-> **PostgreSQL 소스.** 동일한 하향식 분류가 적용됩니다. 변환 전에 미지원 PG 타입을 다시 모델링하세요 —
-> 배열 → `jsonb` 또는 자식 테이블, `network`/`xml`/`bit`/range → `text`, `money` → `numeric(23,4)`,
-> `enum` → `text`, composite → 개별 컬럼 또는 `jsonb`. 각 복제 테이블에 사용 가능한 `REPLICA IDENTITY`가
-> 있어야 한다는 PG **CDC** 전제조건은 여기가 아니라 Data Migration 단계에 속합니다
-> ([4장](04-cdc-and-dsql-constraints.md) 참고).
+> **팁:** 한 가지 수정이 적용되는 모든 객체를 보려면, 목록의 검색 상자에 그 규칙 id(예:
+> `BYTEA_KEY`)를 입력하세요.
 
-> **DSQL에서 특히 중요한 이유:** DSQL은 트리거, 저장 프로시저, 일부 타입을 의도적으로
-> 제외합니다. Evaluation은 그 사실을 — 읽기 전용으로, 데이터 이동 전에, 저렴하게 — 알게 되는
-> 순간입니다. 나중에 로드 실패로 발견하는 것과 다릅니다.
+### 가장 자주 만나는 항목
+
+- **기본 키가 없는** 테이블(`NO_PRIMARY_KEY`)이나 바이너리 컬럼의 기본 키(`BYTEA_KEY`): 소스에서 키를
+  추가하거나 다시 잡으세요.
+- **트리거, 루틴, 이벤트**: 마이그레이션되지 않으니 로직을 애플리케이션에서 다시 만드세요.
+- **텍스트 비교가 달라짐**(`CI_COLLATION`): Aurora DSQL은 텍스트를 바이트로 비교하므로, 대소문자를
+  무시하던 MySQL collation에서는 `=`, `LIKE`, `UNIQUE`가 대소문자를 구분하게 됩니다.
+- **버려진 기본값**, 또는 MySQL `ON UPDATE CURRENT_TIMESTAMP`(`DEFAULT_DROPPED`,
+  `ON_UPDATE_TIMESTAMP`): 애플리케이션이 값을 설정하게 하세요.
+- MySQL에서 `boolean`이 되는 `TINYINT(1)`(`TINYINT_BOOLEAN`)과 0이거나 잘못된 날짜(`ZERO_DATES`).
+
+모든 항목을 소스 엔진별로, 대처 방법과 함께 [§2.4](#24-evaluation-항목-참조)에 정리했습니다. AI 어시스트는 항목을
+설명하거나 수정안을 초안으로 써 줍니다([§2.5](#25-ai-어시스트-선택)).
 
 ---
 
 ## 2.2 Schema Conversion — DSQL DDL 생성·적용
 
-평가 결과를 바탕으로 **Schema Conversion**이 소스 스키마를 DSQL 호환 DDL로 바꿔 타깃에 적용합니다.
-SCT 같은 단계입니다:
+평가 결과를 바탕으로 Schema Conversion이 소스 스키마를 Aurora DSQL DDL로 바꿔 타깃에 적용합니다:
 
-- 소스/타깃 객체 트리 **탐색**.
-- 객체별 소스 DDL과 변환된 DSQL DDL을 **나란히 비교**.
-- 변환된 DDL을 타깃에 **적용** — **Apply all**로 모든 객체를 한 번에, 또는 객체별 **Apply to target** 버튼으로 하나씩. 타깃에 이미 존재하는 객체는 **SKIP**(그대로 유지) 또는 **REPLACE**(삭제 후 재생성)를 선택하며, 단일 객체를 적용하는 경우에는 그 시점에 **Replace / Skip / Cancel**을 바로 물어보므로 선택이 명확합니다 — 이것이 DDL을 변경한 뒤 테이블을 *다시 적용*하는 방법입니다(예: 복합 키를 정수 키로 되돌릴 때 SKIP은 이전 테이블을 그대로 두고, REPLACE는 새 키로 재생성). Aurora DSQL이 일시적인 `XX000`("server unavailable")으로 응답한 `CREATE`는 재시도합니다: 재시도에서 이미 있는 것으로 확인된 테이블·뷰·스키마는 앞선 시도가 만든 것이지만, 그렇게 확인된 인덱스는 이름이 다른 테이블의 인덱스일 수 있으므로 생성된 것으로 보고하지 않습니다.
+1. **Object browser**에서 객체를 **선택**합니다: 스키마나 객체를 체크하고(또는 **Select all**),
+   **Generate DDL for selected**를 클릭합니다.
+2. 각 객체의 DDL을 **검토**하고, 기본 키 전략을 고르고, 항목이 요구하는 곳에서 타깃 DDL을
+   편집합니다.
+3. DDL을 타깃에 **적용**합니다. 객체 하나씩 적용하거나 한 번에 모두 적용할 수 있습니다.
+
+**Reset all**은 생성된 DDL과 편집 내용을 버리므로, 새로 선택해 생성할 수 있습니다. 선택은 타깃에
+어떤 객체를 만들지를 정합니다. 대신 테이블이나 컬럼을 데이터 마이그레이션에서 빼려면 Data
+Migration의 **Exclude tables & columns...** 기능을
+쓰세요([13장](13-excluding-tables-and-columns.md)): 제외한 컬럼은 Aurora DSQL에 그대로 남고, 도구가
+쓰는 모든 행에서 그 컬럼은 NULL입니다. 타깃 테이블이 이미 있다면(앞서 적용했거나 직접 만든 경우)
+**Skip conversion & continue to Data Migration**이 다음 단계를 엽니다. Data Migration은 타깃
+테이블이 있는 테이블만 적재합니다.
 
 ### 변환이 대신 해 주는 것
 
-변환은 방언과 제약의 간극을 자동으로 메워 줍니다. **MySQL 소스**의 경우 `sqlglot`을 거치며(MySQL →
-PostgreSQL 방언 → DSQL 제약), **PostgreSQL 소스**의 경우 소스에서 캡처한 정확한 컬럼 타입(`format_type`
-문자열)으로 구성하는 near-identity PG-16 → DSQL 재구축이며 `sqlglot` MySQL→PostgreSQL 트랜스파일이
-아닙니다:
+변환의 대부분은 여러분이 할 일이 없습니다. MySQL 스키마는 Aurora DSQL의 PostgreSQL 방언으로
+번역되고, PostgreSQL 스키마는 거의 그대로 유지됩니다. 컬럼 타입을 간단히 정리하면 다음과
+같습니다(전체 매핑은 [§2.3](#23-타입-매핑-참조)에 있습니다):
 
-- **타입 매핑** — **MySQL 소스**의 경우 전체 MySQL → DSQL 타입 표(`TINYINT(1)` → `boolean`,
-  `BIT(n)` → 정수, `ENUM` → `text` + `CHECK`, `BLOB`/`BINARY` → `bytea` 등.
-  아래 [§2.3](#23-mysql--dsql-타입과-제약-처리-참조) 참조). **PostgreSQL 소스**에는 이런 변환 표가
-  없습니다 — DSQL이 지원하는 컬럼 타입은 그대로 통과합니다(§2.3 범위 노트 참고).
-- **컬럼 기본값(MySQL 소스)** — 소스 `DEFAULT`를 그대로 가져옵니다(Aurora DSQL이 지원하며,
-  `CURRENT_TIMESTAMP` **및 소수초 `CURRENT_TIMESTAMP(n)`**, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`,
-  `LOCALTIME`/`LOCALTIMESTAMP` 포함). 두 가지는 자동 변환됩니다: `TINYINT(1)` 기본값은 `boolean`
-  타깃에 맞게 `TRUE`/`FALSE`로, 시계를 읽는 `DATETIME` 기본값은 소스의 시간대를 명시합니다(UTC
-  소스라면 `now() AT TIME ZONE 'UTC'`, 아니면 Evaluation이 읽은 시간대: `SOURCE_TIME_ZONE`, §2.1.
-  `CURRENT_TIMESTAMP + INTERVAL 30 DAY`처럼 한 단위의 정수로 된 시계 연산은 그 위에 그대로 유지하고, 그 밖의
-  시계 연산은 아래처럼 드롭 + 보고). 컬럼이 소스의 벽시계를
-  담고 로더가 그 값을 그대로 복사하기 때문입니다. 이것이 가장 중요한 경우는
-  **기본값이 있는 `NOT NULL` 컬럼**입니다: MySQL은 그 컬럼을
-  생략한 `INSERT`를 받아주지만, 기본값이 없으면 타깃은 같은 문장을 거부합니다 — 컷오버 후에야
-  드러나는 애플리케이션 장애입니다. DSQL에 대응이 정말 없는 기본값은(MySQL `UUID()`는 변환되지만
-  다른 컬럼을 참조하는 표현식은 불가) 조용히 사라지지 않고 드롭 + **보고**됩니다.
-  `ON UPDATE CURRENT_TIMESTAMP`는 아예 재현할 수 없습니다 — DSQL에는 `ON UPDATE` 절도 트리거도
-  없습니다 — 따라서 애플리케이션이 처리하도록 **MANUAL**로 표시됩니다. **PostgreSQL 소스**에서는
-  컬럼 DEFAULT를 PostgreSQL이 저장한 텍스트(`pg_get_expr`) **그대로** 가져옵니다. 다시 렌더링하지
-  않으므로 `CURRENT_TIME`, `CURRENT_TIMESTAMP(0)`, PostgreSQL 14 이전에 저장된 `date_part(...)`, 인자가
-  3개인 `date_trunc(..., 'Asia/Seoul')`도 바뀌지 않고 Aurora DSQL에 도달합니다(다만 소스의 시간대가 UTC가
-  아니면, 시간대 없는 컬럼의 시계 기본값은 그 시간대를 명시합니다: `SOURCE_TIME_ZONE`). 기본 키의 `serial`/`IDENTITY`
-  `nextval`은 선택한 기본 키 전략이 대신 좌우하고, 키가 아닌 컬럼의 `nextval`, 파싱되지 않는 기본값,
-  DSQL에 없는 타입으로 캐스팅하는 기본값, DSQL에 없는 함수(다른 uuid-ossp 생성 함수나 `pg_catalog` 밖의
-  스키마 한정 함수)를 호출하는 기본값은 노트와 함께 제외되고 Evaluation도 보고하며(`DEFAULT_DROPPED`),
-  uuid-ossp의 `uuid_generate_v4()`는 내장 `gen_random_uuid()`가 됩니다(enum 기본값은 컬럼이 `text`가
-  되므로 평문 텍스트 리터럴로 유지). 키가 아닌 컬럼의 `nextval`에 대한 노트는 데이터베이스가 값을 계속 생성하게 하는
-  방법을 알려 줍니다: identity인데, Aurora DSQL은 identity를 `bigint` 컬럼에만 허용하고 적용 후에는 컬럼 타입을
-  바꿀 수 없으므로 `serial`(`integer`) 컬럼은 적용 전에 타깃 DDL에서
-  `bigint GENERATED BY DEFAULT AS IDENTITY (CACHE 65536)`으로 선언하고, 컷오버 전에 identity를 로드된 값
-  다음으로 재시작해야 합니다(Evaluation의 `NON_KEY_SEQUENCE` 항목도 같은 안내를 합니다). `CACHE 1`을 쓰면
-  삽입 처리량은 낮아지지만 소스처럼 값을 하나씩 순서대로 발급합니다(중단되거나 재시도된 트랜잭션도 값을 하나
-  소모하므로 빈 번호는 여전히 생길 수 있습니다). 여러 테이블이 공유하는 시퀀스를 호출하는
-  `DEFAULT`에는 identity를 쓰지 않습니다: 그 시퀀스의 Step 1 항목대로 시퀀스를 만들고 `DEFAULT`를 다시 붙이세요. `STORED` 생성 컬럼도
-  **보존**됩니다: 식이 원문 그대로 `GENERATED ALWAYS AS (expr) STORED`로 다시 출력되고 Aurora DSQL이 모든 쓰기에서
-  값을 유지하므로 다시 구현할 것이 없습니다(쓰기는 그 컬럼을 빼야 하며, Full Load와 CDC 싱크가 그렇게
-  합니다). `VIRTUAL` 생성 컬럼(PG18의 기본 종류)은 DSQL에 대응물이 없어 일반 컬럼으로
-  생성됩니다.
-- **외래 키 보존** — FK는 제거되지 않고 **보존**됩니다: 각 소스 FK를 적재 후 실행할
-  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` 문으로 렌더링하고(`CREATE TABLE` 밖에 둠), 데이터
-  적재가 끝난 **뒤** **Apply foreign keys** 동작으로 DSQL에 다시 생성합니다(각 키를 바로 추가한 뒤
-  Aurora DSQL이 검증) — CDC 마이그레이션에서는 **cut over 시점**에 적용합니다(CDC
-  싱크가 순서가 뒤섞인 행을 스트리밍하는 동안에는 외래 키가 있으면 안 됩니다 — FK 위반이 dead-letter로
-  빠지기 때문, SQLSTATE 23503). 원하면 FK를 떼어 내고(`preserve_foreign_keys=False`) 참조 무결성을
-  애플리케이션에서 강제하도록 선택할 수도 있습니다. 런타임 주의점: 참조/피참조 테이블에 대한 DML은
-  **추가 읽기** 비용이 있고(먼저 벤치마크 권장), 동시 충돌은 재시도 가능한 직렬화 오류(`40001`)를 냅니다.
-  또한 `CASCADE`/`SET NULL`/`SET DEFAULT` 동작은 트랜잭션당 3,000행 한도에 포함되므로(3,000행을 넘겨
-  캐스케이드하면 실패), 자식 카디널리티가 무제한일 수 있으면 `NO ACTION`/`RESTRICT`를 택하세요.
-- **기본 키 전략** — 캐싱을 적용한 identity 컬럼(`bigint`가 담을 수 있는 단일 컬럼 생성 키의 기본값),
-  또는 정수 PK를 그대로 유지. 각 테이블 카드에는 **기본 키 선택기**도 있어 **복합 키**(원래 키 앞에 고분산 컬럼을 붙인 형태, 예: `(customer_id, id)`)로 전환할 수 있습니다 — DSQL 파티션 전체에 쓰기를 분산시켜 쓰기 핫 파티션 한계를 실질적으로 움직이는 유일한 전략입니다. DSQL 키 한도에 대한 유효성 검사를 수행하고, `CREATE UNIQUE INDEX ASYNC`를 통해 원래 키의 고유성을 보존합니다. 언제·왜 사용하는지는 [7장 §7.1](07-performance-and-tuning.md#기본-키-전략--핫-파티션-회피) 참조.
-- **인덱스는 `CREATE INDEX ASYNC`** — DSQL은 보조 인덱스를 데이터 적재 후 비동기로 생성합니다.
-- **트랜잭션당 한 개 DDL** — 변환은 각 DDL을 자체 실행 단위로 내보내며(DSQL은 트랜잭션당 한 개 DDL),
-  적용 경로는 낙관적 동시성 충돌(`40001`)을 재시도(다시 적용해도 중복이 안 생기므로 안전).
-- **뷰** — MySQL 뷰는 PostgreSQL `CREATE VIEW`로 변환합니다. 파싱할 수 없는 정의는 조용히 버리지 않고,
-  수동 작업 플래그가 붙은 명확한 자리표시자(placeholder)로 표시합니다. 변환기가 번역하지 않는 함수
-  (`FIND_IN_SET`, `UNIX_TIMESTAMP`, 사용자 함수)를 호출하는 뷰는 두 단계 모두에서 MANUAL로 표시됩니다
-  (`VIEW_NOT_CONVERTED`): 그 함수가 Aurora DSQL에 없으면 `CREATE VIEW`가 실패합니다. 충실한 PostgreSQL 형태가 있는
-  MySQL 호출은 그것으로 다시 씁니다(`YEAR()`/`HOUR()`/`DAYOFWEEK()`/`WEEKOFYEAR()`는 `EXTRACT`로, `DATEDIFF`/`TO_DAYS`,
-  `NOW()`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP`와 `CURTIME()`은 세션의 벽시계로(Evaluation이 읽은 시간대가 UTC가 아니면
-  `SYSDATE()`, `CURDATE()`와 함께 소스 시간대의 벽시계로: `SOURCE_TIME_ZONE`), `UTC_DATE()`/`UTC_TIMESTAMP()`/`UTC_TIME()`은
-  UTC 벽시계로(MySQL처럼 정밀도에 맞춰 반올림이 아니라 잘라서), `STDDEV`/`VARIANCE`는 MySQL이 계산하는 모집단 형태로,
-  `VAR_SAMP`/`STDDEV_SAMP`는 표본 형태로, `CAST(x AS CHAR [CHARSET ...])`는 text로 — 길이가 있으면 자르기만 하고 채우지
-  않는 `varchar(n)`으로 — 바이너리 컬럼은 그 바이트를 디코딩해서(`CONVERT_FROM`), `BINARY x`는 그 바이트로(비교에서는
-  x의 텍스트를 Aurora DSQL이 이미 하듯 바이트 단위로 — 숫자나 날짜는 MySQL의 그 텍스트로, `'010'`은 `10`이 아님, 타입을
-  알 수 없는 값은 값 그 자체로, 숫자라면 그때 숫자로 비교 —
-  `GROUP BY`·`PARTITION BY`·`COUNT(DISTINCT ...)`의 키는 값 그 자체로, `ORDER BY`의 키는 텍스트·날짜·바이트면 그대로, 숫자나
-  타입을 알 수 없는 값은 그 텍스트의 바이트 순으로 — 출력 이름은 그것이 가리키는 식으로, `FROM` 컬럼에도 있는 이름은 MySQL이
-  읽는 대로 그 컬럼으로 — 고르는 것으로만 정렬할 수 있는
-  `UNION`과 `SELECT DISTINCT`의 키는 x 그대로 두고 표시), `CAST(x AS UNSIGNED)`는 MySQL처럼 먼저
-  반올림한 뒤(문자열은 앞쪽 정수로 읽어) 음수를 순환시켜, 정수와 decimal의 `/`는 MySQL의 정확한 나눗셈으로(MySQL이
-  유지하는 소수 자릿수로 잘라서 계산하고 — 정수는 9자리라 `2 / 3 * 1000000`은 `666666.6660` — 피제수의 scale에 4를 더한
-  decimal로 보여 주며 — `10 / 3`은 `3.3333` — 0으로 나누면 `%`·`MOD`·`DIV`와 마찬가지로 NULL) `AVG`는 그 `SUM`을
-  `COUNT`로 나누는 같은 나눗셈으로, `FLOAT`은 MySQL처럼 배정밀도로 계산해서(그 `SUM`, `f * f`), `FLOAT`/`DOUBLE`의
-  `ROUND`/`TRUNCATE(x, d)`는 MySQL처럼 배정밀도로 계산해서(실행 시점에 읽는 자릿수도, 정수는 그 정수로), 숫자로 읽히는
-  `TINYINT(1)`(Aurora DSQL에서는 boolean)과 비교식 — 산술, 비트 연산자, `ROUND`/`SIGN`/`POWER`나 숫자 캐스트, 집계
-  (`SUM(qty > 2)`는 행을 셉니다), 또는 숫자 옆(`= 1`, `<=> 1`, `IN`, 단순 `CASE`) — 은 그 정수로, `TINYINT(1)`에 넣는
-  숫자(`SET paid = 1`, `INSERT ... VALUES (..., 1)`이나 `INSERT ... SELECT` — 채우는 컬럼으로 판단)는 boolean으로,
-  `SET col = a = b`는 MySQL이 읽는 대로(`col = (a = b)`), `GROUP_CONCAT`은 MySQL의 텍스트 위의 집계로(`TINYINT(1)`이나 비교는
-  그 숫자로), `CONCAT_WS`는 NULL을 건너뛰고
-  `GREATEST`/`LEAST`는 MySQL처럼 NULL을 반환하게, `LENGTH`는 텍스트의 바이트 수로, `CHAR_LENGTH`는 그 문자 수로
-  (`CHAR(n)` 컬럼은 채움 공백 없이, JSON 값은 그 텍스트로), MySQL이 문자열을 원하는 곳(`CONCAT`/`CONCAT_WS` —
-  텍스트와 나란한 바이트는 디코딩하고 표시 — `LPAD`/`RPAD`, `LEFT`/`RIGHT`, `SUBSTRING`, `REPLACE`, `UPPER`/`LOWER`, `TRIM`,
-  `REVERSE`, `REPEAT`, `MD5`, `ASCII`, `LOCATE`/`INSTR`, `LIKE`, `REGEXP`, 문자열과 나란한 `GREATEST`/`LEAST` — 다만 문자열
-  순서가 숫자 순서와 같은 2 미만의 숫자 문자열(하한을 0으로 두는 `GREATEST(x, '0')`)은 제외 — 숫자나 날짜와
-  텍스트 컬럼이나 다른 종류의 문자열 `'N/A'`로 된 `UNION`의 컬럼)의 숫자·날짜·`TINYINT(1)`·비교는 MySQL의 텍스트로(`DATETIME(6)`은 소수 6자리 모두), MySQL이
-  문자열로 만드는 `COALESCE`/`CASE`/`IF` — 문자열이나 텍스트 컬럼과 나란한 날짜·시각, 문자열이나 날짜와 나란한 숫자, 그
-  어느 쪽과 나란한 JSON 값 — 는 그 자리에서 MySQL이 그 문자열을 읽는 대로(PostgreSQL이 그 값으로 같은 텍스트로 읽는
-  문자열 — `DATE`와 나란한 `IFNULL(end_date, '9999-12-31')`, `IFNULL(qty, '0')` — 과 나란하면 날짜는 날짜 그대로, 표시되는
-  숫자는 숫자 그대로 두어, 파생 테이블·CTE·뷰의 컬럼을 읽는 쿼리나 `INSERT ... SELECT`가 MySQL처럼 그것으로 계산합니다;
-  숫자로 읽는 자리 — 산술, `SUM`/`AVG`, 숫자 함수,
-  숫자와의 비교 — 에서는 MySQL이 읽는 배정밀도로, 그래서 `IFNULL(qty, '0') + 1`은 덧셈이 되고 `''`은 0; 날짜로 읽는 자리 —
-  날짜 함수, 날짜 산술, 날짜와의 비교 — 에서는 문자열이 그 종류의 날짜면 날짜 그대로, 시각이 있는 문자열과 나란한 `DATE`는
-  타임스탬프로, 숫자가 없는 문자열은 날짜 함수에서는 NULL로, 날짜와의 비교에서는 MySQL의 0 날짜(모든 날짜보다 앞선
-  `'-infinity'`)로; 그 밖의 자리 — 표시, 텍스트화, JSON, 정렬 — 에서는 MySQL의 문자열: 각 값의
-  텍스트, 리터럴은 쓰인 그대로), 날짜와 나란한 `TIME`은 MySQL의 `DATETIME`으로, 정확한 숫자의 `COALESCE`는 가장 넓은
-  scale로(`IFNULL(price, 0)`은 `0.00`), `DATE`에 일/월을 더해도 `DATE`로(컬럼이나 식에서 읽는 양, 또는 소수는
-  MySQL처럼 정수 단위로 세고 — 문자열은 앞쪽 정수로 — `'1 2' DAY_HOUR` 같은 복합 단위는 그 부분들로, 두 자리 연도나
-  `yyyymmdd`의 날짜 문자열은 MySQL처럼 해석), `INTERVAL x unit + d`는 `d + INTERVAL x unit`으로, `TIMESTAMP '...'`
-  리터럴은 그것이 뜻하는 `DATETIME`으로, `+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든)와 tzdata가 링크로
-  정의한 리터럴 시간대 이름을 링크가 가리키는 시간대로 쓰는 `CONVERT_TZ`(`'US/Eastern'`은 `'America/New_York'`으로), NULL을 유지하고
-  `DATETIME`, `TINYINT(1)`(`1`/`0`), 비교(`true`/`false`)를 MySQL처럼 쓰는 `JSON_ARRAY`/`JSON_ARRAYAGG`, 멤버 이름과 배열 첨자로 된 경로의
-  `JSON_EXTRACT`/`->`와 MySQL의 `->>`(MySQL은 뷰에 `json_unquote(json_extract(...))`로 저장합니다)는 MySQL처럼 경로를
-  따라가고(배열이 아닌 값의 `[0]`은 그 값 자체, `[0]`은 문서 안에 중첩된 호출까지 합쳐 세 개까지; 타입을 알 수 없는 문서는 `json`으로 캐스트) —
-  `->>`의 JSON null은 텍스트 `'null'`로(날짜 함수가 읽는 자리에서는 MySQL처럼 NULL로; 그룹화한 `->>`는 쿼리가 읽는 어디서나
-  그 `GROUP BY` 키의 형태로), 숫자와의 비교·산술·`SUM`/`AVG`·`ROUND`·숫자 함수에 쓰이는 그 텍스트나 JSON 값은 MySQL처럼
-  배정밀도로(표시됨: 숫자가 아닌 텍스트는 거기서 실패합니다) — MySQL처럼 형식에 따라 `TIME`/`DATE`/`DATETIME`을
-  돌려주는 `STR_TO_DATE`(빈 문자열은 NULL, 두 자리 연도는 MySQL처럼 해석, 형식을 다 읽고 남은 입력은 무시), `ON` 없는
-  조인(`CROSS JOIN`, `LATERAL`, `INNER JOIN`, Query Converter 문 최상위의 `JOIN` — 쉼표는 쉼표 그대로)은 `CROSS JOIN`으로,
-  `CROSS JOIN ... ON`과 `STRAIGHT_JOIN`은 `JOIN`으로, 재귀 CTE의 재귀 부분 값은 첫 SELECT의 타입에 수식자가 있으면
-  그 타입으로 캐스트하고(컬럼을 넓히는 MySQL의 방법 `CAST(x AS CHAR(n))`, `VARCHAR(n)`이나 `DECIMAL(p,s)` 컬럼; 재귀 부분의
-  소수와 나란한 정수는 표시), 그리고 모든
-  `DATE_FORMAT`/`STR_TO_DATE`/`FROM_UNIXTIME` 형식은 `%%`와 알 수 없는 지정자까지 MySQL 자체의 지정자로부터 씁니다).
-  나머지(ISO 이외 모드의 `WEEK`, `SUBSTRING_INDEX`, `SHA2`, `JSON_SET` 등)는 같은 방식으로 표시되고, PostgreSQL에 같은 이름의
-  함수가 있어도 저장 함수(`date_trunc`), Aurora DSQL이 따라갈 수 없는 JSON 경로(`'$'`, 와일드카드, `last`, 범위, 실행 시
-  계산하는 경로, 네 개 이상의 `[0]`, 여러 경로), 비교·정렬·그룹화·중복 제거되는 JSON 값(Aurora DSQL에는 json 값의 비교가
-  없습니다)은 표시되며, Aurora DSQL 패턴이 없는 형식 토큰(MySQL의 `%U`/`%u`/`%V`/`%X` 주 번호,
-  `%w`)도 표시됩니다: 뷰는 만들어지지만 다른 텍스트를 반환합니다. 컬럼에 대한 `STR_TO_DATE`(형식으로 읽을 수 없는 값에 MySQL은
-  NULL을 돌려주지만, Aurora DSQL은 그런 값에는 오류를 내고 구분자만 다른 값은 날짜로 읽습니다. 또 일광 절약 시간이 있는 세션
-  시간대에서는 시계가 건너뛰는 한 시간 안의 시각이 한 시간 뒤로 읽힙니다), 바이트 디코딩(잘못된 바이트는 MySQL에서 NULL,
-  Aurora DSQL에서 오류), 컬럼에서 읽는 형식, `FLOAT`/`DOUBLE`의 `MOD`(MySQL의 것은 C의 fmod로, Aurora DSQL에는 그
-  연산자도 정확한 형태도 없습니다), `GROUP_CONCAT(DISTINCT x ORDER BY y)`도 표시됩니다. 각 값은 그 내용에 맞게
-  씁니다 — 컬럼은 그 타입으로(MySQL이 저장한 조인을 거쳐서도, MySQL이 바인딩하는 대로 — `db`.`table`.`col`은 그 데이터베이스의
-  테이블로, 그 컬럼이 없는 테이블의 별칭은 건너서, 파생 테이블이나 CTE에는 결코 바인딩하지 않고), 파생 테이블이나 CTE의 컬럼은 그 본문이 고르는 것으로(읽는 테이블과
-  같은 이름의 CTE도), 다른 뷰의 컬럼은 그 뷰의 본문이 고르는 것으로, 식은 그 계산 결과로 — 그리고 Query Converter도 같은 MySQL 식을 같은 방식으로 쓰며(`UPDATE`, `DELETE`,
-  `ON DUPLICATE KEY UPDATE`에서도), 1단계를 실행했다면 Evaluation 인벤토리의 타입을 씁니다(단일 데이터베이스 모드로 읽은 뷰는
-  저장된 텍스트가 자기 데이터베이스의 테이블을 한정자 없이 쓰므로 자기 스키마에서 읽습니다). 타입을 알 수 없는 값 — 다른
-  뷰나 파생 테이블, CTE가 타입을 알 수 없는 값으로 계산하는 컬럼, 1단계 전 Query Converter의 컬럼 — 의 `LENGTH`와 `BINARY`는
-  표시됩니다: `LENGTH`는 `x || ''`의 텍스트를 세어 텍스트·바이트·정수·decimal·날짜에는
-  MySQL과 같은 수가 되고(`TINYINT(1)`, `FLOAT`, `TIMESTAMP`, 소수부가 있는 `DATETIME`은 다름), `BINARY`는
-  `CAST(x AS BYTEA)`로 바이너리 컬럼에만 맞는 형태입니다. 문자열 함수 안에서는 `x || ''`로 써서 텍스트·숫자·날짜의 MySQL
-  텍스트가 되고(`LEFT(created_at, 7)`은 그 달), `LIKE`/`REGEXP`에서는 `CAST(x AS TEXT)`로 써서 텍스트 컬럼의 인덱스가
-  `LIKE 'prefix%'`에 계속 쓰이며(타입을 알 수 없는 곳에서 읽는 바이너리 컬럼은 거기서 16진 텍스트로 비교됩니다), `UPPER`/`LOWER`와
-  `BINARY` 비교에서는 그대로 둡니다. 몫은 MySQL이 보여 주는 곳에서
-  그 scale로 보여 줍니다: 문의 출력과 텍스트, 그리고 MySQL이 구체화(materialize)하는 뷰·파생 테이블·CTE —
-  `ALGORITHM=TEMPTABLE`로 선언한 뷰, 또는 집계, 윈도우, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `UNION`이 있거나
-  테이블이 없거나, 자기 행을 읽는 서브쿼리를 담은 출력이 있는 것 — 의 행으로, 각각 그 컬럼의 scale로 저장됩니다(윈도우의
-  값도, 쿼리가 그것으로 그룹화하는 `CASE`/`IF`도: `0.0000` — MySQL이 정렬로 그룹화하는 `WITH ROLLUP`에서는 각 행의 값
-  그대로). `FLOAT`/`DOUBLE` 브랜치가 있는 `UNION` 컬럼의 몫은 모든 자릿수를 유지하고, `FLOAT` 브랜치가 있는 컬럼은 MySQL이
-  정하는 타입이 됩니다: `DOUBLE`, `DECIMAL`(몫, 정확한 수의 `SUM`)이나 `INT` 컬럼과 나란하거나 다른 정수(리터럴, `BIGINT`, `COUNT(*)`)가
-  `FLOAT` 앞에 있으면 `DOUBLE`, `TINYINT`/`SMALLINT`/`MEDIUMINT`/`YEAR` 컬럼과 나란하거나 그런 정수가 뒤에 있으면 `FLOAT`
-  (`SELECT f ... UNION ALL SELECT 0`은 `FLOAT`의 `0.1`을 보여 줍니다). MySQL이 읽는 쿼리에 병합(merge)하는 뷰는 거기서 몫이 유지하는 모든
-  자릿수로 계산되므로 뷰는 반올림하지 않고 두며, 읽는 쿼리는 MySQL과 같은 결과를 돌려줍니다. 그 대가: 그 뷰를 직접 조회하면
-  몫 컬럼은 MySQL이 계산에 쓰는 자릿수를 보여 줍니다 — MySQL이 `0.3333`을 보여 주는 곳에서 `0.333333333`을, `10.0000`을
-  보여 주는 `(x / 3) * 3`은 `9.999999999`를 — 이것은 AUTO로 평가되고 뷰마다의 안내는 없습니다. 또 그 뷰를 읽는 뷰는 그
-  컬럼이 몫인지 알 수 없어(PostgreSQL 뷰는 읽는 쿼리에 병합되지 않습니다) 거기서 계산한 값도 그 자릿수로 보여 주고, 요청한
-  자릿수대로 반올림하거나 자릅니다(MySQL은 몫의 scale보다 많은 자릿수를 남기지 않아 `1 / 3`의 `TRUNCATE(v.q, 6)`은
-  `0.3333`). 보여 주는 값이 중요하면 `ROUND(q, 4)`로 읽으세요. 재현하지 않는 것: MySQL은 몫의 `GROUP BY`, 윈도우의
-  `PARTITION BY` / `ORDER BY`, `COUNT(DISTINCT ...)`의 키를 보여 주는 scale로 만들지만(`1 / 3`과 `3333 / 10000`은 같은 키)
-  변환은 유지한 자릿수로 키를 만듭니다 — MANUAL로 표시됩니다(`GROUP BY 1`이나 `GROUP BY` 별칭은 두 엔진 모두 보여 주는
-  출력으로 키를 만듭니다). 임시 테이블로 그룹화할 때(그룹화 컬럼에 인덱스가 없을 때) MySQL은 몫의 `SUM`, `MAX`, `MIN`,
-  `AVG`도, 키가 아닌 `CASE`/`IF` 출력도(`0.0000`, 여기서는 `0`) 그 scale로 저장하며, 이는 실행 계획에 따라 달라집니다 —
-  그것이 중요하면 `ROUND(q, 4)`로 그룹화하고 집계하세요.
-  MySQL 8.0.22 이상(Aurora MySQL 3)은 구체화하는 뷰나 파생 테이블의 몫에 대한 필터(`WHERE v.q = 0.3333`)를 그 안으로 밀어
-  넣어 모든 자릿수로 비교하지만, 돌려주는 행은 저장된 scale을 가집니다. Aurora DSQL은 저장된 값으로 비교하므로, 그것이
-  중요하면 `ROUND(q, s)`나 범위로 비교하세요. 인자에 윈도우 함수가 있는 `JSON_ARRAY`/`JSON_OBJECT`는 윈도우 다음에 계산되어
-  그 몫 인자를 scale대로 읽는데(`[7.1429, 2.6667]`), 변환은 유지한 모든 자릿수를 씁니다(`7.142857142`). `IFNULL`, `IF`,
-  `CASE` 또는 다른 함수 뒤로 세 단계보다 깊게 중첩된 `GREATEST`/`LEAST`, 컬럼에서 읽는 복합 단위 interval, 200단계보다 깊게
-  중첩된 식(변환이 타입을 읽는 범위 밖)은 MANUAL로 표시됩니다. 표시되며 아직 다른 것: `FLOAT`의
-  텍스트(MySQL은 유효 숫자 6자리로 `1234.57`)와 JSON 안의 `FLOAT`, 다른 종류의 날짜 문자열과 나란한 날짜의 산술
-  (`IFNULL(d, '2024-06-01 10:00:00') + INTERVAL 1 DAY`: MySQL의 결과는 행마다 형태가 달라지는 문자열로, 날짜 행은
-  `2024-03-06`). 표시 없이 아직 다른 것: 숫자 문자열과 나란한 숫자 — 표시되는 `COALESCE`/`CASE`/`IF`, `UNION`의 컬럼 — 는
-  그것을 읽는 자리에서 숫자로 정렬(또는 텍스트와 비교)됩니다(MySQL은 문자열로 정렬해 `'10'`이 `'9'`보다 앞). 숫자 문자열과 나란한
-  `DECIMAL`을 다른 뷰가 산술로 읽으면 그 scale을 유지합니다(MySQL의 배정밀도가 `20`을 보여 주는 곳에서 `20.00`). 쿼리가
-  그룹화하는 `COALESCE`의 JSON(`ONLY_FULL_GROUP_BY`가 없는 `sql_mode`)은 가장 넓은 scale로 씁니다(`[0.00]`, MySQL은 `[0]`).
-  `DECIMAL`과 정수의 `UNION`은 정수 브랜치의 행을 컬럼의 scale 없이 보여 줍니다(MySQL이 `5.00`을 보여 주는 곳에서 `5`).
-  **PostgreSQL** 뷰의 정의
-  (`pg_get_viewdef`)는 이미 PostgreSQL이므로 따옴표로 감싼 뷰 이름 아래 **원문 그대로** 옮기며, 소스 창도
-  같은 텍스트를 보여줍니다. 다시 렌더링하면 뷰가 돌려주는 결과가 바뀝니다 — 예를 들어 jsonb 키에 붙은
-  `::text` 캐스트가 `->` 전체에 걸려 jsonb 컬럼이 text가 됩니다. 유일한 재작성은 변환이 text로 바꾸는 enum
-  타입으로의 캐스트입니다(`'paid'::order_status`가 `'paid'::text`가 됨). 그 타입은 Aurora DSQL에 없기
-  때문입니다. 변환이 타입을 바꾸는 컬럼(enum, jsonb가 되는 배열, text가 되는 범위)을 읽는 뷰는 두 단계 모두에서
-  **MANUAL**(`VIEW_REMODELLED_COLUMN`)로 표시되며 각 컬럼의 이전·새 타입을 알려 줍니다: 그 안의 배열 첨자나
-  범위 연산자는 적용 시 실패하거나 다른 결과를 돌려줍니다.
+| | MySQL 소스 | PostgreSQL 소스 |
+|---|---|---|
+| 바뀌는 것 | 각 타입이 Aurora DSQL 타입으로 매핑됩니다: `TINYINT(1)` → `boolean`, `DATETIME` → `timestamp`, `BLOB` → `bytea`, `ENUM` → CHECK가 붙은 `text`. | 대부분의 타입은 그대로입니다. Aurora DSQL에 없는 타입은 같은 데이터를 담는 타입으로 바뀝니다: 배열 → `jsonb`, `money` → `numeric(23,4)`, `inet` → `text`. |
+| Review needed | `TINYINT(1)`, `BIT`, `YEAR`, `TIME`, `ENUM`/`SET`, 공간 타입, `MEDIUMTEXT`/`LONGTEXT`/`MEDIUMBLOB`/`LONGBLOB`/`JSON`, 대소문자 무시 collation | 정밀도 없는 `numeric`, 바뀌는 모든 타입, `bytea`/`json`/`jsonb`, 너무 긴 `varchar(n)`/`char(n)`, `C` 이외의 collation |
+| Unsupported | — | composite 타입, domain, 사용자 정의 range, 확장 타입(`citext`, `hstore`, PostGIS, pgvector), 시스템 타입(`oid`, `pg_lsn`, …) |
+| 전체 매핑 | [MySQL → Aurora DSQL](#mysql--aurora-dsql) | [PostgreSQL → Aurora DSQL](#postgresql--aurora-dsql) |
 
-### 외래 키 — DSQL에서 강제되지만, 데이터 적재 *이후*에 적용
+변환이 하는 나머지 일:
 
-Aurora DSQL은 외래 키를 **강제(enforce)**하므로, 도구는 기본적으로 외래 키를 **보존**합니다
-(DDL 위의 **Preserve foreign keys** 토글). 하지만 외래 키는 `CREATE TABLE`의 일부가 아니며
-**Schema Apply 단계에서 적용되지 않습니다** — 별도의 **적재-후(post-load)** 문으로 렌더링됩니다:
+- **기본값**은 그대로 옮겨지며, 이것이 가장 중요한 경우는 `NOT NULL` 컬럼입니다(그 컬럼을 생략한
+  `INSERT`가 계속 동작합니다). Aurora DSQL에 대응이 없는 기본값은 드롭되고
+  보고되며(`DEFAULT_DROPPED`), MySQL의 `ON UPDATE CURRENT_TIMESTAMP`는 재현되지 않습니다.
+- **시계 기본값**(과 시계를 읽는 MySQL 뷰)은 자동으로 소스의 시간대로
+  쓰입니다([소스 시간대와 서버 설정](#소스-시간대와-서버-설정)).
+- **생성 컬럼.** PostgreSQL `STORED` 생성 컬럼은 유지되며, Aurora DSQL이 그 값을 계산합니다(쓰기는
+  그 컬럼을 빼야 하며, Full Load와 CDC가 그렇게 합니다). MySQL 생성 컬럼과 PostgreSQL `VIRTUAL` 생성
+  컬럼은 일반 컬럼이 됩니다: 값은 복사되지만, 컷오버 후에는 아무것도 그 값을 계산하지 않습니다.
+  MySQL 식은 번역해서 타깃 DDL에 `GENERATED ALWAYS AS (…) STORED`로 다시 추가할 수 있습니다.
+  적용하기 전에 결정하세요: Aurora DSQL은 나중에 생성 컬럼을 일반 컬럼으로 바꿀 수는 있지만, 이미
+  있는 컬럼을 생성 컬럼으로 만들 수는 없습니다.
+- **뷰.** MySQL 뷰는 MySQL의 날짜·문자열·숫자·JSON 동작까지 포함해 번역되고, PostgreSQL 뷰는
+  PostgreSQL이 저장한 그대로 복사됩니다. 표시된 뷰는 적용하기 전에 나란히 놓고
+  검토하세요(`VIEW_NOT_CONVERTED`, 또는 결과가 다르다는 노트. PostgreSQL에서는 타입이 바뀌는 컬럼을
+  읽는 뷰의 `VIEW_REMODELLED_COLUMN`).
+- **인덱스**는 데이터 적재 후에 만들어집니다(`CREATE INDEX ASYNC`). MySQL FULLTEXT·SPATIAL 인덱스는
+  생성되지 않고, PostgreSQL GIN이나 GiST 인덱스는 더 이상 원래의 검색에 쓰이지 않는 btree가 됩니다.
+  PostgreSQL `UNIQUE … NULLS NOT DISTINCT` 인덱스는 `NULLS NOT DISTINCT`를 유지합니다.
+- **파티셔닝**은 제거됩니다: Aurora DSQL이 기본 키로 행을 스스로 분산하며, 파티션들은 하나의
+  테이블이 됩니다.
+- **여러 MySQL 데이터베이스**는 하나뿐인 Aurora DSQL 데이터베이스 안에서 각각 하나의 스키마가
+  됩니다.
+- **이름**은 따옴표로 감싸 철자 그대로 유지됩니다(대소문자가 섞인 이름에 주의하세요:
+  `MIXED_CASE_IDENTIFIERS`).
+- **외래 키**는 유지되며, 적재 후에 적용됩니다([외래 키](#외래-키)).
 
-```sql
-ALTER TABLE "orders" ADD CONSTRAINT "fk_customer"
-  FOREIGN KEY ("customer_id") REFERENCES "customers" ("id") NOT VALID;
-```
+### 기본 키 전략 선택
 
-PostgreSQL 키는 `REFERENCES` 뒤에 선언한 내용을 PostgreSQL의 순서대로, `NOT VALID` 앞에 유지합니다:
-`MATCH FULL`, `ON DELETE` / `ON UPDATE` 동작(PostgreSQL 15+ `ON DELETE SET NULL (…)` /
-`SET DEFAULT (…)`의 경우 그 컬럼만 설정하는 컬럼 목록까지), 그리고 `DEFERRABLE INITIALLY DEFERRED`(또는
-`DEFERRABLE INITIALLY IMMEDIATE`). Aurora DSQL은 각각을 `NOT VALID`와 함께 받아들이며, 지연된 키는
-커밋 시점에 검사합니다. 지연 가능한 키는 `ON DELETE` / `ON UPDATE`의 `RESTRICT`도 유지하는데,
-PostgreSQL은 키가 지연된 동안에도 이를 즉시 검사합니다. `NOT ENFORCED`로 선언한 PostgreSQL 18 키는
-아예 생성하지 않습니다.
+각 테이블 카드에는 **Primary key** 선택이 있습니다. 적용하기 전에 정하세요: 테이블이 Aurora DSQL에
+만들어지고 나면 키를 바꿀 수 없으며, 나중에 바꾸려면 CDC를 멈춘 상태에서 **Replace**와 다시 적재가
+필요합니다([최종 상태](#최종-상태)).
 
-**왜 미루는가.** 벌크 적재는 부모·자식 테이블을 **동시에, 테이블별 기본키 순서로, 부모→자식
-순서 보장 없이** 씁니다. 그래서 자식 행이 부모보다 먼저 기록될 수 있습니다. 외래 키가 이미
-강제되고 있었다면 그 쓰기는 실패하고(`SQLSTATE 23503`), **CDC** 마이그레이션에서는 싱크가 행
-변경을 **테이블 간 순서가 뒤섞인 채** 적용하므로 스트리밍 중 외래 키가 있으면 해당 행이
-**dead-letter** 처리됩니다. 따라서 도구는 데이터가 일관된 상태가 된 뒤에만 제약을 추가합니다.
+| 전략 | 제공되는 경우 | 애플리케이션에 주는 의미 |
+|---|---|---|
+| **Server-generated (IDENTITY)** | 단일 컬럼 생성 키(MySQL `AUTO_INCREMENT`, PostgreSQL `serial` 또는 identity)일 때. 키가 `bigint`에 들어가면 기본값 | Aurora DSQL이 캐시된 `bigint` identity로 키를 계속 생성합니다: 값에 빈틈이 생기고 순서가 느슨해집니다. Full Load는 소스의 id를 유지합니다. MySQL에서는 insert 관용구 세 가지가 동작하지 않게 됩니다: 키에 명시적 `NULL`이나 `0` 넣기, `LAST_INSERT_ID()`(`RETURNING` 사용), 그리고 애플리케이션이 직접 지정한 id(identity를 진행시키지 않습니다). |
+| **Keep source PK** | 항상. 소스가 생성하지 않는 키와, `bigint`가 담을 수 없는 MySQL `BIGINT UNSIGNED` 키의 기본값 | 키는 타입을 유지하며, Aurora DSQL에서는 아무것도 키를 생성하지 않습니다: 소스가 생성하던 키라면 애플리케이션이 insert마다 값을 지정해야 합니다. |
+| **Composite key** | 테이블에 키 앞에 둘 고분산 컬럼이 있을 때 | **Leading column (high-cardinality)** 선택란에서 고른 컬럼이 키 앞에 붙어(예: `(customer_id, id)`) 쓰기를 Aurora DSQL 파티션 전체에 분산합니다([§7.1](07-performance-and-tuning.md#기본-키-전략--핫-파티션-회피)). 애플리케이션의 쿼리·조인·upsert는 전체 키를 써야 하며, UNIQUE 인덱스가 원래 키의 유일성을 유지합니다. CDC를 쓰면 모든 키 컬럼이 계속 캡처되어야 합니다. 값이 절대 바뀌지 않는 컬럼을 고르세요: 도구는 이를 검사할 수 없습니다. |
+
+Full Load가 완전히 끝난 뒤와 컷오버 때 다시 한 번, 도구는 각 identity를 적재된 id 다음으로 옮기므로
+컷오버 후 애플리케이션의 첫 insert가 충돌하지
+않습니다([§3.4](03-full-load.md#34-배치재적용-안전한정-병렬-적재),
+[§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환)).
+
+### 외래 키
+
+Aurora DSQL은 외래 키를 강제하며, 도구는 기본적으로 외래 키를
+유지합니다(**Generate DDL for selected** 옆의 **Preserve foreign keys**). Schema Apply는 외래 키를
+만들지 않습니다: 적재는 부모·자식 테이블을 부모→자식 순서 없이 쓰고, CDC는 테이블 간 변경을 순서
+없이 적용하므로, 강제되는 키가 있으면 단지 먼저 도착했을 뿐인 행을 거부하게 됩니다. 각 테이블의 키는
+별도의 읽기 전용 창인 **Foreign keys — applied by a separate action, not at Schema Apply**에
+나타나며, **Schema Apply 직후 외래 키가 없는 타깃은 정상이며 실패가 아닙니다.**
 
 **언제 적용되는가:**
 
-- **Full Load 전용** — 적재가 끝난 뒤 Data Migration 단계의 명시적 **Apply foreign keys**
-  동작으로 적용합니다(적재 종료 시 자동으로 적용되지 않습니다). 활동 로그에
-  `apply foreign keys` 단계(`N applied, S skipped, F failed`)가 기록됩니다.
-- **CDC** — **cut over로 지연**됩니다. 최종 드레인 후 애플리케이션을 재지정(repoint)하기
-  **전에**, cut-over 런북(Step 4)에서 **Apply foreign keys**를 클릭하세요. 멱등이므로 다시
-  실행해도 안전합니다.
+- **Full load only** — 적재가 끝난 뒤 Data Migration 단계의 명시적인 **Apply foreign keys** 동작으로
+  적용합니다(적재 종료 시 자동으로 적용되지 않습니다).
+- **CDC** — Cut over 단계에서, 최종 드레인 후 애플리케이션을 재지정(repoint)하기 전에
+  적용합니다([§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환)). 다시 실행해도
+  안전합니다.
 
-**먼저 추가하고, 나중에 검증합니다.** `NOT VALID`는 DSQL이 받아들이는 유일한 `ADD CONSTRAINT`
-형태이며, 이 단계를 빠르게 만드는 것도 이것입니다: Aurora DSQL은 **행을 하나도 읽지 않고**
-제약을 추가하고 — 자식 테이블 크기와 상관없이, 고아 행이 있어도 1초도 걸리지 않습니다 — 그
-순간부터 **모든 신규 쓰기를 강제**합니다: 없는 부모를 가리키는 삽입이나 키를 바꾸는 갱신은
-거부되고(`23503`), 아직 참조되는 부모 행의 삭제나 키 변경도 거부됩니다. 그래서 키는 쓰기 동결
-안에서 몇 초 만에 자리를 잡고, 너무 커서 안 되는 자식 테이블은 없습니다. 바로 이어서 도구는 각
-키에 `ALTER TABLE ASYNC … VALIDATE CONSTRAINT`를 제출합니다: 이미 적재된 행을 백그라운드에서
-검사하는 Aurora DSQL 작업입니다. 판정은 Aurora DSQL 자신의 것입니다 — 그 문이 돌려준 작업 ID로
-읽는 `sys.jobs`의 작업 상태(`submitted`, `processing`, `completed`, `failed`와 그 상세)와,
-검사가 성공했을 때에만 true가 되는 `pg_constraint.convalidated`이며, 키는 그때에만
-**검증됨(validated)**입니다. 도구는 각 작업 ID를 세션에 보관하고 상태를 백그라운드에서 Aurora
-DSQL로부터 다시 읽으므로, 화면 다시 그리기, Validation 재실행, 앱 재시작에도 잃지 않습니다(Aurora
-DSQL은 끝난 작업을 약 30분 보관하며, 도구는 마지막으로 본 것을 보관합니다).
+**먼저 추가하고, 나중에 검증합니다.** 각 키는 Aurora DSQL이 받아들이는 유일한 형태인 `NOT VALID`로
+추가됩니다: 행을 하나도 읽지 않고 추가되므로 자식 테이블 크기와 상관없이 몇 초면 끝나며, 그 순간부터
+모든 신규 쓰기를 강제합니다. 그다음 Aurora DSQL이 이미 적재된 행을 백그라운드에서 검증합니다.
 
-**검증이 실패하면.** 키는 `NOT VALID` 상태로 그대로 남아 이를 깨는 신규 쓰기를 계속 거부하지만,
-이미 적재된 행 중 일부가 Aurora DSQL에 없는 부모 행을 가리킵니다. 화면과 활동 로그는 Aurora
-DSQL의 오류와 — 이때에만 세는 — 키를 깨는 행 수, 그리고 그 행을 나열하는 쿼리를 보여 줍니다.
-이 쿼리는 셈이 첫 번째 그런 행을 찾은 키 구간(셈이 읽은 바로 그 페이지)만 읽으므로 자식 테이블
-전체를 한 번에 스캔하지 않습니다. 화면에는 바로 실행할 수 있는 형태로 나오고, 활동 로그와 세션에는
-구간의 시작이 값이 아닌 자리표시자(`%(after_0)s`…)로 남습니다. Aurora DSQL에서 트랜잭션당
-최대 3,000행씩 나눠 고치세요: 없는 부모 행을 추가하거나, 각 행이 있는 부모나 NULL을 가리키게 하거나, 삭제한 뒤
-**Validate again**을 클릭합니다. 기본 키가 있는 자식 테이블은 복합 키도 포함해 Aurora DSQL이
-가진 키의 keyset 페이지로 셉니다: 연결이 끊기거나, 서버가 세션을 끝내거나(`57P01`–`57P03`),
-충돌(`40001`)이 나거나, Aurora DSQL의 60분 연결 한도에 걸려도 중단된 그 페이지만 다시 실행하므로 크기와 상관없이 끝까지 셉니다. 기본 키가
-없는 테이블은 쿼리 하나로 세며, 이 쿼리는 DSQL의 ~300초 트랜잭션 한도 안에 끝나야 합니다.
+**검증이 실패하면.** 키는 `NOT VALID` 상태로 그대로 남아 이를 깨는 신규 쓰기를 계속 거부하지만, 이미
+적재된 행 중 일부가 Aurora DSQL에 없는 부모 행을 가리킵니다. 화면은 키를 깨는 행 수와 그 행을
+나열하는 쿼리를 보여 줍니다. Aurora DSQL에서 트랜잭션당 최대 3,000행씩 나눠 행을 고치고(없는 부모
+행을 추가하거나, 행이 있는 부모나 NULL을 가리키게 하거나, 삭제), **Validate again**을 클릭하세요.
 
-**추가하기 전에 세는 키.** 부모 쪽이 설계상 Aurora DSQL에 다 있지 않은 키 — 참조 컬럼이
-마이그레이션에서 제외되었거나, 부모 또는 자식 테이블이 마이그레이션에 포함되지 않은 키 — 는
-먼저 셉니다. 자식 행이 Aurora DSQL에 없는 부모 행을 가리키면 그 키는 **실행 가능한 안내(테이블 /
-외래 키 / 행 수 / 이유)와 함께 건너뜁니다**: 추가하면 그런 부모를 가리키는 애플리케이션의 쓰기를
-거부하게 되기 때문입니다.
+**추가하기 전에 세는 키.** 부모 쪽이 설계상 Aurora DSQL에 다 있지 않은 키(참조 컬럼이 제외되었거나,
+부모 또는 자식 테이블이 마이그레이션되지 않는 키)는 먼저 셉니다. 자식 행이 Aurora DSQL에 없는 부모
+행을 가리키면, 그 키는 이유와 행 수를 밝히는 노트와 함께 건너뜁니다: 추가하면 그런 부모를 가리키는
+애플리케이션의 쓰기를 거부하게 되기 때문입니다.
 
-**직접 추가하거나 이름을 바꾼 키.** 대상 스크립트에서 추가하거나 이름을 바꾼 외래 키도 다른 키와
-똑같이 적용·검증되고 기다립니다. 이름은 Aurora DSQL이 저장하는 대로 읽습니다: 따옴표 없는 이름은
-소문자로(`FK_Orders_Cust`는 `fk_orders_cust`), 따옴표 친 이름은 쓴 그대로입니다. 이름 없이 쓴
-키(`ADD FOREIGN KEY`)는 PostgreSQL이 그런 키에 붙이는 이름 `<table>_<columns>_fkey`(예:
-`orders_cid_fkey`, 같은 컬럼의 두 번째 키는 `orders_cid_fkey1`)로 추가하므로, 다시 적용해도 두 번째
-사본이 생기지 않습니다.
+**직접 추가하거나 이름을 바꾼 키.** 타깃 DDL에서 추가하거나 이름을 바꾼 외래 키도 다른 키와 똑같이
+적용·검증되며, 이름은 Aurora DSQL이 저장하는 대로 읽습니다: 따옴표 없는 이름은
+소문자로(`FK_Orders_Cust`는 `fk_orders_cust`).
 
-**미리보기에서.** FK는 나중에 별도로 실행되므로, 생성된 대상 스크립트는 이를 편집 가능한
-`CREATE` 박스가 아니라 별도의 읽기 전용 **"Foreign keys — applied after Full Load"** 섹션에
-보여주며, Apply 결과도 외래 키가 지연되었음을 알립니다. **Schema Apply 직후 대상에 외래 키가
-없는 것은 정상이며 실패가 아닙니다** — 적용할 때(Full Load 전용) 또는 cut over 시(CDC) 나타납니다.
+**비용.** 강제되는 키는 관련 테이블의 모든 쓰기에 읽기를 더하며(쓰기가 많은 테이블은 먼저
+벤치마크하세요), 충돌은 재시도 가능한 `40001`로 돌아옵니다. `CASCADE`, `SET NULL`, `SET DEFAULT`
+동작은 Aurora DSQL의 트랜잭션당 3,000행 한도에 포함되므로 그보다 큰 cascade는 실패합니다: 자식 행
+수에 상한이 없는 곳에서는 `NO ACTION`이나 `RESTRICT`를 택하세요.
 
-**Cascade 동작은 CDC의 공백입니다.** MySQL은 `ON DELETE`/`ON UPDATE CASCADE`(및 `SET NULL`/
-`SET DEFAULT`)를 *엔진 내부에서* 수행하고, 그 cascade된 자식 변경은 바이너리 로그에 남지
-않습니다 — 그래서 CDC는 부모 변경만 복제하고 **cascade는 복제하지 않아** 고아/낡은 자식 행이 남을
-수 있습니다(부모의 키가 바뀌어도 모든 행 수는 그대로입니다). 이런 FK는 Evaluation에서
-**MANUAL**로 표시됩니다. 자동 동작을 명시적 자식-행 문으로 바꾸거나, 최종 비교 전에 소스 쓰기를
-정지(quiesce)하세요(자세히는 [4장](04-cdc-and-dsql-constraints.md) 참고). cut over에서 이런 키도
-바로 추가되지만 그 행들에서 Aurora DSQL의 검증이 실패합니다: MySQL 소스라면 **I've cut over**는
-이런 키 — 그리고 MySQL이 Aurora DSQL의 바이트 비교보다 느슨하게 맞추는 텍스트 컬럼의 키, 즉
-대소문자를 구분하지 않는(case-insensitive) collation이나 `VARCHAR`에서 끝 공백을 무시하는 PAD SPACE
-collation(`utf8mb4_bin` 등)의 키 — 가 검증될 때까지, 또는 그 검사 없이
-cut over하기로 선택할 때까지 기다립니다.
+**CDC를 쓰는 MySQL 소스: cascade는 공백입니다.** MySQL은 `ON DELETE` / `ON UPDATE`의 `CASCADE`,
+`SET NULL`, `SET DEFAULT`를 엔진 내부에서 수행하고 그 자식 변경은 바이너리 로그에 남지 않으므로,
+CDC는 고아 자식 행이나 낡은 자식 행을 남길 수 있습니다(`FK_CASCADE_CDC_GAP`, **Review needed**). 그
+동작을 명시적인 자식 행 문장으로 바꾸거나, 최종 비교 전에 소스 쓰기를 멈추세요. 컷오버에서
+**I've cut over**는 그런 키와, MySQL이 Aurora DSQL보다 느슨하게 맞추는 텍스트 컬럼의 키(대소문자
+무시 collation, 또는 `VARCHAR`에서 `utf8mb4_bin` 같은 PAD SPACE collation)가 검증될 때까지, 또는 그
+검사 없이 컷오버하기로 선택할 때까지 기다립니다([§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환)).
 
-**무결성을 애플리케이션에서 강제하고 싶다면?** **Preserve foreign keys**를 끄세요. 그러면
-도구가 모든 경로에서 FK DDL을 떼어 냅니다(관계는 Validation의 orphan 검사를 위해 메타데이터로는
-유지). 이 선택은 재접속 / 인스턴스 재시작 후에도 기억되며, 지연된 FK DDL 자체는 읽기 전용
-소스에서 다시 도출되므로 크래시로 유실되지 않습니다. 참고로 강제된 FK는 쓰기당 추가 읽기 비용이
-있고 커밋 시점 낙관적 동시성(재시도 가능한 `40001`)을 쓰며, `CASCADE`/`SET NULL`/`SET DEFAULT`
-행은 DSQL의 트랜잭션당 3,000행 한도에 포함됩니다.
+**PostgreSQL 소스.** 키는 선언한 절을 유지합니다: `MATCH FULL`, `DEFERRABLE`, 그리고
+`ON DELETE SET NULL (…)`의 컬럼 목록 등입니다. `NOT ENFORCED`나 `PERIOD`로 선언한 PostgreSQL 18 키는
+생성되지 않습니다(`PG_FK_NOT_ENFORCED`, `PG_FK_PERIOD`).
 
-### 쿼리(DML) 변환과 안티패턴 린팅
+**무결성을 애플리케이션에서 강제하고 싶다면?** **Preserve foreign keys**를 끄세요. 그러면 도구가
+모든 경로에서 외래 키를 빼지만, 관계는 Validation의 고아 행 검사를 위해 계속 유지합니다. 이 선택은
+다시 연결해도 기억됩니다.
 
-스키마 외에도 도구는 쿼리를 변환하고, DSQL이 받아들이지 않거나 규모가 커지면 성능이 나오지 않을
-**애플리케이션 SQL을 린트**할 수 있습니다. 예를 들면 `SELECT ... FOR UPDATE`(DSQL의 낙관적 동시성에
-반하는 비관적 락), `AUTO_INCREMENT` 가정, 트리거/저장 프로시저 호출, 미지원 함수 등입니다.
-전환(Cut over) **전에** 바꿔야 할 코드를 찾는 데 사용하세요.
+### 검토, 편집, 적용
+
+**Generate DDL for selected** 후에는 각 객체가 소스 DDL과 Aurora DSQL DDL을 나란히 보여 주고 변환이
+바꾼 부분을 강조하며, **Conversion warnings**와 **Recommendations**를 나열합니다.
+
+- 항목에 따라 조치하려면 타깃 DDL을 **Edit**로 편집하고(예: 다른 숫자를 담는 `TINYINT(1)` 컬럼을
+  `smallint`로 변경) **Done**을 클릭합니다. **Reset to generated**는 편집 내용을 버립니다.
+- AI 어시스트를 켜면 AI DBA가 변경 초안을 만들어 줄 수
+  있습니다([선택적 AI 어시스트](#선택적-ai-어시스트-amazon-bedrock)).
+- **Apply to target**은 객체 하나를 적용합니다. 객체가 타깃에 이미 있으면 도구가 그 자리에서
+  **Replace**, **Skip**, **Cancel** 중 하나를 묻습니다: DDL을 바꾼 뒤 테이블을 다시 적용하는 방법이
+  이것입니다(Skip은 이전 테이블을 그대로 둡니다).
+- **Apply generated DDL to target** 카드는 생성된 모든 객체를 적용합니다.
+  **When an object already exists on the target**에서 **Skip if the object already exists**(기본값)
+  또는 **Replace existing objects (destructive)** 중 하나를 고른 뒤
+  **Apply all N generated objects to target**을 클릭하세요. Replace는 이미 있는 각 객체를 삭제하고
+  다시 만들므로 테이블은 행을 잃습니다: 도구가 삭제할 것을 나열하고 **Confirm REPLACE**를
+  요청합니다.
+- **Apply results**는 각 객체를 생성됨, 건너뜀, 실패로 보여 줍니다. 실패한 객체의 DDL을 고치고
+  **Retry failed (N)** 버튼을 클릭하세요.
+
+외래 키는 적용에 포함되지 않으며([외래 키](#외래-키)), CDC가 타깃으로 스트리밍하는 동안에는 적용이
+차단됩니다([최종 상태](#최종-상태)).
 
 ### 최종 상태
 
-Schema Conversion 후에는 **DSQL 타깃 스키마가 고정**됩니다. 이것이 Full Load가 쓰고 CDC가 스트리밍하는
-스키마입니다. 한 가지 중요한 점은, CDC는 이후 소스 DDL을 **전파하지 않는다는** 것입니다. 따라서 CDC
-도중에 소스 스키마를 바꾸면, Aurora DSQL에 대응하는 변경을 직접 해야 합니다 — CDC가 스트리밍하는 동안 여기서
-다시 적용하는 방식이 아닙니다(그동안 Apply는 **Replace**를 포함해 차단되며, Replace는 테이블을 삭제합니다).
-CDC를 중지한 상태에서 타입·키 변경은 다시 만들기입니다: 여기서 **Replace**, 그다음 **Drop & reload**
-([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요) 참조).
+Schema Conversion 후에는 **Aurora DSQL 타깃 스키마가 고정**됩니다: Full Load가 쓰고 CDC가
+스트리밍하는 스키마입니다. CDC는 이후 소스 DDL을 **전파하지 않으므로**, CDC 도중에 소스 스키마를
+바꾸면 Aurora DSQL에 대응하는 변경을 직접 해야 합니다 — CDC가 스트리밍하는 동안 여기서
+다시 적용하는 방식이 아닙니다(그동안 Apply는 **Replace**를 포함해 차단되며, Replace는 테이블을
+삭제합니다). CDC를 중지한 상태에서 타입·키 변경은 다시 만들기입니다: 여기서 **Replace**, 그다음
+**Drop & reload** ([4장 §4.2](04-cdc-and-dsql-constraints.md#42-cdc는-스키마가-아니라-데이터를-복제--중요)
+참조).
 
-## 2.3 MySQL → DSQL 타입과 제약 처리 (참조)
+### 애플리케이션 쿼리 확인
 
-Schema Conversion과 데이터 경로가 SQL 방언 차이를 메우기 위해 하는 일입니다. Full Load 값 변환기와 CDC
-싱크가 모두 따르는 동일한 매핑이며, 공유 "write contract"가 이 둘을 일치시킵니다.
+Schema Conversion은 스키마를 변환할 뿐, 애플리케이션이 보내는 SQL은 변환하지 않습니다. MySQL 쿼리를
+변환하고, 타깃에서 쿼리를 읽기 전용으로 테스트하고, AI 어시스트를 켰다면 튜닝까지 하려면 사이드바의
+선택 도구인 **Query Converter**를 쓰세요([9장](09-query-validation.md)). 어느 엔진이든
+`SELECT … FOR UPDATE`는 확인하세요: Aurora DSQL의 낙관적 동시성에서는 다르게 동작합니다.
 
-> **범위: 이 참조는 MySQL 소스를 설명합니다.** **PostgreSQL 소스**에서는 변환과 데이터 경로가
-> near-identity PG-16 → DSQL **pass-through**입니다 — DSQL이 지원하는 타입은 그대로 넘어가며,
-> MySQL 식 타입 변환은 **전혀** 일어나지 않습니다. DSQL이 지원하는 PG 타입은 그대로 통과합니다(정수 계열,
-> `numeric`/`decimal`, `real`/`double precision`, `char`/`varchar`/`text`/`bpchar`,
-> `date`/`time`/`timetz`/`timestamp`/`timestamptz`, `interval`, `boolean`, `bytea`, `uuid`,
-> `json`, `jsonb`). DSQL에 대응 타입이 없는 별도의 집합은 Evaluation과 Schema Conversion 양쪽에서
-> 표시됩니다: 값을 보존하는 대체 타입은 경고와 함께 생성되고 **MANUAL**(배열은 `jsonb`, `money`는
-> `numeric(23,4)`, enum은 `CHECK`가 붙은 `text`, 나머지는 `text`), 대체 타입이 없는 타입(composite,
-> domain, `pgvector`)은 **UNSUPPORTED**: 배열(`[]`),
-> geometric(`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`),
-> network(`inet`/`cidr`/`macaddr`/`macaddr8`), `xml`, `money`, `bit`/`bit varying`/`varbit`,
-> `tsvector`/`tsquery`, range + PG14 multirange, `pgvector`, `enum`, composite. PG의 numeric
-> 규칙은 아래 표와 같습니다: `p > 1000`/`s > 1000`인 `numeric(p,s)`는 경고와 함께 clamp되고, 정밀도 없는
-> `numeric`/`decimal`은 `numeric(18,6)`으로 저장됩니다: 소수 6자리를 넘는 값은 적재 시 반올림되고
-> Validation도 그 컬럼을 scale 6으로 비교하므로, Evaluation이 표시합니다(`PG_UNCONSTRAINED_NUMERIC`).
-> 컬럼 DEFAULT는 **내보내며** `serial`/`IDENTITY` `nextval`만 제거되고(identity는 PK 전략이 좌우),
-> `STORED` 생성 컬럼의 식은 다시 출력됩니다(Aurora DSQL이 지원·유지하므로). `VIRTUAL` 생성 컬럼은 일반 컬럼이
-> 됩니다.
->
-> **Aurora DSQL이 강제할 수 없는 제약.** PostgreSQL `EXCLUDE` 제약은 생성되지 않으며(Aurora DSQL이 거부함) 소스에서 그것을 강제하던 인덱스도 생성되지 않으므로, 컷오버 후에는 규칙에 어긋나는 행(한 회의실의 겹치는 예약 등)이 받아들여집니다: Evaluation과 Schema Conversion은 각 정의와 함께 테이블을 **MANUAL**로 표시합니다(`PG_EXCLUSION_CONSTRAINT`). `WITHOUT OVERLAPS`로 선언한 PostgreSQL 18의 `PRIMARY KEY`나 `UNIQUE` 키는 같은 컬럼의 일반 키로 생성되는데, 이 키는 모든 키 컬럼이 다른 행과 같은 행만 거부하므로 한 키의 기간이 겹치는 행들은 받아들여집니다(`PG_TEMPORAL_KEY`, **MANUAL**). PostgreSQL 18의 `FOREIGN KEY … PERIOD`는 생성하지 않습니다: Aurora DSQL에는 `PERIOD`가 없고 같은 컬럼의 일반 키는 같은 기간을 요구하므로, 어떤 부모 기간도 덮지 않는 기간의 자식 행이 받아들여집니다(`PG_FK_PERIOD`, **MANUAL**). 이런 규칙은 애플리케이션에서 강제하거나(쓰는 트랜잭션이 충돌하는 행을 확인하고, 같은 범위를 쓰는 동시 쓰기들이 공유 행 하나도 함께 갱신하게 해서 Aurora DSQL의 낙관적 동시성 제어가 그중 하나를 `40001`로 실패시키게 함) 설계를 바꾸세요. 소스에서 `WITHOUT OVERLAPS` 기본 키의 인덱스(GiST)는 키 순서로 행을 돌려줄 수 없는데 Full Load와 Validation은 그 순서로 테이블을 읽으므로, 그런 큰 테이블을 적재하기 전에 소스에서 그 키 컬럼들에 btree 인덱스를 추가하세요. `UNIQUE ... NULLS NOT DISTINCT` 인덱스나 제약(PostgreSQL 15+)은 `NULLS NOT DISTINCT`를 유지하며, Aurora DSQL은 이를 받아들입니다.
->
-> `DEFERRABLE`로 선언한 PostgreSQL `PRIMARY KEY`나 `UNIQUE` 제약은 일반 키로 생성됩니다: Aurora DSQL은 지연 가능한 유니크 키를 지원하지 않으므로, 소스가 각 문장이 끝날 때(`INITIALLY DEFERRED`로 선언한 키는 커밋 시점에) 검사하는 키를 즉시 검사합니다. 컷오버 후에는 두 행이 잠시 같은 키 값을 갖게 하는 문장이나 트랜잭션(두 행의 값 맞바꾸기, 번호 다시 매기기)이 실패할 수 있습니다: Evaluation과 Schema Conversion은 테이블을 **MANUAL**로 표시합니다(`PG_DEFERRABLE_KEY`). CDC를 쓰면 `DEFERRABLE` 기본 키는 `REPLICA IDENTITY`도 되지 못합니다: 테이블이 `REPLICA IDENTITY DEFAULT`인 채로 CDC의 publication에 들어가면 PostgreSQL이 그 테이블의 모든 `UPDATE`와 `DELETE`를 거부하므로, 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을 `REPLICA IDENTITY FULL`로 설정할 때까지 CDC 사전 요구사항 검사가 그 테이블을 실패로 판정합니다(**Full load + CDC**에서는 Full Load 전에). 외래 키는 `DEFERRABLE`과 `MATCH FULL`을 유지합니다(§2.2).
->
-> **MySQL** 생성 컬럼은 일반 컬럼으로 만들어집니다(도구는 MySQL 식을 읽어 결과와 소스 DDL에 보여 주지만 번역하지는 않음). Full Load는 계산된 값을 복사하고, CDC는 `STORED` 컬럼의 값을 전달합니다. 식(`GENERATED ALWAYS AS (...) STORED`)은 마이그레이션 유형과 상관없이 적용 전에 Schema Conversion에서 다시 추가할 수 있습니다. 그러면 Full Load와 CDC가 적용 DDL이 `GENERATED`로 만든 컬럼을 모든 쓰기에서 빼고(Aurora DSQL은 그런 컬럼에 대한 값을 거부합니다, SQLSTATE `428C9`) Aurora DSQL이 값을 계산합니다. 기본 키에 속한 생성 컬럼은 일반 컬럼으로 둡니다. Full Load와 CDC는 모든 키 컬럼을 쓰므로 `GENERATED` 키 컬럼이면 모든 쓰기가 거부됩니다.
+---
 
-### 타입 매핑 (전체 참조)
+## 2.3 타입 매핑 (참조)
 
-아래의 모든 MySQL 데이터 타입에 대해, Schema Conversion이 생성하는 대상 DDL 타입 **및**
-Aurora DSQL에 저장되는 값의 형태를 정리합니다. 두 마이그레이션 경로 — Full Load 벌크 로더(Python)와
-CDC 싱크(Java) — 가 동일한 매핑을 따르며, 공유 **write-contract** 패리티 테스트로 강제되므로 어느
-경로로 옮겨도 같은 소스 행이 동일하게 적재됩니다. 분류: **AUTO** = 자동·무손실, **MANUAL** = 변환되나
-검토/결정 필요, **UNSUPPORTED** = 자동 변환 불가(재설계).
+Schema Conversion이 각 소스 컬럼 타입에 대해 쓰는 것과, 그에 대해 알아 둘 점입니다. Aurora DSQL
+자체의 한도(키, 인덱스, 컬럼, 값 크기, 데이터베이스당 객체 수)는
+[6장 §6.1](06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함)에 있습니다.
 
-#### 정수 타입
+### MySQL → Aurora DSQL
 
-| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
-|---|---|---|---|---|
-| `TINYINT` | `smallint` | `smallint` | AUTO | 부호 있는 8비트. |
-| `TINYINT(1)` | `boolean` | `boolean` (`true`/`false`) | MANUAL | MySQL boolean 관례; `0/1`→`false/true`. `{0,1}` **범위 밖의 값은 거부**(조용한 평탄화 없음): Full Load는 테이블을 중단하고, CDC는 그 행을 데드레터로 보냅니다. 컬럼에 다른 값이 있다면 여기서 타입을 `smallint`로 수정하세요. |
-| `SMALLINT` | `smallint` | `smallint` | AUTO | 부호 있는 16비트. |
-| `MEDIUMINT` | `integer` | `integer` | AUTO | PostgreSQL에 3바이트 정수 없음; `integer`가 부호 있는 24비트 범위를 커버. |
-| `INT` / `INTEGER` | `integer` | `integer` | AUTO | 부호 있는 32비트. |
-| `BIGINT` | `bigint` | `bigint` | AUTO | 부호 있는 64비트. |
-| `TINYINT UNSIGNED` | `smallint` | `smallint` | AUTO | `0..255` 보존을 위해 확장. |
-| `SMALLINT UNSIGNED` | `integer` | `integer` | AUTO | `0..65535` 보존을 위해 확장. |
-| `MEDIUMINT UNSIGNED` | `integer` | `integer` | AUTO | `0..16M` 보존을 위해 확장. |
-| `INT UNSIGNED` | `bigint` | `bigint` | AUTO | `0..4.29B` 보존을 위해 확장. |
-| `BIGINT UNSIGNED` | `numeric(20,0)` | `numeric(20,0)` | AUTO | 더 넓은 정수 타입이 없음; `2^64-1` 전 범위 보존. (CDC는 `bigint.unsigned.handling.mode=precise` 필요.) |
-| `INT(11)`, `BIGINT(20)`, … (표시 폭) | bare `smallint`/`integer`/`bigint` | `smallint`/`integer`/`bigint` | AUTO | `(N)` 표시 폭은 **드롭**(MySQL에서 표시용; PostgreSQL 정수는 폭을 받지 않음). |
-| `BIT(n)` | `smallint`(n≤15) / `integer`(≤31) / `bigint`(≤63) / `numeric(20,0)`(64) | `smallint`/`integer`/`bigint`/`numeric(20,0)` | MANUAL | DSQL에 **`BIT` 타입 없음**; 비트 패턴이 나타내는 부호 없는 정수로 저장. |
+Schema Conversion은 각 컬럼을 아래의 Aurora DSQL 타입으로 쓰고, Full Load와 CDC는 각 값을 같은
+방식으로 저장합니다: CDC는 모든 MySQL 타입을 옮깁니다. 값을 그대로 저장할 수 없으면(`2`를 담은
+`TINYINT(1)`, 음수 `TIME`), 다른 값을 쓰는 대신 Full Load는 그 테이블을 실패시키고 CDC는 그 행을
+dead-letter 처리합니다. MySQL의 표시 폭(`INT(11)`)과 `ZEROFILL`은 MySQL이 숫자를 출력하는 방식만
+바꾸므로 드롭됩니다.
 
-#### 고정소수점 & 부동소수점
+#### 정수
 
-| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
-|---|---|---|---|---|
-| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 정밀도/스케일 보존. **정밀도 > 1000**은 Evaluation에서 **UNSUPPORTED**로 표시(DSQL 문서상 최대 정밀도 1000, 스케일 -1000..1000, 기본값 `numeric(18,6)`)되지만, Schema Conversion은 **최대값으로 clamp**하며 데이터 손실 경고와 함께 DDL을 냅니다. MySQL `DECIMAL`(최대 65,30)과 모든 PostgreSQL `numeric`(자체 한도가 같은 1000)은 이 범위 안이므로, 이 표시와 clamp는 안전장치일 뿐입니다. 타깃이 유지하는 것보다 소수 자릿수가 많은 값(Step 1 이후 넓어진 소스, 또는 여기서 지정한 더 좁은 타입)은 Full Load와 CDC 모두에서 반올림하지 않고 거부합니다. |
-| `DECIMAL(p,s) UNSIGNED` | `numeric(p,s)` | `numeric(p,s)` | AUTO | 부호 없음은 표현 불가하며 저장상 의미 없음. |
-| `FLOAT` | `real` | `real` | AUTO | 단정밀도 float. |
-| `FLOAT(M,D)` | `real` | `real` | AUTO | `(M,D)` 표시 스펙 드롭(PostgreSQL `float`은 스케일이 아닌 정밀도 하나만 받음). |
-| `DOUBLE` / `DOUBLE UNSIGNED` | `double precision` | `double precision` | AUTO | 배정밀도 float. |
+<!-- type-map: mysql -->
+| MySQL 타입 | Aurora DSQL 타입 | 분류 | 알아 둘 점 |
+|---|---|---|---|
+| `TINYINT`, `TINYINT UNSIGNED` | `smallint` | AUTO | PostgreSQL에는 1바이트 정수가 없습니다. |
+| `TINYINT(1)` (`BOOL`, `BOOLEAN`) | `boolean` | MANUAL `TINYINT_BOOLEAN` | MySQL의 boolean 관례입니다: `0`과 `1`은 `false`와 `true`가 됩니다. 그 밖의 값은 거부됩니다. 컬럼에 다른 숫자가 있다면 적용하기 전에 Schema Conversion에서 타입을 `smallint`로 바꾸세요. `TINYINT(1) UNSIGNED`는 일반 `smallint`입니다. |
+| `SMALLINT` | `smallint` | AUTO | |
+| `SMALLINT UNSIGNED`, `MEDIUMINT`, `MEDIUMINT UNSIGNED`, `INT` (`INTEGER`) | `integer` | AUTO | 필요한 곳은 넓혀서 모든 값이 들어갑니다. |
+| `INT UNSIGNED`, `BIGINT` | `bigint` | AUTO | |
+| `BIGINT UNSIGNED` | `numeric(20,0)` | AUTO | 더 넓은 정수 타입이 없습니다: `numeric(20,0)`은 18,446,744,073,709,551,615까지 모든 값을 담습니다. |
+| `BIT(n)` | `smallint`, `integer`, `bigint` or `numeric(20,0)` | MANUAL `BIT_TYPE` | Aurora DSQL에는 비트 문자열 타입이 없습니다. 컬럼은 모든 `BIT(n)` 값을 담는 가장 작은 타입(`BIT(15)`까지 `smallint`, `BIT(31)`까지 `integer`, `BIT(63)`까지 `bigint`)을 받으며, 비트가 나타내는 숫자를 저장합니다(`b'101'`은 `5`). 비트 연산자나 `b'…'` 리터럴을 쓰는 쿼리는 다시 작성하세요. |
 
-#### 날짜 & 시간
+**자동 증가 키.** 기본 키 전체인 `AUTO_INCREMENT` 컬럼은 `bigint GENERATED BY DEFAULT AS IDENTITY`가
+되어 Aurora DSQL이 계속 값을 생성합니다(더 이상 빈틈이 없거나 엄격히 증가하지는 않습니다). 복합 키에
+속한 컬럼이나 `BIGINT UNSIGNED` 키는 값 생성 없이 타입을 유지하므로 애플리케이션이 값을 지정해야
+합니다. `BIGINT UNSIGNED` 키에는 대신 **Server-generated (IDENTITY)** 전략을 고를 수 있습니다:
+그러면 `bigint`가 되며, 키가 9,223,372,036,854,775,807보다 큰 행은 적재되지 않습니다.
+[기본 키 전략 선택](#기본-키-전략-선택)을 참고하세요.
 
-| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
-|---|---|---|---|---|
-| `DATE` | `date` | `date` | AUTO | |
-| `DATETIME` | `timestamp`(시간대 없음) | `timestamp` (소스의 wall-clock) | AUTO | 어느 시간대로 쓰였든 그대로 복사: 시간대를 적용하거나 옮기지 않습니다. 시계를 읽는 기본값은 소스의 시간대를 명시합니다(`SOURCE_TIME_ZONE`, §2.1). |
-| `DATETIME(6)` | `timestamp` | `timestamp` (wall-clock, microsecond precision) | AUTO | 소수 초를 마이크로초까지 보존. |
-| `TIMESTAMP` | `timestamptz` | `timestamptz` (UTC instant) | AUTO | 절대 UTC 시각으로 저장. |
-| `TIME` | `time`(시간대 없음) | `time` | MANUAL | 범위 내 `00:00:00..23:59:59`. **범위 밖** MySQL `TIME`(음수 또는 `> 24h`, MySQL 범위 `-838:59:59..838:59:59`)은 `time` 표현이 없어 **시끄럽게 실패**(대신 `interval` 컬럼 필요). Evaluation도 이를 표시합니다(`TIME_TYPE`). CDC(싱크 플러그인 v54 이상)에서는 이런 값을 interval로 씁니다: `interval`로 리매핑한 컬럼에는 저장되고, `time` 컬럼에서는 그 이유와 함께 dead-letter 처리됩니다. `interval`이나 텍스트로 리매핑하면 Full Load와 CDC가 모두 `[-]HH:MM:SS[.f]`(시간은 24에서 끊지 않음)로 쓰고 Validation은 기간 값을 비교합니다. |
-| `YEAR` | `smallint` | `smallint` (integer year) | MANUAL | DSQL에 `YEAR` 타입 없음; `1901–2155`가 `smallint`에 들어가며 정수 연도로 저장(`YEAR` 표시 의미는 보존 안 됨). |
+#### 고정소수점과 부동소수점
+
+<!-- type-map: mysql -->
+| MySQL 타입 | Aurora DSQL 타입 | 분류 | 알아 둘 점 |
+|---|---|---|---|
+| `DECIMAL(p,s)`, `DECIMAL(p,s) UNSIGNED` (`NUMERIC`, `DEC`, `FIXED`) | `numeric(p,s)` | AUTO | 정밀도와 스케일이 유지됩니다: MySQL의 최대인 `DECIMAL(65,30)`도 Aurora DSQL의 한도 1000 안에 넉넉히 들어갑니다. `UNSIGNED`는 드롭되므로 타깃은 음수도 받아들입니다. |
+| `FLOAT`, `FLOAT(M,D)`, `FLOAT UNSIGNED` | `real` | AUTO | `(M,D)`와 `UNSIGNED`는 드롭됩니다: 값은 정확히 복사되지만, 새 값은 더 이상 소수 `D`자리로 반올림되거나 음수일 때 거부되지 않습니다. |
+| `DOUBLE`, `DOUBLE(M,D)`, `DOUBLE UNSIGNED` (`REAL`, `DOUBLE PRECISION`) | `double precision` | AUTO | `FLOAT`과 같습니다. |
+
+#### 날짜와 시간
+
+<!-- type-map: mysql -->
+| MySQL 타입 | Aurora DSQL 타입 | 분류 | 알아 둘 점 |
+|---|---|---|---|
+| `DATE` | `date` | AUTO | 0이거나 잘못된 날짜(`0000-00-00`, `2024-02-30`)에 해당하는 Aurora DSQL 값은 없습니다: 소스가 그런 값을 담을 수 있다면, Full Load와 CDC가 그 값을 어떻게 처리하는지 Evaluation의 `ZERO_DATES` 항목이 알려 줍니다. |
+| `DATETIME`, `DATETIME(fsp)` | `timestamp` | AUTO | 같은 벽시계 값입니다: 시간대를 적용하거나 옮기지 않습니다. 소수 초는 유지됩니다. 0 날짜: `DATE`와 같습니다. |
+| `TIMESTAMP`, `TIMESTAMP(fsp)` | `timestamptz` | AUTO | 같은 시점을 UTC로 담습니다. 소수 초는 유지됩니다. 0 날짜: `DATE`와 같습니다. |
+| `TIME`, `TIME(fsp)` | `time` | MANUAL `TIME_TYPE` | MySQL `TIME`은 기간(`-838:59:59`부터 `838:59:59`까지)이고, Aurora DSQL `time`은 하루 중의 시각입니다. `00:00:00`보다 작거나 `24:00:00`보다 큰 값은 거부됩니다. 컬럼이 기간을 담는다면 적재하기 전에 Schema Conversion에서 타입을 `interval`로 바꾸세요(키나 인덱스가 그 컬럼을 쓰면 `text`로). |
+| `YEAR` | `smallint` | MANUAL `YEAR_TYPE` | 연도 숫자(`2024`)로 저장됩니다. |
 
 #### 문자열, 바이너리, 구조화
 
-| MySQL 타입 | Aurora DSQL 타입 | 저장 값 형태 | 분류 | 비고 |
+<!-- type-map: mysql -->
+| MySQL 타입 | Aurora DSQL 타입 | 분류 | 알아 둘 점 |
+|---|---|---|---|
+| `CHAR(n)` | `char(n)` | AUTO | |
+| `VARCHAR(n)` | `varchar(n)` | AUTO | |
+| `TINYTEXT`, `TEXT` | `text` | AUTO | |
+| `MEDIUMTEXT`, `LONGTEXT` | `text` | MANUAL `OVERSIZED_LOB` | Aurora DSQL의 1 MiB 한도(압축된 크기 기준)를 넘는 값은 저장할 수 없습니다: Full Load는 그 행을 격리하고 CDC는 dead-letter 처리합니다. Data Migration 사전 점검이 적재 전에 그런 값을 찾아 줍니다. |
+| `BINARY(n)`, `VARBINARY(n)`, `TINYBLOB`, `BLOB` | `bytea` | AUTO | 바이트가 정확히 복사됩니다. |
+| `MEDIUMBLOB`, `LONGBLOB` | `bytea` | MANUAL `OVERSIZED_LOB` | 1 MiB를 넘는 값은 저장할 수 없습니다(Aurora DSQL은 `bytea`를 압축하지 않습니다): Full Load는 그 행을 격리하고 CDC는 dead-letter 처리합니다. |
+| `ENUM('a','b',…)` | `text`, with a CHECK on the values | MANUAL `ENUM_SET_TYPE` | CHECK가 허용 값을 유지합니다. 정렬과 비교는 선언 순서가 아니라 알파벳순이 되며, MySQL의 빈 문자열 오류 값(`''`)은 거부됩니다. |
+| `SET('a','b',…)` | `text` | MANUAL `ENUM_SET_TYPE` | 쉼표로 구분한 멤버(`'a,b'`)로 저장되며 CHECK는 없습니다: 허용 값이 더 이상 강제되지 않습니다. |
+| `JSON` | `json` | MANUAL `OVERSIZED_LOB` | 같은 JSON 텍스트입니다. 1 MiB(압축 후)를 넘는 문서는 저장할 수 없습니다: Full Load는 그 행을 격리하고 CDC는 dead-letter 처리합니다. |
+
+**대소문자 무시 collation.** 대부분의 MySQL 텍스트 컬럼이 이런 collation을
+씁니다(`utf8mb4_0900_ai_ci`가 MySQL 8의 기본값). collation은 옮겨지지 않습니다: Aurora DSQL은
+텍스트를 대소문자를 구분해 비교하므로, 모든 값이 정확히 마이그레이션되더라도 `=`, `LIKE`,
+`ORDER BY`, `UNIQUE`가 다르게 동작합니다(`bob` 옆의 `Bob`을 거부하던 `UNIQUE` 컬럼이 둘 다
+받아들입니다). Evaluation은 그런 테이블을 MANUAL로 표시합니다(`CI_COLLATION`). `_bin`이나 `_cs`
+collation은 이미 대소문자를 구분하므로 표시되지 않습니다.
+
+#### 기타
+
+<!-- type-map: mysql -->
+| MySQL 타입 | Aurora DSQL 타입 | 분류 | 알아 둘 점 |
+|---|---|---|---|
+| `GEOMETRY`, `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `bytea` | MANUAL `SPATIAL_TYPE` | Aurora DSQL에는 공간 타입이 없습니다. geometry는 SRID 없이 WKB 바이트로 유지되며, 공간 함수와 `SPATIAL` 인덱스는 쓸 수 없습니다. |
+
+**Aurora DSQL이 인덱싱할 수 없는 컬럼.** `bytea` 컬럼(`BINARY`, `VARBINARY`, `BLOB` 계열 타입 또는
+공간 타입에서 온 것)은 기본 키나 인덱스의 일부가 될 수 없습니다: 그런 컬럼을 포함한 기본 키는
+테이블을 UNSUPPORTED로 만들고, 그런 컬럼의 인덱스는 생성되지 않습니다(`BYTEA_KEY`). `interval`
+컬럼도 마찬가지이므로, 키에 쓰이면서 기간을 담는 `TIME` 컬럼은 `text`로 바꿉니다.
+
+### PostgreSQL → Aurora DSQL
+
+Aurora DSQL은 PostgreSQL 호환이므로 대부분의 타입은 그대로 유지됩니다. Aurora DSQL에 없는 타입은
+같은 데이터를 담는 타입으로 바뀌거나(MANUAL: 애플리케이션이 새 타입을 따라야 합니다), 그런 타입이
+없으면 그대로 두고 Schema Conversion에서 컬럼을 바꿀 때까지 테이블이 UNSUPPORTED로 평가됩니다. Full
+Load는 변환된 컬럼의 모든 값을 옮깁니다.
+
+**CDC** 열은 CDC가 Full Load와 다른 곳을 알려 줍니다. Evaluation은 이런 컬럼을
+`CDC_UNCARRYABLE_COLUMN`으로 보고하며, CDC로 복제할 때에만 문제가 됩니다:
+
+- *NULL로 도착*: 컬럼이 CDC의 변경 이벤트에 없으므로, CDC가 삽입하는 행은 NULL(또는 컬럼의 기본값)을
+  받고 갱신은 이전 값을 남깁니다. 기본값이 없는 `NOT NULL` 컬럼이면 그런 변경이 대신 실패하며,
+  어떻게 되는지는 `CDC_UNCARRYABLE_COLUMN` 항목이 알려 줍니다.
+- *dead-letter 처리*: 그 컬럼을 설정하는 모든 변경이 dead-letter 처리되어 타깃에 도달하지 않습니다.
+- *바뀐 값으로 도착*: CDC가 Full Load와 다른 값을 씁니다.
+
+*NULL로 도착*과 *바뀐 값으로 도착*은 CHECKSUM 검증만 알아챕니다. 각각을 피하는 방법은
+[4장](04-cdc-and-dsql-constraints.md)과 [§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)에
+있습니다.
+
+#### 정수
+
+<!-- type-map: postgres -->
+| PostgreSQL 타입 | Aurora DSQL 타입 | 분류 | CDC | 알아 둘 점 |
 |---|---|---|---|---|
-| `CHAR(n)` | `char(n)` | `char(n)` | AUTO | |
-| `VARCHAR(n)` | `varchar(n)` | `varchar(n)` | AUTO | |
-| `TINYTEXT`/`TEXT`/`MEDIUMTEXT`/`LONGTEXT` | `text` | `text` | AUTO | 단일 값 **> ~1 MiB**는 DSQL이 거부 → 행 단위 격리(Full Load) / DLQ(CDC); 초대형 LOB 컬럼은 Evaluation에서 플래그. |
-| `COLLATE`(예: `utf8mb4_*_ci`)가 있는 `CHAR`/`VARCHAR`/`TEXT` | 동일, **collation 드롭** | `text` (collation dropped) | MANUAL | DSQL은 기본 collation 사용; 대소문자 무시 collation은 보존 안 됨 → MANUAL 플래그. |
-| `BINARY(n)` / `VARBINARY(n)` | `bytea` | `bytea` (raw bytes) | AUTO | 길이 수식어 드롭(PostgreSQL `bytea`는 받지 않음). |
-| `TINYBLOB`/`BLOB`/`MEDIUMBLOB`/`LONGBLOB` | `bytea` | `bytea` (raw bytes) | AUTO | 바이너리 페이로드를 바이트 단위로 보존. |
-| `ENUM('a','b',…)` | `text` + `CHECK (col IN ('a','b',…))` | `text` | MANUAL | DSQL에 `ENUM` 없음; 순서 의미 보존 안 됨. |
-| `SET('x','y',…)` | `text` | `text` (comma-joined) | MANUAL | 무손실 매핑 없음; 다중 값 set 의미는 앱에서 처리. |
-| `JSON` | `json` | `json` | AUTO | 단일 값 **> ~1 MiB**는 DSQL이 거부(`json`은 압축 후 크기에 한도 적용) → 행 단위 격리(Full Load) / DLQ(CDC); Evaluation이 `OVERSIZED_LOB`로 플래그. (CDC는 JSON 텍스트를 `PGobject(type=json)`로 감싸 `json` 컬럼을 타겟팅.) |
-| 공간(`GEOMETRY`/`POINT`/`LINESTRING`/…) | `bytea` | `bytea` (raw WKB bytes) | MANUAL | DSQL에 공간 타입 없음; 데이터는 원시 WKB 바이트로 **보존**(Full Load는 `ST_AsBinary(col)`, CDC는 Debezium geometry의 `.wkb` 추출; **SRID는 드롭**). `geometry` *컬럼 타입* 자체는 MANUAL로 플래그되며(자동으로 `bytea`로 대체, WKB 보존) 값은 손실되지 않음. |
+| `smallint`, `integer`, `bigint` (`int2`, `int4`, `int8`) | `smallint`, `integer`, `bigint` | AUTO | — | 같은 타입입니다. |
 
-> **DSQL에서 `bytea` 컬럼은 키가 될 수 없습니다.** `bytea`로 매핑되는 컬럼
-> (`BINARY`/`VARBINARY`, `*BLOB`, spatial)은 기본 키나 인덱스의 일부가 **될 수 없습니다**:
-> 그런 컬럼을 PK로 두면 테이블이 **UNSUPPORTED**, 세컨더리 인덱스면 인덱스가 **드롭(MANUAL)**
-> 됩니다. `text`/`uuid`나 해시 컬럼으로 re-key하세요. 아래 구조적 제약 참고.
+**serial과 identity 컬럼.** `smallserial`, `serial`, `bigserial`과 identity 컬럼은 시퀀스가 값을
+공급하는 이 정수 타입들입니다. 기본 키 전체인 컬럼은 `bigint GENERATED BY DEFAULT AS IDENTITY`가
+되어 Aurora DSQL이 계속 값을 생성합니다([기본 키 전략 선택](#기본-키-전략-선택) 참고). 복합 키에
+속하거나 다른 컬럼에 있으면 시퀀스가 옮겨지지 않으므로 애플리케이션이 값을 지정해야
+합니다(Evaluation은 그런 키가 아닌 컬럼을 알려 줍니다: `NON_KEY_SEQUENCE`).
 
-### 구조적 제약
+#### 고정소수점과 부동소수점
 
-| DSQL 규칙 | 도구 동작 |
+<!-- type-map: postgres -->
+| PostgreSQL 타입 | Aurora DSQL 타입 | 분류 | CDC | 알아 둘 점 |
+|---|---|---|---|---|
+| `numeric(p,s)` (`decimal(p,s)`) | `numeric(p,s)` | AUTO | — | 정밀도와 스케일이 유지됩니다(Aurora DSQL은 PostgreSQL처럼 1000까지 허용합니다). |
+| `numeric` (`decimal`), with no precision | `numeric` | MANUAL `PG_UNCONSTRAINED_NUMERIC` | — | Aurora DSQL은 이를 `numeric(18,6)`으로 저장합니다: 소수 6자리를 넘는 값은 반올림되고, 정수부가 12자리를 넘는 값은 들어가지 않습니다. 컬럼에 그런 값이 있다면 적용하기 전에 Schema Conversion에서 명시적인 `numeric(p,s)`를 지정하세요. |
+| `real`, `double precision` (`float4`, `float8`) | `real`, `double precision` | AUTO | — | 같은 타입입니다. |
+| `money` | `numeric(23,4)` | MANUAL `PG_UNSUPPORTED_TYPE` | — | 통화 형식의 텍스트가 아니라 정확한 금액이 유지됩니다. 통화 형식 지정과 `money` 산술은 애플리케이션으로 옮겨 갑니다. |
+
+#### 날짜와 시간
+
+<!-- type-map: postgres -->
+| PostgreSQL 타입 | Aurora DSQL 타입 | 분류 | CDC | 알아 둘 점 |
+|---|---|---|---|---|
+| `date`, `time without time zone`, `timestamp without time zone`, `timestamp with time zone` (`time`, `timestamp`, `timestamptz`) | `date`, `time`, `timestamp`, `timestamptz` | AUTO | — | 같은 타입과 정밀도입니다. |
+| `time with time zone` (`timetz`) | `timetz` | AUTO | — | 기본 키나 인덱스의 일부가 될 수 없습니다(`PG_UNINDEXABLE_COLUMN`). |
+| `interval`, with or without fields or a precision (`interval day to second`, `interval(3)`) | `interval` | AUTO | — | 필드는 유지되고, 정밀도는 선언에서 드롭됩니다(값에서는 드롭되지 않습니다). 기본 키나 인덱스의 일부가 될 수 없습니다(`PG_UNINDEXABLE_COLUMN`). |
+
+#### 문자열, 바이너리, 구조화
+
+<!-- type-map: postgres -->
+| PostgreSQL 타입 | Aurora DSQL 타입 | 분류 | CDC | 알아 둘 점 |
+|---|---|---|---|---|
+| `character varying(n)`, `character varying`, `character(n)`, `text` (`varchar(n)`, `varchar`, `char(n)`) | `varchar(n)`, `varchar`, `char(n)`, `text` | AUTO | — | 같은 타입입니다. Aurora DSQL에서 값은 `varchar`에 최대 65,535바이트, `char`에 4,096바이트, `text`에 1 MiB까지 담깁니다. 길이 제한이 없는 컬럼에 대해서는 Evaluation이 크기 확인을 권장합니다(`OVERSIZED_LOB`). |
+| `character varying(n)` with n over 65535, `character(n)` with n over 4096 | `text` | MANUAL `PG_CHARACTER_LENGTH` | — | Aurora DSQL은 그런 선언 길이를 거부합니다. `text`는 1 MiB까지 모든 값을 담지만 길이 제한은 더 이상 강제되지 않습니다: 애플리케이션이 그 제한에 의존한다면 `CHECK (length(col) <= n)`을 추가하세요. |
+| `bytea` | `bytea` | MANUAL `OVERSIZED_LOB` | — | 바이트가 정확히 복사됩니다. 1 MiB를 넘는 값은 저장할 수 없으며(Aurora DSQL은 `bytea`를 압축하지 않습니다), 이 컬럼은 기본 키나 인덱스의 일부가 될 수 없습니다(`BYTEA_KEY`). |
+| `boolean`, `uuid` (`bool`) | `boolean`, `uuid` | AUTO | — | 같은 타입입니다. |
+| `json`, `jsonb` | `json`, `jsonb` | MANUAL `OVERSIZED_LOB` | — | 1 MiB(압축 후)를 넘는 문서는 저장할 수 없습니다: Full Load는 그 행을 격리하고 CDC는 dead-letter 처리합니다. 기본 키나 인덱스의 일부가 될 수 없습니다(`PG_UNINDEXABLE_COLUMN`). |
+| `xml` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | — | 문서 텍스트는 유지되지만, `xpath()` 같은 XML 함수는 더 이상 적용되지 않습니다. |
+
+#### 기타
+
+<!-- type-map: postgres -->
+| PostgreSQL 타입 | Aurora DSQL 타입 | 분류 | CDC | 알아 둘 점 |
+|---|---|---|---|---|
+| A user-defined enum (`CREATE TYPE … AS ENUM`) | `text`, with a CHECK on the values | MANUAL `PG_UNSUPPORTED_TYPE` | — | Aurora DSQL에는 `CREATE TYPE`이 없습니다. CHECK가 허용 값을 유지하고 기본값은 텍스트로 유지되며, 정렬은 enum의 순서가 아니라 알파벳순이 됩니다. |
+| A composite type (`CREATE TYPE … AS (…)`) | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | NULL로 도착 | Aurora DSQL에는 `CREATE TYPE`이 없습니다. Schema Conversion에서 컬럼을 `text`로 바꾸세요(그러면 Full Load가 `(1,abc)` 같은 값의 텍스트 형태를 복사합니다). |
+| A domain (`CREATE DOMAIN`) | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | — | Aurora DSQL은 domain을 지원하지만 도구는 domain을 만들지 않습니다: 먼저 Aurora DSQL에 domain을 만들거나, Schema Conversion에서 컬럼을 domain의 기본 타입(과 그 CHECK)으로 바꾸세요. CDC는 그 컬럼을 기본 타입으로 다룹니다. |
+| `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | — | 텍스트 형태(`[1,5)`)로 유지되며, range 연산자(`@>`, `&&`)와 함수(`lower()`, `upper()`)는 더 이상 적용되지 않습니다. |
+| `int4multirange`, `int8multirange`, `nummultirange`, `tsmultirange`, `tstzmultirange`, `datemultirange` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | NULL로 도착 | range와 같습니다(텍스트 형태 `{[1,3),[5,7)}`). |
+| A user-defined range (`CREATE TYPE … AS RANGE`) | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | NULL로 도착 | Schema Conversion에서 컬럼을 `text`로 바꾸세요. |
+| `point` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | — | 텍스트 형태(`(1,2)`)로 유지되며, 기하 연산자는 더 이상 적용되지 않습니다. |
+| `line`, `lseg`, `box`, `path`, `polygon`, `circle` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | NULL로 도착 | `point`와 같습니다. |
+| `inet`, `cidr`, `macaddr`, `macaddr8` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | — | 정규화된 주소 텍스트가 유지되며, 네트워크 연산자와 함수는 더 이상 적용되지 않습니다. |
+| `bit(n)`, with n of 2 or more | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | — | 비트 문자열(`'10101010'`)로 유지되며, 비트 연산자는 더 이상 적용되지 않습니다. |
+| `bit(1)` (`bit`), `bit varying(n)` (`varbit(n)`) | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | 바뀐 값으로 도착 | 위와 같습니다. CDC는 `bit(1)` 값을 `true`/`false`로 쓰고, n보다 짧은 `bit varying(n)` 값은 앞에 0을 채워 씁니다. |
+| `bit varying` (`varbit`), with no length | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | dead-letter 처리 | 위와 같습니다. |
+| `tsvector`, `tsquery` | `text` | MANUAL `PG_UNSUPPORTED_TYPE` | NULL로 도착 | 텍스트로 유지되며, 전문 검색 연산자와 인덱스는 더 이상 적용되지 않습니다. |
+| `integer[]`, `text[]` and other arrays | `jsonb` | MANUAL `PG_UNSUPPORTED_TYPE` | — | JSON 배열로 저장됩니다(`{1,2}`는 `[1, 2]`가 됩니다): 배열 연산자와 첨자는 JSON 연산자로 바꾸세요. 배열 컬럼을 키로 하는 테이블은 적용에 실패합니다(`PG_UNINDEXABLE_COLUMN`). |
+| `numeric[]` (no precision), `time with time zone[]`, `bytea[]` | `jsonb` | MANUAL `PG_UNSUPPORTED_TYPE` | dead-letter 처리 | 배열과 같습니다. `numeric[]`에는 소스에서 정밀도를 지정하세요(`numeric(p,s)[]`는 CDC가 옮깁니다). |
+| `interval[]`, `money[]`, `xml[]`, `point[]`, `bit(n)[]`, `bit varying(n)[]` | `jsonb` | MANUAL `PG_UNSUPPORTED_TYPE` | NULL로 도착 | 배열과 같습니다. 이 표에서 *NULL로 도착*으로 표시한 다른 타입의 배열도 NULL로 도착합니다. |
+| `"char"`, `name`, `oid` | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | — | PostgreSQL 시스템 타입입니다. Schema Conversion에서 컬럼을 `char(1)`, `varchar(63)` 또는 `bigint`로 바꾸세요. |
+| `jsonpath`, `pg_lsn`, `xid`, `regclass` (and `regtype`, `regproc`, …) | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | NULL로 도착 | PostgreSQL 시스템 타입입니다. Schema Conversion에서 컬럼을 `text`로 바꾸세요. |
+| Extension types: `citext`, `hstore`, `ltree`, PostGIS `geometry` and `geography` | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | — | Aurora DSQL에는 확장(extension)이 없습니다. Schema Conversion에서 컬럼을 `text`로 바꾸세요(그러면 Full Load가 값의 텍스트 형태를 복사합니다). 이때 `citext` 컬럼은 대소문자를 구분해 비교합니다. |
+| Extension types: pgvector `vector`, `halfvec`, `sparsevec`, and `cube` | — | UNSUPPORTED `PG_UNSUPPORTED_TYPE` | NULL로 도착 | Schema Conversion에서 컬럼을 `jsonb`나 `text`(`sparsevec`은 `text`)로 바꾸세요. Aurora DSQL에서 어떤 타입이든 CDC는 이 컬럼을 옮길 수 없습니다. |
+
+**Collation.** Aurora DSQL은 텍스트를 `C` collation으로만 비교합니다. 다른 collation을 가진
+컬럼(`PG_COLLATION_DROPPED`)이나 기본 collation이 `C`가 아닌
+데이터베이스(`PG_DATABASE_COLLATION`)는, 모든 값이 정확히 마이그레이션되더라도 옮긴 뒤에는 텍스트를
+다르게 정렬하고 비교합니다.
+
+**Aurora DSQL이 인덱싱할 수 없는 컬럼.** `bytea`, `json`, `jsonb`, `interval`, `time with time zone`
+컬럼과 배열(이제 `jsonb`)은 기본 키나 인덱스의 일부가 될 수 없습니다: 그런 컬럼을 포함한 기본 키는
+테이블 적용을 실패시키고, 그런 컬럼의 인덱스는 생성되지 않습니다(`BYTEA_KEY`,
+`PG_UNINDEXABLE_COLUMN`).
+
+---
+
+## 2.4 Evaluation 항목 참조
+
+Evaluation이 보고하는 항목을 소스 엔진별로 정리한 참조이며, 소스 시간대와 서버 설정도 담고 있습니다.
+리포트를 처리하는 동안 찾아보는 용도로 쓰세요([리포트 활용법](#리포트-활용법)).
+
+### 자주 나오는 항목과 대처 방법
+
+가장 자주 만나게 되는 항목을, 여러분에게 뜻하는 바에 따라 묶었습니다. 화면에서는 각 항목이 관련된
+객체와 값도 밝히고 전체 조언을 보여 줍니다.
+소스 엔진별로 나누었으니 **두 엔진 공통**과 여러분의 엔진 블록만 읽으세요.
+
+시간대와 평가되는 MySQL 설정(`SOURCE_TIME_ZONE`, `SQL_MODE`, `EXPLICIT_DEFAULTS_FOR_TIMESTAMP`,
+`AUTO_INCREMENT_STEP`)은 다음 절에서 설명합니다.
+
+#### 두 엔진 공통
+
+**마이그레이션을 가로막음** (Unsupported)
+
+| 항목 | 할 일 |
 |---|---|
-| **외래 키(지원·강제됨)** | FK를 제거하지 않고 **보존**: 각 FK를 적재 후 실행할 `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`로 내보내(`CREATE TABLE` 밖) 데이터 적재 뒤 다시 생성 — CDC 마이그레이션은 cut over 시점에 적용. `NOT ENFORCED`나 `PERIOD`로 선언한 PostgreSQL 18 키는 생성하지 않음(`PG_FK_NOT_ENFORCED`, `PG_FK_PERIOD`). Evaluation은 이를 **권고(RECOMMENDED)**로 분류하며, 원하면 떼어 낼 수도 있음(`preserve_foreign_keys=False`). 주의점: 참조/피참조 DML의 추가 읽기, 충돌 시 재시도 가능한 `40001`, `CASCADE`/`SET NULL`/`SET DEFAULT`는 트랜잭션당 3,000행 한도에 포함. |
-| **기본 키 필수** | PK 없는 테이블은 **UNSUPPORTED**(적재 불가). |
-| **`TRUNCATE` 없음** | "교체" 적재는 **DROP + 재생성**, `TRUNCATE` 사용 안 함. |
-| **트랜잭션당 한 개 DDL** | 스키마 변환은 실행 단위당 정확히 한 개 DDL 문을 내보냄. |
-| **`CREATE INDEX ASYNC`** | 보조 인덱스를 데이터 적재 후 비동기로 생성. |
-| **낙관적 동시성** | 모든 배치·DDL을 `40001` 재시도로 감쌈. |
-| **컬럼 기본값은 지원됨** | **MySQL 소스:** 소스 `DEFAULT`를 그대로 가져옵니다(`CURRENT_TIMESTAMP[(n)]`, `NOW()`, `CURRENT_DATE`/`CURRENT_TIME`, `LOCALTIME`/`LOCALTIMESTAMP` 포함). `TINYINT(1)` 기본값은 `TRUE`/`FALSE`로 변환하고(`boolean` 컬럼은 `DEFAULT 1`을 거부), 시계를 읽는 `DATETIME` 기본값은 소스의 시간대를 명시하며(UTC 소스라면 `now() AT TIME ZONE 'UTC'`; `SOURCE_TIME_ZONE`, 로더가 컬럼의 벽시계를 그대로 복사하므로), 함수형 기본값은 변환됩니다(`UUID()`→`gen_random_uuid()`, `CURDATE()`→`CURRENT_DATE`, `TIME` 컬럼의 `CURTIME()`→`LOCALTIME`(날짜를 담는 컬럼에서는 MySQL이 그 시각을 현재 날짜에 붙이므로 그 컬럼의 `NOW()`나 `CURDATE()`가 받는 값), `TIMESTAMP`·`DATE`·`TIME` 컬럼의 `NOW(n)`→`CURRENT_TIMESTAMP`(시계 산술 앞에서도), `UTC_TIMESTAMP()`/`UTC_DATE()`→UTC 식. `CHAR`·`VARCHAR`·`TEXT` 컬럼의 시계 기본값은 MySQL이 저장하는 텍스트, 즉 소스 시간대 시계의 `TO_CHAR`를 MySQL 형식(예: `'2026-10-24 13:43:37'`)으로 저장). DSQL에 대응이 없는 기본값(예: 다른 컬럼을 참조하는 식)은 조용히 사라지지 않고 드롭 + **보고**됩니다. 기본값 보존이 가장 중요한 경우는 `NOT NULL` 컬럼입니다: MySQL은 해당 컬럼을 생략한 `INSERT`를 받아주지만 타깃은 거부합니다. **PostgreSQL 소스:** 소스 `DEFAULT`를 PostgreSQL이 저장한 텍스트 **그대로** 가져옵니다(다시 렌더링하지 않음. 소스의 시간대가 UTC가 아니면 시간대 없는 컬럼의 시계 기본값은 그 시간대를 명시) — `serial`/`IDENTITY` `nextval`과 생성 컬럼 표현식만 제거되며 identity는 타깃에서 선택한 PK 전략이 좌우합니다. 변환된 enum 컬럼은 기본값을 평문 텍스트 리터럴로 유지하고 uuid-ossp의 `uuid_generate_v4()`는 `gen_random_uuid()`가 되며, DSQL에 없는 다른 타입으로 캐스팅하거나 DSQL에 없는 함수를 호출하는 기본값은 노트와 함께 제외됩니다. |
-| **`ON UPDATE CURRENT_TIMESTAMP` 없음** | 재현 불가: DSQL에는 `ON UPDATE` 절도, (PostgreSQL의 통상적 우회책인) 트리거도 없습니다. 컬럼은 삽입 시점 기본값을 유지하고 **MANUAL**로 표시됩니다 — 갱신 시 타임스탬프를 애플리케이션에서 명시적으로 설정하세요. |
-| **트리거/저장 프로시저/이벤트 없음** | **UNSUPPORTED** — 애플리케이션으로 재구현(스케줄 이벤트는 EventBridge/Lambda). |
-| **네이티브 파티셔닝 없음** | DSQL이 자동 분산; Schema Conversion이 파티셔닝을 제거하며, 파티션 테이블에는 갭이 아니라 권장사항(파티션에 의존하던 것, CDC 중 파티션 관리 중지)이 붙음. |
-| **클러스터당 하나의 DB** | 다중 DB MySQL 소스의 각 데이터베이스는 자동으로 자체 스키마가 됩니다(`RECOMMENDED`로 표시). 몇 개까지 되는지는 다음 행을 참고하세요. |
-| **데이터베이스당 스키마 ≤ 10, 테이블 ≤ 1,000, 뷰 ≤ 5,000** | Evaluation은 마이그레이션 후 타깃 데이터베이스가 담게 될 개수(소스 객체 + 클러스터에 이미 있는 것; 기본 제공 `public` 스키마는 세지 않고, 빈 스키마는 세며, 이름은 63바이트로 잘린 저장 형태로 비교함)를 세어 초과하면 **UNSUPPORTED**(`SCHEMA_COUNT_LIMIT` / `TABLE_COUNT_LIMIT` / `VIEW_COUNT_LIMIT`)로 표시하고, 준비도 점수는 **Blocked**가 됩니다. 그렇지 않으면 적용이 처음 객체들을 만든 뒤 `54000`으로 실패합니다. 한도에 도달하면 Aurora DSQL은 이미 있는 스키마에 대한 `IF NOT EXISTS`까지 모든 `CREATE SCHEMA`를 거부하므로(라이브 확인), 적용은 카탈로그를 확인해 이미 있는 스키마는 생성된 것으로 처리합니다. |
-| **소스 `CHECK` 제약은 드롭됨** | 소스 `CHECK` 제약(MySQL `CHECK`는 8.0.16+ 필요)은 타깃으로 넘어가지 않고 — 함수/연산자가 DSQL과 다를 수 있음 — **MANUAL**로 표시됩니다: DSQL 호환 `CHECK`를 직접 다시 추가하거나 앱에서 강제하세요. (도구가 `ENUM`용으로 *생성*하는 `CHECK … IN (...)`은 영향 없음.) |
-| **`bytea`는 키가 될 수 없음** | `bytea` 컬럼(`BINARY`/`VARBINARY`, `*BLOB`, spatial 유래)은 **기본 키** 컬럼(테이블 → **UNSUPPORTED**)이나 **인덱스** 컬럼(인덱스 드롭 → **MANUAL**; 드롭된 UNIQUE 인덱스는 더 이상 유일성을 보장하지 않으며 노트에 명시)이 될 수 없습니다. Evaluation도 같은 테이블을 표시합니다(`BYTEA_KEY`). `text`/`uuid`/해시로 re-key하세요. |
-| **키 컬럼 ≤ 8개** | PK 또는 인덱스가 8개 컬럼을 넘으면 DSQL 한도 초과: PK는 **UNSUPPORTED**, 과도한 세컨더리 인덱스는 **드롭(MANUAL)**. |
-| **테이블당 인덱스 ≤ 24개** | DSQL은 테이블당 최대 24개 인덱스 허용(PK 포함 → 세컨더리 ≤ 23). 초과 인덱스는 표시되고 일부는 생성되지 않습니다. |
-| **키 값 ≤ 1 KiB** | 결합된 키 값은 ~1 KiB 미만이어야 합니다; 큰 키는 **권장(recommendation)** 으로 표시(실데이터에서 삽입 시 실패 가능). |
-| **식별자 63바이트** | DSQL/PostgreSQL은 식별자를 (문자 경계에서) 63바이트로 자릅니다. 한 테이블의 두 컬럼 이름이 같은 이름으로 잘리면 테이블이 **UNSUPPORTED**(`IDENTIFIER_LENGTH`)가 됩니다. 한 스키마의 두 테이블이나 뷰가 같은 이름으로 잘려도 **UNSUPPORTED**(`NAME_COLLISION`)이며, 먼저 만들어진 쪽이 다른 쪽의 행을 받게 되므로 Schema Conversion은 둘 다 생성하지 않습니다(Data Migration도 대상으로 제시하지 않습니다). 앞 63바이트가 다르도록 소스에서 이름을 바꾸세요. 스키마 이름도 같은 방식으로 잘리므로, 이름의 앞 63바이트가 같은 두 소스 데이터베이스는 하나의 타깃 스키마를 공유합니다. 아무것과도 충돌하지 않는 긴 이름은 **권장(recommendation)** 입니다: DSQL은 줄인 이름으로 저장합니다. |
-| **인덱스 이름은 스키마 단위로 유일** | Aurora DSQL은 한 스키마의 테이블·뷰·인덱스를 하나의 네임스페이스에 두지만, MySQL은 인덱스 이름을 테이블 단위로 구분합니다. 그래서 Schema Conversion은 같은 스키마의 다른 relation도 쓰는 이름의 인덱스를 **모두** `<table>_<index>`로 자동 변경합니다(필요하면 63바이트로 자르고 해시 접미사를 붙임). 테이블과 뷰는 이름을 유지하고, 뷰 이름도 테이블처럼 따옴표로 감싸 대소문자를 유지합니다. 그래서 UNIQUE를 포함한 모든 인덱스가 생성됩니다. Evaluation과 Schema Conversion은 이름이 바뀐 인덱스를 `RECOMMENDED`(`NAME_COLLISION`)로 표시하며, 기본 키 전략을 바꿔도 같은 이름이 유지됩니다. 이전 적용이 남긴 relation이 다른 객체에 필요한 이름을 차지하고 있으면(테이블 이름과 같은 인덱스 등), 적용은 "already exists"로 건너뛰지 않고 그 객체를 차지한 relation 이름과 함께 **FAILED**로 보고하며, Evaluation의 타깃 분석은 이를 *Names held on the target by another object*에 표시합니다. 이전 버전이 만든 타깃에서도 적용은 이름이 바뀐 인덱스와 따옴표로 감싼 뷰를 새로 만들고, 이전 이름으로 남은 옛 사본을 결과에 알려 줍니다. 옛 인덱스 사본은 Aurora DSQL이 쓰기마다 계속 유지하는 중복 인덱스이고(UNIQUE라면 유일성도 계속 강제), 옛 뷰 사본은 더 이상 소스와 맞춰지지 않습니다. 이 사본은 삭제하세요(**Replace**는 함께 삭제합니다). |
-| **대소문자가 섞인 이름** | Schema Conversion은 모든 이름을 따옴표로 감싸 철자 그대로 유지하고, Aurora DSQL은 **따옴표 없는** 이름을 소문자로 바꿉니다. MySQL은 컬럼 이름을 대소문자 구분 없이 맞추므로, `CustomerId`나 `Orders`를 따옴표 없이 쓰는 애플리케이션 SQL은 컷오버 후 아무것도 찾지 못합니다. Evaluation은 이런 이름과 대소문자만 다른 테이블 이름을 **MANUAL**(`MIXED_CASE_IDENTIFIERS`, MySQL 소스)로 알려 줍니다: 애플리케이션에서 철자 그대로 따옴표로 감싸거나, Schema Conversion 전에 **소스**에서 소문자로 이름을 바꾸세요. 컷오버 전에는 타깃에서 이름을 바꾸지 마세요: Full Load, CDC, Validation, 컷오버 DDL이 모두 소스 철자를 씁니다. ASCII 대문자만 해당합니다 — Aurora DSQL은 그 밖의 문자는 소문자로 바꾸지 않습니다. |
+| 기본 키 없음(`NO_PRIMARY_KEY`) | 소스에서 기본 키를 추가하세요(항목이 승격할 수 있는 유니크 키를 알려 줍니다): 도구는 모든 테이블을 그 키로 적재·복제·검증합니다. |
+| 트리거, 저장 프로시저와 함수, 이벤트; PostgreSQL materialized view와 foreign table(`TRIGGER_UNSUPPORTED`, `PROC_PLPGSQL`, `EVENT_UNSUPPORTED`, `PG_UNSUPPORTED_RELATION`) | 마이그레이션되지 않습니다. 로직은 애플리케이션에, 스케줄은 데이터베이스 밖에(예: Amazon EventBridge Scheduler와 AWS Lambda) 다시 만들고, materialized view는 작업(job)이 갱신하는 테이블로 다시 만드세요. |
+| Aurora DSQL이 인덱싱할 수 없는 컬럼의 기본 키(`BYTEA_KEY`, `PG_UNINDEXABLE_COLUMN`) | 소스에서 테이블의 키를 다시 잡으세요. 예를 들어 그 값의 텍스트나 해시 형태를 키로 씁니다. 그런 컬럼은 MySQL `BINARY`, `VARBINARY`, `BLOB`과 공간 타입(Aurora DSQL에서는 모두 `bytea`), 그리고 PostgreSQL `bytea`, `json`, `jsonb`, `interval`, `time with time zone`과 배열입니다. 그런 컬럼에 대한 인덱스는 생성되지 않으므로(**Review needed**), `UNIQUE` 인덱스였다면 더 이상 유일성을 강제하지 않습니다. |
+| Aurora DSQL 데이터베이스 한도 초과(`TABLE_COUNT_LIMIT`, `SCHEMA_COUNT_LIMIT`, `VIEW_COUNT_LIMIT`) | 타깃 데이터베이스가 이미 담고 있는 것을 포함해 테이블 1,000개, 스키마 10개 또는 뷰 5,000개를 넘게 되며, 점수는 **Blocked**가 됩니다. 마이그레이션을 여러 클러스터로 나누세요. |
+| 테이블이나 이름의 한도 초과(`TOO_MANY_COLUMNS`, `TOO_MANY_KEY_COLUMNS`, `IDENTIFIER_LENGTH`, `NAME_COLLISION`) | 컬럼이 255개를 넘거나, 기본 키가 8개를 넘는 컬럼으로 되어 있거나, (MySQL에서) 이름의 앞 63바이트가 같은 경우입니다: 그런 컬럼이 둘이면 테이블의 `CREATE TABLE`이 실패하고, 그런 테이블이나 뷰가 둘이면 어느 쪽도 생성되지 않습니다. 소스에서 테이블이나 이름을 바꾸세요. |
 
-위 표의 **분류** 열은 Evaluation이 모든 객체에 적용하는 것과 같은 AUTO / MANUAL / UNSUPPORTED
-척도입니다 — 각 분류의 의미와, 여러 규칙이 겹칠 때 가장 엄격한 분류가 이기는 방식은
-[§2.1](#모든-객체가-하나의-분류를-받음)을 참고하세요.
+**데이터를 바꾸거나 거부함** (Review needed)
+
+| 항목 | 할 일 |
+|---|---|
+| Aurora DSQL의 1 MiB 한도를 넘는 값(`OVERSIZED_LOB`) | 적재 전에 크기를 확인하세요([리포트 활용법](#리포트-활용법)의 2단계): Full Load는 그런 값이 있는 행을 격리하고, CDC는 그 행을 dead-letter 처리합니다. |
+| Aurora DSQL에 없는 타입이 바뀜(`PG_UNSUPPORTED_TYPE`, `ENUM_SET_TYPE`, `BIT_TYPE`, `YEAR_TYPE`, `SPATIAL_TYPE`, `PG_CHARACTER_LENGTH`) | 데이터는 대체 타입으로 마이그레이션됩니다(PostgreSQL 배열은 `jsonb`, enum은 CHECK가 붙은 `text`, `money`는 `numeric(23,4)`, MySQL 공간 컬럼은 `bytea`): 애플리케이션을 그 타입에 맞추세요. |
+| 텍스트 비교가 달라짐(`CI_COLLATION`, `PG_COLLATION_DROPPED`, `PG_DATABASE_COLLATION`) | Aurora DSQL은 텍스트를 바이트로 비교하며(`C` collation), 소스의 collation은 옮겨지지 않습니다. MySQL의 대소문자 무시 collation이었다면 `=`, `LIKE`, `ORDER BY`, `UNIQUE`가 대소문자를 구분하게 되고(`Bob`과 `bob`은 서로 다른 값), PostgreSQL의 다른 collation이었다면 텍스트의 정렬 순서가 달라집니다. 그런 쿼리와 키를 검토하세요. |
+
+**컷오버 전에 애플리케이션 변경이 필요함** (Review needed)
+
+| 항목 | 할 일 |
+|---|---|
+| 버려진 기본값, 또는 MySQL `ON UPDATE CURRENT_TIMESTAMP`(`DEFAULT_DROPPED`, `ON_UPDATE_TIMESTAMP`) | 애플리케이션이 값을 설정하게 하세요: 그 컬럼을 생략한 `INSERT`는 NULL을 저장하고(`NOT NULL` 컬럼이면 거부되고), 갱신은 더 이상 타임스탬프를 새로 고치지 않습니다. 버려진 기본값은 적용한 뒤 다시 추가할 수도 있습니다. |
+| 일반 컬럼이 되는 생성 컬럼(`GENERATED_COLUMN`) | 컷오버 후에는 아무것도 그 값을 계산하지 않습니다: 애플리케이션에서 계산하거나, 적용하기 전에 식을 다시 추가하세요([변환이 대신 해 주는 것](#변환이-대신-해-주는-것)). PostgreSQL `STORED` 컬럼은 유지됩니다. |
+| 소스의 `CHECK` 제약(`CHECK_CONSTRAINT_DROPPED`) | 옮겨지지 않습니다. Aurora DSQL이 받아들이는 제약은 적재 후 다시 추가하거나(변환 노트가 그 문장을 제시합니다), 애플리케이션에서 규칙을 강제하세요. |
+| 도구가 재현할 수 없는 뷰(`VIEW_NOT_CONVERTED`, `VIEW_UNSUPPORTED_SQL`, `VIEW_REMODELLED_COLUMN`) | 변환된 그대로는 적용에 실패하거나 다른 결과를 돌려줍니다: 적용하기 전에 타깃 DDL을 편집하거나, 적재 후 직접 다시 만드세요. |
+| 그대로 옮겨지지 않는 인덱스(`UNSUPPORTED_INDEX_TYPE`, `PG_INDEX_NOT_PRESERVED`, `EXPRESSION_INDEX`, `TOO_MANY_INDEXES`) | 전문(full-text)·공간·GIN·GiST 검색은 데이터베이스 밖(예: Amazon OpenSearch Service)으로 옮기고, 식 인덱스는 적재 후 다시 만들며(`CREATE INDEX ASYNC`), 보조 인덱스는 테이블당 23개 이하로 유지하세요. |
+
+#### MySQL 전용
+
+**데이터를 바꾸거나 거부함** (Review needed)
+
+| 항목 | 할 일 |
+|---|---|
+| `TINYINT(1)`이 `boolean`이 됨(`TINYINT_BOOLEAN`) | 0이나 1이 아닌 값은 거부됩니다: Full Load는 테이블을 중단하고, CDC는 그 행을 dead-letter 처리합니다. 컬럼에 다른 숫자가 있다면 적용하기 전에 타깃 타입을 `smallint`로 바꾸세요. |
+| 기간(duration)으로 쓰는 `TIME`(`TIME_TYPE`) | 00:00:00보다 작거나 24:00:00보다 큰 값은 거부됩니다. 기간을 담는 컬럼이면 적재하기 전에 타깃 타입을 `interval`로 바꾸세요. |
+| 0이거나 잘못된 날짜(`ZERO_DATES`) | Aurora DSQL에는 그런 값이 없으므로, Full Load와 CDC는 대신 NULL, 컬럼의 기본값 또는 `1970-01-01`을 씁니다([§6.2](06-limitations.md#62-마이그레이션-프로세스-한계)). 항목이 제시하는 쿼리로 그런 값을 세고, 적재 전에 소스에서 고치세요. |
+
+**컷오버 전에 애플리케이션 변경이 필요함** (Review needed)
+
+| 항목 | 할 일 |
+|---|---|
+| 대소문자가 섞인 이름(`MIXED_CASE_IDENTIFIERS`) | Aurora DSQL은 따옴표 없는 이름을 소문자로 바꾸므로, `CustomerId`를 따옴표 없이 쓰는 SQL은 아무것도 찾지 못합니다. 그런 이름은 철자 그대로 따옴표로 감싸거나, Schema Conversion 전에 소스에서 소문자로 이름을 바꾸세요(컷오버 전에 타깃에서 바꾸지는 마세요). |
+| CDC에서의 외래 키 cascade 동작(`FK_CASCADE_CDC_GAP`) | CDC는 MySQL의 cascade를 복제하지 않습니다: [외래 키](#외래-키)를 참고하세요. |
+
+#### PostgreSQL 전용
+
+**마이그레이션을 가로막음** (Unsupported)
+
+| 항목 | 할 일 |
+|---|---|
+| 행 수준 보안(`PG_ROW_LEVEL_SECURITY`) | 컷오버 후에는 그 테이블에 접근하는 모든 역할이 모든 행에 접근합니다: 정책은 애플리케이션에서 강제하세요(항목이 정책을 나열합니다). 모든 행을 읽는 사용자(슈퍼유저, `BYPASSRLS` 역할, 또는 `FORCE ROW LEVEL SECURITY`가 아닌 테이블의 소유자)로 마이그레이션하세요. 그렇지 않으면 적재가 그 테이블에서 멈춥니다. |
+| 대체 타입이 없는 컬럼 타입(`PG_UNSUPPORTED_TYPE`) | composite 타입, domain, 확장 타입(`citext`, `hstore`, PostGIS, pgvector) 또는 시스템 타입입니다: 적용하기 전에 Schema Conversion에서 컬럼의 타깃 타입을 바꾸세요(예: `text`로). |
+
+**데이터를 바꾸거나 거부함** (Review needed)
+
+| 항목 | 할 일 |
+|---|---|
+| 정밀도 없는 `numeric`(`PG_UNCONSTRAINED_NUMERIC`) | `numeric(18,6)`으로 저장되므로 소수 6자리를 넘으면 반올림되고, 정수부는 최대 12자리입니다. 값에 그 이상이 필요하다면 적용하기 전에 컬럼에 명시적인 `numeric(p,s)`를 지정하세요. |
+| CDC가 옮길 수 없는 컬럼(`CDC_UNCARRYABLE_COLUMN`) | CDC를 쓸 때만 해당합니다: 값이 NULL이나 바뀐 값으로 도착하거나, 행이 dead-letter 처리됩니다. CDC를 배포하기 전에 소스에서 컬럼의 타입을 바꾸거나, 컬럼을 제외하거나, 그 테이블을 Full load only로 옮기세요. |
+
+**컷오버 전에 애플리케이션 변경이 필요함** (Review needed)
+
+| 항목 | 할 일 |
+|---|---|
+| 키가 아닌 `serial`이나 identity 컬럼(`NON_KEY_SEQUENCE`) | 타깃에서는 값을 생성하는 것이 없으므로, 그 컬럼을 생략한 `INSERT`는 거부되거나(`23502`) NULL을 허용하는 컬럼이면 NULL을 저장합니다. 애플리케이션이 값을 지정하게 하거나, 적용하기 전에 타깃 DDL에서 컬럼을 `bigint GENERATED BY DEFAULT AS IDENTITY`로 선언하고(나중에는 타입을 바꿀 수 없습니다) 컷오버 전에 적재된 값 다음으로 재시작하세요. |
+| 어떤 컬럼도 소유하지 않는 시퀀스(`PG_STANDALONE_SEQUENCE`) | 생성되지 않습니다. 컷오버 전에 만들고(항목이 그 문장을 제시합니다), 컷오버 때 소스의 마지막 값 다음으로 옮기세요: 도구는 이를 동기화하지 않습니다([§10.3](10-conclusion.md#103-cut-over-애플리케이션을-dsql로-전환)). |
+| Aurora DSQL이 선언대로 강제할 수 없는 규칙(`PG_EXCLUSION_CONSTRAINT`, `PG_TEMPORAL_KEY`, `PG_FK_PERIOD`) | `EXCLUDE` 제약, `WITHOUT OVERLAPS` 키, `FOREIGN KEY … PERIOD`는 컷오버 후 강제되지 않습니다: 애플리케이션에서 규칙을 강제하거나 설계를 바꾸세요. `WITHOUT OVERLAPS` 기본 키를 가진 큰 테이블은 적재하기 전에 소스에서 그 키 컬럼들에 btree 인덱스를 추가하세요. |
+| `DEFERRABLE` 기본 키나 유니크 키(`PG_DEFERRABLE_KEY`) | 즉시 검사되므로, 두 행이 잠시 같은 키 값을 갖게 하는 쓰기(값 맞바꾸기, 번호 다시 매기기)는 실패합니다. CDC를 쓰면 그런 기본 키는 테이블의 `REPLICA IDENTITY`가 될 수 없습니다: `REPLICA IDENTITY DEFAULT`인 테이블은 소스에서 키를 `NOT DEFERRABLE`로 다시 만들거나 테이블을 `REPLICA IDENTITY FULL`로 설정할 때까지 CDC 사전 요구사항 검사에서 실패합니다. |
+| 설치된 확장(`PG_EXTENSION_UNSUPPORTED`) | Aurora DSQL에는 확장(extension)이 없습니다: 애플리케이션의 확장 호출을 바꾸세요(`gen_random_uuid()`는 내장되어 있습니다). |
+
+#### 조언, 그리고 불완전한 리포트
+
+**조언만** (Recommended). 마이그레이션 자체를 위해 할 일은 없습니다:
+
+- `AUTO_INCREMENT`: 키가 계속 값을 생성합니다([기본 키 전략 선택](#기본-키-전략-선택)). Aurora
+  DSQL에서 아무것도 그 값을 생성하지 않게 되면, 이 항목은 대신 **Review needed**입니다.
+- `FK_PRESERVED`: 외래 키가 유지되며 적재 후에 적용됩니다([외래 키](#외래-키)).
+- `PARTITIONED_TABLE`: 파티션들이 하나의 테이블이 되며, 데이터는 잃지 않습니다. CDC를 쓰면
+  컷오버까지 파티션 관리(drop, truncate, detach, attach)를 멈추세요: CDC는 그런 변경을 옮기지
+  못합니다.
+- `MULTIPLE_DATABASES`(MySQL): 각 데이터베이스가 자체 스키마가 됩니다. 애플리케이션이 스키마로
+  한정한 이름을 쓰게 하거나, `search_path`를 설정하세요.
+- `NAME_COLLISION`(인덱스): 같은 스키마의 다른 테이블·뷰·인덱스가 쓰는 이름의 인덱스는
+  `<table>_<index>`로 생성됩니다.
+- `PG_FK_NOT_ENFORCED`(PostgreSQL 18): 키를 생성하지 않으므로 타깃은 소스처럼 동작합니다. Aurora
+  DSQL이 그런 키를 강제하게 하려면(Aurora DSQL에 그런 형태가 없는 `PERIOD`로 선언한 키는 제외) 그
+  키의 `ALTER TABLE … ADD CONSTRAINT … NOT VALID`를 테이블의 타깃 DDL에 추가하세요.
+
+**리포트가 불완전하면,** 그렇다고 알려 줍니다. MySQL에서는 마이그레이션 사용자가 나열할 수 없는
+객체(`SOURCE_VISIBILITY`: `TRIGGER`, `EVENT` 또는 `SHOW_ROUTINE` 권한이 없는 경우이며, 앞의 두
+권한은 그 객체를 변경하는 것도 허용합니다)와 정의를 읽을 수 없는 뷰(`VIEW_DEFINITION_UNREADABLE`:
+`SHOW VIEW` 권한이 없는 경우)입니다. PostgreSQL에서는 실패한 카탈로그
+읽기(`PG_CATALOG_UNREAD`)입니다. 두 엔진 모두에서는 Evaluation이 카탈로그를 읽는 동안 사라진
+테이블(`CATALOG_CHANGED_DURING_READ`)입니다. 보지 못한 객체는 평가되지도 마이그레이션되지도
+않습니다: 빠진 권한을 부여하거나(또는 관리자로서 그 객체를 검토하거나), Evaluation을 다시
+실행하세요.
+
+### 소스 시간대와 서버 설정
+
+Aurora DSQL 세션은 다른 시간대를 설정하지 않는 한 UTC로 실행되지만, 시간대 없는 컬럼은 쓰인 그대로
+소스의 벽시계를 담습니다. 그래서 Evaluation이 읽은 시간대가 UTC가 아니면, Schema Conversion은 시계를
+읽는 곳마다 그 시간대를 자동으로 써 넣습니다: `DATETIME`(`timestamp`) 기본값은
+`DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`이 되고, MySQL 뷰의 `NOW()`는 그 시간대의 시계를
+읽습니다. PostgreSQL 뷰는 그대로 복사되므로, 항목은 시계를 읽는 뷰를 검토할 수 있도록 나열합니다.
+
+`SOURCE_TIME_ZONE` 항목(**Review needed**)은 해당 컬럼과 뷰를 알려 줍니다. 여러분이 할 일은
+애플리케이션에 있습니다: 애플리케이션이 세션 시간대에 의존한다면(그런 컬럼에 `NOW()`나
+`CURRENT_DATE`를 쓰거나 그런 컬럼과 비교한다면), 새 Aurora DSQL 연결마다
+`SET TIME ZONE 'Asia/Seoul'`을 실행하거나 SQL에 시간대를 직접 쓰게 하세요. 시간대를 판별할 수 없으면
+권고 항목이 그렇다고 알리며, 변환은 UTC를 가정합니다: 소스가 UTC가 아니라면 Schema Conversion에서 그
+기본값들을 편집하고 애플리케이션에서 시간대를 설정하세요. 읽는 시간대는 애플리케이션 세션이 기본으로
+받는 시간대입니다: MySQL에서는 GLOBAL `time_zone`(또는 파라미터 그룹의 `init_connect`가 설정하는
+값), PostgreSQL에서는 기본 `TimeZone`이며, `ALTER DATABASE`나 `ALTER ROLE` 기본값은 포함하지만
+마이그레이션 사용자 자신의 기본값은 포함하지 않습니다.
+
+MySQL 소스에서는 설정 세 가지가 더 평가되며, 각각 데이터베이스 수준의 **Review needed**
+항목입니다(`ZERO_DATES`는 위의 표에 있습니다):
+
+| 소스의 설정 | 항목 | Aurora DSQL에서의 의미 |
+|---|---|---|
+| `ONLY_FULL_GROUP_BY`가 없는 `sql_mode` | `SQL_MODE` | `GROUP BY`로 정해지지 않는 컬럼을 선택하는 뷰나 쿼리는 거부됩니다(`42803`). 뷰라면 Schema Conversion이 적용할 때입니다. 같은 항목이 `ANSI_QUOTES`와 `PIPES_AS_CONCAT`도 표시합니다: 이 모드에서는 Query Converter에 붙여 넣는 SQL이 다른 뜻이 됩니다. |
+| `explicit_defaults_for_timestamp=OFF` | `EXPLICIT_DEFAULTS_FOR_TIMESTAMP` | MySQL에서는 `NOT NULL`로 선언된 `TIMESTAMP` 컬럼에 NULL을 쓰면 현재 시각이 저장되었지만, Aurora DSQL은 그 쓰기를 거부합니다. 애플리케이션이 시각을 쓰게 하거나, `INSERT`에서 그 컬럼을 빼세요. |
+| 1보다 큰 `auto_increment_increment` | `AUTO_INCREMENT_STEP` | Aurora DSQL의 identity는 1씩 증가합니다: 그 증가폭에 의존하는 로직(writer별 키 범위)은 애플리케이션으로 옮기세요. |
+
+---
+
+## 2.5 AI 어시스트 (선택)
+
+AI 어시스트는 두 단계 모두에서 쓸 수 있습니다. 이 절은 무엇을 하는지와 켜는 방법을 설명합니다.
+
+### 선택적 AI 어시스트 (Amazon Bedrock)
+
+AI 어시스트는 선택 사항이며 기본적으로 꺼져 있고, Amazon Bedrock에서만 동작합니다. 변환 중 사람의
+판단이 필요한 부분을 돕습니다:
+
+- **Evaluation**에서는 항목 옆의 **Ask AI about this finding** 아이콘이 그 항목에 대한 **AI DBA**
+  패널을 엽니다.
+- **Schema Conversion**에서는 변환 경고 옆의 AI 아이콘이나
+  **Ask AI DBA about converting this object**가 그 객체에 대한 AI DBA를 엽니다. 답변에 DDL이 있으면
+  **Use as target DDL**이 그 문장들을 객체의 타깃 DDL로 복사하며, 다른 편집과 마찬가지로 검토하고
+  적용합니다. 트리거·루틴·이벤트에 대해서는 **Ask AI DBA how to reimplement these**가 각각을 다시
+  만드는 방법을 알려 줍니다.
+
+AI 어시스트는 결정론적 변환을 대체하지 않고(AI를 꺼도 워크플로는 같습니다), 여러분이 적용하기 전에는
+타깃에 닿지 않으며, 스키마와 DDL 메타데이터만 보고 Full Load나 CDC의 행 데이터는 절대 보지 않습니다.
+
+**켜는 방법:**
+
+1. **Connect** 화면에서 **AI Assist**를 펼치고 **Enable AI Assist**를
+   켭니다(**Bedrock settings**에서 모델과 리전 설정). API 키 입력란은 없습니다: AI 어시스트는 도구의
+   AWS 자격증명으로 Bedrock을 호출하며, 이 자격증명에는 선택한 모델(기본값
+   `global.anthropic.claude-sonnet-5`)에 대한 `bedrock:InvokeModel`과
+   `bedrock:InvokeModelWithResponseStream`이 필요합니다. AWS에 호스팅한 배포에서는 스택도 이를 켜야
+   합니다:
+   [Enable AI-assisted conversion (optional)](../../../deploy/DEPLOYMENT.md#enable-ai-assisted-conversion-optional)을
+   참고하세요. 호출마다 Bedrock 비용과 약간의 지연이 추가됩니다.
+2. **Verify AI access** 사전 점검(preflight)을 사용하세요. 이 자격증명으로 설정된 모델을 호출해 보는
+   비차단 점검입니다(유효한 AWS 프로필만으로는 `bedrock:InvokeModel`이 **보장되지 않음**). Bedrock이
+   그 모델을 사용할 수 없다고 하거나 모델 약관 외의 이유로 거부하면 점검은 대체(fallback) 모델도
+   시도하고, 대체 모델이 응답하면 Model ID가 그 모델로 바뀌며 결과는 두 모델을 모두 밝히는 경고가
+   됩니다.
+
+**모델이 계정에서 활성화되지 않았다면.** Bedrock의 Anthropic 모델은 AWS Marketplace
+약관(agreement)을 통해 계정마다 한 번 활성화됩니다. 그러면 AI DBA 패널과 Connect 화면의 AI Assist
+상태가 *the configured model is not enabled for this AWS account yet* 이라고 알립니다(최초
+사용(first-time use) 양식이 제출되지 않은 경우에는 대신 *not enabled or not available* 로 보고될 수
+있습니다). AWS Marketplace 권한이 있는 사람이 Amazon Bedrock 콘솔에서 모델 약관을 수락하고(양식을
+요구하면 제출), 약 2분 기다린 뒤 **Verify AI access**를 다시 실행하세요(명령줄 절차는
+`deploy/DEPLOYMENT.md`에 있습니다). 새 계정에서는 통과가 일시적일 수 있습니다: 약관이 없어 호출이
+멈추기 전까지 최대 약 15분 동안은 호출이 성공할 수 있습니다.
 
 ---
 

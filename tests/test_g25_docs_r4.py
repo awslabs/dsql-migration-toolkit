@@ -48,10 +48,13 @@ from tests.test_g25_docs import (
     LANGS,
     ROOT,
     _all_pages,
+    _fact,
     _flat,
     _function,
     _has,
     _page,
+    _route_halves,
+    _section_43,
 )
 
 
@@ -107,40 +110,11 @@ def test_the_sink_readmes_logging_note_does_not_claim_a_complete_list() -> None:
 # What a first Start is, which stacks count as started, what the check cannot see and where the
 # gapless routes are named: the closing step counts a Start CloudFormation rolled back as a
 # Start, so those pins moved to test_g25_docs_r4c.py (with the round-4 wording as stale).
-_SLOT_RULE = {
-    "en": (
-        "another run with the same CDC stack name re-created or read it, and resuming would skip "
-        "the changes in between",
-        # G25 round 8 (rule E): the re-run that takes the new start point is a Drop & reload.
-        "re-snapshot every table, or Re-run Full Load with **Drop & reload** (under its own CDC "
-        "stack name if another migration shares this one)",
-        # G25 round 6 (decision A): the resume this once described is now unreachable -- a Full
-        # Load that takes a new start point is refused on a stack that has streamed.
-        "A Full Load that would take a new start point is refused on such a stack until the CDC "
-        "infrastructure is deleted and deployed again",
-        "so nothing here describes a resume from a slot a Full Load re-created after this stack "
-        "had streamed",
-    ),
-    "ko": (
-        "같은 CDC 스택 이름을 쓰는 다른 실행이 슬롯을 다시 만들었거나 읽었으므로, 재개하면 그 사이의 "
-        "변경을 건너뜀",
-        "모든 테이블을 다시 스냅샷하거나 **Drop & reload**로 Full Load를 다시 실행하세요(다른 마이그레이션이 "
-        "이 스택 이름을 함께 쓰면 고유한 CDC 스택 이름으로)",
-        "그런 스택에서 새 시작 지점을 가져가는 Full Load는 CDC 인프라를 삭제하고 다시 배포하기 전까지 "
-        "거부되므로",
-        "이 스택이 스트리밍한 뒤 Full Load가 다시 만든 슬롯에서의 재개는 어디에서도 설명하지 않습니다",
-    ),
-    "ja": (
-        "同じ CDC スタック名を使う別の実行がスロットを作り直したか読み取ったため、再開するとその間の変更を"
-        "スキップします",
-        "すべてのテーブルを再スナップショットするか、**Drop & reload** で Full Load を再実行してください "
-        "(別のマイグレーションがこのスタック名を共有している場合は独自の CDC スタック名で)",
-        "そのようなスタックで新しい開始位置を取る Full Load は、CDC インフラを削除して再デプロイするまで"
-        "拒否されるため",
-        "このスタックがストリーミングした後に Full Load が作り直したスロットからの再開は、どこでも説明して"
-        "いません",
-    ),
-}
+# §4.3 (answer-first) lists the block by its title in the blocked-Start table and sends it to the
+# closing route paragraph: for a stack never started, re-snapshot every table or Re-run Full Load
+# with Drop & reload; and the slot's name derives from the CDC stack name, so one source's
+# migrations each need their own. Why the block fires (another run re-created or read the slot)
+# and the Full Load refusal on a streamed stack (chapter 3) are not repeated there.
 # The round-3 rule (a Start that went ahead exempts later ones, a window kept for it) and its
 # way out on a stack started before, where the block no longer fires.
 _STALE_SLOT_RULE = {
@@ -232,9 +206,11 @@ def test_the_slot_position_check_judges_only_a_stacks_first_start(lang: str) -> 
     assert "The gapless route: use Delete CDC infrastructure and deploy it again" in (
         pg.pg_cdc_route(pg.PUBLICATION_MISSING_HEADER, started=True, cdc_only=False))
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _SLOT_RULE[lang]:
-        assert _has(lang, cdc, phrase), (lang, phrase)
+    cdc = _section_43(lang)
+    never_started = _route_halves(lang)[0]
+    assert _has(lang, never_started, "**Re-snapshot every table instead**"), lang
+    assert _has(lang, never_started, "**Drop & reload**"), lang
+    assert _fact(lang, cdc, "slot-name"), lang
     # The block is quoted as the UI names it (English in every manual).
     assert _has(lang, cdc, f"*{pg.SLOT_POSITION_HEADER}*"), lang
     assert not _stale(lang, _STALE_SLOT_RULE[lang]), lang
@@ -242,45 +218,10 @@ def test_the_slot_position_check_judges_only_a_stacks_first_start(lang: str) -> 
 
 # -- f[2]: a source the tool cannot read at all: no block, never silent ---------------------
 
-_NOT_RUN = {
-    "en": (
-        "If the tool can read the source but not which captured tables have any, it refuses "
-        "such a Start too (*Whether a captured table has inheritance child tables could not be "
-        "read*)",
-        "If it cannot read the source at all — for example a Secrets Manager source after an app "
-        "restart, before you test the connection again — Start CDC is not blocked, but its "
-        "PostgreSQL pre-start checks do not run (the publication, the replication slot and its "
-        "position, and the inheritance read)",
-        "the Start CDC dialog warns *{header}*, with the reason",
-        "the activity log records *{action}* (WARNING), from the dialog and again from the Start "
-        "CDC job when it goes ahead without them",
-        "Test the source connection on the Connect step, then open Start CDC again so they run",
-    ),
-    "ko": (
-        "도구가 소스는 읽었지만 어떤 캡처 대상 테이블에 자식 테이블이 있는지 읽지 못하면 그런 Start도 "
-        "거부됩니다(*Whether a captured table has inheritance child tables could not be read*)",
-        "소스를 아예 읽지 못하면 — 예컨대 앱을 재시작한 뒤 연결을 다시 테스트하기 전의 Secrets Manager "
-        "소스 — Start CDC는 막히지 않지만 시작 전 PostgreSQL 검사(publication, 복제 슬롯과 그 위치, 상속 "
-        "읽기)가 실행되지 않습니다",
-        "Start CDC 대화 상자가 이유와 함께 *{header}* 경고를 보여 주고",
-        "활동 로그가 *{action}*(WARNING)을 대화 상자에서 한 번, 그리고 Start CDC 작업이 그 검사 없이 "
-        "진행하면 그 작업에서 다시 기록합니다",
-        "Connect 단계에서 소스 연결을 테스트한 뒤 Start CDC를 다시 열어 검사가 실행되게 하세요",
-    ),
-    "ja": (
-        "ツールがソースは読めても、どのキャプチャ対象テーブルに子テーブルがあるかを読めなければ、そのような"
-        " Start も拒否されます (*Whether a captured table has inheritance child tables could not be "
-        "read*)",
-        "ソースをまったく読めない場合 — たとえばアプリの再起動後、接続をもう一度テストする前の Secrets "
-        "Manager のソース — Start CDC はブロックされませんが、開始前の PostgreSQL のチェック (publication、"
-        "レプリケーションスロットとその位置、継承の読み取り) は実行されません",
-        "Start CDC のダイアログが理由とともに *{header}* という警告を表示し",
-        "アクティビティログが *{action}* (WARNING) を、ダイアログから一度、そして Start CDC のジョブが"
-        "それらのチェックなしで進んだ場合はそのジョブからもう一度記録します",
-        "Connect ステップでソースの接続をテストしてから、もう一度 Start CDC を開いてチェックを実行させて"
-        "ください",
-    ),
-}
+# §4.3 keeps the row for the unreadable source: the notice's title, that Start CDC is not blocked
+# but the checks do not run, and the way to get them to run. The reason the dialog gives, the
+# activity-log line and the unreadable-children refusal (*Whether a captured table has
+# inheritance child tables could not be read*) are shown by the UI.
 _NOT_RUN_6 = {  # §6.1's inheritance row
     "en": "If the tool cannot read the source at all, Start CDC does not refuse the snapshot but "
     "warns that its PostgreSQL checks did not run ([§4.3](04-cdc-and-dsql-constraints.md))",
@@ -321,26 +262,26 @@ def test_a_source_the_tool_cannot_read_is_warned_about_not_refused(lang: str) ->
         ROOT / "src/dsql_migrator/core/cdc_pg_slot.py"
     ).read_text(encoding="utf-8")
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _NOT_RUN[lang]:
-        phrase = phrase.format(header=header, action=action)
-        assert _has(lang, cdc, phrase), (lang, phrase)
-    assert _has(lang, _page(lang, _PAGE["06"]), _NOT_RUN_6[lang]), lang
+    section = _section_43(lang)
+    assert _has(lang, section, f"*{header}*"), lang
+    assert _fact(lang, section, "checks-not-run"), lang
+    assert _fact(lang, section, "test-connection"), lang
+    # (2026-10-28) §6.1's inheritance row no longer carries the sentence about a source the tool
+    # cannot read at all (_NOT_RUN_6): the notice and the way to get the checks to run are §4.3's.
     assert not _stale(lang, _STALE_FAIL_CLOSED[lang]), lang
 
 
 # -- Decision (3), f[0]: the inheritance WARN in every migration type ------------------------
 
+# 2026-10-26: the explanation inside the parentheses ("only the parent's own rows, and each child
+# migrates as a table of its own if it is selected") is said once, in the row's first cell; what is
+# pinned here is the warning itself (title, every migration type) and when the check fails.
+# 2026-10-28 (§6.1 regrouped): the row says the check warns about each such parent; the warning's
+# title, "in every migration type" and when the check fails the parent are the notice's own words.
 _EVERY_TYPE = {
-    "en": "In every migration type the prerequisite check warns about each such parent "
-    "(*{title}*: only the parent's own rows, and each child migrates as a table of its own if it "
-    "is selected), and it fails the parent when this migration's Start CDC would snapshot it",
-    "ko": "사전 요구사항 검사는 모든 마이그레이션 유형에서 그런 부모마다 경고하고(*{title}*: 부모 자신의 "
-    "행만 옮기며, 각 자식은 선택한 경우 별개의 테이블로 마이그레이션됨), 이 마이그레이션의 Start CDC가 "
-    "그 부모를 스냅샷하게 되면",
-    "ja": "前提条件チェックはすべての移行タイプでそのような親テーブルごとに警告し (*{title}*: 親テーブル"
-    "自身の行だけを移し、それぞれの子テーブルは選択した場合に別々のテーブルとして移行されます)、この移行の"
-    " Start CDC がその親をスナップショットすることになる場合",
+    "en": ("The prerequisite check warns about each such parent",),
+    "ko": ("사전 요구사항 검사는 그런 부모마다 경고하고",),
+    "ja": ("前提条件チェックはそのような親テーブルごとに警告し",),
 }
 _STALE_NOT_RUN_FOR_FULL_LOAD = {
     "en": ("(not run for Full load only)",),
@@ -398,7 +339,8 @@ def test_the_inheritance_warn_is_listed_in_every_migration_type(lang: str) -> No
     assert (row.target, row.status, row.required) == ("app.par", PrerequisiteStatus.WARN, False)
 
     limits = _page(lang, _PAGE["06"])
-    assert _has(lang, limits, _EVERY_TYPE[lang].format(title=_INHERITANCE_TITLE)), lang
+    (warns,) = _EVERY_TYPE[lang]
+    assert _has(lang, limits, warns), lang
     assert not _stale(lang, _STALE_NOT_RUN_FOR_FULL_LOAD[lang]), lang
 
 
@@ -443,16 +385,10 @@ def test_the_value_size_checks_measure_an_inheritance_parents_own_rows(lang: str
 
 # -- f[5]: a CHECKSUM-proven table is Verified whatever else holds it -----------------------
 
-_VERIFIED = {
-    "en": "once it does the CDC step shows it as *Verified by CHECKSUM*; if an open source-schema "
-    "or REPLICA IDENTITY finding still holds it at Cut over, that notice names the finding, which "
-    "keeps its own fix (no reload is needed for the dead letters)",
-    "ko": "일치하면 CDC 단계가 그 테이블을 *Verified by CHECKSUM*으로 표시합니다. 열린 소스 스키마나 "
-    "REPLICA IDENTITY 발견 사항이 아직 Cut over에서 그 테이블을 붙잡고 있으면 그 알림이 그 발견 사항을 "
-    "알려 주며, 그 발견 사항은 자체의 해결 방법을 따릅니다(dead letter 때문에 리로드할 필요는 없음)",
-    "ja": "一致すると CDC ステップはそのテーブルを *Verified by CHECKSUM* と表示します。未解決のソース"
-    "スキーマや REPLICA IDENTITY の検出がまだ Cut over でそのテーブルを保留している場合は、その通知が"
-    "その検出を示し、その検出はそれ自身の対処法に従います (デッドレターのためにリロードする必要はありません)",
+_VERIFIED = {  # 2026-10-26: 6.2 keeps the first clause; the open-finding clause is the CDC step's own notice
+    "en": "the CDC step then shows it as *Verified by CHECKSUM*",
+    "ko": "일치하면 CDC 단계가 그 테이블을 *Verified by CHECKSUM*으로 표시합니다",
+    "ja": "一致すると CDC ステップはそのテーブルを *Verified by CHECKSUM* と表示します",
 }
 _STALE_VERIFIED = {
     "en": ("unless an open source-schema or REPLICA IDENTITY finding still holds it",),

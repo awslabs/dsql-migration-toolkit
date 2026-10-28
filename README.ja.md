@@ -266,18 +266,19 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 
 - スキーマとデータの読み取り権限を持つユーザーが設定されたソース **RDS / Aurora MySQL** *または* **PostgreSQL**
   （CDC にはレプリケーション権限が必要で、MySQL の Full load + CDC 実行には、ソースが
-  `gtid_mode=ON` でない限り `RELOAD` も必要: [§1.1](docs/manual/ja/01-setup.md#11-前提条件)）。
+  `gtid_mode=ON` でない限り `RELOAD` も必要: [§1.6](docs/manual/ja/01-setup.md#16-cdc-のためのソース準備)）。
   **対応エンジン/バージョン**（エンドツーエンドで検証済み）: **RDS for MySQL** / **Aurora MySQL**
   5.7 / 8.0 / 8.4（5.7 は Extended Support 対象だがソースとして完全サポート）、および **RDS for
-  PostgreSQL** / **Aurora PostgreSQL** 13–16（CDC は `pgoutput` による論理レプリケーションが必要）。
+  PostgreSQL** / **Aurora PostgreSQL** 13–18（CDC は `pgoutput` による論理レプリケーションが必要）。
 - ソースと**同一リージョン**のターゲット **Aurora DSQL** クラスター（IAM トークン認証、パスワードなし）。
 - 標準チェーン（環境変数 / `~/.aws` / プロファイル）で利用可能な、`dsql:DbConnect`（`admin`
   ユーザーは `dsql:DbConnectAdmin`）権限を持つ **AWS 認証情報**。オプションで
   `secretsmanager:GetSecretValue`、`bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`(AI アシスト)。
 - **ローカル実行時のみ:** Python 3.10 以降（3.12 固定）、[`uv`](https://docs.astral.sh/uv/)。
 
-> ソース DB・CDC のセットアップ（binlog / 論理レプリケーション など）を含む完全なチェックリストは
-> [ユーザーマニュアル §1.1](docs/manual/ja/01-setup.md) を参照。
+> 完全なチェックリストは [ユーザーマニュアル §1.1](docs/manual/ja/01-setup.md#11-前提条件)、
+> ソース DB・CDC のセットアップ（binlog / 論理レプリケーション など）は
+> [§1.6](docs/manual/ja/01-setup.md#16-cdc-のためのソース準備) を参照。
 
 ---
 

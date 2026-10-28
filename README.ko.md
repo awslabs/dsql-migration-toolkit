@@ -248,18 +248,18 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 
 - 스키마·데이터를 읽을 수 있는 사용자를 가진 소스 **RDS / Aurora MySQL** 또는 **PostgreSQL**(CDC에는
   복제 권한이, MySQL Full load + CDC 실행에는 소스가 `gtid_mode=ON`이 아니면 `RELOAD`가 필요:
-  [§1.1](docs/manual/ko/01-setup.md#11-사전-요구사항)).
+  [§1.6](docs/manual/ko/01-setup.md#16-cdc를-위한-소스-준비)).
   **지원 엔진/버전**(end-to-end 검증됨): **RDS for MySQL** / **Aurora MySQL** 5.7 / 8.0 / 8.4
   (5.7은 Extended Support이지만 소스로 완전 지원), 그리고 **RDS for PostgreSQL** / **Aurora
-  PostgreSQL** 13–16 (CDC는 `pgoutput` 논리 복제 필요).
+  PostgreSQL** 13–18 (CDC는 `pgoutput` 논리 복제 필요).
 - 소스와 **동일 리전**의 타깃 **Aurora DSQL** 클러스터(IAM 토큰 인증, 비밀번호 없음).
 - 표준 체인(환경 변수 / `~/.aws` / 프로필)으로 도달 가능하고 `dsql:DbConnect`(admin 사용자는
   `dsql:DbConnectAdmin`) 권한이 있는 **AWS 자격증명**. 선택적으로 `secretsmanager:GetSecretValue`,
   `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`(AI 보조).
 - **로컬 실행 시에만:** Python 3.10+(3.12 고정), [`uv`](https://docs.astral.sh/uv/).
 
-> 소스 DB·CDC 설정(binlog / 논리 복제 등)을 포함한 전체 체크리스트:
-> [사용자 매뉴얼 §1.1](docs/manual/ko/01-setup.md).
+> 전체 체크리스트: [사용자 매뉴얼 §1.1](docs/manual/ko/01-setup.md#11-사전-요구사항),
+> 소스 DB·CDC 설정(binlog / 논리 복제 등): [§1.6](docs/manual/ko/01-setup.md#16-cdc를-위한-소스-준비).
 
 ---
 

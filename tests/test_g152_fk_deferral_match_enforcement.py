@@ -1001,16 +1001,17 @@ def _chapter(language: str, name: str) -> str:
 @pytest.mark.parametrize("language", ["en", "ko", "ja"])
 def test_the_manual_states_what_happens_to_these_keys(language: str) -> None:
     conversion = _chapter(language, "02-evaluation-and-schema-conversion.md")
-    evaluation = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0]
-    for spelled in ("`PG_DEFERRABLE_KEY`", "`PG_FK_NOT_ENFORCED`", "`MATCH FULL`",
-                    "`NOT ENFORCED`", "`INITIALLY DEFERRED`"):
+    # Chapter 2 is a user guide (2026-10-25): it names the finding and what the user does;
+    # the implementation detail this test pinned lives in the CHANGELOG.
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    evaluation = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + conversion.split("## 2.4", 1)[1]
+    for spelled in ("`PG_DEFERRABLE_KEY`", "`PG_FK_NOT_ENFORCED`"):
         assert spelled in evaluation, (language, spelled)
     schema = conversion.split("## 2.2", 1)[1].split("## 2.3", 1)[0]
-    for spelled in ("`MATCH FULL`", "`DEFERRABLE INITIALLY DEFERRED`", "`RESTRICT`",
-                    "`NOT ENFORCED`"):
+    for spelled in ("`MATCH FULL`", "`RESTRICT`", "`NOT ENFORCED`"):
         assert spelled in schema, (language, spelled)
-    reference = conversion.split("## 2.3", 1)[1]
-    assert "`PG_DEFERRABLE_KEY`" in reference and "`DEFERRABLE`" in reference
+    assert "`DEFERRABLE" in schema, language
     limits = _chapter(language, "06-limitations.md").split("## 6.1", 1)[1].split("## 6.2", 1)[0]
     for spelled in ("`PG_DEFERRABLE_KEY`", "`PG_FK_NOT_ENFORCED`", "`MATCH FULL`",
                     "`NOT ENFORCED`"):

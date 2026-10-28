@@ -469,28 +469,17 @@ _P13 = "13-excluding-tables-and-columns.md"
 _PINS = {
     _P03: {
         # G135: the wait is the Full Load step's; the page header's Run meets the G25 gate first
-        # on a stack that has streamed (test_the_header_run_is_refused_with_the_wait).
+        # on a stack that has streamed (test_the_header_run_is_refused_with_the_wait). Chapter 3
+        # shows it as one row of the CDC-state table (2026-10-25), so it is pinned per cell.
         "operation-wait": {
-            "en": "While a **Start CDC**, **Stop CDC** or **Delete CDC infrastructure** is still "
-            "in progress, the Full Load step's actions stay disabled, but the reason they give "
-            "is to wait for it to finish (the CDC step shows its progress), not to Stop CDC "
-            "first. The page header's **Run** starts nothing then either; on a stack that has "
-            "streamed it names the delete-and-redeploy route above instead of the wait. Once a "
-            "Stop or a Delete has finished, a Retry or a Reload runs; once a Start has CDC "
-            "streaming, Stop CDC comes first again.",
-            "ko": "**Start CDC**, **Stop CDC** 또는 **Delete CDC infrastructure**가 아직 진행 중인 "
-            "동안에도 Full Load 단계의 작업들은 비활성화된 채로 있지만, 이때 알려 주는 이유는 먼저 "
-            "Stop CDC를 하라는 것이 아니라 그 작업이 끝나기를 기다리라는 것입니다(CDC 단계에 진행 "
-            "상황이 표시됨). 그동안 페이지 헤더의 **Run**도 아무것도 시작하지 않으며, 스트리밍한 적 있는 "
-            "스택에서는 기다리라는 대신 위의 삭제 후 재배포 경로를 알려 줍니다. Stop이나 Delete가 끝나면 "
-            "Retry나 Reload가 실행되고, Start로 CDC가 스트리밍을 시작하면 다시 Stop CDC가 먼저입니다.",
-            "ja": "**Start CDC**、**Stop CDC**、**Delete CDC infrastructure** がまだ進行中の間も、"
-            "Full Load ステップの操作は無効のままですが、示される理由は、先に Stop CDC することではなく、"
-            "その操作が終わるまで待つことです (CDC ステップに進行状況が表示されます)。このときページ"
-            "ヘッダーの **Run** も何も開始せず、ストリーミングしたことのあるスタックでは、待つ代わりに"
-            "上記の削除と再デプロイの方法を示します。Stop または Delete が終わると Retry や Reload が"
-            "実行でき、Start で CDC がストリーミングを始めると、再び Stop CDC が先になります。",
+            "en": "wait for it to finish (the CDC step shows its progress)",
+            "ko": "끝나기를 기다리세요(CDC 단계에 진행 상황이 표시됨)",
+            "ja": "終わるまで待ってください (CDC ステップに進行状況が表示されます)",
         },
+        # (2026-10-28) The manual no longer spells out what the page header's Run does during
+        # a CDC operation, nor that a Retry or a Reload runs once a Stop or a Delete has
+        # finished: both are UI behavior a tool user does not need to read (the Live row
+        # already says Stop CDC comes first). The code assertions above still pin them.
         # G137: a MySQL table splits in Full load + CDC (CDC replays the load from its start
         # point), PostgreSQL in any run (one shared snapshot).
         "sharding": {

@@ -340,7 +340,7 @@ def test_the_manual_says_a_key_is_left_as_stored_and_quotes_the_new_pin(language
     assert "`1525`" not in zero_dates
     full_load = _chapter(language, "03-full-load.md").split("## 3.3", 1)[1].split("## 3.4", 1)[0]
     assert _FULL_LOAD_KEY[language] in full_load
+    # Chapter 2 no longer quotes the tool's own session settings (a user guide since
+    # 2026-10-25); it must still never state the old empty pin.
     evaluation = _chapter(language, "02-evaluation-and-schema-conversion.md")
-    section = evaluation.split("## 2.1", 1)[1].split("### ", 1)[0]
-    assert "`SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'`" in section
-    assert "sql_mode = ''" not in evaluation and "`1525`" in section
+    assert "sql_mode = ''" not in evaluation

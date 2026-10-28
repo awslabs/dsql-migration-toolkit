@@ -14,211 +14,84 @@ CDC が必要になるのは、**大規模または継続的な** マイグレ�
 
 ## 4.1 パイプライン
 
-<p align="center">
-  <img src="../../images/architecture-cdc-pipeline.png" alt="CDC パイプライン: ソース変更ログ（MySQL binlog / PostgreSQL の論理レプリケーションスロット経由の WAL）→ Debezium ソースコネクタ → Amazon MSK（PK でキー付けしたテーブルごとのトピック + DLQ）→ カスタム DSQL シンクコネクタ → Aurora DSQL" width="900">
-</p>
+<p align="center"> <img src="../../images/architecture-cdc-pipeline.png" alt="CDC パイプライン: ソース変更ログ（MySQL binlog / PostgreSQL の論理レプリケーションスロット経由の WAL）→ Debezium ソースコネクタ → Amazon MSK（PK でキー付けしたテーブルごとのトピック + DLQ）→ カスタム DSQL シンクコネクタ → Aurora DSQL" width="900"> </p>
 
-- **Debezium source connector（MySQL または PostgreSQL）** は、ソースの変更ログ — MySQL はバイナリログ、PostgreSQL は論理レプリケーションスロット経由の write-ahead log (WAL) — を読み込み、変更イベントを出力します。ソースは読み取り専用のままで、認められた例外は 2 つです: PostgreSQL ソースではツールがマイグレーション対象テーブルだけにスコープした論理スロットと publication を作成（し、解体時に削除）します。また、`gtid_mode=ON` でない MySQL ソースでは、Full load + CDC の実行が開始位置を記録した直後に `FLUSH BINARY LOGS` を 1 回実行します ([§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
-- **Amazon MSK (Kafka)** は耐久性のあるバックボーンです。**テーブルごとに 1 トピック** を持ち、主キーでキーイングし (ある行のすべての変更が 1 つのパーティションで順序を保つ)、加えてデッドレター (DLQ) トピック、Debezium の **スキーマ履歴** トピック (新しい開始位置で `recovery` が構築し、再起動時に再生される対象 — **MySQL ソース専用** であり、PostgreSQL/pgoutput コネクタにはスキーマ履歴トピックがありません)、およびアイドル区間でもコミット済みソース位置を前進させ、再起動時のソース位置がアイドル区間のせいで取り残されないようにする **ハートビート** トピック — MySQL は binlog オフセット、PostgreSQL はスロットの確定 LSN (これは WAL の蓄積も止めます) — を備えます (再起動にギャップがないのは、sink が適用していなかった変更を CDC トピックがまだ保持している間だけです: §4.3)。
-- **カスタム DSQL sink connector** — このプロジェクトが所有する Java Kafka Connect プラグイン — が変更を DSQL に適用します。両方の connector は **マネージドの MSK Connect** 上で実行され、ツール自身は **sink 用のコンピュートを一切持たず**、コントロールプレーンとして機能します (構成の作成、再開ポイントの確立 — MySQL では Kafka 開始オフセットをシードし、PostgreSQL では論理レプリケーションスロットと publication を作成 — 監視を行います)。CDC スタックはデプロイ時のプラグインをそのまま使い続けます。Start CDC は新しいプラグインを登録しないため、このバージョンのツールに同梱されているものより古い sink プラグインをスタックが実行している間は CDC ステップがその旨を表示し (*This CDC infrastructure runs an older sink plugin*)、**Delete CDC infrastructure** の後に再デプロイすると同梱のプラグインが登録されます。
+ソースの変更ログは 3 つのステージを通ります。両方の connector は **マネージドの MSK Connect** 上で実行され、ツール自身は **sink 用のコンピュートを一切持たず**、コントロールプレーンとして機能します (構成の作成、再開ポイントの確立、監視を行います)。
 
-**なぜ標準的な JDBC sink ではなく *カスタム* sink なのでしょうか。**
-
-標準的な JDBC sink は DSQL の短命な IAM トークンで認証できず、楽観的並行性の競合 (`SQLSTATE 40001`) や DSQL が拒否する行を DSQL 向けに扱う仕組みもありません。カスタム sink は競合した **トランザクション** (≤3000 行のチャンク 1 つ、または 1 行) を指数バックオフとフルジッター付きで自ら再実行し、拒否された行を DLQ に送りながらそのチャンクの残りはそのまま反映し、DSQL の短命な IAM トークンと再接続を処理します (詳細は §4.4)。
+- **Debezium source connector（MySQL または PostgreSQL）** は、ソースの変更ログ — MySQL はバイナリログ、PostgreSQL は論理レプリケーションスロット経由の write-ahead log (WAL) — を読み込みます。ソースは読み取り専用のままで、認められた例外は 2 つです: PostgreSQL ソースではツールがマイグレーション対象テーブルだけにスコープした論理スロットと publication を作成（し、解体時に削除）します。また、`gtid_mode=ON` でない MySQL ソースでは、Full load + CDC の実行が開始位置を記録した直後に `FLUSH BINARY LOGS` を 1 回実行します ([§3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
+- **Amazon MSK (Kafka)** は耐久性のあるバックボーンです。**テーブルごとに 1 トピック** を持ち、主キーでキーイングし (ある行のすべての変更が 1 つのパーティションで順序を保つ)、加えてデッドレター (DLQ) トピック、アイドル区間でもコミット済みソース位置を前進させる **ハートビート** トピック、MySQL に限り Debezium の **スキーマ履歴** トピックを備えます。再起動にギャップがないのは、sink が適用していなかった変更を CDC トピックがまだ保持している間だけです (§4.3)。
+- **カスタム DSQL sink connector** — このプロジェクトが所有する Java Kafka Connect プラグイン — が変更を DSQL に適用します。標準的な JDBC sink は DSQL の短命な IAM トークンで認証できず、楽観的並行性の競合 (`SQLSTATE 40001`) や DSQL が拒否する行も扱えません (§4.4)。CDC スタックはデプロイ時のプラグインをそのまま使い続けるため、このバージョンのツールに同梱されているものより古い sink プラグインをスタックが実行している間は CDC ステップがその旨を表示し (*This CDC infrastructure runs an older sink plugin*)、**Delete CDC infrastructure** の後に再デプロイすると同梱のプラグインが登録されます。
 
 ---
 
 ## 4.2 CDC は *スキーマ* ではなく *データ* を複製する — 重要
 
-CDC は **行レベルのデータ変更** (insert / update / delete) を複製します。SQL 文や **DDL** は複製 **しません**。具体的には次のとおりです。
+CDC は **行レベルのデータ変更** (insert / update / delete) を複製し、SQL 文や **DDL** は複製しません: ソースの `ALTER TABLE`、`CREATE`、`DROP` は **伝播されず**、Aurora DSQL のスキーマは **Schema Conversion** が作ったままです。
 
-- sink は行の変更 (DML) のみを適用します。MySQL ソースでは、コネクタが `include.schema.changes=false` でも実行されるため、スキーマ変更イベントは Kafka に届きません。PostgreSQL ソースでは `pgoutput` ストリームに DDL がまったく含まれず、Debezium はテーブルの次の変更の前に来るストリームの Relation メッセージからそのテーブルの新しい形状を知ります。
-- ソースの **DDL** (`ALTER TABLE`、`CREATE`、`DROP` など) は DSQL に **伝播されません**。
+**CDC の実行中にソースのスキーマを変更する場合** は、対応する変更を Aurora DSQL に自分で行ってください (追加または名前変更された列は、ドリフトバナーの **Fix target schema…** が行います)。ただし Schema Conversion では行いません: CDC のストリーミング中は **Replace** を含めて Apply がブロックされます (Replace はテーブルとロード済みの行をまとめて削除し、その行は **Drop & reload** でしか戻せません)。ソースより先に Aurora DSQL へ NULL を許可する列を追加するのは安全です。
 
-DSQL のターゲットスキーマは **Schema Conversion** ステップの実行時に固定されます。**CDC の実行中にソースのスキーマを変更する場合** は、対応する変更を Aurora DSQL に自分で行ってください。ただし CDC のストリーミング中は Schema Conversion では行いません: その間は **Replace** を含めて Apply がブロックされます。Replace はテーブルを削除して作り直すため、ロード済みの行は失われ、以降の変更は **Drop & reload** で再ロードするまで空のテーブルに書き込まれます。何を実行するかは変更によって異なります (下の表を参照):
-
-- 追加または名前変更された列: ドリフトバナーの **Fix target schema…** を使うか、同じ `ALTER` を Aurora DSQL で手動実行します。
-- NULL を許可するようになったソース列、または削除する予定のソース列が Aurora DSQL で `NOT NULL` の場合: Aurora DSQL で `ALTER TABLE … ALTER COLUMN … DROP NOT NULL` を実行します (ソースで削除する前に)。
-- 型・キーの変更: CDC を停止した状態でテーブルを作り直します: Schema Conversion の **Replace**、次に **Drop & reload**。下の表の説明どおりです (CDC only の場合はその CDC only の修復に従います)。
-
-ソースより先に Aurora DSQL に行っても安全なのは追加の変更だけです: sink は列名を指定するため、NULL を許可する余分なターゲット列は無視します。ターゲットが一致するまでの間、ターゲットの形状で書き込めない行 (たとえば新しい列を参照する行) は **DLQ** にデッドレターされて再試行されず、そのようなテーブルが最後のデッドレターレコード以降に CHECKSUM を通過するまで Cut over はロックされたままです ([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。ただし、デッドレターを一切出さずに **黙って** 適用される変更もあります — 下の [デッドレターにならない変更](#デッドレターにならない変更-ソーススキーマの再確認) を参照してください。
+ターゲットが一致するまでの間、ターゲットが受け取れない行は **DLQ** に **デッドレター** されて再試行されず、そのようなテーブルが最後のデッドレターレコード以降に CHECKSUM を通過するまで Cut over はロックされたままです ([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。デッドレターをまったく出さない変更もあります: 下の [デッドレターにならない変更](#デッドレターにならない変更-ソーススキーマの再確認) を参照してください。
 
 ### CDC 中のソーススキーマドリフトの検出と対処
 
-ソースの `ALTER` を自分で気づく必要はありません。デッドレターされたレコードがソースの形状変更を示すと、
-ツールは SQLSTATE とレコードの形でドリフトを**分類**（下の表）し、CDC ステップに **「ソース
-スキーマ変更を検出」** バナーを表示します。追加または名前変更された列については **「Fix target schema…」** を
-提供します: 両側でテーブルの現在の定義を読み、正確な文を示し、承認したときだけ適用します（トランザクションごとに
-1 DDL）。その後、そのテーブルの CDC は再開します。
-
-- **新しい列** は追加されます（`ALTER TABLE … ADD COLUMN`、NULL 許容、デフォルトなし）。
-- **名前変更された列** は、名前変更に見えるときに名前を変更し（`ALTER TABLE … RENAME COLUMN`）、
-  値を保ちます: Step 1 のインベントリの同じ位置に同じ型で古い名前がある、ソーススキーマの再確認が名前変更を
-  検出した、または 2 つの名前が大文字小文字だけ異なる場合です。カタログでは、名前変更と、同じ位置で列を削除して
-  同じ型の列を追加した場合を区別できません（追加された列はテーブルの末尾に付きます）。ソースがそうしたのであれば、
-  キャンセルして列を手作業で追加してください: ダイアログがその文を示します。それ以外は追加列として提示され、
-  ソースにない Aurora DSQL の列を示す警告が付きます。それが古い名前であれば、キャンセルして手作業で名前を変更して
-  ください。
-- **主キーまたは CDC キーの列が名前変更・削除・変更されたテーブルは何も変更しません。** CDC はそのキーで行を
-  書き込み・削除するため、列を追加しても修復できません: 書き込みは失敗し続け、削除はどの行にも一致しないまま
-  黙って通り過ぎます。Aurora DSQL は主キーをその場で変更することも主キー列を削除することもできないため、
-  ダイアログは代わりに作り直す手順を示します: Stop CDC、Step 1 を再実行、Schema Conversion でテーブルを
-  **Replace** で再適用、**Drop & reload** でリロード、Start CDC（CDC only: ソースでキーを戻すか **Start over**
-  を使用）。CDC がキーを付け替えるテーブル（Composite key）は、**Delete CDC infrastructure** と新しいデプロイも
-  必要です。
-- **除外設定で外している列は追加しません**: 保存済みの除外ルールに一致する新しい列、ソースで名前変更された除外列、
-  または除外列がソースから消えている間のすべての新しい列です。CDC はその列を送り続け、ダイアログがそのテーブルの
-  ほかの列を追加または名前変更しても、キャプチャリストが変わるまでその行はデッドレターされ続けます。
-  [§13.8](13-excluding-tables-and-columns.md#138-cdc-キャプチャリスト) を参照してください。
-- **生成** 列や、Aurora DSQL が保持できない型の列は追加せず、手作業で追加する方法をダイアログが示します。
-- **ENUM** 列は `CHECK` なしの `text` として追加されます（Aurora DSQL の `ADD COLUMN` は制約を受け付けません）。
-  警告に、その `CHECK` を追加する `ADD CONSTRAINT … CHECK (…) NOT VALID` 文が示されます。
-
-下の表のすべての拒否と、存在しなくなったターゲットテーブル (`42P01`)、一意キーの競合 (`23505`。その行は一意インデックスの名前と、
-起こり得る原因 — 主キーの変更や行の間で移る一意の値 (§4.4)、複合キーのテーブルの先頭列の更新 (§4.6)、そして
-ソースがその `UNIQUE` インデックスを削除または緩和した場合 (CDC はこれを複製しないので、Aurora DSQL でも削除) —
-を示します)、sink がバインドできない値 (`07006`) は同じようにバナーの行になり、手動で対応するために表示のみ行います（ツールはターゲットのデータを
-自動で削除したり書き換えたりしません）。ソースの `TRUNCATE` には専用のバナーが出ます (下記参照)。そのほかの
-デッドレターは専用のバナーの行にならず、デッドレターキューのカードにだけ表示されます:
-
-- そのほかの SQLSTATE による拒否 (たとえば `22P02`、`22007`/`22008`、`22021`、`23503`、`54000`)。その SQLSTATE
-  とともに表示されます。
-- Aurora DSQL には大きすぎる値 ([§4.5](#45-値ごとの-1-mib-上限および-dlq))。
-- sink が変換できない値。たとえば PostgreSQL の `timetz[]`、`bytea[]`、または制約のない `numeric[]` 列 (Evaluation はこのような列を事前に示します、`CDC_UNCARRYABLE_COLUMN`。代わりに NULL で届く列も併せて: `interval[]`、`money[]`、`tsvector`、`tsquery`、幾何型 `box`、`circle`、`line`、`lseg`、`path`、`polygon`、`pg_lsn`、`jsonpath`、`xid` / `xid8`、`regclass` などの `reg*` 型、`txid_snapshot` / `pg_snapshot`、multirange 型、独自に作成した composite 型と range 型(組み込みの range は運ばれます)、そしてほとんどの拡張機能の型、たとえば pgvector の `vector`([§6.2](06-limitations.md#62-移行プロセスの制限)))。スカラーの `point` はシンクプラグイン v54 以降、自身のテキスト `(x,y)` として書き込まれます。
-- ソースの主キーが削除された後のキーのない変更レコード (MySQL または PostgreSQL)。レコード自体は分類されませんが、
-  ソーススキーマの再確認が削除されたキーを "primary key changed at the source" として報告します。
-
-下のソーススキーマの再確認は Aurora DSQL が黙って受け入れる変更を報告しますが、その限界の範囲内に限られます
-（[§6.2](06-limitations.md#62-移行プロセスの制限)）。テーブルにソース DDL を実行した後は、そのテーブルを
-CHECKSUM で検証してください。
-
-Aurora DSQL には `ALTER COLUMN … TYPE` も `SET NOT NULL` もなく、主キーも変更できないため、
-バナーの各行は Aurora DSQL がサポートする修復方法を示します:
+ソースの `ALTER` を自分で気づく必要はありません。デッドレターされたレコードがソースの形状変更を示すと、CDC ステップに **「ソーススキーマ変更を検出」** バナーが表示されます。Aurora DSQL には `ALTER COLUMN … TYPE` も `SET NOT NULL` もなく、主キーをその場で変更することもできないため、下の各行は Aurora DSQL がサポートする修復方法を示します。ツールはターゲットのデータを自動で削除したり書き換えたりしません。
 
 | バナーの行 | SQLSTATE | よくある原因 | Aurora DSQL での修復 |
 |---|---|---|---|
-| column added or renamed at the source | `42703` | `ADD COLUMN` / `RENAME COLUMN` | **Fix target schema…** |
+| column added or renamed at the source | `42703` | `ADD COLUMN` / `RENAME COLUMN` | **Fix target schema…** (下記) |
 | a NOT NULL column got no value（再確認が裏付けると "column dropped at the source"） | `23502`、列が送られていない | `DROP COLUMN`、除外された列、または PostgreSQL で大きな（TOAST された）値を変更しなかった更新 | 削除された列なら **Drop & reload** の前に `DROP COLUMN`（その列がある間 Drop & reload は拒否されます。主キー列は削除できません）、それ以外は `ALTER COLUMN … DROP NOT NULL` |
 | a NULL sent for a NOT NULL column（裏付けられると "NULL rule changed at the source"） | `23502`、NULL が送られた | ソース列が NULL を許容するようになった | `ALTER COLUMN … DROP NOT NULL`（値は保たれます。NOT NULL に戻すことはできません） |
-| column type changed at the source | `42804`（削除では `42883`） | 互換性のない型変更 | 作り直し: **Replace** + **Drop & reload**（CDC only: 列を手作業で追加・コピー・削除・名前変更するか **Start over**） |
+| column type changed at the source | `42804`（削除では `42883`） | 互換性のない型変更 | 作り直し: **Replace** + **Drop & reload** |
 | a value its Aurora DSQL column cannot hold exactly | `22001`、`22003`、および sink の拒否 | 広げられたソースの型、または Schema Conversion で選んだより狭い型 | 同じ作り直し |
 | a CHECK constraint rejected the row | `23514` | MySQL の `ENUM` や PostgreSQL の enum に追加された値（どちらも `text` + `CHECK` に移植されます） | 理由に記された名前で `DROP CONSTRAINT` の後 `ADD CONSTRAINT … CHECK (…) NOT VALID`、トランザクションごとに 1 文 |
-| the change records' key no longer matches the Aurora DSQL primary key（赤: すべての insert と update が失われる） | `42P10` | ソースの主キーが変更された、またはテーブルが別のキーで再適用された | キーを戻すか作り直し（Step 1 を再実行、**Replace**、**Drop & reload**。キーを付け替えるテーブルは **Delete CDC infrastructure** と新しいデプロイも必要）。CDC only: キーを戻す（その後、その間に脇へ置かれた行を手作業で修正する）か **Start over** |
+| the change records' key no longer matches the Aurora DSQL primary key（赤: すべての insert と update が失われる） | `42P10` | ソースの主キーが変更された、またはテーブルが別のキーで再適用された | キーを戻すか作り直し（Step 1 を再実行、**Replace**、**Drop & reload**。キーを付け替えるテーブルは **Delete CDC infrastructure** と新しいデプロイも必要） |
 
-すでに脇へ置かれた行をバックフィルするには: **Full Load + CDC** では Step 1（Evaluation）を再実行 → Stop CDC →
-**Drop & reload** でテーブルをリロード（Schema Conversion でその DDL を編集していなければ、新しいキー・型・NULL
-規則・ENUM の値で作り直されます） → Start CDC → Validation で再確認します（そのテーブルは CHECKSUM が自動です）。
-**CDC only** では Aurora DSQL 上で手作業で修正するか、**Start over** を使います: デッドレターキューのカード
-は各レコードの主キーを示しますが、キーの値は整数か UUID のときだけ表示する（それ以外は伏せる）ため、キーの値
-が伏せられるテーブルには Start over を使ってください。そのほかのデータエラー（`22P02`、`22007`/`22008`、`22021` など）はデッドレターキューの
-カードに SQLSTATE だけが表示されます。デッドレターが出たすべてのテーブルと同様に、Cut over はそのテーブルが
-CHECKSUM で一致するまで保留されます。
-存在しなくなったターゲットテーブル、一意キーの競合、sink がバインドできない値については、バナーの通知は
-*Stop CDC and reload these tables* と表示され、**CDC only** では *Stop CDC and repair these tables* と表示され
-ます: Stop CDC してターゲットにテーブルがあることを確認し（なければ Schema Conversion で再適用）、デッドレター
-になった行を Aurora DSQL 上で手作業で修正してから（トランザクションあたり最大 3,000 行）Start CDC して
-Validation を実行するか、カードがキーの値を伏せるテーブルと同じく **Start over** を使います。ターゲットで削除されたテーブルは、削除前に適用されたすべて
-の行も失っており、どのデッドレターもそれらの行を挙げないため、そのテーブルには Start over を使ってください。
+**CDC only** には再ロード元の Full Load ステップがありません: 表で **Drop & reload** とある箇所は、Aurora DSQL 上でテーブルを手作業で直し、その間に脇へ置かれた行を修正するか (型の変更なら新しい型の列を追加して値をコピーし、古い列を削除して新しい列の名前を変更します。トランザクションあたり最大 3,000 行)、**Start over** を使ってください。
 
-**列が正確に保持できない値**（MySQL・PostgreSQL ソース）は書き込まずに拒否します。sink は書き込む前に各数値を
-Aurora DSQL の列と照合し、列の型はテーブルごとに 1 回（以後 10 分ごとに再度）読み取ります。この確認がないと、
-次の 3 種類の値がエラーなしに変わってしまいます:
+**Fix target schema…** (追加または名前変更された列用) は、正確な文を示し、承認したときだけ適用します (トランザクションごとに 1 DDL)。その後、そのテーブルの CDC は再開します。
 
-- `boolean` 列に入る 0 または 1 以外の数値は `true` または `false` として保存されます。MySQL の `TINYINT(1)` は
-  ソースの `ALTER` がまったくなくても 127 まで保持でき、`INT` に広げられた `TINYINT(1)` や整数型に変更された
-  PostgreSQL の `boolean` も同様です;
-- `numeric(p,s)` 列が保持するより小数桁の多い数値（たとえば `DECIMAL(10,2)` → `DECIMAL(12,4)` の後）は丸められます;
-- 整数列に入る小数（たとえば `INT` → `DECIMAL(10,2)` または `DOUBLE` の後）は整数に丸められます。
+- **新しい列** は追加されます (NULL 許容、デフォルトなし)。**名前変更された列** は、名前変更に見えるときに値を保ったまま名前が変更されます (たとえば Step 1 のインベントリの同じ位置に同じ型で古い名前がある、または大文字小文字だけ異なる場合)。それ以外は追加列として提示され、ソースにもうない Aurora DSQL の列を示す警告が付きます。ダイアログの推測が違っていたらキャンセルして手作業で直してください。
+- **追加しないもの:** **生成** 列、Aurora DSQL が保持できない型 (手作業で追加する方法をダイアログが示します)、除外設定で外している列 ([§13.8](13-excluding-tables-and-columns.md#138-cdc-キャプチャリスト)): キャプチャリストが変わるまでその行はデッドレターされ続けます。**ENUM** 列は `CHECK` なしの `text` として追加され、警告にその `CHECK` を追加する文が示されます。
+- **名前変更・削除・変更された主キーまたは CDC キーの列** には手を付けません: CDC はそのキーで行を書き込み、Aurora DSQL は主キーをその場で変更できないため、ダイアログは代わりに作り直す手順 (上の表の最後の行) を示します。
 
-代わりにその行はデッドレターになり、CDC ステップにはテーブルと列を示す **「Rows set aside: a value does not fit
-its Aurora DSQL column」** バナーが表示されます。デッドレターの理由には列とその型だけが記され、値は決して記され
-ません。収まる値はそのまま書き込まれます（`numeric(10,2)` に `1.2300` を入れると `1.23` が保存されます）。Aurora
-DSQL 自体も、`varchar`/`char` 列より長い文字列（`22001`）や、整数・`numeric` 列の範囲を超える数値（`22003`）を
-拒否します。そうした行にも同じバナーの行と同じ修復方法が示されます。精度を
-指定せずに宣言された PostgreSQL の `numeric` は、Schema Conversion が警告するとおり Aurora DSQL の既定値
-`numeric(18,6)` で保存され、引き続き小数 6 桁に丸められます。`numeric` 列に入る `FLOAT`/`DOUBLE` の値は確認
-せず、引き続き丸められます。Aurora DSQL は列の型をその場で変更できないため、修復方法はテーブルの作り直しです:
+**すでに脇へ置かれた行をバックフィルするには:**
 
-- **Full Load + CDC:** CDC を追いつかせてから Stop CDC → ソースの型が変わった場合は Step 1 を再実行 → 値を保持
-  できる型で Schema Conversion によりそのテーブルを **Replace** で再適用（`TINYINT(1)` は `smallint` に編集）→
-  **Drop & reload** でリロード → Start CDC → Validation で再確認します。
-- **CDC only:** Stop CDC → 列にそのような型を手作業で与えます（その型の列を追加し、トランザクションあたり最大
-  3,000 行ずつ値をコピーし、古い列を削除して新しい列の名前を変更）→ 脇へ置かれた行を修正 → Start CDC。または
-  **Start over** を使います。
+- **Full Load + CDC:** Step 1 (Evaluation) を再実行 → Stop CDC → **Drop & reload** でテーブルをリロード (Schema Conversion でその DDL を編集していなければ、新しいキー・型・NULL 規則・ENUM の値で作り直されます) → Start CDC → Validation で再確認します (そのテーブルは CHECKSUM が自動です)。
+- **CDC only:** Aurora DSQL 上で行を手作業で修正する (トランザクションあたり最大 3,000 行) か、**Start over** を使います。デッドレターキューのカードは各レコードの主キーを示しますが、キーの値は整数か UUID のときだけ表示する（それ以外は伏せる）ため、キーの値が伏せられるテーブルには Start over を使ってください。
 
-そのテーブルが CHECKSUM で一致するまで Cut over は保留されます
-（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー)）。以前のバージョンのツールでデプロイした CDC
-インフラにはこの確認がありません: **Delete CDC infrastructure** して再デプロイするまでは、そのような値を
-`true`/`false` として、または丸めて保存します。
+存在しなくなったターゲットテーブル (`42P01`)、一意キーの競合 (`23505`)、sink がバインドできない値 (`07006`) もバナーの行になり (*Stop CDC and reload these tables*、**CDC only** では *Stop CDC and repair these tables*)、修復は同じです。まずターゲットにテーブルがあることを確認してください (なければ Schema Conversion で再適用)。ターゲットで削除されたテーブルは、削除前に適用されたすべての行も失っており、どのデッドレターもそれらの行を挙げないため、そのテーブルには Start over を使ってください。`23505` の行は一意インデックスの名前と、起こり得る原因を示します (§4.4 と §4.6 を参照)。ソースがその `UNIQUE` インデックスを削除または緩和した場合 (CDC はこれを複製しません) は、Aurora DSQL でも削除してください。
 
-**ソースの `TRUNCATE`**（MySQL・PostgreSQL ソース）はスキーマ変更ではありませんが、CDC が適用することも
-できません。Aurora DSQL には `TRUNCATE` 文がなく、どの行も示さない 1 件のイベントを理由にターゲットの行を
-すべて削除すると、範囲に上限がなく、その後に挿入された行まで消えるおそれがあるため、ツールはそうしません。
-代わりに sink はそのイベントをデッドレターにします（TRUNCATE されたテーブルごとに 1 件）。CDC ステップには
-テーブル名を示す **「Source TRUNCATE was not replicated」** バナーが表示され、そのテーブルへのその後の変更は
-ストリーミングされ続け、ターゲットにはソースが削除した行が残り（Validation が extra 行として報告します）、
-そのテーブルが CHECKSUM で一致するまで Cut over は保留されます
-（[§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー)）。復旧方法:
+そのほかのデッドレターは専用のバナーの行にならず、デッドレターキューのカードにだけ表示され、SQLSTATE があればそれも表示されます:
 
-- **Full Load + CDC:** Stop CDC → Full Load ステップで **Drop & reload** によりテーブルをリロード（CDC の停止中に
-  のみ表示されます。**Append** は欠けている行を追加するだけなので、余分な行は削除できません）→ Start CDC →
-  Validation でそのテーブルを再確認します。
-- **CDC only:** リロード元の Full Load ステップはありません。Stop CDC → Aurora DSQL のテーブルから、ソースに
-  もう存在しない行をトランザクションあたり最大 3,000 行ずつ自分で削除 → Start CDC → Validation でそのテーブルを
-  再確認します。単一列の整数キーのテーブルなら、Validation の **Reconcile every record** が余分な行の数を数え、
-  そのキーの一部を表示します。
+- Aurora DSQL には大きすぎる値 ([§4.5](#45-値ごとの-1-mib-上限および-dlq));
+- sink が変換できない値。たとえば PostgreSQL の `timetz[]`、`bytea[]`、または制約のない `numeric[]` 列。Evaluation はこのような列を事前に示します (`CDC_UNCARRYABLE_COLUMN`。代わりに NULL で届く列も併せて: `interval[]`、`money[]`、`tsvector`、そして pgvector の `vector` のようなほとんどの拡張機能の型; [§6.2](06-limitations.md#62-移行プロセスの制限));
+- ソースの主キーが削除された後のキーのない変更レコード (MySQL または PostgreSQL): ソーススキーマの再確認が "primary key changed at the source" として報告します;
+- そのほかのすべての拒否 (たとえば `22P02`、`22007`/`22008`、`22021`、`23503`、`54000`)。
 
-TRUNCATE が Full Load の開始後、そのテーブルのコピー前に実行された場合、ターゲットはすでに一致していることが
-あり、その場合は CHECKSUM の再確認でリロードなしに保留が解除されます。ワークロードが定期的に TRUNCATE する
-テーブル（ステージングやキューのテーブルなど）は TRUNCATE のたびにこの状態になるため、Aurora DSQL でその
-データが不要なら移行対象から外してください。対象外: MySQL の `ALTER TABLE … TRUNCATE PARTITION` と
-`ALTER TABLE … DROP PARTITION` — および PostgreSQL でのパーティションの drop・detach・truncate (パーティションへの
-`TRUNCATE` はまったく複製されません) — は変更イベントを生成せずに行を削除し、行を持つパーティションの attach は同じく
-行を追加するため、CDC は何も報告せず、余分な (または欠けた) 行は Validation でしか確認できません。そのようなテーブルも同じ方法で
-修復するか、カットオーバーまでパーティションの保守を止めてください。以前のバージョンのツールから
-アップグレードした時点ですでにストリーミング中だった MySQL パイプラインは、Stop CDC → Start CDC を 1 回
-行った後から TRUNCATE を報告します。
+テーブルにソース DDL を実行した後は、そのテーブルを CHECKSUM で検証してください。
 
-**ドリフト中の遅延。** ターゲットに列・テーブル・スキーマがない、キーが変わった、列の型が変わった、または
-`NOT NULL` 列に値が来ないという理由で Aurora DSQL がテーブルの行を拒否すると、シンクはそのテーブルの以後の変更
-だけを 1 トランザクション 1 行で適用し、他のテーブルはバッチ適用を続けます。これでドリフトのためにすべての
-テーブルの変更が 1 行ずつのトランザクションになることはなくなりますが、他のテーブルもドリフトしたテーブルと
-同じシンクを共有しているため、修復の間は他のテーブルの stream lag も増えることがあり、ドリフトしたテーブルが
-忙しいほど大きくなります。ドリフトしたテーブルのすべての行は引き続き Aurora DSQL で適用を試み、Aurora DSQL が
-拒否した行だけをデッドレター化します。**Fix target schema…**(または手動の修復)で修復すると、そのテーブルの
-INSERT または UPDATE が 1 件適用された時点、または最後の拒否から 60 秒後にバッチ適用に戻ります。値単位の拒否
-(一意制約・`CHECK` 違反、長すぎる値や範囲外の値、バインドできない値)ではテーブルは 1 行ずつの適用に切り替わり
-ません。そのような行を含む変更バッチは、他のテーブルの行も含めて引き続き 1 トランザクション 1 行で再適用されます。
+**列が正確に保持できない値** (MySQL・PostgreSQL ソース) は書き込まずに拒否します。sink は各数値を Aurora DSQL の列と照合するため、`boolean` 列に 0 または 1 以外の数値を `true`/`false` として黙って保存したり (MySQL の `TINYINT(1)` はソースの `ALTER` がまったくなくても 127 まで保持できます)、より少ない小数桁や整数に丸めたりすることはありません。その行はデッドレターになり、CDC ステップにはテーブルと列を示す **「Rows set aside: a value does not fit its Aurora DSQL column」** バナーが表示されます (値は決して記されません)。Aurora DSQL 自体も、`varchar`/`char` 列より長い文字列 (`22001`) や、整数・`numeric` 列の範囲を超える数値 (`22003`) を拒否し、そうした行にも同じバナーの行が示されます。確認されず、引き続き丸められるもの: `numeric` 列に入る `FLOAT`/`DOUBLE` の値と、精度を指定せずに宣言された PostgreSQL の `numeric` (Schema Conversion が警告するとおり `numeric(18,6)` で保存されます)。Aurora DSQL は列の型をその場で変更できないため、値を保持できる型でテーブルを作り直してください (たとえば `TINYINT(1)` は `smallint` で **Replace** してから **Drop & reload**。**CDC only**: バナーの表の下の説明を参照)。
+
+**ソースの `TRUNCATE`** (MySQL・PostgreSQL ソース) は複製されません。Aurora DSQL には `TRUNCATE` 文がなく、そのイベントは削除する行を示さないためです。代わりに sink はそのイベントをデッドレターにし (TRUNCATE されたテーブルごとに 1 件)、CDC ステップにはテーブル名を示す **「Source TRUNCATE was not replicated」** バナーが表示され、そのテーブルへのその後の変更はストリーミングされ続け、ターゲットにはソースが削除した行が残ります (Validation が extra 行として報告します)。復旧方法:
+
+- **Full Load + CDC:** Stop CDC → Full Load ステップで **Drop & reload** によりテーブルをリロード（CDC の停止中にのみ表示されます。**Append** は欠けている行を追加するだけなので、余分な行は削除できません）→ Start CDC → Validation でそのテーブルを再確認します。
+- **CDC only:** リロード元の Full Load ステップはありません。Stop CDC → Aurora DSQL のテーブルから、ソースにもう存在しない行をトランザクションあたり最大 3,000 行ずつ自分で削除 → Start CDC → Validation でそのテーブルを再確認します。単一列の整数キーのテーブルなら、Validation の **Reconcile every record** が余分な行の数を数え、そのキーの一部を表示します。
+
+ワークロードが定期的に TRUNCATE するテーブル (ステージングやキューのテーブルなど) は TRUNCATE のたびにこの状態になるため、Aurora DSQL でそのデータが不要なら移行対象から外してください。パーティションの保守 (MySQL の `TRUNCATE PARTITION` や `DROP PARTITION`、PostgreSQL でのパーティションの drop・detach・truncate、行を持つパーティションの attach) は変更イベントなしに行を変えるため、CDC は何も報告せず、余分な (または欠けた) 行は Validation でしか確認できません。そのようなテーブルも同じ方法で修復するか、カットオーバーまでパーティションの保守を止めてください。
+
+**ドリフト中の遅延。** ターゲットに列・テーブル・スキーマがない、キーが変わった、列の型が変わった、または `NOT NULL` 列に値が来ないという理由で Aurora DSQL がテーブルの行を拒否すると、シンクはそのテーブルの以後の変更だけを 1 トランザクション 1 行で適用し、他のテーブルはバッチ適用を続けます。他のテーブルも同じシンクを共有しているため、修復の間は stream lag が増えることがあります。修復すると、そのテーブルの INSERT または UPDATE が 1 件適用された時点、または最後の拒否から 60 秒後にバッチ適用に戻ります。値単位の拒否(一意制約・`CHECK` 違反、長すぎる値や範囲外の値、バインドできない値)ではテーブルは 1 行ずつの適用に切り替わりません。そのような行を含む変更バッチは、他のテーブルの行も含めて引き続き 1 トランザクション 1 行で再適用されます。
 
 ### デッドレターにならない変更: ソーススキーマの再確認
 
-ソースの DDL の中には、Aurora DSQL が 1 行も拒否しないまま CDC が書き込む値を変えるものがあり、デッドレターも
-バナーも現れません:
+ソースの DDL の中には、Aurora DSQL が 1 行も拒否しないまま CDC が書き込む値を変えるものがあり、デッドレターもバナーも現れません:
 
-- ターゲットの列が nullable か DEFAULT を持つ **列の削除**: 新しい行には NULL か DEFAULT が入り、更新された行は
-  古い値のままになります;
-- ターゲットがすべての値をそのまま受け入れる **型の変更**(より広い `VARCHAR` や整数型)。丸められる値や
-  `true`/`false` として保存される値は代わりにデッドレターになります([上記参照](#cdc-中のソーススキーマドリフトの検出と対処))。
-  以前のバージョンのツールでデプロイした CDC インフラは、削除して再デプロイするまで変わった値を書き込み続けます;
-- `numeric(p,s)` ターゲットで `FLOAT`/`DOUBLE` に変更された列(例: `DECIMAL(10,2)` → `DOUBLE`): このケースは
-  確認しないため、値はデッドレターなしにターゲットの小数桁に丸められます;
-- **テーブルの削除・名前変更**(または別スキーマへの移動): CDC はデプロイ時の名前でテーブルをキャプチャするため、
-  ターゲットのテーブルは変化しなくなります。MySQL では同じ名前で作り直したテーブルがそのまま流れ込み、
-  PostgreSQL では名前変更後、コネクタが再起動するまでの間だけ古いターゲットに変更が届きます;
-- PostgreSQL で、CDC が変換できない型(たとえば `interval[]` や `money[]`)の **列の追加**、または **生成列**:
-  その値はまったく届きません;
+- ターゲットの列が nullable か DEFAULT を持つ **列の削除**: 新しい行には NULL か DEFAULT が入り、更新された行は古い値のままになります;
+- ターゲットがすべての値をそのまま受け入れる **型の変更**(より広い `VARCHAR` や整数型)、または `numeric(p,s)` ターゲットで `FLOAT`/`DOUBLE` に変更された列(例: `DECIMAL(10,2)` → `DOUBLE`): このケースは確認しないため、値はデッドレターなしに丸められます(それ以外の丸められる値や `true`/`false` として保存される値はデッドレターになります。[上記参照](#cdc-中のソーススキーマドリフトの検出と対処));
+- **テーブルの削除・名前変更**(または別スキーマへの移動): CDC はデプロイ時の名前でテーブルをキャプチャするため、ターゲットのテーブルは変化しなくなります(MySQL では同じ名前で作り直したテーブルがそのまま流れ込み、PostgreSQL では名前変更後、コネクタが再起動するまでの間だけ古いターゲットに変更が届きます);
+- PostgreSQL で、CDC が変換できない型(たとえば `interval[]` や `money[]`)の **列の追加**、または **生成列**: その値はまったく届きません;
 - **NULL ルール** の変更、または **主キー** の変更。
 
-そのため CDC の実行中、ツールはソース上のキャプチャ対象テーブルの定義を読み直し — すべてに対して読み取り専用の
-カタログクエリを 1 回(MySQL は `information_schema`、PostgreSQL は `pg_catalog`。テーブルのデータは読みません)、
-CDC モニター・Validation・Cut over が開いている間、最大 5 分に 1 回 — 移行の基準である Step 1(Evaluation)の
-インベントリと比較します: 各テーブルがまだ存在するか、列名(大文字小文字まで正確に)、型、NULL ルール、主キー。
-除外した列と CDC がキャプチャしない生成列は対象外とし、**Fix target schema…** で追加した列は定義の一部とみなします
-(名前を変更した列はみなしません: Step 1 を再実行するまで、再確認は名前変更を報告し続け、Cut over を保留します)。
-デフォルト・コメント・照合順序・インデックスは比較しません(変わっても CDC の行は変わりません)。差異は CDC
-ステップに表示され([§4.6](#ソーススキーマの再確認))、ソースが再び Step 1 のインベントリと一致し、その後テーブルが
-CHECKSUM で一致するまで、そのテーブルの Cut over を保留します
-([§5.7](05-validation.md#57-ソーススキーマの変更とカットオーバー))。
+そのため CDC の実行中、ツールはソース上のキャプチャ対象テーブルの定義を読み直し(読み取り専用でテーブルのデータは読みません。CDC モニター・Validation・Cut over が開いている間、最大 5 分に 1 回)、移行の基準である Step 1(Evaluation)のインベントリと比較します: 各テーブルがまだ存在するか、列名(大文字小文字まで正確に)、型、NULL ルール、主キー。除外した列、CDC がキャプチャしない生成列、デフォルト・コメント・照合順序・インデックスは比較せず、**Fix target schema…** で追加した列は定義の一部とみなします(名前を変更した列はみなしません: Step 1 を再実行するまで、再確認は名前変更を報告し続け、Cut over を保留します)。差異は CDC ステップに表示され([§4.6](#ソーススキーマの再確認))、ソースが再び Step 1 のインベントリと一致し、その後テーブルが CHECKSUM で一致するまで、そのテーブルの Cut over を保留します([§5.7](05-validation.md#57-ソーススキーマの変更とカットオーバー))。
 
 ---
 
@@ -226,39 +99,52 @@ CHECKSUM で一致するまで、そのテーブルの Cut over を保留しま�
 
 これは、バルクロードとストリームの間で **変更の取りこぼしも重複もない** ように設計された部分です。
 
-1. Full Load は、スナップショット時点で **ウォーターマーク (watermark)** をキャプチャしました — MySQL は binlog の file:position、GTID セットとソースの `gtid_mode`、PostgreSQL は論理レプリケーションスロットを作成したときに返される WAL LSN で、スロット名・publication 名とともに記録されます ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
-2. CDC を開始すると、ツールはまさにそのウォーターマークに再開ポイントを確立します。**MySQL ソース** では connector の **開始オフセットをシード** します (source connector が開始する前に、VPC 内の Lambda がオフセットレコードを書き込みます)。シードされたオフセットには file:position と GTID セットが入ります: `gtid_mode=ON` では Debezium はまさにその GTID セット (Full Load がすでにコピーしたトランザクション) の次から開始し、`OFF`、`OFF_PERMISSIVE`、`ON_PERMISSIVE` では file:position から開始します。Start CDC はまず `gtid_mode` を読み、使えない開始位置は拒否します ([第 6 章](06-limitations.md))。Manual の開始位置は、binlog file:position とともに保存された GTID セットをシードします。バージョン 0.1.565 以前が保存した Manual の開始位置は GTID セットなしで復元されるため (これらのバージョンは、取得したセットをその後に入力したどの位置の横にも残していました)、`gtid_mode=ON` のソースでは Start CDC の前に **Fetch current position** をもう一度行うか、ちょうどその位置で実行済みだった GTID セットを入力し直してください。**PostgreSQL ソース** ではオフセットシーダー Lambda はありません。代わりに Full Load の整合点で、ツールは論理レプリケーションスロット (と Full Load がロードしたテーブルの publication) を作成し、スロットが返した整合 WAL LSN がそのままウォーターマークになります — CDC はその事前作成済みスロットから直接再開するため、Kafka の connect-offsets には何も書き込まれません。いずれの場合も Debezium は **スナップショット後の最初の変更** からストリーミングを開始します — 「今」からでもなく、データを再読み込みするのでもありません。
+### 仕組み
 
-   > **これは `Full load + CDC` 実行についての説明です。** 再読み込みのない引き継ぎを可能にするのは、そのロード*中*に作成されたスロットであり、PostgreSQL のスロットは過去の位置に作成できません。**`Full Load のみ`**を実行して後から CDC に戻る場合、ストリーミングは依然として無損失ですが、source connector が自前のスロットを作成して publication を選択したテーブルに合わせ、**選択したすべてのテーブルを先に再スナップショット**します — データはもう一度読み込まれます (以前にコネクタを開始した CDC スタックでは、代わりに Start CDC がそのスタック自身のスロットから続けます。ただし、そのスタックの source connector がストリーミングしていなければ、Debezium が先に選択したすべてのテーブルをスナップショットします: sink が適用していなかった変更を CDC トピックがまだ保持している間だけギャップがありません)。選び方は [第 10 章 §10.1](10-conclusion.md) を参照してください。MySQL はコンシューマーがいなくてもバイナリログが履歴を保持するため、一度もストリーミングしたことのない CDC スタックでは、後から CDC を開始してもウォーターマークから再読み込みなしで開始します。ストリーミングしたことのあるスタックでは Start CDC がそのより新しい開始位置を拒否するため、マイグレーションの種類を CDC only に切り替えてから、その CDC ステップで Delete CDC infrastructure して再デプロイし、Start CDC してください (Full load only には CDC ステップがありません。[第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。どちらの場合も CDC はウォーターマークから開始してその後の変更しか運ばないため、その Full load only の実行が以前のロードがターゲットに残した行に append した場合は、先に **Drop & reload** で Re-run Full Load してください。`gtid_mode=ON` でないソースでは、そのウォーターマークは処理中のコミットを待たずに記録された binlog の位置です: CDC が追いついたら CHECKSUM モードで検証するか、正確な開始位置が必要なら Full Load を Full load + CDC で再実行してください。
+1. **Full Load がスナップショット時点でウォーターマークを記録します。** MySQL は binlog の file:position、GTID セットとソースの `gtid_mode`、PostgreSQL は論理レプリケーションスロットを作成したときに返される WAL LSN で、スロット名・publication 名とともに記録されます ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
+2. **Start CDC はまさにそのウォーターマークから再開します。** スナップショット後の最初の変更から始まり — 「今」からでもなく、行を再読み込みすることもありません。MySQL ではツールが connector の開始オフセットに file:position と GTID セットをシードし (`gtid_mode=ON` では Debezium はまさにその GTID セットの次から開始します)、使えない開始位置は拒否します ([第 6 章](06-limitations.md))。PostgreSQL では、Full Load の整合点で作成されたスロットがそのままウォーターマークなので、何もシードされません。
+3. **sink はすべての変更を PK で冪等に適用します。** そのため、オーバーラップやリトライがあっても重複は生じません。
 
-   **以前のコピーに append した可能性のある Full Load の後は**、その Full Load のウォーターマークから始まり、拒否されない Start の前に、CDC ステップが Drop & reload の条件を示します。このセッションが、その Full Load がターゲットに既にあった行 (Full Load ステップの行数に *already there* と表示されます) をあるテーブルの最初の試行 (*Attempts* が 1) で見つけたこと、または、このマイグレーションでその Full Load が実行される前に、より前の開始位置から Start CDC が送信されており、その Full Load がそのような行を一つでも見つけたことを示す場合です — たとえば CDC を一度も開始する前でも CDC がストリーミングした後でも、既定の *Append* で行った再実行です。そのとき開始位置のカードが *Gapless only if this Full Load did not append* を示します: その Full Load がそれらの行に append した場合は、Start CDC の前に **Drop & reload** で Re-run Full Load してください (CDC only には Full Load ステップがありません: MySQL ではその実行の間はマイグレーションの種類を Full load + CDC に切り替え、その Full Load が CDC の開始位置を正確にします。PostgreSQL では種類を Full load + CDC に切り替えてそこで再実行し、その実行がスロットを自身のスナップショット位置に作り直します)。append はそれらの行をそのまま残し、ウォーターマークからの CDC はその後の変更しか運ばないためです。カードはその開始をもうギャップがないとは呼ばず、Start CDC のダイアログは Start をブロックせずに同じ通知を示し、その Start のアクティビティログの行は開始位置の後に *(from the Full Load watermark; gapless only if that Full Load did not append to rows already on the target)* を付けます。PostgreSQL では、開始位置がスナップショットを取り直す設定のとき (*Manual re-snapshots instead of resuming from this load's slot*) や Full Load が完了していないとき、カードの再スナップショットの通知が、戻る方法として挙げるその Full Load のスロットからの再開についても同じ条件を述べ、その Full Load が append した場合のために Drop & reload の再実行を示します。空のテーブルへの最初のコピーは既にあった行を見つけません。Drop & reload の再実行はロードする各テーブルを作り直すため、その実行がターゲットに既にあった行として見つけるのは、自分でロードした行 (リトライ、またはソース接続が切れた後の再読み込みで) だけです。Retry unfinished tables と Reload specific tables はその Full Load のウォーターマークを維持し、各テーブルの試行回数を以前の実行から引き継いで数えるため、それらが再びロードするテーブルが見つけた行は最初の試行の手がかりを残さず、そのまま残したテーブルは自身の手がかりを保ちます。そのため、手がかりを残したすべてのテーブルを再びロードする Retry や Reload は、その Full Load が append した場合でも通知を消します。append しなかったコピーの後にも通知が表示されることがあります (通知は条件として述べるだけです): テーブルの最初の試行がソース接続が切れた後に行を再読み込みした場合、Aurora DSQL がコミット済みのバッチに一時的なエラー (XX000) で応答したか、コミットの後に接続が切れたためにそのバッチのリトライが自身の行を見つけた場合、またはマルチプロセスのロードがリトライしたテーブルの試行の一つを数えなかった場合です。最初の試行で見つかった行は、その Full Load が最新である限り通知を保ち、スタックを更新する前に失敗した Start CDC の後や、既存スタックへの Attach の後も同じです。そうでない場合、通知は、どの開始位置からであれ次に Start CDC を送信したとき、そして Attach の後に消えます。Start over はどちらの場合も通知を消します。
+Manual の開始位置は、binlog file:position とともに保存された GTID セットをシードします。バージョン 0.1.565 以前が保存した Manual の開始位置は GTID セットなしで復元されるため、`gtid_mode=ON` のソースでは Start CDC の前に **Fetch current position** をもう一度行うか、ちょうどその位置で実行済みだった GTID セットを入力し直してください。
 
-   そのような Full Load の前には、Full Load ステップの確認ダイアログも Drop & reload を示します: Full load + CDC で、選択したテーブルに既に行がある場合、Start Full Load、Re-run Full Load、Re-run all tables (いずれも新しい開始位置を取ります) のダイアログは *Append* を推奨 (recommended) と表示せず、選択肢の下に *CDC from this run's new start point needs 'Drop & reload' …* という行を表示し、既定は引き続き *Append* です。Retry unfinished tables と Reload specific tables は開始位置を維持し、その選択肢は変わりません。
+> **これは `Full load + CDC` 実行についての説明です。** **Full load only** の後で CDC を開始しても無損失ですが、動作が異なります。**PostgreSQL** ではスロットを過去の位置に作成できないため、source connector が自前のスロットを作成し、**選択したすべてのテーブルを先に再スナップショット** します (ソースをもう一度読み込みます)。**MySQL** ではバイナリログが履歴を保持するため、再読み込みなしでウォーターマークから開始します — ただしストリーミングしたことのあるスタックでは Start CDC がより新しい開始位置を拒否するため、マイグレーションの種類を CDC only に切り替えてから、その CDC ステップで Delete CDC infrastructure して再デプロイし、Start CDC してください (Full load only には CDC ステップがありません。[第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。どちらの場合も CDC はウォーターマークの後の変更しか運ばないため、その Full load only の実行が以前のロードがターゲットに残した行に append した場合は、先に **Drop & reload** で Re-run Full Load してください。`gtid_mode=ON` でないソースでは、MySQL のウォーターマークは処理中のコミットを待たずに記録された binlog の位置です: CDC が追いついたら CHECKSUM モードで検証するか、正確な開始位置が必要なら Full Load を Full load + CDC で再実行してください。選び方は [第 10 章 §10.1](10-conclusion.md) を参照してください。
 
-   Full Load の後にテーブルのチェックを外すと (Full load + CDC で CDC を開始する前。[§13.7](13-excluding-tables-and-columns.md))、CDC はまだ選択されているテーブルだけをキャプチャし、同じウォーターマークまたはスロットから再開するため、それらのテーブルの引き継ぎはギャップのないままです。PostgreSQL で CDC がそのスロットから再開する場合、publication にチェックを外したテーブルが残り (ツールはソース上の publication からそれらを外しません)、コネクタはそれらの変更を破棄します。代わりにスナップショットを取り直す Start では、コネクタが publication をキャプチャ対象のテーブルに合わせます。縮小した集合での Re-run Full Load は既存の publication を再利用します。
+### CDC を開始する前に
 
-   Full Load の後にチェックを入れたテーブル(Full load + CDC で CDC を開始する前)は、まず [§13.7](13-excluding-tables-and-columns.md) の確認を経て Retry unfinished tables がロードし、その後 CDC が同じウォーターマークまたはスロットからそのテーブルをキャプチャします(MySQL で Full Load が開始点の定義を記録しなかったテーブルは、代わりに **Drop & reload** での Re-run all tables が必要です)。そのテーブルがロードされるまで Start CDC は待機します。MySQL では、CDC はウォーターマーク以降にそのテーブルに加えられたすべての変更を新しいコピーの上に再生します。PostgreSQL では、そのテーブルはコピーを始める直前に CDC の publication に加わり、CDC はそれ以降にそのテーブルに加えられたすべての変更をそのコピーの上にストリーミングします。どちらの場合も結果は収束します。一意インデックスで一時的に衝突する変更はデッドレターになることがあり、その場合 Cut over は CHECKSUM による検証を待ちます。
+- **MySQL — binlog を維持してください。** ウォーターマーク位置の binlog が、CDC 開始時点でまだ存在している必要があります。Aurora MySQL はデフォルトで binlog を 24 時間しか保持せず、CDC スタックのデプロイだけで約 15〜20 分かかるため、**開始前に binlog の保持期間を延長してください** ([§1.6](01-setup.md#16-cdc-のためのソース準備))。すでに失われている場合は、**Drop & reload** で Full Load を再実行して新しいウォーターマークを取得します (ストリーミングしたことのあるスタックでは、Delete CDC infrastructure して再デプロイした後に)。
+- **PostgreSQL — スロットを健全に保ってください。** スロットは作成された時点から WAL を保持するため、前提条件は binlog の保持期間ではなく `wal_level=logical` です。スロットが遅れすぎる (`wal_status='lost'`) と Start CDC がブロックされます (下の「Start CDC がブロックされるとき」を参照)。
+- **Full Load を完了させてください。** Full Load が実行されている間、CDC ステップは *Start CDC waits for the Full Load to finish* を表示し、Start CDC は無効になります。逆に、CDC がストリーミングしている間は Full Load ステップは何も実行しません。先に Stop CDC してください。
+- **Full Load は append しましたか?** ターゲットに既にあった行を見つけた場合 (*already there*。たとえば既定の *Append* での再実行)、開始位置のカードが *Gapless only if this Full Load did not append* を示します。append はそれらの行をそのまま残し、CDC はウォーターマークの後の変更しか運ばないため、Start CDC の前に **Drop & reload** で Re-run Full Load してください (CDC only では、その実行の間はマイグレーションの種類を Full load + CDC に切り替えます)。この通知は Start をブロックせず、append しなかったコピーの後にも表示されることがあり、Drop & reload の後に消えます。Full Load のダイアログが事前に警告します (*CDC from this run's new start point needs 'Drop & reload' …*)。
+- **Full Load の後でテーブル集合を変更しますか?** [§13.7](13-excluding-tables-and-columns.md) を参照してください。
 
-   **Start CDC は実行中の Full Load を待ちます。** このマイグレーションで Full Load が実行されている間 — Start、Re-run、Retry unfinished tables または Reload — CDC ステップは *Ready to start CDC* の代わりに *Start CDC waits for the Full Load to finish* を表示し、Start CDC は無効になります (Retry CDC も拒否されます)。ロードはターゲットにない行だけを insert するため、sink がすでにストリーミングしていると、テーブルのコピー中にソースが削除した行が、CDC がその削除を適用した後に Aurora DSQL に届き、そのまま残ることがあります。逆に CDC がストリーミングしている間は、Full Load ステップは何も実行しません: 先に Stop CDC してください ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
-3. **MySQL ソース** では、**新しい開始位置** での Start — 初回の Start (Full Load のウォーターマークまたは Manual の位置から)、または Delete CDC infrastructure 後の初回 Start — が source connector を **`snapshot.mode=recovery`** で実行します。オフセットがすでにシードされているため、Debezium は (binlog イベントをデコードするために) 内部の **スキーマ履歴** を **現在のソーステーブル** から再構築し、**行データを一切再読み込みせずに** シードされたオフセットから再開します。Start CDC はまず、キャプチャ対象テーブルがその開始位置以降に変更されていないかをチェックします ([第 6 章](06-limitations.md))。ストリーミングしたことのあるスタックでは、インフラを再デプロイするまで、Start CDC がより新しい Full Load や Manual の位置を拒否します (*This CDC stack cannot start from a newer start point*): そのスタックのトピックにはどの sink も適用していない変更が残っている可能性があり、その sink はそれをその後にロードしたものの上に書き込み、その一方でソースは停止した位置と新しい位置の間のすべての変更をスキップするためです ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。CloudFormation がロールバックした初回の Start の後は、その Start が渡した位置より後の開始位置をアプリの再起動後も拒否し (ロールバックがスタックのパラメータを元に戻しますが、アプリはその位置をスタックの CloudFormation イベントから読み取ります)、そのイベントからもその位置が得られなければ、すべての開始位置を拒否します。**Stop CDC 後の再起動** は代わりに **`snapshot.mode=schema_only`** で実行され、記録されたスキーマ履歴を再生し、DDL を binlog の順に適用します。このような再起動は、コネクタの自動再起動と同様に、Debezium が記録した位置から続きます — `gtid_mode=ON` では、最後にコミットした GTID セットの次からです。Stop CDC は sink をドレインせずに両方のコネクタを削除するため、CDC が停止した時点で sink が適用していなかった変更は、その再起動では CDC トピックからしか Aurora DSQL に届きません (sink の最後のコミットから再適用されるため、重複は生じません): その再起動にギャップがないのは、トピックがまだその変更を保持している間 (MSK での保持期間) だけです。*Ready to resume CDC* のカードと *Resuming from the last streamed position* の開始位置のカードがその条件を述べ、どちらも *ギャップなし* や、再適用されるものがないとは約束しません。**PostgreSQL ソース** では、Debezium pgoutput コネクタにスキーマ履歴トピックはありません。ギャップのない経路では **`snapshot.mode=never`** で実行され (論理スロットが既に開始 LSN を保持し、行もロード済み)、スタンドアロン/手動の開始では **`initial`** (スナップショットしてからストリーム) を使います。Debezium PostgreSQL はスロット自身の位置からしか再開できず、任意の WAL LSN にシークすることはできません。Stop CDC 後の Start は、スロットの位置 (ストリーミングが止まったところ、そのスタックの source connector が一度もストリーミングしていなければ Full Load の開始位置) から続けます。ただし `initial` で初期スナップショットを完了しなかった source connector (その前にタスクが失敗したか、CDC を停止した場合) は、選択したすべてのテーブルをもう一度スナップショットします — ソース全体の再読み込みです。Stop CDC はコネクタをドレインせずに削除するため、その時点で sink が適用していなかった変更は CDC トピックからしか Aurora DSQL に届きません: そのような Start にギャップがないのはトピックがまだその変更を保持している間だけで、Start CDC はそれを確認しません。MSK でトピックの保持期間が過ぎるとその Start はそれらの変更をスキップするため、Start CDC のカード (*Ready to resume CDC*) と開始位置のカード (*Resuming from this stack's replication slot*) は、代わりに取る方法として、以前にコネクタを開始したスタックの方法 (新しいトピックが先。下記の PostgreSQL の説明を参照) を示します。**Stop CDC** のダイアログも、停止する前に同じ条件をどちらのソースについても述べ、PostgreSQL ではその保持期間が過ぎた後の方法まで示します。スナップショットする Start は、継承 (`INHERITS`) の子テーブルを持つキャプチャ対象テーブルがあると拒否されます (*CDC cannot snapshot a table that has inheritance child tables*)。Debezium のスナップショットは、そのテーブルを子テーブルの行と一緒に読むためです ([第 6 章](06-limitations.md))。ツールがソースは読めても、どのキャプチャ対象テーブルに子テーブルがあるかを読めなければ、そのような Start も拒否されます (*Whether a captured table has inheritance child tables could not be read*): ツールがソースに到達できることを確認してから、もう一度 Start CDC してください。ソースをまったく読めない場合 — たとえばアプリの再起動後、接続をもう一度テストする前の Secrets Manager のソース — Start CDC はブロックされませんが、開始前の PostgreSQL のチェック (publication、レプリケーションスロットとその位置、継承の読み取り) は実行されません: Start CDC のダイアログが理由とともに *CDC's publication and replication slot could not be checked* という警告を表示し、アクティビティログが *PostgreSQL publication and slot checks not run* (WARNING) を、ダイアログから一度、そして Start CDC のジョブがそれらのチェックなしで進んだ場合はそのジョブからもう一度記録します。Connect ステップでソースの接続をテストしてから、もう一度 Start CDC を開いてチェックを実行させてください。
+### 再開始
 
-その結果、スナップショットと「今」の間のすべての変更が正確に 1 回だけ適用されます。sink の適用は (PK でキーイングされ) **冪等** であるため、オーバーラップやリトライがあっても重複が生じることはありません。
+**Stop CDC 後の再起動** は、最後に記録された位置から続き、記録されたスキーマ履歴を再生します。行は再読み込みしません。Stop CDC は sink をドレインせずにコネクタを削除するため、sink が適用していなかった変更は CDC トピックからしか Aurora DSQL に届きません。**再起動にギャップがないのは、トピックがその変更をまだ保持している間だけです** (MSK での保持期間で、Start CDC はこれを確認しません)。**Stop CDC** のダイアログと *Ready to resume CDC* のカードがこれを伝えます。
 
-> **MySQL: ウォーターマーク位置の binlog は、CDC 開始時点でまだ存在している必要があります。** このハンドオフは、ソースがウォーターマーク位置のバイナリログをまだパージしていない場合にのみ機能します。RDS/Aurora はデフォルトで binlog を積極的にパージし (Aurora MySQL は 24 時間保持)、CDC スタックのデプロイには約 15〜20 分かかるため、**開始前に binlog の保持期間を延長してください** — [§1.1](01-setup.md#11-前提条件) を参照してください。該当セグメントがすでに失われている場合、CDC はギャップなく再開できないため、新しいウォーターマークを取得するために **Drop & reload** で Full Load を再実行することになります (append はロード済みの行をそのまま残します) — ストリーミングしたことのあるスタックでは、Delete CDC infrastructure して再デプロイした後に実行します。それまでは Full Load ステップが新しい開始位置を拒否するためです ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))。
->
-> **PostgreSQL: 論理レプリケーションスロットが代わりに WAL を固定します。** スロットが作成された瞬間から必要な WAL を保持するため、足元で何かがパージされて失われることはありません — 前提条件は binlog の保持ではなく `wal_level=logical` (RDS/Aurora は `rds.logical_replication`) です。ただしスロットは健全に保つ必要があります: 遅れが大きくなりすぎて Postgres が `wal_status='lost'` (スロット無効化) を報告すると、そのスロットからのギャップのない再開が壊れ、Start CDC がブロックして解決方法を示します (下記): Full load + CDC では新しいウォーターマークを取得するために **Drop & reload** で Full Load を再実行し、スタックのコネクタを以前に開始していた場合は、その前に Delete CDC infrastructure して再デプロイします。CDC モニターのスロットパネルも同じスロットを *Replication slot invalidated* として報告し、その方法をすべて示します: Delete CDC infrastructure して再デプロイ、次に **Drop & reload** で Re-run Full Load、次に Start CDC。CDC only では Delete CDC infrastructure して再デプロイしてから新しいスタックで Start CDC し、その Start が選択したすべてのテーブルをスナップショットします (その種類には再実行する Full Load ステップがありません)。スロット名は CDC スタック名から決まるため、1 つのソースを同じスタック名で移行する 2 つのマイグレーションはスロットを共有します。Full Load は、その名前のスロットが使用中または別のデータベースに属している場合は決して削除しません (書き込みの前に停止します)。そのため、その名前のスロットがあっても CDC が使用できない場合 — 別のデータベースのものか、論理 `pgoutput` スロットでない場合 — すべてのブロックは、そのスロット自身の解決策 (そのスロットを削除するか、このマイグレーションに独自の CDC スタック名を使う) を Full Load の再実行より先に示します。そのようなスロットは Full Load の再実行も書き込みの前に拒否するためです。スロットがないというブロックも同じことを述べ、そのようなスロットはキャプチャ対象テーブルの継承の子テーブルより先に報告されます。継承のブロック自身の解決策がまさにその再実行だからです。CDC スタックの最初の Start (スタックにコネクタを開始した記録がまだないスタック。CloudFormation の更新がロールバックされた Start の記録もなく、MSK Connect にそのスタックのコネクタもないこと) では、スロットがもう Full Load の開始位置にない場合、Start CDC はそのスロットからの再開を拒否します (*CDC's replication slot is not at this Full Load's start point*: 同じ CDC スタック名を使う別の実行がスロットを作り直したか読み取ったため、再開するとその間の変更をスキップします): すべてのテーブルを再スナップショットするか、**Drop & reload** で Full Load を再実行してください (別のマイグレーションがこのスタック名を共有している場合は独自の CDC スタック名で) — CDC only では、マイグレーションの種類を Full load + CDC に切り替えてからです。コネクタを開始したことのないスタックの方法は下記にあります。以前にコネクタを開始したスタック — その後停止したスタック、Retry CDC のようにコネクタがそのまま残っているスタック (MSK Connect にそのスタックのコネクタがあれば、スタックのステータスにかかわらず該当)、最後の Start の CloudFormation の更新がロールバックされた (完了、進行中、失敗、クリーンアップ進行中を含むすべての `UPDATE_ROLLBACK_*` ステータス) スタック — はスロットの位置で判定されません: そのスタックの source connector がスロットを進めた可能性があるためです。そのようなスタックで新しい開始位置を取る Full Load は、CDC インフラを削除して再デプロイするまで拒否されるため ([第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))、このスタックがストリーミングした後に Full Load が作り直したスロットからの再開は、どこでも説明していません。このチェックはスタックが記録しているものと、MSK Connect にあるそのスタックのコネクタだけを読むため、拒否された Start、スタックを更新する前に失敗した Start、アプリの再起動、Start over の後も、次の Start は同じように判定されます。このスタックがストリーミングした後、またはこのスタックの最初の Start がロールバックされた後に、同じ CDC スタック名を使う別のマイグレーションがスロットを作り直した場合は検出できないため、マイグレーションごとに独自の CDC スタック名を使ってください。
->
-> **以前にコネクタを開始したスタックでは**、CDC トピックに、まだどの sink も適用していない変更が残っている可能性があります: Stop CDC とロールバックされた Start はコネクタをドレインせずに削除し、このスタックの sink は最後のコミットから再開するため、古いトピックのまま Full Load を再実行すると、それらの変更が再ロードしたテーブルの上に適用されます。そこでは再スナップショットも当てにできません: source connector が一度ストリーミングすると、Debezium はその後のすべての Start でスナップショットをスキップします。そのため、そのようなスタックでは、publication がない、publication に選択したテーブルが含まれていない、スロットがない、無効化された、または使用できないというブロックはそう伝えて、方法を 1 つだけ、新しいトピックを先に示します: Delete CDC infrastructure して再デプロイ (新しいスタックは空のトピックで始まります)、次に **Drop & reload** で Re-run Full Load (スロットが自身のスナップショット位置に作り直されます)、次に Start CDC。CDC only では Delete CDC infrastructure して再デプロイしてから新しいスタックで Start CDC し、その Start が選択したすべてのテーブルをスナップショットします (その間にソースで削除された行は Aurora DSQL に残り、Validation が EXTRA の行として報告します)。同じ理由で、自身の解決策が Full load + CDC の実行である継承のブロック (*CDC cannot snapshot a table that has inheritance child tables*) は、そのようなスタックでは、その Full Load の前に Delete CDC infrastructure して再デプロイするよう求めて終わります。その名前のスロットを使用できないというブロックは、その方法を自身の解決策 (そのスロットを削除するか、別の CDC スタック名を使う) の次の手順として示します。そのようなスタックには **Re-snapshot every table instead** は提示されません。source connector が Debezium の *Publication autocreation is disabled* で失敗したときの診断 (コネクタを開始したスタックでだけ出ます) も、CDC ステップにまだコネクタが表示されていれば Stop CDC してから、両方のマイグレーションの種類について同じ方法を示します。
->
-> **CloudFormation が Start をロールバックした後** は、その Start が位置を記録していれば、次の Start はその位置から続けます: その source connector がロールバックで削除される前にストリーミングして位置をコミットした可能性があり、そのためそのような Start も開始したものとして扱います。記録していなければ、`snapshot.mode=never` ではスロットの確定済みの位置からスナップショットなしで続け、`initial` (Manual を含む) では以前の実行がストリーミングを止めたところから続けます。ただし `initial` で Debezium がスナップショットなしで続けるのは、初期スナップショットを完了した、記録された位置からだけです: その Start (または以前の実行) が初期スナップショットを完了していなかったか、何も記録されていなければ、先に選択したすべてのテーブルをスナップショットしてから、スロットからストリーミングします。そのため、Start CDC のカード (*Ready to start CDC again*)、その上の開始位置のカード (*Starting again after a rolled-back Start*。そこでは開始位置も再スナップショットも提示しません)、その Start のアクティビティログの行はまさにそう述べ、`initial` ではスナップショットも、スナップショットがないことも約束しません。その Start がストリーミングした変更は、ロールバック後も残る CDC トピックにしかなく、次の sink がそこから適用するため、CDC を再び開始してギャップがないのはトピックがまだその変更を保持している間だけで、Start CDC はそれを確認しません。その Start の後 MSK でトピックの保持期間が過ぎた場合は、Delete CDC infrastructure して再デプロイし、**Drop & reload** で Re-run Full Load してから Start CDC してください (CDC only では Delete CDC infrastructure して再デプロイ: その最初の Start CDC が選択したすべてのテーブルをスナップショットします)。ロールバックされたその Start の前に CDC を **停止** していた場合、カードはその事実を述べ、その期間をその Start ではなく **Stop** の時点から数えます (*since CDC was stopped*): CDC が停止した時点で sink が適用していなかった変更がトピックの中で最も古く、先に期限切れになるためです。チェックされないケースが 1 つあります: 最初の Start がロールバックされたスタックで `snapshot.mode=initial` を送る Start は、スロットが存在するかを確認しません。そのときスロットがなければ、通常は失敗したコネクタが作成しなかったもので、その Start はギャップなくスナップショットします。しかし、そのコネクタがストリーミングした後にスロットが削除されていた場合、その Start はその間のすべての変更をスキップします。
->
-> ブロックが **Re-snapshot every table instead** を提示する前に、Start CDC のダイアログは開くときに、その方法が解除する Start (`snapshot.mode=initial`) のチェックを実行し、それらを通過した場合にだけ提示します。この方法が提示されるのは、コネクタを開始したことのないスタックで、publication がない、スロットがない、またはスロットが Full Load の開始位置にない場合だけです。その Start がブロックと同じ理由で拒否される場合は、2 つ目の通知なしでブロックを表示してその末尾にそこで使える方法を示し、別の理由で拒否される場合 — たとえば継承の子テーブルを持つキャプチャ対象テーブルがある、またはその名前のスロットが存在するが使用できない (無効化されたスロットなど) — は、その拒否も *Re-snapshot every table is not offered here: a Start that re-snapshots is refused too.* という前置きに続けて表示します。その後に、そこで使える方法を示します。継承のため (またはその読み取りに失敗したため) の拒否なら、代わりに **Drop & reload** で Re-run Full Load してください。スロットが自身のスナップショット位置に作り直されるため、その後の Start CDC はスナップショットしません (Full Load ステップのない CDC only では、先にマイグレーションの種類を Full load + CDC に切り替えます)。その名前のスロットを使用できないための拒否なら、その拒否自身の解決策 (そのスロットを削除するか、別の CDC スタック名を使う) の次の手順として、**Drop & reload** で Re-run Full Load してから Start CDC してください (CDC only では Start CDC をもう一度実行します)。publication に選択したテーブルが含まれていない場合は、再スナップショットする Start も同じ理由で拒否されるため (そのチェックも publication の対象範囲を判定します)、そのブロックは自身の方法で終わります: **Drop & reload** で Re-run Full Load すると、含まれていない選択したテーブルを publication に追加し、スロットを自身のスナップショット位置に作り直します。その後に Start CDC します (CDC only では Delete CDC infrastructure して再デプロイ: publication を削除するため、新しいスタックの Start CDC が選択したテーブルで publication を作成できます)。Start CDC のジョブは、コネクタを作成する前に publication とスロットのチェックをもう一度実行します (Retry CDC はダイアログを開きません)。コネクタを開始したことのないスタックで publication に選択したテーブルが含まれていない、またはその名前のスロットを使用できないというそのジョブの拒否は同じ方法で終わり、publication がない、スロットがない、またはスロットが Full Load の開始位置にないという拒否は 2 つの方法を示します: Re-snapshot every table instead (再スナップショットする Start が自身のチェックを通過すれば Start CDC のダイアログが提示します)、または **Drop & reload** で Re-run Full Load してから Start CDC (CDC only では、マイグレーションの種類を Full load + CDC に切り替えてから)。それらのチェックがソースを読めない場合、その方法は残り、ダイアログが *The re-snapshot route could not be checked* という警告を表示します。アクティビティログは *PostgreSQL re-snapshot route check not run* (WARNING) を記録します。このとき publication とスロットのチェックは実行されており、Start CDC のジョブがコネクタを作成する前に、再スナップショットする Start のチェックを実行します (そのジョブもソースを読めなければ、それらのチェックなしで進みます)。*CDC's publication and replication slot could not be checked* は、publication とスロットのチェック自体がソースを読めない場合にだけ表示されます (上記)。
->
-> **publication が INSERT/UPDATE/DELETE の一部だけを publish するよう制限されている場合** も Start CDC はブロックされ (*CDC's publication does not publish every change type*)、そのブロックは自身の解決策を先に示します: publication の所有者として、ソースで `ALTER PUBLICATION … SET (publish = 'insert, update, delete')` を実行してください。ただしそれだけでは十分ではなく、ブロックもそう述べます: pgoutput は各変更がコミットされた時点の publication を見て何を publish するかを決めるため、リストを戻しても、狭められていた間にコミットされた変更は戻らず、スロットから続ける Start はそれらの変更を依然としてスキップします。その解決策の後に方法が続きます — コネクタを開始したことのないスタックでは **Drop & reload** で Re-run Full Load してから Start CDC (CDC only では、先にマイグレーションの種類を Full load + CDC に切り替えます)、以前にコネクタを開始したスタックでは上記のとおり新しいトピックが先です。再スナップショットも (Full Load の再実行と同様に) publication をそのまま再利用するため、このブロックに **Re-snapshot every table instead** は提示されません。
->
-> **継承のブロックの 2 つ目の解決策は、UI が実際に実行できる場合にだけ示されます。** *…or untick `<親テーブル>`: each child table migrates as a table of its own* が現れるのは、テーブルのピッカーがまだ集合を変更できる間だけです。Start を一度送ると集合はロックされるため、Start CDC のジョブ自身の拒否はその方法を示さず、Full Load のスナップショット位置から開始する方法だけが残ります。そしてそのような Start がスナップショットする理由が、Full Load が記録したスロットがあるのに **Re-snapshot every table instead** を選んだことだけである場合、そのブロックは戻る方法も示します: 開始位置を Automatic に戻す、CDC の開始位置のカードの **Resume from the Full Load's slot instead** というコントロールです — そのため、記録された再スナップショットが同じブロックを繰り返すことはありません。そのコントロールはまさにその状態でだけ現れ、再スナップショットの通知 (*Manual re-snapshots instead of resuming from this load's slot*) もそれを示します。
+| 状況 | Start CDC が行うこと | あなたが行うこと |
+|---|---|---|
+| Stop CDC 後の再起動、または CloudFormation がロールバックした Start の後 | 最後に記録された位置から続けます (PostgreSQL: スロットの位置)。スナップショットを完了しなかった source connector は、選択したすべてのテーブルをもう一度スナップショットします。 | トピックが未適用の変更をまだ保持している間は何もしません。保持期間が過ぎたら、Delete CDC infrastructure して再デプロイし、**Drop & reload** で Re-run Full Load してから Start CDC してください (CDC only: Delete CDC infrastructure して再デプロイし、Start CDC すると選択したすべてのテーブルをスナップショットします)。 |
+| ストリーミングしたことのあるスタックでの、より新しい開始位置 (Re-run Full Load またはより新しい Manual の位置) | 拒否します (*This CDC stack cannot start from a newer start point*): そのスタックのトピックにはどの sink も適用していない変更が残っている可能性があります。 | Delete CDC infrastructure して再デプロイ (新しい空のトピック) し、Re-run Full Load するか Manual の位置を設定してから Start CDC してください。 |
+| 新しい開始位置での最初の Start (MySQL) | まず、キャプチャ対象テーブルがその開始位置以降に変更されていないかをチェックし ([第 6 章](06-limitations.md))、行は再読み込みせずに、スキーマ履歴を現在のソーステーブルから再構築します。 | なし。 |
 
-> **なぜ新しい開始位置では `recovery`、再起動では `schema_only` なのか。(MySQL ソース)** シードされたオフセットが存在すると、Debezium は「再開」パスをたどり、既存のスキーマ履歴トピックを期待しますが、新しい開始位置にはまだその履歴がありません。`recovery` は、行を再スナップショットせずにその履歴をライブのデータベースから構築するモードです — まさに「データは自分ですでにロード済みなので、このオフセットから再開するだけでよい」という状況に合致します — ただし、テーブルがそのオフセット以降に変更されていないことが前提なので、開始前にチェックします。再起動では履歴がすでに存在するため、それを再生します: 再構築すると古い行を今日の定義で読むことになるからです。履歴が失われていればその Start ははっきり失敗し、次の Start (コネクタがまだ残っていれば Stop CDC の後) が同じチェックの後に `recovery` を使います。**これは PostgreSQL ソースには当てはまりません:** PG にはスキーマ履歴トピックがないため、Debezium は事前作成済みの論理スロットから `snapshot.mode=never` で単純に再開します (スタンドアロン開始の場合は `initial` スナップショット)。
+### Start CDC がブロックされるとき (PostgreSQL ソース)
+
+Start CDC は、コネクタを作成する前に、publication、レプリケーションスロットとその位置、継承の子テーブルを確認します。ブロックの通知はまずその原因自体の対処を、続いて下の手順を示します。
+
+| 表示されるもの | 対処 |
+|---|---|
+| *Replication slot invalidated*、*CDC's replication slot is not at this Full Load's start point*、存在しない publication またはスロット、選択したテーブルが欠けた publication | 下の手順に従います。 |
+| *CDC's publication does not publish every change type* | publication の所有者として、ソースで `ALTER PUBLICATION … SET (publish = 'insert, update, delete')` を実行してから、下の手順に従います。publication が絞られていた間にコミットされた変更は戻りません。 |
+| 同じ名前のスロットがあるが CDC が使えない (別のデータベースのスロット、または論理 `pgoutput` スロットではない) | そのスロットを削除するか、このマイグレーションに独自の CDC スタック名を与え、その後に下の手順に従います (CDC only では Start CDC をもう一度実行します)。 |
+| *CDC cannot snapshot a table that has inheritance child tables* | **Drop & reload** で Re-run Full Load します (コネクタを以前に開始したスタックでは先に Delete CDC infrastructure して再デプロイし、Full Load ステップのない CDC only では、先にマイグレーションの種類を Full load + CDC に切り替えます)。または、テーブルの選択をまだ変更できる間に親の選択を外します。 |
+| *CDC's publication and replication slot could not be checked* | ツールがソースを読めません (たとえばアプリの再起動後の Secrets Manager ソース)。Start CDC はブロックされませんが、これらのチェックは実行されません。Connect ステップでソース接続をテストしてから、Start CDC をもう一度開いてチェックが実行されるようにしてください。 |
+
+**手順。** スタックのコネクタを開始したことがあるかどうかで異なります:
+
+- コネクタを **一度も開始していない** スタック: **Drop & reload** で Re-run Full Load すると、スロットを自身のスナップショット位置に作り直し、その後に Start CDC します (Full Load ステップのない CDC only では、先にマイグレーションの種類を Full load + CDC に切り替えます)。または **Re-snapshot every table instead** — Start CDC のダイアログは、再スナップショットする Start 自体がチェックを通る場合にのみこれを提示します (そうでなければ *Re-snapshot every table is not offered here: a Start that re-snapshots is refused too.* と表示し、通用する手順を示します)。
+- コネクタを **以前に開始した** スタック (その後停止した、または最後の Start がロールバックされた場合): CDC トピックにどの sink も適用していない変更が残っている可能性があり、Debezium は以降の Start でスナップショットをスキップするため、再スナップショットは提示されず、手順は新しいトピックからです: Delete CDC infrastructure して再デプロイし、**Drop & reload** で Re-run Full Load してから Start CDC します。Full Load ステップのない CDC only では、Delete CDC infrastructure して再デプロイし、新しいスタックで Start CDC すると、選択したすべてのテーブルをスナップショットします (その間にソースで削除された行は Aurora DSQL に残り、Validation が EXTRA の行として報告します)。
+
+開始位置のカードの **Resume from the Full Load's slot instead** は、記録された再スナップショット (*Manual re-snapshots instead of resuming from this load's slot*) を元に戻します。スロット名は CDC スタック名から決まるため、同じソースのマイグレーションごとに独自の CDC スタック名を使ってください。
 
 ---
 
@@ -268,14 +154,16 @@ DSQL は分散型かつ PostgreSQL 互換であるため、sink は従来の MyS
 
 | DSQL の制約 | カスタム sink の処理方法 |
 |---|---|
-| **IAM トークン認証 (パスワードなし)** | 短命な IAM トークン (admin または standard) を生成し、TLS 経由の JDBC パスワードとして使用します。**有効期限前に更新** し (15 分のトークン、2 分の更新マージン)、長時間実行される CDC が期限切れトークンで停止しないようにします。 |
-| **楽観的並行性制御 (ロックなし)** | `SQLSTATE 40001` の場合、競合した **トランザクション** を指数バックオフ + ジッターで再実行します (最大 10 回): ≤3000 行のチャンク 1 つ (適用は冪等なので安全)、または拒否された行を隔離するために 1 行ずつ適用している間は 1 行。再実行は毎回クリーンなトランザクションから始まります: 失敗した試行を先にロールバックします。Aurora DSQL はコミット時だけでなく、ステートメントの実行中にも `40001` を返すことがあるためです (`OC001`、クラスターの別の場所でスキーマが変更された後)。以前のバージョンのツールでデプロイした CDC インフラはこのロールバックなしで再実行します: **Delete CDC infrastructure** して再デプロイするまでは、そのような `40001` によって正常な行がデッドレターになることがあります (`25P02`)。 |
-| **一時的なサービス状態 (`XX000` "server unavailable")** | Aurora DSQL は `XX000` を一時的な状態として文書化しています: 接続は引き続き使え、`COMMIT` を含むトランザクション全体を再実行します。sink はこれを `40001` とまったく同じように扱います: 失敗した試行をロールバックしてから **トランザクション** (チャンク 1 つ、または 1 行) を同じ指数バックオフ + ジッターで再実行し、両者は最大 10 回の予算を共有します。その予算を超えて続く場合、sink は再接続し、Aurora DSQL が再び応答するまで Kafka Connect がバッチを再配信するため、そのような行は **デッドレター化されません**。以前のバージョンのツールでデプロイした CDC インフラは、**Delete CDC infrastructure** して再デプロイするまで、そのような行をデッドレターにします (`XX000`)。コミット中の `XX000` はコミットが実際には反映されたことを意味する場合があります。すべての書き込みは PK でキーイングされた upsert または delete なので、再実行は主キー単位では冪等ですが、二次 `UNIQUE` インデックスがあるテーブルでは、反映済みのチャンクがすでに置き換えた中間イメージが拒否される (`23505`) ことがあります。コミットが反映されていた場合、再実行のその中間イメージは同じバッチにあるその行の後の変更で置き換えられ、スキップされます (リキーされていないテーブルの場合)。残る競合はほかの保留された変更と同じように待ち (下の行)、5 分の待機を超えた場合にだけデッドレターになり、そのときはデッドレターが出たすべてのテーブルと同じく、そのテーブルが CHECKSUM で一致するまで Cut over は保留されます ([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。以前のインフラはこれを即座にデッドレターにします。その間、CDC ステップはシンクが停止していると表示し ("The sink is not applying changes")、シンクコネクタのログには `DSQL apply failed (transient sqlstate=XX000); Connect will retry` が繰り返し出力されます。Aurora DSQL が再び応答すると、ストリームは自動的に再開します。`XX000` が繰り返し発生する場合は AWS サポートに問い合わせてください。 |
-| **主キー以外の一意インデックス (`23505`)** | Aurora DSQL は一意インデックスを即座に検査する (遅延できるのは外部キーだけ) ため、別の行がまだその値を持っている間は変更が拒否されることがあります。主キーの `UPDATE` がまさにそれに当たります: Debezium はこれを古いキーの delete と新しいキーの insert として複製し、両者はキーが異なるため別々のパーティションを通り、insert が先に届くことがあります。ある行から別の行へ渡される一意の値も同様です。sink (プラグイン v53 以降) はそのような変更と、そのパーティション上の以降の変更をすべて、値を空ける変更が適用されるまで保留します: ほかのパーティションがすべて適用され続ける間、間隔を伸ばしながら (500 ms から 10 s まで) 再試行し、最初の拒否から — またはそれより後なら、その変更を保留している sink タスクの最後の一時的な失敗 (切断された接続、または再試行を超えた `XX000` か `40001`) から — 最大 5 分間なので、そのタスクが受ける Aurora DSQL の障害は待機を使い切りません。値を空ける変更を別の sink タスクで遅らせるだけの障害は、待機を使い切ることがあります。待機はそのテーブルの Stream lag として表れます (§4.6)。5 分は保留された変更ごとに適用されます: 1 つのパーティションの競合は 1 つずつ順に待たれ、キャッチアップ中も同様です。リキーされていないテーブルで同じ行の後の変更がそれを完全に置き換える場合は (通常の delete、または同じ列のイメージ) — 同じバッチにある場合も、sink がパーティションを一時停止する前に (適用せずに) 読むそのパーティションの次のバッチにある場合も — 競合した変更は代わりにスキップされます (デッドレターにはなりません)。リキーされた (Composite key) テーブルでは何もスキップしません。5 分を超えると SQLSTATE `23505` とインデックス名でデッドレターになります (*a unique constraint rejected the row*)。以前のバージョンのツールでデプロイした CDC インフラは、**Delete CDC infrastructure** して再デプロイするまで、競合した変更を即座にデッドレターにし、その後古い行の delete が行を削除します ([第 6 章](06-limitations.md))。スキップした変更の行は、その置き換えが適用されるまでターゲット上の値がそのまま残ります。そのため、スキップした変更が空けるはずだった値を必要とする別の行の変更 (複数の行を渡っていく一意の値) はその置き換えを待ち、その置き換えがそのパーティション上で後ろに並んでいる場合や、その変更の行がまだ持つ値を置き換え自身が待つ場合 (このときは両方ともデッドレターになります) は、5 分後にデッドレターになります。そのときは、デッドレターが出たすべてのテーブルと同じく、そのテーブルが CHECKSUM で一致するまで Cut over は保留されます。 |
-| **トランザクションあたり ≤ 3000 行** | ≤ 3000 行かつ最大 8 MiB のバイト予算のチャンク単位で適用し (デフォルトバッチは 3000)、チャンクごとに 1 回 `commit()` します。テキスト・JSON・バイナリの値はすべてそのサイズで数えるため、大きな JSON ドキュメントのまとまりも、Aurora DSQL のトランザクションあたり・メッセージあたり 10 MiB の上限を十分下回るように分割されます (1 つのステートメントが 2 つのチャンクにまたがることはありません)。以前のバージョンのツールでデプロイした CDC インフラは、JSON の値 (MySQL の `JSON`、PostgreSQL の `json`/`jsonb` または配列) を数バイトとしか数えませんでした: 大きなドキュメントがまとまって届くとメッセージの上限を超えるステートメントを作ることがあり、Aurora DSQL はそれを拒否します (`08P01`、*invalid message length*)。するとシンクは、**Delete CDC infrastructure** して再デプロイするまで、そのバッチを際限なく再試行します (停止したシンクとして表示されます)。 |
-| **ステートメント単位の UPDATE / リプレイなし** | すべての変更は **PK でキーイングされた冪等な upsert または delete** です。insert/update には `INSERT ... ON CONFLICT (pk) DO UPDATE`、delete には `DELETE ... WHERE pk = ?` (および Kafka のトゥームストーン) を使用します。同じイベントの再適用は安全です。 |
-| **接続の切断 (アイドルクローズ / トークン期限切れ / ワーカー再生成)** | 切断された接続やハーフオープンの接続を検出し、新しいトークンで再接続して **同じオフセットをリプレイ** します (適用が冪等なため安全)。レコードを破棄することはありません。接続エラーは一時的なものとして扱ってリトライし、poison row と誤認しません。Aurora DSQL が接続を開くこと自体を拒否した場合 — IAM トークン (`28xxx`)、開いている接続が多すぎる (`53300`)、接続レートの超過 (`53400`) — も同様です: 新しく署名したトークンでバッチを再試行し、何もデッドレターにしません。以前のバージョンのツールでデプロイした CDC インフラは、**Delete CDC infrastructure** して再デプロイするまで、そのような拒否が続く間に試したすべての行をデッドレターにします。 |
+| **IAM トークン認証 (パスワードなし)** | 短命な IAM トークンを TLS 経由のパスワードとして使用し、**有効期限前に更新** して、長時間実行される CDC が期限切れトークンで停止しないようにします。 |
+| **楽観的並行性制御 (ロックなし)** | `SQLSTATE 40001` の場合、競合した **トランザクション** を指数バックオフ + ジッターで再実行します (最大 10 回): ≤3000 行のチャンク 1 つ (適用は冪等なので安全)、または拒否された行を隔離するために 1 行ずつ適用している間は 1 行。再実行は毎回クリーンなトランザクションから始まります: 失敗した試行を先にロールバックします。Aurora DSQL はコミット時だけでなく、ステートメントの実行中にも `40001` を返すことがあるためです。 |
+| **一時的なサービス状態 (`XX000` "server unavailable")** | Aurora DSQL は `XX000` を一時的な状態として文書化しているため、sink はこれを `40001` とまったく同じように扱います: 失敗した試行をロールバックしてから **トランザクション** を同じバックオフで再実行し、両者は最大 10 回の予算を共有します。その予算を超えて続く場合、sink は再接続し、Aurora DSQL が再び応答するまで Kafka Connect がバッチを再配信するため、そのような行は **デッドレター化されません**。その間、CDC ステップはシンクが停止していると表示し ("The sink is not applying changes")、シンクコネクタのログには `DSQL apply failed (transient sqlstate=XX000); Connect will retry` が繰り返し出力されます。Aurora DSQL が再び応答すると、ストリームは自動的に再開します。`XX000` が繰り返し発生する場合は AWS サポートに問い合わせてください。 |
+| **主キー以外の一意インデックス (`23505`)** | Aurora DSQL は一意インデックスを即座に検査するため、別の行がまだその値を持っている間は変更が拒否されることがあります: 主キーの `UPDATE` (Debezium はこれを古いキーの delete と新しいキーの insert として複製し、両者は別々のパーティションを通ることがあるため、insert が先に届くことがあります) や、ある行から別の行へ渡される一意の値です。sink (プラグイン v53 以降) はそのような変更と、そのパーティション上の以降の変更をすべて、値を空ける変更が適用されるまで保留します: ほかのパーティションがすべて適用され続ける間、間隔を伸ばしながら (500 ms から 10 s まで) 再試行し、最大 5 分間です (Aurora DSQL の障害で待機が中断された場合はそれより長くなります。詳細は [§6.2](06-limitations.md#62-移行プロセスの制限))。5 分は保留された変更ごとに適用されます。待機はそのテーブルの Stream lag として表れます (§4.6)。リキーされていないテーブルで同じ行の後の変更がそれを完全に置き換える場合は (通常の delete、または同じ列のイメージ)、競合した変更は代わりにスキップされます (デッドレターにはなりません)。リキーされた (Composite key) テーブルでは何もスキップしません。スキップした変更の行は、その置き換えが適用されるまでターゲット上の値がそのまま残ります。そのため、スキップした変更が空けるはずだった値を必要とする別の行の変更は、5 分後にデッドレターになることがあります ([§6.2](06-limitations.md#62-移行プロセスの制限) に該当するケースがあります)。5 分を超えると SQLSTATE `23505` とインデックス名でデッドレターになり (*a unique constraint rejected the row*)、デッドレターが出たすべてのテーブルと同じく、そのテーブルが CHECKSUM で一致するまで Cut over は保留されます ([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。 |
+| **トランザクションあたり ≤ 3000 行** | ≤ 3000 行かつ最大 8 MiB のバイト予算のチャンク単位で適用し、チャンクごとに 1 回 `commit()` します。テキスト・JSON・バイナリの値はすべてそのサイズで数えるため、大きな JSON ドキュメントのまとまりも、Aurora DSQL のトランザクションあたり・メッセージあたり 10 MiB の上限を十分下回るように分割されます。 |
+| **ステートメント単位の UPDATE / リプレイなし** | すべての変更は **PK でキーイングされた冪等な upsert または delete** です (`INSERT ... ON CONFLICT (pk) DO UPDATE`、`DELETE ... WHERE pk = ?`、Kafka のトゥームストーン)。同じイベントの再適用は安全です。 |
+| **接続の切断 (アイドルクローズ / トークン期限切れ / ワーカー再生成)** | 切断された接続やハーフオープンの接続を検出し、新しいトークンで再接続して **同じオフセットをリプレイ** します (適用が冪等なため安全)。レコードを破棄することはありません。接続エラーは一時的なものとして扱ってリトライし、poison row と誤認しません。Aurora DSQL が接続を開くこと自体を拒否した場合 — IAM トークン (`28xxx`)、開いている接続が多すぎる (`53300`)、接続レートの超過 (`53400`) — も同様です: 新しく署名したトークンでバッチを再試行し、何もデッドレターにしません。 |
 | **外部キー (ドレイン後のカットオーバーで適用)** | sink がストリーミングしている間、ターゲットに外部キーはありません: sink はテーブルをまたぐ変更を親→子の順序なしに適用するため、強制されたキーがあると先に届いた子行を拒否します(`23503`、デッドレター)。キーは最終ドレインの後、カットオーバーで追加されます: `NOT VALID` ですぐに(数秒、その時点からすべての新規書き込みを強制)追加し、ロード済みの行はその後 Aurora DSQL がバックグラウンドで検証します([第 2 章](02-evaluation-and-schema-conversion.md))。ソースの `ON DELETE` / `ON UPDATE` アクションはストリームに届かない(InnoDB がエンジン内部で適用する)ため、それが変更した子行でその検証が失敗することがあります: MySQL ソースでは **I've cut over** は、そうしたキーが検証されるまで、またはその検査なしでカットオーバーすると選ぶまで待ちます。 |
+
+CDC スタックはデプロイ時のプラグインをそのまま使い続けます: 古い sink プラグインがこの表と異なる動作をする場合は CDC ステップがその旨を表示し (*This CDC infrastructure runs an older sink plugin*)、**Delete CDC infrastructure** して再デプロイするまでそのままです。
 
 ---
 
@@ -286,16 +174,16 @@ DSQL は **約 1 MiB を超える単一の値** (`TEXT`/`bytea` 値) を拒否�
 | 値のサイズ | 処理内容 |
 |---|---|
 | **≤ 1 MiB** | 通常どおり適用されます。 |
-| **1 MiB – 8 MiB** | sink は **書き込み前に** 各値を測定し、特大サイズの値を **DLQ** に **隔離 (quarantine)** します (適用されることは決してありません)。一方でそのレコードのテーブルの残りの値はそのまま流れ続けます。そのようなレコードがデッドレター化のために Kafka を通過できるように、テーブルごとのトピックとクライアントの上限が引き上げられます (デフォルト 4 MiB、最大 8 MiB)。 |
-| **> 8 MiB** | Kafka にまったく入ることができません。これらは **キャプチャ時に除外** する必要があります。Debezium の `column.exclude.list` が特大サイズの LOB 列をドロップし、パイプラインに到達しないようにします。ドロップする列は Data Migration ステップのテーブル一覧の下にある **Exclude tables & columns** でルールにより除外します — その *Oversized-LOB candidates* セクションが Evaluation が `OVERSIZED_LOB` としてフラグ付けするのと同じ集合を示します。ツールが書き込む行では、除外した列は NULL になります。CDC 開始前から Aurora DSQL にあった行は値を保持し(CDC は除外した列を書き込みません)、Validation がそれらの行を数えます。 |
+| **1 MiB – 8 MiB** | sink は **書き込み前に** 各値を測定し、特大サイズの値を **DLQ** に **隔離 (quarantine)** します (適用されることは決してありません)。一方でそのレコードのテーブルの残りの値はそのまま流れ続けます。 |
+| **> 8 MiB** | Kafka にまったく入ることができません。これらは **キャプチャ時に除外** する必要があり、そうすれば特大サイズの LOB 列はパイプラインに到達しません。ドロップする列は Data Migration ステップのテーブル一覧の下にある **Exclude tables & columns** でルールにより除外します — その *Oversized-LOB candidates* セクションが Evaluation が `OVERSIZED_LOB` としてフラグ付けするのと同じ集合を示します。ツールが書き込む行では、除外した列は NULL になります。CDC 開始前から Aurora DSQL にあった行は値を保持し(CDC は除外した列を書き込みません)、Validation がそれらの行を数えます。 |
 
 ### デッドレター化される対象
 
-特大サイズの値に加えて、DLQ は DSQL が **恒久的に** 拒否するあらゆるレコードを隔離します — 型の不一致、制約違反、ターゲット列の欠落 (たとえば伝播されていないソースの `ALTER` の後) など — また、Aurora DSQL の列が値を変えてしまうために sink が拒否する値も隔離します ([§4.2](#cdc-中のソーススキーマドリフトの検出と対処))。一時的な失敗 (OCC `40001`、Aurora DSQL の一時的な `XX000` "server unavailable"、接続の切断) は **リトライ** され、デッドレター化はされません。ソースのスキーマ変更で説明できる拒否は修復方法とともにバナーの行として表示され (§4.2)、スキーマと関係のない値単位のデータエラー (たとえば `22P02`) は SQLSTATE だけが表示されます。ターゲットに列・テーブル・キーがない、または列の型が変わったためにテーブルの行がデッドレター化されている間も、他のテーブルは引き続きバッチで適用されます (§4.2 を参照)。値単位の拒否 (一意制約・`CHECK` 違反、長すぎる値や範囲外の値) では、引き続きその周りの行が 1 トランザクション 1 行で適用されます。insert・update の一意制約違反 (`23505`) は、まず値を空ける変更のために最大 5 分間保留され (§4.4)、それより長く続く場合にだけデッドレターになります。
+特大サイズの値に加えて、DLQ は DSQL が **恒久的に** 拒否するあらゆるレコードを隔離します — 型の不一致、制約違反、ターゲット列の欠落 (たとえば伝播されていないソースの `ALTER` の後) など — また、Aurora DSQL の列が値を変えてしまうために sink が拒否する値も隔離します ([§4.2](#cdc-中のソーススキーマドリフトの検出と対処))。一時的な失敗 (OCC `40001`、Aurora DSQL の一時的な `XX000` "server unavailable"、接続の切断) は **リトライ** され、デッドレター化はされません。ソースのスキーマ変更で説明できる拒否は修復方法とともにバナーの行として表示され (§4.2)、スキーマと関係のない値単位のデータエラー (たとえば `22P02`) は SQLSTATE だけが表示されます。値単位の拒否 (一意制約・`CHECK` 違反、長すぎる値や範囲外の値) では、その周りの行が 1 トランザクション 1 行で適用され、insert・update の一意制約違反 (`23505`) は、まず値を空ける変更のために最大 5 分間保留され (§4.4)、それより長く続く場合にだけデッドレターになります。
 
 ### DLQ が表面化する場所 — 読み取る Kafka トピックではなく CloudWatch
 
-sink は隔離した各レコードをその **CloudWatch** connector ロググループに記録し、ツールの監視機能がそれらの行をパースして UI に反映します (テーブルごとの「Quarantined」件数と、ダウンロード可能な単一のエラーログ)。記録される理由には **SQL テンプレート** (列名 + `?` プレースホルダ) が含まれますが、**行の値や認証情報は一切含まれません** — そのため、データを露出させることなく、DSQL が拒否した正確なステートメントの形状を確認できます。適用もデッドレター化もできないレコードは、サイレントにスキップされるのではなくタスクを **明示的に失敗** させます — サイレントな損失よりも可視性を優先します。
+sink は隔離した各レコードをその **CloudWatch** connector ロググループに記録し、ツールの監視機能がそれらの行をパースして UI に反映します (テーブルごとの「Quarantined」件数と、ダウンロード可能な単一のエラーログ)。記録される理由には **SQL テンプレート** (列名 + `?` プレースホルダ) が含まれますが、**行の値や認証情報は一切含まれません**。適用もデッドレター化もできないレコードは、サイレントにスキップされるのではなくタスクを **明示的に失敗** させます。
 
 ### Full Load が隔離した行に対する以後の変更を CDC はどう扱うか
 
@@ -303,196 +191,84 @@ Full Load がある行を隔離した場合 (特大サイズの値を書き込�
 
 | 存在しない行に対するソースの操作 | CDC の動作 | 結果 |
 |---|---|---|
-| `DELETE` | `DELETE … WHERE pk = ?` が **0 行** に一致します。sink は 0 行の delete をエラーとして扱わないため、そのまま適用・コミットされます。 | **正常。** 意図した最終状態 (「その行がターゲットに無い」) が既に成立しています。これを失敗として扱うと冪等性が壊れます — 再生・再試行された delete は常に安全でなければなりません。 |
-| 値を 1 MiB 未満に縮める `UPDATE` | Debezium が **after-image 全体** を送り、sink が `INSERT … ON CONFLICT (pk) DO UPDATE` を書きます。既存行が無いため `ON CONFLICT` は発火せず、行は **INSERT** されます。 | **ギャップが自己修復します。** 対応不要。 |
+| `DELETE` | `DELETE … WHERE pk = ?` が **0 行** に一致します。sink は 0 行の delete をエラーとして扱わないため、そのまま適用・コミットされます。 | **正常。** 意図した最終状態 (「その行がターゲットに無い」) が既に成立しています。 |
+| 値を 1 MiB 未満に縮める `UPDATE` | Debezium が **after-image 全体** を送り、sink が upsert として書き込みます。既存行が無いため、行は **INSERT** されます。 | **ギャップが自己修復します。** 対応不要。 |
 | 値が依然として特大サイズの `UPDATE` | sink は書き込みの **前** に値を測定するため、同じ理由で **DLQ** に隔離されます。 | ギャップは残りますが **可視** です (DLQ の深さ / モニターの「Quarantined」)。 |
 | *別の* 行の `INSERT` | 影響なし。 | 正常。 |
 
-計画時に留意すべき 2 点:
-
-- **Full Load 後の隔離ギャップは自ら知らせてくれません。** ソースがその行に二度と触れなければ、ギャップはそのまま残ります — CDC に複製するものが無いからです。これを報告するのは **Validation (ステップ 4)** であり、だからこそ Full Load の完全性判定はそちらを指しています。
-- **0 行の delete は通常の再処理と区別できません。** sink は「隔離された行だったため何も見つからなかった delete」と「単に再処理された delete」を区別できません。これは冪等性を優先した意図的なトレードオフであり、ギャップの計上は delete の経路ではなく Validation の役割です。
-
-実務上の指針は変わりません: カットオーバー前に特大サイズのソース値を修正して、CDC を停止した状態でそのテーブルを **Reload** するか (Stop CDC、Reload、それからもう一度 Start CDC: CDC のストリーミング中は Full Load ステップは再ロードを実行しません、[第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))、特大サイズの LOB 列をキャプチャ段階で除外し (§4.5) パイプラインに入れないようにしてください。
+Full Load 後の隔離ギャップは自ら知らせてくれません: ソースがその行に二度と触れなければ CDC に複製するものはなく、0 行の delete は通常の再処理と区別できません。これを報告するのは **Validation (ステップ 4)** であり、だからこそ Full Load の完全性判定はそちらを指しています。実務上の指針は変わりません: カットオーバー前に特大サイズのソース値を修正して、CDC を停止した状態でそのテーブルを **Reload** するか (Stop CDC、Reload、それからもう一度 Start CDC: CDC のストリーミング中は Full Load ステップは再ロードを実行しません、[第 3 章 §3.5](03-full-load.md#35-ウォーターマーク--cdc-への橋渡し))、特大サイズの LOB 列をキャプチャ段階で除外し (§4.5) パイプラインに入れないようにしてください。
 
 ---
 
 ## 4.6 CDC 進捗のモニタリング (マイグレーションモニター)
 
-CDC 実行中、Data Migration 画面はテーブルごとのライブモニターを表示します。手動リロードなしで自動更新され、
-ソースに対しては**スキャン不要**です — 本番 DB に `COUNT(*)` を実行しません。列は次のとおりです。
+CDC 実行中、Data Migration 画面はテーブルごとのライブモニターを表示します。手動リロードなしで自動更新され、ソースに対しては**スキャン不要**です — 本番 DB に `COUNT(*)` を実行しません。列は次のとおりです。
 
 | 列 | 意味 |
 |---|---|
 | **Full Load rows** | ワンショットスナップショットがテーブルにロードした行数。 |
-| **Inserts** | Full Load 以降にこのテーブルへ適用された CDC insert の累計数 — シンクがライブ報告する、テーブルごとの**負にならない**累計カウント(スキャン不要)。 |
-| **Updates** | Full Load 以降にこのテーブルへ適用された CDC update の累計数 — シンクがライブ報告する、テーブルごとの**負にならない**累計カウント(スキャン不要)。 |
-| **Deletes** | Full Load 以降にこのテーブルへ適用された CDC delete の累計数 — シンクがライブ報告する、テーブルごとの**負にならない**累計カウント(スキャン不要)。 |
-| **Quarantined** | **DLQ** に隔離された変更イベントの、テーブルごとの件数 — 恒久的に拒否された行(型の不一致、1 MiB を超える特大サイズの値、制約 / スキーマドリフト)。シンクがライブ報告。 |
-| **Source rows (est.)** | スキャン不要のカタログ **見積り** (MySQL は `information_schema.tables`、PostgreSQL は `pg_class.reltuples`)。**Target rows** — DSQL の正確なカウント。 |
+| **Inserts** / **Updates** / **Deletes** | Full Load 以降にこのテーブルへ適用された CDC の insert・update・delete の累計数。 |
+| **Quarantined** | **DLQ** に隔離された変更イベントの件数(恒久的に拒否された行: 型の不一致、1 MiB を超える特大サイズの値、制約 / スキーマドリフト)。 |
+| **Source rows (est.)** | スキャン不要のカタログ **見積り**。**Target rows** — DSQL の正確なカウント。 |
 | **Stream lag** | ターゲットがソースより**時間的に**どれだけ遅れているか(下記参照)。 |
 | **Consistency** | 色付きバッジ: 緑 *consistent* = カウント一致 · *replicating…* = 追いつき中 · 赤 *rows missing* = 最新の変更は届いたが途中で行が消失 · 赤 *data quarantined* = DLQ に未適用イベントあり。 |
 
 ### Stream lag — 行数ではなく実時間の指標
 
-**Stream lag** はエンドツーエンドのレプリケーション遅延です: 各変更について、シンクが **適用時刻 − ソースの
-コミット時刻**(Debezium `source.ts_ms`)を記録し、テーブルごとの `ReplicationLagMs` CloudWatch メトリクスとして
-送出します。モニターは、最近のウィンドウで観測された **最悪 (最大) の遅延** を表示します (直近の単一値では
-ありません)。
+**Stream lag** はエンドツーエンドのレプリケーション遅延です: 各変更について、シンクが **適用時刻 − ソースのコミット時刻** を記録し、モニターは、最近のウィンドウで観測された **最悪 (最大) の遅延** (直近の単一値ではありません) を時間で表示します: `caught up`(1 秒未満 / ストリーム消化済み)、`8.5s behind`、`2m 10s behind`、`1h 4m behind`。真の**時間**遅延なので、**あらゆる**プライマリキー型で正確であり、最新の insert だけでなく update/delete の遅延も反映します。シンクが**一意インデックスのために保留した変更**(§4.4)は、待っている間そのテーブルの遅延として数えられます。適用されるかデッドレターになると遅延は下がります。パーティション単位の遅延はありません。時間メトリクスがまだ利用できない場合(古いシンクプラグイン、またはデータポイントがまだ無い場合)、モニターは `N behind (PK)` または `caught up` を表示します。単一列の整数 PK でのみ機能します。
 
-- **時間(duration)** で表示されます: `caught up`(1 秒未満 / ストリーム消化済み)、`8.5s behind`、
-  `2m 10s behind`、`1h 4m behind`。
-- 真の**時間**遅延なので、**あらゆる**プライマリキー型で正確であり、最新の insert だけでなく update/delete の
-  遅延も反映します。
-- シンクが**一意インデックスのために保留した変更**(§4.4)は、待っている間そのテーブルの遅延として数えられます
-  — 保留されたとき、再試行のたび、オフセットのコミットのたび(約 1 分に 1 回) — 適用されるまでは insert・
-  update・delete として数えず、適用されるかデッドレターになると遅延は下がります。パーティション単位の遅延は
-  ありません: そのパーティションでその後ろに並んだ変更は、その変更を通してだけ表れます。
-- **フォールバック:** 時間メトリクスがまだ利用できない場合(古いシンクプラグイン、またはメトリクスのデータポイントが
-  まだ無い場合)、モニターは `MAX(pk)` の**先端**チェックにフォールバックし、`N behind (PK)`(ターゲットの最新キーが
-  ソースより何 PK 単位遅れているか)または `caught up` を表示します。このフォールバックは単一列の整数 PK でのみ機能し、
-  上記の時間ベースの値が一般的で推奨される指標です。
-
-遅延の送出は厳密に **best-effort** であり、レプリケーションに影響しません。ソースの最後の書き込みから少なくとも
-5 分経った後の「Stream lag → caught up」を(保留された変更の遅延は表れるまでに 1〜2 分かかることがあります)
-[カットオーバー](10-conclusion.md)に進んで安全なシグナルとして使ってください。
+遅延の送出は厳密に **best-effort** であり、レプリケーションに影響しません。ソースの最後の書き込みから少なくとも 5 分経った後の「Stream lag → caught up」を(保留された変更の遅延は表れるまでに 1〜2 分かかることがあります) [カットオーバー](10-conclusion.md)に進んで安全なシグナルとして使ってください。
 
 ### パイプラインの健全性と change flow
 
-テーブル別テーブルの上に、**パイプライン健全性カード**が各コネクタの状態と **「change flow」** ステータス行
-を表示します — *Streaming*、*No changes flowing — idle*、または **「Sink stalled — changes are NOT reaching
-DSQL」** — ソース poll とシンク send の rec/s ゲージ 2 つとともに、アイドルなストリームと詰まったストリームを
-一目で見分けられます。**ライブ stream-lag チャート**は最悪のエンドツーエンド遅延を時系列で描き、「caught up」
-と確定したシンク stall を区別します。
+テーブル別テーブルの上に、**パイプライン健全性カード**が各コネクタの状態と **「change flow」** ステータス行を表示します — *Streaming*、*No changes flowing — idle*、または **「Sink stalled — changes are NOT reaching DSQL」** — ソース poll とシンク send の rec/s ゲージ 2 つとともに、アイドルなストリームと詰まったストリームを一目で見分けられます。**ライブ stream-lag チャート**は最悪のエンドツーエンド遅延を時系列で描きます。
 
-確定した stall の通知は、シンクコネクタのログを指します。`Commit of offsets timed out` が繰り返される場合は、シン
-クのコンシューマーがグループから外れています: Stop CDC してから Start CDC し、再参加させてください。
-`DSQL apply failed (transient sqlstate=…)` が繰り返される場合は、シンクが失敗する書き込みを再試行し続けており、その
-SQLSTATE が理由を示します: `XX000` は一時的な Aurora DSQL の状態です(シンクは自動的に再開します。長引く場合は
-AWS サポートに問い合わせてください)。`08xxx`、`57xxx` または `null` は、シンクがクラスターに到達できないことを
-意味します(クラスターがまだ存在するか、コネクタのサブネットがポート 5432 でそのエンドポイントに到達できるか —
-セキュリティグループ、NAT ゲートウェイまたは Aurora DSQL VPC エンドポイントとその DNS — そしてコネクタの IAM
-ロールがまだ接続できるかを確認してください)。`28xxx`、`53300` または `53400` は、Aurora DSQL が接続を開くことを
-拒否したことを意味し(`28xxx` は IAM トークン: コネクタの IAM ロールがまだ接続できるかを確認、`53300` はクラスター
-の開いている接続の上限: 他の場所のアイドル接続を閉じるかクォータを引き上げる、`53400` は新しい接続のレート)、
-接続が開けばシンクは再開します。`40001` は、別の何かが Aurora DSQL で同じ行に書き込んでいることを意味します
-(cut over まで止めてください)。シンクの send レートが回復するまで cut over しないでください。
+確定した stall の通知は、シンクコネクタのログを指します。シンクの send レートが回復するまで cut over しないでください。繰り返される行の意味:
 
-コネクタのタスクが停止すると、その行は赤に変わります。コネクタの CloudWatch ワーカーログにツールが認識する
-失敗 — Debezium が解析できない MySQL の DDL 文、スキーマ履歴の問題、作成できない PostgreSQL の publication、
-到達できないソースなど — があれば、行には *Stopped —* に続いて原因が表示され、コネクタの下のエラー通知が
-何をすべきかを示します。ツールはそのログの最新の数百行だけを、コネクタが停止している間だけ、最大 1 分に
-1 回読み、見つけた内容をコネクタが再び実行されるか次の Start まで保持します。DDL 文の引用符で囲まれた値は
-隠されます。それ以外の場合、行には *Stopped — a task is not running. Restart required.* と表示され、詳細は
-ロググループ `/msk-connect/<stack>-cdc` にあります。そのときライフサイクルカードは CDC がストリーミングして
-いないことを示し、**Stop CDC** を提示します: Retry CDC は既存のコネクタをそのままにするため、停止した
-コネクタを再起動できません。Stop CDC の後も、原因は次の Start まで Start CDC カードに残ります。
+| ログの行 | 意味 | 対処 |
+|---|---|---|
+| `Commit of offsets timed out` | シンクのコンシューマーがグループから外れた | Stop CDC してから Start CDC し、再参加させる |
+| `DSQL apply failed (transient sqlstate=XX000)` | 一時的な Aurora DSQL の状態 | シンクは自動的に再開します。長引く場合は AWS サポートに問い合わせる |
+| `DSQL apply failed (transient sqlstate=…)` が `08xxx`、`57xxx` または `null` | シンクがクラスターに到達できない | クラスターがまだ存在するか、コネクタのサブネットがポート 5432 でそのエンドポイントに到達できるか — セキュリティグループ、NAT ゲートウェイまたは Aurora DSQL VPC エンドポイントとその DNS — そしてコネクタの IAM ロールがまだ接続できるかを確認する |
+| 同じ行が `28xxx`、`53300` または `53400` | Aurora DSQL が接続を開くことを拒否した | `28xxx` は IAM トークン(コネクタの IAM ロールがまだ接続できるかを確認)、`53300` はクラスターの開いている接続の上限(他の場所のアイドル接続を閉じるかクォータを引き上げる)、`53400` は新しい接続のレート。接続が開けばシンクは再開します |
+| 同じ行が `40001` | 別の何かが Aurora DSQL で同じ行に書き込んでいる | cut over まで止める |
+
+コネクタのタスクが停止すると、その行は赤に変わります。コネクタの CloudWatch ワーカーログにツールが認識する失敗 — Debezium が解析できない MySQL の DDL 文、スキーマ履歴の問題、作成できない PostgreSQL の publication、到達できないソースなど — があれば、行には *Stopped —* に続いて原因が表示され、コネクタの下のエラー通知が何をすべきかを示します。それ以外の場合、行には *Stopped — a task is not running. Restart required.* と表示され、詳細はロググループ `/msk-connect/<stack>-cdc` にあります。そのときライフサイクルカードは CDC がストリーミングしていないことを示し、**Stop CDC** を提示します: Retry CDC は既存のコネクタをそのままにするため、停止したコネクタを再起動できません。Stop CDC の後も、原因は次の Start まで Start CDC カードに残ります。
 
 ### DLQ を調べる
 
-インタラクティブな **DLQ インスペクター**が、デッドレターされたレコードを **Time / Table / SQLSTATE /
-Reason** で一覧します — ページング・フィルタ対応、テーブル別の内訳と depth バッジ付き — UI を離れずに poison
-行をトリアージできます。**「Download CDC error log」** で NDJSON としてエクスポートします。(Reason には SQL
-テンプレートが含まれ、行の値は含まれません — §4.5 参照。) レコード一覧はメモリ上にしかなく、アプリの再起動後には
-残りません。テーブルごとの件数、最新時刻、ドリフトの種類は残り、Cut over が確認するのはそれです
-([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。
+**DLQ インスペクター**が、デッドレターされたレコードを **Time / Table / SQLSTATE / Reason** で一覧します — ページング・フィルタ対応、テーブル別の内訳と depth バッジ付き — UI を離れずに poison 行をトリアージできます。**「Download CDC error log」** で NDJSON としてエクスポートします。(Reason には SQL テンプレートが含まれ、行の値は含まれません — §4.5 参照。) レコード一覧はメモリ上にしかなく、アプリの再起動後には残りません。テーブルごとの件数、最新時刻、ドリフトの種類は残り、Cut over が確認するのはそれです ([§5.5](05-validation.md#55-cdc-のデッドレターとカットオーバー))。
 
 ### リキーされた PostgreSQL テーブル: REPLICA IDENTITY の再確認
 
-CDC がリキーするテーブル(ソースの主キー外の列を加えた複合ターゲットキー)では、ソースの `REPLICA IDENTITY`
-がテーブルとすべてのパーティションで **FULL** である必要があります。このバージョンがデプロイした CDC
-インフラは、そのようなテーブルの変更レコードを **ソース** の主キーでキー付けするため、1 行への変更はすべて
-順序どおりに保たれ、シンクはそれを複合キーで書き込みます(追加された列の `UPDATE` は、1 つのトランザクション
-の中で古い行の delete と新しい行の insert になります)。FULL 未満では `DELETE` が追加された列を載せません:
-このときシンクはソースの主キーで行を削除しますが、それは Aurora DSQL がそのキーに対するテーブルの一意
-インデックスを構築し終えた後に限られます(Composite key はこのインデックスを、Schema Conversion の Apply で
-テーブルと一緒に、または **Drop & reload** がテーブルを作り直すときはロード後に `CREATE UNIQUE INDEX ASYNC` で
-作成し、Aurora DSQL がバックグラウンドで構築します)。それまでは(たとえば Drop & reload の後にインデックスを
-構築している間)、そしてレコードを複合キーでキー付けする、以前のバージョンがデプロイした CDC インフラでは常に、
-delete はエラーもデッドレターもなく Aurora DSQL に行を残します。追加された列だけを変更する `UPDATE` は
-古いイメージなしで届きます: そのインデックスが構築された後は、シンクがそのソース主キーを持つ行を新しい行で
-置き換えます。それまでは、そして以前のインフラでは常に、デッドレターになり(*a unique constraint rejected the
-row*)、古い行が残ります。そのためモニターが
-`REPLICA IDENTITY` を読み直し(該当するテーブル全体に対して読み取り専用のカタログクエリを 1 回、最大 2 分に
-1 回。MySQL ソースでは行いません)、次の通知を表示します:
+CDC がリキーするテーブル(ソースの主キー外の列を加えた複合ターゲットキー)では、ソースの `REPLICA IDENTITY` がテーブルとすべてのパーティションで **FULL** である必要があります。FULL 未満では `DELETE` が追加された列を載せないため、エラーもデッドレターもなく Aurora DSQL に行が残ることがあり、追加された列だけを変更する `UPDATE` はデッドレターになり(*a unique constraint rejected the row*)、古い行が残ります。そのためモニターが `REPLICA IDENTITY` を読み直し(読み取り専用、最大 2 分に 1 回、MySQL ソースでは行いません)、次の通知を表示します:
 
-- **赤 — 「Deletes on re-keyed tables can be lost」:** テーブル(またはそのパーティションのいずれか)が
-  FULL 未満です。ソースで `ALTER TABLE <table> REPLICA IDENTITY FULL` を実行してください — 親は伝播せず、
-  新しいパーティションは `DEFAULT` で始まるため、各パーティションにも — そのうえで **Check again** を
-  押します(PostgreSQL 18 で生成列を持つテーブルには、FULL の代わりに **Keep source PK** を示し、
-  読み直しが失敗してもそのままです。アプリの再起動後、ツールがソースを読み直すまでは FULL を示し、
-  そのようなテーブルには代わりに **Keep source PK** が必要だと付け加えます。
-  [第 6 章](06-limitations.md) を参照)。Cut over は保留されます。修正前に行われた delete は再生されません。読み直し自体が失敗した
-  場合は通知がそう伝えます: ソースの認証情報やネットワークアクセスが変わった場合は、Connect ステップで
-  ソースを再接続してください。
-- **黄 — 「REPLICA IDENTITY is FULL again」:** 修正は反映されましたが、FULL 未満だった間の delete が
-  欠けている可能性があります。Validation がそのテーブルを自動的に CHECKSUM で比較し、Cut over は修正後に
-  開始した一致を待ちます([§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー))。
-  ただし、そこで **Continue without this check** を選んだ場合は待ちません。テーブルが異なる場合: CDC を
-  追いつかせてから Stop CDC、Full Load ステップで **Drop & reload** でリロード、Start CDC、再確認。CDC
-  only には Full Load ステップがないため、代わりに Aurora DSQL 上の余分な行を手作業で削除してください。
-  FULL 未満だったテーブルを CDC がリキーしなくなった場合(Schema Conversion でテーブルを **Keep source PK**
-  に戻して CDC を再デプロイした、またはソースの主キーが複合キーを含むようになった — 変更レコードをソースの
-  主キーでキー付けすることはこれに当たりません)も、同じ通知が「REPLICA IDENTITY was below FULL on re-keyed
-  tables」という見出しで表示されます: それ以前に失われた delete には引き続き CHECKSUM が必要です。
-- **情報 — 「Can't re-check REPLICA IDENTITY on the source」:** ソースのパスワードはメモリ上にしかない
-  ため、アプリの再起動後は Connect ステップで再接続するまでツールは接続できません。その間、これらの
-  テーブルを FULL に保ってください。
-- **黄 — 「Can't re-check REPLICA IDENTITY on the source」:** 最後の読み取りが失敗しました(2 分後に
-  再試行します)。その間、これらのテーブルを FULL に保ってください。
-
-それぞれの変化(FULL 未満、再び FULL、リキー対象外になった)はアクティビティログに 1 回ずつ記録されます。
+| 通知 | 意味 | 対処 |
+|---|---|---|
+| **赤 — 「Deletes on re-keyed tables can be lost」** | テーブル(またはそのパーティションのいずれか)が FULL 未満です。Cut over は保留され、修正前に行われた delete は再生されません。 | ソースで `ALTER TABLE <table> REPLICA IDENTITY FULL` を実行してください — 親は伝播せず、新しいパーティションは `DEFAULT` で始まるため、各パーティションにも — そのうえで **Check again** を押します。PostgreSQL 18 で生成列を持つテーブルには、通知が FULL の代わりに **Keep source PK** を示します([第 6 章](06-limitations.md) を参照)。 |
+| **黄 — 「REPLICA IDENTITY is FULL again」** | 修正は反映されましたが、FULL 未満だった間の delete が欠けている可能性があります。Validation がそのテーブルを自動的に CHECKSUM で比較し、Cut over は修正後に開始した一致を待ちます([§5.6](05-validation.md#56-リキーされた-postgresql-テーブルとカットオーバー))。ただし、そこで **Continue without this check** を選んだ場合は待ちません。 | テーブルが異なる場合: CDC を追いつかせてから Stop CDC、Full Load ステップで **Drop & reload** でリロード、Start CDC、再確認。CDC only には Full Load ステップがないため、代わりに Aurora DSQL 上の余分な行を手作業で削除してください。FULL 未満だったテーブルを CDC がリキーしなくなった場合(Schema Conversion でテーブルを **Keep source PK** に戻して CDC を再デプロイした、またはソースの主キーが複合キーを含むようになった)も、同じ通知が「REPLICA IDENTITY was below FULL on re-keyed tables」という見出しで表示されます: それ以前に失われた delete には引き続き CHECKSUM が必要です。 |
+| **情報 — 「Can't re-check REPLICA IDENTITY on the source」** | ソースのパスワードはメモリ上にしかないため、アプリの再起動後はツールが接続できません。 | Connect ステップで再接続してください。その間、これらのテーブルを FULL に保ってください。 |
+| **黄 — 「Can't re-check REPLICA IDENTITY on the source」** | 最後の読み取りが失敗しました(2 分後に再試行します)。 | その間、これらのテーブルを FULL に保ってください。 |
 
 ### ソーススキーマの再確認
 
-モニターはソース上のキャプチャ対象テーブルの定義を読み直し([§4.2](#デッドレターにならない変更-ソーススキーマの再確認)
-参照)、DLQ カードの中ではなくその隣に次の通知を表示します:
+モニターはソース上のキャプチャ対象テーブルの定義を読み直し([§4.2](#デッドレターにならない変更-ソーススキーマの再確認) 参照)、DLQ カードの中ではなくその隣に次の通知を表示します:
 
-- **赤 — 「Source schema changed on N captured table(s)」:** テーブルごとに 1 行で、何が変わったか(列の削除・
-  追加・名前変更、型・NULL ルール・主キーの変更、テーブルが見つからない)と、それが CDC の書き込む行に与える影響を
-  示します。Cut over は保留されます。DLQ バナーが同じ種類の変更としてすでに報告しているテーブル(列の追加・削除・型の
-  変更、主キーの変更、またはバナーが NULL を許すようになった列をすべて示す場合の NULL ルールの緩和と、それで
-  拒否された行)は、そのバナーにだけ表示されます。どちらの場合も Cut over は保留されます。ソースが最終的な
-  定義になった後でテーブルを揃え直すには:
-  - **Full Load + CDC:** Step 1(Evaluation)を再実行します — 以後の再確認はそれと比較します。Aurora DSQL の
-    テーブルも変える必要がある場合: CDC を追いつかせてから(Stream lag: caught up) Stop CDC、名前変更された列は
-    Aurora DSQL で名前を変更し(**Fix target schema…** が行います)、削除された列は先にそこで削除し(Drop & reload
-    は新しい定義にないターゲット列を削除しません。主キー列は Aurora DSQL で削除できないため、代わりにそのテーブルを
-    Schema Conversion で **Replace** により再適用します。Drop & reload は型が変わった列を再実行した Step 1 の型で
-    作り直しますが、そのテーブルの DDL を Schema Conversion で編集した場合は編集が優先されるため、先にそこで列の
-    型を変更します — Aurora DSQL は列の型をその場で変更できません)、Full Load ステップで **Drop & reload** に
-    よりテーブルをリロードし、Start CDC します。CDC の停止中は移行対象テーブルに
-    ほかの DDL を実行しないでください。
-  - **CDC only:** ソースに合わせる必要がある部分は Aurora DSQL のテーブルを手作業で変更し、変更以降に CDC が
-    書き込んだ行を修正してから(再生はされません)、Step 1 を再実行します。
-  - または、ソースの変更を元に戻します。
-  - **名前変更または削除されたテーブル** はその場で揃え直せません: CDC は固定のテーブル一覧をキャプチャするため、
-    ソースで名前を戻すか、**Start over** で新しい名前で移行してください。意図して削除した場合は Step 1 を再実行
-    します: そのテーブルは再確認の対象から外れ、Cut over が確認(acknowledge)を求めます。
-  - Aurora DSQL は **主キー** をその場で変更できません: ソースでキーを戻すか、(Full Load + CDC) Step 1 を再実行
-    して **Drop & reload** でリロードし、新しいキーで作り直します。キー列が名前変更または削除された場合は、先に
-    Schema Conversion でテーブルを **Replace** により再適用します(Drop & reload は古いキー列の削除を拒否し、
-    Aurora DSQL はその列を削除できません)。CDC only では **Start over** を使います。
-  - **追加または名前変更された列** については、通知が **Fix target schema…** を表示します(そのテーブルに DLQ
-    バナーがすでに表示している場合を除く)。新しい列は追加し、名前変更された列は値を保つよう名前を変更します。
-    追加した列は以後定義の一部とみなしますが、名前を変更した列は Step 1 を再実行するまで報告され続けます。
-    Validation がその列を比較できるよう、Step 1 も再実行してください。キーの変更や、主キー・CDC キー列の名前
-    変更では何も変更せず、生成列や除外設定で外している列は追加しません。ダイアログが理由と対処を示します。
-    CDC キー列(Composite key)が名前変更された場合、通知は Fix を表示せず、作り直す手順を自ら示します。
-  - 変更後は **Check again** を押します。読み直し自体が失敗した場合や、キャプチャ対象テーブルを 1 つも見つけ
-    られなかった場合(別のデータベース・ユーザーで再接続した場合)は、通知がそう伝えます。
-- **黄 — 「The source schema changed while CDC ran」:** ソースが再び Step 1 のインベントリと一致しました(または
-  Step 1 の再実行がテーブルの定義を変えた、またはテーブルがインベントリから外れた)が、その間に CDC が書き込んだ
-  値が異なる可能性があります。Validation がこれらのテーブルを自動的に CHECKSUM で比較し、Cut over はその時刻
-  以降に開始した一致を待ちます([§5.7](05-validation.md#57-ソーススキーマの変更とカットオーバー))。Step 1 の
-  インベントリから外れたテーブルは比較できないため、Cut over ステップで **Continue without this check** により
-  確認(acknowledge)してください。
-- **情報 — 「Can't re-check the source schema」:** ソースのパスワードはメモリ上にしかないため、アプリの再起動後は
-  Connect ステップで再接続するまでツールは接続できません。
-- **黄 — 「Can't re-check the source schema」:** 最後の読み取りが失敗したか、キャプチャ対象テーブルを 1 つも
-  見つけられませんでした(5 分後に再試行します)。その間、移行対象テーブルに DDL を実行しないでください。
+| 通知 | 意味 | 対処 |
+|---|---|---|
+| **赤 — 「Source schema changed on N captured table(s)」** | テーブルごとに 1 行で、何が変わったか(列の削除・追加・名前変更、型・NULL ルール・主キーの変更、テーブルが見つからない)と、それが CDC の書き込む行に与える影響を示します。Cut over は保留されます。DLQ バナーが同じ種類の変更としてすでに報告しているもの(それで拒否された行とともに)は、そのバナーにだけ表示されます。どちらの場合も Cut over は保留されます。 | ソースが最終的な定義になった後でテーブルを揃え直し(下記)、**Check again** を押します。 |
+| **黄 — 「The source schema changed while CDC ran」** | ソースが再び Step 1 のインベントリと一致しました(または Step 1 の再実行がテーブルの定義を変えた、またはテーブルがインベントリから外れた)が、その間に CDC が書き込んだ値が異なる可能性があります。 | Validation がこれらのテーブルを自動的に CHECKSUM で比較し、Cut over はその時刻以降に開始した一致を待ちます([§5.7](05-validation.md#57-ソーススキーマの変更とカットオーバー))。Step 1 のインベントリから外れたテーブルは比較できないため、Cut over ステップで **Continue without this check** により確認(acknowledge)してください。 |
+| **情報 — 「Can't re-check the source schema」** | ソースのパスワードはメモリ上にしかないため、アプリの再起動後はツールが接続できません。 | Connect ステップで再接続してください。 |
+| **黄 — 「Can't re-check the source schema」** | 最後の読み取りが失敗したか、キャプチャ対象テーブルを 1 つも見つけられませんでした(5 分後に再試行します)。 | その間、移行対象テーブルに DDL を実行しないでください。 |
 
-それぞれの変化はアクティビティログに 1 回記録されます — 1 回の読み取りで同じように変わったテーブル全体に対して 1 行です。
+ソースが最終的な定義になった後でテーブルを揃え直すには:
+
+| 変わったもの | 揃え直す方法 |
+|---|---|
+| 列の追加・名前変更 | **Fix target schema…** (そのテーブルに DLQ バナーがすでに表示している場合を除く): 新しい列は追加し、名前変更された列は値を保つよう名前を変更します。Validation がその列を比較できるよう、続けて Step 1 を再実行してください。キーの変更や、主キー・CDC キー列の名前変更では何も変更せず、生成列や除外設定で外している列は追加しません (ダイアログが理由と対処を示します)。 |
+| 列の削除、または型・NULL ルールの変更 | ソースの変更を元に戻すか: **Full Load + CDC** — Step 1 を再実行します (以後の再確認はそれと比較します)。Aurora DSQL のテーブルも変える必要がある場合は、CDC を追いつかせてから (Stream lag: caught up) Stop CDC、削除された列は先に Aurora DSQL で削除し (Drop & reload は新しい定義にないターゲット列を削除しません)、Full Load ステップで **Drop & reload** によりテーブルをリロードし、Start CDC します。列の型が変わった場合は、先に Schema Conversion で新しい型を指定します (Aurora DSQL は列の型をその場で変更できません)。CDC の停止中は移行対象テーブルにほかの DDL を実行しないでください。**CDC only** — ソースに合わせる必要がある部分は Aurora DSQL のテーブルを手作業で変更し、変更以降に CDC が書き込んだ行を修正してから (再生はされません)、Step 1 を再実行します。 |
+| 主キー | ソースでキーを戻すか、(Full Load + CDC) Step 1 を再実行して **Drop & reload** でリロードし、新しいキーで作り直します。キー列が名前変更または削除された場合は、先に Schema Conversion でテーブルを **Replace** により再適用します (Drop & reload は古いキー列の削除を拒否し、Aurora DSQL はその列を削除できません)。CDC only では **Start over** を使います。CDC キー列 (Composite key) が名前変更された場合、通知は Fix を表示せず、作り直す手順を自ら示します。 |
+| テーブルの名前変更・削除 | CDC は固定のテーブル一覧をキャプチャするため、その場で揃え直せません: ソースで名前を戻すか、**Start over** で新しい名前で移行してください。意図して削除した場合は Step 1 を再実行します: そのテーブルは再確認の対象から外れ、Cut over が確認(acknowledge)を求めます。 |
 
 ---
 

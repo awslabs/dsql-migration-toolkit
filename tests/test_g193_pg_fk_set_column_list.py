@@ -497,9 +497,7 @@ def test_the_manual_says_the_list_is_kept(language: str) -> None:
         (_MANUAL / language / "02-evaluation-and-schema-conversion.md")
         .read_text(encoding="utf-8").split()
     )
-    evaluation = text.split("## 2.1", 1)[1].split("## 2.2", 1)[0]
+    # Chapter 2 is a user guide (2026-10-25): it names the finding and what the user does;
+    # the implementation detail this test pinned lives in the CHANGELOG.
     schema = text.split("## 2.2", 1)[1].split("## 2.3", 1)[0]
-    evaluation_says, schema_says = _SAYS[language]
-    for section, says in ((evaluation, evaluation_says), (schema, schema_says)):
-        assert "`ON DELETE SET NULL (…)`" in section and "`SET DEFAULT (…)`" in section
-        assert "PostgreSQL 15+" in section and says in section, (language, says)
+    assert "`ON DELETE SET NULL (…)`" in schema, language

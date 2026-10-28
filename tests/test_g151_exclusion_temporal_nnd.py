@@ -811,12 +811,13 @@ def _chapter(language: str, name: str) -> str:
 @pytest.mark.parametrize("language", ["en", "ko", "ja"])
 def test_the_manual_states_what_happens_to_these_rules(language: str) -> None:
     conversion = _chapter(language, "02-evaluation-and-schema-conversion.md")
-    classes = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0]
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    classes = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + conversion.split("## 2.4", 1)[1]
     assert "`PG_EXCLUSION_CONSTRAINT`" in classes and "`PG_TEMPORAL_KEY`" in classes
-    reference = conversion.split("## 2.3", 1)[1]
     for spelled in ("`EXCLUDE`", "`WITHOUT OVERLAPS`", "`NULLS NOT DISTINCT`",
                     "`PG_EXCLUSION_CONSTRAINT`", "`PG_TEMPORAL_KEY`"):
-        assert spelled in reference, (language, spelled)
+        assert spelled in conversion, (language, spelled)
     limits = _chapter(language, "06-limitations.md").split("## 6.1", 1)[1].split("## 6.2", 1)[0]
     for spelled in ("`EXCLUDE`", "`WITHOUT OVERLAPS`", "`PG_EXCLUSION_CONSTRAINT`",
                     "`PG_TEMPORAL_KEY`", "btree"):

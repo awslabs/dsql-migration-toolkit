@@ -259,9 +259,11 @@ def test_the_manual_says_mysql_reads_at_repeatable_read_and_what_it_holds(langua
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / language
     export = (manual / "03-full-load.md").read_text(encoding="utf-8")
     export = _flat(export.split("## 3.2", 1)[1].split("## 3.3", 1)[0])
-    assert PIN in export
+    # Chapter 3 is a user guide (2026-10-25): the statement the tool sends and MySQL's
+    # warning 138 are CHANGELOG detail. A DBA needs that the server's own setting is left
+    # alone, that a READ-COMMITTED source still reads one snapshot, and what that holds.
     assert "`transaction_isolation`" in export  # the server's own setting is left alone
-    assert "warning 138" in export and "`READ-COMMITTED`" in export
+    assert "`READ-COMMITTED`" in export
     assert "read view" in export and "History List Length" in export
     assert "07-performance-and-tuning.md#" in export
     tuning = (manual / "07-performance-and-tuning.md").read_text(encoding="utf-8")

@@ -77,88 +77,32 @@ def _entry(template: str, name: str) -> str:
 
 _OFFER_READ = {
     _P03: {
+        # Chapter 3 is a user guide (2026-10-25): the offset seeder's properties, the
+        # CloudFormation events and the seeder Lambda behind a rolled-back Start are CHANGELOG
+        # detail. The page keeps that the next Start is still judged against the point the
+        # rolled-back Start offered, and that an unknown point refuses every start point.
         "judged": {
-            "en": "After a first Start that CloudFormation rolled back, the rollback restores the "
-            "stack's parameters, so they no longer hold the start point that Start offered, but "
-            "the stack's CloudFormation events still do (the offset seeder's properties): the app "
-            "judges the next Start against that point as it recorded it, or, after an app "
-            "restart (or for a Start made in another session), as it reads it from those events.",
-            "ko": "CloudFormation이 롤백한 첫 Start 뒤에는 롤백이 스택의 파라미터를 되돌리므로 파라미터에는 "
-            "그 Start가 준 시작 지점이 더 이상 없지만, 스택의 CloudFormation 이벤트에는 아직 남아 "
-            "있습니다(오프셋 시더의 속성): 앱은 다음 Start를 자신이 기록한 그 지점과 비교하고, 앱을 재시작한 "
-            "뒤에는(또는 다른 세션에서 한 Start라면) 그 이벤트에서 읽은 그 지점과 비교합니다.",
-            "ja": "CloudFormation がロールバックした初回の Start の後は、ロールバックがスタックのパラメータを"
-            "元に戻すため、パラメータにはその Start が渡した開始位置がもう残っていませんが、スタックの "
-            "CloudFormation イベントにはまだ残っています (オフセットシーダーのプロパティ): アプリは次の Start "
-            "を、自分が記録したその位置と比較し、アプリの再起動後 (または別のセッションで行った Start の"
-            "場合) はそのイベントから読み取ったその位置と比較します。",
+            "en": "After a first Start that CloudFormation rolled back, the same rule applies "
+            "against the start point that Start offered",
+            "ko": "CloudFormation이 롤백한 첫 Start 뒤에도 같은 규칙이 그 Start가 준 시작 지점에 대해 "
+            "적용됩니다",
+            "ja": "CloudFormation がロールバックした初回の Start の後も、同じ規則がその Start が渡した開始位置に"
+            "対して適用されます",
         },
-        # The "verdicts" pin (a later point refused, a retry not, an earlier one refused) moved
-        # to _EARLIER_BY_JOB below: the G26 repair added the job's refusal of an earlier point.
+        # (2026-10-28) The refusal's wording (the "cannot be applied" header, the quoted offer lead,
+        # the events and the single EC2 host's seeding) is what the screen says: the page keeps the
+        # rule and the header of the unknown-offer refusal.
         "unknown": {
-            "en": "When the events do not give that point either — they cannot be read, for "
-            "example, or that Start seeded Kafka in the app instead of through the offset-seeder "
-            "Lambda, as the single EC2 host does "
-            "([§1.4](01-setup.md#14-run-on-a-single-ec2-host-from-source)) — no start point can "
-            "be checked against it, so every start point is refused on that stack, that same one "
-            "included (*This CDC stack's last start point is not known*: *CloudFormation rolled "
-            "back this stack's last Start, and the start offset that Start offered is no longer "
-            "known …*), with the same route.",
-            "ko": "이벤트에서도 그 지점을 얻지 못하면 — 예를 들어 이벤트를 읽을 수 없거나, 그 Start가 오프셋 "
-            "시더 Lambda 대신 앱 안에서 Kafka를 시드했다면(단일 EC2 호스트가 그렇게 합니다, "
-            "[§1.4](01-setup.md#14-단일-ec2-호스트에서-실행-소스에서)) — 어떤 시작 지점도 그 지점과 비교할 수 "
-            "없으므로, 그 스택에서는 같은 시작 지점을 포함해 모든 시작 지점이 같은 경로와 함께 "
-            "거부됩니다(*This CDC stack's last start point is not known*: *CloudFormation rolled back "
-            "this stack's last Start, and the start offset that Start offered is no longer "
-            "known …*).",
-            "ja": "イベントからもその位置が得られない場合 — たとえばイベントを読み取れない場合や、その Start "
-            "がオフセットシーダーの Lambda ではなくアプリの中で Kafka をシードした場合 (単一 EC2 ホストは"
-            "そうします。[§1.4](01-setup.md#14-単一-ec2-ホストで実行する-ソースから)) — は、どの開始位置も"
-            "その位置と比較できないため、そのスタックでは同じ開始位置も含めてすべての開始位置が同じ方法と"
-            "ともに拒否されます (*This CDC stack's last start point is not known*: *CloudFormation "
-            "rolled back this stack's last Start, and the start offset that Start offered is no "
-            "longer known …*)。",
+            "en": "every start point is refused on that stack (*This CDC stack's last start point is "
+            "not known*), with the same route.",
+            "ko": "그 스택에서는 같은 시작 지점을 포함해 모든 시작 지점이 같은 경로와 함께 거부됩니다"
+            "(*This CDC stack's last start point is not known*).",
+            "ja": "そのスタックでは同じ開始位置も含めてすべての開始位置が同じ方法とともに拒否されます "
+            "(*This CDC stack's last start point is not known*)。",
         },
     },
-    _P04: {
-        "judged": {
-            "en": "After a first Start that CloudFormation rolled back, it refuses a later point "
-            "than that Start offered, after an app restart too (the rollback restores the stack's "
-            "parameters, but the app reads that point from the stack's CloudFormation events), "
-            "and every start point when those events do not give it either.",
-            "ko": "CloudFormation이 롤백한 첫 Start 뒤에는 그 Start가 준 지점보다 뒤의 시작 지점을 앱을 "
-            "재시작한 뒤에도 거부하고(롤백이 스택의 파라미터를 되돌리지만, 앱은 그 지점을 스택의 "
-            "CloudFormation 이벤트에서 읽습니다), 그 이벤트에서도 그 지점을 얻지 못하면 모든 시작 지점을 "
-            "거부합니다.",
-            "ja": "CloudFormation がロールバックした初回の Start の後は、その Start が渡した位置より後の開始"
-            "位置をアプリの再起動後も拒否し (ロールバックがスタックのパラメータを元に戻しますが、アプリは"
-            "その位置をスタックの CloudFormation イベントから読み取ります)、そのイベントからもその位置が"
-            "得られなければ、すべての開始位置を拒否します。",
-        },
-    },
-    _P06: {
-        "judged": {
-            "en": "On MySQL, after a first Start that CloudFormation rolled back, the rollback "
-            "restores the stack's parameters, so Start CDC judges the next Start against the "
-            "start point that Start offered as the app recorded it or, after an app restart, as "
-            "the stack's CloudFormation events still record it: it refuses a later point than "
-            "that one (a retry from it is not refused), and every start point on that stack when "
-            "neither gives it (for example after a restart on the single EC2 host, which seeds "
-            "Kafka in the app).",
-            "ko": "MySQL에서 CloudFormation이 롤백한 첫 Start 뒤에는 롤백이 스택의 파라미터를 되돌리므로, "
-            "Start CDC는 다음 Start를 앱이 기록한 그 Start의 시작 지점과, 앱을 재시작한 뒤에는 스택의 "
-            "CloudFormation 이벤트에 아직 기록된 그 지점과 비교합니다: 그 지점보다 뒤의 시작 지점을 "
-            "거부하고(그 지점에서 다시 시작하는 것은 거부하지 않음), 둘 다 그 지점을 주지 못하면(예를 들어 "
-            "앱 안에서 Kafka를 시드하는 단일 EC2 호스트에서 재시작한 뒤) 그 스택에서 모든 시작 지점을 "
-            "거부합니다.",
-            "ja": "MySQL では、CloudFormation がロールバックした初回の Start の後、ロールバックがスタックの"
-            "パラメータを元に戻すため、Start CDC は次の Start を、アプリが記録したその Start の開始位置と、"
-            "アプリの再起動後はスタックの CloudFormation イベントにまだ記録されているその位置と比較します: "
-            "その位置より後の開始位置を拒否し (その位置からの再試行は拒否しません)、どちらからもその位置が"
-            "得られなければ (たとえばアプリの中で Kafka をシードする単一 EC2 ホストで再起動した後)、その"
-            "スタックですべての開始位置を拒否します。",
-        },
-    },
+    # Chapter 4 §4.3 and chapter 6 (both answer-first) no longer spell out the rolled-back first Start's offer; chapter 3
+    # keeps it.
 }
 # What G25 round 8 said: the offer lived only in the app's memory, so after any app restart (or
 # for a Start made in another session) every start point was refused, a retry included.
@@ -240,7 +184,7 @@ def test_a_rolled_back_first_starts_point_is_read_back_from_the_stacks_events(
 
     _check(lang, _OFFER_READ)
     page = _page(lang, _P03)
-    for quoted in (OFFER_UNKNOWN_HEADER, _UNKNOWN_LEAD, "This start point cannot be applied"):
+    for quoted in (OFFER_UNKNOWN_HEADER,):
         assert _has(lang, page, f"*{quoted}"), (lang, quoted)
     assert not _stale(lang, _OFFER_READ_STALE[lang]), lang
 
@@ -249,32 +193,29 @@ def test_a_rolled_back_first_starts_point_is_read_back_from_the_stacks_events(
 
 _CONDITION = {
     _P03: {
+        # (2026-10-28) The tooltip's and the job error's quoted route is what the screen says; the
+        # page keeps the condition.
         "condition": {
             "en": "The CDC only route starts the new stack from the Full Load's watermark, so when "
-            "the refused point is that watermark (Automatic), the refusal adds that route's "
-            "condition: if that Full Load appended to rows already on the target, run it again "
-            "choosing **Drop & reload** before that Start — CDC only has no Full Load step, so "
-            "switch the migration type to Full load + CDC for that run, whose Full Load makes the "
-            "CDC start point exact (an append keeps those rows as they were, and CDC from a "
-            "watermark carries only the changes after it).",
+            "the refused point is that watermark (Automatic), the route has one condition: if "
+            "that Full Load appended to rows already on the target, run it again choosing "
+            "**Drop & reload** before that Start. CDC only has no Full Load step, so switch the "
+            "migration type to Full load + CDC for that run, whose Full Load makes the CDC start "
+            "point exact (an append keeps those rows as they were, and CDC from a watermark "
+            "carries only the changes after it).",
             "ko": "CDC only 경로는 새 스택을 Full Load의 워터마크에서 시작하므로, 거부된 지점이 그 "
-            "워터마크(Automatic)이면 거부가 그 경로의 조건을 덧붙입니다: 그 Full Load가 타깃에 이미 있던 "
+            "워터마크(Automatic)이면 그 경로에는 조건이 하나 있습니다: 그 Full Load가 타깃에 이미 있던 "
             "행에 append했다면 그 Start 전에 **Drop & reload**로 다시 실행하세요. CDC only에는 Full Load "
             "단계가 없으므로 그 실행 동안 마이그레이션 유형을 Full load + CDC로 바꿉니다. 그 실행의 "
             "Full Load가 CDC 시작 지점을 정확하게 맞춥니다(append는 그 행을 그대로 두고, 워터마크에서 "
             "시작한 CDC는 그 뒤의 변경만 가져옵니다).",
             "ja": "CDC only の方法は新しいスタックを Full Load のウォーターマークから開始するため、拒否された"
-            "位置がそのウォーターマーク (Automatic) の場合は、拒否がその方法の条件を付け加えます: その "
-            "Full Load がターゲットに既にあった行に append した場合は、その Start の前に **Drop & reload** "
+            "位置がそのウォーターマーク (Automatic) の場合、その方法には条件が 1 つあります: その Full "
+            "Load がターゲットに既にあった行に append した場合は、その Start の前に **Drop & reload** "
             "でもう一度実行してください。CDC only には Full Load ステップがないため、その実行の間は"
             "マイグレーションの種類を Full load + CDC に切り替えます。その実行の Full Load が CDC の"
             "開始位置を正確にします (append はそれらの行をそのまま残し、ウォーターマークからの CDC は"
             "その後の変更しか運びません)。",
-        },
-        "line": {
-            "en": "In the disabled Start's tooltip and the job's error, the route reads",
-            "ko": "비활성화된 Start의 툴팁과 작업의 오류에서는 그 경로가",
-            "ja": "無効になった Start のツールチップとジョブのエラーでは、その方法は",
         },
     },
 }
@@ -337,7 +278,6 @@ def test_the_cdc_only_refusal_names_its_routes_drop_and_reload_condition(lang: s
     )[3]
 
     _check(lang, _CONDITION)
-    assert _has(lang, _page(lang, _P03), f"*{route}*"), lang
     assert not _stale(lang, _CONDITION_STALE[lang]), lang
 
 
@@ -415,24 +355,10 @@ def test_chapter_6_lets_only_a_streamed_source_connectors_reload_converge(lang: 
 
 # -- [A] of the repair: the Start CDC job reads the start point and refuses an earlier one ----
 
-_EARLIER_BY_JOB = {
-    _P03: {
-        "verdicts": {
-            "en": "A start point later than that one is refused, a retry from the same one is not, "
-            "and an earlier one is refused at the click on Start CDC, or by the Start CDC job when "
-            "this session had not read that point yet (*This start point cannot be applied*: that "
-            "offset stays seeded, and the seeder never rewinds).",
-            "ko": "그보다 뒤의 시작 지점은 거부되고, 같은 시작 지점에서 다시 시작하는 것은 거부되지 않으며, "
-            "그보다 이전의 시작 지점은 Start CDC를 클릭할 때, 또는 이 세션이 그 지점을 아직 읽지 않았을 "
-            "때는 Start CDC 작업에서 거부됩니다(*This start point cannot be applied*: 그 오프셋은 시드된 "
-            "채로 남고, 시더는 되감지 않습니다).",
-            "ja": "それより後の開始位置は拒否され、同じ開始位置からの再試行は拒否されず、それより前の開始"
-            "位置は Start CDC をクリックした時点で、またはこのセッションがその位置をまだ読み取っていなかった"
-            "場合は Start CDC のジョブで拒否されます (*This start point cannot be applied*: そのオフセットは"
-            "シードされたまま残り、シーダーは巻き戻さないためです)。",
-        },
-    },
-}
+# (2026-10-28, chapter 3 answer-first) Chapter 3 no longer lists which points a rolled-back Start
+# refuses (a later one, an earlier one, a retry from the same one) or quotes the header of the
+# earlier-point refusal: that is what the notice says. The code assertions in the test below
+# still pin the words themselves.
 # G26's sentence: the click as the only place that refuses an earlier point. A job submitted from
 # a page whose last read of the stack predates the rollback (another session's Start) passes the
 # click, and the job refuses it.
@@ -504,11 +430,10 @@ def test_an_earlier_point_is_refused_by_the_job_when_this_session_had_not_read_i
         "from the stack's events." in _LEAD
     )
 
-    _check(lang, _EARLIER_BY_JOB)
     # The sentence before it still holds on the job's path: it reads the point from the events.
     _check(lang, {_P03: {"judged": _OFFER_READ[_P03]["judged"]}})
     page = _page(lang, _P03)
-    for quoted in (OFFER_UNKNOWN_HEADER, _UNKNOWN_LEAD, _EARLIER):
+    for quoted in (OFFER_UNKNOWN_HEADER,):
         assert _has(lang, page, f"*{quoted}"), (lang, quoted)
     assert not _stale(lang, _EARLIER_BY_JOB_STALE[lang]), lang
     # No page quotes the cause the notice used to assert.

@@ -598,25 +598,23 @@ def test_every_per_fk_line_takes_the_origin_category(monkeypatch, origin, catego
 # ---------------------------------------------------------------------------
 
 
-def test_the_manual_says_the_count_resumes_in_three_languages() -> None:
-    # G142: the count explains a failed Aurora DSQL validation (and still runs first for a
-    # key whose parent side is incomplete), so the resume is described there.
+def test_the_manual_says_what_to_do_when_a_validation_fails_in_three_languages() -> None:
+    # G142: the count explains a failed Aurora DSQL validation. Chapter 2 is a user guide
+    # (2026-10-25): it says what to do about the failing rows; how the count pages and resumes
+    # (keyset pages, the retried SQLSTATEs, the connection and transaction limits) lives in
+    # the CHANGELOG.
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual"
     needles = {
-        "en": ("**When a validation fails.**", "re-runs only the page it interrupted",
-               "60-minute connection limit", "~300 s per-transaction limit",
-               "a composite key too", "no primary key"),
-        "ko": ("**검증이 실패하면.**", "중단된 그 페이지만 다시 실행",
-               "60분 연결 한도", "~300초 트랜잭션 한도", "복합 키도", "기본 키가 없는"),
-        "ja": ("**検証が失敗したとき。**", "中断されたそのページだけを再実行",
-               "60 分の接続上限", "~300 秒トランザクション上限", "複合キーも", "主キーのない"),
+        "en": ("**When a validation fails.**", "**Validate again**", "at most 3,000 rows"),
+        "ko": ("**검증이 실패하면.**", "**Validate again**", "최대 3,000행"),
+        "ja": ("**検証が失敗したとき。**", "**Validate again**", "最大 3,000 行"),
     }
     for lang, (heading, *phrases) in needles.items():
         text = (manual / lang / "02-evaluation-and-schema-conversion.md").read_text(
             encoding="utf-8")
         block = next(b for b in text.split("\n\n") if heading in b)
         flat = " ".join(block.split())
-        for needle in (*phrases, "`40001`", "keyset"):
+        for needle in phrases:
             assert needle in flat, (lang, needle)
         # G138 pages a composite key: only a table without one is counted in one query.
         for stale in ("composite or missing primary key", "복합 PK이거나", "複合 PK や"):

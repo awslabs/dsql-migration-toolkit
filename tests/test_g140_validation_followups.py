@@ -572,13 +572,19 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize("lang, float_rule, stale", [
     ("en", "followed by another key column", "shortest decimal"),
-    ("ko", "뒤에 다른 키 컬럼이 오는", "가장 짧은"),
+    ("ko", "뒤에 다른 키 컬럼이 오는", "가장 짧은 10진수"),
     ("ja", "後ろに別のキー列が続く", "最短の"),
 ])
 def test_the_manual_says_what_g140_changed(lang, float_rule, stale) -> None:
     full_load = (_ROOT / f"docs/manual/{lang}/03-full-load.md").read_text(encoding="utf-8")
+    # Whitespace-flattened, so a hard-wrapped line break inside a phrase does not hide it
+    # (the stale ko phrase is the full "shortest decimal", not the "가장 짧은 경로" label).
+    full_load = "".join(full_load.split()) if lang == "ja" else " ".join(full_load.split())
     assert float_rule in full_load and stale not in full_load
     assert "`TIME`" in full_load and "`BIT`" in full_load
     validation = (_ROOT / f"docs/manual/{lang}/05-validation.md").read_text(encoding="utf-8")
-    assert "`TIME`" in validation and "`BIT`" in validation
-    assert "**Orphan records**" in validation and "**Check for orphan records**" in validation
+    validation = "".join(validation.split()) if lang == "ja" else " ".join(validation.split())
+    # (how a TIME / BIT key part is bound is no longer spelled out in 5.1: Full Load, 3.x, keeps it)
+    strip = (lambda t: t.replace(" ", "")) if lang == "ja" else (lambda t: t)
+    assert strip("**Orphan records**") in validation
+    assert strip("**Check for orphan records**") in validation

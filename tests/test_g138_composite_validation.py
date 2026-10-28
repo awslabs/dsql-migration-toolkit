@@ -1398,4 +1398,5 @@ def test_the_manual_no_longer_says_a_composite_key_is_read_in_one_statement(lang
                   "복합/누락 PK", "복합 기본 키이거나", "複合/主キー無し", "複合主キーまたは主キーのない"):
         assert stale not in text, (lang, stale)
     named = {"en": "no primary key", "ko": "기본 키가 없는", "ja": "主キーのない"}[lang]
-    assert named in text and "5,000" in text
+    # (the 5,000-row page size is no longer quoted: a user does not act on it)
+    assert named in text

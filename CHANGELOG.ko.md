@@ -433,9 +433,9 @@ CDC와 소스 스키마 변경(DDL) 처리를 전 구간에서 보강했습니�
 
 ### 업그레이드 참고 사항
 
-- CDC 재배포는 필요 없습니다. 다음 Start CDC가 0.1.561 스택에서 9098 규칙을 제거하고, 그런 스택은 다시 배포할 때까지 0.1.561의 캡처 목록 매칭을 유지합니다([자세히](docs/manual/ko/13-excluding-tables-and-columns.md#배포된-cdc-스택)).
-- 이미 행이 쓰였을 수 있는 0.1.561 세션의 제외 항목은 omit-only(타깃 DEFAULT)로 남습니다. Change & reload로 바꾸세요([방법](docs/manual/ko/13-excluding-tables-and-columns.md#omit-only레거시-항목과-변환-방법)).
-- 0.1.561로 다운그레이드하면 세션이 새로 시작됩니다. 먼저 Cut over에서 제거된 DEFAULT를 복원하세요([자세히](docs/manual/ko/13-excluding-tables-and-columns.md#01561로-다운그레이드)).
+- CDC 재배포는 필요 없습니다. 다음 Start CDC가 0.1.561 스택에서 9098 규칙을 제거하고, 그런 스택은 다시 배포할 때까지 0.1.561의 캡처 목록 매칭을 유지합니다.
+- 이미 행이 쓰였을 수 있는 0.1.561 세션의 제외 항목은 omit-only(타깃 DEFAULT)로 남습니다. Change & reload로 바꾸세요.
+- 0.1.561로 다운그레이드하면 세션이 새로 시작됩니다. 먼저 Cut over에서 제거된 DEFAULT를 복원하세요.
 - 라이브로 실행하지 않은 것: 압축된 캡처 목록 형식, 대부분의 캡처 목록 이스케이프, PostgreSQL 오버레이와 CDC 절반, S3 기반 원장.
 
 ## v0.1.561

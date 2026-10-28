@@ -401,13 +401,13 @@ def test_the_exactness_check_is_the_catalogs_own_quoting() -> None:
 
 
 @pytest.mark.parametrize("language", ["en", "ko", "ja"])
-def test_the_manual_describes_the_member_walk_and_the_live_members(language: str) -> None:
+def test_the_manual_names_the_enum_set_stop_and_the_re_evaluation(language: str) -> None:
+    # Chapter 3 is a user guide (2026-10-25): how an ENUM / SET cursor is written (one member
+    # per page, the bitmask CAST, the live catalog read) is CHANGELOG detail. What a user meets
+    # is the stop on members the read cannot order, and the advice to re-run Evaluation.
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual" / language / "03-full-load.md"
     section = manual.read_text(encoding="utf-8").split("## 3.2", 1)[1].split("## 3.3", 1)[0]
-    assert "`col = <" in section  # a key led by an ENUM: one member per page
-    assert "CAST(col AS UNSIGNED) > n" in section and "col + 0" not in section
-    assert "information_schema.COLUMNS" in section  # the members, read live
-    assert "NUL" in section  # and the loud stops
+    assert "`ENUM`" in section and "`SET`" in section
     assert "collation" in section or "照合順序" in section
 
 

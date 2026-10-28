@@ -20,10 +20,6 @@ computes -- after the views it reads, for Schema Conversion and Evaluation alike
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
 from dsql_migrator.core.assessor import MySqlViewConversionRule
 from dsql_migrator.core.converter import SchemaConverter, mysql_type_index
 from dsql_migrator.core.models import ColumnDef, SourceInventory, SourceType, TableDef, ViewDef
@@ -142,26 +138,3 @@ def test_evaluation_types_a_view_over_a_view_as_schema_conversion_does() -> None
     assert 'OCTET_LENGTH("v_base"."b")' in ddl["tzv.v_len"]
     inventory = SourceInventory(tables=[_ev()], views=[_BASE, lengths], server_settings=_SEOUL)
     assert MySqlViewConversionRule().evaluate(inventory) == []
-
-
-_MANUAL = Path(__file__).resolve().parents[1] / "docs" / "manual"
-_CLAIMS = {
-    "en": ("also when `ts` is read through another view",
-           "another view's column by what that view's body selects",
-           "a column another view, a derived table or a CTE computes from what cannot be typed"),
-    "ko": ("(`ts`를 다른 뷰를 거쳐 읽어도 마찬가지입니다)",
-           "다른 뷰의 컬럼은 그 뷰의 본문이 고르는 것으로",
-           "뷰나 파생 테이블, CTE가 타입을 알 수 없는 값으로 계산하는 컬럼"),
-    "ja": ("(`ts` を別のビュー経由で読む場合も同じです)",
-           "別のビューの列はそのビューの本体が選ぶもので",
-           "別のビューや派生テーブル、CTE が型のわからない値から計算する列"),
-}
-
-
-@pytest.mark.parametrize("language", ["en", "ko", "ja"])
-def test_the_manual_says_another_views_columns_are_typed(language: str) -> None:
-    text = " ".join(
-        (_MANUAL / language / "02-evaluation-and-schema-conversion.md").read_text(encoding="utf-8").split()
-    )
-    for claim in _CLAIMS[language]:
-        assert claim in text, (language, claim)

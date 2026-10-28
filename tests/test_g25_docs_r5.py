@@ -36,190 +36,90 @@ whitespace at all). Each fails on the manual before this round.
 from __future__ import annotations
 
 import inspect
-import re
 from types import SimpleNamespace
 
 import pytest
 
-from tests.test_g25_docs import _CDC_UI, _PAGE, LANGS, _flat, _function, _has, _page
+from tests.test_g25_docs import (
+    _CDC_UI,
+    _F43,
+    _PAGE,
+    LANGS,
+    _fact,
+    _flat,
+    _function,
+    _has,
+    _page,
+    _route_halves,
+    _section_43,
+    _steps_in_order,
+)
 from tests.test_g25_docs_r4 import _stale
-from tests.test_g25_docs_r4d import _INHERITANCE_FIRST, ROLLBACK_STATUSES, _new_topics_first
+from tests.test_g25_docs_r4d import ROLLBACK_STATUSES, _new_topics_first
 
 _DELETE = "Delete CDC infrastructure and deploy it again"
 _RERUN = "Re-run Full Load on the Full Load step choosing 'Drop & reload'"
 
-# -- the manual's words for each route of the rule ------------------------------------------
+# -- what the manual owes the reader for each route of the rule -----------------------------
+# §4.3 (answer-first) says each route once: the blocked-Start table names a block's own fix, and
+# the closing route paragraph has one half for a stack whose connectors were never started and
+# one for a stack started before. The route table below keeps its code assertions -- the REAL
+# derivation for every stack state, migration type and block kind -- and pins, per key, the FACT
+# the page states for it (UI strings are English in every language; the rest are the verbatim
+# fragments of ``_F43``). The per-block variants of the CDC only route (a missing publication's
+# Delete CDC infrastructure, a Start CDC again after a dropped slot) are in the blocks the UI
+# shows, which name their own route.
 
-_MANUAL = {
-    # A stack started before: why, and its one route (Full load + CDC; CDC only).
-    "started-why": {
-        "en": "the CDC topics may still hold changes that no sink applied: Stop CDC and a "
-        "rolled-back Start remove the connectors without draining them, and this stack's sink "
-        "resumes from its last commit, so a Full Load re-run on the old topics would have those "
-        "changes applied over the reloaded tables",
-        "ko": "CDC 토픽에 아직 어떤 싱크도 적용하지 않은 변경이 남아 있을 수 있습니다: Stop CDC와 롤백된 "
-        "Start는 커넥터를 드레인하지 않고 제거하고 이 스택의 싱크는 마지막 커밋에서 재개하므로, 이전 토픽을 "
-        "둔 채로 Full Load를 다시 실행하면 그 변경이 다시 적재한 테이블 위에 적용됩니다",
-        "ja": "CDC トピックに、まだどの sink も適用していない変更が残っている可能性があります: Stop CDC と"
-        "ロールバックされた Start はコネクタをドレインせずに削除し、このスタックの sink は最後のコミットから"
-        "再開するため、古いトピックのまま Full Load を再実行すると、それらの変更が再ロードしたテーブルの上に"
-        "適用されます",
-    },
-    "started-full-load": {
-        "en": "names one route, new topics first: Delete CDC infrastructure and deploy it again "
-        "(the new stack starts with empty topics), then Re-run Full Load with **Drop & reload** "
-        "(it creates the slot again at its own snapshot point), then Start CDC",
-        "ko": "경로를 하나만, 새 토픽 먼저 알려 줍니다: Delete CDC infrastructure 후 다시 배포(새 스택은 빈 "
-        "토픽으로 시작), 그다음 Re-run Full Load를 **Drop & reload**로(슬롯을 자신의 스냅샷 지점에 다시 "
-        "만듦), 그다음 Start CDC",
-        "ja": "方法を 1 つだけ、新しいトピックを先に示します: Delete CDC infrastructure して再デプロイ (新しい"
-        "スタックは空のトピックで始まります)、次に **Drop & reload** で Re-run Full Load (スロットが自身の"
-        "スナップショット位置に作り直されます)、次に Start CDC",
-    },
-    "started-cdc-only": {
-        "en": "with CDC only, Delete CDC infrastructure and deploy it again, then Start CDC on the "
-        "new stack, which snapshots every selected table (a row deleted on the source in between "
-        "stays on Aurora DSQL; Validation reports it as an EXTRA row)",
-        "ko": "CDC only에서는 Delete CDC infrastructure 후 다시 배포한 뒤 새 스택에서 Start CDC 하며, 그 "
-        "Start가 선택한 모든 테이블을 스냅샷합니다(그 사이에 소스에서 삭제된 행은 Aurora DSQL에 남고, "
-        "Validation이 EXTRA 행으로 보고합니다)",
-        "ja": "CDC only では Delete CDC infrastructure して再デプロイしてから新しいスタックで Start CDC し、"
-        "その Start が選択したすべてのテーブルをスナップショットします (その間にソースで削除された行は Aurora "
-        "DSQL に残り、Validation が EXTRA の行として報告します)",
-    },
-    "started-after-fix": {
-        "en": "The block for a slot of that name it cannot use names the route as a step after its "
-        "own fix (drop that slot, or use a different CDC stack name)",
-        "ko": "그 이름의 슬롯을 쓸 수 없다는 차단은 그 경로를 자체 해결책(그 슬롯을 삭제하거나 다른 CDC 스택 "
-        "이름을 사용) 다음 단계로 알려 줍니다",
-        "ja": "その名前のスロットを使用できないというブロックは、その方法を自身の解決策 (そのスロットを削除する"
-        "か、別の CDC スタック名を使う) の次の手順として示します",
-    },
-    "started-no-remedy": {
-        "en": "No **Re-snapshot every table instead** is offered on such a stack",
-        "ko": "그런 스택에는 **Re-snapshot every table instead**를 제시하지 않습니다",
-        "ja": "そのようなスタックには **Re-snapshot every table instead** は提示されません",
-    },
-    # A stack never started.
-    "never-offered": {
-        "en": "It is offered only on a stack whose connectors were never started, for a missing "
-        "publication, a missing slot or a slot that is not at the Full Load's start point",
-        "ko": "그 방법은 커넥터를 시작한 적 없는 스택에만, publication이 없거나 슬롯이 없거나 슬롯이 Full "
-        "Load의 시작 지점에 있지 않을 때만 제시됩니다",
-        "ja": "この方法が提示されるのは、コネクタを開始したことのないスタックで、publication がない、スロットが"
-        "ない、またはスロットが Full Load の開始位置にない場合だけです",
-    },
-    "never-job-both-ways": {
-        "en": "for a missing publication, a missing slot or a slot that is not at the Full Load's "
-        "start point it names both ways out: Re-snapshot every table instead (the Start CDC "
-        "dialog offers it when the Start that re-snapshots passes its own checks), or Re-run Full "
-        "Load with **Drop & reload**, then Start CDC (with CDC only, after switching the "
-        "migration type to Full load + CDC)",
-        "ko": "publication이 없거나 슬롯이 없거나 슬롯이 Full Load의 시작 지점에 있지 않다는 거부는 두 가지 "
-        "길을 알려 줍니다: Re-snapshot every table instead(다시 스냅샷하는 Start가 자체 검사를 통과하면 "
-        "Start CDC 대화 상자가 제시), 또는 Re-run Full Load를 **Drop & reload**로 실행한 뒤 Start CDC(CDC "
-        "only에서는 마이그레이션 유형을 Full load + CDC로 바꾼 뒤)",
-        "ja": "publication がない、スロットがない、またはスロットが Full Load の開始位置にないという拒否は "
-        "2 つの方法を示します: Re-snapshot every table instead (再スナップショットする Start が自身のチェック"
-        "を通過すれば Start CDC のダイアログが提示します)、または **Drop & reload** で Re-run Full Load "
-        "してから Start CDC (CDC only では、マイグレーションの種類を Full load + CDC に切り替えてから)",
-    },
-    "never-job-same-route": {
-        "en": "On a stack never started, its refusal for a publication that misses a selected "
-        "table, or for a slot of that name it cannot use, ends with the same route",
-        "ko": "커넥터를 시작한 적 없는 스택에서 publication에 선택한 테이블이 빠졌다거나 그 이름의 슬롯을 쓸 "
-        "수 없다는 그 작업의 거부는 같은 경로로 끝나고",
-        "ja": "コネクタを開始したことのないスタックで publication に選択したテーブルが含まれていない、またはその"
-        "名前のスロットを使用できないというそのジョブの拒否は同じ方法で終わり",
-    },
-    "never-inheritance-full-load": {
-        "en": "After an inheritance refusal (or a failed read of them), that is Re-run Full Load "
-        "with **Drop & reload** instead, which creates the slot again at its own snapshot point, "
-        "so the Start CDC after it takes no snapshot",
-        "ko": "상속 때문에(또는 그 읽기에 실패해) 거부되었다면 대신 Re-run Full Load를 **Drop & reload**로 "
-        "실행하세요. 슬롯을 자신의 스냅샷 지점에 다시 만들므로 그 뒤의 Start CDC는 스냅샷하지 않습니다",
-        "ja": "継承のため (またはその読み取りに失敗したため) の拒否なら、代わりに **Drop & reload** で "
-        "Re-run Full Load してください。スロットが自身のスナップショット位置に作り直されるため、その後の "
-        "Start CDC はスナップショットしません",
-    },
-    "never-inheritance-cdc-only": {
-        "en": "with CDC only, which has no Full Load step, switch the migration type to Full "
-        "load + CDC first",
-        "ko": "(Full Load 단계가 없는 CDC only에서는 먼저 마이그레이션 유형을 Full load + CDC로 바꿈)",
-        "ja": "(Full Load ステップのない CDC only では、先にマイグレーションの種類を Full load + CDC に"
-        "切り替えます)",
-    },
-    "never-unusable-full-load": {
-        "en": "After the refusal of a slot of that name it cannot use, it is a step after that "
-        "refusal's own fix (drop that slot, or use a different CDC stack name): then Re-run Full "
-        "Load with **Drop & reload**, then Start CDC",
-        "ko": "그 이름의 슬롯을 쓸 수 없어 거부되었다면, 그 거부의 자체 해결책(그 슬롯을 삭제하거나 다른 CDC "
-        "스택 이름을 사용) 다음 단계로 Re-run Full Load를 **Drop & reload**로 실행한 뒤 Start CDC 하세요",
-        "ja": "その名前のスロットを使用できないための拒否なら、その拒否自身の解決策 (そのスロットを削除するか、"
-        "別の CDC スタック名を使う) の次の手順として、**Drop & reload** で Re-run Full Load してから Start "
-        "CDC してください",
-    },
-    "never-unusable-cdc-only": {
-        "en": "then Start CDC (with CDC only, Start CDC again)",
-        "ko": "Start CDC 하세요(CDC only에서는 Start CDC를 다시 실행)",
-        "ja": "Start CDC してください (CDC only では Start CDC をもう一度実行します)",
-    },
-    "never-coverage-full-load": {
-        "en": "A publication that misses a selected table is refused for its own reason (the Start "
-        "that re-snapshots grades the publication's coverage too), so its block ends with its "
-        "route: Re-run Full Load with **Drop & reload**, which adds each missing selected table to "
-        "the publication and creates the slot again at its own snapshot point, then Start CDC",
-        "ko": "publication에 선택한 테이블이 빠졌다면 다시 스냅샷하는 Start도 같은 이유로 거부되므로(그 검사도 "
-        "publication의 포함 범위를 판정함), 그 차단은 자신의 경로로 끝납니다: Re-run Full Load를 **Drop & "
-        "reload**로 실행하면 빠진 선택 테이블을 publication에 추가하고 슬롯을 자신의 스냅샷 지점에 다시 "
-        "만들며, 그 뒤 Start CDC",
-        "ja": "publication に選択したテーブルが含まれていない場合は、再スナップショットする Start も同じ理由で"
-        "拒否されるため (そのチェックも publication の対象範囲を判定します)、そのブロックは自身の方法で終わり"
-        "ます: **Drop & reload** で Re-run Full Load すると、含まれていない選択したテーブルを publication に"
-        "追加し、スロットを自身のスナップショット位置に作り直します。その後に Start CDC します",
-    },
-    "never-coverage-cdc-only": {
-        "en": "(with CDC only, Delete CDC infrastructure and deploy it again: it drops the "
-        "publication, so the new stack's Start CDC can create one over the selected tables)",
-        "ko": "(CDC only에서는 Delete CDC infrastructure 후 다시 배포: publication을 삭제하므로 새 스택의 "
-        "Start CDC가 선택한 테이블로 publication을 만들 수 있습니다)",
-        "ja": "(CDC only では Delete CDC infrastructure して再デプロイ: publication を削除するため、新しい"
-        "スタックの Start CDC が選択したテーブルで publication を作成できます)",
-    },
-}
+_STEPS_STARTED = ("Delete CDC infrastructure", "Re-run Full Load", "Start CDC")
+_RE_SNAPSHOT = "**Re-snapshot every table instead**"
 
 
-def _cdc4(lang: str) -> str:
-    return _page(lang, _PAGE["04"])
-
-
-def _paragraph(lang: str, start: dict, end: dict) -> str:
-    """Chapter 4's flattened text from ``start[lang]`` up to ``end[lang]``."""
-    cdc = _cdc4(lang)
-    head = cdc.index(_flat(lang, start[lang]).strip())
-    return cdc[head : cdc.index(_flat(lang, end[lang]).strip(), head)]
-
-
-_STARTED_HEAD = {
-    "en": "**On a stack whose connectors were started before**",
-    "ko": "**커넥터를 전에 시작한 스택에서는**",
-    "ja": "**以前にコネクタを開始したスタックでは**",
-}
-_ROLLED_BACK_HEAD = {
-    "en": "**After a Start that CloudFormation rolled back**",
-    "ko": "**CloudFormation이 Start를 롤백한 뒤**",
-    "ja": "**CloudFormation が Start をロールバックした後**",
-}
-_NEVER_HEAD = {
-    "en": "Before a block offers **Re-snapshot every table instead**",
-    "ko": "차단이 **Re-snapshot every table instead**를 제시하기 전에",
-    "ja": "ブロックが **Re-snapshot every table instead** を提示する前に",
-}
-_NEVER_END = {
-    "en": "If those checks cannot read the source, the remedy stays",
-    "ko": "그 검사가 소스를 읽지 못하면 그 방법은 그대로 남고",
-    "ja": "それらのチェックがソースを読めない場合、その方法は残り",
-}
+def _manual_names(lang: str, key: str) -> None:
+    never, started = _route_halves(lang)
+    section = _section_43(lang)
+    route_mark = _F43["route-mark"][lang]
+    if key == "started-why":
+        assert _fact(lang, started, "topics-hold"), (lang, key)
+    elif key == "started-full-load":
+        assert _steps_in_order(lang, started, *_STEPS_STARTED), (lang, key)
+        assert _has(lang, started, "**Drop & reload**"), (lang, key)
+    elif key == "started-cdc-only":
+        assert _fact(lang, started, "cdc-only-new-stack"), (lang, key)
+        assert _fact(lang, started, "extra-row"), (lang, key)
+    elif key == "started-after-fix":
+        assert _steps_in_order(
+            lang, section, _F43["unusable-cell"][lang], _F43["unusable-fix"][lang], route_mark
+        ), (lang, key)
+    elif key == "started-no-remedy":
+        assert _fact(lang, started, "no-resnapshot"), (lang, key)
+        assert not _has(lang, started, _RE_SNAPSHOT), (lang, key)
+    elif key == "inheritance-first":
+        assert _fact(lang, section, "inheritance-started-first"), (lang, key)
+    elif key == "never-offered":
+        assert _has(lang, never, _RE_SNAPSHOT) and _fact(lang, never, "offered-only-when"), key
+    elif key == "never-job-both-ways":
+        assert _has(lang, never, _RE_SNAPSHOT), (lang, key)
+        assert _steps_in_order(lang, never, "Re-run Full Load", "Start CDC"), (lang, key)
+        assert _has(lang, never, "**Drop & reload**"), (lang, key)
+        assert _fact(lang, never, "cdc-only-switch"), (lang, key)
+    elif key == "never-job-same-route":
+        assert _steps_in_order(lang, section, _F43["coverage-cell"][lang], route_mark), (lang, key)
+    elif key == "never-inheritance-full-load":
+        assert _fact(lang, section, "inheritance-rerun"), (lang, key)
+    elif key == "never-inheritance-cdc-only":
+        assert _fact(lang, section, "cdc-only-switch"), (lang, key)
+    elif key == "never-unusable-full-load":
+        assert _fact(lang, section, "unusable-fix"), (lang, key)
+        assert _steps_in_order(lang, never, "Re-run Full Load", "Start CDC"), (lang, key)
+    elif key == "never-unusable-cdc-only":
+        assert _fact(lang, section, "unusable-cdc-only"), (lang, key)
+    elif key == "never-coverage-full-load":
+        assert _fact(lang, section, "coverage-cell"), (lang, key)
+        assert _steps_in_order(lang, never, "Re-run Full Load", "Start CDC"), (lang, key)
+    elif key == "never-coverage-cdc-only":
+        assert _fact(lang, never, "cdc-only-switch"), (lang, key)
+    else:  # pragma: no cover
+        raise AssertionError(key)
 
 
 # -- the code's states, fed to the real route derivation ------------------------------------
@@ -354,73 +254,28 @@ def test_the_manual_names_the_route_rules_route(lang, stack, cdc_only, block, re
     if cdc_only and "Full Load step" in route:
         assert "switch the migration type to full load + cdc" in route.lower(), route
 
-    # Then the manual: that route, in that stack's paragraph.
+    # Then the manual: the fact it states for that route.
     for key in keys:
-        if key == "inheritance-first":
-            phrase = _INHERITANCE_FIRST[lang].format(header=pg.INHERITANCE_SNAPSHOT_HEADER)
-            text = _paragraph(lang, _STARTED_HEAD, _ROLLED_BACK_HEAD)
-        elif key.startswith("started"):
-            phrase, text = _MANUAL[key][lang], _paragraph(lang, _STARTED_HEAD, _ROLLED_BACK_HEAD)
-        else:
-            phrase, text = _MANUAL[key][lang], _paragraph(lang, _NEVER_HEAD, _NEVER_END)
-        assert _has(lang, text, phrase), (lang, key, phrase)
+        _manual_names(lang, key)
 
 
 @pytest.mark.parametrize("lang", LANGS)
 def test_a_started_stacks_paragraph_names_new_topics_before_any_full_load_rerun(lang) -> None:
-    # Every sentence of the started stack's paragraph that names Re-run Full Load names Delete
-    # CDC infrastructure before it; the never-started routes are in their own paragraph.
-    started = _paragraph(lang, _STARTED_HEAD, _ROLLED_BACK_HEAD)
+    # Every sentence of the started stack's half of the route paragraph that names Re-run Full
+    # Load names Delete CDC infrastructure before it; the never-started routes are in the other.
+    started = _route_halves(lang)[1]
     assert _new_topics_first(lang, started), lang
     assert _flat(lang, "Re-snapshot every table instead (").strip() not in started, lang
 
 
 # -- f0: a stopped stack -- one route, and a resume gapless only within the topics' retention --
 
-_STOPPED_RESUME = {
-    "en": (
-        "Stop CDC removes the connectors without draining them, so the changes the sink had not "
-        "applied by then reach Aurora DSQL only from the CDC topics: such a Start is gapless only "
-        "while the topics still retain them, which Start CDC does not check",
-        "Once their retention period on MSK has passed, it would skip them, so the Start CDC card "
-        "(*Ready to resume CDC*) and the start-point card (*Resuming from this stack's "
-        "replication slot*) name the route to take instead: that of a stack whose connectors were "
-        "started before (new topics first; see the PostgreSQL note below)",
-    ),
-    "ko": (
-        "Stop CDC는 커넥터를 드레인하지 않고 제거하므로, 그때까지 싱크가 적용하지 않은 변경은 CDC 토픽에서만 "
-        "Aurora DSQL에 도달합니다: 그런 Start에 빈틈이 없는 것은 토픽이 그 변경을 아직 보존하는 동안뿐이며, "
-        "Start CDC는 이를 확인하지 않습니다",
-        "MSK에서 토픽의 보존 기간이 지나면 그 Start는 그 변경을 건너뛰므로, Start CDC 카드(*Ready to resume "
-        "CDC*)와 시작 지점 카드(*Resuming from this stack's replication slot*)는 대신 택할 경로로 커넥터를 "
-        "전에 시작한 스택의 경로(새 토픽 먼저. 아래 PostgreSQL 설명 참고)를 알려 줍니다",
-    ),
-    "ja": (
-        "Stop CDC はコネクタをドレインせずに削除するため、その時点で sink が適用していなかった変更は CDC "
-        "トピックからしか Aurora DSQL に届きません: そのような Start にギャップがないのはトピックがまだその"
-        "変更を保持している間だけで、Start CDC はそれを確認しません",
-        "MSK でトピックの保持期間が過ぎるとその Start はそれらの変更をスキップするため、Start CDC のカード "
-        "(*Ready to resume CDC*) と開始位置のカード (*Resuming from this stack's replication slot*) は、"
-        "代わりに取る方法として、以前にコネクタを開始したスタックの方法 (新しいトピックが先。下記の "
-        "PostgreSQL の説明を参照) を示します",
-    ),
-}
+# §4.3 states the stopped stack's bound once ("Starting again"): a restart is gapless only
+# while the topics still retain the changes the sink had not applied, the Stop CDC dialog and the
+# *Ready to resume CDC* card say so, and past the retention period the route is new topics first.
+# The start-point card's title and its wording are in the UI.
 # G25 round 8 (rule E): the re-run that takes the fresh watermark is a Drop & reload.
 _LOST_SLOT = {
-    "04": {
-        "en": "`wal_status='lost'` (slot invalidated), gapless resume from it is broken, and Start "
-        "CDC blocks and names the way out (below): with Full load + CDC, re-run Full Load with "
-        "**Drop & reload** to capture a fresh watermark, after Delete CDC infrastructure and a "
-        "new deploy if the stack's connectors were started before",
-        "ko": "`wal_status='lost'`(슬롯 무효화)를 보고하면 그 슬롯에서의 무손실 재개가 깨지고, Start CDC가 "
-        "차단하며 해결 경로를 알려 줍니다(아래): Full load + CDC에서는 새 워터마크를 얻기 위해 **Drop & "
-        "reload**로 Full Load를 다시 실행하되, 스택의 커넥터를 전에 시작했다면 먼저 Delete CDC "
-        "infrastructure 후 다시 배포합니다",
-        "ja": "`wal_status='lost'` (スロット無効化) を報告すると、そのスロットからのギャップのない再開が"
-        "壊れ、Start CDC がブロックして解決方法を示します (下記): Full load + CDC では新しいウォーター"
-        "マークを取得するために **Drop & reload** で Full Load を再実行し、スタックのコネクタを以前に開始"
-        "していた場合は、その前に Delete CDC infrastructure して再デプロイします",
-    },
     "01": {
         "en": "`wal_status='lost'` means the slot was invalidated → gapless resume is broken → "
         "Start CDC blocks and names the way out ([§4.3](04-cdc-and-dsql-constraints.md)): with "
@@ -488,10 +343,14 @@ def test_a_stopped_stack_gets_the_one_route_and_a_resume_bounded_by_the_topics(l
         read_pg_replication_objects
     )
 
-    cdc = _cdc4(lang)
-    for phrase in _STOPPED_RESUME[lang]:
-        assert _has(lang, cdc, phrase), (lang, phrase)
-    assert _has(lang, cdc, _LOST_SLOT["04"][lang]), lang
+    section = _section_43(lang)
+    assert _fact(lang, section, "gapless-while-retained"), lang
+    assert _has(lang, section, "*Ready to resume CDC*"), lang
+    assert _steps_in_order(
+        lang, section, _F43["restart-row"][lang], "Delete CDC infrastructure", "Re-run Full Load",
+        "Start CDC",
+    ), lang
+    assert _fact(lang, section, "lost-slot"), lang
     assert _has(lang, _page(lang, "01-setup.md"), _LOST_SLOT["01"][lang]), lang
     assert not _stale(lang, _STALE_STOPPED[lang]), lang
 
@@ -532,19 +391,9 @@ def test_the_faqs_restart_in_place_tip_states_the_topics_condition(lang) -> None
 
 # -- f1: after a rolled-back Start, Debezium's own snapshot rule -----------------------------
 
-_SNAPSHOT_RULE = {
-    "en": "With `initial`, though, Debezium continues without a snapshot only from a recorded "
-    "position whose initial snapshot had completed: if that Start (or the earlier run) had not "
-    "completed its initial snapshot, or nothing was recorded, it snapshots every selected table "
-    "first, then streams from the slot",
-    "ko": "다만 `initial`에서 Debezium이 스냅샷 없이 이어 가는 것은 초기 스냅샷을 끝낸, 기록된 위치에서뿐"
-    "입니다: 그 Start(또는 이전 실행)가 초기 스냅샷을 끝내지 못했거나 기록된 것이 없으면, 먼저 선택한 모든 "
-    "테이블을 스냅샷한 뒤 슬롯에서 스트리밍합니다",
-    "ja": "ただし `initial` で Debezium がスナップショットなしで続けるのは、初期スナップショットを完了した、"
-    "記録された位置からだけです: その Start (または以前の実行) が初期スナップショットを完了していなかったか、"
-    "何も記録されていなければ、先に選択したすべてのテーブルをスナップショットしてから、スロットから"
-    "ストリーミングします",
-}
+# §4.3's restart row keeps the user-visible half of Debezium's rule: a source connector that never
+# completed its snapshot snapshots every selected table again. When a recorded position counts
+# is on the cards and the Start's activity-log line.
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -570,20 +419,14 @@ def test_a_rolled_back_start_promises_no_snapshot_outcome_debezium_does_not(lang
     assert "Manual's full snapshot runs only if nothing was recorded on this stack, or the run " \
            "that recorded its position had not completed its initial snapshot" in line
 
-    rolled = _paragraph(lang, _ROLLED_BACK_HEAD, _NEVER_HEAD)
-    assert _has(lang, rolled, _SNAPSHOT_RULE[lang]), lang
+    assert _fact(lang, _section_43(lang), "mid-snapshot"), lang
 
 
 # -- f2: the start-point card on a rolled-back stack resumes like the Start card -------------
 
-_START_POINT_CARD = {
-    "en": "the start-point card above it (*Starting again after a rolled-back Start*, which offers "
-    "no start point or re-snapshot there)",
-    "ko": "그 위의 시작 지점 카드(*Starting again after a rolled-back Start*. 그곳에서는 시작 지점도 다시 "
-    "스냅샷도 제시하지 않음)",
-    "ja": "その上の開始位置のカード (*Starting again after a rolled-back Start*。そこでは開始位置も再"
-    "スナップショットも提示しません)",
-}
+# §4.3 puts a rolled-back Start in the restart row; the start-point card's own title (*Starting
+# again after a rolled-back Start*) and the start point and re-snapshot it does not offer are in
+# the UI.
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -600,8 +443,7 @@ def test_a_rolled_back_stacks_start_point_card_is_named_as_it_reads(lang) -> Non
     # The branch's own return (12 spaces) comes before the PostgreSQL choice below it (8).
     assert branch.index("\n            return\n") < branch.index("\n        if is_pg:\n")
 
-    rolled = _paragraph(lang, _ROLLED_BACK_HEAD, _NEVER_HEAD)
-    assert _has(lang, rolled, _START_POINT_CARD[lang]), lang
+    assert _fact(lang, _section_43(lang), "restart-row"), lang
 
 
 # -- f3: after a withheld re-snapshot, the route that works for that refusal -----------------
@@ -655,10 +497,9 @@ def test_a_withheld_re_snapshot_names_the_route_that_works_for_its_refusal(lang)
     assert refused[1].endswith("Drop it, or use a different CDC stack name so the derived slot "
                                "name differs.")
 
-    never = _paragraph(lang, _NEVER_HEAD, _NEVER_END)
     for key in ("never-inheritance-full-load", "never-inheritance-cdc-only",
                 "never-unusable-full-load", "never-unusable-cdc-only"):
-        assert _has(lang, never, _MANUAL[key][lang]), (lang, key)
+        _manual_names(lang, key)
     assert _has(lang, _page(lang, _PAGE["13"]), _CH13_UNUSABLE[lang]), lang
 
 
@@ -693,10 +534,9 @@ def test_a_never_started_stacks_coverage_block_ends_with_its_route(lang) -> None
                                        pg.PUBLICATION_COVERAGE_HEADER, resnapshot=resnapshot)
             assert words in route, (only, resnapshot)
 
-    never = _paragraph(lang, _NEVER_HEAD, _NEVER_END)
     for key in ("never-coverage-full-load", "never-coverage-cdc-only", "never-job-same-route",
                 "never-job-both-ways"):
-        assert _has(lang, never, _MANUAL[key][lang]), (lang, key)
+        _manual_names(lang, key)
     assert not _stale(lang, (_STALE_SHOWN_ALONE[lang],)), lang
 
 
@@ -723,8 +563,6 @@ def test_the_routes_of_a_stack_never_started_name_no_new_topics_but_where_the_co
     ]
     assert {(b, o) for b, o, _r in named} == {(pg.PUBLICATION_COVERAGE_HEADER, True)}
 
-    never = _paragraph(lang, _NEVER_HEAD, _NEVER_END)
-    delete = _flat(lang, "Delete CDC infrastructure").strip()
-    sentences = never.split("。") if lang == "ja" else re.split(r"(?<=[.!?]) ", never)
-    (with_delete,) = [s for s in sentences if delete in s]
-    assert _has(lang, with_delete, _MANUAL["never-coverage-cdc-only"][lang]), (lang, with_delete)
+    # §4.3's never-started half names no new topics at all: the one exception (CDC only's route
+    # for a publication that misses a table) is left to the block, which names its own route.
+    assert not _has(lang, _route_halves(lang)[0], "Delete CDC infrastructure"), lang

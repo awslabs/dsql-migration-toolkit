@@ -2394,13 +2394,8 @@ def test_manual_4_2_scopes_schema_changes_flag_and_does_not_route_ddl_through_sc
         text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
         start = text.index("\n## 4.2")
         intro = text[start : text.index("\n### ", start)]
-        flag_bullets = [b for b in intro.split("\n- ") if "include.schema.changes=false" in b]
-        assert flag_bullets, lang
-        # The sentence carrying the flag names MySQL (it is the MySQL connector's).
-        for bullet in flag_bullets:
-            head = bullet[: bullet.index("include.schema.changes=false")]
-            assert "MySQL" in head.rsplit(".", 1)[-1] or "MySQL" in head.rsplit("。", 1)[-1], lang
-        assert "pgoutput" in intro, lang
+        # The manual no longer names the connector settings (include.schema.changes, the
+        # pgoutput stream): it says CDC replicates row changes, not DDL, which holds for both.
         assert "Fix target schema" in intro, lang
         assert old not in text, lang
 
@@ -2448,8 +2443,9 @@ def test_06_recovery_restart_window_covers_the_whole_run() -> None:
     for lang, phrase in old.items():
         text = (manual / lang / "06-limitations.md").read_text(encoding="utf-8")
         assert phrase not in text, lang
-        assert "Stop CDC" in text and "`schema_only`" in text, lang
-    en = (manual / "en" / "06-limitations.md").read_text(encoding="utf-8")
+        # (2026-10-26, answer-first: 6.2 no longer names the snapshot modes; the window is still "until Stop CDC")
+        assert "Stop CDC" in text, lang
+    en = " ".join((manual / "en" / "06-limitations.md").read_text(encoding="utf-8").split())
     assert "until Stop CDC" in en
 
 
@@ -2483,14 +2479,14 @@ def test_manual_4_says_the_sink_retries_occ_per_transaction_not_per_statement() 
 
 
 def _manual_4_2_drift_region(lang: str) -> str:
-    """4.2's drift sub-section up to the banner-row table (the 'which dead letters get a
-    banner row' paragraph and its bullets live here)."""
+    """4.2's drift sub-section, up to the next ### heading (the banner-row table leads it, and
+    the 'which dead letters get a banner row' paragraph and its bullets follow the table)."""
     import pathlib
 
     manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
     text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
     start = text.index("\n### ", text.index("\n## 4.2"))
-    return text[start : text.index("\n|", start)]
+    return text[start : text.index("\n### ", start + 1)]
 
 
 def test_manual_4_2_banner_row_scope_matches_the_drift_classifier() -> None:
@@ -2535,7 +2531,7 @@ def test_manual_4_2_banner_row_scope_matches_the_drift_classifier() -> None:
         assert "`timetz[]`" in no_banner_list and "`bytea[]`" in no_banner_list, lang
         assert "#45-" in no_banner_list, lang  # the oversized-value bullet links 4.5
         # The no-key record is not MySQL-only, and the re-check does report the key drop.
-        assert "primary key changed at the source" in no_banner_list, lang
+        assert "primary key changed at the source" in " ".join(no_banner_list.split()), lang
         assert "PostgreSQL" in [b for b in bullets if "primary key changed" in b][0], lang
         assert "06-limitations.md#62-" in region and "CHECKSUM" in region, lang
 
@@ -2555,7 +2551,7 @@ def test_manual_4_2_does_not_offer_replace_as_a_mode_apply_does_not_block() -> N
         start = text.index("\n## 4.2")
         intro = text[start : text.index("\n### ", start)]
         assert phrase not in intro, lang
-        assert included[lang] in intro, lang
+        assert included[lang] in " ".join(intro.split()), lang
         assert "**Drop & reload**" in intro, lang
 
 
@@ -2590,7 +2586,8 @@ def test_ddl_advice_names_the_recreate_for_a_type_or_key_change() -> None:
     }
     for page, per_lang in markers.items():
         for lang, marker in per_lang.items():
-            text = (manual / lang / page).read_text(encoding="utf-8")
+            # whitespace-flattened: the page is hard-wrapped
+            text = " ".join((manual / lang / page).read_text(encoding="utf-8").split())
             assert text.count(marker) == 1, (page, lang)
             window = text[text.index(marker) :][:700]
             for phrase in needs[page]:
@@ -2622,22 +2619,29 @@ def test_06_pg_ddl_while_stopped_is_its_own_item_not_a_recheck_blind_spot() -> N
 
 def test_06_schema_only_restart_names_the_missing_history_exception() -> None:
     # G11 review: mysql_snapshot_mode rule 3 -- a resume whose schema history is missing
-    # runs in recovery, so "a restart after Stop CDC resumes in schema_only and is not
-    # affected" was wrong for exactly that Start.
+    # rebuilds it, so "a restart after Stop CDC is not affected" was wrong for exactly that Start.
+    # 2026-10-26 (answer-first): 6.2 no longer names the snapshot modes (`schema_only` / `recovery`); its
+    # "A restart after Stop CDC is different" bullet says the recorded history is replayed, what happens when
+    # it is missing, and that the stale "is not affected" wording is gone.
     import pathlib
 
     manual = pathlib.Path(__file__).resolve().parents[1] / "docs" / "manual"
     item_titles = {
-        "en": ("**What it cannot see.**", "normally resumes in `schema_only`", "schema history is missing"),
-        "ko": ("**검사가 볼 수 없는 것.**", "보통\n    `schema_only`로 재개", "히스토리가 없으면"),
-        "ja": ("**チェックで分からないもの。**", "通常 `schema_only` で", "履歴がない場合"),
+        "en": ("**A restart after Stop CDC is different.**",
+               "If that history is missing, the Start fails saying so", "is not affected"),
+        "ko": ("**Stop CDC 후의 재시작은 다릅니다.**",
+               "그 히스토리가 없으면 Start가 그렇다고 알리며 실패합니다", "영향을 받지 않습니다"),
+        "ja": ("**Stop CDC 後の再起動は別です。**",
+               "その履歴が失われていれば Start はそう示して失敗します", "影響を受けません"),
     }
-    for lang, (title, normally, missing) in item_titles.items():
+    for lang, (title, missing, stale) in item_titles.items():
         text = (manual / lang / "06-limitations.md").read_text(encoding="utf-8")
         item = text[text.index(title) :]
-        item = item[: item.index("\n  - ")]
-        assert normally in item and missing in item, lang
-        assert item.count("`recovery`") >= 2, lang
+        item = " ".join(item[: item.index("\n\n")].split())
+        if lang == "ja":
+            item = item.replace(" ", "")
+        assert missing.replace(" ", "" if lang == "ja" else " ") in item, lang
+        assert stale.replace(" ", "" if lang == "ja" else " ") not in item, lang
 
 
 # --- PostgreSQL CDC: the app seeds MSK itself (SeedMode=External) --------------
@@ -3156,24 +3160,25 @@ def test_manual_4_6_places_the_source_key_index_build_where_it_happens() -> None
     # background after the load". Schema Conversion's Apply creates it WITH the table, so in
     # the default flow it is valid before CDC starts; only Drop & reload builds it after the
     # load. And "the monitor re-reads it" followed the UPDATE sentence, so "it" read as the
-    # old row: the monitor re-reads REPLICA IDENTITY.
+    # old row: the monitor re-reads REPLICA IDENTITY. (Chapter 4's answer-first §4.6 no longer
+    # explains when the index is built -- the notice's fix is the same either way -- so only the
+    # stale claims and the explicit "re-reads REPLICA IDENTITY" are pinned.)
     stale = {
         "en": ("built in the background after the load)", "So the monitor re-reads it ("),
         "ko": ("로드 후 백그라운드에서 빌드됩니다)", "그래서 모니터가 이를 다시 읽고"),
         "ja": ("ロード後にバックグラウンドで構築されます)", "そのためモニターがこれを読み直し"),
     }
     new = {
-        "en": ("Schema Conversion's Apply", "re-reads `REPLICA IDENTITY`"),
-        "ko": ("Schema Conversion의 Apply", "`REPLICA IDENTITY`를 다시 읽고"),
-        "ja": ("Schema Conversion の Apply", "`REPLICA IDENTITY` を読み直し"),
+        "en": ("re-reads `REPLICA IDENTITY`",),
+        "ko": ("`REPLICA IDENTITY`를 다시 읽고",),
+        "ja": ("`REPLICA IDENTITY` を読み直し",),
     }
     for lang, head in _G15_SECTION_4_6.items():
-        intro = _flat_manual_slice(lang, "04-cdc-and-dsql-constraints.md", head, "\n- ")
+        intro = _flat_manual_slice(lang, "04-cdc-and-dsql-constraints.md", head, "\n|")
         for phrase in stale[lang]:
             assert phrase not in intro, (lang, phrase)
         for phrase in new[lang]:
             assert phrase in intro, (lang, phrase)
-        assert "**Drop & reload**" in intro, lang
 
 
 def test_manual_06_says_what_redeploying_older_cdc_infrastructure_costs() -> None:
@@ -3309,12 +3314,13 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
                "スタックに記録が残らない",
                "を実行して再デプロイし、上記のとおりCDCに新しい開始位置を与えてください"),
     }
+    # (the explanation of how an old stack is judged "only by what is recorded, not how the stack
+    # streamed since" is no longer spelled out: 6.2 says to keep such a source not ON or take a new start point)
+    # (2026-10-26: the part-way-failure paragraph -- "rows the sink re-applied keep their older values" -- is gone from 6.2)
     present = {
-        "en": ("not how the stack streamed since",
-               "even when the session no longer holds the start point",
+        "en": ("even when the session no longer holds the start point",
                "set the source's `gtid_mode` to `ON_PERMISSIVE` until cut over",
                "with no gap",
-               "rows the sink re-applied keep their older values until rewritten",
                "changes to the captured tables between the two points are then not replicated",
                "then Start CDC again",
                "comes back without its GTID set",
@@ -3325,11 +3331,9 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
                # G20 review: a new stack starts exactly at the held point when it can.
                "the one you hold if `gtid_mode` was already `ON` when it was recorded and "
                "has stayed `ON` since"),
-        "ko": ("그 뒤 스택이 어떻게 스트리밍했는지는 알 수 없습니다",
-               "세션에 더 이상 시작 지점이 없어도",
+        "ko": ("세션에 더 이상 시작 지점이 없어도",
                "`gtid_mode`를 `ON_PERMISSIVE`로 바꾸고",
                "빈틈 없이",
-               "싱크가 다시 적용한 행은 다시 쓰일 때까지 예전 값을 유지합니다",
                "두 지점 사이의 캡처 대상 테이블 변경은 복제되지 않으므로",
                "Start CDC를 다시 실행하세요",
                "GTID 셋 없이 복원됩니다",
@@ -3338,11 +3342,9 @@ def test_manual_g19_bullets_say_what_the_gtid_start_check_really_covers() -> Non
                "버전 0.1.566 이하가 마지막으로 시작한 스택에는 기록이 없",
                "가지고 있는 시작 지점이 기록될 때 이미 `gtid_mode`가 `ON`이었고 그 뒤로 계속 "
                "`ON`이었다면 그 지점에서"),
-        "ja": ("その後スタックがどうストリーミングしたかはわかりません",
-               "セッションにもう開始位置がなくても",
+        "ja": ("セッションにもう開始位置がなくても",
                "`gtid_mode`を`ON_PERMISSIVE`に変更し",
                "欠落なく再開します",
-               "sinkが再適用した行は書き直されるまで古い値のままです",
                "2つの位置の間のキャプチャ対象テーブルの変更はレプリケートされない",
                "もう一度Start CDCを実行してください",
                "GTIDセットなしで復元されます",
@@ -3437,9 +3439,10 @@ def test_occ_retry_is_described_as_a_transaction_not_a_statement() -> None:
                f"シンクのトランザクションごとに最大 {sink} 回", "`40001` は最大 10 回まで"),
     }
     for lang, (fl_phrase, sink_phrase, stale) in budgets.items():
+        # Chapter 7 no longer quotes the attempt budgets (retry parameters are not a user knob);
+        # it must still not carry the stale shared "up to 10".
         text = (manual / lang / "07-performance-and-tuning.md").read_text(encoding="utf-8")
         text = re.sub(r"[ \t]*\n[ \t]*", "" if lang == "ja" else " ", text)
-        assert fl_phrase in text and sink_phrase in text, lang
         assert stale not in text, lang
     # The ConfigDef string literal ships in the plugin jar (v52, G21): the value is the
     # number of attempts, and the retry re-runs a whole sink transaction. G22 (v52 rebuilt in
@@ -3471,7 +3474,7 @@ def test_manual_says_each_sink_occ_retry_starts_on_a_clean_transaction() -> None
         "ja": ("クリーンなトランザクションから始まります", "ステートメントの実行中にも"),
     }
     for lang, wanted in phrases.items():
-        for page in ("04-cdc-and-dsql-constraints.md", "07-performance-and-tuning.md"):
+        for page in ("04-cdc-and-dsql-constraints.md",):  # chapter 7 no longer repeats the rollback detail
             text = (manual / lang / page).read_text(encoding="utf-8")
             text = re.sub(r"\s+", "", text) if lang == "ja" else re.sub(r"\s+", " ", text)
             for phrase in wanted:
@@ -3482,7 +3485,9 @@ def test_manual_says_each_sink_occ_retry_starts_on_a_clean_transaction() -> None
 def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy() -> None:
     # G21 review: a live cdc-stack keeps its plugin until Delete + Deploy CDC infrastructure
     # (Start CDC carries PluginVersion forward), so the v52 rollback-before-retry is not what
-    # an earlier stack does. Chapter 4 says what such a stack still does and how to get v52,
+    # an earlier stack does. Chapter 4 says once, in the note under its sink table (4.4), that
+    # a stack keeps the plugin it was deployed with and how to get the bundled one (it no
+    # longer lists what each older plugin does differently: the CDC step says it is older),
     # chapter 7 names the plugin version, and section 13.10 no longer says, unscoped, that no
     # Delete + Deploy is needed.
     import pathlib
@@ -3492,42 +3497,26 @@ def test_manual_says_a_stack_deployed_before_plugin_v52_still_needs_a_redeploy()
     wanted = {
         "en": {
             "04-cdc-and-dsql-constraints.md": (
-                "CDC infrastructure deployed by an earlier version of the tool re-runs without "
-                "that rollback: until you **Delete CDC infrastructure** and deploy it again, "
-                "such a `40001` can dead-letter a healthy row (`25P02`).",
+                "A CDC stack keeps the plugin it was deployed with",
+                "until you **Delete CDC infrastructure** and deploy it again.",
             ),
-            "07-performance-and-tuning.md": ("the sink (plugin v52 or later) rolls back",),
-            "13-excluding-tables-and-columns.md": (
-                "**No Delete + Deploy is needed for the changes in this section.**",
-                "Later releases changed the sink plugin (v51, v52, v53, v54), so a stack deployed before "
-                "them needs **Delete CDC infrastructure** and a new deploy",
-            ),
+            # (2026-10-28) Section 13.10 (Upgrading from 0.1.561) was deleted: only the check that
+            # chapter 13 does not say, unscoped, that no Delete + Deploy is needed remains.
+            "13-excluding-tables-and-columns.md": (),
         },
         "ko": {
             "04-cdc-and-dsql-constraints.md": (
-                "이전 버전의 도구로 배포한 CDC 인프라는 이 롤백 없이 다시 실행함: "
-                "**Delete CDC infrastructure** 후 다시 배포하기 전까지는 그런 `40001` 때문에 "
-                "정상 행이 dead-letter 처리될 수 있음(`25P02`).",
+                "CDC 스택은 배포될 때의 플러그인을 그대로 씁니다",
+                "**Delete CDC infrastructure** 후 다시 배포할 때까지 그대로입니다.",
             ),
-            "07-performance-and-tuning.md": ("싱크(플러그인 v52 이상)는 트랜잭션을",),
-            "13-excluding-tables-and-columns.md": (
-                "**이 절의 변경에는 Delete + Deploy가 필요 없습니다.**",
-                "이후 릴리스에서 싱크 플러그인이 바뀌었으므로(v51, v52, v53, v54), 그 전에 배포한 스택은 "
-                "**Delete CDC infrastructure** 후 다시 배포해야",
-            ),
+            "13-excluding-tables-and-columns.md": (),
         },
         "ja": {
             "04-cdc-and-dsql-constraints.md": (
-                "以前のバージョンのツールでデプロイした CDC インフラはこのロールバックなしで再実行します: "
-                "**Delete CDC infrastructure** して再デプロイするまでは、そのような `40001` によって"
-                "正常な行がデッドレターになることがあります (`25P02`)。",
+                "CDC スタックはデプロイ時のプラグインをそのまま使い続けます",
+                "**Delete CDC infrastructure** して再デプロイするまでそのままです。",
             ),
-            "07-performance-and-tuning.md": ("シンク (プラグイン v52 以降) はトランザクションを",),
-            "13-excluding-tables-and-columns.md": (
-                "**この節の変更には Delete + Deploy は不要です。**",
-                "その後のリリースでシンクプラグインが変わったため(v51、v52、v53、v54)、それ以前にデプロイした"
-                "スタックは **Delete CDC infrastructure** して再デプロイするまで",
-            ),
+            "13-excluding-tables-and-columns.md": (),
         },
     }
     unscoped = {
@@ -3620,16 +3609,19 @@ def test_manual_says_a_landed_commits_rerun_can_meet_a_secondary_unique_index() 
     # index can reject (23505) an image the landed chunk already replaced, which is then
     # dead-lettered -- on a re-keyed table or a plain one, as on any redelivery of a committed
     # batch. The manual (ch.4 in every language) and the sink README said "the re-run leaves
-    # the same rows", unqualified.
+    # the same rows", unqualified. Chapter 4 (answer-first) no longer carries the landed-commit
+    # sentence at all (a user acts on the dead letter it can cause like on any other, and the
+    # README keeps the mechanism), so what is pinned there is only that the unqualified claim
+    # does not come back.
     import pathlib
     import re
 
     root = pathlib.Path(__file__).resolve().parents[1]
     manual = root / "docs" / "manual"
     wanted = {
-        "en": ("on a table with a secondary `UNIQUE` index", "Cut over holds the table until it matches by CHECKSUM"),
-        "ko": ("보조 `UNIQUE` 인덱스가 있는 테이블에서는", "Cut over는 그 테이블이 CHECKSUM으로 일치할 때까지 보류됨"),
-        "ja": ("二次 `UNIQUE` インデックスがあるテーブルでは", "そのテーブルが CHECKSUM で一致するまで Cut over は保留されます"),
+        "en": ("Aurora DSQL documents `XX000` as temporary",),
+        "ko": ("Aurora DSQL은 `XX000`을 일시적인 상태로 문서화하므로",),
+        "ja": ("Aurora DSQL は `XX000` を一時的な状態として文書化しているため",),
     }
     stale = {
         "en": "so the re-run leaves the same rows",

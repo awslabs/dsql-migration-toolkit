@@ -4,10 +4,10 @@ _Language: **English** | [한국어](../ko/10-conclusion.md) | [日本語](../ja
 
 > **Prev:** [9. The Query Converter and the AI DBA](09-query-validation.md)
 
-You've now seen the whole journey: connect, plan, **evaluate**, **convert the
-schema**, **Full Load**, optionally **CDC**, **validate**, and **cut over**. This
-chapter ties it together — which path to choose, a recommended end-to-end flow, the
-cut-over runbook, and where to go next.
+You've now seen the whole journey: connect, plan, **evaluate**, **convert the schema**,
+**Full Load**, optionally **CDC**, **validate**, and **cut over**. This chapter ties it
+together — which path to choose, a recommended end-to-end flow, the cut-over runbook, and
+where to go next.
 
 ---
 
@@ -19,168 +19,158 @@ cut-over runbook, and where to go next.
 | Large-scale / continuous; need **near-zero-downtime** cut-over | **Full Load + CDC** (gapless handoff keeps DSQL live until you switch over). |
 | Target already loaded; you only need to attach or resume streaming | **CDC only** (stream into an already-loaded target — e.g. resume CDC from a prior watermark, or feed a target loaded out of band — with no fresh Full Load). |
 
-On **PostgreSQL** the gapless handoff has to be chosen *before* the load. The
-replication slot that retains WAL cannot be created at a past position, so
-**Full Load + CDC** creates it at the snapshot point; after a **Full Load only**
-run that option is gone, and a later CDC start re-snapshots every captured table
-instead — still lossless, but it reads the source a second time and streams every
-row through MSK (on a CDC stack whose connectors were started before, Start CDC instead
-continues from that stack's own slot if its source connector streamed (otherwise Debezium
-snapshots every selected table first): gapless only while the CDC topics still retain what
-the sink had not applied). On MySQL the binary log retains history with no
-consumer, so a later CDC start on a CDC stack that has never streamed starts from the
-watermark with no re-read. On one that has streamed, Start CDC refuses that newer start
-point: set the migration type to CDC only, then on its CDC step Delete CDC
-infrastructure and deploy it again before Start CDC (Full load only has no CDC step;
-[Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Either way CDC
-starts from the watermark and carries only the changes after it, so if that Full load
+On **PostgreSQL** the gapless handoff has to be chosen *before* the load. The replication
+slot that retains WAL cannot be created at a past position, so **Full Load + CDC** creates
+it at the snapshot point; after a **Full Load only** run that option is gone, and a later
+CDC start re-snapshots every captured table instead — still lossless, but it reads the
+source a second time and streams every row through MSK (on a CDC stack whose connectors
+were started before, Start CDC instead continues from that stack's own slot if its source
+connector streamed (otherwise Debezium snapshots every selected table first): gapless only
+while the CDC topics still retain what the sink had not applied). On MySQL the binary log
+retains history with no consumer, so a later CDC start on a CDC stack that has never
+streamed starts from the watermark with no re-read. On one that has streamed, Start CDC
+refuses that newer start point: set the migration type to CDC only, then on its CDC step
+Delete CDC infrastructure and deploy it again before Start CDC (Full load only has no CDC
+step; [Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)). Either way
+CDC starts from the watermark and carries only the changes after it, so if that Full load
 only run appended to rows an earlier load left on the target, first Re-run Full Load
 choosing **Drop & reload**. On a source not running `gtid_mode=ON` that watermark is a
 binlog position recorded without waiting for in-flight commits: validate in CHECKSUM mode
-once CDC has caught up, or, for an exact start point, re-run the Full Load through
-Full load + CDC ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
+once CDC has caught up, or, for an exact start point, re-run the Full Load through Full
+load + CDC ([Chapter 3 §3.5](03-full-load.md#35-the-watermark--the-bridge-to-cdc)).
 
-CDC adds real moving parts (MSK, MSK Connect, the sink connector) and **ongoing
-cost while deployed**. Reach for it only when you genuinely need continuous
-replication; otherwise Full Load alone is simpler and cheaper.
+CDC adds real moving parts (MSK, MSK Connect, the sink connector) and **ongoing cost while
+deployed**. Reach for it only when you genuinely need continuous replication; otherwise
+Full Load alone is simpler and cheaper.
 
 ---
 
 ## 10.2 A recommended end-to-end flow
 
 1. **Connect** to source (read-only) and target (DSQL, IAM-token).
-2. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED**
-   item (no primary key, triggers, routines, PostgreSQL types with no DSQL equivalent) and decide each
-   **MANUAL** item (cascade FKs that CDC can't replicate, spatial types, FULLTEXT/SPATIAL indexes,
-   `ENUM`/`SET`, oversized LOB/JSON columns — check their sizes first, etc.).
-   *Don't skip this* — it's what turns "the load failed mysteriously" into "I knew
-   that object needed changing." It is also where you learn whether CDC is viable
-   at all: a source cascade (`ON DELETE/UPDATE CASCADE`) never reaches the binary
-   log, so CDC can't replicate it — the orphaned child rows it leaves then fail
-   Aurora DSQL's validation of that foreign key at cut over, which holds the cut over
-   until they are fixed (and the Validation orphan check reports them).
+2. **Evaluation** — read the compatibility report. Resolve every **UNSUPPORTED** item (no
+   primary key, triggers, routines, PostgreSQL types with no DSQL equivalent) and decide
+   each **MANUAL** item (cascade FKs that CDC can't replicate, spatial types,
+   FULLTEXT/SPATIAL indexes, `ENUM`/`SET`, oversized LOB/JSON columns — check their sizes
+   first, etc.). *Don't skip this* — it's what turns "the load failed mysteriously" into
+   "I knew that object needed changing." It is also where you learn whether CDC is viable
+   at all: a source cascade (`ON DELETE/UPDATE CASCADE`) never reaches the binary log, so
+   CDC can't replicate it — the orphaned child rows it leaves then fail Aurora DSQL's
+   validation of that foreign key at cut over, which holds the cut over until they are
+   fixed (and the Validation orphan check reports them).
 3. **Schema Conversion** — review the source-vs-converted DDL and apply it to DSQL.
 4. **Data Migration** — choose the migration type (**Full Load only**, **CDC only**, or
    **Full Load + CDC**) now that the report tells you what you are dealing with. Run the
-   prerequisite checks, then **Full Load** bulk-copies the rows and captures the
-   watermark (check the error log: quarantined rows are expected, e.g. oversized
-   values, or actionable). For a CDC type, deploy the streaming infrastructure from
-   the Prerequisites sub-step **before** starting the load, so its ~15–20 min create
-   overlaps the snapshot; then start **CDC** from that watermark and watch the target
-   converge.
-5. **Validation** — run row-count + checksum (+ reconcile before cut-over). The
-   verdict is **MATCH** only when every difference is explained (drift, intentional
-   quarantine, not-yet-converged CDC). For a CDC migration, tables with dead-lettered
-   CDC changes are also compared by CHECKSUM automatically.
-6. **Cut over** — once Validation is a clean MATCH (and, for CDC, the dead-letter
-   check in [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) and the source
-   schema re-check in [§5.7](05-validation.md#57-source-schema-changes-and-cut-over)
-   clear), switch
-   your application to DSQL. This is the one step the tool does not perform for you; follow the
-   tailored runbook (§10.3 below).
+   prerequisite checks, then **Full Load** bulk-copies the rows and captures the watermark
+   (check the error log: quarantined rows are expected, e.g. oversized values, or
+   actionable). For a CDC type, deploy the streaming infrastructure from the Prerequisites
+   sub-step **before** starting the load, so its ~15–20 min create overlaps the snapshot;
+   then start **CDC** from that watermark and watch the target converge.
+5. **Validation** — run row-count + checksum (+ reconcile before cut-over). The verdict is
+   **MATCH** only when every difference is explained (drift, intentional quarantine,
+   not-yet-converged CDC). For a CDC migration, tables with dead-lettered CDC changes are
+   also compared by CHECKSUM automatically.
+6. **Cut over** — once Validation is a clean MATCH (and, for CDC, the dead-letter check in
+   [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) and the source schema
+   re-check in [§5.7](05-validation.md#57-source-schema-changes-and-cut-over) clear),
+   switch your application to DSQL. This is the one step the tool does not perform for
+   you; follow the tailored runbook (§10.3 below).
 
 ---
 
 ## 10.3 The cut-over: switching your application to DSQL
 
-"Cut over" is the final workflow step and the moment your application stops using
-MySQL and starts using Aurora DSQL. It is the one step the tool does **not** do for
-you — it proves the target is correct and gives you a gapless replication stream,
-but *when* and *how* you repoint your application is an operational decision only
-you can make. The UI shows the matching runbook on the **Cut over** step once
-Validation is a clean MATCH (and, for CDC, the dead-letter check in
+"Cut over" is the final workflow step and the moment your application stops using MySQL
+and starts using Aurora DSQL. It is the one step the tool does **not** do for you — it
+proves the target is correct and gives you a gapless replication stream, but *when* and
+*how* you repoint your application is an operational decision only you can make. The UI
+shows the matching runbook on the **Cut over** step once Validation is a clean MATCH (and,
+for CDC, the dead-letter check in
 [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over) and the source schema re-check
 in [§5.7](05-validation.md#57-source-schema-changes-and-cut-over) clear); below is the
 same guidance for each path.
 
 ### Full Load only (a short maintenance freeze)
 
-Use this when a brief write-freeze is acceptable. There is no streaming, so the
-freeze lasts the length of the load + validation.
+Use this when a brief write-freeze is acceptable. There is no streaming, so the freeze
+lasts the length of the load + validation.
 
-1. **Freeze writes on the source** — put the application in maintenance / read-only
-   mode so no new rows are written to MySQL. (The tool keeps the source read-only;
-   *your application* is what must stop writing.)
+1. **Freeze writes on the source** — put the application in maintenance / read-only mode
+   so no new rows are written to MySQL. (The tool keeps the source read-only; *your
+   application* is what must stop writing.)
 2. **Re-run Full Load choosing "Drop & reload"** if the source took writes since the
    snapshot (the default *Append* only adds missing rows and applies no update or delete
    made since), then validate with CHECKSUM. A reload drops a table's foreign keys with
    it: click **Apply foreign keys** again on the Data Migration step (or on Cut over) —
    each key is added at once and enforces every new write, and Aurora DSQL validates the
    rows already loaded in the background.
-3. **Validation** — confirm a clean **MATCH** (the go/no-go gate). On a PostgreSQL
-   source, a sequence no column owns (Evaluation's `PG_STANDALONE_SEQUENCE`) is then
-   yours to move past the source's final value: the Cut over step lists each one under
-   *Before you repoint: move standalone sequences past the source*, with the read to run
-   on the source (`SELECT last_value, is_called FROM <seq>`) and the statement to run on
-   Aurora DSQL with the two values it returns
-   (`SELECT setval('<seq>', <last_value>, <is_called>)`).
-4. **Repoint the application** to the DSQL endpoint (PostgreSQL wire, IAM-token
-   auth — no password). Smoke-test the critical read/write paths.
+3. **Validation** — confirm a clean **MATCH** (the go/no-go gate). On a PostgreSQL source,
+   a sequence no column owns (Evaluation's `PG_STANDALONE_SEQUENCE`) is then yours to move
+   past the source's final value: the Cut over step lists each one under *Before you
+   repoint: move standalone sequences past the source*, with the read to run on the source
+   (`SELECT last_value, is_called FROM <seq>`) and the statement to run on Aurora DSQL
+   with the two values it returns (`SELECT setval('<seq>', <last_value>, <is_called>)`).
+4. **Repoint the application** to the DSQL endpoint (PostgreSQL wire, IAM-token auth — no
+   password). Smoke-test the critical read/write paths.
 5. **Lift the freeze** — the application is now live on DSQL.
 
 ### Full Load + CDC (near-zero-downtime)
 
-CDC keeps DSQL converging while the application keeps writing to MySQL, so the
-freeze shrinks to just the final drain + smoke test.
+CDC keeps DSQL converging while the application keeps writing to MySQL, so the freeze
+shrinks to just the final drain + smoke test.
 
 1. **Let CDC catch up** until replication lag is at/near zero.
 2. **Freeze writes on the source** (brief read-only / maintenance mode).
-3. **Wait for the final drain** — let CDC apply the last in-flight changes until
-   lag is zero again, and at least 5 minutes after the last source write: a change
-   waiting on a unique index is held that long before it is applied or dead-lettered,
-   and its lag can take a minute or two to show. MySQL and DSQL now hold the same rows.
-4. **Re-run Validation** for the final go/no-go; cut over only on a clean MATCH.
-   The final validation also **advances the sequence of every identity /
-   `AUTO_INCREMENT` key** the migration loaded past the rows CDC delivered — a table
-   left out of the run (its chip off under **Objects to validate**) included — and so
-   does the *Sync identity sequences* action on Cut over, so the application's first
-   insert after cut-over can't collide with a migrated id (`23505`). A migrated identity
-   table the action did not reach is named in a red notice (run it again), never shown
-   as done. A PostgreSQL sequence no column owns is not among them: Evaluation lists each
-   one (`PG_STANDALONE_SEQUENCE`), and the Cut over step names it under *Before you
-   repoint: move standalone sequences past the source*, with the read to run on the
-   source (`SELECT last_value, is_called FROM <seq>`) and the statement to run on Aurora
-   DSQL with the two values it returns
-   (`SELECT setval('<seq>', <last_value>, <is_called>)`), before repointing. The
-   acknowledgement line in the activity log records how many were left to you. Tables
-   with dead-lettered CDC changes are compared by CHECKSUM automatically, and Cut over
-   re-reads the dead-letter queue before it opens (see
-   [§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)). On a PostgreSQL source
-   with re-keyed tables, Cut over also re-reads their REPLICA IDENTITY before it opens
-   (see [§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)). Cut over
-   also re-reads the captured tables' definitions on the source before it opens (see
-   [§5.7](05-validation.md#57-source-schema-changes-and-cut-over)).
+3. **Wait for the final drain** — let CDC apply the last in-flight changes until lag is
+   zero again, and at least 5 minutes after the last source write: a change waiting on a
+   unique index is held that long before it is applied or dead-lettered, and its lag can
+   take a minute or two to show. MySQL and DSQL now hold the same rows.
+4. **Re-run Validation** for the final go/no-go; cut over only on a clean MATCH. Tables
+   with dead-lettered CDC changes are compared by CHECKSUM automatically, and before it
+   opens Cut over re-reads the dead-letter queue
+   ([§5.5](05-validation.md#55-cdc-dead-letters-and-cut-over)), the captured tables'
+   definitions on the source
+   ([§5.7](05-validation.md#57-source-schema-changes-and-cut-over)) and, on a PostgreSQL
+   source with re-keyed tables, their REPLICA IDENTITY
+   ([§5.6](05-validation.md#56-re-keyed-postgresql-tables-and-cut-over)).
+   - **Identity sequences are advanced for you.** The final validation, and the *Sync
+     identity sequences* action on Cut over, advance the sequence of every identity /
+     `AUTO_INCREMENT` key the migration loaded past the rows CDC delivered, so the
+     application's first insert after cut-over can't collide with a migrated id (`23505`).
+     A migrated identity table the action did not reach is named in a red notice (run it
+     again), never shown as done.
+   - **A PostgreSQL sequence no column owns is yours to move.** Evaluation lists each one
+     (`PG_STANDALONE_SEQUENCE`), and the Cut over step names it under *Before you repoint:
+     move standalone sequences past the source*, with the read to run on the source and
+     the `setval` statement to run on Aurora DSQL, as in step 3 of Full Load only above.
+     The acknowledgement line in the activity log records how many were left to you.
 5. **Apply foreign keys, then repoint the application** to the DSQL endpoint and
    smoke-test. Tick the drained attestation on Cut over and click **Apply foreign keys**:
-   each key is added at once (`NOT VALID`, seconds) and enforces every new write from
-   then on; Aurora DSQL then validates the rows already loaded in the background, and the
-   step shows how many keys it validated, with any failure's details, the rows that break
-   it and **Validate again**. **I've cut over** waits for the keys to be in place, not for
-   that check — except, for a MySQL source, a key with an `ON DELETE` / `ON UPDATE` action
-   or on a text column MySQL matches more loosely (a case-insensitive collation, or a PAD
-   SPACE one such as `utf8mb4_bin` on a `VARCHAR`), which CDC can leave orphans behind for:
-   Finish waits until those have validated, or until you choose to cut over without that
-   check. Finish waits for exactly the keys **Apply foreign keys** adds: a key of a table
-   outside the migration that is not on Aurora DSQL has nothing to add, so it is not waited
-   for. Finish trusts only a read of the keys taken after the latest validation, and a CDC
-   start or restart clears the last apply (the stream needs the keys gone), as does Start
-   CDC's **Remove foreign keys** even when CDC is then not started, so apply them again
-   after the final drain. Keys not in place and keys not validated are two holds, each
-   with its own choice: choosing to cut over without enforced keys does not also waive the
-   validation check of the keys in place, nor the other way round.
-6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** →
-   *Delete all CDC infrastructure*. It ends replication, stops MSK / MSK
-   Connect / NAT cost, and clears the old stack (a future fresh Full Load or CDC
-   needs it removed before it can deploy).
+   each key is added at once (`NOT VALID`, seconds) and enforces every new write from then
+   on; Aurora DSQL then validates the rows already loaded in the background, and the step
+   shows how many keys it validated, with any failure's details, the rows that break it
+   and **Validate again**.
+   - **I've cut over** waits for the keys to be in place, not for that check — except, for
+     a MySQL source, a key with an `ON DELETE` / `ON UPDATE` action or on a text column
+     MySQL matches more loosely (a case-insensitive collation, or a PAD SPACE one such as
+     `utf8mb4_bin` on a `VARCHAR`), which CDC can leave orphans behind for: Finish waits
+     until those have validated, or until you choose to cut over without that check.
+   - A CDC start or restart clears the last apply (the stream needs the keys gone), as
+     does Start CDC's **Remove foreign keys**, so apply the keys again after the final
+     drain. Keys not in place and keys not validated are two separate holds, each with its
+     own choice.
+6. **Tear the CDC pipeline down LAST** — click **Start over (top right)** → *Delete all
+   CDC infrastructure*. It ends replication, stops MSK / MSK Connect / NAT cost, and
+   clears the old stack (a future fresh Full Load or CDC needs it removed before it can
+   deploy).
 
 ### Rollback anchor
 
-Decide your rollback rule *before* you cut over. Until you've signed off on DSQL,
-keep the MySQL source **frozen (read-only), not dropped**. Before you repoint,
-rollback is trivial — the source is untouched and still authoritative. After the
-application writes to DSQL, those new rows live **only** on DSQL (this tool
-replicates MySQL → DSQL, **not** the reverse), so rolling back then means
-reconciling them yourself first.
+Decide your rollback rule *before* you cut over. Until you've signed off on DSQL, keep the
+MySQL source **frozen (read-only), not dropped**. Before you repoint, rollback is trivial
+— the source is untouched and still authoritative. After the application writes to DSQL,
+those new rows live **only** on DSQL (this tool replicates MySQL → DSQL, **not** the
+reverse), so rolling back then means reconciling them yourself first.
 
 ---
 
@@ -189,19 +179,17 @@ reconciling them yourself first.
 - **Source is read-only.** The tool never writes your MySQL source's data; its one
   statement beyond reads is the `FLUSH BINARY LOGS` a Full load + CDC run issues when the
   source does not run `gtid_mode=ON` (Chapter 3 §3.5).
-- **Loud over silent.** It refuses to corrupt data quietly — a value it can't
-  represent stops the table visibly; an incomplete load is never reported as
-  success.
+- **Loud over silent.** It refuses to corrupt data quietly — a value it can't represent
+  stops the table visibly; an incomplete load is never reported as success.
 - **Idempotent and resumable.** Re-running a Full Load batch or replaying CDC never
-  creates duplicates, and an interrupted load resumes only the unfinished work
-  (**Retry unfinished tables**). A fresh copy is a **Drop & reload**: a re-run's default
-  *Append* only adds the missing rows.
-- **Sound validation.** A "match" is reported only when the evidence (counts,
-  checksums, PK sets) supports it.
-- **Credentials stay in memory.** Never written to disk, logs, reports, or job
-  state.
-- **AI is advisory only.** Optional Bedrock suggestions are review-only and never
-  touch the data path.
+  creates duplicates, and an interrupted load resumes only the unfinished work (**Retry
+  unfinished tables**). A fresh copy is a **Drop & reload**: a re-run's default *Append*
+  only adds the missing rows.
+- **Sound validation.** A "match" is reported only when the evidence (counts, checksums,
+  PK sets) supports it.
+- **Credentials stay in memory.** Never written to disk, logs, reports, or job state.
+- **AI is advisory only.** Optional Bedrock suggestions are review-only and never touch
+  the data path.
 
 ---
 
@@ -211,11 +199,11 @@ reconciling them yourself first.
 - **Run a migration:** start at [Chapter 1 — Set up](01-setup.md).
 - **Architecture & AWS services:** the [top-level README](../../../README.md).
 - **Deploying on AWS:** [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md).
-- **The custom DSQL sink connector:** [`connectors/dsql-sink/`](../../../connectors/dsql-sink).
+- **The custom DSQL sink connector:**
+  [`connectors/dsql-sink/`](../../../connectors/dsql-sink).
 
-Migrating from Aurora MySQL to Aurora DSQL is a **heterogeneous** move — a
-different engine with different rules, not a version upgrade. This tool's job is
-to make those differences explicit up front (Evaluation), handle them
-deterministically where it can (Schema Conversion, Full Load, CDC), and prove the
-result (Validation) — so your cut-over is a decision backed by evidence, not a
-leap of faith.
+Migrating from Aurora MySQL to Aurora DSQL is a **heterogeneous** move — a different
+engine with different rules, not a version upgrade. This tool's job is to make those
+differences explicit up front (Evaluation), handle them deterministically where it can
+(Schema Conversion, Full Load, CDC), and prove the result (Validation) — so your cut-over
+is a decision backed by evidence, not a leap of faith.

@@ -1511,21 +1511,20 @@ def test_the_full_load_card_clears_after_a_clean_pass_that_left_an_absent_child_
 # ---------------------------------------------------------------------------
 
 
-def test_the_manual_names_pad_space_keys_the_listing_window_and_the_fresh_read() -> None:
+def test_the_manual_names_pad_space_keys() -> None:
+    # Chapter 2 is a user guide (2026-10-25): the listing window and the log placeholder are
+    # CHANGELOG detail; the cut-over wait on PAD SPACE keys is what a user meets.
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual"
     needles = {
         ("en", "02-evaluation-and-schema-conversion.md"): (
-            "PAD SPACE", "`utf8mb4_bin`", "the key window where the count found the first",
-            "`%(after_0)s`"),
-        ("en", "10-conclusion.md"): (
-            "PAD SPACE", "taken after the latest validation", "does not also waive"),
+            "PAD SPACE", "`utf8mb4_bin`"),
+        ("en", "10-conclusion.md"): ("PAD SPACE",),
         ("ko", "02-evaluation-and-schema-conversion.md"): (
-            "PAD SPACE", "`utf8mb4_bin`", "키 구간", "`%(after_0)s`"),
-        ("ko", "10-conclusion.md"): (
-            "PAD SPACE", "마지막 검증 이후에", "면제하지는 않습니다"),
+            "PAD SPACE", "`utf8mb4_bin`"),
+        ("ko", "10-conclusion.md"): ("PAD SPACE",),
         ("ja", "02-evaluation-and-schema-conversion.md"): (
-            "PAD SPACE", "`utf8mb4_bin`", "キーの範囲", "`%(after_0)s`"),
-        ("ja", "10-conclusion.md"): ("PAD SPACE", "最新の検証の後に", "免除しません"),
+            "PAD SPACE", "`utf8mb4_bin`"),
+        ("ja", "10-conclusion.md"): ("PAD SPACE",),
     }
     for (lang, name), phrases in needles.items():
         flat = " ".join((manual / lang / name).read_text(encoding="utf-8").split())
@@ -1536,13 +1535,12 @@ def test_the_manual_names_pad_space_keys_the_listing_window_and_the_fresh_read()
 def test_the_manual_says_finish_waits_for_the_pass_keys_in_two_holds() -> None:
     manual = Path(__file__).resolve().parents[1] / "docs" / "manual"
     needles = {
-        "en": ("waits for exactly the keys **Apply foreign keys** adds",
-               "**Remove foreign keys** even when CDC is then not started",
-               "two holds, each with its own choice"),
-        "ko": ("**Apply foreign keys**가 추가하는 키만 정확히 기다립니다",
-               "**Remove foreign keys**도 그 뒤 CDC를 시작하지 않더라도", "서로 다른 두 보류"),
-        "ja": ("**Apply foreign keys** が追加するキーだけを待ちます",
-               "**Remove foreign keys** もその後 CDC を開始しなくても", "別々の二つの保留"),
+        # (2026-10-28) The runbook keeps the two facts a user acts on: apply the keys again after
+        # the final drain (a CDC start and Start CDC's Remove foreign keys clear the last apply),
+        # and that keys not in place and keys not validated are two holds with a choice each.
+        "en": ("**Remove foreign keys**", "two separate holds, each with its own choice"),
+        "ko": ("**Remove foreign keys**", "서로 다른 두 보류이고 각각 따로 선택합니다"),
+        "ja": ("**Remove foreign keys**", "別々の二つの保留で、それぞれに別の選択があります"),
     }
     for lang, phrases in needles.items():
         flat = " ".join((manual / lang / "10-conclusion.md").read_text(encoding="utf-8").split())
@@ -1561,6 +1559,5 @@ def test_the_manual_says_how_a_key_you_add_or_rename_is_named() -> None:
         flat = " ".join(
             (manual / lang / "02-evaluation-and-schema-conversion.md").read_text(
                 encoding="utf-8").split())
-        for phrase in (header, "`FK_Orders_Cust`", "`fk_orders_cust`",
-                       "`<table>_<columns>_fkey`", "`orders_cid_fkey1`"):
+        for phrase in (header, "`FK_Orders_Cust`", "`fk_orders_cust`"):
             assert phrase in flat, (lang, phrase)

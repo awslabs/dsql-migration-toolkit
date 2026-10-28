@@ -168,15 +168,12 @@ def test_the_settings_caption_says_the_logins_own_is_marked() -> None:
 
 _MANUAL = Path(__file__).resolve().parents[1] / "docs" / "manual"
 _CLAIMS = {
-    "en": ("when its role has no `TimeZone` default of its own", "*the migration user*",
-           "or one the migration user's own `ALTER ROLE` default hides",
-           "gets an advisory item that names it"),
-    "ko": ("역할에 자기 `TimeZone` 기본값이 없는 새 세션", "*the migration user*",
-           "마이그레이션 사용자 자신의 `ALTER ROLE` 기본값이 가린 `TimeZone`",
-           "그 역할을 짚는 권고 항목이 나옵니다"),
-    "ja": ("ロールに独自の `TimeZone` 既定値がない新しいセッション", "*the migration user*",
-           "移行ユーザー自身の `ALTER ROLE` の既定値に隠された `TimeZone`",
-           "そのロールを示すアドバイザリー項目が出ます"),
+    # Chapter 2 is a user guide (2026-10-25): one sentence says which default is read.
+    "en": ("default `TimeZone`, including an `ALTER DATABASE` or `ALTER ROLE` default but not "
+           "the migration user's own",),
+    "ko": ("기본 `TimeZone`이며, `ALTER DATABASE`나 `ALTER ROLE` 기본값은 포함하지만 마이그레이션 "
+           "사용자 자신의 기본값은 포함하지 않습니다",),
+    "ja": ("`ALTER DATABASE` や `ALTER ROLE` の既定値を含みますが、移行ユーザー自身の既定値は含みません",),
 }
 
 
@@ -186,6 +183,8 @@ def test_the_manual_says_how_the_default_is_read(language: str) -> None:
         (_MANUAL / language / "02-evaluation-and-schema-conversion.md")
         .read_text(encoding="utf-8").split()
     )
-    evaluation = text.split("## 2.1", 1)[1].split("## 2.2", 1)[0]
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    evaluation = text.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + text.split("## 2.4", 1)[1]
     for claim in _CLAIMS[language]:
         assert " ".join(claim.split()) in evaluation, (language, claim)

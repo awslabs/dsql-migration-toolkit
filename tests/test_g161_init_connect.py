@@ -222,6 +222,9 @@ _MANUAL = Path(__file__).resolve().parents[1] / "docs" / "manual"
 @pytest.mark.parametrize("language", ["en", "ko", "ja"])
 def test_the_manual_says_init_connect_is_read(language: str) -> None:
     text = " ".join((_MANUAL / language / "02-evaluation-and-schema-conversion.md").read_text(encoding="utf-8").split())
-    section = text.split("## 2.1", 1)[1].split("### ", 1)[0]
-    assert section.count("`init_connect`") >= 3, language
-    assert "`CONNECTION_ADMIN`" in section and "`SUPER`" in section and "`ZERO_DATES`" in section
+    # Chapter 2 is a user guide (2026-10-25): it names the finding and what the user does;
+    # the implementation detail this test pinned lives in the CHANGELOG.
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    section = text.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + text.split("## 2.4", 1)[1]
+    assert "`init_connect`" in section and "`ZERO_DATES`" in section, language

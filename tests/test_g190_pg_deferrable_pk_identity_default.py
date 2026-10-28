@@ -61,10 +61,12 @@ def test_the_manual_qualifies_it_where_it_describes_the_key(language: str) -> No
         return " ".join((_MANUAL / language / name).read_text(encoding="utf-8").split())
 
     conversion = chapter("02-evaluation-and-schema-conversion.md")
-    evaluation = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0]
-    reference = conversion.split("## 2.3", 1)[1]
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    evaluation = conversion.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + conversion.split("## 2.4", 1)[1]
     limits = chapter("06-limitations.md").split("## 6.1", 1)[1].split("## 6.2", 1)[0]
-    for part, text in (("2.1", evaluation), ("2.3", reference), ("6.1", limits)):
+    # Section 2.3 is the type mapping since 2026-10-25; the key is described in 2.1 and 6.1.
+    for part, text in (("2.1", evaluation), ("6.1", limits)):
         assert any(
             "`REPLICA IDENTITY DEFAULT`" in after[:500]
             for after in text.split("`PG_DEFERRABLE_KEY`")[1:]

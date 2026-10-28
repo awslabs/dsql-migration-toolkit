@@ -59,19 +59,19 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 | # | 章 | 学べること |
 |---|---|---|
 | 0 | [Before you begin](00-before-you-begin.md) | 事前チェックリスト — 最初のステップから計画を左右する、必ず知っておくべき事実（同一リージョン限定、読み取り専用ソース — ただし PostgreSQL CDC の監査されるスロット／publication は例外、DSQL が省いている機能、CDC は任意・課金対象）。**ここから始めてください。** |
-| 1 | [Set up](01-setup.md) | 前提条件、ツールの実行方法（ローカルまたは AWS）、ソースとターゲットへの接続方法。 |
+| 1 | [Set up](01-setup.md) | 前提条件、ツールの実行方法（ローカルまたは AWS）、ソースとターゲットへの接続方法、CDC のためのソース準備。 |
 | 2 | [Evaluation and Schema Conversion](02-evaluation-and-schema-conversion.md) | DSQL に移せるもの／移せないものをツールがどう評価するか（AUTO / MANUAL / UNSUPPORTED、工数見積り、名前の衝突）と、スキーマの変換・適用。完全な **MySQL → DSQL および PostgreSQL → DSQL の型・制約リファレンス** を含みます（PostgreSQL リファレンスはほぼ同一で、DSQL が非対応の PG 型 — 配列、幾何（geometric）、ネットワーク、xml、money、bit/varbit、range/multirange、enum、composite、tsvector/tsquery、pgvector — は Evaluation と Schema Conversion で示します: 値を保持する代替型は MANUAL、代替型がなければ UNSUPPORTED）。 |
 | 3 | [Full Load](03-full-load.md) | バルクスナップショットロードの動作: ストリーミング export、冪等なバッチロード、ウォーターマーク（watermark）、そして失敗をどう隔離するか。 |
 | 4 | [CDC and DSQL constraints](04-cdc-and-dsql-constraints.md) | ストリーミング CDC の動作、隙間のない Full Load → CDC ハンドオフ、そして DSQL の制約（値あたり 1 MiB、OCC、IAM 認証、外部キー適用の延期）をデータ経路でどう扱うか。 |
 | 5 | [Validation](05-validation.md) | ターゲットがソースと一致することをツールがどう証明するか: 行数、チェックサム、PK 全体の突き合わせ、ライブソースのドリフト。 |
 | 6 | [Limitations](06-limitations.md) | 計画に必ず織り込むべき、実際に強制される制限（DSQL の制約、単一リージョン CDC、単一タスクのコントロールプレーン）。 |
-| 7 | [Performance and tuning](07-performance-and-tuning.md) | データ経路をこのように構築した理由（AWS に基づく根拠: OCC リトライ、ホットパーティションの PK、トランザクションの枠、非同期インデックス、IAM トークン）、Full Load / Validation / CDC の並列度をどうチューニングするか — ローカルおよび Fargate 上で — そして、その根拠を裏付ける再現可能な実測例。 |
-| 8 | [Testing — DSQL が要求するシナリオ](08-testing-and-verification.md) | Aurora DSQL の各特性が *否応なく* テストさせる移行シナリオ（トランザクション上限、OCC、値あたり 1 MiB、IAM トークン、非同期インデックス、強制される FK、隙間のないハンドオフ、ドリフト）と、ツールがそれぞれをどう検証するか — オフラインおよび実際の AWS 上で。 |
+| 7 | [Performance and tuning](07-performance-and-tuning.md) | Aurora DSQL に対してツールが代わりに行うこと（OCC リトライ、ホットパーティションの PK、トランザクションの枠、非同期インデックス、IAM トークン）、Full Load / Validation / CDC の並列度のチューニング — ローカルおよび Fargate 上で — そしてソースへの負荷を抑える方法。 |
+| 8 | [テストと検証](08-testing-and-verification.md) | あなたのデータで Aurora DSQL へ移すときに起こり得る状況（大きなテーブル、1 MiB の値、あいまいな型、OCC の競合、長いストリーム、隙間のないハンドオフ、ドリフト）ごとに、ツールが代わりに行うことと、その結果をどこで確認するか — そして意図的に厄介なデータで実際の AWS 上で得た 100% 一致の結果。 |
 | 9 | [Query Converter と AI DBA](09-query-validation.md) | 任意の Query Converter: 単一の MySQL クエリを Aurora DSQL へ変換し、ターゲット上で読み取り専用でテストし（`EXPLAIN` / `EXPLAIN ANALYZE` + DPU コスト）、**AI DBA** に DSQL の効率に合わせて書き直させ、再テストによって改善を証明します。 |
 | 10 | [Conclusion](10-conclusion.md) | どの経路をいつ使うか、推奨されるエンドツーエンドのフロー、次に進む先。 |
 | 11 | [Customer FAQ](11-customer-faq.md) | 顧客が最もよく尋ねる質問 — Full Load、CDC、制限、型マッピング、検証、カットオーバー／ロールバック、運用 — を、ツールの実際の動作に基づいて回答し、詳細へのリンクを添えています。 |
-| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | チューニングの根拠を裏付ける、実測の Full Load / Validation / CDC スループットの例と方法論。 |
-| 13 | [テーブルと列の除外](13-excluding-tables-and-columns.md) | **Exclude tables & columns** ルールポップアップ: ルール言語、除外できないもの、除外した列が Aurora DSQL で NULL になる仕組み、後から除外設定を変更する方法 (Change & reload)、CDC キャプチャリスト、Validation と Cut over、0.1.561 からのアップグレード。 |
+| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | 実測した Full Load と CDC のスループット — それを左右する要因、MySQL・PostgreSQL ソースでの約 1 TB の実行 — と、測定の再現方法。 |
+| 13 | [テーブルと列の除外](13-excluding-tables-and-columns.md) | **Exclude tables & columns** ルールポップアップ: ルール言語、除外できないもの、除外した列が Aurora DSQL で NULL になる仕組み、後から除外設定を変更する方法 (Change & reload)、CDC キャプチャリスト、Validation と Cut over。 |
 
 ## MySQL・PostgreSQL ユーザーへの Aurora DSQL についての注意
 

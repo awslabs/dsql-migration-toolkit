@@ -552,29 +552,20 @@ def test_the_settings_list_is_on_the_screen_and_not_in_the_downloaded_reports() 
 
 _MANUAL = Path(__file__).resolve().parents[1] / "docs" / "manual"
 _SAID = {
+    # Chapter 2 is a user guide (2026-10-25): how link names and CURDATE() are written is
+    # CHANGELOG detail; the manual keeps where the settings are shown.
     "en": (
         ("lists them on the Evaluation screen under the source object counts (**Source server "
          "settings**, collapsed; the downloaded reports leave the list out, though each item that "
          "grades a setting quotes its value)"),
-        "a MySQL `TIMESTAMP` one's `CURDATE()` the instant that zone's date begins",
-        ("A zone name that tzdata defines as a link — `US/Eastern` and `Asia/Calcutta`, among the "
-         "names the RDS and Aurora MySQL `time_zone` parameter offers, or `Japan` — is written as "
-         "the zone it links to (`America/New_York`, `Asia/Kolkata`, `Asia/Tokyo`)"),
-        "fails only when a row takes the default or the view is read",
     ),
     "ko": (
         ("읽은 설정은 Evaluation 화면의 소스 객체 수 아래(**Source server settings**, 접힌 상태)에 "
          "보여 줍니다(내려받는 리포트에는 이 목록이 들어가지 않으며"),
-        "MySQL `TIMESTAMP` 기본값의 `CURDATE()`는 그 시간대에서 그 날짜가 시작되는 시점",
-        ("은 링크가 가리키는 시간대(`America/New_York`, `Asia/Kolkata`, `Asia/Tokyo`)로 씁니다"),
-        "행이 그 기본값을 받거나 뷰를 읽을 때에야 실패합니다",
     ),
     "ja": (
         ("読み取った設定は、Evaluation 画面のソースオブジェクト数の下 (**Source server settings**、"
          "折りたたみ表示) に一覧されます (ダウンロードするレポートにはこの一覧は含まれませんが"),
-        "MySQL の `TIMESTAMP` のデフォルトの `CURDATE()` はそのタイムゾーンでその日付が始まる時点",
-        ("は、リンク先のタイムゾーン (`America/New_York`、`Asia/Kolkata`、`Asia/Tokyo`) として書き込みます"),
-        "行がそのデフォルトを受け取るときやビューを読むときに初めて失敗します",
     ),
 }
 _GONE = {
@@ -594,20 +585,3 @@ def test_the_manual_says_where_the_settings_are_and_how_links_and_curdate_are_wr
         assert " ".join(claim.split()) in section, (language, claim)
     assert _GONE[language] not in text, language
 
-
-_CONVERT_TZ_SAID = {
-    "en": ("`CONVERT_TZ` with a `+hh:mm` offset (a literal one, or one read from a column) or with a literal zone "
-           "name that tzdata defines as a link (`'US/Eastern'` written as `'America/New_York'`, the zone it links to)"),
-    "ko": ("`+hh:mm` 오프셋의 `CONVERT_TZ`(리터럴이든 컬럼에서 읽든)와 tzdata가 링크로 정의한 리터럴 시간대 이름을 링크가 "
-           "가리키는 시간대로 쓰는 `CONVERT_TZ`(`'US/Eastern'`은 `'America/New_York'`으로)"),
-    "ja": ("`+hh:mm` オフセットの `CONVERT_TZ` (リテラルでも列から読む値でも) と、tzdata がリンクとして定義するリテラルの"
-           "タイムゾーン名をリンク先のタイムゾーンとして書く `CONVERT_TZ` (`'US/Eastern'` は `'America/New_York'` として)"),
-}
-
-
-@pytest.mark.parametrize("language", ["en", "ko", "ja"])
-def test_the_manual_says_a_convert_tz_link_is_written_as_the_zone_it_links_to(language: str) -> None:
-    text = " ".join(
-        (_MANUAL / language / "02-evaluation-and-schema-conversion.md").read_text(encoding="utf-8").split()
-    )
-    assert " ".join(_CONVERT_TZ_SAID[language].split()) in text, language

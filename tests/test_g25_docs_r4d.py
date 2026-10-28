@@ -42,7 +42,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_g25_docs import _CDC_UI, _PAGE, LANGS, _flat, _function, _has, _page
+from tests.test_g25_docs import (
+    _CDC_UI,
+    _F43,
+    _PAGE,
+    LANGS,
+    _fact,
+    _flat,
+    _function,
+    _has,
+    _page,
+    _route_halves,
+    _section_43,
+    _steps_in_order,
+)
 from tests.test_g25_docs_r4 import _stale
 
 ROLLED_BACK = "UPDATE_ROLLBACK_COMPLETE"
@@ -105,23 +118,6 @@ def _watermark():
     )
 
 
-def _rolled_back_paragraph(lang: str) -> str:
-    """Chapter 4's paragraph on a Start CloudFormation rolled back, flattened."""
-    start = {
-        "en": "**After a Start that CloudFormation rolled back**",
-        "ko": "**CloudFormation이 Start를 롤백한 뒤**",
-        "ja": "**CloudFormation が Start をロールバックした後**",
-    }[lang]
-    end = {
-        "en": "Before a block offers **Re-snapshot every table instead**",
-        "ko": "차단이 **Re-snapshot every table instead**를 제시하기 전에",
-        "ja": "ブロックが **Re-snapshot every table instead** を提示する前に",
-    }[lang]
-    cdc = _page(lang, _PAGE["04"])
-    head = cdc.index(_flat(lang, start).strip())
-    return cdc[head : cdc.index(_flat(lang, end).strip(), head)]
-
-
 def _new_topics_first(lang: str, text: str) -> bool:
     """Every sentence of ``text`` that names Re-run Full Load names Delete CDC infrastructure
     before it: no route there re-runs the Full Load on the old topics."""
@@ -133,42 +129,10 @@ def _new_topics_first(lang: str, text: str) -> bool:
 
 # -- f6: every rollback status, and connectors MSK Connect lists, count as started -----------
 
-_STARTED = {
-    "en": (
-        "On a CDC stack's first Start — while the stack records no Start of its connectors, not "
-        "even one whose CloudFormation update rolled back, and MSK Connect lists none of its "
-        "connectors — Start CDC refuses to resume from a slot that is no longer at the Full "
-        "Load's start point",
-        "A stack whose connectors were started before — stopped since, with its connectors "
-        "still in place (as for Retry CDC; connectors of the stack that MSK Connect lists count "
-        "whatever the stack's status), or with a last Start whose CloudFormation update rolled "
-        "back (any `UPDATE_ROLLBACK_*` status: complete, in progress, failed or cleanup in "
-        "progress) — is never judged on the slot's position",
-        "The check reads only what the stack records and which of its connectors MSK Connect "
-        "lists, so a refused Start",
-    ),
-    "ko": (
-        "CDC 스택의 첫 Start(스택에 커넥터를 시작한 기록이 아직 없는 스택. CloudFormation 업데이트가 "
-        "롤백된 Start의 기록도 없고, MSK Connect에 그 스택의 커넥터도 없어야 함)에서는 슬롯이 더 이상 "
-        "Full Load의 시작 지점에 있지 않으면 Start CDC가 그 슬롯에서의 재개를 거부합니다",
-        "커넥터를 전에 시작한 스택 — 그 뒤 멈췄거나, Retry CDC처럼 커넥터가 그대로 있거나(MSK Connect에 "
-        "그 스택의 커넥터가 있으면 스택 상태와 상관없이 해당), 마지막 Start의 CloudFormation 업데이트가 "
-        "롤백된(완료, 진행 중, 실패, 정리 진행 중 등 모든 `UPDATE_ROLLBACK_*` 상태) 스택 — 은 슬롯 위치로 "
-        "판단하지 않습니다",
-        "이 검사는 스택이 기록한 것과 MSK Connect에 있는 그 스택의 커넥터만 읽으므로",
-    ),
-    "ja": (
-        "CDC スタックの最初の Start (スタックにコネクタを開始した記録がまだないスタック。CloudFormation "
-        "の更新がロールバックされた Start の記録もなく、MSK Connect にそのスタックのコネクタもないこと) "
-        "では、スロットがもう Full Load の開始位置にない場合、Start CDC はそのスロットからの再開を拒否します",
-        "以前にコネクタを開始したスタック — その後停止したスタック、Retry CDC のようにコネクタがそのまま"
-        "残っているスタック (MSK Connect にそのスタックのコネクタがあれば、スタックのステータスにかかわらず"
-        "該当)、最後の Start の CloudFormation の更新がロールバックされた (完了、進行中、失敗、クリーン"
-        "アップ進行中を含むすべての `UPDATE_ROLLBACK_*` ステータス) スタック — はスロットの位置で判定"
-        "されません",
-        "このチェックはスタックが記録しているものと、MSK Connect にあるそのスタックのコネクタだけを読むため",
-    ),
-}
+# §4.3 (answer-first) names the slot-position block by its title and says a restart, or a Start
+# after a rolled-back one, continues from the last recorded position (the slot's, on PostgreSQL).
+# Which stacks count as started -- every UPDATE_ROLLBACK_* status, and the connectors MSK Connect
+# lists -- is the code assertions above; the page keeps what the reader acts on.
 # The closing step's wording: one rollback status, and a record without the listed connectors.
 _STALE_STARTED = {
     "en": (
@@ -218,9 +182,9 @@ def test_every_rollback_status_and_a_listed_connector_count_as_started(lang: str
         stack_started=cu._pg_stack_started(listed),
     ) is None
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _STARTED[lang]:
-        assert _has(lang, cdc, phrase), (lang, phrase)
+    section = _section_43(lang)
+    assert _has(lang, section, f"*{pg.SLOT_POSITION_HEADER}*"), lang
+    assert _fact(lang, section, "restart-row") and _fact(lang, section, "pg-slot-position"), lang
     assert not _stale(lang, _STALE_STARTED[lang]), lang
 
 
@@ -229,22 +193,9 @@ def test_every_rollback_status_and_a_listed_connector_count_as_started(lang: str
 # G25 round 5: every stack whose connectors were started before -- a stopped one too, whose
 # topics may hold the sink's unapplied tail -- gets that one route, said in its own paragraph
 # (the rest of it: test_g25_docs_r5.py).
-_ONE_ROUTE = {
-    "en": "So on such a stack a block for a missing publication, a publication that misses a "
-    "selected table, or a missing, invalidated or unusable slot says so and names one route, new "
-    "topics first: Delete CDC infrastructure and deploy it again (the new stack starts with empty "
-    "topics), then Re-run Full Load with **Drop & reload** (it creates the slot again at its own "
-    "snapshot point), then Start CDC",
-    "ko": "그래서 그런 스택에서 publication이 없거나, publication에 선택한 테이블이 빠졌거나, 슬롯이 "
-    "없거나 무효화됐거나 쓸 수 없다는 차단은 그렇게 알리고 경로를 하나만, 새 토픽 먼저 알려 줍니다: Delete "
-    "CDC infrastructure 후 다시 배포(새 스택은 빈 토픽으로 시작), 그다음 Re-run Full Load를 **Drop & "
-    "reload**로(슬롯을 자신의 스냅샷 지점에 다시 만듦), 그다음 Start CDC",
-    "ja": "そのため、そのようなスタックでは、publication がない、publication に選択したテーブルが含まれ"
-    "ていない、スロットがない、無効化された、または使用できないというブロックはそう伝えて、方法を 1 つだけ、"
-    "新しいトピックを先に示します: Delete CDC infrastructure して再デプロイ (新しいスタックは空のトピック"
-    "で始まります)、次に **Drop & reload** で Re-run Full Load (スロットが自身のスナップショット位置に"
-    "作り直されます)、次に Start CDC",
-}
+# G25 round 5: every stack whose connectors were started before -- a stopped one too, whose
+# topics may hold the sink's unapplied tail -- gets that one route (the rest of it:
+# test_g25_docs_r5.py). §4.3 says it in the started half of its closing route paragraph.
 # Stale since round 5: a stopped stack's two routes, the one route said of a rolled-back stack
 # alone, and the lost slot's advice that only a stack whose Start rolled back needs new topics
 # before the Full Load re-run.
@@ -329,9 +280,12 @@ def test_a_rolled_back_stacks_route_takes_new_topics_before_any_full_load_rerun(
     assert "After a rolled-back Start:" not in guidance
     assert guidance.index(DELETE) < guidance.index(RERUN)
 
-    cdc = _page(lang, _PAGE["04"])
-    assert _has(lang, cdc, _ONE_ROUTE[lang]), lang
-    assert _new_topics_first(lang, _rolled_back_paragraph(lang)), lang
+    started = _route_halves(lang)[1]
+    assert _steps_in_order(
+        lang, started, "Delete CDC infrastructure", "Re-run Full Load", "Start CDC"
+    ), lang
+    assert _fact(lang, started, "topics-hold"), lang
+    assert _new_topics_first(lang, started), lang
     assert not _stale(lang, _STALE_ROUTES[lang]), lang
     # G25 round 5: stale since -- the stopped stack's two routes, the one route said of a
     # rolled-back stack alone, and the lost slot's advice that only a stack whose Start rolled
@@ -339,16 +293,8 @@ def test_a_rolled_back_stacks_route_takes_new_topics_before_any_full_load_rerun(
     assert not _stale(lang, _STALE_BY_STATE[lang]), lang
 
 
-_INHERITANCE_FIRST = {
-    "en": "For the same reason the inheritance block (*{header}*), whose own fix is a Full load + "
-    "CDC run, ends there by asking you to Delete CDC infrastructure and deploy it again before "
-    "that Full Load",
-    "ko": "같은 이유로 자체 해결책이 Full load + CDC 실행인 상속 차단(*{header}*)은 그런 스택에서 그 "
-    "Full Load 전에 Delete CDC infrastructure 후 다시 배포하라는 말로 끝납니다",
-    "ja": "同じ理由で、自身の解決策が Full load + CDC の実行である継承のブロック (*{header}*) は、"
-    "そのようなスタックでは、その Full Load の前に Delete CDC infrastructure して再デプロイするよう"
-    "求めて終わります",
-}
+# §4.3's inheritance row: its own fix is a Full load + CDC run, and on a stack whose connectors
+# were started before that run is told to follow Delete CDC infrastructure.
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -376,66 +322,19 @@ def test_a_rolled_back_inheritance_block_asks_for_new_topics_before_its_full_loa
     _block, refusal = pg._inheritance_snapshot_block((("app.par", 1, ("app.kid",)),))
     assert "a \"Full load + CDC\" run whose Full Load has finished" in refusal
 
-    phrase = _INHERITANCE_FIRST[lang].format(header=pg.INHERITANCE_SNAPSHOT_HEADER)
-    assert _has(lang, _page(lang, _PAGE["04"]), phrase), lang
+    section = _section_43(lang)
+    assert _has(lang, section, f"*{pg.INHERITANCE_SNAPSHOT_HEADER}*"), lang
+    assert _fact(lang, section, "inheritance-started-first"), lang
 
 
 # -- f2, f7, f5: the next Start continues from the recorded position, gapless only within the
 # -- topics' retention ------------------------------------------------------------------------
 
-_CONTINUES = {
-    "en": (
-        "**After a Start that CloudFormation rolled back**, the next Start continues from the "
-        "position that Start recorded, if it recorded one: its source connector may have "
-        "streamed, and committed its position, before the rollback deleted it, which is why such "
-        "a Start counts",
-        # G25 round 5: Debezium continues without a snapshot only from a recorded position
-        # whose initial snapshot had completed; the start-point card says so too.
-        "Otherwise, with `snapshot.mode=never`, it continues from the slot's confirmed position, "
-        "with no snapshot; with `initial` (Manual included), from where an earlier run stopped "
-        "streaming. With `initial`, though, Debezium continues without a snapshot only from a "
-        "recorded position whose initial snapshot had completed: if that Start (or the earlier "
-        "run) had not completed its initial snapshot, or nothing was recorded, it snapshots every "
-        "selected table first, then streams from the slot",
-        "So the Start CDC card (*{header}*), the start-point card above it (*Starting again after "
-        "a rolled-back Start*, which offers no start point or re-snapshot there) and the Start's "
-        "activity-log line say just that: with `initial`, they promise neither a snapshot nor "
-        "its absence",
-        "One case goes unchecked: on a stack whose first Start rolled back, a Start that sends "
-        "`snapshot.mode=initial` does not check that the slot exists",
-    ),
-    "ko": (
-        "**CloudFormation이 Start를 롤백한 뒤**에는 그 Start가 위치를 기록했다면 다음 Start가 그 위치에서 "
-        "이어 갑니다: 그 소스 커넥터가 롤백으로 삭제되기 전에 스트리밍하고 위치를 커밋했을 수 있으며, "
-        "그래서 그런 Start도 시작한 것으로 칩니다",
-        "기록하지 않았다면 `snapshot.mode=never`에서는 슬롯의 확정된 위치에서 스냅샷 없이 이어 가고, "
-        "`initial`(Manual 포함)에서는 이전 실행이 스트리밍을 멈춘 곳에서 이어 갑니다. 다만 `initial`에서 "
-        "Debezium이 스냅샷 없이 이어 가는 것은 초기 스냅샷을 끝낸, 기록된 위치에서뿐입니다: 그 Start(또는 "
-        "이전 실행)가 초기 스냅샷을 끝내지 못했거나 기록된 것이 없으면, 먼저 선택한 모든 테이블을 스냅샷한 "
-        "뒤 슬롯에서 스트리밍합니다",
-        "그래서 Start CDC 카드(*{header}*), 그 위의 시작 지점 카드(*Starting again after a rolled-back "
-        "Start*. 그곳에서는 시작 지점도 다시 스냅샷도 제시하지 않음), 그 Start의 활동 로그 줄은 바로 그렇게 "
-        "말하며, `initial`에서는 스냅샷도, 스냅샷이 없다는 것도 약속하지 않습니다",
-        "검사하지 않는 경우가 하나 있습니다: 첫 Start가 롤백된 스택에서 `snapshot.mode=initial`을 보내는 "
-        "Start는 슬롯이 있는지 확인하지 않습니다",
-    ),
-    "ja": (
-        "**CloudFormation が Start をロールバックした後** は、その Start が位置を記録していれば、次の "
-        "Start はその位置から続けます: その source connector がロールバックで削除される前にストリーミング"
-        "して位置をコミットした可能性があり、そのためそのような Start も開始したものとして扱います",
-        "記録していなければ、`snapshot.mode=never` ではスロットの確定済みの位置からスナップショットなしで"
-        "続け、`initial` (Manual を含む) では以前の実行がストリーミングを止めたところから続けます。ただし "
-        "`initial` で Debezium がスナップショットなしで続けるのは、初期スナップショットを完了した、記録"
-        "された位置からだけです: その Start (または以前の実行) が初期スナップショットを完了していなかったか、"
-        "何も記録されていなければ、先に選択したすべてのテーブルをスナップショットしてから、スロットから"
-        "ストリーミングします",
-        "そのため、Start CDC のカード (*{header}*)、その上の開始位置のカード (*Starting again after a "
-        "rolled-back Start*。そこでは開始位置も再スナップショットも提示しません)、その Start のアクティビティ"
-        "ログの行はまさにそう述べ、`initial` ではスナップショットも、スナップショットがないことも約束しません",
-        "チェックされないケースが 1 つあります: 最初の Start がロールバックされたスタックで "
-        "`snapshot.mode=initial` を送る Start は、スロットが存在するかを確認しません",
-    ),
-}
+# §4.3 keeps the user-visible half: a restart (or a Start after a rolled-back one) continues from
+# the last recorded position, and a source connector that never completed its snapshot snapshots
+# every selected table again. The cards' titles, what each promises and the one unchecked case
+# (a first Start that rolled back and sent snapshot.mode=initial does not check the slot) are in
+# the UI; the old wording stays pinned as stale below.
 # Stale since round 5: a snapshot "only if no position was ever recorded" (Debezium also
 # snapshots again from a position whose initial snapshot had not completed), and the card and
 # line that "promise no snapshot" with nothing said of the start-point card.
@@ -454,34 +353,6 @@ _STALE_CONTINUES_R4 = {
         "スナップショットします",
         "そのため、Start CDC のカード (*{header}*) とその Start のアクティビティログの行はスナップショット"
         "を約束しません",
-    ),
-}
-_RETENTION = {
-    "en": (
-        "The changes that Start streamed exist only in the CDC topics, which outlive the "
-        "rollback, and the next sink applies them from there: starting CDC again is gapless "
-        "only while the topics still retain them, which Start CDC does not check",
-        "Once their retention period on MSK has passed since that Start, use Delete CDC "
-        "infrastructure and deploy it again, then Re-run Full Load with **Drop & reload**, then "
-        "Start CDC (with CDC only, Delete CDC infrastructure and deploy it again: its first Start "
-        "CDC snapshots every selected table)",
-    ),
-    "ko": (
-        "그 Start가 스트리밍한 변경은 롤백 뒤에도 남는 CDC 토픽에만 있고 다음 싱크가 거기서 적용하므로, "
-        "CDC를 다시 시작해도 빈틈이 없는 것은 토픽이 그 변경을 아직 보존하는 동안뿐이며, Start CDC는 이를 "
-        "확인하지 않습니다",
-        "그 Start 뒤로 MSK에서 토픽의 보존 기간이 지났다면 Delete CDC infrastructure 후 다시 배포하고, "
-        "Re-run Full Load를 **Drop & reload**로 실행한 뒤 Start CDC 하세요(CDC only에서는 Delete CDC "
-        "infrastructure 후 다시 배포: 그 첫 Start CDC가 선택한 모든 테이블을 스냅샷합니다)",
-    ),
-    "ja": (
-        "その Start がストリーミングした変更は、ロールバック後も残る CDC トピックにしかなく、次の sink が"
-        "そこから適用するため、CDC を再び開始してギャップがないのはトピックがまだその変更を保持している間"
-        "だけで、Start CDC はそれを確認しません",
-        "その Start の後 MSK でトピックの保持期間が過ぎた場合は、Delete CDC infrastructure して再デプロイ"
-        "し、**Drop & reload** で Re-run Full Load してから Start CDC してください (CDC only では Delete "
-        "CDC infrastructure して再デプロイ: その最初の Start CDC が選択したすべてのテーブルをスナップ"
-        "ショットします)",
     ),
 }
 # The closing step's wording: an unconditional "no gap", and a Start that "snapshots".
@@ -543,9 +414,9 @@ def test_a_rolled_back_stacks_card_and_start_line_promise_no_snapshot(
     assert _gate(monkeypatch, "UPDATE_COMPLETE", verdict=None, committed=True,
                  force_initial=True)[2] == [True]  # a stopped stack's slot is read
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _CONTINUES[lang]:
-        assert _has(lang, cdc, phrase.format(header=header)), (lang, phrase)
+    section = _section_43(lang)
+    assert _fact(lang, section, "restart-row") and _fact(lang, section, "pg-slot-position"), lang
+    assert _fact(lang, section, "mid-snapshot"), lang
     assert not _stale(lang, _STALE_CONTINUES[lang]), lang
     # G25 round 5: stale since -- a snapshot "only if no position was ever recorded" (Debezium
     # also snapshots again from a position whose initial snapshot had not completed).
@@ -582,10 +453,13 @@ def test_a_retry_after_a_rollback_is_gapless_only_while_the_topics_retain_its_ch
     assert "a retry is gapless only while the topics still retain them" in doc
     assert "a retry is gapless." not in doc
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _RETENTION[lang]:
-        assert _has(lang, cdc, phrase), (lang, phrase)
-    assert _new_topics_first(lang, _rolled_back_paragraph(lang)), lang
+    section = _section_43(lang)
+    assert _fact(lang, section, "gapless-while-retained"), lang
+    assert _steps_in_order(
+        lang, section, _F43["restart-row"][lang], "Delete CDC infrastructure", "Re-run Full Load",
+        "Start CDC", _F43["restart-cdc-only"][lang],
+    ), lang
+    assert _new_topics_first(lang, _route_halves(lang)[1]), lang
 
 
 # -- f1: a withheld re-snapshot names the route that does work -------------------------------
@@ -593,23 +467,11 @@ def test_a_retry_after_a_rollback_is_gapless_only_while_the_topics_retain_its_ch
 # G25 round 5: the route named after that refusal is the one that works for it -- after an
 # inheritance refusal a Full Load re-run (with CDC only, after a switch to Full load + CDC); the
 # rest of the route rule's cases: test_g25_docs_r5.py.
+# Chapter 13 keeps this sentence. §4.3 (answer-first) names the withheld re-snapshot by the notice
+# the dialog shows (*Re-snapshot every table is not offered here: …*) and gives the refusal's own
+# fix in the blocked-Start table: for an inheritance parent, a Full Load re-run (with CDC only,
+# after the type switch) or unticking the parent.
 _WITHHELD = {
-    "04": {
-        "en": "introduced by *{lead}* It then names the route that works there. After an "
-        "inheritance refusal (or a failed read of them), that is Re-run Full Load with **Drop & "
-        "reload** instead, which creates the slot again at its own snapshot point, so the Start "
-        "CDC after it takes no snapshot; with CDC only, which has no Full Load step, switch the "
-        "migration type to Full load + CDC first",
-        "ko": "*{lead}*로 시작해 보여 줍니다. 그 뒤에는 그곳에서 통하는 경로를 알려 줍니다. 상속 때문에(또는 "
-        "그 읽기에 실패해) 거부되었다면 대신 Re-run Full Load를 **Drop & reload**로 실행하세요. 슬롯을 "
-        "자신의 스냅샷 지점에 다시 만들므로 그 뒤의 Start CDC는 스냅샷하지 않습니다(Full Load 단계가 없는 "
-        "CDC only에서는 먼저 마이그레이션 유형을 Full load + CDC로 바꿈)",
-        "ja": "*{lead}* という前置きに続けて表示します。その後に、そこで使える方法を示します。継承のため "
-        "(またはその読み取りに失敗したため) の拒否なら、代わりに **Drop & reload** で Re-run Full Load "
-        "してください。スロットが自身のスナップショット位置に作り直されるため、その後の Start CDC は"
-        "スナップショットしません (Full Load ステップのない CDC only では、先にマイグレーションの種類を "
-        "Full load + CDC に切り替えます)",
-    },
     "13": {
         "en": "otherwise the dialog shows that Start's refusal (for example for a captured table "
         "with inheritance child tables; see [§4.3](04-cdc-and-dsql-constraints.md)) and then the "
@@ -671,39 +533,19 @@ def test_a_withheld_re_snapshot_names_the_full_load_rerun(lang: str) -> None:
     # Only a stack whose connectors were never started is offered (or refused) the remedy.
     assert "and _pg_stack_started(" in dialog
 
-    assert _has(lang, _page(lang, _PAGE["04"]), _WITHHELD["04"][lang].format(lead=lead)), lang
+    section = _section_43(lang)
+    assert _has(lang, section, f"*{lead}*"), lang
+    assert _fact(lang, section, "inheritance-rerun") and _fact(lang, section, "cdc-only-switch"), lang
     assert _has(lang, _page(lang, _PAGE["13"]), _WITHHELD["13"][lang]), lang
     assert not _stale(lang, _STALE_WITHHELD[lang]), lang
 
 
 # -- f3: a failed read of the re-snapshot route's own checks is reported as that -------------
 
-_NOT_CHECKED = {
-    "en": (
-        "If those checks cannot read the source, the remedy stays, and the dialog warns "
-        "*{header}*; the activity log records *{action}* (WARNING)",
-        "The publication and slot checks did run then, and the Start CDC job runs the "
-        "re-snapshot's own checks before it creates any connector (it goes ahead without them if "
-        "it cannot read the source either)",
-        "*{checks}* is shown only when the publication and slot checks themselves cannot read the "
-        "source (above)",
-    ),
-    "ko": (
-        "그 검사가 소스를 읽지 못하면 그 방법은 그대로 남고, 대화 상자가 *{header}* 경고를 보여 줍니다. "
-        "활동 로그는 *{action}*(WARNING)을 기록합니다",
-        "이때 publication과 슬롯 검사는 실행되었고, Start CDC 작업이 커넥터를 만들기 전에 다시 스냅샷하는 "
-        "Start의 검사를 실행합니다(그 작업도 소스를 읽지 못하면 그 검사 없이 진행)",
-        "*{checks}*는 publication과 슬롯 검사 자체가 소스를 읽지 못할 때만 보입니다(위)",
-    ),
-    "ja": (
-        "それらのチェックがソースを読めない場合、その方法は残り、ダイアログが *{header}* という警告を表示"
-        "します。アクティビティログは *{action}* (WARNING) を記録します",
-        "このとき publication とスロットのチェックは実行されており、Start CDC のジョブがコネクタを作成する"
-        "前に、再スナップショットする Start のチェックを実行します (そのジョブもソースを読めなければ、"
-        "それらのチェックなしで進みます)",
-        "*{checks}* は、publication とスロットのチェック自体がソースを読めない場合にだけ表示されます (上記)",
-    ),
-}
+# §4.3 no longer spells out the warning for a failed read of the re-snapshot route's OWN checks
+# (*The re-snapshot route could not be checked*) or its activity-log line: they are shown by the
+# dialog when the read fails. It keeps the publication and slot checks' notice, and the old
+# wording (which blamed that notice for the re-snapshot's read) stays pinned as stale below.
 # The closing step's wording: the publication and slot notice for the re-snapshot's own read.
 _STALE_NOT_CHECKED = {
     "en": ("the remedy stays, and the dialog warns *CDC's publication and replication slot could "
@@ -738,8 +580,5 @@ def test_a_failed_re_snapshot_check_read_is_reported_as_that(lang: str) -> None:
     assert "PG_RESNAPSHOT_NOT_CHECKED_ACTION," in dialog
     assert "if pg_unread and not conn_blocker:" in dialog
 
-    cdc = _page(lang, _PAGE["04"])
-    for phrase in _NOT_CHECKED[lang]:
-        phrase = phrase.format(header=header, action=action, checks=checks)
-        assert _has(lang, cdc, phrase), (lang, phrase)
+    assert _has(lang, _section_43(lang), f"*{checks}*"), lang
     assert not _stale(lang, _STALE_NOT_CHECKED[lang]), lang

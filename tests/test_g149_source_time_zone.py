@@ -909,14 +909,15 @@ def test_the_manual_no_longer_says_a_datetime_is_normalized_to_utc(language: str
 @pytest.mark.parametrize("language", ["en", "ko", "ja"])
 def test_the_manual_says_what_the_conversion_writes_in_the_source_zone(language: str) -> None:
     chapter = _chapter(language, "02-evaluation-and-schema-conversion.md")
-    section = chapter.split("## 2.1", 1)[1].split("### ", 1)[0]
+    # Chapter 2 is a user guide (2026-10-25): it names the finding and what the user does;
+    # the implementation detail this test pinned lives in the CHANGELOG.
+    # 2.4 is chapter 2's findings reference (the rule catalogue 2.1 points to), so
+    # Evaluation's text is 2.1 plus 2.4.
+    section = chapter.split("## 2.1", 1)[1].split("## 2.2", 1)[0] + chapter.split("## 2.4", 1)[1]
     assert f"`{SOURCE_TIME_ZONE_RULE_ID}`" in section
     for spelled in (
         "`DEFAULT (now() AT TIME ZONE 'Asia/Seoul')`",
-        "`(now() AT TIME ZONE 'UTC') + INTERVAL '+09:00'`",
         "`SET TIME ZONE 'Asia/Seoul'`",
-        "`SYSDATE()`",
-        "`system_time_zone`",
         "`TimeZone`",
     ):
         assert spelled in section, (language, spelled)

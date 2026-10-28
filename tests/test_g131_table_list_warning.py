@@ -613,4 +613,7 @@ def test_the_manual_names_both_headers_of_the_full_load_warning(lang) -> None:
 
     for header in (CDC_TABLE_LIST_HEADER, CDC_TABLE_LIST_WORST_CASE_HEADER):
         assert f"*{header}*" in _FULL_LOAD_WARNING_HEADERS[lang], (lang, header)
-    assert _has(lang, _page(lang, "06-limitations.md"), _FULL_LOAD_WARNING_HEADERS[lang]), lang
+    # 2026-10-26: 6.2 names both headers without the partition-map mechanism behind the "Possibly" one.
+    page = _page(lang, "06-limitations.md")
+    for header in ("Too many tables for one CDC pipeline", "Possibly too many tables for one CDC pipeline"):
+        assert _has(lang, page, f"*{header}*"), (lang, header)
