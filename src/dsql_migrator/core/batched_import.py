@@ -2670,8 +2670,18 @@ def _estimate_row_bytes(row: Mapping[str, object]) -> int:
     """
     total = 0
     for value in row.values():
-        if value is None:
+        # Exact-type fast paths first (the common column types, no isinstance chain; an
+        # ASCII str is its own byte length and ``isascii`` is O(1)); the rest -- subclasses,
+        # bool, Decimal, datetime -- take the general branches, so the integer is unchanged.
+        kind = type(value)
+        if kind is str:
+            total += len(value) if value.isascii() else len(value.encode("utf-8"))
+        elif kind is int or kind is float:
+            total += len(str(value))
+        elif value is None:
             total += 1
+        elif kind is bytes:
+            total += len(value)
         elif isinstance(value, (bytes, bytearray, memoryview)):
             total += len(value)
         elif isinstance(value, str):

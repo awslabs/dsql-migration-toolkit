@@ -1662,11 +1662,12 @@ def _render_tuning_group_controls(group: str) -> None:
             ui,
             tone="info",
             header=(
-                f"In flight: at most {_range_in_flight()} batches per key range, "
-                f"Batches per table per table, {_run_in_flight_budget()} per run"
+                f"Batches in flight are capped at {_range_in_flight()} per key range "
+                f"and {_run_in_flight_budget()} per run"
             ),
             body=(
-                "Each batch in flight holds one Aurora DSQL connection. A key range of an "
+                "Each batch in flight holds one Aurora DSQL connection; a table also never "
+                "exceeds its Batches per table setting. A key range of an "
                 "Aurora DSQL table takes about 10 commits a second, so more batches only "
                 "wait there (higher commit latency and cost); the tool caps them. Tables "
                 "in parallel is how many tables, or parts of a large table, load at once."

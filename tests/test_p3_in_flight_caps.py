@@ -694,16 +694,16 @@ def test_the_settings_notice_names_the_caps_the_loader_applies(monkeypatch) -> N
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
     blob = " ".join(ui.texts)
-    assert ("In flight: at most 4 batches per key range, Batches per table per table, "
-            "128 per run") in blob
+    assert ("Batches in flight are capped at 4 per key range "
+            "and 128 per run") in blob
     assert "A key range of an Aurora DSQL table takes about 10 commits a second" in blob
     # The seams (one-image A/Bs) are what the loader applies, so the notice follows them.
     monkeypatch.setenv(_RANGE_SEAM, "8")
     monkeypatch.setenv(_BUDGET_SEAM, "64")
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
-    assert ("In flight: at most 8 batches per key range, Batches per table per table, "
-            "64 per run") in " ".join(ui.texts)
+    assert ("Batches in flight are capped at 8 per key range "
+            "and 64 per run") in " ".join(ui.texts)
 
 
 def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:

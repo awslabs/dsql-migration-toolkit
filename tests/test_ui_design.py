@@ -1095,9 +1095,9 @@ def test_full_load_tab_shows_ranges_and_the_in_flight_notice(monkeypatch) -> Non
     assert "Changes apply to the next run." in blob
     # How many batches (and so Aurora DSQL connections) a run keeps in flight: capped by the
     # tool (P3), no longer the product of the two parallelism knobs.
-    assert ("In flight: at most 4 batches per key range, Batches per table per table, "
-            "128 per run") in blob
-    assert "Each batch in flight holds one Aurora DSQL connection." in blob
+    assert ("Batches in flight are capped at 4 per key range "
+            "and 128 per run") in blob
+    assert "Each batch in flight holds one Aurora DSQL connection;" in blob
     assert "Tables in parallel is how many tables, or parts of a large table" in blob
     assert "Connections ≈" not in blob
     # Range-valued knobs stay numeric inputs, with their bounds shown as constraints.
