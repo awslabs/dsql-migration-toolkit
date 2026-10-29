@@ -239,10 +239,10 @@ Set the Full Load and Validation variables in the task definition's container
 redeploy. The CDC settings are passed when the tool deploys the cdc-stack.
 
 > **Retune between runs without redeploying.** Open **Settings** (sidebar footer) and go
-> to the **Full Load / Validation** tab: the loader and validator re-read the config on
-> every run, so a value set there applies to the **next** run immediately. It is app-wide
-> and resets on restart, so put the values you want to keep in the task definition and use
-> **Settings** to experiment.
+> to its **Full Load** or **Validation** tab: the loader and validator re-read the config
+> on every run, so a value set there applies to the **next** run immediately. It is
+> app-wide and resets on restart, so put the values you want to keep in the task
+> definition and use **Settings** to experiment.
 
 Size the task for the load, and set *Tables in parallel* to its vCPU count: each table,
 or part of a large table, that loads at once is one worker process. **Memory is a hard
@@ -468,10 +468,10 @@ The knobs above are also editable **in the UI** without a restart: the **Setting
   - **CDC**: *Sink compute (MCU)*;
   - **Validation**: *Tables in parallel*.
 - an **Activity log** tab — everything about the one activity/audit log in one place: set
-  the app **log level** (DEBUG / INFO / WARNING / ERROR), toggle **"Mirror to CloudWatch
-  Logs"** so the log is also streamed to the container's stdout (forwarded to CloudWatch
-  on ECS — a durable copy that survives task replacement), and **download** the session's
-  activity log (the same feed the AI DBA reads).
+  the app **log level** (DEBUG / INFO), toggle **"Mirror to CloudWatch Logs"** so the log
+  is also streamed to the container's stdout (forwarded to CloudWatch on ECS — a durable
+  copy that survives task replacement), and **download** the session's activity log (the
+  same feed the AI DBA reads).
 
 Changes made in the dialog **revert on restart**; to persist one, set its
 `DSQL_MIGRATOR_*` environment variable (listed in §7.2) instead.

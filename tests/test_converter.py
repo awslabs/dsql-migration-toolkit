@@ -1540,8 +1540,9 @@ def _table_with_key_widths(
 
 def test_index_over_eight_columns_is_not_emitted() -> None:
     # DSQL caps a key at 8 columns (error 54011); MySQL allows 16. Emitting a
-    # 9+-column CREATE INDEX ASYNC would guarantee a failure AFTER Full Load wrote
-    # every row, so the converter must leave it out of the applied script.
+    # 9+-column CREATE INDEX ASYNC would guarantee a failure where the indexes are
+    # created (at apply, on the empty table), so the converter must leave it out of the
+    # applied script.
     conversion = _convert_table(_table_with_key_widths(index_widths=(8, 9)))
     ddl = " ".join(conversion.index_ddls)
     assert "ix_1" in ddl  # exactly 8 columns -> still emitted
@@ -1558,6 +1559,11 @@ def test_skipped_wide_index_is_reported_as_a_loss() -> None:
     assert "ix_1 (12 columns)" in warning.message
     assert "NOT emitted" in warning.message
     assert "MySQL allows 16" in warning.message
+    # Why it is left out, in the current index order: the indexes are normally created on
+    # the empty table at apply -- not after every row was written.
+    assert ("wherever the indexes are created, normally on the empty table at apply"
+            in warning.message)
+    assert "already written" not in warning.message
 
 
 def test_primary_key_over_eight_columns_is_unsupported() -> None:
@@ -1609,7 +1615,8 @@ def test_index_budget_ignores_indexes_the_converter_skips() -> None:
 
 def test_over_budget_secondary_indexes_are_capped_and_named() -> None:
     # FIX 7: DSQL allows 24 indexes per table INCLUDING the PK, so at most 23 secondary
-    # indexes; the 24th+ CREATE INDEX ASYNC fails 54000 after the load. The excess is now
+    # indexes; the 24th+ CREATE INDEX ASYNC fails 54000 where the indexes are created (at
+    # apply, on the empty table). The excess is now
     # OMITTED (keeping the applied script runnable) and the omitted names are listed in the
     # MANUAL/LOSS budget warning (consistent with the >8-column omit policy).
     from dsql_migrator.core.converter import _too_many_indexes_warning
@@ -1737,6 +1744,11 @@ def test_wide_secondary_index_key_size_is_flagged_and_named() -> None:
     # The PK itself is a 4-byte int, so it must not be listed as at risk (the phrase
     # "a primary key" appears in the shared explanation, hence the specific form).
     assert "the primary key (" not in warning.message
+    # Where an over-long index value fails: its row's INSERT, since the secondary indexes
+    # are created before the rows load -- not a post-load index build.
+    assert "a primary-key or index value during Full Load/CDC" in warning.message
+    assert "the secondary indexes are on the table before its rows load" in warning.message
+    assert "post-load" not in warning.message
 
 
 def test_key_size_note_is_a_recommendation_not_a_block() -> None:

@@ -1206,10 +1206,12 @@ def test_too_many_indexes_budget_reserves_one_slot_for_the_primary_key() -> None
     assert finding.rule_id == "TOO_MANY_INDEXES"
 
 
-def test_too_many_indexes_explains_the_post_load_failure_timing() -> None:
-    # The whole point of catching this at planning time: secondary indexes are built
-    # by post-load CREATE INDEX ASYNC, so the limit is hit only AFTER Full Load has
-    # written every row -- and a re-run cannot fix it.
+def test_too_many_indexes_explains_where_the_indexes_are_created() -> None:
+    # Caught at planning time so the operator picks which indexes to keep: the error the
+    # over-budget ones would hit lands where the indexes are created, normally on the empty
+    # table -- Schema Conversion's apply, or a Drop & reload's recreated table before its
+    # rows load (P4d); after the data only an index the Full Load did not get to before the
+    # rows (P4a) -- and a re-run cannot fix it.
     from dsql_migrator.core.assessor import TooManyIndexesRule
 
     (finding,) = TooManyIndexesRule().evaluate(
@@ -1224,9 +1226,15 @@ def test_too_many_indexes_explains_the_post_load_failure_timing() -> None:
     # cite a MySQL-specific limit or the MySQL-only sys.schema_unused_indexes view.
     assert "MySQL" not in finding.risk
     assert "sys.schema_unused_indexes" not in finding.recommendation
-    # The error the user would otherwise hit, and WHEN.
+    # The error the user would otherwise hit, and WHERE the indexes are created now.
     assert "54000" in finding.risk
-    assert "after the data loads" in finding.risk.lower() or "already written" in finding.risk.lower()
+    assert ("wherever the indexes are created, normally on the empty table at Schema "
+            "Conversion's apply or before a Drop & reload loads its rows") in finding.risk
+    # Not the old order, in which every index came after Full Load had written every row,
+    # nor one that ties the after-the-data case to a single kind of table (P4a also takes
+    # submissions a Stop cut short and tables an earlier run left owing their indexes).
+    assert "already written" not in finding.risk.lower()
+    assert "partway through" not in finding.risk
     # Actionable: how many to remove, where to look, and that re-running won't help.
     assert "23 secondary indexes" in finding.recommendation
     assert "unused" in finding.recommendation.lower()
@@ -1318,9 +1326,11 @@ def test_wide_primary_key_is_unsupported_because_nothing_loads() -> None:
     assert "not transient" in finding.recommendation.lower()
 
 
-def test_wide_secondary_index_is_manual_and_names_the_post_load_timing() -> None:
-    # Data still loads; only the index fails -- and it fails AFTER Full Load, since
-    # secondary indexes are built by post-load CREATE INDEX ASYNC.
+def test_wide_secondary_index_is_manual_and_names_where_it_would_fail() -> None:
+    # Data still loads; only the index is missing -- the converter leaves it out because
+    # its CREATE INDEX ASYNC would fail where the indexes are created, normally on the
+    # empty table at Schema Conversion's apply (not after Full Load: the indexes come
+    # before the rows).
     from dsql_migrator.core.assessor import TooManyKeyColumnsRule
 
     (finding,) = TooManyKeyColumnsRule().evaluate(
@@ -1332,9 +1342,11 @@ def test_wide_secondary_index_is_manual_and_names_the_post_load_timing() -> None
     assert "ix_1 (10 columns)" in finding.risk
     assert "ix_3 (16 columns)" in finding.risk
     assert "ix_2" not in finding.risk
-    # Schema Conversion leaves a wide index out (it would fail after Full Load), and the
-    # finding says what the conversion does rather than a failure that no longer happens.
+    # Schema Conversion leaves a wide index out, and the finding says what the conversion
+    # does rather than a failure that no longer happens -- and where it would fail.
     assert "left out of the converted DDL" in finding.risk
+    assert "normally on the empty table at Schema Conversion's apply" in finding.risk
+    assert "after Full Load" not in finding.risk
 
 
 def test_wide_pk_and_wide_index_report_the_worst_case_once() -> None:

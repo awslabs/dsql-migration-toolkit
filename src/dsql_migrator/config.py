@@ -327,11 +327,10 @@ class AppConfig(BaseModel):
             "Full Load per-table batch parallelism: at most this many batched "
             "INSERT ... ON CONFLICT statements in flight per table, or part of a split "
             "table (each key range keeps at most 4), each on its own pooled DSQL "
-            "connection. A key range of a "
-            "DSQL table takes about 10 commits a second, so more batches in flight only "
-            "wait there (higher commit latency and cost); the run keeps at most 128 in "
-            "flight over all its tables. More in flight also raises the "
-            "optimistic-concurrency (40001) collision rate on hot key ranges. Bounded "
+            "connection; the run keeps at most 128 in flight over all its tables. A key "
+            "range of an Aurora DSQL table takes about 20,000 rows a second whatever the "
+            "batches in flight, so more of them only add commit latency and Aurora DSQL "
+            "compute cost there, not rows a second. Bounded "
             "(<=32). Config key: DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM."
         ),
     )
@@ -405,7 +404,7 @@ class AppConfig(BaseModel):
             "Full Load reader range sharding: how many disjoint primary-key ranges a "
             "LARGE table's read is split into. The single keyset reader is CPU-bound "
             "(per-row type conversion) and tops out near one core, and Aurora DSQL writes "
-            "one key range of a table at about 10 commits a second, so K ranges let a big "
+            "one key range of a table at about 20,000 rows a second, so K ranges let a big "
             "table use more cores and be written in K key ranges at once. 0 = automatic "
             "(the default): a table with at least 5,000,000 estimated rows (and at least "
             "full_load_shard_min_rows) is read in one range per 2,500,000 of them, at most "
@@ -700,7 +699,7 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         help_text=(
             "A big single table is otherwise read by ONE keyset reader that is CPU-bound "
             "(per-row type conversion) and tops out near one core, and Aurora DSQL writes one "
-            "key range of a table at about 10 commits a second, so a migration dominated by "
+            "key range of a table at about 20,000 rows a second, so a migration dominated by "
             "one huge table stalls there. K splits its primary-key range into K disjoint "
             "ranges read side by side, so the table uses more cores and is written in K key "
             "ranges at once — measured ~3.8x at K=4 on an 8M-row load.\n\n"

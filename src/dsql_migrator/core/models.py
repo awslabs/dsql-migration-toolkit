@@ -316,8 +316,10 @@ class IndexDef(BaseModel):
             "MySQL prefix-index lengths, column -> N for a ``KEY (col(N))`` prefix "
             "index. DSQL has no prefix-index equivalent, so the converter indexes the "
             "FULL column and warns; a prefixed variable-length column whose full value "
-            "exceeds DSQL's key-byte limit would otherwise fail CREATE INDEX ASYNC only "
-            "after the load. Empty for a normal (non-prefix) index."
+            "exceeds DSQL's key-byte limit would otherwise fail unannounced: that row's "
+            "INSERT (the index is on the table before its rows load), or the CREATE INDEX "
+            "ASYNC of an index built over loaded rows. Empty for a normal (non-prefix) "
+            "index."
         ),
     )
     where: Optional[str] = Field(

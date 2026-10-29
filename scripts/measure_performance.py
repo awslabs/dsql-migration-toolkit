@@ -826,8 +826,9 @@ def cmd_full_load(args) -> int:
         return 0
 
     # Set the loader's tunables BEFORE it builds the importer (load_config reads
-    # os.environ fresh). Higher parallelism -> more concurrent writers on the same
-    # hot AUTO_INCREMENT key range -> a higher OCC (40001) collision rate.
+    # os.environ fresh). Higher batch parallelism -> more batches in flight per key range,
+    # which (measured, P3) adds commit latency and Aurora DSQL compute cost but no rows/s
+    # beyond the ~20K rows/s one key range takes.
     os.environ["DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM"] = str(args.table_parallelism)
     os.environ["DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM"] = str(args.batch_parallelism)
     if args.batch_rows:

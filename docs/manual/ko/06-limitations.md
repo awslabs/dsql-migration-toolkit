@@ -29,7 +29,7 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
 | 트리거, 저장 프로시저, 함수, 스케줄 이벤트가 없습니다(`TRIGGER_UNSUPPORTED`, `PROC_PLPGSQL`, `EVENT_UNSUPPORTED`) | 서버 측 로직은 옮겨지지 않습니다. 애플리케이션으로 재구현하세요(이벤트 → EventBridge/Lambda). |
 | 행 수준 보안이 없습니다(PostgreSQL 소스, `PG_ROW_LEVEL_SECURITY`) | 컷오버 후에는 테이블을 읽거나 쓸 수 있는 모든 역할이 모든 행에 접근하므로 각 정책의 조건을 애플리케이션에서 강제하세요. 마이그레이션 사용자는 정책을 우회할 수 있어야 하며(슈퍼유저, `BYPASSRLS`, 또는 테이블 소유자 — `FORCE ROW LEVEL SECURITY`일 때는 제외), 그렇지 않으면 일부 행만 복사하는 대신 해당 테이블이 거부됩니다(사전 점검 `ROW_SECURITY`). |
 | 테이블당 최대 255컬럼, 데이터베이스당 테이블 1,000개·스키마 10개·뷰 5,000개(`TOO_MANY_COLUMNS`, `TABLE_COUNT_LIMIT`, `SCHEMA_COUNT_LIMIT`, `VIEW_COUNT_LIMIT`) | 초과 시 `CREATE`가 실패합니다(컬럼은 `54011`, 데이터베이스 한도는 `54000`). 데이터베이스 단위 개수는 타깃 클러스터에 이미 있는 것을 포함하며, 하나라도 넘으면 준비도 점수가 **Blocked**가 됩니다. |
-| 기본 키·인덱스의 컬럼 수는 최대 8개(MySQL 소스는 16개; `TOO_MANY_KEY_COLUMNS`) | 더 넓은 기본 키는 거부되어(error `54011`) 아무 데이터도 적재되지 않습니다. 더 넓은 인덱스는 적재 후 반드시 실패할 DDL을 내보내는 대신 생략되고 **Review needed**로 표시됩니다. |
+| 기본 키·인덱스의 컬럼 수는 최대 8개(MySQL 소스는 16개; `TOO_MANY_KEY_COLUMNS`) | 더 넓은 기본 키는 거부되어(error `54011`) 아무 데이터도 적재되지 않습니다. 더 넓은 인덱스는 변환된 DDL에서 빠지고 Schema Conversion 노트에 그 이름이 적힙니다. 그래서 테이블은 그 인덱스 없이 적재되고, 그 인덱스에 의존하던 쿼리는 스캔으로 대체되며, `UNIQUE` 인덱스라면 그 유일성은 강제되지 않습니다. **Review needed**로 표시됩니다. |
 
 **컷오버 후 동작이 달라지는 것**(**Review needed**)
 

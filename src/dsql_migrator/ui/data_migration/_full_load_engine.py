@@ -990,15 +990,16 @@ _MAX_READER_RANGES = 32
 
 # P3: how many INSERT batches a load unit (a table, or one part of a split table) keeps in
 # flight, each on its own Aurora DSQL connection. Measured (Seoul, 2026-10-25): one
-# primary-key-ordered stream into one key range of an Aurora DSQL table takes about 10
-# commits a second whatever is in flight -- more only queues there: CommitLatency 26 ms at
-# about 6 commits/s, 0.7 s with 8 in flight, 3 s with 32, and ComputeDPU four times as high
-# at the same rows/s -- and Tables in parallel 12 x Batches per table 32 (352 in flight)
-# loaded SLOWER, at ten times the commit latency. So a unit keeps at most _RANGE_IN_FLIGHT
-# per key range it reads (and at most Batches per table), and the process pool divides
-# _RUN_IN_FLIGHT_BUDGET among its workers (_in_flight_share): at most that many units run
-# at once, so the run never has more in flight than the budget. Static on purpose: no
-# token to leak when a worker is terminated, nothing for a Stop to wait on.
+# primary-key-ordered stream into one key range of an Aurora DSQL table takes about 20,000
+# rows a second (10 commits of 2,000 rows) whatever is in flight -- more only queues there:
+# CommitLatency 26 ms at about 6 commits/s, 0.7 s with 8 in flight, 3 s with 32, and
+# ComputeDPU four times as high at the same rows/s -- and Tables in parallel 12 x Batches
+# per table 32 (352 in flight) loaded SLOWER, at ten times the commit latency. So a unit
+# keeps at most _RANGE_IN_FLIGHT per key range it reads (and at most Batches per table), and
+# the process pool divides _RUN_IN_FLIGHT_BUDGET among its workers (_in_flight_share): at
+# most that many units run at once, so the run never has more in flight than the budget.
+# Static on purpose: no token to leak when a worker is terminated, nothing for a Stop to
+# wait on.
 _RANGE_IN_FLIGHT = 4
 _RUN_IN_FLIGHT_BUDGET = 128
 
@@ -7873,9 +7874,10 @@ def _default_importer_factory(inputs: "DataMigrationInputs") -> BatchedImporter:
         inputs.target_config, aws_profile=inputs.aws_profile
     )
     # Per-table batch parallelism and rows-per-batch are operator-tunable
-    # (DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM / _BATCH_ROWS) so a deployment can
-    # trade throughput against OCC-collision rate and the cluster connection quota
-    # without a code change; they fall back to the bounded defaults.
+    # (DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM / _BATCH_ROWS) so a deployment can size
+    # its batches in flight (one Aurora DSQL connection each; beyond what a key range
+    # absorbs they add only commit latency and compute cost, P3) against the cluster
+    # connection quota without a code change; they fall back to the bounded defaults.
     cfg = load_config()
     options = BatchedImportOptions(
         on_conflict=inputs.on_conflict,

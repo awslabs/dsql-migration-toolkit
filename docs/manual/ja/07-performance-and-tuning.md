@@ -118,7 +118,7 @@ CDC のストリーミング中、CDC ステップには **Stop CDC** しかな�
 
 Full Load と Validation の環境変数は、タスク定義のコンテナ `environment` ブロック (`deploy/cloudformation.yaml` または独自のタスク定義) に設定して再デプロイします。CDC の設定は、ツールが cdc-stack をデプロイするときに渡されます。
 
-> **再デプロイなしで実行の合間に再チューニング。** サイドバー下部の **Settings** を開き、**Full Load / Validation** タブへ移動します。ローダーとバリデーターは実行のたびに設定を読み直すため、そこで設定した値は **次の** 実行にすぐ反映されます。アプリ全体に効き、再起動でリセットされるため、保持したい値はタスク定義に設定し、**Settings** は実験に使ってください。
+> **再デプロイなしで実行の合間に再チューニング。** サイドバー下部の **Settings** を開き、**Full Load** または **Validation** タブへ移動します。ローダーとバリデーターは実行のたびに設定を読み直すため、そこで設定した値は **次の** 実行にすぐ反映されます。アプリ全体に効き、再起動でリセットされるため、保持したい値はタスク定義に設定し、**Settings** は実験に使ってください。
 
 ロードの規模に合わせてタスクのサイズを決め、*Tables in parallel* をその vCPU 数に設定してください: 同時にロードするテーブル (または大きなテーブルの部分) 1 つがワーカープロセス 1 つです。**メモリはハード制限です。**
 
@@ -230,7 +230,7 @@ Full Load を **RDS リードレプリカ / Aurora リーダーエンドポイ�
   - **Full Load**: *Tables in parallel*、*Batches per table*、*Rows per batch*、*Reader shards per large table*、*Source-load throttle (max Threads_running)*。その上に通知 *Batches in flight are capped at 4 per key range and 128 per run* が表示されます。
   - **CDC**: *Sink compute (MCU)*。
   - **Validation**: *Tables in parallel*。
-- **Activity log** タブ — 1 つのアクティビティ/監査ログに関するすべてを 1 か所に: アプリの **ログレベル**（DEBUG / INFO / WARNING / ERROR）設定、**「Mirror to CloudWatch Logs」** の切り替え（ログをコンテナの stdout にもストリーミング → ECS では CloudWatch に転送され、タスク置換後も残る永続コピーを確保）、そしてセッションのアクティビティログの**ダウンロード**（AI DBA が読むのと同じフィード）。
+- **Activity log** タブ — 1 つのアクティビティ/監査ログに関するすべてを 1 か所に: アプリの **ログレベル**（DEBUG / INFO）設定、**「Mirror to CloudWatch Logs」** の切り替え（ログをコンテナの stdout にもストリーミング → ECS では CloudWatch に転送され、タスク置換後も残る永続コピーを確保）、そしてセッションのアクティビティログの**ダウンロード**（AI DBA が読むのと同じフィード）。
 
 ダイアログでの変更は**再起動で元に戻ります**。永続化するには、対応する `DSQL_MIGRATOR_*` 環境変数（§7.2 の一覧）を設定してください。
 

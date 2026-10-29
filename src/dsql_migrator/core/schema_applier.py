@@ -1422,12 +1422,13 @@ def recreate_table(
     the table is dropped and recreated. Each statement runs as its own autocommit
     transaction (never combined) with OC001 idempotent retry (Property 2/5).
 
-    Secondary indexes are NOT created here: the caller (re)creates them *after*
-    the data load via the importer's post-load ``CREATE INDEX ASYNC``, so the
-    bulk load is not slowed by maintaining indexes. ``connection_factory`` opens a
-    fresh autocommit/TLS/IAM connection (DSQL requires a fresh connection after a
-    schema/table change), which is closed before the caller loads data on its own
-    connections.
+    Secondary indexes are NOT created here: the caller (re)creates them with
+    ``CREATE INDEX ASYNC`` -- a Drop & reload on the empty recreated table before its
+    rows load (P4d: an index builds far faster on an empty table); a table recreated
+    partway through a run after its data, in the run's index pass (P4a).
+    ``connection_factory`` opens a fresh autocommit/TLS/IAM connection (DSQL requires a
+    fresh connection after a schema/table change), which is closed before the caller
+    loads data on its own connections.
     """
     parsed = _parse(target_ddl)
     # The schema ensure(s), the DROP, and the CREATE run as ONE replay-idempotent unit. A

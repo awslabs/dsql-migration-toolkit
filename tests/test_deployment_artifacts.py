@@ -397,8 +397,8 @@ def test_session_resume_wiring_storage_secret_and_state_path(template: dict) -> 
     # The activity log shares /tmp; it is size-capped + rotated in code so it
     # cannot grow without bound on the task's ephemeral storage.
     assert env["DSQL_MIGRATOR_ACTIVITY_LOG_PATH"] == "/tmp/migration_activity.log"
-    # Log level is NOT a deploy-time parameter (adjusted at runtime from the app's
-    # Diagnostics control); the template ships a safe default.
+    # Log level is NOT a deploy-time parameter (adjusted at runtime on the app's
+    # Settings -> Activity log tab); the template ships a safe default.
     assert env["DSQL_MIGRATOR_LOG_LEVEL"] == "INFO"
     assert "LogLevel" not in template["Parameters"]
     # CloudWatch mirroring of the activity log IS a deploy-time parameter so the

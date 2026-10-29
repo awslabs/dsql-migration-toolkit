@@ -107,7 +107,8 @@ AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모
 >   변환으로 테이블을 재생성합니다.
 > - **설정하면** — 세션이 중단한 지점부터 이어지고, 재실행이 적용된 스키마를 재사용합니다.
 >
-> 값은 비밀로 취급하세요(— [`.env.example`](../.env.example) 참고).
+> 값은 비밀로 취급해 버전 관리에 넣지 마세요. 앱은 리포지토리 루트의 git-ignore된 `.env` 파일에서도
+> 이 값을 읽습니다.
 
 ---
 
@@ -523,7 +524,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `CertificateArn` | yes | — | HTTPS(443) 리스너용 ACM 인증서 ARN. |
 | `ContainerImageUri` | no | 게시된 ECR Public 이미지 | ECR Public에 게시된 이미지가 기본 — 빌드 불필요. 제한된 네트워크(자체 프라이빗 ECR 사본 / pull-through 캐시)나 커스텀 빌드에만 오버라이드; immutable 태그 또는 digest 권장. |
 | `ContainerCpu` | no | `512` | Fargate 태스크 CPU 단위. **MySQL Full Load는 CPU-bound**(행을 읽고 변환하느라 동시에 로드되는 테이블마다 코어 약 하나가 바쁨)이므로 대규모 마이그레이션에서는 올리고 Full Load의 *Tables in parallel*을 vCPU 수로 설정 — 실측에서 `16384`(16 vCPU)에 *Tables in parallel* 16으로 MySQL 테이블 16개를 **~193K rows/s**로 로드했고 모든 코어가 바빴음. PostgreSQL Full Load는 코어가 훨씬 적게 필요(Aurora DSQL에 묶임). 평가용은 기본 `512`로 충분, 실제 대용량 Full Load에는 **4096 이상** 권장. [매뉴얼 §7.2](../docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝) 참고. |
-| `ContainerMemory` | no | `1024` | Fargate 태스크 메모리(MiB) — **hard limit**: 초과하면 커널이 태스크를 OOM-kill(graceful shutdown 없음, CloudWatch 급등 + ELB 타임아웃만 남음). 메모리는 테이블 크기가 아니라 버퍼링된 파이프라인 — 대략 `table_parallelism × (prefetch + batch_parallelism) × 배치당 바이트`를 **워커 프로세스에 걸쳐 합산** — 으로 제한되며, **넓은/대형 LOB 행이 배치당 바이트를 키우므로** 동시 소스 쓰기가 있는 실제 로드에선 `1024` 기본이 빠듯할 수 있음. **사이징:** 평가/소형은 `1024`로 충분, 실제 Full Load엔 **≥ 2048**, 큰 `TEXT`/`BLOB`이나 병렬도 상향 시 **≥ 4096**(이땐 `ContainerCpu` ≥ 2048 필요). CPU에 유효해야 함(아래 사이징 표 참고). 앱이 메모리 high-water와 ~80% 압박 경고를 로그(+활동 로그)에 남겨 OOM 접근을 kill 전에 볼 수 있음. |
+| `ContainerMemory` | no | `1024` | Fargate 태스크 메모리(MiB) — **hard limit**: 초과하면 커널이 태스크를 OOM-kill(graceful shutdown 없음, CloudWatch 급등 + ELB 타임아웃만 남음). 메모리는 테이블 크기가 아니라 버퍼링된 파이프라인 — 대략 `table_parallelism × (prefetch + batch_parallelism) × 배치당 바이트`를 **워커 프로세스에 걸쳐 합산** — 으로 제한되며, **넓은/대형 LOB 행이 배치당 바이트를 키우므로** 동시 소스 쓰기가 있는 실제 로드에선 `1024` 기본이 빠듯할 수 있음. **사이징:** 평가/소형은 `1024`로 충분, 실제 Full Load엔 **≥ 2048**, 큰 `TEXT`/`BLOB`이나 병렬도 상향 시 **≥ 4096**(`4096` 자체는 `ContainerCpu` `512`, `1024`, `2048`과 조합 가능). CPU에 유효해야 함(아래 사이징 표 참고). 앱이 메모리 high-water와 ~80% 압박 경고를 로그(+활동 로그)에 남겨 OOM 접근을 kill 전에 볼 수 있음. |
 | `AppPort` | no | `8080` | 컨테이너 수신 포트. |
 | `AssignPublicIp` | no | `DISABLED` | NAT 없이 퍼블릭 서브넷에서 태스크 실행하려면 `ENABLED`(테스트); **권장: 프로덕션은 `DISABLED` 유지**(NAT 게이트웨이 또는 VPC 엔드포인트). |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | ALB 443에 도달 허용 CIDR. **권장: 내 네트워크로 범위 제한**, `0.0.0.0/0` 아님. |
@@ -566,7 +567,8 @@ Fargate는 CPU와 메모리를 **독립적으로 못 고릅니다**: CPU 값마�
   PostgreSQL 로드는 훨씬 적음). 메모리는 워커 프로세스에 걸쳐 `table_parallelism × batch_parallelism`로
   증가 — 동시 소스 쓰기가 있는 로드에서 `512`/`1024` 기본이 OOM-kill된 사례가 있음.
 - **큰 `TEXT`/`BLOB` 테이블이나 병렬도 상향 시:** **`4096` CPU / `8192`+ MiB** — 넓은 행이 배치를
-  키움. (메모리 4 GB 초과는 CPU도 올려야: 4 GB는 CPU ≥ `1024`, 8 GB는 CPU ≥ `2048`.)
+  키움. (메모리와 CPU는 함께 올라감: 4 GB 초과는 CPU ≥ `1024`, 8 GB 초과는 ≥ `2048`, 16 GB 초과는
+  ≥ `4096`이 필요하고, 반대로 `4096` CPU는 메모리 8 GB 이상이 필요 — 위 표 참고.)
 
 > [!TIP]
 > 메모리 상향은 **재배포**(스택이 태스크를 in-place 업데이트) — Fargate는 태스크 메모리를 자동
@@ -647,16 +649,16 @@ Evaluation → Schema Conversion → Data Migration → Validation → Cut over)
 
 #### 관측성 & 런타임 진단
 
-배포는 의도적으로 파라미터를 최소화합니다: **로그 레벨과 활동 로그의 CloudWatch 미러링은
-CloudFormation 파라미터가 아닙니다** — 앱의 **Settings → Diagnostics**(사이드바 푸터의 톱니)에서 런타임에
-조정하세요, 재배포 불필요:
+배포는 의도적으로 파라미터를 최소화합니다: **로그 레벨은 CloudFormation 파라미터가 아니고, 활동
+로그의 CloudWatch 미러링은 처음부터 켜 둘 때만 파라미터(`EnableActivityLogCloudWatch`)로 씁니다** —
+둘 다 앱의 **Settings → Activity log**(사이드바 푸터의 톱니)에서 런타임에 조정하세요, 재배포 불필요:
 
 - **로그 레벨** — 문제 해결 중 `INFO`/`DEBUG` 전환(DEBUG는 실패 이벤트에 Python 스택트레이스 추가;
   행 값이나 자격증명은 절대 없음).
-- **Send to CloudWatch (stdout)** — 켜면 활동 로그를 stdout으로 스트리밍하고, 컨테이너의 `awslogs`
+- **Mirror to CloudWatch Logs** — 켜면 활동 로그를 stdout으로 스트리밍하고, 컨테이너의 `awslogs`
   드라이버가 이 스택의 CloudWatch 로그 그룹으로 전달(태스크 교체에도 살아남는 내구성 감사 사본).
-- **Download activity log** — 같은 다이얼로그의 **Activity log** 탭에서 전체 UTC, 이벤트당 한 줄
-  타임라인(연결 / 평가 / 스키마 적용 / Full Load / CDC)을 받기. 파일은 `/tmp`에서 크기 제한·회전됨.
+- **Download activity log** — 같은 탭에서 전체 UTC, 이벤트당 한 줄 타임라인(연결 / 평가 / 스키마
+  적용 / Full Load / CDC)을 받기. 파일은 `/tmp`에서 크기 제한·회전됨.
 
 변경은 앱 전체(단일 태스크)에 적용되고 재시작 시 시작 기본값으로 리셋됩니다. 고급 운영자는
 `DSQL_MIGRATOR_LOG_LEVEL` / `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` 환경 변수로 시작 기본값을 설정할 수
@@ -835,7 +837,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | DSQL 인증 에러 | `DsqlClusterArn` 범위, 리전(`DSQL_MIGRATOR_AWS_REGION`), task-role `dsql:DbConnect`. |
 | AI 켰을 때 Bedrock 에러 | `BedrockModelArns` 범위, 계정에서 모델 활성화(약관 수락, §8), Bedrock 엔드포인트 egress. |
 | AI 응답이 *the configured model is not enabled for this AWS account yet* 로 거부됨 (처음에는 Verify AI access가 통과했을 수 있음) | 모델의 1회성 AWS Marketplace 약관이 수락되지 않았습니다. 백그라운드 구독을 시도하는 동안 첫 호출들은 통과했지만, 태스크 역할이 (의도적으로) 구독할 수 없어 구독이 실패했습니다. AWS Marketplace 권한이 있는 사람이 약관을 수락하고(Bedrock 콘솔, 또는 `list-foundation-model-agreement-offers` + `create-foundation-model-agreement`, §8) 약 2분 기다린 뒤 Verify AI access를 다시 실행하세요. 태스크 역할은 바꿀 필요가 없습니다. |
-| 실패 진단에 더 상세히 필요 | **Settings → Diagnostics**(사이드바 푸터의 톱니)에서 로그 레벨을 `DEBUG`로 설정해 활동 로그 실패 이벤트에 Python 스택트레이스 추가; "Send to CloudWatch (stdout)"를 토글해 내구성 사본. 재배포 불필요. |
+| 실패 진단에 더 상세히 필요 | **Settings → Activity log**(사이드바 푸터의 톱니)에서 로그 레벨을 `DEBUG`로 설정해 활동 로그 실패 이벤트에 Python 스택트레이스 추가; "Mirror to CloudWatch Logs"를 토글해 내구성 사본. 재배포 불필요. |
 
 ### 보안 노트
 

@@ -138,6 +138,11 @@ def test_a_hash_index_over_long_values_stays_a_loss() -> None:
     (note,) = [w for w in _convert(links).warnings if "btree-only" in w.message]
     assert note.kind is ConversionNoteKind.LOSS
     assert "hash index(es) ix_links_url become btree" in note.message
+    # The index is on the table before its rows load, so the Full Load's INSERT of such a
+    # value is what fails -- not a post-load index build.
+    assert "the Full Load's too, since the index is on the table before its rows load" in (
+        note.message)
+    assert "post-load" not in note.message
     item = _assess(links)
     (concern,) = [c for c in item.concerns if c.rule_id == "PG_INDEX_NOT_PRESERVED"]
     assert concern.note_kind is ConversionNoteKind.LOSS

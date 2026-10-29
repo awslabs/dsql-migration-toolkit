@@ -112,7 +112,8 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 > - **設定すると** — セッションは中断したところから再開され、再実行では適用済みのスキーマが
 >   再利用されます。
 >
-> この値はシークレットとして扱ってください（[`.env.example`](../.env.example) を参照）。
+> この値はシークレットとして扱い、バージョン管理に含めないでください。アプリはリポジトリのルートにある
+> git 管理外の `.env` ファイルからもこの値を読み取ります。
 
 ---
 
@@ -556,7 +557,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `CertificateArn` | yes | — | HTTPS (443) リスナー用の ACM 証明書 ARN。 |
 | `ContainerImageUri` | no | 公開された ECR Public イメージ | デフォルトは ECR Public に公開されたイメージ — ビルド不要。制限されたネットワーク（ご自身のプライベート ECR コピー / pull-through キャッシュ）またはカスタムビルドの場合のみオーバーライド。イミュータブルなタグまたはダイジェストを推奨。 |
 | `ContainerCpu` | no | `512` | Fargate タスクの CPU ユニット。**MySQL の Full Load は CPU バウンド**（行の読み取りと変換が、同時にロードするテーブルごとにほぼ 1 コアを使う）なので、大規模移行では引き上げ、Full Load の *Tables in parallel* を vCPU 数に設定すること — 実測では、`16384`（16 vCPU）で *Tables in parallel* を 16 にすると、MySQL の 16 テーブルを全コアが稼働した状態で **約 193K rows/s** でロードした。PostgreSQL の Full Load が必要とするコアははるかに少ない（Aurora DSQL に律速される）。評価用途はデフォルト `512` で十分、実際の大規模 Full Load には **4096 以上** を推奨。[マニュアル §7.2](../docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング) 参照。 |
-| `ContainerMemory` | no | `1024` | Fargate タスクのメモリ（MiB）— **ハード制限**: 超えるとカーネルがタスクを OOM-kill します（graceful shutdown なし、CloudWatch のスパイクと ELB タイムアウトのみ）。メモリはテーブルサイズではなくバッファされたパイプライン — おおよそ `table_parallelism × (prefetch + batch_parallelism) × バッチあたりバイト` を**ワーカープロセスにわたって合算** — で制限され、**広い / 大きな LOB 行がバッチあたりバイトを増やす**ため、同時にソース書き込みがある実運用ロードでは `1024` デフォルトが厳しいことがあります。**サイジング:** 評価/小規模は `1024` で十分、実運用の Full Load には **≥ 2048**、大きな `TEXT`/`BLOB` や並列度を上げる場合は **≥ 4096**（この場合 `ContainerCpu` ≥ 2048 が必要）。CPU に対して有効な値であること（下のサイジング表を参照）。アプリはメモリの high-water と約 80% の圧迫警告をログ（+アクティビティログ）に残すので、kill の前に OOM の接近が見えます。 |
+| `ContainerMemory` | no | `1024` | Fargate タスクのメモリ（MiB）— **ハード制限**: 超えるとカーネルがタスクを OOM-kill します（graceful shutdown なし、CloudWatch のスパイクと ELB タイムアウトのみ）。メモリはテーブルサイズではなくバッファされたパイプライン — おおよそ `table_parallelism × (prefetch + batch_parallelism) × バッチあたりバイト` を**ワーカープロセスにわたって合算** — で制限され、**広い / 大きな LOB 行がバッチあたりバイトを増やす**ため、同時にソース書き込みがある実運用ロードでは `1024` デフォルトが厳しいことがあります。**サイジング:** 評価/小規模は `1024` で十分、実運用の Full Load には **≥ 2048**、大きな `TEXT`/`BLOB` や並列度を上げる場合は **≥ 4096**（`4096` 自体は `ContainerCpu` `512`、`1024`、`2048` と組み合わせ可能）。CPU に対して有効な値であること（下のサイジング表を参照）。アプリはメモリの high-water と約 80% の圧迫警告をログ（+アクティビティログ）に残すので、kill の前に OOM の接近が見えます。 |
 | `AppPort` | no | `8080` | コンテナのリッスンポート。 |
 | `AssignPublicIp` | no | `DISABLED` | NAT なしでタスクをパブリックサブネットで実行するには `ENABLED`（テスト）。**推奨: 本番では `DISABLED` のまま**（NAT ゲートウェイまたは VPC エンドポイント）。 |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | ALB の 443 に到達を許可する CIDR。**推奨: `0.0.0.0/0` ではなく、ご自身のネットワークに絞り込む**。 |
@@ -600,7 +601,8 @@ Fargate では CPU とメモリを**独立に選べません**: CPU 値ごとに
   `table_parallelism × batch_parallelism` で増加します — 同時にソース書き込みがあるロードで
   `512`/`1024` デフォルトが OOM-kill された事例があります。
 - **大きな `TEXT`/`BLOB` テーブル、または並列度を上げる場合:** **`4096` CPU / `8192`+ MiB** — 広い行が
-  バッチを大きくします。（メモリ 4 GB 超は CPU も上げる必要: 4 GB は CPU ≥ `1024`、8 GB は CPU ≥ `2048`。）
+  バッチを大きくします。（メモリと CPU は一緒に上がります: 4 GB 超は CPU ≥ `1024`、8 GB 超は ≥ `2048`、
+  16 GB 超は ≥ `4096` が必要で、逆に `4096` CPU にはメモリ 8 GB 以上が必要です — 上の表を参照。）
 
 > [!TIP]
 > メモリの引き上げは**再デプロイ**（スタックがタスクをインプレース更新）です — Fargate はタスクの
@@ -687,18 +689,18 @@ Schema Conversion → Data Migration → Validation → Cut over）に移動す�
 
 #### 可観測性 & ランタイム診断
 
-デプロイは意図的にパラメータを最小限にしています: **ログレベルとアクティビティログの
-CloudWatch ミラーリングは CloudFormation パラメータではありません** — これらはアプリの
-**Settings → Diagnostics**（サイドバーのフッターの歯車）からランタイムで調整します。
-再デプロイは不要です:
+デプロイは意図的にパラメータを最小限にしています: **ログレベルは CloudFormation パラメータでは
+なく、アクティビティログの CloudWatch ミラーリングは最初からオンにする場合にだけパラメータ
+（`EnableActivityLogCloudWatch`）を使います** — どちらもアプリの **Settings → Activity log**
+（サイドバーのフッターの歯車）からランタイムで調整します。再デプロイは不要です:
 
 - **ログレベル** — トラブルシューティング中に `INFO`/`DEBUG` を切り替えます（DEBUG は
   失敗イベントに Python のスタックトレースを追加します。行の値や認証情報は決して
   含みません）。
-- **Send to CloudWatch (stdout)** — オンにするとアクティビティログを stdout に
+- **Mirror to CloudWatch Logs** — オンにするとアクティビティログを stdout に
   ストリーミングし、コンテナの `awslogs` ドライバーがそれをこのスタックの CloudWatch
   ロググループに転送します（タスクの置き換えを乗り越えて残る、耐久性のある監査コピー）。
-- **Download activity log** — 同じダイアログの **Activity log** タブから、完全な UTC のイベントごとに 1 行の
+- **Download activity log** — 同じタブから、完全な UTC のイベントごとに 1 行の
   タイムライン（接続 / 評価 / スキーマ適用 / Full Load / CDC）を取得します。ファイルは
   `/tmp` 上でサイズ上限が設けられローテーションされます。
 
@@ -899,7 +901,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | DSQL 認証エラー | `DsqlClusterArn` のスコープ、リージョン（`DSQL_MIGRATOR_AWS_REGION`）、タスクロールの `dsql:DbConnect`。 |
 | AI オン時の Bedrock エラー | `BedrockModelArns` のスコープ、アカウントでのモデル有効化（契約の承諾、§8）、Bedrock エンドポイントへの egress。 |
 | AI の応答が *the configured model is not enabled for this AWS account yet* で拒否される（最初は Verify AI access が合格していた場合がある） | モデルの 1 回限りの AWS Marketplace の契約が承諾されていません。バックグラウンドのサブスクリプションを試行している間は最初の呼び出しが成功しましたが、タスクロールが（設計上）サブスクライブできないため失敗しました。AWS Marketplace の権限を持つ人が契約を承諾し（Bedrock コンソール、または `list-foundation-model-agreement-offers` + `create-foundation-model-agreement`、§8）、約 2 分待ってから Verify AI access を再実行してください。タスクロールの変更は不要です。 |
-| 失敗の診断にさらに詳細が必要 | **Settings → Diagnostics**（サイドバーのフッターの歯車）でログレベルを `DEBUG` に設定して、アクティビティログの失敗イベントに Python スタックトレースを追加。「Send to CloudWatch (stdout)」をトグルして耐久性のあるコピーを取得。再デプロイ不要。 |
+| 失敗の診断にさらに詳細が必要 | **Settings → Activity log**（サイドバーのフッターの歯車）でログレベルを `DEBUG` に設定して、アクティビティログの失敗イベントに Python スタックトレースを追加。「Mirror to CloudWatch Logs」をトグルして耐久性のあるコピーを取得。再デプロイ不要。 |
 
 ### セキュリティに関する注記
 

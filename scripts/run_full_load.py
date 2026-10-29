@@ -35,7 +35,7 @@ The source is only ever READ (apart from that one ``FLUSH BINARY LOGS`` with
 ``--watermark-out``). Nothing runs until you pass ``--yes``; without it the script prints
 the plan and exits.
 
-Connection settings come from the environment / ``.env`` (copy ``.env.example``):
+Connection settings come from the environment / a git-ignored ``.env`` in the repo root:
   DB_HOST, DB_PORT, DB_USER, DB_PASSWORD                 (source MySQL, read-only;
                                                           RELOAD too for --watermark-out
                                                           unless gtid_mode=ON)

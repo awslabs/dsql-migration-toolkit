@@ -5555,9 +5555,10 @@ def _too_many_key_columns_warning(table: TableDef) -> Optional[ConversionWarning
     - a **primary key** over the cap makes the generated ``CREATE TABLE`` REJECTED at
       apply, so the table and its data never migrate (UNSUPPORTED);
     - a **secondary index** over the cap is now SKIPPED by :func:`_build_index_ddls`
-      (emitting it would guarantee a post-load ``CREATE INDEX ASYNC`` failure), so the
-      target is missing that index -- a real LOSS the operator has to know about, since
-      queries relying on it will fall back to scans.
+      (emitting it would guarantee a ``CREATE INDEX ASYNC`` failure wherever the index
+      is created -- normally on the empty table at apply), so the target is missing
+      that index -- a real LOSS the operator has to know about, since queries relying
+      on it will fall back to scans.
 
     Reported as one note per table, classified by the worst case present.
     """
@@ -5580,8 +5581,9 @@ def _too_many_key_columns_warning(table: TableDef) -> Optional[ConversionWarning
         listed = ", ".join(f"{name} ({count} columns)" for name, count in wide)
         parts.append(
             f"secondary index(es) {listed} exceed the limit and were therefore NOT "
-            "emitted — the target will be missing them (emitting them would fail the "
-            "post-load CREATE INDEX ASYNC after every row was already written). Trim "
+            "emitted — the target will be missing them (emitting them would make their "
+            "CREATE INDEX ASYNC fail wherever the indexes are created, normally on the "
+            "empty table at apply). Trim "
             f"each to at most {_DSQL_MAX_PK_COLUMNS} columns, most selective leftmost, "
             "and add it after the migration"
         )
@@ -5612,10 +5614,12 @@ def _key_size_warning(
     whose real values are short migrates without trouble, and refusing to convert it
     would be a false alarm.
 
-    It is worth surfacing anyway because of WHERE the failure lands: a too-large
-    primary-key value fails that row's INSERT during Full Load (quarantined to the
-    error log) or its apply during CDC (dead-lettered), and a too-large secondary
-    index value fails the post-load ``CREATE INDEX ASYNC``. Both are discovered
+    It is worth surfacing anyway because of WHERE the failure lands: a too-large key
+    value -- primary key, or a secondary index, which is on the table before its rows
+    load -- fails that row's INSERT during Full Load (quarantined to the error log) or
+    its apply during CDC (dead-lettered); only an index built over rows already loaded
+    (one the Full Load did not get to before the rows, e.g. on a table it recreates
+    partway through) fails its ``CREATE INDEX ASYNC`` instead. Both are discovered
     mid/post-migration, per row, on a limit that a look at the declared widths could
     have flagged up front.
 
@@ -5683,9 +5687,11 @@ def _key_size_warning(
             f"allow {'; '.join(at_risk)} (counting 4 bytes per character, as utf8mb4 "
             "can use). The DDL itself applies fine: DSQL checks the VALUE on INSERT, "
             'so only rows whose actual key exceeds the limit fail (error 54000 "key '
-            'size too large") — a primary-key value during Full Load/CDC (that row is '
-            "quarantined or dead-lettered), or an index value in the post-load CREATE "
-            "INDEX ASYNC. If your real values are well under the limit, nothing "
+            'size too large") — a primary-key or index value during Full Load/CDC (that '
+            "row is quarantined or dead-lettered: the secondary indexes are on the table "
+            "before its rows load), or an index value in the CREATE INDEX ASYNC of an "
+            "index built over rows already loaded. If your real values are well under "
+            "the limit, nothing "
             "happens; if they are not, shorten the column(s) or drop them from the key "
             "before loading."
         ),
@@ -5903,7 +5909,8 @@ def _pg_partial_or_nonbtree_index_warning(
     serves_the_same = {"hash", "brin"}
     # ... except a hash index over values too long for a btree, which is the usual reason
     # to choose hash (it stores only the hash): the btree's 1 KiB key cap then fails the
-    # post-load build or a later INSERT.
+    # INSERT of such a value (the Full Load's too: the index is on the table before its
+    # rows load), or the build of an index created over rows already loaded.
     by_name = {index.name: index for index in table.indexes}
     columns_by_name = {column.name: column for column in table.columns}
 
@@ -5996,8 +6003,10 @@ def _pg_partial_or_nonbtree_index_warning(
         parts.append(
             f"hash index(es) {', '.join(sorted(too_long))} become btree, whose keys Aurora "
             f"DSQL caps at {_DSQL_MAX_KEY_BYTES} bytes, and the columns can hold longer "
-            "values (a hash index stores only the hash): the post-load CREATE INDEX or a "
-            "later INSERT of such a value fails. Index a hash of the value instead (e.g. "
+            "values (a hash index stores only the hash): an INSERT of such a value fails, "
+            "the Full Load's too, since the index is on the table before its rows load "
+            "(an index created over rows already loaded fails its CREATE INDEX "
+            "instead). Index a hash of the value instead (e.g. "
             "a column holding md5 of it) or leave the index out"
         )
     message = "Aurora DSQL secondary indexes are btree-only: " + "; ".join(parts) + "."

@@ -150,12 +150,13 @@ need to be usable in your shell (`aws sso login`, `AWS_PROFILE=…`).
 git clone https://github.com/awslabs/dsql-migration-toolkit.git
 cd dsql-migration-toolkit
 uv sync                       # create + fill a .venv (needs uv)
-cp .env.example .env          # optional: pre-fill connection details (git-ignored)
 uv run mysql-dsql-migrator ui
 ```
 
 Binds to `http://127.0.0.1:8080` by default. Open the printed URL and start from
-the **Connect** step.
+the **Connect** step. Optionally, a git-ignored `.env` file in the repository root
+pre-fills the connection details (manual
+[§1.2](docs/manual/en/01-setup.md#12-run-the-tool-locally)).
 
 ### ECS Fargate (real migrations)
 
@@ -365,14 +366,14 @@ parallelism knobs can also be retuned **at runtime** from the sidebar's
 | `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(unset)_ | Durable S3 store for the per-session snapshot, so resume survives a Fargate task replacement (a redeploy), not just an in-task restart. The Fargate deploy auto-sets it to the managed plugin bucket (no setup); leave unset locally to use the SQLite path above. |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | S3 bucket for Full Load staging (streaming multipart upload — the scalable path for large tables). Unset = bounded local temp CSV (dev / small tables). |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Tables, or parts of a large table, loaded concurrently (one worker process each). For a large run, set it to the task's vCPU count. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table or part, capped at 4 per key range and 128 per run: a key range of an Aurora DSQL table takes about 10 commits a second, so more batches only wait (higher commit latency and cost). |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | In-flight `INSERT … ON CONFLICT` batches per table or part, capped at 4 per key range and 128 per run: a key range of an Aurora DSQL table takes about 20,000 rows/s whatever the batches in flight, so more batches only add commit latency and Aurora DSQL compute cost. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Rows per batched write, capped at DSQL's 3000-row per-transaction limit. |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (on) | Read-ahead prefetch queue (reader thread fills a bounded queue while writes drain). Keep on; set `0` only to reproduce the pre-prefetch path in an A/B benchmark. |
 | `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0` (automatic, ≤32) | How many primary-key ranges a large table with an integer leading key column is read and written in, when `FULL_LOAD_TABLE_PARALLELISM` is above 1: `0` = one per 2,500,000 estimated rows from 5,000,000, at most 32; `1` = off; `2`–`32` = exactly that many. PostgreSQL: the ranges share one snapshot. MySQL: one reader session reads them from one snapshot; separate-snapshot parts need an explicit 2 or more in Full load + CDC from a binlog start point. See manual §3.8 / §7.2. |
 | `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be split (automatic also needs 5,000,000); smaller tables use one reader. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
-| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Settings → Diagnostics**. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Settings → Diagnostics**. |
+| `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Settings → Activity log** (*Log level*). |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Settings → Activity log** (*Mirror to CloudWatch Logs*). |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | Bedrock model / inference-profile id for AI assist. Always a `global.*` profile: those are reachable from any commercial region, while a `us.*` profile only resolves from us-east-1/us-east-2/us-west-2. |
 | `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
 

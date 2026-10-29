@@ -4,13 +4,13 @@
 """P3: the INSERT batches a Full Load keeps in flight are capped, statically.
 
 Measured live (Seoul, 2026-10-25): one primary-key-ordered stream into one key range of an
-Aurora DSQL table takes about 10 commits a second whatever is in flight; more only queues
-there (CommitLatency 26 ms -> 0.7 s with 8 in flight -> 3 s with 32, ComputeDPU four times
-as high at the same rows/s), and Tables in parallel 12 x Batches per table 32 (352 in
-flight) loaded slower, at ten times the commit latency. So each load unit keeps
-``max(1, min(bp, R * ranges, B // total_workers))`` batches in flight -- R = 4 per key range,
-B = 128 per run, bp = Batches per table -- and the run is at most B by construction: at most
-``total_workers`` units run at once. No IPC, no tokens. Pinned here:
+Aurora DSQL table takes about 20,000 rows a second (10 commits of 2,000 rows) whatever is in
+flight; more only queues there (CommitLatency 26 ms -> 0.7 s with 8 in flight -> 3 s with
+32, ComputeDPU four times as high at the same rows/s), and Tables in parallel 12 x Batches
+per table 32 (352 in flight) loaded slower, at ten times the commit latency. So each load
+unit keeps ``max(1, min(bp, R * ranges, B // total_workers))`` batches in flight -- R = 4
+per key range, B = 128 per run, bp = Batches per table -- and the run is at most B by
+construction: at most ``total_workers`` units run at once. No IPC, no tokens. Pinned here:
 
 * the rule and its measurement seams (``DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT`` /
   ``DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET``: an integer >= 1, anything else keeps the
@@ -696,7 +696,11 @@ def test_the_settings_notice_names_the_caps_the_loader_applies(monkeypatch) -> N
     blob = " ".join(ui.texts)
     assert ("Batches in flight are capped at 4 per key range "
             "and 128 per run") in blob
-    assert "A key range of an Aurora DSQL table takes about 10 commits a second" in blob
+    # The live measurement: one key range writes about 20K rows/s however many batches are
+    # in flight; more of them only cost commit latency and Aurora DSQL compute.
+    assert ("A key range of an Aurora DSQL table takes about 20,000 rows a second "
+            "whatever the batches in flight") in blob
+    assert "only add commit latency and Aurora DSQL compute cost" in blob
     # The seams (one-image A/Bs) are what the loader applies, so the notice follows them.
     monkeypatch.setenv(_RANGE_SEAM, "8")
     monkeypatch.setenv(_BUDGET_SEAM, "64")
@@ -712,6 +716,16 @@ def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:
     tables = fields["full_load_table_parallelism"].description
     assert "at most this many" in batches and "each key range keeps at most 4" in batches
     assert "at most 128" in batches
+    # What more in flight costs, as measured live: commit latency and compute, no rows/s --
+    # and not more OCC (40001) conflicts, which the description used to claim.
+    assert "about 20,000 rows a second whatever the batches in flight" in batches
+    assert "commit latency and Aurora DSQL compute cost" in batches
+    assert "40001" not in batches and "collision" not in batches
+    shards = fields["full_load_reader_shards"].description
+    shards_help = {k.field: k for k in TUNABLE_KNOBS}["full_load_reader_shards"].help_text
+    for text in (shards, shards_help):
+        assert "one key range of a table at about 20,000 rows a second" in text
+        assert "commits a second" not in text
     assert "parts of a large table" in tables and "at most 128 per run" in tables
     assert "x full_load_batch_parallelism" not in tables
     knobs = {k.field: k for k in TUNABLE_KNOBS}

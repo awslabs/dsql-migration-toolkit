@@ -32,8 +32,8 @@ otherwise) — so you can gate a shell script on them.
   ```bash
   python -m venv .venv && .venv/bin/pip install -e .
   ```
-- **Connection settings via environment / `.env`** (copy `.env.example` → `.env`).
-  Both scripts read:
+- **Connection settings via environment / `.env`** (a git-ignored `.env` file in the
+  repo root, one `KEY=value` per line). Both scripts read:
 
   | Variable | For | Notes |
   |---|---|---|

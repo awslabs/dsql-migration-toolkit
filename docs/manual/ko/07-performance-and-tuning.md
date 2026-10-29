@@ -217,10 +217,10 @@ Full Load와 Validation 환경 변수는 태스크 정의의 컨테이너 `envir
 블록(`deploy/cloudformation.yaml` 또는 자체 태스크 정의)에 설정하고 재배포하세요. CDC 설정은 도구가
 cdc-stack을 배포할 때 전달됩니다.
 
-> **재배포 없이 실행 사이에 재튜닝.** 사이드바 푸터의 **Settings**를 열고 **Full Load / Validation**
-> 탭으로 가세요. 로더와 검증기가 매 실행마다 설정을 다시 읽으므로, 여기서 바꾼 값은 **다음** 실행에
-> 즉시 반영됩니다. 앱 전역이며 재시작 시 초기화되므로, 유지할 값은 태스크 정의에 설정하고
-> **Settings**는 실험용으로 쓰세요.
+> **재배포 없이 실행 사이에 재튜닝.** 사이드바 푸터의 **Settings**를 열고 **Full Load** 또는
+> **Validation** 탭으로 가세요. 로더와 검증기가 매 실행마다 설정을 다시 읽으므로, 여기서 바꾼
+> 값은 **다음** 실행에 즉시 반영됩니다. 앱 전역이며 재시작 시 초기화되므로, 유지할 값은 태스크
+> 정의에 설정하고 **Settings**는 실험용으로 쓰세요.
 
 작업 규모에 맞게 태스크 크기를 잡고, *Tables in parallel*을 그 vCPU 수로 설정하세요: 동시에 적재되는
 테이블, 또는 큰 테이블의 부분 하나가 worker 프로세스 하나입니다. **메모리는 hard limit**입니다.
@@ -422,10 +422,10 @@ Aurora DSQL의 상태가 모두 수치를 움직이며, `scripts/measure_perform
     *Batches in flight are capped at 4 per key range and 128 per run*이 있습니다;
   - **CDC**: *Sink compute (MCU)*;
   - **Validation**: *Tables in parallel*.
-- **Activity log** 탭 — 하나의 활동/감사 로그에 관한 모든 것을 한곳에: 앱 **로그 레벨**(DEBUG / INFO
-  / WARNING / ERROR) 설정, **"Mirror to CloudWatch Logs"** 토글(로그를 컨테이너 stdout으로도
-  스트리밍 → ECS에서 CloudWatch로 전달되어 태스크 교체에도 남는 사본 확보), 그리고 세션 활동 로그
-  **다운로드**(AI DBA가 읽는 그 피드).
+- **Activity log** 탭 — 하나의 활동/감사 로그에 관한 모든 것을 한곳에: 앱 **로그 레벨**(DEBUG / INFO)
+  설정, **"Mirror to CloudWatch Logs"** 토글(로그를 컨테이너 stdout으로도 스트리밍 → ECS에서
+  CloudWatch로 전달되어 태스크 교체에도 남는 사본 확보), 그리고 세션 활동 로그 **다운로드**(AI DBA가
+  읽는 그 피드).
 
 다이얼로그 변경은 **재시작 시 되돌아갑니다**; 유지하려면 해당 `DSQL_MIGRATOR_*` 환경변수(§7.2
 목록)를 설정하세요.

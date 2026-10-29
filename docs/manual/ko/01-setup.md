@@ -78,13 +78,10 @@ uv run mysql-dsql-migrator ui    # 웹 UI 실행 (기본 127.0.0.1:8080 바인�
 
 브라우저에서 **http://127.0.0.1:8080** 을 엽니다.
 
-선택 사항: `.env.example`을 `.env`로 복사해 연결 항목(소스 DB host/port/user, 타깃 DSQL 엔드포인트,
-리전 등)을 채우면 **Connect** 화면이 이를 미리 채워 줍니다. `.env`는 git-ignore되며 로컬 개발
-전용입니다.
-
-```bash
-cp .env.example .env
-```
+선택 사항: 리포지토리 루트의 `.env` 파일에 연결 항목을 한 줄에 하나씩 `KEY=value`로 적으면(소스는
+`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, Aurora DSQL은 `TARGET_ENDPOINT`, `TARGET_REGION`,
+`TARGET_DATABASE`, `TARGET_USERNAME`) **Connect** 화면이 이를 미리 채워 줍니다. `.env`는
+git-ignore되며 로컬 개발 전용입니다.
 
 앱은 `reload=False`로 실행되므로 코드 변경을 자동으로 다시 불러오지 않습니다(핫 리로드 없음) —
 편집을 반영하려면 재시작하세요. 도구 자체를 수정할 때만 해당됩니다.
@@ -130,7 +127,8 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # 이미지 URI 출력
 - `internal` ALB. `internet-facing`은 `AllowedIngressCidr`를 내 네트워크로 한정했을 때만.
 - `AssignPublicIp=DISABLED` + NAT 게이트웨이 또는 VPC 엔드포인트.
 - immutable 이미지 태그 또는 digest.
-- 활동 로그의 CloudWatch 미러 켜기(**Settings → Diagnostics**) — 영속 감사 추적.
+- 활동 로그의 CloudWatch 미러 켜기(`EnableActivityLogCloudWatch=true`. **Settings → Activity log**의
+  스위치는 앱이 재시작될 때마다 이 값으로 돌아감) — 영속 감사 추적.
 
 상태는 S3에 보관되므로 태스크가 교체돼도 작업 화면 상태와 Full Load 기록이 유지됩니다. 그 순간 실행
 중이던 적재는 중단되고, **Retry unfinished tables**가 끝나지 않은 테이블마다 처음부터 다시 적재합니다

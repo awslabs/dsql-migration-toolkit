@@ -83,13 +83,11 @@ uv run mysql-dsql-migrator ui    # launch the web UI (binds to 127.0.0.1:8080 by
 
 Then open **http://127.0.0.1:8080** in your browser.
 
-Optionally, copy `.env.example` to `.env` and fill in the connection fields (source DB
-host/port/user, target DSQL endpoint, region, etc.). The **Connect** screen prefills its
-form from them. `.env` is git-ignored and for local development only.
-
-```bash
-cp .env.example .env
-```
+Optionally, put the connection fields in a `.env` file in the repository root, one
+`KEY=value` per line: `DB_HOST`, `DB_PORT`, `DB_USER` and `DB_PASSWORD` for the source,
+`TARGET_ENDPOINT`, `TARGET_REGION`, `TARGET_DATABASE` and `TARGET_USERNAME` for Aurora
+DSQL. The **Connect** screen prefills its form from them. `.env` is git-ignored and for
+local development only.
 
 The app doesn't hot-reload (`reload=False`): restart it to pick up code edits. This
 matters only if you're modifying the tool itself.
@@ -138,8 +136,9 @@ described in [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md). Its key se
   network.
 - `AssignPublicIp=DISABLED`, with a NAT gateway or VPC endpoints.
 - An immutable image tag or digest.
-- The CloudWatch mirror of the activity log turned on (**Settings → Diagnostics**) for a
-  durable audit trail.
+- The CloudWatch mirror of the activity log turned on (`EnableActivityLogCloudWatch=true`;
+  the switch on **Settings → Activity log** returns to this value whenever the app
+  restarts) for a durable audit trail.
 
 State is kept in S3, so a task replacement keeps the workbench and the Full Load record. A
 load running at that moment is interrupted, and **Retry unfinished tables** reloads each

@@ -83,13 +83,10 @@ uv run mysql-dsql-migrator ui    # Web UI を起動 (既定では 127.0.0.1:8080
 
 その後、ブラウザで **http://127.0.0.1:8080** を開きます。
 
-任意: `.env.example` を `.env` にコピーして接続項目(ソース DB の host/port/user、ターゲット DSQL
-エンドポイント、リージョンなど)を記入すると、**Connect** 画面がこれらをフォームに事前入力します。
-`.env` は git 管理から除外されており、ローカル開発専用です。
-
-```bash
-cp .env.example .env
-```
+任意: リポジトリのルートにある `.env` ファイルに接続項目を 1 行に 1 つずつ `KEY=value` で記入すると
+(ソースは `DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、Aurora DSQL は `TARGET_ENDPOINT`、
+`TARGET_REGION`、`TARGET_DATABASE`、`TARGET_USERNAME`)、**Connect** 画面がこれらをフォームに
+事前入力します。`.env` は git 管理から除外されており、ローカル開発専用です。
 
 アプリは `reload=False` で実行されるため、コードの変更をホットリロードしません — 編集を反映するには
 再起動してください。これはツール自体を変更している場合にのみ関係します。
@@ -138,7 +135,8 @@ AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出
 - `internal` ALB。`internet-facing` は `AllowedIngressCidr` を自分のネットワークに限定した場合のみ。
 - `AssignPublicIp=DISABLED` + NAT ゲートウェイまたは VPC エンドポイント。
 - イミュータブルなイメージタグまたは digest。
-- アクティビティログの CloudWatch ミラーをオンにする(**Settings → Diagnostics**)— 永続的な監査証跡に
+- アクティビティログの CloudWatch ミラーをオンにする(`EnableActivityLogCloudWatch=true`。
+  **Settings → Activity log** のスイッチは、アプリが再起動するたびにこの値に戻ります)— 永続的な監査証跡に
   なります。
 
 状態は S3 に保存されるため、タスクが置き換えられてもワークベンチの状態と Full Load の記録は保持されます。

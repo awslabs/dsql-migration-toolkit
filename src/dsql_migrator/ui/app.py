@@ -1667,10 +1667,11 @@ def _render_tuning_group_controls(group: str) -> None:
             ),
             body=(
                 "Each batch in flight holds one Aurora DSQL connection; a table also never "
-                "exceeds its Batches per table setting. A key range of an "
-                "Aurora DSQL table takes about 10 commits a second, so more batches only "
-                "wait there (higher commit latency and cost); the tool caps them. Tables "
-                "in parallel is how many tables, or parts of a large table, load at once."
+                "exceeds its Batches per table setting. A key range of an Aurora DSQL "
+                "table takes about 20,000 rows a second whatever the batches in flight, so "
+                "more batches only add commit latency and Aurora DSQL compute cost there; "
+                "the tool caps them. Tables in parallel is how many tables, or parts of a "
+                "large table, load at once."
             ),
         )
 

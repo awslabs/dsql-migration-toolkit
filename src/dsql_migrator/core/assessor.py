@@ -178,8 +178,8 @@ _MAX_SECONDARY_INDEXES_PER_TABLE = _MAX_INDEXES_PER_TABLE - 1
 # error 54011 "more than 8 column keys are not allowed". MySQL allows up to 16
 # columns per index, so a 9..16-column source key is a real schema the assessment
 # has to flag: the PK failure lands when the table DDL is applied, and a secondary
-# index failure lands only AFTER Full Load (indexes are built by post-load
-# CREATE INDEX ASYNC) -- the same late-failure shape as _MAX_INDEXES_PER_TABLE.
+# index's failure wherever its CREATE INDEX ASYNC runs (normally Schema Conversion's
+# apply, on the empty table) -- which is why the converter leaves such an index out.
 _MAX_KEY_COLUMNS = 8
 
 # DSQL's documented maximum numeric precision. Was 38 -- the limit the service enforced
@@ -1211,12 +1211,13 @@ class TooManyColumnsRule(Rule):
 class TooManyIndexesRule(Rule):
     """Flag tables that exceed the DSQL per-table index limit.
 
-    Caught here, at planning time, because the failure otherwise surfaces at the
-    WORST possible moment: the secondary indexes are created by post-load
-    ``CREATE INDEX ASYNC`` statements, so the limit is hit only AFTER Full Load has
-    finished writing every row -- turning a multi-hour load into a failed table that
-    a re-run cannot fix (the limit is not transient). The operator has to change the
-    schema and start over.
+    Caught here, at planning time, so the operator chooses which indexes to keep rather
+    than the cut-off: Schema Conversion keeps the first 23 secondary indexes and omits the
+    rest, because their ``CREATE INDEX ASYNC`` would fail wherever the indexes are created
+    -- on the empty table at Schema Conversion's apply, again on the empty recreated table
+    before a Drop & reload loads it, and after the data only for an index the Full Load
+    did not get to before the rows (e.g. on a table it recreates partway through). No
+    re-run changes that (the limit is not transient).
 
     The budget is compared against SECONDARY indexes only: DSQL always requires a
     primary key and its index counts toward the 24, leaving 23 for the source's
@@ -1266,9 +1267,10 @@ class TooManyIndexesRule(Rule):
                         f"(it names them) and keeps {_MAX_SECONDARY_INDEXES_PER_TABLE}, "
                         "because emitting them would fail with error 54000 \"more than "
                         f"{_MAX_INDEXES_PER_TABLE} indexes per table are not allowed\" "
-                        "after Full Load had already written every row. So the load "
-                        "SUCCEEDS and the target is left missing those indexes -- queries "
-                        "relying on them fall back to scans."
+                        "wherever the indexes are created, normally on the empty table "
+                        "at Schema Conversion's apply or before a Drop & reload loads its "
+                        "rows. So the load SUCCEEDS and the target is left missing those "
+                        "indexes -- queries relying on them fall back to scans."
                     ),
                     recommendation=(
                         "Choose which indexes to keep rather than letting the cut-off "
@@ -1291,15 +1293,18 @@ class TooManyKeyColumnsRule(Rule):
 
     Aurora DSQL caps a key at 8 columns (error 54011 "more than 8 column keys are
     not allowed"); MySQL allows 16, so a 9..16-column key migrates from a perfectly
-    valid source. The two cases fail at different times, which is why both are
-    reported on one finding but described separately:
+    valid source. The two cases end differently, which is why both are reported on
+    one finding but described separately:
 
     - a **primary key** over 8 columns fails when the table DDL is applied, so
       nothing loads at all -- UNSUPPORTED, the table cannot migrate as-is;
-    - a **secondary index** over 8 columns fails its post-load
-      ``CREATE INDEX ASYNC``, i.e. only after Full Load has written every row --
-      the same late-failure shape as :class:`TooManyIndexesRule`, and the reason
-      this belongs at planning time rather than in the apply log.
+    - a **secondary index** over 8 columns would fail its ``CREATE INDEX ASYNC``
+      wherever the index is created -- on the empty table at Schema Conversion's
+      apply, before a Drop & reload loads the recreated table, or after the data for
+      an index the Full Load did not get to before the rows (e.g. on a table it
+      recreates partway through) -- so the converter leaves it out and the data lands
+      without it, the reason this belongs at planning time rather than in the apply
+      log.
 
     Classified by the worst case present: UNSUPPORTED when the primary key itself
     is over the limit (no data can land), MANUAL when only secondary indexes are
@@ -1355,9 +1360,11 @@ class TooManyKeyColumnsRule(Rule):
                 )
             if wide_indexes:
                 when.append(
-                    "A wide secondary index is left out of the converted DDL (it would "
-                    "fail its CREATE INDEX ASYNC after Full Load), so queries relying on it "
-                    "fall back to a scan, and a UNIQUE one's uniqueness is not enforced"
+                    "A wide secondary index is left out of the converted DDL (its CREATE "
+                    "INDEX ASYNC would fail with that error wherever the index is created, "
+                    "normally on the empty table at Schema Conversion's apply), so queries "
+                    "relying on it fall back to a scan, and a UNIQUE one's uniqueness is "
+                    "not enforced"
                 )
 
             findings.append(

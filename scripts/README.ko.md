@@ -28,7 +28,8 @@ _언어: [English](README.md) | **한국어**_
   ```bash
   python -m venv .venv && .venv/bin/pip install -e .
   ```
-- **연결 설정은 환경변수 / `.env`로** (`.env.example` → `.env` 복사). 스크립트가 읽는 값:
+- **연결 설정은 환경변수 / `.env`로** (리포 루트의 git-ignore된 `.env` 파일, 한 줄에 하나씩
+  `KEY=value`). 스크립트가 읽는 값:
 
   | 변수 | 대상 | 비고 |
   |---|---|---|

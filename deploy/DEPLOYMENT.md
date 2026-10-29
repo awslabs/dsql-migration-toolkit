@@ -115,7 +115,8 @@ for a real migration use **[ECS Fargate](#deploy-on-ecs-fargate)**.
 > - **With it** — the session resumes where you left off and the re-run reuses your
 >   applied schema.
 >
-> Treat the value as a secret (see [`.env.example`](../.env.example)).
+> Treat the value as a secret and keep it out of version control: the app also reads it
+> from a git-ignored `.env` file in the repository root.
 
 ---
 
@@ -557,7 +558,7 @@ Optional deep-dives — expand what you need; none of this is required for a fir
 | `CertificateArn` | yes | — | ACM cert ARN for the HTTPS (443) listener. |
 | `ContainerImageUri` | no | published ECR Public image | Defaults to the image published on ECR Public — no build needed. Override only for a restricted network (your private ECR copy / pull-through cache) or a custom build; prefer an immutable tag or digest. |
 | `ContainerCpu` | no | `512` | Fargate task CPU units. **A MySQL Full Load is CPU-bound** (reading and converting rows keeps about one core busy per table loading at once), so raise this for a large migration and set the Full Load's *Tables in parallel* to the vCPU count — measured, `16384` (16 vCPU) with *Tables in parallel* 16 loaded 16 MySQL tables at **~193K rows/s** with every core busy. A PostgreSQL Full Load needs far fewer cores (it is bound by Aurora DSQL). Default `512` is fine for evaluation; use **4096 or higher** for a real large-scale Full Load. See [manual §7.2](../docs/manual/en/07-performance-and-tuning.md#72-tuning-parallelism). |
-| `ContainerMemory` | no | `1024` | Fargate task memory (MiB) — a **hard limit**: exceed it and the kernel OOM-kills the task (no graceful shutdown, only a CloudWatch spike + ELB timeout). Memory is bounded by the buffered pipeline — roughly `table_parallelism × (prefetch + batch_parallelism) × per-batch-bytes` **summed across the worker processes**, not by table size — and **wide / oversized-LOB rows push per-batch bytes up**, so the `1024` default can be tight for a real load with concurrent source writes. **Sizing:** `1024` is fine for evaluation / small tables; use **≥ 2048** for a real Full Load, and **≥ 4096** (which also needs `ContainerCpu` ≥ 2048) when tables have large `TEXT`/`BLOB` values or you raise the parallelism settings. Must be valid for the CPU (Fargate pairs `512` CPU with 1–4 GB, `1024` with 2–8 GB, `2048` with 4–16 GB, `4096` with 8–30 GB — see the sizing table below). The app logs a memory high-water and an ~80% pressure warning (in the activity log too) so an approaching OOM is visible before the kill. |
+| `ContainerMemory` | no | `1024` | Fargate task memory (MiB) — a **hard limit**: exceed it and the kernel OOM-kills the task (no graceful shutdown, only a CloudWatch spike + ELB timeout). Memory is bounded by the buffered pipeline — roughly `table_parallelism × (prefetch + batch_parallelism) × per-batch-bytes` **summed across the worker processes**, not by table size — and **wide / oversized-LOB rows push per-batch bytes up**, so the `1024` default can be tight for a real load with concurrent source writes. **Sizing:** `1024` is fine for evaluation / small tables; use **≥ 2048** for a real Full Load, and **≥ 4096** (`4096` itself is valid with `ContainerCpu` `512`, `1024` or `2048`) when tables have large `TEXT`/`BLOB` values or you raise the parallelism settings. Must be valid for the CPU (Fargate pairs `512` CPU with 1–4 GB, `1024` with 2–8 GB, `2048` with 4–16 GB, `4096` with 8–30 GB — see the sizing table below). The app logs a memory high-water and an ~80% pressure warning (in the activity log too) so an approaching OOM is visible before the kill. |
 | `AppPort` | no | `8080` | Container listen port. |
 | `AssignPublicIp` | no | `DISABLED` | `ENABLED` to run the task in public subnets without a NAT (test); **recommended: keep `DISABLED`** for production (NAT gateway or VPC endpoints). |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | CIDR allowed to reach the ALB on 443. **Recommended: scope to your network**, not `0.0.0.0/0`. |
@@ -602,8 +603,9 @@ shutdown). Pick a valid pair:
   `table_parallelism × batch_parallelism` across worker processes — the `512`/`1024`
   default has OOM-killed a load that ran with concurrent source writes.
 - **Large tables with big `TEXT`/`BLOB`, or raised parallelism:** **`4096` CPU /
-  `8192`+ MiB** — wide rows enlarge each buffered batch. (To go above 4 GB memory you
-  must also raise CPU: 4 GB needs CPU ≥ `1024`, 8 GB needs CPU ≥ `2048`.)
+  `8192`+ MiB** — wide rows enlarge each buffered batch. (Memory and CPU rise together:
+  more than 4 GB needs CPU ≥ `1024`, more than 8 GB ≥ `2048`, more than 16 GB ≥ `4096`,
+  and `4096` CPU in turn needs at least 8 GB — see the table above.)
 
 > [!TIP]
 > Memory to raise it is a **redeploy** (the stack updates the task in place) — Fargate
@@ -689,20 +691,20 @@ Conversion → Data Migration → Validation → Cut over).
 
 #### Observability & runtime diagnostics
 
-Deployment is deliberately parameter-light: **log level and CloudWatch
-mirroring of the activity log are not CloudFormation parameters** — adjust them
-at runtime from **Settings → Diagnostics** in the app (the gear in the sidebar
+Deployment is deliberately parameter-light: **the log level is not a
+CloudFormation parameter, and CloudWatch mirroring of the activity log is one
+only to have it on from the start** (`EnableActivityLogCloudWatch`) — adjust both
+at runtime from **Settings → Activity log** in the app (the gear in the sidebar
 footer), no redeploy:
 
 - **Log level** — flip `INFO`/`DEBUG` while troubleshooting (DEBUG adds Python
   stacktraces to failure events; never row values or credentials).
-- **Send to CloudWatch (stdout)** — toggle on to stream the activity log to
+- **Mirror to CloudWatch Logs** — toggle on to stream the activity log to
   stdout, which the container's `awslogs` driver forwards to this stack's
   CloudWatch log group (a durable audit copy that survives task replacement).
 - **Download activity log** — pull the full UTC, one-line-per-event timeline
-  (connection / assessment / schema apply / Full Load / CDC) from the
-  **Activity log** tab of the same dialog. The file is size-capped and rotated
-  on `/tmp`.
+  (connection / assessment / schema apply / Full Load / CDC) from the same tab.
+  The file is size-capped and rotated on `/tmp`.
 
 Changes apply app-wide (single task) and reset to startup defaults on restart;
 advanced operators can set the startup defaults via the
@@ -899,7 +901,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 | DSQL auth errors | `DsqlClusterArn` scope, region (`DSQL_MIGRATOR_AWS_REGION`), and task-role `dsql:DbConnect`. |
 | Bedrock errors when AI on | `BedrockModelArns` scope, the model enabled for the account (its agreement accepted, §8), and egress to the Bedrock endpoint. |
 | AI replies denied with *the configured model is not enabled for this AWS account yet* (Verify AI access may have passed at first) | The model's one-time AWS Marketplace agreement is not in place: the first calls passed while the background subscription was attempted, and it failed because the task role (by design) cannot subscribe. Someone with AWS Marketplace permissions accepts it (Bedrock console, or `list-foundation-model-agreement-offers` + `create-foundation-model-agreement`, §8); wait about 2 minutes, then run Verify AI access again. No task-role change. |
-| Need more detail when diagnosing a failure | Set log level to `DEBUG` under **Settings → Diagnostics** (the gear in the sidebar footer) to add Python stacktraces to activity-log failure events; toggle "Send to CloudWatch (stdout)" for a durable copy. No redeploy. |
+| Need more detail when diagnosing a failure | Set log level to `DEBUG` under **Settings → Activity log** (the gear in the sidebar footer) to add Python stacktraces to activity-log failure events; toggle "Mirror to CloudWatch Logs" for a durable copy. No redeploy. |
 
 ### Security notes
 

@@ -2424,8 +2424,10 @@ class BatchedImporter:
                         f"{'UNIQUE ' if _unique else ''}{_index_name_of(ddl)}: "
                         f"{_safe_error(exc)}{unconfirmed[0]}"
                     )
+                    # Not "post-load": the same pass submits a Drop & reload table's
+                    # indexes on the empty table before its rows load (P4d).
                     _LOGGER.warning(
-                        "Post-load index creation failed (data is unaffected): %s",
+                        "Index creation failed (data is unaffected): %s",
                         failures[-1],
                     )
                 else:
