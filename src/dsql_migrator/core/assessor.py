@@ -157,6 +157,8 @@ _SPATIAL_TYPE_BASES = frozenset(
         "multilinestring",
         "multipolygon",
         "geometrycollection",
+        # MySQL 8.0+ reports GEOMETRYCOLLECTION as "geomcollection" in COLUMN_TYPE.
+        "geomcollection",
     }
 )
 
