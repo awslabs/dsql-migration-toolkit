@@ -116,9 +116,10 @@ Load**와 **Validation**은 환경 변수나 **Settings**(§7.6)로 튜닝하고
 >   코어 하나의 속도로 적재됩니다(측정에서 호스트에 따라 약 25,000–55,000 rows/s).
 >   binlog 시작 지점이 있는 **Full load + CDC**에서 2 이상을 명시하면, 모든 unique 키가 선행 키
 >   컬럼을 포함하는 테이블은 대신 별도 스냅샷으로 읽는 부분으로 나누어 부분마다 프로세스 하나가
->   읽습니다(150M 행을 16개 부분으로: 약 164,000 rows/s, 세션 하나로는 약 55,500). 그러면 복사본은
->   CDC가 재생해야 일관되며, 그때까지 도구는 그 테이블의 체크 해제, Full load only로의 전환, 더
->   나중 지점에서의 CDC 시작을 거부합니다([§3.8](03-full-load.md#38-병렬-적재)).
+>   읽습니다(150M 행을 16개 부분으로: 전체 약 164,000 rows/s, 세션 하나로는 안정 구간 약 55,500).
+>   그러면 복사본은 CDC가 재생해야 일관되므로, 도구는 그 재생을 건너뛰는 경로인 그 테이블의 체크
+>   해제, Full load only로의 전환, 더 나중 지점에서의 CDC 시작을
+>   거부합니다([§3.8](03-full-load.md#38-병렬-적재)).
 >
 > **트레이드오프:** PostgreSQL에서, 그리고 MySQL의 별도 스냅샷 부분에서 K > 1은 놀던 slot을 같은
 > 테이블에 대한 동시 읽기로 바꾸며, 그 테이블을 다 읽을 때까지 이어지므로, 그동안 소스 읽기
@@ -316,8 +317,8 @@ Length**)의 purge를 막아 undo/디스크 사용량이 늘고 읽기가 느려
 - 큰 테이블의 read view는 그 테이블을 다 읽을 때까지 유지된다고 보세요: 자동 분할은 모든 구간을 세션
   하나에서, 스냅샷 하나로 읽습니다. binlog 시작 지점이 있는 Full load + CDC에서는
   *Reader shards per large table*을 2 이상으로 명시하면 이를 줄여 각 read view가 자기 구간을 읽는
-  동안만 유지되며, 그 대가는 그 테이블에 대한 동시 읽기(§7.2)와, CDC가 재생할 때까지 이어지는
-  [§3.8](03-full-load.md#38-병렬-적재)의 거부입니다.
+  동안만 유지되며, 그 대가는 그 테이블에 대한 동시 읽기(§7.2)와 [§3.8](03-full-load.md#38-병렬-적재)의
+  거부입니다.
 - History List Length를 모니터링하고, 시작 전에 여유 공간을 확보해 undo 증가가 storage-full을
   유발하지 않게 합니다.
 
@@ -363,7 +364,7 @@ Aurora DSQL의 상태가 모두 수치를 움직이며, `scripts/measure_perform
 
 > [!note] 이 수치가 나온 조건 서울(`ap-northeast-2`), 16 vCPU / 120 GB ECS Fargate 태스크 하나에서
 > 실행한 도구, `db.r8g.16xlarge`의 Aurora MySQL·Aurora PostgreSQL 소스, 그리고 *Tables in parallel*
-> 16을 뺀 모든 설정이 기본값(Reader shards 자동, Batches per table 8).
+> 16을 뺀 모든 설정이 기본값(Reader shards는 행에 따로 적지 않으면 자동, Batches per table 8).
 
 | 적재 | 결과 |
 |---|---|
@@ -381,8 +382,8 @@ Aurora DSQL의 상태가 모두 수치를 움직이며, `scripts/measure_perform
   3초)과 컴퓨트 비용(`ComputeDPU`, 약 4배)만 올랐습니다. 키 범위 4개로 분산하자 10M 행 테이블이 전체
   약 37,000–40,000 rows/s(피크 54,000–60,000)로 적재됐고, 엔진마다 하나씩 그런 테이블 두 개는 합쳐서
   127,000에 이르며 계속 오르고 있었습니다. 키 범위 하나의 약 20,000 rows/s와 비교하면, 위의 150M 행
-  테이블은 PostgreSQL에서 약 10배, 부분으로 나눈 MySQL에서 8배, 세션 하나의 MySQL에서 2.8배 빨리
-  적재됐습니다.
+  테이블은 PostgreSQL에서 약 10배, 부분으로 나눈 MySQL에서 8배(둘 다 전체 기준), 세션 하나의
+  MySQL에서 2.8배(안정 구간 기준) 빨리 적재됐습니다.
 - **보조 인덱스는 빈 테이블에 만듭니다.** 8.5M 행에 보조 인덱스 25개(MySQL)인 경우, 행보다 먼저
   인덱스를 만든 Drop & reload는 처음부터 끝까지 512초에 끝났고, 적재 후에 인덱스를 빌드하면
   873초였습니다. 인덱스가 있는 테이블에는 행이 더 느리게 적재됐지만(485초 대 262초), 빌드는 빈
@@ -400,11 +401,12 @@ Aurora DSQL의 상태가 모두 수치를 움직이며, `scripts/measure_perform
 처리량이 필요하면 §7.2의 CDC 파라미터로 확장하세요.
 
 > **직접 재현:** `scripts/measure_performance.py full-load`는 처리량(테이블별, 시간 구간별), 쓰기
-> 경로의 재시도와 지연, 그리고 Aurora DSQL이 인덱스 빌드를 끝낸 시점을 보고합니다. `--reader-shards`와
-> `--cdc-mode`로 위의 각 행을 구성하고, `scripts/measure_performance.py cdc-lag`로 복제 지연을
-> 잽니다(활성 CDC 파이프라인이 필요). `full-load`는 대상 테이블을 **DROP 후 재생성**하므로(`--yes`
-> 필요) **비프로덕션 타깃에서만** 쓰세요. 공정하게 비교하려면 이전 사본을 먼저 삭제하고 Aurora DSQL이
-> 백그라운드 작업을 끝내게 하세요(`--wait-sys-jobs`가 실행 시작 전에 이를 기다립니다).
+> 경로의 재시도와 지연, 그리고 Aurora DSQL이 인덱스 빌드를 끝낸 시점을 보고합니다.
+> `--table-parallelism`, `--reader-shards`, `--cdc-mode`로 위의 각 행을 구성하고,
+> `scripts/measure_performance.py cdc-lag`로 복제 지연을 잽니다(활성 CDC 파이프라인이 필요).
+> `full-load`는 대상 테이블을 **DROP 후 재생성**하므로(`--yes` 필요) **비프로덕션 타깃에서만**
+> 쓰세요. 공정하게 비교하려면 이전 사본을 먼저 삭제하고 Aurora DSQL이 백그라운드 작업을 끝내게
+> 하세요(`--wait-sys-jobs`가 실행 시작 전에 이를 기다립니다).
 
 ---
 

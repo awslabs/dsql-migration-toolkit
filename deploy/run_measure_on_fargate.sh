@@ -31,6 +31,7 @@
 #   AWS_REGION=us-east-1 \
 #   APP_STACK=customer-migration-test \
 #   DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+#   TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 #   MEASURE_SCHEMA=customers_sample MEASURE_TABLES="payments orders" \
 #   deploy/run_measure_on_fargate.sh
 #
@@ -40,6 +41,9 @@
 #   DB_HOST/PORT/USER/PASSWORD   source MySQL connection (PASSWORD is passed as a
 #                    task env override -- prefer a short-lived/test credential; for
 #                    production use a Secrets Manager secret + task-def `secrets`).
+#   TARGET_ENDPOINT  (required) the Aurora DSQL cluster endpoint: the app task-def
+#                    does not bake one in. TARGET_REGION / TARGET_DATABASE /
+#                    TARGET_USERNAME are passed on when set.
 #   MEASURE_SCHEMA   schema to load (default: customers_sample)
 #   MEASURE_TABLES   space-separated table subset (default: all registered)
 #   VARIANTS         which variants to run, space-separated (default: "off on";

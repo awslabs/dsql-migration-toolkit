@@ -173,7 +173,7 @@ table than over loaded rows
 so a table's secondary indexes exist before its rows: Schema Conversion's apply creates
 them with the table, and a **Drop & reload** creates them again on the recreated table,
 then waits up to 10 minutes for Aurora DSQL to build them before the first row loads.
-Only an index the run could not create first (for example on a table it recreates
+Only an index the run did not get to before the rows (for example on a table it recreates
 partway through) is created after every table's data has loaded. With the indexes in
 place, a row that a `UNIQUE` index other than the primary key rejects is quarantined
 (§3.6), and the rest of the table loads.
@@ -184,8 +184,9 @@ so it could be another table's) and the Full Load panel shows it as **not confir
 as missing: check the target before you add it. The panel says a constraint is missing
 only when a `UNIQUE` index is known not to have been created.
 
-Aurora DSQL builds each index in the background, and a Full Load's reported time ends when
-its indexes are submitted, not built. The Data Migration step shows the builds:
+Aurora DSQL builds each index in the background. A Full Load waits for the builds only
+before a Drop & reload loads its rows, and for at most 10 minutes, so a build can still
+be running when the run reports done. The Data Migration step shows the builds:
 
 | The step shows | What it means | What to do |
 |---|---|---|
@@ -437,10 +438,10 @@ one key range of a table at about 20,000 rows/s: spread over several, its writes
   2,500,000 estimated rows from 5,000,000 rows, at most 32 (10M rows: 4 ranges); `1` =
   off; `2`–`32` = exactly that many (below). The estimates are the start point's scan-free
   ones, and nothing is split when `TABLE_PARALLELISM` is 1.
-  - **PostgreSQL**: every range imports one shared snapshot, so the copy is one point in
-    time, as with one reader. The table is read by as many workers as its share of the
-    run's estimated rows (at most `TABLE_PARALLELISM`), each reading a block of its
-    ranges.
+  - **PostgreSQL**: every range is read from one snapshot, which the table's workers
+    share, so the copy is one point in time, as with one reader. The table is read by as
+    many workers as its share of the run's estimated rows (at most `TABLE_PARALLELISM`),
+    each reading a block of its ranges.
   - **MySQL**: one reader session reads every range from one snapshot, a page of each in
     turn, so the copy is one point in time, as with one reader, in Full load only and Full
     load + CDC alike. The table takes one source connection and one worker.

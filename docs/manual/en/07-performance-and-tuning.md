@@ -128,10 +128,11 @@ measurements in §7.5.
 >   depending on the host).
 >   In **Full load + CDC** from a binlog start point, an explicit value of 2 or more reads
 >   it in separate-snapshot parts instead, one process each, if every unique key includes
->   the leading key column (150M rows in 16 parts: about 164,000 rows/s, against about
->   55,500 in one session). The copy is then consistent only once CDC replays it, and
->   until then the tool refuses to untick the table, to switch to Full load only or to
->   start CDC from a later point ([§3.8](03-full-load.md#38-parallel-loading)).
+>   the leading key column (150M rows in 16 parts: about 164,000 rows/s overall, against
+>   about 55,500 steady in one session). The copy is then consistent only once CDC
+>   replays it, so the tool refuses the routes that would skip that replay: unticking the
+>   table, switching to Full load only, or starting CDC from a later point
+>   ([§3.8](03-full-load.md#38-parallel-loading)).
 >
 > **The trade-off:** on PostgreSQL, and for MySQL's separate-snapshot parts, K > 1 turns
 > idle slots into concurrent reads of the same table for its whole read, so the source
@@ -353,8 +354,7 @@ purge horizon. To limit it:
   every range in one session, from one snapshot. In Full load + CDC from a binlog start
   point, an explicit *Reader shards per large table* of 2 or more shortens it, so each
   read view lasts only while its own range is read, at the cost of concurrent reads of
-  that table (§7.2) and of the refusals in [§3.8](03-full-load.md#38-parallel-loading)
-  until CDC replays it.
+  that table (§7.2) and of the refusals in [§3.8](03-full-load.md#38-parallel-loading).
 - Monitor History List Length, and provision free-space headroom before you start so undo
   growth cannot trip a storage-full condition.
 
@@ -404,7 +404,7 @@ your own environment with `scripts/measure_performance.py` (below).
 > [!note] The conditions these numbers came from Seoul (`ap-northeast-2`), the tool on one
 > ECS Fargate task of 16 vCPU / 120 GB, Aurora MySQL and Aurora PostgreSQL sources on
 > `db.r8g.16xlarge`, and every setting at its default except *Tables in parallel* 16
-> (Reader shards automatic, Batches per table 8).
+> (Reader shards automatic unless a row says otherwise, Batches per table 8).
 
 | Load | Result |
 |---|---|
@@ -423,8 +423,8 @@ What they, and smaller runs on a 4 vCPU task with `db.r7g.large` sources, show:
   same rows/s. Spread over 4 key ranges, a 10M-row table loaded at about 37,000–40,000
   rows/s overall (54,000–60,000 at its peak), and two such tables, one per engine, at
   127,000 together and still rising. Against the ~20,000 rows/s of one key range, the
-  150M-row table above loaded about 10× faster on PostgreSQL, 8× on MySQL in parts and
-  2.8× on MySQL in one session.
+  150M-row table above loaded about 10× faster on PostgreSQL and 8× on MySQL in parts
+  (overall), and 2.8× on MySQL in one session (steady).
 - **Secondary indexes go on the empty table.** With 25 secondary indexes over 8.5M rows
   (MySQL), a Drop & reload that created them before the rows ended in 512 s end to end,
   against 873 s with the indexes built after the load. The rows loaded more slowly into
@@ -445,12 +445,12 @@ visible on DSQL at roughly p50 0.8s / p95 1.3s under a sustained load, and p50 0
 
 > **Reproduce it:** `scripts/measure_performance.py full-load` reports the throughput (per
 > table and per time window), the write path's retries and latencies, and when Aurora DSQL
-> finished the index builds; `--reader-shards` and `--cdc-mode` set up the rows above, and
-> `scripts/measure_performance.py cdc-lag` measures replication lag (it needs an active
-> CDC pipeline). `full-load` **drops and recreates** the target tables (needs `--yes`), so
-> use it **only on a non-production target**. For a fair comparison, drop the previous
-> copy first and let Aurora DSQL finish its background jobs (`--wait-sys-jobs` waits for
-> them before the run starts).
+> finished the index builds; `--table-parallelism`, `--reader-shards` and `--cdc-mode` set
+> up the rows above, and `scripts/measure_performance.py cdc-lag` measures replication lag
+> (it needs an active CDC pipeline). `full-load` **drops and recreates** the target tables
+> (needs `--yes`), so use it **only on a non-production target**. For a fair comparison,
+> drop the previous copy first and let Aurora DSQL finish its background jobs
+> (`--wait-sys-jobs` waits for them before the run starts).
 
 ---
 

@@ -34,7 +34,7 @@ Aurora DSQL (sub-millisecond network RTT).
 | **ECS Fargate** | 16 vCPU, 120 GB memory (the largest task) |
 | **Sources** | Aurora MySQL and Aurora PostgreSQL, `db.r8g.16xlarge` |
 | **Target** | Aurora DSQL, `ap-northeast-2` |
-| **Loader settings** | *Tables in parallel* 16, everything else at its default (*Reader shards per large table* automatic, *Batches per table* 8, *Rows per batch* 2000) |
+| **Loader settings** | *Tables in parallel* 16, everything else at its default (*Reader shards per large table* automatic unless a run says otherwise, *Batches per table* 8, *Rows per batch* 2000) |
 | **Measurement** | `scripts/measure_performance.py full-load`, run as a one-off ECS task |
 
 | Run | Rows | Time | Overall | Steady | What limited it |
@@ -51,8 +51,8 @@ Aurora DSQL (sub-millisecond network RTT).
   about 20,000 rows/s whatever is in flight, so a large table goes faster only with its
   writes spread over key ranges, which the loader does by default
   ([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)). Against one range per
-  table, the 150M-row table loaded about 10× faster on PostgreSQL, 8× on MySQL in parts
-  and 2.8× on MySQL in one session.
+  table, the 150M-row table loaded about 10× faster on PostgreSQL and 8× on MySQL in parts
+  (overall), and 2.8× on MySQL in one session (steady).
 - **A MySQL load is bound by the task's CPU, a PostgreSQL load by Aurora DSQL.** Reading
   and converting MySQL rows keeps about one core busy per table or part loading at once;
   PostgreSQL values pass through, so 16 tables loaded at 336K rows/s on about 3.5 cores.
@@ -108,6 +108,7 @@ captured tables ([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
 ```bash
 AWS_REGION=<region> APP_STACK=<app-stack> \
 DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
 TABLE_PARALLELISM=16 VARIANTS=auto \
 deploy/run_measure_on_fargate.sh

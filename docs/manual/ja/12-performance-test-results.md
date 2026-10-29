@@ -29,7 +29,7 @@ _言語: [English](../en/12-performance-test-results.md) | [한국어](../ko/12-
 | **ECS Fargate** | 16 vCPU、120 GB メモリ (最大のタスク) |
 | **ソース** | Aurora MySQL と Aurora PostgreSQL、`db.r8g.16xlarge` |
 | **ターゲット** | Aurora DSQL、`ap-northeast-2` |
-| **ローダー設定** | *Tables in parallel* 16、それ以外はすべて既定 (*Reader shards per large table* は自動、*Batches per table* 8、*Rows per batch* 2000) |
+| **ローダー設定** | *Tables in parallel* 16、それ以外はすべて既定 (*Reader shards per large table* は実行に別の記載がない限り自動、*Batches per table* 8、*Rows per batch* 2000) |
 | **測定** | `scripts/measure_performance.py full-load` を単発の ECS タスクとして実行 |
 
 | 実行 | 行数 | 所要時間 | 全体 | 定常 | 律速要因 |
@@ -42,7 +42,7 @@ _言語: [English](../en/12-performance-test-results.md) | [한국어](../ko/12-
 
 ### スループットを左右する要因
 
-- **効くのは進行中のバッチ数ではなくキー範囲です。** Aurora DSQL はテーブルの 1 つのキー範囲を、進行中の数にかかわらず約 20,000 rows/s で書き込むため、大きなテーブルは書き込みをキー範囲に分散して初めて速くなります。ローダーは既定でこれを行います ([§7.2](07-performance-and-tuning.md#72-並列度のチューニング))。テーブルごとに 1 区間の場合と比べ、150M 行のテーブルは PostgreSQL で約 10 倍、部分に分けた MySQL で 8 倍、1 セッションの MySQL で 2.8 倍速くロードされました。
+- **効くのは進行中のバッチ数ではなくキー範囲です。** Aurora DSQL はテーブルの 1 つのキー範囲を、進行中の数にかかわらず約 20,000 rows/s で書き込むため、大きなテーブルは書き込みをキー範囲に分散して初めて速くなります。ローダーは既定でこれを行います ([§7.2](07-performance-and-tuning.md#72-並列度のチューニング))。テーブルごとに 1 区間の場合と比べ、150M 行のテーブルは PostgreSQL で約 10 倍、部分に分けた MySQL で 8 倍 (いずれも全体)、1 セッションの MySQL で 2.8 倍 (定常) 速くロードされました。
 - **MySQL のロードはタスクの CPU に、PostgreSQL のロードは Aurora DSQL に律速されます。** MySQL の行の読み取りと変換は、同時にロードするテーブルまたは部分ごとにほぼ 1 コアを使います。PostgreSQL の値はそのまま通過するため、16 テーブルのロードは約 3.5 コアで 336K rows/s に達しました。*Tables in parallel* はタスクの vCPU 数に設定してください。
 - **巨大な MySQL テーブル 1 つは、既定では 1 コアの速さでロードされます。** 1 つのセッションがその区間を 1 つのスナップショットから読むためです。binlog の開始位置からの Full load + CDC では、*Reader shards per large table* を明示的に指定すると、別々のスナップショットで読む部分に分けて複数のコアで読み、CDC が再生した時点で一貫します ([§3.8](03-full-load.md#38-並列ロード))。
 - **新しいテーブルにはウォームアップがあります。** Aurora DSQL は新しいテーブルをパーティション 1 つで始め、大きくなるにつれて分割するため、ロードの最初の 1 分ほどは定常の速さより遅くなります。
@@ -74,6 +74,7 @@ CDC はボトルネックの位置が Full Load と異なるパイプライン�
 ```bash
 AWS_REGION=<region> APP_STACK=<app-stack> \
 DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
 TABLE_PARALLELISM=16 VARIANTS=auto \
 deploy/run_measure_on_fargate.sh

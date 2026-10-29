@@ -33,7 +33,7 @@ Connect**)에서 수행했습니다(1ms 미만 네트워크 RTT).
 | **ECS Fargate** | 16 vCPU, 120 GB 메모리(가장 큰 태스크) |
 | **소스** | Aurora MySQL과 Aurora PostgreSQL, `db.r8g.16xlarge` |
 | **타깃** | Aurora DSQL, `ap-northeast-2` |
-| **로더 설정** | *Tables in parallel* 16, 나머지는 모두 기본값(*Reader shards per large table* 자동, *Batches per table* 8, *Rows per batch* 2000) |
+| **로더 설정** | *Tables in parallel* 16, 나머지는 모두 기본값(*Reader shards per large table*은 실행에 따로 적지 않으면 자동, *Batches per table* 8, *Rows per batch* 2000) |
 | **측정 도구** | `scripts/measure_performance.py full-load`, 일회성 ECS 태스크로 실행 |
 
 | 실행 | 행 | 시간 | 전체 | 안정 구간 | 제한 요인 |
@@ -49,8 +49,8 @@ Connect**)에서 수행했습니다(1ms 미만 네트워크 RTT).
 - **동시 진행 배치가 아니라 키 범위입니다.** Aurora DSQL은 테이블의 키 범위 하나를 동시 진행 수와
   관계없이 약 20,000 rows/s로 쓰므로, 큰 테이블은 쓰기를 여러 키 범위로 분산해야만 빨라지며, 로더가
   기본으로 이를 합니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)). 테이블당 범위 하나와
-  비교하면 150M 행 테이블은 PostgreSQL에서 약 10배, 부분으로 나눈 MySQL에서 8배, 세션 하나의
-  MySQL에서 2.8배 빨리 적재됐습니다.
+  비교하면 150M 행 테이블은 PostgreSQL에서 약 10배, 부분으로 나눈 MySQL에서 8배(둘 다 전체 기준),
+  세션 하나의 MySQL에서 2.8배(안정 구간 기준) 빨리 적재됐습니다.
 - **MySQL 적재는 태스크의 CPU에, PostgreSQL 적재는 Aurora DSQL에 묶입니다.** MySQL 행을 읽고
   변환하느라 동시에 적재되는 테이블 또는 부분마다 코어 약 하나가 바쁩니다. PostgreSQL 값은 그대로
   통과하므로 테이블 16개가 코어 약 3.5개로 336K rows/s에 적재됐습니다. *Tables in parallel*을
@@ -102,6 +102,7 @@ CDC는 병목 지점이 Full Load와 다른 파이프라인입니다: `Debezium(
 ```bash
 AWS_REGION=<region> APP_STACK=<app-stack> \
 DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
 TABLE_PARALLELISM=16 VARIANTS=auto \
 deploy/run_measure_on_fargate.sh
