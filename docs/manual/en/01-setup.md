@@ -50,8 +50,8 @@ each; only where the tool *process* runs differs.
     rejects a major version.
 - A target **Amazon Aurora DSQL** cluster in the **same AWS region** as the tool. DSQL has
   no password: you give the tool the cluster **endpoint** and your AWS identity (which must
-  be allowed to connect to that cluster), and it mints a short-lived IAM token per
-  connection.
+  be allowed to connect to that cluster), and it mints the short-lived IAM tokens itself,
+  renewing each before it expires.
 
 **For running locally**
 

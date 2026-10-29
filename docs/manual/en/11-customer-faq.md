@@ -111,9 +111,9 @@ Rows already written are skipped, so the retry costs re-read I/O, not duplicates
 
 With Full load + CDC, the stream replayed from the run's start point corrects every row
 that changed between the two reads; with Full load only, if the source took writes, re-run
-with **Drop & reload**. A MySQL table read in parts (*Reader shards per large table*,
-[§3.8](03-full-load.md#38-parallel-loading)) is not re-read: the table fails, and **Retry
-unfinished tables** loads it again.
+with **Drop & reload**. A MySQL table read in separate-snapshot parts (an explicit *Reader
+shards per large table* of 2 or more, [§3.8](03-full-load.md#38-parallel-loading)) is not
+re-read: the table fails, and **Retry unfinished tables** loads it again.
 
 Only **connection-level** failures retry; a data or schema error fails at once. If the
 retries run out, the per-table error says so and re-running is safe. Tune the attempts
@@ -128,20 +128,26 @@ needs those prerequisites (see Q12).
 
 **Q10. Can I tune Full Load throughput?**
 
-Yes, with bounded defaults you can raise for big hardware or lower to protect a busy
-source: `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` (tables at once, default 4),
-`…_BATCH_PARALLELISM` (in-flight batches per table, default 8), `…_BATCH_ROWS` (rows per
-write, default 2000, hard-capped at DSQL's 3000). Total concurrent DSQL connections ≈
-table × batch parallelism — keep it within the cluster's connection quota. See
-[Chapter 7 §7.2](07-performance-and-tuning.md#72-tuning-parallelism).
+Yes, but the defaults already apply what the live measurements found: a large table is
+read and written in primary-key ranges, and the batches in flight are capped at 4 per key
+range and 128 per run, so a run's DSQL connections stay well within the cluster's quota.
+The setting to raise for a large run is `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM`
+(*Tables in parallel*, default 4): set it to the task's vCPU count, or lower it to protect
+a busy source. `…_BATCH_PARALLELISM` (batches in flight per table, default 8) and
+`…_BATCH_ROWS` (rows per write, default 2000, hard-capped at DSQL's 3000) rarely need a
+change. See [Chapter 7 §7.2](07-performance-and-tuning.md#72-tuning-parallelism).
 
 **Q11. Why does raising parallelism sometimes not speed things up?**
 
-DSQL distributes storage **by primary key**, and a monotonic auto-incrementing PK (MySQL
-`AUTO_INCREMENT`, or a PostgreSQL `serial` / `IDENTITY` / sequence-backed key) makes every
-insert target the same "rightmost" key range — a **write hot-spot**. At high parallelism
-this raises the optimistic-concurrency conflict rate (`SQLSTATE 40001`), so throughput
-gains flatten. This is why Evaluation flags such monotonic PKs regardless of source engine
+Because DSQL distributes storage **by primary key**, and writes into one key range of a
+table run at about 20,000 rows/s whatever the batch size or the batches in flight: more
+in flight only waits there, adding commit latency and cost. What scales is spreading a
+table's writes over key ranges, which the Full Load does for a large table by default; on
+MySQL the task's CPU (about one core per table loading at once) can be the limit too
+([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)). After cut over, a monotonic
+auto-incrementing PK (MySQL `AUTO_INCREMENT`, or a PostgreSQL `serial` / `IDENTITY` /
+sequence-backed key) makes every insert target the same "rightmost" key range — a **write
+hot-spot**. This is why Evaluation flags such monotonic PKs regardless of source engine
 and Schema Conversion offers PK strategies (a cached identity — the default for a
 generated key — / keep integer / composite key). See
 [Chapter 7 §7.1](07-performance-and-tuning.md#primary-key-strategy--avoid-hot-partitions).

@@ -32,10 +32,11 @@ Source (MySQL / PostgreSQL)              Aurora DSQL
 ```
 
 1. **Capture a watermark** (a consistent point in the source's history).
-2. **Stream rows out** of the source by primary-key pages.
+2. **Stream rows out** of the source by primary-key pages (a large table's in several
+   primary-key ranges, so its writes spread, §3.8).
 3. **Convert** each value to its DSQL form as it flows.
-4. **Load** rows into DSQL in bounded, idempotent batches, concurrently.
-5. Build secondary **indexes** afterward.
+4. **Load** rows into DSQL in bounded, idempotent batches, concurrently, into tables that
+   already carry their secondary **indexes** (§3.4).
 
 **What the tool writes to your source.** The source is read **read-only** inside a
 consistent snapshot; the loader never modifies it. Beyond those reads only CDC touches a
@@ -166,13 +167,33 @@ sequence after the largest migrated key once the load finishes, so the applicati
 complete** (or accepted-gap) load — never on a partial/failed one; plain-integer keys have
 no sequence and are untouched.
 
-**Indexes come last.** Secondary indexes are created **after** all data batches succeed,
-and Aurora DSQL builds them asynchronously. A failed index statement is retried; if the
-retry finds an index of that name already there, the tool does not count it as created
-(index names are per schema in Aurora DSQL, so it could be another table's) and the Full
-Load panel shows it as **not confirmed**, not as missing: check the target before you add
-it. The panel says a constraint is missing only when a `UNIQUE` index is known not to have
-been created.
+**Secondary indexes come first.** On Aurora DSQL an index builds far faster on an empty
+table than over loaded rows
+([§7.5](07-performance-and-tuning.md#75-measured-on-live-infrastructure--what-backs-71-and-72)),
+so a table's secondary indexes exist before its rows: Schema Conversion's apply creates
+them with the table, and a **Drop & reload** creates them again on the recreated table,
+then waits up to 10 minutes for Aurora DSQL to build them before the first row loads. A
+table the run recreates later, or an index it could not submit before the rows, gets its
+indexes after every table's data has loaded (a Stop still submits the indexes of the
+tables already loaded). With the indexes in place, a row that a `UNIQUE` index other than
+the primary key rejects is quarantined (§3.6), and the rest of the table loads.
+
+A failed index statement is retried; if the retry finds an index of that name already
+there, the tool does not count it as created (index names are per schema in Aurora DSQL,
+so it could be another table's) and the Full Load panel shows it as **not confirmed**, not
+as missing: check the target before you add it. The panel says a constraint is missing
+only when a `UNIQUE` index is known not to have been created.
+
+Aurora DSQL builds each index in the background, and a Full Load's reported time ends when
+its indexes are submitted, not built. The Data Migration step shows the builds:
+
+| The step shows | What it means | What to do |
+|---|---|---|
+| *Waiting for Aurora DSQL to build the secondary indexes of N recreated table(s) before loading* | A Drop & reload put the indexes on the empty tables and waits for their builds | Nothing: the load starts once they are built, or after 10 minutes with any build still running left building |
+| *Aurora DSQL is building secondary indexes: n of m built* | The data is loaded; a query that needs an index is slower until it is built | Nothing: you can go on to the next step |
+| *Secondary indexes built: all m* | Every index the run submitted is built | — |
+| *UNIQUE index build failed: a constraint is missing*, or *Secondary index builds failed* | Aurora DSQL could not build the index; a failed `UNIQUE` one is a missing constraint | Fix the cause the notice names (for `UNIQUE`, remove the duplicates), drop the index if the table still lists it, and create it again, before cutting over |
+| *Secondary indexes not created yet (N table(s))* | The run ended before it submitted those tables' indexes (a stop or an app restart during that step, or Aurora DSQL not answering); no data is missing | **Retry unfinished tables**: it submits them without reloading any data |
 
 ---
 
@@ -308,7 +329,8 @@ different.
 ### Per-row quarantine (the table keeps loading)
 
 If **Aurora DSQL rejects a specific row** at apply time (for example a value over its 1
-MiB limit, or a constraint violation), the loader does **not** fail the table. It isolates
+MiB limit, or a constraint violation such as a duplicate value for a `UNIQUE` index other
+than the primary key), the loader does **not** fail the table. It isolates
 the offending row, **quarantines** it (recording its **primary key and the reason — never
 its values**), and loads the rest. Quarantined rows show up in a downloadable error log.
 
@@ -352,6 +374,7 @@ why.
 | A table failed after its retries (a temporary Aurora DSQL condition) | **Retry unfinished tables**; no row is quarantined for it. |
 | A table stopped on a value that cannot be written without changing it | Give the column a type that holds the values in Schema Conversion (re-run Step 1 first if the source type changed, then re-apply with **Replace**), or fix the source data or exclude the column, then retry the table. |
 | The run was interrupted (stop, crash, task replacement) | **Retry unfinished tables**: finished tables are kept, unfinished ones reload from their start, and the original watermark (the CDC handoff point) is reused ([§3.7](#37-resumability)). |
+| *Secondary indexes not created yet* (no data is missing) | **Retry unfinished tables**: it submits only those tables' missing indexes, without reloading any data (§3.4). |
 | You want a fresh copy and a new start point | **Re-run Full Load**, choosing **Drop & reload**. On a Full load + CDC migration whose CDC stack has streamed, first see [A new start point needs new CDC topics](#a-new-start-point-needs-new-cdc-topics). |
 
 ---
@@ -398,38 +421,54 @@ table unticked after the load is left as is on Aurora DSQL and no longer holds t
 ## 3.8 Parallel loading
 
 Tables load in parallel, each in its own worker process, so a Full Load can use every vCPU
-of the task it runs on. `table_parallelism` sets how many workers run at once.
+of the task it runs on. `table_parallelism` (*Tables in parallel*) sets how many workers
+run at once. A large table is also read in primary-key ranges, because Aurora DSQL writes
+one key range of a table at about 20,000 rows/s: spread over several, its writes go faster
+([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
 
 ### How it works
 
-- **Small tables** (not shardable, or below the row threshold): one worker each.
+- **Small tables** (below the split threshold, or without an integer leading primary-key
+  column): one worker each, with one reader.
 - **Large tables** whose leading PK column is an integer (a single integer PK, or a
-  composite PK with an integer leading column such as `(tenant_id, id)`) can have their
-  read split into K primary-key ranges, each loaded by its own worker. This reader-range
-  sharding is **off by default** (`full_load_reader_shards=1`; *Reader shards per large
-  table* in **Settings → Full Load**), and it only engages when `TABLE_PARALLELISM` is
-  above 1, for a table of at least `SHARD_MIN_ROWS` estimated rows. K is the setting, at
-  most 32 ÷ `TABLE_PARALLELISM`.
-  - **PostgreSQL**: in any run. Every range imports one shared snapshot, so the copy is
-    one point in time, as with one reader.
+  composite PK with an integer leading column such as `(tenant_id, id)`) are read in K
+  primary-key ranges. *Reader shards per large table* (**Settings → Full Load**,
+  `FULL_LOAD_READER_SHARDS`) sets K: `0` = automatic, the default: one range per
+  2,500,000 estimated rows from 5,000,000 rows, at most 32 (10M rows: 4 ranges); `1` =
+  off; `2`–`32` = exactly that many (below). The estimates are the start point's scan-free
+  ones, and nothing is split when `TABLE_PARALLELISM` is 1.
+  - **PostgreSQL**: every range imports one shared snapshot, so the copy is one point in
+    time, as with one reader. The table is read by as many workers as its share of the
+    run's estimated rows (at most `TABLE_PARALLELISM`), each reading a block of its
+    ranges.
+  - **MySQL**: one reader session reads every range from one snapshot, a page of each in
+    turn, so the copy is one point in time, as with one reader, in Full load only and Full
+    load + CDC alike. The table takes one source connection and one worker.
+- **An explicit 2 to 32** gives exactly that many ranges to a table of at least
+  `SHARD_MIN_ROWS` estimated rows, read the same way, except for separate-snapshot parts
+  on MySQL:
   - **MySQL**: only in **Full load + CDC** whose start point has a binlog file and
     position, and only a table whose every unique key on Aurora DSQL includes the leading
-    key column. MySQL cannot share a snapshot, so each range reads its own and a row whose
-    key changes during the read can be copied twice or not at all; CDC, started from the
-    start point taken before any read ([§3.5](#35-the-watermark--the-bridge-to-cdc)),
-    replays every change since then and corrects that. **Full load only** reads every
-    MySQL table with one reader: nothing would correct a split copy.
-  - A MySQL range is never re-read in place after a lost source connection: the table is
+    key column: each range is then a part, read by its own worker from its own snapshot.
+    MySQL cannot share a snapshot, so a row whose key changes during the read can be
+    copied twice or not at all; CDC, started from the start point taken before any read
+    ([§3.5](#35-the-watermark--the-bridge-to-cdc)), replays every change since then and
+    corrects that. Any other MySQL table is read by one session, as above.
+  - A MySQL part is never re-read in place after a lost source connection: the table is
     *Failed* with that reason (*range 2 of 4*), and **Retry unfinished tables** loads it
-    again. A PostgreSQL range re-reads its shared snapshot.
-- **All work units share one bounded pool**: each range takes one worker slot, so at most
-  `table_parallelism` units run at once.
+    again. A table read by one session is read again whole from a fresh snapshot, and a
+    PostgreSQL range re-reads its shared snapshot.
+- **All work units share one bounded pool**: each table, or part of one, takes one worker
+  slot, so at most `table_parallelism` units run at once, the ones that read the most rows
+  first.
 
 ### A table read in parts needs CDC's replay (MySQL)
 
-Until CDC has replayed it, a MySQL table read in parts is torn, so every route that would
-take it out of that replay is refused with the table's name and the way that ends the
-refusal:
+This applies only to the separate-snapshot parts above, which take an explicit *Reader
+shards per large table* of 2 or more: a run with the default setting reads no table in
+parts. Until CDC has replayed it, a MySQL table read in parts is torn, so every route that
+would take it out of that replay is refused with the table's name and the way that ends
+the refusal:
 
 - **Unticking it** in the table list after the load, or a table rule in *Exclude tables &
   columns* that unselects it: its checkbox is locked, with the reason on the lock icon.
@@ -443,15 +482,15 @@ refusal:
   deselected: they name it as one that cannot be deselected and do not offer Full load
   only.
 
-**Ending the refusal.** Set *Reader shards per large table* to 1 in Settings and reload
-the table (one reader, one snapshot) through the control the Full Load step shows for it —
-**Retry unfinished tables** while it is unfinished, **Reload specific tables** once every
-table has loaded — then do the operation. Full load only and a later start point have a
-second way: once CDC has replayed the table, run Validation in **CHECKSUM** mode with
-*Fast sweep* off: a match proves the copy and ends the refusal. Unticking the table has
-only the reload, before CDC starts: the replay needs CDC started, and from CDC's first
-Start the table set is fixed (only Start over changes it,
-[§13.7](13-excluding-tables-and-columns.md)).
+**Ending the refusal.** Set *Reader shards per large table* to 0 (automatic) or 1 (off) in
+Settings and reload the table (one reader session, one snapshot) through the control the
+Full Load step shows for it — **Retry unfinished tables** while it is unfinished,
+**Reload specific tables** once every table has loaded — then do the operation. Full load
+only and a later start point have a second way: once CDC has replayed the table, run
+Validation in **CHECKSUM** mode with *Fast sweep* off: a match proves the copy and ends
+the refusal. Unticking the table has only the reload, before CDC starts: the replay needs
+CDC started, and from CDC's first Start the table set is fixed (only Start over changes
+it, [§13.7](13-excluding-tables-and-columns.md)).
 
 The table stays marked until one of two things clears the mark: a load that recreates it
 (a **Drop & reload**), or a Validation whose **CHECKSUM** comparison matches it and
@@ -469,12 +508,11 @@ has caught up, the CHECKSUM match ends the Full load only and later-start-point 
 
 ### Tuning it
 
-For a large migration, set the worker count to the task's vCPU count — whole-table units
-and range units queue for the same slots. Reader shards help when a few large tables would
-leave slots idle, at the cost of concurrent reads of the same table
-([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)). The knobs
-(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`),
-their limits, and how they interact with source load live together in
+For a large migration, set *Tables in parallel* to the task's vCPU count: whole-table
+units and range units queue for the same slots. The split itself needs no setting. The
+knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`,
+`FULL_LOAD_READER_SHARDS`), their limits, and how they interact with source load live
+together in
 [Chapter 7 §7.2 — Tuning parallelism](07-performance-and-tuning.md#72-tuning-parallelism);
 the measured throughput this design achieves is in
 [Appendix: Performance test results](12-performance-test-results.md).

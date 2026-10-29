@@ -5,10 +5,12 @@ _Language: **English** | [한국어](../ko/07-performance-and-tuning.md) | [日�
 > **Prev:** [6. Limitations](06-limitations.md)
 
 The defaults fit Aurora DSQL's limits and keep the load on your source modest, so **most
-migrations need no tuning**. Read [§7.2](#72-tuning-parallelism) if a load is slower than
-you need, [§7.3](#73-minimizing-impact-on-the-source) if the source serves production
-traffic, and [§7.1](#71-what-the-tool-does-for-you-on-aurora-dsql) for what the tool
-already does to fit Aurora DSQL.
+migrations need no tuning**: a large table is already read and written in primary-key
+ranges, and the batches in flight are capped where Aurora DSQL stops gaining from more.
+For a large run, set *Tables in parallel* to the task's vCPU count
+([§7.2](#72-tuning-parallelism)). Read [§7.3](#73-minimizing-impact-on-the-source) if the
+source serves production traffic, and [§7.1](#71-what-the-tool-does-for-you-on-aurora-dsql)
+for what the tool already does to fit Aurora DSQL.
 
 > Every design choice below maps to a documented Aurora DSQL behavior or limit. Sources:
 > [DSQL quotas & limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html),
@@ -28,8 +30,9 @@ it:
 |---|---|
 | Write conflicts are detected at commit, and the losing transaction fails with `40001` (there are no row locks) | Keeps every write transaction small and idempotent (a Full Load batch or CDC chunk is at most 3,000 rows, written by primary key), so a re-run is cheap and safe |
 | A transaction holds at most 3,000 rows and 10 MiB, runs at most 5 minutes, and carries one DDL | Batches to at most 3,000 rows and an 8 MiB byte budget, and runs one DDL per transaction |
-| `CREATE INDEX ASYNC` builds an index without blocking | Loads the data first, then builds secondary indexes once over the stable data, instead of paying an index write on every `INSERT` (including rows a later CDC change overwrites) |
-| IAM tokens last about 15 minutes, and connections end after 60 | Mints a fresh token for every new connection, so hours-long CDC never stalls on authentication |
+| Storage is partitioned by primary key, so a primary-key-ordered stream of inserts goes to one key range at a time: measured, about 20,000 rows/s whatever the batch size or the batches in flight | Reads a large table in primary-key ranges, so its writes go to several key ranges at once, and caps the batches in flight at 4 per key range and 128 per run: more would only wait (§7.2) |
+| `CREATE INDEX ASYNC` builds an index in the background, far faster on an empty table than over loaded rows | Creates a table's secondary indexes while it is empty, before any row: Schema Conversion's apply does, and a **Drop & reload** does again and waits up to 10 minutes for the builds before loading. Measured, that ends a load sooner than building them afterward (§7.5) |
+| IAM tokens last about 15 minutes, and connections end after 60 | Renews the token before it expires, and at once if Aurora DSQL refuses it, so an hours-long load or CDC stream never stalls on authentication |
 | There is no logical-replication slot to target | Copies with its own bulk loader (keyset streaming: resumable, bounded memory), then streams changes through Debezium → MSK → a custom sink; Kafka buffers the changes, so the sink can fall behind during a conflict burst without losing events |
 
 **When a write fails.** After a `40001` conflict the tool re-runs the **whole
@@ -46,10 +49,11 @@ the sink sends it to the DLQ, and every healthy row still lands.
 
 Aurora DSQL **partitions and distributes storage by primary key**, and AWS's guidance is
 explicit: **"Choose a random primary key… Avoid patterns that increase contention on
-single keys."** A MySQL `AUTO_INCREMENT` key is monotonic, so every insert targets the
-same rightmost key range: during a fast load all workers converge on one partition, and
-the OCC conflict rate and write latency climb **even though the rows never logically
-conflict**.
+single keys."** A MySQL `AUTO_INCREMENT` key is monotonic, so every new row targets the
+same rightmost key range: the application's inserts after cut over (and CDC's while it
+streams them) converge on one partition, and write latency climbs **even though the rows
+never logically conflict**. The Full Load spreads a large table's writes over key ranges
+itself ([§7.2](#72-tuning-parallelism)).
 
 The tool flags such keys at **Evaluation** (`AUTO_INCREMENT` → `MANUAL`) and lets you
 choose a strategy per table in **Schema Conversion**: a cached identity column (the
@@ -66,12 +70,13 @@ many key ranges instead of one rightmost partition.
 Reach for it when a table's writes are demonstrably hot-partitioned (`CommitLatency` shows
 a long tail under load, seconds at p99 and tens of seconds at the maximum, while the OCC
 conflict rate stays near zero) **and** the table has a natural high-cardinality grouping
-column. In our in-VPC measurements, tuning the client (read-ahead, sharding the read,
-bigger batches, more write parallelism) moved a large-table Full Load by about 0%; only
-spreading the writes across key ranges moves a server-side hot partition. If the load is
-bound by something else, such as client CPU or write round-trip latency, a composite key
-buys nothing: measure first (see
-[§7.5](#75-a-measured-example--one-run-that-backs-71-and-72)).
+column. Measured on Aurora DSQL, bigger batches and more batches in flight do not move a
+hot key range (one took about 20,000 rows/s whatever was in flight); only spreading the
+writes across key ranges does. The Full Load does that for a large table by reading it in
+key ranges (§7.2); a composite key does it for every write to the table, the
+application's after cut over and CDC's included. If the load is bound by something else,
+such as client CPU, a composite key buys nothing: measure first (see
+[§7.5](#75-measured-on-live-infrastructure--what-backs-71-and-72)).
 
 - **The source is never changed**, only the Aurora DSQL target key. A
   `CREATE UNIQUE INDEX ASYNC` keeps the original key unique, so lookups and constraints on
@@ -94,35 +99,52 @@ buys nothing: measure first (see
 
 Raise a setting when a phase is too slow and the hardware has room; lower it to protect a
 busy source. **Full Load** and **Validation** are tuned with environment variables or in
-**Settings** (§7.6); **CDC** is sized for you.
+**Settings** (§7.6); **CDC** is sized for you. For a Full Load the setting that matters is
+*Tables in parallel*: the key ranges and the batches in flight are already sized from the
+measurements in §7.5.
 
 ### Full Load
 
 | Setting (env var) | Default | Bound | Effect |
 |---|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | How many tables load concurrently. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | In-flight `INSERT … ON CONFLICT` batches per table. |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | How many tables, or parts of a large table, load at once: one worker process and one source connection each. Set it to the task's vCPU count for a large run. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | Batches in flight per table or part, each on its own Aurora DSQL connection. The tool also caps them at 4 per key range and 128 per run, so for a table read in one key range a value above 4 changes nothing. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | Rows per batched write (hard-capped at DSQL's 3000-row limit). |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (off) | ≤ 8 | Reader range sharding: split a **large** table's read by its integer leading primary-key column into K ranges, each read by its own worker process ([§3.8](03-full-load.md#38-parallel-loading)). PostgreSQL: any run. MySQL: Full load + CDC only, for a table whose unique keys all include that column. Also *Reader shards per large table* in **Settings → Full Load**. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | A table must have at least this many (estimated) rows to be split; smaller tables use one reader. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0` (automatic) | ≤ 32 | How many primary-key ranges (K) a **large** table is read and written in ([§3.8](03-full-load.md#38-parallel-loading)). `0`: one range per 2,500,000 estimated rows from 5,000,000, at most 32; `1`: off; `2`–`32`: exactly that many. Needs *Tables in parallel* above 1 and an integer leading primary-key column. Also *Reader shards per large table* in **Settings → Full Load**. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | A table must have at least this many (estimated) rows to be split (automatic also needs 5,000,000); smaller tables use one reader. |
 
-> **Reader sharding: when it helps, and what it costs.** It helps when a few large tables
-> dominate a load and pool slots would otherwise idle: one reader converts rows on one
-> core, while each range runs in its own process on its own core (about **3.8× at K = 4**
-> on an 8M-row PostgreSQL load). K is capped at 32 ÷ `TABLE_PARALLELISM`. **The
-> trade-off:** K > 1 turns idle slots into concurrent reads of the same table for its
-> whole read, so the source read rate, the DSQL connections and the memory rise up to
-> `TABLE_PARALLELISM`-fold for that stretch. On a source still serving production traffic,
-> pair it with the `Threads_running` throttle (`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`,
-> §7.3). When the wall is the write side, raise **`BATCH_PARALLELISM`** instead. On MySQL
-> a table is split only in Full load + CDC ([§3.8](03-full-load.md#38-parallel-loading)).
+> **Key ranges: why they help, and what they cost.** Aurora DSQL writes one key range of a
+> table at about 20,000 rows/s whatever the batch size or the batches in flight, so a
+> large table loads faster with its writes spread over several key ranges (a 150M-row
+> PostgreSQL table in 32 ranges loaded at about 205,000 rows/s, §7.5). How the ranges are
+> read depends on the source:
+>
+> - **PostgreSQL:** the ranges share one snapshot and are read by as many worker processes
+>   as the table's share of the run's estimated rows (at most *Tables in parallel*).
+> - **MySQL:** one reader session reads every range from one snapshot, so the table takes
+>   one source connection and one worker process, which keeps about one core busy: a huge
+>   MySQL table loads at one core's pace (about 25,000–55,000 rows/s in our runs,
+>   depending on the host).
+>   In **Full load + CDC** from a binlog start point, an explicit value of 2 or more reads
+>   it in separate-snapshot parts instead, one process each (150M rows in 16 parts: about
+>   164,000 rows/s), and the copy is consistent only once CDC replays it
+>   ([§3.8](03-full-load.md#38-parallel-loading)).
+>
+> **The trade-off:** on PostgreSQL, and for MySQL's separate-snapshot parts, K > 1 turns
+> idle slots into concurrent reads of the same table for its whole read, so the source
+> read rate, the DSQL connections and the memory rise up to `TABLE_PARALLELISM`-fold for
+> that stretch, and a PostgreSQL source keeps the shared snapshot until the last of them
+> has finished. On a source still serving production traffic, pair it with the
+> `Threads_running` throttle (`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`, §7.3). Raising
+> *Batches per table* does not speed up a table that is the load's tail: on PostgreSQL
+> more key ranges do, and on MySQL only the separate-snapshot parts above.
 
-> **Connection-quota guardrail.** Total concurrent DSQL connections ≈
-> `table_parallelism × batch_parallelism` (the default 4 × 8 = 32). DSQL allows up to
-> **10,000 connections per cluster** but only **100 new connections/second**, so keep the
-> product comfortably within quota and don't set both knobs to their maximum without
-> reason. Raising parallelism also raises the **OCC collision rate** on hot key ranges —
-> pair it with a good PK strategy (above).
+> **Connection-quota guardrail.** A run's Aurora DSQL connections are at most its batches
+> in flight, which the tool caps at 4 per key range and 128 per run, plus one per running
+> table or part. DSQL allows up to **10,000 connections per cluster** but only **100 new
+> connections/second**, so the caps keep a run well within the quota. More in flight also
+> raises the **OCC collision rate** on hot key ranges — pair parallelism with a good PK
+> strategy (above).
 
 ### Validation
 
@@ -218,18 +240,25 @@ redeploy. The CDC settings are passed when the tool deploys the cdc-stack.
 > and resets on restart, so put the values you want to keep in the task definition and use
 > **Settings** to experiment.
 
-Size the task for the load: **Full Load is CPU-bound** (the source reader converts every
-row's MySQL types to their Aurora DSQL form in Python), and **memory is a hard limit**.
+Size the task for the load, and set *Tables in parallel* to its vCPU count: each table,
+or part of a large table, that loads at once is one worker process. **Memory is a hard
+limit.**
 
 | Setting | Evaluation | A real large-scale Full Load |
 |---|---|---|
-| `ContainerCpu` | 0.5–1 vCPU (`512`–`1024`) | 2–4 vCPU (`2048`–`4096`) |
+| `ContainerCpu` | 0.5–1 vCPU (`512`–`1024`) | 4–16 vCPU (`4096`–`16384`) |
 | `ContainerMemory` | `1024` MiB | ≥ `2048` MiB; ≥ `8192` MiB (with CPU ≥ `2048`) for large LOBs or raised parallelism |
 
-- **CPU.** In a measured payments+orders load, 4 vCPU ran about **3.8× faster** than the
-  0.5 vCPU (`512`) default on the same data. Beyond about 4 vCPU a single large table
-  gains little (its reader is one thread), so split the read instead: *Reader shards per
-  large table* (§7.2; MySQL in Full load + CDC only).
+- **A MySQL load is CPU-bound on the task.** Reading and converting MySQL rows keeps about
+  one core busy per running table or part, so throughput grows with the vCPUs up to
+  *Tables in parallel* (16 tables of 20M rows on 16 vCPU: about 193,000 rows/s, every core
+  busy).
+- **A PostgreSQL load is bound by Aurora DSQL.** Its values pass through almost unchanged,
+  so the task needs few cores (about 3.5 at 336,000 rows/s), and the throughput comes from
+  the key ranges (above).
+- **The host varies.** Fargate places a task on hosts with different CPUs, and the same
+  MySQL load ran up to about 1.8× faster on one task than on another: judge a change over
+  more than one run.
 - **Memory.** Exceeding `ContainerMemory` OOM-kills the task with no app shutdown (you see
   only a CloudWatch spike and an ELB timeout). Wide rows (large `TEXT`/`BLOB` values) fill
   a batch to its ~8 MiB cap, so the default `512` CPU / `1024` MiB has OOM-killed a real
@@ -256,11 +285,12 @@ it.
 ### The one lever: table parallelism
 
 `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` (default **4**, max **16**) sets how many
-tables are read from the source at once, one streaming connection each.
-`BATCH_PARALLELISM` and `BATCH_ROWS` raise Aurora DSQL write pressure, not source read
-load, so leave them unless Aurora DSQL is the bottleneck. An opt-in `Threads_running` cap
-is a second safety valve (see the note below). Set the parallelism under **Settings → Full
-Load** to experiment between runs, or as the environment variable to persist it (§7.2).
+tables, or parts of a large table, are read from the source at once, one streaming
+connection each (plus one on PostgreSQL while a table shares its snapshot).
+`BATCH_PARALLELISM` and `BATCH_ROWS` change only the Aurora DSQL side, not the source read
+load. An opt-in `Threads_running` cap is a second safety valve (see the note below). Set
+the parallelism under **Settings → Full Load** to experiment between runs, or as the
+environment variable to persist it (§7.2).
 
 ### Start conservative, then tune under observation
 
@@ -316,9 +346,13 @@ and reads slow down, and with many tables in flight the **oldest** read view set
 purge horizon. To limit it:
 
 - Lower the parallelism, so fewer read views are open.
-- Split the biggest tables by primary-key range into separate, shorter runs. In Full load
-  + CDC, *Reader shards per large table* does this within one run, so each read view lasts
-  only while its own range is read, at the cost of concurrent reads of that table (§7.2).
+- Expect a large table's read view to last for its whole read: the automatic split reads
+  every range in one session, from one snapshot. To shorten it, split the biggest tables
+  by primary-key range into separate, shorter runs. In Full load + CDC from a binlog start
+  point, an explicit *Reader shards per large table* of 2 or more does this within one
+  run, so each read view lasts only while its own range is read, at the cost of concurrent
+  reads of that table (§7.2) and of the refusals in
+  [§3.8](03-full-load.md#38-parallel-loading) until CDC replays it.
 - Monitor History List Length, and provision free-space headroom before you start so undo
   growth cannot trip a storage-full condition.
 
@@ -359,39 +393,61 @@ prove the DPU improvement.
 
 ---
 
-## 7.5 A measured example — one run that backs §7.1 and §7.2
+## 7.5 Measured on live infrastructure — what backs §7.1 and §7.2
 
-Below is one run on live infrastructure, done to check whether the design rationale above
-actually shows up in practice. Read it **as an illustration of the method, not as a
-performance spec or guarantee** — anyone can reproduce it in their own environment with
-`scripts/measure_performance.py`.
+These runs check that the design above shows up in practice. Read them **as an
+illustration of the method, not as a performance spec or guarantee**: the source, the
+task's host and Aurora DSQL's state all move the numbers, and you can reproduce them in
+your own environment with `scripts/measure_performance.py` (below).
 
-> [!note] The conditions these numbers came from RDS MySQL 8.0.42 source + Aurora DSQL
-> target + MSK, `us-east-1`, a single run on hardware that was not pinned (source RDS
-> class, Fargate/local CPU and memory, DSQL warm state, network RTT), so absolute
-> throughput and lag are environment-dependent. The run also used an `AUTO_INCREMENT`
-> integer-PK schema, the **hot-partition worst case** from §7.1; the cached identity key
-> this chapter recommends lowers contention.
+> [!note] The conditions these numbers came from Seoul (`ap-northeast-2`), the tool on one
+> ECS Fargate task of 16 vCPU / 120 GB, Aurora MySQL and Aurora PostgreSQL sources on
+> `db.r8g.16xlarge`, and every setting at its default except *Tables in parallel* 16
+> (Reader shards automatic, Batches per table 8).
 
-**Full Load — raising parallelism raises contention faster than throughput (the §7.2
-guardrail).** Doubling both the table and batch parallelism (4×8 = 32 → 8×16 = 128
-connections) bought only **~+5%** throughput, while the **share of batches that hit at
-least one retry** rose by about a third (≈ 9.6% → 12.8%). Even for rows that don't
-logically conflict, writes converge on the same key range of a monotonic PK — exactly the
-hot-partition effect in §7.1. The takeaway: **fix the PK strategy before turning
-parallelism up blindly.**
+| Load | Result |
+|---|---|
+| PostgreSQL, 16 tables × 20M rows | about 336,000 rows/s overall, 600,000 in its steady phase |
+| PostgreSQL, one table of 150M rows (32 ranges) | about 205,000 rows/s overall |
+| MySQL, 16 tables × 20M rows | about 193,000 rows/s overall, the task's 16 vCPU saturated |
+| MySQL, one table of 150M rows, Full load only (one session) | about 55,500 rows/s steady, one process on one core |
+| MySQL, the same table in Full load + CDC, Reader shards 16 | about 164,000 rows/s overall |
 
-**CDC replication lag — a latency floor at the default sizing.** Source commit → visible
-on DSQL measured at roughly p50 0.8s / p95 1.3s under a sustained load, and p50 0.5s / p95
-0.7s under a burst. This is a **good-case floor at the default CDC sizing (MCU=1, one
-worker, a single-column table)**; it can grow with many tables or a high change rate.
-Scale it with the §7.2 CDC parameters when you need throughput.
+What they, and smaller runs on a 4 vCPU task with `db.r7g.large` sources, show:
 
-> **Reproduce it:** `scripts/measure_performance.py full-load` (throughput + contention)
-> and `scripts/measure_performance.py cdc-lag` (replication lag) give you the same metrics
-> against your own source/target. Note that `full-load` **drops and recreates** the target
-> tables (needs `--yes`) so use it **only on a non-production target**, and `cdc-lag`
-> needs an active CDC pipeline.
+- **One key range is the wall, not the batches.** One primary-key-ordered stream into a
+  table took about 20,000 rows/s with 8 or 32 batches in flight and with 3,000-row batches
+  alike; more in flight only raised Aurora DSQL's commit latency (26 ms at a light load,
+  0.7 s at 8 in flight, 3 s at 32) and its compute cost (`ComputeDPU`, about 4×) at the
+  same rows/s. Spread over 4 key ranges, a 10M-row table loaded at about 37,000–40,000
+  rows/s overall (54,000–60,000 at its peak), and two such tables, one per engine, at
+  127,000 together and still rising. Against one key range per table, the 150M-row table
+  above loaded about 10× faster on PostgreSQL, 8× on MySQL in parts and 2.8× on MySQL in
+  one session.
+- **Secondary indexes go on the empty table.** With 25 secondary indexes over 8.5M rows
+  (MySQL), a Drop & reload that created them before the rows ended in 512 s end to end,
+  against 873 s with the indexes built after the load: after a load they took up to 680 s
+  to build, on the empty tables 13–41 s.
+- **A fresh table warms up.** Aurora DSQL starts a new table on one partition and splits
+  it as it grows, so a load's first minute or so runs slower.
+- **An earlier copy's DROP competes.** Dropping a loaded table is a background job on
+  Aurora DSQL: it ran for minutes, and for over an hour for a 75M-row copy, slowing the
+  next load while it ran.
+
+**CDC replication lag — a latency floor.** Measured separately (RDS MySQL 8.0 source, MSK,
+`us-east-1`, a sink of 1 MCU and one worker, a single-column table): source commit →
+visible on DSQL at roughly p50 0.8s / p95 1.3s under a sustained load, and p50 0.5s / p95
+0.7s under a burst. It can grow with many tables or a high change rate; scale it with the
+§7.2 CDC parameters when you need throughput.
+
+> **Reproduce it:** `scripts/measure_performance.py full-load` reports the throughput (per
+> table and per time window), the write path's retries and latencies, and when Aurora DSQL
+> finished the index builds; `--reader-shards` and `--cdc-mode` set up the rows above, and
+> `scripts/measure_performance.py cdc-lag` measures replication lag (it needs an active
+> CDC pipeline). `full-load` **drops and recreates** the target tables (needs `--yes`), so
+> use it **only on a non-production target**. For a fair comparison, drop the previous
+> copy first and let Aurora DSQL finish its background jobs (`--wait-sys-jobs` waits for
+> them before the run starts).
 
 ---
 
@@ -400,9 +456,14 @@ Scale it with the §7.2 CDC parameters when you need throughput.
 The knobs above are also editable **in the UI** without a restart: the **Settings** entry
 (sidebar footer) opens a tabbed dialog with —
 
-- **Full Load / CDC / Validation** tabs — the tunable knobs from §7.2 (table & batch
-  parallelism, batch rows, the source-load throttle, CDC sink MCU, validation workers),
-  each applied to the **next** run of that step.
+- **Full Load**, **CDC** and **Validation** tabs — the tunable knobs from §7.2, each tab
+  opening with when its changes apply (*Changes apply to the next run.*; on the CDC tab,
+  *the next Start CDC*):
+  - **Full Load**: *Tables in parallel*, *Batches per table*, *Rows per batch*, *Reader
+    shards per large table* and *Source-load throttle (max Threads_running)*, under the
+    notice *Batches in flight are capped at 4 per key range and 128 per run*;
+  - **CDC**: *Sink compute (MCU)*;
+  - **Validation**: *Tables in parallel*.
 - an **Activity log** tab — everything about the one activity/audit log in one place: set
   the app **log level** (DEBUG / INFO / WARNING / ERROR), toggle **"Mirror to CloudWatch
   Logs"** so the log is also streamed to the container's stdout (forwarded to CloudWatch

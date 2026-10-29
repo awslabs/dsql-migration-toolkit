@@ -205,10 +205,10 @@ The rest of what the conversion does:
   included; a PostgreSQL view is copied as PostgreSQL stores it. Review a flagged view
   side by side before applying (`VIEW_NOT_CONVERTED`, or a note that its results differ;
   on PostgreSQL, `VIEW_REMODELLED_COLUMN` for a view over a re-typed column).
-- **Indexes** are built after the data load (`CREATE INDEX ASYNC`). MySQL FULLTEXT and
-  SPATIAL indexes are not created, and a PostgreSQL GIN or GiST index becomes a btree that
-  no longer serves its search. A PostgreSQL `UNIQUE … NULLS NOT DISTINCT` index keeps
-  `NULLS NOT DISTINCT`.
+- **Indexes** are created with the table, before any row loads (`CREATE INDEX ASYNC`;
+  Aurora DSQL builds them in the background). MySQL FULLTEXT and SPATIAL indexes are not
+  created, and a PostgreSQL GIN or GiST index becomes a btree that no longer serves its
+  search. A PostgreSQL `UNIQUE … NULLS NOT DISTINCT` index keeps `NULLS NOT DISTINCT`.
 - **Partitioning** is dropped: Aurora DSQL distributes rows by primary key itself, and the
   partitions become one table.
 - **Several MySQL databases** become one schema each in the single Aurora DSQL database.

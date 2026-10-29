@@ -17,93 +17,64 @@ Aurora DSQL (sub-millisecond network RTT).
 
 | Path | Setup | Result |
 |---|---|---|
-| Full Load, 4 tables | 8 vCPU, MySQL source | ~32,000 rows/s |
-| Full Load, one table split across 8 processes | 8 vCPU, MySQL source, empty target | 41,000–51,000 rows/s sustained (~67,000 peak) |
-| Full Load, ~1 TB in 20 tables | 16 vCPU, MySQL source, composite key | 915.7M rows in 2h27m (average ~103K rows/s) |
-| Full Load, ~1 TB in 20 tables | 16 vCPU, PostgreSQL source, composite key | 860M rows in 1h42m (average ~140K rows/s) |
-| Full Load, one huge table (865M rows) | 16 vCPU, PostgreSQL source, default settings | ~20–23K rows/s (single reader) |
+| Full Load, 16 tables × 20M rows | 16 vCPU, PostgreSQL source | ~336,000 rows/s overall (~600,000 steady) |
+| Full Load, 16 tables × 20M rows | 16 vCPU, MySQL source | ~193,000 rows/s overall (~226,000 steady) |
+| Full Load, one table of 150M rows | 16 vCPU, PostgreSQL source | ~205,000 rows/s overall (~280,000 steady) |
+| Full Load, one table of 150M rows | 16 vCPU, MySQL source | ~55,500 rows/s steady by default (one session); ~164,000 rows/s overall in Full load + CDC with *Reader shards per large table* 16 |
 | CDC | default sink sizing (4 MCU) / 8 MCU | ~21,000 rows/s / ~26,000 rows/s |
 
 ---
 
 ## Full Load
 
-### What drives throughput (8 vCPU)
+### The maximum-size runs (16 vCPU)
 
 | Component | Configuration |
 |---|---|
-| **ECS Fargate** | 8 vCPU (8192 CPU units), 16 GB memory |
-| **Source** | Aurora MySQL (RDS), `customers_sample` schema |
-| **Target** | Aurora DSQL, us-east-1 |
-| **Tables** | `order_items` (33.6M rows), `orders` (8.5M), `payments` (8.4M), `customers` (small) |
-| **Measurement** | `scripts/measure_performance.py full-load` with CloudWatch progress monitoring |
+| **ECS Fargate** | 16 vCPU, 120 GB memory (the largest task) |
+| **Sources** | Aurora MySQL and Aurora PostgreSQL, `db.r8g.16xlarge` |
+| **Target** | Aurora DSQL, `ap-northeast-2` |
+| **Loader settings** | *Tables in parallel* 16, everything else at its default (*Reader shards per large table* automatic, *Batches per table* 8, *Rows per batch* 2000) |
+| **Measurement** | `scripts/measure_performance.py full-load`, run as a one-off ECS task |
 
-| Configuration | rows/s | CPU |
-|---|---|---|
-| Threads in one process (single core), 2 tables | 12,277 | 110% (one core) |
-| One process per table, 2 tables | 22,365 | 207% |
-| One process per table, 4 tables | 32,270 | 311% |
-| One large table split across 8 processes, empty target (plain `INSERT`) | 41,000–51,000 sustained, ~67,000 peak | 777% |
-| Same table, appending into existing rows (`ON CONFLICT`) | ~35,000 | 439% |
+| Run | Rows | Time | Overall | Steady | What limited it |
+|---|---|---|---|---|---|
+| PostgreSQL, 16 tables | 320M | 15m53s | ~336K rows/s | ~600K rows/s | Aurora DSQL (the task used about 3.5 cores) |
+| PostgreSQL, one table: 32 ranges on 16 processes | 150M | 12m12s | ~205K rows/s | ~280K rows/s | Aurora DSQL |
+| MySQL, 16 tables | 320M | 27m | ~193K rows/s | ~226K rows/s | the task's CPU (all 16 vCPU busy) |
+| MySQL, one table, Full load only: one session | 75M of 150M (stopped at 25 min) | — | — | ~55.5K rows/s | one core |
+| MySQL, one table, Full load + CDC: 16 separate-snapshot parts | 150M | 15m12s | ~164K rows/s | ~226K rows/s | the task's CPU, beside the previous copy's DROP |
 
-- **Full Load is CPU-bound, not network-bound.** One Python process converts rows on one
-  core, so throughput scales with the number of parallel processes: set table parallelism
-  close to the vCPU count (§7.2).
-- **Loading into an empty target is the fastest path.** After **Drop & reload** the loader
-  uses a plain `INSERT` with no `ON CONFLICT`, which removes optimistic-concurrency
-  contention entirely; appending into existing rows ran roughly 15–30% slower.
-- **Beyond about 8 concurrent writer processes the limit moves from CPU to DSQL write
-  capacity** (about 67K rows/s peak observed).
+### What drives throughput
 
-### Large scale: about 1 TB (16 vCPU)
-
-| | MySQL source | PostgreSQL source |
-|---|---|---|
-| **Source** | Aurora MySQL `db.r7g.8xlarge` (temporarily upsized) | Aurora PostgreSQL 16.14 `db.r7g.8xlarge` (temporarily upsized) |
-| **Dataset** | 20 tables × 45.78M rows = 915.7M rows (≈ 1.07 TB) | 20 tables × 43M rows = 860M rows (≈ 1.02 TB) |
-| **Loader settings** | composite PK (`dist_key`) on all 20 tables, `TABLE_PARALLELISM=16`, `BATCH_PARALLELISM=32`, batch rows 3000 | the same |
-| **Completion** | 20/20 tables, 0 failures | 20/20 tables, 0 failures |
-| **Total wall time** | 2h27m32s | 1h42m31s |
-| **Average throughput** | ~103K rows/s | ~140K rows/s |
-| **While 16 tables ran in parallel** | ~131K rows/s (16 vCPU saturated) | ~194K rows/s (about 12 of 16 vCPU) |
-| **OCC `40001` retries** | 0 | 0 |
-
-Both runs used the same Fargate size and the same Aurora DSQL cluster, driven by automated
-scripting (ECS RunTask) rather than the UI.
-
-- **A composite primary key removes the hot-partition bottleneck.** A monotonic
-  `AUTO_INCREMENT` key funnels every insert into the trailing key range; prepending a
-  high-cardinality column spread the writes, and the retries were exactly 0 (§7.1).
-- **Keep the table count within the table parallelism.** With 20 tables on 16 slots the
-  last 4 tables ran alone (about 21K rows/s) and added about 31 minutes; with table
-  parallelism at least the table count, the MySQL run would have taken about 1h56m.
-- **A PostgreSQL source loads faster at lower CPU.** Its values pass through almost
-  unchanged, so the per-row CPU cost is lower than with MySQL's dialect conversion; MySQL
-  was CPU-saturated, PostgreSQL was not.
-- **Split big data over several tables where you can.** A freshly created DSQL table
-  starts with one partition and splits under load, so a single-table load starts slow
-  (about 16K rows/s) and climbs to 120–150K rows/s; 20 tables start with 20 times the
-  partitions.
-
-### One huge table
-
-With the current tool a single large table loads with **one reader** by default, so
-concurrent readers never read different snapshots of a source that is being written to.
-Measured on an 865M-row PostgreSQL table, one reader reached about 20–23K rows/s (about 12
-hours for the whole table); forcing 4 shards on a static source reached about 42K rows/s
-and was write-bound, not CPU-bound. For one huge table, see *Reader shards per large
-table* ([§3.8](03-full-load.md#38-parallel-loading),
-[§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
+- **Key ranges, not batches in flight.** Aurora DSQL writes one key range of a table at
+  about 20,000 rows/s whatever is in flight, so a large table goes faster only with its
+  writes spread over key ranges, which the loader does by default
+  ([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)). Against one range per
+  table, the 150M-row table loaded about 10× faster on PostgreSQL, 8× on MySQL in parts
+  and 2.8× on MySQL in one session.
+- **A MySQL load is bound by the task's CPU, a PostgreSQL load by Aurora DSQL.** Reading
+  and converting MySQL rows keeps about one core busy per table or part loading at once;
+  PostgreSQL values pass through, so 16 tables loaded at 336K rows/s on about 3.5 cores.
+  Set *Tables in parallel* to the task's vCPU count.
+- **One huge MySQL table loads at one core's pace by default.** One session reads its
+  ranges from one snapshot. In Full load + CDC from a binlog start point, an explicit
+  *Reader shards per large table* reads it in separate-snapshot parts on several cores,
+  consistent once CDC replays it ([§3.8](03-full-load.md#38-parallel-loading)).
+- **A fresh table warms up.** Aurora DSQL starts a new table on one partition and splits
+  it as it grows, so a load's first minute or so is slower than its steady rate.
+- **The host and earlier jobs move the numbers.** The same MySQL load ran up to about 1.8×
+  faster on one Fargate host than on another, and dropping the previous 75M-row copy kept
+  a background job running on Aurora DSQL for over an hour, beside the next load.
 
 ---
 
 ## CDC throughput
 
-CDC is a different pipeline with a different bottleneck. Full Load is **CPU-bound**; CDC
-is `Debezium (source) → MSK topic → custom DSQL sink`, where the sink is
-**DSQL-write-latency-bound** (each statement is a distributed round-trip). The tool infers
-the scaling parameters from the number of captured tables
-([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
+CDC is a different pipeline with a different bottleneck: `Debezium (source) → MSK topic
+→ custom DSQL sink`, where the sink is **DSQL-write-latency-bound** (each statement is a
+distributed round-trip). The tool infers the scaling parameters from the number of
+captured tables ([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
 
 | Component | Configuration |
 |---|---|
@@ -135,20 +106,23 @@ the scaling parameters from the number of captured tables
 ## Reproducing these measurements
 
 ```bash
-AWS_REGION=us-east-1 \
-DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
-TARGET_ENDPOINT=<dsql-cluster-endpoint> \
-MEASURE_SCHEMA=customers_sample \
-MEASURE_TABLES="order_items orders payments customers" \
-TABLE_PARALLELISM=8 \
-BATCH_PARALLELISM=8 \
+AWS_REGION=<region> APP_STACK=<app-stack> \
+DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
+TABLE_PARALLELISM=16 VARIANTS=auto \
 deploy/run_measure_on_fargate.sh
 ```
 
-See [`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh) for
-the full A/B measurement harness and
-[`scripts/measure_performance.py`](../../../scripts/measure_performance.py) for the
-in-process throughput + OCC reporting tool.
+[`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh) runs the
+measurement as a one-off Fargate task in the source's VPC; `VARIANTS=auto` measures the
+loader's defaults, and the script lists the other variants.
+[`scripts/measure_performance.py`](../../../scripts/measure_performance.py) is the
+measurement itself: it reports the throughput per table and per time window, the write
+path's retries and latencies, and when Aurora DSQL finished the index builds. Its header
+shows the usage (`--reader-shards`, `--cdc-mode`, …), and `PERF_SOURCE_ENGINE=postgres`
+points it at a PostgreSQL source. It drops and recreates the target tables, so use it
+**only on a non-production target**, and drop an earlier copy first and let Aurora DSQL
+finish its background jobs (`--wait-sys-jobs`) before you compare runs.
 
 For CDC, deploy the cdc-stack and start a steady insert workload on the source, then read
 the pipeline rates from CloudWatch `AWS/KafkaConnect` (`SourceRecordWriteRate` on the

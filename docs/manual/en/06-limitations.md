@@ -50,7 +50,7 @@ it.
 | Aurora DSQL | What happens, and what to do |
 |---|---|
 | 1 MiB per column value, 2 MiB per row, 10 MiB per write transaction (`OVERSIZED_LOB`) | A column value over 1 MiB can't be stored, whatever the type: `54000 ERROR: maximum column size exceeded`; nor can a row over 2 MiB (`maximum row size exceeded`; [Aurora DSQL quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). Oversized values are **quarantined** per row (the error log in Full Load, the **DLQ** in CDC), and a column that can exceed the Kafka message cap must be **excluded at capture**. Binary and document columns (MySQL `MEDIUMBLOB`/`LONGBLOB`/`MEDIUMTEXT`/`LONGTEXT`/`JSON`, PostgreSQL `bytea`/`json`/`jsonb`) are flagged `OVERSIZED_LOB` as a loss, an unbounded PostgreSQL `text`/`varchar` as a recommendation. |
-| At most 24 indexes per table: the primary key counts, so 23 secondary; a MySQL source allows 64 (`TOO_MANY_INDEXES`) | The excess `CREATE INDEX ASYNC` fails **after** Full Load has written every row, so it is flagged **Review needed** at planning time, with a matching Schema Conversion note. |
+| At most 24 indexes per table: the primary key counts, so 23 secondary; a MySQL source allows 64 (`TOO_MANY_INDEXES`) | Schema Conversion keeps 23 and leaves the rest out, naming them in its note, so the table loads without them and a query that relied on one falls back to a scan. Flagged **Review needed** at planning time: choose which indexes to keep before you apply. |
 | At most 1 KiB combined key size, for each primary key and index | Checked on the **value at `INSERT`/`UPDATE`**, not on the DDL, so only rows whose actual key is too long fail (error `54000` `key size too large`). Conversion warns when the *declared* widths could exceed it (4 bytes per character for `utf8mb4`), naming the key and its worst-case size, but never blocks. |
 
 **Different by design** (the tool handles these)
@@ -453,25 +453,26 @@ it.
     tables CDC does not need to capture (see "Changing the table set after a Full Load
     (Full load + CDC)" in [Chapter 13](13-excluding-tables-and-columns.md)): they stay on
     Aurora DSQL as loaded, and CDC and Validation skip them. A MySQL table the load reads
-    in parts (*Reader shards per large table* above 1,
+    in separate-snapshot parts (an explicit *Reader shards per large table* of 2 or more,
     [§3.8](03-full-load.md#38-parallel-loading)) is the exception: it cannot be unticked
     until it is reloaded with one reader (Drop & reload).
   - Otherwise capture fewer tables in this CDC pipeline (deselect them in the table
     picker), or use Full load only.
-- **MySQL: a table read in parts is consistent only once CDC replays it.** With *Reader
-  shards per large table* above 1, a Full load + CDC load splits a large MySQL table's
-  read into primary-key ranges, each from its own snapshot
-  ([§3.8](03-full-load.md#38-parallel-loading)). Until CDC, started from the Full Load's
-  start point, has replayed the table, a row whose key changed during the read can be on
-  Aurora DSQL twice or not at all, and a transaction across two ranges half applied, with
-  equal row counts: a ROW_COUNT validation does not see it, a CHECKSUM does. So every
+- **MySQL: a table read in parts is consistent only once CDC replays it.** With an
+  explicit *Reader shards per large table* of 2 or more, a Full load + CDC load from a
+  binlog start point reads a large MySQL table in primary-key ranges, each from its own
+  snapshot ([§3.8](03-full-load.md#38-parallel-loading)). Until CDC, started from the Full
+  Load's start point, has replayed the table, a row whose key changed during the read can
+  be on Aurora DSQL twice or not at all, and a transaction across two ranges half applied,
+  with equal row counts: a ROW_COUNT validation does not see it, a CHECKSUM does. So every
   route that would leave such a table without that replay (unticking it, Full load only, a
   Start CDC from a later start point) is refused until the table is reloaded with one
   reader (Drop & reload: an Append keeps those rows); Full load only and the later start
   point are also allowed once a Validation in CHECKSUM mode matches it. Unticking needs
-  the reload before CDC starts: from CDC's first Start the table set is fixed. A table
-  whose unique key does not include the leading key column, and every table of a Full load
-  only run, keeps one reader.
+  the reload before CDC starts: from CDC's first Start the table set is fixed. No table is
+  read this way by default, nor in a Full load only run, nor a table whose unique key does
+  not include the leading key column: those are read by one reader session from one
+  snapshot.
 - **CDC is billable while deployed.** The streaming pipeline (MSK Serverless + MSK
   Connect, plus a NAT gateway if created) costs money for as long as it runs. Tear down
   the cdc-stack after cut-over. Full Load alone provisions no streaming infrastructure.
