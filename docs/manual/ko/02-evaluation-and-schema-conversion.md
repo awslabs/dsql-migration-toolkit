@@ -188,8 +188,9 @@ Migration의 **Exclude tables & columns...** 기능을
   PostgreSQL이 저장한 그대로 복사됩니다. 표시된 뷰는 적용하기 전에 나란히 놓고
   검토하세요(`VIEW_NOT_CONVERTED`, 또는 결과가 다르다는 노트. PostgreSQL에서는 타입이 바뀌는 컬럼을
   읽는 뷰의 `VIEW_REMODELLED_COLUMN`).
-- **인덱스**는 데이터 적재 후에 만들어집니다(`CREATE INDEX ASYNC`). MySQL FULLTEXT·SPATIAL 인덱스는
-  생성되지 않고, PostgreSQL GIN이나 GiST 인덱스는 더 이상 원래의 검색에 쓰이지 않는 btree가 됩니다.
+- **인덱스**는 테이블과 함께, 행이 적재되기 전에 만들어집니다(`CREATE INDEX ASYNC`, Aurora DSQL이
+  백그라운드에서 빌드합니다). MySQL FULLTEXT·SPATIAL 인덱스는 생성되지 않고, PostgreSQL GIN이나 GiST
+  인덱스는 더 이상 원래의 검색에 쓰이지 않는 btree가 됩니다.
   PostgreSQL `UNIQUE … NULLS NOT DISTINCT` 인덱스는 `NULLS NOT DISTINCT`를 유지합니다.
 - **파티셔닝**은 제거됩니다: Aurora DSQL이 기본 키로 행을 스스로 분산하며, 파티션들은 하나의
   테이블이 됩니다.

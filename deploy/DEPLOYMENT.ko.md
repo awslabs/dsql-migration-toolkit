@@ -522,7 +522,7 @@ Schema Conversion → Data Migration → Validation → Cut over). UI가 보이�
 | `AlbScheme` | no | `internal` | `internal` 또는 `internet-facing`. **권장: `internal`**(VPN/Direct Connect/피어링으로 도달); `internet-facing`은 Cognito 켤 때만. |
 | `CertificateArn` | yes | — | HTTPS(443) 리스너용 ACM 인증서 ARN. |
 | `ContainerImageUri` | no | 게시된 ECR Public 이미지 | ECR Public에 게시된 이미지가 기본 — 빌드 불필요. 제한된 네트워크(자체 프라이빗 ECR 사본 / pull-through 캐시)나 커스텀 빌드에만 오버라이드; immutable 태그 또는 digest 권장. |
-| `ContainerCpu` | no | `512` | Fargate 태스크 CPU 단위. **Full Load는 CPU-bound**(소스 리더가 행마다 Python 타입 변환 수행)이므로 대규모 마이그레이션에서는 올려야 함 — 동일 데이터의 payments+orders 로드 실측에서 **512(기본)보다 4096(4 vCPU)에서 약 3.8배 빨랐음**. 평가용은 기본 `512`로 충분, 실제 대용량 Full Load에는 **4096 이상** 권장. [매뉴얼 §7.2](../docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝) 참고. |
+| `ContainerCpu` | no | `512` | Fargate 태스크 CPU 단위. **MySQL Full Load는 CPU-bound**(행을 읽고 변환하느라 동시에 로드되는 테이블마다 코어 약 하나가 바쁨)이므로 대규모 마이그레이션에서는 올리고 Full Load의 *Tables in parallel*을 vCPU 수로 설정 — 실측에서 `16384`(16 vCPU)에 *Tables in parallel* 16으로 MySQL 테이블 16개를 **~193K rows/s**로 로드했고 모든 코어가 바빴음. PostgreSQL Full Load는 코어가 훨씬 적게 필요(Aurora DSQL에 묶임). 평가용은 기본 `512`로 충분, 실제 대용량 Full Load에는 **4096 이상** 권장. [매뉴얼 §7.2](../docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝) 참고. |
 | `ContainerMemory` | no | `1024` | Fargate 태스크 메모리(MiB) — **hard limit**: 초과하면 커널이 태스크를 OOM-kill(graceful shutdown 없음, CloudWatch 급등 + ELB 타임아웃만 남음). 메모리는 테이블 크기가 아니라 버퍼링된 파이프라인 — 대략 `table_parallelism × (prefetch + batch_parallelism) × 배치당 바이트`를 **워커 프로세스에 걸쳐 합산** — 으로 제한되며, **넓은/대형 LOB 행이 배치당 바이트를 키우므로** 동시 소스 쓰기가 있는 실제 로드에선 `1024` 기본이 빠듯할 수 있음. **사이징:** 평가/소형은 `1024`로 충분, 실제 Full Load엔 **≥ 2048**, 큰 `TEXT`/`BLOB`이나 병렬도 상향 시 **≥ 4096**(이땐 `ContainerCpu` ≥ 2048 필요). CPU에 유효해야 함(아래 사이징 표 참고). 앱이 메모리 high-water와 ~80% 압박 경고를 로그(+활동 로그)에 남겨 OOM 접근을 kill 전에 볼 수 있음. |
 | `AppPort` | no | `8080` | 컨테이너 수신 포트. |
 | `AssignPublicIp` | no | `DISABLED` | NAT 없이 퍼블릭 서브넷에서 태스크 실행하려면 `ENABLED`(테스트); **권장: 프로덕션은 `DISABLED` 유지**(NAT 게이트웨이 또는 VPC 엔드포인트). |
@@ -561,9 +561,10 @@ Fargate는 CPU와 메모리를 **독립적으로 못 고릅니다**: CPU 값마�
 **워크로드별 권장:**
 
 - **평가 / 소형 테이블:** `512` / `1024` MiB 기본으로 충분.
-- **실제 Full Load:** **`1024` CPU / `2048` MiB** 이상. Full Load는 CPU-bound(행별 타입 변환)이고
-  메모리는 워커 프로세스에 걸쳐 `table_parallelism × batch_parallelism`로 증가 — 동시 소스 쓰기가
-  있는 로드에서 `512`/`1024` 기본이 OOM-kill된 사례가 있음.
+- **실제 Full Load:** **`1024` CPU / `2048` MiB** 이상, *Tables in parallel*을 vCPU 수로 둔 대규모
+  MySQL 로드라면 **`16384` CPU**까지(MySQL 로드는 동시에 로드되는 테이블마다 코어 약 하나가 바쁘고,
+  PostgreSQL 로드는 훨씬 적음). 메모리는 워커 프로세스에 걸쳐 `table_parallelism × batch_parallelism`로
+  증가 — 동시 소스 쓰기가 있는 로드에서 `512`/`1024` 기본이 OOM-kill된 사례가 있음.
 - **큰 `TEXT`/`BLOB` 테이블이나 병렬도 상향 시:** **`4096` CPU / `8192`+ MiB** — 넓은 행이 배치를
   키움. (메모리 4 GB 초과는 CPU도 올려야: 4 GB는 CPU ≥ `1024`, 8 GB는 CPU ≥ `2048`.)
 

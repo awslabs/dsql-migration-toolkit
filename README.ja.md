@@ -361,12 +361,12 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | セッションごとの非機密のワークベンチ状態 — 再接続したブラウザが再開。`DSQL_MIGRATOR_STORAGE_SECRET` と併用。ローカルディスク — Fargate デプロイは下記の durable な S3 ストアを使用。 |
 | `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(未設定)_ | セッションスナップショット用の durable な S3 ストア — プロセス内再起動だけでなく Fargate のタスク置換（再デプロイ）を越えて再開が保持される。Fargate デプロイが管理対象プラグインバケットに自動設定（設定不要）;ローカルは未設定で上記 SQLite パスを使用。 |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(未設定)_ | Full Load ステージング用の S3 バケット（ストリーミングのマルチパートアップロード — 大規模テーブル向けのスケーラブルな経路）。未設定時は上限付きローカル一時 CSV（開発 / 小規模）。 |
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル数。DSQL への合計接続数をクラスターのクォータ内に収める。 |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブルあたりの処理中の `INSERT … ON CONFLICT` バッチ数。大きいほどスループット↑、OCC（40001）衝突↑。 |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル（または大きなテーブルの部分）の数（それぞれワーカープロセス 1 つ）。大規模な実行ではタスクの vCPU 数に設定。 |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブル（または部分）あたりの処理中の `INSERT … ON CONFLICT` バッチ数。上限はキー範囲あたり 4、実行あたり 128: Aurora DSQL のテーブルの 1 つのキー範囲が処理できるのは 1 秒あたり約 10 コミットなので、それ以上のバッチは待つだけ（コミットレイテンシとコストが増える）。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000`（≤3000） | バッチ書き込みあたりの行数。DSQL のトランザクションごとの 3000 行制限で上限。 |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1`（オン） | 先読み prefetch キュー（リーダースレッドが bounded キューを満たす間に書き込みが進行）。オンのままに。A/B ベンチで pre-prefetch 経路を再現する場合のみ `0`。 |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1`（オフ、≤8） | 大きなテーブルの読み取りを整数の先頭主キー列で K 個の区間に分け、区間ごとに別のワーカープロセスが読む（区間ごとに `FULL_LOAD_TABLE_PARALLELISM` の slot を 1 つ）。PostgreSQL: すべての実行。MySQL: Full load + CDC でのみ、ユニークキーがすべてその列を含むテーブルだけ。マニュアル §3.8 / §7.2 参照。 |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | この推定行数以上のテーブルのみリーダーシャーディング対象；小さいテーブルは単一リーダー。 |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0`（自動、≤32） | 整数の先頭キー列を持つ大きなテーブルを読み書きする主キー区間の数: `0` = 推定 5,000,000 行から 2,500,000 行ごとに 1 区間、最大 32；`1` = オフ；`2`–`32` = その数ちょうど。PostgreSQL: 区間は 1 つのスナップショットを共有。MySQL: 1 つのリーダーセッションが 1 つのスナップショットから読む。別々のスナップショットで読む部分には、binlog の開始位置からの Full load + CDC で値を明示的に指定する必要がある。マニュアル §3.8 / §7.2 参照。 |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 分割対象になる最小の推定行数（自動の場合はさらに 5,000,000 行が必要）；小さいテーブルは単一リーダー。 |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Diagnostics** からも変更可。 |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Diagnostics** から切り替え可。 |

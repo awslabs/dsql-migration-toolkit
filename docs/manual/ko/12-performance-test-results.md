@@ -16,89 +16,62 @@ Connect**)에서 수행했습니다(1ms 미만 네트워크 RTT).
 
 | 경로 | 구성 | 결과 |
 |---|---|---|
-| Full Load, 4개 테이블 | 8 vCPU, MySQL 소스 | ~32,000 rows/s |
-| Full Load, 한 테이블을 8개 프로세스로 분할 | 8 vCPU, MySQL 소스, 빈 타깃 | 지속 41,000–51,000 rows/s (피크 ~67,000) |
-| Full Load, 20개 테이블 약 1 TB | 16 vCPU, MySQL 소스, composite key | 915.7M행을 2시간 27분에 (평균 ~103K rows/s) |
-| Full Load, 20개 테이블 약 1 TB | 16 vCPU, PostgreSQL 소스, composite key | 860M행을 1시간 42분에 (평균 ~140K rows/s) |
-| Full Load, 거대한 단일 테이블(8.65억 행) | 16 vCPU, PostgreSQL 소스, 기본 설정 | ~20–23K rows/s (단일 리더) |
+| Full Load, 테이블 16개 × 20M 행 | 16 vCPU, PostgreSQL 소스 | 전체 ~336,000 rows/s (안정 구간 ~600,000) |
+| Full Load, 테이블 16개 × 20M 행 | 16 vCPU, MySQL 소스 | 전체 ~193,000 rows/s (안정 구간 ~226,000) |
+| Full Load, 150M 행 테이블 하나 | 16 vCPU, PostgreSQL 소스 | 전체 ~205,000 rows/s (안정 구간 ~280,000) |
+| Full Load, 150M 행 테이블 하나 | 16 vCPU, MySQL 소스 | 기본값(세션 하나)으로 안정 구간 ~55,500 rows/s; Full load + CDC에서 *Reader shards per large table* 16으로 전체 ~164,000 rows/s |
 | CDC | 기본 싱크 크기(4 MCU) / 8 MCU | ~21,000 rows/s / ~26,000 rows/s |
 
 ---
 
 ## Full Load
 
-### 처리량을 좌우하는 요인 (8 vCPU)
+### 최대 규모 실행 (16 vCPU)
 
 | 구성요소 | 설정 |
 |---|---|
-| **ECS Fargate** | 8 vCPU (8192 CPU units), 16 GB 메모리 |
-| **소스** | Aurora MySQL (RDS), `customers_sample` 스키마 |
-| **타깃** | Aurora DSQL, us-east-1 |
-| **테이블** | `order_items` (33.6M행), `orders` (8.5M), `payments` (8.4M), `customers` (소형) |
-| **측정 도구** | `scripts/measure_performance.py full-load` + CloudWatch progress 모니터링 |
+| **ECS Fargate** | 16 vCPU, 120 GB 메모리(가장 큰 태스크) |
+| **소스** | Aurora MySQL과 Aurora PostgreSQL, `db.r8g.16xlarge` |
+| **타깃** | Aurora DSQL, `ap-northeast-2` |
+| **로더 설정** | *Tables in parallel* 16, 나머지는 모두 기본값(*Reader shards per large table* 자동, *Batches per table* 8, *Rows per batch* 2000) |
+| **측정 도구** | `scripts/measure_performance.py full-load`, 일회성 ECS 태스크로 실행 |
 
-| 구성 | rows/s | CPU |
-|---|---|---|
-| 한 프로세스의 스레드(코어 1개), 2개 테이블 | 12,277 | 110% (코어 1개) |
-| 테이블당 프로세스 1개, 2개 테이블 | 22,365 | 207% |
-| 테이블당 프로세스 1개, 4개 테이블 | 32,270 | 311% |
-| 큰 테이블 1개를 8개 프로세스로 분할, 빈 타깃(단순 `INSERT`) | 지속 41,000–51,000, 피크 ~67,000 | 777% |
-| 같은 테이블, 기존 행 위에 append(`ON CONFLICT`) | ~35,000 | 439% |
+| 실행 | 행 | 시간 | 전체 | 안정 구간 | 제한 요인 |
+|---|---|---|---|---|---|
+| PostgreSQL, 테이블 16개 | 320M | 15분 53초 | ~336K rows/s | ~600K rows/s | Aurora DSQL(태스크는 코어 약 3.5개 사용) |
+| PostgreSQL, 테이블 하나: 프로세스 16개에서 구간 32개 | 150M | 12분 12초 | ~205K rows/s | ~280K rows/s | Aurora DSQL |
+| MySQL, 테이블 16개 | 320M | 27분 | ~193K rows/s | ~226K rows/s | 태스크의 CPU(16 vCPU 모두 사용) |
+| MySQL, 테이블 하나, Full load only: 세션 하나 | 150M 중 75M(25분에 중단) | — | — | ~55.5K rows/s | 코어 하나 |
+| MySQL, 테이블 하나, Full load + CDC: 별도 스냅샷 부분 16개 | 150M | 15분 12초 | ~164K rows/s | ~226K rows/s | 태스크의 CPU, 이전 사본의 DROP과 동시에 실행 |
 
-- **Full Load는 네트워크가 아니라 CPU 바운드입니다.** Python 프로세스 하나는 한 코어에서 행을
-  변환하므로 처리량은 병렬 프로세스 수에 비례합니다. 테이블 병렬수를 vCPU 수에 가깝게
-  잡으세요(§7.2).
-- **빈 타깃에 적재하는 경로가 가장 빠릅니다.** **Drop & reload** 뒤에는 로더가 `ON CONFLICT` 없는
-  단순 `INSERT`를 쓰므로 낙관적 동시성 경합이 완전히 사라집니다. 기존 행 위에 append하면 대략 15–30%
-  느렸습니다.
-- **동시 쓰기 프로세스가 약 8개를 넘으면 한계가 CPU에서 DSQL 쓰기 용량으로 옮겨 갑니다**(피크 약 67K
-  rows/s 관측).
+### 처리량을 좌우하는 요인
 
-### 대규모: 약 1 TB (16 vCPU)
-
-| | MySQL 소스 | PostgreSQL 소스 |
-|---|---|---|
-| **소스** | Aurora MySQL `db.r7g.8xlarge` (임시 업사이즈) | Aurora PostgreSQL 16.14 `db.r7g.8xlarge` (임시 업사이즈) |
-| **데이터셋** | 20개 테이블 × 45.78M행 = 915.7M행 (≈ 1.07 TB) | 20개 테이블 × 43M행 = 860M행 (≈ 1.02 TB) |
-| **로더 설정** | 20개 전부 composite PK(`dist_key`), `TABLE_PARALLELISM=16`, `BATCH_PARALLELISM=32`, batch rows 3000 | 동일 |
-| **완주** | 20/20 테이블, 실패 0 | 20/20 테이블, 실패 0 |
-| **총 소요 (wall)** | 2시간 27분 32초 | 1시간 42분 31초 |
-| **평균 처리량** | ~103K rows/s | ~140K rows/s |
-| **16개 테이블 병렬 구간** | ~131K rows/s (16 vCPU 포화) | ~194K rows/s (16 vCPU 중 약 12) |
-| **OCC `40001` 재시도** | 0 | 0 |
-
-두 측정 모두 같은 Fargate 크기와 같은 Aurora DSQL 클러스터를 썼고, UI가 아니라 자동 스크립팅(ECS
-RunTask)으로 구동했습니다.
-
-- **composite 기본 키가 핫 파티션 병목을 없앱니다.** 단조 증가 `AUTO_INCREMENT` 키는 모든 insert를
-  맨 끝 키 범위로 몰지만, 카디널리티가 높은 컬럼을 앞에 붙이자 쓰기가 분산되어 재시도가 정확히
-  0이었습니다(§7.1).
-- **테이블 수를 테이블 병렬수 이내로 맞추세요.** 20개 테이블에 슬롯 16개라 마지막 4개 테이블이 혼자
-  돌며(약 21K rows/s) 약 31분이 더 걸렸습니다. 테이블 병렬수를 테이블 수 이상으로 잡았다면 MySQL
-  측정은 약 1시간 56분이었을 것입니다.
-- **PostgreSQL 소스는 더 적은 CPU로 더 빠르게 적재합니다.** 값이 거의 그대로 통과하므로 행당 CPU
-  비용이 MySQL의 방언 변환보다 낮습니다. MySQL은 CPU가 포화였고 PostgreSQL은 그렇지 않았습니다.
-- **큰 데이터는 가능하면 여러 테이블로 나누세요.** 갓 생성된 DSQL 테이블은 파티션 1개로 시작해 부하
-  속에 분할되므로, 단일 테이블 적재는 저조하게(약 16K rows/s) 시작해 120–150K rows/s까지 오릅니다.
-  20개 테이블은 시작부터 20배의 파티션을 갖습니다.
-
-### 거대한 단일 테이블
-
-현행 도구는 단일 대형 테이블을 기본으로 **리더 하나**로 적재해, 쓰기가 일어나는 소스에서 동시
-리더들이 서로 다른 스냅샷을 읽는 일이 없게 합니다. 8.65억 행 PostgreSQL 테이블에서 리더 하나는 약
-20–23K rows/s(테이블 전체에 약 12시간)였고, 정적 소스에서 샤드 4개를 강제하면 약 42K rows/s로 CPU가
-아니라 쓰기에 묶였습니다. 거대한 단일 테이블은 *Reader shards per large
-table*([§3.8](03-full-load.md#38-병렬-적재), [§7.2](07-performance-and-tuning.md#72-병렬수-튜닝))을
-참고하세요.
+- **동시 진행 배치가 아니라 키 범위입니다.** Aurora DSQL은 테이블의 키 범위 하나를 동시 진행 수와
+  관계없이 약 20,000 rows/s로 쓰므로, 큰 테이블은 쓰기를 여러 키 범위로 분산해야만 빨라지며, 로더가
+  기본으로 이를 합니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)). 테이블당 범위 하나와
+  비교하면 150M 행 테이블은 PostgreSQL에서 약 10배, 부분으로 나눈 MySQL에서 8배, 세션 하나의
+  MySQL에서 2.8배 빨리 적재됐습니다.
+- **MySQL 적재는 태스크의 CPU에, PostgreSQL 적재는 Aurora DSQL에 묶입니다.** MySQL 행을 읽고
+  변환하느라 동시에 적재되는 테이블 또는 부분마다 코어 약 하나가 바쁩니다. PostgreSQL 값은 그대로
+  통과하므로 테이블 16개가 코어 약 3.5개로 336K rows/s에 적재됐습니다. *Tables in parallel*을
+  태스크의 vCPU 수로 설정하세요.
+- **거대한 MySQL 테이블 하나는 기본으로 코어 하나의 속도로 적재됩니다.** 세션 하나가 스냅샷
+  하나에서 그 구간들을 읽습니다. binlog 시작 지점이 있는 Full load + CDC에서
+  *Reader shards per large table*을 명시하면 별도 스냅샷 부분으로 나누어 여러 코어에서 읽으며,
+  복사본은 CDC가 재생해야 일관됩니다([§3.8](03-full-load.md#38-병렬-적재)).
+- **새 테이블은 워밍업이 필요합니다.** Aurora DSQL은 새 테이블을 파티션 하나로 시작해 커지면서
+  분할하므로, 적재의 처음 1분 정도는 안정 구간보다 느립니다.
+- **호스트와 앞선 작업이 수치를 움직입니다.** 같은 MySQL 적재가 한 Fargate 호스트에서 다른
+  호스트보다 최대 약 1.8배 빨랐고, 이전 75M 행 사본을 삭제하자 Aurora DSQL의 백그라운드 작업이 1시간
+  넘게 실행되며 다음 적재와 함께 돌았습니다.
 
 ---
 
 ## CDC 처리량
 
-CDC는 병목 지점이 Full Load와 다른 파이프라인입니다. Full Load는 **CPU 바운드**이고, CDC는
-`Debezium(소스) → MSK 토픽 → 커스텀 DSQL 싱크` 구조에서 싱크가 **DSQL 쓰기 지연
-바운드**입니다(문장마다 분산 왕복 1회). 스케일링 파라미터는 도구가 캡처 테이블 수로부터
-추론합니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)).
+CDC는 병목 지점이 Full Load와 다른 파이프라인입니다: `Debezium(소스) → MSK 토픽 → 커스텀 DSQL 싱크`
+구조에서 싱크가 **DSQL 쓰기 지연 바운드**입니다(문장마다 분산 왕복 1회). 스케일링 파라미터는 도구가
+캡처 테이블 수로부터 추론합니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)).
 
 | 구성 요소 | 구성 |
 |---|---|
@@ -127,20 +100,21 @@ CDC는 병목 지점이 Full Load와 다른 파이프라인입니다. Full Load�
 ## 측정 재현
 
 ```bash
-AWS_REGION=us-east-1 \
-DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
-TARGET_ENDPOINT=<dsql-cluster-endpoint> \
-MEASURE_SCHEMA=customers_sample \
-MEASURE_TABLES="order_items orders payments customers" \
-TABLE_PARALLELISM=8 \
-BATCH_PARALLELISM=8 \
+AWS_REGION=<region> APP_STACK=<app-stack> \
+DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
+TABLE_PARALLELISM=16 VARIANTS=auto \
 deploy/run_measure_on_fargate.sh
 ```
 
-전체 A/B 측정 하니스는
-[`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh), 프로세스 내 처리량 +
-OCC 보고 도구는 [`scripts/measure_performance.py`](../../../scripts/measure_performance.py)를
-참고하세요.
+[`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh)는 소스의 VPC에서
+일회성 Fargate 태스크로 측정을 실행합니다. `VARIANTS=auto`는 로더의 기본값을 측정하며, 다른 variant는
+스크립트에 나열되어 있습니다. [`scripts/measure_performance.py`](../../../scripts/measure_performance.py)가
+측정 자체입니다: 테이블별·시간 구간별 처리량, 쓰기 경로의 재시도와 지연, 그리고 Aurora DSQL이 인덱스
+빌드를 끝낸 시점을 보고합니다. 사용법은 그 헤더에 있으며(`--reader-shards`, `--cdc-mode`, …),
+`PERF_SOURCE_ENGINE=postgres`로 PostgreSQL 소스를 측정합니다. 대상 테이블을 삭제 후 다시 만들므로
+**비프로덕션 타깃에서만** 쓰고, 실행을 비교하기 전에 이전 사본을 먼저 삭제하고 Aurora DSQL이
+백그라운드 작업을 끝내게 하세요(`--wait-sys-jobs`).
 
 CDC는 cdc-stack을 배포하고 소스에 꾸준한 insert 워크로드를 건 뒤, CloudWatch `AWS/KafkaConnect`에서
 파이프라인 속도(`-debezium-source` 커넥터의 `SourceRecordWriteRate`, `-dsql-sink` 커넥터의

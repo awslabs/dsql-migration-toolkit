@@ -48,7 +48,7 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
 | Aurora DSQL | 어떻게 되나, 무엇을 하나 |
 |---|---|
 | 값은 열당 1 MiB, 행은 2 MiB, 쓰기 트랜잭션은 10 MiB(`OVERSIZED_LOB`) | 열 하나의 값이 **1 MiB**를 넘으면 타입과 무관하게 저장할 수 없습니다: `54000 ERROR: maximum column size exceeded`. 행이 **2 MiB**를 넘어도 저장할 수 없습니다(`maximum row size exceeded`; [Aurora DSQL 쿼터](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). 한도를 넘는 값은 행 단위로 **격리(quarantine)**되고(Full Load는 에러 로그, CDC는 **DLQ**), Kafka 메시지 상한을 넘길 수 있는 컬럼은 **캡처 단계에서 제외**해야 합니다. 바이너리/문서 컬럼(MySQL `MEDIUMBLOB`/`LONGBLOB`/`MEDIUMTEXT`/`LONGTEXT`/`JSON`, PostgreSQL `bytea`/`json`/`jsonb`)은 `OVERSIZED_LOB`로 LOSS, 길이 제한 없는 PostgreSQL `text`/`varchar`는 RECOMMENDATION으로 표시됩니다. |
-| 테이블당 인덱스 최대 24개: PK가 포함되므로 보조 인덱스는 23개(MySQL 소스는 64개; `TOO_MANY_INDEXES`) | 초과분 `CREATE INDEX ASYNC`가 Full Load로 모든 행을 쓴 **뒤에** 실패하므로, 계획 단계에서 **Review needed**로 표시하고 Schema Conversion에도 같은 노트를 보여 줍니다. |
+| 테이블당 인덱스 최대 24개: PK가 포함되므로 보조 인덱스는 23개(MySQL 소스는 64개; `TOO_MANY_INDEXES`) | Schema Conversion은 23개를 유지하고 나머지는 빼며 노트에 그 이름을 적습니다. 그래서 테이블은 그 인덱스 없이 적재되고, 그중 하나에 의존하던 쿼리는 스캔으로 대체됩니다. 계획 단계에서 **Review needed**로 표시됩니다: 적용하기 전에 유지할 인덱스를 고르세요. |
 | 키 합산 크기 최대 1 KiB(기본 키마다, 인덱스마다) | DDL이 아니라 **`INSERT`/`UPDATE` 시점의 값**에 대해 검사되므로 실제 키가 너무 긴 행만 실패합니다(error `54000` `key size too large`). *선언된* 폭이 이를 넘을 수 있으면 변환이 경고하며(`utf8mb4`는 문자당 4바이트로 계산) 해당 키와 최악의 크기를 명시하지만, 차단하지는 않습니다. |
 
 **설계상 다른 점**(도구가 처리)
@@ -402,22 +402,24 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
     CDC를 시작하기 전에 CDC가 캡처할 필요가 없는 테이블의 선택을 해제할 수 있습니다
     ([13장](13-excluding-tables-and-columns.md)의 "Full Load 후 테이블 집합 바꾸기 (Full load +
     CDC)" 참고): 그 테이블은 적재된 그대로 Aurora DSQL에 남고, CDC와 Validation은 그 테이블을
-    건너뜁니다. 적재가 나누어 읽는 MySQL 테이블(*Reader shards per large table*이 1보다 큼,
-    [§3.8](03-full-load.md#38-병렬-적재))은 예외입니다: 리더 하나로 다시 적재하기(Drop & reload)
-    전에는 선택을 해제할 수 없습니다.
+    건너뜁니다. 적재가 별도 스냅샷 부분으로 나누어 읽는 MySQL
+    테이블(*Reader shards per large table*을 2 이상으로 명시, [§3.8](03-full-load.md#38-병렬-적재))은
+    예외입니다: 리더 하나로 다시 적재하기(Drop & reload) 전에는 선택을 해제할 수 없습니다.
   - 그 밖에는 이 CDC 파이프라인에서 캡처하는 테이블을 줄이거나(테이블 목록에서 선택 해제), Full load
     only를 사용하세요.
-- **MySQL: 나누어 읽은 테이블은 CDC가 재생해야 일관됨.** *Reader shards per large table*이 1보다
-  크면, Full load + CDC 적재는 큰 MySQL 테이블의 읽기를 기본 키 구간으로 나누어 구간마다 자신의
-  스냅샷으로 읽습니다([§3.8](03-full-load.md#38-병렬-적재)). Full Load의 시작 지점에서 시작한 CDC가
-  그 테이블을 재생하기 전까지는, 읽는 동안 키가 바뀐 행이 Aurora DSQL에 두 번 있거나 아예 없을 수
-  있고, 두 구간에 걸친 트랜잭션은 절반만 반영될 수 있습니다 — 행 수는 같은 채로: ROW_COUNT 검증은
-  이를 보지 못하고, CHECKSUM은 봅니다. 그래서 그런 테이블을 그 재생 없이 남기는 경로(선택 해제, Full
-  load only, 더 나중의 시작 지점에서 Start CDC)는 테이블을 리더 하나로 다시 적재할 때까지(Drop &
-  reload: Append는 그 행을 그대로 둡니다) 모두 거부됩니다. Full load only와 더 나중의 시작 지점은
-  CHECKSUM 모드의 Validation이 그 테이블의 일치를 확인해도 허용됩니다. 선택 해제에는 CDC를 시작하기
-  전의 다시 적재가 필요합니다: CDC의 첫 Start부터 테이블 집합은 고정됩니다. 선행 키 컬럼을 포함하지
-  않는 unique 키가 있는 테이블과 Full load only 실행의 모든 테이블은 리더 하나를 유지합니다.
+- **MySQL: 나누어 읽은 테이블은 CDC가 재생해야 일관됨.** *Reader shards per large table*을 2 이상으로
+  명시하면, binlog 시작 지점이 있는 Full load + CDC 적재는 큰 MySQL 테이블을 기본 키 구간으로 나누어
+  구간마다 자신의 스냅샷으로 읽습니다([§3.8](03-full-load.md#38-병렬-적재)). Full Load의 시작 지점에서
+  시작한 CDC가 그 테이블을 재생하기 전까지는, 읽는 동안 키가 바뀐 행이 Aurora DSQL에 두 번 있거나
+  아예 없을 수 있고, 두 구간에 걸친 트랜잭션은 절반만 반영될 수 있습니다 — 행 수는 같은 채로:
+  ROW_COUNT 검증은 이를 보지 못하고, CHECKSUM은 봅니다. 그래서 그런 테이블을 그 재생 없이 남기는
+  경로(선택 해제, Full load only, 더 나중의 시작 지점에서 Start CDC)는 테이블을 리더 하나로 다시
+  적재할 때까지(Drop & reload: Append는 그 행을 그대로 둡니다) 모두 거부됩니다. Full load only와 더
+  나중의 시작 지점은 CHECKSUM 모드의 Validation이 그 테이블의 일치를 확인해도 허용됩니다. 선택
+  해제에는 CDC를 시작하기 전의 다시 적재가 필요합니다: CDC의 첫 Start부터 테이블 집합은 고정됩니다.
+  기본 설정에서는 어떤 테이블도 이렇게 읽지 않으며, Full load only 실행의 테이블과 선행 키 컬럼을
+  포함하지 않는 unique 키가 있는 테이블도 마찬가지입니다: 그런 테이블은 리더 세션 하나가 스냅샷
+  하나에서 읽습니다.
 - **CDC는 배포되어 있는 동안 과금됨.** 스트리밍 파이프라인(MSK Serverless + MSK Connect, NAT
   게이트웨이를 만들었다면 그것까지)은 실행되는 내내 비용이 발생합니다. Cut over 후에는 cdc-stack을
   내리세요. Full Load만 수행하면 스트리밍 인프라가 프로비저닝되지 않습니다.

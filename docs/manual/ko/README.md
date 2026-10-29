@@ -53,12 +53,12 @@ Data Migration은 **Full Load**(도구 자체의 벌크 로더)와, 선택적으
 | 4 | [CDC와 DSQL 제약](04-cdc-and-dsql-constraints.md) | 스트리밍 CDC 동작, 무손실 Full Load → CDC 핸드오프, 그리고 DSQL 제약(트랜잭션당 행 한도, 1 MiB 값 한도, OCC, IAM 인증)을 데이터 경로에서 처리하는 방식. |
 | 5 | [Validation](05-validation.md) | 타깃이 소스와 일치함을 증명하는 방식: 행 수, 체크섬, 전체 PK 대조, 라이브 소스 드리프트. |
 | 6 | [한계](06-limitations.md) | 계획에 반드시 반영해야 하는 실제 제약(DSQL 제약, 단일 리전 CDC, 단일 태스크 컨트롤 플레인). |
-| 7 | [성능과 튜닝](07-performance-and-tuning.md) | Aurora DSQL에서 도구가 대신 해 주는 일(OCC 재시도, 핫 파티션 PK, 트랜잭션 한도, 비동기 인덱스, IAM 토큰)과 Full Load / Validation / CDC 병렬수 튜닝 — 로컬 및 Fargate — 그리고 소스에 주는 부하를 관리하는 방법. |
+| 7 | [성능과 튜닝](07-performance-and-tuning.md) | Aurora DSQL에서 도구가 대신 해 주는 일(OCC 재시도, 키 범위, 핫 파티션 PK, 트랜잭션 한도, 비동기 인덱스, IAM 토큰)과 Full Load / Validation / CDC 병렬수 튜닝 — 로컬 및 Fargate — 소스에 주는 부하를 관리하는 방법, 그리고 그 근거가 된 라이브 실측. |
 | 8 | [테스트 및 검증](08-testing-and-verification.md) | 당신의 데이터에서 어긋날 수 있는 상황(큰 테이블·1 MiB 값·애매한 타입·OCC 경합·긴 스트림·무손실 핸드오프·드리프트)마다 도구가 대신 해 주는 일과, 그 결과를 어디서 확인하는지 — 그리고 일부러 까다롭게 만든 데이터로 실제 AWS에서 낸 100% 일치 결과. |
 | 9 | [Query Converter와 AI DBA](09-query-validation.md) | 선택적 Query Converter: MySQL 쿼리 하나를 Aurora DSQL로 변환하고, 타깃에서 읽기 전용으로 테스트(`EXPLAIN` / `EXPLAIN ANALYZE` + DPU 비용)하며, **AI DBA**가 DSQL에 맞게 효율적으로 재작성하고 재테스트로 개선을 증명. |
 | 10 | [결론](10-conclusion.md) | 어떤 경로를 언제 쓸지, 권장 end-to-end 흐름, 다음 단계. |
 | 11 | [고객 FAQ](11-customer-faq.md) | 고객이 가장 많이 묻는 질문 — Full Load, CDC, 제약, 타입 매핑, 검증, 컷오버/롤백, 운영 — 을 도구의 실제 동작에 근거해 답하고 상세 장으로 연결. |
-| 12 | [부록: 성능 테스트 결과](12-performance-test-results.md) | 실측 Full Load와 CDC 처리량 — 처리량을 좌우하는 요인, MySQL·PostgreSQL 소스의 약 1 TB 실행 — 그리고 측정을 재현하는 방법. |
+| 12 | [부록: 성능 테스트 결과](12-performance-test-results.md) | 실측 Full Load와 CDC 처리량 — MySQL·PostgreSQL 소스의 최대 규모 실행과 그 처리량을 좌우하는 요인 — 그리고 측정을 재현하는 방법. |
 | 13 | [테이블과 컬럼 제외](13-excluding-tables-and-columns.md) | **Exclude tables & columns** 규칙 팝업: 규칙 언어, 제외할 수 없는 것, 제외한 컬럼이 Aurora DSQL에서 NULL이 되는 방식, 나중에 제외 설정 바꾸기(Change & reload), CDC 캡처 목록, Validation과 Cut over. |
 
 ## MySQL·PostgreSQL 사용자를 위한 Aurora DSQL 안내

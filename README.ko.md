@@ -339,12 +339,12 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 세션별 비밀 아닌 워크벤치 상태 — 재연결 브라우저가 이어서 작업. `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용. 로컬 디스크 — Fargate 배포는 아래 durable S3 스토어를 대신 사용. |
 | `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(미설정)_ | 세션 스냅샷용 durable S3 스토어 — 인프로세스 재시작뿐 아니라 Fargate 태스크 교체(재배포)까지 재개가 유지됨. Fargate 배포가 관리형 플러그인 버킷으로 자동 설정(설정 불필요); 로컬은 미설정 시 위 SQLite 경로 사용. |
 | `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | Full Load 스테이징용 S3 버킷(스트리밍 멀티파트 업로드 — 대형 테이블 확장 경로). 미설정 시 제한된 로컬 임시 CSV(개발 / 소형). |
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블 수. 총 DSQL 연결을 클러스터 쿼터 안에서 유지. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블당 in-flight `INSERT … ON CONFLICT` 배치 수. 높을수록 처리량↑, OCC(40001) 충돌↑. |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블, 또는 큰 테이블의 부분 수(각각 worker 프로세스 하나). 큰 실행에서는 태스크의 vCPU 수로 설정. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블 또는 부분당 in-flight `INSERT … ON CONFLICT` 배치 수. 키 범위당 4개, 실행당 128개로 상한: Aurora DSQL 테이블의 키 범위 하나는 초당 약 10회 커밋을 처리하므로, 배치를 늘려도 기다리기만 함(커밋 지연과 비용↑). |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |
 | `DSQL_MIGRATOR_FULL_LOAD_PREFETCH` | `1` (켜짐) | 읽기 선행 prefetch 큐(리더 스레드가 bounded 큐를 채우는 동안 쓰기 진행). 켜 두세요. A/B 벤치마크로 pre-prefetch 경로를 재현할 때만 `0`. |
-| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `1` (꺼짐, ≤8) | 큰 테이블의 읽기를 정수 선행 기본 키 컬럼으로 K개 구간으로 나눠, 구간마다 별도 worker 프로세스가 읽음(구간마다 `FULL_LOAD_TABLE_PARALLELISM`의 slot 하나). PostgreSQL: 모든 실행. MySQL: Full load + CDC에서만, unique 키가 모두 그 컬럼을 포함하는 테이블만. 매뉴얼 §3.8 / §7.2 참고. |
-| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 이 추정 행수 이상인 테이블만 리더 샤딩; 더 작은 테이블은 단일 리더. |
+| `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0` (자동, ≤32) | 정수 선행 키 컬럼이 있는 큰 테이블을 몇 개의 기본 키 구간으로 나누어 읽고 쓰는지: `0` = 추정 5,000,000행부터 2,500,000행마다 하나, 최대 32; `1` = 꺼짐; `2`–`32` = 정확히 그 수. PostgreSQL: 구간들이 스냅샷 하나를 공유. MySQL: 리더 세션 하나가 스냅샷 하나에서 읽음; 별도 스냅샷 부분은 binlog 시작 지점이 있는 Full load + CDC에서 값을 명시해야 함. 매뉴얼 §3.8 / §7.2 참고. |
+| `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 테이블을 나누는 최소 추정 행 수(자동은 5,000,000행도 필요); 더 작은 테이블은 단일 리더. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Validation에서 동시에 비교하는 테이블 수. `1` = 순차. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 시작 로그 레벨. `DEBUG`는 실패 이벤트에 stacktrace(콜 스택만) 추가. 런타임에 **Diagnostics**에서도 변경 가능. |
 | `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch). 런타임에 **Diagnostics**에서 토글 가능. |

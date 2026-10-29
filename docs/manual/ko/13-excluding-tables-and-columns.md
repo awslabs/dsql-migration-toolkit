@@ -257,7 +257,7 @@ include public.settings.preferences
 | Aurora DSQL에서 NOT NULL이면 | NOT NULL이 제거됩니다. **이는 단방향입니다:** Aurora DSQL은 NOT NULL을 제자리에서 다시 추가할 수 없으며, 나중에 그 테이블을 Drop & reload해야만 복원됩니다. 컬럼은 컷오버 후에도 nullable로 남습니다. |
 | DEFAULT가 있으면 | 마이그레이션 동안 DEFAULT가 제거되고 Cut over에서 복원됩니다. 복원된 DEFAULT는 새 행에만 적용됩니다(§13.9). |
 | 보존된 외래 키의 자식 컬럼이면 | 부모와의 관계가 이관되지 않습니다(NULL은 외래 키 검사를 통과합니다). 그 키가 둘 이상의 컬럼에 걸친 `MATCH FULL`이면 대신 일부만 NULL인 키가 거부됩니다: 키의 모든 컬럼을 제외하지 않는 한 이관된 행에서 그 키의 검증이 실패하고(Cut over가 그 키에서 Finish를 보류합니다), 나중에 이 컬럼만 NULL로 두는 쓰기는 거부됩니다(23503). 키의 모든 컬럼을 제외하거나, 이 컬럼을 유지하거나, 테이블의 대상 스크립트에서 `MATCH FULL`(또는 그 키)을 제거하세요. |
-| UNIQUE 제약이나 인덱스에 들어 있으면 | 이관된 행은 모두 NULL이므로, 그 행들에 대해 유일성이 강제되지 않습니다 — 다만 그 인덱스가 NULL을 같은 값으로 보는 `NULLS NOT DISTINCT`(PostgreSQL 15+)이면, 인덱스의 다른 컬럼 값을 공유하는 이관 행은 첫 행 이후 거부되거나(23505) Drop & reload 후 인덱스를 만들 수 없습니다. 이 컬럼을 유지하거나, 테이블의 대상 스크립트에서 그 인덱스의 `NULLS NOT DISTINCT`를 제거하세요. |
+| UNIQUE 제약이나 인덱스에 들어 있으면 | 이관된 행은 모두 NULL이므로, 그 행들에 대해 유일성이 강제되지 않습니다 — 다만 그 인덱스가 NULL을 같은 값으로 보는 `NULLS NOT DISTINCT`(PostgreSQL 15+)이면, 인덱스의 다른 컬럼 값을 공유하는 이관 행은 첫 행 이후 거부되며(23505), Drop & reload에서도 마찬가지입니다(행을 적재하기 전에 인덱스를 만들기 때문). 이 컬럼을 유지하거나, 테이블의 대상 스크립트에서 그 인덱스의 `NULLS NOT DISTINCT`를 제거하세요. |
 | 유지되는 생성 컬럼이 사용하면 | 생성 컬럼이 NOT NULL이고 이 컬럼이 NULL일 때 그 식이 NULL을 내면, 모든 행이 거부됩니다(23502). 생성 컬럼이 nullable이면 NULL로부터 계산되어 소스와 달라집니다. |
 | 뷰가 언급하면(텍스트 매칭) | 뷰는 NULL을 읽습니다. |
 
@@ -552,7 +552,7 @@ Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작�
 | 동작 | 결과 |
 |---|---|
 | **테이블 체크 해제** | Aurora DSQL에 그대로 남습니다(drop되지 않음). CDC는 그 테이블을 캡처하지 않고, 이 마이그레이션은 더 이상 그 테이블을 로드하거나 검증하지 않습니다. 컷오버 DEFAULT 복원은 그 테이블을 복원하지 않고 **Needs your decision** 아래에 나열합니다. 테이블 규칙으로 선택을 해제하면 그 테이블의 제외 컬럼 항목은 유지되지 않습니다. |
-| **Full Load가 나누어 읽은 MySQL 테이블 체크 해제**(*Reader shards per large table*이 1보다 큼, [§3.8](03-full-load.md#38-병렬-적재)) | 불가능합니다: 그 복사본은 여러 스냅샷의 행을 담고 있어, CDC가 Full Load의 시작 지점부터 재생해야 일관됩니다. 체크박스가 잠기고(잠금 아이콘에 이유가 표시됨), Unselect all도 그 테이블은 선택된 채로 두며, 그 테이블의 선택을 해제하는 테이블 규칙은 거부되고, Full load only와 더 나중의 시작 지점에서의 Start CDC도 거부됩니다. 체크를 해제하려면 CDC를 시작하기 전에, Settings에서 Reader shards per large table을 1로 설정하고, 그 테이블을 Drop & reload로 다시 적재한 뒤(끝나지 않았으면 Retry unfinished tables, 그 밖에는 Reload specific tables: 리더 하나로 읽을 때는 Append / Drop & reload 선택과 관계없이 삭제 후 다시 적재합니다), 체크를 해제하세요. CDC가 시작되면 테이블 집합은 고정되므로(바꾸려면 Start over), CDC의 재생 뒤 CHECKSUM 모드의 Validation이 그 테이블의 일치를 확인하면 Full load only와 더 나중의 시작 지점에 대한 거부는 끝나지만, 체크 해제는 허용되지 않습니다. |
+| **Full Load가 나누어 읽은 MySQL 테이블 체크 해제**(*Reader shards per large table*을 2 이상으로 명시, [§3.8](03-full-load.md#38-병렬-적재)) | 불가능합니다: 그 복사본은 여러 스냅샷의 행을 담고 있어, CDC가 Full Load의 시작 지점부터 재생해야 일관됩니다. 체크박스가 잠기고(잠금 아이콘에 이유가 표시됨), Unselect all도 그 테이블은 선택된 채로 두며, 그 테이블의 선택을 해제하는 테이블 규칙은 거부되고, Full load only와 더 나중의 시작 지점에서의 Start CDC도 거부됩니다. 체크를 해제하려면 CDC를 시작하기 전에, Settings에서 Reader shards per large table을 0(자동) 또는 1(꺼짐)로 설정하고, 그 테이블을 Drop & reload로 다시 적재한 뒤(끝나지 않았으면 Retry unfinished tables, 그 밖에는 Reload specific tables: 리더 하나로 읽을 때는 Append / Drop & reload 선택과 관계없이 삭제 후 다시 적재합니다), 체크를 해제하세요. CDC가 시작되면 테이블 집합은 고정되므로(바꾸려면 Start over), CDC의 재생 뒤 CHECKSUM 모드의 Validation이 그 테이블의 일치를 확인하면 Full load only와 더 나중의 시작 지점에 대한 거부는 끝나지만, 체크 해제는 허용되지 않습니다. |
 | **Full Load가 로드하지 않은 테이블 체크** | 먼저 Full Load의 시작 지점 아래에서 로드되고, 그 뒤에야 CDC가 캡처합니다(아래). |
 | **CDC 인프라가 그 테이블 없이 배포된 뒤 다시 체크** | CDC를 시작할 때 캡처됩니다: 그 테이블의 Kafka 토픽은 인프라의 기본 파티션 수를 받으며, 이 수는 인프라를 배포할 때의 테이블들을 기준으로 정해졌습니다. |
 | **exclude table 규칙이 선택을 해제한 테이블** | Change & reload에서 그 규칙을 삭제해야만 돌아오며, 이때 그 테이블의 컬럼 규칙이 적용됩니다(테이블 목록에서 체크하는 것은 거부됩니다: 그 컬럼 규칙이 적용되지 않기 때문입니다). 잠금 아이콘과 그 사유가 표시됩니다. |

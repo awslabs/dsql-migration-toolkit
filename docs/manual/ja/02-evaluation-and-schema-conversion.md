@@ -204,7 +204,8 @@ Data Migration の **Exclude tables & columns...** を使います
   が保存しているとおりにコピーされます。フラグが付いたビューは、
   適用する前にソースと並べて確認してください (`VIEW_NOT_CONVERTED`、または結果が異なるという注記。
   PostgreSQL では、型が変わる列を読むビューに `VIEW_REMODELLED_COLUMN`)。
-- **インデックス** はデータのロードの後に構築されます (`CREATE INDEX ASYNC`)。MySQL の FULLTEXT と
+- **インデックス** はテーブルと一緒に、どの行もロードする前に作成されます (`CREATE INDEX ASYNC`。
+  Aurora DSQL がバックグラウンドで構築します)。MySQL の FULLTEXT と
   SPATIAL のインデックスは作成されず、PostgreSQL の GIN や GiST のインデックスは btree
   になり、その検索にはもう使えません。PostgreSQL の `UNIQUE … NULLS NOT DISTINCT` インデックスは
   `NULLS NOT DISTINCT` を保持します。

@@ -31,10 +31,11 @@ Source (MySQL / PostgreSQL)          Aurora DSQL
 ```
 
 1. **워터마크 캡처**(소스 히스토리의 일관된 지점).
-2. PK 페이지 단위로 **행 스트리밍 추출**.
+2. PK 페이지 단위로 **행 스트리밍 추출**(큰 테이블은 쓰기가 분산되도록 여러 기본 키 구간으로,
+   §3.8).
 3. 읽어 들인 각 값을 DSQL 형태로 **변환**.
-4. 한정된 배치(재적용해도 중복 없음)로 DSQL에 **동시 적재**.
-5. 이후 보조 **인덱스** 빌드.
+4. 한정된 배치(재적용해도 중복 없음)로 DSQL에 **동시 적재**: 보조 **인덱스**가 이미 있는 테이블에
+   적재합니다(§3.4).
 
 **도구가 소스에 쓰는 내용.** 소스는 일관된 스냅샷 안에서 **읽기 전용**으로 읽히며, 로더는 절대
 수정하지 않습니다. 읽기 외에 소스에 손대는 것은 CDC뿐이며, 다음과 같은 경우뿐입니다:
@@ -148,12 +149,31 @@ insert하되 기존 키는 덮어쓰지 않고 건너뜀 — 그래서 재실행
 마이그레이션된 키와 **충돌하지 않게** 합니다. **완전(또는 gap 수용) 적재에서만** 실행되고 부분/실패
 적재에서는 실행되지 않습니다; 평범한 정수 키는 시퀀스가 없어 건드리지 않습니다.
 
-**인덱스는 마지막.** 보조 인덱스는 모든 데이터 배치가 성공한 **후**에 생성되며, Aurora DSQL이
-비동기로 빌드합니다. 실패한 인덱스 구문은 다시 시도합니다. 재시도에서 같은 이름의 인덱스가 이미
-있으면 생성된 것으로 세지 않고(Aurora DSQL에서 인덱스 이름은 스키마 단위라 다른 테이블의 인덱스일
-수도 있기 때문) Full Load 화면에 없는 인덱스가 아니라 **not confirmed**(확인되지 않음)로 표시하므로,
-인덱스를 추가하기 전에 타깃을 확인하세요. 화면의 알림은 `UNIQUE` 인덱스가 생성되지 않은 것이 확실할
-때만 제약이 빠졌다고 말합니다.
+**보조 인덱스가 먼저입니다.** Aurora DSQL에서는 인덱스가 적재된 행 위에서보다 빈 테이블에서 훨씬
+빨리 빌드되므로([§7.5](07-performance-and-tuning.md#75-라이브-인프라-실측--71과-72의-근거)), 테이블의
+보조 인덱스는 행보다 먼저 존재합니다: Schema Conversion의 적용이 테이블과 함께 인덱스를 만들고,
+**Drop & reload**는 다시 만든 테이블에 인덱스를 다시 만든 뒤, 첫 행을 적재하기 전에 Aurora DSQL이 그
+빌드를 마치기를 최대 10분 기다립니다. 실행이 나중에 다시 만드는 테이블의 인덱스, 또는 행보다 먼저
+제출하지 못한 인덱스는 모든 테이블의 데이터가 적재된 뒤에 만들어집니다(Stop해도 이미 적재된 테이블의
+인덱스는 제출됩니다). 인덱스가 이미 있으므로, 기본 키가 아닌 `UNIQUE` 인덱스가 거부하는 행은
+quarantine되고(§3.6) 테이블의 나머지는 적재됩니다.
+
+실패한 인덱스 구문은 다시 시도합니다. 재시도에서 같은 이름의 인덱스가 이미 있으면 생성된 것으로 세지
+않고(Aurora DSQL에서 인덱스 이름은 스키마 단위라 다른 테이블의 인덱스일 수도 있기 때문) Full Load
+화면에 없는 인덱스가 아니라 **not confirmed**(확인되지 않음)로 표시하므로, 인덱스를 추가하기 전에
+타깃을 확인하세요. 화면의 알림은 `UNIQUE` 인덱스가 생성되지 않은 것이 확실할 때만 제약이 빠졌다고
+말합니다.
+
+Aurora DSQL은 인덱스를 각각 백그라운드에서 빌드하며, Full Load가 보고하는 소요 시간은 인덱스가
+빌드된 때가 아니라 제출된 때 끝납니다. **Data Migration** 단계가 빌드 상황을 보여 줍니다:
+
+| 단계에 표시되는 내용 | 의미 | 할 일 |
+|---|---|---|
+| *Waiting for Aurora DSQL to build the secondary indexes of N recreated table(s) before loading* | Drop & reload가 빈 테이블에 인덱스를 만들고 빌드를 기다리는 중 | 없음: 빌드가 끝나면, 또는 10분이 지나면 적재가 시작되며, 그때까지 끝나지 않은 빌드는 계속 진행됩니다 |
+| *Aurora DSQL is building secondary indexes: n of m built* | 데이터는 적재됨. 인덱스가 필요한 쿼리는 빌드가 끝날 때까지 느림 | 없음: 다음 단계로 넘어가도 됩니다 |
+| *Secondary indexes built: all m* | 실행이 제출한 인덱스가 모두 빌드됨 | — |
+| *UNIQUE index build failed: a constraint is missing* 또는 *Secondary index builds failed* | Aurora DSQL이 인덱스를 빌드하지 못함. 실패한 `UNIQUE` 인덱스는 빠진 제약 | 컷오버 전에, 알림이 알려 주는 원인을 고치고(`UNIQUE`라면 중복 제거), 테이블에 아직 그 인덱스가 있으면 삭제한 뒤 다시 만드세요 |
+| *Secondary indexes not created yet (N table(s))* | 그 테이블들의 인덱스를 제출하기 전에 실행이 끝남(그 도중의 정지나 앱 재시작, 또는 Aurora DSQL 무응답). 빠진 데이터는 없음 | **Retry unfinished tables**: 데이터를 다시 적재하지 않고 인덱스를 제출합니다 |
 
 ---
 
@@ -270,9 +290,10 @@ Debezium이 먼저 선택한 모든 테이블을 스냅샷합니다).
 
 ### 행 단위 quarantine (테이블은 계속 적재)
 
-적재 시 **Aurora DSQL이 특정 행을 거부**하면(예: 1 MiB 초과 값, 제약 위반), 로더는 테이블을 실패
-처리하지 **않습니다.** 문제 행만 분리해 **quarantine**하고(그 **기본 키와 사유만 기록 — 값은 절대
-기록 안 함**) 나머지를 적재합니다. quarantine된 행은 다운로드 가능한 에러 로그에 나타납니다.
+적재 시 **Aurora DSQL이 특정 행을 거부**하면(예: 1 MiB 초과 값, 또는 기본 키가 아닌 `UNIQUE`
+인덱스의 중복 값 같은 제약 위반), 로더는 테이블을 실패 처리하지 **않습니다.** 문제 행만 분리해
+**quarantine**하고(그 **기본 키와 사유만 기록 — 값은 절대 기록 안 함**) 나머지를 적재합니다.
+quarantine된 행은 다운로드 가능한 에러 로그에 나타납니다.
 
 Aurora DSQL의 일시적 상태는 거부가 아닙니다: 동시성 충돌, 끊긴 연결, "server unavailable"은 배치
 전체를 재시도하며(§3.4), 재시도를 다 써도 해결되지 않은 배치는 실패로 처리됩니다 — 테이블은 **Retry
@@ -308,6 +329,7 @@ unfinished tables**로 다시 시도할 수 있고, 그 때문에 quarantine되�
 | 재시도를 다 쓰고 테이블이 실패했다(Aurora DSQL의 일시적 상태) | **Retry unfinished tables**. 그 때문에 quarantine되는 행은 없습니다. |
 | 값을 조용히 바꾸지 않고는 쓸 수 없어 테이블이 멈췄다 | Schema Conversion에서 값을 담을 수 있는 타입을 컬럼에 지정하거나(소스 타입이 바뀌었다면 먼저 Step 1을 다시 실행한 뒤 **Replace**로 다시 적용), 소스 데이터를 고치거나 컬럼을 제외한 다음 그 테이블을 재시도하세요. |
 | 실행이 중단되었다(정지, 크래시, 태스크 교체) | **Retry unfinished tables**: 끝난 테이블은 유지되고 끝나지 않은 테이블은 처음부터 다시 적재되며, 원래 워터마크(CDC 핸드오프 지점)를 재사용합니다([§3.7](#37-재개-가능성)). |
+| *Secondary indexes not created yet*(빠진 데이터 없음) | **Retry unfinished tables**: 데이터를 다시 적재하지 않고 그 테이블들의 빠진 인덱스만 제출합니다(§3.4). |
 | 새 복사본과 새 시작 지점이 필요하다 | **Re-run Full Load**에서 **Drop & reload**를 선택하세요. CDC 스택이 스트리밍한 적 있는 Full load + CDC 마이그레이션이라면 먼저 [새 시작 지점에는 새 CDC 토픽이 필요합니다](#새-시작-지점에는-새-cdc-토픽이-필요합니다)를 보세요. |
 
 ---
@@ -351,34 +373,49 @@ UPDATE와 DELETE 없이 그대로 둡니다. Full load + CDC에서 로드 후에
 ## 3.8 병렬 적재
 
 테이블은 병렬로 적재되며, 각 테이블은 자체 worker 프로세스에서 실행되므로 Full Load가 실행되는
-태스크의 vCPU를 모두 쓸 수 있습니다. `table_parallelism`이 동시에 실행되는 worker 수를 정합니다.
+태스크의 vCPU를 모두 쓸 수 있습니다. `table_parallelism`(*Tables in parallel*)이 동시에 실행되는
+worker 수를 정합니다. 큰 테이블은 기본 키 구간으로도 나누어 읽습니다: Aurora DSQL은 테이블의 키 범위
+하나를 약 20,000 rows/s로 쓰므로, 여러 키 범위로 나누면 쓰기가
+빨라집니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)).
 
 ### 동작 방식
 
-- **소형 테이블** (shard 불가 또는 행 수 미달): 테이블당 worker 1개.
-- **대형 테이블** (선행 PK 컬럼이 정수인 경우 — 단일 정수 PK, 또는 `(tenant_id, id)`처럼 선행 컬럼이
-  정수인 복합 PK): 읽기를 K개의 기본 키 구간으로 나누어, 각 구간을 별도 worker가 로드할 수 있습니다.
-  이 reader-range 샤딩은 **기본적으로 꺼져 있으며**(`full_load_reader_shards=1`, **Settings → Full
-  Load**의 *Reader shards per large table*), `TABLE_PARALLELISM`이 1보다 클 때 예상 행 수가
-  `SHARD_MIN_ROWS` 이상인 테이블에만 동작합니다. K는 설정값이며 최대 32 ÷ `TABLE_PARALLELISM`입니다.
-  - **PostgreSQL**: 모든 실행에서. 모든 구간이 하나의 공유 스냅샷을 가져오므로, 리더 하나일 때와
-    마찬가지로 복사본은 한 시점의 것입니다.
+- **소형 테이블**(분할 기준 미만이거나 선행 기본 키 컬럼이 정수가 아닌 경우): 테이블당 worker 1개,
+  리더 1개.
+- **대형 테이블**(선행 PK 컬럼이 정수인 경우 — 단일 정수 PK, 또는 `(tenant_id, id)`처럼 선행 컬럼이
+  정수인 복합 PK)은 K개의 기본 키 구간으로 나누어 읽습니다. K는
+  *Reader shards per large table*(**Settings → Full Load**, `FULL_LOAD_READER_SHARDS`)이 정합니다:
+  `0` = 자동(기본값): 추정 5,000,000행부터 2,500,000행마다 구간 하나, 최대 32(10M 행: 구간 4개);
+  `1` = 꺼짐; `2`–`32` = 정확히 그 수(아래). 추정치는 시작 지점의 스캔 없는 추정치이며,
+  `TABLE_PARALLELISM`이 1이면 아무것도 나누지 않습니다.
+  - **PostgreSQL**: 모든 구간이 하나의 공유 스냅샷을 가져오므로, 리더 하나일 때와 마찬가지로
+    복사본은 한 시점의 것입니다. 실행 전체의 추정 행 수 중 그 테이블이 차지하는 몫만큼의 worker(최대
+    `TABLE_PARALLELISM`)가 테이블을 읽으며, worker마다 연속된 구간 묶음을 읽습니다.
+  - **MySQL**: 리더 세션 하나가 스냅샷 하나에서 모든 구간을 구간마다 한 페이지씩 번갈아 읽으므로,
+    Full load only와 Full load + CDC 모두에서 리더 하나일 때와 마찬가지로 복사본은 한 시점의
+    것입니다. 테이블은 소스 연결 하나와 worker 하나를 씁니다.
+- **2부터 32까지를 명시하면** 추정 행 수가 `SHARD_MIN_ROWS` 이상인 테이블에 정확히 그 수의 구간을
+  주고 같은 방식으로 읽습니다. 예외는 MySQL의 별도 스냅샷 부분입니다:
   - **MySQL**: 시작 지점에 binlog 파일과 위치가 있는 **Full load + CDC**에서만, 그리고 Aurora
-    DSQL에서 모든 unique 키가 선행 키 컬럼을 포함하는 테이블만. MySQL은 스냅샷을 공유할 수 없어
-    구간마다 자신의 스냅샷을 읽으므로, 읽는 동안 키가 바뀐 행은 두 번 복사되거나 전혀 복사되지 않을
-    수 있습니다. 적재 후 모든 읽기보다 먼저 잡은 시작 지점([§3.5](#35-워터마크--cdc로의-다리))에서
-    시작한 CDC가 그 이후의 모든 변경을 재생해 이를 바로잡습니다. **Full load only**는 모든 MySQL
-    테이블을 리더 하나로 읽습니다: 나누어 읽은 복사본을 바로잡을 것이 없기 때문입니다.
-  - MySQL 구간은 소스 연결이 끊긴 뒤 그 자리에서 다시 읽지 않습니다: 그 구간이 실패하고, 테이블은 그
+    DSQL에서 모든 unique 키가 선행 키 컬럼을 포함하는 테이블만: 그러면 각 구간이 부분이 되어, 부분마다
+    자신의 worker가 자신의 스냅샷에서 읽습니다. MySQL은 스냅샷을 공유할 수 없으므로, 읽는 동안 키가
+    바뀐 행은 두 번 복사되거나 전혀 복사되지 않을 수 있습니다. 모든 읽기보다 먼저 잡은 시작
+    지점([§3.5](#35-워터마크--cdc로의-다리))에서 시작한 CDC가 그 이후의 모든 변경을 재생해 이를
+    바로잡습니다. 그 밖의 MySQL 테이블은 위와 같이 세션 하나가 읽습니다.
+  - MySQL 부분은 소스 연결이 끊긴 뒤 그 자리에서 다시 읽지 않습니다: 테이블은 그
     이유(*range 2 of 4*)와 함께 *Failed*가 되며, **Retry unfinished tables**가 다시 적재합니다.
-    PostgreSQL 구간은 공유 스냅샷을 다시 읽습니다.
-- **모든 work unit이 하나의 bounded pool 공유**: 각 구간이 worker slot 하나를 차지하므로 동시에 최대
-  `table_parallelism`개 unit이 실행됩니다.
+    세션 하나로 읽는 테이블은 새 스냅샷에서 전체를 다시 읽고, PostgreSQL 구간은 공유 스냅샷을 다시
+    읽습니다.
+- **모든 work unit이 하나의 bounded pool 공유**: 테이블 또는 그 부분 하나가 worker slot 하나를
+  차지하므로 동시에 최대 `table_parallelism`개 unit이 실행되며, 읽을 행이 가장 많은 unit부터
+  실행됩니다.
 
 ### 나누어 읽은 테이블에는 CDC의 재생이 필요합니다(MySQL)
 
-CDC가 재생하기 전까지 나누어 읽은 MySQL 테이블은 어긋난(torn) 상태이므로, 그 재생에서 테이블을
-빼내는 경로는 모두 테이블 이름과 함께 거부되며, 거부를 끝내는 방법을 안내합니다:
+이 절은 위의 별도 스냅샷 부분에만 해당하며, 그러려면 *Reader shards per large table*을 2 이상으로
+명시해야 합니다: 기본 설정의 실행은 어떤 테이블도 부분으로 나누어 읽지 않습니다. CDC가 재생하기
+전까지 나누어 읽은 MySQL 테이블은 어긋난(torn) 상태이므로, 그 재생에서 테이블을 빼내는 경로는 모두
+테이블 이름과 함께 거부되며, 거부를 끝내는 방법을 안내합니다:
 
 - 적재 후 테이블 목록에서 **체크 해제**하거나, *Exclude tables & columns*의 테이블 규칙으로 선택
   해제하기: 체크박스가 잠기며, 잠금 아이콘에 이유가 표시됩니다.
@@ -390,14 +427,14 @@ CDC가 재생하기 전까지 나누어 읽은 MySQL 테이블은 어긋난(torn
 - 테이블을 선택 해제할 수 없을 때의 **Deploy CDC infrastructure, Start CDC, Retry CDC**: 그런
   테이블을 선택 해제할 수 없는 테이블로 명시하고 Full load only를 제시하지 않습니다.
 
-**거부를 끝내는 방법.** Settings에서 *Reader shards per large table*을 1로 설정하고 Full Load 단계가
-그 테이블에 보여 주는 컨트롤로 다시 적재한 뒤(리더 하나, 스냅샷 하나 — 테이블이 끝나지 않았으면
-**Retry unfinished tables**, 모든 테이블이 적재된 뒤에는 **Reload specific tables**) 작업을
-수행합니다. Full load only와 더 나중의 시작 지점에는 두 번째 방법이 있습니다: CDC가 테이블을 재생한
-뒤 *Fast sweep*을 끄고 **CHECKSUM** 모드로 Validation을 실행합니다: 일치하면 사본이 증명되어 거부가
-끝납니다. 테이블의 체크 해제에는 CDC를 시작하기 전에 다시 적재하는 방법만 있습니다: 재생에는 CDC가
-시작되어야 하고, CDC의 첫 Start부터 테이블 집합이 고정되기 때문입니다(Start over로만 바꿀 수 있음,
-[§13.7](13-excluding-tables-and-columns.md)).
+**거부를 끝내는 방법.** Settings에서 *Reader shards per large table*을 0(자동) 또는 1(꺼짐)로
+설정하고 Full Load 단계가 그 테이블에 보여 주는 컨트롤로 다시 적재한 뒤(리더 세션 하나, 스냅샷 하나 —
+테이블이 끝나지 않았으면 **Retry unfinished tables**, 모든 테이블이 적재된 뒤에는
+**Reload specific tables**) 작업을 수행합니다. Full load only와 더 나중의 시작 지점에는 두 번째
+방법이 있습니다: CDC가 테이블을 재생한 뒤 *Fast sweep*을 끄고 **CHECKSUM** 모드로 Validation을
+실행합니다: 일치하면 사본이 증명되어 거부가 끝납니다. 테이블의 체크 해제에는 CDC를 시작하기 전에
+다시 적재하는 방법만 있습니다: 재생에는 CDC가 시작되어야 하고, CDC의 첫 Start부터 테이블 집합이
+고정되기 때문입니다(Start over로만 바꿀 수 있음, [§13.7](13-excluding-tables-and-columns.md)).
 
 테이블의 표시는 두 가지 중 하나로 지워집니다: 그 테이블을 다시 만드는 적재(**Drop & reload**), 또는
 그 테이블의 마지막 적재가 끝난 뒤 시작된 Validation의 **CHECKSUM** 비교가 일치하는 경우입니다.
@@ -414,12 +451,11 @@ Start CDC는 스트리밍했더라도 거부를 끝내지 않습니다: 도구�
 
 ### 튜닝
 
-대규모 마이그레이션에서는 worker 수를 태스크의 vCPU 수에 맞추세요 — whole-table unit과 구간 unit이
-같은 slot을 기다립니다. Reader shards는 몇몇 대형 테이블 때문에 slot이 놀게 될 때 도움이 되며, 그
-대가는 같은 테이블에 대한 동시 읽기입니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)). 관련
+대규모 마이그레이션에서는 *Tables in parallel*을 태스크의 vCPU 수에 맞추세요: whole-table unit과
+구간 unit이 같은 slot을 기다립니다. 분할 자체에는 설정이 필요 없습니다. 관련
 설정(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`)과 각각의
 한도, 그리고 소스 부하와의 관계는
-[7장 §7.2 — 병렬도 튜닝](07-performance-and-tuning.md#72-병렬수-튜닝)에 모여 있습니다. 이 설계가
+[7장 §7.2 — 병렬수 튜닝](07-performance-and-tuning.md#72-병렬수-튜닝)에 모여 있습니다. 이 설계가
 실제로 낸 처리량은 [Appendix: 성능 테스트 결과](12-performance-test-results.md)에 있습니다.
 
 ---

@@ -65,12 +65,12 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 | 4 | [CDC and DSQL constraints](04-cdc-and-dsql-constraints.md) | ストリーミング CDC の動作、隙間のない Full Load → CDC ハンドオフ、そして DSQL の制約（値あたり 1 MiB、OCC、IAM 認証、外部キー適用の延期）をデータ経路でどう扱うか。 |
 | 5 | [Validation](05-validation.md) | ターゲットがソースと一致することをツールがどう証明するか: 行数、チェックサム、PK 全体の突き合わせ、ライブソースのドリフト。 |
 | 6 | [Limitations](06-limitations.md) | 計画に必ず織り込むべき、実際に強制される制限（DSQL の制約、単一リージョン CDC、単一タスクのコントロールプレーン）。 |
-| 7 | [Performance and tuning](07-performance-and-tuning.md) | Aurora DSQL に対してツールが代わりに行うこと（OCC リトライ、ホットパーティションの PK、トランザクションの枠、非同期インデックス、IAM トークン）、Full Load / Validation / CDC の並列度のチューニング — ローカルおよび Fargate 上で — そしてソースへの負荷を抑える方法。 |
+| 7 | [Performance and tuning](07-performance-and-tuning.md) | Aurora DSQL に対してツールが代わりに行うこと（OCC リトライ、キー範囲、ホットパーティションの PK、トランザクションの枠、非同期インデックス、IAM トークン）、Full Load / Validation / CDC の並列度のチューニング — ローカルおよび Fargate 上で — ソースへの負荷を抑える方法、そしてその裏付けとなるライブ環境での実測。 |
 | 8 | [テストと検証](08-testing-and-verification.md) | あなたのデータで Aurora DSQL へ移すときに起こり得る状況（大きなテーブル、1 MiB の値、あいまいな型、OCC の競合、長いストリーム、隙間のないハンドオフ、ドリフト）ごとに、ツールが代わりに行うことと、その結果をどこで確認するか — そして意図的に厄介なデータで実際の AWS 上で得た 100% 一致の結果。 |
 | 9 | [Query Converter と AI DBA](09-query-validation.md) | 任意の Query Converter: 単一の MySQL クエリを Aurora DSQL へ変換し、ターゲット上で読み取り専用でテストし（`EXPLAIN` / `EXPLAIN ANALYZE` + DPU コスト）、**AI DBA** に DSQL の効率に合わせて書き直させ、再テストによって改善を証明します。 |
 | 10 | [Conclusion](10-conclusion.md) | どの経路をいつ使うか、推奨されるエンドツーエンドのフロー、次に進む先。 |
 | 11 | [Customer FAQ](11-customer-faq.md) | 顧客が最もよく尋ねる質問 — Full Load、CDC、制限、型マッピング、検証、カットオーバー／ロールバック、運用 — を、ツールの実際の動作に基づいて回答し、詳細へのリンクを添えています。 |
-| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | 実測した Full Load と CDC のスループット — それを左右する要因、MySQL・PostgreSQL ソースでの約 1 TB の実行 — と、測定の再現方法。 |
+| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | 実測した Full Load と CDC のスループット — MySQL・PostgreSQL ソースでの最大サイズの実行と、それを左右する要因 — と、測定の再現方法。 |
 | 13 | [テーブルと列の除外](13-excluding-tables-and-columns.md) | **Exclude tables & columns** ルールポップアップ: ルール言語、除外できないもの、除外した列が Aurora DSQL で NULL になる仕組み、後から除外設定を変更する方法 (Change & reload)、CDC キャプチャリスト、Validation と Cut over。 |
 
 ## MySQL・PostgreSQL ユーザーへの Aurora DSQL についての注意
