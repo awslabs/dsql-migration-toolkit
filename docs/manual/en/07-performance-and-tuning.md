@@ -8,9 +8,10 @@ The defaults fit Aurora DSQL's limits and keep the load on your source modest, s
 migrations need no tuning**: a large table is already read and written in primary-key
 ranges, and the batches in flight are capped where Aurora DSQL stops gaining from more.
 For a large run, set *Tables in parallel* to the task's vCPU count
-([§7.2](#72-tuning-parallelism)). Read [§7.3](#73-minimizing-impact-on-the-source) if the
-source serves production traffic, and [§7.1](#71-what-the-tool-does-for-you-on-aurora-dsql)
-for what the tool already does to fit Aurora DSQL.
+([§7.2](#72-tuning-parallelism)); if the source serves production traffic, start at 2–4
+instead and raise it while you watch the source
+([§7.3](#73-minimizing-impact-on-the-source)). What the tool already does to fit Aurora
+DSQL is in [§7.1](#71-what-the-tool-does-for-you-on-aurora-dsql).
 
 > Every design choice below maps to a documented Aurora DSQL behavior or limit. Sources:
 > [DSQL quotas & limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html),
@@ -31,7 +32,7 @@ it:
 | Write conflicts are detected at commit, and the losing transaction fails with `40001` (there are no row locks) | Keeps every write transaction small and idempotent (a Full Load batch or CDC chunk is at most 3,000 rows, written by primary key), so a re-run is cheap and safe |
 | A transaction holds at most 3,000 rows and 10 MiB, runs at most 5 minutes, and carries one DDL | Batches to at most 3,000 rows and an 8 MiB byte budget, and runs one DDL per transaction |
 | Storage is partitioned by primary key, so a primary-key-ordered stream of inserts goes to one key range at a time: measured, about 20,000 rows/s whatever the batch size or the batches in flight | Reads a large table in primary-key ranges, so its writes go to several key ranges at once, and caps the batches in flight at 4 per key range and 128 per run: more would only wait (§7.2) |
-| `CREATE INDEX ASYNC` builds an index in the background, far faster on an empty table than over loaded rows | Creates a table's secondary indexes while it is empty, before any row: Schema Conversion's apply does, and a **Drop & reload** does again and waits up to 10 minutes for the builds before loading. Measured, that ends a load sooner than building them afterward (§7.5) |
+| `CREATE INDEX ASYNC` builds an index in the background | Creates a table's secondary indexes while it is empty, before any row: Schema Conversion's apply does, and a **Drop & reload** does again and waits up to 10 minutes for the builds before loading. Measured, an index builds far faster on the empty table, so the load and its index builds end sooner (§7.5) |
 | IAM tokens last about 15 minutes, and connections end after 60 | Renews the token before it expires, and at once if Aurora DSQL refuses it, so an hours-long load or CDC stream never stalls on authentication |
 | There is no logical-replication slot to target | Copies with its own bulk loader (keyset streaming: resumable, bounded memory), then streams changes through Debezium → MSK → a custom sink; Kafka buffers the changes, so the sink can fall behind during a conflict burst without losing events |
 
@@ -126,25 +127,27 @@ measurements in §7.5.
 >   MySQL table loads at one core's pace (about 25,000–55,000 rows/s in our runs,
 >   depending on the host).
 >   In **Full load + CDC** from a binlog start point, an explicit value of 2 or more reads
->   it in separate-snapshot parts instead, one process each (150M rows in 16 parts: about
->   164,000 rows/s), and the copy is consistent only once CDC replays it
->   ([§3.8](03-full-load.md#38-parallel-loading)).
+>   it in separate-snapshot parts instead, one process each, if every unique key includes
+>   the leading key column (150M rows in 16 parts: about 164,000 rows/s, against about
+>   55,500 in one session). The copy is then consistent only once CDC replays it, and
+>   until then the tool refuses to untick the table, to switch to Full load only or to
+>   start CDC from a later point ([§3.8](03-full-load.md#38-parallel-loading)).
 >
 > **The trade-off:** on PostgreSQL, and for MySQL's separate-snapshot parts, K > 1 turns
 > idle slots into concurrent reads of the same table for its whole read, so the source
 > read rate, the DSQL connections and the memory rise up to `TABLE_PARALLELISM`-fold for
 > that stretch, and a PostgreSQL source keeps the shared snapshot until the last of them
 > has finished. On a source still serving production traffic, pair it with the
-> `Threads_running` throttle (`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`, §7.3). Raising
-> *Batches per table* does not speed up a table that is the load's tail: on PostgreSQL
-> more key ranges do, and on MySQL only the separate-snapshot parts above.
+> `Threads_running` throttle (`FULL_LOAD_MAX_SOURCE_THREADS_RUNNING`, §7.3). A higher
+> *Batches per table* does not speed up a key range (§7.5): to take a huge MySQL table
+> past one core, use the separate-snapshot parts above.
 
 > **Connection-quota guardrail.** A run's Aurora DSQL connections are at most its batches
 > in flight, which the tool caps at 4 per key range and 128 per run, plus one per running
 > table or part. DSQL allows up to **10,000 connections per cluster** but only **100 new
-> connections/second**, so the caps keep a run well within the quota. More in flight also
-> raises the **OCC collision rate** on hot key ranges — pair parallelism with a good PK
-> strategy (above).
+> connections/second**, so the caps keep a run well within the quota. More batches in
+> flight than the key ranges absorb add only commit latency and Aurora DSQL compute cost
+> (`ComputeDPU`), not rows/s (§7.5).
 
 ### Validation
 
@@ -247,7 +250,7 @@ limit.**
 | Setting | Evaluation | A real large-scale Full Load |
 |---|---|---|
 | `ContainerCpu` | 0.5–1 vCPU (`512`–`1024`) | 4–16 vCPU (`4096`–`16384`) |
-| `ContainerMemory` | `1024` MiB | ≥ `2048` MiB; ≥ `8192` MiB (with CPU ≥ `2048`) for large LOBs or raised parallelism |
+| `ContainerMemory` | `1024` MiB | ≥ `8192` MiB at 4 vCPU, ≥ `32768` at 16 vCPU (Fargate's minimum for that CPU) |
 
 - **A MySQL load is CPU-bound on the task.** Reading and converting MySQL rows keeps about
   one core busy per running table or part, so throughput grows with the vCPUs up to
@@ -347,12 +350,11 @@ purge horizon. To limit it:
 
 - Lower the parallelism, so fewer read views are open.
 - Expect a large table's read view to last for its whole read: the automatic split reads
-  every range in one session, from one snapshot. To shorten it, split the biggest tables
-  by primary-key range into separate, shorter runs. In Full load + CDC from a binlog start
-  point, an explicit *Reader shards per large table* of 2 or more does this within one
-  run, so each read view lasts only while its own range is read, at the cost of concurrent
-  reads of that table (§7.2) and of the refusals in
-  [§3.8](03-full-load.md#38-parallel-loading) until CDC replays it.
+  every range in one session, from one snapshot. In Full load + CDC from a binlog start
+  point, an explicit *Reader shards per large table* of 2 or more shortens it, so each
+  read view lasts only while its own range is read, at the cost of concurrent reads of
+  that table (§7.2) and of the refusals in [§3.8](03-full-load.md#38-parallel-loading)
+  until CDC replays it.
 - Monitor History List Length, and provision free-space headroom before you start so undo
   growth cannot trip a storage-full condition.
 
@@ -374,8 +376,7 @@ connector streams from that same host. A replica's binlog coordinates live in a
 **different namespace** than the primary's, and RDS replicas often have binlog disabled or
 unretained, so a replica-sourced watermark can silently produce a **CDC data gap**
 (changes between the snapshot point and CDC start are lost). Set the retention with
-`CALL mysql.rds_set_configuration('binlog retention hours', N)`. Either way, shard the few
-largest tables into PK-range runs.
+`CALL mysql.rds_set_configuration('binlog retention hours', N)`.
 
 ---
 
@@ -410,8 +411,8 @@ your own environment with `scripts/measure_performance.py` (below).
 | PostgreSQL, 16 tables × 20M rows | about 336,000 rows/s overall, 600,000 in its steady phase |
 | PostgreSQL, one table of 150M rows (32 ranges) | about 205,000 rows/s overall |
 | MySQL, 16 tables × 20M rows | about 193,000 rows/s overall, the task's 16 vCPU saturated |
-| MySQL, one table of 150M rows, Full load only (one session) | about 55,500 rows/s steady, one process on one core |
-| MySQL, the same table in Full load + CDC, Reader shards 16 | about 164,000 rows/s overall |
+| MySQL, one table of 150M rows, Full load only (one session) | about 55,500 rows/s steady, one process on one core (stopped after 25 minutes, 75M rows in) |
+| MySQL, the same table in Full load + CDC, Reader shards 16 | about 164,000 rows/s overall, beside an earlier copy's DROP (below) |
 
 What they, and smaller runs on a 4 vCPU task with `db.r7g.large` sources, show:
 
@@ -421,18 +422,20 @@ What they, and smaller runs on a 4 vCPU task with `db.r7g.large` sources, show:
   0.7 s at 8 in flight, 3 s at 32) and its compute cost (`ComputeDPU`, about 4×) at the
   same rows/s. Spread over 4 key ranges, a 10M-row table loaded at about 37,000–40,000
   rows/s overall (54,000–60,000 at its peak), and two such tables, one per engine, at
-  127,000 together and still rising. Against one key range per table, the 150M-row table
-  above loaded about 10× faster on PostgreSQL, 8× on MySQL in parts and 2.8× on MySQL in
-  one session.
+  127,000 together and still rising. Against the ~20,000 rows/s of one key range, the
+  150M-row table above loaded about 10× faster on PostgreSQL, 8× on MySQL in parts and
+  2.8× on MySQL in one session.
 - **Secondary indexes go on the empty table.** With 25 secondary indexes over 8.5M rows
   (MySQL), a Drop & reload that created them before the rows ended in 512 s end to end,
-  against 873 s with the indexes built after the load: after a load they took up to 680 s
-  to build, on the empty tables 13–41 s.
+  against 873 s with the indexes built after the load. The rows loaded more slowly into
+  the indexed tables (485 s against 262 s), but the builds took 13–41 s on the empty
+  tables and 10–11 minutes after a load.
 - **A fresh table warms up.** Aurora DSQL starts a new table on one partition and splits
-  it as it grows, so a load's first minute or so runs slower.
-- **An earlier copy's DROP competes.** Dropping a loaded table is a background job on
-  Aurora DSQL: it ran for minutes, and for over an hour for a 75M-row copy, slowing the
-  next load while it ran.
+  it as it grows, so a load's first minute or two runs at about one key range's rate:
+  judge a short test by its steady phase.
+- **An earlier copy's DROP keeps running.** Dropping a loaded table, as a Drop & reload
+  does, is a background job on Aurora DSQL: it ran for minutes, and for over an hour for a
+  75M-row copy, beside whatever loaded next.
 
 **CDC replication lag — a latency floor.** Measured separately (RDS MySQL 8.0 source, MSK,
 `us-east-1`, a sink of 1 MCU and one worker, a single-column table): source commit →

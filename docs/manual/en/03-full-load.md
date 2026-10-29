@@ -172,11 +172,11 @@ table than over loaded rows
 ([§7.5](07-performance-and-tuning.md#75-measured-on-live-infrastructure--what-backs-71-and-72)),
 so a table's secondary indexes exist before its rows: Schema Conversion's apply creates
 them with the table, and a **Drop & reload** creates them again on the recreated table,
-then waits up to 10 minutes for Aurora DSQL to build them before the first row loads. A
-table the run recreates later, or an index it could not submit before the rows, gets its
-indexes after every table's data has loaded (a Stop still submits the indexes of the
-tables already loaded). With the indexes in place, a row that a `UNIQUE` index other than
-the primary key rejects is quarantined (§3.6), and the rest of the table loads.
+then waits up to 10 minutes for Aurora DSQL to build them before the first row loads.
+Only an index the run could not create first (for example on a table it recreates
+partway through) is created after every table's data has loaded. With the indexes in
+place, a row that a `UNIQUE` index other than the primary key rejects is quarantined
+(§3.6), and the rest of the table loads.
 
 A failed index statement is retried; if the retry finds an index of that name already
 there, the tool does not count it as created (index names are per schema in Aurora DSQL,
@@ -189,7 +189,7 @@ its indexes are submitted, not built. The Data Migration step shows the builds:
 
 | The step shows | What it means | What to do |
 |---|---|---|
-| *Waiting for Aurora DSQL to build the secondary indexes of N recreated table(s) before loading* | A Drop & reload put the indexes on the empty tables and waits for their builds | Nothing: the load starts once they are built, or after 10 minutes with any build still running left building |
+| *Waiting for Aurora DSQL to build the secondary indexes of N recreated table(s) before loading* | A Drop & reload put the indexes on the empty tables and waits for their builds | Nothing: the load starts once they are built, or after 10 minutes while the rest go on building |
 | *Aurora DSQL is building secondary indexes: n of m built* | The data is loaded; a query that needs an index is slower until it is built | Nothing: you can go on to the next step |
 | *Secondary indexes built: all m* | Every index the run submitted is built | — |
 | *UNIQUE index build failed: a constraint is missing*, or *Secondary index builds failed* | Aurora DSQL could not build the index; a failed `UNIQUE` one is a missing constraint | Fix the cause the notice names (for `UNIQUE`, remove the duplicates), drop the index if the table still lists it, and create it again, before cutting over |
@@ -454,13 +454,12 @@ one key range of a table at about 20,000 rows/s: spread over several, its writes
     copied twice or not at all; CDC, started from the start point taken before any read
     ([§3.5](#35-the-watermark--the-bridge-to-cdc)), replays every change since then and
     corrects that. Any other MySQL table is read by one session, as above.
-  - A MySQL part is never re-read in place after a lost source connection: the table is
-    *Failed* with that reason (*range 2 of 4*), and **Retry unfinished tables** loads it
-    again. A table read by one session is read again whole from a fresh snapshot, and a
-    PostgreSQL range re-reads its shared snapshot.
-- **All work units share one bounded pool**: each table, or part of one, takes one worker
-  slot, so at most `table_parallelism` units run at once, the ones that read the most rows
-  first.
+- **After a lost source connection**, a table read by one session is read again whole,
+  from a fresh snapshot, and a PostgreSQL range re-reads its shared snapshot. A MySQL part
+  is never re-read in place: the table is *Failed* with that reason (*range 2 of 4*), and
+  **Retry unfinished tables** loads it again.
+- **At most *Tables in parallel* tables, or parts of a table, load at once**, the ones
+  that read the most rows first.
 
 ### A table read in parts needs CDC's replay (MySQL)
 
@@ -508,11 +507,12 @@ has caught up, the CHECKSUM match ends the Full load only and later-start-point 
 
 ### Tuning it
 
-For a large migration, set *Tables in parallel* to the task's vCPU count: whole-table
-units and range units queue for the same slots. The split itself needs no setting. The
-knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`,
-`FULL_LOAD_READER_SHARDS`), their limits, and how they interact with source load live
-together in
+For a large migration, set *Tables in parallel* to the task's vCPU count (on a source that
+serves production traffic, start at 2–4:
+[§7.3](07-performance-and-tuning.md#73-minimizing-impact-on-the-source)). The split
+itself needs no setting. The knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`,
+`SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`), their limits, and how they interact with
+source load live together in
 [Chapter 7 §7.2 — Tuning parallelism](07-performance-and-tuning.md#72-tuning-parallelism);
 the measured throughput this design achieves is in
 [Appendix: Performance test results](12-performance-test-results.md).
