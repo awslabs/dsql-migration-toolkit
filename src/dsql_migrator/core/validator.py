@@ -149,6 +149,7 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     _decimal_scale,
     _mysql_checksum_expr,
     _mysql_concat_term,
+    _param_safe,
     _pg_checksum_expr,
     _pg_concat_term,
     _pg_table_identifier,
@@ -1655,8 +1656,10 @@ def _from_only(statement: Any, table: "sql.Identifier") -> Any:
     Rewrites the psycopg ``Composed`` the PG readers build (``... FROM {table} ...``, the
     table always right after a ``FROM`` chunk) -- never text -- and REFUSES a statement in
     which it finds none: a reader whose SQL changed must fail the table, never compare an
-    inheritance parent's children unnoticed."""
+    inheritance parent's children unnoticed. A page after a cursor names the table
+    param-safe (:func:`~dsql_migrator.core.validation_sql._param_safe`), which counts too."""
     hits = 0
+    tables = (table, _param_safe(table))
 
     def _walk(node: Any) -> Any:
         nonlocal hits
@@ -1666,7 +1669,7 @@ def _from_only(statement: Any, table: "sql.Identifier") -> Any:
         previous: Any = None
         for part in node:
             if (
-                part == table
+                part in tables
                 and isinstance(previous, sql.SQL)
                 and previous.as_string(None).rstrip().upper().endswith(" FROM")
             ):

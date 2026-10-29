@@ -201,7 +201,7 @@ def _pg_validator_conn(statements):
     class _Sqla:
         connection = SimpleNamespace(driver_connection=None)  # renders Composed offline
 
-        def exec_driver_sql(self, sql, params=None):
+        def exec_driver_sql(self, sql, params=None, execution_options=None):
             statements.append(sql)
             if "SUM(page_tok)" in sql:
                 return _Res([(42, 2, 2)])

@@ -13,6 +13,13 @@ They are pure: each takes a :class:`~dsql_migrator.core.models.TableDef` /
 returns a ``str`` / :class:`psycopg.sql.Composed`. They touch no connection,
 thread, or run state, so they are unit-tested directly. See ``validator.py``'s
 module docstring for the cross-engine checksum-normalization rationale.
+
+A PostgreSQL / Aurora DSQL statement that carries a placeholder (a page after a keyset
+cursor) is executed with its parameters, so it names every identifier through
+:func:`_param_safe`; one without a placeholder is executed without parameters and names
+them as they are. Either way the server receives each name exactly, ``%`` included. The
+orphan listing (:func:`build_orphan_listing_sql`) is the exception: shown to the operator
+and never run by the tool, it names them as they are, placeholders or not.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from typing import Mapping, Optional, Sequence
 
 from psycopg import sql
 
+from dsql_migrator.core.batched_import import _ParamSafeIdentifier
 from dsql_migrator.core.converter import (
     is_spatial_mysql_type,
     map_mysql_type,
@@ -90,6 +98,28 @@ def _pg_table_identifier(name: str) -> "sql.Identifier":
     if separator and schema and obj:
         return sql.Identifier(schema, obj)
     return sql.Identifier(name)
+
+
+def _param_safe(statement: "sql.Composable") -> "sql.Composable":
+    """``statement`` with each name composed by the Full Load's
+    :class:`~dsql_migrator.core.batched_import._ParamSafeIdentifier`: the form of a statement
+    a normal psycopg cursor runs WITH parameters -- each page after a keyset cursor.
+
+    Given parameters, psycopg reads the whole text for ``%`` placeholders, quoted names
+    included, and turns ``%%`` back into ``%``: a table, column or key named ``pct%off``
+    failed that read, ``a%sb`` became a placeholder and ``x%%y`` reached the server as
+    ``x%y``. With each ``%`` of a name doubled the server receives the name itself; a name
+    without one, and every other part of the statement, comes out unchanged. Only for a
+    statement executed with parameters: without them nothing is read and the doubling would
+    stay (a first page, or anything the PostgreSQL source shim runs without parameters).
+    """
+    if isinstance(statement, sql.Composed):
+        return sql.Composed([_param_safe(part) for part in statement])
+    if isinstance(statement, sql.Identifier) and not isinstance(
+        statement, _ParamSafeIdentifier
+    ):
+        return _ParamSafeIdentifier(*statement._obj)
+    return statement
 
 
 # Cross-engine NULL sentinel for checksum/PK-token rendering. It MUST be
@@ -911,8 +941,9 @@ def build_pg_pk_next_page_sql(
 
     The keyset value -- the previous page's last key, as the text it came back as -- is
     bound as a query parameter (``%(last)s``) at execute time, so a billion-row table
-    reuses one prepared statement across all pages. ``nonnull_columns``: as
-    :func:`build_pg_pk_first_page_sql` (TARGET ONLY).
+    reuses one prepared statement across all pages; its names are therefore param-safe
+    (:func:`_param_safe`). ``nonnull_columns``: as :func:`build_pg_pk_first_page_sql`
+    (TARGET ONLY).
     """
     return _pg_pk_page_sql(table, pk_column, page_size, nonnull_columns, first=False)
 
@@ -930,7 +961,7 @@ def _pg_pk_page_sql(
             sql.Identifier(pk_column), sql.Placeholder("last")
         )
     )
-    return sql.SQL(
+    statement = sql.SQL(
         "SELECT {pk}::text AS pk{flags} FROM {table}{cursor} ORDER BY {order} LIMIT {limit}"
     ).format(
         pk=sql.Identifier(pk_column),
@@ -940,6 +971,7 @@ def _pg_pk_page_sql(
         order=_pg_qualified_order(table_sql, (pk_column,)),
         limit=sql.Literal(page_size),
     )
+    return statement if first else _param_safe(statement)
 
 
 def build_pg_count_sql(
@@ -1092,9 +1124,10 @@ def build_pg_page_checksum_next_sql(
     """Subsequent keyset page of the PostgreSQL/DSQL checksum after the ``last`` param.
 
     The keyset value -- the previous page's last key, as text -- is bound as ``%(last)s``
-    at execute time, so a billion-row table reuses one prepared statement across all pages.
+    at execute time, so a billion-row table reuses one prepared statement across all pages;
+    its names are therefore param-safe (:func:`_param_safe`).
     """
-    return sql.SQL(
+    return _param_safe(sql.SQL(
         "SELECT COALESCE(SUM(page_tok), 0), "
         "(array_agg(page_pk::text ORDER BY page_pk))[COUNT(*)], COUNT(*) FROM ("
         "SELECT {pk} AS page_pk, {token} AS page_tok FROM {table} WHERE {pk} > {last} "
@@ -1105,7 +1138,7 @@ def build_pg_page_checksum_next_sql(
         table=_pg_table_identifier(table.name),
         last=sql.Placeholder("last"),
         limit=sql.Literal(page_size),
-    )
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1159,7 +1192,8 @@ def build_pg_composite_page_sql(
     ``row_value`` -- a PostgreSQL source -- it reads after the row-value cursor ``(k0, ...)
     > (%(last_0)s, ...)``, one index range there, in exactly one ``FROM {table}``, which
     :func:`~dsql_migrator.core.validator._from_only` rewrites for a PostgreSQL inheritance
-    parent. The first page is the same on both.
+    parent. The first page is the same on both. A page after the cursor is executed with
+    its parameters, so its names are param-safe (:func:`_param_safe`).
     """
     table_sql = _pg_table_identifier(table.name)
     aliases = [sql.Identifier(f"ck_k{i}") for i in range(len(key))]
@@ -1190,13 +1224,14 @@ def build_pg_composite_page_sql(
         sql.SQL("COUNT(*) FILTER (WHERE {})").format(sql.Identifier(f"ck_nn{j}"))
         for j in range(len(nonnull_columns))
     )
-    return sql.SQL("SELECT {totals} FROM ({window}) ckpage").format(
+    statement = sql.SQL("SELECT {totals} FROM ({window}) ckpage").format(
         totals=sql.SQL(", ").join(totals),
         window=_pg_keyset_window(
             sql.SQL(", ").join(window), table_sql, key, aliases, page_size,
             None if first else _pg_last_key(key), row_value=row_value,
         ),
     )
+    return statement if first else _param_safe(statement)
 
 
 def _pg_last_key(key: Sequence[str]) -> list[sql.Placeholder]:
@@ -1465,6 +1500,8 @@ def build_orphan_listing_sql(
     very large child is never scanned in one statement (Aurora DSQL ends a transaction at
     300 s). Without it, it is one scan of the whole child. Tables and columns are
     identifiers; the only literals are ``limit``, ``page_size`` and the caller's ``after``.
+    The query is shown to the operator, never run by the tool, so its names are written as
+    they are -- not :func:`_param_safe`, even with placeholders for ``after``.
     """
     child = _pg_table_identifier(child_table)
     parent = _pg_table_identifier(fk.referenced_table)
@@ -1530,7 +1567,8 @@ def _build_pg_orphan_page_sql(
     works for any orderable PK type -- ``uuid`` has no ``max()`` aggregate), returned as
     text and bound back untyped, so the server parses it into the column's own type (G141;
     see :func:`build_pg_pk_first_page_sql`), and stops when ``count < page_size``.
-    Identifiers/bounds compose safely (Requirement 9.4).
+    Identifiers/bounds compose safely (Requirement 9.4); a page after the cursor is executed
+    with its parameters, so its names are param-safe (:func:`_param_safe`).
     """
     child = _pg_table_identifier(child_table)
     parent = _pg_table_identifier(fk.referenced_table)
@@ -1568,7 +1606,7 @@ def _build_pg_orphan_page_sql(
     # array_agg stays for the boundary: max() has no uuid overload (verified live --
     # "function max(uuid) does not exist"), and it costs 0.21s per page. The boundary comes
     # back as text, bound back untyped (G141).
-    return sql.SQL(
+    statement = sql.SQL(
         "WITH pg AS MATERIALIZED ("
         "SELECT {pk} AS page_pk, {fk_cols} FROM {child} {where}"
         "ORDER BY {pk} LIMIT {limit}) "
@@ -1592,6 +1630,7 @@ def _build_pg_orphan_page_sql(
         where=where_clause,
         limit=sql.Literal(page_size),
     )
+    return statement if first else _param_safe(statement)
 
 
 def build_pg_orphan_page_first_sql(
@@ -1627,8 +1666,9 @@ def build_pg_composite_orphan_page_sql(
     faster live than a FILTER over NOT EXISTS) over the rows after the cursor only -- one
     range of the primary key per key prefix (:func:`_pg_keyset_window`, G143) -- so its
     boundary also moves past rows that are not orphans; each boundary column comes back as
-    text and is bound back as ``%(last_i)s``, as :func:`build_pg_composite_page_sql` does.
-    A foreign-key column that is also a key column is selected under its own name too, for
+    text and is bound back as ``%(last_i)s``, as :func:`build_pg_composite_page_sql` does
+    (so a page after the cursor names everything param-safe, :func:`_param_safe`). A
+    foreign-key column that is also a key column is selected under its own name too, for
     the anti-join.
     """
     child = _pg_table_identifier(child_table)
@@ -1647,7 +1687,7 @@ def build_pg_composite_orphan_page_sql(
         )
         for alias in aliases
     )
-    return sql.SQL(
+    statement = sql.SQL(
         "WITH pg AS MATERIALIZED ({window}) "
         "SELECT (SELECT COUNT(*) FROM pg LEFT JOIN {parent} AS p ON {join_predicate} "
         "WHERE {not_null} AND {parent_null}), "
@@ -1665,3 +1705,4 @@ def build_pg_composite_orphan_page_sql(
         ),
         boundaries=boundaries,
     )
+    return statement if first else _param_safe(statement)

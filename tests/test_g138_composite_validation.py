@@ -475,7 +475,9 @@ class _PgSqla:
     def dispose(self) -> None:
         return None
 
-    def exec_driver_sql(self, sql: str, params: Any = None) -> _Result:
+    def exec_driver_sql(
+        self, sql: str, params: Any = None, execution_options: Any = None
+    ) -> _Result:
         result = self.double.resolve(sql, params)
         if isinstance(result, list):
             return _Result(result)

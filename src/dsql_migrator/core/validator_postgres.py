@@ -16,7 +16,8 @@ guarded SQLAlchemy connection (read-only ``before_cursor_execute`` guard + the c
 snapshot). :class:`PgSourceConnection` adapts the SQLAlchemy connection to that raw-cursor
 interface by rendering each ``psycopg.sql.Composed`` to text (``as_string``) and running it
 through ``exec_driver_sql`` -- so every read still passes through the read-only guard and
-stays inside the snapshot transaction (no raw-cursor / transaction mixing).
+stays inside the snapshot transaction (no raw-cursor / transaction mixing). A statement
+reaches psycopg exactly as the target's cursor gets it: with its parameters, or with none.
 """
 
 from __future__ import annotations
@@ -32,6 +33,14 @@ class _PgSourceCursor:
     and runs it via the guarded SQLAlchemy connection. Placeholders bind through psycopg's
     pyformat paramstyle. ``fetchone``/``fetchall`` mirror a DB-API cursor; ``close`` is a
     no-op (SQLAlchemy owns the real cursor and the transaction).
+
+    A statement without parameters is sent with SQLAlchemy's ``no_parameters``, as the
+    target's cursor sends it: otherwise SQLAlchemy hands psycopg an EMPTY mapping, and
+    psycopg reads any statement it is given parameters for, quoted names included, for
+    ``%`` placeholders -- so a table or column named ``pct%off`` failed even a first page,
+    ``a%sb`` became ``a$1b`` and ``x%%y`` reached the source as ``x%y``. A statement WITH
+    parameters names its identifiers param-safe already
+    (:func:`~dsql_migrator.core.validation_sql._param_safe`).
     """
 
     def __init__(self, sqla_connection: Any, raw_connection: Any) -> None:
@@ -44,7 +53,9 @@ class _PgSourceCursor:
         if params:
             self._result = self._conn.exec_driver_sql(sql_text, params)
         else:
-            self._result = self._conn.exec_driver_sql(sql_text)
+            self._result = self._conn.exec_driver_sql(
+                sql_text, execution_options={"no_parameters": True}
+            )
 
     def fetchone(self) -> Any:
         return None if self._result is None else self._result.fetchone()

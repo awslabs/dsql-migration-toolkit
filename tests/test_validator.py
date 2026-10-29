@@ -2912,11 +2912,13 @@ def test_pg_source_connection_shim_renders_composed_and_binds_params() -> None:
         def __init__(self, rows):
             self.rows = rows
             self.calls: list = []
+            self.options: list = []
             # driver_connection=None so Composed.as_string(None) renders offline.
             self.connection = SimpleNamespace(driver_connection=None)
 
-        def exec_driver_sql(self, sql, params=None):
+        def exec_driver_sql(self, sql, params=None, execution_options=None):
             self.calls.append((sql, params))
+            self.options.append(execution_options)
             return _Res(self.rows)
 
     table = TableDef(
@@ -2932,18 +2934,22 @@ def test_pg_source_connection_shim_renders_composed_and_binds_params() -> None:
     text, params = sqla.calls[-1]
     assert '"id" > %(last)s' in text and "LIMIT 500" in text
     assert params == {"last": 10}
+    assert sqla.options[-1] is None
     assert cur.fetchall() == [(10,), (11,)]
 
-    # (2) A no-param Composed (checksum) takes the no-params exec branch.
+    # (2) A no-param Composed (checksum) takes the no-params exec branch: sent with
+    # no_parameters, so psycopg is handed no (empty) mapping to read the text for.
     sqla.calls.clear()
     cur.execute(build_pg_checksum_sql(table))
     assert sqla.calls[-1][1] is None
+    assert sqla.options[-1] == {"no_parameters": True}
     assert cur.fetchone() == (10,)
 
     # (3) The `if params:` guard treats an empty dict as no-params too.
     sqla.calls.clear()
     cur.execute(build_pg_pk_next_page_sql(table, "id", 5), {})
     assert sqla.calls[-1][1] is None
+    assert sqla.options[-1] == {"no_parameters": True}
 
 
 def test_checksum_kind_jsonb_included_json_excluded() -> None:
@@ -2985,7 +2991,7 @@ def test_pg_source_keyset_count_through_shim_non_integer_and_composite() -> None
             self.sqls: list = []
             self.connection = SimpleNamespace(driver_connection=None)
 
-        def exec_driver_sql(self, sql, params=None):
+        def exec_driver_sql(self, sql, params=None, execution_options=None):
             self.sqls.append(sql)
             return _Res(self._b.pop(0) if self._b else [])
 
