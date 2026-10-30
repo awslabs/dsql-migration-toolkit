@@ -344,7 +344,7 @@ Optional streaming CDC is a separate **cdc-stack**.
 ## Configuration (advanced — usually no need to touch)
 
 Everything is done in the UI with sensible defaults — **most operators never touch
-this.** The full environment-variable reference (for automation / tuning) is below.
+this.** The main environment variables (for automation / tuning) are below.
 
 <details>
 <summary><b>Environment-variable reference</b> — click to expand</summary>

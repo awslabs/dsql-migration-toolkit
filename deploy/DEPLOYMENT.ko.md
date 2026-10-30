@@ -951,11 +951,13 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 | `InstanceType` | 아니오 | `t3.large` | 컨트롤 플레인 호스트 크기. |
 | `StateVolumeSizeGiB` | 아니오 | `20` | 보존형 EBS 상태 볼륨; 대형 테이블 Full Load의 로컬 CSV 스필오버는 크게. |
 | `SourceSecretArn` | 아니오 | `""` | 기존 소스 자격증명 시크릿 재사용 시에만(그 외에는 UI에서 사용자/비밀번호 입력). |
+| `EnableActivityLogCloudWatch` | 아니오 | `false` | `true`면 앱이 활동 로그 이벤트마다 JSON 한 줄을 stdout으로도 내보내고, 이 호스트에서는 CloudWatch가 아니라 journald가 이를 수집(`journalctl -u dsql-migrator`). **Settings → Activity log**(*Mirror to CloudWatch Logs*)에서 런타임에도 전환할 수 있고, 재시작하면 이 값으로 돌아감. |
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | 아니오 | off / `global.anthropic.claude-sonnet-5` | opt-in Bedrock AI 보조(EC2에서는 IAM 범위를 모델에서 도출). |
 | `KeyName` | 아니오 | `""` | 선택적 SSH 키; SSM이 기본 접속 경로라 보통 비워둠(호스트에 인바운드 규칙 자체가 없음). |
 
 > [!WARNING]
-> 스택 이름은 **`mysql-dsql-cdc-`로 시작하면 안 됩니다**(그 접두사는 CDC 배포 역할 범위에 들어감).
+> 스택 이름은 **`dsql-cdc-` 또는 `mysql-dsql-cdc-`로 시작하면 안 됩니다**(두 접두사 모두 CDC 배포
+> 역할 범위에 들어감 — `dsql-cdc-*`는 기본 cdc-stack 계열, `mysql-dsql-cdc-*`는 아직 허용되는 레거시 계열).
 > `mysql-dsql-migrator-ec2`가 적절합니다.
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
@@ -1001,8 +1003,8 @@ deploy/DEPLOYMENT.md("Run on a single EC2 host")를 따라 이 저장소의 단�
    s3, 그리고 AI 보조(Amazon Bedrock) 활성화 여부.
 4. 내가 OK하면 배포해 — --s3-bucket으로 템플릿을 스테이징하고(CloudFormation의 51,200바이트
    인라인 한도를 초과함); --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM를 사용해; 스택
-   이름은 mysql-dsql-migrator-ec2로(mysql-dsql-cdc-로 시작하면 안 됨). CREATE_COMPLETE를 기다린
-   뒤, UI에 SSM 포트포워드로 접속하는 방법을 알려줘.
+   이름은 mysql-dsql-migrator-ec2로(dsql-cdc- 또는 mysql-dsql-cdc-로 시작하면 안 됨).
+   CREATE_COMPLETE를 기다린 뒤, UI에 SSM 포트포워드로 접속하는 방법을 알려줘.
 
 가드레일: 오직 단일 리전(DSQL 클러스터의 리전); 만들기 전에 read/describe; 기존 리소스를 절대
 수정하거나 삭제하지 마; 모든 것을 프로덕션으로 취급; 모호하거나 단계가 실패하면 멈추고 물어봐.

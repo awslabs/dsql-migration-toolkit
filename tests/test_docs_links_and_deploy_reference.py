@@ -13,6 +13,11 @@ Settings dialog do (follow-ups of the v0.1.577 review).
 * Its ``ContainerMemory`` row asked for >= 4096 MiB for large ``TEXT``/``BLOB`` values where
   the template's description and the guide's own sizing bullet say 8192+; the template's
   description gave the memory of CPU 512 to 4096 only, though the guide goes up to 16384.
+  Neither it nor the row gave CPU 256's, which the parameter allows.
+* The single-EC2-host parameter table had no row for ``EnableActivityLogCloudWatch``, which
+  that template has too; on the host the stdout copy goes to journald, not CloudWatch. In ko
+  and ja its stack-name warning and AI prompt named only the legacy ``mysql-dsql-cdc-``
+  prefix, not ``dsql-cdc-`` too, as en does.
 * README's environment-variable reference said "the four" Full Load / Validation knobs can be
   retuned in Settings; five of its rows can, and it now names them.
 
@@ -227,6 +232,70 @@ def test_the_activity_log_row_says_what_the_parameter_does(lang: str, template: 
         assert fact in row, (lang, fact)
 
 
+_EC2_PARAMETERS = {
+    "en": "### 2. Required / key parameters",
+    "ko": "### 2. 필수 / 핵심 파라미터",
+    "ja": "### 2. 必須 / 主要パラメータ",
+}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_ec2_parameter_table_says_where_the_activity_log_mirror_goes(lang: str) -> None:
+    # The EC2 template has the parameter too, but there the systemd service's stdout goes to
+    # journald -- no awslogs driver, no CloudWatch log group -- as its description says.
+    ec2 = yaml.safe_load((DEPLOY / "cloudformation-ec2.yaml").read_text(encoding="utf-8"))
+    parameter = ec2["Parameters"]["EnableActivityLogCloudWatch"]
+    assert "`journalctl -u dsql-migrator`" in " ".join(parameter["Description"].split())
+    user_data = ec2["Resources"]["AppHost"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+    assert "DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=${EnableActivityLogCloudWatch}" in user_data
+    assert "StandardOutput" not in user_data  # the unit's stdout: systemd's default, the journal
+
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n{_EC2_PARAMETERS[lang]}\n")
+    section = text[start : text.index("\n### ", start + 1)]
+    (row,) = [
+        line
+        for line in section.splitlines()
+        if line.startswith("| `EnableActivityLogCloudWatch` |")
+    ]
+    cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+    assert cells[2] == f"`{parameter['Default']}`", lang
+    for fact in (
+        "JSON",
+        "journald",
+        "`journalctl -u dsql-migrator`",
+        "**Settings → Activity log**",
+        "*Mirror to CloudWatch Logs*",
+    ):
+        assert fact in cells[3], (lang, fact)
+    assert "awslogs" not in cells[3], lang
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_ec2_stack_name_warning_and_prompt_name_both_cdc_prefixes(lang: str) -> None:
+    # The host's CDC deploy role reaches the stacks of both cdc-stack families, so a host stack
+    # named into either falls in its scope. ko and ja named the legacy prefix only (in the
+    # warning under the parameter table and in the AI prompt), as en did before v0.1.439.
+    from dsql_migrator.core.cdc import CDC_STACK_NAME_LEGACY_PREFIX, CDC_STACK_NAME_PREFIX
+
+    ec2 = (DEPLOY / "cloudformation-ec2.yaml").read_text(encoding="utf-8")
+    assert set(re.findall(r":stack/([a-z-]+)\*", ec2)) == {
+        CDC_STACK_NAME_PREFIX,
+        CDC_STACK_NAME_LEGACY_PREFIX,
+    }
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n{_EC2_PARAMETERS[lang]}\n")
+    part = _flat(lang, text[start : text.index("\n### 4", start)])  # sections 2 and 3
+
+    def bare(prefix: str) -> str:  # the prefix itself, not a stack name or a pattern
+        return rf"(?<![A-Za-z0-9_-]){re.escape(prefix)}(?![A-Za-z0-9_*-])"
+
+    legacy = [m.start() for m in re.finditer(bare(CDC_STACK_NAME_LEGACY_PREFIX), part)]
+    assert len(legacy) == 2, (lang, legacy)  # the warning and the AI prompt
+    for at in legacy:  # each names the canonical prefix just before
+        assert re.search(bare(CDC_STACK_NAME_PREFIX), part[max(0, at - 24) : at]), lang
+
+
 # -- task memory: the template, the guide's row, its sizing bullet and AWS's table agree -----
 
 # AWS Fargate's task CPU / memory pairs (Amazon ECS Developer Guide, "Task CPU and memory":
@@ -264,10 +333,8 @@ def test_the_template_gives_the_memory_each_cpu_takes(template: dict) -> None:
         )
     }
     assert described == _FARGATE_GB  # 8192 and 16384 were missing
-    # Every CPU the parameter allows but 256 (0.25 vCPU), which the guide never recommends;
-    # its three sizes are in the guide's sizing table.
-    allowed = set(template["Parameters"]["ContainerCpu"]["AllowedValues"])
-    assert allowed - set(described) == {256}
+    # CPU 256 (0.25 vCPU) takes three sizes, not a range; it was missing too.
+    assert "256->512MiB/1GB/2GB" in _memory_description(template)
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -276,6 +343,25 @@ def test_the_sizing_table_is_fargates(lang: str) -> None:
     rows = re.findall(r"(?m)^\| `(\d+)` \([\d.]+\) \| (\d+)–(\d+) GB \| (\d+) GB \|$", text)
     assert {int(cpu): (int(lo), int(hi), int(step)) for cpu, lo, hi, step in rows} == _FARGATE_GB
     assert re.search(r"(?m)^\| `256` \(0\.25\) \| 512, 1024, 2048 MiB \|", text), lang
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_every_cpu_the_parameter_allows_has_its_memory_in_the_template_and_the_guide(
+    lang: str, template: dict
+) -> None:
+    # The template's description and the guide's sizing table give each allowed CPU's memory
+    # (the description lacked 256), and so does the English row, which spells the pairs out.
+    allowed = sorted(template["Parameters"]["ContainerCpu"]["AllowedValues"])
+    assert allowed == sorted({256, *_FARGATE_GB})  # each one a Fargate task CPU
+    described = re.findall(r"\b(\d+)->", _memory_description(template))
+    assert [int(cpu) for cpu in described] == allowed
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    table = re.findall(r"(?m)^\| `(\d+)` \([\d.]+\) \| ", text)
+    assert [int(cpu) for cpu in table] == allowed, lang
+    if lang == "en":
+        row = _reference_rows(lang)["ContainerMemory"][3]
+        assert [int(cpu) for cpu in re.findall(r"`(\d+)`(?: CPU)? with ", row)] == allowed
+        assert "`256` CPU with 512 MiB, 1 GB or 2 GB" in row
 
 
 _ITSELF = {"en": "itself is valid with", "ko": "자체는", "ja": "自体は"}

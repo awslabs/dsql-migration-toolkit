@@ -1033,12 +1033,14 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 | `InstanceType` | いいえ | `t3.large` | コントロールプレーンホストのサイズ。 |
 | `StateVolumeSizeGiB` | いいえ | `20` | 保持型 EBS 状態ボリューム。大きなテーブルの Full Load でローカル CSV がスピルする場合は大きく。 |
 | `SourceSecretArn` | いいえ | `""` | 既存のソース資格情報シークレットを再利用する場合のみ（それ以外は UI でユーザー名/パスワードを入力）。 |
+| `EnableActivityLogCloudWatch` | いいえ | `false` | `true` にすると、アプリはアクティビティログのイベントごとに JSON 1 行を stdout にも出力し、このホストでは CloudWatch ではなく journald がそれを記録します（`journalctl -u dsql-migrator`）。**Settings → Activity log**（*Mirror to CloudWatch Logs*）から実行時にも切り替えられ、再起動するとこの値に戻ります。 |
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | いいえ | off / `global.anthropic.claude-sonnet-5` | opt-in の Bedrock AI アシスト（EC2 では IAM スコープをモデルから導出）。 |
 | `KeyName` | いいえ | `""` | オプションの SSH キー。SSM が主要なアクセス経路なので通常は空（ホストにはインバウンドルールが一切なし）。 |
 
 > [!WARNING]
-> スタック名は **`mysql-dsql-cdc-` で始めてはいけません**（その接頭辞は CDC デプロイロールのスコープに
-> 入ります）。`mysql-dsql-migrator-ec2` が適切です。
+> スタック名は **`dsql-cdc-` または `mysql-dsql-cdc-` で始めてはいけません**（どちらの接頭辞も CDC
+> デプロイロールのスコープに入ります — `dsql-cdc-*` は標準の cdc-stack 系列、`mysql-dsql-cdc-*`
+> は引き続き受け付けられるレガシー系列です）。`mysql-dsql-migrator-ec2` が適切です。
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -1083,7 +1085,7 @@ app-stack（deploy/cloudformation-ec2.yaml）を私の AWS アカウントにデ
    クローンする）か s3 か、そして AI assist（Amazon Bedrock）を有効にするかどうか。
 4. 私の OK が出たらデプロイする — テンプレートは --s3-bucket でステージングする（CloudFormation の
    51,200 バイトのインライン上限を超えるため）; --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM を
-   使う; スタック名は mysql-dsql-migrator-ec2 にする（mysql-dsql-cdc- で始めてはいけない）。
+   使う; スタック名は mysql-dsql-migrator-ec2 にする（dsql-cdc- または mysql-dsql-cdc- で始めてはいけない）。
    CREATE_COMPLETE を待ってから、SSM ポートフォワードで UI に到達する方法を私に伝える。
 
 ガードレール: リージョンは 1 つだけ（DSQL クラスターのもの）; 作成する前に read/describe する;
