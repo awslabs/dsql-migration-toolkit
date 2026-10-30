@@ -199,7 +199,8 @@ Parameters:
       app log. Memory scales with table_parallelism x batch_parallelism across worker
       processes and with wide TEXT/BLOB rows, so 1024 can be tight for a real load: use
       2048+ for a Full Load, 8192+ for large LOBs. Must be valid for the chosen CPU
-      (512->1-4GB, 1024->2-8GB, 2048->4-16GB, 4096->8-30GB).
+      (512->1-4GB, 1024->2-8GB, 2048->4-16GB, 4096->8-30GB, 8192->16-60GB in 4GB steps,
+      16384->32-120GB in 8GB steps).
 
   AppPort:
     Type: Number

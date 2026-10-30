@@ -10,7 +10,6 @@ AWS-services overview; this folder is the task-oriented documentation.
 | Path | What's inside |
 |---|---|
 | [**`manual/`**](manual/README.md) | The step-by-step **user manual** (EN / KO / JA) — the five migration steps (Evaluation → Schema Conversion → Data Migration → Validation → Cut over), plus performance tuning & measured results, testing / verification, and a customer FAQ. **Start at [`manual/README.md`](manual/README.md).** |
-| [**`dev/`**](dev/) | Developer / maintainer procedures (e.g. the hands-on [Lambda-free "EC2 + MSK only" test](dev/TEST_EC2_MSK_ONLY.md)). Not needed to run a migration. |
 | [**`images/`**](images/) | Architecture and UI diagrams referenced by the README, the deployment guide, and the manual. |
 
 ## Related docs (outside `docs/`)

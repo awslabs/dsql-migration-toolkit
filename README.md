@@ -350,9 +350,11 @@ this.** The full environment-variable reference (for automation / tuning) is bel
 <summary><b>Environment-variable reference</b> — click to expand</summary>
 
 Read from environment variables (no config file, no persisted credentials). On
-Fargate, set these in the ECS task definition. The four Full Load / Validation
-parallelism knobs can also be retuned **at runtime** from the sidebar's
-**Settings** (the Full Load and Validation tabs) — no redeploy; resets on restart.
+Fargate, set these in the ECS task definition. Five of the Full Load / Validation
+knobs below (`FULL_LOAD_TABLE_PARALLELISM`, `FULL_LOAD_BATCH_PARALLELISM`,
+`FULL_LOAD_BATCH_ROWS`, `FULL_LOAD_READER_SHARDS` and `VALIDATE_MAX_WORKERS`) can
+also be retuned **at runtime** from the sidebar's **Settings** (the Full Load and
+Validation tabs) — no redeploy; resets on restart.
 
 | Variable | Default | Description |
 | --- | --- | --- |

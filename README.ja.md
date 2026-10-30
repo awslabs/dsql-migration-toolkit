@@ -346,8 +346,9 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 <summary><b>環境変数リファレンス</b> — クリックで展開</summary>
 
 環境変数で設定します（config ファイルなし、認証情報は永続化されない）。Fargate では ECS
-タスク定義で指定します。Full Load / Validation の並列度パラメータ 4 つは、サイドバーの
-**Settings**（Full Load・Validation タブ）から**実行時に**調整することも可能です（再デプロイ
+タスク定義で指定します。下記の Full Load / Validation のパラメータのうち 5 つ（`FULL_LOAD_TABLE_PARALLELISM`、
+`FULL_LOAD_BATCH_PARALLELISM`、`FULL_LOAD_BATCH_ROWS`、`FULL_LOAD_READER_SHARDS`、`VALIDATE_MAX_WORKERS`）は、
+サイドバーの **Settings**（Full Load・Validation タブ）から**実行時に**調整することも可能です（再デプロイ
 不要、再起動でリセット）。
 
 | 変数 | 既定値 | 説明 |

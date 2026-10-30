@@ -325,8 +325,10 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 <summary><b>환경 변수 레퍼런스</b> — 펼치기</summary>
 
 환경 변수에서 읽으며(config 파일 없음, 자격증명 미영속화) Fargate에서는 ECS 태스크 정의에
-설정합니다. Full Load / Validation 병렬수 4개는 사이드바의 **Settings**(Full Load·Validation 탭)에서
-**런타임에** 재튜닝할 수도 있습니다(재배포 불필요, 재시작 시 리셋).
+설정합니다. 아래 Full Load / Validation 노브 중 5개(`FULL_LOAD_TABLE_PARALLELISM`,
+`FULL_LOAD_BATCH_PARALLELISM`, `FULL_LOAD_BATCH_ROWS`, `FULL_LOAD_READER_SHARDS`,
+`VALIDATE_MAX_WORKERS`)는 사이드바의 **Settings**(Full Load·Validation 탭)에서 **런타임에**
+재튜닝할 수도 있습니다(재배포 불필요, 재시작 시 리셋).
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
