@@ -5,6 +5,40 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.578
+
+Full Load가 키 범위당 동시 진행 배치를 더 적게 두어, 80M 행 테이블을 같은 rows/s로 로드하면서도 Aurora DSQL의 커밋 지연과 컴퓨트 비용은 약 절반이었고, MySQL 리더는 행당 CPU를 약 3분의 1 적게 씁니다. 이제 Validation은 `%`가 들어간 이름을 처리하고(v0.1.577의 알려진 문제), `:`가 들어간 이름은 쓰인 그대로 소스에 도달하며, MySQL 8.0 이상에서는 추정 행 수를 기본 하루 동안 보관되는 캐시가 아니라 InnoDB에서 가져옵니다.
+
+### 변경
+
+- **동시 진행 배치가 키 범위당 4개가 아니라 2개로 제한되며, *Batches per table*이 더 작지 않으면 테이블 또는 부분당 최소 4개를 유지합니다**. 테이블 또는 부분마다 *Batches per table*, 실행당 128개라는 상한은 그대로입니다. 키 범위 k개(k ≥ 2)로 읽는 테이블 또는 부분은 동시 진행 배치를 4k개가 아니라 최대 2k개 유지하고, 키 범위 하나로 읽는 것은 예전처럼 최대 4개입니다: 기본값인 *Batches per table* 8에서는 키 범위가 2개나 3개면 이제 8개가 아니라 4개나 6개를, 1개나 4개 이상이면 각각 4개와 8개를 유지하며, *Tables in parallel*이 기본값 4이고 *Batches per table*이 32이면 키 범위 4개는 16개가 아니라 8개, 8개는 32개가 아니라 16개를 유지합니다. *Batches per table*이 1–3이면 예전처럼 그 수만큼 유지하며, 동시 진행 배치가 줄어드는 곳에서는 실행이 쥐는 Aurora DSQL 연결도 줄어듭니다. 16 vCPU / 120 GB ECS Fargate 태스크 하나에서 `db.r8g.16xlarge`의 Aurora PostgreSQL 17 소스, *Tables in parallel* 16, *Batches per table* 8로 측정하자, 키 범위 31–32개로 나누어 프로세스마다 두 개씩 읽은 80M 행 테이블이 키 범위당 2개일 때(두 번 실행해 150,400과 152,700) 4개일 때(150,000)와 같은 약 150,000 rows/s로 로드됐고, Aurora DSQL의 평균 커밋 지연(1.4–1.6초 대 2.8초)과 `ComputeDPU`는 약 절반, 행당 `TotalDPU`는 약 5% 낮았으며, 어느 실행에서도 OCC 충돌이 없었습니다([§7.5](docs/manual/ko/07-performance-and-tuning.md#75-라이브-인프라-실측--71과-72의-근거)). Settings → Full Load의 알림 문구는 *Batches in flight are capped at 2 per key range (never fewer than 4 per table or part unless Batches per table is lower) and 128 per run*이며(예전에는 *Batches in flight are capped at 4 per key range and 128 per run*), *Batches per table*의 설명은 *Row batches in flight: at most this many per table or part (within that, up to 2 per key range it is read in, never fewer than 4 unless this setting is lower), each on its own Aurora DSQL connection.*입니다.
+- **MySQL Full Load 리더가 행당 CPU를 약 3분의 1 적게 씁니다**(일반적인 테이블 기준). 각 페이지의 행을 위치 기준으로 변환하고, 흔한 값 타입에는 직접 경로를 씁니다. 읽기 경로의 CPU만 잰 로컬 벤치마크(PyMySQL이 디코딩한 11개 컬럼 테이블의 100,000행, 7회 중앙값)에서 행 하나에 16.5마이크로초가 아니라 10.9마이크로초가 걸렸습니다. MySQL Full Load는 동시에 로드하는 테이블마다 코어 약 하나를 바쁘게 쓰므로 CPU가 한계인 로드는 더 빨리 읽지만, 드라이버 자신의 디코딩과 쓰기는 그대로이므로 처음부터 끝까지의 개선 폭은 그보다 작습니다. 쓰는 행은 그대로입니다. PostgreSQL 소스의 행도 같은 위치 기준 경로를 거치지만(마이크로벤치마크에서 도구 자신의 행당 비용이 2.1마이크로초에서 0.8마이크로초로 줄었습니다), PostgreSQL Full Load는 태스크의 CPU가 아니라 Aurora DSQL이 한계입니다.
+
+### 수정
+
+- **MySQL 8.0 이상(Aurora MySQL 3)에서는 도구가 읽는 추정 행 수를 MySQL이 캐시해 두는 사본(기본 하루, `information_schema_stats_expiry`)이 아니라 InnoDB의 통계에서 가져옵니다:** Full Load 시작점의 테이블별 행 수, 명시한 *Reader shards per large table* 값이 `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS`와 비교하는 추정치, **Refresh source/target counts**(CDC 모니터의 *Source rows (est.)*), 그리고 Full Load 전에 CDC 인프라를 배포할 때 CDC 배포가 토픽 파티션 수를 정하려고 읽는 테이블별 크기입니다. 예전에는 그 사본을 만든 뒤 커진 테이블이 이전 추정치를 그대로 가졌습니다: 자동 Reader shards는 지금은 5,000,000행을 넘는 테이블을 구간 하나로 읽고 늦게 시작할 수 있었고, 명시한 값은 그 테이블을 나누지 않은 채 둘 수 있었으며, CDC 배포는 그 테이블에 파티션 하나를 줘 싱크 태스크 하나로 스트리밍되게 할 수 있었습니다. 그 뒤로 행을 지운(purge) 테이블은 새로 고친 뒤 *rows missing*으로 보일 수 있었습니다. *Source rows (est.)* 헤더의 툴팁도 이를 알려 줍니다. 도구는 그런 짧은 세션마다 `SET SESSION information_schema_stats_expiry = 0`을 한 번 보냅니다. 권한이 필요 없고, 서버의 설정은 건드리지 않으며, 행을 읽지 않습니다. MySQL 5.7(Aurora MySQL 2)과 PostgreSQL에는 아무것도 보내지 않으며, 서버가 그 SET을 거부하면 예전처럼 캐시된 추정치를 씁니다([§3.8](docs/manual/ko/03-full-load.md#38-병렬-적재), [§7.2](docs/manual/ko/07-performance-and-tuning.md#72-병렬수-튜닝)).
+- **Validation이 이름에 `%`가 들어간 테이블, 컬럼, 키를 처리하며**, v0.1.577의 알려진 문제가 해결됐습니다. Aurora DSQL에서는 첫 페이지 다음의 모든 페이지(Validation과 Cut over에서의 행 수·대조 페이지, CHECKSUM 페이지, 외래 키 고아 행 세기)가 그런 이름의 `%`를 자리표시자로 읽었습니다: `pct%off`와 `a%sb`는 테이블을 실패시켰고, `x%%y`는 `x%y`로 전송됐습니다. PostgreSQL 소스에서는 첫 페이지를 포함해 모든 읽기가 그랬습니다. 이제 그런 이름은 쓰인 그대로 데이터베이스에 도달하며, 그 밖의 이름에 대한 문장은 그대로입니다.
+- **이름에 공백·구두점·백슬래시 뒤나 맨 앞에 `:`가 들어간 테이블, 컬럼, 키(`a :b`, `:b`, `a\:b`)가 이제 쓰인 그대로 소스에 도달합니다.** 도구가 그런 이름으로 실행한 모든 문장이 그 `:`를 파라미터로 읽어, 문장이 실패하거나(*A value is required for bind parameter 'b'*) 다른 것을 가리켰습니다(`:last`는 읽기의 커서 값을 받았고, `a\:b`는 `a:b`로 전송됐습니다). 그래서 MySQL이나 PostgreSQL에서 그런 테이블의 Full Load가 실패했고, MySQL 소스에서의 그 테이블의 Validation과 그 테이블에 대한 PostgreSQL CDC의 소스 설정(Full load + CDC 실행이 만드는 publication, 나중에 그 publication에 테이블을 추가하는 것, `REPLICA IDENTITY FULL`)도 실패했습니다. CDC 모니터의 소스 high-water 키는 그 테이블에서 빈 채로 남았고, 사전 점검 항목 *No value exceeds the Aurora DSQL per-value limit for its type*은 판정되지 않았습니다(not determined). Evaluation은 만들어지거나 재설정된 뒤 아직 값을 가져간 적이 없는 그런 이름의 PostgreSQL 시퀀스의 다음 값을 읽지 못했고(그 `CREATE SEQUENCE`에 자리표시자가 남았습니다), 그런 이름의 MySQL 활성 역할이 있으면 사용자가 나열할 수 없는 트리거·이벤트·루틴에 대한 항목을 내지 않았습니다. 그 사전 점검 항목은 이제 이름에 백틱(MySQL)이나 큰따옴표(PostgreSQL)가 들어간 테이블이나 컬럼도 측정하며, 예전에는 이를 판정하지 않은 채(not determined) 두었습니다. 그 밖의 이름에 대한 문장은 그대로입니다.
+
+### 알려진 문제
+
+- **데이터베이스(MySQL), 스키마(PostgreSQL) 또는 테이블 이름에 ASCII 영문자, 숫자, `.`, `_`, `-` 이외의 문자가 들어간 테이블은 CDC로 스트리밍할 수 없습니다**(예: `$`, 공백, `%`, `:`, 한글 같은 비 ASCII 문자). 도구가 그 이름으로 테이블의 Kafka 토픽 이름을 짓는데 Kafka가 그 이름을 거부해 Start CDC가 실패합니다. 그런 테이블은 Start CDC 전에 선택을 해제하고(적재된 그대로 Aurora DSQL에 남고, CDC와 Validation은 건너뜁니다) 쓰기가 멈춘 뒤 Full load only 마이그레이션으로 다시 복사하거나, 마이그레이션 전에 소스에서 이름을 바꾸세요.
+
+### 스크립트
+
+- **`scripts/measure_performance.py full-load --range-in-flight N`은 키 범위당 상한만 대체합니다**(이 옵션이 설정하는 `DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT` 변수도 마찬가지입니다). 테이블 또는 부분은 `--batch-parallelism`이 더 작지 않으면 여전히 동시 진행 배치를 최소 4개 유지하므로, `--range-in-flight 1`이면 이제 키 범위 하나로 읽는 테이블이 1개가 아니라 4개를 받습니다. 지정하지 않으면 로더의 값인 2이며(사용법의 A/B 예시는 이제 `4`를 설정합니다), 실행의 로그 줄은 적용된 하한을 밝히고, 리포트의 `in_flight`에는 `unit_floor`가 추가됩니다.
+
+### 문서
+
+- **README의 `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` 행, 매뉴얼 7장, FAQ Q10이 새 동시 진행 상한을 밝히며**, 80M 행 측정은 [§7.5](docs/manual/ko/07-performance-and-tuning.md#75-라이브-인프라-실측--71과-72의-근거)에 있습니다. [FAQ Q10](docs/manual/ko/11-customer-faq.md#b-full-load-벌크-복사)은 이제 범위를 벗어나거나 정수가 아닌 값은 무시되지 않고 거부된다는 것, 바꾼 환경 변수는 재시작한 뒤에야(Fargate에서는 재배포) 반영된다는 것, Settings → Full Load에서 바꾼 값은 재시작 없이 다음 실행에 반영된다는 것을 밝힙니다. 매뉴얼 §3.8과 §7.2는 MySQL 8.0 이상에서 키 범위 분할과 CDC 파티션 사이징의 추정치를 InnoDB에서 읽는다고 설명합니다. 영어·한국어·일본어 모두 반영했습니다.
+- **배포:** CloudFormation `ContainerMemory` 설명이 `ContainerCpu` 8192(16–60 GB, 4 GB 단위)와 16384(32–120 GB, 8 GB 단위)에서 Fargate가 허용하는 메모리도 알려 줍니다. 배포 가이드의 [파라미터 레퍼런스](deploy/DEPLOYMENT.ko.md#파라미터-레퍼런스)(영어·한국어·일본어)가 `EnableActivityLogCloudWatch`를 설명하며, 그 `ContainerMemory` 행은 템플릿과 사이징 권장 사항처럼 큰 `TEXT`/`BLOB` 값이나 병렬도를 올릴 때 8192 MiB 이상을 권장합니다(예전에는 4096이었습니다).
+- **README의 환경 변수 레퍼런스가 그 변수 중 Settings에서 런타임에 재튜닝할 수 있는 5개의 이름을 밝힙니다**(예전에는 4개라고 했습니다). 영어·한국어·일본어 모두 반영했으며, `docs/README.md`는 더 이상 clone한 리포지토리에 없는 개발자용 폴더로 링크하지 않습니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 `ContainerMemory` 파라미터의 설명(과 기본 이미지)만 바뀌었고 IAM 변경은 없으며, 싱크 플러그인도 그대로(v54)라 CDC 인프라 재배포가 필요 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **따로 옮길 것이 없고, v0.1.577로 되돌아가도 안전합니다.** 이 버전은 v0.1.577과 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받아들이므로, 어느 버전이든 다른 버전이 쓴 것을 읽습니다. v0.1.576 이하에서 올라온다면 v0.1.577의 업그레이드 참고도 적용됩니다.
+
 ## v0.1.577
 
 이제 Full Load는 따로 설정하지 않아도 큰 테이블을 기본 키 구간으로 나누어 읽고 쓰며, 동시 진행 배치를 더 늘려도 Aurora DSQL이 빨라지지 않는 지점에서 제한하고, Drop & reload하는 테이블의 보조 인덱스를 행보다 먼저 만듭니다. 16 vCPU / 120 GB ECS Fargate 태스크 하나에서 `db.r8g.16xlarge`의 Aurora MySQL·Aurora PostgreSQL 소스와 *Tables in parallel* 16(나머지 설정은 모두 기본값)으로 실행하자, 20M 행 테이블 16개가 PostgreSQL에서는 전체 약 336,000 rows/s, MySQL에서는 약 193,000 rows/s(태스크의 16 vCPU가 한계)로 로드됐고, 150M 행 PostgreSQL 테이블 하나는 Aurora DSQL이 키 범위 하나에서 받는 약 20,000 rows/s의 약 10배인 약 205,000 rows/s로 로드됐습니다([§7.5](docs/manual/ko/07-performance-and-tuning.md#75-라이브-인프라-실측--71과-72의-근거)). 새 기본값은 재실행의 동작을 바꾸고, 이 버전이 쓰는 Full Load 기록 중 일부는 이전 버전이 읽지 못합니다: 업그레이드 참고를 읽어 보세요.

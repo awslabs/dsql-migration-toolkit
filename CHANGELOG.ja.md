@@ -5,6 +5,40 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.578
+
+Full Load はキー範囲あたりの進行中のバッチを減らし、これによって 80M 行のテーブルを同じ rows/s のまま、Aurora DSQL のコミットレイテンシとコンピュートコストを約半分にしてロードしました。また、MySQL のリーダーが行あたりに使う CPU は約 3 分の 1 減りました。Validation は `%` を含む名前を扱えるようになり (v0.1.577 の既知の問題)、`:` を含む名前は書かれたとおりにソースに届くようになり、MySQL 8.0 以降では推定行数を、既定で 1 日保持されるキャッシュではなく InnoDB から読むようになりました。
+
+### 変更
+
+- **進行中のバッチ数を、キー範囲あたり 4 ではなく 2 に制限し、*Batches per table* のほうが小さくない限り、テーブルまたは部分あたり最低 4 を保つようになりました**。上限は引き続き、テーブルまたは部分ごとに *Batches per table*、実行あたり 128 です。k ≥ 2 個のキー範囲で読むテーブルまたは部分の進行中のバッチは 4k ではなく最大 2k になり、1 つのキー範囲で読むものは以前どおり最大 4 です: 既定の *Batches per table* 8 では、キー範囲が 2 つまたは 3 つなら 8 ではなく 4 または 6 になり、1 つ、または 4 つ以上なら、それぞれ 4 または 8 のままです。*Batches per table* 32 で *Tables in parallel* が既定の 4 なら、キー範囲 4 つでは 16 ではなく 8、8 つでは 32 ではなく 16 になります。*Batches per table* が 1–3 なら以前どおりその数を保ち、進行中のバッチが減るところでは、実行が保持する Aurora DSQL の接続も減ります。16 vCPU / 120 GB の ECS Fargate タスク 1 つで、ソースが `db.r8g.16xlarge` の Aurora PostgreSQL 17、*Tables in parallel* が 16、*Batches per table* が 8 のときの実測では、31–32 個のキー範囲に分けてプロセスごとに 2 つずつ読んだ 80M 行のテーブルは、キー範囲あたり 2 のとき (2 回の実行で 150,400 と 152,700) も 4 のとき (150,000) と同じ約 150,000 rows/s でロードされ、2 のときは Aurora DSQL の平均コミットレイテンシ (1.4–1.6 秒対 2.8 秒) と `ComputeDPU` が約半分、行あたりの `TotalDPU` が約 5% 低く、どの実行でも OCC の競合はありませんでした ([§7.5](docs/manual/ja/07-performance-and-tuning.md#75-ライブインフラでの実測--71-と-72-の裏付け))。Settings → Full Load の通知は *Batches in flight are capped at 2 per key range (never fewer than 4 per table or part unless Batches per table is lower) and 128 per run* になり (以前は *Batches in flight are capped at 4 per key range and 128 per run*)、*Batches per table* の説明は *Row batches in flight: at most this many per table or part (within that, up to 2 per key range it is read in, never fewer than 4 unless this setting is lower), each on its own Aurora DSQL connection.* になりました。
+- **一般的なテーブルで、MySQL の Full Load のリーダーが行あたりに使う CPU が約 3 分の 1 減りました**。リーダーは各ページの行を位置で変換し、よく使われる値の型には直接の経路を使います。ローカルで読み取り経路の CPU だけを測ったベンチマーク (PyMySQL がデコードした 11 列のテーブルの 100,000 行、7 回の中央値) では、1 行にかかる時間が 16.5 マイクロ秒から 10.9 マイクロ秒になりました。MySQL の Full Load は同時にロードするテーブルごとに約 1 コアを使い続けるため、CPU バウンドのロードは読み取りが速くなりますが、ドライバー自身のデコードと書き込みは変わらないため、開始から終了までで見た差はそれより小さくなります。書き込む行は変わりません。PostgreSQL ソースの行も同じ位置による経路を通ります (マイクロベンチマークでは、ツール自身の行あたりのコストが 2.1 マイクロ秒から 0.8 マイクロ秒に下がりました) が、PostgreSQL の Full Load はタスクの CPU ではなく Aurora DSQL に律速されます。
+
+### 修正
+
+- **MySQL 8.0 以降 (Aurora MySQL 3) では、ツールが読む推定行数を、MySQL がキャッシュするコピー (既定で 1 日、`information_schema_stats_expiry`) ではなく、InnoDB の統計から読むようになりました:** 対象は、Full Load の開始位置でのテーブルごとの行数、明示的な *Reader shards per large table* の値が `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` と比べる推定値、**Refresh source/target counts** (CDC モニターの *Source rows (est.)*)、そして Full Load の前に CDC インフラをデプロイした場合に、CDC のデプロイがトピックのパーティション数を決めるために読むテーブルごとのサイズです。以前は、そのコピーが取られた後に大きくなったテーブルは古い推定値のままでした: 自動の Reader shards では、今は 5,000,000 行を超えるテーブルを 1 つの区間で読み、その開始が遅れることがあり、明示的な値ではテーブルが分割されないままになることがあり、CDC のデプロイではそのテーブルにパーティションが 1 つだけ割り当てられ、1 つのシンクタスクでストリーミングされることがありました。その後に行を削除 (purge) したテーブルは、Refresh の後に *rows missing* と表示されることがありました。*Source rows (est.)* の列ヘッダーのツールチップも、そのことを説明しています。ツールは、それらの短いセッションのそれぞれで `SET SESSION information_schema_stats_expiry = 0` を 1 回送ります。権限は不要で、サーバーの設定には触れず、行は読みません。MySQL 5.7 (Aurora MySQL 2) と PostgreSQL には何も送らず、サーバーがその SET を拒否した場合は、以前どおりキャッシュされた推定値を使います ([§3.8](docs/manual/ja/03-full-load.md#38-並列ロード)、[§7.2](docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング))。
+- **名前に `%` を含むテーブル、列、キーを、Validation が扱えるようになりました**。これで v0.1.577 の既知の問題が解消されます。Aurora DSQL では、最初のページより後のすべてのページ (行数と reconcile のページ、CHECKSUM のページ、外部キーの孤立行のカウント。Validation でも Cut over でも) が、そのような名前の `%` をプレースホルダーとして読んでいました: `pct%off` と `a%sb` ではテーブルが失敗し、`x%%y` は `x%y` として送られていました。PostgreSQL ソースでは、最初のページも含めてすべての読み取りがそうでした。そのような名前は書かれたとおりにデータベースに届くようになり、それ以外のすべての名前のステートメントは変わりません。
+- **名前の中の空白、記号、バックスラッシュの後、または名前の先頭に `:` があるテーブル、列、キー (`a :b`、`:b`、`a\:b`) が、書かれたとおりにソースに届くようになりました。** そのような名前を含む、ツールのすべてのステートメントが、その `:` をパラメータとして読んでいました: ステートメントが失敗するか (*A value is required for bind parameter 'b'*)、別のものを指していました (`:last` には読み取りのカーソルの値が入り、`a\:b` は `a:b` として送られていました)。そのため、そのようなテーブルの MySQL や PostgreSQL からの Full Load は失敗し、MySQL ソースでのその Validation と、そのテーブルに対する PostgreSQL の CDC のソース側の準備 (Full load + CDC の実行が作成するパブリケーション、後からテーブルをそこに追加すること、`REPLICA IDENTITY FULL`) も失敗していました。CDC モニターではそのテーブルのソースの high-water キーが空のままで、前提条件 *No value exceeds the Aurora DSQL per-value limit for its type* は未確定になっていました。Evaluation は、そのような名前の PostgreSQL のシーケンスのうち、作成またはリセットされてから一度も値を取り出していないものの次の値を読めず (その `CREATE SEQUENCE` にはプレースホルダーが残っていました)、そのような名前の有効な MySQL のロールがあると、ユーザーが一覧できないトリガー・イベント・ルーチンについて項目を出していませんでした。この前提条件は、名前にバッククォート (MySQL) や二重引用符 (PostgreSQL) を含むテーブルや列も計測するようになりました。以前はそれらを未確定のままにしていました。それ以外のすべての名前のステートメントは変わりません。
+
+### 既知の問題
+
+- **データベース (MySQL)、スキーマ (PostgreSQL)、またはテーブルの名前に ASCII の英字、数字、`.`、`_`、`-` 以外の文字 (`$`、空白、`%`、`:`、日本語などの非 ASCII 文字など) を含むテーブルは、CDC でストリーミングできません**。ツールはテーブルの Kafka トピックの名前をその名前から作りますが、Kafka はその名前を拒否するため、Start CDC が失敗します。そのようなテーブルは Start CDC の前に選択を外し (ロードされたまま Aurora DSQL に残り、CDC と Validation はスキップします)、書き込みが止まってから Full load only の移行でもう一度コピーするか、移行の前にソースで名前を変更してください。
+
+### スクリプト
+
+- **`scripts/measure_performance.py full-load --range-in-flight N` は、キー範囲あたりの上限だけを置き換えるようになりました** (このオプションが設定する `DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT` 変数も同様です): `--batch-parallelism` のほうが小さくない限り、テーブルまたは部分は引き続き進行中のバッチを最低 4 に保つため、`--range-in-flight 1` では、1 つのキー範囲で読むテーブルの進行中のバッチが、以前の 1 ではなく 4 になります。指定しない場合はローダーの 2 です (使い方の説明にある A/B の例は `4` を設定するようになりました)。実行のログの行は適用された下限を示し、レポートの `in_flight` には `unit_floor` が加わりました。
+
+### ドキュメント
+
+- **README の `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` の行、マニュアルの第 7 章、FAQ Q10 が、新しい進行中のバッチの上限を示すようになりました**。80M 行での実測は [§7.5](docs/manual/ja/07-performance-and-tuning.md#75-ライブインフラでの実測--71-と-72-の裏付け) にあります。[FAQ Q10](docs/manual/ja/11-customer-faq.md#b-full-load一括コピー) は、範囲外の値や整数でない値は無視されずに拒否されること、変更した環境変数は再起動 (Fargate では再デプロイ) の後にはじめて反映されること、Settings → Full Load での変更は再起動なしで次の実行に反映されることを説明するようになりました。マニュアルの §3.8 と §7.2 は、MySQL 8.0 以降ではキー範囲の分割と CDC のパーティションのサイジングに使う推定値を InnoDB から読むことを説明します。英語・韓国語・日本語のいずれも同様です。
+- **デプロイ:** CloudFormation の `ContainerMemory` の説明に、`ContainerCpu` 8192 (4 GB 刻みで 16–60 GB) と 16384 (8 GB 刻みで 32–120 GB) で Fargate が許可するメモリも記載しました。デプロイガイドの [パラメータリファレンス](deploy/DEPLOYMENT.ja.md#パラメータリファレンス) (英語・韓国語・日本語) が `EnableActivityLogCloudWatch` を説明するようになり、その `ContainerMemory` の行は、テンプレートやサイジングの推奨と同じく、大きな `TEXT`/`BLOB` の値や並列度を上げる場合に 8192 MiB 以上を推奨します (以前は 4096)。
+- **README の環境変数リファレンスが、そこに載っている変数のうち、Settings で実行時に調整できる 5 つを名前で示すようになりました** (以前は 4 つと書いていました)。英語・韓国語・日本語のいずれも同様です。また、`docs/README.md` は、クローンに含まれない開発者向けのフォルダーにリンクしなくなりました。
+
+### アップグレードの注意
+
+- **アプリスタック: イメージのみの更新で十分です。** `deploy/cloudformation.yaml` は `ContainerMemory` パラメータの説明 (と既定のイメージ) だけが変わり、IAM の変更はありません。シンクプラグインも変わらない (v54) ため、CDC インフラの再デプロイは不要です。実行中のジョブは先に終えるか止めてください: タスクの置き換えでジョブは終了します。
+- **移行が必要なものはなく、v0.1.577 に戻しても安全です。** このバージョンは v0.1.577 と同じ Full Load の記録と保存済みのセッションを読み書きし、同じ設定を受け付けるため、どちらのバージョンも、もう一方が書き込んだものを読めます。v0.1.576 以前から上げる場合は、v0.1.577 のアップグレードの注意も当てはまります。
+
 ## v0.1.577
 
 Full Load は、既定で大きなテーブルを主キーの区間に分けて読み書きし、進行中のバッチ数をそれ以上増やしても Aurora DSQL が速くならないところで制限し、Drop & reload するテーブルの二次インデックスを行より先に作成するようになりました。16 vCPU / 120 GB の ECS Fargate タスク 1 つで、ソースが `db.r8g.16xlarge` の Aurora MySQL と Aurora PostgreSQL、*Tables in parallel* が 16 (それ以外の設定はすべて既定) のとき、20M 行のテーブル 16 個は PostgreSQL から全体で約 336,000 rows/s、MySQL から約 193,000 rows/s (MySQL ではタスクの 16 vCPU が上限でした) でロードされ、150M 行の PostgreSQL テーブル 1 つは約 205,000 rows/s でロードされました。これは Aurora DSQL が 1 つのキー範囲で受け付ける約 20,000 rows/s の約 10 倍です ([§7.5](docs/manual/ja/07-performance-and-tuning.md#75-ライブインフラでの実測--71-と-72-の裏付け))。新しい既定によって再実行の動作が変わり、このバージョンが書き込む Full Load の記録の一部は以前のバージョンでは読めません: アップグレードの注意を読んでください。
