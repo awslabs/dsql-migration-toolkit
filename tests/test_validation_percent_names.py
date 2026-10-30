@@ -22,14 +22,12 @@ Pinned here:
   MySQL source's reads and the identity re-sync -- sends each name as itself: for names
   with a ``%`` (``pct%off``, ``a%sb``, ``x%%y``, ...) and without (mixed case, quotes,
   backslash, unicode), byte for byte what the same statement sends for a name without one;
-* without the fix exactly the statements a ``%`` reached through psycopg's placeholder read
-  changed (a page after a cursor, and every statement on a PostgreSQL source): each failed or
-  named another column, while every other statement, and every other name, is unchanged;
 * Validator runs end to end on the in-memory doubles of ``test_g138_composite_validation``,
   behind cursors that convert each statement as the drivers do and a server that refuses a
-  name no table holds: tables, keys and foreign keys named with a ``%`` match on a MySQL and
-  a PostgreSQL source (an inheritance parent too), orphans are counted, the cut-over orphan
-  count agrees -- and with the fix patched out the same runs fail.
+  name no table holds -- doubles that fail a page named as Validation named it before, as
+  Aurora DSQL did: tables, keys and foreign keys named with a ``%`` match on a MySQL and a
+  PostgreSQL source (an inheritance parent too), orphans are counted, the cut-over orphan
+  count agrees.
 """
 
 from __future__ import annotations
@@ -48,7 +46,6 @@ from sqlalchemy.pool import StaticPool
 
 from dsql_migrator.core import validation_sql
 from dsql_migrator.core import validator as v
-from dsql_migrator.core import validator_postgres
 from dsql_migrator.core.introspector import (
     ReadOnlySourceError,
     _default_engine_factory,
@@ -441,13 +438,6 @@ def _pg_sent(side: str, statement: Any, params: Any, table: Optional[str], offli
     return pg_source.sent(statement, params, from_only=table if side == _O else None)
 
 
-def _pg_sent_or_error(*args: Any) -> Any:
-    try:
-        return _pg_sent(*args)
-    except Exception as exc:  # noqa: BLE001 - a refusal is a result here
-        return (type(exc).__name__, str(exc))
-
-
 @pytest.mark.parametrize("name", _NAMES)
 def test_every_postgresql_read_sends_each_name_as_itself(name, offline, pg_source) -> None:
     # The expected bytes: the same statement built with each '%' of the name as a byte no
@@ -469,59 +459,6 @@ def test_every_postgresql_read_sends_each_name_as_itself(name, offline, pg_sourc
             named += quoted in sent
             checked += 1
     assert checked >= 200 and named >= checked * 3 // 4
-
-
-def _shim_execute_before_the_fix(self: Any, statement: Any, params: Any = None) -> None:
-    """``_PgSourceCursor.execute`` as it was: no ``no_parameters`` without parameters."""
-    sql_text = statement.as_string(self._raw)
-    if params:
-        self._result = self._conn.exec_driver_sql(sql_text, params)
-    else:
-        self._result = self._conn.exec_driver_sql(sql_text)
-
-
-def _patch_the_fix_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(validation_sql, "_param_safe", lambda statement: statement)
-    monkeypatch.setattr(
-        validator_postgres._PgSourceCursor, "execute", _shim_execute_before_the_fix
-    )
-
-
-@pytest.mark.parametrize("name", _NAMES)
-def test_without_the_fix_only_a_percent_read_by_psycopg_broke(
-    name, offline, pg_source, monkeypatch
-) -> None:
-    # What the fix changed, and nothing else: with it patched out, a statement whose names
-    # hold a '%' and that psycopg read for placeholders -- run with parameters (a page after
-    # a cursor) or on a PostgreSQL source (handed an empty mapping) -- failed or named
-    # another object. Every other statement, and every statement of a name without a '%',
-    # is byte for byte what it is now.
-    def every_read() -> dict:
-        return {
-            (index, side): _pg_sent_or_error(side, statement, params, table, offline,
-                                             pg_source)
-            for index, (_label, statement, params, sides, table) in enumerate(_pg_reads(name))
-            for side in sides
-        }
-
-    fixed = every_read()
-    params_of = {index: read[2] for index, read in enumerate(_pg_reads(name))}
-    _patch_the_fix_out(monkeypatch)
-    before = every_read()
-    assert all(isinstance(sent, bytes) for sent in fixed.values())
-    broken = {key for key in fixed if before[key] != fixed[key]}
-    if "%" not in name:
-        assert not broken
-        return
-    read_by_psycopg = {
-        (index, side)
-        for (index, side), sent in fixed.items()
-        if b"%" in sent and (side != _T or params_of[index] is not None)
-    }
-    assert broken == read_by_psycopg and broken
-    quoted = sql.Identifier(name).as_bytes(offline)
-    for key in broken:  # each failed, or reached the server without the name in it
-        assert not isinstance(before[key], bytes) or quoted not in before[key], key
 
 
 def test_the_three_names_of_the_known_issue_fail_as_it_says(offline) -> None:
@@ -563,19 +500,6 @@ def test_param_safe_doubles_only_the_names(offline) -> None:
     table = _keyed_table("s.pct%off", ("a%sb",), "c")
     assert '"s"."pct%off"' in build_pg_pk_first_page_sql(table, "a%sb", 5).as_string(None)
     assert '"s"."pct%%off"' in build_pg_pk_next_page_sql(table, "a%sb", 5).as_string(None)
-
-
-def test_from_only_finds_the_param_safe_table_of_a_page_after_the_cursor() -> None:
-    table = _keyed_table("app.pct%off", ("a%sb",), "c")
-    parent = v._pg_table_identifier(table.name)
-    for statement in (
-        build_pg_pk_next_page_sql(table, "a%sb", 5),
-        build_pg_page_checksum_next_sql(table, "a%sb", 5, True),
-        build_pg_composite_page_sql(table, ("a%sb",), 5, True, checksum=True, first=False,
-                                    row_value=True),
-    ):
-        rendered = v._from_only(statement, parent).as_string(None)
-        assert rendered.count(' FROM ONLY "app"."pct%%off"') == 1, rendered
 
 
 def test_the_orphan_listing_shown_to_the_operator_names_each_table_as_itself() -> None:
@@ -912,29 +836,23 @@ def test_the_cut_over_orphan_count_reads_a_percent_name_page_after_page(
     assert len(after) >= 5 and all(b'LEFT JOIN "app"."pct%off" AS p' in q for q in after)
 
 
-def test_without_the_fix_the_same_runs_fail(offline, mysql_source, monkeypatch) -> None:
-    # Every table errors: psycopg refuses a name's '%' as a placeholder, or the server is
-    # sent another name (x%y for x%%y). On a MySQL source the target's pages after a cursor
-    # fail; on a PostgreSQL source even its first pages do.
-    _patch_the_fix_out(monkeypatch)
-    why = re.compile(r"are allowed as placeholders|does not exist")
-    tables = _percent_tables()
-    report = _run(_WireMySqlSource(mysql_source, *tables), _WireTarget(offline, *tables),
-                  tables, _SOURCE)
-    assert report.is_match is False
-    assert all(why.search(item.error or "") for item in report.items), report.items
-    pg_tables = _percent_tables(pg_types=True)
-    source = _WirePgSource(offline, PgDouble(*pg_tables))
-    report = _run(source, _WireTarget(offline, *pg_tables), pg_tables, _PG_SOURCE)
-    assert all(why.search(item.error or "") for item in report.items), report.items
-    assert source.double.executed == []  # not even a first page reached the source
+def test_the_wire_doubles_fail_a_page_named_as_before_as_aurora_dsql_did(offline) -> None:
+    # Guard the guard: the end-to-end runs above pass only over doubles that read each
+    # statement as psycopg does. Named as Validation named a page after a cursor before (plain
+    # sql.Identifier, run with its parameters) and handed an EMPTY mapping as SQLAlchemy hands
+    # a PostgreSQL source's statement without parameters (pinned above), a '%' fails the read
+    # or names a column no table has -- as on Aurora DSQL -- and nothing reaches the source.
+    def after_cursor(table: str, key: str) -> sql.Composed:
+        return sql.SQL("SELECT COUNT(*) FROM {} WHERE {} > {}").format(
+            sql.Identifier(*table.split(".", 1)), sql.Identifier(key), sql.Placeholder("last")
+        )
 
-
-def test_without_from_only_seeing_the_param_safe_table_an_inheritance_parent_fails(
-    offline, monkeypatch
-) -> None:
-    monkeypatch.setattr(v, "_param_safe", lambda statement: statement)
-    tables = _percent_tables(pg_types=True)
-    report = _run(_WirePgSource(offline, PgDouble(*tables), inheritance_parent=True),
-                  _WireTarget(offline, *tables), tables, _PG_SOURCE)
-    assert all(item.error and "FROM ONLY" in item.error for item in report.items)
+    target = _WireTarget(offline, *_percent_tables())
+    with pytest.raises(psycopg.ProgrammingError):  # '%o' is no placeholder
+        target.cursor().execute(after_cursor("app.pct%off", "a%sb"), {"last": "1"})
+    with pytest.raises(_SqlState, match='"x%y" does not exist'):  # x%%y read as x%y
+        target.cursor().execute(after_cursor("app.x%%y", "k%%2"), {"last": "1"})
+    source = _WirePgSource(offline, PgDouble(*_percent_tables(pg_types=True)))
+    with pytest.raises(psycopg.ProgrammingError):
+        source.exec_driver_sql('SELECT COUNT(*) FROM "app"."pct%off"')
+    assert source.double.executed == []

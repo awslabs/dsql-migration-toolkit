@@ -45,7 +45,6 @@ from dsql_migrator.core.exporter import (
     TableExporter,
     ValueConversionError,
     ValueConverter,
-    _page_reader,
     _told_apart,
     export_rows,
     keyset_pages,
@@ -285,13 +284,24 @@ def test_the_first_refused_column_in_row_order_is_the_error_and_the_tally_up_to_
 
 
 def test_a_column_that_converts_nothing_is_never_visited() -> None:
+    class _Asked(ValueConverter):
+        def __init__(self, table: TableDef) -> None:
+            self.asked = 0
+            super().__init__(table)
+
+        def convert_value(self, column_name, value):  # noqa: ANN001, ANN201
+            self.asked += 1
+            return super().convert_value(column_name, value)
+
     table = _table([ColumnDef(name="n", mysql_type="INT"), ColumnDef(name="s", mysql_type="TEXT"),
                     ColumnDef(name="j", mysql_type="JSON"), ColumnDef(name="m", mysql_type="DECIMAL(9,2)")])
-    converter = ValueConverter(table)
-    assert converter._value_functions == {}
-    marker = object()  # any value at all passes through, as convert_row passes it
+    converter = _Asked(table)
+    # Any value at all passes through as itself, as convert_row passes it, and convert_value is
+    # never asked: a value no conversion knows would have reached it on any visit.
+    marker = object()
     assert converter.row_converter(("id", "n", "s", "j", "m"))((1, marker, marker, marker, marker)) == {
         "id": 1, "n": marker, "s": marker, "j": marker, "m": marker}
+    assert converter.asked == 0
 
 
 def test_the_postgres_converter_converts_by_position_as_it_converts_a_mapping() -> None:
@@ -362,43 +372,54 @@ class _MappingsOnly:
         return self._rows
 
 
-def _key_of_mapping(row) -> tuple:  # noqa: ANN001
-    return (row["id"],)
+class _OnePage:
+    """A source whose keyset read is one short page, ``page()``: an SQLAlchemy result or a
+    test double's mappings (any other statement reads nothing)."""
 
+    def __init__(self, page) -> None:  # noqa: ANN001
+        self._page = page
 
-def _read(result, converter) -> list:  # noqa: ANN001
-    rows, key_of, emit = _page_reader(result, ["id"], _key_of_mapping, converter)
-    return [(key_of(row), row if emit is None else emit(row)) for row in rows]
+    def execute(self, statement, parameters=None, **_kw):  # noqa: ANN001, ANN201
+        return self._page() if " LIMIT " in str(statement) else _MappingsOnly([])
 
 
 def test_only_an_sqlalchemy_result_read_for_a_row_converter_is_read_by_position() -> None:
+    # Seen through keyset_stream at the converter's own methods: row_converter (by position)
+    # or convert_row (by name, as before), the same rows either way.
     table = _table([ColumnDef(name="dt", mysql_type="DATETIME")])
     page = [{"id": 1, "dt": datetime(2024, 1, 1)}, {"id": 2, "dt": "0000-00-00 00:00:00"}]
+    converted = [{"id": 1, "dt": datetime(2024, 1, 1)}, {"id": 2, "dt": None}]
 
     def result(names=("id", "dt")):  # noqa: ANN001, ANN202
-        return IteratorResult(SimpleResultMetaData(list(names)), iter([tuple(r[n] for n in names) for r in page]))
+        return lambda: IteratorResult(
+            SimpleResultMetaData(list(names)), iter([tuple(r[n] for n in names) for r in page]))
 
+    def read(answer, converter) -> list:  # noqa: ANN001
+        return [dict(row) for row in keyset_stream(_OnePage(answer), table, batch_size=10,
+                                                   converter=converter)]
+
+    # By position for an SQLAlchemy result; by name for a test double's mappings and for
+    # columns that repeat a name.
+    for answer, counts in ((result(), (2, 0)), (lambda: _MappingsOnly(page), (0, 2)),
+                           (result(("id", "dt", "dt")), (0, 2))):
+        spy = _SpyConverter(table)
+        assert read(answer, spy) == converted
+        assert (spy.by_position, spy.by_name) == counts
+    # Columns that do not name the key: the read by name's own error.
     spy = _SpyConverter(table)
-    positional = _read(result(), spy)
-    assert (spy.by_position, spy.by_name) == (2, 0)
-    by_name = _read(_MappingsOnly(page), spy)
-    assert (spy.by_position, spy.by_name) == (2, 2)
-    assert positional == by_name == [((1,), {"id": 1, "dt": datetime(2024, 1, 1)}), ((2,), {"id": 2, "dt": None})]
+    with pytest.raises(KeyError):
+        read(result(("dt",)), spy)
+    assert spy.by_position == 0
 
-    # Read by name as before: names that repeat or lack the key, a converter without
-    # row_converter, and no converter at all (the result's own mappings, unconverted).
+    # A converter without row_converter converts by name; no converter yields the result's
+    # own mappings, unconverted.
     class _ByNameOnly:
         def convert_row(self, row):  # noqa: ANN001, ANN202
-            return dict(row)
+            return {**row, "by_name": True}
 
-    for names in (("id", "dt", "dt"), ("dt",)):
-        spy = _SpyConverter(table)
-        rows, _key_of, emit = _page_reader(result(names), ["id"], _key_of_mapping, spy)
-        assert emit == spy.convert_row and not isinstance(rows, IteratorResult)
-    rows, _key, emit = _page_reader(result(), ["id"], _key_of_mapping, _ByNameOnly())
-    assert all(isinstance(row, RowMapping) for row in rows)
-    rows, _key, emit = _page_reader(result(), ["id"], _key_of_mapping, None)
-    assert emit is None and all(isinstance(row, RowMapping) for row in rows)
+    assert read(result(), _ByNameOnly()) == [{**r, "by_name": True} for r in page]
+    rows = list(keyset_stream(_OnePage(result()), table, batch_size=10))
+    assert all(isinstance(row, RowMapping) for row in rows) and [dict(r) for r in rows] == page
 
 
 def test_a_raw_read_still_yields_the_results_mappings() -> None:

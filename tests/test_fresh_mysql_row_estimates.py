@@ -47,11 +47,7 @@ from dsql_migrator.core.introspector import (
     is_write_or_ddl,
 )
 from dsql_migrator.core.models import SourceConnectionConfig
-from dsql_migrator.core.source_dialect.mysql import (
-    MySQLSourceDialect,
-    _LIVE_TABLE_STATISTICS,
-    _caches_table_statistics,
-)
+from dsql_migrator.core.source_dialect.mysql import MySQLSourceDialect, _LIVE_TABLE_STATISTICS
 from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
 from dsql_migrator.core.watermark import (
     COMMIT,
@@ -199,7 +195,6 @@ _ESTIMATE = "SELECT table_schema, table_name, table_rows FROM information_schema
 ])
 def test_mysql_8_and_later_reads_live_statistics_with_one_session_set(version) -> None:
     session = _Session(version)
-    assert _caches_table_statistics(session) is True
     MySQLSourceDialect().prepare_estimate_session(session)
     assert session.sql == [_LIVE_TABLE_STATISTICS] and session.expiry == 0
 
@@ -207,25 +202,27 @@ def test_mysql_8_and_later_reads_live_statistics_with_one_session_set(version) -
 @pytest.mark.parametrize("version", ["5.7.44-log", "5.7.12-mysql_aurora.2.11.2", None])
 def test_mysql_5_7_or_a_connection_that_is_not_mysqls_is_sent_nothing(version) -> None:
     session = _Session(version)
-    assert _caches_table_statistics(session) is False
     MySQLSourceDialect().prepare_estimate_session(session)
     assert session.sql == []
 
 
 def test_an_unknown_version_or_another_engine_is_sent_nothing() -> None:
-    from types import SimpleNamespace
-
     from sqlalchemy.dialects.postgresql import psycopg
     from sqlalchemy.dialects.sqlite import pysqlite
 
     unknown = _Session()
     unknown.dialect = _pymysql.dialect()           # never connected: no version read yet
     assert unknown.dialect.server_version_info is None
-    others = [SimpleNamespace(dialect=d) for d in (pysqlite.dialect(), psycopg.dialect())]
-    for connection in (unknown, *others):
-        assert _caches_table_statistics(connection) is False
-    MySQLSourceDialect().prepare_estimate_session(unknown)
-    assert unknown.sql == []
+    sessions = [unknown]
+    # Another engine's connection, with the version its server reported (PostgreSQL 16 is past
+    # MySQL's 8): the engine, not the number, keeps the statement away.
+    for other, version in ((psycopg.dialect(), (16, 4)), (pysqlite.dialect(), (3, 45, 1))):
+        other.server_version_info = version
+        sessions.append(_Session())
+        sessions[-1].dialect = other
+    for session in sessions:
+        MySQLSourceDialect().prepare_estimate_session(session)
+        assert session.sql == [], session.dialect.name
 
 
 def test_a_refused_set_falls_back_to_the_cached_estimates(caplog) -> None:
