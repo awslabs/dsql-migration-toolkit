@@ -194,7 +194,13 @@ class MySqlDouble:
             )
             expr = re.sub(r"`([^`]+)` > :(\w+)", lambda m: f"_gt(row, {m[1]!r}, p[{m[2]!r}])", expr)
             expr = re.sub(r"`([^`]+)` = :(\w+)", lambda m: f"_eq(row, {m[1]!r}, p[{m[2]!r}])", expr)
-            expr = re.sub(r":(\w+)", lambda m: f"p[{m[1]!r}]", expr)
+            # The parameters left (a SET's bitmask) -- never a ':' inside a name, which is a
+            # Python string literal by now.
+            expr = re.sub(
+                r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")|:(\w+)""",
+                lambda m: m[1] or f"p[{m[2]!r}]",
+                expr,
+            )
             expr = expr.replace(" AND ", " and ").replace(" OR ", " or ").replace("1 = 0", "False")
 
             def _label(column, value):

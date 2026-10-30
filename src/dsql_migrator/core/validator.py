@@ -155,6 +155,7 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     _pg_table_identifier,
     _quote_mysql_identifier,
     _quote_mysql_table,
+    _text_mysql_table,
     build_mysql_checksum_sql,
     build_mysql_composite_boundary_sql,
     build_mysql_composite_page_sql,
@@ -222,7 +223,7 @@ def _norm_pk(value: object) -> str:
 def _source_count(connection: _SourceConnection, table_name: str) -> int:
     """Return ``COUNT(*)`` for a source table (read-only ``SELECT``)."""
     statement = text(
-        f"SELECT COUNT(*) FROM {_quote_mysql_table(table_name)}"
+        f"SELECT COUNT(*) FROM {_text_mysql_table(table_name)}"
     )
     value = connection.execute(statement).scalar()  # type: ignore[attr-defined]
     return int(value) if value is not None else 0
@@ -492,7 +493,7 @@ def _mysql_composite_pages(
     """
     key = list(table.primary_key)
     walk = dialect.keyset_walk(table, members)
-    lead_sql = dialect.quote_identifier(key[0])
+    lead_sql = dialect.text_identifier(key[0])
     lead_name = keyset_param_names(len(key))[0]
     total = rows = 0
     last: Optional[tuple] = None

@@ -981,8 +981,8 @@ def compute_pk_shard_ranges(
     pk_col = shardable_leading_int_pk(table, dialect)
     if pk_col is None or shards <= 1:
         return [(None, None)]
-    quoted_col = dialect.quote_identifier(pk_col)
-    quoted_table = dialect.quote_table(table.name)
+    quoted_col = dialect.text_identifier(pk_col)
+    quoted_table = dialect.text_table(table.name)
     only = "ONLY " if from_only else ""
     row = connection.execute(
         text(f"SELECT MIN({quoted_col}) AS lo, MAX({quoted_col}) AS hi "
@@ -1411,12 +1411,14 @@ def keyset_pages(
     # Pass the APPLIED target type per column: a source type the operator remodelled in
     # Schema Conversion (the tool's own advice for a DSQL-unsupported PG type) has to be
     # READ in a form the target column can accept, which only the dialect can decide.
+    # Every name is quoted for text() (SourceDialect.text_identifier: a ':' in a name
+    # reaches the source as written), as select_column_sql and keyset_after_sql quote theirs.
     applied_types = target_types or {}
     columns_sql = ", ".join(
         dialect.select_column_sql(column, target_type=applied_types.get(column.name))
         for column in table.columns
     )
-    table_sql = dialect.quote_table(table.name)
+    table_sql = dialect.text_table(table.name)
     # Table-QUALIFY each PK reference in ORDER BY so it resolves to the NATIVE input
     # column, never a same-name SELECT output alias. PostgreSQL resolves a bare
     # ``ORDER BY "col"`` to the matching OUTPUT column, so a text-cast PK (json/jsonb/
@@ -1429,7 +1431,7 @@ def keyset_pages(
     # MySQL (``ORDER BY `t`.`col```), which likewise then sorts by the base column rather
     # than any output alias.
     order_by_sql = ", ".join(
-        f"{table_sql}.{dialect.quote_identifier(c)}" for c in pk_columns
+        f"{table_sql}.{dialect.text_identifier(c)}" for c in pk_columns
     )
 
     # Optional range bound on the LEADING PK column (reader sharding). Applies to a
@@ -1441,7 +1443,7 @@ def keyset_pages(
     range_params: dict[str, object] = {}
     range_clauses: list[str] = []
     if pk_lower is not None or pk_upper is not None:
-        pk_sql_bound = dialect.quote_identifier(pk_columns[0])
+        pk_sql_bound = dialect.text_identifier(pk_columns[0])
         if pk_lower is not None:
             range_clauses.append(f"{pk_sql_bound} >= :pk_lower")
             range_params["pk_lower"] = pk_lower
@@ -1467,7 +1469,7 @@ def keyset_pages(
     # A key whose cursor can match the rows that read back as it again (a MySQL key whose
     # last column is a single-precision FLOAT): those rows are skipped, not a stop (G144).
     rereads = dialect.keyset_rereads_cursor(table)
-    lead_sql = dialect.quote_identifier(pk_columns[0])
+    lead_sql = dialect.text_identifier(pk_columns[0])
     lead_name = keyset_param_names(len(pk_columns))[0]
     first_where = " AND ".join(range_clauses)
     # ONLY changes the rows read, not the FROM item's name: ORDER BY still qualifies by it.

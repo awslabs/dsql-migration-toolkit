@@ -43,6 +43,7 @@ from dsql_migrator.core.source_dialect.base import (
     estimate_row_counts_query,
     keyset_param_names,
     probe_scalar,
+    text_safe,
 )
 
 # User schemas to restrict to when resolving a bare (unqualified) table's columns and no
@@ -1412,7 +1413,7 @@ def _sequence_row(
     quoted = ".".join('"' + part.replace('"', '""') + '"' for part in (schema, name))
     try:
         row = connection.execute(  # type: ignore[attr-defined]
-            text(f"SELECT last_value, is_called FROM {quoted}")
+            text(f"SELECT last_value, is_called FROM {text_safe(quoted)}")
         ).first()
     except Exception:  # noqa: BLE001 - unreadable: the statement keeps its placeholder
         return None, None
@@ -1873,7 +1874,7 @@ class PostgresSourceDialect(SourceDialect):
         # order while WHERE advances by native interval, so the exporter table-qualifies
         # the PK in ORDER BY (see keyset_stream) to keep both orderings native and gapless.
         # PostGIS geometry is out of scope (no ST_AsBinary-style case) for a first release.
-        quoted = self.quote_identifier(column.name)  # type: ignore[attr-defined]
+        quoted = self.text_identifier(column.name)  # type: ignore[attr-defined]
         # Match on the STORAGE type. A DOMAIN's format_type is the domain's own NAME, so
         # matching ``mysql_type`` alone missed a domain over jsonb/interval -- while
         # PostgreSQL still describes the result with the BASE type's OID, so psycopg
@@ -1919,7 +1920,7 @@ class PostgresSourceDialect(SourceDialect):
         # ``real`` followed by another key column passed the rest of that value's rows by,
         # silently. Untyped, the server parses the text as a float4, which is the stored
         # value.
-        primary_key = [self.quote_identifier(c) for c in table.primary_key]  # type: ignore[attr-defined]
+        primary_key = [self.text_identifier(c) for c in table.primary_key]  # type: ignore[attr-defined]
         names = keyset_param_names(len(primary_key))
         reals = {
             c.name

@@ -151,6 +151,22 @@ def keyset_param_names(key_columns: int) -> list[str]:
     return ["last"] if key_columns == 1 else [f"last_{i}" for i in range(key_columns)]
 
 
+def text_safe(sql_text: str) -> str:
+    """``sql_text`` -- a quoted name, or SQL without a bind parameter of its own -- as
+    SQLAlchemy ``text()`` must be given it for the source to receive it as written.
+
+    ``text()`` reads a ``:`` that follows a space or other punctuation and precedes a word
+    as a bind parameter, inside a quoted name too, and turns ``\\:`` into ``:``: a table,
+    column or key named ``a :b`` or ``:b`` failed the statement ("A value is required for
+    bind parameter 'b'"), one named after a parameter the statement binds (``:last``) took
+    that parameter's value, and ``a\\:b`` reached the source as ``a:b``. Each ``:`` is
+    written ``\\:``, which ``text()`` turns back into that one ``:``, so the source receives
+    the name itself; anything without a ``:`` comes out unchanged. Only for a statement run
+    through ``text()``: anywhere else the backslashes would stay.
+    """
+    return sql_text.replace(":", "\\:")
+
+
 class SourceDialect(ABC):
     """Source-engine-specific behavior for reading a migration source (read-only)."""
 
@@ -303,6 +319,16 @@ class SourceDialect(ABC):
         one identifier containing a dot.
         """
 
+    def text_identifier(self, name: str) -> str:
+        """:meth:`quote_identifier` for a statement run through SQLAlchemy ``text()``
+        (:func:`text_safe`): the source receives the name as written, a ``:`` included."""
+        return text_safe(self.quote_identifier(name))
+
+    def text_table(self, name: str) -> str:
+        """:meth:`quote_table` for a statement run through SQLAlchemy ``text()``
+        (:func:`text_safe`)."""
+        return text_safe(self.quote_table(name))
+
     @property
     @abstractmethod
     def integer_pk_types(self) -> frozenset[str]:
@@ -312,7 +338,8 @@ class SourceDialect(ABC):
     def select_column_sql(
         self, column: object, *, target_type: Optional[str] = None
     ) -> str:
-        """SELECT-list expression to read one source column (quoted, engine-specific).
+        """SELECT-list expression to read one source column (quoted, engine-specific), for
+        a statement run through SQLAlchemy ``text()`` (names by :meth:`text_identifier`).
 
         ``target_type`` is the APPLIED target column type when it is known and differs
         from the source's -- the operator may have remodelled a DSQL-unsupported type in
@@ -331,7 +358,8 @@ class SourceDialect(ABC):
         last_key: "Sequence[object]",
         members: "Mapping[str, tuple[str, tuple[str, ...]]]",
     ) -> "tuple[str, dict[str, object]]":
-        """The keyset cursor of a next page, and its bind parameters.
+        """The keyset cursor of a next page, and its bind parameters, for SQLAlchemy
+        ``text()`` (names by :meth:`text_identifier`).
 
         A predicate true for exactly the rows of ``table`` whose primary key sorts after
         ``last_key`` -- the previous page's last key as the driver returned it, one value
@@ -669,4 +697,5 @@ __all__ = [
     "probe_scalar",
     "estimate_row_counts_query",
     "keyset_param_names",
+    "text_safe",
 ]

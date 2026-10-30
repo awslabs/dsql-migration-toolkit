@@ -20,6 +20,10 @@ cursor) is executed with its parameters, so it names every identifier through
 them as they are. Either way the server receives each name exactly, ``%`` included. The
 orphan listing (:func:`build_orphan_listing_sql`) is the exception: shown to the operator
 and never run by the tool, it names them as they are, placeholders or not.
+
+A MySQL statement here runs through SQLAlchemy ``text()``, so it names every identifier
+through :func:`_text_mysql_identifier` / :func:`_text_mysql_table`: the source receives
+each name exactly, ``:`` included.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from dsql_migrator.core.mysql_zero_dates import (
     unmapped_columns,
     zero_date_mapping,
 )
+from dsql_migrator.core.source_dialect.base import text_safe
 
 # A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
 # reduce a format_type spelling to its base for a timetz classification (e.g.
@@ -86,6 +91,19 @@ def _quote_mysql_table(name: str) -> str:
     if separator and schema and obj:
         return f"{_quote_mysql_identifier(schema)}.{_quote_mysql_identifier(obj)}"
     return _quote_mysql_identifier(name)
+
+
+def _text_mysql_identifier(name: str) -> str:
+    """:func:`_quote_mysql_identifier` for the MySQL builders here, whose statements run
+    through SQLAlchemy ``text()`` (:func:`~dsql_migrator.core.source_dialect.base.
+    text_safe`): a ``:`` in the name reaches the source as written."""
+    return text_safe(_quote_mysql_identifier(name))
+
+
+def _text_mysql_table(name: str) -> str:
+    """:func:`_quote_mysql_table` for a statement run through ``text()``
+    (:func:`_text_mysql_identifier`)."""
+    return text_safe(_quote_mysql_table(name))
 
 
 def _pg_table_identifier(name: str) -> "sql.Identifier":
@@ -470,7 +488,7 @@ def _mysql_checksum_expr(column: "ColumnDef", *, key: bool = False) -> Optional[
     stored, as Full Load leaves it (G154, G187,
     :func:`~dsql_migrator.core.mysql_zero_dates.zero_date_mappings`).
     """
-    ident = _quote_mysql_identifier(column.name)
+    ident = _text_mysql_identifier(column.name)
     kind = _checksum_kind(column)
     mapping = None if key else zero_date_mapping(column)
     value = mapping.sql(ident) if mapping is not None else ident
@@ -800,7 +818,7 @@ def build_mysql_checksum_sql(table: TableDef) -> str:
     FLOAT/DOUBLE and JSON columns are omitted (``_mysql_checksum_expr`` returns
     ``None`` -- neither has a byte-identical cross-engine text form).
     """
-    table_sql = _quote_mysql_table(table.name)
+    table_sql = _text_mysql_table(table.name)
     return (
         f"SELECT COALESCE(SUM({_mysql_row_token(table)}), 0) FROM {table_sql}"
     )
@@ -842,8 +860,8 @@ def build_mysql_pk_token_sql(table: TableDef, pk_column: str) -> str:
     column's zero or invalid date is not mapped (G154,
     :func:`~dsql_migrator.core.mysql_zero_dates.zero_date_mappings`).
     """
-    pk_sql = _quote_mysql_identifier(pk_column)
-    table_sql = _quote_mysql_table(table.name)
+    pk_sql = _text_mysql_identifier(pk_column)
+    table_sql = _text_mysql_table(table.name)
     return (
         f"SELECT {pk_sql} AS pk, {_mysql_row_token(table)} AS tok FROM {table_sql} "
         f"ORDER BY {pk_sql} LIMIT :sample_size"
@@ -884,15 +902,15 @@ def build_pg_pk_token_sql(
 
 def build_mysql_pk_first_page_sql(table: TableDef, pk_column: str) -> str:
     """First keyset page of source primary keys (ascending, bounded by ``:page``)."""
-    pk_sql = _quote_mysql_identifier(pk_column)
-    table_sql = _quote_mysql_table(table.name)
+    pk_sql = _text_mysql_identifier(pk_column)
+    table_sql = _text_mysql_table(table.name)
     return f"SELECT {pk_sql} AS pk FROM {table_sql} ORDER BY {pk_sql} LIMIT :page"
 
 
 def build_mysql_pk_next_page_sql(table: TableDef, pk_column: str) -> str:
     """Subsequent keyset page of source primary keys after ``:last`` (ascending)."""
-    pk_sql = _quote_mysql_identifier(pk_column)
-    table_sql = _quote_mysql_table(table.name)
+    pk_sql = _text_mysql_identifier(pk_column)
+    table_sql = _text_mysql_table(table.name)
     return (
         f"SELECT {pk_sql} AS pk FROM {table_sql} WHERE {pk_sql} > :last "
         f"ORDER BY {pk_sql} LIMIT :page"
@@ -1036,7 +1054,7 @@ def _mysql_keyset_key(table: TableDef, pk_column: str) -> str:
     member by member, which its composite keys of any size need -- see
     source_dialect/mysql.py.)
     """
-    pk_sql = _quote_mysql_identifier(pk_column)
+    pk_sql = _text_mysql_identifier(pk_column)
     column = next((c for c in table.columns if c.name == pk_column), None)
     if column is not None and mysql_enum_set_members(column.mysql_type) is not None:
         return f"CAST({pk_sql} AS UNSIGNED)"
@@ -1064,8 +1082,8 @@ def _mysql_page_boundary(table: TableDef, pk_column: str) -> str:
 
 def build_mysql_page_checksum_first_sql(table: TableDef, pk_column: str) -> str:
     """First keyset page of the MySQL checksum: ``(sub_sum, last_pk, row_count)``."""
-    pk_sql = _quote_mysql_identifier(pk_column)
-    table_sql = _quote_mysql_table(table.name)
+    pk_sql = _text_mysql_identifier(pk_column)
+    table_sql = _text_mysql_table(table.name)
     return (
         f"SELECT COALESCE(SUM(page_tok), 0), {_mysql_page_boundary(table, pk_column)}, "
         "COUNT(*) FROM ("
@@ -1077,9 +1095,9 @@ def build_mysql_page_checksum_first_sql(table: TableDef, pk_column: str) -> str:
 
 def build_mysql_page_checksum_next_sql(table: TableDef, pk_column: str) -> str:
     """Subsequent keyset page of the MySQL checksum after ``:last`` (ascending)."""
-    pk_sql = _quote_mysql_identifier(pk_column)
+    pk_sql = _text_mysql_identifier(pk_column)
     key_sql = _mysql_keyset_key(table, pk_column)
-    table_sql = _quote_mysql_table(table.name)
+    table_sql = _text_mysql_table(table.name)
     return (
         f"SELECT COALESCE(SUM(page_tok), 0), {_mysql_page_boundary(table, pk_column)}, "
         "COUNT(*) FROM ("
@@ -1321,9 +1339,9 @@ def _pg_qualified_order(table_sql: sql.Composable, key: Sequence[str]) -> sql.Co
 
 def _mysql_key_order(table: TableDef) -> str:
     """```db`.`t`.`k0`, `db`.`t`.`k1```: the primary key, each column table-qualified."""
-    table_sql = _quote_mysql_table(table.name)
+    table_sql = _text_mysql_table(table.name)
     return ", ".join(
-        f"{table_sql}.{_quote_mysql_identifier(column)}" for column in table.primary_key
+        f"{table_sql}.{_text_mysql_identifier(column)}" for column in table.primary_key
     )
 
 
@@ -1336,7 +1354,7 @@ def build_mysql_composite_page_sql(table: TableDef, where_sql: str = "") -> str:
     or ``<lead> = :last_0`` for the first page of a walked ENUM member), embedded
     verbatim; empty for the first page. The token is :func:`_mysql_row_token`.
     """
-    table_sql = _quote_mysql_table(table.name)
+    table_sql = _text_mysql_table(table.name)
     where = f" WHERE {where_sql}" if where_sql else ""
     return (
         "SELECT COALESCE(SUM(ck_tok), 0), COUNT(*) FROM ("
@@ -1354,9 +1372,9 @@ def build_mysql_composite_boundary_sql(table: TableDef, where_sql: str = "") -> 
     The key columns come back as the driver returns them, as the Full Load reader binds
     them to its next cursor.
     """
-    table_sql = _quote_mysql_table(table.name)
+    table_sql = _text_mysql_table(table.name)
     where = f" WHERE {where_sql}" if where_sql else ""
-    keys = ", ".join(_quote_mysql_identifier(column) for column in table.primary_key)
+    keys = ", ".join(_text_mysql_identifier(column) for column in table.primary_key)
     return (
         f"SELECT {keys} FROM {table_sql}{where} "
         f"ORDER BY {_mysql_key_order(table)} LIMIT 1 OFFSET :off"

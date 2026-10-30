@@ -183,21 +183,18 @@ class SessionSourceProbe:
         """
         from sqlalchemy import bindparam
 
+        from dsql_migrator.core.source_dialect import dialect_for
+
         if not columns:
             return {}
         # Identifiers cannot be bind parameters; the names come from the tool's own
-        # introspected inventory (never from user text), and are quoted for the engine.
+        # introspected inventory (never from user text), and are quoted by the source
+        # dialect, for the engine and for text(): an embedded quote doubled, a ':' reaching
+        # the source as written.
         is_postgres = self._config.source_type is SourceType.POSTGRES
-        if is_postgres:
-            schema, _, obj = table_name.partition(".")
-            qualified = (
-                f'"{schema}"."{obj}"' if obj else f'"{table_name}"'
-            )
-            quote = lambda name: f'"{name}"'  # noqa: E731
-        else:
-            schema, _, obj = table_name.partition(".")
-            qualified = f"`{schema}`.`{obj}`" if obj else f"`{table_name}`"
-            quote = lambda name: f"`{name}`"  # noqa: E731
+        dialect = dialect_for(self._config.source_type)
+        qualified = dialect.text_table(table_name)
+        quote = dialect.text_identifier
 
         answer: dict[str, bool] = {}
         owns_engine = engine is None

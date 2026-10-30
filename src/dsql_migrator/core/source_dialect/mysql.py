@@ -31,6 +31,7 @@ from dsql_migrator.core.source_dialect.base import (
     estimate_row_counts_query,
     keyset_param_names,
     probe_scalar,
+    text_safe,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -500,7 +501,7 @@ class MySQLSourceDialect(SourceDialect):
         # what Debezium delivers for CDC) aliased back to the name; others read as-is.
         from dsql_migrator.core.converter import is_spatial_mysql_type
 
-        quoted = self.quote_identifier(column.name)  # type: ignore[attr-defined]
+        quoted = self.text_identifier(column.name)  # type: ignore[attr-defined]
         if is_spatial_mysql_type(column.mysql_type):  # type: ignore[attr-defined]
             return f"ST_AsBinary({quoted}) AS {quoted}"
         return quoted
@@ -632,7 +633,7 @@ class MySQLSourceDialect(SourceDialect):
         equal: list[str] = []
         terms: list[str] = []
         for position, (column, name, value) in enumerate(zip(primary_key, names, last_key)):
-            quoted = self.quote_identifier(column)
+            quoted = self.text_identifier(column)
             if not (walked and position == 0):
                 after = _key_after_sql(quoted, column, members.get(column), name, value, params)
                 if after is not None:
@@ -646,7 +647,7 @@ class MySQLSourceDialect(SourceDialect):
             return terms[0], params
         cursor = "(" + " OR ".join(f"({term})" for term in terms) + ")"
         if walked:
-            cursor = f"{self.quote_identifier(primary_key[0])} = :{names[0]} AND {cursor}"
+            cursor = f"{self.text_identifier(primary_key[0])} = :{names[0]} AND {cursor}"
         return cursor, params
 
     def keyset_rereads_cursor(self, table: object) -> bool:
@@ -809,7 +810,8 @@ class MySQLSourceDialect(SourceDialect):
         statement = "SHOW GRANTS"
         roles_active = bool(roles) and str(roles).strip().upper() != "NONE"
         if roles_active:
-            statement = f"SHOW GRANTS FOR CURRENT_USER() USING {roles}"
+            # The server's own quoted role list: a ':' can only be inside a quoted name.
+            statement = f"SHOW GRANTS FOR CURRENT_USER() USING {text_safe(str(roles))}"
         try:
             rows = connection.execute(text(statement)).fetchall()  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - unknown: claim nothing

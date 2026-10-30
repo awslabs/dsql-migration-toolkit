@@ -1881,7 +1881,7 @@ def add_table_to_publication(
     try:
         _run_write(
             connection,
-            f'ALTER PUBLICATION "{ident}" ADD TABLE ONLY {dialect.quote_table(table)}',
+            f'ALTER PUBLICATION "{ident}" ADD TABLE ONLY {dialect.text_table(table)}',
             action=(
                 f'added {table} to publication "{ident}" (selected after the Full Load; '
                 "its changes stream from now on)"
@@ -2031,7 +2031,7 @@ def create_publication(
     membership = _publication_membership(connection, name)
     if membership is None:
         dialect = dialect_for(SourceType.POSTGRES)
-        quoted = ", ".join(f"ONLY {dialect.quote_table(t)}" for t in tables)
+        quoted = ", ".join(f"ONLY {dialect.text_table(t)}" for t in tables)
         ident = _sanitize(name)  # allowlisted charset; also the literal in the DDL
         try:
             _run_write(
@@ -2160,7 +2160,7 @@ def set_replica_identity_full(
     for table in tables:
         _run_write(
             connection,
-            f"ALTER TABLE {dialect.quote_table(table)} REPLICA IDENTITY FULL",
+            f"ALTER TABLE {dialect.text_table(table)} REPLICA IDENTITY FULL",
             action=f"setting REPLICA IDENTITY FULL on {table} (re-keyed CDC before-image)",
             on_log=on_log,
         )

@@ -235,7 +235,7 @@ def _count_table_rows(
 ) -> int:
     """Return exact ``COUNT(*)`` for ``table`` (full scan; used only when an
     exact count is explicitly required, not during watermark capture)."""
-    statement = text(f"SELECT COUNT(*) FROM {dialect.quote_table(table)}")
+    statement = text(f"SELECT COUNT(*) FROM {dialect.text_table(table)}")
     result = connection.execute(statement)
     value = result.scalar()
     return int(value) if value is not None else 0
@@ -289,8 +289,8 @@ def max_pk_source(
             out[table] = None
             continue
         try:
-            quoted = dialect.quote_table(table)
-            col = dialect.quote_identifier(pk)
+            quoted = dialect.text_table(table)
+            col = dialect.text_identifier(pk)
             only = ""
             if postgres:
                 from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
