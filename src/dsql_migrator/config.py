@@ -311,11 +311,12 @@ class AppConfig(BaseModel):
         description=(
             "Full Load (Step 3) table-level parallelism: how many tables, or parts of a "
             "large table, load concurrently. Each INSERT batch in flight holds one "
-            "pooled DSQL connection, and the tool caps them: at most 2 per key range of "
-            "a table (at least 4 per table or part), at most full_load_batch_parallelism "
-            "per table or part, at most 128 per run. A run's DSQL connections are "
-            "therefore at most its batches in flight (<= 128) plus one per running table "
-            "or part (its short catalog reads and row count). Bounded (<=16). Config key: "
+            "pooled DSQL connection, and the tool caps them: at most "
+            "full_load_batch_parallelism per table or part (within that, up to 2 per key "
+            "range it is read in, never fewer than 4 unless full_load_batch_parallelism "
+            "is lower), at most 128 per run. A run's DSQL connections are therefore at "
+            "most its batches in flight (<= 128) plus one per running table or part (its "
+            "short catalog reads and row count). Bounded (<=16). Config key: "
             "DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM."
         ),
     )
@@ -326,12 +327,13 @@ class AppConfig(BaseModel):
         description=(
             "Full Load per-table batch parallelism: at most this many batched "
             "INSERT ... ON CONFLICT statements in flight per table, or part of a split "
-            "table (at most 2 per key range it reads, at least 4 per table or part), each "
-            "on its own pooled DSQL connection; the run keeps at most 128 in flight over "
-            "all its tables. A key range of an Aurora DSQL table takes about 20,000 rows a "
-            "second whatever the batches in flight, so more of them only add commit "
-            "latency and Aurora DSQL compute cost there, not rows a second. Bounded "
-            "(<=32). Config key: DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM."
+            "table (within that, up to 2 per key range it is read in, never fewer than 4 "
+            "unless this is lower), each on its own pooled DSQL connection; the run keeps "
+            "at most 128 in flight over all its tables. A key range of an Aurora DSQL "
+            "table takes about 20,000 rows a second whatever the batches in flight, so "
+            "more of them only add commit latency and Aurora DSQL compute cost there, not "
+            "rows a second. Bounded (<=32). Config key: "
+            "DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM."
         ),
     )
     full_load_batch_rows: int = Field(
@@ -679,8 +681,9 @@ TUNABLE_KNOBS: tuple[TunableKnob, ...] = (
         "FULL_LOAD_BATCH_PARALLELISM",
         "Full Load",
         "Batches per table",
-        "Row batches in flight: at most this many per table (and at most 2 per key range, "
-        "at least 4 per table or part), each on its own Aurora DSQL connection.",
+        "Row batches in flight: at most this many per table or part (within that, up to 2 "
+        "per key range it is read in, never fewer than 4 unless this setting is lower), "
+        "each on its own Aurora DSQL connection.",
     ),
     TunableKnob(
         "full_load_batch_rows",

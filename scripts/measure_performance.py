@@ -43,8 +43,9 @@ Two subcommands:
               --inventory-order starts the tables in inventory order instead of the
               largest first, the other arm of the start-order A/B; --range-in-flight /
               --in-flight-budget set the INSERT batches in flight at most per key
-              range (2, at least 4 per table or part) and per run (128) for the
-              in-flight A/B, and the report says which caps applied and each table's.
+              range (2, never fewer than 4 per table or part unless
+              --batch-parallelism is lower) and per run (128) for the in-flight A/B,
+              and the report says which caps applied and each table's.
               The loader puts a recreated table's secondary indexes on the empty table
               before its rows and waits (bounded) for their builds (P4d);
               --indexes-after-load submits them after every table's data instead, as
@@ -808,9 +809,10 @@ def _index_order() -> str:
 
 def _in_flight_caps() -> dict:
     """The INSERT batches the loader keeps in flight at most per key range and per run
-    (P3), as it reads them now, and the floor a table or part keeps whatever its ranges:
-    the product's 2, 4 and 128 unless --range-in-flight / --in-flight-budget set its seams
-    to an integer >= 1 (--range-in-flight replaces the per-range cap only)."""
+    (P3), as it reads them now, and the floor a table or part keeps whatever its ranges
+    unless Batches per table is lower: the product's 2, 4 and 128 unless --range-in-flight
+    / --in-flight-budget set its seams to an integer >= 1 (--range-in-flight replaces the
+    per-range cap only)."""
     from dsql_migrator.ui.data_migration import _full_load_engine as engine
 
     return {"per_range": engine._range_in_flight(), "unit_floor": engine._UNIT_IN_FLIGHT_FLOOR,
@@ -997,9 +999,11 @@ def cmd_full_load(args) -> int:
             )
 
     caps = _in_flight_caps()
+    # The floor holds unless Batches per table (bp) is lower: say what applies at this bp.
+    unit_floor = min(caps["unit_floor"], args.batch_parallelism)
     log(f"Full Load '{schema}' ({len(tables)} tables) at "
         f"tp={args.table_parallelism} bp={args.batch_parallelism} (in flight <= "
-        f"{caps['per_range']} per key range (at least {caps['unit_floor']} per table or "
+        f"{caps['per_range']} per key range (at least {unit_floor} per table or "
         f"part), {caps['run_budget']} per run)"
         f"{' as Full load + CDC' if cdc_mode else ''}"
         f"{' in inventory order' if inventory_order else ''}"
@@ -1293,8 +1297,10 @@ def _log_full_load_summary(report: dict) -> None:
         f"at tp={report['table_parallelism']} bp={report['batch_parallelism']}")
     ifl = report.get("in_flight") or {}
     if ifl:
+        # The floor holds unless Batches per table is lower: say what applied at this one.
+        unit_floor = min(ifl.get("unit_floor"), report["batch_parallelism"])
         log(f"in flight: at most {ifl.get('per_range')} per key range (at least "
-            f"{ifl.get('unit_floor')} per table or part), {report['batch_parallelism']} per "
+            f"{unit_floor} per table or part), {report['batch_parallelism']} per "
             f"table or part, {ifl.get('run_budget')} per run")
     if run:
         cores = run.get("worker_cores")
@@ -1554,9 +1560,9 @@ def main() -> int:
                          "value >= 2 reads them as parts from separate snapshots")
     fl.add_argument("--range-in-flight", type=int, default=None, metavar="N",
                     help="INSERT batches in flight at most per key range of a table "
-                         "(default: the loader's 2; still at least 4 and at most "
-                         "--batch-parallelism per table or part): the R arm of the "
-                         "in-flight A/B")
+                         "(default: the loader's 2; a table or part still keeps at most "
+                         "--batch-parallelism and, unless that is lower, at least 4): "
+                         "the R arm of the in-flight A/B")
     fl.add_argument("--in-flight-budget", type=int, default=None, metavar="N",
                     help="INSERT batches in flight at most per run, divided among the "
                          "worker processes (default: the loader's 128)")

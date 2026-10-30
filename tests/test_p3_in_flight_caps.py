@@ -711,6 +711,21 @@ def test_the_flags_set_the_loaders_seams_for_the_run(mp, monkeypatch, tmp_path):
         "per_range": 2, "unit_floor": 4, "run_budget": 64}
 
 
+def test_below_the_floor_the_harness_says_the_floor_that_applied(mp, monkeypatch,  # noqa: F811
+                                                                 tmp_path) -> None:
+    # Batches per table 2 keeps every unit at 2 (the rule's floor of 4 does not raise it):
+    # the run's line and its summary say 2, not "at least 4" beside "2 per table or part".
+    args, seen, _ = _command_doubles(mp, monkeypatch, tmp_path)
+    args.batch_parallelism = 2
+    assert mp.cmd_full_load(args) == 0
+    assert engine._unit_in_flight(2, 1, None) == 2
+    assert any("bp=2 (in flight <= 2 per key range (at least 2 per table or part), 128 per "
+               "run)" in line for line in seen["log"]), seen["log"]
+    assert any("in flight: at most 2 per key range (at least 2 per table or part), 2 per "
+               "table or part, 128 per run" in line for line in seen["log"]), seen["log"]
+    assert not any("at least 4" in line for line in seen["log"]), seen["log"]
+
+
 def test_the_report_carries_each_tables_ranges_and_cap(mp) -> None:  # noqa: F811
     board = LoadStatsBoard()
     board.record("perf.a", None, _shaped(1, 4, batches=2), final=True)
@@ -753,8 +768,12 @@ def test_the_settings_notice_names_the_caps_the_loader_applies(monkeypatch) -> N
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
     blob = " ".join(ui.texts)
-    assert ("Batches in flight are capped at 2 per key range (at least 4 per table or "
-            "part) and 128 per run") in blob
+    # The floor comes with its exception: Batches per table 1-3 keeps fewer than 4, so a bare
+    # "at least 4 per table or part" contradicted "never exceeds its Batches per table".
+    assert ("Batches in flight are capped at 2 per key range (never fewer than 4 per table "
+            "or part unless Batches per table is lower) and 128 per run") in blob
+    assert "a table also never exceeds its Batches per table setting" in blob
+    assert "at least 4" not in blob
     assert "4 per key range" not in blob
     # The live measurement: one key range writes about 20K rows/s however many batches are
     # in flight; more of them only cost commit latency and Aurora DSQL compute.
@@ -767,21 +786,27 @@ def test_the_settings_notice_names_the_caps_the_loader_applies(monkeypatch) -> N
     monkeypatch.setenv(_BUDGET_SEAM, "64")
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
-    assert ("Batches in flight are capped at 8 per key range (at least 4 per table or "
-            "part) and 64 per run") in " ".join(ui.texts)
+    assert ("Batches in flight are capped at 8 per key range (never fewer than 4 per table "
+            "or part unless Batches per table is lower) and 64 per run") in " ".join(ui.texts)
 
 
 def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:
-    # The numbers are the loader's: a description that kept an old cap fails here.
-    per_range = f"at most {engine._RANGE_IN_FLIGHT} per key range"
-    floor = f"at least {engine._UNIT_IN_FLIGHT_FLOOR} per table or part"
-    assert (per_range, floor) == ("at most 2 per key range", "at least 4 per table or part")
+    # The numbers are the loader's: a description that kept an old cap fails here. The floor
+    # is stated with its exception (Batches per table below it binds), never on its own.
+    per_range = f"up to {engine._RANGE_IN_FLIGHT} per key range it is read in"
+    floor = f"never fewer than {engine._UNIT_IN_FLIGHT_FLOOR} unless"
+    assert (per_range, floor) == ("up to 2 per key range it is read in",
+                                  "never fewer than 4 unless")
     fields = AppConfig.model_fields
     batches = fields["full_load_batch_parallelism"].description
     tables = fields["full_load_table_parallelism"].description
     for text in (batches, tables):
         assert per_range in text and floor in text, text
+        assert "at least 4" not in text, text
         assert "at most 4 per key range" not in text and "keeps at most 4" not in text
+    assert "never fewer than 4 unless this is lower" in batches
+    assert "never fewer than 4 unless full_load_batch_parallelism is lower" in tables
+    assert "at most full_load_batch_parallelism per table or part (within that" in tables
     assert "at most this many" in batches
     assert "at most 128" in batches
     # What more in flight costs, as measured live: commit latency and compute, no rows/s --
@@ -797,8 +822,9 @@ def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:
     assert "parts of a large table" in tables and "at most 128 per run" in tables
     assert "x full_load_batch_parallelism" not in tables
     knobs = {k.field: k for k in TUNABLE_KNOBS}
-    assert f"at most this many per table (and {per_range}, {floor})" in (
-        knobs["full_load_batch_parallelism"].description)
+    assert (f"at most this many per table or part (within that, {per_range}, {floor} this "
+            "setting is lower)") in knobs["full_load_batch_parallelism"].description
+    assert "at least 4" not in knobs["full_load_batch_parallelism"].description
     assert "parts of a large table" in knobs["full_load_table_parallelism"].description
     # The OCC-exhaustion hint names the two Settings knobs.
     from dsql_migrator.core.target_connection import target_error_hint
@@ -807,3 +833,32 @@ def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:
     error.sqlstate = "40001"  # type: ignore[attr-defined]
     hint = target_error_hint(error)
     assert "Lower Tables in parallel or Batches per table and re-run" in hint
+
+
+def test_what_the_texts_claim_holds_for_every_batches_per_table() -> None:
+    # The knob text, the two descriptions, the Settings notice and the docs claim three
+    # bounds: at most Batches per table per table or part; within that, up to R per key
+    # range it is read in; never fewer than F unless Batches per table is lower. They used to
+    # contradict themselves below F ("at least 4" beside "at most this many" = 2). Each claim
+    # is the rule's for every value the setting takes, every Tables in parallel (the share of
+    # the run's budget it gives a unit, or none on the thread path) and every count of ranges.
+    knobs = {k.field: k for k in TUNABLE_KNOBS}
+    bp_knob = knobs["full_load_batch_parallelism"]
+    tp_knob = knobs["full_load_table_parallelism"]
+    assert (bp_knob.minimum, bp_knob.maximum, tp_knob.minimum, tp_knob.maximum) == (1, 32, 1, 16)
+    r, f = engine._RANGE_IN_FLIGHT, engine._UNIT_IN_FLIGHT_FLOOR
+    shares = {None} | {
+        engine._in_flight_share(tp) for tp in range(tp_knob.minimum, tp_knob.maximum + 1)
+    }
+    checked = 0
+    for bp in range(bp_knob.minimum, bp_knob.maximum + 1):
+        for share in shares:
+            for k in range(1, engine._MAX_READER_RANGES + 1):
+                cap = engine._unit_in_flight(bp, k, share)
+                assert cap <= bp, (bp, share, k, cap)  # at most this many
+                assert cap <= max(f, r * k), (bp, share, k, cap)  # up to R a range, or F
+                assert cap >= min(f, bp), (bp, share, k, cap)  # F unless the setting is lower
+                checked += 1
+    assert checked == 32 * len(shares) * engine._MAX_READER_RANGES
+    # Below the floor the setting binds; from it, the floor does for one or two ranges.
+    assert [engine._unit_in_flight(bp, 1, None) for bp in (1, 2, 3, 4, 8)] == [1, 2, 3, 4, 4]

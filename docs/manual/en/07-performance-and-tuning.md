@@ -31,7 +31,7 @@ it:
 |---|---|
 | Write conflicts are detected at commit, and the losing transaction fails with `40001` (there are no row locks) | Keeps every write transaction small and idempotent (a Full Load batch or CDC chunk is at most 3,000 rows, written by primary key), so a re-run is cheap and safe |
 | A transaction holds at most 3,000 rows and 10 MiB, runs at most 5 minutes, and carries one DDL | Batches to at most 3,000 rows and an 8 MiB byte budget, and runs one DDL per transaction |
-| Storage is partitioned by primary key, so a primary-key-ordered stream of inserts goes to one key range at a time: measured, about 20,000 rows/s whatever the batch size or the batches in flight | Reads a large table in primary-key ranges, so its writes go to several key ranges at once, and caps the batches in flight at 2 per key range (at least 4 per table or part) and 128 per run: more would only wait (§7.2) |
+| Storage is partitioned by primary key, so a primary-key-ordered stream of inserts goes to one key range at a time: measured, about 20,000 rows/s whatever the batch size or the batches in flight | Reads a large table in primary-key ranges, so its writes go to several key ranges at once, and caps the batches in flight at 2 per key range (never fewer than 4 per table or part unless *Batches per table* is lower) and 128 per run: more would only wait (§7.2) |
 | `CREATE INDEX ASYNC` builds an index in the background | Creates a table's secondary indexes while it is empty, before any row: Schema Conversion's apply does, and a **Drop & reload** does again and waits up to 10 minutes for the builds before loading. Measured, an index builds far faster on the empty table, so the load and its index builds end sooner (§7.5) |
 | IAM tokens last about 15 minutes, and connections end after 60 | Renews the token before it expires, and at once if Aurora DSQL refuses it, so an hours-long load or CDC stream never stalls on authentication |
 | There is no logical-replication slot to target | Copies with its own bulk loader (keyset streaming: resumable, bounded memory), then streams changes through Debezium → MSK → a custom sink; Kafka buffers the changes, so the sink can fall behind during a conflict burst without losing events |
@@ -109,7 +109,7 @@ measurements in §7.5.
 | Setting (env var) | Default | Bound | Effect |
 |---|---|---|---|
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | How many tables, or parts of a large table, load at once: one worker process and one source connection each. Set it to the task's vCPU count for a large run. |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | Batches in flight per table or part, each on its own Aurora DSQL connection. The tool also caps them at 2 per key range (at least 4 per table or part) and 128 per run, so for a table read in one or two key ranges a value above 4 changes nothing. |
+| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | At most this many batches in flight per table or part, each on its own Aurora DSQL connection. Within that, the tool keeps up to 2 per key range it is read in, never fewer than 4 unless this is lower (and at most 128 per run), so for a table read in one or two key ranges a value above 4 changes nothing. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | Rows per batched write (hard-capped at DSQL's 3000-row limit). |
 | `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0` (automatic) | ≤ 32 | How many primary-key ranges (K) a **large** table is read and written in ([§3.8](03-full-load.md#38-parallel-loading)). `0`: one range per 2,500,000 estimated rows from 5,000,000, at most 32; `1`: off; `2`–`32`: exactly that many. Needs *Tables in parallel* above 1 and an integer leading primary-key column. Also *Reader shards per large table* in **Settings → Full Load**. |
 | `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | 1000000 | — | A table must have at least this many (estimated) rows to be split (automatic also needs 5,000,000); smaller tables use one reader. |
@@ -144,12 +144,13 @@ measurements in §7.5.
 > past one core, use the separate-snapshot parts above.
 
 > **Connection-quota guardrail.** A run's Aurora DSQL connections are at most its batches
-> in flight, which the tool caps at 2 per key range (at least 4 per table or part) and 128
-> per run, plus one per running table or part. DSQL allows up to **10,000 connections per
-> cluster** but only **100 new connections/second**, so the caps keep a run well within the
-> quota. More batches in flight than the key ranges absorb add only commit latency and
-> Aurora DSQL compute cost (`ComputeDPU`), not rows/s: 4 per key range instead of 2 about
-> doubled both at the same rows/s (§7.5).
+> in flight, which the tool caps at 2 per key range (never fewer than 4 per table or part
+> unless *Batches per table* is lower) and 128 per run, plus one per running table or part.
+> DSQL allows up to **10,000 connections per cluster** but only **100 new
+> connections/second**, so the caps keep a run well within the quota. More batches in
+> flight than the key ranges absorb add only commit latency and Aurora DSQL compute cost
+> (`ComputeDPU`), not rows/s: 4 per key range instead of 2 about doubled both at the same
+> rows/s (§7.5).
 
 ### Validation
 
@@ -426,13 +427,13 @@ What they, and smaller runs on a 4 vCPU task with `db.r7g.large` sources, show:
   same rows/s. An 80M-row PostgreSQL table read in 31–32 key ranges, two per process,
   loaded at about 150,000 rows/s with 2 batches in flight per range as with 4, at about
   half the commit latency (1.4–1.6 s against 2.8 s) and half the `ComputeDPU` (`TotalDPU`
-  per row about 5% lower); so the tool keeps 2 per key range and at least 4 per table or
-  part: one key range reached its 20,000 rows/s with 4. Spread over 4 key ranges, a
-  10M-row table loaded at about 37,000–40,000 rows/s overall (54,000–60,000 at its peak),
-  and two such tables, one per engine, at 127,000 together and still rising. Against the
-  ~20,000 rows/s of one key range, the 150M-row table above loaded about 10× faster on
-  PostgreSQL and 8× on MySQL in parts (overall), and 2.8× on MySQL in one session
-  (steady).
+  per row about 5% lower); so the tool keeps up to 2 per key range, never fewer than 4 per
+  table or part unless *Batches per table* is lower: one key range reached its 20,000
+  rows/s with 4. Spread over 4 key ranges, a 10M-row table loaded at about 37,000–40,000
+  rows/s overall (54,000–60,000 at its peak), and two such tables, one per engine, at
+  127,000 together and still rising. Against the ~20,000 rows/s of one key range, the
+  150M-row table above loaded about 10× faster on PostgreSQL and 8× on MySQL in parts
+  (overall), and 2.8× on MySQL in one session (steady).
 - **Secondary indexes go on the empty table.** With 25 secondary indexes over 8.5M rows
   (MySQL), a Drop & reload that created them before the rows ended in 512 s end to end,
   against 873 s with the indexes built after the load. The rows loaded more slowly into
@@ -472,8 +473,8 @@ The knobs above are also editable **in the UI** without a restart: the **Setting
   *the next Start CDC*):
   - **Full Load**: *Tables in parallel*, *Batches per table*, *Rows per batch*, *Reader
     shards per large table* and *Source-load throttle (max Threads_running)*, under the
-    notice *Batches in flight are capped at 2 per key range (at least 4 per table or part)
-    and 128 per run*;
+    notice *Batches in flight are capped at 2 per key range (never fewer than 4 per table
+    or part unless Batches per table is lower) and 128 per run*;
   - **CDC**: *Sink compute (MCU)*;
   - **Validation**: *Tables in parallel*.
 - an **Activity log** tab — everything about the one activity/audit log in one place: set

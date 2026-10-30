@@ -130,13 +130,18 @@ needs those prerequisites (see Q12).
 
 Yes, but the defaults already apply what the live measurements found: a large table is
 read and written in primary-key ranges, and the batches in flight are capped at 2 per key
-range (at least 4 per table or part) and 128 per run, so a run's DSQL connections stay
-well within the cluster's quota. The setting to raise for a large run is
-`DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` (*Tables in parallel*, default 4): set it to
-the task's vCPU count, or lower it to protect a busy source. `…_BATCH_PARALLELISM`
-(batches in flight per table, default 8) and `…_BATCH_ROWS` (rows per write, default
-2000, hard-capped at DSQL's 3000) rarely need a change. See
-[Chapter 7 §7.2](07-performance-and-tuning.md#72-tuning-parallelism).
+range (never fewer than 4 per table or part unless *Batches per table* is lower) and 128
+per run, so a run's DSQL connections stay well within the cluster's quota. The setting to
+raise for a large run is `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM`
+(*Tables in parallel*, default 4): set it to the task's vCPU count, or lower it to protect
+a busy source. `…_BATCH_PARALLELISM` (batches in flight per table, default 8) and
+`…_BATCH_ROWS` (rows per write, default 2000, hard-capped at DSQL's 3000) rarely need a
+change. An out-of-bounds or non-integer value is refused, not ignored, and a changed
+environment variable takes effect only after a restart (on Fargate, a redeploy); a change
+made in **Settings → Full Load** applies to the next run without a restart, and a restart
+resets it. See the README's
+[environment-variable reference](../../../README.md#configuration-advanced--usually-no-need-to-touch)
+and [Chapter 7 §7.2](07-performance-and-tuning.md#72-tuning-parallelism).
 
 **Q11. Why does raising parallelism sometimes not speed things up?**
 

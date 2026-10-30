@@ -20,6 +20,8 @@ fails here until it mirrors the English one.
 from __future__ import annotations
 
 import inspect
+import os
+import re
 
 import pytest
 
@@ -85,8 +87,8 @@ def test_the_in_flight_caps_are_the_settings_notice(lang: str, monkeypatch) -> N
     _render_tuning_tab("Full Load", ui)
     header = (
         f"Batches in flight are capped at {engine._range_in_flight()} per key range "
-        f"(at least {engine._UNIT_IN_FLIGHT_FLOOR} per table or part) and "
-        f"{engine._run_in_flight_budget()} per run"
+        f"(never fewer than {engine._UNIT_IN_FLIGHT_FLOOR} per table or part unless Batches "
+        f"per table is lower) and {engine._run_in_flight_budget()} per run"
     )
     assert header in " ".join(ui.texts)
     assert _has(lang, _page(lang, _P07), header), lang
@@ -97,19 +99,32 @@ def test_the_in_flight_caps_are_the_settings_notice(lang: str, monkeypatch) -> N
 
 
 # The per-unit rule in each language's words, its numbers the loader's (2026-10-31): at most
-# R per key range, at least F per table or part. And the old cap of 4 per key range, in the
-# words each page used for it.
+# R per key range, and a floor of F per table or part that holds unless Batches per table is
+# lower -- the floor always with that exception, as Batches per table 1-3 keeps fewer (a bare
+# "at least 4 per table or part" contradicted "at most this many" there, 2026-10-30).
+# Patterns over the flattened text (ja's has no spaces). And the old cap of 4 per key range,
+# in the words each page used for it.
 def _in_flight_rule(lang: str) -> tuple:
     from dsql_migrator.ui.data_migration import _full_load_engine as engine
 
     r, f = engine._RANGE_IN_FLIGHT, engine._UNIT_IN_FLIGHT_FLOOR
     return {
-        "en": (f"{r} per key range", f"at least {f} per table or part"),
-        "ko": (f"키 범위당 {r}개", f"테이블 또는 부분당 최소 {f}개"),
-        "ja": (f"キー範囲あたり {r}", f"テーブルまたは部分あたり最低 {f}"),
+        "en": (rf"{r} per key range",
+               rf"never fewer than {f}(?: per table or part)? unless [^.;:]*?is lower"),
+        "ko": (rf"키 범위당 (?:최대 )?{r}개",
+               rf"더 작지 않으면 (?:테이블 또는 부분당 )?최소 {f}개"),
+        "ja": (rf"キー範囲あたり(?:最大)?{r}",
+               rf"小さくない限り(?:テーブルまたは部分あたり)?最低{f}"),
     }[lang]
 
 
+# The floor stated without its exception, in each language's words (and in English on every
+# page: ko and ja quote the Settings notice).
+_BARE_FLOOR = {
+    "en": r"at least 4 per table or part|never fewer than 4(?! (?:per table or part )?unless)",
+    "ko": r"(?<!더 작지 않으면 )(?<!더 작지 않으면 테이블 또는 부분당 )최소 4개",
+    "ja": r"(?<!小さくない限り)(?<!小さくない限りテーブルまたは部分あたり)最低4",
+}
 _OLD_CAP = {"en": "at 4 per key range", "ko": "키 범위당 4개,", "ja": "キー範囲あたり 4、"}
 _GUARDRAIL = {"en": "**Connection-quota guardrail.**", "ko": "**연결 쿼터 가드레일.**",
               "ja": "**接続クォータのガードレール。**"}
@@ -118,7 +133,8 @@ _GUARDRAIL = {"en": "**Connection-quota guardrail.**", "ko": "**연결 쿼터 �
 @pytest.mark.parametrize("lang", LANGS)
 def test_the_in_flight_rule_is_the_loaders_wherever_it_is_stated(lang: str) -> None:
     per_range, floor = _in_flight_rule(lang)
-    assert _in_flight_rule("en") == ("2 per key range", "at least 4 per table or part")
+    assert _in_flight_rule("en")[0] == "2 per key range"
+    assert "never fewer than 4" in _in_flight_rule("en")[1]
     key = "`DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM`"
     stated = {
         "7.1": _section(lang, _P07, "## 7.1", "### "),
@@ -129,7 +145,7 @@ def test_the_in_flight_rule_is_the_loaders_wherever_it_is_stated(lang: str) -> N
                                        key)),
     }
     for where, text in stated.items():
-        assert _has(lang, text, per_range) and _has(lang, text, floor), (lang, where)
+        assert re.search(per_range, text) and re.search(floor, text), (lang, where)
     # The 7.5 measurement that set the rule, cited where the manual gives in-flight numbers.
     measured = _section(lang, _P07, "## 7.5", "## 7.6")
     for fact in ("80M", "150,000", "1.4–1.6", "2.8", "`TotalDPU`"):
@@ -141,6 +157,95 @@ def test_the_in_flight_rule_is_the_loaders_wherever_it_is_stated(lang: str) -> N
         stale = [name for name, text in {**_all_pages(lang), "README": readme}.items()
                  if _has(lang, text, old)]
         assert not stale, (lang, old, stale)
+    # Nor is the floor stated without its exception anywhere -- in ko and ja also in English.
+    for pattern in sorted({_BARE_FLOOR[lang], _BARE_FLOOR["en"]}):
+        if lang == "ja":
+            pattern = pattern.replace(" ", "")  # ja's flattened text has no spaces
+        bare = [name for name, text in {**_all_pages(lang), "README": readme}.items()
+                if re.search(pattern, text)]
+        assert not bare, (lang, pattern, bare)
+
+
+# FAQ Q10 says the same in every language (2026-10-30). The ko answer alone carried a table
+# of the three variables and a paragraph; the two facts that paragraph held are one sentence
+# in all three now, and the README's environment-variable reference is linked instead of a
+# per-page table. The sentence also says that Settings needs no restart, so that the restart
+# an environment variable needs never reads as the only way to retune.
+_Q10_FACTS = {
+    "en": ("An out-of-bounds or non-integer value is refused, not ignored",
+           "a changed environment variable takes effect only after a restart (on Fargate, a "
+           "redeploy)",
+           "a change made in **Settings → Full Load** applies to the next run without a "
+           "restart, and a restart resets it"),
+    "ko": ("범위를 벗어나거나 정수가 아닌 값은 무시되지 않고 거부되며",
+           "바꾼 환경 변수는 재시작한 뒤에야(Fargate에서는 재배포) 반영되지만",
+           "**Settings → Full Load**에서 바꾼 값은 재시작 없이 다음 실행에 반영되고 재시작 시 "
+           "초기화됩니다"),
+    "ja": ("範囲外の値や整数でない値は無視されずに拒否され",
+           "変更した環境変数は再起動 (Fargate では再デプロイ) の後にはじめて反映されますが",
+           "**Settings → Full Load** での変更は再起動なしで次の実行に反映され、再起動でリセット"
+           "されます"),
+}
+_ENV_REFERENCE = {
+    "en": "(../../../README.md#configuration-advanced--usually-no-need-to-touch)",
+    "ko": "(../../../README.ko.md#설정-고급--보통은-건드릴-필요-없음)",
+    "ja": "(../../../README.ja.md#設定上級者向け--通常は変更不要)",
+}
+_DEFAULT = {"en": "default", "ko": "기본", "ja": "デフォルト"}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_faq_q10_says_the_same_in_every_language(lang: str, monkeypatch) -> None:
+    # The code first. A value out of bounds, or not an integer, raises -- read from the
+    # environment (load_config, which the app runs at its start) or set in Settings --
+    # rather than being clamped or dropped; and the variables are read from the process's
+    # own environment, which only a restart (on Fargate, a new task) changes from outside.
+    # Settings -> Full Load holds all three and writes that environment in the app's own
+    # process, so its change reaches the next run without a restart, and only there: a
+    # restart starts again from the deployed environment.
+    from dsql_migrator.config import (
+        TUNABLE_KNOBS,
+        AppConfig,
+        TuningValueError,
+        group_applies,
+        load_config,
+        set_tuning_value,
+    )
+
+    knobs = {k.env_suffix: k for k in TUNABLE_KNOBS}
+    for name, value in (("FULL_LOAD_TABLE_PARALLELISM", "17"),
+                        ("FULL_LOAD_BATCH_PARALLELISM", "0"),
+                        ("FULL_LOAD_BATCH_ROWS", "2.5")):
+        with pytest.raises(ValueError):
+            load_config({f"DSQL_MIGRATOR_{name}": value})
+        with pytest.raises(TuningValueError):
+            set_tuning_value(name.lower(), value)
+        assert knobs[name].group == "Full Load", name
+    assert group_applies("Full Load") == "the next run"
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "1234")
+    deployed = dict(os.environ)
+    assert load_config().full_load_batch_rows == 1234
+    assert set_tuning_value("full_load_batch_rows", "1500") == 1500
+    assert load_config().full_load_batch_rows == 1500  # the next run, no restart
+    assert load_config(deployed).full_load_batch_rows == 1234  # what a restart reads
+
+    text = (MANUAL / lang / _P11).read_text(encoding="utf-8")
+    start = text.index("**Q10.")
+    q10 = text[start : text.index("**Q11.", start)]
+    assert "\n|" not in q10, lang  # no table of its own
+    assert _ENV_REFERENCE[lang] in q10, lang
+    assert "(07-performance-and-tuning.md#72-" in q10, lang
+    flat = _flat(lang, q10)
+    for fact in _Q10_FACTS[lang]:
+        assert _has(lang, flat, fact), (lang, fact)
+    # The same three variables and defaults, the bound of rows per write included.
+    fields = AppConfig.model_fields
+    for name in ("table_parallelism", "batch_parallelism", "batch_rows"):
+        default = fields[f"full_load_{name}"].default
+        assert _has(lang, flat, f"{_DEFAULT[lang]} {default}"), (lang, name)
+    assert "`DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM`" in q10
+    assert "`…_BATCH_PARALLELISM`" in q10 and "`…_BATCH_ROWS`" in q10
+    assert "3000" in flat
 
 
 # The ten-minute bound on a Drop & reload's wait for the builds on its empty tables (P4d).

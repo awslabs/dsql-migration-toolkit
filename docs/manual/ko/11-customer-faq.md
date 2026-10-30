@@ -121,21 +121,16 @@ Full load + CDC에서는 실행의 시작 지점부터 재생되는 스트림이
 **Q10. Full Load 처리량을 튜닝할 수 있나요?**
 
 네. 다만 기본값에 이미 실측 결과가 반영되어 있습니다: 큰 테이블은 기본 키 구간으로 나누어 읽고 쓰며,
-동시 진행 배치는 키 범위당 2개(테이블 또는 부분당 최소 4개), 실행당 128개로 제한되므로 실행의 DSQL
-연결 수는 클러스터 쿼터 안에 넉넉히 머뭅니다. 큰 실행에서 올릴 설정은
-`DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM`(*Tables in parallel*, 기본 4)입니다: 태스크의 vCPU 수로
-설정하고, 바쁜 소스를 보호하려면 낮추세요. `…_BATCH_PARALLELISM`과 `…_BATCH_ROWS`는 바꿀 일이
-드뭅니다.
-
-| 환경 변수 | 의미 | 기본값 | 상한 |
-|---|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 동시에 적재하는 테이블(또는 큰 테이블의 부분) 수 | 4 | 16 |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 테이블당 동시 진행 배치 수 | 8 | 32 |
-| `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 한 번에 쓰는 행 수 | 2000 | 3000(DSQL 트랜잭션 한도) |
-
-상한을 넘거나 숫자가 아닌 값을 넣으면 **적용되지 않고 오류로 막히므로**(잘못된 설정이 조용히 무시되지
-않음) 안심하고 조정해도 됩니다. 값을 바꾼 뒤에는 앱/태스크를 **다시 시작**하면 반영됩니다. 자세한
-내용은 [7장 §7.2](07-performance-and-tuning.md#72-병렬수-튜닝)를 참조하세요.
+동시 진행 배치는 키 범위당 2개(*Batches per table*이 더 작지 않으면 테이블 또는 부분당 최소 4개),
+실행당 128개로 제한되므로 실행의 DSQL 연결 수는 클러스터 쿼터 안에 넉넉히 머뭅니다. 큰 실행에서 올릴
+설정은 `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM`(*Tables in parallel*, 기본 4)입니다: 태스크의
+vCPU 수로 설정하고, 바쁜 소스를 보호하려면 낮추세요. `…_BATCH_PARALLELISM`(테이블당 동시 진행 배치
+수, 기본 8)과 `…_BATCH_ROWS`(쓰기당 행 수, 기본 2000, DSQL의 3000행으로 하드 상한)는 바꿀 일이
+드뭅니다. 범위를 벗어나거나 정수가 아닌 값은 무시되지 않고 거부되며, 바꾼 환경 변수는 재시작한
+뒤에야(Fargate에서는 재배포) 반영되지만, **Settings → Full Load**에서 바꾼 값은 재시작 없이 다음
+실행에 반영되고 재시작 시 초기화됩니다. README의
+[환경 변수 레퍼런스](../../../README.ko.md#설정-고급--보통은-건드릴-필요-없음)와
+[7장 §7.2](07-performance-and-tuning.md#72-병렬수-튜닝)를 참조하세요.
 
 **Q11. 병렬도를 올려도 왜 빨라지지 않을 때가 있나요?**
 

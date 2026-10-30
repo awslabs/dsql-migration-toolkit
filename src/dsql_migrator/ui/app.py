@@ -1664,8 +1664,8 @@ def _render_tuning_group_controls(group: str) -> None:
             tone="info",
             header=(
                 f"Batches in flight are capped at {_range_in_flight()} per key range "
-                f"(at least {_UNIT_IN_FLIGHT_FLOOR} per table or part) "
-                f"and {_run_in_flight_budget()} per run"
+                f"(never fewer than {_UNIT_IN_FLIGHT_FLOOR} per table or part unless "
+                f"Batches per table is lower) and {_run_in_flight_budget()} per run"
             ),
             body=(
                 "Each batch in flight holds one Aurora DSQL connection; a table also never "
