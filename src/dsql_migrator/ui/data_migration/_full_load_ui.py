@@ -764,6 +764,9 @@ def _render_full_load_step(
     # may not (pre_load_table_list_warning: its header and body). A warning above Start Full
     # Load, never a hold.
     pre_load_warning: Optional[tuple[str, str]] = None,
+    # ...and a selected table's name is one CDC cannot stream (pre_load_topic_name_warning).
+    # A second warning beside it, never a hold.
+    pre_load_topic_warning: Optional[tuple[str, str]] = None,
 ) -> None:
     """Render the Full Load step: confirm the selected workloads, then run it.
 
@@ -2003,6 +2006,12 @@ def _render_full_load_step(
     if pre_load_warning and job is None and status is not StepStatus.IN_PROGRESS:
         render_notice(
             ui, tone="warning", header=pre_load_warning[0], body=pre_load_warning[1]
+        )
+    # ...or it holds a table whose name CDC cannot stream: not a hold either, it is unticked
+    # after the load.
+    if pre_load_topic_warning and job is None and status is not StepStatus.IN_PROGRESS:
+        render_notice(
+            ui, tone="warning", header=pre_load_topic_warning[0], body=pre_load_topic_warning[1]
         )
 
     if status is StepStatus.IN_PROGRESS:

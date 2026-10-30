@@ -4123,6 +4123,27 @@ def table_list_hold_remedy(
     )
 
 
+def topic_name_hold_remedy(
+    refusal: str,
+    table_lock: "Optional[str]",
+    split: "Sequence[str]" = (),
+    job: Optional[MigrationJob] = None,
+    *,
+    cdc_only: bool = False,
+) -> str:
+    """A CDC topic-name refusal (:func:`cdc_topic_name_refusal`, which ends with core.cdc
+    ``CDC_TOPIC_NAME_REMEDY``) followed by the table picker's remedy, as Deploy CDC
+    infrastructure, Start CDC and Retry CDC say it after the load. ``split`` (G137): the
+    refused tables the Full Load read in parts whose copy still waits for CDC's replay --
+    they cannot be deselected until a reload, so they are named
+    (:func:`split_table_list_remedy`, over the record ``job``). Pure.
+    """
+    text = f"{refusal} " + table_picker_remedy(table_lock)
+    if split:
+        text += " " + split_table_list_remedy(split, job, cdc_only=cdc_only)
+    return text
+
+
 # The notice header of a table-list refusal (cdc_table_list_refusal), and of the warning
 # before a Full load + CDC load when a list every deploy sends does not fit
 # (cdc_pre_load_table_list_warning).
@@ -4130,6 +4151,10 @@ CDC_TABLE_LIST_HEADER = "Too many tables for one CDC pipeline"
 # The notice header of a warning that only the deploy's largest partition plan would not
 # fit (cdc_partition_map_worst_case): on the Deploy form, and before a Full load + CDC load.
 CDC_TABLE_LIST_WORST_CASE_HEADER = "Possibly too many tables for one CDC pipeline"
+# The notice header of a topic-name refusal (cdc_topic_name_refusal), and of the warning
+# before a Full load + CDC load whose selection holds such a table
+# (cdc_pre_load_topic_name_warning).
+CDC_TOPIC_NAME_HEADER = "Table names CDC cannot stream"
 
 
 def _cdc_table_lists(names: "Sequence[str]") -> "list[tuple[str, str]]":
@@ -4179,6 +4204,27 @@ def cdc_table_list_refusal(
     return list_parameter_size_refusal(
         _cdc_deploy_lists(names, row_counts_by_table) if deploy else _cdc_table_lists(names)
     )
+
+
+def cdc_topic_name_refusal(table_names: "Sequence[str]") -> "Optional[str]":
+    """Why CDC cannot stream some of these tables, or ``None``. Pure.
+
+    ``core.cdc.topic_name_refusal`` over SinkTopics exactly as the parameter builders send
+    it for ``table_names`` (Deploy CDC infrastructure and Start CDC alike): a table whose
+    database, schema or table name holds a character Kafka refuses in a topic name. Each
+    caller appends :func:`table_picker_remedy` (:func:`topic_name_hold_remedy`; a deploy
+    before a Full load + CDC load, :func:`cdc_pre_load_topic_name_routes`).
+    """
+    from dsql_migrator.core.cdc import topic_name_refusal
+
+    return topic_name_refusal(_cdc_table_lists(list(table_names)))
+
+
+def cdc_topic_name_refused(table_names: "Sequence[str]") -> "list[str]":
+    """The tables of ``table_names`` :func:`cdc_topic_name_refusal` names, in order. Pure."""
+    from dsql_migrator.core.cdc import topic_name_refused_tables
+
+    return topic_name_refused_tables(_cdc_table_lists(list(table_names)))
 
 
 def cdc_tables_per_pipeline(table_count: int, list_bytes: int) -> int:
@@ -4329,6 +4375,57 @@ def cdc_pre_load_table_list_warning(
         fact = f"{worst} Deploy CDC infrastructure would then refuse this set."
         header = CDC_TABLE_LIST_WORST_CASE_HEADER
     return header, f"{fact} " + cdc_pre_load_table_list_routes(table_lock, split=split)
+
+
+def cdc_pre_load_topic_name_routes(table_lock: "Optional[str]", *, split: bool = False) -> str:
+    """The routes for a Full load + CDC selection holding a table CDC cannot stream
+    (:func:`cdc_topic_name_refusal`), before its load and with CDC never started: load it
+    and, until CDC starts, untick it (G16), then copy it again in a Full load only migration
+    once its writes stop; or rename it at the source, or leave it out now
+    (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason).
+    ``split`` (:func:`mysql_reads_may_split`) carves a table the load reads in parts out of
+    the first (G137). Pure."""
+    return (
+        "The Full Load can still load such a table: after it, until CDC starts, untick it in the "
+        "table list (it stays on Aurora DSQL as loaded; CDC and Validation skip it) and copy it "
+        "again in a Full load only migration once its writes stop."
+        + (PRE_LOAD_SPLIT_CARVE_OUT if split else "")
+        + " Or, before the load, rename it at the source and re-run Step 1 (Evaluation), or "
+        "leave it out: " + table_picker_remedy(table_lock)
+    )
+
+
+def cdc_pre_load_topic_name_warning(
+    table_names: "Sequence[str]",
+    *,
+    planned: bool,
+    table_lock: "Optional[str]",
+    split: bool = False,
+) -> "Optional[tuple[str, str]]":
+    """``(header, body)`` of what Full load + CDC says before its load when ``table_names``
+    (the load's selection) holds a table CDC cannot stream (:func:`cdc_topic_name_refusal`),
+    or ``None``. Pure.
+
+    A warning, never a hold, like :func:`cdc_pre_load_table_list_warning`: the load may take
+    such a table and, until CDC starts, it is unticked (G16); Deploy CDC infrastructure and
+    Start CDC then judge the real capture. ``planned``: a cdc-stack is already deployed (or
+    deploying), so only Start CDC is still to refuse. ``table_lock`` and ``split`` as for
+    :func:`cdc_pre_load_topic_name_routes`.
+    """
+    from dsql_migrator.core.cdc import CDC_TOPIC_NAME_REMEDY
+
+    refusal = cdc_topic_name_refusal(table_names)
+    if refusal is None:
+        return None
+    fact = refusal.removesuffix(CDC_TOPIC_NAME_REMEDY).rstrip()
+    refusing = "Start CDC refuses" if planned else (
+        "Deploy CDC infrastructure and Start CDC refuse"
+    )
+    return (
+        CDC_TOPIC_NAME_HEADER,
+        f"{fact} {refusing} a capture holding such a table. "
+        + cdc_pre_load_topic_name_routes(table_lock, split=split),
+    )
 
 
 # DSQL caps a single value at 1 MiB. Used for display.

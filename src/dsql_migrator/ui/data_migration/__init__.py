@@ -290,6 +290,7 @@ from dsql_migrator.ui.data_migration._models import (
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     capture_ambiguity_warning,
     cdc_pre_load_table_list_warning,
+    cdc_pre_load_topic_name_warning,
     mysql_reads_may_split,
     make_lob_candidates_for,
     cutover_restore_block_reason,
@@ -1953,6 +1954,11 @@ def build_data_migration_screen(
             _table_list_warning = pre_load_table_list_warning(
                 migration_state, job_manager, session, inventory
             )
+            # ...nor a selected table whose name CDC cannot stream (Kafka refuses it in a
+            # topic name): loaded, it can be unticked before CDC starts.
+            _topic_name_warning = pre_load_topic_name_warning(
+                migration_state, job_manager, session, inventory
+            )
             # After a set change (Full load only, G12): the tables selected since the load are
             # not vouched for by its prerequisite pass. Full load + CDC (G17): the tables its
             # watermark does not cover yet, whatever the record holds for them -- the same
@@ -3215,6 +3221,7 @@ def build_data_migration_screen(
                             selected_names=selected_names,
                             guard_reason=guard_reason,
                             pre_load_warning=_table_list_warning,
+                            pre_load_topic_warning=_topic_name_warning,
                             start_full_load=start_full_load,
                             retry_failed_load=retry_failed_load,
                             retry_tables=retry_tables,
@@ -4075,12 +4082,13 @@ def data_migration_exclusion_block(
     ``runner()`` itself all read this, so none can start a load the others hold. Before the
     card locks: a saved exclusion that no longer applies, then a source column the applied
     target DDL lacks (42703). Full load + CDC, before any load, also holds a capture list
-    CDC could not carry afterwards -- but not a table set too large for one CDC pipeline:
-    the load may take every table and the ones CDC does not need are unticked before CDC
-    starts, so that is a warning on the Full Load card (:func:`pre_load_table_list_warning`)
-    and a hold only at Deploy CDC infrastructure and Start CDC. ``None`` for CDC only, whose
-    card sits inside the CDC sub-step that Continue leads to -- its Deploy/Attach buttons
-    carry the same gate there.
+    CDC could not carry afterwards -- but neither a table set too large for one CDC pipeline
+    nor a table whose name Kafka refuses in a topic name: the load may take every table and
+    the ones CDC does not need or cannot stream are unticked before CDC starts, so those are
+    warnings on the Full Load card (:func:`pre_load_table_list_warning`,
+    :func:`pre_load_topic_name_warning`) and holds only at Deploy CDC infrastructure and
+    Start CDC. ``None`` for CDC only, whose card sits inside the CDC sub-step that Continue
+    leads to -- its Deploy/Attach buttons carry the same gate there.
     """
     # The first gate: settle a restored pre-overlay session's exclusions before any set
     # is read (a safety net for callers that restored without the app).
@@ -4135,6 +4143,34 @@ def pre_load_table_list_warning(
     plan (deployed, or deploying), else the deploy's. ``None`` too once CDC has started for
     this migration: its set is fixed then, and the CDC step's holds say so.
     """
+    return _pre_load_cdc_warning(
+        cdc_pre_load_table_list_warning, migration_state, job_manager, session, inventory
+    )
+
+
+def pre_load_topic_name_warning(
+    migration_state, job_manager, session, inventory
+) -> Optional[tuple[str, str]]:
+    """Full load + CDC, before any load: ``(header, body)`` of the Full Load card's warning
+    that a selected table's name is one CDC cannot stream (Kafka refuses it in a topic name,
+    :func:`cdc_pre_load_topic_name_warning`), or ``None``.
+
+    Not a hold, like :func:`pre_load_table_list_warning` and under the same gate: the load
+    may take such a table and, until CDC starts, it is unticked (G16); the Deploy CDC
+    infrastructure and Start CDC holds judge the real capture.
+    """
+    return _pre_load_cdc_warning(
+        cdc_pre_load_topic_name_warning, migration_state, job_manager, session, inventory
+    )
+
+
+def _pre_load_cdc_warning(warning, migration_state, job_manager, session, inventory):
+    """The one gate of the Full Load card's CDC warnings (:func:`pre_load_table_list_warning`,
+    :func:`pre_load_topic_name_warning`), so they cannot drift apart: Full load + CDC, no
+    load yet, a selection, and CDC never started for this migration. Then ``warning`` (a
+    ``_models`` pre-load warning) over the load's selection, ``planned`` when a cdc-stack
+    already owns the partition plan (deployed, or deploying), with the table picker's lock
+    and whether the load may read a table in parts. Else ``None``."""
     if (
         migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC
         or getattr(migration_state, "job_id", None) is not None
@@ -4149,7 +4185,7 @@ def pre_load_table_list_warning(
         "ready",
         "deploying",
     ) and not cdc_stack_being_deleted(migration_state, job_manager)
-    return cdc_pre_load_table_list_warning(
+    return warning(
         [t.name for t in inventory.tables if wanted is None or t.name in wanted],
         planned=planned,
         table_lock=table_set_lock_reason(migration_state, job_manager, session),
@@ -6637,6 +6673,7 @@ __all__ = [
     "overlay_in_play",
     "data_migration_exclusion_block",
     "pre_load_table_list_warning",
+    "pre_load_topic_name_warning",
     "exclusion_card_locked",
     "table_set_lock_reason",
     "make_exclusion_inputs_resolver",

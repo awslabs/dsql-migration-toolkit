@@ -75,6 +75,7 @@ from dsql_migrator.core.cdc import (
     list_parameter_size_refusal,
     rekey_parameter_size_refusal,
     rekey_routing_log_lines,
+    topic_name_refusal,
 )
 from dsql_migrator.core.cdc_coords import gtid_set_summary, normalize_gtid_set
 from dsql_migrator.core.models import (
@@ -1645,6 +1646,10 @@ def run_cdc_infra_deploy(
         _list_refusal = list_parameter_size_refusal(params.filled)
         if _list_refusal:
             raise CdcDeployError(_list_refusal)
+        # ...and a captured table whose Kafka topic name Kafka would refuse.
+        _topic_refusal = topic_name_refusal(params.filled)
+        if _topic_refusal:
+            raise CdcDeployError(_topic_refusal)
         # 0a. ensure plugin bucket + 0b. upload plugins (background — ~32-43 MiB,
         #     depending on the source engine).
         driver.stage("ensure_bucket", "IN_PROGRESS")
@@ -2154,6 +2159,11 @@ def run_cdc_start(
         _list_refusal = list_parameter_size_refusal(params.filled)
         if _list_refusal:
             raise CdcDeployError(_list_refusal)
+        # A captured table whose Kafka topic name Kafka refuses would fail the topic
+        # pre-create (or, trimmed into a legal name, never be captured): refused here too.
+        _topic_refusal = topic_name_refusal(params.filled)
+        if _topic_refusal:
+            raise CdcDeployError(_topic_refusal)
         # Backstop for the chooser: a KEPT 0.1.561 ColumnExcludeList may still exclude a
         # composite key column, which 0.1.561 refused to start with (Debezium cannot build
         # the record key). Covers Retry CDC and a UI that judged a stale deployed value.

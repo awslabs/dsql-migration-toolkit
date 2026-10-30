@@ -558,6 +558,7 @@ Full load + CDC에서는 이 마이그레이션에서 CDC를 한 번도 시작�
 | **exclude table 규칙이 선택을 해제한 테이블** | Change & reload에서 그 규칙을 삭제해야만 돌아오며, 이때 그 테이블의 컬럼 규칙이 적용됩니다(테이블 목록에서 체크하는 것은 거부됩니다: 그 컬럼 규칙이 적용되지 않기 때문입니다). 잠금 아이콘과 그 사유가 표시됩니다. |
 | **Unselect all** | 허용됩니다. 다만 Deploy CDC infrastructure와 Start CDC에는 선택된 테이블이 하나 이상 필요합니다. |
 | **CDC 파이프라인 하나가 캡처하는 수보다 많은 테이블**(일반적인 이름이면 약 80–160개, [6장](06-limitations.md) 참고) | 적재할 수 있습니다: Full Load 단계가 적재 전에 경고하고, 여기서 충분한 테이블의 선택을 해제할 때까지 Deploy CDC infrastructure와 Start CDC는 그 캡처를 거부합니다(Full Load가 나누어 읽은 테이블은 제외, 위 참고: 그런 테이블이 캡처되는 동안 그 거부는 테이블을 명시하고 Full load only를 제시하지 않습니다). |
+| **CDC가 스트리밍할 수 없는 이름의 테이블**(데이터베이스, 스키마 또는 테이블 이름에 ASCII 영문자, 숫자, `.`, `_`, `-` 이외의 문자가 있음, [6장](06-limitations.md) 참고) | 적재할 수 있습니다: Full Load 단계가 적재 전에 경고하고, 여기서 그 테이블의 선택을 해제할 때까지 Deploy CDC infrastructure와 Start CDC는 그 캡처를 거부합니다(Full Load가 나누어 읽은 테이블은 제외, 위 참고). 그 테이블은 적재된 그대로 Aurora DSQL에 남습니다: 쓰기가 멈춘 뒤 Full load only 마이그레이션으로 다시 복사하세요. |
 
 - **Full Load가 로드하지 않은 테이블을 체크하면**, 그 테이블은 먼저 Full Load의 시작 지점 아래에서
   로드되고, 그 뒤에야 CDC가 캡처합니다:

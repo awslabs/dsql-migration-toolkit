@@ -600,6 +600,7 @@ line in Change & reload. It works the same in a restored session. No Start over 
 | **A table an exclude table rule unselected** | It comes back only by deleting that rule in Change & reload, which applies its column rules (ticking it in the table list is refused: its column rules would not apply). A lock icon marks it, with the reason. |
 | **Unselect all** | Allowed, but Deploy CDC infrastructure and Start CDC need at least one selected table. |
 | **More tables than one CDC pipeline captures** (about 80–160 with typical names, see [Chapter 6](06-limitations.md)) | They can still be loaded: the Full Load step warns before the load, and Deploy CDC infrastructure and Start CDC refuse the capture until you untick enough tables here (not one the Full Load read in parts, above: while one is captured, that refusal names it and does not offer Full load only). |
+| **A table whose name CDC cannot stream** (its database, schema or table name holds a character other than an ASCII letter, a digit, `.`, `_` or `-`; see [Chapter 6](06-limitations.md)) | It can still be loaded: the Full Load step warns before the load, and Deploy CDC infrastructure and Start CDC refuse the capture until you untick it here (not one the Full Load read in parts, above). It stays on Aurora DSQL as loaded: copy it again in a Full load only migration once its writes stop. |
 
 - **Loading a table you tick that the Full Load did not load.** It is loaded under the
   Full Load's start point first, and only then captured by CDC:

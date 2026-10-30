@@ -109,6 +109,20 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
     아니라 WAL을 고정합니다 — `wal_status`를 관찰하세요, 비활성 슬롯은 소스 디스크를 가득 채울 수
     있습니다.
 
+- **CDC는 이름으로 Kafka 토픽 이름을 지을 수 있는 테이블만 스트리밍함.** CDC는 캡처하는 테이블마다
+  그 데이터베이스(MySQL)나 스키마(PostgreSQL)와 테이블 이름으로 Kafka 토픽 이름을 짓는데, Kafka는
+  토픽 이름에 ASCII 영문자, 숫자, `.`, `_`, `-`만 허용합니다. 데이터베이스, 스키마 또는 테이블
+  이름에 그 밖의 문자(`$`, 공백, `%`, `:`, 쉼표, 한글 같은 비 ASCII 문자)가 들어간 테이블은 캡처할
+  수 없습니다: Deploy CDC infrastructure, Start CDC, Retry CDC는 무엇이든 업로드하거나 만들기 전에
+  그런 테이블을 거부하고(*Table names CDC cannot stream*, 테이블을 명시), Full load + CDC에서는 Full
+  Load 단계가 적재 전에 경고하지만 적재를 막지는 않습니다. Full load + CDC에서는 그런 테이블을
+  적재한 뒤 CDC를 시작하기 전에 선택을 해제하세요([13장](13-excluding-tables-and-columns.md)의 "Full
+  Load 후 테이블 집합 바꾸기 (Full load + CDC)" 참고): 적재된 그대로 Aurora DSQL에 남고, CDC와
+  Validation은 그 테이블을 건너뜁니다. CDC only에서는 Deploy CDC infrastructure 전에 선택을
+  해제하세요. 그런 다음 쓰기가 멈춘 뒤 Full load only 마이그레이션으로 복사하거나, 마이그레이션 전에
+  소스에서 이름을 바꾸세요. 적재가 별도 스냅샷 부분으로 나누어 읽은 MySQL 테이블은 리더 하나로 다시
+  적재한 뒤에만 선택을 해제할 수 있습니다(아래 "용량과 비용" 참고).
+
 - **PostgreSQL 소스, 재키잉(re-keyed) 테이블:** CDC가 재키잉하는 테이블 — Schema Conversion의
   **Composite key**, 또는 소스 기본 키 밖의 컬럼을 더하도록 편집한 타깃 키 — 은 Start 시점만이
   아니라 **CDC 실행 내내 테이블과 모든 파티션에 `REPLICA IDENTITY FULL`**이 필요합니다(나중에 만든

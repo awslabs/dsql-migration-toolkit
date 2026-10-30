@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 import re
+import string
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -1847,6 +1848,17 @@ class CdcStackParams(BaseModel):
 CDC_PARAMETER_BYTE_LIMIT = 4096
 # The remedy a CDC table-list refusal ends with (:func:`list_parameter_size_refusal`).
 CDC_TABLE_LIST_REMEDY = "Capture fewer tables in this CDC pipeline, or use Full load only."
+# Kafka names a topic with ASCII letters, digits, '.', '_' and '-' only
+# (org.apache.kafka.common.internals.Topic). Its 249-character cap is then out of reach: such a
+# topic is at most 7+1+64+1+64 = 137 long (MySQL's 64-character names; 135 for PostgreSQL's
+# 63-byte ones).
+_KAFKA_TOPIC_CHARS = frozenset(string.ascii_letters + string.digits + "._-")
+# The remedy a CDC topic-name refusal ends with (:func:`topic_name_refusal`).
+CDC_TOPIC_NAME_REMEDY = (
+    "Leave such a table out of this CDC pipeline (it stays on Aurora DSQL as it is, and CDC "
+    "and Validation skip it) and copy it in a Full load only migration once its writes stop, "
+    "or rename it at the source before migrating it."
+)
 
 # What Debezium would interpret inside a column.exclude.list name part: the regex
 # metacharacters, and ',' -- the list separator, which its splitter (RegExSplitter) reads
@@ -2477,6 +2489,52 @@ def list_parameter_size_refusal(
         f"The captured tables need {size:,} bytes in the CDC configuration ({key}), "
         f"over CloudFormation's {CDC_PARAMETER_BYTE_LIMIT:,}-byte limit for one parameter. "
         + CDC_TABLE_LIST_REMEDY
+    )
+
+
+def topic_name_refused_tables(filled: "Iterable[tuple[str, object]]") -> list[str]:
+    """The captured tables whose Kafka topic name Kafka refuses, in SinkTopics order. Pure.
+
+    Each part of ``SinkTopics`` is judged as sent, never stripped (a trailing space is
+    refused), against :data:`_KAFKA_TOPIC_CHARS` -- a set test, not a regex (``$`` would let
+    a trailing newline through). Every topic starts with ``<TopicPrefix>.``, so a part that
+    does not comes from a comma inside the previous table's name and is joined back onto it.
+    The table is named without that prefix. Known, accepted gap: a name holding the literal
+    text ``,<TopicPrefix>.`` still reads as two legal names.
+    """
+    values = dict(filled)
+    raw = str(values.get("SinkTopics") or "")
+    lead = f"{values.get('TopicPrefix') or CDC_DEFAULT_TOPIC_PREFIX}."
+    topics: list[str] = []
+    if raw:
+        for part in raw.split(","):
+            if topics and not part.startswith(lead):
+                topics[-1] += "," + part
+            else:
+                topics.append(part)
+    return [t.removeprefix(lead) for t in topics if not set(t) <= _KAFKA_TOPIC_CHARS]
+
+
+def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]":
+    """Why CDC cannot stream these captured tables, or ``None``. Pure.
+
+    Each captured table's Kafka topic is ``<TopicPrefix>.<db>.<table>`` (MySQL) or
+    ``<TopicPrefix>.<schema>.<table>`` (PostgreSQL), and Kafka allows only ASCII letters,
+    digits, '.', '_' and '-' in a topic name (:func:`topic_name_refused_tables`; a '.' is
+    allowed on purpose). Both topic pre-create paths catch only an existing topic, so such a
+    name failed Start CDC after the infrastructure was deployed: an opaque rollback on the
+    Lambda path, about 2 minutes of retries blaming the network on the External one -- and a
+    comma, or whitespace ending a table name, was trimmed into a legal name, so Start
+    succeeded and the table was never captured (read from the code, not seen live). This
+    refuses it first, naming the tables and the remedy (:data:`CDC_TOPIC_NAME_REMEDY`).
+    """
+    tables = topic_name_refused_tables(filled)
+    if not tables:
+        return None
+    return (
+        f"CDC cannot stream {_bounded_names(tables)}: each table's Kafka topic is named after its "
+        "database or schema and its table, and Kafka allows only ASCII letters, digits, '.', '_' "
+        "and '-' in a topic name. " + CDC_TOPIC_NAME_REMEDY
     )
 
 

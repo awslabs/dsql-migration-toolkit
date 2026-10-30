@@ -38,6 +38,7 @@ from typing import (
 
 from dsql_migrator.core.cdc import (
     CDC_TABLE_LIST_REMEDY,
+    CDC_TOPIC_NAME_REMEDY,
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_STACK_NAME,
     CDC_DEFAULT_TOPIC_PREFIX,
@@ -114,10 +115,14 @@ from dsql_migrator.ui.data_migration._models import (
     CAPTURE_SIZE_REMEDY_UNLOCKED,
     CDC_TABLE_LIST_HEADER,
     CDC_TABLE_LIST_WORST_CASE_HEADER,
+    CDC_TOPIC_NAME_HEADER,
     capture_ambiguity_warning,
     cdc_partition_map_worst_case,
     cdc_pre_load_table_list_routes,
+    cdc_pre_load_topic_name_routes,
     cdc_table_list_refusal,
+    cdc_topic_name_refusal,
+    cdc_topic_name_refused,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
     format_column_exclude_list,
@@ -132,6 +137,7 @@ from dsql_migrator.ui.data_migration._models import (
     split_reload_route,
     split_route_view,
     table_list_hold_remedy,
+    topic_name_hold_remedy,
 )
 from dsql_migrator.core.cdc_stack_deployer import is_stable_stack_status
 from dsql_migrator.ui.data_migration._cdc_status import (
@@ -3967,6 +3973,13 @@ def _render_cdc_start_button(
             _tables_refusal, migration_state, job_manager,
             _table_lock(migration_state, job_manager, session),
         )
+    # ...and each captured table's Kafka topic name must be one Kafka accepts.
+    _topic_refusal = cdc_topic_name_refusal([t.name for t in _captured_now])
+    if _topic_refusal:
+        _topic_refusal = _topic_name_hold_remedy(
+            _topic_refusal, migration_state, job_manager,
+            _table_lock(migration_state, job_manager, session),
+        )
     # A source column the target certainly lacks: the sink would dead-letter every change
     # to it (42703). Checked HERE as well as at Deploy, because Attach (which moves no data)
     # does not check it and the DDL can change between Deploy and Start. Not tied to any
@@ -3974,7 +3987,10 @@ def _render_cdc_start_button(
     _missing = missing_column_block_reason(
         migration_state, inventory, job_manager=job_manager
     )
-    if _missing and not prereq_block and not _capture_error and not _tables_refusal:
+    if (
+        _missing and not prereq_block and not _capture_error and not _tables_refusal
+        and not _topic_refusal
+    ):
         render_notice(
             ui,
             tone="error",
@@ -3990,6 +4006,8 @@ def _render_cdc_start_button(
         )
     elif _tables_refusal and not prereq_block:
         render_notice(ui, tone="error", header=CDC_TABLE_LIST_HEADER, body=_tables_refusal)
+    elif _topic_refusal and not prereq_block:
+        render_notice(ui, tone="error", header=CDC_TOPIC_NAME_HEADER, body=_topic_refusal)
     _ambiguity = capture_ambiguity_warning(_capture)
     if _ambiguity:
         render_notice(ui, tone="warning", header="CDC capture needs attention", body=_ambiguity)
@@ -4026,6 +4044,9 @@ def _render_cdc_start_button(
     elif _tables_refusal:
         start_btn.props("disable")
         start_btn.tooltip(_tables_refusal)
+    elif _topic_refusal:
+        start_btn.props("disable")
+        start_btn.tooltip(_topic_refusal)
     elif _missing:
         start_btn.props("disable")
         start_btn.tooltip(_missing)
@@ -4549,7 +4570,8 @@ def _render_cdc_infra_deploy_action(
         return
     # A saved column exclusion that no longer applies would be baked into the stack's
     # ColumnExcludeList and lock the card, so this is its last chance to be removed. (Also
-    # held here: a capture list or a per-table list too long for one stack parameter.)
+    # held here: a capture list or a per-table list too long for one stack parameter, and a
+    # table name Kafka refuses in a topic name.)
     _deploy_capture_now = _deploy_capture(migration_state, job_manager, inventory)
     _exclusion_notice = _deploy_block_notice(
         migration_state, job_manager, inventory, session, capture=_deploy_capture_now
@@ -4637,7 +4659,10 @@ def _deploy_block_notice(
       plan judged on the row estimates the Full Load recorded. With none recorded the deploy
       reads the source's at the click, so only the two lists every deploy sends are held
       here; the plan's worst case is a warning (:func:`_deploy_partition_map_warning`). Its
-      remedy: :func:`_deploy_table_list_refused`.
+      remedy: :func:`_deploy_table_list_refused`;
+    * with ``include_capture`` too, a captured table whose database, schema or table name
+      Kafka refuses in a topic name (:func:`cdc_topic_name_refusal`), with the remedy of
+      :func:`_deploy_topic_name_refused`.
 
     Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
     and changes no DDL; it only locks the card, so only the saved-entry check applies.
@@ -4676,6 +4701,12 @@ def _deploy_block_notice(
         return (
             CDC_TABLE_LIST_HEADER,
             _deploy_table_list_refused(refusal, migration_state, job_manager, session),
+        )
+    refusal = cdc_topic_name_refusal(names)
+    if refusal:
+        return (
+            CDC_TOPIC_NAME_HEADER,
+            _deploy_topic_name_refused(refusal, migration_state, job_manager, session),
         )
     return None
 
@@ -4762,6 +4793,44 @@ def _table_list_hold_remedy(refusal: str, migration_state, job_manager, lock) ->
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
     _split = _captured_split_tables(migration_state, job)
     return table_list_hold_remedy(
+        refusal, lock, _split,
+        split_route_view(migration_state, job_manager, job) if _split else job,
+        cdc_only=_split_cdc_only(migration_state),
+    )
+
+
+def _deploy_topic_name_refused(refusal: str, migration_state, job_manager, session) -> str:
+    """A Deploy CDC infrastructure topic-name refusal with its remedy, as
+    :func:`_deploy_table_list_refused` says a table-list one: before a Full load + CDC load,
+    with CDC never started for this migration, the routes of the Full Load card's warning
+    (:func:`cdc_pre_load_topic_name_routes`) in place of the refusal's own remedy, which they
+    repeat -- the deploy itself stays refused. Otherwise the table picker's after it
+    (:func:`_topic_name_hold_remedy`)."""
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
+
+    lock = _table_lock(migration_state, job_manager, session)
+    if (
+        getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC
+        and getattr(migration_state, "job_id", None) is None
+        and not _cdc_started_for_migration(migration_state, job_manager)
+    ):
+        fact = refusal.removesuffix(CDC_TOPIC_NAME_REMEDY).rstrip()
+        from dsql_migrator.ui.data_migration._models import session_source_type
+
+        return f"{fact} " + cdc_pre_load_topic_name_routes(
+            lock, split=mysql_reads_may_split(session_source_type(session))
+        )
+    return _topic_name_hold_remedy(refusal, migration_state, job_manager, lock)
+
+
+def _topic_name_hold_remedy(refusal: str, migration_state, job_manager, lock) -> str:
+    """A topic-name refusal after the load with the table picker's remedy (``lock`` is its
+    lock reason), as Deploy, Start CDC and Retry CDC say it. A refused table the Full Load
+    read in parts that still waits for CDC's replay (G137) is named as one that cannot be
+    deselected yet (:func:`~dsql_migrator.ui.data_migration._models.topic_name_hold_remedy`)."""
+    job = _current_job(job_manager, getattr(migration_state, "job_id", None))
+    _split = cdc_topic_name_refused(_captured_split_tables(migration_state, job))
+    return topic_name_hold_remedy(
         refusal, lock, _split,
         split_route_view(migration_state, job_manager, job) if _split else job,
         cdc_only=_split_cdc_only(migration_state),
@@ -8937,6 +9006,20 @@ def _start_cdc_deploy(
             ),
         )
         return
+    # ...and so must each captured table's Kafka topic name -- refused before the submit
+    # below stamps the CDC operations window, which fixes the table set (G16).
+    _topic_refusal = cdc_topic_name_refusal([t.name for t in tables_for_config])
+    if _topic_refusal:
+        render_notice(
+            ui,
+            tone="error",
+            header=CDC_TOPIC_NAME_HEADER,
+            body=_topic_name_hold_remedy(
+                _topic_refusal, migration_state, job_manager,
+                _table_lock(migration_state, job_manager, session),
+            ),
+        )
+        return
     _missing = missing_column_block_reason(
         migration_state, inventory, job_manager=job_manager
     )
@@ -9737,6 +9820,15 @@ async def _start_cdc_infra_deploy(
     _deploy_row_counts = None
     _tables_refusal = cdc_table_list_refusal(_captured_names, deploy=False)
     if not _tables_refusal:
+        # A table name Kafka refuses in a topic name: refused before the source is read too.
+        _topic_refusal = cdc_topic_name_refusal(_captured_names)
+        if _topic_refusal:
+            ui.notify(  # type: ignore[attr-defined]
+                _deploy_topic_name_refused(_topic_refusal, migration_state, job_manager, session),
+                type="negative",
+                position="top",
+            )
+            return
         _deploy_row_counts = _cdc_row_counts_from_watermark(_deploy_wm, _captured) or (
             await run.io_bound(_estimate_cdc_table_rows, session, _captured_names)
         )
