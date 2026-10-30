@@ -1576,7 +1576,9 @@ class TableExporter:
         table, i.e. the current behavior — whenever the table can't or shouldn't be
         sharded: ``shards <= 1``, a non-integer leading PK column, an empty table, or
         (when ``min_rows`` > 0) a scan-free ``information_schema`` row estimate BELOW
-        ``min_rows`` (small tables don't justify the extra connections/snapshots).
+        ``min_rows`` (small tables don't justify the extra connections/snapshots) -- on
+        MySQL 8.0+ the storage engine's, not the statistics cache's
+        (:meth:`~dsql_migrator.core.source_dialect.base.SourceDialect.prepare_estimate_session`).
         Called once per table before the shard readers open their own snapshots.
         """
         dialect = dialect_for(conn.source_type)
@@ -1587,6 +1589,7 @@ class TableExporter:
             with engine.connect() as connection:
                 ro = connection.execution_options(isolation_level="AUTOCOMMIT")
                 if min_rows > 0:
+                    dialect.prepare_estimate_session(ro)
                     est = estimate_source_rows(ro, [table.name], dialect).get(table.name)
                     if est is not None and est < min_rows:
                         return [(None, None)]

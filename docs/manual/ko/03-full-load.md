@@ -386,8 +386,10 @@ worker 수를 정합니다. 큰 테이블은 기본 키 구간으로도 나누�
   정수인 복합 PK)은 K개의 기본 키 구간으로 나누어 읽습니다. K는
   *Reader shards per large table*(**Settings → Full Load**, `FULL_LOAD_READER_SHARDS`)이 정합니다:
   `0` = 자동(기본값): 추정 5,000,000행부터 2,500,000행마다 구간 하나, 최대 32(10M 행: 구간 4개);
-  `1` = 꺼짐; `2`–`32` = 정확히 그 수(아래). 추정치는 시작 지점의 스캔 없는 추정치이며,
-  `TABLE_PARALLELISM`이 1이면 아무것도 나누지 않습니다.
+  `1` = 꺼짐; `2`–`32` = 정확히 그 수(아래). 추정치는 시작 지점의 스캔 없는 추정치입니다.
+  MySQL 8.0 이상(Aurora MySQL 3)에서는 MySQL이 캐시해 두는 사본(기본 하루,
+  `information_schema_stats_expiry`)이 아니라 InnoDB에서 읽으므로, 그 사이에 커진 테이블도 지금
+  크기대로 나누어 읽습니다. `TABLE_PARALLELISM`이 1이면 아무것도 나누지 않습니다.
   - **PostgreSQL**: 모든 구간을 스냅샷 하나에서 읽고 테이블의 worker들이 그 스냅샷을 공유하므로,
     리더 하나일 때와 마찬가지로 복사본은 한 시점의 것입니다. 실행 전체의 추정 행 수 중 그 테이블이
     차지하는 몫만큼의 worker(최대 `TABLE_PARALLELISM`)가 테이블을 읽으며, worker마다 연속된 구간

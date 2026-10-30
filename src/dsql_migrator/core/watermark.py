@@ -40,7 +40,10 @@ Two guarantees from the design are preserved:
 
 - Read-only source (Property 1): every statement issued here is a read or
   transaction-control statement (``START TRANSACTION`` / ``COMMIT`` / ``SHOW``
-  / ``SELECT``), and the same read-only guard from
+  / ``SELECT``) -- on MySQL 8.0+ also one session ``SET`` before the row estimates, so
+  they come from InnoDB and not from the statistics cache
+  (:meth:`~dsql_migrator.core.source_dialect.base.SourceDialect.prepare_estimate_session`)
+  -- and the same read-only guard from
   :mod:`dsql_migrator.core.introspector` is installed on the default engine so
   any accidental write/DDL is refused before reaching the database.
 - Graceful degradation (Requirement 5.7): binlog/GTID metadata may be
@@ -395,7 +398,9 @@ def capture_watermark(
         server_uuid = _read_global_variable(connection, "server_uuid")
         # Approximate, scan-free row estimates (information_schema) to keep the
         # source load negligible during capture; validation re-counts exactly
-        # when it needs precise numbers.
+        # when it needs precise numbers. They size the Full Load's key ranges and its
+        # start order, so MySQL 8.0+ gives them from InnoDB, not its day-long cache.
+        _MYSQL_DIALECT.prepare_estimate_session(connection)
         table_row_counts = _approximate_row_counts(connection, tables)
     finally:
         connection.execute(text(COMMIT))

@@ -475,6 +475,20 @@ class SourceDialect(ABC):
         """
         return {}
 
+    def prepare_estimate_session(self, connection: object) -> None:
+        """Make the row estimates read next on ``connection`` current, before they are read.
+
+        Called once on each session the Full Load reads its scan-free estimates in, before
+        those reads: the start point's (whose estimates decide which tables are read in key
+        ranges and the order the tables start in) and the shard planner's (an explicit
+        Reader shards value against ``SHARD_MIN_ROWS``). Best effort: a session it cannot
+        prepare reads the estimates as they stand and the run goes on; only a
+        :class:`~dsql_migrator.core.introspector.ReadOnlySourceError` propagates. The
+        default sends nothing (PostgreSQL's ``reltuples`` is read as it stands); MySQL 8.0
+        and later reads them from the storage engine instead of its statistics cache.
+        """
+        return None
+
     @abstractmethod
     def probe_versions(self, connection: object) -> SourceVersions:
         """Read source version metadata read-only for the overview diagram.

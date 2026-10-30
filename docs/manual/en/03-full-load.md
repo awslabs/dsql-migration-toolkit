@@ -437,7 +437,10 @@ one key range of a table at about 20,000 rows/s: spread over several, its writes
   `FULL_LOAD_READER_SHARDS`) sets K: `0` = automatic, the default: one range per
   2,500,000 estimated rows from 5,000,000 rows, at most 32 (10M rows: 4 ranges); `1` =
   off; `2`–`32` = exactly that many (below). The estimates are the start point's scan-free
-  ones, and nothing is split when `TABLE_PARALLELISM` is 1.
+  ones. On MySQL 8.0 and later (Aurora MySQL 3) the tool reads them from InnoDB, not from
+  the copy MySQL caches (for a day by default, `information_schema_stats_expiry`), so a
+  table that has grown since then is split by its current size. Nothing is split when
+  `TABLE_PARALLELISM` is 1.
   - **PostgreSQL**: every range is read from one snapshot, which the table's workers
     share, so the copy is one point in time, as with one reader. The table is read by as
     many workers as its share of the run's estimated rows (at most `TABLE_PARALLELISM`),

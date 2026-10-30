@@ -8814,6 +8814,7 @@ class BatchedTableMigrator:
             with engine.connect() as connection:
                 if stack_name is None:
                     wal_lsn = dialect.capture_resume_lsn(connection)
+                dialect.prepare_estimate_session(connection)
                 estimates = estimate_source_rows(connection, list(table_names), dialect)
         finally:
             engine.dispose()
