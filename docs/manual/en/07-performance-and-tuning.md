@@ -178,10 +178,12 @@ that product up to a ceiling of 8 sink tasks and stops there:
 is spread evenly. With many tables it gives each topic one partition, and one partition is
 consumed by at most one sink task, so a hot table would stream through a single task while
 the rest sit idle. The tool therefore reads scan-free per-table row-count estimates (the
-Full Load watermark's, or a fresh `information_schema` estimate if CDC infrastructure is
-deployed before Full Load) and gives larger tables 2 or 4 partitions. This is automatic:
-it applies only to a genuinely skewed capture and does nothing under even load. Because a
-topic's partition count is fixed at creation, changing it needs a fresh CDC deploy.
+Full Load watermark's or, if CDC infrastructure is deployed before Full Load, the source's
+at deploy time) and gives larger tables 2 or 4 partitions. On MySQL 8.0 and later
+(Aurora MySQL 3) both come from InnoDB, not from the copy MySQL caches (for a day by
+default, `information_schema_stats_expiry`). This is automatic: it applies only to a
+genuinely skewed capture and does nothing under even load. Because a topic's partition
+count is fixed at creation, changing it needs a fresh CDC deploy.
 
 Per-row ordering holds for every change that keeps the primary key (Debezium keys each
 record by primary key). Two kinds of change span partitions: an `UPDATE` that changes the

@@ -1156,6 +1156,8 @@ def _estimate_cdc_table_rows(session, table_names):
         dialect = dialect_for(source_config.source_type)
         engine = make_source_engine_factory(session.source_password)(source_config)
         with engine.connect() as connection:
+            # MySQL 8.0+: the sizes from InnoDB, not the statistics cache (up to a day old).
+            dialect.prepare_estimate_session(connection)
             estimates = estimate_source_rows(connection, list(table_names), dialect)
         scoped = {n: int(c) for n, c in estimates.items() if c}
         return scoped or None

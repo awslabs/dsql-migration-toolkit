@@ -124,11 +124,12 @@ def _source_estimate_header_tip(source_type) -> str:
     return (
         "Approximate row count from the source's information_schema — a scan-free "
         "ESTIMATE, so this view never runs a COUNT(*) full scan against your live "
-        "source. InnoDB derives it from index sampling, and MySQL 8.0+ also caches it "
-        "for information_schema_stats_expiry (24 hours by default), so it commonly "
-        "differs from the true count by several percent (more on a large table) and "
-        "often UNDERCOUNTS — a target that slightly exceeds it is normal, not data "
-        "duplication. ANALYZE TABLE refreshes it. " + exact_hint
+        "source. InnoDB derives it from index sampling, so it commonly differs from the "
+        "true count by several percent (more on a large table) and often UNDERCOUNTS — "
+        "a target that slightly exceeds it is normal, not data duplication. On MySQL "
+        "8.0+ it is read from InnoDB, not from the copy MySQL caches for "
+        "information_schema_stats_expiry (24 hours by default). ANALYZE TABLE refreshes "
+        "it. " + exact_hint
     )
 
 

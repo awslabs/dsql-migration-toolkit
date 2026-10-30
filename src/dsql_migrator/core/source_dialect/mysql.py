@@ -57,15 +57,16 @@ _MYSQL_INTEGER_PK_TYPES = frozenset(
 # Length) on a write-heavy source.
 _MYSQL_REPEATABLE_READ = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 
-# Sent before the Full Load's row estimates are read (``prepare_estimate_session``): MySQL
+# Sent before the tool's row estimates are read (``prepare_estimate_session``): MySQL
 # 8.0 and later (Aurora MySQL 3) answer information_schema.TABLES' statistics (TABLE_ROWS,
 # AUTO_INCREMENT, the sizes) from a copy the data dictionary keeps for
 # information_schema_stats_expiry seconds, a day by default. A table that grew since the copy
 # was taken reads as it was then, so the Full Load could read a table grown past 5,000,000
-# rows whole, and start it late. 0 makes the session's reads ask the storage engine (InnoDB:
-# the statistics it keeps, never a row read) and store no new copy. A SESSION SET no
-# privilege restricts: the server's setting is left alone, and the read-only guard lets a SET
-# through. MySQL 5.7 (Aurora MySQL 2) has neither the variable nor the cache.
+# rows whole, and start it late, and the CDC monitor and CDC partition sizing saw its old
+# size. 0 makes the session's reads ask the storage engine (InnoDB: the statistics it keeps,
+# never a row read) and store no new copy. A SESSION SET no privilege restricts: the server's
+# setting is left alone, and the read-only guard lets a SET through. MySQL 5.7 (Aurora MySQL
+# 2) has neither the variable nor the cache.
 _LIVE_TABLE_STATISTICS = "SET SESSION information_schema_stats_expiry = 0"
 
 
@@ -718,7 +719,7 @@ class MySQLSourceDialect(SourceDialect):
     def prepare_estimate_session(self, connection: object) -> None:
         # MySQL 8.0+: the estimates from the storage engine, not the statistics cache (see
         # _LIVE_TABLE_STATISTICS); nothing is sent to 5.7. A refused SET leaves the cached
-        # figures, and the run goes on with them.
+        # figures, and the read goes on with them.
         if not _caches_table_statistics(connection):
             return
         from sqlalchemy import text

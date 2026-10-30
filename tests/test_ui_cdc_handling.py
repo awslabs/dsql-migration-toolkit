@@ -1967,6 +1967,9 @@ def _fetch_with_fake_source(monkeypatch, stats_behaviour):
             yield object()
 
     class _Dialect:
+        def prepare_estimate_session(self, connection):
+            return None
+
         def estimate_stats_at(self, connection, tables):
             return stats_behaviour(tables)
 
@@ -2535,6 +2538,9 @@ def test_the_monitor_reads_the_source_in_autocommit(monkeypatch) -> None:
             yield _Connection()
 
     class _Dialect:
+        def prepare_estimate_session(self, connection):
+            return None
+
         def estimate_stats_at(self, connection, tables):
             return {}
 

@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Automatic key-range splitting sees fresh MySQL row estimates.
+"""Automatic key-range splitting, and the UI's own row estimates, see fresh MySQL estimates.
 
 MySQL 8.0 and later (Aurora MySQL 3) answer ``information_schema.TABLES.TABLE_ROWS`` from a
 copy the data dictionary caches for ``information_schema_stats_expiry`` seconds, a day by
@@ -9,7 +9,11 @@ default. A table that grew since the copy was taken read as it was then: Reader 
 (automatic, from 5,000,000 estimated rows) read it whole, and the start order (R2) started it
 late. The Full Load's estimate sessions -- the start point's and the shard planner's -- now send
 ``SET SESSION information_schema_stats_expiry = 0`` once, before their estimate reads, so
-InnoDB answers from the statistics it keeps (still no row read). Pinned here:
+InnoDB answers from the statistics it keeps (still no row read). So do the UI's own estimate
+reads: Refresh source/target counts (the CDC monitor's Source rows (est.), which compared a
+purged table's exact target count with the cache's old figure and read "rows missing") and
+the CDC partition sizing of a deploy before any Full Load (which sized a table grown since
+the cache by its old size). Pinned here:
 
 * the gate: MySQL 8.0 and later (Aurora MySQL 3, 8.4, 9.x), told from the version SQLAlchemy's
   own MySQL dialect parsed at connect, real version strings included; nothing is sent to 5.7 or
@@ -25,9 +29,12 @@ InnoDB answers from the statistics it keeps (still no row read). Pinned here:
 * end to end, FAILING WITHOUT THE CHANGE: the start point captured from a session that caches
   statistics makes the automatic planner read a table that grew past 5M rows in key ranges, and
   start it first; the shard planner plans a table the cache puts under the minimum;
-* PostgreSQL sends nothing, and the estimate read itself is unchanged, so the UI's own reads
-  (Refresh counts, the CDC monitor, whose tooltip says the figure is cached) are as before;
-* the manual says so in every language.
+* the UI's reads (the counts refresh, CDC partition sizing): the SET once per read, before it;
+  nothing on 5.7; a refused SET leaves the cached figure and the read still lands; end to end, a
+  purged table reads consistent and a grown one gets its partitions by its live size; the CDC
+  monitor's tooltip says where the figure comes from;
+* PostgreSQL sends nothing, and the shared estimate read sends no SET of its own;
+* the manual says so in every language (§3.8 and §7.2).
 
 Doubles only: no MySQL, no Aurora DSQL, no AWS.
 """
@@ -349,7 +356,130 @@ def test_a_table_grown_past_5m_rows_since_the_cache_is_split_and_starts_first(
 
 
 # ---------------------------------------------------------------------------
-# 3. What did not change
+# 3. The UI's own reads: Refresh source/target counts and CDC partition sizing
+# ---------------------------------------------------------------------------
+
+
+def _ui_session():
+    """The browser session the UI reads the MySQL source through: the password in memory
+    only (Property 7), no target."""
+    from types import SimpleNamespace
+
+    from dsql_migrator.config import SecretValue
+
+    return SimpleNamespace(
+        source_config=_MYSQL, source_password=SecretValue("pw"), has_source=lambda: True,
+        has_target=lambda: False, target_config=None,
+    )
+
+
+def _refreshed_rows(monkeypatch, session: _Session, tables=(EVENTS,)):
+    """Refresh source/target counts over ``session`` (the CDC monitor's Source rows (est.)),
+    through the real MySQL dialect: the source estimates, which must have been read."""
+    from dsql_migrator.ui.data_migration import DataMigrationState, _cdc_status
+
+    monkeypatch.setattr(
+        _cdc_status, "make_source_engine_factory", lambda _pw: lambda _c: _Engine(session))
+    source_counts, *_rest, source_available = _cdc_status._fetch_migration_row_counts(
+        DataMigrationState(), _ui_session(), list(tables))
+    assert source_available is True
+    return source_counts
+
+
+def _cdc_sized_rows(monkeypatch, session: _Session, tables=(EVENTS,)):
+    """The estimates a CDC deploy sizes its topic partitions from when no Full Load recorded
+    any (CDC infrastructure deployed first), read over ``session`` through the real dialect."""
+    import dsql_migrator.ui.connect as connect
+    from dsql_migrator.ui.data_migration._cdc_ui import _estimate_cdc_table_rows
+
+    monkeypatch.setattr(
+        connect, "make_source_engine_factory", lambda _pw, **_k: lambda _c: _Engine(session))
+    return _estimate_cdc_table_rows(_ui_session(), list(tables))
+
+
+_UI_READS = pytest.mark.parametrize(
+    "read", [_refreshed_rows, _cdc_sized_rows], ids=["counts-refresh", "cdc-sizing"])
+
+
+@_UI_READS
+def test_each_ui_read_sets_it_once_right_before_its_estimate(monkeypatch, read) -> None:
+    # FAILS WITHOUT THE CHANGE: both read the cached 3M rows.
+    session = _Session(cached={EVENTS: 3 * _M}, live={EVENTS: 12 * _M})
+    assert read(monkeypatch, session) == {EVENTS: 12 * _M}
+    assert session.sql.count(_LIVE_TABLE_STATISTICS) == 1
+    assert session.index(_LIVE_TABLE_STATISTICS) == session.index("SELECT DATABASE()") - 1
+    assert session.index(_LIVE_TABLE_STATISTICS) < session.index(_ESTIMATE)
+    assert not [sql for sql in session.sql if is_write_or_ddl(sql)]
+    assert not any("COUNT(*)" in sql.upper() for sql in session.sql)
+
+
+@_UI_READS
+def test_each_ui_read_on_5_7_sends_no_set(monkeypatch, read) -> None:
+    session = _Session("5.7.44-log", live={EVENTS: 12 * _M})
+    assert read(monkeypatch, session) == {EVENTS: 12 * _M}
+    assert not any("INFORMATION_SCHEMA_STATS_EXPIRY" in sql.upper() for sql in session.sql)
+
+
+@_UI_READS
+def test_a_refused_set_leaves_each_ui_read_the_cached_estimate(monkeypatch, read) -> None:
+    # The read still lands (the counts refresh still reports the source as read).
+    session = _Session(cached={EVENTS: 3 * _M}, live={EVENTS: 12 * _M},
+                       refuse=_Refused("(1227, 'Access denied')"))
+    assert read(monkeypatch, session) == {EVENTS: 3 * _M}
+
+
+def test_a_table_purged_since_the_cache_no_longer_reads_as_rows_missing(monkeypatch) -> None:
+    # FAILS WITHOUT THE CHANGE: the cache still held the 12M rows of a table since purged to
+    # 3M, so the monitor set the target's exact 3M against 12M -- far past the estimate's
+    # tolerance, with the stream caught up -- and read "rows missing" (gap).
+    from dsql_migrator.ui.data_migration import build_migration_table_status
+
+    session = _Session(cached={EVENTS: 12 * _M}, live={EVENTS: 3 * _M})
+    (row,) = build_migration_table_status(
+        [EVENTS], source_counts=_refreshed_rows(monkeypatch, session),
+        target_counts={EVENTS: 3 * _M}, source_max_pk={EVENTS: 9}, target_max_pk={EVENTS: 9})
+    assert row.source_estimate is True and row.consistency == "consistent"
+
+
+def test_a_table_grown_since_the_cache_gets_its_cdc_partitions_by_its_live_size(
+        monkeypatch) -> None:
+    # Eight captured tables the cache holds at 1M rows each (even: one partition per topic);
+    # app.events has grown to 12M since. FAILS WITHOUT THE CHANGE: the deploy sized from the
+    # cache left app.events on one partition, so one sink task streamed it.
+    from dsql_migrator.core.cdc import CDC_DEFAULT_TOPIC_PREFIX as prefix, cdc_scaling_params
+
+    names = [EVENTS] + [f"app.t{i}" for i in range(1, 8)]
+    session = _Session(cached={name: 1 * _M for name in names},
+                       live={**{name: 1 * _M for name in names}, EVENTS: 12 * _M})
+    counts = _cdc_sized_rows(monkeypatch, session, names)
+    params = dict(cdc_scaling_params(names, prefix, row_counts_by_table=counts, env={}))
+    assert params["SinkTopicPartitions"], "uniform: every topic on one partition"
+    partitions = dict(pair.rsplit(":", 1) for pair in params["SinkTopicPartitions"].split(","))
+    assert partitions.pop(f"{prefix}.{EVENTS}") == "4"
+    assert set(partitions.values()) == {"1"} and len(partitions) == 7
+
+
+def test_the_cdc_monitor_tooltip_says_mysql_8_reads_innodb_not_the_cache() -> None:
+    from dsql_migrator.core.models import SourceType
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _source_estimate_header_tip
+
+    tip = _source_estimate_header_tip(SourceType.MYSQL)
+    variable = _LIVE_TABLE_STATISTICS.split()[2]
+    assert "MySQL 8.0+ it is read from InnoDB, not from the copy MySQL caches" in tip
+    assert variable in tip and "also caches it" not in tip
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_manual_says_cdc_partition_sizing_reads_mysql_estimates_from_innodb(lang) -> None:
+    variable = _LIVE_TABLE_STATISTICS.split()[2]
+    text_ = (MANUAL / lang / "07-performance-and-tuning.md").read_text(encoding="utf-8")
+    cdc = _flat(lang, text_.split("\n### CDC (", 1)[1].split("\n#### ", 1)[0])
+    assert f"`{variable}`" in cdc and "InnoDB" in cdc, lang
+    assert _has(lang, cdc, "MySQL 8.0") and _has(lang, cdc, "Aurora MySQL 3"), lang
+
+
+# ---------------------------------------------------------------------------
+# 4. What did not change
 # ---------------------------------------------------------------------------
 
 
@@ -362,9 +492,8 @@ def test_postgresql_sends_nothing() -> None:
 
 
 def test_the_estimate_read_itself_sends_no_set() -> None:
-    # The SET belongs to the Full Load's estimate sessions; the read that the UI's Refresh
-    # counts and the CDC monitor share is unchanged (the CDC monitor's tooltip says the MySQL
-    # figure is cached).
+    # Each caller sends the SET once on its own session (the start point, the planner, the
+    # counts refresh, CDC partition sizing); the estimate read they share sends none itself.
     session = _Session(cached={EVENTS: 3 * _M}, live={EVENTS: 12 * _M})
     assert estimate_source_rows(session, [EVENTS]) == {EVENTS: 3 * _M}
     assert _LIVE_TABLE_STATISTICS not in session.sql

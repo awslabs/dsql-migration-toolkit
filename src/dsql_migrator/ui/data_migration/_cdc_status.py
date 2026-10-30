@@ -432,6 +432,9 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
                 # transaction, which every later table's MAX(pk) and the slot-health read
                 # then found ABORTED -- the WAL-retention panel disappeared with them.
                 connection = _autocommit(connection)
+                # MySQL 8.0+: the estimate from InnoDB, not the statistics cache (up to a
+                # day old), as the Full Load reads its own; nothing is sent to 5.7.
+                dialect.prepare_estimate_session(connection)
                 source_counts = estimate_source_rows(connection, list(table_names), dialect)
                 source_max_pk = max_pk_source(connection, pk_by_table, dialect)
                 # PostgreSQL CDC only: piggyback the source read-only connection to read
