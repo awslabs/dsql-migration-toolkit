@@ -7,16 +7,21 @@ Measured live (Seoul, 2026-10-25): one primary-key-ordered stream into one key r
 Aurora DSQL table takes about 20,000 rows a second (10 commits of 2,000 rows) whatever is in
 flight; more only queues there (CommitLatency 26 ms -> 0.7 s with 8 in flight -> 3 s with
 32, ComputeDPU four times as high at the same rows/s), and Tables in parallel 12 x Batches
-per table 32 (352 in flight) loaded slower, at ten times the commit latency. So each load
-unit keeps ``max(1, min(bp, R * ranges, B // total_workers))`` batches in flight -- R = 4
-per key range, B = 128 per run, bp = Batches per table -- and the run is at most B by
-construction: at most ``total_workers`` units run at once. No IPC, no tokens. Pinned here:
+per table 32 (352 in flight) loaded slower, at ten times the commit latency. Measured again
+(Seoul, 2026-10-31, PostgreSQL, one 80M-row table in 31-32 key ranges, two a unit, Tables in
+parallel 16): 2 in flight per key range loaded as fast as 4 (150-153K rows/s, OCC 0) at half
+the CommitLatency and ComputeDPU; one key range reaches its ~20K rows/s with 4 in flight. So
+each load unit keeps ``max(1, min(bp, max(F, R * ranges), B // total_workers))`` batches in
+flight -- R = 2 per key range, F = 4 per unit (the floor), B = 128 per run, bp = Batches
+per table -- and the run is at most B by construction: at most ``total_workers`` units run
+at once. No IPC, no tokens. Pinned here:
 
-* the rule and its measurement seams (``DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT`` /
-  ``DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET``: an integer >= 1, anything else keeps the
-  default);
+* the rule over a grid of literal caps (1-32 ranges x bp 1/8/32 x share None/4/8/16), and
+  its measurement seams (``DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT`` replaces R only, the
+  floor stays / ``DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET``: an integer >= 1, anything
+  else keeps the default);
 * an exhaustive grid (no hypothesis in the venv): the ``total_workers`` largest caps add up
-  to at most B, and every cap is between 1 and bp and at most R per key range;
+  to at most B, and every cap is between 1 and bp and at most R per key range or F;
 * the process path hands every unit its cap; ``migrate_table`` caps the importer it builds
   (a double's ``cap_parallelism``; a real importer never opens nor runs more than the cap);
   a whole-table worker hands ``migrate_table`` the parent's cap and a shard worker caps its
@@ -104,11 +109,13 @@ def _no_seams(monkeypatch):
 
 
 @pytest.mark.parametrize("bp, ranges, share, cap", [
-    (8, 1, None, 4),       # an unsplit table: 4 in flight (it was Batches per table, 8)
+    (8, 1, None, 4),       # an unsplit table: 4 in flight, the floor (2 per range would be 2)
+    (8, 2, None, 4),       # two key ranges: 2 each (it was 8)
+    (8, 3, None, 6),       # three key ranges: 2 each (it was 8)
     (8, 4, None, 8),       # four key ranges: Batches per table binds
-    (2, 1, None, 2),       # Batches per table below 4 binds
+    (2, 1, None, 2),       # Batches per table below the floor binds
     (32, 8, 6, 6),         # the unit's share of the run's budget binds
-    (8, 1, 1, 1),          # a share of one
+    (8, 1, 1, 1),          # a share of one, below the floor too
     (8, 0, None, 4),       # no range is read as one
     (1, 32, 128, 1),
     (32, 32, 128, 32),
@@ -117,9 +124,48 @@ def test_a_units_cap_is_the_smallest_of_its_three_bounds(bp, ranges, share, cap)
     assert engine._unit_in_flight(bp, ranges, share) == cap
 
 
+# The rule over the grid, as literal caps (not recomputed by the rule under test): Batches
+# per table and the unit's share of the run's budget -> its cap at 1, 2, 3, 4, 8 and 32 key
+# ranges. 2 per key range, never fewer than 4 (unless bp or the share is lower).
+_GRID_RANGES = (1, 2, 3, 4, 8, 32)
+_GRID = {
+    (1, None): (1, 1, 1, 1, 1, 1),
+    (1, 4): (1, 1, 1, 1, 1, 1),
+    (1, 8): (1, 1, 1, 1, 1, 1),
+    (1, 16): (1, 1, 1, 1, 1, 1),
+    (8, None): (4, 4, 6, 8, 8, 8),
+    (8, 4): (4, 4, 4, 4, 4, 4),
+    (8, 8): (4, 4, 6, 8, 8, 8),
+    (8, 16): (4, 4, 6, 8, 8, 8),
+    (32, None): (4, 4, 6, 8, 16, 32),
+    (32, 4): (4, 4, 4, 4, 4, 4),
+    (32, 8): (4, 4, 6, 8, 8, 8),
+    (32, 16): (4, 4, 6, 8, 16, 16),
+}
+
+
+def test_the_rule_over_the_grid_of_ranges_batches_per_table_and_shares() -> None:
+    assert len(_GRID) == 3 * 4
+    for (bp, share), caps in _GRID.items():
+        got = tuple(engine._unit_in_flight(bp, k, share) for k in _GRID_RANGES)
+        assert got == caps, (bp, share, got)
+
+
+def test_two_per_key_range_keeps_fewer_than_four_did_from_two_ranges(monkeypatch) -> None:
+    # The 2026-10-31 A/B's two arms, on one image: 2 per key range (the default) and 4 (the
+    # constant before, set through the seam). A unit of one key range keeps 4 either way.
+    assert (engine._RANGE_IN_FLIGHT, engine._UNIT_IN_FLIGHT_FLOOR) == (2, 4)
+    assert [engine._unit_in_flight(8, k, None) for k in (1, 2, 3, 4, 8)] == [4, 4, 6, 8, 8]
+    assert [engine._unit_in_flight(32, k, None) for k in (4, 8, 16)] == [8, 16, 32]
+    monkeypatch.setenv(_RANGE_SEAM, "4")
+    assert [engine._unit_in_flight(8, k, None) for k in (1, 2, 3, 4, 8)] == [4, 8, 8, 8, 8]
+    assert [engine._unit_in_flight(32, k, None) for k in (4, 8, 16)] == [16, 32, 32]
+
+
 def test_the_defaults_and_the_designs_examples() -> None:
-    assert (engine._RANGE_IN_FLIGHT, engine._RUN_IN_FLIGHT_BUDGET) == (4, 128)
-    assert (engine._range_in_flight(), engine._run_in_flight_budget()) == (4, 128)
+    assert (engine._RANGE_IN_FLIGHT, engine._UNIT_IN_FLIGHT_FLOOR,
+            engine._RUN_IN_FLIGHT_BUDGET) == (2, 4, 128)
+    assert (engine._range_in_flight(), engine._run_in_flight_budget()) == (2, 128)
     # Tables in parallel 4 x Batches per table 8 (the defaults), unsplit tables: 4 each,
     # 16 in flight for the run (it was 32). The budget does not bind at Tables in parallel
     # <= 16 with Batches per table 8.
@@ -127,8 +173,10 @@ def test_the_defaults_and_the_designs_examples() -> None:
     assert engine._in_flight_share(16) == 8
     # perf_ecom at Tables in parallel 12 x Batches per table 32: 12 x 4 = 48 (it was 352).
     assert 12 * engine._unit_in_flight(32, 1, engine._in_flight_share(12)) == 48
-    # Tables in parallel 16, two key ranges a unit: 16 x min(8, 8, 8) = 128, the budget.
-    assert 16 * engine._unit_in_flight(8, 2, engine._in_flight_share(16)) == 128
+    # The live A/B: Tables in parallel 16, an 80M-row table in 32 key ranges, two a unit:
+    # 16 x min(8, max(4, 2 x 2), 8) = 64 (it was 16 x 8 = 128, the budget) -- the same
+    # rows/s at half the commit latency and ComputeDPU.
+    assert 16 * engine._unit_in_flight(8, 2, engine._in_flight_share(16)) == 64
 
 
 def test_the_seams_replace_r_and_b(monkeypatch) -> None:
@@ -138,17 +186,20 @@ def test_the_seams_replace_r_and_b(monkeypatch) -> None:
     assert engine._unit_in_flight(16, 1, None) == 8
     assert engine._in_flight_share(4) == 8 and engine._in_flight_share(5) == 6
     assert engine._unit_in_flight(16, 4, engine._in_flight_share(4)) == 8
+    # R only: the floor stays, so 1 per key range still keeps 4 for a unit of up to four.
+    monkeypatch.setenv(_RANGE_SEAM, "1")
+    assert [engine._unit_in_flight(16, k, None) for k in (1, 2, 4, 6)] == [4, 4, 4, 6]
     # Read per call: unset again, the constants are back.
     monkeypatch.delenv(_RANGE_SEAM)
     monkeypatch.delenv(_BUDGET_SEAM)
-    assert (engine._range_in_flight(), engine._run_in_flight_budget()) == (4, 128)
+    assert (engine._range_in_flight(), engine._run_in_flight_budget()) == (2, 128)
 
 
 @pytest.mark.parametrize("raw", ["0", "-2", "", "   ", "four", "2.5", "1e3", "true"])
 def test_a_seam_that_is_not_an_integer_of_at_least_one_keeps_the_default(monkeypatch, raw):
     monkeypatch.setenv(_RANGE_SEAM, raw)
     monkeypatch.setenv(_BUDGET_SEAM, raw)
-    assert (engine._range_in_flight(), engine._run_in_flight_budget()) == (4, 128)
+    assert (engine._range_in_flight(), engine._run_in_flight_budget()) == (2, 128)
 
 
 def test_a_budget_below_the_pool_size_keeps_one_batch_per_running_unit(monkeypatch) -> None:
@@ -167,6 +218,7 @@ def test_a_runs_in_flight_never_exceeds_the_budget_over_the_whole_grid() -> None
     # counts, every unit the same shape and a mix. At most total_workers units run at once,
     # so the run's in flight is at most the sum of the total_workers largest caps.
     r, b = engine._RANGE_IN_FLIGHT, engine._RUN_IN_FLIGHT_BUDGET
+    floor = engine._UNIT_IN_FLIGHT_FLOOR
     checked = 0
     for tp in range(1, 17):
         for bp in (1, 2, 4, 8, 16, 32):
@@ -178,7 +230,7 @@ def test_a_runs_in_flight_never_exceeds_the_budget_over_the_whole_grid() -> None
                 for ranges in shapes:
                     caps = [engine._unit_in_flight(bp, k, share) for k in ranges]
                     for cap, k in zip(caps, ranges):
-                        assert 1 <= cap <= bp and cap <= r * k, (tp, bp, k, cap)
+                        assert 1 <= cap <= bp and cap <= max(floor, r * k), (tp, bp, k, cap)
                     largest = sorted(caps, reverse=True)[:total_workers]
                     assert sum(largest) <= b, (tp, bp, units, ranges)
                     checked += 1
@@ -252,7 +304,7 @@ def test_every_unit_of_the_pool_gets_its_cap(pool) -> None:
     # Batches per table below 4 binds.
     r = pool(tp=2, bp=2)
     assert r.whole == {"app.small": 2} and r.shards == [2, 2, 2, 2]
-    # Batches per table 32 at Tables in parallel 16: still 4 per key range.
+    # Batches per table 32 at Tables in parallel 16: still 4 for a unit of one key range.
     r = pool(tp=16, bp=32)
     assert r.whole == {"app.small": 4} and r.shards == [4, 4, 4, 4]
 
@@ -325,30 +377,35 @@ def test_migrate_table_caps_the_importer_before_it_loads(monkeypatch) -> None:
     result = migrator.migrate_table(orders, in_flight_cap=2)
     assert importer.caps == [2] and result.load_stats["in_flight_cap"] == 2
 
-    # Batches per table below 4 binds; the seam replaces R.
+    # Batches per table below 4 binds; the seam replaces R, never the floor of 4.
     monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM", "2")
     importer = _CappedImporter()
     migrator, orders = _table_migrator(importer)
     migrator.migrate_table(orders)
     assert importer.caps == [2]
     monkeypatch.delenv("DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM")
-    monkeypatch.setenv(_RANGE_SEAM, "1")
-    importer = _CappedImporter()
-    migrator, orders = _table_migrator(importer)
-    migrator.migrate_table(orders)
-    assert importer.caps == [1]
+    for seam, cap in (("1", 4), ("8", 8)):
+        monkeypatch.setenv(_RANGE_SEAM, seam)
+        importer = _CappedImporter()
+        migrator, orders = _table_migrator(importer)
+        migrator.migrate_table(orders)
+        assert importer.caps == [cap], seam
 
 
-def test_a_coexisting_load_read_in_ranges_gets_four_per_range(monkeypatch) -> None:
-    # The in-process K readers of a load while CDC streams (the only one migrate_table
-    # splits): three ranges, at most min(8, 3 x 4) = 8 in flight -- as before P3.
+@pytest.mark.parametrize("ranges, cap", [
+    ([(None, 3), (3, None)], 4),              # 2 per range: 4 (it was 8)
+    ([(None, 3), (3, 5), (5, None)], 6),      # 2 per range: 6 (it was 8)
+    ([(None, 2), (2, 3), (3, 5), (5, None)], 8),   # Batches per table binds, as before
+])
+def test_a_coexisting_load_read_in_ranges_gets_two_per_range(ranges, cap) -> None:
+    # The thread path: the in-process K readers of a load while CDC streams (the only one
+    # migrate_table splits on its own), sized without a share: min(8, max(4, K x 2)).
     importer = _CappedImporter()
-    migrator, orders = _table_migrator(
-        importer, ranges=[(None, 3), (3, 5), (5, None)], coexisting=True
-    )
+    migrator, orders = _table_migrator(importer, ranges=ranges, coexisting=True)
     result = migrator.migrate_table(orders)
-    assert importer.caps == [8]
-    assert (result.load_stats["ranges"], result.load_stats["in_flight_cap"]) == (3, 8)
+    assert importer.caps == [cap] == [engine._unit_in_flight(8, len(ranges), None)]
+    assert (result.load_stats["ranges"], result.load_stats["in_flight_cap"]) == (
+        len(ranges), cap)
     assert sorted(r["id"] for r in importer.received[0][1]) == [1, 2, 3, 4, 5, 6]
 
 
@@ -635,21 +692,23 @@ def test_the_flags_set_the_loaders_seams_for_the_run(mp, monkeypatch, tmp_path):
     assert mp.cmd_full_load(args) == 0                       # no flag: the product's caps
     assert _RANGE_SEAM not in os.environ and _BUDGET_SEAM not in os.environ
     assert json.loads(report_path.read_text())["in_flight"] == {
-        "per_range": 4, "run_budget": 128}
-    assert any("(in flight <= 4 per key range, 128 per run)" in line for line in seen["log"])
+        "per_range": 2, "unit_floor": 4, "run_budget": 128}
+    assert any("(in flight <= 2 per key range (at least 4 per table or part), 128 per run)"
+               in line for line in seen["log"])
 
     args.range_in_flight, args.in_flight_budget = 8, 64
     assert mp.cmd_full_load(args) == 0
     assert (os.environ[_RANGE_SEAM], os.environ[_BUDGET_SEAM]) == ("8", "64")
     assert json.loads(report_path.read_text())["in_flight"] == {
-        "per_range": 8, "run_budget": 64}
-    assert any("(in flight <= 8 per key range, 64 per run)" in line for line in seen["log"])
+        "per_range": 8, "unit_floor": 4, "run_budget": 64}
+    assert any("(in flight <= 8 per key range (at least 4 per table or part), 64 per run)"
+               in line for line in seen["log"])
 
     # A value the loader does not take is reported as what applied: its default.
     args.range_in_flight, args.in_flight_budget = 0, None
     assert mp.cmd_full_load(args) == 0
     assert json.loads(report_path.read_text())["in_flight"] == {
-        "per_range": 4, "run_budget": 64}
+        "per_range": 2, "unit_floor": 4, "run_budget": 64}
 
 
 def test_the_report_carries_each_tables_ranges_and_cap(mp) -> None:  # noqa: F811
@@ -661,7 +720,7 @@ def test_the_report_carries_each_tables_ranges_and_cap(mp) -> None:  # noqa: F81
         _args(), _job(), board, elapsed=13.0, started_at=0.0, finished_at=13.0, monitor={},
         cdc_mode=False,
     )
-    assert report["in_flight"] == {"per_range": 4, "run_budget": 128}
+    assert report["in_flight"] == {"per_range": 2, "unit_floor": 4, "run_budget": 128}
     per = {row["table"]: row for row in report["per_table"]}
     assert (per["perf.a"]["ranges"], per["perf.a"]["in_flight_cap"]) == (1, 4)
     assert (per["perf.b"]["ranges"], per["perf.b"]["in_flight_cap"]) == (2, 8)
@@ -670,8 +729,8 @@ def test_the_report_carries_each_tables_ranges_and_cap(mp) -> None:  # noqa: F81
     lines: list = []
     mp.log = lines.append
     mp._log_full_load_summary(report)
-    assert any("in flight: at most 4 per key range, 8 per table or part, 128 per run" in line
-               for line in lines), lines
+    assert any("in flight: at most 2 per key range (at least 4 per table or part), 8 per "
+               "table or part, 128 per run" in line for line in lines), lines
     assert any("perf.b" in line and "in flight <= 8 over 2 range(s)" in line
                for line in lines), lines
 
@@ -694,27 +753,36 @@ def test_the_settings_notice_names_the_caps_the_loader_applies(monkeypatch) -> N
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
     blob = " ".join(ui.texts)
-    assert ("Batches in flight are capped at 4 per key range "
-            "and 128 per run") in blob
+    assert ("Batches in flight are capped at 2 per key range (at least 4 per table or "
+            "part) and 128 per run") in blob
+    assert "4 per key range" not in blob
     # The live measurement: one key range writes about 20K rows/s however many batches are
     # in flight; more of them only cost commit latency and Aurora DSQL compute.
     assert ("A key range of an Aurora DSQL table takes about 20,000 rows a second "
             "whatever the batches in flight") in blob
     assert "only add commit latency and Aurora DSQL compute cost" in blob
-    # The seams (one-image A/Bs) are what the loader applies, so the notice follows them.
+    # The seams (one-image A/Bs) are what the loader applies, so the notice follows them;
+    # the floor is not a seam.
     monkeypatch.setenv(_RANGE_SEAM, "8")
     monkeypatch.setenv(_BUDGET_SEAM, "64")
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
-    assert ("Batches in flight are capped at 8 per key range "
-            "and 64 per run") in " ".join(ui.texts)
+    assert ("Batches in flight are capped at 8 per key range (at least 4 per table or "
+            "part) and 64 per run") in " ".join(ui.texts)
 
 
 def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:
+    # The numbers are the loader's: a description that kept an old cap fails here.
+    per_range = f"at most {engine._RANGE_IN_FLIGHT} per key range"
+    floor = f"at least {engine._UNIT_IN_FLIGHT_FLOOR} per table or part"
+    assert (per_range, floor) == ("at most 2 per key range", "at least 4 per table or part")
     fields = AppConfig.model_fields
     batches = fields["full_load_batch_parallelism"].description
     tables = fields["full_load_table_parallelism"].description
-    assert "at most this many" in batches and "each key range keeps at most 4" in batches
+    for text in (batches, tables):
+        assert per_range in text and floor in text, text
+        assert "at most 4 per key range" not in text and "keeps at most 4" not in text
+    assert "at most this many" in batches
     assert "at most 128" in batches
     # What more in flight costs, as measured live: commit latency and compute, no rows/s --
     # and not more OCC (40001) conflicts, which the description used to claim.
@@ -729,7 +797,7 @@ def test_the_knob_descriptions_name_the_caps_not_the_product() -> None:
     assert "parts of a large table" in tables and "at most 128 per run" in tables
     assert "x full_load_batch_parallelism" not in tables
     knobs = {k.field: k for k in TUNABLE_KNOBS}
-    assert "at most this many per table (each key range keeps at most 4)" in (
+    assert f"at most this many per table (and {per_range}, {floor})" in (
         knobs["full_load_batch_parallelism"].description)
     assert "parts of a large table" in knobs["full_load_table_parallelism"].description
     # The OCC-exhaustion hint names the two Settings knobs.

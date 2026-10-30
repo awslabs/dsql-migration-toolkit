@@ -27,6 +27,7 @@ from tests.test_g25_docs import LANGS, MANUAL, ROOT, _all_pages, _flat, _has, _p
 
 _P03 = "03-full-load.md"
 _P07 = "07-performance-and-tuning.md"
+_P11 = "11-customer-faq.md"
 _P12 = "12-performance-test-results.md"
 _README = {"en": "README.md", "ko": "README.ko.md", "ja": "README.ja.md"}
 
@@ -83,7 +84,8 @@ def test_the_in_flight_caps_are_the_settings_notice(lang: str, monkeypatch) -> N
     ui = _FormUi()
     _render_tuning_tab("Full Load", ui)
     header = (
-        f"Batches in flight are capped at {engine._range_in_flight()} per key range and "
+        f"Batches in flight are capped at {engine._range_in_flight()} per key range "
+        f"(at least {engine._UNIT_IN_FLIGHT_FLOOR} per table or part) and "
         f"{engine._run_in_flight_budget()} per run"
     )
     assert header in " ".join(ui.texts)
@@ -92,6 +94,53 @@ def test_the_in_flight_caps_are_the_settings_notice(lang: str, monkeypatch) -> N
     key = "`DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM`"
     assert budget in _row((MANUAL / lang / _P07).read_text(encoding="utf-8"), key), lang
     assert budget in _row((ROOT / _README[lang]).read_text(encoding="utf-8"), key), lang
+
+
+# The per-unit rule in each language's words, its numbers the loader's (2026-10-31): at most
+# R per key range, at least F per table or part. And the old cap of 4 per key range, in the
+# words each page used for it.
+def _in_flight_rule(lang: str) -> tuple:
+    from dsql_migrator.ui.data_migration import _full_load_engine as engine
+
+    r, f = engine._RANGE_IN_FLIGHT, engine._UNIT_IN_FLIGHT_FLOOR
+    return {
+        "en": (f"{r} per key range", f"at least {f} per table or part"),
+        "ko": (f"키 범위당 {r}개", f"테이블 또는 부분당 최소 {f}개"),
+        "ja": (f"キー範囲あたり {r}", f"テーブルまたは部分あたり最低 {f}"),
+    }[lang]
+
+
+_OLD_CAP = {"en": "at 4 per key range", "ko": "키 범위당 4개,", "ja": "キー範囲あたり 4、"}
+_GUARDRAIL = {"en": "**Connection-quota guardrail.**", "ko": "**연결 쿼터 가드레일.**",
+              "ja": "**接続クォータのガードレール。**"}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_in_flight_rule_is_the_loaders_wherever_it_is_stated(lang: str) -> None:
+    per_range, floor = _in_flight_rule(lang)
+    assert _in_flight_rule("en") == ("2 per key range", "at least 4 per table or part")
+    key = "`DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM`"
+    stated = {
+        "7.1": _section(lang, _P07, "## 7.1", "### "),
+        "7.2 row": _flat(lang, _row((MANUAL / lang / _P07).read_text(encoding="utf-8"), key)),
+        "7.2 guardrail": _section(lang, _P07, _GUARDRAIL[lang], "### Validation"),
+        _P11: _page(lang, _P11),
+        "README row": _flat(lang, _row((ROOT / _README[lang]).read_text(encoding="utf-8"),
+                                       key)),
+    }
+    for where, text in stated.items():
+        assert _has(lang, text, per_range) and _has(lang, text, floor), (lang, where)
+    # The 7.5 measurement that set the rule, cited where the manual gives in-flight numbers.
+    measured = _section(lang, _P07, "## 7.5", "## 7.6")
+    for fact in ("80M", "150,000", "1.4–1.6", "2.8", "`TotalDPU`"):
+        assert _has(lang, measured, fact), (lang, fact)
+    # The old cap is gone from every page of the manual and from the README -- in ko and ja
+    # also in English, the words of the Settings notice they quote.
+    readme = _flat(lang, (ROOT / _README[lang]).read_text(encoding="utf-8"))
+    for old in sorted({_OLD_CAP[lang], _OLD_CAP["en"]}):
+        stale = [name for name, text in {**_all_pages(lang), "README": readme}.items()
+                 if _has(lang, text, old)]
+        assert not stale, (lang, old, stale)
 
 
 # The ten-minute bound on a Drop & reload's wait for the builds on its empty tables (P4d).

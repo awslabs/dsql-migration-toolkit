@@ -43,11 +43,12 @@ Two subcommands:
               --inventory-order starts the tables in inventory order instead of the
               largest first, the other arm of the start-order A/B; --range-in-flight /
               --in-flight-budget set the INSERT batches in flight at most per key
-              range (4) and per run (128) for the in-flight A/B, and the report says
-              which caps applied and each table's. The loader puts a recreated table's
-              secondary indexes on the empty table before its rows and waits (bounded)
-              for their builds (P4d); --indexes-after-load submits them after every
-              table's data instead, as builds before P4d did, the other arm of that A/B.
+              range (2, at least 4 per table or part) and per run (128) for the
+              in-flight A/B, and the report says which caps applied and each table's.
+              The loader puts a recreated table's secondary indexes on the empty table
+              before its rows and waits (bounded) for their builds (P4d);
+              --indexes-after-load submits them after every table's data instead, as
+              builds before P4d did, the other arm of that A/B.
 
   cdc-lag     Measure END-TO-END CDC replication lag (source commit -> visible on
               the DSQL target) under a SUSTAINED trickle and under BURSTS, reporting
@@ -82,8 +83,8 @@ Usage (from repo root):
     .venv/bin/python scripts/measure_performance.py full-load --yes --reader-shards 1
     # Report the load only, without waiting for the index builds it submitted:
     .venv/bin/python scripts/measure_performance.py full-load --yes --wait-index-builds 0
-    # The in-flight A/B: 8 INSERT batches per key range instead of the loader's 4:
-    .venv/bin/python scripts/measure_performance.py full-load --yes --range-in-flight 8
+    # The in-flight A/B: 4 INSERT batches per key range instead of the loader's 2:
+    .venv/bin/python scripts/measure_performance.py full-load --yes --range-in-flight 4
     # The index-order A/B: secondary indexes after every table's data (before P4d):
     .venv/bin/python scripts/measure_performance.py full-load --yes --indexes-after-load
 
@@ -807,11 +808,13 @@ def _index_order() -> str:
 
 def _in_flight_caps() -> dict:
     """The INSERT batches the loader keeps in flight at most per key range and per run
-    (P3), as it reads them now: the product's 4 and 128 unless --range-in-flight /
-    --in-flight-budget set its seams to an integer >= 1."""
+    (P3), as it reads them now, and the floor a table or part keeps whatever its ranges:
+    the product's 2, 4 and 128 unless --range-in-flight / --in-flight-budget set its seams
+    to an integer >= 1 (--range-in-flight replaces the per-range cap only)."""
     from dsql_migrator.ui.data_migration import _full_load_engine as engine
 
-    return {"per_range": engine._range_in_flight(), "run_budget": engine._run_in_flight_budget()}
+    return {"per_range": engine._range_in_flight(), "unit_floor": engine._UNIT_IN_FLIGHT_FLOOR,
+            "run_budget": engine._run_in_flight_budget()}
 
 
 def cmd_full_load(args) -> int:
@@ -849,7 +852,7 @@ def cmd_full_load(args) -> int:
         os.environ["DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS"] = str(args.reader_shards)
     # --range-in-flight R / --in-flight-budget B: the batches in flight per key range and
     # per run (P3) -- the loader's measurement seams, so one image measures every arm of
-    # the R A/B. Unset: the product's (4 and 128).
+    # the R A/B. Unset: the product's (2 and 128; R never lowers a table or part below 4).
     for flag, key in _IN_FLIGHT_SEAMS:
         if getattr(args, flag, None) is not None:
             os.environ[key] = str(getattr(args, flag))
@@ -996,7 +999,8 @@ def cmd_full_load(args) -> int:
     caps = _in_flight_caps()
     log(f"Full Load '{schema}' ({len(tables)} tables) at "
         f"tp={args.table_parallelism} bp={args.batch_parallelism} (in flight <= "
-        f"{caps['per_range']} per key range, {caps['run_budget']} per run)"
+        f"{caps['per_range']} per key range (at least {caps['unit_floor']} per table or "
+        f"part), {caps['run_budget']} per run)"
         f"{' as Full load + CDC' if cdc_mode else ''}"
         f"{' in inventory order' if inventory_order else ''}"
         f"{' with the secondary indexes after the load' if _index_order() == 'after-load' else ''}"
@@ -1155,8 +1159,9 @@ def _full_load_report(args, job, board, *, elapsed: float, started_at: float,
         "batch_rows": int(cfg("DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS", "2000")),
         # P1: "auto" (0, the loader's default) or the number the loader read.
         "reader_shards": _reader_shards_setting(),
-        # P3: the INSERT batches in flight the loader allowed per key range and per run
-        # (its effective values; batch_parallelism above is the per-unit ceiling).
+        # P3: the INSERT batches in flight the loader allowed per key range and per run, and
+        # the floor per table or part (its effective values; batch_parallelism above is the
+        # per-unit ceiling).
         "in_flight": _in_flight_caps(),
         # P4d: where a recreated table's secondary indexes went: "before-load" (on the
         # empty table, its builds waited for before the first row) or "after-load"
@@ -1288,9 +1293,9 @@ def _log_full_load_summary(report: dict) -> None:
         f"at tp={report['table_parallelism']} bp={report['batch_parallelism']}")
     ifl = report.get("in_flight") or {}
     if ifl:
-        log(f"in flight: at most {ifl.get('per_range')} per key range, "
-            f"{report['batch_parallelism']} per table or part, {ifl.get('run_budget')} "
-            "per run")
+        log(f"in flight: at most {ifl.get('per_range')} per key range (at least "
+            f"{ifl.get('unit_floor')} per table or part), {report['batch_parallelism']} per "
+            f"table or part, {ifl.get('run_budget')} per run")
     if run:
         cores = run.get("worker_cores")
         log(f"connections: {run.get('connects')} opened, {run.get('reconnects')} reconnects, "
@@ -1549,8 +1554,9 @@ def main() -> int:
                          "value >= 2 reads them as parts from separate snapshots")
     fl.add_argument("--range-in-flight", type=int, default=None, metavar="N",
                     help="INSERT batches in flight at most per key range of a table "
-                         "(default: the loader's 4; still at most --batch-parallelism "
-                         "per table or part): the R arm of the in-flight A/B")
+                         "(default: the loader's 2; still at least 4 and at most "
+                         "--batch-parallelism per table or part): the R arm of the "
+                         "in-flight A/B")
     fl.add_argument("--in-flight-budget", type=int, default=None, metavar="N",
                     help="INSERT batches in flight at most per run, divided among the "
                          "worker processes (default: the loader's 128)")

@@ -925,10 +925,10 @@ def test_migrate_table_reads_its_ranges_through_one_session() -> None:
     assert [index for index, _ids in load.pages] == [0, 1, 2, 0, 2, 0, 2, 2]
     assert result.rows_loaded == len(_THREE) and sum(progress) == len(_THREE)
     assert load.on_conflict is OnConflictMode.SKIP_EXISTING     # an append, as with one range
-    # P3: the batches in flight of three key ranges (at most Batches per table).
-    assert importer.caps == [engine._unit_in_flight(8, 3, None)] == [8]
+    # P3: the batches in flight of three key ranges, 2 each (at most Batches per table).
+    assert importer.caps == [engine._unit_in_flight(8, 3, None)] == [6]
     snapshot = stats.snapshot()
-    assert snapshot["ranges"] == 3 and snapshot["in_flight_cap"] == 8
+    assert snapshot["ranges"] == 3 and snapshot["in_flight_cap"] == 6
 
 
 def test_a_page_holds_whole_batches_and_no_more_than_a_ranges_share_in_flight() -> None:
@@ -1209,7 +1209,8 @@ def test_full_load_only_reads_an_explicitly_split_mysql_table_with_one_session(m
     written = sorted(i for batch in target.batches for i in batch[::2])
     assert written == [r["id"] for r in rows]               # every row once
     assert ("reader shards", EVENTS, engine._SPLIT_ONE_SNAPSHOT.format(k=3)) in activity
-    assert len(importers) == 1 and importers[0]._options.parallelism == 8
+    # Its three key ranges keep 2 batches in flight each (P3).
+    assert len(importers) == 1 and importers[0]._options.parallelism == 6
 
 
 # ---------------------------------------------------------------------------

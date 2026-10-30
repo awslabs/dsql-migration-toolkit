@@ -1654,6 +1654,7 @@ def _render_tuning_group_controls(group: str) -> None:
     # a single Validation or CDC field.
     if group == "Full Load":
         from dsql_migrator.ui.data_migration._full_load_engine import (
+            _UNIT_IN_FLIGHT_FLOOR,
             _range_in_flight,
             _run_in_flight_budget,
         )
@@ -1663,6 +1664,7 @@ def _render_tuning_group_controls(group: str) -> None:
             tone="info",
             header=(
                 f"Batches in flight are capped at {_range_in_flight()} per key range "
+                f"(at least {_UNIT_IN_FLIGHT_FLOOR} per table or part) "
                 f"and {_run_in_flight_budget()} per run"
             ),
             body=(

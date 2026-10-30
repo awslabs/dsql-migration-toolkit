@@ -187,8 +187,8 @@ MAX_BATCH_BYTES = 8 * 1024 * 1024
 # Default number of concurrent in-flight INSERT batches (each on its own DSQL
 # connection). Tuned up toward the Loader's parallel model for throughput while
 # staying bounded so a single table does not exhaust DSQL connection/rate
-# limits. The Full Load lowers it per load unit (cap_parallelism): at most 4 per key
-# range the unit reads, and a share of the run's budget (P3, the engine's
+# limits. The Full Load lowers it per load unit (cap_parallelism): at most 2 per key
+# range the unit reads but at least 4, and a share of the run's budget (P3, the engine's
 # _unit_in_flight), so a run's in-flight connections are no longer
 # table_parallelism x this.
 DEFAULT_PARALLELISM = 8
@@ -1214,8 +1214,9 @@ class BatchedImporter:
 
         The pool size, :meth:`_run_data_batches`'s in-flight bound and the prefetch depth
         follow, since they read ``options.parallelism`` at each :meth:`import_rows` call.
-        The Full Load caps each load unit's importer (P3): at most 4 per key range it reads
-        and a share of the run's budget, as the engine's ``_unit_in_flight`` sizes it.
+        The Full Load caps each load unit's importer (P3): at most 2 per key range it reads
+        but at least 4, and a share of the run's budget, as the engine's ``_unit_in_flight``
+        sizes it.
         """
         self._options = self._options.model_copy(
             update={"parallelism": max(1, min(self._options.parallelism, int(n)))}

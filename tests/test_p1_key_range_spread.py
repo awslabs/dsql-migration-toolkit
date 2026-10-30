@@ -346,12 +346,30 @@ def test_a_postgresql_table_of_100m_rows_alone_gets_four_shards_of_eight_ranges(
     ranges = [rng for a in r.shards for rng in a.ranges]
     assert ranges == _KPlanner().plan_pk_shard_ranges(None, _table(BIG), 32)
     assert all((a.pk_lower, a.pk_upper) == (a.ranges[0][0], a.ranges[-1][1]) for a in r.shards)
-    # At most 4 batches in flight per range of its block, Batches per table (8) binding.
+    # At most 2 batches in flight per range of its block, Batches per table (8) binding.
     assert {a.in_flight for a in r.shards} == {engine._unit_in_flight(8, 8, 32)} == {8}
     assert {a.max_quarantine_records for a in r.shards} == {engine.MAX_QUARANTINE_RECORDS // 4}
     assert r.lines == [(BIG, engine._SPLIT_SHARED_SNAPSHOT_BLOCKS.format(k=32, g=4))]
     assert r.lines[0][1] == "read in 32 primary-key ranges by 4 readers sharing one snapshot"
     assert r.parts == {BIG: 4} and r.anchors == 1
+
+
+@pytest.mark.parametrize("tp, rows, k, block, cap", [
+    # The live A/B's shape (Seoul, 2026-10-31): an 80M-row table at Tables in parallel 16 is
+    # read in 32 ranges by 16 shards of two: 4 in flight each, 64 for the run (it was 8, 128).
+    (16, 80 * _M, 32, 2, 4),
+    # A 30M-row table at Tables in parallel 4: 12 ranges, 4 shards of three: 6 each (it was 8).
+    (4, 30 * _M, 12, 3, 6),
+])
+def test_a_postgresql_shards_block_keeps_two_in_flight_per_range(
+        spread, monkeypatch, tp, rows, k, block, cap) -> None:
+    monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", str(tp))
+    r = spread([_table(BIG)], {BIG: rows}, source=SourceType.POSTGRES, binlog=False)
+    assert r.planned == [(BIG, k, 0)]
+    assert [len(a.ranges) for a in r.shards] == [block] * tp
+    share = engine._in_flight_share(tp)
+    assert {a.in_flight for a in r.shards} == {engine._unit_in_flight(8, block, share)} == {cap}
+    assert sum(a.in_flight for a in r.shards) == tp * cap
 
 
 def test_two_postgresql_tables_of_100m_rows_share_the_pool(spread) -> None:
@@ -512,6 +530,24 @@ def test_a_blocks_page_holds_at_most_a_ranges_share_of_the_batches_in_flight(mon
     (call,) = exporter.calls
     assert call.page_rows == engine._range_page_rows(2000, 2, 2 // 2) == 2000
     assert result.load_stats["in_flight_cap"] == 2
+
+
+@pytest.mark.parametrize("ranges, cap", [
+    (_BLOCK, 4),                                         # two ranges: 2 each (it was 8)
+    (((None, 100), (100, 200), (200, None)), 6),         # three: 2 each (it was 8)
+])
+def test_a_block_shard_with_no_cap_from_the_parent_sizes_two_per_range(
+        monkeypatch, ranges, cap) -> None:
+    # A caller that sent no cap: the worker sizes its block itself (P3), at most 2 batches in
+    # flight per key range of it, and its pages hold at most a range's share of them.
+    exporter = _BlockExporter(_THREE)
+    result, _queue = _run_block_shard(monkeypatch, exporter, _PagesImporter(), ranges=ranges,
+                                      base=0, in_flight=None)
+    assert result.status == "DONE"
+    assert (result.load_stats["ranges"], result.load_stats["in_flight_cap"]) == (
+        len(ranges), cap)
+    (call,) = exporter.calls
+    assert call.page_rows == engine._range_page_rows(2000, 2, cap // len(ranges)) == 4000
 
 
 def test_a_shard_re_reading_its_block_imports_the_snapshot_again_and_keeps_its_resume_point(

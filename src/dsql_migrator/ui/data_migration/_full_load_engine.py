@@ -994,22 +994,29 @@ _MAX_READER_RANGES = 32
 # rows a second (10 commits of 2,000 rows) whatever is in flight -- more only queues there:
 # CommitLatency 26 ms at about 6 commits/s, 0.7 s with 8 in flight, 3 s with 32, and
 # ComputeDPU four times as high at the same rows/s -- and Tables in parallel 12 x Batches
-# per table 32 (352 in flight) loaded SLOWER, at ten times the commit latency. So a unit
-# keeps at most _RANGE_IN_FLIGHT per key range it reads (and at most Batches per table), and
-# the process pool divides _RUN_IN_FLIGHT_BUDGET among its workers (_in_flight_share): at
-# most that many units run at once, so the run never has more in flight than the budget.
-# Static on purpose: no token to leak when a worker is terminated, nothing for a Stop to
-# wait on.
-_RANGE_IN_FLIGHT = 4
+# per table 32 (352 in flight) loaded SLOWER, at ten times the commit latency. Measured again
+# (Seoul, 2026-10-31, PostgreSQL, one 80M-row table in 31-32 key ranges, two a unit, Tables
+# in parallel 16): 2 in flight per key range loaded it as fast as 4 (150-153K rows/s either
+# way, OCC 0) at half the CommitLatency (1.4-1.6 s against 2.8 s) and half the ComputeDPU
+# (TotalDPU per row about 5% lower); and one key range reaches its ~20K rows/s with 4 in
+# flight (2 on one key range was never measured). So a unit keeps at most _RANGE_IN_FLIGHT
+# per key range it reads but never fewer than _UNIT_IN_FLIGHT_FLOOR (and at most Batches
+# per table), and the process pool divides _RUN_IN_FLIGHT_BUDGET among its workers
+# (_in_flight_share): at most that many units run at once, so the run never has more in
+# flight than the budget. Static on purpose: no token to leak when a worker is terminated,
+# nothing for a Stop to wait on.
+_RANGE_IN_FLIGHT = 2
+_UNIT_IN_FLIGHT_FLOOR = 4
 _RUN_IN_FLIGHT_BUDGET = 128
 
 
 # Measurement seams ONLY, read per call like core.batched_import._prefetch_enabled: an
 # integer >= 1 in DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT (R) or in
-# DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET (B) replaces the constant above, anything else
-# keeps it. They exist so one deployed image can be A/B'd (scripts/measure_performance.py
-# --range-in-flight / --in-flight-budget, or an ECS RunTask env override); they are not
-# settings -- not in config.py, not on the Settings page -- and nothing in the app sets them.
+# DSQL_MIGRATOR_FULL_LOAD_IN_FLIGHT_BUDGET (B) replaces its constant above (R replaces
+# _RANGE_IN_FLIGHT only: _UNIT_IN_FLIGHT_FLOOR stays), anything else keeps it. They exist
+# so one deployed image can be A/B'd (scripts/measure_performance.py --range-in-flight /
+# --in-flight-budget, or an ECS RunTask env override); they are not settings -- not in
+# config.py, not on the Settings page -- and nothing in the app sets them.
 def _in_flight_seam(name: str, default: int) -> int:
     """The integer >= 1 in the environment variable ``name``, else ``default``."""
     raw = os.environ.get(name)
@@ -1021,7 +1028,8 @@ def _in_flight_seam(name: str, default: int) -> int:
 
 
 def _range_in_flight() -> int:
-    """At most this many INSERT batches in flight per key range a unit reads (P3)."""
+    """At most this many INSERT batches in flight per key range a unit reads (P3; the unit
+    keeps at least :data:`_UNIT_IN_FLIGHT_FLOOR` whatever its ranges)."""
     return _in_flight_seam("DSQL_MIGRATOR_FULL_LOAD_RANGE_IN_FLIGHT", _RANGE_IN_FLIGHT)
 
 
@@ -1040,13 +1048,14 @@ def _in_flight_share(total_workers: int) -> int:
 def _unit_in_flight(batch_parallelism: int, ranges: int, share: Optional[int]) -> int:
     """The INSERT batches one load unit keeps in flight at most (P3): Batches per table
     (``batch_parallelism``, the per-unit ceiling), at most :func:`_range_in_flight` per key
-    range it reads, and at most its ``share`` of the run's budget (``None``: no share, the
-    thread path's one unit at a time). Always at least 1."""
+    range it reads but never fewer than :data:`_UNIT_IN_FLIGHT_FLOOR` (at the defaults: 4 for
+    one or two ranges, 6 for three, 8 from four), and at most its ``share`` of the run's
+    budget (``None``: no share, the thread path's one unit at a time). Always at least 1."""
     return max(
         1,
         min(
             int(batch_parallelism),
-            _range_in_flight() * max(1, int(ranges)),
+            max(_UNIT_IN_FLIGHT_FLOOR, _range_in_flight() * max(1, int(ranges))),
             share if share else int(batch_parallelism),
         ),
     )
@@ -2249,8 +2258,9 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             except Exception:  # noqa: BLE001 - a double may not carry the field
                 pass
         # P3: at most _range_in_flight batches in flight per key range this shard reads -- one,
-        # or (P1) its block of the table's ranges -- and at most its share of the run's
-        # budget (sized by the parent).
+        # or (P1) its block of the table's ranges -- but never fewer than
+        # _UNIT_IN_FLIGHT_FLOOR, and at most its share of the run's budget (sized by the
+        # parent).
         block = tuple(args.ranges) if len(args.ranges) > 1 else ()
         key_ranges = len(block) or 1
         in_flight = args.in_flight or _unit_in_flight(
@@ -5211,8 +5221,9 @@ def _migrate_tables_in_parallel(
         # P3: the INSERT batches each unit keeps in flight. At most total_workers units run
         # at once, each with at most its share of the run's budget, so the run never has
         # more than the budget in flight. A unit reads one key range -- or its ranges in
-        # turn (P2: a table read by one reader session; P1: a shard's block): at most 4 per
-        # range of them (sized per unit at submission).
+        # turn (P2: a table read by one reader session; P1: a shard's block): at most
+        # _RANGE_IN_FLIGHT per range of them, never fewer than _UNIT_IN_FLIGHT_FLOOR (sized
+        # per unit at submission).
         _share = _in_flight_share(total_workers)
         start_order = _largest_first(work_units, _order_estimates)
 
@@ -9547,9 +9558,10 @@ class BatchedTableMigrator:
         one_session = len(read_ranges) > 1 and not (
             not is_replace and self._inputs.cdc_coexisting
         )
-        # P3: at most 4 batches in flight per key range this call reads (a row stream, or a
-        # range of the one session's turn) and at most Batches per table -- or what the
-        # parent sized for this unit.
+        # P3: at most _RANGE_IN_FLIGHT batches in flight per key range this call reads (a row
+        # stream, or a range of the one session's turn) but never fewer than
+        # _UNIT_IN_FLIGHT_FLOOR, and at most Batches per table -- or what the parent sized
+        # for this unit.
         key_ranges = len(read_ranges) if one_session else len(shard_ranges)
         in_flight = in_flight_cap or _unit_in_flight(
             cfg.full_load_batch_parallelism, key_ranges, None
