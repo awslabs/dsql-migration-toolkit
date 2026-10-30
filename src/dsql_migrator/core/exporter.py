@@ -59,13 +59,15 @@ import threading
 from abc import ABC, abstractmethod
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
+from functools import partial
+from operator import itemgetter
 from time import monotonic as _wall_monotonic, sleep as _wall_sleep
 from typing import (
     Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence, TextIO,
 )
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, Result
 
 from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory, _limit_lock_waits
@@ -387,6 +389,74 @@ class ValueConverter:
             and name not in self._duration_columns
             and name not in self._zero_dates
         )
+        # Every other column's conversion, resolved once for the table: what convert_value
+        # does to a value of it that is not None (see _value_function). Used by
+        # row_converter, the Full Load read's per-row path.
+        self._value_functions: dict[str, Callable[[object], object]] = {
+            name: self._value_function(name)
+            for name in self._kinds
+            if name not in self._passthrough_columns
+        }
+
+    def _value_function(self, column_name: str) -> Callable[[object], object]:
+        """``convert_value(column_name, value)`` for a value that is not None, with the
+        column's dispatch decided here, once: the type PyMySQL returns for the column takes a
+        fast path giving what convert_value gives for it, and every other value -- a zero date
+        (a str), a subclass, a value out of range -- goes to convert_value itself, so the
+        result, the zero-date tally and every error stay convert_value's."""
+        slow = partial(self.convert_value, column_name)
+        if column_name in self._bit_columns:
+            # Checked before the target kind, as convert_value does.
+            def bit(value: object) -> object:
+                if type(value) is bytes:
+                    return int.from_bytes(value, byteorder="big")
+                return slow(value)
+
+            return bit
+        if column_name in self._duration_columns:
+            def duration(value: object) -> object:
+                if type(value) is timedelta:
+                    return duration_text(value)
+                return slow(value)
+
+            return duration
+        kind = self._kinds.get(column_name)
+        if kind == "boolean":
+            def boolean(value: object) -> object:
+                if type(value) is int and (value == 0 or value == 1):
+                    return value == 1
+                return slow(value)
+
+            return boolean
+        if kind == "bytea":
+            def bytea(value: object) -> object:
+                # bytes(value) is value itself for a bytes object.
+                return value if type(value) is bytes else slow(value)
+
+            return bytea
+        if kind == "timestamp":
+            def timestamp(value: object) -> object:
+                # A naive DATETIME: _utc(value).replace(tzinfo=None) is the same wall clock.
+                if type(value) is datetime and value.tzinfo is None:
+                    return value
+                return slow(value)
+
+            return timestamp
+        if kind == "timestamptz":
+            def timestamptz(value: object) -> object:
+                if type(value) is datetime and value.tzinfo is None:
+                    return value.replace(tzinfo=timezone.utc)
+                return slow(value)
+
+            return timestamptz
+        if kind == "time" or column_name not in self._zero_dates:
+            return slow
+
+        # A zero-date column whose target kind converts nothing: only a str is mapped.
+        def zero_dates_only(value: object) -> object:
+            return slow(value) if isinstance(value, str) else value
+
+        return zero_dates_only
 
     def zero_date_entries(self) -> "tuple[tuple[str, str, str, int], ...]":
         """The zero / invalid dates this converter mapped, as ``(column, ZERO | INVALID,
@@ -514,6 +584,35 @@ class ValueConverter:
             name: (value if name in passthrough else self.convert_value(name, value))
             for name, value in row.items()
         }
+
+    def row_converter(
+        self, names: Sequence[str]
+    ) -> Callable[[Sequence[object]], dict[str, object]]:
+        """The function that converts a row whose values come in ``names`` order (an
+        SQLAlchemy ``Row``, a tuple) to the dict :meth:`convert_row` returns for the mapping
+        of ``names`` to those values -- the same keys in the same order, the same values,
+        tally and errors. ``names`` must be distinct.
+
+        Resolved once for ``names`` (a keyset page's columns): the row is zipped into a dict,
+        and only the columns convert_value changes are visited, by position, through the
+        functions resolved for them (:meth:`_value_function`); a None stays None."""
+        names = tuple(names)
+        functions = self._value_functions
+        visits = tuple(
+            (position, name, functions[name])
+            for position, name in enumerate(names)
+            if name in functions
+        )
+
+        def convert(values: Sequence[object]) -> dict[str, object]:
+            row = dict(zip(names, values))
+            for position, name, function in visits:
+                value = values[position]
+                if value is not None:
+                    row[name] = function(value)
+            return row
+
+        return convert
 
 
 class ValueFitGuard:
@@ -1146,6 +1245,40 @@ class _RangePages:
             turn.lock.release()
 
 
+def _page_reader(
+    result: object,
+    pk_columns: Sequence[str],
+    key_of_mapping: Callable[[Mapping[str, object]], tuple],
+    converter: Optional[object],
+) -> "tuple[Iterable[object], Callable[[object], tuple], Optional[Callable[[object], object]]]":
+    """How :func:`keyset_pages` reads one page's ``result``: ``(its rows, the key of a row as
+    the source sent it, what is yielded for a row -- None: the row itself)``.
+
+    An SQLAlchemy result read for a ``converter`` that converts a row by position (its
+    ``row_converter``) is iterated as its ``Row`` tuples: the key is taken by position and
+    the row converted from its values in the result's column order -- no ``RowMapping`` per
+    row, no lookup by name per value. Anything else -- no converter, a converter without
+    ``row_converter``, a result that is not SQLAlchemy's (a test double), columns that are
+    not distinct or do not name every key column -- is read as before: the result's
+    mappings, keyed by name, each converted by ``convert_row`` when there is a converter.
+    Either way a row's key and the row yielded are the same; the result is read to its end
+    the same way (P2)."""
+    row_converter = getattr(converter, "row_converter", None)
+    if row_converter is not None and isinstance(result, Result):
+        names = tuple(result.keys())
+        if len(set(names)) == len(names) and all(c in names for c in pk_columns):
+            positions = [names.index(c) for c in pk_columns]
+            # A tuple either way: one position is a one-element slice (a tuple of the Row).
+            key_of = (
+                itemgetter(slice(positions[0], positions[0] + 1))
+                if len(positions) == 1
+                else itemgetter(*positions)
+            )
+            return result, key_of, row_converter(names)
+    emit = None if converter is None else converter.convert_row  # type: ignore[attr-defined]
+    return result.mappings(), key_of_mapping, emit  # type: ignore[attr-defined]
+
+
 def keyset_stream(
     connection: _Connection,
     table: TableDef,
@@ -1159,11 +1292,12 @@ def keyset_stream(
     target_types: Optional[Mapping[str, str]] = None,
     on_description: Optional[Callable[[object], None]] = None,
     from_only: bool = False,
+    converter: Optional[object] = None,
 ) -> Iterator[Mapping[str, object]]:
     """Yield ``table`` rows in ascending primary-key order via keyset pagination.
 
     The rows of :func:`keyset_pages`, page after page: the same statements, parameters,
-    checks and errors (the pages, flattened).
+    checks and errors (the pages, flattened); ``converter`` as there.
 
     ``from_only`` reads ``FROM ONLY <table>``: a PostgreSQL inheritance parent's own rows,
     the rows CDC captures for it (:func:`_reads_own_rows_only`, which callers ask once per
@@ -1223,6 +1357,7 @@ def keyset_stream(
         target_types=target_types,
         on_description=on_description,
         from_only=from_only,
+        converter=converter,
     )
     try:
         for page in pages:
@@ -1244,6 +1379,7 @@ def keyset_pages(
     target_types: Optional[Mapping[str, str]] = None,
     on_description: Optional[Callable[[object], None]] = None,
     from_only: bool = False,
+    converter: Optional[object] = None,
 ) -> Iterator[Iterator[Mapping[str, object]]]:
     """Yield ``table``'s keyset pages in ascending primary-key order, one row iterator each.
 
@@ -1257,6 +1393,12 @@ def keyset_pages(
     page read to its end before any other statement: asking for the next page while the
     previous one still has rows to read raises :class:`RuntimeError` instead of letting the
     driver drop them (:data:`_PAGE_NOT_DRAINED`).
+
+    ``converter`` (optional, the table's ``dialect.value_converter``) yields each row as its
+    ``convert_row`` converts it, after the page's checks have read the row's key as the
+    source sent it; None (the default) yields the result's mappings as they are. An
+    SQLAlchemy result is then read by position (:func:`_page_reader`), the hot path of the
+    Full Load read.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -1350,17 +1492,26 @@ def keyset_pages(
         result: object, cursor: Optional[tuple], member: Optional[int], read: list
     ) -> Iterator[Mapping[str, object]]:
         """One page's rows as the source sends them, checked against the page's ``cursor``
-        (and, walking, its ``member``). Once the last one has been read, ``read`` gets the
-        page's tally: (rows read, rows skipped, its first key, its last key -- ``cursor``
-        when it yielded none)."""
+        (and, walking, its ``member``), each yielded converted when there is a ``converter``.
+        Once the last one has been read, ``read`` gets the page's tally: (rows read, rows
+        skipped, its first key, its last key -- ``cursor`` when it yielded none)."""
+        rows, key_of, emit = _page_reader(result, pk_columns, _key_of, converter)
+        # The cursor as the source tells keys apart, once per page. Told apart, a key equal
+        # to it is equal to it as it is too, so a key that is not equal (every row but a
+        # re-read one) skips the told-apart comparison.
+        told_cursor = None if cursor is None else tuple(map(_told_apart, cursor))
         page_count = 0
         skipped = 0
         first_key: Optional[tuple] = None
         last = cursor
-        for row in result.mappings():  # type: ignore[attr-defined]
+        for row in rows:
             page_count += 1
-            key = _key_of(row)
-            if cursor is not None and tuple(map(_told_apart, key)) == tuple(map(_told_apart, cursor)):
+            key = key_of(row)
+            if (
+                cursor is not None
+                and key == cursor
+                and tuple(map(_told_apart, key)) == told_cursor
+            ):
                 if rereads and first_key is None:
                     # The cursor names its value only as the source rounds it, so the page
                     # starts at the rows that read back as it: ones already read, or ones the
@@ -1392,7 +1543,20 @@ def keyset_pages(
             if first_key is None:
                 first_key = key
             last = key
-            yield row
+            if emit is None:
+                yield row
+                continue
+            try:
+                converted = emit(row)
+            except BaseException:
+                # A value the converter refuses. The error's traceback keeps this frame, so
+                # let go of the page's result here: it (and its cursor) then goes as soon as
+                # nothing else holds it -- for a row stream when the stream closes its pages,
+                # before the COMMIT that ends the snapshot, as when the stream converted the
+                # rows itself -- not only once the error is gone.
+                rows = result = None  # noqa: F841
+                raise
+            yield converted
         read.append((page_count, skipped, first_key, last))
 
     last_key: Optional[tuple] = None
@@ -1734,7 +1898,7 @@ class TableExporter:
                 try:
                     # Inside the snapshot: the read below takes exactly these rows.
                     from_only = _reads_own_rows_only(snapshot, table, dialect)
-                    for raw in keyset_stream(
+                    for row in keyset_stream(
                         snapshot,
                         table,
                         batch_size=self._batch_size,
@@ -1746,8 +1910,8 @@ class TableExporter:
                         target_types=target_types,
                         on_description=on_description,
                         from_only=from_only,
+                        converter=converter,
                     ):
-                        row = converter.convert_row(raw)
                         if guard is not None and guard.armed:
                             guard.check(row)
                         yield row
@@ -1899,6 +2063,7 @@ class TableExporter:
                             target_types=target_types,
                             on_description=on_description,
                             from_only=from_only,
+                            converter=converter,
                         )
                         for lo, hi in bounds
                     ]
@@ -1917,7 +2082,7 @@ class TableExporter:
                             turn.drained = False
                             # The thread asking for it reads it (_RangePages.close).
                             turn.reader = threading.get_ident()
-                            yield index, _converted_page(page, converter, guard, turn)
+                            yield index, _converted_page(page, guard, turn)
                         live = still
                 except BaseException:  # incl. GeneratorExit: the consumer stopped early
                     _end_snapshot_after_failure(snapshot)
@@ -1939,19 +2104,17 @@ class TableExporter:
 
 def _converted_page(
     page: "Iterable[Mapping[str, object]]",
-    converter: object,
     guard: "Optional[ValueFitGuard]",
     turn: _PageTurn,
 ) -> "Iterator[Mapping[str, object]]":
-    """One keyset page's rows converted for the target and checked by ``guard`` once armed,
-    as :meth:`TableExporter.stream_converted_rows` converts and checks them. ``turn.drained``
-    turns True once its last row has been read (:meth:`TableExporter.stream_converted_ranges`
-    asks for no other page before), and ``turn.reader`` is cleared once it has ended in any
-    way: its reader no longer reads the session for it."""
-    convert_row = converter.convert_row  # type: ignore[attr-defined]
+    """One keyset page's rows, converted for the target by the page itself (its
+    :func:`keyset_pages` has the converter), checked by ``guard`` once armed, as
+    :meth:`TableExporter.stream_converted_rows` checks them. ``turn.drained`` turns True once
+    its last row has been read (:meth:`TableExporter.stream_converted_ranges` asks for no
+    other page before), and ``turn.reader`` is cleared once it has ended in any way: its
+    reader no longer reads the session for it."""
     try:
-        for raw in page:
-            row = convert_row(raw)
+        for row in page:
             if guard is not None and guard.armed:
                 guard.check(row)
             yield row
@@ -1989,8 +2152,9 @@ def export_rows(
         for row in keyset_stream(
             connection, table, batch_size=batch_size, dialect=dialect,
             from_only=_reads_own_rows_only(connection, table, dialect),
+            converter=value_converter,
         ):
-            writer.write_row(value_converter.convert_row(row))
+            writer.write_row(row)
             rows_exported += 1
     except BaseException:
         _end_snapshot_after_failure(connection)

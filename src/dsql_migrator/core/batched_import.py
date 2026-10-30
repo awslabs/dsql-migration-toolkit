@@ -115,6 +115,8 @@ from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import date, datetime
+from decimal import Decimal
 from enum import Enum
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
@@ -2673,8 +2675,10 @@ def _estimate_row_bytes(row: Mapping[str, object]) -> int:
     total = 0
     for value in row.values():
         # Exact-type fast paths first (the common column types, no isinstance chain; an
-        # ASCII str is its own byte length and ``isascii`` is O(1)); the rest -- subclasses,
-        # bool, Decimal, datetime -- take the general branches, so the integer is unchanged.
+        # ASCII str is its own byte length and ``isascii`` is O(1); a naive datetime, a date
+        # and a bool are the length of their str() without building it); the rest --
+        # subclasses, an aware datetime -- take the general branches, so the integer is
+        # unchanged.
         kind = type(value)
         if kind is str:
             total += len(value) if value.isascii() else len(value.encode("utf-8"))
@@ -2684,6 +2688,15 @@ def _estimate_row_bytes(row: Mapping[str, object]) -> int:
             total += 1
         elif kind is bytes:
             total += len(value)
+        elif kind is datetime and value.tzinfo is None:
+            # 'YYYY-MM-DD HH:MM:SS', then '.ffffff' when it has microseconds.
+            total += 26 if value.microsecond else 19
+        elif kind is date:
+            total += 10  # 'YYYY-MM-DD'
+        elif kind is Decimal:
+            total += len(str(value))
+        elif kind is bool:
+            total += 4 if value else 5  # 'True' / 'False'
         elif isinstance(value, (bytes, bytearray, memoryview)):
             total += len(value)
         elif isinstance(value, str):

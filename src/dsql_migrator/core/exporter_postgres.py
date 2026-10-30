@@ -27,7 +27,7 @@ Python value, and the converter simply passes rows through unchanged.
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
 from dsql_migrator.core.models import TableDef
 
@@ -36,10 +36,11 @@ class PostgresValueConverter:
     """Pass-through value converter for a PostgreSQL source.
 
     Mirrors :class:`~dsql_migrator.core.exporter.ValueConverter`'s interface
-    (``convert_row``/``convert_value``) so the exporter uses either interchangeably via
-    ``dialect.value_converter``. PostgreSQL->DSQL is psycopg-native on both ends, so no
-    per-value translation is needed; json/jsonb is handled at the source connection (see
-    the module docstring), leaving nothing engine-specific for the converter to do.
+    (``convert_row``/``row_converter``/``convert_value``) so the exporter uses either
+    interchangeably via ``dialect.value_converter``. PostgreSQL->DSQL is psycopg-native on
+    both ends, so no per-value translation is needed; json/jsonb is handled at the source
+    connection (see the module docstring), leaving nothing engine-specific for the converter
+    to do.
     ``target_types`` is accepted for interface parity but unused (no PG type needs a
     per-value transform).
     """
@@ -59,6 +60,15 @@ class PostgresValueConverter:
     def convert_row(self, row: Mapping[str, object]) -> dict[str, object]:
         """Return a plain dict copy of ``row`` (values already bind-ready)."""
         return dict(row)
+
+    def row_converter(
+        self, names: Sequence[str]
+    ) -> Callable[[Sequence[object]], dict[str, object]]:
+        """The function :meth:`convert_row` is for a row whose values come in ``names``
+        order (an SQLAlchemy ``Row``): the dict of ``names`` to its values (the keyset read's
+        positional path, :func:`~dsql_migrator.core.exporter._page_reader`)."""
+        names = tuple(names)
+        return lambda values: dict(zip(names, values))
 
 
 __all__ = ["PostgresValueConverter"]

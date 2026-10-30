@@ -48,13 +48,18 @@ _JAVA_COPY = (
 
 
 def _convert(mysql_type: str, value: object) -> object:
-    """Run one value through ValueConverter for a single-column table."""
+    """Run one value through ValueConverter for a single-column table: ``convert_value``, and
+    the Full Load read's own path (``row_converter``, a page's row by position), which must
+    give the same value of the same type."""
     table = TableDef(
         name="t",
         columns=[ColumnDef(name="val", mysql_type=mysql_type)],
         primary_key=["id"],
     )
-    return ValueConverter(table).convert_value("val", value)
+    expected = ValueConverter(table).convert_value("val", value)
+    got = ValueConverter(table).row_converter(("val",))((value,))["val"]
+    assert (type(got), repr(got)) == (type(expected), repr(expected)), mysql_type
+    return got
 
 
 # ---------------------------------------------------------------------------

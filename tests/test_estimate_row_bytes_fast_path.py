@@ -25,6 +25,20 @@ class _Color(enum.IntEnum):
     RED = 7
 
 
+class _DateTime(dt.datetime):
+    def __str__(self) -> str:
+        return "a datetime"
+
+
+class _Date(dt.date):
+    def __str__(self) -> str:
+        return "a date"
+
+
+class _Decimal(decimal.Decimal):
+    pass
+
+
 def _reference(row) -> int:
     total = 0
     for value in row.values():
@@ -50,6 +64,22 @@ _ROWS = [
      "c": decimal.Decimal("1.2300"), "d": float("inf"), "e": float("nan")},
     {"a": bytearray(b"abc"), "b": memoryview(b"abcd"), "c": 10**40, "d": -3},
     {},
+    # The converted MySQL temporal and numeric values (a naive datetime, a date, a Decimal and
+    # a bool take exact-type paths): with and without microseconds, the year padded to four
+    # digits, the range ends, a fold; an aware datetime and the subclasses take the general rule.
+    {"a": dt.datetime(2024, 1, 2, 3, 4, 5), "b": dt.datetime(2024, 1, 2, 3, 4, 5, 1),
+     "c": dt.datetime(2024, 1, 2, 3, 4, 5, 999999), "d": dt.datetime(1, 1, 1),
+     "e": dt.datetime(999, 12, 31, 23, 59, 59), "f": dt.datetime.max, "g": dt.datetime.min,
+     "h": dt.datetime(2024, 11, 3, 1, 30, fold=1)},
+    {"a": dt.datetime(2024, 1, 2, tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30))),
+     "b": dt.datetime(2024, 1, 2, 3, tzinfo=dt.timezone(dt.timedelta(seconds=-3601, microseconds=5))),
+     "c": _DateTime(2024, 1, 2, 3, 4, 5, 6), "d": _DateTime(2024, 1, 2, tzinfo=_UTC)},
+    {"a": dt.date(2024, 2, 29), "b": dt.date.min, "c": dt.date.max, "d": dt.date(999, 1, 1),
+     "e": _Date(2024, 1, 1)},
+    {"a": decimal.Decimal("123.456000"), "b": decimal.Decimal("-0"), "c": decimal.Decimal("1E+3"),
+     "d": decimal.Decimal("-1.5E-7"), "e": decimal.Decimal("sNaN"), "f": _Decimal("9.99"),
+     "g": decimal.Decimal(10) ** 40},
+    {"a": True, "b": False, "c": dt.time(1, 2, 3, 4), "d": None, "e": 0.1},
 ]
 
 
