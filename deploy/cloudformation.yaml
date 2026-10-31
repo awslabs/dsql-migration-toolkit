@@ -185,11 +185,12 @@ Parameters:
   ContainerCpu:
     Type: Number
     Default: 512
-    AllowedValues: [256, 512, 1024, 2048, 4096, 8192, 16384]
+    AllowedValues: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     Description: >
-      Fargate task CPU units (1024 = 1 vCPU, 4096 = 4 vCPU, 16384 = 16 vCPU). Full Load
-      is CPU-bound (per-row type conversion): 512 is fine for evaluation, but use 1024+
-      (ideally 4096) for a real large-scale Full Load. Also gates the valid memory range.
+      Fargate task CPU units (1024 = 1 vCPU, 4096 = 4 vCPU, 16384 = 16 vCPU,
+      32768 = 32 vCPU). Full Load is CPU-bound (per-row type conversion): 512 is fine for
+      evaluation, but use 1024+ (ideally 4096) for a real large-scale Full Load. Also gates
+      the valid memory range.
 
   ContainerMemory:
     Type: Number
@@ -200,7 +201,7 @@ Parameters:
       processes and with wide TEXT/BLOB rows, so 1024 can be tight for a real load: use
       2048+ for a Full Load, 8192+ for large LOBs. Must be valid for the chosen CPU
       (256->512MiB/1GB/2GB, 512->1-4GB, 1024->2-8GB, 2048->4-16GB, 4096->8-30GB,
-      8192->16-60GB in 4GB steps, 16384->32-120GB in 8GB steps).
+      8192->16-60GB in 4GB steps, 16384->32-120GB in 8GB steps, 32768->60GB/120GB/244GB).
 
   AppPort:
     Type: Number

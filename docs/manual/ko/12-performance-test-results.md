@@ -26,11 +26,11 @@ Connect**)에서 수행했습니다(1ms 미만 네트워크 RTT).
 
 ## Full Load
 
-### 최대 규모 실행 (16 vCPU)
+### 16 vCPU 실행
 
 | 구성요소 | 설정 |
 |---|---|
-| **ECS Fargate** | 16 vCPU, 120 GB 메모리(가장 큰 태스크) |
+| **ECS Fargate** | 16 vCPU, 120 GB 메모리 |
 | **소스** | Aurora MySQL과 Aurora PostgreSQL, `db.r8g.16xlarge` |
 | **타깃** | Aurora DSQL, `ap-northeast-2` |
 | **로더 설정** | *Tables in parallel* 16, 나머지는 모두 기본값(*Reader shards per large table*은 실행에 따로 적지 않으면 자동, *Batches per table* 8, *Rows per batch* 2000) |

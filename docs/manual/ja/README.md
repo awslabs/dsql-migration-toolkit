@@ -70,7 +70,7 @@ Data Migration は **Full Load**（ツール独自のバルクローダー）と
 | 9 | [Query Converter と AI DBA](09-query-validation.md) | 任意の Query Converter: 単一の MySQL クエリを Aurora DSQL へ変換し、ターゲット上で読み取り専用でテストし（`EXPLAIN` / `EXPLAIN ANALYZE` + DPU コスト）、**AI DBA** に DSQL の効率に合わせて書き直させ、再テストによって改善を証明します。 |
 | 10 | [Conclusion](10-conclusion.md) | どの経路をいつ使うか、推奨されるエンドツーエンドのフロー、次に進む先。 |
 | 11 | [Customer FAQ](11-customer-faq.md) | 顧客が最もよく尋ねる質問 — Full Load、CDC、制限、型マッピング、検証、カットオーバー／ロールバック、運用 — を、ツールの実際の動作に基づいて回答し、詳細へのリンクを添えています。 |
-| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | 実測した Full Load と CDC のスループット — MySQL・PostgreSQL ソースでの最大サイズの実行と、それを左右する要因 — と、測定の再現方法。 |
+| 12 | [付録: 性能テスト結果](12-performance-test-results.md) | 実測した Full Load と CDC のスループット — MySQL・PostgreSQL ソースでの 16 vCPU の実行と、それを左右する要因 — と、測定の再現方法。 |
 | 13 | [テーブルと列の除外](13-excluding-tables-and-columns.md) | **Exclude tables & columns** ルールポップアップ: ルール言語、除外できないもの、除外した列が Aurora DSQL で NULL になる仕組み、後から除外設定を変更する方法 (Change & reload)、CDC キャプチャリスト、Validation と Cut over。 |
 
 ## MySQL・PostgreSQL ユーザーへの Aurora DSQL についての注意

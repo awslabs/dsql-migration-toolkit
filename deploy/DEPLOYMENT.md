@@ -557,8 +557,8 @@ Optional deep-dives — expand what you need; none of this is required for a fir
 | `AlbScheme` | no | `internal` | `internal` or `internet-facing`. **Recommended: `internal`** (reach via VPN/Direct Connect/peering); use `internet-facing` only with Cognito on. |
 | `CertificateArn` | yes | — | ACM cert ARN for the HTTPS (443) listener. |
 | `ContainerImageUri` | no | published ECR Public image | Defaults to the image published on ECR Public — no build needed. Override only for a restricted network (your private ECR copy / pull-through cache) or a custom build; prefer an immutable tag or digest. |
-| `ContainerCpu` | no | `512` | Fargate task CPU units. **A MySQL Full Load is CPU-bound** (reading and converting rows keeps about one core busy per table loading at once), so raise this for a large migration and set the Full Load's *Tables in parallel* to the vCPU count — measured, `16384` (16 vCPU) with *Tables in parallel* 16 loaded 16 MySQL tables at **~193K rows/s** with every core busy. A PostgreSQL Full Load needs far fewer cores (it is bound by Aurora DSQL). Default `512` is fine for evaluation; use **4096 or higher** for a real large-scale Full Load. See [manual §7.2](../docs/manual/en/07-performance-and-tuning.md#72-tuning-parallelism). |
-| `ContainerMemory` | no | `1024` | Fargate task memory (MiB) — a **hard limit**: exceed it and the kernel OOM-kills the task (no graceful shutdown, only a CloudWatch spike + ELB timeout). Memory is bounded by the buffered pipeline — roughly `table_parallelism × (prefetch + batch_parallelism) × per-batch-bytes` **summed across the worker processes**, not by table size — and **wide / oversized-LOB rows push per-batch bytes up**, so the `1024` default can be tight for a real load with concurrent source writes. **Sizing:** `1024` is fine for evaluation / small tables; use **≥ 2048** for a real Full Load, and **≥ 8192** (`8192` itself is valid with `ContainerCpu` `1024`, `2048` or `4096`) when tables have large `TEXT`/`BLOB` values or you raise the parallelism settings. Must be valid for the CPU (Fargate pairs `256` CPU with 512 MiB, 1 GB or 2 GB, `512` with 1–4 GB, `1024` with 2–8 GB, `2048` with 4–16 GB, `4096` with 8–30 GB, `8192` with 16–60 GB in 4 GB steps, `16384` with 32–120 GB in 8 GB steps — see the sizing table below). The app logs a memory high-water and an ~80% pressure warning (in the activity log too) so an approaching OOM is visible before the kill. |
+| `ContainerCpu` | no | `512` | Fargate task CPU units. **A MySQL Full Load is CPU-bound** (reading and converting rows keeps about one core busy per table loading at once), so raise this for a large migration and set the Full Load's *Tables in parallel* to the vCPU count, up to its maximum of 16 — measured, `16384` (16 vCPU) with *Tables in parallel* 16 loaded 16 MySQL tables at **~193K rows/s** with every core busy; `32768` (32 vCPU) is accepted too, but loads no more tables or parts at once (not measured). A PostgreSQL Full Load needs far fewer cores (it is bound by Aurora DSQL). Default `512` is fine for evaluation; use **4096 or higher** for a real large-scale Full Load. See [manual §7.2](../docs/manual/en/07-performance-and-tuning.md#72-tuning-parallelism). |
+| `ContainerMemory` | no | `1024` | Fargate task memory (MiB) — a **hard limit**: exceed it and the kernel OOM-kills the task (no graceful shutdown, only a CloudWatch spike + ELB timeout). Memory is bounded by the buffered pipeline — roughly `table_parallelism × (prefetch + batch_parallelism) × per-batch-bytes` **summed across the worker processes**, not by table size — and **wide / oversized-LOB rows push per-batch bytes up**, so the `1024` default can be tight for a real load with concurrent source writes. **Sizing:** `1024` is fine for evaluation / small tables; use **≥ 2048** for a real Full Load, and **≥ 8192** (`8192` itself is valid with `ContainerCpu` `1024`, `2048` or `4096`) when tables have large `TEXT`/`BLOB` values or you raise the parallelism settings. Must be valid for the CPU (Fargate pairs `256` CPU with 512 MiB, 1 GB or 2 GB, `512` with 1–4 GB, `1024` with 2–8 GB, `2048` with 4–16 GB, `4096` with 8–30 GB, `8192` with 16–60 GB in 4 GB steps, `16384` with 32–120 GB in 8 GB steps, `32768` with 60 GB, 120 GB or 244 GB — see the sizing table below). The app logs a memory high-water and an ~80% pressure warning (in the activity log too) so an approaching OOM is visible before the kill. |
 | `AppPort` | no | `8080` | Container listen port. |
 | `AssignPublicIp` | no | `DISABLED` | `ENABLED` to run the task in public subnets without a NAT (test); **recommended: keep `DISABLED`** for production (NAT gateway or VPC endpoints). |
 | `AllowedIngressCidr` | no | `10.0.0.0/8` | CIDR allowed to reach the ALB on 443. **Recommended: scope to your network**, not `0.0.0.0/0`. |
@@ -594,15 +594,17 @@ shutdown). Pick a valid pair:
 | `4096` (4) | 8–30 GB | 1 GB |
 | `8192` (8) | 16–60 GB | 4 GB |
 | `16384` (16) | 32–120 GB | 8 GB |
+| `32768` (32) | 60, 120, 244 GB | fixed |
 
 **Recommended by workload:**
 
 - **Evaluation / small tables:** the `512` / `1024` MiB default is fine.
 - **Real Full Load:** **`1024` CPU / `2048` MiB** or higher, up to **`16384` CPU** for a
   large MySQL load with *Tables in parallel* at the vCPU count (a MySQL load keeps about
-  one core busy per table loading at once; a PostgreSQL one far less). Memory grows with
-  `table_parallelism × batch_parallelism` across worker processes — the `512`/`1024`
-  default has OOM-killed a load that ran with concurrent source writes.
+  one core busy per table loading at once; a PostgreSQL one far less).
+  *Tables in parallel* stops at 16, so `32768` loads no more tables or parts at once.
+  Memory grows with `table_parallelism × batch_parallelism` across worker processes —
+  the `512`/`1024` default has OOM-killed a load that ran with concurrent source writes.
 - **Large tables with big `TEXT`/`BLOB`, or raised parallelism:** **`4096` CPU /
   `8192`+ MiB** — wide rows enlarge each buffered batch. (Memory and CPU rise together:
   more than 4 GB needs CPU ≥ `1024`, more than 8 GB ≥ `2048`, more than 16 GB ≥ `4096`,

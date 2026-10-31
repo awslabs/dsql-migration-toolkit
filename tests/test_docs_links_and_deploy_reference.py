@@ -25,9 +25,15 @@ Settings dialog do (follow-ups of the v0.1.577 review).
   a later stack update leaves unapplied and how to apply them; its row for the mirror names
   the switch as the host shows it (*Mirror to the system journal*), and README's variable row
   and chapter 7 name it for each host.
+* Fargate also takes CPU 32768 (32 vCPU), with 60, 120 or 244 GB only (on Linux platform
+  1.4.0, which the service runs), so the template allows it and gives its memory, as the
+  guide's rows and sizing table do. *Tables in parallel*
+  stops at 16, so the guide says a 32 vCPU task loads no more tables or parts at once, and
+  the manual no longer calls the 16 vCPU task the largest.
 
 Fact pins: the Fargate pairs are AWS's table (below), the knobs come from the Settings
-registry (``config.TUNABLE_KNOBS``), and the defaults and descriptions from the template.
+registry (``config.TUNABLE_KNOBS``) and the bound of *Tables in parallel* from
+``AppConfig``, and the defaults and descriptions from the template.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ import urllib.parse
 import pytest
 import yaml
 
-from tests.test_g25_docs import DEPLOY, LANGS, ROOT, _flat
+from tests.test_g25_docs import DEPLOY, LANGS, ROOT, _all_pages, _flat, _has
 
 _DEPLOYMENT = {"en": "DEPLOYMENT.md", "ko": "DEPLOYMENT.ko.md", "ja": "DEPLOYMENT.ja.md"}
 _README = {"en": "README.md", "ko": "README.ko.md", "ja": "README.ja.md"}
@@ -433,16 +439,20 @@ _FARGATE_GB = {
     8192: (16, 60, 4),
     16384: (32, 120, 8),
 }
+# CPU units -> the only sizes it takes, in GB (the same table).
+_FARGATE_FIXED_GB = {32768: (60, 120, 244)}
 
 
 def _cpus_taking(mib: int) -> list[int]:
     """The CPU values (256 aside) Fargate pairs with exactly ``mib`` MiB of memory."""
     gb, rest = divmod(mib, 1024)
-    return [
+    ranged = [
         cpu
         for cpu, (low, high, step) in _FARGATE_GB.items()
         if not rest and low <= gb <= high and (gb - low) % step == 0
     ]
+    fixed = [cpu for cpu, sizes in _FARGATE_FIXED_GB.items() if not rest and gb in sizes]
+    return ranged + fixed
 
 
 def _memory_description(template: dict) -> str:
@@ -457,8 +467,10 @@ def test_the_template_gives_the_memory_each_cpu_takes(template: dict) -> None:
         )
     }
     assert described == _FARGATE_GB  # 8192 and 16384 were missing
-    # CPU 256 (0.25 vCPU) takes three sizes, not a range; it was missing too.
+    # CPU 256 (0.25 vCPU) takes three sizes, not a range (it was missing too), and so does
+    # 32768 (32 vCPU).
     assert "256->512MiB/1GB/2GB" in _memory_description(template)
+    assert "32768->60GB/120GB/244GB" in _memory_description(template)
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -467,6 +479,7 @@ def test_the_sizing_table_is_fargates(lang: str) -> None:
     rows = re.findall(r"(?m)^\| `(\d+)` \([\d.]+\) \| (\d+)–(\d+) GB \| (\d+) GB \|$", text)
     assert {int(cpu): (int(lo), int(hi), int(step)) for cpu, lo, hi, step in rows} == _FARGATE_GB
     assert re.search(r"(?m)^\| `256` \(0\.25\) \| 512, 1024, 2048 MiB \|", text), lang
+    assert re.search(r"(?m)^\| `32768` \(32\) \| 60, 120, 244 GB \|", text), lang
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -476,7 +489,7 @@ def test_every_cpu_the_parameter_allows_has_its_memory_in_the_template_and_the_g
     # The template's description and the guide's sizing table give each allowed CPU's memory
     # (the description lacked 256), and so does the English row, which spells the pairs out.
     allowed = sorted(template["Parameters"]["ContainerCpu"]["AllowedValues"])
-    assert allowed == sorted({256, *_FARGATE_GB})  # each one a Fargate task CPU
+    assert allowed == sorted({256, 32768, *_FARGATE_GB})  # each one a Fargate task CPU
     described = re.findall(r"\b(\d+)->", _memory_description(template))
     assert [int(cpu) for cpu in described] == allowed
     text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
@@ -486,6 +499,17 @@ def test_every_cpu_the_parameter_allows_has_its_memory_in_the_template_and_the_g
         row = _reference_rows(lang)["ContainerMemory"][3]
         assert [int(cpu) for cpu in re.findall(r"`(\d+)`(?: CPU)? with ", row)] == allowed
         assert "`256` CPU with 512 MiB, 1 GB or 2 GB" in row
+        assert "`32768` with 60 GB, 120 GB or 244 GB" in row
+
+
+def test_the_service_runs_the_platform_the_larger_cpus_need(template: dict) -> None:
+    # Fargate takes CPU 8192, 16384 and 32768 only on Linux platform 1.4.0 or later (the same
+    # table). The service names no PlatformVersion, so it runs LATEST, which is 1.4.0, and the
+    # task names no operating system, so it runs Linux.
+    service = template["Resources"]["Service"]["Properties"]
+    assert service.get("PlatformVersion", "LATEST") in ("LATEST", "1.4.0")
+    task = template["Resources"]["TaskDefinition"]["Properties"]
+    assert task.get("RuntimePlatform", {}).get("OperatingSystemFamily", "LINUX") == "LINUX"
 
 
 _ITSELF = {"en": "itself is valid with", "ko": "자체는", "ja": "自体は"}
@@ -521,6 +545,64 @@ def test_the_memory_row_recommends_what_the_template_and_the_sizing_bullet_do(
     text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
     ((cpu, memory),) = re.findall(r"\*\*`(\d+)` CPU /\s+`(\d+)`\+ MiB\*\*", text)
     assert int(memory) == lobs and int(cpu) in _cpus_taking(lobs), lang
+
+
+# -- a 32 vCPU task: Fargate takes it, Tables in parallel stops at 16 ------------------------
+
+_REAL_FULL_LOAD = {
+    "en": "**Real Full Load:**",
+    "ko": "**실제 Full Load:**",
+    "ja": "**実運用の Full Load:**",
+}
+# Where the ContainerCpu row and that bullet give the bound of *Tables in parallel*.
+_TABLES_IN_PARALLEL_BOUND = {
+    "en": ("the vCPU count, up to its maximum of {n} —", "*Tables in parallel* stops at {n},"),
+    "ko": ("vCPU 수(최대 {n})로 설정", "*Tables in parallel*은 최대 {n}이므로"),
+    "ja": ("vCPU 数（最大 {n}）に設定", "*Tables in parallel* の上限は {n} なので"),
+}
+
+
+def _real_full_load_bullet(lang: str) -> str:
+    """The sizing section's bullet for a real Full Load, up to the next bullet."""
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n- {_REAL_FULL_LOAD[lang]}")
+    return _flat(lang, text[start : text.index("\n- ", start + 1)])
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_cpu_row_and_the_sizing_bullet_say_32768_loads_no_more_at_once(lang: str) -> None:
+    # The guide sets *Tables in parallel* to the vCPU count, but it counts the tables and
+    # parts loading at once, one worker process each, and stops at its bound: a 32 vCPU task
+    # is accepted (above) and loads no more of them at once than a 16 vCPU one.
+    from dsql_migrator.config import AppConfig
+
+    field = AppConfig.model_fields["full_load_table_parallelism"]
+    (limit,) = [meta.le for meta in field.metadata if getattr(meta, "le", None) is not None]
+    assert limit <= 16  # what makes 32768 load no more at once than 16384
+    row = _flat(lang, _reference_rows(lang)["ContainerCpu"][3])
+    bullet = _real_full_load_bullet(lang)
+    in_row, in_bullet = (phrase.format(n=limit) for phrase in _TABLES_IN_PARALLEL_BOUND[lang])
+    assert "`32768`" in row and _has(lang, row, in_row), lang
+    assert "`32768`" in bullet and _has(lang, bullet, in_bullet), lang
+    if lang == "en":
+        no_more = "loads no more tables or parts at once"
+        assert f"`32768` (32 vCPU) is accepted too, but {no_more} (not measured)" in row
+        assert f"stops at {limit}, so `32768` {no_more}." in bullet
+
+
+# What the manual called the 16 vCPU runs while 16384 was the largest CPU the template took.
+_LARGEST = {
+    "en": ("largest task", "maximum-size runs"),
+    "ko": ("가장 큰 태스크", "최대 규모 실행"),
+    "ja": ("最大のタスク", "最大サイズでの実行", "最大サイズの実行"),
+}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_manual_no_longer_calls_16_vcpu_the_largest_task(lang: str) -> None:
+    for page, text in _all_pages(lang).items():
+        for stale in _LARGEST[lang]:
+            assert not _has(lang, text, stale), (lang, page, stale)
 
 
 # -- README: the knobs Settings retunes ------------------------------------------------------

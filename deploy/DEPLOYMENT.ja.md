@@ -556,7 +556,7 @@ Data Migration → Validation → Cut over）です。UI が表示されれば�
 | `AlbScheme` | no | `internal` | `internal` または `internet-facing`。**推奨: `internal`**（VPN/Direct Connect/ピアリング経由で到達）。`internet-facing` は Cognito オンの場合のみ使用。 |
 | `CertificateArn` | yes | — | HTTPS (443) リスナー用の ACM 証明書 ARN。 |
 | `ContainerImageUri` | no | 公開された ECR Public イメージ | デフォルトは ECR Public に公開されたイメージ — ビルド不要。制限されたネットワーク（ご自身のプライベート ECR コピー / pull-through キャッシュ）またはカスタムビルドの場合のみオーバーライド。イミュータブルなタグまたはダイジェストを推奨。 |
-| `ContainerCpu` | no | `512` | Fargate タスクの CPU ユニット。**MySQL の Full Load は CPU バウンド**（行の読み取りと変換が、同時にロードするテーブルごとにほぼ 1 コアを使う）なので、大規模移行では引き上げ、Full Load の *Tables in parallel* を vCPU 数に設定すること — 実測では、`16384`（16 vCPU）で *Tables in parallel* を 16 にすると、MySQL の 16 テーブルを全コアが稼働した状態で **約 193K rows/s** でロードした。PostgreSQL の Full Load が必要とするコアははるかに少ない（Aurora DSQL に律速される）。評価用途はデフォルト `512` で十分、実際の大規模 Full Load には **4096 以上** を推奨。[マニュアル §7.2](../docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング) 参照。 |
+| `ContainerCpu` | no | `512` | Fargate タスクの CPU ユニット。**MySQL の Full Load は CPU バウンド**（行の読み取りと変換が、同時にロードするテーブルごとにほぼ 1 コアを使う）なので、大規模移行では引き上げ、Full Load の *Tables in parallel* を vCPU 数（最大 16）に設定すること — 実測では、`16384`（16 vCPU）で *Tables in parallel* を 16 にすると、MySQL の 16 テーブルを全コアが稼働した状態で **約 193K rows/s** でロードした。`32768`（32 vCPU）も指定できるが、同時にロードするテーブルや部分は増えない（未測定）。PostgreSQL の Full Load が必要とするコアははるかに少ない（Aurora DSQL に律速される）。評価用途はデフォルト `512` で十分、実際の大規模 Full Load には **4096 以上** を推奨。[マニュアル §7.2](../docs/manual/ja/07-performance-and-tuning.md#72-並列度のチューニング) 参照。 |
 | `ContainerMemory` | no | `1024` | Fargate タスクのメモリ（MiB）— **ハード制限**: 超えるとカーネルがタスクを OOM-kill します（graceful shutdown なし、CloudWatch のスパイクと ELB タイムアウトのみ）。メモリはテーブルサイズではなくバッファされたパイプライン — おおよそ `table_parallelism × (prefetch + batch_parallelism) × バッチあたりバイト` を**ワーカープロセスにわたって合算** — で制限され、**広い / 大きな LOB 行がバッチあたりバイトを増やす**ため、同時にソース書き込みがある実運用ロードでは `1024` デフォルトが厳しいことがあります。**サイジング:** 評価/小規模は `1024` で十分、実運用の Full Load には **≥ 2048**、大きな `TEXT`/`BLOB` や並列度を上げる場合は **≥ 8192**（`8192` 自体は `ContainerCpu` `1024`、`2048`、`4096` と組み合わせ可能）。CPU に対して有効な値であること（下のサイジング表を参照）。アプリはメモリの high-water と約 80% の圧迫警告をログ（+アクティビティログ）に残すので、kill の前に OOM の接近が見えます。 |
 | `AppPort` | no | `8080` | コンテナのリッスンポート。 |
 | `AssignPublicIp` | no | `DISABLED` | NAT なしでタスクをパブリックサブネットで実行するには `ENABLED`（テスト）。**推奨: 本番では `DISABLED` のまま**（NAT ゲートウェイまたは VPC エンドポイント）。 |
@@ -592,13 +592,15 @@ Fargate では CPU とメモリを**独立に選べません**: CPU 値ごとに
 | `4096` (4) | 8–30 GB | 1 GB |
 | `8192` (8) | 16–60 GB | 4 GB |
 | `16384` (16) | 32–120 GB | 8 GB |
+| `32768` (32) | 60, 120, 244 GB | 固定 |
 
 **ワークロード別の推奨:**
 
 - **評価 / 小規模テーブル:** `512` / `1024` MiB のデフォルトで十分。
 - **実運用の Full Load:** **`1024` CPU / `2048` MiB** 以上。*Tables in parallel* を vCPU 数にした大規模な
   MySQL のロードでは最大 **`16384` CPU** まで（MySQL のロードは同時にロードするテーブルごとにほぼ 1 コアを
-  使い、PostgreSQL のロードははるかに少ない）。メモリはワーカープロセスにわたって
+  使い、PostgreSQL のロードははるかに少ない）。*Tables in parallel* の上限は 16 なので、
+  `32768` にしても同時にロードするテーブルや部分は増えません。メモリはワーカープロセスにわたって
   `table_parallelism × batch_parallelism` で増加します — 同時にソース書き込みがあるロードで
   `512`/`1024` デフォルトが OOM-kill された事例があります。
 - **大きな `TEXT`/`BLOB` テーブル、または並列度を上げる場合:** **`4096` CPU / `8192`+ MiB** — 広い行が

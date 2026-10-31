@@ -22,11 +22,11 @@ _言語: [English](../en/12-performance-test-results.md) | [한국어](../ko/12-
 
 ## Full Load
 
-### 最大サイズでの実行 (16 vCPU)
+### 16 vCPU での実行
 
 | コンポーネント | 設定 |
 |---|---|
-| **ECS Fargate** | 16 vCPU、120 GB メモリ (最大のタスク) |
+| **ECS Fargate** | 16 vCPU、120 GB メモリ |
 | **ソース** | Aurora MySQL と Aurora PostgreSQL、`db.r8g.16xlarge` |
 | **ターゲット** | Aurora DSQL、`ap-northeast-2` |
 | **ローダー設定** | *Tables in parallel* 16、それ以外はすべて既定 (*Reader shards per large table* は実行に別の記載がない限り自動、*Batches per table* 8、*Rows per batch* 2000) |

@@ -27,11 +27,11 @@ Aurora DSQL (sub-millisecond network RTT).
 
 ## Full Load
 
-### The maximum-size runs (16 vCPU)
+### The 16 vCPU runs
 
 | Component | Configuration |
 |---|---|
-| **ECS Fargate** | 16 vCPU, 120 GB memory (the largest task) |
+| **ECS Fargate** | 16 vCPU, 120 GB memory |
 | **Sources** | Aurora MySQL and Aurora PostgreSQL, `db.r8g.16xlarge` |
 | **Target** | Aurora DSQL, `ap-northeast-2` |
 | **Loader settings** | *Tables in parallel* 16, everything else at its default (*Reader shards per large table* automatic unless a run says otherwise, *Batches per table* 8, *Rows per batch* 2000) |
