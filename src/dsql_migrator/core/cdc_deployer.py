@@ -1646,7 +1646,7 @@ def run_cdc_infra_deploy(
         _list_refusal = list_parameter_size_refusal(params.filled)
         if _list_refusal:
             raise CdcDeployError(_list_refusal)
-        # ...and a captured table whose Kafka topic name Kafka would refuse.
+        # ...and a captured table whose name CDC cannot stream (topic_name_refusal).
         _topic_refusal = topic_name_refusal(params.filled)
         if _topic_refusal:
             raise CdcDeployError(_topic_refusal)
@@ -2159,8 +2159,9 @@ def run_cdc_start(
         _list_refusal = list_parameter_size_refusal(params.filled)
         if _list_refusal:
             raise CdcDeployError(_list_refusal)
-        # A captured table whose Kafka topic name Kafka refuses would fail the topic
-        # pre-create (or, trimmed into a legal name, never be captured): refused here too.
+        # A captured table whose name CDC cannot stream would fail the topic pre-create, never
+        # be captured (trimmed into a legal name) or fail in the sink (a '.' inside a name):
+        # refused here too.
         _topic_refusal = topic_name_refusal(params.filled)
         if _topic_refusal:
             raise CdcDeployError(_topic_refusal)

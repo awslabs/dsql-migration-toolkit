@@ -114,21 +114,28 @@ it.
     the WAL instead of a retention window — watch `wal_status`, because an inactive slot
     can fill the source disk.
 
-- **CDC streams only tables whose names Kafka accepts in a topic name.** CDC names each
+- **CDC streams only tables whose names make a usable Kafka topic name.** CDC names each
   captured table's Kafka topic after its database (MySQL) or schema (PostgreSQL) and its
-  table, and Kafka allows only ASCII letters, digits, `.`, `_` and `-` in a topic name. A
-  table whose database, schema or table name holds any other character (`$`, a space, `%`,
-  `:`, a comma, a non-ASCII letter) cannot be captured: Deploy CDC infrastructure, Start
-  CDC and Retry CDC refuse it before anything is uploaded or created (*Table names CDC
-  cannot stream*, naming the tables), and with Full load + CDC the Full Load step warns
-  before the load but is not held. With Full load + CDC, load such a table, then untick it
-  before CDC starts (see "Changing the table set after a Full Load (Full load + CDC)" in
-  [Chapter 13](13-excluding-tables-and-columns.md)): it stays on Aurora DSQL as loaded,
-  and CDC and Validation skip it. With CDC only, deselect it before Deploy CDC
-  infrastructure. Then copy it in a Full load only migration once its writes stop, or
-  rename it at the source before migrating it. A MySQL table the load read in
+  table, and Kafka allows only ASCII letters, digits, `.`, `_` and `-` in a topic name. CDC
+  cannot capture a table whose database, schema or table name holds any other character
+  (`$`, a space, `%`, `:`, a comma, a non-ASCII letter) or a `.` inside the name (the CDC
+  sink reads every `.` as the one between the database or schema and the table), nor two
+  tables whose names differ only in a `.` against a `_`, such as `app.v2_users` and
+  `app_v2.users` (Kafka does not allow two topics whose names differ only that way;
+  capture one of them). Deploy CDC infrastructure, Start CDC and Retry CDC refuse such a
+  table before anything is uploaded or created (*Table names CDC cannot stream*, naming
+  the tables, with a character that does not show, such as a space or a zero-width space,
+  written as its code point: `<U+0020>`, `<U+200B>`), and with Full load + CDC the Full
+  Load step warns before the load but is not held. With Full load + CDC, load such a
+  table, then untick it before CDC starts (see "Changing the table set after a Full Load
+  (Full load + CDC)" in [Chapter 13](13-excluding-tables-and-columns.md)): it stays on
+  Aurora DSQL as loaded, and CDC and Validation skip it. With CDC only, deselect it before
+  Deploy CDC infrastructure. Then copy it in a Full load only migration once its writes
+  stop, or rename it at the source before migrating it. A MySQL table the load read in
   separate-snapshot parts can be unticked only after a reload with one reader (see
-  "Capacity and cost" below).
+  "Capacity and cost" below). A `.` inside a database or schema name is not supported by
+  the other steps either: the tool takes the first `.` of a qualified name for the
+  separator, so Schema Conversion and the Full Load split such a name in the wrong place.
 
 - **PostgreSQL source, re-keyed tables:** a table CDC re-keys — Schema Conversion's
   **Composite key**, or an edited target key that adds a column outside the source primary

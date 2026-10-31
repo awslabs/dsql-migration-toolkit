@@ -3973,7 +3973,7 @@ def _render_cdc_start_button(
             _tables_refusal, migration_state, job_manager,
             _table_lock(migration_state, job_manager, session),
         )
-    # ...and each captured table's Kafka topic name must be one Kafka accepts.
+    # ...and each captured table's name must be one CDC can stream.
     _topic_refusal = cdc_topic_name_refusal([t.name for t in _captured_now])
     if _topic_refusal:
         _topic_refusal = _topic_name_hold_remedy(
@@ -4571,7 +4571,7 @@ def _render_cdc_infra_deploy_action(
     # A saved column exclusion that no longer applies would be baked into the stack's
     # ColumnExcludeList and lock the card, so this is its last chance to be removed. (Also
     # held here: a capture list or a per-table list too long for one stack parameter, and a
-    # table name Kafka refuses in a topic name.)
+    # table name CDC cannot stream.)
     _deploy_capture_now = _deploy_capture(migration_state, job_manager, inventory)
     _exclusion_notice = _deploy_block_notice(
         migration_state, job_manager, inventory, session, capture=_deploy_capture_now
@@ -4660,8 +4660,10 @@ def _deploy_block_notice(
       reads the source's at the click, so only the two lists every deploy sends are held
       here; the plan's worst case is a warning (:func:`_deploy_partition_map_warning`). Its
       remedy: :func:`_deploy_table_list_refused`;
-    * with ``include_capture`` too, a captured table whose database, schema or table name
-      Kafka refuses in a topic name (:func:`cdc_topic_name_refusal`), with the remedy of
+    * with ``include_capture`` too, a captured table whose name CDC cannot stream -- a
+      character Kafka refuses in a topic name or a '.' inside its database, schema or table
+      name, or two names that differ only in a '.' against a '_'
+      (:func:`cdc_topic_name_refusal`) -- with the remedy of
       :func:`_deploy_topic_name_refused`.
 
     Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
@@ -4827,7 +4829,10 @@ def _topic_name_hold_remedy(refusal: str, migration_state, job_manager, lock) ->
     """A topic-name refusal after the load with the table picker's remedy (``lock`` is its
     lock reason), as Deploy, Start CDC and Retry CDC say it. A refused table the Full Load
     read in parts that still waits for CDC's replay (G137) is named as one that cannot be
-    deselected yet (:func:`~dsql_migrator.ui.data_migration._models.topic_name_hold_remedy`)."""
+    deselected yet (:func:`~dsql_migrator.ui.data_migration._models.topic_name_hold_remedy`).
+    Those tables are judged on their own, on purpose: of two names that differ only in a '.'
+    against a '_', one read in parts is named only when the other is too -- otherwise the
+    other can be deselected."""
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
     _split = cdc_topic_name_refused(_captured_split_tables(migration_state, job))
     return topic_name_hold_remedy(
@@ -9006,8 +9011,8 @@ def _start_cdc_deploy(
             ),
         )
         return
-    # ...and so must each captured table's Kafka topic name -- refused before the submit
-    # below stamps the CDC operations window, which fixes the table set (G16).
+    # ...and each captured table's name must be one CDC can stream -- refused before the
+    # submit below stamps the CDC operations window, which fixes the table set (G16).
     _topic_refusal = cdc_topic_name_refusal([t.name for t in tables_for_config])
     if _topic_refusal:
         render_notice(
@@ -9820,7 +9825,7 @@ async def _start_cdc_infra_deploy(
     _deploy_row_counts = None
     _tables_refusal = cdc_table_list_refusal(_captured_names, deploy=False)
     if not _tables_refusal:
-        # A table name Kafka refuses in a topic name: refused before the source is read too.
+        # A table name CDC cannot stream: refused before the source is read too.
         _topic_refusal = cdc_topic_name_refusal(_captured_names)
         if _topic_refusal:
             ui.notify(  # type: ignore[attr-defined]

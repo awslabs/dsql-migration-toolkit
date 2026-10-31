@@ -1954,8 +1954,8 @@ def build_data_migration_screen(
             _table_list_warning = pre_load_table_list_warning(
                 migration_state, job_manager, session, inventory
             )
-            # ...nor a selected table whose name CDC cannot stream (Kafka refuses it in a
-            # topic name): loaded, it can be unticked before CDC starts.
+            # ...nor a selected table whose name CDC cannot stream (cdc_topic_name_refusal):
+            # loaded, it can be unticked before CDC starts.
             _topic_name_warning = pre_load_topic_name_warning(
                 migration_state, job_manager, session, inventory
             )
@@ -4083,8 +4083,8 @@ def data_migration_exclusion_block(
     card locks: a saved exclusion that no longer applies, then a source column the applied
     target DDL lacks (42703). Full load + CDC, before any load, also holds a capture list
     CDC could not carry afterwards -- but neither a table set too large for one CDC pipeline
-    nor a table whose name Kafka refuses in a topic name: the load may take every table and
-    the ones CDC does not need or cannot stream are unticked before CDC starts, so those are
+    nor a table whose name CDC cannot stream: the load may take every table and the ones
+    CDC does not need or cannot stream are unticked before CDC starts, so those are
     warnings on the Full Load card (:func:`pre_load_table_list_warning`,
     :func:`pre_load_topic_name_warning`) and holds only at Deploy CDC infrastructure and
     Start CDC. ``None`` for CDC only, whose card sits inside the CDC sub-step that Continue
@@ -4152,8 +4152,8 @@ def pre_load_topic_name_warning(
     migration_state, job_manager, session, inventory
 ) -> Optional[tuple[str, str]]:
     """Full load + CDC, before any load: ``(header, body)`` of the Full Load card's warning
-    that a selected table's name is one CDC cannot stream (Kafka refuses it in a topic name,
-    :func:`cdc_pre_load_topic_name_warning`), or ``None``.
+    that a selected table's name is one CDC cannot stream
+    (:func:`cdc_pre_load_topic_name_warning`), or ``None``.
 
     Not a hold, like :func:`pre_load_table_list_warning` and under the same gate: the load
     may take such a table and, until CDC starts, it is unticked (G16); the Deploy CDC

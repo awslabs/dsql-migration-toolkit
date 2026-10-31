@@ -581,9 +581,9 @@ def split_table_list_remedy(
     until that reload or a CHECKSUM match proves the replay. Pure."""
     names = list(names)
     one = len(names) == 1
-    it = "it" if one else "them"
+    it, they = ("it", "it") if one else ("them", "they")
     return (
-        f"The Full Load read {_names_text(names)} in parts, so {it} cannot be deselected: to "
+        f"The Full Load read {_names_text(names)} in parts, so {they} cannot be deselected: to "
         f"deselect {it}, {split_reload_route(names, job, cdc_only=cdc_only)} first. "
         f"{SPLIT_SET_FIXED} Nor can the migration switch to Full load only until that reload, "
         f"or until a match in Validation in CHECKSUM mode proves CDC's replay of {it}."
@@ -4151,8 +4151,9 @@ CDC_TABLE_LIST_HEADER = "Too many tables for one CDC pipeline"
 # The notice header of a warning that only the deploy's largest partition plan would not
 # fit (cdc_partition_map_worst_case): on the Deploy form, and before a Full load + CDC load.
 CDC_TABLE_LIST_WORST_CASE_HEADER = "Possibly too many tables for one CDC pipeline"
-# The notice header of a topic-name refusal (cdc_topic_name_refusal), and of the warning
-# before a Full load + CDC load whose selection holds such a table
+# The notice header of a topic-name refusal (cdc_topic_name_refusal: a name Kafka refuses in
+# a topic name, a '.' inside a name, or two names that differ only in a '.' against a '_'),
+# and of the warning before a Full load + CDC load whose selection holds such a table
 # (cdc_pre_load_topic_name_warning).
 CDC_TOPIC_NAME_HEADER = "Table names CDC cannot stream"
 
@@ -4211,9 +4212,11 @@ def cdc_topic_name_refusal(table_names: "Sequence[str]") -> "Optional[str]":
 
     ``core.cdc.topic_name_refusal`` over SinkTopics exactly as the parameter builders send
     it for ``table_names`` (Deploy CDC infrastructure and Start CDC alike): a table whose
-    database, schema or table name holds a character Kafka refuses in a topic name. Each
-    caller appends :func:`table_picker_remedy` (:func:`topic_name_hold_remedy`; a deploy
-    before a Full load + CDC load, :func:`cdc_pre_load_topic_name_routes`).
+    database, schema or table name holds a character Kafka refuses in a topic name, or a '.'
+    (the sink splits a qualified name on every '.'), and two tables whose names differ only
+    in a '.' against a '_' (Kafka refuses the second topic; both are named). Each caller
+    appends :func:`table_picker_remedy` (:func:`topic_name_hold_remedy`; a deploy before a
+    Full load + CDC load, :func:`cdc_pre_load_topic_name_routes`).
     """
     from dsql_migrator.core.cdc import topic_name_refusal
 
@@ -4382,9 +4385,11 @@ def cdc_pre_load_topic_name_routes(table_lock: "Optional[str]", *, split: bool =
     (:func:`cdc_topic_name_refusal`), before its load and with CDC never started: load it
     and, until CDC starts, untick it (G16), then copy it again in a Full load only migration
     once its writes stop; or rename it at the source, or leave it out now
-    (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason).
-    ``split`` (:func:`mysql_reads_may_split`) carves a table the load reads in parts out of
-    the first (G137). Pure."""
+    (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason). Of two
+    names that differ only in a '.' against a '_', unticking or leaving out one is enough. The
+    first route does not hold for a '.' inside a database or schema name, which no step
+    supports (Chapter 6 says so). ``split`` (:func:`mysql_reads_may_split`) carves a table the
+    load reads in parts out of the first (G137). Pure."""
     return (
         "The Full Load can still load such a table: after it, until CDC starts, untick it in the "
         "table list (it stays on Aurora DSQL as loaded; CDC and Validation skip it) and copy it "
@@ -4408,9 +4413,10 @@ def cdc_pre_load_topic_name_warning(
 
     A warning, never a hold, like :func:`cdc_pre_load_table_list_warning`: the load may take
     such a table and, until CDC starts, it is unticked (G16); Deploy CDC infrastructure and
-    Start CDC then judge the real capture. ``planned``: a cdc-stack is already deployed (or
-    deploying), so only Start CDC is still to refuse. ``table_lock`` and ``split`` as for
-    :func:`cdc_pre_load_topic_name_routes`.
+    Start CDC then judge the real capture. The body is the refusal's facts (each kind of name,
+    in its order) without its remedy, then the routes. ``planned``: a cdc-stack is already
+    deployed (or deploying), so only Start CDC is still to refuse. ``table_lock`` and
+    ``split`` as for :func:`cdc_pre_load_topic_name_routes`.
     """
     from dsql_migrator.core.cdc import CDC_TOPIC_NAME_REMEDY
 

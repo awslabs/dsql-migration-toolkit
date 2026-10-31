@@ -45,6 +45,7 @@ from __future__ import annotations
 import os
 import re
 import string
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -2492,15 +2493,21 @@ def list_parameter_size_refusal(
     )
 
 
-def topic_name_refused_tables(filled: "Iterable[tuple[str, object]]") -> list[str]:
-    """The captured tables whose Kafka topic name Kafka refuses, in SinkTopics order. Pure.
+def _shown_name(name: str) -> str:
+    """``name`` with each character that does not show written as its code point, ``<U+0020>``:
+    whitespace, a control or format character (a zero-width space), and an unassigned or
+    private-use code point (Unicode categories Z* and C*). Pure."""
+    return "".join(
+        f"<U+{ord(ch):04X}>" if unicodedata.category(ch)[0] in "ZC" else ch for ch in name
+    )
 
-    Each part of ``SinkTopics`` is judged as sent, never stripped (a trailing space is
-    refused), against :data:`_KAFKA_TOPIC_CHARS` -- a set test, not a regex (``$`` would let
-    a trailing newline through). Every topic starts with ``<TopicPrefix>.``, so a part that
-    does not comes from a comma inside the previous table's name and is joined back onto it.
-    The table is named without that prefix. Known, accepted gap: a name holding the literal
-    text ``,<TopicPrefix>.`` still reads as two legal names.
+
+def _sink_topics(filled: "Iterable[tuple[str, object]]") -> "tuple[str, list[str]]":
+    """``(<TopicPrefix>., the SinkTopics topics)``, each topic as sent, never stripped. Pure.
+
+    Every topic starts with ``<TopicPrefix>.``, so a part that does not comes from a comma
+    inside the previous table's name and is joined back onto it. Known, accepted gap: a name
+    holding the literal text ``,<TopicPrefix>.`` still reads as two legal names.
     """
     values = dict(filled)
     raw = str(values.get("SinkTopics") or "")
@@ -2512,30 +2519,114 @@ def topic_name_refused_tables(filled: "Iterable[tuple[str, object]]") -> list[st
                 topics[-1] += "," + part
             else:
                 topics.append(part)
-    return [t.removeprefix(lead) for t in topics if not set(t) <= _KAFKA_TOPIC_CHARS]
+    return lead, topics
+
+
+def _topic_name_kinds(
+    filled: "Iterable[tuple[str, object]]",
+) -> "tuple[list[str], list[str], list[list[str]]]":
+    """``(illegal, dotted, groups)``: the captured tables CDC cannot stream, by why, each named
+    once without the topic prefix and in SinkTopics order. Pure.
+
+    - illegal: the topic holds a character Kafka refuses (:data:`_KAFKA_TOPIC_CHARS`; a set
+      test, not a regex -- ``$`` would let a trailing newline through; a trailing space is
+      refused, never stripped).
+    - dotted: a legal topic with more than one '.' after ``<TopicPrefix>.`` -- a '.' inside the
+      database, schema or table name (one inside TopicPrefix does not count). A topic under
+      another prefix is judged on its characters only.
+    - groups: among the other names, those whose topics are equal once '.' and '_' are the
+      same character (Kafka's Topic.hasCollision: case counts, '-' does not). Only groups of
+      two or more; a dotted or illegal name is never in one.
+    """
+    lead, topics = _sink_topics(filled)
+    illegal: list[str] = []
+    dotted: list[str] = []
+    unified: dict[str, list[str]] = {}
+    for topic in dict.fromkeys(topics):
+        name = topic.removeprefix(lead)
+        if not set(topic) <= _KAFKA_TOPIC_CHARS:
+            illegal.append(name)
+        elif topic.startswith(lead) and name.count(".") > 1:
+            dotted.append(name)
+        else:
+            unified.setdefault(topic.replace(".", "_"), []).append(name)
+    return illegal, dotted, [group for group in unified.values() if len(group) > 1]
+
+
+def topic_name_refused_tables(filled: "Iterable[tuple[str, object]]") -> list[str]:
+    """The captured tables CDC cannot stream (:func:`topic_name_refusal`), each once, in
+    SinkTopics order, named as written (without the topic prefix). Pure."""
+    filled = list(filled)  # read twice below: an iterator would leave the second read empty
+    illegal, dotted, groups = _topic_name_kinds(filled)
+    refused = {*illegal, *dotted, *(name for group in groups for name in group)}
+    lead, topics = _sink_topics(filled)
+    names = dict.fromkeys(topic.removeprefix(lead) for topic in topics)
+    return [name for name in names if name in refused]
+
+
+def _together(group: "Sequence[str]") -> str:
+    first, *rest = sorted(group)
+    others = rest[0] if len(rest) == 1 else f"{', '.join(rest[:-1])} and {rest[-1]}"
+    return f"{first} together with {others}"
 
 
 def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]":
     """Why CDC cannot stream these captured tables, or ``None``. Pure.
 
     Each captured table's Kafka topic is ``<TopicPrefix>.<db>.<table>`` (MySQL) or
-    ``<TopicPrefix>.<schema>.<table>`` (PostgreSQL), and Kafka allows only ASCII letters,
-    digits, '.', '_' and '-' in a topic name (:func:`topic_name_refused_tables`; a '.' is
-    allowed on purpose). Both topic pre-create paths catch only an existing topic, so such a
-    name failed Start CDC after the infrastructure was deployed: an opaque rollback on the
-    Lambda path, about 2 minutes of retries blaming the network on the External one -- and a
-    comma, or whitespace ending a table name, was trimmed into a legal name, so Start
-    succeeded and the table was never captured (read from the code, not seen live). This
-    refuses it first, naming the tables and the remedy (:data:`CDC_TOPIC_NAME_REMEDY`).
+    ``<TopicPrefix>.<schema>.<table>`` (PostgreSQL). Three kinds of name fail
+    (:func:`_topic_name_kinds`), and this refuses them first, the facts in that order:
+
+    - a character Kafka refuses in a topic name (it allows only ASCII letters, digits, '.',
+      '_' and '-'). Both topic pre-create paths catch only an existing topic, so such a name
+      failed Start CDC after the infrastructure was deployed: an opaque rollback on the Lambda
+      path, about 2 minutes of retries blaming the network on the External one -- and a
+      comma, or whitespace ending a table name, was trimmed into a legal name, so Start
+      succeeded and the table was never captured (read from the code, not seen live). A
+      character that does not show is written as its code point (:func:`_shown_name`).
+    - a '.' inside the database, schema or table name. Kafka takes it, but the sink splits a
+      qualified name on every '.' (DsqlDialect.quoteQualified), so every change to the table
+      failed, and takes a tombstone's table from the topic's last two segments
+      (DebeziumEvents.tableFromTopic), so a delete on public."public.orders" removed the
+      same-keyed row of public.orders (read from the sink's code, not tested live).
+    - two names whose topics differ only in a '.' against a '_': Kafka refuses the second
+      topic (INVALID_TOPIC_EXCEPTION), and both seeders pre-create every SinkTopics entry, so
+      Start CDC failed after the infrastructure was deployed.
+
+    No check against the stack's own topics is needed: dsql-sink-dlq and
+    ``<stack>-debezium-source-offsets`` hold neither '.' nor '_' (a stack name is letters,
+    digits and hyphens), ``<TopicPrefix>.schema-history`` unifies to a name with one '_' after
+    the prefix, the heartbeat and MSK Connect internal topics start with "__", and a table
+    topic unifies to ``<TopicPrefix>_<db>_<table>``, with at least two. The remedy
+    (:data:`CDC_TOPIC_NAME_REMEDY`) ends the text.
     """
-    tables = topic_name_refused_tables(filled)
-    if not tables:
+    illegal, dotted, groups = _topic_name_kinds(filled)
+    facts: list[str] = []
+    if illegal:
+        facts.append(
+            f"CDC cannot stream {_bounded_names([_shown_name(n) for n in illegal])}: each "
+            "table's Kafka topic is named after its database or schema and its table, and Kafka "
+            "allows only ASCII letters, digits, '.', '_' and '-' in a topic name."
+        )
+    if dotted:
+        facts.append(
+            f"CDC cannot stream {_bounded_names(dotted)}: the CDC sink reads every '.' in a "
+            "table's qualified name as the one between its database or schema and its table, "
+            "so with a '.' inside either name, each change to that table fails or lands in "
+            "another table."
+        )
+    if groups:
+        texts = sorted(_together(group) for group in groups)
+        more = len(texts) - 5
+        shown = ", or ".join(texts[:5]) + (f", and {more} more like them" if more > 0 else "")
+        facts.append(
+            f"CDC cannot stream {shown}: Kafka does not allow two topics whose names differ "
+            "only in a '.' against a '_', so CDC can stream only one of "
+            f"{'them' if len(groups) == 1 else 'each'}."
+        )
+    if not facts:
         return None
-    return (
-        f"CDC cannot stream {_bounded_names(tables)}: each table's Kafka topic is named after its "
-        "database or schema and its table, and Kafka allows only ASCII letters, digits, '.', '_' "
-        "and '-' in a topic name. " + CDC_TOPIC_NAME_REMEDY
-    )
+    return " ".join(facts) + " " + CDC_TOPIC_NAME_REMEDY
 
 
 def deployed_rekey_map(
