@@ -1070,7 +1070,8 @@ aws cloudformation deploy \
 
 첫 부팅은 약 3~4분: 호스트가 443으로 Python 3.12 + wheel을 설치하고,
 `uv sync --extra cdc-external`(인프로세스 시드에 필요한 `kafka-python` + MSK IAM 서명기 포함)을
-실행한 뒤 서비스를 시작합니다. 진행 상황은 호스트의 `/var/log/dsql-migrator-userdata.log`에 있습니다.
+실행한 뒤 서비스를 시작합니다. 진행 상황은 호스트의
+`/var/log/dsql-migrator-userdata.log`에 있습니다(root만 읽을 수 있으니 `sudo`로 보세요).
 
 > [!IMPORTANT]
 > **호스트는 설정과 코드를 첫 부팅 때만 받습니다.** 인스턴스가 처음 시작될 때 시작 스크립트가 앱
@@ -1096,6 +1097,55 @@ aws cloudformation deploy \
 > 이미지를 내놓으면 그 뒤의 모든 업데이트가 인스턴스도 교체합니다(템플릿은 항상 최신 이미지를 씀).
 > 스택 업데이트를 통한 교체는 테스트되지 않았으니, 마이그레이션이 진행 중일 때는 실행하지 마세요.
 > 재시작이나 교체는 진행 중인 Full Load나 Validation을 멈춥니다.
+
+> [!WARNING]
+> **이전 템플릿으로 만든 호스트는 직접 고쳐야 합니다.** 시작 스크립트는 인스턴스가 처음 시작될 때만
+> 실행되므로, 고친 스크립트는 이 템플릿으로 시작한 호스트에만 적용됩니다: 호스트를 그대로 두는 스택
+> 업데이트는 호스트를 멈췄다가 다시 시작할 뿐 스크립트를 다시 실행하지 않습니다. 그런 호스트의 시작
+> 로그에는 쿠키 서명 시크릿이 들어 있습니다(`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log`가
+> `1`을 출력). 내 컴퓨터에서 실행할 명령을 빼고는 모두 호스트에 연 SSM 세션에서 실행하세요.
+>
+> **시작 로그에서 쿠키 서명 시크릿을 지우세요.** 스크립트는 실행한 명령을 하나하나
+> `/var/log/dsql-migrator-userdata.log`에 추적해 남겼는데, 시크릿을 읽은 명령은 그 값까지 남았고, 로컬
+> 사용자라면 누구나 이 로그를 읽을 수 있었습니다. 그 줄을 지우고 로그를 root만 읽을 수 있게
+> 하세요(재시작되는 것은 없습니다):
+>
+> ```bash
+> sudo sed -i '/STORAGE_SECRET=/d' /var/log/dsql-migrator-userdata.log
+> sudo chmod 600 /var/log/dsql-migrator-userdata.log
+> ```
+>
+> **그다음 진행 중인 마이그레이션이 없을 때, 즉 마이그레이션을 시작하기 전이나 Cut over 후에 시크릿을
+> 교체하세요.** 이 시크릿은 UI의 세션 쿠키에 서명할 뿐이지만(데이터베이스나 AWS 자격증명이 아님), 로그나
+> 그 사본을 읽은 사람은 시크릿이 바뀔 때까지 그 쿠키를 위조할 수 있습니다. 새 값을 쓰면 모든 브라우저가
+> 새 세션으로 시작하고, 앱이 이전 세션에 저장해 둔 진행 상황은 복원되지 않습니다: Evaluation 결과,
+> Schema Conversion 선택과 DDL 편집, Data Migration 선택(중단된 Full Load는 재개할 수 없음), 그리고
+> CDC와 Cut over가 기록한 내용입니다. 마이그레이션된 데이터, Aurora DSQL, 배포된 CDC 파이프라인은
+> 건드리지 않습니다. 내 컴퓨터나 AWS CloudShell에서(호스트의 역할은 시크릿을 읽기만 할 수 있음) 시크릿에
+> 새 값을 넣으세요:
+>
+> ```bash
+> SECRET_ARN=$(aws cloudformation describe-stack-resource --stack-name mysql-dsql-migrator-ec2 \
+>   --logical-resource-id StorageSecret --region "$AWS_REGION" \
+>   --query StackResourceDetail.PhysicalResourceId --output text)
+> aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --secret-string "$(aws secretsmanager get-random-password --password-length 64 \
+>   --exclude-punctuation --region "$AWS_REGION" --query RandomPassword --output text)"
+> echo "$SECRET_ARN"
+> ```
+>
+> 호스트는 첫 부팅 때 시크릿을 `/etc/dsql-migrator.env`에 복사해 두었습니다. 호스트에서 새 값을 그
+> 파일에 쓰고 앱을 재시작하세요(재시작하면 진행 중인 Full Load나 Validation이 멈춥니다):
+>
+> ```bash
+> SECRET_ARN=arn:aws:secretsmanager:us-east-1:123456789012:secret:StorageSecret-a1B2c3D4e5F6-GhIjKl  # 위에서 출력된 값
+> AWS_REGION=us-east-1  # 스택의 리전
+> S=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --query SecretString --output text) &&
+>   sudo sed -i '/^DSQL_MIGRATOR_STORAGE_SECRET=/d' /etc/dsql-migrator.env &&
+>   printf 'DSQL_MIGRATOR_STORAGE_SECRET=%s\n' "$S" | sudo tee -a /etc/dsql-migrator.env >/dev/null &&
+>   unset S && sudo systemctl restart dsql-migrator
+> ```
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 

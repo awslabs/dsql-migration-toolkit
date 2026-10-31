@@ -1164,7 +1164,7 @@ aws cloudformation deploy \
 First boot takes ~3–4 min: the host installs Python 3.12 + wheels over 443, runs
 `uv sync --extra cdc-external` (which brings in `kafka-python` + the MSK IAM signer for
 the in-process seed), then starts the service. Progress is in
-`/var/log/dsql-migrator-userdata.log` on the host.
+`/var/log/dsql-migrator-userdata.log` (readable by root only, so use `sudo`) on the host.
 
 > [!IMPORTANT]
 > **The host takes its settings and its code at first boot only.** When the instance
@@ -1193,6 +1193,58 @@ the in-process seed), then starts the service. Progress is in
 > also replaces the instance (the template always takes the latest image). A replacement
 > through a stack update has not been tested, so do not execute one while a migration
 > runs. A restart or a replacement stops any Full Load or Validation in progress.
+
+> [!WARNING]
+> **A host created from an earlier template needs a fix by hand.** Its startup script runs
+> only when an instance first launches, so the fixed script reaches only a host launched
+> from this template: a stack update that keeps the host stops and starts it without
+> running the script again. Such a host's startup log holds the cookie-signing secret
+> (`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log` prints `1`). Run the
+> commands in an SSM session to the host, except the one for your own machine.
+>
+> **Remove the cookie-signing secret from the startup log.** The script traced each command
+> it ran into `/var/log/dsql-migrator-userdata.log`, the one that read the secret with its
+> value, and any local user could read the log. Delete that line and make the log readable
+> by root only (nothing restarts):
+>
+> ```bash
+> sudo sed -i '/STORAGE_SECRET=/d' /var/log/dsql-migrator-userdata.log
+> sudo chmod 600 /var/log/dsql-migrator-userdata.log
+> ```
+>
+> **Then rotate the secret when no migration is in progress: before one starts, or after
+> Cut over.** It signs only the UI's session cookie (it is no database or AWS credential),
+> but whoever has read the log, or a copy of it, can forge that cookie until the secret
+> changes. A new value starts every browser on a new session, and the progress the app
+> saved for the old sessions is not restored: the Evaluation report, Schema Conversion
+> choices and DDL edits, the Data Migration selection (an interrupted Full Load cannot be
+> resumed), and what CDC and Cut over recorded. The migrated data, Aurora DSQL and a
+> deployed CDC pipeline are not touched. On your own machine or in AWS CloudShell (the
+> host's role can only read the secret), give the secret a new value:
+>
+> ```bash
+> SECRET_ARN=$(aws cloudformation describe-stack-resource --stack-name mysql-dsql-migrator-ec2 \
+>   --logical-resource-id StorageSecret --region "$AWS_REGION" \
+>   --query StackResourceDetail.PhysicalResourceId --output text)
+> aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --secret-string "$(aws secretsmanager get-random-password --password-length 64 \
+>   --exclude-punctuation --region "$AWS_REGION" --query RandomPassword --output text)"
+> echo "$SECRET_ARN"
+> ```
+>
+> The host copied the secret into `/etc/dsql-migrator.env` at first boot. On the host, write
+> the new value there and restart the app (the restart stops a Full Load or Validation in
+> progress):
+>
+> ```bash
+> SECRET_ARN=arn:aws:secretsmanager:us-east-1:123456789012:secret:StorageSecret-a1B2c3D4e5F6-GhIjKl  # printed above
+> AWS_REGION=us-east-1  # the stack's region
+> S=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --query SecretString --output text) &&
+>   sudo sed -i '/^DSQL_MIGRATOR_STORAGE_SECRET=/d' /etc/dsql-migrator.env &&
+>   printf 'DSQL_MIGRATOR_STORAGE_SECRET=%s\n' "$S" | sudo tee -a /etc/dsql-migrator.env >/dev/null &&
+>   unset S && sudo systemctl restart dsql-migrator
+> ```
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 

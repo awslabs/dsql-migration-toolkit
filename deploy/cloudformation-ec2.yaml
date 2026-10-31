@@ -1306,6 +1306,8 @@ Resources:
           Fn::Sub: |
             #!/bin/bash
             set -euxo pipefail
+            # The trace (set -x) goes to this log: create it readable by root only.
+            install -m 600 /dev/null /var/log/dsql-migrator-userdata.log
             exec > /var/log/dsql-migrator-userdata.log 2>&1
 
             # --- Base packages: git + uv + SSM agent (NO Docker) ----------------
@@ -1367,7 +1369,10 @@ Resources:
               --extra cdc-external --project /opt/dsql-migrator
 
             # --- Fetch the cookie-signing secret + derive the CDC deploy-role ARN ---
+            # Untraced: set -x would write the secret's value to the log.
+            { set +x; } 2>/dev/null
             STORAGE_SECRET=$(aws secretsmanager get-secret-value --secret-id ${StorageSecret} --query SecretString --output text --region ${AWS::Region})
+            set -x
             CDC_DEPLOY_ROLE_ARN="arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-cdc-deploy"
 
             # Resolve THIS host's own subnet CIDR so the app can pass it to the
@@ -1383,6 +1388,7 @@ Resources:
             # (the SG also has no inbound). JOB_STATE_BUCKET / SESSION_STATE_BUCKET are
             # intentionally UNSET so the app uses SqliteJobStore / SqliteSessionStateStore
             # on the retained EBS mount -- durable across restart AND instance replacement.
+            install -m 600 /dev/null /etc/dsql-migrator.env
             cat > /etc/dsql-migrator.env <<EOF
             DSQL_MIGRATOR_APP_HOST=127.0.0.1
             DSQL_MIGRATOR_APP_PORT=${AppPort}
@@ -1409,7 +1415,6 @@ Resources:
             # attestation as the secret above (generated from DsqlClusterArn, one cluster).
             DSQL_MIGRATOR_DSQL_CLUSTER_ARN=${DsqlClusterArn}
             EOF
-            chmod 600 /etc/dsql-migrator.env
 
             # --- systemd unit: run the venv console script as dsqlapp -----------
             # ExecStart uses the venv entrypoint directly (not `uv run`) so start does

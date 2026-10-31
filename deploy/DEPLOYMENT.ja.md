@@ -1154,7 +1154,8 @@ aws cloudformation deploy \
 
 初回起動は約 3〜4 分: ホストが 443 経由で Python 3.12 + wheel をインストールし、
 `uv sync --extra cdc-external`（インプロセスシードに必要な `kafka-python` + MSK IAM 署名機を含む）
-を実行してからサービスを開始します。進捗はホストの `/var/log/dsql-migrator-userdata.log` にあります。
+を実行してからサービスを開始します。進捗はホストの `/var/log/dsql-migrator-userdata.log` にあります
+（root だけが読めるので `sudo` で見てください）。
 
 > [!IMPORTANT]
 > **ホストは設定とコードを初回起動時にしか取り込みません。** インスタンスが最初に起動するとき、
@@ -1181,6 +1182,56 @@ aws cloudformation deploy \
 > AWS が新しい Amazon Linux 2023 イメージを公開すると、それ以降のどの更新でもインスタンスが置き換えられます（テンプレートは常に最新のイメージを使います）。
 > スタック更新による置き換えはテストされていないため、移行の実行中には実行しないでください。
 > 再起動や置き換えは、進行中の Full Load や Validation を停止させます。
+
+> [!WARNING]
+> **以前のテンプレートで作成したホストは、手動で修正する必要があります。** 起動スクリプトはインスタンスが
+> 最初に起動したときにしか実行されないため、修正したスクリプトが届くのはこのテンプレートで起動したホスト
+> だけです: ホストをそのまま残すスタック更新は、ホストを停止して起動し直すだけで、スクリプトを再び実行
+> しません。そのようなホストの起動ログには、クッキー署名シークレットが入っています
+> （`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log` が `1` を出力します）。
+> 自分のマシンで実行するコマンドを除き、コマンドはすべてホストへの SSM セッションで実行してください。
+>
+> **起動ログからクッキー署名シークレットを削除してください。** スクリプトは実行した各コマンドを
+> `/var/log/dsql-migrator-userdata.log` にトレースしており、シークレットを読んだコマンドはその値とともに
+> 記録され、ローカルユーザーなら誰でもこのログを読めました。その行を削除し、ログを root だけが読めるように
+> してください（何も再起動しません）:
+>
+> ```bash
+> sudo sed -i '/STORAGE_SECRET=/d' /var/log/dsql-migrator-userdata.log
+> sudo chmod 600 /var/log/dsql-migrator-userdata.log
+> ```
+>
+> **その後、進行中の移行がないとき（移行を始める前か、Cut over の後）にシークレットをローテーションして
+> ください。** このシークレットは UI のセッションクッキーに署名するだけですが（データベースや AWS の
+> 認証情報ではありません）、ログやそのコピーを読んだ人は、シークレットが変わるまでそのクッキーを偽造
+> できます。新しい値にすると、すべてのブラウザが新しいセッションで始まり、アプリが古いセッションに保存
+> した進捗は復元されません: Evaluation の結果、Schema Conversion の選択と DDL の編集、Data Migration
+> の選択（中断した Full Load は再開できません）、そして CDC と Cut over が記録した内容です。移行済みの
+> データ、Aurora DSQL、デプロイ済みの CDC パイプラインには影響しません。自分のマシンか AWS CloudShell で
+> （ホストのロールはシークレットを読むことしかできません）、シークレットに新しい値を設定してください:
+>
+> ```bash
+> SECRET_ARN=$(aws cloudformation describe-stack-resource --stack-name mysql-dsql-migrator-ec2 \
+>   --logical-resource-id StorageSecret --region "$AWS_REGION" \
+>   --query StackResourceDetail.PhysicalResourceId --output text)
+> aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --secret-string "$(aws secretsmanager get-random-password --password-length 64 \
+>   --exclude-punctuation --region "$AWS_REGION" --query RandomPassword --output text)"
+> echo "$SECRET_ARN"
+> ```
+>
+> ホストは初回起動時にシークレットを `/etc/dsql-migrator.env` にコピーしています。ホストで新しい値を
+> そこに書き込み、アプリを再起動してください（再起動すると、進行中の Full Load や Validation は停止します）:
+>
+> ```bash
+> SECRET_ARN=arn:aws:secretsmanager:us-east-1:123456789012:secret:StorageSecret-a1B2c3D4e5F6-GhIjKl  # 上で出力された値
+> AWS_REGION=us-east-1  # スタックのリージョン
+> S=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --query SecretString --output text) &&
+>   sudo sed -i '/^DSQL_MIGRATOR_STORAGE_SECRET=/d' /etc/dsql-migrator.env &&
+>   printf 'DSQL_MIGRATOR_STORAGE_SECRET=%s\n' "$S" | sudo tee -a /etc/dsql-migrator.env >/dev/null &&
+>   unset S && sudo systemctl restart dsql-migrator
+> ```
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 

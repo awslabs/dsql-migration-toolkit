@@ -9,12 +9,14 @@ SSM port-forward: no ALB/ACM/Cognito/ECS, state on a retained EBS volume, and th
 in-process CDC seed (SeedMode=External) enabled by user-data. These tests parse
 the template (tolerating CFN intrinsic tags) and assert the shape the design
 requires, so a future edit can't silently reintroduce the ALB tier, drop the EBS
-retain policy, or lose the data-plane MSK IAM the External seed needs.
+retain policy, lose the data-plane MSK IAM the External seed needs, or write a
+secret the user data reads into its trace.
 """
 
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 
@@ -190,3 +192,101 @@ def test_params_source_model_dropped_and_added() -> None:
         assert dropped not in params, dropped
     assert "VpcId" in params  # the one irreducible operator input, reused
     assert params["SourceMode"]["Default"] == "git"
+
+
+# -- the user data's trace and the files it writes ------------------------------
+
+_XTRACE_ON = re.compile(r"^\{?\s*set\s+(?:-[a-z]*x|-o\s+xtrace\b)")
+_XTRACE_OFF = re.compile(r"^\{?\s*set\s+(?:\+[a-z]*x|\+o\s+xtrace\b)")
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*['\"]?(\w+)")
+# The commands that read a secret: their output, assigned to a variable, is the secret.
+_SECRET_SOURCES = ("secretsmanager get-secret-value", "get-random-password", "--with-decryption")
+
+
+def _user_data() -> str:
+    """The host's user-data script as the template writes it (before Fn::Sub)."""
+    return _load()["Resources"]["AppHost"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+
+
+def _traced(script: str) -> list[str]:
+    """The command lines bash runs with xtrace on, each of which it writes to the trace
+    with its expanded arguments and the values it assigns.
+
+    xtrace turns on at ``set -...x`` / ``set -o xtrace`` and off at ``set +x`` /
+    ``set +o xtrace``. A here-document's body is not traced (bash prints ``+ cat``), nor
+    is a comment."""
+    traced: list[str] = []
+    xtrace, terminator = False, None
+    for line in script.split("\n"):
+        stripped = line.strip()
+        if terminator is not None:  # a here-document's body, up to its terminator line
+            if stripped == terminator:
+                terminator = None
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        if _XTRACE_ON.search(stripped):
+            xtrace = True
+        elif _XTRACE_OFF.search(stripped):
+            xtrace = False
+        elif xtrace:
+            traced.append(stripped)
+        heredoc = _HEREDOC.search(stripped)
+        if heredoc:
+            terminator = heredoc.group(1)
+    return traced
+
+
+def test_no_secret_reaches_the_user_data_trace() -> None:
+    # The script runs under set -x with its output sent to /var/log/dsql-migrator-userdata.log,
+    # so the trace of STORAGE_SECRET=$(aws secretsmanager get-secret-value ...) wrote the
+    # cookie-signing secret there, as "+ STORAGE_SECRET=<value>". A secret is read with
+    # xtrace off, and no traced command expands it.
+    script = _user_data()
+    sources = "|".join(re.escape(source) for source in _SECRET_SOURCES)
+    secrets = {
+        match.group(1)
+        for match in re.finditer(
+            rf"(?m)^\s*(?:export\s+)?(\w+)=[\"']?\$\(.*(?:{sources})", script
+        )
+    }
+    assert secrets == {"STORAGE_SECRET"}, secrets  # the scan found the secret it reads
+    traced = _traced(script)
+    leaks = [
+        line
+        for line in traced
+        if any(source in line for source in _SECRET_SOURCES)
+        or any(re.search(rf"\$\{{!?{name}\}}|\${name}(?!\w)", line) for name in secrets)
+    ]
+    assert not leaks, leaks
+    # The env file still gets it (a here-document's body is not traced) ...
+    env_file = re.search(
+        r"cat > /etc/dsql-migrator\.env <<EOF\n(.*?)\nEOF\n", script, re.S
+    ).group(1)
+    assert "DSQL_MIGRATOR_STORAGE_SECRET=${!STORAGE_SECRET}" in env_file.split("\n")
+    # ... and the trace comes back on after the read.
+    assert "systemctl enable --now dsql-migrator.service" in traced
+
+
+def test_the_user_data_log_and_env_file_are_created_owner_only() -> None:
+    # Created by a redirection under the default umask (022), each would be world-readable:
+    # the log holds the trace of every command, the env file the cookie-signing secret (it
+    # was made 0600 only after it was written). Each is created 0600 first, right before
+    # the redirection that writes it, which truncates the file and keeps its mode.
+    commands = [
+        line.strip()
+        for line in _user_data().split("\n")
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    def at(command: str) -> int:
+        assert commands.count(command) == 1, command
+        return commands.index(command)
+
+    for path, writer in (
+        ("/var/log/dsql-migrator-userdata.log", "exec > {path} 2>&1"),
+        ("/etc/dsql-migrator.env", "cat > {path} <<EOF"),
+    ):
+        created = at(f"install -m 600 /dev/null {path}")
+        assert at(writer.format(path=path)) == created + 1, path
+        assert not any(path in command for command in commands[:created]), path

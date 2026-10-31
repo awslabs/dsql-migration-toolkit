@@ -30,10 +30,17 @@ Settings dialog do (follow-ups of the v0.1.577 review).
   guide's rows and sizing table do. *Tables in parallel*
   stops at 16, so the guide says a 32 vCPU task loads no more tables or parts at once, and
   the manual no longer calls the 16 vCPU task the largest.
+* The EC2 host's startup script traced (``set -x``) the command that read the cookie-signing
+  secret into its log, with the secret's value, and any local user could read the log. The
+  fixed script runs on a new host only, so the guide says how to find and delete that line
+  on an earlier host, make the log root-only, and rotate the secret when no migration is in
+  progress.
 
 Fact pins: the Fargate pairs are AWS's table (below), the knobs come from the Settings
 registry (``config.TUNABLE_KNOBS``) and the bound of *Tables in parallel* from
-``AppConfig``, and the defaults and descriptions from the template.
+``AppConfig``, and the defaults and descriptions from the template, as do the EC2 host's
+startup log, its secret's resource and generator settings, and the env-file line that
+holds the secret.
 """
 
 from __future__ import annotations
@@ -424,6 +431,65 @@ def test_the_ec2_guide_says_the_host_takes_its_settings_and_code_at_first_boot_o
         "`sudo xfs_growfs /var/lib/dsql-migrator`",
     ):
         assert _flat(lang, command) in flat, (lang, command)
+
+
+# Where the EC2 guide says the startup log is root-only, and when to rotate the secret.
+_ROOT_ONLY = {
+    "en": "(readable by root only, so use `sudo`)",
+    "ko": "(root만 읽을 수 있으니 `sudo`로 보세요)",
+    "ja": "（root だけが読めるので `sudo` で見てください）",
+}
+_NO_MIGRATION_IN_PROGRESS = {
+    "en": "when no migration is in progress",
+    "ko": "진행 중인 마이그레이션이 없을 때",
+    "ja": "進行中の移行がないとき",
+}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_ec2_guide_cleans_and_rotates_the_secret_an_earlier_startup_log_holds(
+    lang: str,
+) -> None:
+    # The startup script traced (set -x) the command that read the cookie-signing secret into
+    # its log, with the secret's value, and any local user could read the log. The fixed
+    # script runs on a new host only, so the guide says how to find that line on an earlier
+    # host, delete it and make the log root-only, then give the secret a new value and write
+    # it into the host's env file, printing neither. The names and the generator settings are
+    # the template's.
+    ec2 = yaml.safe_load((DEPLOY / "cloudformation-ec2.yaml").read_text(encoding="utf-8"))
+    user_data = ec2["Resources"]["AppHost"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+    (log,) = re.findall(r"(?m)^exec > (\S+) 2>&1$", user_data)
+    ((variable, resource),) = re.findall(
+        r"(?m)^(\w+)=\$\(aws secretsmanager get-secret-value --secret-id \$\{(\w+)\} ",
+        user_data,
+    )
+    (env_variable,) = re.findall(rf"(?m)^(\w+)=\$\{{!{variable}\}}$", user_data)
+    generated = ec2["Resources"][resource]["Properties"]["GenerateSecretString"]
+
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n{_EC2_PARAMETERS[lang]}\n")
+    part = _flat(lang, text[start : text.index("\n### 4", start)])  # sections 2 and 3
+    for phrase in (
+        _ROOT_ONLY[lang],
+        f"sudo grep -c {variable}= {log}",  # finds the line on an earlier host
+        f"sudo sed -i '/{variable}=/d' {log}",
+        f"sudo chmod 600 {log}",
+        _NO_MIGRATION_IN_PROGRESS[lang],
+        f"--logical-resource-id {resource}",
+        "put-secret-value",
+        f"--password-length {generated['PasswordLength']}",
+        *(["--exclude-punctuation"] if generated.get("ExcludePunctuation") else []),
+        f"sudo sed -i '/^{env_variable}=/d' /etc/dsql-migrator.env",
+        f"printf '{env_variable}=%s\\n'",
+        "| sudo tee -a /etc/dsql-migrator.env >/dev/null",  # tee alone echoes the secret
+    ):
+        assert _has(lang, part, phrase), (lang, phrase)
+    # The old line goes before the new one is written (the same sed would delete both), and
+    # the restart that applies the new value comes after the line that writes it.
+    deleted = part.index(_flat(lang, f"sudo sed -i '/^{env_variable}=/d' /etc/dsql-migrator.env"))
+    written = part.index(_flat(lang, f"printf '{env_variable}=%s\\n'"))
+    assert deleted < written, lang
+    assert _flat(lang, "sudo systemctl restart dsql-migrator") in part[written:], lang
 
 
 # -- task memory: the template, the guide's row, its sizing bullet and AWS's table agree -----
