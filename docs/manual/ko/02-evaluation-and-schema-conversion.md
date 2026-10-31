@@ -531,6 +531,7 @@ Evaluation이 보고하는 항목을 소스 엔진별로 정리한 참조이며,
 | Aurora DSQL이 인덱싱할 수 없는 컬럼의 기본 키(`BYTEA_KEY`, `PG_UNINDEXABLE_COLUMN`) | 소스에서 테이블의 키를 다시 잡으세요. 예를 들어 그 값의 텍스트나 해시 형태를 키로 씁니다. 그런 컬럼은 MySQL `BINARY`, `VARBINARY`, `BLOB`과 공간 타입(Aurora DSQL에서는 모두 `bytea`), 그리고 PostgreSQL `bytea`, `json`, `jsonb`, `interval`, `time with time zone`과 배열입니다. 그런 컬럼에 대한 인덱스는 생성되지 않으므로(**Review needed**), `UNIQUE` 인덱스였다면 더 이상 유일성을 강제하지 않습니다. |
 | Aurora DSQL 데이터베이스 한도 초과(`TABLE_COUNT_LIMIT`, `SCHEMA_COUNT_LIMIT`, `VIEW_COUNT_LIMIT`) | 타깃 데이터베이스가 이미 담고 있는 것을 포함해 테이블 1,000개, 스키마 10개 또는 뷰 5,000개를 넘게 되며, 점수는 **Blocked**가 됩니다. 마이그레이션을 여러 클러스터로 나누세요. |
 | 테이블이나 이름의 한도 초과(`TOO_MANY_COLUMNS`, `TOO_MANY_KEY_COLUMNS`, `IDENTIFIER_LENGTH`, `NAME_COLLISION`) | 컬럼이 255개를 넘거나, 기본 키가 8개를 넘는 컬럼으로 되어 있거나, (MySQL에서) 이름의 앞 63바이트가 같은 경우입니다: 그런 컬럼이 둘이면 테이블의 `CREATE TABLE`이 실패하고, 그런 테이블이나 뷰가 둘이면 어느 쪽도 생성되지 않습니다. 소스에서 테이블이나 이름을 바꾸세요. |
+| 데이터베이스나 스키마 이름 안의 `.`(`DOTTED_SCHEMA_NAME`) | 도구는 정규화된 이름의 첫 `.`을 데이터베이스(또는 스키마)와 테이블 사이의 구분자로 보므로, 모든 단계가 그 데이터베이스의 테이블과 뷰 이름을 엉뚱한 곳에서 나누고, 그중 어느 것도 마이그레이션할 수 없습니다. 소스에서 그 데이터베이스나 스키마를 `.`이 없는 이름으로 바꾸거나(MySQL은 데이터베이스 이름을 바꿀 수 없으므로 새 데이터베이스를 만들고, 각 테이블의 트리거를 먼저 삭제한 뒤 `RENAME TABLE`로 테이블을 새 데이터베이스에 옮기고, 그 뷰와 트리거를 거기에 다시 만들며, PostgreSQL은 `ALTER SCHEMA … RENAME TO …`로), 그 테이블과 뷰를 마이그레이션에서 빼세요. |
 
 **데이터를 바꾸거나 거부함** (Review needed)
 

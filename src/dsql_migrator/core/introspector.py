@@ -1170,12 +1170,17 @@ def _assemble_inventory(
     dialect: "SourceDialect",
     progress: Optional[Callable[[int, int], None]] = None,
     vanished_out: "Optional[list[str]]" = None,
+    dotted_out: "Optional[list[str]]" = None,
 ) -> SourceInventory:
     """Assemble a :class:`SourceInventory` from one or all schemas.
 
     ``vanished_out`` collects the (qualified) tables and views that were listed but gone
     when read, and still gone when looked for again: not in the inventory, and reported
     so (dropped at that moment, or replaced by a statement still running).
+
+    ``dotted_out`` collects the databases (MySQL) or schemas (PostgreSQL) read whose name
+    holds a '.' and that hold a table or view, as named on the source: Evaluation reports
+    those tables and views (:func:`~dsql_migrator.core.assessor.dotted_schema_findings`).
 
     For an engine whose ``database`` IS a schema (MySQL, ``dialect.database_is_schema``):
     when ``database`` is set, that single schema is reflected and its names are qualified
@@ -1287,6 +1292,11 @@ def _assemble_inventory(
 
         if qualify:
             _qualify(enrich_db, tables, views, triggers, routines, events)
+            # Every step splits a qualified name at its first '.', and the qualified names
+            # alone cannot tell this case (my.db.orders: database my.db, table orders) from
+            # a '.' inside a table name (shop.a.b: database shop, table a.b).
+            if dotted_out is not None and "." in enrich_db and (tables or views):
+                dotted_out.append(enrich_db)
 
         all_tables.extend(tables)
         all_views.extend(views)
@@ -1368,6 +1378,9 @@ class SourceIntrospector:
         # The tables and views the last introspect() listed but found gone, twice (see
         # _assemble_inventory): read by Evaluation to say so, never persisted.
         self.last_vanished: list[str] = []
+        # The databases (MySQL) or schemas (PostgreSQL) the last introspect() read whose
+        # name holds a '.' (see _assemble_inventory): read by Evaluation, never persisted.
+        self.last_dotted_schemas: list[str] = []
 
     def test_connection(self, conn: SourceConnectionConfig) -> ConnectionResult:
         """Validate connectivity and return a success/failure result.
@@ -1444,6 +1457,8 @@ class SourceIntrospector:
                 inspector = inspect(connection)
                 vanished: list[str] = []
                 self.last_vanished = vanished
+                dotted: list[str] = []
+                self.last_dotted_schemas = dotted
                 try:
                     return _assemble_inventory(
                         inspector,
@@ -1452,6 +1467,7 @@ class SourceIntrospector:
                         dialect=dialect,
                         progress=progress,
                         vanished_out=vanished,
+                        dotted_out=dotted,
                     )
                 except Exception as exc:
                     if _is_lock_timeout(exc):

@@ -350,12 +350,13 @@ def with_refreshed_catalogs(
     assessment = CompatibilityAssessor(source_type=engine).assess(
         inventory, target_inventory=target_inventory
     )
-    # What the run's own probes of the source found -- the privilege gap, and for
-    # PostgreSQL row-level security and standalone sequences -- is not in the inventory, so
-    # a re-assessment carries it over (re-run Step 1 to probe again). Not across an engine
-    # switch, nor onto a fresh read of ANOTHER source: those findings describe the source
-    # that was probed, and carried under the new source's name (now re-stamped) they read
-    # 'no row-level security' for a database nobody checked.
+    # What the run's own probes of the source found -- the privilege gap, a '.' in the name
+    # of a database or schema (from the run's catalog read), and for PostgreSQL row-level
+    # security and standalone sequences -- is not in the inventory, so a re-assessment
+    # carries it over (re-run Step 1 to probe again). Not across an engine switch, nor onto
+    # a fresh read of ANOTHER source: those findings describe the source that was probed,
+    # and carried under the new source's name (now re-stamped) they read 'no row-level
+    # security' for a database nobody checked.
     same_source = source_label is None or same_source_address(
         source_address(result.source_label), source_address(source_label)
     )
@@ -1103,6 +1104,20 @@ def run_evaluation(
 
         assessment = AssessmentReport.from_items(
             [*assessment.items, *catalog_changed_items(vanished)]
+        )
+    # A '.' inside a database or schema name, which the read knew and its qualified names
+    # no longer show: every table and view of it is Unsupported (a refresh carries it).
+    dotted = list(getattr(introspector, "last_dotted_schemas", None) or [])
+    if dotted:
+        from dsql_migrator.core.assessor import dotted_schema_findings, with_object_findings
+
+        assessment = with_object_findings(
+            assessment,
+            dotted_schema_findings(
+                inventory,
+                dotted,
+                is_postgres=inputs.source_config.source_type is SourceType.POSTGRES,
+            ),
         )
     if listing_gaps:
         assessment = AssessmentReport.from_items(

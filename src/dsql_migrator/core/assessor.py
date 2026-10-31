@@ -2548,6 +2548,63 @@ def catalog_changed_items(names: "Sequence[str]") -> list[AssessmentItem]:
     return [item.model_copy(update={"concerns": _single_concern(item)})]
 
 
+DOTTED_SCHEMA_RULE_ID = "DOTTED_SCHEMA_NAME"
+
+
+def dotted_schema_findings(
+    inventory: SourceInventory, schemas: "Sequence[str]", *, is_postgres: bool = False
+) -> list[Finding]:
+    """An UNSUPPORTED finding on each table and view of the databases (MySQL) or schemas
+    (PostgreSQL) in ``schemas``: those the catalog read found with a '.' in their name (the
+    introspector's ``last_dotted_schemas``). Every step splits a qualified name at its
+    first '.', so ``my.db.orders`` is taken for table ``db.orders`` of database ``my``,
+    and the inventory's names alone cannot tell it from a '.' inside a table name.
+
+    An object gets one finding, from the longest of ``schemas`` its name starts with: with
+    ``my.db`` and ``my.db.x`` both dotted, ``my.db.x.t`` belongs to ``my.db.x``, and a
+    second finding would name the wrong database. Pure."""
+    unit = "schema" if is_postgres else "database"
+    rename = (
+        "Rename the schema on the source to a name without a '.' (ALTER SCHEMA ... "
+        "RENAME TO ...)"
+        if is_postgres
+        else "Rename the database on the source to a name without a '.' (MySQL cannot "
+        "rename a database: create the new one, move each table into it with RENAME "
+        "TABLE, dropping its triggers first, and re-create its views and triggers there)"
+    )
+    recommendation = (
+        f"{rename}, or leave its tables and views out of the migration: do not apply them "
+        "in Schema Conversion, and do not select them in Data Migration."
+    )
+    longest_first = sorted(dict.fromkeys(schemas), key=len, reverse=True)
+    findings: list[Finding] = []
+    for kind, name in (
+        *((KIND_TABLE, table.name) for table in inventory.tables),
+        *((KIND_VIEW, view.name) for view in inventory.views),
+    ):
+        schema = next((s for s in longest_first if name.startswith(f"{s}.")), None)
+        if schema is None:
+            continue
+        head, _, tail = schema.partition(".")
+        bare = name[len(schema) + 1:]
+        findings.append(
+            Finding(
+                object=ObjectKey(kind, name),
+                rule_id=DOTTED_SCHEMA_RULE_ID,
+                classification=Classification.UNSUPPORTED,
+                risk=(
+                    f"Its {unit}, {schema}, has a '.' in its name. The tool reads the first "
+                    f"'.' of a qualified name as the one between the {unit} and the {kind}, "
+                    f"so every step takes {name} for {kind} {tail}.{bare} of {unit} {head}, "
+                    "and it cannot be migrated."
+                ),
+                recommendation=recommendation,
+                effort=EffortLevel.MEDIUM,
+            )
+        )
+    return findings
+
+
 def source_visibility_items(gaps: "Sequence[str]") -> list[AssessmentItem]:
     """The database-level item for objects the source user cannot list (``gaps``, from the
     source dialect's listing probe): what is not listed is not assessed, converted or
@@ -2611,7 +2668,9 @@ PG_CATALOG_CHECKED_RULE_ID = "PG_CATALOG_CHECKED"
 # inventory, so a re-assessment from the inventory alone (a catalog refresh, a restored
 # session) cannot recompute them and has to carry them over (:func:`carry_probe_results`).
 # Two shapes: an item of its own (the privilege gap, a sequence, an unread probe), and a
-# concern on an inventory object's item (row-level security on a table).
+# concern on an inventory object's item (row-level security on a table; a '.' in the name
+# of a table's or view's database or schema, which the inventory's qualified names do not
+# tell from one in the table's own name).
 _PROBE_ITEM_RULE_IDS = frozenset(
     {
         SOURCE_VISIBILITY_RULE_ID,
@@ -2620,7 +2679,7 @@ _PROBE_ITEM_RULE_IDS = frozenset(
         PG_CATALOG_CHECKED_RULE_ID,
     }
 )
-_PROBE_CONCERN_RULE_IDS = frozenset({PG_ROW_LEVEL_SECURITY_RULE_ID})
+_PROBE_CONCERN_RULE_IDS = frozenset({PG_ROW_LEVEL_SECURITY_RULE_ID, DOTTED_SCHEMA_RULE_ID})
 
 
 def _findings_of(item: AssessmentItem) -> list[Finding]:
@@ -5043,6 +5102,8 @@ __all__ = [
     "DSQL_DATABASE_LIMITS",
     "default_inventory_rules",
     "catalog_changed_items",
+    "DOTTED_SCHEMA_RULE_ID",
+    "dotted_schema_findings",
     "check_mixed_case_identifiers",
     "check_mysql_time_zone",
     "check_postgres_time_zone",
