@@ -38,12 +38,16 @@ Settings dialog do (follow-ups of the v0.1.577 review).
 * README and the manual (chapters 3, 7, 11 and 12) said to set *Tables in parallel* to the
   task's vCPU count, and chapter 3 that a Full Load can use every vCPU of its task, with no
   bound; it stops at 16, so each one now gives that bound.
+* The EC2 host's ``/etc/fstab`` named its state volume by its NVMe device name, which can
+  change from one boot to the next, and the app did not wait for the volume. The fixed
+  script names it by its file-system UUID and the app's unit requires the mount; it runs on
+  a new host only, so the guide says how to do both on an earlier host.
 
 Fact pins: the Fargate pairs are AWS's table (below), the knobs come from the Settings
 registry (``config.TUNABLE_KNOBS``) and the bound of *Tables in parallel* from
 ``AppConfig``, and the defaults and descriptions from the template, as do the EC2 host's
-startup log, its secret's resource and generator settings, and the env-file line that
-holds the secret.
+startup log, its secret's resource and generator settings, the env-file line that holds
+the secret, and its state volume's device and mount point and the app's unit.
 """
 
 from __future__ import annotations
@@ -493,6 +497,49 @@ def test_the_ec2_guide_cleans_and_rotates_the_secret_an_earlier_startup_log_hold
     written = part.index(_flat(lang, f"printf '{env_variable}=%s\\n'"))
     assert deleted < written, lang
     assert _flat(lang, "sudo systemctl restart dsql-migrator") in part[written:], lang
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_ec2_guide_moves_an_earlier_host_to_its_volume_uuid(lang: str) -> None:
+    # An earlier host's /etc/fstab names the state volume by its NVMe device name, which can
+    # change from one boot to the next, and its startup script does not run again. So the
+    # guide says how to find that line, name the volume by its file-system UUID instead (the
+    # line changes only once blkid has read the UUID) and make the app require the mount with
+    # a drop-in, as the fixed script's unit does, before systemd reloads both. The device, the
+    # mount point and the unit are the template's.
+    ec2 = yaml.safe_load((DEPLOY / "cloudformation-ec2.yaml").read_text(encoding="utf-8"))
+    device = ec2["Resources"]["StateVolumeAttachment"]["Properties"]["Device"]
+    user_data = ec2["Resources"]["AppHost"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+    ((mount_point, options),) = re.findall(
+        r'(?m)^\s*echo "\S+ (\S+) \S+ (\S+) \d \d" >> /etc/fstab$', user_data
+    )
+    (unit,) = re.findall(r"(?m)^cat > (/etc/systemd/system/\S+\.service) <<'EOF'$", user_data)
+    assert f"\nRequiresMountsFor={mount_point}\n" in user_data  # what the drop-in adds
+    assert "nofail" in options.split(","), options
+
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n{_EC2_PARAMETERS[lang]}\n")
+    part = _flat(lang, text[start : text.index("\n### 4", start)])  # sections 2 and 3
+    fstab = (
+        f'sudo sed -i "s|^/dev/[^ ]* {mount_point} |UUID=$STATE_UUID {mount_point} |" /etc/fstab'
+    )
+    drop_in = f"sudo tee {unit}.d/state-volume.conf >/dev/null"
+    grep = f"grep ' {mount_point} ' /etc/fstab"
+    # Once to find an earlier host's line, once to show the new one.
+    assert part.count(_flat(lang, grep)) == 2, lang
+    for phrase in (
+        f'STATE_UUID=$(sudo blkid -s UUID -o value "$(readlink -f {device})") &&',
+        fstab,
+        f"sudo mkdir -p {unit}.d",
+        f"printf '[Unit]\\nRequiresMountsFor={mount_point}\\n'",
+        drop_in,
+        "sudo systemctl daemon-reload",
+        f"findmnt {mount_point}",  # prints nothing when the volume is not mounted now
+    ):
+        assert _has(lang, part, phrase), (lang, phrase)
+    reload = part.index(_flat(lang, "sudo systemctl daemon-reload"))
+    for written in (fstab, drop_in):
+        assert part.index(_flat(lang, written)) < reload, (lang, written)
 
 
 # -- task memory: the template, the guide's row, its sizing bullet and AWS's table agree -----

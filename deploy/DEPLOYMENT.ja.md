@@ -1184,12 +1184,35 @@ aws cloudformation deploy \
 > 再起動や置き換えは、進行中の Full Load や Validation を停止させます。
 
 > [!WARNING]
-> **以前のテンプレートで作成したホストは、手動で修正する必要があります。** 起動スクリプトはインスタンスが
-> 最初に起動したときにしか実行されないため、修正したスクリプトが届くのはこのテンプレートで起動したホスト
-> だけです: ホストをそのまま残すスタック更新は、ホストを停止して起動し直すだけで、スクリプトを再び実行
-> しません。そのようなホストの起動ログには、クッキー署名シークレットが入っています
+> **以前のテンプレートで作成したホストは、2 つの点を手動で修正する必要があります。** 起動スクリプトは
+> インスタンスが最初に起動したときにしか実行されないため、修正したスクリプトが届くのはこのテンプレートで
+> 起動したホストだけです: ホストをそのまま残すスタック更新は、ホストを停止して起動し直すだけで、
+> スクリプトを再び実行しません。そのようなホストは状態ボリュームをデバイス名で指定しており
+> （`grep ' /var/lib/dsql-migrator ' /etc/fstab` が `/dev/` で始まる行を出力します）、起動ログには
+> クッキー署名シークレットが入っています
 > （`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log` が `1` を出力します）。
 > 自分のマシンで実行するコマンドを除き、コマンドはすべてホストへの SSM セッションで実行してください。
+>
+> **ホストが次に停止して起動する前に（このテンプレートへのスタック更新でそうなります）、状態ボリュームを
+> UUID で指定してください。** NVMe のデバイス名は起動時にデバイスが応答した順に付くため、起動のたびに
+> 変わることがあります。そうなると `/etc/fstab` が別のデバイスを指してボリュームがマウントされず、
+> ボリュームを待たないアプリは状態を開けずに 5 秒ごとに再起動します。ボリュームをファイルシステムの
+> UUID で指定し、ボリュームがマウントされてからでないとアプリが起動しないようにしてください
+> （何も再起動しません）:
+>
+> ```bash
+> STATE_UUID=$(sudo blkid -s UUID -o value "$(readlink -f /dev/sdf)") &&
+>   sudo sed -i "s|^/dev/[^ ]* /var/lib/dsql-migrator |UUID=$STATE_UUID /var/lib/dsql-migrator |" /etc/fstab
+> sudo mkdir -p /etc/systemd/system/dsql-migrator.service.d
+> printf '[Unit]\nRequiresMountsFor=/var/lib/dsql-migrator\n' |
+>   sudo tee /etc/systemd/system/dsql-migrator.service.d/state-volume.conf >/dev/null
+> sudo systemctl daemon-reload
+> grep ' /var/lib/dsql-migrator ' /etc/fstab
+> ```
+>
+> 最後のコマンドはボリュームの行を出力し、その行は `UUID=` で始まるようになっています。
+> `findmnt /var/lib/dsql-migrator` が何も出力しない場合、ボリュームは今マウントされていません:
+> `sudo systemctl restart dsql-migrator` がボリュームをマウントしてから、アプリを起動します。
 >
 > **起動ログからクッキー署名シークレットを削除してください。** スクリプトは実行した各コマンドを
 > `/var/log/dsql-migrator-userdata.log` にトレースしており、シークレットを読んだコマンドはその値とともに

@@ -9,8 +9,9 @@ SSM port-forward: no ALB/ACM/Cognito/ECS, state on a retained EBS volume, and th
 in-process CDC seed (SeedMode=External) enabled by user-data. These tests parse
 the template (tolerating CFN intrinsic tags) and assert the shape the design
 requires, so a future edit can't silently reintroduce the ALB tier, drop the EBS
-retain policy, lose the data-plane MSK IAM the External seed needs, or write a
-secret the user data reads into its trace.
+retain policy, lose the data-plane MSK IAM the External seed needs, write a
+secret the user data reads into its trace, or mount the state volume by a device
+name that can change from one boot to the next.
 """
 
 from __future__ import annotations
@@ -290,3 +291,50 @@ def test_the_user_data_log_and_env_file_are_created_owner_only() -> None:
         created = at(f"install -m 600 /dev/null {path}")
         assert at(writer.format(path=path)) == created + 1, path
         assert not any(path in command for command in commands[:created]), path
+
+
+# -- the state volume's mount ---------------------------------------------------
+
+
+def test_the_state_volume_is_mounted_by_uuid_and_the_service_requires_it() -> None:
+    # /etc/fstab named the state volume by its NVMe device name (readlink -f /dev/sdf), which
+    # follows the order the devices answer at boot and can change from one boot to the next:
+    # the volume was then not mounted (nofail lets the host boot), and the app, which did not
+    # wait for it, restarted every 5 s unable to open its state. The line names the file
+    # system's UUID, read after mkfs.xfs (before it, blkid exits 2 on a new volume and set -e
+    # stops every new host's script), and the unit requires the mount that holds the state.
+    script = _user_data()
+    commands = [
+        line.strip()
+        for line in script.split("\n")
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    fstab = re.compile(r'echo "(\S+) (\S+) (\S+) (\S+) (\d) (\d)" >> /etc/fstab')
+    (echoed,) = [i for i, command in enumerate(commands) if fstab.fullmatch(command)]
+    source, mount_point, _type, options, _dump, _pass = fstab.fullmatch(commands[echoed]).groups()
+    assert source == "UUID=${!STATE_UUID}", source
+    assert "nofail" in options.split(","), options  # a boot without the volume still completes
+
+    def at(command: str) -> int:
+        assert commands.count(command) == 1, command
+        return commands.index(command)
+
+    # Read once the volume has a file system: after the block that formats a new volume, so
+    # also for a re-attached one, which that block leaves as it is.
+    formatted = at('mkfs.xfs "${!DEV}"')
+    assert commands[formatted + 1] == "fi", commands[formatted + 1]
+    read = at('STATE_UUID=$(blkid -s UUID -o value "${!DEV}")')
+    assert formatted + 1 < read < echoed, (formatted, read, echoed)
+    unit = re.search(
+        r"cat > /etc/systemd/system/dsql-migrator\.service <<'EOF'\n(.*?)\nEOF\n", script, re.S
+    ).group(1)
+    unit_section = unit.split("\n[Service]\n")[0]
+    assert f"RequiresMountsFor={mount_point}" in unit_section.split("\n"), unit_section
+    # The mount the unit requires holds every state file the env file points the app at.
+    env_file = re.search(
+        r"cat > /etc/dsql-migrator\.env <<EOF\n(.*?)\nEOF\n", script, re.S
+    ).group(1)
+    paths = dict(re.findall(r"(?m)^(DSQL_MIGRATOR_\w+_PATH)=(\S+)$", env_file))
+    assert {"DSQL_MIGRATOR_JOB_STATE_PATH", "DSQL_MIGRATOR_SESSION_STATE_PATH"} <= set(paths)
+    for name, path in paths.items():
+        assert path.startswith(f"{mount_point}/"), (name, path)

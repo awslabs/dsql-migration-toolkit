@@ -1195,12 +1195,35 @@ the in-process seed), then starts the service. Progress is in
 > runs. A restart or a replacement stops any Full Load or Validation in progress.
 
 > [!WARNING]
-> **A host created from an earlier template needs a fix by hand.** Its startup script runs
-> only when an instance first launches, so the fixed script reaches only a host launched
-> from this template: a stack update that keeps the host stops and starts it without
-> running the script again. Such a host's startup log holds the cookie-signing secret
+> **A host created from an earlier template needs two fixes by hand.** Its startup script
+> runs only when an instance first launches, so the fixed script reaches only a host
+> launched from this template: a stack update that keeps the host stops and starts it
+> without running the script again. Such a host names its state volume by device
+> (`grep ' /var/lib/dsql-migrator ' /etc/fstab` prints a line that starts with `/dev/`), and
+> its startup log holds the cookie-signing secret
 > (`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log` prints `1`). Run the
 > commands in an SSM session to the host, except the one for your own machine.
+>
+> **Before the host next stops and starts (a stack update to this template does), name the
+> state volume by its UUID.** NVMe device names follow the order the devices answer at boot
+> and can change from one boot to the next. `/etc/fstab` then names another device, the
+> volume is not mounted, and the app, which does not wait for it, cannot open its state and
+> restarts every 5 seconds. Name the volume by its file-system UUID and make the app require
+> it (nothing restarts):
+>
+> ```bash
+> STATE_UUID=$(sudo blkid -s UUID -o value "$(readlink -f /dev/sdf)") &&
+>   sudo sed -i "s|^/dev/[^ ]* /var/lib/dsql-migrator |UUID=$STATE_UUID /var/lib/dsql-migrator |" /etc/fstab
+> sudo mkdir -p /etc/systemd/system/dsql-migrator.service.d
+> printf '[Unit]\nRequiresMountsFor=/var/lib/dsql-migrator\n' |
+>   sudo tee /etc/systemd/system/dsql-migrator.service.d/state-volume.conf >/dev/null
+> sudo systemctl daemon-reload
+> grep ' /var/lib/dsql-migrator ' /etc/fstab
+> ```
+>
+> The last command prints the volume's line, which now starts with `UUID=`. If
+> `findmnt /var/lib/dsql-migrator` prints nothing, the volume is not mounted now:
+> `sudo systemctl restart dsql-migrator` mounts it, then starts the app.
 >
 > **Remove the cookie-signing secret from the startup log.** The script traced each command
 > it ran into `/var/log/dsql-migrator-userdata.log`, the one that read the secret with its

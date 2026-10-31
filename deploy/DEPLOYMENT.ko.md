@@ -1099,11 +1099,33 @@ aws cloudformation deploy \
 > 재시작이나 교체는 진행 중인 Full Load나 Validation을 멈춥니다.
 
 > [!WARNING]
-> **이전 템플릿으로 만든 호스트는 직접 고쳐야 합니다.** 시작 스크립트는 인스턴스가 처음 시작될 때만
-> 실행되므로, 고친 스크립트는 이 템플릿으로 시작한 호스트에만 적용됩니다: 호스트를 그대로 두는 스택
-> 업데이트는 호스트를 멈췄다가 다시 시작할 뿐 스크립트를 다시 실행하지 않습니다. 그런 호스트의 시작
-> 로그에는 쿠키 서명 시크릿이 들어 있습니다(`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log`가
-> `1`을 출력). 내 컴퓨터에서 실행할 명령을 빼고는 모두 호스트에 연 SSM 세션에서 실행하세요.
+> **이전 템플릿으로 만든 호스트는 두 가지를 직접 고쳐야 합니다.** 시작 스크립트는 인스턴스가 처음
+> 시작될 때만 실행되므로, 고친 스크립트는 이 템플릿으로 시작한 호스트에만 적용됩니다: 호스트를 그대로
+> 두는 스택 업데이트는 호스트를 멈췄다가 다시 시작할 뿐 스크립트를 다시 실행하지 않습니다. 그런
+> 호스트는 상태 볼륨을 장치 이름으로 가리키고(`grep ' /var/lib/dsql-migrator ' /etc/fstab`이
+> `/dev/`로 시작하는 줄을 출력), 시작 로그에는 쿠키 서명 시크릿이 들어
+> 있습니다(`sudo grep -c STORAGE_SECRET= /var/log/dsql-migrator-userdata.log`가 `1`을 출력). 내
+> 컴퓨터에서 실행할 명령을 빼고는 모두 호스트에 연 SSM 세션에서 실행하세요.
+>
+> **호스트가 다음에 멈췄다가 다시 시작하기 전에(이 템플릿으로 스택을 업데이트하면 그렇게 됩니다) 상태
+> 볼륨을 UUID로 지정하세요.** NVMe 장치 이름은 부팅 때 장치가 응답하는 순서를 따르므로 부팅할 때마다
+> 바뀔 수 있습니다. 그러면 `/etc/fstab`이 다른 장치를 가리켜 볼륨이 마운트되지 않고, 볼륨을 기다리지
+> 않는 앱은 상태를 열지 못해 5초마다 재시작합니다. 볼륨을 파일 시스템 UUID로 지정하고, 앱이 볼륨이
+> 마운트된 뒤에만 시작하게 하세요(재시작되는 것은 없습니다):
+>
+> ```bash
+> STATE_UUID=$(sudo blkid -s UUID -o value "$(readlink -f /dev/sdf)") &&
+>   sudo sed -i "s|^/dev/[^ ]* /var/lib/dsql-migrator |UUID=$STATE_UUID /var/lib/dsql-migrator |" /etc/fstab
+> sudo mkdir -p /etc/systemd/system/dsql-migrator.service.d
+> printf '[Unit]\nRequiresMountsFor=/var/lib/dsql-migrator\n' |
+>   sudo tee /etc/systemd/system/dsql-migrator.service.d/state-volume.conf >/dev/null
+> sudo systemctl daemon-reload
+> grep ' /var/lib/dsql-migrator ' /etc/fstab
+> ```
+>
+> 마지막 명령은 볼륨의 줄을 출력하며, 이제 그 줄은 `UUID=`로 시작합니다.
+> `findmnt /var/lib/dsql-migrator`가 아무것도 출력하지 않으면 지금 볼륨이 마운트되어 있지 않은
+> 것입니다: `sudo systemctl restart dsql-migrator`가 볼륨을 마운트한 다음 앱을 시작합니다.
 >
 > **시작 로그에서 쿠키 서명 시크릿을 지우세요.** 스크립트는 실행한 명령을 하나하나
 > `/var/log/dsql-migrator-userdata.log`에 추적해 남겼는데, 시크릿을 읽은 명령은 그 값까지 남았고, 로컬

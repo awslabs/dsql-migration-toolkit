@@ -1337,10 +1337,14 @@ Resources:
             if ! blkid "${!DEV}"; then
               mkfs.xfs "${!DEV}"
             fi
+            # By the file system's UUID, not the device name: an NVMe name (nvme1n1) can
+            # change from one boot to the next; the UUID lasts as long as the file system.
+            STATE_UUID=$(blkid -s UUID -o value "${!DEV}")
             mkdir -p /var/lib/dsql-migrator
-            # nofail so a boot with a missing/late volume does not wedge the host.
+            # nofail so a boot with a missing/late volume does not wedge the host;
+            # RequiresMountsFor in the unit keeps the app from starting without it.
             grep -q " /var/lib/dsql-migrator " /etc/fstab || \
-              echo "${!DEV} /var/lib/dsql-migrator xfs defaults,nofail 0 2" >> /etc/fstab
+              echo "UUID=${!STATE_UUID} /var/lib/dsql-migrator xfs defaults,nofail 0 2" >> /etc/fstab
             mount /var/lib/dsql-migrator
             # The systemd service runs as dsqlapp; give it ownership of the state mount.
             chown -R dsqlapp:dsqlapp /var/lib/dsql-migrator
@@ -1424,6 +1428,7 @@ Resources:
             Description=MySQL/PostgreSQL -> Aurora DSQL migration tool (NiceGUI, run from source)
             After=network-online.target
             Wants=network-online.target
+            RequiresMountsFor=/var/lib/dsql-migrator
 
             [Service]
             Type=simple
