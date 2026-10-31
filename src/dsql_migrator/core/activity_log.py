@@ -34,8 +34,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import sys
 from logging.handlers import RotatingFileHandler
 import traceback
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -103,10 +107,12 @@ class ActivityStatus(str, Enum):
 
     ``WARNING`` is the calibrated middle the other four lacked: nothing FAILED, but the
     event is not routine either -- an operator deliberately waiving an invariant (cutting
-    over without enforced foreign keys), a run the operator stopped part-way, or turning a
-    log sink off. Recording those as ``INFO`` buried the one line a reader most needs to
-    find; recording them as ``FAILURE`` would claim something broke. Mirrors the design
-    system's tone calibration (``ui/design.py``): warning == a real but non-blocking fact.
+    over without enforced foreign keys), a run the operator stopped part-way, or turning off
+    the CloudWatch mirror on ECS (the one copy of the log a task replacement keeps; on the
+    EC2 host or a local run the file stays, so there it is ``INFO``). Recording those as
+    ``INFO`` buried the one line a reader most needs to find; recording them as
+    ``FAILURE`` would claim something broke. Mirrors the design system's tone calibration
+    (``ui/design.py``): warning == a real but non-blocking fact.
     """
 
     STARTED = "started"
@@ -305,16 +311,16 @@ def configure_activity_file_log(
 def configure_activity_stdout_log(*, level: int = logging.INFO) -> None:
     """Also emit activity events to stdout as JSON lines (idempotent, opt-in).
 
-    Companion to :func:`configure_activity_file_log`: on ECS the container's
+    Companion to :func:`configure_activity_file_log`. Where the lines end up is the
+    deployment's doing (:func:`activity_stdout_destination`): on ECS the container's
     awslogs driver forwards stdout to CloudWatch Logs, so enabling this gives a
-    durable, queryable copy of the audit trail that survives task replacement
-    (the rotating file lives on the task's ephemeral storage). Uses the same
-    :class:`ActivityJsonFormatter`, so each event is one JSON line in CloudWatch
-    too. A no-op on repeat calls (the stdout handler is tagged), and harmless
-    off ECS (the lines simply print to the console).
+    durable, queryable copy of the audit trail that survives task replacement (the
+    rotating file lives on the task's ephemeral storage); on the EC2 host journald
+    keeps the systemd service's stdout (``journalctl -u dsql-migrator``) while the file
+    stays on the retained state volume; a local run prints them to the console. Uses
+    the same :class:`ActivityJsonFormatter`, so each event is one JSON line wherever
+    stdout goes. A no-op on repeat calls (the stdout handler is tagged).
     """
-    import sys
-
     logger = logging.getLogger(ACTIVITY_LOGGER_NAME)
     logger.setLevel(level)
     logger.propagate = False
@@ -350,8 +356,9 @@ def set_activity_log_level(level: int) -> None:
     "which data was being moved when it broke".
 
     Process-wide (both loggers are singletons), which suits the single-task app. The
-    data-path lines go to the app's ordinary log stream (stdout -> CloudWatch Logs on ECS),
-    NOT the downloadable activity file, which stays the audit trail.
+    data-path lines go to the app's ordinary log stream (CloudWatch Logs on ECS, the
+    service's journal on the EC2 host, the console when run locally), NOT the downloadable
+    activity file, which stays the audit trail.
     """
     logging.getLogger(ACTIVITY_LOGGER_NAME).setLevel(level)
     logging.getLogger(_PACKAGE_LOGGER_NAME).setLevel(level)
@@ -363,7 +370,7 @@ def current_activity_log_level() -> int:
 
 
 def disable_activity_stdout_log() -> None:
-    """Detach the stdout activity handler if present (stop the CloudWatch mirror).
+    """Detach the stdout activity handler if present (stop the stdout mirror).
 
     Inverse of :func:`configure_activity_stdout_log`; the rotating file handler
     is unaffected. A no-op when no stdout handler is attached.
@@ -379,6 +386,50 @@ def activity_stdout_enabled() -> bool:
     """Return whether activity events are currently mirrored to stdout."""
     logger = logging.getLogger(ACTIVITY_LOGGER_NAME)
     return any(getattr(h, "_activity_stdout", False) for h in logger.handlers)
+
+
+# systemd's "<device>:<inode>" of the journal stream it connected (systemd.exec(5)).
+_JOURNAL_STREAM = re.compile(r"([0-9]+):([0-9]+)")
+
+
+def activity_stdout_destination(
+    environ: Optional[Mapping[str, str]] = None,
+    stdout_stat: Optional[os.stat_result] = None,
+) -> str:
+    """Where this process's stdout goes: ``"cloudwatch"``, ``"journald"`` or ``"console"``.
+
+    The mirror (:func:`configure_activity_stdout_log`) writes to stdout, and what becomes
+    of stdout depends on how the app runs, so the Settings tab names the mirror for it:
+
+    * ``"cloudwatch"`` -- on ECS, where ``ECS_CONTAINER_METADATA_URI_V4`` is set (Fargate
+      injects it into every container from platform 1.4.0 on) and the container's awslogs
+      driver forwards stdout to CloudWatch Logs.
+    * ``"journald"`` -- under systemd with stdout connected to the journal, as on the
+      single EC2 host (``journalctl -u dsql-migrator``). systemd sets ``JOURNAL_STREAM`` to
+      that connection's ``<device>:<inode>``; systemd.exec(5) advises comparing it with the
+      descriptor rather than testing that it is set, since a process started from such a
+      service inherits it even when its own stdout goes elsewhere. It is compared with
+      stdout, the stream the mirror's handler writes to.
+    * ``"console"`` -- anything else: a terminal, or wherever a local run's output is
+      redirected. Also the answer when stdout cannot be inspected.
+
+    ``environ`` and ``stdout_stat`` default to ``os.environ`` and ``os.fstat`` of
+    ``sys.stdout``; tests pass their own. Reads only -- configures nothing.
+    """
+    env = os.environ if environ is None else environ
+    if (env.get("ECS_CONTAINER_METADATA_URI_V4") or "").strip():
+        return "cloudwatch"
+    stream = _JOURNAL_STREAM.fullmatch(env.get("JOURNAL_STREAM") or "")
+    if stream is None:
+        return "console"
+    if stdout_stat is None:
+        try:
+            stdout_stat = os.fstat(sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):  # None, closed, in-memory, or fd gone
+            return "console"
+    if (stdout_stat.st_dev, stdout_stat.st_ino) == (int(stream[1]), int(stream[2])):
+        return "journald"
+    return "console"
 
 
 def render_activity_text(raw: bytes) -> bytes:
@@ -470,6 +521,7 @@ __all__ = [
     "configure_activity_stdout_log",
     "disable_activity_stdout_log",
     "activity_stdout_enabled",
+    "activity_stdout_destination",
     "set_activity_log_level",
     "current_activity_log_level",
     "render_activity_text",

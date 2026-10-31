@@ -951,7 +951,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 | `InstanceType` | 아니오 | `t3.large` | 컨트롤 플레인 호스트 크기. |
 | `StateVolumeSizeGiB` | 아니오 | `20` | 보존형 EBS 상태 볼륨; 대형 테이블 Full Load의 로컬 CSV 스필오버는 크게. |
 | `SourceSecretArn` | 아니오 | `""` | 기존 소스 자격증명 시크릿 재사용 시에만(그 외에는 UI에서 사용자/비밀번호 입력). |
-| `EnableActivityLogCloudWatch` | 아니오 | `false` | `true`면 앱이 활동 로그 이벤트마다 JSON 한 줄을 stdout으로도 내보내고, 이 호스트에서는 CloudWatch가 아니라 journald가 이를 수집(`journalctl -u dsql-migrator`). **Settings → Activity log**(*Mirror to CloudWatch Logs*)에서 런타임에도 전환할 수 있고, 재시작하면 이 값으로 돌아감. |
+| `EnableActivityLogCloudWatch` | 아니오 | `false` | `true`면 앱이 활동 로그 이벤트마다 JSON 한 줄을 stdout으로도 내보내고, 이 호스트에서는 CloudWatch가 아니라 journald가 이를 수집(`journalctl -u dsql-migrator`). **Settings → Activity log**(*Mirror to the system journal*)에서 런타임에도 전환할 수 있고, 재시작하면 `/etc/dsql-migrator.env`에 있는 값으로 돌아감([§3](#3-배포) 참고). |
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | 아니오 | off / `global.anthropic.claude-sonnet-5` | opt-in Bedrock AI 보조(EC2에서는 IAM 범위를 모델에서 도출). |
 | `KeyName` | 아니오 | `""` | 선택적 SSH 키; SSM이 기본 접속 경로라 보통 비워둠(호스트에 인바운드 규칙 자체가 없음). |
 
@@ -1069,6 +1069,31 @@ aws cloudformation deploy \
 첫 부팅은 약 3~4분: 호스트가 443으로 Python 3.12 + wheel을 설치하고,
 `uv sync --extra cdc-external`(인프로세스 시드에 필요한 `kafka-python` + MSK IAM 서명기 포함)을
 실행한 뒤 서비스를 시작합니다. 진행 상황은 호스트의 `/var/log/dsql-migrator-userdata.log`에 있습니다.
+
+> [!IMPORTANT]
+> **호스트는 설정과 코드를 첫 부팅 때만 받습니다.** 인스턴스가 처음 시작될 때 시작 스크립트가 앱
+> 설정을 `/etc/dsql-migrator.env`에 쓰고 소스를 가져옵니다. 나중에 아래 파라미터 중 하나를 바꾸는
+> 스택 업데이트는 그 변경을 적용하지 않은 채 호스트를 재시작합니다: 앱은 처음 부팅했을 때의 설정과
+> 코드로 다시 올라오는 반면, 스택의 IAM 정책과 출력은 새 값을 따릅니다.
+>
+> - `AppPort`, `EnableActivityLogCloudWatch`, `BedrockModelId`, `BedrockRegion`,
+>   `SourceSecretArn`, `DsqlClusterArn`은 그 파일의 줄입니다(`DSQL_MIGRATOR_APP_PORT`,
+>   `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`, `BEDROCK_MODEL_ID`, `BEDROCK_REGION`,
+>   `DSQL_MIGRATOR_SOURCE_SECRET_ARN`, `DSQL_MIGRATOR_DSQL_CLUSTER_ARN`). 스택 업데이트 후
+>   호스트에 SSM 세션을 열어 `sudoedit /etc/dsql-migrator.env`로 그 줄을 고치고(이 파일에는 앱의
+>   쿠키 서명 시크릿도 들어 있으니 내용을 출력하지 마세요), `sudo systemctl restart dsql-migrator`를
+>   실행하세요.
+> - `SourceMode`, `SourceS3Uri`, `SourceRepoUrl`, `SourceRepoRef`는 첫 부팅 때만 읽습니다: 나중에
+>   바꿔도 호스트에서는 아무것도 바뀌지 않습니다.
+>
+> `EnableAiAssist`, `BedrockModelArns`, `SourceDbSecurityGroupId`, `SourceDbCidr`,
+> `SourceDbPort`, `HttpsEgressCidr`, `MskEgressCidr`는 업데이트 때 적용되고(IAM 정책과 보안 그룹
+> 규칙을 정함), `InstanceType`도 재시작과 함께 적용됩니다. `StateVolumeSizeGiB`를 키우면 볼륨은
+> 커지지만 파일 시스템은 그대로입니다: 호스트에서 `sudo xfs_growfs /var/lib/dsql-migrator`를
+> 실행하세요. 업데이트를 실행하기 전에 변경 세트를 확인하세요: AWS가 더 새로운 Amazon Linux 2023
+> 이미지를 내놓으면 그 뒤의 모든 업데이트가 인스턴스도 교체합니다(템플릿은 항상 최신 이미지를 씀).
+> 스택 업데이트를 통한 교체는 테스트되지 않았으니, 마이그레이션이 진행 중일 때는 실행하지 마세요.
+> 재시작이나 교체는 진행 중인 Full Load나 Validation을 멈춥니다.
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 

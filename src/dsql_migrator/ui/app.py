@@ -25,6 +25,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from dsql_migrator import __version__
 from dsql_migrator.config import (
@@ -34,6 +35,9 @@ from dsql_migrator.config import (
     load_connect_defaults,
     read_env_file,
 )
+# Module scope, unlike the activity-log calls below: it only reads the environment, and the
+# Activity log tab's tests swap it here to render each destination.
+from dsql_migrator.core.activity_log import activity_stdout_destination
 from dsql_migrator.core.assessment_strategist import (
     AssessmentStrategist,
     build_general_chat_system,
@@ -150,8 +154,9 @@ def _log_stalled_job(job_id: str, unfinished: int, total: int, timeout_s: float)
     reports through an injected listener because ``core`` must not import the activity log.
     SYSTEM, not FULL_LOAD: the watchdog reaps validation jobs too.
     """
-    # Imported here, like every other activity-log use in this module (module scope keeps
-    # the app importable without touching the log config).
+    # Imported here, like every other activity-log call in this module but the read-only
+    # activity_stdout_destination (module scope keeps the app importable without touching
+    # the log config).
     from dsql_migrator.core.activity_log import (
         ActivityCategory,
         ActivityStatus,
@@ -1549,7 +1554,7 @@ def _render_footer_tools(activity_log_path: str) -> None:
                 ui.tab(name, icon=group_icons.get(name, "tune")) for name in groups
             ]
             # ONE "Activity log" tab, not a separate "Diagnostics" tab beside it. The
-            # log LEVEL, the CloudWatch mirror, and the download are all the same
+            # log LEVEL, the stdout mirror, and the download are all the same
             # subject -- the one activity/audit log (how much is recorded, where it is
             # streamed, how to pull it) -- so they belong on one destination, not split
             # across "Diagnostics" (level + mirror) and "Activity log" (download).
@@ -1725,22 +1730,93 @@ def _render_tuning_group_controls(group: str) -> None:
                     ).props("dense outlined").classes("w-24 text-sm")
 
 
+class _MirrorText(NamedTuple):
+    """What the Activity log tab says about the stdout mirror, for one destination.
+
+    The mirror always writes JSON lines to the app's stdout; what becomes of stdout is the
+    deployment's doing (``activity_stdout_destination``), so the tab names the mirror for
+    it. On the EC2 host "Mirror to CloudWatch Logs" sent the operator to a log group that
+    does not exist: systemd hands the service's stdout to journald there.
+    """
+
+    label: str
+    description: str
+    on_notice: str
+    on_detail: str
+    off_detail: str
+    off_notice: str
+    trace_log: str  # where the DEBUG data-path trace goes (the Log level description)
+
+
+_MIRROR_TEXTS: dict[str, _MirrorText] = {
+    "cloudwatch": _MirrorText(
+        label="Mirror to CloudWatch Logs",
+        description=(
+            "Also streams the activity log to the container's stdout, which the ECS "
+            "awslogs driver forwards to CloudWatch Logs — a durable copy that "
+            "survives task replacement. The log file itself lives on ephemeral task "
+            "storage."
+        ),
+        on_notice="Mirroring the activity log to CloudWatch Logs (via stdout on ECS).",
+        on_detail="CloudWatch Logs mirroring turned ON",
+        off_detail=(
+            "CloudWatch Logs mirroring turned OFF -- the activity log now survives "
+            "only in the container's file sink, which a task replacement discards"
+        ),
+        off_notice="Stopped mirroring the activity log to CloudWatch Logs.",
+        trace_log="the container log",
+    ),
+    "journald": _MirrorText(
+        label="Mirror to the system journal",
+        description=(
+            "Also writes each event as a JSON line to the service's stdout, which "
+            "journald keeps on this host (journalctl -u dsql-migrator). The log file "
+            "itself stays on this host."
+        ),
+        on_notice=(
+            "Mirroring the activity log to the system journal (journalctl -u dsql-migrator)."
+        ),
+        on_detail="system journal mirroring turned ON",
+        off_detail=(
+            "system journal mirroring turned OFF -- the activity log file is unaffected"
+        ),
+        off_notice="Stopped mirroring the activity log to the system journal.",
+        trace_log="the service's journal (journalctl -u dsql-migrator)",
+    ),
+    "console": _MirrorText(
+        label="Mirror to the console",
+        description=(
+            "Also prints each event as a JSON line to the app's stdout (the terminal "
+            "that started it, or wherever its output is redirected). The log file "
+            "itself stays on this machine."
+        ),
+        on_notice="Mirroring the activity log to the console.",
+        on_detail="console mirroring turned ON",
+        off_detail="console mirroring turned OFF -- the activity log file is unaffected",
+        off_notice="Stopped mirroring the activity log to the console.",
+        trace_log="the console",
+    ),
+}
+
+
 def _render_activity_log_controls(activity_log_path: str) -> None:
     """Render the merged "Activity log" tab: recording controls + download.
 
     Everything here concerns the ONE activity/audit log, so it lives on one tab
-    instead of being split across a "Diagnostics" tab (level + CloudWatch mirror)
+    instead of being split across a "Diagnostics" tab (level + mirror)
     and a separate "Activity log" tab (download). The three controls are the same
     subject seen three ways:
 
     * **Log level** -- HOW MUCH is recorded (DEBUG adds failure stacktraces).
-    * **Mirror to CloudWatch Logs** -- WHERE it is also streamed (the container's
-      stdout, which the ECS awslogs driver forwards to CloudWatch, giving a durable
-      copy that survives task replacement).
+    * **The mirror** -- WHERE it is also streamed: the app's stdout, named for where
+      that goes (``_MIRROR_TEXTS``). *Mirror to CloudWatch Logs* on ECS, whose awslogs
+      driver forwards it -- a durable copy that survives task replacement; *Mirror to
+      the system journal* on the EC2 host (journald); *Mirror to the console* when run
+      locally.
     * **Download** -- pull the human-readable timeline as it stands right now.
 
     The level + mirror are runtime knobs (not deploy-time inputs), so an operator can
-    flip INFO<->DEBUG and start/stop the CloudWatch mirror while troubleshooting with
+    flip INFO<->DEBUG and start/stop the mirror while troubleshooting with
     no redeploy. Both apply app-wide (single-task app) and reset to the startup
     defaults on restart; Download is a point-in-time snapshot.
     """
@@ -1770,6 +1846,10 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
     if current not in levels:
         current = "INFO"
 
+    # Read once: where this process's stdout goes is fixed for its life.
+    destination = activity_stdout_destination()
+    mirror = _MIRROR_TEXTS[destination]
+
     # Same "when does this take effect" lead-in as the tuning panels, so every Settings
     # tab opens with the same fact in the same place. Scoped to the runtime knobs (the
     # level + mirror); the download's own timing is stated on its section below.
@@ -1798,29 +1878,28 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
                 ActivityCategory.SYSTEM,
                 "activity log mirror changed",
                 status=ActivityStatus.INFO,
-                detail="CloudWatch Logs mirroring turned ON",
+                detail=mirror.on_detail,
             )
-            ui.notify(
-                "Mirroring the activity log to CloudWatch Logs (via stdout on ECS).",
-                type="info",
-            )
+            ui.notify(mirror.on_notice, type="info")
         else:
             # BEFORE removing the handler: logged after, the "mirror off" event would be the
-            # one event the sink it just removed never carried -- so the CloudWatch copy
-            # would end with no explanation of why it ends. WARNING, not INFO: on ECS the
+            # one event the sink it just removed never carried -- so the mirrored copy
+            # would end with no explanation of why it ends. WARNING on ECS only: there the
             # mirror is what makes the trail survive a task replacement, so turning it off
-            # is a real (if deliberate) loss of durability.
+            # is a real (if deliberate) loss of durability. Elsewhere the file stays where it
+            # was (the EC2 host's retained state volume, a local disk), so INFO.
             log_activity(
                 ActivityCategory.SYSTEM,
                 "activity log mirror changed",
-                status=ActivityStatus.WARNING,
-                detail=(
-                    "CloudWatch Logs mirroring turned OFF -- the activity log now survives "
-                    "only in the container's file sink, which a task replacement discards"
+                status=(
+                    ActivityStatus.WARNING
+                    if destination == "cloudwatch"
+                    else ActivityStatus.INFO
                 ),
+                detail=mirror.off_detail,
             )
             disable_activity_stdout_log()
-            ui.notify("Stopped mirroring the activity log to CloudWatch Logs.", type="info")
+            ui.notify(mirror.off_notice, type="info")
 
     def _download() -> None:
         data = read_activity_log(activity_log_path, "text")
@@ -1840,7 +1919,7 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
                 "DEBUG adds failure stacktraces to the activity log AND turns on the "
                 "Full Load export/import trace — one line per keyset page and per "
                 "import batch (table, the PK range in flight, rows attempted / "
-                "inserted / skipped, OCC retries) in the container log, so you can see "
+                f"inserted / skipped, OCC retries) in {mirror.trace_log}, so you can see "
                 "WHICH data was moving when a problem hit. The audit trail itself is "
                 "always recorded."
             ),
@@ -1849,18 +1928,10 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
                 "dense outlined options-dense"
             ).classes("w-24 text-sm")
         # Destination-first name: "Mirror to stdout" told the operator the mechanism,
-        # not what it is FOR. "Mirror to CloudWatch Logs" names the durable destination
-        # they actually care about; the description keeps the stdout/ephemeral detail.
-        with form_field(
-            ui,
-            label="Mirror to CloudWatch Logs",
-            description=(
-                "Also streams the activity log to the container's stdout, which the ECS "
-                "awslogs driver forwards to CloudWatch Logs — a durable copy that "
-                "survives task replacement. The log file itself lives on ephemeral task "
-                "storage."
-            ),
-        ):
+        # not what it is FOR. The label names where this process's stdout actually goes
+        # (CloudWatch Logs on ECS, the system journal on the EC2 host, the console when
+        # run locally); the description keeps the stdout and where-the-file-lives detail.
+        with form_field(ui, label=mirror.label, description=mirror.description):
             ui.switch(
                 value=activity_stdout_enabled(), on_change=_on_toggle
             ).props("dense")
@@ -1877,10 +1948,16 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
                 "text-gray-400 text-sm cursor-help shrink-0"
             ).tooltip(
                 "The human-readable rendering of the audit trail. The raw NDJSON file "
-                "stays on disk for tooling.\n\n"
-                "On ECS the file lives on ephemeral task storage, so it is lost when the "
-                "task is replaced — turn on 'Mirror to CloudWatch Logs' above for a "
-                "durable copy."
+                "stays on disk for tooling."
+                # Only ECS loses the file with the task: the EC2 host keeps it on the
+                # retained state volume, and a local run on its own disk.
+                + (
+                    "\n\nOn ECS the file lives on ephemeral task storage, so it is lost "
+                    "when the task is replaced — turn on 'Mirror to CloudWatch Logs' above "
+                    "for a durable copy."
+                    if destination == "cloudwatch"
+                    else ""
+                )
             )
         ui.label(
             "One UTC line per event across the whole session — connections, assessment, "
@@ -1979,9 +2056,10 @@ def main() -> None:
             "path (e.g. /tmp/migration_activity.log) to keep the rotating file.",
             config.activity_log_path, exc,
         )
-    # Optional: also stream activity events to stdout so the container's awslogs
-    # driver forwards them to CloudWatch Logs (durable, survives task
-    # replacement). Off by default; the rotating file remains the local copy.
+    # Optional: also stream activity events to stdout, which the container's awslogs
+    # driver forwards to CloudWatch Logs on ECS (durable, survives task replacement) and
+    # journald keeps on the EC2 host. Off by default; the rotating file remains the
+    # local copy.
     if activity_to_stdout:
         configure_activity_stdout_log(level=_level)
     log_activity(

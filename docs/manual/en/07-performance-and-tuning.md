@@ -478,10 +478,11 @@ The knobs above are also editable **in the UI** without a restart: the **Setting
   - **CDC**: *Sink compute (MCU)*;
   - **Validation**: *Tables in parallel*.
 - an **Activity log** tab — everything about the one activity/audit log in one place: set
-  the app **log level** (DEBUG / INFO), toggle **"Mirror to CloudWatch Logs"** so the log
-  is also streamed to the container's stdout (forwarded to CloudWatch on ECS — a durable
-  copy that survives task replacement), and **download** the session's activity log (the
-  same feed the AI DBA reads).
+  the app **log level** (DEBUG / INFO), toggle the mirror (**"Mirror to CloudWatch Logs"**
+  on ECS, **"Mirror to the system journal"** on the EC2 host) so the log is also written
+  to the app's stdout (forwarded to CloudWatch on ECS — a durable copy that survives task
+  replacement — and kept by journald on the EC2 host), and **download** the session's
+  activity log (the same feed the AI DBA reads).
 
 Changes made in the dialog **revert on restart**; to persist one, set its
 `DSQL_MIGRATOR_*` environment variable (listed in §7.2) instead.

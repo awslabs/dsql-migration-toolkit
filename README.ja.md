@@ -370,7 +370,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 分割対象になる最小の推定行数（自動の場合はさらに 5,000,000 行が必要）；小さいテーブルは単一リーダー。 |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4`（≤32） | Validation で並行して比較するテーブル数。`1` = 逐次。 |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 起動時のログレベル。`DEBUG` は失敗イベントに stacktrace（コールスタックのみ）を追加。実行時に **Settings → Activity log**（*Log level*）からも変更可。 |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch）。実行時に **Settings → Activity log**（*Mirror to CloudWatch Logs*）から切り替え可。 |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | アクティビティログイベントを標準出力にもミラーリング（ECS では → CloudWatch、EC2 ホストでは → journald）。実行時に **Settings → Activity log**（ECS では *Mirror to CloudWatch Logs*、EC2 ホストでは *Mirror to the system journal*）から切り替え可。 |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | AI アシスト用の Bedrock モデル / 推論プロファイル ID。常に `global.*` プロファイル — 全ての商用リージョンから呼び出せます（`us.*` は us-east-1/us-east-2/us-west-2 でのみ解決）。 |
 | `BEDROCK_REGION` | _(未設定)_ | Amazon Bedrock 呼び出し用のリージョン。 |
 

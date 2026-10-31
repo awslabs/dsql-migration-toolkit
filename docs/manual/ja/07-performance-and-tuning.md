@@ -230,7 +230,7 @@ Full Load を **RDS リードレプリカ / Aurora リーダーエンドポイ�
   - **Full Load**: *Tables in parallel*、*Batches per table*、*Rows per batch*、*Reader shards per large table*、*Source-load throttle (max Threads_running)*。その上に通知 *Batches in flight are capped at 2 per key range (never fewer than 4 per table or part unless Batches per table is lower) and 128 per run* が表示されます。
   - **CDC**: *Sink compute (MCU)*。
   - **Validation**: *Tables in parallel*。
-- **Activity log** タブ — 1 つのアクティビティ/監査ログに関するすべてを 1 か所に: アプリの **ログレベル**（DEBUG / INFO）設定、**「Mirror to CloudWatch Logs」** の切り替え（ログをコンテナの stdout にもストリーミング → ECS では CloudWatch に転送され、タスク置換後も残る永続コピーを確保）、そしてセッションのアクティビティログの**ダウンロード**（AI DBA が読むのと同じフィード）。
+- **Activity log** タブ — 1 つのアクティビティ/監査ログに関するすべてを 1 か所に: アプリの **ログレベル**（DEBUG / INFO）設定、ミラーの切り替え（ECS では **「Mirror to CloudWatch Logs」**、EC2 ホストでは **「Mirror to the system journal」**。ログをアプリの stdout にも書き込み → ECS では CloudWatch に転送され、タスク置換後も残る永続コピーになり、EC2 ホストでは journald が保持）、そしてセッションのアクティビティログの**ダウンロード**（AI DBA が読むのと同じフィード）。
 
 ダイアログでの変更は**再起動で元に戻ります**。永続化するには、対応する `DSQL_MIGRATOR_*` 環境変数（§7.2 の一覧）を設定してください。
 

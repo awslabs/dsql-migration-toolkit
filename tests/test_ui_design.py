@@ -11,6 +11,8 @@ keeping them correct keeps the whole app's visual language consistent.
 
 from __future__ import annotations
 
+import pytest
+
 from dsql_migrator.ui.design import (
     AI_ACCENT_BG,
     AI_ACCENT_BORDER,
@@ -1127,20 +1129,24 @@ def test_validation_tab_is_rendered_without_the_full_load_notice() -> None:
     assert "batches per key range" not in blob and "Connections" not in blob
 
 
-def test_activity_log_tab_uses_the_same_form_field_rows() -> None:
+@pytest.mark.parametrize("destination", ["cloudwatch", "journald", "console"])
+def test_activity_log_tab_uses_the_same_form_field_rows(monkeypatch, destination) -> None:
     """The merged Activity-log tab's two runtime knobs share the tuning tabs' shape.
 
     Level + mirror route through ``form_field`` so they read as one form (same
     label/description structure as every tuning tab). The tab also carries the
     download action (the former separate "Diagnostics"/"Activity log" split is gone),
-    and the mirror control is named by its DESTINATION ("CloudWatch Logs"), not the
-    opaque "stdout" mechanism.
+    and the mirror control is named by its DESTINATION, not the opaque "stdout"
+    mechanism -- the destination this process's stdout actually has: CloudWatch Logs on
+    ECS, the system journal on the EC2 host (where "CloudWatch Logs" named a log group
+    that does not exist), the console for a local run.
     """
     import sys
     import types
 
     from dsql_migrator.ui import app
 
+    monkeypatch.setattr(app, "activity_stdout_destination", lambda: destination)
     ui = _FormUi()
     fake = types.ModuleType("nicegui")
     fake.ui = ui  # type: ignore[attr-defined]
@@ -1154,17 +1160,33 @@ def test_activity_log_tab_uses_the_same_form_field_rows() -> None:
         else:
             sys.modules["nicegui"] = saved
 
-    blob = " ".join(ui.texts)
+    blob = " ".join(ui.texts)  # tooltips included
     assert "Level and mirroring changes apply immediately." in blob
     # Renamed control: destination, not "stdout".
-    assert "Log level" in blob and "Mirror to CloudWatch Logs" in blob
+    assert "Log level" in blob
     assert "Mirror to stdout" not in blob, "the opaque 'stdout' label must be gone"
+    # Where the Log level description sends the DEBUG data-path trace: the package logger's
+    # stderr, which goes where stdout goes on each host.
+    trace = {
+        "cloudwatch": "the container log",
+        "journald": "the service's journal (journalctl -u dsql-migrator)",
+        "console": "the console",
+    }[destination]
+    assert f"OCC retries) in {trace}, so you can see" in blob
+    if destination == "cloudwatch":
+        assert "Mirror to CloudWatch Logs" in blob
+    elif destination == "journald":
+        assert "Mirror to the system journal" in blob
+        assert "journalctl -u dsql-migrator" in blob
+        assert "CloudWatch" not in blob
+    else:
+        assert "Mirror to the console" in blob
+        assert "CloudWatch" not in blob and "journal" not in blob
     # DEBUG/INFO only: every non-failure audit event is INFO (a waiver/stop is
     # WARNING), so WARNING/ERROR could not filter noise -- only discard the audit
     # trail, which this tab must never offer.
     assert ui.selects and ui.selects[0][0] == ("DEBUG", "INFO")
     assert ui.switches
-    assert "CloudWatch" in blob
     # Merged in: the download action lives on this same tab now.
     assert "Download activity log" in ui.texts
     # The form_field row supplies the label, so the control must NOT carry a floating
@@ -1276,7 +1298,7 @@ def test_form_field_info_tooltip_supplements_a_visible_description() -> None:
     assert plain.tooltips == []
 
 
-def test_activity_log_tab_presents_its_action_at_full_size() -> None:
+def test_activity_log_tab_presents_its_action_at_full_size(monkeypatch) -> None:
     """This tab is an ACTION, so the button is NOT wedged into a form-field slot.
 
     Routing it through ``form_field`` (as an earlier pass did) put the button in the
@@ -1290,6 +1312,8 @@ def test_activity_log_tab_presents_its_action_at_full_size() -> None:
 
     from dsql_migrator.ui import app
 
+    # On ECS, the one place the file goes with the task (the caveat below is ECS's).
+    monkeypatch.setattr(app, "activity_stdout_destination", lambda: "cloudwatch")
     ui = _FormUi()
     fake = types.ModuleType("nicegui")
     fake.ui = ui  # type: ignore[attr-defined]

@@ -1039,7 +1039,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 | `InstanceType` | no | `t3.large` | Control-plane host size. |
 | `StateVolumeSizeGiB` | no | `20` | Retained EBS state volume; size up for a large-table Full Load's local CSV spillover. |
 | `SourceSecretArn` | no | `""` | Only to reuse an existing source-creds secret (else enter username/password in the UI). |
-| `EnableActivityLogCloudWatch` | no | `false` | `true`: the app mirrors each activity-log event to stdout as a JSON line, which journald captures on this host (`journalctl -u dsql-migrator`), not CloudWatch. **Settings → Activity log** (*Mirror to CloudWatch Logs*) also switches it at runtime; a restart returns it to this value. |
+| `EnableActivityLogCloudWatch` | no | `false` | `true`: the app mirrors each activity-log event to stdout as a JSON line, which journald captures on this host (`journalctl -u dsql-migrator`), not CloudWatch. **Settings → Activity log** (*Mirror to the system journal*) also switches it at runtime; a restart returns it to the value in `/etc/dsql-migrator.env` (see [§3](#3-deploy)). |
 | `EnableAiAssist` / `BedrockModelId` / `BedrockRegion` | no | off / `global.anthropic.claude-sonnet-5` | Opt-in Bedrock AI assist (on EC2 the IAM scope is derived from the model). |
 | `KeyName` | no | `""` | Optional SSH key; SSM is the primary access path, so usually left empty (the host has no inbound rule at all). |
 
@@ -1163,6 +1163,34 @@ First boot takes ~3–4 min: the host installs Python 3.12 + wheels over 443, ru
 `uv sync --extra cdc-external` (which brings in `kafka-python` + the MSK IAM signer for
 the in-process seed), then starts the service. Progress is in
 `/var/log/dsql-migrator-userdata.log` on the host.
+
+> [!IMPORTANT]
+> **The host takes its settings and its code at first boot only.** When the instance
+> first launches, the startup script writes the app's settings to
+> `/etc/dsql-migrator.env` and fetches the source. A later stack update that changes one
+> of the parameters below restarts the host without applying the change: the app comes
+> back with the settings and the code it first booted with, while the stack's IAM
+> policies and outputs follow the new values.
+>
+> - `AppPort`, `EnableActivityLogCloudWatch`, `BedrockModelId`, `BedrockRegion`,
+>   `SourceSecretArn` and `DsqlClusterArn` are lines of that file
+>   (`DSQL_MIGRATOR_APP_PORT`, `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`, `BEDROCK_MODEL_ID`,
+>   `BEDROCK_REGION`, `DSQL_MIGRATOR_SOURCE_SECRET_ARN`, `DSQL_MIGRATOR_DSQL_CLUSTER_ARN`).
+>   After the stack update, open an SSM session to the host, change the line with
+>   `sudoedit /etc/dsql-migrator.env` (the file also holds the app's cookie-signing
+>   secret, so do not print it), then run `sudo systemctl restart dsql-migrator`.
+> - `SourceMode`, `SourceS3Uri`, `SourceRepoUrl` and `SourceRepoRef` are read at first
+>   boot only: changing them later changes nothing on the host.
+>
+> `EnableAiAssist`, `BedrockModelArns`, `SourceDbSecurityGroupId`, `SourceDbCidr`,
+> `SourceDbPort`, `HttpsEgressCidr` and `MskEgressCidr` take effect on the update (they
+> set IAM policies and security-group rules), and so does `InstanceType`, with a
+> restart. A larger `StateVolumeSizeGiB` grows the volume but not its file system: run
+> `sudo xfs_growfs /var/lib/dsql-migrator` on the host. Check the change set before you
+> execute an update: once AWS publishes a newer Amazon Linux 2023 image, every update
+> also replaces the instance (the template always takes the latest image). A replacement
+> through a stack update has not been tested, so do not execute one while a migration
+> runs. A restart or a replacement stops any Full Load or Validation in progress.
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 

@@ -375,7 +375,7 @@ Validation tabs) — no redeploy; resets on restart.
 | `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | Minimum estimated rows for a table to be split (automatic also needs 5,000,000); smaller tables use one reader. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Tables compared concurrently in Validation. `1` = sequential. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | Startup log level; `DEBUG` adds a stacktrace (call stack only) to failure events. Also changeable at runtime via **Settings → Activity log** (*Log level*). |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS). Also toggleable at runtime via **Settings → Activity log** (*Mirror to CloudWatch Logs*). |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | Mirror activity-log events to stdout (→ CloudWatch on ECS, → journald on the EC2 host). Also toggleable at runtime via **Settings → Activity log** (*Mirror to CloudWatch Logs* on ECS, *Mirror to the system journal* on the EC2 host). |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | Bedrock model / inference-profile id for AI assist. Always a `global.*` profile: those are reachable from any commercial region, while a `us.*` profile only resolves from us-east-1/us-east-2/us-west-2. |
 | `BEDROCK_REGION` | _(unset)_ | Region for Amazon Bedrock calls. |
 

@@ -20,6 +20,11 @@ Settings dialog do (follow-ups of the v0.1.577 review).
   prefix, not ``dsql-cdc-`` too, as en does.
 * README's environment-variable reference said "the four" Full Load / Validation knobs can be
   retuned in Settings; five of its rows can, and it now names them.
+* The EC2 host takes its settings and its code at first boot only (its user data writes
+  ``/etc/dsql-migrator.env`` and fetches the source once), so the guide says which parameters
+  a later stack update leaves unapplied and how to apply them; its row for the mirror names
+  the switch as the host shows it (*Mirror to the system journal*), and README's variable row
+  and chapter 7 name it for each host.
 
 Fact pins: the Fargate pairs are AWS's table (below), the knobs come from the Settings
 registry (``config.TUNABLE_KNOBS``), and the defaults and descriptions from the template.
@@ -216,8 +221,14 @@ def test_the_activity_log_row_says_what_the_parameter_does(lang: str, template: 
         template["Parameters"]["EnableActivityLogCloudWatch"]["Description"].split()
     )
     assert "awslogs driver" in description and "ephemeral /tmp" in description
-    app = (ROOT / "src" / "dsql_migrator" / "ui" / "app.py").read_text(encoding="utf-8")
-    assert 'ui.tab("Activity log"' in app and 'label="Mirror to CloudWatch Logs"' in app
+    source = (ROOT / "src" / "dsql_migrator" / "ui" / "app.py").read_text(encoding="utf-8")
+    assert 'ui.tab("Activity log"' in source
+    from dsql_migrator.ui import app
+
+    # The switch is named for where the app's stdout goes: CloudWatch Logs on ECS, the
+    # system journal on the EC2 host (that template's row, below).
+    assert app._MIRROR_TEXTS["cloudwatch"].label == "Mirror to CloudWatch Logs"
+    assert app._MIRROR_TEXTS["journald"].label == "Mirror to the system journal"
 
     row = _reference_rows(lang)["EnableActivityLogCloudWatch"][3]
     for fact in (
@@ -260,15 +271,51 @@ def test_the_ec2_parameter_table_says_where_the_activity_log_mirror_goes(lang: s
     ]
     cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
     assert cells[2] == f"`{parameter['Default']}`", lang
+    # The host names the switch for journald, and a restart returns it to the host's env
+    # file -- written at first boot, so not to the parameter a later stack update sets.
     for fact in (
         "JSON",
         "journald",
         "`journalctl -u dsql-migrator`",
         "**Settings → Activity log**",
-        "*Mirror to CloudWatch Logs*",
+        "*Mirror to the system journal*",
+        "`/etc/dsql-migrator.env`",
     ):
         assert fact in cells[3], (lang, fact)
     assert "awslogs" not in cells[3], lang
+    assert "Mirror to CloudWatch Logs" not in cells[3], lang
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_readme_and_chapter_7_name_the_mirror_as_each_host_shows_it(lang: str) -> None:
+    # README's variable row and chapter 7's Activity log bullet name the switch as the app
+    # shows it on each host -- CloudWatch Logs on ECS, the system journal on the EC2 host --
+    # and say that journald keeps the EC2 host's copy.
+    from dsql_migrator.ui import app
+
+    readme = (ROOT / _README[lang]).read_text(encoding="utf-8")
+    (row,) = [
+        line
+        for line in readme.splitlines()
+        if line.startswith("| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` |")
+    ]
+    chapter = ROOT / "docs" / "manual" / lang / "07-performance-and-tuning.md"
+    lines = chapter.read_text(encoding="utf-8").split("\n")
+    (at,) = [
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("- ") and "**Activity log**" in line
+    ]
+    bullet = [lines[at]]
+    for line in lines[at + 1 :]:  # its continuation lines
+        if not line.startswith("  "):
+            break
+        bullet.append(line)
+    for text in (_flat(lang, row), _flat(lang, "\n".join(bullet))):
+        for destination in ("cloudwatch", "journald"):
+            label = app._MIRROR_TEXTS[destination].label
+            assert _flat(lang, label) in text, (lang, destination)
+        assert "journald" in text, lang
 
 
 @pytest.mark.parametrize("lang", LANGS)
@@ -294,6 +341,83 @@ def test_the_ec2_stack_name_warning_and_prompt_name_both_cdc_prefixes(lang: str)
     assert len(legacy) == 2, (lang, legacy)  # the warning and the AI prompt
     for at in legacy:  # each names the canonical prefix just before
         assert re.search(bare(CDC_STACK_NAME_PREFIX), part[max(0, at - 24) : at]), lang
+
+
+def _first_boot_callout(lang: str) -> str:
+    """The EC2 section's ``[!IMPORTANT]`` callout between the first-boot paragraph (the one
+    naming the user-data log) and ``### 4``, its ``>`` markers stripped."""
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n{_EC2_PARAMETERS[lang]}\n")
+    after_log = text.index("`/var/log/dsql-migrator-userdata.log`", start)
+    lines = text[after_log : text.index("\n### 4", after_log)].split("\n")
+    (at,) = [i for i, line in enumerate(lines) if line.strip() == "> [!IMPORTANT]"]
+    block = []
+    for line in lines[at + 1 :]:
+        if not line.startswith(">"):
+            break
+        block.append(re.sub(r"^> ?", "", line))
+    return "\n".join(block)
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_ec2_guide_says_the_host_takes_its_settings_and_code_at_first_boot_only(
+    lang: str,
+) -> None:
+    # The host's user data runs at first boot only, so a stack update that changes a
+    # parameter it reads restarts the host (a user-data change stops and starts it) without
+    # applying the change: the six lines of /etc/dsql-migrator.env it writes and the four
+    # source parameters keep their first-boot values, while IAM and the outputs move on.
+    # A restart then returns the activity-log mirror to the file's value, not the stack's.
+    ec2 = yaml.safe_load((DEPLOY / "cloudformation-ec2.yaml").read_text(encoding="utf-8"))
+    parameters = set(ec2["Parameters"])
+    user_data = ec2["Resources"]["AppHost"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+    env_file = re.search(
+        r"cat > /etc/dsql-migrator\.env <<EOF\n(.*?)\nEOF\n", user_data, re.S
+    ).group(1)
+    env_pairs = {
+        parameter: variable
+        for variable, parameter in re.findall(r"(?m)^(\w+)=\$\{(\w+)\}$", env_file)
+        if parameter in parameters
+    }
+    assert env_pairs == {
+        "AppPort": "DSQL_MIGRATOR_APP_PORT",
+        "EnableActivityLogCloudWatch": "DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT",
+        "BedrockModelId": "BEDROCK_MODEL_ID",
+        "BedrockRegion": "BEDROCK_REGION",
+        "SourceSecretArn": "DSQL_MIGRATOR_SOURCE_SECRET_ARN",
+        "DsqlClusterArn": "DSQL_MIGRATOR_DSQL_CLUSTER_ARN",
+    }
+    # ${!VAR} is a shell variable and ${AWS::...} a pseudo parameter: neither matches.
+    substituted = set(re.findall(r"\$\{(\w+)\}", user_data)) & parameters
+    # HostSubnetId too, but a new subnet replaces the instance (a fresh first boot).
+    source = substituted - set(env_pairs) - {"HostSubnetId"}
+    assert source == {"SourceMode", "SourceS3Uri", "SourceRepoUrl", "SourceRepoRef"}
+
+    callout = _first_boot_callout(lang)
+    for name in [*env_pairs, *env_pairs.values(), *source]:
+        assert f"`{name}`" in callout, (lang, name)
+    # What the callout says DOES take effect on the update: none of it is user data.
+    on_update = re.findall(r"`(\w+)`", re.split(r"\n\s*\n", callout.strip())[-1])
+    assert set(on_update) == {
+        "EnableAiAssist",
+        "BedrockModelArns",
+        "SourceDbSecurityGroupId",
+        "SourceDbCidr",
+        "SourceDbPort",
+        "HttpsEgressCidr",
+        "MskEgressCidr",
+        "InstanceType",
+        "StateVolumeSizeGiB",
+    }, lang
+    for name in on_update:
+        assert name in parameters and name not in substituted, (lang, name)
+    flat = _flat(lang, callout)
+    for command in (
+        "`sudoedit /etc/dsql-migrator.env`",
+        "`sudo systemctl restart dsql-migrator`",
+        "`sudo xfs_growfs /var/lib/dsql-migrator`",
+    ):
+        assert _flat(lang, command) in flat, (lang, command)
 
 
 # -- task memory: the template, the guide's row, its sizing bullet and AWS's table agree -----

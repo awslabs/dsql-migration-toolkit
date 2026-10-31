@@ -349,7 +349,7 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `DSQL_MIGRATOR_FULL_LOAD_SHARD_MIN_ROWS` | `1000000` | 테이블을 나누는 최소 추정 행 수(자동은 5,000,000행도 필요); 더 작은 테이블은 단일 리더. |
 | `DSQL_MIGRATOR_VALIDATE_MAX_WORKERS` | `4` (≤32) | Validation에서 동시에 비교하는 테이블 수. `1` = 순차. |
 | `DSQL_MIGRATOR_LOG_LEVEL` | `INFO` | 시작 로그 레벨. `DEBUG`는 실패 이벤트에 stacktrace(콜 스택만) 추가. 런타임에 **Settings → Activity log**(*Log level*)에서도 변경 가능. |
-| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch). 런타임에 **Settings → Activity log**(*Mirror to CloudWatch Logs*)에서 토글 가능. |
+| `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` | `false` | 활동 로그 이벤트를 stdout에도 미러링(ECS에서는 → CloudWatch, EC2 호스트에서는 → journald). 런타임에 **Settings → Activity log**(ECS에서는 *Mirror to CloudWatch Logs*, EC2 호스트에서는 *Mirror to the system journal*)에서 토글 가능. |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-sonnet-5` | AI 보조용 Bedrock 모델 / 추론 프로파일 id. 항상 `global.*` 프로파일 — 모든 상용 리전에서 호출 가능하며, `us.*`는 us-east-1/us-east-2/us-west-2에서만 해석됩니다. |
 | `BEDROCK_REGION` | _(미설정)_ | Amazon Bedrock 호출용 리전. |
 

@@ -5,8 +5,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
+import sys
+import types
 
 import pytest
 
@@ -14,6 +18,7 @@ from dsql_migrator.core.activity_log import (
     ACTIVITY_LOGGER_NAME,
     ActivityCategory,
     ActivityStatus,
+    activity_stdout_destination,
     activity_stdout_enabled,
     configure_activity_file_log,
     configure_activity_stdout_log,
@@ -469,31 +474,231 @@ def test_warning_status_maps_to_the_warning_log_level() -> None:
     assert logging.WARNING < logging.ERROR
 
 
-def test_the_settings_tab_records_level_and_mirror_changes() -> None:
+# ---------------------------------------------------------------------------
+# Where the stdout mirror goes, and what the Settings tab says about it
+# ---------------------------------------------------------------------------
+
+_ECS = {"ECS_CONTAINER_METADATA_URI_V4": "http://169.254.170.2/v4/0123abcd-task"}
+_STDOUT = types.SimpleNamespace(st_dev=8, st_ino=12345)
+
+
+def test_the_mirror_destination_is_cloudwatch_on_ecs_whatever_the_journal_stream() -> None:
+    # ECS is checked first: its awslogs driver takes stdout, whatever else is set.
+    assert activity_stdout_destination(_ECS, _STDOUT) == "cloudwatch"
+    assert activity_stdout_destination({**_ECS, "JOURNAL_STREAM": "8:12345"}, _STDOUT) == (
+        "cloudwatch"
+    )
+    # Set means non-blank, as for the task-IP lookup that reads the same variable.
+    assert activity_stdout_destination(
+        {"ECS_CONTAINER_METADATA_URI_V4": "  "}, _STDOUT
+    ) == "console"
+
+
+def test_the_mirror_destination_is_journald_only_when_the_journal_stream_is_stdout() -> None:
+    # systemd sets JOURNAL_STREAM to "<device>:<inode>" of the journal connection. A process
+    # started from such a service inherits it with its own stdout elsewhere, so it must be
+    # compared with stdout, not merely present (systemd.exec(5)).
+    assert activity_stdout_destination({"JOURNAL_STREAM": "8:12345"}, _STDOUT) == "journald"
+    for mismatched in ("8:12346", "9:12345", "12345:8"):
+        assert activity_stdout_destination({"JOURNAL_STREAM": mismatched}, _STDOUT) == (
+            "console"
+        ), mismatched
+    for malformed in (
+        "", "8", "8:", ":12345", "8:12345:0", "a:b", " 8:12345", "8:12345 ", "8:12345\n",
+        "8:-1", "+8:12345", "0x8:12345", "８:12345",
+    ):
+        assert activity_stdout_destination({"JOURNAL_STREAM": malformed}, _STDOUT) == (
+            "console"
+        ), repr(malformed)
+    assert activity_stdout_destination({}, _STDOUT) == "console"
+
+
+def test_the_mirror_destination_reads_the_environment_and_stdout_itself(
+    monkeypatch, tmp_path
+) -> None:
+    # The defaults: os.environ, and fstat of sys.stdout -- the stream the mirror's handler
+    # writes to -- read at call time.
+    monkeypatch.delenv("ECS_CONTAINER_METADATA_URI_V4", raising=False)
+    with open(tmp_path / "journal-stream", "w", encoding="utf-8") as stream:
+        stat = os.fstat(stream.fileno())
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setenv("JOURNAL_STREAM", f"{stat.st_dev}:{stat.st_ino}")
+        assert activity_stdout_destination() == "journald"
+        monkeypatch.setenv("JOURNAL_STREAM", f"{stat.st_dev}:{stat.st_ino + 1}")
+        assert activity_stdout_destination() == "console"
+        monkeypatch.delenv("JOURNAL_STREAM")
+        assert activity_stdout_destination() == "console"
+        monkeypatch.setenv("ECS_CONTAINER_METADATA_URI_V4", _ECS["ECS_CONTAINER_METADATA_URI_V4"])
+        assert activity_stdout_destination() == "cloudwatch"
+
+
+def test_the_mirror_destination_is_console_when_stdout_cannot_be_inspected(
+    monkeypatch, tmp_path
+) -> None:
+    import dsql_migrator.core.activity_log as al
+
+    stream = {"JOURNAL_STREAM": "8:12345"}
+    with open(tmp_path / "closed", "w", encoding="utf-8") as closed:
+        pass
+    # fileno() raises AttributeError, io.UnsupportedOperation and ValueError respectively.
+    for stdout in (None, io.StringIO(), closed):
+        monkeypatch.setattr(sys, "stdout", stdout)
+        assert activity_stdout_destination(stream) == "console", stdout
+
+    def _refuse(_fd: int) -> os.stat_result:
+        raise OSError(9, "Bad file descriptor")
+
+    with open(tmp_path / "open", "w", encoding="utf-8") as stdout, monkeypatch.context() as m:
+        m.setattr(sys, "stdout", stdout)
+        m.setattr(al.os, "fstat", _refuse)
+        assert activity_stdout_destination(stream) == "console"
+
+
+class _SettingsUi:
+    """NiceGUI double for the Activity log tab: keeps each control's change handler and the
+    notifications sent, so a test can turn the controls the way the browser does."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.handlers: dict[str, object] = {}
+        self.notices: list[str] = []
+
+    class _El:
+        def __init__(self, ui) -> None:
+            self._ui = ui
+
+        def classes(self, *_a, **_k):
+            return self
+
+        def props(self, *_a, **_k):
+            return self
+
+        def style(self, *_a, **_k):
+            return self
+
+        def tooltip(self, text="", *_a, **_k):
+            self._ui.texts.append(str(text))
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def label(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return self._El(self)
+
+    def select(self, *_a, on_change=None, **_k):
+        self.handlers["level"] = on_change
+        return self._El(self)
+
+    def switch(self, *_a, on_change=None, **_k):
+        self.handlers["mirror"] = on_change
+        return self._El(self)
+
+    def button(self, text="", *_a, **_k):
+        self.texts.append(str(text))
+        return self._El(self)
+
+    def row(self, *_a, **_k):
+        return self._El(self)
+
+    def column(self, *_a, **_k):
+        return self._El(self)
+
+    def icon(self, *_a, **_k):
+        return self._El(self)
+
+    def separator(self, *_a, **_k):
+        return self._El(self)
+
+    def notify(self, message="", *_a, **_k):
+        self.notices.append(str(message))
+
+
+# What each destination's switch records and says (the stdout mirror's three homes).
+_MIRROR_CHANGES = {
+    "cloudwatch": (
+        ActivityStatus.WARNING,
+        "CloudWatch Logs mirroring turned OFF -- the activity log now survives only in the "
+        "container's file sink, which a task replacement discards",
+        "Stopped mirroring the activity log to CloudWatch Logs.",
+        "CloudWatch Logs mirroring turned ON",
+        "Mirroring the activity log to CloudWatch Logs (via stdout on ECS).",
+    ),
+    "journald": (
+        ActivityStatus.INFO,
+        "system journal mirroring turned OFF -- the activity log file is unaffected",
+        "Stopped mirroring the activity log to the system journal.",
+        "system journal mirroring turned ON",
+        "Mirroring the activity log to the system journal (journalctl -u dsql-migrator).",
+    ),
+    "console": (
+        ActivityStatus.INFO,
+        "console mirroring turned OFF -- the activity log file is unaffected",
+        "Stopped mirroring the activity log to the console.",
+        "console mirroring turned ON",
+        "Mirroring the activity log to the console.",
+    ),
+}
+
+
+@pytest.mark.parametrize("destination", sorted(_MIRROR_CHANGES))
+def test_the_settings_tab_records_level_and_mirror_changes(monkeypatch, destination) -> None:
     """The audit trail must record changes to its own recording.
 
     A reader comparing two runs needs to know the quieter one was CONFIGURED that way rather
-    than idle -- and turning the CloudWatch mirror off is, on ECS, what makes the trail stop
-    surviving a task replacement. The mirror-off line is emitted BEFORE the handler is
-    removed, or it would be the one event the sink it just removed never carried, leaving the
-    CloudWatch copy ending with no explanation.
+    than idle. The mirror-off line is emitted BEFORE the handler is removed, or it would be
+    the one event the sink it just removed never carried, leaving the mirrored copy ending
+    with no explanation. It is a WARNING on ECS only, where the mirror is what makes the
+    trail survive a task replacement; on the EC2 host the file stays on the retained state
+    volume, and a local run keeps it on disk, so there turning the mirror off loses nothing.
     """
-    import inspect
-
+    import dsql_migrator.core.activity_log as al
     from dsql_migrator.ui import app as app_mod
 
-    src = inspect.getsource(app_mod._render_activity_log_controls)
-    assert '"activity log level changed"' in src
-    assert '"activity log mirror changed"' in src
-    # Ordering: the OFF line precedes disable_activity_stdout_log().
-    off = src.index("CloudWatch Logs mirroring turned OFF")
-    assert off < src.index("disable_activity_stdout_log()", off - 2000 if off > 2000 else 0) or \
-        off < src.rindex("disable_activity_stdout_log()")
-    # Severity: turning the mirror off is a real (deliberate) durability loss.
-    mirror_off_block = src[off - 400:off + 400]
-    assert "ActivityStatus.WARNING" in mirror_off_block, mirror_off_block[:200]
-    # The change handlers, never the render body.
-    assert "def _on_level" in src and "def _on_toggle" in src
+    off_status, off_detail, off_notice, on_detail, on_notice = _MIRROR_CHANGES[destination]
+    calls: list[tuple] = []
+    monkeypatch.setattr(app_mod, "activity_stdout_destination", lambda: destination)
+    monkeypatch.setattr(al, "log_activity", lambda *a, **k: calls.append(("log", a, k)))
+    monkeypatch.setattr(al, "disable_activity_stdout_log", lambda: calls.append(("off",)))
+    monkeypatch.setattr(
+        al, "configure_activity_stdout_log", lambda **k: calls.append(("on", k))
+    )
+    monkeypatch.setattr(al, "set_activity_log_level", lambda lvl: calls.append(("lvl", lvl)))
+    ui = _SettingsUi()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+
+    app_mod._render_activity_log_controls("/tmp/does-not-matter.ndjson")
+    assert calls == [] and ui.notices == []  # rendering changes nothing
+
+    ui.handlers["level"](types.SimpleNamespace(value="DEBUG"))
+    assert calls[0] == ("lvl", logging.DEBUG)
+    assert calls[1][1] == (ActivityCategory.SYSTEM, "activity log level changed")
+    assert calls[1][2]["status"] == ActivityStatus.INFO
+    assert calls[1][2]["detail"].endswith("-> DEBUG")
+    calls.clear()
+
+    ui.handlers["mirror"](types.SimpleNamespace(value=False))
+    assert [call[0] for call in calls] == ["log", "off"]  # the line, THEN the handler goes
+    assert calls[0][1:] == (
+        (ActivityCategory.SYSTEM, "activity log mirror changed"),
+        {"status": off_status, "detail": off_detail},
+    )
+    assert ui.notices[-1] == off_notice
+    calls.clear()
+
+    ui.handlers["mirror"](types.SimpleNamespace(value=True))
+    assert [call[0] for call in calls] == ["on", "log"]
+    assert calls[1][1:] == (
+        (ActivityCategory.SYSTEM, "activity log mirror changed"),
+        {"status": ActivityStatus.INFO, "detail": on_detail},
+    )
+    assert ui.notices[-1] == on_notice
 
 
 def test_a_stall_reap_is_wired_to_an_audit_line() -> None:
