@@ -56,7 +56,7 @@ Aurora DSQL (sub-millisecond network RTT).
 - **A MySQL load is bound by the task's CPU, a PostgreSQL load by Aurora DSQL.** Reading
   and converting MySQL rows keeps about one core busy per table or part loading at once;
   PostgreSQL values pass through, so 16 tables loaded at 336K rows/s on about 3.5 cores.
-  Set *Tables in parallel* to the task's vCPU count.
+  Set *Tables in parallel* to the task's vCPU count, up to 16.
 - **One huge MySQL table loads at one core's pace by default.** One session reads its
   ranges from one snapshot. In Full load + CDC from a binlog start point, an explicit
   *Reader shards per large table* reads it in separate-snapshot parts on several cores,

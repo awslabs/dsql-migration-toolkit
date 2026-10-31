@@ -35,6 +35,9 @@ Settings dialog do (follow-ups of the v0.1.577 review).
   fixed script runs on a new host only, so the guide says how to find and delete that line
   on an earlier host, make the log root-only, and rotate the secret when no migration is in
   progress.
+* README and the manual (chapters 3, 7, 11 and 12) said to set *Tables in parallel* to the
+  task's vCPU count, and chapter 3 that a Full Load can use every vCPU of its task, with no
+  bound; it stops at 16, so each one now gives that bound.
 
 Fact pins: the Fargate pairs are AWS's table (below), the knobs come from the Settings
 registry (``config.TUNABLE_KNOBS``) and the bound of *Tables in parallel* from
@@ -669,6 +672,49 @@ def test_the_manual_no_longer_calls_16_vcpu_the_largest_task(lang: str) -> None:
     for page, text in _all_pages(lang).items():
         for stale in _LARGEST[lang]:
             assert not _has(lang, text, stale), (lang, page, stale)
+
+
+# Advice to set *Tables in parallel* to the task's vCPU count, in the flattened text (ja has
+# no spaces): (a regular expression that finds it without the bound, the form with it). It is
+# in 7 places: README's row, chapter 3's tuning paragraph, chapter 7's intro, knob row and
+# sizing paragraph, FAQ Q10 and chapter 12.
+_VCPU_COUNT_ADVICE = {
+    "en": (r"vCPU count(?!, up to {n}\b)", "vCPU count, up to {n}"),
+    "ko": (r"vCPU 수(?!\(최대 {n}\))", "vCPU 수(최대 {n})"),
+    "ja": (r"vCPU数に", "vCPU数（最大{n}）に"),
+}
+_VCPU_COUNT_ADVICE_PLACES = 7
+# Chapter 3 on how many of the task's vCPUs a Full Load can use: (what it said, what it says).
+_VCPUS_A_FULL_LOAD_USES = {
+    "en": ("can use every vCPU", "can use up to {n} vCPUs of the task"),
+    "ko": ("vCPU를 모두", "vCPU를 최대 {n}개까지"),
+    "ja": ("すべてのvCPU", "vCPUを最大{n}個まで"),
+}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_every_vcpu_count_advice_gives_the_bound_of_tables_in_parallel(lang: str) -> None:
+    # README and the manual said to set *Tables in parallel* to the task's vCPU count, and
+    # chapter 3 that a Full Load can use every vCPU of its task, with no bound. It stops at
+    # its bound (an environment value above it is refused and the app does not start), so a
+    # 32 vCPU task, which the template now takes, would be told a value it cannot have.
+    from dsql_migrator.config import AppConfig
+
+    field = AppConfig.model_fields["full_load_table_parallelism"]
+    (limit,) = [meta.le for meta in field.metadata if getattr(meta, "le", None) is not None]
+    unbounded, bounded = (form.format(n=limit) for form in _VCPU_COUNT_ADVICE[lang])
+    # Keyed by path: the manual has a README.md of its own.
+    texts = {f"docs/manual/{lang}/{page}": text for page, text in _all_pages(lang).items()}
+    texts[_README[lang]] = _flat(lang, (ROOT / _README[lang]).read_text(encoding="utf-8"))
+    stale = {name: re.findall(unbounded, text) for name, text in texts.items()}
+    assert not {name: found for name, found in stale.items() if found}, lang
+    counts = {name: text.count(bounded) for name, text in texts.items() if bounded in text}
+    assert sum(counts.values()) >= _VCPU_COUNT_ADVICE_PLACES, (lang, counts)
+
+    said, says = _VCPUS_A_FULL_LOAD_USES[lang]
+    chapter_3 = texts[f"docs/manual/{lang}/03-full-load.md"]
+    assert not _has(lang, chapter_3, said), lang
+    assert _has(lang, chapter_3, says.format(n=limit)), lang
 
 
 # -- README: the knobs Settings retunes ------------------------------------------------------

@@ -54,7 +54,7 @@ Connect**)에서 수행했습니다(1ms 미만 네트워크 RTT).
 - **MySQL 적재는 태스크의 CPU에, PostgreSQL 적재는 Aurora DSQL에 묶입니다.** MySQL 행을 읽고
   변환하느라 동시에 적재되는 테이블 또는 부분마다 코어 약 하나가 바쁩니다. PostgreSQL 값은 그대로
   통과하므로 테이블 16개가 코어 약 3.5개로 336K rows/s에 적재됐습니다. *Tables in parallel*을
-  태스크의 vCPU 수로 설정하세요.
+  태스크의 vCPU 수(최대 16)로 설정하세요.
 - **거대한 MySQL 테이블 하나는 기본으로 코어 하나의 속도로 적재됩니다.** 세션 하나가 스냅샷
   하나에서 그 구간들을 읽습니다. binlog 시작 지점이 있는 Full load + CDC에서
   *Reader shards per large table*을 명시하면 별도 스냅샷 부분으로 나누어 여러 코어에서 읽으며,

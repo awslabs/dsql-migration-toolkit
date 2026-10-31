@@ -195,7 +195,7 @@ Aurora DSQL の一時的な状態は拒否ではありません: 競合、切断
 
 ## 3.8 並列ロード
 
-テーブルは並列にロードされ、各テーブルは独自のワーカープロセスで実行されるため、Full Load は実行中のタスクのすべての vCPU を使えます。`table_parallelism`（*Tables in parallel*）が同時に動くワーカー数を決めます。大きなテーブルはさらに主キー区間に分けて読みます。Aurora DSQL はテーブルの 1 つのキー範囲を約 20,000 rows/s で書き込むため、複数のキー範囲に分散すると書き込みが速くなるからです（[§7.2](07-performance-and-tuning.md#72-並列度のチューニング)）。
+テーブルは並列にロードされ、各テーブルは独自のワーカープロセスで実行されるため、Full Load は実行中のタスクの vCPU を最大 16 個まで使えます。`table_parallelism`（*Tables in parallel*）が同時に動くワーカー数を決めます。大きなテーブルはさらに主キー区間に分けて読みます。Aurora DSQL はテーブルの 1 つのキー範囲を約 20,000 rows/s で書き込むため、複数のキー範囲に分散すると書き込みが速くなるからです（[§7.2](07-performance-and-tuning.md#72-並列度のチューニング)）。
 
 ### 動作方式
 
@@ -225,7 +225,7 @@ Start CDC は、ストリーミングした場合でも拒否を終わらせま�
 
 ### チューニング
 
-大規模な移行では *Tables in parallel* をタスクの vCPU 数に合わせてください (本番トラフィックを処理しているソースでは 2〜4 から始めます: [§7.3](07-performance-and-tuning.md#73-ソースへの負荷を最小化する))。分割そのものには設定は要りません。関連する設定 (`TABLE_PARALLELISM`、`BATCH_PARALLELISM`、`SHARD_MIN_ROWS`、`FULL_LOAD_READER_SHARDS`)とその上限、そしてソース負荷との関係は [第 7 章 §7.2 — 並列度のチューニング](07-performance-and-tuning.md#72-並列度のチューニング)にまとまっています。この設計が実際に達成したスループットは [付録: パフォーマンステスト結果](12-performance-test-results.md) にあります。
+大規模な移行では *Tables in parallel* をタスクの vCPU 数（最大 16）に合わせてください (本番トラフィックを処理しているソースでは 2〜4 から始めます: [§7.3](07-performance-and-tuning.md#73-ソースへの負荷を最小化する))。分割そのものには設定は要りません。関連する設定 (`TABLE_PARALLELISM`、`BATCH_PARALLELISM`、`SHARD_MIN_ROWS`、`FULL_LOAD_READER_SHARDS`)とその上限、そしてソース負荷との関係は [第 7 章 §7.2 — 並列度のチューニング](07-performance-and-tuning.md#72-並列度のチューニング)にまとまっています。この設計が実際に達成したスループットは [付録: パフォーマンステスト結果](12-performance-test-results.md) にあります。
 
 ---
 

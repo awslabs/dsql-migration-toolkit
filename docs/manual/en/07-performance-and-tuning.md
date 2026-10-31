@@ -7,7 +7,7 @@ _Language: **English** | [한국어](../ko/07-performance-and-tuning.md) | [日�
 The defaults fit Aurora DSQL's limits and keep the load on your source modest, so **most
 migrations need no tuning**: a large table is already read and written in primary-key
 ranges, and the batches in flight are capped where Aurora DSQL stops gaining from more.
-For a large run, set *Tables in parallel* to the task's vCPU count
+For a large run, set *Tables in parallel* to the task's vCPU count, up to 16
 ([§7.2](#72-tuning-parallelism)); if the source serves production traffic, start at 2–4
 instead and raise it while you watch the source
 ([§7.3](#73-minimizing-impact-on-the-source)). What the tool already does to fit Aurora
@@ -108,7 +108,7 @@ measurements in §7.5.
 
 | Setting (env var) | Default | Bound | Effect |
 |---|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | How many tables, or parts of a large table, load at once: one worker process and one source connection each. Set it to the task's vCPU count for a large run. |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | How many tables, or parts of a large table, load at once: one worker process and one source connection each. Set it to the task's vCPU count, up to 16, for a large run. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | At most this many batches in flight per table or part, each on its own Aurora DSQL connection. Within that, the tool keeps up to 2 per key range it is read in, never fewer than 4 unless this is lower (and at most 128 per run), so for a table read in one or two key ranges a value above 4 changes nothing. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | Rows per batched write (hard-capped at DSQL's 3000-row limit). |
 | `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0` (automatic) | ≤ 32 | How many primary-key ranges (K) a **large** table is read and written in ([§3.8](03-full-load.md#38-parallel-loading)). `0`: one range per 2,500,000 estimated rows from 5,000,000, at most 32; `1`: off; `2`–`32`: exactly that many. Needs *Tables in parallel* above 1 and an integer leading primary-key column. Also *Reader shards per large table* in **Settings → Full Load**. |
@@ -248,9 +248,9 @@ redeploy. The CDC settings are passed when the tool deploys the cdc-stack.
 > app-wide and resets on restart, so put the values you want to keep in the task
 > definition and use **Settings** to experiment.
 
-Size the task for the load, and set *Tables in parallel* to its vCPU count: each table,
-or part of a large table, that loads at once is one worker process. **Memory is a hard
-limit.**
+Size the task for the load, and set *Tables in parallel* to its vCPU count, up to 16: each
+table, or part of a large table, that loads at once is one worker process. **Memory is a
+hard limit.**
 
 | Setting | Evaluation | A real large-scale Full Load |
 |---|---|---|

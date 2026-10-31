@@ -421,11 +421,11 @@ table unticked after the load is left as is on Aurora DSQL and no longer holds t
 
 ## 3.8 Parallel loading
 
-Tables load in parallel, each in its own worker process, so a Full Load can use every vCPU
-of the task it runs on. `table_parallelism` (*Tables in parallel*) sets how many workers
-run at once. A large table is also read in primary-key ranges, because Aurora DSQL writes
-one key range of a table at about 20,000 rows/s: spread over several, its writes go faster
-([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
+Tables load in parallel, each in its own worker process, so a Full Load can use up to 16
+vCPUs of the task it runs on. `table_parallelism` (*Tables in parallel*) sets how many
+workers run at once. A large table is also read in primary-key ranges, because Aurora DSQL
+writes one key range of a table at about 20,000 rows/s: spread over several, its writes go
+faster ([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
 
 ### How it works
 
@@ -511,8 +511,8 @@ has caught up, the CHECKSUM match ends the Full load only and later-start-point 
 
 ### Tuning it
 
-For a large migration, set *Tables in parallel* to the task's vCPU count (on a source that
-serves production traffic, start at 2–4:
+For a large migration, set *Tables in parallel* to the task's vCPU count, up to 16 (on a
+source that serves production traffic, start at 2–4:
 [§7.3](07-performance-and-tuning.md#73-minimizing-impact-on-the-source)). The split
 itself needs no setting. The knobs (`TABLE_PARALLELISM`, `BATCH_PARALLELISM`,
 `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`), their limits, and how they interact with

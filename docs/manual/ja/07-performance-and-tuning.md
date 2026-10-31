@@ -4,7 +4,7 @@ _言語: [English](../en/07-performance-and-tuning.md) | [한국어](../ko/07-pe
 
 > **前へ:** [6. 制限事項](06-limitations.md)
 
-デフォルトは Aurora DSQL の上限に合わせてあり、ソースへの負荷も控えめなので、**ほとんどのマイグレーションではチューニングは不要です。** 大きなテーブルはすでに主キーの区間に分けて読み書きされ、進行中のバッチ数には、それ以上増やしても Aurora DSQL が速くならないところで上限を設けてあります。大規模な実行では、*Tables in parallel* をタスクの vCPU 数に設定してください ([§7.2](#72-並列度のチューニング))。ソースが本番トラフィックを処理しているときは、代わりに 2〜4 から始め、ソースを観察しながら上げてください ([§7.3](#73-ソースへの負荷を最小化する))。Aurora DSQL に合わせてツールがすでに行っていることは [§7.1](#71-aurora-dsql-に対してツールが代わりに行うこと) にあります。
+デフォルトは Aurora DSQL の上限に合わせてあり、ソースへの負荷も控えめなので、**ほとんどのマイグレーションではチューニングは不要です。** 大きなテーブルはすでに主キーの区間に分けて読み書きされ、進行中のバッチ数には、それ以上増やしても Aurora DSQL が速くならないところで上限を設けてあります。大規模な実行では、*Tables in parallel* をタスクの vCPU 数（最大 16）に設定してください ([§7.2](#72-並列度のチューニング))。ソースが本番トラフィックを処理しているときは、代わりに 2〜4 から始め、ソースを観察しながら上げてください ([§7.3](#73-ソースへの負荷を最小化する))。Aurora DSQL に合わせてツールがすでに行っていることは [§7.1](#71-aurora-dsql-に対してツールが代わりに行うこと) にあります。
 
 > 以下のすべての設計上の選択は、文書化された Aurora DSQL の動作・制限にマッピングされています。出典: [DSQL のクォータと制限](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)、 [並行性制御](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-concurrency-control.html)、 [PostgreSQL→DSQL マイグレーションガイド](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-migration-guide.html)、 [非同期インデックス](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-create-index-async.html)、 [プライマリキー](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-primary-keys.html)。
 
@@ -51,7 +51,7 @@ Schema Conversion では、選んだ高カーディナリティの列をテー�
 
 | 設定 (env var) | デフォルト | 上限 | 効果 |
 |---|---|---|---|
-| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | 同時にロードするテーブル (または大きなテーブルの部分) の数。それぞれがワーカープロセス 1 つとソース接続 1 つを使います。大規模な実行ではタスクの vCPU 数に設定します。 |
+| `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | 4 | ≤ 16 | 同時にロードするテーブル (または大きなテーブルの部分) の数。それぞれがワーカープロセス 1 つとソース接続 1 つを使います。大規模な実行ではタスクの vCPU 数（最大 16）に設定します。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | 8 | ≤ 32 | テーブル (または部分) ごとの進行中のバッチ数の上限で、それぞれが自身の Aurora DSQL 接続を使います。その中でツールは、読み取るキー範囲あたり最大 2、この値のほうが小さくない限り最低 4 を保つため (実行全体では最大 128)、1 つか 2 つのキー範囲で読むテーブルでは 4 より大きい値は何も変えません。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | 2000 | ≤ 3000 | バッチ書き込みごとの行数 (DSQL の 3000 行上限でハードキャップ)。 |
 | `DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS` | `0`（自動） | ≤ 32 | **大きな**テーブルを読み書きする主キー区間の数 K（[§3.8](03-full-load.md#38-並列ロード)）。`0`: 推定 5,000,000 行から 2,500,000 行ごとに 1 区間、最大 32。`1`: 無効。`2`–`32`: その数ちょうど。*Tables in parallel* が 1 より大きいことと、整数の先頭主キー列が必要。**Settings → Full Load** の *Reader shards per large table* でも設定可。 |
@@ -120,7 +120,7 @@ Full Load と Validation の環境変数は、タスク定義のコンテナ `en
 
 > **再デプロイなしで実行の合間に再チューニング。** サイドバー下部の **Settings** を開き、**Full Load** または **Validation** タブへ移動します。ローダーとバリデーターは実行のたびに設定を読み直すため、そこで設定した値は **次の** 実行にすぐ反映されます。アプリ全体に効き、再起動でリセットされるため、保持したい値はタスク定義に設定し、**Settings** は実験に使ってください。
 
-ロードの規模に合わせてタスクのサイズを決め、*Tables in parallel* をその vCPU 数に設定してください: 同時にロードするテーブル (または大きなテーブルの部分) 1 つがワーカープロセス 1 つです。**メモリはハード制限です。**
+ロードの規模に合わせてタスクのサイズを決め、*Tables in parallel* をその vCPU 数（最大 16）に設定してください: 同時にロードするテーブル (または大きなテーブルの部分) 1 つがワーカープロセス 1 つです。**メモリはハード制限です。**
 
 | 設定 | 評価用途 | 実運用の大規模 Full Load |
 |---|---|---|

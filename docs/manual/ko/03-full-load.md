@@ -373,9 +373,9 @@ UPDATE와 DELETE 없이 그대로 둡니다. Full load + CDC에서 로드 후에
 ## 3.8 병렬 적재
 
 테이블은 병렬로 적재되며, 각 테이블은 자체 worker 프로세스에서 실행되므로 Full Load가 실행되는
-태스크의 vCPU를 모두 쓸 수 있습니다. `table_parallelism`(*Tables in parallel*)이 동시에 실행되는
-worker 수를 정합니다. 큰 테이블은 기본 키 구간으로도 나누어 읽습니다: Aurora DSQL은 테이블의 키 범위
-하나를 약 20,000 rows/s로 쓰므로, 여러 키 범위로 나누면 쓰기가
+태스크의 vCPU를 최대 16개까지 쓸 수 있습니다. `table_parallelism`(*Tables in parallel*)이 동시에
+실행되는 worker 수를 정합니다. 큰 테이블은 기본 키 구간으로도 나누어 읽습니다: Aurora DSQL은
+테이블의 키 범위 하나를 약 20,000 rows/s로 쓰므로, 여러 키 범위로 나누면 쓰기가
 빨라집니다([§7.2](07-performance-and-tuning.md#72-병렬수-튜닝)).
 
 ### 동작 방식
@@ -452,11 +452,10 @@ Start CDC는 스트리밍했더라도 거부를 끝내지 않습니다: 도구�
 
 ### 튜닝
 
-대규모 마이그레이션에서는 *Tables in parallel*을 태스크의 vCPU 수에 맞추세요(프로덕션 트래픽을
-처리하는 소스라면 2–4에서 시작: [§7.3](07-performance-and-tuning.md#73-소스-부하-최소화)). 분할
-자체에는 설정이 필요 없습니다. 관련
-설정(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`, `SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`)과 각각의
-한도, 그리고 소스 부하와의 관계는
+대규모 마이그레이션에서는 *Tables in parallel*을 태스크의 vCPU 수(최대 16)에 맞추세요(프로덕션
+트래픽을 처리하는 소스라면 2–4에서 시작: [§7.3](07-performance-and-tuning.md#73-소스-부하-최소화)).
+분할 자체에는 설정이 필요 없습니다. 관련 설정(`TABLE_PARALLELISM`, `BATCH_PARALLELISM`,
+`SHARD_MIN_ROWS`, `FULL_LOAD_READER_SHARDS`)과 각각의 한도, 그리고 소스 부하와의 관계는
 [7장 §7.2 — 병렬수 튜닝](07-performance-and-tuning.md#72-병렬수-튜닝)에 모여 있습니다. 이 설계가
 실제로 낸 처리량은 [Appendix: 성능 테스트 결과](12-performance-test-results.md)에 있습니다.
 
