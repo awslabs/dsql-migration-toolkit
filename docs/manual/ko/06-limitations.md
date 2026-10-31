@@ -127,7 +127,11 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
   바꾸세요. 적재가 별도 스냅샷 부분으로 나누어 읽은 MySQL 테이블은 리더 하나로 다시 적재한 뒤에만
   선택을 해제할 수 있습니다(아래 "용량과 비용" 참고). 데이터베이스나 스키마 이름 안의 `.`은 다른
   단계에서도 지원되지 않습니다: 도구는 정규화된 이름의 첫 `.`을 구분자로 보므로, Schema Conversion과
-  Full Load가 그런 이름을 엉뚱한 곳에서 나눕니다.
+  Full Load가 그런 이름을 엉뚱한 곳에서 나눕니다. 이전 Start CDC가 클러스터에 남긴 토픽도
+  충돌합니다(예: Start over 전에 쓰던 테이블 집합의 토픽): 그러면 Start CDC는 커넥터를 만들기 전에
+  실패합니다 — External 경로(PostgreSQL 소스, 또는 EC2 호스트의 MySQL)에서는 그 토픽을 명시하며
+  즉시 실패하고, Lambda 경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백됩니다. 그
+  토픽이 없는 클러스터를 얻으려면 Delete CDC infrastructure 후 다시 배포하세요.
 
 - **PostgreSQL 소스, 재키잉(re-keyed) 테이블:** CDC가 재키잉하는 테이블 — Schema Conversion의
   **Composite key**, 또는 소스 기본 키 밖의 컬럼을 더하도록 편집한 타깃 키 — 은 Start 시점만이

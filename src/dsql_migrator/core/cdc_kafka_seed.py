@@ -71,7 +71,8 @@ class CdcSeedError(RuntimeError):
     """Raised when the in-process CDC Kafka prep cannot complete.
 
     Notably raised (with an actionable message) when ``SeedMode=External`` is
-    selected but the optional ``cdc-external`` dependency extra is not installed.
+    selected but the optional ``cdc-external`` dependency extra is not installed,
+    and when Kafka refuses to create a CDC topic.
     """
 
 
@@ -135,8 +136,8 @@ def _import_kafka():
     """Lazily import the kafka-python symbols this module needs.
 
     Returns ``(KafkaAdminClient, KafkaConsumer, KafkaProducer, TopicPartition,
-    NewTopic, TopicAlreadyExistsError)``. Raises :class:`CdcSeedError` with an
-    actionable message when the optional extra is absent.
+    NewTopic, TopicAlreadyExistsError, InvalidTopicError)``. Raises
+    :class:`CdcSeedError` with an actionable message when the optional extra is absent.
     """
     try:
         from kafka import (
@@ -146,7 +147,7 @@ def _import_kafka():
             TopicPartition,
         )
         from kafka.admin import NewTopic
-        from kafka.errors import TopicAlreadyExistsError
+        from kafka.errors import InvalidTopicError, TopicAlreadyExistsError
     except ImportError as exc:
         raise CdcSeedError(_MISSING_EXTRA_MSG) from exc
     return (
@@ -156,6 +157,7 @@ def _import_kafka():
         TopicPartition,
         NewTopic,
         TopicAlreadyExistsError,
+        InvalidTopicError,
     )
 
 
@@ -179,12 +181,22 @@ def ensure_topics(
     An already-existing topic is left as-is (``TopicAlreadyExistsError`` swallowed),
     matching the Lambda and keeping re-runs idempotent.
 
+    A topic Kafka refuses raises :class:`CdcSeedError` at once, naming it: the topics
+    before it stay created and none after it is tried. kafka-python raises the error
+    class of the first failing topic, ``InvalidTopicError`` (errno 17), both for a name
+    Kafka does not allow and for one that differs from a topic already on the cluster
+    only in a '.' against a '_'. No wait fixes either, and
+    :func:`with_bootstrap_retry` would otherwise retry it for about two minutes and then
+    blame the VPC, the security group and IAM.
+
     ``admin_factory`` is the injected test seam; it defaults to the real
     ``KafkaAdminClient`` (kwargs: ``bootstrap_servers`` + the IAM SASL args).
     """
     if not specs:
         return
-    (KafkaAdminClient, _C, _P, _TP, NewTopic, TopicAlreadyExistsError) = _import_kafka()
+    (
+        KafkaAdminClient, _C, _P, _TP, NewTopic, TopicAlreadyExistsError, InvalidTopicError,
+    ) = _import_kafka()
     factory = admin_factory or KafkaAdminClient
     admin = factory(bootstrap_servers=bootstrap, **iam_sasl_args(region))
     try:
@@ -202,6 +214,16 @@ def ensure_topics(
                 )
             except TopicAlreadyExistsError:
                 continue
+            except InvalidTopicError as exc:
+                # No "leave its table out": this runs in a submitted Start, which has
+                # already fixed the table set (G16). The stack always creates its own MSK
+                # cluster, so a redeploy gets one with no old topics and keeps the table.
+                raise CdcSeedError(
+                    f"Kafka refused to create the CDC topic {spec.name}: a topic already "
+                    "on the cluster differs from it only in a '.' against a '_', or Kafka "
+                    "does not allow the name. No connectors were created. Delete CDC "
+                    "infrastructure and deploy it again (its new cluster has no old topics)."
+                ) from exc
     finally:
         admin.close()
 
@@ -226,7 +248,7 @@ def read_existing_offset(
     """
     import json
 
-    (_A, KafkaConsumer, _P, TopicPartition, _NT, _E) = _import_kafka()
+    (_A, KafkaConsumer, _P, TopicPartition, _NT, _E, _IT) = _import_kafka()
     factory = consumer_factory or KafkaConsumer
     consumer = factory(
         bootstrap_servers=bootstrap,
@@ -292,7 +314,7 @@ def produce(
 
     ``producer_factory`` is the injected test seam.
     """
-    (_A, _C, KafkaProducer, _TP, _NT, _E) = _import_kafka()
+    (_A, _C, KafkaProducer, _TP, _NT, _E, _IT) = _import_kafka()
     factory = producer_factory or KafkaProducer
     producer = factory(
         bootstrap_servers=bootstrap,
@@ -355,17 +377,22 @@ def with_bootstrap_retry(
     policy that were all correct (verified afterwards -- the same code bootstrapped in 0.17s
     once the brokers were warm).
 
-    Retries ANY exception, because a broker that is not ready yet surfaces differently
-    depending on which client and which phase hit it. Raises :class:`CdcSeedError` on
-    exhaustion, with a message that does NOT send the operator back to the three static
-    preconditions first: after this much waiting a warm-up is no longer the likely
-    explanation, and saying so is the whole point of having waited.
+    Retries any exception except :class:`CdcSeedError`, because a broker that is not ready
+    yet surfaces differently depending on which client and which phase hit it. This module
+    raises CdcSeedError only for failures no wait can fix (a missing extra or signer, or
+    Kafka refusing a topic), so that one is re-raised at once, with its own message.
+    Raises :class:`CdcSeedError` on exhaustion, with a message that does NOT send the
+    operator back to the three static preconditions first: after this much waiting a
+    warm-up is no longer the likely explanation, and saying so is the whole point of
+    having waited.
     """
     _sleep = sleep or time.sleep
     last: Optional[BaseException] = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
             result = fn()
+        except CdcSeedError:
+            raise
         except Exception as exc:  # noqa: BLE001 - any failure to reach MSK is retryable here
             last = exc
             if attempt == 1:
@@ -430,7 +457,9 @@ def seed_kafka_prep(
     decision (topic plan, offset record, no-clobber compare) is delegated to
     :mod:`cdc_kafka_prep`; this function only performs the Kafka I/O.
 
-    Raises :class:`CdcSeedError` if the optional ``cdc-external`` extra is missing.
+    Raises :class:`CdcSeedError` at once if the optional ``cdc-external`` extra is
+    missing or Kafka refuses to create a topic, and after the broker wait if the brokers
+    never accept a step.
     """
     # (1) ALWAYS: pre-create the topics. plan_topics is the canonical shaping.
     specs = plan_topics(

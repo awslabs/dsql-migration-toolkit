@@ -57,6 +57,13 @@ class _FakeAdmin:
         for t in topics:
             if t.name in self._rec.existing_topics:
                 raise self._rec.already_exists_exc()
+            if t.name in self._rec.invalid_topics:
+                # What kafka-python 3.0.10's create_topics raises for errno 17: the error
+                # class of the first failing topic, with the request and response in it.
+                raise _InvalidTopic(
+                    f"Request 'CreateTopicsRequest({t.name})' failed with response "
+                    "'CreateTopicsResponse(error_code=17)'."
+                )
             self._rec.created.append((t.name, t.num_partitions, t.topic_configs))
 
     def close(self):
@@ -144,6 +151,7 @@ class _Recorder:
         self.created = []            # (name, partitions, configs)
         self.produced = []           # (topic, key, value)
         self.existing_topics = set()  # names that raise TopicAlreadyExistsError
+        self.invalid_topics = set()  # names Kafka refuses: they raise InvalidTopicError
         self.existing_records = []   # _FakeMsg list the consumer returns
         self.topic_partitions = {0}
         self.send_raises = None
@@ -171,6 +179,13 @@ class _TopicAlreadyExists(Exception):
     pass
 
 
+class _InvalidTopic(Exception):
+    """kafka.errors.InvalidTopicError: INVALID_TOPIC_EXCEPTION, a name Kafka does not allow
+    or one that differs from a topic already on the cluster only in a '.' against a '_'."""
+
+    errno = 17
+
+
 @pytest.fixture
 def rec():
     return _Recorder()
@@ -181,7 +196,8 @@ def _fake_kafka(monkeypatch, rec):
     """Install a fake `kafka` package so the module's lazy _import_kafka() succeeds
     and iam_sasl_args() can build its token-provider subclass without the real deps.
     Individual tests still inject their FakeAdmin/Consumer/Producer via factories;
-    this only satisfies the import + the NewTopic/TopicAlreadyExistsError symbols."""
+    this only satisfies the import + the NewTopic/TopicAlreadyExistsError/InvalidTopicError
+    symbols."""
     kafka = types.ModuleType("kafka")
     kafka.KafkaAdminClient = object
     kafka.KafkaConsumer = object
@@ -191,6 +207,7 @@ def _fake_kafka(monkeypatch, rec):
     admin_mod.NewTopic = _NewTopicRec
     errors_mod = types.ModuleType("kafka.errors")
     errors_mod.TopicAlreadyExistsError = _TopicAlreadyExists
+    errors_mod.InvalidTopicError = _InvalidTopic
     # AbstractTokenProvider base for iam_sasl_args' subclass shim.
     net = types.ModuleType("kafka.net")
     net_sasl = types.ModuleType("kafka.net.sasl")
@@ -272,6 +289,40 @@ def test_ensure_topics_swallows_already_exists(rec) -> None:
 def test_ensure_topics_empty_is_noop(rec) -> None:
     ensure_topics("boot:9098", "us-east-1", [], admin_factory=rec.admin)
     assert rec.created == []
+
+
+# The refusal, word for word: the topic, both causes, that nothing was created and the way on.
+_REFUSED_TOPIC_MSG = (
+    "Kafka refused to create the CDC topic dsqlcdc.app_v2.users: a topic already on the "
+    "cluster differs from it only in a '.' against a '_', or Kafka does not allow the name. "
+    "No connectors were created. Delete CDC infrastructure and deploy it again (its new "
+    "cluster has no old topics)."
+)
+
+
+def test_ensure_topics_names_the_topic_kafka_refuses_and_tries_none_after_it(rec) -> None:
+    """Kafka refuses a topic whose name differs from one already on the cluster only in a
+    '.' against a '_' (say dsqlcdc.app.v2_users, left by an earlier Start), or a name it
+    does not allow: kafka-python 3.0.10 raises the error class of the first failing topic,
+    InvalidTopicError (errno 17). That is no broker warm-up, so it becomes a CdcSeedError
+    naming the topic and the way on, with the Kafka error kept as its cause."""
+    rec.invalid_topics = {"dsqlcdc.app_v2.users"}
+    specs = [
+        TopicSpec("stack-debezium-source-offsets", 1, {"cleanup.policy": "compact"}),
+        TopicSpec("dsqlcdc.app.orders", 1),
+        TopicSpec("dsqlcdc.app_v2.users", 1),
+        TopicSpec("dsql-sink-dlq", 1),
+    ]
+    with pytest.raises(CdcSeedError) as excinfo:
+        ensure_topics("boot:9098", "us-east-1", specs, admin_factory=rec.admin)
+    assert str(excinfo.value) == _REFUSED_TOPIC_MSG
+    # The topics before it are created; none after it is tried.
+    assert [name for name, _p, _c in rec.created] == [
+        "stack-debezium-source-offsets", "dsqlcdc.app.orders",
+    ]
+    assert rec.admin_closed
+    assert isinstance(excinfo.value.__cause__, _InvalidTopic)
+    assert excinfo.value.__cause__.errno == 17
 
 
 # --------------------------------------------------------------------------- #
@@ -700,3 +751,104 @@ def test_the_retry_wraps_the_real_kafka_calls_not_a_throwaway_probe() -> None:
 
     # ...and structurally: the retired probe helper must not come back.
     assert not hasattr(cdc_kafka_seed, "await_kafka_bootstrap")
+
+
+def test_a_refused_topic_fails_the_seed_at_once_instead_of_waiting_for_the_brokers(rec) -> None:
+    """The broker wait retried the refusal like a warm-up: 24 attempts and 115 s of sleeps,
+    then a message that blamed the VPC, the security group and IAM. Now one attempt, no
+    sleep, no "Waiting for the MSK brokers" line, and the refusal itself -- its first line
+    within the 300 characters a persisted job error keeps."""
+    rec.invalid_topics = {"dsqlcdc.app_v2.users"}
+    opened: list = []
+
+    def _admin(**kw):
+        opened.append(kw)
+        return rec.admin(**kw)
+
+    slept: list = []
+    logs: list = []
+    with pytest.raises(CdcSeedError) as excinfo:
+        seed_kafka_prep(
+            bootstrap="boot:9098", region="us-east-1",
+            offset_topic="stack-debezium-source-offsets",
+            sink_topics=["dsqlcdc.app.orders", "dsqlcdc.app_v2.users"],
+            default_partitions=1, dlq_topic="dsql-sink-dlq",
+            connector_name="stack-debezium-source", topic_prefix="dsqlcdc",
+            watermark=_wm(),
+            admin_factory=_admin, consumer_factory=rec.consumer,
+            producer_factory=rec.producer,
+            sleep=slept.append, log=logs.append,
+        )
+    assert len(opened) == 1, "one attempt: no wait makes Kafka accept the topic"
+    assert slept == []
+    assert not any("Waiting for the MSK brokers" in m for m in logs), logs
+    assert str(excinfo.value) == _REFUSED_TOPIC_MSG
+    first_line = str(excinfo.value).splitlines()[0]
+    assert len(first_line) <= 300, len(first_line)
+    assert rec.produced == []  # the offset seed is never reached
+
+
+def test_the_broker_wait_re_raises_a_seed_error_at_once() -> None:
+    """This module raises CdcSeedError only for what no wait fixes (a missing extra or
+    signer, Kafka refusing a topic): the wait passes it on untouched, on the first try."""
+    from dsql_migrator.core.cdc_kafka_seed import with_bootstrap_retry
+
+    refusal = CdcSeedError("Kafka refused to create the CDC topic dsqlcdc.app_v2.users")
+    calls: list = []
+    slept: list = []
+    logs: list = []
+
+    def work():
+        calls.append(1)
+        raise refusal
+
+    with pytest.raises(CdcSeedError) as excinfo:
+        with_bootstrap_retry(
+            "creating the CDC topics", work,
+            bootstrap="boot-x:9098", sleep=slept.append, log=logs.append,
+        )
+    assert excinfo.value is refusal
+    assert calls == [1]
+    assert slept == [] and logs == []
+
+
+def test_a_missing_extra_fails_the_seed_at_once(monkeypatch) -> None:
+    """The missing-extra error is raised inside the retried step (by _import_kafka, or by
+    iam_sasl_args for the signer); the wait no longer spends two minutes on it and then
+    buries it under a message about the path."""
+    calls: list = []
+
+    def _missing():
+        calls.append(1)
+        raise CdcSeedError(cdc_kafka_seed._MISSING_EXTRA_MSG)
+
+    monkeypatch.setattr(cdc_kafka_seed, "_import_kafka", _missing)
+    slept: list = []
+    logs: list = []
+    with pytest.raises(CdcSeedError) as excinfo:
+        seed_kafka_prep(
+            bootstrap="boot:9098", region="us-east-1",
+            offset_topic="stack-debezium-source-offsets",
+            sink_topics=["dsqlcdc.app.orders"], default_partitions=1,
+            connector_name="stack-debezium-source", topic_prefix="dsqlcdc",
+            watermark=None, sleep=slept.append, log=logs.append,
+        )
+    assert str(excinfo.value) == cdc_kafka_seed._MISSING_EXTRA_MSG
+    assert calls == [1]
+    assert slept == [] and logs == []
+
+
+# Chapter 6 says, in every language, that a topic an earlier Start CDC left on the cluster
+# collides too, how Start CDC then fails on each seed path, and the way on.
+_LEFTOVER_TOPIC_DOC = {
+    "en": "an earlier Start CDC left on the cluster",
+    "ko": "이전 Start CDC가 클러스터에 남긴 토픽",
+    "ja": "以前の Start CDC がクラスターに残したトピック",
+}
+
+
+@pytest.mark.parametrize("lang", sorted(_LEFTOVER_TOPIC_DOC))
+def test_the_manual_says_a_topic_left_on_the_cluster_collides_too(lang) -> None:
+    from tests.test_g25_docs import _has, _page
+
+    assert _has(lang, _page(lang, "06-limitations.md"), _LEFTOVER_TOPIC_DOC[lang])

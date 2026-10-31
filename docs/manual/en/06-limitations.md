@@ -136,6 +136,12 @@ it.
   "Capacity and cost" below). A `.` inside a database or schema name is not supported by
   the other steps either: the tool takes the first `.` of a qualified name for the
   separator, so Schema Conversion and the Full Load split such a name in the wrong place.
+  A topic an earlier Start CDC left on the cluster collides too (for example one from a
+  table set used before a Start over): Start CDC then fails before creating any
+  connector — at once, naming the topic, on the External path (a PostgreSQL source, or
+  MySQL on the EC2 host), or as a rolled-back Start on the Lambda path (MySQL on ECS
+  Fargate or run locally). Delete CDC infrastructure and deploy it again to get a cluster
+  without that topic.
 
 - **PostgreSQL source, re-keyed tables:** a table CDC re-keys — Schema Conversion's
   **Composite key**, or an edited target key that adds a column outside the source primary
