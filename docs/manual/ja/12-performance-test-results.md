@@ -73,14 +73,14 @@ CDC はボトルネックの位置が Full Load と異なるパイプライン�
 
 ```bash
 AWS_REGION=<region> APP_STACK=<app-stack> \
-DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+DB_HOST=<source-host> DB_PORT=3306 DB_SECRET_ID=<secret-arn> \
 TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
 TABLE_PARALLELISM=16 VARIANTS=auto \
 deploy/run_measure_on_fargate.sh
 ```
 
-[`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh) は、測定をソースの VPC 内で単発の Fargate タスクとして実行します。`VARIANTS=auto` はローダーの既定を測定し、ほかのバリアントはスクリプトに一覧があります。測定そのものは [`scripts/measure_performance.py`](../../../scripts/measure_performance.py) です: テーブルごと・時間ウィンドウごとのスループット、書き込み経路のリトライとレイテンシ、Aurora DSQL がインデックスの構築を終えた時点を報告します。使い方 (`--reader-shards`、`--cdc-mode`、…) はスクリプトの冒頭にあり、`PERF_SOURCE_ENGINE=postgres` で PostgreSQL ソースを対象にします。ターゲットテーブルを DROP して再作成するため **非本番のターゲットでのみ** 使用し、実行を比べる前に以前のコピーを先に DROP して、Aurora DSQL のバックグラウンドジョブが終わるのを待ってください (`--wait-sys-jobs`)。
+[`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh) は、測定をソースの VPC 内で単発の Fargate タスクとして実行します。`VARIANTS=auto` はローダーの既定を測定し、ほかのバリアントはスクリプトに一覧があります。タスクはソースのユーザー名とパスワードを `DB_SECRET_ID` が指す Secrets Manager シークレット (RDS 形式の JSON) から自分で読むため、パスワードはどのコマンドラインにもタスクのオーバーライドにも残りません。アプリのタスクロールは、スタックの `SourceSecretArn` (`DB_SECRET_ID` が未設定のときに使われます) と `mysql-dsql-migrator/cdc/*` のシークレットを読めます。測定そのものは [`scripts/measure_performance.py`](../../../scripts/measure_performance.py) です: テーブルごと・時間ウィンドウごとのスループット、書き込み経路のリトライとレイテンシ、Aurora DSQL がインデックスの構築を終えた時点を報告します。使い方 (`--reader-shards`、`--cdc-mode`、…) はスクリプトの冒頭にあり、`PERF_SOURCE_ENGINE=postgres` で PostgreSQL ソースを対象にします。ターゲットテーブルを DROP して再作成するため **非本番のターゲットでのみ** 使用し、実行を比べる前に以前のコピーを先に DROP して、Aurora DSQL のバックグラウンドジョブが終わるのを待ってください (`--wait-sys-jobs`)。
 
 CDC は、cdc-stack をデプロイしてソースに一定の insert ワークロードを流し、CloudWatch `AWS/KafkaConnect` からパイプラインの速度 (`-debezium-source` コネクタの `SourceRecordWriteRate`、`-dsql-sink` コネクタの `SinkRecordSendRate`) を読み取り、一定の間隔での DSQL ターゲットの `COUNT(*)` の増分と突合します。
 

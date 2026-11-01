@@ -101,7 +101,7 @@ CDC는 병목 지점이 Full Load와 다른 파이프라인입니다: `Debezium(
 
 ```bash
 AWS_REGION=<region> APP_STACK=<app-stack> \
-DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+DB_HOST=<source-host> DB_PORT=3306 DB_SECRET_ID=<secret-arn> \
 TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
 TABLE_PARALLELISM=16 VARIANTS=auto \
@@ -110,7 +110,11 @@ deploy/run_measure_on_fargate.sh
 
 [`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh)는 소스의 VPC에서
 일회성 Fargate 태스크로 측정을 실행합니다. `VARIANTS=auto`는 로더의 기본값을 측정하며, 다른 variant는
-스크립트에 나열되어 있습니다. [`scripts/measure_performance.py`](../../../scripts/measure_performance.py)가
+스크립트에 나열되어 있습니다. 태스크는 소스의 사용자 이름과 비밀번호를 `DB_SECRET_ID`가
+가리키는 Secrets Manager 시크릿(RDS 형식 JSON)에서 직접 읽으므로, 비밀번호는 어떤 명령줄에도,
+태스크 오버라이드에도 남지 않습니다. 앱의 태스크 역할은 스택의 `SourceSecretArn`(`DB_SECRET_ID`가
+없을 때 쓰임)과 `mysql-dsql-migrator/cdc/*` 시크릿을 읽을 수 있습니다.
+[`scripts/measure_performance.py`](../../../scripts/measure_performance.py)가
 측정 자체입니다: 테이블별·시간 구간별 처리량, 쓰기 경로의 재시도와 지연, 그리고 Aurora DSQL이 인덱스
 빌드를 끝낸 시점을 보고합니다. 사용법은 그 헤더에 있으며(`--reader-shards`, `--cdc-mode`, …),
 `PERF_SOURCE_ENGINE=postgres`로 PostgreSQL 소스를 측정합니다. 대상 테이블을 삭제 후 다시 만들므로

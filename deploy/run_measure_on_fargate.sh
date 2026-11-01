@@ -30,7 +30,7 @@
 # Usage:
 #   AWS_REGION=us-east-1 \
 #   APP_STACK=customer-migration-test \
-#   DB_HOST=<rds-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+#   DB_HOST=<rds-host> DB_PORT=3306 DB_SECRET_ID=<secret-arn> \
 #   TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 #   MEASURE_SCHEMA=customers_sample MEASURE_TABLES="payments orders" \
 #   deploy/run_measure_on_fargate.sh
@@ -38,9 +38,14 @@
 # Env vars:
 #   AWS_REGION       (required, or a configured default)
 #   APP_STACK        app-stack name (default: customer-migration-test)
-#   DB_HOST/PORT/USER/PASSWORD   source MySQL connection (PASSWORD is passed as a
-#                    task env override -- prefer a short-lived/test credential; for
-#                    production use a Secrets Manager secret + task-def `secrets`).
+#   DB_HOST/PORT     source MySQL connection.
+#   DB_SECRET_ID     the source credentials: a Secrets Manager secret (ARN, or name) with
+#                    RDS-style JSON `username`/`password`, which the task reads itself.
+#                    The app's task role can read the stack's SourceSecretArn (the default
+#                    when DB_SECRET_ID is unset) and any mysql-dsql-migrator/cdc/* secret.
+#                    DB_PASSWORD is never sent: a task override is readable by anyone who
+#                    can describe the task, and RunTask's arguments by other local users.
+#   DB_USER          optional; defaults to the secret's username.
 #   TARGET_ENDPOINT  (required) the Aurora DSQL cluster endpoint: the app task-def
 #                    does not bake one in. TARGET_REGION / TARGET_DATABASE /
 #                    TARGET_USERNAME are passed on when set.
@@ -73,7 +78,8 @@ set -euo pipefail
 : "${BATCH_PARALLELISM:=8}"
 : "${PROGRESS_INTERVAL:=30}"
 : "${DB_PORT:=3306}"
-: "${DB_USER:=admin}"
+: "${DB_USER:=}"
+: "${DB_SECRET_ID:=}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -82,7 +88,6 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REGION="${AWS_REGION:-$(aws configure get region || true)}"
 [ -z "${REGION}" ] && { echo "error: set AWS_REGION." >&2; exit 1; }
 [ -z "${DB_HOST:-}" ] && { echo "error: set DB_HOST (source MySQL)." >&2; exit 1; }
-[ -z "${DB_PASSWORD:-}" ] && { echo "error: set DB_PASSWORD (source MySQL)." >&2; exit 1; }
 [ -z "${TARGET_ENDPOINT:-}" ] && { echo "error: set TARGET_ENDPOINT (Aurora DSQL cluster endpoint; the app task-def does not bake one in). Source it from .env." >&2; exit 1; }
 
 q() { aws cloudformation describe-stacks --stack-name "${APP_STACK}" --region "${REGION}" \
@@ -103,6 +108,23 @@ TASK_DEF="${TASK_DEF:-$(aws ecs describe-services --cluster "${CLUSTER}" --servi
 NETCFG="$(aws ecs describe-services --cluster "${CLUSTER}" --services "${SERVICE}" \
   --region "${REGION}" --query "services[0].networkConfiguration" --output json)"
 echo "==> Task definition: ${TASK_DEF}"
+
+# The task reads the source credentials from Secrets Manager itself
+# (scripts/measure_performance.py): DB_SECRET_ID, else the task definition's own
+# DSQL_MIGRATOR_SOURCE_SECRET_ARN (the stack's SourceSecretArn).
+if [ -z "${DB_SECRET_ID}" ]; then
+  TASKDEF_SECRET="$(aws ecs describe-task-definition --task-definition "${TASK_DEF}" --region "${REGION}" \
+    --query "taskDefinition.containerDefinitions[0].environment[?name=='DSQL_MIGRATOR_SOURCE_SECRET_ARN'].value|[0]" \
+    --output text)"
+  if [ -z "${TASKDEF_SECRET}" ] || [ "${TASKDEF_SECRET}" = "None" ]; then
+    echo "error: set DB_SECRET_ID to a Secrets Manager secret holding the source's username and password (RDS-style JSON) that the app's task role can read, such as mysql-dsql-migrator/cdc/<name>; the stack has no SourceSecretArn to use instead." >&2
+    exit 1
+  fi
+  echo "==> Source credentials: the stack's SourceSecretArn, read inside the task"
+else
+  echo "==> Source credentials: ${DB_SECRET_ID}, read inside the task"
+fi
+[ -n "${DB_PASSWORD:-}" ] && echo "note: DB_PASSWORD is not sent to the task; it reads the secret instead."
 
 # Resolve the container name + awslogs group/prefix from the task-def so we can pull
 # the report back from CloudWatch after the task stops (no hardcoding).
@@ -160,27 +182,28 @@ PY
 # does NOT bake in a DSQL target (the UI collects it interactively), so the measure
 # script's TARGET_ENDPOINT/REGION/DATABASE/USERNAME must be passed here (from the
 # caller's env, typically sourced from .env). The DSQL IAM auth uses the task role.
-# Adds DSQL_MIGRATOR_FULL_LOAD_PREFETCH for the variant.
+# Adds DSQL_MIGRATOR_FULL_LOAD_PREFETCH for the variant. No password goes in: the
+# source's is read from DB_SECRET_ID (or the task-def's SourceSecretArn) in the task.
 build_overrides_json() {
   local cmd_json="$1" prefetch_env="$2"
-  python3 - "$cmd_json" "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_PASSWORD" "$MEASURE_SCHEMA" \
+  python3 - "$cmd_json" "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_SECRET_ID" "$MEASURE_SCHEMA" \
             "$CONTAINER" "$prefetch_env" \
             "${TARGET_ENDPOINT:-}" "${TARGET_REGION:-}" "${TARGET_DATABASE:-}" "${TARGET_USERNAME:-}" <<'PY'
 import json, sys
 cmd = json.loads(sys.argv[1])
-host, port, user, pw, schema, container, prefetch = sys.argv[2:9]
+host, port, user, secret_id, schema, container, prefetch = sys.argv[2:9]
 tgt_ep, tgt_region, tgt_db, tgt_user = sys.argv[9:13]
 env = [
     {"name": "DB_HOST", "value": host},
     {"name": "DB_PORT", "value": port},
-    {"name": "DB_USER", "value": user},
-    {"name": "DB_PASSWORD", "value": pw},
     {"name": "CDC_WORKLOAD_SCHEMA", "value": schema},
     {"name": "DSQL_MIGRATOR_FULL_LOAD_PREFETCH", "value": prefetch},
 ]
-# Target DSQL (only set the ones provided; measure_performance defaults region from
-# the endpoint and database/username to postgres/admin).
-for name, val in (("TARGET_ENDPOINT", tgt_ep), ("TARGET_REGION", tgt_region),
+# Only the ones provided: unset, DB_USER is the secret's username and DB_SECRET_ID the
+# task-def's DSQL_MIGRATOR_SOURCE_SECRET_ARN; measure_performance defaults the target
+# region from the endpoint and database/username to postgres/admin.
+for name, val in (("DB_USER", user), ("DB_SECRET_ID", secret_id),
+                  ("TARGET_ENDPOINT", tgt_ep), ("TARGET_REGION", tgt_region),
                   ("TARGET_DATABASE", tgt_db), ("TARGET_USERNAME", tgt_user)):
     if val:
         env.append({"name": name, "value": val})

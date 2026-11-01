@@ -650,3 +650,104 @@ def test_the_inventory_order_flag_parses(mp, monkeypatch) -> None:
         monkeypatch.setattr("sys.argv", ["measure_performance.py", "full-load", *argv])
         mp.main()
         assert captured["args"].inventory_order is expected
+
+
+# --------------------------------------------------------------------------------------- #
+# Source credentials: a Fargate measurement passes a secret's id, never the password
+# --------------------------------------------------------------------------------------- #
+_LAUNCHER = Path(__file__).resolve().parents[1] / "deploy" / "run_measure_on_fargate.sh"
+
+
+@pytest.fixture
+def no_source_env(monkeypatch):
+    for key in ("DB_PASSWORD", "DB_USER", "DB_SECRET_ID", "DSQL_MIGRATOR_SOURCE_SECRET_ARN"):
+        monkeypatch.delenv(key, raising=False)
+
+
+def _fake_secret(monkeypatch, username="secret_user", password="s3cr3t-from-sm"):
+    from dsql_migrator.config import SecretValue
+    import dsql_migrator.core.secrets as secrets
+    calls = []
+
+    def _resolve(secret_id, aws_profile, **_kw):
+        calls.append(secret_id)
+        return username, SecretValue(password)
+
+    monkeypatch.setattr(secrets, "resolve_source_secret", _resolve)
+    return calls
+
+
+def test_the_source_password_comes_from_the_secret_db_secret_id_names(
+    mp, monkeypatch, no_source_env,
+) -> None:
+    calls = _fake_secret(monkeypatch)
+    monkeypatch.setenv("DB_HOST", "db.invalid")
+    monkeypatch.setenv("TARGET_ENDPOINT", "abc.dsql.us-east-1.on.aws")
+    monkeypatch.setenv("DB_SECRET_ID", "arn:aws:secretsmanager:us-east-1:123456789012:secret:src")
+    monkeypatch.setenv("DSQL_MIGRATOR_SOURCE_SECRET_ARN", "arn:aws:secretsmanager:x:1:secret:other")
+    source, _target, password = mp._configs("shop")
+    assert source.username == "secret_user"
+    assert password.reveal() == "s3cr3t-from-sm"
+    assert calls == ["arn:aws:secretsmanager:us-east-1:123456789012:secret:src"]
+    mp._configs("shop")
+    assert len(calls) == 1                                  # read once per process
+
+
+def test_without_db_secret_id_the_task_definitions_source_secret_is_used(
+    mp, monkeypatch, no_source_env,
+) -> None:
+    calls = _fake_secret(monkeypatch)
+    monkeypatch.setenv("DSQL_MIGRATOR_SOURCE_SECRET_ARN", "arn:aws:secretsmanager:x:1:secret:stack")
+    monkeypatch.setenv("DB_USER", "explicit_user")          # DB_USER wins over the secret's
+    username, password = mp._source_credentials()
+    assert (username, password.reveal()) == ("explicit_user", "s3cr3t-from-sm")
+    assert calls == ["arn:aws:secretsmanager:x:1:secret:stack"]
+
+
+def test_db_password_is_used_as_before_and_no_secret_is_read(
+    mp, monkeypatch, no_source_env,
+) -> None:
+    calls = _fake_secret(monkeypatch)
+    monkeypatch.setenv("DB_PASSWORD", "from-dotenv")
+    monkeypatch.setenv("DB_SECRET_ID", "arn:aws:secretsmanager:x:1:secret:src")
+    username, password = mp._source_credentials()
+    assert (username, password.reveal()) == ("admin", "from-dotenv")
+    assert calls == []
+
+
+def test_main_accepts_a_secret_id_instead_of_a_password(mp, monkeypatch, no_source_env) -> None:
+    ran = []
+    monkeypatch.setattr(mp, "cmd_full_load", lambda args: ran.append(args) or 0)
+    monkeypatch.setenv("DB_HOST", "db.invalid")
+    monkeypatch.setattr("sys.argv", ["measure_performance.py", "full-load"])
+    assert mp.main() == 2 and ran == []                     # neither a password nor a secret
+    monkeypatch.setenv("DB_SECRET_ID", "arn:aws:secretsmanager:x:1:secret:src")
+    assert mp.main() == 0 and len(ran) == 1
+
+
+def _overrides_builder() -> str:
+    text = _LAUNCHER.read_text()
+    start = text.index("build_overrides_json() {")
+    end = text.index("\n}\n", text.index("\nPY\n", start)) + 3
+    return text[start:end]
+
+
+def test_the_fargate_launchers_overrides_carry_the_secret_id_never_the_password(tmp_path) -> None:
+    import subprocess
+    script = tmp_path / "overrides.sh"
+    script.write_text(
+        "set -euo pipefail\n" + _overrides_builder()
+        + "\nbuild_overrides_json '[\"echo\"]' 1\n"
+    )
+    env = {
+        "PATH": "/usr/bin:/bin", "DB_HOST": "db.example", "DB_PORT": "3306", "DB_USER": "",
+        "DB_PASSWORD": "pw-must-not-leave", "DB_SECRET_ID": "arn:aws:secretsmanager:x:1:secret:src",
+        "MEASURE_SCHEMA": "shop", "CONTAINER": "app", "TARGET_ENDPOINT": "abc.dsql.us-east-1.on.aws",
+    }
+    out = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True, check=True)
+    assert "pw-must-not-leave" not in out.stdout
+    overrides = json.loads(out.stdout)["containerOverrides"][0]
+    names = {e["name"]: e["value"] for e in overrides["environment"]}
+    assert names["DB_SECRET_ID"] == "arn:aws:secretsmanager:x:1:secret:src"
+    assert "DB_PASSWORD" not in names and "DB_USER" not in names   # unset: the secret's
+    assert "DB_PASSWORD" not in _overrides_builder()                # not even on python3's argv

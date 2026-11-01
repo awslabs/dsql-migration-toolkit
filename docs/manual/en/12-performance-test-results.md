@@ -107,7 +107,7 @@ captured tables ([§7.2](07-performance-and-tuning.md#72-tuning-parallelism)).
 
 ```bash
 AWS_REGION=<region> APP_STACK=<app-stack> \
-DB_HOST=<source-host> DB_PORT=3306 DB_USER=admin DB_PASSWORD=<pw> \
+DB_HOST=<source-host> DB_PORT=3306 DB_SECRET_ID=<secret-arn> \
 TARGET_ENDPOINT=<dsql-cluster-endpoint> \
 MEASURE_SCHEMA=<schema> MEASURE_TABLES="<table> <table>" \
 TABLE_PARALLELISM=16 VARIANTS=auto \
@@ -116,7 +116,11 @@ deploy/run_measure_on_fargate.sh
 
 [`deploy/run_measure_on_fargate.sh`](../../../deploy/run_measure_on_fargate.sh) runs the
 measurement as a one-off Fargate task in the source's VPC; `VARIANTS=auto` measures the
-loader's defaults, and the script lists the other variants.
+loader's defaults, and the script lists the other variants. The task reads the source's
+username and password itself, from the Secrets Manager secret `DB_SECRET_ID` names
+(RDS-style JSON), so the password is on no command line and in no task override; the
+app's task role can read the stack's `SourceSecretArn`, used when `DB_SECRET_ID` is
+unset, and any `mysql-dsql-migrator/cdc/*` secret.
 [`scripts/measure_performance.py`](../../../scripts/measure_performance.py) is the
 measurement itself: it reports the throughput per table and per time window, the write
 path's retries and latencies, and when Aurora DSQL finished the index builds. Its header

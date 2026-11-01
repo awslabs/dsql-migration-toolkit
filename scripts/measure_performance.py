@@ -66,7 +66,10 @@ never receives rows and every sample reports "no target row yet".
 
 Connection reuses ``.env`` (DB_HOST/DB_PORT/DB_USER/DB_PASSWORD source;
 TARGET_ENDPOINT/TARGET_REGION/TARGET_DATABASE/TARGET_USERNAME DSQL), like the other
-scripts. Safety: full-load is DESTRUCTIVE (DROP+recreate target tables, needs --yes);
+scripts. Without DB_PASSWORD, the source credentials are read from the Secrets Manager
+secret DB_SECRET_ID names (an RDS-style JSON secret, ARN or name), else from
+DSQL_MIGRATOR_SOURCE_SECRET_ARN (the app task definition's), inside this process, so
+on Fargate the password reaches no command line and no task override. Safety: full-load is DESTRUCTIVE (DROP+recreate target tables, needs --yes);
 cdc-lag WRITES only to its own ``cdc_perf`` schema on the source.
 
 Usage (from repo root):
@@ -144,6 +147,34 @@ def log(msg: str) -> None:
     print(f"[{_dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
+def _source_secret_id() -> str:
+    return cfg("DB_SECRET_ID") or cfg("DSQL_MIGRATOR_SOURCE_SECRET_ARN")
+
+
+_SOURCE_CREDENTIALS = None
+
+
+def _source_credentials():
+    """The source's ``(username, SecretValue password)``, read once.
+
+    DB_PASSWORD when set; else the Secrets Manager secret :func:`_source_secret_id` names,
+    read in this process (``core.secrets.resolve_source_secret``), so a Fargate run passes
+    only the secret's id. DB_USER, when set, wins over the secret's own username."""
+    global _SOURCE_CREDENTIALS
+    if _SOURCE_CREDENTIALS is None:
+        from dsql_migrator.config import SecretValue
+        password = cfg("DB_PASSWORD")
+        secret_id = "" if password else _source_secret_id()
+        if secret_id:
+            from dsql_migrator.core.secrets import resolve_source_secret
+            secret_user, secret_password = resolve_source_secret(
+                secret_id, os.environ.get("AWS_PROFILE"))
+            _SOURCE_CREDENTIALS = (cfg("DB_USER") or secret_user or "admin", secret_password)
+        else:
+            _SOURCE_CREDENTIALS = (cfg("DB_USER", "admin"), SecretValue(password))
+    return _SOURCE_CREDENTIALS
+
+
 def region() -> str:
     ep = cfg("TARGET_ENDPOINT")
     parts = ep.split(".")
@@ -151,7 +182,6 @@ def region() -> str:
 
 
 def _configs(schema: str):
-    from dsql_migrator.config import SecretValue
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TargetConnectionConfig,
     )
@@ -162,6 +192,7 @@ def _configs(schema: str):
     # only, unused by full-load).
     engine = cfg("PERF_SOURCE_ENGINE", "mysql").strip().lower()
     is_pg = engine in ("postgres", "postgresql", "pg")
+    username, password = _source_credentials()
     source = SourceConnectionConfig(
         source_type=SourceType.POSTGRES if is_pg else SourceType.MYSQL,
         host=cfg("DB_HOST"), port=int(cfg("DB_PORT", "5432" if is_pg else "3306")),
@@ -170,14 +201,14 @@ def _configs(schema: str):
         # `schema` (the --schema arg) qualify the tables as `schema.table` (matching PG
         # introspection's schema-qualified names -- see the `f"{schema}.{t}"` below).
         database=(cfg("DB_NAME", "perfdb") if is_pg else schema),
-        username=cfg("DB_USER", "admin"),
+        username=username,
     )
     target = TargetConnectionConfig(
         cluster_endpoint=cfg("TARGET_ENDPOINT"), region=region(),
         database=cfg("TARGET_DATABASE", "postgres"),
         username=cfg("TARGET_USERNAME", "admin"),
     )
-    return source, target, SecretValue(cfg("DB_PASSWORD"))
+    return source, target, password
 
 
 def _pct(values: list[float], q: float) -> float:
@@ -1337,9 +1368,10 @@ _PERF_TABLE = "pulse"
 
 def _source_conn():
     import pymysql
+    username, password = _source_credentials()
     return pymysql.connect(
         host=cfg("DB_HOST"), port=int(cfg("DB_PORT", "3306")),
-        user=cfg("DB_USER", "admin"), password=cfg("DB_PASSWORD"),
+        user=username, password=password.reveal(),
         connect_timeout=15, read_timeout=60, charset="utf8mb4", autocommit=True,
     )
 
@@ -1628,8 +1660,9 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    if not cfg("DB_HOST") or not cfg("DB_PASSWORD"):
-        log("ERROR: set DB_HOST/DB_PASSWORD in .env (`set -a; source .env; set +a`).")
+    if not cfg("DB_HOST") or not (cfg("DB_PASSWORD") or _source_secret_id()):
+        log("ERROR: set DB_HOST and DB_PASSWORD (or DB_SECRET_ID, a Secrets Manager secret) "
+            "in .env (`set -a; source .env; set +a`).")
         return 2
     return args.func(args)
 
