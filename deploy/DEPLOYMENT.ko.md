@@ -1152,15 +1152,17 @@ aws cloudformation deploy \
 > Schema Conversion 선택과 DDL 편집, Data Migration 선택(중단된 Full Load는 재개할 수 없음), 그리고
 > CDC와 Cut over가 기록한 내용입니다. 마이그레이션된 데이터, Aurora DSQL, 배포된 CDC 파이프라인은
 > 건드리지 않습니다. 내 컴퓨터나 AWS CloudShell에서(호스트의 역할은 시크릿을 읽기만 할 수 있음) 시크릿에
-> 새 값을 넣으세요:
+> 새 값을 넣으세요. 아래 명령은 새 값을 파이프로 넘기고 명령줄에는 올리지 않습니다(명령줄은 명령이
+> 실행되는 동안 그 컴퓨터의 다른 프로그램도 읽을 수 있음):
 >
 > ```bash
 > SECRET_ARN=$(aws cloudformation describe-stack-resource --stack-name mysql-dsql-migrator-ec2 \
 >   --logical-resource-id StorageSecret --region "$AWS_REGION" \
 >   --query StackResourceDetail.PhysicalResourceId --output text)
-> aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
->   --secret-string "$(aws secretsmanager get-random-password --password-length 64 \
->   --exclude-punctuation --region "$AWS_REGION" --query RandomPassword --output text)"
+> aws secretsmanager get-random-password --password-length 64 --exclude-punctuation \
+>   --region "$AWS_REGION" --query RandomPassword --output text | tr -d '\n' |
+>   aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --secret-string file:///dev/stdin
 > echo "$SECRET_ARN"
 > ```
 >

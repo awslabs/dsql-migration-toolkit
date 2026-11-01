@@ -1251,15 +1251,18 @@ the in-process seed), then starts the service. Progress is in
 > choices and DDL edits, the Data Migration selection (an interrupted Full Load cannot be
 > resumed), and what CDC and Cut over recorded. The migrated data, Aurora DSQL and a
 > deployed CDC pipeline are not touched. On your own machine or in AWS CloudShell (the
-> host's role can only read the secret), give the secret a new value:
+> host's role can only read the secret), give the secret a new value. The commands pass the
+> new value through a pipe and never put it on a command line (which other programs on the
+> machine can read while the command runs):
 >
 > ```bash
 > SECRET_ARN=$(aws cloudformation describe-stack-resource --stack-name mysql-dsql-migrator-ec2 \
 >   --logical-resource-id StorageSecret --region "$AWS_REGION" \
 >   --query StackResourceDetail.PhysicalResourceId --output text)
-> aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
->   --secret-string "$(aws secretsmanager get-random-password --password-length 64 \
->   --exclude-punctuation --region "$AWS_REGION" --query RandomPassword --output text)"
+> aws secretsmanager get-random-password --password-length 64 --exclude-punctuation \
+>   --region "$AWS_REGION" --query RandomPassword --output text | tr -d '\n' |
+>   aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --secret-string file:///dev/stdin
 > echo "$SECRET_ARN"
 > ```
 >

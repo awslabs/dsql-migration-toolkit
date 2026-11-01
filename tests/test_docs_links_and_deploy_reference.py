@@ -481,9 +481,9 @@ def test_the_ec2_guide_cleans_and_rotates_the_secret_an_earlier_startup_log_hold
     # The startup script traced (set -x) the command that read the cookie-signing secret into
     # its log, with the secret's value, and any local user could read the log. The fixed
     # script runs on a new host only, so the guide says how to find that line on an earlier
-    # host, delete it and make the log root-only, then give the secret a new value and write
-    # it into the host's env file, printing neither. The names and the generator settings are
-    # the template's.
+    # host, delete it and make the log root-only, then give the secret a new value (through a
+    # pipe, never on a command line) and write it into the host's env file, printing neither.
+    # The names and the generator settings are the template's.
     ec2 = yaml.safe_load((DEPLOY / "cloudformation-ec2.yaml").read_text(encoding="utf-8"))
     user_data = ec2["Resources"]["AppHost"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
     (log,) = re.findall(r"(?m)^exec > (\S+) 2>&1$", user_data)
@@ -507,11 +507,19 @@ def test_the_ec2_guide_cleans_and_rotates_the_secret_an_earlier_startup_log_hold
         "put-secret-value",
         f"--password-length {generated['PasswordLength']}",
         *(["--exclude-punctuation"] if generated.get("ExcludePunctuation") else []),
+        "--query RandomPassword --output text | tr -d '\\n' |",  # text output ends in a newline
+        "--secret-string file:///dev/stdin",  # put-secret-value reads the value from the pipe
         f"sudo sed -i '/^{env_variable}=/d' /etc/dsql-migrator.env",
         f"printf '{env_variable}=%s\\n'",
         "| sudo tee -a /etc/dsql-migrator.env >/dev/null",  # tee alone echoes the secret
     ):
         assert _has(lang, part, phrase), (lang, phrase)
+    # The new value never reaches a command line, which other programs on the machine (on
+    # Linux, any local user's ps) can read while the command runs: the generator comes first
+    # and pipes into put-secret-value, whose one --secret-string reads that pipe.
+    assert part.count(_flat(lang, "--secret-string")) == 1, lang
+    generator = part.index(_flat(lang, "get-random-password"))
+    assert generator < part.index(_flat(lang, "put-secret-value --secret-id")), lang
     # The old line goes before the new one is written (the same sed would delete both), and
     # the restart that applies the new value comes after the line that writes it.
     deleted = part.index(_flat(lang, f"sudo sed -i '/^{env_variable}=/d' /etc/dsql-migrator.env"))

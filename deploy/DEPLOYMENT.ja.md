@@ -1239,15 +1239,18 @@ aws cloudformation deploy \
 > した進捗は復元されません: Evaluation の結果、Schema Conversion の選択と DDL の編集、Data Migration
 > の選択（中断した Full Load は再開できません）、そして CDC と Cut over が記録した内容です。移行済みの
 > データ、Aurora DSQL、デプロイ済みの CDC パイプラインには影響しません。自分のマシンか AWS CloudShell で
-> （ホストのロールはシークレットを読むことしかできません）、シークレットに新しい値を設定してください:
+> （ホストのロールはシークレットを読むことしかできません）、シークレットに新しい値を設定してください。
+> 次のコマンドは新しい値をパイプで渡し、コマンドラインには載せません（コマンドラインは、
+> コマンドの実行中、そのマシンの他のプログラムからも読めます）:
 >
 > ```bash
 > SECRET_ARN=$(aws cloudformation describe-stack-resource --stack-name mysql-dsql-migrator-ec2 \
 >   --logical-resource-id StorageSecret --region "$AWS_REGION" \
 >   --query StackResourceDetail.PhysicalResourceId --output text)
-> aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
->   --secret-string "$(aws secretsmanager get-random-password --password-length 64 \
->   --exclude-punctuation --region "$AWS_REGION" --query RandomPassword --output text)"
+> aws secretsmanager get-random-password --password-length 64 --exclude-punctuation \
+>   --region "$AWS_REGION" --query RandomPassword --output text | tr -d '\n' |
+>   aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --region "$AWS_REGION" \
+>   --secret-string file:///dev/stdin
 > echo "$SECRET_ARN"
 > ```
 >
