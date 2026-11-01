@@ -22,6 +22,7 @@ from dsql_migrator.core.cdc import (
     CDC_ENV_MCU_COUNT,
     CDC_ENV_SINK_TASKS_MAX,
     CDC_ENV_TOPIC_PARTITIONS,
+    CDC_EXACT_TABLE_INCLUDE_PARAM,
     CDC_MAX_SINK_PARALLELISM,
     CDC_PLACEHOLDER_PREFIX,
     CDC_STACK_NAME_LEGACY_PREFIX,
@@ -189,6 +190,8 @@ def test_every_emitted_param_is_declared_in_the_template() -> None:
         | set(CDC_WATERMARK_PARAM_KEYS)
         # G20: Start CDC's gtid_mode record (cdc_deployer.run_cdc_start).
         | {CDC_START_GTID_MODE_PARAM}
+        # Start CDC's first-Start switch (cdc_deployer.run_cdc_start).
+        | {CDC_EXACT_TABLE_INCLUDE_PARAM}
     )
     undeclared = emitted - declared
     assert not undeclared, (

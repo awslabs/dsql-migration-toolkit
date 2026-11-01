@@ -281,7 +281,18 @@ Parameters:
     Description: >
       Fully-qualified tables to capture (db.table), mirrored into Debezium
       table.include.list and the sink topic set. Matches the selection the
-      control plane passes to build_source_config / build_sink_config.
+      control plane passes to build_source_config / build_sink_config. Debezium
+      matches each entry ignoring letter case unless ExactTableIncludeList is "true".
+
+  ExactTableIncludeList:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      "true": the source connector captures exactly the TableIncludeList tables,
+      letter case included. "false" (default): Debezium matches each entry ignoring
+      letter case, as on every stack started before this parameter existed. Set by
+      Start CDC on a stack's first Start; kept by every later update.
 
   TopicPrefix:
     Type: String
@@ -727,6 +738,13 @@ Conditions:
   HasSinkKeyColumns:
     Fn::Not:
       - Fn::Equals: [Ref: SinkKeyColumns, ""]
+
+  # The source connector captures exactly the selected tables, letter case included
+  # (table.include.list in DebeziumSourceConnector / PostgresSourceConnector). Start CDC sets
+  # ExactTableIncludeList "true" on a stack's first Start; at its "false" default -- every
+  # stack started before the parameter existed -- the connector configuration is unchanged.
+  UseExactTableIncludeList:
+    Fn::Equals: [Ref: ExactTableIncludeList, "true"]
 
   # Size-proportional topic.creation groups (skewed-workload fix). Each group is
   # emitted only when the tool supplies a non-empty include list for it, and the
@@ -1874,8 +1892,29 @@ Resources:
           Fn::Sub: "${SourceDbServerId}"
         topic.prefix:
           Ref: TopicPrefix
+        # Exact capture (ExactTableIncludeList). The bundled debezium-core 2.7.4 compiles each
+        # table.include.list entry CASE_INSENSITIVE (Selectors / Strings.setOfRegex) and
+        # matches it against the whole db.table (anchored), so with shop.users selected it
+        # also captured an unselected shop.Users -- on MySQL with lower_case_table_names=0,
+        # also SHOP.users in another database -- into a topic of its own the sink never reads;
+        # on PostgreSQL a filtered publication also took that table (see
+        # PostgresSourceConnector).
+        # "(?-i)" at the start of an entry turns that flag off. The '.' in an entry still
+        # matches any character, but Start CDC refuses a name with any character other than
+        # ASCII letters, digits, '.', '_' and '-', or with a second '.' (topic_name_refusal),
+        # so it can match only the separator: each entry matches exactly one table, its own.
+        # Start CDC sets the parameter only on a stack it has not started before; the "false"
+        # branch is the earlier Fn::Join, byte-identical, so a stack started before keeps its
+        # connector configuration. Written out in both source connectors: CloudFormation
+        # forbids YAML anchors.
         table.include.list:
-          Fn::Join: [",", Ref: TableIncludeList]
+          Fn::If:
+            - UseExactTableIncludeList
+            - Fn::Join:
+                - ""
+                - - "(?-i)"
+                  - Fn::Join: [",(?-i)", Ref: TableIncludeList]
+            - Fn::Join: [",", Ref: TableIncludeList]
         # H13 prevention: drop oversized LOB columns at capture so a value that
         # could exceed DSQL's 1 MiB per-value limit never reaches Kafka/the sink.
         # Empty (default) excludes nothing; never list a PK column.
@@ -2188,8 +2227,22 @@ Resources:
         skipped.operations: none
         topic.prefix:
           Ref: TopicPrefix
+        # Exact capture (ExactTableIncludeList), written out as in the MySQL source connector
+        # above (CloudFormation forbids YAML anchors), which says why. On PostgreSQL the
+        # case-insensitive match also reached the source: with publication.autocreate.mode
+        # filtered, Debezium builds CREATE / ALTER PUBLICATION ... SET TABLE from the tables
+        # this filter admits (determineCapturedTables), so a quoted "Users" twin of a selected
+        # users joined the publication -- the source's UPDATE and DELETE on it then failed
+        # while it had no replica identity, or the source connector failed when its user did
+        # not own it. "(?-i)" never reaches that SQL: Debezium quotes the matched table names.
         table.include.list:
-          Fn::Join: [",", Ref: TableIncludeList]
+          Fn::If:
+            - UseExactTableIncludeList
+            - Fn::Join:
+                - ""
+                - - "(?-i)"
+                  - Fn::Join: [",(?-i)", Ref: TableIncludeList]
+            - Fn::Join: [",", Ref: TableIncludeList]
         column.exclude.list:
           Ref: ColumnExcludeList
         message.key.columns:

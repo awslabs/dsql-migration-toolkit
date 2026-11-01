@@ -2197,6 +2197,19 @@ def infer_column_exclusions(
     return {table: sorted(columns) for table, columns in sorted(found.items())}
 
 
+def cdc_stack_params_started(current_parameters: "Optional[Mapping[str, object]]") -> bool:
+    """Do the cdc-stack's parameters show a Start CDC: ``DeploySink="true"`` or a non-blank
+    ``MskBootstrapServers``? Pure.
+
+    Stop keeps DeploySink; a first Start CloudFormation rolled back leaves neither, so it counts
+    as not started here (unlike ``cdc_stack_has_streamed``).
+    """
+    current = current_parameters or {}
+    return str(current.get("DeploySink", "")).lower() == "true" or bool(
+        str(current.get("MskBootstrapServers", "") or "").strip()
+    )
+
+
 def column_exclude_seen_refusal(
     params: "CdcStackParams", current_parameters: "Optional[Mapping[str, object]]"
 ) -> "Optional[str]":
@@ -2217,9 +2230,7 @@ def column_exclude_seen_refusal(
             "(another session started or redeployed it). Nothing was changed. Reopen the "
             "CDC step so it re-reads the stack, then Start CDC again."
         )
-    started = str(current.get("DeploySink", "")).lower() == "true" or bool(
-        str(current.get("MskBootstrapServers", "") or "").strip()
-    )
+    started = cdc_stack_params_started(current)
     if params.column_exclude_judged and seen is None and live and started:
         return (
             "This screen could not read the CDC stack's excluded columns, and the stack has "
@@ -2682,6 +2693,15 @@ CDC_WATERMARK_PARAM_KEYS: tuple[str, ...] = (
 # (build_watermark_params), and this record must survive that Start. Start CDC sends it only
 # when its GTID check read the mode; every other update keeps it (UsePreviousValue).
 CDC_START_GTID_MODE_PARAM = "StartGtidMode"
+
+# The cdc-stack parameter that makes the source connector capture exactly the selected tables,
+# letter case included: otherwise Debezium matches each table.include.list entry ignoring case,
+# so capturing shop.users also captured an unselected shop.Users. Start CDC sends it "true" only
+# to a stack whose parameters show no Start before (cdc_stack_params_started); every later update
+# keeps it (UsePreviousValue), and a stack started before the parameter existed resolves to its
+# "false" default -- the earlier connector configuration, byte-identical. Like StartGtidMode, not
+# part of params.filled.
+CDC_EXACT_TABLE_INCLUDE_PARAM = "ExactTableIncludeList"
 
 
 def build_watermark_params(

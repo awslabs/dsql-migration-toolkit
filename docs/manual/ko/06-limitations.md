@@ -137,6 +137,20 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
   경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백됩니다. 그 토픽이 없는 클러스터를
   얻으려면 Delete CDC infrastructure 후 다시 배포하세요.
 
+- **버전 0.1.579 이하가 처음 시작한 CDC 스택은 선택한 테이블과 이름이 대소문자만 다른 테이블도
+  캡처함.** 그런 스택은 선택한 이름을 대소문자를 구분하지 않고 맞추므로, `shop.users`를 선택하면
+  `shop.Users`도 캡처하고 그 테이블의 변경을 싱크가 읽지 않는 별도의 Kafka 토픽으로 보냅니다.
+  MySQL에서는 `lower_case_table_names`가 0일 때 그렇게 되며, 그 테이블은 이름이 대소문자만 다른
+  데이터베이스에 있을 수도 있습니다(예: `SHOP.users`). PostgreSQL에서는 따옴표로 묶은 대소문자 혼용
+  이름이 해당되고, 소스 커넥터가 테이블을 직접 스냅샷하는 경우(CDC only, Full load only 뒤의 CDC,
+  또는 **Re-snapshot every table instead**)에만 그렇게 됩니다: 그때 커넥터는 그 테이블의 모든 행도
+  읽고 그 테이블을 publication에 추가합니다(나중에 만든 테이블은 커넥터가 다음에 다시 시작할 때).
+  그런 테이블에 replica identity가 없는 동안(예: 기본 키가 없음) 소스에서 그 테이블의 `UPDATE`와
+  `DELETE`는 모두 실패하므로 기본 키나 `REPLICA IDENTITY FULL`을 주세요. 커넥터의 데이터베이스
+  사용자가 그 테이블의 소유자가 아니면 대신 소스 커넥터가 실패합니다. 그런 스택은 Delete CDC
+  infrastructure 전까지 이렇게 동작하며, 이후 버전이 처음 시작한 스택은 선택한 테이블만 정확히
+  캡처합니다.
+
 - **PostgreSQL 소스, 재키잉(re-keyed) 테이블:** CDC가 재키잉하는 테이블 — Schema Conversion의
   **Composite key**, 또는 소스 기본 키 밖의 컬럼을 더하도록 편집한 타깃 키 — 은 Start 시점만이
   아니라 **CDC 실행 내내 테이블과 모든 파티션에 `REPLICA IDENTITY FULL`**이 필요합니다(나중에 만든

@@ -60,6 +60,7 @@ from dsql_migrator.config import SecretValue
 from dsql_migrator.core import cdc_pg_slot
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import (
+    CDC_EXACT_TABLE_INCLUDE_PARAM,
     CDC_PLACEHOLDER_PREFIX,
     CDC_STACK_NAME_PREFIX,
     CDC_START_GTID_MODE_PARAM,
@@ -72,6 +73,7 @@ from dsql_migrator.core.cdc import (
     build_watermark_params,
     legacy_column_exclude_key_conflicts,
     cdc_expected_connector_names,
+    cdc_stack_params_started,
     list_parameter_size_refusal,
     rekey_parameter_size_refusal,
     rekey_routing_log_lines,
@@ -2114,6 +2116,17 @@ def run_cdc_start(
     config-changed comparison, so a mode-only change never bounces a running connector, and
     the both-RUNNING fast path sends nothing. ``None`` (PostgreSQL, a stack whose
     connectors exist, an unread mode, scripts) sends nothing: the stack keeps its record.
+
+    On a stack whose parameters show no Start yet
+    (:func:`~dsql_migrator.core.cdc.cdc_stack_params_started` is False: a new stack, or one an
+    earlier version deployed but never started), the same pass sends
+    ``ExactTableIncludeList="true"``, both engines: the source connector then captures exactly
+    the selected tables, letter case included, where Debezium otherwise matches each
+    ``table.include.list`` entry ignoring case. A started stack keeps its value
+    (``UsePreviousValue``), one started before the parameter existed resolves to its
+    ``"false"`` default (its connector configuration unchanged), and, like ``StartGtidMode``,
+    it stays out of the connector overrides and the config-changed comparison and is sent only
+    with a template that declares it.
     """
     driver = _StageDriver(
         handle, stages=CDC_START_STAGES, on_log=on_log, sleep=sleep
@@ -2317,6 +2330,21 @@ def run_cdc_start(
                 driver.log(
                     f"Recording source gtid_mode={_recorded_mode} on the stack "
                     "(StartGtidMode): the next Start checks it before it continues by GTID."
+                )
+            # The source connector's exact capture (ExactTableIncludeList), on a stack whose
+            # parameters show no Start yet: no running or stopped pipeline's capture changes, a
+            # started stack keeps its value (UsePreviousValue), and one started before the
+            # parameter existed resolves to its "false" default -- the earlier connector
+            # configuration, byte-identical. Only with a template that declares it, like
+            # StartGtidMode: sent with UsePreviousTemplate to an older stack it would fail.
+            if not cdc_stack_params_started(discovery.current_parameters) and (
+                template_body is not None
+                or CDC_EXACT_TABLE_INCLUDE_PARAM in (discovery.current_parameters or {})
+            ):
+                start_pass.append((CDC_EXACT_TABLE_INCLUDE_PARAM, "true"))
+                driver.log(
+                    "The source connector captures exactly the selected tables, letter case "
+                    "included (ExactTableIncludeList): this stack has not been started before."
                 )
             # SeedMode=External (Lambda-free): the app does the CDC Kafka prep
             # IN-PROCESS here — pre-create the compacted offset topic + per-table

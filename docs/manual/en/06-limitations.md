@@ -147,6 +147,22 @@ it.
   path (MySQL on ECS Fargate or run locally). Delete CDC infrastructure and deploy it
   again to get a cluster without that topic.
 
+- **A CDC stack first started by version 0.1.579 or earlier also captures each table whose
+  name differs from a selected one only in letter case.** It matches each selected name
+  ignoring letter case, so with `shop.users` selected it also captures `shop.Users` and
+  sends that table's changes to a Kafka topic of their own, which the sink never reads. On
+  MySQL this happens with `lower_case_table_names` 0, and the table can also be in a
+  database whose name differs only in letter case, such as `SHOP.users`. On PostgreSQL
+  such a table has a quoted mixed-case name, and this happens only where the source
+  connector snapshots the tables itself (CDC only, CDC after Full load only, or
+  **Re-snapshot every table instead**): the connector then also reads all of that table's
+  rows and adds the table to its publication (one created later, at the connector's next
+  restart). While such a table has no replica identity (no primary key, for example),
+  every `UPDATE` and `DELETE` on it fails on the source, so give it a primary key or
+  `REPLICA IDENTITY FULL`; if the connector's database user does not own the table, the
+  source connector fails instead. Such a stack keeps this until Delete CDC infrastructure;
+  a stack first started by a later version captures exactly the selected tables.
+
 - **PostgreSQL source, re-keyed tables:** a table CDC re-keys — Schema Conversion's
   **Composite key**, or an edited target key that adds a column outside the source primary
   key — needs **`REPLICA IDENTITY FULL` on the table and on every partition, for the whole
