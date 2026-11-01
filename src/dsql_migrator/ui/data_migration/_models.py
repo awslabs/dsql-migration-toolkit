@@ -4380,20 +4380,25 @@ def cdc_pre_load_table_list_warning(
     return header, f"{fact} " + cdc_pre_load_table_list_routes(table_lock, split=split)
 
 
-def cdc_pre_load_topic_name_routes(table_lock: "Optional[str]", *, split: bool = False) -> str:
+def cdc_pre_load_topic_name_routes(
+    table_lock: "Optional[str]", *, split: bool = False, dotted_schema: bool = False
+) -> str:
     """The routes for a Full load + CDC selection holding a table CDC cannot stream
     (:func:`cdc_topic_name_refusal`), before its load and with CDC never started: load it
     and, until CDC starts, untick it (G16), then copy it again in a Full load only migration
     once its writes stop; or rename it at the source, or leave it out now
     (:func:`table_picker_remedy`; ``table_lock`` is the table picker's lock reason). Of two
-    names that differ only in a '.' against a '_', unticking or leaving out one is enough. The
-    first route does not hold for a '.' inside a database or schema name, which no step
-    supports (Chapter 6 says so). ``split`` (:func:`mysql_reads_may_split`) carves a table the
+    names that differ only in a '.' against a '_', unticking or leaving out one is enough.
+    ``dotted_schema`` (set when the facts hold core.cdc ``CDC_TOPIC_NAME_DOTTED_SCHEMA``)
+    excepts from the first route a table of a database or schema whose name holds a '.',
+    which no step supports. ``split`` (:func:`mysql_reads_may_split`) carves a table the
     load reads in parts out of the first (G137). Pure."""
     return (
-        "The Full Load can still load such a table: after it, until CDC starts, untick it in the "
-        "table list (it stays on Aurora DSQL as loaded; CDC and Validation skip it) and copy it "
-        "again in a Full load only migration once its writes stop."
+        "The Full Load can still load such a table"
+        + (" (not one with a '.' inside its database or schema name)" if dotted_schema else "")
+        + ": after it, until CDC starts, untick it in the table list (it stays on Aurora DSQL "
+        "as loaded; CDC and Validation skip it) and copy it again in a Full load only migration "
+        "once its writes stop."
         + (PRE_LOAD_SPLIT_CARVE_OUT if split else "")
         + " Or, before the load, rename it at the source and re-run Step 1 (Evaluation), or "
         "leave it out: " + table_picker_remedy(table_lock)
@@ -4416,9 +4421,10 @@ def cdc_pre_load_topic_name_warning(
     Start CDC then judge the real capture. The body is the refusal's facts (each kind of name,
     in its order) without its remedy, then the routes. ``planned``: a cdc-stack is already
     deployed (or deploying), so only Start CDC is still to refuse. ``table_lock`` and
-    ``split`` as for :func:`cdc_pre_load_topic_name_routes`.
+    ``split`` as for :func:`cdc_pre_load_topic_name_routes`; its ``dotted_schema`` is whether
+    the facts hold core.cdc ``CDC_TOPIC_NAME_DOTTED_SCHEMA``.
     """
-    from dsql_migrator.core.cdc import CDC_TOPIC_NAME_REMEDY
+    from dsql_migrator.core.cdc import CDC_TOPIC_NAME_DOTTED_SCHEMA, CDC_TOPIC_NAME_REMEDY
 
     refusal = cdc_topic_name_refusal(table_names)
     if refusal is None:
@@ -4430,7 +4436,9 @@ def cdc_pre_load_topic_name_warning(
     return (
         CDC_TOPIC_NAME_HEADER,
         f"{fact} {refusing} a capture holding such a table. "
-        + cdc_pre_load_topic_name_routes(table_lock, split=split),
+        + cdc_pre_load_topic_name_routes(
+            table_lock, split=split, dotted_schema=CDC_TOPIC_NAME_DOTTED_SCHEMA in fact
+        ),
     )
 
 

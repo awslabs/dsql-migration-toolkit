@@ -119,20 +119,23 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
   infrastructure, Start CDC, Retry CDC는 무엇이든 업로드하거나 만들기 전에 그런 테이블을
   거부하고(*Table names CDC cannot stream*, 테이블을 명시하며, 공백이나 폭 없는 공백처럼 보이지 않는
   문자는 코드 포인트로 표기: `<U+0020>`, `<U+200B>`), Full load + CDC에서는 Full Load 단계가 적재
-  전에 경고하지만 적재를 막지는 않습니다. Full load + CDC에서는 그런 테이블을 적재한 뒤 CDC를
-  시작하기 전에 선택을 해제하세요([13장](13-excluding-tables-and-columns.md)의 "Full Load 후 테이블
-  집합 바꾸기 (Full load + CDC)" 참고): 적재된 그대로 Aurora DSQL에 남고, CDC와 Validation은 그
-  테이블을 건너뜁니다. CDC only에서는 Deploy CDC infrastructure 전에 선택을 해제하세요. 그런 다음
-  쓰기가 멈춘 뒤 Full load only 마이그레이션으로 복사하거나, 마이그레이션 전에 소스에서 이름을
-  바꾸세요. 적재가 별도 스냅샷 부분으로 나누어 읽은 MySQL 테이블은 리더 하나로 다시 적재한 뒤에만
-  선택을 해제할 수 있습니다(아래 "용량과 비용" 참고). 데이터베이스나 스키마 이름 안의 `.`은 다른
-  단계에서도 지원되지 않습니다: 도구는 정규화된 이름의 첫 `.`을 구분자로 보므로, Schema Conversion과
-  Full Load가 그런 이름을 엉뚱한 곳에서 나눕니다. Evaluation은 그런 데이터베이스나 스키마의 테이블과
-  뷰를 각각 **Unsupported**(`DOTTED_SCHEMA_NAME`)로 보고합니다. 이전 Start CDC가 클러스터에 남긴
-  토픽도 충돌합니다(예: Start over 전에 쓰던 테이블 집합의 토픽): 그러면 Start CDC는 커넥터를 만들기
-  전에 실패합니다 — External 경로(PostgreSQL 소스, 또는 EC2 호스트의 MySQL)에서는 그 토픽을 명시하며
-  즉시 실패하고, Lambda 경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백됩니다. 그
-  토픽이 없는 클러스터를 얻으려면 Delete CDC infrastructure 후 다시 배포하세요.
+  전에 경고하지만 적재를 막지는 않습니다. 데이터베이스나 스키마 이름 안의 `.`은 어느 단계에서도
+  지원되지 않습니다: 도구는 정규화된 이름의 첫 `.`을 구분자로 보므로, Schema Conversion과 Full
+  Load가 그런 이름을 엉뚱한 곳에서 나누고, Evaluation은 그런 데이터베이스나 스키마의 테이블과 뷰를
+  각각 **Unsupported**(`DOTTED_SCHEMA_NAME`)로 보고합니다. 소스에서 그 데이터베이스나 스키마의
+  이름을 바꾸거나, 그 테이블과 뷰를 마이그레이션에서
+  빼세요([§2.4](02-evaluation-and-schema-conversion.md#24-evaluation-항목-참조)). 그 밖의 그런
+  테이블은, Full load + CDC에서는 적재한 뒤 CDC를 시작하기 전에 선택을
+  해제하세요([13장](13-excluding-tables-and-columns.md)의 "Full Load 후 테이블 집합 바꾸기 (Full
+  load + CDC)" 참고): 적재된 그대로 Aurora DSQL에 남고, CDC와 Validation은 그 테이블을 건너뜁니다.
+  CDC only에서는 Deploy CDC infrastructure 전에 선택을 해제하세요. 그런 다음 쓰기가 멈춘 뒤 Full
+  load only 마이그레이션으로 복사하거나, 마이그레이션 전에 소스에서 이름을 바꾸세요. 적재가 별도
+  스냅샷 부분으로 나누어 읽은 MySQL 테이블은 리더 하나로 다시 적재한 뒤에만 선택을 해제할 수
+  있습니다(아래 "용량과 비용" 참고). 이전 Start CDC가 클러스터에 남긴 토픽도 충돌합니다(예: Start
+  over 전에 쓰던 테이블 집합의 토픽): 그러면 Start CDC는 커넥터를 만들기 전에 실패합니다 — External
+  경로(PostgreSQL 소스, 또는 EC2 호스트의 MySQL)에서는 그 토픽을 명시하며 즉시 실패하고, Lambda
+  경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백됩니다. 그 토픽이 없는 클러스터를
+  얻으려면 Delete CDC infrastructure 후 다시 배포하세요.
 
 - **PostgreSQL 소스, 재키잉(re-keyed) 테이블:** CDC가 재키잉하는 테이블 — Schema Conversion의
   **Composite key**, 또는 소스 기본 키 밖의 컬럼을 더하도록 편집한 타깃 키 — 은 Start 시점만이

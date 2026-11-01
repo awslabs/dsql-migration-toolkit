@@ -21,8 +21,11 @@ CDC names each captured table's Kafka topic ``dsqlcdc.<db>.<table>`` (MySQL) or
 - two names that differ only in a '.' against a '_' (app.v2_users, app_v2.users): Kafka refuses
   the second topic, which both seeders pre-create, so Start CDC failed after the deploy.
 
-A character that does not show is written as its code point. Doubles only: no AWS, no
-source, no Aurora DSQL.
+A character that does not show is written as its code point. A refused name with two or more
+'.' may be a table of a database or schema whose name holds a '.', which no step supports
+(DOTTED_SCHEMA_NAME), so the refusal says so before its remedy, and the load-then-untick route
+before a Full load + CDC load excepts such a table. Doubles only: no AWS, no source, no Aurora
+DSQL.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ import pytest
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_TOPIC_PREFIX,
+    CDC_TOPIC_NAME_DOTTED_SCHEMA,
     CDC_TOPIC_NAME_REMEDY,
     cdc_expected_connector_names,
     cdc_stack_name_is_valid,
@@ -100,6 +104,7 @@ _FACT = (
     "schema and its table, and Kafka allows only ASCII letters, digits, '.', '_' and '-' in a "
     "topic name."
 )
+_ILLEGAL_FACT = _FACT.removeprefix("CDC cannot stream shop.a<U+0020>b")  # ": each table's ..."
 _DOTTED_FACT = (
     ": the CDC sink reads every '.' in a table's qualified name as the one between its database "
     "or schema and its table, so with a '.' inside either name, each change to that table fails "
@@ -115,10 +120,24 @@ _REMEDY = (
     "or rename it at the source before migrating it."
 )
 _REFUSAL = f"{_FACT} {_REMEDY}"
+# Said after the facts when a refused name holds two or more '.': it may be a table of a
+# database or schema whose name holds a '.', which no step supports (DOTTED_SCHEMA_NAME).
+_DOTTED_SCHEMA = (
+    "A '.' inside a database or schema name is not supported at any step, so a table of such "
+    "a database or schema cannot be copied in a Full load only migration either (Evaluation "
+    "reports it Unsupported, DOTTED_SCHEMA_NAME): rename that database or schema at the "
+    "source, or leave its tables out of the migration."
+)
 _ROUTES = (
     "The Full Load can still load such a table: after it, until CDC starts, untick it in the "
     "table list (it stays on Aurora DSQL as loaded; CDC and Validation skip it) and copy it "
     "again in a Full load only migration once its writes stop."
+)
+_ROUTES_DOTTED = (
+    "The Full Load can still load such a table (not one with a '.' inside its database or "
+    "schema name): after it, until CDC starts, untick it in the table list (it stays on Aurora "
+    "DSQL as loaded; CDC and Validation skip it) and copy it again in a Full load only "
+    "migration once its writes stop."
 )
 _ROUTES_OR = (
     " Or, before the load, rename it at the source and re-run Step 1 (Evaluation), or leave it "
@@ -229,7 +248,7 @@ def test_a_dot_inside_a_name_is_refused(name) -> None:
     # deleted from public.orders.
     assert topic_name_refused_tables(_lists(["shop.orders", name, "shop.items"])) == [name]
     assert topic_name_refusal(_lists([name])) == (
-        f"CDC cannot stream {name}{_DOTTED_FACT} {_REMEDY}")
+        f"CDC cannot stream {name}{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
 
 
 def test_only_a_dot_after_the_topic_prefix_is_inside_a_name() -> None:
@@ -246,7 +265,7 @@ def test_only_a_dot_after_the_topic_prefix_is_inside_a_name() -> None:
     # All of them in one sentence: sorted, five named and the rest counted.
     assert topic_name_refusal(_lists(_DOTTED)) == (
         "CDC cannot stream .shop.t, my.db.t, public.public.orders, shop..t, shop.a.b and 1 more"
-        f"{_DOTTED_FACT} {_REMEDY}")
+        f"{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
 
 
 def test_names_whose_topics_differ_only_in_a_dot_against_an_underscore_are_refused() -> None:
@@ -295,11 +314,11 @@ def test_a_refused_name_is_never_a_collision_partner() -> None:
     # A dotted name is refused for its '.', and its look-alike streams.
     assert topic_name_refused_tables(_lists(["shop.a.b", "shop.a_b"])) == ["shop.a.b"]
     assert topic_name_refusal(_lists(["shop.a.b", "shop.a_b"])) == (
-        f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_REMEDY}")
+        f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
     # Two dotted names alike once '.' is '_' are named as dotted only; two illegal ones, as
     # illegal only.
     assert topic_name_refusal(_lists(["shop.a.b_c", "shop.a_b.c"])) == (
-        f"CDC cannot stream shop.a.b_c, shop.a_b.c{_DOTTED_FACT} {_REMEDY}")
+        f"CDC cannot stream shop.a.b_c, shop.a_b.c{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
     assert topic_name_refusal(_lists(["a.b c_d", "a_b c.d"])) == (
         "CDC cannot stream a.b<U+0020>c_d, a_b<U+0020>c.d: each table's Kafka topic is named "
         "after its database or schema and its table, and Kafka allows only ASCII letters, "
@@ -334,7 +353,7 @@ def test_every_kind_in_one_capture_is_one_message() -> None:
     names = ["shop.orders", "app_v2.users", "shop.a b", "shop.a.b", "app.v2_users"]
     dotted = f"CDC cannot stream shop.a.b{_DOTTED_FACT}"
     collision = f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them."
-    facts = f"{_FACT} {dotted} {collision}"
+    facts = f"{_FACT} {dotted} {collision} {_DOTTED_SCHEMA}"
     refusal = topic_name_refusal(_lists(names))
     assert refusal == f"{facts} {_REMEDY}"
     assert refusal.count(_REMEDY) == 1
@@ -345,13 +364,13 @@ def test_every_kind_in_one_capture_is_one_message() -> None:
     assert cdc_pre_load_topic_name_warning(names, planned=False, table_lock=None) == (
         CDC_TOPIC_NAME_HEADER,
         f"{facts} Deploy CDC infrastructure and Start CDC refuse a capture holding such a "
-        "table. " + _ROUTES + _ROUTES_OR + _OPEN,
+        "table. " + _ROUTES_DOTTED + _ROUTES_OR + _OPEN,
     )
     from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
 
     assert _deploy_block_notice(
         _deploy_ready(names, FLC), _Jobs({}), _inventory(names), None
-    ) == (CDC_TOPIC_NAME_HEADER, f"{facts} {_ROUTES}{_ROUTES_OR}{_OPEN}")
+    ) == (CDC_TOPIC_NAME_HEADER, f"{facts} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}")
 
 
 def test_the_prefix_is_read_from_the_parameters_and_sinktopics_order_is_kept() -> None:
@@ -388,6 +407,34 @@ def test_the_refusal_names_the_tables_the_rule_and_the_remedy() -> None:
         "its database or schema and its table, and Kafka allows only ASCII letters, digits, '.', "
         "'_' and '-' in a topic name. " + _REMEDY
     )
+
+
+def test_a_name_that_may_be_of_a_dotted_schema_is_not_sent_to_full_load_only() -> None:
+    # FAILS WITHOUT THE FIX: the remedy offered a Full load only copy even for a table of a
+    # database or schema whose name holds a '.', which no step supports (DOTTED_SCHEMA_NAME).
+    # The names alone cannot tell my.db.orders (database my.db) from shop.a.b (a '.' inside the
+    # table name), so every refused name with two or more '.' gets the sentence, once, after
+    # the facts and before the remedy; a name with one '.' never does.
+    assert CDC_TOPIC_NAME_DOTTED_SCHEMA == _DOTTED_SCHEMA
+    assert topic_name_refusal(_lists(["my.db.orders"])) == (
+        f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # A name Kafka refuses, too (database "my.d b").
+    assert topic_name_refusal(_lists(["my.d b.orders"])) == (
+        f"CDC cannot stream my.d<U+0020>b.orders{_ILLEGAL_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # One '.': a name Kafka refuses and a colliding pair keep their text.
+    assert topic_name_refusal(_lists(["shop.a b"])) == _REFUSAL
+    assert topic_name_refusal(_lists(["app.v2_users", "app_v2.users"])) == (
+        f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
+        + _REMEDY)
+    # Several such names of both kinds: one sentence, after every fact.
+    refusal = topic_name_refusal(_lists(
+        ["my.db.orders", "my.d b.orders", "shop.a.b", "x.y z.w", "app.v2_users", "app_v2.users"]))
+    assert refusal == (
+        f"CDC cannot stream my.d<U+0020>b.orders, x.y<U+0020>z.w{_ILLEGAL_FACT} "
+        f"CDC cannot stream my.db.orders, shop.a.b{_DOTTED_FACT} "
+        f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert refusal.count(_DOTTED_SCHEMA) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +585,16 @@ def test_the_pre_load_routes_and_warning() -> None:
         + "The table picker is locked. Locked — X.",
     )
     assert cdc_pre_load_topic_name_warning(["shop.orders"], planned=False, table_lock=None) is None
+
+
+def test_the_pre_load_routes_except_a_dotted_database_or_schema() -> None:
+    # FAILS WITHOUT THE FIX: the load-then-untick route ends in a Full load only copy, which
+    # no step supports for a table of a database or schema whose name holds a '.'.
+    assert cdc_pre_load_topic_name_routes(None, dotted_schema=True) == (
+        _ROUTES_DOTTED + _ROUTES_OR + _OPEN)
+    assert cdc_pre_load_topic_name_routes("Locked — X.", split=True, dotted_schema=True) == (
+        _ROUTES_DOTTED + PRE_LOAD_SPLIT_CARVE_OUT + _ROUTES_OR
+        + "The table picker is locked. Locked — X.")
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +772,28 @@ def test_the_deploy_click_refuses_before_any_read(monkeypatch) -> None:
     assert calls == []  # not even the source's row estimates
 
 
+def test_the_card_and_the_early_deploy_except_a_dotted_database_or_schema(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX: before a Full load + CDC load, the Full Load card's warning, the
+    # early Deploy form and its click offered my.db.orders (database my.db) the
+    # load-then-untick route and a Full load only copy, which no step supports for it.
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
+
+    names = ["shop.orders", "my.db.orders"]
+    inv = _inventory(names)
+    facts = f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA}"
+    assert pre_load_topic_name_warning(_state(names), _Jobs({}), None, inv) == (
+        CDC_TOPIC_NAME_HEADER,
+        f"{facts} Deploy CDC infrastructure and Start CDC refuse a capture holding such a "
+        f"table. {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}",
+    )
+    early = f"{facts} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}"
+    assert _deploy_block_notice(_deploy_ready(names, FLC), _Jobs({}), inv, None) == (
+        CDC_TOPIC_NAME_HEADER, early)
+    calls = _fake_nicegui(monkeypatch, None)
+    assert _click_deploy(_deploy_ready(names, FLC), inv) == [(early, "negative")]
+    assert calls == []
+
+
 def test_the_same_click_with_names_cdc_can_stream_goes_on_to_the_reads(monkeypatch) -> None:
     # Guards the guard: with names CDC can stream, the click reads the source's row estimates
     # and goes on to an AWS call, which the fake fails, so the refused click's empty record is
@@ -795,6 +874,18 @@ def test_start_and_retry_refuse_before_the_submit_that_fixes_the_set(monkeypatch
     assert table_set_editable_after_load(state, jobs) is True
 
 
+@pytest.mark.parametrize("retry", [False, True], ids=["start", "retry"])
+def test_start_and_retry_except_a_dotted_database_or_schema(monkeypatch, retry) -> None:
+    # FAILS WITHOUT THE FIX: after the load, Start and Retry CDC told my.db.orders (database
+    # my.db) to be copied in a Full load only migration, which no step supports for it.
+    names = ["shop.orders", "my.db.orders"]
+    jobs = _Jobs({"job-1": _loaded(names, _counts(names))})
+    hits, submitted = _start_click(monkeypatch, _loaded_state(names), jobs, names, retry=retry)
+    assert [h["body"] for h in hits] == [
+        f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY} {_OPEN}"]
+    assert submitted == []
+
+
 def test_a_set_fixed_by_an_earlier_failed_start_is_refused_with_start_over(monkeypatch) -> None:
     # v0.1.578: the first Start failed on such a name after its submit fixed the table set.
     jobs = _Jobs({"job-1": _loaded(_NAMES, _counts(_NAMES))})
@@ -853,7 +944,7 @@ def test_a_pipeline_that_streamed_with_a_dot_in_a_name_is_refused_at_its_next_st
     state.set_cdc_has_committed_offset(True)
     state.set_cdc_deployed_watermark(("mysql-bin.000042", "120"))
     hits, submitted = _start_click(monkeypatch, state, jobs, names)
-    refusal = f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_REMEDY}"
+    refusal = f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
     assert [h["body"] for h in hits] == [
         f"{refusal} The table picker is locked. {_FULL_LOAD_LOCK}"]
     assert submitted == []
@@ -1020,3 +1111,40 @@ def test_the_manual_names_the_refusal_and_the_rule(lang) -> None:
     for name in _DOC_NAMES:
         assert _has(lang, limitations, name), name
     assert _has(lang, _page(lang, "13-excluding-tables-and-columns.md"), row)
+
+
+# Chapter 6.2 says that a '.' inside a database or schema name is supported at no step, then
+# links the findings reference (§2.4, which chapter 6 links twice before 6.2 too, so it is
+# looked for after the finding), before the load-then-untick route, which it gives once, for
+# any other such table only.
+_DOC_FINDINGS_LINK = {
+    "en": "(02-evaluation-and-schema-conversion.md#24-findings-reference)",
+    "ko": "(02-evaluation-and-schema-conversion.md#24-evaluation-항목-참조)",
+    "ja": "(02-evaluation-and-schema-conversion.md#24-検出結果リファレンス)",
+}
+_DOC_UNTICK_ROUTE = {
+    "en": "load it, then untick it before CDC starts",
+    "ko": "적재한 뒤 CDC를 시작하기 전에 선택을 해제하세요",
+    "ja": "ロードしてから CDC を開始する前に選択を外してください",
+}
+_DOC_OTHER_TABLE = {
+    "en": "For any other such table, with Full load + CDC, ",
+    "ko": "그 밖의 그런 테이블은, Full load + CDC에서는 ",
+    "ja": "それ以外のそのようなテーブルは、Full load + CDC では、",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_manual_excepts_a_dotted_database_or_schema_before_the_routes(lang) -> None:
+    # FAILS WITHOUT THE FIX: the routes came first, as if they held for every such table, and
+    # the dotted database or schema followed them without a link to its finding.
+    from tests.test_g25_docs import _flat, _page
+
+    part = _page(lang, "06-limitations.md").split(_flat(lang, "## 6.2"), 1)[1].split(
+        _flat(lang, "## 6.3"), 1)[0]
+    route = _flat(lang, _DOC_UNTICK_ROUTE[lang])
+    dotted = part.find("(`DOTTED_SCHEMA_NAME`)")
+    link = part.find(_flat(lang, _DOC_FINDINGS_LINK[lang]), max(dotted, 0))
+    assert part.count(route) == 1, lang
+    assert _flat(lang, _DOC_OTHER_TABLE[lang] + _DOC_UNTICK_ROUTE[lang]) in part, lang
+    assert -1 < dotted < link < part.index(route), (lang, dotted, link)

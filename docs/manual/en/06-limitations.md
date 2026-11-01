@@ -126,19 +126,22 @@ it.
   table before anything is uploaded or created (*Table names CDC cannot stream*, naming
   the tables, with a character that does not show, such as a space or a zero-width space,
   written as its code point: `<U+0020>`, `<U+200B>`), and with Full load + CDC the Full
-  Load step warns before the load but is not held. With Full load + CDC, load such a
-  table, then untick it before CDC starts (see "Changing the table set after a Full Load
-  (Full load + CDC)" in [Chapter 13](13-excluding-tables-and-columns.md)): it stays on
-  Aurora DSQL as loaded, and CDC and Validation skip it. With CDC only, deselect it before
-  Deploy CDC infrastructure. Then copy it in a Full load only migration once its writes
-  stop, or rename it at the source before migrating it. A MySQL table the load read in
+  Load step warns before the load but is not held. A `.` inside a database or schema name
+  is not supported at any step: the tool takes the first `.` of a qualified name for the
+  separator, so Schema Conversion and the Full Load split such a name in the wrong place,
+  and Evaluation reports each table and view of such a database or schema as
+  **Unsupported** (`DOTTED_SCHEMA_NAME`). Rename that database or schema at the source, or
+  leave its tables and views out of the migration
+  ([§2.4](02-evaluation-and-schema-conversion.md#24-findings-reference)). For any other
+  such table, with Full load + CDC, load it, then untick it before CDC starts (see
+  "Changing the table set after a Full Load (Full load + CDC)" in
+  [Chapter 13](13-excluding-tables-and-columns.md)): it stays on Aurora DSQL as loaded,
+  and CDC and Validation skip it. With CDC only, deselect it before Deploy CDC
+  infrastructure. Then copy it in a Full load only migration once its writes stop, or
+  rename it at the source before migrating it. A MySQL table the load read in
   separate-snapshot parts can be unticked only after a reload with one reader (see
-  "Capacity and cost" below). A `.` inside a database or schema name is not supported by
-  the other steps either: the tool takes the first `.` of a qualified name for the
-  separator, so Schema Conversion and the Full Load split such a name in the wrong place.
-  Evaluation reports each table and view of such a database or schema as **Unsupported**
-  (`DOTTED_SCHEMA_NAME`). A topic an earlier Start CDC left on the cluster collides too
-  (for example one from a table set used before a Start over): Start CDC then fails
+  "Capacity and cost" below). A topic an earlier Start CDC left on the cluster collides
+  too (for example one from a table set used before a Start over): Start CDC then fails
   before creating any connector — at once, naming the topic, on the External path (a
   PostgreSQL source, or MySQL on the EC2 host), or as a rolled-back Start on the Lambda
   path (MySQL on ECS Fargate or run locally). Delete CDC infrastructure and deploy it

@@ -1860,6 +1860,16 @@ CDC_TOPIC_NAME_REMEDY = (
     "and Validation skip it) and copy it in a Full load only migration once its writes stop, "
     "or rename it at the source before migrating it."
 )
+# Said after the facts when a refused name holds two or more '.' after <TopicPrefix>.: it may
+# name a table of a database or schema whose name holds a '.', which no step supports
+# (Evaluation's DOTTED_SCHEMA_NAME), so the remedy's Full load only copy does not hold for it.
+# A name with one '.' never does; the names alone cannot tell the two kinds apart.
+CDC_TOPIC_NAME_DOTTED_SCHEMA = (
+    "A '.' inside a database or schema name is not supported at any step, so a table of such "
+    "a database or schema cannot be copied in a Full load only migration either (Evaluation "
+    "reports it Unsupported, DOTTED_SCHEMA_NAME): rename that database or schema at the "
+    "source, or leave its tables out of the migration."
+)
 
 # What Debezium would interpret inside a column.exclude.list name part: the regex
 # metacharacters, and ',' -- the list separator, which its splitter (RegExSplitter) reads
@@ -2599,6 +2609,10 @@ def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]
     the prefix, the heartbeat and MSK Connect internal topics start with "__", and a table
     topic unifies to ``<TopicPrefix>_<db>_<table>``, with at least two. The remedy
     (:data:`CDC_TOPIC_NAME_REMEDY`) ends the text.
+
+    A refused name with two or more '.' may belong to a database or schema whose name holds a
+    '.', which no step supports (Full load only included), so
+    :data:`CDC_TOPIC_NAME_DOTTED_SCHEMA` follows the facts once, before the remedy.
     """
     illegal, dotted, groups = _topic_name_kinds(filled)
     facts: list[str] = []
@@ -2624,6 +2638,8 @@ def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]
             "only in a '.' against a '_', so CDC can stream only one of "
             f"{'them' if len(groups) == 1 else 'each'}."
         )
+    if dotted or any(name.count(".") > 1 for name in illegal):
+        facts.append(CDC_TOPIC_NAME_DOTTED_SCHEMA)
     if not facts:
         return None
     return " ".join(facts) + " " + CDC_TOPIC_NAME_REMEDY

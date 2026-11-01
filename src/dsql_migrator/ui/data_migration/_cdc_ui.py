@@ -38,6 +38,7 @@ from typing import (
 
 from dsql_migrator.core.cdc import (
     CDC_TABLE_LIST_REMEDY,
+    CDC_TOPIC_NAME_DOTTED_SCHEMA,
     CDC_TOPIC_NAME_REMEDY,
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_STACK_NAME,
@@ -4806,7 +4807,9 @@ def _deploy_topic_name_refused(refusal: str, migration_state, job_manager, sessi
     :func:`_deploy_table_list_refused` says a table-list one: before a Full load + CDC load,
     with CDC never started for this migration, the routes of the Full Load card's warning
     (:func:`cdc_pre_load_topic_name_routes`) in place of the refusal's own remedy, which they
-    repeat -- the deploy itself stays refused. Otherwise the table picker's after it
+    repeat -- the deploy itself stays refused. When the facts hold
+    ``CDC_TOPIC_NAME_DOTTED_SCHEMA``, the first route excepts a table of a database or schema
+    whose name holds a '.', as on the card. Otherwise the table picker's after it
     (:func:`_topic_name_hold_remedy`)."""
     from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
 
@@ -4820,7 +4823,9 @@ def _deploy_topic_name_refused(refusal: str, migration_state, job_manager, sessi
         from dsql_migrator.ui.data_migration._models import session_source_type
 
         return f"{fact} " + cdc_pre_load_topic_name_routes(
-            lock, split=mysql_reads_may_split(session_source_type(session))
+            lock,
+            split=mysql_reads_may_split(session_source_type(session)),
+            dotted_schema=CDC_TOPIC_NAME_DOTTED_SCHEMA in fact,
         )
     return _topic_name_hold_remedy(refusal, migration_state, job_manager, lock)
 
