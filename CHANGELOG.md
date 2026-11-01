@@ -5,6 +5,24 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.580
+
+The Fargate performance-measurement script no longer sends the source password to its task, the single-EC2-host guide's secret rotation keeps the new secret off every command line, and the *Table names CDC cannot stream* refusal no longer offers a Full load only copy to a table of a database or schema whose name holds a `.`.
+
+### Security
+
+- **`deploy/run_measure_on_fargate.sh` no longer sends the source password to the measurement task.** It put `DB_PASSWORD` on a command line, where other local users could read it with `ps` while the script ran, and into the task's RunTask overrides, where anyone who can describe the task could read it. The task now reads the source credentials from Secrets Manager itself: set `DB_SECRET_ID` to an RDS-style secret (`username`, `password`) the app's task role can read, such as a `mysql-dsql-migrator/cdc/*` secret; when it is unset, the stack's `SourceSecretArn` is used, and with neither the script stops with an error before it starts a task. `DB_USER` now defaults to the secret's username. `scripts/measure_performance.py` reads `DB_SECRET_ID` the same way whenever `DB_PASSWORD` is not set, so a local run from `.env` is unchanged. A password given to an earlier version is in that task's overrides and in your shell history: change it if either was shared. [Chapter 12](docs/manual/en/12-performance-test-results.md#reproducing-these-measurements) shows the new command.
+- **The single-EC2-host guide's own-machine secret rotation pipes the new cookie-signing secret into `aws secretsmanager put-secret-value --secret-string file:///dev/stdin`.** v0.1.579's command put the value on put-secret-value's command line, where other programs on that machine (on Linux, those of every local user, with `ps`) could read it while it ran. Rotating on a machine only you use, or in AWS CloudShell, exposed it to no other user; if you rotated on a shared machine, rotate again with the new command ([deployment guide](deploy/DEPLOYMENT.md#3-deploy), English, Korean and Japanese). The host-side commands are unchanged.
+
+### Fixed
+
+- **The *Table names CDC cannot stream* refusal and the warning before a Full load + CDC load no longer offer a table of a database or schema whose name holds a `.` a Full load only copy or the load-then-untick route**, which no step supports for such a table (the last sentence of v0.1.579's Known issue). A qualified name cannot tell such a table from one with a `.` inside its table name, so whenever a refused name holds two or more `.`, the refusal adds once, before its remedy: *A '.' inside a database or schema name is not supported at any step, so a table of such a database or schema cannot be copied in a Full load only migration either (Evaluation reports it Unsupported, DOTTED_SCHEMA_NAME): rename that database or schema at the source, or leave its tables out of the migration.* The warning's route now reads *The Full Load can still load such a table (not one with a '.' inside its database or schema name)*, and manual [§6.2](docs/manual/en/06-limitations.md#62-migration-process-limits) gives that exception before the routes. Only the texts change: Deploy, Start, the connectors and the templates behave as before.
+
+### Upgrade notes
+
+- **App stack: an image-only update is enough.** `deploy/cloudformation.yaml` is unchanged apart from its default image; there is no IAM change, and the sink plugin is unchanged (v54), so no CDC infrastructure redeploy is needed. Finish or stop running jobs first: the task replacement ends them.
+- **Nothing to migrate, and going back to v0.1.579 is safe.** This version reads and writes the same Full Load records and saved sessions as v0.1.579 and accepts the same settings.
+
 ## v0.1.579
 
 On the single EC2 host, the startup script no longer writes the UI's cookie-signing secret to a log every local user could read, and the state volume is named by its file-system UUID, which a device rename at boot cannot break; a host launched from an earlier template needs the deployment guide's new steps by hand. CDC refuses up front the table names it cannot stream (v0.1.578's Known issue), Evaluation reports the tables and views of a database or schema whose name holds a `.`, and the ECS Fargate app stack accepts a 32 vCPU task.

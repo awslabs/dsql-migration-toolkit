@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.580
+
+Fargate の性能測定スクリプトはソースのパスワードをタスクに送らなくなり、単一 EC2 ホストのガイドのシークレットのローテーションは新しいシークレットをどのコマンドラインにも載せなくなり、*Table names CDC cannot stream* の拒否は、名前に `.` を含むデータベースやスキーマのテーブルに Full load only でのコピーを勧めなくなりました。
+
+### セキュリティ
+
+- **`deploy/run_measure_on_fargate.sh` はソースのパスワードを測定タスクに送らなくなりました。** このスクリプトは `DB_PASSWORD` をコマンドラインに載せていたため、実行中にほかのローカルユーザーが `ps` で読めました。また、タスクの RunTask のオーバーライドにも入れていたため、タスクを参照できる人なら誰でも読めました。いまはタスクがソースの認証情報を Secrets Manager から自分で読みます: `DB_SECRET_ID` に、アプリのタスクロールが読める RDS 形式のシークレット (`username`、`password`)、たとえば `mysql-dsql-migrator/cdc/*` のシークレットを指定してください。未設定ならスタックの `SourceSecretArn` が使われ、どちらもなければ、スクリプトはタスクを開始する前にエラーで止まります。`DB_USER` の既定はシークレットのユーザー名になりました。`scripts/measure_performance.py` も `DB_PASSWORD` がなければ同じように `DB_SECRET_ID` を読むため、`.env` によるローカル実行は変わりません。以前のバージョンに渡したパスワードはそのタスクのオーバーライドとシェルの履歴に残っているので、どちらかが共有されていたならパスワードを変えてください。新しいコマンドは [第 12 章](docs/manual/ja/12-performance-test-results.md#測定の再現) にあります。
+- **単一 EC2 ホストのガイドの自分のマシンでのシークレットのローテーションは、新しい cookie 署名シークレットを `aws secretsmanager put-secret-value --secret-string file:///dev/stdin` にパイプで渡すようになりました。** v0.1.579 のコマンドはその値を put-secret-value のコマンドラインに載せていたため、実行中にそのマシンのほかのプログラム (Linux では `ps` で、すべてのローカルユーザーのもの) が読めました。自分だけが使うマシンや AWS CloudShell でローテーションしたなら、ほかのユーザーには露出していません。共有のマシンでローテーションしたなら、新しいコマンドでもう一度ローテーションしてください ([デプロイガイド](deploy/DEPLOYMENT.ja.md#3-デプロイ)、英語・韓国語・日本語)。ホスト側のコマンドは変わりません。
+
+### 修正
+
+- **Full load + CDC のロード前の警告と *Table names CDC cannot stream* の拒否は、名前に `.` を含むデータベースやスキーマのテーブルに、Full load only でのコピーやロード後に選択を外す経路を勧めなくなりました。** そのようなテーブルはどのステップでもサポートされません (v0.1.579 の既知の問題の最後の文)。修飾名だけでは、そのようなテーブルとテーブル名の中に `.` を含むテーブルを区別できないため、拒否された名前に `.` が 2 つ以上あれば、拒否の文言は対処の前に一度だけ次を加えます: *A '.' inside a database or schema name is not supported at any step, so a table of such a database or schema cannot be copied in a Full load only migration either (Evaluation reports it Unsupported, DOTTED_SCHEMA_NAME): rename that database or schema at the source, or leave its tables out of the migration.* 警告の経路はいま *The Full Load can still load such a table (not one with a '.' inside its database or schema name)* と読み、マニュアルの [§6.2](docs/manual/ja/06-limitations.md#62-移行プロセスの制限) はその例外を経路より先に示します。変わったのは文言だけで、Deploy、Start、コネクタ、テンプレートの動作は変わりません。
+
+### アップグレードの注意
+
+- **アプリスタック: イメージのみの更新で十分です。** `deploy/cloudformation.yaml` は既定のイメージ以外は変わらず、IAM の変更もありません。シンクプラグインも変わらない (v54) ため、CDC インフラの再デプロイは不要です。実行中のジョブは先に終えるか止めてください: タスクの置き換えでジョブは終了します。
+- **移行すべきものはなく、v0.1.579 に戻しても安全です。** このバージョンは v0.1.579 と同じ Full Load の記録と保存済みセッションを読み書きし、同じ設定を受け付けます。
+
 ## v0.1.579
 
 単一の EC2 ホストでは、起動スクリプトが UI のクッキー署名シークレットを、ローカルユーザーなら誰でも読めたログに書き込まなくなり、状態ボリュームを、起動時のデバイス名の変更で壊れることのないファイルシステムの UUID で指定するようになりました。以前のテンプレートで起動したホストでは、デプロイガイドの新しい手順を手作業で行う必要があります。CDC はストリーミングできないテーブル名を事前に拒否するようになり (v0.1.578 の既知の問題)、Evaluation は名前に `.` を含むデータベースまたはスキーマのテーブルとビューを報告し、ECS Fargate のアプリスタックは 32 vCPU のタスクを受け付けるようになりました。

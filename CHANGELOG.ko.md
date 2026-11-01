@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.580
+
+Fargate 성능 측정 스크립트가 더 이상 소스 비밀번호를 태스크에 보내지 않고, 단일 EC2 호스트 가이드의 시크릿 교체는 새 시크릿을 어떤 명령줄에도 올리지 않으며, *Table names CDC cannot stream* 거부는 이름에 `.`이 들어간 데이터베이스나 스키마의 테이블에 더 이상 Full load only 복사를 권하지 않습니다.
+
+### 보안
+
+- **`deploy/run_measure_on_fargate.sh`가 더 이상 소스 비밀번호를 측정 태스크에 보내지 않습니다.** 이 스크립트는 `DB_PASSWORD`를 명령줄에 올려 실행 중에 다른 로컬 사용자가 `ps`로 읽을 수 있었고, 태스크의 RunTask 오버라이드에도 넣어 태스크를 조회할 수 있는 누구나 읽을 수 있었습니다. 이제 태스크가 소스 자격 증명을 Secrets Manager에서 직접 읽습니다: `DB_SECRET_ID`를 앱의 태스크 역할이 읽을 수 있는 RDS 형식 시크릿(`username`, `password`), 예를 들어 `mysql-dsql-migrator/cdc/*` 시크릿으로 지정하세요. 지정하지 않으면 스택의 `SourceSecretArn`이 쓰이고, 둘 다 없으면 스크립트는 태스크를 시작하기 전에 오류로 멈춥니다. `DB_USER`의 기본값은 이제 시크릿의 사용자 이름입니다. `scripts/measure_performance.py`도 `DB_PASSWORD`가 없으면 같은 방식으로 `DB_SECRET_ID`를 읽으므로, `.env`로 하는 로컬 실행은 그대로입니다. 이전 버전에 넘긴 비밀번호는 그 태스크의 오버라이드와 셸 히스토리에 남아 있으니, 둘 중 하나라도 공유되었다면 비밀번호를 바꾸세요. 새 명령은 [12장](docs/manual/ko/12-performance-test-results.md#측정-재현)에 있습니다.
+- **단일 EC2 호스트 가이드의 내 PC 시크릿 교체가 새 쿠키 서명 시크릿을 `aws secretsmanager put-secret-value --secret-string file:///dev/stdin`으로 파이프합니다.** v0.1.579의 명령은 그 값을 put-secret-value의 명령줄에 올려, 실행 중에 그 PC의 다른 프로그램(Linux에서는 `ps`로 모든 로컬 사용자의 것)이 읽을 수 있었습니다. 혼자 쓰는 PC나 AWS CloudShell에서 교체했다면 다른 사용자에게 노출되지 않았고, 공유 PC에서 교체했다면 새 명령으로 다시 교체하세요([배포 가이드](deploy/DEPLOYMENT.ko.md#3-배포), 영어·한국어·일본어). 호스트 쪽 명령은 그대로입니다.
+
+### 수정
+
+- **Full load + CDC 로드 전의 경고와 *Table names CDC cannot stream* 거부가, 이름에 `.`이 들어간 데이터베이스나 스키마의 테이블에 더 이상 Full load only 복사나 로드 후 선택 해제 경로를 권하지 않습니다.** 그런 테이블은 어느 단계도 지원하지 않습니다(v0.1.579 알려진 문제의 마지막 문장). 정규화된 이름만으로는 그런 테이블과 테이블 이름 안에 `.`이 있는 테이블을 구분할 수 없으므로, 거부된 이름에 `.`이 두 개 이상 있으면 거부 문구가 조치 앞에 한 번 다음을 덧붙입니다: *A '.' inside a database or schema name is not supported at any step, so a table of such a database or schema cannot be copied in a Full load only migration either (Evaluation reports it Unsupported, DOTTED_SCHEMA_NAME): rename that database or schema at the source, or leave its tables out of the migration.* 경고의 경로는 이제 *The Full Load can still load such a table (not one with a '.' inside its database or schema name)*로 읽히고, 매뉴얼 [§6.2](docs/manual/ko/06-limitations.md#62-마이그레이션-프로세스-한계)는 그 예외를 경로보다 먼저 밝힙니다. 바뀐 것은 문구뿐이며 Deploy, Start, 커넥터, 템플릿 동작은 그대로입니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 기본 이미지 말고는 그대로이고 IAM 변경은 없으며, 싱크 플러그인도 그대로(v54)라 CDC 인프라 재배포가 필요 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **따로 옮길 것이 없고, v0.1.579로 되돌리는 것도 안전합니다.** 이 버전은 v0.1.579와 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받습니다.
+
 ## v0.1.579
 
 단일 EC2 호스트에서 시작 스크립트가 더 이상 UI의 쿠키 서명 시크릿을 모든 로컬 사용자가 읽을 수 있는 로그에 쓰지 않으며, 상태 볼륨은 부팅 때 장치 이름이 바뀌어도 깨지지 않는 파일 시스템 UUID로 지정됩니다. 이전 템플릿으로 시작한 호스트에서는 배포 가이드의 새 절차를 직접 실행해야 합니다. CDC는 스트리밍할 수 없는 테이블 이름을 미리 거부하고(v0.1.578의 알려진 문제), Evaluation은 이름에 `.`이 들어간 데이터베이스나 스키마의 테이블과 뷰를 보고하며, ECS Fargate 앱 스택은 32 vCPU 태스크를 받아들입니다.
