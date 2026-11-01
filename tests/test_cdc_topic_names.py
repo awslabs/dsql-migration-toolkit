@@ -38,7 +38,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from dsql_migrator.core import cdc_deployer
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_TOPIC_PREFIX,
@@ -716,14 +715,15 @@ def test_the_deploy_click_refuses_before_any_read(monkeypatch) -> None:
     assert calls == []  # not even the source's row estimates
 
 
-def test_without_the_check_the_deploy_click_reads_the_source(monkeypatch) -> None:
-    from dsql_migrator.ui.data_migration import _cdc_ui
-
+def test_the_same_click_with_names_cdc_can_stream_goes_on_to_the_reads(monkeypatch) -> None:
+    # Guards the guard: with names CDC can stream, the click reads the source's row estimates
+    # and goes on to an AWS call, which the fake fails, so the refused click's empty record is
+    # the refusal's doing.
     calls = _fake_nicegui(monkeypatch, None)
-    monkeypatch.setattr(_cdc_ui, "cdc_topic_name_refusal", lambda names: None)
+    legal = ["shop.orders", "shop.items"]
     with pytest.raises(AssertionError, match="no AWS call may run before the refusal"):
-        _click_deploy(_deploy_ready(_NAMES), _inventory(_NAMES))
-    assert calls[0] is _cdc_ui._estimate_cdc_table_rows
+        _click_deploy(_deploy_ready(legal), _inventory(legal))
+    assert len(calls) == 2, calls  # the row estimates, then the AWS call
 
 
 def test_the_start_section_holds_start_with_the_refusal(monkeypatch) -> None:
@@ -859,7 +859,7 @@ def test_a_pipeline_that_streamed_with_a_dot_in_a_name_is_refused_at_its_next_st
     assert submitted == []
 
 
-def test_without_the_check_start_cdc_builds_the_connector_config(monkeypatch) -> None:
+def test_start_cdc_builds_the_connector_config_only_for_names_it_can_stream(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _cdc_ui
 
     class _Reached(Exception):
@@ -872,9 +872,10 @@ def test_without_the_check_start_cdc_builds_the_connector_config(monkeypatch) ->
     jobs = _Jobs({"job-1": _loaded(_NAMES, _counts(_NAMES))})
     hits, _submitted = _start_click(monkeypatch, _loaded_state(_NAMES), jobs, _NAMES)
     assert len(hits) == 1  # refused before the config is built
-    monkeypatch.setattr(_cdc_ui, "cdc_topic_name_refusal", lambda names: None)
+    legal = ["shop.orders", "shop.items"]  # guards the guard: these reach it
+    jobs = _Jobs({"job-1": _loaded(legal, _counts(legal))})
     with pytest.raises(_Reached):
-        _start_click(monkeypatch, _loaded_state(_NAMES), jobs, _NAMES)
+        _start_click(monkeypatch, _loaded_state(legal), jobs, legal)
 
 
 def test_the_table_cap_speaks_first_when_both_apply(monkeypatch) -> None:
@@ -982,14 +983,16 @@ def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, runnin
     assert handle.job.error_count == 1
 
 
-def test_without_the_core_check_start_sends_the_bad_topics(monkeypatch) -> None:
-    monkeypatch.setattr(cdc_deployer, "topic_name_refusal", lambda filled: None)
+def test_names_cdc_can_stream_reach_the_stack_update() -> None:
+    # Guards the guard: names CDC can stream go on to submit_update, their topics in SinkTopics,
+    # so the backstops above see no update because they refuse.
+    legal = ["shop.orders", "shop.items"]
     deployer = _FakeDeployer(
         connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]}
     )
-    _start_with(_start("mysql", _NAMES), deployer)
+    _start_with(_start("mysql", legal), deployer)
     assert "submit_update" in deployer.calls
-    assert dict(deployer.updates[0])["SinkTopics"] == "dsqlcdc.shop.orders,dsqlcdc.shop.a b"
+    assert dict(deployer.updates[0])["SinkTopics"] == "dsqlcdc.shop.orders,dsqlcdc.shop.items"
 
 
 # ---------------------------------------------------------------------------

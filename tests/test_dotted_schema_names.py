@@ -52,7 +52,6 @@ from dsql_migrator.ui.evaluation import EvaluationInputs, run_evaluation, with_r
 from tests.test_introspector import (
     _FakeInspector,
     _NonMysqlConnection,
-    _source_config,
     _sqlite_factory,
 )
 
@@ -118,22 +117,17 @@ def test_the_catalog_read_records_each_dotted_database_or_schema_holding_a_table
     assert dotted == ["my.app"]
 
 
-def test_introspect_keeps_the_dotted_names_of_its_own_read_for_evaluation(monkeypatch) -> None:
-    import dsql_migrator.core.introspector as introspector_module
-
-    found = [["my.db"], []]
-
-    def _fake_assemble(inspector, connection, database, **kwargs):  # noqa: ANN001, ANN003
-        kwargs["dotted_out"].extend(found.pop(0))
-        return SourceInventory()
-
-    monkeypatch.setattr(introspector_module, "_assemble_inventory", _fake_assemble)
-    introspector = SourceIntrospector(engine_factory=_sqlite_factory())
+def test_introspect_keeps_the_dotted_names_of_its_own_read_for_evaluation() -> None:
+    # The real catalog read, one database selected on Connect (SQLite stands in for the
+    # source, a fresh copy of its tables on every read).
+    introspector = SourceIntrospector(engine_factory=lambda conn: _sqlite_factory()(conn))
     assert introspector.last_dotted_schemas == []
-    introspector.introspect(_source_config())
+    inventory = introspector.introspect(SourceConnectionConfig(host="db", database="my.db"))
+    assert "my.db.orders" in {table.name for table in inventory.tables}
     assert introspector.last_dotted_schemas == ["my.db"]
     # The next read starts afresh: a database renamed meanwhile is no longer named.
-    introspector.introspect(_source_config())
+    inventory = introspector.introspect(SourceConnectionConfig(host="db", database="my_db"))
+    assert "my_db.orders" in {table.name for table in inventory.tables}
     assert introspector.last_dotted_schemas == []
 
 

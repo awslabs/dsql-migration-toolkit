@@ -611,14 +611,17 @@ def test_iam_sasl_args_shape_and_token(rec) -> None:
 # --------------------------------------------------------------------------- #
 # Missing-extra behavior: a clear CdcSeedError, not a bare ImportError
 # --------------------------------------------------------------------------- #
-def test_missing_extra_raises_cdcseederror(monkeypatch) -> None:
-    # Simulate the extra not installed: make the lazy kafka import fail.
+def _without_the_extra(monkeypatch) -> list:
+    """Make the lazy kafka and signer imports fail, as without the cdc-external extra.
+    Returns the names whose import was refused, one per attempt to import the client."""
     import builtins
 
     real_import = builtins.__import__
+    refused: list = []
 
     def _blocked(name, *a, **k):
         if name == "kafka" or name.startswith("kafka.") or name == "aws_msk_iam_sasl_signer":
+            refused.append(name)
             raise ImportError("no kafka")
         return real_import(name, *a, **k)
 
@@ -626,6 +629,12 @@ def test_missing_extra_raises_cdcseederror(monkeypatch) -> None:
         monkeypatch.delitem(sys.modules, mod, raising=False)
     monkeypatch.delitem(sys.modules, "aws_msk_iam_sasl_signer", raising=False)
     monkeypatch.setattr(builtins, "__import__", _blocked)
+    return refused
+
+
+def test_missing_extra_raises_cdcseederror(monkeypatch) -> None:
+    # Simulate the extra not installed: make the lazy kafka import fail.
+    _without_the_extra(monkeypatch)
     with pytest.raises(CdcSeedError, match="cdc-external"):
         cdc_kafka_seed.ensure_topics("boot", "us-east-1", [TopicSpec("t", 1)])
 
@@ -813,19 +822,13 @@ def test_the_broker_wait_re_raises_a_seed_error_at_once() -> None:
 
 
 def test_a_missing_extra_fails_the_seed_at_once(monkeypatch) -> None:
-    """The missing-extra error is raised inside the retried step (by _import_kafka, or by
-    iam_sasl_args for the signer); the wait no longer spends two minutes on it and then
-    buries it under a message about the path."""
-    calls: list = []
-
-    def _missing():
-        calls.append(1)
-        raise CdcSeedError(cdc_kafka_seed._MISSING_EXTRA_MSG)
-
-    monkeypatch.setattr(cdc_kafka_seed, "_import_kafka", _missing)
+    """The missing-extra error is raised inside the retried step (by the lazy kafka import,
+    or by the signer's); the wait no longer spends two minutes on it and then buries it
+    under a message about the path."""
+    refused = _without_the_extra(monkeypatch)
     slept: list = []
     logs: list = []
-    with pytest.raises(CdcSeedError) as excinfo:
+    with pytest.raises(CdcSeedError, match="cdc-external"):
         seed_kafka_prep(
             bootstrap="boot:9098", region="us-east-1",
             offset_topic="stack-debezium-source-offsets",
@@ -833,8 +836,7 @@ def test_a_missing_extra_fails_the_seed_at_once(monkeypatch) -> None:
             connector_name="stack-debezium-source", topic_prefix="dsqlcdc",
             watermark=None, sleep=slept.append, log=logs.append,
         )
-    assert str(excinfo.value) == cdc_kafka_seed._MISSING_EXTRA_MSG
-    assert calls == [1]
+    assert refused == ["kafka"]  # one attempt to import the client: no wait
     assert slept == [] and logs == []
 
 

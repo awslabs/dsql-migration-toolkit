@@ -1178,9 +1178,17 @@ the in-process seed), then starts the service. Progress is in
 >   `SourceSecretArn` and `DsqlClusterArn` are lines of that file
 >   (`DSQL_MIGRATOR_APP_PORT`, `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`, `BEDROCK_MODEL_ID`,
 >   `BEDROCK_REGION`, `DSQL_MIGRATOR_SOURCE_SECRET_ARN`, `DSQL_MIGRATOR_DSQL_CLUSTER_ARN`).
->   After the stack update, open an SSM session to the host, change the line with
->   `sudoedit /etc/dsql-migrator.env` (the file also holds the app's cookie-signing
->   secret, so do not print it), then run `sudo systemctl restart dsql-migrator`.
+>   After the stack update, open an SSM session to the host and replace the line without
+>   opening the file, which also holds the app's cookie-signing secret: an editor or `cat`
+>   would show the secret on screen, and so in the session log if Session Manager keeps
+>   one. Then restart the app. For `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`, for example:
+>
+>   ```bash
+>   sudo sed -i '/^DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=/d' /etc/dsql-migrator.env
+>   echo 'DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=true' | sudo tee -a /etc/dsql-migrator.env >/dev/null
+>   sudo systemctl restart dsql-migrator
+>   ```
+>
 > - `SourceMode`, `SourceS3Uri`, `SourceRepoUrl` and `SourceRepoRef` are read at first
 >   boot only: changing them later changes nothing on the host.
 >

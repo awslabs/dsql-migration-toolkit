@@ -1083,9 +1083,17 @@ aws cloudformation deploy \
 >   `SourceSecretArn`, `DsqlClusterArn`은 그 파일의 줄입니다(`DSQL_MIGRATOR_APP_PORT`,
 >   `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`, `BEDROCK_MODEL_ID`, `BEDROCK_REGION`,
 >   `DSQL_MIGRATOR_SOURCE_SECRET_ARN`, `DSQL_MIGRATOR_DSQL_CLUSTER_ARN`). 스택 업데이트 후
->   호스트에 SSM 세션을 열어 `sudoedit /etc/dsql-migrator.env`로 그 줄을 고치고(이 파일에는 앱의
->   쿠키 서명 시크릿도 들어 있으니 내용을 출력하지 마세요), `sudo systemctl restart dsql-migrator`를
->   실행하세요.
+>   호스트에 SSM 세션을 열어 파일을 열지 말고 그 줄을 바꾸세요. 이 파일에는 앱의 쿠키 서명 시크릿도
+>   들어 있어서, 편집기나 `cat`으로 열면 시크릿이 화면에 나오고, Session Manager가 세션 로그를
+>   남긴다면 로그에도 남습니다. 그런 다음 앱을 재시작하세요. 예를 들어
+>   `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`이라면:
+>
+>   ```bash
+>   sudo sed -i '/^DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=/d' /etc/dsql-migrator.env
+>   echo 'DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=true' | sudo tee -a /etc/dsql-migrator.env >/dev/null
+>   sudo systemctl restart dsql-migrator
+>   ```
+>
 > - `SourceMode`, `SourceS3Uri`, `SourceRepoUrl`, `SourceRepoRef`는 첫 부팅 때만 읽습니다: 나중에
 >   바꿔도 호스트에서는 아무것도 바뀌지 않습니다.
 >

@@ -1167,9 +1167,17 @@ aws cloudformation deploy \
 >   `SourceSecretArn`、`DsqlClusterArn` はこのファイルの行です（`DSQL_MIGRATOR_APP_PORT`、
 >   `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT`、`BEDROCK_MODEL_ID`、`BEDROCK_REGION`、
 >   `DSQL_MIGRATOR_SOURCE_SECRET_ARN`、`DSQL_MIGRATOR_DSQL_CLUSTER_ARN`）。
->   スタック更新の後、ホストへの SSM セッションを開き、`sudoedit /etc/dsql-migrator.env` でその行を変更してから
->   （このファイルにはアプリのクッキー署名シークレットも入っているので、中身を表示しないでください）、
->   `sudo systemctl restart dsql-migrator` を実行してください。
+>   スタック更新の後、ホストへの SSM セッションを開き、ファイルを開かずにその行を置き換えてください。
+>   このファイルにはアプリのクッキー署名シークレットも入っているため、エディタや `cat` で開くと
+>   シークレットが画面に表示され、Session Manager がセッションログを残していればログにも残ります。
+>   その後、アプリを再起動してください。たとえば `DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT` なら:
+>
+>   ```bash
+>   sudo sed -i '/^DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=/d' /etc/dsql-migrator.env
+>   echo 'DSQL_MIGRATOR_ACTIVITY_LOG_STDOUT=true' | sudo tee -a /etc/dsql-migrator.env >/dev/null
+>   sudo systemctl restart dsql-migrator
+>   ```
+>
 > - `SourceMode`、`SourceS3Uri`、`SourceRepoUrl`、`SourceRepoRef` は初回起動時にしか読まれません:
 >   後から変えても、ホスト上では何も変わりません。
 >

@@ -42,6 +42,10 @@ Settings dialog do (follow-ups of the v0.1.577 review).
   change from one boot to the next, and the app did not wait for the volume. The fixed
   script names it by its file-system UUID and the app's unit requires the mount; it runs on
   a new host only, so the guide says how to do both on an earlier host.
+* To apply a parameter a stack update leaves unapplied, the guide had the operator change
+  its line of ``/etc/dsql-migrator.env`` with ``sudoedit``, which shows the file's
+  cookie-signing secret on screen (and so in a Session Manager session log). It now replaces
+  the line without opening the file, as the secret's own rotation does.
 
 Fact pins: the Fargate pairs are AWS's table (below), the knobs come from the Settings
 registry (``config.TUNABLE_KNOBS``) and the bound of *Tables in parallel* from
@@ -432,12 +436,29 @@ def test_the_ec2_guide_says_the_host_takes_its_settings_and_code_at_first_boot_o
     for name in on_update:
         assert name in parameters and name not in substituted, (lang, name)
     flat = _flat(lang, callout)
-    for command in (
-        "`sudoedit /etc/dsql-migrator.env`",
-        "`sudo systemctl restart dsql-migrator`",
-        "`sudo xfs_growfs /var/lib/dsql-migrator`",
-    ):
-        assert _flat(lang, command) in flat, (lang, command)
+    # The file also holds the cookie-signing secret, so its line is replaced without opening
+    # the file: an editor (the callout said sudoedit) or cat shows the secret on screen, and
+    # so in the session log where Session Manager keeps one. The old line goes, the new one
+    # is appended silently (tee alone echoes it), then the app restarts to read it.
+    (variable,) = re.findall(r"(?m)^\s*sudo sed -i '/\^(\w+)=/d' /etc/dsql-migrator\.env$", callout)
+    assert variable in env_pairs.values(), (lang, variable)
+    steps = [
+        f"sudo sed -i '/^{variable}=/d' /etc/dsql-migrator.env",
+        "| sudo tee -a /etc/dsql-migrator.env >/dev/null",
+        "sudo systemctl restart dsql-migrator",
+    ]
+    at = [flat.find(_flat(lang, step)) for step in steps]
+    assert -1 not in at and at == sorted(at), (lang, at)
+    assert _flat(lang, f"echo '{variable}=") in flat[at[0] : at[1]], lang
+    assert _flat(lang, "`sudo xfs_growfs /var/lib/dsql-migrator`") in flat, lang
+    # Nowhere in the EC2 guide's sections 2 and 3 is the file opened or printed.
+    text = (DEPLOY / _DEPLOYMENT[lang]).read_text(encoding="utf-8")
+    start = text.index(f"\n{_EC2_PARAMETERS[lang]}\n")
+    part = _flat(lang, text[start : text.index("\n### 4", start)])
+    for shows in ("sudoedit", "cat /etc/dsql-migrator.env"):
+        assert _flat(lang, shows) not in part, (lang, shows)
+    tee = _flat(lang, "| sudo tee -a /etc/dsql-migrator.env")
+    assert part.count(tee) == part.count(_flat(lang, f"{tee} >/dev/null")) == 2, lang
 
 
 # Where the EC2 guide says the startup log is root-only, and when to rotate the secret.
