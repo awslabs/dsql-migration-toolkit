@@ -202,7 +202,7 @@ def test_a_first_start_sends_exact_capture(discovery) -> None:
 @pytest.mark.parametrize(
     "discovery, running",
     [
-        # Stopped (Stop keeps DeploySink), started by 0.1.579 (no such parameter) ...
+        # Stopped (Stop keeps DeploySink), started by 0.1.580 or earlier (no such parameter) ...
         ({"DeploySink": "true", "MskBootstrapServers": ""}, False),
         # ... or by this version, which kept it either way.
         ({"DeploySink": "true", "MskBootstrapServers": "", "ExactTableIncludeList": "false"}, False),
@@ -285,15 +285,15 @@ def test_without_the_bundled_template_only_a_stack_that_declares_it_gets_it() ->
 
 _DOC_HEADLINE = {
     "en": (
-        "**A CDC stack first started by version 0.1.579 or earlier also captures each table "
+        "**A CDC stack first started by version 0.1.580 or earlier also captures each table "
         "whose name differs from a selected one only in letter case.**"
     ),
     "ko": (
-        "**버전 0.1.579 이하가 처음 시작한 CDC 스택은 선택한 테이블과 이름이 대소문자만 다른 "
+        "**버전 0.1.580 이하가 처음 시작한 CDC 스택은 선택한 테이블과 이름이 대소문자만 다른 "
         "테이블도 캡처함.**"
     ),
     "ja": (
-        "**バージョン 0.1.579 以前が最初に開始した CDC スタックは、選択したテーブルと名前が"
+        "**バージョン 0.1.580 以前が最初に開始した CDC スタックは、選択したテーブルと名前が"
         "大文字小文字だけ異なるテーブルもキャプチャします。**"
     ),
 }
@@ -310,7 +310,7 @@ def test_the_manual_names_the_stacks_that_capture_a_case_twin(lang) -> None:
     bullet = part[start:part.index(_flat(lang, "\n- **"), start)]
     # The twin in another MySQL database, and the PostgreSQL routes it is limited to.
     for phrase in (
-        "`lower_case_table_names`", "`shop.Users`", "`SHOP.users`", "0.1.579",
+        "`lower_case_table_names`", "`shop.Users`", "`SHOP.users`", "0.1.580",
         "**Re-snapshot every table instead**",
     ):
         assert _flat(lang, phrase) in bullet, (lang, phrase)

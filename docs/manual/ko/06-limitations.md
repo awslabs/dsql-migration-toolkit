@@ -137,7 +137,7 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
   경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백됩니다. 그 토픽이 없는 클러스터를
   얻으려면 Delete CDC infrastructure 후 다시 배포하세요.
 
-- **버전 0.1.579 이하가 처음 시작한 CDC 스택은 선택한 테이블과 이름이 대소문자만 다른 테이블도
+- **버전 0.1.580 이하가 처음 시작한 CDC 스택은 선택한 테이블과 이름이 대소문자만 다른 테이블도
   캡처함.** 그런 스택은 선택한 이름을 대소문자를 구분하지 않고 맞추므로, `shop.users`를 선택하면
   `shop.Users`도 캡처하고 그 테이블의 변경을 싱크가 읽지 않는 별도의 Kafka 토픽으로 보냅니다.
   MySQL에서는 `lower_case_table_names`가 0일 때 그렇게 되며, 그 테이블은 이름이 대소문자만 다른

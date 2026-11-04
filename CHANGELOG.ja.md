@@ -5,6 +5,24 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.581
+
+最初の Start CDC をこのバージョンで実行する CDC スタックは、大文字小文字も区別して、選択したテーブルだけを正確にキャプチャします。以前のバージョンが開始したスタックは、Delete CDC infrastructure するまで、選択した `shop.users` と並ぶ `shop.Users` のように、名前が大文字小文字だけ異なる選択していないテーブルもキャプチャします。また、このバージョンがデプロイまたは開始した CDC スタックは、以前のバージョンでは開始できません: アップグレードの注意を読んでください。
+
+### 修正
+
+- **最初の Start CDC をこのバージョンで実行する CDC スタック (以前のバージョンがデプロイしたものの一度も開始していないスタックを含む) では、CDC は大文字小文字も区別して、選択したテーブルだけを正確にキャプチャするようになりました。** Debezium は `table.include.list` の各エントリを ASCII の大文字小文字を区別せずに照合するため、`shop.users` をキャプチャすると、選択していない `shop.Users` もキャプチャしていました。MySQL で `lower_case_table_names` が 0 の場合 (そのテーブルは、名前が大文字小文字だけ異なるデータベースの `SHOP.users` であることもあります)、その変更はシンクが読まない専用の Kafka トピックに送られていました (MSK Serverless は既定でトピックのレコードを 7 日間保持します)。PostgreSQL では、ソースコネクタがテーブルのスナップショットを自分で取る場合 (CDC only、Full load only の後の CDC、または **Re-snapshot every table instead**) に、引用符で囲んだ大文字小文字混在の名前のそのようなテーブルがキャプチャされていました: コネクタはそのテーブルのすべての行も読み、そのテーブルを publication に追加していました (後から作成したテーブルは、コネクタが次に再起動したとき)。そのテーブルに replica identity がない間、ソースのアプリケーションによるそのテーブルへの `UPDATE` と `DELETE` は失敗し、コネクタのデータベースユーザーがそのテーブルの所有者でなければ、代わりにソースコネクタが失敗していました。この以前のキャプチャは、同梱の Debezium 2.7.4 のコードから読み取ったもので、ライブでは確認していません。cdc-stack テンプレートに新しいパラメータ `ExactTableIncludeList` (既定は `false`) が加わり、`true` のとき各エントリの先頭に `(?-i)` を付けます。Start CDC はこれを、一度も開始していないスタックでだけ `true` に設定し、そのとき Start CDC のログは *The source connector captures exactly the selected tables, letter case included (ExactTableIncludeList): this stack has not been started before.* と示します。このバージョンが最初に開始した CDC スタックで、`lower_case_table_names` が 0 の Aurora MySQL 3 からと、CDC only の Aurora PostgreSQL 17 から、ECS Fargate 上で検証しました: Debezium は、選択したテーブルと名前が大文字小文字だけ異なる、選択していないテーブルをキャプチャせず、Kafka はそのテーブルのレコードを受け取らず、選択したテーブルはソースと一致しました。PostgreSQL では publication は選択したテーブルだけを保持し、主キーのないその大文字小文字違いのテーブルは、CDC のストリーミング中も `UPDATE` と `DELETE` を受け付け続けました。以前のバージョンが開始したスタックは以前の照合のままです: アップグレードの注意を参照してください。
+
+### ドキュメント
+
+- **マニュアルの [§6.2](docs/manual/ja/06-limitations.md#62-移行プロセスの制限) が、選択したテーブルと名前が大文字小文字だけ異なるテーブルもキャプチャするのはどの CDC スタックかを説明するようになりました。** それが MySQL と PostgreSQL で何を引き起こすか、そしてそのようなスタックは Delete CDC infrastructure するまでその動作を続けることも示します。英語・韓国語・日本語のいずれも同様です。
+
+### アップグレードの注意
+
+- **アプリスタック: イメージのみの更新で十分です。** `deploy/cloudformation.yaml` は既定のイメージ以外は変わらず、IAM の変更もありません。シンクプラグインも変わりません (v54)。cdc-stack テンプレートはイメージに含まれていて Start CDC がそれを送るため、CDC インフラの再デプロイは不要です。実行中のジョブは先に終えるか止めてください: タスクの置き換えでジョブは終了します。
+- **以前のバージョンが開始した CDC スタックは、Delete CDC infrastructure するまで、選択した名前を大文字小文字を区別せずに照合し続けます。** 実行中のコネクタは更新されず、Stop CDC、Start CDC、Retry CDC もその照合を維持します。これが問題になるのは、選択していないテーブルの名前が、選択したテーブルの名前と大文字小文字だけ異なる場合だけです (MySQL では `lower_case_table_names` が 0 のとき、PostgreSQL ではソースコネクタがテーブルのスナップショットを自分で取る経路): PostgreSQL では、それまでの間、そのようなテーブルに主キーか `REPLICA IDENTITY FULL` を与えてください。Delete CDC infrastructure の後にもう一度デプロイしたスタックは正確にキャプチャしますが、古いスタックを削除すると、そのストリームの位置も削除されます ([§13.7](docs/manual/ja/13-excluding-tables-and-columns.md#137-後から除外設定を変更する) の「削除後に再び CDC を開始する」を参照)。
+- **移行すべきものはなく、v0.1.580 に戻しても安全なのは、このバージョンがデプロイも開始もしていない CDC スタックだけです。** このバージョンの Deploy CDC infrastructure と Start CDC は、スタックに `ExactTableIncludeList` パラメータを与えますが、v0.1.580 以前のテンプレートはこのパラメータを宣言していないため、それらのバージョンからの Start CDC や Retry CDC はスタックの更新に失敗します (Stop CDC と Delete CDC infrastructure は引き続き動作します)。それ以外では、このバージョンは v0.1.580 と同じ Full Load の記録と保存済みのセッションを読み書きし、同じ設定を受け付けるため、どちらのバージョンも、もう一方が書き込んだものを読めます。
+
 ## v0.1.580
 
 Fargate の性能測定スクリプトはソースのパスワードをタスクに送らなくなり、単一 EC2 ホストのガイドのシークレットのローテーションは新しいシークレットをどのコマンドラインにも載せなくなり、*Table names CDC cannot stream* の拒否は、名前に `.` を含むデータベースやスキーマのテーブルに Full load only でのコピーを勧めなくなりました。

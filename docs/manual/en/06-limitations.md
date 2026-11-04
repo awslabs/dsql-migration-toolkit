@@ -147,7 +147,7 @@ it.
   path (MySQL on ECS Fargate or run locally). Delete CDC infrastructure and deploy it
   again to get a cluster without that topic.
 
-- **A CDC stack first started by version 0.1.579 or earlier also captures each table whose
+- **A CDC stack first started by version 0.1.580 or earlier also captures each table whose
   name differs from a selected one only in letter case.** It matches each selected name
   ignoring letter case, so with `shop.users` selected it also captures `shop.Users` and
   sends that table's changes to a Kafka topic of their own, which the sink never reads. On

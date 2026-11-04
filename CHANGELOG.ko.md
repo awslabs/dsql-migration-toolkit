@@ -5,6 +5,24 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.581
+
+첫 Start CDC를 이 버전에서 실행한 CDC 스택은 선택한 테이블만 대소문자까지 정확히 캡처합니다. 이전 버전이 시작한 스택은 Delete CDC infrastructure 전까지, 선택한 `shop.users` 옆의 `shop.Users`처럼 이름이 대소문자만 다른, 선택하지 않은 테이블도 캡처하며, 이 버전이 배포했거나 시작한 CDC 스택은 이전 버전이 시작할 수 없습니다: 업그레이드 참고를 읽어 보세요.
+
+### 수정
+
+- **첫 Start CDC를 이 버전에서 실행하는 CDC 스택에서는, 이전 버전이 배포했지만 한 번도 시작하지 않은 스택을 포함해, CDC가 선택한 테이블만 대소문자까지 정확히 캡처합니다.** Debezium은 `table.include.list`의 각 항목을 ASCII 대소문자를 구분하지 않고 맞추므로, `shop.users`를 캡처하면 선택하지 않은 `shop.Users`도 캡처했습니다. `lower_case_table_names`가 0인 MySQL에서는(그런 테이블은 이름이 대소문자만 다른 데이터베이스에 있는 `SHOP.users`일 수도 있습니다) 그 테이블의 변경이 싱크가 읽지 않는 별도의 Kafka 토픽으로 갔습니다(MSK Serverless는 토픽의 레코드를 기본 7일 동안 보관합니다). PostgreSQL에서는 소스 커넥터가 테이블을 직접 스냅샷하는 경우(CDC only, Full load only 뒤의 CDC, 또는 **Re-snapshot every table instead**) 따옴표로 묶은 대소문자 혼용 이름의 그런 테이블이 캡처됐습니다: 커넥터는 그 테이블의 모든 행도 읽고 그 테이블을 publication에 추가했습니다(나중에 만든 테이블은 커넥터가 다음에 다시 시작할 때). 그 테이블에 replica identity가 없는 동안에는 소스 애플리케이션이 그 테이블에 하는 `UPDATE`와 `DELETE`가 실패했고, 커넥터의 데이터베이스 사용자가 그 테이블의 소유자가 아니면 대신 소스 커넥터가 실패했습니다. 이 예전 캡처는 도구에 들어 있는 Debezium 2.7.4의 코드로 확인했고, 라이브로 겪지는 않았습니다. cdc-stack 템플릿에 `true`이면 각 항목 앞에 `(?-i)`를 붙이는 새 파라미터 `ExactTableIncludeList`(기본값 `false`)가 생겼고, Start CDC는 한 번도 시작한 적이 없는 스택에서만 이를 `true`로 설정합니다. 그때 Start CDC 로그에는 *The source connector captures exactly the selected tables, letter case included (ExactTableIncludeList): this stack has not been started before.*라고 나옵니다. 이 버전이 처음 시작한 CDC 스택으로 ECS Fargate에서, `lower_case_table_names`가 0인 Aurora MySQL 3과 CDC only의 Aurora PostgreSQL 17에서 검증했습니다: Debezium은 선택한 테이블과 이름이 대소문자만 다른, 선택하지 않은 테이블을 캡처하지 않았고 Kafka는 그 테이블의 레코드를 하나도 받지 않았으며, 선택한 테이블은 소스와 일치했습니다. PostgreSQL에서는 publication에 선택한 테이블만 정확히 들어 있었고, 기본 키가 없는 그 대소문자만 다른 테이블은 CDC가 스트리밍하는 동안에도 `UPDATE`와 `DELETE`를 계속 받아들였습니다. 이전 버전이 시작한 스택은 예전 방식대로 맞춥니다: 업그레이드 참고를 보세요.
+
+### 문서
+
+- **매뉴얼 [§6.2](docs/manual/ko/06-limitations.md#62-마이그레이션-프로세스-한계)가 어떤 CDC 스택이 선택한 테이블과 이름이 대소문자만 다른 테이블도 캡처하는지 밝히고**, 그것이 MySQL과 PostgreSQL에서 각각 어떤 결과를 낳는지, 그런 스택은 Delete CDC infrastructure 전까지 그렇게 동작한다는 것을 설명합니다. 영어·한국어·일본어 모두 반영했습니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 기본 이미지 말고는 그대로이고 IAM 변경은 없으며, 싱크 플러그인도 그대로(v54)입니다. cdc-stack 템플릿은 이미지에 들어 있고 Start CDC가 그 템플릿을 보내므로 CDC 인프라 재배포가 필요 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **이전 버전이 시작한 CDC 스택은 Delete CDC infrastructure 전까지 선택한 이름을 대소문자를 구분하지 않고 맞춥니다.** 실행 중인 커넥터는 업데이트되지 않으며, Stop CDC, Start CDC, Retry CDC도 그 맞춤 방식을 그대로 유지합니다. 이것이 문제가 되는 것은 선택하지 않은 테이블의 이름이 선택한 테이블의 이름과 대소문자만 다를 때뿐입니다(MySQL에서는 `lower_case_table_names`가 0일 때, PostgreSQL에서는 소스 커넥터가 테이블을 직접 스냅샷하는 경로에서): PostgreSQL에서는 그때까지 그런 테이블에 기본 키나 `REPLICA IDENTITY FULL`을 주세요. Delete CDC infrastructure 후 다시 배포한 스택은 정확히 캡처하지만, 이전 스택을 삭제하면 그 스트림 위치도 삭제됩니다([§13.7](docs/manual/ko/13-excluding-tables-and-columns.md#137-나중에-제외-설정-바꾸기)의 "삭제 후 다시 CDC 시작" 참고).
+- **따로 옮길 것이 없고, v0.1.580으로 되돌리는 것은 이 버전이 배포하거나 시작하지 않은 CDC 스택에만 안전합니다.** 이 버전의 Deploy CDC infrastructure와 Start CDC는 스택에 `ExactTableIncludeList` 파라미터를 주는데, v0.1.580 이하의 템플릿은 이 파라미터를 선언하지 않으므로 그 버전들의 Start CDC나 Retry CDC는 스택 업데이트에 실패합니다(Stop CDC와 Delete CDC infrastructure는 여전히 동작합니다). 그 밖에는 이 버전이 v0.1.580과 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받아들이므로, 어느 버전이든 다른 버전이 쓴 것을 읽습니다.
+
 ## v0.1.580
 
 Fargate 성능 측정 스크립트가 더 이상 소스 비밀번호를 태스크에 보내지 않고, 단일 EC2 호스트 가이드의 시크릿 교체는 새 시크릿을 어떤 명령줄에도 올리지 않으며, *Table names CDC cannot stream* 거부는 이름에 `.`이 들어간 데이터베이스나 스키마의 테이블에 더 이상 Full load only 복사를 권하지 않습니다.
