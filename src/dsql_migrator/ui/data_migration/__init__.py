@@ -1191,8 +1191,9 @@ def build_data_migration_screen(
                 ui.notify(_conn_block[2], type="warning", multi_line=True)
                 refresh()
                 return
+            _target_now = _target_inventory()
             generated = migratable_table_names(
-                inventory, conv_state.generated_node_ids, _target_inventory()
+                inventory, conv_state.generated_node_ids, _target_now
             )
             if not generated:
                 migration_state.set_error(
@@ -1202,16 +1203,10 @@ def build_data_migration_screen(
                 )
                 refresh()
                 return
-            names = effective_migration_selection(
-                generated,
-                migration_state.selection,
-                touched=migration_state.selection_touched,
-                default=default_migration_selection(
-                    inventory,
-                    conv_state.generated_node_ids,
-                    _target_inventory(),
-                    conv_state.ticked_node_ids,
-                ),
+            # The screen's ONE selection formula, as Start Full Load's runner: the checks
+            # run on the tables the load would migrate.
+            names = resolve_migration_selection(
+                inventory, conv_state, migration_state, _target_now
             )
             if not names:
                 migration_state.set_error("Select at least one table to check.")
