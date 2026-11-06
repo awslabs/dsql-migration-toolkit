@@ -65,6 +65,22 @@ def _mode_value(mode: object) -> Optional[str]:
     return str(getattr(mode, "value", mode))
 
 
+def _restored_source_type(raw: Optional[str]) -> SourceType:
+    """The engine a snapshot's persisted ``source_type`` string names (MySQL by default).
+
+    ONE rule for every restore path: an absent value (a snapshot older than the field) or
+    an unknown one restores as MySQL, the historical default. The restored connection
+    and the restored report's address both take their default port from the engine this
+    returns (``dialect_for(...).default_port``), so the two cannot disagree again -- they
+    did: the connection used ``or 3306`` for every engine, so a PostgreSQL session saved
+    without a port came back on 3306 while the report's header said 5432.
+    """
+    try:
+        return SourceType(raw) if raw else SourceType.MYSQL
+    except ValueError:
+        return SourceType.MYSQL
+
+
 def _restore_prereq_gated_mode(migration_state: object, raw: Optional[str]) -> None:
     """Restore the prerequisite mode that gated the last started Full Load.
 
@@ -522,9 +538,16 @@ def apply_session_snapshot(
 
     from types import SimpleNamespace
 
+    from dsql_migrator.core.source_dialect import dialect_for
     from dsql_migrator.ui.data_migration import MigrationType
     from dsql_migrator.ui.evaluation import EvaluationResult, describe_source
 
+    # The port the restored connection takes, and the restored report's address with it:
+    # the engine's own default when the snapshot has none (an older one).
+    restored_source_port = (
+        snapshot.source_port
+        or dialect_for(_restored_source_type(snapshot.source_type)).default_port
+    )
     session.set_workflow(snapshot.workflow.model_copy(deep=True))  # type: ignore[attr-defined]
     # Restore the NON-SECRET source connection (host/port/database/username + engine)
     # so Connect pre-fills it, exactly like the target above -- the user re-enters ONLY
@@ -534,19 +557,11 @@ def apply_session_snapshot(
     if snapshot.source_host and hasattr(session, "set_source"):
         from dsql_migrator.core.models import SourceConnectionConfig
 
-        try:
-            _stype = (
-                SourceType(snapshot.source_type)
-                if snapshot.source_type
-                else SourceType.MYSQL
-            )
-        except ValueError:
-            _stype = SourceType.MYSQL
         session.set_source(  # type: ignore[attr-defined]
             SourceConnectionConfig(
-                source_type=_stype,
+                source_type=_restored_source_type(snapshot.source_type),
                 host=snapshot.source_host,
-                port=snapshot.source_port or 3306,
+                port=restored_source_port,
                 database=snapshot.source_database,
                 username=snapshot.source_username,
             ),
@@ -649,18 +664,11 @@ def apply_session_snapshot(
         and snapshot.target_inventory is not None
     ):
         # The engine has to be restored too, or a restored PostgreSQL session exports an
-        # Evaluation report titled "MySQL to Aurora DSQL...". Derived here rather than
-        # reusing the ``_stype`` above, because that one sits inside the
-        # ``if snapshot.source_host`` block and an older snapshot without a host would
-        # otherwise silently fall back to MySQL.
-        try:
-            restored_source_type = (
-                SourceType(snapshot.evaluation_source_type or snapshot.source_type)
-                if (snapshot.evaluation_source_type or snapshot.source_type)
-                else SourceType.MYSQL
-            )
-        except ValueError:
-            restored_source_type = SourceType.MYSQL
+        # Evaluation report titled "MySQL to Aurora DSQL...". The report's own engine
+        # first (it may describe another source), else the connected one.
+        restored_source_type = _restored_source_type(
+            snapshot.evaluation_source_type or snapshot.source_type
+        )
         restored = EvaluationResult(
             inventory=snapshot.inventory,
             assessment=snapshot.assessment,
@@ -675,8 +683,7 @@ def apply_session_snapshot(
                 SimpleNamespace(
                     host=snapshot.source_host,
                     # As the restored connection takes it (an older snapshot has none).
-                    port=snapshot.source_port
-                    or (5432 if restored_source_type is SourceType.POSTGRES else 3306),
+                    port=restored_source_port,
                     database=snapshot.source_database,
                 )
             ),
@@ -1102,19 +1109,28 @@ def session_signature(
     lob_sig = tuple(
         _flatten_lob_exclusions(migration_state.lob_exclusions())  # type: ignore[attr-defined]
     )
+    # Every target coordinate the snapshot stores (DSQL is IAM-token auth, so none is a
+    # credential): a username-only edit on Connect must persist too, or the restore
+    # pre-fills the old one. The database is not editable on Connect (it is fixed at
+    # "postgres"); it is a term only so no persisted field sits outside the dirty-check.
     target = getattr(session, "target_config", None)  # type: ignore[attr-defined]
     target_sig = (
         getattr(target, "cluster_endpoint", None),
         getattr(target, "region", None),
+        getattr(target, "database", None),
+        getattr(target, "username", None),
     )
     # The source coordinates the snapshot stores (and the evaluation_source_* fields are
-    # derived against): a source switch on Connect alone must persist too.
+    # derived against): a source switch on Connect alone must persist too, and so must a
+    # username-only edit. NON-SECRET only (Property 7): never the password, which lives
+    # only in the session's SecretValue; the secret REFERENCE is in auth_sig below.
     source = getattr(session, "source_config", None)  # type: ignore[attr-defined]
     source_sig = (
         _mode_value(getattr(source, "source_type", None)),
         getattr(source, "host", None),
         getattr(source, "port", None),
         getattr(source, "database", None),
+        getattr(source, "username", None),
     )
     # Part of the dirty-check, or a newly-recorded secret reference / a just-accepted
     # quarantine gap would never be written and the restore would lose it again.
@@ -1156,6 +1172,11 @@ def session_signature(
         # save and the deploy-stage view survives a reconnect.
         getattr(migration_state, "cdc_deploy_job_id", None),  # type: ignore[attr-defined]
         getattr(migration_state, "cdc_action_kind", None),  # type: ignore[attr-defined]
+        # The tracked connector names -- a discovery can add the sink's, or clear a stack
+        # deleted from the console, with no job id moving -- and the applied-ops window
+        # start, so neither is saved only when some neighbouring field happens to move.
+        tuple(getattr(migration_state, "cdc_connector_names", None) or ()),
+        getattr(migration_state, "cdc_ops_window_start", None),
         # AI Assist preference, so toggling it (or changing the model/region)
         # triggers a save and the choice survives a reconnect.
         bool(getattr(getattr(session, "ai_assist", None), "enabled", False)),  # type: ignore[attr-defined]
