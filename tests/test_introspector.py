@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 
-from dsql_migrator.config import SecretRef, SecretSource
+from dsql_migrator.config import SecretValue
 from dsql_migrator.core.introspector import (
     ReadOnlySourceError,
     SourceIntrospector,
@@ -292,6 +292,8 @@ def test_test_connection_failure_returns_reason() -> None:
 
 
 def test_test_connection_does_not_expose_credentials() -> None:
+    # The caller hands over the password its engine factory connects with (the Connect
+    # screen's check_source_connection does): it is the value redacted from the reason.
     secret_password = "super-secret-password"
 
     def leaky_factory(_conn: SourceConnectionConfig) -> Engine:
@@ -301,24 +303,17 @@ def test_test_connection_does_not_expose_credentials() -> None:
         )
 
     config = SourceConnectionConfig(
-        host="db.example.com",
-        database="app",
-        username="app_user",
-        secret=SecretRef(source=SecretSource.ENVIRONMENT, locator="DB_PASSWORD"),
+        host="db.example.com", database="app", username="app_user"
     )
     introspector = SourceIntrospector(engine_factory=leaky_factory)
 
-    import os
-
-    os.environ["DB_PASSWORD"] = secret_password
-    try:
-        result = introspector.test_connection(config)
-    finally:
-        del os.environ["DB_PASSWORD"]
+    result = introspector.test_connection(config, redact=SecretValue(secret_password))
 
     assert result.success is False
     assert secret_password not in result.detail
-    assert "***" in result.detail
+    assert "access denied using password *** for db.example.com" in result.detail
+    # Never kept on the introspector (Property 7: the credential lives with its caller).
+    assert secret_password not in repr(vars(introspector))
 
 
 # ---------------------------------------------------------------------------

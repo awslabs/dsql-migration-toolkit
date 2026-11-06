@@ -367,12 +367,14 @@ def check_source_connection(
 
     The password is supplied in memory via a per-session engine factory; on
     failure the introspector returns a reason with the credential redacted
-    (Requirement 1.4 / 9.2).
+    (Requirement 1.4 / 9.2 / Property 7). The same in-memory ``password`` is handed
+    to the introspector as the value to redact: the factory's closure is the only
+    other place it lives, so the introspector cannot find it on its own.
     """
     introspector = introspector or SourceIntrospector(
         engine_factory=make_source_engine_factory(password)
     )
-    return introspector.test_connection(config)
+    return introspector.test_connection(config, redact=password)
 
 
 def check_target_connection(

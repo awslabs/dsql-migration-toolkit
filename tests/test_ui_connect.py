@@ -47,14 +47,18 @@ from dsql_migrator.ui.session import SessionConnectionState, SessionStore
 
 
 class _FakeIntrospector:
-    """Records the config it was asked to test and returns a canned result."""
+    """Records the config (and the secret to redact) it was asked to test; canned result."""
 
     def __init__(self, result: ConnectionResult) -> None:
         self.result = result
         self.tested: list[SourceConnectionConfig] = []
+        self.redacted: list[object] = []
 
-    def test_connection(self, conn: SourceConnectionConfig) -> ConnectionResult:
+    def test_connection(
+        self, conn: SourceConnectionConfig, *, redact: object = None
+    ) -> ConnectionResult:
         self.tested.append(conn)
+        self.redacted.append(redact)
         return self.result
 
 
@@ -191,6 +195,8 @@ def test_check_source_connection_passes_through_result() -> None:
     )
     assert result.success is True
     assert introspector.tested == [config]
+    # The in-memory password is what the introspector redacts from a failure reason.
+    assert introspector.redacted == [SecretValue("pw")]
 
 
 def test_check_source_connection_reports_failure() -> None:

@@ -1377,11 +1377,22 @@ class SourceIntrospector:
         # name holds a '.' (see _assemble_inventory): read by Evaluation, never persisted.
         self.last_dotted_schemas: list[str] = []
 
-    def test_connection(self, conn: SourceConnectionConfig) -> ConnectionResult:
+    def test_connection(
+        self,
+        conn: SourceConnectionConfig,
+        *,
+        redact: Optional[SecretValue] = None,
+    ) -> ConnectionResult:
         """Validate connectivity and return a success/failure result.
 
-        Implements Requirement 1.1. On failure the reason is returned with any
-        plaintext credential redacted (Requirement 1.4 / 9.2).
+        Implements Requirement 1.1. On failure the reason is returned with the
+        plaintext credential redacted (Requirement 1.4 / 9.2 / Property 7).
+
+        ``redact`` is the password the engine factory connects with. The caller passes
+        it because only the caller holds it: the factory keeps the password in its own
+        closure and ``conn`` never carries it, so without ``redact`` a driver error that
+        echoes the credential would reach the operator verbatim. The value is used for
+        the redaction only and is never stored on this instance.
         """
         from dsql_migrator.core.source_dialect import dialect_for
 
@@ -1404,7 +1415,8 @@ class SourceIntrospector:
                 aurora_version=versions.aurora_version,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failure reason
-            message = _sanitize_message(str(exc), _revealed_secret(conn))
+            secret = redact.reveal() if redact is not None else _revealed_secret(conn)
+            message = _sanitize_message(str(exc), secret)
             reason = message or exc.__class__.__name__
             return ConnectionResult(
                 success=False,
