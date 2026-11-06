@@ -233,8 +233,11 @@ def test_a_real_psycopg_connection_that_is_not_open_is_discarded() -> None:
 
 @pytest.mark.parametrize("sqlstate, retried", [
     ("40001", True), ("08006", True), ("08P01", True), ("XX000", True),
+    # A3: a session the server ended is a lost connection, retried (on a fresh one: it is
+    # discarded above) rather than split as a poison row (test_rr_a3_server_ended_session_retry).
+    ("57P01", True),
     ("23505", False), ("22001", False), ("54000", False), ("42804", False),
-    ("57P01", False), ("53300", False), ("58030", False), ("40003", False),
+    ("53300", False), ("58030", False), ("40003", False),
 ])
 def test_keeping_a_connection_moves_no_retry_decision(sqlstate, retried) -> None:
     # Where a retry runs changes, never whether it runs (_is_retryable_load_error as before).

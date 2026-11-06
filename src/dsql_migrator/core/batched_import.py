@@ -142,6 +142,7 @@ from dsql_migrator.core.occ import (
 from dsql_migrator.core.target_connection import (
     DsqlConnector,
     TRANSIENT_CONN_SIGNATURES,
+    is_dropped_connection,
     is_server_unavailable,
     is_transient_connection_error,
 )
@@ -266,15 +267,27 @@ _TRANSIENT_CONN_SIGNATURES = TRANSIENT_CONN_SIGNATURES
 
 def _is_retryable_load_error(exc: BaseException) -> bool:
     """Retryable during a batch load: an OCC ``40001`` conflict, Aurora DSQL's temporary
-    "server unavailable" (``XX000``), OR a transient class-08 connection drop / expired
-    token. A permanent data error (e.g. a type/constraint violation) is NOT retryable and
-    is isolated to its row. A retryable error that outlasts the budget fails the BATCH,
-    never a row: it is raised, so the batch is FAILED (retryable), not split or quarantined.
+    "server unavailable" (``XX000``), OR a lost connection
+    (:func:`~dsql_migrator.core.target_connection.is_dropped_connection`): a class-08 /
+    no-SQLSTATE drop or expired token, or a session the server ended (57P01 admin_shutdown,
+    57P02 crash_shutdown, 57P03 cannot_connect_now). A permanent data error (e.g. a
+    type/constraint violation) is NOT retryable and is isolated to its row. A retryable error
+    that outlasts the budget fails the BATCH, never a row: it is raised, so the batch is FAILED
+    (retryable), not split or quarantined.
+
+    A server-ended session counts (A3) because it is no row's fault: classed as a poison row,
+    the batch was binary-split, and a second 57P0x on a one-row half -- a restart still under
+    way -- quarantined a healthy row. Validation's target reads and the CDC sink already
+    replace such a session. Here the pool discards it (class 57, see
+    :data:`_SESSION_ENDING_CLASSES`) and the retry runs on a fresh connection, within the
+    same bounded budget, and re-runs exactly, as after a class-08 drop: a batch whose
+    commit landed before the session ended is idempotent (``ON CONFLICT``, or the
+    select-filter recovery of a plain ``INSERT``'s ``23505``).
     """
     return (
         is_occ_conflict(exc)
         or is_server_unavailable(exc)
-        or _is_transient_connection_error(exc)
+        or is_dropped_connection(exc)
     )
 
 
@@ -2378,11 +2391,13 @@ class BatchedImporter:
                     if _is_retryable_load_error(exc):
                         self.load_stats.record_index_retry(exc)
                     if not unconfirmed[0]:
+                        # A session the server ended while the CREATE ran is a drop too:
+                        # it is retried, and the statement may have committed first.
                         unconfirmed[0] = (
                             UNCONFIRMED_INDEX_NOTE
                             if is_server_unavailable(exc)
                             else UNCONFIRMED_INDEX_DROP_NOTE
-                            if _is_transient_connection_error(exc)
+                            if is_dropped_connection(exc)
                             else ""
                         )
                     raise

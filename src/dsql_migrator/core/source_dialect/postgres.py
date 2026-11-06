@@ -2159,6 +2159,16 @@ class PostgresSourceDialect(SourceDialect):
         # psycopg connection-level error type, or a known drop signature, as transient.
         import socket
 
+        # SQLAlchemy raises PendingRollbackError on a connection an EARLIER error invalidated;
+        # it is recoverable exactly when that earlier error (its context) was -- the MySQL
+        # classifier's rule (introspector._mysql_source_transient), which this twin lacked
+        # (A3): the same shape after a 57P01 / class-08 drop failed the table here and was
+        # re-read on MySQL. Only this type looks behind itself, and only this classifier:
+        # error_candidates never follows __context__, so too-many-connections and the
+        # row-security refusal are judged as before.
+        if type(exc).__name__ == "PendingRollbackError" and exc.__context__ is not None:
+            return self.is_transient_error(exc.__context__)
+
         candidates = error_candidates(exc)
         saw_sqlstate = False
         for candidate in candidates:
