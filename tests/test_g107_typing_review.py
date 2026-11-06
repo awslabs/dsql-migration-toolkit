@@ -9,6 +9,7 @@ case MySQL keeps. Each form was run on MySQL 8.4 and PostgreSQL 17 over the same
 
 from __future__ import annotations
 
+import gc
 import re
 import time
 
@@ -148,7 +149,15 @@ def test_typing_through_nested_derived_tables_is_linear() -> None:
         return time.perf_counter() - started
 
     took(10)  # warm up
-    small, large = took(15), took(60)
+    # Timed with the garbage collector paused, as timeit does: in the full suite one
+    # collection over its heap costs far more than either conversion, and where it lands
+    # is down to how many objects the other tests allocated, not to this code.
+    gc.collect()
+    gc.disable()
+    try:
+        small, large = took(15), took(60)
+    finally:
+        gc.enable()
     assert large < small * 10  # linear: 4x the depth
 
 
