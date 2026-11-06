@@ -95,6 +95,7 @@ from dsql_migrator.core.table_selection import (
 )
 from dsql_migrator.ui.data_migration._models import (
     MigrationType,
+    session_source_type,
     capture_load_complete,
     cdc_capture_names,
     classify_restored_exclusions,
@@ -219,10 +220,16 @@ from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402,F401
 
 
 def _cdc_source_type(session) -> SourceType:
-    """The session's source engine (default MySQL), for CDC config dispatch."""
-    return getattr(
-        getattr(session, "source_config", None), "source_type", SourceType.MYSQL
-    )
+    """The session's source engine (default MySQL), for CDC config dispatch.
+
+    Through :func:`session_source_type`: a session restored from a host-less snapshot has
+    no ``source_config`` but still knows its engine, and reading only the config rendered
+    a restored PostgreSQL session's CDC step as MySQL (the start-point card, the connector
+    preview and its parameter file, the Start button's seed notices, the least-privilege
+    note). Start CDC itself still needs a live config, so a live session's dispatch is
+    unchanged.
+    """
+    return session_source_type(session)
 
 
 def _cdc_source_database(session) -> str:
@@ -1247,7 +1254,7 @@ def _estimate_cdc_table_rows(session, table_names):
         # Source-engine dialect (PG uses pg_class.reltuples, not MySQL information_schema)
         # so a PostgreSQL source's per-table sizing estimate does not raise + fall back to
         # the uniform partition default. Mirrors _full_load_engine's capture path.
-        dialect = dialect_for(source_config.source_type)
+        dialect = dialect_for(_cdc_source_type(session))
         engine = make_source_engine_factory(session.source_password)(source_config)
         # Disposed on every exit: a QueuePool engine left to the GC kept its pooled
         # connection to the (production) source open.

@@ -327,3 +327,39 @@ def test_the_app_wide_ai_dba_chat_grounds_a_restored_session_as_postgresql() -> 
     system, kwargs = _general_chat_systems_after(_restore)
     assert kwargs.get("source_engine") == "PostgreSQL", kwargs
     assert "THIS PostgreSQL -> Aurora DSQL migration" in system
+
+
+# -- The CDC step ---------------------------------------------------------------------------------
+
+
+def test_the_cdc_step_renders_a_restored_session_as_postgresql() -> None:
+    # _cdc_source_type is the CDC step's engine read (about 50 call sites: the start-point
+    # card, the connector-configuration preview and its parameter file, the Start button's
+    # seed notices, the least-privilege note). It returned MySQL whenever source_config was
+    # None, while other code in the same package already used session_source_type.
+    from datetime import datetime, timezone
+
+    from dsql_migrator.core.models import ColumnDef, TableDef, Watermark
+    from dsql_migrator.ui.data_migration import DataMigrationState, _cdc_ui
+    from tests.test_rr_a2_restored_engine import _restored_pg_session
+    from tests.test_ui_data_migration import _RecordingUi
+
+    session = _restored_pg_session()
+    assert _cdc_ui._cdc_source_type(session) is SourceType.POSTGRES
+
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_least_privilege_note(ui, session=session)
+    shown = " ".join(ui.texts)
+    assert "create a dedicated PostgreSQL role" in shown, shown
+    assert "MySQL user" not in shown
+
+    # The preview's and Start CDC's one builder makes the PostgreSQL parameter set.
+    table = TableDef(name="public.orders", primary_key=["id"],
+                     columns=[ColumnDef(name="id", mysql_type="integer", nullable=False)])
+    watermark = Watermark(snapshot_timestamp=datetime(2026, 10, 1, tzinfo=timezone.utc),
+                          wal_lsn="0/16B3748", slot_name="dsqlmig_s",
+                          table_row_counts={"public.orders": 1})
+    _config, _sink, params = _cdc_ui._cdc_start_connector_params(
+        DataMigrationState(), session, [table], watermark=watermark, seed=None,
+        start_facts=None, exclude_list=None)
+    assert dict(params.filled).get("EngineType") == "postgres", dict(params.filled)
