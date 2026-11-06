@@ -2455,11 +2455,12 @@ def build_data_migration_screen(
                         # built here would keep answering -- and latching denials -- with
                         # the Bedrock model / region / AWS profile of THIS moment after
                         # the operator switched to a verified one.
+                        # The engine through session_source_type: a RESTORED session
+                        # has no source_config, and source_engine_word(None) is "MySQL",
+                        # so a restored PostgreSQL operator's AI DBA reasoned in MySQL.
                         return AssessmentStrategist(
                             session.ai_assist, aws_profile=session.aws_profile,
-                            source_engine=source_engine_word(
-                                getattr(session.source_config, "source_type", None)
-                            ),
+                            source_engine=source_engine_word(session_source_type(session)),
                         )
 
                     # Ground the reply in THIS migration's situation (type, CDC
@@ -2507,12 +2508,11 @@ def build_data_migration_screen(
                     )
 
                     def strategist_now() -> AssessmentStrategist:
-                        # Per SEND, like ai_error_opener's (see there).
+                        # Per SEND and through session_source_type, like
+                        # ai_error_opener's (see there).
                         return AssessmentStrategist(
                             session.ai_assist, aws_profile=session.aws_profile,
-                            source_engine=source_engine_word(
-                                getattr(session.source_config, "source_type", None)
-                            ),
+                            source_engine=source_engine_word(session_source_type(session)),
                         )
 
                     open_ai_scope(

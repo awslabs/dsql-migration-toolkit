@@ -19,6 +19,9 @@ Measured consequences, each pinned below:
 * The Data Migration foreign-key card read ``_src.source_type`` off a ``None`` config; the
   advisory count swallowed the AttributeError, so its denominator read 0 and the card
   hid every pending key.
+* The AI DBA on the Full Load failure / quarantine chat and on the CDC dead-letter /
+  schema-drift chat read ``getattr(session.source_config, "source_type", None)``;
+  ``source_engine_word(None)`` is "MySQL", so it was told the source is MySQL.
 
 Doubles only: no source, no Aurora DSQL, no AWS.
 """
@@ -131,7 +134,13 @@ def test_the_cut_over_foreign_key_pass_converts_a_restored_session_as_postgresql
     import dsql_migrator.ui.schema_conversion as schema_conversion
     from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
 
-    eval_store, conv_store, conv_state = _stores(_pg_inventory())
+    # One edit, for a table the inventory does not hold (applied_table_conversions only
+    # reads the edits of the tables it converts, so the conversion is unchanged): an EMPTY
+    # dict is falsy, so ``edits or {}`` hands out a new {} with or without the copy, and
+    # the identity check below could not tell them apart.
+    eval_store, conv_store, conv_state = _stores(
+        _pg_inventory(), {"public.not_migrated": "CREATE TABLE not_migrated (id integer)"})
+    assert conv_state.edited_target_ddls
     captured: dict = {}
     real = schema_conversion.applied_table_conversions
 
@@ -161,6 +170,7 @@ def test_the_cut_over_foreign_key_pass_converts_a_restored_session_as_postgresql
     assert captured["edits"] and all(
         edits is not conv_state.edited_target_ddls for edits in captured["edits"]
     ), "the job-thread pass read the live edits dict instead of a copy"
+    assert all(edits == conv_state.edited_target_ddls for edits in captured["edits"])
 
 
 def test_the_runbook_names_postgresql_for_a_restored_session():
@@ -170,13 +180,17 @@ def test_the_runbook_names_postgresql_for_a_restored_session():
     assert _source_engine_word(SimpleNamespace(source_config=None)) == "MySQL"
 
 
-def _full_load_fk_card(monkeypatch):
+def _full_load_fk_card(monkeypatch, *, migration_type=None, open_ai_scope=None):
     """The Data Migration step of a finished Full load only of both tables for a RESTORED
     PostgreSQL session. Returns the FK card's providers (``_render_full_load_step`` records
-    them), every input the screen built a migrator from, and the rendered texts."""
+    them), every input the screen built a migrator from, and the rendered texts.
+
+    ``migration_type`` overrides Full load only; ``open_ai_scope`` turns AI Assist on (the
+    session's opt-in) and is the screen's AI-panel seam."""
     from datetime import datetime, timezone
 
     from dsql_migrator.core.models import (
+        AiAssistConfig,
         AssessmentReport,
         ChunkState,
         MigrationJob,
@@ -215,7 +229,9 @@ def _full_load_fk_card(monkeypatch):
     session.set_target(TargetConnectionConfig(
         cluster_endpoint="c.dsql.us-east-1.on.aws", region="us-east-1"))
     assert session.source_config is None
-    session.set_migration_type(MigrationType.FULL_LOAD_ONLY)
+    session.set_migration_type(migration_type or MigrationType.FULL_LOAD_ONLY)
+    if open_ai_scope is not None:
+        session.set_ai_assist(AiAssistConfig(enabled=True))
     session.set_workflow(with_status(session.workflow, WorkflowStep.FULL_LOAD, StepStatus.DONE))
     evals = EvaluationStore()
     evals.get_or_create("s1").set_result(EvaluationResult(
@@ -245,7 +261,7 @@ def _full_load_fk_card(monkeypatch):
 
     content, _runner = dm.build_data_migration_screen(
         sessions, "s1", job_manager=jobs, eval_store=evals, migration_store=migrations,
-        conv_store=convs, migrator_factory=_factory,
+        conv_store=convs, migrator_factory=_factory, open_ai_scope=open_ai_scope,
     )
     content(lambda: None)
     return card, built, " ".join(ui.texts)
@@ -271,3 +287,43 @@ def test_the_full_load_only_next_step_gives_a_restored_postgresql_session_the_sl
     _card, _built, texts = _full_load_fk_card(monkeypatch)
     assert "This run created no replication slot" in texts
     assert "streams from this Full Load's watermark" not in texts
+
+
+def test_the_ai_dba_reasons_about_a_restored_postgresql_source(monkeypatch):
+    # The Full Load failure / quarantine chat and the CDC dead-letter / schema-drift chat
+    # each build an AI DBA strategist per send, grounded in the source engine. They read
+    # getattr(session.source_config, "source_type", None), and source_engine_word(None) is
+    # "MySQL": a restored PostgreSQL operator's AI DBA was told the source is MySQL.
+    import dsql_migrator.core.assessment_strategist as strategist
+    from dsql_migrator.ui import data_migration as dm
+    from dsql_migrator.ui.data_migration import MigrationType
+
+    engines: list = []
+
+    class _Strategist:
+        def __init__(self, *_a, source_engine="MySQL", **_k):
+            engines.append(source_engine)
+
+        def stream_full_load_error_chat(self, *_a, **_k):
+            return ""
+
+        def stream_cdc_chat(self, *_a, **_k):
+            return ""
+
+    monkeypatch.setattr(strategist, "AssessmentStrategist", _Strategist)
+    cdc: dict = {}
+    monkeypatch.setattr(dm, "_render_cdc_step", lambda *_a, **kw: cdc.update(kw))
+    scopes: list = []
+    card, _built, _texts = _full_load_fk_card(
+        monkeypatch, migration_type=MigrationType.FULL_LOAD_AND_CDC,
+        open_ai_scope=lambda **kw: scopes.append(kw),
+    )
+    assert card["ai_error_opener"] is not None and cdc["cdc_ai_opener"] is not None
+    card["ai_error_opener"](CHILD, "duplicate key value violates unique constraint")
+    cdc["cdc_ai_opener"]("dlq", "1 record in the dead-letter queue", "Why?")
+    assert [s["scope_id"] for s in scopes] == [f"full_load:failure:{CHILD}", "cdc:dlq"]
+    for scope in scopes:
+        scope["streamer"]([], lambda _delta: None)
+    assert engines == ["PostgreSQL", "PostgreSQL"], (
+        f"a restored PostgreSQL session's AI DBA was grounded as {engines}"
+    )

@@ -28261,7 +28261,10 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
     # applied conversion -- may read a source_config's engine: not the fallback form, not a
     # local's (`source_config.source_type`), not the foreign-key card's `_src.source_type`
     # (it raised for a restored session and the card's count read 0), not the getattr
-    # chain with a MySQL default. session_source_type is the sanctioned read.
+    # chain with a MySQL default, not `getattr(session.source_config, "source_type", None)`
+    # (the AI DBA openers' read: source_engine_word(None) is "MySQL", so a restored
+    # PostgreSQL operator's AI DBA reasoned in MySQL). session_source_type is the
+    # sanctioned read.
     import re
 
     from dsql_migrator.ui import validation as uival
@@ -28270,6 +28273,7 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
         r"source_config\.source_type"
         r"|\b_src\.source_type"
         r"|[\"']source_config[\"'],\s*None\),\s*[\"']source_type[\"']"
+        r"|\bsource_config\s*,\s*[\"']source_type[\"']"
     )
     screen = inspect.getsource(dm.build_data_migration_screen)
     cut_over = inspect.getsource(uival)
