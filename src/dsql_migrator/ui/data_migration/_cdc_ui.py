@@ -870,9 +870,11 @@ def _render_cdc_source_config_card(
 
     # The connector configs and the deployable cdc-stack parameter set (tool-known values
     # filled, customer-environment values as <FILL_ME> placeholders), built by the SAME
-    # builder Start CDC sends from (_cdc_start_connector_params): from the same seed and
+    # builder Start CDC uses (_cdc_start_connector_params): from the same seed and
     # stack facts, so the preview cannot claim a start point or a snapshot.mode the Start
-    # would not send, nor leave out a parameter Start sends (the composite record key).
+    # would not send, nor leave out a parameter Start builds (the composite record key, in
+    # MessageKeyColumns -- the routing every sink plugin applies; on a stack whose sink
+    # plugin reads SinkKeyColumns, Start CDC moves it there against the live stack).
     config, sink, params = _cdc_start_connector_params(
         migration_state,
         session,
@@ -1014,13 +1016,17 @@ def _cdc_start_connector_params(
     start_facts,
     exclude_list,
 ):
-    """The ``(source_config, sink_config, params)`` a Start CDC sends -- ONE builder for the
+    """The ``(source_config, sink_config, params)`` a Start CDC builds -- ONE builder for the
     connector-configuration preview and Start CDC, so the preview's downloadable parameter
-    file cannot leave out (or differ in) a parameter Start sends. No AWS call, no UI.
+    file cannot leave out (or differ in) a parameter Start builds. No AWS call, no UI.
 
     The preview was a second copy of this build, and the copies drifted: it never passed the
     composite record key, so a re-keyed table's file carried an empty ``MessageKeyColumns``
-    while Start CDC sent the key. Everything that decides the parameters is resolved here --
+    while Start CDC's set carried the key. ``run_cdc_start`` then judges two things against
+    the LIVE stack, which a preview cannot see: the column exclusion (below) and the re-key
+    routing (``choose_rekey_routing`` moves a re-keyed table's key to ``SinkKeyColumns`` on a
+    stack whose sink plugin reads it); the file keeps the routing every sink plugin applies.
+    Everything that decides the parameters is resolved here --
     the engine, the start coordinate (MySQL: the ``seed`` Start offers the seeder;
     PostgreSQL: the job ``watermark``), the resume signal, the captured tables' key map, the
     sink and the sink MCU count -- except what the callers pass:

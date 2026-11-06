@@ -6,12 +6,20 @@
 The connector-configuration preview's downloadable cdc-stack parameter file is built "so the
 preview cannot disagree with Start" -- but it was a second copy of Start's build that did not
 pass the composite record key (``message_key_columns``) to ``dispatch_source_config``. For a
-re-keyed table the file therefore carried an empty ``MessageKeyColumns`` while Start CDC sends
-the key (``core.cdc.build_cdc_stack_params``). Both now call one builder,
-``_cdc_start_connector_params``; only the column-exclusion value stays the caller's choice
-(the preview shows what Start sends, ``_capture.sent``; Start sends the exact form,
-``_capture.value``, which it re-chooses against the live stack). Offline: the preview renders
-into a recording UI double and Start's job body runs with ``run_cdc_start`` captured.
+re-keyed table the file therefore carried an empty ``MessageKeyColumns`` while the set Start
+CDC builds carries the key (``core.cdc.build_cdc_stack_params``), so a stack deployed from the
+file keyed that table's change records on the source primary key alone. Both now call one
+builder, ``_cdc_start_connector_params``; only the column-exclusion value stays the caller's
+choice (the preview shows what Start sends, ``_capture.sent``; Start sends the exact form,
+``_capture.value``, which it re-chooses against the live stack).
+
+What is pinned is the set Start CDC BUILDS -- what ``run_cdc_start`` receives. That job then
+judges two things against the LIVE stack, which the preview cannot see: the column exclusion,
+and the re-key routing (``choose_rekey_routing``: on a stack whose sink plugin reads
+``SinkKeyColumns``, the key moves there and ``MessageKeyColumns`` is emptied). The preview's
+file keeps the routing every sink plugin applies (the key in ``MessageKeyColumns``). Offline:
+the preview renders into a recording UI double and Start's job body runs with
+``run_cdc_start`` captured.
 """
 
 from __future__ import annotations
@@ -83,7 +91,7 @@ def _rekeyed_state() -> DataMigrationState:
     return state
 
 
-def test_the_preview_parameter_file_is_the_set_start_cdc_sends_for_a_rekeyed_table(
+def test_the_preview_parameter_file_is_the_set_start_cdc_builds_for_a_rekeyed_table(
     monkeypatch,
 ) -> None:
     from dsql_migrator.ui.data_migration import _cdc_ui
@@ -125,6 +133,16 @@ def test_the_preview_parameter_file_is_the_set_start_cdc_sends_for_a_rekeyed_tab
     # ...and the whole file is the set Start CDC builds: the same values, the same placeholders.
     assert dict(preview.filled) == dict(built[1].filled)
     assert preview.placeholders == built[1].placeholders
+
+    # The live-stack routing comes after this build (run_cdc_start): on a stack whose sink
+    # plugin reads SinkKeyColumns -- the bundled one does -- the key moves there. The preview's
+    # file keeps it in MessageKeyColumns, the routing every sink plugin applies.
+    from dsql_migrator.core.cdc import choose_rekey_routing
+    from dsql_migrator.core.s3_provision import PLUGIN_VERSION
+
+    assert dict(preview.filled)["SinkKeyColumns"] == ""
+    routed = dict(choose_rekey_routing(sent, PLUGIN_VERSION).filled)
+    assert (routed["MessageKeyColumns"], routed["SinkKeyColumns"]) == ("", r"orders:tenant_id,id")
 
 
 def test_the_preview_and_start_build_through_one_builder() -> None:
