@@ -1375,10 +1375,18 @@ class DataMigrationState:
 
         Used when the tracked stack finishes while later ones are still going: the marker
         (and therefore the banner + the Start-over race guard) follows the next unfinished
-        stack instead of being cleared. Deliberately keeps ``kind``/``ctx`` -- the same
-        operation and the same retry context apply to every stack in one teardown.
+        stack instead of being cleared. Keeps ``kind`` and the AWS half of ``ctx``
+        (region, role, profile, cleanup_secret): the same operation and the same deployer
+        apply to every stack in one teardown. NOT ``ctx["source"]``: it is the source the
+        session's credentials were entered for, recorded for the session's OWN stack only
+        (``_cdc_ui.submit_cdc_teardown``), and the next stack may be a discovered one that
+        captures another source. Kept, it let a Retry cleanup of that stack, after the
+        operator reconnected to their own source, send that source's password to the
+        other stack's source host.
         """
         with self._lock:
+            if stack != self.cdc_teardown_stack:
+                self.cdc_teardown_ctx = {**self.cdc_teardown_ctx, "source": None}
             self.cdc_teardown_job_id = job_id
             self.cdc_teardown_stack = stack
 

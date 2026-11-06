@@ -10282,7 +10282,9 @@ def submit_cdc_teardown(
 
     ``source_identity`` is :func:`_session_source_identity` -- the source those credentials
     were entered for, captured with them. It goes into the marker's ``ctx["source"]`` for
-    the session's own stack only (``None`` for any other), and it is what Retry cleanup
+    the session's own stack only (``None`` for any other; the marker drops it when the
+    banner moves on to the next stack of a multi-stack Start over, which may be such an
+    other stack -- ``DataMigrationState.advance_cdc_teardown``), and it is what Retry cleanup
     (``ui/app.py`` ``_cdc_teardown_retry``) checks before it hands over the credentials the
     live session holds then: only while the session still targets that source, else
     ``None``. The stack-name check alone does not cover a retry. Start over resets
