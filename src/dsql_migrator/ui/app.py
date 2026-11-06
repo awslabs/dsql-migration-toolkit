@@ -1167,76 +1167,39 @@ def build_page(
         role_arn,
         aws_profile,
         cleanup_secret,
+        source_credentials,
+        source_identity,
         track_in_queue: Optional[list] = None,
     ) -> Optional[str]:
-        """Build the deployer and submit a CDC teardown (stop/delete) as a background
-        job, recording the durable marker + the retry context ({region, role_arn,
-        profile, cleanup_secret}). Shared by the Start-over teardown and the banner's
-        one-click "Retry cleanup". Returns the submitted job id (or ``None`` when the
-        ownership guard declined to overwrite a different, still-running teardown).
+        """Submit a CDC teardown (stop/delete) for Start over or the banner's one-click
+        "Retry cleanup", through the CDC step's own ``submit_cdc_teardown`` -- the one
+        submission Stop / Delete use too, so the lifecycle outcome line, the residue
+        report, the source-write audit and the session's ``source_credentials`` (for
+        the session's own stack only) reach these two paths as well. It records the
+        durable marker + the retry context ({region, role_arn, profile, cleanup_secret,
+        source}: ``source`` is the non-secret ``source_identity``; never the
+        credentials). The deploy-log lines are dropped: that log belongs to the CDC
+        card's own lifecycle job, which these paths do not set. Returns the submitted
+        job id, or ``None`` when the ownership guard declined to overwrite a different,
+        still-running teardown.
         """
-        from dsql_migrator.core.cdc_deployer import (
-            build_cdc_stack_deployer,
-            run_cdc_delete,
-            run_cdc_stop,
+        from dsql_migrator.ui.data_migration._cdc_ui import submit_cdc_teardown
+
+        job_id, claimed = submit_cdc_teardown(
+            migration_state,
+            JOB_MANAGER,
+            mode=mode,
+            stack_name=stack_name,
+            region=region,
+            role_arn=role_arn,
+            aws_profile=aws_profile,
+            cleanup_secret=cleanup_secret,
+            source_credentials=source_credentials,
+            source_identity=source_identity,
+            on_log=lambda _ts, _msg: None,
+            track_in_queue=track_in_queue,
         )
-        from dsql_migrator.ui.data_migration._cdc_status import (
-            should_replace_teardown_marker,
-        )
-
-        deployer = build_cdc_stack_deployer(
-            region, aws_profile=aws_profile, assume_role_arn=role_arn
-        )
-        if mode == "delete":
-
-            def work(handle) -> None:
-                run_cdc_delete(
-                    handle,
-                    stack_name=stack_name,
-                    deployer=deployer,
-                    on_log=lambda _ts, _msg: None,
-                    region=region,
-                    aws_profile=aws_profile,
-                    cleanup_source_secret=cleanup_secret,
-                )
-
-        else:
-
-            def work(handle) -> None:
-                run_cdc_stop(
-                    handle,
-                    stack_name=stack_name,
-                    deployer=deployer,
-                    on_log=lambda _ts, _msg: None,
-                )
-
-        job_id = JOB_MANAGER.submit(work)
-        # Record it in the caller's queue REGARDLESS of who wins the marker below: with
-        # several stacks only the first claims the single marker, so the queue is the only
-        # thing that keeps the rest tracked (and lets the banner advance to them).
-        if track_in_queue is not None:
-            track_in_queue.append((job_id, stack_name))
-        # Durable marker (survives the Start-over reset) + the retry context so the
-        # banner can re-launch this teardown even after the session is wiped. Ownership
-        # guard: don't clobber a DIFFERENT teardown still tracked+running -- keep the
-        # first, longer-lived one. This is the normal case for a multi-stack Start-over
-        # teardown (stack 2+ is refused), not just a two-tab race.
-        if should_replace_teardown_marker(
-            JOB_MANAGER, getattr(migration_state, "cdc_teardown_job_id", None), job_id
-        ):
-            migration_state.set_cdc_teardown(
-                job_id,
-                kind=mode,
-                stack=stack_name,
-                ctx={
-                    "region": region,
-                    "role_arn": role_arn,
-                    "profile": aws_profile,
-                    "cleanup_secret": cleanup_secret,
-                },
-            )
-            return job_id
-        return None
+        return job_id if claimed else None
 
     def _cdc_teardown_on_reset(mode: str) -> None:
         """Submit a CDC teardown as part of Start over (called BEFORE the reset).
@@ -1244,8 +1207,9 @@ def build_page(
         ``mode`` is ``"stop"`` (delete only the 2 MSK connectors, keep MSK/VPC/IAM
         for a fast restart) or ``"delete"`` (tear down the whole cdc-stack). All
         config is captured now (into the durable marker's retry ctx and the job
-        closure), so the imminent session reset cannot race it; the teardown runs in
-        the background and stays visible/retryable via the persistent banner.
+        closure; the session's source credentials into the job closure only), so the
+        imminent session reset cannot race it; the teardown runs in the background and
+        stays visible/retryable via the persistent banner.
         """
         migration_state = DATA_MIGRATION_STORE.get_or_create(session_id)
         session = SESSION_STORE.get_or_create(session_id)
@@ -1268,6 +1232,23 @@ def build_page(
         cleanup_secret = mode == "delete" and not getattr(
             session, "source_secret_id", None
         )
+        # The session's source username/password, read ONCE and NOW: the Start-over reset
+        # runs right after this returns and wipes them, so a read when the job runs gets
+        # None -- and on Fargate the app's identity cannot read the CDC secret instead, so
+        # a PostgreSQL teardown could not drop the replication slot (it keeps pinning
+        # source WAL). Held only by the job closures until they finish (Property 7), and
+        # handed only to this session's own stack: submit_cdc_teardown gives a discovered
+        # stack None, so it reads its own secret (it may capture a different source).
+        # The source they were entered for is read with them (the reset wipes it too) and
+        # recorded, non-secret, in the marker: a Retry cleanup after the operator has
+        # connected another source must not hand that source's password to this stack.
+        from dsql_migrator.ui.data_migration._cdc_ui import (
+            _session_source_credentials,
+            _session_source_identity,
+        )
+
+        source_credentials = _session_source_credentials(session)
+        source_identity = _session_source_identity(session)
         # The durable marker tracks ONE teardown, so the banner follows the first stack
         # and the rest are launched behind it. Only the first claims the marker (the
         # ownership guard declines the others while it is still running); each still runs
@@ -1288,6 +1269,8 @@ def build_page(
                 role_arn=role_arn,
                 aws_profile=aws_profile,
                 cleanup_secret=stack_cleanup_secret,
+                source_credentials=source_credentials,
+                source_identity=source_identity,
                 # Only the first claims the single durable marker; the queue below is
                 # what keeps the rest visible.
                 track_in_queue=launched_queue,
@@ -1369,6 +1352,28 @@ def build_page(
         # Clear first so the ownership guard sees a fresh claim (the old FAILED job is
         # a different, settled one, so it would allow the write anyway).
         migration_state.clear_cdc_teardown()
+        from dsql_migrator.ui.data_migration._cdc_ui import (
+            _session_source_credentials,
+            _session_source_identity,
+        )
+
+        # The live session's credentials, but ONLY while it still targets the source the
+        # teardown was submitted for (the marker's non-secret ctx["source"]): a failed
+        # CDC-step Delete keeps its session, so the retry can drop the slot without the
+        # secret, and so can a retry after Start over once the operator has reconnected
+        # to that same source. Anything else gets None and the delete reads the secrets,
+        # as before: a session wiped by Start over, or one connected to ANOTHER source
+        # since. The stack-name check in submit_cdc_teardown does not cover that last
+        # case -- Start over resets cdc_stack_name to the default name, and a reconnect
+        # without Start over keeps the name -- and the slot drop tries the credentials it
+        # is handed first, against the stack's own source host, with no fallback to the
+        # secret: the other source's password would reach this one and the slot stay.
+        session = SESSION_STORE.get_or_create(session_id)
+        recorded_source = ctx.get("source")
+        same_source = (
+            recorded_source is not None
+            and _session_source_identity(session) == recorded_source
+        )
         _launch_cdc_teardown(
             migration_state,
             mode=kind,
@@ -1377,6 +1382,12 @@ def build_page(
             role_arn=ctx.get("role_arn"),
             aws_profile=ctx.get("profile"),
             cleanup_secret=bool(ctx.get("cleanup_secret")),
+            source_credentials=(
+                _session_source_credentials(session) if same_source else None
+            ),
+            # Carried forward, so a retry made while the session was empty does not stop
+            # the next one (after a reconnect to the same source) from using its password.
+            source_identity=recorded_source,
         )
         ui.notify("Retrying CDC cleanup…", type="info", position="top")  # type: ignore[attr-defined]
 

@@ -267,6 +267,24 @@ def _session_source_credentials(session) -> Optional[tuple[str, str]]:
     return (getattr(config, "username", "") or "", revealed)
 
 
+def _session_source_identity(session) -> Optional[tuple]:
+    """The session's source as ``(host, port, database)``, or ``None`` with no source.
+
+    Non-secret (no username, no password), so it may sit in the teardown marker's retry
+    ctx as ``ctx["source"]``. Retry cleanup compares it with the live session's to tell
+    whether the credentials the session holds NOW were entered for the source the
+    teardown was submitted for (see :func:`submit_cdc_teardown`).
+    """
+    config = getattr(session, "source_config", None) if session is not None else None
+    if config is None:
+        return None
+    return (
+        getattr(config, "host", None),
+        getattr(config, "port", None),
+        getattr(config, "database", None),
+    )
+
+
 def _cdc_stack_has_seeder_lambda(migration_state) -> Optional[bool]:
     """Does THIS session's cdc-stack contain the in-VPC offset-seeder Lambda?
 
@@ -10163,35 +10181,198 @@ async def _start_cdc_infra_deploy(
     ui.notify("Infrastructure deploy started (~5 min).", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
+def submit_cdc_teardown(
+    migration_state,
+    job_manager,
+    *,
+    mode: str,
+    stack_name: str,
+    region: str,
+    role_arn: Optional[str],
+    aws_profile: Optional[str],
+    cleanup_secret: bool,
+    source_credentials: Optional[tuple[str, str]],
+    source_identity: Optional[tuple],
+    on_log,
+    track_in_queue: Optional[list] = None,
+) -> tuple[str, bool]:
+    """Submit a CDC teardown as a background job; return ``(job_id, claimed_marker)``.
+
+    ``mode`` ``"delete"`` tears the whole cdc-stack down; anything else is Stop (delete the
+    two MSK connectors, keep MSK / VPC / IAM for a fast restart). This is the ONE teardown
+    submission: Stop CDC and Delete CDC infrastructure on the CDC step, Start over, and the
+    cross-view banner's Retry cleanup all come here, so a teardown fix reaches all four.
+    Start over and Retry cleanup used to have their own copy in ``ui/app.py``, and it fell
+    behind this module's: it passed no source credentials (so on Fargate, where the app's
+    identity cannot read the tool-managed CDC secret, a PostgreSQL Start over could not drop
+    the replication slot, which keeps pinning source WAL), no residue or source-write
+    callbacks, and no ``_logged_cdc_lifecycle`` -- so nothing durable said the slot was left,
+    that the source was written, or how the teardown ended.
+
+    Every job runs under ``_logged_cdc_lifecycle`` (looked up as this module's global when
+    called, so a test can patch it) with the residue collector, and a delete reports its
+    source writes (the slot / publication drop) to the activity log.
+
+    ``source_credentials`` is the session's ``(username, password)`` from
+    :func:`_session_source_credentials`, or ``None`` (the delete then reads the secrets, as
+    before). Passed BY VALUE, because the caller decides when to read them: Start over must
+    read them BEFORE it resets the session -- a read inside the job runs after the reset and
+    gets ``None``. They are held only by the job's closure until the job ends (Property 7)
+    and NEVER go into the teardown marker's ``ctx``, which a later Retry cleanup reads.
+    They reach ONLY the stack this session targets (``migration_state.cdc_stack_name``,
+    checked here, at submit time); any other stack gets ``None`` and its delete reads that
+    stack's own secret, as before. Start over also tears down the account's discovered
+    stacks (``cdc_other_stacks``), and the banner's marker can name one of them: such a
+    stack may capture a different source, and the slot drop tries the credentials it is
+    handed first, against that stack's own source host, with no fallback to the secret
+    when they fail. Passing them on sent the operator's password to a server it was never
+    entered for, and left that source's slot pinning WAL.
+
+    ``source_identity`` is :func:`_session_source_identity` -- the source those credentials
+    were entered for, captured with them. It goes into the marker's ``ctx["source"]`` for
+    the session's own stack only (``None`` for any other), and it is what Retry cleanup
+    (``ui/app.py`` ``_cdc_teardown_retry``) checks before it hands over the credentials the
+    live session holds then: only while the session still targets that source, else
+    ``None``. The stack-name check alone does not cover a retry. Start over resets
+    ``cdc_stack_name`` to the default name and keeps the marker, so a failed teardown of a
+    DEFAULT-named stack still passes it once the operator has connected a different source
+    -- and a reconnect without Start over keeps the name as it was. A retry passes the
+    recorded identity back in, so it survives a retry made while the session was empty.
+    ``on_log`` receives the deploy-log lines: the CDC step shows them, Start over and Retry
+    cleanup drop them. ``track_in_queue``: a multi-stack Start over's list, appended
+    ``(job_id, stack_name)`` whether or not this job claims the marker.
+
+    ``claimed_marker`` says whether the job took the durable teardown marker (banner +
+    Start-over race guard + Retry context). It is refused while a DIFFERENT tracked
+    teardown is still running (:func:`should_replace_teardown_marker`): a two-tab race on
+    the CDC step, and every stack after the first in a multi-stack Start over. The caller
+    adds its own extras (the CDC step's lifecycle job link, notify, refresh).
+    """
+    from dsql_migrator.core.cdc_deployer import (
+        build_cdc_stack_deployer,
+        run_cdc_delete,
+        run_cdc_stop,
+    )
+
+    if stack_name != getattr(migration_state, "cdc_stack_name", None):
+        # Not this session's stack: it may capture another source (see the docstring).
+        source_credentials = source_identity = None
+    deployer = build_cdc_stack_deployer(
+        region, aws_profile=aws_profile, assume_role_arn=role_arn
+    )
+    # What the teardown could not remove from the customer's source. Collected here and
+    # read by _logged_cdc_lifecycle so the DURABLE audit line carries it -- the deploy
+    # log this also goes to is in-memory and the next lifecycle action wipes it.
+    _residue: list[str] = []
+    if mode == "delete":
+        _action = "delete CDC infrastructure"
+
+        def work(handle) -> None:
+            run_cdc_delete(
+                handle,
+                stack_name=stack_name,
+                deployer=deployer,
+                on_log=on_log,
+                region=region,
+                aws_profile=aws_profile,
+                cleanup_source_secret=cleanup_secret,
+                # The credentials this process already holds, so dropping the PostgreSQL
+                # replication slot does not depend on secretsmanager:GetSecretValue (which
+                # the app's identity is not granted for the tool-managed CDC secret).
+                source_credentials=source_credentials,
+                on_residue=_residue.append,
+                # Destroying the slot/publication on the customer's source is as auditable
+                # as creating them (which Full Load already logs via its own _audit hook);
+                # without this, teardown's source writes lived only in the in-memory deploy
+                # log. Value-free -- object names and outcomes, no row data.
+                on_source_write=lambda message: _log_cdc_event(
+                    "CDC source replication teardown",
+                    status=(
+                        ActivityStatus.WARNING
+                        if message.startswith(("WARNING", "FAILED"))
+                        else ActivityStatus.INFO
+                    ),
+                    detail=f"source ({stack_name}): {message}",
+                ),
+            )
+
+    else:
+        _action = "stop CDC connectors"
+
+        def work(handle) -> None:
+            run_cdc_stop(
+                handle,
+                stack_name=stack_name,
+                deployer=deployer,
+                on_log=on_log,
+            )
+            # The connectors are gone, so there is no live snapshot mode for the next Start
+            # to keep (core.cdc.mysql_snapshot_mode); the next probe re-reads the rest.
+            _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
+            if callable(_set_mode):
+                _set_mode(None)
+
+    job_id = job_manager.submit(
+        _logged_cdc_lifecycle(
+            _action,
+            detail=f"stack {stack_name}",
+            work=work,
+            residue=lambda: tuple(_residue),
+        )
+    )
+    # Record it in the caller's queue REGARDLESS of who wins the marker below: with
+    # several stacks only the first claims the single marker, so the queue is the only
+    # thing that keeps the rest tracked (and lets the banner advance to them).
+    if track_in_queue is not None:
+        track_in_queue.append((job_id, stack_name))
+    # Durable marker → the persistent cross-view "teardown in progress" banner (a delete
+    # runs ~15–45 min; the banner keeps it visible on every step, and it survives the
+    # Start-over reset), plus the retry context so the banner can re-launch this teardown
+    # even after the session is wiped. No credentials in it: the session's password must
+    # not outlive the session in a marker (Property 7). "source" is the non-secret
+    # (host, port, database) a retry checks before it uses the live session's credentials.
+    claimed = should_replace_teardown_marker(
+        job_manager, getattr(migration_state, "cdc_teardown_job_id", None), job_id
+    )
+    if claimed:
+        migration_state.set_cdc_teardown(
+            job_id,
+            kind=mode,
+            stack=stack_name,
+            ctx={
+                "region": region,
+                "role_arn": role_arn,
+                "profile": aws_profile,
+                "cleanup_secret": cleanup_secret,
+                "source": source_identity,
+            },
+        )
+    return job_id, claimed
+
 def _start_cdc_stop(
     ui, migration_state, job_manager, refresh, *, session=None
 ) -> None:
     """Submit Stop CDC (blank MskBootstrapServers → delete connectors) as a job."""
-    from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer, run_cdc_stop
-
     _, region = _cdc_target_region(ui, session)
     if region is None:
         return
-    deployer = build_cdc_stack_deployer(
-        region,
-        aws_profile=getattr(session, "aws_profile", None),
-        assume_role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
-    )
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
-
-    def work(handle) -> None:
-        run_cdc_stop(
-            handle,
-            stack_name=stack_name,
-            deployer=deployer,
-            on_log=migration_state.append_cdc_deploy_log,
-        )
-        # The connectors are gone, so there is no live snapshot mode for the next Start to
-        # keep (core.cdc.mysql_snapshot_mode); the next probe re-reads the rest.
-        _set_mode = getattr(migration_state, "set_cdc_deployed_snapshot_mode", None)
-        if callable(_set_mode):
-            _set_mode(None)
+    job_id, _claimed = submit_cdc_teardown(
+        migration_state,
+        job_manager,
+        mode="stop",
+        stack_name=stack_name,
+        region=region,
+        role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
+        aws_profile=getattr(session, "aws_profile", None),
+        cleanup_secret=False,
+        # Stop never touches the source (no slot drop), so it needs no credentials.
+        source_credentials=None,
+        source_identity=None,
+        on_log=migration_state.append_cdc_deploy_log,
+    )
+    migration_state.set_cdc_deploy_job_id(job_id, kind="stop")
 
     # CLOSE the run's data-path record before the connectors go away. Stop is the last
     # moment the applied-ops metrics mean anything (the connectors, and their CloudWatch
@@ -10214,31 +10395,7 @@ def _start_cdc_stop(
                 + " — as of the last status poll before Stop"
             ),
         )
-
-    _action = "stop CDC connectors"
-    _detail = f"stack {stack_name}"
-    job_id = job_manager.submit(
-        _logged_cdc_lifecycle(_action, detail=_detail, work=work)
-    )
-    migration_state.set_cdc_deploy_job_id(job_id, kind="stop")
-    # Durable marker → the persistent cross-view "teardown in progress" banner (so
-    # navigating away from the CDC step doesn't hide the running stop). Ownership
-    # guard: don't clobber a DIFFERENT teardown still running (rare two-tab race).
-    if should_replace_teardown_marker(
-        job_manager, migration_state.cdc_teardown_job_id, job_id
-    ):
-        migration_state.set_cdc_teardown(
-            job_id,
-            kind="stop",
-            stack=stack_name,
-            ctx={
-                "region": region,
-                "role_arn": getattr(migration_state, "cdc_deploy_role_arn", None),
-                "profile": getattr(session, "aws_profile", None),
-                "cleanup_secret": False,
-            },
-        )
-    _log_cdc_event(_action, detail=_detail)
+    _log_cdc_event("stop CDC connectors", detail=f"stack {stack_name}")
     ui.notify("Stop CDC submitted — removing connectors.", type="positive", position="top")  # type: ignore[attr-defined]
     refresh()
 
@@ -10246,91 +10403,35 @@ def _start_cdc_delete(
     ui, migration_state, job_manager, refresh, *, session=None
 ) -> None:
     """Submit Delete CDC infrastructure (full stack delete) as a job."""
-    from dsql_migrator.core.cdc_deployer import build_cdc_stack_deployer, run_cdc_delete
-
     _, region = _cdc_target_region(ui, session)
     if region is None:
         return
-    aws_profile = getattr(session, "aws_profile", None)
-    deployer = build_cdc_stack_deployer(
-        region,
-        aws_profile=aws_profile,
-        assume_role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
-    )
     migration_state.clear_cdc_deploy_log()
     stack_name = migration_state.cdc_stack_name
-    # Only the tool-managed (password-auth) secret should be cleaned up; if the
-    # source used Secrets Manager auth, the tool never created one and must NOT
-    # delete the customer's secret. delete_source_secret targets only the
-    # deterministic mysql-dsql-migrator/cdc/<stack>/source name, but gating here keeps
-    # the customer's own SM-auth secret entirely out of scope.
-    cleanup_secret = not getattr(session, "source_secret_id", None)
-
-    # What the teardown could not remove from the customer's source. Collected here and
-    # read by _logged_cdc_lifecycle so the DURABLE audit line carries it -- the deploy
-    # log this also goes to is in-memory and the next lifecycle action wipes it.
-    _residue: list[str] = []
-
-    def work(handle) -> None:
-        run_cdc_delete(
-            handle,
-            stack_name=stack_name,
-            deployer=deployer,
-            on_log=migration_state.append_cdc_deploy_log,
-            region=region,
-            aws_profile=aws_profile,
-            cleanup_source_secret=cleanup_secret,
-            # The credentials this process already holds, so dropping the PostgreSQL
-            # replication slot does not depend on secretsmanager:GetSecretValue (which the
-            # app's identity is not granted for the tool-managed CDC secret).
-            source_credentials=_session_source_credentials(session),
-            on_residue=_residue.append,
-            # Destroying the slot/publication on the customer's source is as auditable
-            # as creating them (which Full Load already logs via its own _audit hook);
-            # without this, teardown's source writes lived only in the in-memory deploy
-            # log. Value-free -- object names and outcomes, no row data.
-            on_source_write=lambda message: _log_cdc_event(
-                "CDC source replication teardown",
-                status=(
-                    ActivityStatus.WARNING
-                    if message.startswith(("WARNING", "FAILED"))
-                    else ActivityStatus.INFO
-                ),
-                detail=f"source ({stack_name}): {message}",
-            ),
-        )
-
-    _action = "delete CDC infrastructure"
-    _detail = f"stack {stack_name}"
-    job_id = job_manager.submit(
-        _logged_cdc_lifecycle(
-            _action, detail=_detail, work=work, residue=lambda: tuple(_residue)
-        )
+    job_id, _claimed = submit_cdc_teardown(
+        migration_state,
+        job_manager,
+        mode="delete",
+        stack_name=stack_name,
+        region=region,
+        role_arn=getattr(migration_state, "cdc_deploy_role_arn", None),
+        aws_profile=getattr(session, "aws_profile", None),
+        # Only the tool-managed (password-auth) secret should be cleaned up; if the
+        # source used Secrets Manager auth, the tool never created one and must NOT
+        # delete the customer's secret. delete_source_secret targets only the
+        # deterministic mysql-dsql-migrator/cdc/<stack>/source name, but gating here keeps
+        # the customer's own SM-auth secret entirely out of scope.
+        cleanup_secret=not getattr(session, "source_secret_id", None),
+        source_credentials=_session_source_credentials(session),
+        source_identity=_session_source_identity(session),
+        on_log=migration_state.append_cdc_deploy_log,
     )
     migration_state.set_cdc_deploy_job_id(job_id, kind="delete")
     # Clear any latched redeploy answer: this teardown must prompt again when it lands,
     # otherwise a deploy -> delete -> delete sequence silently reuses the earlier "yes"
     # and drops the operator straight back onto the deploy form.
     migration_state.set_cdc_redeploy_confirmed(False)
-    # Durable marker → the persistent cross-view "teardown in progress" banner (the
-    # delete runs ~15–45 min; the banner keeps it visible on every step, not just
-    # the CDC card the user may navigate away from). Ownership guard: don't clobber a
-    # DIFFERENT teardown still running (rare two-tab race).
-    if should_replace_teardown_marker(
-        job_manager, migration_state.cdc_teardown_job_id, job_id
-    ):
-        migration_state.set_cdc_teardown(
-            job_id,
-            kind="delete",
-            stack=stack_name,
-            ctx={
-                "region": region,
-                "role_arn": getattr(migration_state, "cdc_deploy_role_arn", None),
-                "profile": aws_profile,
-                "cleanup_secret": cleanup_secret,
-            },
-        )
-    _log_cdc_event(_action, detail=_detail)
+    _log_cdc_event("delete CDC infrastructure", detail=f"stack {stack_name}")
     ui.notify("Delete CDC infrastructure submitted.", type="warning", position="top")  # type: ignore[attr-defined]
     refresh()
 

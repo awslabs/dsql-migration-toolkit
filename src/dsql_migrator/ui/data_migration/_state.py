@@ -665,8 +665,11 @@ class DataMigrationState:
         # Everything a one-click "Retry cleanup" needs to re-launch this teardown
         # AFTER a Start-over session reset has wiped the session config (region /
         # deploy-role / profile / whether to also delete the tool-managed secret).
-        # {"region","role_arn","profile","cleanup_secret"}. Preserved with the marker
-        # across reset_in_place; empty when no teardown is tracked.
+        # {"region","role_arn","profile","cleanup_secret","source"}: "source" is the
+        # non-secret (host, port, database) the teardown was submitted for, which Retry
+        # cleanup checks before it uses the live session's credentials. Never the
+        # credentials themselves (Property 7). Preserved with the marker across
+        # reset_in_place; empty when no teardown is tracked.
         self.cdc_teardown_ctx: dict = {}
         # UI-only: remembered open/closed state of the "Deploy log" expansion.
         # Anchored on the (session-scoped) state -- NOT a local of the render fn --
@@ -1329,7 +1332,8 @@ class DataMigrationState:
         ``kind`` is ``"stop"`` (remove connectors) or ``"delete"`` (tear down the
         whole cdc-stack); ``stack`` names the targeted cdc-stack for the banner copy;
         ``ctx`` carries the config a one-click retry needs after a session reset
-        ({"region","role_arn","profile","cleanup_secret"}). Unlike
+        ({"region","role_arn","profile","cleanup_secret","source"}; "source" is the
+        non-secret source identity, never a credential). Unlike
         :meth:`set_cdc_deploy_job_id`, this marker is PRESERVED across a Start-over
         :meth:`~DataMigrationStore.reset_in_place`, so a teardown fired by Start-over
         stays visible/guarded/retryable even though the session was wiped. Cleared

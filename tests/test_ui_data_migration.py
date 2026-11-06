@@ -29011,14 +29011,16 @@ def test_the_delete_action_wires_both_audit_channels() -> None:
 
     Asserted on the parse tree so a reworded comment cannot satisfy it -- dropping either
     keyword restores the exact defect (a SUCCESS line over a surviving slot, and a
-    source-destroying write with no durable record).
+    source-destroying write with no durable record). The delete is built in
+    ``submit_cdc_teardown``, which Delete, Start over and Retry cleanup all submit through
+    (A1); tests/test_rr_a1_cdc_teardown_paths.py runs each of them.
     """
     import ast
     import inspect
 
     import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
 
-    tree = ast.parse(inspect.getsource(cdc_ui._start_cdc_delete))
+    tree = ast.parse(inspect.getsource(cdc_ui.submit_cdc_teardown))
     delete_calls = [
         node
         for node in ast.walk(tree)
