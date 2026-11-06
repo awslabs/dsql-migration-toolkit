@@ -907,8 +907,9 @@ def build_data_migration_screen(
         # DDL was generated in this session's Step 2, or it already exists on the
         # target DSQL (Schema Conversion applied earlier). The picker defaults to
         # all of them (Property 16).
+        _target_now = _target_inventory()
         generated = migratable_table_names(
-            inventory, conv_state.generated_node_ids, _target_inventory()
+            inventory, conv_state.generated_node_ids, _target_now
         )
         if not generated:
             migration_state.set_error(
@@ -917,16 +918,9 @@ def build_data_migration_screen(
                 "already exist; only tables with a target table can be migrated."
             )
             return
-        names = effective_migration_selection(
-            generated,
-            migration_state.selection,
-            touched=migration_state.selection_touched,
-            default=default_migration_selection(
-                inventory,
-                conv_state.generated_node_ids,
-                _target_inventory(),
-                conv_state.ticked_node_ids,
-            ),
+        # The screen's ONE selection formula (the card, the picker, the live gates).
+        names = resolve_migration_selection(
+            inventory, conv_state, migration_state, _target_now
         )
         if not names:
             migration_state.set_error("Select at least one table to migrate.")
