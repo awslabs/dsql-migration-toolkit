@@ -353,9 +353,14 @@ def capture_session_snapshot(
         snapshot.target_database = getattr(target, "database", None)
         snapshot.target_username = getattr(target, "username", None)
     # The source ENGINE kind only (never the source connection/secret) so a restore can
-    # pre-select the right engine on Connect. Store its plain string value.
+    # pre-select the right engine on Connect. Store its plain string value. A session
+    # restored from a host-less snapshot has no source_config but still knows its engine
+    # (restored_source_type): without that fallback the first save after the restore
+    # wrote None over the old snapshot, and the next restart brought it back as MySQL.
     source = getattr(session, "source_config", None)
-    source_type = getattr(source, "source_type", None)
+    source_type = getattr(source, "source_type", None) or getattr(
+        session, "restored_source_type", None
+    )
     if source_type is not None:
         snapshot.source_type = getattr(source_type, "value", source_type)
     # The NON-SECRET source coordinates (never the password -- it lives only in the
