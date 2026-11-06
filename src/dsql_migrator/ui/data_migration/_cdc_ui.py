@@ -826,7 +826,6 @@ def _render_cdc_source_config_card(
     _capture = cdc_capture_exclusions(migration_state, inventory, tables_for_config)
     # The preview shows what Start CDC will SEND (a stack on the 0.1.561 form keeps it).
     exclude_list = split_column_exclude_value(_capture.sent) or None
-    _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
 
     # A CDC sink needs at least one table: with none selected the sink topic list
     # would be empty and the deploy would later fail at connector create (opaque
@@ -869,45 +868,19 @@ def _render_cdc_source_config_card(
         )
         return
 
-    # MySQL: built from the SEED, the same one Start sends (see _start_cdc_deploy), so
-    # the preview cannot claim a start point the Start would not seed -- and from the same
-    # stack facts, so it prints the snapshot.mode Start sends (mysql_start_facts).
-    _config_wm = watermark if is_pg else seed
-    config = dispatch_source_config(
-        _cdc_source_type(session),
+    # The connector configs and the deployable cdc-stack parameter set (tool-known values
+    # filled, customer-environment values as <FILL_ME> placeholders), built by the SAME
+    # builder Start CDC sends from (_cdc_start_connector_params): from the same seed and
+    # stack facts, so the preview cannot claim a start point or a snapshot.mode the Start
+    # would not send, nor leave out a parameter Start sends (the composite record key).
+    config, sink, params = _cdc_start_connector_params(
+        migration_state,
+        session,
         tables_for_config,
-        _config_wm if _config_wm is not None else _sentinel_watermark(),
-        database=_cdc_source_database(session),
-        stack_name=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
-        column_exclude_list=exclude_list,
-        resume_override=_resume_override,
-        force_initial_snapshot=_force_initial_snapshot,
+        watermark=watermark,
+        seed=seed,
         start_facts=mysql_start_facts(migration_state, seed, source_type),
-    )
-
-    # The sink config (topics, keying, DLQ). DLQ name is the cdc-stack default --
-    # NOT derived from a connector that may not exist yet (pre-deploy). Engine-neutral
-    # (the DSQL sink is the same for both source engines); the deployed connector is
-    # named ``<stack>-dsql-sink``, so the preview uses "dsql-sink" (not "mysql-sink",
-    # which was wrong for BOTH engines and misleading on a PostgreSQL source).
-    sink = CdcPipelineOrchestrator().build_sink_config(
-        "dsql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
-    )
-
-    # Build the deployable cdc-stack parameter set: tool-known values filled,
-    # customer-environment values as <FILL_ME> placeholders.
-    target = getattr(session, "target_config", None)
-    params = dispatch_cdc_stack_params(
-        config,
-        sink,
-        target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
-        target_database=getattr(target, "database", "postgres") if target else "postgres",
-        target_username=getattr(target, "username", "admin") if target else "admin",
-        stack_name=getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME),
-        topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
-        # Same value the deploy would send, so this preview cannot show a
-        # SinkMcuCount the actual Start CDC then contradicts.
-        sink_mcu_count=_sink_mcu_count(),
+        exclude_list=exclude_list,
     )
 
     # SECONDARY (collapsed): connector configuration to hand to the cdc-stack.
@@ -1017,6 +990,96 @@ def _sentinel_watermark() -> "Watermark":
     valid watermark stamped with the current time so the type contract holds.
     """
     return Watermark(snapshot_timestamp=datetime.now(timezone.utc))
+
+
+def _cdc_scoped_message_key_columns(migration_state, tables_for_config) -> dict:
+    """The composite record-key overrides ({table: key columns}) of the CAPTURED tables only:
+    the map Start CDC judges its key-column gates on and sends as ``MessageKeyColumns``.
+    Pure."""
+    selected_names = {t.name for t in tables_for_config}
+    return {
+        table: cols
+        for table, cols in migration_state.cdc_message_key_columns().items()
+        if table in selected_names
+    }
+
+
+def _cdc_start_connector_params(
+    migration_state,
+    session,
+    tables_for_config,
+    *,
+    watermark,
+    seed,
+    start_facts,
+    exclude_list,
+):
+    """The ``(source_config, sink_config, params)`` a Start CDC sends -- ONE builder for the
+    connector-configuration preview and Start CDC, so the preview's downloadable parameter
+    file cannot leave out (or differ in) a parameter Start sends. No AWS call, no UI.
+
+    The preview was a second copy of this build, and the copies drifted: it never passed the
+    composite record key, so a re-keyed table's file carried an empty ``MessageKeyColumns``
+    while Start CDC sent the key. Everything that decides the parameters is resolved here --
+    the engine, the start coordinate (MySQL: the ``seed`` Start offers the seeder;
+    PostgreSQL: the job ``watermark``), the resume signal, the captured tables' key map, the
+    sink and the sink MCU count -- except what the callers pass:
+
+    - ``exclude_list``: chosen on purpose per caller. The preview shows what Start CDC sends
+      (``_capture.sent``, which keeps a 0.1.561-form value a stack carries); Start sends the
+      exact form (``_capture.value``) and ``run_cdc_start`` re-chooses it against the LIVE
+      stack.
+    - ``start_facts``: :func:`mysql_start_facts` for ``seed``; Start's worker re-judges the
+      very facts the ``snapshot.mode`` was decided from.
+
+    The target is the session's ``target_config`` (the preview may have none). Start CDC
+    checks its region right after this build (:func:`_cdc_target_region`, which can stop
+    the click), where it checked it before the build was shared.
+
+    The sink connector is named "dsql-sink" (the deployed one is ``<stack>-dsql-sink``, for
+    both engines; "mysql-sink" was wrong for both); the name does not reach the parameters.
+    """
+    source_type = _cdc_source_type(session)
+    stack_name = getattr(migration_state, "cdc_stack_name", CDC_DEFAULT_STACK_NAME)
+    target = getattr(session, "target_config", None)
+    resume_override, force_initial_snapshot = _cdc_resume_signal(migration_state, session)
+    config_wm = watermark if source_type is SourceType.POSTGRES else seed
+    source_config = dispatch_source_config(
+        source_type,
+        tables_for_config,
+        config_wm if config_wm is not None else _sentinel_watermark(),
+        database=_cdc_source_database(session),
+        stack_name=stack_name,
+        column_exclude_list=exclude_list,
+        resume_override=resume_override,
+        force_initial_snapshot=force_initial_snapshot,
+        message_key_columns=_cdc_scoped_message_key_columns(migration_state, tables_for_config),
+        # publication.autocreate.mode is NOT passed: it is derived from the snapshot mode
+        # (pg_publication_autocreate_mode). It used to come from a separate piece of UI
+        # state that the start-position radio and session restore never set, which is how
+        # snapshot.mode=initial + autocreate=disabled -- guaranteed connector death, after
+        # both connectors are billed -- became reachable.
+        start_facts=start_facts,
+    )
+    # The sink config (topics, keying, DLQ). The DLQ name is the cdc-stack default -- NOT
+    # derived from a connector that may not exist yet (pre-deploy).
+    sink_config = CdcPipelineOrchestrator().build_sink_config(
+        "dsql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
+    )
+    params = dispatch_cdc_stack_params(
+        source_config,
+        sink_config,
+        target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
+        target_database=getattr(target, "database", "postgres") if target else "postgres",
+        target_username=getattr(target, "username", "admin") if target else "admin",
+        stack_name=stack_name,
+        topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
+        # Read fresh per call, so a Settings change reaches the next Start CDC (and this
+        # preview shows the SinkMcuCount that Start then sends).
+        sink_mcu_count=_sink_mcu_count(),
+    )
+    return source_config, sink_config, params
+
 
 def _render_cdc_exclusion_summary(ui, migration_state, job_manager, inventory) -> None:
     """The CDC step's read-only line: how much is excluded, and the ColumnExcludeList CDC
@@ -8986,7 +9049,9 @@ def _start_cdc_deploy(
             body=_exclusion_mismatch,
         )
         return
-    _resume_override, _force_initial_snapshot = _cdc_resume_signal(migration_state, session)
+    # The builder below reads the same signal for the connector config (pure; no await
+    # between): Start's activity line says whether it forces a snapshot.
+    _force_initial_snapshot = _cdc_resume_signal(migration_state, session)[1]
     mode = migration_state.cdc_start_mode()
     # Guard: a CDC sink requires at least one table (empty -> SinkTopics="" ->
     # connector create fails later with an opaque HTTP 400, ~minutes into a
@@ -9006,12 +9071,8 @@ def _start_cdc_deploy(
     # replicated, then gate the ONE precondition -- a composite key column must not
     # be dropped at capture (column.exclude.list), or CDC can't build the composite key
     # (Debezium's record key, or the sink's from the row image on a v51+ stack).
-    selected_names = {t.name for t in tables_for_config}
-    message_key_columns = {
-        table: cols
-        for table, cols in migration_state.cdc_message_key_columns().items()
-        if table in selected_names
-    }
+    # The same scoping the connector-config builder sends (_cdc_start_connector_params).
+    message_key_columns = _cdc_scoped_message_key_columns(migration_state, tables_for_config)
     if _capture.error:
         render_notice(
             ui,
@@ -9209,42 +9270,22 @@ def _start_cdc_deploy(
     # MySQL: the connector config is built from the SEED and the cached stack facts, so
     # snapshot.mode (mysql_snapshot_mode: recovery for a NEW start offset, schema_only for
     # a resume) and the start coordinate agree with what is seeded by construction -- and
-    # with the preview. PostgreSQL: the job watermark exactly as before (no facts).
-    _config_wm = watermark if _cdc_source_type(session) is SourceType.POSTGRES else seed
+    # with the preview, which is built by the same builder. PostgreSQL: the job watermark
+    # exactly as before (no facts).
     _start_facts = mysql_start_facts(migration_state, seed, _cdc_source_type(session))
-    source_config = dispatch_source_config(
-        _cdc_source_type(session),
+    source_config, _sink_config, params = _cdc_start_connector_params(
+        migration_state,
+        session,
         tables_for_config,
-        _config_wm if _config_wm is not None else _sentinel_watermark(),
-        database=_cdc_source_database(session),
-        stack_name=migration_state.cdc_stack_name,
-        column_exclude_list=exclude_list,
-        resume_override=_resume_override,
-        force_initial_snapshot=_force_initial_snapshot,
-        message_key_columns=message_key_columns,
-        # publication.autocreate.mode is NOT passed: it is derived from the snapshot mode
-        # (pg_publication_autocreate_mode). It used to come from a separate piece of UI
-        # state that the start-position radio and session restore never set, which is how
-        # snapshot.mode=initial + autocreate=disabled -- guaranteed connector death, after
-        # both connectors are billed -- became reachable.
+        watermark=watermark,
+        seed=seed,
         start_facts=_start_facts,
+        exclude_list=exclude_list,
     )
     _sent_snapshot_mode = getattr(source_config, "snapshot_mode", None)
-    sink_config = CdcPipelineOrchestrator().build_sink_config(
-        "mysql-sink", tables_for_config, CDC_DEFAULT_DLQ_TOPIC
-    )
     target, region = _cdc_target_region(ui, session)
     if region is None:
         return
-    params = dispatch_cdc_stack_params(
-        source_config, sink_config,
-        target_endpoint=getattr(target, "cluster_endpoint", "") if target else "",
-        target_database=getattr(target, "database", "postgres") if target else "postgres",
-        target_username=getattr(target, "username", "admin") if target else "admin",
-        stack_name=migration_state.cdc_stack_name,
-        topic_prefix=CDC_DEFAULT_TOPIC_PREFIX,
-        sink_mcu_count=_sink_mcu_count(),
-    )
     params = params.model_copy(update={"column_exclude_legacy": _capture.legacy})
     # The stack value the exclusion-mismatch refusal judged: the job refuses if the LIVE
     # stack carries another one by the time it runs (another session started it).

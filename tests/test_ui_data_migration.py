@@ -17142,10 +17142,11 @@ def test_every_cdc_param_build_passes_the_configured_sink_mcu() -> None:
 
     The builders DEFAULT this argument, so a forgotten call site is silently wrong
     rather than a TypeError: the Settings knob would appear to work while that path
-    kept deploying the template default. The three sites matter for different reasons
-    -- the infra create records the value on a fresh stack, Start CDC is what actually
-    creates/updates the sink connector, and the read-only params preview must not
-    advertise a value the deploy then contradicts. This is the "state exists but was
+    kept deploying the template default. The sites matter for different reasons -- the
+    infra create records the value on a fresh stack, and the Start CDC build
+    (``_cdc_start_connector_params``) is what actually creates/updates the sink connector
+    and, being the read-only params preview's builder too, keeps the preview from
+    advertising a value the deploy then contradicts. This is the "state exists but was
     never wired into the render/deploy" gap, so it is asserted structurally.
     """
     import ast
@@ -17163,8 +17164,17 @@ def test_every_cdc_param_build_passes_the_configured_sink_mcu() -> None:
         # PostgreSQL); the sink_mcu_count wiring must survive that indirection.
         and node.func.id in ("dispatch_cdc_stack_params", "dispatch_cdc_infra_params")
     ]
-    # Two Start-CDC-path builds (preview + deploy) and one infra create.
-    assert len(calls) == 3, f"expected 3 param builds, found {len(calls)}"
+    # One Start-CDC-path build (shared by the preview and the deploy) and one infra create.
+    assert len(calls) == 2, f"expected 2 param builds, found {len(calls)}"
+    starts = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_cdc_start_connector_params"
+    ]
+    assert len(starts) == 1 and any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "dispatch_cdc_stack_params"
+        for n in ast.walk(starts[0])
+    )
     for call in calls:
         kwargs = {kw.arg for kw in call.keywords if kw.arg}
         assert "sink_mcu_count" in kwargs, (
