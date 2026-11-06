@@ -2436,6 +2436,42 @@ def preselect_lob_columns_for_reason(
     return tuple(matched)
 
 
+def _convert_with_edits(inventory, conv_state, source_type):
+    """``(conversion, applied)`` for ``source_type``: the deterministic conversion of
+    ``inventory`` and the per-table APPLIED conversion (Schema Conversion's edits and its
+    foreign-key toggle). The one chain behind :func:`session_applied_conversions` (the
+    engine read off the session) and :func:`effective_target_ddls` (whose callers pass
+    :func:`session_source_type`); nothing else calls it. The edits are COPIED first: the
+    callers include job threads, and the UI thread may be editing that dict meanwhile."""
+    from dsql_migrator.core.converter import SchemaConverter
+    from dsql_migrator.ui.schema_conversion import applied_table_conversions
+
+    conversion = SchemaConverter(source_type=source_type).convert(inventory)
+    return conversion, applied_table_conversions(
+        conversion,
+        dict(getattr(conv_state, "edited_target_ddls", None) or {}),
+        preserve_foreign_keys=getattr(conv_state, "preserve_foreign_keys", True),
+    )
+
+
+def session_applied_conversions(session, inventory, conv_state):
+    """``(conversion, applied)`` -- the session's schema conversion and the per-table
+    APPLIED conversion (Schema Conversion's edits and foreign-key toggle) -- converted
+    with the session's engine as :func:`session_source_type` reads it.
+
+    THE derivation for every screen that rebuilds what Full Load applied: the Full Load
+    run, a retry or reload, the foreign-key action and its count, the post-load identity
+    sync, the render, Validation and Cut over. Each used to pick the engine itself, and
+    three ways drifted apart: ``session.source_config.source_type if ... else MYSQL`` and
+    ``_src.source_type`` both lose the engine of a RESTORED session (an older snapshot
+    restores it with no ``source_config``), so Cut over converted a PostgreSQL inventory
+    as MySQL (a PG ``timestamp`` became TIMESTAMPTZ) and the foreign-key card's count
+    raised and read 0. The edits are copied (safe on a job thread) and the toggle is
+    always applied. Raises what the converter raises; each caller keeps its own fallback.
+    """
+    return _convert_with_edits(inventory, conv_state, session_source_type(session))
+
+
 def effective_target_ddls(inventory, conv_state, source_type) -> "Optional[dict[str, str]]":
     """The applied target DDL per table, from the SAME inputs the Full Load runner converts
     with (inventory + Schema Conversion edits and toggle). ``None`` when either is missing.
@@ -2443,19 +2479,12 @@ def effective_target_ddls(inventory, conv_state, source_type) -> "Optional[dict[
     The ONE text source the overlay records against and cut over compares with (a DDL
     digest only matches byte-identical text), so every caller passes
     :func:`session_source_type` -- a MySQL fallback would convert a restored PostgreSQL
-    session's DDL differently. Called on job threads: the edits are copied first.
+    session's DDL differently. Called on job threads: the edits are copied first (the
+    chain :func:`session_applied_conversions` converts with).
     """
     if inventory is None or not getattr(inventory, "tables", None) or conv_state is None:
         return None
-    from dsql_migrator.core.converter import SchemaConverter
-    from dsql_migrator.ui.schema_conversion import applied_table_conversions
-
-    edited = dict(getattr(conv_state, "edited_target_ddls", None) or {})
-    applied = applied_table_conversions(
-        SchemaConverter(source_type=source_type).convert(inventory),
-        edited,
-        preserve_foreign_keys=getattr(conv_state, "preserve_foreign_keys", True),
-    )
+    _conversion, applied = _convert_with_edits(inventory, conv_state, source_type)
     return {name: conversion.target_ddl for name, conversion in applied.items()}
 
 

@@ -23317,7 +23317,7 @@ def test_a_reload_that_replaces_a_table_clears_the_stale_fk_result() -> None:
     # 2. a retry clears it ONLY when it will actually replace a table -- an append-only
     #    retry leaves the constraints in place, and clearing then would nag for no reason.
     retry = src[src.index("retry_replace = ("):]
-    retry = retry[:retry.index("_retry_conversion = SchemaConverter")]
+    retry = retry[:retry.index("_retry_conversion, _applied_retry_conversion = ")]
     assert "if retry_replace:" in retry, (
         "the retry's clear must be scoped to replacements:\n" + retry
     )
@@ -28257,14 +28257,35 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
     assert restored.source_config is None
     assert session_source_type(restored) is SourceType.POSTGRES
 
-    # No engine read in this screen may use the fallback form.
-    src = inspect.getsource(dm.build_data_migration_screen)
-    assert "session.source_config.source_type" not in src, (
-        "an engine read still falls back to MySQL; a restored PostgreSQL session would be "
-        "treated as MySQL"
+    # No engine read in this screen -- nor in Validation / Cut over, which rebuild the same
+    # applied conversion -- may read a source_config's engine: not the fallback form, not a
+    # local's (`source_config.source_type`), not the foreign-key card's `_src.source_type`
+    # (it raised for a restored session and the card's count read 0), not the getattr
+    # chain with a MySQL default. session_source_type is the sanctioned read.
+    import re
+
+    from dsql_migrator.ui import validation as uival
+
+    engine_read = re.compile(
+        r"source_config\.source_type"
+        r"|\b_src\.source_type"
+        r"|[\"']source_config[\"'],\s*None\),\s*[\"']source_type[\"']"
     )
-    # ...and the reads that replaced it are the shared helper.
-    assert src.count("session_source_type(session)") >= 3
+    screen = inspect.getsource(dm.build_data_migration_screen)
+    cut_over = inspect.getsource(uival)
+    for where, src in (("build_data_migration_screen", screen), ("ui/validation.py", cut_over)):
+        assert not engine_read.findall(src), (
+            f"{where}: an engine read bypasses session_source_type; a restored PostgreSQL "
+            f"session would be treated as MySQL: {engine_read.findall(src)}"
+        )
+        # ...and the applied conversion is converted only through the one helper, which
+        # takes the engine from session_source_type and copies the edits.
+        assert "SchemaConverter(" not in src, (
+            f"{where}: a conversion picks its own engine; use session_applied_conversions"
+        )
+    assert "applied_table_conversions(" not in cut_over
+    assert screen.count("session_applied_conversions(") >= 6
+    assert cut_over.count("session_applied_conversions(") >= 4
 
 
 def test_the_converter_reads_consume_engine_independent_values_today() -> None:

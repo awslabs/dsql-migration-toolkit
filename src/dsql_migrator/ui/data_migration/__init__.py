@@ -295,6 +295,7 @@ from dsql_migrator.ui.data_migration._models import (
     make_lob_candidates_for,
     cutover_restore_block_reason,
     effective_target_ddls,
+    session_applied_conversions,
     session_source_type,
     scope_lob_candidates,
     format_column_exclude_list,
@@ -515,13 +516,8 @@ def build_data_migration_screen(
             inventory_now = _inventory()
             if inventory_now is None:
                 return {}
-            conv_now = conv_store.get_or_create(session_id)
-            applied = applied_table_conversions(
-                SchemaConverter(source_type=session_source_type(session)).convert(
-                    inventory_now
-                ),
-                dict(conv_now.edited_target_ddls or {}),
-                preserve_foreign_keys=conv_now.preserve_foreign_keys,
+            _conversion, applied = session_applied_conversions(
+                session, inventory_now, conv_store.get_or_create(session_id)
             )
             return identity_sync_extras(
                 source_config=session.source_config,
@@ -857,13 +853,8 @@ def build_data_migration_screen(
         target_config = session.target_config
         assert source_config is not None  # guaranteed by has_source()
         assert target_config is not None  # guaranteed by has_target()
-        _conversion = SchemaConverter(
-            source_type=source_config.source_type
-        ).convert(inventory)
-        _applied_conversions = applied_table_conversions(
-            _conversion,
-            conv_state.edited_target_ddls,
-            preserve_foreign_keys=conv_state.preserve_foreign_keys,
+        _conversion, _applied_conversions = session_applied_conversions(
+            session, inventory, conv_state
         )
         _run_replace, _disclosed = migration_state.take_run_choice()
         inputs = DataMigrationInputs(
@@ -955,7 +946,7 @@ def build_data_migration_screen(
             migration_state.pending_full_load_confirm = True
             return
         inputs = dataclasses.replace(inputs, **_overlay_fields)
-        if source_config.source_type is SourceType.MYSQL:
+        if _engine is SourceType.MYSQL:
             # G17: the start-point definition of every migratable table this run does not
             # load, recorded with its watermark -- the only proof that one of them, ticked
             # after a Full load + CDC load, has not changed since this start point. Both run
@@ -1133,8 +1124,9 @@ def build_data_migration_screen(
         # on the source PK with the sink writing the composite key (G15). Recompute from the
         # applied conversion each render and store it on the state for the CDC start path.
         if inventory is not None and inventory.tables:
-            # session_source_type, NOT a source_config read with a MySQL fallback: a
-            # RESTORED session (reconnect / task replacement) records the engine WITHOUT a
+            # session_applied_conversions (the engine via session_source_type), NOT a
+            # source_config read with a MySQL fallback: a RESTORED session (reconnect /
+            # task replacement) records the engine WITHOUT a
             # source_config, so the fallback built a MySQL converter for a PostgreSQL
             # inventory. Measured: that changes column TYPES (a PG `timestamp` becomes
             # TIMESTAMPTZ instead of TIMESTAMP -- a timezone-semantics change -- and
@@ -1144,13 +1136,8 @@ def build_data_migration_screen(
             # fix is behaviour-preserving -- but only by luck: the moment an engine
             # difference reaches the re-key choice or FK ownership, the wrong CDC record
             # key would make the sink upsert on the wrong columns, silently.
-            _conversion = SchemaConverter(
-                source_type=session_source_type(session)
-            ).convert(inventory)
-            _applied = applied_table_conversions(
-                _conversion,
-                conv_state.edited_target_ddls,
-                preserve_foreign_keys=conv_state.preserve_foreign_keys,
+            _conversion, _applied = session_applied_conversions(
+                session, inventory, conv_state
             )
             migration_state.set_cdc_message_key_columns(
                 composite_key_columns_for_cdc(inventory.tables, _applied)
@@ -1243,6 +1230,9 @@ def build_data_migration_screen(
             source_config = session.source_config
             target_config = session.target_config
             assert source_config is not None and target_config is not None
+            # The engine through session_source_type, the screen's one rule (the live
+            # config asserted above wins in it).
+            _check_engine = session_source_type(session)
             checker = build_prerequisite_checker(
                 source_config=source_config,
                 source_password=session.source_password,
@@ -1273,7 +1263,7 @@ def build_data_migration_screen(
                 # Engine selects the CDC-only checks: a PostgreSQL source reports
                 # CDC as not-yet-supported (INFO) instead of running MySQL binlog
                 # checks that would falsely FAIL.
-                source_type=source_config.source_type,
+                source_type=_check_engine,
                 # ... AND the consistency point has not been passed yet. The stack predicate
                 # alone answers only "is this the provisioning CONFIGURATION"; it stays true
                 # for the whole session, so once the load has run it kept asserting a
@@ -1311,7 +1301,7 @@ def build_data_migration_screen(
                 # absences a re-snapshot repairs, so nothing leaves a red FAIL beside an
                 # enabled primary button.
                 cdc_start_resnapshots=(
-                    source_config.source_type is SourceType.POSTGRES
+                    _check_engine is SourceType.POSTGRES
                     and pg_snapshot_mode(
                         _wm_for_gate,
                         force_initial_snapshot=(
@@ -1347,7 +1337,7 @@ def build_data_migration_screen(
                     fl_cdc_pending_additions(
                         migration_state, job_manager, names, job=_record_for_gate
                     )
-                    if source_config.source_type is SourceType.POSTGRES
+                    if _check_engine is SourceType.POSTGRES
                     else []
                 ),
             )
@@ -2256,13 +2246,8 @@ def build_data_migration_screen(
                     # would reject a violating row), so this is scoped to replacements.
                     # G142: with Aurora DSQL's validation record and Cut over's result.
                     migration_state.forget_applied_foreign_keys()
-                _retry_conversion = SchemaConverter(
-                    source_type=source_config.source_type
-                ).convert(inventory)
-                _applied_retry_conversion = applied_table_conversions(
-                    _retry_conversion,
-                    conv_state.edited_target_ddls,
-                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
+                _retry_conversion, _applied_retry_conversion = session_applied_conversions(
+                    session, inventory, conv_state
                 )
                 retry_inputs = DataMigrationInputs(
                     source_config=source_config,
@@ -2561,12 +2546,10 @@ def build_data_migration_screen(
                 _src = session.source_config
                 _tgt = session.target_config
                 _inv = _inventory()
-                _conv = SchemaConverter(source_type=_src.source_type).convert(_inv)
-                _applied_conv = applied_table_conversions(
-                    _conv,
-                    conv_state.edited_target_ddls,
-                    preserve_foreign_keys=conv_state.preserve_foreign_keys,
-                )
+                # The session's engine (session_source_type), not _src's: a RESTORED
+                # session has no source_config, and reading it raised -- which the card's
+                # count swallowed as 0 pending keys.
+                _conv, _applied_conv = session_applied_conversions(session, _inv, conv_state)
                 # The migration's keys (a key is on its child) plus keys INTO it from an
                 # unselected child -- the ones a replace pre-drop or the CDC precondition
                 # may have removed. The pinned selection, not the live picker: a stale
@@ -3275,23 +3258,14 @@ def build_data_migration_screen(
                             schema_recreate_candidates=lambda: schema_recreate_tables(
                                 selected_names,
                                 table_conversions=(
-                                    applied_table_conversions(
-                                        SchemaConverter(
-                                            # Same restored-session fallback as above.
-                                            # This site only reads the target PRIMARY KEY
-                                            # (schema_recreate_tables ->
-                                            # parse_target_primary_key), which does not
-                                            # diverge by engine, so it is safe today --
-                                            # changed anyway so one rule holds for every
-                                            # engine read rather than two with different
-                                            # reasons for being correct.
-                                            source_type=session_source_type(session)
-                                        ).convert(inventory),
-                                        conv_state.edited_target_ddls,
-                                        preserve_foreign_keys=(
-                                            conv_state.preserve_foreign_keys
-                                        ),
-                                    )
+                                    # The one restored-session-safe derivation. This
+                                    # site only reads the target PRIMARY KEY
+                                    # (schema_recreate_tables -> parse_target_primary_key),
+                                    # which does not diverge by engine -- it shares it so
+                                    # one rule holds for every engine read.
+                                    session_applied_conversions(
+                                        session, inventory, conv_state
+                                    )[1]
                                     if inventory is not None
                                     else {}
                                 ),
@@ -3392,14 +3366,9 @@ def build_data_migration_screen(
                                 infra_ready = getattr(
                                     migration_state, "cdc_stack_phase", None
                                 ) in ("infra", "running", "unstable")
-                                _is_pg = (
-                                    getattr(
-                                        getattr(session, "source_config", None),
-                                        "source_type",
-                                        None,
-                                    )
-                                    is SourceType.POSTGRES
-                                )
+                                # session_source_type: a restored PostgreSQL session
+                                # (no source_config) gets the PostgreSQL wording too.
+                                _is_pg = session_source_type(session) is SourceType.POSTGRES
                                 # G12: a table was selected after this load, so its
                                 # watermark does not cover it and the type selector is
                                 # locked (migration_type_lock_reason): say how to add CDC

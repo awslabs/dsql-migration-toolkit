@@ -543,9 +543,11 @@ def test_validation_recognises_a_composite_key_after_a_restore(monkeypatch):
     import dsql_migrator.ui.validation as validation
 
     body = inspect.getsource(validation.session_exclusion_split)
-    # Only when nothing is recorded, and with the Schema Conversion state's own inputs.
+    # Only when nothing is recorded, and with the Schema Conversion state's own inputs (the
+    # one helper converts with its edits and toggle, the engine a restore recorded too).
     assert "if not recorded and conv_state is not None:" in body
-    assert "conv_state.edited_target_ddls" in body and "conv_state.preserve_foreign_keys" in body
+    assert "session_applied_conversions(session, inv, conv_state)" in body
+    assert "conv_state.preserve_foreign_keys" in body
     # The shape it relies on: an explicit applied conversion drops B2 with no recorded state.
     from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
 

@@ -150,7 +150,11 @@ from dsql_migrator.ui.cutover_defaults import (
 )
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.data_migration import DataMigrationStore
-from dsql_migrator.ui.data_migration._models import effective_lob_exclusions
+from dsql_migrator.ui.data_migration._models import (
+    effective_lob_exclusions,
+    session_applied_conversions,
+    session_source_type,
+)
 from dsql_migrator.ui.design import (
     badge_classes,
     chip_group_quasar_color,
@@ -1962,13 +1966,13 @@ def _source_engine_word(session: object) -> str:
 
     The cut-over runbook names the source engine ("your app stops writing to
     MySQL", "keep the MySQL source frozen") — copy that is wrong for a PostgreSQL
-    source. Derive the word from the session's source config; default to "MySQL"
-    (the original/most common source, matching :class:`SourceType`'s own default)
-    if the source type cannot be resolved, so the runbook is never left blank.
+    source. Derive the word from the session's engine (``session_source_type``: the
+    live source config, else the engine a restore recorded without one); default to
+    "MySQL" (the original/most common source, matching :class:`SourceType`'s own
+    default) if the source type cannot be resolved, so the runbook is never left blank.
     """
     try:
-        source_config = getattr(session, "source_config", None)
-        if source_config is not None and source_config.source_type is SourceType.POSTGRES:
+        if session_source_type(session) is SourceType.POSTGRES:
             return "PostgreSQL"
     except Exception:  # noqa: BLE001 - decorative; never break the page
         pass
@@ -2965,15 +2969,7 @@ def session_exclusion_split(
     recorded = getter()[0] if callable(getter) else {}
     if not recorded and conv_state is not None:
         try:
-            from dsql_migrator.core.converter import SchemaConverter
-            from dsql_migrator.ui.data_migration._models import session_source_type
-            from dsql_migrator.ui.schema_conversion import applied_table_conversions
-
-            applied = applied_table_conversions(
-                SchemaConverter(source_type=session_source_type(session)).convert(inv),
-                conv_state.edited_target_ddls,
-                preserve_foreign_keys=conv_state.preserve_foreign_keys,
-            )
+            _conversion, applied = session_applied_conversions(session, inv, conv_state)
             preserve = conv_state.preserve_foreign_keys
         except Exception:  # noqa: BLE001 - fall back to the recorded / source facts
             applied = None
@@ -3067,21 +3063,9 @@ def build_validation_screen(
         if conv_state is None:
             return {}
         try:
-            from dsql_migrator.core.converter import (
-                SchemaConverter,
-                parse_target_column_types,
-            )
-            from dsql_migrator.ui.schema_conversion import applied_table_conversions
+            from dsql_migrator.core.converter import parse_target_column_types
 
-            _stype = (
-                session.source_config.source_type
-                if session.source_config is not None
-                else SourceType.MYSQL
-            )
-            applied = applied_table_conversions(
-                SchemaConverter(source_type=_stype).convert(inv),
-                conv_state.edited_target_ddls,
-            )
+            _conversion, applied = session_applied_conversions(session, inv, conv_state)
             out: dict[str, dict[str, str]] = {}
             for name, conversion in applied.items():
                 types = parse_target_column_types(conversion.target_ddl)
@@ -4915,7 +4899,9 @@ def _cutover_fk_keys(
     if conv_state is None or not getattr(conv_state, "preserve_foreign_keys", True):
         return [], frozenset(), {}
     defs = foreign_key_defs(applied)
-    source = getattr(getattr(session, "source_config", None), "source_type", SourceType.MYSQL)
+    # The session's engine, a restored one too (no source_config): a PostgreSQL source has
+    # no MySQL cascade / collation gap to hold Finish on.
+    source = session_source_type(session)
     breakable = (
         foreign_keys_cdc_can_break(applied, tables)
         if cdc_in_use and source is SourceType.MYSQL
@@ -5414,19 +5400,9 @@ def _identity_sync_context(
     inventory = result.inventory if result is not None else None
     if inventory is None:
         return None
-    from dsql_migrator.core.converter import SchemaConverter
-    from dsql_migrator.ui.schema_conversion import applied_table_conversions
-
-    stype = (
-        session.source_config.source_type  # type: ignore[attr-defined]
-        if getattr(session, "source_config", None) is not None
-        else SourceType.MYSQL
-    )
-    applied = applied_table_conversions(
-        SchemaConverter(source_type=stype).convert(inventory),
-        conv_state.edited_target_ddls,
-        preserve_foreign_keys=conv_state.preserve_foreign_keys,
-    )
+    # The session's engine, a RESTORED one too (no source_config): a MySQL fallback
+    # converted a PostgreSQL inventory as MySQL for every cut-over FK / identity input.
+    _conversion, applied = session_applied_conversions(session, inventory, conv_state)
     # Only the migrated tables (the FK count is scoped the same way).
     return list(inventory.tables), _in_migration_scope(applied, migration_state)
 
@@ -5507,23 +5483,14 @@ def _run_cutover_foreign_keys(
     scope = _migrated_tables(migration_state)
 
     def _work(_handle: object = None) -> None:
-        from dsql_migrator.core.converter import SchemaConverter
         from dsql_migrator.core.target_connection import DsqlConnector
         from dsql_migrator.ui.data_migration._full_load_engine import (
             apply_preserved_foreign_keys,
         )
-        from dsql_migrator.ui.schema_conversion import applied_table_conversions
 
-        _stype = (
-            session.source_config.source_type  # type: ignore[attr-defined]
-            if getattr(session, "source_config", None) is not None
-            else SourceType.MYSQL
-        )
-        applied = applied_table_conversions(
-            SchemaConverter(source_type=_stype).convert(inventory),
-            conv_state.edited_target_ddls,
-            preserve_foreign_keys=conv_state.preserve_foreign_keys,
-        )
+        # The session's engine (a restored one too) and a COPY of the edits: this runs
+        # on a job thread while the UI thread may be editing them.
+        _conversion, applied = session_applied_conversions(session, inventory, conv_state)
         from dsql_migrator.ui.data_migration._full_load_engine import (
             foreign_keys_counted_before_add,
             foreign_keys_in_scope,
@@ -5679,7 +5646,7 @@ def build_cutover_screen(
             tuple(sorted((getattr(conv_state, "edited_target_ddls", None) or {}).items())),
             getattr(conv_state, "preserve_foreign_keys", None),
             tuple(_migrated_tables(migration_state) or ()),
-            getattr(getattr(session, "source_config", None), "source_type", None),
+            session_source_type(session),
             bool(cdc_in_use),
             # The children the last pass left out as absent: not waited for.
             absent() if callable(absent) else frozenset(),
