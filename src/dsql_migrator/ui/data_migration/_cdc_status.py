@@ -425,32 +425,37 @@ def _fetch_migration_row_counts(migration_state, session, table_names, inventory
             dialect = dialect_for(source_config.source_type)
             engine_factory = make_source_engine_factory(session.source_password)
             engine = engine_factory(source_config)
-            with engine.connect() as connection:
-                # Autocommit, so one refused read cannot fail the ones after it: a table
-                # whose row-level security refuses this user (row_security = off makes
-                # PostgreSQL raise rather than filter) failed its MAX(pk) inside one shared
-                # transaction, which every later table's MAX(pk) and the slot-health read
-                # then found ABORTED -- the WAL-retention panel disappeared with them.
-                connection = _autocommit(connection)
-                # MySQL 8.0+: the estimate from InnoDB, not the statistics cache (up to a
-                # day old), as the Full Load reads its own; nothing is sent to 5.7.
-                dialect.prepare_estimate_session(connection)
-                source_counts = estimate_source_rows(connection, list(table_names), dialect)
-                source_max_pk = max_pk_source(connection, pk_by_table, dialect)
-                # PostgreSQL CDC only: piggyback the source read-only connection to read
-                # the replication slot's WAL-retention health (a cheap pg_replication_slots
-                # SELECT), so the monitor can warn about WAL pressure before the source
-                # disk fills. Best-effort; MySQL's dialect returns None (no slot).
-                _refresh_pg_slot_health(migration_state, source_config, connection)
-                # How old each estimate is (PostgreSQL: last ANALYZE/VACUUM stamps via the
-                # per-OID statistics functions -- no scan). Kept the LAST read on this
-                # connection, for a connection that could not be made autocommit (a failed
-                # statement then leaves the transaction ABORTED for the reads after it).
-                # Display-only, so it can never cost the counts either.
-                try:
-                    stats_at = dict(dialect.estimate_stats_at(connection, list(table_names)))
-                except Exception:  # noqa: BLE001 - display metadata only
-                    stats_at = {}
+            # Disposed on every exit: a QueuePool engine left to the GC kept its pooled
+            # connection to the (production) source open after every Refresh click.
+            try:
+                with engine.connect() as connection:
+                    # Autocommit, so one refused read cannot fail the ones after it: a table
+                    # whose row-level security refuses this user (row_security = off makes
+                    # PostgreSQL raise rather than filter) failed its MAX(pk) inside one shared
+                    # transaction, which every later table's MAX(pk) and the slot-health read
+                    # then found ABORTED -- the WAL-retention panel disappeared with them.
+                    connection = _autocommit(connection)
+                    # MySQL 8.0+: the estimate from InnoDB, not the statistics cache (up to a
+                    # day old), as the Full Load reads its own; nothing is sent to 5.7.
+                    dialect.prepare_estimate_session(connection)
+                    source_counts = estimate_source_rows(connection, list(table_names), dialect)
+                    source_max_pk = max_pk_source(connection, pk_by_table, dialect)
+                    # PostgreSQL CDC only: piggyback the source read-only connection to read
+                    # the replication slot's WAL-retention health (a cheap pg_replication_slots
+                    # SELECT), so the monitor can warn about WAL pressure before the source
+                    # disk fills. Best-effort; MySQL's dialect returns None (no slot).
+                    _refresh_pg_slot_health(migration_state, source_config, connection)
+                    # How old each estimate is (PostgreSQL: last ANALYZE/VACUUM stamps via the
+                    # per-OID statistics functions -- no scan). Kept the LAST read on this
+                    # connection, for a connection that could not be made autocommit (a failed
+                    # statement then leaves the transaction ABORTED for the reads after it).
+                    # Display-only, so it can never cost the counts either.
+                    try:
+                        stats_at = dict(dialect.estimate_stats_at(connection, list(table_names)))
+                    except Exception:  # noqa: BLE001 - display metadata only
+                        stats_at = {}
+            finally:
+                engine.dispose()
             source_available = True
     except Exception:  # noqa: BLE001 - read-only best effort; keep None on failure
         pass
@@ -3337,10 +3342,14 @@ def read_cdc_replica_identity_once(session, scope) -> object:
     )
 
 
-# The runtime source-schema read's bound (seconds): one catalog statement for every captured
-# table. On PostgreSQL it is the statement_timeout; on MySQL the PyMySQL socket timeout, with
-# the statement's own MAX_EXECUTION_TIME(8000) hint stopping the server first.
-_CATALOG_DRIFT_READ_TIMEOUT_SECONDS = 10
+# The bound (seconds) of the CDC step's one-shot source catalog reads: the runtime
+# source-schema read (one catalog statement for every captured table), the start-point and
+# GTID reads, and Fetch current position / Fix target schema. On PostgreSQL it is the
+# statement_timeout; on MySQL the PyMySQL socket timeout, with the source-schema statement's
+# own MAX_EXECUTION_TIME(8000) hint stopping the server first.
+_SOURCE_CATALOG_READ_TIMEOUT_SECONDS = 10
+# The name it had when only the source-schema read used it; kept for anything importing it.
+_CATALOG_DRIFT_READ_TIMEOUT_SECONDS = _SOURCE_CATALOG_READ_TIMEOUT_SECONDS
 
 
 def read_cdc_catalog_drift_once(session, request) -> object:
@@ -3386,7 +3395,7 @@ def read_cdc_catalog_drift_once(session, request) -> object:
                 request, {}, started=started, finished=datetime.now(timezone.utc)
             )
         engine = make_source_engine_factory(
-            password, read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS
+            password, read_timeout_seconds=_SOURCE_CATALOG_READ_TIMEOUT_SECONDS
         )(source_config)
         try:
             with engine.connect() as connection:
@@ -3448,7 +3457,7 @@ def read_cdc_start_point_once(session, names, recorded) -> object:
         return StartPointVerdict(kind="unreadable", problem=PROBLEM_NO_SOURCE)
     try:
         engine = make_source_engine_factory(
-            password, read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS
+            password, read_timeout_seconds=_SOURCE_CATALOG_READ_TIMEOUT_SECONDS
         )(source_config)
         try:
             with engine.connect() as connection:
@@ -3514,7 +3523,7 @@ def read_source_gtid_state_once(session, gtid_set: Optional[str]) -> object:
 
     try:
         engine = make_source_engine_factory(
-            password, read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS
+            password, read_timeout_seconds=_SOURCE_CATALOG_READ_TIMEOUT_SECONDS
         )(source_config)
     except Exception as exc:  # noqa: BLE001 - unreadable is a state, not a crash
         return GtidSourceState(problem=PROBLEM_READ_FAILED, error_class=_class(exc))

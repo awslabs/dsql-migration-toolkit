@@ -1966,6 +1966,9 @@ def _fetch_with_fake_source(monkeypatch, stats_behaviour):
         def connect(self):
             yield object()
 
+        def dispose(self):  # the read disposes its engine on every exit
+            pass
+
     class _Dialect:
         def prepare_estimate_session(self, connection):
             return None

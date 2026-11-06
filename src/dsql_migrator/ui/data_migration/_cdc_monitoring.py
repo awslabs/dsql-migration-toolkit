@@ -2951,7 +2951,7 @@ async def _open_add_column_dialog(
     from dsql_migrator.core.target_connection import DsqlConnector
     from dsql_migrator.ui.connect import make_source_engine_factory
     from dsql_migrator.ui.data_migration._cdc_status import (
-        _CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+        _SOURCE_CATALOG_READ_TIMEOUT_SECONDS,
     )
 
     source_config = getattr(session, "source_config", None)
@@ -2972,7 +2972,7 @@ async def _open_add_column_dialog(
     def _build_plan():
         engine = make_source_engine_factory(
             getattr(session, "source_password", None),
-            read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+            read_timeout_seconds=_SOURCE_CATALOG_READ_TIMEOUT_SECONDS,
         )(source_config)
         try:
             with engine.connect() as connection:

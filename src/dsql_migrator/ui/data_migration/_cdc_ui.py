@@ -1180,10 +1180,15 @@ def _estimate_cdc_table_rows(session, table_names):
         # the uniform partition default. Mirrors _full_load_engine's capture path.
         dialect = dialect_for(source_config.source_type)
         engine = make_source_engine_factory(session.source_password)(source_config)
-        with engine.connect() as connection:
-            # MySQL 8.0+: the sizes from InnoDB, not the statistics cache (up to a day old).
-            dialect.prepare_estimate_session(connection)
-            estimates = estimate_source_rows(connection, list(table_names), dialect)
+        # Disposed on every exit: a QueuePool engine left to the GC kept its pooled
+        # connection to the (production) source open.
+        try:
+            with engine.connect() as connection:
+                # MySQL 8.0+: the sizes from InnoDB, not the statistics cache (up to a day old).
+                dialect.prepare_estimate_session(connection)
+                estimates = estimate_source_rows(connection, list(table_names), dialect)
+        finally:
+            engine.dispose()
         scoped = {n: int(c) for n, c in estimates.items() if c}
         return scoped or None
     except Exception:  # noqa: BLE001 - optional sizing signal; uniform fallback
@@ -1988,12 +1993,12 @@ def _fetch_start_position(
     from dsql_migrator.core.watermark import read_binlog_status_row, read_gtid_mode
     from dsql_migrator.ui.connect import make_source_engine_factory
     from dsql_migrator.ui.data_migration._cdc_status import (
-        _CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+        _SOURCE_CATALOG_READ_TIMEOUT_SECONDS,
     )
 
     engine = make_source_engine_factory(
         getattr(session, "source_password", None),
-        read_timeout_seconds=_CATALOG_DRIFT_READ_TIMEOUT_SECONDS,
+        read_timeout_seconds=_SOURCE_CATALOG_READ_TIMEOUT_SECONDS,
     )(getattr(session, "source_config", None))
     try:
         with engine.connect() as conn:
