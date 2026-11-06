@@ -2167,10 +2167,13 @@ def build_evaluation_screen(
                         # Ground the AI DBA on THIS migration's source engine (MySQL vs
                         # PostgreSQL); the factory builds the strategist before the
                         # source type is in scope, so pin it here (best-effort — a bare
-                        # fake in tests may not expose the setter).
+                        # fake in tests may not expose the setter). The REPORT's engine:
+                        # the chat is about one of its objects or findings, and a
+                        # restored session has no source_config to read (it took a
+                        # restored PostgreSQL report for MySQL).
                         try:
                             strategist.source_engine = source_engine_word(
-                                getattr(session.source_config, "source_type", None)
+                                result.source_type
                             )
                         except AttributeError:
                             pass

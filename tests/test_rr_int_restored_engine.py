@@ -153,3 +153,49 @@ def test_schema_conversions_ai_dba_chats_ground_a_restored_session_as_postgresql
     assert len(opened) == 2
     assert engines == [("build_conversion_chat_system", "PostgreSQL"),
                        ("build_reimplementation_chat_system", "PostgreSQL")], engines
+
+
+def _evaluation_chat_engine(monkeypatch, *, hint, report_engine) -> str:
+    """The engine the restored Evaluation result's per-object AI DBA chat is grounded on."""
+    from dsql_migrator.core.job_manager import JobManager
+    from dsql_migrator.ui import evaluation as ev
+    from dsql_migrator.ui.evaluation import EvaluationStore
+    from dsql_migrator.ui.session import SessionStore
+
+    _fake_nicegui(monkeypatch)
+    store, eval_store = SessionStore(), EvaluationStore()
+    session = _restored_pg(store)
+    session.set_restored_source_type(hint)
+    _pg_evaluation(eval_store, source_type=report_engine)
+    captured: dict = {}
+    monkeypatch.setattr(ev, "_render_result", lambda *a, **k: captured.update(k))
+
+    class _Strategist:
+        source_engine = "unset"
+
+        def stream_object_chat(self, *_a, **_k):
+            captured["engine"] = self.source_engine
+            return ""
+
+    content, _runner = ev.build_evaluation_screen(
+        store, "s1", job_manager=JobManager(), eval_store=eval_store,
+        strategist_factory=lambda *_a: _Strategist(), open_ai_scope=lambda **_k: None)
+    content(lambda: None)
+    captured["guidance_provider"](object(), [], lambda _delta: None)
+    return captured["engine"]
+
+
+def test_the_evaluation_reports_ai_dba_chat_is_grounded_on_the_reports_engine(monkeypatch):
+    # The restored EvaluationResult carries source_type=POSTGRES; the chat about one of its
+    # objects or findings was told "MySQL" because it read the absent source_config.
+    assert _evaluation_chat_engine(
+        monkeypatch, hint=SourceType.POSTGRES, report_engine=SourceType.POSTGRES
+    ) == "PostgreSQL"
+    # A snapshot whose engine an earlier save already dropped restores the report's own
+    # engine (evaluation_source_type) with no session hint: the report still decides.
+    assert _evaluation_chat_engine(
+        monkeypatch, hint=None, report_engine=SourceType.POSTGRES
+    ) == "PostgreSQL"
+    assert _evaluation_chat_engine(
+        monkeypatch, hint=None, report_engine=SourceType.MYSQL
+    ) == "MySQL"
