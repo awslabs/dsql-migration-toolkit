@@ -28300,6 +28300,16 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
     assert "applied_table_conversions(" not in cut_over
     assert screen.count("session_applied_conversions(") >= 6
     assert cut_over.count("session_applied_conversions(") >= 4
+    # The same engine-read rule on the modules around the screen that render for a
+    # restored session too (they convert with their own SchemaConverter, so only the read
+    # is checked): Schema Conversion's AI DBA chats were told "MySQL".
+    from dsql_migrator.ui import schema_conversion as uisc
+
+    for where, src in (("ui/schema_conversion.py", inspect.getsource(uisc)),):
+        assert not engine_read.findall(src), (
+            f"{where}: an engine read bypasses session_source_type; a restored PostgreSQL "
+            f"session would be treated as MySQL: {engine_read.findall(src)}"
+        )
 
 
 def test_the_converter_reads_consume_engine_independent_values_today() -> None:

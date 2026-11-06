@@ -2934,9 +2934,8 @@ def build_schema_conversion_screen(
             ) -> None:
                 if open_ai_scope is None or not ai_is_usable(session):
                     return
-                engine = source_engine_word(
-                    getattr(session.source_config, "source_type", None)
-                )
+                # The screen's one engine read (a restored session has no source_config).
+                engine = source_engine_word(_source_type())
 
                 def strategist_now() -> AssessmentStrategist:
                     # Resolved per SEND, not when the scope opens: the app-wide panel
@@ -3031,9 +3030,8 @@ def build_schema_conversion_screen(
             def open_reimplementation_chat() -> None:
                 if open_ai_scope is None or not ai_is_usable(session):
                     return
-                engine = source_engine_word(
-                    getattr(session.source_config, "source_type", None)
-                )
+                # The screen's one engine read (a restored session has no source_config).
+                engine = source_engine_word(_source_type())
 
                 def strategist_now() -> AssessmentStrategist:
                     # Per SEND, like open_conversion_chat's (see there).
