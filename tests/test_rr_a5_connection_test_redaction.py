@@ -15,6 +15,9 @@ These tests drive the REAL path: ``check_source_connection`` with no injected
 introspector, so the production engine factory receives the password and builds the URL
 with it. Only ``create_engine`` is replaced, by a driver whose connect error echoes the
 password of the URL it was given -- the case the redaction exists for.
+
+The last test pins the other half: with the unused ``secret`` reference gone, the source
+config carries no credential at all, and a persisted session still restores it.
 """
 
 from __future__ import annotations
@@ -80,3 +83,55 @@ def test_a_source_test_without_a_password_still_reports_the_driver_reason(
 
     assert result.success is False
     assert "access denied for user 'reader' using password 'None'" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# One credential path: the source config carries no credential, persisted or not
+# ---------------------------------------------------------------------------
+
+
+def test_the_source_config_holds_no_credential_and_its_snapshot_restores_without_one() -> None:
+    # SourceConnectionConfig no longer has a ``secret`` reference: the password is only
+    # ever the in-memory SecretValue beside it. The session snapshot never carried that
+    # field either -- it flattens the config into non-secret source_* coordinates -- so a
+    # snapshot saved by an earlier version restores unchanged.
+    from dsql_migrator.core.models import SourceConnectionConfig
+    from dsql_migrator.core.session_state_store import SessionSnapshot
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.evaluation import EvaluationState
+    from dsql_migrator.ui.schema_conversion import SchemaConversionState
+    from dsql_migrator.ui.session import SessionConnectionState
+    from dsql_migrator.ui.session_persistence import (
+        apply_session_snapshot,
+        capture_session_snapshot,
+    )
+
+    assert not [
+        name
+        for name in SourceConnectionConfig.model_fields
+        if "secret" in name or "password" in name
+    ]
+
+    session = SessionConnectionState()
+    config = build_source_config(
+        host="db.example.com", port=3306, database="app", username="reader"
+    )
+    session.set_source(config, SecretValue(_PASSWORD))
+    payload = capture_session_snapshot(
+        "s1", session, EvaluationState(), SchemaConversionState(), DataMigrationState()
+    ).model_dump_json()
+    assert _PASSWORD not in payload
+    assert '"secret"' not in payload
+
+    restored = SessionConnectionState()
+    migration = DataMigrationState()
+    migration.bind_session(restored)
+    apply_session_snapshot(
+        SessionSnapshot.model_validate_json(payload),
+        restored,
+        EvaluationState(),
+        SchemaConversionState(),
+        migration,
+    )
+    assert restored.source_config == config
+    assert restored.source_password is None  # re-entered on Connect (Property 7)

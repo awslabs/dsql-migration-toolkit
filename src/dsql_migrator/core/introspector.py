@@ -11,9 +11,10 @@ guarantees from the design:
 - Read-only source (Property 1 / Requirement 1.5): a SQLAlchemy guard rejects
   any write or DDL statement before it reaches the database, so introspection
   and connection checks can never mutate the source.
-- Credential confidentiality (Property 7 / Requirement 1.4 / 9.2): passwords are
-  resolved from a :class:`~dsql_migrator.config.SecretRef` only at connect time,
-  are never stored on this class, and are redacted from any failure message.
+- Credential confidentiality (Property 7 / Requirement 1.4 / 9.2): the password
+  reaches the engine only through the caller's engine factory, at connect time, is
+  never stored on this class, and is redacted from a connection test's failure
+  message (the caller passes it to :meth:`SourceIntrospector.test_connection`).
 
 The MySQL-specific enrichment (triggers, routines, AUTO_INCREMENT, collation)
 runs against ``information_schema`` only when connected to a MySQL dialect; the
@@ -32,7 +33,7 @@ from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import URL
 
-from dsql_migrator.config import SecretValue, resolve_secret
+from dsql_migrator.config import SecretValue
 from dsql_migrator.core.models import (
     CheckConstraintDef,
     ColumnDef,
@@ -512,18 +513,17 @@ def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
 
     The driver scheme and engine kwargs come from the source dialect selected by
     ``conn.source_type`` (default MySQL). ``dialect_for`` is imported lazily to avoid
-    an import cycle (``source_dialect`` imports this module's MySQL helpers).
+    an import cycle (``source_dialect`` imports this module's MySQL helpers). It sends
+    no password: a caller that has one passes an engine factory that injects it
+    (``ui.connect.make_source_engine_factory``).
     """
     from dsql_migrator.core.source_dialect import dialect_for
 
     dialect = dialect_for(conn.source_type)
-    password: Optional[str] = None
-    if conn.secret is not None:
-        password = resolve_secret(conn.secret).reveal()
     url = URL.create(
         dialect.driver_scheme,
         username=conn.username,
-        password=password,
+        password=None,
         host=conn.host,
         port=conn.port,
         database=conn.database,
@@ -532,17 +532,6 @@ def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
     install_read_only_guard(engine)
     install_session_setup(engine, dialect.session_setup_sql)
     return engine
-
-
-def _revealed_secret(conn: SourceConnectionConfig) -> Optional[str]:
-    """Return the plaintext password for redaction, or ``None`` if unavailable."""
-    if conn.secret is None:
-        return None
-    try:
-        value = resolve_secret(conn.secret)
-    except Exception:
-        return None
-    return value.reveal() if isinstance(value, SecretValue) else None
 
 
 def _sanitize_message(message: str, secret: Optional[str]) -> str:
@@ -1415,8 +1404,9 @@ class SourceIntrospector:
                 aurora_version=versions.aurora_version,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failure reason
-            secret = redact.reveal() if redact is not None else _revealed_secret(conn)
-            message = _sanitize_message(str(exc), secret)
+            message = _sanitize_message(
+                str(exc), redact.reveal() if redact is not None else None
+            )
             reason = message or exc.__class__.__name__
             return ConnectionResult(
                 success=False,

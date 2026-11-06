@@ -253,11 +253,6 @@ def build_fence_engine(
 
     from dsql_migrator.core.source_dialect import dialect_for
 
-    if password is None and getattr(source_config, "secret", None) is not None:
-        # Secrets Manager authentication: resolved like the read path's factory.
-        from dsql_migrator.config import resolve_secret
-
-        password = resolve_secret(source_config.secret)
     dialect = dialect_for(SourceType.MYSQL)
     url = URL.create(
         dialect.driver_scheme,

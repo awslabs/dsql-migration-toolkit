@@ -6,9 +6,9 @@
 These Pydantic v2 models are the common vocabulary used across the engine
 components (introspection, assessment, conversion, migration, validation) and
 the UI. They validate untrusted input (Requirement 9.4) and never carry
-plaintext credentials: connection models reference a secret via
-:class:`~dsql_migrator.config.SecretRef` rather than embedding its value
-(Requirement 9.2 / Property 7).
+plaintext credentials: a password is held in memory beside a connection model, as
+a :class:`~dsql_migrator.config.SecretValue`, never on it (Requirement 9.2 /
+Property 7).
 
 Concrete engine behavior is implemented in later tasks; this module only defines
 the data contracts.
@@ -22,8 +22,6 @@ from enum import Enum
 from typing import Iterable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from dsql_migrator.config import SecretRef
 
 # ---------------------------------------------------------------------------
 # Connection configuration
@@ -46,10 +44,11 @@ class SourceType(str, Enum):
 class SourceConnectionConfig(BaseModel):
     """Connection settings for the source database (RDS/Aurora MySQL or PostgreSQL).
 
-    Credentials are not stored here: ``secret`` references where to resolve them
-    (e.g., a Secrets Manager ARN), and ``username`` is non-secret. This keeps the
-    model safe to serialize and log. ``source_type`` selects the source engine
-    (default MySQL) and drives the source-reading dialect.
+    Credentials are not stored here: the password is held in memory beside this
+    model, as a :class:`~dsql_migrator.config.SecretValue` handed to the engine
+    factory, and ``username`` is non-secret. This keeps the model safe to serialize
+    and log. ``source_type`` selects the source engine (default MySQL) and drives the
+    source-reading dialect.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -67,12 +66,7 @@ class SourceConnectionConfig(BaseModel):
             "required before introspection selects objects."
         ),
     )
-    username: Optional[str] = Field(
-        default=None, description="Non-secret username (used when no secret ref)."
-    )
-    secret: Optional[SecretRef] = Field(
-        default=None, description="Reference to the credential; never the value."
-    )
+    username: Optional[str] = Field(default=None, description="Non-secret username.")
 
 
 class ConnectionResult(BaseModel):

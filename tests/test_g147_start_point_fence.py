@@ -190,8 +190,8 @@ def test_the_read_only_guard_refuses_server_administration() -> None:
         assert not is_write_or_ddl(sql), sql
 
 
-def test_the_fence_engine_has_no_read_only_guard_and_runs_in_autocommit(monkeypatch) -> None:
-    from dsql_migrator.config import SecretRef, SecretSource, SecretValue
+def test_the_fence_engine_has_no_read_only_guard_and_runs_in_autocommit() -> None:
+    from dsql_migrator.config import SecretValue
     from dsql_migrator.ui.connect import make_source_engine_factory
 
     config = SourceConnectionConfig(host="db.example.com", username="admin")
@@ -206,14 +206,6 @@ def test_the_fence_engine_has_no_read_only_guard_and_runs_in_autocommit(monkeypa
         assert engine.url.password == "pw-1" and engine.url.host == "db.example.com"
     finally:
         engine.dispose()
-    # Secrets Manager / environment authentication: resolved like the read path's factory.
-    monkeypatch.setenv("G147_FENCE_PW", "pw-2")
-    with_secret = config.model_copy(
-        update={"secret": SecretRef(source=SecretSource.ENVIRONMENT, locator="G147_FENCE_PW")}
-    )
-    engine = fence.build_fence_engine(with_secret, None)
-    assert engine.url.password == "pw-2"
-    engine.dispose()
     with pytest.raises(fence.StartPointFenceError, match="MySQL-only"):
         fence.build_fence_engine(
             SourceConnectionConfig(host="h", source_type=SourceType.POSTGRES), None

@@ -167,10 +167,11 @@ class SessionConnectionState:
         # source config where known. Transient/session-only.
         self._cdc_infra_inputs: dict[str, str] = {}
         # When the source was connected via AWS Secrets Manager auth, the secret's
-        # ARN/name entered on Connect. ``source_config.secret`` is NOT populated by
-        # build_source_config, so this is the only place the secret id survives the
-        # Connect screen -- the CDC deploy reads it to auto-fill SourceSecretArn/Name
-        # (Property 7: only the non-secret reference is stored, never the credential).
+        # ARN/name entered on Connect. ``source_config`` holds no credential reference
+        # (the resolved password is kept as ``source_password``), so this is the only
+        # place the secret id survives the Connect screen -- the CDC deploy reads it to
+        # auto-fill SourceSecretArn/Name (Property 7: only the non-secret reference is
+        # stored, never the credential).
         self.source_secret_id: Optional[str] = None
         # The engine the operator has CURRENTLY picked on the Connect screen, which is not
         # the same thing as the engine of the last successful connection. NiceGUI rebuilds

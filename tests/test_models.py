@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from dsql_migrator.config import SecretRef, SecretSource
 from dsql_migrator.core.models import (
     AssessmentItem,
     AssessmentReport,
@@ -43,7 +42,6 @@ def test_source_connection_config_defaults_and_validation() -> None:
     config = SourceConnectionConfig(host="db.example.com", database="app")
     assert config.port == 3306
     assert config.username is None
-    assert config.secret is None
 
 
 def test_source_connection_config_rejects_invalid_port() -> None:
@@ -59,14 +57,6 @@ def test_source_connection_config_rejects_empty_host() -> None:
 def test_source_connection_config_rejects_unknown_field() -> None:
     with pytest.raises(ValidationError):
         SourceConnectionConfig(host="db", database="app", password="leak")
-
-
-def test_source_connection_config_uses_secret_reference_not_value() -> None:
-    ref = SecretRef(source=SecretSource.SECRETS_MANAGER, locator="arn:aws:secret:db")
-    config = SourceConnectionConfig(host="db", database="app", secret=ref)
-    dumped = config.model_dump()
-    assert dumped["secret"]["locator"] == "arn:aws:secret:db"
-    assert "password" not in dumped
 
 
 def test_target_connection_config_defaults() -> None:

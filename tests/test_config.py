@@ -19,15 +19,12 @@ from dsql_migrator.config import (
     ENV_PREFIX,
     TUNABLE_KNOBS,
     ConnectDefaults,
-    SecretRef,
-    SecretSource,
     SecretValue,
     TuningValueError,
     current_tuning_values,
     load_config,
     load_connect_defaults,
     read_env_file,
-    resolve_secret,
     set_tuning_value,
 )
 
@@ -264,32 +261,6 @@ def test_secret_value_is_masked_in_repr_and_str() -> None:
     assert "super-secret-password" not in repr(secret)
     assert "super-secret-password" not in str(secret)
     assert secret.reveal() == "super-secret-password"
-
-
-def test_secret_ref_describe_is_log_safe() -> None:
-    ref = SecretRef(source=SecretSource.SECRETS_MANAGER, locator="arn:aws:secret:db")
-    description = ref.describe()
-    assert description == "SECRETS_MANAGER:arn:aws:secret:db"
-
-
-def test_resolve_secret_from_environment_returns_masked_value() -> None:
-    ref = SecretRef(source=SecretSource.ENVIRONMENT, locator="DB_PASSWORD")
-    resolved = resolve_secret(ref, env={"DB_PASSWORD": "p@ss"})
-    assert isinstance(resolved, SecretValue)
-    assert resolved.reveal() == "p@ss"
-    assert "p@ss" not in str(resolved)
-
-
-def test_resolve_secret_missing_environment_variable_raises() -> None:
-    ref = SecretRef(source=SecretSource.ENVIRONMENT, locator="MISSING_VAR")
-    with pytest.raises(KeyError):
-        resolve_secret(ref, env={})
-
-
-def test_resolve_secret_unimplemented_source_raises() -> None:
-    ref = SecretRef(source=SecretSource.SESSION, locator="session-key")
-    with pytest.raises(NotImplementedError):
-        resolve_secret(ref, env={})
 
 
 # ---------------------------------------------------------------------------

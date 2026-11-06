@@ -85,7 +85,6 @@ def test_build_source_config_valid() -> None:
     assert config.port == 3306
     assert config.database == "app"
     assert config.username == "reader"
-    assert config.secret is None
 
 
 def test_build_source_config_defaults_to_mysql_source_type() -> None:

@@ -11,62 +11,22 @@ Design principles enforced here:
 
 - Credential confidentiality (Property 7 / Requirement 9.2): credential values
   are never stored in the serialized configuration and never appear in plaintext
-  in logs, reprs, or model dumps. They are represented either as opaque
-  references (``SecretRef``) or as masked values (``SecretValue``).
+  in logs, reprs, or model dumps. A credential is held in process memory only, as
+  a masked ``SecretValue``.
 - Environment-driven settings (Requirement 9.2): connection details and secrets
   are not hardcoded; they are supplied at runtime via environment variables or
   the UI session.
-
-Note: source/target connection configuration models (with their secret
-references) are defined in a later task. This module only establishes the
-configuration-loading scaffold and the secret-handling primitives.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from enum import Enum
 from typing import Mapping, Optional
 
 from pydantic import BaseModel, Field
 
 ENV_PREFIX = "DSQL_MIGRATOR_"
-
-
-class SecretSource(str, Enum):
-    """Where a secret value should be resolved from at runtime.
-
-    Resolution itself (e.g., calling Secrets Manager) is implemented in a later
-    task. This enum lets configuration describe *how* to obtain a secret without
-    ever embedding the secret value.
-    """
-
-    SECRETS_MANAGER = "SECRETS_MANAGER"
-    ENVIRONMENT = "ENVIRONMENT"
-    SESSION = "SESSION"
-
-
-class SecretRef(BaseModel):
-    """An opaque reference to a secret, never the secret value itself.
-
-    A ``SecretRef`` describes where a credential can be resolved from (for
-    example, a Secrets Manager ARN or an environment variable name) but does not
-    contain the plaintext credential. It is safe to log and serialize.
-    """
-
-    source: SecretSource
-    locator: str = Field(
-        ...,
-        description=(
-            "Pointer to the secret: a Secrets Manager ARN, an environment "
-            "variable name, or a session key. Not the secret value."
-        ),
-    )
-
-    def describe(self) -> str:
-        """Return a human-readable, log-safe description of this reference."""
-        return f"{self.source.value}:{self.locator}"
 
 
 class SecretValue:
@@ -112,9 +72,9 @@ class SecretValue:
 class AppConfig(BaseModel):
     """Top-level application configuration.
 
-    Contains only non-secret runtime settings. Credentials are resolved on demand
-    through ``SecretRef``/``SecretValue`` and are never stored on this model, so
-    ``AppConfig`` is always safe to serialize and log.
+    Contains only non-secret runtime settings. Credentials are held in memory as
+    ``SecretValue`` and are never stored on this model, so ``AppConfig`` is always
+    safe to serialize and log.
     """
 
     model_config = {"frozen": True}
@@ -991,35 +951,8 @@ def load_connect_defaults(
     )
 
 
-def resolve_secret(
-    ref: SecretRef,
-    env: Optional[Mapping[str, str]] = None,
-) -> SecretValue:
-    """Resolve a :class:`SecretRef` into a masked :class:`SecretValue`.
-
-    Only environment-variable resolution is implemented at this scaffolding
-    stage; Secrets Manager and session resolution are completed in later tasks.
-    The resolved value is wrapped in :class:`SecretValue` so it cannot be logged
-    in plaintext, and it is never written back into :class:`AppConfig`.
-    """
-    if ref.source is SecretSource.ENVIRONMENT:
-        source = os.environ if env is None else env
-        raw = source.get(ref.locator)
-        if raw is None:
-            raise KeyError(
-                f"environment variable for secret '{ref.describe()}' is not set"
-            )
-        return SecretValue(raw)
-
-    raise NotImplementedError(
-        f"secret resolution for source '{ref.source.value}' is not implemented yet"
-    )
-
-
 __all__ = [
     "ENV_PREFIX",
-    "SecretSource",
-    "SecretRef",
     "SecretValue",
     "AppConfig",
     "load_config",
@@ -1031,5 +964,4 @@ __all__ = [
     "ConnectDefaults",
     "read_env_file",
     "load_connect_defaults",
-    "resolve_secret",
 ]
