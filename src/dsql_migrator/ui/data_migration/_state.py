@@ -725,7 +725,7 @@ class DataMigrationState:
         # (process config, threaded at screen-build time). None -> default key.
         self.cdc_secret_kms_key_id: Optional[str] = None
         # Builder-time handles (not user state, never persisted; they outlive Start over,
-        # see reset_in_place): the overlay-ledger store, the current effective target DDL
+        # see _BUILDER_HANDLES): the overlay-ledger store, the current effective target DDL
         # provider, the Start CDC notification, and the cut-over restore probe.
         self.overlay_ledger: Optional[object] = None
         self.effective_target_ddls: Optional[Callable[[], Optional[dict]]] = None
@@ -3034,6 +3034,46 @@ class DataMigrationState:
             self._error_migration_type = None
 
 
+# Everything ``build_data_migration_screen`` attaches to the state at BUILD time. The
+# builder does not re-run after Start over, so ``DataMigrationStore.reset_in_place`` must
+# carry each of these across its ``__init__()`` -- otherwise it is gone until the page is
+# rebuilt. ONE list, checked against the builder's own source by
+# tests/test_rr_a4_builder_handles.py: reset_in_place used to keep two lists by hand, and
+# one of them silently lost a handle (the secret's CMK, below). The teardown carry-over
+# in reset_in_place is session STATE, not a builder handle, and stays separate.
+_BUILDER_HANDLES: tuple[str, ...] = (
+    # The session binding (``bind_session``), so ``migration_type`` keeps reading through
+    # to the live session.
+    "_session",
+    # The CDC deploy-role ARN: DEPLOYMENT CONFIG (env DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN, the
+    # CdcDeployRole the TaskRole assumes for CloudFormation/MSK), not user state. Without
+    # it every CDC operation -- even the read-only state probe -- falls back to the bare
+    # TaskRole, which lacks cloudformation:DescribeStacks, and fails with AccessDenied on
+    # the deployed stack after any Start over.
+    "cdc_deploy_role_arn",
+    # The optional CMK for the tool-managed source-credentials secret: the SAME kind of
+    # value, set on the builder's next line from the same process config -- and once left
+    # out of the hand-kept list, so a Start over silently dropped it and the next CDC
+    # deploy created the secret under the account's default aws/secretsmanager key instead
+    # of the operator's CMK, with no UI signal.
+    "cdc_secret_kms_key_id",
+    # The overlay-ledger store and the builder's providers / callbacks.
+    "overlay_ledger",
+    "effective_target_ddls",
+    "on_cdc_start",
+    "cutover_restore_in_flight",
+    "validation_state_provider",
+    "source_primary_key_for",
+    "cdc_catalog_baseline",
+    # The live exclusion-inputs resolver (``set_exclusion_inputs_resolver``). Every render
+    # registers it again, which is the only reason leaving it out was harmless. Carrying it
+    # changes nothing a user sees: between Start over and the next render it resolves no
+    # inputs (the Evaluation result is reset first, so there is no inventory) -- exactly
+    # what a missing resolver returns -- but it is attached at build time like the rest.
+    "_exclusion_inputs_resolver",
+)
+
+
 @dataclass
 class DataMigrationStore:
     """Process-memory map of session id to :class:`DataMigrationState`.
@@ -3068,32 +3108,15 @@ class DataMigrationStore:
         The workflow screen captures this state object in its builder closures at
         build time, so popping + recreating would orphan the captured reference.
         Re-initialising the SAME instance keeps every closure on the live object.
-        The session binding (set once at build time via ``bind_session``, not
-        per render) is preserved across the reset so ``migration_type`` keeps
-        reading through to the live session.
+        Everything the builder attached (``_BUILDER_HANDLES``: the session binding, so
+        ``migration_type`` keeps reading through to the live session, the deployment
+        config and the providers) is preserved across the reset.
         """
         if session_id is None:
             return
         state = self._states.get(session_id)
         if state is not None:
-            bound = getattr(state, "_session", None)
-            # Preserve the CDC deploy-role ARN across the reset. It is a DEPLOYMENT
-            # CONFIG value (env DSQL_MIGRATOR_CDC_DEPLOY_ROLE_ARN, the CdcDeployRole the
-            # TaskRole assumes for CloudFormation/MSK), set ONCE at screen-build time --
-            # not per-render user state. __init__() below resets it to None, and the
-            # builder does not re-run after Start over, so without this every CDC
-            # operation (even the read-only state probe) would fall back to the bare
-            # TaskRole -- which lacks cloudformation:DescribeStacks -- and fail with
-            # AccessDenied on the deployed stack after any Start over.
-            deploy_role_arn = getattr(state, "cdc_deploy_role_arn", None)
-            # The optional CMK for the tool-managed source-credentials secret is the
-            # SAME kind of value, set on the very next line of the builder
-            # (data_migration/__init__.py:375-376) from the same process config -- and it
-            # was left out of this preserve list. So a Start over silently dropped it and
-            # the next CDC deploy created the secret under the account's default
-            # aws/secretsmanager key instead of the operator's CMK, with no UI signal;
-            # nobody would notice until they audited the secret's encryption key.
-            secret_kms_key_id = getattr(state, "cdc_secret_kms_key_id", None)
+            handles = {name: getattr(state, name, None) for name in _BUILDER_HANDLES}
             # Preserve an in-flight CDC teardown marker across the reset. A Start-over
             # that chose stop/delete submits the teardown BEFORE this reset; the
             # persistent teardown banner and the Start-over race-guard both read this
@@ -3123,22 +3146,7 @@ class DataMigrationStore:
             # infrastructure deleted (dsql-cdc-stack)" stayed on every screen of the next
             # one). A teardown this Start over submits finishes after the reset and records
             # its own notice then.
-            # Builder-time handles (the ledger store and three callables), set once when
-            # the screen is built -- the builder does not re-run after Start over.
-            handles = {
-                name: getattr(state, name, None)
-                for name in (
-                    "overlay_ledger", "effective_target_ddls", "on_cdc_start",
-                    "cutover_restore_in_flight", "validation_state_provider",
-                    "source_primary_key_for", "cdc_catalog_baseline",
-                )
-            }
             state.__init__()  # type: ignore[misc]  # re-run init on the same object
-            if bound is not None:
-                state.bind_session(bound)
-            # Deploy-time config, not user state -- it must outlive Start over.
-            state.cdc_deploy_role_arn = deploy_role_arn
-            state.cdc_secret_kms_key_id = secret_kms_key_id
             for name, value in handles.items():
                 setattr(state, name, value)
             if teardown[0] is not None:
