@@ -169,3 +169,50 @@ def test_moving_the_marker_to_another_stack_drops_only_the_recorded_source() -> 
     assert (state.cdc_teardown_job_id, state.cdc_teardown_stack) == ("job-2", "dsql-cdc-other")
     assert state.cdc_teardown_kind == "delete"
     assert state.cdc_teardown_ctx == {**ctx, "source": None}
+
+
+# -- A renamed own stack: Retry cleanup after Start over ---------------------------------------
+#
+# Start over resets ``cdc_stack_name`` to the default name, so submit_cdc_teardown's stack-name
+# check failed for the session's own RENAMED stack on a retry: the retry passed no credentials
+# even after the operator reconnected to the very source the teardown was submitted for, and
+# dropped the recorded source from the new marker. On Fargate the delete cannot read the CDC
+# secret, so the slot stayed. A recorded ctx["source"] already proves the marker's stack was
+# the session's own (it is recorded for no other, and the marker drops it when it moves).
+
+OTHER_PW = "rr-int-other-sentinel-not-a-password"
+
+
+def test_a_retry_of_a_renamed_own_stack_after_start_over_uses_the_same_sources_credentials(
+    page,
+) -> None:
+    from dsql_migrator.core.cdc import CDC_DEFAULT_STACK_NAME
+
+    page.hooks["on_reset_cdc"]("delete")
+    page.hooks["on_reset"]()  # the job is left unrun: the stack delete failed
+    assert page.state.cdc_teardown_stack == OWN
+    assert page.state.cdc_stack_name == CDC_DEFAULT_STACK_NAME
+    # Wiped by the reset: the first retry has nothing to pass and reads the secret ...
+    first = _retry(page)
+    assert first["stack_name"] == OWN and first.get("source_credentials") is None
+    # ... and keeps the recorded source, so once the operator reconnects to the SAME
+    # source the next retry drops the slot with the session's credentials.
+    assert page.state.cdc_teardown_ctx.get("source") == SOURCE_A
+    _reconnect(page.session, host=SOURCE_A[0], user=USER, password=PW)
+    second = _retry(page)
+    assert second["stack_name"] == OWN
+    assert second.get("source_credentials") == (USER, PW)
+
+
+def test_a_retry_of_a_renamed_own_stack_after_a_reconnect_to_another_source_passes_none(
+    page,
+) -> None:
+    page.hooks["on_reset_cdc"]("delete")
+    page.hooks["on_reset"]()
+    _reconnect(page.session, host="other-source-b.example.internal", user="bob",
+               password=OTHER_PW)
+
+    kwargs = _retry(page)
+    assert kwargs["stack_name"] == OWN
+    assert kwargs.get("source_credentials") is None
+    assert OTHER_PW not in repr(page.state.cdc_teardown_ctx)

@@ -10247,6 +10247,7 @@ def submit_cdc_teardown(
     source_identity: Optional[tuple],
     on_log,
     track_in_queue: Optional[list] = None,
+    own_stack: bool = False,
 ) -> tuple[str, bool]:
     """Submit a CDC teardown as a background job; return ``(job_id, claimed_marker)``.
 
@@ -10272,8 +10273,9 @@ def submit_cdc_teardown(
     gets ``None``. They are held only by the job's closure until the job ends (Property 7)
     and NEVER go into the teardown marker's ``ctx``, which a later Retry cleanup reads.
     They reach ONLY the stack this session targets (``migration_state.cdc_stack_name``,
-    checked here, at submit time); any other stack gets ``None`` and its delete reads that
-    stack's own secret, as before. Start over also tears down the account's discovered
+    checked here, at submit time, unless ``own_stack`` says the caller has proved it
+    otherwise); any other stack gets ``None`` and its delete reads that stack's own secret,
+    as before. Start over also tears down the account's discovered
     stacks (``cdc_other_stacks``), and the banner's marker can name one of them: such a
     stack may capture a different source, and the slot drop tries the credentials it is
     handed first, against that stack's own source host, with no fallback to the secret
@@ -10292,6 +10294,12 @@ def submit_cdc_teardown(
     DEFAULT-named stack still passes it once the operator has connected a different source
     -- and a reconnect without Start over keeps the name as it was. A retry passes the
     recorded identity back in, so it survives a retry made while the session was empty.
+    ``own_stack=True`` (Retry cleanup, when the marker recorded a source) skips the
+    stack-name check: a recorded ``ctx["source"]`` already proves the marker's stack was the
+    session's own when it was submitted, and Start over's reset of ``cdc_stack_name`` to
+    the default name would otherwise fail the check for a stack the operator had renamed --
+    no credentials even after a reconnect to that same source, and the recorded identity
+    dropped from the new marker.
     ``on_log`` receives the deploy-log lines: the CDC step shows them, Start over and Retry
     cleanup drop them. ``track_in_queue``: a multi-stack Start over's list, appended
     ``(job_id, stack_name)`` whether or not this job claims the marker.
@@ -10308,7 +10316,7 @@ def submit_cdc_teardown(
         run_cdc_stop,
     )
 
-    if stack_name != getattr(migration_state, "cdc_stack_name", None):
+    if not own_stack and stack_name != getattr(migration_state, "cdc_stack_name", None):
         # Not this session's stack: it may capture another source (see the docstring).
         source_credentials = source_identity = None
     deployer = build_cdc_stack_deployer(

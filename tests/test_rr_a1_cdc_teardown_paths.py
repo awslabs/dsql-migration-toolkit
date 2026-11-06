@@ -325,10 +325,13 @@ def test_retry_cleanup_after_start_over_falls_back_to_the_secret(page) -> None:
 
 
 def test_retry_cleanup_of_another_stack_passes_no_credentials(page) -> None:
-    """The marker can name a discovered stack: the stack-name check gives it None.
+    """The marker can name a discovered stack: its ctx records no source, so Retry gives it
+    None while the session is connected to its own source.
 
-    Even with the session's own source recorded in the ctx, so the stack check is what
-    decides.
+    submit_cdc_teardown records ``ctx["source"]`` for the session's own stack only, and the
+    marker drops it when it moves on to another stack (tests/test_rr_int_teardown_retry_
+    source.py). A recorded source is what lets a retry skip the stack-name check (a renamed
+    own stack after Start over), so a marker naming another stack must not carry one.
     """
     page.state.set_cdc_teardown(
         "rr-a1-failed-delete",
@@ -336,7 +339,7 @@ def test_retry_cleanup_of_another_stack_passes_no_credentials(page) -> None:
         stack=OTHER,
         ctx={
             "region": REGION, "role_arn": None, "profile": None, "cleanup_secret": False,
-            "source": ("source.example.internal", 5432, "app"),
+            "source": None,
         },
     )
     page.hooks["cdc_teardown_retry"]()

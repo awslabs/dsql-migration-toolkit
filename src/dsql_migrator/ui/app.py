@@ -1170,6 +1170,7 @@ def build_page(
         source_credentials,
         source_identity,
         track_in_queue: Optional[list] = None,
+        own_stack: bool = False,
     ) -> Optional[str]:
         """Submit a CDC teardown (stop/delete) for Start over or the banner's one-click
         "Retry cleanup", through the CDC step's own ``submit_cdc_teardown`` -- the one
@@ -1198,6 +1199,7 @@ def build_page(
             source_identity=source_identity,
             on_log=lambda _ts, _msg: None,
             track_in_queue=track_in_queue,
+            own_stack=own_stack,
         )
         return job_id if claimed else None
 
@@ -1361,13 +1363,15 @@ def build_page(
         # teardown was submitted for (the marker's non-secret ctx["source"]): a failed
         # CDC-step Delete keeps its session, so the retry can drop the slot without the
         # secret, and so can a retry after Start over once the operator has reconnected
-        # to that same source. Anything else gets None and the delete reads the secrets,
-        # as before: a session wiped by Start over, or one connected to ANOTHER source
-        # since. The stack-name check in submit_cdc_teardown does not cover that last
-        # case -- Start over resets cdc_stack_name to the default name, and a reconnect
-        # without Start over keeps the name -- and the slot drop tries the credentials it
-        # is handed first, against the stack's own source host, with no fallback to the
-        # secret: the other source's password would reach this one and the slot stay.
+        # to that same source -- for a renamed stack too. Anything else gets None and the
+        # delete reads the secrets, as before: a session wiped by Start over, one
+        # connected to ANOTHER source since, or a marker with no recorded source (a
+        # discovered stack's, or one the banner moved on to). The stack-name check in
+        # submit_cdc_teardown does not cover the other-source case -- Start over resets
+        # cdc_stack_name to the default name, and a reconnect without Start over keeps
+        # the name -- and the slot drop tries the credentials it is handed first, against
+        # the stack's own source host, with no fallback to the secret: the other
+        # source's password would reach this one and the slot stay.
         session = SESSION_STORE.get_or_create(session_id)
         recorded_source = ctx.get("source")
         same_source = (
@@ -1388,6 +1392,11 @@ def build_page(
             # Carried forward, so a retry made while the session was empty does not stop
             # the next one (after a reconnect to the same source) from using its password.
             source_identity=recorded_source,
+            # A recorded source is recorded only for the session's own stack (and dropped
+            # when the marker moves to another), so it proves this is that stack: skip the
+            # stack-name check, which Start over's reset to the default name would fail
+            # for a stack the operator had renamed.
+            own_stack=recorded_source is not None,
         )
         ui.notify("Retrying CDC cleanup…", type="info", position="top")  # type: ignore[attr-defined]
 
