@@ -398,8 +398,15 @@ def fold_replica_identity_probe(
 # ---------------------------------------------------------------------------
 
 
-async def _probe_and_land(session: object, migration_state: object, scope: Mapping) -> None:
-    """Read on a worker thread, land on the loop, log the transitions; owns the claim."""
+async def _probe_and_land(
+    session: object, migration_state: object, scope: Mapping, epoch: object = None
+) -> None:
+    """Read on a worker thread, land on the loop, log the transitions; owns the claim.
+
+    ``epoch`` is the migration the claim was taken for (``_cdc_replica_identity_epoch``, read
+    right after the claim, on the loop): a read that started before Start over is dropped when
+    it lands, and its claim is not released over a newer one -- as the source-schema
+    re-check's read is (cdc_catalog_drift_gate)."""
     try:
         from nicegui import run
 
@@ -416,10 +423,10 @@ async def _probe_and_land(session: object, migration_state: object, scope: Mappi
                 replace(probe, migration_type=getattr(migration_state, "migration_type", None)),
             )
         if probe is not None:  # None only when the app is stopping
-            transitions = migration_state.apply_cdc_replica_identity_probe(probe)  # type: ignore[attr-defined]
+            transitions = migration_state.apply_cdc_replica_identity_probe(probe, epoch)  # type: ignore[attr-defined]
             log_replica_identity_transitions(transitions)
     finally:
-        migration_state.finish_cdc_replica_identity_probe()  # type: ignore[attr-defined]
+        migration_state.finish_cdc_replica_identity_probe(epoch)  # type: ignore[attr-defined]
 
 
 def start_replica_identity_probe(
@@ -442,9 +449,16 @@ def start_replica_identity_probe(
         return False
     if not migration_state.begin_cdc_replica_identity_probe():  # type: ignore[attr-defined]
         return False
+    # Taken right after the claim, on the loop: no Start over can slip between the two.
+    epoch = getattr(migration_state, "_cdc_replica_identity_epoch", None)
     from dsql_migrator.ui.data_migration._cdc_status import spawn_detached
 
-    spawn_detached(lambda: _probe_and_land(session, migration_state, scope))
+    try:
+        spawn_detached(lambda: _probe_and_land(session, migration_state, scope, epoch))
+    except Exception:
+        # Nothing was spawned to release it: the claim would hold until the watchdog.
+        migration_state.finish_cdc_replica_identity_probe(epoch)  # type: ignore[attr-defined]
+        raise
     return True
 
 
@@ -456,9 +470,10 @@ async def probe_replica_identity_now(session: object, migration_state: object) -
     scope = replica_identity_read_scope(migration_state, session)
     if not migration_state.begin_cdc_replica_identity_probe():  # type: ignore[attr-defined]
         return False
+    epoch = getattr(migration_state, "_cdc_replica_identity_epoch", None)  # right after it
     from dsql_migrator.ui.data_migration._cdc_status import land_detached
 
-    await land_detached(lambda: _probe_and_land(session, migration_state, scope))
+    await land_detached(lambda: _probe_and_land(session, migration_state, scope, epoch))
     return True
 
 
@@ -583,9 +598,10 @@ def schedule_replica_identity_probe(
                 migration_state, evidence_at, before, refresh, always=force or drawn_pending
             )
             return
+        epoch = getattr(migration_state, "_cdc_replica_identity_epoch", None)  # right after it
 
         async def _read_and_land() -> None:
-            await _probe_and_land(session, migration_state, scope_now)
+            await _probe_and_land(session, migration_state, scope_now, epoch)
             if force or _view_signature(migration_state, evidence_at) != before:
                 try:
                     refresh()

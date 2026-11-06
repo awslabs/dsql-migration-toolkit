@@ -371,6 +371,10 @@ class DataMigrationState:
         # Single-flight claim for that read (monotonic start; None when none runs), with a
         # watchdog of twice the TTL so a hung read never pins "re-reading".
         self._cdc_replica_identity_probe_started: Optional[float] = None
+        # Which migration that read belongs to (same idea as _cdc_catalog_drift_epoch
+        # below): a fresh object per __init__, so a read in flight across Start over lands
+        # nowhere and never releases the new migration's claim.
+        self._cdc_replica_identity_epoch: object = object()
         # Captured tables whose SOURCE definition stopped matching the migration's baseline
         # while CDC ran (ui/cdc_catalog_drift_gate.py): {table: CdcCatalogDriftFinding}. A
         # change no rejected row reveals, so this is PERSISTED on the session snapshot and
@@ -2060,13 +2064,19 @@ class DataMigrationState:
                 ]
             )
 
-    def apply_cdc_replica_identity_probe(self, probe: object) -> list:
+    def apply_cdc_replica_identity_probe(self, probe: object, epoch: object = None) -> list:
         """Land a runtime REPLICA IDENTITY read (on the loop): store it as the last probe and
         fold it into the findings (copy-on-write). Returns the transitions for the caller to
-        log AFTER the lock (one activity line each, never per poll)."""
+        log AFTER the lock (one activity line each, never per poll).
+
+        ``epoch`` is the migration the read was claimed for: a read that started before
+        Start over is dropped -- nothing stored, nothing folded, nothing to log -- so it can
+        never open a finding (persisted, holding Cut over) in the new migration."""
         from dsql_migrator.ui.cdc_replica_identity_gate import fold_replica_identity_probe
 
         with self._lock:
+            if epoch is not None and epoch is not self._cdc_replica_identity_epoch:
+                return []
             self.cdc_replica_identity_last_probe = probe
             findings, transitions = fold_replica_identity_probe(
                 self.cdc_replica_identity_findings, probe
@@ -2094,8 +2104,12 @@ class DataMigrationState:
             self._cdc_replica_identity_probe_started = now
             return True
 
-    def finish_cdc_replica_identity_probe(self) -> None:
+    def finish_cdc_replica_identity_probe(self, epoch: object = None) -> None:
+        """Release the claim -- unless ``epoch`` names a migration Start over has replaced
+        (that read's claim went with it; never release one taken since)."""
         with self._lock:
+            if epoch is not None and epoch is not self._cdc_replica_identity_epoch:
+                return
             self._cdc_replica_identity_probe_started = None
 
     @property
