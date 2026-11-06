@@ -3048,8 +3048,8 @@ def test_reconnect_retry_covers_the_reconnect_itself() -> None:
         return _Conn()
 
     slept: list[float] = []
-    monkey = _v.is_transient_connection_error
-    _v.is_transient_connection_error = lambda exc: isinstance(exc, _Transient)
+    monkey = _v._is_dropped_connection
+    _v._is_dropped_connection = lambda exc: isinstance(exc, _Transient)
     try:
         owner = _v._ReconnectingTargetConnection.__new__(_v._ReconnectingTargetConnection)
         owner._connection = None
@@ -3062,7 +3062,7 @@ def test_reconnect_retry_covers_the_reconnect_itself() -> None:
         cur = _v._ReconnectingCursor(owner)
         result = cur.execute("SELECT 1")
     finally:
-        _v.is_transient_connection_error = monkey
+        _v._is_dropped_connection = monkey
 
     assert result is not None
     assert attempts_seen["n"] == 3, "the reconnect itself must be retried, not raised"

@@ -40,6 +40,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.source_dialect.base import (
     SourceDialect,
     SourceVersions,
+    error_candidates,
     estimate_row_counts_query,
     keyset_param_names,
     probe_scalar,
@@ -101,17 +102,6 @@ def _not_extension_owned(classid: str, oid_expr: str) -> str:
 _PG_TRANSIENT_SQLSTATES = frozenset(
     {"57P01", "57P02", "57P03", "53300", "53400", "57014"}
 )
-
-
-def _pg_error_candidates(exc: BaseException) -> list[BaseException]:
-    """The exception plus its wrapped ``.orig`` / ``.__cause__`` (psycopg under
-    SQLAlchemy keeps the real ``.sqlstate`` on ``.orig``)."""
-    candidates: list[BaseException] = [exc]
-    for attr in ("orig", "__cause__"):
-        nested = getattr(exc, attr, None)
-        if nested is not None and nested is not exc:
-            candidates.append(nested)
-    return candidates
 
 
 def _reads_as_text(type_string: str) -> bool:
@@ -1834,7 +1824,7 @@ class PostgresSourceDialect(SourceDialect):
         return pg_read_row_security(connection, self._reflected_schemas(connection))
 
     def is_row_security_refusal(self, exc: BaseException) -> bool:
-        for candidate in _pg_error_candidates(exc):
+        for candidate in error_candidates(exc):
             if (
                 getattr(candidate, "sqlstate", None) == "42501"
                 and _PG_ROW_SECURITY_REFUSAL in str(candidate)
@@ -2169,7 +2159,7 @@ class PostgresSourceDialect(SourceDialect):
         # psycopg connection-level error type, or a known drop signature, as transient.
         import socket
 
-        candidates = _pg_error_candidates(exc)
+        candidates = error_candidates(exc)
         saw_sqlstate = False
         for candidate in candidates:
             if isinstance(candidate, (socket.timeout, TimeoutError)):
@@ -2197,7 +2187,7 @@ class PostgresSourceDialect(SourceDialect):
     def is_too_many_connections(self, exc: BaseException) -> bool:
         # PostgreSQL too_many_connections is SQLSTATE 53300 (its message is
         # "sorry, too many clients already" / "remaining connection slots are reserved").
-        for candidate in _pg_error_candidates(exc):
+        for candidate in error_candidates(exc):
             state = getattr(candidate, "sqlstate", None)
             if isinstance(state, str) and state == "53300":
                 return True

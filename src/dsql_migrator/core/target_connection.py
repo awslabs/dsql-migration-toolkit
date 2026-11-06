@@ -143,6 +143,30 @@ def is_transient_connection_error(exc: BaseException) -> bool:
     return False
 
 
+# A session the server ended (G141): 57P01 admin_shutdown (``pg_terminate_backend``, a
+# shutdown), 57P02 crash_shutdown and 57P03 cannot_connect_now (a server not accepting
+# connections yet). The connection is gone, as after a class-08 / no-SQLSTATE drop, so a
+# caller replaces it and replays its idempotent work -- as the CDC sink already treats class
+# 57 (DsqlSinkTask.isTransient, which names Aurora DSQL's idle close among closes that can
+# surface that way). Not 57014 (a cancelled statement): the session survives it.
+_SERVER_ENDED_SESSION_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
+
+
+def is_dropped_connection(exc: BaseException) -> bool:
+    """Is ``exc`` a lost target connection -- :func:`is_transient_connection_error` (class
+    ``08`` or no SQLSTATE), or a session the server ended (57P01 / 57P02 / 57P03)?
+
+    The one definition of "the target connection is gone" for every path that replaces the
+    connection and replays idempotent work on a fresh one: Validation's target reads (its
+    reconnecting proxy) and Full Load's target catalog read before a recreate.
+    :func:`is_transient_connection_error` stays the narrower connect-level check.
+    """
+    return (
+        is_transient_connection_error(exc)
+        or getattr(exc, "sqlstate", None) in _SERVER_ENDED_SESSION_SQLSTATES
+    )
+
+
 # Aurora DSQL's "server unavailable" (troubleshooting guide): a temporary service condition
 # after which the connection stays open. Exactly XX000: XX001 (data corrupted) and XX002
 # (index corrupted) share its class but are not transient.

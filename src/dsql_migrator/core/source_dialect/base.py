@@ -167,6 +167,28 @@ def text_safe(sql_text: str) -> str:
     return sql_text.replace(":", "\\:")
 
 
+def error_candidates(exc: BaseException) -> list[BaseException]:
+    """``exc`` followed by the driver errors it wraps: its ``.orig`` (where SQLAlchemy keeps
+    the DBAPI error, and with it PyMySQL's numeric code or psycopg's ``.sqlstate``), then its
+    ``.__cause__`` -- each only when set and not ``exc`` itself.
+
+    The one candidate walk of the source-error classifiers: MySQL's transient and
+    too-many-connections checks and PostgreSQL's transient, too-many-connections and
+    row-security checks each look for their code on these. Never ``.__context__``: an error
+    raised while another was being handled is not that error. The one shape judged by its
+    context -- SQLAlchemy's ``PendingRollbackError``, recoverable exactly when the error that
+    invalidated its connection was -- is each dialect's :meth:`SourceDialect.
+    is_transient_error` rule alone; here it would also move the too-many-connections and
+    row-security answers.
+    """
+    candidates: list[BaseException] = [exc]
+    for attr in ("orig", "__cause__"):
+        nested = getattr(exc, attr, None)
+        if nested is not None and nested is not exc:
+            candidates.append(nested)
+    return candidates
+
+
 class SourceDialect(ABC):
     """Source-engine-specific behavior for reading a migration source (read-only)."""
 

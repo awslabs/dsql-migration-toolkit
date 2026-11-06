@@ -138,14 +138,11 @@ def _mysql_source_transient(exc: BaseException) -> bool:
     """
     import socket
 
+    # Lazy: the source_dialect package imports this module's MySQL helpers.
+    from dsql_migrator.core.source_dialect.base import error_candidates
+
     # A DBAPI error wrapped by SQLAlchemy keeps the driver exception on .orig.
-    candidates = [exc]
-    orig = getattr(exc, "orig", None)
-    if orig is not None and orig is not exc:
-        candidates.append(orig)
-    cause = getattr(exc, "__cause__", None)
-    if cause is not None and cause is not exc:
-        candidates.append(cause)
+    candidates = error_candidates(exc)
     # SQLAlchemy raises PendingRollbackError on a connection an EARLIER error invalidated;
     # it is recoverable exactly when that earlier error (its context) was. Only this type
     # looks behind itself: any other error raised while handling a drop stays non-transient.
@@ -219,12 +216,10 @@ def _mysql_too_many_connections(exc: BaseException) -> bool:
 
     MySQL-specific predicate behind ``MySQLSourceDialect.is_too_many_connections``.
     """
-    candidates = [exc]
-    for attr in ("orig", "__cause__"):
-        nested = getattr(exc, attr, None)
-        if nested is not None and nested is not exc:
-            candidates.append(nested)
-    for candidate in candidates:
+    # Lazy: the source_dialect package imports this module's MySQL helpers.
+    from dsql_migrator.core.source_dialect.base import error_candidates
+
+    for candidate in error_candidates(exc):
         args = getattr(candidate, "args", ()) or ()
         if (
             args

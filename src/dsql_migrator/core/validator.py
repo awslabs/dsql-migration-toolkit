@@ -117,9 +117,9 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.target_connection import (
     TRANSACTION_AGE_LIMIT_SQLSTATE,
     DsqlConnector,
+    is_dropped_connection,
     is_dsql_statement_limit,
     is_server_unavailable,
-    is_transient_connection_error,
 )
 from dsql_migrator.core.target_introspector import (
     read_overlay_column_facts,
@@ -861,22 +861,11 @@ def _source_binlog_position(
 _TARGET_RECONNECT_MAX_ATTEMPTS = 4
 _TARGET_RECONNECT_BASE_DELAY_SECONDS = 0.5
 
-# A session the server ended (G141): 57P01 admin_shutdown (``pg_terminate_backend``, a
-# shutdown), 57P02 crash_shutdown and 57P03 cannot_connect_now (a server not accepting
-# connections yet). The connection is gone, as after a class-08 / no-SQLSTATE drop, so the
-# read path replaces it and replays the statement -- as the CDC sink already treats class 57
-# (DsqlSinkTask.isTransient, which names Aurora DSQL's idle close among closes that can
-# surface that way).
-_SERVER_ENDED_SESSION_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
-
-
-def _is_dropped_connection(exc: BaseException) -> bool:
-    """Is ``exc`` a lost target connection -- :func:`is_transient_connection_error` (class
-    ``08`` or no SQLSTATE), or a session the server ended (57P01 / 57P02 / 57P03)?"""
-    return (
-        is_transient_connection_error(exc)
-        or getattr(exc, "sqlstate", None) in _SERVER_ENDED_SESSION_SQLSTATES
-    )
+# "The target connection is gone" (class 08 / no SQLSTATE, or a session the server ended:
+# 57P01 / 57P02 / 57P03, G141) is defined once, in the target connection layer; the read path
+# replaces the connection and replays the statement on it. Kept under its historical private
+# name, which the read path below calls.
+_is_dropped_connection = is_dropped_connection
 
 
 _EXECUTE_SENTINEL = object()
@@ -927,9 +916,9 @@ class _ReconnectingTargetConnection:
 
     Transparent: it quacks like a psycopg connection (``cursor()`` / ``close()``), so
     every ``_target_*`` read helper is unchanged. Only a connection-level transient
-    error (SQLSTATE class ``08`` / no-SQLSTATE, via
-    :func:`is_transient_connection_error`) or a session the server ended (57P01 / 57P02 /
-    57P03, G141: :func:`_is_dropped_connection`) triggers a reconnect; Aurora DSQL's XX000
+    error (SQLSTATE class ``08`` / no-SQLSTATE) or a session the server ended (57P01 / 57P02 /
+    57P03, G141), both :func:`~dsql_migrator.core.target_connection.is_dropped_connection`,
+    triggers a reconnect; Aurora DSQL's XX000
     (server unavailable) re-runs the statement on the same connection, which Aurora DSQL
     keeps; any real query / constraint error propagates unchanged. The underlying
     connection is opened EAGERLY so the open cost / an immediate connect failure surfaces

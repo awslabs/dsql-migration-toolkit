@@ -7985,16 +7985,19 @@ def _target_columns_the_conversion_would_drop(
     :class:`_ReusedTargetConnection`), else on one extra DSQL connection. Nothing scans a
     row; append loads pay nothing.
 
-    The read runs again, on a connection opened again, after a dropped connection (as
-    Validation's reads classify one, G141), an XX000 or a 40001, as the DROP + CREATE after
+    The read runs again, on a connection opened again, after a dropped connection (one
+    :func:`~dsql_migrator.core.target_connection.is_dropped_connection` counts, as Validation's
+    reads do, G141), an XX000 or a 40001, as the DROP + CREATE after
     it replays its unit; a host that does not resolve fails at once. On the pre-pass's reused
     connection it is each table's FIRST statement, so a connection Aurora DSQL closed after
     the table before fails here first; without the retry that aborted the whole run.
     """
     from dsql_migrator.core.occ import is_occ_conflict, with_occ_retry
     from dsql_migrator.core.schema_applier import _is_permanent_connect_error
-    from dsql_migrator.core.target_connection import is_server_unavailable
-    from dsql_migrator.core.validator import _is_dropped_connection
+    from dsql_migrator.core.target_connection import (
+        is_dropped_connection,
+        is_server_unavailable,
+    )
 
     expected = parse_target_column_types(conversion.target_ddl)
     if not expected:
@@ -8017,7 +8020,7 @@ def _target_columns_the_conversion_would_drop(
 
     current = with_occ_retry(
         retryable=lambda exc: not _is_permanent_connect_error(exc)
-        and (_is_dropped_connection(exc) or is_server_unavailable(exc) or is_occ_conflict(exc)),
+        and (is_dropped_connection(exc) or is_server_unavailable(exc) or is_occ_conflict(exc)),
         sleep=_time.sleep,
     )(_read)()
     return [name for name in current if name not in expected]
