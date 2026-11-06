@@ -2323,18 +2323,52 @@ class ValidationState:
         the combination the gate reads first.
         """
         with self._lock:
-            self._cutover_fk_apply = None
-            self._cutover_fk_apply_job_id = None
-            self._cutover_fk_apply_progress = None
-            self.proceed_without_foreign_keys = False
-            self.proceed_without_fk_validation = frozenset()
-            # The target's tables were just dropped and recreated, so whatever the
-            # operator attested about a drained stream belongs to the previous schema.
-            self.cutover_cdc_drained_confirmed = False
-            # The recreate brought the DEFAULTs back: re-read. The running restore job id
-            # is kept, so the reverse gate still sees it.
-            self._cutover_default_restore_outcome = None
-            self._invalidate_cutover_defaults_locked()
+            # The target's tables were just dropped and recreated: a drained-stream
+            # attestation belongs to the previous schema, and the recreate brought the
+            # DEFAULTs back (re-read). The running restore job id is kept, so the reverse
+            # gate still sees it; the verdict's identity sync and waivers stay too.
+            self._clear_cutover_fk_outcomes_locked()
+
+    def _clear_cutover_fk_outcomes_locked(self) -> None:
+        """Forget the cut-over foreign-key and DEFAULT-restore outcomes (lock held).
+
+        The ONE list every reset shares -- a schema REPLACE (``clear_cutover_outcomes``), a
+        new verdict (``set_result``) and a re-run's start (``clear_outputs``) -- so a new
+        cut-over outcome is cleared by all three or by none, never by the two its author
+        remembered: a stale one has shown a wrong "go" before (a green "Applied N foreign
+        key(s)" after a REPLACE, an old FK-apply result or "proceed without FKs" opt-out on
+        a new run -- FIX 4 / FIX 5).
+
+        The drained attestation goes too: whatever the operator attested about a drained
+        stream belongs to the target / source state before the reset. The DEFAULTs are
+        re-read (a recreate brings them back). The running restore job id is KEPT, so the
+        reverse gate still sees it.
+        """
+        self._cutover_fk_apply = None
+        self._cutover_fk_apply_job_id = None
+        self._cutover_fk_apply_progress = None
+        self.proceed_without_foreign_keys = False
+        self.proceed_without_fk_validation = frozenset()
+        self.cutover_cdc_drained_confirmed = False
+        self._cutover_default_restore_outcome = None
+        self._invalidate_cutover_defaults_locked()
+
+    def _clear_verdict_scoped_cutover_locked(self) -> None:
+        """Forget what belongs to ONE verdict: the cut-over identity sync and the gate
+        waivers (lock held).
+
+        A new verdict (``set_result``) and a re-run's start (``clear_outputs``) drop them:
+        the target may have advanced since, so a stale red "identity sync failed" or a
+        waiver signed against the previous comparison must not carry onto a run it does
+        not describe. A schema REPLACE (``clear_cutover_outcomes``) keeps them -- the
+        verdict they belong to still stands.
+        """
+        self._cutover_identity_sync = None
+        self._cutover_identity_sync_failed = None
+        self._cutover_identity_sync_covered = None
+        self.cutover_dlq_waiver = None
+        self.cutover_replica_identity_waiver = None
+        self.cutover_catalog_drift_waiver = None
 
     def set_cutover_cdc_drained_confirmed(self, confirmed: bool) -> None:
         """Latch the operator's "source frozen, CDC drained to zero lag" attestation.
@@ -2689,27 +2723,14 @@ class ValidationState:
             self._rechecked_at = None
             self._compared_run_start = self._run_started_wall
             self._compared_overrides = dict(compared_overrides or {})
-            self.cutover_dlq_waiver = None
-            self.cutover_replica_identity_waiver = None
-            self.cutover_catalog_drift_waiver = None
             # A new verdict supersedes any earlier cut-over outcome (the target may have
             # advanced since), so the runbook offers fresh runs and starts its outcomes
             # clean -- otherwise a stale red "identity sync failed" / an old FK-apply
             # result / an old "proceed without FKs" opt-out would persist onto a run they
-            # do not belong to (FIX 5 / FIX 4).
-            self._cutover_identity_sync = None
-            self._cutover_identity_sync_failed = None
-            self._cutover_identity_sync_covered = None
-            self._cutover_fk_apply = None
-            self._cutover_fk_apply_job_id = None
-            self._cutover_fk_apply_progress = None
-            self.proceed_without_foreign_keys = False
-            self.proceed_without_fk_validation = frozenset()
-            # A new comparison means the source was read again, so a freeze/drain
-            # attestation made before it no longer describes the current state.
-            self.cutover_cdc_drained_confirmed = False
-            self._cutover_default_restore_outcome = None
-            self._invalidate_cutover_defaults_locked()
+            # do not belong to (FIX 5 / FIX 4). A new comparison means the source was read
+            # again, so a freeze/drain attestation made before it is dropped with them.
+            self._clear_verdict_scoped_cutover_locked()
+            self._clear_cutover_fk_outcomes_locked()
 
     def set_identity_sync(
         self,
@@ -2861,24 +2882,12 @@ class ValidationState:
             self._recheck_error = None
             self._identity_sync = None
             self._identity_sync_failed = None
-            self._cutover_identity_sync = None
-            self._cutover_identity_sync_failed = None
-            self._cutover_identity_sync_covered = None
-            self._cutover_fk_apply = None
-            self._cutover_fk_apply_job_id = None
-            self._cutover_fk_apply_progress = None
-            self.proceed_without_foreign_keys = False
-            self.proceed_without_fk_validation = frozenset()
-            self.cutover_cdc_drained_confirmed = False
             self.interrupted_by_restart = False
-            self._cutover_default_restore_outcome = None
-            self._invalidate_cutover_defaults_locked()
             self._run_started_wall = None
             self._compared_run_start = None
             self._compared_overrides = {}
-            self.cutover_dlq_waiver = None
-            self.cutover_replica_identity_waiver = None
-            self.cutover_catalog_drift_waiver = None
+            self._clear_verdict_scoped_cutover_locked()
+            self._clear_cutover_fk_outcomes_locked()
 
 
 @dataclass
