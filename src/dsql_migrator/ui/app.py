@@ -61,6 +61,7 @@ from dsql_migrator.ui.data_migration import (
     data_migration_exclusion_block,
     full_load_run_guard_reason,
     prereq_mode_for_type,
+    session_source_type,
 )
 from dsql_migrator.ui.evaluation import (
     EvaluationStore,
@@ -526,9 +527,9 @@ def build_page(
 
         def _stream(messages, on_delta):
             st = SESSION_STORE.get_or_create(session_id)
-            engine = source_engine_word(
-                getattr(getattr(st, "source_config", None), "source_type", None)
-            )
+            # session_source_type: a session restored from a host-less snapshot has no
+            # source_config but still knows its engine.
+            engine = source_engine_word(session_source_type(st))
             strategist = AssessmentStrategist(
                 st.ai_assist, aws_profile=st.aws_profile, source_engine=engine
             )

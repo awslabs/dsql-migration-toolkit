@@ -654,11 +654,13 @@ def build_migration_diagram(
     Data Migration / Validation). NiceGUI-agnostic so the label derivation is
     unit-testable.
     """
+    from dsql_migrator.ui.data_migration import session_source_type  # lazy: no cycle
+
     source_config = getattr(state, "source_config", None)
-    # Source engine word for the node label/title/placeholder (MySQL/PostgreSQL);
-    # unknown (no source_config, e.g. a fresh/resumed session) defaults to MySQL so
-    # existing MySQL flows render byte-identically.
-    source_type = getattr(source_config, "source_type", SourceType.MYSQL)
+    # Source engine word for the node label/title/placeholder (MySQL/PostgreSQL): the
+    # live config, else the engine a restore recorded (a host-less snapshot leaves
+    # source_config None), else MySQL, so existing MySQL flows render byte-identically.
+    source_type = session_source_type(state)
     source_word = _SOURCE_ENGINE_WORD.get(source_type, "MySQL")
     target_config = getattr(state, "target_config", None)
     source_verified = bool(getattr(state, "source_verified", False))
@@ -1590,10 +1592,9 @@ def build_workflow_sidebar(
             ai_panel.set_visible(True)
             return
         # Source-aware engine word (MySQL/PostgreSQL), derived like build_migration_diagram.
-        source_type = getattr(
-            getattr(state, "source_config", None), "source_type", SourceType.MYSQL
-        )
-        engine_word = _SOURCE_ENGINE_WORD.get(source_type, "MySQL")
+        from dsql_migrator.ui.data_migration import session_source_type
+
+        engine_word = _SOURCE_ENGINE_WORD.get(session_source_type(state), "MySQL")
         seed = (
             f"Given where I am in this {engine_word} → Aurora DSQL migration, what "
             "should I do next, and what are my top risks right now? Use your tools to "

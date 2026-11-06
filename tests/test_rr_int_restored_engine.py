@@ -267,3 +267,63 @@ def test_the_query_converter_converts_and_grounds_a_restored_session_as_postgres
     ui.find_button("Tune with AI DBA").click()
     assert engines == [("build_query_chat_system", "PostgreSQL"),
                        ("build_query_optimize_system", "PostgreSQL")], engines
+
+
+# -- Every page: the journey diagram, What's next? and the app-wide AI DBA chat ---------------
+
+
+def test_the_journey_diagram_names_a_restored_sessions_postgresql_source() -> None:
+    # The step banner on the same page already said PostgreSQL (session_source_type).
+    from dsql_migrator.ui.workflow import build_migration_diagram
+    from tests.test_rr_a2_restored_engine import _restored_pg_session
+
+    source, _tool, _target = build_migration_diagram(_restored_pg_session())
+    assert (source.title, source.subtitle) == (
+        "Source PostgreSQL", "RDS / Aurora PostgreSQL"), (source.title, source.subtitle)
+
+
+def test_whats_next_asks_about_a_restored_sessions_postgresql_migration(monkeypatch) -> None:
+    import sys
+    import types
+
+    from dsql_migrator.ui import workflow as wf
+    from dsql_migrator.ui.session import SessionStore
+    from tests.test_ui_connect_ai_status import _io_bound, _Ui
+
+    ui = _Ui()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui
+    fake.run = types.SimpleNamespace(io_bound=_io_bound, cpu_bound=_io_bound)
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+    sent: list = []
+
+    class _Panel:
+        def is_enabled(self) -> bool:
+            return True
+
+        def open_scope(self, **_kw):
+            return sent.append
+
+        def __getattr__(self, _name):
+            return lambda *_a, **_k: None
+
+    monkeypatch.setattr(wf, "build_ai_panel", lambda *_a, **_k: _Panel())
+    store = SessionStore()
+    store.get_or_create("s1").set_restored_source_type(SourceType.POSTGRES)
+    wf.build_workflow_sidebar(store, "s1", app_title="t", version="v",
+                              connect_builder=lambda *_a: None,
+                              ai_general_streamer_factory=lambda: object())
+    ui.find_button("What's next?").click()
+    (seed,) = sent
+    assert seed.startswith("Given where I am in this PostgreSQL → Aurora DSQL migration"), seed
+
+
+def test_the_app_wide_ai_dba_chat_grounds_a_restored_session_as_postgresql() -> None:
+    from tests.test_ai_panel import _general_chat_systems_after
+
+    def _restore(session) -> None:
+        session.set_restored_source_type(SourceType.POSTGRES)
+
+    system, kwargs = _general_chat_systems_after(_restore)
+    assert kwargs.get("source_engine") == "PostgreSQL", kwargs
+    assert "THIS PostgreSQL -> Aurora DSQL migration" in system
