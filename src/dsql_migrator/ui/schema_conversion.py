@@ -3232,6 +3232,27 @@ def _install_poll_timer(
         try:
             job = job_manager.get_status(job_id)
         except JobNotFoundError:
+            # The job manager no longer knows this job (its record was dropped). A bare return
+            # here left the step IN_PROGRESS for the rest of the session -- spinner up, Apply
+            # locked -- since only a restart triggers the reconcile in
+            # ``session_persistence``. Settle it here as that reconcile does (Validation's
+            # poll does the same): no record means the outcome is unknown, so FAILED with
+            # the re-run advice, which re-enables the Apply controls; the apply is
+            # idempotent per object, so re-running it is safe.
+            conv_state.set_error(
+                "The apply job record was lost, so this screen cannot tell whether the "
+                "apply finished. Objects it created are already on the target. Re-run the "
+                'apply to finish the rest; with "Skip if exists" it leaves existing objects '
+                "untouched."
+            )
+            session.set_workflow(  # type: ignore[attr-defined]
+                with_status(
+                    session.workflow,  # type: ignore[attr-defined]
+                    WorkflowStep.SCHEMA_CONVERSION,
+                    StepStatus.FAILED,
+                )
+            )
+            refresh()
             return
         mapped = job_status_to_step_status(job.status)
         if mapped is None:

@@ -2271,6 +2271,12 @@ def _install_poll_timer(
         try:
             job = job_manager.get_status(job_id)
         except JobNotFoundError:
+            # The job manager no longer knows this job (its record was dropped). A bare return
+            # here left the step IN_PROGRESS -- spinner up, Run locked -- until something
+            # else re-rendered it. Re-render now: the render's reconcile
+            # (reconcile_evaluation_step) settles a step with no live job, exactly as after
+            # a restart -- DONE when the result is there, else NOT_STARTED with its notice.
+            refresh()
             return
         mapped = job_status_to_step_status(job.status)
         if mapped is None:
