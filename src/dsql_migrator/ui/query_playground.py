@@ -46,7 +46,6 @@ from dsql_migrator.core.assessment_strategist import (
 )
 from dsql_migrator.core.models import (
     Classification,
-    SourceType,
     TargetConnectionConfig,
 )
 from dsql_migrator.core.query_converter import (
@@ -560,9 +559,15 @@ def build_query_playground_screen(
     """
     from nicegui import run, ui
 
+    from dsql_migrator.ui.data_migration._models import session_source_type
+
     session = store.get_or_create(session_id)
     state = playground_store.get_or_create(session_id)
     make_factory = target_connection_factory or _default_target_connection_factory
+
+    def _engine_word() -> str:
+        """The session's CURRENT source engine word, for the intro and the AI grounding."""
+        return source_engine_word(session_source_type(session))
 
     def _query_converter() -> QueryConverter:
         """The converter for the session's CURRENT source engine.
@@ -570,20 +575,16 @@ def build_query_playground_screen(
         Resolved at click time, not when the screen is built: this screen is reachable
         from the tools menu before a source is connected, so a converter bound at build
         time would be stuck on the MySQL default for the whole session. An injected
-        converter always wins, so tests keep full control. Same lazy
-        ``getattr(session.source_config, "source_type", None)`` shape the AI grounding
-        below already uses.
+        converter always wins, so tests keep full control. The engine comes from
+        ``session_source_type``, as the intro and the AI grounding below: a session
+        restored from a host-less snapshot has no ``source_config`` but still knows its
+        engine, and reading only the config converted its PostgreSQL SQL as MySQL.
         """
         if converter is not None:
             return converter
         column_types, column_names = _inventory_columns()
         return QueryConverter(
-            source_type=getattr(
-                getattr(session, "source_config", None),
-                "source_type",
-                SourceType.MYSQL,
-            )
-            or SourceType.MYSQL,
+            source_type=session_source_type(session),
             column_types=column_types,
             column_names=column_names,
         )
@@ -641,7 +642,7 @@ def build_query_playground_screen(
                 ui, icon="science", title="Query Converter"
             )
             intro = (
-                f"Paste a {source_engine_word(getattr(getattr(session, 'source_config', None), 'source_type', None))} "
+                f"Paste a {_engine_word()} "
                 "statement to see how it converts to Aurora DSQL "
                 "(PostgreSQL) and, for SELECT/DDL, test whether it runs on the "
                 "target."
@@ -912,9 +913,7 @@ def build_query_playground_screen(
                     if probe is not None and probe.outcome is ProbeOutcome.FAILED
                     else None
                 )
-                engine = source_engine_word(
-                    getattr(getattr(session, "source_config", None), "source_type", None)
-                )
+                engine = _engine_word()
                 system = build_query_chat_system(
                     result.original_sql,
                     result.converted_sql or "",
@@ -975,9 +974,7 @@ def build_query_playground_screen(
                     if probe is not None and probe.dpu is not None
                     else None
                 )
-                engine = source_engine_word(
-                    getattr(getattr(session, "source_config", None), "source_type", None)
-                )
+                engine = _engine_word()
                 system = build_query_optimize_system(
                     result.original_sql,
                     result.converted_sql or "",

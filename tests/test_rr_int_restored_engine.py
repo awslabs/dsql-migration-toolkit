@@ -199,3 +199,71 @@ def test_the_evaluation_reports_ai_dba_chat_is_grounded_on_the_reports_engine(mo
     assert _evaluation_chat_engine(
         monkeypatch, hint=None, report_engine=SourceType.MYSQL
     ) == "MySQL"
+
+
+# -- The Query Converter ------------------------------------------------------------------------
+
+
+def test_the_query_converter_converts_and_grounds_a_restored_session_as_postgresql(monkeypatch):
+    # Reachable from the tools menu with no source connected. For a restored PostgreSQL
+    # session it built QueryConverter(source_type=MYSQL), converting pasted PostgreSQL SQL
+    # with the MySQL dialect, said "Paste a MySQL statement" and grounded both AI DBA
+    # chats as MySQL.
+    import sys
+    import types
+
+    from dsql_migrator.core.models import Classification
+    from dsql_migrator.core.query_converter import QueryConversionResult, StatementKind
+    from dsql_migrator.core.query_playground import ExecutionProbe, ProbeMode, ProbeOutcome
+    from dsql_migrator.ui import query_playground as qp
+    from dsql_migrator.ui.session import SessionStore
+    from tests.test_ui_connect_ai_status import _io_bound, _Ui
+
+    dialects: list = []
+    real_converter = qp.QueryConverter
+
+    def _recording_converter(*a, source_type=None, **k):
+        dialects.append(source_type)
+        return real_converter(*a, source_type=source_type, **k)
+
+    monkeypatch.setattr(qp, "QueryConverter", _recording_converter)
+    engines: list = []
+    for name in ("build_query_chat_system", "build_query_optimize_system"):
+        real = getattr(qp, name)
+
+        def _spy(*a, source_engine=None, _real=real, _name=name, **k):
+            engines.append((_name, source_engine))
+            return _real(*a, source_engine=source_engine, **k)
+
+        monkeypatch.setattr(qp, name, _spy)
+
+    store = SessionStore()
+    _restored_pg(store)
+    playground = qp.PlaygroundStore()
+    state = playground.get_or_create("s1")
+    state.sql = "SELECT now()::date"
+    ui = _Ui()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui
+    fake.run = types.SimpleNamespace(io_bound=_io_bound, cpu_bound=_io_bound)
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+    content = qp.build_query_playground_screen(
+        store, "s1", playground_store=playground, open_ai_scope=lambda **_k: None)
+    content(lambda: None)
+    assert any(el.text.startswith("Paste a PostgreSQL statement") for el in ui.els), (
+        "the intro told a restored PostgreSQL operator to paste a MySQL statement"
+    )
+
+    ui.find_button("Convert").click()
+    assert dialects == [SourceType.POSTGRES], dialects
+
+    # Both AI DBA chats ("Tune" needs a passed Test on target).
+    state.result = QueryConversionResult(
+        original_sql="SELECT 1", converted_sql="SELECT 1",
+        classification=Classification.AUTO, statement_kind=StatementKind.SELECT)
+    state.set_probe(ExecutionProbe(outcome=ProbeOutcome.PASSED, mode=ProbeMode.EXPLAIN))
+    content(lambda: None)
+    ui.find_button("Review with AI DBA").click()
+    ui.find_button("Tune with AI DBA").click()
+    assert engines == [("build_query_chat_system", "PostgreSQL"),
+                       ("build_query_optimize_system", "PostgreSQL")], engines
