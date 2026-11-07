@@ -774,6 +774,7 @@ def classify_schema_drift(
     * ``07006`` (the sink could not bind a value -> UNBINDABLE VALUE);
     * ``42P10`` (no unique key matches the records' ON CONFLICT key -> KEY CHANGE);
     * ``23514`` (a CHECK rejected the value -> CHECK VIOLATION);
+    * ``428C9`` (a value sent for a generated column -> GENERATED COLUMN);
     * ``22001`` / ``22003`` (too long / out of range for the Aurora DSQL column) and the
       sink's synthetic ``VALUE_DOES_NOT_FIT`` -> VALUE DOES NOT FIT;
     * the synthetic ``SOURCE_TRUNCATE`` -> SOURCE TRUNCATE.
