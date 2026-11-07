@@ -2929,6 +2929,16 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # A marker a shaded dependency also holds proves nothing blob-wide, so it is looked for
     # in the class that owns it.
     class_markers = {
+        # v56 (T1): a text or JSON value is sent and Aurora DSQL decides (only a bytea value is
+        # refused before writing); a row Aurora DSQL refuses over its 1 MiB per-value limit
+        # (54000, which names only the type) is dead-lettered with the column named when
+        # exactly one value of the row can be it (DsqlSinkTask.valueLimitNote).
+        "value-limit rejection names its column": (
+            "dev/dsqlmigrator/connect/DsqlSinkTask.class", b" bytes sent) exceeds DSQL's "
+        ),
+        "value-limit rejection matched": (
+            "dev/dsqlmigrator/connect/DsqlSinkTask.class", b" bytes not supported for (\\w+)"
+        ),
         # v55 (A7): a value sent for a generated column (428C9) starts the table's drift
         # cool-down, like the other structural SQLSTATEs of isStructuralDrift.
         "generated column cools down": ("dev/dsqlmigrator/connect/DsqlSinkTask.class", b"428C9"),
@@ -3559,7 +3569,7 @@ def test_plugin_v52_history_records_the_g22_rebuild() -> None:
     source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
     text = (source / "s3_provision.py").read_text(encoding="utf-8")
     history = " ".join(text.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v55"' in text  # G23 past the released v52, B6 v53, A7 v54
+    assert 'PLUGIN_VERSION = "v56"' in text  # G23 past v52, B6 v53, A7 v54, T1 v55
     assert "rebuilt in place (G22" in history
     assert "XX000" in history
     # G22 also changed paths other than XX000 (a failed error-path rollback drops the

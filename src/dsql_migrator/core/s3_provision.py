@@ -868,7 +868,37 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   Deploy CDC infrastructure to pick up v55 (Start CDC does not re-register the plugin), which
 #   also drops the stream position (MySQL re-reads from the watermark; the PostgreSQL slot is
 #   recreated).
-PLUGIN_VERSION = "v55"
+# v56 (T1): the sink ZIP's CONTENT changed --
+#   * the 1 MiB per-value guard (oversizedColumn) refuses only a bytea value before any write; a
+#     text value is sent and Aurora DSQL decides, as for json / jsonb and as in Full Load. Aurora
+#     DSQL limits text by its STORED size, after its compression, so a text value over 1 MiB that
+#     compresses below it is stored: v55 and every earlier sink dead-lettered it, on CDC only,
+#     while Full Load loaded it. Measured live (2026-11-07, a scratch schema on a test cluster,
+#     with the incompressible control v40's lesson asks for): random base64 text accepted at
+#     0.95 MiB and refused at 1.05 MiB ("54000 datatype limit greater than 1048576 bytes not
+#     supported for text"); "x" * 8 MiB stored in 32,915 bytes; JSON-shaped text of 1.5 MiB
+#     stored in 807,991 bytes and refused at 3 MiB; random-word prose of 1.5 MiB refused (the
+#     compressor is weaker than zlib); json / jsonb 1.5 MiB stored, 3 MiB refused; bytea refused
+#     at 1.05 MiB of random bytes and at 1.5 MiB of zero bytes (its RAW size binds). The same on
+#     a multi-row INSERT ... ON CONFLICT DO UPDATE (insert and conflict update) and a plain
+#     UPDATE. The "Supported data types" page documents the compressed size for json / jsonb and
+#     compression for text without saying which size binds text, hence the measurement. A text
+#     value Aurora DSQL refuses now costs its chunk a failed batch and a one-row replay, as a
+#     refused json value always did; the chunk byte budget still counts raw bytes;
+#   * a row Aurora DSQL refuses over that limit (its 54000 names only the TYPE) is dead-lettered
+#     with the column named in the guard's format -- "Value for column '<c>' (<type>, <n> bytes
+#     sent) exceeds DSQL's 1048576-byte limit as stored. ..." -- when exactly one value of the
+#     row has that type and over 1 MiB of bytes, else with none, so the in-app recovery can
+#     pre-tick it. The control plane classifies such a 54000 as OVERSIZED_VALUE for every sink
+#     version (core/cdc_dlq.py), so with v55 the recovery card, the dead-letter gate and Cut over
+#     offer the remedy too, only with no column pre-ticked.
+#   No config key, template or Start CDC change; the worker configuration, connector properties,
+#   Debezium ZIPs and seeder Lambda are unchanged (the bump renames only the CustomPlugins and the
+#   worker configurations). Bumped because the ZIP changed; a live cdc-stack needs Delete +
+#   Deploy CDC infrastructure to pick up v56 (Start CDC does not re-register the plugin), which
+#   also drops the stream position (MySQL re-reads from the watermark; the PostgreSQL slot is
+#   recreated).
+PLUGIN_VERSION = "v56"
 
 
 class S3ProvisionError(RuntimeError):

@@ -734,7 +734,7 @@ def test_chapter_13_names_new_topics_for_the_type_switch_and_the_re_copy(lang: s
         "before the new stack's first Start CDC: once that stack has streamed, a new Full Load "
         "start point needs another Delete and redeploy." in monitoring
     )
-    assert PLUGIN_VERSION == "v55"
+    assert PLUGIN_VERSION == "v56"
 
     _all(lang, _P13, _CH13)
     assert not _stale(lang, _CH13_STALE[lang]), lang
