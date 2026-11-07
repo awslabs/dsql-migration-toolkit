@@ -17,7 +17,9 @@
 package dev.dsqlmigrator.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.InvocationHandler;
@@ -25,19 +27,24 @@ import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.Test;
 import org.postgresql.util.PGobject;
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.ServerErrorMessage;
 
 class DsqlSinkPerValueGuardTest {
 
@@ -191,10 +198,25 @@ class DsqlSinkPerValueGuardTest {
         "dsqlcdc.app.docs", 0, KEY, new Struct(KEY).put("id", id), ENVELOPE, envelope, id);
   }
 
-  /** A JDBC double that keeps the bound rows of every committed statement. */
+  /**
+   * A JDBC double that keeps the bound rows of every committed statement, and refuses a row the
+   * way Aurora DSQL refuses a value over its limit when {@link #refuse} names a type for it.
+   */
   private static final class RecordingDsql {
     final List<List<Object>> committed = new ArrayList<>();
     private final List<List<Object>> pending = new ArrayList<>();
+    // The type a row's statement is refused for (54000), or null: the row is accepted.
+    Function<List<Object>, String> refuse = row -> null;
+
+    private void execute(List<List<Object>> rows) throws SQLException {
+      for (List<Object> row : rows) {
+        String type = refuse.apply(row);
+        if (type != null) {
+          throw valueLimit(type);
+        }
+      }
+      pending.addAll(rows);
+    }
 
     @SuppressWarnings("unchecked")
     private static <T> T proxy(Class<T> type, InvocationHandler handler) {
@@ -219,11 +241,11 @@ class DsqlSinkPerValueGuardTest {
                   yield null;
                 }
                 case "executeUpdate" -> {
-                  pending.addAll(batch.isEmpty() ? List.of(current) : batch);
+                  execute(batch.isEmpty() ? List.of(current) : batch);
                   yield 1;
                 }
                 case "executeBatch" -> {
-                  pending.addAll(batch);
+                  execute(batch);
                   yield new int[batch.size()];
                 }
                 case "hashCode" -> System.identityHashCode(self);
@@ -324,5 +346,154 @@ class DsqlSinkPerValueGuardTest {
     assertTrue(DsqlSinkTask.encodedBytes(array) > LIMIT);
     assertEquals(List.of(3L), deadLettered);
     assertTrue(reasons.get(0).startsWith("Value for column 'blob' exceeds DSQL's 1048576-byte"));
+  }
+
+  // --- Aurora DSQL's own rejection: the reason names the column when it can --------------------
+
+  /** Aurora DSQL's refusal of one value over its 1 MiB limit (measured): it names the TYPE. */
+  private static SQLException valueLimit(String type) {
+    return new PSQLException(
+        new ServerErrorMessage(
+            "SERROR\0C54000\0Mdatatype limit greater than 1048576 bytes not supported for "
+                + type + "\0"));
+  }
+
+  private static final String TEXT_LIMIT =
+      "datatype limit greater than 1048576 bytes not supported for text";
+
+  private static ChangeEvent row(List<String> columns, Object... values) {
+    return ChangeEvent.insert(
+        "app.docs", columns, Arrays.asList(values), List.of("id"), List.of(values[0]), 0L);
+  }
+
+  @Test
+  void aValueLimitRejectionNamesTheOneCandidateColumnOfItsType() throws Exception {
+    // FAILS before T1 part 2: the reason of a row Aurora DSQL refused carried only the TYPE, so
+    // the in-app recovery could not pre-tick the column to stop capturing.
+    String big = "x".repeat(2 * LIMIT);
+    ChangeEvent text = row(List.of("id", "title", "body"), 1L, "small", big);
+    String note = DsqlSinkTask.valueLimitNote(text, "54000", TEXT_LIMIT);
+    assertEquals(
+        " -- Value for column 'body' (text, " + (2 * LIMIT) + " bytes sent) exceeds DSQL's "
+            + "1048576-byte limit as stored. This row cannot be stored as-is and is never "
+            + "retried: exclude the column at capture and keep the value outside the database.",
+        note);
+    // The server's spelling may lead with a capital.
+    assertTrue(
+        DsqlSinkTask.valueLimitNote(text, "54000", "Datatype limit greater than 1048576 bytes "
+            + "not supported for text").contains("column 'body'"));
+    // json: the one PGobject over 1 MiB, even beside a larger text value.
+    ChangeEvent json =
+        row(List.of("id", "doc", "body"), 1L, pg("json", document(2 * LIMIT)), big);
+    assertTrue(
+        DsqlSinkTask.valueLimitNote(json, "54000", TEXT_LIMIT.replace("text", "json"))
+            .startsWith(" -- Value for column 'doc' (json, "));
+    // jsonb: the sink binds a PostgreSQL jsonb document as a json PGobject (Aurora DSQL casts
+    // it), so a json PGobject is a jsonb candidate too.
+    ChangeEvent jsonb = row(List.of("id", "doc"), 1L, pg("json", document(2 * LIMIT)));
+    assertTrue(
+        DsqlSinkTask.valueLimitNote(jsonb, "54000", TEXT_LIMIT.replace("text", "jsonb"))
+            .startsWith(" -- Value for column 'doc' (jsonb, "));
+    // bytea: a byte[] (the guard refuses one over 1 MiB before any write; this is the rule).
+    ChangeEvent bytea = row(List.of("id", "blob"), 1L, new byte[LIMIT + 1]);
+    assertTrue(
+        DsqlSinkTask.valueLimitNote(bytea, "54000", TEXT_LIMIT.replace("text", "bytea"))
+            .startsWith(" -- Value for column 'blob' (bytea, " + (LIMIT + 1) + " bytes sent)"));
+  }
+
+  @Test
+  void aValueLimitRejectionNamesNoColumnUnlessExactlyOneCandidateHasItsTypeAndSize()
+      throws Exception {
+    String big = "x".repeat(2 * LIMIT);
+    // Two text values over 1 MiB: either could be the one refused, so none is named.
+    ChangeEvent two = row(List.of("id", "a", "b"), 1L, big, big);
+    assertEquals("", DsqlSinkTask.valueLimitNote(two, "54000", TEXT_LIMIT));
+    // No text value over 1 MiB (a stored size over 1 MiB implies a raw size over 1 MiB).
+    ChangeEvent none = row(List.of("id", "a", "doc"), 1L, "x".repeat(LIMIT), pg("json", big));
+    assertEquals("", DsqlSinkTask.valueLimitNote(none, "54000", TEXT_LIMIT));
+    // A json and a jsonb (array) value both over 1 MiB: a jsonb rejection names neither.
+    ChangeEvent docs =
+        row(List.of("id", "doc", "tags"), 1L, pg("json", big), arrayAsJsonb(2 * LIMIT));
+    assertEquals(
+        "", DsqlSinkTask.valueLimitNote(docs, "54000", TEXT_LIMIT.replace("text", "jsonb")));
+    // A text value is no json or bytea candidate, and a byte[] no text one.
+    ChangeEvent text = row(List.of("id", "body"), 1L, big);
+    assertEquals(
+        "", DsqlSinkTask.valueLimitNote(text, "54000", TEXT_LIMIT.replace("text", "json")));
+    assertEquals(
+        "", DsqlSinkTask.valueLimitNote(text, "54000", TEXT_LIMIT.replace("text", "bytea")));
+    ChangeEvent bytes = row(List.of("id", "blob"), 1L, new byte[2 * LIMIT]);
+    assertEquals("", DsqlSinkTask.valueLimitNote(bytes, "54000", TEXT_LIMIT));
+    // Any other 54000 (the transaction, row or key size), another limit (varchar's 65535
+    // bytes), another SQLSTATE, no message, or a delete: no column named.
+    for (String other :
+        List.of(
+            "transaction size limit 10485760 exceeded",
+            "maximum row size exceeded",
+            "key size too large",
+            "datatype limit greater than 65535 bytes not supported for varchar")) {
+      assertEquals("", DsqlSinkTask.valueLimitNote(text, "54000", other), other);
+    }
+    assertEquals("", DsqlSinkTask.valueLimitNote(text, "22001", TEXT_LIMIT));
+    assertEquals("", DsqlSinkTask.valueLimitNote(text, null, TEXT_LIMIT));
+    assertEquals("", DsqlSinkTask.valueLimitNote(text, "54000", null));
+    assertEquals(
+        "",
+        DsqlSinkTask.valueLimitNote(
+            ChangeEvent.delete("app.docs", List.of("id"), List.of(1L), 0L), "54000",
+            TEXT_LIMIT));
+  }
+
+  @Test
+  void aTextValueAuroraDsqlRefusesIsDeadLetteredAloneWithItsColumnNamed() throws Exception {
+    // Through put(): the text value goes to Aurora DSQL (the guard no longer refuses it); the
+    // 54000 fails the batch, the per-row replay applies the healthy rows and dead-letters the
+    // refused one, and its reason names the column, the type and the size -- never the value.
+    String refused = "R" + "x".repeat(2 * LIMIT - 1); // stands for 2 MiB that do not compress
+    List<SinkRecord> records =
+        List.of(
+            insert("mysql", 1, "doc", document(LIMIT + LIMIT / 2)),
+            insert("mysql", 2, "body", refused),
+            insert("mysql", 3, "body", "small"));
+    RecordingDsql dsql = new RecordingDsql();
+    dsql.refuse = r -> refused.equals(r.get(2)) ? "text" : null;
+    List<Object> deadLettered = new ArrayList<>();
+    List<Throwable> causes = new ArrayList<>();
+    ErrantRecordReporter dlq =
+        (record, error) -> {
+          deadLettered.add(record.kafkaOffset());
+          causes.add(error);
+          return CompletableFuture.completedFuture(null);
+        };
+    UncheckedTask task = new UncheckedTask();
+    Map<String, String> props = new HashMap<>();
+    props.put(DsqlSinkConnectorConfig.CLUSTER_ENDPOINT, "example.dsql.us-east-1.on.aws");
+    props.put(DsqlSinkConnectorConfig.REGION, "us-east-1");
+    props.put(DsqlSinkConnectorConfig.RETRY_BACKOFF_MS, "0");
+    task.startMetrics(props);
+    setField(task, "connection", dsql.connection());
+    setField(task, "dlqReporter", dlq);
+
+    task.put(records);
+
+    assertEquals(List.of(1L, 3L), dsql.committedIds());
+    assertEquals(List.of(2L), deadLettered);
+    // The Kafka dead letter keeps Aurora DSQL's own error.
+    assertEquals("54000", ((SQLException) causes.get(0)).getSQLState());
+
+    // The logged reason (what the control plane parses), read from the loud no-DLQ failure.
+    UncheckedTask loud = new UncheckedTask();
+    loud.startMetrics(props);
+    setField(loud, "connection", dsql.connection());
+    ConnectException e =
+        assertThrows(ConnectException.class, () -> loud.put(List.of(records.get(1))));
+    String reason = e.getMessage();
+    assertTrue(
+        reason.contains(
+            ": sqlstate=54000 " + TEXT_LIMIT + " -- Value for column 'body' (text, "
+                + (2 * LIMIT) + " bytes sent) exceeds DSQL's 1048576-byte limit as stored."),
+        reason.substring(0, Math.min(reason.length(), 600)));
+    assertTrue(reason.contains(" | pk: id=2 | op: c/r | sql: INSERT INTO "), reason);
+    assertFalse(reason.contains("RXX") || reason.contains("xxxx"), "no value in the reason");
   }
 }

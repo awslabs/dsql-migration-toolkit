@@ -1615,9 +1615,10 @@ public class DsqlSinkTask extends SinkTask {
    * <p>Text and JSON are sent as they are and DSQL decides, as it does for Full Load, which
    * sends such values the same way; a real rejection (54000, the same message on a multi-row
    * upsert, its conflict update and a plain UPDATE) dead-letters that one row on the per-row
-   * path. Refusing them here would dead-letter, on CDC only, values Full Load loads. Numbers,
-   * booleans and timestamps are small. The chunk byte budget still counts every text, PGobject
-   * text and bytea by its raw bytes ({@link #estimateValueBytes}). Package-private for tests.
+   * path, naming the column when the row shows which it is ({@link #valueLimitNote}). Refusing
+   * them here would dead-letter, on CDC only, values Full Load loads. Numbers, booleans and
+   * timestamps are small. The chunk byte budget still counts every text, PGobject text and
+   * bytea by its raw bytes ({@link #estimateValueBytes}). Package-private for tests.
    */
   static String oversizedColumn(ChangeEvent event) {
     if (event.isDelete()) {
@@ -1632,6 +1633,74 @@ public class DsqlSinkTask extends SinkTask {
       }
     }
     return null;
+  }
+
+  /**
+   * Aurora DSQL's rejection of ONE value over its 1 MiB per-value limit, SQLSTATE 54000:
+   * "datatype limit greater than 1048576 bytes not supported for &lt;type&gt;". Measured for text,
+   * json, jsonb and bytea, on a single-row insert, a multi-row upsert (its insert and its
+   * conflict update) and a plain UPDATE. It names the TYPE, never the column. Any other 54000
+   * (the transaction, row or key size) and any other limit (varchar's 65535 bytes) do not match.
+   */
+  private static final Pattern VALUE_LIMIT =
+      Pattern.compile(
+          "datatype limit greater than " + DSQL_MAX_VALUE_BYTES
+              + " bytes not supported for (\\w+)",
+          Pattern.CASE_INSENSITIVE);
+
+  /**
+   * What a {@link #VALUE_LIMIT} rejection of {@code event}'s own statement adds to its
+   * dead-letter reason: the column, in the size guard's format ("Value for column
+   * '&lt;name&gt;' ...", which the control plane reads -- core/cdc_dlq.py
+   * {@code oversized_column_from_reason} -- to pre-tick the column to stop capturing), its type
+   * and its size as sent; or {@code ""}. A column is named only when exactly ONE value of the
+   * row has the named type and an encoded size over 1 MiB (a stored size over 1 MiB implies a
+   * raw size over 1 MiB): text is a {@code String}, json and jsonb a json or jsonb
+   * {@link org.postgresql.util.PGobject} (the sink binds every JSON document as json, also into
+   * a jsonb column, and an array as jsonb), bytea a {@code byte[]}. With none or several
+   * candidates no column is named, and the operator chooses. Names, types and sizes only, never
+   * a value (Property 7). Package-private for tests.
+   */
+  static String valueLimitNote(ChangeEvent event, String sqlState, String message) {
+    if (event.isDelete() || !"54000".equals(sqlState) || message == null) {
+      return "";
+    }
+    java.util.regex.Matcher limit = VALUE_LIMIT.matcher(message);
+    if (!limit.find()) {
+      return "";
+    }
+    String type = limit.group(1).toLowerCase(java.util.Locale.ROOT);
+    List<String> cols = event.columns();
+    List<Object> vals = event.values();
+    int found = -1;
+    for (int i = 0; i < vals.size() && i < cols.size(); i++) {
+      Object v = vals.get(i);
+      if (holdsValueOfType(v, type) && encodedBytes(v) > DSQL_MAX_VALUE_BYTES) {
+        if (found >= 0) {
+          return ""; // several candidates: name none rather than guess
+        }
+        found = i;
+      }
+    }
+    if (found < 0) {
+      return "";
+    }
+    return " -- Value for column '" + cols.get(found) + "' (" + type + ", "
+        + encodedBytes(vals.get(found)) + " bytes sent) exceeds DSQL's " + DSQL_MAX_VALUE_BYTES
+        + "-byte limit as stored. This row cannot be stored as-is and is never retried: "
+        + "exclude the column at capture and keep the value outside the database.";
+  }
+
+  /** Whether {@code v} is how the sink binds a value of the Aurora DSQL type {@code type}. */
+  private static boolean holdsValueOfType(Object v, String type) {
+    return switch (type) {
+      case "text" -> v instanceof String;
+      case "bytea" -> v instanceof byte[];
+      case "json", "jsonb" ->
+          v instanceof org.postgresql.util.PGobject pg
+              && ("json".equals(pg.getType()) || "jsonb".equals(pg.getType()));
+      default -> false;
+    };
   }
 
   /**
@@ -2289,6 +2358,8 @@ public class DsqlSinkTask extends SinkTask {
     // key is empty.
     String pk = pkSuffix(formatPk(event.pkColumns(), event.pkValues()));
     String message = safeCauseMessage(cause);
+    // Aurora DSQL's per-value limit names only the TYPE: name the column when the row shows it.
+    message += valueLimitNote(event, state, message);
     String op = opSuffix(event);
     String reason = sql == null ? message + pk + op : message + pk + op + " | sql: " + sql;
     quarantine(record, cause, sqlStateTag(cause) + reason);
