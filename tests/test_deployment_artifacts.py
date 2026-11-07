@@ -2929,6 +2929,13 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # A marker a shaded dependency also holds proves nothing blob-wide, so it is looked for
     # in the class that owns it.
     class_markers = {
+        # v55 (A7): a value sent for a generated column (428C9) starts the table's drift
+        # cool-down, like the other structural SQLSTATEs of isStructuralDrift.
+        "generated column cools down": ("dev/dsqlmigrator/connect/DsqlSinkTask.class", b"428C9"),
+        # ...and the metrics WARN names the metrics the sink emits.
+        "metrics WARN names applied ops": (
+            "dev/dsqlmigrator/connect/DsqlSinkTask.class", b"DeletesApplied / ReplicationLagMs"
+        ),
         # v54 (G65, rebuilt in place): a whole decimal bound into an integer parameter is
         # bound as a long (`"id" = ?` on a numeric(12,0) serial key made a bigint identity
         # became `"id"::numeric = $1`, a full scan per DELETE). The shaded pgjdbc
@@ -2956,6 +2963,10 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # java.sql.Date through the same calendar, whose switch skips 1582-10-05 .. 1582-10-14, so
     # a date in those ten days was written ten days later (G133).
     class_absent = {
+        # v55 (A7): the retired net-rows metric is no longer named in the metrics WARN.
+        "net-rows WARN": (
+            "dev/dsqlmigrator/connect/DsqlSinkTask.class", b"net-rows / replication-lag"
+        ),
         "pre-1582 timestamp shift": (
             "dev/dsqlmigrator/connect/DebeziumTypeConverter.class", b"java/sql/Timestamp"
         ),
@@ -3548,7 +3559,7 @@ def test_plugin_v52_history_records_the_g22_rebuild() -> None:
     source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
     text = (source / "s3_provision.py").read_text(encoding="utf-8")
     history = " ".join(text.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v54"' in text  # G23 bumped past the released v52, B6 past v53
+    assert 'PLUGIN_VERSION = "v55"' in text  # G23 past the released v52, B6 v53, A7 v54
     assert "rebuilt in place (G22" in history
     assert "XX000" in history
     # G22 also changed paths other than XX000 (a failed error-path rollback drops the

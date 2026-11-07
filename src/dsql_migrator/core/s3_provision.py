@@ -840,7 +840,35 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #     (1582-10-10 as 1582-10-20), and on a key column the update inserted a second row and the
 #     delete matched nothing. pgjdbc sends a LocalDate before 4713-01-01 BC as -infinity, so a
 #     PostgreSQL date before then (its dates start at 4714-11-24 BC) is bound as its own text.
-PLUGIN_VERSION = "v54"
+# v55 (A7): the sink ZIP's CONTENT changed --
+#   * a value sent for a column the target GENERATES (SQLSTATE 428C9, the GENERATED_COLUMN drift
+#     kind the control plane already reports) starts the table's drift cool-down, like a column
+#     the target lacks: Aurora DSQL rejects every insert and update of such a table, and each
+#     change batch holding one of its rows paid a failed batch, a rollback and a
+#     one-row-per-transaction replay of the whole batch, every other table's rows included. Now
+#     only that table's later changes go one per transaction while the other tables keep
+#     batching, until one of its inserts or updates applies, or 60 s after its last rejection.
+#     Which rows are dead-lettered, and with what reason, is unchanged;
+#   * the 1 MiB per-value guard (oversizedColumn) is unchanged and now shares the chunk byte
+#     budget's sizer: before any write it refuses a text value whose UTF-8 bytes pass 1 MiB and a
+#     bytea over 1 MiB, never a json / jsonb value or a PostgreSQL array rendered as jsonb.
+#     Aurora DSQL compresses json and jsonb, and its "Supported data types" page says their
+#     1 MiB limit applies to the COMPRESSED size, so a larger document that compresses below it
+#     is stored -- as Full Load stores it -- and a real rejection (54000) dead-letters that one
+#     row; refusing them in the sink would have dead-lettered, on CDC only, documents Full Load
+#     loads. For text the page does not say the limit binds the compressed size, so the guard
+#     keeps the raw reading;
+#   * the WARN logged when the CDC monitor metrics cannot be emitted names the metrics the sink
+#     emits (InsertsApplied / UpdatesApplied / DeletesApplied / ReplicationLagMs) instead of the
+#     retired net-rows metric, and a dead letter's SQL template is rendered by the mapping that
+#     builds the statement (the same text for every row that can be dead-lettered).
+#   No config key, template or Start CDC change; the worker configuration, connector properties,
+#   Debezium ZIPs and seeder Lambda are unchanged (the bump renames only the CustomPlugins and the
+#   worker configurations). Bumped because the ZIP changed; a live cdc-stack needs Delete +
+#   Deploy CDC infrastructure to pick up v55 (Start CDC does not re-register the plugin), which
+#   also drops the stream position (MySQL re-reads from the watermark; the PostgreSQL slot is
+#   recreated).
+PLUGIN_VERSION = "v55"
 
 
 class S3ProvisionError(RuntimeError):
