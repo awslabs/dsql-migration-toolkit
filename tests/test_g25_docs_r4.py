@@ -82,11 +82,14 @@ def test_the_sink_readmes_logging_note_does_not_claim_a_complete_list() -> None:
         '"Source-key deletes are off for table {}: its Aurora DSQL unique indexes could not be '
         'read "',
         '"Could not roll back the failed attempt before its retry (sqlstate={}); the retry "',
-        '"Could not emit CDC monitor metrics (net-rows / replication-lag; best-effort; "',
+        # A7: the metrics WARN names the metrics the sink emits (the net-rows one is retired).
+        '"Could not emit CDC monitor metrics (InsertsApplied / UpdatesApplied / " '
+        '+ "DeletesApplied / ReplicationLagMs; best-effort; replication unaffected): {}"',
         '"Since the last offset commit, Aurora DSQL asked this task to retry a transaction {} "',
         '"Table {}: partition {} was revoked while the change at offset {} was held; its commit "',
     ):
         assert literal in source, literal
+    assert "net-rows / replication-lag" not in source
     readme = _flat("en", _SINK_README.read_text(encoding="utf-8"))
     note = readme[
         readme.index("## Per-record apply logging") : readme.index("**Why a connector-config gate")

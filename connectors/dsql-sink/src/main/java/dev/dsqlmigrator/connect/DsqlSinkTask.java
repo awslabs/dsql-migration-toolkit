@@ -411,8 +411,9 @@ public class DsqlSinkTask extends SinkTask {
   void startMetrics(Map<String, String> props) {
     this.config = new DsqlSinkConnectorConfig(props);
     this.targetKeys = config.targetKeyColumns();
-    // Net-rows metric is on only when a Stack dimension was supplied (the cdc-stack
-    // connector config sets it); otherwise stay silent (e.g. local/unit runs).
+    // The applied-ops and replication-lag metrics are on only when a Stack dimension was
+    // supplied (the cdc-stack connector config sets it); otherwise stay silent (e.g.
+    // local/unit runs).
     this.metricsStack = config.metricsStack();
     this.metricsEnabled = config.metricsEnabled() && !metricsStack.isEmpty();
     if (metricsEnabled) {
@@ -2936,7 +2937,7 @@ public class DsqlSinkTask extends SinkTask {
     // Replication lag (gauge): the worst apply-time lag per table since the last
     // emit, then reset. getAndSet(0) reads-and-clears so an idle next window (no
     // events) emits no datapoint (= caught up). Same Stack+Table dimensions and the
-    // same PutMetricData request as the net-rows datums above.
+    // same PutMetricData request as the applied-ops datums above.
     for (Map.Entry<String, AtomicLong> e : lagByTable.entrySet()) {
       long lagMs = e.getValue().getAndSet(0L);
       if (lagMs <= 0L) {
@@ -2965,8 +2966,8 @@ public class DsqlSinkTask extends SinkTask {
       // Drop this window (do NOT re-accumulate: avoids unbounded growth if CloudWatch
       // stays unreachable); the next window re-reports its own delta.
       log.warn(
-          "Could not emit CDC monitor metrics (net-rows / replication-lag; best-effort; "
-              + "replication unaffected): {}",
+          "Could not emit CDC monitor metrics (InsertsApplied / UpdatesApplied / "
+              + "DeletesApplied / ReplicationLagMs; best-effort; replication unaffected): {}",
           ex.toString());
     }
   }

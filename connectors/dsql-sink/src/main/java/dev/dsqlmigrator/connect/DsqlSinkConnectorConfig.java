@@ -39,7 +39,8 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
   public static final String BATCH_SIZE = "batch.size";
   public static final String MAX_RETRIES = "occ.max.retries";
   public static final String RETRY_BACKOFF_MS = "occ.retry.backoff.ms";
-  // Per-table net-rows monitor metric (CloudWatch). Best-effort and off unless a
+  // Per-table applied-ops (InsertsApplied / UpdatesApplied / DeletesApplied) and
+  // ReplicationLagMs monitor metrics (CloudWatch). Best-effort and off unless a
   // stack name is supplied by the cdc-stack connector config; a metric-emit failure
   // never affects replication.
   public static final String METRICS_ENABLED = "metrics.enabled";
