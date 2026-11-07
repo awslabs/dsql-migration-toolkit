@@ -2392,12 +2392,16 @@ def build_data_migration_screen(
             # call inside it shipped.
             lob_candidates_for = make_lob_candidates_for(inventory, session, migration_state)
 
-            def exclude_cdc_capture_columns(table_name: str, columns: Sequence[str]) -> None:
+            def exclude_cdc_capture_columns(
+                table_name: str, columns: Sequence[str], *, column_unknown: bool = False
+            ) -> None:
                 # The CDC dead-letter "Exclude column…": record a pending rule per named
-                # column and open the exclusion popup in the mode the lock gives.
+                # column and open the exclusion popup in the mode the lock gives (with the
+                # choice open when a dropped row of the table names no column).
                 from dsql_migrator.ui.data_migration._exclusion_dialog import open_dlq_route
 
-                open_dlq_route(ui, _exclusion_ctx, table_name, columns)
+                open_dlq_route(ui, _exclusion_ctx, table_name, columns,
+                               column_unknown=column_unknown)
 
             def exclusion_route(table_name: str, reason_text: str) -> None:
                 # The quarantine card's "Exclude column & reload": the exclusion popup,

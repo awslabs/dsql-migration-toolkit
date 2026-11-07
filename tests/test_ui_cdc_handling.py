@@ -1639,10 +1639,11 @@ def test_the_oversized_quarantine_groups_only_the_class_that_has_a_remedy() -> N
     ]
     groups = cdc_oversized_quarantine_groups(records)
     assert len(groups) == 1, groups
-    table, pks, columns = groups[0]
+    table, pks, columns, unnamed = groups[0]
     assert table == "ecommerce.product_media"
     assert pks == ["id=1", "id=2"]
     assert columns == ["content"]
+    assert unnamed == 0  # every record names its column
     # Nothing to group -> nothing rendered at all.
     assert cdc_oversized_quarantine_groups([]) == []
     assert cdc_oversized_quarantine_groups(None) == []
@@ -1678,7 +1679,7 @@ def test_the_card_groups_dsqls_own_value_limit_rejection_and_never_guesses_a_col
         parse_dlq_log_message(line("shop.notes", "id=7")),
     ]
     groups = cdc_oversized_quarantine_groups(records)
-    assert groups == [("shop.pages", ["id=1"], ["body"]), ("shop.notes", ["id=7"], [])]
+    assert groups == [("shop.pages", ["id=1"], ["body"], 0), ("shop.notes", ["id=7"], [], 1)]
 
     ui = _FakeUi()
     routed: list = []
@@ -1687,7 +1688,7 @@ def test_the_card_groups_dsqls_own_value_limit_rejection_and_never_guesses_a_col
         object(),
         "log",
         lob_candidates_for=lambda _t: [("body", "text"), ("summary", "text")],
-        exclude_columns=lambda t, c: routed.append((t, c)),
+        exclude_columns=lambda t, c, **k: routed.append((t, c, k)),
         records=records,
     )
     body = " ".join(ui.texts)
@@ -1695,7 +1696,86 @@ def test_the_card_groups_dsqls_own_value_limit_rejection_and_never_guesses_a_col
     assert "id=7" in body and "never retried" in body
     for button in [b for b in ui.buttons if "Exclude column" in getattr(b, "text", "")]:
         button.on_click()
-    assert routed == [("shop.pages", ["body"]), ("shop.notes", [])]
+    assert routed == [
+        ("shop.pages", ["body"], {"column_unknown": False}),
+        ("shop.notes", [], {"column_unknown": True}),
+    ]
+
+
+def test_a_named_and_an_unnamed_rejection_on_one_table_never_attributes_the_named_column() -> None:
+    """T1 review follow-up: columns are merged per table, so a 54000 dead letter that names no
+    column (an older sink, or a v56 row with several candidates) sat under another record's
+    column -- the card said "column body" for both rows and "Exclude column..." pre-ticked only
+    body with the LOB section unfiltered, so the operator was never asked for the other row's
+    column. Before T1 every oversized record named its column, so this could not happen.
+
+    The unnamed rows are counted apart: the card names body for its rows and says the column of
+    the other could not be determined, and the route still records body's line but opens the
+    choice filtered to the table."""
+    from dsql_migrator.core.cdc_dlq import parse_dlq_log_message
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _render_cdc_oversized_recovery,
+        cdc_oversized_quarantine_groups,
+    )
+
+    def line(pk: str, note: str = "") -> str:
+        return (
+            "Quarantined record to DLQ (topic=dsqlcdc.shop.pages, partition=0, offset=5): "
+            "sqlstate=54000 datatype limit greater than 1048576 bytes not supported for text"
+            f"{note} | pk: {pk} | op: c/r | sql: INSERT INTO x (\"id\", \"body\", \"summary\")"
+            " VALUES (?, ?, ?)"
+        )
+
+    named = (
+        " -- Value for column 'body' (text, 2097152 bytes sent) exceeds DSQL's 1048576-byte "
+        "limit as stored. This row cannot be stored as-is and is never retried: exclude the "
+        "column at capture and keep the value outside the database."
+    )
+    records = [
+        parse_dlq_log_message(line("id=1", named)),
+        parse_dlq_log_message(line("id=2")),
+        parse_dlq_log_message(line("id=2")),  # the same row again: one row, not two
+        parse_dlq_log_message(line("id=3")),
+    ]
+    assert cdc_oversized_quarantine_groups(records) == [
+        ("shop.pages", ["id=1", "id=2", "id=3"], ["body"], 2)
+    ]
+
+    ui = _FakeUi()
+    routed: list = []
+    _render_cdc_oversized_recovery(
+        ui,
+        object(),
+        "log",
+        lob_candidates_for=lambda _t: [("body", "text"), ("summary", "text")],
+        exclude_columns=lambda t, c, **k: routed.append((t, c, k)),
+        records=records,
+    )
+    body = " ".join(ui.texts)
+    assert (
+        "Dropped over DSQL's 1 MiB per-value limit — column body; for 2 rows the column could "
+        "not be determined."
+    ) in body, body
+    assert "Dropped over DSQL's 1 MiB per-value limit — column body." not in body
+    buttons = [b for b in ui.buttons if "Exclude column" in getattr(b, "text", "")]
+    assert len(buttons) == 1
+    buttons[0].on_click()
+    assert routed == [("shop.pages", ["body"], {"column_unknown": True})]
+
+    # Every record named: unchanged (the column pre-ticked, no choice forced).
+    ui = _FakeUi()
+    routed.clear()
+    _render_cdc_oversized_recovery(
+        ui,
+        object(),
+        "log",
+        lob_candidates_for=lambda _t: [("body", "text")],
+        exclude_columns=lambda t, c, **k: routed.append((t, c, k)),
+        records=records[:1],
+    )
+    assert "Dropped over DSQL's 1 MiB per-value limit — column body." in " ".join(ui.texts)
+    next(b for b in ui.buttons if "Exclude column" in getattr(b, "text", "")).on_click()
+    assert routed == [("shop.pages", ["body"], {"column_unknown": False})]
 
 
 def test_the_cdc_quarantine_card_offers_the_in_app_recovery() -> None:
@@ -1720,7 +1800,7 @@ def test_the_cdc_quarantine_card_offers_the_in_app_recovery() -> None:
         _State(),
         "log",
         lob_candidates_for=lambda _t: [("content", "bytea")],
-        exclude_columns=lambda t, c: captured.append((t, c)),
+        exclude_columns=lambda t, c, **_k: captured.append((t, c)),
         records=[_oversized_record("ecommerce.product_media", "id=1")],
     )
     body = " ".join(ui.texts)
@@ -1747,7 +1827,7 @@ def test_the_exclude_button_is_enabled_in_every_state_and_routes() -> None:
         object(),
         "log",
         lob_candidates_for=lambda _t: [("content", "bytea")],
-        exclude_columns=lambda t, c: routed.append((t, c)),
+        exclude_columns=lambda t, c, **_k: routed.append((t, c)),
         records=[_oversized_record("ecommerce.product_media", "id=1")],
     )
     btn = next(b for b in ui.buttons if "Exclude column" in getattr(b, "text", ""))

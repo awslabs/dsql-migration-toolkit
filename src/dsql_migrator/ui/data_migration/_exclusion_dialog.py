@@ -1984,13 +1984,15 @@ def _route_hint(outcome, table: str, text: str, editable: bool, when: str,
 DLQ_RULE_COMMENT = "# from the CDC dead-letter queue"
 
 
-def open_dlq_route(ui, ctx: ExclusionDialogContext, table: str, columns: Sequence[str]) -> None:
+def open_dlq_route(ui, ctx: ExclusionDialogContext, table: str, columns: Sequence[str], *,
+                   column_unknown: bool = False) -> None:
     """The CDC dead-letter "Exclude column…": record the rule for each column the record
     names as a PENDING line (persisted; it never changes what is excluded by itself), then
     open the popup in the mode the lock gives: Change & reload when it can run, editable
     while nothing is locked (the line inserted), read-only otherwise -- its text is the
     lock's own steps. A record naming no column records nothing and opens the LOB section
-    filtered to the table."""
+    filtered to the table; so does ``column_unknown`` (another dead letter of the table
+    names no column) beside the named columns' lines, so the operator still chooses it."""
     from dsql_migrator.core.exclusion_rules import rule_name_writable, rule_part_token
 
     state = ctx.migration_state
@@ -2001,7 +2003,7 @@ def open_dlq_route(ui, ctx: ExclusionDialogContext, table: str, columns: Sequenc
                 "exclude " + ".".join(rule_part_token(x) for x in (schema, rest, column))
                 + f"  {DLQ_RULE_COMMENT}")
     lock = _lock_state(ctx)
-    lob_filter = None if columns else table
+    lob_filter = table if column_unknown or not columns else None
     if lock.tier == 3 and lock.offers_change_and_reload and _reload_gate(ctx) is None:
         open_exclusion_dialog(ui, ctx, mode="change_and_reload", lob_filter=lob_filter)
     elif not lock.locked:

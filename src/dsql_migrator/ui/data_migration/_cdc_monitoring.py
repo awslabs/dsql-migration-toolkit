@@ -3874,11 +3874,17 @@ def _render_cdc_schema_drift_banner(
         _render_cdc_dlq_resolved(ui, _resolved, _verified, _held)
 
 
-def cdc_oversized_quarantine_groups(records) -> "list[tuple[str, list[str], list[str]]]":
+def cdc_oversized_quarantine_groups(
+    records,
+) -> "list[tuple[str, list[str], list[str], int]]":
     """Group the OVERSIZED_VALUE dead-letter records by table. Pure.
 
-    Returns ``(table, primary_keys, columns)`` per table in first-seen order, so the recovery
-    card can name the rows that were dropped and pre-tick exactly the column to stop capturing.
+    Returns ``(table, primary_keys, columns, unnamed)`` per table in first-seen order, so the
+    recovery card can name the rows that were dropped and pre-tick exactly the column to stop
+    capturing. ``unnamed`` counts the rows (distinct primary keys; a record without one counts
+    alone) whose record names no column -- Aurora DSQL's own 54000 names only the type, and the
+    sink names the column only when the row shows which it is -- so the card never attributes
+    another record's column to them and still lets the operator choose.
     Only the oversized class is grouped: it is the one quarantine with an in-app remedy, and
     offering that remedy for a duplicate-key or a drift rejection would be a lie.
 
@@ -3893,6 +3899,8 @@ def cdc_oversized_quarantine_groups(records) -> "list[tuple[str, list[str], list
     order: list[str] = []
     pks: dict[str, list[str]] = {}
     cols: dict[str, list[str]] = {}
+    unnamed_pks: dict[str, set[str]] = {}
+    unnamed: dict[str, int] = {}
     for record in records or []:
         if getattr(record, "error_code", None) != OVERSIZED_VALUE_CODE:
             continue
@@ -3903,13 +3911,20 @@ def cdc_oversized_quarantine_groups(records) -> "list[tuple[str, list[str], list
             order.append(table)
             pks[table] = []
             cols[table] = []
+            unnamed_pks[table] = set()
+            unnamed[table] = 0
         pk = getattr(record, "pk", None)
         if pk and pk not in pks[table]:
             pks[table].append(pk)
         column = oversized_column_from_reason(getattr(record, "message", ""))
-        if column and column not in cols[table]:
-            cols[table].append(column)
-    return [(table, pks[table], cols[table]) for table in order]
+        if column:
+            if column not in cols[table]:
+                cols[table].append(column)
+        elif not pk or pk not in unnamed_pks[table]:
+            if pk:
+                unnamed_pks[table].add(pk)
+            unnamed[table] += 1
+    return [(table, pks[table], cols[table], unnamed[table]) for table in order]
 
 
 def _render_cdc_oversized_recovery(
@@ -3930,11 +3945,12 @@ def _render_cdc_oversized_recovery(
     them to hand-edit ``column.exclude.list`` on the connector (not doable from this UI,
     and not necessary: the tool owns that setting and re-sends it on every Start CDC).
 
-    ``exclude_columns(table, columns)`` is the route into the exclusion popup: it records
-    the rule for each named column as a PENDING line (it never changes what is excluded
-    by itself) and opens the popup in the mode the lock gives -- read-only with the lock's
-    own steps while a stack holds the set, editable (the line inserted) once it can change.
-    So the button is enabled in every state.
+    ``exclude_columns(table, columns, column_unknown=...)`` is the route into the exclusion
+    popup: it records the rule for each named column as a PENDING line (it never changes what
+    is excluded by itself) and opens the popup in the mode the lock gives -- read-only with the
+    lock's own steps while a stack holds the set, editable (the line inserted) once it can
+    change. ``column_unknown`` is set when a dropped row of the table names no column, so the
+    popup still lets the operator choose it. So the button is enabled in every state.
     """
     if exclude_columns is None:
         # No in-app action wired (an older caller) -> render nothing rather than a dead card.
@@ -3947,7 +3963,7 @@ def _render_cdc_oversized_recovery(
     if not groups:
         return
 
-    def _action(table: str, columns: "list[str]"):
+    def _action(table: str, columns: "list[str]", unnamed: int):
         def _render() -> None:
             candidates = list(lob_candidates_for(table)) if lob_candidates_for else []
             if not candidates and not columns:
@@ -3963,7 +3979,9 @@ def _render_cdc_oversized_recovery(
             button = ui.button(  # type: ignore[attr-defined]
                 "Exclude column…",
                 icon="filter_alt_off",
-                on_click=lambda: exclude_columns(table, list(columns)),
+                on_click=lambda: exclude_columns(
+                    table, list(columns), column_unknown=unnamed > 0
+                ),
             )
             button.props("flat dense no-caps size=sm color=warning")
             button.tooltip(
@@ -3973,17 +3991,26 @@ def _render_cdc_oversized_recovery(
 
         return _render
 
-    for table, pks, columns in groups:
+    for table, pks, columns, unnamed in groups:
+        where = ""
+        if columns:
+            where = f" — column {', '.join(columns)}"
+            if unnamed:
+                # A row whose record names no column is never shown under another's column.
+                where += (
+                    f"; for {unnamed} row{'s' if unnamed != 1 else ''} the column could not "
+                    "be determined"
+                )
         _quarantine_detail_row(
             ui,
             table=table,
             primary_keys=pks,
             reasons=[
                 "Dropped over DSQL's 1 MiB per-value limit"
-                + (f" — column {', '.join(columns)}" if columns else "")
+                + where
                 + ". This row cannot be stored as-is and is never retried."
             ],
-            action=_action(table, columns),
+            action=_action(table, columns, unnamed),
         )
 
 

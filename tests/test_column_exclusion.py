@@ -417,6 +417,8 @@ def test_both_recovery_actions_check_the_rule_before_writing():
     # P3-C20: the dead-letter route only records a pending rule (never an exclusion).
     dlq = inspect.getsource(_exclusion_dialog.open_dlq_route)
     assert "set_lob_exclusion" not in dlq and "add_pending_rule" in dlq
+    # T1 review follow-up: the screen's route passes on that a dropped row names no column.
+    assert "column_unknown=column_unknown" in inspect.getsource(dm.build_data_migration_screen)
     assert "make_lob_candidates_for(inventory, session, migration_state)" in inspect.getsource(
         dm.build_data_migration_screen)
 

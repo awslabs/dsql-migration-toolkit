@@ -1108,6 +1108,26 @@ def test_a_record_naming_no_column_records_nothing_and_filters_the_lob_section()
         t.startswith("shop.u.") for t in ui.texts)
 
 
+def test_a_named_column_beside_a_record_naming_none_records_it_and_still_filters_the_lob_section():
+    """T1 review follow-up: when another dead letter of the table names no column, the named
+    column's pending line is recorded, but the popup still opens the LOB section filtered to
+    the table so the operator picks the column the database did not name."""
+    state = DataMigrationState()
+    ctx, _calls = _ctx(state)
+    ui = _Ui()
+    open_dlq_route(ui, ctx, "shop.t", ["b"], column_unknown=True)
+    assert state.pending_rules() == ["exclude shop.t.b  # from the CDC dead-letter queue"]
+    lob = next(el for t, (_h, el) in ui.expansions.items() if t.startswith("Oversized-LOB"))
+    assert lob.value is True
+    assert any(t.startswith("shop.t.") for t in ui.texts) and not any(
+        t.startswith("shop.u.") for t in ui.texts)
+    # Every record named its column: the section is not forced open on the table.
+    ui = _Ui()
+    open_dlq_route(ui, ctx, "shop.t", ["b"])
+    lob = next(el for t, (_h, el) in ui.expansions.items() if t.startswith("Oversized-LOB"))
+    assert lob.value is not True
+
+
 # --- review #3 fixes (C12-C18) ---------------------------------------------------------
 
 
