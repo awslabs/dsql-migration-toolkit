@@ -5,6 +5,37 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.582
+
+소스 연결 테스트는 드라이버 오류가 소스 비밀번호를 그대로 담으면 그 비밀번호를 가립니다. Start over와 CDC teardown 배너의 Retry cleanup은 이제 Stop CDC와 Delete CDC infrastructure처럼 CDC를 정리합니다: PostgreSQL에서는 세션 자신의 자격 증명으로 복제 슬롯과 publication을 드롭하며, 그 자격 증명은 세션 자신의 스택과 소스에만 쓰이고, 활동 로그에는 각 teardown이 어떻게 끝났는지 기록됩니다. v0.1.413 이하가 저장한 스냅샷에서 복원한 PostgreSQL 세션은 Cut over, 외래 키 카드, Query Converter에서 더 이상 MySQL로 변환되거나 세어지거나 기술되지 않으며, 서버가 Aurora DSQL 세션을 끝낸 Full Load 배치는 분할되지 않고 재시도됩니다(분할은 정상 행을 격리할 수 있었습니다).
+
+### 보안
+
+- **Connect의 소스 연결 테스트가 실패하면, Connect가 보여 주고 활동 로그가 기록하는 사유에서 데이터베이스 드라이버의 오류가 되풀이한 소스 비밀번호가 이제 모두 `***`로 바뀝니다.** 마스킹은 도구가 한 번도 채우지 않는 연결 설정에서 비밀번호를 찾았으므로, Connect가 실행하는 경로에서는 비밀번호를 입력했든 Secrets Manager에서 읽었든 아무것도 가리지 않았습니다. 비밀번호를 되풀이하는 드라이버 오류는 지금까지 관측되지 않았습니다. 그런 오류에 비밀번호가 나타난 적이 있다면 활동 로그에도 남아 있을 수 있으니 그 비밀번호를 바꾸세요.
+
+### 수정
+
+- **Start over와 CDC teardown 배너의 Retry cleanup이 이제 CDC 단계의 Stop CDC와 Delete CDC infrastructure처럼 CDC를 정리합니다.** PostgreSQL 소스에서 Start over의 **Delete all CDC infrastructure**와, 실패한 삭제(Start over의 삭제 또는 CDC 단계의 Delete CDC infrastructure로 한 삭제)에 대한 배너의 Retry cleanup이, Delete CDC infrastructure가 이미 그랬듯 세션이 가진 소스 사용자 이름과 비밀번호로 복제 슬롯과 publication을 드롭합니다. Start over는 세션을 비우기 전에 그것들을 읽으며, 그것들은 teardown이 끝날 때까지만 메모리에 보관됩니다. 예전에는 Start over와 Retry cleanup이 자격 증명을 넘기지 않아 드롭이 저장된 시크릿을 읽을 수 있느냐에 달려 있었고, 소스 WAL을 계속 붙잡는 슬롯을 드롭하지 못했을 때 그 사실을 남기는 지속적인 기록이 없었습니다. 이제 활동 로그는 각 teardown이 어떻게 끝났는지(완료, 실패, 또는 완료했지만 *LEFT BEHIND on the source*이며 그 뒤에 소스에 남은 것)를 **Remove connectors, keep infrastructure**에 대해서도 기록하고, 삭제가 소스에 한 쓰기(슬롯과 publication 드롭)도 기록합니다. 자격 증명은 세션 자신의 CDC 스택(이름을 바꾼 스택 포함)과 그 소스에만 쓰입니다: Start over가 정리하는 다른 CDC 스택은 예전처럼 자기 시크릿을 읽고, Retry cleanup은 세션이 teardown을 시작했을 때의 소스(같은 호스트, 포트, 데이터베이스)에 연결되어 있는 동안에만 자격 증명을 넘깁니다. 그래서 Start over 후의 Retry는 그 소스에 다시 연결하면 자격 증명을 쓰고, 다른 소스를 연결한 뒤의 Retry는 스택 자신의 시크릿을 읽습니다. CDC only의 Aurora PostgreSQL로 ECS Fargate에서, Start over가 실행하는 방식대로(자격 증명을 읽은 뒤 세션 초기화) 정리해 검증했습니다: 복제 슬롯과 publication이 드롭됐고, 활동 로그에 결과와 소스 쓰기가 기록됐습니다.
+- **서버가 Aurora DSQL 세션을 끝낸 Full Load 배치(서버가 종료 중이거나 아직 연결을 받지 않을 때처럼 SQLSTATE `57P01`, `57P02`, `57P03`)는 이제 분할되지 않고 새 연결로 재시도되므로, 더 이상 정상 행을 격리하지 않습니다.** 이런 오류를 잘못된 행의 오류로 여겨, 배치를 반으로 나눠 그 행을 가려내려 했고, 한 행짜리 반쪽이 또 그런 오류를 만나면(재시작이 아직 진행 중일 때) 그 정상 행이 격리되어 로드되지 않았습니다. 이제 배치는 연결이 끊긴 뒤처럼 배치별 재시도 예산(`DSQL_MIGRATOR_FULL_LOAD_OCC_MAX_ATTEMPTS`, 기본값 20) 안에서 재시도합니다. 예산보다 오래가면 행이 아니라 배치가 실패해 Retry unfinished tables의 대상이 되며, 취소된 문장(`57014`)은 여전히 재시도하지 않습니다. 로드 후 인덱스 단계도 그런 인덱스 빌드를 재시도하며(예전에는 그 인덱스를 즉시 실패로 처리했습니다), 재시도가 실패한 인덱스는 그래도 만들어졌을 수 있다고 알립니다. PostgreSQL 소스에서는 앞서 끊긴 연결 때문에 연결을 쓸 수 없게 되어 실패한 읽기를 이제 MySQL에서처럼 끊긴 연결로 다룹니다: `DSQL_MIGRATOR_FULL_LOAD_SOURCE_RETRY_ATTEMPTS` 안에서 다시 읽고 끊긴 연결로 설명합니다(예전에는 테이블이 즉시 실패했습니다). 두 경우 모두 코드로 확인했고, 라이브로 겪지는 않았습니다.
+- **CDC 단계의 *Connector configuration (hand to cdc-stack)* 아래 *cdc-stack parameter file (JSON)*이 이제 재키잉한 테이블의 레코드 키를 `MessageKeyColumns`에 넣습니다.** 이 파일은 키를 한 번도 넘기지 않는, Start CDC 빌드 과정의 두 번째 사본으로 만들어졌으므로, Schema Conversion에서 재키잉한 테이블(**Composite key**, 편집한 키)에 대해 `MessageKeyColumns`와 `SinkKeyColumns`를 모두 비워 두었고, 이 파일로 손수 배포한 cdc-stack은 그 테이블의 변경 레코드를 소스 기본 키만으로 키잉했습니다. Start CDC는 영향을 받지 않았습니다. 이제 파일과 Start CDC가 한 곳에서 파라미터를 만듭니다: 파일은 모든 싱크 플러그인이 적용하는 라우팅인 `MessageKeyColumns`에 키를 두고, Start CDC는 그 파라미터를 읽는 싱크 플러그인(v51 이상, 들어 있는 플러그인은 v54)의 스택에서는 여전히 키를 `SinkKeyColumns`로 옮길 수 있습니다.
+- **PostgreSQL CDC에서, Start over를 클릭했을 때 아직 소스를 읽고 있던 REPLICA IDENTITY 재확인이 더 이상 새 마이그레이션에 발견 항목을 만들지 않습니다.** 그 결과가 새 마이그레이션에 들어가, 약한 REPLICA IDENTITY 발견 항목이 다음 Start over까지 Cut over를 막았고, 이전 읽기가 끝나면 새 마이그레이션의 재확인이 동시에 두 번 실행될 수 있었습니다. 백그라운드 읽기를 시작하지 못한 재확인은 더 이상 시간 초과될 때까지 다음 재확인을 막지 않습니다.
+- **Connect에서 소스나 타깃 사용자 이름만 바꾼 것도 이제 저장되며, CDC 단계가 추적하는 CDC 커넥터 이름도 저장됩니다.** 세션은 추적하는 값이 바뀔 때 저장되는데 이 세 가지는 추적되지 않았으므로, 함께 바뀐 다른 값이 없으면 재연결이나 task 교체 후 이전 값이 돌아왔습니다: Connect는 예전 사용자 이름을 미리 채웠고, CDC 단계는 예전 커넥터 이름으로 파이프라인을 판단했습니다.
+- **PostgreSQL 소스는 기록했지만 그 주소는 기록하지 않은 스냅샷(v0.1.413 이하가 저장한 것)에서 복원한 세션은, 소스를 다시 연결하기 전에도 더 이상 MySQL로 변환되지 않으며, 저장과 재시작을 거쳐도 PostgreSQL을 유지합니다.** 예전에는 다시 연결하기 전까지:
+  - Cut over가 외래 키 단계와 identity 및 외래 키 입력에 MySQL 규칙으로 스키마를 변환했고(PostgreSQL `timestamp`가 `timestamptz`가 됐습니다), Finish는 MySQL CDC 스트림이 깨뜨릴 수 있는 외래 키를 Aurora DSQL이 검증하기를 기다렸습니다.
+  - Data Migration 외래 키 카드가 외래 키를 0개로 세어, 아직 적용할 키를 모두 가렸습니다.
+  - Query Converter가 붙여 넣은 SQL을 MySQL 방언으로 변환했습니다.
+  - CDC 단계의 커넥터 구성과 cdc-stack 파라미터 파일이 MySQL 소스를 기술했습니다.
+
+  그런 복원 후의 첫 저장은 스냅샷에서 엔진도 지웠으므로, 그다음 재시작은 세션을 모든 곳에서 MySQL로 되돌렸습니다. 이전 버전이 이미 다시 연 스냅샷은 그 버전의 첫 저장에서 엔진을 잃었으며 복구되지 않습니다: Connect에서 PostgreSQL을 다시 고르세요.
+- **같은 복원된 세션은 이제 MySQL이 아니라 PostgreSQL로 기술되고 논의됩니다:** 모든 페이지의 여정 다이어그램, Cut over 런북, Full load only 다음 단계(MySQL의 경로인, Full Load의 워터마크부터 CDC를 스트리밍하는 방법을 제시했습니다), CDC 단계의 start-point 카드, Start CDC 옆의 알림과 최소 권한 사용자 안내, What's next?, 그리고 이제 *Paste a PostgreSQL statement*라고 안내하는 Query Converter입니다. 앱 전체 AI DBA 채팅과 Schema Conversion, Full Load, CDC, Query Converter의 AI DBA 채팅은 PostgreSQL을 기준으로 추론합니다. Evaluation 보고서의 객체나 발견 항목에 대한 AI DBA 채팅은 이제 그 보고서의 엔진으로 추론하며, 보고서가 연결된 소스와 다른 소스를 기술할 때도 그렇습니다.
+- **앱이 작업 기록을 잃은 Schema Conversion 적용이나 Evaluation이 이제 세션이 끝날 때까지 돌기만 하지 않고 결론이 납니다.** 단계가 진행 중으로 남아 컨트롤이 잠겨 있었습니다(Schema Conversion에서는 재시작할 때까지). 이제 Schema Conversion은 적용을 실패로 보여 줍니다: *The apply job record was lost, so this screen cannot tell whether the apply finished. Objects it created are already on the target. Re-run the apply to finish the rest; with "Skip if exists" it leaves existing objects untouched.* Evaluation은 재시작 후 보여 주는 상태로 돌아갑니다: 보고서가 있으면 보고서를, 없으면 시작 전 상태를 보여 줍니다.
+- **Refresh source/target counts와, Full Load 전에 한 CDC 배포의 파티션 수 산정이 이제 읽기가 끝나면 성공하든 실패하든 소스 연결을 닫습니다.** 예전에는 각각 풀의 소스 연결 하나를 가비지 컬렉션 때까지 열어 두었습니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 기본 이미지 말고는 그대로이고 IAM 변경은 없으며, 싱크 플러그인도 그대로(v54)라 CDC 인프라 재배포가 필요 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **따로 옮길 것이 없고, 소스 주소가 없는 스냅샷에서 복원한 PostgreSQL 세션을 빼면 v0.1.581로 되돌리는 것도 안전합니다.** 이 버전은 v0.1.581과 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받아들이므로, 어느 버전이든 다른 버전이 쓴 것을 읽습니다. v0.1.581은 그런 세션을 처음 저장할 때 PostgreSQL 엔진을 지우므로, 재시작 후 그 세션은 MySQL로 돌아옵니다: 이 버전으로 다시 올린 뒤 Connect에서 PostgreSQL을 다시 고르세요.
+
 ## v0.1.581
 
 첫 Start CDC를 이 버전에서 실행한 CDC 스택은 선택한 테이블만 대소문자까지 정확히 캡처합니다. 이전 버전이 시작한 스택은 Delete CDC infrastructure 전까지, 선택한 `shop.users` 옆의 `shop.Users`처럼 이름이 대소문자만 다른, 선택하지 않은 테이블도 캡처하며, 이 버전이 배포했거나 시작한 CDC 스택은 이전 버전이 시작할 수 없습니다: 업그레이드 참고를 읽어 보세요.
