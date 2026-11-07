@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.583
+
+Aurora DSQL이 생성 컬럼 값을 담았다는 이유로 어떤 테이블의 변경을 거부하면, 싱크 플러그인 v55는 한동안 그 테이블의 변경을 트랜잭션당 한 행씩 적용하고 다른 테이블은 계속 배치로 적용하며, 게시하지 못한 CloudWatch 메트릭에 대한 싱크의 경고는 싱크가 내보내는 메트릭을 밝힙니다. 기존 CDC 스택은 Delete CDC infrastructure 후 Deploy CDC infrastructure로만 v55를 받으며, 이 릴리스의 어떤 변경도 그 재배포를 요구하지 않습니다: v54도 같은 행을 적용하고 dead-letter합니다. 매뉴얼의 값당 1 MiB 한도는 이제 `json`과 `jsonb`가 Aurora DSQL이 압축한 뒤의 크기로 제한된다고 밝힙니다.
+
+### 수정
+
+- **Aurora DSQL이 생성 컬럼 값을 담았다는 이유로 어떤 테이블의 변경을 거부하면(`SQLSTATE 428C9`), 이제 싱크는 그 테이블의 이후 변경을 트랜잭션당 한 행씩 적용하고 다른 모든 테이블은 계속 배치로 적용합니다**(싱크 플러그인 v55). 타깃에 컬럼, 테이블 또는 그 스키마가 없을 때, 키가 바뀌었거나 컬럼의 타입이 바뀌었을 때, `NOT NULL` 컬럼에 값이 오지 않았을 때 이미 그랬던 것과 같습니다. 그러면 Aurora DSQL은 그 테이블의 모든 insert와 update를 거부하는데, 싱크가 이 거부를 그런 경우처럼 다루지 않았으므로, 테이블을 복구할 때까지 그 테이블의 insert나 update를 하나라도 담은 변경 배치는 모두 실패해 롤백되었고, 그 안의 다른 테이블 행까지 포함해 트랜잭션당 한 행씩 다시 적용되었습니다(코드로 확인했고, 라이브로 겪지는 않았습니다). 그 테이블은 자신의 insert나 update가 하나라도 적용되는 즉시(적용된 delete는 세지 않습니다), 또는 마지막 거부 후 60초가 지나면 배치로 돌아갑니다. 어떤 행이 어떤 사유로 dead-letter되는지는 바뀌지 않습니다: 각 변경은 여전히 Aurora DSQL에서 시도되며, 자기 문장이 실패할 때만 dead-letter됩니다. 매뉴얼 [§4.2](docs/manual/ko/04-cdc-and-dsql-constraints.md#cdc-중-소스-스키마-드리프트-감지처리)(*드리프트 중의 지연*)가 이제 이 경우를 나열합니다. 영어·한국어·일본어 모두 반영했습니다.
+- **CloudWatch 메트릭을 게시하지 못할 때의 싱크 경고가 이제 싱크가 내보내는 메트릭을 밝힙니다**(싱크 플러그인 v55): 커넥터 로그 그룹 `/msk-connect/<stack>-cdc`에 *Could not emit CDC monitor metrics (InsertsApplied / UpdatesApplied / DeletesApplied / ReplicationLagMs; best-effort; replication unaffected)*로 나옵니다. 예전에는 *net-rows / replication-lag*라고 하여, 싱크가 더 이상 내보내지 않는 net-rows 메트릭을 가리켰습니다(InsertsApplied, UpdatesApplied, DeletesApplied가 그 메트릭을 대신했습니다). 바뀐 것은 문구뿐입니다.
+
+### 문서
+
+- **매뉴얼 [§6.1](docs/manual/ko/06-limitations.md#61-aurora-dsql-기능-한계-스키마가-이에-맞아야-함): 값당 1 MiB 한도에, `json`과 `jsonb`에서는 Aurora DSQL이 압축한 뒤의 크기에 한도가 적용된다는 내용이 더해졌습니다.** 그래서 1 MiB보다 크더라도 압축하면 1 MiB 미만이 되는 문서는 저장됩니다. 이 항목은 Aurora DSQL의 지원 데이터 타입 페이지도 링크합니다. 영어·한국어·일본어 모두 반영했습니다. 로드는 이미 이렇게 동작했고 바뀌지 않았습니다: Full Load와 CDC 싱크는 1 MiB를 넘는 `json`이나 `jsonb` 값(MySQL `JSON` 문서 포함)을 그대로 보내 Aurora DSQL이 판단하게 하며, 싱크는 1 MiB를 넘는 `text`나 `bytea` 값을 쓰기 전에 계속 거부합니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 기본 이미지 말고는 그대로이고 IAM 변경은 없으며, CDC 스택 템플릿도 그대로입니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **CDC 인프라: 싱크 플러그인 v55에는 Delete CDC infrastructure 후 Deploy CDC infrastructure가 필요하며, 서두를 필요는 없습니다.** Start CDC는 플러그인을 절대 다시 등록하지 않으므로, 0.1.571–0.1.582가 배포한 CDC 스택은 v54 싱크를 유지하고(더 오래된 스택은 자신의 싱크를 유지합니다), 이제 CDC 단계가 그 스택에 v54와 v55를 밝히는 경고 *This CDC infrastructure runs an older sink plugin*을 보여 줍니다. 이 경고는 아무것도 막지 않으며 스택을 다시 배포할 때까지 남습니다. v54는 계속 올바르게 동작합니다: v55와 같은 행을 적용하고 dead-letter하며, 위의 두 v55 변경은 테이블의 생성 컬럼에 값이 오는 동안의 처리량 개선(어느 플러그인에서든 그 지연은 테이블을 복구하면 끝납니다)과 로그 문구 수정입니다. 그러므로 이미 진행 중인 파이프라인은 cut over까지 v54를 유지해도 되며, 다른 이유로 스택을 삭제할 때 다시 배포하세요. 스택을 삭제하면 스트림 위치와 CDC 토픽, PostgreSQL에서는 복제 슬롯과 publication도 사라지므로, 새 스택의 CDC에는 다시 시작점이 필요합니다(경로는 v0.1.568의 업그레이드 참고에 나와 있고, [§13.7](docs/manual/ko/13-excluding-tables-and-columns.md#137-나중에-제외-설정-바꾸기)의 "삭제 후 다시 CDC 시작"이 자세한 내용을 더합니다). 이 릴리스의 다른 변경은 재배포가 필요 없습니다.
+- **따로 옮길 것이 없고, v0.1.582로 되돌리는 것도 안전합니다.** 이 버전은 v0.1.582와 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받아들이므로, 어느 버전이든 다른 버전이 쓴 것을 읽습니다. v55로 배포한 CDC 스택은 v0.1.582에서도 v55 싱크를 유지하며, v0.1.582는 그 스택을 다른 스택처럼 시작하고 멈추고 삭제하며 그 스택에 플러그인 경고를 보여 주지 않습니다(v0.1.582의 그 경고는 그 버전에 들어 있는 v54보다 오래된 플러그인에만 나옵니다).
+
 ## v0.1.582
 
 소스 연결 테스트는 드라이버 오류가 소스 비밀번호를 그대로 담으면 그 비밀번호를 가립니다. Start over와 CDC teardown 배너의 Retry cleanup은 이제 Stop CDC와 Delete CDC infrastructure처럼 CDC를 정리합니다: PostgreSQL에서는 세션 자신의 자격 증명으로 복제 슬롯과 publication을 드롭하며, 그 자격 증명은 세션 자신의 스택과 소스에만 쓰이고, 활동 로그에는 각 teardown이 어떻게 끝났는지 기록됩니다. v0.1.413 이하가 저장한 스냅샷에서 복원한 PostgreSQL 세션은 Cut over, 외래 키 카드, Query Converter에서 더 이상 MySQL로 변환되거나 세어지거나 기술되지 않으며, 서버가 Aurora DSQL 세션을 끝낸 Full Load 배치는 분할되지 않고 재시도됩니다(분할은 정상 행을 격리할 수 있었습니다).
