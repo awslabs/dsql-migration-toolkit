@@ -110,9 +110,10 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * ({@link ValueFit}, fed by a per-table catalog read cached on this task).
  *
  * <p><b>Drift cool-down (per table).</b> A source DDL the target lacks (an added column, a
- * changed type or key, a dropped table) makes DSQL reject EVERY upsert of that one table, so
- * without memory each chunk holding one of its rows paid a failed batch, a rollback and a
- * one-row-per-transaction replay of the WHOLE chunk -- every other table on this task included.
+ * changed type or key, a dropped table), or a value sent for a column the target generates,
+ * makes DSQL reject EVERY upsert of that one table, so without memory each chunk holding one
+ * of its rows paid a failed batch, a rollback and a one-row-per-transaction replay of the WHOLE
+ * chunk -- every other table on this task included.
  * Once DSQL rejects a table's row for such a structural reason ({@link #isStructuralDrift}),
  * that table's later rows go straight to the one-row-per-transaction path while every other
  * table keeps batching. It ends on the table's first applied row of the kind that failed, or
@@ -838,7 +839,9 @@ public class DsqlSinkTask extends SinkTask {
    * Per-value codes (class 22, 23505, 23514, 23503, 07006, 54000, 25P02) do not count -- one
    * bad value says nothing about the next row. Transient codes (40001 incl. DSQL OC000/OC001,
    * XX000, 08xxx, 57xxx, no SQLSTATE) never get here: they are retried, never quarantined.
-   * Only the PATH depends on this set, never a row's fate. Package-private for tests.
+   * Only the PATH depends on this set, never a row's fate. tests/test_rr_a7_drift_contract.py
+   * holds every other {@code _DRIFT_BY_SQLSTATE} key, each with why it is not in it, so a code
+   * added there must be classified here. Package-private for tests.
    */
   static boolean isStructuralDrift(String sqlState) {
     if (sqlState == null) {
@@ -851,7 +854,8 @@ public class DsqlSinkTask extends SinkTask {
           "42P10", // KEY_CHANGE: the record key no longer matches the primary key
           "42804", // TYPE_CHANGE: a column's type changed
           "42883", // TYPE_CHANGE: no operator/function for the new type
-          "23502" // DROP_COLUMN / NULLABILITY_CHANGE: a NOT NULL column got no value
+          "23502", // DROP_COLUMN / NULLABILITY_CHANGE: a NOT NULL column got no value
+          "428C9" // GENERATED_COLUMN: a value sent for a column the target generates
           -> true;
       default -> false;
     };
@@ -2331,8 +2335,9 @@ public class DsqlSinkTask extends SinkTask {
    * probe. The map lives in core/cdc.py {@code _DRIFT_BY_SQLSTATE}: 42703 a column the
    * target lacks (added or renamed), 23502 a NOT NULL column got no value or a NULL
    * (told apart by the SQL template), 42804/42883 a type change, 42P10 the record key
-   * no longer matches the primary key, 23514 a CHECK rejected a value, 22001/22003 a
-   * value its column cannot hold; the rest of class 22 is per-value and not classified.
+   * no longer matches the primary key, 23514 a CHECK rejected a value, 428C9 a value sent
+   * for a GENERATED column, 22001/22003 a value its column cannot hold; the rest of class 22
+   * is per-value and not classified.
    * pgjdbc's {@code getMessage()} does not include the SQLSTATE, so this is the only
    * place it reaches the log; it carries no row values (Property 7).
    *

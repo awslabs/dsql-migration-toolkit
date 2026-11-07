@@ -188,14 +188,14 @@ until cut over.
 
 **Lag while a table drifts.** After Aurora DSQL rejects one of a table's rows because the
 target lacks a column, the table or its schema, the key changed, a column's type changed,
-or a `NOT NULL` column got no value, the sink applies that table's later changes one row
-per transaction (the other tables stay in batches but share the sink, so their stream lag
-can still grow while you repair it). After the repair, the table goes back to batches as
-soon as one of its inserts or updates is applied, or 60 seconds after its last rejection.
-A value-level rejection (a unique or `CHECK` violation, a value too long or out of range,
-a value that can't be bound) does not switch the table to one row per transaction, but
-each change batch that holds such a row is still replayed one row per transaction, the
-other tables' rows in it included.
+a `NOT NULL` column got no value, or a generated column was sent a value, the sink applies
+that table's later changes one row per transaction (the other tables stay in batches but
+share the sink, so their stream lag can still grow while you repair it). After the repair,
+the table goes back to batches as soon as one of its inserts or updates is applied, or 60
+seconds after its last rejection. A value-level rejection (a unique or `CHECK` violation, a
+value too long or out of range, a value that can't be bound) does not switch the table to
+one row per transaction, but each change batch that holds such a row is still replayed one
+row per transaction, the other tables' rows in it included.
 
 ### Changes that dead-letter nothing: the source schema re-check
 

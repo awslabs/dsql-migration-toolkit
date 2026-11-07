@@ -755,7 +755,8 @@ class DsqlSinkDriftCooldownTest {
 
   @Test
   void isStructuralDriftTable() {
-    for (String s : List.of("42703", "42P01", "3F000", "42P10", "42804", "42883", "23502")) {
+    for (String s :
+        List.of("42703", "42P01", "3F000", "42P10", "42804", "42883", "23502", "428C9")) {
       assertTrue(DsqlSinkTask.isStructuralDrift(s), s);
     }
     for (String s :
@@ -765,6 +766,38 @@ class DsqlSinkDriftCooldownTest {
       assertFalse(DsqlSinkTask.isStructuralDrift(s), s);
     }
     assertFalse(DsqlSinkTask.isStructuralDrift(null));
+  }
+
+  @Test
+  void aValueForAGeneratedColumnCoolsTheTableDownUntilAnInsertOrUpdateApplies() throws Exception {
+    // A7: Aurora DSQL refuses every insert and update of a table whose target column is
+    // GENERATED while its change records carry a value for it (428C9, GENERATED_COLUMN in
+    // core/cdc.py): a per-table shape, like a missing column. FAILS ON PLUGIN v54: 428C9 was not
+    // structural, so every chunk holding one of the table's rows paid a failed batch, a rollback
+    // and a one-row replay of the whole chunk, healthy tables' rows included.
+    FakeDsql dsql = new FakeDsql();
+    dsql.failure = driftedUpserts("428C9");
+    RecordingReporter dlq = new RecordingReporter();
+    ClockedTask task = task(dsql, dlq, 100);
+    task.put(List.of(insert(HEALTHY, 1), insert(DRIFTED, 2), insert(HEALTHY, 3)));
+    assertEquals(1, dlq.records.size());
+    assertEquals(Set.of("shop." + DRIFTED), task.driftCooledTables());
+
+    // The next put batches the healthy rows and tries the cooled table's row alone.
+    dsql.calls.clear();
+    task.put(List.of(insert(HEALTHY, 4), insert(DRIFTED, 5), insert(HEALTHY, 6)));
+    assertEquals(
+        List.of(
+            "prepare:upsert:" + HEALTHY, "batch:upsert:" + HEALTHY, "commit",
+            "prepare:upsert:" + DRIFTED, "update:upsert:" + DRIFTED, "rollback"),
+        dsql.calls);
+    assertEquals(2, dlq.records.size()); // still executed, still dead-lettered on its own
+
+    // Repaired (the capture leaves the generated column out): its first applied insert ends it.
+    dsql.failure = sql -> null;
+    task.put(List.of(insert(DRIFTED, 7)));
+    assertTrue(task.driftCooledTables().isEmpty());
+    assertEquals(2, dlq.records.size());
   }
 
   // --- (n) G22: an XX000 on the cooled path is retried, and the row ends the cool-down --------

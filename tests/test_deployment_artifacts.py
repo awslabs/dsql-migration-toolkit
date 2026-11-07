@@ -2348,8 +2348,9 @@ def test_the_cut_over_runbook_in_every_language_covers_a_cdc_only_truncate() -> 
 
 def test_the_drift_lag_paragraph_promises_only_what_the_sink_cool_down_does() -> None:
     # G10: DsqlSinkTask's per-table cool-down (isStructuralDrift) starts only for a missing
-    # column/table/schema, a key, type or NOT NULL change; the other tables keep batching but
-    # still share the task thread, so their lag is NOT "normal". A value-level rejection
+    # column/table/schema, a key, type or NOT NULL change, and (A7, sink plugin v55) a value
+    # sent for a generated column (428C9); the other tables keep batching but still share the
+    # task thread, so their lag is NOT "normal". A value-level rejection
     # (23505/23514/22001/22003/07006) starts no cool-down: its chunk still replays per row.
     import pathlib
 
@@ -2362,6 +2363,7 @@ def test_the_drift_lag_paragraph_promises_only_what_the_sink_cool_down_does() ->
         "ja": ("**ドリフト中の遅延。**", "### デッドレター化される対象",
                ("通常どおり", "通常の速度", "スキーマ上の理由で")),
     }
+    generated = {"en": "generated column", "ko": "생성 컬럼", "ja": "生成列"}
     for lang, (lag_head, dlq_head, overclaims) in cases.items():
         text = (manual / lang / "04-cdc-and-dsql-constraints.md").read_text(encoding="utf-8")
         start = text.index(lag_head)
@@ -2374,6 +2376,8 @@ def test_the_drift_lag_paragraph_promises_only_what_the_sink_cool_down_does() ->
             # The value-level exception is spelled out where the isolation is described.
             assert "`CHECK`" in part, (lang, name)
         assert "`NOT NULL`" in lag and "60" in lag, lang
+        # Every kind the cool-down starts on is named, the generated column (428C9) included.
+        assert generated[lang] in " ".join(lag.split()), lang
 
 
 def test_manual_4_2_scopes_schema_changes_flag_and_does_not_route_ddl_through_schema_conversion() -> None:
