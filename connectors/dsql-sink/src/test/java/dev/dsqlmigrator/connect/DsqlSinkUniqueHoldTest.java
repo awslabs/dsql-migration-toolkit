@@ -133,6 +133,11 @@ class DsqlSinkUniqueHoldTest {
     return change(tp, offset, id, "d", row(id, null, null), null);
   }
 
+  /** An insert the sink refuses before any write (a bytea value over 1 MiB). */
+  private static SinkRecord oversized(TopicPartition tp, long offset, int id, String email) {
+    return HoldHarness.createOversized(tp, offset, id, email);
+  }
+
   private static SinkRecord tombstone(TopicPartition tp, long offset, int id) {
     Struct key = new Struct(KEY).put("id", id);
     return new SinkRecord(tp.topic(), tp.partition(), KEY, key, null, null, offset);
@@ -795,9 +800,8 @@ class DsqlSinkUniqueHoldTest {
     dsql.seed(5, "a", "b5");
     RecordingReporter dlq = new RecordingReporter();
     HoldTask task = task(dsql, dlq);
-    String huge = "x".repeat(DsqlSinkTask.DSQL_MAX_VALUE_BYTES + 1);
     // P1@10 is held; P0@11 (the same offset as P1's tail) is refused before any write.
-    task.put(List.of(create(P1, 10, 100005, "a", "b5"), create(P0, 11, 300, "e", huge)));
+    task.put(List.of(create(P1, 10, 100005, "a", "b5"), oversized(P0, 11, 300, "e")));
     assertEquals(1, dlq.records.size());
     assertEquals(Map.of(P1, 10L), task.heldOffsets());
     task.put(List.of(delete(P0, 12, 5)));
@@ -861,23 +865,22 @@ class DsqlSinkUniqueHoldTest {
     dsql.seed(5, "a", "b5");
     RecordingReporter dlq = new RecordingReporter();
     HoldTask task = task(dsql, dlq);
-    String huge = "x".repeat(DsqlSinkTask.DSQL_MAX_VALUE_BYTES + 1);
     task.put(List.of(create(P1, 10, 100005, "a", "b5")));
     task.put(List.of(create(P1, 12, 77, "q", "r"))); // the look-ahead poll: paused
     assertTrue(task.ctx.paused.contains(P1));
     // A redelivered held tail that would be refused before any write: skipped unparsed.
-    task.put(List.of(create(P1, 11, 300, "e", huge)));
+    task.put(List.of(oversized(P1, 11, 300, "e")));
     assertTrue(dlq.records.isEmpty(), () -> String.valueOf(dlq.causes));
     task.put(List.of(delete(P0, 3, 5)));
     task.advance(SECOND);
     task.ctx.calls.clear();
     // Only held-tail records: nothing to apply, but the due hold is tried and released.
-    task.put(List.of(create(P1, 11, 300, "e", huge), create(P1, 12, 77, "q", "r")));
+    task.put(List.of(oversized(P1, 11, 300, "e"), create(P1, 12, 77, "q", "r")));
     assertTrue(task.heldOffsets().isEmpty());
     assertEquals(List.of("offset:" + TOPIC + "-1:11", "resume:" + TOPIC + "-1"), task.ctx.calls);
     assertTrue(dlq.records.isEmpty(), () -> String.valueOf(dlq.causes));
     // Fetched again from 11: the oversized row is dead-lettered exactly once, then 77 applies.
-    task.put(List.of(create(P1, 11, 300, "e", huge), create(P1, 12, 77, "q", "r")));
+    task.put(List.of(oversized(P1, 11, 300, "e"), create(P1, 12, 77, "q", "r")));
     assertEquals(1, dlq.records.size());
     assertEquals(List.of("77:q:r", "100005:a:b5"), dsql.rows());
   }
@@ -969,8 +972,7 @@ class DsqlSinkUniqueHoldTest {
     dsql.seed(5, "a", "b5");
     RecordingReporter dlq = new RecordingReporter();
     HoldTask task = task(dsql, dlq);
-    String huge = "x".repeat(DsqlSinkTask.DSQL_MAX_VALUE_BYTES + 1);
-    task.put(List.of(create(P1, 10, 100005, "a", "b5"), create(P1, 11, 300, "e", huge)));
+    task.put(List.of(create(P1, 10, 100005, "a", "b5"), oversized(P1, 11, 300, "e")));
     assertEquals(1, dlq.records.size()); // the oversized row, refused before any write
     task.put(List.of(delete(P0, 1, 5)));
     task.advance(SECOND);
@@ -979,13 +981,13 @@ class DsqlSinkUniqueHoldTest {
     // The released cap holds the commit exactly at the refused offset: it is kept.
     assertEquals(11L, committedOffset(task.preCommit(offsets(P1, 12L)), P1));
     // Fetched again from 11: not dead-lettered a second time, even on a second re-fetch.
-    task.put(List.of(create(P1, 11, 300, "e", huge), create(P1, 12, 301, "f", "g")));
-    task.put(List.of(create(P1, 11, 300, "e", huge)));
+    task.put(List.of(oversized(P1, 11, 300, "e"), create(P1, 12, 301, "f", "g")));
+    task.put(List.of(oversized(P1, 11, 300, "e")));
     assertEquals(1, dlq.records.size());
     assertEquals(List.of("301:f:g", "100005:a:b5"), dsql.rows());
     // Once the commit passes it, it is forgotten.
     task.preCommit(offsets(P1, 13L));
-    task.put(List.of(create(P1, 11, 300, "e", huge)));
+    task.put(List.of(oversized(P1, 11, 300, "e")));
     assertEquals(2, dlq.records.size());
   }
 

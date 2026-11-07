@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /*
- * The pre-write per-value guard (DsqlSinkTask.oversizedColumn) against Aurora DSQL's documented
- * per-type limits ("Supported data types in Aurora DSQL",
- * https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-data-types.html):
- * a bytea or text value over 1 MiB is refused before any write, but a json / jsonb value -- and
- * a PostgreSQL array, which the sink renders as jsonb -- is sent as it is. Aurora DSQL compresses
- * large json and jsonb values and "the 1 MiB limit applies to the compressed size", so a
- * compressible document well past 1 MiB is stored, as Full Load stores it. A guard that sized a
- * PGobject would dead-letter, on CDC only, a document Full Load loads. The chunk byte budget
- * still counts the JSON text (G126): the two use one sizer, only the guard's TYPES differ.
+ * The pre-write per-value guard (DsqlSinkTask.oversizedColumn) against Aurora DSQL's per-type
+ * limits ("Supported data types in Aurora DSQL",
+ * https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-data-types.html,
+ * and a live measurement for text): only a bytea value over 1 MiB is refused before any write.
+ * A text value, a json / jsonb value and a PostgreSQL array (which the sink renders as jsonb) are
+ * sent as they are. Aurora DSQL limits json and jsonb by their compressed size (documented) and
+ * text the same way (measured 2026-11-07: a 1.5 MiB JSON-shaped text value stored in 807,991
+ * bytes, while 1.05 MiB of random characters was refused), so a compressible value well past
+ * 1 MiB is stored, as Full Load stores it; bytea is limited by its raw size. A guard that sized a
+ * String or a PGobject would dead-letter, on CDC only, a value Full Load loads. The chunk byte
+ * budget still counts the raw text (G126): the two use one sizer, only the guard's TYPES differ.
  */
 package dev.dsqlmigrator.connect;
 
@@ -85,22 +87,38 @@ class DsqlSinkPerValueGuardTest {
   }
 
   @Test
-  void aTextOrByteaValueOverOneMebibyteIsStillRefused() {
-    assertEquals("payload", DsqlSinkTask.oversizedColumn(upsertOf("x".repeat(LIMIT + 1))));
-    assertEquals("payload", DsqlSinkTask.oversizedColumn(upsertOf(new byte[LIMIT + 1])));
-    // Text is sized by its UTF-8 bytes: fewer than 1 Mi characters, 3 bytes each.
+  void aTextValueOverOneMebibyteIsNotRefusedByTheGuard() {
+    // FAILS on the v55 guard, which refused a String whose UTF-8 bytes passed 1 MiB: Aurora DSQL
+    // limits text by its stored, compressed size (measured), so these are stored when they
+    // compress below 1 MiB -- as Full Load stores them -- and Aurora DSQL decides when not.
+    assertNull(DsqlSinkTask.oversizedColumn(upsertOf("x".repeat(LIMIT + 1))));
+    assertNull(DsqlSinkTask.oversizedColumn(upsertOf(document(3 * LIMIT))));
+    // Fewer than 1 Mi characters but over 1 MiB of UTF-8 bytes (3 bytes each): not refused either.
     String hangul = "한".repeat(LIMIT / 3 + 1);
     assertTrue(hangul.length() < LIMIT);
-    assertEquals("payload", DsqlSinkTask.oversizedColumn(upsertOf(hangul)));
-    // At the limit itself, and for any value that is not text or bytea, nothing is refused.
-    assertNull(DsqlSinkTask.oversizedColumn(upsertOf("x".repeat(LIMIT))));
+    assertTrue(DsqlSinkTask.encodedBytes(hangul) > LIMIT);
+    assertNull(DsqlSinkTask.oversizedColumn(upsertOf(hangul)));
+  }
+
+  @Test
+  void aByteaValueOverOneMebibyteIsStillRefused() {
+    // bytea is limited by its RAW size (measured: 1.5 MiB of zero bytes was refused too).
+    assertEquals("payload", DsqlSinkTask.oversizedColumn(upsertOf(new byte[LIMIT + 1])));
+    // Beside a larger text value in the same row, the bytea column is the one named.
+    ChangeEvent both =
+        ChangeEvent.insert(
+            "app.docs", List.of("id", "body", "blob"),
+            Arrays.asList(1L, "x".repeat(2 * LIMIT), new byte[LIMIT + 1]), List.of("id"),
+            List.of(1L), 0L);
+    assertEquals("blob", DsqlSinkTask.oversizedColumn(both));
+    // At the limit itself, and for any value that is not bytea, nothing is refused.
     assertNull(DsqlSinkTask.oversizedColumn(upsertOf(new byte[LIMIT])));
     assertNull(DsqlSinkTask.oversizedColumn(upsertOf(null)));
     assertNull(DsqlSinkTask.oversizedColumn(upsertOf(42L)));
     // A delete carries only its key: never refused.
     assertNull(
         DsqlSinkTask.oversizedColumn(
-            ChangeEvent.delete("app.docs", List.of("id"), List.of("x".repeat(LIMIT + 1)), 0L)));
+            ChangeEvent.delete("app.docs", List.of("id"), List.of(new byte[LIMIT + 1]), 0L)));
   }
 
   @Test
@@ -262,10 +280,10 @@ class DsqlSinkPerValueGuardTest {
   }
 
   @Test
-  void putWritesLargeJsonAndArraysAndRefusesLargeTextAndByteaBeforeAnyWrite() throws Exception {
-    // FAILS on a guard that sizes a PGobject: the MySQL JSON document and the PostgreSQL array
-    // were dead-lettered as "exceeds DSQL's 1048576-byte limit" -- on CDC only, since Full Load
-    // sends them and Aurora DSQL stores them compressed.
+  void putWritesLargeTextJsonAndArraysAndRefusesOnlyLargeByteaBeforeAnyWrite() throws Exception {
+    // FAILS on a guard that sizes a String or a PGobject: the text value, the MySQL JSON
+    // document and the PostgreSQL array were dead-lettered as "exceeds DSQL's 1048576-byte
+    // limit" -- on CDC only, since Full Load sends them and Aurora DSQL stores them compressed.
     List<String> tags = new ArrayList<>();
     for (int i = 0; i < LIMIT / 40; i++) {
       tags.add("z".repeat(60));
@@ -296,15 +314,15 @@ class DsqlSinkPerValueGuardTest {
 
     task.put(records);
 
-    assertEquals(List.of(1L, 4L), dsql.committedIds());
+    assertEquals(List.of(1L, 2L, 4L), dsql.committedIds());
     PGobject doc = (PGobject) dsql.committed.get(0).get(1);
     assertEquals("json", doc.getType());
     assertTrue(DsqlSinkTask.encodedBytes(doc) > LIMIT);
-    PGobject array = (PGobject) dsql.committed.get(1).get(4);
+    assertEquals("x".repeat(LIMIT + 1), dsql.committed.get(1).get(2)); // the text, as it is
+    PGobject array = (PGobject) dsql.committed.get(2).get(4);
     assertEquals("jsonb", array.getType());
     assertTrue(DsqlSinkTask.encodedBytes(array) > LIMIT);
-    assertEquals(List.of(2L, 3L), deadLettered);
-    assertTrue(reasons.get(0).startsWith("Value for column 'body' exceeds DSQL's 1048576-byte"));
-    assertTrue(reasons.get(1).startsWith("Value for column 'blob' exceeds DSQL's 1048576-byte"));
+    assertEquals(List.of(3L), deadLettered);
+    assertTrue(reasons.get(0).startsWith("Value for column 'blob' exceeds DSQL's 1048576-byte"));
   }
 }

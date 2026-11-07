@@ -103,8 +103,7 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * healthy row is safe (idempotent {@code ON CONFLICT} upsert / PK delete).
  *
  * <p>Two kinds of row are refused BEFORE any write, so they never cost a chunk rollback or a
- * per-row replay: a text or bytea value over DSQL's per-value byte limit
- * ({@link #oversizedColumn}), and a
+ * per-row replay: a bytea value over DSQL's per-value byte limit ({@link #oversizedColumn}), and a
  * number its target column would silently change -- a number other than 0/1 for a boolean,
  * more decimal places than a {@code numeric(p,s)} keeps, or a fraction for an integer column
  * ({@link ValueFit}, fed by a per-table catalog read cached on this task).
@@ -140,10 +139,12 @@ public class DsqlSinkTask extends SinkTask {
   private static final Logger log = LoggerFactory.getLogger(DsqlSinkTask.class);
 
   /**
-   * DSQL rejects a single TEXT/bytea value larger than 1 MiB ("datatype limit
-   * greater than 1048576 bytes not supported"). Such a value can never be applied,
-   * so the sink quarantines it to the DLQ from a copy held in memory <em>before</em>
-   * attempting any DSQL write — see {@link #oversizedColumn}.
+   * DSQL rejects a single value over 1 MiB ("datatype limit greater than 1048576 bytes not
+   * supported for &lt;type&gt;", SQLSTATE 54000): a bytea value by its raw size, a text, json or
+   * jsonb value by its STORED size, after Aurora DSQL's compression. A bytea value over it can
+   * never be applied, so the sink quarantines it to the DLQ from a copy held in memory
+   * <em>before</em> attempting any DSQL write — see {@link #oversizedColumn}. A text or JSON
+   * value is sent and Aurora DSQL decides, as for Full Load; a rejection dead-letters that row.
    *
    * <p><b>Why the dead-letter actually works.</b> A record only reaches
    * this task if the broker accepted it, and the MSK Serverless broker caps a
@@ -154,12 +155,13 @@ public class DsqlSinkTask extends SinkTask {
    * {@code MaxMessageBytes} parameter). Without that, the SOURCE producer throws
    * {@code RecordTooLargeException} and the row never arrives — a stall this guard
    * cannot see. The two go together: raised limits make the row reachable, this
-   * guard keeps a per-value-oversized one from being sent to DSQL.
+   * guard keeps an oversized bytea value from being sent to DSQL.
    *
    * <p><b>The hard limit is prevention.</b> A value &gt;8 MiB can't enter Kafka at
    * all, so it must be removed at capture (Debezium {@code column.exclude.list},
-   * driven by the Evaluation {@code OVERSIZED_LOB} rule). This guard handles the
-   * 1-8 MiB band (quarantine); prevention handles the &gt;8 MiB band.
+   * driven by the Evaluation {@code OVERSIZED_LOB} rule). In the 1-8 MiB band this guard
+   * quarantines a bytea value and Aurora DSQL decides a text or JSON one; prevention handles the
+   * &gt;8 MiB band.
    */
   static final int DSQL_MAX_VALUE_BYTES = 1024 * 1024; // 1 MiB
 
@@ -599,9 +601,9 @@ public class DsqlSinkTask extends SinkTask {
       if (event.isDelete() && !config.deleteEnabled()) {
         continue;
       }
-      // Size guard: a text or bytea value over DSQL's 1 MiB limit can neither be applied
-      // nor dead-lettered through Kafka, so quarantine it here (before any DSQL
-      // write) rather than let it stall the partition.
+      // Size guard: a bytea value over DSQL's 1 MiB limit can never be applied, so quarantine
+      // it here (before any DSQL write) rather than send it. Text and JSON are limited by their
+      // stored, compressed size, so they are sent and Aurora DSQL decides.
       String oversized = oversizedColumn(event);
       if (oversized != null) {
         // The event is in scope here, so the op can be reported -- and on THIS path it is
@@ -757,7 +759,7 @@ public class DsqlSinkTask extends SinkTask {
    * array rendered as jsonb, interval) count their UTF-8 bytes -- what goes on the wire, and
    * CJK/emoji are multi-byte -- and a {@code byte[]} its length. The one sizer of the chunk byte
    * budget ({@link #estimateValueBytes}) and of the per-value guard ({@link #oversizedColumn}),
-   * which applies it to text and bytea values only. Package-private for tests.
+   * which applies it to bytea values only. Package-private for tests.
    */
   static long encodedBytes(Object v) {
     if (v instanceof CharSequence s) {
@@ -1587,29 +1589,35 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * Return the name of the first column whose value exceeds DSQL's per-value byte limit, or
-   * {@code null} if all values may be sent. Only a {@code String} (text) and a {@code byte[]}
-   * (bytea) are checked, by their {@link #encodedBytes} (a String by its UTF-8 bytes, which is
-   * what DSQL measures). The rule per type is the one documented on Aurora DSQL's "Supported
-   * data types" page
-   * (https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-data-types.html):
+   * Return the name of the first column whose value exceeds DSQL's per-value byte limit before
+   * any write, or {@code null} if all values may be sent. Only a {@code byte[]} (bytea) is
+   * checked, by its {@link #encodedBytes}. The rule per type, from Aurora DSQL's "Supported data
+   * types" page
+   * (https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-data-types.html)
+   * and, for text, a live measurement (2026-11-07, with an incompressible control):
    *
    * <ul>
-   *   <li><b>bytea</b>: 1 MiB, with no compression. Refused above it.
-   *   <li><b>text</b>: 1 MiB. DSQL compresses large text values, but the page does not say the
-   *       limit binds the compressed size, so the guard keeps the raw reading and refuses a value
-   *       whose UTF-8 bytes exceed it (a documented quota outranks a probe).
+   *   <li><b>bytea</b>: 1 MiB of RAW bytes, with no compression (measured: 1.05 MiB of random
+   *       bytes and 1.5 MiB of zero bytes were both refused). Refused above it, here.
+   *   <li><b>text</b>: 1 MiB of STORED bytes, after Aurora DSQL's compression. Measured: random
+   *       base64 text (incompressible, stored at its raw size) was accepted at 0.95 MiB and
+   *       refused at 1.05 MiB; "x" repeated 8 MiB was stored in 32,915 bytes; JSON-shaped text of
+   *       1.5 MiB was stored in 807,991 bytes, and at 3 MiB refused; random-word prose of 1.5 MiB
+   *       was refused (DSQL's compressor is weaker than zlib). The page documents the compression
+   *       but not which size binds text, hence the measurement. So a String is never sized here:
+   *       the sink cannot tell how well Aurora DSQL compresses it.
    *   <li><b>json / jsonb</b>, and a PostgreSQL array the sink renders as jsonb
    *       ({@link DebeziumTypeConverter#pgArrayAsJsonb}): the page says the 1 MiB limit applies
-   *       to the COMPRESSED size, so a value far larger than 1 MiB is stored when it compresses
-   *       below it. These arrive as a {@link org.postgresql.util.PGobject} and are never sized
-   *       here: DSQL decides, as it does for Full Load, which sends such values as they are (a
-   *       real rejection, 54000, dead-letters that one row). Refusing them here would
-   *       dead-letter, on CDC only, documents Full Load loads.
+   *       to the COMPRESSED size (measured: 1.5 MiB stored, 3 MiB refused). These arrive as a
+   *       {@link org.postgresql.util.PGobject} and are never sized here.
    * </ul>
    *
-   * <p>Numbers, booleans and timestamps are small. The chunk byte budget still counts every
-   * text, PGobject text and bytea ({@link #estimateValueBytes}). Package-private for tests.
+   * <p>Text and JSON are sent as they are and DSQL decides, as it does for Full Load, which
+   * sends such values the same way; a real rejection (54000, the same message on a multi-row
+   * upsert, its conflict update and a plain UPDATE) dead-letters that one row on the per-row
+   * path. Refusing them here would dead-letter, on CDC only, values Full Load loads. Numbers,
+   * booleans and timestamps are small. The chunk byte budget still counts every text, PGobject
+   * text and bytea by its raw bytes ({@link #estimateValueBytes}). Package-private for tests.
    */
   static String oversizedColumn(ChangeEvent event) {
     if (event.isDelete()) {
@@ -1619,7 +1627,7 @@ public class DsqlSinkTask extends SinkTask {
     List<Object> vals = event.values();
     for (int i = 0; i < vals.size(); i++) {
       Object v = vals.get(i);
-      if ((v instanceof String || v instanceof byte[]) && encodedBytes(v) > DSQL_MAX_VALUE_BYTES) {
+      if (v instanceof byte[] && encodedBytes(v) > DSQL_MAX_VALUE_BYTES) {
         return i < cols.size() ? cols.get(i) : ("column[" + i + "]");
       }
     }

@@ -19,13 +19,13 @@
  */
 package dev.dsqlmigrator.connect;
 
-import static dev.dsqlmigrator.connect.HoldHarness.HUGE;
 import static dev.dsqlmigrator.connect.HoldHarness.P0;
 import static dev.dsqlmigrator.connect.HoldHarness.P1;
 import static dev.dsqlmigrator.connect.HoldHarness.P2;
 import static dev.dsqlmigrator.connect.HoldHarness.SECOND;
 import static dev.dsqlmigrator.connect.HoldHarness.TOPIC;
 import static dev.dsqlmigrator.connect.HoldHarness.create;
+import static dev.dsqlmigrator.connect.HoldHarness.createOversized;
 import static dev.dsqlmigrator.connect.HoldHarness.delete;
 import static dev.dsqlmigrator.connect.HoldHarness.offsets;
 import static dev.dsqlmigrator.connect.HoldHarness.task;
@@ -222,7 +222,7 @@ class DsqlSinkHoldRedeliveryTest {
     ConnectSinkLoop connect = connect(task);
     connect.declare(P0, 2);
     connect.declare(P1, 10);
-    connect.append(create(P1, 10, 100005, "a", "b5"), create(P1, 11, 300, "e", HUGE));
+    connect.append(create(P1, 10, 100005, "a", "b5"), createOversized(P1, 11, 300, "e"));
     connect.start(task, task.ctx);
     assertTrue(connect.poll());
     assertEquals(List.of("P1@11"), dlq.names());

@@ -48,7 +48,6 @@ final class HoldHarness {
   static final TopicPartition P0 = new TopicPartition(TOPIC, 0);
   static final TopicPartition P1 = new TopicPartition(TOPIC, 1);
   static final TopicPartition P2 = new TopicPartition(TOPIC, 2);
-  static final String HUGE = "x".repeat(DsqlSinkTask.DSQL_MAX_VALUE_BYTES + 1);
 
   // --- Records ----------------------------------------------------------------------------------
 
@@ -111,6 +110,41 @@ final class HoldHarness {
 
   static SinkRecord update(TopicPartition tp, long offset, int id, String email, String bio) {
     return change(tp, offset, id, "u", null, row(id, email, bio), 0L);
+  }
+
+  // The same table with a bytea column, for a row the sink refuses before any write: a bytea
+  // value over 1 MiB (since plugin v56 a large text value is sent and Aurora DSQL decides).
+  private static final Schema PHOTO_ROW =
+      SchemaBuilder.struct()
+          .name("app.customers.Value")
+          .field("id", Schema.INT32_SCHEMA)
+          .field("email", Schema.OPTIONAL_STRING_SCHEMA)
+          .field("bio", Schema.OPTIONAL_STRING_SCHEMA)
+          .field("photo", Schema.OPTIONAL_BYTES_SCHEMA)
+          .optional()
+          .build();
+  private static final Schema PHOTO_ENVELOPE =
+      SchemaBuilder.struct()
+          .name("Envelope")
+          .field("op", Schema.STRING_SCHEMA)
+          .field("after", PHOTO_ROW)
+          .field("source", SOURCE)
+          .build();
+
+  /** An insert the sink refuses before any write: its bytea value is over 1 MiB. */
+  static SinkRecord createOversized(TopicPartition tp, long offset, int id, String email) {
+    Struct after =
+        new Struct(PHOTO_ROW)
+            .put("id", id)
+            .put("email", email)
+            .put("photo", new byte[DsqlSinkTask.DSQL_MAX_VALUE_BYTES + 1]);
+    Struct source =
+        new Struct(SOURCE).put("connector", "postgresql").put("schema", "app")
+            .put("table", "customers");
+    Struct envelope =
+        new Struct(PHOTO_ENVELOPE).put("op", "c").put("after", after).put("source", source);
+    Struct key = new Struct(KEY).put("id", id);
+    return new SinkRecord(tp.topic(), tp.partition(), KEY, key, PHOTO_ENVELOPE, envelope, offset);
   }
 
   static SinkRecord delete(TopicPartition tp, long offset, int id) {
