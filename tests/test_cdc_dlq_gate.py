@@ -683,6 +683,28 @@ def test_cdc_only_has_its_own_way_forward_and_names_oversized_values(monkeypatch
     assert "exclude that column (Exclude tables & columns on the Data Migration step)" in s.body()
 
 
+def test_dsqls_own_value_limit_rejection_holds_cut_over_as_an_oversized_value(monkeypatch):
+    """T1: a 54000 per-value rejection, parsed from the sink's log line, folds into the ledger
+    as an oversized value, so Cut over holds the table and names the remedy. FAILS before T1:
+    it folded as a plain 54000 and the way forward never said the value cannot be stored."""
+    from dsql_migrator.core.cdc_dlq import parse_dlq_log_message
+    from dsql_migrator.ui.data_migration import _apply_cdc_status
+
+    s = _Cutover(monkeypatch, mtype="CDC_ONLY")
+    err = parse_dlq_log_message(
+        "Quarantined record to DLQ (topic=dsqlcdc.app.t, partition=0, offset=3): "
+        "sqlstate=54000 datatype limit greater than 1048576 bytes not supported for jsonb "
+        "| pk: id=3 | op: u",
+        occurred_at=_now() - timedelta(hours=2),
+    )
+    _apply_cdc_status(s.ms, ([], {}, [err], {}, {}, []))
+    assert s.ms.cdc_dlq_ledger["app.t"].kinds == ["oversized-value"]
+    s.validate(_item(checksum=None))
+    s.render()
+    assert "a value over Aurora DSQL's per-value limit" in s.body()
+    assert "exclude that column (Exclude tables & columns on the Data Migration step)" in s.body()
+
+
 # ---------------------------------------------------------------------------
 # A read cancelled by a refresh still lands (the timer is not the read's owner)
 # ---------------------------------------------------------------------------

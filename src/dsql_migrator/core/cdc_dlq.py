@@ -70,15 +70,27 @@ _OP = re.compile(r"\|\s*op:\s*(?P<op>[a-z](?:/[a-z])?)(?P<tombstone>\s*\(tombsto
 # operator-facing message. It cannot be turned off at the source; strip it here.
 _LOG4J_TAIL = re.compile(r"\s*\([\w.$]+:\d+\)\s*$")
 
-# A STABLE code for the quarantines that carry no SQLSTATE, so the UI can branch on the error
-# CLASS instead of matching prose. The sink's pre-write size guard raises a DataException --
-# there is no server error and therefore no SQLSTATE to report (asserted in tests/test_cdc_dlq
-# as intended behaviour), yet it is the most common quarantine in practice and the one with a
-# specific remedy. Deliberately NOT a 5-character SQLSTATE shape: classify_schema_drift() keys
-# the source-schema-drift banner off error_code, and a synthetic code must never be mistaken
-# for one of the SQLSTATEs it maps.
+# A STABLE code for a value over Aurora DSQL's 1 MiB per-value limit, so the UI can branch on
+# the error CLASS instead of matching prose. It is the most common quarantine in practice and
+# the one with a specific remedy, and a record reaches it two ways:
+#   * the sink's pre-write size guard refused it (a bytea value since plugin v56; also a text
+#     value before): a DataException, so no server error and no SQLSTATE (asserted in
+#     tests/test_cdc_dlq as intended behaviour);
+#   * Aurora DSQL refused it (a json / jsonb value with every sink version, and since plugin
+#     v56 a text value too): SQLSTATE 54000 with "datatype limit greater than 1048576 bytes not
+#     supported for <type>" (live-measured for text, json, jsonb and bytea), which names the
+#     TYPE, never the column. The record keeps "sqlstate=54000" and Aurora DSQL's message in its
+#     text; only its CLASS is this code. Any other 54000 (the transaction, row or key size,
+#     varchar's 65535-byte limit) stays 54000.
+# Deliberately NOT a 5-character SQLSTATE shape: classify_schema_drift() keys the
+# source-schema-drift banner off error_code, and a synthetic code must never be mistaken for
+# one of the SQLSTATEs it maps.
 OVERSIZED_VALUE_CODE = "OVERSIZED_VALUE"
 _OVERSIZED = re.compile(r"exceeds DSQL's\s+\d+-byte limit", re.IGNORECASE)
+_VALUE_LIMIT_SQLSTATE = "54000"
+_DSQL_VALUE_LIMIT = re.compile(
+    r"datatype limit greater than 1048576 bytes not supported for \w+", re.IGNORECASE
+)
 
 # The same shape for a source TRUNCATE: the sink refuses it before sending anything to DSQL, so
 # there is no server error and therefore no SQLSTATE. Unlike OVERSIZED_VALUE this code IS mapped
@@ -115,10 +127,13 @@ _MAX_MESSAGE_LEN = 2000
 
 
 # The offending column, which the sink names verbatim: "Value for column 'content' exceeds
-# DSQL's 1048576-byte limit". This is BETTER evidence than the Full Load has for the same
-# recovery -- there, the driver message names the TYPE and not the column, so the picker has to
-# infer candidates from a type token (see preselect_lob_columns_for_reason). Here the column is
-# stated, so the exclusion picker can pre-tick exactly the right one.
+# DSQL's 1048576-byte limit" -- its guard's reason, and since plugin v56 the note it adds to
+# Aurora DSQL's own 54000 when exactly one value of the row can be the one refused. This is
+# BETTER evidence than the Full Load has for the same recovery -- there, the driver message
+# names the TYPE and not the column, so the picker has to infer candidates from a type token
+# (see preselect_lob_columns_for_reason). Here the column is stated, so the exclusion picker can
+# pre-tick exactly the right one; a 54000 that names none (an older sink, or several
+# candidates) pre-ticks nothing.
 _OVERSIZED_COLUMN = re.compile(r"Value for column '(?P<column>[^']+)'", re.IGNORECASE)
 
 
@@ -222,8 +237,13 @@ def parse_dlq_log_message(
     reason = _LOG4J_TAIL.sub("", reason).strip() or "quarantined to DLQ"
     code = _SQLSTATE.search(message)
     # A synthetic class only when the sink reported no SQLSTATE: a real one always wins, so
-    # this can never mask a server error.
+    # this can never mask a server error -- except Aurora DSQL's own per-value rejection, which
+    # IS the oversized class; its 54000 and message stay in the record's text.
     error_code = code.group("state") if code else None
+    if error_code == _VALUE_LIMIT_SQLSTATE and _DSQL_VALUE_LIMIT.search(
+        reason.split(" | ", 1)[0]  # the server's message, never the SQL template after it
+    ):
+        error_code = OVERSIZED_VALUE_CODE
     if error_code is None and _OVERSIZED.search(reason):
         error_code = OVERSIZED_VALUE_CODE
     if error_code is None and _SOURCE_TRUNCATE.search(reason):
@@ -262,8 +282,9 @@ def parse_dlq_log_message(
 # The per-table dead-letter ledger (the cut-over gate's persisted memory)
 # ---------------------------------------------------------------------------
 
-# The ledger kind for an oversized-value quarantine. Not a SchemaDriftKind (the size guard is
-# deliberately unmapped by classify_schema_drift, see OVERSIZED_VALUE_CODE), but the cut-over
+# The ledger kind for an oversized-value quarantine (the size guard's, or Aurora DSQL's own
+# 54000 per-value rejection). Not a SchemaDriftKind (the class is deliberately unmapped by
+# classify_schema_drift, see OVERSIZED_VALUE_CODE), but the cut-over
 # gate needs it: such a value can NEVER be stored, so the way forward is to exclude the column
 # or shrink the value -- a re-check alone cannot clear it.
 OVERSIZED_VALUE_KIND = "oversized-value"

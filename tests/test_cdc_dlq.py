@@ -2098,3 +2098,130 @@ def test_a_generated_column_mixed_with_other_drift_never_claims_a_source_truncat
     assert _drift_ai_case(groups("generated-column", "value-does-not-fit")) == "target-side"
     assert _drift_ai_case(groups("generated-column", "source-truncate")) == "target-side"
     assert _drift_ai_case(groups("source-truncate", "value-does-not-fit")) == "truncate-value-fit"
+
+
+# ---------------------------------------------------------------------------
+# T1: Aurora DSQL's own per-value rejection (54000) is the oversized class too
+# ---------------------------------------------------------------------------
+
+# A dead letter of a row Aurora DSQL refused over its 1 MiB per-value limit, as every sink
+# version logs it (the message names the TYPE, never the column; live-measured 2026-11-07).
+def _value_limit_line(type_name: str, *, note: str = "", lead: str = "datatype") -> str:
+    return (
+        "Quarantined record to DLQ (topic=dsqlcdc.app.docs, partition=0, offset=9): "
+        f"sqlstate=54000 {lead} limit greater than 1048576 bytes not supported for {type_name}"
+        f"{note} | pk: id=4 | op: u | sql: INSERT INTO \"app\".\"docs\" (\"id\", \"body\") "
+        "VALUES (?, ?) ON CONFLICT (\"id\") DO UPDATE SET \"body\" = EXCLUDED.\"body\" "
+        "(dev.dsqlmigrator.connect.DsqlSinkTask:2365)"
+    )
+
+
+# The column note sink plugin v56 adds (DsqlSinkTask.valueLimitNote), in the size guard's format.
+_V56_NOTE = (
+    " -- Value for column 'body' (text, 2097152 bytes sent) exceeds DSQL's 1048576-byte limit "
+    "as stored. This row cannot be stored as-is and is never retried: exclude the column at "
+    "capture and keep the value outside the database."
+)
+
+
+@pytest.mark.parametrize("type_name", ["text", "json", "jsonb", "bytea"])
+def test_dsqls_own_value_limit_rejection_is_the_oversized_class(type_name) -> None:
+    """FAILS before T1: a row Aurora DSQL refused over its 1 MiB per-value limit kept the plain
+    54000, so the recovery card, the dead-letter gate's oversized label and Cut over's way
+    forward never offered the remedy -- the sink's own guard and Aurora DSQL's rejection are the
+    same class, and since plugin v56 the second is how a large text or JSON value ends."""
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE, oversized_column_from_reason
+
+    rec = parse_dlq_log_message(_value_limit_line(type_name))
+    assert rec is not None
+    assert rec.table == "app.docs"
+    assert rec.error_code == OVERSIZED_VALUE_CODE
+    # The real SQLSTATE and Aurora DSQL's message stay where the record shows them.
+    assert "sqlstate=54000 datatype limit greater than 1048576 bytes" in rec.message
+    assert rec.drift_kind is None  # never a source-schema-change banner
+    assert rec.pk == "id=4" and rec.op == "u"
+    # An older sink names no column: nothing is guessed.
+    assert oversized_column_from_reason(rec.message) is None
+    # The server may spell it with a capital.
+    capital = parse_dlq_log_message(_value_limit_line(type_name, lead="Datatype"))
+    assert capital is not None and capital.error_code == OVERSIZED_VALUE_CODE
+
+
+def test_the_v56_sinks_column_note_is_parsed_for_the_recovery() -> None:
+    import pathlib
+
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE, oversized_column_from_reason
+
+    rec = parse_dlq_log_message(_value_limit_line("text", note=_V56_NOTE))
+    assert rec is not None and rec.error_code == OVERSIZED_VALUE_CODE
+    assert oversized_column_from_reason(rec.message) == "body"
+    assert rec.pk == "id=4" and rec.op == "u"
+    # The note above is the sink's own text: the Java source builds it with that prefix.
+    sink = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "connectors/dsql-sink/src/main/java/dev/dsqlmigrator/connect/DsqlSinkTask.java"
+    ).read_text(encoding="utf-8")
+    body = sink[sink.index("static String valueLimitNote(") :]
+    body = body[: body.index("\n  }\n")]
+    assert "\" -- Value for column '\" + cols.get(found) + \"' (\" + type + \", \"" in body
+    assert "bytes sent) exceeds DSQL's \" + DSQL_MAX_VALUE_BYTES" in body
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "sqlstate=54000 transaction size limit 10485760 exceeded",
+        "sqlstate=54000 maximum row size exceeded",
+        "sqlstate=54000 key size too large",
+        "sqlstate=54000 datatype limit greater than 65535 bytes not supported for varchar",
+        "sqlstate=54000 transaction age limit of 300s exceeded",
+        # The same words under another SQLSTATE are not Aurora DSQL's per-value limit either.
+        "sqlstate=22001 datatype limit greater than 1048576 bytes not supported for text",
+    ],
+)
+def test_any_other_54000_is_not_an_oversized_value(reason) -> None:
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_CODE
+
+    rec = parse_dlq_log_message(
+        f"Quarantined record to DLQ (topic=dsqlcdc.app.docs, partition=0, offset=9): {reason}"
+    )
+    assert rec is not None
+    assert rec.error_code != OVERSIZED_VALUE_CODE
+    assert rec.error_code == reason.split()[0].split("=")[1]
+
+
+def test_the_ledger_holds_dsqls_value_limit_rejection_as_an_oversized_value() -> None:
+    from dsql_migrator.core.cdc_dlq import OVERSIZED_VALUE_KIND, fold_dlq_ledger
+
+    now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+    rec = parse_dlq_log_message(_value_limit_line("jsonb"), occurred_at=now)
+    ledger = fold_dlq_ledger({}, [rec], now=now)
+    assert ledger["app.docs"].count == 1
+    assert ledger["app.docs"].kinds == [OVERSIZED_VALUE_KIND]
+
+
+def test_the_ai_dba_sees_dsqls_value_limit_rejection_as_the_oversized_class(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+    from dsql_migrator.ui.data_migration import _cdc_status
+
+    records = [
+        parse_dlq_log_message(_value_limit_line("text", note=_V56_NOTE)),
+        parse_dlq_log_message(_value_limit_line("jsonb")),
+    ]
+    monkeypatch.setattr(_cdc_status, "cdc_dlq_records", lambda *_a: records)
+    monkeypatch.setattr(cm, "_cdc_dlq_proven", lambda *_a: {})
+    state = SimpleNamespace(cdc_activity=None, migration_type=None, job_id=None)
+    facts = cm._cdc_dlq_facts(state, "k")
+    assert "OVERSIZED_VALUE (2)" in facts
+    # The samples keep Aurora DSQL's SQLSTATE and message, and the column the sink named.
+    assert "sqlstate=54000 datatype limit greater than 1048576 bytes" in facts
+    assert "Value for column 'body'" in facts
+    assert "INSERT INTO" not in facts and "id=4" not in facts  # still row-free
+    # The grounding describes both ways a record lands in the class.
+    system = build_cdc_error_chat_system("DLQ depth: 2", scope="dlq")
+    assert "OVERSIZED_VALUE" in system
+    assert "54000" in system and "datatype limit greater than 1048576 bytes" in system
+    assert "after Aurora DSQL's compression, for bytea to the raw size" in system

@@ -1648,6 +1648,56 @@ def test_the_oversized_quarantine_groups_only_the_class_that_has_a_remedy() -> N
     assert cdc_oversized_quarantine_groups(None) == []
 
 
+def test_the_card_groups_dsqls_own_value_limit_rejection_and_never_guesses_a_column() -> None:
+    """T1: a row Aurora DSQL refused over its 1 MiB per-value limit (54000 "datatype limit
+    greater than 1048576 bytes not supported for <type>") is the same class as the sink guard's
+    refusal. FAILS before T1: the parser kept the plain 54000, so the card offered nothing. With
+    the column named (sink plugin v56) it is pre-ticked; without (an older sink, or a row with
+    several candidates) the card opens the choice with nothing pre-ticked."""
+    from dsql_migrator.core.cdc_dlq import parse_dlq_log_message
+    from dsql_migrator.ui.data_migration._cdc_monitoring import (
+        _render_cdc_oversized_recovery,
+        cdc_oversized_quarantine_groups,
+    )
+
+    def line(table: str, pk: str, note: str = "") -> str:
+        db, name = table.split(".")
+        return (
+            f"Quarantined record to DLQ (topic=dsqlcdc.{db}.{name}, partition=0, offset=5): "
+            "sqlstate=54000 datatype limit greater than 1048576 bytes not supported for text"
+            f"{note} | pk: {pk} | op: c/r | sql: INSERT INTO x (\"id\", \"body\") VALUES (?, ?)"
+        )
+
+    named = (
+        " -- Value for column 'body' (text, 2097152 bytes sent) exceeds DSQL's 1048576-byte "
+        "limit as stored. This row cannot be stored as-is and is never retried: exclude the "
+        "column at capture and keep the value outside the database."
+    )
+    records = [
+        parse_dlq_log_message(line("shop.pages", "id=1", named)),
+        parse_dlq_log_message(line("shop.notes", "id=7")),
+    ]
+    groups = cdc_oversized_quarantine_groups(records)
+    assert groups == [("shop.pages", ["id=1"], ["body"]), ("shop.notes", ["id=7"], [])]
+
+    ui = _FakeUi()
+    routed: list = []
+    _render_cdc_oversized_recovery(
+        ui,
+        object(),
+        "log",
+        lob_candidates_for=lambda _t: [("body", "text"), ("summary", "text")],
+        exclude_columns=lambda t, c: routed.append((t, c)),
+        records=records,
+    )
+    body = " ".join(ui.texts)
+    assert "Dropped over DSQL's 1 MiB per-value limit — column body." in body
+    assert "id=7" in body and "never retried" in body
+    for button in [b for b in ui.buttons if "Exclude column" in getattr(b, "text", "")]:
+        button.on_click()
+    assert routed == [("shop.pages", ["body"]), ("shop.notes", [])]
+
+
 def test_the_cdc_quarantine_card_offers_the_in_app_recovery() -> None:
     """The CDC dead-letter surface was read-only while the Full Load had a recovery card.
 
