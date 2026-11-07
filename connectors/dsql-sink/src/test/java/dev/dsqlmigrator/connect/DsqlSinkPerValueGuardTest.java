@@ -494,6 +494,6 @@ class DsqlSinkPerValueGuardTest {
                 + (2 * LIMIT) + " bytes sent) exceeds DSQL's 1048576-byte limit as stored."),
         reason.substring(0, Math.min(reason.length(), 600)));
     assertTrue(reason.contains(" | pk: id=2 | op: c/r | sql: INSERT INTO "), reason);
-    assertFalse(reason.contains("RXX") || reason.contains("xxxx"), "no value in the reason");
+    assertFalse(reason.contains("Rxx") || reason.contains("xxxx"), "no value in the reason");
   }
 }

@@ -3569,7 +3569,7 @@ def test_plugin_v52_history_records_the_g22_rebuild() -> None:
     source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
     text = (source / "s3_provision.py").read_text(encoding="utf-8")
     history = " ".join(text.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v56"' in text  # G23 past v52, B6 v53, A7 v54, T1 v55
+    assert 'PLUGIN_VERSION = "v56"' in text  # v55 A7, v56 T1 (s3_provision's history lists every bump)
     assert "rebuilt in place (G22" in history
     assert "XX000" in history
     # G22 also changed paths other than XX000 (a failed error-path rollback drops the
