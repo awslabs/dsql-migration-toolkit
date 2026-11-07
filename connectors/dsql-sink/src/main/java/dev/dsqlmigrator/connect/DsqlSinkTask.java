@@ -2269,10 +2269,7 @@ public class DsqlSinkTask extends SinkTask {
     }
     String sql;
     try {
-      sql =
-          event.isDelete()
-              ? DsqlDialect.deleteSql(event.table(), event.pkColumns())
-              : DsqlDialect.upsertSql(event.table(), event.columns(), event.pkColumns());
+      sql = renderSql(event); // the statement this event runs: one event-to-SQL mapping
     } catch (RuntimeException e) {
       sql = null; // never let SQL rendering mask the real failure
     }

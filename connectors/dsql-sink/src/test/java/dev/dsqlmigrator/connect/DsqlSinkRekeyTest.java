@@ -1779,4 +1779,72 @@ class DsqlSinkRekeyTest {
       }
     }
   }
+
+  // --- The dead-letter template is the statement the event renders (A7, JS-7) -----------------
+
+  /** The " | sql: " template of {@code record}'s dead-letter reason when every write fails. */
+  private static String deadLetterSql(SinkRecord record, boolean indexValid, boolean failDeletes)
+      throws Exception {
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(5, 2, "a");
+    dsql.seed(5, 3, "z");
+    dsql.failure =
+        (sql, binds) ->
+            !failDeletes || sql.startsWith("DELETE")
+                ? new SQLException("column \"x\" does not exist", "42703")
+                : null;
+    RekeyTask task = task(dsql, null, TARGET_KEYS).index(indexValid); // no DLQ: the reason throws
+    ConnectException e = assertThrows(ConnectException.class, () -> task.put(List.of(record)));
+    String m = e.getMessage();
+    return m.substring(m.indexOf(" | sql: ") + " | sql: ".length());
+  }
+
+  @Test
+  void aDeadLetterNamesTheStatementItsEventRendersOnEveryPath() throws Exception {
+    // The reason's SQL template is parsed by the control plane (core/cdc.py _SQL_TEMPLATE_MARK /
+    // _INSERT_HEAD): it is the statement of the reported event, renderSql's -- a re-keyed
+    // delete by its exact composite key or by the source key, a move (reported as itself, an
+    // upsert, whichever half failed) and a row of a table that is not re-keyed.
+    SinkRecord delete = record(ORDERS, sourceKey(3), "d", row(5, 3, "z"), null);
+    assertEquals(DELETE_EXACT, deadLetterSql(delete, false, false));
+    assertEquals(DELETE_BY_SOURCE_KEY, deadLetterSql(delete, true, false));
+    assertEquals(UPSERT_COMPOSITE, deadLetterSql(leadUpdate(), false, true));
+    assertEquals(UPSERT_COMPOSITE, deadLetterSql(leadUpdate(), true, true));
+    assertEquals(UPSERT_COMPOSITE, deadLetterSql(blindUpdate(11, 3, "r3"), true, true));
+    Schema itemKey = SchemaBuilder.struct().field("id", Schema.INT32_SCHEMA).build();
+    for (SinkRecord item :
+        List.of(
+            record(ITEMS, new Struct(itemKey).put("id", 1), "c", null, row(0, 1, "x")),
+            record(ITEMS, new Struct(itemKey).put("id", 1), "d", row(0, 1, "x"), null))) {
+      assertEquals(
+          DsqlSinkTask.renderSql(DebeziumEvents.parse(item)), deadLetterSql(item, false, false));
+    }
+  }
+
+  @Test
+  void theDeadLetterTemplateIsRenderSqlsEvenForADeleteThatSparesARow() throws Exception {
+    // FAILS BEFORE A7: reportOrThrow rendered the template with its own delete/upsert ternary, a
+    // second copy of renderSql without the delete-unless shape (G15), so this delete was logged
+    // as a plain DELETE by the source key. Unreachable today (a failing move is reported as the
+    // move), but the next statement shape must not be logged under a template other than the
+    // one that ran.
+    ChangeEvent blind =
+        DebeziumEvents.parse(blindUpdate(11, 3, "r3"), Map.of(ORDERS, List.of("lead", "id")));
+    ChangeEvent spares = blind.withMoveDeleteBySourceKey().moveDelete();
+    assertEquals(DELETE_UNLESS_AT, DsqlSinkTask.renderSql(spares));
+    RekeyTask task = task(new FakeDsql(), null, TARGET_KEYS);
+    java.lang.reflect.Method report =
+        DsqlSinkTask.class.getDeclaredMethod(
+            "reportOrThrow", SinkRecord.class, ChangeEvent.class, SQLException.class);
+    report.setAccessible(true);
+    java.lang.reflect.InvocationTargetException e =
+        assertThrows(
+            java.lang.reflect.InvocationTargetException.class,
+            () ->
+                report.invoke(
+                    task, blindUpdate(11, 3, "r3"), spares, new SQLException("boom", "22P02")));
+    ConnectException thrown = assertInstanceOf(ConnectException.class, e.getCause());
+    assertTrue(
+        thrown.getMessage().endsWith(" | sql: " + DELETE_UNLESS_AT), thrown.getMessage());
+  }
 }
