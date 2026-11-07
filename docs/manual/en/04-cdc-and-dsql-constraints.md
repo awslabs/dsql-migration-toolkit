@@ -378,13 +378,15 @@ sink plugin*) until you **Delete CDC infrastructure** and deploy it again.
 
 ## 4.5 The 1 MiB per-value limit, and the DLQ
 
-DSQL rejects a **single value larger than ~1 MiB** (a `TEXT`/`bytea` value). The pipeline
-handles oversized values in **three bands**:
+DSQL rejects a **single value larger than 1 MiB**: a `bytea` value by its raw size, a `text`,
+`json` or `jsonb` value by its size after Aurora DSQL's compression (for `text` this is
+measured), so a larger value that compresses below 1 MiB is stored. The pipeline handles
+oversized values in **three bands**:
 
 | Value size | What happens |
 |---|---|
 | **≤ 1 MiB** | Applied normally. |
-| **1 MiB – 8 MiB** | The sink measures each value **before writing** and **quarantines** the oversized one to the **DLQ** (it can never be applied), while the rest of the record's table keeps flowing. |
+| **1 MiB – 8 MiB** | The sink refuses a `bytea` value over 1 MiB **before writing** and **quarantines** its row to the **DLQ** (it can never be applied). A `text` or JSON value goes to Aurora DSQL, as in Full Load, and is stored if it compresses below 1 MiB; if Aurora DSQL refuses it, the row is dead-lettered as an oversized value, with the column named when it can be determined. Either way the rest of the record's table keeps flowing. |
 | **> 8 MiB** | Cannot enter Kafka at all. These must be **excluded at capture**, so the oversized LOB column never reaches the pipeline. You exclude it with a rule in **Exclude tables & columns** (under the table list on the Data Migration step); its *Oversized-LOB candidates* section lists the same columns Evaluation flags `OVERSIZED_LOB`. Rows the tool writes hold NULL in an excluded column; rows already on Aurora DSQL before CDC started keep their values (CDC never writes an excluded column), and Validation counts them. |
 
 ### What gets dead-lettered
@@ -421,7 +423,7 @@ row changes later depends on the operation:
 |---|---|---|
 | `DELETE` | `DELETE … WHERE pk = ?` matches **0 rows**; the sink does not treat that as an error, so it is applied and committed silently. | **Correct.** The intended end state — "the row is not on the target" — already holds. |
 | `UPDATE` that shrinks the value below 1 MiB | Debezium sends the **full after-image** and the sink writes it as an upsert; with no existing row, the row is **inserted**. | **The gap heals itself.** No action needed. |
-| `UPDATE` where the value is still oversized | The sink measures values **before** writing, so the record is quarantined to the **DLQ** for the same reason. | Gap persists, and it is **visible** (DLQ depth / "Quarantined" in the monitor). |
+| `UPDATE` where the value is still oversized | The record is quarantined to the **DLQ** for the same reason: the sink refuses a `bytea` value before writing, and Aurora DSQL refuses a `text` or JSON value. | Gap persists, and it is **visible** (DLQ depth / "Quarantined" in the monitor). |
 | `INSERT` of a *different* row | Unaffected. | Normal. |
 
 A quarantine gap is not self-announcing after Full Load: if the source never touches that
