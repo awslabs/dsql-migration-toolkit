@@ -103,7 +103,8 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * healthy row is safe (idempotent {@code ON CONFLICT} upsert / PK delete).
  *
  * <p>Two kinds of row are refused BEFORE any write, so they never cost a chunk rollback or a
- * per-row replay: a value over DSQL's per-value byte limit ({@link #oversizedColumn}), and a
+ * per-row replay: a text or bytea value over DSQL's per-value byte limit
+ * ({@link #oversizedColumn}), and a
  * number its target column would silently change -- a number other than 0/1 for a boolean,
  * more decimal places than a {@code numeric(p,s)} keeps, or a fraction for an integer column
  * ({@link ValueFit}, fed by a per-table catalog read cached on this task).
@@ -596,8 +597,8 @@ public class DsqlSinkTask extends SinkTask {
       if (event.isDelete() && !config.deleteEnabled()) {
         continue;
       }
-      // Size guard: a value over DSQL's 1 MiB limit can neither be applied nor
-      // dead-lettered through Kafka, so quarantine it here (before any DSQL
+      // Size guard: a text or bytea value over DSQL's 1 MiB limit can neither be applied
+      // nor dead-lettered through Kafka, so quarantine it here (before any DSQL
       // write) rather than let it stall the partition.
       String oversized = oversizedColumn(event);
       if (oversized != null) {
@@ -733,26 +734,40 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * Estimated wire bytes of one value: UTF-8 for text and for a PGobject's text, length for
-   * bytea, else fixed. A PGobject used to count as a fixed scalar, so a chunk of 100 KiB JSON
-   * documents looked 32 bytes a row: one rewritten statement of 128 of them passed 10 MiB, Aurora
-   * DSQL refused the message (08P01, a connection error) and Connect redelivered the same batch
-   * forever.
+   * Estimated wire bytes of one value: its {@link #encodedBytes} -- UTF-8 for text and for a
+   * PGobject's text, length for bytea -- else 1 for a null (or a PGobject with no text) and a
+   * fixed estimate for any other scalar. A PGobject used to count as a fixed scalar, so a chunk
+   * of 100 KiB JSON documents looked 32 bytes a row: one rewritten statement of 128 of them
+   * passed 10 MiB, Aurora DSQL refused the message (08P01, a connection error) and Connect
+   * redelivered the same batch forever.
    */
   private static long estimateValueBytes(Object v) {
-    if (v == null) {
-      return 1L;
+    long bytes = encodedBytes(v);
+    if (bytes >= 0L) {
+      return bytes;
     }
+    return v == null || v instanceof org.postgresql.util.PGobject ? 1L : SCALAR_VALUE_BYTES;
+  }
+
+  /**
+   * The encoded byte length of a text or binary value, or -1 for any other (null, a number, a
+   * timestamp, a PGobject with no text). A CharSequence and a PGobject's text (json, jsonb, an
+   * array rendered as jsonb, interval) count their UTF-8 bytes -- what goes on the wire, and
+   * CJK/emoji are multi-byte -- and a {@code byte[]} its length. The one sizer of the chunk byte
+   * budget ({@link #estimateValueBytes}) and of the per-value guard ({@link #oversizedColumn}),
+   * which applies it to text and bytea values only. Package-private for tests.
+   */
+  static long encodedBytes(Object v) {
     if (v instanceof CharSequence s) {
       return utf8Bytes(s.toString());
     }
     if (v instanceof org.postgresql.util.PGobject pg) {
-      return pg.getValue() == null ? 1L : utf8Bytes(pg.getValue());
+      return pg.getValue() == null ? -1L : utf8Bytes(pg.getValue());
     }
     if (v instanceof byte[] b) {
       return b.length;
     }
-    return SCALAR_VALUE_BYTES;
+    return -1L;
   }
 
   private static long utf8Bytes(String text) {
@@ -1567,12 +1582,31 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * Return the name of the first column whose value exceeds DSQL's per-value
-   * byte limit, or {@code null} if all values fit. Only string/byte[] values are
-   * size-bounded (TEXT/bytea); numbers/booleans/timestamps are small. The UTF-8
-   * byte length is what DSQL measures, so a String is sized by its encoded bytes.
+   * Return the name of the first column whose value exceeds DSQL's per-value byte limit, or
+   * {@code null} if all values may be sent. Only a {@code String} (text) and a {@code byte[]}
+   * (bytea) are checked, by their {@link #encodedBytes} (a String by its UTF-8 bytes, which is
+   * what DSQL measures). The rule per type is the one documented on Aurora DSQL's "Supported
+   * data types" page
+   * (https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-data-types.html):
+   *
+   * <ul>
+   *   <li><b>bytea</b>: 1 MiB, with no compression. Refused above it.
+   *   <li><b>text</b>: 1 MiB. DSQL compresses large text values, but the page does not say the
+   *       limit binds the compressed size, so the guard keeps the raw reading and refuses a value
+   *       whose UTF-8 bytes exceed it (a documented quota outranks a probe).
+   *   <li><b>json / jsonb</b>, and a PostgreSQL array the sink renders as jsonb
+   *       ({@link DebeziumTypeConverter#pgArrayAsJsonb}): the page says the 1 MiB limit applies
+   *       to the COMPRESSED size, so a value far larger than 1 MiB is stored when it compresses
+   *       below it. These arrive as a {@link org.postgresql.util.PGobject} and are never sized
+   *       here: DSQL decides, as it does for Full Load, which sends such values as they are (a
+   *       real rejection, 54000, dead-letters that one row). Refusing them here would
+   *       dead-letter, on CDC only, documents Full Load loads.
+   * </ul>
+   *
+   * <p>Numbers, booleans and timestamps are small. The chunk byte budget still counts every
+   * text, PGobject text and bytea ({@link #estimateValueBytes}). Package-private for tests.
    */
-  private static String oversizedColumn(ChangeEvent event) {
+  static String oversizedColumn(ChangeEvent event) {
     if (event.isDelete()) {
       return null; // deletes carry only PK values, never a large payload
     }
@@ -1580,15 +1614,7 @@ public class DsqlSinkTask extends SinkTask {
     List<Object> vals = event.values();
     for (int i = 0; i < vals.size(); i++) {
       Object v = vals.get(i);
-      int bytes;
-      if (v instanceof String s) {
-        bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-      } else if (v instanceof byte[] b) {
-        bytes = b.length;
-      } else {
-        continue;
-      }
-      if (bytes > DSQL_MAX_VALUE_BYTES) {
+      if ((v instanceof String || v instanceof byte[]) && encodedBytes(v) > DSQL_MAX_VALUE_BYTES) {
         return i < cols.size() ? cols.get(i) : ("column[" + i + "]");
       }
     }
