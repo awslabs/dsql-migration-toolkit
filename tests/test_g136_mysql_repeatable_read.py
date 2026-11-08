@@ -46,7 +46,6 @@ from dsql_migrator.core.introspector import (
 from dsql_migrator.core.models import SourceConnectionConfig, SourceType
 from dsql_migrator.core.source_dialect import MySQLSourceDialect, dialect_for
 from dsql_migrator.core.validator import Validator
-from dsql_migrator.ui import connect
 from dsql_migrator.ui.connect import make_source_engine_factory
 
 PIN = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
@@ -214,7 +213,9 @@ def test_a_pooled_session_reads_at_repeatable_read_on_a_read_committed_source(
     monkeypatch: pytest.MonkeyPatch, factory_name: str
 ) -> None:
     source = _ReadCommittedSource()
-    module = connect if factory_name == "ui" else introspector
+    # Both factories build through core.introspector.build_source_engine, so its
+    # create_engine is where the double goes.
+    module = introspector
     real_create_engine = module.create_engine
     monkeypatch.setattr(
         module, "create_engine",

@@ -27,16 +27,10 @@ import inspect
 import re
 from typing import Callable, Optional, Sequence
 
-from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import URL
 
 from dsql_migrator.config import ConnectDefaults, SecretValue
-from dsql_migrator.core.introspector import (
-    SourceIntrospector,
-    install_read_only_guard,
-    install_session_setup,
-)
+from dsql_migrator.core.introspector import SourceIntrospector, build_source_engine
 from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.activity_log import (
     ActivityCategory,
@@ -312,12 +306,14 @@ def make_source_engine_factory(
 ) -> Callable[[SourceConnectionConfig], Engine]:
     """Build an engine factory that injects the in-memory ``password``.
 
-    The returned factory builds a source engine for the config's dialect (MySQL or
-    PostgreSQL, selected by ``conn.source_type``) and installs the read-only guard,
-    so any introspection or connection test performed through it cannot write to
-    the source (Property 1). The plaintext password is read from the
-    :class:`SecretValue` only here, at connect time, and is never stored on the
-    connection config (Property 7).
+    The returned factory builds the source engine with
+    :func:`~dsql_migrator.core.introspector.build_source_engine`, the one builder of
+    read-only source engines: the config's dialect (MySQL or PostgreSQL, selected by
+    ``conn.source_type``), the read-only guard, so any introspection or connection test
+    performed through it cannot write to the source (Property 1), and the dialect's
+    per-session settings. The plaintext password is read from the :class:`SecretValue`
+    only there, at connect time, and is never stored on the connection config
+    (Property 7).
 
     ``read_timeout_seconds`` (opt-in) bounds each socket read/write so a
     connected-but-stalled stream raises instead of blocking forever. Pass it for
@@ -327,32 +323,9 @@ def make_source_engine_factory(
     """
 
     def factory(conn: SourceConnectionConfig) -> Engine:
-        # Driver scheme + engine kwargs come from the source dialect selected by
-        # conn.source_type (default MySQL, so the MySQL path is unchanged).
-        dialect = dialect_for(conn.source_type)
-        url = URL.create(
-            dialect.driver_scheme,
-            username=conn.username,
-            password=password.reveal() if password is not None else None,
-            host=conn.host,
-            port=conn.port,
-            database=conn.database,
+        return build_source_engine(
+            conn, password, read_timeout_seconds=read_timeout_seconds
         )
-        # Shared engine settings (pool_pre_ping + a bounded connect_timeout) so an
-        # unreachable source fails fast instead of hanging the connection test /
-        # introspection / validation (which would otherwise spin with no
-        # interruptible point). The Full Load path also opts into a per-socket
-        # read/write timeout so a mid-stream stall fails the table (retryable)
-        # rather than hanging the job in RUNNING forever.
-        engine = create_engine(
-            url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
-        )
-        install_read_only_guard(engine)
-        # The dialect's per-session settings, as a statement after connect (PostgreSQL:
-        # row_security = off, so a role its policies apply to fails loudly instead of
-        # reading a filtered subset). Every source engine, like the guard above.
-        install_session_setup(engine, dialect.session_setup_sql)
-        return engine
 
     return factory
 

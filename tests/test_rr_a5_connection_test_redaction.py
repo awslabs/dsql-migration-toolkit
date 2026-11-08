@@ -13,8 +13,9 @@ Connect screen verbatim.
 
 These tests drive the REAL path: ``check_source_connection`` with no injected
 introspector, so the production engine factory receives the password and builds the URL
-with it. Only ``create_engine`` is replaced, by a driver whose connect error echoes the
-password of the URL it was given -- the case the redaction exists for.
+with it. Only ``create_engine`` is replaced (in ``core.introspector``, where
+``build_source_engine`` builds every read-only source engine), by a driver whose connect
+error echoes the password of the URL it was given -- the case the redaction exists for.
 
 The last test pins the other half: with the unused ``secret`` reference gone, the source
 config carries no credential at all, and a persisted session still restores it.
@@ -25,7 +26,7 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import create_engine as _real_create_engine
 
-import dsql_migrator.ui.connect as connect_mod
+import dsql_migrator.core.introspector as introspector_mod
 from dsql_migrator.config import SecretValue
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.ui.connect import build_source_config, check_source_connection
@@ -51,7 +52,7 @@ def _leaky_create_engine(url, **_kwargs):  # noqa: ANN001, ANN202 - create_engin
 def test_the_connect_screen_source_test_redacts_a_password_the_driver_echoes(
     monkeypatch: pytest.MonkeyPatch, source_type: SourceType, port: int
 ) -> None:
-    monkeypatch.setattr(connect_mod, "create_engine", _leaky_create_engine)
+    monkeypatch.setattr(introspector_mod, "create_engine", _leaky_create_engine)
     config = build_source_config(
         host="db.example.com",
         port=port,
@@ -76,7 +77,7 @@ def test_a_source_test_without_a_password_still_reports_the_driver_reason(
 ) -> None:
     # No password held (e.g. a passwordless test account): nothing to redact, and the
     # failure reason is passed through unchanged rather than blanked.
-    monkeypatch.setattr(connect_mod, "create_engine", _leaky_create_engine)
+    monkeypatch.setattr(introspector_mod, "create_engine", _leaky_create_engine)
     config = build_source_config(host="db.example.com", port=3306, username="reader")
 
     result = check_source_connection(config, None)

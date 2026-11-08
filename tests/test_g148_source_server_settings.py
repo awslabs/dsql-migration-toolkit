@@ -67,7 +67,6 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.source_dialect import postgres as pg_dialect_module
 from dsql_migrator.core.source_dialect.mysql import MYSQL_SERVER_SETTINGS
-from dsql_migrator.ui import connect
 from dsql_migrator.ui.connect import make_source_engine_factory
 
 PIN = "SET time_zone = '+00:00', sql_mode = 'ALLOW_INVALID_DATES'"
@@ -279,7 +278,8 @@ def test_every_mysql_source_engine_runs_the_pin_on_connect(
     from sqlalchemy import text
 
     server = _MySqlServer()
-    module = {"ui": connect, "core": introspector}.get(factory_name)
+    # ui and core both build through core.introspector.build_source_engine.
+    module = None if factory_name == "fence" else introspector
     if module is None:
         import sqlalchemy
 
@@ -310,7 +310,7 @@ def test_a_view_body_is_never_read_under_the_parameter_groups_ansi_quotes(
     """Through introspection itself: SHOW CREATE runs under the pinned sql_mode, so the body
     is backtick-quoted, and the converter reads its identifiers as identifiers."""
     server = _MySqlServer()
-    module = connect if factory_name == "ui" else introspector
+    module = introspector  # ui and core both build through build_source_engine
     _through(monkeypatch, server, module)
     factory = make_source_engine_factory(None) if factory_name == "ui" else _default_engine_factory
     inventory = SourceIntrospector(engine_factory=factory).introspect(_config())

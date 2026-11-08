@@ -499,14 +499,40 @@ def install_session_setup(engine: Engine, statements: "Sequence[str]") -> None:
     event.listen(engine, "connect", _set_up, insert=True)
 
 
-def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
-    """Build a read-only-guarded source engine from a connection config.
+def build_source_engine(
+    conn: SourceConnectionConfig,
+    password: Optional[SecretValue] = None,
+    *,
+    read_timeout_seconds: Optional[int] = None,
+) -> Engine:
+    """Build a read-only source engine: every guarded source engine is built here.
 
     The driver scheme and engine kwargs come from the source dialect selected by
-    ``conn.source_type`` (default MySQL). ``dialect_for`` is imported lazily to avoid
-    an import cycle (``source_dialect`` imports this module's MySQL helpers). It sends
-    no password: a caller that has one passes an engine factory that injects it
-    (``ui.connect.make_source_engine_factory``).
+    ``conn.source_type`` (default MySQL); the shared kwargs (``pool_pre_ping`` and a bounded
+    connect timeout) make an unreachable source fail fast instead of hanging a connection
+    test, introspection or Validation. Every engine gets the read-only guard (Property 1)
+    and the dialect's per-session settings (:func:`install_session_setup`: PostgreSQL's
+    ``row_security = off``, MySQL's REPEATABLE READ pin), so a future session setting or
+    engine argument cannot reach one read path and miss another.
+
+    ``password`` is revealed only here, when the engine is built, and is never stored on
+    the connection config (Property 7); without one the URL carries no password.
+    ``read_timeout_seconds`` (opt-in) bounds each socket read/write so a
+    connected-but-stalled stream raises instead of blocking forever: the Full Load source
+    stream passes it (bounded keyset pages); introspection and Validation leave it
+    ``None``, since their single long queries must not be killed by a per-read deadline.
+
+    The deliberate exceptions build their own engines and never come through here: the
+    two source-WRITE engines, which have no guard
+    (:func:`~dsql_migrator.core.cdc_pg_slot.build_pg_source_write_engine` for the
+    PostgreSQL CDC slot and publication, and
+    :func:`~dsql_migrator.core.mysql_start_point_fence.build_fence_engine` for the MySQL
+    start-point fence), and PostgreSQL's TimeZone probe
+    (``source_dialect.postgres._settings_probe_engine``), which has the guard but no
+    session setup, since it reads the server's own default.
+
+    ``dialect_for`` is imported lazily to avoid an import cycle (``source_dialect`` imports
+    this module's MySQL helpers).
     """
     from dsql_migrator.core.source_dialect import dialect_for
 
@@ -514,15 +540,23 @@ def _default_engine_factory(conn: SourceConnectionConfig) -> Engine:
     url = URL.create(
         dialect.driver_scheme,
         username=conn.username,
-        password=None,
+        password=password.reveal() if password is not None else None,
         host=conn.host,
         port=conn.port,
         database=conn.database,
     )
-    engine = create_engine(url, **dialect.engine_kwargs())
+    engine = create_engine(
+        url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
+    )
     install_read_only_guard(engine)
     install_session_setup(engine, dialect.session_setup_sql)
     return engine
+
+
+# The default engine factory of the introspector, the exporter, the watermark capture and
+# the Validator: a guarded engine that sends no password. A caller that has one passes an
+# engine factory that injects it (``ui.connect.make_source_engine_factory``).
+_default_engine_factory = build_source_engine
 
 
 def _sanitize_message(message: str, secret: Optional[str]) -> str:
@@ -1791,6 +1825,7 @@ __all__ = [
     "ReadOnlySourceError",
     "is_write_or_ddl",
     "install_read_only_guard",
+    "build_source_engine",
     "collect_triggers",
     "collect_routines",
     "collect_events",

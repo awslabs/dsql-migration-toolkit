@@ -45,7 +45,6 @@ from dsql_migrator.core.introspector import is_write_or_ddl, source_engine_kwarg
 from dsql_migrator.core.models import SourceType, TargetConnectionConfig
 from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.ui import connect
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.data_migration import _full_load_engine as engine
 from dsql_migrator.ui.data_migration._full_load_engine import (
@@ -91,7 +90,8 @@ def test_the_full_load_streams_session_runs_it_and_its_other_sessions_do_not(mon
     from tests.test_ui_data_migration import _inputs as _load_inputs
 
     server = _MySqlServer()
-    _through(monkeypatch, server, connect)
+    # Every builder below builds through core.introspector.build_source_engine.
+    _through(monkeypatch, server, introspector)
     worker = BatchedTableMigrator(_load_inputs())  # what a worker builds for its table
     source = worker._inputs.source_config
     builders = (
