@@ -8883,21 +8883,17 @@ class BatchedTableMigrator:
                 detail=f"source ({stack_name}): {message}",
             )
 
-        engine = cdc_pg_slot.build_pg_source_write_engine(
+        with cdc_pg_slot.pg_source_write_connection(
             source, self._inputs.source_password
-        )
-        try:
-            with engine.connect() as connection:
-                return cdc_pg_slot.provision_pg_replication(
-                    connection,
-                    slot_name=slot,
-                    publication_name=publication,
-                    tables=list(table_names),
-                    full_identity_tables=full_identity_tables,
-                    on_log=_audit,
-                )
-        finally:
-            engine.dispose()
+        ) as connection:
+            return cdc_pg_slot.provision_pg_replication(
+                connection,
+                slot_name=slot,
+                publication_name=publication,
+                tables=list(table_names),
+                full_identity_tables=full_identity_tables,
+                on_log=_audit,
+            )
 
     def guard_cdc_additions(
         self,

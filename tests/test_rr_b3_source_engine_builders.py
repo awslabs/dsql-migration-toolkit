@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""One builder for every read-only source engine.
+"""One builder for every read-only source engine, one entry point for the PostgreSQL writes.
 
 Property 1 (the source is read-only) and the per-session settings (G136's REPEATABLE READ
 pin, PostgreSQL's ``row_security = off``) used to depend on two copies of the same five
@@ -11,6 +11,10 @@ steps agreeing: ``ui.connect.make_source_engine_factory`` and
 named exceptions: the two unguarded write engines (the PostgreSQL CDC slot / publication
 and the G147 MySQL start-point fence) and PostgreSQL's TimeZone probe.
 
+The PostgreSQL write engine's build / connect / dispose runs through
+``cdc_pg_slot.pg_source_write_connection`` everywhere except the CDC-addition guard, which
+reports a failed build apart from a failure after it.
+
 Doubles only: no source, no AWS.
 """
 
@@ -18,11 +22,12 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from dsql_migrator.config import SecretValue
-from dsql_migrator.core import introspector
+from dsql_migrator.core import cdc_deployer, cdc_pg_slot, introspector
 from dsql_migrator.core.introspector import _default_engine_factory, build_source_engine
 from dsql_migrator.core.models import SourceConnectionConfig, SourceType
 from dsql_migrator.core.source_dialect import dialect_for
@@ -113,3 +118,74 @@ def test_the_source_engines_not_built_by_the_one_builder_are_the_named_exception
         "core.source_dialect.postgres:_settings_probe_engine",
     }
     assert _calls_in("install_session_setup") == {"core.introspector:build_source_engine"}
+
+
+class _Connection:
+    def __init__(self, log: list, error: "Exception | None") -> None:
+        self._log, self._error = log, error
+
+    def __enter__(self):  # noqa: ANN204
+        if self._error is not None:
+            raise self._error
+        self._log.append("connect")
+        return self
+
+    def __exit__(self, *_exc) -> bool:  # noqa: ANN002
+        self._log.append("close")
+        return False
+
+
+class _Engine:
+    def __init__(self, log: list, connect_error: "Exception | None" = None) -> None:
+        self._log, self._connect_error = log, connect_error
+
+    def connect(self) -> _Connection:
+        return _Connection(self._log, self._connect_error)
+
+    def dispose(self) -> None:
+        self._log.append("dispose")
+
+
+@pytest.mark.parametrize("failure", [None, "body", "connect", "build"])
+def test_the_pg_write_connection_disposes_its_engine_on_every_exit(
+    monkeypatch: pytest.MonkeyPatch, failure: "str | None"
+) -> None:
+    log: list = []
+    password = SecretValue("pw")
+    config = _config(SourceType.POSTGRES)
+
+    def _build(source_config, secret):  # noqa: ANN001, ANN202 - the two-argument call
+        assert (source_config, secret) == (config, password)
+        if failure == "build":
+            raise RuntimeError("build")
+        return _Engine(log, RuntimeError("connect") if failure == "connect" else None)
+
+    monkeypatch.setattr(cdc_pg_slot, "build_pg_source_write_engine", _build)
+    if failure is None:
+        with cdc_pg_slot.pg_source_write_connection(config, password) as connection:
+            assert isinstance(connection, _Connection)
+            log.append("write")
+        assert log == ["connect", "write", "close", "dispose"]
+        return
+    with pytest.raises(RuntimeError, match=failure):
+        with cdc_pg_slot.pg_source_write_connection(config, password):
+            log.append("write")
+            raise RuntimeError("body")
+    assert log == {
+        "body": ["connect", "write", "close", "dispose"],
+        "connect": ["dispose"],
+        "build": [],
+    }[failure]
+
+
+def test_a_pg_teardown_with_no_source_host_reports_the_slot_not_dropped() -> None:
+    logged: list = []
+    dropped = cdc_deployer._drop_pg_source_replication(
+        SimpleNamespace(log=logged.append),
+        stack_name="dsql-cdc-stack",
+        stack_params={"EngineType": "postgres", "PgSlotName": "dsqlmig_s1"},
+        region=None,
+        aws_profile=None,
+    )
+    assert dropped is False  # the annotated bool, not None
+    assert "could not determine the source host" in logged[-1]

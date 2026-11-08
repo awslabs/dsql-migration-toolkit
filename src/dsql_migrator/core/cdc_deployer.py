@@ -1969,10 +1969,10 @@ def _repair_publication_via_partition_root(
             "PARTITIONED, its changes will be silently dropped by the connector. " + manual
         )
         return
-    engine = None
     try:
-        engine = cdc_pg_slot.build_pg_source_write_engine(source_config, source_password)
-        with engine.connect() as connection:
+        with cdc_pg_slot.pg_source_write_connection(
+            source_config, source_password
+        ) as connection:
             outcome = cdc_pg_slot.ensure_publication_via_partition_root(
                 connection,
                 name=publication,
@@ -1988,9 +1988,6 @@ def _repair_publication_via_partition_root(
             f"root ({str(exc).splitlines()[0]}). Changes to a PARTITIONED captured table "
             "would be silently dropped by the connector. " + manual
         )
-    finally:
-        if engine is not None:
-            engine.dispose()
 
 
 def run_cdc_start(
@@ -2527,7 +2524,7 @@ def _drop_pg_source_replication(
             "WARNING: could not determine the source host to drop the PostgreSQL "
             f"replication slot '{slot}'. {manual}"
         )
-        return
+        return False
     try:
         from dsql_migrator.core.models import SourceConnectionConfig, SourceType
         from dsql_migrator.core.secrets import (
@@ -2603,21 +2600,17 @@ def _drop_pg_source_replication(
         # SecretValue's constructor REFUSES a non-str and double-wrapping raised TypeError --
         # which the teardown's catch-all swallowed into "could not drop the slot", i.e. the
         # same silent failure by another route.
-        engine = cdc_pg_slot.build_pg_source_write_engine(
+        with cdc_pg_slot.pg_source_write_connection(
             source_config,
             SecretValue(password) if isinstance(password, str) else password,
-        )
-        try:
-            with engine.connect() as connection:
-                cdc_pg_slot.deprovision_pg_replication(
-                    connection,
-                    slot_name=slot,
-                    publication_name=publication,
-                    on_log=_source_log,
-                )
-            _source_log("replication slot + publication dropped")
-        finally:
-            engine.dispose()
+        ) as connection:
+            cdc_pg_slot.deprovision_pg_replication(
+                connection,
+                slot_name=slot,
+                publication_name=publication,
+                on_log=_source_log,
+            )
+        _source_log("replication slot + publication dropped")
         return True
     except Exception as exc:  # noqa: BLE001 - teardown is already complete; never fatal
         _failure = (

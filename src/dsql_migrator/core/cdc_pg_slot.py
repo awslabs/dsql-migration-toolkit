@@ -1,12 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The ONE audited source-write path: PostgreSQL CDC replication slot + publication.
+"""The audited PostgreSQL source-write path: the CDC replication slot + publication.
 
 Everywhere else in this tool the migration source is strictly READ-ONLY (Property 1),
 enforced by :func:`~dsql_migrator.core.introspector.install_read_only_guard` on every
-source engine. PostgreSQL CDC is the sole, deliberate exception: to hand off from Full
-Load to CDC gaplessly the tool must, ON THE SOURCE,
+source engine. There are two deliberate exceptions, each with its own unguarded
+engine: this module, and the MySQL start-point fence
+(:mod:`dsql_migrator.core.mysql_start_point_fence`, G147). For PostgreSQL CDC, to hand
+off from Full Load to CDC gaplessly the tool must, ON THE SOURCE,
 
   1. create a **publication** scoped to exactly the migrated tables (``FOR TABLE ONLY``:
      an inheritance child is never pulled in with its parent), and
@@ -19,7 +21,8 @@ publication's ``publish_via_partition_root``, and -- for a table selected after 
 load + CDC Full Load, before CDC starts (G17) -- adds that ONE table to the run's
 publication just before its copy, then takes one transaction ID to wait out the
 transactions open at that moment (:func:`take_xid_after_change`). These are the only
-writes the tool ever issues to a source, so they are confined to this module, which:
+writes the tool ever issues to a PostgreSQL source, so they are confined to this module,
+which:
 
 - builds its OWN engine that deliberately does NOT install the read-only guard and runs
   in **AUTOCOMMIT** (``pg_create_logical_replication_slot`` cannot run inside a wrapping
@@ -27,7 +30,7 @@ writes the tool ever issues to a source, so they are confined to this module, wh
   explicit path, never a bypass token on the guarded factory. (The guard could not police
   these anyway: it is first-keyword based, so ``SELECT pg_create_logical_replication_slot``
   slips through unaudited while ``CREATE PUBLICATION`` is wrongly blocked.)
-- is gated on ``source_type is SourceType.POSTGRES`` (a MySQL source never gets a write
+- is gated on ``source_type is SourceType.POSTGRES`` (a MySQL source never gets this
   engine -- MySQL uses the binlog offset-seeder),
 - issues ONLY a fixed allowlist of statements (:data:`_ALLOWED_WRITE_PREFIXES`), asserted
   before every write, so a bug can never send arbitrary SQL down the un-guarded path,
@@ -52,8 +55,9 @@ from __future__ import annotations
 
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, NamedTuple, Optional, Sequence
+from typing import Callable, Iterator, Mapping, NamedTuple, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -629,12 +633,15 @@ def build_pg_source_write_engine(
 ) -> Engine:
     """Build the dedicated, NON-read-only-guarded, AUTOCOMMIT PostgreSQL source engine.
 
-    This is the ONLY source engine in the tool without :func:`install_read_only_guard`;
-    it exists solely so this module can create/drop the replication slot + publication.
+    One of the two source engines in the tool without :func:`install_read_only_guard`
+    (the other is the MySQL start-point fence's,
+    :func:`~dsql_migrator.core.mysql_start_point_fence.build_fence_engine`, G147); it
+    exists solely so this module can create/drop the replication slot + publication.
     AUTOCOMMIT is required because ``pg_create_logical_replication_slot`` must not run
-    inside a wrapping transaction. Refuses a non-PostgreSQL source (MySQL never writes
-    the source). The password is revealed only here (Property 7), mirroring
-    ``make_source_engine_factory`` but WITHOUT the guard. ``read_timeout_seconds`` sets the
+    inside a wrapping transaction. Refuses a non-PostgreSQL source (a MySQL source never
+    gets this engine). The password is revealed only here (Property 7), mirroring the
+    read-only builder (:func:`~dsql_migrator.core.introspector.build_source_engine`) but
+    WITHOUT the guard or its session setup. ``read_timeout_seconds`` sets the
     dialect's ``statement_timeout`` (and keepalives), so a write that waits on a lock -- a
     one-table ADD behind a VACUUM or an index build (G17) -- fails instead of hanging.
     """
@@ -660,6 +667,27 @@ def build_pg_source_write_engine(
     return create_engine(
         url, **dialect.engine_kwargs(read_timeout_seconds=read_timeout_seconds)
     ).execution_options(isolation_level="AUTOCOMMIT")
+
+
+@contextmanager
+def pg_source_write_connection(
+    source_config: SourceConnectionConfig, password: Optional[SecretValue]
+) -> Iterator[object]:
+    """One connection of :func:`build_pg_source_write_engine`, its engine disposed on exit.
+
+    The build / connect / dispose around the slot and publication writes: provisioning at
+    the Full Load consistency point, the teardown drop and the Start CDC partition-root
+    repair. Whatever fails -- the build, the connect or the body -- propagates, after the
+    engine (if built) is disposed. ``BatchedTableMigrator.guard_cdc_additions`` builds its
+    engine itself, since it reports a failed build ("nothing was written") apart from a
+    failure after it.
+    """
+    engine = build_pg_source_write_engine(source_config, password)
+    try:
+        with engine.connect() as connection:
+            yield connection
+    finally:
+        engine.dispose()
 
 
 def _assert_allowed(statement: str) -> None:
@@ -2392,6 +2420,7 @@ __all__ = [
     "REPLICA_IDENTITY_UNKNOWN",
     "set_replica_identity_full",
     "build_pg_source_write_engine",
+    "pg_source_write_connection",
     "slot_exists",
     "publication_tables",
     "publication_publishes_via_partition_root",
