@@ -1,43 +1,34 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Optional CDC catch-up mode: interface/stub (Requirement 5.5, optional goal).
+"""The CDC control plane: data contracts, the pipeline orchestrator, the cdc-stack parameters.
 
-This module defines the *interface* for an opt-in, binlog-based Change Data
-Capture (CDC) catch-up mode that would run after the initial snapshot load to
-reduce cut-over lag (design.md "CDC (선택적 목표)"). Requirement 5.5 marks this
-as an **optional goal**, so per the project's product principles ("no bloat —
-only necessary features"), this module is intentionally a stub: it fixes the
-data contracts and the resume-from-watermark behavior, but does not implement a
-live binlog event loop.
+Continuous CDC (Requirement 12) runs as Kafka Connect connectors on managed MSK
+Connect: a Debezium source connector -> Amazon MSK -> the custom DSQL sink
+connector plugin -> Aurora DSQL. Those connectors are the data plane; this module
+is the tool's side of the pipeline:
 
-Resume-from-watermark contract (Property 11 / Requirement 5.5): a real CDC run
-resumes from the *exact* consistency point captured at export start by
-:mod:`dsql_migrator.core.watermark` -- the binlog coordinates
-(``binlog_file:binlog_position``) and/or the GTID set (``gtid_executed``) recorded
-on the :class:`~dsql_migrator.core.models.Watermark`. :class:`CdcResumePoint`
-makes that starting point explicit so the catch-up begins precisely where the
-snapshot ended, with no gap and no overlap.
+- the data contracts the UI, the deployer and the monitors share -- the start
+  point (:class:`CdcResumePoint`), connector status and error records, and the
+  schema-drift reading of a sink rejection (:func:`classify_schema_drift`);
+- :class:`CdcPipelineOrchestrator`, which builds the connector configs, reports
+  connector status and surfaces connector and DLQ errors into the downloadable
+  error log;
+- the cdc-stack parameter builders (:func:`build_cdc_stack_params`,
+  :func:`build_cdc_infra_params`, :func:`build_watermark_params`), the refusals
+  that stop a deploy CloudFormation or Kafka would reject, and the scaling,
+  partition and cost estimates that size the pipeline.
 
-Read-only source (Property 1): CDC reads the MySQL binary log only; it never
-writes to or alters the source. The (future) backend streams binlog events and
-applies the resulting changes to the *target* DSQL cluster, leaving the source
-untouched.
+Resume-from-watermark contract (Property 11): CDC starts from the exact
+consistency point the Full Load captured (:mod:`dsql_migrator.core.watermark`)
+-- a MySQL source's binlog ``file:position`` and/or GTID set
+(``gtid_executed``), a PostgreSQL source's WAL LSN -- recorded on the
+:class:`~dsql_migrator.core.models.Watermark`. :class:`CdcResumePoint` carries
+that point, so streaming begins where the snapshot ended, with no gap and no
+overlap.
 
-Dependency note (deliberate, "no bloat"): the design names
-``python-mysql-replication`` as the binlog reader for a real implementation.
-Because this is a behind-a-flag stub, that package is **not** added as a
-dependency and is **not** imported here -- importing this module never requires
-it. Enabling a real CDC backend in the future would install
-``python-mysql-replication`` and stream events starting from a
-:class:`CdcResumePoint`; until then, an enabled :meth:`CdcCatchUp.start` returns
-a structured :attr:`CdcStatus.NOT_IMPLEMENTED` result that carries the resume
-point it *would* have used.
-
-Result shape for the UI: :class:`CdcResult` mirrors what the design wants the UI
-to show ("caught up to <time> / lag"): a status, the resume point, an optional
-"caught up to" timestamp, and an optional lag in seconds. Only the data shape is
-provided here -- there is no live implementation behind it yet.
+Read-only source (Property 1): nothing in this module writes to or alters the
+source; the sink connector applies the changes to the target DSQL cluster.
 """
 
 from __future__ import annotations
@@ -70,31 +61,14 @@ from dsql_migrator.core.models import (
     LoadKind,
     LoadStatusView,
     SchemaDriftSummary,
-    SourceConnectionConfig,
     SourceType,
     TableDef,
     TableStatusRow,
-    TargetConnectionConfig,
     Watermark,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module boto3-free
     from dsql_migrator.core.ec2_metadata import HostLookup
-
-
-class CdcStatus(str, Enum):
-    """Outcome status of a CDC catch-up attempt.
-
-    ``DISABLED`` is returned when the opt-in flag is off (the default), so the
-    caller can treat CDC as a no-op. ``NOT_IMPLEMENTED`` is returned when CDC is
-    enabled but no binlog backend is wired in yet -- the stub state for this
-    optional goal. ``CAUGHT_UP`` is reserved for a future real implementation
-    that has applied all changes up to a target point.
-    """
-
-    DISABLED = "DISABLED"
-    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
-    CAUGHT_UP = "CAUGHT_UP"
 
 
 class CdcResumePoint(BaseModel):
@@ -200,143 +174,6 @@ class CdcResumePoint(BaseModel):
         ``@@GLOBAL.gtid_executed`` is a plain global read.
         """
         return self.binlog_file is not None and self.binlog_position is not None
-
-
-class CdcOptions(BaseModel):
-    """Opt-in configuration for the CDC catch-up mode (Requirement 5.5).
-
-    CDC is an optional goal, so it is **disabled by default** (``enabled=False``),
-    matching the opt-in pattern used elsewhere in the design. Kept intentionally
-    minimal: a real backend would add its own tuning here, but no speculative
-    settings are introduced for a stub.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = Field(
-        default=False,
-        description="Opt-in flag for binlog-based CDC catch-up; disabled by default.",
-    )
-
-
-class CdcResult(BaseModel):
-    """Structured outcome of a CDC catch-up attempt (UI/data shape only).
-
-    Carries the :attr:`status`, the :class:`CdcResumePoint` the run started from
-    (so the UI can show where catch-up resumed), and -- for a future real run --
-    a ``caught_up_to`` timestamp and ``lag_seconds`` so the UI can display
-    "caught up to <time> / lag" as the design describes. ``detail`` is a
-    human-readable, log-safe message.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    status: CdcStatus
-    resume_point: Optional[CdcResumePoint] = Field(
-        default=None,
-        description="The watermark-derived coordinates the run resumed from.",
-    )
-    caught_up_to: Optional[datetime] = Field(
-        default=None,
-        description="Point-in-time CDC has applied up to (reserved for a real run).",
-    )
-    lag_seconds: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        description="Replication lag in seconds (reserved for a real run).",
-    )
-    detail: str = Field(
-        default="",
-        description="Human-readable, log-safe status message.",
-    )
-
-
-# Documented integration note surfaced to callers when CDC is enabled but no
-# binlog backend is wired in. Kept as a constant so the message is consistent
-# across the stub result and any future log lines.
-_NOT_IMPLEMENTED_DETAIL = (
-    "CDC catch-up is enabled but not implemented in this build. A real backend "
-    "would stream MySQL binlog events with 'python-mysql-replication' (read-only "
-    "on the source, Property 1), resuming from the watermark coordinates "
-    "(GTID set or binlog file:position) and applying changes to the target."
-)
-
-_NO_COORDINATES_DETAIL = (
-    "CDC cannot resume: the export watermark has no GTID set or binlog "
-    "file:position (source binlog/GTID metadata was unavailable at export time)."
-)
-
-
-class CdcCatchUp:
-    """Interface for the optional binlog-based CDC catch-up mode (stub).
-
-    Construct with :class:`CdcOptions` plus the source and target connection
-    configs, then call :meth:`start` with the export-start
-    :class:`~dsql_migrator.core.models.Watermark`. When CDC is disabled (the
-    default), :meth:`start` is a no-op returning a :attr:`CdcStatus.DISABLED`
-    result. When enabled, it returns a structured :attr:`CdcStatus.NOT_IMPLEMENTED`
-    result documenting the intended ``python-mysql-replication`` integration and
-    the resume point it would have used (Property 11). The source is only ever
-    read (Property 1).
-    """
-
-    def __init__(
-        self,
-        options: CdcOptions,
-        *,
-        source: SourceConnectionConfig,
-        target: TargetConnectionConfig,
-    ) -> None:
-        """Create a catch-up coordinator.
-
-        ``source`` is the read-only MySQL source whose binlog would be streamed;
-        ``target`` is the DSQL cluster changes would be applied to. Neither is
-        contacted by this stub.
-        """
-        self._options = options
-        self._source = source
-        self._target = target
-
-    @property
-    def options(self) -> CdcOptions:
-        """Return the CDC options this coordinator was built with."""
-        return self._options
-
-    def start(self, watermark: Watermark) -> CdcResult:
-        """Begin CDC catch-up from the export-start ``watermark`` (stub).
-
-        Behavior:
-
-        - When :attr:`CdcOptions.enabled` is ``False`` (default): no-op, returns a
-          :attr:`CdcStatus.DISABLED` result. Nothing reads or writes anything.
-        - When enabled: derives the :class:`CdcResumePoint` from ``watermark``
-          (Property 11) and returns a :attr:`CdcStatus.NOT_IMPLEMENTED` result
-          carrying that resume point. The result documents that a real backend
-          would stream binlog events from this point using
-          ``python-mysql-replication`` (read-only source, Property 1) and apply
-          changes to the target. If the watermark lacks usable coordinates, the
-          result's ``detail`` explains that CDC could not resume.
-
-        This method never writes to the source (Property 1) and -- as a stub --
-        does not contact the source or target at all.
-        """
-        if not self._options.enabled:
-            return CdcResult(
-                status=CdcStatus.DISABLED,
-                detail="CDC catch-up is disabled (opt-in mode, Requirement 5.5).",
-            )
-
-        resume_point = CdcResumePoint.from_watermark(watermark)
-        detail = _NOT_IMPLEMENTED_DETAIL
-        if not resume_point.has_coordinates():
-            detail = f"{_NOT_IMPLEMENTED_DETAIL} {_NO_COORDINATES_DETAIL}"
-
-        return CdcResult(
-            status=CdcStatus.NOT_IMPLEMENTED,
-            resume_point=resume_point,
-            caught_up_to=watermark.snapshot_timestamp,
-            detail=detail,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -3313,11 +3150,7 @@ def cdc_stack_params_to_json(params: CdcStackParams) -> str:
 
 
 __all__ = [
-    "CdcStatus",
     "CdcResumePoint",
-    "CdcOptions",
-    "CdcResult",
-    "CdcCatchUp",
     "ConnectorState",
     "ConnectorStatus",
     "DebeziumSourceConfig",

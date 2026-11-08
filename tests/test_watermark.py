@@ -29,7 +29,6 @@ from dsql_migrator.core.watermark import (
     START_CONSISTENT_SNAPSHOT,
     WatermarkCapturer,
     capture_watermark,
-    count_source_rows,
     estimate_source_rows,
     max_pk_source,
 )
@@ -455,7 +454,7 @@ def test_watermark_round_trips_through_migration_job() -> None:
 
 
 # ---------------------------------------------------------------------------
-# count_source_rows / max_pk_source: per-table source counts + high-water PK
+# max_pk_source: per-table high-water PK
 # ---------------------------------------------------------------------------
 
 
@@ -485,13 +484,6 @@ class _ScalarConn:
                 self._pending = val
                 break
         return _FakeResult(scalar=self._pending)
-
-
-def test_count_source_rows_per_table_and_missing_is_none() -> None:
-    conn = _ScalarConn({"cdc_demo.orders": 100, "cdc_demo.items": 0},
-                       raises={"cdc_demo.gone"})
-    counts = count_source_rows(conn, ["cdc_demo.orders", "cdc_demo.items", "cdc_demo.gone"])
-    assert counts == {"cdc_demo.orders": 100, "cdc_demo.items": 0, "cdc_demo.gone": None}
 
 
 def test_max_pk_source_returns_high_water_and_skips_no_pk() -> None:

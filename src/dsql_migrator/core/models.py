@@ -1084,17 +1084,6 @@ class AssessmentReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ChunkSpec(BaseModel):
-    """A planned unit of work: a PK range of a table to migrate."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    table: str = Field(min_length=1)
-    pk_range_start: Optional[str] = None
-    pk_range_end: Optional[str] = None
-    estimated_rows: int = Field(default=0, ge=0)
-
-
 class ChunkState(BaseModel):
     """Runtime state of a single chunk, persisted for resumability."""
 
@@ -2680,7 +2669,6 @@ __all__ = [
     "AssessmentItem",
     "AssessmentReport",
     "EffortLevel",
-    "ChunkSpec",
     "ChunkState",
     "Watermark",
     "IndexBuild",

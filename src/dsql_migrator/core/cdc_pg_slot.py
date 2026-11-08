@@ -727,14 +727,6 @@ def _run_write(
     return result
 
 
-def publication_exists(connection: object, name: str) -> bool:
-    """Return whether a publication named ``name`` already exists (read-only)."""
-    row = connection.execute(  # type: ignore[attr-defined]
-        text("SELECT 1 FROM pg_publication WHERE pubname = :name"), {"name": name}
-    ).first()
-    return row is not None
-
-
 def slot_exists(connection: object, name: str) -> bool:
     """Return whether a replication slot named ``name`` already exists (read-only)."""
     row = connection.execute(  # type: ignore[attr-defined]
@@ -2400,7 +2392,6 @@ __all__ = [
     "REPLICA_IDENTITY_UNKNOWN",
     "set_replica_identity_full",
     "build_pg_source_write_engine",
-    "publication_exists",
     "slot_exists",
     "publication_tables",
     "publication_publishes_via_partition_root",

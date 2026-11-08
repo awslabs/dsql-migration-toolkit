@@ -243,13 +243,6 @@ def read_connector_log_tail(
         return ""
 
 
-# Known connector-failure signatures and the actionable guidance for each. The
-# CloudFormation event for a CREATE_FAILED connector is only a generic
-# GeneralServiceException; the real cause is in the worker log. Each entry is
-# (substring-matcher, guidance template) -- the first match wins. Matchers are
-# lowercase substring checks against the joined worker log.
-
-
 class CdcStackDeployer:
     """CloudFormation-driven cdc-stack updater (reuses existing MSK/VPC/plugins).
 

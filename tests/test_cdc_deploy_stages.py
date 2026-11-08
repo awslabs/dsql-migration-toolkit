@@ -28,13 +28,13 @@ from dsql_migrator.core.cdc_deployer import (
     CdcDeployError,
     CdcStackDiscovery,
     _MAX_STATE_READ_FAILURES,
-    _parse_unsupported_azs,
     _wait_connector_running,
     run_cdc_delete,
     run_cdc_infra_deploy,
     run_cdc_start,
     run_cdc_stop,
 )
+from dsql_migrator.core.cdc_stack_deployer import _parse_unsupported_azs
 from dsql_migrator.core.models import MigrationJob
 
 STACK = "mysql-dsql-cdc-stack"

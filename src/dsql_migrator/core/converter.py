@@ -3743,12 +3743,6 @@ _ORDERING_OPERATORS = frozenset({"<", ">", "<=", ">="})
 _ORDERING_WORDS = frozenset({"between", "greatest", "least"})
 
 
-def _orders_values(masked: str) -> bool:
-    """Whether masked SQL compares by order: ``<``, ``<=``, ``>``, ``>=``, BETWEEN,
-    GREATEST/LEAST (a trailing sign is the operand's: ``x >-1``)."""
-    return bool(_ordering_spans(masked))
-
-
 def _ordering_spans(masked: str) -> "list[tuple[int, int]]":
     """The innermost bracket group around each ordering comparison of masked SQL (the
     whole text when it is not bracketed): what the comparison's operands are in.
@@ -13649,14 +13643,6 @@ def _item_names_and_enum_cast(
                 names.update(parts)
         after_cast = False
     return sorted(names), cast
-
-
-def pg_view_remodelled_references(
-    view: ViewDef, tables: "Sequence[TableDef]"
-) -> "list[tuple[str, str, str, str]]":
-    """The re-typed columns ``view`` itself reads from ``tables`` (no other view in sight;
-    :func:`pg_views_remodelling` follows views over views). Pure."""
-    return list(pg_views_remodelling([view], tables)[view.name].references)
 
 
 _IDENTIFIER_PART = r'"(?:[^"]|"")+"|[A-Za-z_][\w$]*'

@@ -110,7 +110,7 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# The MySQL source dialect: default for the exact-count / max-PK helpers below, whose
+# The MySQL source dialect: default for the max-PK helper below, whose
 # identifier quoting now comes from the dialect (single source of truth) so a non-MySQL
 # source quotes its own way. (The information_schema row-estimate query stays
 # MySQL-specific for now; its PostgreSQL pg_class form is a later phase.)
@@ -228,42 +228,6 @@ def estimate_source_rows(
     comparison when one is explicitly needed).
     """
     return dialect.estimate_row_counts(connection, tables)
-
-
-def _count_table_rows(
-    connection: _Connection, table: str, dialect: "SourceDialect" = _MYSQL_DIALECT
-) -> int:
-    """Return exact ``COUNT(*)`` for ``table`` (full scan; used only when an
-    exact count is explicitly required, not during watermark capture)."""
-    statement = text(f"SELECT COUNT(*) FROM {dialect.text_table(table)}")
-    result = connection.execute(statement)
-    value = result.scalar()
-    return int(value) if value is not None else 0
-
-
-def count_source_rows(
-    connection: _Connection,
-    tables: list[str],
-    dialect: "SourceDialect" = _MYSQL_DIALECT,
-) -> dict[str, Optional[int]]:
-    """Return an exact ``COUNT(*)`` per source table over one connection (read-only).
-
-    NOT used by the per-table migration-status view: that view reads the scan-free
-    :func:`estimate_source_rows` instead, because this scans every table and the
-    "Refresh counts" button runs against a live production source (exact counts belong
-    to Validation). Kept for callers that explicitly need an exact source count. A
-    table that errors (missing / no access) maps to ``None`` (unknown) rather than 0, so
-    it is distinguishable from a genuinely empty table.
-    """
-    counts: dict[str, Optional[int]] = {}
-    for table in tables:
-        try:
-            counts[table] = _count_table_rows(connection, table, dialect)
-        except ReadOnlySourceError:
-            raise
-        except Exception:  # noqa: BLE001 - missing table/error -> unknown
-            counts[table] = None
-    return counts
 
 
 def max_pk_source(
@@ -620,7 +584,6 @@ __all__ = [
     "capture_watermark",
     "read_gtid_mode",
     "read_start_point_fingerprints",
-    "count_source_rows",
     "estimate_source_rows",
     "max_pk_source",
     "list_binary_logs",

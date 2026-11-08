@@ -1087,11 +1087,6 @@ def catalog_drift_waived_tables(
     }
 
 
-def cdc_catalog_drift_forced_tables(migration_state: object) -> "set[str]":
-    """Every table with a source-schema finding (Validation compares it by CHECKSUM)."""
-    return set(_findings(migration_state))
-
-
 # ---------------------------------------------------------------------------
 # Copy (value-free: table / column names, catalog type text, times, error classes)
 # ---------------------------------------------------------------------------

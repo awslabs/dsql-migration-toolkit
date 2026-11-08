@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
@@ -93,8 +93,6 @@ from dsql_migrator.core.models import (
 # so the orchestration below and the existing test/ui imports
 # (`from dsql_migrator.core.cdc_deployer import CdcStackDeployer`) resolve unchanged.
 from dsql_migrator.core.cdc_stack_deployer import (  # noqa: F401
-    _UNSUPPORTED_AZ_RE,
-    _parse_unsupported_azs,
     CdcDeployError,
     CdcStackDeployer,
     CdcStackDiscovery,
@@ -191,46 +189,12 @@ def _is_terminal_read_error(exc: Exception) -> bool:
     return any(marker in text for marker in _TERMINAL_READ_ERROR_MARKERS)
 
 
-@dataclass
-class CdcDeployLog:
-    """An append-only, timestamped progress log for one deploy run.
-
-    Lives on the session state (transient); the work function appends one line
-    per meaningful step / stack event and the UI renders them logging-style.
-    """
-
-    lines: list[tuple[datetime, str]] = field(default_factory=list)
-
-    def append(self, when: datetime, message: str) -> None:
-        self.lines.append((when, message))
-
-
 # -- Stage progression on a JobManager job ----------------------------------
 
 
 def _seed_stages(job: MigrationJob, stages: tuple[tuple[str, str], ...]) -> None:
     """Seed one PENDING chunk per stage of an operation (chunk_id = stage name)."""
     job.chunks = [ChunkState(chunk_id=name) for name, _ in stages]
-
-
-def seed_infra_stages(job: MigrationJob) -> None:
-    """Seed PENDING chunks for the Deploy-infra operation."""
-    _seed_stages(job, CDC_INFRA_STAGES)
-
-
-def seed_start_stages(job: MigrationJob) -> None:
-    """Seed PENDING chunks for the Start-CDC operation."""
-    _seed_stages(job, CDC_START_STAGES)
-
-
-def seed_stop_stages(job: MigrationJob) -> None:
-    """Seed PENDING chunks for the Stop-CDC operation."""
-    _seed_stages(job, CDC_STOP_STAGES)
-
-
-def seed_delete_stages(job: MigrationJob) -> None:
-    """Seed PENDING chunks for the Delete-infra operation."""
-    _seed_stages(job, CDC_DELETE_STAGES)
 
 
 def _set_stage(job: MigrationJob, stage: str, status: str) -> None:
@@ -1492,11 +1456,10 @@ def _patch_plugin_params(params: CdcInfraParams, upload) -> CdcInfraParams:
     # The source plugin key is engine-specific: a MySQL param set carries
     # DebeziumPluginS3Key, a PostgreSQL one carries DebeziumPostgresPluginS3Key.
     # Fill whichever the set already carries; never cross-add the other engine's key
-    # (a MySQL stack must not gain a PG plugin param and vice versa). getattr keeps
-    # this tolerant of an older PluginUploadResult without the PG field.
+    # (a MySQL stack must not gain a PG plugin param and vice versa).
     engine_keys = {
         "DebeziumPluginS3Key": upload.debezium_key,
-        "DebeziumPostgresPluginS3Key": getattr(upload, "debezium_pg_key", ""),
+        "DebeziumPostgresPluginS3Key": upload.debezium_pg_key,
     }
     new_filled = [
         (k, engine_keys[k] if k in engine_keys else updates.get(k, v))
@@ -3022,7 +2985,6 @@ def _deadline_passed(deadline: float) -> bool:
 __all__ = [
     "CdcDeployError",
     "CdcStackDiscovery",
-    "CdcDeployLog",
     "SCHEMA_HISTORY_MARK",
     "DEFINITION_SNAPSHOT_MARK",
     "ConnectorLogDiagnosis",
@@ -3037,10 +2999,6 @@ __all__ = [
     "CDC_STOP_STAGES",
     "CDC_DELETE_STAGES",
     # seed helpers
-    "seed_infra_stages",
-    "seed_start_stages",
-    "seed_stop_stages",
-    "seed_delete_stages",
     # lifecycle operations (JobManager work functions)
     "run_cdc_infra_deploy",
     "run_cdc_start",

@@ -82,7 +82,7 @@ from dsql_migrator.core.validation_sql import (
     build_mysql_pk_next_page_sql,
     build_mysql_pk_token_sql,
 )
-from dsql_migrator.core.watermark import count_source_rows, max_pk_source
+from dsql_migrator.core.watermark import max_pk_source
 from dsql_migrator.ui.prerequisite_probes import SessionSourceProbe
 from tests.test_cdc_pg_slot import _FakeConn
 from tests.test_g138_composite_validation import PgDouble, _Result, _Table
@@ -492,7 +492,9 @@ def _reader_reads(table: TableDef, dialect: Any) -> tuple:
                 for r in keyset_stream(source, table, batch_size=2, pk_lower=lo, pk_upper=hi,
                                        dialect=dialect)
             ]
-            counted = count_source_rows(source, [table.name], dialect)[table.name]
+            counted = source.execute(
+                text(f"SELECT COUNT(*) FROM {dialect.text_table(table.name)}")
+            ).scalar()
             high = max_pk_source(source, {table.name: table.primary_key[0]}, dialect)[table.name]
     finally:
         engine.dispose()
