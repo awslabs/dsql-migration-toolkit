@@ -280,6 +280,8 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #    unless the cdc-stack passes metrics.stack. Adds the aws-sdk cloudwatch dep to the
 #    shaded jar (~11.5->13 MiB) and requires cloudwatch:PutMetricData on the connector
 #    execution role. Sink-jar + connector config + connector-role IAM change.
+#    (NetRowsApplied no longer exists: v22 replaced it with InsertsApplied /
+#    UpdatesApplied / DeletesApplied under the same namespace, dimensions and grant.)
 # v17 makes the sink survive a transient DSQL connectivity blip instead of dying.
 #    On a transient failure (OCC budget exhausted, or a connection torn down by
 #    DSQL's 1h idle close / IAM-token expiry / MSK Connect worker recycle),

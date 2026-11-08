@@ -1352,7 +1352,8 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # The sink emits the per-table NetRowsApplied monitor metric.
+              # The sink emits the per-table CDC monitor metrics (InsertsApplied /
+              # UpdatesApplied / DeletesApplied and ReplicationLagMs).
               # cloudwatch:PutMetricData has no resource-level scoping (Resource must
               # be "*"); a namespace condition restricts it to the tool's own metrics.
               - Sid: PutCdcMetrics
@@ -2456,9 +2457,10 @@ Resources:
         # DSQL constraint: <=3,000 rows per transaction.
         batch.size:
           Fn::Sub: "${SinkBatchMaxRows}"
-        # Per-table net-rows monitor metric (CloudWatch, best-effort): the sink emits
-        # NetRowsApplied per table under this Stack dimension so the UI shows CDC
-        # net-rows WITHOUT COUNT(*)-scanning the source. The stack name is the Stack
+        # Per-table CDC monitor metrics (CloudWatch, best-effort): the sink emits
+        # InsertsApplied / UpdatesApplied / DeletesApplied and ReplicationLagMs per
+        # table under this Stack dimension so the UI shows CDC's applied changes and
+        # lag WITHOUT COUNT(*)-scanning the source. The stack name is the Stack
         # dimension value the UI queries by; blank would disable emission.
         metrics.stack:
           Ref: AWS::StackName
@@ -2599,9 +2601,10 @@ Resources:
         # DSQL constraint: <=3,000 rows per transaction.
         batch.size:
           Fn::Sub: "${SinkBatchMaxRows}"
-        # Per-table net-rows monitor metric (CloudWatch, best-effort): the sink emits
-        # NetRowsApplied per table under this Stack dimension so the UI shows CDC
-        # net-rows WITHOUT COUNT(*)-scanning the source. The stack name is the Stack
+        # Per-table CDC monitor metrics (CloudWatch, best-effort): the sink emits
+        # InsertsApplied / UpdatesApplied / DeletesApplied and ReplicationLagMs per
+        # table under this Stack dimension so the UI shows CDC's applied changes and
+        # lag WITHOUT COUNT(*)-scanning the source. The stack name is the Stack
         # dimension value the UI queries by; blank would disable emission.
         metrics.stack:
           Ref: AWS::StackName

@@ -580,7 +580,8 @@ Resources:
               # Read the pipeline's CloudWatch metrics for the live health panel:
               # the built-in AWS/KafkaConnect throughput/task metrics
               # (SinkRecordSendRate, SourceRecordPollRate, Running/ErroredTaskCount)
-              # AND the sink's per-table net-rows custom metric. ListMetrics discovers
+              # AND the sink's per-table custom metrics (InsertsApplied /
+              # UpdatesApplied / DeletesApplied, ReplicationLagMs). ListMetrics discovers
               # the sink's actual per-table dimension values (the sink emits the Table
               # dimension schema-qualified, e.g. db.table) so the monitor matches them
               # to the tool's table names regardless of single-db vs cluster naming.
