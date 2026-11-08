@@ -275,6 +275,18 @@ class DataMigrationInputs:
     # (dropped from worker inputs: it can name every converted table).
     cdc_baseline_tables: tuple[str, ...] = ()
 
+    def replaces(self, name: str) -> bool:
+        """Does this run DROP and recreate ``name`` before loading it?
+
+        Only a table the user confirmed to load fresh (``replace_tables``), and never
+        while CDC streams into the target (``cdc_coexisting``): a DROP+recreate would
+        race the live sink, so replace/DROP is disabled regardless of ``replace_tables``.
+        The one spelling of that rule for every load path (process table and shard
+        workers, the overlay pre-pass, the parallel runner and ``migrate_table``).
+        ``migrate_table`` may still promote a table to the replace path afterwards
+        (a changed target key on an empty target)."""
+        return not self.cdc_coexisting and name in self.replace_tables
+
 
 @dataclass(frozen=True)
 class TableLoadResult:
@@ -2216,10 +2228,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
         # Use plain INSERT (NONE) when the table was just DROP+recreated in the
         # parent (empty target, no conflicts possible, faster). Use SKIP_EXISTING
         # for append/CDC-coexisting loads (existing data, idempotent).
-        is_replace = (
-            not args.inputs.cdc_coexisting
-            and table.name in args.inputs.replace_tables
-        )
+        is_replace = args.inputs.replaces(table.name)
         conflict_mode = OnConflictMode.NONE if is_replace else OnConflictMode.SKIP_EXISTING
         # The TARGET's primary key, from the applied DDL -- the same conflict key
         # ``migrate_table`` resolves. Sharding is chosen off the SOURCE PK (a single
@@ -3487,8 +3496,7 @@ class _OverlayPrepass:
         return name not in self._withheld
 
     def _is_replace(self, name: str) -> bool:
-        inputs = self._m._inputs
-        return not inputs.cdc_coexisting and name in inputs.replace_tables
+        return self._m._inputs.replaces(name)
 
     def before_planning(self) -> None:
         inputs = self._m._inputs
@@ -4051,6 +4059,8 @@ def _thread_load_recreated(
     row (``migrate_table``), so one that finished was (G137: its earlier copy is gone). A
     failed or stopped one may not have been, so it keeps its record."""
     inputs = getattr(migrator, "_inputs", None)
+    # DataMigrationInputs.replaces, spelled with getattr: the thread path's test doubles
+    # carry only the two fields (or no inputs at all).
     return (
         outcome in (_TableLoadOutcome.LOADED, _TableLoadOutcome.QUARANTINED)
         and inputs is not None
@@ -5068,10 +5078,7 @@ def _migrate_tables_in_parallel(
             if table.name in withheld:
                 work_units.append(_Unit("table", table))  # skipped at submission
                 continue
-            table_is_replace = (
-                not _coexisting
-                and table.name in migrator._inputs.replace_tables
-            )
+            table_is_replace = migrator._inputs.replaces(table.name)
             lead = shardable_leading_int_pk(table, _shard_dialect)
             may_shard = _table_may_shard(
                 cdc_coexisting=_coexisting,
@@ -5257,10 +5264,7 @@ def _migrate_tables_in_parallel(
                 tbl = wu[1]
                 if tbl.name in recreated_names or tbl.name in withheld:
                     continue
-                is_replace = (
-                    not migrator._inputs.cdc_coexisting
-                    and tbl.name in migrator._inputs.replace_tables
-                )
+                is_replace = migrator._inputs.replaces(tbl.name)
                 if is_replace:
                     if prepass is not None and handle.cancelled:
                         break  # the rest stay PENDING and are settled as unfinished
@@ -9369,16 +9373,16 @@ class BatchedTableMigrator:
         #
         # ``target_is_final`` decides WHICH signal is authoritative -- see
         # resolve_generated_columns. Here the target is final when this run recreates it
-        # from the applied DDL (is_replace, computed below from the same inputs) or the
-        # parent already did (pre_recreated).
-        table_is_replace_now = (
-            not self._inputs.cdc_coexisting
-            and table.name in self._inputs.replace_tables
-        )
+        # from the applied DDL (is_replace) or the parent already did (pre_recreated).
+        # When CDC is streaming into the target, a DROP+recreate would race the live
+        # sink, so replace/DROP is disabled regardless of replace_tables
+        # (DataMigrationInputs.replaces). Read once, here: the empty-target promotion
+        # below may turn it on, which the generated-column decision does not see.
+        is_replace = self._inputs.replaces(table.name)
         generated_columns = self.resolve_generated_columns(
             original_table,
             applied,
-            target_is_final=(table_is_replace_now or pre_recreated),
+            target_is_final=(is_replace or pre_recreated),
         )
         if generated_columns is None:
             raise FullLoadIncompleteError(
@@ -9425,12 +9429,6 @@ class BatchedTableMigrator:
         # secondary-index DDLs are (re)created after the load -- by this call, or with
         # ``defer_indexes`` by the run's index pass once every table has loaded (P4a).
         index_ddls: Optional[list[str]] = None
-        # When CDC is streaming into the target, a DROP+recreate would race the
-        # live sink, so replace/DROP is disabled regardless of replace_tables.
-        is_replace = (
-            not self._inputs.cdc_coexisting
-            and table.name in self._inputs.replace_tables
-        )
         # A CHANGED target PK on an EMPTY target is promoted to the replace path (see
         # _needs_empty_target_promotion; the probes stay lazy).
         # A process worker never promotes an overlay table: the parent decided that (and
