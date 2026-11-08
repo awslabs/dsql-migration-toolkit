@@ -1669,11 +1669,6 @@ class PrerequisiteChecker:
                     results.extend(
                         self._inheritance_rows([effective[t.name] for t in tables])
                     )
-            # The MySQL rows stay present for a PostgreSQL source too, but as an ENGINE
-            # skip rather than a mode skip: D-1 established that a check id present in
-            # one mode and absent in another reads as an oversight, so PG CDC keeps them
-            # visible -- and Full Load must match, or the id would vanish going the other
-            # way. Only the reason differs by engine.
             if not is_postgres:
                 # MySQL only: these preview what switching to CDC will additionally
                 # require. A PostgreSQL source gets its OWN six previewed above instead --
