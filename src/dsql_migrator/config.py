@@ -152,17 +152,6 @@ class AppConfig(BaseModel):
             "(local dev). Config key: DSQL_MIGRATOR_SESSION_STATE_BUCKET."
         ),
     )
-    staging_bucket: Optional[str] = Field(
-        default=None,
-        description=(
-            "Optional S3 bucket for Full Load staging. When set, large tables are "
-            "exported to this bucket via a streaming multipart upload and loaded "
-            "from the s3:// URI, so a whole-table CSV never lands on the "
-            "container's ephemeral disk. When None, a bounded local temp CSV is "
-            "used (local dev / small tables only). Config key: "
-            "DSQL_MIGRATOR_STAGING_BUCKET."
-        ),
-    )
     cdc_deploy_role_arn: Optional[str] = Field(
         default=None,
         description=(
@@ -500,8 +489,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> AppConfig:
         values["session_state_path"] = session_state_path
     if (session_state_bucket := _read(source, "SESSION_STATE_BUCKET")) is not None:
         values["session_state_bucket"] = session_state_bucket
-    if (staging_bucket := _read(source, "STAGING_BUCKET")) is not None:
-        values["staging_bucket"] = staging_bucket
     if (cdc_deploy_role_arn := _read(source, "CDC_DEPLOY_ROLE_ARN")) is not None:
         values["cdc_deploy_role_arn"] = cdc_deploy_role_arn
     if (cdc_secret_kms := _read(source, "CDC_SECRET_KMS_KEY_ID")) is not None:

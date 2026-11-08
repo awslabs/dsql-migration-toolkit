@@ -340,7 +340,6 @@ Debezium은 MSK Connect *위에서* 실행되는 오픈소스 소프트웨어입
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 구조화된 활동 로그(이벤트당 UTC 타임스탬프 JSON 한 줄); UI에서 다운로드, 크기 제한·회전(~20 MB × 백업 4개). |
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | 세션별 비밀 아닌 워크벤치 상태 — 재연결 브라우저가 이어서 작업. `DSQL_MIGRATOR_STORAGE_SECRET`과 함께 사용. 로컬 디스크 — Fargate 배포는 아래 durable S3 스토어를 대신 사용. |
 | `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(미설정)_ | 세션 스냅샷용 durable S3 스토어 — 인프로세스 재시작뿐 아니라 Fargate 태스크 교체(재배포)까지 재개가 유지됨. Fargate 배포가 관리형 플러그인 버킷으로 자동 설정(설정 불필요); 로컬은 미설정 시 위 SQLite 경로 사용. |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(미설정)_ | 효과 없음. Full Load는 소스의 행을 배치 `INSERT`로 Aurora DSQL에 바로 스트리밍하며, S3나 로컬 파일에 스테이징하지 않습니다. |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | 동시에 로드하는 테이블, 또는 큰 테이블의 부분 수(각각 worker 프로세스 하나). 큰 실행에서는 태스크의 vCPU 수(최대 16)로 설정. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | 테이블 또는 부분당 in-flight `INSERT … ON CONFLICT` 배치의 최대 수(그 안에서 읽는 키 범위당 최대 2개, 이 값이 더 작지 않으면 최소 4개), 실행당 최대 128개: Aurora DSQL 테이블의 키 범위 하나는 동시 진행 배치 수와 관계없이 약 20,000 rows/s를 쓰므로, 배치를 늘려도 커밋 지연과 Aurora DSQL 컴퓨트 비용만 늘어남. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | 배치 쓰기당 행 수, DSQL의 트랜잭션당 3000행 한도로 하드캡. |

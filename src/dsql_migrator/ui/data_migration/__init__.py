@@ -348,7 +348,6 @@ def build_data_migration_screen(
     migration_store: DataMigrationStore,
     conv_store: SchemaConversionStore,
     migrator_factory: MigratorFactory = default_migrator_factory,
-    staging_bucket: Optional[str] = None,
     cdc_deploy_role_arn: Optional[str] = None,
     cdc_secret_kms_key_id: Optional[str] = None,
     validation_store: Optional[object] = None,
@@ -796,7 +795,6 @@ def build_data_migration_screen(
             target_config=target_config,
             inventory=inventory,
             aws_profile=session.aws_profile,
-            staging_bucket=staging_bucket,
             # The run's replace set; consumes the Start dialog's confirmed forced set.
             replace_tables=_run_replace,
             # Only suppress DROP+recreate when CDC is ACTIVELY STREAMING into the
@@ -2177,7 +2175,6 @@ def build_data_migration_screen(
                     target_config=target_config,
                     inventory=inventory,
                     aws_profile=session.aws_profile,
-                    staging_bucket=staging_bucket,
                     replace_tables=retry_replace,
                     cdc_coexisting=retry_cdc_coexisting,
                     is_cdc_migration=migration_state.migration_type

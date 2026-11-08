@@ -624,7 +624,6 @@ def build_page(
         eval_store=EVALUATION_STORE,
         migration_store=DATA_MIGRATION_STORE,
         conv_store=SCHEMA_CONVERSION_STORE,
-        staging_bucket=config.staging_bucket,
         cdc_deploy_role_arn=config.cdc_deploy_role_arn,
         cdc_secret_kms_key_id=config.cdc_secret_kms_key_id,
         validation_store=VALIDATION_STORE,

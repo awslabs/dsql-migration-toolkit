@@ -159,11 +159,6 @@ class DataMigrationInputs:
     # Optional global AWS profile, threaded into the target DSQL connection so
     # the load shares the single credential context (Requirements 9.5/9.7).
     aws_profile: Optional[str] = None
-    # Unused by the in-process streaming importer (which never materializes a
-    # whole table to disk or S3); retained only as inert configuration carried
-    # from AppConfig.
-    staging_bucket: Optional[str] = None
-    staging_prefix: str = "mysql-dsql-migrator/full-load"
     # Tables (qualified names) the user confirmed to load fresh: their target is
     # DROPped and recreated from converted DDL before loading (DSQL has no
     # TRUNCATE). Empty by default, so a normal load never drops anything.
