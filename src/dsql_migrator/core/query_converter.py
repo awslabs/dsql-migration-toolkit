@@ -58,14 +58,14 @@ from sqlglot import exp
 from sqlglot.tokens import TokenType
 from pydantic import BaseModel, ConfigDict, Field
 
-from dsql_migrator.core.converter import (
+from dsql_migrator.core.models import Classification, SourceType
+from dsql_migrator.core.mysql_view_sql import (
     _COMMA_JOIN,
     MYSQL_EXPRESSION_DIALECT,
     inline_having_aliases,
     rewrite_mysql_expressions,
     unquote_json_extracts,
 )
-from dsql_migrator.core.models import Classification, SourceType
 
 _POSTGRES = "postgres"
 
@@ -2203,7 +2203,7 @@ def _explain_warning(tree: exp.Expression) -> "Optional[QueryWarning]":
 def table_column_names(tables: "Sequence") -> "tuple[tuple[str, tuple[str, ...]], ...]":
     """``((table, (column, ...)), ...)``: the Evaluation inventory's tables' columns as the
     source spells them -- Schema Conversion keeps each so, quoted, so they are Aurora DSQL's
-    names -- where :func:`~dsql_migrator.core.converter.table_type_index` lower-cases them."""
+    names -- where :func:`~dsql_migrator.core.mysql_view_sql.table_type_index` lower-cases them."""
     return tuple(
         (table.name, tuple(column.name for column in table.columns)) for table in tables or ()
     )
