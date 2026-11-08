@@ -1,12 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export source table rows to files via read-only PK keyset streaming.
+"""Read source table rows for the Full Load via read-only PK keyset streaming.
 
 This module implements the export half of the data migrator (design.md section
 "Data Migration Design" -> "Export", Requirement 5.1 / Property 1). It streams a
-source MySQL table to an output file (CSV today; a pluggable :class:`RowWriter`
-keeps other formats orthogonal) while guaranteeing the source is only ever read.
+source table's rows, converted for the target, to the in-process importer while
+guaranteeing the source is only ever read.
 
 Pipeline for one table:
 
@@ -35,35 +35,28 @@ Pipeline for one table:
    divergent mapping table: the target DSQL type decides the value transform
    (``TINYINT(1)`` -> boolean ``0/1`` -> ``False/True``; ``DATETIME`` -> UTC
    ``timestamp``; ``BLOB`` -> ``bytea`` bytes; ``ENUM``/``SET`` -> text).
-4. Streaming output: rows are written as they stream, never accumulated.
+4. Streaming hand-off: :meth:`TableExporter.stream_converted_rows` (and
+   :meth:`TableExporter.stream_converted_ranges`) yield the converted rows as they
+   stream, one page at a time, never accumulated; the in-process importer applies
+   them as batched ``INSERT``s, with no file staging.
 
-Output formats and sinks are orthogonal. The :class:`RowWriter` abstraction is
-the format boundary; :class:`CsvRowWriter` implements CSV (stdlib ``csv``, no
-extra dependency) targeting a text stream (e.g. a local file). The live import
-path does not stage rows to a file at all -- it converts and applies them in
-process via :meth:`TableExporter.stream_converted_rows` -- so CSV output is a
-utility, not the migration hot path. A Parquet writer could be added as another
-:class:`RowWriter` without touching the streaming/conversion core.
-
-Dependencies (engine, output stream) are injectable -- mirroring
+Dependencies (the engine factory) are injectable -- mirroring
 :class:`~dsql_migrator.core.introspector.SourceIntrospector` and the watermark
 capturer -- so unit tests never touch a real MySQL.
 """
 
 from __future__ import annotations
 
-import csv
 import logging
 import math
 import threading
-from abc import ABC, abstractmethod
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from functools import partial
 from operator import itemgetter
 from time import monotonic as _wall_monotonic, sleep as _wall_sleep
 from typing import (
-    Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence, TextIO,
+    Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence,
 )
 
 from sqlalchemy import text
@@ -308,10 +301,6 @@ class ValueConverter:
     - ``bytea``: Python ``bytes`` (MySQL ``BLOB`` payload preserved),
     - ``timestamp``: tz-aware UTC :class:`datetime` (``DATETIME`` normalized),
     - everything else: the value unchanged.
-
-    Serialization to a concrete file format (e.g. CSV text) is the
-    :class:`RowWriter`'s responsibility, keeping type semantics and output format
-    separate.
     """
 
     def __init__(
@@ -744,102 +733,6 @@ class ValueFitGuard:
 
 
 # ---------------------------------------------------------------------------
-# Output: pluggable row writers (format boundary)
-# ---------------------------------------------------------------------------
-
-
-def _csv_cell(value: object) -> str:
-    """Serialize a converted value into a DSQL-loadable CSV text cell.
-
-    ``None`` becomes an empty field, booleans become ``true``/``false``, bytes
-    become PostgreSQL ``bytea`` hex (``\\x...``), and datetimes become ISO 8601.
-    Everything else uses its string form; the ``csv`` module handles quoting.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return "\\x" + bytes(value).hex()
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
-
-
-class RowWriter(ABC):
-    """A streaming, single-file row writer; subclasses implement a format.
-
-    The exporter calls :meth:`write_header` once, then :meth:`write_row` per row
-    as rows stream from the source, then :meth:`close`. This interface is the
-    seam where additional formats (e.g. Parquet) or sinks plug in without
-    changing the streaming/conversion core.
-    """
-
-    @abstractmethod
-    def write_header(self, columns: list[str]) -> None:
-        """Write the column header (column order for subsequent rows)."""
-
-    @abstractmethod
-    def write_row(self, row: Mapping[str, object]) -> None:
-        """Write one already-converted row."""
-
-    @abstractmethod
-    def close(self) -> None:
-        """Flush and finalize output (e.g. close the underlying file)."""
-
-
-class CsvRowWriter(RowWriter):
-    """Writes rows as CSV to a text stream (e.g. a local file).
-
-    Rows are emitted in the header's column order. The writer optionally owns the
-    underlying stream (closing it on :meth:`close`) and optionally runs a
-    finalizer on close.
-    """
-
-    def __init__(
-        self,
-        stream: TextIO,
-        *,
-        owns_stream: bool = False,
-        on_close: Optional[Callable[[], None]] = None,
-    ) -> None:
-        """Create a CSV writer over ``stream``.
-
-        ``owns_stream`` closes ``stream`` on :meth:`close`; ``on_close`` runs an
-        extra finalizer (after flushing, before closing the stream).
-        """
-        self._stream = stream
-        self._writer = csv.writer(stream)
-        self._owns_stream = owns_stream
-        self._on_close = on_close
-        self._columns: list[str] = []
-        self._closed = False
-
-    def write_header(self, columns: list[str]) -> None:
-        self._columns = list(columns)
-        self._writer.writerow(self._columns)
-
-    def write_row(self, row: Mapping[str, object]) -> None:
-        self._writer.writerow([_csv_cell(row.get(name)) for name in self._columns])
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._stream.flush()
-        if self._on_close is not None:
-            self._on_close()
-        if self._owns_stream:
-            self._stream.close()
-
-    @classmethod
-    def for_local_path(cls, path: str) -> "CsvRowWriter":
-        """Create a CSV writer that writes to (and owns) a local file at ``path``."""
-        stream = open(path, "w", newline="", encoding="utf-8")  # noqa: SIM115
-        return cls(stream, owns_stream=True)
-
-
-# ---------------------------------------------------------------------------
 # Keyset streaming (read-only)
 # ---------------------------------------------------------------------------
 
@@ -849,16 +742,6 @@ class CsvRowWriter(RowWriter):
 # source of truth for the source-engine SQL and lets a non-MySQL source supply its
 # own quoting/types later without touching these call sites.
 _MYSQL_DIALECT = MySQLSourceDialect()
-
-
-def _quote_mysql_identifier(name: str) -> str:
-    """Quote a MySQL identifier with backticks (delegates to the MySQL dialect)."""
-    return _MYSQL_DIALECT.quote_identifier(name)
-
-
-def _quote_mysql_table(name: str) -> str:
-    """Quote a possibly schema-qualified MySQL table name (delegates to the dialect)."""
-    return _MYSQL_DIALECT.quote_table(name)
 
 
 def _primary_key_columns(table: TableDef) -> list[str]:
@@ -1665,7 +1548,7 @@ def keyset_pages(
 
 
 class TableExporter:
-    """Exports a source table to a file via read-only PK keyset streaming.
+    """Streams a source table's converted rows via read-only PK keyset streaming.
 
     The engine factory is injectable (like
     :class:`~dsql_migrator.core.introspector.SourceIntrospector`) so tests can
@@ -1690,41 +1573,6 @@ class TableExporter:
         self._engine_factory = engine_factory or _default_engine_factory
         self._batch_size = batch_size
         self._max_source_threads_running = max_source_threads_running
-
-    def export_table(
-        self,
-        conn: SourceConnectionConfig,
-        table: TableDef,
-        writer: RowWriter,
-        *,
-        target_types: Optional[Mapping[str, str]] = None,
-    ) -> int:
-        """Stream ``table`` to ``writer`` from a consistent read-only snapshot.
-
-        Opens the source, runs the keyset stream inside ``START TRANSACTION WITH
-        CONSISTENT SNAPSHOT`` in autocommit mode (so the explicit transaction
-        controls the snapshot, matching watermark capture), converts each row's
-        values with :class:`ValueConverter`, and writes them as they stream
-        (Requirement 5.1 / Property 1). The caller owns ``writer`` and is
-        responsible for closing it. Returns the number of rows exported.
-        """
-        dialect = dialect_for(conn.source_type)
-        engine = self._engine_factory(conn)
-        try:
-            with engine.connect() as connection:
-                snapshot = connection.execution_options(
-                    isolation_level="AUTOCOMMIT", stream_results=True
-                )
-                return export_rows(
-                    snapshot,
-                    table,
-                    writer,
-                    batch_size=self._batch_size,
-                    target_types=target_types,
-                    dialect=dialect,
-                )
-        finally:
-            engine.dispose()
 
     def plan_pk_shard_ranges(
         self,
@@ -1797,19 +1645,6 @@ class TableExporter:
         finally:
             engine.dispose()
 
-    def export_table_to_csv_path(
-        self,
-        conn: SourceConnectionConfig,
-        table: TableDef,
-        path: str,
-    ) -> int:
-        """Export ``table`` to a local CSV file at ``path`` (manages the writer)."""
-        writer = CsvRowWriter.for_local_path(path)
-        try:
-            return self.export_table(conn, table, writer)
-        finally:
-            writer.close()
-
     def stream_converted_rows(
         self,
         conn: SourceConnectionConfig,
@@ -1829,11 +1664,10 @@ class TableExporter:
         """Yield target-ready (converted) rows from a read-only consistent snapshot.
 
         The in-process importer pulls these straight into batched ``INSERT``s with
-        no CSV/S3 staging. Mirrors :meth:`export_table` -- one ``START
-        TRANSACTION WITH CONSISTENT SNAPSHOT`` keyset stream with a per-row
-        :class:`ValueConverter` -- but is pull-based: rows are produced lazily so
-        only one page is held at a time (Requirement 5.1), and the source is only
-        ever read (Property 1). The snapshot transaction is held open for the
+        no file staging: one ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` keyset
+        stream with a per-row :class:`ValueConverter`, pull-based -- rows are produced
+        lazily so only one page is held at a time (Requirement 5.1), and the source is
+        only ever read (Property 1). The snapshot transaction is held open for the
         table's read and committed when the generator is exhausted or closed.
 
         ``should_cancel`` (optional) is forwarded to :func:`keyset_stream`, which
@@ -2125,59 +1959,14 @@ def _converted_page(
         turn.reader = None
 
 
-def export_rows(
-    connection: _Connection,
-    table: TableDef,
-    writer: RowWriter,
-    *,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    target_types: Optional[Mapping[str, str]] = None,
-    dialect: "SourceDialect" = _MYSQL_DIALECT,
-) -> int:
-    """Stream-convert-write ``table`` rows on an open connection (read-only).
-
-    Wraps the keyset stream in a consistent-snapshot transaction, writes the
-    header, then converts and writes each row as it arrives. Returns the row
-    count. The transaction is committed even if writing fails; the caller owns
-    the ``writer`` lifecycle. ``dialect`` (default MySQL) supplies the snapshot SQL,
-    the per-row value converter, and the keyset quoting.
-    """
-    value_converter = dialect.value_converter(table, target_types=target_types)
-    column_names = [column.name for column in table.columns]
-
-    connection.execute(
-        text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
-    )
-    rows_exported = 0
-    try:
-        writer.write_header(column_names)
-        for row in keyset_stream(
-            connection, table, batch_size=batch_size, dialect=dialect,
-            from_only=_reads_own_rows_only(connection, table, dialect),
-            converter=value_converter,
-        ):
-            writer.write_row(row)
-            rows_exported += 1
-    except BaseException:
-        _end_snapshot_after_failure(connection)
-        raise
-    connection.execute(
-        text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
-    )
-    return rows_exported
-
-
 __all__ = [
     "DEFAULT_BATCH_SIZE",
     "ExportError",
     "ExportCancelled",
     "UnsupportedPrimaryKeyError",
     "ValueConverter",
-    "RowWriter",
-    "CsvRowWriter",
     "keyset_stream",
     "keyset_pages",
-    "export_rows",
     "TableExporter",
     "SourceLoadGovernor",
 ]

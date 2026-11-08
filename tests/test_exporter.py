@@ -12,16 +12,12 @@ Covers (Requirement 5.1 / Property 1):
   and a missing primary key raises a clear error,
 - value conversion reuses the Schema Converter mapping (TINYINT(1) -> bool,
   DATETIME -> UTC, BLOB -> bytes),
-- CSV output content (including bytea hex and boolean text) is correct,
 - the source is read-only: only SELECT / transaction-control statements run,
-- the engine path wires a consistent-snapshot autocommit streaming connection,
-- the S3 sink uploads via an injected client (no real S3).
+- the engine path wires a consistent-snapshot autocommit streaming connection.
 """
 
 from __future__ import annotations
 
-import csv
-import io
 from datetime import datetime, timezone
 from itertools import islice
 from typing import Optional
@@ -29,12 +25,8 @@ from typing import Optional
 import pytest
 
 from dsql_migrator.core.exporter import (
-    _quote_mysql_identifier,
-    _quote_mysql_table,
-    CsvRowWriter,
     ExportCancelled,
     ExportError,
-    RowWriter,
     SourceLoadGovernor,
     TableExporter,
     UnsupportedPrimaryKeyError,
@@ -42,7 +34,6 @@ from dsql_migrator.core.exporter import (
     ValueConverter,
     _read_threads_running,
     compute_pk_shard_ranges,
-    export_rows,
     keyset_stream,
     shardable_leading_int_pk,
 )
@@ -203,24 +194,6 @@ class _FakeEngine:
 
     def dispose(self) -> None:
         self.disposed = True
-
-
-class _RecordingWriter(RowWriter):
-    """Captures header and rows in order for streaming assertions."""
-
-    def __init__(self) -> None:
-        self.header: list[str] = []
-        self.rows: list[dict] = []
-        self.closed = False
-
-    def write_header(self, columns: list[str]) -> None:
-        self.header = list(columns)
-
-    def write_row(self, row) -> None:  # noqa: ANN001
-        self.rows.append(dict(row))
-
-    def close(self) -> None:
-        self.closed = True
 
 
 # ---------------------------------------------------------------------------
@@ -827,14 +800,17 @@ def test_quoting_escapes_embedded_backticks_and_splits_qualified_names() -> None
     # literal, not a column), so every statement here interpolates the name and the
     # quoting IS the protection. Static analysers flag those f-strings on sight, so
     # pin the escaping rather than leaving it to a reviewer's reading.
-    assert _quote_mysql_identifier("id") == "`id`"
-    assert _quote_mysql_identifier("a`b") == "`a``b`"      # backtick doubled, not dropped
+    from dsql_migrator.core.source_dialect import dialect_for
+
+    mysql = dialect_for(SourceType.MYSQL)
+    assert mysql.quote_identifier("id") == "`id`"
+    assert mysql.quote_identifier("a`b") == "`a``b`"      # backtick doubled, not dropped
     # Cluster-wide introspection yields "database.table"; each part is quoted
     # separately, else MySQL reads `db.tbl` as ONE name in the unset current database.
-    assert _quote_mysql_table("db.tbl") == "`db`.`tbl`"
-    assert _quote_mysql_table("plain") == "`plain`"
+    assert mysql.quote_table("db.tbl") == "`db`.`tbl`"
+    assert mysql.quote_table("plain") == "`plain`"
     # A dot inside an unqualified name is still one identifier, not a split point.
-    assert _quote_mysql_table("db.tbl.extra") == "`db`.`tbl.extra`"
+    assert mysql.quote_table("db.tbl.extra") == "`db`.`tbl.extra`"
 
 
 def test_shard_range_sql_keeps_a_hostile_identifier_inside_one_quoted_name() -> None:
@@ -1265,7 +1241,7 @@ def _hours(value: int):  # noqa: ANN202 - tiny helper for tz offsets
 
 
 # ---------------------------------------------------------------------------
-# export_rows: streaming, conversion, CSV output, read-only
+# keyset_stream with the dialect's value converter: streaming, conversion, read-only
 # ---------------------------------------------------------------------------
 
 
@@ -1286,52 +1262,45 @@ def _typed_rows() -> list[dict]:
     ]
 
 
-def test_export_rows_writes_converted_csv_content() -> None:
-    connection = _FakeConnection(_typed_rows())
-    buffer = io.StringIO()
-    writer = CsvRowWriter(buffer)
+def _converted_stream(connection: _FakeConnection, *, batch_size: int) -> list[dict]:
+    from dsql_migrator.core.source_dialect import dialect_for
 
-    count = export_rows(connection, _typed_table(), writer, batch_size=10)
-    writer.close()
+    table = _typed_table()
+    converter = dialect_for(SourceType.MYSQL).value_converter(table)
+    return [
+        dict(row)
+        for row in keyset_stream(connection, table, batch_size=batch_size, converter=converter)
+    ]
 
-    assert count == 2
-    parsed = list(csv.reader(io.StringIO(buffer.getvalue())))
-    assert parsed[0] == ["id", "active", "created_at", "payload"]
+
+def test_keyset_stream_converts_each_row_for_the_target() -> None:
+    rows = _converted_stream(_FakeConnection(_typed_rows()), batch_size=10)
+
+    assert [list(row) for row in rows] == [["id", "active", "created_at", "payload"]] * 2
+    assert [row["id"] for row in rows] == [1, 2]
+    # TINYINT(1) -> boolean.
+    assert rows[0]["active"] is True and rows[1]["active"] is False
     # created_at is DATETIME -> naive UTC (no +00:00 offset), session-tz-independent.
-    assert parsed[1] == ["1", "true", "2024-01-01T00:00:00", "\\x0102"]
-    assert parsed[2] == ["2", "false", "2024-06-01T12:30:00", "\\xff"]
+    assert rows[0]["created_at"] == datetime(2024, 1, 1, 0, 0, 0)
+    assert rows[1]["created_at"] == datetime(2024, 6, 1, 12, 30, 0)
+    assert rows[0]["created_at"].tzinfo is None
+    # BLOB -> bytea: the bytes as read.
+    assert rows[0]["payload"] == b"\x01\x02" and rows[1]["payload"] == b"\xff"
 
 
-def test_export_rows_streams_rows_in_primary_key_order() -> None:
+def test_keyset_stream_streams_converted_rows_in_primary_key_order() -> None:
     connection = _FakeConnection(_typed_rows())
-    writer = _RecordingWriter()
 
-    count = export_rows(connection, _typed_table(), writer, batch_size=1)
+    rows = _converted_stream(connection, batch_size=1)
 
-    assert count == 2
-    assert writer.header == ["id", "active", "created_at", "payload"]
-    assert [row["id"] for row in writer.rows] == [1, 2]
-    # Converted values reached the writer (not raw MySQL values).
-    assert writer.rows[0]["active"] is True
+    assert [row["id"] for row in rows] == [1, 2]
+    # Converted values reached the consumer (not raw MySQL values).
+    assert rows[0]["active"] is True
     # DATETIME -> naive UTC (no tzinfo), session-tz-independent for the timestamp col.
-    assert writer.rows[0]["created_at"].tzinfo is None
-    assert writer.rows[0]["created_at"] == datetime(2024, 1, 1, 0, 0, 0)
-
-
-def test_export_rows_uses_consistent_snapshot_and_is_read_only() -> None:
-    connection = _FakeConnection(_typed_rows())
-    writer = _RecordingWriter()
-
-    export_rows(connection, _typed_table(), writer, batch_size=10)
-
-    statements = [sql for sql, _ in connection.executed]
-    assert any(
-        sql.strip().upper().startswith("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-        for sql in statements
-    )
-    assert any(sql.strip().upper() == "COMMIT" for sql in statements)
-    offending = [sql for sql in statements if is_write_or_ddl(sql)]
-    assert offending == [], f"export issued write/DDL on the source: {offending}"
+    assert rows[0]["created_at"].tzinfo is None
+    assert rows[0]["created_at"] == datetime(2024, 1, 1, 0, 0, 0)
+    offending = [sql for sql, _ in connection.executed if is_write_or_ddl(sql)]
+    assert offending == [], f"the read issued write/DDL on the source: {offending}"
 
 
 # ---------------------------------------------------------------------------
@@ -1339,23 +1308,28 @@ def test_export_rows_uses_consistent_snapshot_and_is_read_only() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_table_exporter_uses_autocommit_streaming_snapshot() -> None:
+def test_table_exporter_streams_from_an_autocommit_consistent_snapshot() -> None:
     connection = _FakeConnection(_typed_rows())
     engine = _FakeEngine(connection)
 
     exporter = TableExporter(engine_factory=lambda _conn: engine, batch_size=10)
-    writer = _RecordingWriter()
+    rows = list(exporter.stream_converted_rows(_source_config(), _typed_table()))
 
-    count = exporter.export_table(_source_config(), _typed_table(), writer)
-
-    assert count == 2
+    assert len(rows) == 2
+    assert rows[0]["active"] is True  # converted on the way out
     assert connection.execution_options_seen == {
         "isolation_level": "AUTOCOMMIT",
         "stream_results": True,
     }
     assert engine.disposed is True
-    offending = [sql for sql, _ in connection.executed if is_write_or_ddl(sql)]
-    assert offending == []
+    statements = [sql for sql, _ in connection.executed]
+    assert any(
+        sql.strip().upper().startswith("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+        for sql in statements
+    )
+    assert any(sql.strip().upper() == "COMMIT" for sql in statements)
+    offending = [sql for sql in statements if is_write_or_ddl(sql)]
+    assert offending == [], f"the read issued write/DDL on the source: {offending}"
 
 
 def test_table_exporter_rejects_table_without_columns() -> None:
@@ -1365,7 +1339,7 @@ def test_table_exporter_rejects_table_without_columns() -> None:
     table = TableDef(name="empty", columns=[], primary_key=["id"])
 
     with pytest.raises(ExportError, match="no columns"):
-        exporter.export_table(_source_config(), table, _RecordingWriter())
+        list(exporter.stream_converted_rows(_source_config(), table))
 
 
 def test_select_column_sql_wraps_spatial_in_st_asbinary() -> None:
@@ -1522,24 +1496,6 @@ def test_a_lost_source_connection_mid_stream_raises_the_lost_connection_not_the_
     assert is_source_transient_error(raised.value) is True
 
 
-def test_export_rows_keeps_the_lost_connection_too():
-    from dsql_migrator.core.exporter import export_rows
-
-    rows = [{"id": i, "name": f"n{i}"} for i in range(1, 8)]
-    conn = _DyingConnection(rows, die_on_page=2)
-
-    class _Writer:
-        def write_header(self, _cols):
-            pass
-
-        def write_row(self, _row):
-            pass
-
-    with pytest.raises(Exception) as raised:
-        export_rows(conn, _simple_table(), _Writer(), batch_size=3)
-    assert type(raised.value).__name__ == "OperationalError"
-
-
 def test_a_normal_and_a_closed_stream_still_commit_the_snapshot():
     rows = [{"id": i, "name": f"n{i}"} for i in range(1, 5)]
     conn = _FakeConnection(rows)
@@ -1618,8 +1574,6 @@ def test_the_status_reads_fail_open_only_on_a_live_connection():
 
 
 def test_a_cancelled_or_failed_read_on_a_live_connection_still_ends_its_snapshot():
-    from dsql_migrator.core.exporter import ExportCancelled, export_rows
-
     rows = [{"id": i, "name": f"n{i}"} for i in range(1, 8)]
     conn = _FakeConnection(rows)
     with pytest.raises(ExportCancelled):
@@ -1627,35 +1581,20 @@ def test_a_cancelled_or_failed_read_on_a_live_connection_still_ends_its_snapshot
             _source_config(), _simple_table(), should_cancel=lambda: conn.page_queries >= 1))
     assert [s for s, _ in conn.executed][-1].strip().upper().startswith("COMMIT")
 
-    class _Boom(Exception):
-        pass
-
-    class _Writer:
-        def write_header(self, _cols):
-            pass
-
-        def write_row(self, _row):
-            raise _Boom()
-
-    conn2 = _FakeConnection(rows)
-    with pytest.raises(_Boom):
-        export_rows(conn2, _simple_table(), _Writer(), batch_size=2)
-    assert [s for s, _ in conn2.executed][-1].strip().upper().startswith("COMMIT")
-
     class _CommitFails(_FakeConnection):
         def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
             if str(statement).strip().upper().startswith("COMMIT"):
                 raise RuntimeError("commit failed")
             return super().execute(statement, parameters, execution_options)
 
-    with pytest.raises(_Boom):  # the original error, never the COMMIT's
-        export_rows(_CommitFails(rows), _simple_table(), _Writer(), batch_size=2)
+    conn2 = _CommitFails(rows)
+    with pytest.raises(ExportCancelled):  # the original error, never the COMMIT's
+        list(TableExporter(engine_factory=lambda _c: _FakeEngine(conn2), batch_size=2).stream_converted_rows(
+            _source_config(), _simple_table(), should_cancel=lambda: conn2.page_queries >= 1))
 
 
 def test_a_commit_failure_after_a_complete_read_still_surfaces():
     from sqlalchemy.exc import OperationalError
-
-    from dsql_migrator.core.exporter import export_rows
 
     class _CommitLost(_FakeConnection):
         def execute(self, statement, parameters=None, execution_options=None):  # noqa: ANN001, ANN201
@@ -1663,16 +1602,7 @@ def test_a_commit_failure_after_a_complete_read_still_surfaces():
                 raise OperationalError("COMMIT", {}, _pymysql_lost())
             return super().execute(statement, parameters, execution_options)
 
-    class _Writer:
-        def write_header(self, _cols):
-            pass
-
-        def write_row(self, _row):
-            pass
-
     rows = [{"id": i, "name": f"n{i}"} for i in range(1, 4)]
-    with pytest.raises(OperationalError):
-        export_rows(_CommitLost(rows), _simple_table(), _Writer(), batch_size=2)
     conn = _CommitLost(rows)
     with pytest.raises(OperationalError):
         list(TableExporter(engine_factory=lambda _c: _FakeEngine(conn), batch_size=2).stream_converted_rows(

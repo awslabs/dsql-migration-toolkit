@@ -138,22 +138,13 @@ def test_the_full_load_reads_an_inheritance_parents_own_rows_only(parent) -> Non
         assert ' FROM "app"."par" ORDER BY "app"."par"."id" ' in f"{page} "
 
 
-def test_the_file_export_reads_an_inheritance_parents_own_rows_only() -> None:
-    from dsql_migrator.core.exporter import export_rows
-    from dsql_migrator.core.source_dialect import dialect_for
+def test_the_ranged_read_reads_an_inheritance_parents_own_rows_only() -> None:
+    from dsql_migrator.core.exporter import TableExporter
 
-    class _Writer:
-        def __init__(self):
-            self.rows = []
-
-        def write_header(self, _cols):
-            pass
-
-        def write_row(self, row):
-            self.rows.append(row)
-
-    conn, writer = _PgReadConn(True), _Writer()
-    assert export_rows(conn, _par(), writer, dialect=dialect_for(SourceType.POSTGRES)) == 1
+    conn = _PgReadConn(True)
+    pages = TableExporter(engine_factory=lambda _c: _Engine(conn)).stream_converted_ranges(
+        _PG, _par(), [(None, None)], page_rows=10)
+    assert [r["id"] for _index, page in pages for r in page] == [1]
     assert any(' FROM ONLY "app"."par" ORDER BY' in s for s in conn.sql)
 
 

@@ -1055,19 +1055,6 @@ def test_mysql_dialect_integer_pk_types() -> None:
     assert "varchar" not in d.integer_pk_types
 
 
-def test_exporter_quote_helpers_delegate_to_the_mysql_dialect() -> None:
-    # The exporter's module helpers now delegate to the dialect (single source of
-    # truth), so they must produce identical output.
-    from dsql_migrator.core.exporter import (
-        _quote_mysql_identifier,
-        _quote_mysql_table,
-    )
-
-    d = dialect_for(SourceType.MYSQL)
-    assert _quote_mysql_identifier("a`b") == d.quote_identifier("a`b")
-    assert _quote_mysql_table("db.t") == d.quote_table("db.t")
-
-
 def test_mysql_dialect_snapshot_sql_matches_watermark_constant() -> None:
     from dsql_migrator.core.watermark import START_CONSISTENT_SNAPSHOT
 

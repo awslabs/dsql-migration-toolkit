@@ -40,13 +40,11 @@ from sqlalchemy.engine.result import SimpleResultMetaData
 from sqlalchemy.engine.row import RowMapping
 
 from dsql_migrator.core.exporter import (
-    CsvRowWriter,
     ExportError,
     TableExporter,
     ValueConversionError,
     ValueConverter,
     _told_apart,
-    export_rows,
     keyset_pages,
     keyset_stream,
 )
@@ -552,25 +550,16 @@ def test_stream_converted_ranges_by_position_yields_what_it_yields_by_name(page_
     assert (flat, zero) == _converted_by_reference()
 
 
-def test_export_rows_by_position_writes_what_it_writes_by_name() -> None:
-    import io
-
+def test_a_converting_keyset_stream_by_position_yields_what_it_yields_by_name() -> None:
     def read(session, table, overrides):  # noqa: ANN001, ANN202
-        buffer = io.StringIO()
-        count = export_rows(session, table, CsvRowWriter(buffer), batch_size=16, target_types=overrides)
-        return count, buffer.getvalue()
+        converter = MySQLSourceDialect().value_converter(table, target_types=overrides)
+        return _strict(keyset_stream(session, table, batch_size=16, target_types=overrides,
+                                     converter=converter))
 
     (by_name, sql_a, _), (by_position, sql_b, _) = _both(read)
-    assert by_name[0] == "ok" and by_name[1][0] == 120
+    assert by_name[0] == "ok" and len(by_name[1]) == 120
     assert by_position == by_name and sql_b == sql_a
-    table, overrides, rows = _corpus_rows(120)
-    reference = ValueConverter(table, target_types=overrides)
-    buffer = io.StringIO()
-    writer = CsvRowWriter(buffer)
-    writer.write_header([c.name for c in table.columns])
-    for row in rows:
-        writer.write_row(reference.convert_row(row))
-    assert by_name[1] == (120, buffer.getvalue())
+    assert by_name[1] == _converted_by_reference()[0]
 
 
 def _refusing(rows: "list[dict]") -> "list[dict]":

@@ -39,7 +39,6 @@ To run the infra-gated tests:
 
 from __future__ import annotations
 
-import io
 import os
 from typing import Any, Optional
 
@@ -54,7 +53,7 @@ from dsql_migrator.core.batched_import import (
     OnConflictMode,
 )
 from dsql_migrator.core.converter import SchemaConverter
-from dsql_migrator.core.exporter import CsvRowWriter, RowWriter, export_rows
+from dsql_migrator.core.exporter import keyset_stream
 from dsql_migrator.core.introspector import (
     SourceIntrospector,
     install_read_only_guard,
@@ -69,6 +68,7 @@ from dsql_migrator.core.models import (
 )
 from dsql_migrator.core.occ import OCC_SQLSTATE
 from dsql_migrator.core.query_converter import QueryConverter
+from dsql_migrator.core.source_dialect import MySQLSourceDialect
 from dsql_migrator.core.validator import Validator
 
 
@@ -129,23 +129,6 @@ class _FakeExportConnection:
         limit = params.get("batch_size")
         candidates = [r for r in self._rows if last is None or r[self._pk] > last]
         return _FakeMappingResult(candidates[:limit] if limit is not None else candidates)
-
-
-class _CapturingWriter(RowWriter):
-    """A row writer that captures converted rows so they can be re-imported."""
-
-    def __init__(self) -> None:
-        self.columns: list[str] = []
-        self.rows: list[dict] = []
-
-    def write_header(self, columns: list[str]) -> None:
-        self.columns = list(columns)
-
-    def write_row(self, row) -> None:  # noqa: ANN001
-        self.rows.append(dict(row))
-
-    def close(self) -> None:  # noqa: D401 - nothing to release
-        return None
 
 
 class _ImportConflict(Exception):
@@ -415,13 +398,17 @@ def _run_pipeline(*, fail_first_import: bool) -> tuple[_FakeDsqlStore, int]:
     # 5. Export (real keyset stream + value conversion) through a fake source.
     table = _customers_table()
     export_conn = _FakeExportConnection(_customer_rows())
-    writer = _CapturingWriter()
-    exported = export_rows(export_conn, table, writer, batch_size=2)
+    converter = MySQLSourceDialect().value_converter(table)
+    exported_rows = [
+        dict(row)
+        for row in keyset_stream(export_conn, table, batch_size=2, converter=converter)
+    ]
+    exported = len(exported_rows)
     assert exported == 3
     # The exporter must never write to the source.
     assert [s for s in export_conn.executed if is_write_or_ddl(s)] == []
     # TINYINT(1) values were converted to booleans on the way out.
-    assert writer.rows[0]["is_active"] is True
+    assert exported_rows[0]["is_active"] is True
 
     # 6. Import (real batched INSERT + OCC retry) into a fake DSQL store.
     store = _FakeDsqlStore(fail_first=fail_first_import)
@@ -433,7 +420,7 @@ def _run_pipeline(*, fail_first_import: bool) -> tuple[_FakeDsqlStore, int]:
         sleep=lambda _s: None,
         jitter=lambda: 0.0,
     )
-    result = importer.import_rows(writer.rows, table)
+    result = importer.import_rows(exported_rows, table)
     assert result.failures == 0
     return store, exported
 
@@ -556,11 +543,12 @@ def test_real_mysql_introspection_and_export() -> None:
 
         from dsql_migrator.core.exporter import TableExporter
 
-        buffer = io.StringIO()
-        rows = TableExporter(engine_factory=lambda _c: engine).export_table(
-            _source_config(), table, CsvRowWriter(buffer)
+        rows = list(
+            TableExporter(engine_factory=lambda _c: engine).stream_converted_rows(
+                _source_config(), table
+            )
         )
-        assert rows == 2
+        assert len(rows) == 2
     finally:
         with engine.begin() as connection:
             connection.execute(text("DROP TABLE IF EXISTS it_customers"))
