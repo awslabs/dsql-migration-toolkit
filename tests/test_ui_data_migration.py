@@ -68,7 +68,6 @@ from dsql_migrator.ui.data_migration import (
     migratable_table_names,
     MigrationType,
     prerequisite_block_reason,
-    run_data_migration,
     run_full_load,
     summarize_progress,
     target_existing_table_names,
@@ -180,7 +179,9 @@ def _run_job(migrator: _FakeMigrator, tables: list[TableDef]) -> MigrationJob:
     """Run a migration to completion on a real JobManager and return the job."""
     manager = JobManager()
     job_id = manager.submit(
-        lambda handle: run_data_migration(handle, tables, migrator=migrator)
+        lambda handle: run_full_load(
+            handle, tables, migrator=migrator, error_log=ErrorLogStore()
+        )
     )
     assert manager.wait(job_id, timeout=5.0)
     return manager.get_status(job_id)
@@ -191,7 +192,7 @@ def _run_job(migrator: _FakeMigrator, tables: list[TableDef]) -> MigrationJob:
 # ---------------------------------------------------------------------------
 
 
-def test_run_data_migration_captures_watermark_once_and_persists_it() -> None:
+def test_run_full_load_captures_watermark_once_and_persists_it() -> None:
     migrator = _FakeMigrator(rows_by_table={"orders": 10, "customers": 3})
     job = _run_job(migrator, _tables())
 
@@ -201,7 +202,7 @@ def test_run_data_migration_captures_watermark_once_and_persists_it() -> None:
     assert job.status == "DONE"
 
 
-def test_run_data_migration_records_per_table_progress() -> None:
+def test_run_full_load_records_per_table_progress() -> None:
     migrator = _FakeMigrator(rows_by_table={"orders": 10, "customers": 3})
     job = _run_job(migrator, _tables())
 
@@ -214,7 +215,7 @@ def test_run_data_migration_records_per_table_progress() -> None:
     assert job.error_count == 0
 
 
-def test_run_data_migration_isolates_per_table_failure() -> None:
+def test_run_full_load_isolates_per_table_failure() -> None:
     """A per-table failure is recorded and the remaining tables still migrate."""
     migrator = _FakeMigrator(
         rows_by_table={"customers": 3}, fail_tables=("orders",)
@@ -308,11 +309,13 @@ def test_full_load_quarantined_rows_make_run_incomplete_not_success() -> None:
     assert len(quarantine_msgs) == 2
 
 
-def test_run_data_migration_watermark_failure_is_fatal() -> None:
+def test_run_full_load_watermark_failure_is_fatal() -> None:
     migrator = _FakeMigrator(watermark_error=RuntimeError("no REPLICATION CLIENT"))
     manager = JobManager()
     job_id = manager.submit(
-        lambda handle: run_data_migration(handle, _tables(), migrator=migrator)
+        lambda handle: run_full_load(
+            handle, _tables(), migrator=migrator, error_log=ErrorLogStore()
+        )
     )
     assert manager.wait(job_id, timeout=5.0)
     job = manager.get_status(job_id)
@@ -324,7 +327,7 @@ def test_run_data_migration_watermark_failure_is_fatal() -> None:
     assert "no REPLICATION CLIENT" in error
 
 
-def test_run_data_migration_seeds_one_chunk_per_table() -> None:
+def test_run_full_load_seeds_one_chunk_per_table() -> None:
     migrator = _FakeMigrator()
     job = _run_job(migrator, _tables())
     assert [chunk.chunk_id for chunk in job.chunks] == ["orders", "customers"]

@@ -363,8 +363,7 @@ def test_retry_and_reload_on_a_streamed_stack_still_run_under_the_original_start
 def test_every_run_full_load_call_in_the_ui_passes_the_gate() -> None:
     # The callers of run_full_load under src/dsql_migrator/ui: the screen's runner() (Start /
     # Re-run Full Load / Re-run all tables through the Start dialog, and the page header's
-    # Run). The engine's own back-compat wrapper (run_data_migration) has no session to judge
-    # and no UI caller. A new caller without start_point_refusal fails here.
+    # Run). A new caller without start_point_refusal fails here.
     root = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "ui"
     calls: list = []
     for path in sorted(root.rglob("*.py")):
@@ -382,6 +381,4 @@ def test_every_run_full_load_call_in_the_ui_passes_the_gate() -> None:
     callers = {(name, fn) for name, fn, _kw in calls}
     assert ("__init__.py", "work") in callers
     for name, fn, keywords in calls:
-        if (name, fn) == ("_full_load_engine.py", "run_data_migration"):
-            continue
         assert "start_point_refusal" in keywords, (name, fn)

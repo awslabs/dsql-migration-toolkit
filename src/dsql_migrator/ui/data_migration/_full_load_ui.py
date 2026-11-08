@@ -6,9 +6,9 @@
 The Full Load step/progress/results rendering -- watermark, the load-status table,
 the ~830-line ``_render_full_load_step``, the per-cell/tooltip formatters, the
 quarantine helpers, the progress/completeness/error-log renderers -- plus the tiny
-``format_selected_workloads`` headline. Mirrors the existing ``_cdc_ui.py`` split and
-is re-exported at the bottom of the package ``__init__`` so ``dm.<name>`` and
-``from ...data_migration import <name>`` resolve unchanged. One-directional: this
+``format_selected_workloads`` headline. Mirrors the existing ``_cdc_ui.py`` split; the
+package ``__init__`` re-exports at its bottom the names its screen code uses and the ones
+its readers reach as ``dm.<name>`` / ``from ...data_migration import <name>``. One-directional: this
 module imports from ``_engine`` / ``_models`` / ``_status`` / ``_cdc_ui`` and the
 shared ``core`` + ``ui`` modules -- never back from the package ``__init__``.
 """
@@ -24,8 +24,6 @@ from dsql_migrator.core.batched_import import is_unconfirmed_index_failure
 from dsql_migrator.core.error_log import ErrorLogStore
 from dsql_migrator.core.job_manager import JobNotFoundError
 from dsql_migrator.core.models import (
-    LoadKind,
-    LoadStatusView,
     MigrationJob,
     SourceType,
     StepStatus,
@@ -98,7 +96,11 @@ from dsql_migrator.ui.data_migration._index_builds import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# How often the live Full Load progress region polls the background job (seconds).
+# How often the live Full Load progress region polls the background job (seconds). Each
+# tick rebuilds the live per-table progress table (one row per migrating table, with
+# custom Quasar slots), so an overly-fast poll makes the browser laggy on a wide table
+# set. 1.5s is still clearly "live" for a bulk load while cutting the per-tick DOM churn
+# to a third of the old 0.5s.
 _POLL_INTERVAL_SECONDS = 1.5
 # How often the foreign-key card re-renders while Aurora DSQL is still validating a key
 # (G142) -- or still building a secondary index the run submitted (P4b); the background
@@ -404,65 +406,6 @@ def _render_watermark(ui: object, job: MigrationJob, source_type=None) -> None:
                         ui.label(_abbrev_count(rows_count)).classes(  # type: ignore[attr-defined]
                             "text-xs font-mono text-gray-800"
                         )
-
-
-def _render_load_status(ui, view: LoadStatusView) -> None:
-    """Render the unified load status (Full Load or CDC) -- Req 13.1.
-
-    One component for both modes: Full Load shows the progress bar + terminal
-    summary; CDC shows continuous lag / "caught up to" / DLQ depth / connector
-    states. Both show the same per-table table (with an errors column sourced
-    from the single error log).
-    """
-    heading = "Migration progress" if view.kind == LoadKind.FULL_LOAD else "CDC status"
-    ui.label(heading).classes("text-lg font-semibold")
-
-    if not view.tables and view.kind == LoadKind.FULL_LOAD:
-        ui.label("No tables to migrate.").classes("text-sm text-gray-500")
-        return
-
-    if view.progress_pct is not None:
-        ui.linear_progress(value=view.progress_pct / 100.0, show_value=False).props(
-            "instant-feedback"
-        ).classes("w-full")
-        ui.label(
-            f"Summary — {view.progress_pct:.1f}% complete, "
-            f"{view.tables_done}/{len(view.tables)} tables done, "
-            f"{view.tables_failed} failed"
-        ).classes("text-sm text-gray-600")
-
-    if view.kind == LoadKind.CDC:
-        bits: list[str] = []
-        if view.lag_seconds is not None:
-            bits.append(f"lag {view.lag_seconds:.1f}s")
-        if view.caught_up_to is not None:
-            bits.append(f"caught up to {view.caught_up_to.isoformat()}")
-        if view.dlq_depth is not None:
-            bits.append(f"DLQ depth {view.dlq_depth}")
-        if bits:
-            ui.label("  ·  ".join(bits)).classes("text-sm text-gray-600")
-        if view.connector_states:
-            states = ", ".join(
-                f"{name}={state}" for name, state in view.connector_states.items()
-            )
-            ui.label(f"Connectors: {states}").classes("text-xs text-gray-500")
-
-    columns = [
-        {"name": "table", "label": "Table", "field": "table", "align": "left"},
-        {"name": "state", "label": "Status", "field": "state"},
-        {"name": "rows_loaded", "label": "Rows loaded", "field": "rows_loaded"},
-        {"name": "errors", "label": "Errors", "field": "errors"},
-    ]
-    rows = [
-        {
-            "table": row.table,
-            "state": row.state,
-            "rows_loaded": row.rows_loaded if row.rows_loaded is not None else "",
-            "errors": row.errors,
-        }
-        for row in view.tables
-    ]
-    ui.table(columns=columns, rows=rows, row_key="table").classes("w-full")
 
 
 def format_selected_workloads(names: Sequence[str]) -> str:

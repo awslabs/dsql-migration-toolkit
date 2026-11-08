@@ -6,8 +6,8 @@
 Progress aggregation, the unified Full Load status/table views, prerequisite
 grouping, watermark formatting, and the CDC handling read-models live here,
 split out of the screen module so they can be unit tested without NiceGUI. The
-screen package re-exports every name from this module, so the public import
-surface is unchanged.
+screen package imports the names its screen code uses and re-exports the ones its
+readers reach through it (``dm.<name>``).
 """
 
 from __future__ import annotations

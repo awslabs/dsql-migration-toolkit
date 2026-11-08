@@ -4,11 +4,11 @@
 """Full Load backend run engine for the Data Migration screen (NiceGUI-free).
 
 The run inputs, the :class:`DataMigrator` seam, the run orchestration
-(:func:`run_full_load` / :func:`run_data_migration` and the parallel per-table
+(:func:`run_full_load` and the parallel per-table
 runner), and the in-process reference migrator (:class:`BatchedTableMigrator`)
 live here, split out of the screen module so they can be unit tested directly
-without touching NiceGUI. The screen package re-exports every name from this
-module, so the public import surface is unchanged.
+without touching NiceGUI. The screen package imports the names its screen code
+uses and re-exports the ones its readers reach through it (``dm.<name>``).
 """
 
 from __future__ import annotations
@@ -92,7 +92,6 @@ from dsql_migrator.core.cdc_schema_evolve import read_target_columns
 from dsql_migrator.core.source_time_zone import resolve_source_zone
 from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
 from dsql_migrator.core.mysql_zero_dates import INVALID as INVALID_DATE, ZERO as ZERO_DATE
-from dsql_migrator.core.column_exclusion import names_in as _names_in  # noqa: F401
 from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
 from dsql_migrator.core.schema_applier import (
     OverlayRefusedError, apply_foreign_key, build_overlay_statements, recreate_table,
@@ -354,7 +353,7 @@ def _as_load_result(value: "Union[int, TableLoadResult]") -> TableLoadResult:
 
 
 class DataMigrator(Protocol):
-    """The export/import seam driven by :func:`run_data_migration`.
+    """The export/import seam driven by :func:`run_full_load`.
 
     An implementation captures the export consistency point once
     (:meth:`capture_watermark`) and migrates one table at a time
@@ -938,13 +937,6 @@ def _set_table_throttled(job: MigrationJob, table_name: str, paused: bool) -> No
         else:
             counts.pop(table_name, None)
 
-
-# Default number of tables migrated concurrently during Full Load. Operator-tunable
-# via DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM (read at run time below). Each running
-# table (or part of one) keeps a capped number of INSERT batches in flight, each on its
-# own DSQL connection (P3: _unit_in_flight), so the run's DSQL connections stay within
-# the cluster connection quota.
-FULL_LOAD_TABLE_PARALLELISM = 4
 
 # Per-socket read/write timeout (seconds) for the Full Load source stream. Each
 # keyset page is bounded (DEFAULT_BATCH_SIZE rows) and returns quickly, so this
@@ -4860,7 +4852,8 @@ def _migrate_tables_in_parallel(
 ) -> _RunCounts:
     """Migrate ``tables`` concurrently (bounded), isolating per-table failures.
 
-    Tables load in parallel up to :data:`FULL_LOAD_TABLE_PARALLELISM` workers for
+    Tables load in parallel up to
+    :attr:`~dsql_migrator.config.AppConfig.full_load_table_parallelism` workers for
     throughput; each worker calls :func:`_migrate_one_table`, which catches its
     own per-table errors, so one table's failure never aborts the others. If the
     job is cancelled, in-flight tables stop mid-load and not-yet-started ones are
@@ -4938,8 +4931,8 @@ def _migrate_tables_in_parallel(
         if table.name in _clash:
             _fail_prepass_table(table.name, reason=name_clash_message(table.name))
 
-    # Operator-tunable table-level parallelism (default FULL_LOAD_TABLE_PARALLELISM),
-    # bounded by the table count.
+    # Operator-tunable table-level parallelism (AppConfig.full_load_table_parallelism,
+    # DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM), bounded by the table count.
     cfg = load_config()
     table_parallelism = cfg.full_load_table_parallelism
 
@@ -6882,8 +6875,7 @@ def run_full_load(
     gate then keeps Validation from running on partial data until the failed
     tables are retried.
 
-    This is the selected-table-scoped successor to :func:`run_data_migration`
-    (Property 16): the ``tables`` are the resolved selection from
+    The ``tables`` are the resolved selection (Property 16) from
     :class:`~dsql_migrator.core.table_selection.TableSelector`.
     """
     job_id = handle.job_id
@@ -7766,23 +7758,6 @@ def run_full_load_retry(
         error_job_ids=error_job_ids,
         inputs=inputs,
     )
-
-
-def run_data_migration(
-    handle: JobHandle,
-    tables: Sequence[TableDef],
-    *,
-    migrator: DataMigrator,
-) -> None:
-    """Run Full Load without surfacing per-table errors to an error log.
-
-    Thin back-compat wrapper over :func:`run_full_load` (the primary entry point)
-    that discards per-table error records into a throwaway in-memory log. New
-    callers should use :func:`run_full_load` with the session's
-    :class:`~dsql_migrator.core.error_log.ErrorLogStore` so failures are
-    downloadable (Property 15).
-    """
-    run_full_load(handle, tables, migrator=migrator, error_log=ErrorLogStore())
 
 
 def job_status_to_step_status(job_status: str) -> Optional[StepStatus]:

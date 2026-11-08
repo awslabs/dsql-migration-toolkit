@@ -19,8 +19,8 @@ Two things here are NOT CDC-specific but live here by COHESION, not by feature:
   panel and the CDC DLQ panel add up to the whole log; splitting the FL readers into
   the FL engine would fragment that and drag a CDC predicate into the FL module.
 
-The package ``__init__`` re-imports these names so the public import surface of
-``dsql_migrator.ui.data_migration`` is unchanged and the render code resolves them.
+The package ``__init__`` imports the names its render code resolves and re-exports
+the ones its readers reach through ``dsql_migrator.ui.data_migration``.
 """
 
 from __future__ import annotations

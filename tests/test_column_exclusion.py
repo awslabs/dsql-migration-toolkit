@@ -662,7 +662,6 @@ def test_an_edit_that_drops_the_generated_clause_makes_a_pg_generated_column_exc
 from dsql_migrator.core.column_exclusion import (  # noqa: E402
     W1, W2, W3, W4, W5, W6,
     column_exclusion_warnings,
-    names_in,
     table_exclusion_findings,
     views_referencing,
 )
@@ -842,7 +841,7 @@ def test_each_ddl_is_parsed_once_for_repeated_calls():
 def test_the_view_helpers_moved_to_core_unchanged():
     from dsql_migrator.ui.data_migration import _full_load_engine as engine
 
-    assert engine._views_referencing is views_referencing and engine._names_in is names_in
+    assert engine._views_referencing is views_referencing
 
 
 # --- review fixes (C05-C11 review): views by reference, W5 from the applied DDL --------

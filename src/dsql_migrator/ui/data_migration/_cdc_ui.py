@@ -5,9 +5,9 @@
 
 Extracted verbatim from ``data_migration/__init__.py`` -- a pure code move with
 no behavior change. Every function and constant here previously lived in that
-module and is re-exported from the package ``__init__`` (at the bottom of that
-file), so ``dm.<name>`` attribute access and all existing monkeypatch targets keep
-resolving exactly as before. This module owns the optional CDC data-plane UI:
+module; the package ``__init__`` re-exports (at the bottom of that file) the names
+its screen code uses and the ones its readers reach as ``dm.<name>``. A test patches
+this module itself: rebinding ``dm.<name>`` does not change what this module calls. This module owns the optional CDC data-plane UI:
 source/start-point cards, infra + start/stop/delete dialogs and their control-plane
 actions, the deploy/live-status panels, DLQ + pipeline-health monitoring, and the
 shared live migration-table status grid. The Full Load screen, the activity-log

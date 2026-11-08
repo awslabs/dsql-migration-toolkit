@@ -135,43 +135,30 @@ from dsql_migrator.ui.schema_conversion import (
 from dsql_migrator.ui.session import SessionStore
 from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 
-# Full Load backend run engine (NiceGUI-free); re-exported so the package's
-# public import surface is unchanged.
+# Full Load backend run engine (NiceGUI-free). Each submodule name this module imports
+# is used by the screen code below or re-exported for a reader that reaches it through
+# the package (``dm.<name>``). A re-export serves such readers only: rebinding
+# ``dm.<name>`` does not change what the submodule calls, so tests patch the submodule.
 from dsql_migrator.ui.data_migration._full_load_engine import (
     MigratorFactory,
     preserved_foreign_key_names,
     DataMigrationInputs,
-    TableLoadResult,
-    _as_load_result,
     DataMigrator,
-    _seed_chunks,
-    _start_chunk,
-    _complete_chunk,
-    _fail_chunk,
     _advance_chunk_rows,
-    _find_chunk,
-    _recompute_progress,
-    _error_code,
     full_load_progress_caption,
-    FULL_LOAD_TABLE_PARALLELISM,
-    PROGRESS_FLUSH_ROWS,
     _FullLoadStopped,
     FullLoadIncompleteError,
     _fail_unfinished_chunks,
-    _migrate_one_table,
-    _migrate_tables_in_parallel,
     new_start_point_block,
     new_start_point_refusal,
     run_full_load,
     identity_sync_extras,
     sync_identity_sequences_for_tables,
-    _seed_retry_chunks,
     run_full_load_retry,
     # The explicit "Apply foreign keys" action runs the SAME engine pass the load used to
     # run automatically (aliased, since `_apply_foreign_keys` is the engine's private name).
     _apply_foreign_keys as _apply_foreign_keys_for,
     pending_foreign_key_count,
-    run_data_migration,
     job_status_to_step_status,
     data_migration_step_after_cdc,
     foreign_keys_counted_before_add,
@@ -180,15 +167,12 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     full_load_phase_status,
     reconcile_full_load_step,
     ImporterFactory,
-    _default_importer_factory,
-    TableRecreator,
-    _default_table_recreator,
     BatchedTableMigrator,
     default_migrator_factory,
 )
 
-# Pure view-models, formatters, and enums (NiceGUI-free); re-exported so the
-# package's public import surface is unchanged.
+# Pure view-models, formatters, and enums (NiceGUI-free): for the screen code below
+# and the ``dm.<name>`` readers.
 from dsql_migrator.ui.data_migration._models import (
     MigrationType,
     RestoredExclusionFacts,
@@ -196,7 +180,6 @@ from dsql_migrator.ui.data_migration._models import (
     legacy_lob_exclusions,
     overlay_lob_exclusions,
     _CDC_MIGRATION_TYPES,
-    _SUBSTEPS,
     source_supports_cdc,
     prereq_mode_for_type,
     migration_status_label,
@@ -207,7 +190,6 @@ from dsql_migrator.ui.data_migration._models import (
     resolve_active_substep_for_type,
     resolve_active_substep,
     should_pin_cdc_substep,
-    _MigrationTypeMeta,
     _MIGRATION_TYPE_META,
     migration_type_blurb,
     migration_type_when,
@@ -224,7 +206,6 @@ from dsql_migrator.ui.data_migration._models import (
     split_read_tables,
     split_read_refusal,
     split_route_view,
-    SPLIT_READ_HEADER,
     unsettled_table_names,
     index_pending_tables,
     full_load_scope_names,
@@ -236,7 +217,6 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_not_addable_refusal,
     SCOPE_ADDED_REASON_FL_CDC,
     SCOPE_ADDED_REASON_PG_SUFFIX,
-    SCOPE_ADDED_QUARANTINED_REASON,
     CDC_NOT_ADDABLE_REASON,
     keep_unlisted_covered,
     narrowed_record_names,
@@ -258,15 +238,12 @@ from dsql_migrator.ui.data_migration._models import (
     full_load_completeness,
     MigrationTableStatus,
     build_migration_table_status,
-    _LOAD_STATE_ORDER,
     summarize_table_states,
     prereq_scope_gap,
     schema_recreate_tables,
     prerequisite_block_reason,
     resnapshot_resolvable_failures,
     PrereqCategory,
-    _PREREQ_CATEGORY_BY_CHECK,
-    _PREREQ_CATEGORY_ORDER,
     PrereqCategoryGroup,
     _rollup_category_status,
     _category_summary,
@@ -280,15 +257,12 @@ from dsql_migrator.ui.data_migration._models import (
     effective_lob_exclusions,
     stored_exclusion_block_reason,
     stored_exclusion_issues,
-    exclusion_refusal,
     missing_column_block_reason,
     capture_exclusion_mismatch,
     cdc_capture_exclusions,
     exclusion_scope,
     ExclusionInputs,
     live_target_columns_of,
-    CAPTURE_SIZE_REMEDY_UNLOCKED,
-    capture_ambiguity_warning,
     cdc_pre_load_table_list_warning,
     cdc_pre_load_topic_name_warning,
     mysql_reads_may_split,
@@ -299,12 +273,9 @@ from dsql_migrator.ui.data_migration._models import (
     session_source_type,
     scope_lob_candidates,
     format_column_exclude_list,
-    _DSQL_VALUE_LIMIT_MIB,
     DlqHealth,
     assess_dlq_health,
     ConnectorHealthRow,
-    _HEALTHY_CONNECTOR_STATES,
-    _BAD_CONNECTOR_STATES,
     connector_role_label,
     connector_health_rows,
     CdcHandlingFact,
@@ -314,25 +285,16 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_prerequisite_block_reason,
 )
 
-# CDC status / controller / deploy-formatting logic (NiceGUI-free); re-exported so
-# the package's public import surface is unchanged and the render code below
-# resolves the pure helpers/constants it consumes.
+# CDC status / controller / deploy-formatting logic (NiceGUI-free): the render code
+# below resolves the pure helpers/constants it consumes, and the ``dm.<name>`` readers
+# the rest.
 from dsql_migrator.ui.data_migration._cdc_status import (
     _current_job,
     adopt_deployed_exclusions_if_safe,
-    _read_cdc_template_body,
-    _CDC_ACTION_NOUN,
-    _CDC_ACTION_TERMINAL,
-    _CDC_STAGE_LABELS,
-    _CDC_ACTION_TITLE,
     _CDC_STAGE_ETA_SECONDS,
     _format_eta_hint,
-    _CDC_DEPLOY_STAGE_STYLE,
-    _deploy_total_duration,
-    _LOG_GLYPH_FALLBACKS,
     _ascii_log,
     _migration_status_tables,
-    _fetch_migration_row_counts,
     _cdc_status_view,
     _filter_mine,
     _is_inflight_stack_status,
@@ -341,36 +303,23 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     split_cleanup_by_progress,
     cdc_attach_scope_mismatch,
     split_attachable_stacks,
-    _classify_cdc_stack_phase,
-    _probe_cdc_stack_phase,
     _ensure_cdc_controller,
     cdc_discovery_fingerprint,
     _CDC_DISCOVERY_THROTTLE_SECONDS,
-    _CDC_IDLE_RATE_THRESHOLD,
     CdcActivitySummary,
     cdc_activity_summary,
     cdc_error_log_key,
-    full_load_error_records,
-    full_load_error_summary,
-    full_load_latest_messages,
     _fetch_cdc_status,
     _apply_cdc_status,
     _refresh_cdc_status,
-    _CDC_TONE_STYLE,
 )
-
-# Text shown when a watermark field could not be captured (binary logging
-# disabled, or SHOW MASTER STATUS restricted on RDS/Aurora). The export is still
-# valid; only the optional coordinate is missing (Requirement 5.7).
-_UNAVAILABLE = "unavailable"
-
 
 _LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Per-session data-migration state (NiceGUI-free); re-exported so the package's
-# public import surface is unchanged.
+# Per-session data-migration state (NiceGUI-free): for the screen code below and the
+# ``dm.<name>`` readers.
 # ---------------------------------------------------------------------------
 from dsql_migrator.ui.data_migration._state import (
     DataMigrationState,
@@ -389,22 +338,6 @@ _STATUS_COLORS: dict[StepStatus, str] = {
     StepStatus.DONE: "positive",
     StepStatus.FAILED: "negative",
 }
-
-# Quasar color names for each per-table chunk status badge.
-_CHUNK_STATUS_COLORS: dict[str, str] = {
-    "PENDING": "grey",
-    "IN_PROGRESS": "primary",
-    "DONE": "positive",
-    "FAILED": "negative",
-}
-
-# How often the screen polls the background migration job (seconds). Each tick
-# rebuilds the live per-table progress table (one row per migrating table, with
-# custom Quasar slots), so an overly-fast poll makes the browser laggy on a wide
-# table set. 1.5s is still clearly "live" for a bulk load while cutting the
-# per-tick DOM churn to a third of the old 0.5s.
-_POLL_INTERVAL_SECONDS = 1.5
-
 
 def build_data_migration_screen(
     store: SessionStore,
@@ -6575,28 +6508,16 @@ def _render_prereq_table(
 # -- Infrastructure input form (BYO-VPC) ------------------------------------
 
 
-# AWS Console (Cloudscape) "Alert" notice: the tone palette and renderer live in
-# the shared design module (single source of truth so every page reads the same).
-# These module-level aliases preserve the existing in-file call sites/imports.
-_NOTICE_STYLE = NOTICE_STYLE
+# AWS Console (Cloudscape) "Alert" notice: the renderer lives in the shared design
+# module (single source of truth so every page reads the same). This module-level
+# alias preserves the existing in-file call sites and the name ``_cdc_ui`` imports back.
 _render_notice = render_notice
-
-
-# Quasar badge color per Full Load chunk state, for the per-table status table.
-_MIGRATION_FL_BADGE: dict[str, str] = {
-    "DONE": "positive",
-    "IN_PROGRESS": "primary",
-    "FAILED": "negative",
-    "PENDING": "grey",
-    "": "grey",
-}
 
 
 __all__ = [
     "DataMigrationInputs",
     "DataMigrator",
     "MigratorFactory",
-    "run_data_migration",
     "run_full_load",
     "job_status_to_step_status",
     "reconcile_full_load_step",
@@ -6696,50 +6617,30 @@ __all__ = [
 # docstring). Imported HERE, at the bottom of the module, so that the four
 # names ``_cdc_ui`` imports back from this package (``_log_cdc_event``,
 # ``migration_type_lock_reason``, ``_LOGGER``, ``_render_notice``) are already
-# defined above -- this ordering is what breaks the import cycle. Re-exported
-# so ``dm.<name>`` and existing monkeypatch targets keep resolving unchanged.
+# defined above -- this ordering is what breaks the import cycle. Re-exported for
+# the screen code above and the ``dm.<name>`` readers only: rebinding ``dm.<name>``
+# does not change what ``_cdc_ui`` calls, so tests patch ``_cdc_ui`` itself.
 # ---------------------------------------------------------------------------
 from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     # CDC-domain constants re-exported from ``core.cdc`` via ``_cdc_ui`` so the
     # package's import surface is unchanged (e.g. ``from ...data_migration import
     # CDC_DEFAULT_STACK_NAME`` still resolves after the CDC UI move).
     CDC_DEFAULT_STACK_NAME,
-    _CDC_INFRA_FIELDS,
-    _CDC_POLL_INTERVAL_SECONDS,
-    _CdcSourceSecret,
-    _DLQ_LEVEL_TONE,
-    _DLQ_RECORD_LIST_LIMIT,
-    _DLQ_RECORD_PAGE_SIZE,
     _cdc_infra_prefill,
     derive_cdc_vpc_from_source,
     _cdc_is_streaming,
     _cdc_stack_has_seeder_lambda,
     _cdc_tables_for_config,
-    _cdc_target_region,
     _cdc_watermark,
     _diagnose_for_dialog,
-    _dlq_panel_tone,
-    _open_cdc_delete_dialog,
     _open_cdc_infra_dialog,
-    _open_cdc_start_dialog,
-    _open_cdc_stop_dialog,
-    _render_cdc_cost_estimate,
-    _render_cdc_delete_action,
-    _render_cdc_deploy_live,
-    _render_cdc_dlq_breakdown,
     _render_cdc_dlq_panel,
-    _render_cdc_dlq_records,
-    _render_cdc_error_download,
-    _render_cdc_handling_panel,
-    _render_cdc_infra_deploy_action,
     _render_cdc_infra_form,
     _render_cdc_infra_prep_section,
     _render_cdc_attach_row,
     cdc_infra_prep_state,
     _render_cdc_least_privilege_note,
-    _render_cdc_live_monitoring,
     exclusion_lock_state,
-    change_and_reload_block_reason,
     fk_apply_running,
     table_set_editable_after_load,
     table_set_wait_reason,
@@ -6772,28 +6673,10 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
-    _render_cdc_manual_inputs,
-    _render_cdc_params_file,
-    _render_cdc_partial_actions,
-    _render_cdc_pipeline_health,
-    _render_cdc_running_actions,
-    _render_cdc_runs_on_banner,
-    _render_cdc_source_config_card,
-    _render_cdc_start_action,
-    _render_cdc_start_button,
-    _render_cdc_start_point_card,
-    _render_cdc_start_summary,
     _render_cdc_step,
-    _render_change_flow_status,
     _render_deploy_log,
-    _render_deploy_stages,
-    _render_migration_table_status,
     _resolve_cdc_source_secret,
-    _sentinel_watermark,
-    _start_cdc_delete,
-    _start_cdc_deploy,
     _start_cdc_infra_deploy,
-    _start_cdc_stop,
     cdc_deploy_card_superseded,
     cdc_deploy_connection_blocker,
     cdc_live_running_names,
@@ -6817,19 +6700,16 @@ from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
 
 # The Full Load render cluster was extracted to _full_load_ui.py for maintainability
 # (mirrors the _cdc_ui.py split above). Re-exported here -- AFTER the _cdc_ui re-export,
-# since _full_load_ui imports cdc_streaming_started from _cdc_ui -- so dm.<name> and every
-# consumer/test import resolve unchanged; content()'s calls resolve as module globals.
+# since _full_load_ui imports cdc_streaming_started from _cdc_ui -- for the screen code
+# above (content()'s calls resolve as module globals) and the dm.<name> readers.
 from dsql_migrator.ui.data_migration._full_load_ui import (  # noqa: E402,F401
     cdc_load_hold,
     full_load_step_for_scope,
     submit_scope_identity_sync,
     _view_tables,
-    _LOAD_STATE_COLORS,
-    _LOAD_STATE_LABELS,
     _QUARANTINE_PK_CHIP_LIMIT,
     _abbrev_count,
     _format_attempts_cell,
-    _format_progress_cell,
     _format_rows_on_target_cell,
     _group_quarantine_entries,
     _incomplete_is_quarantine_only,
@@ -6843,7 +6723,6 @@ from dsql_migrator.ui.data_migration._full_load_ui import (  # noqa: E402,F401
     _render_error_log,
     _render_full_load_progress,
     _render_full_load_step,
-    _render_load_status,
     _render_table_state_summary,
     _render_watermark,
     _rows_breakdown_tooltip,
