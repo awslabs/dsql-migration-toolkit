@@ -110,10 +110,10 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# The MySQL source dialect: default for the max-PK helper below, whose
-# identifier quoting now comes from the dialect (single source of truth) so a non-MySQL
-# source quotes its own way. (The information_schema row-estimate query stays
-# MySQL-specific for now; its PostgreSQL pg_class form is a later phase.)
+# The MySQL source dialect: default for the row-estimate / max-PK helpers below and the
+# dialect the MySQL watermark capture uses. Each helper takes the source's dialect (single
+# source of truth for its identifier quoting and its scan-free estimate query), so a
+# PostgreSQL source quotes and estimates its own way (pg_class.reltuples).
 _MYSQL_DIALECT = MySQLSourceDialect()
 
 

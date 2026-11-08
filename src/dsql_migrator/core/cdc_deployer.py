@@ -2998,7 +2998,6 @@ __all__ = [
     "CDC_START_STAGES",
     "CDC_STOP_STAGES",
     "CDC_DELETE_STAGES",
-    # seed helpers
     # lifecycle operations (JobManager work functions)
     "run_cdc_infra_deploy",
     "run_cdc_start",
