@@ -1371,7 +1371,8 @@ def _render_cdc_live_monitoring(
 
         from dsql_migrator.ui.data_migration._cdc_status import land_detached
 
-        # Scope the scan-free net-rows metric read to the migrated table set.
+        # Scope the scan-free applied-ops metric read (InsertsApplied / UpdatesApplied /
+        # DeletesApplied, from which the panel derives net rows) to the migrated table set.
         tables = _migration_status_tables(migration_state, job_manager)
 
         async def _fetch_and_land() -> None:
