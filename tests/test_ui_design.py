@@ -23,9 +23,7 @@ from dsql_migrator.ui.design import (
     CHIP_GROUP_PALETTE,
     INLINE_HINT_TEXT,
     NOTICE_STYLE,
-    SEGMENTED_TOGGLE_CLASSES,
     EXPANSION_PANEL_CLASSES,
-    SEGMENTED_TOGGLE_PROPS,
     badge_classes,
     chip_group_index,
     chip_group_text_class,
@@ -33,7 +31,6 @@ from dsql_migrator.ui.design import (
     render_notice,
     schema_chip_classes,
     section_header,
-    segmented_control,
 )
 
 
@@ -120,15 +117,6 @@ class _RecordingUi:
 
     def element(self, tag="div", *_a, **_k):
         return _El(self, tag)
-
-    def toggle(self, options=None, *_a, value=None, on_change=None, **_k):
-        # Record the option labels so a test can assert what the segmented
-        # control offered; returns a chainable element double.
-        if isinstance(options, dict):
-            self.texts.extend(str(v) for v in options.values())
-        elif isinstance(options, (list, tuple)):
-            self.texts.extend(str(v) for v in options)
-        return _El(self, "toggle")
 
     def select(self, options=None, *_a, value=None, label=None, on_change=None, **_k):
         # Record the option labels and the floating property label so a test can
@@ -480,7 +468,7 @@ def test_inline_hint_defaults_to_neutral_and_unknown_tone_falls_back() -> None:
 
 
 # ---------------------------------------------------------------------------
-# segmented_control
+# expansion panel
 # ---------------------------------------------------------------------------
 
 
@@ -492,46 +480,6 @@ def test_expansion_panel_border_token_matches_the_card_palette() -> None:
     assert "border-gray-200" in EXPANSION_PANEL_CLASSES
 
 
-def test_segmented_control_tokens_are_aws_style() -> None:
-    # One palette: selected segment filled primary on a white group; the group
-    # is bordered and clips its segments (Cloudscape "SegmentedControl" look).
-    assert "toggle-color=primary" in SEGMENTED_TOGGLE_PROPS
-    assert "no-caps" in SEGMENTED_TOGGLE_PROPS
-    assert "border" in SEGMENTED_TOGGLE_CLASSES
-    assert "rounded" in SEGMENTED_TOGGLE_CLASSES
-
-
-def test_segmented_control_emits_options_props_and_border() -> None:
-    ui = _RecordingUi()
-    captured: list[object] = []
-    toggle = segmented_control(
-        ui,
-        {"ALL": "All", "ATTENTION": "Needs attention"},
-        value="ALL",
-        on_change=lambda e: captured.append(e),
-    )
-    assert toggle is not None
-    # The option labels were offered.
-    assert "All" in ui.texts and "Needs attention" in ui.texts
-    # The shared AWS-style props and border classes were applied.
-    props_blob = " ".join(ui.props)
-    assert "toggle-color=primary" in props_blob and "no-caps" in props_blob
-    classes_blob = " ".join(ui.classes)
-    assert "border" in classes_blob and "rounded" in classes_blob
-
-
-def test_segmented_control_appends_caller_props_and_classes() -> None:
-    ui = _RecordingUi()
-    segmented_control(
-        ui,
-        {"ALL": "All"},
-        value="ALL",
-        on_change=lambda e: None,
-        extra_props="spread",
-        classes="w-full",
-    )
-    assert "spread" in " ".join(ui.props)
-    assert "w-full" in " ".join(ui.classes)
 
 
 # ---------------------------------------------------------------------------

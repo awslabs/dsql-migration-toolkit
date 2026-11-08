@@ -26,10 +26,8 @@ from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
 # cost). ``MAX_CHAT_INPUT_CHARS`` caps a SINGLE message: generous enough to paste a
 # whole table DDL / SQL statement into the multi-line composer (that is a common
 # follow-up), while still bounding one turn -- the model context is trimmed
-# elsewhere, so this is a UX/abuse guard, not the cost lever. (``MAX_CHAT_TURNS`` is
-# retained for the pure ``chat_turns_remaining`` helper some callers still import; the
-# persistent panel no longer caps turns -- bounded context replaced the turn wall.)
-MAX_CHAT_TURNS = 10
+# elsewhere, so this is a UX/abuse guard, not the cost lever. (The persistent panel
+# caps no turns -- bounded context replaced the turn wall.)
 MAX_CHAT_INPUT_CHARS = 4000
 
 # A streaming chat turn: given the running transcript and a per-chunk callback,
@@ -86,25 +84,9 @@ def ends_in_open_fence(md: str) -> bool:
     return kind == "text" and _FENCE_LINE_RE.search(body) is not None
 
 
-def chat_turns_remaining(
-    messages: "list[dict[str, str]]", *, max_turns: int = MAX_CHAT_TURNS
-) -> int:
-    """Return how many more user turns the chat allows (0 when at the limit).
-
-    Counts the ``user`` entries already in the transcript (the initial
-    auto-question included) and subtracts from ``max_turns``, floored at 0. Pure
-    and deterministic so the drawer's turn-limit gating is unit-testable.
-    """
-    used = sum(1 for entry in messages if (entry or {}).get("role") == "user")
-    return max(0, max_turns - used)
-
-
-
 __all__ = [
-    "MAX_CHAT_TURNS",
     "MAX_CHAT_INPUT_CHARS",
     "ChatStreamer",
-    "chat_turns_remaining",
     "split_markdown_segments",
     "markdown_has_code_block",
 ]

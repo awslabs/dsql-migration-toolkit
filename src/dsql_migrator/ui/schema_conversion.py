@@ -146,7 +146,6 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     ApplyMode,
     ApplyObject,
     ApplyOutcome,
-    CoreApplierFactory,
     DsqlSchemaApplier,
     ObjectApplyError,
     ObjectApplyResult,
@@ -158,25 +157,14 @@ from dsql_migrator.ui.schema_conversion_apply import (  # noqa: F401
     TargetExistenceChecker,
     _FOREIGN_KEY_ROLE,
     _INDEX_KIND,
-    _SCHEMA_KIND,
     _TABLE_KIND,
     _VIEW_KIND,
     _apply_should_replace,
-    _apply_success_detail,
     _apply_summary,
-    _build_core_applier,
-    _classify_edited_table_conversion,
-    _clean_detail,
-    _column_clause,
     _dedupe_apply_objects,
-    _describe_ddl,
-    _first_create_table,
     _is_applicable_target_ddl,
-    _predrop_dependent_views,
     _safe_post_await_ui,
-    _table_manual_reason,
     _tree_leaf_ids,
-    _view_create_ddls,
     ai_candidate_object_names,
     applied_table_conversions,
     applied_view_ddls,
@@ -4606,20 +4594,6 @@ def _render_preview(
         )
 
 
-def ddl_equivalent(left: str, right: str) -> bool:
-    """Return whether two DDL scripts are equivalent ignoring formatting.
-
-    Each script is split into single statements (on ``;``), trimmed, and
-    compared. This treats trailing semicolons and surrounding whitespace as
-    insignificant so a deterministic conversion and an AI suggestion that only
-    differ cosmetically are shown as one view rather than as differing tabs.
-    """
-    def _normalize(text: str) -> list[str]:
-        return [stmt.strip() for stmt in split_sql_statements(text)]
-
-    return _normalize(left) == _normalize(right)
-
-
 # Quasar badge colors for a conversion warning's classification (severity cue).
 _WARNING_BADGE_COLOR: dict[str, str] = {
     Classification.UNSUPPORTED.value: "negative",
@@ -5815,7 +5789,6 @@ __all__ = [
     "build_apply_objects",
     "override_apply_objects",
     "selected_object_names",
-    "ddl_equivalent",
     "ai_candidate_object_names",
     "build_ai_apply_objects",
     "run_schema_apply",

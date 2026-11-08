@@ -141,7 +141,6 @@ from dsql_migrator.core.occ import (
 )
 from dsql_migrator.core.target_connection import (
     DsqlConnector,
-    TRANSIENT_CONN_SIGNATURES,
     is_dropped_connection,
     is_server_unavailable,
     is_transient_connection_error,
@@ -262,7 +261,6 @@ def _get_counted(q: "Queue[object]", stats: Optional[LoadStats]) -> object:
 # ``schema_applier``. Aliased to the historical private name so existing callers
 # and tests keep working.
 _is_transient_connection_error = is_transient_connection_error
-_TRANSIENT_CONN_SIGNATURES = TRANSIENT_CONN_SIGNATURES
 
 
 def _is_retryable_load_error(exc: BaseException) -> bool:

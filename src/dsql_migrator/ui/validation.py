@@ -5255,9 +5255,9 @@ def _cutover_gate_inputs_missing(
 ) -> bool:
     """Whether the cut-over gates have no schema inputs to count from.
 
-    ``_cutover_pending_foreign_keys`` / ``_cutover_pending_identity_tables`` answer 0
+    ``_cutover_pending_foreign_keys`` / ``_cutover_identity_tables`` answer 0 / ``[]``
     both when there is genuinely nothing to apply AND when the evaluation / conversion
-    state they read is absent -- and 0 hides the corresponding runbook action. Those
+    state they read is absent -- and that hides the corresponding runbook action. Those
     semantics are correct and pinned, so this is a SEPARATE predicate: it tells the
     render which of the two zeros it is looking at, so "nothing to do" and "can't tell"
     stop rendering identically (an empty runbook that reads as done).
@@ -5274,36 +5274,6 @@ def _cutover_gate_inputs_missing(
     return result is None or result.inventory is None
 
 
-def _cutover_pending_identity_tables(
-    session: object,
-    eval_store: "Optional[EvaluationStore]",
-    conversion_store: "Optional[Any]",
-    session_id: str,
-    *,
-    migration_state: object = None,
-) -> int:
-    """Count tables converted to a server-generated (IDENTITY) primary key.
-
-    Zero when no schema-conversion / evaluation state exists, or no table uses the
-    IDENTITY_WITH_CACHE strategy. Used to GATE the cut-over "Sync identity sequences"
-    action symmetrically with ``_cutover_pending_foreign_keys`` -- the sync only
-    advances GENERATED-identity keys, so a schema with none has nothing to sync and the
-    button (and its outcome line) should not appear.
-
-    Rebuilds the APPLIED conversions exactly as :func:`_cutover_pending_foreign_keys`
-    does (deterministic re-conversion overlaid with the Schema-Conversion edits, where
-    the per-table PK-strategy picker bakes the ``GENERATED ... AS IDENTITY`` clause), and
-    counts the tables whose applied DDL declares the auto-increment key as an identity --
-    the same tables ``sync_identity_sequences`` reaches via ``is_identity`` in the
-    catalog. Pure and side-effect-free (no DB); cut over is not a hot path.
-    """
-    return len(
-        _cutover_identity_tables(
-            session, eval_store, conversion_store, session_id, migration_state=migration_state
-        )
-    )
-
-
 def _cutover_identity_tables(
     session: object,
     eval_store: "Optional[EvaluationStore]",
@@ -5312,8 +5282,16 @@ def _cutover_identity_tables(
     *,
     migration_state: object = None,
 ) -> "list[str]":
-    """The migrated tables whose applied conversion makes the key an identity (what
-    :func:`_cutover_pending_identity_tables` counts), ``[]`` without the schema inputs.
+    """The migrated tables whose applied conversion makes the key an identity, ``[]``
+    without the schema inputs (no schema-conversion / evaluation state) or when no table
+    uses the IDENTITY_WITH_CACHE strategy.
+
+    Rebuilds the APPLIED conversions exactly as :func:`_cutover_pending_foreign_keys`
+    does (deterministic re-conversion overlaid with the Schema-Conversion edits, where
+    the per-table PK-strategy picker bakes the ``GENERATED ... AS IDENTITY`` clause), and
+    keeps the tables whose applied DDL declares the auto-increment key as an identity --
+    the same tables ``sync_identity_sequences`` reaches via ``is_identity`` in the
+    catalog.
 
     Both identity syncs take these beside the tables a Validation compared: a table left
     out of the run (its chip off) still took CDC's explicit ids, and its sequence was

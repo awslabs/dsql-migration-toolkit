@@ -330,7 +330,6 @@ def test_an_unselected_identity_table_pointing_into_the_set_is_neither_counted_n
     from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
     from dsql_migrator.ui.validation import (
         _cutover_identity_tables,
-        _cutover_pending_identity_tables,
         _in_migration_scope,
         _identity_sync_context,
     )
@@ -358,9 +357,9 @@ def test_an_unselected_identity_table_pointing_into_the_set_is_neither_counted_n
     assert _cutover_identity_tables(
         session, evals, _conversion_store(), "s1", migration_state=migration
     ) == [ORDERS, EVENTS]
-    assert _cutover_pending_identity_tables(
+    assert len(_cutover_identity_tables(
         session, evals, _conversion_store(), "s1", migration_state=migration
-    ) == 2
+    )) == 2
     # No recorded selection: every table, as before.
     assert _cutover_identity_tables(
         session, evals, _conversion_store(), "s1",

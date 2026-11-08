@@ -79,7 +79,6 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.target_introspector import TargetIntrospector
 from dsql_migrator.ui.ai_assist import ai_is_usable
 from dsql_migrator.ui.connect import make_source_engine_factory
-from dsql_migrator.ui.ai_chat_drawer import chat_turns_remaining
 from dsql_migrator.ui.design import (
     EXPANSION_PANEL_CLASSES,
     definition_row,
@@ -3545,7 +3544,6 @@ __all__ = [
     "compute_migration_score",
     "MigrationScore",
     "with_refreshed_catalogs",
-    "chat_turns_remaining",
     "filter_assessment_items",
     "assessment_page",
     "OBJECTS_PER_PAGE",

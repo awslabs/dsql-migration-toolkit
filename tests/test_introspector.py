@@ -1074,7 +1074,7 @@ def test_is_source_transient_error_dispatches_by_source_type() -> None:
 
 def test_source_error_hint_is_worded_for_the_source_engine() -> None:
     from dsql_migrator.core.introspector import (
-        SOURCE_CONNECTION_LOST_HINT,
+        SOURCE_CONNECTION_LOST_HINT_TEMPLATE,
         source_error_hint,
     )
     from dsql_migrator.core.models import SourceType
@@ -1090,9 +1090,11 @@ def test_source_error_hint_is_worded_for_the_source_engine() -> None:
     )
     assert pg_toomany is not None
     assert "PostgreSQL" in pg_toomany and "connection" in pg_toomany.lower()
-    # Back-compat: the MySQL-rendered constant is unchanged and the default dispatch
-    # still words the hint for MySQL.
-    assert SOURCE_CONNECTION_LOST_HINT.startswith("The source MySQL connection dropped")
+    # The template rendered for MySQL is unchanged and the default dispatch still
+    # words the hint for MySQL.
+    assert SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine="MySQL").startswith(
+        "The source MySQL connection dropped"
+    )
     mysql_hint = source_error_hint(_pymysql_operational(2013, "Lost connection"))
     assert mysql_hint is not None and "MySQL" in mysql_hint and "PostgreSQL" not in mysql_hint
 

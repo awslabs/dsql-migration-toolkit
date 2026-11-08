@@ -13,6 +13,7 @@ converted (Property 6 / Requirements 4.1, 4.2, 4.3, 4.4).
 from __future__ import annotations
 
 import pytest
+import sqlglot
 
 from dsql_migrator.core.models import Classification
 from dsql_migrator.core.query_converter import (
@@ -25,7 +26,7 @@ from dsql_migrator.core.query_converter import (
     QueryConversionResult,
     QueryConverter,
     StatementKind,
-    classify_sql,
+    classify_statement,
 )
 
 
@@ -282,11 +283,14 @@ def test_manual_review_never_silently_drops_input() -> None:
         ("DROP TABLE t", StatementKind.DDL),
         ("TRUNCATE TABLE t", StatementKind.DDL),
         ("SET autocommit = 1", StatementKind.OTHER),
-        ("nonsense ((", StatementKind.OTHER),
     ],
 )
-def test_classify_sql(sql: str, expected: StatementKind) -> None:
-    assert classify_sql(sql) is expected
+def test_classify_statement(sql: str, expected: StatementKind) -> None:
+    assert classify_statement(sqlglot.parse_one(sql, read="mysql")) is expected
+
+
+def test_an_unparseable_statement_is_classified_other() -> None:
+    assert _convert("nonsense ((").statement_kind is StatementKind.OTHER
 
 
 def test_pretty_renders_multi_line_without_changing_default() -> None:
@@ -333,11 +337,10 @@ def test_pg_only_syntax_becomes_testable_instead_of_other() -> None:
 
     sql = "SELECT id FROM t WHERE tags @> '[1]'::jsonb"
     assert QueryConverter().convert(sql).statement_kind is StatementKind.OTHER
-    assert classify_sql(sql) is StatementKind.OTHER
     pg = QueryConverter(source_type=SourceType.POSTGRES).convert(sql)
     assert pg.statement_kind is StatementKind.SELECT
     assert pg.converted_sql is not None
-    assert classify_sql(sql, source_type=SourceType.POSTGRES) is StatementKind.SELECT
+    assert classify_statement(sqlglot.parse_one(sql, read="postgres")) is StatementKind.SELECT
 
 
 def test_parse_error_names_the_source_engine() -> None:

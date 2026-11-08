@@ -1169,29 +1169,18 @@ def check_msk_connect_available(available: bool) -> PrerequisiteResult:
     )
 
 
-def _skipped(
-    check_id: PrerequisiteCheckId, title: str, *, reason: str = "mode"
-) -> PrerequisiteResult:
+def _skipped(check_id: PrerequisiteCheckId, title: str) -> PrerequisiteResult:
     """Build a non-applicable (SKIP) result for a check that did not run.
 
-    ``reason`` says WHY, because the two are not interchangeable and saying the wrong
-    one misleads: ``"mode"`` means the check applies to this engine but only in CDC
-    (so Full Load previews it as upcoming work), while ``"engine"`` means it never
-    applies to this source at all. A PostgreSQL source was shown "Binary log uses ROW
-    format ... Not applicable for this mode", which reads as "it WILL apply once you
-    switch to CDC" -- PostgreSQL has no binary log in any mode.
+    The check applies to this engine but only in CDC, so Full Load previews it as
+    upcoming work ("Not applicable for this mode.").
     """
-    detail = (
-        "Not applicable for this source engine."
-        if reason == "engine"
-        else "Not applicable for this mode."
-    )
     return PrerequisiteResult(
         check_id=check_id,
         title=title,
         status=PrerequisiteStatus.SKIP,
         required=True,
-        detail=detail,
+        detail="Not applicable for this mode.",
     )
 
 

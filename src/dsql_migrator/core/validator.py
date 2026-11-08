@@ -141,20 +141,12 @@ from dsql_migrator.core.watermark import COMMIT, read_binlog_status_row
 # (`from dsql_migrator.core.validator import build_mysql_checksum_sql`, used by tests)
 # and this module's own DB-access layer keep resolving unchanged.
 from dsql_migrator.core.validation_sql import (  # noqa: F401
-    _CHECKSUM_HEX_DIGITS,
-    _INTEGER_BASE_TYPES,
-    _NULL_SENTINEL,
     _checksum_kind,
     _checksum_omits_column,
-    _decimal_scale,
     _mysql_checksum_expr,
-    _mysql_concat_term,
     _param_safe,
     _pg_checksum_expr,
-    _pg_concat_term,
     _pg_table_identifier,
-    _quote_mysql_identifier,
-    _quote_mysql_table,
     _text_mysql_table,
     build_mysql_checksum_sql,
     build_mysql_composite_boundary_sql,
@@ -179,7 +171,6 @@ from dsql_migrator.core.validation_sql import (  # noqa: F401
     has_numeric_checksum_column,
     integer_pk_column,
     pk_paging_columns,
-    single_pk_column,
     stale_numeric_render_scales,
 )
 

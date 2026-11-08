@@ -5284,8 +5284,8 @@ def test_validation_run_identity_sync_failed_stored_and_surfaced() -> None:
     assert "orders" in blob
 
 
-def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> None:
-    # FIX 8: the identity-sync button is gated on a count of tables converted to a
+def test_cutover_identity_tables_counts_identity_strategy_tables() -> None:
+    # FIX 8: the identity-sync button is gated on the tables converted to a
     # server-generated (IDENTITY) key -- computed from the applied conversions, like
     # _cutover_pending_foreign_keys.
     from types import SimpleNamespace
@@ -5299,7 +5299,7 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
         ColumnDef, SourceInventory, SourceType, TableDef,
     )
     from dsql_migrator.ui.schema_conversion import applied_table_conversions
-    from dsql_migrator.ui.validation import _cutover_pending_identity_tables
+    from dsql_migrator.ui.validation import _cutover_identity_tables
 
     # An AUTO_INCREMENT table + a plain (no auto-increment) table.
     inv = SourceInventory(
@@ -5331,9 +5331,9 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
             preserve_foreign_keys=True, edited_target_ddls={}
         )
     )
-    assert _cutover_pending_identity_tables(
+    assert len(_cutover_identity_tables(
         session, eval_store, default_store, "s"
-    ) == 1
+    )) == 1
     # An explicit Keep (the picker bakes it into an edited DDL) -> no identity -> 0.
     keep_conv = SchemaConverter(source_type=SourceType.MYSQL).convert(
         inv,
@@ -5347,7 +5347,7 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
             },
         )
     )
-    assert _cutover_pending_identity_tables(session, eval_store, keep_store, "s") == 0
+    assert len(_cutover_identity_tables(session, eval_store, keep_store, "s")) == 0
 
     # Bake the IDENTITY_WITH_CACHE conversion for "orders" into an edited DDL (exactly
     # what the Schema-Conversion PK-strategy picker stores) -> counted as 1.
@@ -5367,9 +5367,9 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
             edited_target_ddls={"orders": orders_ddl},
         )
     )
-    assert _cutover_pending_identity_tables(
+    assert len(_cutover_identity_tables(
         session, eval_store, identity_store, "s"
-    ) == 1
+    )) == 1
     # Scoped to the migrated selection like the FK count: an identity table the
     # migration never loaded is not "pending" (the syncs reach the migrated tables, G127).
     from dsql_migrator.core.models import TableSelection
@@ -5377,15 +5377,15 @@ def test_cutover_pending_identity_tables_counts_identity_strategy_tables() -> No
     def _ms(tables):
         return SimpleNamespace(selection=TableSelection(selected_tables=tables))
 
-    assert _cutover_pending_identity_tables(
+    assert len(_cutover_identity_tables(
         session, eval_store, identity_store, "s", migration_state=_ms(["lookup"])
-    ) == 0
-    assert _cutover_pending_identity_tables(
+    )) == 0
+    assert len(_cutover_identity_tables(
         session, eval_store, identity_store, "s", migration_state=_ms(["orders"])
-    ) == 1
+    )) == 1
 
     # No conversion / eval state -> 0 (guarded).
-    assert _cutover_pending_identity_tables(session, None, identity_store, "s") == 0
+    assert len(_cutover_identity_tables(session, None, identity_store, "s")) == 0
     # And the applied overlay actually carries the identity clause (round-trip sanity).
     applied = applied_table_conversions(
         SchemaConverter(source_type=SourceType.MYSQL).convert(inv),

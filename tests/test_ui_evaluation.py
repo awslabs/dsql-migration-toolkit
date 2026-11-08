@@ -551,31 +551,6 @@ def test_evaluation_state_filters_default_to_all() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AI chat guardrails (turn limit)
-# ---------------------------------------------------------------------------
-
-
-def test_chat_turns_remaining_counts_only_user_turns() -> None:
-    from dsql_migrator.ui.evaluation import chat_turns_remaining
-
-    # The auto first question counts as one user turn; assistant turns do not.
-    messages = [
-        {"role": "user", "text": "auto question"},
-        {"role": "assistant", "text": "answer"},
-        {"role": "user", "text": "follow-up"},
-    ]
-    assert chat_turns_remaining(messages, max_turns=10) == 8
-
-
-def test_chat_turns_remaining_floors_at_zero() -> None:
-    from dsql_migrator.ui.evaluation import chat_turns_remaining
-
-    messages = [{"role": "user", "text": f"q{i}"} for i in range(5)]
-    assert chat_turns_remaining(messages, max_turns=3) == 0
-    assert chat_turns_remaining([], max_turns=3) == 3
-
-
-# ---------------------------------------------------------------------------
 # Migration readiness score
 # ---------------------------------------------------------------------------
 

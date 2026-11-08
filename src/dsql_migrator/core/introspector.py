@@ -178,8 +178,6 @@ SOURCE_CONNECTION_LOST_HINT_TEMPLATE = (
     "resumes by primary key, so it fills only what is missing and never duplicates "
     "rows."
 )
-# MySQL-rendered constant kept for backward compatibility (and existing callers/tests).
-SOURCE_CONNECTION_LOST_HINT = SOURCE_CONNECTION_LOST_HINT_TEMPLATE.format(engine="MySQL")
 
 # Operator-facing explanation for a PostgreSQL read refused under ``row_security = off``
 # (see ``source_dialect.postgres._PG_ROW_SECURITY_OFF``). The driver text names the table
@@ -207,9 +205,6 @@ SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE = (
     "FULL_LOAD_READER_SHARDS), or raise the source's max_connections, then re-run — "
     "the load is idempotent and fills only what is missing."
 )
-SOURCE_TOO_MANY_CONNECTIONS_HINT = SOURCE_TOO_MANY_CONNECTIONS_HINT_TEMPLATE.format(
-    engine="MySQL"
-)
 
 
 def _mysql_too_many_connections(exc: BaseException) -> bool:
@@ -229,10 +224,6 @@ def _mysql_too_many_connections(exc: BaseException) -> bool:
         ):
             return True
     return "too many connections" in str(exc).lower()
-
-
-# Backward-compatible alias (the historical private name).
-_is_too_many_connections = _mysql_too_many_connections
 
 
 def is_source_transient_error(

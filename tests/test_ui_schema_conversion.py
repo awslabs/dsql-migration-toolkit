@@ -71,7 +71,6 @@ from dsql_migrator.ui.schema_conversion import (
     build_object_tree,
     build_table_preview,
     build_target_object_tree,
-    ddl_equivalent,
     generate_previews,
     job_status_to_step_status,
     override_apply_objects,
@@ -690,25 +689,6 @@ def test_selected_object_names_strips_leaf_prefixes_and_ignores_groups() -> None
 
 def test_selected_object_names_empty_for_no_object_leaves() -> None:
     assert selected_object_names(["schema:app", "category:views:app"]) == set()
-
-
-def test_ddl_equivalent_ignores_trailing_semicolons_and_whitespace() -> None:
-    assert ddl_equivalent(
-        'CREATE TABLE "t" (id uuid);',
-        '  CREATE TABLE "t" (id uuid)  ',
-    )
-    # Multi-statement scripts compare statement-by-statement.
-    assert ddl_equivalent(
-        'CREATE TABLE "t" (id uuid);\nCREATE INDEX ASYNC ix ON "t" (id);',
-        'CREATE TABLE "t" (id uuid) ;  CREATE INDEX ASYNC ix ON "t" (id)',
-    )
-
-
-def test_ddl_equivalent_detects_real_differences() -> None:
-    assert not ddl_equivalent(
-        'CREATE TABLE "t" (id uuid PRIMARY KEY);',
-        'CREATE TABLE "t" (id bigint PRIMARY KEY);',
-    )
 
 
 class _FakeCoreApplier:

@@ -67,7 +67,6 @@ from dsql_migrator.core.converter import (
 )
 from dsql_migrator.core.models import Classification, SourceType
 
-_MYSQL = "mysql"
 _POSTGRES = "postgres"
 
 
@@ -156,28 +155,6 @@ def classify_statement(tree: exp.Expression) -> StatementKind:
         return StatementKind.SELECT
     return StatementKind.OTHER
 
-
-def classify_sql(
-    sql: str, *, source_type: "Optional[SourceType]" = None
-) -> StatementKind:
-    """Parse ``sql`` in the SOURCE dialect and classify it; ``OTHER`` when unparseable.
-
-    A convenience wrapper over :func:`classify_statement` for callers that have a
-    raw string rather than a parsed tree. Parsing only -- never executed.
-
-    ``source_type`` selects the read dialect and defaults to MySQL (the original engine).
-    It matters because the classification gates the read-only target probe: a statement
-    that does not parse falls to ``OTHER``, which is not testable, so hard-coding MySQL
-    made every PostgreSQL-only construct untestable on a PostgreSQL migration.
-    """
-    read = _POSTGRES if source_type is SourceType.POSTGRES else _MYSQL
-    try:
-        tree = sqlglot.parse_one(sql, read=read)
-    except sqlglot.errors.ParseError:
-        return StatementKind.OTHER
-    if tree is None:
-        return StatementKind.OTHER
-    return classify_statement(tree)
 
 # A single, reused description of the DSQL FOR UPDATE constraint so every lock
 # warning explains the same rule (Requirement 4.2).
@@ -2494,7 +2471,6 @@ __all__ = [
     "QueryConverter",
     "StatementKind",
     "classify_statement",
-    "classify_sql",
     "table_column_names",
     "CODE_PARSE_ERROR",
     "CODE_RENDER_ERROR",

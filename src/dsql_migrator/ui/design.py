@@ -471,23 +471,6 @@ def schema_chip_classes(group: str, *, selected: bool) -> str:
     return f"{base} border-gray-300 {text} bg-white hover:bg-gray-50"
 
 
-# ---------------------------------------------------------------------------
-# Segmented control (Cloudscape "SegmentedControl")
-# ---------------------------------------------------------------------------
-
-# A Cloudscape "segmented control" is a single bordered group of segments where
-# the selected segment is filled with the primary color and the rest stay quiet
-# (white background, dark text). NiceGUI is Quasar-based, so this maps onto a
-# ``q-btn-toggle`` (``ui.toggle``): keeping the props/classes here is the single
-# source of truth so every in-app filter/segmented picker reads the same instead
-# of each screen styling a toggle ad hoc. Props give the selected/unselected
-# coloring; the classes draw the surrounding border and clip the segments.
-SEGMENTED_TOGGLE_PROPS = (
-    "no-caps unelevated dense toggle-color=primary color=white text-color=grey-8"
-)
-SEGMENTED_TOGGLE_CLASSES = "rounded-md border border-gray-300 overflow-hidden"
-
-
 # Quasar's QTable puts ``q-table--no-wrap`` on its container unless the ``wrap-cells``
 # prop is set, and that class is what carries ``white-space: nowrap`` onto every
 # ``th``/``td`` (verified in a real browser: the rule matching the cell is
@@ -568,31 +551,6 @@ def fit_table_css(ui) -> None:
 # (usually with ``w-full``) to keep every collapsible panel matching the cards. Kept
 # here as the single source of truth so the shade cannot drift per screen.
 EXPANSION_PANEL_CLASSES = "rounded-md border border-gray-200"
-
-
-def segmented_control(
-    ui,
-    options,
-    *,
-    value,
-    on_change,
-    extra_props: str = "",
-    classes: str = "",
-):
-    """Render an AWS Console (Cloudscape "SegmentedControl")-style picker.
-
-    Wraps NiceGUI's ``ui.toggle`` with the shared :data:`SEGMENTED_TOGGLE_PROPS`
-    and :data:`SEGMENTED_TOGGLE_CLASSES` so every segmented filter in the app
-    looks the same: a bordered group of segments with the selected one filled in
-    the primary color. ``options`` is the usual ``ui.toggle`` mapping (value ->
-    label) or list; ``value``/``on_change`` are forwarded unchanged.
-    ``extra_props``/``classes`` append caller tweaks. Returns the created toggle
-    so the caller can further chain (e.g. ``.tooltip(...)``).
-    """
-    toggle = ui.toggle(options, value=value, on_change=on_change)
-    toggle.props(f"{SEGMENTED_TOGGLE_PROPS} {extra_props}".strip())
-    toggle.classes(f"{SEGMENTED_TOGGLE_CLASSES} {classes}".strip())
-    return toggle
 
 
 # ---------------------------------------------------------------------------
@@ -893,11 +851,8 @@ __all__ = [
     "chip_group_text_class",
     "chip_group_quasar_color",
     "schema_chip_classes",
-    "SEGMENTED_TOGGLE_PROPS",
-    "SEGMENTED_TOGGLE_CLASSES",
     "EXPANSION_PANEL_CLASSES",
     "WRAP_CELLS_PROP",
-    "segmented_control",
     "FILTER_SELECT_PROPS",
     "FILTER_SELECT_CLASSES",
     "filter_bar",

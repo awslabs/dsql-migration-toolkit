@@ -158,10 +158,8 @@ def _open_connection_with_retry(
 ConnectionFactory = Callable[[], Any]
 
 # DDL object kinds the applier recognizes when deriving an object's identity and
-# building its DROP statement for a destructive REPLACE.
-_TABLE = "TABLE"
-_VIEW = "VIEW"
-_MATERIALIZED_VIEW = "MATERIALIZED VIEW"
+# building its DROP statement for a destructive REPLACE (tables and views are compared
+# as the literal kinds "TABLE" / "VIEW").
 _INDEX = "INDEX"
 _SCHEMA = "SCHEMA"
 
