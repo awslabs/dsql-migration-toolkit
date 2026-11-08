@@ -31,6 +31,12 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import sqlglot
 
+from dsql_migrator.core.dsql_limits import (
+    DSQL_MAX_CHAR_LENGTH,
+    DSQL_MAX_VARCHAR_LENGTH,
+    DSQL_NUMERIC_MAX_PRECISION,
+    DSQL_NUMERIC_MAX_SCALE,
+)
 from dsql_migrator.core.models import ColumnDef, TableDef
 from dsql_migrator.core.source_dialect import PostgresSourceDialect
 
@@ -691,20 +697,13 @@ _DSQL_SUPPORTED_PG_BASE_TYPES = frozenset(
 # timestamp(6) with time zone.
 _TYPE_MODIFIER_RE = re.compile(r"\(\s*\d+\s*(?:,\s*\d+\s*)?\)")
 
-# Aurora DSQL numeric limits, from the SERVICE DOCUMENTATION ("Supported data types":
-# "The maximum precision is 1000 and scale can be between -1000 and 1000", default
-# numeric(18,6), max storage 510 bytes) and re-confirmed live 2026-09-25 against a real
-# cluster: numeric(1000,1000) is accepted, numeric(1001,0) is rejected with "NUMERIC
-# precision 1001 must be between 1 and 1000", and a 500-integer-digit + 500-decimal-digit
-# value round-tripped EXACT.
-#
-# These were 38/37 (mirroring converter._DSQL_NUMERIC_*), the limit DSQL enforced when this
-# code was written. The service raised it and the constants did not, so a PostgreSQL
-# numeric(40,10) -- well within both engines -- was silently narrowed to numeric(38,10) and
-# lost digits, while the warning asserted a DSQL maximum that no longer exists. A
-# numeric(p,s) beyond 1000 is still REJECTED at CREATE TABLE, so the clamp itself is kept.
-_DSQL_NUMERIC_MAX_PRECISION = 1000
-_DSQL_NUMERIC_MAX_SCALE = 1000
+# Aurora DSQL numeric limits (core/dsql_limits.py holds the figures and their sources). While
+# they said 38/37 a PostgreSQL numeric(40,10) -- well within both engines -- was silently
+# narrowed to numeric(38,10) and lost digits, while the warning asserted a DSQL maximum that
+# no longer exists. A numeric(p,s) beyond 1000 is still REJECTED at CREATE TABLE, so the
+# clamp itself is kept.
+_DSQL_NUMERIC_MAX_PRECISION = DSQL_NUMERIC_MAX_PRECISION
+_DSQL_NUMERIC_MAX_SCALE = DSQL_NUMERIC_MAX_SCALE
 _NUMERIC_SPEC_RE = re.compile(
     r"^\s*(numeric|decimal|dec)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*$", re.IGNORECASE
 )
@@ -790,16 +789,13 @@ def clamp_pg_numeric(pg_type: str) -> "tuple[str, Optional[str]]":
     )
 
 
-# Aurora DSQL's DECLARED-LENGTH ceilings for the character types, live-verified on a real
-# cluster (and documented in "Supported data types in Aurora DSQL"):
-#   CREATE ... VARCHAR(65536) -> ProgramLimitExceeded
-#       "Datatype limit greater than 65535 bytes not supported for varchar"
-#   CREATE ... CHAR(4097)     -> "Datatype limit greater than 4096 bytes not supported for char"
-# VARCHAR(65535) / CHAR(4096) are accepted. PostgreSQL allows up to ~1 GB, so a source
-# column above these ceilings made the WHOLE CREATE TABLE fail at apply with nothing having
-# warned -- and `dsql_lint` does not catch it either (0 diagnostics on VARCHAR(100000)).
-_DSQL_MAX_VARCHAR_LENGTH = 65535
-_DSQL_MAX_CHAR_LENGTH = 4096
+# Aurora DSQL's DECLARED-LENGTH ceilings for the character types (core/dsql_limits.py holds
+# the figures and the errors DSQL returns past them). PostgreSQL allows up to ~1 GB, so a
+# source column above these ceilings made the WHOLE CREATE TABLE fail at apply with nothing
+# having warned -- and `dsql_lint` does not catch it either (0 diagnostics on
+# VARCHAR(100000)).
+_DSQL_MAX_VARCHAR_LENGTH = DSQL_MAX_VARCHAR_LENGTH
+_DSQL_MAX_CHAR_LENGTH = DSQL_MAX_CHAR_LENGTH
 
 # `character varying(n)`/`varchar(n)` and `character(n)`/`char(n)`, capturing n. Deliberately
 # NOT matching a bare spelling (no modifier): an unbounded varchar is already emitted as

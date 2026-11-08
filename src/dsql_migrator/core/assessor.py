@@ -36,6 +36,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Sequence
 
+from dsql_migrator.core.dsql_limits import DSQL_NUMERIC_MAX_PRECISION
 from dsql_migrator.core.models import (
     AiAssessmentReport,
     AssessmentConcern,
@@ -182,16 +183,13 @@ _MAX_SECONDARY_INDEXES_PER_TABLE = _MAX_INDEXES_PER_TABLE - 1
 # apply, on the empty table) -- which is why the converter leaves such an index out.
 _MAX_KEY_COLUMNS = 8
 
-# DSQL's documented maximum numeric precision. Was 38 -- the limit the service enforced
-# when this rule was written -- and the service has since raised it to 1000 ("Supported
-# data types": maximum precision 1000, scale -1000..1000, default numeric(18,6)),
-# re-confirmed live: numeric(1000,1000) is accepted, numeric(1001,0) is rejected with
-# "NUMERIC precision 1001 must be between 1 and 1000", and a 500+500-digit value
-# round-trips EXACT. While it said 38 this rule graded a perfectly migratable
-# numeric(40,10) UNSUPPORTED ("a redesign is required") and the converter narrowed it,
-# losing digits DSQL would have stored. MySQL caps DECIMAL at 65, so in practice only a
-# PostgreSQL source can reach this at all.
-_MAX_NUMERIC_PRECISION = 1000
+# DSQL's documented maximum numeric precision (core/dsql_limits.py holds the figure and its
+# sources). Was 38 -- the limit the service enforced when this rule was written -- and while
+# it said 38 this rule graded a perfectly migratable numeric(40,10) UNSUPPORTED ("a
+# redesign is required") and the converter narrowed it, losing digits DSQL would have
+# stored. MySQL caps DECIMAL at 65, so in practice only a PostgreSQL source can reach this
+# at all.
+_MAX_NUMERIC_PRECISION = DSQL_NUMERIC_MAX_PRECISION
 
 # The MySQL base types whose values can exceed Aurora DSQL's 1 MiB per-value limit, so a
 # large enough value cannot be stored and must be reviewed: the MEDIUM*/LONG* TEXT and BLOB

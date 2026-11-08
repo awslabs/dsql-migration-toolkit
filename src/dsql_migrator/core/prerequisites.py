@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from dsql_migrator.core.prerequisites_postgres import PostgresCdcFacts
 
 from dsql_migrator.core.cdc_coords import gtid_mode_is_on
+from dsql_migrator.core.dsql_limits import DSQL_MAX_CHAR_LENGTH, DSQL_MAX_VARCHAR_LENGTH
 from dsql_migrator.core.models import (
     ConnectionResult,
     MigrationMode,
@@ -572,11 +573,11 @@ _DSQL_VALUE_LIMIT_BY_BASE_TYPE = {
     "bytea": DSQL_MAX_VALUE_BYTES,
     "json": DSQL_MAX_VALUE_BYTES,
     "jsonb": DSQL_MAX_VALUE_BYTES,
-    "character varying": 65535,
-    "varchar": 65535,
-    "character": 4096,
-    "char": 4096,
-    "bpchar": 4096,
+    "character varying": DSQL_MAX_VARCHAR_LENGTH,
+    "varchar": DSQL_MAX_VARCHAR_LENGTH,
+    "character": DSQL_MAX_CHAR_LENGTH,
+    "char": DSQL_MAX_CHAR_LENGTH,
+    "bpchar": DSQL_MAX_CHAR_LENGTH,
     # MySQL LOB families, whose own source limits are all at or under DSQL's text ceiling
     # (LONGTEXT/LONGBLOB reach 4 GiB, hence the cap). A MySQL JSON column converts to DSQL
     # json and uses the shared "json" key above.

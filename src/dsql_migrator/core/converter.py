@@ -83,6 +83,7 @@ from sqlglot.helper import seq_get
 from sqlglot.tokens import TokenType
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from dsql_migrator.core.dsql_limits import DSQL_NUMERIC_MAX_PRECISION, DSQL_NUMERIC_MAX_SCALE
 from dsql_migrator.core.models import (
     Classification,
     ColumnDef,
@@ -132,21 +133,11 @@ IDENTITY_FALLBACK_CAVEAT = (
     "target DDL before applying -- then " + IDENTITY_RESTART_ADVICE
 )
 
-# Aurora DSQL numeric limits, from the SERVICE DOCUMENTATION ("Supported data types":
-# "The maximum precision is 1000 and scale can be between -1000 and 1000", default
-# numeric(18,6), max storage 510 bytes) and re-confirmed live 2026-09-25 against a real
-# cluster: numeric(1000,1000) is accepted, numeric(1001,0) is rejected with "NUMERIC
-# precision 1001 must be between 1 and 1000", and a 500-integer-digit + 500-decimal-digit
-# value round-tripped EXACT.
-#
-# These were 38/37 -- the limit DSQL enforced when this code was written (the old comment
-# quoted its "precision 39 must be between 1 and 38" error verbatim). The service raised it
-# and the constants did not, so every numeric(p>38) column was silently NARROWED, losing
-# digits DSQL would have stored, while the warning asserted a maximum the service no longer
-# has. Whenever a DSQL limit is load-bearing, re-verify it against the docs first -- a
-# hardcoded quota goes stale invisibly.
-_DSQL_NUMERIC_MAX_PRECISION = 1000
-_DSQL_NUMERIC_MAX_SCALE = 1000
+# Aurora DSQL numeric limits (core/dsql_limits.py holds the figures, their sources, and how
+# they once went stale at 38/37). Whenever a DSQL limit is load-bearing, re-verify it
+# against the docs first -- a hardcoded quota goes stale invisibly.
+_DSQL_NUMERIC_MAX_PRECISION = DSQL_NUMERIC_MAX_PRECISION
+_DSQL_NUMERIC_MAX_SCALE = DSQL_NUMERIC_MAX_SCALE
 #
 # For a MySQL source the clamp is now effectively unreachable -- MySQL caps DECIMAL at
 # precision 65 / scale 30, both far below 1000 -- so a MySQL DECIMAL now converts verbatim
@@ -210,7 +201,8 @@ def _clamp_numeric_spec(params: list) -> tuple[str, Optional[str]]:
 # Aurora DSQL hard limits on primary/secondary keys (see the DSQL quotas docs).
 # Used to validate a COMPOSITE_KEY request so the converter never emits DDL that
 # DSQL would reject at CREATE/INSERT time. These are not configurable in DSQL.
-_DSQL_MAX_PK_COLUMNS = 8  # >8 -> error 54011 "more than 8 column keys ..."
+# The column limit (>8 -> error 54011 "more than 8 column keys ...") is the assessor's
+# _MAX_KEY_COLUMNS, bound as _DSQL_MAX_PK_COLUMNS after the assessor import further down.
 _DSQL_MAX_KEY_BYTES = 1024  # combined key >1 KiB -> error 54000 "key size too large"
 
 _MYSQL = "mysql"
@@ -3289,21 +3281,9 @@ def build_source_table_ddl(table: TableDef) -> str:
 
 # MySQL spatial types have no Aurora DSQL (PostgreSQL, no PostGIS) equivalent and
 # are not recognized as data types by sqlglot's MySQL dialect, so a table using
-# one cannot be reconstructed/transpiled. Detected to give a precise reason.
-_SPATIAL_TYPES = frozenset(
-    {
-        "geometry",
-        "point",
-        "linestring",
-        "polygon",
-        "multipoint",
-        "multilinestring",
-        "multipolygon",
-        "geometrycollection",
-        # MySQL 8.0+ reports GEOMETRYCOLLECTION as "geomcollection" in COLUMN_TYPE.
-        "geomcollection",
-    }
-)
+# one cannot be reconstructed/transpiled. Detected to give a precise reason. The set,
+# _SPATIAL_TYPES, is the assessor's _SPATIAL_TYPE_BASES, bound after the assessor import
+# further down, so a new spelling (like geomcollection) is added in one place.
 
 
 def _spatial_columns(table: TableDef) -> list[str]:
@@ -4788,14 +4768,18 @@ def _foreign_key_warning(
     )
 
 
-# Aurora DSQL limits + type sets, imported from the assessor rather than restated, so the
-# Evaluation rule and the matching conversion warning can never disagree. Restating a
-# literal in both places is exactly how the two screens drifted apart before.
+# Aurora DSQL limits + type sets the Evaluation rules also enforce, imported from the
+# assessor rather than restated, so the Evaluation rule and the matching conversion warning
+# can never disagree. Restating a literal in both places is exactly how the two screens
+# drifted apart before (the GEOMCOLLECTION fix had to edit a spatial set kept in each). The
+# numeric limits come from core/dsql_limits.py, imported at the top of this module.
 from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate literals
     _MAX_COLUMNS_PER_TABLE,
     _MAX_INDEXES_PER_TABLE,
+    _MAX_KEY_COLUMNS,
     _MAX_SECONDARY_INDEXES_PER_TABLE,
     _OVERSIZED_LOB_BASES,
+    _SPATIAL_TYPE_BASES,
     _UNSUPPORTED_INDEX_TYPES,
     _base_type,
     foreign_key_clauses_kept,
@@ -4803,6 +4787,11 @@ from dsql_migrator.core.assessor import (  # noqa: E402 - avoids duplicate liter
     pg_lob_is_deliberately_large,
     pg_oversized_lob_column_names,
 )
+
+# The converter's own names for two of them, which its functions read: the MySQL spatial
+# base types, and the 8-column limit on a primary key or secondary index.
+_SPATIAL_TYPES = _SPATIAL_TYPE_BASES
+_DSQL_MAX_PK_COLUMNS = _MAX_KEY_COLUMNS
 
 
 def mysql_generated_column_detail(table: TableDef) -> Optional[str]:
