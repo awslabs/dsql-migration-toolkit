@@ -542,7 +542,7 @@ def resync_identity_sequences(
     sync: "Optional[Callable[..., dict]]" = None,
     extras: "Optional[Mapping[str, object]]" = None,
     heartbeat: "Optional[Callable[[], None]]" = None,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, str]]:
     """Advance target identity sequences past the CURRENT ``MAX(pk)``. Best-effort.
 
     Run right after a full validation -- the step the operator reaches just before
