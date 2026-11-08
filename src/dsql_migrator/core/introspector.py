@@ -505,15 +505,17 @@ def build_source_engine(
     *,
     read_timeout_seconds: Optional[int] = None,
 ) -> Engine:
-    """Build a read-only source engine: every guarded source engine is built here.
+    """Build a read-only source engine: the shared builder of guarded source engines.
 
-    The driver scheme and engine kwargs come from the source dialect selected by
-    ``conn.source_type`` (default MySQL); the shared kwargs (``pool_pre_ping`` and a bounded
-    connect timeout) make an unreachable source fail fast instead of hanging a connection
-    test, introspection or Validation. Every engine gets the read-only guard (Property 1)
-    and the dialect's per-session settings (:func:`install_session_setup`: PostgreSQL's
-    ``row_security = off``, MySQL's REPEATABLE READ pin), so a future session setting or
-    engine argument cannot reach one read path and miss another.
+    Every guarded source engine is built here except PostgreSQL's TimeZone probe, named
+    with the other exceptions below. The driver scheme and engine kwargs come from the
+    source dialect selected by ``conn.source_type`` (default MySQL); the shared kwargs
+    (``pool_pre_ping`` and a bounded connect timeout) make an unreachable source fail fast
+    instead of hanging a connection test, introspection or Validation. Every engine built
+    here gets the read-only guard (Property 1) and the dialect's per-session settings
+    (:func:`install_session_setup`: PostgreSQL's ``row_security = off``, MySQL's
+    REPEATABLE READ pin), so a future session setting or engine argument cannot reach one
+    read path and miss another.
 
     ``password`` is revealed only here, when the engine is built, and is never stored on
     the connection config (Property 7); without one the URL carries no password.

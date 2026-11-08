@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""One builder for every read-only source engine, one entry point for the PostgreSQL writes.
+"""One shared read-only source-engine builder, one entry point for the PostgreSQL writes.
 
 Property 1 (the source is read-only) and the per-session settings (G136's REPEATABLE READ
 pin, PostgreSQL's ``row_security = off``) used to depend on two copies of the same five

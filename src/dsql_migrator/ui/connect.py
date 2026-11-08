@@ -307,7 +307,7 @@ def make_source_engine_factory(
     """Build an engine factory that injects the in-memory ``password``.
 
     The returned factory builds the source engine with
-    :func:`~dsql_migrator.core.introspector.build_source_engine`, the one builder of
+    :func:`~dsql_migrator.core.introspector.build_source_engine`, the shared builder of
     read-only source engines: the config's dialect (MySQL or PostgreSQL, selected by
     ``conn.source_type``), the read-only guard, so any introspection or connection test
     performed through it cannot write to the source (Property 1), and the dialect's

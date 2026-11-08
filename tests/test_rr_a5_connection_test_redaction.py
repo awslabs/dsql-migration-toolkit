@@ -13,9 +13,9 @@ Connect screen verbatim.
 
 These tests drive the REAL path: ``check_source_connection`` with no injected
 introspector, so the production engine factory receives the password and builds the URL
-with it. Only ``create_engine`` is replaced (in ``core.introspector``, where
-``build_source_engine`` builds every read-only source engine), by a driver whose connect
-error echoes the password of the URL it was given -- the case the redaction exists for.
+with it. Only ``create_engine`` is replaced (in ``core.introspector``, where the shared
+read-only builder ``build_source_engine`` calls it), by a driver whose connect error
+echoes the password of the URL it was given -- the case the redaction exists for.
 
 The last test pins the other half: with the unused ``secret`` reference gone, the source
 config carries no credential at all, and a persisted session still restores it.
