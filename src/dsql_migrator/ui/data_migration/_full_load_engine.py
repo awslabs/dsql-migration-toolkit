@@ -1490,6 +1490,45 @@ def _report_progress(
         pass
 
 
+class _RowFlusher:
+    """One load unit's live row progress, coalesced into occasional ``emit`` calls.
+
+    :meth:`add` takes each committed batch's ``(loaded, skipped)`` rows and calls
+    ``emit(loaded, skipped)`` with what has accumulated once :data:`PROGRESS_FLUSH_ROWS`
+    rows are pending or :data:`PROGRESS_FLUSH_SECONDS` have passed since the last flush.
+    :meth:`flush` sends the remainder, if any. The one accumulator for every load path: a
+    process worker emits ``(table, loaded, skipped)`` onto the progress queue, the thread
+    path advances the job's chunk. Touched only by the thread draining the unit's import,
+    so it needs no lock."""
+
+    __slots__ = ("_emit", "_loaded", "_skipped", "_last_flush")
+
+    def __init__(self, emit: Callable[[int, int], None]) -> None:
+        self._emit = emit
+        self._loaded = 0
+        self._skipped = 0
+        self._last_flush = _time.monotonic()
+
+    def add(self, loaded: int, skipped: int = 0) -> None:
+        self._loaded += loaded
+        self._skipped += skipped
+        now = _time.monotonic()
+        if (
+            self._loaded + self._skipped >= PROGRESS_FLUSH_ROWS
+            or now - self._last_flush >= PROGRESS_FLUSH_SECONDS
+        ):
+            loaded_now, skipped_now = self._loaded, self._skipped
+            self._loaded, self._skipped = 0, 0
+            self._last_flush = now
+            self._emit(loaded_now, skipped_now)
+
+    def flush(self) -> None:
+        if self._loaded or self._skipped:
+            loaded_now, skipped_now = self._loaded, self._skipped
+            self._loaded, self._skipped = 0, 0
+            self._emit(loaded_now, skipped_now)
+
+
 def _bind_load_stats(importer: object, stats: Optional[LoadStats]) -> None:
     """Make ``importer`` count into the load unit's ``stats`` (core.load_stats).
 
@@ -1960,24 +1999,9 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
     )
     try:
         migrator = BatchedTableMigrator(args.inputs)
-        pending_loaded = 0
-        pending_skipped = 0
-
-        last_flush = [_time.monotonic()]
-
-        def _on_rows(loaded: int, skipped: int = 0) -> None:
-            nonlocal pending_loaded, pending_skipped
-            pending_loaded += loaded
-            pending_skipped += skipped
-            now = _time.monotonic()
-            if (
-                pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS
-                or now - last_flush[0] >= PROGRESS_FLUSH_SECONDS
-            ):
-                flush_l, flush_s = pending_loaded, pending_skipped
-                pending_loaded, pending_skipped = 0, 0
-                last_flush[0] = now
-                _report_progress(progress_queue, (name, flush_l, flush_s))
+        row_progress = _RowFlusher(
+            lambda loaded, skipped: _report_progress(progress_queue, (name, loaded, skipped))
+        )
 
         _is_cancelled = lambda: (  # noqa: E731 - shared by the load + its retry
             cancel_event is not None and cancel_event.is_set()
@@ -2011,7 +2035,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             _attempt_state["first"] = False
             return migrator.migrate_table(
                 table,
-                on_rows=_on_rows,
+                on_rows=row_progress.add,
                 should_cancel=_is_cancelled,
                 pre_recreated=pre,
                 # P4d: the parent put its secondary indexes on before any unit -- true only
@@ -2046,8 +2070,7 @@ def _migrate_one_table_in_process(args: _TableWorkerArgs) -> _TableWorkerResult:
             )
         )
         # Flush remaining progress.
-        if (pending_loaded or pending_skipped) and progress_queue is not None:
-            _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
+        row_progress.flush()
         quarantine_recs = tuple(
             {"primary_key": r.primary_key, "message": r.message, "error_code": getattr(r, "error_code", None)}
             for r in (getattr(outcome, "quarantine_records", ()) or ())
@@ -2169,25 +2192,13 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     )
     try:
         migrator = BatchedTableMigrator(args.inputs)
-        pending_loaded = 0
-        pending_skipped = 0
-
-        last_flush = [_time.monotonic()]
+        row_progress = _RowFlusher(
+            lambda loaded, skipped: _report_progress(progress_queue, (name, loaded, skipped))
+        )
 
         def _on_rows(loaded: int, skipped: int = 0) -> None:
-            nonlocal pending_loaded, pending_skipped
             written[0] += loaded
-            pending_loaded += loaded
-            pending_skipped += skipped
-            now = _time.monotonic()
-            if (
-                pending_loaded + pending_skipped >= PROGRESS_FLUSH_ROWS
-                or now - last_flush[0] >= PROGRESS_FLUSH_SECONDS
-            ):
-                flush_l, flush_s = pending_loaded, pending_skipped
-                pending_loaded, pending_skipped = 0, 0
-                last_flush[0] = now
-                _report_progress(progress_queue, (name, flush_l, flush_s))
+            row_progress.add(loaded, skipped)
 
         applied = args.inputs.table_conversions.get(table.name)
         # Same deterministic fallback as the in-process path: the parent recreated this
@@ -2394,8 +2405,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             reread=bool(args.shared_snapshot_id),
             shard_count=args.shard_count,
         )
-        if (pending_loaded or pending_skipped) and progress_queue is not None:
-            _report_progress(progress_queue, (name, pending_loaded, pending_skipped))
+        row_progress.flush()
         if result.cancelled:
             return _TableWorkerResult(
                 table_name=name, status="STOPPED", shard_index=args.shard_index,
@@ -2641,6 +2651,51 @@ def _log_source_reread(
     )
 
 
+def _apply_progress_message(
+    msg: object, handle: JobHandle, load_stats: Optional[LoadStatsBoard]
+) -> None:
+    """Apply one worker progress message to the job (or, for counters, to ``load_stats``).
+
+    The one dispatch for the worker message kinds (:data:`_HEARTBEAT`, :data:`_LOAD_STATS`,
+    :data:`_SOURCE_REREAD`, :data:`_CHUNK_STARTED`, :data:`_CHUNK_THROTTLED` and the
+    ``(table, delta_loaded, delta_skipped)`` progress tuple), shared by
+    :func:`_drain_progress_queue`'s live loop and its final drain after stop, so a kind is
+    never handled in one and not the other. The tagged tuples are matched by tag AND length
+    before the generic progress tuple. Raises on a malformed message; the caller guards
+    each one."""
+    if msg == _HEARTBEAT:
+        # "Still alive, deliberately waiting" (a source-retry backoff). Stamps the
+        # watchdog's liveness clock without changing any job state.
+        handle.update(lambda job: None)
+        return
+    if isinstance(msg, tuple) and len(msg) == 4 and msg[0] == _LOAD_STATS:
+        # Counters only: no job update, so no persist and no liveness stamp. They
+        # are sent on a clock, so stamping would keep a worker that has stopped
+        # making progress looking alive to the stall watchdog.
+        _record_load_stats(load_stats, msg[1], msg[2], msg[3])
+        return
+    if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
+        _log_source_reread(*msg[1:])
+        return
+    if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
+        # A worker actually began its table -> mark IN_PROGRESS now (not at
+        # submission). (== not is: the marker is pickled across the process boundary.)
+        handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
+        return
+    if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
+        # Source-load governor paused/resumed a reader -> update the caption hint.
+        handle.update(
+            lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
+        )
+        return
+    table_name, delta_loaded, delta_skipped = msg  # type: ignore[misc]
+    handle.update(
+        lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
+            _start_then_advance(job, n, dl, ds)
+        )
+    )
+
+
 def _drain_progress_queue(
     progress_queue: "multiprocessing.Queue[object]",
     handle: JobHandle,
@@ -2680,37 +2735,7 @@ def _drain_progress_queue(
         # failure was invisible. A lost progress message costs a stale count; losing this
         # thread costs the run.
         try:
-            if msg == _HEARTBEAT:
-                # "Still alive, deliberately waiting" (a source-retry backoff). Stamps the
-                # watchdog's liveness clock without changing any job state.
-                handle.update(lambda job: None)
-                continue
-            if isinstance(msg, tuple) and len(msg) == 4 and msg[0] == _LOAD_STATS:
-                # Counters only: no job update, so no persist and no liveness stamp. They
-                # are sent on a clock, so stamping would keep a worker that has stopped
-                # making progress looking alive to the stall watchdog.
-                _record_load_stats(load_stats, msg[1], msg[2], msg[3])
-                continue
-            if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
-                _log_source_reread(*msg[1:])
-                continue
-            if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
-                # A worker actually began its table -> mark IN_PROGRESS now (not at
-                # submission). (== not is: the marker is pickled across the process boundary.)
-                handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
-                continue
-            if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
-                # Source-load governor paused/resumed a reader -> update the caption hint.
-                handle.update(
-                    lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
-                )
-                continue
-            table_name, delta_loaded, delta_skipped = msg
-            handle.update(
-                lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
-                    _start_then_advance(job, n, dl, ds)
-                )
-            )
+            _apply_progress_message(msg, handle, load_stats)
         except Exception:  # noqa: BLE001 - one message must never kill the drain thread
             _LOGGER.warning(
                 "Full Load progress drain could not apply a message; continuing",
@@ -2726,28 +2751,11 @@ def _drain_progress_queue(
             break
         # Guarded per message, like the main loop: this runs at TEARDOWN, where an
         # exception would propagate out of the drain thread's target and be reported as a
-        # run failure for work that had already finished.
+        # run failure for work that had already finished. The same dispatch as the main
+        # loop: this copy once lacked the heartbeat, so a trailing one fell through to the
+        # progress-tuple unpack and logged a spurious warning with a traceback.
         try:
-            if isinstance(msg, tuple) and len(msg) == 4 and msg[0] == _LOAD_STATS:
-                _record_load_stats(load_stats, msg[1], msg[2], msg[3])
-                continue
-            if isinstance(msg, tuple) and len(msg) == 7 and msg[0] == _SOURCE_REREAD:
-                _log_source_reread(*msg[1:])
-                continue
-            if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == _CHUNK_STARTED:
-                handle.update(lambda job, n=msg[1]: _start_chunk_if_pending(job, n))
-                continue
-            if isinstance(msg, tuple) and len(msg) == 3 and msg[0] == _CHUNK_THROTTLED:
-                handle.update(
-                    lambda job, n=msg[1], p=msg[2]: _set_table_throttled(job, n, p)
-                )
-                continue
-            table_name, delta_loaded, delta_skipped = msg
-            handle.update(
-                lambda job, n=table_name, dl=delta_loaded, ds=delta_skipped: (
-                    _start_then_advance(job, n, dl, ds)
-                )
-            )
+            _apply_progress_message(msg, handle, load_stats)
         except Exception:  # noqa: BLE001 - teardown must not raise over a progress count
             _LOGGER.warning(
                 "Full Load final progress drain could not apply a message; continuing",
@@ -3134,32 +3142,16 @@ def _migrate_one_table(
 
     # Coalesce frequent per-batch callbacks into occasional job updates so a
     # large table advances visibly without persisting on every batch. The
-    # accumulators are touched only on the single draining thread of this table's
-    # import, so they need no lock. ``pending_skipped`` is tracked separately so a
+    # accumulator is touched only on the single draining thread of this table's
+    # import, so it needs no lock. Skipped rows are tracked separately so a
     # re-load that mostly SKIPS already-present rows still advances the live
     # progress (rows-present) instead of looking stuck at zero, while the per-table
     # "newly loaded" count stays distinct from the "already present" count.
-    pending = [0]
-    pending_skipped = [0]
-
-    _last_flush = [_time.monotonic()]
-
-    def _on_rows(loaded: int, skipped: int = 0) -> None:
-        pending[0] += loaded
-        pending_skipped[0] += skipped
-        _now = _time.monotonic()
-        if (
-            pending[0] + pending_skipped[0] >= PROGRESS_FLUSH_ROWS
-            or _now - _last_flush[0] >= PROGRESS_FLUSH_SECONDS
-        ):
-            _last_flush[0] = _now
-            flush_loaded, pending[0] = pending[0], 0
-            flush_skipped, pending_skipped[0] = pending_skipped[0], 0
-            handle.update(
-                lambda job, n=name, dl=flush_loaded, ds=flush_skipped: (
-                    _advance_chunk_rows(job, n, dl, ds)
-                )
-            )
+    row_progress = _RowFlusher(
+        lambda loaded, skipped: handle.update(
+            lambda job, n=name, dl=loaded, ds=skipped: _advance_chunk_rows(job, n, dl, ds)
+        )
+    )
 
     # The table's write-path collector, across its source-drop re-reads, and on the run's
     # board while it loads; the final counters are recorded on every outcome.
@@ -3174,7 +3166,7 @@ def _migrate_one_table(
         try:
             outcome = _as_load_result(
                 _migrate_table_with_source_retry(
-                    migrator, table, on_rows=_on_rows, handle=handle, load_stats=stats,
+                    migrator, table, on_rows=row_progress.add, handle=handle, load_stats=stats,
                     defer_indexes=deferred_indexes is not None,
                     before_load_indexes=(
                         before_load_indexes if deferred_indexes is not None else None
