@@ -235,7 +235,7 @@ to both stacks. Debezium is open-source software running *on* MSK Connect.
 | AWS IAM | Least-privilege roles and DSQL IAM-token auth. |
 | AWS Secrets Manager | UI session-cookie signing secret (auto-created); optional reuse of an existing source-creds secret. |
 | Amazon Aurora DSQL | The migration target (PostgreSQL-compatible, IAM auth, OCC). |
-| Amazon S3 | Full Load staging, connector plugin artifacts, CodeBuild source. |
+| Amazon S3 | Connector plugin artifacts, CodeBuild source. |
 | Amazon CloudWatch (Logs) | App and connector logs; CDC lag / metrics. |
 | Amazon Bedrock | Optional AI assist (control plane only). |
 | AWS CloudFormation | Infrastructure-as-code for both stacks. |
@@ -366,7 +366,7 @@ Validation tabs) — no redeploy; resets on restart.
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | Structured activity log (one UTC-timestamped JSON line per event); downloadable from the UI, size-capped/rotated (~20 MB × 4 backups). |
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | Per-session non-secret workbench state so a reconnecting browser resumes. Pair with `DSQL_MIGRATOR_STORAGE_SECRET`. Local disk — the Fargate deploy uses the durable S3 store below instead. |
 | `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(unset)_ | Durable S3 store for the per-session snapshot, so resume survives a Fargate task replacement (a redeploy), not just an in-task restart. The Fargate deploy auto-sets it to the managed plugin bucket (no setup); leave unset locally to use the SQLite path above. |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | S3 bucket for Full Load staging (streaming multipart upload — the scalable path for large tables). Unset = bounded local temp CSV (dev / small tables). |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(unset)_ | No effect. Full Load streams rows from the source straight into Aurora DSQL in batched `INSERT`s; nothing is staged in S3 or in a local file. |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4` (≤16) | Tables, or parts of a large table, loaded concurrently (one worker process each). For a large run, set it to the task's vCPU count, up to 16. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8` (≤32) | At most this many in-flight `INSERT … ON CONFLICT` batches per table or part (within that, up to 2 per key range it is read in, never fewer than 4 unless this is lower), and 128 per run: a key range of an Aurora DSQL table takes about 20,000 rows/s whatever the batches in flight, so more batches only add commit latency and Aurora DSQL compute cost. |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000` (≤3000) | Rows per batched write, capped at DSQL's 3000-row per-transaction limit. |

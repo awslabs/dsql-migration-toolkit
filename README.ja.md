@@ -232,7 +232,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | AWS IAM | 最小権限のロールと DSQL の IAM トークン認証。 |
 | AWS Secrets Manager | UI セッションクッキー署名シークレット（自動作成）。既存のソース認証情報シークレットの再利用は任意。 |
 | Amazon Aurora DSQL | 移行のターゲット（PostgreSQL 互換、IAM 認証、OCC）。 |
-| Amazon S3 | Full Load のステージング、コネクタプラグインのアーティファクト、CodeBuild のソース。 |
+| Amazon S3 | コネクタプラグインのアーティファクト、CodeBuild のソース。 |
 | Amazon CloudWatch (Logs) | アプリとコネクタのログ。CDC のラグ / メトリクス。 |
 | Amazon Bedrock | 任意の AI アシスト（コントロールプレーンのみ）。 |
 | AWS CloudFormation | 両スタックの Infrastructure-as-Code。 |
@@ -361,7 +361,7 @@ MSK Connect *上で*動作するオープンソースソフトウェアです。
 | `DSQL_MIGRATOR_ACTIVITY_LOG_PATH` | `migration_activity.log` | 構造化アクティビティログ（イベントごとに UTC タイムスタンプ付きの JSON 1 行）。UI からダウンロード可、サイズ上限・ローテーション（約 20 MB × バックアップ 4 個）。 |
 | `DSQL_MIGRATOR_SESSION_STATE_PATH` | `session_state.sqlite` | セッションごとの非機密のワークベンチ状態 — 再接続したブラウザが再開。`DSQL_MIGRATOR_STORAGE_SECRET` と併用。ローカルディスク — Fargate デプロイは下記の durable な S3 ストアを使用。 |
 | `DSQL_MIGRATOR_SESSION_STATE_BUCKET` | _(未設定)_ | セッションスナップショット用の durable な S3 ストア — プロセス内再起動だけでなく Fargate のタスク置換（再デプロイ）を越えて再開が保持される。Fargate デプロイが管理対象プラグインバケットに自動設定（設定不要）;ローカルは未設定で上記 SQLite パスを使用。 |
-| `DSQL_MIGRATOR_STAGING_BUCKET` | _(未設定)_ | Full Load ステージング用の S3 バケット（ストリーミングのマルチパートアップロード — 大規模テーブル向けのスケーラブルな経路）。未設定時は上限付きローカル一時 CSV（開発 / 小規模）。 |
+| `DSQL_MIGRATOR_STAGING_BUCKET` | _(未設定)_ | 効果なし。Full Load はソースの行をバッチ `INSERT` で Aurora DSQL に直接ストリーミングし、S3 やローカルファイルにはステージングしません。 |
 | `DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM` | `4`（≤16） | 並行してロードするテーブル（または大きなテーブルの部分）の数（それぞれワーカープロセス 1 つ）。大規模な実行ではタスクの vCPU 数（最大 16）に設定。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_PARALLELISM` | `8`（≤32） | テーブル（または部分）あたりの処理中の `INSERT … ON CONFLICT` バッチ数の上限（その中で、読み取るキー範囲あたり最大 2、この値のほうが小さくない限り最低 4）、実行あたり最大 128: Aurora DSQL はテーブルの 1 つのキー範囲を進行中のバッチ数にかかわらず約 20,000 rows/s で書き込むため、それ以上のバッチはコミットレイテンシと Aurora DSQL のコンピュートコストを増やすだけ。 |
 | `DSQL_MIGRATOR_FULL_LOAD_BATCH_ROWS` | `2000`（≤3000） | バッチ書き込みあたりの行数。DSQL のトランザクションごとの 3000 行制限で上限。 |
