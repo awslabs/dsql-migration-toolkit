@@ -7575,14 +7575,18 @@ class SchemaConverter:
                 )
             )
 
-        # A tinyint(1) AUTO_INCREMENT key the identity strategy makes a bigint identity is
-        # an integer key, not a boolean: the "mapped to boolean" note would describe a type
-        # its DDL does not have.
+        # An UNSET strategy resolves per table (identity where it applies and is lossless,
+        # keep otherwise). An explicitly-set one is honoured as given -- the operator's
+        # choice, not a default. Resolved once: the notes below and _apply_pk_strategy
+        # must describe the same strategy.
         effective_strategy = (
             options.primary_key_strategy
             if "primary_key_strategy" in options.model_fields_set
             else default_primary_key_strategy(table, is_postgres=is_postgres)
         )
+        # A tinyint(1) AUTO_INCREMENT key the identity strategy makes a bigint identity is
+        # an integer key, not a boolean: the "mapped to boolean" note would describe a type
+        # its DDL does not have.
         identity_key = (
             table.auto_increment_column
             if effective_strategy is PrimaryKeyStrategy.IDENTITY_WITH_CACHE
@@ -7902,16 +7906,7 @@ class SchemaConverter:
                 _apply_pk_strategy(
                     create,
                     table,
-                    # An UNSET strategy resolves per table (identity where it applies
-                    # and is lossless, keep otherwise). An explicitly-set one is
-                    # honoured as given -- the operator's choice, not a default.
-                    (
-                        options.primary_key_strategy
-                        if "primary_key_strategy" in options.model_fields_set
-                        else default_primary_key_strategy(
-                            table, is_postgres=is_postgres
-                        )
-                    ),
+                    effective_strategy,  # resolved once, above the column loop
                     is_postgres=is_postgres,
                 )
             )
