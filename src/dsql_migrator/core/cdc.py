@@ -66,6 +66,7 @@ from dsql_migrator.core.models import (
     TableStatusRow,
     Watermark,
 )
+from dsql_migrator.core.pg_names import pg_stored_name
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module boto3-free
     from dsql_migrator.core.ec2_metadata import HostLookup
@@ -1564,7 +1565,7 @@ def cdc_blocking_foreign_keys(
         # source FK name is stored TRUNCATED in pg_constraint while the rendered DDL
         # carries it in full. Without this the tool would disown its own constraint and
         # block CDC with no way out (it refuses to drop what it does not own).
-        truncated = {name.encode()[:63].decode(errors="ignore"): name for name in expected}
+        truncated = {pg_stored_name(name): name for name in expected}
         for constraint in constraints:
             if constraint in expected or constraint in truncated:
                 ours.append((table, constraint))

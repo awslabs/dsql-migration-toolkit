@@ -23,6 +23,8 @@ from typing import Iterable, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from dsql_migrator.core.pg_names import pg_fold_unquoted
+
 # ---------------------------------------------------------------------------
 # Connection configuration
 # ---------------------------------------------------------------------------
@@ -362,7 +364,6 @@ _FK_SET_COLUMN = r'"(?:[^"]|"")+"|[^\s(),"]+'
 _FK_SET_COLUMNS_RE = re.compile(
     rf"\(\s*((?:{_FK_SET_COLUMN})(?:\s*,\s*(?:{_FK_SET_COLUMN}))*)\s*\)\s*"
 )
-_FK_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
 class ForeignKeyDef(BaseModel):
@@ -472,7 +473,7 @@ class ForeignKeyDef(BaseModel):
             return []
         return [
             token[1:-1].replace('""', '"') if token.startswith('"')
-            else token.translate(_FK_ASCII_FOLD)
+            else pg_fold_unquoted(token)
             for token in re.findall(_FK_SET_COLUMN, match.group(1))
         ]
 

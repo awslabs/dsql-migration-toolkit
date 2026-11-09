@@ -52,6 +52,7 @@ from dsql_migrator.core.models import (
     TableDef,
     TargetInventory,
 )
+from dsql_migrator.core.pg_names import pg_fold_unquoted
 
 if TYPE_CHECKING:
     from dsql_migrator.core.source_time_zone import SourceZone
@@ -3133,9 +3134,6 @@ def check_mixed_case_identifiers(
     def upper(name: str) -> bool:
         return any("A" <= ch <= "Z" for ch in name)
 
-    def folded(name: str) -> str:
-        return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in name)
-
     schemas: set[str] = set()
     relations: list[str] = []
     columns: list[str] = []
@@ -3148,7 +3146,9 @@ def check_mixed_case_identifiers(
             schemas.add(schema)
         if upper(bare):
             relations.append(relation.name)
-        by_folded.setdefault((folded(schema), folded(bare)), []).append(relation.name)
+        by_folded.setdefault(
+            (pg_fold_unquoted(schema), pg_fold_unquoted(bare)), []
+        ).append(relation.name)
     for table in inventory.tables:
         columns.extend(f"{table.name}.{c.name}" for c in table.columns if upper(c.name))
     if not (schemas or relations or columns):

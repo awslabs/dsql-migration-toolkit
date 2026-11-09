@@ -66,6 +66,7 @@ from dsql_migrator.core.mysql_view_sql import (
     rewrite_mysql_expressions,
     unquote_json_extracts,
 )
+from dsql_migrator.core.pg_names import pg_fold_unquoted
 
 _POSTGRES = "postgres"
 
@@ -538,9 +539,6 @@ def _drop_from_dual(tree: exp.Expression) -> None:
             select.set("from_" if "from_" in select.args else "from", None)
 
 
-_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
-
-
 def _is_dual_keyword(table: exp.Table) -> bool:
     """MySQL's DUAL: unqualified and unquoted (a backquoted `dual` is a real table)."""
     this = table.args.get("this")
@@ -560,7 +558,7 @@ def _key(identifier: object) -> str:
     if not isinstance(identifier, exp.Identifier):
         return ""
     name = identifier.name or ""
-    return name if identifier.quoted else name.translate(_ASCII_FOLD)
+    return name if identifier.quoted else pg_fold_unquoted(name)
 
 
 def _output_identifiers(
@@ -755,12 +753,12 @@ class _Scopes:
         key."""
         memo = (id(scope), key)
         if memo not in self._coalesced:
-            folded = key.translate(_ASCII_FOLD)
+            folded = pg_fold_unquoted(key)
             found: list = []
             for join in self._coalescing.get(id(scope), []):
                 natural = (join.args.get("method") or "").upper() == "NATURAL"
                 if not natural and all(
-                    _key(part).translate(_ASCII_FOLD) != folded
+                    pg_fold_unquoted(_key(part)) != folded
                     for part in join.args.get("using") or []
                 ):
                     continue
@@ -1302,7 +1300,7 @@ def _mixed_case_names(
             and qualifier.quoted
         ):
             # `O`.id over orders O: the alias folds to o, the quoted reference stays O.
-            folded = qualifier.name.translate(_ASCII_FOLD)
+            folded = pg_fold_unquoted(qualifier.name)
             if folded != qualifier.name and scopes.qualified_source(column, folded)[0]:
                 _mismatch(qualifier)
                 found, outputs = scopes.qualified_source(column, folded)
@@ -1326,8 +1324,8 @@ def _mixed_case_names(
             if (
                 outputs is not None
                 and this.quoted
-                and key.translate(_ASCII_FOLD) != key
-                and key.translate(_ASCII_FOLD) in outputs
+                and pg_fold_unquoted(key) != key
+                and pg_fold_unquoted(key) in outputs
             ):
                 _mismatch(this)  # d.`UserId` over an unquoted output UserId (userid)
                 continue
@@ -1352,7 +1350,7 @@ def _mixed_case_names(
                 relaxed = scope is not None and not scopes.coalesced(scope, key)
                 if _own_name(sources, key, relaxed=relaxed):
                     continue  # only the statement's own outputs are in scope
-                folded = key.translate(_ASCII_FOLD)
+                folded = pg_fold_unquoted(key)
                 if this.quoted and folded != key and _own_name(sources, folded, relaxed=relaxed):
                     _mismatch(this)  # `UserId` over an unquoted derived output UserId
                     continue
@@ -1444,7 +1442,7 @@ def _mixed_case_label_warning(
         classification=Classification.MANUAL,
         message=(
             f"Result column label(s) {shown} come back from Aurora DSQL in lower case "
-            f"({', '.join(name.translate(_ASCII_FOLD) for name in labels[:5])}): an "
+            f"({', '.join(pg_fold_unquoted(name) for name in labels[:5])}): an "
             "unquoted label is folded, where MySQL kept its case. The query itself runs; a "
             "client that reads result columns by name (an ORM, dictionary rows) no longer "
             f"finds {labels[0]}. If yours does, label it quoted (AS \"{labels[0]}\") and "
@@ -1467,7 +1465,7 @@ def _quote_mismatch_warning(names: "Sequence[str]") -> "Optional[QueryWarning]":
             f"{', '.join(names[:5])}{' ...' if len(names) > 5 else ''} "
             f"{'is' if len(names) == 1 else 'are'} quoted in one place and not in another: "
             "Aurora DSQL folds the unquoted spelling to lower case, so the two no longer name "
-            f'the same alias or column ("{first}" is not {first.translate(_ASCII_FOLD)}) and '
+            f'the same alias or column ("{first}" is not {pg_fold_unquoted(first)}) and '
             "the statement fails. Write each the same way everywhere."
         ),
     )

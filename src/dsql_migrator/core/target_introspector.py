@@ -43,6 +43,11 @@ from dsql_migrator.core.models import (
     TargetRelation,
     TargetSchemaNode,
 )
+from dsql_migrator.core.pg_names import (  # noqa: F401 - re-exported (harness, scripts)
+    _PG_NAME_MAX_BYTES,
+    pg_fold_unquoted,
+    pg_stored_name,
+)
 
 # System schemas that are never part of the user object tree.
 #
@@ -1145,24 +1150,6 @@ def _relation_predicate(table_name: str) -> "tuple[str, dict[str, object]]":
     return "c.relname = %(table)s AND pg_catalog.pg_table_is_visible(c.oid)", {
         "table": table_name
     }
-
-
-# PostgreSQL (and Aurora DSQL) stores an identifier cut to NAMEDATALEN-1 bytes.
-_PG_NAME_MAX_BYTES = 63
-
-
-def pg_fold_unquoted(name: str) -> str:
-    """``name`` as PostgreSQL folds an UNQUOTED identifier: ASCII letters to lower case."""
-    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in name)
-
-
-def pg_stored_name(name: str) -> str:
-    """``name`` as the catalog stores it: UTF-8 cut to 63 bytes on a character boundary
-    (PostgreSQL's pg_mbcliplen). A DDL or DML naming the long form reaches this column."""
-    raw = name.encode("utf-8")
-    if len(raw) <= _PG_NAME_MAX_BYTES:
-        return name
-    return raw[:_PG_NAME_MAX_BYTES].decode("utf-8", errors="ignore")
 
 
 def read_overlay_column_facts(

@@ -95,6 +95,7 @@ from dsql_migrator.core.models import (
     TemporalKeyDef,
     ViewDef,
 )
+from dsql_migrator.core.pg_names import _PG_NAME_MAX_BYTES, pg_fold_unquoted
 from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
 
 # The MySQL view / query expression rewriter (the sqlglot dialect Schema Conversion and
@@ -2071,16 +2072,13 @@ def _folded_name(node) -> str:
     return name if quoted else fold_identifier(name)
 
 
-_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
-
-
 def fold_identifier(name: str) -> str:
     """Fold an UNQUOTED identifier the way PostgreSQL does: ASCII A-Z only.
 
     ``str.lower()`` also lowercases non-ASCII letters (``É`` -> ``é``), which PostgreSQL
     leaves as written, so it would name a column the target does not have.
     """
-    return name.translate(_ASCII_FOLD)
+    return pg_fold_unquoted(name)
 
 
 def parse_target_generated_columns(create_ddl: str, *, folded: bool = False) -> set[str]:
@@ -6249,7 +6247,7 @@ def _partitioned_table_warning(
     )
 
 
-_PG_NAMEDATALEN = 63  # PostgreSQL/DSQL identifiers are truncated to 63 BYTES.
+_PG_NAMEDATALEN = _PG_NAME_MAX_BYTES  # PostgreSQL/DSQL identifiers are truncated to 63 BYTES.
 
 
 # How many of the other relations sharing a name a collision note spells out. A schema

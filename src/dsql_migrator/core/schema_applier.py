@@ -77,6 +77,7 @@ from dsql_migrator.core.occ import (
     is_occ_conflict,
     with_occ_retry,
 )
+from dsql_migrator.core.pg_names import pg_fold_unquoted, pg_stored_name
 from dsql_migrator.core.target_connection import (
     is_server_unavailable,
     is_transient_connection_error,
@@ -283,8 +284,6 @@ class _ParsedObject:
 
         Each part cut to 63 bytes like the server does (:func:`~dsql_migrator.core.
         target_introspector.pg_stored_name`); an index's schema is its table's."""
-        from dsql_migrator.core.target_introspector import pg_stored_name
-
         if self.kind == _INDEX:
             schema = self._index_schema
             if schema is None:
@@ -315,8 +314,6 @@ class _ParsedObject:
     @property
     def stored_on_table_name(self) -> Optional[str]:
         """The ``ON`` table as the catalog stores it (each part cut to 63 bytes)."""
-        from dsql_migrator.core.target_introspector import pg_stored_name
-
         if not self.on_table:
             return None
         return ".".join(pg_stored_name(part) for part in self.on_table)
@@ -417,8 +414,6 @@ def converted_names(
     """:class:`ConvertedNames` from the source's view and table names (``schema.name``,
     split on the first dot like the converter) and the conversion's index renames (keyed
     by table)."""
-    from dsql_migrator.core.target_introspector import pg_stored_name
-
     def _stored(qualified: str) -> "Optional[tuple[str, str]]":
         schema, _, name = qualified.partition(".")
         return (pg_stored_name(schema), pg_stored_name(name)) if schema and name else None
@@ -903,8 +898,6 @@ def _holder_matches(parsed: _ParsedObject, holder: "tuple[str, Optional[str]]") 
 
 def _ascii_fold(name: str) -> str:
     """``name`` as PostgreSQL folds an unquoted identifier (ASCII letters only)."""
-    from dsql_migrator.core.target_introspector import pg_fold_unquoted
-
     return pg_fold_unquoted(name)
 
 
@@ -951,8 +944,6 @@ def _legacy_renamed_index(
     old = renamed.get(stored)
     if old is None:
         return None
-    from dsql_migrator.core.target_introspector import pg_stored_name
-
     old_stored = (stored[0], pg_stored_name(old))
     if old_stored == stored:
         return None
@@ -1051,8 +1042,6 @@ def _name_taken_detail(
         # Up to 0.1.570 the colliding index kept this name; the conversion now creates it
         # as ``copy_of[1]``. Whether THAT index exists yet decides the safe order: dropping
         # the copy first would leave the table without it (a UNIQUE one unenforced).
-        from dsql_migrator.core.target_introspector import pg_stored_name
-
         drop = f"DROP INDEX {_quoted_name(stored[0], stored[1])}"
         renamed_there = index_present is not None and index_present(
             stored[0], pg_stored_name(copy_of[1]), owner
@@ -1156,8 +1145,6 @@ def _ensured_schema_name(statement: object) -> Optional[str]:
 
 def _schema_present(connection: Any, schema: str) -> bool:
     """Whether ``schema`` exists on the target (``False`` when the catalog read fails)."""
-    from dsql_migrator.core.target_introspector import pg_stored_name
-
     cursor = connection.cursor()
     try:
         cursor.execute(
