@@ -15,6 +15,8 @@ import re
 
 from typing import Mapping, Optional, Sequence
 
+from dsql_migrator.core.export_errors import ExportError
+from dsql_migrator.core.exporter_mysql import ValueConverter, duration_text
 from dsql_migrator.core.introspector import (
     MYSQL_DRIVER,
     MYSQL_SYSTEM_SCHEMAS,
@@ -361,8 +363,6 @@ def _key_after_sql(
 
 def _unknown_member(column: str, kind: str) -> Exception:
     """The read cannot place a key value its column's members (read live) do not hold."""
-    from dsql_migrator.core.exporter import ExportError
-
     return ExportError(
         f"key column '{column}' holds {'an ENUM' if kind == 'enum' else 'a SET'} value that "
         "is not one of the members the source lists for it (information_schema.COLUMNS), so "
@@ -403,8 +403,6 @@ def _cursor_value(column_type: Optional[str], value: object) -> object:
     from datetime import timedelta
 
     if isinstance(value, timedelta):
-        from dsql_migrator.core.exporter import duration_text
-
         return duration_text(value)
     if mysql_base_type(column_type) == "bit" and isinstance(value, (bytes, bytearray)):
         return int.from_bytes(bytes(value), byteorder="big")
@@ -413,8 +411,6 @@ def _cursor_value(column_type: Optional[str], value: object) -> object:
 
 def _unreadable_members(column: str, why: str, remedy: str) -> Exception:
     """The read cannot write a cursor that keeps this key column's order."""
-    from dsql_migrator.core.exporter import ExportError
-
     return ExportError(
         f"key column '{column}' {why}, so the read cannot write a cursor that keeps the key "
         f"order and stops instead of loading the table with rows missing. {remedy}"
@@ -681,8 +677,6 @@ class MySQLSourceDialect(SourceDialect):
         return (_MYSQL_REPEATABLE_READ,)
 
     def value_converter(self, table: object, *, target_types: object = None) -> object:
-        from dsql_migrator.core.exporter import ValueConverter
-
         return ValueConverter(table, target_types=target_types)
 
     def live_number_shape(self, entry: object) -> "Optional[tuple[str, Optional[int]]]":

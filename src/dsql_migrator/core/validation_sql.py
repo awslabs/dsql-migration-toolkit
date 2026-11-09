@@ -39,6 +39,9 @@ from dsql_migrator.core.converter import (
     map_mysql_type,
     mysql_enum_set_members,
 )
+# The target kinds a MySQL TIME duration lands in: the Full Load's own set (it writes the
+# duration there as text).
+from dsql_migrator.core.exporter_mysql import _DURATION_TARGET_KINDS
 from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
 from dsql_migrator.core.mysql_zero_dates import (
     temporal_base,
@@ -294,12 +297,6 @@ def stale_numeric_render_scales(
         if recorded != current:
             stale.append((column.name, column.mysql_type, fresh))
     return stale
-
-
-# Target kinds a MySQL TIME duration lands in (the exporter writes it there as text).
-_DURATION_TARGET_KINDS = frozenset(
-    {"interval", "text", "varchar", "character varying", "char", "character", "bpchar"}
-)
 
 
 def _checksum_kind(column: "ColumnDef", source_is_postgres: bool = False) -> str:

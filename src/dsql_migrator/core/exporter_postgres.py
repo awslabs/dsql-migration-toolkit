@@ -3,7 +3,7 @@
 
 """PostgreSQL-source value conversion for Full Load.
 
-Kept in its own module -- not tangled into ``exporter.py``'s MySQL ``ValueConverter`` --
+Kept in its own module -- the twin of ``exporter_mysql.py``'s MySQL ``ValueConverter`` --
 per the per-engine separation principle. A PostgreSQL source migrates to Aurora DSQL
 (PostgreSQL-16 wire) via psycopg on BOTH ends, so value conversion is **pure
 pass-through**: psycopg returns native Python types (``int``/``Decimal``/``float``/``str``/
@@ -35,7 +35,7 @@ from dsql_migrator.core.models import TableDef
 class PostgresValueConverter:
     """Pass-through value converter for a PostgreSQL source.
 
-    Mirrors :class:`~dsql_migrator.core.exporter.ValueConverter`'s interface
+    Mirrors :class:`~dsql_migrator.core.exporter_mysql.ValueConverter`'s interface
     (``convert_row``/``row_converter``/``convert_value``) so the exporter uses either
     interchangeably via ``dialect.value_converter``. PostgreSQL->DSQL is psycopg-native on
     both ends, so no per-value translation is needed; json/jsonb is handled at the source
