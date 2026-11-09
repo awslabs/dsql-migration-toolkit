@@ -2671,7 +2671,7 @@ def build_cdc_stack_params(
     labeled placeholder for each customer-environment parameter it cannot. Pure:
     no AWS, no I/O. The one transformation the cdc-stack template delegates to the
     caller -- building ``SinkTopics`` as ``<topic_prefix>.<db>.<table>`` for each
-    captured table -- is done here.
+    captured table -- is done by :func:`cdc_table_list_params`, spliced in here.
 
     The CDC start position (GTID / binlog file:position) is deliberately NOT a
     parameter: the cdc-stack seeds it via the ``connect-offsets`` topic, not a

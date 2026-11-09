@@ -12,7 +12,7 @@ CDC gate's own 63-byte cut (``cdc.cdc_blocking_foreign_keys``). Each copy is exa
 canonical rule for every ``str`` (proven below), so each now calls ``core.pg_names``;
 ``target_introspector`` re-exports all three names (the E2E harness and ``scripts/`` import
 ``pg_stored_name`` from there) and ``schema_applier`` imports them at its top level instead
-of five lazy imports from the introspector.
+of seven lazy imports from the introspector.
 
 Pinned here:
 
@@ -22,8 +22,10 @@ Pinned here:
   canonical answer -- through its own public entry point where it has one -- and the
   answers themselves are spelled out by hand;
 * the re-exports are the very same objects;
-* structure: no module but ``pg_names`` spells the fold or the cut again, and
-  ``pg_names`` imports nothing but the standard library.
+* structure: none of the modules whose copies were replaced spells the PostgreSQL fold or
+  the 63-byte cut again (``cdc.py`` keeps ``_cdc_ascii_fold``, deliberately: it is
+  Debezium's rule, which happens to agree), and ``pg_names`` imports nothing but the
+  standard library.
 
 Pure: no Aurora DSQL, no AWS.
 """
@@ -31,6 +33,7 @@ Pure: no Aurora DSQL, no AWS.
 from __future__ import annotations
 
 import ast
+import re
 import pathlib
 
 import pytest
@@ -217,8 +220,11 @@ _COPY_MODULES = (
 @pytest.mark.parametrize("module", _COPY_MODULES)
 def test_no_copy_of_the_rules_comes_back(module: str) -> None:
     text = (_SRC / "core" / module).read_text(encoding="utf-8")
-    # The fold, as a translate table or as the per-character join.
-    assert 'maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ"' not in text
+    # The fold, as a translate table (however the call is wrapped) or as the per-character
+    # join. cdc.py's _cdc_ascii_fold table is Debezium's rule, kept on purpose.
+    flat = re.sub(r"\s+", "", text)
+    allowed = 1 if module == "cdc.py" else 0
+    assert flat.count('maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ"') <= allowed
     assert 'ch.lower() if "A" <= ch <= "Z"' not in text
     # The 63-byte cut.
     assert "[:63]" not in text and "[:_PG_" not in text

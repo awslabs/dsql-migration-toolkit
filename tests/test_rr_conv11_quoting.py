@@ -240,8 +240,8 @@ def test_the_split_rule_stays_its_own() -> None:
 
 
 def test_the_bound_names_stay() -> None:
-    # The E2E harness binds validation_sql._quote_mysql_table; mysql_zero_dates and the
-    # CDC monitor import the rest.
+    # The E2E harness binds validation_sql._quote_mysql_table; the other names stay
+    # importable for the modules and tests that use them.
     for module, names in (
         (vsql, ("_quote_mysql_identifier", "_quote_mysql_table", "_text_mysql_identifier",
                 "_text_mysql_table")),

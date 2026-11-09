@@ -19,8 +19,10 @@ Pinned here:
   topic prefix, column exclusions, a composite re-key, more sink topics than captured
   tables) and an empty one;
 * the shared block on its own;
-* structure: no builder and no UI module spells the block (``"TopicPrefix"`` /
-  ``"SinkTopics"`` tuples, the ``<prefix>.<table>`` join) again.
+* structure: no function in ``core/cdc.py`` but the shared one spells more than one of the
+  block's parameter tuples (the builders none: each splices the block in once), the UI's
+  ``_cdc_table_lists`` calls the block and joins nothing itself, and no UI module builds
+  ``<CDC_DEFAULT_TOPIC_PREFIX>.<table>`` in an f-string.
 
 Pure: no AWS.
 """
@@ -229,9 +231,23 @@ def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
     )
 
 
+def _body_without_docstring(fn: ast.FunctionDef) -> list:
+    body = list(fn.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(
+        getattr(body[0], "value", None), ast.Constant
+    ) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    return body
+
+
 def test_only_the_shared_block_spells_the_six_parameters() -> None:
     tree = ast.parse((_SRC / "core" / "cdc.py").read_text(encoding="utf-8"))
     assert _block_tuples(_function(tree, "cdc_table_list_params")) == [k for k, _ in _BLOCK]
+    # No other function in cdc.py spells the block, or a piece of it beyond a single key
+    # (rekey_parameter_size_refusal names MessageKeyColumns for its own size refusal).
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef) and fn.name != "cdc_table_list_params":
+            assert len(set(_block_tuples(fn))) <= 1, fn.name
     for builder in ("build_cdc_stack_params", "build_cdc_infra_params"):
         assert _block_tuples(_function(tree, builder)) == [], builder
         # ... and each splices the block in exactly once.
@@ -249,8 +265,27 @@ def test_the_ui_does_not_rederive_the_lists() -> None:
         (_SRC / "ui" / "data_migration" / "_models.py").read_text(encoding="utf-8")
     )
     lists = _function(tree, "_cdc_table_lists")
-    assert "cdc_table_list_params" in ast.unparse(lists)
-    assert '",".join(' not in ast.unparse(lists)
-    # No module under ui/ joins the topic prefix onto table names itself.
+    body = _body_without_docstring(lists)  # the docstring names the helper: not a call
+    calls = [
+        node for stmt in body for node in ast.walk(stmt) if isinstance(node, ast.Call)
+    ]
+    called = {
+        getattr(node.func, "id", None) or getattr(node.func, "attr", None) for node in calls
+    }
+    assert "cdc_table_list_params" in called
+    assert "join" not in called  # the lists come out of the block, never re-joined here
+    # No module under ui/ joins the topic prefix onto table names itself: no f-string
+    # holds {CDC_DEFAULT_TOPIC_PREFIX} followed by a '.', however it is spelled or wrapped.
     for path in (_SRC / "ui").rglob("*.py"):
-        assert "{CDC_DEFAULT_TOPIC_PREFIX}." not in path.read_text(encoding="utf-8"), path
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            parts = node.values
+            for i, part in enumerate(parts[:-1]):
+                if (
+                    isinstance(part, ast.FormattedValue)
+                    and getattr(part.value, "id", None) == "CDC_DEFAULT_TOPIC_PREFIX"
+                    and isinstance(parts[i + 1], ast.Constant)
+                    and str(parts[i + 1].value).startswith(".")
+                ):
+                    raise AssertionError(f"{path}:{node.lineno} joins the topic prefix")
