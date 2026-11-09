@@ -1547,6 +1547,79 @@ def keyset_pages(
 # ---------------------------------------------------------------------------
 
 
+def _open_read_session(
+    connection,
+    dialect: "SourceDialect",
+    shared_snapshot_id: Optional[str],
+    max_source_threads_running: Optional[int],
+    on_throttle: Optional[Callable[[bool, Optional[int]], None]],
+    on_pause_slice: Optional[Callable[[], None]],
+) -> "tuple[object, Optional[SourceLoadGovernor]]":
+    """Open a Full Load read session on ``connection``: ``(snapshot, governor)``.
+
+    What :meth:`TableExporter.stream_converted_rows` and
+    :meth:`TableExporter.stream_converted_ranges` each do once before their first read
+    (DP-1): AUTOCOMMIT with a streaming (server-side) cursor, the dialect's snapshot start
+    (MySQL ``START TRANSACTION WITH CONSISTENT SNAPSHOT`` under the session's REPEATABLE READ
+    pin, PostgreSQL ``START TRANSACTION ISOLATION LEVEL REPEATABLE READ``), then -- given
+    ``shared_snapshot_id`` -- ``SET TRANSACTION SNAPSHOT`` as the transaction's first
+    statement. Both run without the server-side cursor (:data:`_TXN_CONTROL_EXEC_OPTS`). The
+    governor (``None`` unless ``max_source_threads_running`` is set) reads the source's
+    active-query count with the dialect's own reader.
+
+    A failure here propagates as it is, before the caller's ``try`` whose ``except`` ends
+    the snapshot (:func:`_end_snapshot_after_failure`): no COMMIT is sent for it."""
+    snapshot = connection.execution_options(
+        isolation_level="AUTOCOMMIT", stream_results=True
+    )
+    snapshot.execute(
+        text(dialect.snapshot_start_sql),
+        execution_options=_TXN_CONTROL_EXEC_OPTS,
+    )
+    if shared_snapshot_id is not None:
+        # First statement in the just-opened transaction: adopt the shared point-in-time
+        # snapshot so this shard sees exactly what the others do.
+        snapshot.execute(
+            text(dialect.set_transaction_snapshot_sql(shared_snapshot_id)),
+            execution_options=_TXN_CONTROL_EXEC_OPTS,
+        )
+    governor = (
+        SourceLoadGovernor(
+            snapshot,
+            max_source_threads_running,
+            on_state_change=on_throttle,
+            on_pause_slice=on_pause_slice,
+            # Engine-correct metric: MySQL Threads_running vs PostgreSQL
+            # pg_stat_activity. Never runs MySQL SQL on a PG snapshot conn.
+            metric_reader=dialect.read_active_query_count,
+        )
+        if max_source_threads_running
+        else None
+    )
+    return snapshot, governor
+
+
+def _finish_read_session(
+    snapshot,
+    converter: object,
+    on_zero_dates: "Optional[Callable[[tuple[tuple[str, str, str, int], ...]], None]]",
+) -> None:
+    """End a read session whose read completed (DP-1): COMMIT the snapshot, then report the
+    zero / invalid MySQL dates ``converter`` wrote to ``on_zero_dates`` when there were any.
+
+    Only after a read that ended normally: a failure or an early close ends the snapshot
+    with :func:`_end_snapshot_after_failure` instead and reports nothing. A COMMIT that fails
+    here raises, before any report."""
+    snapshot.execute(
+        text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+    )
+    entries = getattr(converter, "zero_date_entries", None)
+    if on_zero_dates is not None and callable(entries):
+        found = entries()
+        if found:
+            on_zero_dates(found)
+
+
 class TableExporter:
     """Streams a source table's converted rows via read-only PK keyset streaming.
 
@@ -1645,6 +1718,64 @@ class TableExporter:
         finally:
             engine.dispose()
 
+    def open_shared_snapshot(
+        self, conn: SourceConnectionConfig, dialect: "SourceDialect"
+    ) -> "tuple[Engine, object, str]":
+        """Open the anchor of a shared snapshot: ``(engine, connection, snapshot id)``.
+
+        A REPEATABLE READ transaction (``dialect.snapshot_start_sql``) on its own source
+        connection, and the id its snapshot exports (``dialect.export_snapshot_sql``), which
+        every shard reader imports (``shared_snapshot_id``) so a range-sharded read is one
+        point-in-time cut -- consistent even for a REPLACE (no-CDC) load. PostgreSQL only.
+        The transaction is held open until :meth:`close_shared_snapshot` is given the engine
+        and connection returned. It is not a context manager: the Full Load engine releases
+        the anchor early, once the last shard reading it has returned.
+
+        On a failure (an empty id included) the checked-out connection is closed BEFORE the
+        engine is disposed -- ``engine.dispose()`` does not close a leased connection, so its
+        open transaction would linger until GC -- and the error is raised."""
+        engine = self._engine_factory(conn)
+        connection = None
+        try:
+            connection = engine.connect()
+            anchor = connection.execution_options(isolation_level="AUTOCOMMIT")
+            anchor.execute(
+                text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
+            )
+            snapshot_id = anchor.execute(text(dialect.export_snapshot_sql())).scalar()
+            if not snapshot_id:
+                raise RuntimeError("source returned an empty exported-snapshot id")
+            return engine, connection, snapshot_id
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:  # noqa: BLE001 - best-effort on the failure path
+                    pass
+            engine.dispose()
+            raise
+
+    @staticmethod
+    def close_shared_snapshot(engine: "Optional[Engine]", connection: object) -> None:
+        """COMMIT and close the anchor :meth:`open_shared_snapshot` opened, then dispose its
+        engine. The COMMIT is best effort (a read-only anchor); a failed ``close()`` still
+        disposes the engine and is raised. ``connection`` ``None`` -- an anchor never opened,
+        or already released -- does nothing (the engine is left as it is)."""
+        if connection is None:
+            return
+        try:
+            connection.execution_options(isolation_level="AUTOCOMMIT").execute(
+                text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
+            )
+        except Exception:  # noqa: BLE001 - best-effort teardown of a read-only anchor txn
+            pass
+        finally:
+            try:
+                connection.close()
+            finally:
+                if engine is not None:
+                    engine.dispose()
+
     def stream_converted_rows(
         self,
         conn: SourceConnectionConfig,
@@ -1704,32 +1835,9 @@ class TableExporter:
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
-                snapshot = connection.execution_options(
-                    isolation_level="AUTOCOMMIT", stream_results=True
-                )
-                snapshot.execute(
-                    text(dialect.snapshot_start_sql),
-                    execution_options=_TXN_CONTROL_EXEC_OPTS,
-                )
-                if shared_snapshot_id is not None:
-                    # First statement in the just-opened transaction: adopt the shared
-                    # point-in-time snapshot so this shard sees exactly what the others do.
-                    snapshot.execute(
-                        text(dialect.set_transaction_snapshot_sql(shared_snapshot_id)),
-                        execution_options=_TXN_CONTROL_EXEC_OPTS,
-                    )
-                governor = (
-                    SourceLoadGovernor(
-                        snapshot,
-                        self._max_source_threads_running,
-                        on_state_change=on_throttle,
-                        on_pause_slice=on_pause_slice,
-                        # Engine-correct metric: MySQL Threads_running vs PostgreSQL
-                        # pg_stat_activity. Never runs MySQL SQL on a PG snapshot conn.
-                        metric_reader=dialect.read_active_query_count,
-                    )
-                    if self._max_source_threads_running
-                    else None
+                snapshot, governor = _open_read_session(
+                    connection, dialect, shared_snapshot_id,
+                    self._max_source_threads_running, on_throttle, on_pause_slice,
                 )
                 try:
                     # Inside the snapshot: the read below takes exactly these rows.
@@ -1754,14 +1862,7 @@ class TableExporter:
                 except BaseException:  # incl. GeneratorExit: the consumer stopped early
                     _end_snapshot_after_failure(snapshot)
                     raise
-                snapshot.execute(
-                    text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
-                )
-                entries = getattr(converter, "zero_date_entries", None)
-                if on_zero_dates is not None and callable(entries):
-                    found = entries()
-                    if found:
-                        on_zero_dates(found)
+                _finish_read_session(snapshot, converter, on_zero_dates)
         finally:
             engine.dispose()
 
@@ -1859,28 +1960,9 @@ class TableExporter:
         engine = self._engine_factory(conn)
         try:
             with engine.connect() as connection:
-                snapshot = connection.execution_options(
-                    isolation_level="AUTOCOMMIT", stream_results=True
-                )
-                snapshot.execute(
-                    text(dialect.snapshot_start_sql),
-                    execution_options=_TXN_CONTROL_EXEC_OPTS,
-                )
-                if shared_snapshot_id is not None:
-                    snapshot.execute(
-                        text(dialect.set_transaction_snapshot_sql(shared_snapshot_id)),
-                        execution_options=_TXN_CONTROL_EXEC_OPTS,
-                    )
-                governor = (
-                    SourceLoadGovernor(
-                        snapshot,
-                        self._max_source_threads_running,
-                        on_state_change=on_throttle,
-                        on_pause_slice=on_pause_slice,
-                        metric_reader=dialect.read_active_query_count,
-                    )
-                    if self._max_source_threads_running
-                    else None
+                snapshot, governor = _open_read_session(
+                    connection, dialect, shared_snapshot_id,
+                    self._max_source_threads_running, on_throttle, on_pause_slice,
                 )
                 pagers: list = []
                 try:
@@ -1921,19 +2003,14 @@ class TableExporter:
                             yield index, _converted_page(page, guard, turn)
                         live = still
                 except BaseException:  # incl. GeneratorExit: the consumer stopped early
+                    # P2: on a failure the snapshot ends (once) BEFORE the pagers close
+                    # below; on success they close first and the COMMIT follows.
                     _end_snapshot_after_failure(snapshot)
                     raise
                 finally:
                     for pager in pagers:
                         pager.close()
-                snapshot.execute(
-                    text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
-                )
-                entries = getattr(converter, "zero_date_entries", None)
-                if on_zero_dates is not None and callable(entries):
-                    found = entries()
-                    if found:
-                        on_zero_dates(found)
+                _finish_read_session(snapshot, converter, on_zero_dates)
         finally:
             engine.dispose()
 

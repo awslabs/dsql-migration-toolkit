@@ -2028,9 +2028,11 @@ def test_open_shared_snapshot_closes_connection_on_failure() -> None:
         def dispose(self):
             calls.append("engine.dispose")
 
+    from dsql_migrator.core.exporter import TableExporter
+
     class _Mig:
-        class _exporter:
-            _engine_factory = staticmethod(lambda _cfg: _Eng())
+        # DP-1: the anchor is the exporter's (TableExporter.open_shared_snapshot).
+        _exporter = TableExporter(engine_factory=lambda _cfg: _Eng())
 
         class _inputs:
             source_config = None

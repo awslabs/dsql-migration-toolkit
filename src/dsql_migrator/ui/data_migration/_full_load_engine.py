@@ -3368,33 +3368,10 @@ def _open_shared_snapshot(migrator, dialect):
     the same point-in-time cut (``dialect.set_transaction_snapshot_sql``) -- a consistent
     range-sharded read even for a REPLACE (no-CDC) load. Caller MUST call
     :func:`_close_shared_snapshot` when the load finishes. PostgreSQL only.
+    The anchor itself is the run's exporter's
+    (:meth:`~dsql_migrator.core.exporter.TableExporter.open_shared_snapshot`).
     """
-    from sqlalchemy import text
-
-    from dsql_migrator.core.exporter import _TXN_CONTROL_EXEC_OPTS
-
-    engine = migrator._exporter._engine_factory(migrator._inputs.source_config)
-    conn = None
-    try:
-        conn = engine.connect()
-        anchor = conn.execution_options(isolation_level="AUTOCOMMIT")
-        anchor.execute(
-            text(dialect.snapshot_start_sql), execution_options=_TXN_CONTROL_EXEC_OPTS
-        )
-        snapshot_id = anchor.execute(text(dialect.export_snapshot_sql())).scalar()
-        if not snapshot_id:
-            raise RuntimeError("source returned an empty exported-snapshot id")
-        return engine, conn, snapshot_id
-    except Exception:
-        # Close the checked-out connection (else its open REPEATABLE READ txn lingers until
-        # GC) BEFORE disposing the engine -- engine.dispose() does not close a leased conn.
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001 - best-effort on the failure path
-                pass
-        engine.dispose()
-        raise
+    return migrator._exporter.open_shared_snapshot(migrator._inputs.source_config, dialect)
 
 
 # The anchor session's own idle-in-transaction limit, in milliseconds (0 = none): one catalog
@@ -3428,25 +3405,9 @@ def _anchor_keepalive_seconds(conn) -> float:
 
 
 def _close_shared_snapshot(engine, conn) -> None:
-    """COMMIT + close the anchor snapshot transaction opened by :func:`_open_shared_snapshot`."""
-    if conn is None:
-        return
-    from sqlalchemy import text
-
-    from dsql_migrator.core.exporter import _TXN_CONTROL_EXEC_OPTS, COMMIT
-
-    try:
-        conn.execution_options(isolation_level="AUTOCOMMIT").execute(
-            text(COMMIT), execution_options=_TXN_CONTROL_EXEC_OPTS
-        )
-    except Exception:  # noqa: BLE001 - best-effort teardown of a read-only anchor txn
-        pass
-    finally:
-        try:
-            conn.close()
-        finally:
-            if engine is not None:
-                engine.dispose()
+    """COMMIT + close the anchor snapshot transaction opened by :func:`_open_shared_snapshot`
+    (:meth:`~dsql_migrator.core.exporter.TableExporter.close_shared_snapshot`)."""
+    TableExporter.close_shared_snapshot(engine, conn)
 
 
 def _record_prepass_failure(
