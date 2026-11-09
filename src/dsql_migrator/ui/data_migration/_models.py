@@ -307,6 +307,47 @@ def quarantined_rows_by_table(job: Optional[MigrationJob]) -> dict[str, int]:
     return counts
 
 
+# The error-log message for a row the Full Load permanently dropped (quarantined):
+# ``quarantined row pk[<key>]: <reason>``. The step's quarantine count, the per-table card,
+# the failure/quarantine split and the AI DBA recognise a quarantine by this prefix alone,
+# so it is spelled here only -- the engine's one writer and every reader go through these.
+QUARANTINE_PREFIX = "quarantined row pk["
+
+
+def quarantine_message(primary_key: object, reason: object) -> str:
+    """The error-log message for one quarantined row.
+
+    Both parts are interpolated as given (a missing one reads ``None``) and nothing is
+    truncated: the key arrives already bounded by ``format_key_values``.
+    """
+    return f"{QUARANTINE_PREFIX}{primary_key}]: {reason}"
+
+
+def is_quarantine_message(message: object) -> bool:
+    """True when ``message`` (any object, read as ``str``) is a quarantined-row message."""
+    return str(message).startswith(QUARANTINE_PREFIX)
+
+
+def parse_quarantine_message(
+    message: object,
+) -> "Optional[tuple[Optional[str], Optional[str]]]":
+    """Split a quarantined-row message into ``(primary_key, reason)``; ``None`` if not one.
+
+    The two parts keep the split points the step's card always used, which disagree only
+    when the key's text holds a ``]`` (a key column's NAME may): the key ends at the FIRST
+    ``]`` after the prefix (``None`` when there is none, or it is empty), and the reason
+    starts after the FIRST ``]: `` (``None`` when there is none; not stripped).
+    """
+    text = str(message or "")
+    if not text.startswith(QUARANTINE_PREFIX):
+        return None
+    end = text.find("]", len(QUARANTINE_PREFIX))
+    primary_key = (text[len(QUARANTINE_PREFIX) : end] or None) if end != -1 else None
+    marker = text.find("]: ")
+    reason = text[marker + len("]: ") :] if marker != -1 else None
+    return primary_key, reason
+
+
 def failed_table_names(job: MigrationJob) -> list[str]:
     """Return the names of the tables whose Full Load chunk is ``FAILED``."""
     return [chunk.chunk_id for chunk in job.chunks if chunk.status == "FAILED"]

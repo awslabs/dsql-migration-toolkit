@@ -14922,9 +14922,14 @@ def test_every_load_path_logs_quarantined_rows(monkeypatch) -> None:
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     src = inspect.getsource(_engine)
-    # One definition + one call per load path.
-    assert src.count("_log_quarantined_row(") == 4, (
-        "expected the helper plus a call in each of the three load paths"
+    # FL-3: the three paths share ONE writer, which makes the audit entry. One definition
+    # + one call (in the writer) for the helper; one definition + one call per load path
+    # for the writer. tests/test_rr_fl3_quarantine_codec.py pins each path's bytes.
+    assert src.count("_log_quarantined_row(") == 2, (
+        "expected the helper plus its one call, in _record_quarantined_rows"
+    )
+    assert src.count("_record_quarantined_rows(") == 4, (
+        "expected the writer plus a call in each of the three load paths"
     )
 
 
@@ -25966,7 +25971,9 @@ def test_a_failed_shard_does_not_discard_its_siblings_quarantine_evidence() -> N
     from dsql_migrator.ui.data_migration import _full_load_engine as fle
 
     src = inspect.getsource(fle)
-    marker = "for rec in all_quarantine:"
+    # FL-3: the shard path records them through the engine's one quarantine writer
+    # (tests/test_rr_fl3_quarantine_codec.py drives a failed sibling end to end).
+    marker = "_record_quarantined_rows(error_log, job_id, name, all_quarantine)"
     assert src.count(marker) == 1, (
         "the shard quarantine loop was duplicated rather than hoisted"
     )

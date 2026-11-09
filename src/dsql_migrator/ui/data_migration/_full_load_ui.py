@@ -72,7 +72,9 @@ from dsql_migrator.ui.data_migration._models import (
     full_load_completeness,
     exclusion_forced_replace,
     index_pending_tables,
+    is_quarantine_message,
     mysql_reads_may_split,
+    parse_quarantine_message,
     SPLIT_SET_FIXED,
     split_read_tables,
     split_reload_route,
@@ -2486,7 +2488,7 @@ def _quarantined_row_count(
     return sum(
         1
         for record in error_log.records(job.job_id)
-        if str(getattr(record, "message", "")).startswith("quarantined row pk[")
+        if is_quarantine_message(getattr(record, "message", ""))
         and (wanted is None or str(getattr(record, "table", "")) in wanted)
     )
 
@@ -2787,24 +2789,16 @@ def _parse_quarantined_pk(message: str) -> "Optional[str]":
     Returns ``None`` when the message is not in that shape, so a caller falls back to
     showing it verbatim rather than mangling an unexpected format.
     """
-    prefix = "quarantined row pk["
-    text = str(message or "")
-    if not text.startswith(prefix):
-        return None
-    end = text.find("]", len(prefix))
-    if end == -1:
-        return None
-    return text[len(prefix) : end] or None
+    parsed = parse_quarantine_message(message)
+    return parsed[0] if parsed is not None else None
 
 
 def _quarantined_reason(message: str) -> str:
     """Return just the reason from a ``quarantined row pk[...]: reason`` message."""
-    text = str(message or "")
-    marker = "]: "
-    index = text.find(marker)
-    if text.startswith("quarantined row pk[") and index != -1:
-        return text[index + len(marker) :].strip()
-    return text.strip()
+    parsed = parse_quarantine_message(message)
+    if parsed is not None and parsed[1] is not None:
+        return parsed[1].strip()
+    return str(message or "").strip()
 
 
 _QUARANTINE_PK_CHIP_LIMIT = 12
@@ -3177,7 +3171,6 @@ def _render_full_load_progress(
     # error message so the user can diagnose without downloading the log. Always
     # shown (not collapsible) so the live poll re-render never hides it.
     failures = [row for row in rows if row.error_message]
-    quar_prefix = "quarantined row pk["
     # An index that could not be created is recorded against the table like any other
     # error-log entry, but it is NOT a load failure: every row is present and only an
     # access path is missing. Split it out so it is reported as its own warning instead
@@ -3189,11 +3182,11 @@ def _render_full_load_progress(
     real_failures = [
         r
         for r in failures
-        if not str(r.error_message).startswith(quar_prefix)
+        if not is_quarantine_message(r.error_message)
         and not str(r.error_message).startswith(index_prefix)
     ]
     quarantined = [
-        r for r in failures if str(r.error_message).startswith(quar_prefix)
+        r for r in failures if is_quarantine_message(r.error_message)
     ]
     # One entry per failed INDEX (G25), not per table: a table records one failure per
     # CREATE that failed, in DDL order, and judged by its latest one an earlier UNIQUE index
@@ -3566,7 +3559,7 @@ def _render_full_load_progress(
     quarantine_entries: "list[tuple[str, str]]" = [
         (table, message)
         for table, message in (quarantine_records or ())
-        if str(message).startswith(quar_prefix)
+        if is_quarantine_message(message)
     ] or [(r.table, str(r.error_message)) for r in quarantined]
     # LAST RESORT: key on the DURABLE per-chunk count when no message survives. A table
     # can carry a dropped-row count with no reason text at all -- a restored session has

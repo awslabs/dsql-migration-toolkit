@@ -132,6 +132,7 @@ from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.target_introspector import pg_fold_unquoted, pg_stored_name
 from dsql_migrator.core.watermark import WatermarkCapturer, estimate_source_rows
 from dsql_migrator.ui.connect import make_source_engine_factory
+from dsql_migrator.ui.data_migration._models import is_quarantine_message, quarantine_message
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2875,6 +2876,38 @@ def _log_quarantined_row(name: str, primary_key: object, message: object,
     )
 
 
+def _record_quarantined_rows(
+    error_log: ErrorLogStore, job_id: str, name: str, records: "Iterable[Any]"
+) -> None:
+    """Record each permanently-dropped row of ``name``: its error-log entry
+    (:func:`~dsql_migrator.ui.data_migration._models.quarantine_message`, PK + reason only)
+    and its durable audit line (:func:`_log_quarantined_row`).
+
+    The one writer for all three load paths, taking both record shapes as each path read
+    them: the thread path's ``QuarantineRecord`` (attributes, ``error_code`` optional) and
+    the process workers' dicts (``.get``, so a missing field reads ``None``).
+    """
+    for record in records:
+        if isinstance(record, dict):
+            primary_key = record.get("primary_key")
+            reason = record.get("message")
+            error_code = record.get("error_code")
+        else:
+            primary_key, reason = record.primary_key, record.message
+            error_code = getattr(record, "error_code", None)
+        error_log.record(
+            job_id,
+            DataErrorRecord(
+                table=name,
+                chunk_id=name,
+                error_code=error_code,
+                message=quarantine_message(primary_key, reason),
+                occurred_at=datetime.now(timezone.utc),
+            ),
+        )
+        _log_quarantined_row(name, primary_key, reason, error_code)
+
+
 def _assert_overlay_in_place(
     table_name: str,
     overlay_columns: "Iterable[str]",
@@ -3270,23 +3303,9 @@ def _migrate_one_table(
     else:
         # Surface any quarantined poison rows to the single error log (PK + reason
         # only) so an isolated bad row is visible, never a silent loss.
-        for record in getattr(outcome, "quarantine_records", ()) or ():
-            error_log.record(
-                job_id,
-                DataErrorRecord(
-                    table=name,
-                    chunk_id=name,
-                    error_code=getattr(record, "error_code", None),
-                    message=(
-                        f"quarantined row pk[{record.primary_key}]: {record.message}"
-                    ),
-                    occurred_at=datetime.now(timezone.utc),
-                ),
-            )
-            _log_quarantined_row(
-                name, record.primary_key, record.message,
-                getattr(record, "error_code", None),
-            )
+        _record_quarantined_rows(
+            error_log, job_id, name, getattr(outcome, "quarantine_records", ()) or ()
+        )
         # Indexes that could not be created. Recorded so the operator sees WHICH
         # index is missing, but deliberately NOT treated as a table failure: every
         # row loaded, so the table is complete -- only an access path is absent.
@@ -5599,17 +5618,7 @@ def _migrate_tables_in_parallel(
                         # leaving "one or more shards failed" as the only trace and no primary
                         # key to act on -- exactly when the operator needs the detail most.
                         # The chunk verdict below is unchanged; only the evidence is kept.
-                        for rec in all_quarantine:
-                            error_log.record(job_id, DataErrorRecord(
-                                table=name, chunk_id=name,
-                                error_code=rec.get("error_code"),
-                                message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
-                                occurred_at=datetime.now(timezone.utc),
-                            ))
-                            _log_quarantined_row(
-                                name, rec.get("primary_key"), rec.get("message"),
-                                rec.get("error_code"),
-                            )
+                        _record_quarantined_rows(error_log, job_id, name, all_quarantine)
                         _record_index_failures(
                             error_log, job_id, name,
                             [f for r in shard_results[name]
@@ -5709,17 +5718,9 @@ def _migrate_tables_in_parallel(
                         # Single-table worker result (same as before).
                         if result.status == "DONE":
                             had_quarantine = len(result.quarantine_records) > 0
-                            for rec in result.quarantine_records:
-                                error_log.record(job_id, DataErrorRecord(
-                                    table=name, chunk_id=name,
-                                    error_code=rec.get("error_code"),
-                                    message=f"quarantined row pk[{rec.get('primary_key')}]: {rec.get('message')}",
-                                    occurred_at=datetime.now(timezone.utc),
-                                ))
-                                _log_quarantined_row(
-                                    name, rec.get("primary_key"), rec.get("message"),
-                                    rec.get("error_code"),
-                                )
+                            _record_quarantined_rows(
+                                error_log, job_id, name, result.quarantine_records
+                            )
                             # P4a: the secondary indexes the worker left to the run's index
                             # pass: a table it recreated itself, or (P4d) one the submissions
                             # before the load did not reach. A table they reached owes none
@@ -6124,7 +6125,7 @@ def _finalize_run(
     # Full Load records only: CDC writes under this same job id (cdc_error_log_key), so
     # an unfiltered read could attribute a dead-lettered row's reason to a table in a
     # FULL_LOAD activity-log line. The quarantine count above is already safe (it keys
-    # on the "quarantined row pk[" prefix, which only the Full Load writers emit).
+    # on QUARANTINE_PREFIX, which only the Full Load's quarantine writer emits).
     from dsql_migrator.ui.data_migration._cdc_status import full_load_error_records
 
     for record in full_load_error_records(error_log, job_id):
@@ -7152,7 +7153,7 @@ def _count_quarantined_rows(error_log, job_id: str, owners: Optional[dict] = Non
             return []
         return [
             r for r in records
-            if str(getattr(r, "message", "")).startswith("quarantined row pk[")
+            if is_quarantine_message(getattr(r, "message", ""))
         ]
 
     total = 0

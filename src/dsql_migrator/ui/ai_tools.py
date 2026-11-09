@@ -810,6 +810,7 @@ def build_ai_tool_executor(
                 from dsql_migrator.ui.data_migration._cdc_status import (
                     full_load_latest_messages_for,
                 )
+                from dsql_migrator.ui.data_migration._models import is_quarantine_message
 
                 _dm = DATA_MIGRATION_STORE.get_or_create(session_id)
                 _job = _current_job(JOB_MANAGER, _dm.job_id)
@@ -826,7 +827,6 @@ def build_ai_tool_executor(
                     )
                 except Exception:  # noqa: BLE001
                     _msgs = {}
-                _quar_prefix = "quarantined row pk["
                 _chunks = list(getattr(_job, "chunks", []) or [])
                 # Per-table failure detail: attempts (retries) + what got loaded /
                 # skipped / permanently dropped, so the chat can reason lag vs gap.
@@ -844,7 +844,7 @@ def build_ai_tool_executor(
                 # the legacy message-prefix detection, with the dropped-row count.
                 _by_id = {c.chunk_id: c for c in _chunks}
                 _quar_names = {
-                    t for t, m in _msgs.items() if str(m).startswith(_quar_prefix)
+                    t for t, m in _msgs.items() if is_quarantine_message(m)
                 }
                 _quar_names |= {
                     c.chunk_id for c in _chunks
