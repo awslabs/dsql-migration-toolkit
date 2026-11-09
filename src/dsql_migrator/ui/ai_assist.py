@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""AI-assisted conversion: NiceGUI-agnostic config, review gate, and seam.
+"""AI assist: NiceGUI-agnostic config, availability, and "Verify AI access".
 
 This module holds the AI-assist logic that is independent of NiceGUI so it can
 be unit tested directly:
@@ -9,41 +9,27 @@ be unit tested directly:
 - building the per-session :class:`~dsql_migrator.core.models.AiAssistConfig`
   from the settings form (default disabled / opt-in, default model id
   ``global.anthropic.claude-sonnet-5`` -- Requirements 11.1, 11.2, 11.3, 11.4),
-- the injectable :class:`AiConversionAssistant` Protocol seam. The real
-  Bedrock-backed assistant lands in Task 16; the UI depends only on this seam so
-  it can be wired later without changing the screen,
-- suggestion status transitions (edit / approve / reject), and
-- the human-review gate (Property 13): only an explicitly ``APPROVED`` suggestion
-  is eligible for the Schema Applier path; rejected / pending /
-  edited-but-not-approved suggestions are excluded.
+- the one availability answer every AI affordance asks (off / unverified /
+  available / unavailable), and
+- the "Verify AI access" preflight runner and its result-display mapping
+  (Requirements 11.13-11.16).
 
 AI assist augments the deterministic (sqlglot) path; it never replaces it. When
-AI is disabled (the default) or no assistant is wired, no suggestions are
-generated and the review gate yields nothing, so the workflow behaves exactly
-as the deterministic-only path (Requirements 11.1, 11.2).
+AI is disabled (the default), no Bedrock call is made, so the workflow behaves
+exactly as the deterministic-only path (Requirements 11.1, 11.2).
 """
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple, Optional, Protocol, Sequence
+from typing import Callable, NamedTuple, Optional, Protocol
 
-from dsql_migrator.core.models import (
-    AiAccessCheckResult,
-    AiAssistConfig,
-    AiConversionSuggestion,
-)
-
-# Review lifecycle status values (mirror AiConversionSuggestion.status).
-AI_STATUS_PENDING_REVIEW = "PENDING_REVIEW"
-AI_STATUS_EDITED = "EDITED"
-AI_STATUS_APPROVED = "APPROVED"
-AI_STATUS_REJECTED = "REJECTED"
+from dsql_migrator.core.models import AiAccessCheckResult, AiAssistConfig
 
 # Default Bedrock model id used when the model input is left blank (Req 11.3).
 # This MUST be a real Bedrock model / inference-profile id (it is passed verbatim
 # as ``modelId`` to ``invoke_model``), not a display name. Sonnet 5 is the
-# general, cost-effective default; AI assist is opt-in and every suggestion
-# passes the human-review gate (Property 13) before it can touch the schema.
+# general, cost-effective default; AI assist is opt-in and advisory: SQL from a
+# reply touches the schema only after the operator adopts it and runs Apply.
 # The ``global.`` (not ``us.``) cross-region-inference profile is used so the
 # default is reachable from any commercial region -- a ``us.*`` profile is
 # US-geography-scoped and fails InvokeModel in e.g. ap-northeast-2 (Seoul).
@@ -219,102 +205,6 @@ def ai_unavailable_hint(state: object) -> str:
 
 
 # ---------------------------------------------------------------------------
-# AI Conversion Assistant seam (Task 16 wires the real Bedrock-backed impl)
-# ---------------------------------------------------------------------------
-
-
-class AiConversionAssistant(Protocol):
-    """Generates a reviewable schema-conversion suggestion (design.md section).
-
-    Mirrors the design's ``AiConversionAssistant.suggest_schema_conversion``. The
-    UI depends only on this seam so the real Bedrock-backed assistant (Task 16)
-    can be injected later. Implementations treat their output as untrusted data
-    and never write to the source (Property 1, 13).
-    """
-
-    def suggest_schema_conversion(
-        self,
-        *,
-        object_name: str,
-        source_ddl: str,
-        deterministic_result: Optional[str],
-        dsql_constraints: str,
-    ) -> AiConversionSuggestion:
-        """Return an AI suggestion for one MANUAL/UNSUPPORTED schema object."""
-
-
-# ---------------------------------------------------------------------------
-# Suggestion status transitions (edit / approve / reject)
-# ---------------------------------------------------------------------------
-
-
-def edit_suggestion(
-    suggestion: AiConversionSuggestion, new_text: str
-) -> AiConversionSuggestion:
-    """Return a copy with edited text, status ``EDITED`` and approval cleared.
-
-    Editing a suggestion always revokes any prior approval: an edited suggestion
-    must be explicitly approved again before it can be applied (Property 13).
-    """
-    return suggestion.model_copy(
-        update={
-            "suggested_sql_or_expr": new_text,
-            "status": AI_STATUS_EDITED,
-            "approved_by_user": False,
-        }
-    )
-
-
-def approve_suggestion(suggestion: AiConversionSuggestion) -> AiConversionSuggestion:
-    """Return a copy marked ``APPROVED`` with ``approved_by_user`` set.
-
-    Only after this explicit approval may a suggestion flow to the Schema
-    Applier path (Property 13 / Requirements 10.9, 11.7).
-    """
-    return suggestion.model_copy(
-        update={"status": AI_STATUS_APPROVED, "approved_by_user": True}
-    )
-
-
-def reject_suggestion(suggestion: AiConversionSuggestion) -> AiConversionSuggestion:
-    """Return a copy marked ``REJECTED`` with approval cleared.
-
-    A rejected suggestion is never applied; the deterministic result and the
-    object's ``MANUAL``/``UNSUPPORTED`` flag are kept (Requirement 11.10).
-    """
-    return suggestion.model_copy(
-        update={"status": AI_STATUS_REJECTED, "approved_by_user": False}
-    )
-
-
-# ---------------------------------------------------------------------------
-# Human-review gate (Property 13)
-# ---------------------------------------------------------------------------
-
-
-def is_approved(suggestion: AiConversionSuggestion) -> bool:
-    """Return whether ``suggestion`` is explicitly approved for apply.
-
-    A suggestion is approved only when both its ``status`` is ``APPROVED`` and
-    ``approved_by_user`` is ``True``. Pending, edited, and rejected suggestions
-    are never considered approved (Property 13).
-    """
-    return suggestion.status == AI_STATUS_APPROVED and suggestion.approved_by_user
-
-
-def approved_suggestions(
-    suggestions: Sequence[AiConversionSuggestion],
-) -> list[AiConversionSuggestion]:
-    """Return only the explicitly approved suggestions from ``suggestions``.
-
-    This is the heart of the review gate (Property 13): rejected, pending, and
-    edited-but-not-approved suggestions are excluded, so nothing reaches the
-    Schema Applier path without an explicit human approval.
-    """
-    return [suggestion for suggestion in suggestions if is_approved(suggestion)]
-
-
-# ---------------------------------------------------------------------------
 # "Verify AI access" result display mapping (Requirements 11.13, 11.14)
 # ---------------------------------------------------------------------------
 
@@ -464,10 +354,6 @@ def run_verify_ai_access(
 
 
 __all__ = [
-    "AI_STATUS_PENDING_REVIEW",
-    "AI_STATUS_EDITED",
-    "AI_STATUS_APPROVED",
-    "AI_STATUS_REJECTED",
     "DEFAULT_BEDROCK_MODEL_ID",
     "SUPPORTED_BEDROCK_MODELS",
     "build_ai_assist_config",
@@ -480,12 +366,6 @@ __all__ = [
     "ai_settings_key",
     "ai_is_usable",
     "ai_unavailable_hint",
-    "AiConversionAssistant",
-    "edit_suggestion",
-    "approve_suggestion",
-    "reject_suggestion",
-    "is_approved",
-    "approved_suggestions",
     "AiAccessDisplay",
     "ACCESS_CHECK_NOTIFY_TYPES",
     "map_access_check_display",

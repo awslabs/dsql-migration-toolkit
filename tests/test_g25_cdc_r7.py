@@ -644,12 +644,8 @@ def test_start_over_and_the_exclusion_runbooks_name_the_new_topics_order() -> No
 def test_the_ai_facts_carry_whether_the_stack_has_streamed() -> None:
     import inspect
 
-    from dsql_migrator.core.cdc_assist import CdcReadinessSignals, build_cdc_readiness_prompt
     from dsql_migrator.ui import ai_tools
 
     src = inspect.getsource(ai_tools)
     assert '"stack_has_streamed": bool(cdc_stack_has_streamed(_dm))' in src
     assert "watermark_handoff is where CDC resumes from after Full Load." not in src
-    prompt = build_cdc_readiness_prompt(CdcReadinessSignals(gtid_enabled=False), [])
-    assert "gapless resume" not in prompt
-    assert "GTID enabled (Debezium positions by GTID set): no" in prompt

@@ -9,11 +9,8 @@ NiceGUI:
 - Building :class:`AiAssistConfig` from the settings form: opt-in default
   (disabled) and default model id ``global.anthropic.claude-sonnet-5`` (Requirements 11.1-11.4).
 - Per-session AI config state isolation (Requirement 9.2 pattern).
-- Suggestion review status transitions (edit / approve / reject) and the
-  invariant that editing revokes any prior approval.
-- The human-review gate (Property 13): only an explicitly APPROVED suggestion is
-  forwarded to the Schema Applier path; rejected / pending / edited-but-not
-  -approved and non-SCHEMA suggestions are excluded (Requirements 10.9, 11.7).
+- AI candidate selection, the "Verify AI access" display mapping and runner, and
+  the AI availability model (intent vs verified capability).
 """
 
 from __future__ import annotations
@@ -21,58 +18,19 @@ from __future__ import annotations
 from dsql_migrator.core.models import (
     AiAccessCheckResult,
     AiAssistConfig,
-    AiConversionSuggestion,
     AssessmentItem,
     AssessmentReport,
     Classification,
 )
 from dsql_migrator.ui.ai_assist import (
     ACCESS_CHECK_NOTIFY_TYPES,
-    AI_STATUS_APPROVED,
-    AI_STATUS_EDITED,
-    AI_STATUS_PENDING_REVIEW,
-    AI_STATUS_REJECTED,
     DEFAULT_BEDROCK_MODEL_ID,
-    approve_suggestion,
-    approved_suggestions,
     build_ai_assist_config,
-    edit_suggestion,
-    is_approved,
     map_access_check_display,
-    reject_suggestion,
     run_verify_ai_access,
 )
-from dsql_migrator.ui.schema_conversion import (
-    SchemaConversionState,
-    SchemaConversionStore,
-    ai_candidate_object_names,
-    build_ai_apply_objects,
-)
+from dsql_migrator.ui.schema_conversion import ai_candidate_object_names
 from dsql_migrator.ui.session import SessionStore
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _suggestion(
-    object_name: str = "audit_trigger",
-    *,
-    kind: str = "SCHEMA",
-    sql: str = "CREATE TABLE foo (id int PRIMARY KEY)",
-    status: str = AI_STATUS_PENDING_REVIEW,
-    approved: bool = False,
-) -> AiConversionSuggestion:
-    return AiConversionSuggestion(
-        object_name=object_name,
-        kind=kind,  # type: ignore[arg-type]
-        suggested_sql_or_expr=sql,
-        rationale="example",
-        model_id="global.anthropic.claude-sonnet-5",
-        status=status,  # type: ignore[arg-type]
-        approved_by_user=approved,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +56,6 @@ def test_default_model_is_region_agnostic_global_profile() -> None:
     assert not DEFAULT_BEDROCK_MODEL_ID.startswith("us.")
     # The model-level default and the UI-level default must not drift apart.
     assert AiAssistConfig().model_id == DEFAULT_BEDROCK_MODEL_ID
-
-
-def test_ai_conversion_suggestion_defaults_pending_and_unapproved() -> None:
-    suggestion = _suggestion()
-    assert suggestion.status == AI_STATUS_PENDING_REVIEW
-    assert suggestion.approved_by_user is False
 
 
 # ---------------------------------------------------------------------------
@@ -169,107 +121,6 @@ def test_session_clear_resets_ai_assist_to_default() -> None:
 
     assert state.ai_assist.enabled is False
     assert state.ai_assist.model_id == "global.anthropic.claude-sonnet-5"
-
-
-# ---------------------------------------------------------------------------
-# Suggestion status transitions
-# ---------------------------------------------------------------------------
-
-
-def test_edit_suggestion_sets_edited_and_clears_approval() -> None:
-    edited = edit_suggestion(_suggestion(), "CREATE TABLE bar (id int PRIMARY KEY)")
-    assert edited.status == AI_STATUS_EDITED
-    assert edited.approved_by_user is False
-    assert edited.suggested_sql_or_expr == "CREATE TABLE bar (id int PRIMARY KEY)"
-
-
-def test_approve_suggestion_marks_approved() -> None:
-    approved = approve_suggestion(_suggestion())
-    assert approved.status == AI_STATUS_APPROVED
-    assert approved.approved_by_user is True
-
-
-def test_reject_suggestion_marks_rejected_and_unapproved() -> None:
-    rejected = reject_suggestion(approve_suggestion(_suggestion()))
-    assert rejected.status == AI_STATUS_REJECTED
-    assert rejected.approved_by_user is False
-
-
-def test_editing_an_approved_suggestion_revokes_approval() -> None:
-    """Property 13: an edit after approval must require re-approval."""
-    approved = approve_suggestion(_suggestion())
-    re_edited = edit_suggestion(approved, "CREATE TABLE baz (id int PRIMARY KEY)")
-    assert is_approved(re_edited) is False
-    assert re_edited.status == AI_STATUS_EDITED
-
-
-# ---------------------------------------------------------------------------
-# Review gate -- Property 13
-# ---------------------------------------------------------------------------
-
-
-def test_is_approved_only_for_approved_and_flagged() -> None:
-    assert is_approved(approve_suggestion(_suggestion())) is True
-    assert is_approved(_suggestion(status=AI_STATUS_PENDING_REVIEW)) is False
-    assert is_approved(_suggestion(status=AI_STATUS_EDITED)) is False
-    assert is_approved(_suggestion(status=AI_STATUS_REJECTED)) is False
-    # status says APPROVED but the explicit flag is missing: not approved.
-    assert is_approved(_suggestion(status=AI_STATUS_APPROVED, approved=False)) is False
-
-
-def test_approved_suggestions_excludes_unapproved() -> None:
-    pending = _suggestion("a", status=AI_STATUS_PENDING_REVIEW)
-    edited = _suggestion("b", status=AI_STATUS_EDITED)
-    rejected = _suggestion("c", status=AI_STATUS_REJECTED)
-    approved = approve_suggestion(_suggestion("d"))
-
-    result = approved_suggestions([pending, edited, rejected, approved])
-
-    assert [s.object_name for s in result] == ["d"]
-
-
-def test_build_ai_apply_objects_forwards_only_approved_schema() -> None:
-    """Property 13: only explicitly approved SCHEMA suggestions reach apply."""
-    approved = approve_suggestion(
-        _suggestion("orders_v2", sql="CREATE TABLE orders_v2 (id int PRIMARY KEY)")
-    )
-    pending = _suggestion("pending_obj")
-    edited = _suggestion("edited_obj", status=AI_STATUS_EDITED)
-    rejected = _suggestion("rejected_obj", status=AI_STATUS_REJECTED)
-
-    objects = build_ai_apply_objects([approved, pending, edited, rejected])
-
-    assert [obj.object_name for obj in objects] == ["orders_v2"]
-    assert objects[0].ddls == ("CREATE TABLE orders_v2 (id int PRIMARY KEY)",)
-
-
-def test_build_ai_apply_objects_excludes_non_schema_suggestions() -> None:
-    approved_data = approve_suggestion(
-        _suggestion("col_expr", kind="DATA", sql="CAST(x AS TEXT)")
-    )
-    approved_query = approve_suggestion(
-        _suggestion("q1", kind="QUERY", sql="SELECT 1")
-    )
-    assert build_ai_apply_objects([approved_data, approved_query]) == []
-
-
-def test_build_ai_apply_objects_splits_multiple_statements() -> None:
-    approved = approve_suggestion(
-        _suggestion(
-            "multi",
-            sql="CREATE TABLE multi (id int PRIMARY KEY); CREATE INDEX ASYNC i ON multi (id)",
-        )
-    )
-    objects = build_ai_apply_objects([approved])
-    assert len(objects) == 1
-    assert len(objects[0].ddls) == 2
-    assert objects[0].ddls[0].lower().startswith("create table")
-    assert "CREATE INDEX ASYNC" in objects[0].ddls[1]
-
-
-def test_build_ai_apply_objects_drops_approved_but_empty_text() -> None:
-    approved_empty = approve_suggestion(_suggestion("empty", sql="   ;  "))
-    assert build_ai_apply_objects([approved_empty]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +192,9 @@ def test_ai_candidate_object_names_empty_when_all_auto() -> None:
 # NOTE: the per-object AI *suggestion* storage on SchemaConversionState (set/get/all/
 # clear_suggestion) was removed with the unreachable approve/reject-suggestion UI. The
 # AI-DDL loop is now the conversion chat's "Use as target DDL" footer, which adopts a
-# reply's SQL into edited_target_ddls -> Apply. The suggestion MODELS + helpers
-# (approve/reject/build_ai_apply_objects) remain (used + tested via core ai_routing).
+# reply's SQL into edited_target_ddls -> Apply. The never-wired suggest / review / apply
+# pipeline behind it (the suggestion model, approve/reject, build_ai_apply_objects,
+# core ai_routing) was deleted in X1; tests/test_rr_x1_removed.py pins that it stays gone.
 
 
 # ---------------------------------------------------------------------------

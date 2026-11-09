@@ -3378,18 +3378,6 @@ def _build_source_ddl(table: TableDef, *, zone: "Optional[SourceZone]" = None) -
     return f"CREATE TABLE {_quote_mysql_qualified(table.name)} ({body})"
 
 
-def build_source_table_ddl(table: TableDef) -> str:
-    """Return the reconstructed MySQL ``CREATE TABLE`` DDL for ``table``.
-
-    Public wrapper over the internal builder so the AI routing layer (Task 16.4)
-    can ground a suggestion prompt with the already-extracted source DDL without
-    reaching into a private helper or the UI. This only reads the in-memory
-    :class:`TableDef`; it never touches the source database. Raises
-    ``ValueError`` if the table has no columns.
-    """
-    return _build_source_ddl(table)
-
-
 # MySQL spatial types have no Aurora DSQL (PostgreSQL, no PostGIS) equivalent and
 # are not recognized as data types by sqlglot's MySQL dialect, so a table using
 # one cannot be reconstructed/transpiled. Detected to give a precise reason. The set,
@@ -8725,7 +8713,6 @@ __all__ = [
     "SchemaConverter",
     "map_data_type",
     "map_mysql_type",
-    "build_source_table_ddl",
     "parse_target_column_constraints",
     "parse_target_column_default_texts",
     "views_in_dependency_order",

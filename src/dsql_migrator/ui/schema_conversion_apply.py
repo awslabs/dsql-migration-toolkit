@@ -5,12 +5,11 @@
 
 The apply contracts (ApplyMode/ApplyObject/SchemaApplier protocols), the
 OCC-retrying orchestration (``run_schema_apply`` + ``build_apply_objects`` family),
-the AI-assisted conversion-unit builders, and the DSQL applier adapter. Pure
-domain/apply logic with NO NiceGUI dependency (heavily unit-tested); the screen
-builder + render helpers stay in ``schema_conversion.py``, which re-exports these
-names so every consumer/test import resolves unchanged. One-directional: this
-module imports only stdlib + ``core.*`` + ``ui.ai_assist`` (never back from
-``schema_conversion``).
+the AI-candidate selector, and the DSQL applier adapter. Pure domain/apply logic
+with NO NiceGUI dependency (heavily unit-tested); the screen builder + render
+helpers stay in ``schema_conversion.py``, which re-exports these names so every
+consumer/test import resolves unchanged. One-directional: this module imports
+only stdlib + ``core.*`` (never back from ``schema_conversion``).
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
-from dsql_migrator.core.ai_assistant import validate_suggested_sql
 from dsql_migrator.core.converter import (
     PrimaryKeyStrategy,
     SchemaConversionResult,
@@ -37,7 +35,6 @@ from dsql_migrator.core.converter import (
     views_in_dependency_order,
 )
 from dsql_migrator.core.models import (
-    AiConversionSuggestion,
     AssessmentReport,
     Classification,
     StepStatus,
@@ -51,7 +48,6 @@ from dsql_migrator.core.occ import (
     SleepFunc,
     with_occ_retry,
 )
-from dsql_migrator.ui.ai_assist import approved_suggestions
 
 # ---------------------------------------------------------------------------
 # Apply contracts (NiceGUI-agnostic) -- the Task 15 Schema Applier seam
@@ -999,7 +995,7 @@ def override_apply_objects(
 
 
 # ---------------------------------------------------------------------------
-# AI-assisted conversion: candidate selection + review-gate apply units
+# AI-assisted conversion: candidate selection
 # ---------------------------------------------------------------------------
 
 
@@ -1440,60 +1436,6 @@ def applied_view_ddls(
     for name, stmt in helpers.items():
         ddls.setdefault(name, stmt)
     return ddls
-
-
-def build_ai_apply_objects(
-    suggestions: Sequence[AiConversionSuggestion],
-) -> list[ApplyObject]:
-    """Turn only the *approved, safe* SCHEMA suggestions into apply units.
-
-    This is the review gate (Property 13). It forwards a suggestion to the Schema
-    Applier path only when:
-
-    - the user explicitly approved it (``status == APPROVED`` and
-      ``approved_by_user``) -- reusing :func:`approved_suggestions`; rejected,
-      pending, and edited-but-not-approved suggestions are excluded,
-    - it is a SCHEMA suggestion (DATA/QUERY are not applied to the target),
-    - its untrusted text passes :func:`validate_suggested_sql` -- so a suggestion
-      that was edited to contain a forbidden statement (e.g. DROP/DELETE/GRANT)
-      and then approved is still refused and never applied (Requirement 11.8 /
-      Property 13), and
-    - its text contains at least one DDL statement.
-
-    Each suggestion's text is split into single DDL statements so every statement
-    is applied in its own transaction (Property 2), consistent with the
-    deterministic apply path.
-    """
-    objects: list[ApplyObject] = []
-    for suggestion in approved_suggestions(suggestions):
-        if suggestion.kind != "SCHEMA":
-            continue
-        # Untrusted output: refuse forbidden statements even when approved.
-        if not validate_suggested_sql(suggestion.suggested_sql_or_expr).is_safe:
-            continue
-        ddls = tuple(split_sql_statements(suggestion.suggested_sql_or_expr))
-        if not ddls:
-            continue
-        objects.append(ApplyObject(object_name=suggestion.object_name, ddls=ddls))
-    return objects
-
-
-def _dedupe_apply_objects(
-    objects: Sequence[ApplyObject], ai_objects: Sequence[ApplyObject]
-) -> list[ApplyObject]:
-    """Merge deterministic + AI/edited apply units, deduped by ``object_name``.
-
-    One object can yield BOTH a deterministic unit (e.g. an UNSUPPORTED ``skip_reason``
-    placeholder) and an approved AI SCHEMA suggestion for the same name. Without dedupe the
-    object is applied AND reported twice (a skip line plus a create line). The AI/edited unit
-    wins and replaces the deterministic one IN PLACE -- insertion order is preserved, so the
-    dependency-ordered position is kept -- and an AI unit for a name not already present is
-    appended.
-    """
-    by_name: dict[str, ApplyObject] = {obj.object_name: obj for obj in objects}
-    for ai_obj in ai_objects:
-        by_name[ai_obj.object_name] = ai_obj
-    return list(by_name.values())
 
 
 def _apply_success_detail(outcome: ApplyOutcome, mode: ApplyMode) -> str:

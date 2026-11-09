@@ -2102,33 +2102,6 @@ class MigrationContext(BaseModel):
     summary: str = ""
 
 
-class AiConversionSuggestion(BaseModel):
-    """A reviewable AI conversion suggestion for one MANUAL/UNSUPPORTED object.
-
-    The model output is treated as untrusted data: a suggestion is only ever
-    applied after a human explicitly approves it (Requirement 11.7, 11.8).
-    ``status`` tracks the review lifecycle (``PENDING_REVIEW`` ->
-    ``EDITED``/``APPROVED``/``REJECTED``) and ``approved_by_user`` records the
-    explicit approval. Only an ``APPROVED`` suggestion may flow to the Schema
-    Applier path; rejected/pending/edited suggestions never reach apply
-    (Property 13 / Requirements 10.9, 11.7). ``model_id`` carries provenance:
-    which Bedrock model produced the suggestion.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    object_name: str = Field(min_length=1)
-    kind: Literal["SCHEMA", "DATA", "QUERY"]
-    suggested_sql_or_expr: str
-    rationale: str = ""
-    confidence: Optional[float] = None
-    model_id: str = Field(min_length=1)
-    status: Literal["PENDING_REVIEW", "EDITED", "APPROVED", "REJECTED"] = (
-        "PENDING_REVIEW"
-    )
-    approved_by_user: bool = False
-
-
 class AiAssessmentInsight(BaseModel):
     """AI-generated, advisory analysis for one assessed source object (Req 11).
 
@@ -2200,8 +2173,7 @@ class AiAccessCheckResult(BaseModel):
     7). ``MODEL_AGREEMENT_REQUIRED`` means the model's AWS Marketplace
     subscription (its agreement) is missing or failed for the account.
     ``model_id`` and ``region`` echo the configuration the check ran against.
-    This only reports connectivity/permission; it does not alter the AI
-    suggestion review gate (Property 13).
+    This only reports connectivity/permission.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -2691,7 +2663,6 @@ __all__ = [
     "StepStatus",
     "WorkflowState",
     "AiAssistConfig",
-    "AiConversionSuggestion",
     "AiAssessmentInsight",
     "AiAssessmentFinding",
     "AiAssessmentReport",

@@ -304,7 +304,6 @@ def _assert_no_leak(*texts: str) -> None:
 
 def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> None:
     from dsql_migrator.core.assessment_strategist import AssessmentStrategist
-    from dsql_migrator.core.cdc_assist import CdcAssistant, CdcReadinessSignals
     from dsql_migrator.core.models import AssessmentItem, Classification, EffortLevel
 
     caplog.set_level(logging.DEBUG)
@@ -319,7 +318,6 @@ def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> No
     assert (error.reason, error.detail) == ("MODEL_AGREEMENT_REQUIRED", chat_copy)
     _assert_no_leak(error.detail, str(error), repr(error.args))
 
-    assistant = AiConversionAssistant(cfg, client=_RaisingClient(exc))
     item = AssessmentItem(
         object_name="orders",
         rule_id="FK_PRESERVED",
@@ -329,18 +327,6 @@ def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> No
     )
     strategist = AssessmentStrategist(cfg, client=_RaisingClient(exc))
     outcomes = {
-        "try_suggest_schema_conversion": assistant.try_suggest_schema_conversion(
-            object_name="t",
-            source_ddl="CREATE TABLE t (id INT PRIMARY KEY)",
-            deterministic_result="MANUAL",
-            dsql_constraints="PK required",
-        ),
-        "try_suggest_data_transformation": assistant.try_suggest_data_transformation(
-            object_name="t.c",
-            source_type="SET('a','b')",
-            sample_values=["a"],
-            deterministic_mapping="MANUAL",
-        ),
         "stream_chat": strategist.stream_chat(
             "SYS", [{"role": "user", "text": "hi"}], lambda _delta: None
         ),
@@ -355,9 +341,6 @@ def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> No
         "stream_object_guidance": strategist.stream_object_guidance(
             item, lambda _delta: None
         ),
-        "CdcAssistant.try_readiness": CdcAssistant(
-            cfg, client=_RaisingClient(exc)
-        ).try_readiness(CdcReadinessSignals(), ["app.t"]),
     }
     for path, outcome in outcomes.items():
         assert outcome.available is False, path
@@ -504,7 +487,7 @@ def test_every_reason_taxonomy_is_complete() -> None:
     unavailable = set(typing.get_args(aa.UnavailableReason))
     assert "MODEL_AGREEMENT_REQUIRED" in unavailable
     assert set(aa._UNAVAILABLE_DETAILS) == unavailable
-    for cls in (aa.AiSuggestionOutcome, AiAssessmentOutcome, ObjectGuidanceOutcome):
+    for cls in (AiAssessmentOutcome, ObjectGuidanceOutcome):
         hint = typing.get_type_hints(cls)["reason"]
         assert set(typing.get_args(hint)) == {"OK"} | unavailable, cls.__name__
 

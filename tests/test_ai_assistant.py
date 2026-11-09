@@ -3,15 +3,18 @@
 
 """Unit tests for AI-assist data models, config loading, and the Bedrock seam.
 
-Covers Task 16.1:
+Covers:
 
-- ``AiAssistConfig`` / ``AiConversionSuggestion`` serialization round-trips,
-  defaults, and validation (Requirements 11.1-11.4).
+- ``AiAssistConfig`` serialization round-trips, defaults, and validation
+  (Requirements 11.1-11.4).
 - Loading ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION`` into an ``AiAssistConfig``
   (default model id, region, opt-in disabled).
 - Constructing the ``bedrock-runtime`` client from an injected fake session:
   the right region is forwarded, no credentials are passed (IAM-based auth), and
   building the client performs no network call.
+- Untrusted-output parsing, the forbidden-statement validator, the typed
+  Bedrock-failure classification (Requirements 11.8, 11.10), and the
+  ``verify_access`` preflight (Requirements 11.13-11.16).
 
 All Bedrock interaction is mocked through an injected fake session, so these
 tests never reach AWS.
@@ -36,14 +39,11 @@ from dsql_migrator.core.ai_assistant import (
     load_ai_assist_config,
     validate_suggested_sql,
 )
-from dsql_migrator.core.ai_assistant import (
-    _extract_suggestion_text,  # internal: exercised for untrusted-output safety
+from dsql_migrator.core.ai_assistant import (  # internal: untrusted-output safety
+    _classify_bedrock_error,
+    _extract_suggestion_text,
 )
-from dsql_migrator.core.models import (
-    AiAccessCheckResult,
-    AiAssistConfig,
-    AiConversionSuggestion,
-)
+from dsql_migrator.core.models import AiAccessCheckResult, AiAssistConfig
 
 
 # ---------------------------------------------------------------------------
@@ -96,70 +96,6 @@ def test_ai_assist_config_rejects_blank_model_id() -> None:
 def test_ai_assist_config_rejects_unknown_field() -> None:
     with pytest.raises(ValidationError):
         AiAssistConfig(unexpected="value")
-
-
-# ---------------------------------------------------------------------------
-# AiConversionSuggestion model: defaults, serialization round-trip, validation
-# ---------------------------------------------------------------------------
-
-
-def test_ai_conversion_suggestion_defaults() -> None:
-    suggestion = AiConversionSuggestion(
-        object_name="audit_trigger",
-        kind="SCHEMA",
-        suggested_sql_or_expr="CREATE TABLE t (id int PRIMARY KEY)",
-        model_id="global.anthropic.claude-sonnet-5",
-    )
-    assert suggestion.status == "PENDING_REVIEW"
-    assert suggestion.approved_by_user is False
-    assert suggestion.confidence is None
-    assert suggestion.rationale == ""
-
-
-def test_ai_conversion_suggestion_serialization_round_trip() -> None:
-    suggestion = AiConversionSuggestion(
-        object_name="legacy_proc",
-        kind="QUERY",
-        suggested_sql_or_expr="SELECT 1",
-        rationale="rewrite",
-        confidence=0.5,
-        model_id="global.anthropic.claude-sonnet-5",
-        status="APPROVED",
-        approved_by_user=True,
-    )
-    restored = AiConversionSuggestion.model_validate(suggestion.model_dump())
-    assert restored == suggestion
-
-
-def test_ai_conversion_suggestion_rejects_invalid_kind() -> None:
-    with pytest.raises(ValidationError):
-        AiConversionSuggestion(
-            object_name="t",
-            kind="TABLE",  # not one of SCHEMA/DATA/QUERY
-            suggested_sql_or_expr="x",
-            model_id="global.anthropic.claude-sonnet-5",
-        )
-
-
-def test_ai_conversion_suggestion_rejects_invalid_status() -> None:
-    with pytest.raises(ValidationError):
-        AiConversionSuggestion(
-            object_name="t",
-            kind="SCHEMA",
-            suggested_sql_or_expr="x",
-            model_id="global.anthropic.claude-sonnet-5",
-            status="DONE",  # not a valid review status
-        )
-
-
-def test_ai_conversion_suggestion_requires_model_id() -> None:
-    with pytest.raises(ValidationError):
-        AiConversionSuggestion(
-            object_name="t",
-            kind="SCHEMA",
-            suggested_sql_or_expr="x",
-            model_id="",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -260,16 +196,16 @@ def test_build_bedrock_runtime_client_performs_no_network_call() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AiConversionAssistant: grounded prompts, InvokeModel call, suggestion output
+# AiConversionAssistant: fake bedrock-runtime client + lazy client build
 # ---------------------------------------------------------------------------
 
 
 class _FakeBedrockRuntimeClient:
     """A fake bedrock-runtime client recording InvokeModel calls.
 
-    It returns a canned Anthropic-style response so suggestion generation never
-    reaches AWS. Each call's kwargs are recorded so tests can assert the
-    configured ``modelId`` was used and the request body is grounded.
+    It returns a canned Anthropic-style response so the preflight never reaches
+    AWS. Each call's kwargs are recorded so tests can assert which ``modelId``
+    was used.
     """
 
     def __init__(self, suggestion_text: str) -> None:
@@ -282,101 +218,12 @@ class _FakeBedrockRuntimeClient:
         return {"body": json.dumps(payload).encode("utf-8")}
 
 
-def _decode_prompt(call: dict[str, Any]) -> str:
-    """Return the user prompt text from a recorded InvokeModel call body."""
-    body = json.loads(call["body"])
-    return body["messages"][0]["content"][0]["text"]
-
-
-def test_suggest_schema_conversion_grounds_prompt_and_returns_suggestion() -> None:
-    client = _FakeBedrockRuntimeClient("CREATE TABLE t (id uuid PRIMARY KEY)")
-    config = AiAssistConfig(enabled=True, model_id="anthropic.claude-test")
-    assistant = AiConversionAssistant(config, client=client)
-
-    suggestion = assistant.suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT AUTO_INCREMENT PRIMARY KEY)",
-        deterministic_result="MANUAL: monotonic AUTO_INCREMENT key risks hot partition",
-        dsql_constraints="Foreign keys enforced; primary key required; indexes async",
-    )
-
-    # InvokeModel was called once with the configured model id (provenance).
-    assert len(client.calls) == 1
-    assert client.calls[0]["modelId"] == "anthropic.claude-test"
-
-    # The prompt is grounded with source DDL, DSQL constraints, deterministic result.
-    prompt = _decode_prompt(client.calls[0])
-    assert "CREATE TABLE `orders`" in prompt
-    assert "Foreign keys enforced; primary key required; indexes async" in prompt
-    assert "monotonic AUTO_INCREMENT key risks hot partition" in prompt
-
-    # The returned suggestion is reviewable and carries provenance.
-    assert isinstance(suggestion, AiConversionSuggestion)
-    assert suggestion.kind == "SCHEMA"
-    assert suggestion.object_name == "orders"
-    assert suggestion.suggested_sql_or_expr == "CREATE TABLE t (id uuid PRIMARY KEY)"
-    assert suggestion.model_id == "anthropic.claude-test"
-    assert suggestion.status == "PENDING_REVIEW"
-    assert suggestion.approved_by_user is False
-    assert suggestion.rationale
-
-
-def test_suggest_data_transformation_grounds_on_schema_converter_mapping() -> None:
-    client = _FakeBedrockRuntimeClient("value::boolean")
-    config = AiAssistConfig(enabled=True, model_id="anthropic.claude-test")
-    assistant = AiConversionAssistant(config, client=client)
-
-    suggestion = assistant.suggest_data_transformation(
-        object_name="users.is_active",
-        source_type="TINYINT(1)",
-        sample_values=["0", "1"],
-        deterministic_mapping="MANUAL: TINYINT(1) -> boolean by convention",
-    )
-
-    assert len(client.calls) == 1
-    assert client.calls[0]["modelId"] == "anthropic.claude-test"
-
-    prompt = _decode_prompt(client.calls[0])
-    # Grounded on the source type, sample values, and deterministic mapping.
-    assert "TINYINT(1)" in prompt
-    assert "MANUAL: TINYINT(1) -> boolean by convention" in prompt
-    # Grounded consistently with the SchemaConverter export-time type mapping:
-    # TINYINT(1) maps to boolean, and the canonical mapping is cited in the prompt.
-    assert "boolean" in prompt
-    assert "SchemaConverter" in prompt
-
-    assert suggestion.kind == "DATA"
-    assert suggestion.object_name == "users.is_active"
-    assert suggestion.suggested_sql_or_expr == "value::boolean"
-    assert suggestion.model_id == "anthropic.claude-test"
-    assert suggestion.status == "PENDING_REVIEW"
-    assert suggestion.approved_by_user is False
-
-
-def test_suggest_data_transformation_handles_unparsable_source_type() -> None:
-    # An unparsable source type must not raise; the canonical mapping is reported
-    # as unavailable while still grounding the rest of the prompt.
-    client = _FakeBedrockRuntimeClient("(no change)")
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    suggestion = assistant.suggest_data_transformation(
-        object_name="t.c",
-        source_type="NOT A TYPE",
-        sample_values=[],
-        deterministic_mapping=None,
-    )
-
-    prompt = _decode_prompt(client.calls[0])
-    assert "canonical mapping unavailable" in prompt
-    assert suggestion.kind == "DATA"
-
-
 def test_assistant_builds_client_lazily_when_none_injected(monkeypatch: Any) -> None:
     # With no client injected, the assistant builds one lazily on first use via
     # the module's default-session factory. Patching that factory to return a
     # fake session keeps the test offline and proves construction itself does no
-    # AWS work (the factory is only touched on the first suggest call).
-    fake_client = _FakeBedrockRuntimeClient("CREATE TABLE t (id uuid PRIMARY KEY)")
+    # AWS work (the factory is only touched on the first verify_access call).
+    fake_client = _FakeBedrockRuntimeClient("pong")
 
     class _LazySession:
         def __init__(self) -> None:
@@ -395,12 +242,7 @@ def test_assistant_builds_client_lazily_when_none_injected(monkeypatch: Any) -> 
     # No session/client touched at construction time.
     assert session.calls == []
 
-    suggestion = assistant.suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result=None,
-        dsql_constraints="primary key required",
-    )
+    result = assistant.verify_access()
 
     # The lazy client was built from the configured region and used for InvokeModel.
     assert len(session.calls) == 1
@@ -409,19 +251,19 @@ def test_assistant_builds_client_lazily_when_none_injected(monkeypatch: Any) -> 
     assert kwargs["region_name"] == "us-east-1"
     assert kwargs["config"].read_timeout == 60
     assert len(fake_client.calls) == 1
-    assert suggestion.suggested_sql_or_expr == "CREATE TABLE t (id uuid PRIMARY KEY)"
+    assert result.ok is True
 
 
 # ---------------------------------------------------------------------------
-# Task 16.3: untrusted-output handling + graceful degradation
+# Untrusted-output handling + typed Bedrock-failure classification
 # ---------------------------------------------------------------------------
 
 
 class _RaisingBedrockRuntimeClient:
     """A fake bedrock-runtime client whose ``invoke_model`` always raises.
 
-    Used to simulate Bedrock failures (permission/throttle/network/unknown)
-    without reaching AWS.
+    Used to simulate Bedrock failures (permission/throttle/network/unknown) in
+    the preflight without reaching AWS.
     """
 
     def __init__(self, exc: BaseException) -> None:
@@ -431,16 +273,6 @@ class _RaisingBedrockRuntimeClient:
     def invoke_model(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
         raise self._exc
-
-
-class _RawBodyBedrockRuntimeClient:
-    """A fake client returning an arbitrary, possibly malformed, response body."""
-
-    def __init__(self, body: Any) -> None:
-        self._body = body
-
-    def invoke_model(self, **kwargs: Any) -> dict[str, Any]:
-        return {"body": self._body}
 
 
 def _client_error(code: str) -> Exception:
@@ -490,23 +322,6 @@ def test_extract_suggestion_text_caps_oversized_output() -> None:
     payload = json.dumps({"content": [{"type": "text", "text": huge}]})
     extracted = _extract_suggestion_text({"body": payload})
     assert len(extracted) == MAX_SUGGESTION_CHARS
-
-
-def test_invoke_maps_unparseable_output_to_invalid_output() -> None:
-    client = _RawBodyBedrockRuntimeClient(b"not json at all")
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    outcome = assistant.try_suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
-    )
-
-    assert outcome.available is False
-    assert outcome.reason == "INVALID_OUTPUT"
-    assert outcome.suggestion is None
-    assert "deterministic" in outcome.detail.lower()
 
 
 # --- Forbidden-statement validation (Req 11.8) -----------------------------
@@ -562,190 +377,42 @@ def test_validate_suggested_sql_ignores_commented_out_dangerous_statements() -> 
     ).is_safe
 
 
-def test_suggest_schema_conversion_flags_forbidden_output_as_rejected() -> None:
-    # Untrusted model output containing a forbidden statement must come back
-    # flagged REJECTED (not produced as an APPLY-ready suggestion).
-    client = _FakeBedrockRuntimeClient("DROP DATABASE prod; CREATE TABLE t (id int)")
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    suggestion = assistant.suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
-    )
-
-    assert suggestion.status == "REJECTED"
-    assert suggestion.approved_by_user is False
-    assert "forbidden" in suggestion.rationale.lower()
-
-
 # --- Graceful degradation on Bedrock errors (Req 11.10) --------------------
 
 
-def test_try_suggest_schema_conversion_degrades_on_access_denied() -> None:
-    client = _RaisingBedrockRuntimeClient(_client_error("AccessDeniedException"))
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    outcome = assistant.try_suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
+def test_bedrock_access_denied_maps_to_a_typed_actionable_error() -> None:
+    error = AiAssistUnavailableError(
+        _classify_bedrock_error(_client_error("AccessDeniedException"))
     )
 
-    assert outcome.available is False
-    assert outcome.reason == "ACCESS_DENIED"
-    assert outcome.suggestion is None
+    assert error.reason == "ACCESS_DENIED"
     # Clear, actionable message that keeps the deterministic result/flag.
-    assert "deterministic" in outcome.detail.lower()
-    assert "bedrock:InvokeModel".lower() in outcome.detail.lower()
+    assert "deterministic" in error.detail.lower()
+    assert "bedrock:InvokeModel".lower() in error.detail.lower()
 
 
-def test_try_suggest_schema_conversion_degrades_on_throttling() -> None:
-    client = _RaisingBedrockRuntimeClient(_client_error("ThrottlingException"))
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    outcome = assistant.try_suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
-    )
-
-    assert outcome.available is False
-    assert outcome.reason == "THROTTLED"
+def test_bedrock_throttling_maps_to_throttled() -> None:
+    assert _classify_bedrock_error(_client_error("ThrottlingException")) == "THROTTLED"
 
 
-def test_try_suggest_schema_conversion_degrades_on_network_error() -> None:
+def test_bedrock_network_error_maps_to_network() -> None:
     class EndpointConnectionError(Exception):
         """Mimics botocore's connectivity error by class name."""
 
-    client = _RaisingBedrockRuntimeClient(EndpointConnectionError("unreachable"))
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    outcome = assistant.try_suggest_data_transformation(
-        object_name="users.is_active",
-        source_type="TINYINT(1)",
-        sample_values=["0", "1"],
-        deterministic_mapping="MANUAL",
-    )
-
-    assert outcome.available is False
-    assert outcome.reason == "NETWORK"
+    assert _classify_bedrock_error(EndpointConnectionError("unreachable")) == "NETWORK"
 
 
-def test_try_suggest_schema_conversion_degrades_on_unknown_error() -> None:
-    client = _RaisingBedrockRuntimeClient(ValueError("boom"))
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    outcome = assistant.try_suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
-    )
-
-    assert outcome.available is False
-    assert outcome.reason == "UNAVAILABLE"
-
-
-def test_try_suggest_schema_conversion_returns_ok_on_success() -> None:
-    client = _FakeBedrockRuntimeClient("CREATE TABLE t (id uuid PRIMARY KEY)")
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    outcome = assistant.try_suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
-    )
-
-    assert outcome.available is True
-    assert outcome.reason == "OK"
-    assert outcome.suggestion is not None
-    assert outcome.suggestion.status == "PENDING_REVIEW"
-
-
-def test_suggest_schema_conversion_raises_typed_error_on_failure() -> None:
-    # The raising form surfaces a typed, catchable signal (the existing UI and
-    # the try_* wrappers both handle it) rather than a raw boto exception.
-    client = _RaisingBedrockRuntimeClient(_client_error("ThrottlingException"))
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
-
-    with pytest.raises(AiAssistUnavailableError) as excinfo:
-        assistant.suggest_schema_conversion(
-            object_name="orders",
-            source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-            deterministic_result="MANUAL",
-            dsql_constraints="primary key required",
-        )
-    assert excinfo.value.reason == "THROTTLED"
+def test_bedrock_unknown_error_maps_to_unavailable() -> None:
+    assert _classify_bedrock_error(ValueError("boom")) == "UNAVAILABLE"
 
 
 def test_degradation_detail_never_leaks_credentials() -> None:
     # The classifier must never echo the raw exception text (Property 7).
     secret = "AKIA_SECRET_SHOULD_NOT_LEAK"
-    client = _RaisingBedrockRuntimeClient(ValueError(f"creds={secret}"))
-    assistant = AiConversionAssistant(AiAssistConfig(enabled=True), client=client)
+    error = AiAssistUnavailableError(_classify_bedrock_error(ValueError(f"creds={secret}")))
 
-    outcome = assistant.try_suggest_schema_conversion(
-        object_name="orders",
-        source_ddl="CREATE TABLE `orders` (`id` INT PRIMARY KEY)",
-        deterministic_result="MANUAL",
-        dsql_constraints="primary key required",
-    )
-
-    assert secret not in outcome.detail
-
-
-# --- Apply gate: refuse unapproved and forbidden suggestions (Property 13) --
-
-
-def test_apply_gate_refuses_unapproved_and_passes_only_approved_safe() -> None:
-    from dsql_migrator.ui.ai_assist import approve_suggestion, is_approved
-    from dsql_migrator.ui.schema_conversion import build_ai_apply_objects
-
-    pending = AiConversionSuggestion(
-        object_name="pending",
-        kind="SCHEMA",
-        suggested_sql_or_expr="CREATE TABLE pending (id int PRIMARY KEY)",
-        model_id="global.anthropic.claude-sonnet-5",
-    )
-    approved = approve_suggestion(
-        AiConversionSuggestion(
-            object_name="approved",
-            kind="SCHEMA",
-            suggested_sql_or_expr="CREATE TABLE approved (id int PRIMARY KEY)",
-            model_id="global.anthropic.claude-sonnet-5",
-        )
-    )
-
-    assert is_approved(pending) is False
-    assert is_approved(approved) is True
-
-    objects = build_ai_apply_objects([pending, approved])
-    assert [obj.object_name for obj in objects] == ["approved"]
-
-
-def test_apply_gate_refuses_approved_but_forbidden_suggestion() -> None:
-    # Even an explicitly approved suggestion is refused if its (untrusted) text
-    # contains a forbidden statement, so it is never applied (Req 11.8).
-    from dsql_migrator.ui.ai_assist import approve_suggestion
-    from dsql_migrator.ui.schema_conversion import build_ai_apply_objects
-
-    dangerous = approve_suggestion(
-        AiConversionSuggestion(
-            object_name="dangerous",
-            kind="SCHEMA",
-            suggested_sql_or_expr="DROP DATABASE prod",
-            model_id="global.anthropic.claude-sonnet-5",
-            status="APPROVED",
-            approved_by_user=True,
-        )
-    )
-
-    assert build_ai_apply_objects([dangerous]) == []
+    assert secret not in error.detail
+    assert secret not in str(error)
 
 
 # ---------------------------------------------------------------------------
@@ -1195,38 +862,3 @@ def test_verify_access_never_raises_and_detail_is_credential_free() -> None:
     # The configuration is echoed back regardless of the failure.
     assert result.model_id == "m"
     assert result.region == "us-east-1"
-
-
-
-def test_split_sql_and_rationale_separates_code_from_prose() -> None:
-    from dsql_migrator.core.ai_assistant import _split_sql_and_rationale
-
-    text = (
-        "## Analysis\nThe object is a VIEW.\n\n"
-        "```sql\nCREATE VIEW v AS SELECT 1;\n```\n\n"
-        "## Caveats\nViews are not materialized."
-    )
-    sql, rationale = _split_sql_and_rationale(text)
-    assert sql == "CREATE VIEW v AS SELECT 1;"
-    assert "Analysis" in rationale and "Caveats" in rationale
-    assert "CREATE VIEW" not in rationale  # the SQL is not duplicated into prose
-
-
-def test_split_sql_and_rationale_joins_multiple_sql_blocks() -> None:
-    from dsql_migrator.core.ai_assistant import _split_sql_and_rationale
-
-    text = (
-        "Intro.\n```sql\nCREATE VIEW v AS SELECT 1;\n```\n"
-        "Indexes:\n```sql\nCREATE INDEX ASYNC i ON t (c);\n```"
-    )
-    sql, _rationale = _split_sql_and_rationale(text)
-    assert "CREATE VIEW v AS SELECT 1;" in sql
-    assert "CREATE INDEX ASYNC i ON t (c);" in sql
-
-
-def test_split_sql_and_rationale_no_fence_falls_back_to_raw() -> None:
-    from dsql_migrator.core.ai_assistant import _split_sql_and_rationale
-
-    sql, rationale = _split_sql_and_rationale("CREATE VIEW v AS SELECT 1;")
-    assert sql == "CREATE VIEW v AS SELECT 1;"
-    assert rationale == ""

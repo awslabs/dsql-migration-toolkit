@@ -1,52 +1,33 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""AI-assisted conversion: config/env loading and Bedrock-runtime client seam.
+"""AI assist plumbing shared by the AI DBA: config, Bedrock client, output safety.
 
-Task 16.1 scope. The AI data models (:class:`~dsql_migrator.core.models.AiAssistConfig`
-and :class:`~dsql_migrator.core.models.AiConversionSuggestion`) live in
-``core/models.py``; this module adds the two remaining pieces of 16.1:
+The AI data models (:class:`~dsql_migrator.core.models.AiAssistConfig` and
+:class:`~dsql_migrator.core.models.AiAccessCheckResult`) live in ``core/models.py``.
+This module holds the Bedrock plumbing the AI DBA (``core/assessment_strategist.py``)
+and the Connect screen's "Verify AI access" build on:
 
 - loading the ``BEDROCK_MODEL_ID`` (default ``global.anthropic.claude-sonnet-5``) and
   ``BEDROCK_REGION`` settings from the environment into an ``AiAssistConfig``
-  (Requirements 11.3, 11.4), and
-- constructing the ``bedrock-runtime`` ``boto3`` client used to call Bedrock
-  (Requirement 11.9).
+  (Requirements 11.3, 11.4), and constructing the ``bedrock-runtime`` ``boto3``
+  client used to call Bedrock (Requirement 11.9);
+- :func:`_extract_suggestion_text`, which treats the InvokeModel response as
+  untrusted data and never raises into the workflow on a malformed/empty/non-JSON
+  body, missing/unexpected fields, or oversized output; it returns the text it can
+  safely recover (capped at :data:`MAX_SUGGESTION_CHARS`) or an empty string
+  (Requirement 11.8);
+- :func:`validate_suggested_sql`, which blocks forbidden statements (e.g. data
+  mutation, ``DROP``, role/grant, transaction control, ``COPY``) in AI-proposed SQL
+  before Schema Conversion adopts it as a target DDL (Requirement 11.8);
+- the mapping of Bedrock failures (permission / model agreement / throttle /
+  network / unavailable / unparseable output) to a typed, credential-free
+  :class:`AiAssistUnavailableError` (Requirement 11.10); and
+- :meth:`AiConversionAssistant.verify_access`, the least-cost "Verify AI access"
+  preflight (Requirements 11.13-11.16).
 
-Task 16.2 adds the concrete :class:`AiConversionAssistant` and its two
-suggestion methods (``suggest_schema_conversion`` / ``suggest_data_transformation``):
-they ground a prompt with the already-extracted source DDL/types, the DSQL
-constraints, and the deterministic conversion result, call bedrock-runtime
-``InvokeModel`` via the injected client, and return a reviewable
-:class:`~dsql_migrator.core.models.AiConversionSuggestion` carrying provenance
-(``model_id``) and status ``PENDING_REVIEW`` (Requirements 11.5, 11.6).
-
-Task 16.3 hardens the untrusted model output and adds graceful degradation:
-
-- :func:`_extract_suggestion_text` now treats the InvokeModel response as
-  untrusted data and never raises into the workflow on a malformed/empty/
-  non-JSON body, missing/unexpected fields, or oversized output; it returns the
-  text it can safely recover (capped at :data:`MAX_SUGGESTION_CHARS`) or an empty
-  string (Requirement 11.8).
-- :func:`validate_suggested_sql` blocks forbidden statements (e.g. data
-  mutation, ``DROP``, role/grant, transaction control, ``COPY``) so an unsafe
-  suggestion is never produced as APPLY-ready (Requirement 11.8 / Property 13).
-  A schema/data suggestion that fails validation is returned flagged
-  ``REJECTED`` with a clear reason rather than as a usable suggestion.
-- Bedrock failures (permission / throttle / network / unavailable / unparseable
-  output) are mapped to :class:`AiAssistUnavailableError`. The
-  ``try_suggest_*`` methods catch it and return an :class:`AiSuggestionOutcome`
-  so the caller (converter routing, Task 16.4) can keep the deterministic result
-  and its ``MANUAL``/``UNSUPPORTED`` flag and continue the workflow with a clear,
-  credential-free message (Requirement 11.10).
-
-Nothing is ever auto-applied: every generated suggestion stays ``PENDING_REVIEW``
-(or ``REJECTED`` when it fails validation) and only an explicit human approval,
-gated in :mod:`dsql_migrator.ui.ai_assist`, makes it eligible for the Schema
-Applier path (Property 13). Cost/latency guidance (Requirement 11.12) is exposed
-by the UI (Connect and Schema Conversion screens); no engine-level duplicate is
-added. Converter routing and ``verify_access`` are implemented in later subtasks
-(16.4, 17.3).
+Nothing here applies anything: AI output is advisory, and SQL from a reply reaches
+the target only after the operator adopts it as a target DDL and runs Apply.
 
 Credential handling (Requirement 11.9 / Property 7):
 
@@ -73,8 +54,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Optional, Sequence
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
-from dsql_migrator.core.converter import map_mysql_type
-from dsql_migrator.core.models import AiAccessCheckResult, AiAssistConfig, AiConversionSuggestion
+from dsql_migrator.core.models import AiAccessCheckResult, AiAssistConfig
 
 # Documented config keys (NOT DSQL_MIGRATOR_-prefixed): Requirements 11.3, 11.4.
 ENV_BEDROCK_MODEL_ID = "BEDROCK_MODEL_ID"
@@ -300,12 +280,13 @@ def validate_suggested_sql(text: str) -> SqlValidation:
 
 
 # ---------------------------------------------------------------------------
-# Graceful degradation: typed unavailability + outcome (Req 11.10)
+# Graceful degradation: typed unavailability (Req 11.10)
 # ---------------------------------------------------------------------------
 
-# Why the AI suggestion could not be produced. "OK" means a suggestion is
-# available; the others mean the deterministic result and its MANUAL/UNSUPPORTED
-# flag must be kept while the workflow continues (Requirement 11.10).
+# Why an AI reply could not be produced. The outcome types built from it (e.g.
+# ``AiAssessmentOutcome`` in core/assessment_strategist.py) add "OK" for a usable
+# reply; every reason here means the deterministic workflow continues without the
+# AI part (Requirement 11.10).
 UnavailableReason = Literal[
     "ACCESS_DENIED",
     "MODEL_AGREEMENT_REQUIRED",
@@ -381,62 +362,20 @@ _UNAVAILABLE_DETAILS: dict[str, str] = {
 
 
 class AiAssistUnavailableError(RuntimeError):
-    """Raised when an AI suggestion cannot be produced (Requirement 11.10).
+    """Raised when an AI reply cannot be produced (Requirement 11.10).
 
     This is a *typed, catchable* signal -- not a raw boto/Bedrock exception -- so
-    a caller can map it to "AI unavailable; keep the deterministic result and the
-    MANUAL/UNSUPPORTED flag" without breaking the workflow. ``reason`` is one of
-    :data:`UnavailableReason` and ``detail`` is a fixed, credential-free message
-    (Property 7). The ``try_suggest_*`` methods catch it and return an
-    :class:`AiSuggestionOutcome`; the existing UI also degrades gracefully when
-    it surfaces.
+    a caller can map it to "AI unavailable" without breaking the deterministic
+    workflow. ``reason`` is one of :data:`UnavailableReason` and ``detail`` is a
+    fixed, credential-free message (Property 7). The AI DBA's ``try_*`` wrappers in
+    ``core/assessment_strategist.py`` catch it and return an unavailable outcome;
+    the UI also degrades gracefully when it surfaces.
     """
 
     def __init__(self, reason: UnavailableReason) -> None:
         self.reason: UnavailableReason = reason
         self.detail: str = _UNAVAILABLE_DETAILS[reason]
         super().__init__(self.detail)
-
-
-@dataclass(frozen=True)
-class AiSuggestionOutcome:
-    """A suggestion-or-failure result that never breaks the workflow (Req 11.10).
-
-    This is the representation the converter routing (Task 16.4) consumes: call
-    :meth:`AiConversionAssistant.try_suggest_schema_conversion` /
-    :meth:`AiConversionAssistant.try_suggest_data_transformation`, then:
-
-    - if :attr:`available` is ``True``, offer :attr:`suggestion` for human review
-      (it may itself be flagged ``REJECTED`` when its SQL failed validation), and
-    - if :attr:`available` is ``False``, keep the deterministic result and the
-      object's ``MANUAL``/``UNSUPPORTED`` flag and show :attr:`detail` (a clear,
-      credential-free message). :attr:`reason` distinguishes the cause.
-
-    ``reason`` is ``"OK"`` exactly when :attr:`available` is ``True``.
-    """
-
-    available: bool
-    reason: Literal[
-        "OK",
-        "ACCESS_DENIED",
-        "MODEL_AGREEMENT_REQUIRED",
-        "THROTTLED",
-        "NETWORK",
-        "UNAVAILABLE",
-        "INVALID_OUTPUT",
-    ]
-    detail: str
-    suggestion: Optional[AiConversionSuggestion] = None
-
-    @classmethod
-    def ok(cls, suggestion: AiConversionSuggestion) -> "AiSuggestionOutcome":
-        """Build a successful outcome carrying a reviewable ``suggestion``."""
-        return cls(available=True, reason="OK", detail="", suggestion=suggestion)
-
-    @classmethod
-    def unavailable(cls, error: "AiAssistUnavailableError") -> "AiSuggestionOutcome":
-        """Build a failed outcome from a typed unavailability error."""
-        return cls(available=False, reason=error.reason, detail=error.detail)
 
 
 # IAM / SigV4 auth failures: either no permission, or the credentials/session
@@ -766,101 +705,8 @@ def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
 
 
 # ---------------------------------------------------------------------------
-# Prompt grounding (Requirements 11.5, 11.6)
+# InvokeModel request shaping + untrusted-output parsing (Req 11.8)
 # ---------------------------------------------------------------------------
-
-
-def _canonical_dsql_type(source_type: str) -> str:
-    """Return the SchemaConverter export-time DSQL type for ``source_type``.
-
-    Reuses :func:`dsql_migrator.core.converter.map_mysql_type` (the canonical
-    export-time type mapping) so a data/value transformation suggestion is
-    grounded to be consistent with how the schema export maps the same type
-    (Requirement 11.6), rather than re-deriving the mapping here. Any
-    non-lossless mapping note is appended so the model sees the same caveat the
-    deterministic converter records. Best-effort: if the type cannot be parsed,
-    the canonical mapping is reported as unavailable instead of raising.
-    """
-    try:
-        target_type, warning = map_mysql_type(source_type)
-    except ValueError:
-        return "(canonical mapping unavailable: source type could not be parsed)"
-    if warning is not None:
-        return f"{target_type} (note: {warning.message})"
-    return target_type
-
-
-def _build_schema_prompt(
-    object_name: str,
-    source_ddl: str,
-    deterministic_result: Optional[str],
-    dsql_constraints: str,
-) -> str:
-    """Build the grounded prompt for a schema (DDL) conversion suggestion.
-
-    The prompt is grounded with the already-extracted source DDL, the DSQL
-    constraints supplied by the caller (FK unsupported, ``C`` collation, async
-    indexes, PK required, transaction limits, etc.), and the deterministic
-    converter's result/reason, so the model augments (not replaces) the
-    deterministic path (Requirement 11.5).
-    """
-    return (
-        "You are assisting a MySQL -> Amazon Aurora DSQL (PostgreSQL-compatible) "
-        "schema migration. The deterministic (sqlglot) converter flagged the "
-        "following object as MANUAL/UNSUPPORTED. Suggest a DSQL-compatible "
-        "conversion (DDL, or an application-level reimplementation when DSQL "
-        "cannot express the construct) for this object only.\n\n"
-        f"Object name:\n{object_name}\n\n"
-        f"Source MySQL DDL:\n{source_ddl}\n\n"
-        f"Aurora DSQL constraints to respect:\n{dsql_constraints}\n\n"
-        "Deterministic converter result / reason:\n"
-        f"{deterministic_result or '(none provided)'}\n\n"
-        "Response format (IMPORTANT):\n"
-        "- Put the executable Aurora DSQL DDL in a SINGLE ```sql fenced code "
-        "block, with one statement per statement terminated by ';'. The code "
-        "block must contain ONLY runnable SQL -- no prose, headings, tables, or "
-        "comments other than SQL comments.\n"
-        "- Put any explanation, caveats, or notes as brief prose OUTSIDE the "
-        "code block.\n"
-        "- If DSQL cannot express the construct, put a single SQL comment "
-        "stating the manual step inside the code block."
-    )
-
-
-def _build_data_prompt(
-    object_name: str,
-    source_type: str,
-    sample_values: Sequence[str],
-    deterministic_mapping: Optional[str],
-) -> str:
-    """Build the grounded prompt for a data/value transformation suggestion.
-
-    The prompt is grounded with the canonical export-time type mapping from the
-    SchemaConverter (:func:`_canonical_dsql_type`) so the value/type suggestion
-    stays consistent with how the schema export maps the same source type
-    (Requirement 11.6), alongside the source type, sample values, and the
-    deterministic mapping/reason.
-    """
-    canonical_target = _canonical_dsql_type(source_type)
-    samples = (
-        "\n".join(f"- {value}" for value in sample_values)
-        if sample_values
-        else "(none provided)"
-    )
-    return (
-        "You are assisting a MySQL -> Amazon Aurora DSQL (PostgreSQL-compatible) "
-        "data/value migration. The deterministic (sqlglot) converter flagged the "
-        "following value/type conversion as MANUAL/UNSUPPORTED. Suggest a value "
-        "transformation expression or a semantic target type for this column "
-        "only.\n\n"
-        f"Object name:\n{object_name}\n\n"
-        f"Source MySQL type:\n{source_type}\n\n"
-        "Canonical export-time type mapping (SchemaConverter) you MUST stay "
-        f"consistent with:\n{canonical_target}\n\n"
-        f"Sample source values:\n{samples}\n\n"
-        "Deterministic mapping / reason:\n"
-        f"{deterministic_mapping or '(none provided)'}\n"
-    )
 
 
 def _build_invoke_body(prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
@@ -885,36 +731,6 @@ def _build_invoke_body(prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
         ],
     }
     return json.dumps(body)
-
-
-# Matches a Markdown fenced code block, capturing the (optional) language tag
-# and the body, so an LLM that wraps DDL in ```sql ... ``` can be split into the
-# executable SQL (for the editor/apply) and the surrounding prose (rationale).
-_FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
-_SQL_FENCE_LANGS = {"", "sql", "postgres", "postgresql", "plpgsql", "pgsql", "ddl"}
-
-
-def _split_sql_and_rationale(text: str) -> tuple[str, str]:
-    """Split a model reply into executable SQL and the surrounding prose.
-
-    Models often answer with a Markdown report: prose + one or more ```sql
-    fenced blocks. The editable/apply field must hold only the executable DDL,
-    so this returns ``(sql, rationale)`` where ``sql`` is the concatenation of
-    the SQL code blocks (preferring ``sql``-tagged ones) and ``rationale`` is the
-    text with the code fences removed. When the reply has no code fence at all,
-    ``sql`` is the whole text (best-effort fallback) and ``rationale`` is empty.
-    """
-    text = text or ""
-    blocks = _FENCE_RE.findall(text)
-    if not blocks:
-        return text.strip(), ""
-    sql_blocks = [
-        body for lang, body in blocks if lang.lower() in _SQL_FENCE_LANGS
-    ]
-    chosen = sql_blocks if sql_blocks else [body for _lang, body in blocks]
-    sql = "\n\n".join(body.strip() for body in chosen).strip()
-    rationale = _FENCE_RE.sub("", text).strip()
-    return sql, rationale
 
 
 def _extract_suggestion_text(response: Mapping[str, Any]) -> str:
@@ -955,27 +771,19 @@ def _extract_suggestion_text(response: Mapping[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# AI Conversion Assistant (concrete Bedrock-backed implementation)
+# Bedrock-backed assistant: the "Verify AI access" preflight
 # ---------------------------------------------------------------------------
 
 
 class AiConversionAssistant:
-    """Generates reviewable Bedrock conversion suggestions (Req 11.5, 11.6).
+    """Runs the "Verify AI access" Bedrock preflight (Req 11.13-11.16).
 
-    Concrete implementation of the design's ``AiConversionAssistant`` (the
-    ``ui.ai_assist`` module declares a matching Protocol used purely as a seam).
-    It augments — never replaces — the deterministic (sqlglot) path and is only
-    meant to be called for items the deterministic converter flagged
-    ``MANUAL``/``UNSUPPORTED`` (the converter routing in Task 16.4 enforces the
-    trigger condition; this class assumes it).
-
-    Each method grounds a prompt with the already-extracted source DDL/types,
-    DSQL constraints, and the deterministic result, calls bedrock-runtime
-    ``InvokeModel`` via the injected client (IAM-based auth; no credentials
-    here), and returns an :class:`AiConversionSuggestion` carrying ``model_id``
-    provenance and status ``PENDING_REVIEW`` — nothing is ever auto-applied
-    (Property 13). The source DB is never written to: inputs are pre-extracted
-    (Property 1).
+    :meth:`verify_access` makes one least-cost ``InvokeModel`` per candidate model
+    via the injected client (IAM-based auth; no credentials here) and reports a
+    credential-free :class:`~dsql_migrator.core.models.AiAccessCheckResult`. The
+    Connect screen calls it through
+    :func:`dsql_migrator.ui.ai_assist.run_verify_ai_access`; the AI DBA's replies
+    come from ``core/assessment_strategist.py``, not from here.
     """
 
     def __init__(
@@ -997,34 +805,6 @@ class AiConversionAssistant:
             self._client = build_bedrock_runtime_client(self._config)
         return self._client
 
-    def _invoke(self, prompt: str) -> str:
-        """Call bedrock-runtime ``InvokeModel`` and return the suggestion text.
-
-        Uses ``config.model_id`` as the ``modelId`` for provenance and IAM-based
-        auth via the injected/lazy client. Any boto/Bedrock failure is mapped to
-        a typed :class:`AiAssistUnavailableError` (credential-free) instead of a
-        raw exception, and empty/unparseable output becomes ``INVALID_OUTPUT``,
-        so the caller can keep the deterministic result and continue the workflow
-        (Requirement 11.10). The response body is treated as untrusted data and
-        parsed safely (Requirement 11.8).
-        """
-        try:
-            response = self._get_client().invoke_model(
-                modelId=self._config.model_id,
-                body=_build_invoke_body(prompt),
-                contentType="application/json",
-                accept="application/json",
-            )
-        except AiAssistUnavailableError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            raise AiAssistUnavailableError(_classify_bedrock_error(exc)) from None
-
-        text = _extract_suggestion_text(response)
-        if not text:
-            raise AiAssistUnavailableError("INVALID_OUTPUT")
-        return text
-
     def verify_access(self) -> AiAccessCheckResult:
         """Run a lightweight, non-blocking Bedrock access preflight (Req 11.13-11.16).
 
@@ -1043,8 +823,7 @@ class AiConversionAssistant:
         It never raises into the workflow (every exception is caught) and never
         echoes raw exception text or credentials (Requirement 11.15 / Property
         7), so it does not block the deterministic conversion workflow
-        (Requirement 11.16). It only checks connectivity/permission and does not
-        change the AI suggestion review gate (Property 13).
+        (Requirement 11.16). It only checks connectivity/permission.
         """
         # Try the configured model, then the fallback chain -- but only for the failures a
         # DIFFERENT model can actually fix: MODEL_NOT_ENABLED, and a denial whose code is
@@ -1144,156 +923,6 @@ class AiConversionAssistant:
                 candidates.append(fallback)
         return candidates
 
-    def _build_suggestion(
-        self,
-        *,
-        object_name: str,
-        kind: Literal["SCHEMA", "DATA", "QUERY"],
-        suggested: str,
-        rationale: str,
-    ) -> AiConversionSuggestion:
-        """Build a reviewable suggestion, flagging unsafe output as REJECTED.
-
-        The model output is untrusted: it is validated for forbidden statements
-        (:func:`validate_suggested_sql`). Safe output is returned
-        ``PENDING_REVIEW``; unsafe output is returned flagged ``REJECTED`` with
-        the blocking reason prepended to the rationale, so it is surfaced for
-        review and is never produced as an APPLY-ready suggestion (Requirement
-        11.8 / Property 13). Either way the suggestion is never auto-applied.
-        """
-        validation = validate_suggested_sql(suggested)
-        if validation.is_safe:
-            return AiConversionSuggestion(
-                object_name=object_name,
-                kind=kind,
-                suggested_sql_or_expr=suggested,
-                rationale=rationale,
-                model_id=self._config.model_id,
-            )
-        return AiConversionSuggestion(
-            object_name=object_name,
-            kind=kind,
-            suggested_sql_or_expr=suggested,
-            rationale=(
-                f"Blocked by output validation: {validation.reason}. "
-                "Treated as untrusted output and flagged for review; it will not "
-                "be applied. Edit it to a safe conversion before approving."
-            ),
-            model_id=self._config.model_id,
-            status="REJECTED",
-        )
-
-    def suggest_schema_conversion(
-        self,
-        object_name: str,
-        source_ddl: str,
-        deterministic_result: Optional[str],
-        dsql_constraints: str,
-    ) -> AiConversionSuggestion:
-        """Suggest a DSQL schema conversion for one MANUAL/UNSUPPORTED object.
-
-        Grounds the prompt with the source DDL, DSQL constraints, and the
-        deterministic result (Requirement 11.5), then returns a reviewable
-        suggestion (``kind="SCHEMA"``, status ``PENDING_REVIEW``) with
-        ``model_id`` provenance. The suggestion is never auto-applied.
-        """
-        prompt = _build_schema_prompt(
-            object_name, source_ddl, deterministic_result, dsql_constraints
-        )
-        raw = self._invoke(prompt)
-        # Keep the editable/apply field to executable DDL only; surface the
-        # model's explanation/caveats as the rationale (shown for review).
-        sql, prose = _split_sql_and_rationale(raw)
-        default_rationale = (
-            "Bedrock suggestion grounded on the source DDL, Aurora DSQL "
-            "constraints, and the deterministic converter result; augments "
-            "the deterministic path for a MANUAL/UNSUPPORTED object. Review "
-            "and approve before applying."
-        )
-        return self._build_suggestion(
-            object_name=object_name,
-            kind="SCHEMA",
-            suggested=sql or raw,
-            rationale=(prose or default_rationale) if sql else default_rationale,
-        )
-
-    def suggest_data_transformation(
-        self,
-        object_name: str,
-        source_type: str,
-        sample_values: list[str],
-        deterministic_mapping: Optional[str],
-    ) -> AiConversionSuggestion:
-        """Suggest a value/type transformation for a MANUAL/UNSUPPORTED case.
-
-        Grounds the prompt with the canonical SchemaConverter export-time type
-        mapping for ``source_type`` so the suggestion stays consistent with the
-        schema export (Requirement 11.6), then returns a reviewable suggestion
-        (``kind="DATA"``, status ``PENDING_REVIEW``) with ``model_id``
-        provenance. The suggestion is never auto-applied.
-        """
-        prompt = _build_data_prompt(
-            object_name, source_type, sample_values, deterministic_mapping
-        )
-        suggested = self._invoke(prompt)
-        return self._build_suggestion(
-            object_name=object_name,
-            kind="DATA",
-            suggested=suggested,
-            rationale=(
-                "Bedrock suggestion grounded on the SchemaConverter export-time "
-                "type mapping, sample values, and the deterministic mapping; "
-                "kept consistent with the export-time type mapping. Review and "
-                "approve before applying."
-            ),
-        )
-
-    def try_suggest_schema_conversion(
-        self,
-        object_name: str,
-        source_ddl: str,
-        deterministic_result: Optional[str],
-        dsql_constraints: str,
-    ) -> AiSuggestionOutcome:
-        """Graceful-degradation wrapper around :meth:`suggest_schema_conversion`.
-
-        Never raises on a Bedrock failure or unparseable output: it returns an
-        :class:`AiSuggestionOutcome`. This is the representation the converter
-        routing (Task 16.4) consumes -- when the outcome is not ``available`` the
-        caller keeps the deterministic result and the object's
-        ``MANUAL``/``UNSUPPORTED`` flag and surfaces ``detail`` (Requirement
-        11.10).
-        """
-        try:
-            suggestion = self.suggest_schema_conversion(
-                object_name, source_ddl, deterministic_result, dsql_constraints
-            )
-        except AiAssistUnavailableError as error:
-            return AiSuggestionOutcome.unavailable(error)
-        return AiSuggestionOutcome.ok(suggestion)
-
-    def try_suggest_data_transformation(
-        self,
-        object_name: str,
-        source_type: str,
-        sample_values: list[str],
-        deterministic_mapping: Optional[str],
-    ) -> AiSuggestionOutcome:
-        """Graceful-degradation wrapper around :meth:`suggest_data_transformation`.
-
-        Mirrors :meth:`try_suggest_schema_conversion`: it never raises on a
-        Bedrock failure or unparseable output, returning an
-        :class:`AiSuggestionOutcome` so the workflow continues with the
-        deterministic result retained (Requirement 11.10).
-        """
-        try:
-            suggestion = self.suggest_data_transformation(
-                object_name, source_type, sample_values, deterministic_mapping
-            )
-        except AiAssistUnavailableError as error:
-            return AiSuggestionOutcome.unavailable(error)
-        return AiSuggestionOutcome.ok(suggestion)
-
 
 __all__ = [
     "ENV_BEDROCK_MODEL_ID",
@@ -1305,7 +934,6 @@ __all__ = [
     "UnavailableReason",
     "AccessCheckReason",
     "AiAssistUnavailableError",
-    "AiSuggestionOutcome",
     "AiConversionAssistant",
     "AiAccessCheckResult",
     "load_ai_assist_config",
