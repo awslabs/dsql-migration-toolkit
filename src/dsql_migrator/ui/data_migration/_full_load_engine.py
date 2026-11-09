@@ -126,10 +126,13 @@ from dsql_migrator.ui.connect import make_source_engine_factory
 
 # The foreign-key pass -- the post-load ADD CONSTRAINT ... NOT VALID, the VALIDATE after
 # it and the orphan pre-gate, with the key selection the Data Migration screen and Cut over
-# share -- is _foreign_keys.py, with the _error_code helper both modules use. Re-exported
-# (every name, private ones too), so this module's own calls and every `from
-# dsql_migrator.ui.data_migration._full_load_engine import ...` resolve unchanged. A
-# re-export does not carry a monkeypatch: patch a name the pass reads in _foreign_keys.
+# share -- is _foreign_keys.py, with the _error_code helper both modules use. Every name it
+# defines but _LOGGER (this module's own, below: the same logger) is re-exported, private
+# ones too, so this module's own calls and every `from
+# dsql_migrator.ui.data_migration._full_load_engine import ...` of such a name resolve
+# unchanged. The names it only imports (ForeignKeyDef, apply_foreign_key,
+# validate_foreign_key, ...) are not: import them from their own modules. A re-export
+# does not carry a monkeypatch: patch a name the pass reads in _foreign_keys.
 from dsql_migrator.ui.data_migration._foreign_keys import (  # noqa: F401
     ForeignKeyValidationSubmission,
     _FK_CONSTRAINT_NAME_RE,

@@ -38,7 +38,12 @@ from dsql_migrator.core.assessment_strategist import (
     build_validation_chat_system,
 )
 from dsql_migrator.core.models import StepStatus
-from dsql_migrator.ui.data_migration import MigrationType, _full_load_engine, _full_load_ui
+from dsql_migrator.ui.data_migration import (
+    MigrationType,
+    _foreign_keys,
+    _full_load_engine,
+    _full_load_ui,
+)
 
 from tests.test_g25_fl_r6 import MY, NEVER_STARTED, PG, _btn, _failed_b, _render, _state
 
@@ -92,8 +97,8 @@ def test_re_run_all_tables_names_the_retry_button_its_row_draws(monkeypatch, eng
 
 @pytest.mark.parametrize(
     "module",
-    [_full_load_ui, assessment_strategist, _full_load_engine, config],
-    ids=["full_load_ui", "strategist", "full_load_engine", "config"],
+    [_full_load_ui, assessment_strategist, _full_load_engine, _foreign_keys, config],
+    ids=["full_load_ui", "strategist", "full_load_engine", "foreign_keys", "config"],
 )
 def test_no_string_in_the_module_names_the_retired_label(module) -> None:
     # FAILS WITHOUT THE FIX: the tooltip (_full_load_ui), two grounding bullets plus the chat
@@ -101,7 +106,9 @@ def test_no_string_in_the_module_names_the_retired_label(module) -> None:
     # incomplete_load_message's branches, an anchor-lost table's recorded reason (which its
     # AI Assist chat takes as authoritative facts) and the re-read activity line
     # (_full_load_engine), and two Settings help texts (config). Comments may keep the old
-    # name; strings are copy or describe it.
+    # name; strings are copy or describe it. _foreign_keys is the Full Load's foreign-key
+    # pass, split out of the engine (FL-1): its activity lines and failure reasons tell the
+    # operator what to re-run, so it is checked like the rest of the engine.
     tree = ast.parse(inspect.getsource(module))
     hits = [
         node.lineno

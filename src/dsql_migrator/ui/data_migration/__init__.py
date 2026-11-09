@@ -45,20 +45,28 @@ genuinely larger subsystem (infra deploy, MSK, connectors, offset seeding, DLQ,
 schema drift) -- and a per-LAYER split for Full Load and the shared parts:
 
 - Full Load: ``_full_load_engine`` (backend run engine, NiceGUI-free) + ``_full_load_ui``
-  (render). Core: :mod:`~dsql_migrator.core.exporter` + :mod:`~dsql_migrator.core.batched_import`.
+  (render), ``_index_builds`` (when Aurora DSQL finished the secondary indexes a load
+  submitted), and the foreign-key pass, which Cut over also runs: ``_foreign_keys`` (ADD
+  ... NOT VALID, then VALIDATE, the orphan pre-gate and the key selection; NiceGUI-free,
+  re-exported by the engine) and ``_fk_validation`` (Aurora DSQL's verdict on those keys,
+  and the notice both screens show). Core: :mod:`~dsql_migrator.core.exporter` +
+  :mod:`~dsql_migrator.core.batched_import`.
 - CDC: ``_cdc_ui`` (control render), ``_cdc_monitoring`` (post-start monitoring / DLQ
   render), ``_cdc_state`` (pure phase predicates), ``_cdc_status`` (status / controller /
-  teardown + a couple of shared job/error-log helpers that co-locate by cohesion). Core:
+  teardown + a couple of shared job/error-log helpers that co-locate by cohesion),
+  ``_cdc_overlay`` (the column-exclusion overlay at Start CDC). Core:
   :mod:`~dsql_migrator.core.cdc` and siblings + :mod:`~dsql_migrator.core.msk_connect_controller`.
 - Shared, used by BOTH data paths (the Full Load -> CDC watermark handoff, prerequisites,
   and table selection couple them, so they are ONE layer, not split by feature):
   ``_models`` (pure view-models / formatters / enums), ``_state`` (per-session
-  :class:`DataMigrationState`), and this ``__init__`` (the
+  :class:`DataMigrationState`), ``_exclusion_dialog`` (the "Exclude tables & columns"
+  popup, for every migration type), and this ``__init__`` (the
   :func:`build_data_migration_screen` orchestrator that wires both steps into one journey).
 
-File count tracks intrinsic complexity, not symmetry: CDC's ~11 core modules vs Full
-Load's 2 reflect that CDC is a distributed-systems subsystem while Full Load is a tight
-stream -> batch-insert -> verify pipeline. Do NOT split Full Load further just to "match" CDC.
+File count tracks intrinsic complexity, not symmetry: CDC spans many more core modules than
+Full Load because CDC is a distributed-systems subsystem while Full Load is a tight
+stream -> batch-insert -> verify pipeline. Do NOT split Full Load further just to "match"
+CDC: a module splits off when it is a unit of its own, as the foreign-key pass is.
 """
 
 from __future__ import annotations

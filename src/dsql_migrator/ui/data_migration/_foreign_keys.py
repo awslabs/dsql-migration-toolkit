@@ -15,12 +15,15 @@ drained, both run it. Beside it: the key selection both share (:func:`foreign_ke
 (:func:`_named_foreign_key_ddls`, :func:`_stored_index_name`).
 
 It was split out of ``_full_load_engine``, which re-exports every name defined here
-(private ones too), so ``from dsql_migrator.ui.data_migration._full_load_engine import
-...`` keeps resolving. A re-export does not carry a monkeypatch: a test patches a name the
-pass reads in this module. This module must not import the engine at its top level,
-because the engine imports it. So ``DataMigrator``, which only an annotation names, is
-imported for type checking only; the pass logs through the engine's logger, as before the
-split; and ``_error_code``, which both modules call, moved here with the pass.
+(private ones too; ``_LOGGER`` it defines itself, the same logger), so ``from
+dsql_migrator.ui.data_migration._full_load_engine import ...`` of any of them keeps
+resolving. A re-export does not carry a monkeypatch: a test patches a name the pass reads
+in this module. This module must not import the engine at its top level, because the
+engine imports it. So ``DataMigrator``, which only an annotation names, is imported for
+type checking only: that annotation (:func:`pending_foreign_key_count`'s) does not
+evaluate at run time (``typing.get_type_hints`` raises NameError), and nothing evaluates
+it. The pass logs through the engine's logger, as before the split; and ``_error_code``,
+which both modules call, moved here with the pass.
 """
 
 from __future__ import annotations
