@@ -5,13 +5,12 @@
 
 These tests use a fake Bedrock client (no AWS) and cover:
 
-- Parsing a well-formed structured response into an :class:`AiAssessmentReport`.
-- Untrusted-output handling: invented object names dropped, bad efforts coerced
-  to None, code fences/extra prose tolerated, garbage -> INVALID_OUTPUT.
+- Untrusted-output handling: an empty reply -> INVALID_OUTPUT, malformed stream
+  events skipped.
 - Graceful degradation: a Bedrock failure maps to an unavailable outcome that
   never raises, so the deterministic assessment stands alone.
-- The augment-not-replace contract: the strategist only references objects from
-  the deterministic assessment.
+- The grounding prompts and chat systems each scope builds, and the tool-calling
+  chat loop.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import json
 from dsql_migrator.core.assessment_strategist import (
     AiAssessmentOutcome,
     AssessmentStrategist,
-    parse_assessment_output,
 )
 from dsql_migrator.core.models import (
     AiAssistConfig,
@@ -104,7 +102,7 @@ def _well_formed_text() -> str:
                     "effort": "SIMPLE",
                 },
                 {
-                    "object_name": "ghost_table",  # not in the assessment -> dropped
+                    "object_name": "ghost_table",
                     "recommendation": "should be ignored",
                     "rationale": "invented",
                     "effort": "MEDIUM",
@@ -119,59 +117,6 @@ def _well_formed_text() -> str:
             ],
         }
     )
-
-
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
-
-def test_parse_well_formed_output_keeps_valid_objects_only() -> None:
-    report = parse_assessment_output(
-        _well_formed_text(),
-        model_id="test-model",
-        valid_object_names={"orders", "audit_log"},
-    )
-    assert report.strategy_summary.startswith("Migrate reference tables")
-    # The invented "ghost_table" insight is dropped; only "orders" remains.
-    assert [i.object_name for i in report.insights] == ["orders"]
-    assert report.insights[0].ai_effort is EffortLevel.SIMPLE
-    assert report.additional_findings[0].area == "orders"
-    assert report.model_id == "test-model"
-
-
-def test_parse_tolerates_code_fences_and_prose() -> None:
-    fenced = "Here is the report:\n```json\n" + _well_formed_text() + "\n```"
-    report = parse_assessment_output(
-        fenced, model_id="m", valid_object_names={"orders", "audit_log"}
-    )
-    assert report.insights and report.insights[0].object_name == "orders"
-
-
-def test_parse_coerces_unknown_effort_to_none() -> None:
-    text = json.dumps(
-        {
-            "strategy_summary": "s",
-            "insights": [
-                {"object_name": "orders", "recommendation": "r", "effort": "HUGE"}
-            ],
-            "additional_findings": [],
-        }
-    )
-    report = parse_assessment_output(
-        text, model_id="m", valid_object_names={"orders"}
-    )
-    assert report.insights[0].ai_effort is None
-
-
-def test_parse_garbage_raises_invalid_output() -> None:
-    import pytest
-
-    from dsql_migrator.core.ai_assistant import AiAssistUnavailableError
-
-    with pytest.raises(AiAssistUnavailableError) as exc:
-        parse_assessment_output("not json at all", model_id="m", valid_object_names=set())
-    assert exc.value.reason == "INVALID_OUTPUT"
 
 
 # ---------------------------------------------------------------------------

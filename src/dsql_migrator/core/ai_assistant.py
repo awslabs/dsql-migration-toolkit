@@ -173,18 +173,18 @@ def build_bedrock_runtime_client(
 # Untrusted-output handling: forbidden-statement validation (Req 11.8)
 # ---------------------------------------------------------------------------
 
-# Statement-leading keywords that must never appear in an AI conversion
-# suggestion that could be applied to the target. A single-object conversion
-# suggestion is expected to be object DDL (CREATE TABLE/INDEX/VIEW/SEQUENCE/TYPE,
-# CREATE FUNCTION for a stored-procedure reimplementation, or a value expression
-# for a data transformation). The following are out of that scope and dangerous
-# if auto-applied, so they are blocked: data mutation (DELETE/UPDATE/INSERT/
-# TRUNCATE), object/database removal (DROP), privilege/role changes
-# (GRANT/REVOKE), transaction/session control (BEGIN/START/COMMIT/ROLLBACK/
-# SAVEPOINT/SET), bulk/file I/O (COPY), and arbitrary procedural execution
-# (CALL/DO). The set is intentionally small and documented; the human review
-# gate (Property 13) is the primary control and this validation is
-# defense-in-depth so unsafe output is never produced as APPLY-ready.
+# Statement-leading keywords that must never appear in AI-written SQL that
+# Schema Conversion's "Use as target DDL" adopts as an object's target DDL, which
+# Apply then runs on the target. That SQL is expected to be the object's own DDL
+# (its CREATE TABLE or CREATE VIEW, and a table's indexes and foreign keys). The
+# following are out of that scope and dangerous if applied, so they are blocked:
+# data mutation (DELETE/UPDATE/INSERT/TRUNCATE), object/database removal (DROP),
+# privilege/role changes (GRANT/REVOKE), transaction/session control (BEGIN/
+# START/COMMIT/ROLLBACK/SAVEPOINT/SET), bulk/file I/O (COPY), and arbitrary
+# procedural execution (CALL/DO). The set is intentionally small and documented;
+# the operator's explicit action (Property 13: adopting the reply, then running
+# Apply) is the primary control, and this validation is defense-in-depth so
+# unsafe output never becomes a target DDL.
 _FORBIDDEN_LEADING_KEYWORDS = frozenset(
     {
         "DROP",
@@ -225,12 +225,11 @@ _LINE_COMMENT_PATTERN = re.compile(r"--[^\n]*")
 
 @dataclass(frozen=True)
 class SqlValidation:
-    """Outcome of validating an AI suggestion's SQL/expression (Req 11.8).
+    """Outcome of validating AI-written SQL (Req 11.8).
 
     ``is_safe`` is ``True`` only when no forbidden statement was found; when it is
     ``False``, ``reason`` is a short, human-readable explanation of the blocked
-    construct so the suggestion can be surfaced as flagged for review rather than
-    applied.
+    construct, which "Use as target DDL" shows instead of adopting the SQL.
     """
 
     is_safe: bool
@@ -246,14 +245,15 @@ def _strip_sql_comments(text: str) -> str:
 def validate_suggested_sql(text: str) -> SqlValidation:
     """Validate untrusted model output for forbidden statements (Req 11.8).
 
-    The model output is untrusted data, so before a suggestion can ever be
-    applied it is scanned for statements outside the scope of a single-object
-    conversion suggestion. Each ``;``-separated statement is checked by its
-    leading keyword against :data:`_FORBIDDEN_LEADING_KEYWORDS` (plus the
-    ``CREATE``/``ALTER`` target guard), which also catches a dangerous statement
-    appended after a benign one (statement-injection). This is a deliberately
-    small, documented denylist used as defense-in-depth behind the human review
-    gate (Property 13); it is not a full SQL parser.
+    The model output is untrusted data, so before AI-written SQL can become an
+    object's target DDL ("Use as target DDL" in Schema Conversion) it is scanned
+    for statements outside the scope of one object's DDL. Each ``;``-separated
+    statement is checked by its leading keyword against
+    :data:`_FORBIDDEN_LEADING_KEYWORDS` (plus the ``CREATE``/``ALTER`` target
+    guard), which also catches a dangerous statement appended after a benign one
+    (statement-injection). This is a deliberately small, documented denylist used
+    as defense-in-depth behind the operator's explicit action (Property 13); it is
+    not a full SQL parser.
 
     Empty/whitespace text is treated as safe here (it carries no forbidden
     statement); the caller decides separately whether empty output is usable.
@@ -296,7 +296,7 @@ UnavailableReason = Literal[
     "INVALID_OUTPUT",
 ]
 
-# The one-time remedy for MODEL_AGREEMENT_REQUIRED, shared by the chat/suggestion copy
+# The one-time remedy for MODEL_AGREEMENT_REQUIRED, shared by the AI DBA reply copy
 # and the preflight copy so the two cannot drift. Fixed text only (Property 7): the
 # denial's own message is never echoed. ``--model-id`` takes the FOUNDATION-model id,
 # not the ``global.`` inference-profile id this tool is configured with, hence the
@@ -313,23 +313,28 @@ _MODEL_AGREEMENT_REMEDY = (
     "to this tool's role is needed. Wait about 2 minutes, then "
 )
 
-# Fixed, credential-free, actionable messages. They never echo the raw boto/
-# Bedrock exception text so no credential or endpoint detail can leak (Property
-# 7), and each one states that the deterministic path is kept.
+# Fixed, credential-free, actionable messages for an AI DBA reply that could not be
+# produced. They never echo the raw boto/Bedrock exception text, so no credential or
+# endpoint detail can leak (Property 7), and each one says what failed, that the
+# deterministic workflow is unaffected, and what to do next. Every reason is shown in
+# the AI DBA panel's "AI reply unavailable" notice, whichever chat asked (a step's chat,
+# the general chat or the "What's next?" briefing). A reason that latches the session
+# unavailable (ui.ai_assist.AI_LATCHING_REASONS: ACCESS_DENIED and
+# MODEL_AGREEMENT_REQUIRED here) is also shown away from that reply -- the composer
+# hint, the "What's next?" toast and the Connect screen's AI status notice -- so its
+# copy says where Verify AI access is. Verify AI access reports its own copy
+# (_ACCESS_CHECK_DETAILS).
 _UNAVAILABLE_DETAILS: dict[str, str] = {
     "ACCESS_DENIED": (
-        "AI assist is unavailable: access to Amazon Bedrock InvokeModel was "
-        "denied. The deterministic conversion result and its MANUAL/UNSUPPORTED "
-        "flag are kept. Grant a scoped bedrock:InvokeModel permission to enable "
-        "AI suggestions -- or, if your AWS credentials or session have expired, "
-        "re-authenticate and retry."
+        "AI assist is unavailable: Amazon Bedrock denied the request. The "
+        "deterministic workflow is unaffected. Grant scoped bedrock:InvokeModel and "
+        "bedrock:InvokeModelWithResponseStream permissions for the configured model "
+        "-- or, if your AWS credentials or session have expired, re-authenticate -- "
+        "then retry, or run Verify AI access on the Connect screen."
     ),
-    # Also shown outside the suggestion path (the AI panel bubble, the composer hint,
-    # the Connect AI status notice after a panel latch), so it names no MANUAL/UNSUPPORTED
-    # flag -- only that the deterministic workflow is unaffected. "the configured model
-    # is not enabled for this AWS account yet" is word for word the preflight copy's
-    # phrase and the one the docs quote, so the panel's sentence can be matched to the
-    # manual and the troubleshooting table.
+    # "the configured model is not enabled for this AWS account yet" is word for word the
+    # preflight copy's phrase and the one the docs quote, so the panel's sentence can be
+    # matched to the manual and the troubleshooting table.
     "MODEL_AGREEMENT_REQUIRED": (
         "AI assist is unavailable: the configured model is not enabled for this AWS "
         "account yet (its AWS Marketplace subscription is missing or did not "
@@ -339,24 +344,24 @@ _UNAVAILABLE_DETAILS: dict[str, str] = {
     ),
     "THROTTLED": (
         "AI assist is temporarily unavailable: Amazon Bedrock throttled the "
-        "request. The deterministic conversion result and its MANUAL/UNSUPPORTED "
-        "flag are kept. Retry later to get an AI suggestion."
+        "request. The deterministic workflow is unaffected. Wait a minute, then ask "
+        "again."
     ),
     "NETWORK": (
         "AI assist is unavailable: Amazon Bedrock could not be reached (network "
-        "error). The deterministic conversion result and its MANUAL/UNSUPPORTED "
-        "flag are kept. Check connectivity to the Bedrock endpoint and retry."
+        "error or timeout). The deterministic workflow is unaffected. Check "
+        "connectivity to the Bedrock endpoint, then ask again."
     ),
     "UNAVAILABLE": (
         "AI assist is unavailable: the Amazon Bedrock request failed. The "
-        "deterministic conversion result and its MANUAL/UNSUPPORTED flag are "
-        "kept. The workflow continues without an AI suggestion."
+        "deterministic workflow is unaffected. Ask again; if it keeps failing, run "
+        "Verify AI access on the Connect screen to check the configured model and "
+        "region."
     ),
     "INVALID_OUTPUT": (
-        "AI assist could not produce a usable result this time: the model's "
-        "reply could not be parsed. This is optional and non-blocking -- the "
-        "deterministic result above is complete and authoritative. Re-run to try "
-        "again."
+        "AI assist could not produce a usable reply this time: the model's reply "
+        "came back empty. The deterministic workflow is unaffected. Ask again, or "
+        "rephrase the question."
     ),
 }
 
@@ -367,9 +372,9 @@ class AiAssistUnavailableError(RuntimeError):
     This is a *typed, catchable* signal -- not a raw boto/Bedrock exception -- so
     a caller can map it to "AI unavailable" without breaking the deterministic
     workflow. ``reason`` is one of :data:`UnavailableReason` and ``detail`` is a
-    fixed, credential-free message (Property 7). The AI DBA's ``try_*`` wrappers in
-    ``core/assessment_strategist.py`` catch it and return an unavailable outcome;
-    the UI also degrades gracefully when it surfaces.
+    fixed, credential-free message (Property 7). The AI DBA's chats in
+    ``core/assessment_strategist.py`` (``stream_chat``, ``tool_chat``) turn it into
+    an unavailable outcome, whose ``detail`` the AI DBA panel shows.
     """
 
     def __init__(self, reason: UnavailableReason) -> None:
@@ -534,11 +539,11 @@ def _classify_bedrock_error(exc: BaseException) -> UnavailableReason:
 # AI access verification preflight ("Verify AI access") -- Req 11.13-11.16
 # ---------------------------------------------------------------------------
 
-# Reason taxonomy for verify_access. This is deliberately distinct from the
-# suggestion-path :data:`UnavailableReason` (16.3): the preflight reports a
+# Reason taxonomy for verify_access. This is deliberately distinct from
+# :data:`UnavailableReason`, the AI DBA reply path's: the preflight reports a
 # permission/connectivity verdict for the configured model/region, so it uses
 # MODEL_NOT_ENABLED (model not enabled / not available in the region) and a
-# single catch-all UNKNOWN (network/other) instead of the suggestion path's
+# single catch-all UNKNOWN (network/other) instead of the reply path's
 # NETWORK/UNAVAILABLE/INVALID_OUTPUT. The two classifications are kept separate
 # on purpose and neither changes the other's behavior. MODEL_AGREEMENT_REQUIRED (the
 # model's AWS Marketplace subscription / agreement is missing or failed) is the one
@@ -672,10 +677,10 @@ def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
     """Map a boto/Bedrock exception to a verify_access failure reason.
 
     This is the preflight's own mapping (Task 17.3), kept separate from
-    :func:`_classify_bedrock_error` (the suggestion path, 16.3): an
+    :func:`_classify_bedrock_error` (the AI DBA reply path): an
     authorization-ambiguous denial (:data:`_MODEL_ACCESS_DENIED_CODES`) whose message
     names AWS Marketplace becomes ``MODEL_AGREEMENT_REQUIRED`` (the same rule as the
-    suggestion path); any other ``AccessDeniedException`` or credential failure
+    reply path); any other ``AccessDeniedException`` or credential failure
     becomes ``ACCESS_DENIED``; a ``ValidationException`` or a model-not-enabled /
     not-found style error becomes ``MODEL_NOT_ENABLED``; a ``ThrottlingException``
     becomes ``THROTTLED``; and everything else (network errors, anything
@@ -713,17 +718,17 @@ def _build_invoke_body(prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
     """Serialize an Anthropic-style messages InvokeModel request body.
 
     Model-specific request shaping is intentionally minimal and localized here
-    so it is easy to adjust for other model families (Task 16.3+ may broaden it).
-    ``max_tokens`` defaults to :data:`_MAX_TOKENS`; the access-check preflight
-    (Task 17.3) passes a tiny value so the verification request is least-cost.
+    so it is easy to adjust for other model families. ``max_tokens`` defaults to
+    :data:`_MAX_TOKENS`; the access-check preflight (Task 17.3), its live caller,
+    passes a tiny value so the verification request is least-cost.
     """
     body = {
         "anthropic_version": _ANTHROPIC_VERSION,
         "max_tokens": max_tokens,
         # Turn OFF extended thinking (Claude 5 does it by default): thinking tokens
         # count against max_tokens, so a reasoning-heavy turn could spend the whole
-        # budget on thinking and emit no answer text -- surfacing as "AI reply
-        # unavailable / could not be parsed". These replies are grounded (context +
+        # budget on thinking and emit no answer text -- surfacing as an empty reply
+        # ("AI reply unavailable"). These replies are grounded (context +
         # deterministic facts carry the load), so the full budget goes to the answer.
         "thinking": {"type": "disabled"},
         "messages": [

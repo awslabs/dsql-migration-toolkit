@@ -198,10 +198,11 @@ VPC 内のプライベートなデータ経路（ソース → EC2 → DSQL）�
 
 > 図をクリックすると原寸で表示されます。
 
-- **AI アシストはコントロールプレーンのみ** — 有効にすると Amazon Bedrock が変換案の
-  提示・CDC 準備状況の評価・DLQ トリアージを行いますが、Full Load / CDC の行データには
-  一切アクセスしません。スキーマ/DDL/プランのメタデータのみを使用します。既定はオフ、
-  サードパーティ API キー不要（スコープ限定の `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`）。
+- **AI アシストはコントロールプレーンのみ** — 有効にすると Amazon Bedrock が全ステップの
+  AI DBA パネルを動かし、変換とクエリチューニングの助言、「What's next?」ブリーフィング、
+  Full Load の失敗・CDC のデッドレター・Validation の不一致の診断を行いますが、Full Load /
+  CDC の行データには一切アクセスしません。スキーマ/DDL/プランのメタデータのみを使用します。
+  既定はオフ、サードパーティ API キー不要（スコープ限定の `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`）。
 - **CDC は別スタック**（`cdc-stack`）— Amazon MSK + Debezium → マネージド
   MSK Connect 上の**カスタム Aurora DSQL シンクコネクタ**
   ([`connectors/dsql-sink/`](connectors/dsql-sink))。既製の JDBC シンクでは DSQL の短

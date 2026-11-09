@@ -941,6 +941,7 @@ def test_access_denied_reply_records_ai_unavailable_on_the_session() -> None:
     # a green "AI assist: On" chip and every step kept offering live AI buttons while
     # each request failed. The denial must now latch onto the session so the whole UI
     # goes honest.
+    from dsql_migrator.core.ai_assistant import _UNAVAILABLE_DETAILS
     from dsql_migrator.ui.ai_assist import (
         AI_UNAVAILABLE,
         ai_availability,
@@ -949,7 +950,7 @@ def test_access_denied_reply_records_ai_unavailable_on_the_session() -> None:
 
     state = _enabled_state()
     ui = _Ui()
-    detail = "AI assist is unavailable: access to Amazon Bedrock InvokeModel was denied."
+    detail = _UNAVAILABLE_DETAILS["ACCESS_DENIED"]
 
     def denying_streamer(messages, on_delta):  # noqa: ANN001
         return ObjectGuidanceOutcome(
@@ -995,6 +996,65 @@ def test_transient_reply_failure_does_not_mark_ai_unavailable() -> None:
 
         assert state.ai_verified is None, f"{reason} must not latch unavailable"
         assert ai_is_usable(state) is True
+
+
+@pytest.mark.parametrize("chat", ["stream_chat", "tool_chat"])
+def test_an_empty_reply_shows_the_invalid_output_copy(chat: str) -> None:
+    """A reply that comes back with no text ends the turn INVALID_OUTPUT (raised in
+    stream_chat / tool_chat), and the panel's "AI reply unavailable" notice shows its fixed
+    copy. That copy said the reply "could not be parsed" and pointed at "the deterministic
+    result above" and a "Re-run" -- the deleted suggestion flow's words, not a chat's."""
+    import io
+    import json
+
+    from dsql_migrator.core.assessment_strategist import AssessmentStrategist
+
+    copy = (
+        "AI assist could not produce a usable reply this time: the model's reply came "
+        "back empty. The deterministic workflow is unaffected. Ask again, or rephrase "
+        "the question."
+    )
+
+    class _EmptyReplies:
+        """Bedrock answering with a reply that carries no text, on either call."""
+
+        def invoke_model_with_response_stream(self, **_kw):  # noqa: ANN003, ANN202
+            events = [{"type": "message_start"}, {"type": "message_stop"}]
+            return {"body": iter({"chunk": {"bytes": json.dumps(e).encode()}} for e in events)}
+
+        def invoke_model(self, **_kw):  # noqa: ANN003, ANN202
+            body = {"stop_reason": "end_turn", "content": []}
+            return {"body": io.BytesIO(json.dumps(body).encode())}
+
+    state = _enabled_state()
+    strategist = AssessmentStrategist(state.ai_assist, client=_EmptyReplies())
+    outcomes: list = []
+
+    def streamer(messages, on_delta):  # noqa: ANN001, ANN202
+        if chat == "stream_chat":
+            outcome = strategist.stream_chat("sys", messages, on_delta)
+        else:
+            outcome = strategist.tool_chat(
+                "sys", messages, on_delta, tools=[], execute=lambda _n, _i: "{}"
+            )
+        outcomes.append(outcome)
+        return outcome
+
+    ui = _Ui()
+    panel = build_ai_panel(ui, state=state)
+    panel.open_scope(
+        scope_id="general", title="AI DBA",
+        streamer=streamer, seed_question="What should I do next?",
+    )
+    _pump(ui, max_iters=400)
+
+    [outcome] = outcomes
+    assert (outcome.available, outcome.reason, outcome.detail) == (
+        False, "INVALID_OUTPUT", copy,
+    )
+    shown = [el.text for el in ui.labels]
+    assert "AI reply unavailable" in shown and copy in shown
+    assert state.ai_verified is None  # transient: never latched
 
 
 def test_successful_reply_clears_a_latched_denial_in_the_panel() -> None:

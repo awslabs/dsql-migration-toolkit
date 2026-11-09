@@ -386,7 +386,8 @@ def test_bedrock_access_denied_maps_to_a_typed_actionable_error() -> None:
     )
 
     assert error.reason == "ACCESS_DENIED"
-    # Clear, actionable message that keeps the deterministic result/flag.
+    # Clear, actionable message: the deterministic workflow is unaffected, and the grant
+    # to add.
     assert "deterministic" in error.detail.lower()
     assert "bedrock:InvokeModel".lower() in error.detail.lower()
 
@@ -413,6 +414,31 @@ def test_degradation_detail_never_leaks_credentials() -> None:
 
     assert secret not in error.detail
     assert secret not in str(error)
+
+
+def test_every_unavailable_copy_describes_the_ai_dba_not_the_deleted_suggestion_flow() -> None:
+    """The fixed copy is the body of the AI DBA panel's "AI reply unavailable" notice, and a
+    latched one is also the composer hint, the "What's next?" toast and the Connect screen's
+    AI status. It described the suggestion pipeline X1 deleted -- "the deterministic
+    conversion result and its MANUAL/UNSUPPORTED flag are kept", "to enable AI
+    suggestions", "Re-run", "the deterministic result above" -- none of which a chat has."""
+    from dsql_migrator.core.ai_assistant import _UNAVAILABLE_DETAILS
+    from dsql_migrator.ui.ai_assist import AI_LATCHING_REASONS
+
+    for reason, detail in _UNAVAILABLE_DETAILS.items():
+        assert "The deterministic workflow is unaffected." in detail, reason
+        for stale in (
+            "MANUAL/UNSUPPORTED",
+            "suggestion",
+            "conversion result",
+            "result above",
+            "re-run",
+            "could not be parsed",
+        ):
+            assert stale.casefold() not in detail.casefold(), (reason, stale)
+        if reason in AI_LATCHING_REASONS:
+            # Latched, it is also shown off the Connect screen: say where the button is.
+            assert "Verify AI access on the Connect screen" in detail, reason
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +512,35 @@ def test_verify_access_returns_ok_on_success() -> None:
     assert client.calls[0]["modelId"] == "anthropic.claude-test"
     body = json.loads(client.calls[0]["body"])
     assert body["max_tokens"] == 1
+
+
+def test_verify_access_sends_the_access_check_prompt_as_one_user_text_turn() -> None:
+    """The request body ``_build_invoke_body`` builds, through its one live caller.
+
+    Verify AI access sends an Anthropic messages-API body: one user turn whose one content
+    block is text carrying the access-check prompt, capped at one output token. Nothing else
+    checked this shape once the suggestion calls went (X1). An empty or misplaced prompt is
+    an invalid request -- a ValidationException, which the preflight reports as
+    MODEL_NOT_ENABLED, sending the operator after the wrong fix.
+    """
+    from dsql_migrator.core.ai_assistant import _ACCESS_CHECK_PROMPT
+
+    client = _FakeBedrockRuntimeClient("pong")
+    config = AiAssistConfig(
+        enabled=True, model_id="anthropic.claude-test", region="us-east-1"
+    )
+
+    assert AiConversionAssistant(config, client=client).verify_access().ok is True
+
+    [call] = client.calls
+    body = json.loads(call["body"])
+    assert body["max_tokens"] == 1
+    [message] = body["messages"]
+    assert message["role"] == "user"
+    [block] = message["content"]
+    assert block["type"] == "text"
+    assert block["text"] == _ACCESS_CHECK_PROMPT
+    assert block["text"].strip()
 
 
 class _PerModelBedrockRuntimeClient:

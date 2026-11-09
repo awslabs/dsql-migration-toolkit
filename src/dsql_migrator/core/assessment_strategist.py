@@ -20,9 +20,9 @@ Design guarantees (consistent with the existing AI-assist path):
   deterministic classification or effort.
 - **Read-only** (Property 1 / Requirement 11.11): inputs are already-extracted
   in-memory models; no source/target connection is opened here.
-- **Untrusted output** (Requirement 11.8): the model output is parsed
-  defensively. Object insights that do not map to a real assessed object are
-  dropped, an unrecognized AI effort becomes ``None``, and sizes are capped.
+- **Untrusted output** (Requirement 11.8): the model output is read
+  defensively -- an empty or malformed reply degrades to an unavailable outcome
+  -- and reply and tool-result sizes are capped.
 - **Graceful degradation** (Requirement 11.10): :meth:`AssessmentStrategist.try_generate`
   never raises; on any Bedrock failure or unparseable output it returns an
   unavailable :class:`AiAssessmentOutcome` so the deterministic report still
@@ -35,7 +35,6 @@ Design guarantees (consistent with the existing AI-assist path):
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
@@ -49,13 +48,10 @@ from dsql_migrator.core.ai_assistant import (
     build_bedrock_runtime_client,
 )
 from dsql_migrator.core.models import (
-    AiAssessmentFinding,
-    AiAssessmentInsight,
     AiAssessmentReport,
     AiAssistConfig,
     AssessmentItem,
     AssessmentReport,
-    EffortLevel,
     SourceInventory,
     SourceType,
     TargetInventory,
@@ -209,9 +205,8 @@ def bounded_tool_output(text: str) -> str:
     )
 
 
-# Defensive caps on untrusted output so a single response cannot flood the UI.
-_MAX_INSIGHTS = 200
-_MAX_FINDINGS = 100
+# Cap on each piece of grounding text a prompt embeds (a DDL, a query, a plan, the
+# facts), so a prompt stays bounded however large its inputs are.
 _MAX_TEXT_CHARS = 4000
 # The AI-led assessment is a free-form Markdown narrative; cap it generously so
 # a verbose model reply cannot flood the page (best practice: accept prose, not
@@ -268,12 +263,6 @@ DSQL_CONSTRAINTS = (
     "column but never ADDED to an existing one; there are transaction limits (a single "
     "DDL statement per transaction, at most 3000 rows per transaction)."
 )
-
-# Mapping from a model-provided effort token to the EffortLevel enum. Anything
-# not in this map (or missing) becomes None (advisory effort unknown).
-_EFFORT_BY_NAME: dict[str, EffortLevel] = {level.value: level for level in EffortLevel}
-
-_JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -415,13 +404,6 @@ def build_object_guidance_prompt(item: AssessmentItem, *, source_engine: str = "
         "a natural reply, not a form. Don't restate these instructions; just give "
         "the answer."
     )
-
-
-def _coerce_text(value: Any) -> str:
-    """Return a capped string for an untrusted model value (or empty)."""
-    if not isinstance(value, str):
-        return ""
-    return value.strip()[:_MAX_TEXT_CHARS]
 
 
 def build_object_chat_system(item: AssessmentItem, *, source_engine: str = "MySQL") -> str:
@@ -1520,85 +1502,6 @@ def _iter_stream_text(response: Mapping[str, Any]) -> Iterator[str]:
                 yield text
 
 
-def _coerce_effort(value: Any) -> Optional[EffortLevel]:
-    """Map an untrusted effort token to an EffortLevel, or None."""
-    if not isinstance(value, str):
-        return None
-    return _EFFORT_BY_NAME.get(value.strip().upper())
-
-
-def parse_assessment_output(
-    text: str, *, model_id: str, valid_object_names: set[str]
-) -> AiAssessmentReport:
-    """Parse untrusted model output into an :class:`AiAssessmentReport`.
-
-    Tolerates code fences and extra prose; insights whose ``object_name`` is not
-    a real assessed object are dropped (so AI cannot invent objects), efforts are
-    validated against :class:`EffortLevel`, and list/text sizes are capped. A
-    body that cannot yield a JSON object raises
-    :class:`AiAssistUnavailableError` (``INVALID_OUTPUT``) so the caller degrades
-    gracefully.
-    """
-    stripped = _JSON_FENCE.sub("", text.strip())
-    try:
-        data = json.loads(stripped)
-    except (ValueError, json.JSONDecodeError):
-        # Try to recover the first JSON object embedded in the text.
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise AiAssistUnavailableError("INVALID_OUTPUT") from None
-        try:
-            data = json.loads(stripped[start : end + 1])
-        except (ValueError, json.JSONDecodeError):
-            raise AiAssistUnavailableError("INVALID_OUTPUT") from None
-
-    if not isinstance(data, dict):
-        raise AiAssistUnavailableError("INVALID_OUTPUT")
-
-    insights: list[AiAssessmentInsight] = []
-    raw_insights = data.get("insights")
-    if isinstance(raw_insights, list):
-        for entry in raw_insights[:_MAX_INSIGHTS]:
-            if not isinstance(entry, dict):
-                continue
-            name = _coerce_text(entry.get("object_name"))
-            if not name or name not in valid_object_names:
-                continue
-            insights.append(
-                AiAssessmentInsight(
-                    object_name=name,
-                    recommendation=_coerce_text(entry.get("recommendation")),
-                    rationale=_coerce_text(entry.get("rationale")),
-                    ai_effort=_coerce_effort(entry.get("effort")),
-                )
-            )
-
-    findings: list[AiAssessmentFinding] = []
-    raw_findings = data.get("additional_findings")
-    if isinstance(raw_findings, list):
-        for entry in raw_findings[:_MAX_FINDINGS]:
-            if not isinstance(entry, dict):
-                continue
-            area = _coerce_text(entry.get("area"))
-            if not area:
-                continue
-            findings.append(
-                AiAssessmentFinding(
-                    area=area,
-                    risk=_coerce_text(entry.get("risk")),
-                    recommendation=_coerce_text(entry.get("recommendation")),
-                )
-            )
-
-    return AiAssessmentReport(
-        strategy_summary=_coerce_text(data.get("strategy_summary")),
-        insights=insights,
-        additional_findings=findings,
-        model_id=model_id,
-    )
-
-
 class AssessmentStrategist:
     """Generates an AI-led migration assessment from grounded inputs (Req 11).
 
@@ -2294,6 +2197,5 @@ __all__ = [
     "build_query_optimize_system",
     "build_full_load_error_chat_system",
     "build_connection_error_chat_system",
-    "parse_assessment_output",
     "source_engine_word",
 ]

@@ -200,10 +200,12 @@ an **HTTPS ALB** (`internal` by default, optional Cognito), pulling the image fr
 
 > Click the diagram for the full-resolution image.
 
-- **AI assist is control-plane only** — when enabled, Amazon Bedrock adds conversion
-  suggestions, CDC-readiness assessment, and DLQ triage. It never sees Full Load /
-  CDC row data — only schema/DDL/plan metadata. Off by default; no third-party API
-  keys (scoped `bedrock:InvokeModel` / `bedrock:InvokeModelWithResponseStream`).
+- **AI assist is control-plane only** — when enabled, Amazon Bedrock powers the AI DBA
+  panel on every step: conversion and query-tuning advice, a "What's next?" briefing,
+  and diagnosis of Full Load failures, CDC dead letters and Validation mismatches. It
+  never sees Full Load / CDC row data — only schema/DDL/plan metadata. Off by default;
+  no third-party API keys (scoped `bedrock:InvokeModel` /
+  `bedrock:InvokeModelWithResponseStream`).
 - **CDC is a separate stack** (`cdc-stack`) — Amazon MSK + Debezium → a
   **custom Aurora DSQL sink connector**
   ([`connectors/dsql-sink/`](connectors/dsql-sink)) on managed MSK Connect. A stock

@@ -273,10 +273,13 @@ def test_agreement_copy_names_the_right_remedy_and_not_the_wrong_one() -> None:
         # AI DBA composer hint and the "What's next?" toast), so the retry step says
         # where the button is.
         assert "Verify AI access on the Connect screen" in detail
-    # A plain denial keeps its own, unchanged remedy.
-    assert "Grant a scoped bedrock:InvokeModel permission" in aa._UNAVAILABLE_DETAILS[
-        "ACCESS_DENIED"
-    ]
+    # A plain denial keeps its own remedy: the IAM grant -- both actions, since the AI DBA
+    # streams a plain chat (InvokeModelWithResponseStream) and runs a tool-calling chat
+    # with InvokeModel.
+    assert (
+        "Grant scoped bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream "
+        "permissions"
+    ) in aa._UNAVAILABLE_DETAILS["ACCESS_DENIED"]
     assert "Add a scoped bedrock:InvokeModel permission" in aa._ACCESS_CHECK_DETAILS[
         "ACCESS_DENIED"
     ]

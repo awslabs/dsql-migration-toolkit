@@ -3559,6 +3559,35 @@ def test_apply_card_names_the_generated_ddl_it_applies() -> None:
     assert "Apply all 7 generated objects to target" in ui.buttons
     # Still says it is not the whole schema.
     assert any("not the whole schema" in t for t in ui.texts)
+    # A DDL adopted from AI DBA is an edit counted in the 7, not an extra "approved AI
+    # suggestion" (that pipeline was deleted, X1): the scope line says so.
+    [scope] = [t for t in ui.texts if "from the Generated DDL list above" in t]
+    assert 'with your edits (including DDL adopted from AI DBA with "Use as target DDL")' in scope
+    assert "suggestion" not in scope
+
+
+def test_reset_all_tooltip_names_what_reset_discards() -> None:
+    """Reset all runs reset_generation(), which drops the generated DDL, the edits (a DDL
+    adopted from AI DBA is one) and the apply results. Its tooltip also promised to discard
+    "AI suggestions", which no longer exist (X1)."""
+    import ast
+
+    tips = [
+        node.args[0].value
+        for node in ast.walk(ast.parse(_browser_fn_source()))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "tooltip"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "reset_btn"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert (
+        "Discard the generated DDL, your edits (including DDL adopted from AI DBA) and "
+        "the apply results, and start fresh."
+    ) in tips
+    assert not any("suggestion" in tip for tip in tips)
 
 
 def test_apply_card_uses_singular_and_drops_the_redundant_pointer() -> None:
@@ -3658,9 +3687,9 @@ def test_object_browser_trees_restore_their_expansion_after_a_rerender() -> None
 def test_expansion_state_defaults_empty_and_survives_clear() -> None:
     """Fresh state starts collapsed; "Clear" discards ANALYSIS, not navigation.
 
-    reset_generation() drops the generated DDL, edits and AI suggestions -- but where the
-    operator had navigated to in the browser is not analysis, and collapsing the tree on
-    Clear would repeat the bug this fixes.
+    reset_generation() drops the generated DDL and edits -- but where the operator had
+    navigated to in the browser is not analysis, and collapsing the tree on Clear would
+    repeat the bug this fixes.
     """
     from dsql_migrator.ui.schema_conversion import SchemaConversionState
 

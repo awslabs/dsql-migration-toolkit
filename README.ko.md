@@ -181,9 +181,10 @@ EC2 호스트에서 소스로**(systemd + SSM 포트포워드, ALB/ECR 없음) �
 
 > 다이어그램을 클릭하면 원본 해상도로 열립니다.
 
-- **AI 보조는 컨트롤 플레인만** — 켜면 Amazon Bedrock이 변환 제안·CDC 준비도·DLQ 분류를 더해
-  주지만, Full Load / CDC 행 데이터는 보지도 건드리지도 않고 스키마/DDL/플랜 메타데이터만
-  사용합니다. 기본 off, 서드파티 API 키 없음(범위 제한된 `bedrock:InvokeModel` /
+- **AI 보조는 컨트롤 플레인만** — 켜면 Amazon Bedrock이 모든 단계의 AI DBA 패널을 구동해
+  변환·쿼리 튜닝 조언, "What's next?" 브리핑, Full Load 실패·CDC 데드레터·Validation 불일치
+  진단을 더해 주지만, Full Load / CDC 행 데이터는 보지도 건드리지도 않고 스키마/DDL/플랜
+  메타데이터만 사용합니다. 기본 off, 서드파티 API 키 없음(범위 제한된 `bedrock:InvokeModel` /
   `bedrock:InvokeModelWithResponseStream`).
 - **CDC는 별도 스택**(`cdc-stack`) — Amazon MSK + Debezium → 관리형 MSK Connect 위의
   **커스텀 Aurora DSQL 싱크 커넥터**([`connectors/dsql-sink/`](connectors/dsql-sink)). 표준 JDBC

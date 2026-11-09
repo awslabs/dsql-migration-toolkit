@@ -45,6 +45,8 @@ _DELETED_NAMES: dict[str, tuple[str, ...]] = {
     ),
     "dsql_migrator.core.models": ("AiConversionSuggestion",),
     "dsql_migrator.core.converter": ("build_source_table_ddl",),
+    # Its only caller was CdcAssistant._invoke (X1 follow-up).
+    "dsql_migrator.core.assessment_strategist": ("parse_assessment_output",),
     "dsql_migrator.ui.ai_assist": (
         "AI_STATUS_PENDING_REVIEW",
         "AI_STATUS_EDITED",

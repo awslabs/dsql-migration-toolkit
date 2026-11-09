@@ -1423,11 +1423,12 @@ class SchemaConversionState:
     def reset_generation(self) -> None:
         """Discard a prior generation/apply so the next run starts fresh.
 
-        Clears the committed generation scope, per-object edits and AI
-        suggestions, the apply results/progress, and the REPLACE confirmation --
-        returning the screen to a ready-to-generate state (used by the Clear
-        button), so "Clear" removes all prior analysis rather than only hiding
-        the generated DDL list.
+        Clears the committed generation scope (and a rejected Generate's
+        message), the per-object edits (a DDL adopted from AI DBA with "Use as
+        target DDL" is one), the apply job, results and progress, and the REPLACE
+        confirmation -- returning the screen to a ready-to-generate state (used by
+        the Reset all button), so it removes all prior analysis rather than only
+        hiding the generated DDL list. The AI DBA conversation is not touched.
         """
         self.generated_node_ids = None
         self.generate_error = None
@@ -2069,9 +2070,12 @@ def build_schema_conversion_screen(
         return selected_object_names(node_ids)
 
     def _all_apply_objects(inventory: SourceInventory) -> list[ApplyObject]:
-        """Build the selected scope's apply units: deterministic + edits + approved AI (Prop 13).
+        """Build the selected scope's apply units: the deterministic conversion with edits.
 
-        The result is restricted to the objects the user selected (see
+        One unit per object, its target DDL the user's edit when there is one -- an
+        AI DBA reply adopted with "Use as target DDL" is such an edit (the explicit
+        human approval, Property 13), not a unit of its own. The result is
+        restricted to the objects the user selected (see
         :func:`_selected_apply_names`) so a partial selection applies only those
         objects, mirroring the generated-DDL preview scope.
         """
@@ -2202,7 +2206,7 @@ def build_schema_conversion_screen(
     def _run_bulk_apply(
         only_names: Optional[set[str]] = None, *, merge: bool = False
     ) -> None:
-        """Submit the converted-scope apply (deterministic + edits + approved AI).
+        """Submit the converted-scope apply (the deterministic conversion with edits).
 
         ``only_names`` restricts the apply to those object names (used by "Retry
         failed"); ``None`` applies the full scope. ``merge`` upserts the results
@@ -2666,8 +2670,9 @@ def build_schema_conversion_screen(
             # Defer the (possibly expensive) deterministic conversion until it
             # is actually needed: opening the page shows only the object
             # browser. The conversion runs when the user clicks "Generate DDL
-            # for selected" (preview) or when AI suggestions are rendered for
-            # flagged objects. Memoized so one render computes it at most once.
+            # for selected" (preview) or when its index renames are needed (the
+            # target existence check, a conversion chat's "Use as target DDL").
+            # Memoized so one render computes it at most once.
             conversion_cache: dict[str, SchemaConversionResult] = {}
 
             def get_conversion() -> SchemaConversionResult:
@@ -2733,11 +2738,11 @@ def build_schema_conversion_screen(
                 # cluster at all.
                 existence_checker = None
                 _derived_checker_state["snapshot"] = None
-            # AI assistance is integrated per generated object (not a separate
-            # section): for each object the deterministic conversion and the AI
-            # suggestion are compared and shown as one view when identical, or as
-            # "Converted" / "AI Suggested" tabs when they differ. Candidacy is
-            # limited to MANUAL/UNSUPPORTED objects and only when AI is enabled.
+            # AI candidates: the objects the assessment flagged MANUAL/UNSUPPORTED,
+            # and only while AI is usable (_render_preview adds the objects the
+            # conversion could not convert). AI help is the AI DBA chat, per object
+            # rather than a separate section, and a reply becomes an object's target
+            # DDL only through the chat's "Use as target DDL", as an edit.
             assessment = (
                 eval_result.assessment if eval_result is not None else None
             )
@@ -3760,9 +3765,9 @@ def _render_browser_and_preview(
             # pattern (no auto-fired turn on a deterministic action).
 
     def on_clear() -> None:
-        # Full reset: discard the generated DDL, per-object edits, AI
-        # suggestions, and prior apply results so the screen is ready for a
-        # fresh generate/run.
+        # Full reset: discard the generated DDL, the per-object edits (a DDL
+        # adopted from AI DBA is one) and prior apply results so the screen is
+        # ready for a fresh generate/run (see reset_generation).
         conv_state.reset_generation()
         refresh()
 
@@ -3840,8 +3845,8 @@ def _render_browser_and_preview(
                 )
             else:
                 reset_btn.tooltip(  # type: ignore[attr-defined]
-                    "Discard the generated DDL, edits, AI suggestions, and apply "
-                    "results, and start fresh."
+                    "Discard the generated DDL, your edits (including DDL adopted "
+                    "from AI DBA) and the apply results, and start fresh."
                 )
                 ui.label(  # type: ignore[attr-defined]
                     'Generated below — use "Reset all" to generate a new selection.'
@@ -3982,9 +3987,9 @@ def _render_browser_and_preview(
             value=expanded,
             on_value_change=_on_expand_change,
         ).classes("w-full").props("expand-separator"):
-            # An object is eligible for an AI suggestion when the assessment
-            # flagged it MANUAL/UNSUPPORTED, OR the deterministic converter did
-            # not produce a target DDL (views/triggers/routines/events/etc.).
+            # An object is an AI candidate when the assessment flagged it
+            # MANUAL/UNSUPPORTED, OR the deterministic converter did not
+            # produce a target DDL (views/triggers/routines/events/etc.).
             # So any "Not auto-converted" object also gets the AI conversion
             # button when AI assist is enabled.
             not_auto_converted = not _is_applicable_target_ddl(preview.target_ddl)
@@ -5523,9 +5528,10 @@ def _render_apply_controls(
     SKIP/REPLACE mode), so the user configures and triggers the apply in one
     place instead of hunting for the step's Run button. ``on_apply_all`` runs the
     same selected-scope apply as Run (only the objects generated/selected above,
-    plus approved AI suggestions); in REPLACE mode it opens an action-time
-    confirmation dialog (so confirmation happens at the moment of applying, not
-    via a sticky checkbox). ``table_count`` shows how many objects are in that
+    each with its edit if it has one -- a DDL adopted from AI DBA with "Use as
+    target DDL" is an edit, inside that count); in REPLACE mode it opens an
+    action-time confirmation dialog (so confirmation happens at the moment of
+    applying, not via a sticky checkbox). ``table_count`` shows how many objects are in that
     apply scope; ``in_progress`` disables the button while an apply job is running.
     ``generated`` is whether "Generate DDL for selected" has been run: this card
     applies the GENERATED, reviewed DDL, so before generation the action is disabled
@@ -5554,9 +5560,10 @@ def _render_apply_controls(
         ).classes("text-sm text-gray-500")
     else:
         ui.label(  # type: ignore[attr-defined]
-            f"Applies the {table_count} {noun} from the Generated DDL list above "
-            "(plus any approved AI suggestions) — not the whole schema. Choose how to "
-            "handle objects that already exist on the target, then apply."
+            f"Applies the {table_count} {noun} from the Generated DDL list above, with "
+            "your edits (including DDL adopted from AI DBA with \"Use as target DDL\") "
+            "— not the whole schema. Choose how to handle objects that already exist "
+            "on the target, then apply."
         ).classes("text-sm text-gray-500")
 
     def on_mode_change(event: object) -> None:
