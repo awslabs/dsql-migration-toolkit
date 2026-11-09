@@ -2622,6 +2622,36 @@ def cdc_seed_watermark(
     return None, "manual_unseedable"
 
 
+def cdc_table_list_params(
+    source_config: DebeziumSourceConfig,
+    sink_config: SinkConnectorConfig,
+    topic_prefix: str = CDC_DEFAULT_TOPIC_PREFIX,
+) -> list[tuple[str, str]]:
+    """The cdc-stack's table/topic parameters, in the order both builders send them. Pure.
+
+    ``TableIncludeList`` (the captured tables), ``TopicPrefix``, ``SinkTopics`` (one
+    ``<topic_prefix>.<db>.<table>`` topic per sink table -- the one transformation the
+    cdc-stack template leaves to the caller), ``DlqTopicName``, ``ColumnExcludeList`` and
+    ``MessageKeyColumns``. :func:`build_cdc_stack_params` and :func:`build_cdc_infra_params`
+    each splice this block in where they list it; the Data Migration step's pre-deploy
+    refusals read TableIncludeList and SinkTopics back out of it, so they judge exactly
+    what is sent.
+    """
+    return [
+        ("TableIncludeList", ",".join(source_config.table_include_list)),
+        ("TopicPrefix", topic_prefix),
+        ("SinkTopics", ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)),
+        ("DlqTopicName", sink_config.dlq_topic),
+        ("ColumnExcludeList", ",".join(source_config.column_exclude_list)),
+        # Composite-PK re-key: Debezium keys the change record on the target's
+        # composite key so the sink's record-key ON CONFLICT/DELETE match it.
+        # Empty (the common case) leaves the record keyed on the source PK. Empty on the
+        # create path too (no connectors yet); Start CDC supplies the real value.
+        ("MessageKeyColumns",
+         format_message_key_columns(source_config.message_key_columns)),
+    ]
+
+
 def build_cdc_stack_params(
     source_config: DebeziumSourceConfig,
     sink_config: SinkConnectorConfig,
@@ -2656,18 +2686,10 @@ def build_cdc_stack_params(
     template's ``AllowedValues``); the caller validates (see
     ``config.set_tuning_value``).
     """
-    sink_topics = ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)
     filled: list[tuple[str, str]] = [
-        ("TableIncludeList", ",".join(source_config.table_include_list)),
-        ("TopicPrefix", topic_prefix),
-        ("SinkTopics", sink_topics),
-        ("DlqTopicName", sink_config.dlq_topic),
-        ("ColumnExcludeList", ",".join(source_config.column_exclude_list)),
-        # Composite-PK re-key: Debezium keys the change record on the target's
-        # composite key so the sink's record-key ON CONFLICT/DELETE match it.
-        # Empty (the common case) leaves the record keyed on the source PK.
-        ("MessageKeyColumns",
-         format_message_key_columns(source_config.message_key_columns)),
+        # TableIncludeList / TopicPrefix / SinkTopics / DlqTopicName / ColumnExcludeList /
+        # MessageKeyColumns (the composite-PK re-key).
+        *cdc_table_list_params(source_config, sink_config, topic_prefix),
         # The re-keyed tables the SINK writes by their composite key from records keyed on
         # the source PK (G15). Always empty here, so these params route exactly as before;
         # Start CDC fills it from MessageKeyColumns for a stack whose sink plugin reads it
@@ -3034,9 +3056,10 @@ def build_cdc_infra_params(
 ) -> CdcInfraParams:
     """Build the full cdc-stack parameter set for a first-time ``create_stack``.
 
-    Reuses the table/topic derivation from :func:`build_cdc_stack_params`
-    (``TableIncludeList`` from the source config, ``SinkTopics`` as
-    ``<topic_prefix>.<db>.<table>``, ``ColumnExcludeList``, ``DlqTopicName``) and
+    Sends the same table/topic block as :func:`build_cdc_stack_params`
+    (:func:`cdc_table_list_params`: ``TableIncludeList`` from the source config,
+    ``SinkTopics`` as ``<topic_prefix>.<db>.<table>``, ``ColumnExcludeList``,
+    ``DlqTopicName``, ...) and
     fills every customer-environment parameter from the BYO-VPC inputs. Pure: no
     AWS, no I/O.
 
@@ -3050,7 +3073,6 @@ def build_cdc_infra_params(
     :func:`compute_cdc_scaling_defaults` (env-overridable). Partition count is set
     here, at create, because it is irreversible for the life of the topic.
     """
-    sink_topics = ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)
     scaling = compute_cdc_scaling_defaults(len(sink_config.topics))
     scaling_params = cdc_scaling_params(
         sink_config.topics, topic_prefix, row_counts_by_table=row_counts_by_table
@@ -3085,16 +3107,8 @@ def build_cdc_infra_params(
         ("DsqlClusterEndpoint", target_endpoint),
         ("DsqlDatabaseName", target_database),
         ("DsqlConnectUser", target_username),
-        # CDC / topic config (same derivation as build_cdc_stack_params)
-        ("TableIncludeList", ",".join(source_config.table_include_list)),
-        ("TopicPrefix", topic_prefix),
-        ("SinkTopics", sink_topics),
-        ("DlqTopicName", sink_config.dlq_topic),
-        ("ColumnExcludeList", ",".join(source_config.column_exclude_list)),
-        # Composite-PK re-key (empty on the create path -- no connectors yet;
-        # Start CDC supplies the real value via build_cdc_stack_params).
-        ("MessageKeyColumns",
-         format_message_key_columns(source_config.message_key_columns)),
+        # CDC / topic config (the same block build_cdc_stack_params sends)
+        *cdc_table_list_params(source_config, sink_config, topic_prefix),
         # Snapshot mode: no connector exists yet on the create path; Start CDC sends
         # the real value via build_cdc_stack_params (mysql_snapshot_mode).
         ("SnapshotMode", source_config.snapshot_mode),
@@ -3180,6 +3194,7 @@ __all__ = [
     "start_point_check_due",
     "CDC_PLACEHOLDER_PREFIX",
     "CdcStackParams",
+    "cdc_table_list_params",
     "build_cdc_stack_params",
     "CdcInfraParams",
     "build_cdc_infra_params",

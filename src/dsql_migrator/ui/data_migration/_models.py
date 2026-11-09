@@ -4230,13 +4230,24 @@ CDC_TOPIC_NAME_HEADER = "Table names CDC cannot stream"
 
 def _cdc_table_lists(names: "Sequence[str]") -> "list[tuple[str, str]]":
     """TableIncludeList and SinkTopics as the parameter builders send them: the two lists
-    every Deploy CDC infrastructure and every Start CDC sends."""
-    from dsql_migrator.core.cdc import CDC_DEFAULT_TOPIC_PREFIX
+    every Deploy CDC infrastructure and every Start CDC sends, read out of the builders' own
+    block (``core.cdc.cdc_table_list_params``). The configs are built unvalidated
+    (``model_construct``): only the names are judged here, not a connector config."""
+    from dsql_migrator.core.cdc import (
+        CDC_DEFAULT_TOPIC_PREFIX,
+        DebeziumSourceConfig,
+        SinkConnectorConfig,
+        cdc_table_list_params,
+    )
 
-    return [
-        ("TableIncludeList", ",".join(names)),
-        ("SinkTopics", ",".join(f"{CDC_DEFAULT_TOPIC_PREFIX}.{name}" for name in names)),
-    ]
+    sent = dict(
+        cdc_table_list_params(
+            DebeziumSourceConfig.model_construct(table_include_list=names),
+            SinkConnectorConfig.model_construct(topics=names, dlq_topic=""),
+            CDC_DEFAULT_TOPIC_PREFIX,
+        )
+    )
+    return [(key, sent[key]) for key in ("TableIncludeList", "SinkTopics")]
 
 
 def _cdc_deploy_lists(
