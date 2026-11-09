@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
 import dsql_migrator.ui.data_migration._full_load_engine as engine
 from dsql_migrator.core.converter import TableConversion
 from dsql_migrator.core.models import ForeignKeyDef
@@ -481,15 +482,15 @@ def _pass(monkeypatch, child: _Child, origin: str = "cut-over"):
     validated: list = []
     events: list = []
     # The real count, on PAGE-row pages and without sleeping between retries.
-    monkeypatch.setattr(engine, "_count_orphans", functools.partial(
-        engine._count_orphans, page_size=PAGE, sleep=lambda _s: None))
-    monkeypatch.setattr(engine, "_wait_for_referenced_unique_index",
+    monkeypatch.setattr(fk_pass, "_count_orphans", functools.partial(
+        fk_pass._count_orphans, page_size=PAGE, sleep=lambda _s: None))
+    monkeypatch.setattr(fk_pass, "_wait_for_referenced_unique_index",
                         lambda *a, **k: ("valid", 0.0))
-    monkeypatch.setattr(engine, "apply_foreign_key",
+    monkeypatch.setattr(fk_pass, "apply_foreign_key",
                         lambda ddl, *, connection_factory: added.append(ddl))
-    monkeypatch.setattr(engine, "validate_foreign_key",
+    monkeypatch.setattr(fk_pass, "validate_foreign_key",
                         lambda table, name, *, connection_factory: validated.append(name))
-    monkeypatch.setattr(engine, "log_activity",
+    monkeypatch.setattr(fk_pass, "log_activity",
                         lambda category, action, **kw: events.append((category, action, kw)))
     beats: list = []
     result = engine.apply_preserved_foreign_keys(
@@ -555,26 +556,26 @@ def test_every_per_fk_line_takes_the_origin_category(monkeypatch, origin, catego
     # All three counted before their ADD (G142: their parent side is incomplete by design).
     # fk_a: orphans (skipped); fk_b: the pre-check fails (concurrent and serial);
     # fk_c: its parent's index had to be waited for, then the ADD is refused.
-    monkeypatch.setattr(engine, "_pregate_orphans",
+    monkeypatch.setattr(fk_pass, "_pregate_orphans",
                         lambda pending, *a, **k: {0: 4, 1: RuntimeError("boom"), 2: 0})
 
     def _serial(*_a, **_k):
         raise RuntimeError("catalog unreadable")
 
-    monkeypatch.setattr(engine, "_count_orphans", _serial)
+    monkeypatch.setattr(fk_pass, "_count_orphans", _serial)
 
     def _wait(fk, *_a, **_k):
         return ("valid", 2.0) if fk.name == "fk_c" else ("valid", 0.0)
 
-    monkeypatch.setattr(engine, "_wait_for_referenced_unique_index", _wait)
+    monkeypatch.setattr(fk_pass, "_wait_for_referenced_unique_index", _wait)
 
     def _add(ddl, *, connection_factory):
         raise RuntimeError("ALTER rejected")
 
-    monkeypatch.setattr(engine, "apply_foreign_key", _add)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", _add)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
     events: list = []
-    monkeypatch.setattr(engine, "log_activity",
+    monkeypatch.setattr(fk_pass, "log_activity",
                         lambda cat, action, **kw: events.append((cat, action, kw)))
 
     result = engine.apply_preserved_foreign_keys(

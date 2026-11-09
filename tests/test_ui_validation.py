@@ -2930,7 +2930,7 @@ def test_cutover_section_fk_block_warns_on_orphans() -> None:
 def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    import dsql_migrator.ui.validation as uiv
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TargetConnectionConfig,
     )
@@ -2965,7 +2965,7 @@ def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
         captured["child_pk_columns"] = child_pk_columns
         return (1, 0, 0)
 
-    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr(
         "dsql_migrator.core.target_connection.DsqlConnector",
         lambda *a, **k: SimpleNamespace(connect=lambda: object()),
@@ -6033,7 +6033,7 @@ def _cutover_fk_fixtures(monkeypatch, result=(1, 0, 0)):
     """Session/stores/patches for driving _run_cutover_foreign_keys. Returns captured kwargs."""
     from types import SimpleNamespace
 
-    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    import dsql_migrator.ui.validation as uiv
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TargetConnectionConfig,
     )
@@ -6063,7 +6063,7 @@ def _cutover_fk_fixtures(monkeypatch, result=(1, 0, 0)):
             kw["on_progress"](1, 3)
         return result
 
-    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr(
         "dsql_migrator.core.target_connection.DsqlConnector",
         lambda *a, **k: SimpleNamespace(connect=lambda: object()),
@@ -6791,7 +6791,7 @@ def test_cutover_pending_foreign_keys_counts_only_the_migrated_selection() -> No
 def test_run_cutover_foreign_keys_never_alters_a_table_outside_the_selection(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    import dsql_migrator.ui.validation as uiv
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TableSelection, TargetConnectionConfig,
     )
@@ -6807,7 +6807,7 @@ def test_run_cutover_foreign_keys_never_alters_a_table_outside_the_selection(mon
         captured.append(sorted(t for t, c in conversions.items() if c.foreign_key_ddls))
         return (len(captured[-1]), 0, 0)
 
-    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr("dsql_migrator.core.target_connection.DsqlConnector",
                         lambda *a, **k: SimpleNamespace(connect=lambda: object()))
     for tables, expected in ((["plain"], []), (["plain", "orders"], ["orders"]), (None, ["orders"])):

@@ -4,7 +4,7 @@
 """VAL-3: one single-column orphan keyset pager, shared by Validation and the Full Load.
 
 Validation's orphan check (``validator._target_orphan_count``) and the Full Load's
-foreign-key pre-gate (``_full_load_engine._count_orphans``) page a single-column-keyed child
+foreign-key pre-gate (``_foreign_keys._count_orphans``) page a single-column-keyed child
 the same way: ``build_pg_orphan_page_first_sql`` once, then ``build_pg_orphan_page_next_sql``
 bound with ``{"last": <the previous page's last key, as text>}``, one cursor per page, a
 liveness call before each, until a page returns fewer rows than the page size. The pre-gate
@@ -27,6 +27,7 @@ from dsql_migrator.core.validation_sql import (
     build_pg_orphan_page_first_sql,
     build_pg_orphan_page_next_sql,
 )
+from dsql_migrator.ui.data_migration import _foreign_keys as fk_pass
 from dsql_migrator.ui.data_migration import _full_load_engine as engine
 
 CHILD = "app.child"
@@ -254,11 +255,15 @@ def test_the_full_load_has_no_pager_of_its_own() -> None:
     import inspect
     import textwrap
 
-    assert not hasattr(engine, "_count_orphans_keyset")
-    tree = ast.parse(textwrap.dedent(inspect.getsource(engine._count_orphans)))
+    # The pre-gate lives in the foreign-key pass (_foreign_keys), which the engine re-exports:
+    # the Full Load is both modules.
+    for module in (engine, fk_pass):
+        assert not hasattr(module, "_count_orphans_keyset")
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fk_pass._count_orphans)))
     called = {n.func.id for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert {"target_orphan_count_keyset", "target_orphan_count_composite"} <= called
-    source = inspect.getsource(engine)
-    assert "build_pg_orphan_page_first_sql" not in source
-    assert "build_pg_orphan_page_next_sql" not in source
+    for module in (engine, fk_pass):
+        source = inspect.getsource(module)
+        assert "build_pg_orphan_page_first_sql" not in source
+        assert "build_pg_orphan_page_next_sql" not in source

@@ -1791,7 +1791,9 @@ def build_schema_conversion_screen(
                 conv_state.edited_target_ddls,
                 preserve_foreign_keys=True,
             )
-            from dsql_migrator.ui.data_migration._full_load_engine import (
+            # Function-local, as in _predrop_replace_blocking_foreign_keys: the
+            # data_migration package's __init__ imports this module at its top.
+            from dsql_migrator.ui.data_migration._foreign_keys import (
                 foreign_keys_blocking_replace,
             )
 
@@ -1863,11 +1865,13 @@ def build_schema_conversion_screen(
         was silence measured against the 900 s stall window -- the reap this apply path was
         already bitten by once.
         """
-        # Function-local imports: the engine module imports from this package's apply
-        # module, so a module-level import here would close a cycle.
+        # Function-local imports. The one from the foreign-key pass must stay here: importing
+        # any dsql_migrator.ui.data_migration module first runs that package's __init__,
+        # which imports this module at its top, so a module-level import would close that
+        # cycle (loading this module first would then fail on its own TABLE_PREFIX).
         from dsql_migrator.core.schema_applier import drop_foreign_key
         from dsql_migrator.core.target_connection import DsqlConnector
-        from dsql_migrator.ui.data_migration._full_load_engine import (
+        from dsql_migrator.ui.data_migration._foreign_keys import (
             foreign_keys_blocking_replace,
         )
 

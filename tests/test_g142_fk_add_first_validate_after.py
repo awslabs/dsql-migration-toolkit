@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 import dsql_migrator.ui.data_migration._fk_validation as fkv
+import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
 import dsql_migrator.ui.data_migration._full_load_engine as engine
 from dsql_migrator.core.converter import TableConversion
 from dsql_migrator.core.models import (
@@ -221,12 +222,12 @@ def _conversions(*, cascade: bool = False) -> dict:
 def _pass(db: _Dsql, **kwargs):
     events: list = []
     kwargs.setdefault("on_validation", None)
-    original = engine.log_activity
-    engine.log_activity = lambda category, action, **kw: events.append((category, action, kw))
+    original = fk_pass.log_activity
+    fk_pass.log_activity = lambda category, action, **kw: events.append((category, action, kw))
     try:
         result = engine.apply_preserved_foreign_keys(_conversions(), db.connect, **kwargs)
     finally:
-        engine.log_activity = original
+        fk_pass.log_activity = original
     return result, events
 
 
@@ -325,17 +326,17 @@ def test_a_recorded_job_unknown_to_aurora_dsql_is_submitted_again_not_waited_on(
 
 def test_a_validate_that_cannot_be_submitted_is_reported_and_the_key_stays() -> None:
     db = _Dsql()
-    original = engine.validate_foreign_key
+    original = fk_pass.validate_foreign_key
 
     def _refuse(table, name, *, connection_factory):
         raise _SqlState("42501", "permission denied")
 
-    engine.validate_foreign_key = _refuse
+    fk_pass.validate_foreign_key = _refuse
     try:
         submitted: list = []
         result, events = _pass(db, on_validation=submitted.append)
     finally:
-        engine.validate_foreign_key = original
+        fk_pass.validate_foreign_key = original
     assert result == (2, 0, 0)
     assert set(submitted[0].unsubmitted) == {KEY_ORDERS, KEY_LINES}
     warned = [e for e in events if e[1] == "foreign key validation not submitted"]

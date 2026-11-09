@@ -141,7 +141,6 @@ from dsql_migrator.ui.workflow import WorkflowStep, get_status, with_status
 # ``dm.<name>`` does not change what the submodule calls, so tests patch the submodule.
 from dsql_migrator.ui.data_migration._full_load_engine import (
     MigratorFactory,
-    preserved_foreign_key_names,
     DataMigrationInputs,
     DataMigrator,
     _advance_chunk_rows,
@@ -158,17 +157,23 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     # The explicit "Apply foreign keys" action runs the SAME engine pass the load used to
     # run automatically (aliased, since `_apply_foreign_keys` is the engine's private name).
     _apply_foreign_keys as _apply_foreign_keys_for,
-    pending_foreign_key_count,
     job_status_to_step_status,
     data_migration_step_after_cdc,
-    foreign_keys_counted_before_add,
-    foreign_keys_in_scope,
-    foreign_keys_pointing_in,
     full_load_phase_status,
     reconcile_full_load_step,
     ImporterFactory,
     BatchedTableMigrator,
     default_migrator_factory,
+)
+
+# The foreign-key pass's key selection and count (NiceGUI-free), from the module that
+# defines them, for the screen code below and the ``dm.<name>`` readers.
+from dsql_migrator.ui.data_migration._foreign_keys import (
+    foreign_keys_counted_before_add,
+    foreign_keys_in_scope,
+    foreign_keys_pointing_in,
+    pending_foreign_key_count,
+    preserved_foreign_key_names,
 )
 
 # Pure view-models, formatters, and enums (NiceGUI-free): for the screen code below

@@ -150,6 +150,13 @@ from dsql_migrator.ui.cutover_defaults import (
 )
 from dsql_migrator.ui.connect import make_source_engine_factory
 from dsql_migrator.ui.data_migration import DataMigrationStore
+from dsql_migrator.ui.data_migration._foreign_keys import (
+    apply_preserved_foreign_keys,
+    foreign_keys_counted_before_add,
+    foreign_keys_in_scope,
+    foreign_keys_pointing_in,
+    foreign_keys_to_apply,
+)
 from dsql_migrator.ui.data_migration._models import (
     effective_lob_exclusions,
     session_applied_conversions,
@@ -4823,10 +4830,6 @@ def _cutover_fk_targets(
     )
     if context is None:
         return None
-    from dsql_migrator.ui.data_migration._full_load_engine import (
-        foreign_keys_pointing_in,
-        foreign_keys_to_apply,
-    )
 
     tables, scoped = context
     absent = getattr(migration_state, "fk_absent_children", None)
@@ -5022,8 +5025,6 @@ def _migrated_tables(migration_state: object) -> "Optional[list[str]]":
 def _in_migration_scope(table_conversions, migration_state: object):
     """The conversions of the migrated tables only (see ``foreign_keys_in_scope``: a key is
     on its child); no recorded selection keeps every table."""
-    from dsql_migrator.ui.data_migration._full_load_engine import foreign_keys_in_scope
-
     return foreign_keys_in_scope(table_conversions, _migrated_tables(migration_state))
 
 
@@ -5438,18 +5439,10 @@ def _run_cutover_foreign_keys(
 
     def _work(_handle: object = None) -> None:
         from dsql_migrator.core.target_connection import DsqlConnector
-        from dsql_migrator.ui.data_migration._full_load_engine import (
-            apply_preserved_foreign_keys,
-        )
 
         # The session's engine (a restored one too) and a COPY of the edits: this runs
         # on a job thread while the UI thread may be editing them.
         _conversion, applied = session_applied_conversions(session, inventory, conv_state)
-        from dsql_migrator.ui.data_migration._full_load_engine import (
-            foreign_keys_counted_before_add,
-            foreign_keys_in_scope,
-            foreign_keys_pointing_in,
-        )
 
         _unscoped = applied
         applied = foreign_keys_in_scope(applied, scope)

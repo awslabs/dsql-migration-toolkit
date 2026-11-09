@@ -38,6 +38,7 @@ from types import SimpleNamespace
 import pytest
 
 import dsql_migrator.ui.data_migration._fk_validation as fkv
+import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
 import dsql_migrator.ui.data_migration._full_load_engine as engine
 from dsql_migrator.core.job_manager import JobNotFoundError
 from dsql_migrator.core.models import (
@@ -467,7 +468,7 @@ def test_the_cut_over_pass_shows_running_at_once_and_its_result_at_its_end(monke
     vstate.set_cutover_fk_apply((1, 0, 0))  # an earlier pass
     jobs = _Jobs()
     seen: list = []
-    monkeypatch.setattr(engine, "apply_preserved_foreign_keys", lambda *_a, **_k: (0, 0, 1))
+    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", lambda *_a, **_k: (0, 0, 1))
     uiv._run_cutover_foreign_keys(
         session_obj, vstate, eval_store=eval_store, conversion_store=conv_store,
         session_id="s1", job_manager=jobs, refresh=lambda: seen.append(vstate.cutover_fk_apply),
@@ -805,7 +806,7 @@ def test_the_listing_reads_the_window_where_the_count_found_the_first_orphan(
         on_orphans((4999,))
         return 3
 
-    monkeypatch.setattr(engine, "_count_orphans", _count)
+    monkeypatch.setattr(fkv, "_count_orphans", _count)
     monkeypatch.setattr(fkv, "target_primary_key_columns", lambda *_a, **_k: ["id"])
     count, template, runnable = fkv.explain_foreign_key_failure(lambda: None, ORDERS, fk)
     assert count == 3
@@ -830,7 +831,7 @@ def test_the_listing_reads_the_window_where_the_count_found_the_first_orphan(
     fkv.render_fk_validation(ui, restored.fk_validation_view())
     assert "is not kept across a restart" in ui.body()
     # No orphan found now: no listing at all.
-    monkeypatch.setattr(engine, "_count_orphans", lambda *_a, **_k: 0)
+    monkeypatch.setattr(fkv, "_count_orphans", lambda *_a, **_k: 0)
     assert fkv.explain_foreign_key_failure(lambda: None, ORDERS, fk) == (0, None, None)
 
 
@@ -927,8 +928,8 @@ def _dsql_double(monkeypatch, *, absent=("shop.audit",)):
     db.children = {name: ("x", "shop.customers", {}) for name in ("shop.orders", "shop.audit")}
     monkeypatch.setattr(target_connection, "DsqlConnector",
                         lambda *_a, **_k: SimpleNamespace(connect=db.connect))
-    monkeypatch.setattr(engine, "_target_table_present", lambda _cf, name: name not in absent)
-    monkeypatch.setattr(engine, "log_activity", lambda *_a, **_k: None)
+    monkeypatch.setattr(fk_pass, "_target_table_present", lambda _cf, name: name not in absent)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *_a, **_k: None)
     monkeypatch.setattr(fkv, "log_activity", lambda *_a, **_k: None)
     return db
 
@@ -1379,7 +1380,7 @@ def test_the_full_load_count_is_the_keys_the_pass_adds(monkeypatch) -> None:
     assert engine.pending_foreign_key_count(migrator, absent={"shop.audit"}) == 1
     assert engine.pending_foreign_key_count(migrator, absent={ORDERS}) == 2
     progress: list = []
-    monkeypatch.setattr(engine, "_target_table_present", lambda _cf, _name: False)
+    monkeypatch.setattr(fk_pass, "_target_table_present", lambda _cf, _name: False)
     result = engine.apply_preserved_foreign_keys(
         {"shop.audit": conv["shop.audit"]}, lambda: None,
         skip_if_absent=frozenset({"shop.audit"}),

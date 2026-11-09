@@ -4,7 +4,7 @@
 """Aurora DSQL's verdict on the foreign keys "Apply foreign keys" puts in place (G142).
 
 "Add first, check after": the pass
-(:func:`~dsql_migrator.ui.data_migration._full_load_engine.apply_preserved_foreign_keys`)
+(:func:`~dsql_migrator.ui.data_migration._foreign_keys.apply_preserved_foreign_keys`)
 adds every preserved key ``NOT VALID`` -- seconds, no row read, and from then on Aurora
 DSQL refuses every write that would break it -- and then submits ``ALTER TABLE ASYNC ...
 VALIDATE CONSTRAINT``, a server-side job that checks the rows already loaded. This module
@@ -41,6 +41,12 @@ from dsql_migrator.core.target_introspector import (
     target_primary_key_columns,
 )
 from dsql_migrator.core.validation_sql import build_orphan_listing_sql
+from dsql_migrator.ui.data_migration._foreign_keys import (
+    _ORPHAN_PAGE_SIZE,
+    _constraint_name_from_ddl,
+    _count_orphans,
+    _named_foreign_key_ddls,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -238,8 +244,6 @@ def fk_validation_view(
 
 def foreign_key_defs(table_conversions) -> "dict[tuple[str, str], ForeignKeyDef]":
     """``(child, constraint) -> ForeignKeyDef`` for every rendered preserved key. Pure."""
-    from dsql_migrator.ui.data_migration._full_load_engine import _constraint_name_from_ddl
-
     defs: "dict[tuple[str, str], ForeignKeyDef]" = {}
     for child, conv in (table_conversions or {}).items():
         by_name = {fk.name: fk for fk in getattr(conv, "preserved_foreign_keys", ()) or ()}
@@ -257,8 +261,6 @@ def pending_foreign_keys(table_conversions) -> "list[tuple[str, Optional[str]]]"
     one added without a name under the name the pass gives it. The constraint is ``None``
     when its name cannot be read from the DDL: such a key can never be confirmed in place
     by a catalog read. Pure."""
-    from dsql_migrator.ui.data_migration._full_load_engine import _named_foreign_key_ddls
-
     return [
         (child, name)
         for child, conv in (table_conversions or {}).items()
@@ -338,8 +340,6 @@ def foreign_keys_cdc_can_break(table_conversions, tables) -> "frozenset[tuple[st
     names). The final Validation's defaults (row counts, the key reconcile) see none of
     these: the rows are there, only their keys point nowhere.
     """
-    from dsql_migrator.ui.data_migration._full_load_engine import _named_foreign_key_ddls
-
     by_table = {getattr(table, "name", None): table for table in (tables or ())}
 
     def _loose(table_name: Optional[str], columns: "Sequence[str]") -> bool:
@@ -478,11 +478,6 @@ def explain_foreign_key_failure(
     are the same). No orphan found: no listing. Raises when the count cannot finish.
     """
     from psycopg import sql
-
-    from dsql_migrator.ui.data_migration._full_load_engine import (
-        _ORPHAN_PAGE_SIZE,
-        _count_orphans,
-    )
 
     first: dict = {}
     count = int(

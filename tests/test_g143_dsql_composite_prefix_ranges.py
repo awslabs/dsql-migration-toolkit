@@ -374,9 +374,9 @@ def test_the_listing_reads_the_page_where_the_count_found_the_first_orphan(monke
     child, orders, fk, expected = _orders_child()
     double = PgDouble(child, orders)
     page = 4
-    monkeypatch.setattr(engine, "_ORPHAN_PAGE_SIZE", page)
-    monkeypatch.setattr(engine, "_count_orphans",
-                        functools.partial(engine._count_orphans, page_size=page))
+    monkeypatch.setattr(fkv, "_ORPHAN_PAGE_SIZE", page)
+    monkeypatch.setattr(fkv, "_count_orphans",
+                        functools.partial(fkv._count_orphans, page_size=page))
     count, template, runnable = fkv.explain_foreign_key_failure(lambda: double, child.name, fk)
     assert count == expected
     # The count's pages in key order: the first orphan (order 1001) is on the second, after

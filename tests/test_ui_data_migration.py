@@ -2739,6 +2739,7 @@ class _FkProbeConnection:
 
 def _patch_fk_apply(monkeypatch, *, orphans: int = 0):
     """Stub the FK connection factory and record apply_foreign_key calls (no real DSQL)."""
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     applied: list[str] = []
@@ -2747,9 +2748,9 @@ def _patch_fk_apply(monkeypatch, *, orphans: int = 0):
         "_view_connection_factory",
         lambda self: (lambda: _FkProbeConnection(orphans)),
     )
-    # The engine imported apply_foreign_key by name, so patch the engine binding.
+    # The foreign-key pass imported apply_foreign_key by name, so patch its binding.
     monkeypatch.setattr(
-        engine,
+        fk_pass,
         "apply_foreign_key",
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
@@ -2893,20 +2894,21 @@ def test_the_foreign_key_pass_emits_one_named_audit_line_with_its_outcome(monkey
     function directly and logs nothing of its own, so moving the line to that wrapper -- the
     obvious way to de-duplicate -- would have silently deleted cut over's only record.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 4, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 4, 2: 0})
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
 
     def _apply(add_ddl, *, connection_factory):
         if '"fk_c"' in add_ddl:
             raise RuntimeError("ALTER rejected")
 
-    monkeypatch.setattr(engine, "apply_foreign_key", _apply)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", _apply)
     events: list[tuple] = []
     monkeypatch.setattr(
-        engine, "log_activity",
+        fk_pass, "log_activity",
         lambda category, action, **kw: events.append((category, action, kw)),
     )
     engine.apply_preserved_foreign_keys(
@@ -3153,6 +3155,7 @@ def test_apply_preserved_fk_matches_ddl_to_metadata_by_name(monkeypatch) -> None
     # Regression: an edited script that dropped fk_a leaves foreign_key_ddls=[fk_b] but
     # preserved_foreign_keys=[fk_a, fk_b]. A positional zip would key the orphan pre-gate
     # and VALIDATE off fk_a (WRONG); name-matching keys them off fk_b (the DDL applied).
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     ddl_b = (
@@ -3164,11 +3167,11 @@ def test_apply_preserved_fk_matches_ddl_to_metadata_by_name(monkeypatch) -> None
     applied: list[str] = []
     validated: list[tuple] = []
     monkeypatch.setattr(
-        engine, "apply_foreign_key",
+        fk_pass, "apply_foreign_key",
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
     monkeypatch.setattr(
-        engine, "validate_foreign_key",
+        fk_pass, "validate_foreign_key",
         lambda tbl, name, *, connection_factory: validated.append((tbl, name)),
     )
     result = engine.apply_preserved_foreign_keys(
@@ -3185,11 +3188,12 @@ def test_apply_preserved_fk_matches_ddl_to_metadata_by_name(monkeypatch) -> None
 
 
 def test_apply_preserved_fk_counts_orphan_skip(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     applied: list[str] = []
     monkeypatch.setattr(
-        engine, "apply_foreign_key",
+        fk_pass, "apply_foreign_key",
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
     result = engine.apply_preserved_foreign_keys(
@@ -3208,6 +3212,7 @@ def test_apply_preserved_fk_counts_orphan_skip(monkeypatch) -> None:
 def test_apply_preserved_fk_counts_precheck_failure(monkeypatch) -> None:
     # A PERMANENT (non-OCC, non-connection) pre-check error must count `failed` and
     # NOT risk a bad ADD -- the data-safety-critical branch that had no coverage.
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     class _BoomCursor:
@@ -3229,7 +3234,7 @@ def test_apply_preserved_fk_counts_precheck_failure(monkeypatch) -> None:
 
     applied: list[str] = []
     monkeypatch.setattr(
-        engine, "apply_foreign_key",
+        fk_pass, "apply_foreign_key",
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
     result = engine.apply_preserved_foreign_keys(
@@ -3245,6 +3250,7 @@ def test_apply_preserved_fk_reconnects_on_transient_drop(monkeypatch) -> None:
     # count replaces it and replays the statement (G139: its own reconnecting connection,
     # not a shared probe reopened once), and the FK still applies.
     import dsql_migrator.core.validator as validator_mod
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     monkeypatch.setattr(validator_mod.time, "sleep", lambda _s: None)
@@ -3272,10 +3278,10 @@ def test_apply_preserved_fk_reconnects_on_transient_drop(monkeypatch) -> None:
     conns: list = [_DeadConn(), _FkProbeConnection(0)]  # first dies, reconnect is healthy
     applied: list[str] = []
     monkeypatch.setattr(
-        engine, "apply_foreign_key",
+        fk_pass, "apply_foreign_key",
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
     result = engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: conns.pop(0),
         check_before_add=_ORDERS_COUNTED,
@@ -3288,18 +3294,19 @@ def test_apply_preserved_fk_reconnects_on_transient_drop(monkeypatch) -> None:
 def test_apply_preserved_fk_validate_failure_still_counts_applied(monkeypatch) -> None:
     # A NOT VALID FK enforces every new write even if the async VALIDATE never lands,
     # so a VALIDATE failure is swallowed and the FK still counts as applied (1,0,0).
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     applied: list[str] = []
     monkeypatch.setattr(
-        engine, "apply_foreign_key",
+        fk_pass, "apply_foreign_key",
         lambda add_ddl, *, connection_factory: applied.append(add_ddl),
     )
 
     def _boom_validate(*_a, **_k):
         raise RuntimeError("VALIDATE not ready")
 
-    monkeypatch.setattr(engine, "validate_foreign_key", _boom_validate)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", _boom_validate)
     result = engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
     )
@@ -20637,6 +20644,7 @@ def test_apply_preserved_fk_logs_the_real_reason_end_to_end(monkeypatch) -> None
     guards -- the activity log is the artifact an operator pastes into a runbook, and the
     exception used to go only to the module logger.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     class _NoUniqueIndex(Exception):
@@ -20647,15 +20655,15 @@ def test_apply_preserved_fk_logs_the_real_reason_end_to_end(monkeypatch) -> None
             "there is no unique constraint matching given keys for referenced table"
         )
 
-    monkeypatch.setattr(engine, "apply_foreign_key", _boom)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", _boom)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
     # The referenced unique index simply is not there -> no waiting, actionable reason.
     monkeypatch.setattr(
         "dsql_migrator.core.target_introspector.unique_index_state",
         lambda *a, **k: "absent",
     )
     events: list = []
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: events.append((a, k)))
 
     result = engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
@@ -20680,16 +20688,17 @@ def test_a_real_index_wait_is_logged_and_a_normal_run_stays_quiet(monkeypatch) -
     between the last table load and the FK pass was ~5.4s either way, and neither the
     activity log nor CloudWatch had an entry for the interval.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     events: list = []
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
 
     # A wait really happened (2.5s), then the index became valid.
     monkeypatch.setattr(
-        engine, "_wait_for_referenced_unique_index", lambda *a, **k: ("valid", 2.5)
+        fk_pass, "_wait_for_referenced_unique_index", lambda *a, **k: ("valid", 2.5)
     )
     result = engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
@@ -20705,7 +20714,7 @@ def test_a_real_index_wait_is_logged_and_a_normal_run_stays_quiet(monkeypatch) -
     # The normal case (index already valid, nothing waited) logs NO wait entry.
     events.clear()
     monkeypatch.setattr(
-        engine, "_wait_for_referenced_unique_index", lambda *a, **k: ("valid", 0.0)
+        fk_pass, "_wait_for_referenced_unique_index", lambda *a, **k: ("valid", 0.0)
     )
     engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
@@ -21243,12 +21252,13 @@ def test_a_normal_fk_pass_logs_no_wait_line_through_the_real_timer(monkeypatch) 
     trip the guard if the timer starts too early (which is how the field log filled up
     with "still building ... waited 0.0s" for every FK).
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     events: list = []
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
     # NOT patched: _wait_for_referenced_unique_index. Only the catalog probe is faked, and
     # it reports the index as already valid -- the normal case.
     monkeypatch.setattr(
@@ -21588,14 +21598,15 @@ def test_the_wait_log_never_prints_a_python_literal_to_an_operator(monkeypatch) 
     assert "budget" in _engine._index_state_phrase("building")
     assert "no such unique index" in _engine._index_state_phrase("absent")
 
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     events: list = []
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: events.append((a, k)))
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
     monkeypatch.setattr(
-        engine, "_wait_for_referenced_unique_index", lambda *a, **k: (None, 3.0)
+        fk_pass, "_wait_for_referenced_unique_index", lambda *a, **k: (None, 3.0)
     )
     engine.apply_preserved_foreign_keys(
         {"orders": _fk_conv(foreign_key_ddls=[_FK_DDL])}, lambda: _FkProbeConnection(0)
@@ -22082,11 +22093,12 @@ def test_the_fk_post_pass_reports_liveness_per_fk_and_honours_a_stop(monkeypatch
     load could be reaped as "an unresponsive source/target connection", which _mark_done
     cannot undo, leaving the Data Migration step FAILED and Validation gated shut.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
     monkeypatch.setattr(
         "dsql_migrator.core.target_introspector.unique_index_state",
         lambda *a, **k: "valid",
@@ -22472,6 +22484,7 @@ def test_a_failing_pre_gate_falls_back_to_the_serial_check() -> None:
     # through to the existing serial pre-check so the verdict and its error handling are
     # unchanged. A wrong answer here would add a constraint over violating rows.
     from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _foreign_keys as fk_pass
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     fk = ForeignKeyDef(name="fk", columns=["pid"], referenced_table="e.parent",
@@ -22485,14 +22498,14 @@ def test_a_failing_pre_gate_falls_back_to_the_serial_check() -> None:
     def boom(*_a, **_k):
         raise RuntimeError("catalog unreadable")
 
-    real = _engine._count_orphans
-    _engine._count_orphans = boom
+    real = fk_pass._count_orphans
+    fk_pass._count_orphans = boom
     try:
         out = _engine._pregate_orphans(
             pending, lambda: _Conn(), beat=lambda: None, stopped=lambda: False
         )
     finally:
-        _engine._count_orphans = real
+        fk_pass._count_orphans = real
     # Recorded as an exception, NOT as "0 orphans" -- the caller then re-checks serially.
     assert isinstance(out.get(0), Exception), out
     assert not isinstance(out.get(0), int)
@@ -22501,6 +22514,7 @@ def test_a_failing_pre_gate_falls_back_to_the_serial_check() -> None:
 def test_the_pre_gate_fan_out_honours_a_stop() -> None:
     # Stop must not be held for a whole concurrent sweep of large children.
     from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.ui.data_migration import _foreign_keys as fk_pass
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     fk = ForeignKeyDef(name="fk", columns=["pid"], referenced_table="e.parent",
@@ -22512,15 +22526,15 @@ def test_the_pre_gate_fan_out_honours_a_stop() -> None:
         calls["n"] += 1
         return 0
 
-    real = _engine._count_orphans
-    _engine._count_orphans = counted
+    real = fk_pass._count_orphans
+    fk_pass._count_orphans = counted
     try:
         out = _engine._pregate_orphans(
             pending, lambda: type("C", (), {"close": lambda s: None})(),
             beat=lambda: None, stopped=lambda: True,
         )
     finally:
-        _engine._count_orphans = real
+        fk_pass._count_orphans = real
     assert out == {}, out
     assert calls["n"] == 0, "a stop did not prevent the pre-gate work"
 
@@ -22869,21 +22883,22 @@ _ORDERS_COUNTED = {("orders", "fk_user"): "its parent table users is not part of
 
 
 def test_fk_pass_reports_progress_for_every_settled_fk(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     ddls, conv = _three_fk_conv()
     # Mixed outcomes so the count cannot be an artefact of the happy path alone:
     # fk_a applies, fk_b has orphans (skipped), fk_c's ALTER raises (failed).
-    monkeypatch.setattr(engine, "_pregate_orphans",
+    monkeypatch.setattr(fk_pass, "_pregate_orphans",
                         lambda pending, *a, **k: {0: 0, 1: 4, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
 
     def _apply(add_ddl, *, connection_factory):
         if '"fk_c"' in add_ddl:
             raise RuntimeError("ALTER rejected")
 
-    monkeypatch.setattr(engine, "apply_foreign_key", _apply)
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", _apply)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: None)
 
     seen: list[tuple[int, int]] = []
     result = engine.apply_preserved_foreign_keys(
@@ -22904,13 +22919,14 @@ def test_fk_pass_reports_progress_for_every_settled_fk(monkeypatch) -> None:
 def test_fk_pass_final_progress_is_the_partial_count_when_stopped(monkeypatch) -> None:
     # Stop applying must leave the card reporting what it ACTUALLY finished. The old
     # unconditional (total, total) write would have claimed a stopped pass was complete.
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda add_ddl, *, connection_factory: None)
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda add_ddl, *, connection_factory: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: None)
 
     calls = {"n": 0}
 
@@ -22930,13 +22946,14 @@ def test_fk_pass_final_progress_is_the_partial_count_when_stopped(monkeypatch) -
 
 def test_fk_pass_survives_a_progress_reporter_that_raises(monkeypatch) -> None:
     # Progress is display only; a reporter error must never cost a foreign key.
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda add_ddl, *, connection_factory: None)
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda add_ddl, *, connection_factory: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: None)
 
     def _boom(_done, _total):
         raise RuntimeError("the UI went away")
@@ -24506,15 +24523,16 @@ def test_the_cutover_foreign_key_pass_is_logged_as_a_cutover_event(monkeypatch) 
     "(cut-over)" under VALIDATION, so the two halves of one operator action were recorded
     differently. Still exactly ONE line: only its category and label vary.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
     events: list[tuple] = []
     monkeypatch.setattr(
-        engine, "log_activity",
+        fk_pass, "log_activity",
         lambda category, action, **kw: events.append((category, action, kw)),
     )
 
@@ -29097,15 +29115,16 @@ def test_orphan_skipped_constraints_make_the_pass_a_warning(monkeypatch) -> None
     constraints off the target as a clean success -- exactly the line a cut-over reviewer
     reads to conclude referential integrity is in place.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 7, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 7, 2: 0})
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
     events: list[tuple] = []
     monkeypatch.setattr(
-        engine, "log_activity",
+        fk_pass, "log_activity",
         lambda category, action, **kw: events.append((category, action, kw)),
     )
     applied, skipped, failed = engine.apply_preserved_foreign_keys(
@@ -29127,15 +29146,16 @@ def test_a_pass_stopped_part_way_names_the_unattempted_constraints(monkeypatch) 
     For a 15-FK schema that reads as a completed pass; the un-attempted constraints went
     only to ``_LOGGER.info``, which is the app stream, not the audit file.
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "apply_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", lambda *a, **k: None)
     events: list[tuple] = []
     monkeypatch.setattr(
-        engine, "log_activity",
+        fk_pass, "log_activity",
         lambda category, action, **kw: events.append((category, action, kw)),
     )
     calls = {"n": 0}
@@ -29162,21 +29182,22 @@ def test_an_interrupted_pass_still_left_a_started_line(monkeypatch) -> None:
     evidence the pass ever ran (Fargate task replaced, or an expired IAM token raising
     inside the loop).
     """
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     _ddls, conv = _three_fk_conv()
-    monkeypatch.setattr(engine, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
+    monkeypatch.setattr(fk_pass, "_pregate_orphans", lambda pending, *a, **k: {0: 0, 1: 0, 2: 0})
     events: list[tuple] = []
     monkeypatch.setattr(
-        engine, "log_activity",
+        fk_pass, "log_activity",
         lambda category, action, **kw: events.append((category, action, kw)),
     )
 
     def _boom(*_a, **_k):
         raise RuntimeError("token expired")
 
-    monkeypatch.setattr(engine, "apply_foreign_key", _boom)
-    monkeypatch.setattr(engine, "validate_foreign_key", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "apply_foreign_key", _boom)
+    monkeypatch.setattr(fk_pass, "validate_foreign_key", lambda *a, **k: None)
 
     def _explode():
         raise RuntimeError("task replaced")
@@ -30624,6 +30645,7 @@ def test_a_key_pointing_into_the_migration_stays_in_scope() -> None:
 
 
 def test_the_apply_skips_an_absent_pointing_in_child_silently_but_not_a_migrated_one(monkeypatch) -> None:
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
     import dsql_migrator.ui.data_migration._full_load_engine as engine
 
     conv = {
@@ -30631,9 +30653,9 @@ def test_the_apply_skips_an_absent_pointing_in_child_silently_but_not_a_migrated
         "shop.addresses": _fk_conv_named("shop.addresses", [("fk_addr_cust", "shop.customers")]),
     }
     present = {"shop.customers": True, "shop.addresses": False}
-    monkeypatch.setattr(engine, "_target_table_present", lambda _cf, name: present[name])
+    monkeypatch.setattr(fk_pass, "_target_table_present", lambda _cf, name: present[name])
     seen = []
-    monkeypatch.setattr(engine, "_pregate_orphans",
+    monkeypatch.setattr(fk_pass, "_pregate_orphans",
                         lambda *a, **k: (seen.append(a), 0)[1], raising=False)
     optional = frozenset({"shop.addresses"})
 

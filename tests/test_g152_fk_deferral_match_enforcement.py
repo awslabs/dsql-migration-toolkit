@@ -720,17 +720,17 @@ def test_a_column_a_not_enforced_key_references_can_be_excluded() -> None:
 
 
 def _fake_pass(monkeypatch) -> tuple[list, list]:  # noqa: ANN001
-    import dsql_migrator.ui.data_migration._full_load_engine as engine
+    import dsql_migrator.ui.data_migration._foreign_keys as fk_pass
 
     added: list = []
     validated: list = []
-    monkeypatch.setattr(engine, "_wait_for_referenced_unique_index",
+    monkeypatch.setattr(fk_pass, "_wait_for_referenced_unique_index",
                         lambda *a, **k: ("valid", 0.0))
-    monkeypatch.setattr(engine, "apply_foreign_key",
+    monkeypatch.setattr(fk_pass, "apply_foreign_key",
                         lambda ddl, *, connection_factory: added.append(ddl))
-    monkeypatch.setattr(engine, "validate_foreign_key",
+    monkeypatch.setattr(fk_pass, "validate_foreign_key",
                         lambda table, name, *, connection_factory: validated.append(name) or "j")
-    monkeypatch.setattr(engine, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(fk_pass, "log_activity", lambda *a, **k: None)
     monkeypatch.setattr("dsql_migrator.core.target_introspector.foreign_key_validation_states",
                         lambda *a, **k: {})
     return added, validated
