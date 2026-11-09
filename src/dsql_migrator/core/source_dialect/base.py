@@ -430,6 +430,14 @@ class SourceDialect(ABC):
         """
         return False
 
+    def reads_own_rows_only(self, connection: object, table_name: str) -> bool:
+        """Whether a read of ``table_name`` must say ``FROM ONLY`` -- take the table's own
+        rows, not its children's (G25). Asked by every source read that scans a table: the
+        Full Load, Validation, the CDC monitor's ``MAX(pk)`` and the value-size probe. The
+        base: ``False``, with no read (MySQL has no table inheritance).
+        """
+        return False
+
     @property
     @abstractmethod
     def snapshot_start_sql(self) -> str:

@@ -132,7 +132,6 @@ from dsql_migrator.core.source_dialect.mysql import (  # noqa: F401
     is_single_precision_float,
     mysql_base_type,
 )
-from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
 from dsql_migrator.core.validator_postgres import PgSourceConnection
 from dsql_migrator.core.watermark import COMMIT, read_binlog_status_row
 
@@ -2815,9 +2814,7 @@ class Validator:
         # Full Load copied and CDC captures (each child table is compared as itself). Read
         # live, in the validation snapshot like the catalog read above, never from the Step 1
         # inventory: a table partitioned since then must not compare as empty.
-        from_only = _source_is_postgres(source_dialect) and pg_reads_own_rows_only(
-            source_connection, table.name
-        )
+        from_only = source_dialect.reads_own_rows_only(source_connection, table.name)
         # Every scan of this table beats the page hook and polls the stop once per page.
         page = self._page_or_stop(should_cancel)
         # G138: a side is paged only by a key that SIDE enforces as unique -- a page boundary

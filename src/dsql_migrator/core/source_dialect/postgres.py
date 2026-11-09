@@ -1926,6 +1926,11 @@ class PostgresSourceDialect(SourceDialect):
         bound = ", ".join(f":{name}" for name in names)
         return f"({', '.join(primary_key)}) > ({bound})", params
 
+    def reads_own_rows_only(self, connection: object, table_name: str) -> bool:
+        # An inheritance parent: one live catalog read (pg_reads_own_rows_only), looked up
+        # through this module's global at call time so a patch of it applies to every reader.
+        return pg_reads_own_rows_only(connection, table_name)
+
     @property
     def snapshot_start_sql(self) -> str:
         # PostgreSQL consistent read snapshot for the streaming read.

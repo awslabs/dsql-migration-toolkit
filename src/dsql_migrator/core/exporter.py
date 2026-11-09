@@ -64,7 +64,7 @@ from sqlalchemy.engine import Engine, Result
 
 from dsql_migrator.core.converter import TargetValueSpec, map_mysql_type
 from dsql_migrator.core.introspector import _default_engine_factory, _limit_lock_waits
-from dsql_migrator.core.models import SourceConnectionConfig, SourceType, TableDef
+from dsql_migrator.core.models import SourceConnectionConfig, TableDef
 from dsql_migrator.core.mysql_zero_dates import ZeroDateMapping, zero_date_mappings
 from dsql_migrator.core.source_dialect import (
     MySQLSourceDialect,
@@ -822,15 +822,11 @@ def _reads_own_rows_only(
 ) -> bool:
     """Read ``table`` with ``FROM ONLY``? A PostgreSQL inheritance parent only (G25).
 
-    One live catalog read (:func:`~dsql_migrator.core.source_dialect.postgres.
-    pg_reads_own_rows_only`), so the read takes exactly the rows CDC captures for the table:
-    its own -- each child is its own table in the inventory. A partitioned table and every
-    MySQL table read as before."""
-    if dialect.source_type is not SourceType.POSTGRES:
-        return False
-    from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
-
-    return pg_reads_own_rows_only(connection, table.name)
+    The dialect's :meth:`~dsql_migrator.core.source_dialect.base.SourceDialect.
+    reads_own_rows_only` -- on PostgreSQL one live catalog read, so the read takes exactly
+    the rows CDC captures for the table: its own -- each child is its own table in the
+    inventory. A partitioned table and every MySQL table read as before."""
+    return dialect.reads_own_rows_only(connection, table.name)
 
 
 def compute_pk_shard_ranges(

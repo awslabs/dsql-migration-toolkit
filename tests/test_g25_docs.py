@@ -1175,7 +1175,17 @@ def test_an_inheritance_parent_is_read_as_its_own_rows_and_never_snapshotted(lan
     exporter = (core / "exporter.py").read_text(encoding="utf-8")
     assert 'f"ONLY {table_sql}" if from_only else table_sql' in exporter
     assert "class _OwnRowsSource" in (core / "validator.py").read_text(encoding="utf-8")
-    assert "pg_reads_own_rows_only" in _function(core / "watermark.py", "max_pk_source")
+    # Each reader asks the dialect (DP-4); PostgreSQL's answer is the live catalog read.
+    import inspect
+
+    from dsql_migrator.core.source_dialect.postgres import PostgresSourceDialect
+
+    assert "return pg_reads_own_rows_only(connection, table_name)" in inspect.getsource(
+        PostgresSourceDialect.reads_own_rows_only
+    )
+    assert "dialect.reads_own_rows_only(connection, table)" in _function(
+        core / "watermark.py", "max_pk_source"
+    )
     refused, unread = _inheritance_blocks()
     assert refused is not None and refused[0] == pg.INHERITANCE_SNAPSHOT_HEADER
     assert "untick app.par" in refused[1] and '"Full load + CDC"' in refused[1]

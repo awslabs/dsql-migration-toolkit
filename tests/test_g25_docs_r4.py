@@ -375,7 +375,7 @@ def test_the_value_size_checks_measure_an_inheritance_parents_own_rows(lang: str
     # exclusion popup calls the same method) asks the Full Load's own live rule.
     probes = ROOT / "src/dsql_migrator/ui/prerequisite_probes.py"
     measure = _function(probes, "oversized_values")
-    assert "if pg_reads_own_rows_only(connection, table_name):" in measure
+    assert "if dialect.reads_own_rows_only(connection, table_name):" in measure  # DP-4
     assert 'qualified = f"ONLY {qualified}"' in measure
     dialog = (ROOT / "src/dsql_migrator/ui/data_migration/_exclusion_dialog.py").read_text(
         encoding="utf-8"

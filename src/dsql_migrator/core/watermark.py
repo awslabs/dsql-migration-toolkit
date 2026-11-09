@@ -76,7 +76,7 @@ from dsql_migrator.core.introspector import (
     ReadOnlySourceError,
     _default_engine_factory,
 )
-from dsql_migrator.core.models import SourceConnectionConfig, SourceType, Watermark
+from dsql_migrator.core.models import SourceConnectionConfig, Watermark
 from dsql_migrator.core.source_dialect import MySQLSourceDialect, SourceDialect
 
 # Transaction-control and read statements issued during capture. None of these
@@ -247,7 +247,6 @@ def max_pk_source(
     a high-water its Aurora DSQL table never reaches (G25).
     """
     out: dict[str, Optional[int]] = {}
-    postgres = getattr(dialect, "source_type", None) is SourceType.POSTGRES
     for table, pk in pk_by_table.items():
         if not pk:
             out[table] = None
@@ -255,11 +254,7 @@ def max_pk_source(
         try:
             quoted = dialect.text_table(table)
             col = dialect.text_identifier(pk)
-            only = ""
-            if postgres:
-                from dsql_migrator.core.source_dialect.postgres import pg_reads_own_rows_only
-
-                only = "ONLY " if pg_reads_own_rows_only(connection, table) else ""
+            only = "ONLY " if dialect.reads_own_rows_only(connection, table) else ""
             result = connection.execute(text(f"SELECT MAX({col}) FROM {only}{quoted}"))
             val = result.scalar()
             out[table] = int(val) if isinstance(val, int) else None

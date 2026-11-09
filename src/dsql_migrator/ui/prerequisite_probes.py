@@ -206,17 +206,13 @@ class SessionSourceProbe:
         try:
             with engine.connect() as connection:
                 self._apply_statement_timeout(connection, timeout_seconds, is_postgres)
-                if is_postgres:
-                    # An inheritance parent is measured FROM ONLY: the Full Load and CDC
-                    # move only its own rows, so a child table's value is the child's to
-                    # report. The same live catalog read as the Full Load's (G25); if it
-                    # fails, nothing is measured (not determined, never a guess).
-                    from dsql_migrator.core.source_dialect.postgres import (
-                        pg_reads_own_rows_only,
-                    )
-
-                    if pg_reads_own_rows_only(connection, table_name):
-                        qualified = f"ONLY {qualified}"
+                # A PostgreSQL inheritance parent is measured FROM ONLY: the Full Load and
+                # CDC move only its own rows, so a child table's value is the child's to
+                # report. The Full Load's own rule (the dialect's reads_own_rows_only, one
+                # live catalog read on PostgreSQL, none on MySQL -- G25); if it fails,
+                # nothing is measured (not determined, never a guess).
+                if dialect.reads_own_rows_only(connection, table_name):
+                    qualified = f"ONLY {qualified}"
                 for index, name in enumerate(columns):
                     if should_cancel is not None and should_cancel():
                         break
