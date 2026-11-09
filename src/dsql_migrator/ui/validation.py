@@ -984,11 +984,8 @@ def legacy_values_remedy(migration_state, job_manager) -> str:
     first); otherwise Start over and a Full Load that drops and recreates the table. A
     stack must be deleted first in both cases -- a fresh session would find it and adopt
     the same omit-only column again -- and a running create or delete must finish."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import (
-        _current_job,
-        _stop_then,
-        exclusion_lock_state,
-    )
+    from dsql_migrator.ui.data_migration._cdc_status import _current_job
+    from dsql_migrator.ui.data_migration._table_set_lock import _stop_then, exclusion_lock_state
     from dsql_migrator.ui.data_migration._cdc_state import cdc_streaming_started
     from dsql_migrator.ui.data_migration._models import MigrationType
 
@@ -1093,7 +1090,7 @@ def excluded_values_remedy(migration_state, job_manager) -> str:
         "Drop & reload (an append keeps the stored values)"
     )
     if streaming:
-        from dsql_migrator.ui.data_migration._cdc_monitoring import _stop_then
+        from dsql_migrator.ui.data_migration._table_set_lock import _stop_then
 
         return (
             "A table cannot be dropped while CDC streams to it: "

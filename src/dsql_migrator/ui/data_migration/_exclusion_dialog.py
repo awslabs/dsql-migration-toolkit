@@ -48,6 +48,12 @@ from dsql_migrator.ui.data_migration._models import (
     stored_exclusion_block_reason,
     stored_exclusion_issues,
 )
+from dsql_migrator.ui.data_migration._table_set_lock import (
+    RECONNECT_REASON,
+    change_and_reload_block_reason,
+    exclusion_lock_state,
+    table_set_editable_after_load,
+)
 from dsql_migrator.ui.design import CODE_SURFACE_CLASSES, EXPANSION_PANEL_CLASSES, inline_hint, render_notice
 
 TITLE = "Exclude tables & columns"
@@ -132,14 +138,12 @@ class ExclusionDialogContext:
     capture_tables_fn: Optional[Callable[[Sequence[str]], Sequence[object]]] = None
     # Why the migration type cannot change now (the type selector's own lock), or None.
     type_lock_reason_fn: Callable[[], Optional[str]] = lambda: None
-    # The per-table add-lock (``_cdc_monitoring.TableSetAddLock``) or None (G16).
+    # The per-table add-lock (``_table_set_lock.TableSetAddLock``) or None (G16).
     add_lock_fn: Callable[[], Optional[object]] = lambda: None
     extra: dict = field(default_factory=dict)
 
 
 def _lock_state(ctx: ExclusionDialogContext):
-    from dsql_migrator.ui.data_migration._cdc_monitoring import exclusion_lock_state
-
     return exclusion_lock_state(ctx.migration_state, ctx.job_manager)
 
 
@@ -212,10 +216,6 @@ def render_exclusion_button_row(ui, ctx: ExclusionDialogContext):
             drift = exclusion_drift(state, _resolve(ctx, inventory, inputs, saved, slot="row"),
                                     migratable=inputs.migratable)
         elif saved is not None and state.rule_reticked_tables():
-            from dsql_migrator.ui.data_migration._cdc_monitoring import (
-                table_set_editable_after_load,
-            )
-
             # Full load only after a load (G12), or Full load + CDC before CDC starts (G16):
             # the columns are locked but the table set is not, so a rule-unselected table can
             # have been ticked again -- without the column rules its entries were dropped
@@ -1080,8 +1080,6 @@ def _render_check_sizes(ui, ctx: ExclusionDialogContext, rows, rerun) -> None:
     cancellable between columns, ONE source engine per pass disposed in a finally, the
     probe off the event loop, the popup on screen refreshed between awaits (never from a
     worker)."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import RECONNECT_REASON
-
     state = ctx.migration_state
     rows = rows[:_PAGE_SIZE]
     if not rows:
@@ -1333,8 +1331,6 @@ def _build_read_only_dialog(ui, ctx: ExclusionDialogContext, lock, *, hint=None,
 
 
 def _reload_gate(ctx: ExclusionDialogContext) -> Optional[str]:
-    from dsql_migrator.ui.data_migration._cdc_monitoring import change_and_reload_block_reason
-
     ready = bool(getattr(ctx.session, "connection_ready", lambda: False)())
     return change_and_reload_block_reason(ctx.migration_state, ctx.job_manager,
                                           connections_ready=ready)
@@ -1376,7 +1372,6 @@ def _record_chunks(ctx: ExclusionDialogContext) -> "Optional[dict]":
     """Full load only after a load (G12), or Full load + CDC before CDC starts (G16):
     ``{table: chunk}`` of the Full Load record, else ``None`` (every other state reads the
     reload set as before)."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import table_set_editable_after_load
     from dsql_migrator.ui.data_migration._cdc_status import _current_job
 
     if not table_set_editable_after_load(ctx.migration_state, ctx.job_manager):
@@ -1465,10 +1460,6 @@ def _reload_dialog_label(ctx: ExclusionDialogContext) -> str:
     if fl_cdc and reason is None:
         return FL_CDC_RELOAD_LABEL
     if fl_cdc:
-        from dsql_migrator.ui.data_migration._cdc_monitoring import (
-            table_set_editable_after_load,
-        )
-
         if table_set_editable_after_load(ctx.migration_state, ctx.job_manager):
             # A wait (the CDC state not read yet): it lifts by itself, never Start over.
             return f"Column rules are editable. {reason}"

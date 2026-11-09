@@ -204,18 +204,23 @@ from dsql_migrator.ui.data_migration import (
 )
 
 # The pure CDC state/phase predicates were extracted to _cdc_state.py so both this
-# module and _cdc_monitoring.py can import them without a cycle. Re-exported here so
-# _cdc_ui.<predicate> and every consumer/test import resolve unchanged.
-from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402,F401
+# module and _cdc_monitoring.py can import them without a cycle. This module imports the
+# ones it reads; every other consumer imports them from _cdc_state.
+from dsql_migrator.ui.data_migration._cdc_state import (
     _CDC_POLL_INTERVAL_SECONDS,
-    _cdc_is_streaming,
     cdc_infra_deploy_in_flight,
-    cdc_monitoring_visible,
-    cdc_delete_in_flight,
-    cdc_evidence_unverified,
-    cdc_pipeline_live,
     cdc_streaming_started,
     cdc_teardown_badge,
+)
+# The column-exclusion and table-set locks this module reads (_table_set_lock: no NiceGUI
+# call). A top-level import: _table_set_lock imports only _cdc_state, _models, _cdc_status
+# and core.models, none of which imports this module.
+from dsql_migrator.ui.data_migration._table_set_lock import (
+    _cdc_started_for_migration,
+    capture_error_with_remedy,
+    cdc_uncovered_selection,
+    fl_cdc_pending_additions,
+    table_set_editable_after_load,
 )
 
 
@@ -3570,8 +3575,6 @@ def _gate_selection(migration_state) -> "list[str]":
 def cdc_start_uncovered(migration_state, job_manager, job) -> "list[str]":
     """The selected tables Start CDC waits for (G17, :func:`cdc_uncovered_selection` over
     the resolved selection -- else the stored one -- and the record ``job`` in hand)."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import cdc_uncovered_selection
-
     return cdc_uncovered_selection(
         migration_state, job_manager, _gate_selection(migration_state), job=job
     )
@@ -3580,8 +3583,6 @@ def cdc_start_uncovered(migration_state, job_manager, job) -> "list[str]":
 def cdc_deploy_pending(migration_state, job_manager, job) -> "list[str]":
     """The Full load + CDC tables a Deploy now would not size (G17: still to load under the
     Full Load's start point, :func:`fl_cdc_pending_additions`)."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import fl_cdc_pending_additions
-
     return fl_cdc_pending_additions(
         migration_state, job_manager, _gate_selection(migration_state), job=job
     )
@@ -3603,8 +3604,6 @@ WILL_STREAM_NONE_LOCKED_LIST = (
 def will_stream_none(migration_state, job_manager) -> str:
     """The empty-capture line/tooltip whose remedy is reachable from THIS state (G16): the
     table list while it can still change the set, else the route that can."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import table_set_editable_after_load
-
     return (
         WILL_STREAM_NONE
         if table_set_editable_after_load(migration_state, job_manager)
@@ -3878,8 +3877,6 @@ def _render_cdc_start_button(
     # Not on a start that re-snapshots every table (said in "Ready to start CDC" above):
     # nothing is replayed over a copy there, which is what this notice is about.
     if _added_captured and not _resnapshots:
-        from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
-
         if not _cdc_started_for_migration(migration_state, job_manager):
             render_notice(
                 ui,
@@ -4869,8 +4866,6 @@ def _deploy_table_list_refused(refusal: str, migration_state, job_manager, sessi
     the refusal's own remedy, which they repeat: the load may still take every table, and the
     tables CDC does not need be unticked after it, before CDC starts (G16) -- the deploy itself
     stays refused. Otherwise the table picker's after it (:func:`_table_list_hold_remedy`)."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
-
     lock = _table_lock(migration_state, job_manager, session)
     if (
         getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC
@@ -4910,8 +4905,6 @@ def _deploy_topic_name_refused(refusal: str, migration_state, job_manager, sessi
     ``CDC_TOPIC_NAME_DOTTED_SCHEMA``, the first route excepts a table of a database or schema
     whose name holds a '.', as on the card. Otherwise the table picker's after it
     (:func:`_topic_name_hold_remedy`)."""
-    from dsql_migrator.ui.data_migration._cdc_monitoring import _cdc_started_for_migration
-
     lock = _table_lock(migration_state, job_manager, session)
     if (
         getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC
@@ -10751,55 +10744,12 @@ def _render_deploy_log(ui, log_lines, log_state=None) -> None:
 
 # The post-start CDC monitoring / DLQ / status render panels were extracted to
 # _cdc_monitoring.py for maintainability (after the _cdc_state predicate split, so the
-# panels import those predicates from _cdc_state, not back from here -- no cycle).
-# Re-exported so _cdc_ui.<name>, _render_cdc_step's calls, and every consumer/test import
-# resolve unchanged.
-from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402,F401
-    _DLQ_LEVEL_TONE,
-    _DLQ_RECORD_LIST_LIMIT,
-    _DLQ_RECORD_PAGE_SIZE,
-    _DRIFT_LABELS,
-    _dlq_panel_tone,
-    _open_add_column_dialog,
-    _render_cdc_dlq_breakdown,
-    _render_cdc_dlq_panel,
-    _render_cdc_dlq_records,
-    _render_cdc_error_download,
+# panels import those predicates from _cdc_state, not back from here -- no cycle). This
+# module imports the panels _render_cdc_step renders; every other consumer imports from the
+# module that defines the name (_cdc_monitoring, _table_set_lock or _cdc_state).
+from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
     _render_cdc_handling_panel,
     _render_cdc_live_monitoring,
-    _render_cdc_pipeline_health,
-    _render_cdc_schema_drift_banner,
-    _render_change_flow_status,
-    _render_full_load_quarantine_pointer,
     _render_migration_table_status,
-    exclusion_lock_state,
-    change_and_reload_block_reason,
-    fk_apply_running,
-    table_set_editable_after_load,
-    table_set_wait_reason,
-    TABLE_SET_WAIT_LOAD,
-    TABLE_SET_WAIT_FK,
-    TABLE_SET_WAIT_RESTORE,
-    TABLE_SET_WAIT_INFRA,
-    TABLE_SET_WAIT_CDC_CHECK,
-    TABLE_SET_WAIT_CDC_UNREAD,
-    table_set_failed_create_wait,
-    table_set_delete_wait,
-    TableSetAddLock,
-    table_set_add_lock,
-    cdc_uncovered_selection,
-    fl_cdc_pending_additions,
-    cdc_addition_block_reason,
-    LOCK_TIP_RULE,
-    LOCK_TIP_SPLIT,
-    TREE_HINT_FL_CDC,
-    TREE_HINT_SPLIT,
-    CDC_ONLY_NARROWING_SENTENCE,
-    R4_FL_CDC_NARROWING,
-    R1_FL_CDC_SENTENCE,
-    CONTINUE_HINT_FL_CDC,
-    capture_error_with_remedy,
-    cdc_stack_being_deleted,
-    cdc_delete_eta,
     _render_cdc_oversized_recovery_without_monitoring,
 )

@@ -18530,14 +18530,14 @@ def test_cdc_dlq_records_memoizes_on_append_only_count() -> None:
 
 def test_cdc_error_download_label_and_payload_exclude_full_load_rows() -> None:
     """"Download CDC error log (3 errors)" handed over three Full Load quarantines."""
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
     key = _mixed_error_log(state, full_load=3, cdc=1)
 
     ui = _RecordingUi()
-    _cdc_ui._render_cdc_error_download(ui, state, key)
+    _cdc_monitoring._render_cdc_error_download(ui, state, key)
 
     joined = " ".join(ui.texts)
     assert "Download CDC error log (1 error)" in joined, (
@@ -18553,14 +18553,14 @@ def test_cdc_error_download_label_and_payload_exclude_full_load_rows() -> None:
 
 def test_download_is_not_offered_when_only_full_load_rows_exist() -> None:
     # Nothing was dead-lettered, so there is no CDC error log to download.
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
     key = _mixed_error_log(state, full_load=3, cdc=0)
 
     ui = _RecordingUi()
-    _cdc_ui._render_cdc_error_download(ui, state, key)
+    _cdc_monitoring._render_cdc_error_download(ui, state, key)
 
     assert not any("Download CDC error log" in t for t in ui.texts)
 
@@ -18571,14 +18571,14 @@ def test_dlq_panel_points_at_the_full_load_for_its_own_quarantines() -> None:
     They are rows that never reached the target, so cut-over depends on knowing about
     them -- the panel cross-references them instead of silently dropping them.
     """
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
     key = _mixed_error_log(state, full_load=3, cdc=0)
 
     ui = _RecordingUi()
-    _cdc_ui._render_full_load_quarantine_pointer(ui, state, key)
+    _cdc_monitoring._render_full_load_quarantine_pointer(ui, state, key)
 
     joined = " ".join(ui.texts)
     assert "Full Load also set 3 rows aside" in joined
@@ -18587,13 +18587,13 @@ def test_dlq_panel_points_at_the_full_load_for_its_own_quarantines() -> None:
 
 def test_no_full_load_pointer_when_every_record_is_cdc() -> None:
     # Don't mention a Full Load that set nothing aside.
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     key = _mixed_error_log(state, full_load=0, cdc=2)
 
     ui = _RecordingUi()
-    _cdc_ui._render_full_load_quarantine_pointer(ui, state, key)
+    _cdc_monitoring._render_full_load_quarantine_pointer(ui, state, key)
 
     assert not any("Full Load also set" in t for t in ui.texts)
 
@@ -18605,14 +18605,14 @@ def test_dlq_record_table_rows_come_from_the_filtered_set() -> None:
     0, three rows sit underneath). ``cdc_dlq_records`` covers the helper; this covers
     what ``_render_cdc_dlq_records`` actually puts in the table.
     """
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
     key = _mixed_error_log(state, full_load=3, cdc=1)
 
     ui = _RecordingUi()
-    _cdc_ui._render_cdc_dlq_records(ui, state, key)
+    _cdc_monitoring._render_cdc_dlq_records(ui, state, key)
 
     joined = " ".join(ui.texts)
     assert "product_media" not in joined, (
@@ -18625,14 +18625,14 @@ def test_dlq_record_table_rows_come_from_the_filtered_set() -> None:
 
 def test_dlq_record_table_is_empty_when_only_full_load_rows_exist() -> None:
     # Nothing was dead-lettered -> no record table at all (not a table of Full Load rows).
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
     key = _mixed_error_log(state, full_load=3, cdc=0)
 
     ui = _RecordingUi()
-    _cdc_ui._render_cdc_dlq_records(ui, state, key)
+    _cdc_monitoring._render_cdc_dlq_records(ui, state, key)
 
     assert not any("Quarantined records" in t for t in ui.texts)
     assert not any("product_media" in t for t in ui.texts)
@@ -18644,7 +18644,7 @@ def test_cdc_download_payload_is_driven_by_the_buttons_own_handler() -> None:
     Asserting a separately-recomputed payload let a "render_log(log_key)" regression
     survive: the label said 1 error while the file carried all four rows.
     """
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
 
     state = DataMigrationState()
     state.job_id = "job-fullload-1"
@@ -18660,7 +18660,7 @@ def test_cdc_download_payload_is_driven_by_the_buttons_own_handler() -> None:
 
     ui = _RecordingUi()
     ui.download = _Dl()
-    _cdc_ui._render_cdc_error_download(ui, state, key)
+    _cdc_monitoring._render_cdc_error_download(ui, state, key)
 
     handlers = [b.on_click for b in ui.buttons if b.on_click is not None]
     assert handlers, "the download button must be wired"
@@ -18691,7 +18691,7 @@ def test_full_load_pointer_is_rendered_by_the_dlq_panel() -> None:
         ConnectorStatus,
         build_cdc_status_view,
     )
-    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration import _cdc_monitoring
     from dsql_migrator.ui.data_migration._cdc_status import cdc_dlq_summary
 
     state = DataMigrationState()
@@ -18704,7 +18704,7 @@ def test_full_load_pointer_is_rendered_by_the_dlq_panel() -> None:
         dlq_depth=0,
     )
     ui = _RecordingUi()
-    _cdc_ui._render_cdc_dlq_panel(ui, state, _StubJobManager({}), view)
+    _cdc_monitoring._render_cdc_dlq_panel(ui, state, _StubJobManager({}), view)
 
     joined = " ".join(ui.texts)
     # The DLQ itself is clean...
@@ -19673,7 +19673,7 @@ def test_monitoring_hidden_while_the_infrastructure_is_being_deleted() -> None:
     live stream-lag chart and per-table replication figures on screen for a pipeline
     being dismantled.
     """
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_monitoring_visible
 
     assert (
         cdc_monitoring_visible(
@@ -19685,7 +19685,7 @@ def test_monitoring_hidden_while_the_infrastructure_is_being_deleted() -> None:
 
 def test_monitoring_hidden_while_stopping_cdc() -> None:
     # Stop CDC removes the connectors too, so the live views are equally moot.
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_monitoring_visible
 
     assert (
         cdc_monitoring_visible(
@@ -19697,7 +19697,7 @@ def test_monitoring_hidden_while_stopping_cdc() -> None:
 
 def test_monitoring_visible_for_a_streaming_pipeline() -> None:
     # The control: with no teardown in flight the views must show, which is their point.
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_monitoring_visible
 
     assert cdc_monitoring_visible(_live_cdc_state(), _TeardownJobManager()) is True
 
@@ -19707,7 +19707,7 @@ def test_monitoring_still_visible_during_the_connector_ramp() -> None:
 
     Scoping the hide to teardowns only is what keeps the ramp observable.
     """
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_monitoring_visible
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_monitoring_visible
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("job-start", kind="start")

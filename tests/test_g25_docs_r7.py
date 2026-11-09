@@ -729,10 +729,11 @@ def test_chapter_13_names_new_topics_for_the_type_switch_and_the_re_copy(lang: s
         "a stack that has streamed only continues from where it stopped, never from a newer "
         "start point."
     )
-    monitoring = _joined(_SRC / "ui" / "data_migration" / "_cdc_monitoring.py")
+    # The exclusion lock's R2 text (moved from _cdc_monitoring.py, cdcui-5).
+    table_set_lock = _joined(_SRC / "ui" / "data_migration" / "_table_set_lock.py")
     assert (
         "before the new stack's first Start CDC: once that stack has streamed, a new Full Load "
-        "start point needs another Delete and redeploy." in monitoring
+        "start point needs another Delete and redeploy." in table_set_lock
     )
     assert PLUGIN_VERSION == "v56"
 

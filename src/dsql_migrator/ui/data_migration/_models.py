@@ -869,7 +869,7 @@ def full_load_scope_names(
     once CDC starts (the set is then locked again) a table unticked before it never comes
     back as a red error or a Retry / Reload row -- followed, while CDC never started for the
     migration, by the tables selected since that the watermark does not cover yet (G17:
-    ``_cdc_monitoring.fl_cdc_pending_additions`` over ``selected``, the resolved selection;
+    ``_table_set_lock.fl_cdc_pending_additions`` over ``selected``, the resolved selection;
     ``pending`` passes them when the caller computed them), in selection order: each is
     unfinished until its guarded load extends the coverage. ``job`` is the Full Load record
     when the caller already holds it (a read is a deep copy of the record); ``None`` reads
@@ -886,7 +886,8 @@ def full_load_scope_names(
 
             job = _current_job(job_manager, getattr(migration_state, "job_id", None))
         if pending is _PENDING_UNSET:
-            from dsql_migrator.ui.data_migration._cdc_monitoring import (
+            # Function-local: _table_set_lock imports this module at its top (a cycle otherwise).
+            from dsql_migrator.ui.data_migration._table_set_lock import (
                 fl_cdc_pending_additions,
             )
 
@@ -911,7 +912,8 @@ def full_load_scope_names(
     names = [n for n in dict.fromkeys(selected or ()) if n]
     if not names:
         return None
-    from dsql_migrator.ui.data_migration._cdc_monitoring import table_set_editable_after_load
+    # Function-local: _table_set_lock imports this module at its top (a cycle otherwise).
+    from dsql_migrator.ui.data_migration._table_set_lock import table_set_editable_after_load
 
     if not table_set_editable_after_load(migration_state, job_manager):
         return None
@@ -974,7 +976,8 @@ def scoped_full_load_view(migration_state, job_manager, selected, *, job):
         return job
     pending: "list[str]" = []
     if getattr(migration_state, "migration_type", None) is MigrationType.FULL_LOAD_AND_CDC:
-        from dsql_migrator.ui.data_migration._cdc_monitoring import fl_cdc_pending_additions
+        # Function-local: _table_set_lock imports this module at its top (a cycle otherwise).
+        from dsql_migrator.ui.data_migration._table_set_lock import fl_cdc_pending_additions
 
         pending = fl_cdc_pending_additions(migration_state, job_manager, selected, job=job)
     return scope_full_load_job(
@@ -3175,7 +3178,7 @@ def popup_resolution(
     when ``capture_tables(selected')`` is given (CDC types) -- the capture preview.
 
     ``add_lock`` (Full load + CDC after its Full Load, before CDC starts, G16: the table
-    picker's per-table add-lock, ``_cdc_monitoring.TableSetAddLock``) turns a table line
+    picker's per-table add-lock, ``_table_set_lock.TableSetAddLock``) turns a table line
     that would select a table the lock refuses -- or unselect one the Full Load read in parts
     (G137) -- into a per-table E3; ``None`` changes nothing.
 

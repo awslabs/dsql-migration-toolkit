@@ -642,7 +642,7 @@ def test_sink_stall_is_never_asserted_on_an_unknown_rate() -> None:
 def test_dlq_zero_depth_is_not_painted_green_while_the_sink_is_stalled() -> None:
     # A stalled sink never reaches a record to quarantine, so depth is 0 -- which the
     # panel used to paint as a green "success" all-clear during total data loss.
-    from dsql_migrator.ui.data_migration._cdc_ui import _dlq_panel_tone
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _dlq_panel_tone
     from dsql_migrator.ui.data_migration._models import assess_dlq_health
 
     clean = assess_dlq_health(0)
@@ -721,7 +721,7 @@ def test_change_flow_renders_the_stall_instead_of_streaming_all_clear() -> None:
     # through to "Streaming — changes are flowing", asserting health off the SOURCE rate
     # while nothing reached DSQL. The stall branch must win, and must say what to do.
     from tests.test_ui_data_migration import _RecordingUi
-    from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_change_flow_status
 
     # A CONFIRMED stall (the divergence held for the required consecutive polls) --
     # a single-poll blip must not render this, which the test above covers.
@@ -745,7 +745,7 @@ def test_change_flow_renders_the_stall_instead_of_streaming_all_clear() -> None:
 
 def test_change_flow_still_shows_streaming_when_the_sink_keeps_up() -> None:
     from tests.test_ui_data_migration import _RecordingUi
-    from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_change_flow_status
 
     ui = _RecordingUi()
     _render_change_flow_status(
@@ -764,7 +764,7 @@ def test_change_flow_still_shows_streaming_when_the_sink_keeps_up() -> None:
 
 def test_change_flow_shows_idle_for_a_drained_pipeline() -> None:
     from tests.test_ui_data_migration import _RecordingUi
-    from dsql_migrator.ui.data_migration._cdc_ui import _render_change_flow_status
+    from dsql_migrator.ui.data_migration._cdc_monitoring import _render_change_flow_status
 
     ui = _RecordingUi()
     _render_change_flow_status(

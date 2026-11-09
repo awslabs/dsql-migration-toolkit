@@ -6739,7 +6739,7 @@ def _lob_excluded_note(migrator: "DataMigrator", table_name: str) -> str:
 # converge, so they are not gated.
 NEW_START_POINT_HEADER = "Delete CDC infrastructure and deploy it again before a new Full Load"
 # The CDC state is not read yet (or could not be): whether the stack has streamed is unknown,
-# so the gate holds, as the G17 addition guard does (_cdc_monitoring.cdc_addition_block_reason).
+# so the gate holds, as the G17 addition guard does (_table_set_lock.cdc_addition_block_reason).
 NEW_START_POINT_UNREAD_HEADER = "A new Full Load start point waits until the CDC state is read"
 _NEW_START_POINT_WHY = (
     "Stop CDC removes the sink without a drain (a rolled-back Start removes it mid-stream), so "

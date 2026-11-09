@@ -247,7 +247,7 @@ def cdc_load_hold(
     CDC streams (Stop CDC first). Pure apart from the job reads."""
     if not cdc_streaming_started(migration_state, job_manager):
         return None
-    from dsql_migrator.ui.data_migration._cdc_monitoring import cdc_operation_in_flight
+    from dsql_migrator.ui.data_migration._table_set_lock import cdc_operation_in_flight
 
     operation = cdc_operation_in_flight(migration_state, job_manager)
     if operation is not None:
@@ -760,7 +760,7 @@ def _render_full_load_step(
         and _record_job is not None
         and getattr(_record_job, "status", None) not in ("PENDING", "RUNNING")
     ):
-        from dsql_migrator.ui.data_migration._cdc_monitoring import fl_cdc_pending_additions
+        from dsql_migrator.ui.data_migration._table_set_lock import fl_cdc_pending_additions
 
         _pending = fl_cdc_pending_additions(
             migration_state, job_manager, selected_names, job=_record_job

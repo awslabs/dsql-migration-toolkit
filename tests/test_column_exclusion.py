@@ -193,8 +193,8 @@ def test_every_path_reads_the_effective_set_not_the_raw_one():
     cdc = (root / "_cdc_ui.py").read_text(encoding="utf-8")
     assert cdc.count("cdc_capture_exclusions(migration_state, inventory, tables_for_config)") == 3
     assert "format_column_exclude_list(" not in cdc and "cdc_excluded_columns(" not in cdc
-    assert "format_column_exclude_list(" not in (root / "_cdc_monitoring.py").read_text(
-        encoding="utf-8")
+    for name in ("_cdc_monitoring.py", "_table_set_lock.py"):  # one file before cdcui-5
+        assert "format_column_exclude_list(" not in (root / name).read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

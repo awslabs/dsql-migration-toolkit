@@ -575,11 +575,12 @@ class _Jobs:
      "delete"),
 ])
 def test_the_remedy_matrix(monkeypatch, mtype, job_id, known, streaming, stopping, expect, absent):
-    import dsql_migrator.ui.data_migration._cdc_monitoring as cdc_monitoring
     import dsql_migrator.ui.data_migration._cdc_state as cdc_state
+    import dsql_migrator.ui.data_migration._table_set_lock as table_set_lock
 
     monkeypatch.setattr(cdc_state, "cdc_streaming_started", lambda *_a, **_k: streaming)
-    monkeypatch.setattr(cdc_monitoring, "cdc_stop_in_flight", lambda *_a, **_k: stopping)
+    # _stop_then reads cdc_stop_in_flight in _table_set_lock (cdcui-5).
+    monkeypatch.setattr(table_set_lock, "cdc_stop_in_flight", lambda *_a, **_k: stopping)
     text = excluded_values_remedy(SimpleNamespace(migration_type=mtype, job_id=job_id), _Jobs(known))
     assert expect in text and absent not in text, text
     assert "Reload specific tables" in text or "Start over" in text or "before CDC started" in text

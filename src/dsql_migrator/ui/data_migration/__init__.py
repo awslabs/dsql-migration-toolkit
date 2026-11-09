@@ -59,9 +59,11 @@ schema drift) -- and a per-LAYER split for Full Load and the shared parts:
 - Shared, used by BOTH data paths (the Full Load -> CDC watermark handoff, prerequisites,
   and table selection couple them, so they are ONE layer, not split by feature):
   ``_models`` (pure view-models / formatters / enums), ``_state`` (per-session
-  :class:`DataMigrationState`), ``_exclusion_dialog`` (the "Exclude tables & columns"
-  popup, for every migration type), and this ``__init__`` (the
-  :func:`build_data_migration_screen` orchestrator that wires both steps into one journey).
+  :class:`DataMigrationState`), ``_table_set_lock`` (the column-exclusion and table-set
+  locks: what may still change once data or a CDC stack exists; NiceGUI-free),
+  ``_exclusion_dialog`` (the "Exclude tables & columns" popup, for every migration type),
+  and this ``__init__`` (the :func:`build_data_migration_screen` orchestrator that wires
+  both steps into one journey).
 
 File count tracks intrinsic complexity, not symmetry: CDC spans many more core modules than
 Full Load because CDC is a distributed-systems subsystem while Full Load is a tight
@@ -6638,18 +6640,43 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     CDC_DEFAULT_STACK_NAME,
     _cdc_infra_prefill,
     derive_cdc_vpc_from_source,
-    _cdc_is_streaming,
     _cdc_stack_has_seeder_lambda,
     _cdc_tables_for_config,
     _cdc_watermark,
     _diagnose_for_dialog,
     _open_cdc_infra_dialog,
-    _render_cdc_dlq_panel,
     _render_cdc_infra_form,
     _render_cdc_infra_prep_section,
     _render_cdc_attach_row,
     cdc_infra_prep_state,
     _render_cdc_least_privilege_note,
+    START_TOOLTIP_NARROWING,
+    WILL_STREAM_NONE,
+    WILL_STREAM_NONE_LOCKED_LIST,
+    DEPLOY_EMPTY_CAPTURE,
+    will_stream_none,
+    _render_cdc_step,
+    _render_deploy_log,
+    _resolve_cdc_source_secret,
+    _start_cdc_infra_deploy,
+    cdc_deploy_card_superseded,
+    cdc_deploy_connection_blocker,
+    cdc_live_running_names,
+    cdc_unstable_message,
+    classify_cdc_card_phase,
+)
+# cdcui-10: the CDC phase predicates, the dead-letter-queue panel and the column-exclusion /
+# table-set locks come from the modules that define them, not relayed through _cdc_ui.
+from dsql_migrator.ui.data_migration._cdc_state import (  # noqa: E402
+    _cdc_is_streaming,
+    cdc_delete_in_flight,
+    cdc_evidence_unverified,
+    cdc_pipeline_live,
+    cdc_infra_deploy_in_flight,
+    cdc_streaming_started,
+)
+from dsql_migrator.ui.data_migration._cdc_monitoring import _render_cdc_dlq_panel  # noqa: E402
+from dsql_migrator.ui.data_migration._table_set_lock import (  # noqa: E402
     exclusion_lock_state,
     fk_apply_running,
     table_set_editable_after_load,
@@ -6675,32 +6702,11 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     R4_FL_CDC_NARROWING,
     R1_FL_CDC_SENTENCE,
     CONTINUE_HINT_FL_CDC,
-    START_TOOLTIP_NARROWING,
-    WILL_STREAM_NONE,
-    WILL_STREAM_NONE_LOCKED_LIST,
-    DEPLOY_EMPTY_CAPTURE,
-    will_stream_none,
     capture_error_with_remedy,
     cdc_stack_being_deleted,
     cdc_delete_eta,
-    _render_cdc_step,
-    _render_deploy_log,
-    _resolve_cdc_source_secret,
-    _start_cdc_infra_deploy,
-    cdc_deploy_card_superseded,
-    cdc_deploy_connection_blocker,
-    cdc_live_running_names,
-    cdc_delete_in_flight,
-    cdc_evidence_unverified,
-    cdc_pipeline_live,
-    cdc_infra_deploy_in_flight,
-    cdc_streaming_started,
-    cdc_unstable_message,
-    classify_cdc_card_phase,
-)
-# G16's CDC-evidence reads, shared with the type-switch lock and CDC only's lock text
-# (cdc_stop_in_flight: the type lock's Stop wait, G27).
-from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
+    # G16's CDC-evidence reads, shared with the type-switch lock and CDC only's lock text
+    # (cdc_stop_in_flight: the type lock's Stop wait, G27).
     _cdc_started_for_migration,
     _fl_cdc_narrowing_open,
     cdc_stop_in_flight,
