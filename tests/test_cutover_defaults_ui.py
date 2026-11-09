@@ -90,10 +90,10 @@ def _render(ui, *, cdc=True, snap=None, fk=0, drained=False, block=None, checkin
 
     latched = []
     notices = []
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
 
-    orig = uiv.render_notice
-    uiv.render_notice = lambda _ui, **kw: (notices.append(kw), _ui.texts.append(kw.get("header", "")),
+    orig = uic.render_notice
+    uic.render_notice = lambda _ui, **kw: (notices.append(kw), _ui.texts.append(kw.get("header", "")),
                                            _ui.texts.append(kw.get("body", "")))
     try:
         _render_cutover_section(
@@ -104,7 +104,7 @@ def _render(ui, *, cdc=True, snap=None, fk=0, drained=False, block=None, checkin
             restore_provider=provider or (lambda request: None), restore_job_block=block,
             restore_outcome=outcome, drained_gated=gated)
     finally:
-        uiv.render_notice = orig
+        uic.render_notice = orig
     return latched, notices
 
 
@@ -217,6 +217,7 @@ def _screen(monkeypatch, *, snap, cdc=True, drained=False, in_use=True, exclude=
     import sys
     import types
 
+    import dsql_migrator.ui.cutover as uic
     import dsql_migrator.ui.validation as uiv
     from dsql_migrator.core.models import TableValidationResult, ValidationMode, ValidationReport
     from dsql_migrator.core.overlay_ledger import InMemoryOverlayLedger
@@ -228,11 +229,13 @@ def _screen(monkeypatch, *, snap, cdc=True, drained=False, in_use=True, exclude=
     fake = types.ModuleType("nicegui")
     fake.ui = ui
     monkeypatch.setitem(sys.modules, "nicegui", fake)
-    monkeypatch.setattr(uiv, "_cdc_in_use", lambda _s: cdc)
-    monkeypatch.setattr(uiv, "render_notice", lambda _ui, **kw: (ui.texts.append(kw.get("header", "")),
+    # The screen (ui/cutover.py) reads it, and so do the CDC gates it builds (ui/validation.py).
+    for module in (uic, uiv):
+        monkeypatch.setattr(module, "_cdc_in_use", lambda _s: cdc)
+    monkeypatch.setattr(uic, "render_notice", lambda _ui, **kw: (ui.texts.append(kw.get("header", "")),
                                                                  ui.texts.append(kw.get("body", ""))))
     logged = []
-    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(uic, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
     sessions = SessionStore()
     sessions.get_or_create("s1").set_target(SimpleNamespace(
         cluster_endpoint="c.dsql.us-east-1.on.aws", database="postgres", region="us-east-1"))
@@ -319,14 +322,14 @@ def test_the_checking_state_offers_check_again():
 
 
 def test_an_all_skipped_restore_is_reported(monkeypatch):
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
 
     logged = []
-    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(uic, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
     outcome = CutoverRestoreOutcome(skipped=("app.t.a",))
-    uiv._log_cutover_restore(outcome)
+    uic._log_cutover_restore(outcome)
     assert [(a, kw["status"]) for a, kw in logged] == [
-        ("excluded-column DEFAULTs not restored (cut-over)", uiv.ActivityStatus.WARNING)]
+        ("excluded-column DEFAULTs not restored (cut-over)", uic.ActivityStatus.WARNING)]
     assert "app.t.a" in logged[0][1]["detail"]
     ui = _Ui()
     _l, notices = _render(ui, snap=_snap(_item("a")), outcome=outcome)
@@ -336,11 +339,11 @@ def test_an_all_skipped_restore_is_reported(monkeypatch):
 def test_the_restored_line_names_each_statement_once_terminated(monkeypatch):
     """Each statement carries its own ';' (the block shows them so): the activity line
     must not double it before the next clause (live: '...::text);; migrated rows')."""
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
 
     logged = []
-    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
-    uiv._log_cutover_restore(CutoverRestoreOutcome(
+    monkeypatch.setattr(uic, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    uic._log_cutover_restore(CutoverRestoreOutcome(
         restored=("app.t.a", "app.t.b"),
         statements=('ALTER TABLE "app"."t" ALTER COLUMN "a" SET DEFAULT (0);',
                     'ALTER TABLE "app"."t" ALTER COLUMN "b" SET DEFAULT (1);')))

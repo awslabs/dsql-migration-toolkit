@@ -10,7 +10,8 @@ first, then REPLICA IDENTITY, then a source schema change) by three copies; and 
 REPLICA IDENTITY and source-schema gates were rendered by two copied functions.
 
 These pin, per call site, what each gate is built with and in what order (a recorder wraps
-the three builders where ``ui/validation.py`` looks them up), and the strings the sites
+the three builders where ``ui/validation.py`` and, since Cut over moved out of it,
+``ui/cutover.py`` look them up), and the strings the sites
 produce: the run's start and verdict lines (the start partition reads the snapshot taken when
 the run starts, the verdict's the state after the CHECKSUM pass), the Options' per-reason
 CHECKSUM lists and hint, the report's gates and notices, the Cut over click's re-checks and
@@ -26,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import dsql_migrator.ui.cutover as uic
 import dsql_migrator.ui.validation as uiv
 from dsql_migrator.core.models import ValidationMode
 
@@ -38,8 +40,9 @@ _KIND = {
 
 @pytest.fixture
 def built(monkeypatch):
-    """Every gate ``ui/validation.py`` builds: ``(kind, positional count, cdc_in_use,
-    release, summary given, check)`` in build order (``check`` as the builder sees it)."""
+    """Every gate ``ui/validation.py`` and ``ui/cutover.py`` build: ``(kind, positional count,
+    cdc_in_use, release, summary given, check)`` in build order (``check`` as the builder sees
+    it)."""
     calls: list = []
     for name, kind in _KIND.items():
         real = getattr(uiv, name)
@@ -50,7 +53,8 @@ def built(monkeypatch):
                           kwargs["summary"] is not None, check))
             return _real(*args, **kwargs)
 
-        monkeypatch.setattr(uiv, name, _recording)
+        for module in (uiv, uic):
+            monkeypatch.setattr(module, name, _recording)
     return calls
 
 
@@ -386,7 +390,7 @@ def _expected(kind, gate, running, with_dict, waive, check):
         out += [("button", "Check again", "refresh", check),
                 ("props", "Check again", "no-caps color=primary")]
         if running or not gate.has_source_connection or (
-                kind == "g4" and gate.probe_state == uiv.G4_PROBE_NO_BASELINE):
+                kind == "g4" and gate.probe_state == uic.G4_PROBE_NO_BASELINE):
             out.append(("props", "Check again", "disable"))
         if with_dict:
             out.append(("captured",))
@@ -398,16 +402,16 @@ def test_the_held_probe_gate_renders_follow_their_rule(monkeypatch, kind) -> Non
     events: list = []
     for name, slot in zip(_NOTICES[kind], ("open", "pending", "must", "waivable")):
         monkeypatch.setattr(
-            uiv, name,
+            uic, name,
             lambda gate, _slot=slot: (f"{kind} {_slot} header", f"{kind} {_slot} body")
             if gate.parts[_slot] else None)
-    monkeypatch.setattr(uiv, "render_notice",
+    monkeypatch.setattr(uic, "render_notice",
                         lambda _ui, *, tone, header, body="", **_k:
                         events.append(("notice", tone, header, body)))
-    render = getattr(uiv, _RENDER[kind])
+    render = getattr(uic, _RENDER[kind])
     flags = itertools.product(*([(False, True)] * 8))
     for opened, pending, must, waivable, can_waive, source, running, with_dict in flags:
-        for state in (None, uiv.G4_PROBE_NO_BASELINE):
+        for state in (None, uic.G4_PROBE_NO_BASELINE):
             gate = SimpleNamespace(
                 parts={"open": opened, "pending": pending, "must": must, "waivable": waivable},
                 can_waive=can_waive, has_source_connection=source, probe_state=state)
@@ -553,29 +557,40 @@ def _loads_by_function(tree, names):
     return found
 
 
-def test_every_gate_is_built_through_cdc_gates_but_the_cut_over_block() -> None:
-    import ast
+def _sources():
+    """Validation's and Cut over's modules (Cut over moved to ``ui/cutover.py``): read together,
+    as the one ``ui/validation.py`` these checks were written over."""
     import inspect
 
-    loads = _loads_by_function(ast.parse(inspect.getsource(uiv)), set(_KIND))
-    # The cut-over render block's three gates wait for VAL-1 (the Cut over move).
+    return [inspect.getsource(module) for module in (uiv, uic)]
+
+
+def _loads_in_sources(names):
+    import ast
+
+    loads: dict = {}
+    for source in _sources():
+        for where, count in _loads_by_function(ast.parse(source), names).items():
+            loads[where] = loads.get(where, 0) + count
+    return loads
+
+
+def test_every_gate_is_built_through_cdc_gates_but_the_cut_over_block() -> None:
+    loads = _loads_in_sources(set(_KIND))
+    # The cut-over render block's three gates moved with Cut over (VAL-1), as they were.
     assert loads == {"_cdc_gates._build": 3, "build_cutover_screen.content": 3}
 
 
 def test_every_forced_checksum_split_goes_through_the_partition() -> None:
-    import ast
-    import inspect
-
-    loads = _loads_by_function(ast.parse(inspect.getsource(uiv)),
-                               {"forced_checksum_partition"})
+    loads = _loads_in_sources({"forced_checksum_partition"})
     assert loads == {
         "build_validation_screen.runner.work": 2,  # the run's start line, its verdict line
         "build_validation_screen._forced_checksum_scopes": 1,  # the Options' lists
     }
-    source = inspect.getsource(uiv)
-    for gone in ("_ledger_at_start", "_ledger_done", "_cdc_checksum_scope",
-                 "_validation_dlq_gate", "_validation_ri_gate", "_validation_g4_gate"):
-        assert gone not in source, gone
+    for source in _sources():
+        for gone in ("_ledger_at_start", "_ledger_done", "_cdc_checksum_scope",
+                     "_validation_dlq_gate", "_validation_ri_gate", "_validation_g4_gate"):
+            assert gone not in source, gone
 
 
 def test_the_two_held_gate_renders_are_one() -> None:

@@ -966,7 +966,7 @@ def _cutover(monkeypatch, *, selected, report_tables, mtype=MigrationType.FULL_L
     import types
 
     from dsql_migrator.core.models import AssessmentReport, TargetInventory
-    from dsql_migrator.ui import validation as uiv
+    from dsql_migrator.ui import cutover as uic
     from dsql_migrator.ui.data_migration import DataMigrationStore
     from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
     from dsql_migrator.ui.session import SessionStore
@@ -986,8 +986,8 @@ def _cutover(monkeypatch, *, selected, report_tables, mtype=MigrationType.FULL_L
     fake = types.ModuleType("nicegui")
     fake.ui = ui
     monkeypatch.setitem(sys.modules, "nicegui", fake)
-    monkeypatch.setattr(uiv, "_cdc_in_use", lambda _s: False)
-    monkeypatch.setattr(uiv, "_cutover_pending_foreign_keys", lambda *a, **k: 0)
+    monkeypatch.setattr(uic, "_cdc_in_use", lambda _s: False)
+    monkeypatch.setattr(uic, "_cutover_pending_foreign_keys", lambda *a, **k: 0)
     sessions = SessionStore()
     session = sessions.get_or_create("s1")
     session.set_workflow(with_status(session.workflow, WorkflowStep.FULL_LOAD, full_load))
@@ -1160,19 +1160,20 @@ def test_the_read_forwards_the_selection_and_an_empty_one_is_every_table() -> No
 def test_the_cut_over_fill_forwards_the_migration_selection(monkeypatch) -> None:
     # The app's wiring: without it a dropped DEFAULT on a table no longer selected would be
     # restored automatically -- a DDL write to a table the migration left as is.
+    import dsql_migrator.ui.cutover as uic
     import dsql_migrator.ui.data_migration._models as models
-    import dsql_migrator.ui.validation as uiv
     from dsql_migrator.ui.cutover_defaults import NOT_SELECTED_REASON
 
     from tests.test_cutover_defaults import D1, TARGET
 
     monkeypatch.setattr(models, "effective_target_ddls", lambda *a, **k: {"app.t": D1})
-    monkeypatch.setattr(uiv, "session_exclusion_split",
+    # Validation's helper, read by the cut-over fill where it now lives (ui/cutover.py).
+    monkeypatch.setattr(uic, "session_exclusion_split",
                         lambda *a, **k: ({}, {"app.t": frozenset({"a"})}, {}))
     mstate = SimpleNamespace(selection=TableSelection(selected_tables=["app.other"]))
 
     def fill(generation):
-        (item,) = uiv._fill_cutover_defaults(
+        (item,) = uic._fill_cutover_defaults(
             SimpleNamespace(target_config=TARGET), mstate, None, None, _cd_ledger(), None,
             fill_key="k", generation=generation, facts_reader=_cd_facts).items
         return item

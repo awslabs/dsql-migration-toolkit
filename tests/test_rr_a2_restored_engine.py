@@ -130,7 +130,7 @@ def test_cut_over_holds_no_mysql_cdc_key_for_a_restored_postgresql_session():
 
 
 def test_the_cut_over_foreign_key_pass_converts_a_restored_session_as_postgresql(monkeypatch):
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     import dsql_migrator.ui.schema_conversion as schema_conversion
     from dsql_migrator.ui.validation import ValidationState, _run_cutover_foreign_keys
 
@@ -153,7 +153,7 @@ def test_the_cut_over_foreign_key_pass_converts_a_restored_session_as_postgresql
         return (1, 0, 0)
 
     monkeypatch.setattr(schema_conversion, "applied_table_conversions", _spy)
-    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uic, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr("dsql_migrator.core.target_connection.DsqlConnector",
                         lambda *_a, **_k: SimpleNamespace(connect=lambda: object()))
     state = ValidationState()

@@ -23317,9 +23317,11 @@ def test_cutover_does_not_claim_foreign_keys_were_applied_automatically() -> Non
     # so someone who never clicked it, or clicked Stop, was told integrity was in place.
     import inspect
 
+    import dsql_migrator.ui.cutover as c
     import dsql_migrator.ui.validation as v
 
-    src = inspect.getsource(v)
+    # The Cut over screen is ui/cutover.py, split out of ui/validation.py: both are read.
+    src = inspect.getsource(v) + inspect.getsource(c)
     assert "were applied automatically at the" not in src, (
         "the cut-over copy still asserts the load applied the foreign keys"
     )
@@ -28309,6 +28311,7 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
     # sanctioned read.
     import re
 
+    from dsql_migrator.ui import cutover as uicut
     from dsql_migrator.ui import validation as uival
 
     engine_read = re.compile(
@@ -28318,8 +28321,10 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
         r"|\bsource_config\s*,\s*[\"']source_type[\"']"
     )
     screen = inspect.getsource(dm.build_data_migration_screen)
-    cut_over = inspect.getsource(uival)
-    for where, src in (("build_data_migration_screen", screen), ("ui/validation.py", cut_over)):
+    # Validation and Cut over (ui/cutover.py, split out of ui/validation.py), read together.
+    cut_over = inspect.getsource(uival) + inspect.getsource(uicut)
+    for where, src in (("build_data_migration_screen", screen),
+                       ("ui/validation.py + ui/cutover.py", cut_over)):
         assert not engine_read.findall(src), (
             f"{where}: an engine read bypasses session_source_type; a restored PostgreSQL "
             f"session would be treated as MySQL: {engine_read.findall(src)}"

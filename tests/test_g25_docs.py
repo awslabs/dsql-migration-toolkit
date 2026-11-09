@@ -566,7 +566,7 @@ _RUNBOOK_WAIT = {
 def test_the_cut_over_runbook_waits_five_minutes_after_the_last_source_write(lang: str) -> None:
     # confirmed[5], [8]: a held change is dead-lettered only when its wait ends, so the final
     # drain waits at least that long; the docs say what the UI runbook (step 3) says.
-    ui = (ROOT / "src" / "dsql_migrator" / "ui" / "validation.py").read_text(encoding="utf-8")
+    ui = (ROOT / "src" / "dsql_migrator" / "ui" / "cutover.py").read_text(encoding="utf-8")
     assert "at least 5 minutes after " in ui and "the last source write" in ui
     assert _has(lang, _page(lang, "10-conclusion.md"), _RUNBOOK_WAIT[lang]), lang
     assert _has(lang, _page(lang, "05-validation.md"), "§10.3"), lang

@@ -177,6 +177,7 @@ def test_every_path_reads_the_effective_set_not_the_raw_one():
     raw = "migration_state.lob_exclusions()"
     assert raw not in (root / "_cdc_ui.py").read_text(encoding="utf-8")
     assert raw not in (ui / "validation.py").read_text(encoding="utf-8")
+    assert raw not in (ui / "cutover.py").read_text(encoding="utf-8")  # split out of it
     init = (root / "__init__.py").read_text(encoding="utf-8")
     assert init.count("excluded_lob_columns=effective_lob_exclusions(") == 3
     assert init.count(raw) == 0  # the run guard reads state.lob_exclusions() on its own name

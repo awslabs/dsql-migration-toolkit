@@ -1864,12 +1864,12 @@ def test_validation_verdict_is_failure_on_mismatch(monkeypatch) -> None:
 
 def test_cut_over_acknowledgement_is_logged(monkeypatch) -> None:
     """Clicking "I've cut over" records the journey's conclusion + release state."""
-    from dsql_migrator.ui import validation as _v
+    from dsql_migrator.ui import cutover as _c
     from dsql_migrator.ui.session import SessionStore
 
     captured: list[dict] = []
     monkeypatch.setattr(
-        _v, "log_activity",
+        _c, "log_activity",
         lambda category, action, **kw: captured.append({"action": action, **kw}),
     )
 
@@ -1882,7 +1882,7 @@ def test_cut_over_acknowledgement_is_logged(monkeypatch) -> None:
     vstate = validation_store.get_or_create(session_id)
     vstate.set_result(_report(matched=True))
 
-    _content, runner = _v.build_cutover_screen(
+    _content, runner = _c.build_cutover_screen(
         store, session_id, validation_store=validation_store, job_manager=manager,
     )
     runner()
@@ -1900,12 +1900,12 @@ def test_cut_over_acknowledgement_is_logged(monkeypatch) -> None:
 
 def test_cut_over_acknowledgement_states_a_waiver(monkeypatch) -> None:
     # The loudest of the four situations: the operator went live with integrity unenforced.
-    from dsql_migrator.ui import validation as _v
+    from dsql_migrator.ui import cutover as _c
     from dsql_migrator.ui.session import SessionStore
 
     captured: list[dict] = []
     monkeypatch.setattr(
-        _v, "log_activity",
+        _c, "log_activity",
         lambda category, action, **kw: captured.append({"action": action, **kw}),
     )
     session_id = "cutover2"
@@ -1915,7 +1915,7 @@ def test_cut_over_acknowledgement_states_a_waiver(monkeypatch) -> None:
     vstate.set_result(_report(matched=True))
     vstate.proceed_without_foreign_keys = True
 
-    _content, runner = _v.build_cutover_screen(
+    _content, runner = _c.build_cutover_screen(
         store, session_id, validation_store=validation_store, job_manager=JobManager(),
     )
     runner()
@@ -2501,6 +2501,7 @@ def test_cutover_section_renders_error_when_a_sync_failed() -> None:
     # error notice (do-not-cut-over), never the green success line (audit finding D2).
     import inspect
 
+    from dsql_migrator.ui import cutover
     from dsql_migrator.ui import validation as val
 
     src = inspect.getsource(val._render_cutover_section)
@@ -2510,8 +2511,8 @@ def test_cutover_section_renders_error_when_a_sync_failed() -> None:
     # And a failed sync renders an error notice with a do-not-cut-over header.
     assert "do not cut over yet" in src
     assert 'tone="error"' in src
-    # The screen threads the failed map into the render.
-    module_src = inspect.getsource(val)
+    # The screen (ui/cutover.py) threads the failed map into the render.
+    module_src = inspect.getsource(cutover)
     assert "identity_sync_failed=validation_state.cutover_identity_sync_failed" in module_src
 
 
@@ -2930,7 +2931,7 @@ def test_cutover_section_fk_block_warns_on_orphans() -> None:
 def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TargetConnectionConfig,
     )
@@ -2965,7 +2966,7 @@ def test_run_cutover_foreign_keys_applies_and_records(monkeypatch) -> None:
         captured["child_pk_columns"] = child_pk_columns
         return (1, 0, 0)
 
-    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uic, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr(
         "dsql_migrator.core.target_connection.DsqlConnector",
         lambda *a, **k: SimpleNamespace(connect=lambda: object()),
@@ -6033,7 +6034,7 @@ def _cutover_fk_fixtures(monkeypatch, result=(1, 0, 0)):
     """Session/stores/patches for driving _run_cutover_foreign_keys. Returns captured kwargs."""
     from types import SimpleNamespace
 
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TargetConnectionConfig,
     )
@@ -6063,7 +6064,7 @@ def _cutover_fk_fixtures(monkeypatch, result=(1, 0, 0)):
             kw["on_progress"](1, 3)
         return result
 
-    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uic, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr(
         "dsql_migrator.core.target_connection.DsqlConnector",
         lambda *a, **k: SimpleNamespace(connect=lambda: object()),
@@ -6644,12 +6645,16 @@ def test_both_verdict_and_cutover_lines_carry_the_disclosure() -> None:
     import ast
     import inspect
 
+    from dsql_migrator.ui import cutover
     from dsql_migrator.ui import validation as val
 
-    tree = ast.parse(inspect.getsource(val))
+    # The verdict line is Validation's (ui/validation.py), the acknowledgement Cut over's
+    # (ui/cutover.py): both modules are read.
+    sources = [inspect.getsource(module) for module in (val, cutover)]
     callers = {
         node.name
-        for node in ast.walk(tree)
+        for source in sources
+        for node in ast.walk(ast.parse(source))
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and any(
             isinstance(c, ast.Call)
@@ -6659,7 +6664,7 @@ def test_both_verdict_and_cutover_lines_carry_the_disclosure() -> None:
         )
     }
     assert callers, "verdict_evidence_caveats is never called"
-    src = inspect.getsource(val)
+    src = "".join(sources)
     # Both log details must be built from it.
     for marker in ("NOT covered:", "NOT covered by validation:"):
         assert marker in src, f"{marker} missing -- a verdict line is not disclosing"
@@ -6722,9 +6727,9 @@ def test_the_cutover_ack_passes_both_ambiguity_predicates() -> None:
     """Wiring: the new branches are dead unless the ack line supplies them."""
     import inspect
 
-    from dsql_migrator.ui import validation as val
+    from dsql_migrator.ui import cutover
 
-    src = inspect.getsource(val)
+    src = inspect.getsource(cutover)  # the ack line is the Cut over screen's
     assert "inputs_missing=_cutover_gate_inputs_missing(" in src
     assert "fks_stripped=_cutover_foreign_keys_stripped(" in src
 
@@ -6791,7 +6796,7 @@ def test_cutover_pending_foreign_keys_counts_only_the_migrated_selection() -> No
 def test_run_cutover_foreign_keys_never_alters_a_table_outside_the_selection(monkeypatch) -> None:
     from types import SimpleNamespace
 
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     from dsql_migrator.core.models import (
         SourceConnectionConfig, SourceType, TableSelection, TargetConnectionConfig,
     )
@@ -6807,7 +6812,7 @@ def test_run_cutover_foreign_keys_never_alters_a_table_outside_the_selection(mon
         captured.append(sorted(t for t, c in conversions.items() if c.foreign_key_ddls))
         return (len(captured[-1]), 0, 0)
 
-    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", _fake_apply)
+    monkeypatch.setattr(uic, "apply_preserved_foreign_keys", _fake_apply)
     monkeypatch.setattr("dsql_migrator.core.target_connection.DsqlConnector",
                         lambda *a, **k: SimpleNamespace(connect=lambda: object()))
     for tables, expected in ((["plain"], []), (["plain", "orders"], ["orders"]), (None, ["orders"])):
@@ -8529,8 +8534,11 @@ def test_postgres_drift_explains_why_it_is_not_compared() -> None:
     assert tone == "info"
     assert "advances its WAL LSN on its own" in body
     assert "did not report" not in body
-    # Both screens hand the session's engine in (the persisted report has no engine field).
-    src = inspect.getsource(v)
+    # Both screens hand the session's engine in (the persisted report has no engine field):
+    # Validation's (ui/validation.py) and Cut over's (ui/cutover.py).
+    from dsql_migrator.ui import cutover
+
+    src = inspect.getsource(v) + inspect.getsource(cutover)
     assert 'postgres_source=_source_engine_word(session) == "PostgreSQL"' in src
     assert 'format_drift(report, postgres_source=engine == "PostgreSQL")' in src
 

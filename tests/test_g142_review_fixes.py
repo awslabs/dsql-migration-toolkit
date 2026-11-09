@@ -113,6 +113,7 @@ class _TimerUi(_Ui):
 def _screen(monkeypatch, *, jobs=None, cascade=True, edited=None, cdc=True, inputs=None):
     """Cut over for a MySQL CDC migration of ``_cutover_inputs`` (or ``inputs``) with a
     clean verdict."""
+    import dsql_migrator.ui.cutover as uic
     import dsql_migrator.ui.validation as uiv
     from dsql_migrator.core.models import (
         SourceType,
@@ -134,11 +135,13 @@ def _screen(monkeypatch, *, jobs=None, cascade=True, edited=None, cdc=True, inpu
     fake = types.ModuleType("nicegui")
     fake.ui = ui
     monkeypatch.setitem(sys.modules, "nicegui", fake)
-    monkeypatch.setattr(uiv, "_cdc_in_use", lambda _s: cdc)
-    monkeypatch.setattr(uiv, "render_notice", lambda _ui, **kw: (
+    # The screen (ui/cutover.py) reads it, and so do the CDC gates it builds (ui/validation.py).
+    for module in (uic, uiv):
+        monkeypatch.setattr(module, "_cdc_in_use", lambda _s: cdc)
+    monkeypatch.setattr(uic, "render_notice", lambda _ui, **kw: (
         ui.texts.append(kw.get("header", "")), ui.texts.append(kw.get("body", ""))))
     logged: list = []
-    monkeypatch.setattr(uiv, "log_activity", lambda _c, action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(uic, "log_activity", lambda _c, action, **kw: logged.append((action, kw)))
     sessions = SessionStore()
     live = sessions.get_or_create("s1")
     live.set_target(session_obj.target_config)
@@ -458,7 +461,7 @@ def test_a_renamed_key_keeps_its_own_cascade_and_loose_text_key_for_cdc() -> Non
 
 
 def test_the_cut_over_pass_shows_running_at_once_and_its_result_at_its_end(monkeypatch) -> None:
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     from dsql_migrator.core.models import SourceType
     from dsql_migrator.ui.validation import ValidationState
 
@@ -468,8 +471,8 @@ def test_the_cut_over_pass_shows_running_at_once_and_its_result_at_its_end(monke
     vstate.set_cutover_fk_apply((1, 0, 0))  # an earlier pass
     jobs = _Jobs()
     seen: list = []
-    monkeypatch.setattr(uiv, "apply_preserved_foreign_keys", lambda *_a, **_k: (0, 0, 1))
-    uiv._run_cutover_foreign_keys(
+    monkeypatch.setattr(uic, "apply_preserved_foreign_keys", lambda *_a, **_k: (0, 0, 1))
+    uic._run_cutover_foreign_keys(
         session_obj, vstate, eval_store=eval_store, conversion_store=conv_store,
         session_id="s1", job_manager=jobs, refresh=lambda: seen.append(vstate.cutover_fk_apply),
     )

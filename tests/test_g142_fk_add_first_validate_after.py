@@ -854,7 +854,7 @@ def test_the_cut_over_screen_holds_finish_on_an_unvalidated_cascade_key(monkeypa
     import sys
     import types
 
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     from dsql_migrator.core.models import (
         SourceType,
         TableValidationResult,
@@ -871,12 +871,12 @@ def test_the_cut_over_screen_holds_finish_on_an_unvalidated_cascade_key(monkeypa
     fake = types.ModuleType("nicegui")
     fake.ui = ui
     monkeypatch.setitem(sys.modules, "nicegui", fake)
-    monkeypatch.setattr(uiv, "_cdc_in_use", lambda _s: True)
+    monkeypatch.setattr(uic, "_cdc_in_use", lambda _s: True)
     notices: list = []
-    monkeypatch.setattr(uiv, "render_notice", lambda _ui, **kw: (
+    monkeypatch.setattr(uic, "render_notice", lambda _ui, **kw: (
         notices.append(kw), ui.texts.append(kw.get("header", "")), ui.texts.append(kw.get("body", ""))))
     logged: list = []
-    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(uic, "log_activity", lambda cat, action, **kw: logged.append((action, kw)))
     sessions = SessionStore()
     live = sessions.get_or_create("s1")
     live.set_target(session_obj.target_config)

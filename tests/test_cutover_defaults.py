@@ -475,6 +475,7 @@ class _Jobs:
 
 def _click(*, cdc=False, drained=True, jobs=None, snap=None, request=None, mstate=None, restore=None,
            probe=None, ledger=None):
+    import dsql_migrator.ui.cutover as uic
     import dsql_migrator.ui.validation as uiv
 
     state = _vstate()
@@ -491,15 +492,15 @@ def _click(*, cdc=False, drained=True, jobs=None, snap=None, request=None, mstat
     mstate = mstate or SimpleNamespace(job_id=None, cdc_action_kind=None, cdc_deploy_job_id=None,
                                        cdc_stack_name="cdc", cdc_deploy_role_arn=None)
     jobs = jobs if jobs is not None else _Jobs()
-    orig = uiv._cdc_in_use
-    uiv._cdc_in_use = lambda _s: cdc
+    orig = uic._cdc_in_use
+    uic._cdc_in_use = lambda _s: cdc
     try:
         uiv._run_cutover_default_restore(
             session, state, mstate, request=request, overlay_ledger=ledger, job_manager=jobs,
             refresh=lambda: refreshes.append(1), notify=lambda m, **k: notes.append(m),
             settle_probe=probe, restore=restore or _Restore(), connection_factory=lambda: None)
     finally:
-        uiv._cdc_in_use = orig
+        uic._cdc_in_use = orig
     return state, jobs, notes, ledger
 
 
@@ -540,31 +541,31 @@ def test_the_click_time_gates(case):
 
 
 def test_a_click_submits_one_job_that_records_the_outcome(monkeypatch):
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
 
     logged = []
-    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw.get("status"))))
+    monkeypatch.setattr(uic, "log_activity", lambda cat, action, **kw: logged.append((action, kw.get("status"))))
     state, jobs, notes, ledger = _click()
     assert notes == [] and len(jobs.submitted) == 1 and state.cutover_default_restore_job_id == "job-1"
     gen_before = state.cutover_defaults
     jobs.submitted[0](_Handle())
     assert state.cutover_default_restore_outcome.restored == ("app.t.a",)
     assert state.cutover_defaults is None and gen_before is not None  # re-read after the job
-    assert ("excluded-column DEFAULTs restored (cut-over)", uiv.ActivityStatus.SUCCESS) in logged
+    assert ("excluded-column DEFAULTs restored (cut-over)", uic.ActivityStatus.SUCCESS) in logged
 
 
 def test_a_settle_refusal_clears_the_attestation_and_logs_a_warning(monkeypatch):
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
 
     logged = []
-    monkeypatch.setattr(uiv, "log_activity", lambda cat, action, **kw: logged.append((action, kw.get("status"))))
+    monkeypatch.setattr(uic, "log_activity", lambda cat, action, **kw: logged.append((action, kw.get("status"))))
     restore = _Restore()
     state, jobs, _n, _l = _click(cdc=True, drained=True, restore=restore,
                                  probe=lambda: "cdc-debezium-source is CREATING")
     jobs.submitted[0](_Handle())
     assert restore.calls == [] and state.cutover_cdc_drained_confirmed is False
     assert state.cutover_default_restore_outcome.refused_by_settle
-    assert ("excluded-column DEFAULTs not restored (cut-over)", uiv.ActivityStatus.WARNING) in logged
+    assert ("excluded-column DEFAULTs not restored (cut-over)", uic.ActivityStatus.WARNING) in logged
 
 
 def test_a_per_row_click_restores_only_that_manual_row():
@@ -713,7 +714,7 @@ def _screen(monkeypatch, *, ledger, cdc=False, fk_pending=0):
     import sys
     import types
 
-    import dsql_migrator.ui.validation as uiv
+    import dsql_migrator.ui.cutover as uic
     from dsql_migrator.core.models import TableValidationResult, ValidationMode, ValidationReport
     from dsql_migrator.ui.data_migration import DataMigrationStore
     from dsql_migrator.ui.session import SessionStore
@@ -742,10 +743,10 @@ def _screen(monkeypatch, *, ledger, cdc=False, fk_pending=0):
     fake = types.ModuleType("nicegui")
     fake.ui, fake.run = recorder, _Run
     monkeypatch.setitem(sys.modules, "nicegui", fake)
-    monkeypatch.setattr(uiv, "_cdc_in_use", lambda _s: cdc)
-    monkeypatch.setattr(uiv, "_cutover_pending_foreign_keys", lambda *a, **k: fk_pending)
+    monkeypatch.setattr(uic, "_cdc_in_use", lambda _s: cdc)
+    monkeypatch.setattr(uic, "_cutover_pending_foreign_keys", lambda *a, **k: fk_pending)
     applied = []
-    monkeypatch.setattr(uiv, "_run_cutover_foreign_keys", lambda *a, **k: applied.append(1))
+    monkeypatch.setattr(uic, "_run_cutover_foreign_keys", lambda *a, **k: applied.append(1))
     sessions = SessionStore()
     session = sessions.get_or_create("s1")
     session.set_target(TARGET)

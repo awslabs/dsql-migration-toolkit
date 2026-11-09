@@ -79,10 +79,10 @@ from dsql_migrator.ui.query_playground import (
 )
 from dsql_migrator.ui.validation import (
     ValidationStore,
-    build_cutover_screen,
     build_validation_screen,
     validation_run_guard_reason,
 )
+from dsql_migrator.ui.cutover import build_cutover_screen
 from dsql_migrator.ui.workflow import (
     OptionalTool,
     WorkflowStep,

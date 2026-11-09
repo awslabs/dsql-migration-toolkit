@@ -359,6 +359,7 @@ class _Cutover:
     def __init__(self, monkeypatch, *, cdc=True, mtype="FULL_LOAD_AND_CDC", with_store=True,
                  ops_start=True):
         import dsql_migrator.core.activity_log as act
+        import dsql_migrator.ui.cutover as uic
         import dsql_migrator.ui.validation as uiv
         from dsql_migrator.ui.data_migration import DataMigrationStore, MigrationType
         from dsql_migrator.ui.session import SessionStore
@@ -408,19 +409,23 @@ class _Cutover:
         fake = types.ModuleType("nicegui")
         fake.ui, fake.run = self.ui, _Run
         monkeypatch.setitem(sys.modules, "nicegui", fake)
-        monkeypatch.setattr(uiv, "_cdc_in_use", lambda _s: cdc)
-        monkeypatch.setattr(uiv, "_cutover_pending_foreign_keys", lambda *a, **k: 0)
-        monkeypatch.setattr(uiv, "_cutover_gate_inputs_missing", lambda *a, **k: False)
+        # Cut over (ui/cutover.py) and what it calls in ui/validation.py (_cdc_gates, the
+        # renders both steps share) each read the name in their own module: both are patched.
+        for module in (uic, uiv):
+            monkeypatch.setattr(module, "_cdc_in_use", lambda _s: cdc)
+        monkeypatch.setattr(uic, "_cutover_pending_foreign_keys", lambda *a, **k: 0)
+        monkeypatch.setattr(uic, "_cutover_gate_inputs_missing", lambda *a, **k: False)
         self.notices: list[dict] = []
 
         def _notice(_ui, *, tone, header, body="", **_k):
             self.notices.append({"tone": tone, "header": header, "body": body})
             self.ui.texts.extend([header, body])
 
-        monkeypatch.setattr(uiv, "render_notice", _notice)
+        for module in (uic, uiv):
+            monkeypatch.setattr(module, "render_notice", _notice)
         self.logged: list[tuple] = []
         _log = lambda _cat, action, **kw: self.logged.append((action, kw))  # noqa: E731
-        monkeypatch.setattr(uiv, "log_activity", _log)
+        monkeypatch.setattr(uic, "log_activity", _log)
         monkeypatch.setattr(act, "log_activity", _log)
         self.reads: list[int] = []
         self.next_read = None

@@ -168,6 +168,7 @@ def _floors(monkeypatch, values):
 
 
 def _cutover_screen(monkeypatch, *, report, sync, logged, mtype=MigrationType.FULL_LOAD_AND_CDC):
+    from dsql_migrator.ui import cutover as uic
     from dsql_migrator.ui import validation as uiv
     from dsql_migrator.ui.data_migration import DataMigrationStore
     from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
@@ -179,7 +180,7 @@ def _cutover_screen(monkeypatch, *, report, sync, logged, mtype=MigrationType.FU
     fake = types.ModuleType("nicegui")
     fake.ui = ui  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "nicegui", fake)
-    monkeypatch.setattr(uiv, "log_activity", lambda _c, action, **kw: logged.append((action, kw)))
+    monkeypatch.setattr(uic, "log_activity", lambda _c, action, **kw: logged.append((action, kw)))
     sessions = SessionStore()
     session = sessions.get_or_create("s1")
     session.set_target(_TARGET)
@@ -616,6 +617,7 @@ def test_a_narrowed_set_turning_done_syncs_its_loaded_tables_above_the_source_co
 def _standalone_screen(monkeypatch, mtype, *, postgres=True, logged=None):
     from dsql_migrator.core.assessor_postgres import standalone_sequence_items
     from dsql_migrator.core.catalog_postgres import StandaloneSequence
+    from dsql_migrator.ui import cutover as uic
     from dsql_migrator.ui import validation as uiv
     from dsql_migrator.ui.evaluation import EvaluationResult, EvaluationStore
     from dsql_migrator.ui.schema_conversion import SchemaConversionStore
@@ -629,7 +631,7 @@ def _standalone_screen(monkeypatch, mtype, *, postgres=True, logged=None):
     fake.ui = ui  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "nicegui", fake)
     if logged is not None:
-        monkeypatch.setattr(uiv, "log_activity", lambda *a, **k: logged.append((a, k)))
+        monkeypatch.setattr(uic, "log_activity", lambda *a, **k: logged.append((a, k)))
     # The entity table has a plain bigint key the application fills from orders_seq, a
     # Hibernate-style sequence (INCREMENT BY 50) that no column owns.
     inventory = SourceInventory(tables=[TableDef(
