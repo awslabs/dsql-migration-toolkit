@@ -2739,8 +2739,8 @@ def build_schema_conversion_screen(
                 existence_checker = None
                 _derived_checker_state["snapshot"] = None
             # AI candidates: the objects the assessment flagged MANUAL/UNSUPPORTED,
-            # and only while AI is usable (_render_preview adds the objects the
-            # conversion could not convert). AI help is the AI DBA chat, per object
+            # and only while AI is usable (_render_preview_expansion adds the objects
+            # the conversion could not convert). AI help is the AI DBA chat, per object
             # rather than a separate section, and a reply becomes an object's target
             # DDL only through the chat's "Use as target DDL", as an edit.
             assessment = (

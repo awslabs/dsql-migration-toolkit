@@ -4,12 +4,13 @@
 """AI-led migration assessment that augments the deterministic assessment.
 
 The :class:`AssessmentStrategist` uses Amazon Bedrock to act as a "senior
-migration analyst": grounded on the already-extracted source inventory, the
+migration analyst", grounded on the already-extracted source inventory, the
 deterministic :class:`~dsql_migrator.core.models.AssessmentReport` (the factual
-backbone), the target DSQL catalog, and the known Aurora DSQL constraints, it
-produces an :class:`~dsql_migrator.core.models.AiAssessmentReport` with an
-overall migration strategy, per-object expert insights, and additional advisory
-findings the static rules did not catch (Requirement 11).
+backbone), the target DSQL catalog, and the known Aurora DSQL constraints
+(Requirement 11). The app uses it for the AI DBA panel's chats
+(:meth:`AssessmentStrategist.stream_chat`, :meth:`AssessmentStrategist.tool_chat`);
+its one-shot Markdown report methods (``generate`` / ``try_generate`` and the
+per-object guidance ones) have no caller in the app.
 
 Design guarantees (consistent with the existing AI-assist path):
 
@@ -24,7 +25,7 @@ Design guarantees (consistent with the existing AI-assist path):
   defensively -- an empty or malformed reply degrades to an unavailable outcome
   -- and reply and tool-result sizes are capped.
 - **Graceful degradation** (Requirement 11.10): :meth:`AssessmentStrategist.try_generate`
-  never raises; on any Bedrock failure or unparseable output it returns an
+  never raises; on any Bedrock failure or an empty reply it returns an
   unavailable :class:`AiAssessmentOutcome` so the deterministic report still
   stands alone.
 - **Credential confidentiality** (Property 7): the Bedrock client uses IAM auth
@@ -87,7 +88,7 @@ def source_engine_word(source_type: Optional["SourceType"]) -> str:
 # (Verified: a tuning turn burned an entire 1536-token cap on thinking alone and
 # produced no text.) Keep them generous.
 #
-# One-shot structured report (strategy + insights + findings) -- the largest output.
+# One-shot Markdown assessment report (generate / try_generate) -- the largest output.
 _ASSESSMENT_MAX_TOKENS = 8192
 
 # EVERY interactive AI DBA turn -- object guidance, plain grounded chat
@@ -331,12 +332,13 @@ def build_assessment_prompt(
     *,
     source_engine: str = "MySQL",
 ) -> str:
-    """Build the grounded prompt that asks the model for a structured report.
+    """Build the grounded prompt that asks the model for a Markdown assessment report.
 
     The prompt grounds the model on the deterministic assessment (the factual
     backbone it must respect), the source inventory shape, the target catalog,
-    and the DSQL constraints, and asks for a single JSON object so the output
-    can be parsed defensively (Requirement 11.8).
+    and the DSQL constraints, and asks for a concise GitHub-flavored Markdown
+    narrative; the reply is untrusted text, capped and rendered, never parsed
+    (Requirement 11.8).
     """
     return (
         f"You are a senior AWS database migration analyst. Analyze a {source_engine} "

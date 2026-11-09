@@ -69,10 +69,9 @@ BEDROCK_RUNTIME_SERVICE = "bedrock-runtime"
 _ANTHROPIC_VERSION = "bedrock-2023-05-31"
 _MAX_TOKENS = 1024
 
-# Upper bound on how much model output we accept. The output is untrusted data
-# (Requirement 11.8); an oversized body is truncated rather than processed in
-# full so a single suggestion cannot exhaust memory or hide content past a huge
-# prefix. A human still reviews whatever survives before anything is applied.
+# Upper bound on how much model output _extract_suggestion_text accepts. The output is
+# untrusted data (Requirement 11.8); an oversized body is truncated rather than processed
+# in full so a single reply cannot exhaust memory or hide content past a huge prefix.
 MAX_SUGGESTION_CHARS = 20_000
 
 
@@ -330,7 +329,7 @@ _UNAVAILABLE_DETAILS: dict[str, str] = {
         "deterministic workflow is unaffected. Grant scoped bedrock:InvokeModel and "
         "bedrock:InvokeModelWithResponseStream permissions for the configured model "
         "-- or, if your AWS credentials or session have expired, re-authenticate -- "
-        "then retry, or run Verify AI access on the Connect screen."
+        "then run Verify AI access on the Connect screen to turn AI assist back on."
     ),
     # "the configured model is not enabled for this AWS account yet" is word for word the
     # preflight copy's phrase and the one the docs quote, so the panel's sentence can be
@@ -344,13 +343,12 @@ _UNAVAILABLE_DETAILS: dict[str, str] = {
     ),
     "THROTTLED": (
         "AI assist is temporarily unavailable: Amazon Bedrock throttled the "
-        "request. The deterministic workflow is unaffected. Wait a minute, then ask "
-        "again."
+        "request. The deterministic workflow is unaffected. Ask again later."
     ),
     "NETWORK": (
-        "AI assist is unavailable: Amazon Bedrock could not be reached (network "
-        "error or timeout). The deterministic workflow is unaffected. Check "
-        "connectivity to the Bedrock endpoint, then ask again."
+        "AI assist is unavailable: Amazon Bedrock could not be reached or did not "
+        "answer in time. The deterministic workflow is unaffected. Ask again; if it "
+        "keeps failing, check connectivity to the Bedrock endpoint."
     ),
     "UNAVAILABLE": (
         "AI assist is unavailable: the Amazon Bedrock request failed. The "

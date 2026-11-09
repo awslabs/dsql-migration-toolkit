@@ -535,6 +535,9 @@ def test_verify_access_sends_the_access_check_prompt_as_one_user_text_turn() -> 
     [call] = client.calls
     body = json.loads(call["body"])
     assert body["max_tokens"] == 1
+    # Bedrock rejects an Anthropic messages body without its API version (ValidationException).
+    assert body["anthropic_version"] == "bedrock-2023-05-31"
+    assert body["thinking"] == {"type": "disabled"}
     [message] = body["messages"]
     assert message["role"] == "user"
     [block] = message["content"]
