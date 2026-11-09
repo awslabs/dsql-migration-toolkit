@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.585
+
+A maintenance release with no new features. A Full Load no longer logs a false warning with a traceback as it ends, and the `DSQL_MIGRATOR_STAGING_BUCKET` setting, which never had an effect, is no longer read. The rest is internal refactoring that changes no behaviour.
+
+### Fixed
+
+- **A Full Load no longer logs *Full Load final progress drain could not apply a message; continuing* with a `ValueError` traceback as it ends.** When a liveness heartbeat was still queued as the load finished, the last pass over the progress queue did not recognise it and logged this WARNING in the app's log. The row counts and the job's status were right; only the warning was false.
+
+### Changed
+
+- **`DSQL_MIGRATOR_STAGING_BUCKET` is no longer read.** It never had an effect: the Full Load streams rows straight into Aurora DSQL, with no S3 or local-file staging. A deployment that sets it can drop it, and leaving it set changes nothing. The READMEs no longer list it or describe an S3 / local-CSV staging path.
+- **Internal refactoring, with no behaviour change:** dead code removed (an unused CSV export path among it); each Aurora DSQL type limit the converter checks is defined once; one builder for the read-only source connections and one for the PostgreSQL replication slot and publication writes; the MySQL view and query expression rewriter moved to its own module; and new tests that pin the CDC sink's CloudWatch metrics to the app's reader and the IAM grant. The CloudFormation templates changed only in comments.
+
+### Upgrade notes
+
+- **App stack: an image-only update is enough.** `deploy/cloudformation.yaml` is unchanged apart from its default image and comments; there is no IAM change. Finish or stop running jobs first: the task replacement ends them.
+- **CDC infrastructure: nothing to redeploy.** The sink plugin is still v56, and the CDC stack template changed only in comments.
+- **Nothing to migrate, and going back to v0.1.584 is safe.** This version reads and writes the same Full Load records and saved sessions as v0.1.584 and accepts the same settings (v0.1.584 reads `DSQL_MIGRATOR_STAGING_BUCKET` and does nothing with it).
+
 ## v0.1.584
 
 CDC no longer dead-letters a `text` value over 1 MiB that Aurora DSQL can store: sink plugin v56 refuses a value over 1 MiB before it writes only when it is `bytea`, and sends `text` and JSON values to Aurora DSQL, which limits them by their size after its compression, as the Full Load already did. A dead letter of Aurora DSQL's own refusal of a value over that limit now gets the oversized-value remedy (**Exclude column…**) with every sink plugin from v28 (v0.1.313) on, and with v56 it names the column when the row shows which one it is. An existing CDC stack gets v56 only through Delete CDC infrastructure, then Deploy CDC infrastructure, which this release recommends for a migration whose tables hold text values over 1 MiB: until then, the stack's sink keeps dead-lettering every `text` value over 1 MiB, so CDC loses such a row's change. The manual now says how Aurora DSQL limits each type.

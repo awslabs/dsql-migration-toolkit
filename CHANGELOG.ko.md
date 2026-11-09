@@ -5,6 +5,25 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.585
+
+새 기능이 없는 유지보수 릴리스입니다. Full Load가 끝날 때 트레이스백이 붙은 거짓 경고를 더 이상 남기지 않으며, 효과가 전혀 없던 `DSQL_MIGRATOR_STAGING_BUCKET` 설정을 더 이상 읽지 않습니다. 나머지는 동작을 바꾸지 않는 내부 리팩터링입니다.
+
+### 수정
+
+- **Full Load가 끝날 때 `ValueError` 트레이스백과 함께 *Full Load final progress drain could not apply a message; continuing*을 더 이상 남기지 않습니다.** 로드가 끝나는 시점에 생존 신호(heartbeat)가 아직 큐에 남아 있으면, 진행 큐를 마지막으로 비우는 단계가 그것을 알아보지 못하고 앱 로그에 이 WARNING을 남겼습니다. 행 수와 작업 상태는 맞았고, 경고만 거짓이었습니다.
+
+### 변경
+
+- **`DSQL_MIGRATOR_STAGING_BUCKET`을 더 이상 읽지 않습니다.** 이 설정은 원래 효과가 없었습니다. Full Load는 S3나 로컬 파일 스테이징 없이 행을 Aurora DSQL로 바로 스트리밍합니다. 이 값을 설정한 배포는 지워도 되고, 그대로 두어도 달라지는 것은 없습니다. README에서도 이 설정과 S3 / 로컬 CSV 스테이징 경로에 대한 설명을 뺐습니다.
+- **동작을 바꾸지 않는 내부 리팩터링:** 죽은 코드 삭제(쓰이지 않던 CSV 내보내기 경로 포함), 변환기가 검사하는 Aurora DSQL 타입 한도를 한 곳에서 정의, 읽기 전용 소스 연결을 만드는 빌더 하나와 PostgreSQL 복제 슬롯·publication 쓰기용 빌더 하나로 통합, MySQL 뷰·쿼리 표현식 변환기를 별도 모듈로 분리, 그리고 CDC 싱크의 CloudWatch 지표를 앱의 읽기 쪽과 IAM 권한에 고정하는 테스트 추가. CloudFormation 템플릿은 주석만 바뀌었습니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 기본 이미지와 주석 말고는 그대로이고 IAM 변경은 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **CDC 인프라: 다시 배포할 것이 없습니다.** 싱크 플러그인은 여전히 v56이고, CDC 스택 템플릿은 주석만 바뀌었습니다.
+- **따로 옮길 것이 없고, v0.1.584로 되돌리는 것도 안전합니다.** 이 버전은 v0.1.584와 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받아들입니다(v0.1.584는 `DSQL_MIGRATOR_STAGING_BUCKET`을 읽지만 아무 데도 쓰지 않습니다).
+
 ## v0.1.584
 
 CDC는 이제 Aurora DSQL이 저장할 수 있는 1 MiB 초과 `text` 값을 dead-letter하지 않습니다: 싱크 플러그인 v56은 1 MiB를 넘는 값을 쓰기 전에 거부하는 것을 그 값이 `bytea`일 때로만 한정하고, `text`와 JSON 값은 Full Load가 이미 그랬듯 Aurora DSQL로 보내며, Aurora DSQL은 그 값을 압축한 뒤의 크기로 제한합니다. 그 한도를 넘는 값에 대한 Aurora DSQL 자신의 거부를 담은 dead letter는 이제 v28(v0.1.313) 이후의 모든 싱크 플러그인에서 초대형 값의 해법(**Exclude column…**)을 받으며, v56에서는 행이 어느 컬럼인지 보여 줄 때 그 컬럼을 밝힙니다. 기존 CDC 스택은 Delete CDC infrastructure 후 Deploy CDC infrastructure로만 v56을 받으며, 이 릴리스는 테이블에 1 MiB를 넘는 텍스트 값이 있는 마이그레이션에 그 재배포를 권장합니다: 그때까지 스택의 싱크는 1 MiB를 넘는 모든 `text` 값을 계속 dead-letter하므로, CDC는 그런 행의 변경을 잃습니다. 매뉴얼은 이제 Aurora DSQL이 각 타입을 어떻게 제한하는지 밝힙니다.
