@@ -42,12 +42,13 @@ from dsql_migrator.core.converter import (
 # The target kinds a MySQL TIME duration lands in: the Full Load's own set (it writes the
 # duration there as text).
 from dsql_migrator.core.exporter_mysql import _DURATION_TARGET_KINDS
-from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, TableDef
+from dsql_migrator.core.models import ColumnDef, ForeignKeyDef, SourceType, TableDef
 from dsql_migrator.core.mysql_zero_dates import (
     temporal_base,
     unmapped_columns,
     zero_date_mapping,
 )
+from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.source_dialect.base import text_safe
 
 # A length/precision/scale modifier "(N)" / "(p,s)" anywhere in a type string, used to
@@ -76,9 +77,9 @@ _CONCAT_MAX_TERMS = 96
 
 
 def _quote_mysql_identifier(name: str) -> str:
-    """Quote a MySQL identifier with backticks, escaping embedded backticks."""
-    escaped = name.replace("`", "``")
-    return f"`{escaped}`"
+    """Quote a MySQL identifier with backticks, escaping embedded backticks (the MySQL
+    dialect's ``quote_identifier``)."""
+    return dialect_for(SourceType.MYSQL).quote_identifier(name)
 
 
 def _quote_mysql_table(name: str) -> str:
@@ -88,12 +89,10 @@ def _quote_mysql_table(name: str) -> str:
     whole string as one identifier yields ``\\`database.table\\``` which MySQL
     reads as a single table in the (unset) current database -- causing "1046, No
     database selected". Split on the first dot so each part is quoted
-    independently; an unqualified name quotes as before.
+    independently; an unqualified name quotes as before. The MySQL dialect's
+    ``quote_table``.
     """
-    schema, separator, obj = name.partition(".")
-    if separator and schema and obj:
-        return f"{_quote_mysql_identifier(schema)}.{_quote_mysql_identifier(obj)}"
-    return _quote_mysql_identifier(name)
+    return dialect_for(SourceType.MYSQL).quote_table(name)
 
 
 def _text_mysql_identifier(name: str) -> str:

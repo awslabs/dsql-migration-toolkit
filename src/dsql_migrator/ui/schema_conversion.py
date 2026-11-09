@@ -85,6 +85,7 @@ from dsql_migrator.core.converter import (
     without_composite_placeholder,
 )
 from dsql_migrator.core.assessor import kind_label
+from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone
 from dsql_migrator.core.models import (
     AssessmentReport,
@@ -597,18 +598,16 @@ class DdlPreview:
 
 
 def _quote_mysql(name: str) -> str:
-    """Backtick-quote a MySQL identifier for display (doubling any backtick)."""
-    escaped = name.replace("`", "``")
-    return f"`{escaped}`"
+    """Backtick-quote a MySQL identifier for display (doubling any backtick): the MySQL
+    source dialect's ``quote_identifier``."""
+    return dialect_for(SourceType.MYSQL).quote_identifier(name)
 
 
 def _quote_mysql_table(name: str) -> str:
     """Quote a (possibly ``schema.table``) MySQL name per part for display -- one backtick
-    pair around both names a table literally called ``schema.table``."""
-    schema, sep, obj = name.partition(".")
-    if sep and schema and obj:
-        return f"{_quote_mysql(schema)}.{_quote_mysql(obj)}"
-    return _quote_mysql(name)
+    pair around both names a table literally called ``schema.table``: the MySQL source
+    dialect's ``quote_table``."""
+    return dialect_for(SourceType.MYSQL).quote_table(name)
 
 
 # The one expression default MySQL writes WITHOUT parentheses in SHOW CREATE TABLE (and

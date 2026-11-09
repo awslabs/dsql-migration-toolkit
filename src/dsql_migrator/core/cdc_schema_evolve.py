@@ -72,8 +72,6 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Union
 
-from sqlglot import exp
-
 from dsql_migrator.core.cdc_catalog_drift import (
     LiveTable,
     read_live_catalog,
@@ -86,20 +84,23 @@ from dsql_migrator.core.converter_postgres import (
     unsupported_dsql_reason,
 )
 from dsql_migrator.core.models import SourceType
-
-# Mirrors converter._quote_pg_identifier. Kept local like exporter/validator keep
-# their own MySQL quoter: the rule is one line and a local copy cannot drift out
-# from under this module's rendered DDL.
-_POSTGRES = "postgres"
+from dsql_migrator.core.source_dialect import dialect_for
 
 
 def _quote_ident(name: str) -> str:
-    """Return ``name`` as a safely double-quoted PostgreSQL/DSQL identifier."""
-    return exp.to_identifier(name, quoted=True).sql(dialect=_POSTGRES)
+    """Return ``name`` as a safely double-quoted PostgreSQL/DSQL identifier: the
+    PostgreSQL dialect's ``quote_identifier`` (the sqlglot rendering this module used
+    gives the same text for every name)."""
+    return dialect_for(SourceType.POSTGRES).quote_identifier(name)
 
 
 def _quote_qualified(name: str) -> str:
-    """Double-quote a possibly schema-qualified name as ``"schema"."table"``."""
+    """Double-quote a possibly schema-qualified name as ``"schema"."table"``.
+
+    Its own split, not the dialect's ``quote_table``: a name holding a '.' is always
+    split at the first one, so a part may be empty (``a.`` -> ``"a".""``) where
+    ``quote_table`` quotes such a name whole (``"a."``).
+    """
     if "." in name:
         schema, _, obj = name.partition(".")
         return f"{_quote_ident(schema)}.{_quote_ident(obj)}"
