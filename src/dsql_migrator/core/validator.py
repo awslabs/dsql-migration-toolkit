@@ -1908,7 +1908,7 @@ def _target_orphan_count(
     """Return the number of orphan child rows for ``fk`` on the target.
 
     Accumulated over BOUNDED keyset pages of the child's ``key`` (the key the target
-    enforces; ``None``: ``table``'s own primary key) -- :func:`_target_orphan_count_keyset`
+    enforces; ``None``: ``table``'s own primary key) -- :func:`target_orphan_count_keyset`
     for a single column, :func:`target_orphan_count_composite` for a composite key -- so a
     billion-row child never runs the orphan scan in one transaction: a single unbounded
     ``COUNT(*) ... NOT EXISTS`` would exceed Aurora DSQL's hard 300s transaction limit,
@@ -1917,7 +1917,7 @@ def _target_orphan_count(
     """
     key = pk_paging_columns(table) if key is None else tuple(key)
     if len(key) == 1:
-        return _target_orphan_count_keyset(
+        return target_orphan_count_keyset(
             connection, table.name, fk, key[0], page_size, on_page=on_page
         )
     if key:
@@ -1991,13 +1991,16 @@ def target_orphan_count_composite(
         last = boundary
 
 
-def _target_orphan_count_keyset(
+def target_orphan_count_keyset(
     connection: Any,
     child_table: str,
     fk: ForeignKeyDef,
     pk_column: str,
     page_size: int,
     on_page: Optional[Callable[[], None]] = None,
+    *,
+    page_row: Optional[Callable[[Any, Optional[dict]], Any]] = None,
+    on_orphans: Optional[Callable[[Optional[tuple]], None]] = None,
 ) -> int:
     """Accumulate the orphan count over bounded keyset pages (single-column PK).
 
@@ -2009,28 +2012,51 @@ def _target_orphan_count_keyset(
     the loop stops when a page returns fewer than ``page_size`` rows. Bounded per page, so
     it stays well under DSQL's 300s limit; a connection aged out at ~1h is handled by the
     reconnecting proxy wrapping ``connection`` (the page replays from ``WHERE pk > :last``).
-    ``last_pk`` comes back as text, bound back untyped (G141).
+    ``last_pk`` comes back as text, bound back untyped, in the column's own type (G141).
+
+    Shared by Validation's orphan check and the Full Load's foreign-key pre-gate (VAL-3),
+    with the hooks :func:`target_orphan_count_composite` has: ``page_row(statement,
+    parameters)`` runs one page (``parameters`` ``None`` for the first) and returns its row
+    in place of a cursor of ``connection`` -- the pre-gate passes its replay, so a conflict
+    re-reads that page alone from its own bound, never the pages already counted (G139);
+    ``on_orphans`` hears the cursor of the first page holding an orphan (``(last,)``, or
+    ``None`` for the first page), once (G142).
     """
     first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
     next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
-    total = 0
-    last: object = None
-    while True:
-        if on_page is not None:
-            on_page()
+
+    def _cursor_row(statement: Any, parameters: Optional[dict]) -> Any:
         cursor = connection.cursor()
         try:
-            if last is None:
-                cursor.execute(first_sql)
+            if parameters is None:
+                cursor.execute(statement)
             else:
-                cursor.execute(next_sql, {"last": last})
-            row = cursor.fetchone()
+                cursor.execute(statement, parameters)
+            return cursor.fetchone()
         finally:
             _safe_close(cursor)
+
+    run_page = page_row if page_row is not None else _cursor_row
+    total = 0
+    last: object = None
+    told = False
+    while True:
+        # A page is a real unit of work (a 3M-row child is ~600 round trips for ONE key):
+        # liveness per page, never only per key.
+        if on_page is not None:
+            on_page()
+        if last is None:
+            row = run_page(first_sql, None)
+        else:
+            row = run_page(next_sql, {"last": last})
         if row is None:
             return total
         sub_count, last_pk, count = row[0], row[1], row[2]
-        total += int(sub_count) if sub_count is not None else 0
+        found = int(sub_count) if sub_count is not None else 0
+        total += found
+        if found and not told and on_orphans is not None:
+            told = True
+            on_orphans(None if last is None else (last,))
         if count is None or int(count) < page_size:
             return total
         last = last_pk
@@ -3800,6 +3826,7 @@ __all__ = [
     "PagedReadError",
     "KEYLESS_TABLE_LIMIT_HINT",
     "target_orphan_count_composite",
+    "target_orphan_count_keyset",
     "CancelCheck",
     "SourceEngineFactory",
     "TargetConnectionFactory",

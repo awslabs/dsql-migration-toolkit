@@ -107,11 +107,7 @@ from dsql_migrator.core.overlay_ledger import (
     overlay_ledger_key,
     plan_ledger_record,
 )
-from dsql_migrator.core.validation_sql import (
-    build_orphan_count_sql,
-    build_pg_orphan_page_first_sql,
-    build_pg_orphan_page_next_sql,
-)
+from dsql_migrator.core.validation_sql import build_orphan_count_sql
 from dsql_migrator.core.models import (
     ChunkState,
     DataErrorRecord,
@@ -11253,6 +11249,7 @@ def _count_orphans(
     from dsql_migrator.core.validator import (
         _ReconnectingTargetConnection,
         target_orphan_count_composite,
+        target_orphan_count_keyset,
     )
 
     connection = _ReconnectingTargetConnection(connection_factory, sleep=sleep)
@@ -11261,9 +11258,14 @@ def _count_orphans(
             connection, lambda: read_target_primary_key(connection, child_table), sleep=sleep
         )
         if len(key) == 1:
-            return _count_orphans_keyset(
-                connection, child_table, fk, key[0], page_size,
-                on_page=on_page, sleep=sleep, on_orphans=on_orphans,
+            # Validation's pager (VAL-3); each page through _orphan_page_row, so a conflict
+            # replays that page from its own bound, never the pages already counted.
+            return target_orphan_count_keyset(
+                connection, child_table, fk, key[0], page_size, on_page=on_page,
+                page_row=lambda statement, parameters: _orphan_page_row(
+                    connection, statement, parameters, sleep=sleep
+                ),
+                on_orphans=on_orphans,
             )
         if key:
             return target_orphan_count_composite(
@@ -11346,57 +11348,6 @@ def _orphan_page_row(
                 pass
 
     return _orphan_replay(connection, _read, sleep=sleep)
-
-
-def _count_orphans_keyset(
-    connection: Any,
-    child_table: str,
-    fk: ForeignKeyDef,
-    pk_column: str,
-    page_size: int,
-    on_page: Optional[Callable[[], None]] = None,
-    *,
-    sleep: Optional[Callable[[float], None]] = None,
-    on_orphans: Optional[Callable[[Optional[tuple]], None]] = None,
-) -> int:
-    """Accumulate the orphan count over bounded keyset pages (single-column-PK child).
-
-    Each page reports ``(orphan_sub_count, last_pk, row_count)`` over an UNFILTERED PK
-    window (the orphan predicate is a ``COUNT(*) FILTER``), so ``last_pk`` advances the
-    keyset over non-orphan rows too and no PK range is skipped; it comes back as text and
-    is bound back untyped, in the column's own type (G141). Sub-counts fold into a
-    Python integer; the loop stops when a page returns fewer than ``page_size`` rows.
-    Each page runs through :func:`_orphan_page_row`, so a conflict replays that page from
-    its own bound, never the pages already counted. ``on_orphans`` hears the cursor of the
-    first page holding an orphan (``(last,)``, or ``None`` for the first page), once.
-    """
-    first_sql = build_pg_orphan_page_first_sql(child_table, fk, pk_column, page_size)
-    next_sql = build_pg_orphan_page_next_sql(child_table, fk, pk_column, page_size)
-    total = 0
-    last: object = None
-    told = False
-    while True:
-        # A page is a real unit of work, and this loop is where the pass actually spends
-        # its time: a 3M-row child is ~600 round trips for ONE foreign key. Reporting
-        # liveness only per FK (v0.1.456) still left a single FK's count silent for
-        # minutes, so a live run under an armed watchdog was reaped mid-pass.
-        if on_page is not None:
-            on_page()
-        if last is None:
-            row = _orphan_page_row(connection, first_sql, sleep=sleep)
-        else:
-            row = _orphan_page_row(connection, next_sql, {"last": last}, sleep=sleep)
-        if row is None:
-            return total
-        sub_count, last_pk, count = row[0], row[1], row[2]
-        found = int(sub_count) if sub_count is not None else 0
-        total += found
-        if found and not told and on_orphans is not None:
-            told = True
-            on_orphans(None if last is None else (last,))
-        if count is None or int(count) < page_size:
-            return total
-        last = last_pk
 
 
 def default_migrator_factory(inputs: DataMigrationInputs) -> DataMigrator:

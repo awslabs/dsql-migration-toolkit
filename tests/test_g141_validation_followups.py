@@ -216,8 +216,8 @@ def _real_child() -> tuple[_Table, _Table, ForeignKeyDef]:
 @pytest.mark.parametrize("page", [2, 7, 100])
 def test_a_real_keyed_childs_orphans_are_counted_once(page) -> None:
     child, parent, fk = _real_child()
-    assert v._target_orphan_count_keyset(_RealPg(child, parent), "app.prices", fk, "f",
-                                         page) == 270
+    assert v.target_orphan_count_keyset(_RealPg(child, parent), "app.prices", fk, "f",
+                                        page) == 270
     # The cut-over pre-check counts the same way, on its own reconnecting connection.
     assert engine._count_orphans(lambda: _RealPg(child, parent), "app.prices", fk,
                                  page_size=page, sleep=lambda _s: None) == 270

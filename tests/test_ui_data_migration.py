@@ -22323,10 +22323,12 @@ def test_the_orphan_pre_gate_reports_liveness_per_page() -> None:
     import inspect
 
     from dsql_migrator.core.models import ForeignKeyDef
+    from dsql_migrator.core.validator import target_orphan_count_keyset
     from dsql_migrator.ui.data_migration import _full_load_engine as _engine
 
     assert "on_page" in inspect.signature(_engine._count_orphans).parameters
-    assert "on_page" in inspect.signature(_engine._count_orphans_keyset).parameters
+    # VAL-3: a single-column child is paged by Validation's pager, which the pre-gate calls.
+    assert "on_page" in inspect.signature(target_orphan_count_keyset).parameters
 
     # Behaviour: one report per page, not one per call.
     pages = [(0, 10, 5), (0, 20, 5), (0, 30, 2)]   # 3 pages, last one short
@@ -22349,7 +22351,7 @@ def test_the_orphan_pre_gate_reports_liveness_per_page() -> None:
             return _Cur()
 
     beats: list[int] = []
-    total = _engine._count_orphans_keyset(
+    total = target_orphan_count_keyset(
         _Conn(), "e.child",
         ForeignKeyDef(name="fk", columns=["pid"], referenced_table="e.parent",
                       referenced_columns=["id"]),

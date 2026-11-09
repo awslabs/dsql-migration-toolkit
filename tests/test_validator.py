@@ -3085,7 +3085,7 @@ def test_every_bounded_scan_reports_a_page_hook() -> None:
 
     pagers = [
         _v._source_checksum_keyset, _v._target_count_keyset, _v._target_checksum_keyset,
-        _v._iter_source_pks, _v._iter_target_pks, _v._target_orphan_count_keyset,
+        _v._iter_source_pks, _v._iter_target_pks, _v.target_orphan_count_keyset,
     ]
     for fn in pagers:
         assert "on_page" in inspect.signature(fn).parameters, fn.__name__

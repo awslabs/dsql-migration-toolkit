@@ -835,7 +835,11 @@ def test_the_listing_reads_the_window_where_the_count_found_the_first_orphan(
 
 
 def test_the_counts_report_the_cursor_of_the_first_page_holding_an_orphan() -> None:
-    from dsql_migrator.core.validator import target_orphan_count_composite
+    # VAL-3: the pre-gate's single-column count is Validation's pager, given its replay.
+    from dsql_migrator.core.validator import (
+        target_orphan_count_composite,
+        target_orphan_count_keyset,
+    )
 
     fk = ForeignKeyDef(name="f", columns=["c"], referenced_table="shop.p",
                        referenced_columns=["id"])
@@ -847,8 +851,8 @@ def test_the_counts_report_the_cursor_of_the_first_page_holding_an_orphan() -> N
             return SimpleNamespace(execute=lambda *_a: None, fetchone=lambda: next(pages),
                                    close=lambda: None)
 
-    assert engine._count_orphans_keyset(_Conn(), "shop.c", fk, "id", 2,
-                                        on_orphans=told.append) == 3
+    assert target_orphan_count_keyset(_Conn(), "shop.c", fk, "id", 2,
+                                      on_orphans=told.append) == 3
     assert told == [(9,)]
     composite = iter([(0, 2, "1", "a"), (1, 2, "1", "c"), (0, 1, "2", "a")])
     told.clear()
@@ -866,7 +870,7 @@ def test_the_counts_report_the_cursor_of_the_first_page_holding_an_orphan() -> N
             return SimpleNamespace(execute=lambda *_a: None, fetchone=lambda: next(first),
                                    close=lambda: None)
 
-    engine._count_orphans_keyset(_One(), "shop.c", fk, "id", 2, on_orphans=told.append)
+    target_orphan_count_keyset(_One(), "shop.c", fk, "id", 2, on_orphans=told.append)
     assert told == [None]
 
 
