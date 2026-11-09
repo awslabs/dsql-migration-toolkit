@@ -11038,7 +11038,7 @@ def test_infra_create_does_not_count_as_streaming_started() -> None:
     the step to DONE, which an infra create must never do (that once unlocked Validation
     with zero rows loaded). The new type lock asks a different question.
     """
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_streaming_started
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_streaming_started
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("job-1", kind="infra")
@@ -19565,7 +19565,7 @@ def test_delete_in_flight_replaces_the_streaming_badge() -> None:
     already says "Deleting infrastructure". Two contradictory verdicts, and the
     reassuring one was wrong.
     """
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_teardown_badge
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("job-del", kind="delete")
@@ -19579,7 +19579,7 @@ def test_delete_in_flight_replaces_the_streaming_badge() -> None:
 def test_stop_in_flight_is_named_distinctly_from_delete() -> None:
     # Stop CDC (connectors only, MSK kept) and Delete (everything) leave very
     # different systems behind, so the badge must not conflate them.
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_teardown_badge
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("job-stop", kind="stop")
@@ -19596,7 +19596,7 @@ def test_teardown_badge_clears_once_the_job_finishes() -> None:
     Otherwise the card would be stuck on "Deleting…" forever after a teardown, instead
     of falling through to "Not deployed".
     """
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_teardown_badge
 
     state = DataMigrationState()
     state.set_cdc_deploy_job_id("job-del", kind="delete")
@@ -19607,7 +19607,7 @@ def test_teardown_badge_clears_once_the_job_finishes() -> None:
 def test_non_teardown_jobs_do_not_claim_the_badge() -> None:
     # Start / infra have their own badges ("Provisioning…", "Working…"); a teardown
     # check that swallowed them would be a regression in the other direction.
-    from dsql_migrator.ui.data_migration._cdc_ui import cdc_teardown_badge
+    from dsql_migrator.ui.data_migration._cdc_state import cdc_teardown_badge
 
     for kind in ("start", "infra"):
         state = DataMigrationState()

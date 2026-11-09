@@ -9,8 +9,10 @@ quarantine helpers, the progress/completeness/error-log renderers -- plus the ti
 ``format_selected_workloads`` headline. Mirrors the existing ``_cdc_ui.py`` split; the
 package ``__init__`` re-exports at its bottom the names its screen code uses and the ones
 its readers reach as ``dm.<name>`` / ``from ...data_migration import <name>``. One-directional: this
-module imports from ``_engine`` / ``_models`` / ``_status`` / ``_cdc_ui`` and the
-shared ``core`` + ``ui`` modules -- never back from the package ``__init__``.
+module imports, at its top, from ``_full_load_engine`` / ``_models`` / ``_cdc_status`` /
+``_cdc_state`` / ``_index_builds`` and the shared ``core`` + ``ui`` modules -- never from
+the package ``__init__``, or from ``_cdc_ui``, which imports this module through
+``_cdc_monitoring``.
 """
 
 from __future__ import annotations
@@ -90,7 +92,7 @@ from dsql_migrator.ui.data_migration._cdc_status import (
     full_load_latest_messages,
     full_load_latest_messages_for,
 )
-from dsql_migrator.ui.data_migration._cdc_ui import cdc_streaming_started
+from dsql_migrator.ui.data_migration._cdc_state import cdc_streaming_started
 from dsql_migrator.ui.data_migration._index_builds import (
     index_builds_pending,
     render_index_builds,

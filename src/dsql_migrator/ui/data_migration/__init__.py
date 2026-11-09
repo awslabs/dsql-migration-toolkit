@@ -6715,9 +6715,8 @@ from dsql_migrator.ui.data_migration._table_set_lock import (  # noqa: E402
 
 
 # The Full Load render cluster was extracted to _full_load_ui.py for maintainability
-# (mirrors the _cdc_ui.py split above). Re-exported here -- AFTER the _cdc_ui re-export,
-# since _full_load_ui imports cdc_streaming_started from _cdc_ui -- for the screen code
-# above (content()'s calls resolve as module globals) and the dm.<name> readers.
+# (mirrors the _cdc_ui.py split above). Re-exported here for the screen code above
+# (content()'s calls resolve as module globals) and the dm.<name> readers.
 from dsql_migrator.ui.data_migration._full_load_ui import (  # noqa: E402,F401
     cdc_load_hold,
     full_load_step_for_scope,

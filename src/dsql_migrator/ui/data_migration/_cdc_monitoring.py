@@ -11,11 +11,18 @@ panel, with the texts and facts they show (the schema-drift runbooks, the AI-ass
 facts). The pure state predicates live in ``_cdc_state``, the read-models in ``_models`` /
 ``_cdc_status``, and the column-exclusion and table-set locks, which make no NiceGUI call,
 in ``_table_set_lock``: this module re-exports every name defined there, private ones
-included, so an import from here resolves unchanged (a re-export does not carry a
-monkeypatch: a test patches ``_table_set_lock``). One-directional: imports from
-``_cdc_state`` / ``_models`` / ``_cdc_status`` / ``_table_set_lock`` / ``_full_load_ui`` /
-``core`` / ``ui.design`` and the package's ``_LOGGER`` (never back from ``_cdc_ui``, which
-imports the panels it renders from here).
+included, so an import from here resolves unchanged. A re-export does not carry a
+monkeypatch: a patch on ``_table_set_lock`` does not reach this module's own read of
+``exclusion_lock_state`` (in :func:`_exclusion_state_facts`), which a test patches here;
+``_table_set_lock``'s docstring says what a patch there reaches.
+
+Its imports: at its top, ``_cdc_state`` / ``_models`` / ``_cdc_status`` /
+``_table_set_lock`` / ``_full_load_ui`` / ``core`` / ``ui.design`` and the package's
+``_LOGGER``; inside functions, more of those and also ``ui.ai_tools``,
+``ui.cdc_catalog_drift_gate``, ``ui.cdc_dlq_gate`` (which imports ``_DRIFT_LABELS`` back
+from here, inside a function too), ``ui.cdc_replica_identity_gate``, ``ui.connect`` and
+NiceGUI's ``run``. One-directional with ``_cdc_ui``: never imports from it, since
+``_cdc_ui`` imports the panels it renders from here.
 """
 
 from __future__ import annotations
@@ -59,7 +66,9 @@ from dsql_migrator.ui.data_migration._cdc_status import (
 )
 # The column-exclusion and table-set locks moved to _table_set_lock.py (cdcui-5); every name
 # defined there, private ones included, is re-exported here so an import from this module
-# resolves unchanged. A re-export does not carry a monkeypatch: patch _table_set_lock.
+# resolves unchanged. A re-export does not carry a monkeypatch: patch _table_set_lock for
+# the calls made there, and this module for its own read (exclusion_lock_state in
+# _exclusion_state_facts).
 from dsql_migrator.ui.data_migration._table_set_lock import (  # noqa: F401
     _EXCLUSION_BAKED_PHASES,
     cdc_stack_being_deleted,

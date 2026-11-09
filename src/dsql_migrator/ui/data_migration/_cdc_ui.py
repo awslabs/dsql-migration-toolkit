@@ -204,8 +204,8 @@ from dsql_migrator.ui.data_migration import (
 )
 
 # The pure CDC state/phase predicates were extracted to _cdc_state.py so both this
-# module and _cdc_monitoring.py can import them without a cycle. This module imports the
-# ones it reads; every other consumer imports them from _cdc_state.
+# module and _cdc_monitoring.py can import them without a cycle. This module imports only
+# the ones it reads, and relays none: import them from _cdc_state.
 from dsql_migrator.ui.data_migration._cdc_state import (
     _CDC_POLL_INTERVAL_SECONDS,
     cdc_infra_deploy_in_flight,
@@ -213,8 +213,10 @@ from dsql_migrator.ui.data_migration._cdc_state import (
     cdc_teardown_badge,
 )
 # The column-exclusion and table-set locks this module reads (_table_set_lock: no NiceGUI
-# call). A top-level import: _table_set_lock imports only _cdc_state, _models, _cdc_status
-# and core.models, none of which imports this module.
+# call). A top-level import, with no cycle: _table_set_lock's own top-level imports are
+# _cdc_state, _models, _cdc_status and core.models, none of which imports this module.
+# Bound when this module loads, so a patch on _table_set_lock does not reach this module's
+# own calls to them: a test patches the name here.
 from dsql_migrator.ui.data_migration._table_set_lock import (
     _cdc_started_for_migration,
     capture_error_with_remedy,
@@ -10745,8 +10747,9 @@ def _render_deploy_log(ui, log_lines, log_state=None) -> None:
 # The post-start CDC monitoring / DLQ / status render panels were extracted to
 # _cdc_monitoring.py for maintainability (after the _cdc_state predicate split, so the
 # panels import those predicates from _cdc_state, not back from here -- no cycle). This
-# module imports the panels _render_cdc_step renders; every other consumer imports from the
-# module that defines the name (_cdc_monitoring, _table_set_lock or _cdc_state).
+# module imports from it only the panels _render_cdc_step renders, and relays none of its
+# names: import any other name from the module that defines it (_cdc_monitoring,
+# _table_set_lock or _cdc_state).
 from dsql_migrator.ui.data_migration._cdc_monitoring import (  # noqa: E402
     _render_cdc_handling_panel,
     _render_cdc_live_monitoring,

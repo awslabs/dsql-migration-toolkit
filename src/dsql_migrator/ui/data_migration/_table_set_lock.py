@@ -20,8 +20,15 @@ records only. Its top-level imports are ``_cdc_state``, ``_models``, ``_cdc_stat
 ``core.models``. ``_models`` imports from this module only inside functions: this module
 imports ``_models`` at its top, so a top-level import back would be a cycle.
 ``_cdc_monitoring``, where this block lived, re-exports every name defined here, private
-ones included, so an import from it resolves unchanged; a re-export does not carry a
-monkeypatch, so a test patches this module.
+ones included, so an import from it resolves unchanged.
+
+A re-export does not carry a monkeypatch, nor does any module-level import: a test patches
+a name on the module whose code reads it. A patch here reaches the calls made in this
+module and the readers that import the name inside a function, at call time: ``_models``,
+``_full_load_ui`` and ``ui.validation``. It does not reach the readers that bind it with a
+module-level import: ``_exclusion_dialog``, ``_cdc_ui``, the package ``__init__``, and
+``_cdc_monitoring``, whose ``_exclusion_state_facts`` reads ``exclusion_lock_state``
+through the re-export. A test of one of those patches the name there.
 """
 
 from __future__ import annotations
