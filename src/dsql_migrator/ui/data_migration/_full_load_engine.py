@@ -775,6 +775,30 @@ def _overlay_set(inputs: "DataMigrationInputs", table_name: str) -> frozenset[st
     )
 
 
+def _load_columns(
+    inputs: "DataMigrationInputs",
+    table: TableDef,
+    generated_columns: "Optional[Collection[str]]",
+) -> TableDef:
+    """``table`` with only the columns a Full Load reads and writes: the one column decision
+    of every load path (``BatchedTableMigrator.migrate_table`` and the shard worker, which
+    drives the exporter and importer itself and once missed the LOB exclusions).
+
+    The exporter's keyset SELECT and the importer's INSERT / ON CONFLICT lists all derive
+    from ``table.columns``, so this drops, through :func:`apply_lob_exclusions` (never a
+    primary-key column, source order kept): the operator's excluded oversized-LOB columns,
+    then ``generated_columns`` -- the columns the target computes, whose supplied value
+    Aurora DSQL rejects (428C9). Pure: each caller resolves ``generated_columns`` itself
+    (``BatchedTableMigrator.resolve_generated_columns``, whose authority differs by path)
+    and refuses, in its own words, when that is unknown. ``table`` is left whole: a target
+    recreation must keep every column in the schema.
+    """
+    loaded = apply_lob_exclusions(table, inputs.excluded_lob_columns.get(table.name))
+    if generated_columns:
+        loaded = apply_lob_exclusions(loaded, generated_columns)
+    return loaded
+
+
 def _advance_chunk_rows(
     job: MigrationJob, chunk_id: str, delta_loaded: int, delta_skipped: int = 0
 ) -> None:
@@ -2154,24 +2178,21 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
     shared snapshot (``TableExporter.stream_converted_ranges``), as one reader session reads
     a table's ranges (P2).
 
-    The operator's oversized-LOB column exclusions are applied HERE: this worker does not
-    go through :meth:`BatchedTableMigrator.migrate_table` (which filters), it drives the
-    exporter and importer directly -- and both derive their column lists from
-    ``table.columns``, so an unfiltered ``TableDef`` reads and writes the excluded column
-    anyway. That made "Exclude column & reload" a NO-OP on exactly the tables big enough to
-    be sharded: the >1 MiB values are rejected (54000) and the whole ROW is quarantined
-    again -- the opposite of the operator's intent, which is to keep the row and drop the
-    column -- and past the quarantine cap the load aborts outright. ``_slim_worker_inputs``
-    already carried the exclusions into the worker; only the filter was missing.
+    The loaded columns come from :func:`_load_columns`, the column decision
+    :meth:`BatchedTableMigrator.migrate_table` makes too: this worker does not go through
+    ``migrate_table``, it drives the exporter and importer directly -- and both derive their
+    column lists from ``table.columns``, so an unfiltered ``TableDef`` reads and writes an
+    excluded column anyway. A hand-copied filter here once missed the operator's
+    oversized-LOB exclusions, which made "Exclude column & reload" a NO-OP on exactly the
+    tables big enough to be sharded: the >1 MiB values are rejected (54000) and the whole
+    ROW is quarantined again -- the opposite of the operator's intent, which is to keep the
+    row and drop the column -- and past the quarantine cap the load aborts outright.
     ``args.table`` retains the full column set for anything that must see it (a target
     recreation must not drop the column from the SCHEMA).
     """
     progress_queue = _worker_progress_queue
     cancel_event = _worker_cancel_event
-    table = apply_lob_exclusions(
-        args.table, args.inputs.excluded_lob_columns.get(args.table.name)
-    )
-    name = table.name
+    name = args.table.name
     # Signal that this worker actually began the table, so the parent marks the chunk
     # IN_PROGRESS now (a bounded pool runs only a few at once) rather than at submission.
     _report_progress(progress_queue, (_CHUNK_STARTED, name))
@@ -2200,7 +2221,7 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
             written[0] += loaded
             row_progress.add(loaded, skipped)
 
-        applied = args.inputs.table_conversions.get(table.name)
+        applied = args.inputs.table_conversions.get(name)
         # Same deterministic fallback as the in-process path: the parent recreated this
         # target from _derived_table_conversion when no applied conversion was carried in,
         # so the read expressions must come from that same conversion.
@@ -2227,8 +2248,9 @@ def _migrate_shard_in_process(args: _ShardWorkerArgs) -> _TableWorkerResult:
                 "A generated column REJECTS a supplied value and omitting the wrong "
                 "column would write NULLs, so neither default is safe."
             )
-        if generated_columns:
-            table = apply_lob_exclusions(table, generated_columns)
+        # The columns this shard reads and writes: without the excluded LOB columns and the
+        # generated ones, as migrate_table loads them.
+        table = _load_columns(args.inputs, args.table, generated_columns)
         # The parent overlaid this table; confirm it before the shard's first write.
         _assert_overlay_in_place(
             name, _overlay_set(args.inputs, name), facts_reader=migrator.overlay_facts
@@ -9328,26 +9350,18 @@ class BatchedTableMigrator:
         whole-table load's. A caller's re-read (a lost source connection) calls this again:
         a fresh session reads every range from a new snapshot.
         """
-        # Drop the user-excluded LOB columns up front so EVERY downstream use --
-        # the keyset read, the INSERT column list, and shard planning -- sees the
-        # same column-filtered view. The target still carries the column (it is
-        # recreated from the applied DDL, which is untouched); the load simply never
-        # writes to it, and the column takes its default / NULL. Name and PK are
-        # preserved, so target-PK parsing and target lookups below are unaffected.
-        # ``original_table`` keeps the full column set for target RECREATION only:
-        # dropping the column from the load must not drop it from the target schema
-        # (that would diverge from CDC and from the schema the user applied in Step
-        # 2), so the recreator is always handed the unfiltered table.
         # The excluded columns this run makes nullable with no DEFAULT (the overlay). With
         # an unreadable ledger such a table is not touched at all: no recreate, no ALTER,
         # no row (its dropped DEFAULTs could not be recorded).
         overlay = _overlay_set(self._inputs, table.name)
         if _blocked_by_unreadable_ledger(self._inputs, table.name):
             raise OverlayLedgerReadError(OverlayLedgerUnavailableError.MESSAGE)
+        # ``original_table`` keeps the full column set for target RECREATION only:
+        # dropping a column from the load must not drop it from the target schema
+        # (that would diverge from CDC and from the schema the user applied in Step
+        # 2), so the recreator is always handed the unfiltered table. ``table`` becomes
+        # the loaded columns (_load_columns) once the generated columns are known.
         original_table = table
-        table = apply_lob_exclusions(
-            table, self._inputs.excluded_lob_columns.get(table.name)
-        )
         applied = self._inputs.table_conversions.get(table.name)
         if table.name in self._inputs.name_clash_tables or (
             applied is not None and is_name_collision_placeholder(applied.target_ddl)
@@ -9359,8 +9373,8 @@ class BatchedTableMigrator:
             raise FullLoadIncompleteError(name_clash_message(table.name))
         # A column the TARGET computes must not be sent: Aurora DSQL rejects an INSERT
         # that supplies a value for a generated column (428C9), permanently, so every
-        # batch would fail and every row would be quarantined. Filtered through the same
-        # primitive as the LOB exclusions, which covers the keyset SELECT, the INSERT
+        # batch would fail and every row would be quarantined. Filtered with the LOB
+        # exclusions by _load_columns below, which covers the keyset SELECT, the INSERT
         # column list and the ON CONFLICT DO UPDATE SET list in one stroke.
         #
         # ``target_is_final`` decides WHICH signal is authoritative -- see
@@ -9385,8 +9399,14 @@ class BatchedTableMigrator:
                 "default is safe. Check the target connection and retry; if the table has "
                 "no generated columns, applying the schema again also resolves it."
             )
-        if generated_columns:
-            table = apply_lob_exclusions(table, generated_columns)
+        # Drop the user-excluded LOB columns and the generated ones here, before EVERY
+        # downstream use -- the keyset read, the INSERT column list, and shard planning --
+        # so all of them see the same column-filtered view (the shard worker loads the
+        # same one). The target still carries an excluded column (it is recreated from the
+        # applied DDL, which is untouched); the load simply never writes to it, and the
+        # column takes its default / NULL. Name and PK are preserved, so target-PK parsing
+        # and target lookups below are unaffected.
+        table = _load_columns(self._inputs, original_table, generated_columns)
         # No applied conversion (a library/harness caller) => derive the SAME conversion
         # the recreator derives, rather than reading every column uncast: see
         # _derived_table_conversion. ``applied`` stays None so the generated-column and
