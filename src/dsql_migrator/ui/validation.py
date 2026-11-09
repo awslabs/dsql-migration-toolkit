@@ -1918,6 +1918,99 @@ def _cdc_in_use(session: object) -> bool:
         return False
 
 
+# The three CDC cut-over gates, in the order every caller builds and names them: dead-letter
+# (G1, ui/cdc_dlq_gate.py), REPLICA IDENTITY (G2, ui/cdc_replica_identity_gate.py), source
+# schema (G4, ui/cdc_catalog_drift_gate.py).
+_CDC_GATE_KINDS = ("dlq", "ri", "g4")
+
+
+def _cdc_gates(
+    migration_state: object,
+    validation_state: object,
+    session: object,
+    *,
+    summary: "Optional[ValidationSummary]",
+    release: Optional[str] = None,
+    check: bool = True,
+    kinds: "Sequence[str]" = _CDC_GATE_KINDS,
+    isolated: bool = False,
+) -> tuple:
+    """The CDC cut-over gates of ``kinds`` (``"dlq"``, ``"ri"``, ``"g4"``) for this state, in
+    that order. No I/O (the gate modules' ``*_gate_for``, signatures unchanged).
+
+    Each gate is built on its own, as the callers did: ``cdc_in_use`` read, then ``release``
+    -- the one given, or (``None``) the release state of ``summary`` as cut over gates on it
+    (:func:`cutover_release_state` with the session's accepted gap) -- then the gate, with
+    ``check`` as its ``check_reads`` / ``check_probe``. ``isolated``: a gate that cannot be
+    built is ``None`` and the others are still built (the report and the verdict line render
+    without it); otherwise the error is raised.
+    """
+    def _build(kind: str) -> object:
+        cdc_in_use = _cdc_in_use(session)
+        gate_release = (
+            cutover_release_state(summary, gap_accepted=validation_state.accept_explained_gap)
+            if release is None
+            else release
+        )
+        if kind == "dlq":
+            return cdc_dlq_gate_for(
+                migration_state, validation_state,
+                cdc_in_use=cdc_in_use, release=gate_release, summary=summary,
+                check_reads=check,
+            )
+        if kind == "ri":
+            build = replica_identity_gate_for
+        elif kind == "g4":
+            build = catalog_drift_gate_for
+        else:
+            raise ValueError(f"unknown CDC gate {kind!r}")
+        return build(
+            migration_state, validation_state, session,
+            cdc_in_use=cdc_in_use, release=gate_release, summary=summary, check_probe=check,
+        )
+
+    gates: list = []
+    for kind in kinds:
+        if not isolated:
+            gates.append(_build(kind))
+            continue
+        try:
+            gates.append(_build(kind))
+        except Exception:  # noqa: BLE001 - the caller renders / logs without this gate
+            gates.append(None)
+    return tuple(gates)
+
+
+def _forced_checksum_snapshot(migration_state: object) -> "tuple[Mapping, Mapping, Mapping]":
+    """What forces a CHECKSUM, as the state holds it now: ``(dead-letter ledger, REPLICA
+    IDENTITY findings, source-schema findings)``, each keyed by table name (copy-on-write, so
+    a consistent view)."""
+    return (
+        getattr(migration_state, "cdc_dlq_ledger", None) or {},
+        getattr(migration_state, "cdc_replica_identity_findings", None) or {},
+        getattr(migration_state, "cdc_catalog_drift_findings", None) or {},
+    )
+
+
+def forced_checksum_partition(
+    names: "Iterable[str]", snapshot: "tuple[Mapping, Mapping, Mapping]"
+) -> "tuple[list[str], list[str], list[str]]":
+    """``names`` a CHECKSUM is forced for, split by reason, each name under one reason only:
+    dead-lettered first, then REPLICA IDENTITY, then a source schema change. ``snapshot`` is
+    :func:`_forced_checksum_snapshot`'s -- the one a run takes when it starts, for its start
+    line, or the state as of the call. Each part keeps the order of ``names``. Pure."""
+    ledger, replica_identity, catalog_drift = snapshot
+    names = list(names)
+    return (
+        [n for n in names if n in ledger],
+        [n for n in names if n not in ledger and n in replica_identity],
+        [
+            n for n in names
+            if n not in ledger and n not in replica_identity and n in catalog_drift
+        ],
+    )
+
+
 def _cdc_stack_streamed(migration_state: object) -> bool:
     """Whether this migration's CDC stack has streamed, or rolled back a Start (G25), whatever
     the migration type -- a CDC only migration's too: a backfill on it (a Full Load with a new
@@ -3262,26 +3355,15 @@ def build_validation_screen(
             # Tables CDC dead-lettered a change for get a CHECKSUM pass on top of this
             # run's mode (see below), so the start line says so up front. Read here, in the
             # worker: the ledger is copy-on-write, so this reference is a consistent view.
-            _ledger_at_start = getattr(migration_state, "cdc_dlq_ledger", None) or {}
-            _dlq_scope = [t.name for t in scoped_tables if t.name in _ledger_at_start]
             # Re-keyed tables whose REPLICA IDENTITY dropped below FULL are CHECKSUM'd too
             # (a lost DELETE is an extra row a row count may miss); named apart from G1's.
             # So are tables whose source schema changed while CDC ran (G4), each named under
             # its own reason, once: dead-lettered first, then REPLICA IDENTITY, then schema.
-            _ri_at_start = getattr(migration_state, "cdc_replica_identity_findings", None) or {}
-            _g4_at_start = getattr(migration_state, "cdc_catalog_drift_findings", None) or {}
-            _ri_scope = [
-                t.name
-                for t in scoped_tables
-                if t.name in _ri_at_start and t.name not in _ledger_at_start
-            ]
-            _g4_scope = [
-                t.name
-                for t in scoped_tables
-                if t.name in _g4_at_start
-                and t.name not in _ledger_at_start
-                and t.name not in _ri_at_start
-            ]
+            # The run-start snapshot: a dead letter folded during the run is in the CHECKSUM
+            # pass and the verdict line, not in this start line.
+            _dlq_scope, _ri_scope, _g4_scope = forced_checksum_partition(
+                [t.name for t in scoped_tables], _forced_checksum_snapshot(migration_state)
+            )
             _extra_pass = (
                 inputs.mode is not ValidationMode.CHECKSUM
                 or inputs.deep_only_on_count_mismatch
@@ -3409,71 +3491,29 @@ def build_validation_screen(
             )
             # "ready for cut-over" must not contradict the cut-over gate: while a table CDC
             # dead-lettered a change for lacks a CHECKSUM match after its last one, the log
-            # says cut over is held instead.
-            try:
-                _held_clause = held_log_clause(
-                    cdc_dlq_gate_for(
-                        migration_state,
-                        validation_state,
-                        cdc_in_use=_cdc_in_use(session),
-                        release=cutover_release_state(
-                            _summary, gap_accepted=validation_state.accept_explained_gap
-                        ),
-                        summary=_summary,
-                        check_reads=False,
-                    )
-                )
-            except Exception:  # noqa: BLE001 - the verdict line still logs
-                _held_clause = None
-            # ...nor the REPLICA IDENTITY gate (re-keyed PostgreSQL tables).
-            try:
-                _ri_held = replica_identity_held_log_clause(
-                    replica_identity_gate_for(
-                        migration_state,
-                        validation_state,
-                        session,
-                        cdc_in_use=_cdc_in_use(session),
-                        release=cutover_release_state(
-                            _summary, gap_accepted=validation_state.accept_explained_gap
-                        ),
-                        summary=_summary,
-                        check_probe=False,
-                    )
-                )
-            except Exception:  # noqa: BLE001 - the verdict line still logs
-                _ri_held = None
-            if _ri_held:
-                _held_clause = (_held_clause or "") + _ri_held
-            # ...nor the source-schema gate (G4).
-            try:
-                _g4_held = catalog_drift_held_log_clause(
-                    catalog_drift_gate_for(
-                        migration_state,
-                        validation_state,
-                        session,
-                        cdc_in_use=_cdc_in_use(session),
-                        release=cutover_release_state(
-                            _summary, gap_accepted=validation_state.accept_explained_gap
-                        ),
-                        summary=_summary,
-                        check_probe=False,
-                    )
-                )
-            except Exception:  # noqa: BLE001 - the verdict line still logs
-                _g4_held = None
-            if _g4_held:
-                _held_clause = (_held_clause or "") + _g4_held
+            # says cut over is held instead -- nor the REPLICA IDENTITY gate (re-keyed
+            # PostgreSQL tables), nor the source-schema gate (G4). Each gate and its clause
+            # on its own: one that cannot be built or worded leaves the others' clauses.
+            _held_clause = None
+            for _held_of, _gate in zip(
+                (held_log_clause, replica_identity_held_log_clause,
+                 catalog_drift_held_log_clause),
+                _cdc_gates(
+                    migration_state, validation_state, session,
+                    summary=_summary, check=False, isolated=True,
+                ),
+            ):
+                try:
+                    _held = None if _gate is None else _held_of(_gate)
+                except Exception:  # noqa: BLE001 - the verdict line still logs
+                    _held = None
+                if _held:
+                    _held_clause = (_held_clause or "") + _held
             # The CHECKSUM pass, named per reason (each table once): dead-lettered, then
-            # REPLICA IDENTITY, then a source schema change.
-            _ledger_done = getattr(migration_state, "cdc_dlq_ledger", None) or {}
-            _ri_done = getattr(migration_state, "cdc_replica_identity_findings", None) or {}
-            _g4_done = getattr(migration_state, "cdc_catalog_drift_findings", None) or {}
-            _dlq_pass = [t for t in _checksum_pass if t in _ledger_done]
-            _ri_pass = [t for t in _checksum_pass if t not in _ledger_done and t in _ri_done]
-            _g4_pass = [
-                t for t in _checksum_pass
-                if t not in _ledger_done and t not in _ri_done and t in _g4_done
-            ]
+            # REPLICA IDENTITY, then a source schema change -- as the state holds them now.
+            _dlq_pass, _ri_pass, _g4_pass = forced_checksum_partition(
+                _checksum_pass, _forced_checksum_snapshot(migration_state)
+            )
             log_activity(
                 ActivityCategory.VALIDATION,
                 "validation completed",
@@ -3827,95 +3867,29 @@ def build_validation_screen(
         except Exception:  # noqa: BLE001 - the hint falls back to every recorded table
             return None
 
-    def _cdc_checksum_scope(inv: "Optional[SourceInventory]") -> tuple[str, ...]:
-        """Tables in the NEXT run's scope that CDC dead-lettered a change for."""
-        ledger = getattr(migration_state, "cdc_dlq_ledger", None) or {}
-        if not ledger:
-            return ()
+    def _forced_checksum_scopes(
+        inv: "Optional[SourceInventory]",
+    ) -> "tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]":
+        """Tables in the NEXT run's scope a CHECKSUM is forced for, per reason, each once:
+        dead-lettered, then a REPLICA IDENTITY finding, then a source schema change while CDC
+        ran (:func:`forced_checksum_partition`). Every such table, sorted, when the scope
+        cannot be resolved; the scope is resolved only when one is recorded."""
+        snapshot = _forced_checksum_snapshot(migration_state)
+        if not any(snapshot):
+            return (), (), ()
         scoped = _next_run_names(inv)
-        if scoped is None:
-            return tuple(sorted(ledger))
-        return tuple(name for name in scoped if name in ledger)
+        names = sorted(set().union(*snapshot)) if scoped is None else scoped
+        dlq, ri, g4 = forced_checksum_partition(names, snapshot)
+        return tuple(dlq), tuple(ri), tuple(g4)
 
-    def _ri_checksum_scope(inv: "Optional[SourceInventory]") -> tuple[str, ...]:
-        """Tables in the NEXT run's scope with a REPLICA IDENTITY finding, not already named
-        as dead-lettered (each is CHECKSUM'd once whatever the reason)."""
-        findings = getattr(migration_state, "cdc_replica_identity_findings", None) or {}
-        if not findings:
-            return ()
-        ledger = getattr(migration_state, "cdc_dlq_ledger", None) or {}
-        wanted = {t for t in findings if t not in ledger}
-        scoped = _next_run_names(inv)
-        if scoped is None:
-            return tuple(sorted(wanted))
-        return tuple(name for name in scoped if name in wanted)
-
-    def _g4_checksum_scope(inv: "Optional[SourceInventory]") -> tuple[str, ...]:
-        """Tables in the NEXT run's scope whose source schema changed while CDC ran, not
-        already named as dead-lettered or REPLICA IDENTITY tables."""
-        findings = getattr(migration_state, "cdc_catalog_drift_findings", None) or {}
-        if not findings:
-            return ()
-        ledger = getattr(migration_state, "cdc_dlq_ledger", None) or {}
-        ri = getattr(migration_state, "cdc_replica_identity_findings", None) or {}
-        wanted = {t for t in findings if t not in ledger and t not in ri}
-        scoped = _next_run_names(inv)
-        if scoped is None:
-            return tuple(sorted(wanted))
-        return tuple(name for name in scoped if name in wanted)
-
-    def _validation_g4_gate(report: ValidationReport):
-        """The source-schema gate as Validation shows it (per table; no probe state)."""
-        summary = summarize_validation(report)
-        try:
-            return catalog_drift_gate_for(
-                migration_state,
-                validation_state,
-                session,
-                cdc_in_use=_cdc_in_use(session),
-                release=cutover_release_state(
-                    summary, gap_accepted=validation_state.accept_explained_gap
-                ),
-                summary=summary,
-                check_probe=False,
-            )
-        except Exception:  # noqa: BLE001 - the report still renders without it
-            return None
-
-    def _validation_ri_gate(report: ValidationReport):
-        """The REPLICA IDENTITY gate as Validation shows it (per table; no probe state)."""
-        summary = summarize_validation(report)
-        try:
-            return replica_identity_gate_for(
-                migration_state,
-                validation_state,
-                session,
-                cdc_in_use=_cdc_in_use(session),
-                release=cutover_release_state(
-                    summary, gap_accepted=validation_state.accept_explained_gap
-                ),
-                summary=summary,
-                check_probe=False,
-            )
-        except Exception:  # noqa: BLE001 - the report still renders without it
-            return None
-
-    def _validation_dlq_gate(report: ValidationReport):
-        """The CDC dead-letter gate as Validation shows it (per table; no read state)."""
-        summary = summarize_validation(report)
-        try:
-            return cdc_dlq_gate_for(
-                migration_state,
-                validation_state,
-                cdc_in_use=_cdc_in_use(session),
-                release=cutover_release_state(
-                    summary, gap_accepted=validation_state.accept_explained_gap
-                ),
-                summary=summary,
-                check_reads=False,
-            )
-        except Exception:  # noqa: BLE001 - the report still renders without it
-            return None
+    def _validation_gates(report: ValidationReport) -> tuple:
+        """The three CDC gates as Validation shows them (per table; no read or probe state):
+        dead-letter, REPLICA IDENTITY, source schema. One that cannot be built is ``None``:
+        the report still renders without it."""
+        return _cdc_gates(
+            migration_state, validation_state, session,
+            summary=summarize_validation(report), check=False, isolated=True,
+        )
 
     def _cdc_history_hint() -> str:
         """The Options hint while the CDC dead-letter history can't be confirmed, unless the
@@ -3928,15 +3902,9 @@ def build_validation_screen(
         try:
             report = validation_state.result
             summary = summarize_validation(report) if report is not None else None
-            gate = cdc_dlq_gate_for(
-                migration_state,
-                validation_state,
-                cdc_in_use=_cdc_in_use(session),
-                release=cutover_release_state(
-                    summary, gap_accepted=validation_state.accept_explained_gap
-                ),
-                summary=summary,
-                check_reads=False,
+            (gate,) = _cdc_gates(
+                migration_state, validation_state, session,
+                summary=summary, check=False, kinds=("dlq",),
             )
         except Exception:  # noqa: BLE001 - an advisory hint never breaks the page
             return ""
@@ -3944,12 +3912,9 @@ def build_validation_screen(
 
     def _schedule_dlq_check(refresh: Callable[[], None]) -> None:
         try:
-            gate = cdc_dlq_gate_for(
-                migration_state,
-                validation_state,
-                cdc_in_use=_cdc_in_use(session),
-                release="clean",
-                summary=None,
+            (gate,) = _cdc_gates(
+                migration_state, validation_state, session,
+                summary=None, release="clean", kinds=("dlq",),
             )
         except Exception:  # noqa: BLE001 - never break the page for an advisory read
             return
@@ -4074,15 +4039,16 @@ def build_validation_screen(
             # the scope card -- they apply only to the NEXT run and are disabled
             # while one is in flight. Shown otherwise.
             if status is not StepStatus.IN_PROGRESS:
+                _forced_scopes = _forced_checksum_scopes(inventory)
                 _render_options(
                     ui,
                     validation_state,
                     status,
                     refresh=refresh,
-                    cdc_checksum_tables=_cdc_checksum_scope(inventory),
+                    cdc_checksum_tables=_forced_scopes[0],
                     cdc_history_hint=_cdc_history_hint(),
-                    replica_identity_checksum_tables=_ri_checksum_scope(inventory),
-                    catalog_drift_checksum_tables=_g4_checksum_scope(inventory),
+                    replica_identity_checksum_tables=_forced_scopes[1],
+                    catalog_drift_checksum_tables=_forced_scopes[2],
                 )
                 # Keep the dead-letter ledger fresh before a run and for the cut-over gate:
                 # one bounded background read, TTL-throttled, never on the render itself.
@@ -4292,13 +4258,14 @@ def build_validation_screen(
                     result, inventory, migration_state, validation_state.table_exclude,
                     covered=full_load_covered_tables(migration_state, job_manager),
                 )
+                _dlq_gate, _ri_gate, _g4_gate = _validation_gates(result)
                 _render_result(
                     ui, result,
                     scope_missing=_scope_missing,
                     scope_extra=_scope_extra,
-                    cdc_gate=_validation_dlq_gate(result),
-                    replica_identity_gate=_validation_ri_gate(result),
-                    catalog_drift_gate=_validation_g4_gate(result),
+                    cdc_gate=_dlq_gate,
+                    replica_identity_gate=_ri_gate,
+                    catalog_drift_gate=_g4_gate,
                     diagnose_provider=diagnose_provider,
                     restored=validation_state.restored,
                     completed_at=validation_state.completed_at,
@@ -5826,44 +5793,27 @@ def build_cutover_screen(
 
         return not is_prerequisite_met(session.workflow, WorkflowStep.VALIDATION)
 
-    def _current_dlq_gate():
-        """The CDC dead-letter gate from the CURRENT state (no I/O), for click handlers."""
+    def _current_gate(kind: str):
+        """One CDC gate (``"dlq"``, ``"ri"`` or ``"g4"``) from the CURRENT state (no I/O),
+        for click handlers: each re-check builds only its own gate, when it is reached."""
         _report = validation_state.result
         _summary = summarize_validation(_report) if _report is not None else None
-        return cdc_dlq_gate_for(
-            migration_state, validation_state,
-            cdc_in_use=_cdc_in_use(session),
-            release=cutover_release_state(
-                _summary, gap_accepted=validation_state.accept_explained_gap
-            ),
-            summary=_summary,
+        (gate,) = _cdc_gates(
+            migration_state, validation_state, session, summary=_summary, kinds=(kind,),
         )
+        return gate
+
+    def _current_dlq_gate():
+        """The CDC dead-letter gate from the CURRENT state (no I/O), for click handlers."""
+        return _current_gate("dlq")
 
     def _current_ri_gate():
         """The REPLICA IDENTITY gate from the CURRENT state (no I/O), for click handlers."""
-        _report = validation_state.result
-        _summary = summarize_validation(_report) if _report is not None else None
-        return replica_identity_gate_for(
-            migration_state, validation_state, session,
-            cdc_in_use=_cdc_in_use(session),
-            release=cutover_release_state(
-                _summary, gap_accepted=validation_state.accept_explained_gap
-            ),
-            summary=_summary,
-        )
+        return _current_gate("ri")
 
     def _current_g4_gate():
         """The source-schema gate from the CURRENT state (no I/O), for click handlers."""
-        _report = validation_state.result
-        _summary = summarize_validation(_report) if _report is not None else None
-        return catalog_drift_gate_for(
-            migration_state, validation_state, session,
-            cdc_in_use=_cdc_in_use(session),
-            release=cutover_release_state(
-                _summary, gap_accepted=validation_state.accept_explained_gap
-            ),
-            summary=_summary,
-        )
+        return _current_gate("g4")
 
     def runner() -> None:
         # Re-checked at the acknowledgement (another tab may have ticked a table since the
@@ -5954,30 +5904,19 @@ def build_cutover_screen(
                     )
                     else ""
                 )
-                # What the CDC dead-letter gate rested on (nothing when it is inert).
-                + ack_log_clause(
-                    cdc_dlq_gate_for(
-                        migration_state, validation_state,
-                        cdc_in_use=_cdc_in_use(session), release=_release,
-                        summary=_summary,
-                    )
-                )
-                # ...and the re-keyed tables' REPLICA IDENTITY re-check (nothing when inert,
-                # i.e. MySQL, no re-key, Full load only).
-                + replica_identity_ack_log_clause(
-                    replica_identity_gate_for(
-                        migration_state, validation_state, session,
-                        cdc_in_use=_cdc_in_use(session), release=_release,
-                        summary=_summary,
-                    )
-                )
-                # ...and the captured tables' source-schema re-check (nothing when inert,
-                # i.e. Full load only, or no baseline handle).
-                + catalog_drift_ack_log_clause(
-                    catalog_drift_gate_for(
-                        migration_state, validation_state, session,
-                        cdc_in_use=_cdc_in_use(session), release=_release,
-                        summary=_summary,
+                # What the CDC dead-letter gate rested on, then the re-keyed tables'
+                # REPLICA IDENTITY re-check (inert: MySQL, no re-key, Full load only), then
+                # the captured tables' source-schema re-check (inert: Full load only, or no
+                # baseline handle) -- nothing for a gate that is inert.
+                + "".join(
+                    _ack_of(_gate)
+                    for _ack_of, _gate in zip(
+                        (ack_log_clause, replica_identity_ack_log_clause,
+                         catalog_drift_ack_log_clause),
+                        _cdc_gates(
+                            migration_state, validation_state, session,
+                            summary=_summary, release=_release,
+                        ),
                     )
                 )
             ),
@@ -8637,83 +8576,40 @@ def _render_cdc_dlq_gate(
                 check_button["button"] = button
 
 
-def _render_replica_identity_gate(
+def _render_probe_gate(
     ui: object,
     gate: object,
     *,
+    notices: "tuple[Callable, Callable, Callable, Callable]",
     on_waive: Callable[[], None],
     on_check_again: Callable[[], None],
     check_running: bool,
     check_button: "Optional[dict]" = None,
+    needs_baseline: bool = False,
 ) -> None:
-    """Render the held REPLICA IDENTITY gate (re-keyed PostgreSQL tables): why, what to do,
-    the actions. Copy from :mod:`dsql_migrator.ui.cdc_replica_identity_gate` (value-free).
+    """Render a held gate the tool re-reads the source for -- REPLICA IDENTITY (re-keyed
+    PostgreSQL tables) or the source schema (G4): why, what to do, the actions. ``notices``
+    are the gate module's ``(open, pending, must re-check, waivable)`` notice functions
+    (value-free copy).
 
-    ``error`` while a table is still below FULL (with "Check again", disabled while a read
-    runs or without the source password), ``info`` while the fresh read Cut over waits for
-    is in flight, ``warning`` for a restored table that needs a CHECKSUM after the fix, and
-    ``warning`` with "Continue without this check" only for tables Validation cannot prove
-    and only when nothing else is open.
+    ``error`` while a table is still open (with "Check again", disabled while a read runs or
+    without the source password -- and, with ``needs_baseline``, without the baseline a read
+    is compared with: the button could only do nothing, the notice says when the check
+    resumes), ``info`` while the fresh read Cut over waits for is in flight, ``warning`` for
+    a table that needs a CHECKSUM after the fix, and ``warning`` with "Continue without this
+    check" only for tables Validation cannot prove and only when nothing else is open.
     """
-    weak = ri_weak_notice(gate)  # type: ignore[arg-type]
-    if weak is not None:
-        render_notice(ui, tone="error", header=weak[0], body=weak[1])
-    pending = ri_pending_notice(gate)  # type: ignore[arg-type]
-    if pending is not None:
-        render_notice(ui, tone="info", header=pending[0], body=pending[1])
-    must = ri_must_recheck_notice(gate)  # type: ignore[arg-type]
-    if must is not None:
-        render_notice(ui, tone="warning", header=must[0], body=must[1])
-    waivable = ri_waivable_notice(gate)  # type: ignore[arg-type]
-    if waivable is not None:
-        render_notice(ui, tone="warning", header=waivable[0], body=waivable[1])
-    can_waive = bool(getattr(gate, "can_waive", False))
-    show_check = weak is not None
-    if not (show_check or can_waive):
-        return
-    with ui.row().classes("w-full justify-end gap-2"):  # type: ignore[attr-defined]
-        if can_waive:
-            ui.button(  # type: ignore[attr-defined]
-                "Continue without this check", icon="rule", on_click=on_waive,
-            ).props("no-caps color=warning outline")
-        if show_check:
-            button = ui.button(  # type: ignore[attr-defined]
-                "Check again", icon="refresh", on_click=on_check_again,
-            ).props("no-caps color=primary")
-            if check_running or not bool(getattr(gate, "has_source_connection", False)):
-                button.props("disable")
-            if check_button is not None:
-                check_button["button"] = button
-
-
-def _render_catalog_drift_gate(
-    ui: object,
-    gate: object,
-    *,
-    on_waive: Callable[[], None],
-    on_check_again: Callable[[], None],
-    check_running: bool,
-    check_button: "Optional[dict]" = None,
-) -> None:
-    """Render the held source-schema gate: why, what to do, the actions. Copy from
-    :mod:`dsql_migrator.ui.cdc_catalog_drift_gate` (value-free).
-
-    ``error`` while a table's source schema still differs from the Step 1 inventory (with
-    "Check again", disabled while a read runs or without the source password), ``info``
-    while the fresh read Cut over waits for is in flight, ``warning`` for a resolved table
-    that needs a CHECKSUM after that, and ``warning`` with "Continue without this check"
-    only for tables Validation cannot prove and only when nothing else is open.
-    """
-    opened = g4_open_notice(gate)  # type: ignore[arg-type]
+    open_notice, pending_notice, must_notice, waivable_notice = notices
+    opened = open_notice(gate)
     if opened is not None:
         render_notice(ui, tone="error", header=opened[0], body=opened[1])
-    pending = g4_pending_notice(gate)  # type: ignore[arg-type]
+    pending = pending_notice(gate)
     if pending is not None:
         render_notice(ui, tone="info", header=pending[0], body=pending[1])
-    must = g4_must_recheck_notice(gate)  # type: ignore[arg-type]
+    must = must_notice(gate)
     if must is not None:
         render_notice(ui, tone="warning", header=must[0], body=must[1])
-    waivable = g4_waivable_notice(gate)  # type: ignore[arg-type]
+    waivable = waivable_notice(gate)
     if waivable is not None:
         render_notice(ui, tone="warning", header=waivable[0], body=waivable[1])
     can_waive = bool(getattr(gate, "can_waive", False))
@@ -8729,16 +8625,60 @@ def _render_catalog_drift_gate(
             button = ui.button(  # type: ignore[attr-defined]
                 "Check again", icon="refresh", on_click=on_check_again,
             ).props("no-caps color=primary")
-            # Without a baseline there is nothing to compare a read with: the button could
-            # only do nothing (the notice says when the check resumes).
             if (
                 check_running
                 or not bool(getattr(gate, "has_source_connection", False))
-                or getattr(gate, "probe_state", None) == G4_PROBE_NO_BASELINE
+                or (
+                    needs_baseline
+                    and getattr(gate, "probe_state", None) == G4_PROBE_NO_BASELINE
+                )
             ):
                 button.props("disable")
             if check_button is not None:
                 check_button["button"] = button
+
+
+def _render_replica_identity_gate(
+    ui: object,
+    gate: object,
+    *,
+    on_waive: Callable[[], None],
+    on_check_again: Callable[[], None],
+    check_running: bool,
+    check_button: "Optional[dict]" = None,
+) -> None:
+    """Render the held REPLICA IDENTITY gate (re-keyed PostgreSQL tables): copy from
+    :mod:`dsql_migrator.ui.cdc_replica_identity_gate`, rendered by :func:`_render_probe_gate`
+    (``error`` while a table is still below FULL)."""
+    _render_probe_gate(
+        ui, gate,
+        notices=(ri_weak_notice, ri_pending_notice, ri_must_recheck_notice,
+                 ri_waivable_notice),
+        on_waive=on_waive, on_check_again=on_check_again, check_running=check_running,
+        check_button=check_button,
+    )
+
+
+def _render_catalog_drift_gate(
+    ui: object,
+    gate: object,
+    *,
+    on_waive: Callable[[], None],
+    on_check_again: Callable[[], None],
+    check_running: bool,
+    check_button: "Optional[dict]" = None,
+) -> None:
+    """Render the held source-schema gate: copy from
+    :mod:`dsql_migrator.ui.cdc_catalog_drift_gate`, rendered by :func:`_render_probe_gate`
+    (``error`` while a table's source schema still differs from the Step 1 inventory; "Check
+    again" also disabled without a baseline)."""
+    _render_probe_gate(
+        ui, gate,
+        notices=(g4_open_notice, g4_pending_notice, g4_must_recheck_notice,
+                 g4_waivable_notice),
+        on_waive=on_waive, on_check_again=on_check_again, check_running=check_running,
+        check_button=check_button, needs_baseline=True,
+    )
 
 
 def _render_cutover_section(
