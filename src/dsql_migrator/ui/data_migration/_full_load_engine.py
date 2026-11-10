@@ -3917,6 +3917,69 @@ def _unit_counts(
     return counts
 
 
+def _assign_group_blocks(
+    work_units: "list[_Unit]",
+    estimates: "Mapping[str, int]",
+    tp: int,
+    withheld: "Collection[str]",
+) -> "tuple[list[_Unit], dict[str, int], list[tuple[str, str]]]":
+    """The plan with each "group" unit -- a PostgreSQL table whose key ranges share the run's
+    snapshot (P1) -- replaced, where it stands, by the units that read it: ``(units, parts,
+    details)``.
+
+    A table gets the shard count G that :func:`_unit_counts` gives its share of the run's
+    estimated rows (``estimates``) of the ``tp`` worker processes, beside the plan's other
+    units that are not ``withheld``. Shard g of its K ranges reads the contiguous block
+    ``ranges[g*K//G:(g+1)*K//G]`` in turn: ``lo`` and ``hi`` span it, ``index`` is g and
+    ``base`` is the table-wide index of its first range. One shard (G == 1) is a whole-table
+    unit that reads the K ranges in turn (P2). Every other unit stays as it is. ``parts``:
+    each table read by more than one shard, and its G; ``details``: each group table's
+    ``(table, detail)`` for its "reader shards" line, in plan order, for the caller to log. A
+    plan without a group comes back as it is.
+
+    Pure, so the same plan always gives the same units in the same order: a table's G does
+    not depend on the order of the plan (:func:`_unit_counts` breaks a tie by name), and a
+    range keeps its table-wide index whatever G is, so its batch ids and resume point are the
+    same in whichever shard reads it (:func:`_table_wide_range_pages`).
+    """
+    planned_parts: dict[str, int] = {}
+    details: list[tuple[str, str]] = []
+    groups = {wu.table.name: len(wu.ranges) for wu in work_units if wu.kind == "group"}
+    if groups:
+        shards_of = _unit_counts(
+            groups, estimates, tp,
+            other_units=sum(
+                1 for wu in work_units
+                if wu.kind != "group" and wu.table.name not in withheld
+            ),
+        )
+        planned: list[_Unit] = []
+        for wu in work_units:
+            if wu.kind != "group":
+                planned.append(wu)
+                continue
+            k, g_count = len(wu.ranges), shards_of[wu.table.name]
+            if g_count <= 1:
+                planned.append(_Unit("table", wu.table, ranges=wu.ranges))
+                detail = _SPLIT_ONE_SNAPSHOT.format(k=k)
+            else:
+                for g in range(g_count):
+                    first, after = g * k // g_count, (g + 1) * k // g_count
+                    block = wu.ranges[first:after]
+                    planned.append(_Unit(
+                        "shard", wu.table, block[0][0], block[-1][1], g, block, first
+                    ))
+                planned_parts[wu.table.name] = g_count
+                detail = (
+                    _SPLIT_SHARED_SNAPSHOT.format(k=k)
+                    if g_count == k
+                    else _SPLIT_SHARED_SNAPSHOT_BLOCKS.format(k=k, g=g_count)
+                )
+            details.append((wu.table.name, detail))
+        work_units = planned
+    return work_units, planned_parts, details
+
+
 def _largest_first(
     work_units: "Sequence[tuple]", estimates: "Mapping[str, int]"
 ) -> "list[tuple]":
@@ -5196,45 +5259,18 @@ def _migrate_tables_in_parallel(
         # the pool. Shard g reads the contiguous block ranges[g*K//G:(g+1)*K//G] in turn (one
         # range each when G == K, as before); one shard (G == 1) is one reader session with
         # its own snapshot (P2), so it needs no anchor.
-        groups = {wu.table.name: len(wu.ranges) for wu in work_units if wu.kind == "group"}
-        if groups:
-            shards_of = _unit_counts(
-                groups, _order_estimates, tp,
-                other_units=sum(
-                    1 for wu in work_units
-                    if wu.kind != "group" and wu.table.name not in withheld
-                ),
+        work_units, group_parts, group_details = _assign_group_blocks(
+            work_units, _order_estimates, tp, withheld
+        )
+        planned_parts.update(group_parts)
+        for target, detail in group_details:
+            log_activity(
+                ActivityCategory.FULL_LOAD,
+                "reader shards",
+                status=ActivityStatus.INFO,
+                target=target,
+                detail=detail,
             )
-            planned: list[_Unit] = []
-            for wu in work_units:
-                if wu.kind != "group":
-                    planned.append(wu)
-                    continue
-                k, g_count = len(wu.ranges), shards_of[wu.table.name]
-                if g_count <= 1:
-                    planned.append(_Unit("table", wu.table, ranges=wu.ranges))
-                    detail = _SPLIT_ONE_SNAPSHOT.format(k=k)
-                else:
-                    for g in range(g_count):
-                        first, after = g * k // g_count, (g + 1) * k // g_count
-                        block = wu.ranges[first:after]
-                        planned.append(_Unit(
-                            "shard", wu.table, block[0][0], block[-1][1], g, block, first
-                        ))
-                    planned_parts[wu.table.name] = g_count
-                    detail = (
-                        _SPLIT_SHARED_SNAPSHOT.format(k=k)
-                        if g_count == k
-                        else _SPLIT_SHARED_SNAPSHOT_BLOCKS.format(k=k, g=g_count)
-                    )
-                log_activity(
-                    ActivityCategory.FULL_LOAD,
-                    "reader shards",
-                    status=ActivityStatus.INFO,
-                    target=wu.table.name,
-                    detail=detail,
-                )
-            work_units = planned
 
         total_workers = min(table_parallelism, len(work_units))
         # P3: the INSERT batches each unit keeps in flight. At most total_workers units run
