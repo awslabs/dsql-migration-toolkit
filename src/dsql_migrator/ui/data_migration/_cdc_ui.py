@@ -10289,8 +10289,8 @@ def submit_cdc_teardown(
     the session's own stack only (``None`` for any other; the marker drops it when the
     banner moves on to the next stack of a multi-stack Start over, which may be such an
     other stack -- ``DataMigrationState.advance_cdc_teardown``), and it is what Retry cleanup
-    (``ui/app.py`` ``_cdc_teardown_retry``) checks before it hands over the credentials the
-    live session holds then: only while the session still targets that source, else
+    (``_cdc_teardown.py`` ``_cdc_teardown_retry``) checks before it hands over the credentials
+    the live session holds then: only while the session still targets that source, else
     ``None``. The stack-name check alone does not cover a retry. Start over resets
     ``cdc_stack_name`` to the default name and keeps the marker, so a failed teardown of a
     DEFAULT-named stack still passes it once the operator has connected a different source

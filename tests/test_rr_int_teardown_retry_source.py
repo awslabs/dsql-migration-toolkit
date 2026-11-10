@@ -6,8 +6,8 @@
 The teardown marker's ``ctx["source"]`` is the non-secret ``(host, port, database)`` the
 session's credentials were entered for, and ``submit_cdc_teardown`` records it only for the
 session's OWN stack (``None`` for a discovered one, which may capture another source).
-Retry cleanup (``ui/app.py`` ``_cdc_teardown_retry``) hands over the live session's
-credentials only while the session still targets that source.
+Retry cleanup (``ui/data_migration/_cdc_teardown.py`` ``_cdc_teardown_retry``) hands over the
+live session's credentials only while the session still targets that source.
 
 A multi-stack Start over launches every stack behind one marker, and the banner moves the
 marker on to the next unfinished stack when the tracked one settles

@@ -54,7 +54,9 @@ schema drift) -- and a per-LAYER split for Full Load and the shared parts:
 - CDC: ``_cdc_ui`` (control render), ``_cdc_monitoring`` (post-start monitoring / DLQ
   render), ``_cdc_state`` (pure phase predicates), ``_cdc_status`` (status / controller /
   teardown + a couple of shared job/error-log helpers that co-locate by cohesion),
-  ``_cdc_overlay`` (the column-exclusion overlay at Start CDC). Core:
+  ``_cdc_overlay`` (the column-exclusion overlay at Start CDC), ``_cdc_teardown`` (Start
+  over's CDC teardown and the cross-view teardown banner: the hooks the page hands the
+  sidebar). Core:
   :mod:`~dsql_migrator.core.cdc` and siblings + :mod:`~dsql_migrator.core.msk_connect_controller`.
 - Shared, used by BOTH data paths (the Full Load -> CDC watermark handoff, prerequisites,
   and table selection couple them, so they are ONE layer, not split by feature):

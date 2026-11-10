@@ -16389,16 +16389,15 @@ def test_start_over_offers_teardown_for_a_stack_under_another_name() -> None:
     invisible to it -- and the silent prompt is the one that would have stopped the
     MSK / NAT billing.
 
-    Asserted on ``app.py``'s source because the callbacks are per-session closures: the
-    contract is that the offer consults ``cdc_other_stacks``, not just the session's own
-    name.
+    Asserted on the offer's source (``ui/data_migration/_cdc_teardown.py``): the contract is
+    that the offer consults ``cdc_other_stacks``, not just the session's own name.
     """
     import ast
     import inspect
 
-    from dsql_migrator.ui import app as app_module
+    from dsql_migrator.ui.data_migration import _cdc_teardown
 
-    src = inspect.getsource(app_module)
+    src = inspect.getsource(_cdc_teardown)
     tree = ast.parse(src)
     deployed = next(
         node
@@ -16509,9 +16508,9 @@ def test_start_over_offer_and_teardown_share_one_resolver() -> None:
     import ast
     import inspect
 
-    from dsql_migrator.ui import app as app_module
+    from dsql_migrator.ui.data_migration import _cdc_teardown
 
-    tree = ast.parse(inspect.getsource(app_module))
+    tree = ast.parse(inspect.getsource(_cdc_teardown))
     by_name = {
         node.name: node
         for node in ast.walk(tree)
@@ -16528,10 +16527,10 @@ def test_start_over_offer_and_teardown_share_one_resolver() -> None:
     assert "_cdc_teardown_stack_names()" in teardown, (
         "the teardown must resolve stacks the same way the offer did"
     )
-    # It must hand the WHOLE resolved list to the plan builder. This lives inside
-    # build_page's closure, so it cannot be called directly -- and the failure mode is
-    # silent (extra stacks keep billing behind a success toast), so assert on the call
-    # shape: cdc_teardown_plan(stack_names, ...) with stack_names passed unsliced.
+    # It must hand the WHOLE resolved list to the plan builder. The failure mode is silent
+    # (extra stacks keep billing behind a success toast), so the call shape is pinned as
+    # well: cdc_teardown_plan(stack_names, ...) with stack_names passed unsliced
+    # (tests/test_rr_as1_cdc_teardown_hooks.py runs the hook over two stacks).
     plan_calls = [
         node
         for node in ast.walk(by_name["_cdc_teardown_on_reset"])
@@ -24453,12 +24452,12 @@ def test_a_still_deleting_stack_is_not_reported_as_a_failed_teardown() -> None:
 
 def test_the_banner_getter_uses_the_settled_state_helper() -> None:
     # Structural: the decision must come from the shared helper, so the in-flight case
-    # cannot drift back to "failed" inside the closure where no test can reach it.
+    # cannot drift back to "failed" inside the banner hook (ui/data_migration/_cdc_teardown.py).
     import inspect
 
-    from dsql_migrator.ui import app as app_mod
+    from dsql_migrator.ui.data_migration import _cdc_teardown
 
-    src = inspect.getsource(app_mod)
+    src = inspect.getsource(_cdc_teardown)
     assert "_settled_teardown_banner_state(_last_status)" in src
     assert '"state": _settled_state,' in src
     # And the observed status is carried for the copy to echo.

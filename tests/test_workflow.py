@@ -1743,62 +1743,6 @@ def test_teardown_queue_progress_and_finished_stacks() -> None:
     assert finished_teardown_stacks([], None) == []
 
 
-def test_banner_getter_wires_the_queue_advance_and_completion() -> None:
-    """Structural guard for the three behaviours that live in build_page's closure.
-
-    They cannot be called directly (the closure needs a live session + stores), and each
-    failure mode is SILENT -- the banner simply stops mentioning stacks that are still
-    deleting and still billing. So assert the wiring: the queue is recorded, the advance
-    is consulted, and completion is persisted before the marker is cleared.
-    """
-    import ast
-    import inspect
-
-    from dsql_migrator.ui import app as app_module
-
-    tree = ast.parse(inspect.getsource(app_module))
-    by_name = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-    }
-
-    # 1. Every launched teardown is recorded, or the banner has nothing to advance to.
-    teardown = ast.unparse(by_name["_cdc_teardown_on_reset"])
-    assert "set_cdc_teardown_queue(" in teardown
-    assert "track_in_queue=launched_queue" in teardown
-
-    # 2. On settle the banner advances to the next unfinished stack instead of clearing.
-    banner = ast.unparse(by_name["_cdc_teardown_banner"])
-    assert "next_unfinished_teardown(" in banner
-    assert "advance_cdc_teardown(" in banner
-    # The advance must be REACHED, not merely present: gating it on a constant-false test
-    # (or dropping the branch body) puts the banner straight back to going silent while
-    # later stacks are still deleting. Assert the guard tests the resolver's result.
-    advance_guard = [
-        node
-        for node in ast.walk(by_name["_cdc_teardown_banner"])
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Name)
-        and node.test.left.id == "following"
-    ]
-    assert advance_guard, (
-        "the queue-advance must be guarded on `following is not None`, not a constant"
-    )
-    assert "advance_cdc_teardown(" in ast.unparse(advance_guard[0])
-    # 3. ...and records a durable completion notice before clearing the marker, so a
-    #    refresh can still tell "finished" from "never ran".
-    assert "set_cdc_teardown_done(" in banner
-    done_at = banner.index("set_cdc_teardown_done(")
-    cleared_at = banner.index("clear_cdc_teardown()")
-    assert done_at < cleared_at, "completion must be recorded BEFORE the marker is cleared"
-    # The dismiss path exists for the close button.
-    assert "dismiss_cdc_teardown_done" in ast.unparse(
-        by_name["_cdc_teardown_done_dismiss"]
-    )
-
-
 def test_build_migration_diagram_labels_postgres_source() -> None:
     # A PostgreSQL source renders "Aurora PostgreSQL" / "PostgreSQL" wording (not MySQL),
     # driven by source_config.source_type.

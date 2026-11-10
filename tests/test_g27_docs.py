@@ -629,8 +629,10 @@ def test_the_manual_says_a_slot_the_postgresql_teardown_cannot_drop_keeps_the_se
     )
     # Start over's "Delete all CDC infrastructure" runs the same teardown, secret cleanup on:
     # it submits through the CDC step's own submit_cdc_teardown (A1).
-    launch = _function(_SRC / "ui" / "app.py", "_launch_cdc_teardown")
-    assert "submit_cdc_teardown(" in launch and "cleanup_secret=cleanup_secret," in launch
+    from tests.test_rr_as1_cdc_teardown_hooks import start_over_delete
+
+    submitted, delete = start_over_delete(monkeypatch)
+    assert submitted["cleanup_secret"] is True and delete["cleanup_source_secret"] is True
     submit = _function(_SRC / "ui" / "data_migration" / "_cdc_ui.py", "submit_cdc_teardown")
     assert "run_cdc_delete(" in submit and "cleanup_source_secret=cleanup_secret," in submit
 

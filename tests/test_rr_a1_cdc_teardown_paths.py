@@ -14,7 +14,7 @@ WAL -- and nothing durable recorded that it was left, that the source was writte
 the teardown ended.
 
 Both paths now go through one ``_cdc_ui.submit_cdc_teardown``. These tests drive the REAL
-``build_page`` closures (the hooks it hands ``build_workflow_sidebar``) with a fake NiceGUI,
+hooks ``build_page`` hands ``build_workflow_sidebar`` (``_cdc_teardown.py``) with a fake NiceGUI,
 a job manager that only records the submitted work, and stubbed deployer functions: no AWS.
 The order is the real one -- Start over's teardown is submitted, then the session is reset,
 then the job body runs -- so credentials read lazily inside the job would come back empty.
