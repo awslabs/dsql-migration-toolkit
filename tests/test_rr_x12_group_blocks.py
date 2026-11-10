@@ -46,6 +46,17 @@ from tests.test_g137_mysql_reader_shards import _table as _source_table
 from tests.test_p1_key_range_spread import spread  # noqa: F401 - the planner on the inline pool
 
 _M = 1_000_000
+_READER_SHARDS = "DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS"
+
+
+@pytest.fixture(autouse=True)
+def _automatic(monkeypatch):
+    """Every test starts with Reader shards unset (the default, automatic), as in
+    tests/test_p1_key_range_spread.py, whose ``spread`` the planner runs below borrow: their
+    expected shards and lines are the automatic split's. Whatever was set before the test is
+    restored after it."""
+    monkeypatch.setenv(_READER_SHARDS, "")  # records the value before the test ...
+    monkeypatch.delenv(_READER_SHARDS)      # ... which the test then runs without
 
 
 def _table(name: str) -> TableDef:
@@ -501,7 +512,6 @@ def _mixed_run(spread, monkeypatch):  # noqa: F811 - the fixture's run, passed i
     session), app.mid (15M: 6 ranges) and app.big (60M: 24 ranges), the last two sharing the
     run's snapshot -- in that order, which is not their names' order. Every activity call
     recorded."""
-    monkeypatch.delenv("DSQL_MIGRATOR_FULL_LOAD_READER_SHARDS", raising=False)
     said: list = []
     monkeypatch.setattr(engine, "log_activity", lambda category, action, **kw: said.append(
         (category, action, kw.get("status"), kw.get("target"), kw.get("detail"))))

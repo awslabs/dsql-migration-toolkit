@@ -1,18 +1,24 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CDC (Change Data Capture) UI for the Data Migration screen.
+"""CDC (Change Data Capture) control UI for the Data Migration screen.
 
-Extracted verbatim from ``data_migration/__init__.py`` -- a pure code move with
-no behavior change. Every function and constant here previously lived in that
-module; the package ``__init__`` re-exports (at the bottom of that file) the names
-its screen code uses and the ones its readers reach as ``dm.<name>``. A test patches
-this module itself: rebinding ``dm.<name>`` does not change what this module calls. This module owns the optional CDC data-plane UI:
-source/start-point cards, infra + start/stop/delete dialogs and their control-plane
-actions, the deploy/live-status panels, DLQ + pipeline-health monitoring, and the
-shared live migration-table status grid. The Full Load screen, the activity-log
-anchor (``_log_cdc_event``) and its connector-transition logger, and the
-migration-type lock helper stay in ``__init__``.
+The CDC step (:func:`_render_cdc_step`) and what it controls: the source and start-point
+cards, the infrastructure, Start, Stop and Delete dialogs, the control-plane actions behind
+them and the checks they run first, and the panel that follows a running lifecycle job (its
+stages and deploy log). The post-start monitoring is ``_cdc_monitoring``'s. The step renders
+four of its panels -- the live monitoring, the dead-letter recovery shown while that is
+hidden, the per-table migration status grid and the CDC-handling reference -- which this
+module imports at its bottom, so only a patch made here reaches the step. The
+dead-letter-queue and pipeline-health panels render inside that live monitoring: this module
+neither defines nor imports them.
+
+Split out of ``data_migration/__init__.py``, which re-exports (at the bottom of that file)
+the names its screen code uses and the ones its readers reach as ``dm.<name>``. A test
+patches this module itself: rebinding ``dm.<name>`` does not change what this module calls.
+The activity-log anchor (``_log_cdc_event``) and its connector-transition logger, and the
+migration-type lock helper, stay in ``__init__``; the Full Load step's render lives in
+``_full_load_ui``.
 """
 
 from __future__ import annotations

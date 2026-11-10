@@ -10,8 +10,11 @@ key whose parent side is incomplete by design is counted for orphans before its 
 pre-gate (:func:`_pregate_orphans`, :func:`_count_orphans`). The Full Load's post-load pass
 (``BatchedTableMigrator.apply_foreign_keys``) and Cut over, once the CDC stream has
 drained, both run it. Beside it: the key selection both share (:func:`foreign_keys_in_scope`,
-:func:`foreign_keys_to_apply`, :func:`foreign_keys_counted_before_add`,
-:func:`pending_foreign_key_count`, ...) and the constraint and index name readers
+:func:`foreign_keys_pointing_in`, :func:`foreign_keys_to_apply`,
+:func:`foreign_keys_counted_before_add`), the Full Load's count of the keys it still has to
+apply (:func:`pending_foreign_key_count`; Cut over counts its own over the same selection,
+``ui/cutover.py``'s ``_cutover_pending_foreign_keys``, and lists them with
+``_fk_validation.pending_foreign_keys``), and the constraint and index name readers
 (:func:`_named_foreign_key_ddls`, :func:`_stored_index_name`).
 
 It was split out of ``_full_load_engine``, which re-exports every name defined here

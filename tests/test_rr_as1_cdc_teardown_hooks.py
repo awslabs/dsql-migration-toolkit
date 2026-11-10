@@ -18,6 +18,10 @@ Pinned here:
 * when the tracked stack settles while another is still deleting, the banner moves the
   marker to that one and says which of how many, instead of going silent: to the FIRST
   stack in the queue still deleting, past any that finished before the tracked one;
+* a stack whose job record is gone (pruned, or lost with the process) counts as settled
+  there too, wherever it sits in the queue -- first, in the middle, or every record: each
+  read does exactly what ``next_unfinished_teardown`` says for the same queue, the helper
+  tests/test_workflow.py pins the rule on;
 * once every stack has settled, the banner records the finished-teardown notice -- every
   stack, and the teardown's kind, both read from the marker -- before it clears the marker,
   and the notice's close button dismisses it;
@@ -208,6 +212,95 @@ def test_the_banner_moves_past_stacks_that_finished_first_to_the_first_still_del
     assert rig.hooks.cdc_teardown_banner() is None
     assert rig.hooks.cdc_teardown_done() == {"kind": "delete", "stacks": stacks}
     assert rig.state.cdc_teardown_job_id is None
+
+
+def _forget(jm, job_id: str) -> None:
+    """The job manager loses ``job_id``'s record: pruned once it finished, or lost with the
+    process. ``get_status`` then raises ``JobNotFoundError``, as the real JobManager's does."""
+    del jm.works[job_id]
+    del jm.status[job_id]
+
+
+def _start_over_three_stacks(monkeypatch) -> SimpleNamespace:
+    """Start over's delete with the session's own stack and two discovered ones."""
+    rig = _hooks(monkeypatch)
+    discovered = ["dsql-cdc-as1-second", "dsql-cdc-as1-third"]
+    rig.state.set_cdc_other_stacks([(name, "UPDATE_COMPLETE") for name in discovered])
+    rig.hooks.cdc_teardown_on_reset("delete")
+    rig.stacks, rig.jobs = [STACK, *discovered], list(rig.jm.works)
+    assert rig.state.cdc_teardown_queue == list(zip(rig.jobs, rig.stacks))
+    return rig
+
+
+def _read_the_banner_against_the_resolver(rig):
+    """Read the banner once and check it did what ``next_unfinished_teardown`` says for the
+    same job manager and queue, read just before it: moved the marker to the stack the
+    resolver names, or -- when it names none -- recorded every stack finished and cleared the
+    marker. Returns the resolver's answer."""
+    from dsql_migrator.ui.data_migration._cdc_status import next_unfinished_teardown
+
+    queue = list(rig.state.cdc_teardown_queue)
+    following = next_unfinished_teardown(rig.jm, queue)
+    banner = rig.hooks.cdc_teardown_banner()
+    if following is None:
+        assert banner is None
+        assert rig.hooks.cdc_teardown_done() == {
+            "kind": "delete", "stacks": [stack for _job, stack in queue],
+        }
+        assert rig.state.cdc_teardown_job_id is None
+    else:
+        job_id, stack, index, total = following
+        assert banner == {
+            "state": "running", "kind": "delete", "stack": stack, "index": index,
+            "total": total,
+        }
+        assert (rig.state.cdc_teardown_job_id, rig.state.cdc_teardown_stack) == (
+            job_id, stack,
+        )
+        assert rig.hooks.cdc_teardown_done() is None
+    return following
+
+
+def test_the_banner_moves_past_a_tracked_stack_whose_job_record_is_gone(monkeypatch) -> None:
+    """A job the manager no longer knows counts as settled (``next_unfinished_teardown``;
+    tests/test_workflow.py pins the rule on the helper). The banner reads the queue through
+    that helper, so it skips such a stack wherever it sits; the tests above build queues whose
+    records all exist, so they cannot tell the helper from a loop that crashes on a missing
+    record or one that keeps following it. This one: the first, tracked stack's record."""
+    rig = _start_over_three_stacks(monkeypatch)
+    _forget(rig.jm, rig.jobs[0])
+
+    assert _read_the_banner_against_the_resolver(rig) == (rig.jobs[1], rig.stacks[1], 2, 3)
+    rig.jm.run(rig.jobs[1])
+    assert _read_the_banner_against_the_resolver(rig) == (rig.jobs[2], rig.stacks[2], 3, 3)
+    rig.jm.run(rig.jobs[2])
+    # Every stack has settled: the notice names all three, the forgotten one too.
+    assert _read_the_banner_against_the_resolver(rig) is None
+
+
+def test_the_banner_moves_past_a_queued_stack_whose_job_record_is_gone(monkeypatch) -> None:
+    """The record missing in the middle of the queue: the tracked stack finished, and the
+    banner moves past the next one, whose record is gone, to the last, still deleting."""
+    rig = _start_over_three_stacks(monkeypatch)
+    rig.jm.run(rig.jobs[0])
+    _forget(rig.jm, rig.jobs[1])
+
+    assert _read_the_banner_against_the_resolver(rig) == (rig.jobs[2], rig.stacks[2], 3, 3)
+    rig.jm.run(rig.jobs[2])
+    assert _read_the_banner_against_the_resolver(rig) is None
+
+
+def test_the_banner_reports_the_teardown_finished_when_every_job_record_is_gone(
+    monkeypatch,
+) -> None:
+    """Every record gone, as after a restart: nothing is left to follow, so the banner
+    records the finished-teardown notice for all three stacks and clears the marker."""
+    rig = _start_over_three_stacks(monkeypatch)
+    for job_id in rig.jobs:
+        _forget(rig.jm, job_id)
+
+    assert _read_the_banner_against_the_resolver(rig) is None
+    assert rig.state.cdc_teardown_queue == []
 
 
 def test_the_banner_records_the_finished_teardown_before_it_clears_the_marker(

@@ -18,8 +18,12 @@ Pinned here:
   ``__init__``, or ``_cdc_ui``, which imports names back from it -- at its top or inside a
   function, by any import statement: ``import ...data_migration``, ``from ...data_migration
   import <name>``, a relative import, or the parent-package ``from dsql_migrator.ui import
-  data_migration``, the E2E harness's own spelling. A self-test feeds the scan each
-  spelling, so a scan that stops seeing one fails;
+  data_migration``, the E2E harness's own spelling -- nor reads either off an ancestor it
+  imports, through an attribute chain: ``import dsql_migrator.ui`` then
+  ``dsql_migrator.ui.data_migration.<name>``, ``from dsql_migrator import ui`` then
+  ``ui.data_migration.<name>``, ``import dsql_migrator`` then
+  ``dsql_migrator.ui.data_migration...``. A self-test feeds the scan each spelling, so a
+  scan that stops seeing one fails;
 * which moved names the package's own code reads: the only calls a patch on ``dm.<name>``
   reaches. The screen code calls the picker, the panel, the default and effective selection
   and the migratable / target-existing table names, and the suite patches the picker and the
@@ -99,26 +103,57 @@ def test_the_package_re_exports_every_name_the_two_modules_define() -> None:
 
 
 def _back_imports(source: str) -> "list[str]":
-    """The import statements anywhere in ``source`` that import the package or ``_cdc_ui``.
+    """The places anywhere in ``source`` that import the package or ``_cdc_ui``, or reach
+    either through an attribute chain.
 
     ``from M import a`` reads ``a`` off ``M`` or loads the submodule ``M.a``, so ``M`` and
     ``M.a`` are both its targets: ``from dsql_migrator.ui import data_migration`` imports
     the package as ``import dsql_migrator.ui.data_migration`` does. Any relative import
     counts (both modules import absolutely).
+
+    An import of an ancestor reaches the package without naming it: ``import
+    dsql_migrator.ui`` then ``dsql_migrator.ui.data_migration.<name>``, ``from dsql_migrator
+    import ui`` then ``ui.data_migration.<name>``, and any ``import dsql_migrator...``, which
+    binds ``dsql_migrator``. So each name an import binds is followed through the attribute
+    chains read off it, and a chain that passes through the package or ``_cdc_ui`` counts.
     """
     banned = {_PACKAGE, f"{_PACKAGE}._cdc_ui"}
+    tree = ast.parse(source)
     found: "list[str]" = []
-    for node in ast.walk(ast.parse(source)):
+    bound: "dict[str, set[str]]" = {}  # a name an import binds -> the module paths it names
+    for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.level:  # from . import x / from ._cdc_ui import x
                 found.append(f"{node.lineno}: {ast.unparse(node)}")
                 continue
             targets = {node.module} | {f"{node.module}.{alias.name}" for alias in node.names}
+            for alias in node.names:
+                bound.setdefault(alias.asname or alias.name, set()).add(
+                    f"{node.module}.{alias.name}"
+                )
         elif isinstance(node, ast.Import):
             targets = {alias.name for alias in node.names}
+            for alias in node.names:
+                # import a.b.c binds a, to a; import a.b.c as x binds x, to a.b.c
+                top = alias.name.split(".")[0]
+                bound.setdefault(alias.asname or top, set()).add(
+                    alias.name if alias.asname else top
+                )
         else:
             continue
         if targets & banned:
+            found.append(f"{node.lineno}: {ast.unparse(node)}")
+    for node in ast.walk(tree):
+        # Every Attribute is checked, prefixes included: a.b.c's prefix a.b is its own node.
+        if not isinstance(node, ast.Attribute):
+            continue
+        attrs, base = [], node
+        while isinstance(base, ast.Attribute):
+            attrs.insert(0, base.attr)
+            base = base.value
+        if isinstance(base, ast.Name) and any(
+            ".".join([path, *attrs]) in banned for path in bound.get(base.id, ())
+        ):
             found.append(f"{node.lineno}: {ast.unparse(node)}")
     return found
 
@@ -140,8 +175,9 @@ def test_neither_module_imports_the_package_or_cdc_ui() -> None:
 
 def test_the_import_scan_catches_every_spelling_of_a_back_import() -> None:
     # The scan is only as good as the spellings it knows. Each of these imports the package
-    # or _cdc_ui, or is relative, and must be caught at a module's top and inside a function;
-    # the kinds of import the two modules make, and a sibling's parent-package spelling,
+    # or _cdc_ui, or is relative, or imports an ancestor and reads the package or _cdc_ui off
+    # it, and must be caught at a module's top and inside a function; the kinds of import the
+    # two modules make, a sibling's parent-package spelling and a chain to another module
     # must not be.
     back_imports = [
         "import dsql_migrator.ui.data_migration",
@@ -154,16 +190,35 @@ def test_the_import_scan_catches_every_spelling_of_a_back_import() -> None:
         "import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui",
         "from . import _cdc_ui",
         "from ._models import keep_unlisted_covered",
+        # An ancestor, then an attribute chain through the package or _cdc_ui: the import
+        # names neither, and any import dsql_migrator.<module> binds dsql_migrator.
+        "import dsql_migrator.ui\ndsql_migrator.ui.data_migration.build_data_migration_screen()",
+        "from dsql_migrator import ui\nui.data_migration.build_data_migration_screen()",
+        "import dsql_migrator\n"
+        "dsql_migrator.ui.data_migration._cdc_ui._render_cdc_attach_row()",
+        "import dsql_migrator.ui as u\nu.data_migration.build_data_migration_screen()",
+        "import dsql_migrator.ui.design\n"
+        "dsql_migrator.ui.data_migration.build_data_migration_screen()",
     ]
     allowed = [
         "from dsql_migrator.ui.data_migration._models import keep_unlisted_covered",
         "from dsql_migrator.ui.data_migration._table_set_lock import LOCK_TIP_RULE",
         "from dsql_migrator.ui.design import render_notice",
         "from dsql_migrator.ui import design",
+        "import dsql_migrator.ui.design\ndsql_migrator.ui.design.render_notice()",
+        "from dsql_migrator import ui\nui.design.render_notice()",
+        "import dsql_migrator\ndsql_migrator.core.models.SourceType",
     ]
 
-    def placements(statement: str) -> "list[str]":
-        return [statement, f"def f():\n    {statement}\n"]
+    def placements(snippet: str) -> "list[str]":
+        """At a module's top and inside a function; an import and a read, also split: the
+        import at the top, the read inside a function."""
+        lines = snippet.split("\n")
+        indented = "".join(f"    {line}\n" for line in lines)
+        out = [snippet, f"def f():\n{indented}"]
+        if len(lines) == 2:
+            out.append(f"{lines[0]}\ndef f():\n    {lines[1]}\n")
+        return out
 
     missed = [
         statement
