@@ -16,7 +16,10 @@ Pinned here:
   leave the suite green;
 * the one-directional imports both docstrings state: neither module imports the package
   ``__init__``, or ``_cdc_ui``, which imports names back from it -- at its top or inside a
-  function;
+  function, by any import statement: ``import ...data_migration``, ``from ...data_migration
+  import <name>``, a relative import, or the parent-package ``from dsql_migrator.ui import
+  data_migration``, the E2E harness's own spelling. A self-test feeds the scan each
+  spelling, so a scan that stops seeing one fails;
 * which moved names the package's own code reads: the only calls a patch on ``dm.<name>``
   reaches. The screen code calls the picker, the panel, the default and effective selection
   and the migratable / target-existing table names, and the suite patches the picker and the
@@ -95,27 +98,86 @@ def test_the_package_re_exports_every_name_the_two_modules_define() -> None:
     assert not_re_exported == [], f"the package does not re-export {not_re_exported}"
 
 
+def _back_imports(source: str) -> "list[str]":
+    """The import statements anywhere in ``source`` that import the package or ``_cdc_ui``.
+
+    ``from M import a`` reads ``a`` off ``M`` or loads the submodule ``M.a``, so ``M`` and
+    ``M.a`` are both its targets: ``from dsql_migrator.ui import data_migration`` imports
+    the package as ``import dsql_migrator.ui.data_migration`` does. Any relative import
+    counts (both modules import absolutely).
+    """
+    banned = {_PACKAGE, f"{_PACKAGE}._cdc_ui"}
+    found: "list[str]" = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level:  # from . import x / from ._cdc_ui import x
+                found.append(f"{node.lineno}: {ast.unparse(node)}")
+                continue
+            targets = {node.module} | {f"{node.module}.{alias.name}" for alias in node.names}
+        elif isinstance(node, ast.Import):
+            targets = {alias.name for alias in node.names}
+        else:
+            continue
+        if targets & banned:
+            found.append(f"{node.lineno}: {ast.unparse(node)}")
+    return found
+
+
 def test_neither_module_imports_the_package_or_cdc_ui() -> None:
     import importlib
 
-    banned = {_PACKAGE, f"{_PACKAGE}._cdc_ui"}
-    offenders: "list[str]" = []
-    for module in _MODULES:
-        path = pathlib.Path(importlib.import_module(f"{_PACKAGE}.{module}").__file__)
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.ImportFrom):
-                targets = {node.module or ""}
-                if node.level:  # from . import x / from ._cdc_ui import x
-                    targets = {"<relative>"}
-                elif node.module == _PACKAGE:
-                    targets |= {f"{_PACKAGE}.{alias.name}" for alias in node.names}
-            elif isinstance(node, ast.Import):
-                targets = {alias.name for alias in node.names}
-            else:
-                continue
-            if targets & (banned | {"<relative>"}):
-                offenders.append(f"{module}:{node.lineno}: {ast.unparse(node)}")
+    offenders = [
+        f"{module}:{statement}"
+        for module in _MODULES
+        for statement in _back_imports(
+            pathlib.Path(importlib.import_module(f"{_PACKAGE}.{module}").__file__).read_text(
+                encoding="utf-8"
+            )
+        )
+    ]
     assert offenders == [], offenders
+
+
+def test_the_import_scan_catches_every_spelling_of_a_back_import() -> None:
+    # The scan is only as good as the spellings it knows. Each of these imports the package
+    # or _cdc_ui, or is relative, and must be caught at a module's top and inside a function;
+    # the kinds of import the two modules make, and a sibling's parent-package spelling,
+    # must not be.
+    back_imports = [
+        "import dsql_migrator.ui.data_migration",
+        "import dsql_migrator.ui.data_migration as dm",
+        "from dsql_migrator.ui import data_migration",
+        "from dsql_migrator.ui import data_migration as dm",
+        "from dsql_migrator.ui.data_migration import build_data_migration_screen",
+        "from dsql_migrator.ui.data_migration import _cdc_ui",
+        "from dsql_migrator.ui.data_migration._cdc_ui import _render_cdc_attach_row",
+        "import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui",
+        "from . import _cdc_ui",
+        "from ._models import keep_unlisted_covered",
+    ]
+    allowed = [
+        "from dsql_migrator.ui.data_migration._models import keep_unlisted_covered",
+        "from dsql_migrator.ui.data_migration._table_set_lock import LOCK_TIP_RULE",
+        "from dsql_migrator.ui.design import render_notice",
+        "from dsql_migrator.ui import design",
+    ]
+
+    def placements(statement: str) -> "list[str]":
+        return [statement, f"def f():\n    {statement}\n"]
+
+    missed = [
+        statement
+        for statement in back_imports
+        for source in placements(statement)
+        if not _back_imports(source)
+    ]
+    flagged = [
+        statement
+        for statement in allowed
+        for source in placements(statement)
+        if _back_imports(source)
+    ]
+    assert missed == [] and flagged == [], (missed, flagged)
 
 
 def test_the_package_code_reads_only_these_moved_names() -> None:
