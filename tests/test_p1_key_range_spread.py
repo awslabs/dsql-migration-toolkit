@@ -183,7 +183,8 @@ class _KPlanner:
 @pytest.fixture
 def spread(monkeypatch):
     """``_migrate_tables_in_parallel`` on the process path, the workers inline and recorded;
-    Tables in parallel 4, Reader shards unset."""
+    Tables in parallel 4, Reader shards unset. ``fresh=False``: a retry, its start point
+    captured by an earlier run."""
     seen = SimpleNamespace(shards=[], wholes=[], activity=[], anchors=0, unique=[])
 
     def _shard(args):
@@ -212,7 +213,7 @@ def spread(monkeypatch):
     monkeypatch.setenv("DSQL_MIGRATOR_FULL_LOAD_TABLE_PARALLELISM", "4")
 
     def run(tables, counts, *, source=SourceType.MYSQL, cdc=False, binlog=True,
-            coexisting=False, replace=()):
+            coexisting=False, replace=(), fresh=True):
         for bucket in (seen.shards, seen.wholes, seen.activity, seen.unique):
             bucket.clear()
         seen.anchors = 0
@@ -236,7 +237,7 @@ def spread(monkeypatch):
         handle.job.watermark = watermark       # what split_read_tables reads the record by
         counts_ = engine._migrate_tables_in_parallel(
             handle, "j", tables, migrator, ErrorLogStore(), watermark=watermark,
-            fresh_watermark=True,
+            fresh_watermark=fresh,
         )
         return SimpleNamespace(
             counts=counts_, planned=list(planner.calls), shards=list(seen.shards),

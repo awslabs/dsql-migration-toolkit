@@ -21,7 +21,10 @@ Pinned here:
 * blocks: over a grid, a table's shards read its ranges once, contiguously, in order;
 * the planner: its "reader shards" lines in plan order through ``_migrate_tables_in_parallel``,
   as captured before the extraction; it reaches the helper and ``_largest_first`` (which the
-  perf harness patches) through the module, and the helper reads, logs and stamps nothing.
+  perf harness patches) through the module, and the helper reads, logs and stamps nothing;
+* what the planner hands the helper: the tables it withheld, which leave their slots to a
+  shared-snapshot table, and the start point's estimates, which size a retry's shares as they
+  sized the run that took it (the plans pass on the engine before the extraction too).
 
 Doubles only: no source, no Aurora DSQL, no AWS.
 """
@@ -546,7 +549,8 @@ def test_the_planner_reaches_the_helper_and_largest_first_through_the_module(
     helper, largest_first = engine._assign_group_blocks, engine._largest_first
 
     def _helper(work_units, estimates, tp, withheld):
-        seen.append(("helper", [u.table.name for u in work_units], dict(estimates), tp))
+        seen.append(("helper", [u.table.name for u in work_units], dict(estimates), tp,
+                     set(withheld)))
         return helper(work_units, estimates, tp, withheld)
 
     def _largest(work_units, estimates):
@@ -559,7 +563,7 @@ def test_the_planner_reaches_the_helper_and_largest_first_through_the_module(
     estimates = {"app.small": 1 * _M, "app.refused": 20 * _M, "app.big": 60 * _M,
                  "app.mid": 15 * _M}
     assert seen == [
-        ("helper", ["app.small", "app.refused", "app.mid", "app.big"], estimates, 4),
+        ("helper", ["app.small", "app.refused", "app.mid", "app.big"], estimates, 4, set()),
         ("largest_first", ["app.small", "app.refused", "app.mid", "app.big", "app.big"]),
     ]
 
@@ -596,3 +600,90 @@ def test_the_helper_reads_logs_and_stamps_nothing() -> None:
         "_SPLIT_ONE_SNAPSHOT.format", "_SPLIT_SHARED_SNAPSHOT.format",
         "_SPLIT_SHARED_SNAPSHOT_BLOCKS.format",
     }
+
+
+# ---------------------------------------------------------------------------
+# What the planner hands the helper: what it withheld, the start point's estimates
+# ---------------------------------------------------------------------------
+
+# Two names that agree in their first 63 bytes share one stored name on Aurora DSQL, so the run
+# withholds both (BatchedTableMigrator finds them in the inventory: name_clash_tables): they are
+# never recreated, split or loaded.
+_CLASHING = ("app." + "c" * 63 + "1", "app." + "c" * 63 + "2")
+
+
+def _beside(spread, others):  # noqa: F811 - the fixture's run, passed in
+    """A PostgreSQL run at Tables in parallel 4: app.big (30M rows: 12 ranges) shares the run's
+    snapshot, app.keyed (30M, a text key: one reader) does not, and ``others`` have no rows."""
+    return spread(
+        [_source_table("app.big"), _source_table("app.keyed", lead="text"),
+         *[_source_table(name) for name in others]],
+        {"app.big": 30 * _M, "app.keyed": 30 * _M, **dict.fromkeys(others, 0)},
+        source=SourceType.POSTGRES, binlog=False,
+    )
+
+
+def _alone(spread, *, fresh):  # noqa: F811 - the fixture's run, passed in
+    """app.events (100M rows: 32 ranges) alone, on PostgreSQL at Tables in parallel 4;
+    ``fresh=False``: a retry, its start point captured by an earlier run."""
+    return spread([_source_table("app.events")], {"app.events": 100 * _M},
+                  source=SourceType.POSTGRES, binlog=False, fresh=fresh)
+
+
+def _shards(r) -> list:
+    """Each shard the run started: (table, index, base, how many ranges it reads)."""
+    return [(a.table.name, a.shard_index, a.range_base, len(a.ranges)) for a in r.shards]
+
+
+def test_a_table_the_planner_withheld_leaves_its_slot_to_a_shared_snapshot_table(
+        spread) -> None:  # noqa: F811
+    # app.big's share of the 4 processes is 2.0 beside app.keyed. The two clashing tables are
+    # withheld and hold no slot, so the idle one goes to app.big: 3 shards of 4 ranges. Two
+    # empty tables that do load hold one each, so none is idle: 2 shards of 6.
+    withheld = _beside(spread, _CLASHING)
+    assert {name: withheld.status[name] for name in _CLASHING} == dict.fromkeys(
+        _CLASHING, "FAILED")
+    assert set(withheld.wholes) == {"app.keyed"}
+    assert _shards(withheld) == [("app.big", 0, 0, 4), ("app.big", 1, 4, 4), ("app.big", 2, 8, 4)]
+    assert withheld.lines == [
+        ("app.big", "read in 12 primary-key ranges by 3 readers sharing one snapshot")]
+    loaded = _beside(spread, ("app.e1", "app.e2"))
+    assert _shards(loaded) == [("app.big", 0, 0, 6), ("app.big", 1, 6, 6)]
+    assert loaded.lines == [
+        ("app.big", "read in 12 primary-key ranges by 2 readers sharing one snapshot")]
+
+
+def test_a_retry_spreads_a_shared_snapshot_table_as_the_run_that_took_its_start_point(
+        spread) -> None:  # noqa: F811
+    # A retry's start point may be days old, so its estimates no longer spare a planning read
+    # (the planner's _estimates is empty), but they still size the table's split and its share
+    # of the run: all 4 processes, 4 shards of 8 ranges, not one reader session.
+    for fresh in (True, False):
+        r = _alone(spread, fresh=fresh)
+        assert _shards(r) == [("app.events", g, 8 * g, 8) for g in range(4)], fresh
+        assert r.lines == [
+            ("app.events", "read in 32 primary-key ranges by 4 readers sharing one snapshot"),
+        ], fresh
+        assert r.wholes == {} and r.parts == {"app.events": 4}, fresh
+
+
+def test_the_planner_hands_the_helper_what_it_withheld_and_its_start_points_estimates(
+        spread, monkeypatch) -> None:  # noqa: F811
+    # The two runs above, as the helper sees them: the tables the planner withheld, and the
+    # start point's estimates of the tables that may start (_order_estimates) -- without the
+    # withheld ones, which the fresh run's _estimates still holds (0 rows each), and also on a
+    # retry, whose _estimates is empty.
+    handed: list = []
+    helper = engine._assign_group_blocks
+
+    def _spy(work_units, estimates, tp, withheld):
+        handed.append((dict(estimates), tp, set(withheld)))
+        return helper(work_units, estimates, tp, withheld)
+
+    monkeypatch.setattr(engine, "_assign_group_blocks", _spy)
+    _beside(spread, _CLASHING)
+    _alone(spread, fresh=False)
+    assert handed == [
+        ({"app.big": 30 * _M, "app.keyed": 30 * _M}, 4, set(_CLASHING)),
+        ({"app.events": 100 * _M}, 4, set()),
+    ]
