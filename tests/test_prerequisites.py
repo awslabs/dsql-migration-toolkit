@@ -2206,6 +2206,11 @@ def test_the_existence_check_is_gated_by_the_provisioners_own_predicate() -> Non
     assert "_handoff_stack is not None and _wm_for_gate is None" in window
     # ...and NOT re-derived from the migration type, which is the drift this avoids.
     assert "provisions_replication=migration_state.migration_type" not in src
+    from dsql_migrator.ui.data_migration import _prereq_ui, _selection_ui
+
+    for module in (_prereq_ui, _selection_ui):  # split out of the package (dmshared-06)
+        source = inspect.getsource(module)
+        assert "provisions_replication=migration_state.migration_type" not in source
 
 
 def test_the_checker_derives_the_object_names_and_forwards_the_provisioning_flag() -> None:

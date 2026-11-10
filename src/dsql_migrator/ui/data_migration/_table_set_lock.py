@@ -26,9 +26,10 @@ A re-export does not carry a monkeypatch, nor does any module-level import: a te
 a name on the module whose code reads it. A patch here reaches the calls made in this
 module and the readers that import the name inside a function, at call time: ``_models``,
 ``_full_load_ui`` and ``ui.validation``. It does not reach the readers that bind it with a
-module-level import: ``_exclusion_dialog``, ``_cdc_ui``, the package ``__init__``, and
-``_cdc_monitoring``, whose ``_exclusion_state_facts`` reads ``exclusion_lock_state``
-through the re-export. A test of one of those patches the name there.
+module-level import: ``_exclusion_dialog``, ``_cdc_ui``, ``_selection_ui`` (the table
+tree's two lock tips), the package ``__init__``, and ``_cdc_monitoring``, whose
+``_exclusion_state_facts`` reads ``exclusion_lock_state`` through the re-export. A test of
+one of those patches the name there.
 """
 
 from __future__ import annotations

@@ -228,6 +228,7 @@ def test_the_start_cdc_refusal_lists_are_bounded_and_read_right() -> None:
 def test_the_combined_panel_names_each_blocked_table_once(monkeypatch) -> None:
     """The 'CDC stream blocked' notice repeated one bare title per failing table."""
     import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.ui.data_migration import _prereq_ui
     from dsql_migrator.core.models import (
         MigrationMode,
         PrerequisiteCheckId,
@@ -264,7 +265,10 @@ def test_the_combined_panel_names_each_blocked_table_once(monkeypatch) -> None:
     ]
     results.append(results[0].model_copy())
     shown: list = []
-    monkeypatch.setattr(dm, "render_notice", lambda _ui, **kw: shown.append(kw.get("body", "")))
+    # _render_prereq_phase_verdicts lives in _prereq_ui and reads render_notice there.
+    monkeypatch.setattr(
+        _prereq_ui, "render_notice", lambda _ui, **kw: shown.append(kw.get("body", ""))
+    )
     dm._render_prereq_phase_verdicts(_Ui(), PrerequisiteReport.build(MigrationMode.CDC, results))
     (text,) = shown
     assert f"{title} (app.devices_0); {title} (app.devices_1)" in text

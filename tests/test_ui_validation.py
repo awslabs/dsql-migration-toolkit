@@ -4191,13 +4191,15 @@ def test_object_picker_shortcuts_match_the_other_screens_convention() -> None:
     """
     import inspect
 
-    from dsql_migrator.ui import data_migration, schema_conversion, validation
+    from dsql_migrator.ui import schema_conversion, validation
+    # Data Migration's picker renders its shortcuts in _selection_ui (_render_table_selection).
+    from dsql_migrator.ui.data_migration import _selection_ui
 
     affirmative = "flat dense no-caps size=sm color=primary icon=done_all"
     clearing = "flat dense no-caps size=sm color=grey-7 icon=remove_done"
 
     # The convention is what the other two screens actually use.
-    for module in (schema_conversion, data_migration):
+    for module in (schema_conversion, _selection_ui):
         src = inspect.getsource(module)
         assert affirmative in src, module.__name__
         assert clearing in src, module.__name__

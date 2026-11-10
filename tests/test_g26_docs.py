@@ -339,7 +339,8 @@ def test_chapter_6_lets_only_a_streamed_source_connectors_reload_converge(lang: 
         "the target; Validation reports it as an EXTRA row)"
         in pg_cdc_route(None, started=True, cdc_only=True)
     )
-    screen = _joined(ROOT / "src" / "dsql_migrator" / "ui" / "data_migration" / "__init__.py")
+    # The gapless-handoff choice's re-snapshot route (_render_gapless_choice, _prereq_ui).
+    screen = _joined(ROOT / "src" / "dsql_migrator" / "ui" / "data_migration" / "_prereq_ui.py")
     assert (
         "a row DELETED between the load and the start is in neither the snapshot nor the stream, "
         "so it stays on the target (Validation reports it as an extra row" in screen

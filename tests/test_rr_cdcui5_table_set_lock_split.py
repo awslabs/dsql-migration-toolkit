@@ -132,6 +132,7 @@ def test_the_patch_note_lists_every_src_reader_by_where_it_imports() -> None:
     assert at_load == {
         f"{_PACKAGE}._exclusion_dialog",
         f"{_PACKAGE}._cdc_ui",
+        f"{_PACKAGE}._selection_ui",
         f"{_PACKAGE}.__init__",
         f"{_PACKAGE}._cdc_monitoring",
     }, f"update _table_set_lock's patch note (a patch there misses these): {sorted(at_load)}"

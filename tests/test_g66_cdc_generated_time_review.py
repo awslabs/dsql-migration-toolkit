@@ -452,6 +452,7 @@ def test_a_domains_not_null_counts_for_the_uncarryable_column_probe() -> None:
 def test_the_combined_panel_says_the_run_waits_for_cdc(monkeypatch) -> None:
     """'The Full Load can run now' sat beside a Run held by the same CDC-only FAIL."""
     import dsql_migrator.ui.data_migration as dm
+    from dsql_migrator.ui.data_migration import _prereq_ui
     from dsql_migrator.core.models import (
         MigrationMode,
         PrerequisiteCheckId,
@@ -488,7 +489,10 @@ def test_the_combined_panel_says_the_run_waits_for_cdc(monkeypatch) -> None:
         )
     ])
     shown: list = []
-    monkeypatch.setattr(dm, "render_notice", lambda _ui, **kw: shown.append(kw.get("body", "")))
+    # _render_prereq_phase_verdicts lives in _prereq_ui and reads render_notice there.
+    monkeypatch.setattr(
+        _prereq_ui, "render_notice", lambda _ui, **kw: shown.append(kw.get("body", ""))
+    )
     dm._render_prereq_phase_verdicts(_Ui(), report)
     (text,) = shown
     assert "starts only once CDC can follow it" in text

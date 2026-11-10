@@ -181,6 +181,8 @@ def test_every_path_reads_the_effective_set_not_the_raw_one():
     init = (root / "__init__.py").read_text(encoding="utf-8")
     assert init.count("excluded_lob_columns=effective_lob_exclusions(") == 3
     assert init.count(raw) == 0  # the run guard reads state.lob_exclusions() on its own name
+    for name in ("_prereq_ui.py", "_selection_ui.py"):  # split out of __init__ (dmshared-06)
+        assert raw not in (root / name).read_text(encoding="utf-8")
     assert "_prereq_exclusions = effective_lob_exclusions(" in init
     val = (ui / "validation.py").read_text(encoding="utf-8")
     # Both builders (run and re-check) take the omitted set from the ONE split, which
