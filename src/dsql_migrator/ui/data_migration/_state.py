@@ -637,8 +637,9 @@ class DataMigrationState:
         # stop/delete submits the teardown just before the reset, and wiping the
         # marker would hide the running teardown (the very gap the banner closes).
         # ``kind`` is "stop"|"delete"; cleared once the job settles (see the banner
-        # getter in ``app.py``). Transient/session-only (not persisted across restart;
-        # the CDC step's DELETE_IN_PROGRESS stack-probe notice covers that case).
+        # getter, ``_cdc_teardown_banner`` in ``ui/data_migration/_cdc_teardown.py``).
+        # Transient/session-only (not persisted across restart; the CDC step's
+        # DELETE_IN_PROGRESS stack-probe notice covers that case).
         self.cdc_teardown_job_id: Optional[str] = None
         self.cdc_teardown_kind: Optional[str] = None  # "stop"|"delete"
         self.cdc_teardown_stack: Optional[str] = None

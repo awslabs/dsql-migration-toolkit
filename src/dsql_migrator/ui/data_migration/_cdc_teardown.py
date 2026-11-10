@@ -18,9 +18,12 @@ and Data Migration stores and the job manager (app.py's ``SESSION_STORE``,
 body is the code that ran in ``build_page``. A hook still looks its session's state up in the
 store when it is called, not when the page is built.
 
-Every import a hook makes is inside it, as in ``build_page``, so a patch on the module that
-defines the name reaches the hook. The one exception is ``cdc_teardown_estimate``, this
-module's global.
+Every import a hook makes is inside it, as in ``build_page``, so a patch on the module a hook
+imports a name from reaches the hook. That is not always the module that defines the name:
+``build_cdc_stack_deployer`` comes from ``core.cdc_deployer``, which re-exports it from
+``core.cdc_stack_deployer``, so a patch on ``core.cdc_stack_deployer`` does not reach the
+hook. The hooks read one name this module imports at its top, ``cdc_teardown_estimate``:
+patch it here, not on ``core.cdc``.
 """
 
 from __future__ import annotations

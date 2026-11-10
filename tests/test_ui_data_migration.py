@@ -5112,7 +5112,8 @@ def test_ensure_cdc_controller_detects_deployed_connectors_for_start_over() -> N
 
     _ensure_cdc_controller(state, _Sess())
 
-    # cdc_deployed (app._cdc_deployed) reads exactly these -> now truthy -> tiles show.
+    # cdc_deployed (the _cdc_deployed hook, ui/data_migration/_cdc_teardown.py) reads
+    # exactly these -> now truthy -> tiles show.
     assert state.cdc_connector_names == [src, sink]
     assert state.cdc_connector_running_names == [src, sink]
 

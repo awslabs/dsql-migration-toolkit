@@ -57,7 +57,8 @@ def _teardown_on_the_cdc_step(state: DataMigrationState, kind: str) -> None:
 
 
 def _settled(state: DataMigrationState) -> None:
-    """What app.py's banner getter does when the tracked teardown finished cleanly."""
+    """What the banner getter does when the tracked teardown finished cleanly
+    (``ui/data_migration/_cdc_teardown.py`` ``_cdc_teardown_banner``)."""
     state.set_cdc_teardown_done(
         kind=state.cdc_teardown_kind,
         stacks=finished_teardown_stacks(state.cdc_teardown_queue, state.cdc_teardown_stack),
@@ -66,7 +67,8 @@ def _settled(state: DataMigrationState) -> None:
 
 
 def _banner_text(state: DataMigrationState) -> str:
-    """The cross-view banner with nothing in flight, reading the notice as app.py does."""
+    """The cross-view banner with nothing in flight, reading the notice as the page's hook
+    does (``ui/data_migration/_cdc_teardown.py`` ``_cdc_teardown_done``)."""
     ui = _BannerUi()
     _render_cdc_teardown_banner(
         ui,
@@ -203,7 +205,7 @@ def test_a_teardown_submitted_after_a_deploy_or_start_is_reported() -> None:
     state = _state(A)
     _teardown_on_the_cdc_step(state, "stop")  # it failed and left one connector
     state.set_cdc_deploy_job_id("j-retry-cdc", kind="start")  # Retry CDC
-    state.clear_cdc_teardown()  # Retry cleanup (app.py _cdc_teardown_retry) ...
+    state.clear_cdc_teardown()  # Retry cleanup (_cdc_teardown.py _cdc_teardown_retry) ...
     state.set_cdc_teardown("j-retry-stop", kind="stop", stack=A, ctx=CTX)  # ... re-launches it
     _settled(state)
     assert state.cdc_teardown_done == {"kind": "stop", "stacks": [A]}

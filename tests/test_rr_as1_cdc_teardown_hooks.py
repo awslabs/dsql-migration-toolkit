@@ -16,7 +16,8 @@ Pinned here:
 * a multi-stack Start over records every teardown it launched, in order, behind the one
   marker the first stack claims -- without the queue the banner has nothing to advance to;
 * when the tracked stack settles while another is still deleting, the banner moves the
-  marker to that one and says which of how many, instead of going silent;
+  marker to that one and says which of how many, instead of going silent: to the FIRST
+  stack in the queue still deleting, past any that finished before the tracked one;
 * once every stack has settled, the banner records the finished-teardown notice -- every
   stack, and the teardown's kind, both read from the marker -- before it clears the marker,
   and the notice's close button dismisses it;
@@ -165,6 +166,48 @@ def test_the_banner_moves_to_the_next_unfinished_stack_when_the_tracked_one_sett
         rig.second, OTHER,
     )
     assert rig.hooks.cdc_teardown_done() is None  # nothing is reported finished yet
+
+
+def test_the_banner_moves_past_stacks_that_finished_first_to_the_first_still_deleting(
+    monkeypatch,
+) -> None:
+    """The teardowns run side by side, so a later stack can finish before the tracked one,
+    and a tab left alone can see several finish between two reads.
+
+    The banner follows the first stack in the queue that is still deleting
+    (``next_unfinished_teardown``), past any that finished. A banner that took the entry
+    after the tracked one would find it finished, record the whole teardown as done and
+    clear the marker while two stacks are still deleting and billing for MSK / NAT. The
+    two-stack tests cannot tell the two apart: there, the next stack is the only one left.
+    """
+    rig = _hooks(monkeypatch)
+    discovered = ["dsql-cdc-as1-second", "dsql-cdc-as1-third", "dsql-cdc-as1-fourth"]
+    rig.state.set_cdc_other_stacks([(name, "UPDATE_COMPLETE") for name in discovered])
+    rig.hooks.cdc_teardown_on_reset("delete")
+    stacks, jobs = [STACK, *discovered], list(rig.jm.works)
+    assert rig.state.cdc_teardown_queue == list(zip(jobs, stacks))
+
+    def running(index: int) -> dict:
+        return {
+            "state": "running", "kind": "delete", "stack": stacks[index - 1],
+            "index": index, "total": 4,
+        }
+
+    rig.jm.run(jobs[1])  # the second stack finishes first
+    assert rig.hooks.cdc_teardown_banner() == running(1)  # the tracked one is still deleting
+    rig.jm.run(jobs[0])
+    # Past the finished second stack, to the third: the first still deleting, not the last.
+    assert rig.hooks.cdc_teardown_banner() == running(3)
+    assert (rig.state.cdc_teardown_job_id, rig.state.cdc_teardown_stack) == (
+        jobs[2], stacks[2],
+    )
+    assert rig.hooks.cdc_teardown_done() is None
+    # The last two finish between two reads: the next read reports all four finished.
+    rig.jm.run(jobs[2])
+    rig.jm.run(jobs[3])
+    assert rig.hooks.cdc_teardown_banner() is None
+    assert rig.hooks.cdc_teardown_done() == {"kind": "delete", "stacks": stacks}
+    assert rig.state.cdc_teardown_job_id is None
 
 
 def test_the_banner_records_the_finished_teardown_before_it_clears_the_marker(
