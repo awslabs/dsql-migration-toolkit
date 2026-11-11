@@ -307,7 +307,6 @@ def _assert_no_leak(*texts: str) -> None:
 
 def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> None:
     from dsql_migrator.core.assessment_strategist import AssessmentStrategist
-    from dsql_migrator.core.models import AssessmentItem, Classification, EffortLevel
 
     caplog.set_level(logging.DEBUG)
     exc = _ce("AccessDeniedException", MARKETPLACE_MSG)
@@ -321,13 +320,6 @@ def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> No
     assert (error.reason, error.detail) == ("MODEL_AGREEMENT_REQUIRED", chat_copy)
     _assert_no_leak(error.detail, str(error), repr(error.args))
 
-    item = AssessmentItem(
-        object_name="orders",
-        rule_id="FK_PRESERVED",
-        classification=Classification.MANUAL,
-        effort=EffortLevel.SIMPLE,
-        kind="TABLE",
-    )
     strategist = AssessmentStrategist(cfg, client=_RaisingClient(exc))
     outcomes = {
         "stream_chat": strategist.stream_chat(
@@ -339,10 +331,6 @@ def test_every_path_maps_the_marketplace_denial_without_leaking_it(caplog) -> No
             lambda _delta: None,
             tools=[],
             execute=lambda _name, _input: "{}",
-        ),
-        "try_generate_object_guidance": strategist.try_generate_object_guidance(item),
-        "stream_object_guidance": strategist.stream_object_guidance(
-            item, lambda _delta: None
         ),
     }
     for path, outcome in outcomes.items():
@@ -481,18 +469,14 @@ def test_every_reason_taxonomy_is_complete() -> None:
     # Every table lookup / Literal check below runs inside an ``except`` block at
     # runtime; a missing entry would raise there and chain the original botocore
     # error -- with its message -- into the panel's log.
-    from dsql_migrator.core.assessment_strategist import (
-        AiAssessmentOutcome,
-        ObjectGuidanceOutcome,
-    )
+    from dsql_migrator.core.assessment_strategist import ObjectGuidanceOutcome
     from dsql_migrator.ui.ai_assist import ACCESS_CHECK_NOTIFY_TYPES
 
     unavailable = set(typing.get_args(aa.UnavailableReason))
     assert "MODEL_AGREEMENT_REQUIRED" in unavailable
     assert set(aa._UNAVAILABLE_DETAILS) == unavailable
-    for cls in (AiAssessmentOutcome, ObjectGuidanceOutcome):
-        hint = typing.get_type_hints(cls)["reason"]
-        assert set(typing.get_args(hint)) == {"OK"} | unavailable, cls.__name__
+    hint = typing.get_type_hints(ObjectGuidanceOutcome)["reason"]
+    assert set(typing.get_args(hint)) == {"OK"} | unavailable
 
     access = set(typing.get_args(aa.AccessCheckReason))
     assert "MODEL_AGREEMENT_REQUIRED" in access

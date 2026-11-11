@@ -2102,63 +2102,6 @@ class MigrationContext(BaseModel):
     summary: str = ""
 
 
-class AiAssessmentInsight(BaseModel):
-    """AI-generated, advisory analysis for one assessed source object (Req 11).
-
-    Attached to a deterministic :class:`AssessmentItem` by ``object_name``. The
-    deterministic classification and effort remain authoritative (Property 8 is
-    unaffected); this only adds an expert remediation ``recommendation``, a
-    ``rationale``, and an optional AI ``ai_effort`` opinion shown alongside the
-    deterministic estimate. It is treated as untrusted, advisory output and is
-    never auto-applied.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    object_name: str = Field(min_length=1)
-    recommendation: str = ""
-    rationale: str = ""
-    ai_effort: Optional[EffortLevel] = Field(
-        default=None,
-        description="AI's effort opinion; advisory, never overrides the rule effort.",
-    )
-
-
-class AiAssessmentFinding(BaseModel):
-    """An AI-proposed additional risk the deterministic rules did not flag.
-
-    Advisory only: it never changes a deterministic classification and is
-    surfaced for human review. ``area`` names the object or topic the finding
-    concerns.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    area: str = Field(min_length=1)
-    risk: str = ""
-    recommendation: str = ""
-
-
-class AiAssessmentReport(BaseModel):
-    """AI-led migration assessment that augments the deterministic report (Req 11).
-
-    The deterministic :class:`AssessmentReport` remains the factual backbone
-    (Property 8). This adds an overall migration ``strategy_summary`` narrative,
-    per-object expert ``insights``, and ``additional_findings`` the rules did not
-    catch. ``model_id`` carries provenance. All content is untrusted/advisory and
-    never overrides deterministic facts; the deterministic path runs first and
-    stands alone when AI is disabled or unavailable (Requirements 11.1, 11.2,
-    11.10).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    strategy_summary: str = ""
-    insights: list[AiAssessmentInsight] = Field(default_factory=list)
-    additional_findings: list[AiAssessmentFinding] = Field(default_factory=list)
-    model_id: str = Field(min_length=1)
-
-
 class AiAccessCheckResult(BaseModel):
     """Outcome of the "Verify AI access" Bedrock preflight (Req 11.13, 11.14).
 
@@ -2663,9 +2606,6 @@ __all__ = [
     "StepStatus",
     "WorkflowState",
     "AiAssistConfig",
-    "AiAssessmentInsight",
-    "AiAssessmentFinding",
-    "AiAssessmentReport",
     "AiAccessCheckResult",
     "ValidationMode",
     "RowDiffKind",

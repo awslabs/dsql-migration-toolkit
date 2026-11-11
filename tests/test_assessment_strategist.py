@@ -1,14 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the AI-led assessment strategist.
+"""Unit tests for the AI DBA's chat strategist.
 
 These tests use a fake Bedrock client (no AWS) and cover:
 
-- Untrusted-output handling: an empty reply -> INVALID_OUTPUT, malformed stream
-  events skipped.
+- Untrusted-output handling: malformed stream events are skipped.
 - Graceful degradation: a Bedrock failure maps to an unavailable outcome that
-  never raises, so the deterministic assessment stands alone.
+  never raises, so the deterministic workflow goes on without the reply.
 - The grounding prompts and chat systems each scope builds, and the tool-calling
   chat loop.
 """
@@ -17,39 +16,19 @@ from __future__ import annotations
 
 import json
 
-from dsql_migrator.core.assessment_strategist import (
-    AiAssessmentOutcome,
-    AssessmentStrategist,
-)
+from dsql_migrator.core.assessment_strategist import AssessmentStrategist
 from dsql_migrator.core.models import (
     AiAssistConfig,
     AssessmentItem,
-    AssessmentReport,
     Classification,
     EffortLevel,
-    SourceInventory,
     SourceType,
-    TableDef,
-    TargetInventory,
 )
 
 
 # ---------------------------------------------------------------------------
 # Fakes / fixtures
 # ---------------------------------------------------------------------------
-
-
-class _FakeClient:
-    """A fake bedrock-runtime client returning a canned InvokeModel body."""
-
-    def __init__(self, text: str) -> None:
-        self._text = text
-        self.calls: list[dict] = []
-
-    def invoke_model(self, **kwargs: object) -> dict:
-        self.calls.append(kwargs)
-        envelope = json.dumps({"content": [{"type": "text", "text": self._text}]})
-        return {"body": envelope}
 
 
 class _BoomClient:
@@ -63,124 +42,8 @@ def _config() -> AiAssistConfig:
     return AiAssistConfig(enabled=True, model_id="test-model")
 
 
-def _assessment() -> AssessmentReport:
-    return AssessmentReport.from_items(
-        [
-            AssessmentItem(
-                object_name="orders",
-                rule_id="FK_PRESERVED",
-                classification=Classification.MANUAL,
-                risk="FK not supported",
-                recommendation="drop FK",
-                effort=EffortLevel.SIMPLE,
-            ),
-            AssessmentItem(
-                object_name="audit_log",
-                rule_id="NO_PRIMARY_KEY",
-                classification=Classification.UNSUPPORTED,
-                risk="no PK",
-                recommendation="add PK",
-                effort=EffortLevel.MEDIUM,
-            ),
-        ]
-    )
-
-
-def _inventory() -> SourceInventory:
-    return SourceInventory(tables=[TableDef(name="orders"), TableDef(name="audit_log")])
-
-
-def _well_formed_text() -> str:
-    return json.dumps(
-        {
-            "strategy_summary": "Migrate reference tables first, then orders.",
-            "insights": [
-                {
-                    "object_name": "orders",
-                    "recommendation": "Preserve the foreign key; DSQL enforces it after load.",
-                    "rationale": "Aurora DSQL enforces foreign keys.",
-                    "effort": "SIMPLE",
-                },
-                {
-                    "object_name": "ghost_table",
-                    "recommendation": "should be ignored",
-                    "rationale": "invented",
-                    "effort": "MEDIUM",
-                },
-            ],
-            "additional_findings": [
-                {
-                    "area": "orders",
-                    "risk": "Hot partition on sequential id.",
-                    "recommendation": "Use a random/UUID key.",
-                }
-            ],
-        }
-    )
-
-
 # ---------------------------------------------------------------------------
-# Strategist generate / try_generate
-# ---------------------------------------------------------------------------
-
-
-def test_strategist_generates_report_via_fake_client() -> None:
-    narrative = (
-        "## Migration strategy\nMigrate reference tables first, then orders.\n\n"
-        "## Prioritized recommendations\n- orders: enforce FK in the app (Simple)."
-    )
-    client = _FakeClient(narrative)
-    strategist = AssessmentStrategist(_config(), client=client)
-
-    report = strategist.generate(
-        _inventory(), _assessment(), TargetInventory(), []
-    )
-
-    assert report.model_id == "test-model"
-    # Best practice: the AI reply is a free-form Markdown narrative kept verbatim
-    # (no brittle JSON parsing) in strategy_summary; rendered as Markdown by the UI.
-    assert report.strategy_summary == narrative
-    assert report.insights == []
-    # The model id is used for provenance on the InvokeModel call.
-    assert client.calls and client.calls[0]["modelId"] == "test-model"
-
-
-def test_try_generate_returns_available_outcome() -> None:
-    strategist = AssessmentStrategist(_config(), client=_FakeClient(_well_formed_text()))
-    outcome = strategist.try_generate(
-        _inventory(), _assessment(), TargetInventory(), []
-    )
-    assert isinstance(outcome, AiAssessmentOutcome)
-    assert outcome.available is True
-    assert outcome.reason == "OK"
-    assert outcome.report is not None
-
-
-def test_try_generate_degrades_gracefully_on_failure() -> None:
-    strategist = AssessmentStrategist(_config(), client=_BoomClient())
-    outcome = strategist.try_generate(
-        _inventory(), _assessment(), TargetInventory(), []
-    )
-    # Never raises; the deterministic assessment stands alone.
-    assert outcome.available is False
-    assert outcome.report is None
-    assert outcome.detail  # a clear, credential-free message
-    assert "network down" not in outcome.detail
-
-
-def test_try_generate_invalid_output_is_unavailable() -> None:
-    # Only an empty/blank reply is INVALID_OUTPUT now -- any prose is a valid
-    # Markdown narrative (best practice: no brittle JSON parsing).
-    strategist = AssessmentStrategist(_config(), client=_FakeClient("   "))
-    outcome = strategist.try_generate(
-        _inventory(), _assessment(), TargetInventory(), []
-    )
-    assert outcome.available is False
-    assert outcome.reason == "INVALID_OUTPUT"
-
-
-# ---------------------------------------------------------------------------
-# Streaming on-demand object guidance (Evaluation drawer)
+# Streaming fakes (the Evaluation object chat)
 # ---------------------------------------------------------------------------
 
 
@@ -219,41 +82,6 @@ def _guidance_item() -> AssessmentItem:
         effort=EffortLevel.SIMPLE,
         kind="TABLE",
     )
-
-
-def test_stream_object_guidance_emits_chunks_and_returns_markdown() -> None:
-    client = _FakeStreamClient(["## Why\n", "Foreign keys ", "are enforced."])
-    strategist = AssessmentStrategist(_config(), client=client)
-    seen: list[str] = []
-
-    outcome = strategist.stream_object_guidance(_guidance_item(), seen.append)
-
-    # Every delta was emitted in order, and the final markdown is their join.
-    assert seen == ["## Why\n", "Foreign keys ", "are enforced."]
-    assert outcome.available is True
-    assert outcome.reason == "OK"
-    assert outcome.markdown == "## Why\nForeign keys are enforced."
-    assert outcome.model_id == "test-model"
-    assert client.calls and client.calls[0]["modelId"] == "test-model"
-
-
-def test_stream_object_guidance_graceful_when_stream_fails_to_start() -> None:
-    strategist = AssessmentStrategist(_config(), client=_BoomStreamClient())
-    seen: list[str] = []
-
-    outcome = strategist.stream_object_guidance(_guidance_item(), seen.append)
-
-    assert seen == []  # nothing was emitted
-    assert outcome.available is False
-    assert outcome.detail  # clear, credential-free message
-    assert "network down" not in outcome.detail
-
-
-def test_stream_object_guidance_empty_stream_is_invalid_output() -> None:
-    strategist = AssessmentStrategist(_config(), client=_FakeStreamClient([]))
-    outcome = strategist.stream_object_guidance(_guidance_item(), lambda _t: None)
-    assert outcome.available is False
-    assert outcome.reason == "INVALID_OUTPUT"
 
 
 def test_iter_stream_text_skips_malformed_events() -> None:
@@ -916,7 +744,6 @@ def test_source_engine_word_maps_source_type() -> None:
 
 def test_builders_ground_on_postgres_source_engine() -> None:
     from dsql_migrator.core.assessment_strategist import (
-        build_assessment_prompt,
         build_cdc_error_chat_system,
         build_connection_error_chat_system,
         build_conversion_chat_system,
@@ -924,7 +751,6 @@ def test_builders_ground_on_postgres_source_engine() -> None:
         build_full_load_error_chat_system,
         build_general_chat_system,
         build_object_chat_system,
-        build_object_guidance_prompt,
         build_query_chat_system,
         build_query_optimize_system,
         build_reimplementation_chat_system,
@@ -932,10 +758,9 @@ def test_builders_ground_on_postgres_source_engine() -> None:
     )
 
     pg = "PostgreSQL"
-    # Chat / guidance system prompts: the source is PostgreSQL, never MySQL.
+    # Chat system prompts: the source is PostgreSQL, never MySQL.
     for system in (
         build_object_chat_system(_guidance_item(), source_engine=pg),
-        build_object_guidance_prompt(_guidance_item(), source_engine=pg),
         build_general_chat_system(source_engine=pg),
         build_conversion_chat_system("orders", "CREATE TABLE", "CREATE TABLE", source_engine=pg),
         build_reimplementation_chat_system(source_engine=pg),
@@ -949,7 +774,6 @@ def test_builders_ground_on_postgres_source_engine() -> None:
             side="source", coordinates="host=x", error_message="err",
             source_engine=pg,
         ),
-        build_assessment_prompt(_inventory(), _assessment(), TargetInventory(), [], source_engine=pg),
     ):
         assert "PostgreSQL" in system
         assert "MySQL" not in system

@@ -8,15 +8,10 @@ The AI data models (:class:`~dsql_migrator.core.models.AiAssistConfig` and
 This module holds the Bedrock plumbing the AI DBA (``core/assessment_strategist.py``)
 and the Connect screen's "Verify AI access" build on:
 
-- loading the ``BEDROCK_MODEL_ID`` (default ``global.anthropic.claude-sonnet-5``) and
-  ``BEDROCK_REGION`` settings from the environment into an ``AiAssistConfig``
-  (Requirements 11.3, 11.4), and constructing the ``bedrock-runtime`` ``boto3``
-  client used to call Bedrock (Requirement 11.9);
-- :func:`_extract_suggestion_text`, which treats the InvokeModel response as
-  untrusted data and never raises into the workflow on a malformed/empty/non-JSON
-  body, missing/unexpected fields, or oversized output; it returns the text it can
-  safely recover (capped at :data:`MAX_SUGGESTION_CHARS`) or an empty string
-  (Requirement 11.8);
+- constructing the ``bedrock-runtime`` ``boto3`` client used to call Bedrock
+  (Requirement 11.9) for an ``AiAssistConfig``, whose model id and region the Connect
+  screen seeds from ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION``
+  (:func:`dsql_migrator.config.load_connect_defaults`; Requirements 11.3, 11.4);
 - :func:`validate_suggested_sql`, which blocks forbidden statements (e.g. data
   mutation, ``DROP``, role/grant, transaction control, ``COPY``) in AI-proposed SQL
   before Schema Conversion adopts it as a target DDL (Requirement 11.8);
@@ -38,70 +33,25 @@ Credential handling (Requirement 11.9 / Property 7):
   profile, is used to build the client; callers may also pass a session or a
   fake in explicitly without changing call sites, and unit tests supply a fake
   so they never reach AWS. Constructing the client performs no network call.
-
-The ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION`` keys are intentionally *not*
-prefixed with ``DSQL_MIGRATOR_``: they are documented as those exact names in
-the requirements/design and ``BEDROCK_REGION`` is a Bedrock-specific setting
-distinct from the global AWS profile/region.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional, Sequence
+from typing import Any, Literal, Mapping, Optional
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.models import AiAccessCheckResult, AiAssistConfig
-
-# Documented config keys (NOT DSQL_MIGRATOR_-prefixed): Requirements 11.3, 11.4.
-ENV_BEDROCK_MODEL_ID = "BEDROCK_MODEL_ID"
-ENV_BEDROCK_REGION = "BEDROCK_REGION"
 
 # The boto3 service name for the Bedrock runtime (InvokeModel) client.
 BEDROCK_RUNTIME_SERVICE = "bedrock-runtime"
 
 # Anthropic-style InvokeModel request shaping (the default model is an
 # Anthropic Claude model). Kept minimal and localized so it is easy to adjust
-# for other model families; the response is treated as text we extract from.
+# for other model families.
 _ANTHROPIC_VERSION = "bedrock-2023-05-31"
-_MAX_TOKENS = 1024
-
-# Upper bound on how much model output _extract_suggestion_text accepts. The output is
-# untrusted data (Requirement 11.8); an oversized body is truncated rather than processed
-# in full so a single reply cannot exhaust memory or hide content past a huge prefix.
-MAX_SUGGESTION_CHARS = 20_000
-
-
-def _read(env: Mapping[str, str], name: str) -> Optional[str]:
-    """Read an environment variable, returning None when unset or blank."""
-    raw = env.get(name)
-    if raw is None:
-        return None
-    raw = raw.strip()
-    return raw or None
-
-
-def load_ai_assist_config(env: Optional[Mapping[str, str]] = None) -> AiAssistConfig:
-    """Load AI-assist settings from ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION``.
-
-    ``model_id`` defaults to ``global.anthropic.claude-sonnet-5`` (the model's own
-    default, kept as the single source of truth) when ``BEDROCK_MODEL_ID`` is unset or blank,
-    and ``region`` comes from ``BEDROCK_REGION`` (``None`` when unset). AI assist
-    is opt-in, so ``enabled`` is always ``False`` here; the user turns it on in
-    the UI (Requirements 11.1, 11.2). No credential value is ever read.
-    """
-    source = os.environ if env is None else env
-
-    values: dict[str, object] = {"enabled": False}
-    if (model_id := _read(source, ENV_BEDROCK_MODEL_ID)) is not None:
-        values["model_id"] = model_id
-    if (region := _read(source, ENV_BEDROCK_REGION)) is not None:
-        values["region"] = region
-
-    return AiAssistConfig(**values)
 
 
 def _default_session() -> BotoSessionLike:
@@ -282,8 +232,8 @@ def validate_suggested_sql(text: str) -> SqlValidation:
 # Graceful degradation: typed unavailability (Req 11.10)
 # ---------------------------------------------------------------------------
 
-# Why an AI reply could not be produced. The outcome types built from it (e.g.
-# ``AiAssessmentOutcome`` in core/assessment_strategist.py) add "OK" for a usable
+# Why an AI reply could not be produced. The outcome type built from it
+# (``ObjectGuidanceOutcome`` in core/assessment_strategist.py) adds "OK" for a usable
 # reply; every reason here means the deterministic workflow continues without the
 # AI part (Requirement 11.10).
 UnavailableReason = Literal[
@@ -708,69 +658,30 @@ def _classify_access_check_error(exc: BaseException) -> AccessCheckReason:
 
 
 # ---------------------------------------------------------------------------
-# InvokeModel request shaping + untrusted-output parsing (Req 11.8)
+# InvokeModel request shaping
 # ---------------------------------------------------------------------------
 
 
-def _build_invoke_body(prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
+def _build_invoke_body(prompt: str, max_tokens: int) -> str:
     """Serialize an Anthropic-style messages InvokeModel request body.
 
     Model-specific request shaping is intentionally minimal and localized here
-    so it is easy to adjust for other model families. ``max_tokens`` defaults to
-    :data:`_MAX_TOKENS`; the access-check preflight (Task 17.3), its live caller,
-    passes a tiny value so the verification request is least-cost.
+    so it is easy to adjust for other model families. Its one caller, the
+    access-check preflight (Task 17.3), passes a tiny ``max_tokens`` so the
+    verification request is least-cost.
     """
     body = {
         "anthropic_version": _ANTHROPIC_VERSION,
         "max_tokens": max_tokens,
-        # Turn OFF extended thinking (Claude 5 does it by default): thinking tokens
-        # count against max_tokens, so a reasoning-heavy turn could spend the whole
-        # budget on thinking and emit no answer text -- surfacing as an empty reply
-        # ("AI reply unavailable"). These replies are grounded (context +
-        # deterministic facts carry the load), so the full budget goes to the answer.
+        # Extended thinking off, as in every AI DBA request (_THINKING_OFF in
+        # core/assessment_strategist.py): Claude 5 thinks by default, and thinking
+        # tokens count against max_tokens.
         "thinking": {"type": "disabled"},
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],
     }
     return json.dumps(body)
-
-
-def _extract_suggestion_text(response: Mapping[str, Any]) -> str:
-    """Safely extract suggestion text from an untrusted InvokeModel response.
-
-    The response is untrusted data (Requirement 11.8): this never raises into the
-    workflow on a malformed/empty/non-JSON body, missing/unexpected fields, or an
-    oversized payload. It defensively reads the Anthropic-style ``content`` text
-    blocks and returns whatever text it can recover, capped at
-    :data:`MAX_SUGGESTION_CHARS`; if nothing usable can be parsed it returns an
-    empty string and the caller treats that as no usable output (``INVALID_OUTPUT``).
-    """
-    try:
-        raw = response.get("body") if isinstance(response, Mapping) else None
-        if raw is None:
-            return ""
-        payload = raw.read() if hasattr(raw, "read") else raw
-        data = json.loads(payload)
-    except (AttributeError, ValueError, TypeError, json.JSONDecodeError):
-        # Non-Mapping response, unreadable body, non-JSON, or non-decodable bytes:
-        # treat as no usable output rather than raising into the workflow.
-        return ""
-
-    if not isinstance(data, Mapping):
-        return ""
-    content = data.get("content")
-    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
-        return ""
-
-    text_parts = [
-        block.get("text", "")
-        for block in content
-        if isinstance(block, Mapping)
-        and block.get("type") == "text"
-        and isinstance(block.get("text"), str)
-    ]
-    return "".join(text_parts).strip()[:MAX_SUGGESTION_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -928,10 +839,7 @@ class AiConversionAssistant:
 
 
 __all__ = [
-    "ENV_BEDROCK_MODEL_ID",
-    "ENV_BEDROCK_REGION",
     "BEDROCK_RUNTIME_SERVICE",
-    "MAX_SUGGESTION_CHARS",
     "BotoSessionLike",
     "SqlValidation",
     "UnavailableReason",
@@ -939,7 +847,6 @@ __all__ = [
     "AiAssistUnavailableError",
     "AiConversionAssistant",
     "AiAccessCheckResult",
-    "load_ai_assist_config",
     "build_bedrock_runtime_client",
     "validate_suggested_sql",
 ]

@@ -1,33 +1,31 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""AI-led migration assessment that augments the deterministic assessment.
+"""The AI DBA's Amazon Bedrock chats, grounded on the deterministic migration facts.
 
-The :class:`AssessmentStrategist` uses Amazon Bedrock to act as a "senior
-migration analyst", grounded on the already-extracted source inventory, the
-deterministic :class:`~dsql_migrator.core.models.AssessmentReport` (the factual
-backbone), the target DSQL catalog, and the known Aurora DSQL constraints
-(Requirement 11). The app uses it for the AI DBA panel's chats
-(:meth:`AssessmentStrategist.stream_chat`, :meth:`AssessmentStrategist.tool_chat`);
-its one-shot Markdown report methods (``generate`` / ``try_generate`` and the
-per-object guidance ones) have no caller in the app.
+:class:`AssessmentStrategist` answers the AI DBA panel's turns:
+:meth:`AssessmentStrategist.stream_chat` streams a grounded reply, and
+:meth:`AssessmentStrategist.tool_chat` lets the model look facts up through read-only
+tools before it answers. The ``build_*_system`` functions write each scope's
+grounding, most of them on top of the known Aurora DSQL constraints
+(:data:`DSQL_CONSTRAINTS`; Requirement 11).
 
 Design guarantees (consistent with the existing AI-assist path):
 
 - **Augment, never replace** (Property 6 / Requirement 11.1, 11.2): the
   deterministic assessment is authoritative for the hard DSQL facts (FK/PK/
   trigger/type/etc.) and Property 8 holds regardless of AI. This layer only
-  adds strategy, narrative, and advisory findings; AI never changes a
-  deterministic classification or effort.
+  adds advice in the AI DBA's replies; AI never changes a deterministic
+  classification or effort.
 - **Read-only** (Property 1 / Requirement 11.11): inputs are already-extracted
   in-memory models; no source/target connection is opened here.
 - **Untrusted output** (Requirement 11.8): the model output is read
   defensively -- an empty or malformed reply degrades to an unavailable outcome
   -- and reply and tool-result sizes are capped.
-- **Graceful degradation** (Requirement 11.10): :meth:`AssessmentStrategist.try_generate`
-  never raises; on any Bedrock failure or an empty reply it returns an
-  unavailable :class:`AiAssessmentOutcome` so the deterministic report still
-  stands alone.
+- **Graceful degradation** (Requirement 11.10): the chat methods never raise; on
+  any Bedrock failure or an empty reply they return an unavailable
+  :class:`ObjectGuidanceOutcome`, so the deterministic workflow goes on without
+  the reply.
 - **Credential confidentiality** (Property 7): the Bedrock client uses IAM auth
   via the shared session/profile; no credential value is read or logged, and
   failure messages are fixed and credential-free.
@@ -43,19 +41,13 @@ from typing import Any, Callable, Literal, Optional
 from dsql_migrator.core.ai_assistant import (
     _ANTHROPIC_VERSION,
     AiAssistUnavailableError,
-    _build_invoke_body,
     _classify_bedrock_error,
-    _extract_suggestion_text,
     build_bedrock_runtime_client,
 )
 from dsql_migrator.core.models import (
-    AiAssessmentReport,
     AiAssistConfig,
     AssessmentItem,
-    AssessmentReport,
-    SourceInventory,
     SourceType,
-    TargetInventory,
 )
 
 
@@ -75,8 +67,8 @@ def source_engine_word(source_type: Optional["SourceType"]) -> str:
 # Keyed by CALL SHAPE, not by screen/feature. The AI DBA is now ONE persistent
 # app-wide panel, so every interactive turn shares a SINGLE chat budget
 # (_CHAT_MAX_TOKENS) -- there is no per-screen limit to keep in sync. The only
-# reason two other budgets exist is that they are genuinely different SHAPES of
-# call: a whole one-shot structured report, and a bare permission probe.
+# other budget is a genuinely different SHAPE of call: the bare permission probe
+# (_ACCESS_CHECK_MAX_TOKENS in core/ai_assistant.py).
 #
 # IMPORTANT: the current models (Claude 5 family, e.g. global.anthropic.
 # claude-sonnet-5) use EXTENDED THINKING, and thinking tokens count against
@@ -84,18 +76,16 @@ def source_engine_word(source_type: Optional["SourceType"]) -> str:
 # thinking BEFORE emitting any answer/tool call; if the cap is too small the turn
 # stops (stop_reason="max_tokens") with only a thinking block -- no text and no
 # completable tool_use -- which the chat then had to treat as an empty/unparseable
-# reply. So the generation caps must comfortably fit THINKING + the answer.
+# reply. So the generation cap must comfortably fit THINKING + the answer.
 # (Verified: a tuning turn burned an entire 1536-token cap on thinking alone and
-# produced no text.) Keep them generous.
-#
-# One-shot Markdown assessment report (generate / try_generate) -- the largest output.
-_ASSESSMENT_MAX_TOKENS = 8192
+# produced no text.) Keep it generous.
 
-# EVERY interactive AI DBA turn -- object guidance, plain grounded chat
-# (stream_chat), and tool-calling chat (tool_chat), incl. Query Converter tuning
-# and the CDC error chat that delegates here. Single source of truth for the
-# persistent panel: one place to tune the chat budget. With extended thinking
-# DISABLED (see _THINKING_OFF) the whole budget is available for the answer.
+# EVERY interactive AI DBA turn -- plain grounded chat (stream_chat) and
+# tool-calling chat (tool_chat), which every scope's chat goes through (an
+# object's guidance, Query Converter tuning, the CDC error chat, ...). Single
+# source of truth for the persistent panel: one place to tune the chat budget.
+# With extended thinking DISABLED (see _THINKING_OFF) the whole budget is
+# available for the answer.
 _CHAT_MAX_TOKENS = 8192
 
 # The current models (Claude 5 family) do EXTENDED THINKING by default, and thinking
@@ -209,9 +199,9 @@ def bounded_tool_output(text: str) -> str:
 # Cap on each piece of grounding text a prompt embeds (a DDL, a query, a plan, the
 # facts), so a prompt stays bounded however large its inputs are.
 _MAX_TEXT_CHARS = 4000
-# The AI-led assessment is a free-form Markdown narrative; cap it generously so
-# a verbose model reply cannot flood the page (best practice: accept prose, not
-# brittle JSON, and render it as Markdown).
+# A chat reply is a free-form Markdown narrative; cap it generously so a verbose
+# model reply cannot flood the panel (best practice: accept prose, not brittle
+# JSON, and render it as Markdown).
 _MAX_NARRATIVE_CHARS = 12000
 
 # Shared response-style directive appended to EVERY chat system prompt in
@@ -236,7 +226,7 @@ _RESPONSE_STYLE = (
     "answer is good when that is enough."
 )
 
-# Aurora DSQL constraints used to ground the assessment prompt. Mirrors the
+# Aurora DSQL constraints the AI DBA's chats are grounded on. Mirrors the
 # constraints the deterministic assessor/converter apply so the AI analysis
 # stays consistent with the factual backbone.
 DSQL_CONSTRAINTS = (
@@ -266,154 +256,11 @@ DSQL_CONSTRAINTS = (
 )
 
 
-@dataclass(frozen=True)
-class AiAssessmentOutcome:
-    """An AI assessment result that never breaks the Evaluation workflow.
-
-    When :attr:`available` is ``True`` the :attr:`report` carries the AI-led
-    assessment; when ``False`` the deterministic report stands alone and
-    :attr:`detail` is a fixed, credential-free message explaining why AI was
-    unavailable. ``reason`` is ``"OK"`` exactly when :attr:`available` is True.
-    """
-
-    available: bool
-    reason: Literal[
-        "OK",
-        "ACCESS_DENIED",
-        "MODEL_AGREEMENT_REQUIRED",
-        "THROTTLED",
-        "NETWORK",
-        "UNAVAILABLE",
-        "INVALID_OUTPUT",
-    ]
-    detail: str
-    report: Optional[AiAssessmentReport] = None
-
-    @classmethod
-    def ok(cls, report: AiAssessmentReport) -> "AiAssessmentOutcome":
-        """Build a successful outcome carrying the AI assessment ``report``."""
-        return cls(available=True, reason="OK", detail="", report=report)
-
-    @classmethod
-    def unavailable(cls, error: AiAssistUnavailableError) -> "AiAssessmentOutcome":
-        """Build a failed outcome from a typed unavailability error."""
-        return cls(available=False, reason=error.reason, detail=error.detail)
-
-
-def _summarize_assessment(report: AssessmentReport) -> str:
-    """Render the deterministic assessment as compact grounding text."""
-    lines = []
-    for item in report.assessed_items:  # never the report's own markers
-        effort = item.effort.value if item.effort is not None else "NONE"
-        risk = item.risk or "-"
-        lines.append(
-            f"- {item.object_name} | {item.classification.value} | effort={effort} "
-            f"| rule={item.rule_id} | risk={risk}"
-        )
-    return "\n".join(lines) if lines else "(no objects)"
-
-
-def _summarize_target(target: TargetInventory, conflicts: list[str]) -> str:
-    """Render the target catalog and any conflicts as grounding text."""
-    tables = sum(len(schema.tables) for schema in target.schemas)
-    views = sum(len(schema.views) for schema in target.schemas)
-    conflict_text = ", ".join(conflicts) if conflicts else "(none)"
-    return (
-        f"Target catalog: {len(target.schemas)} schemas, {tables} tables, "
-        f"{views} views. Source objects already present on target: {conflict_text}."
-    )
-
-
-def build_assessment_prompt(
-    inventory: SourceInventory,
-    assessment: AssessmentReport,
-    target: TargetInventory,
-    conflicts: list[str],
-    *,
-    source_engine: str = "MySQL",
-) -> str:
-    """Build the grounded prompt that asks the model for a Markdown assessment report.
-
-    The prompt grounds the model on the deterministic assessment (the factual
-    backbone it must respect), the source inventory shape, the target catalog,
-    and the DSQL constraints, and asks for a concise GitHub-flavored Markdown
-    narrative; the reply is untrusted text, capped and rendered, never parsed
-    (Requirement 11.8).
-    """
-    return (
-        f"You are a senior AWS database migration analyst. Analyze a {source_engine} "
-        "-> Amazon Aurora DSQL (PostgreSQL-16 wire-compatible) migration and write a "
-        "concise, well-structured assessment in GitHub-flavored Markdown that "
-        "AUGMENTS a deterministic, rule-based assessment. The deterministic "
-        "findings below are authoritative facts you MUST respect and never "
-        "contradict; add expert strategy, prioritization, and any risks the "
-        "rules may have missed.\n\n"
-        f"Source inventory: {len(inventory.tables)} tables, "
-        f"{len(inventory.views)} views, {len(inventory.triggers)} triggers, "
-        f"{len(inventory.routines)} routines, {len(inventory.events)} events.\n\n"
-        f"{_summarize_target(target, conflicts)}\n\n"
-        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}\n\n"
-        "Deterministic assessment (authoritative facts):\n"
-        f"{_summarize_assessment(assessment)}\n\n"
-        "Structure the Markdown with these sections:\n"
-        "- `## Migration strategy` -- the overall approach and a prioritized "
-        "plan.\n"
-        "- `## Prioritized recommendations` -- for each flagged object (use the "
-        "EXACT object names from the deterministic assessment above), the "
-        "concrete remediation and an effort of Simple / Medium / Significant.\n"
-        "- `## Additional risks` -- risks or pitfalls the rules may have "
-        "missed.\n\n"
-        "Be concise and actionable. Only reference object names that appear in "
-        "the deterministic assessment. Output the Markdown report only, with no "
-        "preamble or sign-off."
-    )
-
-
-def build_object_guidance_prompt(item: AssessmentItem, *, source_engine: str = "MySQL") -> str:
-    """Build the prompt for on-demand, single-object remediation guidance.
-
-    Grounds the model on ONE deterministic :class:`AssessmentItem` (its name,
-    kind, classification, effort, rule, risk) and the DSQL constraints, and asks
-    for a natural, conversational answer (as in a chat with a helpful engineer)
-    rather than a fixed-section template. The deterministic classification/effort
-    stay authoritative; this only explains and remediates in the model's own
-    words.
-    """
-    effort = item.effort.value if item.effort is not None else "NONE"
-    return (
-        "You are a senior AWS database migration engineer chatting with a "
-        f"teammate who is migrating a {source_engine} database to Amazon Aurora DSQL "
-        "(PostgreSQL-16 wire-compatible). A deterministic, rule-based assessment flagged "
-        "the object below. Answer naturally and conversationally, the way you "
-        "would in a chat — explain it in your own words, in a friendly, helpful "
-        "tone. Do NOT use a rigid template or fixed section headings (no "
-        "\"Why this needs attention\" / \"How to fix it\" / \"Example\" "
-        "boilerplate). Just talk it through: briefly say what the issue is and "
-        "why it matters on DSQL, then how you'd handle it, weaving in a short "
-        "code snippet only if it genuinely helps. The deterministic facts below "
-        "are authoritative — build on them, never contradict them.\n\n"
-        f"Object: {item.object_name}\n"
-        f"Kind: {item.kind}\n"
-        f"Classification: {item.classification.value}\n"
-        f"Estimated manual effort: {effort}\n"
-        f"Rule: {item.rule_id}\n"
-        f"Risk (deterministic): {item.risk or '(none recorded)'}\n"
-        f"Recommendation (deterministic): {item.recommendation or '(none)'}\n\n"
-        f"Aurora DSQL constraints:\n{DSQL_CONSTRAINTS}\n\n"
-        "Keep it specific to this object and reasonably concise (a few short "
-        "paragraphs). Light GitHub-flavored Markdown is fine (a bit of emphasis, "
-        "an occasional fenced code block or short list) but keep it reading like "
-        "a natural reply, not a form. Don't restate these instructions; just give "
-        "the answer."
-    )
-
-
 def build_object_chat_system(item: AssessmentItem, *, source_engine: str = "MySQL") -> str:
     """Build the system grounding for a multi-turn chat about ONE object.
 
-    Unlike :func:`build_object_guidance_prompt` (a single-shot user prompt), this
-    is the persistent system context for a back-and-forth conversation: it pins
-    the model to ONE deterministic :class:`AssessmentItem` and the DSQL
+    This is the persistent system context for a back-and-forth conversation: it
+    pins the model to ONE deterministic :class:`AssessmentItem` and the DSQL
     constraints, sets a natural, conversational tone, and tells it the
     deterministic facts are authoritative. The turns themselves (the initial
     question and any follow-ups) are supplied as the chat ``messages``.
@@ -1505,12 +1352,13 @@ def _iter_stream_text(response: Mapping[str, Any]) -> Iterator[str]:
 
 
 class AssessmentStrategist:
-    """Generates an AI-led migration assessment from grounded inputs (Req 11).
+    """Answers the AI DBA's chat turns through Amazon Bedrock (Req 11).
 
-    Augments — never replaces — the deterministic assessment. The Bedrock client
-    is injectable (tests pass a fake) and otherwise built lazily from the shared
-    session honoring the optional global AWS profile, so constructing the
-    strategist performs no network call (Property 7 / Requirement 9.5).
+    Augments — never replaces — the deterministic results each chat is grounded
+    on. The Bedrock client is injectable (tests pass a fake) and otherwise built
+    lazily from the shared session honoring the optional global AWS profile, so
+    constructing the strategist performs no network call (Property 7 /
+    Requirement 9.5).
     """
 
     def __init__(
@@ -1549,181 +1397,6 @@ class AssessmentStrategist:
                 self._config, aws_profile=self._aws_profile
             )
         return self._client
-
-    def generate(
-        self,
-        inventory: SourceInventory,
-        assessment: AssessmentReport,
-        target: TargetInventory,
-        conflicts: list[str],
-    ) -> AiAssessmentReport:
-        """Produce the AI assessment, raising on Bedrock failure/invalid output.
-
-        The prompt is grounded on the deterministic facts; the response is parsed
-        defensively (Requirement 11.8). Any boto/Bedrock failure is mapped to a
-        typed :class:`AiAssistUnavailableError` (credential-free), and empty or
-        unparseable output becomes ``INVALID_OUTPUT``.
-        """
-        prompt = build_assessment_prompt(
-            inventory, assessment, target, conflicts,
-            source_engine=self._source_engine,
-        )
-        try:
-            response = self._get_client().invoke_model(
-                modelId=self._config.model_id,
-                body=_build_invoke_body(prompt, max_tokens=_ASSESSMENT_MAX_TOKENS),
-                contentType="application/json",
-                accept="application/json",
-            )
-        except AiAssistUnavailableError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            raise AiAssistUnavailableError(_classify_bedrock_error(exc)) from None
-
-        # Best practice: accept a free-form Markdown narrative rather than forcing
-        # brittle JSON. Any non-empty reply is valid and is rendered as Markdown;
-        # only an empty/unreadable body is treated as INVALID_OUTPUT. The narrative
-        # is capped so a single response cannot flood the UI.
-        text = _extract_suggestion_text(response).strip()
-        if not text:
-            raise AiAssistUnavailableError("INVALID_OUTPUT")
-        return AiAssessmentReport(
-            strategy_summary=text[:_MAX_NARRATIVE_CHARS],
-            model_id=self._config.model_id,
-        )
-
-    def try_generate(
-        self,
-        inventory: SourceInventory,
-        assessment: AssessmentReport,
-        target: TargetInventory,
-        conflicts: list[str],
-    ) -> AiAssessmentOutcome:
-        """Graceful-degradation wrapper around :meth:`generate` (Req 11.10).
-
-        Never raises: on any Bedrock failure or unparseable output it returns an
-        unavailable :class:`AiAssessmentOutcome`, so the deterministic assessment
-        still stands alone.
-        """
-        try:
-            report = self.generate(inventory, assessment, target, conflicts)
-        except AiAssistUnavailableError as error:
-            return AiAssessmentOutcome.unavailable(error)
-        return AiAssessmentOutcome.ok(report)
-
-    def generate_object_guidance(self, item: AssessmentItem) -> str:
-        """Produce on-demand Markdown guidance for ONE assessed object.
-
-        Grounds the prompt on the single deterministic :class:`AssessmentItem`
-        and the DSQL constraints, calls bedrock-runtime ``InvokeModel`` via the
-        injected/lazy client, and returns the model's Markdown narrative (capped).
-        Any Bedrock failure is mapped to a typed, credential-free
-        :class:`AiAssistUnavailableError`; empty output becomes
-        ``INVALID_OUTPUT`` (Requirements 11.8, 11.10).
-        """
-        prompt = build_object_guidance_prompt(item, source_engine=self._source_engine)
-        try:
-            response = self._get_client().invoke_model(
-                modelId=self._config.model_id,
-                body=_build_invoke_body(
-                    prompt, max_tokens=_CHAT_MAX_TOKENS
-                ),
-                contentType="application/json",
-                accept="application/json",
-            )
-        except AiAssistUnavailableError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            raise AiAssistUnavailableError(_classify_bedrock_error(exc)) from None
-
-        text = _extract_suggestion_text(response).strip()
-        if not text:
-            raise AiAssistUnavailableError("INVALID_OUTPUT")
-        return text[:_MAX_NARRATIVE_CHARS]
-
-    def try_generate_object_guidance(self, item: AssessmentItem) -> "ObjectGuidanceOutcome":
-        """Graceful-degradation wrapper around :meth:`generate_object_guidance`.
-
-        Never raises: on any Bedrock failure or unparseable output it returns an
-        unavailable :class:`ObjectGuidanceOutcome` carrying a fixed,
-        credential-free message, so the drawer can show the reason instead of an
-        error (Requirement 11.10).
-        """
-        try:
-            markdown = self.generate_object_guidance(item)
-        except AiAssistUnavailableError as error:
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
-            )
-        return ObjectGuidanceOutcome(
-            available=True,
-            reason="OK",
-            detail="",
-            markdown=markdown,
-            model_id=self._config.model_id,
-        )
-
-    def stream_object_guidance(
-        self,
-        item: AssessmentItem,
-        on_delta: Callable[[str], None],
-    ) -> "ObjectGuidanceOutcome":
-        """Stream on-demand guidance for ONE object, emitting text via ``on_delta``.
-
-        Calls bedrock-runtime ``InvokeModelWithResponseStream`` and invokes
-        ``on_delta(text)`` for each incremental text chunk so the UI can render
-        the answer as it is generated (a chat-like, token-by-token reveal). The
-        returned :class:`ObjectGuidanceOutcome` carries the full assembled
-        Markdown on success, or a fixed, credential-free unavailable message on
-        any Bedrock failure / empty stream (Requirements 11.8, 11.10). Never
-        raises -- the drawer must stay robust -- and ``on_delta`` is only ever
-        called with already-received text, so a mid-stream failure still leaves
-        the partial text visible while the outcome explains the interruption.
-        """
-        prompt = build_object_guidance_prompt(item, source_engine=self._source_engine)
-        try:
-            response = self._get_client().invoke_model_with_response_stream(
-                modelId=self._config.model_id,
-                body=_build_invoke_body(
-                    prompt, max_tokens=_CHAT_MAX_TOKENS
-                ),
-                contentType="application/json",
-                accept="application/json",
-            )
-        except AiAssistUnavailableError as error:
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
-            )
-        except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            error = AiAssistUnavailableError(_classify_bedrock_error(exc))
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
-            )
-
-        parts: list[str] = []
-        try:
-            for text in _iter_stream_text(response):
-                parts.append(text)
-                on_delta(text)
-        except Exception as exc:  # noqa: BLE001 - mapped to a typed, safe signal
-            error = AiAssistUnavailableError(_classify_bedrock_error(exc))
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
-            )
-
-        markdown = "".join(parts).strip()
-        if not markdown:
-            error = AiAssistUnavailableError("INVALID_OUTPUT")
-            return ObjectGuidanceOutcome(
-                available=False, reason=error.reason, detail=error.detail
-            )
-        return ObjectGuidanceOutcome(
-            available=True,
-            reason="OK",
-            detail="",
-            markdown=markdown[:_MAX_NARRATIVE_CHARS],
-            model_id=self._config.model_id,
-        )
 
     def stream_object_chat(
         self,
@@ -2160,12 +1833,13 @@ class AssessmentStrategist:
 
 @dataclass(frozen=True)
 class ObjectGuidanceOutcome:
-    """On-demand single-object AI guidance that never breaks the workflow.
+    """The outcome of one AI DBA chat turn; it never breaks the workflow.
 
-    When :attr:`available` is ``True`` the :attr:`markdown` carries the model's
-    remediation write-up for one object and :attr:`model_id` its provenance;
-    otherwise :attr:`detail` is a fixed, credential-free message explaining why
-    AI was unavailable. ``reason`` is ``"OK"`` exactly when available.
+    Every chat method returns it, whatever the scope. When :attr:`available` is
+    ``True`` the :attr:`markdown` carries the reply and :attr:`model_id` its
+    provenance; otherwise :attr:`detail` is a fixed, credential-free message
+    explaining why AI was unavailable. ``reason`` is ``"OK"`` exactly when
+    available.
     """
 
     available: bool
@@ -2186,11 +1860,8 @@ class ObjectGuidanceOutcome:
 __all__ = [
     "DSQL_CONSTRAINTS",
     "DSQL_QUERY_EFFICIENCY_RUBRIC",
-    "AiAssessmentOutcome",
     "AssessmentStrategist",
     "ObjectGuidanceOutcome",
-    "build_assessment_prompt",
-    "build_object_guidance_prompt",
     "build_object_chat_system",
     "build_general_chat_system",
     "build_validation_chat_system",

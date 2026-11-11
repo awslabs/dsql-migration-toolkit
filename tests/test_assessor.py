@@ -1028,21 +1028,6 @@ def test_render_html_report_includes_target_analysis() -> None:
     assert "Target analysis (Aurora DSQL)" not in render_html_report(report)
 
 
-def test_render_html_report_includes_ai_assessment_when_provided() -> None:
-    from dsql_migrator.core.assessor import render_html_report
-    from dsql_migrator.core.models import AiAssessmentReport
-
-    report = _assess(_representative_inventory())
-    ai = AiAssessmentReport(
-        strategy_summary="## Migration strategy\nDo X then Y.", model_id="m"
-    )
-    markup = render_html_report(report, ai_report=ai)
-    assert "AI-led migration assessment" in markup
-    assert "Do X then Y." in markup
-    # Without an AI report, the AI section is omitted.
-    assert "AI-led migration assessment" not in render_html_report(report)
-
-
 def test_render_text_report_matches_export_text() -> None:
     report = _assess(_representative_inventory())
     assert render_text_report(report) == export_report(report, "text")

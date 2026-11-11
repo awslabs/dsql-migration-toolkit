@@ -1,20 +1,18 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for AI-assist data models, config loading, and the Bedrock seam.
+"""Unit tests for AI-assist data models and the Bedrock seam.
 
 Covers:
 
 - ``AiAssistConfig`` serialization round-trips, defaults, and validation
   (Requirements 11.1-11.4).
-- Loading ``BEDROCK_MODEL_ID`` / ``BEDROCK_REGION`` into an ``AiAssistConfig``
-  (default model id, region, opt-in disabled).
 - Constructing the ``bedrock-runtime`` client from an injected fake session:
   the right region is forwarded, no credentials are passed (IAM-based auth), and
   building the client performs no network call.
-- Untrusted-output parsing, the forbidden-statement validator, the typed
-  Bedrock-failure classification (Requirements 11.8, 11.10), and the
-  ``verify_access`` preflight (Requirements 11.13-11.16).
+- The forbidden-statement validator, the typed Bedrock-failure classification
+  (Requirements 11.8, 11.10), and the ``verify_access`` preflight
+  (Requirements 11.13-11.16).
 
 All Bedrock interaction is mocked through an injected fake session, so these
 tests never reach AWS.
@@ -30,18 +28,13 @@ from pydantic import ValidationError
 
 from dsql_migrator.core.ai_assistant import (
     BEDROCK_RUNTIME_SERVICE,
-    ENV_BEDROCK_MODEL_ID,
-    ENV_BEDROCK_REGION,
-    MAX_SUGGESTION_CHARS,
     AiAssistUnavailableError,
     AiConversionAssistant,
     build_bedrock_runtime_client,
-    load_ai_assist_config,
     validate_suggested_sql,
 )
-from dsql_migrator.core.ai_assistant import (  # internal: untrusted-output safety
+from dsql_migrator.core.ai_assistant import (  # internal: the Bedrock-failure classifier
     _classify_bedrock_error,
-    _extract_suggestion_text,
 )
 from dsql_migrator.core.models import AiAccessCheckResult, AiAssistConfig
 
@@ -96,46 +89,6 @@ def test_ai_assist_config_rejects_blank_model_id() -> None:
 def test_ai_assist_config_rejects_unknown_field() -> None:
     with pytest.raises(ValidationError):
         AiAssistConfig(unexpected="value")
-
-
-# ---------------------------------------------------------------------------
-# load_ai_assist_config (BEDROCK_MODEL_ID / BEDROCK_REGION)
-# ---------------------------------------------------------------------------
-
-
-def test_load_ai_assist_config_uses_defaults_when_env_empty() -> None:
-    config = load_ai_assist_config(env={})
-    assert config.enabled is False
-    assert config.model_id == "global.anthropic.claude-sonnet-5"
-    assert config.region is None
-
-
-def test_load_ai_assist_config_reads_model_id_and_region() -> None:
-    env = {
-        ENV_BEDROCK_MODEL_ID: "anthropic.claude-3",
-        ENV_BEDROCK_REGION: "us-west-2",
-    }
-    config = load_ai_assist_config(env=env)
-    assert config.model_id == "anthropic.claude-3"
-    assert config.region == "us-west-2"
-    # Still opt-in: env never enables AI assist.
-    assert config.enabled is False
-
-
-def test_load_ai_assist_config_treats_blank_values_as_unset() -> None:
-    env = {ENV_BEDROCK_MODEL_ID: "   ", ENV_BEDROCK_REGION: "  "}
-    config = load_ai_assist_config(env=env)
-    assert config.model_id == "global.anthropic.claude-sonnet-5"
-    assert config.region is None
-
-
-def test_load_ai_assist_config_keys_are_not_prefixed() -> None:
-    # The keys are exactly BEDROCK_MODEL_ID / BEDROCK_REGION (no DSQL_MIGRATOR_).
-    assert ENV_BEDROCK_MODEL_ID == "BEDROCK_MODEL_ID"
-    assert ENV_BEDROCK_REGION == "BEDROCK_REGION"
-    env = {"DSQL_MIGRATOR_BEDROCK_MODEL_ID": "ignored"}
-    config = load_ai_assist_config(env=env)
-    assert config.model_id == "global.anthropic.claude-sonnet-5"
 
 
 # ---------------------------------------------------------------------------
@@ -288,40 +241,6 @@ def _client_error(code: str) -> Exception:
             super().__init__(error_code)
 
     return _ClientError(code)
-
-
-# --- Safe parsing of untrusted output (never raises) -----------------------
-
-
-def test_extract_suggestion_text_handles_malformed_bodies_without_raising() -> None:
-    # Each of these untrusted bodies must yield "" rather than raising.
-    assert _extract_suggestion_text({}) == ""
-    assert _extract_suggestion_text({"body": None}) == ""
-    assert _extract_suggestion_text({"body": b"not json"}) == ""
-    assert _extract_suggestion_text({"body": "{not valid json"}) == ""
-    assert _extract_suggestion_text({"body": json.dumps([1, 2, 3])}) == ""
-    assert _extract_suggestion_text({"body": json.dumps({"content": "x"})}) == ""
-    assert _extract_suggestion_text({"body": json.dumps({"other": 1})}) == ""
-
-
-def test_extract_suggestion_text_ignores_non_text_blocks() -> None:
-    payload = json.dumps(
-        {
-            "content": [
-                {"type": "tool_use", "id": "abc"},
-                {"type": "text", "text": "keep me"},
-                {"type": "text"},  # missing text
-            ]
-        }
-    )
-    assert _extract_suggestion_text({"body": payload}) == "keep me"
-
-
-def test_extract_suggestion_text_caps_oversized_output() -> None:
-    huge = "A" * (MAX_SUGGESTION_CHARS + 5_000)
-    payload = json.dumps({"content": [{"type": "text", "text": huge}]})
-    extracted = _extract_suggestion_text({"body": payload})
-    assert len(extracted) == MAX_SUGGESTION_CHARS
 
 
 # --- Forbidden-statement validation (Req 11.8) -----------------------------
