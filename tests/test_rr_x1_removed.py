@@ -138,7 +138,9 @@ _LIVE_STRATEGIST_METHODS = (
     "stream_cdc_chat",
 )
 
-# Live names that shared these modules; their production callers import them from here.
+# Live names that shared these modules; production code in another module imports each
+# from here. A name only its own module uses (ai_assistant's _build_invoke_body and
+# _UNAVAILABLE_DETAILS) is not pinned: inlining or moving it breaks no importer in src.
 _KEPT_NAMES: dict[str, tuple[str, ...]] = {
     "dsql_migrator.core.ai_assistant": (
         "AiConversionAssistant",
@@ -146,9 +148,7 @@ _KEPT_NAMES: dict[str, tuple[str, ...]] = {
         "validate_suggested_sql",
         "build_bedrock_runtime_client",
         "_ANTHROPIC_VERSION",
-        "_build_invoke_body",
         "_classify_bedrock_error",
-        "_UNAVAILABLE_DETAILS",
         "_ACCESS_CHECK_DETAILS",
         "_classify_access_check_error",
     ),
@@ -173,7 +173,8 @@ _KEPT_NAMES: dict[str, tuple[str, ...]] = {
         "map_access_check_display",
         "run_verify_ai_access",
     ),
-    "dsql_migrator.ui.schema_conversion": ("ai_candidate_object_names",),
+    # Defined here; the Schema Conversion screen (ui/schema_conversion.py) imports it.
+    "dsql_migrator.ui.schema_conversion_apply": ("ai_candidate_object_names",),
 }
 
 

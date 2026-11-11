@@ -690,8 +690,9 @@ class PgNonKeySequenceRule(Rule):
             # the rarer case -- so the go/no-go artifact described a data-quality item to
             # clean up later while Schema Conversion, which DOES branch on nullability,
             # said "REJECTED on Aurora DSQL" about the same column. This risk text is also
-            # copied into the AI strategist's prompt, so the wrong outcome propagated into
-            # the generated migration plan.
+            # copied into the AI DBA's per-object chat grounding
+            # (build_object_chat_system) and its get_assessment tool's reply, so the
+            # wrong outcome reached its answers.
             clauses, remedies = [], []
             if not_null:
                 clauses.append(
