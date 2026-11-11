@@ -5,11 +5,15 @@
 
 The MySQL watermark records an unknown estimate as 0 (``watermark._approximate_row_counts``):
 ``information_schema.TABLES`` has no row for the table, its ``TABLE_ROWS`` is NULL, or the
-estimate read failed. A PostgreSQL start point keeps ``None`` (0.1.499: collapsed to 0, the
-panel read "5 / 0"). The 2026-11-06 refactoring review asked whether MySQL should keep
-``None`` too, once every consumer was audited. This file is that audit, run on a MySQL
-watermark that holds ``None`` beside the same watermark holding 0 (doubles only: no MySQL,
-Aurora DSQL or AWS).
+server stopped the estimate read with a statement error the session survives (a
+``max_execution_time`` timeout, a KILL QUERY), which leaves every table unknown. A dropped
+connection there, or a client read timeout, records no start point at all: the capture
+fails, and with it the run. A PostgreSQL start point keeps ``None`` (0.1.499: collapsed to
+0, the panel read "5 / 0"). The 2026-11-06 refactoring review asked whether MySQL should
+keep ``None`` too, once every consumer was audited. This file is that audit, run on a MySQL
+watermark that holds ``None`` beside the same watermark holding 0 (doubles only, and an
+in-memory SQLite engine behind the one real SQLAlchemy connection: no MySQL, Aurora DSQL or
+AWS).
 
 A None changes three decisions, so the MySQL fold stays (the review's one-line comment marks
 it):
@@ -20,10 +24,15 @@ it):
 * the Full Load verdict (``full_load_completeness``): a 0 is complete, a None is a table
   "without an estimate to compare", so the green "Full Load complete" turns into the info note.
 
+With every table unknown, 0s tie as Nones do, so neither order changes -- unless the run holds
+a table the start point never counted (one selected after the load, which a Retry loads under
+it): beside 0s that table is the one unknown, beside Nones every table ties.
+
 Alike for both: an automatic split and the Reader shards minimum (neither spares the planning
 read), CDC partition sizing (both dropped), Validation (an approximate figure is never an exact
 count), and every reader of the KEYS only (CDC coverage, Validation's scope gap, the table-set
-lock, the activity line).
+lock, the rules popup's capture preview, the activity line), with one table unknown and with
+every table unknown.
 
 Displays that already show a None as unknown, on either engine: the Rows cell and its tooltip,
 the watermark panel, the CDC per-table status and Change & reload's estimate. A None
@@ -37,7 +46,11 @@ import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pymysql
 import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.dialects.mysql.pymysql import MySQLDialect_pymysql
+from sqlalchemy.exc import PendingRollbackError
 
 import dsql_migrator.ui.data_migration._full_load_engine as engine
 from dsql_migrator.core.job_store import SqliteJobStore
@@ -73,6 +86,8 @@ from dsql_migrator.ui.validation import full_load_covered_tables
 
 import tests.test_g137_mysql_reader_shards as g137
 from tests.test_full_load_start_order import _Exporter, _migrator
+from tests.test_g12_table_set_after_load import _c
+from tests.test_g16_full_load_and_cdc_narrowing import _fc_screen
 from tests.test_g137_mysql_reader_shards import rig  # noqa: F401 - the process-path rig
 from tests.test_p4a_deferred_indexes import prig  # noqa: F401 - the process-path rig
 from tests.test_ui_data_migration import _RecordingUi, _WatermarkUi
@@ -81,11 +96,20 @@ from tests.test_watermark import FIXED_NOW, _FakeConnection
 # UNKNOWN sorts before EMPTY by name, so an order that puts a None behind the real zeros shows.
 UNKNOWN, EMPTY, BIG = "app.a_unknown", "app.b_empty", "app.c_big"
 NAMES = (UNKNOWN, EMPTY, BIG)
+# A table the start point never counted: selected after the load, loaded by a Retry under it.
+# It sorts before every other name, so an order by name shows it.
+ADDED = "app.a_added"
 _TS = datetime(2026, 11, 6, tzinfo=timezone.utc)
 
 
 def _counts(unknown) -> dict:
     return {UNKNOWN: unknown, EMPTY: 0, BIG: 50_000}
+
+
+def _all_unknown(unknown) -> dict:
+    """Every table unknown: an estimate read the server stopped, as MySQL records it (0) or
+    with a None."""
+    return dict.fromkeys(NAMES, unknown)
 
 
 def _mysql_wm(unknown, *, counts=None) -> Watermark:
@@ -149,15 +173,6 @@ def _free_the_runs_queues():
 # ---------------------------------------------------------------------------
 
 
-class _EstimateReadFails(_FakeConnection):
-    """A source that answers everything but the estimate read (the connection dropped)."""
-
-    def execute(self, statement, _parameters=None):  # noqa: ANN001, ANN201
-        if "INFORMATION_SCHEMA.TABLES" in str(statement).upper():
-            raise RuntimeError("Lost connection to MySQL server during query")
-        return super().execute(statement, _parameters)
-
-
 def test_the_mysql_start_point_records_an_unknown_estimate_as_0() -> None:
     # "nulled": TABLE_ROWS is NULL; "ghost": information_schema has no row for it at all;
     # "empty": a real 0.
@@ -176,13 +191,60 @@ def test_the_mysql_start_point_records_an_unknown_estimate_as_0() -> None:
     }
 
 
-def test_a_failed_estimate_read_records_every_table_as_0() -> None:
-    watermark = capture_watermark(
-        _EstimateReadFails(counts={"orders": 5}), ["orders", "items"], now=lambda: FIXED_NOW
+def _capture_on_a_sqlalchemy_connection(*, disconnect: bool) -> Watermark:
+    """``capture_watermark`` on a real SQLAlchemy AUTOCOMMIT connection, opened as
+    ``WatermarkCapturer.capture`` opens it. An in-memory SQLite engine stands in for the
+    source: every read answers NULL but the estimate read, which fails -- as a disconnect
+    (``disconnect``: SQLAlchemy then invalidates the connection, as for a MySQL 2013 or 2006)
+    or as a statement error the session survives."""
+    source = create_engine("sqlite://")
+
+    @event.listens_for(source, "before_cursor_execute", retval=True)
+    def _answer(_conn, _cursor, statement, _parameters, _context, _many):  # noqa: ANN001, ANN202
+        if "TABLE_ROWS" in statement.upper():
+            return "SELECT * FROM the_estimate_read_fails", ()
+        return "SELECT NULL", ()
+
+    @event.listens_for(source, "handle_error")
+    def _classify(context):  # noqa: ANN001, ANN202
+        context.is_disconnect = disconnect
+
+    try:
+        with source.connect() as connection:
+            return capture_watermark(
+                connection.execution_options(isolation_level="AUTOCOMMIT"),
+                ["app.orders", "app.items"],
+                now=lambda: FIXED_NOW,
+            )
+    finally:
+        source.dispose()
+
+
+def test_only_an_estimate_read_the_server_stops_records_every_table_as_0() -> None:
+    # A statement error the session survives (a max_execution_time timeout, a KILL QUERY): the
+    # read gives no figure, the capture commits, and every requested table keeps its key at 0
+    # -- so the readers of the keys (section 3) see the run's tables whatever the figures are.
+    stopped = _capture_on_a_sqlalchemy_connection(disconnect=False)
+    assert stopped.table_row_counts == {"app.orders": 0, "app.items": 0}
+    # A dropped connection there (or a client read timeout) records no start point at all:
+    # SQLAlchemy invalidates the connection, the capture's COMMIT raises, and the run fails
+    # before any table loads.
+    with pytest.raises(PendingRollbackError):
+        _capture_on_a_sqlalchemy_connection(disconnect=True)
+    # Which MySQL error is which, by SQLAlchemy's own rule for the PyMySQL driver: a lost
+    # connection (2013, also what a client read timeout raises) and a gone server (2006) are
+    # disconnects; the max_execution_time timeout (3024) and a KILL QUERY (1317) are not.
+    dialect = MySQLDialect_pymysql(dbapi=pymysql)
+
+    def _is_disconnect(code: int, message: str) -> bool:
+        return dialect.is_disconnect(pymysql.err.OperationalError(code, message), None, None)
+
+    assert _is_disconnect(2013, "Lost connection to MySQL server during query (timed out)")
+    assert _is_disconnect(2006, "MySQL server has gone away")
+    assert not _is_disconnect(
+        3024, "Query execution was interrupted, maximum statement execution time exceeded"
     )
-    # Every requested table keeps its key, so the readers of the keys (section 3) see the
-    # run's tables whatever the figures are.
-    assert watermark.table_row_counts == {"orders": 0, "items": 0}
+    assert not _is_disconnect(1317, "Query execution was interrupted")
 
 
 # ---------------------------------------------------------------------------
@@ -195,18 +257,19 @@ def _ddl(name: str) -> str:
     return f'CREATE INDEX ASYNC "ix_{short}" ON "app"."{short}" ("email")'
 
 
-def _load_twice(prig) -> dict:  # noqa: F811 - the fixture
-    """One process-path run (Reader shards 4, workers inline) per figure of UNKNOWN: the order
-    the pool started the tables in, and the order the index pass after it submitted their
-    indexes in (each whole-table unit hands its DDL back, as one that recreated its table)."""
-    table_of = {_ddl(name): name for name in NAMES}
+def _load_twice(prig, *, names=NAMES, counts=_counts) -> dict:  # noqa: F811 - the fixture
+    """One process-path run (Reader shards 4, workers inline) of ``names`` per figure of the
+    unknown estimate, under the start point ``counts(figure)``: the order the pool started the
+    tables in, and the order the index pass after it submitted their indexes in (each
+    whole-table unit hands its DDL back, as one that recreated its table)."""
+    table_of = {_ddl(name): name for name in names}
     out = {}
     for unknown in (0, None):
         prig.events.clear()
         prig.whole.clear()
-        prig.whole.update({name: {"ddls": [_ddl(name)]} for name in NAMES})
-        r = prig([g137._table(name) for name in NAMES], counts=_counts(unknown))
-        assert all(r.chunks[name].status == "DONE" for name in NAMES)
+        prig.whole.update({name: {"ddls": [_ddl(name)]} for name in names})
+        r = prig([g137._table(name) for name in names], counts=counts(unknown))
+        assert all(r.chunks[name].status == "DONE" for name in names)
         out[unknown] = SimpleNamespace(
             started=[e[1] for e in prig.events if e[0] == "unit"],
             indexed=[table_of[e[1][0]] for e in prig.events if e[0] == "index"],
@@ -226,6 +289,23 @@ def test_a_none_would_follow_the_empty_tables_in_the_index_pass(prig) -> None:  
     runs = _load_twice(prig)
     assert runs[0].indexed == [BIG, UNKNOWN, EMPTY]       # the zeros among themselves, by name
     assert runs[None].indexed == [BIG, EMPTY, UNKNOWN]    # unknown last, after every 0
+
+
+def test_with_every_table_unknown_only_a_table_never_counted_changes_the_orders(
+    prig,  # noqa: F811
+) -> None:
+    # Every table unknown: 0s tie with each other as Nones do, so neither order changes.
+    alone = _load_twice(prig, counts=_all_unknown)
+    assert alone[0].started == alone[None].started == list(NAMES)    # the order they came in
+    assert alone[0].indexed == alone[None].indexed == list(NAMES)    # by name
+    # A table the start point never counted, in the same run: beside 0s it is the one table
+    # without an estimate, so it starts first and indexes last; beside Nones every table
+    # ties, so it starts where it came in and indexes by its name.
+    runs = _load_twice(prig, names=(*NAMES, ADDED), counts=_all_unknown)
+    assert runs[0].started == [ADDED, *NAMES]
+    assert runs[None].started == [*NAMES, ADDED]
+    assert runs[0].indexed == [*NAMES, ADDED]
+    assert runs[None].indexed == [ADDED, *NAMES]
 
 
 def test_mysql_reads_no_size_for_a_none_where_postgresql_sizes_it() -> None:
@@ -318,25 +398,58 @@ def test_validation_takes_neither_as_an_exact_count() -> None:
         assert _exact_watermark_count(watermark, BIG) is None
 
 
-def test_the_readers_of_the_keys_see_the_same_tables(monkeypatch) -> None:
+# What a reader of the keys may be given: one table unknown, and every table unknown -- where
+# a reader that skipped the unknown figures would find no table at all -- each as MySQL
+# records it (0) and with a None.
+_UNKNOWN_IDS = ["one 0", "one None", "every 0", "every None"]
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [_counts(0), _counts(None), _all_unknown(0), _all_unknown(None)],
+    ids=_UNKNOWN_IDS,
+)
+def test_the_readers_of_the_keys_see_the_same_tables(monkeypatch, counts) -> None:
     details: list = []
     monkeypatch.setattr(
         engine, "log_activity", lambda _cat, _action, **kw: details.append(kw.get("detail"))
     )
     monkeypatch.setattr(_table_set_lock, "_cdc_started_for_migration", lambda *_a: False)
-    for unknown in (0, None):
-        watermark = _mysql_wm(unknown)
-        job = MigrationJob(job_id="j", status="DONE", watermark=watermark)
-        state = SimpleNamespace(
-            job_id="j", migration_type=MigrationType.FULL_LOAD_AND_CDC, cdc_stack_phase=None
-        )
-        assert cdc_covered_names(watermark) == frozenset(NAMES)              # CDC capture
-        assert engine._covered_by(watermark) == set(NAMES)                    # guarded additions
-        assert full_load_covered_tables(state, _manager(job)) == frozenset(NAMES)  # scope gap
-        # Full load + CDC's narrowing stays open on the record's per-table counts (G16).
-        assert _table_set_lock._fl_cdc_narrowing_job(state, _manager(job), job=job) is job
-        engine._log_captured_watermark(watermark)
-    assert len(details) == 2 and all("; 3 table(s) counted" in d for d in details)
+    watermark = _mysql_wm(None, counts=counts)
+    job = MigrationJob(job_id="j", status="DONE", watermark=watermark)
+    state = SimpleNamespace(
+        job_id="j", migration_type=MigrationType.FULL_LOAD_AND_CDC, cdc_stack_phase=None
+    )
+    assert cdc_covered_names(watermark) == frozenset(NAMES)              # CDC capture
+    assert engine._covered_by(watermark) == set(NAMES)                    # guarded additions
+    assert full_load_covered_tables(state, _manager(job)) == frozenset(NAMES)  # scope gap
+    # Full load + CDC's narrowing stays open on the record's per-table counts (G16).
+    assert _table_set_lock._fl_cdc_narrowing_job(state, _manager(job), job=job) is job
+    engine._log_captured_watermark(watermark)
+    assert len(details) == 1 and "; 3 table(s) counted" in details[0]
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [{"app.a": 0, "app.b": 5}, {"app.a": None, "app.b": 5},
+     {"app.a": 0, "app.b": 0}, {"app.a": None, "app.b": None}],
+    ids=_UNKNOWN_IDS,
+)
+def test_the_rules_popups_capture_preview_reads_the_keys(monkeypatch, counts) -> None:
+    """The package's ``_exclusion_capture_tables`` (the tables CDC would capture after a popup
+    Save) on the real Data Migration screen: Full load + CDC after its Full Load, CDC not
+    started; the record's start point covers app.a and app.b, the inventory adds app.c."""
+    job = MigrationJob(
+        job_id="job-1", status="DONE", watermark=_mysql_wm(None, counts=counts),
+        chunks=[_c("app.a"), _c("app.b")],
+    )
+    screen = _fc_screen(monkeypatch, job=job, selected=["app.a", "app.b"])
+    capture = screen.captured["ctx"].capture_tables_fn
+    # A Save that keeps the selection: the capture as it is now.
+    assert [t.name for t in capture(["app.a", "app.b"])] == ["app.a", "app.b"]
+    # A Save that unticks app.b and ticks app.c, which the start point does not cover: app.c
+    # is captured only once a Retry has loaded it, so the preview holds app.a alone.
+    assert [t.name for t in capture(["app.a", "app.c"])] == ["app.a"]
 
 
 # ---------------------------------------------------------------------------
