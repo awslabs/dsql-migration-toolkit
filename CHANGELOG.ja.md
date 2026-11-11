@@ -5,6 +5,36 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.586
+
+新機能のないメンテナンスリリースです。AI DBA の失敗メッセージと Schema Conversion の 2 つの文言は、アプリが一度も提示したことのない、承認対象の AI の変換提案について述べなくなりました: 各メッセージは何が失敗したかと次に何をすべきかを示すようになり、拒否されたリクエストのメッセージは、AI DBA に必要な Amazon Bedrock の権限を 2 つとも示します。README の AI アシストの行は、AI DBA が何をするかを示すようになりました。残りは動作を変えない内部リファクタリングです。
+
+### 修正
+
+- **AI DBA の失敗メッセージは、承認対象の AI の変換提案について述べなくなりました: 各メッセージは何が失敗したかと次に何をすべきかを示すようになり、拒否されたリクエストのメッセージは、AI DBA に必要な Amazon Bedrock の権限を 2 つとも示します。** これらは、**What's next?** を含むすべてのチャットで、AI DBA パネルに表示される *AI reply unavailable* の通知の本文です。各メッセージは *The deterministic workflow is unaffected.* と示し (以前は、そのうち 4 つが *The deterministic conversion result and its MANUAL/UNSUPPORTED flag are kept.* と示していました)、続けて何をすべきかを案内するようになりました:
+  - 拒否されたリクエスト: 設定したモデルに対する `bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream` を付与するか、AWS の認証情報またはセッションの有効期限が切れている場合は再認証し、その後 Connect 画面で **Verify AI access** を実行して AI Assist をオンに戻すよう案内します (以前は `bedrock:InvokeModel` だけを挙げていましたが、AI DBA は一部の応答をストリーミングし、それには 2 つ目の権限が必要です。**Verify AI access** は `bedrock:InvokeModel` だけを確認するため、ストリーミングの権限がなくても成功します)。
+  - スロットリングされたリクエスト: *Ask again later.* と示します (以前は *Retry later to get an AI suggestion.* と示していました)。
+  - Bedrock が応答しなかったリクエスト: もう一度質問し、失敗が続く場合は Bedrock のエンドポイントへの接続を確認するよう案内します (以前は、タイムアウトの場合でも、Bedrock が *could not be reached (network error)* だと示していました)。
+  - それ以外の失敗したリクエスト: もう一度質問し、失敗が続く場合は Connect 画面で **Verify AI access** を実行して、設定したモデルとリージョンを確認するよう案内します (以前は *The workflow continues without an AI suggestion.* と示していました)。
+  - 空の応答: 応答が *came back empty* だったことを伝え、もう一度質問するか、質問を言い換えるよう案内します (以前は、応答が *could not be parsed* だったことと、*the deterministic result above is complete and authoritative* であることを示していました)。
+
+  リクエストが拒否された後は AI Assist が *Unavailable* と表示され、拒否のメッセージは、Connect 画面の *AI Assist unavailable* の通知、AI DBA パネルの質問の入力欄の下、そして **What's next?** が出す通知にも表示されます。変わったのは文言だけです: どの失敗にどのメッセージが表示されるかと、どの失敗が AI Assist を利用不可とするかは、以前と同じです。マニュアルとデプロイガイドが引用している、AWS Marketplace の契約がないモデルについてのメッセージは変わらず、**Verify AI access** が報告する内容も変わりません。
+- **Schema Conversion の 2 つの文言が AI の提案に言及しなくなりました: *Apply generated DDL to target* カードの適用範囲を示す行と、Generate DDL for selected と並んでいる Reset all ボタンのツールチップです。** カードの適用範囲を示す行は *Applies the <n> objects from the Generated DDL list above, with your edits (including DDL adopted from AI DBA with "Use as target DDL") — not the whole schema.* になり (以前は、編集内容を挙げる代わりに *(plus any approved AI suggestions)* と示していました)、**Reset all** のツールチップは *Discard the generated DDL, your edits (including DDL adopted from AI DBA) and the apply results, and start fresh.* になりました (以前は *AI suggestions* を挙げていました)。変わったのは文言だけです: カードは以前と同じオブジェクトを適用し、**Reset all** は以前と同じものを消去して、AI DBA の会話はそのまま残します。
+
+### 変更
+
+- **動作を変えない内部リファクタリング:** 不要なコードの削除 (使われていなかった AI の提案・レビュー・適用のコードを含む)、複数の箇所がそれぞれ記述していたロジックを 1 か所で定義 (隔離された行のメッセージ、Full Load の列のルール、Validation の CDC のチェック、Start CDC と Deploy CDC infrastructure が送るテーブルとトピックのパラメータなど)、そして大きなモジュールを分割 (Cut over や Full Load の外部キーの処理などを独立したモジュールに移動)。
+
+### ドキュメント
+
+- **README の AI アシストの行が、英語・韓国語・日本語のいずれでも、AI DBA が何をするかを示すようになりました:** AI アシストを有効にすると、Amazon Bedrock がすべてのステップの AI DBA パネルを動かし、変換とクエリチューニングの助言、**What's next?** のブリーフィング、Full Load の失敗・CDC のデッドレター・Validation の不一致の診断を行います。以前は、Bedrock が変換案の提示、CDC の準備状況の評価、DLQ のトリアージを行うと書いていました。AI DBA がしていたことで、なくなるものはありません: この行が挙げていた CDC の準備状況の評価は一度も表示されたことがなく、デッドレターは引き続き AI DBA の CDC デッドレターのチャットで診断されます。行のそれ以外の部分は変わりません。
+
+### アップグレードの注意
+
+- **アプリスタック: イメージのみの更新で十分です。** `deploy/cloudformation.yaml` は既定のイメージ以外は変わらず、IAM の変更もありません。実行中のジョブは先に終えるか止めてください: タスクの置き換えでジョブは終了します。
+- **CDC インフラストラクチャ: 再デプロイは不要です。** sink プラグインは引き続き v56 で、CDC スタックのテンプレートは変わりません。
+- **移行すべきものはなく、v0.1.585 に戻しても安全です。** このバージョンは v0.1.585 と同じ Full Load の記録と保存済みのセッションを読み書きし、同じ設定を受け付けるため、どちらのバージョンも、もう一方が書き込んだものを読めます。v0.1.585 は、以前の AI DBA の失敗メッセージと Schema Conversion の文言を再び表示します。
+
 ## v0.1.585
 
 新機能のないメンテナンスリリースです。Full Load は終了時にトレースバック付きの誤った警告を記録しなくなり、効果のなかった `DSQL_MIGRATOR_STAGING_BUCKET` 設定は読まれなくなりました。残りは動作を変えない内部リファクタリングです。

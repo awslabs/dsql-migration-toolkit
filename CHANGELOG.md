@@ -5,6 +5,36 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.586
+
+A maintenance release with no new features. The AI DBA's failure messages and two Schema Conversion texts no longer describe AI conversion suggestions to approve, which the app never offered: each message now says what failed and what to do next, and the one for a denied request names both Amazon Bedrock permissions the AI DBA needs. The README's AI assist line now says what the AI DBA does. The rest is internal refactoring that changes no behaviour.
+
+### Fixed
+
+- **The AI DBA's failure messages no longer describe AI conversion suggestions to approve: each now says what failed and what to do next, and the one for a denied request names both Amazon Bedrock permissions the AI DBA needs.** They are the body of the AI DBA panel's *AI reply unavailable* notice in every chat, **What's next?** included. Each now says *The deterministic workflow is unaffected.*, where four said *The deterministic conversion result and its MANUAL/UNSUPPORTED flag are kept.*, then what to do:
+  - a denied request: grant `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` for the configured model, or re-authenticate if your AWS credentials or session have expired, then run **Verify AI access** on the Connect screen to turn AI Assist back on (it named only `bedrock:InvokeModel`, but the AI DBA streams some of its replies, which needs the second; **Verify AI access** checks `bedrock:InvokeModel` only, so it passes without the streaming grant);
+  - a throttled request: *Ask again later.* (it said *Retry later to get an AI suggestion.*);
+  - a request Bedrock did not answer: ask again and, if it keeps failing, check connectivity to the Bedrock endpoint (it said Bedrock *could not be reached (network error)*, even on a timeout);
+  - any other failed request: ask again and, if it keeps failing, run **Verify AI access** on the Connect screen to check the configured model and region (it said *The workflow continues without an AI suggestion.*);
+  - an empty reply: the reply *came back empty*; ask again, or rephrase the question (it said the reply *could not be parsed* and that *the deterministic result above is complete and authoritative*).
+
+  After a denial, AI Assist shows as *Unavailable*, and the denial message also appears in the Connect screen's *AI Assist unavailable* notice, under the AI DBA panel's question box and in the notification **What's next?** shows. Only the wording changes: which failure gets which message, and which ones mark AI Assist unavailable, are as before. The message for a model whose AWS Marketplace agreement is missing, which the manual and the deployment guide quote, is unchanged, and so is what **Verify AI access** reports.
+- **Two Schema Conversion texts no longer mention AI suggestions: the scope line of the *Apply generated DDL to target* card and the tooltip of the Reset all button in the row with Generate DDL for selected.** The card's scope line now reads *Applies the <n> objects from the Generated DDL list above, with your edits (including DDL adopted from AI DBA with "Use as target DDL") — not the whole schema.*, where it said *(plus any approved AI suggestions)* instead of naming your edits, and the **Reset all** tooltip reads *Discard the generated DDL, your edits (including DDL adopted from AI DBA) and the apply results, and start fresh.*, where it listed *AI suggestions*. Only the wording changes: the card applies the same objects as before, and **Reset all** clears the same things, leaving the AI DBA conversation as it is.
+
+### Changed
+
+- **Internal refactoring, with no behaviour change:** dead code removed (the unused AI suggestion, review and apply code among it); logic that several places each spelled out is defined once, such as the quarantined-row message, the Full Load's column rules, Validation's CDC checks and the table and topic parameters that Start CDC and Deploy CDC infrastructure send; and large modules are split, Cut over and the Full Load's foreign-key pass among the parts moved to modules of their own.
+
+### Documentation
+
+- **The README's AI assist line now says what the AI DBA does, in English, Korean and Japanese:** with AI assist enabled, Amazon Bedrock powers the AI DBA panel on every step, with conversion and query-tuning advice, a **What's next?** briefing, and diagnosis of Full Load failures, CDC dead letters and Validation mismatches. It said Bedrock adds conversion suggestions, CDC-readiness assessment and DLQ triage. Nothing the AI DBA did goes: the CDC-readiness assessment the line named was never shown, and dead letters are still diagnosed in the AI DBA's CDC dead-letter chat. The rest of the line is unchanged.
+
+### Upgrade notes
+
+- **App stack: an image-only update is enough.** `deploy/cloudformation.yaml` is unchanged apart from its default image; there is no IAM change. Finish or stop running jobs first: the task replacement ends them.
+- **CDC infrastructure: nothing to redeploy.** The sink plugin is still v56, and the CDC stack template is unchanged.
+- **Nothing to migrate, and going back to v0.1.585 is safe.** This version reads and writes the same Full Load records and saved sessions as v0.1.585 and accepts the same settings, so either version reads what the other wrote. v0.1.585 shows the earlier AI DBA failure messages and Schema Conversion texts again.
+
 ## v0.1.585
 
 A maintenance release with no new features. A Full Load no longer logs a false warning with a traceback as it ends, and the `DSQL_MIGRATOR_STAGING_BUCKET` setting, which never had an effect, is no longer read. The rest is internal refactoring that changes no behaviour.

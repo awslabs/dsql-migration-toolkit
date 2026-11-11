@@ -5,6 +5,36 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.586
+
+새 기능이 없는 유지보수 릴리스입니다. AI DBA의 실패 메시지와 Schema Conversion의 두 문구는 앱이 한 번도 제시한 적 없는, 승인할 AI 변환 제안을 더 이상 언급하지 않습니다: 이제 각 메시지는 무엇이 실패했고 다음에 무엇을 할지 알려 주며, 거부된 요청에 대한 메시지는 AI DBA에 필요한 Amazon Bedrock 권한 두 가지를 모두 밝힙니다. README의 AI 보조 항목은 이제 AI DBA가 하는 일을 밝힙니다. 나머지는 동작을 바꾸지 않는 내부 리팩터링입니다.
+
+### 수정
+
+- **AI DBA의 실패 메시지가 더 이상 승인할 AI 변환 제안을 언급하지 않습니다: 이제 각 메시지는 무엇이 실패했고 다음에 무엇을 할지 알려 주며, 거부된 요청에 대한 메시지는 AI DBA에 필요한 Amazon Bedrock 권한 두 가지를 모두 밝힙니다.** 이 메시지들은 **What's next?**를 포함한 모든 채팅에서 AI DBA 패널에 나오는 *AI reply unavailable* 알림의 본문입니다. 이제 각 메시지는 *The deterministic workflow is unaffected.*라고 말한 뒤(예전에는 그중 네 메시지가 이 문장 대신 *The deterministic conversion result and its MANUAL/UNSUPPORTED flag are kept.*라고 했습니다) 할 일을 알려 줍니다:
+  - 거부된 요청: 설정된 모델에 대한 `bedrock:InvokeModel`과 `bedrock:InvokeModelWithResponseStream`을 부여하거나, AWS 자격 증명이나 세션이 만료되었다면 다시 인증한 다음, Connect 화면에서 **Verify AI access**를 실행해 AI Assist를 다시 켜라고 안내합니다(예전에는 `bedrock:InvokeModel`만 밝혔지만, AI DBA는 응답 일부를 스트리밍하며 그러려면 두 번째 권한이 필요합니다. **Verify AI access**는 `bedrock:InvokeModel`만 확인하므로, 스트리밍 권한이 없어도 통과합니다);
+  - 스로틀된 요청: *Ask again later.*라고 안내합니다(예전에는 *Retry later to get an AI suggestion.*이라고 했습니다);
+  - Bedrock이 응답하지 않은 요청: 다시 질문하고, 계속 실패하면 Bedrock 엔드포인트로의 연결을 확인하라고 안내합니다(예전에는 시간이 초과된 경우에도 Bedrock *could not be reached (network error)*라고 했습니다);
+  - 그 밖의 실패한 요청: 다시 질문하고, 계속 실패하면 Connect 화면에서 **Verify AI access**를 실행해 설정된 모델과 리전을 확인하라고 안내합니다(예전에는 *The workflow continues without an AI suggestion.*이라고 했습니다);
+  - 빈 응답: 응답이 *came back empty*라고 알리고, 다시 질문하거나 질문을 다른 말로 바꿔 보라고 안내합니다(예전에는 응답이 *could not be parsed*라고 하고, *the deterministic result above is complete and authoritative*라고 했습니다).
+
+  거부된 뒤에는 AI Assist가 *Unavailable*로 표시되며, 거부 메시지는 Connect 화면의 *AI Assist unavailable* 알림, AI DBA 패널의 질문 입력창 아래, 그리고 **What's next?**가 띄우는 토스트 알림에도 나옵니다. 바뀐 것은 문구뿐입니다: 어떤 실패에 어떤 메시지가 나오는지, 그리고 어떤 실패가 AI Assist를 사용할 수 없는 상태로 표시하는지는 예전과 같습니다. 매뉴얼과 배포 가이드가 인용하는, AWS Marketplace 약관이 수락되지 않은 모델에 대한 메시지는 바뀌지 않았으며, **Verify AI access**가 보고하는 내용도 마찬가지입니다.
+- **Schema Conversion의 두 문구가 더 이상 AI 제안을 언급하지 않습니다: *Apply generated DDL to target* 카드의 범위 안내 문구와, Generate DDL for selected 버튼과 같은 줄에 있는 Reset all 버튼의 툴팁입니다.** 카드의 범위 안내 문구는 이제 *Applies the <n> objects from the Generated DDL list above, with your edits (including DDL adopted from AI DBA with "Use as target DDL") — not the whole schema.*라고 표시됩니다. 예전에는 편집 내용을 밝히는 대신 *(plus any approved AI suggestions)*라고 했습니다. **Reset all** 툴팁은 이제 *Discard the generated DDL, your edits (including DDL adopted from AI DBA) and the apply results, and start fresh.*라고 표시되며, 예전에는 지우는 항목에 *AI suggestions*가 들어 있었습니다. 바뀐 것은 문구뿐입니다: 카드는 예전과 같은 객체를 적용하고, **Reset all**은 예전과 같은 것들을 지우며 AI DBA 대화는 그대로 둡니다.
+
+### 변경
+
+- **동작을 바꾸지 않는 내부 리팩터링:** 죽은 코드 삭제(쓰이지 않던 AI 제안·검토·적용 코드 포함), 여러 곳에서 각자 풀어 쓰던 로직을 한 곳에서 정의(격리된 행 메시지, Full Load의 컬럼 규칙, Validation의 CDC 점검, Start CDC와 Deploy CDC infrastructure가 보내는 테이블·토픽 파라미터 등), 그리고 큰 모듈 분할(별도 모듈로 옮긴 부분에 Full Load의 외래 키 패스와 Cut over 단계 포함).
+
+### 문서
+
+- **README의 AI 보조(AI assist) 항목이 이제 영어·한국어·일본어 모두에서 AI DBA가 하는 일을 밝힙니다:** AI 보조를 켜면 Amazon Bedrock이 모든 단계의 AI DBA 패널을 구동하며, 변환·쿼리 튜닝 조언, **What's next?** 브리핑, 그리고 Full Load 실패·CDC dead letter·Validation 불일치 진단을 제공합니다. 예전에는 Bedrock이 변환 제안, CDC 준비도 평가, DLQ 분류를 더한다고 했습니다. AI DBA가 하던 일 중 없어지는 것은 없습니다: 그 항목이 언급한 CDC 준비도 평가는 한 번도 표시된 적이 없고, dead letter는 여전히 AI DBA의 CDC dead-letter 채팅에서 진단됩니다. 그 항목의 나머지는 그대로입니다.
+
+### 업그레이드 참고
+
+- **앱 스택: 이미지만 업데이트하면 됩니다.** `deploy/cloudformation.yaml`은 기본 이미지 말고는 그대로이고 IAM 변경은 없습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **CDC 인프라: 다시 배포할 것이 없습니다.** 싱크 플러그인은 여전히 v56이고, CDC 스택 템플릿은 그대로입니다.
+- **따로 옮길 것이 없고, v0.1.585로 되돌리는 것도 안전합니다.** 이 버전은 v0.1.585와 같은 Full Load 기록과 저장된 세션을 읽고 쓰며 같은 설정을 받아들이므로, 어느 버전이든 다른 버전이 쓴 것을 읽습니다. v0.1.585는 예전의 AI DBA 실패 메시지와 Schema Conversion 문구를 다시 보여 줍니다.
+
 ## v0.1.585
 
 새 기능이 없는 유지보수 릴리스입니다. Full Load가 끝날 때 트레이스백이 붙은 거짓 경고를 더 이상 남기지 않으며, 효과가 전혀 없던 `DSQL_MIGRATOR_STAGING_BUCKET` 설정을 더 이상 읽지 않습니다. 나머지는 동작을 바꾸지 않는 내부 리팩터링입니다.
