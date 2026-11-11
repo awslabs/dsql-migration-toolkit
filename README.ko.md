@@ -88,7 +88,7 @@ Load만** 실행한 뒤에는 그 선택지가 사라지고, 나중에 CDC를 �
 | 단계 | 하는 일 |
 | --- | --- |
 | Connect | 소스(RDS/Aurora MySQL 또는 PostgreSQL)와 타깃(Aurora DSQL) 연결 정보 입력. 자격증명은 세션별 메모리에만 있다가 세션 종료 시 폐기. |
-| 1. Evaluation | 소스 **와** 타깃을 introspect해 호환성 리포트(`AUTO`/`MANUAL`/`UNSUPPORTED`) 생성. 작업량 추정·이름 충돌 감지·선택적 AI 전략 포함. |
+| 1. Evaluation | 소스 **와** 타깃을 introspect해 호환성 리포트(`AUTO`/`MANUAL`/`UNSUPPORTED`) 생성. 작업량 추정·이름 충돌 감지·선택적인 항목별 AI DBA 안내 포함. |
 | 2. Schema Conversion | 객체를 탐색하고 소스 vs 변환 DDL을 나란히 비교, 타깃에 적용(SKIP / REPLACE), 안전 재시도 포함. |
 | 3. Data Migration | 마이그레이션 타입(**Full Load**만, 또는 **CDC** 추가)을 선택하고, 사전 점검·테이블 선택 후 스냅샷 실행(워터마크 → export → 로드, 테이블별 진행률 + 에러 로그). CDC 타입이면 스트리밍 인프라도 여기서 배포되므로 약 15~20분의 생성이 Full Load와 **동시에** 진행됩니다. |
 | 4. Validation | 워터마크 시점 기준으로 타깃을 소스와 비교 — 행 수/체크섬 결과와 드리프트를 보고, 리포트 export. |

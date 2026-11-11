@@ -936,7 +936,7 @@ def load_connect_defaults(
     password_raw = _read_plain(source, "DB_PASSWORD")
     return ConnectDefaults(
         source_host=_read_plain(source, "DB_HOST"),
-        source_port=int(port_raw) if port_raw and port_raw.isdigit() else None,
+        source_port=int(port_raw) if port_raw and port_raw.isdecimal() and port_raw.isascii() else None,
         source_username=_read_plain(source, "DB_USER"),
         source_password=SecretValue(password_raw) if password_raw else None,
         target_endpoint=_read_plain(source, "TARGET_ENDPOINT"),

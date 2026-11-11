@@ -222,3 +222,15 @@ def test_an_empty_quoted_value_renders_as_a_blank_one(tmp_path: Path) -> None:
         ("Username", ""),
         ("Username", "admin"),
     ]
+
+
+def test_a_non_ascii_digit_port_is_ignored_not_a_startup_crash() -> None:
+    """``str.isdigit`` accepts characters ``int`` rejects (a superscript two); since X11 a
+    quoted ``DB_PORT="²"`` reaches the port parse unquoted, so the parse checks
+    ``isdecimal`` and ASCII and treats anything else as no port, as an unparsable port
+    always was."""
+    from dsql_migrator.config import load_connect_defaults
+
+    for raw in ("²", "٣٣٠٦", "3306"):
+        defaults = load_connect_defaults({"DB_HOST": "h", "DB_PORT": raw})
+        assert defaults.source_port == (3306 if raw == "3306" else None), raw

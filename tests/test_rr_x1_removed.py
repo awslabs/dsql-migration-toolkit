@@ -263,4 +263,16 @@ def test_no_src_module_defines_or_imports_a_deleted_name() -> None:
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if node.name in deleted:
                     found.append(f"{rel}:{node.lineno} defines {node.name}")
+        # A deleted module-level constant (MAX_SUGGESTION_CHARS, ENV_BEDROCK_*, ...) brought
+        # back by assignment in any module.
+        for node in tree.body:
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target] if isinstance(node, ast.AnnAssign) else []
+            )
+            found.extend(
+                f"{rel}:{node.lineno} assigns {t.id}"
+                for t in targets
+                if isinstance(t, ast.Name) and t.id in deleted
+            )
     assert found == []

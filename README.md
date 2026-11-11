@@ -101,7 +101,7 @@ The web UI guides you through five steps, with **Connect** as the preliminary st
 | Step | What it does |
 | --- | --- |
 | Connect | Enter source (RDS/Aurora MySQL or PostgreSQL) and target (Aurora DSQL) connection details. Credentials stay in per-session memory and are discarded on session end. |
-| 1. Evaluation | Introspect source **and** target, produce a compatibility report (`AUTO`/`MANUAL`/`UNSUPPORTED`) with effort estimates and name-conflict detection, plus optional AI strategy. |
+| 1. Evaluation | Introspect source **and** target, produce a compatibility report (`AUTO`/`MANUAL`/`UNSUPPORTED`) with effort estimates and name-conflict detection, plus optional per-finding AI DBA guidance. |
 | 2. Schema Conversion | Browse objects, view source-vs-converted DDL side by side, apply to target (SKIP / REPLACE) with idempotent retry. |
 | 3. Data Migration | Choose the migration type (**Full Load** only, or add **CDC**), run prerequisite checks and pick tables, then run the snapshot (watermark → export → load, per-table progress + error log). For a CDC type the streaming infrastructure is deployed here too, so its ~15–20 min create runs **while** the Full Load does. |
 | 4. Validation | Compare target against source as of the watermark; report row-count/checksum results and drift; export the report. |

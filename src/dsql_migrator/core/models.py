@@ -1231,7 +1231,11 @@ class Watermark(BaseModel):
             "freshly bulk-loaded source), and the dialect deliberately maps that to None. "
             "Collapsing it to 0 made the panel read \"5 / 0\" -- a target ahead of its "
             "source, which looks like a bug in the migration rather than a missing "
-            "estimate. Consumers must render None as \"unknown\", not as a number."
+            "estimate. Consumers must render None as \"unknown\", not as a number. "
+            "The MySQL start point is the exception: it records an unknown estimate as 0 "
+            "on purpose (core.watermark._approximate_row_counts, DP-2), because a None "
+            "there would change the Full Load's table start order, the index pass's order "
+            "and its completeness verdict."
         ),
     )
     row_counts_approximate: bool = Field(
