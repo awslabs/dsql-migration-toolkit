@@ -531,11 +531,11 @@ def apply_session_snapshot(
 ) -> None:
     """Restore a :class:`SessionSnapshot` onto the live (fresh) session state.
 
-    The Evaluation result is rebuilt only when its deterministic parts are all
-    present; the advisory AI assessment is left ``None`` (regenerable). The last
-    Validation report is re-hydrated (flagged restored, with its completion time)
-    so the result page reopens. Source credentials are not restored -- the user
-    re-enters them on Connect to resume.
+    The Evaluation result is rebuilt only when its inventory, assessment and
+    target catalog are all present. The last Validation report is re-hydrated
+    (flagged restored, with its completion time) so the result page reopens.
+    Source credentials are not restored -- the user re-enters them on Connect to
+    resume.
     """
     # A pre-upgrade snapshot from single-database mode holds BARE names; bring them to the
     # current qualified vintage before anything reads them (see the helper).

@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""AI assist plumbing shared by the AI DBA: config, Bedrock client, output safety.
+"""AI assist plumbing: Bedrock client, output safety, failure mapping, access preflight.
 
 The AI data models (:class:`~dsql_migrator.core.models.AiAssistConfig` and
 :class:`~dsql_migrator.core.models.AiAccessCheckResult`) live in ``core/models.py``.

@@ -15,8 +15,7 @@ their (possibly interrupted) Full Load job.
 
 Only serializable, non-secret state is stored (Property 7): source credentials
 are never captured here -- the user re-enters them on the Connect screen to
-resume a run. The advisory AI assessment is intentionally dropped (it is
-regenerable); the deterministic inventory/assessment/target catalog are kept so
+resume a run. The deterministic inventory/assessment/target catalog are kept so
 the downstream screens are fully functional after a restore.
 """
 
