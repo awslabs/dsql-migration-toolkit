@@ -880,9 +880,15 @@ class ConnectDefaults:
 def read_env_file(path: str) -> dict[str, str]:
     """Parse a simple ``KEY=VALUE`` ``.env`` file into a dict.
 
-    Comment lines (``#``) and blank lines are ignored. This is a best-effort,
-    dependency-free reader for local development: a missing or unreadable file
-    yields an empty dict rather than raising.
+    Comment lines (``#``) and blank lines are ignored. A line splits at its first
+    ``=``; the key and the value are stripped of surrounding whitespace, and then
+    one matching pair of single or double quotes around the value is removed, so
+    ``KEY="a b"`` and ``KEY='a b'`` both give ``a b`` (whitespace inside the quotes
+    is kept). Any other quote character is kept as written, and ``KEY=""`` gives
+    an empty value, which callers treat as unset. There is no escape processing
+    and no inline-comment stripping. This is a best-effort, dependency-free reader
+    for local development: a missing or unreadable file yields an empty dict
+    rather than raising.
     """
     values: dict[str, str] = {}
     try:
@@ -892,7 +898,10 @@ def read_env_file(path: str) -> dict[str, str]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, value = line.partition("=")
-                values[key.strip()] = value.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                values[key.strip()] = value
     except OSError:
         return {}
     return values
