@@ -500,32 +500,6 @@ def test_stream_full_load_error_chat_routes_to_tool_chat_when_tools_given() -> N
     assert executed == ["get_converted_ddl"]  # the tool loop actually ran
 
 
-def test_build_cutover_chat_system_grounds_on_facts_and_cutover_model() -> None:
-    from dsql_migrator.core.assessment_strategist import build_cutover_chat_system
-
-    facts = (
-        "Target coordinates (non-secret): endpoint=abc.dsql.us-east-1.on.aws "
-        "region=us-east-1 database=postgres role=admin.\n"
-        "Migration path: Full Load + CDC.\n"
-        "Last validation: match=True, matched=8/8 tables.\n"
-        "Identity-sync: NOT RUN in this session."
-    )
-    system = build_cutover_chat_system(facts)
-    # The facts are woven in verbatim and called authoritative.
-    assert "endpoint=abc.dsql.us-east-1.on.aws" in system
-    assert "Identity-sync: NOT RUN" in system
-    assert "authoritative" in system.lower()
-    # The cut-over model is grounded: IAM tokens + sslmode + OCC 40001 + rollback
-    # asymmetry + no-writes-from-chat rule + identity sequences.
-    assert "IAM" in system and "sslmode=require" in system
-    assert "40001" in system  # OCC retry framing
-    assert "ROLLBACK" in system or "Rollback" in system or "rollback" in system.lower()
-    assert "identity" in system.lower() and "23505" in system
-    # It must NEVER propose writes -- writes to DSQL go through the tool's approval.
-    assert "Do NOT propose changes to the target from a chat" in system
-    # Loosened guard for tool-wired chat.
-    assert "USE ANY TOOLS" in system
-    assert "decline" in system.lower()
 def test_build_cdc_error_chat_system_grounds_on_facts_and_cdc_model() -> None:
     from dsql_migrator.core.assessment_strategist import build_cdc_error_chat_system
 
@@ -752,7 +726,6 @@ def test_builders_ground_on_postgres_source_engine() -> None:
         build_cdc_error_chat_system,
         build_connection_error_chat_system,
         build_conversion_chat_system,
-        build_cutover_chat_system,
         build_full_load_error_chat_system,
         build_general_chat_system,
         build_object_chat_system,
@@ -773,7 +746,6 @@ def test_builders_ground_on_postgres_source_engine() -> None:
         build_query_optimize_system("SELECT 1", "SELECT 1", source_engine=pg),
         build_validation_chat_system("counts", source_engine=pg),
         build_full_load_error_chat_system("orders", "boom", source_engine=pg),
-        build_cutover_chat_system("facts", source_engine=pg),
         build_cdc_error_chat_system("facts", source_engine=pg),
         build_connection_error_chat_system(
             side="source", coordinates="host=x", error_message="err",
@@ -783,12 +755,9 @@ def test_builders_ground_on_postgres_source_engine() -> None:
         assert "PostgreSQL" in system
         assert "MySQL" not in system
 
-    # The CDC/cutover recovery contexts pick the PostgreSQL-specific capture path
-    # and identity model, not MySQL binlog / AUTO_INCREMENT.
+    # The CDC recovery context picks the PostgreSQL-specific capture path, not MySQL binlog.
     cdc = build_cdc_error_chat_system("facts", source_engine=pg)
     assert "logical replication" in cdc and "binlog" not in cdc
-    cutover = build_cutover_chat_system("facts", source_engine=pg)
-    assert "IDENTITY" in cutover and "AUTO_INCREMENT" not in cutover
     val = build_validation_chat_system("counts", source_engine=pg)
     assert "PostgreSQL logical replication" in val
 

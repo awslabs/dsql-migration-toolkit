@@ -2365,7 +2365,9 @@ def test_the_cutover_screen_no_longer_offers_an_ai_dba_chat() -> None:
     assert 'scope_id="cutover"' not in code, code
 
     # And nothing orphaned: the grounding builder and the strategist entry point are gone
-    # too, rather than left as dead code a reader has to reason about.
+    # too, rather than left as dead code a reader has to reason about. The system prompt
+    # that entry point built (build_cutover_chat_system) and its recovery context are
+    # pinned gone in tests/test_rr_x1_removed.py.
     assert not hasattr(validation_mod, "cutover_ai_facts")
     assert not hasattr(strategist_mod.AssessmentStrategist, "stream_cutover_chat")
 

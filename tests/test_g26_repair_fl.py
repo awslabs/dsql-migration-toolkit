@@ -32,7 +32,6 @@ from dsql_migrator.core.assessment_strategist import (
     _FULL_LOAD_RECOVERY_CONTEXT,
     _validation_recovery_context,
     build_cdc_error_chat_system,
-    build_cutover_chat_system,
     build_full_load_error_chat_system,
     build_general_chat_system,
     build_validation_chat_system,
@@ -266,7 +265,6 @@ def test_a_postgresql_grounding_says_an_lsn_watermark() -> None:
         ),
         build_full_load_error_chat_system("app.b", "boom", source_engine=pg),
         build_cdc_error_chat_system("facts", source_engine=pg),
-        build_cutover_chat_system("facts", source_engine=pg),
         build_general_chat_system(source_engine=pg),
     ):
         assert not re.search(r"\ba LSN\b", system)

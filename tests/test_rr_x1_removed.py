@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """X1 and X1b: the never-wired AI suggest -> review -> apply pipeline and the never-called
-AI report code stay deleted.
+AI report code stay deleted, and so does the cut-over chat's orphaned prompt.
 
 X1: the pipeline (``core/ai_routing.py``, the ``AiConversionAssistant`` suggestion methods,
 ``CdcAssistant``, the ``AiConversionSuggestion`` model, the approve/reject review gate
@@ -21,9 +21,15 @@ caller ever passed), ``_extract_suggestion_text``, and ``load_ai_assist_config``
 Connect screen seeds the AI settings through ``config.load_connect_defaults``): no call
 site was ever added for any of them, or the last one went with X1.
 
-These pins keep both from coming back half-wired, and keep the live AI pieces that shared
-their modules (the AI DBA's chats, the Verify AI access preflight, the SQL denylist that
-guards "Use as target DDL", the Bedrock error classifier and the CDC dead-letter
+The cut-over chat's prompt: ``build_cutover_chat_system`` lost its one caller,
+``AssessmentStrategist.stream_cutover_chat``, when v0.1.479 removed the "Ask AI DBA about
+cut over" chat (f5c490ee), and ``_cutover_recovery_context`` was used only by it. On the
+Cut over step the AI DBA panel answers through its general chat
+(``build_general_chat_system`` with ``tool_chat``), which stays.
+
+These pins keep all three from coming back half-wired, and keep the live AI pieces that
+shared their modules (the AI DBA's chats, the Verify AI access preflight, the SQL denylist
+that guards "Use as target DDL", the Bedrock error classifier and the CDC dead-letter
 summarizer the AI DBA's DLQ chat uses) where the live callers import them.
 """
 
@@ -84,6 +90,10 @@ _DELETED_NAMES: dict[str, tuple[str, ...]] = {
         "_summarize_assessment",
         "_summarize_target",
         "_ASSESSMENT_MAX_TOKENS",
+        # The cut-over chat's system prompt, whose one caller (stream_cutover_chat) went in
+        # f5c490ee (v0.1.479), and the recovery context only that prompt used.
+        "build_cutover_chat_system",
+        "_cutover_recovery_context",
     ),
     # X1b: the HTML export's AI section (its ai_report argument was never passed).
     "dsql_migrator.core.assessor": ("_render_ai_html_section",),
