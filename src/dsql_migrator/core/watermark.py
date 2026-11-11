@@ -204,6 +204,7 @@ def _approximate_row_counts(
     negligible load even for very large tables) that maps its ``None`` "unknown"
     sentinel to ``0`` for the progress-baseline callers that want a numeric default.
     """
+    # DP-2: stays 0 (PostgreSQL keeps None): a None would start first (_largest_first), not last.
     return {
         name: (0 if estimate is None else estimate)
         for name, estimate in dialect.estimate_row_counts(connection, tables).items()
