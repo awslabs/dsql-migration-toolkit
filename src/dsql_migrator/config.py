@@ -883,12 +883,13 @@ def read_env_file(path: str) -> dict[str, str]:
     Comment lines (``#``) and blank lines are ignored. A line splits at its first
     ``=``; the key and the value are stripped of surrounding whitespace, and then
     one matching pair of single or double quotes around the value is removed, so
-    ``KEY="a b"`` and ``KEY='a b'`` both give ``a b`` (whitespace inside the quotes
-    is kept). Any other quote character is kept as written, and ``KEY=""`` gives
-    an empty value, which callers treat as unset. There is no escape processing
-    and no inline-comment stripping. This is a best-effort, dependency-free reader
-    for local development: a missing or unreadable file yields an empty dict
-    rather than raising.
+    ``KEY="a b"`` and ``KEY='a b'`` both give ``a b``. Whitespace inside the quotes
+    is kept here, though :func:`load_connect_defaults` strips every Connect prefill
+    value again. Any other quote (a lone or mismatched one, one inside the value, a
+    backtick) is kept as written, and ``KEY=""`` gives an empty value, which callers
+    treat as unset. There is no escape processing and no inline-comment stripping.
+    This is a best-effort, dependency-free reader for local development: a missing
+    or unreadable file yields an empty dict rather than raising.
     """
     values: dict[str, str] = {}
     try:
